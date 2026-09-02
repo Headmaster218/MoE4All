@@ -390,9 +390,13 @@ impl GpuPager {
             .ok_or_else(|| be("cannot loan a slot from a legacy pager arena"))?;
         let loan_count = slots
             .iter()
-            .filter(|&&slot| unified.slots[slot].allocation.is_some())
+            .filter(|&&slot| {
+                unified.slots[slot].allocation.is_some() && self.pager.slot_enabled(slot as u32)
+            })
             .count();
-        if !loan_preserves_pool_floor(self.pager.enabled_slots(), loan_count, min_enabled_slots) {
+        if loan_count != 0
+            && !loan_preserves_pool_floor(self.pager.enabled_slots(), loan_count, min_enabled_slots)
+        {
             return Err(be(format!(
                 "unified VRAM loan of {loan_count} slot(s) would shrink an expert pool from {} \
                  below its {min_enabled_slots}-slot dispatch-batch safety floor",
@@ -404,12 +408,14 @@ impl GpuPager {
             if unified.slots[slot].allocation.is_none() {
                 continue;
             }
-            if let Some(evicted) = self.pager.disable_slot(slot as u32) {
-                victims.push(evicted);
-                if let Some(entry) = self.lut_host.get_mut(evicted as usize) {
-                    *entry = NOT_RESIDENT;
+            if self.pager.slot_enabled(slot as u32) {
+                if let Some(evicted) = self.pager.disable_slot(slot as u32) {
+                    victims.push(evicted);
+                    if let Some(entry) = self.lut_host.get_mut(evicted as usize) {
+                        *entry = NOT_RESIDENT;
+                    }
+                    self.lut_dirty = true;
                 }
-                self.lut_dirty = true;
             }
             unified.slots[slot].allocation.take();
         }
@@ -581,6 +587,81 @@ impl GpuPager {
             "exchange slot reserved before first touch"
         );
         Ok(slot)
+    }
+
+    /// Prefill may temporarily borrow the disabled exchange cell together with the Decode floor.
+    /// Releasing the ring restores that cell as enabled/free; turn it back into the same empty
+    /// spare before Decode can issue another inclusive-cache promotion.
+    fn restore_exchange_slot(&mut self, slot: u32) -> Option<BlockId> {
+        if !self.pager.slot_enabled(slot) {
+            return None;
+        }
+        let evicted = self.pager.disable_slot(slot);
+        if let Some(id) = evicted {
+            if let Some(entry) = self.lut_host.get_mut(id as usize) {
+                *entry = NOT_RESIDENT;
+            }
+            self.lut_dirty = true;
+        }
+        evicted
+    }
+
+    /// Keep the bounded-host exchange spare out of a higher-priority ownership claim. The old
+    /// spare contains no live block, so make it an enabled/free slot for the imminent loan and
+    /// disable the coldest surviving floor slot in its place. This performs the one resident
+    /// eviction that shrinking the physical cache by this slot already requires, without copying
+    /// bytes or changing ordinary promotion/LRU behavior.
+    fn park_exchange_for_claim(
+        &mut self,
+        exchange_slot: &mut u32,
+        floor_slots: &[usize],
+        claimed_slots: &HashSet<usize>,
+    ) -> Result<Option<BlockId>> {
+        let old_exchange = *exchange_slot as usize;
+        if !claimed_slots.contains(&old_exchange) {
+            return Ok(None);
+        }
+        let unified = self
+            .unified
+            .as_ref()
+            .ok_or_else(|| be("cannot park an exchange slot outside a unified arena"))?;
+        let eligible: HashSet<u32> = floor_slots
+            .iter()
+            .copied()
+            .filter(|slot| {
+                !claimed_slots.contains(slot)
+                    && unified
+                        .slots
+                        .get(*slot)
+                        .is_some_and(|backing| backing.allocation.is_some())
+            })
+            .map(|slot| slot as u32)
+            .collect();
+        let replacement = self
+            .pager
+            .resident_slots_lru()
+            .into_iter()
+            .find_map(|(_, slot)| eligible.contains(&slot).then_some(slot))
+            .or_else(|| {
+                eligible
+                    .iter()
+                    .copied()
+                    .find(|&slot| self.pager.slot_enabled(slot))
+            })
+            .ok_or_else(|| {
+                be("unified VRAM claim cannot park its rotating host-tier exchange slot in the protected expert floor")
+            })?;
+
+        let evicted = self.pager.disable_slot(replacement);
+        if let Some(id) = evicted {
+            if let Some(entry) = self.lut_host.get_mut(id as usize) {
+                *entry = NOT_RESIDENT;
+            }
+            self.lut_dirty = true;
+        }
+        self.pager.enable_slot(*exchange_slot);
+        *exchange_slot = replacement;
+        Ok(evicted)
     }
 
     /// Resolve one inclusive VRAM/RAM promotion. A full-cache miss is written into the currently
@@ -1545,6 +1626,12 @@ pub struct MoePagerLayout {
     /// Maximum lazily committed KV/QSA bytes. The unified arena reserves this low-address
     /// corridor logically while allowing Expert filler to occupy uncommitted cells.
     pub dynamic_state_reserve_bytes: u64,
+    /// Largest independently allocated KV/QSA segment. The arena uses this only to leave bounded
+    /// per-shard packing slack; those tail bytes are intentionally not reclaimed at runtime.
+    pub dynamic_state_max_allocation_bytes: u64,
+    /// Smallest complete whole-layer Prefill lane. The frozen high corridor must retain this much
+    /// contiguous room beyond the runtime reserve before the first request starts.
+    pub prefill_min_lane_bytes: u64,
     /// High-address corridor sized for the planner's peak graph/runtime workspace.
     pub runtime_reserve_bytes: u64,
     /// Non-overlapping layer-boundary chunks covering the exact layer-major host-store extent.
@@ -1647,11 +1734,25 @@ impl MoePagerSession {
         let unified_specs: Vec<_> = layout
             .pools
             .iter()
-            .map(|spec| (spec.slot_bytes, spec.n_slots))
-            .collect();
+            .map(|spec| {
+                let physical_floor = spec
+                    .min_enabled_slots
+                    .checked_add(1)
+                    .ok_or_else(|| be("MoE pool physical floor overflow"))?;
+                if physical_floor > spec.n_slots {
+                    return Err(be(format!(
+                        "MoE pool needs {physical_floor} physical floor slots (including its exchange spare), but has only {}",
+                        spec.n_slots,
+                    )));
+                }
+                Ok((spec.slot_bytes, spec.n_slots, physical_floor))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let unified_pool = vk.init_unified_vram_for_expert_slots(
             &unified_specs,
             layout.dynamic_state_reserve_bytes,
+            layout.dynamic_state_max_allocation_bytes,
+            layout.prefill_min_lane_bytes,
             layout.runtime_reserve_bytes,
         )?;
         let mut pools = Vec::with_capacity(layout.pools.len());
@@ -1962,10 +2063,13 @@ impl MoePagerSession {
         Ok(src.bank_bytes)
     }
 
-    /// Expert cells that are currently disabled as bounded-RAM promotion exchange destinations.
-    /// Their identity rotates after each full-cache miss, so arena planning queries this live set
-    /// instead of freezing one physical slot at session construction.
+    /// Exchange cells already parked inside the physical Decode floor. Persistent KV/runtime
+    /// claims must preserve them; the phase-exclusive Prefill ring deliberately uses a separate
+    /// unprotected claim path and restores the same spare before returning to Decode.
     pub(crate) fn protected_expert_slots(&self) -> Vec<ExpertSlotId> {
+        let Some(layout) = self.unified_pool.expert_layout() else {
+            return Vec::new();
+        };
         self.pools
             .iter()
             .enumerate()
@@ -1975,6 +2079,7 @@ impl MoePagerSession {
                     slot: slot as usize,
                 })
             })
+            .filter(|&id| layout.slot_is_in_floor(id))
             .collect()
     }
 
@@ -1985,6 +2090,16 @@ impl MoePagerSession {
         &mut self,
         plan: UnifiedClaimPlan,
     ) -> Result<Vec<Arc<UnifiedAllocationHandle>>> {
+        let floor_suspended =
+            plan.class() == UnifiedVramClass::Prefill || self.mode == MoeArenaMode::PrefillLayer;
+        let floor_slots: Vec<Vec<usize>> = (0..self.pools.len())
+            .map(|pool| {
+                self.unified_pool
+                    .expert_layout()
+                    .map(|layout| layout.floor_slots(pool))
+                    .unwrap_or_default()
+            })
+            .collect();
         let mut by_pool: Vec<Vec<usize>> = vec![Vec::new(); self.pools.len()];
         for &id in plan.victims() {
             let pool = self.pools.get(id.pool).ok_or_else(|| {
@@ -2002,11 +2117,14 @@ impl MoePagerSession {
             by_pool[id.pool].push(id.slot);
         }
         for (pool, slots) in self.pools.iter().zip(&by_pool) {
-            if !loan_preserves_pool_floor(
-                pool.pager.enabled_slots(),
-                slots.len(),
-                pool.min_enabled_slots,
-            ) {
+            if !floor_suspended
+                && !slots.is_empty()
+                && !loan_preserves_pool_floor(
+                    pool.pager.enabled_slots(),
+                    slots.len(),
+                    pool.min_enabled_slots,
+                )
+            {
                 return Err(be(format!(
                     "unified VRAM claim of {} slot(s) would shrink an expert pool from {} below its {}-slot dispatch-batch safety floor",
                     slots.len(),
@@ -2017,8 +2135,27 @@ impl MoePagerSession {
         }
 
         let loaned: usize = by_pool.iter().map(Vec::len).sum();
-        for (pool, slots) in self.pools.iter_mut().zip(by_pool) {
-            let evicted = pool.pager.loan_slots(&slots, pool.min_enabled_slots)?;
+        for (pool_index, (pool, slots)) in self.pools.iter_mut().zip(by_pool).enumerate() {
+            let claimed: HashSet<_> = slots.iter().copied().collect();
+            let mut evicted = Vec::new();
+            if !floor_suspended {
+                if let Some(mut exchange) = pool.exchange_slot {
+                    if let Some(id) = pool.pager.park_exchange_for_claim(
+                        &mut exchange,
+                        &floor_slots[pool_index],
+                        &claimed,
+                    )? {
+                        evicted.push(id);
+                    }
+                    pool.exchange_slot = Some(exchange);
+                }
+            }
+            let retained_floor = if floor_suspended {
+                0
+            } else {
+                pool.min_enabled_slots
+            };
+            evicted.extend(pool.pager.loan_slots(&slots, retained_floor)?);
             if let Some(host) = &pool.host {
                 host.release_gpu_blocks(&evicted);
             }
@@ -2077,6 +2214,48 @@ impl MoePagerSession {
         restored
     }
 
+    fn restore_exchange_spares(&mut self) {
+        for pool in &mut self.pools {
+            let Some(exchange) = pool.exchange_slot else {
+                continue;
+            };
+            let evicted = pool.pager.restore_exchange_slot(exchange);
+            if let (Some(host), Some(id)) = (&pool.host, evicted) {
+                host.release_gpu_blocks(&[id]);
+            }
+        }
+    }
+
+    fn park_exchange_spares_in_floor(&mut self) -> Result<()> {
+        let floor_slots: Vec<Vec<usize>> = (0..self.pools.len())
+            .map(|pool| {
+                self.unified_pool
+                    .expert_layout()
+                    .map(|layout| layout.floor_slots(pool))
+                    .unwrap_or_default()
+            })
+            .collect();
+        for (pool_index, pool) in self.pools.iter_mut().enumerate() {
+            let Some(mut exchange) = pool.exchange_slot else {
+                continue;
+            };
+            if floor_slots[pool_index].contains(&(exchange as usize)) {
+                continue;
+            }
+            let claimed = HashSet::from([exchange as usize]);
+            let evicted = pool.pager.park_exchange_for_claim(
+                &mut exchange,
+                &floor_slots[pool_index],
+                &claimed,
+            )?;
+            pool.exchange_slot = Some(exchange);
+            if let (Some(host), Some(id)) = (&pool.host, evicted) {
+                host.release_gpu_blocks(&[id]);
+            }
+        }
+        Ok(())
+    }
+
     /// Switch the shared arenas back to expert-LRU interpretation. Entering Prefill already
     /// invalidated exactly the Decode slots its temporary ring borrowed, so every mapping outside
     /// those ranges remains valid and hot. The borrowed slots are already on each pager's free
@@ -2094,6 +2273,7 @@ impl MoePagerSession {
         self.prefill_allocations.clear();
         self.mode = MoeArenaMode::DecodeLru;
         self.restore_unified_slots_if_changed();
+        self.restore_exchange_spares();
         true
     }
 
@@ -2101,6 +2281,10 @@ impl MoePagerSession {
         if !self.prefill_placement.is_empty() {
             return Ok(());
         }
+        // Inclusive-cache promotions rotate the empty exchange identity through arbitrary slots.
+        // Anchor it back inside the permanent floor before Prefill borrows that whole corridor, so
+        // KV/runtime claims made during the phase can never strand the spare in elastic space.
+        self.park_exchange_spares_in_floor()?;
         type PrefillSource = (u8, usize, usize, usize, Option<usize>, usize);
         type PackedBank = (usize, usize, usize, usize);
         type PrefillLayer = (u32, Vec<PackedBank>, usize);
@@ -2167,7 +2351,9 @@ impl MoePagerSession {
         let requested_lanes = self.prefill_target_lanes.min(layers.len()).max(1);
         let mut chosen_layout = None;
         let mut last_error = None;
-        let protected_experts = self.protected_expert_slots();
+        // Prefill is phase-exclusive with Decode: its whole-layer ring may borrow the Decode floor
+        // and the empty exchange cells. `enter_decode` restores both before paging resumes.
+        let protected_experts = Vec::new();
         for candidate_lanes in (1..=requested_lanes).rev() {
             let mut lane_bank_bytes = vec![Vec::<usize>::new(); candidate_lanes];
             for (layer_idx, (_, banks, _)) in layers.iter().enumerate() {

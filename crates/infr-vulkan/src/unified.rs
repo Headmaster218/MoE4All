@@ -39,28 +39,63 @@ pub(crate) struct ExpertSlotPlacement {
 /// Load-time geometry of the elastic VRAM arena. Physical storage remains a small number of large
 /// Vulkan shards; the entries below are only a logical filler directory over those shards.
 ///
-/// The arena has three priority corridors:
+/// The arena has four priority corridors:
 ///
 /// - `[0, kv_reserve_bytes)` is reserved for lazy low-address KV growth;
-/// - the middle corridor is available to the fixed Prefill lane while active;
+/// - one middle band retains every pool's physical dispatch floor;
+/// - the remaining middle corridor is available to the fixed Prefill lane while active;
 /// - the high suffix is the planned runtime reserve.
 ///
-/// Expert cells initially fill all three corridors and are disabled only as their bytes are
-/// claimed by a higher-priority owner.
-#[derive(Clone, Debug)]
+/// Surplus Expert cells initially fill the elastic corridors and are disabled only as their bytes
+/// are claimed by a higher-priority owner. Floor cells never enter those corridors.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ExpertArenaLayout {
     shard_sizes: Vec<usize>,
     slots_by_pool: Vec<Vec<ExpertSlotPlacement>>,
     total_bytes: usize,
     kv_reserve_bytes: usize,
     runtime_reserve_bytes: usize,
+    floor_corridor: Range<usize>,
+}
+
+fn smooth_weighted_pool_order(counts: &[usize]) -> Vec<usize> {
+    let total: usize = counts.iter().sum();
+    if total == 0 {
+        return Vec::new();
+    }
+    let weights: Vec<i128> = counts.iter().map(|&count| count as i128).collect();
+    let total_weight = total as i128;
+    let mut current = vec![0i128; counts.len()];
+    let mut remaining = counts.to_vec();
+    let mut order = Vec::with_capacity(total);
+    for _ in 0..total {
+        let mut selected = None;
+        for pool in 0..counts.len() {
+            if remaining[pool] == 0 {
+                continue;
+            }
+            current[pool] += weights[pool];
+            if selected.is_none_or(|old| {
+                current[pool] > current[old] || (current[pool] == current[old] && pool < old)
+            }) {
+                selected = Some(pool);
+            }
+        }
+        let pool = selected.expect("total tracks every remaining weighted item");
+        current[pool] -= total_weight;
+        remaining[pool] -= 1;
+        order.push(pool);
+    }
+    order
 }
 
 impl ExpertArenaLayout {
     pub(crate) fn build(
-        specs: &[(usize, usize)],
+        specs: &[(usize, usize, usize)],
         max_shard: usize,
         kv_reserve_bytes: usize,
+        kv_max_allocation_bytes: usize,
+        prefill_min_lane_bytes: usize,
         runtime_reserve_bytes: usize,
     ) -> Result<Self> {
         if specs.is_empty() || max_shard < UNIFIED_ALIGN {
@@ -70,14 +105,16 @@ impl ExpertArenaLayout {
         }
         let mut total_bytes = 0usize;
         let mut total_slots = 0usize;
-        for &(slot_bytes, n_slots) in specs {
+        let mut floor_bytes = 0usize;
+        for &(slot_bytes, n_slots, floor_slots) in specs {
             if slot_bytes == 0
                 || n_slots == 0
+                || floor_slots > n_slots
                 || !slot_bytes.is_multiple_of(UNIFIED_ALIGN)
                 || slot_bytes > max_shard
             {
                 return Err(be(format!(
-                    "invalid expert arena pool: {n_slots} slot(s) x {slot_bytes} bytes, shard limit {max_shard}"
+                    "invalid expert arena pool: {n_slots} slot(s), {floor_slots} protected, x {slot_bytes} bytes, shard limit {max_shard}"
                 )));
             }
             total_bytes = total_bytes
@@ -90,57 +127,159 @@ impl ExpertArenaLayout {
             total_slots = total_slots
                 .checked_add(n_slots)
                 .ok_or_else(|| be("expert arena slot count overflow"))?;
+            floor_bytes = floor_bytes
+                .checked_add(
+                    slot_bytes
+                        .checked_mul(floor_slots)
+                        .ok_or_else(|| be("expert arena floor byte size overflow"))?,
+                )
+                .ok_or_else(|| be("expert arena total floor byte size overflow"))?;
         }
         let kv_reserve_bytes = align_up(kv_reserve_bytes, UNIFIED_ALIGN)
             .ok_or_else(|| be("KV reserve alignment overflow"))?;
+        let kv_max_allocation_bytes = align_up(kv_max_allocation_bytes, UNIFIED_ALIGN)
+            .ok_or_else(|| be("maximum KV allocation alignment overflow"))?;
+        let prefill_min_lane_bytes = align_up(prefill_min_lane_bytes, UNIFIED_ALIGN)
+            .ok_or_else(|| be("minimum Prefill lane alignment overflow"))?;
         let runtime_reserve_bytes = align_up(runtime_reserve_bytes, UNIFIED_ALIGN)
             .ok_or_else(|| be("runtime reserve alignment overflow"))?;
-        if kv_reserve_bytes.saturating_add(runtime_reserve_bytes) > total_bytes {
+        if kv_max_allocation_bytes > max_shard {
             return Err(be(format!(
-                "elastic arena has {total_bytes} bytes, below its {kv_reserve_bytes}-byte KV and {runtime_reserve_bytes}-byte runtime reserves"
+                "maximum KV segment is {kv_max_allocation_bytes} bytes, above the {max_shard}-byte Vulkan arena shard limit"
+            )));
+        }
+        // The logical KV estimate is byte-exact, while every physical segment must fit wholly in
+        // one Vulkan allocation. Expert-sized shard tails can therefore strand less than one
+        // largest KV segment per shard. Price that packing loss inside the existing arena instead
+        // of discovering it only at the final 32K growth boundary.
+        let max_slot_bytes = specs
+            .iter()
+            .map(|&(slot_bytes, _, _)| slot_bytes)
+            .max()
+            .unwrap_or(0);
+        let minimum_shard_payload = max_shard.saturating_sub(max_slot_bytes).max(UNIFIED_ALIGN);
+        let guaranteed_kv_payload = minimum_shard_payload
+            .saturating_sub(kv_max_allocation_bytes)
+            .max(UNIFIED_ALIGN);
+        let packing_shards = if kv_reserve_bytes == 0 || kv_max_allocation_bytes == 0 {
+            0
+        } else {
+            kv_reserve_bytes.div_ceil(guaranteed_kv_payload)
+        };
+        let kv_packing_slack = packing_shards
+            .checked_mul(kv_max_allocation_bytes)
+            .ok_or_else(|| be("KV shard-packing reserve overflow"))?;
+        let kv_corridor_target = kv_reserve_bytes
+            .checked_add(kv_packing_slack)
+            .ok_or_else(|| be("KV corridor size overflow"))?;
+        let loanable_bytes = total_bytes.saturating_sub(floor_bytes);
+        if kv_corridor_target.saturating_add(runtime_reserve_bytes) > loanable_bytes {
+            return Err(be(format!(
+                "elastic arena has {loanable_bytes} loanable bytes after its {floor_bytes}-byte expert floor, below its {kv_reserve_bytes}-byte KV reserve, {kv_packing_slack}-byte KV packing reserve and {runtime_reserve_bytes}-byte runtime reserve"
             )));
         }
 
-        // Smooth weighted round-robin preserves each planner-selected pool's slot fraction in
-        // every broad physical prefix. A growing low-address KV frontier therefore sheds all size
-        // classes proportionally instead of exhausting whichever class happened to be allocated
-        // first. The weights are the final slot counts, not raw expert counts.
-        let weights: Vec<i128> = specs.iter().map(|&(_, n)| n as i128).collect();
-        let total_weight = total_slots as i128;
-        let mut current = vec![0i128; specs.len()];
-        let mut remaining: Vec<usize> = specs.iter().map(|&(_, n)| n).collect();
-        let mut slots_by_pool: Vec<Vec<ExpertSlotPlacement>> =
-            specs.iter().map(|&(_, n)| Vec::with_capacity(n)).collect();
+        // Only slots above each pool's dispatch floor may enter an elastic corridor. Interleave
+        // that surplus in weighted-fair order, put enough at low addresses for maximum KV, keep
+        // every physical floor together in the middle, then leave the remaining surplus at high
+        // addresses for Prefill/runtime owners. A pool already at its floor therefore cannot be
+        // clipped by an unrelated KV claim merely because its cells happened to land in a broad
+        // weighted prefix.
+        let loanable_counts: Vec<_> = specs
+            .iter()
+            .map(|&(_, n_slots, floor_slots)| n_slots - floor_slots)
+            .collect();
+        let mut loanable_order = smooth_weighted_pool_order(&loanable_counts);
+        let mut low_bytes = 0usize;
+        let mut low_count = 0usize;
+        while low_bytes < kv_corridor_target && low_count < loanable_order.len() {
+            low_bytes = low_bytes
+                .checked_add(specs[loanable_order[low_count]].0)
+                .ok_or_else(|| be("low-address expert surplus size overflow"))?;
+            low_count += 1;
+        }
+        if low_bytes < kv_corridor_target
+            || loanable_bytes.saturating_sub(low_bytes) < runtime_reserve_bytes
+        {
+            return Err(be(format!(
+                "expert slot granularity cannot split {loanable_bytes} loanable bytes into a {kv_corridor_target}-byte packed-KV prefix and {runtime_reserve_bytes}-byte runtime suffix"
+            )));
+        }
+        let prefill_bytes = floor_bytes
+            .checked_add(
+                loanable_bytes
+                    .saturating_sub(low_bytes)
+                    .saturating_sub(runtime_reserve_bytes),
+            )
+            .ok_or_else(|| be("Prefill corridor size overflow"))?;
+        if prefill_bytes < prefill_min_lane_bytes {
+            return Err(be(format!(
+                "elastic arena leaves a {prefill_bytes}-byte phase-exclusive Prefill corridor, below its {prefill_min_lane_bytes}-byte minimum lane"
+            )));
+        }
+        let high_order = loanable_order.split_off(low_count);
+        let low_order = loanable_order;
+        let floor_counts: Vec<_> = specs
+            .iter()
+            .map(|&(_, _, floor_slots)| floor_slots)
+            .collect();
+        let floor_order = smooth_weighted_pool_order(&floor_counts);
+
+        let mut loanable_slot = vec![0usize; specs.len()];
+        let mut floor_slot = loanable_counts.clone();
+        let mut physical_order = Vec::with_capacity(total_slots);
+        for pool in low_order {
+            let slot = loanable_slot[pool];
+            loanable_slot[pool] += 1;
+            physical_order.push((pool, slot));
+        }
+        let floor_start = low_bytes;
+        for pool in floor_order {
+            let slot = floor_slot[pool];
+            floor_slot[pool] += 1;
+            physical_order.push((pool, slot));
+        }
+        let floor_end = floor_start
+            .checked_add(floor_bytes)
+            .ok_or_else(|| be("expert floor corridor overflow"))?;
+        for pool in high_order {
+            let slot = loanable_slot[pool];
+            loanable_slot[pool] += 1;
+            physical_order.push((pool, slot));
+        }
+        debug_assert_eq!(physical_order.len(), total_slots);
+        debug_assert!(loanable_slot
+            .iter()
+            .zip(&loanable_counts)
+            .all(|(placed, wanted)| placed == wanted));
+        debug_assert!(floor_slot
+            .iter()
+            .zip(specs)
+            .all(|(placed, &(_, wanted, _))| placed == &wanted));
+
+        let mut slot_table: Vec<Vec<Option<ExpertSlotPlacement>>> = specs
+            .iter()
+            .map(|&(_, n_slots, _)| vec![None; n_slots])
+            .collect();
         let mut shard_sizes = Vec::new();
         let mut shard = 0usize;
         let mut shard_offset = 0usize;
         let mut logical_offset = 0usize;
 
-        for _ in 0..total_slots {
-            let mut selected = None;
-            for pool in 0..specs.len() {
-                if remaining[pool] == 0 {
-                    continue;
-                }
-                current[pool] += weights[pool];
-                if selected.is_none_or(|old| {
-                    current[pool] > current[old] || (current[pool] == current[old] && pool < old)
-                }) {
-                    selected = Some(pool);
-                }
-            }
-            let pool = selected.expect("total_slots tracks every remaining expert cell");
-            current[pool] -= total_weight;
-            remaining[pool] -= 1;
-
+        for (position, (pool, slot)) in physical_order.into_iter().enumerate() {
             let slot_bytes = specs[pool].0;
-            if shard_offset != 0 && shard_offset.saturating_add(slot_bytes) > max_shard {
+            // KV can never borrow the Decode floor. End its physical shard before the floor so the
+            // phase-exclusive Prefill corridor can borrow floor + high filler from a clean Vulkan
+            // allocation instead of inheriting an arbitrary KV-shard tail.
+            let starts_prefill_corridor = position == low_count && low_count != total_slots;
+            if shard_offset != 0
+                && (starts_prefill_corridor || shard_offset.saturating_add(slot_bytes) > max_shard)
+            {
                 shard_sizes.push(shard_offset);
                 shard += 1;
                 shard_offset = 0;
             }
-            let slot = slots_by_pool[pool].len();
-            slots_by_pool[pool].push(ExpertSlotPlacement {
+            slot_table[pool][slot] = Some(ExpertSlotPlacement {
                 id: ExpertSlotId { pool, slot },
                 logical_offset,
                 shard,
@@ -154,7 +293,15 @@ impl ExpertArenaLayout {
             shard_sizes.push(shard_offset);
         }
         debug_assert_eq!(logical_offset, total_bytes);
-        debug_assert!(remaining.iter().all(|&n| n == 0));
+        let slots_by_pool = slot_table
+            .into_iter()
+            .map(|slots| {
+                slots
+                    .into_iter()
+                    .map(|slot| slot.expect("every planned expert slot has physical coordinates"))
+                    .collect()
+            })
+            .collect();
 
         Ok(Self {
             shard_sizes,
@@ -162,6 +309,7 @@ impl ExpertArenaLayout {
             total_bytes,
             kv_reserve_bytes,
             runtime_reserve_bytes,
+            floor_corridor: floor_start..floor_end,
         })
     }
 
@@ -178,15 +326,46 @@ impl ExpertArenaLayout {
     }
 
     pub(crate) fn kv_corridor(&self) -> Range<usize> {
-        0..self.kv_reserve_bytes
+        // The low surplus is selected in whole Expert slots, so its physical boundary can extend
+        // slightly past the byte-exact model estimate. Keep that otherwise unreachable tail in
+        // the KV corridor; it supplies useful shard-packing slack without growing the arena.
+        0..self.floor_corridor.start
     }
 
     pub(crate) fn prefill_corridor(&self) -> Range<usize> {
-        self.kv_reserve_bytes..self.total_bytes - self.runtime_reserve_bytes
+        // Prefill and Decode are mutually exclusive phases. The whole-layer ring may therefore
+        // evict and borrow Decode-floor cells; release restores those physical slots before the
+        // next Decode dispatch. KV and runtime owners continue to exclude the floor.
+        self.floor_corridor.start..self.total_bytes - self.runtime_reserve_bytes
     }
 
     pub(crate) fn runtime_corridor(&self) -> Range<usize> {
         self.total_bytes - self.runtime_reserve_bytes..self.total_bytes
+    }
+
+    pub(crate) fn floor_corridor(&self) -> Range<usize> {
+        self.floor_corridor.clone()
+    }
+
+    pub(crate) fn floor_slots(&self, pool: usize) -> Vec<usize> {
+        let floor = &self.floor_corridor;
+        self.slots(pool)
+            .into_iter()
+            .flatten()
+            .filter(|slot| {
+                slot.logical_offset >= floor.start
+                    && slot.logical_offset.saturating_add(slot.len) <= floor.end
+            })
+            .map(|slot| slot.id.slot)
+            .collect()
+    }
+
+    pub(crate) fn slot_is_in_floor(&self, id: ExpertSlotId) -> bool {
+        let Some(slot) = self.slots(id.pool).and_then(|slots| slots.get(id.slot)) else {
+            return false;
+        };
+        slot.logical_offset >= self.floor_corridor.start
+            && slot.logical_offset.saturating_add(slot.len) <= self.floor_corridor.end
     }
 
     fn physical_pieces(&self, logical: Range<usize>) -> Vec<ArenaPiece> {
@@ -217,6 +396,28 @@ impl ExpertArenaLayout {
         direction: ClaimDirection,
         protected_experts: &[ExpertSlotId],
     ) -> Result<UnifiedClaimPlan> {
+        self.plan_claim_with_reservations(
+            live,
+            requested,
+            class,
+            corridor,
+            direction,
+            protected_experts,
+            &[],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_claim_with_reservations(
+        &self,
+        live: &[UnifiedRange],
+        requested: &[usize],
+        class: UnifiedVramClass,
+        corridor: Range<usize>,
+        direction: ClaimDirection,
+        protected_experts: &[ExpertSlotId],
+        reservations: &[PlannedRange],
+    ) -> Result<UnifiedClaimPlan> {
         if class == UnifiedVramClass::Expert || requested.is_empty() {
             return Err(be("elastic claim needs non-Expert bytes"));
         }
@@ -235,6 +436,7 @@ impl ExpertArenaLayout {
                 requested_len: range.requested_len,
             })
             .collect();
+        blockers.extend_from_slice(reservations);
         for &id in protected_experts {
             let placement = self
                 .slots_by_pool
@@ -325,6 +527,118 @@ impl ExpertArenaLayout {
             victims,
         })
     }
+
+    fn plan_exact_claim(
+        &self,
+        live: &[UnifiedRange],
+        ranges: &[PlannedRange],
+        class: UnifiedVramClass,
+        corridor: Range<usize>,
+        protected_experts: &[ExpertSlotId],
+    ) -> Result<UnifiedClaimPlan> {
+        if class == UnifiedVramClass::Expert || ranges.is_empty() {
+            return Err(be("exact elastic claim needs non-Expert ranges"));
+        }
+        let pieces = self.physical_pieces(corridor);
+        for (index, range) in ranges.iter().enumerate() {
+            if range.requested_len == 0
+                || range.len < range.requested_len
+                || !range.len.is_multiple_of(UNIFIED_ALIGN)
+                || !pieces.iter().any(|piece| {
+                    piece.shard == range.shard
+                        && range.offset >= piece.start
+                        && range.offset.saturating_add(range.len) <= piece.end
+                })
+            {
+                return Err(be(format!(
+                    "exact {class:?} range {index} is outside its frozen arena corridor"
+                )));
+            }
+            if ranges[..index].iter().any(|old| {
+                old.shard == range.shard
+                    && ranges_overlap(old.offset, old.len, range.offset, range.len)
+            }) {
+                return Err(be(format!(
+                    "exact {class:?} range {index} overlaps an earlier range"
+                )));
+            }
+        }
+
+        let live_experts: HashSet<_> = live
+            .iter()
+            .filter(|range| range.class == UnifiedVramClass::Expert)
+            .map(|range| (range.shard, range.offset, range.len))
+            .collect();
+        for allocation in live
+            .iter()
+            .filter(|allocation| allocation.class != UnifiedVramClass::Expert)
+        {
+            if ranges.iter().any(|range| {
+                range.shard == allocation.shard
+                    && ranges_overlap(range.offset, range.len, allocation.offset, allocation.len)
+            }) {
+                return Err(be(format!(
+                    "exact {class:?} range overlaps a live {:?} allocation",
+                    allocation.class
+                )));
+            }
+        }
+        for &id in protected_experts {
+            let placement = self
+                .slots_by_pool
+                .get(id.pool)
+                .and_then(|slots| slots.get(id.slot))
+                .ok_or_else(|| {
+                    be(format!(
+                        "protected Expert slot {}/{} is unknown",
+                        id.pool, id.slot
+                    ))
+                })?;
+            if live_experts.contains(&(placement.shard, placement.offset, placement.len))
+                && ranges.iter().any(|range| {
+                    range.shard == placement.shard
+                        && ranges_overlap(range.offset, range.len, placement.offset, placement.len)
+                })
+            {
+                return Err(be(format!(
+                    "exact {class:?} range overlaps protected Expert slot {}/{}",
+                    id.pool, id.slot
+                )));
+            }
+        }
+
+        let mut victims = Vec::new();
+        for placement in self.slots_by_pool.iter().flatten() {
+            if live_experts.contains(&(placement.shard, placement.offset, placement.len))
+                && ranges.iter().any(|range| {
+                    range.shard == placement.shard
+                        && ranges_overlap(range.offset, range.len, placement.offset, placement.len)
+                })
+            {
+                victims.push(placement.id);
+            }
+        }
+        let mapped_experts = self
+            .slots_by_pool
+            .iter()
+            .flatten()
+            .filter(|placement| {
+                live_experts.contains(&(placement.shard, placement.offset, placement.len))
+            })
+            .count();
+        if mapped_experts != live_experts.len() {
+            return Err(be(
+                "elastic arena contains an Expert allocation outside its frozen slot directory",
+            ));
+        }
+        victims.sort_unstable_by_key(|id| (id.pool, id.slot));
+        victims.dedup();
+        Ok(UnifiedClaimPlan {
+            class,
+            ranges: ranges.to_vec(),
+            victims,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -341,11 +655,11 @@ enum ClaimDirection {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PlannedRange {
-    shard: usize,
-    offset: usize,
-    len: usize,
-    requested_len: usize,
+pub(crate) struct PlannedRange {
+    pub(crate) shard: usize,
+    pub(crate) offset: usize,
+    pub(crate) len: usize,
+    pub(crate) requested_len: usize,
 }
 
 /// A side-effect-free arena mutation plan. Pager retirement happens between planning and commit;
@@ -367,8 +681,39 @@ impl UnifiedClaimPlan {
         self.ranges.len()
     }
 
+    pub(crate) fn ranges(&self) -> &[PlannedRange] {
+        &self.ranges
+    }
+
     pub(crate) fn class(&self) -> UnifiedVramClass {
         self.class
+    }
+}
+
+#[derive(Default)]
+struct KvReservationState {
+    next_id: u64,
+    ranges: HashMap<u64, Vec<PlannedRange>>,
+}
+
+/// Frozen coordinates for every segment of one or more logical KV planes. A reservation owns no
+/// VRAM bytes: Expert filler remains live until an exact segment claim retires the overlapping
+/// cells. It only prevents later segmented-KV buffers from choosing the same future coordinates.
+pub(crate) struct UnifiedKvReservation {
+    id: u64,
+    ranges: Vec<PlannedRange>,
+    state: Arc<Mutex<KvReservationState>>,
+}
+
+impl UnifiedKvReservation {
+    pub(crate) fn ranges(&self) -> &[PlannedRange] {
+        &self.ranges
+    }
+}
+
+impl Drop for UnifiedKvReservation {
+    fn drop(&mut self) {
+        self.state.lock().unwrap().ranges.remove(&self.id);
     }
 }
 
@@ -886,6 +1231,7 @@ pub struct UnifiedVramPool {
     ranges: UnifiedRangePool,
     arena: DeviceArena,
     expert_layout: Option<ExpertArenaLayout>,
+    kv_reservations: Arc<Mutex<KvReservationState>>,
 }
 
 impl UnifiedVramPool {
@@ -946,6 +1292,7 @@ impl UnifiedVramPool {
             ranges,
             arena,
             expert_layout,
+            kv_reservations: Arc::new(Mutex::new(KvReservationState::default())),
         }))
     }
 
@@ -988,6 +1335,59 @@ impl UnifiedVramPool {
         )
     }
 
+    pub(crate) fn reserve_kv_layout(
+        &self,
+        requested: &[usize],
+        protected_experts: &[ExpertSlotId],
+    ) -> Result<Arc<UnifiedKvReservation>> {
+        let layout = self
+            .expert_layout
+            .as_ref()
+            .ok_or_else(|| be("KV reservations require an expert-aware unified VRAM layout"))?;
+        let live = self.ranges.allocations();
+        let mut state = self.kv_reservations.lock().unwrap();
+        let existing: Vec<_> = state.ranges.values().flatten().copied().collect();
+        let plan = layout.plan_claim_with_reservations(
+            &live,
+            requested,
+            UnifiedVramClass::KvCache,
+            layout.kv_corridor(),
+            ClaimDirection::Low,
+            protected_experts,
+            &existing,
+        )?;
+        let id = state.next_id;
+        state.next_id = state
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| be("KV reservation id overflow"))?;
+        let ranges = plan.ranges().to_vec();
+        state.ranges.insert(id, ranges.clone());
+        Ok(Arc::new(UnifiedKvReservation {
+            id,
+            ranges,
+            state: Arc::clone(&self.kv_reservations),
+        }))
+    }
+
+    pub(crate) fn plan_exact_kv_claim(
+        &self,
+        ranges: &[PlannedRange],
+        protected_experts: &[ExpertSlotId],
+    ) -> Result<UnifiedClaimPlan> {
+        let layout = self
+            .expert_layout
+            .as_ref()
+            .ok_or_else(|| be("exact KV claims require an expert-aware unified VRAM layout"))?;
+        layout.plan_exact_claim(
+            &self.ranges.allocations(),
+            ranges,
+            UnifiedVramClass::KvCache,
+            layout.kv_corridor(),
+            protected_experts,
+        )
+    }
+
     pub(crate) fn plan_prefill_claim(
         &self,
         requested: &[usize],
@@ -1007,8 +1407,8 @@ impl UnifiedVramPool {
         )
     }
 
-    /// Plan a non-KV, non-Prefill owner from high addresses. The maximum KV corridor remains a
-    /// hard lower boundary even before those lazy segments are physically committed.
+    /// Plan a non-KV, non-Prefill owner from high addresses. The physical expert-floor corridor
+    /// remains a hard lower boundary even before lazy KV segments are committed.
     pub(crate) fn plan_high_claim(
         &self,
         requested: &[usize],
@@ -1031,7 +1431,7 @@ impl UnifiedVramPool {
             &self.ranges.allocations(),
             requested,
             class,
-            layout.kv_corridor().end..layout.total_bytes(),
+            layout.floor_corridor().end..layout.total_bytes(),
             ClaimDirection::High,
             protected_experts,
         )
@@ -1183,8 +1583,8 @@ mod tests {
 
     #[test]
     fn expert_layout_interleaves_planner_selected_pool_ratios() {
-        let specs = [(512, 2), (256, 1), (256, 17)];
-        let layout = ExpertArenaLayout::build(&specs, 4096, 0, 0).unwrap();
+        let specs = [(512, 2, 0), (256, 1, 0), (256, 17, 0)];
+        let layout = ExpertArenaLayout::build(&specs, 4096, 0, 0, 0, 0).unwrap();
         let mut ordered: Vec<_> = layout.slots_by_pool.iter().flatten().copied().collect();
         ordered.sort_unstable_by_key(|slot| slot.logical_offset);
         assert_eq!(ordered.len(), 20);
@@ -1193,7 +1593,7 @@ mod tests {
         for (prefix, slot) in ordered.iter().enumerate() {
             seen[slot.id.pool] += 1;
             let prefix = prefix + 1;
-            for (pool, &(_, wanted)) in specs.iter().enumerate() {
+            for (pool, &(_, wanted, _)) in specs.iter().enumerate() {
                 let error = (seen[pool] * ordered.len()) as isize - (prefix * wanted) as isize;
                 assert!(
                     error.unsigned_abs() <= ordered.len(),
@@ -1212,8 +1612,8 @@ mod tests {
 
     #[test]
     fn expert_layout_uses_large_shards_without_crossing_or_holes() {
-        let specs = [(1024, 5), (512, 7), (256, 9)];
-        let layout = ExpertArenaLayout::build(&specs, 2048, 0, 0).unwrap();
+        let specs = [(1024, 5, 0), (512, 7, 0), (256, 9, 0)];
+        let layout = ExpertArenaLayout::build(&specs, 2048, 0, 0, 0, 0).unwrap();
         assert!(layout.shard_sizes().iter().all(|&bytes| bytes <= 2048));
         assert_eq!(
             layout.shard_sizes().iter().sum::<usize>(),
@@ -1237,7 +1637,7 @@ mod tests {
 
     #[test]
     fn arena_corridors_align_and_leave_the_middle_for_experts_and_prefill() {
-        let layout = ExpertArenaLayout::build(&[(256, 20)], 4096, 257, 513).unwrap();
+        let layout = ExpertArenaLayout::build(&[(256, 20, 0)], 4096, 257, 0, 0, 513).unwrap();
         assert_eq!(layout.kv_corridor(), 0..512);
         assert_eq!(layout.runtime_corridor(), 4352..5120);
         assert_eq!(layout.prefill_corridor(), 512..4352);
@@ -1245,13 +1645,143 @@ mod tests {
 
     #[test]
     fn arena_corridors_reject_reserves_larger_than_the_physical_pool() {
-        let error = ExpertArenaLayout::build(&[(256, 4)], 4096, 768, 512).unwrap_err();
+        let error = ExpertArenaLayout::build(&[(256, 4, 0)], 4096, 768, 0, 0, 512).unwrap_err();
         assert!(error.to_string().contains("below its"));
     }
 
     #[test]
+    fn persistent_corridors_preserve_floor_while_prefill_may_borrow_it() {
+        let layout =
+            ExpertArenaLayout::build(&[(256, 4, 4), (512, 8, 2)], 4096, 1024, 0, 512, 512).unwrap();
+        let floor = layout.floor_corridor();
+        assert_eq!(floor, 1024..3072);
+        assert_eq!(layout.prefill_corridor(), 1024..4608);
+        assert!(layout.slots(0).unwrap().iter().all(|slot| {
+            slot.logical_offset >= floor.start && slot.logical_offset + slot.len <= floor.end
+        }));
+
+        let ranges = UnifiedRangePool::new(layout.shard_sizes().iter().copied()).unwrap();
+        let _leases: Vec<_> = layout
+            .slots_by_pool
+            .iter()
+            .flatten()
+            .map(|slot| {
+                ranges
+                    .try_claim_exact(slot.shard, slot.offset, slot.len, UnifiedVramClass::Expert)
+                    .unwrap()
+            })
+            .collect();
+        let kv = layout
+            .plan_claim(
+                &ranges.allocations(),
+                &[1024],
+                UnifiedVramClass::KvCache,
+                layout.kv_corridor(),
+                ClaimDirection::Low,
+                &[],
+            )
+            .unwrap();
+        assert!(kv.victims.iter().all(|victim| victim.pool == 1));
+        let prefill = layout
+            .plan_claim(
+                &ranges.allocations(),
+                &[512],
+                UnifiedVramClass::Prefill,
+                layout.prefill_corridor(),
+                ClaimDirection::Low,
+                &[],
+            )
+            .unwrap();
+        assert!(prefill.victims.iter().any(|victim| victim.pool == 0));
+        let runtime = layout
+            .plan_claim(
+                &ranges.allocations(),
+                &[512],
+                UnifiedVramClass::LlmRuntime,
+                layout.floor_corridor().end..layout.total_bytes(),
+                ClaimDirection::High,
+                &[],
+            )
+            .unwrap();
+        assert!(runtime.victims.iter().all(|victim| victim.pool == 1));
+    }
+
+    #[test]
+    fn prefill_corridor_starts_on_a_clean_shard_after_the_expert_floor() {
+        let layout =
+            ExpertArenaLayout::build(&[(256, 4, 4), (512, 8, 2)], 4096, 1024, 0, 512, 512).unwrap();
+        let pieces = layout.physical_pieces(layout.prefill_corridor());
+
+        assert!(!pieces.is_empty());
+        assert_eq!(pieces[0].start, 0);
+        assert_eq!(pieces[0].end - pieces[0].start, 3584);
+    }
+
+    #[test]
+    fn frozen_kv_layout_survives_incremental_exact_claims() {
+        let layout = ExpertArenaLayout::build(&[(256, 32, 4)], 2048, 4096, 512, 0, 0).unwrap();
+        let ranges = UnifiedRangePool::new(layout.shard_sizes().iter().copied()).unwrap();
+        let mut experts: HashMap<_, _> = layout
+            .slots_by_pool
+            .iter()
+            .flatten()
+            .map(|slot| {
+                let lease = ranges
+                    .try_claim_exact(slot.shard, slot.offset, slot.len, UnifiedVramClass::Expert)
+                    .unwrap();
+                (slot.id, lease)
+            })
+            .collect();
+
+        // Three logical planes grow together through four depth increments. Reserve every future
+        // segment up front, but leave the backing Expert cells live until each increment commits.
+        let requested = [512, 512, 512, 512, 256, 256, 256, 256, 256, 256, 256, 256];
+        let frozen = layout
+            .plan_claim_with_reservations(
+                &ranges.allocations(),
+                &requested,
+                UnifiedVramClass::KvCache,
+                layout.kv_corridor(),
+                ClaimDirection::Low,
+                &[],
+                &[],
+            )
+            .unwrap();
+        let mut kv = Vec::new();
+        for segment in 0..4 {
+            let exact_ranges = [
+                frozen.ranges[segment],
+                frozen.ranges[4 + segment],
+                frozen.ranges[8 + segment],
+            ];
+            let claim = layout
+                .plan_exact_claim(
+                    &ranges.allocations(),
+                    &exact_ranges,
+                    UnifiedVramClass::KvCache,
+                    layout.kv_corridor(),
+                    &[],
+                )
+                .unwrap();
+            for victim in claim.victims() {
+                drop(experts.remove(victim).unwrap());
+            }
+            kv.extend(
+                ranges
+                    .try_claim_planned(UnifiedVramClass::KvCache, claim.ranges())
+                    .unwrap(),
+            );
+        }
+
+        assert_eq!(kv.len(), requested.len());
+        assert_eq!(ranges.stats().class_bytes(UnifiedVramClass::KvCache), 4096);
+        assert_eq!(experts.len(), 16);
+    }
+
+    #[test]
     fn low_kv_claim_reports_exact_interleaved_expert_victims() {
-        let layout = ExpertArenaLayout::build(&[(256, 8), (512, 4)], 4096, 1024, 512).unwrap();
+        let layout =
+            ExpertArenaLayout::build(&[(256, 8, 0), (512, 4, 0)], 4096, 1024, 0, 0, 512).unwrap();
         let ranges = UnifiedRangePool::new(layout.shard_sizes().iter().copied()).unwrap();
         let leases: Vec<_> = layout
             .slots_by_pool
@@ -1293,7 +1823,8 @@ mod tests {
 
     #[test]
     fn protected_exchange_slot_is_a_hard_claim_blocker() {
-        let layout = ExpertArenaLayout::build(&[(256, 8), (512, 4)], 4096, 1024, 512).unwrap();
+        let layout =
+            ExpertArenaLayout::build(&[(256, 8, 0), (512, 4, 0)], 4096, 1024, 0, 0, 512).unwrap();
         let ranges = UnifiedRangePool::new(layout.shard_sizes().iter().copied()).unwrap();
         let _leases: Vec<_> = layout
             .slots_by_pool
@@ -1321,7 +1852,7 @@ mod tests {
 
     #[test]
     fn high_claim_never_enters_the_maximum_kv_corridor() {
-        let layout = ExpertArenaLayout::build(&[(256, 16)], 4096, 1024, 512).unwrap();
+        let layout = ExpertArenaLayout::build(&[(256, 16, 0)], 4096, 1024, 0, 0, 512).unwrap();
         let plan = layout
             .plan_claim(
                 &[],
@@ -1332,9 +1863,12 @@ mod tests {
                 &[],
             )
             .unwrap();
+        let pieces = layout.physical_pieces(layout.kv_corridor().end..layout.total_bytes());
+        let high_piece = pieces.last().unwrap();
         assert_eq!(plan.ranges.len(), 1);
-        assert_eq!(plan.ranges[0].offset, layout.total_bytes() - 512);
-        assert!(plan.ranges[0].offset >= layout.kv_corridor().end);
+        assert_eq!(plan.ranges[0].shard, high_piece.shard);
+        assert_eq!(plan.ranges[0].offset, high_piece.end - 512);
+        assert!(plan.ranges[0].offset >= high_piece.start);
     }
 
     #[test]

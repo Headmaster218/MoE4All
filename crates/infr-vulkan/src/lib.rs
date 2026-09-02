@@ -834,6 +834,12 @@ struct VkSegmentedKvBuffer {
     spec: SegmentedKvSpec,
     table: VkBuffer,
     segments: Mutex<Vec<VkBuffer>>,
+    reservation: Mutex<Option<SegmentedKvReservation>>,
+}
+
+struct SegmentedKvReservation {
+    owner: Arc<crate::unified::UnifiedKvReservation>,
+    start: usize,
 }
 
 impl VkSegmentedKvBuffer {
@@ -3907,8 +3913,10 @@ impl VulkanBackend {
     /// driver allocation cap never strands an unusable tail smaller than the next slot.
     pub(crate) fn init_unified_vram_for_expert_slots(
         &self,
-        specs: &[(usize, usize)],
+        specs: &[(usize, usize, usize)],
         dynamic_state_reserve_bytes: u64,
+        dynamic_state_max_allocation_bytes: u64,
+        prefill_min_lane_bytes: u64,
         runtime_reserve_bytes: u64,
     ) -> Result<Arc<crate::unified::UnifiedVramPool>> {
         const WINDOWS_MAX_SHARD: usize = 3 * 1024 * 1024 * 1024;
@@ -3925,6 +3933,10 @@ impl VulkanBackend {
             platform_max,
             usize::try_from(dynamic_state_reserve_bytes)
                 .map_err(|_| be("dynamic-state reserve exceeds the host address space"))?,
+            usize::try_from(dynamic_state_max_allocation_bytes)
+                .map_err(|_| be("dynamic-state allocation exceeds the host address space"))?,
+            usize::try_from(prefill_min_lane_bytes)
+                .map_err(|_| be("minimum Prefill lane exceeds the host address space"))?,
             usize::try_from(runtime_reserve_bytes)
                 .map_err(|_| be("runtime reserve exceeds the host address space"))?,
         )?;
@@ -3932,10 +3944,9 @@ impl VulkanBackend {
         let mut cell = self.unified_pool.lock().unwrap();
         if let Some(pool) = cell.as_ref() {
             let same_layout = pool.stats().capacity_bytes == expected
-                && pool.expert_layout().is_some_and(|existing| {
-                    existing.kv_corridor() == layout.kv_corridor()
-                        && existing.runtime_corridor() == layout.runtime_corridor()
-                });
+                && pool
+                    .expert_layout()
+                    .is_some_and(|existing| existing == &layout);
             if !same_layout {
                 return Err(be(format!(
                     "unified VRAM arena is already {} bytes with different corridors; expert plan requires {expected} bytes",
@@ -3955,13 +3966,17 @@ impl VulkanBackend {
     /// A successful probe stays installed and is reused byte-for-byte by [`init_moe_pager`].
     pub fn prepare_moe_unified_vram(
         &self,
-        specs: &[(usize, usize)],
+        specs: &[(usize, usize, usize)],
         dynamic_state_reserve_bytes: u64,
+        dynamic_state_max_allocation_bytes: u64,
+        prefill_min_lane_bytes: u64,
         runtime_reserve_bytes: u64,
     ) -> Result<usize> {
         let pool = self.init_unified_vram_for_expert_slots(
             specs,
             dynamic_state_reserve_bytes,
+            dynamic_state_max_allocation_bytes,
+            prefill_min_lane_bytes,
             runtime_reserve_bytes,
         )?;
         Ok(pool.stats().capacity_bytes)
@@ -4176,6 +4191,7 @@ impl VulkanBackend {
             spec,
             table,
             segments: Mutex::new(Vec::new()),
+            reservation: Mutex::new(None),
         })
     }
 
@@ -4231,7 +4247,61 @@ impl VulkanBackend {
             let sizes: Vec<_> = requests.iter().map(|&(_, _, bytes)| bytes).collect();
             let handles = if pool.expert_layout().is_some() {
                 let protected = self.protected_unified_experts();
-                let plan = pool.plan_kv_claim(&sizes, &protected)?;
+                let mut reservations = buffers
+                    .iter()
+                    .map(|buffer| buffer.reservation.lock().unwrap())
+                    .collect::<Vec<_>>();
+                let mut reserve_sizes = Vec::new();
+                let mut reserve_starts = Vec::new();
+                for (buffer_idx, (buffer, reservation)) in
+                    buffers.iter().zip(&reservations).enumerate()
+                {
+                    if reservation.is_some() {
+                        continue;
+                    }
+                    if !locked[buffer_idx].is_empty() {
+                        return Err(be(
+                            "segmented KV has committed ranges without a frozen physical layout",
+                        ));
+                    }
+                    let start = reserve_sizes.len();
+                    reserve_sizes.extend(std::iter::repeat_n(
+                        buffer.spec.segment_bytes,
+                        buffer.spec.max_segments,
+                    ));
+                    reserve_starts.push((buffer_idx, start));
+                }
+                if !reserve_sizes.is_empty() {
+                    let owner = pool.reserve_kv_layout(&reserve_sizes, &protected)?;
+                    debug_assert_eq!(owner.ranges().len(), reserve_sizes.len());
+                    for (buffer_idx, start) in reserve_starts {
+                        *reservations[buffer_idx] = Some(SegmentedKvReservation {
+                            owner: Arc::clone(&owner),
+                            start,
+                        });
+                    }
+                }
+
+                let exact_ranges = requests
+                    .iter()
+                    .map(|&(buffer_idx, index, bytes)| {
+                        let reservation = reservations[buffer_idx].as_ref().ok_or_else(|| {
+                            be("segmented KV buffer has no frozen physical layout")
+                        })?;
+                        let range = *reservation
+                            .owner
+                            .ranges()
+                            .get(reservation.start + index)
+                            .ok_or_else(|| be("segmented KV reservation index is out of range"))?;
+                        if range.requested_len != bytes {
+                            return Err(be(
+                                "segmented KV reservation byte size differs from its buffer spec",
+                            ));
+                        }
+                        Ok(range)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let plan = pool.plan_exact_kv_claim(&exact_ranges, &protected)?;
                 debug_assert_eq!(plan.len(), sizes.len());
                 self.commit_unified_claim_locked(&pool, plan)?
             } else {
@@ -6420,6 +6490,8 @@ mod tests {
                 host: None,
             }],
             dynamic_state_reserve_bytes: 0,
+            dynamic_state_max_allocation_bytes: 0,
+            prefill_min_lane_bytes: 0,
             runtime_reserve_bytes: 0,
             host_chunks: vec![crate::pager::MoeHostChunkSpec {
                 base_offset: 0,
@@ -6584,6 +6656,8 @@ mod tests {
                 host: None,
             }],
             dynamic_state_reserve_bytes: 0,
+            dynamic_state_max_allocation_bytes: 0,
+            prefill_min_lane_bytes: 0,
             runtime_reserve_bytes: 0,
             host_chunks: vec![crate::pager::MoeHostChunkSpec {
                 base_offset: 0,

@@ -109,6 +109,7 @@ fn log_host_ram_request(
     what: &str,
     request: infr_core::hostmem::RamRequest,
     process_resident: Option<u64>,
+    planned_future_resident: u64,
     cache_bytes: u64,
 ) {
     match (request, process_resident) {
@@ -116,6 +117,7 @@ fn log_host_ram_request(
             tracing::info!(
                 total_process_ram_budget_bytes = total,
                 observed_process_resident_bytes = resident,
+                planned_future_resident_bytes = planned_future_resident,
                 host_cache_budget_bytes = cache_bytes,
                 "{what} host tier: resolved total-process RAM budget"
             )
@@ -179,7 +181,7 @@ fn cpu_paged_store(
         infr_core::hostmem::ArenaPlan::Take(bytes) => bytes,
         _ => 0,
     };
-    log_host_ram_request("CPU", ram_request, process_resident, cache_bytes);
+    log_host_ram_request("CPU", ram_request, process_resident, 0, cache_bytes);
     let budget = match arena_plan {
         // Only the GPU tiers can want a reader with no cache under them (their arena IS the cache
         // on unified memory). For the CPU backend this arena is the only tier there is, so a
@@ -300,7 +302,7 @@ fn vulkan_host_tier(
         infr_core::hostmem::ArenaPlan::Take(bytes) => bytes,
         _ => 0,
     };
-    log_host_ram_request(what, ram_request, process_resident, cache_bytes);
+    log_host_ram_request(what, ram_request, process_resident, 0, cache_bytes);
     let budget = match arena_plan {
         // Unified memory: the arena above is already GPU-accessible RAM, so there is nothing
         // to cache down here — but its misses still come from BLOCK reads instead of the
@@ -2326,6 +2328,30 @@ pub(crate) fn moe_prefill_floor_bytes(g: &Gguf, cfg: &Config) -> u64 {
     moe_pool_floor_bytes(&pools, moe.n_expert.max(1)).unwrap_or(u64::MAX)
 }
 
+/// Exact minimum whole-layer Prefill lane: one maximum bank for each role position used by any
+/// paged layer. This mirrors the pager's one-lane layout without multiplying mutually exclusive
+/// size classes into the Decode dispatch floor.
+fn moe_prefill_min_lane_bytes(g: &Gguf, cfg: &Config) -> u64 {
+    let mut role_max = [0u64; 3];
+    for tensor in g.tensors() {
+        let Some(_layer) = moe_expert_layer(&tensor.name).filter(|&layer| layer < cfg.n_layer)
+        else {
+            continue;
+        };
+        let Some(role) = moe_role_index(&tensor.name) else {
+            continue;
+        };
+        role_max[role] = role_max[role].max(tensor.nbytes as u64);
+    }
+    role_max
+        .into_iter()
+        .try_fold(0u64, |sum, bytes| {
+            let aligned = bytes.checked_add(255).map(|value| value & !255)?;
+            sum.checked_add(aligned)
+        })
+        .unwrap_or(u64::MAX)
+}
+
 /// Whole-layer Prefill ring depth from the model's actual mixer topology. A recurrent run gives
 /// the uploader that many fast layers in which to prepare the next slow Attention/MLA layer; the
 /// extra lane is the layer currently being consumed. Models without recurrent mixers keep the
@@ -2758,13 +2784,14 @@ fn moe_host_backing(
     ram_request: infr_core::hostmem::RamRequest,
     available: Option<u64>,
     process_resident: Option<u64>,
+    planned_future_resident: u64,
     payload_bytes: usize,
 ) -> MoeHostBacking {
     let budget = match ram_request {
         infr_core::hostmem::RamRequest::TotalProcessBudget(total) => {
             infr_core::hostmem::cache_bytes_for_total_budget(
                 total,
-                process_resident,
+                process_resident.map(|resident| resident.saturating_add(planned_future_resident)),
                 payload_bytes as u64,
             )
         }
@@ -2825,6 +2852,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
     let mut expert_cache_target_bytes = 0u64;
     let mut pager_budget_bytes = 0u64;
     let mut pager_memory_plan = None;
+    let mut dynamic_state_max_allocation_bytes = 0u64;
+    let mut planned_future_host_resident_bytes = 0u64;
     // Placement is decided ONCE, on the session's FIRST load — the only call where `bind_weight`
     // runs (see the `state.is_none()` init block in `generate_dense_backend`) and the only moment
     // the tier-3 budget math is consistent: `vram.available` is LIVE (heapBudget − heapUsage), so
@@ -2844,6 +2873,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // `infr_vulkan::linear::moe_expert_dtype_ok` is true for all of them; the invariant is
         // pinned by `moe_expert_floor_covers_dense_set` in infr-vulkan's linear.rs tests.
         let fp = crate::weights::weight_footprint(g);
+        planned_future_host_resident_bytes = fp.dense;
         let vram = vk.vram();
         let room = planned_vram_room(&vram, ec);
         // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows`), so a mostly-SWA
@@ -2859,6 +2889,16 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let dynamic_kv_reserve = dynamic_layout
             .as_ref()
             .map(|layout| layout.committed_bytes(want_ctx))
+            .unwrap_or(0);
+        dynamic_state_max_allocation_bytes = dynamic_layout
+            .as_ref()
+            .and_then(|layout| {
+                layout
+                    .planes
+                    .iter()
+                    .map(|plane| plane.segment_bytes() as u64)
+                    .max()
+            })
             .unwrap_or(0);
         let kv_bytes_at = |ubatch| match (k_fmt, v_fmt) {
             (DType::Q8_0, DType::Q8_0) => kv_bytes_estimate(cfg, want_ctx, ring, ubatch, true),
@@ -3174,8 +3214,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // little room for the same fixed weights on another. Automatic placement shrinks and
             // retries while the arena is still empty; an explicit `paging.cache` remains exact.
             let plan = pager_memory_plan.expect("n_paged > 0 carries its selected memory plan");
+            let physical_pool_floors = moe_pool_slot_floors(&logical_pools, n_expert);
             let physical_pool_floor = moe_pool_physical_floor_bytes(&logical_pools, n_expert)
                 .ok_or_else(|| anyhow!("MoE physical pool floor size overflow"))?;
+            let prefill_min_lane_bytes = moe_prefill_min_lane_bytes(g, cfg);
             let planned_pager_budget = pager_budget_bytes;
             let elastic_reserve = plan.elastic_reserve_bytes();
             let minimum_pager_budget = elastic_reserve.saturating_add(physical_pool_floor);
@@ -3210,15 +3252,20 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         physical_pool_floor as f64 / 2f64.powi(20),
                     ));
                 }
-                let specs: Vec<(usize, usize)> = logical_pools
+                let specs: Vec<(usize, usize, usize)> = logical_pools
                     .iter()
                     .zip(&candidate_slots)
-                    .map(|(&(slot_bytes, ..), &n_slots)| (slot_bytes, n_slots))
+                    .zip(&physical_pool_floors)
+                    .map(|((&(slot_bytes, ..), &n_slots), &floor_slots)| {
+                        (slot_bytes, n_slots, floor_slots)
+                    })
                     .collect();
 
                 let failure = match vk.prepare_moe_unified_vram(
                     &specs,
                     plan.dynamic_state_reserve_bytes,
+                    dynamic_state_max_allocation_bytes,
+                    prefill_min_lane_bytes,
                     plan.runtime_reserve_bytes,
                 ) {
                     Ok(committed) => {
@@ -3295,8 +3342,13 @@ pub(crate) fn vulkan_moe_binder<'a>(
             let ram_request = host_ram_request(ec);
             let host_available = infr_core::hostmem::available_bytes();
             let process_resident = infr_core::hostmem::process_resident_bytes();
-            let host_backing =
-                moe_host_backing(ram_request, host_available, process_resident, host_bytes);
+            let host_backing = moe_host_backing(
+                ram_request,
+                host_available,
+                process_resident,
+                planned_future_host_resident_bytes,
+                host_bytes,
+            );
             let (host_kind, host_resident_bytes) = match host_backing {
                 MoeHostBacking::Full => ("full-RAM", host_bytes),
                 MoeHostBacking::Bounded { bytes } => ("inclusive-RAM/SSD", bytes),
@@ -3305,6 +3357,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 "MoE",
                 ram_request,
                 process_resident,
+                planned_future_host_resident_bytes,
                 host_resident_bytes as u64,
             );
             if let MoeHostBacking::Bounded {
@@ -3441,6 +3494,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 n_blocks,
                 pools,
                 dynamic_state_reserve_bytes: plan.dynamic_state_reserve_bytes,
+                dynamic_state_max_allocation_bytes,
+                prefill_min_lane_bytes,
                 runtime_reserve_bytes: plan.runtime_reserve_bytes,
                 host_chunks,
                 prefill_target_lanes,
@@ -5187,6 +5242,7 @@ mod seam_helper_tests {
                 RamRequest::LegacyCacheBudget(payload as u64),
                 None,
                 Some(0),
+                0,
                 payload,
             ),
             super::MoeHostBacking::Full,
@@ -5197,13 +5253,20 @@ mod seam_helper_tests {
                 RamRequest::LegacyCacheBudget((40 * GIB) as u64),
                 None,
                 Some(0),
+                0,
                 payload,
             ),
             super::MoeHostBacking::Full,
             "budget above the routed payload must not create a bounded SSD cache"
         );
         assert_eq!(
-            super::moe_host_backing(RamRequest::Auto, Some((64 * GIB) as u64), Some(0), payload,),
+            super::moe_host_backing(
+                RamRequest::Auto,
+                Some((64 * GIB) as u64),
+                Some(0),
+                0,
+                payload,
+            ),
             super::MoeHostBacking::Full,
             "automatic sizing must select the full store when its post-headroom budget fits"
         );
@@ -5219,6 +5282,7 @@ mod seam_helper_tests {
                 RamRequest::LegacyCacheBudget((23 * GIB) as u64),
                 None,
                 Some(0),
+                0,
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes: 23 * GIB }
@@ -5228,6 +5292,7 @@ mod seam_helper_tests {
                 RamRequest::Auto,
                 Some((25 * GIB) as u64),
                 Some(0),
+                0,
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes } if bytes < payload
@@ -5237,6 +5302,7 @@ mod seam_helper_tests {
                 RamRequest::TotalProcessBudget(0),
                 Some((64 * GIB) as u64),
                 Some(0),
+                0,
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes: 0 }
@@ -5246,6 +5312,7 @@ mod seam_helper_tests {
                 RamRequest::Bypass,
                 Some((64 * GIB) as u64),
                 Some(0),
+                0,
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes: 0 }
@@ -5262,6 +5329,7 @@ mod seam_helper_tests {
                 RamRequest::TotalProcessBudget((50 * GIB) as u64),
                 Some((48 * GIB) as u64),
                 Some((2 * GIB) as u64),
+                0,
                 payload,
             ),
             super::MoeHostBacking::Bounded {
@@ -5270,7 +5338,20 @@ mod seam_helper_tests {
             "the total target also covers persistent process objects created after planning"
         );
         assert_eq!(
-            super::moe_host_backing(RamRequest::Auto, None, Some(0), payload),
+            super::moe_host_backing(
+                RamRequest::TotalProcessBudget((50 * GIB) as u64),
+                Some((48 * GIB) as u64),
+                Some((2 * GIB) as u64),
+                (5 * GIB) as u64,
+                payload,
+            ),
+            super::MoeHostBacking::Bounded {
+                bytes: 43 * GIB - (512 << 20),
+            },
+            "known fixed weights that have not been touched yet still count toward the process total"
+        );
+        assert_eq!(
+            super::moe_host_backing(RamRequest::Auto, None, Some(0), 0, payload),
             super::MoeHostBacking::Bounded { bytes: 0 },
             "auto sizing without a probe must not assume the whole payload fits RAM"
         );
