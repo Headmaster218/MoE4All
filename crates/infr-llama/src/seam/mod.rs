@@ -2911,11 +2911,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     infr_gguf::nbytes(t.dtype, numel)
                 })
                 .sum();
-            // The trunk's own token_embd upload during the MTP verify binds is F16 (dequantized
-            // from its GGUF dtype — Q8_0 here), i.e. TWICE the bytes minimum_required prices it
-            // at. This term covers that delta (and the head's device embed table when
-            // `device_embed_enabled`, which shares the same magnitude).
-            let embed_table = cfg.vocab * cfg.n_embd * 2;
+            // The embed-table term is GONE: the MTP verify path forces spec.gpu_embed=false,
+            // so the trunk never uploads token_embd (embeddings ride the host table), and the
+            // head's device embed table is gated off (`device_embed_enabled`) — counting it
+            // here double-booked 1 GiB and starved the prefill ring on smaller cards.
             let head_kv = want_ctx * cfg.n_kv * cfg.head_dim * 2 * 2; // K+V f16, 1 layer
                                                                       // Scratch covers the BDA geometry rounding AND the head's later blocks beyond the
                                                                       // first `resident-bda` request: with the reserve inside required_after_arena, an
@@ -2927,13 +2926,12 @@ pub(crate) fn vulkan_moe_binder<'a>(
                                                                       // enforced inside the arena search's `required_after_arena`, an undersized scratch
                                                                       // surfaces as a mid-upload guard refusal; the loop pays for the bigger scratch out of
                                                                       // expert slots instead.
-            let scratch = 1280 << 20;
-            let mtp_reserve = head_weights + embed_table + head_kv + scratch;
+            let scratch = 1600 << 20;
+            let mtp_reserve = head_weights + head_kv + scratch;
             tracing::info!(
-                "[mtp] headroom reserve: head_weights={:.0}MB embed_table={:.0}MB head_kv={:.0}MB \
+                "[mtp] headroom reserve: head_weights={:.0}MB head_kv={:.0}MB \
                  scratch={:.0}MB total={:.2}GB",
                 head_weights as f64 / 1e6,
-                embed_table as f64 / 1e6,
                 head_kv as f64 / 1e6,
                 scratch as f64 / 1e6,
                 mtp_reserve as f64 / 1e9,
