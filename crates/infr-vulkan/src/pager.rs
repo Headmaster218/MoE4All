@@ -2209,6 +2209,7 @@ impl MoePagerSession {
             // (non-resident, non-ring) expert slot — their data is re-pullable from the host
             // store — to coalesce free space, then rescan once.
             let ring_ranges = self.prefill_reserved_ranges.clone();
+            let mut cold_evicted = 0usize;
             for (pool_idx, pool) in self.pools.iter_mut().enumerate() {
                 let cold: Vec<usize> = pool
                     .pager
@@ -2229,11 +2230,17 @@ impl MoePagerSession {
                     continue;
                 }
                 if let Ok(evicted) = pool.pager.loan_slots(&cold, pool.min_enabled_slots) {
+                    cold_evicted += evicted.len();
                     if let Some(host) = &pool.host {
                         host.release_gpu_blocks(&evicted);
                     }
                 }
             }
+            tracing::warn!(
+                "[pager] unified loan fragmented: evicted {} cold expert blocks to defragment, rescanning for a {}-byte window",
+                cold_evicted,
+                bytes
+            );
             best = self.scan_loan_window(bytes, protect_prefill_ring);
         }
         let Some((_, victims)) = best else {
