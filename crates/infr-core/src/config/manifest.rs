@@ -125,6 +125,7 @@ knobs! {
     // ── device (§6.1) ────────────────────────────────────────────────────────
     "INFR_DEV"                  => "device.dev",               Text, Ignored, "vulkan0", migrated;
     "INFR_CTX"                  => "device.ctx",               Size, Ignored, "32k",     migrated;
+    "INFR_AUTO_PROFILE"         => "device.auto_profile",      Literal, Error, "aggressive", migrated;
     "INFR_VRAM_BUDGET"          => "device.vram_budget",       Size, Ignored, "23g",     migrated;
     "INFR_RAM_BUDGET"           => "device.ram_budget",        Size, Ignored, "50g",     migrated;
     "INFR_VRAM_RESERVE"         => "device.vram_reserve",      Size, Ignored, "512m",    migrated;

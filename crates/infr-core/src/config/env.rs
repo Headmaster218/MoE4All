@@ -20,7 +20,7 @@
 
 use std::path::PathBuf;
 
-use super::{ConfigError, PartialConfig};
+use super::{AutoProfile, ConfigError, PartialConfig};
 use crate::{DType, SizeSpec};
 
 /// An environment reader: variable name → value, `None` when unset. An empty value is
@@ -134,6 +134,12 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     // policy and stays at its site, and `resolve_infr_dev_index` tolerates an empty value.
     p.device.dev = opt_text(get, "INFR_DEV");
     p.device.ctx = opt_size(get, "INFR_CTX");
+    if let Some(v) = get("INFR_AUTO_PROFILE") {
+        p.device.auto_profile = Some(v.parse::<AutoProfile>().map_err(|()| ConfigError::Env {
+            key: "INFR_AUTO_PROFILE",
+            message: format!("expected conservative or aggressive (got {v:?})"),
+        })?);
+    }
     p.device.vram_budget = opt_size(get, "INFR_VRAM_BUDGET");
     p.device.ram_budget = opt_size(get, "INFR_RAM_BUDGET");
     p.device.vram_reserve = opt_size(get, "INFR_VRAM_RESERVE");

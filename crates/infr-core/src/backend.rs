@@ -255,21 +255,17 @@ pub fn integrated_ubatch_rows(cu: u32) -> usize {
 /// a coin flip against that budget.
 pub const SUBMIT_BUDGET_NS: u64 = 250_000_000;
 
-/// Initial cap on DISPATCHES PER SUBMIT for a device that has not been measured yet — the value
-/// that has to protect the very first forward, before [`submit_cap_from_measurement`] has anything
-/// to go on. `0` = unlimited (never split).
+/// Stable fallback cap on DISPATCHES PER SUBMIT. `0` = unlimited (never split).
 ///
-/// Discrete GPUs get 0: a whole forward there is tens of milliseconds, two orders of magnitude
-/// inside any watchdog, and splitting it would only add barriers and submit overhead to the tuned
-/// path. Integrated GPUs get a real cap, because they are the parts whose forward is measured in
-/// SECONDS.
+/// Vulkan's transient/static path normally calibrates from a safer cap using GPU timestamps. This
+/// fallback remains for queues without timestamp support and for persistent decode command buffers,
+/// which are recorded once and therefore cannot follow a cap that changes during calibration.
 ///
 /// 128 comes from the surveyed 2-CU part: 757 dispatches ≈ 2.05 s ⇒ ~2.7 ms/dispatch ⇒ 128
 /// dispatches ≈ 0.35 s, inside [`SUBMIT_BUDGET_NS`] with room to spare. It is deliberately NOT
 /// scaled by CU count: a bigger iGPU takes proportionally more rows (`integrated_ubatch_rows`), so
 /// its per-dispatch cost lands in the same place, and the same dispatch count lands in the same
-/// segment time. Whatever this gets wrong on an unsurveyed part, the measured feedback loop in
-/// [`submit_cap_from_measurement`] corrects after one forward.
+/// segment time.
 ///
 /// PRIOR ART (independent confirmation of both the diagnosis and the shape of the fix):
 /// llama.cpp's Vulkan backend splits its graph the same way, and its comment says the same thing —
@@ -279,8 +275,8 @@ pub const SUBMIT_BUDGET_NS: u64 = 250_000_000;
 /// (`2e9 * shader_core_count` for a non-GCN AMD part under 24 CUs — i.e. ~4 GFLOP/submit on this
 /// 2-CU iGPU). Bounding WORK per submit rather than dispatches is the more general form of this
 /// and would also stay correct if a caller forced a much larger `INFR_UBATCH` on an iGPU (each
-/// dispatch then gets heavier while the count stays put); today that case is caught one forward
-/// late by the measured loop instead. Worth adopting if this ever needs to be tighter.
+/// dispatch then gets heavier while the count stays put). Worth adopting if this ever needs to be
+/// tighter.
 pub fn initial_submit_dispatch_cap(integrated: bool) -> usize {
     if integrated {
         128
@@ -289,9 +285,9 @@ pub fn initial_submit_dispatch_cap(integrated: bool) -> usize {
     }
 }
 
-/// The measured feedback loop behind the submit splitter: given how long the last forward's
-/// dispatches ACTUALLY took on this device (`elapsed_ns` across `dispatches` of them), return the
-/// dispatch cap that would have put each submit at [`SUBMIT_BUDGET_NS`]. `0` = unlimited.
+/// Given actual GPU time (`elapsed_ns` across `dispatches`), return the dispatch cap that would
+/// place each submit near [`SUBMIT_BUDGET_NS`]. `0` = unlimited. Vulkan feeds this with bounded
+/// startup calibration samples from timestamp queries, excluding host I/O and queue-wait time.
 ///
 /// This is what makes the splitter hardware-agnostic instead of a table of magic numbers: it does
 /// not care whether the GPU is a 2-CU iGPU, a 96-CU dGPU, or something that does not exist yet —
@@ -299,16 +295,26 @@ pub fn initial_submit_dispatch_cap(integrated: bool) -> usize {
 /// produces a cap far larger than any forward's dispatch count, which never splits anything (and
 /// is reported as unlimited); a slow one converges to segments of ~[`SUBMIT_BUDGET_NS`].
 pub fn submit_cap_from_measurement(elapsed_ns: u64, dispatches: usize) -> usize {
-    /// Never split below this — a submit is not free, and a cap this small means something other
-    /// than dispatch cost (a first-forward pipeline compile, a stalled host) dominated the sample.
+    submit_cap_from_measurement_with_budget(elapsed_ns, dispatches, SUBMIT_BUDGET_NS)
+}
+
+/// [`submit_cap_from_measurement`] with an explicit per-submit GPU-time target. Automatic
+/// performance profiles use this to explore a wider cap while retaining the same measured,
+/// hardware-independent calculation. A zero budget is treated as a degenerate sample.
+pub fn submit_cap_from_measurement_with_budget(
+    elapsed_ns: u64,
+    dispatches: usize,
+    budget_ns: u64,
+) -> usize {
+    /// Never split below this: submits are not free, and individual dispatches are indivisible.
     const MIN_CAP: usize = 16;
     /// A cap at or above this covers any forward we record, so it means "never split".
     const UNLIMITED_ABOVE: usize = 1 << 20;
-    if dispatches == 0 || elapsed_ns == 0 {
+    if dispatches == 0 || elapsed_ns == 0 || budget_ns == 0 {
         return 0;
     }
     let ns_per_dispatch = (elapsed_ns / dispatches as u64).max(1);
-    let cap = (SUBMIT_BUDGET_NS / ns_per_dispatch) as usize;
+    let cap = (budget_ns / ns_per_dispatch) as usize;
     if cap >= UNLIMITED_ABOVE {
         0
     } else {
@@ -316,15 +322,11 @@ pub fn submit_cap_from_measurement(elapsed_ns: u64, dispatches: usize) -> usize 
     }
 }
 
-/// A forward this slow (whole pass, nanoseconds) is close enough to a GPU hang watchdog to be
-/// worth splitting even on a device we did NOT pre-classify as needing it.
+/// Legacy whole-forward wall-clock threshold retained for API compatibility.
 ///
-/// This is the ONLY thing that can put a never-split device (every discrete GPU — see
-/// [`initial_submit_dispatch_cap`]) onto the splitting path, and it is deliberately far above any
-/// healthy discrete forward (tens of ms) so that the tuned discrete path is never touched by the
-/// feedback loop, no matter how many dispatches a model's graph happens to have. What it DOES
-/// cover is the case the CU-count heuristics cannot know about: a discrete GPU slow enough — or a
-/// model big enough — that a forward pass lands in watchdog territory anyway.
+/// Vulkan's automatic splitter no longer consumes this value: it calibrates from bounded GPU
+/// timestamp samples instead. External users that imported the constant continue to compile.
+#[doc(hidden)]
 pub const SUBMIT_DANGER_NS: u64 = 1_000_000_000;
 
 impl Capabilities {
@@ -774,17 +776,15 @@ mod tests {
         }
     }
 
-    /// The submit splitter's pre-measurement default. The load-bearing property is that a DISCRETE
-    /// GPU never splits: a dGPU forward is tens of milliseconds, nowhere near a hang watchdog, and
-    /// splitting it would only add barriers and submits to a tuned path.
+    /// The stable fallback used by persistent replay and queues without timestamp support.
     #[test]
     fn initial_submit_cap_splits_only_integrated() {
         assert_eq!(initial_submit_dispatch_cap(false), 0); // discrete: never split
         assert_eq!(initial_submit_dispatch_cap(true), 128); // integrated: the measured default
     }
 
-    /// The measured feedback loop. The property that matters is that the cap it returns puts a
-    /// segment inside the budget on whatever device produced the sample.
+    /// The GPU-time calibration formula. The property that matters is that the cap it returns puts
+    /// a segment inside the budget on whatever device produced the sample.
     #[test]
     fn submit_cap_tracks_measured_dispatch_cost() {
         // The surveyed 2-CU iGPU: 757 dispatches, ~2.05 s ⇒ ~2.7 ms/dispatch. The cap it yields
@@ -800,8 +800,7 @@ mod tests {
         assert!((2..=32).contains(&757usize.div_ceil(cap)), "cap={cap}");
 
         // A discrete GPU (same graph, ~30 ms) yields a cap so far above the forward's own
-        // dispatch count that nothing is ever split — and the danger gate in the caller keeps it
-        // formally unlimited anyway (see `submit_danger_threshold_is_far_above_a_healthy_forward`).
+        // dispatch count that nothing is split.
         let dcap = submit_cap_from_measurement(30_000_000, 757);
         assert!(
             dcap > 757,
@@ -815,29 +814,12 @@ mod tests {
         assert_eq!(submit_cap_from_measurement(2_050_000_000, 0), 0);
         // A pathologically slow sample still never splits below the floor (submits are not free).
         assert!(submit_cap_from_measurement(u64::MAX / 2, 4) >= 16);
-    }
 
-    /// The danger threshold is what keeps the feedback loop OFF a healthy discrete GPU: a forward
-    /// has to be genuinely watchdog-adjacent before a never-split device starts splitting. Phrased
-    /// against real forward timings rather than the bare constants, which is what actually matters.
-    #[test]
-    fn submit_danger_threshold_is_far_above_a_healthy_forward() {
-        // Healthy discrete forwards (measured order of magnitude: tens of ms) stay well clear...
-        for healthy_ns in [5_000_000u64, 30_000_000, 100_000_000, 250_000_000] {
-            assert!(
-                healthy_ns < SUBMIT_DANGER_NS,
-                "{healthy_ns}ns must not look dangerous"
-            );
-        }
-        // ...while the forward that actually caused the device-lost is over the line. (`black_box`
-        // keeps these comparisons off clippy's `assertions_on_constants`: the property is about
-        // the constants' RELATIONSHIP, which is exactly what a reader needs pinned down.)
-        let danger = std::hint::black_box(SUBMIT_DANGER_NS);
-        let budget = std::hint::black_box(SUBMIT_BUDGET_NS);
-        assert!(std::hint::black_box(2_050_000_000u64) >= danger);
-        // And the threshold is above the per-submit budget it guards (a submit that merely wants
-        // splitting is not the same thing as a device that must start splitting).
-        assert!(danger > budget);
+        let conservative =
+            submit_cap_from_measurement_with_budget(100_000_000, 100, SUBMIT_BUDGET_NS);
+        let aggressive =
+            submit_cap_from_measurement_with_budget(100_000_000, 100, SUBMIT_BUDGET_NS * 2);
+        assert_eq!(aggressive, conservative * 2);
     }
 
     /// A DISCRETE GPU must be untouched by any of this: `integrated` defaults false, so the seam's

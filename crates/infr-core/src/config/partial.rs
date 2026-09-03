@@ -114,6 +114,17 @@ impl ConfigValue for DType {
     }
 }
 
+impl ConfigValue for super::AutoProfile {
+    fn parse_set(raw: &str) -> Result<Self, String> {
+        raw.parse()
+            .map_err(|()| format!("expected conservative or aggressive (got {raw:?})"))
+    }
+
+    fn to_display(&self) -> String {
+        self.to_string()
+    }
+}
+
 impl ConfigValue for super::MetalDeviceTime {
     /// Named modes (`off` / `flush` / `counters`), not an integer level — the predecessor
     /// (`INFR_METAL_PROFILE`) compared against the exact literals `"2"` and `"3"`, so `=20` read

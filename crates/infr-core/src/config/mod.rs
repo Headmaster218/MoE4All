@@ -46,6 +46,39 @@ pub use partial::{ConfigValue, SetPathError};
 
 use partial::cfg_struct;
 
+/// Policy used when a resource or execution knob is left to automatic selection.
+///
+/// Explicit values always win over this profile. `Conservative` is the shipped default and keeps
+/// the pre-profile behavior; `Aggressive` spends more of the measured RAM/VRAM headroom and lets
+/// startup calibration explore higher-throughput execution shapes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AutoProfile {
+    #[default]
+    Conservative,
+    Aggressive,
+}
+
+impl std::str::FromStr for AutoProfile {
+    type Err = ();
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "conservative" | "safe" => Ok(Self::Conservative),
+            "aggressive" | "performance" | "perf" => Ok(Self::Aggressive),
+            _ => Err(()),
+        }
+    }
+}
+
+impl std::fmt::Display for AutoProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Conservative => "conservative",
+            Self::Aggressive => "aggressive",
+        })
+    }
+}
+
 // ── sections ─────────────────────────────────────────────────────────────────
 
 cfg_struct! {
@@ -57,6 +90,10 @@ cfg_struct! {
         dev: Option<String> = None,
         /// `INFR_CTX`: context length (the shared size grammar).
         ctx: Option<SizeSpec> = None,
+        /// `INFR_AUTO_PROFILE`: policy for values left on automatic selection. Explicit RAM/VRAM,
+        /// ubatch and submit-splitter values remain authoritative. The conservative default is the
+        /// behavior shipped before profiles were introduced.
+        auto_profile: AutoProfile = AutoProfile::Conservative,
         /// `INFR_VRAM_BUDGET`: total device-memory budget for this backend. Unlike
         /// `paging.cache`, this includes resident weights, KV, runtime scratch and paging arenas.
         /// Percentages resolve against total device-local memory.

@@ -71,6 +71,7 @@ fn default_config_matches_documented_defaults() {
     assert_eq!(d.sampling.max_new, 2048);
     // §6.1: `Option` means "the user pinned it"; the 1024 / iGPU-adaptive chain stays at its site.
     assert_eq!(d.device.ubatch, None);
+    assert_eq!(d.device.auto_profile, super::AutoProfile::Conservative);
     assert_eq!(d.device.vram_budget, None);
     assert_eq!(d.device.ram_budget, None);
     assert_eq!(d.device.vram_reserve, None);
@@ -128,6 +129,24 @@ fn default_config_matches_documented_defaults() {
     assert!(d.spec.mtp_ckpt && d.spec.mtp_reprime && d.spec.mtp_draft_chain);
     assert_eq!(d.spec.k, 6);
     assert_eq!(d.spec.decode_chain, 8);
+}
+
+#[test]
+fn auto_profile_parses_from_every_configuration_layer() {
+    let from_file =
+        Config::load_from_layers(&[file_layer("[device]\nauto_profile = 'aggressive'\n")]);
+    assert_eq!(
+        from_file.device.auto_profile,
+        super::AutoProfile::Aggressive
+    );
+
+    let from_env = Config::load_from_layers(&[env_layer(&[("INFR_AUTO_PROFILE", "performance")])]);
+    assert_eq!(from_env.device.auto_profile, super::AutoProfile::Aggressive);
+
+    let from_cli = Config::load_from_layers(&[cli_layer(&["device.auto_profile=aggressive"])]);
+    assert_eq!(from_cli.device.auto_profile, super::AutoProfile::Aggressive);
+
+    assert!(try_env_layer(&[("INFR_AUTO_PROFILE", "reckless")]).is_err());
 }
 
 // ── §8.2 / §8.3 / §8.4 — precedence ──────────────────────────────────────────
@@ -1158,6 +1177,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     /// gpu_pos}` (§6.12's two-crate knobs — the llama half moved, S5 takes the Vulkan half).
     const S4: &[&str] = &[
         "INFR_CACHE",
+        "INFR_AUTO_PROFILE",
         "INFR_DECODE_CHAIN",
         "INFR_MOE_SIZE_CACHE_BIAS",
         "INFR_PROF_STAGES",

@@ -56,7 +56,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use ash::vk;
@@ -291,6 +291,287 @@ fn backend_physical_alloc_room(vram: VramInfo, tracked_used: u64) -> u64 {
     }
 }
 
+const AUTO_SUBMIT_INITIAL_CAP: usize = 16;
+const AUTO_SUBMIT_SAMPLES_PER_CAP: usize = 2;
+const AUTO_SUBMIT_MAX_ROUNDS: usize = 12;
+const AGGRESSIVE_SUBMIT_BUDGET_NS: u64 = 500_000_000;
+const AGGRESSIVE_SUBMIT_EXPLORE_CAP: usize = 256;
+
+#[derive(Clone, Copy, Debug)]
+struct SubmitAutoSettings {
+    profile: infr_core::config::AutoProfile,
+    initial_cap: usize,
+    samples_per_cap: usize,
+    max_rounds: usize,
+    budget_ns: u64,
+    explore_through_cap: usize,
+}
+
+impl SubmitAutoSettings {
+    fn for_profile(profile: infr_core::config::AutoProfile) -> Self {
+        match profile {
+            infr_core::config::AutoProfile::Conservative => Self {
+                profile,
+                initial_cap: AUTO_SUBMIT_INITIAL_CAP,
+                samples_per_cap: AUTO_SUBMIT_SAMPLES_PER_CAP,
+                max_rounds: AUTO_SUBMIT_MAX_ROUNDS,
+                budget_ns: infr_core::SUBMIT_BUDGET_NS,
+                explore_through_cap: AUTO_SUBMIT_INITIAL_CAP,
+            },
+            infr_core::config::AutoProfile::Aggressive => Self {
+                profile,
+                initial_cap: AUTO_SUBMIT_INITIAL_CAP,
+                samples_per_cap: AUTO_SUBMIT_SAMPLES_PER_CAP,
+                max_rounds: AUTO_SUBMIT_MAX_ROUNDS,
+                budget_ns: AGGRESSIVE_SUBMIT_BUDGET_NS,
+                explore_through_cap: AGGRESSIVE_SUBMIT_EXPLORE_CAP,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SubmitTimingToken {
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SubmitRoundStats {
+    gpu_ns: u64,
+    dispatches: usize,
+    submits: usize,
+    max_submit_ns: u64,
+}
+
+impl SubmitRoundStats {
+    fn add_submit(&mut self, gpu_ns: u64, dispatches: usize) {
+        self.submits = self.submits.saturating_add(1);
+        if dispatches == 0 {
+            return;
+        }
+        self.gpu_ns = self.gpu_ns.saturating_add(gpu_ns);
+        self.dispatches = self.dispatches.saturating_add(dispatches);
+        self.max_submit_ns = self.max_submit_ns.max(gpu_ns);
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.gpu_ns = self.gpu_ns.saturating_add(other.gpu_ns);
+        self.dispatches = self.dispatches.saturating_add(other.dispatches);
+        self.submits = self.submits.saturating_add(other.submits);
+        self.max_submit_ns = self.max_submit_ns.max(other.max_submit_ns);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubmitTuneStop {
+    NoSplit,
+    Budget,
+    Stable,
+    RoundLimit,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SubmitTuneUpdate {
+    cap: usize,
+    stop: Option<SubmitTuneStop>,
+}
+
+/// Finite, monotonic calibration policy for the automatic submit splitter.
+///
+/// Each cap is sampled for two complete forwards. Growth is geometric but bounded by the cap
+/// implied by measured GPU time, so calibration reaches the useful range quickly without ever
+/// jumping from the safe initial value to one noisy estimate. Once the cap no longer causes an
+/// extra split, converges on the GPU-time budget, or consumes the fixed round budget, it freezes.
+struct SubmitAutoPolicy {
+    settings: SubmitAutoSettings,
+    cap: usize,
+    stage: SubmitRoundStats,
+    all: SubmitRoundStats,
+    stage_rounds: usize,
+    stage_splits: usize,
+    total_rounds: usize,
+}
+
+impl SubmitAutoPolicy {
+    fn new(settings: SubmitAutoSettings) -> Self {
+        Self {
+            settings,
+            cap: settings.initial_cap,
+            stage: SubmitRoundStats::default(),
+            all: SubmitRoundStats::default(),
+            stage_rounds: 0,
+            stage_splits: 0,
+            total_rounds: 0,
+        }
+    }
+
+    fn observe_round(
+        &mut self,
+        round: SubmitRoundStats,
+        splitter_splits: usize,
+    ) -> SubmitTuneUpdate {
+        self.stage.merge(round);
+        self.all.merge(round);
+        self.stage_rounds += 1;
+        self.stage_splits = self.stage_splits.saturating_add(splitter_splits);
+        self.total_rounds += 1;
+
+        // A measured command buffer already exceeded the target. Tightening is safe even though
+        // the lower cap has not itself been sampled; unlike growth, it cannot create a longer job.
+        if self.stage.max_submit_ns > self.settings.budget_ns {
+            let scaled = ((self.cap as u128) * (self.settings.budget_ns as u128)
+                / (self.stage.max_submit_ns as u128)) as usize;
+            self.cap = scaled.clamp(self.settings.initial_cap, self.cap);
+            return SubmitTuneUpdate {
+                cap: self.cap,
+                stop: Some(SubmitTuneStop::Budget),
+            };
+        }
+
+        if self.stage_rounds < self.settings.samples_per_cap
+            && self.total_rounds < self.settings.max_rounds
+        {
+            return SubmitTuneUpdate {
+                cap: self.cap,
+                stop: None,
+            };
+        }
+
+        // The cap did not create a command-buffer boundary in either sample. A larger number
+        // cannot improve this graph, so retain the finite tested cap as protection for later,
+        // larger graph shapes and stop paying calibration overhead.
+        if self.stage_splits == 0 && self.cap >= self.settings.explore_through_cap {
+            return SubmitTuneUpdate {
+                cap: self.cap,
+                stop: Some(SubmitTuneStop::NoSplit),
+            };
+        }
+
+        let measured = infr_core::submit_cap_from_measurement_with_budget(
+            self.stage.gpu_ns,
+            self.stage.dispatches,
+            self.settings.budget_ns,
+        );
+        if measured != 0 && measured <= self.cap {
+            self.cap = measured.max(self.settings.initial_cap);
+            return SubmitTuneUpdate {
+                cap: self.cap,
+                stop: Some(SubmitTuneStop::Stable),
+            };
+        }
+        if self.total_rounds >= self.settings.max_rounds {
+            return SubmitTuneUpdate {
+                cap: self.cap,
+                stop: Some(SubmitTuneStop::RoundLimit),
+            };
+        }
+
+        let doubled = self.cap.saturating_mul(2);
+        self.cap = if measured == 0 {
+            doubled
+        } else {
+            doubled.min(measured)
+        };
+        self.stage = SubmitRoundStats::default();
+        self.stage_rounds = 0;
+        self.stage_splits = 0;
+        SubmitTuneUpdate {
+            cap: self.cap,
+            stop: None,
+        }
+    }
+}
+
+struct SubmitAutoTuner {
+    policy: SubmitAutoPolicy,
+    generation: u64,
+    owner: Option<std::thread::ThreadId>,
+    round: SubmitRoundStats,
+}
+
+impl SubmitAutoTuner {
+    fn new(settings: SubmitAutoSettings) -> Self {
+        Self {
+            policy: SubmitAutoPolicy::new(settings),
+            generation: 0,
+            owner: None,
+            round: SubmitRoundStats::default(),
+        }
+    }
+
+    fn begin_round(&mut self) -> Option<SubmitTimingToken> {
+        if self.owner.is_some() {
+            return None;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        self.owner = Some(std::thread::current().id());
+        self.round = SubmitRoundStats::default();
+        Some(SubmitTimingToken {
+            generation: self.generation,
+        })
+    }
+
+    fn token_for_current_thread(&self) -> Option<SubmitTimingToken> {
+        (self.owner == Some(std::thread::current().id())).then_some(SubmitTimingToken {
+            generation: self.generation,
+        })
+    }
+
+    fn record_submit(&mut self, token: SubmitTimingToken, gpu_ns: u64, dispatches: usize) {
+        if self.owner.is_some() && token.generation == self.generation {
+            self.round.add_submit(gpu_ns, dispatches);
+        }
+    }
+
+    fn finish_round(
+        &mut self,
+        token: SubmitTimingToken,
+        splitter_splits: usize,
+    ) -> Option<SubmitTuneUpdate> {
+        if self.owner.is_none() || token.generation != self.generation {
+            return None;
+        }
+        self.owner = None;
+        Some(
+            self.policy
+                .observe_round(std::mem::take(&mut self.round), splitter_splits),
+        )
+    }
+
+    fn cancel_round(&mut self, token: SubmitTimingToken) {
+        if self.owner.is_some() && token.generation == self.generation {
+            self.owner = None;
+            self.round = SubmitRoundStats::default();
+        }
+    }
+}
+
+pub(crate) struct SubmitTuneRound {
+    shared: Arc<VulkanShared>,
+    token: Option<SubmitTimingToken>,
+    cap: usize,
+}
+
+impl SubmitTuneRound {
+    pub(crate) fn cap(&self) -> usize {
+        self.cap
+    }
+
+    pub(crate) fn finish(mut self, splitter_splits: usize) {
+        if let Some(token) = self.token.take() {
+            self.shared.finish_submit_tune_round(token, splitter_splits);
+        }
+    }
+}
+
+impl Drop for SubmitTuneRound {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.shared.cancel_submit_tune_round(token);
+        }
+    }
+}
+
 struct VulkanShared {
     // NOTE: field declaration order matters for drop.
     // Rust drops struct fields in *declaration order*.  We keep `allocator`
@@ -318,6 +599,9 @@ struct VulkanShared {
     recorder_desc_pools: Mutex<Vec<vk::DescriptorPool>>,
     /// Completed fences from non-blocking recorder submissions. They are reset on acquisition.
     recorder_fences: Mutex<Vec<vk::Fence>>,
+    /// Two-timestamp query pools used only during finite submit-cap calibration. Recycled across
+    /// recorder segments; after calibration they remain idle until backend teardown.
+    recorder_submit_query_pools: Mutex<Vec<vk::QueryPool>>,
     /// Must be dropped before the device is destroyed.
     allocator: ManuallyDrop<Mutex<Allocator>>,
     caps: Capabilities,
@@ -409,16 +693,21 @@ struct VulkanShared {
     /// work: the segments still run back-to-back on the queue (`finish_nowait`, no host sync), the
     /// watchdog just gets N short jobs to watch instead of one long one.
     ///
-    /// Seeded from `infr_core::initial_submit_dispatch_cap` (unlimited on discrete — a dGPU
-    /// forward is tens of ms and must not pay for barriers it does not need) and then RE-TUNED
-    /// from measurement after every forward (`infr_core::submit_cap_from_measurement`), so the
-    /// bound tracks whatever the device actually is rather than a table of magic numbers.
+    /// Automatic mode starts at 16 and samples real GPU command-buffer time for a finite number
+    /// of complete forwards. It grows conservatively, then freezes permanently. An explicit
+    /// `device.submit_dispatches` value bypasses calibration (`0` remains no splitting).
     submit_dispatch_cap: AtomicUsize,
     /// Whether `submit_dispatch_cap` came from `device.submit_dispatches`
     /// (`INFR_SUBMIT_DISPATCHES` / `--set`) rather than the automatic initial default. When true,
     /// feedback must not re-tune the cap: `0` is an explicit no-split experiment, and `N > 0` is a
     /// fixed cap experiment.
     submit_dispatch_cap_explicit: bool,
+    /// Fast gate checked once when a transient recorder is created. False for explicit overrides,
+    /// unsupported timestamp queues, and forever after the finite calibration has stopped.
+    submit_tune_active: AtomicBool,
+    submit_auto_tuner: Mutex<Option<SubmitAutoTuner>>,
+    submit_timestamp_period_ns: f32,
+    submit_timestamp_valid_bits: u32,
     /// UNIFIED-MEMORY parts only (`None` on every discrete GPU): the host-visible memory type on
     /// the non-device-local heap that `GpuOnly` allocations SPILL into once the device-local heap
     /// is full. See [`probe_host_visible_non_device_local_type`] for why counting that heap in the
@@ -639,6 +928,173 @@ impl VulkanShared {
             pc.maybe_save(&self.device, self.pipeline_cache);
         }
     }
+
+    fn replay_submit_dispatch_cap(&self) -> usize {
+        if self.submit_dispatch_cap_explicit {
+            self.submit_dispatch_cap.load(Ordering::Relaxed)
+        } else {
+            infr_core::initial_submit_dispatch_cap(self.caps.integrated)
+        }
+    }
+
+    fn begin_submit_tune_round(self: &Arc<Self>) -> SubmitTuneRound {
+        let token = if self.submit_tune_active.load(Ordering::Acquire) {
+            self.submit_auto_tuner
+                .lock()
+                .unwrap()
+                .as_mut()
+                .and_then(SubmitAutoTuner::begin_round)
+        } else {
+            None
+        };
+        SubmitTuneRound {
+            shared: Arc::clone(self),
+            token,
+            cap: self.submit_dispatch_cap.load(Ordering::Relaxed),
+        }
+    }
+
+    fn cancel_submit_tune_round(&self, token: SubmitTimingToken) {
+        if let Some(tuner) = self.submit_auto_tuner.lock().unwrap().as_mut() {
+            tuner.cancel_round(token);
+        }
+    }
+
+    fn finish_submit_tune_round(&self, token: SubmitTimingToken, splitter_splits: usize) {
+        let result = {
+            let mut guard = self.submit_auto_tuner.lock().unwrap();
+            let Some(tuner) = guard.as_mut() else {
+                return;
+            };
+            tuner
+                .finish_round(token, splitter_splits)
+                .map(|update| (update, tuner.policy.total_rounds, tuner.policy.all))
+        };
+        let Some((update, rounds, all)) = result else {
+            return;
+        };
+        self.submit_dispatch_cap
+            .store(update.cap, Ordering::Relaxed);
+        let Some(stop) = update.stop else {
+            return;
+        };
+        self.submit_tune_active.store(false, Ordering::Release);
+        let reason = match stop {
+            SubmitTuneStop::NoSplit => "the cap no longer creates extra submits",
+            SubmitTuneStop::Budget => "a measured submit reached the GPU-time budget",
+            SubmitTuneStop::Stable => "the measured GPU-time target converged",
+            SubmitTuneStop::RoundLimit => "the calibration round limit was reached",
+        };
+        let avg_dispatch_us = if all.dispatches == 0 {
+            0.0
+        } else {
+            all.gpu_ns as f64 / all.dispatches as f64 / 1e3
+        };
+        tracing::info!(
+            "[infr] submit splitter calibrated: split/{} after {} forward(s), {} timed submit(s), \
+             {:.2} us/dispatch average, {:.2} ms longest submit; {}. The cap is now fixed for \
+             this process.",
+            update.cap,
+            rounds,
+            all.submits,
+            avg_dispatch_us,
+            all.max_submit_ns as f64 / 1e6,
+            reason,
+        );
+    }
+
+    fn submit_timing_token(&self) -> Option<SubmitTimingToken> {
+        if !self.submit_tune_active.load(Ordering::Acquire) {
+            return None;
+        }
+        self.submit_auto_tuner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(SubmitAutoTuner::token_for_current_thread)
+    }
+
+    pub(crate) fn take_submit_timing_query(&self) -> Option<(vk::QueryPool, SubmitTimingToken)> {
+        let token = self.submit_timing_token()?;
+        let pool = match self.recorder_submit_query_pools.lock().unwrap().pop() {
+            Some(pool) => pool,
+            None => match unsafe {
+                self.device.create_query_pool(
+                    &vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::TIMESTAMP)
+                        .query_count(2),
+                    None,
+                )
+            } {
+                Ok(pool) => pool,
+                Err(e) => {
+                    self.disable_submit_tuning(&format!("could not create timestamp query: {e}"));
+                    return None;
+                }
+            },
+        };
+        Some((pool, token))
+    }
+
+    pub(crate) fn return_submit_timing_query(&self, pool: vk::QueryPool) {
+        if pool != vk::QueryPool::null() {
+            self.recorder_submit_query_pools.lock().unwrap().push(pool);
+        }
+    }
+
+    pub(crate) fn resolve_submit_timing_query(
+        &self,
+        pool: vk::QueryPool,
+        token: SubmitTimingToken,
+        dispatches: usize,
+    ) {
+        let mut ticks = [0u64; 2];
+        let result = unsafe {
+            self.device.get_query_pool_results(
+                pool,
+                0,
+                &mut ticks,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+            )
+        };
+        self.return_submit_timing_query(pool);
+        if let Err(e) = result {
+            self.disable_submit_tuning(&format!("could not read timestamp query: {e}"));
+            return;
+        }
+
+        let delta = ticks[1].wrapping_sub(ticks[0]);
+        let valid_delta = if self.submit_timestamp_valid_bits >= 64 {
+            delta
+        } else {
+            delta & ((1u64 << self.submit_timestamp_valid_bits) - 1)
+        };
+        let gpu_ns = (valid_delta as f64 * self.submit_timestamp_period_ns as f64) as u64;
+        if let Some(tuner) = self.submit_auto_tuner.lock().unwrap().as_mut() {
+            tuner.record_submit(token, gpu_ns, dispatches);
+        }
+    }
+
+    fn disable_submit_tuning(&self, reason: &str) {
+        if !self.submit_tune_active.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let fallback = infr_core::initial_submit_dispatch_cap(self.caps.integrated);
+        self.submit_dispatch_cap.store(fallback, Ordering::Relaxed);
+        if let Some(tuner) = self.submit_auto_tuner.lock().unwrap().as_mut() {
+            tuner.owner = None;
+            tuner.round = SubmitRoundStats::default();
+        }
+        tracing::warn!(
+            "[infr] automatic submit calibration disabled ({reason}); using the conservative \
+             platform fallback {}",
+            if fallback == 0 {
+                "without splitting".to_owned()
+            } else {
+                format!("split/{fallback}")
+            },
+        );
+    }
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -670,6 +1126,9 @@ impl Drop for VulkanShared {
             }
             for fence in self.recorder_fences.lock().unwrap().drain(..) {
                 self.device.destroy_fence(fence, None);
+            }
+            for pool in self.recorder_submit_query_pools.lock().unwrap().drain(..) {
+                self.device.destroy_query_pool(pool, None);
             }
             // Destroy command pool.
             let pool = *self.cmd_pool.lock().unwrap();
@@ -2039,6 +2498,8 @@ impl VulkanBackend {
             .position(|p| p.queue_flags.contains(vk::QueueFlags::COMPUTE))
             .map(|i| i as u32)
             .ok_or_else(|| be("no compute queue family found"))?;
+        let submit_timestamp_valid_bits =
+            qf_props[queue_family_index as usize].timestamp_valid_bits;
 
         // ── probe device extensions ────────────────────────────────────────────
         let avail_exts = unsafe { instance.enumerate_device_extension_properties(physical_device) }
@@ -2848,16 +3309,48 @@ impl VulkanBackend {
             },
             caps.max_shared_memory_bytes / 1024,
         );
-        // Submit splitter (see `VulkanShared::submit_dispatch_cap`): the initial, pre-measurement
-        // cap. `device.submit_dispatches` (`INFR_SUBMIT_DISPATCHES`) overrides it (`0` = never
-        // split) — the kill switch if this ever misjudges a device. A non-numeric value is still
-        // rejected loudly, now by the env layer, with the SAME text
-        // (`ConfigError::Env` renders as `INFR_SUBMIT_DISPATCHES: expected a dispatch count …`).
+        // Submit splitter (see `VulkanShared::submit_dispatch_cap`). An explicit value is fixed
+        // (`0` = never split). Automatic mode starts at the safe floor and samples actual GPU
+        // command-buffer duration for a bounded number of forwards before freezing permanently.
         let submit_dispatch_cap_explicit = cfg.device.submit_dispatches.is_some();
-        let submit_dispatch_cap = cfg
-            .device
-            .submit_dispatches
-            .unwrap_or_else(|| infr_core::initial_submit_dispatch_cap(caps.integrated));
+        let submit_timestamp_period_ns = props.limits.timestamp_period;
+        let submit_auto_supported = !submit_dispatch_cap_explicit
+            && submit_timestamp_valid_bits > 0
+            && submit_timestamp_period_ns.is_finite()
+            && submit_timestamp_period_ns > 0.0;
+        let submit_auto_settings = SubmitAutoSettings::for_profile(cfg.device.auto_profile);
+        let submit_dispatch_cap = cfg.device.submit_dispatches.unwrap_or_else(|| {
+            if submit_auto_supported {
+                submit_auto_settings.initial_cap
+            } else {
+                infr_core::initial_submit_dispatch_cap(caps.integrated)
+            }
+        });
+        let submit_auto_tuner =
+            submit_auto_supported.then(|| SubmitAutoTuner::new(submit_auto_settings));
+        if submit_auto_supported {
+            tracing::info!(
+                "[infr] submit splitter: {} automatic GPU calibration starts at split/{}; {} \
+                 sample(s) per cap, explores through split/{}, targets {:.0} ms GPU time, at \
+                 most {} forwards, then the cap freezes",
+                submit_auto_settings.profile,
+                submit_auto_settings.initial_cap,
+                submit_auto_settings.samples_per_cap,
+                submit_auto_settings.explore_through_cap,
+                submit_auto_settings.budget_ns as f64 / 1e6,
+                submit_auto_settings.max_rounds,
+            );
+        } else if !submit_dispatch_cap_explicit {
+            tracing::warn!(
+                "[infr] compute queue exposes no usable Vulkan timestamps; automatic submit \
+                 calibration is unavailable, using {}",
+                if submit_dispatch_cap == 0 {
+                    "no splitting".to_owned()
+                } else {
+                    format!("split/{submit_dispatch_cap}")
+                },
+            );
+        }
         // Integrated GPUs run a DIFFERENT shape of forward (smaller prefill chunk, and the whole
         // pass split across several submits so no single command buffer can trip the GPU's hang
         // watchdog), so say so out loud: it is the first thing to check when an iGPU run hangs or
@@ -2985,6 +3478,7 @@ impl VulkanBackend {
                 recorder_cmds: Mutex::new(Vec::new()),
                 recorder_desc_pools: Mutex::new(Vec::new()),
                 recorder_fences: Mutex::new(Vec::new()),
+                recorder_submit_query_pools: Mutex::new(Vec::new()),
                 allocator: ManuallyDrop::new(Mutex::new(allocator)),
                 caps,
                 device_arch,
@@ -3008,6 +3502,10 @@ impl VulkanBackend {
                 act_peak: AtomicU64::new(0),
                 submit_dispatch_cap: AtomicUsize::new(submit_dispatch_cap),
                 submit_dispatch_cap_explicit,
+                submit_tune_active: AtomicBool::new(submit_auto_supported),
+                submit_auto_tuner: Mutex::new(submit_auto_tuner),
+                submit_timestamp_period_ns,
+                submit_timestamp_valid_bits,
                 uma_overflow_type,
                 host_overflow_type,
                 kv_spill: SpillTally::default(),
@@ -3423,67 +3921,25 @@ impl VulkanBackend {
     }
 
     /// The submit splitter's current cap — see `VulkanShared::submit_dispatch_cap`. `0` =
-    /// unlimited (record the whole forward into one command buffer, the discrete default).
+    /// unlimited. Automatic mode changes this only during its bounded startup calibration.
     pub(crate) fn submit_dispatch_cap(&self) -> usize {
         self.shared.submit_dispatch_cap.load(Ordering::Relaxed)
     }
 
-    /// Feed a completed forward's measurement back into the submit splitter: `elapsed` of wall
-    /// across `dispatches` dispatches, measured with the queue drained at both ends. Re-tunes the
-    /// cap so the NEXT forward's segments land inside `infr_core::SUBMIT_BUDGET_NS` on whatever
-    /// device this actually is — the loop that makes the splitter hardware-agnostic instead of a
-    /// table of per-GPU constants.
-    ///
-    /// The cap only ever RATCHETS DOWN within a process. A forward's wall time is a noisy sample
-    /// (a cold pipeline compile, a busy host, a first-touch page fault all inflate it), and the
-    /// asymmetry of the two mistakes is total: too small a cap costs a few extra submits, too
-    /// large a cap costs a device-lost. So a slow sample tightens the bound and a fast one is
-    /// simply ignored.
-    pub(crate) fn observe_forward(&self, elapsed: std::time::Duration, dispatches: usize) {
-        if self.shared.submit_dispatch_cap_explicit {
-            return;
-        }
-        let ns = elapsed.as_nanos() as u64;
-        let cur = self.submit_dispatch_cap();
-        // A device that has never split (every discrete GPU) only starts splitting if a forward
-        // actually lands in watchdog territory — see `infr_core::SUBMIT_DANGER_NS`. Without this,
-        // the measured cap (finite, just very large) would eventually split a big enough graph on
-        // a perfectly healthy dGPU, which is a tuned path this has no business touching.
-        if cur == 0 && ns < infr_core::SUBMIT_DANGER_NS {
-            return;
-        }
-        let want = infr_core::submit_cap_from_measurement(ns, dispatches);
-        if want == 0 {
-            return; // measurement says "no split needed"; never loosen an existing cap on it
-        }
-        let next = if cur == 0 { want } else { cur.min(want) };
-        if next != cur {
-            self.shared
-                .submit_dispatch_cap
-                .store(next, Ordering::Relaxed);
-            // SAY IT OUT LOUD when a never-split device starts splitting. This transition is
-            // latched (the cap only ratchets down) and it is decided by ONE wall-clock sample, so
-            // a slow first forward — a cold pipeline build, a loaded host — permanently changes
-            // the submit structure of every later forward in the process. Two runs of the same
-            // command can therefore differ in submit count while dispatching byte-identical
-            // kernels, which is invisible in `INFR_PROF_OPS` and looks exactly like unexplained
-            // benchmark variance. `infr bench` reports the final cap for the same reason.
-            if cur == 0 {
-                tracing::warn!(
-                    "[infr] submit splitter ARMED: a forward took {:.0} ms over {dispatches} \
-                     dispatches (past the {} ms danger threshold), so forwards now split every \
-                     {next} dispatches for the rest of this process. Set \
-                     INFR_SUBMIT_DISPATCHES=0 to disable.",
-                    ns as f64 / 1e6,
-                    infr_core::SUBMIT_DANGER_NS / 1_000_000,
-                );
-            }
-        }
+    pub(crate) fn begin_submit_tune_round(&self) -> SubmitTuneRound {
+        self.shared.begin_submit_tune_round()
+    }
+
+    /// Persistent decode is recorded once and cannot follow a cap that changes during startup.
+    /// Keep its established platform default in automatic mode; explicit overrides still apply
+    /// exactly. Static/paged execution uses the independently calibrated current cap above.
+    pub(crate) fn replay_submit_dispatch_cap(&self) -> usize {
+        self.shared.replay_submit_dispatch_cap()
     }
 
     /// The submit splitter's cap as it stands NOW, for reporting (`infr bench`'s result line).
-    /// `0` = unlimited, i.e. one command buffer per forward — see [`Self::observe_forward`] for
-    /// why this is worth printing next to a throughput number.
+    /// `0` = unlimited. During the bounded startup calibration this is the cap currently sampled;
+    /// afterwards it is immutable and directly comparable across benchmark runs.
     pub fn submit_cap_now(&self) -> usize {
         self.submit_dispatch_cap()
     }
@@ -5567,14 +6023,11 @@ impl Backend for VulkanBackend {
         self.with_unified_exclusive(|| adapter::execute(self, plan, bindings))
     }
 
-    /// See `Backend::max_decode_chain`. A device that needs its FORWARD split into several
-    /// submits (`submit_dispatch_cap` — every integrated part measured so far) cannot also afford
-    /// to pack several decode steps into one: a decode graph is hundreds of dispatches, i.e.
-    /// already at or past that cap on its own, so the honest bound there is a chain of ONE. A
-    /// device that never splits (every discrete GPU) keeps the unbounded default, and the tuned
-    /// chained-decode fast path is untouched.
+    /// See `Backend::max_decode_chain`. Persistent decode keeps the established platform cap
+    /// because its command buffers are recorded once and cannot be rebuilt while static submits
+    /// run through their finite startup calibration.
     fn max_decode_chain(&self) -> usize {
-        if self.submit_dispatch_cap() == 0 {
+        if self.replay_submit_dispatch_cap() == 0 {
             usize::MAX
         } else {
             1
@@ -6013,6 +6466,88 @@ mod tests {
     use super::*;
     use infr_core::Backend;
 
+    fn submit_sample(gpu_ns: u64, dispatches: usize) -> SubmitRoundStats {
+        SubmitRoundStats {
+            gpu_ns,
+            dispatches,
+            submits: 1,
+            max_submit_ns: gpu_ns,
+        }
+    }
+
+    fn submit_policy(profile: infr_core::config::AutoProfile) -> SubmitAutoPolicy {
+        SubmitAutoPolicy::new(SubmitAutoSettings::for_profile(profile))
+    }
+
+    #[test]
+    fn submit_auto_policy_samples_then_grows_geometrically() {
+        let mut policy = submit_policy(infr_core::config::AutoProfile::Conservative);
+        let sample = submit_sample(16_000_000, 160); // 100 us/dispatch, far below budget
+
+        let first = policy.observe_round(sample, 1);
+        assert_eq!((first.cap, first.stop), (16, None));
+        let second = policy.observe_round(sample, 1);
+        assert_eq!((second.cap, second.stop), (32, None));
+
+        assert_eq!(policy.observe_round(sample, 1).cap, 32);
+        let fourth = policy.observe_round(sample, 1);
+        assert_eq!((fourth.cap, fourth.stop), (64, None));
+    }
+
+    #[test]
+    fn submit_auto_policy_freezes_when_cap_stops_splitting() {
+        let mut policy = submit_policy(infr_core::config::AutoProfile::Conservative);
+        let sample = submit_sample(2_000_000, 12);
+        assert_eq!(policy.observe_round(sample, 0).stop, None);
+        let done = policy.observe_round(sample, 0);
+        assert_eq!(done.cap, AUTO_SUBMIT_INITIAL_CAP);
+        assert_eq!(done.stop, Some(SubmitTuneStop::NoSplit));
+    }
+
+    #[test]
+    fn aggressive_submit_auto_policy_explores_past_small_startup_graphs() {
+        let mut policy = submit_policy(infr_core::config::AutoProfile::Aggressive);
+        let sample = submit_sample(2_000_000, 12);
+        let mut update = SubmitTuneUpdate {
+            cap: policy.cap,
+            stop: None,
+        };
+        for _ in 0..10 {
+            update = policy.observe_round(sample, 0);
+            if update.stop.is_some() {
+                break;
+            }
+        }
+        assert_eq!(update.cap, AGGRESSIVE_SUBMIT_EXPLORE_CAP);
+        assert_eq!(update.stop, Some(SubmitTuneStop::NoSplit));
+    }
+
+    #[test]
+    fn submit_auto_policy_tightens_immediately_on_over_budget_submit() {
+        let mut policy = submit_policy(infr_core::config::AutoProfile::Conservative);
+        policy.cap = 64;
+        let done = policy.observe_round(submit_sample(500_000_000, 64), 1);
+        assert_eq!(done.cap, 32);
+        assert_eq!(done.stop, Some(SubmitTuneStop::Budget));
+    }
+
+    #[test]
+    fn submit_auto_policy_has_a_finite_calibration_window() {
+        let mut policy = submit_policy(infr_core::config::AutoProfile::Conservative);
+        let sample = submit_sample(1_000, 1_000);
+        let mut done = None;
+        for _ in 0..AUTO_SUBMIT_MAX_ROUNDS {
+            let update = policy.observe_round(sample, 1);
+            if update.stop.is_some() {
+                done = Some(update);
+                break;
+            }
+        }
+        let done = done.expect("the tuner must stop at its fixed round limit");
+        assert_eq!(done.stop, Some(SubmitTuneStop::RoundLimit));
+        assert_eq!(policy.total_rounds, AUTO_SUBMIT_MAX_ROUNDS);
+    }
+
     #[test]
     fn fallback_vram_room_subtracts_tracked_allocations() {
         const GIB: u64 = 1 << 30;
@@ -6414,8 +6949,8 @@ mod tests {
         );
     }
 
-    /// `device.submit_dispatches` (`INFR_SUBMIT_DISPATCHES`) overrides the measured initial submit
-    /// cap, `0` meaning "never split"; unset keeps `initial_submit_dispatch_cap(integrated)`.
+    /// `device.submit_dispatches` (`INFR_SUBMIT_DISPATCHES`) bypasses automatic calibration, with
+    /// `0` meaning "never split" and a positive number remaining fixed.
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn config_submit_dispatches_overrides_the_splitter_cap() {
@@ -6428,17 +6963,25 @@ mod tests {
         let integrated = dflt.caps().integrated;
         assert_eq!(
             dflt.submit_dispatch_cap(),
+            if dflt.shared.submit_tune_active.load(Ordering::Acquire) {
+                AUTO_SUBMIT_INITIAL_CAP
+            } else {
+                infr_core::initial_submit_dispatch_cap(integrated)
+            }
+        );
+        assert_eq!(
+            dflt.replay_submit_dispatch_cap(),
             infr_core::initial_submit_dispatch_cap(integrated)
         );
         drop(dflt);
         let fixed = build(Some(7));
-        fixed.observe_forward(std::time::Duration::from_secs(2), 1_000);
         assert_eq!(fixed.submit_dispatch_cap(), 7);
+        assert!(!fixed.shared.submit_tune_active.load(Ordering::Acquire));
         drop(fixed);
 
         let disabled = build(Some(0));
-        disabled.observe_forward(std::time::Duration::from_secs(2), 1_000);
         assert_eq!(disabled.submit_dispatch_cap(), 0, "0 = no split");
+        assert!(!disabled.shared.submit_tune_active.load(Ordering::Acquire));
     }
 
     #[test]

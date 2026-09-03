@@ -934,6 +934,11 @@ pub struct Recorder<'a> {
     /// (`kind:mM:KxN`) instead of the bare kernel name. Read once at construction.
     op_shapes: bool,
     query_pool: vk::QueryPool,
+    /// Whole-command-buffer timestamps used only while the automatic submit cap is calibrating.
+    /// Unlike `query_pool`, this has exactly two queries and remains compatible with nowait
+    /// submission; ownership moves to `PendingSegment` until its fence is collected.
+    submit_query_pool: std::cell::Cell<vk::QueryPool>,
+    submit_timing_token: std::cell::Cell<Option<crate::SubmitTimingToken>>,
     ts_labels: RefCell<Vec<&'static str>>,
     /// Dispatches past the query-pool capacity: counted (and reported) instead of stamped.
     ts_dropped: std::cell::Cell<usize>,
@@ -1106,6 +1111,26 @@ impl<'a> Recorder<'a> {
             vk::QueryPool::null()
         };
 
+        let (submit_query_pool, submit_timing_token) = if !persistent {
+            backend.shared.take_submit_timing_query().map_or(
+                (vk::QueryPool::null(), None),
+                |(pool, token)| {
+                    unsafe {
+                        device.cmd_reset_query_pool(cmd, pool, 0, 2);
+                        device.cmd_write_timestamp(
+                            cmd,
+                            vk::PipelineStageFlags::TOP_OF_PIPE,
+                            pool,
+                            0,
+                        );
+                    }
+                    (pool, Some(token))
+                },
+            )
+        } else {
+            (vk::QueryPool::null(), None)
+        };
+
         Ok(Self {
             be: backend,
             cmd,
@@ -1123,6 +1148,8 @@ impl<'a> Recorder<'a> {
             prof_ops,
             op_shapes,
             query_pool,
+            submit_query_pool: std::cell::Cell::new(submit_query_pool),
+            submit_timing_token: std::cell::Cell::new(submit_timing_token),
             ts_labels: RefCell::new(Vec::new()),
             ts_dropped: std::cell::Cell::new(0),
             next_label: std::cell::Cell::new(None),
@@ -11307,7 +11334,34 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Free the recorder's transient Vulkan objects: the query pool (if any), command buffer and
+    fn close_submit_timing(&self) {
+        let pool = self.submit_query_pool.get();
+        if pool != vk::QueryPool::null() {
+            unsafe {
+                self.be.shared.device.cmd_write_timestamp(
+                    self.cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    pool,
+                    1,
+                );
+            }
+        }
+    }
+
+    fn resolve_submit_timing(&self, dispatches: usize) {
+        let pool = self.submit_query_pool.replace(vk::QueryPool::null());
+        let token = self.submit_timing_token.take();
+        match (pool != vk::QueryPool::null(), token) {
+            (true, Some(token)) => self
+                .be
+                .shared
+                .resolve_submit_timing_query(pool, token, dispatches),
+            (true, None) => self.be.shared.return_submit_timing_query(pool),
+            _ => {}
+        }
+    }
+
+    /// Free the recorder's transient Vulkan objects: query pools (if any), command buffer and
     /// every descriptor-pool tranche. Idempotence lets explicit finish/error paths clean up at the
     /// exact point they stop using the objects while [`Drop`] remains the backstop for any other
     /// recording-time `?` or unwind.
@@ -11322,6 +11376,9 @@ impl<'a> Recorder<'a> {
                 device.destroy_query_pool(self.query_pool, None);
             }
         }
+        let submit_pool = self.submit_query_pool.replace(vk::QueryPool::null());
+        self.submit_timing_token.set(None);
+        self.be.shared.return_submit_timing_query(submit_pool);
         self.be.shared.recorder_cmds.lock().unwrap().push(self.cmd);
         self.be
             .shared
@@ -11351,6 +11408,7 @@ impl<'a> Recorder<'a> {
                 );
             }
         }
+        self.close_submit_timing();
         // Each fallible step frees the transient objects before propagating — see `free_transient`.
         if let Err(e) = unsafe { device.end_command_buffer(self.cmd) } {
             self.free_transient();
@@ -11389,6 +11447,7 @@ impl<'a> Recorder<'a> {
         if self.prof_ops {
             self.report_timestamps();
         }
+        self.resolve_submit_timing(dispatches);
         self.free_transient();
         Ok(())
     }
@@ -11435,6 +11494,8 @@ impl<'a> Recorder<'a> {
                 cmd: vk::CommandBuffer::null(),
                 pools: Vec::new(),
                 buffer_keepalive: Vec::new(),
+                submit_query_pool: vk::QueryPool::null(),
+                submit_timing_token: None,
                 dispatches,
             });
         }
@@ -11442,6 +11503,7 @@ impl<'a> Recorder<'a> {
         // On SUCCESS the cmd buffer + pools are handed to the returned `PendingSegment` (freed in
         // its `wait`); on every ERROR exit we still own them and free them immediately. `Drop`
         // remains the backstop for any future early-return path.
+        self.close_submit_timing();
         if let Err(e) = unsafe { device.end_command_buffer(self.cmd) } {
             self.free_transient();
             return Err(be(format!("end cmd: {e}")));
@@ -11478,6 +11540,8 @@ impl<'a> Recorder<'a> {
         let shared = std::sync::Arc::clone(&self.be.shared);
         let pools = self.pools.borrow().clone();
         let buffer_keepalive = std::mem::take(&mut *self.buffer_keepalive.borrow_mut());
+        let submit_query_pool = self.submit_query_pool.replace(vk::QueryPool::null());
+        let submit_timing_token = self.submit_timing_token.take();
         self.owns_transient.set(false);
         Ok(PendingSegment {
             shared,
@@ -11485,6 +11549,8 @@ impl<'a> Recorder<'a> {
             cmd: self.cmd,
             pools,
             buffer_keepalive,
+            submit_query_pool,
+            submit_timing_token,
             dispatches,
         })
     }
@@ -11542,6 +11608,7 @@ impl<'a> Recorder<'a> {
             return Err(be(format!("end cmd: {e}")));
         }
         debug_assert_eq!(self.query_pool, vk::QueryPool::null());
+        debug_assert_eq!(self.submit_query_pool.get(), vk::QueryPool::null());
         let pools = self.pools.borrow().clone();
         self.owns_transient.set(false);
         Ok(RecordedSegment {
@@ -11697,10 +11764,7 @@ impl RecordedCmd {
     /// recording only exists on a splitting device whose decode already EXCEEDS the cap, so this
     /// returns 1 there — `replay_n` never packs copies of a split decode.
     pub fn max_chain(&self) -> usize {
-        let cap = self
-            .shared
-            .submit_dispatch_cap
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let cap = self.shared.replay_submit_dispatch_cap();
         if cap == 0 || self.dispatches == 0 {
             return usize::MAX;
         }
@@ -11799,8 +11863,11 @@ pub struct PendingSegment {
     pools: Vec<vk::DescriptorPool>,
     /// Temporary transfer buffers referenced by `cmd`; released only after `fence` signals.
     buffer_keepalive: Vec<std::sync::Arc<dyn Buffer>>,
-    /// Dispatches this segment carried — the submit splitter sums them across a forward to feed
-    /// `VulkanBackend::observe_forward`.
+    /// Automatic submit calibration query state. Both are empty after calibration, on explicit
+    /// caps, and on the already-drained profiling compatibility path.
+    submit_query_pool: vk::QueryPool,
+    submit_timing_token: Option<crate::SubmitTimingToken>,
+    /// Dispatches this segment carried; consumed by the submit profiler and finite GPU tuner.
     dispatches: usize,
 }
 
@@ -11836,6 +11903,20 @@ impl PendingSegment {
         let waited = unsafe { device.wait_for_fences(&[fence], true, u64::MAX) };
         if let Some(elapsed) = pager_profile::elapsed(wait_t0) {
             pager_profile::record_sync_wait(pager_profile::SyncKind::Fence, elapsed);
+        }
+        let submit_pool = std::mem::replace(&mut self.submit_query_pool, vk::QueryPool::null());
+        let submit_token = self.submit_timing_token.take();
+        if submit_pool != vk::QueryPool::null() {
+            if waited.is_ok() {
+                if let Some(token) = submit_token {
+                    self.shared
+                        .resolve_submit_timing_query(submit_pool, token, self.dispatches);
+                } else {
+                    self.shared.return_submit_timing_query(submit_pool);
+                }
+            } else {
+                self.shared.return_submit_timing_query(submit_pool);
+            }
         }
         self.shared.recorder_fences.lock().unwrap().push(fence);
         self.shared.recorder_cmds.lock().unwrap().push(self.cmd);

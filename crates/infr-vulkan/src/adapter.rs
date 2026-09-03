@@ -5790,9 +5790,8 @@ pub(crate) fn execute_chain(
     // advanced past the tokens it produced. Returning None hands the caller back to its per-token
     // path, which re-draws for the position it actually reaches.
     //
-    // Normally unreachable — the caller's own clamp already collapses the chain to 1 on any
-    // splitting device — but the cap is re-tuned from measurement (`observe_forward`) and can flip
-    // under a concurrent request between that clamp and this call.
+    // Normally unreachable: the caller clamps with the same persistent-replay cap. Keep the exact
+    // command-level check as a backstop for callers that bypass that hint.
     if n > replay.recorded.max_chain() {
         return Ok(None);
     }
@@ -5849,7 +5848,7 @@ fn record_decode_replay(
     // instead of one long one. This preserves the `_dyn`/params/ring decode semantics exactly — the
     // identical dispatch stream is just distributed across command buffers, with a seeded global
     // barrier at each continuation segment's head carrying the cross-segment ordering.
-    let cap = be_.submit_dispatch_cap();
+    let cap = be_.replay_submit_dispatch_cap();
     let mut segments: Vec<crate::recorder::RecordedSegment> = Vec::new();
     let mut rec = be_.recorder_persistent()?;
     // Device-side position stream: seed params to [pos0-1, pos0] and record a one-thread
@@ -6175,6 +6174,10 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     // blocks (the small-m split's router readback) when residency actually demands it — see
     // `PagedStream`'s doc. Every non-paged graph (the overwhelming common case) never touches any
     // of this and records exactly like before — one recorder, one submit.
+    // Automatic submit calibration owns one complete execute as a sample. Open it before the
+    // first recorder so pager-driven recorder rotations are included in the same GPU-time round.
+    let submit_tune_round = be_.begin_submit_tune_round();
+    let cap = submit_tune_round.cap();
     let mut rec = Some(be_.recorder()?);
     let mode = RopeMode::Static(&rope_pos);
     let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
@@ -6189,11 +6192,10 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     // default) bounds the dispatches per command buffer; segments are submitted WITHOUT waiting
     // and run back-to-back on the queue, so the GPU sees the same uninterrupted stream of work —
     // only the watchdog's view changes, from one long job to several short ones.
-    let cap = be_.submit_dispatch_cap();
     let pager_prof = infr_core::pager_profile::active();
     let submit_before = pager_prof.then(infr_core::pager_profile::queue_submit_count);
-    let t_forward = std::time::Instant::now();
     let mut submitted_dispatches = 0usize;
+    let mut splitter_splits = 0usize;
     /// In-flight segments allowed at once. Each one pins a command buffer plus its descriptor
     /// pools until the GPU is done reading them, and the devices that split are exactly the
     /// memory-tight ones — letting every segment of a forward pile up (6+ on a Qwen3-8B prefill
@@ -6246,6 +6248,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         // share transient scratch, and the hazard tracking that orders them is per-recorder.
         // Crossing the cap therefore closes the segment at the next op boundary.
         if cap > 0 && rec.as_ref().is_some_and(|r| r.dispatches() >= cap) {
+            splitter_splits += 1;
             let seg = rec
                 .take()
                 .expect("segment always Some between ops")
@@ -6378,9 +6381,10 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         // drained. It is now safe to release superseded capacities from this execute.
         pool.finish_execute();
     }
-    // Feed this forward back into the splitter: `finish` waited the queue idle, so the elapsed
-    // time now covers every segment's GPU execution. See `VulkanBackend::observe_forward`.
-    be_.observe_forward(t_forward.elapsed(), submitted_dispatches);
+    // Every recorder and pager-owned pending segment has now resolved its two GPU timestamps.
+    // Fold this complete sample into the finite auto-tuner; dropping the guard on an earlier error
+    // cancels the partial round instead.
+    submit_tune_round.finish(splitter_splits);
     if let Some(before) = submit_before {
         let submits = infr_core::pager_profile::queue_submit_count().saturating_sub(before);
         infr_core::pager_profile::record_splitter_forward(
