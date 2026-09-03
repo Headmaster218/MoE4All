@@ -4,7 +4,7 @@
 //! mapped targets take the direct write fast path, while ordinary device-local targets use a
 //! host-visible staging allocation and `vkCmdCopyBuffer`.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use ash::vk;
 use gpu_allocator::MemoryLocation;
@@ -33,18 +33,24 @@ pub(crate) trait TransferExecutor: Sync {
     ) -> Result<()>;
 }
 
-/// Immutable transport bindings for one loaded model session. Hardware capabilities are probed
-/// while the Vulkan backend is created and host allocations are imported exactly once at session
-/// finalization. Runtime uploads only locate their source inside these frozen ranges and execute
-/// the already-established target route.
+/// Transport bindings for one loaded model session. Hardware capabilities are probed while the
+/// Vulkan backend is created and host allocations are imported at session finalization. Runtime
+/// uploads only locate their source inside these ranges and execute the established target route.
+///
+/// The table is normally immutable. Its write side exists solely for the rare queue-submit OOM
+/// recovery path, which retires unused imported tails after a queue drain. Prepared/in-flight
+/// copies retain their source buffers independently, so shrinking the table cannot invalidate a
+/// command that has already been recorded.
 #[derive(Default)]
 pub(crate) struct SessionTransferPlan {
-    imports: Vec<ImportedHostAllocation>,
+    imports: RwLock<Vec<ImportedHostAllocation>>,
 }
 
 impl SessionTransferPlan {
     pub(crate) fn new(imports: Vec<ImportedHostAllocation>) -> Self {
-        Self { imports }
+        Self {
+            imports: RwLock::new(imports),
+        }
     }
 
     /// Add one host-to-device request to `prepared`. Imported host ranges become Vulkan buffer
@@ -114,9 +120,45 @@ impl SessionTransferPlan {
 
     fn imported_ranges(&self, src: &[u8]) -> Option<Vec<crate::ImportedHostRange>> {
         self.imports
+            .read()
+            .unwrap()
             .iter()
             .find(|import| import.contains(src.as_ptr(), src.len()))
             .and_then(|import| import.ranges(src.as_ptr(), src.len()))
+    }
+
+    /// Release up to `target_bytes` of imported-host aliases without touching any source buffer
+    /// retained by a prepared or in-flight command. Imports cover contiguous prefixes, so only a
+    /// physical tail shard can be retired while keeping all earlier source addresses valid.
+    pub(crate) fn shed_unused_import_tails(&self, target_bytes: usize) -> usize {
+        let mut imports = self.imports.write().unwrap();
+        let mut released = 0usize;
+        while released < target_bytes {
+            let candidate = imports
+                .iter()
+                .enumerate()
+                .filter_map(|(index, import)| {
+                    let shard = import.shards.last()?;
+                    (Arc::strong_count(&shard.buffer) == 1).then_some((index, shard.len))
+                })
+                .max_by_key(|&(_, len)| len);
+            let Some((index, _)) = candidate else {
+                break;
+            };
+            let shard = imports[index]
+                .shards
+                .pop()
+                .expect("candidate import has a tail shard");
+            debug_assert_eq!(
+                shard.offset.saturating_add(shard.len),
+                imports[index].imported_len
+            );
+            imports[index].imported_len = shard.offset;
+            released = released.saturating_add(shard.len);
+            drop(shard);
+        }
+        imports.retain(|import| !import.shards.is_empty());
+        released
     }
 
     pub(crate) fn upload_now<E: TransferExecutor>(
@@ -579,5 +621,61 @@ mod tests {
 
         let unrelated = vec![0u8; 16];
         assert!(plan.imported_ranges(&unrelated).is_none());
+    }
+
+    #[test]
+    fn shedding_an_idle_import_tail_preserves_the_remaining_prefix() {
+        let host = vec![0u8; 64];
+        let plan = SessionTransferPlan::new(vec![ImportedHostAllocation {
+            base: host.as_ptr() as usize,
+            logical_len: host.len(),
+            imported_len: host.len(),
+            shards: vec![
+                ImportedHostShard {
+                    offset: 0,
+                    len: 32,
+                    buffer: Arc::new(DummyBuffer(32)),
+                },
+                ImportedHostShard {
+                    offset: 32,
+                    len: 32,
+                    buffer: Arc::new(DummyBuffer(32)),
+                },
+            ],
+        }]);
+
+        assert_eq!(plan.shed_unused_import_tails(1), 32);
+        assert!(plan.imported_ranges(&host[..32]).is_some());
+        assert!(plan.imported_ranges(&host[32..48]).is_none());
+    }
+
+    #[test]
+    fn shedding_does_not_release_a_tail_retained_by_a_command() {
+        let host = vec![0u8; 64];
+        let tail: Arc<dyn Buffer> = Arc::new(DummyBuffer(32));
+        let command_keepalive = Arc::clone(&tail);
+        let plan = SessionTransferPlan::new(vec![ImportedHostAllocation {
+            base: host.as_ptr() as usize,
+            logical_len: host.len(),
+            imported_len: host.len(),
+            shards: vec![
+                ImportedHostShard {
+                    offset: 0,
+                    len: 32,
+                    buffer: Arc::new(DummyBuffer(32)),
+                },
+                ImportedHostShard {
+                    offset: 32,
+                    len: 32,
+                    buffer: tail,
+                },
+            ],
+        }]);
+
+        assert_eq!(plan.shed_unused_import_tails(32), 0);
+        assert!(plan.imported_ranges(&host[32..]).is_some());
+        drop(command_keepalive);
+        assert_eq!(plan.shed_unused_import_tails(32), 32);
+        assert!(plan.imported_ranges(&host[32..]).is_none());
     }
 }

@@ -1836,8 +1836,8 @@ impl MoePagerSession {
         std::mem::take(&mut self.pending_transfer_sources)
     }
 
-    pub(crate) fn install_transfer_plan(&mut self, plan: SessionTransferPlan) {
-        self.transfer_plan = Arc::new(plan);
+    pub(crate) fn install_transfer_plan(&mut self, plan: Arc<SessionTransferPlan>) {
+        self.transfer_plan = plan;
     }
 
     pub(crate) fn prefill_host_worker_ready(&self) -> bool {

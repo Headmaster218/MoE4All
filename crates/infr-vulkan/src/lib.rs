@@ -56,8 +56,8 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use ash::vk;
 use gpu_allocator::vulkan::{
@@ -302,6 +302,14 @@ struct VulkanShared {
     device: ash::Device,
     queue: vk::Queue,
     queue_family_index: u32,
+    /// Vulkan requires host access to one queue to be externally synchronized. It also turns the
+    /// rare submit-OOM recovery into one atomic drain/retry boundary across the graph and Prefill
+    /// upload threads without changing GPU submission order.
+    queue_access: Mutex<()>,
+    /// First unrecoverable queue-submit result, or `SUCCESS` while submissions are usable. Pager
+    /// residency is resolved before its copies are submitted, so allowing a later request after an
+    /// ultimately failed submit could turn those unexecuted copies into false cache hits.
+    queue_submit_failure: AtomicI32,
     /// Serialises all one-shot command-buffer submissions.
     cmd_pool: Mutex<vk::CommandPool>,
     /// Completed transient recorder command buffers. Acquisition resets one before recording.
@@ -352,6 +360,10 @@ struct VulkanShared {
     /// pager's one existing allocation; it does not create a GTT mirror or consume the VRAM budget.
     external_memory_host: Option<ash::ext::external_memory_host::Device>,
     host_import_alignment: usize,
+    /// The transport plan shared with the pager. Keeping this handle below the pager abstraction
+    /// lets queue-submit recovery shed unused imported-host aliases without taking the pager lock
+    /// or changing logical residency state.
+    session_transfer_plan: RwLock<Option<Weak<crate::transfer::SessionTransferPlan>>>,
     /// `VK_KHR_external_semaphore_fd` loader — exports/imports a semaphore fd so a tensor-parallel
     /// all-reduce can order a peer's read after this device's GPU-side signal with no host round-trip
     /// (`AllReduceMode::P2pSemaphore`). `None` = the all-reduce uses the host fence (`queue_wait_idle`)
@@ -432,6 +444,27 @@ struct VulkanShared {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl VulkanShared {
+    fn queue_submit_failure(&self) -> Option<vk::Result> {
+        let raw = self.queue_submit_failure.load(Ordering::Acquire);
+        (raw != vk::Result::SUCCESS.as_raw()).then(|| vk::Result::from_raw(raw))
+    }
+
+    fn make_queue_unusable(&self, error: vk::Result, context: &str) -> vk::Result {
+        self.queue_submit_failure
+            .compare_exchange(
+                vk::Result::SUCCESS.as_raw(),
+                error.as_raw(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok();
+        tracing::error!(
+            "[infr] {context} could not be submitted after recovery ({error}); refusing later GPU \
+             submissions because pager residency may describe copies that never executed"
+        );
+        error
+    }
+
     /// Wait for every in-flight staging copy and tear the ring down. Called when the weight-load
     /// scope ends, so all weights are fully resident before any forward is recorded — this is the
     /// synchronization point that replaced the old per-tensor `queue_wait_idle`.
@@ -461,6 +494,141 @@ impl VulkanShared {
 // accessed through our Mutexes.
 unsafe impl Send for VulkanShared {}
 unsafe impl Sync for VulkanShared {}
+
+const QUEUE_SUBMIT_OOM_RETRY_DELAYS_MS: [u64; 3] = [10, 50, 200];
+const QUEUE_SUBMIT_POST_SHED_DELAYS_MS: [u64; 2] = [100, 250];
+const HOST_DMA_SHED_STEP_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+fn retryable_queue_submit_error(error: vk::Result) -> bool {
+    matches!(
+        error,
+        vk::Result::ERROR_OUT_OF_DEVICE_MEMORY | vk::Result::ERROR_OUT_OF_HOST_MEMORY
+    )
+}
+
+impl VulkanShared {
+    fn queue_submit_once(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: vk::Fence,
+        profile_dispatches: Option<usize>,
+    ) -> std::result::Result<(), vk::Result> {
+        let started = profile_dispatches
+            .filter(|_| infr_core::pager_profile::active())
+            .map(|_| std::time::Instant::now());
+        let result = unsafe { self.device.queue_submit(self.queue, submits, fence) };
+        if let (Some(dispatches), Some(t0)) = (profile_dispatches, started) {
+            infr_core::pager_profile::record_queue_submit(dispatches, t0.elapsed());
+        }
+        result
+    }
+
+    fn drain_queue_for_submit_retry(&self) -> std::result::Result<(), vk::Result> {
+        let started = infr_core::pager_profile::active().then(std::time::Instant::now);
+        let result = unsafe { self.device.queue_wait_idle(self.queue) };
+        if let Some(t0) = started {
+            infr_core::pager_profile::record_sync_wait(
+                infr_core::pager_profile::SyncKind::QueueIdle,
+                t0.elapsed(),
+            );
+        }
+        result
+    }
+
+    fn shed_host_dma_imports(&self, target_bytes: usize) -> usize {
+        let plan = self
+            .session_transfer_plan
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade);
+        plan.map_or(0, |plan| plan.shed_unused_import_tails(target_bytes))
+    }
+
+    /// Submit one already-ended command buffer batch. OOM leaves Vulkan resources untouched, so
+    /// the exact command can first be retried after draining older work. If WDDM pressure persists,
+    /// retire unused imported-host tails in bounded steps; recorded sources remain alive through
+    /// the command's own keepalive references and future uploads transparently use staging.
+    pub(crate) fn queue_submit_recovering(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: vk::Fence,
+        profile_dispatches: Option<usize>,
+        context: &str,
+    ) -> std::result::Result<(), vk::Result> {
+        let _queue = self.queue_access.lock().unwrap();
+        if let Some(error) = self.queue_submit_failure() {
+            return Err(error);
+        }
+        let mut attempts = 1usize;
+        let mut last = match self.queue_submit_once(submits, fence, profile_dispatches) {
+            Ok(()) => return Ok(()),
+            Err(error) if retryable_queue_submit_error(error) => error,
+            Err(error) => return Err(self.make_queue_unusable(error, context)),
+        };
+
+        for delay_ms in QUEUE_SUBMIT_OOM_RETRY_DELAYS_MS {
+            tracing::warn!(
+                "[infr] {context} hit {last}; draining queued work and retrying submit after {delay_ms} ms"
+            );
+            if let Err(error) = self.drain_queue_for_submit_retry() {
+                return Err(self.make_queue_unusable(error, context));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            attempts += 1;
+            match self.queue_submit_once(submits, fence, profile_dispatches) {
+                Ok(()) => {
+                    tracing::warn!(
+                        "[infr] {context} recovered after {attempts} queue-submit attempts"
+                    );
+                    return Ok(());
+                }
+                Err(error) if retryable_queue_submit_error(error) => last = error,
+                Err(error) => return Err(self.make_queue_unusable(error, context)),
+            }
+        }
+
+        for delay_ms in QUEUE_SUBMIT_POST_SHED_DELAYS_MS {
+            if let Err(error) = self.drain_queue_for_submit_retry() {
+                return Err(self.make_queue_unusable(error, context));
+            }
+            let released = self.shed_host_dma_imports(HOST_DMA_SHED_STEP_BYTES);
+            if released == 0 {
+                tracing::warn!(
+                    "[infr] {context} still cannot submit and no idle Host DMA tail mapping can be released"
+                );
+                break;
+            }
+            tracing::warn!(
+                "[infr] {context} still cannot submit; released {:.2} GiB of idle Host DMA mappings and will retry after {delay_ms} ms",
+                released as f64 / (1u64 << 30) as f64,
+            );
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            attempts += 1;
+            match self.queue_submit_once(submits, fence, profile_dispatches) {
+                Ok(()) => {
+                    tracing::warn!(
+                        "[infr] {context} recovered after {attempts} queue-submit attempts"
+                    );
+                    return Ok(());
+                }
+                Err(error) if retryable_queue_submit_error(error) => last = error,
+                Err(error) => return Err(self.make_queue_unusable(error, context)),
+            }
+        }
+        Err(self.make_queue_unusable(last, context))
+    }
+
+    pub(crate) fn queue_wait_idle_serialized(&self) -> std::result::Result<(), vk::Result> {
+        let _queue = self.queue_access.lock().unwrap();
+        unsafe { self.device.queue_wait_idle(self.queue) }
+    }
+
+    fn device_wait_idle_serialized(&self) -> std::result::Result<(), vk::Result> {
+        let _queue = self.queue_access.lock().unwrap();
+        unsafe { self.device.device_wait_idle() }
+    }
+}
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl VulkanShared {
@@ -2811,6 +2979,8 @@ impl VulkanBackend {
                 device,
                 queue,
                 queue_family_index,
+                queue_access: Mutex::new(()),
+                queue_submit_failure: AtomicI32::new(vk::Result::SUCCESS.as_raw()),
                 cmd_pool: Mutex::new(cmd_pool),
                 recorder_cmds: Mutex::new(Vec::new()),
                 recorder_desc_pools: Mutex::new(Vec::new()),
@@ -2827,6 +2997,7 @@ impl VulkanBackend {
                 has_dma_buf: has_ext_mem_dma_buf,
                 external_memory_host,
                 host_import_alignment,
+                session_transfer_plan: RwLock::new(None),
                 external_semaphore_fd,
                 kernels: Mutex::new(HashMap::new()),
                 pipeline_cache,
@@ -3345,6 +3516,7 @@ impl VulkanBackend {
     /// already read true by the time that closure's placeholder buffers are bound). Replaces any
     /// previous session (there is only ever one loaded model per process today).
     pub fn init_moe_pager(&self, layout: crate::pager::MoePagerLayout) -> Result<()> {
+        *self.shared.session_transfer_plan.write().unwrap() = None;
         let session = crate::pager::MoePagerSession::new(self, layout)?;
         *self.moe_pager.lock().unwrap() = Some(session);
         Ok(())
@@ -5000,8 +5172,13 @@ impl VulkanBackend {
 
                 let cmds = [cmd];
                 let submit = vk::SubmitInfo::default().command_buffers(&cmds);
-                device
-                    .queue_submit(self.shared.queue, &[submit], ring.fences[i])
+                self.shared
+                    .queue_submit_recovering(
+                        &[submit],
+                        ring.fences[i],
+                        None,
+                        "staging-ring queue_submit",
+                    )
                     .map_err(|e| be(format!("staging ring queue_submit: {e}")))?;
             }
             ring.busy[i] = true;
@@ -5093,10 +5270,12 @@ impl VulkanBackend {
 
         let cmds = [cmd];
         let submit = vk::SubmitInfo::default().command_buffers(&cmds);
-        unsafe { device.queue_submit(self.shared.queue, &[submit], vk::Fence::null()) }
+        self.shared
+            .queue_submit_recovering(&[submit], vk::Fence::null(), None, "one-shot queue_submit")
             .map_err(|e| be(format!("queue_submit: {e}")))?;
 
-        unsafe { device.queue_wait_idle(self.shared.queue) }
+        self.shared
+            .queue_wait_idle_serialized()
             .map_err(|e| be(format!("queue_wait_idle: {e}")))?;
 
         Ok(())
@@ -5412,7 +5591,8 @@ impl Backend for VulkanBackend {
     }
 
     fn sync(&self) -> Result<()> {
-        unsafe { self.shared.device.device_wait_idle() }
+        self.shared
+            .device_wait_idle_serialized()
             .map_err(|e| be(format!("device_wait_idle: {e}")))
     }
 
@@ -5456,13 +5636,14 @@ impl Backend for VulkanBackend {
             .map(crate::pager::MoePagerSession::take_transfer_sources)
             .unwrap_or_default();
         if !sources.is_empty() {
-            let plan = self.build_session_transfer_plan(sources);
+            let plan = Arc::new(self.build_session_transfer_plan(sources));
             self.moe_pager
                 .lock()
                 .unwrap()
                 .as_mut()
                 .expect("MoE pager disappeared during session finalization")
-                .install_transfer_plan(plan);
+                .install_transfer_plan(Arc::clone(&plan));
+            *self.shared.session_transfer_plan.write().unwrap() = Some(Arc::downgrade(&plan));
         }
         Ok(())
     }
@@ -5856,6 +6037,18 @@ mod tests {
             live.alloc_room(),
             "a live heap budget already nets out tracked allocations"
         );
+    }
+
+    #[test]
+    fn only_queue_submit_memory_pressure_is_retryable() {
+        assert!(retryable_queue_submit_error(
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+        ));
+        assert!(retryable_queue_submit_error(
+            vk::Result::ERROR_OUT_OF_HOST_MEMORY
+        ));
+        assert!(!retryable_queue_submit_error(vk::Result::ERROR_DEVICE_LOST));
+        assert!(!retryable_queue_submit_error(vk::Result::ERROR_UNKNOWN));
     }
 
     #[test]

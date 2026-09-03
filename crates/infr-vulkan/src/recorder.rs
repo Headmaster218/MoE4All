@@ -11351,30 +11351,25 @@ impl<'a> Recorder<'a> {
                 );
             }
         }
-        let queue = self.be.shared.queue;
         // Each fallible step frees the transient objects before propagating — see `free_transient`.
         if let Err(e) = unsafe { device.end_command_buffer(self.cmd) } {
             self.free_transient();
             return Err(be(format!("end cmd: {e}")));
         }
         let prof = pager_profile::active();
-        let submit_t0 = prof.then(std::time::Instant::now);
-        let submit = unsafe {
-            device.queue_submit(
-                queue,
-                &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd))],
-                vk::Fence::null(),
-            )
-        };
-        if let Some(t0) = submit_t0 {
-            pager_profile::record_queue_submit(dispatches, t0.elapsed());
-        }
+        let submits = [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd))];
+        let submit = self.be.shared.queue_submit_recovering(
+            &submits,
+            vk::Fence::null(),
+            Some(dispatches),
+            "forward queue_submit",
+        );
         if let Err(e) = submit {
             self.free_transient();
             return Err(be(format!("queue_submit: {e}")));
         }
         let wait_t0 = prof.then(std::time::Instant::now);
-        let wait = unsafe { device.queue_wait_idle(queue) };
+        let wait = self.be.shared.queue_wait_idle_serialized();
         if let Some(t0) = wait_t0 {
             pager_profile::record_sync_wait(pager_profile::SyncKind::QueueIdle, t0.elapsed());
         }
@@ -11468,18 +11463,13 @@ impl<'a> Recorder<'a> {
                 }
             },
         };
-        let prof = pager_profile::active();
-        let submit_t0 = prof.then(std::time::Instant::now);
-        let submit = unsafe {
-            device.queue_submit(
-                self.be.shared.queue,
-                &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd))],
-                fence,
-            )
-        };
-        if let Some(t0) = submit_t0 {
-            pager_profile::record_queue_submit(dispatches, t0.elapsed());
-        }
+        let submits = [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd))];
+        let submit = self.be.shared.queue_submit_recovering(
+            &submits,
+            fence,
+            Some(dispatches),
+            "pipelined queue_submit",
+        );
         if let Err(e) = submit {
             self.be.shared.recorder_fences.lock().unwrap().push(fence);
             self.free_transient();
@@ -11733,23 +11723,18 @@ impl RecordedCmd {
             }
             return Ok(());
         };
-        let device = &self.shared.device;
         let cmds = vec![seg.cmd; n];
         let prof = pager_profile::active();
-        let submit_t0 = prof.then(std::time::Instant::now);
-        let submit = unsafe {
-            device.queue_submit(
-                self.shared.queue,
-                &[vk::SubmitInfo::default().command_buffers(&cmds)],
-                vk::Fence::null(),
-            )
-        };
-        if let Some(t0) = submit_t0 {
-            pager_profile::record_queue_submit(seg.dispatches * n, t0.elapsed());
-        }
+        let submits = [vk::SubmitInfo::default().command_buffers(&cmds)];
+        let submit = self.shared.queue_submit_recovering(
+            &submits,
+            vk::Fence::null(),
+            Some(seg.dispatches * n),
+            "decode replay_n queue_submit",
+        );
         submit.map_err(|e| be(format!("replay_n submit: {e}")))?;
         let wait_t0 = prof.then(std::time::Instant::now);
-        let wait = unsafe { device.queue_wait_idle(self.shared.queue) };
+        let wait = self.shared.queue_wait_idle_serialized();
         if let Some(t0) = wait_t0 {
             pager_profile::record_sync_wait(pager_profile::SyncKind::QueueIdle, t0.elapsed());
         }
@@ -11765,24 +11750,20 @@ impl RecordedCmd {
     /// submitted earlier on the same queue). A discrete GPU has exactly ONE segment, so this is a
     /// single submit + wait — byte-identical to the record-once fast path.
     pub fn replay(&self) -> Result<()> {
-        let device = &self.shared.device;
         let prof = pager_profile::active();
         for seg in &self.segments {
-            let submit_t0 = prof.then(std::time::Instant::now);
-            let submit = unsafe {
-                device.queue_submit(
-                    self.shared.queue,
-                    &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&seg.cmd))],
-                    vk::Fence::null(),
-                )
-            };
-            if let Some(t0) = submit_t0 {
-                pager_profile::record_queue_submit(seg.dispatches, t0.elapsed());
-            }
+            let submits =
+                [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&seg.cmd))];
+            let submit = self.shared.queue_submit_recovering(
+                &submits,
+                vk::Fence::null(),
+                Some(seg.dispatches),
+                "decode replay queue_submit",
+            );
             submit.map_err(|e| be(format!("replay submit: {e}")))?;
         }
         let wait_t0 = prof.then(std::time::Instant::now);
-        let wait = unsafe { device.queue_wait_idle(self.shared.queue) };
+        let wait = self.shared.queue_wait_idle_serialized();
         if let Some(t0) = wait_t0 {
             pager_profile::record_sync_wait(pager_profile::SyncKind::QueueIdle, t0.elapsed());
         }
@@ -11794,10 +11775,7 @@ impl RecordedCmd {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Drop for RecordedCmd {
     fn drop(&mut self) {
-        let device = &self.shared.device;
-        unsafe {
-            let _ = device.queue_wait_idle(self.shared.queue);
-        }
+        let _ = self.shared.queue_wait_idle_serialized();
         for seg in &self.segments {
             self.shared.recorder_cmds.lock().unwrap().push(seg.cmd);
             self.shared

@@ -186,11 +186,12 @@ impl VulkanBackend {
             .command_buffers(&cmds)
             .signal_semaphores(&sems)
             .push_next(&mut tl);
-        if let Err(e) = unsafe {
-            self.shared
-                .device
-                .queue_submit(self.shared.queue, &[submit], vk::Fence::null())
-        } {
+        if let Err(e) = self.shared.queue_submit_recovering(
+            &[submit],
+            vk::Fence::null(),
+            None,
+            "tp copy-signal queue_submit",
+        ) {
             // Submit failed → the cmd never runs; free it so it does not leak the shared pool.
             self.tp_free_cmds(&[cmd]);
             return Err(be(format!("tp_submit_copy_signal queue_submit: {e}")));
@@ -224,11 +225,12 @@ impl VulkanBackend {
             .wait_semaphores(&wait_sems)
             .wait_dst_stage_mask(&wait_stages)
             .push_next(&mut tl);
-        if let Err(e) = unsafe {
-            self.shared
-                .device
-                .queue_submit(self.shared.queue, &[submit], vk::Fence::null())
-        } {
+        if let Err(e) = self.shared.queue_submit_recovering(
+            &[submit],
+            vk::Fence::null(),
+            None,
+            "tp copy-wait queue_submit",
+        ) {
             self.tp_free_cmds(&[cmd]);
             return Err(be(format!("tp_submit_copies_wait queue_submit: {e}")));
         }
@@ -266,11 +268,9 @@ impl VulkanBackend {
     fn tp_submit_wait_free(&self, cmd: vk::CommandBuffer, what: &str) -> Result<()> {
         let cmds = [cmd];
         let submit = vk::SubmitInfo::default().command_buffers(&cmds);
-        let r = unsafe {
-            self.shared
-                .device
-                .queue_submit(self.shared.queue, &[submit], vk::Fence::null())
-        };
+        let r = self
+            .shared
+            .queue_submit_recovering(&[submit], vk::Fence::null(), None, what);
         if let Err(e) = r {
             self.tp_free_cmds(&[cmd]);
             return Err(be(format!("{what} queue_submit: {e}")));
@@ -390,7 +390,8 @@ impl VulkanBackend {
     /// wait per all-reduce, after which the summed partials in scratch are safe for the reduce
     /// dispatch to read. All the cross-device ordering already happened GPU-side on the semaphores.
     pub fn tp_queue_wait_idle(&self) -> Result<()> {
-        unsafe { self.shared.device.queue_wait_idle(self.shared.queue) }
+        self.shared
+            .queue_wait_idle_serialized()
             .map_err(|e| be(format!("tp_queue_wait_idle: {e}")))
     }
 
