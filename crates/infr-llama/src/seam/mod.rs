@@ -175,8 +175,13 @@ fn cpu_paged_store(
         .sum();
     let available = infr_core::hostmem::available_bytes();
     let process_resident = infr_core::hostmem::process_resident_bytes();
-    let arena_plan =
-        infr_core::hostmem::cpu_arena_plan(ram_request, available, process_resident, pageable);
+    let arena_plan = infr_core::hostmem::cpu_arena_plan_for_profile(
+        ec.device.auto_profile,
+        ram_request,
+        available,
+        process_resident,
+        pageable,
+    );
     let cache_bytes = match arena_plan {
         infr_core::hostmem::ArenaPlan::Take(bytes) => bytes,
         _ => 0,
@@ -291,7 +296,8 @@ fn vulkan_host_tier(
     let available = infr_core::hostmem::available_bytes();
     let process_resident = infr_core::hostmem::process_resident_bytes();
     let pageable: u64 = classes.iter().map(|&(s, n)| (s * n) as u64).sum();
-    let arena_plan = infr_core::hostmem::streaming_arena_plan(
+    let arena_plan = infr_core::hostmem::streaming_arena_plan_for_profile(
+        ec.device.auto_profile,
         ram_request,
         available,
         process_resident,
@@ -1039,7 +1045,9 @@ pub(crate) fn ubatch_rows(ec: &EngineConfig) -> usize {
             },
         )
     });
-    let selected = configured.or(placed).unwrap_or_else(default_ubatch_rows);
+    let selected = configured
+        .or(placed)
+        .unwrap_or_else(|| default_ubatch_rows(ec.device.auto_profile));
     match moe_cap {
         Some(cap) => selected.min(cap),
         None => selected,
@@ -1053,14 +1061,15 @@ pub(crate) fn user_pinned_ubatch(ec: &EngineConfig) -> bool {
     ec.device.ubatch_specified
 }
 
-/// The SHRINK ladder the dense placement sweeps walk when the default prefill chunk's activation
-/// reserve is what tips a model out of residency: 512 → 256 → 128 rows. A shorter chunk shrinks
+/// The SHRINK ladder the dense placement sweeps walk when the selected prefill chunk's activation
+/// reserve is what tips a model out of residency: 2048 → 1024 → 512 → 256 → 128 rows. A shorter
+/// chunk shrinks
 /// both the activation reserve (whole-chunk scratch scales with rows) and the SWA ring rows
 /// (`window + chunk`), and resident-at-512 decodes ~10x faster than streaming at the PCIe ceiling
 /// — so trading prefill chunk height for residency is strictly the right call.
 ///
 /// 128 is the floor: below it the per-dispatch launch overhead dominates prefill entirely.
-pub(crate) const DENSE_UBATCH_LADDER: [usize; 3] = [512, 256, 128];
+pub(crate) const DENSE_UBATCH_LADDER: [usize; 4] = [1024, 512, 256, 128];
 
 /// Every prefill chunk height a dense placement decision is allowed to settle on, TALLEST FIRST:
 /// the current/default height ([`ubatch_rows`]) followed by the [`DENSE_UBATCH_LADDER`] rungs
@@ -1099,18 +1108,22 @@ fn moe_ubatch_fallback_candidates(ec: &EngineConfig) -> Vec<usize> {
     candidates
 }
 
-/// The prefill chunk when neither INFR_UBATCH nor the placement sweep pinned one: 1024 rows, EXCEPT
-/// on an integrated GPU, where a chunk that big is a single multi-second command buffer and trips
+/// The prefill chunk when neither INFR_UBATCH nor the placement sweep pinned one: 1024 rows in the
+/// conservative profile and 2048 in the aggressive profile, EXCEPT on an integrated GPU, where a
+/// chunk that big is a single multi-second command buffer and trips
 /// the ~10 s GPU watchdog (`ring gfx_0.0.0 timeout` -> `VK_ERROR_DEVICE_LOST`). See
 /// [`infr_core::integrated_ubatch_rows`] for the measurements behind the smaller default.
 ///
 /// A DISCRETE device (and a CPU/Metal run, where no Vulkan backend was constructed and
-/// `device_class()` is `None`) takes the 1024 branch — byte-identical to before this existed, so
-/// no tuned dGPU shape moves.
-fn default_ubatch_rows() -> usize {
+/// `device_class()` is `None`) uses the profile default. Conservative remains byte-identical to
+/// the pre-profile behavior.
+fn default_ubatch_rows(profile: infr_core::config::AutoProfile) -> usize {
     match infr_vulkan::device_class() {
         Some(d) if d.integrated => infr_core::integrated_ubatch_rows(d.compute_units),
-        _ => 1024,
+        _ => match profile {
+            infr_core::config::AutoProfile::Conservative => 1024,
+            infr_core::config::AutoProfile::Aggressive => 2048,
+        },
     }
 }
 
@@ -2165,6 +2178,9 @@ const WINDOWS_LARGE_REBAR_LOAD_DRIVER_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
 /// reliable first launch over the last few Expert slots. An explicit total VRAM budget/reserve
 /// remains authoritative and opts out of this extra policy margin.
 const WINDOWS_LARGE_REBAR_AUTO_STARTUP_RESERVE: u64 = 1024 * 1024 * 1024;
+/// The performance profile still keeps half of the observed cold-start fluctuation. The live
+/// allocation-feedback retry remains the final authority if this tighter margin proves optimistic.
+const WINDOWS_LARGE_REBAR_AGGRESSIVE_STARTUP_RESERVE: u64 = 512 * 1024 * 1024;
 
 fn load_driver_reserve(cfg: &Config) -> u64 {
     if cfg.deepseek4 {
@@ -2182,7 +2198,14 @@ fn session_load_driver_reserve(cfg: &Config, ec: &EngineConfig) -> u64 {
         && ec.device.vram_budget.is_none()
         && ec.device.vram_reserve.is_none()
     {
-        WINDOWS_LARGE_REBAR_AUTO_STARTUP_RESERVE
+        match ec.device.auto_profile {
+            infr_core::config::AutoProfile::Conservative => {
+                WINDOWS_LARGE_REBAR_AUTO_STARTUP_RESERVE
+            }
+            infr_core::config::AutoProfile::Aggressive => {
+                WINDOWS_LARGE_REBAR_AGGRESSIVE_STARTUP_RESERVE
+            }
+        }
     } else {
         0
     };
@@ -5391,6 +5414,14 @@ mod seam_helper_tests {
             "no pin, no iGPU: the 1024 default"
         );
 
+        let mut aggressive = EngineConfig::default();
+        aggressive.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
+        assert_eq!(
+            super::ubatch_rows(&aggressive),
+            2048,
+            "the aggressive discrete default uses a larger prefill chunk"
+        );
+
         let pinned = EngineConfig {
             device: infr_core::config::DeviceCfg {
                 ubatch: Some(512),
@@ -6593,10 +6624,17 @@ mod seam_helper_tests {
     #[test]
     fn dense_ubatch_ladder_is_the_only_one() {
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
-        assert_eq!(super::DENSE_UBATCH_LADDER, [512, 256, 128]);
+        assert_eq!(super::DENSE_UBATCH_LADDER, [1024, 512, 256, 128]);
         let unset = EngineConfig::default();
         assert_eq!(super::ubatch_rows(&unset), 1024);
         assert_eq!(super::ubatch_candidates(&unset), vec![1024, 512, 256, 128]);
+
+        let mut aggressive = EngineConfig::default();
+        aggressive.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
+        assert_eq!(
+            super::ubatch_candidates(&aggressive),
+            vec![2048, 1024, 512, 256, 128]
+        );
 
         // Rungs at or above the current height are filtered out — a SHRINK ladder must never
         // raise an integrated GPU past its watchdog-safe default.
@@ -6811,6 +6849,16 @@ mod seam_helper_tests {
         assert_eq!(
             super::session_load_driver_reserve(&cfg, &automatic),
             if cfg!(windows) { 3 * GIB } else { 0 }
+        );
+        let mut aggressive = EngineConfig::default();
+        aggressive.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
+        assert_eq!(
+            super::session_load_driver_reserve(&cfg, &aggressive),
+            if cfg!(windows) {
+                2 * GIB + 512 * MIB
+            } else {
+                0
+            }
         );
         let mut explicit = EngineConfig::default();
         explicit.device.vram_reserve = Some(infr_core::SizeSpec::Bytes(512 * MIB));
