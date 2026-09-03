@@ -84,8 +84,11 @@ Start-INFR-Wizard.cmd
 
 Choose interactive terminal chat, the OpenAI-compatible API, or benchmark
 mode, then paste or drag the GGUF path into the open model prompt. Automatic
-configuration is recommended: MoE4All detects the GPU, available VRAM, system
-memory, model structure, KV requirements, runtime space, and expert cache.
+configuration in the conservative profile is recommended: MoE4All detects the
+GPU, available VRAM, system memory, model structure, KV requirements, runtime
+space, and expert cache. The aggressive profile keeps automatic detection and
+hard resource guards, but uses tighter RAM/VRAM headroom and explores larger
+Ubatch and submit-splitter caps.
 
 At startup, the wizard makes a short request to check the latest GitHub
 Release. It only displays a download link when an update exists and never

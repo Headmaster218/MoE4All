@@ -447,15 +447,27 @@ $launchMode = Read-Choice -Label '你想做什么？/ What would you like to do?
 )
 $modelPath = Select-ModelPath -InitialPath $InitialModelPath
 
-$setupModeDefault = 'quick'
+$setupModeDefault = 'conservative'
 if ($null -ne $script:Saved) {
     $savedSetupMode = $script:Saved.PSObject.Properties['setup_mode']
     # States written by the older all-advanced wizard keep their previous behavior after upgrade.
-    $setupModeDefault = if ($null -eq $savedSetupMode) { 'advanced' } else { [string]$savedSetupMode.Value }
+    $setupModeDefault = if ($null -eq $savedSetupMode) {
+        'manual'
+    } else {
+        switch ([string]$savedSetupMode.Value) {
+            'quick' { 'conservative' }
+            'advanced' { 'manual' }
+            'conservative' { 'conservative' }
+            'aggressive' { 'aggressive' }
+            'manual' { 'manual' }
+            default { 'conservative' }
+        }
+    }
 }
 $setupMode = Read-Choice -Label '配置方式 / Configuration' -DefaultValue $setupModeDefault -Options @(
-    [pscustomobject]@{ Key = '1'; Value = 'quick'; Label = '自动配置（推荐）/ Automatic setup (recommended)' }
-    [pscustomobject]@{ Key = '2'; Value = 'advanced'; Label = '高级设置 / Advanced settings' }
+    [pscustomobject]@{ Key = '1'; Value = 'conservative'; Label = '自动配置：保守（推荐）/ Automatic: conservative (recommended)' }
+    [pscustomobject]@{ Key = '2'; Value = 'aggressive'; Label = '自动配置：激进性能 / Automatic: aggressive performance' }
+    [pscustomobject]@{ Key = '3'; Value = 'manual'; Label = '全手动配置 / Fully manual configuration' }
 )
 
 $device = [string](Get-SavedValue 'device' '')
@@ -468,7 +480,7 @@ $kvTypeK = [string](Get-SavedValue 'kv_type_k' 'q8_0')
 $kvTypeV = [string](Get-SavedValue 'kv_type_v' 'q8_0')
 $configureMemory = [bool](Get-SavedValue 'configure_memory' $false)
 
-if ($setupMode -eq 'advanced') {
+if ($setupMode -eq 'manual') {
     Write-Host "`n高级通用设置 / Advanced common settings" -ForegroundColor Cyan
     Write-Host '各项留空即可继续使用引擎的硬件探测与自动预算。Leave values blank to keep engine auto-detection.' -ForegroundColor DarkGray
     $device = Read-TextValue -Label '设备，留空为自动 / Device, blank for auto' -Default $device
@@ -499,6 +511,11 @@ if ($setupMode -eq 'advanced') {
     }
 
     $configureMemory = Read-YesNo -Label '设置显存、内存和分页参数？/ Configure memory and paging?' -Default $configureMemory
+} elseif ($setupMode -eq 'aggressive') {
+    Write-Host "`n将自动探测硬件，并减少 RAM/VRAM 保留、提高 Ubatch、探索更大的 Submit cap。" -ForegroundColor Yellow
+    Write-Host 'Hardware stays auto-detected, with tighter RAM/VRAM headroom, a larger Ubatch and a wider Submit cap search.' -ForegroundColor DarkGray
+    Write-Host '适合追求吞吐且能接受更高资源压力；启动失败或系统换页时请改用保守档。' -ForegroundColor Yellow
+    Write-Host 'Use conservative mode if allocation fails or Windows starts paging.' -ForegroundColor DarkGray
 } else {
     Write-Host "`n将自动探测 GPU、上下文、显存和 RAM；不覆盖引擎默认值。" -ForegroundColor DarkGray
     Write-Host 'GPU, context, VRAM and RAM will be detected automatically; engine defaults stay intact.' -ForegroundColor DarkGray
@@ -518,7 +535,7 @@ $hostDma = [bool](Get-SavedValue 'host_dma' $true)
 $kvOverflow = [bool](Get-SavedValue 'kv_overflow' $false)
 $kvOverflowVram = [string](Get-SavedValue 'kv_overflow_vram_mb' '')
 $kvOverflowReserve = [string](Get-SavedValue 'kv_overflow_reserve_mb' '')
-if ($setupMode -eq 'advanced' -and $configureMemory) {
+if ($setupMode -eq 'manual' -and $configureMemory) {
     Write-Host '大小可写 21g、512m、80%；留空表示自动。Sizes accept 21g, 512m or 80%; blank means auto.' -ForegroundColor DarkGray
     $vramBudget = Read-TextValue -Label '总显存预算 / Total VRAM budget' -Default $vramBudget
     $vramReserve = Read-TextValue -Label '额外显存保留 / Additional VRAM reserve' -Default $vramReserve
@@ -536,7 +553,7 @@ if ($setupMode -eq 'advanced' -and $configureMemory) {
 
 $submitMode = [string](Get-SavedValue 'submit_mode' 'auto')
 $submitCap = [string](Get-SavedValue 'submit_cap' '64')
-if ($setupMode -eq 'advanced') {
+if ($setupMode -eq 'manual') {
     $submitMode = Read-Choice -Label 'Submit splitter' -DefaultValue $submitMode -Options @(
         [pscustomobject]@{ Key = '1'; Value = 'auto'; Label = '自动反馈 / Automatic feedback' }
         [pscustomobject]@{ Key = '2'; Value = 'disabled'; Label = '禁用，no-split / Disabled, no-split' }
@@ -552,10 +569,10 @@ $pagerStats = [bool](Get-SavedValue 'pager_stats' $false)
 $pagerProfile = [bool](Get-SavedValue 'pager_profile' $false)
 $stageProfile = [bool](Get-SavedValue 'stage_profile' $false)
 $vramProfile = [bool](Get-SavedValue 'vram_profile' $false)
-if ($setupMode -eq 'advanced') {
+if ($setupMode -eq 'manual') {
     $configureDiagnostics = Read-YesNo -Label '设置统计或 profiler？/ Configure statistics or profilers?' -Default $configureDiagnostics
 }
-if ($setupMode -eq 'advanced' -and $configureDiagnostics) {
+if ($setupMode -eq 'manual' -and $configureDiagnostics) {
     $pagerStats = Read-YesNo -Label '输出 pager 命中统计？/ Print pager hit statistics?' -Default $pagerStats
     $pagerProfile = Read-YesNo -Label '启用聚合 pager profiler？/ Enable aggregate pager profiler?' -Default $pagerProfile
     $stageProfile = Read-YesNo -Label '启用阶段计时？/ Enable stage timings?' -Default $stageProfile
@@ -663,7 +680,7 @@ if ($launchMode -eq 'benchmark') {
 }
 
 $customSets = [string](Get-SavedValue 'custom_sets' '')
-if ($setupMode -eq 'advanced') {
+if ($setupMode -eq 'manual') {
     $customSets = Read-TextValue -Label '额外 --set，以分号分隔，留空为无 / Extra --set entries separated by semicolons, blank for none' -Default $customSets
 }
 
@@ -673,7 +690,7 @@ $nativeArgs = [System.Collections.Generic.List[string]]::new()
     'server' { 'serve' }
     default { 'run' }
 }))
-if ($setupMode -eq 'advanced') {
+if ($setupMode -eq 'manual') {
     if (-not [string]::IsNullOrWhiteSpace($configPath)) { [void]$nativeArgs.Add('--config'); [void]$nativeArgs.Add($configPath) }
     if (-not [string]::IsNullOrWhiteSpace($device)) { [void]$nativeArgs.Add('--dev'); [void]$nativeArgs.Add($device) }
     if (-not [string]::IsNullOrWhiteSpace($context)) { [void]$nativeArgs.Add('--ctx'); [void]$nativeArgs.Add($context) }
@@ -681,11 +698,15 @@ if ($setupMode -eq 'advanced') {
     if (-not [string]::IsNullOrWhiteSpace($threads)) { [void]$nativeArgs.Add('--threads'); [void]$nativeArgs.Add($threads) }
 }
 
-if ($setupMode -eq 'advanced' -and $kvPreset -ne 'auto') {
+if ($setupMode -eq 'conservative' -or $setupMode -eq 'aggressive') {
+    Add-SetArgument $nativeArgs 'device.auto_profile' $setupMode
+}
+
+if ($setupMode -eq 'manual' -and $kvPreset -ne 'auto') {
     Add-SetArgument $nativeArgs 'kv.type_k' $kvTypeK
     Add-SetArgument $nativeArgs 'kv.type_v' $kvTypeV
 }
-if ($setupMode -eq 'advanced' -and $configureMemory) {
+if ($setupMode -eq 'manual' -and $configureMemory) {
     if ($vramBudget) { Add-SetArgument $nativeArgs 'device.vram_budget' $vramBudget }
     if ($vramReserve) { Add-SetArgument $nativeArgs 'device.vram_reserve' $vramReserve }
     if ($expertCache) { Add-SetArgument $nativeArgs 'paging.cache' $expertCache }
@@ -697,19 +718,19 @@ if ($setupMode -eq 'advanced' -and $configureMemory) {
     if ($kvOverflow -and $kvOverflowVram) { Add-SetArgument $nativeArgs 'kv.overflow_vram_mb' $kvOverflowVram }
     if ($kvOverflow -and $kvOverflowReserve) { Add-SetArgument $nativeArgs 'kv.overflow_reserve_mb' $kvOverflowReserve }
 }
-if ($setupMode -eq 'advanced') {
+if ($setupMode -eq 'manual') {
     switch ($submitMode) {
         'disabled' { Add-SetArgument $nativeArgs 'device.submit_dispatches' '0' }
         'fixed' { Add-SetArgument $nativeArgs 'device.submit_dispatches' $submitCap }
     }
 }
-if ($setupMode -eq 'advanced' -and $configureDiagnostics) {
+if ($setupMode -eq 'manual' -and $configureDiagnostics) {
     Add-SetArgument $nativeArgs 'paging.stats' $pagerStats.ToString().ToLowerInvariant()
     Add-SetArgument $nativeArgs 'prof.pager_profile' $pagerProfile.ToString().ToLowerInvariant()
     Add-SetArgument $nativeArgs 'prof.stages' $stageProfile.ToString().ToLowerInvariant()
     Add-SetArgument $nativeArgs 'prof.vram' $vramProfile.ToString().ToLowerInvariant()
 }
-if ($setupMode -eq 'advanced' -and -not [string]::IsNullOrWhiteSpace($customSets)) {
+if ($setupMode -eq 'manual' -and -not [string]::IsNullOrWhiteSpace($customSets)) {
     foreach ($entry in $customSets.Split(';')) {
         $entry = $entry.Trim()
         if (-not $entry) { continue }

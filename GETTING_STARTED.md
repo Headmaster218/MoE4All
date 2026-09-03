@@ -131,15 +131,23 @@ Start-INFR-Wizard.cmd
 它只提示下载地址，不会自动下载或替换程序。如需完全禁用，可在启动前设置
 `MOE4ALL_NO_UPDATE_CHECK=1`。
 
-### 自动配置
+### 配置模式
 
 普通用户请选择：
 
 ```text
-[1] 自动配置（推荐）/ Automatic setup (recommended)
+[1] 自动配置：保守（推荐）/ Automatic: conservative (recommended)
 ```
 
-自动配置会让引擎探测 Vulkan GPU、可用显存、系统 RAM 和模型结构，并规划：
+向导提供三种模式：
+
+| 模式 | 行为 | 适用场景 |
+|---|---|---|
+| 自动配置：保守 | 自动探测资源，保留较多 RAM/VRAM 余量，使用稳妥的 Ubatch 与 Submit 校准 | 首次运行、后台程序较多、未知 GPU |
+| 自动配置：激进性能 | 仍自动探测并保留硬性 OOM/TDR 保护，但减少部分余量，使用更大的 Ubatch，并让 Submit 校准探索更大的 cap | 已确认机器稳定，希望提高 prefill/decode 吞吐 |
+| 全手动配置 | 显式设置设备、上下文、KV、RAM/VRAM、Ubatch、Submit 和诊断选项 | 可复现实验与高级调优 |
+
+两种自动配置都会让引擎探测 Vulkan GPU、可用显存、系统 RAM 和模型结构，并规划：
 
 - 固定模型权重；
 - KV Cache 和 recurrent state；
@@ -147,8 +155,18 @@ Start-INFR-Wizard.cmd
 - GPU expert cache；
 - full-RAM 或 bounded RAM/SSD 专家层。
 
-自动配置以“在当前机器上可靠启动”为优先目标，不保证一定是最高性能设置。
-第一次不要照抄其他电脑的 `12g`、`45g` 或 submit cap。
+保守档以“在当前机器上可靠启动”为优先目标，不保证一定是最高性能设置。激进档
+仍不会绕过统一显存 guard 或 MoE 可运行性下限；如果 Windows 开始换页、模型加载
+失败或其它程序也在占用 GPU，请退回保守档。第一次不要照抄其他电脑的 `12g`、
+`45g` 或 submit cap。
+
+激进档的较大 Ubatch 通常提高长 prompt 的 prefill 吞吐，但也需要更大的临时工作区，
+因此某些显存紧张、专家 miss 较多的 decode 负载未必更快；档位表示资源取向，不是对
+所有模型都保证提速。
+
+直接使用 CLI 时可写 `--set device.auto_profile=aggressive`，或设置
+`INFR_AUTO_PROFILE=aggressive`。显式的 `device.ram_budget`、
+`device.vram_budget`、`device.ubatch` 和 `device.submit_dispatches` 始终优先于自动档位。
 
 ### 启动前确认
 
@@ -208,6 +226,7 @@ Benchmark 不检查回答质量。Synthetic KV 是确定性测试数据，不包
 | 参数 | 通俗解释 | 建议 |
 |---|---|---|
 | Context / `--ctx` | 一次会话最多保留多少 token；越大通常需要越多 KV 内存 | 首次留空自动 |
+| Auto profile (`device.auto_profile` / `INFR_AUTO_PROFILE`) | 未手动指定资源与执行参数时使用保守或激进策略 | 首次使用 `conservative`；确认稳定后再试 `aggressive` |
 | Max new tokens | 每轮最多生成多少 token，不是上下文总长度 | 避免设置得远高于实际需要 |
 | Thinking | 是否向支持的模型请求思考模式 | 不确定时使用模型默认 |
 | KV Cache 类型 | 保存历史注意力状态的格式；Q8 通常比 F16 更省空间 | 留空让架构选择；确认支持后再固定 Q8 |
