@@ -10,7 +10,7 @@
 // dwords: no block structure, no decode, no scale.
 //
 // The table is BOUND as an ordinary storage buffer rather than read through the resident-BDA arena
-// (native_weight_addr.glsl): it is `n_expert_used * n_vocab` dwords — 3.1 MB on the shipped V4 file
+// (native_weight_addr.glsl): it is `n_expert_used * n_vocab` dwords — 3.1 MiB on the shipped V4 file
 // — which is orders of magnitude under any device's maxStorageBufferRange, and one descriptor is
 // cheaper to reason about than a second addressing mode.
 //

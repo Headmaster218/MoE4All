@@ -41,10 +41,10 @@ layout(binding = 6) readonly buffer DTB { float dtbias[]; };  // [nv]
 layout(binding = 7) coherent buffer SB { float state[]; };    // [nv*kd*vd] in/out
 layout(binding = 8) buffer OB { float outp[]; };              // [rows, nv*vd]
 
-shared float kn[C * 128u];   // normalized k̂ chunk [C, kd]      16 KB
-shared float qn[C * 128u];   // normalized q̂ chunk (×1/√kd)     16 KB
-shared float aa[C * C];      // A (solve), then Wq (output)      4 KB
-shared float dl[C * COLS];   // R → Δ for this column block      4 KB
+shared float kn[C * 128u];   // normalized k̂ chunk [C, kd]      16 KiB
+shared float qn[C * 128u];   // normalized q̂ chunk (×1/√kd)     16 KiB
+shared float aa[C * C];      // A (solve), then Wq (output)      4 KiB
+shared float dl[C * COLS];   // R → Δ for this column block      4 KiB
 shared float gg[C];          // inclusive prefix log-decay
 shared float bb[C];          // β
 shared float gt[C];          // per-token log-decay (pre-scan)

@@ -13,7 +13,7 @@
 //
 // -DWIDE build (`rmsnorm_wide`): the DECODE norm. This kernel is one-workgroup-per-row, so at
 // decode (rows==1) the whole dispatch is a SINGLE 256-thread workgroup — one WGP of 48 — and the
-// row is only ~21 KB, so it is pure memory-LATENCY bound with almost no requests in flight. It
+// row is only ~21 KiB, so it is pure memory-LATENCY bound with almost no requests in flight. It
 // measured 10.5 us/dispatch on gemma-4-31B (dim 5376) against ~1.2 us for `add` over the SAME
 // vector (which fans out to dim/64 workgroups): 8.9% of ALL decode GPU time, 301 dispatches/token,
 // ~10x the cost of an equal-sized elementwise op. WIDE keeps the single workgroup (a cross-row

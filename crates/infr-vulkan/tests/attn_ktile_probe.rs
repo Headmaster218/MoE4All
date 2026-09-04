@@ -23,13 +23,13 @@ use infr_core::backend::{Backend, Buffer, BufferUsage};
 use infr_vulkan::{Recorder, VulkanBackend};
 
 /// The four `attn_ktile` build configurations, as `Recorder::attention_kv_split_ktile_at`'s `cfg`.
-/// LDS figures are the K tile only (`keys * row_stride_words * 4`); each adds ~3.8 KB of
+/// LDS figures are the K tile only (`keys * row_stride_words * 4`); each adds ~3.8 KiB of
 /// `sc`/`qf4`/`red`/`vsh` on top.
 const CFGS: &[(u32, &str)] = &[
-    (0, "w64      (64-key tile, 68-word rows, 17.0 KB K-LDS)"),
-    (1, "w64_nopad(64-key tile, 64-word rows, 16.0 KB K-LDS)"),
-    (2, "w128     (128-key tile, 68-word rows, 34.0 KB K-LDS)"),
-    (3, "w64_dw32 (64-key tile, half-depth stage, 9.0 KB K-LDS)"),
+    (0, "w64      (64-key tile, 68-word rows, 17.0 KiB K-LDS)"),
+    (1, "w64_nopad(64-key tile, 64-word rows, 16.0 KiB K-LDS)"),
+    (2, "w128     (128-key tile, 68-word rows, 34.0 KiB K-LDS)"),
+    (3, "w64_dw32 (64-key tile, half-depth stage, 9.0 KiB K-LDS)"),
 ];
 
 struct Rng(u64);

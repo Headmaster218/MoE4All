@@ -5,7 +5,7 @@
 // per query tile instead of the full m×kv scores round-tripping HBM 4×. Q/K/V f16, O f32. Causal
 // mask via absolute positions. GQA: head h → kv head h/(nh/nkv). hd%16, hd<=128. sg32.
 // BM_TILE (query rows/tile) is a build knob: shared scratch = BM*908 B. BM=64 → 58112 B (needs a
-// 64 KB device); BM=32 → 29056 B (fits NVIDIA 48 KB / MoltenVK 32 KB). The recorder picks the tile
+// 64 KiB device); BM=32 → 29056 B (fits NVIDIA 48 KiB / MoltenVK 32 KiB). The recorder picks the tile
 // from maxComputeSharedMemorySize; workgroup = (BM/16) subgroups of 32. (See attn_flash_warp.comp.)
 #ifndef BM_TILE
 #define BM_TILE 64

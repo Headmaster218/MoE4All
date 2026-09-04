@@ -275,10 +275,10 @@ impl DiffusionGemmaChat {
         );
 
         // Size the session to THIS turn's [prompt | every block's canvas] plus REPL headroom —
-        // NOT n_ctx_train: DG's per-token KV is heavy (hd 256/512 across 30 layers ≈ 225 KB/tok)
+        // NOT n_ctx_train: DG's per-token KV is heavy (hd 256/512 across 30 layers ≈ 225 KiB/tok)
         // and this model trains at 262144 ctx, so the n_ctx_train default every AR chat uses
-        // would ask the backend for a ~59 GB KV cache (observed: radv device-lost at submit).
-        // Default headroom is min(n_ctx_train, 8192) ≈ 1.8 GB — the same clamp the spec-decode
+        // would ask the backend for a ~59 GiB KV cache (observed: radv device-lost at submit).
+        // Default headroom is min(n_ctx_train, 8192) ≈ 1.8 GiB — the same clamp the spec-decode
         // pair uses. A later REPL turn that outgrows the session reopens it bigger (the KV is
         // rebuilt by a from-scratch prefill; correct, just slower for that one turn).
         let blocks = max_new.div_ceil(canvas_len.max(1)).max(1);

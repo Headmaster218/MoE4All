@@ -57,7 +57,7 @@ const MAX_TENSOR_DIMS: usize = 4;
 /// `read_meta_value` is recursive: an ARRAY reads an `elem_type` and then parses `count`
 /// values of that type, and `elem_type` may itself be ARRAY. Each nesting level costs the
 /// attacker only 12 bytes of file (u32 elem_type + u64 count) but one full stack frame of
-/// ours, so a ~1 MB crafted GGUF nests ~85 000 deep and blows the stack — a SIGSEGV/abort
+/// ours, so a ~1 MiB crafted GGUF nests ~85 000 deep and blows the stack — a SIGSEGV/abort
 /// the caller cannot catch, not a `Result` it can report. Since `Gguf::open` is reachable
 /// from "open this model I downloaded", that is a remote DoS on the whole process.
 ///
@@ -300,7 +300,7 @@ impl<'a> Reader<'a> {
                 let elem_type = self.read_u32()?;
                 let count = self.read_u64()? as usize;
                 // Clamp the reservation: an attacker-controlled `count` on a tiny file
-                // must not trigger a multi-GB `with_capacity` abort before we read.
+                // must not trigger a multi-GiB `with_capacity` abort before we read.
                 let mut arr = Vec::with_capacity(count.min(self.remaining()));
                 for _ in 0..count {
                     arr.push(self.read_meta_value_at_depth(elem_type, depth + 1)?);
@@ -725,8 +725,8 @@ impl Gguf {
             // Populate/readahead the whole mapping into the page cache now, front-loading
             // the weight read at load instead of faulting it in lazily on the first token.
             let _ = mmap.advise(memmap2::Advice::WillNeed);
-            // Linux only: request 2 MB transparent huge pages to cut dTLB page-walks over
-            // the multi-GB sequential weight stream. On file-backed mmaps this is frequently
+            // Linux only: request 2 MiB transparent huge pages to cut dTLB page-walks over
+            // the multi-GiB sequential weight stream. On file-backed mmaps this is frequently
             // a no-op (THP-for-filesystem is not always enabled) — hence best-effort.
             #[cfg(target_os = "linux")]
             let _ = mmap.advise(memmap2::Advice::HugePage);
@@ -1363,7 +1363,7 @@ mod tests {
         assert!(msg.contains("duplicate"), "{msg}");
     }
 
-    /// A huge `tensor_count` on a tiny file must error gracefully — no multi-GB
+    /// A huge `tensor_count` on a tiny file must error gracefully — no multi-GiB
     /// `with_capacity` reservation / capacity-overflow abort.
     #[test]
     fn huge_tensor_count_errors_gracefully() {
@@ -1411,7 +1411,7 @@ mod tests {
         push_gguf_str(&mut b, "bomb");
         push_u32(&mut b, 9); // value type = ARRAY
                              // Each pair opens one more ARRAY level holding exactly one element, which is itself
-                             // an ARRAY: 8192 levels in ~96 KB of file.
+                             // an ARRAY: 8192 levels in ~96 KiB of file.
         for _ in 0..8192 {
             push_u32(&mut b, 9); // elem_type = ARRAY
             push_u64(&mut b, 1); // count = 1

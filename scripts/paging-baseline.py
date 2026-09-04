@@ -7,12 +7,12 @@ tier has to beat, and the harness every later phase is re-measured against.
 
 The squeeze is a cgroup-v2 `MemoryMax` (via `systemd-run --user --scope`), not a
 bigger model: page cache charged to the cgroup is reclaimed under the limit, so a
-2 GB model under a 1.5 GB cap streams from disk exactly as a 60 GB model does on
-a 48 GB host, and the sweep runs in minutes instead of needing a >RAM blob. Each
+2 GiB model under a 1.5 GiB cap streams from disk exactly as a 60 GiB model does on
+a 48 GiB host, and the sweep runs in minutes instead of needing a >RAM blob. Each
 run starts cold — `posix_fadvise(DONTNEED)` drops the model's page cache first,
 which needs no root.
 
-    scripts/paging-baseline.py MODEL.gguf --limits 8G,3G,2G,1.5G
+    scripts/paging-baseline.py MODEL.gguf --limits 8GiB,3GiB,2GiB,1.5GiB
 
 Reports, per limit: prefill and decode throughput, MAJOR faults (the page cache
 missing), and 512-byte blocks read from the device. Throughput alone cannot tell
@@ -29,10 +29,12 @@ import subprocess
 import sys
 
 INFR = "./target/release/infr"
+MIB = 1 << 20
+GIB = 1 << 30
 
 
 def parse_size(s):
-    """`8G` / `1.5G` / `512M` / a byte count -> bytes."""
+    """`8GiB` / `1.5GiB` / `512MiB` / a byte count -> bytes."""
     m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([kKmMgG]?)i?[bB]?", s.strip())
     if not m:
         raise argparse.ArgumentTypeError(f"bad size: {s!r}")
@@ -109,7 +111,7 @@ def main():
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("--dram", default=None,
                     help="also run each limit with the legacy exact-cache paging.dram budget "
-                         "(e.g. `1g`), or "
+                         "(e.g. `1GiB`), or "
                          "`auto` to leave the budget unset and measure the engine's own sizing")
     ap.add_argument("--cache", default=None,
                     help="paging.cache (VRAM paging budget), applied to BOTH arms — how a GPU run "
@@ -123,10 +125,10 @@ def main():
 
     size = os.path.getsize(args.model)
     print(f"model: {args.model}")
-    print(f"bytes: {size / 1e9:.2f} GB   dev: {args.dev}   reps: {args.reps}")
+    print(f"bytes: {size / GIB:.2f} GiB   dev: {args.dev}   reps: {args.reps}")
     print()
-    print(f"{'limit':>8} {'mode':>6} {'pp t/s':>9} {'pp majflt':>10} {'pp read MB':>11} "
-          f"{'tg t/s':>8} {'tg majflt':>10} {'tg read MB':>11}")
+    print(f"{'limit':>8} {'mode':>6} {'pp t/s':>9} {'pp majflt':>10} {'pp read MiB':>11} "
+          f"{'tg t/s':>8} {'tg majflt':>10} {'tg read MiB':>11}")
 
     arms = [("mmap", None)] + ([("dram", args.dram)] if args.dram else [])
     for spec in args.limits.split(","):
@@ -139,8 +141,8 @@ def main():
                             ["-p", "0", "-n", str(args.gen), "-r", str(args.reps)],
                             dram, args.cache)
             print(f"{spec.strip():>8} {name:>6} {pp:>9.1f} {pru['majflt']:>10} "
-                  f"{pru['inblock'] / 2048:>11.0f} {tg:>8.2f} {tru['majflt']:>10} "
-                  f"{tru['inblock'] / 2048:>11.0f}")
+                  f"{pru['inblock'] * 512 / MIB:>11.0f} {tg:>8.2f} {tru['majflt']:>10} "
+                  f"{tru['inblock'] * 512 / MIB:>11.0f}")
 
 
 if __name__ == "__main__":

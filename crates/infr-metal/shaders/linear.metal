@@ -428,7 +428,7 @@ constant float kvalues_iq4nl_f[16] = {
 // 8 sub-blocks of 32; value = (d * (ls - 32)) * kvalues[q4] — every factor exact in f32, so it
 // matches dequant_codebook bit-for-bit. The dominant mac format (bartowski IQ4_XS mixes);
 // without a native kernel it dequanted to a cached f32 weight, which OOM-corrupted any >2B
-// model on a 18 GB machine.
+// model on a 18 GiB machine.
 #define DEC16_IQ4XS(wk)                                                                           \
     device const uchar* blk = codes + (ulong)(bi >> 4) * 136ul;                                   \
     device const ushort* b16 = (device const ushort*)blk;                                         \
@@ -1049,7 +1049,7 @@ kernel void NAME(device const half*   x     [[buffer(0)]],                      
 // MULTI-ROW mul_mv GEMV (m = 2..8: speculative verify's candidate rows, short suffix
 // prefills): the single-row bodies below re-stream the whole weight once PER TOKEN if simply
 // looped, and the cooperative GEMM tile is latency-bound on its serial k-loop at these sizes
-// (measured ~44 GB/s effective vs the GEMV's ~136). This keeps the mul_mv access pattern,
+// (measured ~41 GiB/s effective vs the GEMV's ~127). This keeps the mul_mv access pattern,
 // hoists each (block, out-row)'s weight bytes into registers, and loops up to 4 token rows
 // inside — the weight streams from DRAM once per 4 tokens, the activations re-read from L1.
 // Grid = out-row-pairs x token-blocks; exact f32 like the other GEMVs (reassociated dot only).

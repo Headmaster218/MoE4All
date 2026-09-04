@@ -246,7 +246,7 @@ pub struct CpuBackend {
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     repack_cache: Mutex<RepackCacheState>,
     /// Q6_K sibling of `repack_cache` (same keying and budget knob; separate accounting) — holds
-    /// e.g. the tied Q6_K lm_head's ~740 MB pack, built once per session.
+    /// e.g. the tied Q6_K lm_head's ~740 MiB pack, built once per session.
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     repack6_cache: Mutex<Repack6CacheState>,
     /// Persistent spin-pool for the op interpreter's parallel loops (see `pool.rs`, threadpool
@@ -2640,7 +2640,7 @@ impl Backend for CpuBackend {
                     let n = n as usize;
                     // Elementwise with no cross-element dependency — chunked spin-pool, bit-
                     // identical. (The oldest form CLONED the whole `a` vector, then added serially:
-                    // a ~0.7 MB memcpy + a one-thread loop per Add while 31 threads slept.)
+                    // a ~0.7 MiB memcpy + a one-thread loop per Add while 31 threads slept.)
                     let av = &vals[a.0 as usize];
                     let bv = &vals[b.0 as usize];
                     let mut out = vec![0f32; n];

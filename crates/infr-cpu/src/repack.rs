@@ -261,7 +261,7 @@ impl Q6kPack {
 }
 
 /// Build the interleaved pack for a `[out_f, in_f]` Q6_K bank (e.g. the tied Q6_K lm_head —
-/// ~740 MB of expanded codes for gemma's 262k vocab, built once per session, rayon over groups).
+/// ~740 MiB of expanded codes for gemma's 262k vocab, built once per session, rayon over groups).
 /// `out_f % 8` tail rows are NOT packed.
 #[cfg(target_arch = "x86_64")]
 #[cfg_attr(infr_profile, infr_prof::instrument)]

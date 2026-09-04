@@ -3,7 +3,7 @@
 //!
 //! The reason this exists is the same measurement that motivated fetching several shards at once —
 //! a single connection to the HF CDN, not the link, is what caps a download — except that a model
-//! shipped as one file (`unsloth/DeepSeek-V3.2-GGUF`'s 161 GB `UD-TQ1_0`) has no shards to spread
+//! shipped as one file (`unsloth/DeepSeek-V3.2-GGUF`'s 161 GiB `UD-TQ1_0`) has no shards to spread
 //! over connections. So the FILE is spread instead: worker `k` asks for `Range: bytes=A-B` and
 //! `pwrite`s the reply at offset `A`, and the assembled file is byte-identical to what one stream
 //! would have written.
@@ -55,7 +55,7 @@ pub(crate) struct Probe {
 ///
 /// A `HEAD` rather than a one-byte ranged `GET` because it costs no body at all — a server that
 /// declines the range would answer a ranged `GET` with the WHOLE object, and the client abandoning
-/// that response has still made the origin start sending 161 GB down a socket it is about to close.
+/// that response has still made the origin start sending 161 GiB down a socket it is about to close.
 /// The cost of asking this way is that `Accept-Ranges` is an advertisement rather than a
 /// demonstration; the demonstration isevery chunk request, each of which must come back `206` naming
 /// the bytes it asked for, and a server that advertised ranges and then declines one falls back to

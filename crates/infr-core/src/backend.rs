@@ -148,7 +148,7 @@ pub struct Capabilities {
     /// this false; nothing there reads it.
     pub buffer_device_address: bool,
     /// `maxComputeSharedMemorySize` — the per-workgroup shared-memory budget. Vulkan only guarantees
-    /// 16 KB; RADV gives 64 KB, NVIDIA 48 KB, MoltenVK/mobile often 32 KB. The flash-attention tile
+    /// 16 KiB; RADV gives 64 KiB, NVIDIA 48 KiB, MoltenVK/mobile often 32 KiB. The flash-attention tile
     /// height is picked to fit this (and flash is skipped entirely if even the smallest tile won't).
     pub max_shared_memory_bytes: u32,
     pub unified_memory: bool,

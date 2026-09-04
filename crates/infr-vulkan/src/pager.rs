@@ -59,6 +59,9 @@ use crate::unified::{
     UnifiedVramPool,
 };
 
+const MIB_F64: f64 = (1u64 << 20) as f64;
+const GIB_F64: f64 = (1u64 << 30) as f64;
+
 /// Validate [`GpuPager::new`]'s block dimensions. Pure (no GPU) so it can be unit-tested and so a
 /// bad seam budget (0 slots) or sizing bug (misaligned stride) returns `Err` before any allocation.
 fn validate_pager_dims(n_slots: usize, slot_bytes: usize) -> Result<()> {
@@ -1584,10 +1587,10 @@ pub struct MoePagerSession {
 /// One size pool's spec in [`MoePagerLayout`]: slot counts are INDEPENDENT per pool. Each pool's arena
 /// is a `bufferDeviceAddress` buffer (`48ad9c1`) addressed by 64-bit pointer — no per-arena
 /// `maxStorageBufferRange` ceiling — but per-pool sizing
-/// still matters because of unequal per-expert sizes (Scout: gate/up 13.8 MB, down 18 MB): a
+/// still matters because of unequal per-expert sizes (Scout: gate/up 12.9 MiB, down 16.8 MiB): a
 /// shared slot count is dragged down to fit the LARGEST pool's per-slot bytes within the VRAM
 /// budget and strands budget the smaller pools could have used as real hit rate (Scout: uniform
-/// 238 slots everywhere left ~6 GB of a 19 GB budget unused; per-pool sizing gives gate/up 312
+/// 238 slots everywhere left ~5.6 GiB of a 17.7 GiB budget unused; per-pool sizing gives gate/up 312
 /// each). Each pool has its own LRU/LUT and `push_role_cpu` resolves pools independently, so
 /// unequal counts are correctness-neutral — a pool with fewer slots just misses more often. Computed by
 /// the caller (budget-driven count, then per-pool split — see `seam::mod`'s placement policy).
@@ -1923,11 +1926,11 @@ impl MoePagerSession {
             })?;
             let elapsed = started.elapsed();
             tracing::info!(
-                "[infr] preloaded bounded MoE RAM pool {pool_idx}: {blocks} blocks / {:.2} GB across {} layers in {:.2}s ({:.2} GB/s)",
-                bytes as f64 / 1e9,
+                "[infr] preloaded bounded MoE RAM pool {pool_idx}: {blocks} blocks / {:.2} GiB across {} layers in {:.2}s ({:.2} GiB/s)",
+                bytes as f64 / GIB_F64,
                 n_layers,
                 elapsed.as_secs_f64(),
-                bytes as f64 / 1e9 / elapsed.as_secs_f64().max(f64::EPSILON),
+                bytes as f64 / GIB_F64 / elapsed.as_secs_f64().max(f64::EPSILON),
             );
             total_blocks += blocks;
             total_bytes += bytes;
@@ -3174,29 +3177,29 @@ impl MoePagerSession {
         for p in &self.pools {
             let s = p.pager.stats();
             tracing::info!(
-                "[moe pager] shared/{:.1}MB: {} slots={}",
-                p.slot_bytes as f64 / 1e6,
+                "[moe pager] shared/{:.1} MiB: {} slots={}",
+                p.slot_bytes as f64 / MIB_F64,
                 stats_suffix(&s),
                 p.pager.enabled_slots(),
             );
             if let Some(host) = &p.host {
                 let hs = host.stats();
                 tracing::info!(
-                    "[moe pager]   inclusive RAM: slots={} shadows={} preload={} ({:.3}GB) \
+                    "[moe pager]   inclusive RAM: slots={} shadows={} preload={} ({:.3} GiB) \
                      hits={} ssd_reads={} ram_evictions={} gpu_evictions={} \
-                     shadow_promotions={} shadow_releases={} promoted={:.3}GB disk={:.3}GB",
+                     shadow_promotions={} shadow_releases={} promoted={:.3} GiB disk={:.3} GiB",
                     host.n_slots(),
                     hs.shadow_resident,
                     hs.preload_reads,
-                    hs.bytes_preloaded as f64 / 1e9,
+                    hs.bytes_preloaded as f64 / GIB_F64,
                     hs.ram_hits,
                     hs.ssd_reads,
                     hs.ram_evictions,
                     hs.gpu_evictions,
                     hs.shadow_promotions,
                     hs.shadow_releases,
-                    hs.bytes_promoted as f64 / 1e9,
-                    hs.bytes_read as f64 / 1e9,
+                    hs.bytes_promoted as f64 / GIB_F64,
+                    hs.bytes_read as f64 / GIB_F64,
                 );
             }
         }
@@ -3231,7 +3234,7 @@ pub type MoePagerCell = Mutex<Option<MoePagerSession>>;
 //     knows the slot at record time, so the offset can be baked directly; a LUT hop would add a
 //     device dependency for information the host already has.
 //   - Embeddings / lm_head / norms / biases stay RESIDENT: norms and biases are consumed by ops
-//     with no weight-offset support and are tiny (a few KB/layer); token_embd/lm_head are read at
+//     with no weight-offset support and are tiny (a few KiB/layer); token_embd/lm_head are read at
 //     every token edge — streaming lm_head would add its full bytes to every token's PCIe bill
 //     with zero locality to exploit, a strict loss.
 
@@ -3485,8 +3488,8 @@ impl DensePagerSession {
         for (i, p) in self.pools.iter().enumerate() {
             let s = p.pager.stats();
             tracing::info!(
-                "[dense pager] pool{i}/{:.1}MB: {} slots={}/{}",
-                p.spec.slot_bytes as f64 / 1e6,
+                "[dense pager] pool{i}/{:.1} MiB: {} slots={}/{}",
+                p.spec.slot_bytes as f64 / MIB_F64,
                 stats_suffix(&s),
                 p.spec.n_slots,
                 p.spec.n_blocks,
@@ -3498,12 +3501,12 @@ impl DensePagerSession {
                 let hs = h.stats();
                 tracing::info!(
                     "[dense pager]   host{i}: {} slots={} reads={} ({} streamed past the arena) \
-                     {:.2}GB from disk",
+                     {:.2} GiB from disk",
                     stats_suffix(&hs.pager),
                     h.n_slots(),
                     hs.reads,
                     hs.streamed,
-                    hs.bytes_read as f64 / 1e9,
+                    hs.bytes_read as f64 / GIB_F64,
                 );
             }
         }

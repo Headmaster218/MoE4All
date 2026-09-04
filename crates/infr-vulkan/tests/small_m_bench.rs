@@ -85,9 +85,9 @@ fn small_m_linear_bench() {
                 f64::NAN
             };
             // Effective weight-stream bandwidth if the weight were read once.
-            let bw = |us: f64| wbytes as f64 / (us * 1e-6) / 1e9;
+            let bw = |us: f64| wbytes as f64 / (us * 1e-6) / (1u64 << 30) as f64;
             println!(
-                "  m={m}: gemm {gemm_us:8.1} us ({:5.0} GB/s)   gemv {gemv_us:8.1} us ({:5.0} GB/s)   mrow {mrow_us:8.1} us ({:5.0} GB/s)",
+                "  m={m}: gemm {gemm_us:8.1} us ({:5.0} GiB/s)   gemv {gemv_us:8.1} us ({:5.0} GiB/s)   mrow {mrow_us:8.1} us ({:5.0} GiB/s)",
                 bw(gemm_us),
                 bw(gemv_us),
                 bw(mrow_us),

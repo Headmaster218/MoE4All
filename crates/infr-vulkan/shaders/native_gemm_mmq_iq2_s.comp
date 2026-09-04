@@ -9,7 +9,7 @@
 // 16-element scale sub-blocks together and folding each into `acc` under its own scale — see the
 // BLK comment below for why. SYMMETRIC (no min term): no `sact` binding.
 //
-// The 8 KB grid table is staged into `shared` memory once per workgroup (grid_init() from the
+// The 8 KiB grid table is staged into `shared` memory once per workgroup (grid_init() from the
 // generated native_grids.glsl — the same per-invocation-scratch fix the grid decode GEMVs
 // needed, see build.rs::gen_grids); one shared gather serves FOUR staged weight bytes, and each
 // staged word is reused BM times by the dp4a loop — the staging-ALU objection the original mmq

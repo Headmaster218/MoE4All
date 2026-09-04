@@ -6,7 +6,7 @@
 //!
 //! `docs/deepseek.md` § "Why this order": stages 3 (`deepseek32`/V3.2) and 4 (`deepseek4`/V4) have
 //! **no model small enough to develop against** — V3.2 is 671B and V4-Flash's smallest quant is
-//! 82.5 GB — so "stages 1–2 must leave behind MLA and MoE-routing pieces that are independently
+//! 82.5 GiB — so "stages 1–2 must leave behind MLA and MoE-routing pieces that are independently
 //! tested". `docs/backlog.md` B46 names the two pieces stage 3 inherits verbatim that no test on a
 //! real model reaches: **group-limited routing** (`n_expert_groups > 1`) and the **`exp_probs_b`
 //! router bias**. V2-Lite — the only DeepSeek small enough to run here — ships

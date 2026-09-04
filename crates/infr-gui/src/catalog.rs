@@ -516,7 +516,9 @@ mod tests {
 
     #[test]
     fn host_cache_modes_match_the_moe_backing_contract() {
-        let payload = 8 * 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+        let payload = 8 * GIB;
         let fixed = ModelProfile {
             ram_budget: "3g".into(),
             ..ModelProfile::default()
@@ -525,12 +527,12 @@ mod tests {
             &fixed,
             true,
             payload,
-            Some(64 * 1024 * 1024 * 1024),
+            Some(64 * GIB),
             Some(0),
-            Some(64 * 1024 * 1024 * 1024),
+            Some(64 * GIB),
         );
         assert_eq!(estimated.mode.as_deref(), Some("bounded"));
-        assert_eq!(estimated.effective_bytes, Some(3 * 1024 * 1024 * 1024));
+        assert_eq!(estimated.effective_bytes, Some(3 * GIB - 512 * MIB));
         assert_eq!(estimated.fits_payload, Some(false));
 
         let bypass = ModelProfile {
@@ -542,29 +544,23 @@ mod tests {
             &bypass,
             true,
             payload,
-            Some(64 * 1024 * 1024 * 1024),
+            Some(64 * GIB),
             Some(0),
-            Some(64 * 1024 * 1024 * 1024),
+            Some(64 * GIB),
         );
         assert_eq!(estimated.mode.as_deref(), Some("bypass"));
         assert_eq!(estimated.effective_bytes, Some(0));
 
         assert_eq!(
-            estimate_host_cache(
-                &fixed,
-                false,
-                0,
-                Some(64 * 1024 * 1024 * 1024),
-                Some(0),
-                Some(64 * 1024 * 1024 * 1024),
-            ),
+            estimate_host_cache(&fixed, false, 0, Some(64 * GIB), Some(0), Some(64 * GIB),),
             HostCacheEstimate::default()
         );
     }
 
     #[test]
     fn host_cache_estimate_treats_an_explicit_50g_as_total_process_ram() {
-        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
         let profile = ModelProfile {
             ram_budget: "50g".into(),
             ..ModelProfile::default()
@@ -578,7 +574,7 @@ mod tests {
             Some(64 * GIB),
         );
         assert_eq!(estimated.mode.as_deref(), Some("bounded"));
-        assert_eq!(estimated.effective_bytes, Some(48 * GIB));
+        assert_eq!(estimated.effective_bytes, Some(48 * GIB - 512 * MIB));
         assert_eq!(estimated.fits_payload, Some(false));
 
         let automatic = estimate_host_cache(
@@ -618,8 +614,8 @@ mod tests {
                 Some(64 * GIB),
             )
             .effective_bytes,
-            Some(30 * GIB),
-            "percentage budgets use total physical RAM before subtracting process residency"
+            Some(30 * GIB - 512 * MIB),
+            "percentage budgets use total physical RAM before subtracting process residency and the future allocation reserve"
         );
     }
 

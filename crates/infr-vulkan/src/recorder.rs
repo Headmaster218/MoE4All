@@ -62,7 +62,7 @@ fn flash_split_count(
 /// `deltanet_seq.comp`'s `NCOL`.
 ///
 /// Raising NCOL cuts the redundant k̂/q̂ cache re-reads (every column-workgroup of a head reads the
-/// same row each token, ~1.07 GB/layer of L2 traffic at NCOL=1) and lets the NCOL reductions
+/// same row each token, ~1.07 GiB/layer of L2 traffic at NCOL=1) and lets the NCOL reductions
 /// pipeline — but it divides the wave count by NCOL, and this kernel is latency-bound, so the two
 /// effects fight and the curve has an interior optimum. Measured, Ornith-35B pp512, scan total over
 /// the 30 DeltaNet layers: NCOL=1 → 10.07ms (2048 waves), NCOL=2 → 8.29ms (1024), NCOL=4 → 9.42ms
@@ -243,8 +243,8 @@ fn native_id_sg_choice(
     // IQ2_S is deliberately NOT here. Its expert gate/up is the mirrored shape (in_f=2048,
     // out_f=512), and out_f=512 both falls under this band AND is where the SG route loses badly:
     // forced on (MINOUT=512), native_idm_iq2s went 49.8 → 117.2ms (NR=2) / 85.8ms (NR=4) / 86.8ms
-    // (NR=8), dragging tg128 136 → 121-127. A 32-lane workgroup has to stage the same 8 KB table
-    // with half the tree kernel's threads, and 8 KB of LDS on a single-wave workgroup collapses
+    // (NR=8), dragging tg128 136 → 121-127. A 32-lane workgroup has to stage the same 8 KiB table
+    // with half the tree kernel's threads, and 8 KiB of LDS on a single-wave workgroup collapses
     // occupancy — the staging amortization NR buys never pays that back. Eliminating the staging
     // (codebook in an L2-resident BUFFER instead of per-workgroup LDS) is the real fix for the
     // gate/up shape and is NOT what this tier does; ablating grid_init() outright measured
@@ -975,7 +975,7 @@ pub struct Recorder<'a> {
 /// not at graph-build time: `execute_static` re-walks `for op in &graph.ops` and re-records every
 /// dispatch on EVERY execute. A per-call `Box::leak` therefore leaked one small string per op per
 /// forward pass — on a ~400-op graph at 50 tok/s that is ~20k leaked strings a second, on the
-/// order of tens of MB per minute, growing without bound for as long as the profile runs. The
+/// order of tens of MiB per minute, growing without bound for as long as the profile runs. The
 /// `next_label.get().is_none()` guard did not help: it only skips labels that an explicit
 /// `label_next` already claimed, it is not a shape registry.
 ///
@@ -3221,7 +3221,7 @@ impl<'a> Recorder<'a> {
     /// range — bits shifted `<<16` into f32 registers, no f16 clamp and no upconverted weight
     /// copy). Shared-memory fma warptile (BM=64×BN=64×BK=32, 256 threads, TM=TN=4 register
     /// block — see `native_gemm_fma.comp` for the Intel Arc design constraints: no subgroup
-    /// ops, no f16 extensions, 16.5 KB LDS, modest registers). Selected by the adapter's
+    /// ops, no f16 extensions, 16.5 KiB LDS, modest registers). Selected by the adapter's
     /// non-coopmat tier (`nc_fma`, `!caps.f16_coopmat`); beats the per-row scalar GEMVs by
     /// amortizing each weight element across the 64-row tile, does NOT need to beat coopmat.
     /// `c` is `ceil(m/64)*64` rows (the usual padded-GEMM convention). Requires `n%64`, `k%32`.
@@ -3381,7 +3381,7 @@ impl<'a> Recorder<'a> {
     /// Multi-row native GEMV (`2 <= rows <= 8`): the GEMV's out_f-wide cooperative-over-K grid,
     /// each workgroup decoding a weight sub-block ONCE and dotting it against every row — the
     /// spec-decode verify / short-suffix-prefill shape, where the single-M-tile coopmat GEMM
-    /// underfills the GPU (measured 51-182 GB/s effective vs the GEMV's 292-651 on a 7900 XTX)
+    /// underfills the GPU (measured 47-170 GiB/s effective vs the GEMV's 272-606 on a 7900 XTX)
     /// and the plain GEMV re-streams the weight per row. Same push layout as the GEMV; `w_off`
     /// (fused-QKV slices) rides `w_base`. Caller gates on [`crate::gemm::native_mrow_kernel_name`].
     #[allow(clippy::too_many_arguments)]
@@ -4639,7 +4639,7 @@ impl<'a> Recorder<'a> {
         // single barrier vs the 64-thread WGSL shared-tree. ~2.6× faster as a kernel.
         //
         // DECODE (rows==1) takes the -DWIDE twin instead. The kernel is one-workgroup-per-row, so
-        // rows==1 is a SINGLE workgroup: at 256 threads that is 8 wave32s on one WGP with a ~21 KB
+        // rows==1 is a SINGLE workgroup: at 256 threads that is 8 wave32s on one WGP with a ~21 KiB
         // row, i.e. memory-LATENCY bound with barely any requests in flight. Profiled on
         // gemma-4-31B (dim 5376) it cost 10.5 us/dispatch — vs ~1.2 us for `add` over the SAME
         // vector, which fans out to dim/64 workgroups — and 301 dispatches/token made it 8.9% of
@@ -5366,13 +5366,13 @@ impl<'a> Recorder<'a> {
         //
         // The warp partial's shared scratch is bm*908 B (Ss+Ps+Os+mrow/lrow/corr, BN=64/HD=128).
         // Pick the largest tile the device's maxComputeSharedMemorySize allows: bm=64 → 58112 B (needs
-        // 64 KB, e.g. RADV); bm=32 → 29056 B (fits NVIDIA 48 KB / MoltenVK 32 KB). The transformer
+        // 64 KiB, e.g. RADV); bm=32 → 29056 B (fits NVIDIA 48 KiB / MoltenVK 32 KiB). The transformer
         // skips flash entirely when even bm=32 won't fit, so one of these always fits here.
         let shared_limit = self.be.max_shared_memory_bytes();
         let bm64_shared = 64 * crate::FLASH_SHARED_PER_ROW; // 58112 B
                                                             // `INFR_FLASH_BM=32` (`kernels.vulkan.flash_bm32` — compared to the LITERAL "32", §10.4)
-                                                            // forces the small (29056 B) tile even on a 64 KB device, so the bm=32 shaders get
-                                                            // numeric-parity coverage on any GPU (they otherwise only run on sub-64 KB ones).
+                                                            // forces the small (29056 B) tile even on a 64 KiB device, so the bm=32 shaders get
+                                                            // numeric-parity coverage on any GPU (they otherwise only run on sub-64 KiB ones).
         let force_bm32 = self.vk().flash_bm32;
         // Partial tiles (rows < 64, the small-m deep-kv tier) take BM=32: half the padded-row
         // waste and half the shared scratch (2x resident workgroups). Measured @d16384 on a
@@ -5386,7 +5386,7 @@ impl<'a> Recorder<'a> {
         // Each workgroup covers `bm` query rows → mpad/bm×nh groups (mpad is 64-aligned → /32 exact).
         let tile_wg = (mpad / bm) * nh as u32;
         // INFR_NO_FLASH_WARP routes to the non-warp partial. Both warp and non-warp paths have a
-        // bm=32 build (29056 B) that fits sub-64 KB devices, so the knob is honored everywhere —
+        // bm=32 build (29056 B) that fits sub-64 KiB devices, so the knob is honored everywhere —
         // no longer forced back to warp on NVIDIA / MoltenVK.
         // Dequant-in-flash (Lever 2) now has a WARP build (attn_flash_warp_deq_*), so `Dequant` also
         // keeps the fast register-tiled warp path here — it no longer forfeits warp to the ~2x-slower
@@ -5520,7 +5520,7 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// hd=256 FlashAttention prefill for 32 KB-shared devices. A fixed BM=16 tile and four
+    /// hd=256 FlashAttention prefill for 32 KiB-shared devices. A fixed BM=16 tile and four
     /// subgroup column workers plus safe final-tile staging fit in 30,912 B shared memory.
     /// This is deliberately separate from [`Self::attention_prefill_flash`]: its hd=128 shader
     /// selection, split heuristic and combine SPIR-V remain untouched.
@@ -5699,8 +5699,8 @@ impl<'a> Recorder<'a> {
     ) {
         // mpad is 128-aligned → divisible by both BR tiles.
         let mpad = (n.div_ceil(128) * 128) as u32;
-        // Register-O shared = BR*FLASH_REG_SHARED_PER_ROW: BR=128 → 58880 B (needs 64 KB); BR=64 →
-        // 29440 B (NVIDIA 48 KB / MoltenVK 32 KB). Largest that fits; transformer skips reg if neither.
+        // Register-O shared = BR*FLASH_REG_SHARED_PER_ROW: BR=128 → 58880 B (needs 64 KiB); BR=64 →
+        // 29440 B (NVIDIA 48 KiB / MoltenVK 32 KiB). Largest that fits; transformer skips reg if neither.
         let br128_f16score = hd == 256
             && prefer_deep_splits
             && kv_addr.is_none()
@@ -7089,8 +7089,8 @@ impl<'a> Recorder<'a> {
         // Rows-BATCHED pass 1 (INFR_MROWS_ATTN=1 [+ INFR_MROWS_CHUNK=256], OFF by default): one
         // workgroup per (head, chunk) streams K/V ONCE for a 4-row group — one subgroupAdd(vec4)
         // per key, scores staged in LDS. The occupancy sweep on a 7900 XTX (pp4@d16384) was
-        // monotone in LDS — 22KB (RB=8) 188 t/s, 11KB (RB=4) 325, 7KB (RB=4 + c256) 456, vs the
-        // per-row grid's 548 — but even at 7KB the design beats per-row only in a NARROW band:
+        // monotone in LDS — 22 KiB (RB=8) 188 t/s, 11 KiB (RB=4) 325, 7 KiB (RB=4 + c256) 456, vs the
+        // per-row grid's 548 — but even at 7 KiB the design beats per-row only in a NARROW band:
         // rows >= ~12 AND deep kv (pp16@d16384 832 -> 925, pp32 963 -> 1123; pp4-8 lose or wash,
         // pp16@d4096 loses). On RDNA3 the per-row grid's rows-x extra workgroups fill the DRAM
         // queue better than the batched form's rows-/ bandwidth saving, so the spec-verify band
@@ -7119,7 +7119,7 @@ impl<'a> Recorder<'a> {
         // B7 slice 3a — DECODE-ONLY pass 1 (`attn_decode.comp`). Same grid, same chunk policy, same
         // pm/pl/pacc layout, same 60-byte BDA push, same 6 bindings, so this is a pure kernel swap;
         // pass 2 below is untouched. It is `attn_partial_bda`'s hd=128 f16 inner loop with every
-        // other arm deleted, which is worth 120 → 96 VGPRs and 4.75 → 2.75 KB LDS (occupancy 12 →
+        // other arm deleted, which is worth 120 → 96 VGPRs and 4.75 → 2.75 KiB LDS (occupancy 12 →
         // 16 waves/SIMD). The reduction is the same plain `subgroupAdd`, so the output is
         // BIT-identical — `tests/attn_decode_parity.rs` asserts that on raw bits.
         //
@@ -13030,10 +13030,10 @@ mod tests {
         run_attn_prefill_flash(&split, 64, 2000, 16, 8, 128);
         run_attn_prefill_flash(&split, 128, 500, 2, 1, 128);
         run_attn_prefill_flash(&split, 64, 2000, 8, 2, 256);
-        // Force the bm=32 tile (otherwise only selected on sub-64 KB-shared devices like NVIDIA /
+        // Force the bm=32 tile (otherwise only selected on sub-64 KiB-shared devices like NVIDIA /
         // MoltenVK) so the small shaders get numeric-parity coverage on any GPU: the fused kernel
         // (hd=64), the warp split-K partial+combine (hd=128), and the non-warp partial
-        // (`flash_warp = false`). Without this, a 64 KB device only ever exercises the bm=64 build.
+        // (`flash_warp = false`). Without this, a 64 KiB device only ever exercises the bm=64 build.
         let bm32 = be_with(|v| v.flash_bm32 = true);
         run_attn_prefill_flash(&bm32, 80, 300, 9, 3, 64); // fused attn_flash_bm32
         run_attn_prefill_flash(&bm32, 128, 200, 4, 2, 128); // warp partial+combine (bm32)

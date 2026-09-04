@@ -312,8 +312,8 @@ kernel void attnvec_dyn_qkv_t(device const float* q    [[buffer(0)]],
 // simdgroup_load'ed from q8 blocks, so per 64-position KV block all 128 threads dequantize the
 // tile into threadgroup memory — K PRE-TRANSPOSED [hd][64] so the QK fragments load
 // non-transposed and conflict-free, V row-major [64][hd] staged into the SAME tile during the
-// softmax phase (the K reads are done by then; one extra barrier per block). ~24 KB threadgroup
-// at hd=128 (vs 8 KB for the f16 kernel — the occupancy cost of in-kernel dequant).
+// softmax phase (the K reads are done by then; one extra barrier per block). ~24 KiB threadgroup
+// at hd=128 (vs 8 KiB for the f16 kernel — the occupancy cost of in-kernel dequant).
 template<uint hd, uint NSG>
 kernel void attnflash2_q8kv_t(device const half*  q   [[buffer(0)]],
                               device const uchar* k   [[buffer(1)]],
@@ -474,7 +474,7 @@ typedef decltype(attnvec_dyn_qkv_t<64, 32, KVQ8>) attnvec_dyn_q_t;
 template [[host_name("attnvec_dyn_q8kv_hd64")]]  kernel attnvec_dyn_q_t attnvec_dyn_qkv_t<64, 32, KVQ8>;
 template [[host_name("attnvec_dyn_q8kv_hd128")]] kernel attnvec_dyn_q_t attnvec_dyn_qkv_t<128, 32, KVQ8>;
 // hd=256 at NSG=16 — same threadgroup-budget math as the f16 vec kernel. (No q8 flash hd256:
-// its dequant-staging tile alone is C*hd = 32 KB half — needs a C=32 variant first.)
+// its dequant-staging tile alone is C*hd = 32 KiB half — needs a C=32 variant first.)
 template [[host_name("attnvec_q8kv_hd256")]]     kernel attnvec_q_t     attnvec_qkv_t<256, 16, KVQ8>;
 template [[host_name("attnvec_dyn_q8kv_hd256")]] kernel attnvec_dyn_q_t attnvec_dyn_qkv_t<256, 16, KVQ8>;
 

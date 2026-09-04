@@ -60,7 +60,7 @@ impl Store {
     /// Resolve a cached GGUF for `repo` selecting `sel` (a quant like `Q4_K_M`, or an explicit
     /// `*.gguf` filename; `None` → [`DEFAULT_QUANT`]). Uses the SAME selection routine as the
     /// download path ([`pick_gguf`]) so a repo that downloaded once is judged cached on the next
-    /// run (a divergence otherwise re-pulls multi-GB every invocation). Snapshots are tried in
+    /// run (a divergence otherwise re-pulls multi-GiB every invocation). Snapshots are tried in
     /// [`refs/main`][Self::ordered_snapshots] order first. A sharded GGUF only counts as cached when
     /// the WHOLE shard set is present (a lone shard 1 fails at load), and its blobs must not be
     /// dangling (garbage-collected).
@@ -137,7 +137,7 @@ const MAX_SNAPSHOT_DEPTH: usize = 3;
 /// return exactly what the download path's `pick_gguf` selected from the HF API's `rfilename`s, and
 /// they are re-joined onto `snap` to test for existence. A NON-recursive listing here was the bug
 /// that made a subdirectory GGUF invisible to the cache check, so `infr run` re-downloaded multiple
-/// GB on every single invocation.
+/// GiB on every single invocation.
 fn snapshot_ggufs(snap: &Path) -> Vec<String> {
     let mut out = Vec::new();
     collect_ggufs(snap, "", 0, &mut out);
@@ -478,7 +478,7 @@ mod tests {
 
     /// unsloth's Dynamic quants live in a per-quant SUBDIRECTORY
     /// (`UD-Q4_K_XL/Qwen3-30B-A3B-UD-Q4_K_XL.gguf`). Such a GGUF must read as cached — a
-    /// non-recursive snapshot listing made it invisible, so `infr run` re-downloaded ~18 GB every
+    /// non-recursive snapshot listing made it invisible, so `infr run` re-downloaded ~18 GiB every
     /// invocation. Reading THROUGH the returned symlink also pins the `..` depth of its target: a
     /// hardcoded `../../blobs/<sha>` one directory too shallow dangles and this read fails.
     #[test]

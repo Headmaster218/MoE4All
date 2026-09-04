@@ -166,7 +166,7 @@ impl SpecMetalChat {
     fn ensure_sessions(&mut self) -> Result<()> {
         if self.target_session.is_none() {
             // TWO models + TWO KV caches share the working set — a full-n_ctx_train pair
-            // (40k tokens on qwen3) thrashes an 18 GB machine into second-long forwards.
+            // (40k tokens on qwen3) thrashes an 18 GiB machine into second-long forwards.
             // Default to 8k unless `device.ctx` (INFR_CTX) says otherwise (shared size grammar;
             // % of the trained context, same note as ensure_session above).
             let train = self.target.config().n_ctx_train;

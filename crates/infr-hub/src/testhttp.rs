@@ -5,7 +5,7 @@
 //! actually uses (`HEAD`/`GET /<repo>/resolve/main/<file>`) on `127.0.0.1`, and records what it
 //! saw: how many bodies were in flight at once, and which byte offset each `Range` resumed from.
 //!
-//! A body is held for [`BODY_DELAY`] before a byte of it is written. Without that pause a 40 KB
+//! A body is held for [`BODY_DELAY`] before a byte of it is written. Without that pause a 40 KiB
 //! file over loopback completes inside one scheduler slice and every request looks sequential no
 //! matter how many workers are running — which is the observation the bound test rests on. Holding
 //! it BEFORE the write, rather than dribbling the body out afterwards, is what keeps the count

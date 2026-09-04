@@ -120,7 +120,7 @@ fn ms(d: Duration) -> f64 {
 /// This is half the point of the slice. Nobody on this project can run Metal, so the only durable
 /// record of what the pipeline cache buys is what the macOS CI log says — which is why the job
 /// passes `--nocapture`. The split matters more than the totals: RM caches the BACK end (AIR → GPU
-/// ISA, one compile per PSO) and cannot cache the FRONT end (MSL → AIR over ~340 KB of source),
+/// ISA, one compile per PSO) and cannot cache the FRONT end (MSL → AIR over ~340 KiB of source),
 /// because `MTLLibrary` has no serialize API. If the front end is what dominates a warm launch,
 /// then the next lever is a build-time `.metallib`, not anything about this cache — and the log
 /// should say so rather than leave the next person to re-derive it.

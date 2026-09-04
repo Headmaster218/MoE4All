@@ -8,8 +8,8 @@
 // hd is fixed 128 so the per-warp fragment counts are compile-time. Requires sg32, q4-irrelevant.
 //
 // BM_TILE (query rows per workgroup) is a build-time knob: the shared scratch is Ss(BM*BN f32) +
-// Ps(BM*BN f16) + Os(BM*HD f32) + 3*BM f32 = BM*908 bytes. BM=64 → 58112 B needs a 64 KB shared
-// device (AMD RADV); BM=32 → 29056 B fits NVIDIA (48 KB) / MoltenVK (32 KB). The recorder picks the
+// Ps(BM*BN f16) + Os(BM*HD f32) + 3*BM f32 = BM*908 bytes. BM=64 → 58112 B needs a 64 KiB shared
+// device (AMD RADV); BM=32 → 29056 B fits NVIDIA (48 KiB) / MoltenVK (32 KiB). The recorder picks the
 // largest tile the device's maxComputeSharedMemorySize allows. BM only scales WARPS_M / workgroup
 // size / shared sizes — the coopmat fragment counts (QK/PV_CMS_N) and the kv block (BN) are fixed,
 // so the online-softmax accumulation order is identical across tiles (bit-for-bit vs BM=64).
@@ -20,8 +20,8 @@
 // is decoded to f16 IN the QK/PV stage via native_decode's coalesced scale-once `dqblk`. The
 // staging structure mirrors attn_flash_partial.comp's Lever-2 arm: a 32-WIDE COLUMN BLOCK
 // (KVstg[BN*32], 4096 B) — ONE buffer REUSED for K then V, decoded 32 contiguous elems/lane per
-// GGUF sub-block — then `coopMatLoad` FROM shmem. BM=64 58112 B → staged 62208 B (one 4 KB slab
-// under the 64 KB cap; occupancy discipline of the slice-4 lesson). The warp register accumulators
+// GGUF sub-block — then `coopMatLoad` FROM shmem. BM=64 58112 B → staged 62208 B (one 4 KiB slab
+// under the 64 KiB cap; occupancy discipline of the slice-4 lesson). The warp register accumulators
 // (sacc[QK_CMS_N], oacc via Os reload) are PRESERVED: the QK dcol×kf2 order (0,16,…,112) and the PV
 // kf order (0,16,32,48) are identical to the direct path, so the staged decode is BIT-IDENTICAL to
 // warp+prepass. The `#else` arms below are the untouched direct default — base .spv byte-identical.

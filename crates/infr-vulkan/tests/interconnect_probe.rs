@@ -22,8 +22,8 @@ use std::time::Instant;
 
 const MIB: usize = 1024 * 1024;
 
-fn gbs(bytes: usize, secs: f64) -> f64 {
-    (bytes as f64 / secs) / 1e9
+fn gib_per_sec(bytes: usize, secs: f64) -> f64 {
+    (bytes as f64 / secs) / (1u64 << 30) as f64
 }
 
 /// (discrete index, integrated index) if the box has both — else `None` (test self-skips).
@@ -137,7 +137,7 @@ fn interconnect_probe() {
         dgpu.download(d_buf.as_ref(), &mut host).expect("d->host");
     }
     dgpu.sync().expect("sync");
-    let d2h = gbs(block * iters, t.elapsed().as_secs_f64());
+    let d2h = gib_per_sec(block * iters, t.elapsed().as_secs_f64());
 
     // Phase B: host → iGPU
     let t = Instant::now();
@@ -145,7 +145,7 @@ fn interconnect_probe() {
         igpu.upload(i_buf.as_ref(), &host).expect("host->i");
     }
     igpu.sync().expect("sync");
-    let h2i = gbs(block * iters, t.elapsed().as_secs_f64());
+    let h2i = gib_per_sec(block * iters, t.elapsed().as_secs_f64());
 
     // Combined: full dGPU → host → iGPU cross-device copy (the real cost of moving a tensor).
     let t = Instant::now();
@@ -154,7 +154,7 @@ fn interconnect_probe() {
         igpu.upload(i_buf.as_ref(), &host).expect("host->i");
     }
     igpu.sync().expect("sync");
-    let combined = gbs(block * iters, t.elapsed().as_secs_f64());
+    let combined = gib_per_sec(block * iters, t.elapsed().as_secs_f64());
 
     // Verify the bytes actually crossed (correctness of the host-bounce path).
     let mut check = vec![0u8; block];
@@ -169,9 +169,9 @@ fn interconnect_probe() {
         "\n── host-mediated cross-device bandwidth ({} MiB blocks, {iters} iters) ──",
         block / MIB
     );
-    eprintln!("  dGPU → host          : {d2h:.2} GB/s");
-    eprintln!("  host → iGPU          : {h2i:.2} GB/s");
-    eprintln!("  dGPU → host → iGPU   : {combined:.2} GB/s  (effective cross-device throughput)");
+    eprintln!("  dGPU → host          : {d2h:.2} GiB/s");
+    eprintln!("  host → iGPU          : {h2i:.2} GiB/s");
+    eprintln!("  dGPU → host → iGPU   : {combined:.2} GiB/s  (effective cross-device throughput)");
 
     // ── round-trip latency: a tiny transfer, dGPU → host → iGPU → host → dGPU ────────────────
     let small = 4096usize;
@@ -208,7 +208,7 @@ fn interconnect_probe() {
 
 /// Slice-1 baseline numbers this P2P slice is measured against (Slice-0 `interconnect_probe`,
 /// RX 7900 XTX ↔ 9950X3D iGPU): effective host-bounce cross-device throughput and per-hop latency.
-const HOST_BOUNCE_GBS: f64 = 3.82;
+const HOST_BOUNCE_GIB_PER_SEC: f64 = 3.56;
 const HOST_BOUNCE_HOP_US: f64 = 33.0;
 
 /// Move `block` bytes producer→consumer through SHARED external memory (no host bounce) and verify
@@ -283,7 +283,7 @@ fn p2p_move(
     consumer
         .sync()
         .map_err(|e| format!("{label}: bw sync failed: {e}"))?;
-    let bw = gbs(block * iters, t.elapsed().as_secs_f64());
+    let bw = gib_per_sec(block * iters, t.elapsed().as_secs_f64());
 
     // ── single-hop latency: a small shared buffer, one consumer pull ─────────────────────────
     let small = 4096usize;
@@ -316,8 +316,8 @@ fn p2p_move(
     let hop_us = t.elapsed().as_secs_f64() * 1e6 / rt_iters as f64;
 
     Ok(format!(
-        "{label}: bytes OK ✓  {bw:.2} GB/s ({:.2}x host-bounce)  {hop_us:.1} µs/hop ({:.2}x)",
-        bw / HOST_BOUNCE_GBS,
+        "{label}: bytes OK ✓  {bw:.2} GiB/s ({:.2}x host-bounce)  {hop_us:.1} µs/hop ({:.2}x)",
+        bw / HOST_BOUNCE_GIB_PER_SEC,
         HOST_BOUNCE_HOP_US / hop_us,
     ))
 }
@@ -346,7 +346,7 @@ fn p2p_external_memory_probe() {
         );
     }
     eprintln!(
-        "  baseline (Slice 0, host-bounce): {HOST_BOUNCE_GBS:.2} GB/s effective, \
+        "  baseline (Slice 0, host-bounce): {HOST_BOUNCE_GIB_PER_SEC:.2} GiB/s effective, \
          ~{HOST_BOUNCE_HOP_US:.0} µs/hop"
     );
 
@@ -387,7 +387,7 @@ fn p2p_external_memory_probe() {
     }
 
     eprintln!(
-        "\n[p2p] done — a '✓' line beating {HOST_BOUNCE_GBS:.2} GB/s means host-less P2P is the \
+        "\n[p2p] done — a '✓' line beating {HOST_BOUNCE_GIB_PER_SEC:.2} GiB/s means host-less P2P is the \
          viable cross-device transport on this box; a rejection line is the equally-valid finding \
          that this handle type/direction is not usable on RADV here."
     );

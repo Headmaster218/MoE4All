@@ -18,7 +18,7 @@
 // scratch and the GPU hangs (observed: "logical device has been lost" on an RX 7900 XTX with
 // the earlier 128-lane-per-token layout where every lane carried the full arrays). Here the
 // arrays live in WORKGROUP shared memory (576+512 floats = 4352 bytes, trivially within the
-// 64 KB limit) and the 128 lanes fill/read them cooperatively: each lane owns a strided slice.
+// 64 KiB limit) and the 128 lanes fill/read them cooperatively: each lane owns a strided slice.
 //
 //   -DMLA_SG  The subgroup tier (`mla_sg*`, dispatched through `kernel_sg(.., MLA_SG_WIDTH)`).
 //             Same math, two structural changes: ONE pass over the keys with an online (running

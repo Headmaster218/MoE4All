@@ -417,7 +417,7 @@ pub(crate) struct SeamKv {
     /// slots for free (a pure function of the model, not per-conversation state).
     pub(super) self_cond_w: Option<std::sync::Arc<SelfCondWeights>>,
     /// Phase-B/D perf: the in-graph SC soft-embedding weight (`token_embd` dequantized + transposed
-    /// to f16 `[n_embd, n_vocab]`, ~1.4 GB — see the reference's `dg_ensure_sc_embT` and
+    /// to f16 `[n_embd, n_vocab]`, ~1.4 GiB — see the reference's `dg_ensure_sc_embT` and
     /// `build_sc_embt`), built lazily on the FIRST Vulkan/Metal denoise call with SC on. `None` for
     /// CPU (it never sets it) and for every non-diffusion-gemma caller. `Arc` so `fork()`
     /// shares it with forked conversation slots for free — mirrors `self_cond_w`.

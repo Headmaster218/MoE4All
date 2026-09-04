@@ -524,8 +524,8 @@ fn main() {
         // needs a bespoke planar decoder + a `cap` push constant; out of scope for the GGUF-block
         // substrate. iq4_nl (codebook gather) is likewise left on the prepass.
         ("attn_flash_warp", "attn_flash_warp", &[]),
-        // BM=32 tile: 29056 B shared (vs 58112 B), fits NVIDIA (48 KB) / MoltenVK (32 KB) devices
-        // whose maxComputeSharedMemorySize is under the 64 KB the default BM=64 tile needs.
+        // BM=32 tile: 29056 B shared (vs 58112 B), fits NVIDIA (48 KiB) / MoltenVK (32 KiB) devices
+        // whose maxComputeSharedMemorySize is under the 64 KiB the default BM=64 tile needs.
         ("attn_flash_warp", "attn_flash_warp_bm32", &["-DBM_TILE=32"]),
         // KV-cache u64/BDA twins (#74 slice 4 resurrection): the hd==128 register-O DEFAULT prefill
         // kernel reading K/V by device address (INFR_KV_COOPMAT_BDA=1, default OFF). See the
@@ -586,12 +586,12 @@ fn main() {
             "attn_flash_warp_deq_q5_1_bm32",
             &["-DSTAGE", "-DDEQUANT", "-DFMT_Q5_1", "-DBM_TILE=32"],
         ),
-        // hd=256 production FlashAttention for 32 KB-shared devices. BM=16 and four column
+        // hd=256 production FlashAttention for 32 KiB-shared devices. BM=16 and four column
         // subgroups plus safe final-tile staging fit in 30,912 B; this is a separate shader so
         // the established hd=128 variants remain byte-for-byte untouched.
         ("attn_flash_warp_hd256", "attn_flash_warp_hd256_bm16", &[]),
         ("attn_flash_reg", "attn_flash_reg", &[]),
-        // BR=64 tile: 29440 B shared (vs 58880 B) for sub-64 KB shared devices (NVIDIA, MoltenVK).
+        // BR=64 tile: 29440 B shared (vs 58880 B) for sub-64 KiB shared devices (NVIDIA, MoltenVK).
         ("attn_flash_reg", "attn_flash_reg_br64", &["-DBR_TILE=64"]),
         // KV-cache u64/BDA twins (#74 slice 4 resurrection): K/V by device address (INFR_KV_COOPMAT_BDA
         // =1, default OFF). See the attn_flash_partial_bda note; base .spv byte-identical.
@@ -2627,8 +2627,8 @@ fn main() {
         ("native_gemm_fma", "native_gemm_fma_f32", &["-DFMT_F32"]),
         // Non-coopmat shared-memory fma flash-attention prefill (adapter.rs `nc_fa_ok`, see
         // attn_nc_fa.comp): the attention companion of the fma GEMM tier above. No subgroup ops.
-        // One build per shared-Os ceiling: hd<=128 (37.6 KB), hd<=256 (54.0 KB), hd<=512 (BM=16,
-        // 47.6 KB) — the recorder picks the smallest that fits the layer's head dim.
+        // One build per shared-Os ceiling: hd<=128 (37.6 KiB), hd<=256 (54.0 KiB), hd<=512 (BM=16,
+        // 47.6 KiB) — the recorder picks the smallest that fits the layer's head dim.
         ("attn_nc_fa", "attn_nc_fa_hd128", &[]),
         ("attn_nc_fa", "attn_nc_fa_hd256", &["-DHD_MAX=256"]),
         ("attn_nc_fa", "attn_nc_fa_hd512", &["-DHD_MAX=512"]),
@@ -3237,7 +3237,7 @@ fn main() {
             &["-DFMT_Q4K", "-DNARROW_N", "-DA_GLOBAL"],
         ),
         // BK=32 NARROW_N measurement variant — halves per-stage shared memory
-        // (10 KB vs 18 KB) and doubles barriers. Hypothesized higher occupancy.
+        // (10 KiB vs 18 KiB) and doubles barriers. Hypothesized higher occupancy.
         (
             "native_gemm_warp",
             "native_gemm_warp_q4k_n128_ag_bk32",
@@ -4033,7 +4033,7 @@ fn main() {
 /// only ever indexes the shared mirror: a dynamically-indexed large `const` array is lowered
 /// (glslang emits one initialized Function-storage copy PER ACCESS SITE; RADV/ACO puts them in
 /// per-invocation scratch) to a full table materialization in scratch memory by every invocation —
-/// the IQ2_S id-GEMV carried 1 MB of scratch per wave and ran ~400x slower than its memory
+/// the IQ2_S id-GEMV carried 1 MiB of scratch per wave and ran ~400x slower than its memory
 /// traffic, stacking one real MoE decode step (40 layers x gate/up/down, 8 experts) past amdgpu's
 /// ~10 s gfx-ring timeout (device-lost TDR on Qwen3.6-35B-A3B IQ3_S; `ring gfx_0.0.0 timeout` in
 /// dmesg). The single sequential access site inside `grid_init()`'s copy loop is promoted to

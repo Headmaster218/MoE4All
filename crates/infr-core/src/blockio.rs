@@ -329,8 +329,8 @@ impl BlockIo for FileBlockIo {
 /// How many positioned reads one block is split across.
 ///
 /// A drive reaches its bandwidth on queue depth, not on request size: measured on this workspace's
-/// NVMe over 16-128 MB blocks, one read sustains 1.2-1.5 GB/s and the device tops out at
-/// 2.2 GB/s, which two to four concurrent reads already reach — eight and sixteen buy nothing and
+/// NVMe over 16-128 MiB blocks, one read sustains 1.12-1.40 GiB/s and the device tops out at
+/// 2.05 GiB/s, which two to four concurrent reads already reach — eight and sixteen buy nothing and
 /// cost threads. The gap between those two figures is the whole reason this exists; a serial reader
 /// loses to the mapping it replaces, whose faults the kernel issues in parallel for free.
 ///

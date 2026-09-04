@@ -3,7 +3,7 @@
 // it computes this chunk's softmax partials (max m, sum l, weighted V acc) for a single decode
 // query. The QK dot uses a SUBGROUP reduction: the 32 lanes of a wave cooperate on ONE key's hd
 // vector — lane reads k[key, kvh, lane + 32r] (contiguous → coalesced), partial-sums, subgroupAdd.
-// This replaces the old thread-per-key WGSL kernel whose 64 threads read keys 2KB apart (fully
+// This replaces the old thread-per-key WGSL kernel whose 64 threads read keys 2 KiB apart (fully
 // uncoalesced, ~25x bandwidth amplification — the decode bottleneck at long context). Uses almost
 // no shared memory, so occupancy stays high. Requires requiredSubgroupSize=32 (wave32 → 2 sgs).
 #extension GL_KHR_shader_subgroup_basic : require

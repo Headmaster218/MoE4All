@@ -536,7 +536,7 @@ $kvOverflow = [bool](Get-SavedValue 'kv_overflow' $false)
 $kvOverflowVram = [string](Get-SavedValue 'kv_overflow_vram_mb' '')
 $kvOverflowReserve = [string](Get-SavedValue 'kv_overflow_reserve_mb' '')
 if ($setupMode -eq 'manual' -and $configureMemory) {
-    Write-Host '大小可写 21g、512m、80%；留空表示自动。Sizes accept 21g, 512m or 80%; blank means auto.' -ForegroundColor DarkGray
+    Write-Host '大小可写 21GiB、512MiB、80%；留空表示自动。Sizes accept 21GiB, 512MiB or 80%; blank means auto.' -ForegroundColor DarkGray
     $vramBudget = Read-TextValue -Label '总显存预算 / Total VRAM budget' -Default $vramBudget
     $vramReserve = Read-TextValue -Label '额外显存保留 / Additional VRAM reserve' -Default $vramReserve
     $expertCache = Read-TextValue -Label 'GPU 专家缓存 / GPU expert cache' -Default $expertCache

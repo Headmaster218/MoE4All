@@ -8,7 +8,7 @@
 //   S ← e^{G_{c−1}} S₀ + Σ_j e^{G_{c−1}−G_j} k̂_j ⊗ Δ_j
 // One workgroup per (value head, COLS-column block). With the shared work hoisted into the prep
 // pass, the per-block work here is purely state-coupled (no duplication), so small blocks are
-// cheap occupancy: vd=128 / COLS=16 → nv·8 workgroups. LDS is tiny (~7KB) — many wgs per CU.
+// cheap occupancy: vd=128 / COLS=16 → nv·8 workgroups. LDS is tiny (~7 KiB) — many wgs per CU.
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 

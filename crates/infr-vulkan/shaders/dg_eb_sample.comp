@@ -7,7 +7,7 @@
 // crossing to host between passes) — cheap relative to the PCIe download it replaces.
 //
 // Mirrors the host closure EXACTLY (same math, same order), just spread across three passes
-// because a single row (up to 262144 f32 = 1 MB) can't fit shared memory for a one-pass scan:
+// because a single row (up to 262144 f32 = 1 MiB) can't fit shared memory for a one-pass scan:
 //   1. argmax over z = raw*temp_inv (temp_inv > 0 never flips the argmax vs raw, but this keeps
 //      the value comparable across the module) — strict `>` keeps the LOWEST index on ties,
 //      exactly like the host's `if z > m`.

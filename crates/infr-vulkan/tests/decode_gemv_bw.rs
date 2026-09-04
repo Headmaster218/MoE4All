@@ -1,6 +1,6 @@
 //! Cold-weight decode GEMV bandwidth at the real Qwen3-8B decode shapes. Rotates through DISTINCT
 //! weight buffers so the aggregate working set exceeds the 96 MiB Infinity Cache — the reported
-//! GB/s is TRUE DRAM bandwidth (the in-model INFR_PROF_OPS numbers for small tensors are cache-
+//! GiB/s is TRUE DRAM bandwidth (the in-model INFR_PROF_OPS numbers for small tensors are cache-
 //! contaminated). A/Bs the RM=1 grid vs the multi-output-row (RM=2/4) grid, and asserts the RM
 //! path is BIT-IDENTICAL to RM=1 (per-row math is unchanged). Run:
 //!   cargo test -p infr-vulkan --test decode_gemv_bw -- --ignored --nocapture
@@ -26,7 +26,7 @@ fn decode_gemv_bw() {
     // The six devices are built INSIDE the shape loop and dropped with it. Six live backends each
     // holding a shape's ~200 MiB cache-busting weight set is 6x the pre-S5b footprint, and holding
     // that across all 18 shapes trips the VRAM guard on a 24 GiB part; per-shape devices bound the
-    // peak to one shape (worst case: lm_head, 6 x 3 x 511 MB).
+    // peak to one shape (worst case: lm_head, 6 x 3 x 487 MiB).
     let mode_cfg = |mode: &str| -> infr_core::config::GemvCfg {
         let mut g = infr_core::config::GemvCfg {
             rm_maxout: 999_999,
@@ -206,7 +206,7 @@ fn decode_gemv_bw() {
             let t = std::time::Instant::now();
             run();
             let us = t.elapsed().as_secs_f64() * 1e6 / reps as f64;
-            wbytes as f64 / (us * 1e-6) / 1e9
+            wbytes as f64 / (us * 1e-6) / (1u64 << 30) as f64
         };
         // Best-of-3, interleaved, to fight the ~25% thermal swing.
         let mut best = [0f64; 6];
@@ -219,7 +219,7 @@ fn decode_gemv_bw() {
         let rm_best = r2.max(r4);
         let sg_best = s2.max(s4).max(s8);
         println!(
-            "  {label} in{in_f} out{out_f} {dt:?} [{} MiB]:  tree {g1:5.0}  RM2 {r2:5.0} RM4 {r4:5.0}  |  SG2 {s2:5.0} SG4 {s4:5.0} SG8 {s8:5.0} GB/s  (SGbest vs tree {:+.0}%, vs RMbest {:+.0}%, maxrel {sg_maxrel:.1e})",
+            "  {label} in{in_f} out{out_f} {dt:?} [{} MiB]:  tree {g1:5.0}  RM2 {r2:5.0} RM4 {r4:5.0}  |  SG2 {s2:5.0} SG4 {s4:5.0} SG8 {s8:5.0} GiB/s  (SGbest vs tree {:+.0}%, vs RMbest {:+.0}%, maxrel {sg_maxrel:.1e})",
             wbytes >> 20,
             (sg_best / g1 - 1.0) * 100.0,
             (sg_best / rm_best - 1.0) * 100.0,

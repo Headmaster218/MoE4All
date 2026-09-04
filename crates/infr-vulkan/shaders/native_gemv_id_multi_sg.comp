@@ -117,7 +117,7 @@ void main() {
     //
     // NR rows/workgroup is what makes this tier pay for the GRID formats, and for a different
     // reason than it pays for Q5_K/Q6_K: the tree id kernel computes ONE output row per workgroup,
-    // so every workgroup re-stages the WHOLE table (8 KB for IQ2_S) to serve a single row's worth
+    // so every workgroup re-stages the WHOLE table (8 KiB for IQ2_S) to serve a single row's worth
     // of gathers — staging costs more than the dot product it feeds. NR folds the workgroup count
     // (and the staging with it) down by NR. Ablating grid_init() entirely on
     // Qwen3.6-35B-A3B-UD-IQ3_S tg64 measured native_idm_iq2s 49.8 → 23.3ms and native_idm_iq3s

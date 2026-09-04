@@ -1,5 +1,5 @@
 #version 460
-// Register-blocked FlashAttention partial specialized for head_dim=256 on devices with a 32 KB
+// Register-blocked FlashAttention partial specialized for head_dim=256 on devices with a 32 KiB
 // shared-memory limit. BM=16 plus a final-tile staging slab uses 30,912 bytes. Four subgroup
 // column workers split both the BN=64 QK tile and the HD=256 PV tile, so each subgroup owns one
 // 16x16 score fragment and four 16x16 output fragments. Full tiles read K/V directly; only the

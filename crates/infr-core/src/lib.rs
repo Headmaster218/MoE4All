@@ -71,12 +71,12 @@ impl SizeSpec {
 }
 
 /// Parse a human size/count string: a plain number is the base unit (bytes for sizes, tokens for
-/// counts); an optional case-insensitive suffix scales by 1024-powers — `k`, `m`, `g`, `t` (a
-/// trailing `b` is tolerated: `256mb` == `256m`; a bare `b` is the base unit, so
-/// `INFR_CACHE=256b` == `256`); a `%` suffix yields [`SizeSpec::Percent`], which the caller
-/// resolves against the device-appropriate base ([`SizeSpec::resolve`]). Fractional mantissas
-/// work (`1.5g`, `12.5%`). `None` on anything else — callers treat unparseable values as unset
-/// rather than guessing.
+/// counts); an optional case-insensitive IEC suffix scales by 1024-powers — `kib`, `mib`, `gib`,
+/// `tib`. The short forms `k`, `m`, `g`, `t` and historical `kb`, `mb`, `gb`, `tb` spellings stay
+/// accepted as compatibility aliases; a bare `b` is the base unit, so `INFR_CACHE=256b` == `256`.
+/// A `%` suffix yields [`SizeSpec::Percent`], which the caller resolves against the
+/// device-appropriate base ([`SizeSpec::resolve`]). Fractional mantissas work (`1.5GiB`, `12.5%`).
+/// `None` on anything else — callers treat unparseable values as unset rather than guessing.
 ///
 /// This is the shared grammar for every size/count env the engine reads (`INFR_CACHE`,
 /// `INFR_CTX`, ...): one parser so `256m` never means something different between knobs.
@@ -90,10 +90,18 @@ pub fn parse_size(s: &str) -> Option<SizeSpec> {
         return Some(SizeSpec::Percent(v / 100.0));
     }
     let (num, mult): (&str, u64) = match s.as_bytes() {
-        [head @ .., b'k', b'b'] | [head @ .., b'k'] => (std::str::from_utf8(head).ok()?, 1 << 10),
-        [head @ .., b'm', b'b'] | [head @ .., b'm'] => (std::str::from_utf8(head).ok()?, 1 << 20),
-        [head @ .., b'g', b'b'] | [head @ .., b'g'] => (std::str::from_utf8(head).ok()?, 1 << 30),
-        [head @ .., b't', b'b'] | [head @ .., b't'] => (std::str::from_utf8(head).ok()?, 1 << 40),
+        [head @ .., b'k', b'i', b'b'] | [head @ .., b'k', b'b'] | [head @ .., b'k'] => {
+            (std::str::from_utf8(head).ok()?, 1 << 10)
+        }
+        [head @ .., b'm', b'i', b'b'] | [head @ .., b'm', b'b'] | [head @ .., b'm'] => {
+            (std::str::from_utf8(head).ok()?, 1 << 20)
+        }
+        [head @ .., b'g', b'i', b'b'] | [head @ .., b'g', b'b'] | [head @ .., b'g'] => {
+            (std::str::from_utf8(head).ok()?, 1 << 30)
+        }
+        [head @ .., b't', b'i', b'b'] | [head @ .., b't', b'b'] | [head @ .., b't'] => {
+            (std::str::from_utf8(head).ok()?, 1 << 40)
+        }
         [head @ .., b'b'] => (std::str::from_utf8(head).ok()?, 1),
         _ => (s.as_str(), 1),
     };
@@ -120,10 +128,14 @@ mod parse_size_tests {
         assert_eq!(parse_size("256k"), b(256 << 10));
         assert_eq!(parse_size("256K"), b(256 << 10));
         assert_eq!(parse_size("256kb"), b(256 << 10));
+        assert_eq!(parse_size("256KiB"), b(256 << 10));
         assert_eq!(parse_size("3m"), b(3 << 20));
+        assert_eq!(parse_size("3MiB"), b(3 << 20));
         assert_eq!(parse_size("19g"), b(19u64 << 30));
+        assert_eq!(parse_size("19GiB"), b(19u64 << 30));
         assert_eq!(parse_size("1t"), b(1 << 40));
-        assert_eq!(parse_size("1.5g"), b((1.5 * (1u64 << 30) as f64) as u64));
+        assert_eq!(parse_size("1TiB"), b(1 << 40));
+        assert_eq!(parse_size("1.5GiB"), b((1.5 * (1u64 << 30) as f64) as u64));
         assert_eq!(parse_size(" 8G "), b(8u64 << 30));
         assert_eq!(parse_size("0"), b(0));
         assert_eq!(parse_size("80%"), Some(SizeSpec::Percent(0.8)));

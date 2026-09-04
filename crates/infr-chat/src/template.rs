@@ -47,7 +47,7 @@ static ENV_CACHE: LazyLock<Mutex<HashMap<String, SharedEnv>>> =
 /// | 1000 turns, 32 tools (gemma-4, worst)     | 14_336_388 |      ~7x |
 /// | 4001 messages, 64 tools (gemma-4, worst)  | 56_672_684 |    ~1.8x |
 ///
-/// The bottom row is a 276 KB prompt — past any context window infr serves — and it still renders.
+/// The bottom row is a 276 KiB prompt — past any context window infr serves — and it still renders.
 /// The ceiling is also self-limiting in wall-clock terms: minijinja runs ~90M instructions/sec in
 /// release, so a render that actually exhausts 100M fuel has already burned a full CPU-second
 /// building a PROMPT, which is itself the pathology, not the work.
@@ -120,7 +120,7 @@ fn build_env(template: &str) -> Result<minijinja::Environment<'static>, minijinj
 ///
 /// ONE lock acquisition covers both the lookup and the insert. Split across two (get, drop, build,
 /// re-lock, insert) the miss path is a race: under `serve --parallel N` the first N requests for a
-/// freshly loaded model arrive together, all miss, all parse the (16 KB, for gemma-4) template, and
+/// freshly loaded model arrive together, all miss, all parse the (16 KiB, for gemma-4) template, and
 /// the last insert overwrites the rest — N-1 parses thrown away, and N distinct `Arc`s briefly
 /// handed out for what is documented to be a shared compiled environment.
 ///

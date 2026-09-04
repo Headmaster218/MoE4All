@@ -512,7 +512,7 @@ cfg_struct! {
         /// AIR → GPU-ISA back end for every kernel, every launch.
         ///
         /// This caches the BACK end only: `MTLLibrary` exposes no way to serialize the AIR it
-        /// compiled from MSL, so the ~340 KB front-end compile in `Pipelines::build` still runs
+        /// compiled from MSL, so the ~340 KiB front-end compile in `Pipelines::build` still runs
         /// every launch (see `infr-metal/src/pcache.rs`).
         ///
         /// Has NO env key, like [`CpuCfg::reference`] — settable
@@ -732,8 +732,8 @@ cfg_struct! {
         ///
         /// A single HTTPS connection to the HF CDN is the ceiling, not the link, so a pull is
         /// worth spreading over several. Measured against `unsloth/DeepSeek-V3.2-GGUF`'s Q2_K
-        /// shards (`curl` to `/dev/null`, 25 s per run): one connection sustained 8.8 MB/s, five
-        /// sustained 78.7 MB/s — 15.7 MB/s EACH, so the per-connection rate went UP rather than
+        /// shards (`curl` to `/dev/null`, 25 s per run): one connection sustained 8.39 MiB/s, five
+        /// sustained 75.1 MiB/s — 15.0 MiB/s EACH, so the per-connection rate went UP rather than
         /// down. Five were nowhere near the point where they start competing, which is why the
         /// default sits above five.
         ///
@@ -742,10 +742,10 @@ cfg_struct! {
         ///
         /// * a split model is `-NNNNN-of-MMMMM` shards, fetched one file per connection;
         /// * a model shipped as ONE file — `unsloth/DeepSeek-V3.2-GGUF`'s `UD-TQ1_0` is a single
-        ///   161 GB GGUF — is split into byte ranges instead, fetched several at a time and
+        ///   150 GiB GGUF — is split into byte ranges instead, fetched several at a time and
         ///   reassembled (measured on that object through `infr pull` itself, same 60-second
-        ///   window: 11.4 MB/s at `1`, 80.5 MB/s at the default `8`; the whole 161 GB pull ran at
-        ///   80.0 MB/s end to end);
+        ///   window: 10.9 MiB/s at `1`, 76.8 MiB/s at the default `8`; the whole 150 GiB pull ran at
+        ///   76.3 MiB/s end to end);
         /// * and the tail of a shard set, where fewer files remain than there are connections,
         ///   gives the leftovers to the files still going.
         ///

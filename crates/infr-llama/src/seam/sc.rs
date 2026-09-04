@@ -47,7 +47,7 @@ pub(super) struct SelfCondWeights {
     /// vocab-tiled loop is L3-BANDWIDTH-bound (each canvas row re-reads the tile from L3 —
     /// FMA alone measured neutral), so halving the element width halves the traffic. Same
     /// precision as the reference, whose `sc_embT` is f16 (its CPU matmul then also converts
-    /// through f16). ~1.5 GB for gemma's 262k vocab, built once per session.
+    /// through f16). ~1.5 GiB for gemma's 262k vocab, built once per session.
     pub(super) emb16: Vec<u16>,
 }
 
@@ -62,7 +62,7 @@ pub(super) struct SelfCondWeights {
 /// directly against the CPU runner's already-dequantized `token_embd` table (a vocab-tiled
 /// threaded GEMM — see the `SC_VT` comment in the body) rather than materializing the
 /// reference's second on-device transposed-embedding
-/// weight (`sc_embT`, ~1.4 GB). CPU keeps this host path (this function). Phase-B moved the
+/// weight (`sc_embT`, ~1.4 GiB). CPU keeps this host path (this function). Phase-B moved the
 /// Vulkan denoise path's SC block IN-GRAPH instead (a `sc_embT` device weight + `Op::Softmax` +
 /// `Op::Linear`/`Op::GatedAct` — see the SC subgraph in `build` and `build_sc_embt` below) since
 /// the host matvec here was ~85% of every Vulkan denoise step's wall time (see
@@ -88,7 +88,7 @@ pub(super) fn diffusion_self_cond(
     let sqrt_ne = (ne as f32).sqrt();
     let eps = c.rms_eps;
     // probs = softmax(logits * temp_inv) over the FULL vocab, all rows up front ([cc, vocab] —
-    // ~1 MB/row; materialized so the soft-embed below can be vocab-TILED across rows).
+    // ~1 MiB/row; materialized so the soft-embed below can be vocab-TILED across rows).
     let mut probs = vec![0f32; cc * vocab];
     probs
         .par_chunks_mut(vocab)
@@ -110,10 +110,10 @@ pub(super) fn diffusion_self_cond(
     // soft = (probs @ token_embd) — a [ne] weighted sum over ALL vocab rows per canvas row
     // (token_embd is row-major [vocab, ne], already fully dequantized in host memory).
     //
-    // TILED over vocab: the naive per-row loop streams the whole [vocab, ne] f32 table (~2 GB for
-    // gemma's 262k vocab) once per canvas row — cc=256 rows ≈ 540 GB of DRAM traffic, which alone
+    // TILED over vocab: the naive per-row loop streams the whole [vocab, ne] f32 table (~2 GiB for
+    // gemma's 262k vocab) once per canvas row — cc=256 rows ≈ 540 GiB of DRAM traffic, which alone
     // was ~47% of every denoise step. Instead each `SC_VT`-row embedding tile (SC_VT·ne·4 B ≈
-    // 16 MB — L3-resident) is consumed by ALL cc rows while hot, so the table streams from DRAM
+    // 16 MiB — L3-resident) is consumed by ALL cc rows while hot, so the table streams from DRAM
     // ONCE per step. The accumulation uses FMA (`mul_add`): once the tiling made this loop
     // compute-bound, the unfused mul+add pair was the ceiling — the reference (llama.cpp) runs
     // this very matmul as f16 weights with FMA accumulation, so f32+FMA is strictly MORE precise
@@ -159,8 +159,8 @@ pub(super) fn diffusion_self_cond(
     drop(soft_all);
     // Gated-GELU MLP: down(gelu_tanh(gate·normed) * (up·normed)) — WEIGHT-row-major loops, same
     // traffic argument as the soft-embed above: the per-canvas-row version streamed the full
-    // gate/up/down tables (~400 MB f32) once per row. Parallelizing over WEIGHT rows instead
-    // streams each table once per step, with the [cc, ne] activations (2 MB) L3-hot. `act` is
+    // gate/up/down tables (~400 MiB f32) once per row. Parallelizing over WEIGHT rows instead
+    // streams each table once per step, with the [cc, ne] activations (2 MiB) L3-hot. `act` is
     // kept TRANSPOSED ([nff, cc]) so both phases read/write contiguously. Bit-identical: every
     // per-(row, f) / per-(row, e) dot accumulates in the same ascending element order.
     let mut act_t = vec![0f32; nff * cc];
@@ -179,7 +179,7 @@ pub(super) fn diffusion_self_cond(
     drop(normed_all);
     // down phase, also weight-row-major: one [cc]-wide accumulator per output dim `e`, written
     // TRANSPOSED ([ne, cc]) so every read and write streams contiguously; the final [cc, ne]
-    // un-transpose is a 2 MB copy — noise next to the streaming reads it buys.
+    // un-transpose is a 2 MiB copy — noise next to the streaming reads it buys.
     let mut sig_t = vec![0f32; ne * cc];
     sig_t.par_chunks_mut(cc).enumerate().for_each(|(e, acc)| {
         let drow = &down_w[e * nff..e * nff + nff];

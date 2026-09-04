@@ -357,10 +357,10 @@ fn denoise_block(
                 // first `exp` in a per-thread scratch buffer (reused across this worker's
                 // positions instead of a fresh per-position `Vec`) drops the loop from 2 exp passes +
                 // 1 ln pass to 1 exp pass + 1 ln pass over the row — same values, same order,
-                // bit-identical output, ~1/3 fewer transcendental calls and one fewer full 1 MB/row
+                // bit-identical output, ~1/3 fewer transcendental calls and one fewer full 1 MiB/row
                 // traversal.
                 // The `escratch` is a persistent PER-THREAD `thread_local` grown once to `vocab`,
-                // NOT a `map_init` init closure — the latter reallocated the ~1 MB buffer fresh on
+                // NOT a `map_init` init closure — the latter reallocated the ~1 MiB buffer fresh on
                 // every `par_iter` (i.e. every denoise step). Same values/order, bit-identical.
                 thread_local! {
                     static ESCRATCH: std::cell::RefCell<Vec<f32>> =

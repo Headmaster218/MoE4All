@@ -149,8 +149,8 @@ fn read_bandwidth_ceiling() {
     let f = lib.get_function("sumr", None).unwrap();
     let pso = dev.new_compute_pipeline_state_with_function(&f).unwrap();
 
-    let mb = 512usize;
-    let bytes = mb * 1024 * 1024;
+    let mib = 512usize;
+    let bytes = mib * 1024 * 1024;
     let src = dev.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
     let out = dev.new_buffer(4096, MTLResourceOptions::StorageModeShared);
     let n4 = (bytes / 16) as u32;
@@ -171,9 +171,9 @@ fn read_bandwidth_ceiling() {
             let dt = t0.elapsed().as_secs_f64();
             if rep > 0 {
                 println!(
-                    "read ceiling ({threads} threads): {mb} MB in {:.2} ms -> {:.1} GB/s",
+                    "read ceiling ({threads} threads): {mib} MiB in {:.2} ms -> {:.1} GiB/s",
                     dt * 1e3,
-                    bytes as f64 / dt / 1e9
+                    bytes as f64 / dt / (1u64 << 30) as f64
                 );
             }
         }

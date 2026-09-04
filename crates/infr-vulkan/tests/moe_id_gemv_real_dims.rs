@@ -4,7 +4,7 @@
 //! (`moe_id_gemv_new_formats_parity.rs`) passes while the real model device-losts: one decode
 //! step submits 40x(gate,up,down) = 120 `linear_native_id_multi` dispatches in one queue submit,
 //! and when the grid decode is scratch-bound (dynamically-indexed const grid LUTs → one
-//! per-invocation scratch table copy PER ACCESS SITE; the IQ2_S pipeline carried 1 MB of scratch)
+//! per-invocation scratch table copy PER ACCESS SITE; the IQ2_S pipeline carried 1 MiB of scratch)
 //! the real model's decode step exceeds amdgpu's ~10s gfx-ring timeout (TDR, `ring gfx_0.0.0
 //! timeout` in dmesg — NOT a page fault). This test replays that decode-step shape with synthetic
 //! banks and asserts the submit stays FAR from the timeout: the scratch-bound kernels measured
@@ -96,8 +96,8 @@ const N_EXPERT: usize = 256;
 const N_USED: usize = 8;
 const N_LAYER: usize = 40;
 /// Distinct weight banks cycled across the 40 layers: one shared bank would sit in the 7900 XTX's
-/// 96 MB Infinity Cache and hide the real model's per-layer cold-bank traffic (each real layer
-/// streams ~290 MB of distinct expert weights).
+/// 96 MiB Infinity Cache and hide the real model's per-layer cold-bank traffic (each real layer
+/// streams ~290 MiB of distinct expert weights).
 const N_BANKS: usize = 8;
 
 fn make_role(be: &VulkanBackend, dt: DType, in_f: usize, out_f: usize, seed: u64) -> Role {

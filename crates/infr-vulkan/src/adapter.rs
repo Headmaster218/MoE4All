@@ -650,7 +650,7 @@ fn mmv_decode_enabled(vk: &infr_core::config::VulkanCfg) -> bool {
 /// Multi-warp int8 dp4a decode GEMV route (`native_mmv_mw.comp`, llama's mul_mat_vec_q block:
 /// warp-per-row subgroupAdd, WARPS warps/block) for wave32-native GPUs (NVIDIA/Intel — on Intel
 /// the warps are pinned SG=16 via `caps.sg_pref`). There the AMD-tuned scalar-dequant decode GEMV
-/// runs memory-LATENCY-starved (~30 GB/s of 616 on an RTX 2080 Ti) — a per-op dead end for the
+/// runs memory-LATENCY-starved (~27.9 GiB/s of 574 on an RTX 2080 Ti) — a per-op dead end for the
 /// scalar path, since it is the f32 dequant ALU + the `v[32]` register pressure (not the
 /// reduction) that cap it (a scalar multi-warp variant measured SLOWER than the tree). Only dp4a
 /// (raw int8 blocks, no f32 dequant) breaks the ceiling: Qwen3-1.7B Q4_K_M tg128 17.9 → 61.7 t/s
@@ -1582,7 +1582,7 @@ fn lower_op(
             // Decode (m=1) and non-tileable shapes fall through to the GEMV.
             // Small multi-row batches (m = 2..8: spec-decode verify rows, a short chat-turn
             // suffix prefill) take the multi-row GEMV first — the single-M-tile coopmat GEMM
-            // launches only n/64 workgroups (underfills the GPU: measured 51-182 GB/s effective
+            // launches only n/64 workgroups (underfills the GPU: measured 47-170 GiB/s effective
             // weight stream vs the GEMV class's 292-651 on a 7900 XTX), and the plain GEMV
             // re-streams the weight per row. 7900 XTX, 8B Q4_K shapes: m=2 is 5.6-8.3x the GEMM
             // route, m=4 1.4-4.1x, m=8 1.7-2.6x — EXCEPT very wide n at m>=5 (gate+up n=24576:
@@ -3849,7 +3849,7 @@ fn lower_op(
                 // without the feature (Intel Arc/ANV) previously ran ALL prefill attention on the
                 // scalar per-row `attention_kv` (31% of knob pp512 on Qwen3-14B) or, for rows<64 /
                 // ring-past shapes, the split-K path. This shared-memory fma tile (no subgroup
-                // ops, ≤54 KB shared) takes the flash tier's row floor; unlike flash/nonfa it
+                // ops, ≤54 KiB shared) takes the flash tier's row floor; unlike flash/nonfa it
                 // handles SWA windows AND ring caches (attn_partial's `cap` row-modulo mapping),
                 // so ring-past prefill rides it too. f16 KV only — quantized KV was already
                 // dequanted to the f16 ring-layout scratch above at rows>1 (`k/v_q8_eff` false by
@@ -3878,7 +3878,7 @@ fn lower_op(
                 // f16 scratch above, so k/v_q8_eff are false there by construction).
                 // Rows-BATCHED split tier (rows 12..flash-floor at deep kv): one workgroup per
                 // (head, chunk) streams K/V once per 4-row group through attn_partial_mrows_c256
-                // (7KB LDS). Measured wins over the per-row grid: pp12/16/20@d16384
+                // (7 KiB LDS). Measured wins over the per-row grid: pp12/16/20@d16384
                 // 741->799/822->924/882->1012 t/s, pp16@8k a wash — below rows=12 or kv=8192
                 // the per-row grid's extra workgroups fill the DRAM queue better than the
                 // bandwidth saving pays. hd<=128 (one q vec4 per lane per row); q8 never reaches
@@ -3898,7 +3898,7 @@ fn lower_op(
                     && !(k_q8_eff || v_q8_eff)
                     && mrows_attn != Some(false)
                     && ((rows >= 12 && kv_len >= 8192) || mrows_attn == Some(true));
-                // The batched kernel stages chunk scores in 4KB of LDS → chunk 256; the per-row
+                // The batched kernel stages chunk scores in 4 KiB of LDS → chunk 256; the per-row
                 // grid keeps the adaptive ~32-chunks policy.
                 //
                 // Canvas (DiffusionGemma denoise, slice 7 comparative-attribution against the
@@ -3972,9 +3972,9 @@ fn lower_op(
                 } else if (ring_past || cap_short) && rows >= 64 {
                     // Large-rows ring/capacity-limited prefill: the pm/pl/pacc partials are [rows,
                     // nh, n_chunks, hd] — the ordinary ~32-chunk policy would balloon them (1024
-                    // rows x 32 chunks x hd 256 ≈ 1 GB), and the span is already bounded (window +
+                    // rows x 32 chunks x hd 256 ≈ 1 GiB), and the span is already bounded (window +
                     // rows for a ring, kv_len itself here), so a few big chunks keep the scratch
-                    // ~100s of MB with plenty of workgroups (nh * n_chunks * rows).
+                    // ~100s of MiB with plenty of workgroups (nh * n_chunks * rows).
                     512
                 } else if rows == 1
                     && k_q8_eff
@@ -4005,7 +4005,7 @@ fn lower_op(
                 if flash_ok {
                     let mpad = rows.div_ceil(64) * 64;
                     // Pooled split partials (fully written before the combine reads them) — one
-                    // set serves every layer instead of n_layer live copies (~1GB each at 8B p8k).
+                    // set serves every layer instead of n_layer live copies (~1 GiB each at 8B p8k).
                     let po = pooled(pool, be_, "flash_po", 8 * mpad * nh * hd * 4)?;
                     let pm = pooled(pool, be_, "flash_pm", 8 * mpad * nh * 4)?;
                     let pl = pooled(pool, be_, "flash_pl", 8 * mpad * nh * 4)?;
@@ -4069,7 +4069,7 @@ fn lower_op(
                     let mpad = rows.div_ceil(64) * 64;
                     let kv_pad = kv_len.div_ceil(256) * 256;
                     // Pooled scores scratch [nh, mpad, kv_pad] f16 + split-K PV partials (≤8
-                    // splits) f32 — ~80MB per attention op, fully written before read (attn_qk
+                    // splits) f32 — ~80 MiB per attention op, fully written before read (attn_qk
                     // fills every [mpad, kv_pad] row; PV partials are written per split before
                     // the reduce), and one set serves every same-shape layer.
                     let s = pooled(pool, be_, "nonfa_s", nh * mpad * kv_pad * 2)?;

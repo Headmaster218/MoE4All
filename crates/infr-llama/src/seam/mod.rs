@@ -17,6 +17,9 @@ use infr_core::WeightSource;
 use infr_cpu::CpuBackend;
 use infr_gguf::{Gguf, TensorBytes};
 
+const MIB_F64: f64 = (1u64 << 20) as f64;
+const GIB_F64: f64 = (1u64 << 30) as f64;
+
 pub mod model;
 mod ple;
 mod runner;
@@ -198,12 +201,12 @@ fn cpu_paged_store(
         infr_core::hostmem::ArenaPlan::Take(n) => {
             if ram_request == infr_core::hostmem::RamRequest::Auto {
                 tracing::info!(
-                    "host paging: {:.2} GB of weights exceed the {:.2} GB of host memory \
-                     available, so they stream from disk through a {:.2} GB arena instead of the \
+                    "host paging: {:.2} GiB of weights exceed the {:.2} GiB of host memory \
+                     available, so they stream from disk through a {:.2} GiB arena instead of the \
                      OS page cache (set INFR_RAM_BUDGET to override)",
-                    pageable as f64 / 1e9,
-                    available.unwrap_or(0) as f64 / 1e9,
-                    n as f64 / 1e9,
+                    pageable as f64 / GIB_F64,
+                    available.unwrap_or(0) as f64 / GIB_F64,
+                    n as f64 / GIB_F64,
                 );
             }
             n as usize
@@ -215,12 +218,12 @@ fn cpu_paged_store(
             // where the run is about to be slow for a reason the user can act on.
             if why == Skip::TooLittle {
                 tracing::warn!(
-                    "host paging: {:.2} GB of weights do not fit the {:.2} GB of host memory \
+                    "host paging: {:.2} GiB of weights do not fit the {:.2} GiB of host memory \
                      available, but too little is free to seat a useful arena — falling back to \
                      the OS page cache, which thrashes on a forward pass's cyclic sweep. Free \
                      memory, or set INFR_RAM_BUDGET explicitly",
-                    pageable as f64 / 1e9,
-                    available.unwrap_or(0) as f64 / 1e9,
+                    pageable as f64 / GIB_F64,
+                    available.unwrap_or(0) as f64 / GIB_F64,
                 );
             }
             return Ok(None);
@@ -229,9 +232,9 @@ fn cpu_paged_store(
     let plans = infr_cpu::paged::plan_pools(budget, g.tensors());
     if plans.is_empty() {
         tracing::warn!(
-            "host paging: a {:.2} GB budget seats no weight class of this model — keeping the \
+            "host paging: a {:.2} GiB budget seats no weight class of this model — keeping the \
              mmap path (raise INFR_RAM_BUDGET enough to leave room for one tensor)",
-            budget as f64 / 1e9,
+            budget as f64 / GIB_F64,
         );
         return Ok(None);
     }
@@ -240,10 +243,10 @@ fn cpu_paged_store(
     );
     let store = infr_cpu::paged::PagedWeights::new(&plans, io).map_err(|e| anyhow!("{e}"))?;
     tracing::info!(
-        "host paging: {} weight class(es), {:.2} GB arena of a {:.2} GB budget",
+        "host paging: {} weight class(es), {:.2} GiB arena of a {:.2} GiB budget",
         plans.len(),
-        store.arena_bytes() as f64 / 1e9,
-        budget as f64 / 1e9,
+        store.arena_bytes() as f64 / GIB_F64,
+        budget as f64 / GIB_F64,
     );
     Ok(Some(std::sync::Arc::new(store)))
 }
@@ -336,10 +339,10 @@ fn vulkan_host_tier(
         infr_core::hostmem::ArenaPlan::Take(n) => {
             if ram_request == infr_core::hostmem::RamRequest::Auto {
                 tracing::info!(
-                    "{what} host tier: sized automatically to {:.2} GB of {:.2} GB available host \
+                    "{what} host tier: sized automatically to {:.2} GiB of {:.2} GiB available host \
                      memory (set INFR_RAM_BUDGET to override)",
-                    n as f64 / 1e9,
-                    available.unwrap_or(0) as f64 / 1e9,
+                    n as f64 / GIB_F64,
+                    available.unwrap_or(0) as f64 / GIB_F64,
                 );
             }
             n as usize
@@ -354,10 +357,10 @@ fn vulkan_host_tier(
                      OS page cache"
                 ),
                 Skip::TooLittle => tracing::warn!(
-                    "{what} host tier: this model must stream, but only {:.2} GB of host memory \
+                    "{what} host tier: this model must stream, but only {:.2} GiB of host memory \
                      is available — too little to seat a useful arena, so the weights stay on the \
                      OS page cache. Free memory, or set INFR_RAM_BUDGET explicitly",
-                    available.unwrap_or(0) as f64 / 1e9,
+                    available.unwrap_or(0) as f64 / GIB_F64,
                 ),
                 // Off by name: say so once, because a user who set it and then wonders why
                 // streaming is slow should find the reason in the log.
@@ -375,9 +378,9 @@ fn vulkan_host_tier(
     let slots = infr_core::hostpager::plan_slots(budget, classes);
     if slots.iter().all(|&n| n == 0) {
         tracing::warn!(
-            "{what} host tier: a {:.2} GB budget seats no block class of this model — keeping \
+            "{what} host tier: a {:.2} GiB budget seats no block class of this model — keeping \
              the mmap path (raise INFR_RAM_BUDGET enough to leave room for one block)",
-            budget as f64 / 1e9,
+            budget as f64 / GIB_F64,
         );
         return Ok(unpaged());
     }
@@ -397,11 +400,11 @@ fn vulkan_host_tier(
         out.push(Some(std::sync::Arc::new(p)));
     }
     tracing::info!(
-        "{what} host tier: {} of {} pool(s) paged, {:.2} GB arena of a {:.2} GB budget",
+        "{what} host tier: {} of {} pool(s) paged, {:.2} GiB arena of a {:.2} GiB budget",
         slots.iter().filter(|&&n| n > 0).count(),
         classes.len(),
-        arena as f64 / 1e9,
-        budget as f64 / 1e9,
+        arena as f64 / GIB_F64,
+        budget as f64 / GIB_F64,
     );
     Ok(out)
 }
@@ -564,15 +567,15 @@ pub(crate) fn generate_dense_cpu_mode(
 fn report_host_paging(store: &infr_cpu::paged::PagedWeights) {
     for (slot_bytes, n_slots, s) in store.pool_stats() {
         tracing::info!(
-            "[host pager] {:.1}MB x {n_slots} slots: {} hits, {} misses ({:.1}% hit), {} evictions, \
-             {} reads, {:.2} GB from disk",
-            slot_bytes as f64 / 1e6,
+            "[host pager] {:.1} MiB x {n_slots} slots: {} hits, {} misses ({:.1}% hit), {} evictions, \
+             {} reads, {:.2} GiB from disk",
+            slot_bytes as f64 / MIB_F64,
             s.pager.hits,
             s.pager.misses,
             s.pager.hit_rate() * 100.0,
             s.pager.evictions,
             s.reads,
-            s.bytes_read as f64 / 1e9,
+            s.bytes_read as f64 / GIB_F64,
         );
     }
 }
@@ -2876,7 +2879,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
     //      caller (or a test) force the paged path deterministically instead of depending on
     //      this box's free VRAM — see the `gpu_seam_paged_moe_matches_*` tests. The value is the
     //      shared size grammar (`infr_core::parse_size`): plain bytes, `k/m/g/t` 1024-suffixes
-    //      (`INFR_CACHE=19g`), or a percentage of the device's AVAILABLE VRAM at first load
+    //      (`INFR_CACHE=19GiB`), or a percentage of the device's AVAILABLE VRAM at first load
     //      (`INFR_CACHE=80%` — device-appropriate base: the cache lives in VRAM).
     //   2. Auto (unset): fully resident (the fast path, zero change) when the banks fit VRAM;
     //      otherwise the pager with budget = remaining VRAM after dense+KV+headroom.
@@ -2898,7 +2901,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
     // the tier-3 budget math is consistent: `vram.available` is LIVE (heapBudget − heapUsage), so
     // once this model's weights are resident a recompute would subtract `fp.dense` from an
     // `available` that ALREADY excludes it — double-counting the model against itself and
-    // collapsing the budget (observed: a fully-resident 16.4 GB model "re-placed" as 5/30
+    // collapsing the budget (observed: a fully-resident 15.3 GiB model "re-placed" as 5/30
     // resident on the warm second call of a bench). Warm calls leave `n_paged` at 0; nothing
     // consumes it (no binding, and the pager init below is first_load-gated anyway). A first
     // load racing ANOTHER resident model (swap mid-drain) still reads reduced `available` —
@@ -2967,13 +2970,13 @@ pub(crate) fn vulkan_moe_binder<'a>(
             POST_KV_DEVICE_RESERVE,
         ) else {
             return Err(anyhow!(
-                "this MoE model's dense weights ({:.2} GB) + KV cache ({:.2} GB) exceed the unified \
-                 VRAM room ({:.2} GB after guard/reserve/configured cap) — dense layer streaming \
+                "this MoE model's dense weights ({:.2} GiB) + KV cache ({:.2} GiB) exceed the unified \
+                 VRAM room ({:.2} GiB after guard/reserve/configured cap) — dense layer streaming \
                  does not cover MoE models' dense parts; reduce ctx or run on the CPU backend \
                  (INFR_DEV=cpu)",
-                fp.dense as f64 / 1e9,
-                kv_bytes as f64 / 1e9,
-                room as f64 / 1e9,
+                fp.dense as f64 / GIB_F64,
+                kv_bytes as f64 / GIB_F64,
+                room as f64 / GIB_F64,
             ));
         };
         let requested_cache = cache_override.map(|spec| spec.resolve(vram.available));
@@ -3039,10 +3042,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 expert_cache_target_bytes = requested.min(auto_budget);
                 if requested > auto_budget {
                     tracing::warn!(
-                        "INFR_CACHE requested {:.2} GB of expert arena but the unified VRAM plan \
-                         leaves {:.2} GB; clamping the arena to the safe remainder",
-                        requested as f64 / 1e9,
-                        auto_budget as f64 / 1e9,
+                        "INFR_CACHE requested {:.2} GiB of expert arena but the unified VRAM plan \
+                         leaves {:.2} GiB; clamping the arena to the safe remainder",
+                        requested as f64 / GIB_F64,
+                        auto_budget as f64 / GIB_F64,
                     );
                 }
             }
@@ -3074,25 +3077,25 @@ pub(crate) fn vulkan_moe_binder<'a>(
             format!("k={k_fmt:?}, v={v_fmt:?}")
         };
         tracing::info!(
-            "VRAM plan: total_room={:.2} GB fixed={:.2} GB state={:.2} GB runtime_elastic={:.2} GB \
-             dynamic_state_elastic={:.2} GB \
-             packing_margin={:.2} GB load_driver={:.2} GB post_load={:.2} GB \
-             expert_cache_target={:.2} GB elastic_pool={:.2} GB ({cache_layout}, ctx={want_ctx})",
-            room as f64 / 1e9,
-            plan.fixed_weight_bytes as f64 / 1e9,
-            plan.persistent_state_bytes as f64 / 1e9,
-            plan.runtime_reserve_bytes as f64 / 1e9,
-            plan.dynamic_state_reserve_bytes as f64 / 1e9,
-            plan.weight_packing_margin_bytes as f64 / 1e9,
-            plan.load_driver_reserve_bytes as f64 / 1e9,
-            plan.post_load_reserve_bytes as f64 / 1e9,
+            "VRAM plan: total_room={:.2} GiB fixed={:.2} GiB state={:.2} GiB runtime_elastic={:.2} GiB \
+             dynamic_state_elastic={:.2} GiB \
+             packing_margin={:.2} GiB load_driver={:.2} GiB post_load={:.2} GiB \
+             expert_cache_target={:.2} GiB elastic_pool={:.2} GiB ({cache_layout}, ctx={want_ctx})",
+            room as f64 / GIB_F64,
+            plan.fixed_weight_bytes as f64 / GIB_F64,
+            plan.persistent_state_bytes as f64 / GIB_F64,
+            plan.runtime_reserve_bytes as f64 / GIB_F64,
+            plan.dynamic_state_reserve_bytes as f64 / GIB_F64,
+            plan.weight_packing_margin_bytes as f64 / GIB_F64,
+            plan.load_driver_reserve_bytes as f64 / GIB_F64,
+            plan.post_load_reserve_bytes as f64 / GIB_F64,
             (if n_paged > 0 {
                 expert_cache_target_bytes
             } else {
                 fp.expert
             }) as f64
-                / 1e9,
-            pager_budget_bytes as f64 / 1e9,
+                / GIB_F64,
+            pager_budget_bytes as f64 / GIB_F64,
         );
     }
     // The layer index of a `blk.{l}.…_exps…` tensor name.
@@ -3436,9 +3439,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     moe_host_by_size.insert(slot_bytes, std::sync::Arc::new(cache));
                 }
                 tracing::info!(
-                    "MoE host plan: bounded inclusive RAM cache {:.2} GB / {:.2} GB expert payload; GPU shadows share this budget and remaining Experts stream from SSD",
-                    host_cache_budget as f64 / 1e9,
-                    host_bytes as f64 / 1e9,
+                    "MoE host plan: bounded inclusive RAM cache {:.2} GiB / {:.2} GiB expert payload; GPU shadows share this budget and remaining Experts stream from SSD",
+                    host_cache_budget as f64 / GIB_F64,
+                    host_bytes as f64 / GIB_F64,
                 );
             } else {
                 // Keep the complete payload in one logical layer-major store, split only BETWEEN
@@ -3470,9 +3473,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     })
                     .collect();
                 tracing::info!(
-                    "MoE host plan: full layer-contiguous RAM store {:.2} GB; RAM budget covers \
+                    "MoE host plan: full layer-contiguous RAM store {:.2} GiB; RAM budget covers \
                      every routed expert, runtime SSD tier disabled",
-                    host_bytes as f64 / 1e9,
+                    host_bytes as f64 / GIB_F64,
                 );
             }
             // No per-pool arena ceiling: each MoE pool is a `bufferDeviceAddress` buffer read by
@@ -3501,7 +3504,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         // that layer that must be simultaneously resident (the within-batch safety
                         // invariant — see `infr_core::pager::Pager::new`'s doc). Decode's rows=1 needs
                         // only `n_used`, but the batched bound subsumes it and `n_expert` slots is tiny
-                        // next to any real budget (Scout: 16 x ~18 MB per role). Capped at `nb` (no
+                        // next to any real budget (Scout: 16 x ~17.2 MiB per role). Capped at `nb` (no
                         // point holding more slots than the pool has distinct experts).
                         // The dynamic Prefill ring can legally degrade to one lane when the user
                         // budget cannot hold its topology target. The old A/B implementation
@@ -3521,19 +3524,24 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 .iter()
                 .zip(&pools)
                 .map(|(&(sb, nb, _), p)| {
-                    format!("shared[{:.1}MB] {}/{}", sb as f64 / 1e6, p.n_slots, nb)
+                    format!(
+                        "shared[{:.1} MiB] {}/{}",
+                        sb as f64 / MIB_F64,
+                        p.n_slots,
+                        nb
+                    )
                 })
                 .collect();
             tracing::info!(
                 "MoE pager: {n_paged}/{} expert layers PAGED ({cached} expert blocks cached — {}; \
-             {:.2} GB device arena budget; Decode size bias {size_cache_bias:+.2} \
-             ({size_cache_bias_source}); host={} {:.2} GB in {host_chunk_count} chunks; \
+             {:.2} GiB device arena budget; Decode size bias {size_cache_bias:+.2} \
+             ({size_cache_bias_source}); host={} {:.2} GiB in {host_chunk_count} chunks; \
              ctx={want_ctx})",
                 cfg.n_layer,
                 pool_desc.join(", "),
-                pager_budget_bytes as f64 / 1e9,
+                pager_budget_bytes as f64 / GIB_F64,
                 host_kind,
-                host_resident_bytes as f64 / 1e9,
+                host_resident_bytes as f64 / GIB_F64,
             );
             // Recurrent hybrids use current + the longest consecutive recurrent run. The pager
             // may lower that target to fit the Expert-cache share, but never spends the runtime
@@ -3673,7 +3681,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // path) whenever weights + this session's KV + an HONEST dense activation estimate fit
         // the allocatable VRAM; only a genuine miss streams. The MoE tier's 2 GiB ACT_HEADROOM is
         // sized for pager arenas/staging that a dense-resident session doesn't have — reusing it
-        // here streamed gemma-4-31B (21.9 GB weights on a 24 GB card, decode 33 t/s resident vs
+        // here streamed gemma-4-31B (20.4 GiB weights on a 24 GiB card, decode 33 t/s resident vs
         // ~3 t/s streamed at the PCIe ceiling). If residency is chosen but a later activation
         // alloc still misses (fragmentation, another process grabbing VRAM), the alloc-time VRAM
         // guard fails that request cleanly — INFR_CACHE=<size> is the escape hatch that forces
@@ -3790,10 +3798,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 );
                 if requested > safe {
                     tracing::warn!(
-                        "INFR_CACHE requested {:.2} GB of dense streaming arena but the unified \
-                         VRAM plan leaves {:.2} GB; clamping the arena to the safe remainder",
-                        requested as f64 / 1e9,
-                        safe as f64 / 1e9,
+                        "INFR_CACHE requested {:.2} GiB of dense streaming arena but the unified \
+                         VRAM plan leaves {:.2} GiB; clamping the arena to the safe remainder",
+                        requested as f64 / GIB_F64,
+                        safe as f64 / GIB_F64,
                     );
                 }
                 Some(requested.min(safe))
@@ -3896,7 +3904,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     // `DensePagerSession`), NEVER bound as a descriptor, so BOTH pre-BDA caps are
                     // gone — no `maxStorageBufferRange` binding ceiling and no u32 element-reach
                     // limit. A single pool may span well past 4 GiB (matching the paged-MoE arena,
-                    // e.g. Scout's 6.57 GB role pools).
+                    // e.g. Scout's 6.12 GiB role pools).
                     let share =
                         (budget as u128 * (stride * nb) as u128 / total_bytes as u128) as u64;
                     let floor = 2.min(nb).max(1);
@@ -3916,23 +3924,23 @@ pub(crate) fn vulkan_moe_binder<'a>(
             if alloc > budget.max(1) && cache_override.is_none() {
                 // Auto tier only: the floors overran what's actually free — streaming can't help.
                 return Err(anyhow!(
-                    "dense weights exceed VRAM and the leftover budget ({:.2} GB) can't hold \
-                     even the streaming floor ({:.2} GB) — reduce ctx or run on the CPU backend \
+                    "dense weights exceed VRAM and the leftover budget ({:.2} GiB) can't hold \
+                     even the streaming floor ({:.2} GiB) — reduce ctx or run on the CPU backend \
                      (INFR_DEV=cpu)",
-                    budget as f64 / 1e9,
-                    alloc as f64 / 1e9,
+                    budget as f64 / GIB_F64,
+                    alloc as f64 / GIB_F64,
                 ));
             }
             let cached: usize = specs.iter().map(|s| s.n_slots).sum();
             let n_blocks: usize = specs.iter().map(|s| s.n_blocks).sum();
             tracing::info!(
                 "dense streaming: {n_blocks} weight blocks across {} pools, {cached} slots \
-                 cached ({:.2} GB arena + {:.2} GB ring; budget {:.2} GB; ctx={want_ctx}; \
+                 cached ({:.2} GiB arena + {:.2} GiB ring; budget {:.2} GiB; ctx={want_ctx}; \
                  chunk={})",
                 specs.len(),
-                alloc as f64 / 1e9,
-                ring_bytes as f64 / 1e9,
-                (budget + ring_bytes as u64) as f64 / 1e9,
+                alloc as f64 / GIB_F64,
+                ring_bytes as f64 / GIB_F64,
+                (budget + ring_bytes as u64) as f64 / GIB_F64,
                 ubatch_rows(ec).min(want_ctx),
             );
             vk.init_dense_pager(infr_vulkan::pager::DensePagerLayout {
@@ -5023,7 +5031,7 @@ pub(crate) enum WBytes {
     ///
     /// Kept as its COMPONENTS rather than a concatenated buffer, because a binder that pages or
     /// streams the group never wants the bytes at all: it registers the components' file ranges and
-    /// has them read straight into a slot later. Materializing first meant building a multi-MB
+    /// has them read straight into a slot later. Materializing first meant building a multi-MiB
     /// concat per fused group at load and immediately dropping it (and touching every one of those
     /// pages, which for a model that does not fit memory is the cost this whole tier exists to
     /// avoid).
@@ -6269,7 +6277,7 @@ mod seam_helper_tests {
     // are this box's 7900 XTX (`/sys/class/drm/card1/device/mem_info_vram_total` = 25 753 026 560,
     // live free ~23.94 GiB on an idle desktop).
 
-    /// RX 7900 XTX, 24 GB.
+    /// RX 7900 XTX, 24 GiB.
     const XTX_TOTAL: u64 = 25_753_026_560;
     /// Live FREE bytes on an idle XTX (~23.94 GiB) — the raw `VramInfo::available` figure, which is
     /// NOT the budget: see [`XTX_ROOM`].

@@ -148,11 +148,11 @@ fn moe_layer_wall() {
         "host"
     };
     // Dense-equivalent bytes: grouped GEMM reuses each expert's weights across routed rows.
-    let mb = (3 * n_used * nff * ne) as f64 * 0.5625 / 1e6;
+    let mib = (3 * n_used * nff * ne) as f64 * 0.5625 / (1u64 << 20) as f64;
     println!(
-        "moe layer ({path}, rows={rows}, marginal of {nlayers}-chain): {:.3} ms/op, dense-equivalent expert bytes {:.1} MB -> {:.1} effective GB/s",
+        "moe layer ({path}, rows={rows}, marginal of {nlayers}-chain): {:.3} ms/op, dense-equivalent expert bytes {:.1} MiB -> {:.1} effective GiB/s",
         per * 1e3,
-        mb * rows as f64,
-        mb * rows as f64 / 1e3 / per
+        mib * rows as f64,
+        mib * rows as f64 / 1024.0 / per
     );
 }

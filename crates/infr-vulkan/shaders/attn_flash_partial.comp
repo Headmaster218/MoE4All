@@ -5,8 +5,8 @@
 // (q-tile, head, split) emits an UN-normalized online-softmax partial: Os (running Σ exp(s-m)·v),
 // m (running max), l (running sum). attn_flash_combine merges splits per (row,head). No race: each
 // partial writes a disjoint [split] slice; combine only reads. Q/K/V f16, partials f32. hd%16,hd<=128.
-// BM_TILE (query rows/tile) is a build knob: shared scratch = BM*908 B. BM=64 → 58112 B (64 KB
-// device); BM=32 → 29056 B (NVIDIA 48 KB / MoltenVK 32 KB). Recorder picks the tile from
+// BM_TILE (query rows/tile) is a build knob: shared scratch = BM*908 B. BM=64 → 58112 B (64 KiB
+// device); BM=32 → 29056 B (NVIDIA 48 KiB / MoltenVK 32 KiB). Recorder picks the tile from
 // maxComputeSharedMemorySize; workgroup = (BM/16) subgroups of 32. (See attn_flash_warp.comp.)
 //
 // SHMEM STAGING (Levers 2 & 5, kv-decode-perf-levers). Two opt-in build variants stage the K/V tile
@@ -20,7 +20,7 @@
 // OCCUPANCY: the slab is a 32-WIDE COLUMN BLOCK (KVstg[BN*32], 4096 B), ONE buffer REUSED for K then
 // V — mirrors llama.cpp flash_attn_cm1's single `kvsh` sub-tile rather than a full Bc×hd K+V stage
 // (which halved occupancy → 2x slower, kv-u64-campaign slice-4). BM=64 default 58112 B → staged
-// 62208 B (still 1 stage-slab under the 64 KB cap). The stage is 32-wide because native_decode's
+// 62208 B (still 1 stage-slab under the 64 KiB cap). The stage is 32-wide because native_decode's
 // `dqblk` decodes 32 contiguous elements per call (one GGUF sub-block, scale decoded once); each slab
 // feeds two coopmat 16-wide kf/ct tiles. Q stays direct (query tile, small, always f16).
 #ifndef BM_TILE

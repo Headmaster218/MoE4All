@@ -6,8 +6,8 @@
 // multiply (thread owns its row). hd=128 specialized. Split-K over kv via gl_WorkGroupID.y; emits
 // un-normalized partials (Of, m, l) for attn_flash_combine. sg32.
 // BR_TILE (query rows/tile) is a build knob: shared = sfsh(BR*BC f32) + Psh(BR*BC f16) +
-// pvsh((BR/16)*256 f32) + 3*BR = BR*460 B. BR=128 → 58880 B (needs a 64 KB device); BR=64 →
-// 29440 B (fits NVIDIA 48 KB / MoltenVK 32 KB). The recorder picks the tile from
+// pvsh((BR/16)*256 f32) + 3*BR = BR*460 B. BR=128 → 58880 B (needs a 64 KiB device); BR=64 →
+// 29440 B (fits NVIDIA 48 KiB / MoltenVK 32 KiB). The recorder picks the tile from
 // maxComputeSharedMemorySize. BR only scales WARPS_M / workgroup size / shared arrays — the
 // per-warp 32×32 coopmat work (sacc[2][2]) and BC are fixed, so results are identical across tiles.
 #ifndef BR_TILE

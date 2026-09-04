@@ -150,7 +150,7 @@ fn fetch_and_link(
                 blobs,
                 filename,
                 want.as_deref(),
-                None, // model blobs are legitimately multi-GB — never capped
+                None, // model blobs are legitimately multi-GiB — never capped
                 budget,
                 progress,
             )?
@@ -187,7 +187,7 @@ fn fetch_and_link(
 /// The work queue is one shared cursor, so each file is handed to exactly one worker and the order
 /// is still shard 1 first. A failure sets `stop`, which keeps the other workers from CLAIMING more
 /// files (an in-flight transfer is not interruptible and runs to its own end) — without it, a
-/// missing shard 1 would be followed by cheerfully downloading the other 200 GB. That matches the
+/// missing shard 1 would be followed by cheerfully downloading the other 200 GiB. That matches the
 /// sequential loop this replaced, which stopped at the first `?`.
 ///
 /// `jobs = 0` and `jobs = 1` both mean strictly one connection: one file at a time, unsplit, which
@@ -272,7 +272,7 @@ fn fetch_all(
 /// `snapshots/<commit>/<file>` is two levels down from the repo dir → `../../blobs/<hex>`; every
 /// extra directory in `rel` (`snapshots/<commit>/UD-Q4_K_XL/<file>`) adds one more `..`. Hardcoding
 /// `../../` — as this used to — silently produces a DANGLING link for a subdirectory GGUF, which
-/// reads as "not cached" and re-downloads multiple GB on every run. The link must also stay valid
+/// reads as "not cached" and re-downloads multiple GiB on every run. The link must also stay valid
 /// when the whole hub dir is moved, and stay byte-identical to what `huggingface_hub` / llama.cpp
 /// would write, since the two share this cache (see the module header).
 pub(crate) fn blob_link_target(rel: &str, hex: &str) -> String {
@@ -469,13 +469,13 @@ const COMPANIONS: &[&str] = &["generation_config.json"];
 /// advertises an `X-Linked-Etag` sha256 for LFS objects, and a small `generation_config.json` is
 /// usually stored as a plain (non-LFS) blob, so there is nothing to check the body against. Without
 /// a cap, "unverified" also means "unbounded": a hostile mirror, a misrouted redirect or simply a
-/// broken proxy answering with a multi-GB body writes all of it into the user's HF cache before
+/// broken proxy answering with a multi-GiB body writes all of it into the user's HF cache before
 /// anyone notices, and the failure is disk exhaustion, not a bad config.
 ///
-/// 1 MiB is chosen as generous-but-finite. The real files are under 2 KB (a handful of sampling
+/// 1 MiB is chosen as generous-but-finite. The real files are under 2 KiB (a handful of sampling
 /// keys), so this is ~500x headroom — no plausible companion is ever refused — while bounding the
 /// worst case to a single megabyte of wasted I/O that is then deleted. The cap deliberately does
-/// NOT apply to the model blob path: a GGUF is legitimately multi-GB and is sha256-verified.
+/// NOT apply to the model blob path: a GGUF is legitimately multi-GiB and is sha256-verified.
 pub(crate) const MAX_COMPANION_BYTES: u64 = 1 << 20;
 
 /// Download any [`COMPANIONS`] the repo lists into `snap` (the GGUF's snapshot dir, so they sit
@@ -495,7 +495,7 @@ pub(crate) const MAX_COMPANION_BYTES: u64 = 1 << 20;
 /// Both new failure modes stay inside the non-fatal contract: a sha mismatch or an over-cap body
 /// is a `debug!` and a skipped companion, never a failed model pull.
 ///
-/// Deliberately NOT part of the [`fetch_all`] fan-out: this is one sub-2-KB file, so a connection
+/// Deliberately NOT part of the [`fetch_all`] fan-out: this is one sub-2-KiB file, so a connection
 /// spent on it buys nothing, and it runs after the shards precisely so it cannot take a slot from
 /// them.
 fn fetch_companions(
@@ -525,7 +525,7 @@ fn fetch_companions(
         // file is not LFS, so no digest exists; a HEAD transport error degrades to the same
         // unverified-but-capped path rather than skipping the companion.
         let want = head_lfs_sha(origin, repo, name).ok().flatten();
-        // No connection budget: a companion is a sub-2-KB file and splitting it across ranges
+        // No connection budget: a companion is a sub-2-KiB file and splitting it across ranges
         // would be more requests than bytes.
         let dl = download_to_blob(
             &url,
@@ -668,7 +668,7 @@ mod tests {
         }
     }
 
-    /// The companion cap is generous relative to what these files actually are (~2 KB of
+    /// The companion cap is generous relative to what these files actually are (~2 KiB of
     /// sampling keys) but finite — the point is bounding an UNVERIFIED download, not policing a
     /// plausible size. Pinned so a later edit to the constant is a deliberate decision.
     #[test]
@@ -906,7 +906,7 @@ mod tests {
     }
 
     /// A failure stops the fan-out CLAIMING more work. Without it a repo whose first shard 404s
-    /// still pulls every other shard — 200 GB for a model that cannot load.
+    /// still pulls every other shard — 200 GiB for a model that cannot load.
     #[test]
     fn a_failure_stops_the_remaining_fetches() {
         let hub = TestHub::start();
@@ -1275,7 +1275,7 @@ mod tests {
     }
 
     /// ONE file spends the WHOLE allowance on itself — the case this slice exists for, since a
-    /// 161 GB single-file model has no shards to spread over connections.
+    /// 161 GiB single-file model has no shards to spread over connections.
     #[test]
     fn one_big_file_uses_the_whole_budget() {
         let hub = TestHub::start();

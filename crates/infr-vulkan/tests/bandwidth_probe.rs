@@ -1,8 +1,8 @@
 //! Pager design gate (deliverable 0 of the MoE-expert-pager task): measures REAL host→device copy
 //! bandwidth for the two block sizes the pager will move — one expert (~40 MiB) and one layer's
 //! stacked expert bank (~660 MiB, Llama-4-Scout Q2_K numbers) — before any pager code is written.
-//! If this comes back far below ~20 GB/s the whole per-expert-upload design is unsound (the
-//! decisive-math note in the task assumed ~26 GB/s PCIe) and building the pager on top would be
+//! If this comes back far below ~18.6 GiB/s the whole per-expert-upload design is unsound (the
+//! decisive-math note in the task assumed ~24.2 GiB/s PCIe) and building the pager on top would be
 //! wasted work.
 //!
 //! Compares three upload strategies, all through the SAME `Backend` trait surface every other
@@ -27,7 +27,7 @@ use memmap2::Mmap;
 use std::time::Instant;
 
 const MIB: usize = 1024 * 1024;
-const EXPERT_BYTES: usize = 40 * MIB; // one Scout Q2_K expert (~41.3 MiB, rounded down to fit)
+const EXPERT_BYTES: usize = 40 * MIB; // one Scout Q2_K expert-sized transfer
 const LAYER_BYTES: usize = 660 * MIB; // one Scout Q2_K layer's stacked gate+up+down bank
 
 /// Real GGUF blob already on this box (avoids materializing a 660 MiB scratch file); falls back to
@@ -62,19 +62,19 @@ fn mmap_source(min_bytes: usize) -> Mmap {
     m
 }
 
-fn gbs(bytes: usize, secs: f64) -> f64 {
-    (bytes as f64 / secs) / 1e9
+fn gib_per_sec(bytes: usize, secs: f64) -> f64 {
+    (bytes as f64 / secs) / (1u64 << 30) as f64
 }
 
 /// Times `iters` back-to-back calls of `f` (each moving `bytes`), discarding the first call as
-/// warmup, and returns the achieved GB/s over the remaining `iters - 1`.
+/// warmup, and returns the achieved GiB/s over the remaining `iters - 1`.
 fn bench(iters: usize, bytes: usize, mut f: impl FnMut()) -> f64 {
     f(); // warmup: first touch of these mmap pages, first pipeline/allocator warm-up
     let t0 = Instant::now();
     for _ in 0..iters {
         f();
     }
-    gbs(bytes * iters, t0.elapsed().as_secs_f64())
+    gib_per_sec(bytes * iters, t0.elapsed().as_secs_f64())
 }
 
 #[test]
@@ -103,7 +103,7 @@ fn bandwidth_probe() {
 
     eprintln!(
         "\n{:<10} {:>10} {:>14} {:>14} {:>14} {:>14}",
-        "block", "iters", "fresh(GB/s)", "memcpy(GB/s)", "pcie(GB/s)", "combined(GB/s)"
+        "block", "iters", "fresh(GiB/s)", "memcpy(GiB/s)", "pcie(GiB/s)", "combined(GiB/s)"
     );
     for (label, block, iters) in [("expert", EXPERT_BYTES, 20), ("layer", LAYER_BYTES, 5)] {
         let src = &mmap[0..block];
@@ -145,7 +145,7 @@ fn bandwidth_probe() {
     }
 
     // Gate: if the reused-staging combined path can't clear a conservative floor, the pager's
-    // whole per-expert-upload premise (decisive math assumed ~26 GB/s) doesn't hold on this box —
+    // whole per-expert-upload premise (decisive math assumed ~24.2 GiB/s) doesn't hold on this box —
     // fail loudly rather than let a silent regression hide inside "it still runs, just slow".
     // (No hard assert here: this test's JOB is to print the numbers for a human/agent to read
     // before committing to the design, not to gate CI — see the module doc.)

@@ -145,12 +145,12 @@ ATTN_SINKS_KERNEL(attention_sinks_f16kv, half)
 // sum, divide). Exists because decode has rows=1: the one-simdgroup kernel then launches only
 // `n_head` simdgroups — far too few to occupy the GPU — and its runtime grows O(kv_len) on that
 // fixed tiny width. Split kernels multiply decode parallelism by NSG; the host routes here only
-// when rows*n_head is small, so prefill keeps the leaner kernel (this one's static ~8 KB of
+// when rows*n_head is small, so prefill keeps the leaner kernel (this one's static ~8 KiB of
 // threadgroup memory would cap prefill occupancy).
 // One macro instantiates each (KV type, split width) variant. NSG=8 covers short contexts and any
 // head_dim; NSG=32 quarters the serial online-softmax chain per simdgroup (the kernel is
 // latency-bound on that chain, ~kv_len/NSG dependent steps), but its threadgroup accumulator only
-// fits head_dim <= 128 in the 32 KB threadgroup-memory budget, so the host routes to it only for
+// fits head_dim <= 128 in the 32 KiB threadgroup-memory budget, so the host routes to it only for
 // long-context decode at hd <= 128.
 #define ATTNSPLIT_KERNEL(NAME, KVT, NSG, MAXHD)                                                    \
 kernel void NAME(device const float* q   [[buffer(0)]],                                           \
@@ -308,7 +308,7 @@ ATTNSPLIT_CANVAS_KERNEL(attention_canvas32_f16kv, half, 32u, 128u)
 // benched, lost to the scalar split-KV kernel, removed), there is NO staging: K^T and V 8x8
 // fragments load DIRECTLY from the f16 cache (strided, transposed for K), and Q is pre-cast once
 // per op to f16 — the f32 version spent its time converting K/V through threadgroup memory and
-// choked occupancy on the 8 KB tiles. Scores and the output tile accumulate in f32; the online
+// choked occupancy on the 8 KiB tiles. Scores and the output tile accumulate in f32; the online
 // softmax runs scalar in f32 on an 8x8 score tile per 8-position KV block, with the row-rescale
 // applied as a diagonal f32 MMA. P rounds to f16 (same trade as the half-fragment GEMM).
 // Tail KV blocks may read up to 7 rows past the causal limit — always inside the bound cache
@@ -636,7 +636,7 @@ kernel void attnflash2_f16kv_t(device const half*  q   [[buffer(0)]],
 typedef decltype(attnflash2_f16kv_t<64, 4, 64>) attnflash2_t;
 template [[host_name("attnflash2_f16kv_hd64")]]  kernel attnflash2_t attnflash2_f16kv_t<64, 4, 64>;
 template [[host_name("attnflash2_f16kv_hd128")]] kernel attnflash2_t attnflash2_f16kv_t<128, 4, 64>;
-// hd=256 (gemma): sq 4KB + so 8KB + ss 2KB = 14KB shared, 8 O fragments per simdgroup.
+// hd=256 (gemma): sq 4 KiB + so 8 KiB + ss 2 KiB = 14 KiB shared, 8 O fragments per simdgroup.
 template [[host_name("attnflash2_f16kv_hd256")]] kernel attnflash2_t attnflash2_f16kv_t<256, 4, 64>;
 typedef decltype(attnflash2_f16kv_t<128, 4, 128>) attnflash2_c128_t;
 template [[host_name("attnflash2_c128_f16kv_hd128")]]
@@ -826,7 +826,7 @@ template [[host_name("attnvec_f16kv_hd128")]] kernel attnvec_t attnvec_f16kv_t<1
 typedef decltype(attnvec_dyn_f16kv_t<64, 32>) attnvec_dyn_t;
 template [[host_name("attnvec_dyn_f16kv_hd64")]]  kernel attnvec_dyn_t attnvec_dyn_f16kv_t<64, 32>;
 template [[host_name("attnvec_dyn_f16kv_hd128")]] kernel attnvec_dyn_t attnvec_dyn_f16kv_t<128, 32>;
-// hd=256 (gemma) drops to NSG=16: the per-simdgroup O partials are NSG*hd*4 bytes — 32 KB at
+// hd=256 (gemma) drops to NSG=16: the per-simdgroup O partials are NSG*hd*4 bytes — 32 KiB at
 // NSG=32/hd=256, over the whole threadgroup budget before sq/ssc. 16 simdgroups still cut the
 // serial chain 16x vs the plain split kernel; the merge tree just starts one level lower.
 template [[host_name("attnvec_f16kv_hd256")]]     kernel attnvec_t     attnvec_f16kv_t<256, 16>;

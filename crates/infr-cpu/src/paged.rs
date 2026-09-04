@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// Smallest weight worth paging. Below this the arena bookkeeping outweighs the bytes: a 1 MiB
-/// floor keeps norms, biases and rope tables mapped (a few MB across a whole model) while covering
+/// floor keeps norms, biases and rope tables mapped (a few MiB across a whole model) while covering
 /// every projection and expert bank, which are what a forward pass streams.
 pub const MIN_PAGED_BYTES: usize = 1 << 20;
 

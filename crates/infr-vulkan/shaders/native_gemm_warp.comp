@@ -53,7 +53,7 @@ layout(local_size_x = WG_THREADS, local_size_y = 1, local_size_z = 1) in;
 
 const uint THREADS = WG_THREADS;
 // -DNARROW_N halves the column tile (BN 256→128) and doubles the k-stage (BK 32→64): the SAME
-// 256 dequant calls per stage (128 cols × 2 k-blocks), the same ~25 KB LDS, but 2× the
+// 256 dequant calls per stage (128 cols × 2 k-blocks), the same ~25 KiB LDS, but 2× the
 // workgroups — narrow-n GEMMs (n=1024/2048: the qkv/o/down shapes of small-ne models) underfill
 // a big GPU with the wide tile (n=1024 → 32 wgs on a 96-wg part = 5-9 TFLOPS vs the kernel's 36).
 // Tile-shape experiments (kernel tuning): -DBM128 doubles the row tile (WM 32→64: 4×4 acc frags
@@ -160,7 +160,7 @@ layout(binding = 0) readonly buffer ABuf { float a[]; };   // [M, K] f32 activat
 #elif defined(A_GLOBAL)
 // A pre-converted to f16 by the caller (one store_f16 pass, padded to the row tile): A fragments
 // coopMatLoad straight from global — no As staging, no As LDS. LDS shrinks to Bs-only
-// (~20 KB → 3 workgroups/WGP instead of 2), which is the occupancy the f32-staging tile lacks.
+// (~20 KiB → 3 workgroups/WGP instead of 2), which is the occupancy the f32-staging tile lacks.
 layout(binding = 0) readonly buffer ABuf { CMTYPE a[]; }; // [Mpad, K] f16 (or bf16 under BF16CM) activations
 #else
 layout(binding = 0) readonly buffer ABuf { float a[]; };   // [M, K] f32 activations

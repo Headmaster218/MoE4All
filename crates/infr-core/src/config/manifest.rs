@@ -126,9 +126,9 @@ knobs! {
     "INFR_DEV"                  => "device.dev",               Text, Ignored, "vulkan0", migrated;
     "INFR_CTX"                  => "device.ctx",               Size, Ignored, "32k",     migrated;
     "INFR_AUTO_PROFILE"         => "device.auto_profile",      Literal, Error, "aggressive", migrated;
-    "INFR_VRAM_BUDGET"          => "device.vram_budget",       Size, Ignored, "23g",     migrated;
-    "INFR_RAM_BUDGET"           => "device.ram_budget",        Size, Ignored, "50g",     migrated;
-    "INFR_VRAM_RESERVE"         => "device.vram_reserve",      Size, Ignored, "512m",    migrated;
+    "INFR_VRAM_BUDGET"          => "device.vram_budget",       Size, Ignored, "23GiB",   migrated;
+    "INFR_RAM_BUDGET"           => "device.ram_budget",        Size, Ignored, "50GiB",   migrated;
+    "INFR_VRAM_RESERVE"         => "device.vram_reserve",      Size, Ignored, "512MiB",  migrated;
     "INFR_UBATCH"               => "device.ubatch",            Int,  Ignored, "512",     migrated;
     "INFR_UBATCH_PARALLEL"      => "device.ubatch_parallel",   Int,  Ignored, "128",     migrated;
     "INFR_SUBMIT_DISPATCHES"    => "device.submit_dispatches", Int,  Error,   "64",      migrated;
@@ -157,14 +157,14 @@ knobs! {
     "INFR_KV_OVERFLOW_RESERVE_MB" => "kv.overflow_reserve_mb", Mib,       Ignored, "128",  migrated;
 
     // ── paging (§6.4) ────────────────────────────────────────────────────────
-    "INFR_CACHE"                => "paging.cache",                     Size,     Ignored, "8g",  migrated;
-    "INFR_PAGER_RING"           => "paging.ring",                      Size,     Ignored, "1g",  migrated;
+    "INFR_CACHE"                => "paging.cache",                     Size,     Ignored, "8GiB", migrated;
+    "INFR_PAGER_RING"           => "paging.ring",                      Size,     Ignored, "1GiB", migrated;
     "INFR_PAGER_RING_SLOTS"     => "paging.ring_slots",                Int,      Ignored, "2",   migrated;
     "INFR_NO_MOE_LAYER_STREAM"  => "paging.moe_layer_stream",          PresenceInv, Ignored, "1", migrated;
     "INFR_MOE_SIZE_CACHE_BIAS"  => "paging.moe_size_cache_bias",       Float,    Ignored, "2",   migrated;
     "INFR_PAGER_STATS"          => "paging.stats",                     Presence, Ignored, "1",   migrated;
     "INFR_PAGER_TRACE"          => "paging.trace",                     Path,     Ignored, "pager-trace.csv", migrated;
-    "INFR_DRAM_CACHE"           => "paging.dram",                      Size,     Ignored, "8g",  migrated;
+    "INFR_DRAM_CACHE"           => "paging.dram",                      Size,     Ignored, "8GiB", migrated;
     "INFR_DRAM_BYPASS"          => "paging.dram_bypass",               Flag,     Ignored, "1",   migrated;
     "INFR_NO_HOST_DMA"          => "paging.host_dma",                  PresenceInv, Ignored, "1", migrated;
     "INFR_LAYER_MAJOR"          => "paging.layer_major",               TriState, Ignored, "1",   migrated;

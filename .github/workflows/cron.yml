@@ -17,7 +17,7 @@ name: Cron
 #
 # Mirrors the sibling repos' `cron.yml` (hjkl, crcbl, hrdr, langr, tikr) in
 # schedule and shape. Jobs those have and this does not: `fuzz` (no fuzz targets
-# in this tree yet), `bench` (infr's benchmarks need a GPU and multi-GB models,
+# in this tree yet), `bench` (infr's benchmarks need a GPU and multi-GiB models,
 # so they run on the workstation, not a runner), and `wasm_size` (not a target).
 
 on:

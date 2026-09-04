@@ -1,6 +1,6 @@
 # MoE4All
 
-只需10MB，windows免安装，拖入模型即下即用！
+只需约 10 MiB，Windows 免安装，拖入模型即下即用！
 
 **让 A 卡用户也能在本地运行大型 MoE AI**
 *Making huge MoE LLMs accessible to AMD users.*
@@ -60,7 +60,7 @@ Visual Studio 或 Vulkan SDK，只需要正常的 64 位 AMD 显卡驱动及其 
 模型需要是当前支持架构的 GGUF 文件，发布包不包含模型。分片 GGUF 的所有
 分片必须放在同一个目录；加载器可以从其中任意一片找到完整模型。
 
-建议第一次先用小模型确认环境，再尝试几十到上百 GB 的大型 MoE。模型下载、
+建议第一次先用小模型确认环境，再尝试几十到上百 GiB 的大型 MoE。模型下载、
 分片和量化选择见[快速开始](GETTING_STARTED.md)。
 
 ### 3. 启动

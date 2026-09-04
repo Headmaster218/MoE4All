@@ -1,8 +1,8 @@
 #version 460
 // PROBE: flash-decoding pass 1, rows-batched at RB=4 — one workgroup per (head, kv-chunk) computes
 // partials for a group of up to 4 query rows against ONE K/V stream. The RB=8 version measured
-// 2-3x SLOWER than the per-row grid (occupancy: 22KB LDS / ~90 VGPRs, and per-key reduction
-// serialization). RB=4 cuts LDS to ~11KB and packs the whole group's dots into a SINGLE
+// 2-3x SLOWER than the per-row grid (occupancy: 22 KiB LDS / ~90 VGPRs, and per-key reduction
+// serialization). RB=4 cuts LDS to ~11 KiB and packs the whole group's dots into a SINGLE
 // subgroupAdd(vec4) per key — per-key cost is then one load + 4 dots + 1 reduction, near the
 // per-row kernel's (1 + 1 + 1) while serving 4 rows from one K/V stream. Opt-in via
 // INFR_MROWS_ATTN=1 (occupancy-hypothesis probe; the per-row grid stays the default).
@@ -45,14 +45,14 @@ layout(binding = 4) buffer PL { float pl[]; };               // [rows*nh, n_chun
 layout(binding = 5) buffer PACC { float pacc[]; };           // [rows*nh, n_chunks, hd]
 
 const uint RB = 4u; // rows per group
-// -DSC_MAX=256 variant: half the score staging (4KB) for chunk <= 256 — the residency probe.
+// -DSC_MAX=256 variant: half the score staging (4 KiB) for chunk <= 256 — the residency probe.
 #ifndef SC_MAX
 #define SC_MAX 512u
 #endif
 const uint SC = SC_MAX;
 shared float sc[RB * SC]; // per-row chunk scores (chunk <= SC)
-shared float red[RB * 64u]; // 1KB
-shared vec4 vsh[RB * 32u];  // subgroup-1 V partials: 2KB
+shared float red[RB * 64u]; // 1 KiB
+shared vec4 vsh[RB * 32u];  // subgroup-1 V partials: 2 KiB
 
 void main() {
     uint t = gl_LocalInvocationIndex;

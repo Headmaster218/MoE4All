@@ -12,6 +12,7 @@ $ErrorActionPreference = 'Stop'
 
 $script:RepoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $script:Utf8 = [Text.UTF8Encoding]::new($false)
+$script:GiB = [uint64](1L -shl 30)
 
 function Resolve-RepoPath {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -48,9 +49,9 @@ function ConvertTo-ByteCount {
     return [uint64]($number * [math]::Pow(1024, $power))
 }
 
-function Format-Gib {
+function Format-GiB {
     param([Parameter(Mandatory = $true)][uint64]$Bytes)
-    return ($Bytes / 1GB).ToString('0.00', [Globalization.CultureInfo]::InvariantCulture)
+    return ($Bytes / $script:GiB).ToString('0.00', [Globalization.CultureInfo]::InvariantCulture)
 }
 
 function Read-JsonFile {
@@ -959,8 +960,8 @@ function Assert-Manifest {
             $largestProfile = $total
         }
     }
-    if ($largestProfile -gt ($realRam + 1GB)) {
-        throw "largest RAM profile is $(Format-Gib $largestProfile) GiB, but this host reports $(Format-Gib $realRam) GiB"
+    if ($largestProfile -gt ($realRam + $script:GiB)) {
+        throw "largest RAM profile is $(Format-GiB $largestProfile) GiB, but this host reports $(Format-GiB $realRam) GiB"
     }
 }
 
@@ -988,24 +989,24 @@ function Write-MatrixReport {
         $peakRam = if ($null -ne $result.resources) {
             $privateWs = $result.resources.PSObject.Properties['peak_private_working_set_bytes']
             if ($null -ne $privateWs) {
-                Format-Gib ([uint64]$privateWs.Value)
+                Format-GiB ([uint64]$privateWs.Value)
             }
             else {
-                Format-Gib ([uint64]$result.resources.peak_working_set_bytes)
+                Format-GiB ([uint64]$result.resources.peak_working_set_bytes)
             }
         }
         else {
             '-'
         }
         $peakTotalWs = if ($null -ne $result.resources) {
-            Format-Gib ([uint64]$result.resources.peak_working_set_bytes)
+            Format-GiB ([uint64]$result.resources.peak_working_set_bytes)
         }
         else {
             '-'
         }
         $peakVram = if ($null -ne $result.resources -and
             [bool]$result.resources.gpu_counter_available) {
-            Format-Gib ([uint64]$result.resources.peak_gpu_dedicated_bytes)
+            Format-GiB ([uint64]$result.resources.peak_gpu_dedicated_bytes)
         }
         else {
             '-'

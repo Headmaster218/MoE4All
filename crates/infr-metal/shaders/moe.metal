@@ -471,7 +471,7 @@ kernel void NAME(device const float*  x     [[buffer(0)]],                      
     uint tid = sgid * 32u + lane;                                                                 \
     uint nr1 = min(32u, p.m - rt);                                                                \
                                                                                                   \
-    threadgroup float shraw[2048];  /* 8 KB: sa(4K half) + sb(2K half); reused f32 for stores */  \
+    threadgroup float shraw[2048];  /* 8 KiB: sa(4K half) + sb(2K half); reused f32 for stores */  \
     threadgroup half* sa = (threadgroup half*)shraw;                                              \
     threadgroup half* sb = ((threadgroup half*)shraw) + 2048u;                                    \
                                                                                                   \

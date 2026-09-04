@@ -13,8 +13,8 @@
 //  • SMALL row tile: BM=32 (16 for the hd=512 build) × BN=64 kv block, 256 threads — Alchemist
 //    SIMD8 EUs spill easily and prefer more, smaller workgroups. Registers stay modest: the QK
 //    phase holds E=BN·BM/256 score accumulators (8/4), the PV phase 32/TPR partial sums (≤4).
-//  • Shared ≤64 KB: Qs+KVs BK-chunk staging (the native_gemm_fma warptile pattern) + Ss score
-//    tile + Os accumulator = 37.6 KB (hd≤128) / 54.0 KB (hd≤256) / 47.6 KB (hd=512, BM=16).
+//  • Shared ≤64 KiB: Qs+KVs BK-chunk staging (the native_gemm_fma warptile pattern) + Ss score
+//    tile + Os accumulator = 37.6 KiB (hd≤128) / 54.0 KiB (hd≤256) / 47.6 KiB (hd=512, BM=16).
 //  • Barriers AFTER all shared reads of an iteration (the mmq race lesson) — a fast thread must
 //    never restage Qs/KVs/Ss while a slow one still reads the previous block's values.
 //
@@ -41,7 +41,7 @@
 #define HD_MAX 128
 #endif
 #if HD_MAX > 256
-#define BM 16u // hd=512: halve the row tile so Os stays 32 KB
+#define BM 16u // hd=512: halve the row tile so Os stays 32 KiB
 #else
 #define BM 32u
 #endif

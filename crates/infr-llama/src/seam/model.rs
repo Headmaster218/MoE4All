@@ -825,7 +825,7 @@ impl SeamModel {
         let max_ctx = session.max_ctx;
         // Cap the reply to the context that's actually left ("a turn also caps to remaining
         // context" — the CLI's generation ceiling is a default, not a demand): a VRAM-clamped
-        // default session (e.g. a 21.9 GB model on a 24 GB card clamps 262k -> ~1.7k) would
+        // default session (e.g. a 21.9 GiB model on a 24 GiB card clamps 262k -> ~1.7k) would
         // otherwise hard-error on `infr run`'s default max_new=2048 before generating a single
         // token. EOS ends almost every reply long before this cap; an over-long PROMPT still
         // errors cleanly in the runner (its `prompt + gen + 1 > max_ctx` guard stays).
@@ -1846,7 +1846,7 @@ impl SeamModel {
     /// Runs through a persistent [`DenseMetalSession`] so backend, uploaded weights, compiled
     /// pipelines, and the dequant/repack weight caches all survive across reps — a fresh backend
     /// per rep re-paid every one-time cost inside the measurement (a factored-format checkpoint
-    /// re-repacked hundreds of MB per rep). `reset_tokens` starts a fresh repetition; leaving it
+    /// re-repacked hundreds of MiB per rep). `reset_tokens` starts a fresh repetition; leaving it
     /// false preserves a preceding untimed depth warm so the next call measures only its suffix.
     /// `profile` controls whether this call contributes to the backend's profiler summary.
     #[cfg(target_os = "macos")]

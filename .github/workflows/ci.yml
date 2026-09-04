@@ -84,11 +84,11 @@ jobs:
   # caches them across runs, and runs the CPU suite so those goldens actually
   # execute and their hashes are asserted. Runs in parallel with the other jobs.
   #
-  # Model set (Q4_K_M, ~1.7 GB total) — one per distinct architecture family
-  # with a CPU golden, deliberately excluding the multi-GB MoE / big models:
-  #   unsloth/gemma-3-1b-it-GGUF  (769 MB) — dense SWA/GeGLU, hd=256; the
+  # Model set (Q4_K_M, ~1.58 GiB total) — one per distinct architecture family
+  # with a CPU golden, deliberately excluding the multi-GiB MoE / big models:
+  #   unsloth/gemma-3-1b-it-GGUF  (733 MiB) — dense SWA/GeGLU, hd=256; the
   #                                          non-256-in_f arch that caught Q8_0
-  #   unsloth/Qwen3-0.6B-GGUF     (379 MB) — dense; also drives the cpu_kv_*
+  #   unsloth/Qwen3-0.6B-GGUF     (361 MiB) — dense; also drives the cpu_kv_*
   #                                          coherence + quant-sweep tests
   # Qwen3.5-0.8B (gated-DeltaNet) is intentionally NOT downloaded: its longer
   # greedy generation is FP-sensitive, so the exact-token golden hash is not

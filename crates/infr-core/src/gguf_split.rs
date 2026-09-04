@@ -30,7 +30,7 @@ pub struct Shard {
 /// real split. The bound matters because `total` is REMOTE input: `pull_repo_latest` runs
 /// `shard_set` on a filename taken from the HuggingFace sibling list, before any download and
 /// before `check_relative`, and `shard_set` materialises every name in `1..=total` into a `Vec`.
-/// Ten digits parse happily as `u32::MAX`, which is 4.29e9 `String`s — roughly 100 GB — allocated
+/// Ten digits parse happily as `u32::MAX`, which is 4.29e9 `String`s — roughly 100 GiB — allocated
 /// from one hostile filename (backlog B19).
 ///
 /// Rejected in the PARSER rather than in `shard_set` so every call site is covered by one check:

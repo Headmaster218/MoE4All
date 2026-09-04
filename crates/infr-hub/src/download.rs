@@ -36,7 +36,7 @@ use tracing::{debug, info};
 /// `max_bytes` caps the FINAL size of the file (resumed prefix included) and is enforced INSIDE the
 /// streaming loop, so an over-long body is aborted mid-transfer instead of after it has already
 /// landed on disk — the whole point of a cap on an unverified download. `None` means uncapped and
-/// is what the model-blob path passes: a GGUF is legitimately multi-GB, and its integrity comes
+/// is what the model-blob path passes: a GGUF is legitimately multi-GiB, and its integrity comes
 /// from `expected_sha` instead. See [`crate::pull::MAX_COMPANION_BYTES`] for the only capped
 /// caller. The advertised `Content-Length` is checked first as a courtesy (fail before writing a
 /// byte) but is never trusted on its own — it is attacker-controlled and may be absent under

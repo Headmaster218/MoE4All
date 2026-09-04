@@ -1115,7 +1115,7 @@ fn gpu_seam_matches_cpu_gemma4_e2b() {
 /// E2B's layer stack reads `per_layer_inp`, which the graph PROLOGUE builds, so a layer span
 /// starting past layer 0 would read an unbound tensor; `build` asserts exactly that. E2B does take
 /// the batched-prefill path, so once a streamed model defaulted to layer-major that assert became
-/// reachable: `infr bench <e2b> --set paging.cache=200m` panicked with "gemma4-E2B cannot start a
+/// reachable: `infr bench <e2b> --set paging.cache=200MiB` panicked with "gemma4-E2B cannot start a
 /// layer span past layer 0". `seam::layer_major_prefill` now refuses the architecture and warns.
 ///
 /// The assertion is token identity against the resident run, so this fails both if the gate is
@@ -2100,7 +2100,7 @@ fn gpu_seam_paged_moe_matches_resident_and_cpu() {
         .generate_vulkan_ids(&prompt_ids, n, |id| resident_ids.push(id))
         .expect("resident gpu gen");
 
-    // 0.05 GB is far below what even ONE Q4_K_M expert layer's gate+up+down banks need — guarantees
+    // 0.05 GiB is far below what even ONE Q4_K_M expert layer's gate+up+down banks need — guarantees
     // real eviction pressure across the model's 48 MoE layers.
     let paged = model_cfg(&path, |c| {
         pin_ubatch(c);
@@ -2227,7 +2227,7 @@ fn gpu_seam_dense_stream_matches_resident_and_cpu() {
         .generate_vulkan_ids(&prompt_ids, n, |id| resident_ids.push(id))
         .expect("resident gpu gen");
 
-    // 0.2 GB is far below the model's ~1.4 GB of streamable projections — every pool runs at its
+    // 0.2 GiB is far below the model's ~1.4 GiB of streamable projections — every pool runs at its
     // floor slot count, so (nearly) every layer re-uploads every pass: real eviction pressure.
     let streamed = model_cfg(&path, |c| {
         c.paging.cache = Some(infr_core::SizeSpec::Bytes(200 * 1024 * 1024));
@@ -2301,7 +2301,7 @@ fn qwen3_14b_q8() -> Option<PathBuf> {
     find_gguf("unsloth--Qwen3-14B-GGUF", "Qwen3-14B-Q8_0.gguf")
 }
 
-/// The BIG dense streaming shape: Qwen3-14B Q8_0 (~15.7 GB — genuinely more than an 8 GB budget)
+/// The BIG dense streaming shape: Qwen3-14B Q8_0 (~15.7 GiB — genuinely more than an 8 GiB budget)
 /// with fused qkv AND fused gate_up blocks (uniform Q8_0 passes both fuse gates), streamed vs
 /// fully resident. Same token-identity bar as the 1.7B test; CPU included (Q8_0 int dots on both
 /// sides — the 14B CPU run is ~15 s of the suite, the price of a real >budget model check).
@@ -2382,7 +2382,7 @@ fn gpu_seam_dense_stream_prefill_matches_resident() {
         .generate_vulkan_ids(&prompt_ids, n, |id| resident_ids.push(id))
         .expect("resident gpu gen");
 
-    // Below the model's ~1.4 GB of streamable projections → real eviction every pass.
+    // Below the model's ~1.4 GiB of streamable projections → real eviction every pass.
     let streamed = model_cfg(&path, |c| {
         c.paging.cache = Some(infr_core::SizeSpec::Bytes(200 * 1024 * 1024));
     });
@@ -2447,7 +2447,7 @@ fn gpu_seam_dense_stream_prefill_layer_major_matches_chunk_major() {
         .generate_vulkan_ids(&prompt_ids, n, |id| resident_ids.push(id))
         .expect("resident gpu gen");
 
-    // Below the model's ~1.4 GB of streamable projections → real eviction every pass.
+    // Below the model's ~1.4 GiB of streamable projections → real eviction every pass.
     let streamed = |layer_major: Option<bool>| {
         model_cfg(&path, |c| {
             pin_chunk(c);
@@ -2709,7 +2709,7 @@ fn cpu_llama4_scout_greedy() {
     assert!(out.iter().all(|&t| (t as usize) < model.config().vocab));
 }
 
-/// Vulkan seam, GPU-resident: Scout's 37 GB Q2_K expert banks don't fit a 24 GB card, so this
+/// Vulkan seam, GPU-resident: Scout's 37 GiB Q2_K expert banks don't fit a 24 GiB card, so this
 /// exercises the paged executor split end to end (real weights, real eviction, real host
 /// readback/upload cadence — not a synthetic bank) and locks it against the SAME oracle prefix
 /// `cpu_llama4_scout_greedy` checks. llama4's gate/up/down banks are each uniformly Q2_K/Q2_K/Q3_K
@@ -2757,7 +2757,7 @@ fn gemma4_12b() -> Option<PathBuf> {
 // Phase 1 scope only: Config + weight loading + a CAUSAL PROMPT PREFILL through the unified
 // runner (dual FFN — dense GeGLU ∥ 128-expert MoE with a fused gate_up_exps + per-expert down
 // scale, encoder-scalar per-layer output, heterogeneous per-layer attn dims). No canvas/denoise —
-// see docs/diffusion-gemma.md. 26B-A4B Q4_K_M is large (16 GB); a CPU prefill of ~16 tokens takes
+// see docs/diffusion-gemma.md. 26B-A4B Q4_K_M is large (16 GiB); a CPU prefill of ~16 tokens takes
 // on the order of a minute.
 
 fn diffusion_gemma_model() -> Option<PathBuf> {
@@ -3767,7 +3767,7 @@ fn gpu_seam_matches_cpu_bitnet() {
 // ─── DeepSeek V1 ────────────────────────────────────────────────────────────────
 
 /// Locate a DeepSeek-LLM-7B-Chat GGUF in the HF cache. The smallest V1 model (7B,
-/// ~4 GB Q4_K_M). `None` ⇒ tests self-skip.
+/// ~4 GiB Q4_K_M). `None` ⇒ tests self-skip.
 fn deepseek_v1_7b() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("INFR_TEST_DEEPSEEK") {
         return Some(PathBuf::from(p));
@@ -4046,7 +4046,7 @@ fn gpu_seam_matches_cpu_deepseek2() {
 // `exp_probs_b` router bias run on a real file rather than the synthetic GGUFs of
 // `tests/synthetic_deepseek2.rs`.
 //
-// The file is 245 GB of Q2_K across five shards and the box has 60 GB of RAM, so every weight
+// The file is 245 GiB of Q2_K across five shards and the box has 60 GiB of RAM, so every weight
 // streams from disk through the host pager on EVERY forward: one prefill costs minutes and one
 // decoded token ~1.5 minutes. Only the metadata test runs unattended; the two that load weights
 // are `#[ignore]`d and self-skip on top of that.
@@ -4140,7 +4140,7 @@ fn cpu_deepseek_v32_config() {
 /// cannot land on the same stream by chance. Going shorter would not buy much anyway — prefill,
 /// not the token count, is what dominates the wall time here.
 #[test]
-#[ignore = "streams 245 GB per forward: ~26 min. Run with --include-ignored"]
+#[ignore = "streams 245 GiB per forward: ~26 min. Run with --include-ignored"]
 fn cpu_deepseek_v32_golden() {
     let path = need_model!(deepseek_v32(), "DeepSeek-V3.2");
     let mut _tlk = test_serial_lock();

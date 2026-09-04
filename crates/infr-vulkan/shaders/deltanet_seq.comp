@@ -68,7 +68,7 @@ void main() {
 
     // S[:, d0..d0+NCOL) into registers: lane owns rows {r*32 + lane} of each column. Strided by vd
     // across lanes (not coalesced), but this is one load + one store for the ENTIRE scan —
-    // nv·vd·kd·2·4B = 2MB per layer, negligible — whereas the chunked kernel re-touched its LDS
+    // nv·vd·kd·2·4B = 2 MiB per layer, negligible — whereas the chunked kernel re-touched its LDS
     // copy every chunk.
     float s[NCOL][RPL];
     [[unroll]] for (uint c = 0u; c < NCOL; c++) {
@@ -80,7 +80,7 @@ void main() {
     for (uint tk = 0u; tk < pc.rows; tk++) {
         uint nbase = tk * pc.nk * kd + khid * kd;
         // Lane-contiguous → coalesced. Every column-workgroup of a head re-reads the same k̂/q̂ row
-        // (cache-resident: ~1.07 GB/layer of L2 traffic at NCOL=1). Blocking NCOL columns into one
+        // (cache-resident: ~1.07 GiB/layer of L2 traffic at NCOL=1). Blocking NCOL columns into one
         // subgroup divides that traffic by NCOL and makes the NCOL reductions below mutually
         // independent, so they pipeline instead of each sitting alone on the dependency chain — but
         // it also cuts the wave count by NCOL, and this kernel is latency-bound, so the two effects

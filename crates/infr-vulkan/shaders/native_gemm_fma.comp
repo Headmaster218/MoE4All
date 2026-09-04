@@ -17,7 +17,7 @@
 //    (acc 16 + av/bv 8 floats) — Alchemist SIMD8 EUs spill easily and prefer MORE smaller
 //    workgroups over giant occupancy-starved tiles. Same geometry as the proven
 //    native_gemm_mmq_* family (register-blocked 64x64, scalar inner product).
-//  • Shared: (64+64)*(32+1)*4B = 16.5 KB « the 64 KB Arc SLM budget (no double buffer — the
+//  • Shared: (64+64)*(32+1)*4B = 16.5 KiB « the 64 KiB Arc SLM budget (no double buffer — the
 //    barrier discipline below is the mmq family's, race lesson included).
 //  • bf16 stays NATIVE end to end: FMT_BF16 reads the raw bf16 bits and shifts <<16 into f32
 //    registers — no f16 clamp (full exponent range), no f32 upconvert of the weight buffer.

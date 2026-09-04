@@ -109,18 +109,18 @@ overflow = false
 
 [paging]
 # Force every layer through the paged VRAM cache with this budget, regardless of
-# whether the weights would have fit. Size grammar (19g / 80%).
+# whether the weights would have fit. Size grammar (19GiB / 80%).
 # Default: unset = resident when it fits, paged with the remaining VRAM if not.
-# cache = "8g"
+# cache = "8GiB"
 
 # Upload staging ring. Default: unset = budget/8, clamped to [256 MiB, 2 GiB].
-# ring = "1g"
+# ring = "1GiB"
 
 # Host weight-cache budget. Default: unset = size automatically from available RAM while leaving
 # headroom. For paged MoE, a budget large enough for every routed expert selects one permanent
 # layer-contiguous Host Store and disables runtime SSD reads; smaller budgets use RAM as an
 # inclusive cache above SSD. Set to "0" to disable the RAM cache.
-# dram = "40g"
+# dram = "40GiB"
 
 # Print per-pool hit/miss/eviction counts at exit.
 stats = false
@@ -279,10 +279,10 @@ full_barrier = false
 endpoint = "https://huggingface.co"
 
 # How many CONNECTIONS one model's download may use at once. The CONNECTION is
-# the ceiling, not the link (measured here: 1 connection 8.8 MB/s, 5 connections
-# 78.7 MB/s). They go to whatever the model offers: a split model gets one file
+# the ceiling, not the link (measured here: 1 connection 8.39 MiB/s, 5 connections
+# 75.1 MiB/s). They go to whatever the model offers: a split model gets one file
 # per connection, a single-file model is split into byte ranges and reassembled
-# (measured on a 161 GB one-file GGUF: 11.4 MB/s at 1, 80.5 MB/s at 8). One
+# (measured on a 150 GiB one-file GGUF: 10.9 MiB/s at 1, 76.8 MiB/s at 8). One
 # number for both, because a bound per axis would multiply — some repos ship 236
 # shards. 0 and 1 both mean strictly one connection, never split.
 pull_jobs = 8

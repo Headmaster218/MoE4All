@@ -202,7 +202,9 @@ OpenAI `temperature`/`top_p` still overrides them.
 **`[kv]`** — cache element format (`type_k` / `type_v`, plus the legacy
 `force_q8` alias), prefix-cache `slots`, the sliding-window `ring`, and the
 host-overflow trio (`overflow`, `overflow_vram_mb`, `overflow_reserve_mb`) that
-spills KV to system RAM when VRAM runs out.
+spills KV to system RAM when VRAM runs out. The two `_mb` path names and their
+`INFR_*_MB` environment aliases are frozen compatibility spellings; their numeric
+values have always represented MiB.
 
 **`[paging]`** — the MoE expert cache and dense layer streaming: `cache` sizes
 the paged VRAM budget (and forces paging even when the weights would have fit),
@@ -233,7 +235,8 @@ and these exist to force one off when bisecting a correctness or perf problem.
   `kernels.cpu.reference` it has no `INFR_*` twin.
 - **`[kernels.cpu]`** — `spin` (spin-pool idle ceiling), `spinpool`,
   `repack_mb`, and `reference` (the bit-reference kernel path, which has no
-  `INFR_*` twin and never had one).
+  `INFR_*` twin and never had one). `repack_mb` is likewise a compatibility name;
+  its numeric value represents MiB.
 
 **`[spec]`** — MTP / speculative decode: `mtp`, `k`, `decode_chain`, `draft` (a
 draft-model path), the GPU-side sampling steps (`gpu_argmax`, `gpu_sample`,
@@ -293,15 +296,15 @@ HuggingFace-compatible origin: `https://huggingface.co` by default, or for examp
 `https://hf-mirror.com`. `pull_jobs`
 (`INFR_PULL_JOBS`, default `8`) — how many CONNECTIONS one model's download may
 use at once. It is the CONNECTION that is slow, not the link: measured against
-the same CDN objects, one connection sustained 8.8 MB/s and five sustained 78.7
-MB/s — 15.7 MB/s each, so the per-connection rate rose rather than fell.
+the same CDN objects, one connection sustained 8.39 MiB/s and five sustained 75.1
+MiB/s — 15.0 MiB/s each, so the per-connection rate rose rather than fell.
 
 What the connections are spent on depends on the model, and the setting does not
 have to say: a split model is `-NNNNN-of-MMMMM` shards fetched one file per
 connection, while a model shipped as one file is split into byte ranges instead
-and reassembled (on `unsloth/DeepSeek-V3.2-GGUF`'s single 161 GB `UD-TQ1_0`,
-same 60-second window: 11.4 MB/s at `1`, 80.5 MB/s at the default `8`; the whole
-161 GB pull ran at 80.0 MB/s end to end). One number covers both because a bound
+and reassembled (on `unsloth/DeepSeek-V3.2-GGUF`'s single 150 GiB `UD-TQ1_0`,
+same 60-second window: 10.9 MiB/s at `1`, 76.8 MiB/s at the default `8`; the whole
+150 GiB pull ran at 76.3 MiB/s end to end). One number covers both because a bound
 per axis would multiply — 8 files x 8 ranges is 64 sockets on a repo whose file
 count is the publisher's choice (`DeepSeek-V3.2-REAP` ships 236).
 

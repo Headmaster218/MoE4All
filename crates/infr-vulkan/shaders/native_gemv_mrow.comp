@@ -2,16 +2,16 @@
 // Multi-row native-block dequant GEMV: y[r] = x[r]·Wᵀ for r in 0..rows (rows ≤ 8) with the weight
 // streamed ONCE — the spec-decode verify / short-suffix-prefill shape (m = 2..8). The m=1 GEMV
 // grid re-streams the whole weight per row (m× bandwidth), and the coopmat GEMM at a single
-// M-tile launches only n/64 workgroups (underfills the GPU: measured 51-182 GB/s effective vs the
+// M-tile launches only n/64 workgroups (underfills the GPU: measured 47-170 GiB/s effective vs the
 // GEMV's 292-651 on a 7900 XTX). This kernel keeps the GEMV's out_f-wide grid and cooperative-
 // over-K shape — one workgroup per OUTPUT, 64 threads own whole 32-elem sub-blocks, decode each
 // weight sub-block once (dqblk), then dot it against ALL rows' activations (L2-resident: m·k·4 is
-// a few hundred KB) — so the per-call cost stays near the m=1 GEMV for every m ≤ 8.
+// a few hundred KiB) — so the per-call cost stays near the m=1 GEMV for every m ≤ 8.
 // -DFMT_* selects the format (shared native_decode.glsl). MR is fixed at 8; the r-loops are
 // compile-time unrolled with uniform `r < pc.rows` guards, keeping acc[] in registers.
 // Reduction: per-row subgroupAdd within each wave + one shared combine across the gl_NumSubgroups
 // waves (one barrier total, wave-size-agnostic — same pattern as rmsnorm.comp/mul_mat_vec_q.comp)
-// — replaces the old 8-row shared-tree reduce (6 levels / 7 barriers over 2KB of LDS). The m=1
+// — replaces the old 8-row shared-tree reduce (6 levels / 7 barriers over 2 KiB of LDS). The m=1
 // native_gemv.comp deliberately KEEPS its tree: measured neutral-to-negative there (RDNA3 wave64
 // runs a 64-thread workgroup as one wave, so its barriers are nearly free; qwen3-8b tg128 lost 6%
 // with the subgroup form), while this kernel's 8-row tree was the real cost.

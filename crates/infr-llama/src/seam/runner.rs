@@ -534,7 +534,7 @@ pub(crate) fn generate_dense_backend(
     // GPU embed gather (Op::EmbedGather, task #28): the host feeds token IDS (4 bytes each) and
     // the device gathers+dequantizes the embedding rows from the resident quantized table —
     // decode and prefill stop uploading f32 embedding rows entirely (a 512-token prefill chunk
-    // was 4*n_embd*512 = ~8 MB of host-embedded f32; now it's 2 KB of ids). Tied-lm_head models
+    // was 4*n_embd*512 = ~8 MiB of host-embedded f32; now it's 2 KiB of ids). Tied-lm_head models
     // reuse the already-uploaded lm_head buffer (same tensor); untied models upload token_embd
     // once more (extra VRAM = its on-disk size). INFR_NO_GPU_EMBED forces the host path (A/B).
     let untied_lm = g.tensors().iter().any(|t| t.name == "output.weight");
@@ -825,7 +825,7 @@ pub(crate) fn generate_dense_backend(
                 // A fused group (qkv, gate+up). Its components are handed over as VIEWS, not as a
                 // concatenated buffer: a binder that pages or streams the group registers their
                 // file ranges and never wants the bytes, and materializing here would build — and
-                // fault in — a multi-MB copy per group only to drop it. `WBytes::materialize` joins
+                // fault in — a multi-MiB copy per group only to drop it. `WBytes::materialize` joins
                 // them for the binders that do read bytes.
                 //
                 // A permuted component (qwen2 q/k) is a load-time REWRITE with no on-disk form, so
@@ -5990,8 +5990,8 @@ pub(crate) fn generate_dense_backend(
             let t_embt0 = std::time::Instant::now();
             *sc_embt = Some(build_sc_embt(be, token_embd, ne, c.vocab)?);
             tracing::info!(
-                "[diffusion denoise] built the SC soft-embedding weight ({:.0} MB) in {:.2}s",
-                (ne * c.vocab * 2) as f64 / 1e6,
+                "[diffusion denoise] built the SC soft-embedding weight ({:.0} MiB) in {:.2}s",
+                (ne * c.vocab * 2) as f64 / (1u64 << 20) as f64,
                 t_embt0.elapsed().as_secs_f64()
             );
         }
@@ -6447,7 +6447,7 @@ pub(crate) fn generate_dense_backend(
     // `Op::MoeFfn` gate (its `mmq_ok`) both derive from — a mismatch either silently falls back to
     // per-token prefill or compiles a graph the adapter rejects; `moe_mmq_drift_test` (in
     // infr-vulkan, since only that crate links both dtype sets at test time) guards it. NOTE:
-    // accepting Q2_K/Q3_K here also flips paged models (Scout: 37GB Q2_K/Q3_K experts on a 24GB
+    // accepting Q2_K/Q3_K here also flips paged models (Scout: 37 GiB Q2_K/Q3_K experts on a 24 GiB
     // card) onto the batched-chunk `Op::MoeFfn` construction — the Vulkan adapter's paged-buffer
     // interception (`execute_static`, ahead of `lower_op`'s batched/small-m split) routes every
     // paged MoeFfn through `execute_paged_moe`, whose own batched arm runs the same

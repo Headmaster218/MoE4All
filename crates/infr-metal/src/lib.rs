@@ -361,7 +361,7 @@ impl Backend for MetalBackend {
             compute_units: 0,
             buffer_device_address: false, // Metal backend has no Vulkan buffer-device-address path
             // Metal's per-threadgroup memory limit (MTLDevice.maxThreadgroupMemoryLength) — the
-            // analogue of Vulkan's maxComputeSharedMemorySize (typically 32 KB, 64 KB on Apple GPUs).
+            // analogue of Vulkan's maxComputeSharedMemorySize (typically 32 KiB, 64 KiB on Apple GPUs).
             max_shared_memory_bytes: self.device.max_threadgroup_memory_length() as u32,
             unified_memory: self.device.has_unified_memory(),
             // Eligible decode graphs are recorded once as a flat dispatch tape and re-encoded

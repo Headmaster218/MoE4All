@@ -1741,7 +1741,7 @@ pub struct DeviceInfo {
 /// Copy `src` into a persistently-mapped destination, in PARALLEL for large buffers.
 ///
 /// For a ReBAR weight the destination is write-combined VRAM across PCIe, where a single core
-/// cannot saturate the link (measured ~8.8 GB/s single-threaded on a 7900 XTX / PCIe 4.0 x16).
+/// cannot saturate the link (measured ~8.2 GiB/s single-threaded on a 7900 XTX / PCIe 4.0 x16).
 /// Splitting the copy across cores lets several write-combine streams be in flight at once. Small
 /// buffers copy inline — below the threshold the rayon fork/join costs more than it saves.
 fn copy_to_mapped(src: &[u8], dst: *mut u8) {
@@ -3310,7 +3310,7 @@ impl VulkanBackend {
         let yn = |b: bool| if b { "y" } else { "n" };
         tracing::info!(
             "[infr] GPU: {} | {:?}/{} | f16:{} f16cm:{} bf16:{} bf16cm:{} f8:{} f8cm:{} i8:{} \
-             i8dot:{} i8cm:{} cm2:{} subgroup:{}-{} sgp:{} cores:{} shared:{}KB",
+             i8dot:{} i8cm:{} cm2:{} subgroup:{}-{} sgp:{} cores:{} shared:{} KiB",
             caps.name,
             device_arch,
             driver_label,
@@ -5294,8 +5294,8 @@ impl VulkanBackend {
         let requirements = unsafe { self.shared.device.get_buffer_memory_requirements(buffer) };
 
         // Large buffers (KV cache, big weights) get a DEDICATED exact-size VkDeviceMemory; otherwise
-        // they sub-allocate into gpu-allocator's 256MB blocks and waste the remainder (e.g. 3×67MB
-        // KV buffers per block leave ~55MB unused — ~0.7GB across a long-context KV cache). Small/
+        // they sub-allocate into gpu-allocator's 256 MiB blocks and waste the remainder (e.g. 3×67 MiB
+        // KV buffers per block leave ~55 MiB unused — ~0.7 GiB across a long-context KV cache). Small/
         // transient buffers stay sub-allocated (cheap, pooled).
         const DEDICATED_MIN: u64 = 32 * 1024 * 1024;
         let scheme = if force_dedicated || requirements.size >= DEDICATED_MIN {
@@ -6218,8 +6218,8 @@ impl Backend for VulkanBackend {
             .map_or(Ok((0, 0)), |s| s.preload_host_tier(progress.as_ref()))?;
         if blocks > 0 {
             tracing::info!(
-                "[infr] bounded MoE RAM preload complete: {blocks} blocks / {:.2} GB",
-                bytes as f64 / 1e9,
+                "[infr] bounded MoE RAM preload complete: {blocks} blocks / {:.2} GiB",
+                bytes as f64 / (1u64 << 30) as f64,
             );
         }
         Ok(())

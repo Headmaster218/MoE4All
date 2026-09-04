@@ -10,8 +10,8 @@
 //!     is exactly what reqwest's default of NO timeout does.
 //!   * a total `timeout` ONLY on the metadata/HEAD clients. `Client::timeout` bounds the WHOLE
 //!     request including reading the body, so putting it on the download client would abort every
-//!     multi-GB model download that legitimately takes longer than the limit. Metadata requests are
-//!     a few KB, so a total bound is right there and wrong on the download path. A stalled *body*
+//!     multi-GiB model download that legitimately takes longer than the limit. Metadata requests are
+//!     a few KiB, so a total bound is right there and wrong on the download path. A stalled *body*
 //!     mid-download is not fatal here anyway: the partial is kept and the next run resumes it.
 
 use infr_core::error::{Error, Result};
@@ -21,7 +21,7 @@ use std::{sync::OnceLock, time::Duration};
 
 /// TCP+TLS handshake budget. Generous enough for a slow link, short enough to fail rather than hang.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Whole-request budget for the small (few-KB) metadata calls: the model API GET and the LFS HEAD.
+/// Whole-request budget for the small (few-KiB) metadata calls: the model API GET and the LFS HEAD.
 const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The client used for BODY transfers (model blobs, companions). No total timeout — see above.

@@ -346,9 +346,9 @@ fn bad_value_is_an_error_not_a_silent_default() {
 ///
 /// `banana` is not repeated here: [`bad_value_is_an_error_not_a_silent_default`] already sweeps it
 /// across every value-carrying knob. What is here is the spellings that fail for a DIFFERENT reason
-/// than "not a number at all" — a float and a negative for a `u64` MiB count, the empty value, and
-/// a size suffix (`GiB`) that reads like the grammar but is not it. Each must leave the field
-/// unspecified rather than half-parse.
+/// than "not a number at all" — a float and a negative for a `u64` MiB count, plus the empty
+/// value. Each must leave the field unspecified rather than half-parse. The shared size grammar's
+/// canonical IEC suffix is pinned here as accepted alongside its historical short alias.
 #[test]
 fn mib_and_size_string_spellings() {
     let d = Config::default();
@@ -364,19 +364,22 @@ fn mib_and_size_string_spellings() {
     let cfg = Config::load_from_layers(&[env_layer(&[("INFR_KV_OVERFLOW_VRAM_MB", "  512  ")])]);
     assert_eq!(cfg.kv.overflow_vram_mb, Some(512));
 
-    // Size: `1GiB` is NOT the shared grammar's spelling (`1g` is) — it must read as unset, not as
-    // a `1`-byte ring.
-    for raw in ["", "1GiB"] {
+    // Size: canonical IEC and historical short spellings mean the same binary quantity.
+    let cfg = Config::load_from_layers(&[env_layer(&[("INFR_PAGER_RING", "")])]);
+    assert_eq!(
+        cfg.paging.ring, d.paging.ring,
+        "an empty INFR_PAGER_RING must not specify a ring size"
+    );
+    for raw in ["1GiB", "1g"] {
         let cfg = Config::load_from_layers(&[env_layer(&[("INFR_PAGER_RING", raw)])]);
         assert_eq!(
-            cfg.paging.ring, d.paging.ring,
-            "INFR_PAGER_RING={raw:?} must not specify a ring size"
+            cfg.paging.ring,
+            Some(super::SizeSpec::Bytes(1 << 30)),
+            "INFR_PAGER_RING={raw:?}"
         );
     }
-    let cfg = Config::load_from_layers(&[env_layer(&[("INFR_PAGER_RING", "1g")])]);
-    assert_eq!(cfg.paging.ring, Some(super::SizeSpec::Bytes(1 << 30)));
 
-    let cfg = Config::load_from_layers(&[env_layer(&[("INFR_RAM_BUDGET", "50g")])]);
+    let cfg = Config::load_from_layers(&[env_layer(&[("INFR_RAM_BUDGET", "50GiB")])]);
     assert_eq!(
         cfg.device.ram_budget,
         Some(super::SizeSpec::Bytes(50 << 30))

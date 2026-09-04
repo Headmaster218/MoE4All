@@ -2221,7 +2221,7 @@ impl MetalBackend {
     /// ballooning a quant tensor 4-8x. Formats without native kernels (IQ2*/IQ3*/TQ*/fp4 — every
     /// Linear falls here) can push a model that FITS in its quantized form past the GPU working
     /// set, and Metal shared-storage allocation doesn't fail there — it silently corrupts under
-    /// pressure (observed: a 4B IQ4_XS ballooned to 16 GB on a 12.9 GB working set and generated
+    /// pressure (observed: a 4B IQ4_XS ballooned to 16 GiB on a 12.9 GiB working set and generated
     /// garbage with no error). Exceeding the budget is now a hard error naming the fix.
     fn weight_buf(
         &self,
@@ -4680,7 +4680,7 @@ impl MetalBackend {
                     );
                     // Expert FFN, batched over (chunk rows x selected experts) — one dispatch per
                     // stage per chunk; chunking bounds the expert scratch (a full 8k-row prefill
-                    // would need ~0.5 GB of it).
+                    // would need ~0.5 GiB of it).
                     let gq = self.weight_qui(gate_exps, g, bindings);
                     let uq = self.weight_qui(up_exps, g, bindings);
                     let dq = self.weight_qui(down_exps, g, bindings);

@@ -27,12 +27,12 @@ fn main() {
             let shared = props.limits.max_compute_shared_memory_size;
             println!("== {name} ==");
             println!(
-                "  maxComputeSharedMemorySize = {shared} bytes ({} KB)",
+                "  maxComputeSharedMemorySize = {shared} bytes ({} KiB)",
                 shared / 1024
             );
             println!("  subgroupSize               = {}", sub.subgroup_size);
             println!(
-                "  flash-warp shared need     = 58112 bytes (56.75 KB)  -> {}",
+                "  flash-warp shared need     = 58112 bytes (56.75 KiB)  -> {}",
                 if 58112 > shared {
                     "OVER LIMIT (device-lost)"
                 } else {

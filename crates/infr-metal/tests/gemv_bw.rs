@@ -121,10 +121,10 @@ fn bench(
     let dt = t0.elapsed().as_secs_f64() / reps as f64;
     let bytes = (out_f * in_f) as f64 * bpw / 8.0;
     println!(
-        "{label}: {out_f}x{in_f} -> {:.3} ms/dispatch, {:.1} GB/s (stream {:.1} MB)",
+        "{label}: {out_f}x{in_f} -> {:.3} ms/dispatch, {:.1} GiB/s (stream {:.1} MiB)",
         dt * 1e3,
-        bytes / dt / 1e9,
-        bytes / 1e6
+        bytes / dt / (1u64 << 30) as f64,
+        bytes / (1u64 << 20) as f64
     );
 }
 
@@ -548,10 +548,10 @@ fn bench_chained_m(
     let dt = t0.elapsed().as_secs_f64() / (reps * k) as f64;
     let bytes = (out_f * in_f) as f64 * bpw / 8.0;
     println!(
-        "{label}: m={m} {out_f}x{in_f} chained -> {:.3} ms/gemv, {:.1} GB/s (stream {:.1} MB)",
+        "{label}: m={m} {out_f}x{in_f} chained -> {:.3} ms/gemv, {:.1} GiB/s (stream {:.1} MiB)",
         dt * 1e3,
-        bytes / dt / 1e9,
-        bytes / 1e6
+        bytes / dt / (1u64 << 30) as f64,
+        bytes / (1u64 << 20) as f64
     );
 }
 

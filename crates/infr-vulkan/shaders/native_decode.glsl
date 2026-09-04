@@ -10,7 +10,7 @@
 // every weight read — the paged expert kernels (`native_gemv_id(_multi).comp`'s -DPAGED build) use
 // this to relocate all dequant math into one arena slot: the within-expert ELEMENT offsets this
 // library computes stay small (they fit u32 comfortably for any real expert), while the slot's
-// arena position — whose ELEMENT/BYTE offset would overflow u32 past a few dozen ~14 MB slots
+// arena position — whose ELEMENT/BYTE offset would overflow u32 past a few dozen ~14 MiB slots
 // (u32 element math wrapped at slot ≥ ~102 on Scout, the task's coherent-but-wrong bug) — is
 // carried as a u32 WORD index added only here, at the final indexing step (a 16 GiB-per-arena
 // reach, enforced host-side; see `GpuPager`). Undefined = plain nw[i]: every non-paged build
@@ -107,7 +107,7 @@ float dq(uint g) {
 #define HAVE_DQBLK
 // Word-parallel qs: the 32-byte qs body is pulled as two b128 quads (NW4) instead of eight per-word
 // ru32u loads, and a SIGNED bitfieldExtract per element replaces the rb() byte-extract + sgn8 select
-// chain — the byte-serial form left the Q8_0 decode GEMV at ~600-690 GB/s (llama.cpp's runs ~850-900).
+// chain — the byte-serial form left the Q8_0 decode GEMV at ~559-643 GiB/s (llama.cpp's runs ~792-838).
 // bitfieldExtract(int, 8b, 8) IS the signed byte value — same integers, bit-identical.
 //
 // The b128 quads matter under -DSTREAMED: there each NW() is a scalar 64-bit BDA load that the
@@ -498,10 +498,10 @@ void dqblk(uint gstart, out float v[32]) {  // decode d/dmin/6-bit scale once fo
     // is bit-identical to the byte-serial form.
     //
     // Why it matters: Q5_K's dequant ALU is CO-CRITICAL with DRAM at decode, not free. On a
-    // 7900 XTX the gemma-4-31B Q5_K weights (14.90 GB/token) have a 15.5 us/GB DRAM floor of
+    // 7900 XTX the gemma-4-31B Q5_K weights (14.90 GiB/token) have a 15.5 us/GiB DRAM floor of
     // 15.5 ms, while the old ~9 ops/elem cost ~12.7 ms of ALU — so the two could not overlap and
-    // the GEMV landed at 737 GB/s (77% of peak). Q8_0, whose decode is ~4 ops/elem (ALU
-    // effectively free), hits 863 GB/s (90%) through this SAME kernel — that gap was the ALU,
+    // the GEMV landed at 686 GiB/s (77% of peak). Q8_0, whose decode is ~4 ops/elem (ALU
+    // effectively free), hits 804 GiB/s (90%) through this SAME kernel — that gap was the ALU,
     // and this cuts it to ~5 ops/elem.
     // b128 the qs/qh quads (176%16==0, qh at +16, qs at +48 => qw/hw 16B-aligned). Matches the
     // descriptor path's buffer_load_b128; streamed NW4 keeps a saddr base. Bit-identical words.

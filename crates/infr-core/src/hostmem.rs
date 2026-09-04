@@ -31,7 +31,7 @@
 ///
 /// **A cgroup memory limit overrides it.** `/proc/meminfo` is host-wide and knows nothing about the
 /// limit a container or a `systemd-run --scope -p MemoryMax=` puts on this process — measured on
-/// this box, an 8 GB scope still reports 54.6 GB available. Sizing an anonymous arena from that
+/// this box, an 8 GiB scope still reports 54.6 GiB available. Sizing an anonymous arena from that
 /// figure is an OOM kill, so the smaller of the two wins.
 pub fn available_bytes() -> Option<u64> {
     let observed = platform_available_bytes()?;
@@ -155,8 +155,8 @@ fn windows_process_resident_bytes() -> Option<u64> {
 #[cfg(any(target_os = "linux", test))]
 fn parse_process_resident(text: &str) -> Option<u64> {
     let line = text.lines().find(|line| line.starts_with("VmRSS:"))?;
-    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kb * 1024)
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib * 1024)
 }
 
 /// Memory this process may still commit before its cgroup kills it, or `None` when no ancestor
@@ -216,7 +216,7 @@ fn read_u64(path: &std::path::Path) -> Option<u64> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-/// Pull `MemAvailable` (in kB, as `/proc/meminfo` always reports it) out of the file's text.
+/// Pull `MemAvailable` out of `/proc/meminfo`. Linux labels the binary KiB value as `kB`.
 ///
 /// Split from the read so the parse is testable against a literal — the one machine this runs on
 /// cannot produce a file with the field missing, which is the case worth checking.
@@ -224,15 +224,15 @@ fn read_u64(path: &std::path::Path) -> Option<u64> {
 fn parse_mem_available(text: &str) -> Option<u64> {
     let line = text.lines().find(|l| l.starts_with("MemAvailable:"))?;
     // `MemAvailable:   12345678 kB`
-    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kb * 1024)
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib * 1024)
 }
 
 #[cfg(any(target_os = "linux", test))]
 fn parse_mem_total(text: &str) -> Option<u64> {
     let line = text.lines().find(|l| l.starts_with("MemTotal:"))?;
-    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kb * 1024)
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib * 1024)
 }
 
 /// Never take the last of the machine's memory: the larger of this and the bounded
@@ -529,7 +529,7 @@ mod tests {
     const GIB: u64 = 1 << 30;
 
     #[test]
-    fn parses_mem_available_in_kb() {
+    fn parses_mem_available_from_linux_kb_field() {
         let text = "MemTotal:       65780000 kB\nMemFree:         2000000 kB\n\
                     MemAvailable:   43000000 kB\nBuffers:          100000 kB\n";
         assert_eq!(parse_mem_available(text), Some(43_000_000 * 1024));
@@ -552,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_process_resident_in_kb() {
+    fn parses_process_resident_from_linux_kb_field() {
         let text = "Name:\tinfr\nVmSize:\t100000 kB\nVmRSS:\t12345 kB\nRssAnon:\t8000 kB\n";
         assert_eq!(parse_process_resident(text), Some(12_345 * 1024));
         assert_eq!(parse_process_resident("Name:\tinfr\n"), None);

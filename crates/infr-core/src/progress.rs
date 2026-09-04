@@ -4,7 +4,7 @@
 //! Layout is a single auto-width line: details on the left/right, the bar fills the middle:
 //! ```text
 //! label  37/40 layers [━━━━━━━━━━━━━━━━━━━━━━━━━━━━━] 3s
-//! label  4.2GB/8.4GB  [━━━━━━━━━━━━━━━━╾────────────] 180MB/s ETA 23s
+//! label  4.2 GiB/8.4 GiB  [━━━━━━━━━━━━━━━━╾────────────] 180 MiB/s ETA 23s
 //! ```
 
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};

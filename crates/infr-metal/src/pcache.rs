@@ -6,7 +6,7 @@
 //! Turning MSL into something a GPU runs is TWO compilers:
 //!
 //! 1. the **front end**, MSL → AIR (Apple's IR), which `MTLDevice.newLibraryWithSource:` runs over
-//!    the ~340 KB [`msl_source`](crate::msl_source) assembles, and
+//!    the ~340 KiB [`msl_source`](crate::msl_source) assembles, and
 //! 2. the **back end**, AIR → that GPU's ISA, which every `MTLComputePipelineState` creation runs
 //!    for one kernel.
 //!

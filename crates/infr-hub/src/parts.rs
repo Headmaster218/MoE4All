@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 ///
 /// It trades two costs against each other. Each chunk is one HTTP request — and against HF each is
 /// a redirect from `huggingface.co` to the CDN as well — so a smaller chunk spends more of the
-/// transfer on request setup: a 161 GB object at 64 MiB is ~2 570 requests, which at ~100 ms of
+/// transfer on request setup: a 161 GiB object at 64 MiB is ~2 570 requests, which at ~100 ms of
 /// setup spread over eight connections is tens of seconds against a transfer measured in tens of
 /// minutes. A larger chunk costs the other way: an interrupted download loses the in-flight chunks,
 /// so the worst case thrown away is `pull_jobs × CHUNK_BYTES` — half a gigabyte at eight
@@ -37,12 +37,12 @@ use std::path::{Path, PathBuf};
 /// It is ALSO the threshold for splitting at all, and deliberately the same number rather than a
 /// second constant: an object of one chunk or less has exactly one cell in its grid, so it is
 /// fetched by one request on one connection with no sidecar involved. That is what keeps every
-/// small file — a `generation_config.json`, a 20 MB tokenizer, a tiny GGUF — on precisely the path
+/// small file — a `generation_config.json`, a 20 MiB tokenizer, a tiny GGUF — on precisely the path
 /// it used before ranges existed.
 pub(crate) const CHUNK_BYTES: u64 = 64 << 20;
 
 /// The chunk size a FRESH plan is built with. Tests use a small grid so that a fan-out over many
-/// chunks costs a few hundred KB of loopback traffic instead of gigabytes; every byte offset here
+/// chunks costs a few hundred KiB of loopback traffic instead of gigabytes; every byte offset here
 /// is `u64` arithmetic that does not care which value it is given, and the production constant is
 /// what the real-object pull exercises.
 #[cfg(not(test))]
@@ -224,7 +224,7 @@ pub(crate) fn load(tmp: &Path) -> Option<Plan> {
 ///
 /// Written to a neighbouring temp and `rename`d, so a crash between the two leaves either the old
 /// plan or the new one and never a half-written line that would read as "this file has no plan" and
-/// throw away a 100 GB partial. `sync_all` before the rename is what makes that a promise rather
+/// throw away a 100 GiB partial. `sync_all` before the rename is what makes that a promise rather
 /// than a hope — a rename can otherwise reach the disk before the bytes it points at.
 pub(crate) fn save(tmp: &Path, plan: &Plan) -> Result<()> {
     let path = plan_path(tmp);

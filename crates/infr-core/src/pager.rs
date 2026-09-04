@@ -865,7 +865,7 @@ impl Drop for Pager {
 /// to [256 MiB, 2 GiB].
 ///
 /// Bigger halves = fewer pipeline rotations, and each rotation stalls the CPU on the other half's
-/// fence — measured on Scout pp512 (miss-heavy steady state, ~22 GB staged/rep): 256 MiB →
+/// fence — measured on Scout pp512 (miss-heavy steady state, ~22 GiB staged/rep): 256 MiB →
 /// 224 t/s, 1 GiB → 324, 2 GiB → 404, flat beyond. The budget fraction keeps small explicit
 /// `INFR_CACHE` runs from spending most of their grant on staging instead of arena slots.
 ///
@@ -895,7 +895,7 @@ mod tests {
     /// Driven through [`ring_bytes`] itself, over resolved [`SizeSpec`] values. It used to go
     /// through a `&str` façade (`ring_bytes_from`) so the sweep could avoid the process
     /// environment, which the value-taking function already allows; the SPELLINGS it exercised
-    /// (`1g`, `512m`, a bare byte count, and the unparseable `banana` / `1GiB`) are
+    /// (`1GiB`, `1g`, `512m`, a bare byte count, and the unparseable `banana`) are
     /// `crate::parse_size`'s grammar and are pinned by `parse_size_grammar` and by
     /// `config`'s `mib_and_size_string_spellings` — everything unparseable arrives here as `None`.
     #[test]
@@ -950,6 +950,7 @@ mod tests {
             (2048 * MIB) as usize
         );
         for (raw, want) in [
+            ("1GiB", 1024 * MIB as usize),
             ("1g", 1024 * MIB as usize),
             ("512m", 512 * MIB as usize),
             ("banana", (2048 * MIB) as usize), // rejected by the grammar ⇒ field stays None

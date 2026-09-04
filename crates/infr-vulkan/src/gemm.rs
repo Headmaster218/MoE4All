@@ -2150,7 +2150,7 @@ pub(crate) fn attn_qk_warp_spv() -> &'static [u32] {
 pub(crate) fn attn_flash_spv() -> &'static [u32] {
     ATTN_FLASH_SPV.get_or_init(|| spv_words(ATTN_FLASH_SPV_BYTES))
 }
-/// BM=32 build of the fused flash prefill (29056 B shared) for sub-64 KB shared devices.
+/// BM=32 build of the fused flash prefill (29056 B shared) for sub-64 KiB shared devices.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_flash_bm32_spv() -> &'static [u32] {
     ATTN_FLASH_BM32_SPV.get_or_init(|| spv_words(ATTN_FLASH_BM32_SPV_BYTES))
@@ -2160,7 +2160,7 @@ pub(crate) fn attn_flash_bm32_spv() -> &'static [u32] {
 pub(crate) fn attn_flash_partial_spv() -> &'static [u32] {
     ATTN_FLASH_PARTIAL_SPV.get_or_init(|| spv_words(ATTN_FLASH_PARTIAL_SPV_BYTES))
 }
-/// BM=32 build of the split-K flash partial (29056 B shared) for sub-64 KB shared devices.
+/// BM=32 build of the split-K flash partial (29056 B shared) for sub-64 KiB shared devices.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_flash_partial_bm32_spv() -> &'static [u32] {
     ATTN_FLASH_PARTIAL_BM32_SPV.get_or_init(|| spv_words(ATTN_FLASH_PARTIAL_BM32_SPV_BYTES))
@@ -2244,7 +2244,7 @@ pub(crate) fn attn_flash_warp_spv() -> &'static [u32] {
     ATTN_FLASH_WARP_SPV.get_or_init(|| spv_words(ATTN_FLASH_WARP_SPV_BYTES))
 }
 /// BM=32 build of the flash partial (29056 B shared vs 58112 B): for devices whose
-/// maxComputeSharedMemorySize is under the 64 KB the default BM=64 tile needs (NVIDIA, MoltenVK).
+/// maxComputeSharedMemorySize is under the 64 KiB the default BM=64 tile needs (NVIDIA, MoltenVK).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_flash_warp_bm32_spv() -> &'static [u32] {
     ATTN_FLASH_WARP_BM32_SPV.get_or_init(|| spv_words(ATTN_FLASH_WARP_BM32_SPV_BYTES))
@@ -2310,7 +2310,7 @@ pub(crate) fn attn_flash_warp_deq_spv(
 pub(crate) fn attn_flash_reg_spv() -> &'static [u32] {
     ATTN_FLASH_REG_SPV.get_or_init(|| spv_words(ATTN_FLASH_REG_SPV_BYTES))
 }
-/// BR=64 build of the register-O flash partial (29440 B shared) for sub-64 KB shared devices.
+/// BR=64 build of the register-O flash partial (29440 B shared) for sub-64 KiB shared devices.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_flash_reg_br64_spv() -> &'static [u32] {
     ATTN_FLASH_REG_BR64_SPV.get_or_init(|| spv_words(ATTN_FLASH_REG_BR64_SPV_BYTES))
@@ -3855,7 +3855,7 @@ dyn_spv!(
 );
 // B7 slice 3a: DECODE-ONLY specialization of the split-K pass 1 (`attn_decode.comp`) — the same
 // hd=128 f16-BDA inner loop `attn_partial_bda` runs, with every non-decode arm deleted so it fits
-// 96 VGPRs instead of 120 and 2.75 KB of LDS instead of 4.75 KB. Bit-identical output (the
+// 96 VGPRs instead of 120 and 2.75 KiB of LDS instead of 4.75 KiB. Bit-identical output (the
 // reduction stays a plain `subgroupAdd`). Selected in `Recorder::attention_kv_split_impl` /
 // `attention_kv_split_dynac_impl` when the shape qualifies; `INFR_NO_ATTN_DECODE=1`
 // (`kernels.vulkan.attn_decode`) forces `attn_partial` back for the A/B.

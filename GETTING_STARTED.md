@@ -299,7 +299,7 @@ $model = 'D:\Models\Qwen3-0.6B-Q4_K_M.gguf'
 & $infr run  'unsloth/Qwen3-0.6B-GGUF:Q4_K_M'
 ```
 
-受限仓库可在当前 PowerShell 会话设置 `HF_TOKEN`。对于国内网络或数十 GB 的
+受限仓库可在当前 PowerShell 会话设置 `HF_TOKEN`。对于国内网络或数十 GiB 的
 模型，仍建议通过熟悉的下载工具准备本地 GGUF。
 
 ## 8. API 示例

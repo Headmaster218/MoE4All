@@ -135,7 +135,7 @@ pub fn flag_from(raw: Option<&str>) -> bool {
 /// at `u64::MAX` keeps the only sane reading of a huge cap — effectively no cap — and it can never
 /// be reached by real bytes, so the gate behaves exactly as "uncapped" downstream.
 pub fn mib_bytes(mib: Option<u64>) -> Option<u64> {
-    mib.map(|mb| mb.saturating_mul(1024 * 1024))
+    mib.map(|mib| mib.saturating_mul(1024 * 1024))
 }
 
 /// VRAM headroom a VRAM-first spill keeps free below the live free-byte figure, so the consumers

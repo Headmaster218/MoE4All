@@ -689,11 +689,11 @@ pub fn print_summary_if_enabled() {
     );
     let _ = writeln!(
         out,
-        "host memcpy / ReBAR push: count={} bytes={} time={} bw={:.2} GB/s",
+        "host memcpy / ReBAR push: count={} bytes={} time={} bw={:.2} GiB/s",
         s.memcpys,
         fmt_bytes(s.memcpy_bytes),
         fmt_ns(s.memcpy_ns),
-        bandwidth_gbs(s.memcpy_bytes, s.memcpy_ns),
+        bandwidth_gib_per_sec(s.memcpy_bytes, s.memcpy_ns),
     );
     let _ = writeln!(
         out,
@@ -822,11 +822,12 @@ fn avg(sum: u64, count: u64) -> f64 {
     }
 }
 
-fn bandwidth_gbs(bytes: u64, ns: u64) -> f64 {
+fn bandwidth_gib_per_sec(bytes: u64, ns: u64) -> f64 {
     if ns == 0 {
         0.0
     } else {
-        bytes as f64 / ns as f64
+        const GIB: f64 = (1u64 << 30) as f64;
+        bytes as f64 * 1_000_000_000.0 / ns as f64 / GIB
     }
 }
 
@@ -880,9 +881,9 @@ mod tests {
     }
 
     #[test]
-    fn bandwidth_uses_decimal_gb_per_second() {
-        assert_eq!(bandwidth_gbs(2_000_000_000, 1_000_000_000), 2.0);
-        assert_eq!(bandwidth_gbs(10, 0), 0.0);
+    fn bandwidth_uses_binary_gib_per_second() {
+        assert_eq!(bandwidth_gib_per_sec(2u64 << 30, 1_000_000_000), 2.0);
+        assert_eq!(bandwidth_gib_per_sec(10, 0), 0.0);
     }
 
     #[test]

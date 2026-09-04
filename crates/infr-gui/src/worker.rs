@@ -609,9 +609,8 @@ async fn record_worker_log(status: &RwLock<RuntimeStatus>, line: String) {
 
 fn update_memory_status(state: &mut RuntimeStatus, line: &str) {
     if line.contains("VRAM plan:") {
-        state.memory.expert_cache_target_bytes =
-            metric(line, "expert_cache_target=").map(decimal_gb_bytes);
-        state.memory.elastic_pool_bytes = metric(line, "elastic_pool=").map(decimal_gb_bytes);
+        state.memory.expert_cache_target_bytes = logged_gib_metric(line, "expert_cache_target=");
+        state.memory.elastic_pool_bytes = logged_gib_metric(line, "elastic_pool=");
         state.memory.context_tokens = metric(line, "ctx=").map(|value| value as u64);
         state.memory.kv_layout = line
             .split_once('(')
@@ -625,13 +624,13 @@ fn update_memory_status(state: &mut RuntimeStatus, line: &str) {
     }
     if line.contains("MoE host plan: bounded inclusive RAM cache") {
         state.memory.host_mode = Some("bounded".into());
-        state.memory.host_cache_bytes =
-            metric(line, "bounded inclusive RAM cache ").map(decimal_gb_bytes);
-        state.memory.expert_payload_bytes = metric(line, " GB / ").map(decimal_gb_bytes);
+        state.memory.host_cache_bytes = logged_gib_metric(line, "bounded inclusive RAM cache ");
+        state.memory.expert_payload_bytes = metric(line, " GiB / ")
+            .map(gib_bytes)
+            .or_else(|| metric(line, " GB / ").map(legacy_decimal_gb_bytes));
     } else if line.contains("MoE host plan: full layer-contiguous RAM store") {
         state.memory.host_mode = Some("full".into());
-        state.memory.host_cache_bytes =
-            metric(line, "full layer-contiguous RAM store ").map(decimal_gb_bytes);
+        state.memory.host_cache_bytes = logged_gib_metric(line, "full layer-contiguous RAM store ");
         state.memory.expert_payload_bytes = state.memory.host_cache_bytes;
     }
     if line.contains("host DMA import total:") {
@@ -656,7 +655,19 @@ fn update_memory_status(state: &mut RuntimeStatus, line: &str) {
     }
 }
 
-fn decimal_gb_bytes(value: f64) -> u64 {
+/// Parse current GiB-valued engine logs while retaining compatibility with pre-IEC binaries whose
+/// otherwise-identical lines used decimal GB. The unit marker on the line chooses the multiplier;
+/// this must never relabel a decimal value as binary.
+fn logged_gib_metric(line: &str, marker: &str) -> Option<u64> {
+    let value = metric(line, marker)?;
+    Some(if line.contains(" GiB") {
+        gib_bytes(value)
+    } else {
+        legacy_decimal_gb_bytes(value)
+    })
+}
+
+fn legacy_decimal_gb_bytes(value: f64) -> u64 {
     (value * 1_000_000_000.0).round() as u64
 }
 
@@ -944,14 +955,14 @@ mod tests {
         let mut status = RuntimeStatus::default();
         update_memory_status(
             &mut status,
-            "VRAM plan: total_room=19.86 GB fixed=5.20 GB state=0.16 GB \
-             runtime_elastic=0.36 GB packing_margin=0.27 GB load_driver=0.00 GB \
-             post_load=0.27 GB expert_cache_target=13.61 GB elastic_pool=13.97 GB \
+            "VRAM plan: total_room=19.86 GiB fixed=5.20 GiB state=0.16 GiB \
+             runtime_elastic=0.36 GiB packing_margin=0.27 GiB load_driver=0.00 GiB \
+             post_load=0.27 GiB expert_cache_target=13.61 GiB elastic_pool=13.97 GiB \
              (k=F16, v=F16, ctx=145)",
         );
         update_memory_status(
             &mut status,
-            "MoE host plan: bounded inclusive RAM cache 48.32 GB / 72.36 GB expert payload",
+            "MoE host plan: bounded inclusive RAM cache 48.32 GiB / 72.36 GiB expert payload",
         );
         update_memory_status(
             &mut status,
@@ -966,14 +977,35 @@ mod tests {
         assert_eq!(status.memory.context_tokens, Some(145));
         assert_eq!(
             status.memory.expert_cache_target_bytes,
+            Some(gib_bytes(13.61))
+        );
+        assert_eq!(status.memory.elastic_pool_bytes, Some(gib_bytes(13.97)));
+        assert_eq!(status.memory.host_mode.as_deref(), Some("bounded"));
+        assert_eq!(status.memory.host_cache_bytes, Some(gib_bytes(48.32)));
+        assert_eq!(status.memory.expert_payload_bytes, Some(gib_bytes(72.36)));
+        assert_eq!(status.memory.host_dma_arenas.as_deref(), Some("3/3"));
+        assert_eq!(status.memory.unified_arena_bytes, Some(13_966_884_864));
+    }
+
+    #[test]
+    fn startup_log_parser_retains_pre_iec_decimal_gb_compatibility() {
+        let mut status = RuntimeStatus::default();
+        update_memory_status(
+            &mut status,
+            "VRAM plan: expert_cache_target=13.61 GB elastic_pool=13.97 GB (k=F16, v=F16, ctx=145)",
+        );
+        update_memory_status(
+            &mut status,
+            "MoE host plan: bounded inclusive RAM cache 48.32 GB / 72.36 GB expert payload",
+        );
+
+        assert_eq!(
+            status.memory.expert_cache_target_bytes,
             Some(13_610_000_000)
         );
         assert_eq!(status.memory.elastic_pool_bytes, Some(13_970_000_000));
-        assert_eq!(status.memory.host_mode.as_deref(), Some("bounded"));
         assert_eq!(status.memory.host_cache_bytes, Some(48_320_000_000));
         assert_eq!(status.memory.expert_payload_bytes, Some(72_360_000_000));
-        assert_eq!(status.memory.host_dma_arenas.as_deref(), Some("3/3"));
-        assert_eq!(status.memory.unified_arena_bytes, Some(13_966_884_864));
     }
 
     #[test]

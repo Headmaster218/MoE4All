@@ -7,7 +7,7 @@
 //!
 //! Each rank `p` publishes its partial into an EXPORTED device-local buffer `E_p`
 //! ([`VulkanBackend::p2p_export`]); every other rank imports `E_p` ([`p2p_import`]) so it can read
-//! `p`'s VRAM directly over PCIe (no host bounce — the campaign measured 12.9-27.2 GB/s vs 3.82
+//! `p`'s VRAM directly over PCIe (no host bounce — the campaign measured 12.0-25.3 GiB/s vs 3.56
 //! host-bounce). A rank then copies each peer's published partial into a local scratch and sums
 //! `own + Σ peers` with an on-device `Op::Add` chain. The reduction is a FIXED rank-order sum, so it
 //! is deterministic run-to-run (bit-reproducible), and — crucially for correctness — every rank
