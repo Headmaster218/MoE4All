@@ -564,6 +564,23 @@ impl SubmitTuneRound {
     }
 }
 
+/// Select the cap for one transient/static graph. Automatic single-token paged-MoE decode already
+/// has mandatory pager submission boundaries between expert layers; inheriting a cap calibrated
+/// from a large prefill only subdivides those bounded segments again. Explicit overrides remain
+/// authoritative, and integrated GPUs retain their established TDR-safe platform cap.
+fn static_submit_mode(
+    explicit: bool,
+    integrated: bool,
+    single_token_paged_moe: bool,
+    current_cap: usize,
+) -> (usize, bool) {
+    if single_token_paged_moe && !explicit {
+        (infr_core::initial_submit_dispatch_cap(integrated), false)
+    } else {
+        (current_cap, true)
+    }
+}
+
 impl Drop for SubmitTuneRound {
     fn drop(&mut self) {
         if let Some(token) = self.token.take() {
@@ -941,8 +958,14 @@ impl VulkanShared {
         }
     }
 
-    fn begin_submit_tune_round(self: &Arc<Self>) -> SubmitTuneRound {
-        let token = if self.submit_tune_active.load(Ordering::Acquire) {
+    fn begin_submit_tune_round(self: &Arc<Self>, single_token_paged_moe: bool) -> SubmitTuneRound {
+        let (cap, allow_tuning) = static_submit_mode(
+            self.submit_dispatch_cap_explicit,
+            self.caps.integrated,
+            single_token_paged_moe,
+            self.submit_dispatch_cap.load(Ordering::Relaxed),
+        );
+        let token = if allow_tuning && self.submit_tune_active.load(Ordering::Acquire) {
             self.submit_auto_tuner
                 .lock()
                 .unwrap()
@@ -954,7 +977,7 @@ impl VulkanShared {
         SubmitTuneRound {
             shared: Arc::clone(self),
             token,
-            cap: self.submit_dispatch_cap.load(Ordering::Relaxed),
+            cap,
         }
     }
 
@@ -3930,8 +3953,8 @@ impl VulkanBackend {
         self.shared.submit_dispatch_cap.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn begin_submit_tune_round(&self) -> SubmitTuneRound {
-        self.shared.begin_submit_tune_round()
+    pub(crate) fn begin_submit_tune_round(&self, single_token_paged_moe: bool) -> SubmitTuneRound {
+        self.shared.begin_submit_tune_round(single_token_paged_moe)
     }
 
     /// Persistent decode is recorded once and cannot follow a cap that changes during startup.
@@ -6602,6 +6625,15 @@ mod tests {
 
     fn submit_policy(profile: infr_core::config::AutoProfile) -> SubmitAutoPolicy {
         SubmitAutoPolicy::new(SubmitAutoSettings::for_profile(profile))
+    }
+
+    #[test]
+    fn automatic_paged_decode_uses_platform_cap_without_changing_explicit_overrides() {
+        assert_eq!(static_submit_mode(false, false, true, 31), (0, false));
+        assert_eq!(static_submit_mode(false, true, true, 31), (128, false));
+        assert_eq!(static_submit_mode(false, false, false, 31), (31, true));
+        assert_eq!(static_submit_mode(true, false, true, 37), (37, true));
+        assert_eq!(static_submit_mode(true, false, true, 0), (0, true));
     }
 
     #[test]

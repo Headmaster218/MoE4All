@@ -6174,9 +6174,25 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     // blocks (the small-m split's router readback) when residency actually demands it — see
     // `PagedStream`'s doc. Every non-paged graph (the overwhelming common case) never touches any
     // of this and records exactly like before — one recorder, one submit.
-    // Automatic submit calibration owns one complete execute as a sample. Open it before the
-    // first recorder so pager-driven recorder rotations are included in the same GPU-time round.
-    let submit_tune_round = be_.begin_submit_tune_round();
+    // A paged single-token graph already submits at its per-layer router/residency boundaries.
+    // On automatic discrete-GPU settings, do not inherit a prefill-calibrated splitter cap and
+    // subdivide those bounded decode segments again. This test is deliberately based on the MoE
+    // input shape rather than replay eligibility: QSA and other stateful decode ops correctly force
+    // this graph down the static path while still carrying exactly one token row.
+    let mut saw_moe = false;
+    let single_token_paged_moe = be_.moe_paged()
+        && graph.ops.iter().all(|op| {
+            let Op::MoeFfn { x, ne, .. } = op else {
+                return true;
+            };
+            saw_moe = true;
+            graph.desc(*x).numel() == *ne as usize
+        })
+        && saw_moe;
+    // Automatic submit calibration owns one complete prefill/batched execute as a sample. Open it
+    // before the first recorder so pager-driven recorder rotations are included in the same GPU-
+    // time round. Single-token paged decode intentionally does not consume a calibration round.
+    let submit_tune_round = be_.begin_submit_tune_round(single_token_paged_moe);
     let cap = submit_tune_round.cap();
     let mut rec = Some(be_.recorder()?);
     let mode = RopeMode::Static(&rope_pos);
