@@ -784,8 +784,8 @@ impl VulkanShared {
 unsafe impl Send for VulkanShared {}
 unsafe impl Sync for VulkanShared {}
 
-const QUEUE_SUBMIT_OOM_RETRY_DELAYS_MS: [u64; 3] = [10, 50, 200];
-const QUEUE_SUBMIT_POST_SHED_DELAYS_MS: [u64; 2] = [100, 250];
+const MEMORY_OOM_RETRY_DELAYS_MS: [u64; 3] = [10, 50, 200];
+const MEMORY_OOM_POST_SHED_DELAYS_MS: [u64; 2] = [100, 250];
 const HOST_DMA_SHED_STEP_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 fn retryable_queue_submit_error(error: vk::Result) -> bool {
@@ -793,6 +793,10 @@ fn retryable_queue_submit_error(error: vk::Result) -> bool {
         error,
         vk::Result::ERROR_OUT_OF_DEVICE_MEMORY | vk::Result::ERROR_OUT_OF_HOST_MEMORY
     )
+}
+
+fn retryable_allocation_error(error: &gpu_allocator::AllocationError) -> bool {
+    matches!(error, gpu_allocator::AllocationError::OutOfMemory)
 }
 
 impl VulkanShared {
@@ -856,7 +860,7 @@ impl VulkanShared {
             Err(error) => return Err(self.make_queue_unusable(error, context)),
         };
 
-        for delay_ms in QUEUE_SUBMIT_OOM_RETRY_DELAYS_MS {
+        for delay_ms in MEMORY_OOM_RETRY_DELAYS_MS {
             tracing::warn!(
                 "[infr] {context} hit {last}; draining queued work and retrying submit after {delay_ms} ms"
             );
@@ -877,7 +881,7 @@ impl VulkanShared {
             }
         }
 
-        for delay_ms in QUEUE_SUBMIT_POST_SHED_DELAYS_MS {
+        for delay_ms in MEMORY_OOM_POST_SHED_DELAYS_MS {
             if let Err(error) = self.drain_queue_for_submit_retry() {
                 return Err(self.make_queue_unusable(error, context));
             }
@@ -5100,6 +5104,129 @@ impl VulkanBackend {
             .map(|b| Box::new(b) as Box<dyn Buffer>)
     }
 
+    /// Allocate backing memory with bounded recovery from transient WDDM pressure. The successful
+    /// fast path is still one allocator call; only a driver OOM drains/retries and may retire idle
+    /// Host DMA aliases.
+    fn allocate_buffer_memory_recovering(
+        &self,
+        label: &str,
+        requested_size: usize,
+        requirements: vk::MemoryRequirements,
+        location: MemoryLocation,
+        scheme: AllocationScheme,
+    ) -> Result<Allocation> {
+        let allocate_once = || {
+            self.shared
+                .allocator
+                .lock()
+                .unwrap()
+                .allocate(&AllocationCreateDesc {
+                    name: label,
+                    requirements,
+                    location,
+                    linear: true,
+                    allocation_scheme: scheme,
+                })
+        };
+        let mut attempts = 1usize;
+        let mut last = match allocate_once() {
+            Ok(allocation) => return Ok(allocation),
+            Err(error) if retryable_allocation_error(&error) => error,
+            Err(error) => {
+                return Err(be(format!(
+                    "gpu_allocator::allocate({label}, requested={}, allocation={}, location={location:?}): {error}",
+                    fmt_bytes(requested_size as u64),
+                    fmt_bytes(requirements.size),
+                )))
+            }
+        };
+
+        // WDDM may reject a new allocation while completed work and external-host aliases still
+        // consume its accounting window. Serialize this recovery with submitters, then first give
+        // ordinary retirement a chance to settle before sacrificing any Host DMA coverage.
+        let _queue = self.shared.queue_access.lock().unwrap();
+        for delay_ms in MEMORY_OOM_RETRY_DELAYS_MS {
+            tracing::warn!(
+                "[infr] Vulkan allocation {label} ({}, {location:?}) hit {last}; draining queued work and retrying after {delay_ms} ms",
+                fmt_bytes(requirements.size),
+            );
+            self.shared
+                .drain_queue_for_submit_retry()
+                .map_err(|error| {
+                    be(format!(
+                        "Vulkan allocation {label} OOM recovery could not drain queued work: {error}"
+                    ))
+                })?;
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            attempts += 1;
+            match allocate_once() {
+                Ok(allocation) => {
+                    tracing::warn!(
+                        "[infr] Vulkan allocation {label} ({}, {location:?}) recovered after {attempts} attempts",
+                        fmt_bytes(requirements.size),
+                    );
+                    return Ok(allocation);
+                }
+                Err(error) if retryable_allocation_error(&error) => last = error,
+                Err(error) => {
+                    return Err(be(format!(
+                        "gpu_allocator::allocate({label}, allocation={}, location={location:?}) failed on recovery attempt {attempts}: {error}",
+                        fmt_bytes(requirements.size),
+                    )))
+                }
+            }
+        }
+
+        // Imported RAM remains the source of truth after its Vulkan alias is retired. Future
+        // transfers through that tail transparently take the existing staged/direct fallback.
+        for delay_ms in MEMORY_OOM_POST_SHED_DELAYS_MS {
+            self.shared
+                .drain_queue_for_submit_retry()
+                .map_err(|error| {
+                    be(format!(
+                        "Vulkan allocation {label} OOM recovery could not drain queued work: {error}"
+                    ))
+                })?;
+            let released = self.shared.shed_host_dma_imports(HOST_DMA_SHED_STEP_BYTES);
+            if released == 0 {
+                tracing::warn!(
+                    "[infr] Vulkan allocation {label} ({}, {location:?}) still failed and no idle Host DMA tail mapping can be released",
+                    fmt_bytes(requirements.size),
+                );
+                break;
+            }
+            tracing::warn!(
+                "[infr] Vulkan allocation {label} ({}, {location:?}) still failed; released {} of idle Host DMA mappings and will retry after {delay_ms} ms",
+                fmt_bytes(requirements.size),
+                fmt_bytes(released as u64),
+            );
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            attempts += 1;
+            match allocate_once() {
+                Ok(allocation) => {
+                    tracing::warn!(
+                        "[infr] Vulkan allocation {label} ({}, {location:?}) recovered after {attempts} attempts",
+                        fmt_bytes(requirements.size),
+                    );
+                    return Ok(allocation);
+                }
+                Err(error) if retryable_allocation_error(&error) => last = error,
+                Err(error) => {
+                    return Err(be(format!(
+                        "gpu_allocator::allocate({label}, allocation={}, location={location:?}) failed on recovery attempt {attempts}: {error}",
+                        fmt_bytes(requirements.size),
+                    )))
+                }
+            }
+        }
+
+        Err(be(format!(
+            "gpu_allocator::allocate({label}, requested={}, allocation={}, location={location:?}) failed after {attempts} attempts: {last}",
+            fmt_bytes(requested_size as u64),
+            fmt_bytes(requirements.size),
+        )))
+    }
+
     /// [`make_buf`](Self::make_buf) with an explicit dedicated-allocation override. Post-load
     /// memory hygiene: `force_dedicated` bypasses gpu-allocator's general (sub-allocating)
     /// memory blocks entirely, so a TRANSIENT buffer frees its `VkDeviceMemory` fully on drop.
@@ -5215,21 +5342,19 @@ impl VulkanBackend {
             }
         }
 
-        let allocation = {
-            let mut alloc = self.shared.allocator.lock().unwrap();
-            alloc
-                .allocate(&AllocationCreateDesc {
-                    name: label,
-                    requirements,
-                    location,
-                    linear: true,
-                    allocation_scheme: scheme,
-                })
-                .map_err(|e| {
-                    // Clean up the buffer we created if allocation fails.
-                    unsafe { self.shared.device.destroy_buffer(buffer, None) };
-                    be(format!("gpu_allocator::allocate: {e}"))
-                })?
+        let allocation = match self.allocate_buffer_memory_recovering(
+            label,
+            size,
+            requirements,
+            location,
+            scheme,
+        ) {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                // Clean up the buffer we created if every allocation attempt fails.
+                unsafe { self.shared.device.destroy_buffer(buffer, None) };
+                return Err(error);
+            }
         };
 
         if let Err(e) = unsafe {
@@ -6584,6 +6709,19 @@ mod tests {
         ));
         assert!(!retryable_queue_submit_error(vk::Result::ERROR_DEVICE_LOST));
         assert!(!retryable_queue_submit_error(vk::Result::ERROR_UNKNOWN));
+    }
+
+    #[test]
+    fn only_driver_allocation_oom_is_retryable() {
+        assert!(retryable_allocation_error(
+            &gpu_allocator::AllocationError::OutOfMemory
+        ));
+        assert!(!retryable_allocation_error(
+            &gpu_allocator::AllocationError::NoCompatibleMemoryTypeFound
+        ));
+        assert!(!retryable_allocation_error(
+            &gpu_allocator::AllocationError::InvalidAllocationCreateDesc
+        ));
     }
 
     #[test]
