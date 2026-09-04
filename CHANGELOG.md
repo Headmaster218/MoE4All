@@ -6,6 +6,45 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.0-beta.1] - 2026-09-02
+
+### Highlights
+
+- Vulkan device arenas are no longer tied to mapped Resizable BAR memory. Startup selects either
+  direct mapped writes or ordinary device-local VRAM with staged uploads, then freezes that
+  transfer route for the session. This adds a compatibility fallback for GPUs and drivers with a
+  small host-visible device-local heap, including the RDNA2 class reported by users.
+- MoE experts now act as reclaimable filler inside one elastic VRAM layout. Segmented Q8 K/V,
+  Prefill lanes, graph runtime memory, and optional embedding workloads claim explicit corridors
+  transactionally; Decode safety floors remain protected while phase-exclusive Prefill can borrow
+  and restore them.
+- `infr serve` can host an optional embedding GGUF through the same VRAM budget. Embedding weights
+  load lazily from SSD for `/v1/embeddings` requests and may be released after an idle timeout.
+
+### Changed
+
+- Paged MoE Decode promotions use one unified U/G/D transfer path, with hardware capability and
+  source location resolved by the session transfer plan rather than scattered backend branches.
+- Dynamic segmented K/V reserves frozen physical coordinates up front, while uncommitted ranges
+  remain available to the expert cache until each 32K context boundary is crossed.
+
+### Fixed
+
+- Qwen3.8 multi-turn continuation now checkpoints and restores both per-layer DeltaNet state and
+  model-level PLE history, avoiding full-context recomputation and recurrent-state drift.
+- Manual `device.ram_budget` accounts for fixed model pages that have not yet entered the process
+  working set when the host expert cache is planned, preventing startup paging under an explicit
+  total-process limit.
+- Elastic ownership changes preserve every Decode dispatch floor and bounded-cache exchange spare,
+  avoid fragmented late K/V growth, and restore borrowed slots correctly across repeated
+  Prefill/Decode transitions.
+
+### Validation
+
+- The Windows long-context resource matrix covers Qwen3.6 35B and Qwen3.8 IQ4_XS under simulated
+  16 GiB VRAM + 32 GiB RAM and 24 GiB VRAM + 64 GiB RAM profiles, with automatic and manual
+  budgets, repeated 32K/64K/96K K/V growth, API continuation, and a CLI smoke test.
+
 ## [0.5.2] - 2026-09-01
 
 ### Fixed

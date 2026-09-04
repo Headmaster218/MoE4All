@@ -56,6 +56,7 @@ jobs:
           }
           $packageName = "MoE4All-Windows-x86_64-v$version"
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "prerelease=$($version.Contains('-').ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "package_name=$packageName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "archive_name=$packageName.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
@@ -118,12 +119,16 @@ jobs:
             '.\dist\${{ steps.release.outputs.archive_name }}'
             '.\dist\${{ steps.release.outputs.archive_name }}.sha256'
           )
+          $releaseFlags = @()
+          if ('${{ steps.release.outputs.prerelease }}' -eq 'true') {
+            $releaseFlags += '--prerelease'
+          }
           & gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
             & gh release upload $tag @assets --clobber
             if ($LASTEXITCODE -ne 0) { throw "GitHub Release upload failed with exit code $LASTEXITCODE" }
-            & gh release edit $tag --title "MoE4All v${{ steps.release.outputs.version }}"
+            & gh release edit $tag --title "MoE4All v${{ steps.release.outputs.version }}" @releaseFlags
           } else {
-            & gh release create $tag @assets --verify-tag --title "MoE4All v${{ steps.release.outputs.version }}" --generate-notes
+            & gh release create $tag @assets --verify-tag --title "MoE4All v${{ steps.release.outputs.version }}" --generate-notes @releaseFlags
           }
           if ($LASTEXITCODE -ne 0) { throw "GitHub Release publish failed with exit code $LASTEXITCODE" }
