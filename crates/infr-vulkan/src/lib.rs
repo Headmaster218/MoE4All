@@ -711,6 +711,49 @@ struct ImportedHostShard {
     buffer: Arc<dyn Buffer>,
 }
 
+/// Size of the persistent D2H DMA readback slab: one ordinary host allocation imported via
+/// `VK_EXT_external_memory_host` that large downloads are DMA'd into by the copy engine
+/// (see [`VulkanBackend::download_dma`]). System-RAM only; never touches VRAM.
+const D2H_DMA_SLAB_BYTES: usize = 32 * 1024 * 1024;
+/// Downloads at or above this size route through the DMA slab; below it, the mapped readback
+/// paths stay cheaper (a one-shot submit + wait costs more than an uncached read of a few KiB).
+const D2H_DMA_MIN_BYTES: usize = 256 * 1024;
+
+/// Why this channel exists: on some Windows/WDDM driver configurations the driver's host-visible
+/// types land in BAR (device-local host-visible), whose CPU reads are uncached — a direct read of
+/// a mapped readback buffer then crawls at ~25 MB/s (observed on RX 7700 XT during the MTP
+/// stochastic-verify work, where the per-cycle m×vocab logits download costed hundreds of ms).
+/// The DMA path has the copy engine WRITE into an ordinary, page-table-backed (cached) host
+/// allocation instead: PCIe writes are posted and run at full engine bandwidth, and the
+/// subsequent CPU read is a memcpy. The same infrastructure the pager's expert cache uses for
+/// H2D (`try_import_host_shard`), run in the opposite direction.
+///
+/// MEASURED escape hatch, not a default win: on the same RX 7700 XT (ReBAR on, driver exposing
+/// cached sysmem types) the direct paths measure 14.4 GB/s (mapped Readback) and 5.5 GB/s
+/// (fresh GpuToCpu staging) at 8 MiB, while the DMA route pays a ~1.5 ms one-shot submit+wait
+/// on top of the transfer and lands at 3.7-4.4 GB/s — a net LOSS at logits scale. The channel is
+/// therefore OPT-IN (`INFR_D2H_DMA=1`): flip it on when the mapped readback is measurably slow
+/// (BAR-placed Readback class, other drivers), verified with
+/// `cargo test -p infr-vulkan --release --test d2h_dma_bench -- --ignored --nocapture`.
+#[derive(Clone)]
+struct D2hDma {
+    /// Keeps the slab's bytes alive; must outlive the Vulkan import bound on top of them.
+    _owner: Arc<AlignedHostBuffer>,
+    /// The single import shard covering the whole slab (`TRANSFER_SRC|TRANSFER_DST` buffer).
+    buffer: Arc<dyn Buffer>,
+    /// Usable bytes (slab size rounded down to the import alignment, capped by
+    /// `max_mem_alloc_size`).
+    bytes: usize,
+}
+
+/// Lazy one-time probe state for the D2H DMA channel. The outer `Option` distinguishes "not yet
+/// attempted" from "attempted and unavailable" so a platform without
+/// `VK_EXT_external_memory_host` (or a failed first import) pays the probe once, never per call.
+enum D2hDmaCell {
+    Untouched,
+    Probed(Option<D2hDma>),
+}
+
 /// Vulkan aliases over one existing host allocation. A requested byte range may cross a 2-GiB
 /// import shard, so callers iterate the returned pieces rather than assuming one source buffer.
 pub(crate) struct ImportedHostAllocation {
@@ -1301,6 +1344,22 @@ pub struct VulkanBackend {
     /// crosses this boundary through the environment. The env-only [`VulkanBackend::new`] entry
     /// point remains for this crate's own GPU tests and for external library callers.
     cfg: Arc<Config>,
+    /// Persistent D2H DMA readback channel (see [`D2hDma`]) — probed lazily on the first
+    /// >=`D2H_DMA_MIN_BYTES` download. The `Arc` makes the slab DEVICE-level, shared by
+    /// `fork_embedding_client`'s co-handle: one device owns one slab, and the shared `Mutex`
+    /// also serializes the two handles' copies (a wait_idle race across handles could
+    /// otherwise read the other fork's bytes out of the shared staging).
+    d2h_dma: Arc<Mutex<D2hDmaCell>>,
+    /// `INFR_D2H_DMA=0` opts out of the DMA readback path (mapped readback stays). Read once
+    /// here at construction so no per-call env read exists (S5b).
+    d2h_dma_enabled: bool,
+    /// Diagnostics: live guarded-allocation bytes per label (`check_vram_budget_labeled`),
+    /// dumped on guard refusals so the budget's consumers are named, not inferred. Shared with
+    /// `fork_embedding_client`'s co-handle (one device, one ledger).
+    alloc_ledger: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, u64>>>,
+    /// Diagnostics: the last 40 guarded allocations ≥1 MiB, newest last — the refusal dump's
+    /// tail names the REPEATED allocation pattern (per-cycle leaks show up immediately).
+    alloc_recent: std::sync::Arc<std::sync::Mutex<Vec<(String, u64)>>>,
     shared: Arc<VulkanShared>,
 }
 
@@ -2777,6 +2836,13 @@ impl VulkanBackend {
         // destruction). Disarm so `cleanup`'s Drop is a no-op and never double-frees them.
         cleanup.armed = false;
 
+        // D2H DMA readback is OPT-IN (`INFR_D2H_DMA=1` — measured net-negative on drivers that
+        // expose cached sysmem types, see `D2hDma`'s doc); the opt-in is read exactly once so
+        // the hot decode loop never touches the environment (S5b, same rule as the dispatch
+        // knobs). Grammar follows `budget::flag_from`: empty and "0" are OFF.
+        let d2h_dma_enabled =
+            matches!(std::env::var_os("INFR_D2H_DMA"), Some(v) if !v.is_empty() && v != "0");
+
         let backend = Self {
             moe_pager: Arc::new(Mutex::new(None)),
             session_finalization_deferred: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2786,6 +2852,10 @@ impl VulkanBackend {
             unified_pool: Arc::new(Mutex::new(None)),
             unified_exec: Arc::new(RwLock::new(())),
             unified_client: None,
+            d2h_dma: Arc::new(Mutex::new(D2hDmaCell::Untouched)),
+            d2h_dma_enabled,
+            alloc_ledger: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            alloc_recent: Arc::new(Mutex::new(Vec::new())),
             cfg,
             shared: Arc::new(VulkanShared {
                 _entry: entry,
@@ -3499,7 +3569,39 @@ impl VulkanBackend {
     /// `vram_budget`/`vram_reserve`). An explicit unified limit checks every allocation so a tail
     /// of small buffers cannot collectively cross the caller's hard cap.
     fn check_vram_budget(&self, want: u64) -> Result<()> {
+        self.check_vram_budget_labeled(want, "?")
+    }
+
+    fn check_vram_budget_labeled(&self, want: u64, label: &str) -> Result<()> {
         const CHECK_MIN: u64 = 1 << 20; // 1 MiB
+                                        // Per-label allocation ledger (diagnostics): on a guard refusal the top consumers are
+                                        // dumped, naming exactly what consumed the budget instead of leaving the 3.7 GB between
+                                        // "placement guaranteed room" and "mid-run refusal" unaccounted for.
+        if want >= CHECK_MIN {
+            *self
+                .alloc_ledger
+                .lock()
+                .unwrap()
+                .entry(label.to_owned())
+                .or_insert(0) += want;
+            {
+                let mut recent = self.alloc_recent.lock().unwrap();
+                recent.push((label.to_owned(), want));
+                if recent.len() > 40 {
+                    recent.remove(0);
+                }
+            }
+            // Big-allocation live trace: the placement-vs-consumption gap hunt needs the
+            // SEQUENCE of multi-hundred-MB uploads, not just label aggregates.
+            if want >= (256 << 20) {
+                let total: u64 = self.alloc_ledger.lock().unwrap().values().sum();
+                tracing::warn!(
+                    "[vram-alloc] {label} {} MiB (guarded total {} MiB)",
+                    want / (1024 * 1024),
+                    total / (1024 * 1024)
+                );
+            }
+        }
         let unified_limit = self.cfg.device.vram_budget.is_some()
             || self.cfg.device.vram_reserve.is_some()
             || infr_core::test_resource::active().is_some();
@@ -3530,10 +3632,36 @@ impl VulkanBackend {
             .device
             .vram_budget
             .map(|spec| spec.resolve(v.total).min(v.total));
+        {
+            let ledger = self.alloc_ledger.lock().unwrap();
+            let mut top: Vec<(&String, &u64)> = ledger.iter().collect();
+            top.sort_by(|a, b| b.1.cmp(a.1));
+            let rows: Vec<String> = top
+                .iter()
+                .take(12)
+                .map(|(l, b)| format!("{}: {}", l, fmt_bytes(**b)))
+                .collect();
+            tracing::warn!(
+                requested_label = label,
+                "VRAM guard refusal — backend allocation ledger (top consumers): {}",
+                rows.join(", ")
+            );
+            let recent: Vec<String> = self
+                .alloc_recent
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(l, b)| format!("{}:{}", l, b / (1024 * 1024)))
+                .collect();
+            tracing::warn!(
+                "VRAM guard refusal — last 40 guarded allocations (label:MB, oldest first): {}",
+                recent.join(" | ")
+            );
+        }
         Err(be(format!(
-            "{} budget exceeded: {} requested with {} physical / {} backend bytes already in use; \
-                 {} remains under the unified limit (physical cap {}, configured cap {}). \
-                 Refusing to over-commit: exceeding it doesn't fail \
+            "{} budget exceeded: {} requested for `{label}` with {} physical / {} backend bytes \
+                 already in use; {} remains under the unified limit (physical cap {}, configured cap \
+                 {}). Refusing to over-commit: exceeding it doesn't fail \
                  cleanly — the driver evicts (weights get read back over the bus) or the device is \
                  lost (TDR) mid-inference. Use a smaller context (INFR_CTX), a smaller/more- \
                  quantized model, close other GPU processes, or run on the CPU backend \
@@ -3604,7 +3732,7 @@ impl VulkanBackend {
         // UMA spill keeps it: on a unified part every heap IS the same DDR pool and the guard
         // budgets against all of them.
         if budget_check {
-            self.check_vram_budget(requirements.size)?;
+            self.check_vram_budget_labeled(requirements.size, "bda-weights")?;
         }
 
         let mut flags_info =
@@ -3807,6 +3935,7 @@ impl VulkanBackend {
     pub(crate) fn init_unified_vram_for_expert_slots(
         &self,
         specs: &[(usize, usize)],
+        runtime_margin: usize,
     ) -> Result<Arc<crate::unified::UnifiedVramPool>> {
         const WINDOWS_MAX_SHARD: usize = 3 * 1024 * 1024 * 1024;
         let driver_max = usize::try_from(self.shared.max_mem_alloc_size)
@@ -3838,6 +3967,16 @@ impl VulkanBackend {
         if current != 0 {
             shard_sizes.push(current);
         }
+        // The runtime margin becomes its OWN trailing shard(s): `UnifiedRangePool::allocate_high`
+        // scans shards reversed, so runtime windows land here FIRST and coalesce among themselves
+        // instead of fragmenting the expert-slot space (see `MoePagerLayout::runtime_margin_bytes`
+        // for the failure this closes).
+        let mut margin_left = runtime_margin;
+        while margin_left > 0 {
+            let shard = margin_left.min(platform_max);
+            shard_sizes.push(shard);
+            margin_left -= shard;
+        }
         let expected: usize = shard_sizes.iter().sum();
         let mut cell = self.unified_pool.lock().unwrap();
         if let Some(pool) = cell.as_ref() {
@@ -3858,9 +3997,20 @@ impl VulkanBackend {
     /// The seam uses this as a real allocation probe: mapped ReBAR memory can consume a
     /// driver-dependent amount of heap budget beyond its logical byte size, especially on WDDM.
     /// A successful probe stays installed and is reused byte-for-byte by [`init_moe_pager`].
-    pub fn prepare_moe_unified_vram(&self, specs: &[(usize, usize)]) -> Result<usize> {
-        let pool = self.init_unified_vram_for_expert_slots(specs)?;
-        Ok(pool.stats().capacity_bytes)
+    pub fn prepare_moe_unified_vram(
+        &self,
+        specs: &[(usize, usize)],
+        runtime_margin: usize,
+    ) -> Result<usize> {
+        let pool = self.init_unified_vram_for_expert_slots(specs, runtime_margin)?;
+        let bytes = pool.stats().capacity_bytes;
+        *self
+            .alloc_ledger
+            .lock()
+            .unwrap()
+            .entry("moe-arena".to_owned())
+            .or_insert(0) += bytes as u64;
+        Ok(bytes)
     }
 
     /// Drop a prepared MoE arena after a placement probe found that it leaves too little live
@@ -3881,6 +4031,9 @@ impl VulkanBackend {
         let pool = cell.take().expect("checked above");
         drop(cell);
         drop(pool);
+        if let Some(v) = self.alloc_ledger.lock().unwrap().get_mut("moe-arena") {
+            *v = v.saturating_sub(bytes as u64);
+        }
         Ok(bytes)
     }
 
@@ -3905,6 +4058,10 @@ impl VulkanBackend {
             unified_pool: Arc::clone(&self.unified_pool),
             unified_exec: Arc::clone(&self.unified_exec),
             unified_client: Some(UnifiedClient::Embedding),
+            d2h_dma: Arc::clone(&self.d2h_dma),
+            d2h_dma_enabled: self.d2h_dma_enabled,
+            alloc_ledger: Arc::clone(&self.alloc_ledger),
+            alloc_recent: Arc::clone(&self.alloc_recent),
             cfg: Arc::clone(&self.cfg),
             shared: Arc::clone(&self.shared),
         })
@@ -4282,7 +4439,7 @@ impl VulkanBackend {
         // budget can't cover (host-visible staging/readback/host-weights are exempt — the guard
         // protects VRAM only).
         if location == MemoryLocation::GpuOnly {
-            if let Err(e) = self.check_vram_budget(requirements.size) {
+            if let Err(e) = self.check_vram_budget_labeled(requirements.size, label) {
                 unsafe { self.shared.device.destroy_buffer(buffer, None) };
                 return Err(e);
             }
@@ -4804,6 +4961,116 @@ impl VulkanBackend {
 
         Ok(())
     }
+
+    /// The D2H DMA slab, probing the platform ONCE on first use. `None` afterwards means the
+    /// channel is unavailable (opted out, extension missing, import failed) and the mapped
+    /// readback paths stay — silently; a missing fast path must never turn into an error.
+    fn probe_d2h_slab(&self) -> Option<D2hDma> {
+        if !self.d2h_dma_enabled {
+            return None;
+        }
+        let Some(ext) = self.shared.external_memory_host.as_ref() else {
+            return None;
+        };
+        let align = self.shared.host_import_alignment.max(1);
+        if align > AlignedHostBuffer::ALIGNMENT {
+            tracing::warn!(
+                "[infr] D2H DMA readback disabled: Vulkan import alignment {align} exceeds host slab alignment {}",
+                AlignedHostBuffer::ALIGNMENT,
+            );
+            return None;
+        }
+        // One shard only (the slab is well under the 2-GiB shard cap the pager fights), sized
+        // down to both the import alignment and `max_mem_alloc_size`.
+        let bytes = D2H_DMA_SLAB_BYTES.min(self.shared.max_mem_alloc_size as usize) / align * align;
+        if bytes < D2H_DMA_MIN_BYTES {
+            tracing::warn!(
+                "[infr] D2H DMA readback disabled: usable slab is under {D2H_DMA_MIN_BYTES} bytes"
+            );
+            return None;
+        }
+        let Ok(owner) = AlignedHostBuffer::new(bytes) else {
+            tracing::warn!("[infr] D2H DMA readback disabled: host slab allocation failed");
+            return None;
+        };
+        match self.try_import_host_shard(ext, Arc::clone(&owner), 0, bytes) {
+            Ok(shard) => Some(D2hDma {
+                _owner: owner,
+                buffer: shard.buffer,
+                bytes: shard.len,
+            }),
+            Err(e) => {
+                tracing::warn!("[infr] D2H DMA readback disabled: {e}");
+                None
+            }
+        }
+    }
+
+    /// Copy `src` (device-local OR mapped) into `dst` through the persistent host-DMA slab:
+    /// a `cmd_copy_buffer` from `src` into the imported host allocation, then a plain memcpy
+    /// out of the slab's CACHED pages. Returns `None` when the channel is unavailable (caller
+    /// falls back to the mapped readback paths inside `download`).
+    ///
+    /// This sidesteps the Windows/WDDM uncached-mapped-read pathology entirely (see
+    /// [`D2hDma`]): the CPU never dereferences a write-combined mapping; it reads ordinary
+    /// cached RAM the copy engine just wrote at full PCIe bandwidth. The copy's completion is
+    /// guaranteed by `one_shot`'s `queue_wait_idle`, and the imported memory type is
+    /// HOST_COHERENT (enforced in `try_import_host_shard`), so no invalidate is needed — the
+    /// same contract the direct mapped reads already rely on.
+    ///
+    /// The `d2h_dma` mutex is held for the WHOLE operation (probe + all chunks): the slab is a
+    /// singleton, and a concurrent download whose `queue_wait_idle` raced ours could otherwise
+    /// read the other copy's bytes out of the shared staging.
+    fn download_dma(&self, src: &VkBuffer, dst: &mut [u8]) -> Option<Result<()>> {
+        let mut cell = self.d2h_dma.lock().unwrap();
+        let slab = match &*cell {
+            D2hDmaCell::Probed(slab) => slab.clone(),
+            D2hDmaCell::Untouched => {
+                let probed = self.probe_d2h_slab();
+                *cell = D2hDmaCell::Probed(probed.clone());
+                probed
+            }
+        };
+        let slab = slab?;
+        let host_base = slab._owner.as_ptr();
+        let slab_buf = match as_vk_buf(slab.buffer.as_ref()) {
+            // A slab whose own buffer can't be downcast is a build-time invariant break; fall
+            // back to the mapped paths rather than erroring a working readback.
+            Ok(b) => b.buffer,
+            Err(_) => return None,
+        };
+        let slab_cap = slab.bytes;
+        let src_buf = src.buffer;
+        let src_off = src.sub_offset as u64;
+
+        let mut done = 0usize;
+        while done < dst.len() {
+            let n = (dst.len() - done).min(slab_cap);
+            let size = n as u64;
+            let soff = src_off + done as u64;
+            let shared = Arc::clone(&self.shared);
+            let result = self.one_shot(move |cmd| {
+                let region = vk::BufferCopy {
+                    src_offset: soff,
+                    dst_offset: 0,
+                    size,
+                };
+                unsafe {
+                    shared
+                        .device
+                        .cmd_copy_buffer(cmd, src_buf, slab_buf, &[region])
+                };
+            });
+            if let Err(e) = result {
+                return Some(Err(e));
+            }
+            // GPU→slab transfer is complete (queue_wait_idle returned); the slab is ordinary
+            // cached process RAM, so this is a memcpy — NOT an uncached mapped read.
+            unsafe { std::ptr::copy_nonoverlapping(host_base, dst[done..].as_mut_ptr(), n) };
+            done += n;
+        }
+        Some(Ok(()))
+    }
 }
 
 // ── Backend impl ──────────────────────────────────────────────────────────────
@@ -4993,6 +5260,16 @@ impl Backend for VulkanBackend {
         // The staging path's failure is tamer but still wrong: a `vkCmdCopyBuffer` whose `size`
         // overruns the source.
         check_extent("download", "out of", dst.len(), vk_src.size)?;
+
+        // Opt-in escape hatch (`INFR_D2H_DMA=1`): large readbacks route through the host-DMA
+        // slab (copy engine writes into cached ordinary RAM; see `download_dma`/`D2hDma`) —
+        // for platforms where the direct mapped reads below land in uncached BAR. Default OFF:
+        // on cached-sysmem drivers the mapped paths are faster at every logits-class size.
+        if dst.len() >= D2H_DMA_MIN_BYTES {
+            if let Some(result) = self.download_dma(vk_src, dst) {
+                return result;
+            }
+        }
 
         if let Some(ptr) = vk_src.mapped_ptr() {
             // Host-visible (Readback or Staging): direct read from the persistently-mapped pointer.
@@ -6149,6 +6426,7 @@ mod tests {
             }],
             prefill_target_lanes: 1,
             prefill_cache_bytes: (SLOT * SLOTS) as u64,
+            runtime_margin_bytes: 0,
         })
         .expect("init pager");
         let pool = be.unified_vram().expect("unified pool");
@@ -6311,6 +6589,7 @@ mod tests {
             }],
             prefill_target_lanes: 2,
             prefill_cache_bytes: 8192,
+            runtime_margin_bytes: 0,
         })
         .expect("init_moe_pager");
         let weak = Arc::downgrade(&be.shared);

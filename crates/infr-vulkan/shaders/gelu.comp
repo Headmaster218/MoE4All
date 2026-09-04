@@ -1,0 +1,15 @@
+#version 460
+// Standalone elementwise GELU (exact-tanh), llama.cpp FFN_GELU.
+// dst[i] = 0.5*x*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC { uint n; } pc;
+layout(binding = 0) readonly buffer XB { float x[]; };
+layout(binding = 1) writeonly buffer YB { float y[]; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) { return; }
+    float v = x[i];
+    float c = 0.7978845608028654; // sqrt(2/pi)
+    float inner = c * (v + 0.044715 * v * v * v);
+    y[i] = 0.5 * v * (1.0 + tanh(inner));
+}

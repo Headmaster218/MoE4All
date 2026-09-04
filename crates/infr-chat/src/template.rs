@@ -232,12 +232,56 @@ pub fn render_chat_oai(
     )
 }
 
+/// The per-image vision marker the Qwen3-VL chat template emits for an `image_url` content part.
+/// infr flattens message content to a plain string BEFORE the template sees it (stage V5 keeps
+/// the payloads on [`ChatMessage::images`]), so the marker is substituted into the flattened text
+/// here — once per image, at each [`IMAGE_PART_PLACEHOLDER`] (i.e. at the part's original
+/// position; surplus images append after the text) — and the tokenizer encodes it ATOMICALLY
+/// (type-3 specials, same as template-emitted `<|im_start|>`), which is what the chat layer's
+/// expansion pass expands into the pad run.
+pub const VISION_MARKER: &str = "<|vision_start|><|image_pad|><|vision_end|>";
+
+/// Placeholder inserted into a message's flattened text AT each `image_url` content part's
+/// original position (infr-server's `flatten_content`), so multi-image prompts keep their
+/// interleaving ("text A → image 1 → text B → image 2" must not collapse into
+/// "text A + text B → images 1, 2"). `message_to_json` swaps every occurrence for
+/// [`VISION_MARKER`] before the template renders; U+FFFC (OBJECT REPLACEMENT CHARACTER) is the
+/// Unicode-standard object placeholder and cannot survive into a rendered prompt by accident —
+/// any occurrence in client text would have been replaced the same way (a client sending it
+/// without matching image payloads gets an image-count mismatch error at the expansion pass,
+/// which is the honest failure).
+pub const IMAGE_PART_PLACEHOLDER: char = '\u{FFFC}';
+
 /// Build the template's per-message dict, preserving the tool round-trip fields the HF chat templates
 /// read (`tool_calls`, `tool_call_id`, `name`).
 fn message_to_json(m: &ChatMessage) -> Value {
     let mut obj = serde_json::Map::new();
     obj.insert("role".into(), m.role.clone().into());
-    obj.insert("content".into(), m.content.clone().into());
+    // Vision (stage V5, ordering fix per PR #21 review): the flattened text carries an
+    // [`IMAGE_PART_PLACEHOLDER`] at each image part's ORIGINAL position (infr-server's
+    // `flatten_content` inserts them), so markers render where the client put them — not
+    // appended after all text. Each placeholder becomes one [`VISION_MARKER`]; a message whose
+    // images outnumber its placeholders (payloads attached to string content, which cannot carry
+    // inline positions) appends the surplus markers AFTER the text, the pre-fix behaviour, so
+    // that legacy shape still renders one marker per image.
+    let mut content = m.content.clone();
+    if !m.images.is_empty() {
+        let segs: Vec<&str> = content.split(IMAGE_PART_PLACEHOLDER).collect();
+        let inline = segs.len() - 1;
+        let mut rendered =
+            String::with_capacity(content.len() + m.images.len() * VISION_MARKER.len());
+        for (i, seg) in segs.iter().enumerate() {
+            rendered.push_str(seg);
+            if i < inline {
+                rendered.push_str(VISION_MARKER);
+            }
+        }
+        if m.images.len() > inline {
+            rendered.push_str(&VISION_MARKER.repeat(m.images.len() - inline));
+        }
+        content = rendered;
+    }
+    obj.insert("content".into(), content.into());
     if let Some(calls) = &m.tool_calls {
         let arr: Vec<Value> = calls
             .iter()
@@ -437,6 +481,37 @@ mod template_tests {
             .expect("1000 iterations is legitimate work, not a runaway");
         assert!(out.starts_with("0,1,2,"), "{out}");
         assert!(out.ends_with(",999,"), "{out}");
+    }
+
+    /// PR #21 review fix: the template substitutes one [`VISION_MARKER`] per
+    /// [`IMAGE_PART_PLACEHOLDER`] AT the placeholder's position, so a client's
+    /// "text A → image 1 → text B → image 2" interleaving renders as
+    /// "A <marker> B <marker>" — never "A B <marker><marker>". Surplus images (payloads on
+    /// string content, which cannot carry inline positions) still append after the text.
+    #[test]
+    fn vision_markers_render_at_their_original_part_positions() {
+        let m = ChatMessage {
+            role: "user".into(),
+            content: format!("A{IMAGE_PART_PLACEHOLDER}B{IMAGE_PART_PLACEHOLDER}"),
+            images: vec!["data:one".into(), "data:two".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            message_to_json(&m)["content"],
+            serde_json::Value::String(format!("A{VISION_MARKER}B{VISION_MARKER}"))
+        );
+
+        // String-content legacy shape: no placeholders, both markers appended after the text.
+        let m = ChatMessage {
+            role: "user".into(),
+            content: "look".into(),
+            images: vec!["data:one".into(), "data:two".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            message_to_json(&m)["content"],
+            serde_json::Value::String(format!("look{VISION_MARKER}{VISION_MARKER}"))
+        );
     }
 
     #[test]

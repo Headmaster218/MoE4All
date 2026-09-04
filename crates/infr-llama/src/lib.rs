@@ -13,6 +13,9 @@ pub mod chat;
 mod config;
 pub mod seam;
 pub use seam::model::{BenchPlacement, SeamModel};
+/// The vision mrope plan (`seam::MropePlan`/`seam::ImageSpanEmbeds`) — what a caller hands a
+/// vision turn's generation (stage V4b).
+pub use seam::{ImageSpanEmbeds, MropePlan};
 pub mod diffusion;
 mod util;
 pub(crate) use util::*;

@@ -339,6 +339,54 @@ pub enum Op {
         /// asserts.
         backward: bool,
     },
+    /// Vision 2D RoPE on Q and K — ggml's `GGML_ROPE_TYPE_VISION` via `ggml_rope_multi`, the
+    /// rope llama.cpp's `tools/mtmd/models/qwen3vl.cpp` applies inside the qwen3vl ViT:
+    /// `ggml_rope_multi(ctx, cur, positions, nullptr, d_head/2, {d/4,d/4,d/4,d/4},
+    /// GGML_ROPE_TYPE_VISION, ..., 10000, ...)`.
+    ///
+    /// Semantics, read off `ggml_compute_forward_rope_flt`'s VISION arm plus
+    /// `ggml_mrope_cache_init` with `indep_sects = true` (VISION passes true), `freq_scale = 1`,
+    /// `ext_factor = 0` (no YaRN), `mscale = 1`:
+    ///
+    /// * **All `head_dim` dims rotate** (`n_dims == head_dim/2` pairs, `n_offs == 0` — no
+    ///   pass-through tail), with NEOX-style split-half pairing: pair `p` is elements
+    ///   `(p, p + head_dim/2)`.
+    /// * `pos_hw` is an I32 tensor `[rows, 2]` holding the patch's 2D grid coordinate `(y, x)`
+    ///   in the SAME (merge-major) order as the rows of `q`/`k`. ggml's positions input carries
+    ///   4 slots per token (`t, h, w, e`); the vision encoder fills them `(y, x, y, x)` (see
+    ///   `clip.cpp`'s `PROJECTOR_TYPE_QWEN3VL` positions loop), so this op maps section streams
+    ///   0,2 → y and 1,3 → x rather than carry the duplicated slots.
+    /// * The `head_dim/2` pairs are split into 4 consecutive sections; pair `p`'s sector is
+    ///   `p % sum(sections)` and sections 0..3 use position streams `[y, x, y, x]`. llama.cpp
+    ///   passes `mrope_sections = {d_head/4}×4` and ggml compares those entries against the PAIR
+    ///   index (`sector = (i0/2) % sect_dims`), so each entry functions as a count of PAIRS
+    ///   numerically equal to `head_dim/4` — this op's `sections` is exactly llama.cpp's array,
+    ///   `{head_dim/4, head_dim/4, head_dim/4, head_dim/4}`.
+    /// * **Theta resets at each section start** (`indep_sects`): within a section, the pair with
+    ///   0-based local index `l` rotates by `pos * theta^(-2*l / n_pairs)` where `n_pairs =
+    ///   head_dim/2` (`theta_scale = pow(theta, -2/n_dims)` in ggml with `n_dims = head_dim/2`).
+    ///   So for qwen3vl (`head_dim = 72`, `theta = 10000`): pairs 0..18 take `y *
+    ///   10000^(-l/18)` and pairs 18..36 take `x * 10000^(-l/18)` — sections 2/3 are unreachable
+    ///   because the sector never leaves `[0, n_pairs)` and `sum(sections) == head_dim >
+    ///   n_pairs`.
+    ///
+    /// `dst_q`/`dst_k` may alias `q`/`k` (in place). `q`/`k`/`dst_*` are `[rows, n_head *
+    /// head_dim]` f32; `rows` is derived from the tensor desc.
+    Rope2D {
+        q: TensorId,
+        k: TensorId,
+        pos_hw: TensorId,
+        dst_q: TensorId,
+        dst_k: TensorId,
+        n_head: u32,
+        head_dim: u32,
+        theta: f32,
+        /// Section widths in PAIRS — llama.cpp's `mrope_sections` verbatim (its entries are
+        /// numerically `head_dim/4` and ggml compares them against pair indices). Their sum must
+        /// be `>= head_dim/2` so every pair's sector names a section (ggml's VISION call sites
+        /// pass `{d/4}×4`, sum `== head_dim == 2*n_pairs`).
+        sections: [u32; 4],
+    },
     /// Fused per-head RMSNorm + NEOX RoPE — `QkNorm` immediately followed by `Rope` on the same
     /// tensor (the common qwen3/gemma q/k case). One pass: each head is rmsnormed (`× weight`) then
     /// its first `rope_dim` rotated, dims beyond `rope_dim` passing through normed. Maps 1:1 to the
@@ -357,6 +405,44 @@ pub enum Op {
         eps: f32,
         freq_factors: Option<TensorId>,
         /// Per-row stride in `x`. 0 = packed (stride = n_head * head_dim).
+        x_stride: u32,
+    },
+    /// Fused per-head RMSNorm + **IMROPE** (interleaved multi-plane RoPE) — the qwen3vl /
+    /// qwen35moe text-model rope (llama.cpp `LLAMA_ROPE_TYPE_IMROPE`). Identical to
+    /// [`Op::QkNormRope`] except the per-pair position comes from a 4-plane tensor and the
+    /// plane is selected per pair by the interleaved mrope rule.
+    ///
+    /// * `positions4` is an I32 tensor `[rows, 4]` holding per-token planes `(T, H, W, E)`.
+    ///   For a text-only token all of T/H/W equal the linear position (the op then collapses
+    ///   exactly to [`Op::QkNormRope`] — which is why text-only inference needs no special
+    ///   path). Image spans set `T` constant, `H = base + row/nx`, `W = base + row%nx`.
+    /// * Pair `p` (split-half over the first `rope_dim` dims: elements `(p, p + rope_dim/2)`)
+    ///   selects its plane with ggml's IMROPE rule (`ops.cpp` `ggml_mrope_cache_init`,
+    ///   `is_imrope` branch): with `sector = p % sum(sections)`,
+    ///   `sector%3==1 && sector < 3*sections[1]` → H, `sector%3==2 && sector <
+    ///   3*sections[2]` → W, `sector%3==0 && sector < 3*sections[0]` → T, else E. With
+    ///   Ornith's `[11,11,10,0]` over 32 pairs this yields T={0,3,..30}, H={1,4,..31},
+    ///   W={2,5,..29}.
+    /// * Per-pair angle: `pos_plane * theta^(-2p/rope_dim)` — the four ggml thetas
+    ///   accumulate one `theta_scale` per pair without per-section reset (text mrope has
+    ///   `indep_sects == false`), so each plane's angle is exactly its position times the
+    ///   standard ramp.
+    QkNormMrope {
+        x: TensorId,
+        weight: TensorId,
+        positions4: TensorId,
+        dst: TensorId,
+        rows: u32,
+        n_head: u32,
+        head_dim: u32,
+        rope_dim: u32,
+        theta: f32,
+        eps: f32,
+        /// IMROPE section widths in DIMS, from the GGUF's `rope.dimension_sections`
+        /// (Ornith: `[11, 11, 10, 0]`).
+        sections: [u32; 4],
+        /// Per-row stride in `x` for the interleaved q+gate buffer (qwen35 attn_out_gate),
+        /// head h's query at `r*x_stride + h*2*head_dim`. 0 = packed.
         x_stride: u32,
     },
     /// Append `src` (`rows × row_stride`) into the persistent KV `cache` starting at row `pos`,
@@ -926,6 +1012,18 @@ pub enum Op {
         n: u32,
         scale: f32,
     },
+    /// Elementwise plain (ungated) GELU, exact-tanh approximation — llama.cpp's `ggml_gelu` /
+    /// `FFN_GELU`: `dst[i] = 0.5*x*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))` over `rows * cols`
+    /// elements. The qwen3vl_merger ViT uses it for the block FFN and the mm.0/mm.2 merger MLP
+    /// (`clip.use_gelu`, as opposed to the older CLIP QuickGELU). This is the same formula
+    /// [`Activation::Gelu`] applies to the gate inside [`Op::GatedAct`], lifted to a standalone
+    /// op because the vision FFN is not gated (`ffn_up` → GELU → `ffn_down`, no gate half).
+    Gelu {
+        x: TensorId,
+        dst: TensorId,
+        rows: u32,
+        cols: u32,
+    },
     /// Qwen3.8 stream collapse after its low-rank gate projection. `x` and `gate` are
     /// `[rows, hc, n_embd]`; gate contains raw logits. The output is
     /// `mean_h(x[r,h,d] * sigmoid(gate[r,h,d]))`.
@@ -1307,7 +1405,9 @@ impl Op {
             Op::QkNorm { .. } => "QkNorm",
             Op::GatedRmsNorm { .. } => "GatedRmsNorm",
             Op::Rope { .. } => "Rope",
+            Op::Rope2D { .. } => "Rope2D",
             Op::QkNormRope { .. } => "QkNormRope",
+            Op::QkNormMrope { .. } => "QkNormMrope",
             Op::WriteKv { .. } => "WriteKv",
             Op::Dsv4Compress { .. } => "Dsv4Compress",
             Op::Dsv4CacheWrite { .. } => "Dsv4CacheWrite",
@@ -1329,6 +1429,7 @@ impl Op {
             Op::AddBias { .. } => "AddBias",
             Op::Scale { .. } => "Scale",
             Op::Silu { .. } => "Silu",
+            Op::Gelu { .. } => "Gelu",
             Op::QwenHcMix { .. } => "QwenHcMix",
             Op::QwenHcInject { .. } => "QwenHcInject",
             Op::QwenPleGate { .. } => "QwenPleGate",
@@ -1400,6 +1501,14 @@ impl Op {
                 r.extend(freq_factors);
                 (r, vec![dst])
             }
+            Op::Rope2D {
+                q,
+                k,
+                pos_hw,
+                dst_q,
+                dst_k,
+                ..
+            } => (vec![q, k, pos_hw], vec![dst_q, dst_k]),
             Op::QkNormRope {
                 x,
                 weight,
@@ -1412,6 +1521,13 @@ impl Op {
                 r.extend(freq_factors);
                 (r, vec![dst])
             }
+            Op::QkNormMrope {
+                x,
+                weight,
+                positions4,
+                dst,
+                ..
+            } => (vec![x, weight, positions4], vec![dst]),
             Op::WriteKv { src, cache, .. } => (vec![src, cache], vec![cache]),
             Op::Dsv4Compress {
                 values,
@@ -1538,6 +1654,7 @@ impl Op {
             Op::AddBias { x, bias, dst, .. } => (vec![x, bias], vec![dst]),
             Op::Scale { x, dst, .. } => (vec![x], vec![dst]),
             Op::Silu { x, dst, .. } => (vec![x], vec![dst]),
+            Op::Gelu { x, dst, .. } => (vec![x], vec![dst]),
             Op::QwenHcMix { x, gate, dst, .. } => (vec![x, gate], vec![dst]),
             Op::QwenHcInject {
                 residual,

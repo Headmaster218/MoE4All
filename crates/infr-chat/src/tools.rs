@@ -51,7 +51,9 @@ pub fn split_channels(full: &str) -> (String, String) {
 // ---------------------------------------------------------------------------
 
 /// One parsed tool invocation from the model's `<|tool_call>…<tool_call|>` block.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// `Deserialize` because [`crate::ChatMessage`] (the `tool_calls` round-trip field) deserializes.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 pub struct ToolCall {
     pub name: String,
     pub arguments: Value,

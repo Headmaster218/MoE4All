@@ -440,12 +440,13 @@ pub(crate) struct SeamKv {
     /// the whole `[cc, vocab]` logits buffer. Lazily allocated alongside `sc_ping`.
     pub(super) sc_temp_inv_buf: Option<Box<dyn Buffer>>,
     /// MTP spec-decode rollback checkpoint (`mtp_snapshot_delta`/`mtp_restore_delta`): a device-
-    /// resident copy of every qwen35 DeltaNet layer's recurrent state at the last CLEAN committed
-    /// boundary, plus the cached-token length there. Lets a partial-accept cycle roll the trunk's
-    /// draft-polluted state back to a committed prefix and re-prefill only the short accepted suffix,
-    /// instead of qwen35's default full re-prefill-from-zero (its append-only DeltaNet state can't
-    /// rewind by cache truncation the way a per-position KV cache can — see the `c.qwen35` branch in
-    /// `generate_dense_backend`'s `start` computation). `None` for every non-MTP caller.
+    /// resident copy of every qwen35/qwen35moe DeltaNet layer's recurrent state at the last CLEAN
+    /// committed boundary, plus the cached-token length there. Lets a partial-accept cycle roll
+    /// the trunk's draft-polluted state back to a committed prefix and re-prefill only the short
+    /// accepted suffix, instead of qwen35's default full re-prefill-from-zero (its append-only
+    /// DeltaNet state can't rewind by cache truncation the way a per-position KV cache can — see
+    /// the `c.qwen35` branch in `generate_dense_backend`'s `start` computation, which `Config`
+    /// widens over qwen35moe too). `None` for every non-MTP caller.
     pub(super) mtp_delta_ckpt: Option<MtpDeltaCkpt>,
     /// Rolling conversation checkpoint for append-only recurrent mixers. Unlike the MTP rollback
     /// checkpoint above, this snapshot is taken at the stable rendered-history boundary BEFORE
@@ -573,8 +574,9 @@ pub(super) fn alloc_segmented_plane(
 }
 
 /// The device-resident DeltaNet-state snapshot backing [`SeamKv::mtp_snapshot_delta`] — one
-/// conv-state + one S-state buffer per qwen35 DeltaNet layer (parallel to `layers`), plus the
-/// cached-token length the snapshot corresponds to. Allocated once (lazily) and reused every cycle.
+/// conv-state + one S-state buffer per qwen35/qwen35moe DeltaNet layer (parallel to `layers`),
+/// plus the cached-token length the snapshot corresponds to. Allocated once (lazily) and reused
+/// every cycle.
 pub(super) struct MtpDeltaCkpt {
     kbufs: Vec<Box<dyn Buffer>>,
     vbufs: Vec<Box<dyn Buffer>>,
@@ -908,14 +910,22 @@ impl SeamKv {
     }
 
     /// Fork a fresh conversation slot: same (Arc-shared) weights, its own zero KV + IO buffers.
-    /// Snapshot the qwen35 DeltaNet recurrent state (every DeltaNet layer's conv + S buffers) plus
-    /// the current `cached` length into the device-resident [`MtpDeltaCkpt`] (allocated once on the
-    /// first call). The MTP spec-decode loop calls this at a CLEAN committed boundary (after the
-    /// prime prefill and after every fully-accepted cycle) so a later partial-accept cycle can roll
-    /// back to it via [`mtp_restore_delta`]. A no-op on a non-qwen35 model (no DeltaNet layers). The
-    /// snapshot is a pure device→device buffer copy (`Backend::copy_buffer`), never a host bounce.
+    /// Snapshot the qwen35/qwen35moe DeltaNet recurrent state (every DeltaNet layer's conv + S
+    /// buffers) plus the current `cached` length into the device-resident [`MtpDeltaCkpt`]
+    /// (allocated once on the first call). The MTP spec-decode loop calls this at a CLEAN committed
+    /// boundary (after the prime prefill and after every fully-accepted cycle) so a later
+    /// partial-accept cycle can roll back to it via [`mtp_restore_delta`]. A no-op on a non-qwen35
+    /// model (no DeltaNet layers). The snapshot is a pure device→device buffer copy
+    /// (`Backend::copy_buffer`), never a host bounce.
     pub(crate) fn mtp_snapshot_delta(&mut self, be: &dyn Backend, cfg: &Config) -> AResult<()> {
         if self.mtp_delta_ckpt.is_none() {
+            // Layer filter: `cfg.qwen35` is widened over BOTH `qwen35` and `qwen35moe`
+            // (config.rs — the two arches share the DeltaNet/full-attention hybrid skeleton and
+            // `full_attn_interval` is parsed under the widened flag), so
+            // `!is_qwen35_attn_layer(l)` selects exactly the recurrent DeltaNet layers for
+            // qwen35moe too — every layer whose conv/S state `generate_dense_backend` binds into
+            // `kbufs`/`vbufs` (`Config::is_recurrent_layer` agrees for these arches, and is NOT
+            // used here because it would also admit qwen4exp/bailingmoe3 layers).
             let layers: Vec<usize> = (0..cfg.n_layer)
                 .filter(|&l| cfg.qwen35 && !cfg.is_qwen35_attn_layer(l))
                 .collect();
@@ -967,7 +977,9 @@ impl SeamKv {
     /// Restore the DeltaNet state captured by the last [`mtp_snapshot_delta`] and truncate `cached`
     /// back to the snapshot's token length — the MTP loop's rollback after a partial-accept cycle
     /// (drops the rejected drafts the verify forward absorbed into the recurrent state). A no-op
-    /// when no snapshot has been taken yet.
+    /// when no snapshot has been taken yet. `cached.truncate` runs unconditionally (not per-layer):
+    /// a snapshot with an EMPTY layer set (a hypothetical `full_attn_interval == 1` model) still
+    /// pins a committed token length the caller must roll back to.
     pub(crate) fn mtp_restore_delta(&mut self, be: &dyn Backend) -> AResult<()> {
         let Some(ck) = self.mtp_delta_ckpt.as_ref() else {
             return Ok(());
@@ -1261,5 +1273,41 @@ mod tests {
         assert_eq!(checkpoint_extension_start(&[], &[10]), None);
         assert_eq!(checkpoint_extension_start(&[10, 20], &[10, 20]), None);
         assert_eq!(checkpoint_extension_start(&[10, 20], &[10, 99, 30]), None);
+    }
+
+    /// qwen35moe (MTP stage 2): `mtp_snapshot_delta`'s layer filter
+    /// (`cfg.qwen35 && !is_qwen35_attn_layer(l)`) must select EXACTLY the recurrent DeltaNet
+    /// layers for the MoE sibling too — `Config` widens `qwen35` over both arches and parses
+    /// `full_attention_interval` under the widened flag, so the predicate is already correct;
+    /// this pins that against a regression to an arch-string-only check.
+    #[test]
+    fn mtp_delta_filter_covers_qwen35moe_recurrent_layers() {
+        let cfg = crate::Config {
+            qwen35: true, // widened over qwen35moe by Config::from_gguf
+            moe: Some(crate::MoeConfig {
+                n_expert: 8,
+                n_used: 2,
+                n_ff_exp: 64,
+                scale: 1.0,
+                gating: infr_core::graph::MoeGating::Softmax,
+                norm_w: true,
+                weight_before: false,
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
+            }),
+            n_layer: 40,
+            full_attn_interval: 4,
+            ..Default::default()
+        };
+        let filtered: Vec<usize> = (0..cfg.n_layer)
+            .filter(|&l| cfg.qwen35 && !cfg.is_qwen35_attn_layer(l))
+            .collect();
+        let recurrent: Vec<usize> = (0..cfg.n_layer)
+            .filter(|&l| cfg.is_recurrent_layer(l))
+            .collect();
+        assert_eq!(filtered, recurrent);
+        // 40 layers, `(l+1) % 4 == 0` full attention → 10 attn + 30 DeltaNet.
+        assert_eq!(filtered.len(), 30);
+        assert!(filtered.iter().all(|&l| (l + 1) % 4 != 0));
     }
 }

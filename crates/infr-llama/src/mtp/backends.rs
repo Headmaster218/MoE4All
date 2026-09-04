@@ -15,14 +15,18 @@ use super::{
 /// backend). **Greedy only** (temp 0) — the commit/accept invariant below only holds at temp 0;
 /// sampling-temperature support is a follow-up phase.
 ///
-/// No cross-turn KV reuse: every call builds a FRESH trunk session + [`MtpHeadSession`] and
-/// re-prefills the WHOLE (rendered, multi-turn-inclusive) prompt from scratch. `DenseSeamChat`'s
-/// non-MTP path keeps a persistent per-conversation `DenseVulkanSession`; MTP's
+/// No cross-turn KV reuse: every call resets the trunk's materialized tokens and re-prefills the
+/// WHOLE (rendered, multi-turn-inclusive) prompt from scratch, and builds a FRESH
+/// [`MtpHeadSession`]. `DenseSeamChat`'s non-MTP path keeps a persistent per-conversation
+/// `DenseVulkanSession`; MTP's
 /// win is DECODE throughput (the thing `docs/mtp.md`'s 2.0x oracle number measures), not prefill
 /// reuse, so trading a little prefill cost for a MUCH simpler (and correct) session lifetime is
 /// the pragmatic call this phase makes — a real persistent MTP session hits a self-referential-
 /// struct problem ([`MtpHeadSession`] borrows the backend + embedding table it's built from) that
 /// isn't worth solving until multi-turn MTP throughput is actually the bottleneck being chased.
+/// What DOES persist across calls on the state-holding entry
+/// ([`generate_mtp_spec_vulkan_timed_on_state`]) is the trunk's BOUND WEIGHTS + pager registration
+/// (the caller-held `SeamKv`) — only the KV rows are fresh.
 ///
 /// ## Round structure (ported from `speculative.cpp`'s `common_speculative_impl_draft_mtp` driver
 /// loop around the target decode, adapted to infr's own VERIFY primitive)
@@ -115,10 +119,12 @@ pub fn generate_mtp_spec_vulkan_timed(
 
 /// [`generate_mtp_spec_vulkan_timed`] over a CALLER-supplied Vulkan backend, so a persistent
 /// caller can share ONE device (+ allocator + pipeline cache) across every MTP `generate()` call
-/// instead of constructing a fresh one per call. Each call still rebuilds a fresh trunk+head
-/// SESSION (KV cache state) by design — see this module's doc on "no cross-turn KV reuse" — that
-/// is an ordinary-sized allocation, not a VkDevice re-init, so sharing the backend loses nothing
-/// while dropping the redundant device construction.
+/// instead of constructing a fresh one per call. Each call still starts from fresh trunk+head KV
+/// by design — see this module's doc on "no cross-turn KV reuse". This is the COLD convenience
+/// wrapper: it holds no caller state, so the trunk weights are (re)bound through the paged-MoE
+/// placement binder on every call. A caller that CAN hold state (a chat session) should use
+/// [`generate_mtp_spec_vulkan_timed_on_state`] instead so the trunk's bound weights — and the
+/// pager they register with — persist across turns.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn generate_mtp_spec_vulkan_timed_on(
     vk: &infr_vulkan::VulkanBackend,
@@ -128,18 +134,78 @@ pub fn generate_mtp_spec_vulkan_timed_on(
     max_new: usize,
     on_piece: impl FnMut(&str),
 ) -> Result<(crate::GenStats, MtpTiming)> {
-    let cfg = model.config();
     let max_ctx = model.encode(prompt)?.len() + max_new + DEFAULT_N_MAX + 8;
-    let bind: &BindWeightFn = &|_name, tb, dt, _n| {
-        let bytes = tb.materialize();
-        let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
-        let buf = vk
-            .alloc(padded.len(), BufferUsage::Weights)
-            .map_err(|e| anyhow!("{e}"))?;
-        vk.upload(buf.as_ref(), &padded)
-            .map_err(|e| anyhow!("{e}"))?;
-        Ok((buf, dt))
+    let mut trunk_state = None;
+    generate_mtp_spec_vulkan_timed_on_state(
+        vk,
+        &mut trunk_state,
+        model,
+        head,
+        max_ctx,
+        prompt,
+        max_new,
+        on_piece,
+    )
+}
+
+/// [`generate_mtp_spec_vulkan_timed_on`] with a CALLER-HELD trunk [`crate::seam::SeamKv`]: the
+/// session-infrastructure twin of `seam::generate_dense_vulkan_session`'s cold/warm split for the
+/// MTP trunk verify. `max_ctx` is the OWNING session's KV capacity (the trunk's KV is sized to it
+/// on the cold call); `prompt + max_new + DEFAULT_N_MAX + 8` must fit it, else this errors before
+/// touching the device.
+///
+/// A COLD call (`trunk_state.is_none()`) binds the trunk weights through
+/// [`crate::seam::vulkan_moe_binder`] — the same placement planner + pager installer the non-MTP
+/// Vulkan path uses — so a paged MoE model's `_exps` banks divert to pager placeholders instead of
+/// raw-uploading the whole 22 GB to VRAM (the old naive bind closure OOMed there; the planner's
+/// 512 MiB MTP-head reserve already leaves room for the head session this call then builds). A
+/// WARM call keeps the already-bound weights and uses a poisoned binder that errors loudly if the
+/// runner ever re-binds (mirrors `seam/mod.rs`'s `warm session must not re-bind` guard). Either
+/// way [`generate_mtp_spec_core`] resets the trunk's KV at entry, so turns never share cache.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn generate_mtp_spec_vulkan_timed_on_state(
+    vk: &infr_vulkan::VulkanBackend,
+    trunk_state: &mut Option<crate::seam::SeamKv>,
+    model: &crate::SeamModel,
+    head: &MtpHeadWeights,
+    max_ctx: usize,
+    prompt: &str,
+    max_new: usize,
+    on_piece: impl FnMut(&str),
+) -> Result<(crate::GenStats, MtpTiming)> {
+    let cfg = model.config();
+    let prompt_len = model.encode(prompt)?.len();
+    anyhow::ensure!(
+        prompt_len + max_new + DEFAULT_N_MAX + 8 <= max_ctx,
+        "mtp: prompt {prompt_len} + gen {max_new} + draft window exceeds the session KV capacity \
+         {max_ctx}",
+    );
+    // A WARM call has every weight already resident, and the runner never calls `bind_weight`
+    // again once `trunk_state` holds them — so skip the whole placement/pager pass and hand the
+    // runner a no-op binder that errors loudly if that invariant ever breaks (mirrors
+    // `seam::generate_dense_vulkan_session`'s cold/warm split).
+    let warm_binder: Box<BindWeightFn> =
+        Box::new(|name: &str, _tb, _dt, _n| Err(anyhow!("warm session must not re-bind {name}")));
+    let bind = if trunk_state.is_some() {
+        warm_binder
+    } else {
+        match crate::seam::vulkan_moe_binder(
+            vk,
+            model.gguf(),
+            cfg,
+            model.engine_cfg(),
+            true,
+            max_ctx,
+        ) {
+            Ok(bind) => bind,
+            Err(error) => {
+                vk.release_moe_load_reservation();
+                return Err(error);
+            }
+        }
     };
+    let bind: &BindWeightFn = &*bind;
     let mut head_sess = MtpHeadSession::new_vulkan(
         vk,
         model.gguf(),
@@ -149,16 +215,29 @@ pub fn generate_mtp_spec_vulkan_timed_on(
         model.token_embd()?,
         max_ctx,
     )?;
-    generate_mtp_spec_core(
+    // VRAM milestone probe (PR #21 follow-up): the head session's weights fit at build time, but
+    // the trunk verify binds (token_embd F16 upload) and the dynamic KV expansion happen later
+    // through the same guard — this names the live room each stage starts with, so the
+    // placement-time guarantee vs runtime-consumption gap is measurable instead of inferred.
+    tracing::info!(
+        after_head_session_live_mb = vk.alloc_room() as f64 / 1e6,
+        "[mtp] vram milestone: head session built"
+    );
+    let out = generate_mtp_spec_core(
         vk,
         bind,
         model,
         &mut head_sess,
+        trunk_state,
         max_ctx,
         prompt,
         max_new,
         on_piece,
-    )
+    );
+    if out.is_err() {
+        vk.release_moe_load_reservation();
+    }
+    out
 }
 
 /// Metal twin of [`generate_mtp_spec_vulkan_timed`] — the SAME draft-verify-catchup driver over
@@ -193,11 +272,13 @@ pub fn generate_mtp_spec_metal_timed(
         model.token_embd()?,
         max_ctx,
     )?;
+    let mut trunk_state = None;
     generate_mtp_spec_core(
         &mtl,
         bind,
         model,
         &mut head_sess,
+        &mut trunk_state,
         max_ctx,
         prompt,
         max_new,
@@ -239,11 +320,13 @@ pub fn generate_mtp_spec_cpu_timed(
         model.token_embd()?,
         max_ctx,
     )?;
+    let mut trunk_state = None;
     generate_mtp_spec_core(
         &cpu,
         bind,
         model,
         &mut head_sess,
+        &mut trunk_state,
         max_ctx,
         prompt,
         max_new,

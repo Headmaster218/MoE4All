@@ -541,6 +541,7 @@ pub(crate) fn generate_dense_cpu_mode(
         None, // denoise_req
         None, // turn checkpoint boundary
         req,
+        None, // mm
     );
     if let Some(store) = store.filter(|_| ec.paging.stats) {
         report_host_paging(&store);
@@ -602,6 +603,7 @@ pub(crate) fn generate_dense_vulkan(
         None, // turn checkpoint boundary
         None, // constraint
         None, // req: the one-shot runner is a sole sequence — config sampling, no gate
+        None, // mm
     )
 }
 
@@ -615,6 +617,30 @@ pub(crate) enum TurnCheckpoint {
     Enable,
     /// Allocate if needed and capture state after this many prompt tokens.
     Boundary(usize),
+}
+
+/// One image span's ViT embeddings as the seam consumes them (stage V4b): the rows overwrite the
+/// token-embedding-table rows of the span's `<|image_pad|>` tokens during host prefill embedding,
+/// and the span's tokens rope on a (T,H,W) sub-grid instead of the linear position.
+pub struct ImageSpanEmbeds {
+    /// Token index (in the EXPANDED prompt token array) of the span's first token.
+    pub start: usize,
+    /// Number of tokens the span occupies (nx*ny merged tokens).
+    pub n_tokens: usize,
+    /// ViT output rows, [n_tokens * n_embd] f32 row-major.
+    pub embeds: std::sync::Arc<Vec<f32>>,
+}
+
+/// The vision mrope plan a caller hands [`generate_dense_vulkan_session`] (and, transitively,
+/// `generate_dense_backend`) for a turn whose rendered prompt contains `<|image_pad|>` tokens and
+/// whose image embeddings come from the ViT (`infr-vision`). `None` on every text-only turn —
+/// byte-for-byte the pre-V4b graph and uploads.
+pub struct MropePlan {
+    /// Per-token (T,H,W,E) for every PROMPT token, [plen*4] i32 row-major.
+    pub prompt_pos4: Vec<i32>,
+    pub spans: Vec<ImageSpanEmbeds>,
+    /// Rope position of generated token i (i = 0,1,2... after the prompt): decode_base + i.
+    pub decode_base: i32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -634,6 +660,8 @@ pub(crate) fn generate_dense_vulkan_session(
     turn_checkpoint: Option<TurnCheckpoint>,
     constraint: Option<&mut crate::grammar::Constraint>,
     req: Option<&crate::sampling::RequestCtx>,
+    // Vision mrope plan (stage V4b): `None` on every text-only caller.
+    mm: Option<&MropePlan>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     // Placement can allocate + upload (the pager arenas, a weight re-bind), i.e. it RECORDS on the
     // Vulkan command pool — so it takes a turn on the baton like any other GPU region. Scoped: the
@@ -679,6 +707,7 @@ pub(crate) fn generate_dense_vulkan_session(
         None,
         turn_checkpoint,
         req,
+        mm,
     );
     if out.is_err() {
         vk.release_moe_load_reservation();
@@ -834,11 +863,18 @@ pub(crate) fn dense_act_reserve_at(
     // graph owns the row-scaled pools above. Two real runs at d4096 measured the fixed intercept
     // at 54.6 MiB (64 rows: 143.6 MiB peak; 128 rows: 232.7 MiB), so round it up to 64 MiB.
     // This is a fixed plan-overlap cost, not another per-row multiplier.
-    row_reserve.saturating_add(if cfg.qwen4exp {
+    let reserve = row_reserve.saturating_add(if cfg.qwen4exp {
         QWEN4_PLAN_OVERLAP_RESERVE
     } else {
         0
-    })
+    });
+    // Fixed slack over the algebraic reserve. Measured on Ornith-1.5-35B (qwen35moe, MTP verify
+    // re-prefill, chunk 128): the true peak ran 174 KB over the reserve — the follow-up unified
+    // arena growth request then had to carve a fresh window beside the pager's permanent expert
+    // slots and failed outright ("cannot create a contiguous window ... expert minimum working
+    // set"). 8 MiB absorbs the model-specific residue the per-row terms miss; when the reserve is
+    // already generous this is plan headroom, never waste (see the unified arena's sizing).
+    reserve.saturating_add(DENSE_ACT_RESERVE_SLACK)
 }
 
 /// F16 expansion buffers held by Vulkan while a batched attention op reads a Q8_0 KV cache.
@@ -1006,6 +1042,9 @@ pub(crate) fn layer_major_prefill(
 /// already builds rather than re-deriving them here (backlog B8).
 const ACT_RESERVE_PAD: (u64, u64) = (3, 2);
 const QWEN4_PLAN_OVERLAP_RESERVE: u64 = 64 * 1024 * 1024;
+/// Fixed slack added on top of the algebraic [`dense_act_reserve_at`] model — see the call site
+/// for the measurement that motivated it.
+const DENSE_ACT_RESERVE_SLACK: u64 = 8 * 1024 * 1024;
 
 /// Batched-prefill micro-batch: rows per prefill chunk (`device.ubatch` / `INFR_UBATCH`, default
 /// 1024 — but see [`default_ubatch_rows`] for the INTEGRATED-GPU default). ONE reader funnel — the
@@ -2836,6 +2875,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
     // load racing ANOTHER resident model (swap mid-drain) still reads reduced `available` —
     // that's real pressure, deliberately not compensated; the alloc-time VRAM budget guard is
     // the backstop against over-commit.
+    // Carried into the arena search's `required_after_arena` when MTP is opted in (see the
+    // computation inside the first-load block below).
+    let mut mtp_head_reserve: u64 = 0;
     if first_load && cfg.moe.is_some() {
         // NB: the load-time expert-bank dtype gate that used to live here (field report:
         // MXFP4_MOE expert banks `expect`-panicked mid-inference before it existed) is GONE —
@@ -2846,6 +2888,58 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let fp = crate::weights::weight_footprint(g);
         let vram = vk.vram();
         let room = planned_vram_room(&vram, ec);
+        // MTP headroom (qwen35/qwen35moe speculative decode): the MTP head session is built AFTER
+        // placement by the chat layer and allocates its own weights/KV/draft-chain buffers through
+        // the SAME unified guard. The head's need is therefore carried into the arena search's
+        // `required_after_arena` (see below) instead of being subtracted from `room` up front:
+        // inside the requirement, a shortfall degrades the physical runtime margin and then
+        // shrinks the EXPERT arena — trading expert-cache capacity for head space — instead of
+        // erroring when a static subtraction guessed wrong (a fixed scratch cannot cover both
+        // 8K and 131K: measured shortfalls on the RX 7700 XT ranged from -289 MiB at 8K to
+        // +287 MiB at 131K). Computed from the GGUF: the head layer's own tensor bytes (native
+        // dtype, the same upload the binder does) + the draft-chain vocab embed table
+        // (token_embd F16 upload, vocab*ne*2 B) + head KV + a scratch margin for the BDA block
+        // geometry rounding (`bda_weight_alloc` floors each resident block at 64/128/256 MiB).
+        let mtp_head_reserve = if crate::mtp::should_use_mtp(cfg, ec) {
+            let head_prefix = format!("blk.{}.", cfg.n_layer);
+            let head_weights: usize = g
+                .tensors()
+                .iter()
+                .filter(|t| t.name.starts_with(&head_prefix))
+                .map(|t| {
+                    let numel: usize = t.shape.iter().product();
+                    infr_gguf::nbytes(t.dtype, numel)
+                })
+                .sum();
+            // The embed-table term is GONE: the MTP verify path forces spec.gpu_embed=false,
+            // so the trunk never uploads token_embd (embeddings ride the host table), and the
+            // head's device embed table is gated off (`device_embed_enabled`) — counting it
+            // here double-booked 1 GiB and starved the prefill ring on smaller cards.
+            let head_kv = want_ctx * cfg.n_kv * cfg.head_dim * 2 * 2; // K+V f16, 1 layer
+                                                                      // Scratch covers the BDA geometry rounding AND the head's later blocks beyond the
+                                                                      // first `resident-bda` request: with the reserve inside required_after_arena, an
+                                                                      // undersized scratch surfaces as a mid-upload guard refusal (measured: 272.0 MiB
+                                                                      // block refused with 180.7 MiB left at 131K kv-q8 on the RX 7700 XT). 896 MiB
+                                                                      // closes it; the shortfall-driven search pays for it out of expert slots.
+                                                                      // Scratch covers the BDA geometry rounding (272/397 MiB blocks vs raw tensor bytes)
+                                                                      // plus the dynamic KV expansion segments that land after placement — with the reserve
+                                                                      // enforced inside the arena search's `required_after_arena`, an undersized scratch
+                                                                      // surfaces as a mid-upload guard refusal; the loop pays for the bigger scratch out of
+                                                                      // expert slots instead.
+            let scratch = 1600 << 20;
+            let mtp_reserve = head_weights + head_kv + scratch;
+            tracing::info!(
+                "[mtp] headroom reserve: head_weights={:.0}MB head_kv={:.0}MB \
+                 scratch={:.0}MB total={:.2}GB",
+                head_weights as f64 / 1e6,
+                head_kv as f64 / 1e6,
+                scratch as f64 / 1e6,
+                mtp_reserve as f64 / 1e9,
+            );
+            mtp_reserve as u64
+        } else {
+            0
+        };
         // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows`), so a mostly-SWA
         // model's KV prices far below n_layer * ctx. Price the actual per-side Vulkan formats:
         // explicit Q8 and F16 choices must change the expert remainder just like the allocation.
@@ -3179,11 +3273,25 @@ pub(crate) fn vulkan_moe_binder<'a>(
             let planned_pager_budget = pager_budget_bytes;
             let elastic_reserve = plan.elastic_reserve_bytes();
             let minimum_pager_budget = elastic_reserve.saturating_add(physical_pool_floor);
+            // The MTP head session allocates through the same guard right after this loop, so
+            // when the user opted in its reserve is part of what must stay live beside the
+            // arena (a shortfall then degrades the margin and shrinks expert slots — head
+            // space is traded against expert-cache capacity, never against starting at all).
             let required_after_arena = plan
                 .minimum_required_bytes()
-                .saturating_sub(elastic_reserve);
+                .saturating_sub(elastic_reserve)
+                .saturating_add(mtp_head_reserve);
             let adaptive_arena = cache_override.is_none();
             let mut candidate_budget = pager_budget_bytes;
+            // The runtime margin became PHYSICAL trailing arena shards (see
+            // `MoePagerLayout::runtime_margin_bytes`), which raises the mapped-arena size by the
+            // full activation reserve. At large KV sizes that can overflow a small card even
+            // though the same plan fit when the reserve borrowed expert slots at runtime. The
+            // margin is a placement-QUALITY knob (runtime windows coalesce instead of borrowing),
+            // not a correctness requirement, so on a fit shortfall degrade it: first by the
+            // shortfall itself, then to zero (full slot-borrowing, the proven pre-margin
+            // behaviour) — and only error when even the margin-free layout does not fit.
+            let mut effective_margin = plan.runtime_reserve_bytes;
             let mut attempts = 0usize;
             let slot_counts = loop {
                 attempts += 1;
@@ -3216,9 +3324,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     .map(|(&(slot_bytes, ..), &n_slots)| (slot_bytes, n_slots))
                     .collect();
 
-                let failure = match vk.prepare_moe_unified_vram(&specs) {
+                let failure = match vk.prepare_moe_unified_vram(&specs, effective_margin as usize) {
                     Ok(committed) => {
-                        debug_assert_eq!(committed as u64, physical_bytes);
+                        debug_assert_eq!(committed as u64, physical_bytes + effective_margin);
                         let live_room = vk.alloc_room();
                         if live_room >= required_after_arena {
                             pager_budget_bytes = physical_bytes;
@@ -3238,6 +3346,23 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         let shortfall = required_after_arena - live_room;
                         vk.discard_empty_moe_unified_vram()
                             .map_err(|e| anyhow!("discarding MoE allocation probe: {e}"))?;
+                        // Degrade the runtime margin before giving up: unmapping margin bytes
+                        // frees them one-for-one, so shrinking by `shortfall` closes the gap
+                        // directly (windows borrow expert slots for the degraded remainder,
+                        // exactly the pre-margin placement behaviour).
+                        if effective_margin > 0 {
+                            let shrunk = effective_margin.saturating_sub(shortfall);
+                            tracing::warn!(
+                                from_margin_bytes = effective_margin,
+                                to_margin_bytes = shrunk,
+                                shortfall_bytes = shortfall,
+                                "runtime margin does not fit at this KV size; degrading the \
+                                 pager to expert-slot borrowing for the difference"
+                            );
+                            effective_margin = shrunk;
+                            attempts -= 1;
+                            continue;
+                        }
                         (
                             shortfall,
                             format!(
@@ -3439,6 +3564,13 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 host_chunks,
                 prefill_target_lanes,
                 prefill_cache_bytes: expert_cache_target_bytes,
+                // The activation reserve becomes a PHYSICAL trailing shard (see
+                // `MoePagerLayout::runtime_margin_bytes`): runtime windows live there instead of
+                // borrowing expert slots, which is what wedged long serve sessions before.
+                // The committed runtime margin: `effective_margin` starts at the full plan
+                // reserve and degrades when the mapped arena would otherwise overflow the
+                // device (windows borrow expert slots for the degraded part).
+                runtime_margin_bytes: effective_margin,
             })
             .map_err(|e| anyhow!("{e}"))?;
         }
@@ -4097,6 +4229,7 @@ fn run_dense_oneshot(
         None, // denoise_req
         None, // turn checkpoint boundary
         None, // req
+        None, // mm
     )
 }
 
@@ -4672,6 +4805,7 @@ pub(crate) fn generate_dense_metal_session(
         None,
         None,
         req,
+        None, // mm
     )
 }
 
@@ -4716,6 +4850,8 @@ pub(crate) fn verify_dense_metal2(
         None,
         None,
         None,
+        None,
+        None, // mm
     )?;
     Ok((logits, stats.prompt_secs))
 }
@@ -4757,6 +4893,7 @@ pub(crate) fn verify_dense_cpu(
         None,
         None,
         None,
+        None, // mm
     )?;
     Ok(logits)
 }
@@ -4799,6 +4936,7 @@ pub(crate) fn verify_dense_cpu_with_h(
         None,
         None,
         None,
+        None, // mm
     )?;
     Ok((logits, h))
 }
@@ -4843,6 +4981,7 @@ pub(crate) fn verify_rows_cpu_with_h(
         None,
         None,
         None,
+        None, // mm
     )?;
     Ok((logits, h))
 }
@@ -4891,6 +5030,7 @@ pub(crate) fn verify_dense_vulkan(
         None,
         None,
         None,
+        None, // mm
     )?;
     Ok(logits)
 }
@@ -5765,9 +5905,9 @@ mod seam_helper_tests {
         let half = super::dense_act_reserve_at(&cfg, &conservative_caps(), 4096, 512);
         let full = super::dense_act_reserve_at(&cfg, &conservative_caps(), 4096, 1024);
         assert_eq!(
-            full - super::QWEN4_PLAN_OVERLAP_RESERVE,
-            2 * (half - super::QWEN4_PLAN_OVERLAP_RESERVE),
-            "only the row-scaled part doubles; the retained decode plan is fixed"
+            full - super::QWEN4_PLAN_OVERLAP_RESERVE - super::DENSE_ACT_RESERVE_SLACK,
+            2 * (half - super::QWEN4_PLAN_OVERLAP_RESERVE - super::DENSE_ACT_RESERVE_SLACK),
+            "only the row-scaled part doubles; the retained decode plan and the fixed slack are constant"
         );
     }
 
@@ -6315,13 +6455,19 @@ mod seam_helper_tests {
         let got = super::dense_act_reserve_at(&cfg, &conservative_caps(), ctx, ubatch);
         assert_eq!(
             got,
-            unpadded * super::ACT_RESERVE_PAD.0 / super::ACT_RESERVE_PAD.1,
-            "reserve must be the per-row model times the pad"
+            unpadded * super::ACT_RESERVE_PAD.0 / super::ACT_RESERVE_PAD.1
+                + super::DENSE_ACT_RESERVE_SLACK,
+            "reserve must be the per-row model times the pad plus the fixed slack"
         );
-        assert_eq!(got, 500_957_184);
-        // No fixed term: halving the rows must halve the reserve, which a constant would floor.
+        assert_eq!(got, 500_957_184 + super::DENSE_ACT_RESERVE_SLACK);
+        // The row-scaled part still halves with the rows (the fixed slack cancels out), which a
+        // constant reserve would floor.
         let half = super::dense_act_reserve_at(&cfg, &conservative_caps(), ctx, 64);
-        assert_eq!(half * 2, got, "the reserve is purely per-row");
+        assert_eq!(
+            (half - super::DENSE_ACT_RESERVE_SLACK) * 2,
+            got - super::DENSE_ACT_RESERVE_SLACK,
+            "the reserve is per-row plus one fixed slack term"
+        );
     }
 
     /// Ling's KDA/MLA hybrid never emits Op::Attention. Its dedicated MLA kernel scans the
@@ -6362,10 +6508,11 @@ mod seam_helper_tests {
         let per_pair = 3 * m.n_ff_exp * 4 + cfg.n_embd * 4 + m.n_ff_exp + cfg.n_embd;
         let moe = m.n_used * per_pair + 48 * cfg.n_embd;
         let per_row = 12 * cfg.n_ff + 96 * cfg.n_embd + moe;
-        let expected =
-            ubatch as u64 * per_row as u64 * super::ACT_RESERVE_PAD.0 / super::ACT_RESERVE_PAD.1;
+        let expected = ubatch as u64 * per_row as u64 * super::ACT_RESERVE_PAD.0
+            / super::ACT_RESERVE_PAD.1
+            + super::DENSE_ACT_RESERVE_SLACK;
         assert_eq!(got, expected);
-        assert_eq!(got, 959_447_040);
+        assert_eq!(got, 959_447_040 + super::DENSE_ACT_RESERVE_SLACK);
 
         let mut ordinary = cfg.clone();
         ordinary.bailingmoe3 = false;

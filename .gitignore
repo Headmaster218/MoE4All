@@ -18,3 +18,6 @@ target-prof/
 /gui-data/
 /artifacts/context-resource-matrix/
 /tests/context-resource/matrix.local.json
+
+target-msvc/
+qwen35-4b-mtp/

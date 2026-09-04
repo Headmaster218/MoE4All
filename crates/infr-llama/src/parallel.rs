@@ -246,6 +246,7 @@ impl ParallelSeam {
                 Some(crate::seam::TurnCheckpoint::Enable),
                 None, // constraint
                 None, // req: startup, not a request — env sampling, no gate
+                None, // mm
             )
         })?;
         let mut slot0 = slot0.ok_or_else(|| anyhow!("warmup did not initialize a KV slot"))?;
@@ -497,6 +498,7 @@ impl ParallelSeam {
             turn_checkpoint,
             constraint,
             Some(req),
+            None, // mm
         )?;
         Ok(stats)
     }

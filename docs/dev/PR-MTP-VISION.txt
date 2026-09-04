@@ -1,0 +1,103 @@
+MoE4All MTP Speculative Decoding for qwen35moe + Qwen3-VL Vision Support
+
+## Summary
+
+This PR enables MTP (Multi-Token Prediction) speculative decoding for qwen35 and qwen35moe architectures on the Vulkan backend with paged-MoE expert streaming. On an RX 7700 XT 12GB running Ornith-1.5-35B-A3B (22GB, Q6_K/Q5_K/IQ4_XS mixed experts), greedy MTP achieves 93.6 tok/s vs 54.7 tok/s baseline (1.71x) with alpha=1.0 using a properly trained MTP head.
+
+Additionally adds Qwen3-VL vision understanding (mmproj parsing, ViT forward, IMROPE text-side positions, embedding splice, OpenAI API image input).
+
+## The Problem
+
+MoE4All's MTP implementation (issue #33, docs/mtp.md) was complete for qwen35 (dense) but had three blockers preventing it from working on qwen35moe (MoE) models:
+
+1. Head loading: load_mtp_head only accepted cfg.qwen35 with dense FFN; qwen35moe heads have MoE FFN (routed experts + shared expert)
+2. Verify path: generate_dense_backend's VERIFY branch bailed on c.moe.is_some()
+3. Naive weight upload: the MTP driver's bind closure raw-uploaded ALL trunk weights to VRAM (OOM for models larger than VRAM)
+
+Additionally, the shipped Ornith-1.5 MTP head was never trained (random init), so a properly trained head (shisa-ai's KL-distilled graft) was used for validation.
+
+## Changes
+
+### Stage 1: qwen35moe MTP head support (crates/infr-llama/src/mtp/mod.rs)
+- MtpFfn enum: Dense { gate, up, down } | Moe { gate_inp, gate_exps, up_exps, down_exps, shexp }
+- load_mtp_head: accepts qwen35moe via cfg.moe.is_some(), shapes derived from Config
+- upload_mtp_head_bufs: variable weight list per FFN variant
+- build_mtp_graph + build_mtp_draft_chain_graph: emit Op::MoeFfn + shared expert + Op::MoeSharedExpertAdd
+
+### Stage 2: Verify path + rollback
+- runner.rs VERIFY gate relaxed: qwen35moe admitted when moe_batched_ok
+- DeltaNet rollback filter verified correct for qwen35moe hybrid structure
+- Unit test: mtp_delta_filter_covers_qwen35moe_recurrent_layers
+
+### Stage 3: Paged-MoE verify integration
+- mtp/backends.rs: naive raw-upload bind replaced with vulkan_moe_binder (shared placement planner + pager installer)
+- chat/vulkan.rs: MTP branch routes through ensure_session() + PlacementScope on shared session backend
+- seam/mod.rs: dynamic MTP headroom reserve in VRAM planner (computed from GGUF tensor bytes + embed table size)
+
+### Stage 4: Greedy fast path
+- GPU argmax accept path (Op::Argmax, m*4 bytes readback) replaces full logits D2H (m*vocab*4B, 4-11 MB per verify at ~25 MB/s)
+- verify download: 800ms -> 1.8ms (400x)
+- INFR_MTP_N_MAX env var to tune draft length
+
+### Vision: Qwen3-VL (qwen3vl_merger)
+- infr-vision crate: ClipConfig, VisionWeights, preprocess (smart resize, patchify, merge-major, bilinear pos-embed), VitEngine (CPU 19s + Vulkan 0.19s per image)
+- Op::Gelu (exact-tanh): CPU + Vulkan shader
+- Op::Rope2D: ggml GGML_ROPE_TYPE_VISION semantics, CPU + Vulkan shader
+- Op::QkNormMrope: fused RMSNorm + IMROPE for image spans, CPU + Vulkan shader
+- Embedding splice in batched prefill and per-token loop
+- MropePlan position cursor (T=const in image span, H/W spread, cursor advances max(nx,ny))
+- ChatMessage.images + image_url collection in infr-server
+- --mmproj flag for serve/run, serialised engine routing
+
+## Known Limitations
+
+1. temp>0 stochastic path downloads full m*vocab*4B logits per verify (~25 MB/s D2H). GPU-side accept or persistent staging needed.
+2. Head session rebuilt per request ("no cross-turn KV reuse" design). Persistent sessions would eliminate ~300ms per-request setup.
+3. QkNormMrope has no fused KV write or decode replay (static per-token rebuild for mrope turns).
+4. mtp_enabled() should remain parked upstream until f32-margin re-verify is implemented (docs/mtp.md parked rationale applies). This PR enables it as an opt-in experimental feature via INFR_MTP=1.
+5. Parallel engine (--parallel N>1) does not support MTP or vision.
+
+## Performance
+
+RX 7700 XT 12GB, Ornith-1.5-35B-A3B-APEX-MTP-I-Quality-MTPFIX, 8K context, greedy:
+
+| Config | decode |
+|--------|--------|
+| Baseline (no MTP) | 54.7 tok/s |
+| MTP (n_max=6, alpha=1.0) | 93.6 tok/s (1.71x) |
+
+Serve mode serialised engine: prefill 446 tok/s, decode 69.5 tok/s at 12.5K-token prompts.
+
+Vision: ViT encode 256x256 = 0.19s (Vulkan), 19s (CPU).
+
+## Testing
+
+- cargo test -p infr-cpu: 104 pass (incl. QkNormMrope text-collapse + plane-selection)
+- cargo test -p infr-vision: 16 pass (incl. real mmproj smoke test)
+- cargo test -p infr-chat: 64 pass
+- cargo test -p infr-server: 88 pass
+- cargo check --workspace: clean
+
+## Files Changed (47 files, +6653 -334)
+
+New:
+  crates/infr-vision/ (6 files)
+  crates/infr-vulkan/shaders/gelu.comp
+  crates/infr-vulkan/shaders/rope2d.comp
+  crates/infr-vulkan/shaders/qk_norm_rope_mrope.comp
+  crates/infr-vulkan/tests/rope2d_parity.rs
+  crates/infr-vulkan/tests/vit_qkv_block_parity.rs
+
+Modified:
+  crates/infr-core/src/graph.rs
+  crates/infr-cpu/src/lib.rs
+  crates/infr-vulkan/src/{adapter,recorder,gemm}.rs
+  crates/infr-vulkan/build.rs
+  crates/infr-llama/src/mtp/{mod,backends}.rs
+  crates/infr-llama/src/seam/{mod,runner,weights,model}.rs
+  crates/infr-llama/src/chat/{vulkan,mod}.rs
+  crates/infr-chat/src/{lib,template,tools}.rs
+  crates/infr-server/src/lib.rs
+  crates/infr-cli/src/main.rs
+  crates/infr-llama/src/parallel.rs
+  Cargo.toml, crates/infr-llama/Cargo.toml

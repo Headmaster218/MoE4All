@@ -378,6 +378,15 @@ enum Cmd {
             hide_env = true
         )]
         diffusion_visual: String,
+        /// Vision projector GGUF (`infr serve/run --mmproj`), overriding the default lazy
+        /// discovery of `mmproj*.gguf` beside the model file. Purely an override: without it
+        /// vision support activates lazily on the first request that carries images, so there is
+        /// no startup cost for text-only use (stage V5). Vulkan seam only.
+        ///
+        /// Supported scope (see `infr-vision`'s crate doc): qwen35/qwen35moe trunks +
+        /// `qwen3vl_merger` projectors, deepstack-free, data-URI/base64 images only.
+        #[arg(long, value_name = "PATH")]
+        mmproj: Option<PathBuf>,
         #[command(flatten)]
         device: DeviceOpts,
         #[command(flatten)]
@@ -386,6 +395,9 @@ enum Cmd {
     /// Start the OpenAI-compatible HTTP API (auto-pulls if missing).
     Serve {
         model: String,
+        /// Vision projector GGUF override — see the `run` subcommand's `--mmproj` doc (stage V5).
+        #[arg(long, value_name = "PATH")]
+        mmproj: Option<PathBuf>,
         /// Optional GGUF embedding model hosted natively at /v1/embeddings.
         #[arg(long, value_name = "MODEL")]
         embedding_model: Option<String>,
@@ -794,11 +806,13 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
             model,
             message,
             diffusion_visual,
+            mmproj,
             ..
         } => cmd_run(
             &model,
             message.as_deref(),
             &diffusion_visual,
+            mmproj.as_deref(),
             cfg,
             specified,
         ),
@@ -808,6 +822,7 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
             embedding_runner,
             addr,
             parallel,
+            mmproj,
             ..
         } => cmd_serve(
             &model,
@@ -815,6 +830,7 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
             embedding_runner.as_deref(),
             &addr,
             parallel,
+            mmproj.as_deref(),
             cfg,
             specified,
         ),
@@ -1400,6 +1416,7 @@ fn build_chat_model(
     tok: Option<&Path>,
     is_dg: bool,
     cfg: &Arc<Config>,
+    mmproj: Option<&Path>,
 ) -> anyhow::Result<Box<dyn infr_llama::chat::ChatModel + Send>> {
     let backend = selected_backend(cfg)?;
     if is_dg {
@@ -1454,9 +1471,16 @@ fn build_chat_model(
             tracing::info!(
                 "[vulkan seam — dense/MoE on the agnostic compute graph, persistent KV session]"
             );
-            Ok(Box::new(infr_llama::chat::DenseSeamChat::new(
-                infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?,
-            )))
+            // `--mmproj` rides ONLY the Vulkan seam chat (vision, stage V5); the other backends
+            // bail at request time instead. Discovery stays lazy — `None` costs nothing.
+            Ok(Box::new(
+                infr_llama::chat::DenseSeamChat::new(infr_llama::SeamModel::load_with(
+                    gguf,
+                    tok,
+                    cfg.clone(),
+                )?)
+                .with_mmproj_override(mmproj.map(Path::to_path_buf)),
+            ))
         }
     }
 }
@@ -1465,6 +1489,7 @@ fn cmd_run(
     model: &str,
     message: Option<&str>,
     diffusion_visual: &str,
+    mmproj: Option<&Path>,
     cfg: &Arc<Config>,
     specified: &PartialConfig,
 ) -> anyhow::Result<()> {
@@ -1574,7 +1599,7 @@ fn cmd_run(
     // the SAME standard `ChatModel` structs (issue #30). Model-aware chat sampling first (arch-family
     // table + generation_config sibling; a user `--temp`/`--top-k`/`--top-p` already in the env wins).
     let cfg = apply_model_sampling_defaults(cfg, specified, &gguf);
-    let mut model = build_chat_model(&gguf, tok.as_deref(), is_dg, &cfg)?;
+    let mut model = build_chat_model(&gguf, tok.as_deref(), is_dg, &cfg, mmproj)?;
     // Compile the lazily-built pipelines NOW (like `serve` does before its first request) so the
     // first turn's reported prefill rate measures prefill, not one-time pipeline builds — a cold
     // diffusion-gemma prefill measured 26 t/s vs 1424 t/s warm, all compile.
@@ -2143,6 +2168,21 @@ trait GenBackend: Send + Sync {
         on_piece: &mut dyn FnMut(&str),
     ) -> anyhow::Result<infr_llama::GenStats>;
 
+    /// Vision turn (stage V5): `prompt` was rendered for a request that carries images — the
+    /// backend expands the prompt's `<|image_pad|>` markers with ViT embeddings before prefill.
+    /// Default: bail — a backend without vision support says so and the request gets the error,
+    /// instead of the images silently vanishing.
+    fn generate_mm(
+        &self,
+        _prompt: &str,
+        _images: &[String],
+        _max_new: usize,
+        _req: &infr_llama::sampling::RequestCtx,
+        _on_piece: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<infr_llama::GenStats> {
+        anyhow::bail!("this model/backend has no vision support")
+    }
+
     /// Drop the serialised session's persistent KV so the NEXT `generate` re-prefills from scratch.
     /// The forced-tool fallback calls this before its unconstrained retry so the retry can never
     /// inherit the constrained attempt's primed `<tool_call>` state. Default no-op: the multi-slot
@@ -2203,6 +2243,22 @@ impl GenBackend for SeamGenerator {
             .lock()
             .expect("serve generator poisoned")
             .reset_kv();
+    }
+
+    fn generate_mm(
+        &self,
+        prompt: &str,
+        images: &[String],
+        max_new: usize,
+        req: &infr_llama::sampling::RequestCtx,
+        on_piece: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<infr_llama::GenStats> {
+        // The `ChatModel::generate_mm` primitive behind the SAME serialised mutex as `generate`
+        // — the mmproj loads lazily inside this call, so an image-free process never pays it.
+        self.model
+            .lock()
+            .expect("serve generator poisoned")
+            .generate_mm(prompt, images, max_new, Some(req), on_piece)
     }
 }
 
@@ -2327,11 +2383,24 @@ fn run_chat(
         // turn. Owned by this call — not installed anywhere ambient — so it cannot be observed by,
         // or leak into, any other in-flight request.
         let req = be.request_ctx(request_sampling(params));
+        // Vision (stage V5): the request's image payloads, in message order. Non-empty reroutes
+        // the turn through `generate_mm` (pad-marker expansion + ViT embeddings) and skips the
+        // forced-tool grammar below (constraint + vision is a v1 non-goal — unconstrained decode).
+        let images: Vec<String> = messages
+            .iter()
+            .flat_map(|m| m.images.iter().cloned())
+            .collect();
         // Forced tool_choice ("required"/named): grammar-constrain the call body (the same
         // llguidance machinery as the bespoke path — grammar::constrained_step runs inside the
         // seam decode). Prime the assistant turn with the <tool_call> opener and parse the
         // constrained JSON; on any failure fall back to unconstrained (mirrors LlamaGenerator).
-        if let Some(mut constraint) = be.renderer().tool_constraint(tools, tool_choice)? {
+        // TEXT turns only: a vision turn never takes the forced-grammar path (v1 non-goal).
+        let forced_constraint = if images.is_empty() {
+            be.renderer().tool_constraint(tools, tool_choice)?
+        } else {
+            None
+        };
+        if let Some(mut constraint) = forced_constraint {
             let primed = format!("{prompt}<tool_call>\n");
             let mut body = String::new();
             let mut tokens = (0u32, 0u32);
@@ -2412,24 +2481,40 @@ fn run_chat(
             if infr_engine::prompt_prefills_think(&prompt) {
                 stream.push("<think>", &mut *od);
             }
-            let stats = be.generate(
-                &prompt,
-                Some(&stable_prefix),
-                max_new,
-                None,
-                &req,
-                &mut |piece: &str| {
+            // Vision (stage V5) reroutes to `generate_mm` — same streaming contract, the mm
+            // expansion happens inside the backend. A text-only request takes the EXACT
+            // pre-V5 `generate` path.
+            let stats = if images.is_empty() {
+                be.generate(
+                    &prompt,
+                    Some(&stable_prefix),
+                    max_new,
+                    None,
+                    &req,
+                    &mut |piece: &str| {
+                        let safe = stops.push(piece);
+                        if !safe.is_empty() {
+                            stream.push(&safe, &mut *od);
+                        }
+                        // A stop sequence hit OR a client disconnect (the server latched `cancel`)
+                        // both abort THIS sequence's decode at its next poll, freeing the GPU slot
+                        // promptly.
+                        if stops.hit() || cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            req.abort();
+                        }
+                    },
+                )?
+            } else {
+                be.generate_mm(&prompt, &images, max_new, &req, &mut |piece: &str| {
                     let safe = stops.push(piece);
                     if !safe.is_empty() {
                         stream.push(&safe, &mut *od);
                     }
-                    // A stop sequence hit OR a client disconnect (the server latched `cancel`) both
-                    // abort THIS sequence's decode at its next poll, freeing the GPU slot promptly.
                     if stops.hit() || cancel.load(std::sync::atomic::Ordering::Relaxed) {
                         req.abort();
                     }
-                },
-            )?;
+                })?
+            };
             // No stop fired: whatever the matcher was holding back was never a stop prefix.
             let tail = stops.flush();
             if !tail.is_empty() {
@@ -4373,6 +4458,7 @@ fn cmd_serve(
     embedding_runner: Option<&Path>,
     addr: &str,
     parallel: Option<usize>,
+    mmproj: Option<&Path>,
     cfg: &Arc<Config>,
     specified: &PartialConfig,
 ) -> anyhow::Result<()> {
@@ -4411,7 +4497,9 @@ fn cmd_serve(
     // ── the CONCURRENT path: dense/MoE/qwen35 on the Vulkan seam ────────────────────────────────
     // N KV slots off ONE weight upload, round-robin on the GPU at token granularity. This is the
     // default `infr serve` engine.
-    if is_vulkan {
+    // Vision (stage V5) rides the SERIALISED seam chat only — the multi-slot engine has no
+    // mrope-plan path yet, so an explicit `--mmproj` routes to the serialised serve below.
+    if is_vulkan && mmproj.is_none() {
         let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
         // `--ctx` (or INFR_CTX) is the PER-SLOT window: an explicit token count is used verbatim,
         // a `%` is a fraction of the whole device's KV capacity split across the slots, and unset
@@ -4500,7 +4588,7 @@ fn cmd_serve(
     // the reference backends; Vulkan is the default. qwen35 shares the SAME funnel as every other arch
     // (issue #30). Metal also honours INFR_SPEC_DRAFT (draft-verify speculative decode) via
     // `metal_chat_model` inside the funnel.
-    let mut m = build_chat_model(&gguf, tok.as_deref(), is_dg, cfg)?;
+    let mut m = build_chat_model(&gguf, tok.as_deref(), is_dg, cfg, mmproj)?;
     {
         // Compile every lazily-built pipeline NOW (a tiny throwaway generation) so the first
         // request doesn't pay seconds of pipeline builds on top of its own prefill.
@@ -5144,6 +5232,7 @@ mod tests {
             model: "m".to_string(),
             message: None,
             diffusion_visual: String::new(),
+            mmproj: None,
             device: device_opts(None),
             sampling: no_sampling_opts(),
         })

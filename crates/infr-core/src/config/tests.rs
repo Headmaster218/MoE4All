@@ -806,6 +806,10 @@ fn scan_file_for_keys(path: &Path, out: &mut Vec<String>) {
 ///   on the environment.
 /// * `INFR_NO_MOE_SHARED_SLOT` — a backend-private same-binary validation escape hatch, explicitly
 ///   accounted for in `manifest::NOT_MIGRATED`.
+/// * `INFR_D2H_DMA` — the Vulkan readback A/B escape hatch (opt-in, default OFF), likewise
+///   backend-private and accounted for in `manifest::NOT_MIGRATED`.
+/// * `INFR_MTP_N_MAX` — the MTP draft-depth A/B override, backend-private and accounted for in
+///   `manifest::NOT_MIGRATED`.
 ///
 /// `RAYON_NUM_THREADS` is not an `INFR_*` knob and is not in scope: `infr-cli` still PUBLISHES it,
 /// because rayon's global pool has no other input.
@@ -820,6 +824,8 @@ fn no_infr_env_reads_outside_the_config_layer() {
         "INFR_EMBEDDING_TEST_VULKAN",
         "INFR_LLAMA_DIFFUSION_CLI",
         "INFR_NO_MOE_SHARED_SLOT",
+        "INFR_D2H_DMA",
+        "INFR_MTP_N_MAX",
     ];
 
     let Some(crates) = repo_crates_dir() else {
