@@ -6568,6 +6568,20 @@ pub(crate) fn generate_dense_backend(
             chunks.len().max(1)
         };
         let mut live: Vec<Option<PfChunk>> = (0..chunks.len()).map(|_| None).collect();
+        // Keep Qwen3.8 PLE one chunk ahead. Chunk N+1's mmap/SSD gather runs while chunk N
+        // traverses the GPU, instead of making the GPU wait for random host I/O at every chunk
+        // boundary. Tickets are consumed before taking the shared GPU gate, so a slow PLE read
+        // never stalls another session that is ready to submit compute.
+        let mut ple_tickets = (0..chunks.len()).map(|_| None).collect::<Vec<_>>();
+        if c.qwen4exp {
+            let worker = ple_worker
+                .as_ref()
+                .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?;
+            if let Some(&(cstart, cend)) = chunks.first() {
+                ple_tickets[0] =
+                    Some(worker.submit_range(prompt, cstart, cend - cstart, c.ple_ngram_size)?);
+            }
+        }
         for group_start in (0..chunks.len()).step_by(group_chunks) {
             let group_end = (group_start + group_chunks).min(chunks.len());
             let preallocate_group = layer_major && c.qwen4exp;
@@ -6590,6 +6604,37 @@ pub(crate) fn generate_dense_backend(
                         if crate::sampling::abort_requested(req) {
                             anyhow::bail!("aborted: shutdown requested");
                         }
+                        let ple_rows = if c.qwen4exp && live[ci].is_none() {
+                            let worker = ple_worker
+                                .as_ref()
+                                .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?;
+                            let ticket = match ple_tickets[ci].take() {
+                                Some(ticket) => ticket,
+                                None => worker.submit_range(
+                                    prompt,
+                                    cstart,
+                                    cend - cstart,
+                                    c.ple_ngram_size,
+                                )?,
+                            };
+
+                            // Queue only the immediate successor. The bounded worker channel keeps
+                            // random I/O shallow while the current chunk's GPU work supplies the
+                            // overlap window.
+                            if let Some(&(next_start, next_end)) = chunks.get(ci + 1) {
+                                if ple_tickets[ci + 1].is_none() {
+                                    ple_tickets[ci + 1] = Some(worker.submit_range(
+                                        prompt,
+                                        next_start,
+                                        next_end - next_start,
+                                        c.ple_ngram_size,
+                                    )?);
+                                }
+                            }
+                            Some(ticket.wait()?)
+                        } else {
+                            None
+                        };
                         // One dispatch = one turn on the GPU. Dropped at the end of the iteration, handing
                         // the baton to whichever sequence has been waiting longest.
                         let _gp = if materialize_only {
@@ -6676,11 +6721,9 @@ pub(crate) fn generate_dense_backend(
                                 None
                             };
                             let ple_embd = if c.qwen4exp {
-                                let rows = ple_worker
-                                    .as_ref()
-                                    .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?
-                                    .submit_range(prompt, cstart, pf_m, c.ple_ngram_size)?
-                                    .wait()?;
+                                let rows = ple_rows.ok_or_else(|| {
+                                    anyhow!("qwen4exp prefill chunk has no prefetched PLE rows")
+                                })?;
                                 let heads = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram;
                                 let expected = pf_m * heads * c.ple_head_dim;
                                 if rows.len() != expected {
