@@ -2803,7 +2803,13 @@ enum MoeHostBacking {
     Bounded { bytes: usize },
 }
 
+/// Aggressive auto mode may spend down to this much currently-available host memory when doing so
+/// removes the runtime SSD expert tier entirely. Partial caches retain the normal profile-aware
+/// headroom: the extra pressure is worthwhile only at the full-residency discontinuity.
+const AGGRESSIVE_MOE_FULL_FIT_HEADROOM: u64 = 4 << 30;
+
 fn moe_host_backing(
+    profile: infr_core::config::AutoProfile,
     ram_request: infr_core::hostmem::RamRequest,
     available: Option<u64>,
     process_resident: Option<u64>,
@@ -2822,7 +2828,17 @@ fn moe_host_backing(
         infr_core::hostmem::RamRequest::Bypass => 0,
         infr_core::hostmem::RamRequest::Auto => available
             .map(|available| {
-                infr_core::hostmem::auto_cache_bytes(available, 0, payload_bytes as u64)
+                let payload = payload_bytes as u64;
+                let aggressive_full_fit =
+                    matches!(profile, infr_core::config::AutoProfile::Aggressive)
+                        && payload
+                            .checked_add(AGGRESSIVE_MOE_FULL_FIT_HEADROOM)
+                            .is_some_and(|required| required <= available);
+                if aggressive_full_fit {
+                    payload
+                } else {
+                    infr_core::hostmem::auto_cache_bytes_for_profile(profile, available, 0, payload)
+                }
             })
             .unwrap_or(0),
     } as usize;
@@ -3366,6 +3382,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
             let host_available = infr_core::hostmem::available_bytes();
             let process_resident = infr_core::hostmem::process_resident_bytes();
             let host_backing = moe_host_backing(
+                ec.device.auto_profile,
                 ram_request,
                 host_available,
                 process_resident,
@@ -3376,6 +3393,19 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 MoeHostBacking::Full => ("full-RAM", host_bytes),
                 MoeHostBacking::Bounded { bytes } => ("inclusive-RAM/SSD", bytes),
             };
+            if ram_request == infr_core::hostmem::RamRequest::Auto {
+                if let Some(available) = host_available {
+                    tracing::info!(
+                        auto_profile = ?ec.device.auto_profile,
+                        available_host_bytes = available,
+                        expert_payload_bytes = host_bytes,
+                        headroom_after_full_bytes = available.saturating_sub(host_bytes as u64),
+                        full_fit_shortfall_bytes = (host_bytes as u64).saturating_sub(available),
+                        decision = host_kind,
+                        "MoE automatic host residency decision"
+                    );
+                }
+            }
             log_host_ram_request(
                 "MoE",
                 ram_request,
@@ -5262,6 +5292,7 @@ mod seam_helper_tests {
         let payload = 24 * GIB;
         assert_eq!(
             super::moe_host_backing(
+                infr_core::config::AutoProfile::Conservative,
                 RamRequest::LegacyCacheBudget(payload as u64),
                 None,
                 Some(0),
@@ -5273,6 +5304,7 @@ mod seam_helper_tests {
         );
         assert_eq!(
             super::moe_host_backing(
+                infr_core::config::AutoProfile::Conservative,
                 RamRequest::LegacyCacheBudget((40 * GIB) as u64),
                 None,
                 Some(0),
@@ -5284,6 +5316,7 @@ mod seam_helper_tests {
         );
         assert_eq!(
             super::moe_host_backing(
+                infr_core::config::AutoProfile::Conservative,
                 RamRequest::Auto,
                 Some((64 * GIB) as u64),
                 Some(0),
@@ -5302,6 +5335,7 @@ mod seam_helper_tests {
         let payload = 24 * GIB;
         assert_eq!(
             super::moe_host_backing(
+                infr_core::config::AutoProfile::Conservative,
                 RamRequest::LegacyCacheBudget((23 * GIB) as u64),
                 None,
                 Some(0),
@@ -5312,6 +5346,7 @@ mod seam_helper_tests {
         );
         assert!(matches!(
             super::moe_host_backing(
+                infr_core::config::AutoProfile::Conservative,
                 RamRequest::Auto,
                 Some((25 * GIB) as u64),
                 Some(0),
@@ -5322,6 +5357,7 @@ mod seam_helper_tests {
         ));
         assert_eq!(
             super::moe_host_backing(
+                infr_core::config::AutoProfile::Conservative,
                 RamRequest::TotalProcessBudget(0),
                 Some((64 * GIB) as u64),
                 Some(0),
@@ -5332,6 +5368,7 @@ mod seam_helper_tests {
         );
         assert_eq!(
             super::moe_host_backing(
+                infr_core::config::AutoProfile::Conservative,
                 RamRequest::Bypass,
                 Some((64 * GIB) as u64),
                 Some(0),
@@ -5343,12 +5380,69 @@ mod seam_helper_tests {
     }
 
     #[test]
+    fn aggressive_moe_auto_spends_to_four_gib_only_for_a_complete_host_store() {
+        use infr_core::config::AutoProfile;
+        use infr_core::hostmem::RamRequest;
+
+        let payload = 24 * GIB;
+        assert_eq!(
+            super::moe_host_backing(
+                AutoProfile::Aggressive,
+                RamRequest::Auto,
+                Some((payload + 4 * GIB) as u64),
+                Some(0),
+                0,
+                payload,
+            ),
+            super::MoeHostBacking::Full,
+            "aggressive auto should remove SSD when the complete payload leaves four GiB"
+        );
+        assert!(matches!(
+            super::moe_host_backing(
+                AutoProfile::Aggressive,
+                RamRequest::Auto,
+                Some((payload + 4 * GIB - 1) as u64),
+                Some(0),
+                0,
+                payload,
+            ),
+            super::MoeHostBacking::Bounded { bytes } if bytes < payload
+        ));
+        assert!(matches!(
+            super::moe_host_backing(
+                AutoProfile::Conservative,
+                RamRequest::Auto,
+                Some((payload + 4 * GIB) as u64),
+                Some(0),
+                0,
+                payload,
+            ),
+            super::MoeHostBacking::Bounded { bytes } if bytes < payload
+        ));
+
+        let large_payload = 80 * GIB;
+        assert_eq!(
+            super::moe_host_backing(
+                AutoProfile::Aggressive,
+                RamRequest::Auto,
+                Some((40 * GIB) as u64),
+                Some(0),
+                0,
+                large_payload,
+            ),
+            super::MoeHostBacking::Bounded { bytes: 32 * GIB },
+            "below full fit, MoE must still use the selected profile's ordinary headroom"
+        );
+    }
+
+    #[test]
     fn moe_host_backing_resolves_total_ram_and_auto_requires_a_probe() {
         use infr_core::hostmem::RamRequest;
 
         let payload = 80 * GIB;
         assert_eq!(
             super::moe_host_backing(
+                infr_core::config::AutoProfile::Conservative,
                 RamRequest::TotalProcessBudget((50 * GIB) as u64),
                 Some((48 * GIB) as u64),
                 Some((2 * GIB) as u64),
@@ -5362,6 +5456,7 @@ mod seam_helper_tests {
         );
         assert_eq!(
             super::moe_host_backing(
+                infr_core::config::AutoProfile::Aggressive,
                 RamRequest::TotalProcessBudget((50 * GIB) as u64),
                 Some((48 * GIB) as u64),
                 Some((2 * GIB) as u64),
@@ -5374,7 +5469,14 @@ mod seam_helper_tests {
             "known fixed weights that have not been touched yet still count toward the process total"
         );
         assert_eq!(
-            super::moe_host_backing(RamRequest::Auto, None, Some(0), 0, payload),
+            super::moe_host_backing(
+                infr_core::config::AutoProfile::Aggressive,
+                RamRequest::Auto,
+                None,
+                Some(0),
+                0,
+                payload,
+            ),
             super::MoeHostBacking::Bounded { bytes: 0 },
             "auto sizing without a probe must not assume the whole payload fits RAM"
         );
