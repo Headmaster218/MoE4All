@@ -118,7 +118,7 @@ MTP 与非 MTP 的 usage 统计一致；带 stop 序列的请求行为与非 MTP
    ①索引偏移做 32 字节对齐而数据写循环连续写（源文件本身连续），从第一个非
    32 倍数张量起索引与数据累积漂移，全文件读出垃圾（`output.weight` 全零 →
    logits 恒定 → "!!!"）；②`down_proj` 多做了 `transpose(0,2,1)`（gate/up 没有）。
-   `graft_v3.py`（Temp）修复两者并带 753 张量字节级自检；MTPFIX2.gguf trunk
+   `scripts/graft_mtp_head.py`修复两者并带 753 张量字节级自检；MTPFIX2.gguf trunk
    输出质量回归通过（"391"），数值探针全部健康。
 7. **⚠️ 终审（09-02）：健康文件上嫁接头 α = 0.000 —— 根因改判：引擎的 paged-MoE 批量 verify 前向有正确性 bug**
    - 排除过程：graft 映射全表核对（19 张量形状与原始 blk.40 逐一吻合）→ router 恢复 F32
