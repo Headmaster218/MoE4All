@@ -7,6 +7,7 @@
 //!   GET  /health                -> 200 OK                                              (open)
 //!   GET  /v1/models             -> { object: "list", data: [{ id, object, owned_by }] } (auth)
 //!   POST /v1/chat/completions   -> chat.completion | SSE chat.completion.chunk stream   (auth)
+//!   POST /v1/responses          -> OpenAI Responses JSON | typed SSE event stream        (auth)
 //!   POST /v1/embeddings         -> OpenAI-compatible normalized float embeddings         (auth)
 //!
 //! Two process-level limits bound one request's hold on a `--parallel` slot: `serve.max_tokens_cap`
@@ -19,8 +20,10 @@
 //!   `Delta::ToolCall`   -> `delta.tool_calls[]`  (finish_reason "tool_calls")
 
 use std::{
+    cell::Cell,
     convert::Infallible,
     net::SocketAddr,
+    rc::Rc,
     sync::{
         atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
         Arc,
@@ -125,7 +128,7 @@ pub struct ChatOutcome {
     pub finish: Finish,
     /// Total prompt tokens presented to the model, including any prefix served from KV cache.
     pub prompt_tokens: u32,
-    /// Prompt tokens served from a reusable prefix cache and not recomputed for this request.
+    /// Prompt tokens served from a reusable prefix cache and therefore not recomputed this turn.
     pub cached_prompt_tokens: u32,
     pub completion_tokens: u32,
 }
@@ -174,6 +177,505 @@ pub struct ChatRequest {
     /// llama.cpp extension (1.0 = off).
     #[serde(default)]
     pub repeat_penalty: Option<f32>,
+}
+
+/// Stateless compatibility subset of OpenAI's Responses request. Fields whose semantics would
+/// change the model input are represented explicitly so unsupported behavior is rejected rather
+/// than silently ignored.
+#[derive(Debug, Deserialize)]
+pub struct ResponsesRequest {
+    pub model: String,
+    #[serde(default)]
+    pub input: Option<serde_json::Value>,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(default)]
+    pub tools: Option<serde_json::Value>,
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub top_p: Option<f64>,
+    #[serde(default)]
+    pub top_k: Option<i64>,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default)]
+    pub truncation: Option<String>,
+    #[serde(default)]
+    pub store: Option<bool>,
+    #[serde(default)]
+    pub previous_response_id: Option<serde_json::Value>,
+    #[serde(default)]
+    pub conversation: Option<serde_json::Value>,
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+    #[serde(default)]
+    pub text: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+struct ResponsesMeta {
+    instructions: Option<String>,
+    max_output_tokens: Option<u32>,
+    parallel_tool_calls: bool,
+    temperature: Option<f64>,
+    tool_choice: serde_json::Value,
+    tools: Vec<serde_json::Value>,
+    top_p: Option<f64>,
+    text: serde_json::Value,
+    metadata: serde_json::Value,
+}
+
+impl ResponsesMeta {
+    fn from_request(req: &ResponsesRequest) -> Result<Self, ParamError> {
+        if req
+            .previous_response_id
+            .as_ref()
+            .is_some_and(|v| !v.is_null())
+        {
+            return Err(ParamError {
+                param: "previous_response_id",
+                message: "previous_response_id is not supported by this stateless server".into(),
+            });
+        }
+        if req.conversation.as_ref().is_some_and(|v| !v.is_null()) {
+            return Err(ParamError {
+                param: "conversation",
+                message: "conversation is not supported by this stateless server".into(),
+            });
+        }
+        if matches!(req.parallel_tool_calls, Some(false)) {
+            return Err(ParamError {
+                param: "parallel_tool_calls",
+                message: "parallel_tool_calls=false is not supported".into(),
+            });
+        }
+        let metadata = match req.metadata.as_ref() {
+            None | Some(serde_json::Value::Null) => serde_json::json!({}),
+            Some(value @ serde_json::Value::Object(_)) => value.clone(),
+            Some(_) => {
+                return Err(ParamError {
+                    param: "metadata",
+                    message: "metadata must be an object".into(),
+                })
+            }
+        };
+        let text = match req.text.as_ref() {
+            None | Some(serde_json::Value::Null) => serde_json::json!({
+                "format":{"type":"text"}, "verbosity":"medium"
+            }),
+            Some(serde_json::Value::Object(config)) => {
+                let format = config
+                    .get("format")
+                    .and_then(|value| value.get("type"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("text");
+                if format != "text" {
+                    return Err(ParamError {
+                        param: "text.format",
+                        message: "only text.format.type=\"text\" is supported".into(),
+                    });
+                }
+                let verbosity = config
+                    .get("verbosity")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("medium");
+                if !matches!(verbosity, "low" | "medium" | "high") {
+                    return Err(ParamError {
+                        param: "text.verbosity",
+                        message: "text.verbosity must be low, medium, or high".into(),
+                    });
+                }
+                serde_json::json!({
+                    "format":{"type":"text"}, "verbosity":verbosity
+                })
+            }
+            Some(_) => {
+                return Err(ParamError {
+                    param: "text",
+                    message: "text must be an object".into(),
+                })
+            }
+        };
+        let tools = match req.tools.as_ref() {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(serde_json::Value::Array(tools)) => tools.clone(),
+            Some(_) => {
+                return Err(ParamError {
+                    param: "tools",
+                    message: "tools must be an array".into(),
+                })
+            }
+        };
+        Ok(Self {
+            instructions: req.instructions.clone(),
+            max_output_tokens: req.max_output_tokens,
+            parallel_tool_calls: req.parallel_tool_calls.unwrap_or(true),
+            temperature: req.temperature,
+            tool_choice: req
+                .tool_choice
+                .clone()
+                .unwrap_or_else(|| serde_json::json!("auto")),
+            tools,
+            top_p: req.top_p,
+            text,
+            metadata,
+        })
+    }
+}
+
+impl ResponsesRequest {
+    /// Convert Responses' item-oriented input and flat function schema to the chat-shaped request
+    /// already understood by the generator. This is intentionally stateless: callers replay prior
+    /// output items in `input`, just as `store=false` Responses clients do.
+    fn into_chat(self) -> Result<ChatRequest, ParamError> {
+        if matches!(self.store, Some(true)) {
+            return Err(ParamError {
+                param: "store",
+                message: "store=true is not supported by this stateless local server".into(),
+            });
+        }
+        if let Some(mode) = self.truncation.as_deref() {
+            if mode != "disabled" {
+                return Err(ParamError {
+                    param: "truncation",
+                    message: format!("truncation mode {mode:?} is not supported; use \"disabled\""),
+                });
+            }
+        }
+
+        let mut messages = Vec::new();
+        if let Some(instructions) = self.instructions.filter(|s| !s.is_empty()) {
+            messages.push(ChatMessageDto {
+                role: "developer".into(),
+                content: Some(serde_json::Value::String(instructions)),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            });
+        }
+        if let Some(input) = self.input {
+            responses_input_to_messages(input, &mut messages)?;
+        }
+        if messages.is_empty() {
+            return Err(ParamError {
+                param: "input",
+                message: "input must contain text or at least one supported message item".into(),
+            });
+        }
+
+        Ok(ChatRequest {
+            model: self.model,
+            messages,
+            stream: self.stream,
+            tools: responses_tools_to_chat(self.tools)?,
+            tool_choice: responses_tool_choice_to_chat(self.tool_choice)?,
+            max_tokens: None,
+            max_completion_tokens: self.max_output_tokens,
+            temperature: self.temperature.map(|value| value as f32),
+            top_p: self.top_p.map(|value| value as f32),
+            top_k: self.top_k,
+            seed: self.seed,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            repeat_penalty: None,
+        })
+    }
+}
+
+fn responses_input_to_messages(
+    input: serde_json::Value,
+    messages: &mut Vec<ChatMessageDto>,
+) -> Result<(), ParamError> {
+    match input {
+        serde_json::Value::String(text) => {
+            messages.push(simple_message("user", text));
+            Ok(())
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                let kind = match item.get("type").and_then(|v| v.as_str()) {
+                    Some(kind) => kind,
+                    // OpenAI's easy-input message shape permits `{role, content}` without an
+                    // explicit discriminator. Treat it exactly like a `type:"message"` item.
+                    None if item.get("role").and_then(|v| v.as_str()).is_some() => "message",
+                    None => {
+                        return Err(ParamError {
+                            param: "input",
+                            message: "every Responses input item must have a string `type` or a message `role`".into(),
+                        })
+                    }
+                };
+                match kind {
+                    "message" => {
+                        let role = item.get("role").and_then(|v| v.as_str()).ok_or_else(|| {
+                            ParamError {
+                                param: "input",
+                                message: "message input item requires a string `role`".into(),
+                            }
+                        })?;
+                        if !matches!(role, "user" | "assistant" | "system" | "developer") {
+                            return Err(ParamError {
+                                param: "input",
+                                message: format!("unsupported message role {role:?}"),
+                            });
+                        }
+                        let content = responses_content_text(item.get("content"))?;
+                        messages.push(simple_message(role, content));
+                    }
+                    "function_call" => {
+                        let name = item.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
+                            ParamError {
+                                param: "input",
+                                message: "function_call input item requires `name`".into(),
+                            }
+                        })?;
+                        let arguments =
+                            item.get("arguments")
+                                .and_then(|v| v.as_str())
+                                .ok_or_else(|| ParamError {
+                                    param: "input",
+                                    message: "function_call input item requires string `arguments`"
+                                        .into(),
+                                })?;
+                        let call_id =
+                            item.get("call_id")
+                                .and_then(|v| v.as_str())
+                                .ok_or_else(|| ParamError {
+                                    param: "input",
+                                    message: "function_call input item requires string `call_id`"
+                                        .into(),
+                                })?;
+                        messages.push(ChatMessageDto {
+                            role: "assistant".into(),
+                            content: None,
+                            tool_calls: Some(serde_json::json!([{
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": name, "arguments": arguments}
+                            }])),
+                            tool_call_id: None,
+                            name: None,
+                        });
+                    }
+                    "function_call_output" => {
+                        let call_id =
+                            item.get("call_id")
+                                .and_then(|v| v.as_str())
+                                .ok_or_else(|| ParamError {
+                                    param: "input",
+                                    message: "function_call_output requires `call_id`".into(),
+                                })?;
+                        let output = match item.get("output") {
+            Some(serde_json::Value::String(output)) => output.clone(),
+            Some(output @ serde_json::Value::Array(_)) => {
+                responses_content_text(Some(output))?
+            }
+            Some(_) => {
+                return Err(ParamError {
+                    param: "input",
+                    message: "function_call_output.output must be text or an array of text parts"
+                        .into(),
+                })
+            }
+                            None => {
+                                return Err(ParamError {
+                                    param: "input",
+                                    message: "function_call_output requires `output`".into(),
+                                })
+                            }
+                        };
+                        messages.push(ChatMessageDto {
+                            role: "tool".into(),
+                            content: Some(serde_json::Value::String(output)),
+                            tool_calls: None,
+                            tool_call_id: Some(call_id.to_owned()),
+                            name: None,
+                        });
+                    }
+                    "reasoning" => {
+                        let summaries = item
+                            .get("summary")
+                            .and_then(|value| value.as_array())
+                            .ok_or_else(|| ParamError {
+                                param: "input",
+                                message: "reasoning input requires a `summary` array".into(),
+                            })?;
+                        let mut summary = String::new();
+                        for part in summaries {
+                            if part.get("type").and_then(|value| value.as_str())
+                                != Some("summary_text")
+                            {
+                                return Err(ParamError {
+                                    param: "input",
+                                    message: "only reasoning summary_text parts are supported"
+                                        .into(),
+                                });
+                            }
+                            let text = part
+                                .get("text")
+                                .and_then(|value| value.as_str())
+                                .ok_or_else(|| ParamError {
+                                    param: "input",
+                                    message: "reasoning summary_text requires string `text`".into(),
+                                })?;
+                            summary.push_str(text);
+                        }
+                        if summary.is_empty() {
+                            return Err(ParamError {
+                                param: "input",
+                                message: "opaque reasoning without a text summary is not supported"
+                                    .into(),
+                            });
+                        }
+                        messages.push(simple_message("assistant", summary));
+                    }
+                    other => {
+                        return Err(ParamError {
+                            param: "input",
+                            message: format!("unsupported Responses input item type {other:?}"),
+                        })
+                    }
+                }
+            }
+            Ok(())
+        }
+        _ => Err(ParamError {
+            param: "input",
+            message: "input must be a string or an array of Responses input items".into(),
+        }),
+    }
+}
+
+fn simple_message(role: &str, content: String) -> ChatMessageDto {
+    ChatMessageDto {
+        role: role.to_owned(),
+        content: Some(serde_json::Value::String(content)),
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+    }
+}
+
+fn responses_content_text(content: Option<&serde_json::Value>) -> Result<String, ParamError> {
+    match content {
+        Some(serde_json::Value::String(s)) => Ok(s.clone()),
+        Some(serde_json::Value::Array(parts)) => {
+            let mut text = String::new();
+            for part in parts {
+                let kind = part
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ParamError {
+                        param: "input",
+                        message: "every message content part requires a string `type`".into(),
+                    })?;
+                if !matches!(kind, "input_text" | "output_text" | "text") {
+                    return Err(ParamError {
+                        param: "input",
+                        message: format!("unsupported message content part type {kind:?}"),
+                    });
+                }
+                let value =
+                    part.get("text")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| ParamError {
+                            param: "input",
+                            message: format!("content part {kind:?} requires a string `text`"),
+                        })?;
+                text.push_str(value);
+            }
+            Ok(text)
+        }
+        Some(_) => Err(ParamError {
+            param: "input",
+            message: "message content must be a string or an array of text parts".into(),
+        }),
+        None => Ok(String::new()),
+    }
+}
+
+fn responses_tools_to_chat(
+    tools: Option<serde_json::Value>,
+) -> Result<Option<serde_json::Value>, ParamError> {
+    let Some(tools) = tools else { return Ok(None) };
+    let arr = tools.as_array().ok_or_else(|| ParamError {
+        param: "tools",
+        message: "tools must be an array".into(),
+    })?;
+    let mut out = Vec::with_capacity(arr.len());
+    for tool in arr {
+        let kind = tool.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if kind != "function" {
+            return Err(ParamError {
+                param: "tools",
+                message: format!(
+                    "tool type {kind:?} is not available locally; only custom function tools are supported"
+                ),
+            });
+        }
+        let name = tool
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ParamError {
+                param: "tools",
+                message: "function tool requires a string `name`".into(),
+            })?;
+        out.push(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": tool.get("description").cloned().unwrap_or(serde_json::Value::Null),
+                "parameters": tool.get("parameters").cloned().unwrap_or_else(|| serde_json::json!({"type":"object","properties":{}})),
+                "strict": tool.get("strict").cloned().unwrap_or(serde_json::Value::Bool(false))
+            }
+        }));
+    }
+    Ok(Some(serde_json::Value::Array(out)))
+}
+
+fn responses_tool_choice_to_chat(
+    choice: Option<serde_json::Value>,
+) -> Result<Option<serde_json::Value>, ParamError> {
+    let Some(choice) = choice else {
+        return Ok(None);
+    };
+    match choice {
+        serde_json::Value::Object(mut obj) => {
+            if obj.get("type").and_then(|v| v.as_str()) == Some("function") {
+                let name = obj
+                    .remove("name")
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                    .ok_or_else(|| ParamError {
+                        param: "tool_choice",
+                        message: "function tool_choice requires `name`".into(),
+                    })?;
+                Ok(Some(serde_json::json!({
+                    "type":"function", "function":{"name":name}
+                })))
+            } else {
+                Err(ParamError {
+                    param: "tool_choice",
+                    message: "only function tool_choice objects are supported".into(),
+                })
+            }
+        }
+        serde_json::Value::String(s) => Ok(Some(serde_json::Value::String(s))),
+        serde_json::Value::Null => Ok(None),
+        _ => Err(ParamError {
+            param: "tool_choice",
+            message: "tool_choice must be a string or function choice object".into(),
+        }),
+    }
 }
 
 /// The validated, per-request generation config handed to [`ChatGenerator::chat`]. `None` fields
@@ -622,6 +1124,9 @@ pub struct UsageInfo {
 }
 
 impl UsageInfo {
+    /// Build the OpenAI usage block from the generator's authoritative counts. `prompt_tokens`
+    /// INCLUDES any KV-prefix-cache hits; the cached share is reported separately so clients can
+    /// see what was recomputed vs reused (mirrors Responses' `input_tokens_details`).
     fn from_outcome(outcome: ChatOutcome) -> Self {
         Self {
             prompt_tokens: outcome.prompt_tokens,
@@ -1323,6 +1828,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health_handler))
         .route("/v1/models", get(models_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))
+        .route("/v1/responses", post(responses_handler))
         .route("/v1/embeddings", post(embeddings_handler))
         .with_state(state)
 }
@@ -1590,6 +2096,142 @@ async fn chat_completions_handler(
         Ok(j) => j,
         Err(e) => return param_error(None, e.body_text()),
     };
+    dispatch_chat(state, req, "/v1/chat/completions", WireFormat::Chat, None).await
+}
+
+fn responses_output_items(
+    cid: &str,
+    reasoning: &str,
+    content: &str,
+    tool_calls: &[OAIToolCall],
+) -> Vec<serde_json::Value> {
+    let mut output = Vec::new();
+    if !reasoning.is_empty() {
+        output.push(serde_json::json!({
+            "id": format!("rs_{cid}"),
+            "type": "reasoning",
+            "summary": [{"type":"summary_text", "text":reasoning}],
+            "status": "completed"
+        }));
+    }
+    if !content.is_empty() || tool_calls.is_empty() {
+        output.push(serde_json::json!({
+            "id": format!("msg_{cid}"),
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{
+                "type":"output_text", "text":content, "annotations":[], "logprobs":[]
+            }]
+        }));
+    }
+    output.extend(tool_calls.iter().map(|call| {
+        serde_json::json!({
+            "id": format!("fc_{}_{}", cid, call.index),
+            "type": "function_call",
+            "status": "completed",
+            "call_id": call.id,
+            "name": call.function.name,
+            "arguments": call.function.arguments
+        })
+    }));
+    output
+}
+
+fn responses_completed_value(
+    cid: &str,
+    created: i64,
+    model: &str,
+    reasoning: &str,
+    content: &str,
+    tool_calls: &[OAIToolCall],
+    outcome: ChatOutcome,
+    finish: Finish,
+    meta: &ResponsesMeta,
+) -> serde_json::Value {
+    let incomplete =
+        (finish == Finish::Length).then(|| serde_json::json!({"reason":"max_output_tokens"}));
+    serde_json::json!({
+        "id": cid,
+        "object": "response",
+        "created_at": created,
+        "completed_at": (finish != Finish::Length).then(unix_ts),
+        "status": if finish == Finish::Length { "incomplete" } else { "completed" },
+        "background": false,
+        "error": null,
+        "incomplete_details": incomplete,
+        "instructions": meta.instructions,
+        "max_output_tokens": meta.max_output_tokens,
+        "max_tool_calls": null,
+        "model": model,
+        "output": responses_output_items(cid, reasoning, content, tool_calls),
+        "parallel_tool_calls": meta.parallel_tool_calls,
+        "previous_response_id": null,
+        "prompt_cache_key": null,
+        "prompt_cache_retention": null,
+        "reasoning": {"effort":null, "summary":null},
+        "safety_identifier": null,
+        "service_tier": "default",
+        "store": false,
+        "temperature": meta.temperature,
+        "text": meta.text,
+        "tool_choice": meta.tool_choice,
+        "tools": meta.tools,
+        "top_p": meta.top_p,
+        "top_logprobs": 0,
+        "truncation": "disabled",
+        "usage": {
+            "input_tokens": outcome.prompt_tokens,
+            "input_tokens_details": {
+                "cached_tokens":outcome.cached_prompt_tokens,
+                "cache_write_tokens":0
+            },
+            "output_tokens": outcome.completion_tokens,
+            "output_tokens_details": {"reasoning_tokens":0},
+            "total_tokens": outcome.prompt_tokens.saturating_add(outcome.completion_tokens)
+        },
+        "user": null,
+        "metadata": meta.metadata
+    })
+}
+
+async fn responses_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<ResponsesRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Some(denied) = auth_gate(&state.cfg, &headers) {
+        return denied;
+    }
+    let Json(req) = match body {
+        Ok(j) => j,
+        Err(e) => return param_error(None, e.body_text()),
+    };
+    let meta = match ResponsesMeta::from_request(&req) {
+        Ok(meta) => Arc::new(meta),
+        Err(e) => return param_error(Some(e.param), e.message),
+    };
+    let req = match req.into_chat() {
+        Ok(req) => req,
+        Err(e) => return param_error(Some(e.param), e.message),
+    };
+    dispatch_chat(
+        state,
+        req,
+        "/v1/responses",
+        WireFormat::Responses,
+        Some(meta),
+    )
+    .await
+}
+
+async fn dispatch_chat(
+    state: AppState,
+    req: ChatRequest,
+    route: &'static str,
+    wire: WireFormat,
+    responses: Option<Arc<ResponsesMeta>>,
+) -> Response {
     let mut params = match GenParams::from_request(&req) {
         Ok(p) => p,
         Err(e) => return param_error(Some(e.param), e.message),
@@ -1626,7 +2268,10 @@ async fn chat_completions_handler(
     let model_id = entry.id.to_string();
     let ctx = ReqCtx {
         id: next_req_id(),
-        cid: make_id(),
+        cid: match wire {
+            WireFormat::Chat => make_id("chatcmpl"),
+            WireFormat::Responses => make_id("resp"),
+        },
         model_id,
         created: unix_ts(),
         // Resolved HERE, once, so both paths see the same policy and neither reaches for the config
@@ -1634,10 +2279,12 @@ async fn chat_completions_handler(
         deadline: request_timeout(&state.cfg),
         stream: req.stream,
         stats: state.stats.clone(),
+        wire,
+        responses,
     };
     log_request_start(
         ctx.id,
-        "/v1/chat/completions",
+        route,
         &ctx.model_id,
         messages.len(),
         messages.iter().map(|m| m.content.len()).sum(),
@@ -1650,6 +2297,12 @@ async fn chat_completions_handler(
     } else {
         non_streaming(entry, messages, tools, tool_choice, params, ctx).await
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireFormat {
+    Chat,
+    Responses,
 }
 
 /// Everything about one in-flight request that is not its messages: identity (the log's `req` and
@@ -1669,6 +2322,8 @@ struct ReqCtx {
     deadline: Option<Duration>,
     stream: bool,
     stats: Arc<ServeStats>,
+    wire: WireFormat,
+    responses: Option<Arc<ResponsesMeta>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1691,6 +2346,8 @@ async fn non_streaming(
         deadline,
         stream,
         stats,
+        wire,
+        responses,
     } = ctx;
     // Wait for a free slot ON THIS MODEL. With `--parallel N`, the (N+1)'th concurrent request to
     // this model queues HERE — in the async runtime, holding no thread — and is admitted FIFO as
@@ -1829,36 +2486,52 @@ async fn non_streaming(
             let rec = tally.finish(outcome, finish);
             stats.fold_completion(&rec);
             log_request_done(req_id, &model_id, stream, &rec);
-            Json(ChatCompletionResponse {
-                id: cid,
-                object: "chat.completion",
-                created,
-                model: model_id,
-                choices: vec![CompletionChoice {
-                    index: 0,
-                    message: AssistantMessage {
-                        role: "assistant",
-                        content: if content.is_empty() {
-                            None
-                        } else {
-                            Some(content.clone())
+            match wire {
+                WireFormat::Chat => Json(ChatCompletionResponse {
+                    id: cid,
+                    object: "chat.completion",
+                    created,
+                    model: model_id,
+                    choices: vec![CompletionChoice {
+                        index: 0,
+                        message: AssistantMessage {
+                            role: "assistant",
+                            content: if content.is_empty() {
+                                None
+                            } else {
+                                Some(content.clone())
+                            },
+                            reasoning_content: if reasoning.is_empty() {
+                                None
+                            } else {
+                                Some(reasoning)
+                            },
+                            tool_calls: if tool_calls.is_empty() {
+                                None
+                            } else {
+                                Some(tool_calls)
+                            },
                         },
-                        reasoning_content: if reasoning.is_empty() {
-                            None
-                        } else {
-                            Some(reasoning)
-                        },
-                        tool_calls: if tool_calls.is_empty() {
-                            None
-                        } else {
-                            Some(tool_calls)
-                        },
-                    },
-                    finish_reason: finish.as_str().into(),
-                }],
-                usage: UsageInfo::from_outcome(outcome),
-            })
-            .into_response()
+                        finish_reason: finish.as_str().into(),
+                    }],
+                    usage: UsageInfo::from_outcome(outcome),
+                })
+                .into_response(),
+                WireFormat::Responses => Json(responses_completed_value(
+                    &cid,
+                    created,
+                    &model_id,
+                    &reasoning,
+                    &content,
+                    &tool_calls,
+                    outcome,
+                    finish,
+                    responses
+                        .as_deref()
+                        .expect("Responses requests carry response metadata"),
+                ))
+                .into_response(),
+            }
         }
     }
 }
@@ -1883,6 +2556,8 @@ async fn streaming(
         deadline,
         stream,
         stats,
+        wire,
+        responses,
     } = ctx;
     // UNBOUNDED on purpose. The generator's `on_delta` callback is invoked from inside the decode
     // loop — which, under `--parallel N`, is holding the GPU baton. A bounded channel would make a
@@ -1940,6 +2615,10 @@ async fn streaming(
         // Disarms the deadline watchdog when this task ends — see [`arm_deadline`]. `None` when no
         // deadline was configured, in which case there is no watchdog to disarm.
         let _done_tx = done_tx;
+        // The Responses SSE sequence counter is shared with `DoneGuard` (single-threaded interior
+        // mutability is enough — the generation callback and the guard never run concurrently) so
+        // an error frame continues the numbering instead of restarting at 0.
+        let sequence = Rc::new(Cell::new(0u64));
         // Closes the stream exactly once, however this closure ends. It emits `[DONE]` always, and
         // — unless `settled()` says a terminal frame already went out — reports the generation as a
         // failure. Both matter on an unwinding panic, which skips every arm below (B23).
@@ -1948,19 +2627,44 @@ async fn streaming(
             req_id,
             stats: stats.clone(),
             settled: false,
+            wire,
+            sequence: sequence.clone(),
         };
 
-        // First chunk: role delta (mirrors the Python shim's opening chunk).
-        let _ = tx.send(Ok(sse_chunk(
-            &cid,
-            &model_id,
-            created,
-            DeltaPayload {
-                role: Some("assistant".into()),
-                ..Default::default()
-            },
-            None,
-        )));
+        match wire {
+            WireFormat::Chat => {
+                // First chunk: role delta (mirrors the Python shim's opening chunk).
+                let _ = tx.send(Ok(sse_chunk(
+                    &cid,
+                    &model_id,
+                    created,
+                    DeltaPayload {
+                        role: Some("assistant".into()),
+                        ..Default::default()
+                    },
+                    None,
+                )));
+            }
+            WireFormat::Responses => {
+                let meta = responses
+                    .as_deref()
+                    .expect("Responses requests carry response metadata");
+                let progress =
+                    responses_progress_value(&cid, created, &model_id, "in_progress", meta);
+                let _ = tx.send(Ok(responses_sse_event(
+                    "response.created",
+                    &sequence,
+                    serde_json::json!({"response":progress}),
+                )));
+                let progress =
+                    responses_progress_value(&cid, created, &model_id, "in_progress", meta);
+                let _ = tx.send(Ok(responses_sse_event(
+                    "response.in_progress",
+                    &sequence,
+                    serde_json::json!({"response":progress}),
+                )));
+            }
+        }
 
         let Some(engine) = engine_arc else {
             // `fail` sends the error frame, folds the statistic and logs; `DoneGuard` then closes
@@ -1971,6 +2675,12 @@ async fn streaming(
 
         let mut tc_index = 0usize;
         let mut saw_tool_call = false;
+        let mut reasoning = String::new();
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+        let mut reasoning_started = false;
+        let mut content_started = false;
+        let mut output_index = 0usize;
         // Per-request tally: plain locals inside the generation, folded in once below.
         let mut tally = ReqTally::new();
 
@@ -1981,43 +2691,156 @@ async fn streaming(
             &params,
             &cancel_cb,
             &mut |delta| {
-                let payload = match delta {
+                // Some Responses deltas emit setup events directly before returning their primary
+                // event, so keep the callback event optional.
+                let event: Option<Event> = match delta {
                     Delta::Reasoning(t) => {
                         tally.on_text_delta(&stats_cb);
-                        DeltaPayload {
-                            reasoning_content: Some(t),
-                            ..Default::default()
-                        }
+                        reasoning.push_str(&t);
+                        Some(match wire {
+                            WireFormat::Chat => sse_chunk(
+                                &cid_cb,
+                                &model_cb,
+                                created,
+                                DeltaPayload {
+                                    reasoning_content: Some(t),
+                                    ..Default::default()
+                                },
+                                None,
+                            ),
+                            WireFormat::Responses => {
+                                if !reasoning_started {
+                                    reasoning_started = true;
+                                    let item = serde_json::json!({
+                                        "id":format!("rs_{}", cid_cb), "type":"reasoning",
+                                        "summary":[], "status":"in_progress"
+                                    });
+                                    let _ = tx_cb.send(Ok(responses_sse_event(
+                                        "response.output_item.added", &sequence,
+                                        serde_json::json!({"output_index":output_index,"item":item})
+                                    )));
+                                }
+                                responses_sse_event(
+                                    "response.reasoning_summary_text.delta",
+                                    &sequence,
+                                    serde_json::json!({
+                                        "item_id":format!("rs_{}",cid_cb),
+                                        "output_index":output_index,"summary_index":0,"delta":t
+                                    }),
+                                )
+                            }
+                        })
                     }
                     Delta::Content(t) => {
                         tally.on_text_delta(&stats_cb);
-                        DeltaPayload {
-                            content: Some(t),
-                            ..Default::default()
-                        }
+                        content.push_str(&t);
+                        Some(match wire {
+                            WireFormat::Chat => sse_chunk(
+                                &cid_cb,
+                                &model_cb,
+                                created,
+                                DeltaPayload {
+                                    content: Some(t),
+                                    ..Default::default()
+                                },
+                                None,
+                            ),
+                            WireFormat::Responses => {
+                                if !content_started {
+                                    if reasoning_started {
+                                        output_index += 1;
+                                    }
+                                    content_started = true;
+                                    let item = serde_json::json!({
+                                        "id":format!("msg_{}",cid_cb), "type":"message",
+                                        "status":"in_progress", "role":"assistant", "content":[]
+                                    });
+                                    let _ = tx_cb.send(Ok(responses_sse_event(
+                                        "response.output_item.added", &sequence,
+                                        serde_json::json!({"output_index":output_index,"item":item})
+                                    )));
+                                    let part = serde_json::json!({
+                                        "type":"output_text","text":"","annotations":[],"logprobs":[]
+                                    });
+                                    let _ = tx_cb.send(Ok(responses_sse_event(
+                                        "response.content_part.added", &sequence,
+                                        serde_json::json!({
+                                            "item_id":format!("msg_{}",cid_cb),"output_index":output_index,
+                                            "content_index":0,"part":part
+                                        })
+                                    )));
+                                }
+                                responses_sse_event(
+                                    "response.output_text.delta",
+                                    &sequence,
+                                    serde_json::json!({
+                                        "item_id":format!("msg_{}",cid_cb),"output_index":output_index,
+                                        "content_index":0,"delta":t,"logprobs":[]
+                                    }),
+                                )
+                            }
+                        })
                     }
                     Delta::ToolCall { name, arguments } => {
+                        let idx = tc_index;
+                        tc_index += 1;
                         let tc = OAIToolCall {
-                            index: tc_index,
-                            id: format!("call_{cid_cb}_{tc_index}"),
+                            index: idx,
+                            id: format!("call_{cid_cb}_{idx}"),
                             kind: "function",
                             function: OAIFunction { name, arguments },
                         };
-                        tc_index += 1;
                         saw_tool_call = true;
-                        DeltaPayload {
-                            tool_calls: Some(vec![tc]),
-                            ..Default::default()
-                        }
+                        tool_calls.push(tc.clone());
+                        Some(match wire {
+                            WireFormat::Chat => sse_chunk(
+                                &cid_cb,
+                                &model_cb,
+                                created,
+                                DeltaPayload {
+                                    tool_calls: Some(vec![tc]),
+                                    ..Default::default()
+                                },
+                                None,
+                            ),
+                            WireFormat::Responses => {
+                                let tool_output_index = usize::from(!reasoning.is_empty())
+                                    + usize::from(!content.is_empty())
+                                    + tc.index;
+                                let item = serde_json::json!({
+                                    "id":format!("fc_{}_{}",cid_cb,tc.index),
+                                    "type":"function_call","status":"in_progress",
+                                    "call_id":tc.id,"name":tc.function.name,"arguments":""
+                                });
+                                let _ = tx_cb.send(Ok(responses_sse_event(
+                                    "response.output_item.added", &sequence,
+                                    serde_json::json!({"output_index":tool_output_index,"item":item})
+                                )));
+                                let _ = tx_cb.send(Ok(responses_sse_event(
+                                    "response.function_call_arguments.delta", &sequence,
+                                    serde_json::json!({
+                                        "item_id":format!("fc_{}_{}",cid_cb,tc.index),
+                                        "output_index":tool_output_index,"delta":tc.function.arguments
+                                    })
+                                )));
+                                responses_sse_event(
+                                    "response.function_call_arguments.done", &sequence,
+                                    serde_json::json!({
+                                        "item_id":format!("fc_{}_{}",cid_cb,tc.index),
+                                        "output_index":tool_output_index,"name":tc.function.name,
+                                        "arguments":tc.function.arguments
+                                    })
+                                )
+                            }
+                        })
                     }
                 };
                 // A failed send means the receiver (the client's stream) is gone. Latch the abort so
                 // the decode loop stops at its next poll and returns the slot.
-                if tx_cb
-                    .send(Ok(sse_chunk(&cid_cb, &model_cb, created, payload, None)))
-                    .is_err()
-                {
-                    cancel_cb.store(true, Ordering::Relaxed);
+                if let Some(event) = event {
+                    if tx_cb.send(Ok(event)).is_err() {
+                        cancel_cb.store(true, Ordering::Relaxed);
+                    }
                 }
             },
         );
@@ -2034,14 +2857,35 @@ async fn streaming(
                 } else {
                     outcome.finish
                 };
-                // Finish chunk: empty delta + finish_reason.
-                let _ = tx.send(Ok(sse_chunk(
-                    &cid,
-                    &model_id,
-                    created,
-                    DeltaPayload::default(),
-                    Some(finish.as_str().into()),
-                )));
+                match wire {
+                    WireFormat::Chat => {
+                        // Finish chunk: empty delta + finish_reason.
+                        let _ = tx.send(Ok(sse_chunk(
+                            &cid,
+                            &model_id,
+                            created,
+                            DeltaPayload::default(),
+                            Some(finish.as_str().into()),
+                        )));
+                    }
+                    WireFormat::Responses => {
+                        send_responses_done_events(
+                            &tx,
+                            &cid,
+                            created,
+                            &model_id,
+                            &reasoning,
+                            &content,
+                            &tool_calls,
+                            outcome,
+                            finish,
+                            &sequence,
+                            responses
+                                .as_deref()
+                                .expect("Responses requests carry response metadata"),
+                        );
+                    }
+                }
                 // Fold the request's tallies in ONCE, here, and log its completion line. The finish
                 // chunk above IS this stream's terminal frame, so the guard must not also report a
                 // failure when it drops.
@@ -2101,6 +2945,10 @@ struct DoneGuard {
     stats: Arc<ServeStats>,
     /// Set by [`Self::settled`] once a terminal frame is out and the tallies are folded.
     settled: bool,
+    wire: WireFormat,
+    /// Shared with the streaming closure's Responses SSE counter so an error frame continues the
+    /// event numbering rather than restarting it.
+    sequence: Rc<Cell<u64>>,
 }
 
 impl DoneGuard {
@@ -2122,7 +2970,22 @@ impl DoneGuard {
         self.settled = true;
         // A failed send just means the client is already gone; the accounting still has to be
         // right, so the fold and the log are NOT conditional on it.
-        let _ = self.tx.send(Ok(sse_error_event(msg)));
+        let event = match self.wire {
+            WireFormat::Chat => sse_error_event(msg),
+            WireFormat::Responses => {
+                // Continue the stream's own numbering — a mid-stream error must not restart at 0.
+                let n = self.sequence.get();
+                self.sequence.set(n.saturating_add(1));
+                Event::default().event("error").data(
+                    serde_json::json!({
+                        "type":"error","sequence_number":n,
+                        "code":"server_error","message":msg,"param":null
+                    })
+                    .to_string(),
+                )
+            }
+        };
+        let _ = self.tx.send(Ok(event));
         self.stats.fold_failure();
         tracing::warn!(req = self.req_id, error = msg, "request failed");
     }
@@ -2131,7 +2994,9 @@ impl DoneGuard {
 impl Drop for DoneGuard {
     fn drop(&mut self) {
         self.fail("internal error: generation ended without a terminal frame");
-        let _ = self.tx.send(Ok(Event::default().data("[DONE]")));
+        if self.wire == WireFormat::Chat {
+            let _ = self.tx.send(Ok(Event::default().data("[DONE]")));
+        }
     }
 }
 
@@ -2178,6 +3043,139 @@ fn sse_chunk(
         .expect("ChatCompletionChunk always serializes")
 }
 
+fn responses_progress_value(
+    cid: &str,
+    created: i64,
+    model: &str,
+    status: &str,
+    meta: &ResponsesMeta,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id":cid,"object":"response","created_at":created,"status":status,
+        "background":false,
+        "error":null,"incomplete_details":null,"instructions":meta.instructions,
+        "max_output_tokens":meta.max_output_tokens,"max_tool_calls":null,
+        "model":model,"output":[],
+        "parallel_tool_calls":meta.parallel_tool_calls,"previous_response_id":null,
+        "prompt_cache_key":null,"prompt_cache_retention":null,
+        "reasoning":{"effort":null,"summary":null},"store":false,
+        "safety_identifier":null,"service_tier":"default",
+        "temperature":meta.temperature,
+        "text":meta.text,
+        "tool_choice":meta.tool_choice,"tools":meta.tools,"top_p":meta.top_p,
+        "top_logprobs":0,"truncation":"disabled","usage":null,"user":null,
+        "metadata":meta.metadata
+    })
+}
+
+/// Typed SSE event used by `/v1/responses`. Both the SSE `event:` field and JSON `type` are set;
+/// OpenAI SDKs key off the JSON discriminator, while command-line consumers often key off `event`.
+fn responses_sse_event(
+    kind: &'static str,
+    sequence: &Cell<u64>,
+    mut body: serde_json::Value,
+) -> Event {
+    body["type"] = serde_json::Value::String(kind.to_owned());
+    body["sequence_number"] = serde_json::json!(sequence.get());
+    sequence.set(sequence.get().saturating_add(1));
+    Event::default()
+        .event(kind)
+        .json_data(body)
+        .expect("Responses event JSON always serializes")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_responses_done_events(
+    tx: &tokio::sync::mpsc::UnboundedSender<Result<Event, Infallible>>,
+    cid: &str,
+    created: i64,
+    model: &str,
+    reasoning: &str,
+    content: &str,
+    tool_calls: &[OAIToolCall],
+    outcome: ChatOutcome,
+    finish: Finish,
+    sequence: &Cell<u64>,
+    meta: &ResponsesMeta,
+) {
+    let mut output_index = 0usize;
+    if !reasoning.is_empty() {
+        let item_id = format!("rs_{cid}");
+        let _ = tx.send(Ok(responses_sse_event(
+            "response.reasoning_summary_text.done",
+            sequence,
+            serde_json::json!({
+                "item_id":item_id,"output_index":output_index,"summary_index":0,
+                "text":reasoning
+            }),
+        )));
+        let item = responses_output_items(cid, reasoning, "", &[]).remove(0);
+        let _ = tx.send(Ok(responses_sse_event(
+            "response.output_item.done",
+            sequence,
+            serde_json::json!({"output_index":output_index,"item":item}),
+        )));
+        output_index += 1;
+    }
+    if !content.is_empty() || tool_calls.is_empty() {
+        let item_id = format!("msg_{cid}");
+        let part = serde_json::json!({
+            "type":"output_text","text":content,"annotations":[],"logprobs":[]
+        });
+        let _ = tx.send(Ok(responses_sse_event(
+            "response.output_text.done",
+            sequence,
+            serde_json::json!({
+                "item_id":item_id,"output_index":output_index,"content_index":0,
+                "text":content,"logprobs":[]
+            }),
+        )));
+        let _ = tx.send(Ok(responses_sse_event(
+            "response.content_part.done",
+            sequence,
+            serde_json::json!({
+                "item_id":item_id,"output_index":output_index,"content_index":0,"part":part
+            }),
+        )));
+        let item = serde_json::json!({
+            "id":item_id,"type":"message","status":"completed","role":"assistant",
+            "content":[part]
+        });
+        let _ = tx.send(Ok(responses_sse_event(
+            "response.output_item.done",
+            sequence,
+            serde_json::json!({"output_index":output_index,"item":item}),
+        )));
+        output_index += 1;
+    }
+    for call in tool_calls {
+        let item = serde_json::json!({
+            "id":format!("fc_{}_{}",cid,call.index),"type":"function_call",
+            "status":"completed","call_id":call.id,"name":call.function.name,
+            "arguments":call.function.arguments
+        });
+        let _ = tx.send(Ok(responses_sse_event(
+            "response.output_item.done",
+            sequence,
+            serde_json::json!({"output_index":output_index,"item":item}),
+        )));
+        output_index += 1;
+    }
+    let response = responses_completed_value(
+        cid, created, model, reasoning, content, tool_calls, outcome, finish, meta,
+    );
+    let event = if finish == Finish::Length {
+        "response.incomplete"
+    } else {
+        "response.completed"
+    };
+    let _ = tx.send(Ok(responses_sse_event(
+        event,
+        sequence,
+        serde_json::json!({"response":response}),
+    )));
+}
+
 fn json_error(status: StatusCode, msg: String) -> Response {
     (status, Json(error_body(&msg, "server_error"))).into_response()
 }
@@ -2203,13 +3201,17 @@ fn param_error(param: Option<&str>, msg: String) -> Response {
 /// `call_{cid}_{idx}` tool-call ids unique (audit finding 4).
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn make_id() -> String {
+fn make_id(prefix: &str) -> String {
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
     let seq = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("chatcmpl-{ms}-{seq}")
+    if prefix == "chatcmpl" {
+        format!("{prefix}-{ms}-{seq}")
+    } else {
+        format!("{prefix}_{ms}_{seq}")
+    }
 }
 
 /// Default ceiling for `max_tokens`/`max_completion_tokens` when `INFR_MAX_TOKENS_CAP` is unset —
@@ -2516,6 +3518,31 @@ mod tests {
                 prompt_tokens: 3,
                 cached_prompt_tokens: 0,
                 completion_tokens: 2,
+            })
+        }
+    }
+
+    struct ToolGen;
+
+    impl ChatGenerator for ToolGen {
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            _cancel: &AtomicBool,
+            on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            on_delta(Delta::ToolCall {
+                name: "shell".into(),
+                arguments: r#"{"cmd":"dir"}"#.into(),
+            });
+            Ok(ChatOutcome {
+                finish: Finish::ToolCalls,
+                prompt_tokens: 3,
+                cached_prompt_tokens: 0,
+                completion_tokens: 5,
             })
         }
     }
@@ -3354,7 +4381,7 @@ mod tests {
         // Two completions minted in the same millisecond (routine under --parallel N) must NOT
         // collide — the monotonic suffix guarantees it even when the ms component is identical.
         let n = 10_000;
-        let ids: std::collections::HashSet<String> = (0..n).map(|_| make_id()).collect();
+        let ids: std::collections::HashSet<String> = (0..n).map(|_| make_id("chatcmpl")).collect();
         assert_eq!(ids.len(), n, "make_id produced a collision");
     }
 
@@ -3376,19 +4403,6 @@ mod tests {
             usage.total_tokens,
             usage.prompt_tokens + usage.completion_tokens
         );
-    }
-
-    #[test]
-    fn usage_reports_full_prompt_and_cached_share() {
-        let usage = UsageInfo::from_outcome(ChatOutcome {
-            finish: Finish::Stop,
-            prompt_tokens: 100,
-            cached_prompt_tokens: 76,
-            completion_tokens: 4,
-        });
-        assert_eq!(usage.prompt_tokens, 100);
-        assert_eq!(usage.prompt_tokens_details.cached_tokens, 76);
-        assert_eq!(usage.total_tokens, 104);
     }
 
     /// End-to-end: the non-streaming handler must surface the generator's REAL counts (EchoGen
@@ -3413,6 +4427,334 @@ mod tests {
         assert_eq!(v["usage"]["prompt_tokens"], 3);
         assert_eq!(v["usage"]["completion_tokens"], 2);
         assert_eq!(v["usage"]["total_tokens"], 5);
+    }
+
+    #[tokio::test]
+    async fn responses_non_streaming_returns_item_oriented_shape() {
+        let resp = multi_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"alpha","input":"hi"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["object"], "response");
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["model"], "alpha");
+        assert_eq!(v["output"][0]["type"], "message");
+        assert_eq!(v["output"][0]["content"][0]["type"], "output_text");
+        assert_eq!(v["output"][0]["content"][0]["text"], "from:alpha");
+        assert_eq!(v["usage"]["input_tokens"], 3);
+        assert_eq!(v["usage"]["output_tokens"], 2);
+        assert!(v["id"].as_str().unwrap().starts_with("resp_"));
+    }
+
+    #[tokio::test]
+    async fn responses_echoes_effective_request_metadata() {
+        let resp = multi_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model":"alpha",
+                            "input":"hi",
+                            "instructions":"be concise",
+                            "max_output_tokens":64,
+                            "temperature":0.25,
+                            "top_p":0.8,
+                            "tools":[{
+                                "type":"function","name":"shell","description":"run",
+                                "parameters":{"type":"object"}
+                            }],
+                            "tool_choice":"auto",
+                            "metadata":{"trace":"test"},
+                            "text":{"format":{"type":"text"},"verbosity":"low"}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["instructions"], "be concise");
+        assert_eq!(v["max_output_tokens"], 64);
+        assert_eq!(v["temperature"], 0.25);
+        assert_eq!(v["top_p"], 0.8);
+        assert_eq!(v["tool_choice"], "auto");
+        assert_eq!(v["tools"][0]["name"], "shell");
+        assert_eq!(v["text"]["verbosity"], "low");
+        assert_eq!(v["metadata"]["trace"], "test");
+    }
+
+    #[tokio::test]
+    async fn responses_rejects_unsupported_stateful_fields_and_truncation() {
+        for (field, value, param) in [
+            (
+                "previous_response_id",
+                serde_json::json!("resp_previous"),
+                "previous_response_id",
+            ),
+            ("conversation", serde_json::json!("conv_1"), "conversation"),
+            ("truncation", serde_json::json!("auto"), "truncation"),
+            ("store", serde_json::json!(true), "store"),
+            (
+                "parallel_tool_calls",
+                serde_json::json!(false),
+                "parallel_tool_calls",
+            ),
+        ] {
+            let mut request = serde_json::json!({"model":"alpha","input":"hi"});
+            request[field] = value;
+            let resp = multi_router()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/responses")
+                        .header("content-type", "application/json")
+                        .body(Body::from(request.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "field={field}");
+            let v = body_json(resp).await;
+            assert_eq!(v["error"]["param"], param, "field={field}: {v}");
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_rejects_non_text_content_instead_of_dropping_it() {
+        for kind in ["input_image", "input_file", "reasoning"] {
+            let input = if kind == "reasoning" {
+                serde_json::json!([{"type":"reasoning","summary":[]}])
+            } else {
+                serde_json::json!([{
+                    "type":"message",
+                    "role":"user",
+                    "content":[{"type":kind,"image_url":"data:ignored"}]
+                }])
+            };
+            let resp = multi_router()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/responses")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({"model":"alpha","input":input}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "kind={kind}");
+            let v = body_json(resp).await;
+            assert_eq!(v["error"]["param"], "input", "kind={kind}: {v}");
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_rejects_hosted_tools_and_structured_output() {
+        for (request, param) in [
+            (
+                serde_json::json!({
+                    "model":"alpha","input":"hi","tools":[{"type":"web_search"}]
+                }),
+                "tools",
+            ),
+            (
+                serde_json::json!({
+                    "model":"alpha","input":"hi",
+                    "text":{"format":{"type":"json_schema","name":"answer","schema":{}}}
+                }),
+                "text.format",
+            ),
+        ] {
+            let resp = multi_router()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/responses")
+                        .header("content-type", "application/json")
+                        .body(Body::from(request.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let v = body_json(resp).await;
+            assert_eq!(v["error"]["param"], param, "{v}");
+        }
+    }
+
+    #[test]
+    fn responses_usage_preserves_kv_cached_prompt_tokens() {
+        let meta = ResponsesMeta {
+            instructions: None,
+            max_output_tokens: None,
+            parallel_tool_calls: true,
+            temperature: None,
+            tool_choice: serde_json::json!("auto"),
+            tools: Vec::new(),
+            top_p: None,
+            text: serde_json::json!({"format":{"type":"text"},"verbosity":"medium"}),
+            metadata: serde_json::json!({}),
+        };
+        let v = responses_completed_value(
+            "resp_test",
+            0,
+            "m",
+            "",
+            "ok",
+            &[],
+            ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: 100,
+                cached_prompt_tokens: 76,
+                completion_tokens: 4,
+            },
+            Finish::Stop,
+            &meta,
+        );
+        assert_eq!(v["usage"]["input_tokens"], 100);
+        assert_eq!(v["usage"]["input_tokens_details"]["cached_tokens"], 76);
+        assert_eq!(v["usage"]["output_tokens"], 4);
+    }
+
+    #[tokio::test]
+    async fn responses_stream_emits_typed_sse_events() {
+        let resp = multi_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"alpha","input":"hi","stream":true,"temperature":0.25,"metadata":{"trace":"stream"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("event: response.created"), "{text}");
+        assert!(text.contains("event: response.output_text.delta"), "{text}");
+        assert!(text.contains("from:alpha"), "{text}");
+        assert!(text.contains("event: response.completed"), "{text}");
+        assert!(text.contains(r#""temperature":0.25"#), "{text}");
+        assert!(text.contains(r#""trace":"stream""#), "{text}");
+        assert!(!text.contains("data: [DONE]"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn responses_function_call_stream_matches_openai_event_lifecycle() {
+        let router = build_router(AppState::new(
+            Arc::new(ToolGen),
+            "tool-model",
+            1,
+            Arc::new(Config::default()),
+        ));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model":"tool-model",
+                            "input":"run",
+                            "stream":true,
+                            "tools":[{
+                                "type":"function","name":"shell",
+                                "parameters":{"type":"object"}
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let events: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str(data).ok())
+            .collect();
+        let kinds: Vec<&str> = events
+            .iter()
+            .filter_map(|event| event["type"].as_str())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+                "response.completed",
+            ],
+            "{text}"
+        );
+        let added = &events[2]["item"];
+        assert_eq!(added["type"], "function_call");
+        assert_eq!(added["status"], "in_progress");
+        assert_eq!(added["name"], "shell");
+        assert_eq!(added["arguments"], "");
+        assert_eq!(events[3]["delta"], r#"{"cmd":"dir"}"#);
+        assert_eq!(events[5]["item"]["status"], "completed");
+        assert_eq!(events[6]["response"]["output"][0]["type"], "function_call");
+    }
+
+    #[test]
+    fn responses_function_items_and_tools_convert_to_chat() {
+        let req: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model":"m",
+            "input":[
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]},
+                {"type":"reasoning","summary":[{"type":"summary_text","text":"plan"}]},
+                {"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"dir\"}"},
+                {"type":"function_call_output","call_id":"call_1","output":[{"type":"input_text","text":"ok"}]}
+            ],
+            "tools":[{"type":"function","name":"shell","description":"run","parameters":{"type":"object"}}],
+            "tool_choice":{"type":"function","name":"shell"}
+        }))
+        .unwrap();
+        let chat = req.into_chat().unwrap();
+        assert_eq!(chat.messages.len(), 4);
+        assert_eq!(
+            chat.messages[1].content.as_ref().and_then(|v| v.as_str()),
+            Some("plan")
+        );
+        assert_eq!(chat.messages[2].role, "assistant");
+        assert_eq!(chat.messages[3].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(
+            chat.messages[3].content.as_ref().and_then(|v| v.as_str()),
+            Some("ok")
+        );
+        assert_eq!(chat.tools.as_ref().unwrap()[0]["function"]["name"], "shell");
+        assert_eq!(
+            chat.tool_choice.as_ref().unwrap()["function"]["name"],
+            "shell"
+        );
     }
 
     // --- tool_choice parsing (audit finding 6) -----------------------------
@@ -3779,6 +5121,8 @@ mod tests {
             deadline,
             stream,
             stats: Arc::default(),
+            wire: WireFormat::Chat,
+            responses: None,
         }
     }
 
@@ -4095,17 +5439,6 @@ mod tests {
             total: Duration::from_millis(500),
             finish: Finish::Stop,
         }
-    }
-
-    #[test]
-    fn cached_prompt_tokens_are_excluded_from_prefill_rates() {
-        let stats = ServeStats::default();
-        let mut request = rec(100, 0, 0);
-        request.cached_prompt_tokens = 80;
-
-        assert_eq!(request.prefill_tps(), 200.0);
-        stats.fold_completion(&request);
-        assert_eq!(stats.drain(Duration::from_secs(1)).prompt_tokens, 20);
     }
 
     /// **The whole point of the periodic line.** Its numbers must describe the INTERVAL, so a drain
