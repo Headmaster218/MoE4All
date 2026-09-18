@@ -3562,6 +3562,8 @@ fn lower_op(
                     .min()
                     .unwrap_or(0)
             });
+            let crosses_dense_prefix =
+                independent_spans.is_none() && *rows > 1 && *top_blocks <= blocks;
             let invalid_rows = independent_spans.is_none() && (*rows == 0 || *rows > *kv_len);
             if *head_dim != 128
                 || invalid_rows
@@ -3571,7 +3573,7 @@ fn lower_op(
                 || *rope_dim > *head_dim
                 || !rope_dim.is_multiple_of(2)
                 || *top_blocks == 0
-                || *top_blocks > first_blocks
+                || (*top_blocks > first_blocks && !crosses_dense_prefix)
                 || *top_blocks > QSA_MAX_TOP_BLOCKS
                 || positions4.is_some_and(|id| {
                     graph.desc(id).dtype != infr_core::DType::I32
@@ -3580,7 +3582,8 @@ fn lower_op(
             {
                 return Err(be(format!(
                     "vulkan Op::QsaIndexer requires head_dim=128, 1..=4 heads, even rope_dim, \
-                     ratio>0 and 0<top_blocks<=min(blocks,{QSA_MAX_TOP_BLOCKS}); got head_dim={head_dim} \
+                     ratio>0 and 0<top_blocks<=min(blocks,{QSA_MAX_TOP_BLOCKS}), except for a \
+                     contiguous batched dense prefix; got head_dim={head_dim} \
                      n_head={n_head} rope_dim={rope_dim} ratio={ratio} top_blocks={top_blocks} \
                      rows={rows} kv_len={kv_len}"
                 )));
@@ -3807,6 +3810,8 @@ fn lower_op(
                     .min()
                     .unwrap_or(0)
             });
+            let crosses_dense_prefix =
+                independent_spans.is_none() && *rows > 1 && *top_blocks <= *kv_len / ratio_safe;
             let kdt = graph.desc(*k_cache).dtype;
             let vdt = graph.desc(*v_cache).dtype;
             let supported = |dt| matches!(dt, infr_core::DType::F16 | infr_core::DType::Q8_0);
@@ -3817,7 +3822,7 @@ fn lower_op(
                 || !matches!(*head_dim, 128 | 256)
                 || *ratio == 0
                 || *top_blocks == 0
-                || *top_blocks > first_blocks
+                || (*top_blocks > first_blocks && !crosses_dense_prefix)
                 || *top_blocks > QSA_MAX_TOP_BLOCKS
                 || graph.desc(*q).dtype != infr_core::DType::F16
                 || !supported(kdt)
@@ -3826,7 +3831,8 @@ fn lower_op(
                 return Err(be(format!(
                     "vulkan Op::QsaBatchAttention requires F16 q, F16/Q8_0 k/v, rows<=kv_len, \
                      head_dim=128/256, n_head divisible by n_kv, ratio>0 and \
-                     0<top_blocks<=min(first complete blocks,{QSA_MAX_TOP_BLOCKS}); \
+                     0<top_blocks<=min(first complete blocks,{QSA_MAX_TOP_BLOCKS}), except for a \
+                     contiguous batched dense prefix; \
                      got rows={rows} kv_len={kv_len} n_head={n_head} n_kv={n_kv} \
                      head_dim={head_dim} ratio={ratio} top_blocks={top_blocks} \
                      k_dtype={kdt:?} v_dtype={vdt:?}"

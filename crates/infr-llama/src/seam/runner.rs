@@ -6145,15 +6145,10 @@ fn generate_dense_backend_inner(
                 };
                 let visible = max_visible;
                 let qsa_threshold = c.indexer_top_k + qsa_ratio - 1;
-                let batched_qsa = batch > 1
-                    && qsa_query.is_some()
-                    && visible > qsa_threshold
-                    && min_start + 1 > qsa_threshold;
+                // A crossing batch stays whole: QsaIndexer emits chronological identity indices
+                // for dense-prefix rows, then exact top-k indices once each row becomes sparse.
+                let batched_qsa = batch > 1 && qsa_query.is_some() && visible > qsa_threshold;
                 if batched_qsa {
-                    assert!(
-                        min_start + 1 > qsa_threshold,
-                        "a batched QSA span must not cross the dense-to-sparse boundary"
-                    );
                     let (ix_q, ix_k, ix_blocks, ix_norm) = qsa_query.expect("batched QSA query");
                     let selected = c.indexer_top_k / qsa_ratio;
                     g.push(Op::QsaIndexer {
@@ -8973,18 +8968,9 @@ fn generate_dense_backend_inner(
         let chunks: Vec<(usize, usize)> = {
             let mut v = Vec::new();
             let mut cs = start;
-            let qsa_boundary = c.qwen4exp.then(|| {
-                let ratio = c.compress_ratios.iter().copied().max().unwrap_or(4).max(1);
-                c.indexer_top_k + ratio - 1
-            });
             while cs < pf_end {
                 let mut ce = (cs + ubatch).min(pf_end);
                 if let Some(boundary) = turn_checkpoint_boundary {
-                    if cs < boundary && boundary < ce {
-                        ce = boundary;
-                    }
-                }
-                if let Some(boundary) = qsa_boundary {
                     if cs < boundary && boundary < ce {
                         ce = boundary;
                     }

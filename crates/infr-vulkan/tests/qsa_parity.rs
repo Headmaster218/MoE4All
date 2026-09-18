@@ -513,9 +513,12 @@ fn qsa_batched_rows_match_causal_reference() {
         return;
     };
     let (rows, ratio, index_hd, index_heads, rope_dim, top) =
-        (3usize, 4usize, 128usize, 4usize, 64usize, 3usize);
+        (6usize, 4usize, 128usize, 4usize, 64usize, 3usize);
     let (n_head, n_kv, attn_hd) = (4usize, 2usize, 256usize);
-    let kv_len = 26usize;
+    // Visible lengths 13..=18 cross the top*ratio+ratio-1 == 15 dense-to-sparse
+    // boundary. The first three rows retain every complete block in chronological order;
+    // the final three exercise score-based top-k selection in the same dispatch.
+    let kv_len = 18usize;
     let max_blocks = kv_len / ratio;
     let theta = 10_000.0f32;
     let eps = 1e-6f32;
