@@ -738,8 +738,18 @@ fn main() {
         ("qsa_indexer_score", "qsa_indexer_score", &[]),
         (
             "qsa_indexer_score",
+            "qsa_indexer_score_h4",
+            &["-DQSA_SCORE_H4"],
+        ),
+        (
+            "qsa_indexer_score",
             "qsa_indexer_score_seg",
             &["-DKV_SEGMENTED"],
+        ),
+        (
+            "qsa_indexer_score",
+            "qsa_indexer_score_h4_seg",
+            &["-DKV_SEGMENTED", "-DQSA_SCORE_H4"],
         ),
         (
             "qsa_indexer_score",

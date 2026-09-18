@@ -9274,7 +9274,22 @@ impl<'a> Recorder<'a> {
 
         let decode8 = rows == 1 && self.vk().qsa_score_decode8;
         let segmented = segment_shifts.is_some();
-        let (score_name, score_spv, block_tile, query_tile) = if decode8 && segmented {
+        let h4 = rows > 1 && n_head == 4 && head_dim == 128;
+        let (score_name, score_spv, block_tile, query_tile) = if h4 && segmented {
+            (
+                "qsa_indexer_score_h4_seg",
+                crate::gemm::qsa_indexer_score_h4_seg_spv(),
+                4,
+                2,
+            )
+        } else if h4 {
+            (
+                "qsa_indexer_score_h4",
+                crate::gemm::qsa_indexer_score_h4_spv(),
+                4,
+                2,
+            )
+        } else if decode8 && segmented {
             (
                 "qsa_indexer_score_decode8_seg",
                 crate::gemm::qsa_indexer_score_decode8_seg_spv(),
@@ -13691,6 +13706,94 @@ mod tests {
                 "phase {phase}: segmented QSA block cache diverges at 32K: {block_err:e}"
             );
         }
+
+        // Batched prefill uses the four-head score specialization. Compare its flat and segmented
+        // variants over two causal rows so the production segmented route stays covered.
+        const SCORE_ROWS: usize = 2;
+        let q2v = qv
+            .iter()
+            .copied()
+            .cycle()
+            .take(SCORE_ROWS * HEADS * HD)
+            .collect::<Vec<_>>();
+        let q2 = upf16(&be, &q2v);
+        let scores2_flat = be
+            .alloc(SCORE_ROWS * blocks * 4, BufferUsage::Readback)
+            .unwrap();
+        let scores2_segmented = be
+            .alloc(SCORE_ROWS * blocks * 4, BufferUsage::Readback)
+            .unwrap();
+        let ids2_flat = be
+            .alloc(SCORE_ROWS * TOP * 4, BufferUsage::Readback)
+            .unwrap();
+        let ids2_segmented = be
+            .alloc(SCORE_ROWS * TOP * 4, BufferUsage::Readback)
+            .unwrap();
+        let rec = be.recorder().unwrap();
+        for (raw, block, scores, ids, shifts) in [
+            (
+                raw_flat.as_ref(),
+                block_flat.as_ref(),
+                scores2_flat.as_ref(),
+                ids2_flat.as_ref(),
+                None,
+            ),
+            (
+                raw_virtual.table_buffer(),
+                block_virtual.table_buffer(),
+                scores2_segmented.as_ref(),
+                ids2_segmented.as_ref(),
+                segment_shifts,
+            ),
+        ] {
+            rec.qsa_indexer(
+                q2.as_ref(),
+                raw,
+                block,
+                nw.as_ref(),
+                scores,
+                None,
+                ids,
+                SCORE_ROWS as u32,
+                kv_len as u32,
+                blocks as u32,
+                HEADS as u32,
+                HD as u32,
+                TOP as u32,
+                RATIO as u32,
+                64,
+                10_000.0,
+                1e-6,
+                1.0 / (HD as f32).sqrt(),
+                shifts,
+                None,
+            );
+        }
+        rec.finish().unwrap();
+
+        let flat_scores2 = download_f32(&be, scores2_flat.as_ref(), SCORE_ROWS * blocks);
+        let segmented_scores2 = download_f32(&be, scores2_segmented.as_ref(), SCORE_ROWS * blocks);
+        for row in 0..SCORE_ROWS {
+            let visible_blocks = (kv_len - SCORE_ROWS + row + 1) / RATIO;
+            let score_err = flat_scores2[row * blocks..row * blocks + visible_blocks]
+                .iter()
+                .zip(&segmented_scores2[row * blocks..row * blocks + visible_blocks])
+                .map(|(flat, segmented)| (flat - segmented).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                score_err < 1e-5,
+                "batched segmented QSA score row {row} diverges at 32K: {score_err:e}"
+            );
+        }
+        let mut flat_ids2 = vec![0u8; SCORE_ROWS * TOP * 4];
+        let mut segmented_ids2 = vec![0u8; SCORE_ROWS * TOP * 4];
+        be.download(ids2_flat.as_ref(), &mut flat_ids2).unwrap();
+        be.download(ids2_segmented.as_ref(), &mut segmented_ids2)
+            .unwrap();
+        assert_eq!(
+            segmented_ids2, flat_ids2,
+            "batched segmented QSA selected different blocks across 32K"
+        );
 
         // The production default is planar Q8 K/V, whose scale plane is local to each physical
         // segment. Exercise a single write that straddles the exact 32K cut, then read those rows

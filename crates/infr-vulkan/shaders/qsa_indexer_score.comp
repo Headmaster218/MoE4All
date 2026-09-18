@@ -93,6 +93,21 @@ void main() {
 
     uint lane = gl_SubgroupInvocationID;
     float score = 0.0;
+#ifdef QSA_SCORE_H4
+    vec4 part = vec4(0.0);
+    for (uint d = lane; d < 128u; d += 32u) {
+        float key = ktile[bs][d];
+        part += vec4(
+            qtile[qr][0][d],
+            qtile[qr][1][d],
+            qtile[qr][2][d],
+            qtile[qr][3][d]
+        ) * key;
+    }
+    vec4 heads = subgroupAdd(part);
+    score = max(heads.x, 0.0) + max(heads.y, 0.0)
+        + max(heads.z, 0.0) + max(heads.w, 0.0);
+#else
     for (uint h = 0u; h < pc.n_head; ++h) {
         float part = 0.0;
         for (uint d = lane; d < pc.head_dim; d += 32u) {
@@ -100,6 +115,7 @@ void main() {
         }
         score += max(subgroupAdd(part), 0.0);
     }
+#endif
     if (lane == 0u) {
         scores[row * max_blocks + block] = score * pc.scale;
     }

@@ -3357,6 +3357,8 @@ qsa_spv!(
     "qsa_indexer_compress_mrope_seg"
 );
 qsa_spv!(qsa_indexer_score_seg_spv, "qsa_indexer_score_seg");
+qsa_spv!(qsa_indexer_score_h4_spv, "qsa_indexer_score_h4");
+qsa_spv!(qsa_indexer_score_h4_seg_spv, "qsa_indexer_score_h4_seg");
 qsa_spv!(
     qsa_indexer_score_decode8_seg_spv,
     "qsa_indexer_score_decode8_seg"
