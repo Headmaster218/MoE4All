@@ -3451,7 +3451,8 @@ impl<'a> Recorder<'a> {
         debug_assert!((2..=8).contains(&rows));
         assert_native_k("linear_native_mrow_at", in_f);
         self.label_gemv("mrow_streamed", rows, in_f, out_f);
-        let (name, spv) = crate::gemm::native_mrow_spv(dtype).expect("native mrow streamed spv");
+        let (name, spv) =
+            crate::gemm::native_mrow_spv(dtype, rows).expect("native mrow streamed spv");
         let k = self.be.kernel(name, spv, 3, 24);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());

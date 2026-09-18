@@ -136,7 +136,10 @@ pub(crate) fn native_streamed_build_spv(
 /// directly with an explicit arena address (`tests/weight_addr_parity.rs`). `None` for a dtype
 /// without an mrow build.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mrow_spv(dtype: infr_core::DType) -> Option<(&'static str, &'static [u32])> {
+pub(crate) fn native_mrow_spv(
+    dtype: infr_core::DType,
+    rows: usize,
+) -> Option<(&'static str, &'static [u32])> {
     use infr_core::DType::*;
     macro_rules! v {
         ($name:literal) => {{
@@ -149,21 +152,22 @@ pub(crate) fn native_mrow_spv(dtype: infr_core::DType) -> Option<(&'static str, 
             Some(($name, s))
         }};
     }
-    match dtype {
-        Q8_0 => v!("native_mrow_q8_0"),
-        Bf16 => v!("native_mrow_bf16"),
-        Q4_0 => v!("native_mrow_q4_0"),
-        Q4_1 => v!("native_mrow_q4_1"),
-        Q5_0 => v!("native_mrow_q5_0"),
-        Q5_1 => v!("native_mrow_q5_1"),
-        Q2K => v!("native_mrow_q2k"),
-        Q3K => v!("native_mrow_q3k"),
-        Q4K => v!("native_mrow_q4k"),
-        Q5K => v!("native_mrow_q5k"),
-        Q6K => v!("native_mrow_q6k"),
-        Iq4Nl => v!("native_mrow_iq4nl"),
-        Iq4Xs => v!("native_mrow_iq4xs"),
-        Q2_0 => v!("native_mrow_q2_0"),
+    match (dtype, rows) {
+        (Q8_0, 2) => v!("native_mrow_q8_0_m2"),
+        (Q8_0, _) => v!("native_mrow_q8_0"),
+        (Bf16, _) => v!("native_mrow_bf16"),
+        (Q4_0, _) => v!("native_mrow_q4_0"),
+        (Q4_1, _) => v!("native_mrow_q4_1"),
+        (Q5_0, _) => v!("native_mrow_q5_0"),
+        (Q5_1, _) => v!("native_mrow_q5_1"),
+        (Q2K, _) => v!("native_mrow_q2k"),
+        (Q3K, _) => v!("native_mrow_q3k"),
+        (Q4K, _) => v!("native_mrow_q4k"),
+        (Q5K, _) => v!("native_mrow_q5k"),
+        (Q6K, _) => v!("native_mrow_q6k"),
+        (Iq4Nl, _) => v!("native_mrow_iq4nl"),
+        (Iq4Xs, _) => v!("native_mrow_iq4xs"),
+        (Q2_0, _) => v!("native_mrow_q2_0"),
         _ => None,
     }
 }

@@ -1395,6 +1395,11 @@ fn main() {
         // Multi-row GEMV (m = 2..8: spec verify / short suffix prefill) — mainstream dense
         // projection formats only; the rest fall back to the tiled GEMM.
         ("native_gemv_mrow", "native_mrow_q8_0", &["-DFMT_Q8_0"]),
+        (
+            "native_gemv_mrow",
+            "native_mrow_q8_0_m2",
+            &["-DFMT_Q8_0", "-DMR=2"],
+        ),
         ("native_gemv_mrow", "native_mrow_bf16", &["-DFMT_BF16"]),
         ("native_gemv_mrow", "native_mrow_q4_0", &["-DFMT_Q4_0"]),
         ("native_gemv_mrow", "native_mrow_q4_1", &["-DFMT_Q4_1"]),
