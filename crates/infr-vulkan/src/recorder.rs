@@ -9276,7 +9276,22 @@ impl<'a> Recorder<'a> {
         let decode8 = rows == 1 && self.vk().qsa_score_decode8;
         let segmented = segment_shifts.is_some();
         let h4 = rows > 1 && n_head == 4 && head_dim == 128;
-        let (score_name, score_spv, block_tile, query_tile) = if h4 && segmented {
+        let decode8_h4 = decode8 && n_head == 4 && head_dim == 128;
+        let (score_name, score_spv, block_tile, query_tile) = if decode8_h4 && segmented {
+            (
+                "qsa_indexer_score_decode8_h4_seg",
+                crate::gemm::qsa_indexer_score_decode8_h4_seg_spv(),
+                8,
+                1,
+            )
+        } else if decode8_h4 {
+            (
+                "qsa_indexer_score_decode8_h4",
+                crate::gemm::qsa_indexer_score_decode8_h4_spv(),
+                8,
+                1,
+            )
+        } else if h4 && segmented {
             (
                 "qsa_indexer_score_h4_seg",
                 crate::gemm::qsa_indexer_score_h4_seg_spv(),

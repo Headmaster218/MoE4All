@@ -3367,6 +3367,14 @@ qsa_spv!(
     qsa_indexer_score_decode8_seg_spv,
     "qsa_indexer_score_decode8_seg"
 );
+qsa_spv!(
+    qsa_indexer_score_decode8_h4_spv,
+    "qsa_indexer_score_decode8_h4"
+);
+qsa_spv!(
+    qsa_indexer_score_decode8_h4_seg_spv,
+    "qsa_indexer_score_decode8_h4_seg"
+);
 qsa_spv!(qsa_gather_spv, "qsa_gather");
 qsa_spv!(qsa_gather_kq8_spv, "qsa_gather_kq8");
 qsa_spv!(qsa_gather_vq8_spv, "qsa_gather_vq8");

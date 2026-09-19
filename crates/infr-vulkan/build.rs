@@ -758,8 +758,18 @@ fn main() {
         ),
         (
             "qsa_indexer_score",
+            "qsa_indexer_score_decode8_h4",
+            &["-DQSA_SCORE_DECODE8", "-DQSA_SCORE_H4"],
+        ),
+        (
+            "qsa_indexer_score",
             "qsa_indexer_score_decode8_seg",
             &["-DQSA_SCORE_DECODE8", "-DKV_SEGMENTED"],
+        ),
+        (
+            "qsa_indexer_score",
+            "qsa_indexer_score_decode8_h4_seg",
+            &["-DQSA_SCORE_DECODE8", "-DQSA_SCORE_H4", "-DKV_SEGMENTED"],
         ),
         ("qsa_indexer_topk", "qsa_indexer_topk", &[]),
         ("qsa_indexer_topk_hist", "qsa_indexer_topk_hist", &[]),
