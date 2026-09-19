@@ -185,6 +185,8 @@ const MOE_SMALL_M: infr_core::tier::EnvRows = infr_core::tier::EnvRows {
 const MOE_ROW_MASK_NONE: u32 = 0;
 const MOE_ROW_MASK_HITS: u32 = 1;
 const MOE_ROW_MASK_MISSES: u32 = 2;
+const MOE_HIT_FIRST_MAX_ROWS: usize = 8;
+const MOE_HIT_FIRST_MAX_SLOTS: usize = MOE_HIT_FIRST_MAX_ROWS * u32::BITS as usize;
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn moe_small_m_threshold(be_: &VulkanBackend) -> usize {
@@ -9948,10 +9950,12 @@ fn execute_paged_moe<'a>(
                 }
                 active_prefetch_finished = true;
             }
-            let mut id_bytes = vec![0u8; n_slots * 4];
-            be_.download(pool[&ids_key].as_ref(), &mut id_bytes)
-                .map_err(|e| be(e.to_string()))?;
-            stage_ids = bytemuck::cast_slice(&id_bytes).to_vec();
+            stage_ids.resize(n_slots, 0);
+            be_.download(
+                pool[&ids_key].as_ref(),
+                bytemuck::cast_slice_mut(stage_ids.as_mut_slice()),
+            )
+            .map_err(|e| be(e.to_string()))?;
         }
     }
     if (prefetch_gpu.is_some() || close_active_prefetch) && !stream_synced_for_cpu_push {
@@ -10039,43 +10043,53 @@ fn execute_paged_moe<'a>(
         && !*weight_before
         && stage_ids.len() == n_slots
         && n_used <= u32::BITS as usize
+        && rows <= MOE_HIT_FIRST_MAX_ROWS
+        && n_slots <= MOE_HIT_FIRST_MAX_SLOTS
     {
-        let hit_masks = {
+        let mut hit_masks = [0u32; MOE_HIT_FIRST_MAX_ROWS];
+        {
             let guard = be_.moe_pager().lock().unwrap();
             let sess = guard.as_ref().expect("paged execution requires a session");
-            stage_ids
-                .chunks_exact(n_used)
-                .map(|ids| sess.routed_roles_resident_mask(&[gate_id, up_id, down_id], ids))
-                .collect::<Result<Vec<_>>>()?
-        };
-        let miss_masks = hit_masks
-            .iter()
-            .map(|&hit_mask| routed_mask ^ hit_mask)
-            .collect::<Vec<_>>();
-        let any_hit = hit_masks.iter().any(|&mask| mask != 0);
-        let any_miss = miss_masks.iter().any(|&mask| mask != 0);
+            for (row, ids) in stage_ids.chunks_exact(n_used).enumerate() {
+                hit_masks[row] =
+                    sess.routed_roles_resident_mask(&[gate_id, up_id, down_id], ids)?;
+            }
+        }
+        let mut miss_masks = [0u32; MOE_HIT_FIRST_MAX_ROWS];
+        for row in 0..rows {
+            miss_masks[row] = routed_mask ^ hit_masks[row];
+        }
+        let any_hit = hit_masks[..rows].iter().any(|&mask| mask != 0);
+        let any_miss = miss_masks[..rows].iter().any(|&mask| mask != 0);
         // Without a shared expert, an empty hit set still has no useful first-stage work. With
         // one, shared-only is useful work and overlaps the all-miss host promotion as requested.
         if any_miss && (any_hit || shared.is_some()) {
-            let mut hit_ids = Vec::with_capacity(n_slots);
-            let mut miss_ids = Vec::with_capacity(n_slots);
+            let mut hit_ids = [0u32; MOE_HIT_FIRST_MAX_SLOTS];
+            let mut miss_ids = [0u32; MOE_HIT_FIRST_MAX_SLOTS];
+            let mut hit_count = 0usize;
+            let mut miss_count = 0usize;
             for (flat_slot, &expert) in stage_ids.iter().enumerate() {
                 let row = flat_slot / n_used;
                 let slot = flat_slot % n_used;
                 if hit_masks[row] & (1u32 << slot) != 0 {
-                    hit_ids.push(expert);
+                    hit_ids[hit_count] = expert;
+                    hit_count += 1;
                 } else {
-                    miss_ids.push(expert);
+                    miss_ids[miss_count] = expert;
+                    miss_count += 1;
                 }
             }
             if parallel_decode {
-                let mut ids_and_masks = Vec::with_capacity(n_slots + 2 * rows);
-                ids_and_masks.extend_from_slice(stage_ids.as_slice());
-                ids_and_masks.extend(hit_masks.iter().map(|&mask| mask | shared_mask));
-                ids_and_masks.extend_from_slice(miss_masks.as_slice());
+                let mut ids_and_masks =
+                    [0u32; MOE_HIT_FIRST_MAX_SLOTS + 2 * MOE_HIT_FIRST_MAX_ROWS];
+                ids_and_masks[..n_slots].copy_from_slice(stage_ids.as_slice());
+                for row in 0..rows {
+                    ids_and_masks[n_slots + row] = hit_masks[row] | shared_mask;
+                    ids_and_masks[n_slots + rows + row] = miss_masks[row];
+                }
                 be_.upload(
                     pool[&ids_key].as_ref(),
-                    bytemuck::cast_slice(ids_and_masks.as_slice()),
+                    bytemuck::cast_slice(&ids_and_masks[..n_slots + 2 * rows]),
                 )
                 .map_err(|e| be(e.to_string()))?;
             }
@@ -10083,13 +10097,13 @@ fn execute_paged_moe<'a>(
                 let mut guard = be_.moe_pager().lock().unwrap();
                 let sess = guard.as_mut().expect("paged execution requires a session");
                 let role_batches_open = sess.begin_role_batches(&[gate_id, up_id, down_id])?;
-                let push = if role_batches_open && !hit_ids.is_empty() {
+                let push = if role_batches_open && hit_count > 0 {
                     Some(sess.push_roles_cpu(
                         be_,
                         &[
-                            (gate_id, hit_ids.as_slice()),
-                            (up_id, hit_ids.as_slice()),
-                            (down_id, hit_ids.as_slice()),
+                            (gate_id, &hit_ids[..hit_count]),
+                            (up_id, &hit_ids[..hit_count]),
+                            (down_id, &hit_ids[..hit_count]),
                         ],
                         false,
                     )?)
@@ -10237,7 +10251,8 @@ fn execute_paged_moe<'a>(
                 fresh.seed_barrier();
                 fresh.arena_stream_barrier();
                 *rec = Some(fresh);
-                stage_ids = miss_ids;
+                stage_ids.clear();
+                stage_ids.extend_from_slice(&miss_ids[..miss_count]);
                 active_mask = if parallel_decode { 0 } else { miss_masks[0] };
                 row_mask_bank = if parallel_decode {
                     MOE_ROW_MASK_MISSES
