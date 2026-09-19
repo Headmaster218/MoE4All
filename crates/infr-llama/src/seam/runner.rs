@@ -8930,11 +8930,10 @@ fn generate_dense_backend_inner(
         // ownership, so a chunk is exactly how long a newly-admitted request's prefill can stall
         // everyone else's decode. The default ubatch (INFR_UBATCH, 1024 rows) is ~100ms+ of
         // unpreemptible GPU on a 14B — enough to visibly hitch 3 other streams. Under a gate we
-        // therefore cap the chunk (INFR_UBATCH_PARALLEL, default 256 rows), yield the baton between
-        // chunks, and let the round-robin interleave prefill chunks with the other sequences' decode
-        // steps. This is llama.cpp's "chunked prefill interleaved with decode" without the shared
-        // batch: same starvation bound, no batching win. A sole request (`req` None, or `-np 1`)
-        // keeps the full 1024-row chunk — prefill throughput is UNCHANGED there.
+        // therefore cap an otherwise-adaptive chunk (INFR_UBATCH_PARALLEL, default 256 rows), yield
+        // the baton between chunks, and let the round-robin interleave prefill chunks with the other
+        // sequences' decode steps. An explicit INFR_UBATCH/--ubatch remains authoritative: parallel
+        // prefills take turns one full chunk at a time unless INFR_UBATCH_PARALLEL is also explicit.
         let ubatch: usize = if req.is_some_and(crate::sampling::RequestCtx::shares_gpu) {
             crate::seam::ubatch_rows(ec).min(crate::seam::ubatch_rows_parallel(ec))
         } else {

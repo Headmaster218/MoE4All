@@ -93,7 +93,12 @@ pub fn parse_reporting(
         seen.push(path.to_string());
     }
 
+    let parallel_ubatch_specified =
+        layer.device.ubatch_parallel.is_some() || overrides.flags.device.ubatch_parallel.is_some();
     // The bespoke flags go on LAST, so they win over any `--set` for the same field.
     layer.merge(overrides.flags.clone());
+    if parallel_ubatch_specified {
+        layer.device.ubatch_parallel_specified = Some(true);
+    }
     Ok((layer, warnings))
 }

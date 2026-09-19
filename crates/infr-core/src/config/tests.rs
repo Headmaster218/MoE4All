@@ -111,6 +111,7 @@ fn default_config_matches_documented_defaults() {
     assert_eq!(d.device.ram_budget, None);
     assert_eq!(d.device.vram_reserve, None);
     assert_eq!(d.device.ubatch_parallel, 256);
+    assert!(!d.device.ubatch_parallel_specified);
     assert_eq!(d.device.submit_dispatches, None);
     assert_eq!(d.device.subgroup_pref, None);
     // §6.3 / §6.4.
@@ -169,6 +170,20 @@ fn default_config_matches_documented_defaults() {
     assert!(d.spec.mtp_ckpt && d.spec.mtp_reprime && d.spec.mtp_draft_chain);
     assert_eq!(d.spec.k, 6);
     assert_eq!(d.spec.decode_chain, 8);
+}
+
+#[test]
+fn parallel_ubatch_explicitness_tracks_each_input_layer() {
+    let layers = [
+        file_layer("[device]\nubatch_parallel = 512\n"),
+        env_layer(&[("INFR_UBATCH_PARALLEL", "512")]),
+        cli_layer(&["device.ubatch_parallel=512"]),
+    ];
+    for layer in layers {
+        let cfg = Config::load_from_layers(&[layer]);
+        assert_eq!(cfg.device.ubatch_parallel, 512);
+        assert!(cfg.device.ubatch_parallel_specified);
+    }
 }
 
 #[test]

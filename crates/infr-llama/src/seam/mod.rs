@@ -1355,12 +1355,16 @@ fn default_ubatch_rows(profile: infr_core::config::AutoProfile) -> usize {
 /// a newly-admitted request's prefill stalls every in-flight decode. The solo default (1024 rows,
 /// [`ubatch_rows`]) is ~100ms+ on a 14B — a visible hitch across 3 other streams. 256 rows bounds
 /// that to ~25-30ms (about the cost of ~4 decode steps) at a small prefill-throughput cost, which
-/// is the right trade when N clients are streaming. Never applies to a sole request: `infr run`,
-/// `bench`, the goldens, and a `-np 1` server all keep the full [`ubatch_rows`] chunk, so prefill
-/// throughput there is UNCHANGED. INFR_UBATCH_PARALLEL overrides; it only ever SHRINKS the chunk
-/// (the runner takes the `min` with [`ubatch_rows`]).
+/// is the automatic trade when N clients are streaming. An explicit `device.ubatch` is
+/// authoritative for both solo and parallel servers: parallel prefills take turns one full chunk
+/// at a time. `device.ubatch_parallel` can still explicitly request a smaller shared-GPU chunk.
+/// The runner takes the `min` of this value and [`ubatch_rows`].
 pub(crate) fn ubatch_rows_parallel(ec: &EngineConfig) -> usize {
-    ec.device.ubatch_parallel
+    if !ec.device.ubatch_parallel_specified && ec.device.ubatch.is_some_and(|rows| rows > 0) {
+        ubatch_rows(ec)
+    } else {
+        ec.device.ubatch_parallel
+    }
 }
 
 /// The two placement decisions the VRAM ladder pins for a session and then keeps STABLE for its
@@ -6229,6 +6233,21 @@ mod seam_helper_tests {
             1024,
             "…and the height falls back"
         );
+    }
+
+    #[test]
+    fn explicit_ubatch_also_governs_parallel_prefill_unless_overridden() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let mut ec = EngineConfig::default();
+        assert_eq!(super::ubatch_rows_parallel(&ec), 256);
+
+        ec.device.ubatch = Some(3072);
+        ec.device.ubatch_specified = true;
+        assert_eq!(super::ubatch_rows_parallel(&ec), 3072);
+
+        ec.device.ubatch_parallel = 512;
+        ec.device.ubatch_parallel_specified = true;
+        assert_eq!(super::ubatch_rows_parallel(&ec), 512);
     }
 
     #[test]

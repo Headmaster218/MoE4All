@@ -148,6 +148,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.device.ubatch = num_pos(get, "INFR_UBATCH").map(Some);
     p.device.ubatch_specified = presence(get, "INFR_UBATCH");
     p.device.ubatch_parallel = num_pos(get, "INFR_UBATCH_PARALLEL");
+    p.device.ubatch_parallel_specified = presence(get, "INFR_UBATCH_PARALLEL");
     // Rejects a bad value LOUDLY today (`VulkanBackend::new` returns an error) — keep erroring.
     if let Some(v) = get("INFR_SUBMIT_DISPATCHES") {
         let n = v.parse::<usize>().map_err(|e| ConfigError::Env {

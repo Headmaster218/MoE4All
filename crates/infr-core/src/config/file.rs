@@ -93,6 +93,9 @@ pub fn parse_str(text: &str, label: &Path) -> Result<(PartialConfig, Vec<String>
     let mut partial = PartialConfig::default();
     let mut warnings = Vec::new();
     walk(&doc, "", &known, &mut partial, &mut warnings)?;
+    if partial.device.ubatch_parallel.is_some() {
+        partial.device.ubatch_parallel_specified = Some(true);
+    }
     Ok((partial, warnings))
 }
 
