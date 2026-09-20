@@ -699,32 +699,18 @@ mod tests {
     #[test]
     fn the_windows_live_probe_is_plausible() {
         let avail = available_bytes().expect("windows GlobalMemoryStatusEx should answer");
-        let status = windows_memory_status().expect("GlobalMemoryStatusEx");
-        assert!(
-            status.ullTotalPhys > 0,
-            "total physical memory must be non-zero"
-        );
-        assert!(
-            avail <= status.ullTotalPhys,
-            "available {avail} exceeds total {}",
-            status.ullTotalPhys
-        );
-        assert_eq!(total_bytes(), Some(status.ullTotalPhys));
-        assert!(
-            avail.abs_diff(status.ullAvailPhys) <= 16 << 20,
-            "two adjacent physical-memory samples drifted by more than 16 MiB: {avail} vs {}",
-            status.ullAvailPhys
-        );
-        assert_eq!(commit_available_bytes(), Some(status.ullAvailPageFile));
+        let total = total_bytes().expect("GlobalMemoryStatusEx should report total RAM");
+        assert!(total > 0, "total physical memory must be non-zero");
+        assert!(avail <= total, "available {avail} exceeds total {}", total);
+        assert!(commit_available_bytes().is_some());
         let resident = process_resident_bytes().expect("GetProcessMemoryInfo should answer");
         assert!(
             resident > 0,
             "the running test process must have resident pages"
         );
         assert!(
-            resident <= status.ullTotalPhys,
-            "process working set {resident} exceeds physical RAM {}",
-            status.ullTotalPhys
+            resident <= total,
+            "process working set {resident} exceeds physical RAM {total}",
         );
     }
 

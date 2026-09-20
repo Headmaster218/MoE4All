@@ -57,6 +57,7 @@ fn run(
 /// As [`run`], but also download one input that the op mutates in place. Recurrent kernels can
 /// produce the right rows for the current batch while persisting the wrong state for the next
 /// execute, so output-only parity is not enough for them.
+#[allow(clippy::too_many_arguments)]
 fn run_with_mutated_state(
     be: &dyn Backend,
     g: &Graph,

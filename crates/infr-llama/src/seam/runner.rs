@@ -13,7 +13,8 @@ use super::weights::{
     SessionStable, TurnRecurrentCkpt,
 };
 use super::{
-    common_prefix_len, e2b_ipl_rows, kv_forces_static, BindWeight, TurnCheckpoint, WBytes,
+    common_prefix_len, e2b_ipl_rows, kv_forces_static, BindWeight, ParallelSampledOutput,
+    TurnCheckpoint, WBytes,
 };
 use crate::seam::TokenEmbd;
 use crate::{Config, EngineConfig, GenStats, PerLayerEmbd};
@@ -1324,7 +1325,7 @@ pub(crate) fn generate_dense_backend_parallel_sampled(
     on_token: &mut dyn FnMut(usize, u32) -> bool,
     yield_requested: Option<&std::sync::atomic::AtomicBool>,
     req: Option<&crate::sampling::RequestCtx>,
-) -> AResult<(Vec<Vec<u32>>, Vec<f64>, Vec<f64>)> {
+) -> AResult<ParallelSampledOutput> {
     if prompts.len() != peers.len() + 1
         || prompt_ends.len() != prompts.len()
         || checkpoint_boundaries.len() != prompts.len()
@@ -1520,7 +1521,7 @@ fn generate_dense_backend_inner(
     finish_fixed_allocations: Option<&dyn Fn() -> AResult<()>>,
     // Vision request plan. `None` keeps every existing text-only graph and upload unchanged.
     mm: Option<&crate::seam::MropePlan>,
-    mut parallel_decode: Option<&mut ParallelDecodeRequest<'_>>,
+    parallel_decode: Option<&mut ParallelDecodeRequest<'_>>,
     mut parallel_prefill: Option<&mut ParallelPrefillRequest<'_>>,
     verify_frontier_only: bool,
 ) -> AResult<(Vec<u32>, GenStats)> {
@@ -3126,10 +3127,11 @@ fn generate_dense_backend_inner(
         start
     };
     if state_trace {
-        let qsa_ratio = c
-            .qwen4exp
-            .then(|| c.compress_ratios.iter().copied().max().unwrap_or(4).max(1))
-            .unwrap_or(1);
+        let qsa_ratio = if c.qwen4exp {
+            c.compress_ratios.iter().copied().max().unwrap_or(4).max(1)
+        } else {
+            1
+        };
         tracing::warn!(
             "[state trace] cold_slot={} recurrent={} prompt={} cached_before={} common={} live_start={:?} checkpoint_attempted={} checkpoint_start={:?} path={} start_before_ring={} start={} checkpoint_boundary={:?} kv_ring={} segmented_kv={} qsa_ratio={} start_mod_qsa={} prompt_mod_qsa={} start_mod_32k={} prompt_mod_32k={}",
             state_was_cold,
@@ -3949,24 +3951,24 @@ fn generate_dense_backend_inner(
         // hand-off. Keep an explicit directory so layer 0 can still name layer 1's router and
         // expert banks; it stays empty for prefill and every architecture without the validated
         // one-layer-ahead predictor.
-        let prefetch_targets: Vec<Option<(TensorId, TensorId, TensorId, TensorId, bool)>> =
-            if expert_prefetch && batch == 1 {
-                lw.iter()
-                    .map(|layer| match &layer.ffn {
-                        FfnW::Moe {
-                            router,
-                            gate_exps,
-                            up_exps,
-                            down_exps,
-                            fused_gate_up,
-                            ..
-                        } => Some((*router, *gate_exps, *up_exps, *down_exps, *fused_gate_up)),
-                        _ => None,
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+        type PrefetchTarget = (TensorId, TensorId, TensorId, TensorId, bool);
+        let prefetch_targets: Vec<Option<PrefetchTarget>> = if expert_prefetch && batch == 1 {
+            lw.iter()
+                .map(|layer| match &layer.ffn {
+                    FfnW::Moe {
+                        router,
+                        gate_exps,
+                        up_exps,
+                        down_exps,
+                        fused_gate_up,
+                        ..
+                    } => Some((*router, *gate_exps, *up_exps, *down_exps, *fused_gate_up)),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let qwen_hc_head = c.qwen4exp.then(|| QwenHcW {
             norm: wpush(&mut g, &mut weights),
             down: wpush(&mut g, &mut weights),
@@ -7329,9 +7331,7 @@ fn generate_dense_backend_inner(
 
     // ── layer-synchronous multi-session prefill ─────────────────────────────────────────────
     if let Some(prepared) = parallel_prepared.as_ref() {
-        let parallel = parallel_prefill
-            .as_deref_mut()
-            .expect("prepared parallel prefill retains its request");
+        let parallel = parallel_prefill.expect("prepared parallel prefill retains its request");
         if !gpu_embed {
             return Err(anyhow!("parallel prefill requires Vulkan GPU embedding"));
         }
@@ -7652,7 +7652,7 @@ fn generate_dense_backend_inner(
             })
             .collect::<Vec<_>>();
         parallel.peer_stats.extend(stats.iter().skip(1).cloned());
-        return Ok((Vec::new(), stats[0].clone()));
+        return Ok((Vec::new(), stats[0]));
     }
 
     // ── Phase-2 DiffusionGemma canvas denoise (see `DenoiseReq`'s doc) ───────────────────────
@@ -8554,7 +8554,7 @@ fn generate_dense_backend_inner(
     }
 
     // ── drive ───────────────────────────────────────────────────────────────────────
-    if let Some(parallel) = parallel_decode.as_deref_mut() {
+    if let Some(parallel) = parallel_decode {
         if !c.qwen4exp {
             return Err(anyhow!("parallel decode currently supports qwen4exp only"));
         }

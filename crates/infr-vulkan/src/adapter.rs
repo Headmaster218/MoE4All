@@ -626,6 +626,8 @@ struct PagedSmallScratch {
     ybuf: ScratchKey,
 }
 
+// Kept inline: this is built on the MoE recording path, where boxing adds allocator traffic.
+#[allow(clippy::large_enum_variant)]
 enum PagedMoeScratch {
     Mmq(PagedMmqScratch),
     Small(PagedSmallScratch),
@@ -666,8 +668,8 @@ impl ScratchPool {
         }
 
         let key = (tag, bytes);
-        if !self.buffers.contains_key(&key) {
-            self.buffers.insert(key, alloc(bytes)?);
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.buffers.entry(key) {
+            entry.insert(alloc(bytes)?);
         }
         self.in_use.insert(key);
         Ok(key)
@@ -3732,7 +3734,7 @@ fn lower_op(
                 *scale,
                 segment_shifts,
                 positions4
-                    .map(|id| r(id))
+                    .map(&r)
                     .transpose()?
                     .map(|buffer| (buffer, *sections)),
             );

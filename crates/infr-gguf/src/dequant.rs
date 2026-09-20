@@ -13,12 +13,16 @@ pub fn dequant_block(dtype: infr_core::DType, bytes: &[u8]) -> Result<Vec<f32>> 
     Ok(match dtype {
         F32 => bytemuck::cast_slice::<u8, f32>(bytes).to_vec(),
         F16 => bytes
-            .chunks_exact(2)
-            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| half::f16::from_le_bytes(*c).to_f32())
             .collect(),
         Bf16 => bytes
-            .chunks_exact(2)
-            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| f32::from_bits((u16::from_le_bytes(*c) as u32) << 16))
             .collect(),
         // Affine quants: decode once into the compact factored form, then expand in a
         // single fused pass — hoist the f16 super-scale `dd.to_f32()` out to once per

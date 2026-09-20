@@ -5644,9 +5644,7 @@ impl VulkanBackend {
             }
 
             let mut pending = Vec::with_capacity(requests.len());
-            for ((buffer_idx, index, bytes), handle) in
-                requests.into_iter().zip(handles.into_iter())
-            {
+            for ((buffer_idx, index, bytes), handle) in requests.into_iter().zip(handles) {
                 let segment = self.unified_sub_buffer(handle, bytes)?;
                 let addr = segment
                     .device_addr()

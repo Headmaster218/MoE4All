@@ -106,7 +106,7 @@ mod tests {
         let p = TestResourceProfile::new(16 * GIB, 2 * GIB, 32 * GIB, 10 * GIB).unwrap();
         assert_eq!(p.cap_vram(24 * GIB, 20 * GIB, 0), (16 * GIB, 14 * GIB));
         assert_eq!(p.cap_vram(24 * GIB, 15 * GIB, 5 * GIB), (16 * GIB, 9 * GIB));
-        assert_eq!(p.cap_vram(12 * GIB, 7 * GIB, 1 * GIB), (12 * GIB, 7 * GIB));
+        assert_eq!(p.cap_vram(12 * GIB, 7 * GIB, GIB), (12 * GIB, 7 * GIB));
     }
 
     #[test]

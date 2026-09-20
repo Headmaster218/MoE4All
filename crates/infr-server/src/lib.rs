@@ -229,6 +229,7 @@ pub trait ChatGenerator: Send + Sync {
     ///   only at natural work boundaries; it is optional so non-server frontends stay unaffected.
     /// * Returns a [`ChatOutcome`] carrying the finish reason AND the real prompt/completion token
     ///   counts so the handler can populate `usage` truthfully.
+    #[allow(clippy::too_many_arguments)]
     fn chat(
         &self,
         messages: &[ChatMessage],

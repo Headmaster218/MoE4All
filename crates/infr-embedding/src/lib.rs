@@ -23,8 +23,11 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
+
+#[cfg(windows)]
+use std::time::SystemTime;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);

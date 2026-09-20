@@ -36,6 +36,8 @@ pub use sc::{DenoiseOutcome, EbReduced};
 pub(crate) use session_state::{SessionBuffer, SessionBufferKey, SessionStateMeta};
 pub(crate) use weights::SeamKv;
 
+pub(crate) type ParallelSampledOutput = (Vec<Vec<u32>>, Vec<f64>, Vec<f64>);
+
 /// A LAZILY-dequantized host f32 token-embedding table, threaded through the seam runners in place
 /// of a `&[f32]`.
 ///
@@ -777,7 +779,7 @@ pub(crate) fn generate_dense_vulkan_parallel_sampled_session(
     on_token: &mut dyn FnMut(usize, u32) -> bool,
     yield_requested: Option<&std::sync::atomic::AtomicBool>,
     req: Option<&crate::sampling::RequestCtx>,
-) -> AResult<(Vec<Vec<u32>>, Vec<f64>, Vec<f64>)> {
+) -> AResult<ParallelSampledOutput> {
     if primary.is_none() {
         return Err(anyhow!(
             "sampled parallel Vulkan decode requires an initialized primary session"
@@ -7865,7 +7867,7 @@ mod seam_helper_tests {
             "a measured deficit rounds up and skips directly past it"
         );
         assert_eq!(
-            super::next_auto_moe_arena_budget(current, 2 * GIB64, 1 * MIB),
+            super::next_auto_moe_arena_budget(current, 2 * GIB64, MIB),
             Some(current - 64 * MIB),
             "a small measured deficit must not trigger the conservative five-percent step"
         );

@@ -2574,7 +2574,7 @@ mod tests {
             multimodal_key(&[b, a.clone()])
         );
         assert_ne!(
-            multimodal_key(&[a.clone()]),
+            multimodal_key(std::slice::from_ref(&a)),
             multimodal_key(&[image([1; 32], 3, 2)])
         );
     }

@@ -828,10 +828,10 @@ fn gc_root(root: &Path, max_bytes: u64, ttl: Option<Duration>) -> Result<()> {
     let now = SystemTime::now();
     if let Some(ttl) = ttl {
         for file in &mut files {
-            if now.duration_since(file.modified).unwrap_or_default() > ttl {
-                if remove_cache_file(&file.path) {
-                    file.removed = true;
-                }
+            if now.duration_since(file.modified).unwrap_or_default() > ttl
+                && remove_cache_file(&file.path)
+            {
+                file.removed = true;
             }
         }
     }
