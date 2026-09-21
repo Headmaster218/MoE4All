@@ -294,6 +294,7 @@ struct BatchWork {
     prefill_start: usize,
     checkpoint_boundary: Option<usize>,
     turn_checkpoint: Option<crate::seam::TurnCheckpoint>,
+    mrope_plan: Option<crate::seam::MropePlan>,
     finished: bool,
     sampling: RequestSampling,
     sampler: Option<ParallelSampler>,
@@ -1885,6 +1886,14 @@ impl ParallelSeam {
             .iter()
             .map(|&index| active[index].checkpoint_boundary)
             .collect::<Vec<_>>();
+        let mut owned_mrope_plans = indices
+            .iter()
+            .map(|&index| active[index].mrope_plan.take())
+            .collect::<Vec<_>>();
+        let mrope_plans = owned_mrope_plans
+            .iter()
+            .map(Option::as_ref)
+            .collect::<Vec<_>>();
         let mut primary = active[indices[0]].kv.take();
         let mut peers = indices[1..]
             .iter()
@@ -1955,6 +1964,7 @@ impl ParallelSeam {
             &prompts,
             &prompt_ends,
             &checkpoints,
+            &mrope_plans,
             max_steps,
             &mut primary,
             &mut peers,
@@ -1974,6 +1984,10 @@ impl ParallelSeam {
         }
         for (&index, channel) in indices.iter().zip(channels) {
             active[index].channels = channel;
+        }
+        drop(mrope_plans);
+        for (&index, plan) in indices.iter().zip(owned_mrope_plans.drain(..)) {
+            active[index].mrope_plan = plan;
         }
 
         let (outputs, prompt_secs, decode_secs) = result?;
@@ -2109,7 +2123,13 @@ impl ParallelSeam {
             let qsa_groups = groups.iter().filter(|indices| !indices.is_empty()).count();
             let quantum = if qsa_groups > 1 { 16 } else { usize::MAX };
             for mut indices in groups {
-                indices.sort_by_key(|&index| std::cmp::Reverse(active[index].remaining_prefill()));
+                // The primary lane decides whether the shared graph carries MRoPE history.
+                indices.sort_by_key(|&index| {
+                    (
+                        active[index].mrope_plan.is_none(),
+                        std::cmp::Reverse(active[index].remaining_prefill()),
+                    )
+                });
                 if let Err(error) = self.run_token_group(&mut active, &indices, quantum) {
                     self.fail_unified_scheduler(&mut active, error);
                     return;
@@ -2226,6 +2246,7 @@ impl ParallelSeam {
             prefill_start: 0,
             checkpoint_boundary: None,
             turn_checkpoint,
+            mrope_plan: None,
             finished: false,
             sampling: req.sampling().clone(),
             sampler: Some(sampler),
@@ -2329,6 +2350,13 @@ impl ParallelSeam {
             decode_base = plan.decode_base,
             "multimodal prompt prepared"
         );
+        let frontier = prompt_tokens.len().saturating_sub(1);
+        let frontier_is_image = plan.spans.iter().any(|span| {
+            frontier >= span.start && frontier < span.start.saturating_add(span.n_tokens)
+        });
+        // Consume image embedding rows on the legacy path, but leave the final text frontier and
+        // every sampled token to the unified scheduler so multimodal and text decodes can batch.
+        let legacy_max_new = if frontier_is_image { max_new } else { 0 };
         let result = crate::seam::generate_dense_vulkan_session(
             &self.vk,
             self.model.gguf(),
@@ -2337,7 +2365,7 @@ impl ParallelSeam {
             self.model.embd(),
             self.model.per_layer_embd(),
             &prompt_tokens,
-            max_new,
+            legacy_max_new,
             |id| {
                 crate::stream_token(
                     self.model.tokenizer(),
@@ -2359,8 +2387,62 @@ impl ParallelSeam {
                 kv.reset();
             }
         }
-        let (_, stats) = result?;
-        Ok(stats)
+        let (legacy_ids, stats) = result?;
+        if legacy_max_new > 0 || max_new == 0 || crate::sampling::abort_requested(Some(req)) {
+            return Ok(stats);
+        }
+        debug_assert!(legacy_ids.is_empty());
+
+        let prompt_end = prompt_tokens.len();
+        let generated = 0;
+        let prefill_start = stats.n_cached;
+        let remaining_prefill = prompt_end.saturating_sub(1).saturating_sub(
+            guard
+                .kv
+                .as_ref()
+                .map(crate::seam::SeamKv::cached_len)
+                .unwrap_or(0),
+        );
+        let sampler = ParallelSampler::new(req, &self.model.engine_cfg().sampling);
+        let mut queue = self
+            .decode_batch
+            .lock()
+            .expect("decode batch queue poisoned");
+        let (event_tx, event_rx) = mpsc::sync_channel(0);
+        let (ack_tx, ack_rx) = mpsc::sync_channel(0);
+        queue.waiting.push_back(BatchWork {
+            slot: guard.idx,
+            kv: Some(guard.detach()),
+            prompt: prompt_tokens,
+            prompt_end,
+            max_new,
+            generated,
+            stats,
+            phase: phase_for_remaining_prefill(remaining_prefill),
+            prefill_start,
+            checkpoint_boundary: None,
+            turn_checkpoint: None,
+            mrope_plan: Some(plan),
+            finished: false,
+            sampling: req.sampling().clone(),
+            sampler: Some(sampler),
+            channels: Some(BatchChannels {
+                events: event_tx,
+                acknowledgements: ack_rx,
+            }),
+        });
+        self.batch_interrupt.store(true, Ordering::Release);
+        self.decode_ready.notify_all();
+        drop(queue);
+        self.wait_for_decode_batch(
+            &mut guard,
+            event_rx,
+            ack_tx,
+            req,
+            &mut acc,
+            &mut printed,
+            &mut on_piece,
+        )
     }
 }
 

@@ -195,6 +195,55 @@ fn mrope_rows_are_plain_rope(
     true
 }
 
+fn full_mrope_positions(
+    plan: Option<&crate::seam::MropePlan>,
+    prompt_len: usize,
+    max_ctx: usize,
+) -> AResult<Vec<i32>> {
+    let mut positions = Vec::with_capacity(max_ctx * 4);
+    if let Some(plan) = plan {
+        let plan_prompt_len = plan.prompt_pos4.len() / 4;
+        if plan.prompt_pos4.len() % 4 != 0 || plan_prompt_len > prompt_len {
+            return Err(anyhow!(
+                "multimodal position table has {} values but the current sequence has only {prompt_len} tokens",
+                plan.prompt_pos4.len(),
+            ));
+        }
+        positions.extend_from_slice(&plan.prompt_pos4);
+        for token in plan_prompt_len..max_ctx {
+            let delta = i32::try_from(token - plan_prompt_len)
+                .map_err(|_| anyhow!("multimodal context exceeds i32 position range"))?;
+            let pos = plan
+                .decode_base
+                .checked_add(delta)
+                .ok_or_else(|| anyhow!("multimodal decode position overflow"))?;
+            positions.extend_from_slice(&[pos, pos, pos, 0]);
+        }
+    } else {
+        for token in 0..max_ctx {
+            let pos = i32::try_from(token)
+                .map_err(|_| anyhow!("text context exceeds i32 position range"))?;
+            positions.extend_from_slice(&[pos, pos, pos, 0]);
+        }
+    }
+    Ok(positions)
+}
+
+fn mrope_token_position(plan: Option<&crate::seam::MropePlan>, token: usize) -> AResult<i32> {
+    let Some(plan) = plan else {
+        return i32::try_from(token).map_err(|_| anyhow!("text position exceeds i32"));
+    };
+    let prompt_len = plan.prompt_pos4.len() / 4;
+    if token < prompt_len {
+        return Ok(plan.prompt_pos4[token * 4]);
+    }
+    let delta = i32::try_from(token - prompt_len)
+        .map_err(|_| anyhow!("multimodal decode position exceeds i32"))?;
+    plan.decode_base
+        .checked_add(delta)
+        .ok_or_else(|| anyhow!("multimodal decode position overflow"))
+}
+
 fn allocate_parallel_prefill_rows(available: &[usize], ubatch: usize) -> Vec<usize> {
     let mut rows = vec![0; available.len()];
     let mut budget = ubatch.min(available.iter().sum());
@@ -446,6 +495,7 @@ fn bind_parallel_layer_io<'a>(
     qsa_kbufs: &'a [Option<Box<dyn Buffer>>],
     qsa_cbufs: &'a [Option<Box<dyn Buffer>>],
     mrope_history_buf: &'a Option<Box<dyn Buffer>>,
+    peer_mrope_history_bufs: Option<&'a [Box<dyn Buffer>]>,
     wbufs: &'a [Box<dyn Buffer>],
     primary_wide: &'a Option<Box<dyn Buffer>>,
     primary_ple_embd: &'a Option<Box<dyn Buffer>>,
@@ -491,6 +541,30 @@ fn bind_parallel_layer_io<'a>(
             1,
             "a shared-row binding requires exactly one sequence lane"
         );
+    }
+    if let (Some(id), Some(peer_buffers)) = (h.mrope_history, peer_mrope_history_bufs) {
+        assert_eq!(
+            peer_buffers.len(),
+            peers.len(),
+            "each peer lane needs one MRoPE history buffer"
+        );
+        let rows = lanes
+            .iter()
+            .map(|&lane| {
+                if lane == 0 {
+                    mrope_history_buf
+                        .as_deref()
+                        .expect("MRoPE handle requires primary history")
+                } else {
+                    peer_buffers[lane - 1].as_ref()
+                }
+            })
+            .collect::<Vec<_>>();
+        if independent_rows {
+            b.bind_rows(id, rows);
+        } else {
+            b.bind(id, rows[0]);
+        }
     }
     for layer in 0..n_layer {
         let mut k_rows: Vec<&dyn Buffer> = Vec::with_capacity(lanes.len());
@@ -1080,6 +1154,7 @@ struct ParallelDecodeRequest<'a> {
     prompts: &'a [Vec<u32>],
     prompt_ends: &'a [usize],
     checkpoint_boundaries: &'a [Option<usize>],
+    mrope_plans: &'a [Option<&'a crate::seam::MropePlan>],
     peers: &'a mut [SeamKv],
     peer_outputs: &'a mut Vec<Vec<u32>>,
     prompt_secs: &'a mut Vec<f64>,
@@ -1164,6 +1239,7 @@ pub(crate) fn generate_dense_backend_parallel_sampled(
     prompts: &[Vec<u32>],
     prompt_ends: &[usize],
     checkpoint_boundaries: &[Option<usize>],
+    mrope_plans: &[Option<&crate::seam::MropePlan>],
     max_steps: usize,
     primary: &mut Option<SeamKv>,
     peers: &mut [SeamKv],
@@ -1176,13 +1252,15 @@ pub(crate) fn generate_dense_backend_parallel_sampled(
     if prompts.len() != peers.len() + 1
         || prompt_ends.len() != prompts.len()
         || checkpoint_boundaries.len() != prompts.len()
+        || mrope_plans.len() != prompts.len()
         || samplers.len() != prompts.len()
     {
         return Err(anyhow!(
-            "parallel token step has {} prompts, {} prompt ends, {} checkpoints, {} slots and {} samplers",
+            "parallel token step has {} prompts, {} prompt ends, {} checkpoints, {} MRoPE plans, {} slots and {} samplers",
             prompts.len(),
             prompt_ends.len(),
             checkpoint_boundaries.len(),
+            mrope_plans.len(),
             peers.len() + 1,
             samplers.len()
         ));
@@ -1194,6 +1272,7 @@ pub(crate) fn generate_dense_backend_parallel_sampled(
         prompts,
         prompt_ends,
         checkpoint_boundaries,
+        mrope_plans,
         peers,
         peer_outputs: &mut peer_outputs,
         prompt_secs: &mut prompt_secs,
@@ -1224,7 +1303,7 @@ pub(crate) fn generate_dense_backend_parallel_sampled(
         None,
         req,
         None,
-        None,
+        mrope_plans[0],
         Some(&mut parallel),
         None,
     )?;
@@ -2730,12 +2809,11 @@ fn generate_dense_backend_inner(
                 "multimodal RoPE is currently supported only by qwen4exp"
             ));
         }
-        if plan.prompt_pos4.len() != prompt.len() * 4 {
+        if plan.prompt_pos4.len() % 4 != 0 || plan.prompt_pos4.len() / 4 > prompt.len() {
             return Err(anyhow!(
-                "multimodal position table has {} values for {} prompt tokens (expected {})",
+                "multimodal position table has {} values but the current sequence has only {} tokens",
                 plan.prompt_pos4.len(),
                 prompt.len(),
-                prompt.len() * 4
             ));
         }
         if c.rope_sections.iter().sum::<u32>() == 0 {
@@ -2770,17 +2848,7 @@ fn generate_dense_backend_inner(
                 plan.decode_base
             ));
         }
-        let mut all_positions = Vec::with_capacity(max_ctx * 4);
-        all_positions.extend_from_slice(&plan.prompt_pos4);
-        for token in prompt.len()..max_ctx {
-            let delta = i32::try_from(token - prompt.len())
-                .map_err(|_| anyhow!("multimodal context exceeds i32 position range"))?;
-            let pos = plan
-                .decode_base
-                .checked_add(delta)
-                .ok_or_else(|| anyhow!("multimodal decode position overflow"))?;
-            all_positions.extend_from_slice(&[pos, pos, pos, 0]);
-        }
+        let all_positions = full_mrope_positions(Some(plan), prompt.len(), max_ctx)?;
         let _gp = req.and_then(|r| r.gate_pass());
         let buffer = be
             .alloc_uninit(all_positions.len() * 4, BufferUsage::Staging)
@@ -7280,6 +7348,7 @@ fn generate_dense_backend_inner(
                 &qsa_kbufs[..],
                 &qsa_cbufs[..],
                 &mrope_history_buf,
+                None,
                 &wbufs[..],
                 qwen_wide_buf,
                 ple_embd_buf,
@@ -7339,6 +7408,7 @@ fn generate_dense_backend_inner(
                 &qsa_kbufs[..],
                 &qsa_cbufs[..],
                 &mrope_history_buf,
+                None,
                 &wbufs[..],
                 qwen_wide_buf,
                 ple_embd_buf,
@@ -8033,11 +8103,6 @@ fn generate_dense_backend_inner(
         if !c.qwen4exp {
             return Err(anyhow!("parallel decode currently supports qwen4exp only"));
         }
-        if mm.is_some() {
-            return Err(anyhow!(
-                "parallel decode does not yet support multimodal position rows"
-            ));
-        }
         if !gpu_embed {
             return Err(anyhow!("parallel decode requires Vulkan GPU embedding"));
         }
@@ -8049,6 +8114,18 @@ fn generate_dense_backend_inner(
             return Err(anyhow!(
                 "parallel decode has {lanes} lanes but {} samplers",
                 parallel.samplers.len()
+            ));
+        }
+        if parallel.mrope_plans.len() != lanes {
+            return Err(anyhow!(
+                "parallel decode has {lanes} lanes but {} MRoPE plans",
+                parallel.mrope_plans.len()
+            ));
+        }
+        let has_multimodal_lane = parallel.mrope_plans.iter().any(Option::is_some);
+        if has_multimodal_lane != mm.is_some() {
+            return Err(anyhow!(
+                "a multimodal parallel cohort must place a multimodal lane first"
             ));
         }
         if parallel.prompt_ends.len() != lanes || parallel.checkpoint_boundaries.len() != lanes {
@@ -8129,6 +8206,23 @@ fn generate_dense_backend_inner(
         let profile_once_t0 = profile_cohort.then(std::time::Instant::now);
         let ple_heads = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram;
         let ple_row = ple_heads * c.ple_head_dim;
+        let peer_mrope_history_bufs = if has_multimodal_lane {
+            let _gp = req.and_then(|request| request.gate_pass());
+            let mut buffers = Vec::with_capacity(lanes.saturating_sub(1));
+            for (lane_prompt, plan) in parallel.prompts[1..].iter().zip(&parallel.mrope_plans[1..])
+            {
+                let positions = full_mrope_positions(*plan, lane_prompt.len(), max_ctx)?;
+                let buffer = be
+                    .alloc_uninit(positions.len() * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("allocate parallel MRoPE position table: {e}"))?;
+                be.upload(buffer.as_ref(), bytemuck::cast_slice(&positions))
+                    .map_err(|e| anyhow!("upload parallel MRoPE position table: {e}"))?;
+                buffers.push(buffer);
+            }
+            Some(buffers)
+        } else {
+            None
+        };
         let (
             ids_buf,
             pos_batch,
@@ -8212,8 +8306,9 @@ fn generate_dense_backend_inner(
                 .collect::<Vec<_>>();
             let position_rows = positions
                 .iter()
-                .map(|&position| position as i32)
-                .collect::<Vec<_>>();
+                .zip(parallel.mrope_plans)
+                .map(|(&position, plan)| mrope_token_position(*plan, position))
+                .collect::<AResult<Vec<_>>>()?;
             be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids))
                 .map_err(|e| anyhow!("{e}"))?;
             be.upload(pos_batch.as_ref(), bytemuck::cast_slice(&position_rows))
@@ -8275,6 +8370,7 @@ fn generate_dense_backend_inner(
                 &qsa_kbufs[..],
                 &qsa_cbufs[..],
                 &mrope_history_buf,
+                peer_mrope_history_bufs.as_deref(),
                 &wbufs[..],
                 qwen_wide_buf,
                 ple_embd_buf,
@@ -8349,6 +8445,7 @@ fn generate_dense_backend_inner(
                 &qsa_kbufs[..],
                 &qsa_cbufs[..],
                 &mrope_history_buf,
+                peer_mrope_history_bufs.as_deref(),
                 &wbufs[..],
                 qwen_wide_buf,
                 ple_embd_buf,
@@ -10169,9 +10266,9 @@ fn generate_dense_backend_inner(
 #[cfg(test)]
 mod tests {
     use super::{
-        allocate_parallel_prefill_rows, dense_request_exceeds_capacity, mrope_rows_are_plain_rope,
-        parallel_prefill_progress, recurrent_extension_start, resident_after_gen,
-        sampling_suffix_start, validate_token_ids,
+        allocate_parallel_prefill_rows, dense_request_exceeds_capacity, full_mrope_positions,
+        mrope_rows_are_plain_rope, mrope_token_position, parallel_prefill_progress,
+        recurrent_extension_start, resident_after_gen, sampling_suffix_start, validate_token_ids,
     };
 
     #[test]
@@ -10208,6 +10305,30 @@ mod tests {
             [11, 11, 10, 0],
             32
         ));
+    }
+
+    #[test]
+    fn parallel_mrope_history_preserves_vision_and_text_lane_positions() {
+        let plan = crate::seam::MropePlan {
+            prompt_pos4: vec![0, 0, 0, 0, 5, 2, 3, 0],
+            spans: Vec::new(),
+            decode_base: 6,
+        };
+        assert_eq!(
+            full_mrope_positions(Some(&plan), 2, 4).unwrap(),
+            [0, 0, 0, 0, 5, 2, 3, 0, 6, 6, 6, 0, 7, 7, 7, 0]
+        );
+        assert_eq!(mrope_token_position(Some(&plan), 1).unwrap(), 5);
+        assert_eq!(mrope_token_position(Some(&plan), 3).unwrap(), 7);
+        assert_eq!(
+            full_mrope_positions(Some(&plan), 3, 4).unwrap(),
+            [0, 0, 0, 0, 5, 2, 3, 0, 6, 6, 6, 0, 7, 7, 7, 0]
+        );
+        assert_eq!(
+            full_mrope_positions(None, 2, 3).unwrap(),
+            [0, 0, 0, 0, 1, 1, 1, 0, 2, 2, 2, 0]
+        );
+        assert_eq!(mrope_token_position(None, 29_772).unwrap(), 29_772);
     }
 
     #[test]

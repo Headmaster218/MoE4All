@@ -3621,14 +3621,12 @@ fn lower_op(
                     None
                 };
             if graph.independent_rows {
-                if positions4.is_some() {
-                    return Err(be(
-                        "independent-row QSA does not support multimodal positions",
-                    ));
-                }
                 let spans = independent_spans.expect("independent spans were validated");
                 let raw = resolve_rows(bindings, *k_cache, spans.len())?;
                 let compressed = resolve_rows(bindings, *block_cache, spans.len())?;
+                let position_rows = positions4
+                    .map(|id| resolve_rows(bindings, id, spans.len()))
+                    .transpose()?;
                 let q_row_bytes = *n_head as usize * *head_dim as usize * 2;
                 let dst_row_bytes = *top_blocks as usize * 4;
                 for (lane, span) in spans.iter().enumerate() {
@@ -3670,7 +3668,7 @@ fn lower_op(
                         *eps,
                         *scale,
                         segment_shifts,
-                        None,
+                        position_rows.map(|rows| (rows[lane], *sections)),
                         span.row_start as usize * q_row_bytes,
                         span.row_start as usize * dst_row_bytes,
                     );
@@ -10929,6 +10927,143 @@ mod tests {
             qsa_indexer_score_capacity_bytes(3_072, 16_384, 40_960 * 128, 128),
             3_072 * 40_960 * 4,
         );
+    }
+
+    #[test]
+    fn qsa_independent_indexer_accepts_per_lane_mrope_history() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return;
+        };
+        let (lanes, heads, head_dim, ratio, top_blocks, capacity) =
+            (2usize, 4usize, 128usize, 4usize, 2usize, 24usize);
+        let spans = vec![
+            SequenceSpan {
+                row_start: 0,
+                rows: 1,
+                start_pos: 15,
+            },
+            SequenceSpan {
+                row_start: 1,
+                rows: 1,
+                start_pos: 19,
+            },
+        ];
+        let mut graph = Graph::new();
+        graph.independent_rows = true;
+        graph.sequence_spans = spans.clone();
+        let query = graph.input(TensorDesc::new(vec![lanes, heads, head_dim], DType::F16));
+        let raw_cache = graph.input(TensorDesc::new(vec![capacity, head_dim], DType::F16));
+        let block_cache = graph.input(TensorDesc::new(
+            vec![capacity / ratio, head_dim],
+            DType::F32,
+        ));
+        let norm = graph.input(TensorDesc::new(vec![head_dim], DType::F32));
+        let positions4 = graph.input(TensorDesc::new(vec![capacity, 4], DType::I32));
+        let indices = graph.output(TensorDesc::new(vec![lanes, top_blocks], DType::I32));
+        graph.push(Op::QsaIndexer {
+            q: query,
+            k_cache: raw_cache,
+            block_cache,
+            k_norm: norm,
+            positions4: Some(positions4),
+            dst: indices,
+            rows: lanes as u32,
+            kv_len: 20,
+            compress_from: 0,
+            n_head: heads as u32,
+            head_dim: head_dim as u32,
+            top_blocks: top_blocks as u32,
+            ratio: ratio as u32,
+            rope_dim: 64,
+            theta: 10_000.0,
+            eps: 1e-6,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            sections: [11, 11, 10, 0],
+        });
+
+        let query_values = (0..lanes * heads * head_dim)
+            .map(|index| half::f16::from_f32((index as f32 * 0.017).sin()).to_bits())
+            .collect::<Vec<_>>();
+        let query_buffer = be_
+            .alloc(query_values.len() * 2, BufferUsage::Activations)
+            .unwrap();
+        let norm_buffer = be_.alloc(head_dim * 4, BufferUsage::Weights).unwrap();
+        let indices_buffer = be_
+            .alloc(lanes * top_blocks * 4, BufferUsage::Activations)
+            .unwrap();
+        be_.upload(query_buffer.as_ref(), bytemuck::cast_slice(&query_values))
+            .unwrap();
+        be_.upload(
+            norm_buffer.as_ref(),
+            bytemuck::cast_slice(&vec![1.0f32; head_dim]),
+        )
+        .unwrap();
+
+        let mut raw_buffers = Vec::new();
+        let mut block_buffers = Vec::new();
+        let mut position_buffers = Vec::new();
+        for lane in 0..lanes {
+            let raw_values = (0..capacity * head_dim)
+                .map(|index| {
+                    half::f16::from_f32(((index + lane * 37) as f32 * 0.013).cos()).to_bits()
+                })
+                .collect::<Vec<_>>();
+            let position_values = (0..capacity)
+                .flat_map(|position| {
+                    let pos = position as i32;
+                    [pos, pos + lane as i32, pos + (lane * 2) as i32, 0]
+                })
+                .collect::<Vec<_>>();
+            let raw = be_
+                .alloc(raw_values.len() * 2, BufferUsage::KvCache)
+                .unwrap();
+            let blocks = be_
+                .alloc(capacity / ratio * head_dim * 4, BufferUsage::KvCache)
+                .unwrap();
+            let positions = be_
+                .alloc(position_values.len() * 4, BufferUsage::Staging)
+                .unwrap();
+            be_.upload(raw.as_ref(), bytemuck::cast_slice(&raw_values))
+                .unwrap();
+            be_.upload(positions.as_ref(), bytemuck::cast_slice(&position_values))
+                .unwrap();
+            raw_buffers.push(raw);
+            block_buffers.push(blocks);
+            position_buffers.push(positions);
+        }
+
+        let plan = be_.compile(&graph).unwrap();
+        let mut bindings = Bindings::new();
+        bindings.bind(query, query_buffer.as_ref());
+        bindings.bind(norm, norm_buffer.as_ref());
+        bindings.bind(indices, indices_buffer.as_ref());
+        bindings.bind_rows(
+            raw_cache,
+            raw_buffers.iter().map(|buffer| buffer.as_ref()).collect(),
+        );
+        bindings.bind_rows(
+            block_cache,
+            block_buffers.iter().map(|buffer| buffer.as_ref()).collect(),
+        );
+        bindings.bind_rows(
+            positions4,
+            position_buffers
+                .iter()
+                .map(|buffer| buffer.as_ref())
+                .collect(),
+        );
+        be_.execute(plan.as_ref(), &bindings).unwrap();
+
+        let mut selected = vec![0u32; lanes * top_blocks];
+        be_.download(
+            indices_buffer.as_ref(),
+            bytemuck::cast_slice_mut(&mut selected),
+        )
+        .unwrap();
+        for (lane, blocks) in selected.chunks_exact(top_blocks).enumerate() {
+            let complete_blocks = (spans[lane].start_pos + 1) as usize / ratio;
+            assert!(blocks.iter().all(|&block| block < complete_blocks as u32));
+        }
     }
 
     #[test]
