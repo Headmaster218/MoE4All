@@ -50,9 +50,9 @@ use partial::cfg_struct;
 
 /// Policy used when a resource or execution knob is left to automatic selection.
 ///
-/// Explicit values always win over this profile. `Conservative` is the shipped default and keeps
-/// the pre-profile behavior; `Aggressive` spends more of the measured RAM/VRAM headroom and lets
-/// startup calibration explore higher-throughput execution shapes.
+/// Explicit values always win over this profile. `Conservative` is the ordinary automatic mode:
+/// it sizes from live RAM/VRAM availability. `Aggressive` uses larger total-capacity targets and
+/// lets startup calibration explore higher-throughput execution shapes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AutoProfile {
     #[default]
@@ -93,8 +93,7 @@ cfg_struct! {
         /// `INFR_CTX`: context length (the shared size grammar).
         ctx: Option<SizeSpec> = None,
         /// `INFR_AUTO_PROFILE`: policy for values left on automatic selection. Explicit RAM/VRAM,
-        /// ubatch and submit-splitter values remain authoritative. The conservative default is the
-        /// behavior shipped before profiles were introduced.
+        /// ubatch and submit-splitter values remain authoritative.
         auto_profile: AutoProfile = AutoProfile::Conservative,
         /// `INFR_VRAM_BUDGET`: total device-memory budget for this backend. Unlike
         /// `paging.cache`, this includes resident weights, KV, runtime scratch and paging arenas.

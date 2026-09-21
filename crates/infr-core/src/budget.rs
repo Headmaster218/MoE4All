@@ -166,8 +166,8 @@ pub fn reserve_bytes(total_vram: u64, override_mib: Option<u64>) -> u64 {
 /// - physical room: `guarded_available - reserve`;
 /// - configured process room: `budget - tracked_used`.
 ///
-/// With both knobs unset this is exactly `guarded_available`, preserving the historical allocator
-/// ceiling and placement behavior.
+/// This compatibility form applies explicit limits only. The automatic profile is layered by
+/// [`unified_vram_room_for_profile`].
 pub fn unified_vram_room(
     total: u64,
     guarded_available: u64,
@@ -181,6 +181,36 @@ pub fn unified_vram_room(
         spec.resolve(total).min(total).saturating_sub(tracked_used)
     });
     physical_room.min(configured_room)
+}
+
+/// Profile-aware form of [`unified_vram_room`] used when the budget and reserve may both be left
+/// to automatic policy. Conservative mode leaves 1 GiB below current free VRAM in total: the
+/// caller's 256 MiB allocator guard plus another 768 MiB here. Aggressive mode caps this backend
+/// at total VRAM minus 2 GiB while still respecting the live physical room.
+pub fn unified_vram_room_for_profile(
+    total: u64,
+    guarded_available: u64,
+    tracked_used: u64,
+    budget: Option<SizeSpec>,
+    reserve: Option<SizeSpec>,
+    profile: crate::config::AutoProfile,
+) -> u64 {
+    const CONSERVATIVE_RESERVE_AFTER_GUARD: u64 = 768 << 20;
+    const AGGRESSIVE_TOTAL_RESERVE: u64 = 2 << 30;
+
+    if budget.is_none() && reserve.is_none() {
+        return match profile {
+            crate::config::AutoProfile::Conservative => {
+                guarded_available.saturating_sub(CONSERVATIVE_RESERVE_AFTER_GUARD)
+            }
+            crate::config::AutoProfile::Aggressive => guarded_available.min(
+                total
+                    .saturating_sub(AGGRESSIVE_TOTAL_RESERVE)
+                    .saturating_sub(tracked_used),
+            ),
+        };
+    }
+    unified_vram_room(total, guarded_available, tracked_used, budget, reserve)
 }
 
 // ── VRAM-first spill bookkeeping + banner ────────────────────────────────────
@@ -556,8 +586,26 @@ mod tests {
         const MIB: u64 = 1024 * 1024;
 
         assert_eq!(
-            unified_vram_room(24 * GIB, 20 * GIB, 0, None, None),
-            20 * GIB
+            unified_vram_room_for_profile(
+                24 * GIB,
+                20 * GIB,
+                0,
+                None,
+                None,
+                crate::config::AutoProfile::Conservative,
+            ),
+            20 * GIB - 768 * MIB,
+        );
+        assert_eq!(
+            unified_vram_room_for_profile(
+                24 * GIB,
+                20 * GIB,
+                0,
+                None,
+                None,
+                crate::config::AutoProfile::Aggressive,
+            ),
+            20 * GIB,
         );
         assert_eq!(
             unified_vram_room(
