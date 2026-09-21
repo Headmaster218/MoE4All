@@ -1776,6 +1776,19 @@ const CANVAS_CHUNK_N: infr_core::tier::EnvRows = infr_core::tier::EnvRows {
     max: usize::MAX,
 };
 
+/// `attn_partial.comp`'s fixed `shared float sc[1024]` score slab. Every static split-K chunk must
+/// fit this many keys; exceeding it is an LDS out-of-bounds access that can silently corrupt the
+/// attention result instead of producing a Vulkan error.
+const ATTN_PARTIAL_MAX_KEYS: usize = 1024;
+
+fn canvas_attention_chunk(kv_len: usize, target_chunks: usize) -> usize {
+    debug_assert!(kv_len >= 2);
+    kv_len
+        .div_ceil(target_chunks.max(1))
+        .min(kv_len - 1)
+        .clamp(1, ATTN_PARTIAL_MAX_KEYS)
+}
+
 /// Cap the static split-K attention chunk COUNT so `n_chunks = span.div_ceil(chunk) <= 1024` (see
 /// [`ATTN_MAX_CHUNKS`]). Raises the chunk floor to `span.div_ceil(1024)`; only bites when
 /// `span > 512*1024` (≈524k keys, reachable under `INFR_KV_OVERFLOW` huge ctx). Below that it
@@ -5329,7 +5342,7 @@ fn lower_op(
                 let cap_short = kv_len.div_ceil(256) * 256 > att_cap_rows;
                 let chunk = if canvas_lo.is_some() && kv_len >= 2 {
                     let n = CANVAS_CHUNK_N.clamped(be_.cfg().kernels.vulkan.canvas_chunk_n);
-                    kv_len.div_ceil(n).min(kv_len - 1).max(1)
+                    canvas_attention_chunk(kv_len, n)
                 } else if batched_attn {
                     256
                 } else if segmented_read && rows >= 64 {
@@ -5361,6 +5374,11 @@ fn lower_op(
                 // span span.div_ceil(1024) <= the branch value above, so `chunk` — and the recorded
                 // dispatch — is byte-identical. (The Dynamic path caps count the same way, ~2531.)
                 let chunk = split_k_chunk_count_cap(span, chunk);
+                if chunk > ATTN_PARTIAL_MAX_KEYS {
+                    return Err(be(format!(
+                        "split-K attention chunk {chunk} exceeds attn_partial's {ATTN_PARTIAL_MAX_KEYS}-key score slab"
+                    )));
+                }
                 // Canvas forces the split-K tier regardless of row count (see `canvas_lo` above) —
                 // `attn_partial` carries the fixed `lo` override this mask needs; flash/nonfa don't.
                 let split_ok =
@@ -11624,6 +11642,20 @@ mod tests {
     /// re-tune of `ATTN_SPLIT` must face this literal.
     fn old_static_chunk(span: usize) -> usize {
         (span / 32).clamp(64, 512)
+    }
+
+    /// Vision reaches the Canvas path with one key per ViT patch. The default three-way split is
+    /// valid through 3072 patches; above that it must add chunks rather than overrun
+    /// `attn_partial.comp`'s `sc[1024]` slab (the 3128-patch image that exposed this bug).
+    #[test]
+    fn canvas_attention_chunk_respects_shader_score_slab() {
+        assert_eq!(canvas_attention_chunk(3036, 3), 1012);
+        assert_eq!(canvas_attention_chunk(3072, 3), 1024);
+        assert_eq!(canvas_attention_chunk(3128, 3), 1024);
+        assert_eq!(3128usize.div_ceil(canvas_attention_chunk(3128, 3)), 4);
+        assert_eq!(canvas_attention_chunk(4096, 3), 1024);
+        assert_eq!(canvas_attention_chunk(4096, 1), 1024);
+        assert_eq!(canvas_attention_chunk(2, 3), 1);
     }
 
     /// #2 regression guard: the chunk-COUNT cap must NOT change `chunk` (and thus `n_chunks`, the
