@@ -9025,12 +9025,10 @@ fn generate_dense_backend_inner(
         // this chunk height — see `kv_rows`' correctness bound.
         // Prefill vs in-flight decodes (`infr serve --parallel N`): the chunk is the unit of GPU
         // ownership, so a chunk is exactly how long a newly-admitted request's prefill can stall
-        // everyone else's decode. The default ubatch (INFR_UBATCH, 1024 rows) is ~100ms+ of
-        // unpreemptible GPU on a 14B — enough to visibly hitch 3 other streams. Under a gate we
-        // therefore cap an otherwise-adaptive chunk (INFR_UBATCH_PARALLEL, default 256 rows), yield
-        // the baton between chunks, and let the round-robin interleave prefill chunks with the other
-        // sequences' decode steps. An explicit INFR_UBATCH/--ubatch remains authoritative: parallel
-        // prefills take turns one full chunk at a time unless INFR_UBATCH_PARALLEL is also explicit.
+        // everyone else's decode. Automatic parallel prefill now uses the same profile-selected
+        // chunk as a single request (1024 ordinary, 2048 aggressive); INFR_UBATCH_PARALLEL remains
+        // the explicit latency-oriented cap. Yield the baton between chunks so the round-robin can
+        // interleave prefill with other sequences' decode steps.
         let ubatch: usize = if req.is_some_and(crate::sampling::RequestCtx::shares_gpu) {
             crate::seam::ubatch_rows(ec).min(crate::seam::ubatch_rows_parallel(ec))
         } else {

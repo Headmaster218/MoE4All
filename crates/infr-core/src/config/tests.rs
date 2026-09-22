@@ -110,7 +110,7 @@ fn default_config_matches_documented_defaults() {
     assert_eq!(d.device.vram_budget, None);
     assert_eq!(d.device.ram_budget, None);
     assert_eq!(d.device.vram_reserve, None);
-    assert_eq!(d.device.ubatch_parallel, 256);
+    assert_eq!(d.device.ubatch_parallel, 1024);
     assert!(!d.device.ubatch_parallel_specified);
     assert_eq!(d.device.submit_dispatches, None);
     assert_eq!(d.device.subgroup_pref, None);

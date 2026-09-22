@@ -122,10 +122,9 @@ cfg_struct! {
         /// resolved it here.
         ubatch_specified: bool = false,
         /// `INFR_UBATCH_PARALLEL`: prefill chunk for a sequence sharing the GPU (`serve -np N`).
-        ubatch_parallel: usize = 256,
-        /// Whether the parallel-prefill chunk was explicitly configured. When it was not, an
-        /// explicit `device.ubatch` also governs parallel servers; the 256-row latency default is
-        /// only for an otherwise-adaptive server.
+        ubatch_parallel: usize = 1024,
+        /// Whether the parallel-prefill chunk was explicitly configured. When it was not, parallel
+        /// prefill inherits the same profile/placement-selected chunk as a single request.
         ubatch_parallel_specified: bool = false,
         /// `INFR_SUBMIT_DISPATCHES`: submit-splitter cap (`0` = never split). `None` = the
         /// measured `initial_submit_dispatch_cap(integrated)` default.

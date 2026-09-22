@@ -1371,16 +1371,12 @@ fn default_ubatch_rows(profile: infr_core::config::AutoProfile) -> usize {
 /// Prefill chunk (rows) for a sequence SHARING the GPU with other in-flight sequences
 /// (`infr serve --parallel N`, i.e. the runner's `req` carries a `StepGate`).
 ///
-/// A prefill chunk is unpreemptible GPU: the whole chunk holds the baton, so it is exactly how long
-/// a newly-admitted request's prefill stalls every in-flight decode. The solo default (1024 rows,
-/// [`ubatch_rows`]) is ~100ms+ on a 14B — a visible hitch across 3 other streams. 256 rows bounds
-/// that to ~25-30ms (about the cost of ~4 decode steps) at a small prefill-throughput cost, which
-/// is the automatic trade when N clients are streaming. An explicit `device.ubatch` is
-/// authoritative for both solo and parallel servers: parallel prefills take turns one full chunk
-/// at a time. `device.ubatch_parallel` can still explicitly request a smaller shared-GPU chunk.
-/// The runner takes the `min` of this value and [`ubatch_rows`].
+/// Unset inherits [`ubatch_rows`], including the ordinary/aggressive profile default and any
+/// placement-selected lower rung. `device.ubatch_parallel` can explicitly request a smaller
+/// shared-GPU chunk when decode latency matters more than prefill throughput. The runner takes the
+/// `min` of this value and [`ubatch_rows`].
 pub(crate) fn ubatch_rows_parallel(ec: &EngineConfig) -> usize {
-    if !ec.device.ubatch_parallel_specified && ec.device.ubatch.is_some_and(|rows| rows > 0) {
+    if !ec.device.ubatch_parallel_specified {
         ubatch_rows(ec)
     } else {
         ec.device.ubatch_parallel
@@ -6271,7 +6267,10 @@ mod seam_helper_tests {
     fn explicit_ubatch_also_governs_parallel_prefill_unless_overridden() {
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let mut ec = EngineConfig::default();
-        assert_eq!(super::ubatch_rows_parallel(&ec), 256);
+        assert_eq!(super::ubatch_rows_parallel(&ec), 1024);
+
+        ec.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
+        assert_eq!(super::ubatch_rows_parallel(&ec), 2048);
 
         ec.device.ubatch = Some(3072);
         ec.device.ubatch_specified = true;
