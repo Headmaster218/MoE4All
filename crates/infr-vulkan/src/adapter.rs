@@ -807,7 +807,7 @@ pub(crate) struct RuntimePhaseArena {
     scratch_topology: Vec<bool>,
     scratch_layout: ScratchLayout,
     scratch: ScratchSet,
-    parked_scratch: Option<PhaseScratch>,
+    parked_scratch: Vec<PhaseScratch>,
     pool: ScratchPool,
 }
 
@@ -824,6 +824,11 @@ struct RuntimePhaseStart {
 }
 
 impl RuntimePhaseArena {
+    // Qwen3.8 MTP alternates the head draft, two target VERIFY spans and two correction spans.
+    // Retain that bounded family instead of evicting one topology on nearly every execute. Wide
+    // Prefill shapes never enter this cache (the phase transition below releases all of them).
+    const MAX_DECODE_SCRATCH_TOPOLOGIES: usize = 6;
+
     /// Enter one Decode or Prefill execute. The arena owns every graph and pooled runtime buffer
     /// for that phase even though the physical ranges may be split across Vulkan arena shards.
     fn begin_execute(&mut self, phase: RuntimePhase, layout: &ScratchLayout) -> RuntimePhaseStart {
@@ -856,10 +861,9 @@ impl RuntimePhaseArena {
         }
     }
 
-    /// Keep the two graph families used by split Qwen3.8 decode (layer 0 and layers 1..end). A
-    /// third family replaces the inactive one, bounding retained VRAM while preserving the common
-    /// A/B/A/B path. Buffers never move while an execute is live: callers enter here only after the
-    /// preceding execution has drained.
+    /// Keep a small LRU of decode graph families. Ordinary split Qwen3.8 decode uses two; MTP adds
+    /// its head draft and small VERIFY/correction shapes. Buffers never move while an execute is
+    /// live: callers enter here only after the preceding execution has drained.
     fn activate_scratch_topology(&mut self, phase: RuntimePhase, layout: &ScratchLayout) -> bool {
         let topology: Vec<bool> = layout.iter().map(Option::is_some).collect();
         if self.scratch_topology == topology {
@@ -875,7 +879,7 @@ impl RuntimePhaseArena {
             self.scratch_layout = layout.iter().map(|_| None).collect();
             self.scratch = (0..layout.len()).map(|_| None).collect();
             self.scratch_topology = topology;
-            self.parked_scratch = None;
+            self.parked_scratch.clear();
             return true;
         }
 
@@ -884,23 +888,26 @@ impl RuntimePhaseArena {
             layout: std::mem::take(&mut self.scratch_layout),
             scratch: std::mem::take(&mut self.scratch),
         });
-        if self
+        if let Some(index) = self
             .parked_scratch
-            .as_ref()
-            .is_some_and(|parked| parked.topology == topology)
+            .iter()
+            .position(|parked| parked.topology == topology)
         {
-            let parked = self.parked_scratch.take().expect("checked above");
+            let parked = self.parked_scratch.remove(index);
             self.scratch_topology = parked.topology;
             self.scratch_layout = parked.layout;
             self.scratch = parked.scratch;
-            self.parked_scratch = current;
         } else {
-            // Only one inactive family is retained. Dropping an older parked family before
-            // installing the current one returns its unified ranges to the expert filler first.
-            self.parked_scratch = current;
             self.scratch_topology = topology;
             self.scratch_layout = layout.iter().map(|_| None).collect();
             self.scratch = (0..layout.len()).map(|_| None).collect();
+        }
+        if let Some(current) = current {
+            self.parked_scratch.push(current);
+            let parked_limit = Self::MAX_DECODE_SCRATCH_TOPOLOGIES.saturating_sub(1);
+            if self.parked_scratch.len() > parked_limit {
+                self.parked_scratch.remove(0);
+            }
         }
         true
     }
@@ -994,7 +1001,7 @@ impl RuntimePhaseArena {
         self.scratch_topology.clear();
         self.scratch.clear();
         self.scratch_layout.clear();
-        self.parked_scratch = None;
+        self.parked_scratch.clear();
         self.pool.clear();
     }
 }
@@ -9466,8 +9473,8 @@ struct PagedMoeShared {
 }
 
 /// Recognize the exact Qwen sigmoid-gated shared-expert tail emitted by `seam::runner`. This is a
-/// backend peephole rather than a graph semantic change: other backends and prefill retain the
-/// ordinary dense chain, while Vulkan decode can place the shared expert in routed slot 8.
+/// backend peephole rather than a graph semantic change: other backends retain the ordinary dense
+/// chain, while Vulkan small-m decode/VERIFY can place the shared expert in routed slot 8.
 fn paged_moe_shared_at(graph: &Graph, op_idx: usize) -> Option<PagedMoeShared> {
     // Validation/escape hatch: permits same-binary A/B and an immediate fallback if a future
     // model reuses the exact graph shape but violates an unstated packing invariant.
@@ -9493,7 +9500,12 @@ fn paged_moe_shared_at(graph: &Graph, op_idx: usize) -> Option<PagedMoeShared> {
     else {
         return None;
     };
-    if graph.desc(*x).numel() != *ne as usize || *n_used >= 31 {
+    let rows = graph.desc(*x).numel().checked_div(*ne as usize)?;
+    if rows == 0
+        || rows > MOE_HIT_FIRST_MAX_ROWS
+        || graph.desc(*x).numel() != rows * *ne as usize
+        || *n_used >= 31
+    {
         return None;
     }
     let supported_routed = |id: TensorId| {
@@ -9513,7 +9525,7 @@ fn paged_moe_shared_at(graph: &Graph, op_idx: usize) -> Option<PagedMoeShared> {
         x: gate_x,
         weight: gate_inp,
         dst: gate,
-        m: 1,
+        m: gate_rows,
         in_f: gate_in,
         out_f: 1,
         w_off: 0,
@@ -9525,7 +9537,7 @@ fn paged_moe_shared_at(graph: &Graph, op_idx: usize) -> Option<PagedMoeShared> {
         x: gx,
         weight: wgate,
         dst: gbuf,
-        m: 1,
+        m: g_rows,
         in_f: gin,
         out_f: gout,
         w_off: 0,
@@ -9537,7 +9549,7 @@ fn paged_moe_shared_at(graph: &Graph, op_idx: usize) -> Option<PagedMoeShared> {
         x: ux,
         weight: wup,
         dst: ubuf,
-        m: 1,
+        m: u_rows,
         in_f: uin,
         out_f: uout,
         w_off: 0,
@@ -9549,7 +9561,7 @@ fn paged_moe_shared_at(graph: &Graph, op_idx: usize) -> Option<PagedMoeShared> {
         gate: ag,
         up: au,
         dst: abuf,
-        rows: 1,
+        rows: act_rows,
         nff,
         act: Activation::Silu,
         up_off: 0,
@@ -9565,7 +9577,7 @@ fn paged_moe_shared_at(graph: &Graph, op_idx: usize) -> Option<PagedMoeShared> {
         x: dx,
         weight: wdown,
         dst: d_out,
-        m: 1,
+        m: down_rows,
         in_f: din,
         out_f: dout,
         w_off: 0,
@@ -9578,7 +9590,7 @@ fn paged_moe_shared_at(graph: &Graph, op_idx: usize) -> Option<PagedMoeShared> {
         shexp,
         gate: add_gate,
         dst,
-        rows: 1,
+        rows: add_rows,
         n,
     } = add_op
     else {
@@ -9586,7 +9598,14 @@ fn paged_moe_shared_at(graph: &Graph, op_idx: usize) -> Option<PagedMoeShared> {
     };
     let ne = *ne;
     let nff_exp = *n_ff_exp;
-    if *gate_x != *x
+    let rows = rows as u32;
+    if *gate_rows != rows
+        || *g_rows != rows
+        || *u_rows != rows
+        || *act_rows != rows
+        || *down_rows != rows
+        || *add_rows != rows
+        || *gate_x != *x
         || *gx != *x
         || *ux != *x
         || *gate_in != ne
@@ -9747,10 +9766,11 @@ fn execute_paged_moe<'a>(
     );
     let rows = graph.desc(*x).numel() / ne;
     let n_slots = rows * n_used;
-    let parallel_decode = rows > 1
-        && graph.independent_rows
-        && graph.sequence_spans.len() == rows
-        && graph.sequence_spans.iter().all(|span| span.rows == 1);
+    // MoE has no cross-row recurrence. The same per-row hit/miss masks used by parallel decode are
+    // therefore valid for a short causal VERIFY batch too; attention and DeltaNet remain on their
+    // original causal graph paths outside this local op.
+    let row_hit_masks =
+        rows > 1 && rows <= MOE_HIT_FIRST_MAX_ROWS && n_slots <= MOE_HIT_FIRST_MAX_SLOTS;
     let physical_used = n_used + usize::from(shared.is_some());
     let physical_slots = rows * physical_used;
     let routed_mask = if n_used == u32::BITS as usize {
@@ -9791,7 +9811,7 @@ fn execute_paged_moe<'a>(
         pool,
         be_,
         "moe_paged_ids",
-        (n_slots + usize::from(parallel_decode) * 2 * rows) * 4,
+        (n_slots + usize::from(row_hit_masks) * 2 * rows) * 4,
         BufferUsage::Staging,
     )?;
     let wts = pooled(pool, be_, "moe_paged_wts", n_slots * 4)?;
@@ -10115,14 +10135,15 @@ fn execute_paged_moe<'a>(
     let mut row_mask_bank = MOE_ROW_MASK_NONE;
     let mut role_batches_preopened = false;
     let mut promotion_probe = None;
-    // Decode-only hit-first schedule: launch complete resident Gate/Up/Down triplets while every
-    // missing triplet is promoted. A scalar decode uses the original push-constant mask; an
-    // independent-row decode cohort appends one mask per row for each half to the immutable ids
-    // buffer. The original slot order is retained, so router weights and final accumulation stay
-    // byte-for-byte in their ordinary layout. Keep the pager epoch open across both halves: miss
-    // insertion may then use any cold slot except the hit weights still being read by the GPU.
+    // Small-m hit-first schedule: launch complete resident Gate/Up/Down triplets while every
+    // missing triplet is promoted. A scalar decode uses the original push-constant mask; a short
+    // multi-row batch appends one mask per row for each half to the immutable ids buffer. The
+    // original slot order is retained, so router weights and final accumulation stay byte-for-byte
+    // in their ordinary layout. Keep the pager epoch open across both halves: miss insertion may
+    // then use any cold slot except the hit weights still being read by the GPU.
     if !layer_stream
-        && (rows == 1 || parallel_decode)
+        && (rows == 1 || row_hit_masks)
+        && matches!(&moe_scratch, PagedMoeScratch::Small(_))
         && !*fused_gate_up
         && !*weight_before
         && stage_ids.len() == n_slots
@@ -10163,7 +10184,7 @@ fn execute_paged_moe<'a>(
                     miss_count += 1;
                 }
             }
-            if parallel_decode {
+            if row_hit_masks {
                 let mut ids_and_masks =
                     [0u32; MOE_HIT_FIRST_MAX_SLOTS + 2 * MOE_HIT_FIRST_MAX_ROWS];
                 ids_and_masks[..n_slots].copy_from_slice(stage_ids.as_slice());
@@ -10208,7 +10229,7 @@ fn execute_paged_moe<'a>(
                 let down_hit_w =
                     stage_and_window(be_, rec, ps, down_id, &[], n_expert, false, true)?;
                 let PagedMoeScratch::Small(scratch) = &moe_scratch else {
-                    unreachable!("decode hit-first path always uses small-m scratch")
+                    unreachable!("hit-first path always uses small-m scratch")
                 };
                 let (gbuf, ubuf, abuf, ybuf) = (
                     scratch.gbuf,
@@ -10224,12 +10245,12 @@ fn execute_paged_moe<'a>(
                 rec2.zero(pool[&ybuf].as_ref(), physical_slots * ne);
                 rec2.arena_stream_barrier();
                 let xb = r(*x)?;
-                let first_mask = if parallel_decode {
+                let first_mask = if row_hit_masks {
                     0
                 } else {
                     hit_masks[0] | shared_mask
                 };
-                let first_row_mask_bank = if parallel_decode {
+                let first_row_mask_bank = if row_hit_masks {
                     MOE_ROW_MASK_HITS
                 } else {
                     MOE_ROW_MASK_NONE
@@ -10337,8 +10358,8 @@ fn execute_paged_moe<'a>(
                 *rec = Some(fresh);
                 stage_ids.clear();
                 stage_ids.extend_from_slice(&miss_ids[..miss_count]);
-                active_mask = if parallel_decode { 0 } else { miss_masks[0] };
-                row_mask_bank = if parallel_decode {
+                active_mask = if row_hit_masks { 0 } else { miss_masks[0] };
+                row_mask_bank = if row_hit_masks {
                     MOE_ROW_MASK_MISSES
                 } else {
                     MOE_ROW_MASK_NONE
@@ -11445,6 +11466,49 @@ mod tests {
     }
 
     #[test]
+    fn runtime_phase_retains_the_bounded_mtp_decode_family() {
+        let mut arena = RuntimePhaseArena::default();
+        let layouts = (0..RuntimePhaseArena::MAX_DECODE_SCRATCH_TOPOLOGIES)
+            .map(|slot| {
+                (0..RuntimePhaseArena::MAX_DECODE_SCRATCH_TOPOLOGIES)
+                    .map(|i| (i == slot).then_some((slot + 1) * 4))
+                    .collect::<ScratchLayout>()
+            })
+            .collect::<Vec<_>>();
+
+        for layout in &layouts {
+            let start = arena.begin_execute(RuntimePhase::Decode, layout);
+            assert!(!start.scratch_reused);
+            arena.install_scratch(
+                layout,
+                layout
+                    .iter()
+                    .map(|bytes| bytes.map(|n| Box::new(TestBuffer(n)) as Box<dyn Buffer>))
+                    .collect(),
+            );
+        }
+
+        for layout in &layouts {
+            let start = arena.begin_execute(RuntimePhase::Decode, layout);
+            assert!(
+                start.scratch_reused,
+                "all bounded MTP topologies must survive"
+            );
+        }
+
+        let overflow = vec![Some(64); RuntimePhaseArena::MAX_DECODE_SCRATCH_TOPOLOGIES];
+        assert!(
+            !arena
+                .begin_execute(RuntimePhase::Decode, &overflow)
+                .scratch_reused
+        );
+        assert_eq!(
+            arena.parked_scratch.len(),
+            RuntimePhaseArena::MAX_DECODE_SCRATCH_TOPOLOGIES - 1
+        );
+    }
+
+    #[test]
     fn runtime_phase_prefill_releases_the_previous_scratch_topology() {
         let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut arena = RuntimePhaseArena::default();
@@ -11475,7 +11539,7 @@ mod tests {
         assert!(!start.scratch_reused);
         assert!(!start.reset_retained_scratch);
         assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 2);
-        assert!(arena.parked_scratch.is_none());
+        assert!(arena.parked_scratch.is_empty());
         assert!(arena.pool.buffers.is_empty());
         assert_eq!(arena.scratch_topology, vec![false, true]);
         assert_eq!(arena.scratch.len(), tail.len());

@@ -10,6 +10,54 @@ use super::{BindWeightFn, MtpTensor};
 
 pub const DRAFT_TOKENS: usize = 4;
 
+struct PhaseProfile {
+    name: &'static str,
+    start: std::time::Instant,
+    before: Option<infr_core::pager_profile::Snapshot>,
+}
+
+impl PhaseProfile {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            start: std::time::Instant::now(),
+            before: infr_core::pager_profile::active().then(infr_core::pager_profile::snapshot),
+        }
+    }
+}
+
+impl Drop for PhaseProfile {
+    fn drop(&mut self) {
+        let Some(before) = self.before.as_ref() else {
+            return;
+        };
+        let after = infr_core::pager_profile::snapshot();
+        let delta = |a: u64, b: u64| a.saturating_sub(b);
+        let ms = |a: u64, b: u64| delta(a, b) as f64 / 1e6;
+        // Backend sub-timers overlap; these are scoped counters, not additive wall-time shares.
+        tracing::info!(
+            "[qwen4 mtp phase] name={} wall={:.2}ms backend={:.2}ms setup={:.2}ms scratch={:.2}ms record={:.2}ms sync={:.2}ms idle={:.2}ms paging_sync={:.2}ms submits={} hits={} misses={} push={:.2}MiB/{:.2}ms dma={:.2}MiB dma_gpu={:.2}ms ple_wait={:.2}ms",
+            self.name,
+            self.start.elapsed().as_secs_f64() * 1e3,
+            ms(after.backend_execute_ns, before.backend_execute_ns),
+            ms(after.backend_setup_ns, before.backend_setup_ns),
+            ms(after.backend_setup_phase_scratch_ns, before.backend_setup_phase_scratch_ns),
+            ms(after.command_record_ns, before.command_record_ns),
+            ms(after.sync_wait_ns, before.sync_wait_ns),
+            ms(after.queue_idle_wait_ns, before.queue_idle_wait_ns),
+            ms(after.paging_sync_wait_ns, before.paging_sync_wait_ns),
+            delta(after.queue_submits, before.queue_submits),
+            delta(after.gpu_hits, before.gpu_hits),
+            delta(after.gpu_misses, before.gpu_misses),
+            delta(after.memcpy_bytes, before.memcpy_bytes) as f64 / 1048576.0,
+            ms(after.memcpy_ns, before.memcpy_ns),
+            delta(after.dedicated_transfer_bytes, before.dedicated_transfer_bytes) as f64 / 1048576.0,
+            ms(after.dedicated_transfer_gpu_ns, before.dedicated_transfer_gpu_ns),
+            ms(after.ple_wait_ns, before.ple_wait_ns),
+        );
+    }
+}
+
 struct Qwen4MtpWeights {
     hc_attn_norm: MtpTensor,
     hc_attn_down: MtpTensor,
@@ -813,13 +861,13 @@ fn build_catch_graph(
 struct DraftHandles {
     id: TensorId,
     h: TensorId,
-    positions: [TensorId; DRAFT_TOKENS],
+    positions: Vec<TensorId>,
     k_cache: TensorId,
     v_cache: TensorId,
     weights: Vec<TensorId>,
     embd: TensorId,
     lm_head: TensorId,
-    ids: [TensorId; DRAFT_TOKENS],
+    ids: Vec<TensorId>,
 }
 
 fn build_draft_graph(
@@ -828,6 +876,7 @@ fn build_draft_graph(
     shared: [(DType, usize); 2],
     max_ctx: usize,
     start_pos: usize,
+    steps: usize,
 ) -> (Graph, DraftHandles) {
     let mut g = Graph::new();
     let f32d = |n| TensorDesc::new(vec![n], DType::F32);
@@ -835,28 +884,36 @@ fn build_draft_graph(
     let kvrow = cfg.n_kv * cfg.head_dim;
     let id = g.input(TensorDesc::new(vec![1], DType::I32));
     let h = g.input(f32d(hcw));
-    let positions = std::array::from_fn(|_| g.input(TensorDesc::new(vec![1], DType::I32)));
+    let positions = (0..steps)
+        .map(|_| g.input(TensorDesc::new(vec![1], DType::I32)))
+        .collect::<Vec<_>>();
     let k_cache = g.input(TensorDesc::new(vec![max_ctx * kvrow], DType::F16));
     let v_cache = g.input(TensorDesc::new(vec![max_ctx * kvrow], DType::F16));
     let (weights, handles) = declare_weights(&mut g, specs, shared[0], shared[1]);
     let scratch = step_scratch(&mut g, cfg, 1);
     let mut prev_id = id;
     let mut prev_h = h;
-    let mut out_ids = Vec::with_capacity(DRAFT_TOKENS);
-    for step in 0..DRAFT_TOKENS {
+    let mut out_ids = Vec::with_capacity(steps.saturating_sub(1));
+    for (step, &position) in positions.iter().enumerate() {
         emit_bridge(&mut g, cfg, 1, prev_id, prev_h, &weights, &scratch);
         let h_next = g.internal(f32d(hcw));
         emit_full_step(
             &mut g,
             cfg,
             start_pos + step,
-            positions[step],
+            position,
             k_cache,
             v_cache,
             &weights,
             &scratch,
             h_next,
         );
+        // The last step is needed to commit the final verified token to the MTP KV cache, but its
+        // prediction is not part of this target batch. Avoid an unused HC mix, vocab projection,
+        // argmax and readback.
+        if step + 1 == steps {
+            break;
+        }
         let head_hidden = g.internal(f32d(cfg.n_embd));
         emit_hc_mix(
             &mut g,
@@ -905,7 +962,7 @@ fn build_draft_graph(
             weights: handles,
             embd: weights.embd,
             lm_head: weights.lm_head,
-            ids: out_ids.try_into().expect("fixed four draft ids"),
+            ids: out_ids,
         },
     )
 }
@@ -1092,14 +1149,19 @@ impl Qwen4MtpSession {
         Ok(())
     }
 
-    pub(crate) fn draft4(
+    pub(crate) fn draft(
         &self,
         be: &dyn Backend,
         token: u32,
         h: &[f32],
         start_pos: usize,
+        verify_tokens: usize,
         shared: ((&dyn Buffer, DType, usize), (&dyn Buffer, DType, usize)),
-    ) -> Result<[u32; DRAFT_TOKENS]> {
+    ) -> Result<Vec<u32>> {
+        anyhow::ensure!(
+            (2..=DRAFT_TOKENS).contains(&verify_tokens),
+            "Qwen3.8 MTP verify width {verify_tokens} is outside 2..={DRAFT_TOKENS}"
+        );
         let hcw = self.cfg.hc_mult * self.cfg.n_embd;
         if h.len() != hcw {
             bail!(
@@ -1107,14 +1169,14 @@ impl Qwen4MtpSession {
                 h.len()
             );
         }
-        if start_pos + DRAFT_TOKENS > self.max_ctx {
+        if start_pos + verify_tokens > self.max_ctx {
             bail!("Qwen3.8 MTP draft exceeds {} token cache", self.max_ctx);
         }
         be.upload(self.draft_id.as_ref(), bytemuck::bytes_of(&(token as i32)))
             .map_err(|e| anyhow!("{e}"))?;
         be.upload(self.draft_h.as_ref(), bytemuck::cast_slice(h))
             .map_err(|e| anyhow!("{e}"))?;
-        for (step, buffer) in self.draft_positions.iter().enumerate() {
+        for (step, buffer) in self.draft_positions[..verify_tokens].iter().enumerate() {
             be.upload(
                 buffer.as_ref(),
                 bytemuck::bytes_of(&((start_pos + step) as i32)),
@@ -1122,8 +1184,14 @@ impl Qwen4MtpSession {
             .map_err(|e| anyhow!("{e}"))?;
         }
         let specs = [(shared.0 .1, shared.0 .2), (shared.1 .1, shared.1 .2)];
-        let (graph, handles) =
-            build_draft_graph(&self.cfg, &self.specs, specs, self.max_ctx, start_pos);
+        let (graph, handles) = build_draft_graph(
+            &self.cfg,
+            &self.specs,
+            specs,
+            self.max_ctx,
+            start_pos,
+            verify_tokens,
+        );
         let plan = be.compile(&graph).map_err(|e| anyhow!("{e}"))?;
         let mut bindings = Bindings::new();
         bindings.bind(handles.id, self.draft_id.as_ref());
@@ -1146,7 +1214,7 @@ impl Qwen4MtpSession {
         );
         be.execute(plan.as_ref(), &bindings)
             .map_err(|e| anyhow!("{e}"))?;
-        let mut result = [0u32; DRAFT_TOKENS];
+        let mut result = vec![0u32; verify_tokens - 1];
         for (dst, buffer) in result.iter_mut().zip(&self.draft_ids) {
             be.download(buffer.as_ref(), bytemuck::bytes_of_mut(dst))
                 .map_err(|e| anyhow!("{e}"))?;
@@ -1210,6 +1278,11 @@ impl Qwen4MtpRuntime {
     ) -> Result<(crate::GenStats, super::MtpTiming)> {
         let cfg = model.config();
         let ec = model.engine_cfg();
+        // Treat spec.k as a ceiling. Three rows are the measured sweet spot for the short target
+        // batch: two rows need too many paging rounds, while four spend more on VERIFY than their
+        // additional accepts recover.
+        let max_verify_tokens = ec.spec.k.clamp(2, DRAFT_TOKENS);
+        let verify_tokens = max_verify_tokens.min(3);
         let h_width = cfg.hc_mult * cfg.n_embd;
         let prompt_tokens = model.encode(prompt)?;
         if prompt_tokens.is_empty() {
@@ -1272,13 +1345,11 @@ impl Qwen4MtpRuntime {
         let prompt_secs = t_prime.elapsed().as_secs_f64();
 
         let mut committed = prompt_tokens;
-        let mut last_token = *committed.last().expect("non-empty prompt");
-        // The NextN block is trained on (token_i, target_hidden_{i-1}) at position i. Keep both
-        // sides of that one-row offset: `last_h` seeds catch-up for the next committed token,
-        // while `draft_h` pairs with `last_token` to predict that next token.
-        let mut last_h = prime_h[(p - 1) * h_width..].to_vec();
-        let mut draft_h = shifted_h[(p - 1) * h_width..].to_vec();
-        let mut target_prediction = prime_ids[p - 1];
+        // Keep the target's already-known next token one row ahead of the committed trunk state.
+        // The next VERIFY consumes it as row zero, so every batch commits at least one token and
+        // rejection never needs a separate correction forward or MTP-head catch-up.
+        let mut pending_token = prime_ids[p - 1];
+        let mut pending_h = prime_h[(p - 1) * h_width..].to_vec();
         let mut acc = Vec::new();
         let mut printed = 0usize;
         let mut generated = 0usize;
@@ -1289,32 +1360,36 @@ impl Qwen4MtpRuntime {
             !ec.sampling.ignore_eos && (cfg.eos_ids.contains(&token) || token == cfg.eos)
         };
 
-        while generated < max_new && !req.is_some_and(crate::sampling::RequestCtx::aborted) {
+        'decode: while generated < max_new && !req.is_some_and(crate::sampling::RequestCtx::aborted)
+        {
             cycle += 1;
             let n_past = committed.len();
 
             let t_draft = std::time::Instant::now();
             let candidates = {
+                let _profile = PhaseProfile::new("draft");
                 let shared = self
                     .trunk
                     .as_ref()
                     .expect("target trunk remains initialized")
                     .mtp_shared_weights();
                 self.head
-                    .draft4(vk, last_token, &draft_h, n_past - 1, shared)?
+                    .draft(vk, pending_token, &pending_h, n_past, verify_tokens, shared)?
             };
             let draft_secs = t_draft.elapsed().as_secs_f64();
             timing.draft_secs += draft_secs;
-            timing.total_drafted += DRAFT_TOKENS;
+            timing.total_drafted += verify_tokens - 1;
 
-            let mut feed = Vec::with_capacity(committed.len() + DRAFT_TOKENS);
+            let mut feed = Vec::with_capacity(committed.len() + verify_tokens);
             feed.extend_from_slice(&committed);
-            feed.extend_from_slice(&candidates);
+            feed.push(pending_token);
+            feed.extend_from_slice(&candidates[..verify_tokens - 1]);
             self.trunk
                 .as_mut()
                 .expect("target trunk remains initialized")
-                .mtp_arm_delta_trace(DRAFT_TOKENS)?;
+                .mtp_arm_delta_trace(verify_tokens)?;
             let t_verify = std::time::Instant::now();
+            let verify_profile = PhaseProfile::new("verify");
             let (target_bind, finish_fixed_allocations) = crate::seam::vulkan_moe_binder(
                 vk,
                 model.gguf(),
@@ -1336,123 +1411,50 @@ impl Qwen4MtpRuntime {
                 finish_fixed_allocations.as_deref(),
             )?;
             let verify_secs = t_verify.elapsed().as_secs_f64();
+            drop(verify_profile);
             timing.verify_secs += verify_secs;
             anyhow::ensure!(
-                verify_ids.len() == DRAFT_TOKENS
-                    && verify_h.len() == DRAFT_TOKENS * h_width,
-                "Qwen3.8 MTP VERIFY must return exactly {DRAFT_TOKENS} rows; got {} ids and {} hidden values",
+                verify_ids.len() == verify_tokens
+                    && verify_h.len() == verify_tokens * h_width,
+                "Qwen3.8 MTP VERIFY must return exactly {verify_tokens} rows; got {} ids and {} hidden values",
                 verify_ids.len(),
                 verify_h.len()
             );
 
-            let accepted = (0..DRAFT_TOKENS)
-                .take_while(|&i| {
-                    let expected = if i == 0 {
-                        target_prediction
-                    } else {
-                        verify_ids[i - 1]
-                    };
-                    candidates[i] == expected
-                })
+            let accepted_spec = (0..verify_tokens - 1)
+                .take_while(|&i| candidates[i] == verify_ids[i])
                 .count();
-            timing.total_accepted += accepted;
+            let accepted = accepted_spec + 1;
+            timing.total_accepted += accepted_spec;
 
             let t_catchup = std::time::Instant::now();
-            let emitted: Vec<u32>;
-            if accepted == DRAFT_TOKENS {
-                let mut catch_h = Vec::with_capacity(DRAFT_TOKENS * h_width);
-                catch_h.extend_from_slice(&last_h);
-                catch_h.extend_from_slice(&verify_h[..(DRAFT_TOKENS - 1) * h_width]);
-                {
-                    let shared = self
-                        .trunk
-                        .as_ref()
-                        .expect("target trunk remains initialized")
-                        .mtp_shared_weights();
-                    self.head
-                        .catch_up(vk, &candidates, &catch_h, n_past, shared)?;
-                }
-                committed.extend_from_slice(&candidates);
-                last_token = candidates[DRAFT_TOKENS - 1];
-                draft_h =
-                    verify_h[(DRAFT_TOKENS - 2) * h_width..(DRAFT_TOKENS - 1) * h_width].to_vec();
-                last_h = verify_h[(DRAFT_TOKENS - 1) * h_width..].to_vec();
-                target_prediction = verify_ids[DRAFT_TOKENS - 1];
-                self.trunk
-                    .as_mut()
-                    .expect("target trunk remains initialized")
-                    .mtp_snapshot_delta(vk, cfg)?;
-                emitted = candidates.to_vec();
-            } else {
-                let correction = if accepted == 0 {
-                    target_prediction
-                } else {
-                    verify_ids[accepted - 1]
-                };
-                let mut catch_tokens = candidates[..accepted].to_vec();
-                catch_tokens.push(correction);
-                let mut catch_h = Vec::with_capacity(catch_tokens.len() * h_width);
-                catch_h.extend_from_slice(&last_h);
-                catch_h.extend_from_slice(&verify_h[..accepted * h_width]);
-                let next_draft_h = if accepted == 0 {
-                    last_h.clone()
-                } else {
-                    verify_h[(accepted - 1) * h_width..accepted * h_width].to_vec()
-                };
-                {
-                    let shared = self
-                        .trunk
-                        .as_ref()
-                        .expect("target trunk remains initialized")
-                        .mtp_shared_weights();
-                    self.head
-                        .catch_up(vk, &catch_tokens, &catch_h, n_past, shared)?;
-                }
-
+            if accepted < verify_tokens {
                 let trunk = self
                     .trunk
                     .as_mut()
                     .expect("target trunk remains initialized");
+                let restore_profile = PhaseProfile::new("restore");
                 trunk.mtp_restore_delta_row(vk, accepted)?;
-                committed.extend_from_slice(&candidates[..accepted]);
-                committed.push(correction);
-                let (next_prediction, _, correction_h) = super::run_prime_last(
-                    vk,
-                    &|_name, bytes, dtype, _numel| {
-                        let bytes = bytes.materialize();
-                        let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
-                        let buffer = vk
-                            .alloc(padded.len(), BufferUsage::Weights)
-                            .map_err(|e| anyhow!("{e}"))?;
-                        vk.upload(buffer.as_ref(), &padded)
-                            .map_err(|e| anyhow!("{e}"))?;
-                        Ok((buffer, dtype))
-                    },
-                    model.gguf(),
-                    cfg,
-                    ec,
-                    model.embd(),
-                    &committed,
-                    &mut self.trunk,
-                    self.max_ctx,
-                    false,
-                )?;
-                self.trunk
-                    .as_mut()
-                    .expect("target trunk remains initialized")
-                    .mtp_snapshot_delta(vk, cfg)?;
-                last_token = correction;
-                draft_h = next_draft_h;
-                last_h = correction_h;
-                target_prediction = next_prediction;
-                emitted = catch_tokens;
+                drop(restore_profile);
             }
+            let new_tokens = &feed[n_past..n_past + accepted];
+            committed.extend_from_slice(new_tokens);
+            pending_token = verify_ids[accepted - 1];
+            pending_h = verify_h[(accepted - 1) * h_width..accepted * h_width].to_vec();
+            let snapshot_profile = PhaseProfile::new("snapshot");
+            self.trunk
+                .as_mut()
+                .expect("target trunk remains initialized")
+                .mtp_snapshot_delta(vk, cfg)?;
+            drop(snapshot_profile);
+            let emitted = new_tokens.to_vec();
             let catchup_secs = t_catchup.elapsed().as_secs_f64();
             timing.catchup_secs += catchup_secs;
 
             if ec.prof.stages {
                 tracing::info!(
-                    "[qwen4 mtp cycle {cycle}] drafted={DRAFT_TOKENS} accepted={accepted} draft={:.1}ms verify={:.1}ms catchup={:.1}ms",
+                    "[qwen4 mtp cycle {cycle}] drafted={} accepted={accepted_spec} committed={accepted} draft={:.1}ms verify={:.1}ms catchup={:.1}ms",
+                    verify_tokens - 1,
                     draft_secs * 1e3,
                     verify_secs * 1e3,
                     catchup_secs * 1e3,
@@ -1471,7 +1473,7 @@ impl Qwen4MtpRuntime {
                     );
                 }
                 if eos || generated >= max_new {
-                    break;
+                    break 'decode;
                 }
             }
         }

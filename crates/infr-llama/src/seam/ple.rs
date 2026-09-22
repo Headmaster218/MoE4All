@@ -405,9 +405,11 @@ impl WorkerState {
             len: output_len,
         };
         let independent_batch = spans.len() > 1;
+        let multirow_span = spans.iter().any(|span| span.rows > 1);
         let parallel = self.gather_threads > 1
             && (self.groups.len() >= PARALLEL_MIN_UNIQUE_ROWS
-                || (independent_batch && self.groups.len() > 1));
+                || ((independent_batch || multirow_span)
+                    && self.groups.len() >= self.gather_threads * 2));
         let work_t0 = profile.then(std::time::Instant::now);
         let table: &[u8] = &self.table;
         let requests = &self.requests;

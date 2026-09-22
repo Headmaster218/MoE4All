@@ -9,8 +9,8 @@ use super::segmented_kv::{PlaneKind, SegmentedKvLayout};
 use super::weights::{
     alloc_segmented_plane, AttnW, DeltaW, Dsv4CompressedW, Dsv4CompressorW, Dsv4IndexerW, Dsv4W,
     FfnW, HcTriple, IndexerW, KdaW, LayerHcW, LayerW, MixerW, MlaW, MoeSharedW, MtpDeltaCkpt, QsaW,
-    QwenHcW, QwenLayerHcW, QwenPleW, SeamKv, SeamWeights, SegmentedKvState, SessionStable,
-    TurnRecurrentCkpt,
+    QwenHcW, QwenLayerHcW, QwenMtpVerifyBuffers, QwenPleW, SeamKv, SeamWeights, SegmentedKvState,
+    SessionStable, TurnRecurrentCkpt,
 };
 use super::{
     common_prefix_len, e2b_ipl_rows, kv_forces_static, BindWeight, TurnCheckpoint, WBytes,
@@ -1162,6 +1162,7 @@ fn finish_pending_seam_slot(
         },
         ple_embd_buf: pending.ple_embd_buf,
         ple_state_buf: pending.ple_state_buf,
+        mtp_verify_bufs: None,
         max_ctx: want_ctx,
         kv_ring,
         cached: Vec::new(),
@@ -2566,6 +2567,36 @@ fn generate_dense_backend_inner(
         } else {
             None
         };
+        let mtp_verify_bufs = if ec.spec.mtp && c.qwen4exp {
+            let rows = crate::mtp::DRAFT_TOKENS;
+            let h_width = c.hc_mult * ne;
+            let ple_row = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram * c.ple_head_dim;
+            Some(QwenMtpVerifyBuffers {
+                ids: be
+                    .alloc(rows * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?,
+                positions: be
+                    .alloc(rows * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?,
+                wide: be
+                    .alloc_uninit(rows * h_width * 4, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+                ple: be
+                    .alloc(rows * ple_row * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?,
+                logits: be
+                    .alloc(rows * c.vocab * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?,
+                h_out: be
+                    .alloc(rows * h_width * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?,
+                out_ids: be
+                    .alloc(rows * 4, BufferUsage::Readback)
+                    .map_err(|e| anyhow!("{e}"))?,
+            })
+        } else {
+            None
+        };
 
         if let Some(finish) = finish_fixed_allocations {
             finish()?;
@@ -2676,6 +2707,7 @@ fn generate_dense_backend_inner(
             qwen_wide_buf,
             ple_embd_buf,
             ple_state_buf,
+            mtp_verify_bufs,
             max_ctx: want_ctx,
             kv_ring,
             cached: Vec::new(),
@@ -2783,6 +2815,7 @@ fn generate_dense_backend_inner(
         qwen_wide_buf,
         ple_embd_buf,
         ple_state_buf,
+        mtp_verify_bufs,
         max_ctx,
         cached,
         denoise_cache,
@@ -8042,77 +8075,87 @@ fn generate_dense_backend_inner(
                 .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?
                 .submit_range(prompt, start, m, c.ple_ngram_size)?;
 
-            let ids_buf = be
-                .alloc(m * 4, BufferUsage::Staging)
+            let want_h = h_out.is_some();
+            let gpu_verify_ids = verify_ids.is_some()
+                && constraint.is_none()
+                && caps.argmax_rows
+                && ec.spec.gpu_argmax
+                && ec.spec.gpu_mtp_accept;
+            let fixed = (m <= crate::mtp::DRAFT_TOKENS)
+                .then(|| mtp_verify_bufs.as_ref())
+                .flatten();
+            let ids_owned = fixed
+                .is_none()
+                .then(|| be.alloc(m * 4, BufferUsage::Staging))
+                .transpose()
                 .map_err(|e| anyhow!("{e}"))?;
-            let pos_batch = be
-                .alloc(m * 4, BufferUsage::Staging)
+            let pos_owned = fixed
+                .is_none()
+                .then(|| be.alloc(m * 4, BufferUsage::Staging))
+                .transpose()
                 .map_err(|e| anyhow!("{e}"))?;
-            let hidden_batch = be
-                .alloc_uninit(m * ne * 4, BufferUsage::Activations)
+            let wide_owned = fixed
+                .is_none()
+                .then(|| be.alloc_uninit(m * h_width * 4, BufferUsage::Activations))
+                .transpose()
                 .map_err(|e| anyhow!("{e}"))?;
-            let wide_batch = Some(
-                be.alloc_uninit(m * h_width * 4, BufferUsage::Activations)
-                    .map_err(|e| anyhow!("{e}"))?,
-            );
-            let ple_batch = Some(
-                be.alloc(m * ple_row * 4, BufferUsage::Staging)
-                    .map_err(|e| anyhow!("{e}"))?,
-            );
-            let logits_batch = be
-                .alloc(m * c.vocab * 4, BufferUsage::Staging)
+            let ple_owned = fixed
+                .is_none()
+                .then(|| be.alloc(m * ple_row * 4, BufferUsage::Staging))
+                .transpose()
                 .map_err(|e| anyhow!("{e}"))?;
-            be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids))
+            let logits_owned = fixed
+                .is_none()
+                .then(|| be.alloc(m * c.vocab * 4, BufferUsage::Staging))
+                .transpose()
                 .map_err(|e| anyhow!("{e}"))?;
-            be.upload(pos_batch.as_ref(), bytemuck::cast_slice(&positions))
+            let h_owned = (want_h && fixed.is_none())
+                .then(|| be.alloc(m * h_width * 4, BufferUsage::Staging))
+                .transpose()
+                .map_err(|e| anyhow!("{e}"))?;
+            let out_ids_owned = (gpu_verify_ids && fixed.is_none())
+                .then(|| be.alloc(m * 4, BufferUsage::Readback))
+                .transpose()
+                .map_err(|e| anyhow!("{e}"))?;
+            let ids_buf = fixed
+                .map(|bufs| bufs.ids.as_ref())
+                .or(ids_owned.as_deref())
+                .expect("fixed or temporary MTP ids buffer");
+            let pos_buf = fixed
+                .map(|bufs| bufs.positions.as_ref())
+                .or(pos_owned.as_deref())
+                .expect("fixed or temporary MTP position buffer");
+            let wide_buf = fixed
+                .map(|bufs| bufs.wide.as_ref())
+                .or(wide_owned.as_deref())
+                .expect("fixed or temporary MTP wide buffer");
+            let ple_buf = fixed
+                .map(|bufs| bufs.ple.as_ref())
+                .or(ple_owned.as_deref())
+                .expect("fixed or temporary MTP PLE buffer");
+            let logits_buf = fixed
+                .map(|bufs| bufs.logits.as_ref())
+                .or(logits_owned.as_deref())
+                .expect("fixed or temporary MTP logits buffer");
+            let h_buf = want_h.then(|| {
+                fixed
+                    .map(|bufs| bufs.h_out.as_ref())
+                    .or(h_owned.as_deref())
+                    .expect("fixed or temporary MTP hidden output buffer")
+            });
+            let out_ids_buf = gpu_verify_ids.then(|| {
+                fixed
+                    .map(|bufs| bufs.out_ids.as_ref())
+                    .or(out_ids_owned.as_deref())
+                    .expect("fixed or temporary MTP id output buffer")
+            });
+            be.upload(ids_buf, bytemuck::cast_slice(&ids))
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(pos_buf, bytemuck::cast_slice(&positions))
                 .map_err(|e| anyhow!("{e}"))?;
             ensure_kv_depth!(start + m);
-
-            // Layer 0 overlaps the mmap PLE gather. The second graph owns layer 1 (PLE), all
-            // remaining layers, the model head, and the one m-row verification projection.
-            let (g0, h0) = build(
-                m,
-                start,
-                0,
-                false,
-                None,
-                false,
-                false,
-                false,
-                false,
-                true,
-                true,
-                false,
-                None,
-                Some(0..1),
-            );
-            let plan0 = be.compile(&g0).map_err(|e| anyhow!("{e}"))?;
-            let mut b0 = Bindings::new();
-            b0.bind(
-                h0.tok_ids.expect("GPU embedding needs token ids"),
-                ids_buf.as_ref(),
-            );
-            b0.bind(h0.hidden, hidden_batch.as_ref());
-            b0.bind(h0.positions, pos_batch.as_ref());
-            bind_layer_io(
-                &mut b0,
-                &h0,
-                c.n_layer,
-                rf_buf,
-                yff_buf,
-                &kbufs[..],
-                &vbufs[..],
-                &qsa_kbufs[..],
-                &qsa_cbufs[..],
-                &mrope_history_buf,
-                &wbufs[..],
-                &wide_batch,
-                &ple_batch,
-                ple_state_buf,
-            );
-            bind_mtp_recurrent_traces(&mut b0, &h0, mtp_delta_ckpt);
-            be.execute(plan0.as_ref(), &b0)
-                .map_err(|e| anyhow!("{e}"))?;
+            let vf_alloc = verify_t0.elapsed();
+            let vf_t0 = std::time::Instant::now();
 
             let ple_rows = ticket.wait()?;
             if ple_rows.len() != m * ple_row {
@@ -8122,19 +8165,14 @@ fn generate_dense_backend_inner(
                     m * ple_row
                 ));
             }
-            be.upload(
-                ple_batch.as_ref().expect("allocated above").as_ref(),
-                bytemuck::cast_slice(ple_rows.as_slice()),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
+            be.upload(ple_buf, bytemuck::cast_slice(ple_rows.as_slice()))
+                .map_err(|e| anyhow!("{e}"))?;
 
-            let want_h = h_out.is_some();
-            let gpu_verify_ids = verify_ids.is_some()
-                && constraint.is_none()
-                && caps.argmax_rows
-                && ec.spec.gpu_argmax
-                && ec.spec.gpu_mtp_accept;
-            let (g1, h1) = build(
+            let vf_ple = vf_t0.elapsed();
+            let vf_t0 = std::time::Instant::now();
+            // VERIFY's PLE rows are ready before the GPU starts in steady state. A single graph
+            // avoids a second execute boundary without giving up measurable host/GPU overlap.
+            let (vg, vh) = build(
                 m,
                 start,
                 m,
@@ -8144,27 +8182,19 @@ fn generate_dense_backend_inner(
                 want_h,
                 gpu_verify_ids,
                 false,
-                false,
+                true,
                 true,
                 false,
                 None,
-                Some(1..c.n_layer),
+                None,
             );
-            let plan1 = be.compile(&g1).map_err(|e| anyhow!("{e}"))?;
-            let h_batch = want_h
-                .then(|| be.alloc(m * h_width * 4, BufferUsage::Staging))
-                .transpose()
-                .map_err(|e| anyhow!("{e}"))?;
-            let ids_batch = gpu_verify_ids
-                .then(|| be.alloc(m * 4, BufferUsage::Readback))
-                .transpose()
-                .map_err(|e| anyhow!("{e}"))?;
-            let mut b1 = Bindings::new();
-            b1.bind(h1.hidden, hidden_batch.as_ref());
-            b1.bind(h1.positions, pos_batch.as_ref());
+            let vplan = be.compile(&vg).map_err(|e| anyhow!("{e}"))?;
+            let mut vb = Bindings::new();
+            vb.bind(vh.tok_ids.expect("GPU embedding needs token ids"), ids_buf);
+            vb.bind(vh.positions, pos_buf);
             bind_layer_io(
-                &mut b1,
-                &h1,
+                &mut vb,
+                &vh,
                 c.n_layer,
                 rf_buf,
                 yff_buf,
@@ -8174,39 +8204,53 @@ fn generate_dense_backend_inner(
                 &qsa_cbufs[..],
                 &mrope_history_buf,
                 &wbufs[..],
-                &wide_batch,
-                &ple_batch,
+                qwen_wide_buf,
+                ple_embd_buf,
                 ple_state_buf,
             );
-            bind_mtp_recurrent_traces(&mut b1, &h1, mtp_delta_ckpt);
-            b1.bind(
-                h1.logits.expect("verify build has logits"),
-                logits_batch.as_ref(),
+            vb.bind(
+                vh.qwen_wide.expect("Qwen VERIFY has a wide residual"),
+                wide_buf,
             );
-            if let (Some(id), Some(buf)) = (h1.tok_id, ids_batch.as_deref()) {
-                b1.bind(id, buf);
+            vb.bind(vh.ple_embd.expect("Qwen VERIFY has PLE input"), ple_buf);
+            bind_mtp_recurrent_traces(&mut vb, &vh, mtp_delta_ckpt);
+            vb.bind(vh.logits.expect("verify build has logits"), logits_buf);
+            if let (Some(id), Some(buf)) = (vh.tok_id, out_ids_buf) {
+                vb.bind(id, buf);
             }
-            if let (Some(id), Some(buf)) = (h1.h_out, h_batch.as_deref()) {
-                b1.bind(id, buf);
+            if let (Some(id), Some(buf)) = (vh.h_out, h_buf) {
+                vb.bind(id, buf);
             }
-            be.execute(plan1.as_ref(), &b1)
+            let vf_build = vf_t0.elapsed();
+            let vf_t0 = std::time::Instant::now();
+            be.execute(vplan.as_ref(), &vb)
                 .map_err(|e| anyhow!("{e}"))?;
+            let vf_exec = vf_t0.elapsed();
+            let vf_t0 = std::time::Instant::now();
 
-            if let (Some(out_ids), Some(buf)) = (verify_ids, ids_batch.as_deref()) {
+            if let (Some(out_ids), Some(buf)) = (verify_ids, out_ids_buf) {
                 out_ids.resize(m, 0);
                 be.download(buf, bytemuck::cast_slice_mut(out_ids))
                     .map_err(|e| anyhow!("{e}"))?;
             } else {
                 out_logits.resize(m * c.vocab, 0.0);
-                be.download(logits_batch.as_ref(), bytemuck::cast_slice_mut(out_logits))
+                be.download(logits_buf, bytemuck::cast_slice_mut(out_logits))
                     .map_err(|e| anyhow!("{e}"))?;
             }
-            if let (Some(out), Some(buf)) = (h_out.take(), h_batch.as_deref()) {
+            if let (Some(out), Some(buf)) = (h_out.take(), h_buf) {
                 out.resize(m * h_width, 0.0);
                 be.download(buf, bytemuck::cast_slice_mut(out))
                     .map_err(|e| anyhow!("{e}"))?;
             }
             cached.extend_from_slice(&prompt[start..]);
+            if ec.prof.stages {
+                let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+                tracing::info!(
+                    "[qwen4 mtp verify] m={m} start={start} io={:.2}ms ple={:.2}ms build={:.2}ms exec={:.2}ms readback={:.2}ms total={:.2}ms",
+                    ms(vf_alloc), ms(vf_ple), ms(vf_build), ms(vf_exec),
+                    ms(vf_t0.elapsed()), ms(verify_t0.elapsed()),
+                );
+            }
             return Ok((
                 Vec::new(),
                 GenStats {

@@ -397,6 +397,9 @@ pub(crate) struct SeamKv {
     pub(super) ple_embd_buf: Option<Box<dyn Buffer>>,
     /// Persistent PLE dilated-convolution history (9 x hc*n_embd f32 on the released model).
     pub(super) ple_state_buf: Option<Box<dyn Buffer>>,
+    /// Fixed four-row Qwen3.8 MTP VERIFY IO. These buffers are allocated before the deferred
+    /// Vulkan pager measures the remaining room, then replayed by every speculative cycle.
+    pub(super) mtp_verify_bufs: Option<QwenMtpVerifyBuffers>,
     /// The context this slot's KV cache was ACTUALLY allocated for. Usually the `want_ctx` the
     /// caller asked for; smaller when the cold init's live-room re-clamp shrank it (see
     /// `crate::seam::reclamp_ctx_to_live_room`), which is why callers holding a `want_ctx` of
@@ -457,6 +460,16 @@ pub(crate) struct SeamKv {
     /// 0 before the unified arena consumed the measured remainder. Startup drains this vector
     /// immediately; ordinary one-shot/session paths always keep it empty.
     pub(super) preallocated_siblings: Vec<SeamKv>,
+}
+
+pub(super) struct QwenMtpVerifyBuffers {
+    pub(super) ids: Box<dyn Buffer>,
+    pub(super) positions: Box<dyn Buffer>,
+    pub(super) wide: Box<dyn Buffer>,
+    pub(super) ple: Box<dyn Buffer>,
+    pub(super) logits: Box<dyn Buffer>,
+    pub(super) h_out: Box<dyn Buffer>,
+    pub(super) out_ids: Box<dyn Buffer>,
 }
 
 #[derive(Default)]
@@ -1523,6 +1536,7 @@ impl SeamKv {
                 None
             },
             ple_state_buf,
+            mtp_verify_bufs: None,
             max_ctx: self.max_ctx,
             kv_ring: self.kv_ring,
             cached: Vec::new(),
