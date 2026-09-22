@@ -45,6 +45,7 @@ fn deltanet_layer_wall() {
             a_coef,
             dt_bias,
             state,
+            state_trace: None,
             dst,
             rows: rows as u32,
             n_vhead: nv as u32,

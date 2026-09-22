@@ -106,6 +106,65 @@ fn run_with_mutated_state(
     (o, s)
 }
 
+/// Run an op that mutates its live recurrent state and writes a row-major state trace.
+fn run_with_state_trace(
+    be: &dyn Backend,
+    g: &Graph,
+    inputs: &[(TensorId, &[f32])],
+    weights: &[(TensorId, &[f32])],
+    out: TensorId,
+    out_len: usize,
+    state: TensorId,
+    state_len: usize,
+    trace: TensorId,
+    trace_len: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let plan = be.compile(g).expect("compile");
+    let mut keep: Vec<(TensorId, Box<dyn infr_core::backend::Buffer>)> = Vec::new();
+    for (id, data) in inputs {
+        let buf = be
+            .alloc(data.len() * 4, BufferUsage::Activations)
+            .expect("alloc in");
+        be.upload(buf.as_ref(), bytemuck::cast_slice(data)).unwrap();
+        keep.push((*id, buf));
+    }
+    for (id, data) in weights {
+        let buf = be
+            .alloc(data.len() * 4, BufferUsage::Weights)
+            .expect("alloc w");
+        be.upload(buf.as_ref(), bytemuck::cast_slice(data)).unwrap();
+        keep.push((*id, buf));
+    }
+    let obuf = be
+        .alloc(out_len * 4, BufferUsage::Readback)
+        .expect("alloc out");
+    let mut bindings = Bindings::new();
+    for (id, buf) in &keep {
+        bindings.bind(*id, buf.as_ref());
+    }
+    bindings.bind(out, obuf.as_ref());
+    be.execute(plan.as_ref(), &bindings).expect("execute");
+
+    let download = |id: TensorId, len: usize| {
+        let buf = keep
+            .iter()
+            .find_map(|(candidate, buf)| (*candidate == id).then_some(buf.as_ref()))
+            .expect("mutated graph input");
+        let mut values = vec![0f32; len];
+        be.download(buf, bytemuck::cast_slice_mut(&mut values))
+            .unwrap();
+        values
+    };
+    let mut output = vec![0f32; out_len];
+    be.download(obuf.as_ref(), bytemuck::cast_slice_mut(&mut output))
+        .unwrap();
+    (
+        output,
+        download(state, state_len),
+        download(trace, trace_len),
+    )
+}
+
 fn gpu() -> Option<infr_vulkan::VulkanBackend> {
     if let Some(index) = std::env::var("INFR_TEST_VULKAN_DEVICE")
         .ok()
@@ -139,6 +198,7 @@ fn state_persists_across_executes() {
             x,
             weight: w,
             state,
+            state_trace: None,
             dst,
             rows: 1,
             channels: cc as u32,
@@ -863,6 +923,7 @@ fn conv1d_silu_parity() {
         x,
         weight: w,
         state,
+        state_trace: None,
         dst,
         rows: rows as u32,
         channels: cc as u32,
@@ -923,6 +984,91 @@ fn conv1d_silu_parity() {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
+fn mtp_conv_trace_matches_each_prefix_state() {
+    let Some(vk) = gpu() else {
+        return;
+    };
+    let (rows, trace_rows, cc, kernel) = (4usize, 3usize, 32usize, 4usize);
+    let state_len = (kernel - 1) * cc;
+    let xi = gen(rows * cc, 71);
+    let wi = gen(cc * kernel, 72);
+    let initial = gen(state_len, 73);
+
+    let mut graph = Graph::new();
+    let x = graph.input(f32d(rows * cc));
+    let weight = graph.weight(f32d(cc * kernel));
+    let state = graph.input(f32d(state_len));
+    let trace = graph.input(f32d(trace_rows * state_len));
+    let dst = graph.output(f32d(rows * cc));
+    graph.push(Op::Conv1dSilu {
+        x,
+        weight,
+        state,
+        state_trace: Some(trace),
+        dst,
+        rows: rows as u32,
+        channels: cc as u32,
+        kernel: kernel as u32,
+    });
+    let trace_zero = vec![0.0f32; trace_rows * state_len];
+    let (trace_out, trace_final, snapshots) = run_with_state_trace(
+        &vk,
+        &graph,
+        &[(x, &xi), (state, &initial), (trace, &trace_zero)],
+        &[(weight, &wi)],
+        dst,
+        rows * cc,
+        state,
+        state_len,
+        trace,
+        trace_rows * state_len,
+    );
+
+    let run_prefix = |prefix: usize| {
+        let mut graph = Graph::new();
+        let x = graph.input(f32d(prefix * cc));
+        let weight = graph.weight(f32d(cc * kernel));
+        let state = graph.input(f32d(state_len));
+        let dst = graph.output(f32d(prefix * cc));
+        graph.push(Op::Conv1dSilu {
+            x,
+            weight,
+            state,
+            state_trace: None,
+            dst,
+            rows: prefix as u32,
+            channels: cc as u32,
+            kernel: kernel as u32,
+        });
+        run_with_mutated_state(
+            &vk,
+            &graph,
+            &[(x, &xi[..prefix * cc]), (state, &initial)],
+            &[(weight, &wi)],
+            dst,
+            prefix * cc,
+            state,
+            state_len,
+        )
+    };
+    for prefix in 1..=trace_rows {
+        let (_, expected_state) = run_prefix(prefix);
+        assert_eq!(
+            &snapshots[(prefix - 1) * state_len..prefix * state_len],
+            expected_state,
+            "Conv trace row {prefix} does not match the prefix state"
+        );
+    }
+    let (expected_out, expected_final) = run_prefix(rows);
+    assert_eq!(trace_out, expected_out, "Conv trace changed VERIFY output");
+    assert_eq!(
+        trace_final, expected_final,
+        "Conv trace changed final live state"
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
 fn conv1d_silu_partition_invariance() {
     let Some(vk) = gpu() else {
         return;
@@ -943,6 +1089,7 @@ fn conv1d_silu_partition_invariance() {
             x,
             weight: w,
             state,
+            state_trace: None,
             dst,
             rows: part_rows as u32,
             channels: cc as u32,
@@ -1010,6 +1157,7 @@ fn deltanet_chunked_parity() {
         a_coef,
         dt_bias,
         state,
+        state_trace: None,
         dst,
         rows: rows as u32,
         n_vhead: nv as u32,
@@ -1076,6 +1224,7 @@ fn deltanet_chunked_parity() {
         a_coef: dac,
         dt_bias: ddt,
         state: ds,
+        state_trace: None,
         dst: dout,
         rows: 1,
         n_vhead: nv as u32,
@@ -1123,6 +1272,144 @@ fn deltanet_chunked_parity() {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
+fn mtp_deltanet_trace_matches_each_prefix_state() {
+    let Some(vk) = gpu() else {
+        return;
+    };
+    let (rows, trace_rows, nv, nk, kd, vd) = (4usize, 3usize, 2usize, 2usize, 128usize, 8usize);
+    let state_len = nv * kd * vd;
+    let qi = gen(rows * nk * kd, 81);
+    let ki = gen(rows * nk * kd, 82);
+    let vi = gen(rows * nv * vd, 83);
+    let bi = gen(rows * nv, 84);
+    let ai = gen(rows * nv, 85);
+    let a_coef: Vec<f32> = gen(nv, 86).iter().map(|value| -value.abs() - 0.1).collect();
+    let dt_bias = gen(nv, 87);
+    let initial = gen(state_len, 88);
+
+    let mut graph = Graph::new();
+    let q = graph.input(f32d(rows * nk * kd));
+    let k = graph.input(f32d(rows * nk * kd));
+    let v = graph.input(f32d(rows * nv * vd));
+    let b = graph.input(f32d(rows * nv));
+    let a = graph.input(f32d(rows * nv));
+    let ac = graph.weight(f32d(nv));
+    let dt = graph.weight(f32d(nv));
+    let state = graph.input(f32d(state_len));
+    let trace = graph.input(f32d(trace_rows * state_len));
+    let dst = graph.output(f32d(rows * nv * vd));
+    graph.push(Op::DeltaNet {
+        q,
+        k,
+        v,
+        b,
+        a,
+        a_coef: ac,
+        dt_bias: dt,
+        state,
+        state_trace: Some(trace),
+        dst,
+        rows: rows as u32,
+        n_vhead: nv as u32,
+        n_khead: nk as u32,
+        head_k: kd as u32,
+        head_v: vd as u32,
+        eps: 1e-6,
+        src_stride: 0,
+    });
+    let trace_zero = vec![0.0f32; trace_rows * state_len];
+    let (trace_out, trace_final, snapshots) = run_with_state_trace(
+        &vk,
+        &graph,
+        &[
+            (q, &qi),
+            (k, &ki),
+            (v, &vi),
+            (b, &bi),
+            (a, &ai),
+            (state, &initial),
+            (trace, &trace_zero),
+        ],
+        &[(ac, &a_coef), (dt, &dt_bias)],
+        dst,
+        rows * nv * vd,
+        state,
+        state_len,
+        trace,
+        trace_rows * state_len,
+    );
+
+    let run_prefix = |prefix: usize| {
+        let mut graph = Graph::new();
+        let q = graph.input(f32d(prefix * nk * kd));
+        let k = graph.input(f32d(prefix * nk * kd));
+        let v = graph.input(f32d(prefix * nv * vd));
+        let b = graph.input(f32d(prefix * nv));
+        let a = graph.input(f32d(prefix * nv));
+        let ac = graph.weight(f32d(nv));
+        let dt = graph.weight(f32d(nv));
+        let state = graph.input(f32d(state_len));
+        let dst = graph.output(f32d(prefix * nv * vd));
+        graph.push(Op::DeltaNet {
+            q,
+            k,
+            v,
+            b,
+            a,
+            a_coef: ac,
+            dt_bias: dt,
+            state,
+            state_trace: None,
+            dst,
+            rows: prefix as u32,
+            n_vhead: nv as u32,
+            n_khead: nk as u32,
+            head_k: kd as u32,
+            head_v: vd as u32,
+            eps: 1e-6,
+            src_stride: 0,
+        });
+        run_with_mutated_state(
+            &vk,
+            &graph,
+            &[
+                (q, &qi[..prefix * nk * kd]),
+                (k, &ki[..prefix * nk * kd]),
+                (v, &vi[..prefix * nv * vd]),
+                (b, &bi[..prefix * nv]),
+                (a, &ai[..prefix * nv]),
+                (state, &initial),
+            ],
+            &[(ac, &a_coef), (dt, &dt_bias)],
+            dst,
+            prefix * nv * vd,
+            state,
+            state_len,
+        )
+    };
+    for prefix in 1..=trace_rows {
+        let (_, expected_state) = run_prefix(prefix);
+        assert!(
+            maxerr(
+                &snapshots[(prefix - 1) * state_len..prefix * state_len],
+                &expected_state
+            ) < 1e-5,
+            "DeltaNet trace row {prefix} does not match the prefix state"
+        );
+    }
+    let (expected_out, expected_final) = run_prefix(rows);
+    assert!(
+        maxerr(&trace_out, &expected_out) < 1e-5,
+        "DeltaNet trace changed VERIFY output"
+    );
+    assert!(
+        maxerr(&trace_final, &expected_final) < 1e-5,
+        "DeltaNet trace changed final live state"
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
 fn deltanet_partition_invariance() {
     let Some(vk) = gpu() else {
         return;
@@ -1159,6 +1446,7 @@ fn deltanet_partition_invariance() {
             a_coef,
             dt_bias,
             state,
+            state_trace: None,
             dst,
             rows: part_rows as u32,
             n_vhead: nv as u32,
@@ -1239,6 +1527,7 @@ fn deltanet_qwen38_seq_is_deterministic() {
         a_coef,
         dt_bias,
         state,
+        state_trace: None,
         dst,
         rows: ROWS as u32,
         n_vhead: NV as u32,
@@ -1329,6 +1618,7 @@ fn deltanet_parity() {
         a_coef,
         dt_bias,
         state,
+        state_trace: None,
         dst,
         rows: rows as u32,
         n_vhead: nv as u32,

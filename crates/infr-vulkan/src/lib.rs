@@ -6861,6 +6861,48 @@ impl Backend for VulkanBackend {
         })
     }
 
+    fn copy_buffer_ranges(
+        &self,
+        copies: &[(&dyn Buffer, usize, &dyn Buffer, usize, usize)],
+    ) -> Result<()> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        let mut prepared = Vec::with_capacity(copies.len());
+        for &(src, src_offset, dst, dst_offset, bytes) in copies {
+            let (s, d) = (as_vk_buf(src)?, as_vk_buf(dst)?);
+            let src_end = src_offset
+                .checked_add(bytes)
+                .ok_or_else(|| be("copy_buffer_ranges source range overflow"))?;
+            let dst_end = dst_offset
+                .checked_add(bytes)
+                .ok_or_else(|| be("copy_buffer_ranges destination range overflow"))?;
+            check_extent("copy_buffer_ranges", "out of", src_end, s.size)?;
+            check_extent("copy_buffer_ranges", "into", dst_end, d.size)?;
+            prepared.push((
+                s.buffer,
+                d.buffer,
+                s.sub_offset as u64 + src_offset as u64,
+                d.sub_offset as u64 + dst_offset as u64,
+                bytes as u64,
+            ));
+        }
+        self.one_shot(move |cmd| unsafe {
+            for (src, dst, src_offset, dst_offset, size) in prepared {
+                self.shared.device.cmd_copy_buffer(
+                    cmd,
+                    src,
+                    dst,
+                    &[vk::BufferCopy {
+                        src_offset,
+                        dst_offset,
+                        size,
+                    }],
+                );
+            }
+        })
+    }
+
     /// persistent mapped pointer.  Otherwise, creates a temporary staging buffer,
     /// writes there, then submits a `cmd_copy_buffer` to the compute queue.
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()> {

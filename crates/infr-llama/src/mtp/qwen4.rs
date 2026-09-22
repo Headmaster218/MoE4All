@@ -1310,6 +1310,10 @@ impl Qwen4MtpRuntime {
             let mut feed = Vec::with_capacity(committed.len() + DRAFT_TOKENS);
             feed.extend_from_slice(&committed);
             feed.extend_from_slice(&candidates);
+            self.trunk
+                .as_mut()
+                .expect("target trunk remains initialized")
+                .mtp_arm_delta_trace(DRAFT_TOKENS)?;
             let t_verify = std::time::Instant::now();
             let (target_bind, finish_fixed_allocations) = crate::seam::vulkan_moe_binder(
                 vk,
@@ -1409,7 +1413,7 @@ impl Qwen4MtpRuntime {
                     .trunk
                     .as_mut()
                     .expect("target trunk remains initialized");
-                trunk.mtp_restore_delta(vk)?;
+                trunk.mtp_restore_delta_row(vk, accepted)?;
                 committed.extend_from_slice(&candidates[..accepted]);
                 committed.push(correction);
                 let (next_prediction, _, correction_h) = super::run_prime_last(

@@ -5754,11 +5754,30 @@ fn lower_op(
             x,
             weight,
             state,
+            state_trace,
             dst,
             rows,
             channels,
             kernel,
         } => {
+            if let Some(trace) = state_trace {
+                if graph.independent_rows {
+                    return Err(be(
+                        "recurrent state tracing does not support independent rows",
+                    ));
+                }
+                rec.conv1d_silu_trace(
+                    r(*x)?,
+                    r(*weight)?,
+                    r(*state)?,
+                    r(*trace)?,
+                    r(*dst)?,
+                    *rows as usize,
+                    *channels as usize,
+                    *kernel as usize,
+                );
+                return Ok(());
+            }
             // Batch (rows ≥ kconv-1): all rows·cc outputs in parallel + a history rebuild pass,
             // instead of the token-serial history walk. Decode keeps the sequential kernel.
             if graph.independent_rows {
@@ -5825,6 +5844,7 @@ fn lower_op(
             a_coef,
             dt_bias,
             state,
+            state_trace,
             dst,
             rows,
             n_vhead,
@@ -5863,6 +5883,53 @@ fn lower_op(
                 *head_k as usize,
                 *head_v as usize,
             );
+            if let Some(trace) = state_trace {
+                if graph.independent_rows
+                    || rows_ < 2
+                    || !be_.cfg().kernels.vulkan.dn_chunk
+                    || kd_ != 128
+                    || !vd_.is_multiple_of(crate::recorder::DN_SEQ_NCOL)
+                    || !be_.cfg().kernels.vulkan.dn_chunk_scan
+                    || !be_.cfg().kernels.vulkan.dn_split
+                {
+                    return Err(be(
+                        "MTP recurrent tracing requires the multi-row sequential DeltaNet scan",
+                    ));
+                }
+                let kn = pooled(pool, be_, "dn_seq_kn", rows_ * nk_ * kd_ * 4)?;
+                let qn = pooled(pool, be_, "dn_seq_qn", rows_ * nk_ * kd_ * 4)?;
+                let bet = pooled(pool, be_, "dn_seq_bet", rows_ * nv_ * 4)?;
+                let dec = pooled(pool, be_, "dn_seq_dec", rows_ * nv_ * 4)?;
+                rec.deltanet_seq_split_off(
+                    r(*q)?,
+                    r(*k)?,
+                    r(*v)?,
+                    r(*b)?,
+                    r(*a)?,
+                    r(*a_coef)?,
+                    r(*dt_bias)?,
+                    r(*state)?,
+                    r(*dst)?,
+                    pool[&kn].as_ref(),
+                    pool[&qn].as_ref(),
+                    pool[&bet].as_ref(),
+                    pool[&dec].as_ref(),
+                    rows_,
+                    nv_,
+                    nk_,
+                    kd_,
+                    vd_,
+                    *eps,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(r(*trace)?),
+                );
+                return Ok(());
+            }
             if graph.independent_rows {
                 let spans = sequence_spans(graph, rows_)?;
                 let states = resolve_rows(bindings, *state, spans.len())?;
@@ -5949,6 +6016,7 @@ fn lower_op(
                             blog_off,
                             alpha_off,
                             out_off,
+                            None,
                         );
                     } else if chunked && chunk_split {
                         let (kn, qn, dk, dq, bg, gg) = chunk_scratch

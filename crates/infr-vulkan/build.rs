@@ -854,7 +854,9 @@ fn main() {
         ("deltanet_norm", "deltanet_norm", &[]),
         ("deltanet_gates_seq", "deltanet_gates_seq", &[]),
         ("deltanet_seq", "deltanet_seq", &[]),
+        ("deltanet_seq_trace", "deltanet_seq_trace", &[]),
         ("conv1d_silu", "conv1d_silu", &[]),
+        ("conv1d_silu_trace", "conv1d_silu_trace", &[]),
         ("conv1d_silu_par", "conv1d_silu_par", &[]),
         ("conv1d_shift", "conv1d_shift", &[]),
         ("copy_strided", "copy_strided", &[]),
@@ -3890,7 +3892,7 @@ fn main() {
             // BDA address and dispatch this STREAMED build directly (the old bound-SSBO resident
             // build is dead), same as linear_f16/linear_bf16 above. (e2b_proj — the per-layer PROJ
             // counterpart — is gone entirely: see the base builds list above.)
-            "conv1d_silu" | "conv1d_silu_par" | "e2b_gate" => true,
+            "conv1d_silu" | "conv1d_silu_trace" | "conv1d_silu_par" | "e2b_gate" => true,
             // The coopmat f16/repacked-quant projection GEMM (prefill C=A·Wᵀ): the quant arms ride
             // along on the shared WQ() seam — see gemm_proj.comp's STREAMED doc.
             "gemm_proj" | "gemm_proj_warp" => true,

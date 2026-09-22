@@ -2021,6 +2021,8 @@ const DELTANET_NORM_SPV_BYTES: &[u8] =
 const DELTANET_GATES_SEQ_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_gates_seq.spv"));
 const DELTANET_SEQ_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_seq.spv"));
+const DELTANET_SEQ_TRACE_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_seq_trace.spv"));
 const CONV1D_SHIFT_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_shift.spv"));
 const COPY_STRIDED_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/copy_strided.spv"));
 const MUL_SIGMOID_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_sigmoid.spv"));
@@ -3451,6 +3453,12 @@ pub(crate) fn deltanet_seq_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(DELTANET_SEQ_SPV_BYTES))
 }
+/// MTP VERIFY twin of [`deltanet_seq_spv`] that snapshots recurrent state after every row.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn deltanet_seq_trace_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(DELTANET_SEQ_TRACE_SPV_BYTES))
+}
 /// SPIR-V for the CHUNKED gated-DeltaNet prefill (chunkwise delta rule, C=32).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn deltanet_chunked_spv() -> &'static [u32] {
@@ -3471,6 +3479,13 @@ pub(crate) fn conv1d_shift_spv() -> &'static [u32] {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn conv1d_silu_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_silu.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// MTP VERIFY conv1d variant that writes one post-row recurrent-state snapshot.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn conv1d_silu_trace_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_silu_trace.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }

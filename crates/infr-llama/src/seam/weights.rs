@@ -577,13 +577,21 @@ pub(super) fn alloc_segmented_plane(
 
 /// The device-resident DeltaNet-state snapshot backing [`SeamKv::mtp_snapshot_delta`] — one
 /// conv-state + one S-state buffer per qwen35 DeltaNet layer (parallel to `layers`), plus the
-/// cached-token length the snapshot corresponds to. Allocated once (lazily) and reused every cycle.
+/// cached-token length the snapshot corresponds to. Qwen3.8 MTP allocates it before the dynamic
+/// KV/expert pool is sized and reuses it every cycle; the fallback constructor remains lazy.
 pub(super) struct MtpDeltaCkpt {
-    kbufs: Vec<Box<dyn Buffer>>,
-    vbufs: Vec<Box<dyn Buffer>>,
-    ple_state: Option<Box<dyn Buffer>>,
+    pub(super) kbufs: Vec<Box<dyn Buffer>>,
+    pub(super) vbufs: Vec<Box<dyn Buffer>>,
+    pub(super) ple_state: Option<Box<dyn Buffer>>,
+    /// Row-major recurrent snapshots written as part of the target VERIFY scan. Each buffer is
+    /// `trace_rows` consecutive copies of its corresponding live state.
+    pub(super) trace_kbufs: Vec<Box<dyn Buffer>>,
+    pub(super) trace_vbufs: Vec<Box<dyn Buffer>>,
+    pub(super) trace_ple_state: Option<Box<dyn Buffer>>,
     /// The layer indices (into `SeamKv::kbufs`/`vbufs`) that are DeltaNet mixers.
-    layers: Vec<usize>,
+    pub(super) layers: Vec<usize>,
+    pub(super) trace_rows: usize,
+    armed_verify_rows: Option<usize>,
     cached_len: usize,
 }
 
@@ -594,6 +602,7 @@ impl MtpDeltaCkpt {
         src_k: &[Option<Box<dyn Buffer>>],
         src_v: &[Option<Box<dyn Buffer>>],
         src_ple: Option<&dyn Buffer>,
+        trace_rows: usize,
     ) -> AResult<Option<Self>> {
         Self::allocate_sized(
             be,
@@ -601,6 +610,7 @@ impl MtpDeltaCkpt {
             |layer| src_k[layer].as_ref().map(|buffer| buffer.len_bytes()),
             |layer| src_v[layer].as_ref().map(|buffer| buffer.len_bytes()),
             src_ple.map(Buffer::len_bytes),
+            trace_rows,
         )
     }
 
@@ -610,6 +620,7 @@ impl MtpDeltaCkpt {
         mut k_len: impl FnMut(usize) -> Option<usize>,
         mut v_len: impl FnMut(usize) -> Option<usize>,
         ple_len: Option<usize>,
+        trace_rows: usize,
     ) -> AResult<Option<Self>> {
         let layers: Vec<usize> = (0..cfg.n_layer)
             .filter(|&layer| cfg.is_recurrent_layer(layer))
@@ -619,6 +630,8 @@ impl MtpDeltaCkpt {
         }
         let mut kbufs = Vec::with_capacity(layers.len());
         let mut vbufs = Vec::with_capacity(layers.len());
+        let mut trace_kbufs = Vec::with_capacity(layers.len());
+        let mut trace_vbufs = Vec::with_capacity(layers.len());
         for &layer in &layers {
             let kb = k_len(layer).ok_or_else(|| {
                 anyhow!("MTP checkpoint layer {layer} has no fixed K/state allocation")
@@ -634,6 +647,26 @@ impl MtpDeltaCkpt {
                 be.alloc(vb.max(1), BufferUsage::KvCache)
                     .map_err(|e| anyhow!("{e}"))?,
             );
+            if trace_rows > 0 {
+                trace_kbufs.push(
+                    be.alloc(
+                        kb.checked_mul(trace_rows)
+                            .ok_or_else(|| anyhow!("MTP conv trace allocation overflow"))?
+                            .max(1),
+                        BufferUsage::KvCache,
+                    )
+                    .map_err(|e| anyhow!("{e}"))?,
+                );
+                trace_vbufs.push(
+                    be.alloc(
+                        vb.checked_mul(trace_rows)
+                            .ok_or_else(|| anyhow!("MTP DeltaNet trace allocation overflow"))?
+                            .max(1),
+                        BufferUsage::KvCache,
+                    )
+                    .map_err(|e| anyhow!("{e}"))?,
+                );
+            }
         }
         let ple_state = ple_len
             .map(|bytes| {
@@ -641,11 +674,32 @@ impl MtpDeltaCkpt {
                     .map_err(|e| anyhow!("{e}"))
             })
             .transpose()?;
+        let trace_ple_state = if trace_rows > 0 {
+            ple_len
+                .map(|bytes| {
+                    be.alloc(
+                        bytes
+                            .checked_mul(trace_rows)
+                            .ok_or_else(|| anyhow!("MTP PLE trace allocation overflow"))?
+                            .max(1),
+                        BufferUsage::KvCache,
+                    )
+                    .map_err(|e| anyhow!("{e}"))
+                })
+                .transpose()?
+        } else {
+            None
+        };
         Ok(Some(Self {
             kbufs,
             vbufs,
             ple_state,
+            trace_kbufs,
+            trace_vbufs,
+            trace_ple_state,
             layers,
+            trace_rows,
+            armed_verify_rows: None,
             cached_len: 0,
         }))
     }
@@ -1147,6 +1201,7 @@ impl SeamKv {
                 |layer| Some(self.kbufs[layer].len_bytes()),
                 |layer| Some(self.vbufs[layer].len_bytes()),
                 self.ple_state_buf.as_deref().map(Buffer::len_bytes),
+                0,
             )?;
         }
         if self.mtp_delta_ckpt.is_none() {
@@ -1179,6 +1234,30 @@ impl SeamKv {
         Ok(())
     }
 
+    /// Arm the next target VERIFY to write its intermediate recurrent states. Row zero already has
+    /// the clean checkpoint and a fully accepted batch leaves the live state intact, so an `n`-row
+    /// VERIFY needs storage for only `n - 1` rows.
+    pub(crate) fn mtp_arm_delta_trace(&mut self, rows: usize) -> AResult<()> {
+        let ck = self
+            .mtp_delta_ckpt
+            .as_mut()
+            .ok_or_else(|| anyhow!("MTP recurrent trace requested without a checkpoint runtime"))?;
+        if rows == 0 || rows.saturating_sub(1) > ck.trace_rows {
+            return Err(anyhow!(
+                "MTP recurrent trace requested {rows} VERIFY rows, intermediate capacity is {}",
+                ck.trace_rows
+            ));
+        }
+        ck.armed_verify_rows = Some(rows);
+        Ok(())
+    }
+
+    pub(super) fn mtp_take_delta_trace(&mut self) -> Option<(usize, usize)> {
+        let ck = self.mtp_delta_ckpt.as_mut()?;
+        let verify_rows = ck.armed_verify_rows.take()?;
+        Some((verify_rows, verify_rows.saturating_sub(1)))
+    }
+
     /// Restore the DeltaNet state captured by the last [`mtp_snapshot_delta`] and truncate `cached`
     /// back to the snapshot's token length — the MTP loop's rollback after a partial-accept cycle
     /// (drops the rejected drafts the verify forward absorbed into the recurrent state). A no-op
@@ -1206,6 +1285,60 @@ impl SeamKv {
         }
         be.copy_buffers(&copies).map_err(|e| anyhow!("{e}"))?;
         self.cached.truncate(ck.cached_len);
+        Ok(())
+    }
+
+    /// Restore the recurrent state immediately after `accepted` VERIFY rows. Row zero is the
+    /// existing clean checkpoint; positive rows come from the snapshots emitted inside the
+    /// recurrent kernels during that VERIFY. This avoids replaying accepted target tokens.
+    pub(crate) fn mtp_restore_delta_row(
+        &mut self,
+        be: &dyn Backend,
+        accepted: usize,
+    ) -> AResult<()> {
+        if accepted == 0 {
+            return self.mtp_restore_delta(be);
+        }
+        let ck = self
+            .mtp_delta_ckpt
+            .as_ref()
+            .ok_or_else(|| anyhow!("MTP recurrent row restore has no checkpoint runtime"))?;
+        if accepted > ck.trace_rows {
+            return Err(anyhow!(
+                "MTP recurrent row restore requested {accepted} rows, capacity is {}",
+                ck.trace_rows
+            ));
+        }
+        let row = accepted - 1;
+        let mut copies =
+            Vec::with_capacity(ck.layers.len() * 2 + usize::from(ck.trace_ple_state.is_some()));
+        for (i, &layer) in ck.layers.iter().enumerate() {
+            let kb = self.kbufs[layer].len_bytes();
+            let vb = self.vbufs[layer].len_bytes();
+            copies.push((
+                ck.trace_kbufs[i].as_ref(),
+                row * kb,
+                self.kbufs[layer].as_ref(),
+                0,
+                kb,
+            ));
+            copies.push((
+                ck.trace_vbufs[i].as_ref(),
+                row * vb,
+                self.vbufs[layer].as_ref(),
+                0,
+                vb,
+            ));
+        }
+        if let (Some(src), Some(dst)) =
+            (ck.trace_ple_state.as_deref(), self.ple_state_buf.as_deref())
+        {
+            let bytes = dst.len_bytes();
+            copies.push((src, row * bytes, dst, 0, bytes));
+        }
+        be.copy_buffer_ranges(&copies)
+            .map_err(|e| anyhow!("restore MTP recurrent row {row}: {e}"))?;
+        self.cached.truncate(ck.cached_len + accepted);
         Ok(())
     }
 

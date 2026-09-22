@@ -708,6 +708,29 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
 
+    /// Copy several arbitrary buffer ranges as one logical batch. The default is a bounded host
+    /// bounce per range; command-buffer backends override it so restoring a speculative recurrent
+    /// checkpoint remains one submission even when every model layer owns separate state.
+    fn copy_buffer_ranges(
+        &self,
+        copies: &[(&dyn Buffer, usize, &dyn Buffer, usize, usize)],
+    ) -> Result<()> {
+        for &(src, src_offset, dst, dst_offset, bytes) in copies {
+            let src_end = src_offset
+                .checked_add(bytes)
+                .ok_or_else(|| Error::backend("copy source range overflow"))?;
+            let dst_end = dst_offset
+                .checked_add(bytes)
+                .ok_or_else(|| Error::backend("copy destination range overflow"))?;
+            check_copy_bytes(src_end, src.len_bytes())?;
+            check_copy_bytes(dst_end, dst.len_bytes())?;
+            let mut tmp = vec![0u8; bytes];
+            self.download_range(src, src_offset, &mut tmp)?;
+            self.upload_range(dst, dst_offset, &tmp)?;
+        }
+        Ok(())
+    }
+
     // ---- execution (compile once per shape, execute per token/step) ----
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>>;
     fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()>;
@@ -1021,6 +1044,24 @@ mod tests {
             &dst_b.0.lock().unwrap()[..10],
             &[16, 17, 18, 19, 20, 21, 22, 23, 0xBB, 0xBB]
         );
+    }
+
+    #[test]
+    fn copy_buffer_ranges_default_honors_both_offsets() {
+        let be = MockBackend {
+            last_download_len: std::sync::Mutex::new(0),
+        };
+        let src = MockBuffer(std::sync::Mutex::new((0u8..32).collect()));
+        let dst = MockBuffer(std::sync::Mutex::new(vec![0xAAu8; 24]));
+
+        be.copy_buffer_ranges(&[(&src, 7, &dst, 11, 6)]).unwrap();
+        let out = dst.0.lock().unwrap();
+        assert!(out[..11].iter().all(|&byte| byte == 0xAA));
+        assert_eq!(&out[11..17], &[7, 8, 9, 10, 11, 12]);
+        assert!(out[17..].iter().all(|&byte| byte == 0xAA));
+        drop(out);
+        assert!(be.copy_buffer_ranges(&[(&src, 28, &dst, 0, 5)]).is_err());
+        assert!(be.copy_buffer_ranges(&[(&src, 0, &dst, 20, 5)]).is_err());
     }
 
     #[test]

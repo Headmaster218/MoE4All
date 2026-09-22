@@ -483,6 +483,30 @@ fn bind_layer_io<'a>(
     }
 }
 
+fn bind_mtp_recurrent_traces<'a>(
+    b: &mut Bindings<'a>,
+    h: &DecodeHandles,
+    checkpoint: &'a Option<MtpDeltaCkpt>,
+) {
+    let Some(checkpoint) = checkpoint.as_ref() else {
+        debug_assert!(h.mtp_k_trace.iter().all(Option::is_none));
+        debug_assert!(h.mtp_v_trace.iter().all(Option::is_none));
+        debug_assert!(h.mtp_ple_trace.is_none());
+        return;
+    };
+    for (i, &layer) in checkpoint.layers.iter().enumerate() {
+        if let Some(id) = h.mtp_k_trace[layer] {
+            b.bind(id, checkpoint.trace_kbufs[i].as_ref());
+        }
+        if let Some(id) = h.mtp_v_trace[layer] {
+            b.bind(id, checkpoint.trace_vbufs[i].as_ref());
+        }
+    }
+    if let (Some(id), Some(buffer)) = (h.mtp_ple_trace, checkpoint.trace_ple_state.as_deref()) {
+        b.bind(id, buffer);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn bind_parallel_layer_io<'a>(
     b: &mut Bindings<'a>,
@@ -879,6 +903,9 @@ pub(super) struct DecodeHandles {
     ple_state: Option<TensorId>,
     k_cache: Vec<TensorId>,
     v_cache: Vec<TensorId>,
+    mtp_k_trace: Vec<Option<TensorId>>,
+    mtp_v_trace: Vec<Option<TensorId>>,
+    mtp_ple_trace: Option<TensorId>,
     qsa_k_cache: Vec<Option<TensorId>>,
     qsa_block_cache: Vec<Option<TensorId>>,
     weights: Vec<TensorId>, // flat, in declaration == upload order
@@ -2458,6 +2485,7 @@ fn generate_dense_backend_inner(
                 &kbufs,
                 &vbufs,
                 ple_state_buf.as_deref(),
+                crate::mtp::DRAFT_TOKENS.saturating_sub(1),
             )?
         } else {
             None
@@ -2735,6 +2763,7 @@ fn generate_dense_backend_inner(
     } else {
         None
     };
+    let mtp_trace = state.as_mut().and_then(SeamKv::mtp_take_delta_trace);
     let SeamKv {
         weights,
         // The session-stable derivations are already read via the `stable` local above (cloned
@@ -2762,7 +2791,7 @@ fn generate_dense_backend_inner(
         sc_ping,
         sc_ping_write,
         sc_temp_inv_buf,
-        mtp_delta_ckpt: _,
+        mtp_delta_ckpt,
         turn_recurrent_ckpt,
         preallocated_siblings: _,
         // The env-derived local `kv_ring` above is this same value on every call (stable env),
@@ -3360,6 +3389,12 @@ fn generate_dense_backend_inner(
             let hist = (c.ple_conv_kernel - 1) * c.ple_ngram_size;
             g.input(f32d(hist * c.hc_mult * ne))
         });
+        let trace_recurrent = mtp_verify && mtp_trace.is_some_and(|(rows, _)| rows == batch);
+        let mtp_trace_rows = mtp_trace.map_or(0, |(_, trace_rows)| trace_rows);
+        let mtp_ple_trace = (trace_recurrent && span_has_ple).then(|| {
+            let hist = (c.ple_conv_kernel - 1) * c.ple_ngram_size;
+            g.input(f32d(mtp_trace_rows * hist * c.hc_mult * ne))
+        });
         let rope_freqs = rf_buf.as_ref().map(|(_, n)| g.input(f32d(*n)));
         // DeepSeek V2+ YaRN per-pair frequency divisors (qk_rope_dim/2 floats) — a per-step f32
         // Input like `rope_freqs` (uploaded once into `yff_buf`, rebound every execute).
@@ -3403,6 +3438,8 @@ fn generate_dense_backend_inner(
         // `generate_dense_backend` and `MixerW::DeltaNet`'s use of them below).
         let mut k_cache = Vec::new();
         let mut v_cache = Vec::new();
+        let mut mtp_k_trace = Vec::new();
+        let mut mtp_v_trace = Vec::new();
         let mut qsa_k_cache = Vec::new();
         let mut qsa_block_cache = Vec::new();
         for l in 0..c.n_layer {
@@ -3411,6 +3448,9 @@ fn generate_dense_backend_inner(
                 let s_elems = c.recurrent_state_elems();
                 k_cache.push(g.input(f32d(conv_elems)));
                 v_cache.push(g.input(f32d(s_elems)));
+                mtp_k_trace
+                    .push(trace_recurrent.then(|| g.input(f32d(mtp_trace_rows * conv_elems))));
+                mtp_v_trace.push(trace_recurrent.then(|| g.input(f32d(mtp_trace_rows * s_elems))));
                 qsa_k_cache.push(None);
                 qsa_block_cache.push(None);
                 continue;
@@ -3425,6 +3465,8 @@ fn generate_dense_backend_inner(
                     vec![layout.state_bytes.div_ceil(4)],
                     DType::U32,
                 )));
+                mtp_k_trace.push(None);
+                mtp_v_trace.push(None);
                 qsa_k_cache.push(None);
                 qsa_block_cache.push(None);
                 continue;
@@ -3437,6 +3479,8 @@ fn generate_dense_backend_inner(
             let rows_l = crate::seam::kv_rows(c, l, max_ctx, kv_ring, ec);
             k_cache.push(g.input(kd(crate::seam::kv_side_elems(rows_l * k_row))));
             v_cache.push(g.input(vd(crate::seam::kv_side_elems(rows_l * v_row))));
+            mtp_k_trace.push(None);
+            mtp_v_trace.push(None);
             qsa_k_cache.push(
                 (crate::seam::qsa_raw_cache_bytes(c, l, max_ctx) > 0)
                     .then(|| g.input(f16d(max_ctx * c.indexer_head_size))),
@@ -4637,6 +4681,7 @@ fn generate_dense_backend_inner(
                     x: ple_key,
                     weight: pw.conv,
                     state,
+                    state_trace: mtp_ple_trace,
                     dst: ple_conv,
                     rows: batch as u32,
                     channels: hcw as u32,
@@ -4762,6 +4807,7 @@ fn generate_dense_backend_inner(
                     x: dn_qkvbuf,
                     weight: dw.conv1d,
                     state: k_cache[l],
+                    state_trace: mtp_k_trace[l],
                     dst: dn_convout,
                     rows: batch as u32,
                     channels: q35_cc as u32,
@@ -4837,6 +4883,7 @@ fn generate_dense_backend_inner(
                     a_coef: dw.ssm_a,
                     dt_bias: dw.dt_bias,
                     state: v_cache[l],
+                    state_trace: mtp_v_trace[l],
                     dst: dn_out,
                     rows: batch as u32,
                     n_vhead: q35_nv as u32,
@@ -4917,6 +4964,7 @@ fn generate_dense_backend_inner(
                     x: dn_qkvbuf,
                     weight: kw.conv,
                     state: k_cache[l],
+                    state_trace: None,
                     dst: dn_convout,
                     rows: batch as u32,
                     channels: packed as u32,
@@ -7182,6 +7230,9 @@ fn generate_dense_backend_inner(
                 ple_state,
                 k_cache,
                 v_cache,
+                mtp_k_trace,
+                mtp_v_trace,
+                mtp_ple_trace,
                 qsa_k_cache,
                 qsa_block_cache,
                 weights,
@@ -7973,6 +8024,12 @@ fn generate_dense_backend_inner(
             }
             let verify_t0 = std::time::Instant::now();
             let m = prompt.len() - start;
+            if let Some((verify_rows, _)) = mtp_trace {
+                anyhow::ensure!(
+                    verify_rows == m,
+                    "Qwen3.8 MTP recurrent trace armed for {verify_rows} rows, VERIFY has {m}"
+                );
+            }
             let h_width = c.hc_mult * ne;
             let ple_row = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram * c.ple_head_dim;
             let ids = prompt[start..]
@@ -8053,6 +8110,7 @@ fn generate_dense_backend_inner(
                 &ple_batch,
                 ple_state_buf,
             );
+            bind_mtp_recurrent_traces(&mut b0, &h0, mtp_delta_ckpt);
             be.execute(plan0.as_ref(), &b0)
                 .map_err(|e| anyhow!("{e}"))?;
 
@@ -8120,6 +8178,7 @@ fn generate_dense_backend_inner(
                 &ple_batch,
                 ple_state_buf,
             );
+            bind_mtp_recurrent_traces(&mut b1, &h1, mtp_delta_ckpt);
             b1.bind(
                 h1.logits.expect("verify build has logits"),
                 logits_batch.as_ref(),
