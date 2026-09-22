@@ -8,8 +8,8 @@ use super::sc::{
 use super::segmented_kv::{PlaneKind, SegmentedKvLayout};
 use super::weights::{
     alloc_segmented_plane, AttnW, DeltaW, Dsv4CompressedW, Dsv4CompressorW, Dsv4IndexerW, Dsv4W,
-    FfnW, HcTriple, IndexerW, KdaW, LayerHcW, LayerW, MixerW, MlaW, MoeSharedW, QsaW, QwenHcW,
-    QwenLayerHcW, QwenPleW, SeamKv, SeamWeights, SegmentedKvState, SessionStable,
+    FfnW, HcTriple, IndexerW, KdaW, LayerHcW, LayerW, MixerW, MlaW, MoeSharedW, MtpDeltaCkpt, QsaW,
+    QwenHcW, QwenLayerHcW, QwenPleW, SeamKv, SeamWeights, SegmentedKvState, SessionStable,
     TurnRecurrentCkpt,
 };
 use super::{
@@ -17,7 +17,7 @@ use super::{
 };
 use crate::seam::TokenEmbd;
 use crate::{Config, EngineConfig, GenStats, PerLayerEmbd};
-use anyhow::{anyhow, Result as AResult};
+use anyhow::{anyhow, Context, Result as AResult};
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage};
 use infr_core::graph::{
     Activation, AttnMask, Dsv4CacheFormat, Graph, HyperGates, MoePrefetchHint, Op, SequenceSpan,
@@ -1703,6 +1703,7 @@ fn generate_dense_backend_inner(
             }
             out
         };
+        let wload_count = std::cell::Cell::new(0usize);
         let mut wload = |names: &[&str]| -> AResult<()> {
             let info = |name: &str| {
                 g.tensors()
@@ -1840,9 +1841,11 @@ fn generate_dense_backend_inner(
             };
             // bind_weight returns the EFFECTIVE dtype the buffer holds (the GPU binder may convert float
             // weights to f16), so the graph declares the handle to match what the backend will read.
-            let (buf, eff_dt) = bind_weight(names[0], bytes, dt, numel)?;
+            let (buf, eff_dt) = bind_weight(names[0], bytes, dt, numel)
+                .with_context(|| format!("bind fixed weight `{}`", names[0]))?;
             wbufs.push(buf);
             wspecs.push((eff_dt, numel));
+            wload_count.set(wload_count.get() + 1);
             Ok(())
         };
         for l in 0..c.n_layer {
@@ -2167,6 +2170,7 @@ fn generate_dense_backend_inner(
         }
         // LM head = `output.weight`, or (tied) the quantized `token_embd.weight` mapped from the
         // mmap and dequantized per-row by `Op::Linear` — same f32 values as the host embedding.
+        let mtp_lm_head_index = wload_count.get();
         if g.tensors().iter().any(|t| t.name == "output.weight") {
             wload(&["output.weight"])?;
         } else {
@@ -2184,7 +2188,9 @@ fn generate_dense_backend_inner(
         // GPU embed gather: untied models upload the quantized token_embd as one extra weight
         // slot (tied models reuse the lm_head slot above — same tensor). Order-sensitive:
         // mirrors `build`'s `w_embd` wpush, right after `w_lm`.
+        let mut mtp_token_embd_index = mtp_lm_head_index;
         if gpu_embed && untied_lm {
+            mtp_token_embd_index = wload_count.get();
             wload(&["token_embd.weight"])?;
         }
         // gemma4-E2B on-device per-layer gather: the (large, quantized) per-layer token
@@ -2445,6 +2451,17 @@ fn generate_dense_backend_inner(
                 &[],
             )?;
         }
+        let mtp_delta_ckpt = if ec.spec.mtp && c.qwen4exp {
+            MtpDeltaCkpt::allocate_before_dynamic_kv(
+                be,
+                c,
+                &kbufs,
+                &vbufs,
+                ple_state_buf.as_deref(),
+            )?
+        } else {
+            None
+        };
 
         // A paged serve engine must make every sibling slot's pool-external lifetime allocation
         // visible to the driver's live-budget query below. Their unified runtime storage is
@@ -2587,6 +2604,8 @@ fn generate_dense_backend_inner(
             layer_has_epb,
             layer_fused_experts,
             ple_worker,
+            mtp_token_embd_index,
+            mtp_lm_head_index,
         });
         let mut preallocated_siblings = Vec::with_capacity(pending_siblings.len());
         for pending in pending_siblings {
@@ -2638,7 +2657,7 @@ fn generate_dense_backend_inner(
             sc_ping: None,
             sc_ping_write: 0,
             sc_temp_inv_buf: None,
-            mtp_delta_ckpt: None,
+            mtp_delta_ckpt,
             turn_recurrent_ckpt,
             preallocated_siblings,
         });
@@ -2759,6 +2778,7 @@ fn generate_dense_backend_inner(
         layer_has_epb,
         layer_fused_experts,
         ple_worker,
+        ..
     } = weights.as_ref();
     let max_ctx = *max_ctx;
     // In a parallel token call `max_new` is a step budget containing both the uncached prompt tail
@@ -7066,13 +7086,21 @@ fn generate_dense_backend_inner(
             // after `output_norm` in `qwen35.cpp`). A plain Copy into a fresh Output, so this never
             // disturbs `lm_in`'s existing consumer (the `Op::Linear` below).
             let h_out = if h_tap {
-                let ho = g.output(f32d(ne * logits_rows));
+                // Qwen3.8's detached MTP layer consumes the four-stream residual before the
+                // model head collapses it. Other MTP architectures consume the LM-head input.
+                let h_width = if c.qwen4exp { c.hc_mult * ne } else { ne };
+                let h_src = if c.qwen4exp {
+                    qwen_wide.expect("qwen4exp MTP tap needs qwen_wide")
+                } else {
+                    lm_in
+                };
+                let ho = g.output(f32d(h_width * logits_rows));
                 g.push(Op::Copy {
-                    src: lm_in,
-                    src_off: 0,
+                    src: h_src,
+                    src_off: ((batch - logits_rows) * h_width) as u32,
                     dst: ho,
                     dst_off: 0,
-                    n: (ne * logits_rows) as u32,
+                    n: (h_width * logits_rows) as u32,
                 });
                 Some(ho)
             } else {
@@ -7937,6 +7965,200 @@ fn generate_dense_backend_inner(
     // truncates its committed token list and the next call's prefix diff overwrites the
     // stale KV rows. Dense non-E2B models only (mirrors the batched-prefill guard).
     if let Some(out_logits) = verify {
+        if c.qwen4exp {
+            if !gpu_embed {
+                return Err(anyhow!(
+                    "Qwen3.8 MTP verify requires the backend's GPU embedding gather"
+                ));
+            }
+            let verify_t0 = std::time::Instant::now();
+            let m = prompt.len() - start;
+            let h_width = c.hc_mult * ne;
+            let ple_row = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram * c.ple_head_dim;
+            let ids = prompt[start..]
+                .iter()
+                .map(|&token| token as i32)
+                .collect::<Vec<_>>();
+            let positions = (start as i32..(start + m) as i32).collect::<Vec<_>>();
+            let ticket = ple_worker
+                .as_ref()
+                .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?
+                .submit_range(prompt, start, m, c.ple_ngram_size)?;
+
+            let ids_buf = be
+                .alloc(m * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?;
+            let pos_batch = be
+                .alloc(m * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?;
+            let hidden_batch = be
+                .alloc_uninit(m * ne * 4, BufferUsage::Activations)
+                .map_err(|e| anyhow!("{e}"))?;
+            let wide_batch = Some(
+                be.alloc_uninit(m * h_width * 4, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            let ple_batch = Some(
+                be.alloc(m * ple_row * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            let logits_batch = be
+                .alloc(m * c.vocab * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids))
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(pos_batch.as_ref(), bytemuck::cast_slice(&positions))
+                .map_err(|e| anyhow!("{e}"))?;
+            ensure_kv_depth!(start + m);
+
+            // Layer 0 overlaps the mmap PLE gather. The second graph owns layer 1 (PLE), all
+            // remaining layers, the model head, and the one m-row verification projection.
+            let (g0, h0) = build(
+                m,
+                start,
+                0,
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                None,
+                Some(0..1),
+            );
+            let plan0 = be.compile(&g0).map_err(|e| anyhow!("{e}"))?;
+            let mut b0 = Bindings::new();
+            b0.bind(
+                h0.tok_ids.expect("GPU embedding needs token ids"),
+                ids_buf.as_ref(),
+            );
+            b0.bind(h0.hidden, hidden_batch.as_ref());
+            b0.bind(h0.positions, pos_batch.as_ref());
+            bind_layer_io(
+                &mut b0,
+                &h0,
+                c.n_layer,
+                rf_buf,
+                yff_buf,
+                &kbufs[..],
+                &vbufs[..],
+                &qsa_kbufs[..],
+                &qsa_cbufs[..],
+                &mrope_history_buf,
+                &wbufs[..],
+                &wide_batch,
+                &ple_batch,
+                ple_state_buf,
+            );
+            be.execute(plan0.as_ref(), &b0)
+                .map_err(|e| anyhow!("{e}"))?;
+
+            let ple_rows = ticket.wait()?;
+            if ple_rows.len() != m * ple_row {
+                return Err(anyhow!(
+                    "qwen4exp verify PLE produced {} values, expected {}",
+                    ple_rows.len(),
+                    m * ple_row
+                ));
+            }
+            be.upload(
+                ple_batch.as_ref().expect("allocated above").as_ref(),
+                bytemuck::cast_slice(ple_rows.as_slice()),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+
+            let want_h = h_out.is_some();
+            let gpu_verify_ids = verify_ids.is_some()
+                && constraint.is_none()
+                && caps.argmax_rows
+                && ec.spec.gpu_argmax
+                && ec.spec.gpu_mtp_accept;
+            let (g1, h1) = build(
+                m,
+                start,
+                m,
+                false,
+                None,
+                false,
+                want_h,
+                gpu_verify_ids,
+                false,
+                false,
+                true,
+                false,
+                None,
+                Some(1..c.n_layer),
+            );
+            let plan1 = be.compile(&g1).map_err(|e| anyhow!("{e}"))?;
+            let h_batch = want_h
+                .then(|| be.alloc(m * h_width * 4, BufferUsage::Staging))
+                .transpose()
+                .map_err(|e| anyhow!("{e}"))?;
+            let ids_batch = gpu_verify_ids
+                .then(|| be.alloc(m * 4, BufferUsage::Readback))
+                .transpose()
+                .map_err(|e| anyhow!("{e}"))?;
+            let mut b1 = Bindings::new();
+            b1.bind(h1.hidden, hidden_batch.as_ref());
+            b1.bind(h1.positions, pos_batch.as_ref());
+            bind_layer_io(
+                &mut b1,
+                &h1,
+                c.n_layer,
+                rf_buf,
+                yff_buf,
+                &kbufs[..],
+                &vbufs[..],
+                &qsa_kbufs[..],
+                &qsa_cbufs[..],
+                &mrope_history_buf,
+                &wbufs[..],
+                &wide_batch,
+                &ple_batch,
+                ple_state_buf,
+            );
+            b1.bind(
+                h1.logits.expect("verify build has logits"),
+                logits_batch.as_ref(),
+            );
+            if let (Some(id), Some(buf)) = (h1.tok_id, ids_batch.as_deref()) {
+                b1.bind(id, buf);
+            }
+            if let (Some(id), Some(buf)) = (h1.h_out, h_batch.as_deref()) {
+                b1.bind(id, buf);
+            }
+            be.execute(plan1.as_ref(), &b1)
+                .map_err(|e| anyhow!("{e}"))?;
+
+            if let (Some(out_ids), Some(buf)) = (verify_ids, ids_batch.as_deref()) {
+                out_ids.resize(m, 0);
+                be.download(buf, bytemuck::cast_slice_mut(out_ids))
+                    .map_err(|e| anyhow!("{e}"))?;
+            } else {
+                out_logits.resize(m * c.vocab, 0.0);
+                be.download(logits_batch.as_ref(), bytemuck::cast_slice_mut(out_logits))
+                    .map_err(|e| anyhow!("{e}"))?;
+            }
+            if let (Some(out), Some(buf)) = (h_out.take(), h_batch.as_deref()) {
+                out.resize(m * h_width, 0.0);
+                be.download(buf, bytemuck::cast_slice_mut(out))
+                    .map_err(|e| anyhow!("{e}"))?;
+            }
+            cached.extend_from_slice(&prompt[start..]);
+            return Ok((
+                Vec::new(),
+                GenStats {
+                    n_prompt: m,
+                    n_cached: start,
+                    prompt_secs: verify_t0.elapsed().as_secs_f64(),
+                    n_gen: 0,
+                    decode_secs: 0.0,
+                },
+            ));
+        }
         if c.moe.is_some() || ple.is_some() {
             return Err(anyhow!("speculative verify: dense non-E2B models only"));
         }
@@ -9844,9 +10066,10 @@ fn generate_dense_backend_inner(
         // logits — same row `h_out` (when requested) captures. `dyn_replay` already excludes
         // `h_out.is_some()` (see its doc), so this is always the rebuild (`else`) branch below.
         let want_h = h_out.is_some() && is_decode && at_frontier;
+        let h_width = ne * if c.qwen4exp { c.hc_mult } else { 1 };
         let h_tap_buf = if want_h {
             Some(
-                be.alloc(ne * 4, BufferUsage::Staging)
+                be.alloc(h_width * 4, BufferUsage::Staging)
                     .map_err(|e| anyhow!("{e}"))?,
             )
         } else {
@@ -10082,7 +10305,7 @@ fn generate_dense_backend_inner(
             }
             // MTP Phase 1 h-tap (see `want_h` above): same row, one op earlier than `logits`.
             if let (Some(out), Some(hb)) = (h_out.take(), &h_tap_buf) {
-                let mut hrow = vec![0f32; ne];
+                let mut hrow = vec![0f32; h_width];
                 be.download(hb.as_ref(), bytemuck::cast_slice_mut(&mut hrow))
                     .map_err(|e| anyhow!("{e}"))?;
                 *out = hrow;

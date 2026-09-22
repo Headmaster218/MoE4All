@@ -6828,6 +6828,39 @@ impl Backend for VulkanBackend {
         })
     }
 
+    fn copy_buffers(&self, copies: &[(&dyn Buffer, &dyn Buffer, usize)]) -> Result<()> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        let mut prepared = Vec::with_capacity(copies.len());
+        for &(src, dst, bytes) in copies {
+            let (s, d) = (as_vk_buf(src)?, as_vk_buf(dst)?);
+            check_extent("copy_buffers", "out of", bytes, s.size)?;
+            check_extent("copy_buffers", "into", bytes, d.size)?;
+            prepared.push((
+                s.buffer,
+                d.buffer,
+                s.sub_offset as u64,
+                d.sub_offset as u64,
+                bytes as u64,
+            ));
+        }
+        self.one_shot(move |cmd| unsafe {
+            for (src, dst, src_offset, dst_offset, size) in prepared {
+                self.shared.device.cmd_copy_buffer(
+                    cmd,
+                    src,
+                    dst,
+                    &[vk::BufferCopy {
+                        src_offset,
+                        dst_offset,
+                        size,
+                    }],
+                );
+            }
+        })
+    }
+
     /// persistent mapped pointer.  Otherwise, creates a temporary staging buffer,
     /// writes there, then submits a `cmd_copy_buffer` to the compute queue.
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()> {

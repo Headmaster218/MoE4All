@@ -3315,7 +3315,11 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // working set, not a persistent owner of the process RAM budget.
         reclaimable_fixed_host_source_bytes = fp.dense;
         let vram = vk.vram();
-        let room = planned_vram_room(&vram, ec);
+        // Usually this binder is the backend's first owner, making `planned_vram_room`'s
+        // tracked_used=0 assumption exact. A detached MTP head is intentionally resident before
+        // the target, however, so use the backend's live accounting here. This keeps the
+        // provisional placement consistent with the final post-fixed `vk.alloc_room()` query.
+        let room = vk.alloc_room();
         // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows`), so a mostly-SWA
         // model's KV prices far below n_layer * ctx. Price the actual per-side Vulkan formats:
         // explicit Q8 and F16 choices must change the expert remainder just like the allocation.

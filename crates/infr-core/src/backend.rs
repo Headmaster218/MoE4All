@@ -698,6 +698,16 @@ pub trait Backend: Send + Sync {
         self.upload(dst, &tmp)
     }
 
+    /// Copy several independent buffer prefixes as one logical batch. The default preserves the
+    /// established backend behavior; command-buffer backends can override this to amortize submit
+    /// and synchronization overhead across the whole batch.
+    fn copy_buffers(&self, copies: &[(&dyn Buffer, &dyn Buffer, usize)]) -> Result<()> {
+        for &(src, dst, bytes) in copies {
+            self.copy_buffer(src, dst, bytes)?;
+        }
+        Ok(())
+    }
+
     // ---- execution (compile once per shape, execute per token/step) ----
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>>;
     fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()>;
@@ -992,6 +1002,25 @@ mod tests {
         let out = dst.0.lock().unwrap();
         assert_eq!(&out[..8], &[0, 1, 2, 3, 4, 5, 6, 7]); // prefix copied
         assert!(out[8..].iter().all(|&b| b == 0xAA)); // tail untouched
+    }
+
+    #[test]
+    fn copy_buffers_default_copies_each_prefix() {
+        let be = MockBackend {
+            last_download_len: std::sync::Mutex::new(0),
+        };
+        let src_a = MockBuffer(std::sync::Mutex::new((0u8..16).collect()));
+        let src_b = MockBuffer(std::sync::Mutex::new((16u8..32).collect()));
+        let dst_a = MockBuffer(std::sync::Mutex::new(vec![0xAAu8; 16]));
+        let dst_b = MockBuffer(std::sync::Mutex::new(vec![0xBBu8; 16]));
+
+        be.copy_buffers(&[(&src_a, &dst_a, 4), (&src_b, &dst_b, 8)])
+            .unwrap();
+        assert_eq!(&dst_a.0.lock().unwrap()[..6], &[0, 1, 2, 3, 0xAA, 0xAA]);
+        assert_eq!(
+            &dst_b.0.lock().unwrap()[..10],
+            &[16, 17, 18, 19, 20, 21, 22, 23, 0xBB, 0xBB]
+        );
     }
 
     #[test]

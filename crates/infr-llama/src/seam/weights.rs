@@ -581,9 +581,74 @@ pub(super) fn alloc_segmented_plane(
 pub(super) struct MtpDeltaCkpt {
     kbufs: Vec<Box<dyn Buffer>>,
     vbufs: Vec<Box<dyn Buffer>>,
+    ple_state: Option<Box<dyn Buffer>>,
     /// The layer indices (into `SeamKv::kbufs`/`vbufs`) that are DeltaNet mixers.
     layers: Vec<usize>,
     cached_len: usize,
+}
+
+impl MtpDeltaCkpt {
+    pub(super) fn allocate_before_dynamic_kv(
+        be: &dyn Backend,
+        cfg: &Config,
+        src_k: &[Option<Box<dyn Buffer>>],
+        src_v: &[Option<Box<dyn Buffer>>],
+        src_ple: Option<&dyn Buffer>,
+    ) -> AResult<Option<Self>> {
+        Self::allocate_sized(
+            be,
+            cfg,
+            |layer| src_k[layer].as_ref().map(|buffer| buffer.len_bytes()),
+            |layer| src_v[layer].as_ref().map(|buffer| buffer.len_bytes()),
+            src_ple.map(Buffer::len_bytes),
+        )
+    }
+
+    fn allocate_sized(
+        be: &dyn Backend,
+        cfg: &Config,
+        mut k_len: impl FnMut(usize) -> Option<usize>,
+        mut v_len: impl FnMut(usize) -> Option<usize>,
+        ple_len: Option<usize>,
+    ) -> AResult<Option<Self>> {
+        let layers: Vec<usize> = (0..cfg.n_layer)
+            .filter(|&layer| cfg.is_recurrent_layer(layer))
+            .collect();
+        if layers.is_empty() && ple_len.is_none() {
+            return Ok(None);
+        }
+        let mut kbufs = Vec::with_capacity(layers.len());
+        let mut vbufs = Vec::with_capacity(layers.len());
+        for &layer in &layers {
+            let kb = k_len(layer).ok_or_else(|| {
+                anyhow!("MTP checkpoint layer {layer} has no fixed K/state allocation")
+            })?;
+            let vb = v_len(layer).ok_or_else(|| {
+                anyhow!("MTP checkpoint layer {layer} has no fixed V/state allocation")
+            })?;
+            kbufs.push(
+                be.alloc(kb.max(1), BufferUsage::KvCache)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            vbufs.push(
+                be.alloc(vb.max(1), BufferUsage::KvCache)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+        }
+        let ple_state = ple_len
+            .map(|bytes| {
+                be.alloc(bytes.max(1), BufferUsage::KvCache)
+                    .map_err(|e| anyhow!("{e}"))
+            })
+            .transpose()?;
+        Ok(Some(Self {
+            kbufs,
+            vbufs,
+            ple_state,
+            layers,
+            cached_len: 0,
+        }))
+    }
 }
 
 /// Device-resident recurrent state at one stable rendered conversation boundary. Buffers are
@@ -825,10 +890,26 @@ pub(crate) struct SeamWeights {
     pub(super) layer_has_epb: Vec<bool>,
     pub(super) layer_fused_experts: Vec<bool>,
     pub(super) ple_worker: Option<std::sync::Arc<super::ple::PleWorker>>,
+    /// Main-model tables borrowed by Qwen3.8's detached shared MTP head. Indices point into
+    /// `wbufs`/`wspecs`; the sidecar deliberately omits both tensors.
+    pub(super) mtp_token_embd_index: usize,
+    pub(super) mtp_lm_head_index: usize,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl SeamKv {
+    pub(crate) fn mtp_shared_weights(
+        &self,
+    ) -> ((&dyn Buffer, DType, usize), (&dyn Buffer, DType, usize)) {
+        let wi = &self.weights;
+        let emb = wi.mtp_token_embd_index;
+        let lm = wi.mtp_lm_head_index;
+        (
+            (wi.wbufs[emb].as_ref(), wi.wspecs[emb].0, wi.wspecs[emb].1),
+            (wi.wbufs[lm].as_ref(), wi.wspecs[lm].0, wi.wspecs[lm].1),
+        )
+    }
+
     pub(crate) fn take_preallocated_siblings(&mut self) -> Vec<SeamKv> {
         std::mem::take(&mut self.preallocated_siblings)
     }
@@ -1060,47 +1141,37 @@ impl SeamKv {
     /// snapshot is a pure device→device buffer copy (`Backend::copy_buffer`), never a host bounce.
     pub(crate) fn mtp_snapshot_delta(&mut self, be: &dyn Backend, cfg: &Config) -> AResult<()> {
         if self.mtp_delta_ckpt.is_none() {
-            let layers: Vec<usize> = (0..cfg.n_layer)
-                .filter(|&l| cfg.qwen35 && !cfg.is_qwen35_attn_layer(l))
-                .collect();
-            if layers.is_empty() {
-                return Ok(());
-            }
-            let mut kbufs = Vec::with_capacity(layers.len());
-            let mut vbufs = Vec::with_capacity(layers.len());
-            for &l in &layers {
-                kbufs.push(
-                    be.alloc(self.kbufs[l].len_bytes().max(1), BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?,
-                );
-                vbufs.push(
-                    be.alloc(self.vbufs[l].len_bytes().max(1), BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?,
-                );
-            }
-            self.mtp_delta_ckpt = Some(MtpDeltaCkpt {
-                kbufs,
-                vbufs,
-                layers,
-                cached_len: 0,
-            });
+            self.mtp_delta_ckpt = MtpDeltaCkpt::allocate_sized(
+                be,
+                cfg,
+                |layer| Some(self.kbufs[layer].len_bytes()),
+                |layer| Some(self.vbufs[layer].len_bytes()),
+                self.ple_state_buf.as_deref().map(Buffer::len_bytes),
+            )?;
+        }
+        if self.mtp_delta_ckpt.is_none() {
+            return Ok(());
         }
         let cached_len = self.cached.len();
         let ck = self.mtp_delta_ckpt.as_ref().expect("just ensured Some");
+        let mut copies =
+            Vec::with_capacity(ck.layers.len() * 2 + usize::from(ck.ple_state.is_some()));
         for (i, &l) in ck.layers.iter().enumerate() {
-            be.copy_buffer(
+            copies.push((
                 self.kbufs[l].as_ref(),
                 ck.kbufs[i].as_ref(),
                 self.kbufs[l].len_bytes(),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
-            be.copy_buffer(
+            ));
+            copies.push((
                 self.vbufs[l].as_ref(),
                 ck.vbufs[i].as_ref(),
                 self.vbufs[l].len_bytes(),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
+            ));
         }
+        if let (Some(src), Some(dst)) = (self.ple_state_buf.as_deref(), ck.ple_state.as_deref()) {
+            copies.push((src, dst, src.len_bytes()));
+        }
+        be.copy_buffers(&copies).map_err(|e| anyhow!("{e}"))?;
         self.mtp_delta_ckpt
             .as_mut()
             .expect("just ensured Some")
@@ -1116,20 +1187,24 @@ impl SeamKv {
         let Some(ck) = self.mtp_delta_ckpt.as_ref() else {
             return Ok(());
         };
+        let mut copies =
+            Vec::with_capacity(ck.layers.len() * 2 + usize::from(ck.ple_state.is_some()));
         for (i, &l) in ck.layers.iter().enumerate() {
-            be.copy_buffer(
+            copies.push((
                 ck.kbufs[i].as_ref(),
                 self.kbufs[l].as_ref(),
                 ck.kbufs[i].len_bytes(),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
-            be.copy_buffer(
+            ));
+            copies.push((
                 ck.vbufs[i].as_ref(),
                 self.vbufs[l].as_ref(),
                 ck.vbufs[i].len_bytes(),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
+            ));
         }
+        if let (Some(src), Some(dst)) = (ck.ple_state.as_deref(), self.ple_state_buf.as_deref()) {
+            copies.push((src, dst, src.len_bytes()));
+        }
+        be.copy_buffers(&copies).map_err(|e| anyhow!("{e}"))?;
         self.cached.truncate(ck.cached_len);
         Ok(())
     }

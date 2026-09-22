@@ -29,6 +29,9 @@ pub struct DenseSeamChat {
     /// turn on the SAME VkDevice/allocator/pipeline-cache instead of constructing a new one each
     /// time (previously: two full Vulkan backends for a single-turn `INFR_MTP=1` run).
     mtp_vk: Option<infr_vulkan::VulkanBackend>,
+    /// Qwen3.8's detached MTP head and target slot. Created before the target's first forward so
+    /// the fixed head weights/runtime precede unified expert-pool finalization.
+    qwen4_mtp: Option<crate::mtp::Qwen4MtpRuntime>,
     /// Physical device this chat's session pins: `Some(idx)` = `VulkanN` (the multi-device path,
     /// `new_on`), `None` = the default device (`new`, byte-identical to before). Threaded into
     /// [`ensure_session`](Self::ensure_session) and [`ensure_mtp_backend`](Self::ensure_mtp_backend)
@@ -45,6 +48,7 @@ impl DenseSeamChat {
             mtp_head: None,
             mtp_checked: false,
             mtp_vk: None,
+            qwen4_mtp: None,
             dev: None,
         }
     }
@@ -59,6 +63,7 @@ impl DenseSeamChat {
             mtp_head: None,
             mtp_checked: false,
             mtp_vk: None,
+            qwen4_mtp: None,
             dev: Some(idx),
         }
     }
@@ -126,6 +131,47 @@ impl DenseSeamChat {
         Ok(())
     }
 
+    fn wants_qwen4_mtp(&self, req: Option<&crate::sampling::RequestCtx>) -> Result<bool> {
+        if !self.model.config().qwen4exp || !self.model.engine_cfg().spec.mtp {
+            return Ok(false);
+        }
+        if self.model.engine_cfg().spec.draft.is_none() {
+            anyhow::bail!("Qwen3.8 MTP requires a sidecar path (`INFR_SPEC_DRAFT` / `spec.draft`)");
+        }
+        let base = crate::sampling::Sampler::from_cfg(&self.model.engine_cfg().sampling);
+        let effective = crate::sampling::Sampler::resolve(req, &self.model.engine_cfg().sampling);
+        let greedy = |sampler: crate::sampling::Sampler| sampler.temp <= 0.0 || sampler.top_k == 1;
+        let neutral_penalties = req.is_none_or(|ctx| !ctx.sampling().penalties_active());
+        if !greedy(base) || !greedy(effective) || !neutral_penalties {
+            tracing::warn!("Qwen3.8 MTP v1 is greedy-only; using ordinary decode for this request");
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn ensure_qwen4_mtp(&mut self) -> Result<()> {
+        self.ensure_mtp_backend()?;
+        if self.qwen4_mtp.is_none() {
+            let sidecar = self
+                .model
+                .engine_cfg()
+                .spec
+                .draft
+                .as_deref()
+                .expect("wants_qwen4_mtp checked the sidecar");
+            let train_ctx = self.model.config().n_ctx_train;
+            let max_ctx = super::cfg_ctx(self.model.engine_cfg(), train_ctx).unwrap_or(train_ctx);
+            let vk = self.mtp_vk.as_ref().expect("ensure_mtp_backend set it");
+            self.qwen4_mtp = Some(crate::mtp::Qwen4MtpRuntime::new_vulkan(
+                vk,
+                &self.model,
+                sidecar,
+                max_ctx,
+            )?);
+        }
+        Ok(())
+    }
+
     fn generate_turn_impl(
         &mut self,
         prompt: &str,
@@ -134,6 +180,14 @@ impl DenseSeamChat {
         req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
+        if self.wants_qwen4_mtp(req)? {
+            self.ensure_qwen4_mtp()?;
+            let vk = self.mtp_vk.as_ref().expect("ensure_qwen4_mtp set it");
+            let runtime = self.qwen4_mtp.as_mut().expect("ensure_qwen4_mtp set it");
+            return runtime
+                .generate_vulkan(vk, &self.model, prompt, max_new, req, |p| on_piece(p))
+                .map(|(stats, _)| stats);
+        }
         if self.wants_mtp()? {
             self.ensure_mtp_backend()?;
             let head = self.mtp_head.as_ref().expect("wants_mtp loaded it");
@@ -172,6 +226,9 @@ impl ChatModel for DenseSeamChat {
 
     fn reset_kv(&mut self) {
         super::reset_session(&mut self.session);
+        if let Some(runtime) = self.qwen4_mtp.as_mut() {
+            runtime.reset();
+        }
     }
 
     fn warmup(&mut self) -> Result<()> {
