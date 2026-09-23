@@ -1,6 +1,6 @@
 //! Embedding-model integration for INFR.
 //!
-//! Supported encoder architectures run directly on INFR's CPU/Vulkan graph backends. The
+//! Supported embedding architectures run directly on INFR's CPU/Vulkan graph backends. The
 //! `llama.cpp` process adapter remains available as a compatibility path and numeric oracle. Both
 //! implementations share one engine boundary and resource-accounting contract so embedding
 //! weights can join the future unified VRAM/RAM/SSD policy without changing the HTTP API.
@@ -151,10 +151,19 @@ impl LlamaCppEmbeddingEngine {
 
         // Read metadata only, then drop the mapping before llama.cpp opens the model. This keeps
         // INFR from retaining a second full-model mapping beside the worker.
-        let (cfg, logical_bytes) = {
+        let (cfg, logical_bytes, pooling) = {
             let gguf = Gguf::open(path).map_err(|error| anyhow!(error.to_string()))?;
             let logical_bytes = gguf.shards().iter().map(|(_, bytes)| *bytes).sum();
-            (EmbeddingConfig::from_gguf(&gguf)?, logical_bytes)
+            let cfg = EmbeddingConfig::from_gguf(&gguf)?;
+            let pooling_key = format!("{}.pooling_type", cfg.architecture);
+            let pooling = match gguf.metadata().u64(&pooling_key).unwrap_or(1) {
+                1 => "mean",
+                2 => "cls",
+                3 => "last",
+                4 => "rank",
+                value => bail!("unsupported GGUF {pooling_key}={value}"),
+            };
+            (cfg, logical_bytes, pooling)
         };
         let runner_path = resolve_runner(runner, device.wants_vulkan())?;
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
@@ -171,7 +180,7 @@ impl LlamaCppEmbeddingEngine {
             path.as_os_str().to_owned(),
             OsString::from("--embedding"),
             OsString::from("--pooling"),
-            OsString::from("mean"),
+            OsString::from(pooling),
             OsString::from("--embd-normalize"),
             OsString::from("2"),
             OsString::from("--ctx-size"),

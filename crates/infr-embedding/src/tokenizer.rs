@@ -1,4 +1,4 @@
-//! GGUF-backed BERT WordPiece tokenizer.
+//! GGUF-backed tokenizers for native embedding models.
 //!
 //! llama.cpp stores WordPiece word starts with a SentencePiece-style `▁` marker and removes the
 //! original Hugging Face `##` continuation prefix. Reversing that representation lets the mature
@@ -8,10 +8,20 @@ use anyhow::{anyhow, bail, Context, Result};
 use infr_core::loader::{MetaValue, Metadata};
 use std::collections::HashMap;
 use tokenizers::{
-    models::wordpiece::WordPiece, normalizers::bert::BertNormalizer,
-    pre_tokenizers::bert::BertPreTokenizer, processors::bert::BertProcessing, AddedToken,
-    Tokenizer,
+    models::{bpe::BPE, wordpiece::WordPiece},
+    normalizers::bert::BertNormalizer,
+    pre_tokenizers::{
+        bert::BertPreTokenizer,
+        byte_level::ByteLevel,
+        sequence::Sequence as PreSequence,
+        split::{Split, SplitPattern},
+        PreTokenizerWrapper,
+    },
+    processors::bert::BertProcessing,
+    AddedToken, SplitDelimiterBehavior, Tokenizer,
 };
+
+const QWEN2_PRE_RE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 pub(crate) struct BertWordPiece {
     tokenizer: Tokenizer,
@@ -137,6 +147,149 @@ impl BertWordPiece {
             );
         }
         Ok(ids.to_vec())
+    }
+}
+
+pub(crate) struct QwenBpe {
+    tokenizer: Tokenizer,
+    max_context: usize,
+    bos: Option<u32>,
+    eos: Option<u32>,
+}
+
+impl QwenBpe {
+    pub(crate) fn from_metadata(md: &Metadata, max_context: usize) -> Result<Self> {
+        if md.str("tokenizer.ggml.model") != Some("gpt2") {
+            bail!(
+                "native Qwen3 embedding requires tokenizer.ggml.model=\"gpt2\" (got {:?})",
+                md.str("tokenizer.ggml.model")
+            );
+        }
+        if md.str("tokenizer.ggml.pre") != Some("qwen2") {
+            bail!(
+                "native Qwen3 embedding requires tokenizer.ggml.pre=\"qwen2\" (got {:?})",
+                md.str("tokenizer.ggml.pre")
+            );
+        }
+        let tokens = md
+            .get("tokenizer.ggml.tokens")
+            .and_then(MetaValue::as_arr)
+            .context("GGUF missing tokenizer.ggml.tokens")?;
+        let vocab = tokens
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                value
+                    .as_str()
+                    .map(|token| (token.to_owned(), index as u32))
+                    .with_context(|| format!("tokenizer token {index} is not a string"))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        let merges = md
+            .get("tokenizer.ggml.merges")
+            .and_then(MetaValue::as_arr)
+            .context("GGUF missing tokenizer.ggml.merges")?
+            .iter()
+            .filter_map(|value| {
+                let merge = value.as_str()?;
+                let mut parts = merge.splitn(2, ' ');
+                Some((parts.next()?.to_owned(), parts.next()?.to_owned()))
+            })
+            .collect::<Vec<_>>();
+        let model = BPE::builder()
+            .vocab_and_merges(vocab, merges)
+            .build()
+            .map_err(|error| anyhow!("build Qwen BPE vocabulary: {error}"))?;
+        let split = Split::new(
+            SplitPattern::Regex(QWEN2_PRE_RE.to_owned()),
+            SplitDelimiterBehavior::Isolated,
+            false,
+        )
+        .map_err(|error| anyhow!("build Qwen pre-tokenizer: {error}"))?;
+        let pre = PreSequence::new(vec![
+            PreTokenizerWrapper::Split(split),
+            PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, false, false)),
+        ]);
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(pre));
+
+        if let Some(types) = md
+            .get("tokenizer.ggml.token_type")
+            .and_then(MetaValue::as_arr)
+        {
+            let mut added = Vec::new();
+            let mut specials = Vec::new();
+            for (index, ty) in types.iter().enumerate() {
+                let Some(token) = tokens.get(index).and_then(MetaValue::as_str) else {
+                    continue;
+                };
+                match ty.as_u64() {
+                    Some(3) => specials.push(AddedToken::from(token.to_owned(), true)),
+                    Some(4) => added.push(AddedToken::from(token.to_owned(), false)),
+                    _ => {}
+                }
+            }
+            if !added.is_empty() {
+                tokenizer.add_tokens(&added);
+            }
+            if !specials.is_empty() {
+                tokenizer.add_special_tokens(&specials);
+            }
+        }
+
+        let special_id = |flag: &str, id_key: &str| -> Result<Option<u32>> {
+            let enabled = matches!(md.get(flag), Some(MetaValue::Bool(true)));
+            if !enabled {
+                return Ok(None);
+            }
+            let id = md
+                .u64(id_key)
+                .with_context(|| format!("GGUF enables {flag} but is missing {id_key}"))?;
+            let id = u32::try_from(id).with_context(|| format!("GGUF {id_key} is too large"))?;
+            if id as usize >= tokens.len() {
+                bail!(
+                    "GGUF {id_key}={id} is outside the {}-token vocabulary",
+                    tokens.len()
+                );
+            }
+            Ok(Some(id))
+        };
+
+        Ok(Self {
+            tokenizer,
+            max_context,
+            bos: special_id(
+                "tokenizer.ggml.add_bos_token",
+                "tokenizer.ggml.bos_token_id",
+            )?,
+            eos: special_id(
+                "tokenizer.ggml.add_eos_token",
+                "tokenizer.ggml.eos_token_id",
+            )?,
+        })
+    }
+
+    pub(crate) fn encode(&self, input: &str) -> Result<Vec<u32>> {
+        let encoding = self
+            .tokenizer
+            .encode(input, false)
+            .map_err(|error| anyhow!("tokenize embedding input: {error}"))?;
+        let mut ids = Vec::with_capacity(
+            encoding.get_ids().len()
+                + usize::from(self.bos.is_some())
+                + usize::from(self.eos.is_some()),
+        );
+        ids.extend(self.bos);
+        ids.extend_from_slice(encoding.get_ids());
+        ids.extend(self.eos);
+        if ids.len() > self.max_context {
+            bail!(
+                "embedding input has {} tokens, exceeding model context {}",
+                ids.len(),
+                self.max_context
+            );
+        }
+        Ok(ids)
     }
 }
 

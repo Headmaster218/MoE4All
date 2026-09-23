@@ -1,6 +1,9 @@
-//! Native INFR execution for encoder-only Nomic-BERT embedding models.
+//! Native INFR execution for Nomic-BERT and Qwen3 embedding models.
 
-use crate::{tokenizer::BertWordPiece, EmbeddingBatch, EmbeddingConfig, EmbeddingEngine};
+use crate::{
+    tokenizer::{BertWordPiece, QwenBpe},
+    EmbeddingBatch, EmbeddingConfig, EmbeddingEngine,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use infr_core::{
     backend::{Backend, Bindings, Buffer, BufferUsage, Plan},
@@ -93,6 +96,142 @@ impl NomicConfig {
     }
 }
 
+#[derive(Clone, Debug)]
+struct Qwen3Config {
+    public: EmbeddingConfig,
+    layers: usize,
+    hidden: usize,
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    q_width: usize,
+    kv_width: usize,
+    ffn: usize,
+    vocab: usize,
+    eps: f32,
+    rope_theta: f32,
+}
+
+impl Qwen3Config {
+    fn from_gguf(gguf: &Gguf) -> Result<Self> {
+        let public = EmbeddingConfig::from_gguf(gguf)?;
+        if public.architecture != "qwen3" {
+            bail!("native Qwen3 embedding requires general.architecture=\"qwen3\"");
+        }
+        let md = gguf.metadata();
+        let integer = |suffix: &str| -> Result<usize> {
+            let key = format!("qwen3.{suffix}");
+            usize::try_from(
+                md.u64(&key)
+                    .with_context(|| format!("GGUF missing {key}"))?,
+            )
+            .with_context(|| format!("GGUF {key} is too large"))
+        };
+        let pooling = md
+            .u64("qwen3.pooling_type")
+            .context("native Qwen3 embedding requires qwen3.pooling_type")?;
+        if pooling != 3 {
+            bail!("native Qwen3 embedding requires last-token pooling (pooling_type=3, got {pooling})");
+        }
+        let hidden = public.dimensions;
+        let heads = integer("attention.head_count")?;
+        let kv_heads = integer("attention.head_count_kv")?;
+        let head_dim = integer("attention.key_length")?;
+        let value_dim = integer("attention.value_length")?;
+        if heads == 0 || kv_heads == 0 || heads % kv_heads != 0 || head_dim == 0 {
+            bail!(
+                "invalid Qwen3 head geometry: heads={heads}, kv_heads={kv_heads}, head_dim={head_dim}"
+            );
+        }
+        if value_dim != head_dim {
+            bail!(
+                "native Qwen3 embedding requires equal key/value head dimensions; got key={head_dim}, value={value_dim}"
+            );
+        }
+        let vocab = md
+            .get("tokenizer.ggml.tokens")
+            .and_then(MetaValue::as_arr)
+            .context("GGUF missing tokenizer.ggml.tokens")?
+            .len();
+        Ok(Self {
+            layers: integer("block_count")?,
+            q_width: heads * head_dim,
+            kv_width: kv_heads * head_dim,
+            ffn: integer("feed_forward_length")?,
+            eps: md
+                .get("qwen3.attention.layer_norm_rms_epsilon")
+                .and_then(MetaValue::as_f64)
+                .unwrap_or(1e-6) as f32,
+            rope_theta: md
+                .get("qwen3.rope.freq_base")
+                .and_then(MetaValue::as_f64)
+                .unwrap_or(1_000_000.0) as f32,
+            public,
+            hidden,
+            heads,
+            kv_heads,
+            head_dim,
+            vocab,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+enum NativeConfig {
+    Nomic(NomicConfig),
+    Qwen3(Qwen3Config),
+}
+
+impl NativeConfig {
+    fn from_gguf(gguf: &Gguf) -> Result<Self> {
+        match gguf.metadata().str("general.architecture") {
+            Some("nomic-bert") => Ok(Self::Nomic(NomicConfig::from_gguf(gguf)?)),
+            Some("qwen3") => Ok(Self::Qwen3(Qwen3Config::from_gguf(gguf)?)),
+            architecture => bail!(
+                "native embedding supports general.architecture=\"nomic-bert\" or \"qwen3\"; got {architecture:?}"
+            ),
+        }
+    }
+
+    fn public(&self) -> &EmbeddingConfig {
+        match self {
+            Self::Nomic(cfg) => &cfg.public,
+            Self::Qwen3(cfg) => &cfg.public,
+        }
+    }
+
+    fn hidden(&self) -> usize {
+        self.public().dimensions
+    }
+}
+
+enum NativeTokenizer {
+    Nomic(BertWordPiece),
+    Qwen3(QwenBpe),
+}
+
+impl NativeTokenizer {
+    fn from_gguf(gguf: &Gguf, cfg: &NativeConfig) -> Result<Self> {
+        match cfg {
+            NativeConfig::Nomic(cfg) => Ok(Self::Nomic(BertWordPiece::from_metadata(
+                gguf.metadata(),
+                cfg.public.max_context,
+            )?)),
+            NativeConfig::Qwen3(cfg) => Ok(Self::Qwen3(QwenBpe::from_metadata(
+                gguf.metadata(),
+                cfg.public.max_context,
+            )?)),
+        }
+    }
+
+    fn encode(&self, input: &str) -> Result<Vec<u32>> {
+        match self {
+            Self::Nomic(tokenizer) => tokenizer.encode(input),
+            Self::Qwen3(tokenizer) => tokenizer.encode(input),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct WeightSpec {
     label: String,
@@ -103,7 +242,7 @@ struct WeightSpec {
 }
 
 #[derive(Clone, Copy)]
-struct LayerWeights {
+struct NomicLayerWeights {
     qkv: usize,
     attn_output: usize,
     attn_norm_weight: usize,
@@ -115,12 +254,38 @@ struct LayerWeights {
     output_norm_bias: usize,
 }
 
-struct WeightLayout {
+struct NomicWeightLayout {
     token_embedding: usize,
     token_type_zero: usize,
     embedding_norm_weight: usize,
     embedding_norm_bias: usize,
-    layers: Vec<LayerWeights>,
+    layers: Vec<NomicLayerWeights>,
+}
+
+#[derive(Clone, Copy)]
+struct Qwen3LayerWeights {
+    attn_norm: usize,
+    q: usize,
+    q_norm: usize,
+    k: usize,
+    k_norm: usize,
+    v: usize,
+    attn_output: usize,
+    ffn_norm: usize,
+    ffn_gate: usize,
+    ffn_up: usize,
+    ffn_down: usize,
+}
+
+struct Qwen3WeightLayout {
+    token_embedding: usize,
+    output_norm: usize,
+    layers: Vec<Qwen3LayerWeights>,
+}
+
+enum WeightLayout {
+    Nomic(NomicWeightLayout),
+    Qwen3(Qwen3WeightLayout),
 }
 
 struct NativePlan {
@@ -263,11 +428,11 @@ impl Drop for IdleWeightReaper {
     }
 }
 
-/// Nomic-BERT embedding inference executed directly by INFR's CPU or Vulkan graph backend.
+/// Embedding inference executed directly by INFR's CPU or Vulkan graph backend.
 pub struct NativeEmbeddingEngine {
     model_path: PathBuf,
-    cfg: NomicConfig,
-    tokenizer: BertWordPiece,
+    cfg: NativeConfig,
+    tokenizer: NativeTokenizer,
     backend: Box<dyn Backend>,
     specs: Vec<WeightSpec>,
     weights: Arc<WeightCache>,
@@ -338,8 +503,8 @@ impl NativeEmbeddingEngine {
             bail!("embedding model does not exist: {}", path.display());
         }
         let gguf = Gguf::open(path).map_err(|error| anyhow!(error.to_string()))?;
-        let cfg = NomicConfig::from_gguf(&gguf)?;
-        let tokenizer = BertWordPiece::from_metadata(gguf.metadata(), cfg.public.max_context)?;
+        let cfg = NativeConfig::from_gguf(&gguf)?;
+        let tokenizer = NativeTokenizer::from_gguf(&gguf, &cfg)?;
         let (specs, layout, weight_bytes) = build_weight_catalog(&gguf, &cfg)?;
         let weights = if dynamic_weights {
             None
@@ -355,11 +520,11 @@ impl NativeEmbeddingEngine {
         let model_id = path
             .file_stem()
             .and_then(|name| name.to_str())
-            .unwrap_or(&cfg.public.name)
+            .unwrap_or(&cfg.public().name)
             .to_owned();
         tracing::info!(
             model = %model_id,
-            architecture = %cfg.public.architecture,
+            architecture = %cfg.public().architecture,
             backend = backend.name(),
             tier = ?tier,
             weights_mib = weight_bytes as f64 / 1048576.0,
@@ -414,7 +579,7 @@ impl NativeEmbeddingEngine {
     }
 
     pub fn config(&self) -> &EmbeddingConfig {
-        &self.cfg.public
+        self.cfg.public()
     }
 
     pub fn resource_snapshot(&self) -> ResourceSnapshot {
@@ -476,6 +641,23 @@ impl NativeEmbeddingEngine {
     }
 
     fn build_plan(&self, rows: usize) -> Result<NativePlan> {
+        match (&self.cfg, &self.layout) {
+            (NativeConfig::Nomic(cfg), WeightLayout::Nomic(layout)) => {
+                self.build_nomic_plan(rows, cfg, layout)
+            }
+            (NativeConfig::Qwen3(cfg), WeightLayout::Qwen3(layout)) => {
+                self.build_qwen3_plan(rows, cfg, layout)
+            }
+            _ => unreachable!("embedding config and weight layout must use the same architecture"),
+        }
+    }
+
+    fn build_nomic_plan(
+        &self,
+        rows: usize,
+        cfg: &NomicConfig,
+        layout: &NomicWeightLayout,
+    ) -> Result<NativePlan> {
         let mut graph = Graph::new();
         let ids = graph.input(TensorDesc::new(vec![rows], DType::I32));
         let ids = graph.label(ids, "embedding.token_ids");
@@ -492,8 +674,8 @@ impl NativeEmbeddingEngine {
         let wid = |index: usize| weight_ids[index];
         let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
         let f16d = |n: usize| TensorDesc::new(vec![n], DType::F16);
-        let hidden_len = rows * self.cfg.hidden;
-        let ffn_len = rows * self.cfg.ffn;
+        let hidden_len = rows * cfg.hidden;
+        let ffn_len = rows * cfg.ffn;
         let state = [
             graph.internal(f32d(hidden_len)),
             graph.internal(f32d(hidden_len)),
@@ -517,41 +699,41 @@ impl NativeEmbeddingEngine {
 
         graph.push(Op::EmbedGather {
             ids,
-            table: wid(self.layout.token_embedding),
+            table: wid(layout.token_embedding),
             dst: state[0],
             rows: rows as u32,
-            ne: self.cfg.hidden as u32,
+            ne: cfg.hidden as u32,
             scale: 1.0,
         });
         graph.push(Op::AddBias {
             x: state[0],
-            bias: wid(self.layout.token_type_zero),
+            bias: wid(layout.token_type_zero),
             dst: state[0],
             rows: rows as u32,
-            n: self.cfg.hidden as u32,
+            n: cfg.hidden as u32,
         });
         graph.push(Op::LayerNorm {
             x: state[0],
-            weight: wid(self.layout.embedding_norm_weight),
-            bias: wid(self.layout.embedding_norm_bias),
+            weight: wid(layout.embedding_norm_weight),
+            bias: wid(layout.embedding_norm_bias),
             dst: state[1],
             rows: rows as u32,
-            dim: self.cfg.hidden as u32,
-            eps: self.cfg.eps,
+            dim: cfg.hidden as u32,
+            eps: cfg.eps,
         });
 
         let current = state[1];
         let residual = state[0];
-        let matrix = self.cfg.hidden * self.cfg.hidden;
-        for layer in &self.layout.layers {
+        let matrix = cfg.hidden * cfg.hidden;
+        for layer in &layout.layers {
             for (dst, offset) in [(q, 0usize), (k, matrix), (v, 2 * matrix)] {
                 graph.push(Op::Linear {
                     x: current,
                     weight: wid(layer.qkv),
                     dst,
                     m: rows as u32,
-                    in_f: self.cfg.hidden as u32,
-                    out_f: self.cfg.hidden as u32,
+                    in_f: cfg.hidden as u32,
+                    out_f: cfg.hidden as u32,
                     w_off: offset as u32,
                 });
             }
@@ -561,10 +743,10 @@ impl NativeEmbeddingEngine {
                     positions,
                     dst,
                     rows: rows as u32,
-                    n_head: self.cfg.heads as u32,
-                    head_dim: self.cfg.head_dim as u32,
-                    rope_dim: self.cfg.head_dim as u32,
-                    theta: self.cfg.rope_theta,
+                    n_head: cfg.heads as u32,
+                    head_dim: cfg.head_dim as u32,
+                    rope_dim: cfg.head_dim as u32,
+                    theta: cfg.rope_theta,
                     freq_factors: None,
                     x_stride: 0,
                     neox: true,
@@ -587,10 +769,10 @@ impl NativeEmbeddingEngine {
                 dst: attention,
                 rows: rows as u32,
                 kv_len: rows as u32,
-                n_head: self.cfg.heads as u32,
-                n_kv: self.cfg.heads as u32,
-                head_dim: self.cfg.head_dim as u32,
-                scale: 1.0 / (self.cfg.head_dim as f32).sqrt(),
+                n_head: cfg.heads as u32,
+                n_kv: cfg.heads as u32,
+                head_dim: cfg.head_dim as u32,
+                scale: 1.0 / (cfg.head_dim as f32).sqrt(),
                 mask: AttnMask::Canvas { lo: 0 },
                 pos: 0,
                 sinks: None,
@@ -600,8 +782,8 @@ impl NativeEmbeddingEngine {
                 weight: wid(layer.attn_output),
                 dst: sublayer,
                 m: rows as u32,
-                in_f: self.cfg.hidden as u32,
-                out_f: self.cfg.hidden as u32,
+                in_f: cfg.hidden as u32,
+                out_f: cfg.hidden as u32,
                 w_off: 0,
             });
             graph.push(Op::Add {
@@ -616,16 +798,16 @@ impl NativeEmbeddingEngine {
                 bias: wid(layer.attn_norm_bias),
                 dst: normed,
                 rows: rows as u32,
-                dim: self.cfg.hidden as u32,
-                eps: self.cfg.eps,
+                dim: cfg.hidden as u32,
+                eps: cfg.eps,
             });
             graph.push(Op::Linear {
                 x: normed,
                 weight: wid(layer.ffn_gate),
                 dst: gate,
                 m: rows as u32,
-                in_f: self.cfg.hidden as u32,
-                out_f: self.cfg.ffn as u32,
+                in_f: cfg.hidden as u32,
+                out_f: cfg.ffn as u32,
                 w_off: 0,
             });
             graph.push(Op::Linear {
@@ -633,8 +815,8 @@ impl NativeEmbeddingEngine {
                 weight: wid(layer.ffn_up),
                 dst: up,
                 m: rows as u32,
-                in_f: self.cfg.hidden as u32,
-                out_f: self.cfg.ffn as u32,
+                in_f: cfg.hidden as u32,
+                out_f: cfg.ffn as u32,
                 w_off: 0,
             });
             graph.push(Op::GatedAct {
@@ -642,7 +824,7 @@ impl NativeEmbeddingEngine {
                 up,
                 dst: activated,
                 rows: rows as u32,
-                nff: self.cfg.ffn as u32,
+                nff: cfg.ffn as u32,
                 act: Activation::Silu,
                 up_off: 0,
                 up_stride: 0,
@@ -655,8 +837,8 @@ impl NativeEmbeddingEngine {
                 weight: wid(layer.ffn_down),
                 dst: sublayer,
                 m: rows as u32,
-                in_f: self.cfg.ffn as u32,
-                out_f: self.cfg.hidden as u32,
+                in_f: cfg.ffn as u32,
+                out_f: cfg.hidden as u32,
                 w_off: 0,
             });
             graph.push(Op::Add {
@@ -671,8 +853,8 @@ impl NativeEmbeddingEngine {
                 bias: wid(layer.output_norm_bias),
                 dst: current,
                 rows: rows as u32,
-                dim: self.cfg.hidden as u32,
-                eps: self.cfg.eps,
+                dim: cfg.hidden as u32,
+                eps: cfg.eps,
             });
         }
         graph.push(Op::Copy {
@@ -687,6 +869,245 @@ impl NativeEmbeddingEngine {
             .backend
             .compile(&graph)
             .map_err(|error| anyhow!("compile native embedding graph: {error}"))?;
+        let ids_buffer = self.alloc(rows * 4, BufferUsage::Staging)?;
+        let positions_buffer = self.alloc(rows * 4, BufferUsage::Staging)?;
+        let output_buffer = self.alloc(hidden_len * 4, BufferUsage::Readback)?;
+        Ok(NativePlan {
+            plan,
+            ids,
+            positions,
+            output,
+            weight_ids,
+            ids_buffer,
+            positions_buffer,
+            output_buffer,
+        })
+    }
+
+    fn build_qwen3_plan(
+        &self,
+        rows: usize,
+        cfg: &Qwen3Config,
+        layout: &Qwen3WeightLayout,
+    ) -> Result<NativePlan> {
+        let mut graph = Graph::new();
+        let ids = graph.input(TensorDesc::new(vec![rows], DType::I32));
+        let ids = graph.label(ids, "embedding.token_ids");
+        let positions = graph.input(TensorDesc::new(vec![rows], DType::I32));
+        let positions = graph.label(positions, "embedding.positions");
+        let weight_ids = self
+            .specs
+            .iter()
+            .map(|spec| {
+                let id = graph.weight(spec.desc.clone());
+                graph.label(id, spec.label.clone())
+            })
+            .collect::<Vec<_>>();
+        let wid = |index: usize| weight_ids[index];
+        let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
+        let f16d = |n: usize| TensorDesc::new(vec![n], DType::F16);
+        let hidden_len = rows * cfg.hidden;
+        let q_len = rows * cfg.q_width;
+        let kv_len = rows * cfg.kv_width;
+        let ffn_len = rows * cfg.ffn;
+        let state = [
+            graph.internal(f32d(hidden_len)),
+            graph.internal(f32d(hidden_len)),
+        ];
+        let normed = graph.internal(f32d(hidden_len));
+        let q = graph.internal(f32d(q_len));
+        let k = graph.internal(f32d(kv_len));
+        let v = graph.internal(f32d(kv_len));
+        let q16 = graph.internal(f16d(q_len));
+        let k16 = graph.internal(f16d(kv_len));
+        let v16 = graph.internal(f16d(kv_len));
+        let attention = graph.internal(f32d(q_len));
+        let sublayer = graph.internal(f32d(hidden_len));
+        let gate = graph.internal(f32d(ffn_len));
+        let up = graph.internal(f32d(ffn_len));
+        let activated = graph.internal(f32d(ffn_len));
+        let output = graph.output(f32d(hidden_len));
+        let output = graph.label(output, "embedding.last_hidden_state");
+
+        graph.push(Op::EmbedGather {
+            ids,
+            table: wid(layout.token_embedding),
+            dst: state[0],
+            rows: rows as u32,
+            ne: cfg.hidden as u32,
+            scale: 1.0,
+        });
+        let current = state[0];
+        let residual = state[1];
+        for layer in &layout.layers {
+            graph.push(Op::RmsNorm {
+                x: current,
+                weight: wid(layer.attn_norm),
+                dst: normed,
+                rows: rows as u32,
+                dim: cfg.hidden as u32,
+                eps: cfg.eps,
+            });
+            graph.push(Op::Linear {
+                x: normed,
+                weight: wid(layer.q),
+                dst: q,
+                m: rows as u32,
+                in_f: cfg.hidden as u32,
+                out_f: cfg.q_width as u32,
+                w_off: 0,
+            });
+            graph.push(Op::Linear {
+                x: normed,
+                weight: wid(layer.k),
+                dst: k,
+                m: rows as u32,
+                in_f: cfg.hidden as u32,
+                out_f: cfg.kv_width as u32,
+                w_off: 0,
+            });
+            graph.push(Op::Linear {
+                x: normed,
+                weight: wid(layer.v),
+                dst: v,
+                m: rows as u32,
+                in_f: cfg.hidden as u32,
+                out_f: cfg.kv_width as u32,
+                w_off: 0,
+            });
+            graph.push(Op::QkNormRope {
+                x: q,
+                weight: wid(layer.q_norm),
+                positions,
+                dst: q16,
+                rows: rows as u32,
+                n_head: cfg.heads as u32,
+                head_dim: cfg.head_dim as u32,
+                rope_dim: cfg.head_dim as u32,
+                theta: cfg.rope_theta,
+                eps: cfg.eps,
+                freq_factors: None,
+                x_stride: 0,
+            });
+            graph.push(Op::QkNormRope {
+                x: k,
+                weight: wid(layer.k_norm),
+                positions,
+                dst: k16,
+                rows: rows as u32,
+                n_head: cfg.kv_heads as u32,
+                head_dim: cfg.head_dim as u32,
+                rope_dim: cfg.head_dim as u32,
+                theta: cfg.rope_theta,
+                eps: cfg.eps,
+                freq_factors: None,
+                x_stride: 0,
+            });
+            graph.push(Op::Copy {
+                src: v,
+                src_off: 0,
+                dst: v16,
+                dst_off: 0,
+                n: kv_len as u32,
+            });
+            graph.push(Op::Attention {
+                q: q16,
+                k_cache: k16,
+                v_cache: v16,
+                dst: attention,
+                rows: rows as u32,
+                kv_len: rows as u32,
+                n_head: cfg.heads as u32,
+                n_kv: cfg.kv_heads as u32,
+                head_dim: cfg.head_dim as u32,
+                scale: 1.0 / (cfg.head_dim as f32).sqrt(),
+                mask: AttnMask::Causal,
+                pos: 0,
+                sinks: None,
+            });
+            graph.push(Op::Linear {
+                x: attention,
+                weight: wid(layer.attn_output),
+                dst: sublayer,
+                m: rows as u32,
+                in_f: cfg.q_width as u32,
+                out_f: cfg.hidden as u32,
+                w_off: 0,
+            });
+            graph.push(Op::Add {
+                a: current,
+                b: sublayer,
+                dst: residual,
+                n: hidden_len as u32,
+            });
+            graph.push(Op::RmsNorm {
+                x: residual,
+                weight: wid(layer.ffn_norm),
+                dst: normed,
+                rows: rows as u32,
+                dim: cfg.hidden as u32,
+                eps: cfg.eps,
+            });
+            graph.push(Op::Linear {
+                x: normed,
+                weight: wid(layer.ffn_gate),
+                dst: gate,
+                m: rows as u32,
+                in_f: cfg.hidden as u32,
+                out_f: cfg.ffn as u32,
+                w_off: 0,
+            });
+            graph.push(Op::Linear {
+                x: normed,
+                weight: wid(layer.ffn_up),
+                dst: up,
+                m: rows as u32,
+                in_f: cfg.hidden as u32,
+                out_f: cfg.ffn as u32,
+                w_off: 0,
+            });
+            graph.push(Op::GatedAct {
+                gate,
+                up,
+                dst: activated,
+                rows: rows as u32,
+                nff: cfg.ffn as u32,
+                act: Activation::Silu,
+                up_off: 0,
+                up_stride: 0,
+                gate_stride: 0,
+                gate_block_width: 0,
+                swiglu_clamp: None,
+            });
+            graph.push(Op::Linear {
+                x: activated,
+                weight: wid(layer.ffn_down),
+                dst: sublayer,
+                m: rows as u32,
+                in_f: cfg.ffn as u32,
+                out_f: cfg.hidden as u32,
+                w_off: 0,
+            });
+            graph.push(Op::Add {
+                a: residual,
+                b: sublayer,
+                dst: current,
+                n: hidden_len as u32,
+            });
+        }
+        graph.push(Op::RmsNorm {
+            x: current,
+            weight: wid(layout.output_norm),
+            dst: output,
+            rows: rows as u32,
+            dim: cfg.hidden as u32,
+            eps: cfg.eps,
+        });
+
+        let plan = self
+            .backend
+            .compile(&graph)
+            .map_err(|error| anyhow!("compile native Qwen3 embedding graph: {error}"))?;
         let ids_buffer = self.alloc(rows * 4, BufferUsage::Staging)?;
         let positions_buffer = self.alloc(rows * 4, BufferUsage::Staging)?;
         let output_buffer = self.alloc(hidden_len * 4, BufferUsage::Readback)?;
@@ -736,21 +1157,28 @@ impl NativeEmbeddingEngine {
         self.backend
             .execute(plan.plan.as_ref(), &bindings)
             .map_err(|error| anyhow!("execute native embedding graph: {error}"))?;
-        let mut bytes = vec![0u8; ids.len() * self.cfg.hidden * 4];
+        let hidden_size = self.cfg.hidden();
+        let mut bytes = vec![0u8; ids.len() * hidden_size * 4];
         self.backend
             .download(plan.output_buffer.as_ref(), &mut bytes)
             .map_err(|error| anyhow!("download native embedding output: {error}"))?;
         let hidden = bytemuck::cast_slice::<u8, f32>(&bytes);
-        let mut pooled = vec![0.0f32; self.cfg.hidden];
-        for row in hidden.chunks_exact(self.cfg.hidden) {
-            for (dst, value) in pooled.iter_mut().zip(row) {
-                *dst += *value;
+        let mut pooled = match &self.cfg {
+            NativeConfig::Nomic(_) => {
+                let mut pooled = vec![0.0f32; hidden_size];
+                for row in hidden.chunks_exact(hidden_size) {
+                    for (dst, value) in pooled.iter_mut().zip(row) {
+                        *dst += *value;
+                    }
+                }
+                let inv_rows = 1.0 / ids.len() as f32;
+                for value in &mut pooled {
+                    *value *= inv_rows;
+                }
+                pooled
             }
-        }
-        let inv_rows = 1.0 / ids.len() as f32;
-        for value in &mut pooled {
-            *value *= inv_rows;
-        }
+            NativeConfig::Qwen3(_) => hidden[hidden.len() - hidden_size..].to_vec(),
+        };
         let norm = pooled.iter().map(|value| value * value).sum::<f32>().sqrt();
         if norm > 0.0 {
             for value in &mut pooled {
@@ -839,8 +1267,24 @@ impl<'a> WeightCatalogBuilder<'a> {
 
 fn build_weight_catalog(
     gguf: &Gguf,
-    cfg: &NomicConfig,
+    cfg: &NativeConfig,
 ) -> Result<(Vec<WeightSpec>, WeightLayout, u64)> {
+    match cfg {
+        NativeConfig::Nomic(cfg) => {
+            let (specs, layout, bytes) = build_nomic_weight_catalog(gguf, cfg)?;
+            Ok((specs, WeightLayout::Nomic(layout), bytes))
+        }
+        NativeConfig::Qwen3(cfg) => {
+            let (specs, layout, bytes) = build_qwen3_weight_catalog(gguf, cfg)?;
+            Ok((specs, WeightLayout::Qwen3(layout), bytes))
+        }
+    }
+}
+
+fn build_nomic_weight_catalog(
+    gguf: &Gguf,
+    cfg: &NomicConfig,
+) -> Result<(Vec<WeightSpec>, NomicWeightLayout, u64)> {
     let mut loader = WeightCatalogBuilder::new(gguf);
     let token_embedding = loader.push("token_embd.weight", &[cfg.hidden, cfg.vocab])?;
     let token_type_dtype = loader.tensor("token_types.weight", &[cfg.hidden, 2])?.dtype;
@@ -866,7 +1310,7 @@ fn build_weight_catalog(
     let mut layers = Vec::with_capacity(cfg.layers);
     for layer in 0..cfg.layers {
         let name = |suffix: &str| format!("blk.{layer}.{suffix}");
-        layers.push(LayerWeights {
+        layers.push(NomicLayerWeights {
             qkv: loader.push(&name("attn_qkv.weight"), &[cfg.hidden, 3 * cfg.hidden])?,
             attn_output: loader.push(&name("attn_output.weight"), &[cfg.hidden, cfg.hidden])?,
             attn_norm_weight: loader.push(&name("attn_output_norm.weight"), &[cfg.hidden])?,
@@ -885,11 +1329,51 @@ fn build_weight_catalog(
     } = loader;
     Ok((
         specs,
-        WeightLayout {
+        NomicWeightLayout {
             token_embedding,
             token_type_zero,
             embedding_norm_weight,
             embedding_norm_bias,
+            layers,
+        },
+        weight_bytes,
+    ))
+}
+
+fn build_qwen3_weight_catalog(
+    gguf: &Gguf,
+    cfg: &Qwen3Config,
+) -> Result<(Vec<WeightSpec>, Qwen3WeightLayout, u64)> {
+    let mut loader = WeightCatalogBuilder::new(gguf);
+    let token_embedding = loader.push("token_embd.weight", &[cfg.hidden, cfg.vocab])?;
+    let output_norm = loader.push("output_norm.weight", &[cfg.hidden])?;
+    let mut layers = Vec::with_capacity(cfg.layers);
+    for layer in 0..cfg.layers {
+        let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+        layers.push(Qwen3LayerWeights {
+            attn_norm: loader.push(&name("attn_norm.weight"), &[cfg.hidden])?,
+            q: loader.push(&name("attn_q.weight"), &[cfg.hidden, cfg.q_width])?,
+            q_norm: loader.push(&name("attn_q_norm.weight"), &[cfg.head_dim])?,
+            k: loader.push(&name("attn_k.weight"), &[cfg.hidden, cfg.kv_width])?,
+            k_norm: loader.push(&name("attn_k_norm.weight"), &[cfg.head_dim])?,
+            v: loader.push(&name("attn_v.weight"), &[cfg.hidden, cfg.kv_width])?,
+            attn_output: loader.push(&name("attn_output.weight"), &[cfg.q_width, cfg.hidden])?,
+            ffn_norm: loader.push(&name("ffn_norm.weight"), &[cfg.hidden])?,
+            ffn_gate: loader.push(&name("ffn_gate.weight"), &[cfg.hidden, cfg.ffn])?,
+            ffn_up: loader.push(&name("ffn_up.weight"), &[cfg.hidden, cfg.ffn])?,
+            ffn_down: loader.push(&name("ffn_down.weight"), &[cfg.ffn, cfg.hidden])?,
+        });
+    }
+    let WeightCatalogBuilder {
+        specs,
+        weight_bytes,
+        ..
+    } = loader;
+    Ok((
+        specs,
+        Qwen3WeightLayout {
+            token_embedding,
+            output_norm,
             layers,
         },
         weight_bytes,
@@ -1100,5 +1584,62 @@ mod tests {
         )
         .unwrap();
         run_oracle(engine, Path::new(&oracle), true);
+    }
+
+    #[test]
+    fn real_qwen3_vulkan_matches_llama_cpp_when_requested() {
+        let (Ok(model), Ok(runner), Ok(_)) = (
+            std::env::var("INFR_QWEN_EMBEDDING_TEST_MODEL"),
+            std::env::var("INFR_EMBEDDING_TEST_RUNNER"),
+            std::env::var("INFR_EMBEDDING_TEST_VULKAN"),
+        ) else {
+            return;
+        };
+        let mut engine_cfg = infr_core::config::Config::default();
+        if let Ok(device) = std::env::var("INFR_QWEN_EMBEDDING_TEST_DEVICE") {
+            engine_cfg.device.dev = Some(device);
+        }
+        let engine_cfg = Arc::new(engine_cfg);
+        let inputs = vec![
+            "如何提高本地大模型推理速度？".to_owned(),
+            "How can local LLM inference be accelerated?".to_owned(),
+        ];
+        let oracle = crate::LlamaCppEmbeddingEngine::load_vulkan_on(
+            Path::new(&model),
+            Arc::clone(&engine_cfg),
+            None,
+            Some(Path::new(&runner)),
+            1,
+        )
+        .unwrap();
+        let expected = oracle.embed(&inputs).unwrap();
+        drop(oracle);
+
+        let native = NativeEmbeddingEngine::load_vulkan(Path::new(&model), engine_cfg).unwrap();
+        let got = native.embed(&inputs).unwrap();
+        assert_eq!(got.prompt_tokens, expected.prompt_tokens);
+        assert_eq!(got.embeddings.len(), expected.embeddings.len());
+        for (index, (actual, reference)) in
+            got.embeddings.iter().zip(&expected.embeddings).enumerate()
+        {
+            assert_eq!(actual.len(), reference.len());
+            let similarity = cosine(actual, reference);
+            let max_abs = actual
+                .iter()
+                .zip(reference)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            eprintln!(
+                "native Qwen3 embedding row {index}: cosine={similarity:.8}, max_abs={max_abs:.6}"
+            );
+            assert!(
+                similarity > 0.999,
+                "Qwen3 row {index} cosine {similarity} is below parity floor"
+            );
+            assert!(
+                max_abs < 0.01,
+                "Qwen3 row {index} max absolute error {max_abs} exceeds parity floor"
+            );
+        }
     }
 }
