@@ -11697,6 +11697,15 @@ impl<'a> Recorder<'a> {
             Self::vkb(lut),
             Self::vkb(y),
         ];
+        if rows > 1 {
+            let nr = self.gemv().id_grid_nr;
+            if let Some((name, spv)) = crate::gemm::native_idm_grid_nr_paged_build_spv(dtype, nr) {
+                let k = self.be.kernel(name, spv, 5, 44);
+                let groups = (rows * n_used * out_f.div_ceil(nr as usize)) as u32;
+                self.dispatch_wide(k, &bufs, 1, &push, groups);
+                return;
+            }
+        }
         if rows == 1 {
             if let Some(nr) = native_id_sg_choice(dtype, in_f, out_f, self.gemv()) {
                 if let Some((name, spv)) =

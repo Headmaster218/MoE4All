@@ -1278,11 +1278,9 @@ impl Qwen4MtpRuntime {
     ) -> Result<(crate::GenStats, super::MtpTiming)> {
         let cfg = model.config();
         let ec = model.engine_cfg();
-        // Treat spec.k as a ceiling. Three rows are the measured sweet spot for the short target
-        // batch: two rows need too many paging rounds, while four spend more on VERIFY than their
-        // additional accepts recover.
-        let max_verify_tokens = ec.spec.k.clamp(2, DRAFT_TOKENS);
-        let verify_tokens = max_verify_tokens.min(3);
+        // The fixed MTP runtime supports two through four VERIFY rows. Keep the configured width
+        // effective so kernel improvements can change the best batch size without a hidden cap.
+        let verify_tokens = ec.spec.k.clamp(2, DRAFT_TOKENS);
         let h_width = cfg.hc_mult * cfg.n_embd;
         let prompt_tokens = model.encode(prompt)?;
         if prompt_tokens.is_empty() {
@@ -1451,7 +1449,7 @@ impl Qwen4MtpRuntime {
             let catchup_secs = t_catchup.elapsed().as_secs_f64();
             timing.catchup_secs += catchup_secs;
 
-            if ec.prof.stages {
+            if ec.prof.stages || infr_core::pager_profile::active() {
                 tracing::info!(
                     "[qwen4 mtp cycle {cycle}] drafted={} accepted={accepted_spec} committed={accepted} draft={:.1}ms verify={:.1}ms catchup={:.1}ms",
                     verify_tokens - 1,
@@ -1478,7 +1476,7 @@ impl Qwen4MtpRuntime {
             }
         }
 
-        if ec.prof.stages {
+        if ec.prof.stages || infr_core::pager_profile::active() {
             let (draft_pct, verify_pct, catchup_pct) = timing.phase_shares();
             tracing::info!(
                 "[qwen4 mtp summary] {cycle} cycles, {}/{} accepted (alpha={:.3}), {generated} tokens generated, phase share: draft {:.0}% verify {:.0}% catchup {:.0}%",

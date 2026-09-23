@@ -149,6 +149,8 @@ fn default_config_matches_documented_defaults() {
     assert_eq!(d.kernels.vulkan.gemv.sg_minout, 2048);
     assert_eq!(d.kernels.vulkan.gemv.sg_maxout, 8192);
     assert_eq!(d.kernels.vulkan.gemv.sg_nr, 2);
+    assert_eq!(d.kernels.vulkan.gemv.id_grid_nr, 8);
+    assert!(d.kernels.ple_single_parallel);
     // §6.7 / §6.9.
     assert_eq!(d.kernels.cpu.spin, 1 << 15);
     assert!(d.kernels.cpu.spinpool);
@@ -168,6 +170,7 @@ fn default_config_matches_documented_defaults() {
     // §6.8: `INFR_MTP` is the exact string "1"; unset ⇒ off, and the three MTP hatches default on.
     assert!(!d.spec.mtp);
     assert!(d.spec.mtp_ckpt && d.spec.mtp_reprime && d.spec.mtp_draft_chain);
+    assert!(d.spec.mtp_ple_overlap);
     assert_eq!(d.spec.k, 6);
     assert_eq!(d.spec.decode_chain, 8);
 }
@@ -1317,6 +1320,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_NO_KV_RING",
         "INFR_NO_MTP_CKPT",
         "INFR_NO_MTP_DRAFT_CHAIN",
+        "INFR_NO_MTP_PLE_OVERLAP",
         "INFR_NO_MTP_REPRIME",
         "INFR_NO_QKV_FUSE",
         "INFR_PIPELINE",
@@ -1395,6 +1399,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_GEMV_SG_MAXOUT",
         "INFR_GEMV_SG_MINOUT",
         "INFR_GEMV_SG_NR",
+        "INFR_GEMV_ID_GRID_NR",
         "INFR_GEMV_VARIANT",
         "INFR_I8_COOPMAT",
         "INFR_I8_ROW_SCALE",
@@ -1408,6 +1413,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_NOBARRIER",
         "INFR_NO_ATTN_DECODE",
         "INFR_NO_ATTN_HD",
+        "INFR_NO_PLE_SINGLE_PAR",
         "INFR_NO_BM16",
         "INFR_NO_DELTA_STRIDED",
         "INFR_NO_DN_CHUNK",

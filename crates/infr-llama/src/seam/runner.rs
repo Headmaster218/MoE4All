@@ -2578,6 +2578,9 @@ fn generate_dense_backend_inner(
                 positions: be
                     .alloc(rows * 4, BufferUsage::Staging)
                     .map_err(|e| anyhow!("{e}"))?,
+                hidden: be
+                    .alloc_uninit(rows * ne * 4, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
                 wide: be
                     .alloc_uninit(rows * h_width * 4, BufferUsage::Activations)
                     .map_err(|e| anyhow!("{e}"))?,
@@ -2588,7 +2591,7 @@ fn generate_dense_backend_inner(
                     .alloc(rows * c.vocab * 4, BufferUsage::Staging)
                     .map_err(|e| anyhow!("{e}"))?,
                 h_out: be
-                    .alloc(rows * h_width * 4, BufferUsage::Staging)
+                    .alloc(rows * h_width * 4, BufferUsage::Readback)
                     .map_err(|e| anyhow!("{e}"))?,
                 out_ids: be
                     .alloc(rows * 4, BufferUsage::Readback)
@@ -2654,7 +2657,8 @@ fn generate_dense_backend_inner(
         } else {
             None
         };
-        let ple_worker = super::ple::PleWorker::new(g, c)?.map(std::sync::Arc::new);
+        let ple_worker = super::ple::PleWorker::new(g, c, ec.kernels.ple_single_parallel)?
+            .map(std::sync::Arc::new);
         let weights = std::sync::Arc::new(SeamWeights {
             wbufs,
             wspecs,
@@ -8081,6 +8085,7 @@ fn generate_dense_backend_inner(
                 && caps.argmax_rows
                 && ec.spec.gpu_argmax
                 && ec.spec.gpu_mtp_accept;
+            let overlap_ple = ec.spec.mtp_ple_overlap && c.n_layer > 1;
             let fixed = (m <= crate::mtp::DRAFT_TOKENS)
                 .then(|| mtp_verify_bufs.as_ref())
                 .flatten();
@@ -8092,6 +8097,10 @@ fn generate_dense_backend_inner(
             let pos_owned = fixed
                 .is_none()
                 .then(|| be.alloc(m * 4, BufferUsage::Staging))
+                .transpose()
+                .map_err(|e| anyhow!("{e}"))?;
+            let hidden_owned = (overlap_ple && fixed.is_none())
+                .then(|| be.alloc_uninit(m * ne * 4, BufferUsage::Activations))
                 .transpose()
                 .map_err(|e| anyhow!("{e}"))?;
             let wide_owned = fixed
@@ -8110,7 +8119,7 @@ fn generate_dense_backend_inner(
                 .transpose()
                 .map_err(|e| anyhow!("{e}"))?;
             let h_owned = (want_h && fixed.is_none())
-                .then(|| be.alloc(m * h_width * 4, BufferUsage::Staging))
+                .then(|| be.alloc(m * h_width * 4, BufferUsage::Readback))
                 .transpose()
                 .map_err(|e| anyhow!("{e}"))?;
             let out_ids_owned = (gpu_verify_ids && fixed.is_none())
@@ -8125,6 +8134,12 @@ fn generate_dense_backend_inner(
                 .map(|bufs| bufs.positions.as_ref())
                 .or(pos_owned.as_deref())
                 .expect("fixed or temporary MTP position buffer");
+            let hidden_verify_buf = overlap_ple.then(|| {
+                fixed
+                    .map(|bufs| bufs.hidden.as_ref())
+                    .or(hidden_owned.as_deref())
+                    .expect("fixed or temporary MTP hidden buffer")
+            });
             let wide_buf = fixed
                 .map(|bufs| bufs.wide.as_ref())
                 .or(wide_owned.as_deref())
@@ -8155,8 +8170,64 @@ fn generate_dense_backend_inner(
                 .map_err(|e| anyhow!("{e}"))?;
             ensure_kv_depth!(start + m);
             let vf_alloc = verify_t0.elapsed();
-            let vf_t0 = std::time::Instant::now();
+            let mut vf_build = std::time::Duration::ZERO;
+            let mut vf_exec = std::time::Duration::ZERO;
 
+            if overlap_ple {
+                let vf_t0 = std::time::Instant::now();
+                let (vg0, vh0) = build(
+                    m,
+                    start,
+                    0,
+                    false,
+                    None,
+                    false,
+                    false,
+                    false,
+                    false,
+                    true,
+                    true,
+                    false,
+                    None,
+                    Some(0..1),
+                );
+                let vplan0 = be.compile(&vg0).map_err(|e| anyhow!("{e}"))?;
+                let mut vb0 = Bindings::new();
+                vb0.bind(vh0.tok_ids.expect("GPU embedding needs token ids"), ids_buf);
+                vb0.bind(
+                    vh0.hidden,
+                    hidden_verify_buf.expect("PLE overlap has a hidden buffer"),
+                );
+                vb0.bind(vh0.positions, pos_buf);
+                bind_layer_io(
+                    &mut vb0,
+                    &vh0,
+                    c.n_layer,
+                    rf_buf,
+                    yff_buf,
+                    &kbufs[..],
+                    &vbufs[..],
+                    &qsa_kbufs[..],
+                    &qsa_cbufs[..],
+                    &mrope_history_buf,
+                    &wbufs[..],
+                    qwen_wide_buf,
+                    ple_embd_buf,
+                    ple_state_buf,
+                );
+                vb0.bind(
+                    vh0.qwen_wide.expect("Qwen VERIFY head has a wide residual"),
+                    wide_buf,
+                );
+                bind_mtp_recurrent_traces(&mut vb0, &vh0, mtp_delta_ckpt);
+                vf_build += vf_t0.elapsed();
+                let vf_t0 = std::time::Instant::now();
+                be.execute(vplan0.as_ref(), &vb0)
+                    .map_err(|e| anyhow!("{e}"))?;
+                vf_exec += vf_t0.elapsed();
+            }
+
+            let vf_t0 = std::time::Instant::now();
             let ple_rows = ticket.wait()?;
             if ple_rows.len() != m * ple_row {
                 return Err(anyhow!(
@@ -8170,8 +8241,8 @@ fn generate_dense_backend_inner(
 
             let vf_ple = vf_t0.elapsed();
             let vf_t0 = std::time::Instant::now();
-            // VERIFY's PLE rows are ready before the GPU starts in steady state. A single graph
-            // avoids a second execute boundary without giving up measurable host/GPU overlap.
+            // With overlap enabled, layer 0 has already initialized hidden/wide state while the
+            // PLE worker gathered these rows. The tail starts at the first PLE-bearing layer.
             let (vg, vh) = build(
                 m,
                 start,
@@ -8182,15 +8253,22 @@ fn generate_dense_backend_inner(
                 want_h,
                 gpu_verify_ids,
                 false,
-                true,
+                !overlap_ple,
                 true,
                 false,
                 None,
-                None,
+                overlap_ple.then_some(1..c.n_layer),
             );
             let vplan = be.compile(&vg).map_err(|e| anyhow!("{e}"))?;
             let mut vb = Bindings::new();
-            vb.bind(vh.tok_ids.expect("GPU embedding needs token ids"), ids_buf);
+            if overlap_ple {
+                vb.bind(
+                    vh.hidden,
+                    hidden_verify_buf.expect("PLE overlap has a hidden buffer"),
+                );
+            } else {
+                vb.bind(vh.tok_ids.expect("GPU embedding needs token ids"), ids_buf);
+            }
             vb.bind(vh.positions, pos_buf);
             bind_layer_io(
                 &mut vb,
@@ -8221,11 +8299,11 @@ fn generate_dense_backend_inner(
             if let (Some(id), Some(buf)) = (vh.h_out, h_buf) {
                 vb.bind(id, buf);
             }
-            let vf_build = vf_t0.elapsed();
+            vf_build += vf_t0.elapsed();
             let vf_t0 = std::time::Instant::now();
             be.execute(vplan.as_ref(), &vb)
                 .map_err(|e| anyhow!("{e}"))?;
-            let vf_exec = vf_t0.elapsed();
+            vf_exec += vf_t0.elapsed();
             let vf_t0 = std::time::Instant::now();
 
             if let (Some(out_ids), Some(buf)) = (verify_ids, out_ids_buf) {
@@ -8243,7 +8321,7 @@ fn generate_dense_backend_inner(
                     .map_err(|e| anyhow!("{e}"))?;
             }
             cached.extend_from_slice(&prompt[start..]);
-            if ec.prof.stages {
+            if ec.prof.stages || infr_core::pager_profile::active() {
                 let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
                 tracing::info!(
                     "[qwen4 mtp verify] m={m} start={start} io={:.2}ms ple={:.2}ms build={:.2}ms exec={:.2}ms readback={:.2}ms total={:.2}ms",
@@ -9286,9 +9364,14 @@ fn generate_dense_backend_inner(
     // graph + compile + bind) vs execute (record + submit + GPU + wait) to guide the
     // record-once-replay decision. Hoisted here, ABOVE the loop — the old read was a `getenv` on
     // EVERY decode step (R6/§10.9).
-    let prof_dec = ec.prof.stages;
+    let profile_single = c.qwen4exp && infr_core::pager_profile::active();
+    let prof_dec = ec.prof.stages || profile_single;
     let mut dec_setup = std::time::Duration::ZERO;
     let mut dec_exec = std::time::Duration::ZERO;
+    let mut dec_layer0 = std::time::Duration::ZERO;
+    let mut dec_ple = std::time::Duration::ZERO;
+    let mut dec_id_readback = std::time::Duration::ZERO;
+    let mut decode_profile_before = None;
 
     // ── batched prefill (dense + adapter-covered MoE; non-E2B models only) ────────────────────
     // Process all-but-the-last prompt tokens in a single graph execution: each Op::Linear runs
@@ -10078,6 +10161,15 @@ fn generate_dense_backend_inner(
                 // Backend declined (e.g. adapter fell back to static) — per-token path below.
             }
         }
+        // Sample only after prefill, at a drained single-sequence decode boundary.
+        if profile_single && pos + 1 >= prompt.len() && decode_profile_before.is_none() {
+            decode_profile_before = Some((
+                infr_core::pager_profile::snapshot(),
+                infr_core::pager_profile::device_timeline_snapshot(),
+                infr_core::pager_profile::paged_moe_layer_snapshot(),
+            ));
+            tracing::info!("[single-decode-begin] pos={pos} max_new={max_new}");
+        }
         let step_t0 = std::time::Instant::now();
         let tok = cur[pos] as usize;
         let image_row = mm.and_then(|plan| {
@@ -10180,6 +10272,8 @@ fn generate_dense_backend_inner(
         };
         let t_setup = std::time::Instant::now();
         let (setup_el, exec_el);
+        let mut layer0_el = std::time::Duration::ZERO;
+        let mut ple_el = std::time::Duration::ZERO;
         if let Some((plan, b)) = &ro {
             // Record-once path: reuse the single compiled plan + bindings (no per-token rebuild).
             setup_el = t_setup.elapsed();
@@ -10243,6 +10337,7 @@ fn generate_dense_backend_inner(
             be.execute(plan0.as_ref(), &b0)
                 .map_err(|e| anyhow!("{e}"))?;
             let exec0 = t_exec0.elapsed();
+            layer0_el = exec0;
 
             let t_setup1 = std::time::Instant::now();
             let ple_rows = ticket.wait()?;
@@ -10261,6 +10356,9 @@ fn generate_dense_backend_inner(
                 .map_err(|e| anyhow!("{e}"))?;
             if let Some(elapsed) = infr_core::pager_profile::elapsed(upload_t0) {
                 infr_core::pager_profile::record_ple_upload(ple_rows.len() * 4, elapsed);
+            }
+            if profile_single {
+                ple_el = t_setup1.elapsed();
             }
 
             let (g1, h1) = build(
@@ -10390,6 +10488,17 @@ fn generate_dense_backend_inner(
         if prof_dec && pos + 1 >= prompt.len() {
             dec_setup += setup_el;
             dec_exec += exec_el;
+            dec_layer0 += layer0_el;
+            dec_ple += ple_el;
+            if profile_single {
+                tracing::info!(
+                    "[single-decode-forward] pos={pos} setup={:.3}ms exec={:.3}ms layer0={:.3}ms ple={:.3}ms",
+                    setup_el.as_secs_f64() * 1e3,
+                    exec_el.as_secs_f64() * 1e3,
+                    layer0_el.as_secs_f64() * 1e3,
+                    ple_el.as_secs_f64() * 1e3,
+                );
+            }
         }
 
         if is_decode && at_frontier {
@@ -10442,7 +10551,11 @@ fn generate_dense_backend_inner(
                 let next = if gpu_argmax || gpu_sample {
                     // Device-side sampling (Op::Argmax / Op::Sample): read back the 4-byte id.
                     let mut idb = [0u8; 4];
+                    let readback_t0 = profile_single.then(std::time::Instant::now);
                     be.download(id_out, &mut idb).map_err(|e| anyhow!("{e}"))?;
+                    if let Some(t0) = readback_t0 {
+                        dec_id_readback += t0.elapsed();
+                    }
                     u32::from_le_bytes(idb)
                 } else {
                     // Serve-only: repetition penalties patch the row in place (no-op allocation-wise
@@ -10524,6 +10637,74 @@ fn generate_dense_backend_inner(
             dec_setup.as_secs_f64() * 1e3 / decode_n as f64,
             dec_exec.as_secs_f64() * 1e3 / decode_n as f64,
         );
+    }
+    if let Some((before, timeline_before, layers_before)) = decode_profile_before {
+        let after = infr_core::pager_profile::snapshot();
+        let timeline = infr_core::pager_profile::device_timeline_snapshot();
+        let delta = |a: u64, b: u64| a.saturating_sub(b);
+        let ms = |a: u64, b: u64| delta(a, b) as f64 / 1e6;
+        let mib = |a: u64, b: u64| delta(a, b) as f64 / 1048576.0;
+        // Pager timers overlap execution and one another; they are not additive stalls.
+        tracing::info!(
+            "[single-decode-summary] tokens={decode_n} wall={:.3}ms setup={:.3}ms exec={:.3}ms layer0={:.3}ms ple={:.3}ms id_readback={:.3}ms",
+            decode_t.as_secs_f64() * 1e3,
+            dec_setup.as_secs_f64() * 1e3,
+            dec_exec.as_secs_f64() * 1e3,
+            dec_layer0.as_secs_f64() * 1e3,
+            dec_ple.as_secs_f64() * 1e3,
+            dec_id_readback.as_secs_f64() * 1e3,
+        );
+        tracing::info!(
+            "[single-decode-pager] hits={} misses={} evictions={} push={:.3}MiB/{:.3}ms dma={:.3}MiB dma_submits={} submits={} submit_cpu={:.3}ms record={:.3}ms sync={:.3}ms paging_calls={} paging_sync={:.3}ms backend_setup={:.3}ms scratch={:.3}ms layout={:.3}ms scan={:.3}ms host_reads={} mmap_reads={}",
+            delta(after.gpu_hits, before.gpu_hits),
+            delta(after.gpu_misses, before.gpu_misses),
+            delta(after.gpu_evictions, before.gpu_evictions),
+            mib(after.memcpy_bytes, before.memcpy_bytes),
+            ms(after.memcpy_ns, before.memcpy_ns),
+            mib(after.dedicated_transfer_bytes, before.dedicated_transfer_bytes),
+            delta(after.dedicated_transfer_submits, before.dedicated_transfer_submits),
+            delta(after.queue_submits, before.queue_submits),
+            ms(after.queue_submit_ns, before.queue_submit_ns),
+            ms(after.command_record_ns, before.command_record_ns),
+            ms(after.sync_wait_ns, before.sync_wait_ns),
+            delta(after.paging_sync_waits, before.paging_sync_waits),
+            ms(after.paging_sync_wait_ns, before.paging_sync_wait_ns),
+            ms(after.backend_setup_ns, before.backend_setup_ns),
+            ms(after.backend_setup_phase_scratch_ns, before.backend_setup_phase_scratch_ns),
+            ms(after.backend_setup_layout_ns, before.backend_setup_layout_ns),
+            ms(after.backend_setup_paged_moe_scan_ns, before.backend_setup_paged_moe_scan_ns),
+            delta(after.host_reads, before.host_reads),
+            delta(after.mmap_fallbacks, before.mmap_fallbacks),
+        );
+        tracing::info!(
+            "[single-decode-device] main_busy={:.3}ms dma_busy={:.3}ms dma_timed={} ple_work={:.3}ms ple_wait={:.3}ms hit_windows={} overlap_lower_bound={:.3}ms",
+            ms(timeline.main_busy_ns, timeline_before.main_busy_ns),
+            ms(timeline.dma_busy_ns, timeline_before.dma_busy_ns),
+            delta(after.dedicated_transfer_gpu_timed_submits, before.dedicated_transfer_gpu_timed_submits),
+            ms(after.ple_work_ns, before.ple_work_ns),
+            ms(after.ple_wait_ns, before.ple_wait_ns),
+            delta(after.prefetch_windows, before.prefetch_windows),
+            ms(after.prefetch_confirmed_overlap_ns, before.prefetch_confirmed_overlap_ns),
+        );
+        for (layer, after) in infr_core::pager_profile::paged_moe_layer_snapshot()
+            .into_iter()
+            .enumerate()
+        {
+            let stats = after.saturating_sub(layers_before.get(layer).copied().unwrap_or_default());
+            if stats.calls == 0 {
+                continue;
+            }
+            tracing::info!(
+                "[single-decode-layer] layer={layer} calls={} wall={:.3}ms paging_calls={} paging_sync={:.3}ms hits={} misses={} push={:.3}MiB/{:.3}ms dma={:.3}MiB submits={} submit_cpu={:.3}ms record={:.3}ms",
+                stats.calls, stats.wall_ns as f64 / 1e6,
+                stats.paging_sync_waits, stats.paging_sync_wait_ns as f64 / 1e6,
+                stats.gpu_hits, stats.gpu_misses,
+                stats.memcpy_bytes as f64 / 1048576.0, stats.memcpy_ns as f64 / 1e6,
+                stats.dedicated_transfer_bytes as f64 / 1048576.0,
+                stats.queue_submits, stats.queue_submit_ns as f64 / 1e6,
+                stats.command_record_ns as f64 / 1e6,
+            );
+        }
     }
     // Record what the KV cache now holds for the next turn's prefix diff, straight from the
     // per-step `last_written` bookkeeping (`resident_after_gen`): exactly the tokens whose KV rows

@@ -328,6 +328,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     g.sg_minout = num(get, "INFR_GEMV_SG_MINOUT");
     g.sg_maxout = num(get, "INFR_GEMV_SG_MAXOUT");
     g.sg_nr = num(get, "INFR_GEMV_SG_NR");
+    g.id_grid_nr = num(get, "INFR_GEMV_ID_GRID_NR");
     // `INFR_NO_GEMV_REG` silently WINS over `INFR_GEMV_VARIANT` — R1-frozen (§10.11).
     if get("INFR_NO_GEMV_REG").is_some() {
         g.variant = Some(None);
@@ -364,6 +365,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     // ── kernels (graph shape, `infr-llama`) ──────────────────────────────────
     p.kernels.qkv_fuse = presence_inv(get, "INFR_NO_QKV_FUSE");
     p.kernels.gated_rmsnorm = presence_inv(get, "INFR_NO_GATED_RMSNORM");
+    p.kernels.ple_single_parallel = presence_inv(get, "INFR_NO_PLE_SINGLE_PAR");
 
     // ── spec ─────────────────────────────────────────────────────────────────
     // The EXACT string "1"; `INFR_MTP=true` does nothing today.
@@ -371,6 +373,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.spec.mtp_ckpt = presence_inv(get, "INFR_NO_MTP_CKPT");
     p.spec.mtp_reprime = presence_inv(get, "INFR_NO_MTP_REPRIME");
     p.spec.mtp_draft_chain = presence_inv(get, "INFR_NO_MTP_DRAFT_CHAIN");
+    p.spec.mtp_ple_overlap = presence_inv(get, "INFR_NO_MTP_PLE_OVERLAP");
     p.spec.draft = opt_path(get, "INFR_SPEC_DRAFT");
     p.spec.k = num(get, "INFR_SPEC_K");
     p.spec.debug = presence(get, "INFR_SPEC_DEBUG");

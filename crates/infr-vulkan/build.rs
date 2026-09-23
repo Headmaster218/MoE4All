@@ -1755,8 +1755,8 @@ fn main() {
             &["-DFMT_IQ4XS", "-DPAGED"],
         ),
         // Qwen shared-expert decode: routed slots keep their native quant while the final slot
-        // reads one fixed Q8_0 shared-expert matrix by BDA. These are deliberately limited to the
-        // routed formats present in Qwen3.5/3.6 APEX-I models.
+        // reads one fixed Q8_0 shared-expert matrix by BDA. Keep the format set aligned with
+        // `paged_moe_shared_at`; Qwen3.8 uses IQ2_S/IQ4_NL/IQ3_S across its mixed-quant banks.
         (
             "native_gemv_id_multi",
             "native_idm_q5k_paged_shexp",
@@ -1771,6 +1771,21 @@ fn main() {
             "native_gemv_id_multi",
             "native_idm_iq4xs_paged_shexp",
             &["-DFMT_IQ4XS", "-DPAGED", "-DSHARED_Q8"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq4nl_paged_shexp",
+            &["-DFMT_IQ4NL", "-DPAGED", "-DSHARED_Q8"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_paged_shexp",
+            &["-DFMT_IQ2S", "-DUSE_GRID", "-DPAGED", "-DSHARED_Q8"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3s_paged_shexp",
+            &["-DFMT_IQ3S", "-DUSE_GRID", "-DPAGED", "-DSHARED_Q8"],
         ),
         (
             "native_gemv_id_multi",
@@ -1811,6 +1826,21 @@ fn main() {
             "native_gemv_id_multi",
             "native_idm_iq2s_paged",
             &["-DFMT_IQ2S", "-DUSE_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_nr2_paged",
+            &["-DFMT_IQ2S", "-DUSE_GRID", "-DNR=2", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_nr4_paged",
+            &["-DFMT_IQ2S", "-DUSE_GRID", "-DNR=4", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_nr8_paged",
+            &["-DFMT_IQ2S", "-DUSE_GRID", "-DNR=8", "-DPAGED"],
         ),
         (
             "native_gemv_id_multi",
@@ -1981,6 +2011,39 @@ fn main() {
             "native_gemv_id_multi_sg",
             "native_idm_iq3s_sg8_paged",
             &["-DFMT_IQ3S", "-DUSE_GRID", "-DNR=8", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_iq3s_sg2_paged_shexp",
+            &[
+                "-DFMT_IQ3S",
+                "-DUSE_GRID",
+                "-DNR=2",
+                "-DPAGED",
+                "-DSHARED_Q8",
+            ],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_iq3s_sg4_paged_shexp",
+            &[
+                "-DFMT_IQ3S",
+                "-DUSE_GRID",
+                "-DNR=4",
+                "-DPAGED",
+                "-DSHARED_Q8",
+            ],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_iq3s_sg8_paged_shexp",
+            &[
+                "-DFMT_IQ3S",
+                "-DUSE_GRID",
+                "-DNR=8",
+                "-DPAGED",
+                "-DSHARED_Q8",
+            ],
         ),
         // Qwen3.8's paged 2560x640 IQ2_XS gate/up banks: NR=8 stages the 4 KiB codebook once
         // for eight output rows. Both routed-only and routed+fixed-Q8-shared variants are kept;

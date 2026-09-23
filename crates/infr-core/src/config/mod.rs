@@ -295,6 +295,8 @@ cfg_struct! {
         sg_maxout: usize = 8192,
         /// `INFR_GEMV_SG_NR`.
         sg_nr: u32 = 2,
+        /// `INFR_GEMV_ID_GRID_NR`: output rows handled per 64-thread paged IQ id-GEMV workgroup.
+        id_grid_nr: u32 = 8,
         /// The selected GEMV variant, COMPUTED from two keys exactly as `GemvKnobs::resolve`
         /// does it: `INFR_NO_GEMV_REG` present ⇒ `None` (and it silently wins over
         /// `INFR_GEMV_VARIANT`); otherwise `INFR_GEMV_VARIANT`, else `Some("reg")`.
@@ -584,6 +586,8 @@ cfg_struct! {
             qkv_fuse: bool = true,
             /// `INFR_NO_GATED_RMSNORM` (inverted), ANDed with `caps.gated_rmsnorm` at the site.
             gated_rmsnorm: bool = true,
+            /// `INFR_NO_PLE_SINGLE_PAR` (inverted): use the persistent gather pool for one row.
+            ple_single_parallel: bool = true,
         }
     }
 }
@@ -600,6 +604,8 @@ cfg_struct! {
         mtp_reprime: bool = true,
         /// `INFR_NO_MTP_DRAFT_CHAIN` (inverted).
         mtp_draft_chain: bool = true,
+        /// `INFR_NO_MTP_PLE_OVERLAP` (inverted): run VERIFY layer 0 while PLE rows are gathered.
+        mtp_ple_overlap: bool = true,
         /// `INFR_SPEC_DRAFT`: draft-model path.
         draft: Option<PathBuf> = None,
         /// `INFR_SPEC_K`: draft-length upper bound.

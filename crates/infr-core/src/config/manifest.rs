@@ -259,6 +259,7 @@ knobs! {
     "INFR_GEMV_SG_MINOUT" => "kernels.vulkan.gemv.sg_minout", Int,            Ignored, "1024",  migrated;
     "INFR_GEMV_SG_MAXOUT" => "kernels.vulkan.gemv.sg_maxout", Int,            Ignored, "4096",  migrated;
     "INFR_GEMV_SG_NR"     => "kernels.vulkan.gemv.sg_nr",     Int,            Ignored, "4",     migrated;
+    "INFR_GEMV_ID_GRID_NR" => "kernels.vulkan.gemv.id_grid_nr", Int,           Ignored, "4",     migrated;
     "INFR_NO_GEMV_REG"    => "kernels.vulkan.gemv.variant",   PresenceClears, Ignored, "1",     migrated;
     "INFR_GEMV_VARIANT"   => "kernels.vulkan.gemv.variant",   Text,           Ignored, "rm",    migrated;
 
@@ -290,12 +291,14 @@ knobs! {
     // ── kernels — graph shape, `infr-llama` (§6.9) ───────────────────────────
     "INFR_NO_QKV_FUSE"      => "kernels.qkv_fuse",      PresenceInv, Ignored, "1", migrated;
     "INFR_NO_GATED_RMSNORM" => "kernels.gated_rmsnorm", PresenceInv, Ignored, "1", migrated;
+    "INFR_NO_PLE_SINGLE_PAR" => "kernels.ple_single_parallel", PresenceInv, Ignored, "1", migrated;
 
     // ── spec (§6.8) ──────────────────────────────────────────────────────────
     "INFR_MTP"                => "spec.mtp",             Literal,     Ignored, "1",         migrated;
     "INFR_NO_MTP_CKPT"        => "spec.mtp_ckpt",        PresenceInv, Ignored, "1",         migrated;
     "INFR_NO_MTP_REPRIME"     => "spec.mtp_reprime",     PresenceInv, Ignored, "1",         migrated;
     "INFR_NO_MTP_DRAFT_CHAIN" => "spec.mtp_draft_chain", PresenceInv, Ignored, "1",         migrated;
+    "INFR_NO_MTP_PLE_OVERLAP" => "spec.mtp_ple_overlap", PresenceInv, Ignored, "1",         migrated;
     "INFR_SPEC_DRAFT"         => "spec.draft",           Path,        Ignored, "/tmp/d.gguf", migrated;
     "INFR_SPEC_K"             => "spec.k",               Int,         Ignored, "4",         migrated;
     "INFR_SPEC_DEBUG"         => "spec.debug",           Presence,    Ignored, "1",         migrated;

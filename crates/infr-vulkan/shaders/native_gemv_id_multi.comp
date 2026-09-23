@@ -67,7 +67,10 @@ layout(binding = 4) buffer YB { float y_buf[]; };
 layout(binding = 3) buffer YB { float y_buf[]; };
 #endif
 
-shared float part[8];   // one partial per subgroup (64 threads / min 8-wide subgroup = 8 max)
+#ifndef NR
+#define NR 1
+#endif
+shared float part[NR][8]; // one partial per output row and subgroup (8 subgroups maximum)
 
 #ifdef PAGED
 uint active_mask_for_row(uint row) {
@@ -144,18 +147,27 @@ float dqsub(uint gstart, uint xoff) {
 }
 
 void main() {
-    GRID_INIT; // barrier inside — must precede the (workgroup-uniform) early return below
     // Flat-index recovery for a possibly-2-D dispatch grid — see linear_f16.comp's main() for why.
     // `slot_global` (and the `ids[]` read it drives) can go out of range for a padding workgroup,
-    // so this needs an explicit bound (unlike native_gemv_rm/sg's per-output-only guard).
+    // so reject padding before grid-codebook staging. Every invocation in the workgroup observes
+    // the same WorkGroupID and mask, keeping both the return and GRID_INIT's barrier uniform.
+    uint og = (pc.out_f + uint(NR) - 1u) / uint(NR);
     uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
-    if (unit >= pc.rows * pc.n_used * pc.out_f) { return; }
-    uint slot_global = unit / pc.out_f; // (row, slot) flattened — see the small-batch note above
-    uint o = unit - slot_global * pc.out_f;
+    if (unit >= pc.rows * pc.n_used * og) { return; }
+    uint slot_global = unit / og; // (row, slot) flattened — see the small-batch note above
+    uint o0 = (unit - slot_global * og) * uint(NR);
     uint row = slot_global / pc.n_used;
     uint slot = slot_global - row * pc.n_used;
 #ifdef PAGED
     if ((active_mask_for_row(row) & (1u << slot)) == 0u) { return; }
+#endif
+#ifdef SHARED_Q8
+    // The fixed Q8 slot uses no routed IQ lookup table. Avoid staging up to 8 KiB of codebook for
+    // every shared-expert output workgroup; `is_shared` is workgroup-uniform.
+    bool is_shared = slot == pc.routed_used;
+    if (!is_shared) { GRID_INIT; }
+#else
+    GRID_INIT;
 #endif
     uint t = gl_LocalInvocationID.x;
 #ifdef PAGED
@@ -167,7 +179,6 @@ void main() {
     // `MoePagerSession::lut_window` for why in-flight segments must read a frozen copy, not the
     // live pool LUT).
 #ifdef SHARED_Q8
-    bool is_shared = slot == pc.routed_used;
     if (is_shared) {
         w_addr = arena_base(pc.shared_lo, pc.shared_hi);
     } else {
@@ -178,34 +189,46 @@ void main() {
 #else
     w_addr = arena_base(lut[pc.stride + ids[slot_global]].x, lut[pc.stride + ids[slot_global]].y);
 #endif
-    uint wbase = o * pc.in_f;
+    uint wexp = 0u;
 #elif defined(STREAMED)
     // Expert base BYTE address straight from `ids` (no LUT); `pc.stride` is the per-expert BYTE
     // stride in this build. wbase keeps only the small within-expert element offset.
     w_addr = arena_base(pc.arena_lo, pc.arena_hi)
              + uint64_t(ids[slot_global]) * uint64_t(pc.stride);
-    uint wbase = o * pc.in_f;
+    uint wexp = 0u;
 #else
-    uint wbase = ids[slot_global] * pc.stride + o * pc.in_f;
+    uint wexp = ids[slot_global] * pc.stride;
 #endif
     uint xbase = (pc.x_per_slot != 0u ? slot_global * pc.in_f : row * pc.in_f);
     uint nsub = pc.in_f / 32u;
-    float acc = 0.0;
+    float acc[NR];
+    for (uint rr = 0u; rr < uint(NR); rr++) { acc[rr] = 0.0; }
     for (uint s = t; s < nsub; s += 64u) {
+        for (uint rr = 0u; rr < uint(NR); rr++) {
+            uint o = o0 + rr;
+            if (o >= pc.out_f) { continue; }
+            uint wbase = wexp + o * pc.in_f;
 #ifdef SHARED_Q8
-        acc += is_shared
-            ? dqsub_shared_q8(wbase + s * 32u, xbase + s * 32u)
-            : dqsub(wbase + s * 32u, xbase + s * 32u);
+            acc[rr] += is_shared
+                ? dqsub_shared_q8(wbase + s * 32u, xbase + s * 32u)
+                : dqsub(wbase + s * 32u, xbase + s * 32u);
 #else
-        acc += dqsub(wbase + s * 32u, xbase + s * 32u);
+            acc[rr] += dqsub(wbase + s * 32u, xbase + s * 32u);
 #endif
+        }
     }
-    float sg = subgroupAdd(acc);
-    if (subgroupElect()) { part[gl_SubgroupID] = sg; }
+    for (uint rr = 0u; rr < uint(NR); rr++) {
+        float sg = subgroupAdd(acc[rr]);
+        if (subgroupElect()) { part[rr][gl_SubgroupID] = sg; }
+    }
     barrier();
     if (t == 0u) {
-        float tot = 0.0;
-        for (uint s = 0u; s < gl_NumSubgroups; s++) { tot += part[s]; }
-        y_buf[unit] = tot;
+        for (uint rr = 0u; rr < uint(NR); rr++) {
+            uint o = o0 + rr;
+            if (o >= pc.out_f) { continue; }
+            float tot = 0.0;
+            for (uint s = 0u; s < gl_NumSubgroups; s++) { tot += part[rr][s]; }
+            y_buf[slot_global * pc.out_f + o] = tot;
+        }
     }
 }

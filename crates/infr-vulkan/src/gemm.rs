@@ -392,6 +392,32 @@ pub(crate) fn native_idm_paged_build_spv(dtype: infr_core::DType) -> Option<&'st
     })
 }
 
+/// Multi-output-row 64-thread tree variant for paged IQ2_S. It keeps the established reduction
+/// order while amortizing one grid-codebook initialization across `nr` output rows.
+pub(crate) fn native_idm_grid_nr_paged_build_spv(
+    dtype: infr_core::DType,
+    nr: u32,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
+        }};
+    }
+    match (dtype, nr) {
+        (Iq2S, 2) => v!("native_idm_iq2s_nr2_paged"),
+        (Iq2S, 4) => v!("native_idm_iq2s_nr4_paged"),
+        (Iq2S, 8) => v!("native_idm_iq2s_nr8_paged"),
+        _ => None,
+    }
+}
+
 /// Hybrid paged-Qwen decode GEMV: routed slots use `dtype`, while the final slot reads a fixed
 /// dense Q8_0 shared-expert matrix. Kept separate from the ordinary paged table so unsupported
 /// graphs cannot accidentally select the larger push-constant ABI.
@@ -413,6 +439,9 @@ pub(crate) fn native_idm_paged_shared_build_spv(
     match dtype {
         Q5K => v!("native_idm_q5k_paged_shexp"),
         Q6K => v!("native_idm_q6k_paged_shexp"),
+        Iq2S => v!("native_idm_iq2s_paged_shexp"),
+        Iq3S => v!("native_idm_iq3s_paged_shexp"),
+        Iq4Nl => v!("native_idm_iq4nl_paged_shexp"),
         Iq4Xs => v!("native_idm_iq4xs_paged_shexp"),
         _ => None,
     }
@@ -641,6 +670,12 @@ pub(crate) fn native_idm_sg_paged_shared_build_spv(
         (Q5K, 2, true) => v!("native_idm_q5k_sg2_paged_shexp_sg16"),
         (Q5K, 4, true) => v!("native_idm_q5k_sg4_paged_shexp_sg16"),
         (Q5K, 8, true) => v!("native_idm_q5k_sg8_paged_shexp_sg16"),
+        (Iq3S, 2, false) => v!("native_idm_iq3s_sg2_paged_shexp"),
+        (Iq3S, 4, false) => v!("native_idm_iq3s_sg4_paged_shexp"),
+        (Iq3S, 8, false) => v!("native_idm_iq3s_sg8_paged_shexp"),
+        (Iq3S, 2, true) => v!("native_idm_iq3s_sg2_paged_shexp_sg16"),
+        (Iq3S, 4, true) => v!("native_idm_iq3s_sg4_paged_shexp_sg16"),
+        (Iq3S, 8, true) => v!("native_idm_iq3s_sg8_paged_shexp_sg16"),
         (Iq2Xs, 8, false) => v!("native_idm_iq2xs_sg8_paged_shexp"),
         (Iq2Xs, 8, true) => v!("native_idm_iq2xs_sg8_paged_shexp_sg16"),
         _ => None,
@@ -3453,6 +3488,7 @@ pub(crate) fn deltanet_seq_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(DELTANET_SEQ_SPV_BYTES))
 }
+
 /// MTP VERIFY twin of [`deltanet_seq_spv`] that snapshots recurrent state after every row.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn deltanet_seq_trace_spv() -> &'static [u32] {

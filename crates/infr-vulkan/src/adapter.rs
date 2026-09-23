@@ -9511,11 +9511,28 @@ fn paged_moe_shared_at(graph: &Graph, op_idx: usize) -> Option<PagedMoeShared> {
     let supported_routed = |id: TensorId| {
         matches!(
             graph.desc(id).dtype,
-            infr_core::DType::Q5K | infr_core::DType::Q6K | infr_core::DType::Iq4Xs
+            infr_core::DType::Q5K
+                | infr_core::DType::Q6K
+                | infr_core::DType::Iq2S
+                | infr_core::DType::Iq3S
+                | infr_core::DType::Iq4Nl
+                | infr_core::DType::Iq4Xs
         )
     };
     if !supported_routed(*gate_exps) || !supported_routed(*up_exps) || !supported_routed(*down_exps)
     {
+        return None;
+    }
+    // The new IQ formats win in scalar decode by removing separate Q8 launches. For multi-row
+    // VERIFY, the original dense shared path retains weight reuse through `mrow_streamed`, while
+    // appending it to each routed id dispatch repeats the same shared matrix once per row.
+    let is_new_iq = |id: TensorId| {
+        matches!(
+            graph.desc(id).dtype,
+            infr_core::DType::Iq2S | infr_core::DType::Iq3S | infr_core::DType::Iq4Nl
+        )
+    };
+    if rows > 1 && (is_new_iq(*gate_exps) || is_new_iq(*up_exps) || is_new_iq(*down_exps)) {
         return None;
     }
     let [gate_op, g_op, u_op, act_op, d_op, add_op] = graph.ops.get(op_idx + 1..op_idx + 7)? else {

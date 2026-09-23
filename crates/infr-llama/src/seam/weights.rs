@@ -465,6 +465,7 @@ pub(crate) struct SeamKv {
 pub(super) struct QwenMtpVerifyBuffers {
     pub(super) ids: Box<dyn Buffer>,
     pub(super) positions: Box<dyn Buffer>,
+    pub(super) hidden: Box<dyn Buffer>,
     pub(super) wide: Box<dyn Buffer>,
     pub(super) ple: Box<dyn Buffer>,
     pub(super) logits: Box<dyn Buffer>,
