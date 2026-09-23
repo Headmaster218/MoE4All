@@ -1,5 +1,9 @@
 # Qwen3.8 MTP investigation and implementation path
 
+Follow-up: [post-optimization measurements and priorities](qwen38-mtp-bottlenecks-20260923.md).
+The follow-up corrects the queue-timing interpretation below and includes a
+controlled hidden-readback experiment.
+
 ## Implementation update
 
 The first optimization pass is now implemented. The fixed benchmark remains
@@ -37,7 +41,10 @@ Implemented changes:
    unified expert arena is finalized. VERIFY uses one target graph after its PLE
    rows are ready.
 3. Decode scratch retains the bounded alternating draft/VERIFY topology family.
-   Multi-row causal VERIFY uses shared-expert fusion and per-row hit-first masks.
+   Multi-row causal VERIFY supports shared-expert fusion and per-row hit-first
+   masks. The later [single-decode investigation](qwen38-single-decode-bottlenecks-20260923.md)
+   confirmed that shared-slot fusion does not cover this model's executed
+   IQ2_S/IQ4_NL/IQ3_S formats; the implemented fusion is not active for these banks.
 4. Draft length follows VERIFY width. The final draft step still writes MTP KV,
    but skips its unused HC head, vocabulary projection, argmax and readback.
 5. Multi-row PLE batches use the four-thread gather pool. PLE work fell from
@@ -56,16 +63,16 @@ Measured dead ends from this pass:
 - Disabling the submit splitter reduced submissions from 3970 to 3874 but left
   throughput unchanged at 26.5 tok/s.
 
-The remaining target bottleneck is structural. A representative three-row run
-spent 1.40 s GPU-busy inside a 2.84 s device span. It performed exactly one
-paging sync per target layer and VERIFY cycle: 1536 waits totaling 1.36 s over
-32 cycles. Command recording consumed about 0.99 s, partly overlapping those
-waits. The compute-only lower bound is sufficient for roughly 40 tok/s, but the
-current host-managed pager must finish each layer's router, read its expert IDs,
-and prepare the next expert segment before progressing. The next material step
-is a GPU-resident routed-hit schedule or reusable command-template path that
-overlaps router readback, resident expert work and miss promotion without
-changing expert order. More MTP-head micro-optimization cannot close this gap.
+The remaining target cost includes a structural synchronization boundary. A
+representative three-row run recorded 1.40 s inside main-queue timestamped
+intervals over a 2.84 s span, and one paging sync per target layer and VERIFY
+cycle: 1536 waits totaling 1.36 s over 32 cycles. The 0.99 s recorder lifetime
+also includes host preparation, not just command encoding. These are overlapping
+measurements: paging sync waits for prior GPU computation as well as transfers,
+and untimed DMA is absent from the queue coverage. They do NOT establish a
+compute-only lower bound or prove 40 tok/s is attainable. The follow-up measures
+the required per-cycle reduction and identifies smaller verified opportunities
+before recommending a GPU-resident routed-hit schedule.
 
 ## Scope and baseline
 
