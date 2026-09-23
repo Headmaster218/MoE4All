@@ -12,8 +12,13 @@ fn main() {
         println!("cargo:rustc-cfg=infr_profile");
     }
     println!("cargo:rerun-if-changed=shaders");
+    println!("cargo:rerun-if-env-changed=INFR_GLSLC");
     let out = std::env::var("OUT_DIR").expect("OUT_DIR");
     gen_grids(&out);
+    // `glslc` must be new enough to compile `GL_KHR_cooperative_matrix` (the tiled GEMM /
+    // attention shaders use it). Distro-bundled shaderc can lag behind: the LunarG Vulkan SDK's
+    // glslc always works. Point INFR_GLSLC at an explicit binary to override PATH lookup.
+    let glslc = std::env::var("INFR_GLSLC").unwrap_or_else(|_| "glslc".to_string());
     // (source stem, output stem, extra glslc defines)
     let builds: &[(&str, &str, &[&str])] = &[
         ("gemm_coopmat_tiled", "gemm_coopmat_tiled", &[]),
@@ -3970,11 +3975,28 @@ fn main() {
         args.push(src.clone());
         args.push("-o".into());
         args.push(dst);
-        let status = Command::new("glslc")
+        let status = Command::new(&glslc)
             .args(&args)
             .status()
-            .expect("failed to run glslc — install shaderc (provides glslc)");
-        assert!(status.success(), "glslc failed for {src}");
+            .unwrap_or_else(|err| {
+                panic!(
+                    "failed to run glslc ({}): {err}\n\n\
+                     MoE4All compiles its Vulkan shaders with `glslc` at build time. It must be on \
+                     PATH or set INFR_GLSLC to its full path. On Linux install a recent glslc — \
+                     the LunarG Vulkan SDK's glslc is the reference (distro `shaderc` is often too \
+                     old for GL_KHR_cooperative_matrix): see docs/linux.md.",
+                    glslc
+                )
+            });
+        if !status.success() {
+            panic!(
+                "glslc ({}) failed to compile {src} (exit {status:?}).\n\n\
+                 If the errors mention `GL_KHR_cooperative_matrix` or `coopmat`, the glslc is too \
+                 old for these shaders — use the LunarG Vulkan SDK's glslc or a newer shaderc and \
+                 set INFR_GLSLC to it. See docs/linux.md.",
+                glslc
+            );
+        }
     }
     // Shader-set fingerprint for the on-disk vkPipelineCache (see src/pcache.rs): FNV-1a over
     // every compiled SPIR-V blob in the (stable) build-list order. Any shader edit, new variant,

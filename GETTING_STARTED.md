@@ -467,17 +467,35 @@ GUI 启动器会构建 `infr.exe` 和 `infr-gui.exe`，因此不包含在当前�
 
 ### Linux
 
-Linux 保留上游 Vulkan 路径，但 MoE4All 当前主要在 Windows AMD 主机验证：
+Linux 保留上游 Vulkan 路径，可在 AMD（RADV/Mesa）、NVIDIA 或 Intel 的
+Vulkan GPU 上运行。Rust 源码本身已含正确的 Linux/unix 分支，无需改动；唯一
+不可移植的构件是**构建期的 shader 编译器 `glslc`**——MoE4All 的
+GEMM/attention shader 使用 `GL_KHR_cooperative_matrix`，`glslc` 必须足够新。
+许多发行版自带的 `glslc`（例如 Ubuntu 24.04 的 `glslc 2023.8`）会编译失败：
+
+```text
+error: '#extension' : extension not supported: GL_KHR_cooperative_matrix
+```
+
+推荐用仓库自带的安装器（免 sudo，自动探测现有 `glslc` 是否够用，够用则不重复
+安装；否则从 LunarG Vulkan SDK 只提取 `glslc` 与其运行库到 `~/.local`）：
 
 ```bash
-sudo apt install -y git build-essential glslc libvulkan1 vulkan-tools
 git clone https://github.com/Headmaster218/MoE4All.git
 cd MoE4All
+./scripts/install-linux.sh
 cargo build --release --locked -p infr-cli
 ./target/release/infr devices
 ```
 
-发行版自带的 `glslc` 必须足够新，能够编译项目使用的 Vulkan 扩展。
+构建依赖：Rust 工具链（rustup）、`build-essential`、`cmake`；运行时依赖
+`libvulkan1` 与你的 GPU 驱动。`glslc` 不在 PATH 时可用
+`INFR_GLSLC=/path/to/glslc cargo build ...` 指定。完整说明、手动安装方式与
+各发行版注意事项见 [docs/linux.md](docs/linux.md)。
+
+> 注意：MoE4All 的性能基准均测于 Windows 11 + RX 7900 XTX + Vulkan；Linux 走
+> 相同的 Vulkan 路径，但各 GPU 上的速度未单独基准化，请以 Windows 数字为
+> 参考而非 Linux 承诺。
 
 ### macOS
 
