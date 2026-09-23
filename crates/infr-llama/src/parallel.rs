@@ -2116,24 +2116,21 @@ impl ParallelSeam {
             }
             long_prefill_coalesced = false;
 
-            let mut groups = [Vec::new(), Vec::new()];
-            for (index, work) in active.iter().enumerate() {
-                groups[usize::from(self.qsa_sparse_at(work.next_qsa_position()))].push(index);
-            }
-            let qsa_groups = groups.iter().filter(|indices| !indices.is_empty()).count();
-            let quantum = if qsa_groups > 1 { 16 } else { usize::MAX };
-            for mut indices in groups {
-                // The primary lane decides whether the shared graph carries MRoPE history.
-                indices.sort_by_key(|&index| {
-                    (
-                        active[index].mrope_plan.is_none(),
-                        std::cmp::Reverse(active[index].remaining_prefill()),
-                    )
-                });
-                if let Err(error) = self.run_token_group(&mut active, &indices, quantum) {
-                    self.fail_unified_scheduler(&mut active, error);
-                    return;
-                }
+            // QSA attention remains lane-specific, but the surrounding projections and MoE are
+            // shared across dense- and sparse-QSA rows. Keep the whole token cohort together;
+            // `run_token_group` still stops exactly at the next dense-to-sparse boundary so the
+            // following graph is rebuilt with the correct per-lane QSA geometry.
+            let mut indices = (0..active.len()).collect::<Vec<_>>();
+            // The primary lane decides whether the shared graph carries MRoPE history.
+            indices.sort_by_key(|&index| {
+                (
+                    active[index].mrope_plan.is_none(),
+                    std::cmp::Reverse(active[index].remaining_prefill()),
+                )
+            });
+            if let Err(error) = self.run_token_group(&mut active, &indices, usize::MAX) {
+                self.fail_unified_scheduler(&mut active, error);
+                return;
             }
             let cohort_len = active.len();
             self.retire_finished_work(&mut active);

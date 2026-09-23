@@ -441,6 +441,10 @@ fn qsa_indexer_blocks(kv_len: u32, independent_spans: Option<&[SequenceSpan]>, r
     })
 }
 
+fn qsa_lane_top_blocks(span: &SequenceSpan, ratio: u32, configured: u32) -> u32 {
+    configured.min((span.start_pos + span.rows) / ratio.max(1))
+}
+
 fn qsa_indexer_score_capacity_bytes(
     rows: u32,
     current_blocks: u32,
@@ -3595,7 +3599,9 @@ fn lower_op(
                 || *rope_dim > *head_dim
                 || !rope_dim.is_multiple_of(2)
                 || *top_blocks == 0
-                || (*top_blocks > first_blocks && !crosses_dense_prefix)
+                || (independent_spans.is_none()
+                    && *top_blocks > first_blocks
+                    && !crosses_dense_prefix)
                 || *top_blocks > QSA_MAX_TOP_BLOCKS
                 || positions4.is_some_and(|id| {
                     graph.desc(id).dtype != infr_core::DType::I32
@@ -3638,6 +3644,13 @@ fn lower_op(
                 let dst_row_bytes = *top_blocks as usize * 4;
                 for (lane, span) in spans.iter().enumerate() {
                     let lane_blocks = (span.start_pos + span.rows) / ratio_safe;
+                    let lane_top_blocks = qsa_lane_top_blocks(span, ratio_safe, *top_blocks);
+                    // A mixed dense/sparse cohort shares the model graph. Dense-prefix lanes keep
+                    // all complete blocks in chronological order; sparse lanes retain the model's
+                    // configured top-k. No index output is consumed when a lane has only a tail.
+                    if lane_top_blocks == 0 {
+                        continue;
+                    }
                     let lane_topk_work = topk_work
                         .filter(|_| span.rows == 1 && lane_blocks >= QSA_TOPK_PARALLEL_MIN_BLOCKS)
                         .map(|id| pool[&id].as_ref());
@@ -3668,7 +3681,7 @@ fn lower_op(
                         span.start_pos / *ratio,
                         *n_head,
                         *head_dim,
-                        *top_blocks,
+                        lane_top_blocks,
                         *ratio,
                         *rope_dim,
                         *theta,
@@ -3842,7 +3855,9 @@ fn lower_op(
                 || !matches!(*head_dim, 128 | 256)
                 || *ratio == 0
                 || *top_blocks == 0
-                || (*top_blocks > first_blocks && !crosses_dense_prefix)
+                || (independent_spans.is_none()
+                    && *top_blocks > first_blocks
+                    && !crosses_dense_prefix)
                 || *top_blocks > QSA_MAX_TOP_BLOCKS
                 || graph.desc(*q).dtype != infr_core::DType::F16
                 || !supported(kdt)
@@ -3879,7 +3894,8 @@ fn lower_op(
                             let visible = (span.start_pos + 1) as usize;
                             let complete = visible / ratio_safe as usize;
                             let tail = visible % ratio_safe as usize;
-                            let selected = (*top_blocks as usize).min(complete);
+                            let selected =
+                                qsa_lane_top_blocks(span, ratio_safe, *top_blocks) as usize;
                             let keys = selected * ratio_safe as usize + tail;
                             let chunk = split_k_chunk_count_cap(
                                 keys,
@@ -11036,6 +11052,22 @@ mod tests {
     }
 
     #[test]
+    fn qsa_mixed_cohort_clamps_dense_lane_selection_only() {
+        let dense = SequenceSpan {
+            row_start: 0,
+            rows: 1,
+            start_pos: 507,
+        };
+        let sparse = SequenceSpan {
+            row_start: 1,
+            rows: 1,
+            start_pos: 28_667,
+        };
+        assert_eq!(qsa_lane_top_blocks(&dense, 4, 512), 127);
+        assert_eq!(qsa_lane_top_blocks(&sparse, 4, 512), 512);
+    }
+
+    #[test]
     fn qsa_independent_indexer_accepts_per_lane_mrope_history() {
         let Ok(be_) = VulkanBackend::new() else {
             return;
@@ -11046,7 +11078,7 @@ mod tests {
             SequenceSpan {
                 row_start: 0,
                 rows: 1,
-                start_pos: 15,
+                start_pos: 3,
             },
             SequenceSpan {
                 row_start: 1,
@@ -11168,7 +11200,16 @@ mod tests {
         .unwrap();
         for (lane, blocks) in selected.chunks_exact(top_blocks).enumerate() {
             let complete_blocks = (spans[lane].start_pos + 1) as usize / ratio;
-            assert!(blocks.iter().all(|&block| block < complete_blocks as u32));
+            let selected_blocks = top_blocks.min(complete_blocks);
+            assert!(blocks[..selected_blocks]
+                .iter()
+                .all(|&block| block < complete_blocks as u32));
+            if complete_blocks <= top_blocks {
+                assert_eq!(
+                    &blocks[..selected_blocks],
+                    &(0..selected_blocks as u32).collect::<Vec<_>>()
+                );
+            }
         }
     }
 

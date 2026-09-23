@@ -8587,18 +8587,6 @@ fn generate_dense_backend_inner(
                 "parallel token lanes must be ordered by descending remaining prefill"
             ));
         }
-        let qsa_ratio = c.compress_ratios.iter().copied().max().unwrap_or(4).max(1);
-        let qsa_threshold = c.indexer_top_k + qsa_ratio - 1;
-        let sparse = lane_starts[0] + 1 > qsa_threshold;
-        if lane_starts
-            .iter()
-            .any(|&lane_start| (lane_start + 1 > qsa_threshold) != sparse)
-        {
-            return Err(anyhow!(
-                "parallel decode cannot mix dense and sparse QSA rows in one graph"
-            ));
-        }
-
         let profile_cohort = infr_core::pager_profile::active();
         let profile_cohort_t0 = profile_cohort.then(std::time::Instant::now);
         let profile_before = profile_cohort.then(infr_core::pager_profile::snapshot);
