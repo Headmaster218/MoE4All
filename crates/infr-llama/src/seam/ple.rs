@@ -424,11 +424,11 @@ impl WorkerState {
         let row_bytes = self.row_bytes;
         let row_dim = self.row_dim;
         if parallel {
-            let task_count = if independent_batch {
-                self.gather_threads.min(spans.len()).min(groups.len())
-            } else {
-                self.gather_threads.min(groups.len())
-            };
+            // Row groups own disjoint output ranges, so an independent multi-slot batch is not
+            // limited by its number of request spans. Capping this at spans.len() left a two-slot
+            // decode using only two workers from the four-thread pool, even with dozens of row
+            // groups ready to gather.
+            let task_count = self.gather_threads.min(groups.len());
             let groups_per_task = groups.len().div_ceil(task_count);
             self.gather_pool.install(|| {
                 groups
