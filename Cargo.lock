@@ -1191,7 +1191,7 @@ dependencies = [
 
 [[package]]
 name = "infr-chat"
-version = "0.6.0-beta.1"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "infr-core",
@@ -1206,7 +1206,7 @@ dependencies = [
 
 [[package]]
 name = "infr-cli"
-version = "0.6.0-beta.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1231,7 +1231,7 @@ dependencies = [
 
 [[package]]
 name = "infr-core"
-version = "0.6.0-beta.1"
+version = "0.7.0"
 dependencies = [
  "bytemuck",
  "half",
@@ -1250,7 +1250,7 @@ dependencies = [
 
 [[package]]
 name = "infr-cpu"
-version = "0.6.0-beta.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -1266,7 +1266,7 @@ dependencies = [
 
 [[package]]
 name = "infr-embedding"
-version = "0.6.0-beta.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -1283,7 +1283,7 @@ dependencies = [
 
 [[package]]
 name = "infr-engine"
-version = "0.6.0-beta.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "infr-chat",
@@ -1297,7 +1297,7 @@ dependencies = [
 
 [[package]]
 name = "infr-gguf"
-version = "0.6.0-beta.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -1313,7 +1313,7 @@ dependencies = [
 
 [[package]]
 name = "infr-gui"
-version = "0.6.0-beta.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1333,7 +1333,7 @@ dependencies = [
 
 [[package]]
 name = "infr-hub"
-version = "0.6.0-beta.1"
+version = "0.7.0"
 dependencies = [
  "dirs",
  "indicatif",
@@ -1350,7 +1350,7 @@ dependencies = [
 
 [[package]]
 name = "infr-llama"
-version = "0.6.0-beta.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -1375,7 +1375,7 @@ dependencies = [
 
 [[package]]
 name = "infr-metal"
-version = "0.6.0-beta.1"
+version = "0.7.0"
 dependencies = [
  "bytemuck",
  "half",
@@ -1391,7 +1391,7 @@ dependencies = [
 
 [[package]]
 name = "infr-prof"
-version = "0.6.0-beta.1"
+version = "0.7.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1400,11 +1400,11 @@ dependencies = [
 
 [[package]]
 name = "infr-prof-rt"
-version = "0.6.0-beta.1"
+version = "0.7.0"
 
 [[package]]
 name = "infr-server"
-version = "0.6.0-beta.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1424,7 +1424,7 @@ dependencies = [
 
 [[package]]
 name = "infr-testkit"
-version = "0.6.0-beta.1"
+version = "0.7.0"
 dependencies = [
  "bytemuck",
  "half",
@@ -1434,7 +1434,7 @@ dependencies = [
 
 [[package]]
 name = "infr-vision"
-version = "0.6.0-beta.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1451,7 +1451,7 @@ dependencies = [
 
 [[package]]
 name = "infr-vulkan"
-version = "0.6.0-beta.1"
+version = "0.7.0"
 dependencies = [
  "ash",
  "bytemuck",

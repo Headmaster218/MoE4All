@@ -21,28 +21,32 @@ MoE 模型的专家权重按需在显存、内存和 SSD 之间流动，因此�
 > 当前主要开发和实测平台是原生 Windows 11、AMD Radeon RX 7900 XTX 和
 > Vulkan。其他 Vulkan GPU 可能可用，但不是 MoE4All 当前的重点验证平台。
 
-## 最新进展：完整支持 Qwen3.8-Flash-Next
+## 0.7.0：视觉、并发服务与 SSD 会话缓存
 
-Qwen3.8-Flash-Next 已经通过 MoE4All 在消费级 **AMD Radeon RX 7900 XTX**
-上稳定生成正常内容，简单数学和推理问题也能够正确回答。Q2_K_XL 和 IQ4_XS
-量化均已完成 Windows 11 实测，并可在**受限进程 RAM 预算**下从 SSD 分页运行。
+0.7.0 在完整 Qwen3.8-Flash-Next 文本路径上增加了原生 Vulkan 视觉推理、并发请求
+调度和可持久化会话 K/V。Q2_K_XL、IQ4_XS 与 Q4_K_M 均已在 Windows 11 上完成
+实测，大模型可以在受限进程 RAM 预算下继续从 SSD 分页运行。
 
-2026-09-01 的发版资源矩阵验证了较高 RAM 覆盖率下的真实多轮 API 性能。以下使用
-`device.vram_budget=22g`、`device.ram_budget=54g`（进程总 RAM 目标）和 Q8 K/V；
+- **视觉聊天**：加载匹配的 `mmproj*.gguf`，通过标准 OpenAI image content parts
+  输入图片；相同图片可复用解码后的 embedding，同一多模态会话可复用驻留 K/V。
+- **并发服务**：`infr serve --parallel N` 使用独立 K/V 槽，并对兼容的 Qwen3.8
+  prefill、decode、PLE 与采样工作进行批处理；终端表格显示每个槽位的实时状态和速度。
+- **SSD 会话缓存**：启用后，空闲的动态 Q8 K/V 会话可写入带校验的 SSD 缓存，
+  并在进程重启后恢复。默认上限为 5 GiB，保留 24 小时，正常退出时会主动保存驻留会话。
+- **推理控制**：终端和 OpenAI 兼容 API 支持模型默认、开关思考以及原生
+  `reasoning_effort`。
 
-| 模型                            |          32K / 64K / 96K 增量 prefill |             32K / 64K / 96K decode |
-| ------------------------------- | ------------------------------------: | ---------------------------------: |
-| Qwen3.6-35B-A3B APEX-I-Balanced | **720.2 / 709.3 / 686.4 tok/s** | **95.8 / 94.7 / 75.6 tok/s** |
-| Qwen3.8-Flash-Next IQ4_XS       | **229.1 / 279.0 / 282.2 tok/s** | **45.7 / 45.7 / 40.9 tok/s** |
+当前稳定分支的代表性 Qwen3.8 成绩如下。测试主机为 RX 7900 XTX 24 GiB、
+Ryzen 5 5600X、64 GiB DDR4；两项均使用 Q8 K/V 和 `ubatch=3072`：
 
-更多历史稳定成绩与测试条件见
+| 模型与负载 | 关键条件 | 结果 |
+| --- | --- | ---: |
+| IQ4_XS，131K synthetic depth 后 prefill 3,072 | 49.33 GiB 专家 RAM cache，3 次平均 | **750.7 tok/s** |
+| Q4_K_M 4.27 bpw，32K + 8K 错峰双路 decode | 24 GiB VRAM + 48 GiB RAM，间隔 8 秒，6 次平均 | **56.9 tok/s 合计** |
+
+更多历史稳定成绩与测试条件见[实测结果](#实测结果)和
 [Windows 本地大模型代表性性能记录](docs/perf/windows-local-model-matrix-20260829.md)。
-
-Q2 与 IQ4_XS 都通过了三轮真实 API 对话，能够保持校验码、完成跨轮算术并总结
-先前内容。
-
-QSA 当前使用保持 score/index 精确顺序的 radix top-k，并已接入 batched QSA/PLE
-Prefill。Decode 仍明显受专家 RAM/SSD 覆盖率影响，仍有继续优化空间。
+Decode 仍会随上下文长度、并发形态和专家 RAM/SSD 覆盖率变化。
 
 ## 三步开始
 
@@ -87,6 +91,8 @@ Start-INFR-Wizard.cmd
 - **直接聊天**：终端中保持上下文进行多轮对话，可选择模型默认、开启或关闭
   思考模式。
 - **兼容现有客户端**：提供 OpenAI 兼容的聊天与 Embedding API。
+- **并发服务**：多个独立 K/V 槽可处理先后到达、上下文长度不同的请求。
+- **会话持久化**：可选的 SSD 缓存能转存空闲文本 K/V，并在服务重启后恢复。
 - **长上下文**：支持量化 KV Cache、KV 溢出和长上下文性能测试。
 - **可测量、可调试**：内置 prefill/decode benchmark、synthetic depth 和分页
   统计工具。
@@ -113,6 +119,8 @@ Start-INFR-Wizard.cmd
 
 | 模型与负载                                        | 关键条件                                    |                    结果 |
 | ------------------------------------------------- | ------------------------------------------- | ----------------------: |
+| Qwen3.8-Flash-Next IQ4_XS，131K 后 prefill 3,072 | Q8 K/V，49.33 GiB 专家 RAM cache，3 次平均  |  **750.7 tok/s** |
+| Qwen3.8-Flash-Next Q4_K_M，32K + 8K 双路 decode  | Q8 K/V，24+48 GiB，`ubatch=3072`，错峰 8 秒，6 次平均 | **56.9 tok/s 合计** |
 | Qwen3.6-35B-A3B，250K synthetic depth 后 decode   | Q8 K/V，生成 1,000 token                    |    **41.2 tok/s** |
 | Qwen3.6-35B-A3B，250K 后 prefill 4,096            | Q8 K/V                                      |   **477.9 tok/s** |
 | Qwen3.6-35B-A3B，depth 0 prefill 4,096            | Q8 K/V                                      | **2,855.6 tok/s** |
@@ -136,7 +144,7 @@ Start-INFR-Wizard.cmd
 | Llama、Llama 4          | `llama`、`llama4`              | Dense 与 MoE Vulkan 推理                                              |
 | Qwen2 / Qwen2.5 / Qwen3 | `qwen2`、`qwen3`、`qwen3moe` | Dense 与 Qwen3 MoE                                                    |
 | Qwen3.5 / Qwen3.6       | `qwen35`、`qwen35moe`          | Gated DeltaNet、Attention 与分页 MoE                                  |
-| Qwen3.8 Flash Next      | `qwen4exp`                       | Hyper-Connection、Gated DeltaNet、PLE、QSA 与分页 MoE Vulkan 文本推理 |
+| Qwen3.8 Flash Next      | `qwen4exp`                       | Vulkan 文本与视觉推理、并发生成、Hyper-Connection、DeltaNet、PLE、QSA 与分页 MoE |
 | Gemma 3 / Gemma 4       | `gemma3`、`gemma4`             | Dense、MoE 与 E2B 变体                                                |
 | Ling 3.0 Flash          | `bailingmoe3`                    | KDA、gated MLA、512 experts 与 RAM/SSD 分页                           |
 | DeepSeek V4 Flash       | `deepseek4`                      | FP8 KV、MXFP4 indexer cache 与分页 MoE                                |
@@ -192,8 +200,8 @@ API Base URL 为 `http://127.0.0.1:8080/v1`。对局域网开放前请配置 API
 ```
 
 当前原生视觉路径仅支持 Vulkan `qwen4exp`。为避免服务端代取 URL 带来的安全风险，
-不直接下载 HTTP(S) 图片；客户端应先编码图片。首版会在每个视觉请求中重新处理图片，
-不会跨请求复用视觉 KV。
+不直接下载 HTTP(S) 图片；客户端应先编码图片。相同图片通过内容指纹复用预处理后的
+embedding，延续同一多模态会话时可复用驻留 K/V；多模态 K/V 暂不写入 SSD 冷缓存。
 
 ### 性能测试
 

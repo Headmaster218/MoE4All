@@ -88,7 +88,7 @@ impl CompletionShell {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Backend {
     /// A Vulkan GPU. `Some("Vulkan1")` pins a device (carried as `device.dev`); `None` =
-    /// the default "first discrete GPU, else device 0".
+    /// the default "largest discrete GPU by device-local memory, else device 0".
     Vulkan(Option<String>),
     /// The Apple GPU (`device.dev = "metal"` / `INFR_DEV=metal`).
     Metal,
@@ -141,8 +141,8 @@ fn parse_dev_spec(d: &str) -> anyhow::Result<Backend> {
 /// The SINGLE backend decision, shared by `--dev` resolution and the per-command readers.
 ///
 /// Precedence (mirrors how `--ctx`/`-u`/`-t` relate to their envs): the `--dev` flag > the
-/// `INFR_DEV` env (SAME grammar/parser as `--dev`) > the default (`Vulkan(None)` = first discrete
-/// GPU, else device 0). A garbage `--dev`/`INFR_DEV` errors early. The legacy `INFR_METAL`/`INFR_CPU`
+/// `INFR_DEV` env (SAME grammar/parser as `--dev`) > the default (`Vulkan(None)` = largest discrete
+/// GPU by device-local memory, else device 0). A garbage `--dev`/`INFR_DEV` errors early. The legacy `INFR_METAL`/`INFR_CPU`
 /// flags were removed cleanly — they are no longer read; `INFR_DEV=metal`/`cpu` replaces them.
 fn resolve_backend(dev: Option<&str>, env: BackendEnv) -> anyhow::Result<Backend> {
     // 1. an explicit `--dev` flag wins outright.
@@ -153,7 +153,7 @@ fn resolve_backend(dev: Option<&str>, env: BackendEnv) -> anyhow::Result<Backend
     if let Some(d) = env.dev.as_deref() {
         return parse_dev_spec(d).with_context(|| format!("invalid INFR_DEV `{d}`"));
     }
-    // 3. default: the first discrete Vulkan GPU.
+    // 3. default: the largest discrete Vulkan GPU by device-local memory.
     Ok(Backend::Vulkan(None))
 }
 
@@ -199,8 +199,8 @@ fn nan_safe_ratio_cmp(a: f64, b: f64) -> std::cmp::Ordering {
 #[derive(clap::Args)]
 struct DeviceOpts {
     /// Device for the forward: a Vulkan GPU (`Vulkan0`/`Vulkan1`/…), `metal` (Apple GPU), or `cpu`
-    /// (reference backend). Case-insensitive; matches llama.cpp's --dev. Unset = the first discrete
-    /// Vulkan GPU, else device 0.
+    /// (reference backend). Case-insensitive; matches llama.cpp's --dev. Unset = the largest
+    /// discrete Vulkan GPU by device-local memory, else device 0.
     #[arg(long)]
     dev: Option<String>,
     /// Context window in tokens (`8192`, `256k`, or `50%` of the free-VRAM KV capacity). Config
@@ -224,8 +224,8 @@ impl DeviceOpts {
     ///
     /// PRECEDENCE, unchanged: an explicit `--dev` OVERRIDES an inherited `INFR_DEV` because the CLI
     /// layer beats the env layer in the fold; an UNSET `--dev` specifies nothing, so the inherited
-    /// `INFR_DEV` (or `[device] dev`) survives, and with neither the default is "first discrete GPU,
-    /// else device 0". `--dev`/`INFR_DEV` share the ONE parser ([`parse_dev_spec`],
+    /// `INFR_DEV` (or `[device] dev`) survives, and with neither the default is "largest discrete
+    /// GPU by device-local memory, else device 0". `--dev`/`INFR_DEV` share the ONE parser ([`parse_dev_spec`],
     /// `vulkan*`/`metal`/`cpu`, case-insensitive) and a garbage `--dev` still fails fast
     /// here, before anything is loaded. The deprecated `INFR_METAL`/`INFR_CPU` are still not
     /// written and still not read.
@@ -5138,7 +5138,7 @@ mod tests {
         let msg = format!("{e:#}");
         assert!(msg.contains("INFR_DEV"), "message names the source: {msg}");
         assert!(msg.contains("foo"), "message echoes the bad value: {msg}");
-        // No env at all → the default, first discrete Vulkan GPU.
+        // No env at all → the default, largest discrete Vulkan GPU by device-local memory.
         assert_eq!(
             resolve_backend(None, BackendEnv::default()).unwrap(),
             Backend::Vulkan(None)

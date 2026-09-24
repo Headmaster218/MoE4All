@@ -2043,6 +2043,34 @@ fn device_type_str(t: vk::PhysicalDeviceType) -> &'static str {
     }
 }
 
+fn device_local_heap_bytes(instance: &ash::Instance, pd: vk::PhysicalDevice) -> u64 {
+    let mp = unsafe { instance.get_physical_device_memory_properties(pd) };
+    (0..mp.memory_heap_count as usize)
+        .filter(|&h| {
+            mp.memory_heaps[h]
+                .flags
+                .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+        })
+        .map(|h| mp.memory_heaps[h].size)
+        .sum()
+}
+
+/// Prefer the discrete GPU with the most device-local memory. Vulkan enumeration order is not a
+/// useful performance signal on multi-GPU Windows systems, where a small display adapter may be
+/// `Vulkan0`. Ties retain the first enumerated device; with no discrete GPU, device 0 remains the
+/// fallback.
+fn preferred_device_index(devices: &[(vk::PhysicalDeviceType, u64)]) -> usize {
+    let mut best: Option<(usize, u64)> = None;
+    for (index, &(device_type, vram_bytes)) in devices.iter().enumerate() {
+        if device_type == vk::PhysicalDeviceType::DISCRETE_GPU
+            && best.is_none_or(|(_, best_bytes)| vram_bytes > best_bytes)
+        {
+            best = Some((index, vram_bytes));
+        }
+    }
+    best.map_or(0, |(index, _)| index)
+}
+
 /// A physical device as seen by [`VulkanBackend::enumerate_devices`]. `index` is the `VulkanN` /
 /// `INFR_DEV` / [`VulkanBackend::new_on`] handle. The `external_memory*` flags report whether the
 /// device could, in principle, participate in a host-less GPU↔GPU transfer (dma-buf / fd import) —
@@ -2055,7 +2083,8 @@ pub struct DeviceInfo {
     pub integrated: bool,
     /// Sum of DEVICE_LOCAL heap sizes (a UMA part reports its GTT-backed heap here).
     pub vram_bytes: u64,
-    /// True for the device `VulkanBackend::new()` would bind today (INFR_DEV, else discrete, else 0).
+    /// True for the device `VulkanBackend::new()` would bind today (`INFR_DEV`, else the largest
+    /// discrete GPU by device-local memory, else device 0).
     pub is_default_pick: bool,
     pub external_memory: bool,
     pub external_memory_fd: bool,
@@ -2590,9 +2619,9 @@ impl VulkanBackend {
         Ok(())
     }
 
-    /// The historical default-device rule, EXACTLY preserved for the Vulkan case: honor
-    /// `INFR_DEV=VulkanN` (the CLI's `--dev`, matching llama.cpp's naming) if set, else the first
-    /// `DISCRETE_GPU`, else device 0. An out-of-range / unparseable Vulkan index is a hard error
+    /// Default-device rule: honor `INFR_DEV=VulkanN` (the CLI's `--dev`, matching llama.cpp's
+    /// naming) if set, else the `DISCRETE_GPU` with the most device-local memory, else device 0.
+    /// An out-of-range / unparseable Vulkan index is a hard error
     /// (silently running on a different GPU than asked produces plausible-but-wrong numbers).
     ///
     /// `INFR_DEV` is now the SINGLE device-selection env, so it can also hold `metal`/`cpu` (the
@@ -2610,6 +2639,9 @@ impl VulkanBackend {
         pdevices: &[vk::PhysicalDevice],
         spec: Option<&str>,
     ) -> Result<vk::PhysicalDevice> {
+        if pdevices.is_empty() {
+            return Err(be("no Vulkan physical devices found"));
+        }
         // A pinned Vulkan index needs the device names for the "no such device" message; build them
         // once (cold init path, a handful of devices).
         let names: Vec<String> = pdevices
@@ -2625,14 +2657,16 @@ impl VulkanBackend {
             .collect();
         match resolve_infr_dev_index(spec, &names)? {
             Some(idx) => Ok(pdevices[idx]), // range already checked by the resolver
-            None => Ok(pdevices
-                .iter()
-                .copied()
-                .find(|&pd| {
-                    let p = unsafe { instance.get_physical_device_properties(pd) };
-                    p.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
-                })
-                .unwrap_or(pdevices[0])),
+            None => {
+                let devices = pdevices
+                    .iter()
+                    .map(|&pd| {
+                        let p = unsafe { instance.get_physical_device_properties(pd) };
+                        (p.device_type, device_local_heap_bytes(instance, pd))
+                    })
+                    .collect::<Vec<_>>();
+                Ok(pdevices[preferred_device_index(&devices)])
+            }
         }
     }
 
@@ -2668,15 +2702,7 @@ impl VulkanBackend {
                 let name = unsafe { CStr::from_ptr(p.device_name.as_ptr()) }
                     .to_string_lossy()
                     .into_owned();
-                let mp = unsafe { instance.get_physical_device_memory_properties(pd) };
-                let vram_bytes: u64 = (0..mp.memory_heap_count as usize)
-                    .filter(|&h| {
-                        mp.memory_heaps[h]
-                            .flags
-                            .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
-                    })
-                    .map(|h| mp.memory_heaps[h].size)
-                    .sum();
+                let vram_bytes = device_local_heap_bytes(&instance, pd);
                 let exts = unsafe { instance.enumerate_device_extension_properties(pd) }
                     .unwrap_or_default();
                 let has = |name: &CStr| {
@@ -2716,8 +2742,9 @@ impl VulkanBackend {
     /// the process environment. The `Arc` is held for the backend's whole life and borrowed
     /// (never cloned) at each read site (`docs/config-plan.md` R4/R6).
     ///
-    /// Device pick: `cfg.device.dev` (`INFR_DEV`) if it names a `VulkanN`, else the first discrete
-    /// GPU, else device 0. See [`new_on_with`](Self::new_on_with) to pin a SPECIFIC index.
+    /// Device pick: `cfg.device.dev` (`INFR_DEV`) if it names a `VulkanN`, else the discrete GPU
+    /// with the most device-local memory, else device 0. See [`new_on_with`](Self::new_on_with) to
+    /// pin a SPECIFIC index.
     pub fn new_with(cfg: Arc<Config>) -> Result<Self> {
         Self::new_selected(None, cfg)
     }
@@ -7512,6 +7539,26 @@ fn probe_flash_attention_hd256(
 mod tests {
     use super::*;
     use infr_core::Backend;
+
+    #[test]
+    fn default_device_prefers_the_largest_discrete_gpu() {
+        let gib = 1u64 << 30;
+        let devices = [
+            (vk::PhysicalDeviceType::DISCRETE_GPU, 2 * gib),
+            (vk::PhysicalDeviceType::DISCRETE_GPU, 24 * gib),
+            (vk::PhysicalDeviceType::INTEGRATED_GPU, 64 * gib),
+        ];
+        assert_eq!(preferred_device_index(&devices), 1);
+
+        let tied = [
+            (vk::PhysicalDeviceType::DISCRETE_GPU, 24 * gib),
+            (vk::PhysicalDeviceType::DISCRETE_GPU, 24 * gib),
+        ];
+        assert_eq!(preferred_device_index(&tied), 0);
+
+        let integrated_only = [(vk::PhysicalDeviceType::INTEGRATED_GPU, 64 * gib)];
+        assert_eq!(preferred_device_index(&integrated_only), 0);
+    }
 
     fn submit_sample(gpu_ns: u64, dispatches: usize) -> SubmitRoundStats {
         SubmitRoundStats {

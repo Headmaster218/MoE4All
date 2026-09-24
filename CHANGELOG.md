@@ -6,6 +6,45 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-20
+
+### Highlights
+
+- Qwen3.8-Flash-Next now supports native Vulkan vision inference with GGUF multimodal
+  projectors and OpenAI-compatible image content parts. Repeated turns can reuse decoded image
+  embeddings and resident multimodal K/V state.
+- `infr serve --parallel` now schedules mixed prefill and decode work across independent K/V
+  slots, batches compatible Qwen3.8 decode rows, and reports live per-slot progress and speed.
+- Idle dynamic Q8 K/V sessions can be stored in a checksummed SSD cache and restored after a
+  restart. The release defaults retain up to 5 GiB for 24 hours and flush resident sessions during
+  orderly shutdown.
+
+### Changed
+
+- Qwen3.8 segmented QSA prefill uses online softmax and hoisted segment addressing, substantially
+  improving long-context prefill without changing the model or K/V format.
+- Batched PLE gathers and GPU sampling reduce CPU synchronization in parallel generation.
+- Chat and OpenAI-compatible serving expose configurable reasoning controls while preserving each
+  model's default behavior.
+
+### Fixed
+
+- Vulkan shared command-pool access is synchronized across concurrent inference and embedding
+  work.
+- Cached prefill steps are no longer double-counted, and live status reports actual prefill
+  progress instead of remaining at `Starting`.
+- Text-only continuation after a Qwen3.8 image turn uses the normal text RoPE path, restoring
+  expected decode performance.
+- Session-cache restore validates conversation identity and capacity before reusing persisted K/V
+  state.
+
+### Validation
+
+- Qwen3.8 long-context prefill reached 750.7 tok/s for `pp3072` at 131K synthetic depth with Q8
+  K/V on the RX 7900 XTX validation host.
+- Staggered 32K + 8K two-request Qwen3.8 decode sustained 56.9 aggregate tok/s with 24 GiB VRAM,
+  a 48 GiB process-RAM target, Q8 K/V, and `ubatch=3072`.
+
 ## [0.6.0-beta.1] - 2026-09-02
 
 ### Highlights
