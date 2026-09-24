@@ -4,7 +4,7 @@
 //! The DRAM tier's arena is ANONYMOUS, non-evictable memory — the expensive kind backlog B30
 //! measured — so its size cannot be a guess. Two separate concerns live here:
 //!
-//! - [`available_bytes`], a PLATFORM probe of what could be committed right now. It is deliberately
+//! - [`available_bytes`], a PLATFORM probe of physical RAM available right now. It is deliberately
 //!   allowed to answer "I do not know" rather than estimate, because an over-estimate here is an
 //!   out-of-memory kill or a swap storm mid-generation, not a slow run.
 //! - [`auto_cache_bytes`], the PURE arithmetic that turns that answer into a budget. Separate so
@@ -12,7 +12,7 @@
 //! - [`process_resident_bytes`], the current process working set used to resolve an explicit
 //!   total-process RAM budget into the part that can actually become a weight cache.
 
-/// Host memory that could be committed right now, or `None` where this platform has no probe.
+/// Physical host memory available right now, or `None` where this platform has no probe.
 ///
 /// `None` is a real answer and callers must treat it as one: it means "do not auto-size", not
 /// "assume zero" and not "assume plenty". The tier then stays off unless the user names a budget,
@@ -23,10 +23,11 @@
 /// a new allocation can have without swapping — it already accounts for reclaimable page cache, so
 /// it is exactly the figure this tier wants and not something derivable from `MemTotal`.
 ///
-/// **Windows** reads `GlobalMemoryStatusEx` and uses the smaller of `ullAvailPhys` and
-/// `ullAvailPageFile`. The arena needs both reusable physical pages and commit charge;
-/// `VirtualAlloc(MEM_COMMIT)` can fail even with free RAM when the process/system commit limit is
-/// tighter. Every other platform answers `None` today; macOS would need `host_statistics64`'s
+/// **Windows** reads `GlobalMemoryStatusEx::ullAvailPhys`. Commit headroom is deliberately exposed
+/// separately through [`commit_available_bytes`]: the automatic RAM policy is frozen before any
+/// Vulkan allocation and has the same semantics as an explicit total-process RAM budget. Folding
+/// WDDM's later device-memory charge into this probe would silently shrink that startup decision.
+/// Every other platform answers `None` today; macOS would need `host_statistics64`'s
 /// free/inactive/purgeable split.
 ///
 /// **A cgroup memory limit overrides it.** `/proc/meminfo` is host-wide and knows nothing about the
@@ -57,10 +58,7 @@ fn platform_available_bytes() -> Option<u64> {
     #[cfg(windows)]
     {
         let status = windows_memory_status()?;
-        Some(windows_available_bytes(
-            status.ullAvailPhys,
-            status.ullAvailPageFile,
-        ))
+        Some(status.ullAvailPhys)
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     {
@@ -113,11 +111,6 @@ fn platform_total_bytes() -> Option<u64> {
     {
         None
     }
-}
-
-#[cfg(any(windows, test))]
-fn windows_available_bytes(available_phys: u64, available_commit: u64) -> u64 {
-    available_phys.min(available_commit)
 }
 
 #[cfg(windows)]
@@ -281,7 +274,58 @@ const AUTO_AVAILABLE_RESERVE: u64 = 3 << 30;
 /// Aggressive automatic sizing treats this as a process-wide reserve below total physical RAM.
 /// Unlike the ordinary profile, already-used RAM does not permanently shrink the target: the
 /// current process working set is subtracted from `total - reserve` to obtain the new arena size.
-const AGGRESSIVE_TOTAL_RESERVE: u64 = 13 << 30;
+const AGGRESSIVE_TOTAL_RESERVE: u64 = 14 << 30;
+
+/// One startup-time automatic RAM decision after it has been frozen into
+/// `device.ram_budget`. From this point on it deliberately follows the explicit total-process
+/// budget path, including its process-resident subtraction and allocation behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrozenAutomaticRamBudget {
+    pub profile: crate::config::AutoProfile,
+    pub budget_bytes: u64,
+    pub startup_available_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+}
+
+/// Resolve an unset automatic RAM policy once, before model or backend construction.
+///
+/// Explicit `device.ram_budget`, legacy `paging.dram`, and `paging.dram_bypass` retain their
+/// existing precedence. A missing platform probe leaves the config unset so the backend's
+/// best-effort automatic fallback remains available.
+pub fn freeze_automatic_ram_budget(
+    config: &mut crate::config::Config,
+) -> Option<FrozenAutomaticRamBudget> {
+    let available = available_bytes();
+    let total = total_bytes();
+    freeze_automatic_ram_budget_for_snapshot(config, available, total)
+}
+
+fn freeze_automatic_ram_budget_for_snapshot(
+    config: &mut crate::config::Config,
+    available: Option<u64>,
+    total: Option<u64>,
+) -> Option<FrozenAutomaticRamBudget> {
+    if config.device.ram_budget.is_some()
+        || config.paging.dram.is_some()
+        || config.paging.dram_bypass
+    {
+        return None;
+    }
+    let profile = config.device.auto_profile;
+    let budget_bytes = match profile {
+        crate::config::AutoProfile::Conservative => {
+            available?.saturating_sub(AUTO_AVAILABLE_RESERVE)
+        }
+        crate::config::AutoProfile::Aggressive => total?.saturating_sub(AGGRESSIVE_TOTAL_RESERVE),
+    };
+    config.device.ram_budget = Some(crate::SizeSpec::Bytes(budget_bytes));
+    Some(FrozenAutomaticRamBudget {
+        profile,
+        budget_bytes,
+        startup_available_bytes: available,
+        total_bytes: total,
+    })
+}
 
 /// Below this an arena is not worth building: the tier costs a copy per streamed block, and a
 /// budget this small holds so little of a model that the hit rate cannot pay for it.
@@ -666,12 +710,12 @@ mod tests {
             status.ullTotalPhys
         );
         assert_eq!(total_bytes(), Some(status.ullTotalPhys));
-        assert_eq!(commit_available_bytes(), Some(status.ullAvailPageFile));
         assert!(
-            avail <= status.ullAvailPageFile,
-            "available {avail} exceeds commit headroom {}",
-            status.ullAvailPageFile
+            avail.abs_diff(status.ullAvailPhys) <= 16 << 20,
+            "two adjacent physical-memory samples drifted by more than 16 MiB: {avail} vs {}",
+            status.ullAvailPhys
         );
+        assert_eq!(commit_available_bytes(), Some(status.ullAvailPageFile));
         let resident = process_resident_bytes().expect("GetProcessMemoryInfo should answer");
         assert!(
             resident > 0,
@@ -682,12 +726,6 @@ mod tests {
             "process working set {resident} exceeds physical RAM {}",
             status.ullTotalPhys
         );
-    }
-
-    #[test]
-    fn windows_probe_is_bounded_by_physical_and_commit_headroom() {
-        assert_eq!(windows_available_bytes(48 * GIB, 20 * GIB), 20 * GIB);
-        assert_eq!(windows_available_bytes(12 * GIB, 40 * GIB), 12 * GIB);
     }
 
     /// Ordinary automatic sizing retains exactly 3 GiB of current availability.
@@ -712,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn aggressive_profile_targets_total_ram_minus_thirteen_gib() {
+    fn aggressive_profile_targets_total_ram_minus_fourteen_gib() {
         let available = 40 * GIB;
         let conservative = auto_cache_bytes(available, 0, u64::MAX);
         let aggressive = auto_cache_bytes_for_snapshot(
@@ -724,7 +762,65 @@ mod tests {
             u64::MAX,
         );
         assert!(aggressive > conservative);
-        assert_eq!(aggressive, 49 * GIB);
+        assert_eq!(aggressive, 48 * GIB);
+    }
+
+    #[test]
+    fn automatic_ram_budget_is_frozen_like_an_explicit_startup_value() {
+        let mut conservative = crate::config::Config::default();
+        let frozen = freeze_automatic_ram_budget_for_snapshot(
+            &mut conservative,
+            Some(48 * GIB),
+            Some(64 * GIB),
+        )
+        .expect("conservative startup budget");
+        assert_eq!(frozen.budget_bytes, 45 * GIB);
+        assert_eq!(
+            conservative.device.ram_budget,
+            Some(crate::SizeSpec::Bytes(45 * GIB))
+        );
+
+        let mut aggressive = crate::config::Config::default();
+        aggressive.device.auto_profile = crate::config::AutoProfile::Aggressive;
+        let frozen = freeze_automatic_ram_budget_for_snapshot(
+            &mut aggressive,
+            Some(48 * GIB),
+            Some(64 * GIB),
+        )
+        .expect("aggressive startup budget");
+        assert_eq!(frozen.budget_bytes, 50 * GIB);
+        assert_eq!(
+            aggressive.device.ram_budget,
+            Some(crate::SizeSpec::Bytes(50 * GIB))
+        );
+    }
+
+    #[test]
+    fn automatic_ram_freeze_never_overrides_an_explicit_host_policy() {
+        let mut explicit = crate::config::Config::default();
+        explicit.device.ram_budget = Some(crate::SizeSpec::Bytes(32 * GIB));
+        assert_eq!(
+            freeze_automatic_ram_budget_for_snapshot(&mut explicit, Some(48 * GIB), Some(64 * GIB)),
+            None
+        );
+        assert_eq!(
+            explicit.device.ram_budget,
+            Some(crate::SizeSpec::Bytes(32 * GIB))
+        );
+
+        let mut legacy = crate::config::Config::default();
+        legacy.paging.dram = Some(crate::SizeSpec::Bytes(7 * GIB));
+        assert_eq!(
+            freeze_automatic_ram_budget_for_snapshot(&mut legacy, Some(48 * GIB), Some(64 * GIB)),
+            None
+        );
+
+        let mut bypass = crate::config::Config::default();
+        bypass.paging.dram_bypass = true;
+        assert_eq!(
+            freeze_automatic_ram_budget_for_snapshot(&mut bypass, Some(48 * GIB), Some(64 * GIB)),
+            None
+        );
     }
 
     #[test]

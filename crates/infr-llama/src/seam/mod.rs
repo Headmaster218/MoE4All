@@ -5996,7 +5996,7 @@ mod seam_helper_tests {
     }
 
     #[test]
-    fn aggressive_moe_auto_targets_total_minus_thirteen_gib() {
+    fn aggressive_moe_auto_targets_total_minus_fourteen_gib() {
         use infr_core::config::AutoProfile;
         use infr_core::hostmem::RamRequest;
 
@@ -6006,20 +6006,20 @@ mod seam_helper_tests {
                 AutoProfile::Aggressive,
                 RamRequest::Auto,
                 Some((26 * GIB) as u64),
-                Some((40 * GIB) as u64),
+                Some((41 * GIB) as u64),
                 Some((3 * GIB) as u64),
                 None,
                 payload,
             ),
             super::MoeHostBacking::Full,
-            "40 GiB total minus 13 GiB reserve and 3 GiB resident leaves the 24 GiB payload"
+            "41 GiB total minus 14 GiB reserve and 3 GiB resident leaves the 24 GiB payload"
         );
         assert!(matches!(
             super::moe_host_backing(
                 AutoProfile::Aggressive,
                 RamRequest::Auto,
                 Some((26 * GIB) as u64),
-                Some((40 * GIB) as u64),
+                Some((41 * GIB) as u64),
                 Some((3 * GIB + 1) as u64),
                 None,
                 payload,
@@ -6050,7 +6050,7 @@ mod seam_helper_tests {
                 None,
                 large_payload,
             ),
-            super::MoeHostBacking::Bounded { bytes: 49 * GIB },
+            super::MoeHostBacking::Bounded { bytes: 48 * GIB },
             "below full fit, MoE uses the same total-process target"
         );
     }

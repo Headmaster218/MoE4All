@@ -736,7 +736,17 @@ fn main() -> anyhow::Result<()> {
         sets: cli.set.clone(),
         flags: cli_flag_layer(&cmd)?,
     };
-    let cfg = Arc::new(Config::load(&overrides)?);
+    let mut cfg = Config::load(&overrides)?;
+    if let Some(frozen) = infr_core::hostmem::freeze_automatic_ram_budget(&mut cfg) {
+        tracing::info!(
+            auto_profile = %frozen.profile,
+            startup_available_host_bytes = ?frozen.startup_available_bytes,
+            total_host_bytes = ?frozen.total_bytes,
+            total_process_ram_budget_bytes = frozen.budget_bytes,
+            "automatic RAM budget frozen at process startup; applying explicit total-process budget semantics"
+        );
+    }
+    let cfg = Arc::new(cfg);
     install_shutdown_file_watcher(cfg.serve.shutdown_file.as_deref())?;
     publish_thread_count(&cfg);
     publish_profile_out(&cfg);
