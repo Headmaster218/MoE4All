@@ -108,7 +108,7 @@ cfg_struct! {
         /// budget, on top of the Vulkan allocator's built-in safety guard. Percentages resolve
         /// against total device-local memory.
         vram_reserve: Option<SizeSpec> = None,
-        /// `INFR_UBATCH`: prefill micro-batch rows. `None` = no usable value; the 1024 /
+        /// `INFR_UBATCH`: prefill micro-batch rows. `None` = no usable value; the profile /
         /// iGPU-adaptive fallback chain stays at its call site (R5).
         ubatch: Option<usize> = None,
         /// Was `INFR_UBATCH` / `--ubatch` supplied AT ALL, usable or not? The PRESENCE half of

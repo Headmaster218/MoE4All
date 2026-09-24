@@ -9422,7 +9422,7 @@ fn generate_dense_backend_inner(
         // Prefill vs in-flight decodes (`infr serve --parallel N`): the chunk is the unit of GPU
         // ownership, so a chunk is exactly how long a newly-admitted request's prefill can stall
         // everyone else's decode. Automatic parallel prefill now uses the same profile-selected
-        // chunk as a single request (1024 ordinary, 2048 aggressive); INFR_UBATCH_PARALLEL remains
+        // chunk as a single request (2048 ordinary, 4096 aggressive); INFR_UBATCH_PARALLEL remains
         // the explicit latency-oriented cap. Yield the baton between chunks so the round-robin can
         // interleave prefill with other sequences' decode steps.
         let ubatch: usize = if req.is_some_and(crate::sampling::RequestCtx::shares_gpu) {

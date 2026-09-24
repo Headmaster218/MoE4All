@@ -868,7 +868,7 @@ pub(crate) fn generate_dense_vulkan_parallel_prefill_session(
 /// Honest activation/scratch reservation for a DENSE model's placement decision: the transient
 /// VRAM a resident session needs BEYOND weights + KV, at the largest shape it will ever run — a
 /// full prefill chunk of `rows = min(ubatch, want_ctx)` rows (the runner chunks batched prefill at
-/// INFR_UBATCH, default 1024; decode's single row is dwarfed by this).
+/// INFR_UBATCH, profile-selected by default; decode's single row is dwarfed by this).
 ///
 /// Every term is per ROW of the prefill chunk, and the whole estimate is now checked against the
 /// backend's own high-water mark of live activation bytes at the end of every generation (see
@@ -1243,9 +1243,9 @@ const ACT_RESERVE_PAD: (u64, u64) = (3, 2);
 const QWEN4_PLAN_OVERLAP_RESERVE: u64 = 64 * 1024 * 1024;
 
 /// Batched-prefill micro-batch: rows per prefill chunk (`device.ubatch` / `INFR_UBATCH`, default
-/// 1024 — but see [`default_ubatch_rows`] for the INTEGRATED-GPU default). ONE reader funnel — the
-/// prefill loop, the activation reserve, and the SWA ring sizing below all derive from this,
-/// because the ring's correctness bound is "window + one whole prefill chunk".
+/// 2048/4096 by profile — but see [`default_ubatch_rows`] for the INTEGRATED-GPU default). ONE
+/// reader funnel — the prefill loop, the activation reserve, and the SWA ring sizing below all
+/// derive from this, because the ring's correctness bound is "window + one whole prefill chunk".
 ///
 /// **`ubatch_specified` IS needed** (the S0 report's open question; §10's `INFR_UBATCH=abc` note).
 /// `INFR_UBATCH` is a §6.12 two-consumer knob — the VALUE here, and the PRESENCE the placement
@@ -1349,21 +1349,20 @@ fn moe_ubatch_fallback_candidates(ec: &EngineConfig) -> Vec<usize> {
     candidates
 }
 
-/// The prefill chunk when neither INFR_UBATCH nor the placement sweep pinned one: 1024 rows in the
-/// conservative profile and 2048 in the aggressive profile, EXCEPT on an integrated GPU, where a
+/// The prefill chunk when neither INFR_UBATCH nor the placement sweep pinned one: 2048 rows in the
+/// conservative profile and 4096 in the aggressive profile, EXCEPT on an integrated GPU, where a
 /// chunk that big is a single multi-second command buffer and trips
 /// the ~10 s GPU watchdog (`ring gfx_0.0.0 timeout` -> `VK_ERROR_DEVICE_LOST`). See
 /// [`infr_core::integrated_ubatch_rows`] for the measurements behind the smaller default.
 ///
 /// A DISCRETE device (and a CPU/Metal run, where no Vulkan backend was constructed and
-/// `device_class()` is `None`) uses the profile default. Conservative remains byte-identical to
-/// the pre-profile behavior.
+/// `device_class()` is `None`) uses the profile default.
 fn default_ubatch_rows(profile: infr_core::config::AutoProfile) -> usize {
     match infr_vulkan::device_class() {
         Some(d) if d.integrated => infr_core::integrated_ubatch_rows(d.compute_units),
         _ => match profile {
-            infr_core::config::AutoProfile::Conservative => 1024,
-            infr_core::config::AutoProfile::Aggressive => 2048,
+            infr_core::config::AutoProfile::Conservative => 2048,
+            infr_core::config::AutoProfile::Aggressive => 4096,
         },
     }
 }
@@ -3352,9 +3351,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let kv_bytes = total_slot_state_bytes(kv_bytes_at(selected_ubatch));
         let persistent_state = kv_bytes.saturating_sub(dynamic_kv_reserve);
         // Reserve the workspace for the chunk this session will actually execute. A user selecting
-        // 4096 rows still gets the full 4K reserve; the default 1024-row session no longer strands
-        // the difference behind a permanent 2 GiB/4K assumption. Prefill's layer ring already
-        // borrows only cold Decode arena ranges and returns them on `enter_decode`.
+        // 4096 rows still gets the full 4K reserve; a lower selected rung no longer strands the
+        // difference behind a permanent 2 GiB/4K assumption. Prefill's layer ring already borrows
+        // only cold Decode arena ranges and returns them on `enter_decode`.
         let runtime_reserve =
             runtime_reserve_at(cfg, &caps, want_ctx, ring, selected_ubatch, k_fmt, v_fmt);
         let packing_margin = resident_weight_packing_margin(fp.dense);
@@ -6224,15 +6223,15 @@ mod seam_helper_tests {
         assert!(!super::user_pinned_ubatch(&unset));
         assert_eq!(
             super::ubatch_rows(&unset),
-            1024,
-            "no pin, no iGPU: the 1024 default"
+            2048,
+            "no pin, no iGPU: the conservative 2048 default"
         );
 
         let mut aggressive = EngineConfig::default();
         aggressive.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
         assert_eq!(
             super::ubatch_rows(&aggressive),
-            2048,
+            4096,
             "the aggressive discrete default uses a larger prefill chunk"
         );
 
@@ -6262,7 +6261,7 @@ mod seam_helper_tests {
         );
         assert_eq!(
             super::ubatch_rows(&adaptive),
-            1024,
+            2048,
             "…and the height falls back"
         );
     }
@@ -6271,10 +6270,10 @@ mod seam_helper_tests {
     fn explicit_ubatch_also_governs_parallel_prefill_unless_overridden() {
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let mut ec = EngineConfig::default();
-        assert_eq!(super::ubatch_rows_parallel(&ec), 1024);
+        assert_eq!(super::ubatch_rows_parallel(&ec), 2048);
 
         ec.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
-        assert_eq!(super::ubatch_rows_parallel(&ec), 2048);
+        assert_eq!(super::ubatch_rows_parallel(&ec), 4096);
 
         ec.device.ubatch = Some(3072);
         ec.device.ubatch_specified = true;
@@ -7242,16 +7241,9 @@ mod seam_helper_tests {
     }
 
     /// **Regression, the reported case.** gemma-3-12b at its trained 131072 window on a 24 GiB
-    /// XTX fits at f16 — it never needed the q8 cache the clamp used to pin. What used to make it
-    /// miss is priced here explicitly: the DEFAULT 1024-row prefill chunk's activation reserve
-    /// does not fit, a SHORTER rung of the same ladder the dense placement sweep walks does, and
-    /// the sweep would have shrunk to it anyway. Pricing only the default chunk decided the KV
-    /// format against an assumption the very next step abandoned.
-    ///
-    /// Deliberately does not name the winning rung. Which one it is moves with the reserve's own
-    /// coefficients and that is not what this is guarding — the invariant is "the default chunk
-    /// misses, a lower rung on the SHARED ladder saves it, and f16 therefore reaches the trained
-    /// window".
+    /// XTX fits at f16 — it never needed the q8 cache the clamp used to pin. The winning rung can
+    /// move with the profile default and reserve coefficients; the invariant is that context-fit
+    /// checks the same complete ladder as placement and accepts f16 when any rung fits.
     ///
     /// (Whole-run confirmation is `infr bench -d 120000` on the real model, which peaks at
     /// 17.5 GiB of 24.0 GiB — GPU + 8 GiB of weights, so not something a unit test can host.)
@@ -7267,12 +7259,9 @@ mod seam_helper_tests {
                 + super::dense_act_reserve_at(&cfg, &conservative_caps(), want, ub)
         };
         let cands = super::ubatch_candidates(&ec);
-        assert_eq!(cands[0], 1024, "the default chunk leads the ladder");
-        // With the measured reserve this model now fits at the DEFAULT chunk — it no longer needs
-        // a shorter rung to reach its trained window, which is a strictly better outcome than the
-        // one this test was written for (and matches the device: `infr bench -p 131056` runs at
-        // ubatch 1024, 780 t/s, peaking 4735 MiB of activations against a 7146 MiB reserve).
-        // What still has to hold is that SOME rung of the shared ladder serves it.
+        assert_eq!(cands[0], 2048, "the default chunk leads the ladder");
+        // The profile default may change independently of this regression. What has to hold is
+        // that some rung of the shared ladder serves the trained window.
         assert!(
             cands.iter().any(|&ub| need(ub) <= XTX_ROOM),
             "a rung of the shared ladder must serve the trained window: {:?}",
@@ -7516,14 +7505,17 @@ mod seam_helper_tests {
     fn dense_ubatch_ladder_is_the_only_one() {
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let unset = EngineConfig::default();
-        assert_eq!(super::ubatch_rows(&unset), 1024);
-        assert_eq!(super::ubatch_candidates(&unset), vec![1024, 512, 256]);
+        assert_eq!(super::ubatch_rows(&unset), 2048);
+        assert_eq!(
+            super::ubatch_candidates(&unset),
+            vec![2048, 1536, 1024, 512, 256]
+        );
 
         let mut aggressive = EngineConfig::default();
         aggressive.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
         assert_eq!(
             super::ubatch_candidates(&aggressive),
-            vec![2048, 1536, 1024, 512, 256]
+            vec![4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
         );
         assert_eq!(
             super::ubatch_fallbacks_below(3072),
@@ -7977,9 +7969,9 @@ mod seam_helper_tests {
         // A shape where the ladder is genuinely WALKED — otherwise "they agree" would be satisfied
         // by both picking the default rung and the guard would prove nothing. Derived, not
         // hardcoded: the heaviest weights that still fit at the 512-row rung, which by construction
-        // cannot fit at 1024. (The reported gemma-3-12b @131072 case no longer needs a shorter rung
-        // at all — the measured reserve is small enough that the default chunk holds it — so the
-        // agreement is checked here and the trained-window outcome in
+        // cannot fit at any taller rung. (The reported gemma-3-12b @131072 case no longer needs a
+        // shorter rung at its measured 1024-row setting, so the agreement is checked here and the
+        // trained-window outcome in
         // `kv_fit_walks_the_placement_chunk_ladder_gemma3_12b`.)
         let want = cfg.n_ctx_train;
         let heavy = XTX_ROOM
@@ -7990,7 +7982,10 @@ mod seam_helper_tests {
                 + super::kv_bytes_estimate_fmt(&cfg, want, true, ub, k, v)
                 + super::dense_act_reserve_at(&cfg, &conservative_caps(), want, ub)
         };
-        assert!(need_heavy(1024) > XTX_ROOM, "the default chunk must miss");
+        assert!(
+            need_heavy(cands[0]) > XTX_ROOM,
+            "the default chunk must miss"
+        );
         assert!(
             need_heavy(512) <= XTX_ROOM,
             "…and the 512-row rung must save it"

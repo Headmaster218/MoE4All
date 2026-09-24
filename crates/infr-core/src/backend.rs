@@ -939,7 +939,7 @@ mod tests {
     }
 
     /// A DISCRETE GPU must be untouched by any of this: `integrated` defaults false, so the seam's
-    /// `default_ubatch_rows` takes its 1024 branch and no tuned dGPU shape moves.
+    /// `default_ubatch_rows` takes its profile-selected dGPU branch.
     #[test]
     fn discrete_is_the_default() {
         let caps = Capabilities::default();
