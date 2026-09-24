@@ -8139,7 +8139,7 @@ fn generate_dense_backend_inner(
                 && ec.spec.gpu_mtp_accept;
             let overlap_ple = ec.spec.mtp_ple_overlap && c.n_layer > 1;
             let fixed = (m <= crate::mtp::DRAFT_TOKENS)
-                .then(|| mtp_verify_bufs.as_ref())
+                .then_some(mtp_verify_bufs.as_ref())
                 .flatten();
             let ids_owned = fixed
                 .is_none()

@@ -964,11 +964,12 @@ pub(crate) struct SeamWeights {
     pub(super) mtp_lm_head_index: usize,
 }
 
+type MtpSharedWeight<'a> = (&'a dyn Buffer, DType, usize);
+type MtpSharedWeights<'a> = (MtpSharedWeight<'a>, MtpSharedWeight<'a>);
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl SeamKv {
-    pub(crate) fn mtp_shared_weights(
-        &self,
-    ) -> ((&dyn Buffer, DType, usize), (&dyn Buffer, DType, usize)) {
+    pub(crate) fn mtp_shared_weights(&self) -> MtpSharedWeights<'_> {
         let wi = &self.weights;
         let emb = wi.mtp_token_embd_index;
         let lm = wi.mtp_lm_head_index;

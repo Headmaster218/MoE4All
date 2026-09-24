@@ -10,6 +10,9 @@ use super::{BindWeightFn, MtpTensor};
 
 pub const DRAFT_TOKENS: usize = 4;
 
+type SharedWeight<'a> = (&'a dyn Buffer, DType, usize);
+type SharedWeights<'a> = (SharedWeight<'a>, SharedWeight<'a>);
+
 struct PhaseProfile {
     name: &'static str,
     start: std::time::Instant,
@@ -324,6 +327,7 @@ struct HcScratch {
     inject: TensorId,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_hc_mix(
     g: &mut Graph,
     cfg: &crate::Config,
@@ -533,6 +537,7 @@ fn emit_bridge(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_attention_kv(
     g: &mut Graph,
     cfg: &crate::Config,
@@ -622,6 +627,7 @@ fn emit_attention_kv(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_full_step(
     g: &mut Graph,
     cfg: &crate::Config,
@@ -1091,7 +1097,7 @@ impl Qwen4MtpSession {
         tokens: &[u32],
         h: &[f32],
         start_pos: usize,
-        shared: ((&dyn Buffer, DType, usize), (&dyn Buffer, DType, usize)),
+        shared: SharedWeights<'_>,
     ) -> Result<()> {
         let hcw = self.cfg.hc_mult * self.cfg.n_embd;
         if h.len() != tokens.len() * hcw {
@@ -1156,7 +1162,7 @@ impl Qwen4MtpSession {
         h: &[f32],
         start_pos: usize,
         verify_tokens: usize,
-        shared: ((&dyn Buffer, DType, usize), (&dyn Buffer, DType, usize)),
+        shared: SharedWeights<'_>,
     ) -> Result<Vec<u32>> {
         anyhow::ensure!(
             (2..=DRAFT_TOKENS).contains(&verify_tokens),

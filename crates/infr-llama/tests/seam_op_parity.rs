@@ -108,6 +108,7 @@ fn run_with_mutated_state(
 }
 
 /// Run an op that mutates its live recurrent state and writes a row-major state trace.
+#[allow(clippy::too_many_arguments)]
 fn run_with_state_trace(
     be: &dyn Backend,
     g: &Graph,
