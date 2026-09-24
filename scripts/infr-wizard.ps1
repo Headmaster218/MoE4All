@@ -516,8 +516,8 @@ $banner = @'
 
 Write-Host $banner -ForegroundColor Green
 Write-Host "  MoE4All v$productVersion" -ForegroundColor Green
-Write-Host '  Making huge MoE LLMs accessible to AMD users.'
-Write-Host '  让 A 卡用户也能在本地运行大型 MoE AI！'
+Write-Host '  Run models far larger than VRAM on gaming GPUs.'
+Write-Host '  让游戏显卡跑起远超显存容量的大模型。'
 Write-Host '  John / Headmaster218  https://github.com/Headmaster218/MoE4All' -ForegroundColor DarkGray
 Write-Host '============================================================' -ForegroundColor Green
 Write-Host 'MoE4All 启动向导 / MoE4All Launch Wizard' -ForegroundColor Green

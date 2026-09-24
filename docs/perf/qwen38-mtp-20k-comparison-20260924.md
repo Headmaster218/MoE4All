@@ -1,4 +1,4 @@
-# Qwen3.8 MTP and ordinary decode at 20K context
+# Qwen3.8 MTP and ordinary decode with 20K input
 
 ## Scope
 
@@ -19,14 +19,14 @@ with the same 4.44 GiB ring shape.
 
 | Path and output | Prompt | Prefill | Decode, whole | Decode, middle | Decode, late | MTP alpha |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| MTP, count 0-200 | 19,988 | 936 tok/s | 60.2 tok/s | 61.4 tok/s | 61.3 tok/s | 0.994 |
-| MTP, ordinary answer | 20,019 | 937 tok/s | 39.9 tok/s | 42.0 tok/s | 39.7 tok/s | 0.594 |
-| Ordinary, count 0-200 | 19,988 | 1,035 tok/s | 37.7 tok/s | 38.6 tok/s | 37.8 tok/s | n/a |
-| Ordinary, ordinary answer | 20,019 | 1,034 tok/s | 35.0 tok/s | 35.1 tok/s | 36.8 tok/s | n/a |
+| MTP, simple prompt | 19,988 | 936 tok/s | 60.2 tok/s | 61.4 tok/s | 61.3 tok/s | 0.994 |
+| MTP, complex prompt | 20,019 | 937 tok/s | 39.9 tok/s | 42.0 tok/s | 39.7 tok/s | 0.594 |
+| Ordinary, simple prompt | 19,988 | 1,035 tok/s | 37.7 tok/s | 38.6 tok/s | 37.8 tok/s | n/a |
+| Ordinary, complex prompt | 20,019 | 1,034 tok/s | 35.0 tok/s | 35.1 tok/s | 36.8 tok/s | n/a |
 
-The count output is byte-identical between MTP and ordinary decode. At this
-depth MTP is 62% faster on the high-acceptance count task and 14% faster on the
-ordinary question. The ordinary-question result remains acceptance-sensitive:
+The simple-prompt output is byte-identical between MTP and ordinary decode. At
+this depth MTP is 60% faster on the high-acceptance simple prompt and 14% faster
+on the complex prompt. The complex-prompt result remains acceptance-sensitive:
 its late MTP speed is only 8% above ordinary late decode.
 
 ## Prefill gap
@@ -34,7 +34,7 @@ its late MTP speed is only 8% above ordinary late decode.
 The controlled 20K result does not reproduce a twofold prefill gap. MTP is
 about 9.5% slower: 21.35-21.36 seconds versus 19.31-19.36 seconds.
 
-For the count prompt, the five MTP target-prime chunks consume 20.818 seconds.
+For the simple prompt, the five MTP target-prime chunks consume 20.818 seconds.
 The detached-head catch-up and outer-loop work consume the remaining 0.534
 seconds. Relative to ordinary prefill, roughly 1.509 seconds of the 2.043-second
 gap is already inside the target's special prime path; only 0.534 seconds is

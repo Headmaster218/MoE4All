@@ -8,9 +8,6 @@ the `infr` inference engine. The top-level project overview lives in the root
 
 - [thinking-controls.md](thinking-controls.md) — native reasoning effort, per-request
   thinking controls, model differences, and reasoning-history replay.
-- [../GETTING_STARTED.md](../GETTING_STARTED.md) — clean-clone installation,
-  native Windows 11 prerequisites, release build, Vulkan verification,
-  small-model smoke test, launch wizard, GUI, server, and troubleshooting.
 - [config.md](config.md) — the configuration reference: the four layers
   (defaults < config file < `INFR_*` env < CLI flags) and their precedence, the
   TOML file format and lookup order, `--set`, and a per-section walkthrough of
@@ -37,6 +34,9 @@ at that index. It holds:
   profiling, shape-itemised buckets, CPU `samply`.
 - [perf/playbook.md](perf/playbook.md) — the optimization method and the
   recorded dead ends. Read before starting a perf slice.
+- [perf/qwen38-mtp-20k-comparison-20260924.md](perf/qwen38-mtp-20k-comparison-20260924.md)
+  — the 0.8.0 Qwen3.8 Flash Next MTP comparison with 20K actual input,
+  automatic aggressive configuration, segmented Decode, and acceptance rates.
 - [perf/kernels.md](perf/kernels.md) — cross-backend fast-kernel coverage (24/24
   quant formats on CPU / Vulkan / Metal) and each backend's decode strategy.
 - [perf/cpu.md](perf/cpu.md) — the CPU backend's own roadmap.

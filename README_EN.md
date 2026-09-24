@@ -1,164 +1,209 @@
 # MoE4All
 
-**Making huge MoE LLMs accessible to AMD users.**
+**Run models far larger than VRAM on gaming GPUs. AMD, NVIDIA, and Intel are all working.**
 
-[Latest Windows release](https://github.com/Headmaster218/MoE4All/releases/latest) |
-[Getting started](GETTING_STARTED.md#english-quick-start) |
+The portable Windows package is 13 MiB. Download a GGUF, choose automatic
+configuration, and start local chat or an OpenAI-compatible API. MoE expert
+weights are coordinated across VRAM, system RAM, and SSD.
+
+**0.8.0 release benchmark:** RX 7900 XTX 24 GiB + 64 GiB DDR4, using the
+automatic aggressive-performance profile. The table shows measured generation
+speed in tok/s; see [Measured results](#measured-results) for full conditions and
+per-segment results.
+
+| Recommended model and quantization | MTP | 20K input | 150K input |
+| --- | --- | ---: | ---: |
+| **Qwen3.6-35B-A3B · APEX-I-Balanced** | Off | **65.6** | **39.9** |
+| **Qwen3.8-Flash-Next · AD-4.27bpw-Q4_K_M-M64** | On | **60.2** | **48.1** |
+
+[Released Windows builds](https://github.com/Headmaster218/MoE4All/releases/latest) |
+[Quick start](#quick-start) |
+[Measured results](#measured-results) |
+[Community results](#community-results) |
 [简体中文](README.md) |
-[Technical documentation](https://github.com/Headmaster218/MoE4All/blob/main/docs/README.md)
+[Technical documentation](docs/README.md)
 
-MoE4All is a local LLM inference project focused on AMD GPUs and native
-Windows 11. It moves MoE expert weights between VRAM, system RAM, and SSD on
-demand, allowing models much larger than GPU memory to run on consumer Radeon
-hardware.
+## Quick start
 
-You do not need to understand paging, KV caches, or Vulkan before using it.
-Download the portable package, prepare a supported GGUF model, launch the
-bilingual wizard, and choose automatic configuration.
+### 1. Download the program
 
-> Native Windows 11, AMD Radeon RX 7900 XTX, and Vulkan are the primary
-> development and validation platform. Other Vulkan GPUs may work, but they do
-> not currently receive the same compatibility and performance coverage.
+Open [MoE4All Releases](https://github.com/Headmaster218/MoE4All/releases) and
+download the matching `MoE4All-Windows-x86_64-v*.zip`. The features and
+measurements on this page correspond to the upcoming **0.8.0** release.
 
-## 0.7.0: vision, parallel serving, and SSD session cache
+### 2. Extract it
 
-Version 0.7.0 adds native Vulkan vision inference, concurrent request
-scheduling, and persistent session K/V to the complete Qwen3.8-Flash-Next text
-path. Q2_K_XL, IQ4_XS, and Q4_K_M quantizations have been tested on Windows 11,
-including SSD expert paging under a bounded process-RAM budget.
+Fully extract the ZIP into a directory such as `D:\MoE4All`.
 
-- **Vision chat:** load a matching `mmproj*.gguf` and send images through
-  standard OpenAI image content parts. Identical images can reuse decoded
-  embeddings, and continued multimodal sessions can reuse resident K/V.
-- **Parallel serving:** `infr serve --parallel N` uses independent K/V slots
-  and batches compatible Qwen3.8 prefill, decode, PLE, and sampling work. The
-  terminal dashboard reports live state and speed for every slot.
-- **SSD session cache:** when enabled, idle dynamic Q8 K/V sessions can be
-  stored in checksummed files and restored after a process restart. The
-  defaults retain up to 5 GiB for 24 hours and flush resident sessions during
-  orderly shutdown.
-- **Reasoning controls:** terminal chat and the OpenAI-compatible API support
-  the model default, explicit thinking on/off, and native `reasoning_effort`.
+### 3. Download a GGUF model
 
-Representative Qwen3.8 results from the stable branch are shown below. The
-test host uses an RX 7900 XTX 24 GiB, Ryzen 5 5600X, and 64 GiB DDR4; both rows
-use Q8 K/V and `ubatch=3072`.
+The current release is optimized and measured with the following two
+quantizations. Store the model files on a local SSD.
 
-| Model and workload | Key conditions | Result |
-|---|---|---:|
-| IQ4_XS prefill 3,072 after 131K synthetic depth | 49.33 GiB expert RAM cache, 3-run average | **750.7 tok/s** |
-| Q4_K_M 4.27 bpw staggered 32K + 8K dual decode | 24 GiB VRAM + 48 GiB RAM, 8-second stagger, 6-run average | **56.9 aggregate tok/s** |
+| Model / component | Download | File and purpose |
+| --- | --- | --- |
+| **Qwen3.6 35B model** | [Download APEX-I-Balanced](https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/resolve/main/Qwen3.6-35B-A3B-APEX-I-Balanced.gguf?download=true) | `Qwen3.6-35B-A3B-APEX-I-Balanced.gguf`; this single file is sufficient for the 35B model |
+| **Flash-Next main model** | [Download all AD-4.27bpw-Q4_K_M-M64 shards](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/tree/main/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64) | Download all **33 GGUF shards** from this directory into one folder |
+| **Flash-Next vision** | [Download the F16 vision projector](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/mmproj-Qwen3.8-Flash-Next-F16.gguf?download=true) | `mmproj-Qwen3.8-Flash-Next-F16.gguf`; load it for image understanding |
+| **Flash-Next MTP** | [Download the shared Q4_K_M MTP head](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf?download=true) | `mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf`; the text-acceleration component used in these measurements |
 
-See [Measured results](#measured-results) and the
-[Windows local-model performance matrix](docs/perf/windows-local-model-matrix-20260829.md)
-for historical results and full conditions. Decode still varies with context
-length, request timing, and expert coverage in RAM and SSD.
+For Flash-Next, select the first shard when launching:
+`Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00033.gguf`.
+The vision and MTP files can be placed beside the main-model shards and selected
+for their respective modes in the wizard.
 
-## Start in three steps
+### 4. Run
 
-### 1. Download
+1. Double-click **`Start-INFR-Wizard.cmd`** in the extracted directory.
+2. Choose terminal chat or the OpenAI-compatible API, drag the main-model GGUF
+   into the prompt, and press Enter.
+3. Choose an automatic profile. **Aggressive performance** is the profile used
+   for the results on this page; **conservative** provides more headroom for a
+   first run or a system with other active workloads.
+4. Leave context blank for automatic sizing, then confirm launch. To reproduce
+   these measurements, use `32768` for 20K input and `163840` for 150K input.
 
-Open the [latest Release](https://github.com/Headmaster218/MoE4All/releases/latest),
-download `MoE4All-Windows-x86_64-v*.zip`, and fully extract the archive.
+Automatic profiles use Q8 K/V by default and plan VRAM, system RAM, expert
+cache, and Ubatch. The 35B model is ready for chat with its main GGUF alone.
+Flash-Next offers two optional paths:
 
-The package includes `infr.exe` and the bilingual launch wizard. Running the
-packaged build does not require Rust, Visual Studio, or the Vulkan SDK. It does
-require a working 64-bit AMD GPU driver with Vulkan support.
+- **MTP text acceleration:** enable “Qwen3.8 MTP single-stream acceleration,”
+  select the MTP head above, and use verification width `4`. This path uses
+  greedy decoding (`temperature=0`) and one session.
+- **Image understanding:** choose API mode, leave MTP disabled, enable vision,
+  and select the F16 vision projector above.
 
-### 2. Prepare a model
-
-Models are not bundled. Download a GGUF using an architecture and quantization
-supported by MoE4All. For a split GGUF, keep every shard in the same directory;
-the loader can discover the complete model from any shard.
-
-Start with a small model to verify the driver and generation path before
-trying an MoE model that is tens or hundreds of gigabytes. See the
-[getting-started guide](GETTING_STARTED.md#english-quick-start) for model and
-shard guidance.
-
-### 3. Launch
-
-Double-click:
-
-```text
-Start-INFR-Wizard.cmd
-```
-
-Choose interactive terminal chat, the OpenAI-compatible API, or benchmark
-mode, then paste or drag the GGUF path into the open model prompt. Automatic
-configuration in the conservative profile is recommended: MoE4All detects the
-GPU, available VRAM, system memory, model structure, KV requirements, runtime
-space, and expert cache. The aggressive profile keeps automatic detection and
-hard resource guards, but uses tighter RAM/VRAM headroom and explores larger
-Ubatch and submit-splitter caps.
-
-At startup, the wizard makes a short request to check the latest GitHub
-Release. It only displays a download link when an update exists and never
-modifies the installation automatically. Offline startup continues normally.
-
-## What it does
-
-- **Runs models beyond VRAM:** uses VRAM, RAM, and SSD on demand instead of
-  requiring every MoE expert to stay on the GPU.
-- **Native AMD Vulkan:** runs directly on Windows without CUDA or WSL.
-- **Interactive chat:** keeps conversation state across turns and supports the
-  model default, forced reasoning, and no-reasoning modes.
-- **OpenAI-compatible serving:** exposes chat and embedding APIs for existing
-  clients.
-- **Parallel serving:** independent K/V slots handle requests that arrive at
-  different times and use different context lengths.
-- **Persistent sessions:** an optional SSD cache can store idle text K/V and
-  restore it after a server restart.
-- **Long-context execution:** supports quantized KV caches, KV overflow, and
-  long-context performance tests.
-- **Built-in measurement:** includes prefill/decode benchmarks, synthetic
-  context depth, pager statistics, and profiling controls.
-
-## Requirements
-
-| Component | Notes |
-|---|---|
-| Operating system | Primarily tested on 64-bit Windows 11 |
-| GPU | AMD Vulkan is the current focus; more VRAM keeps more weights and KV resident |
-| Driver | Install a current stable AMD driver; `infr.exe devices` should list the GPU |
-| System RAM | Large MoE models use RAM as an expert tier; models beyond RAM can continue paging from SSD |
-| Storage | A fast local SSD is recommended, with enough room for every model shard |
-| Model | Bring a supported local GGUF, either a single file or a complete shard set |
-
-The largest usable model depends on quantization, fixed weights, context size,
-VRAM, system RAM, and storage performance. MoE4All aims to use the available
-hardware effectively; it does not promise identical performance for every
-model on every Radeon GPU.
+The default API base URL is `http://127.0.0.1:8080/v1`. See the
+[configuration reference](docs/config.md) for all available settings.
 
 ## Measured results
 
-The following measurements come from one Windows 11 machine with an RX 7900
-XTX 24 GiB, Ryzen 5 5600X, and 64 GiB DDR4. They demonstrate current project
-capabilities; rows use different workloads and are not directly comparable.
+### 0.8.0: Qwen3.8-Flash-Next, 20K versus 150K input
 
-| Model and workload | Key conditions | Result |
-|---|---|---:|
-| Qwen3.8-Flash-Next IQ4_XS prefill 3,072 after 131K | Q8 K/V, 49.33 GiB expert RAM cache, 3-run average | **750.7 tok/s** |
-| Qwen3.8-Flash-Next Q4_K_M staggered 32K + 8K dual decode | Q8 K/V, 24+48 GiB, `ubatch=3072`, 8-second stagger, 6-run average | **56.9 aggregate tok/s** |
-| Qwen3.6-35B-A3B decode after 250K synthetic depth | Q8 K/V, 1,000 generated tokens | **41.2 tok/s** |
-| Qwen3.6-35B-A3B prefill 4,096 after 250K synthetic depth | Q8 K/V | **477.9 tok/s** |
-| Qwen3.6-35B-A3B prefill 4,096 at depth 0 | Q8 K/V | **2,855.6 tok/s** |
-| Qwen3.5-122B-A10B decode at depth 0 | F16 K/V, 45 GiB bounded RAM, 3 repetitions | **23.2 tok/s** |
-| Qwen3.8-Flash-Next Q2_K_XL decode after 250K synthetic depth | Q8 K/V, 40 GiB bounded RAM, tg128, 3-run average | **22.82 tok/s** |
-| Qwen3.8-Flash-Next Q2_K_XL prefill 1,024 after 250K | Q8 K/V, 40 GiB bounded RAM, 3-run average | **152.27 tok/s** |
-| Qwen3.8-Flash-Next IQ4_XS decode after 250K synthetic depth | Q8 K/V, 40 GiB bounded RAM, tg128, 3-run average | **15.26 tok/s** |
-| Qwen3.8-Flash-Next IQ4_XS prefill 1,024 after 250K | Q8 K/V, 40 GiB bounded RAM, 3-run average | **239.00 tok/s** |
+Both input sizes use the **automatic aggressive-performance profile**. Context,
+Q8 K/V, and sampling are specified; the engine plans the remaining resources
+and automatically selects `ubatch=4096`.
 
-Full conditions and engineering history:
+- **Hardware and OS:** RX 7900 XTX 24 GiB, Ryzen 5 5600X, 64 GiB DDR4, Windows 11.
+- **Model:** `Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64`; MTP uses
+  `mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf`.
+- **Shared settings:** Q8 K/V, greedy, thinking disabled, single-stream
+  generation, automatic aggressive profile.
+- **Context capacity:** 32K for the 20K input and `ctx=163840` for the 150K input.
 
-- [Qwen3.6 RX 7900 XTX optimization history](https://github.com/Headmaster218/MoE4All/blob/main/docs/perf/qwen36-rx7900xtx-optimization-history-20260819.md)
-- [Unified elastic VRAM acceptance](https://github.com/Headmaster218/MoE4All/blob/main/docs/unified-vram-elastic-acceptance-20260824.md)
-- [DeepSeek V4 Flash closeout](https://github.com/Headmaster218/MoE4All/blob/main/docs/perf/deepseek-v4-flash-rx7900xtx-closeout-20260824.md)
+Prefill is input-processing speed and Decode is end-to-end generation speed.
+Both are measured in tok/s.
+
+| Workload | Mode | 20K Prefill | 20K Decode | 150K Prefill | 150K Decode |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Complex prompt | MTP | 937 | **39.9** | 766 | **33.4** |
+| Complex prompt | No MTP | 1,034 | **35.0** | 889 | **30.8** |
+| Simple prompt (high acceptance) | MTP | 936 | **60.2** | 769 | **48.1** |
+| Simple prompt (high acceptance) | No MTP | 1,035 | **37.7** | 888 | **32.4** |
+
+- **Long-input generation remains fast:** from 20K to 150K, end-to-end Decode
+  retains approximately **80%–88%** across the four workloads.
+- **MTP gains vary with content:** complex prompts improve by approximately
+  **14.0% / 8.4%** at 20K / 150K; simple prompts improve by approximately
+  **59.7% / 48.5%**.
+- **Input and output are timed separately:** MTP adds Prefill work in this test.
+  Total request time combines input processing and output generation.
+
+<details>
+<summary>Full per-segment results, MTP acceptance, and long-context changes</summary>
+
+Speeds are in tok/s. Middle covers 25%–62.5% of generated tokens and Late covers
+62.5%–100%. Alpha is the MTP draft acceptance rate.
+
+| Input size | Mode and workload | Prefill | Full Decode | Middle | Late | Alpha |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 20K | MTP simple prompt | 936 | 60.2 | 61.4 | 61.3 | 0.994 |
+| 20K | MTP complex prompt | 937 | 39.9 | 42.0 | 39.7 | 0.594 |
+| 20K | No-MTP simple prompt | 1,035 | 37.7 | 38.6 | 37.8 | — |
+| 20K | No-MTP complex prompt | 1,034 | 35.0 | 35.1 | 36.8 | — |
+| 150K | MTP simple prompt | 769 | 48.1 | 49.2 | 46.8 | 0.979 |
+| 150K | MTP complex prompt | 766 | 33.4 | 35.5 | 34.3 | 0.642 |
+| 150K | No-MTP simple prompt | 888 | 32.4 | 32.0 | 32.9 | — |
+| 150K | No-MTP complex prompt | 889 | 30.8 | 31.4 | 31.2 | — |
+
+Actual input lengths for the 20K simple / complex prompts are **19,988 / 20,019**
+tokens; the 150K inputs contain **149,849 / 149,857** tokens.
+
+| Mode and workload | Prefill change, 150K vs 20K | Full Decode change |
+| --- | ---: | ---: |
+| MTP simple prompt | -17.8% | -20.1% |
+| MTP complex prompt | -18.2% | -16.3% |
+| No-MTP simple prompt | -14.2% | -14.1% |
+| No-MTP complex prompt | -14.0% | -12.0% |
+
+[20K test setup, results, and analysis](docs/perf/qwen38-mtp-20k-comparison-20260924.md).
+
+</details>
+
+### 0.8.0: Qwen3.6 35B without MTP
+
+**The complex prompt generates at 59.1 tok/s with 20K input and 39.0 tok/s
+with 150K input.**
+
+- **Model:** `Qwen3.6-35B-A3B-APEX-I-Balanced`, without MTP.
+- **Hardware and OS:** the same RX 7900 XTX 24 GiB, Ryzen 5 5600X, 64 GiB DDR4,
+  and Windows 11 system.
+- **Test settings:** automatic aggressive-performance profile, Q8 K/V, greedy,
+  thinking disabled, and single-stream generation. Context capacity is 32K for
+  the 20K input and `ctx=163840` for the 150K input.
+
+Prompt is the actual input token count. Prefill and Decode are measured in
+tok/s. Middle and Late cover 25%–62.5% and 62.5%–100% of generated tokens.
+
+| Input / workload | Prompt | Prefill | Full Decode | Middle | Late |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 20K simple prompt | 20,041 | 2,484 | **65.6** | 66.7 | 66.8 |
+| 20K complex prompt | 20,049 | 2,421 | **59.1** | 59.5 | 62.6 |
+| 150K simple prompt | 149,849 | 1,135 | **39.9** | 40.3 | 39.9 |
+| 150K complex prompt | 149,857 | 1,140 | **39.0** | 39.6 | 39.8 |
+
+## Community results
+
+**AMD, NVIDIA RTX, and Intel Arc all have user-tested configurations and
+generation-speed reports.**
+
+| GPU and memory | Model and conditions | Generation speed | Version and source |
+| --- | --- | ---: | --- |
+| **AMD RX 7700 XT 12GB + 64GB RAM** | Ornith 1.5 35B-A3B, `serve`, 131K context capacity | **41.5–42.7 tok/s** | v0.5.2 community baseline, [PR #21](https://github.com/Headmaster218/MoE4All/pull/21) |
+| **Intel Arc A770 16GB + 64GB DDR4-3200** | Ornith 1.5 35B Q4_K_M, F16 KV, 96K context capacity, three REAL-workload runs | **30.15–30.28 tok/s** | v0.6.0-beta.1, [Issue #41](https://github.com/Headmaster218/MoE4All/issues/41) |
+| **NVIDIA RTX 3090 Ti + 64GB RAM** | Successful community run; model, quantization, and context were not included in the original comment | **about 29 tok/s** | Version not reported, [Bilibili user report](https://www.bilibili.com/video/BV1ALha63Eyd/) (rpid `318146261056`) |
+
+Share successful configurations in
+[Discussions](https://github.com/Headmaster218/MoE4All/discussions), or report
+problems through [Issues](https://github.com/Headmaster218/MoE4All/issues).
+Include the GPU/VRAM, RAM, OS and driver, MoE4All version, model quantization,
+context, automatic profile or launch command, and Prefill/Decode speeds.
+
+## What it does
+
+- **Runs models beyond VRAM:** coordinates MoE expert caching and loading across
+  VRAM, system RAM, and SSD.
+- **Vulkan inference:** executes directly through the Windows GPU driver; AMD is
+  the primary validation platform, with community results from NVIDIA and Intel.
+- **Interactive chat:** keeps context across turns and supports model-default,
+  enabled, or disabled thinking modes.
+- **OpenAI-compatible serving:** provides chat and Embedding APIs for existing
+  clients.
+- **Parallel serving:** independent K/V slots handle requests arriving at
+  different times and using different context lengths.
+- **Persistent sessions:** an optional SSD cache stores idle text K/V and restores
+  it after a server restart.
+- **Long context:** supports quantized KV Cache, KV overflow, and long-context
+  performance tests.
+- **Qwen3.8 MTP (0.8.0 preview):** optional single-stream speculative decoding;
+  gains depend on draft acceptance. Setup is covered in [Quick start](#quick-start).
+- **Measurement and diagnostics:** built-in prefill/decode benchmarks, synthetic
+  depth, and paging statistics.
 
 ## Current model support
 
 | Model family | GGUF architecture | Status |
-|---|---|---|
+| --- | --- | --- |
 | Llama and Llama 4 | `llama`, `llama4` | Dense and MoE Vulkan inference |
 | Qwen2 / Qwen2.5 / Qwen3 | `qwen2`, `qwen3`, `qwen3moe` | Dense and Qwen3 MoE |
 | Qwen3.5 / Qwen3.6 | `qwen35`, `qwen35moe` | Gated DeltaNet, attention, and paged MoE |
@@ -167,83 +212,16 @@ Full conditions and engineering history:
 | Ling 3.0 Flash | `bailingmoe3` | KDA, gated MLA, 512 experts, and RAM/SSD paging |
 | DeepSeek V4 Flash | `deepseek4` | FP8 KV, MXFP4 indexer cache, and paged MoE |
 | DiffusionGemma | `diffusion-gemma` | Text-diffusion inference |
-| Embedding GGUFs | Supported embedding architectures | Native CPU/Vulkan OpenAI embedding API |
+| Embedding GGUFs | Supported embedding architectures | Native CPU/Vulkan OpenAI Embedding API |
 
-Fine-tunes using an existing architecture often work without a new runner,
-but the GGUF metadata, quantization format, tokenizer, and chat template must
-still be complete. Compatibility is never inferred from a model name alone.
-
-## Everyday usage
-
-### Terminal chat
-
-Choose interactive chat in the wizard, or run:
-
-```powershell
-.\infr.exe run 'D:\Models\model.gguf'
-```
-
-### OpenAI-compatible API
-
-```powershell
-.\infr.exe serve --addr 127.0.0.1:8080 'D:\Models\model.gguf'
-```
-
-The API base URL is `http://127.0.0.1:8080/v1`. Configure an API key before
-binding to a LAN address, and never expose an unauthenticated server directly
-to the internet.
-
-#### Qwen3.8 vision chat
-
-Place the matching vision projector beside the text model so the wizard can
-discover the single `mmproj*.gguf`, or pass it explicitly:
-
-```powershell
-.\infr.exe serve --mmproj 'D:\Models\mmproj-Qwen3.8-Flash-Next-Q8_0.gguf' `
-  --addr 127.0.0.1:8080 'D:\Models\Qwen3.8-Flash-Next.gguf'
-```
-
-Send standard OpenAI content parts to `/v1/chat/completions`, with each image
-encoded as a data URI or bare base64 in `image_url`:
-
-```json
-{
-  "model": "Qwen3.8-Flash-Next",
-  "messages": [{
-    "role": "user",
-    "content": [
-      {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}},
-      {"type": "text", "text": "Describe this image."}
-    ]
-  }]
-}
-```
-
-The native vision path currently supports Vulkan `qwen4exp` only. The server
-does not fetch HTTP(S) image URLs; clients must encode the image first.
-Identical images reuse preprocessed embeddings by content fingerprint, and a
-continued multimodal session can reuse resident K/V. Multimodal K/V is not yet
-written to the SSD cold cache.
-
-### Benchmark
-
-```powershell
-# Prefill
-.\infr.exe bench -p 1024 -n 0 -r 1 'D:\Models\model.gguf'
-
-# Decode
-.\infr.exe bench -p 0 -n 128 -r 1 'D:\Models\model.gguf'
-```
-
-The [getting-started guide](GETTING_STARTED.md#9-benchmark-示例) explains the
-common options and synthetic depth for measuring inference after a long
-existing context.
+Fine-tunes using an existing architecture can often reuse the same
+implementation. Compatibility depends on complete GGUF metadata, quantization
+format, tokenizer, and chat template.
 
 ## How models can exceed VRAM
 
-An MoE model normally activates only a small fraction of its experts for each
-token. MoE4All therefore maintains three storage tiers instead of requiring
-every expert to remain on the GPU:
+Large MoE models typically activate only a small fraction of their experts for
+each token. MoE4All maintains three storage tiers:
 
 ```text
 Complete GGUF on SSD
@@ -252,46 +230,32 @@ Full host store or bounded RAM cache
         ↓
 Elastic GPU expert cache
         ↓
-AMD Vulkan execution
+Vulkan GPU execution
 ```
 
-Frequently used experts remain in VRAM when possible, RAM provides a larger
-hot tier, and SSD supplies the rest. Fixed model weights, KV caches, runtime
-scratch, and expert residency share a coordinated VRAM budget. Elastic space
-can be reassigned when execution changes between prefill and decode.
+Frequently used experts remain in VRAM when possible, RAM provides a larger hot
+tier, and SSD supplies the rest. Fixed model weights, KV Cache, runtime scratch,
+and the expert cache share a coordinated VRAM budget. Elastic space can be
+reassigned when execution switches between prefill and decode.
 
-For implementation details, see the
-[documentation index](https://github.com/Headmaster218/MoE4All/blob/main/docs/README.md)
+Implementation details are available in the
+[technical documentation index](https://github.com/Headmaster218/MoE4All/blob/main/docs/README.md)
 and the
-[MoE4All wiki](https://github.com/Headmaster218/MoE4All/blob/main/infr-fork-wiki/README.md).
-
-## Current limitations
-
-- The first turns of a large model can be slower while the RAM cache is being
-  populated from SSD.
-- Large-model prefill still has room for a more complete asynchronous SSD-to-RAM
-  lookahead pipeline.
-- Host DMA is limited by the amount of system memory the Windows driver accepts
-  for external import; other ranges fall back to CPU writes into ReBAR.
-- Automatic budgeting prioritizes a reliable launch and is not guaranteed to
-  be the highest-throughput configuration for every machine.
-- The current portable Windows package focuses on the command-line wizard; the
-  browser GUI remains a source-development entry point.
+[MoE4All Wiki](https://github.com/Headmaster218/MoE4All/blob/main/infr-fork-wiki/README.md).
 
 ## Project and attribution
 
 MoE4All is maintained by John / [Headmaster218](https://github.com/Headmaster218).
 It is based on kryptic.sh's Pure-Rust, Vulkan-first inference engine
-[infr](https://github.com/kryptic-sh/infr). Read the original upstream project
-description in the [infr README](https://github.com/kryptic-sh/infr#readme);
-it is not embedded in this repository's README.
+[infr](https://github.com/kryptic-sh/infr). The upstream project description is
+in the [infr README](https://github.com/kryptic-sh/infr#readme).
 
 The maintainer directs architecture, performance investigations, priorities,
-and acceptance. AI coding agents are used extensively to assist with Rust,
-Vulkan, testing, and documentation work.
+and acceptance. AI coding agents assist extensively with Rust, Vulkan, testing,
+and documentation work.
 
 MoE4All modifications and the collective distribution use the
 [Apache License 2.0](LICENSE). Code inherited from infr retains its original
-[MIT License](LICENSE-MIT) and copyright notice. See [NOTICE](NOTICE) for
-attribution. The two license files describe different parts of the project's
-provenance; they are not alternative buttons the user must choose between.
+[MIT License](LICENSE-MIT) and copyright notice; see [NOTICE](NOTICE) for
+attribution. The two license files record the provenance of the MoE4All and
+upstream portions respectively.
