@@ -28,7 +28,9 @@ mod segmented_kv;
 mod session_state;
 mod weights;
 
-pub(crate) use runner::{generate_dense_backend, PreparedParallelPrompt};
+pub(crate) use runner::{
+    generate_dense_backend, generate_dense_backend_verify_frontier, PreparedParallelPrompt,
+};
 pub(crate) use sc::DenoiseReq;
 pub use sc::{DenoiseOutcome, EbReduced};
 pub(crate) use session_state::{SessionBuffer, SessionBufferKey, SessionStateMeta};

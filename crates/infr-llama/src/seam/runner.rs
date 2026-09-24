@@ -878,11 +878,9 @@ pub(super) struct DecodeHandles {
     // `None` for headless builds (`logits_rows == 0` — the batched-prefill chunks, whose logits
     // nothing consumes); `Some` everywhere else.
     logits: Option<TensorId>,
-    // MTP Phase 1 (issue #33, docs/mtp.md): the LM-head INPUT — the same rows `logits` was
-    // computed from, one op earlier (post-`output_norm`, pre-`w_lm`). `Some` only when `build`
-    // was called with `h_tap: true`; `None` for every ordinary caller (no extra op, no extra
-    // download). This is the primitive Phase 2's MTP head needs (`h_p` in `docs/mtp.md`'s forward
-    // pseudocode) — Phase 1 only exposes the tap, no head graph reads it yet.
+    // MTP target hidden output. This normally covers the rows projected by the LM head; Qwen3.8
+    // prompt prime deliberately taps every four-stream residual row while projecting only the
+    // frontier. `Some` only when `build` was called with `h_tap: true`.
     h_out: Option<TensorId>,
     // GPU embed gather (`use_ids` on `build`): the I32 token-id Input the driver binds instead
     // of uploading embedded f32 rows into `hidden` (which is then an Internal fed by the
@@ -1250,6 +1248,56 @@ pub(crate) fn generate_dense_backend(
         mm,
         None,
         None,
+        false,
+    )
+}
+
+/// Prime Qwen3.8 MTP over every uncached prompt row while projecting only the frontier row
+/// through the vocabulary head. The detached head needs every target hidden row, but the driver
+/// consumes only the final target token prediction; computing `[m, vocab]` logits here wastes
+/// work and can exceed a Vulkan arena shard for a large prompt.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_dense_backend_verify_frontier(
+    be: &dyn Backend,
+    bind_weight: &BindWeight,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    prompt: &[u32],
+    state: &mut Option<SeamKv>,
+    want_ctx: usize,
+    verify: &mut Vec<f32>,
+    verify_ids: &mut Vec<u32>,
+    h_out: &mut Vec<f32>,
+    finish_fixed_allocations: Option<&dyn Fn() -> AResult<()>>,
+) -> AResult<(Vec<u32>, GenStats)> {
+    generate_dense_backend_inner(
+        be,
+        bind_weight,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        None,
+        prompt,
+        0,
+        |_| {},
+        state,
+        want_ctx,
+        None,
+        Some(verify),
+        Some(verify_ids),
+        None,
+        Some(h_out),
+        None,
+        None,
+        None,
+        finish_fixed_allocations,
+        None,
+        None,
+        None,
+        true,
     )
 }
 
@@ -1334,6 +1382,7 @@ pub(crate) fn generate_dense_backend_parallel_sampled(
         mrope_plans[0],
         Some(&mut parallel),
         None,
+        false,
     )?;
     let mut outputs = Vec::with_capacity(prompts.len());
     outputs.push(first);
@@ -1401,6 +1450,7 @@ pub(crate) fn generate_dense_backend_parallel_prefill(
         None,
         None,
         Some(&mut parallel),
+        false,
     )?;
     let mut stats = Vec::with_capacity(prompts.len());
     stats.push(primary_stats);
@@ -1444,12 +1494,10 @@ fn generate_dense_backend_inner(
     // MoE-incompatible — see its guard below) this rides the existing rows==1 per-token loop, so
     // it works for MoE/diffusion-gemma models too.
     mut logits_out: Option<&mut Vec<f32>>,
-    // MTP Phase 1 (issue #33, docs/mtp.md): captures the LM-head INPUT rows (post-`output_norm`,
-    // pre-`w_lm` — `DecodeHandles::h_out`'s doc) for the SAME row(s) `logits_out`/`verify` came
-    // from: `[ne]` for the per-token decode loop's frontier row, `[m * ne]` for speculative
-    // VERIFY's `m` rows. `None` everywhere else (no extra op, no extra download — see `h_tap`'s
-    // doc on `build`). This is Phase 2's MTP driver primitive (`h_p` in `docs/mtp.md`); Phase 1
-    // only exposes it for validation (`lm_head(h_row) == logits_row`).
+    // MTP Phase 1 (issue #33, docs/mtp.md): captures the target hidden rows consumed by the MTP
+    // head. Ordinary decode captures the frontier row and speculative VERIFY captures all rows.
+    // Qwen3.8 prompt prime also captures all rows while projecting only its frontier through the
+    // vocabulary head. `None` everywhere else (no extra op or download).
     mut h_out: Option<&mut Vec<f32>>,
     // Phase-2 DiffusionGemma canvas denoise (see `DenoiseReq`'s doc). `None` everywhere else.
     denoise_req: Option<DenoiseReq>,
@@ -1474,6 +1522,7 @@ fn generate_dense_backend_inner(
     mm: Option<&crate::seam::MropePlan>,
     mut parallel_decode: Option<&mut ParallelDecodeRequest<'_>>,
     mut parallel_prefill: Option<&mut ParallelPrefillRequest<'_>>,
+    verify_frontier_only: bool,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
     let state_trace = ec.debug.state_trace;
@@ -7174,18 +7223,19 @@ fn generate_dense_backend_inner(
                 // Qwen3.8's detached MTP layer consumes the four-stream residual before the
                 // model head collapses it. Other MTP architectures consume the LM-head input.
                 let h_width = if c.qwen4exp { c.hc_mult * ne } else { ne };
+                let h_rows = if c.qwen4exp { batch } else { logits_rows };
                 let h_src = if c.qwen4exp {
                     qwen_wide.expect("qwen4exp MTP tap needs qwen_wide")
                 } else {
                     lm_in
                 };
-                let ho = g.output(f32d(h_width * logits_rows));
+                let ho = g.output(f32d(h_width * h_rows));
                 g.push(Op::Copy {
                     src: h_src,
-                    src_off: ((batch - logits_rows) * h_width) as u32,
+                    src_off: ((batch - h_rows) * h_width) as u32,
                     dst: ho,
                     dst_off: 0,
-                    n: (h_width * logits_rows) as u32,
+                    n: (h_width * h_rows) as u32,
                 });
                 Some(ho)
             } else {
@@ -8047,8 +8097,9 @@ fn generate_dense_backend_inner(
     }
 
     // ── speculative VERIFY ──────────────────────────────────────────────────────────
-    // One batched forward over the un-cached suffix with the LM head on EVERY row: returns
-    // [m, vocab] logits (the distribution after each suffix token) and generates nothing.
+    // One batched forward over the un-cached suffix with the LM head on every VERIFY row. Qwen3.8
+    // prompt prime uses the same trunk path but requests only the frontier logits while retaining
+    // every hidden row for detached-head catch-up.
     // The suffix-prefill contract doubles as the accept/rollback mechanism: the caller
     // truncates its committed token list and the next call's prefix diff overwrites the
     // stale KV rows. Dense non-E2B models only (mirrors the batched-prefill guard).
@@ -8061,6 +8112,7 @@ fn generate_dense_backend_inner(
             }
             let verify_t0 = std::time::Instant::now();
             let m = prompt.len() - start;
+            let logits_rows = if verify_frontier_only { 1 } else { m };
             if let Some((verify_rows, _)) = mtp_trace {
                 anyhow::ensure!(
                     verify_rows == m,
@@ -8115,7 +8167,7 @@ fn generate_dense_backend_inner(
                 .map_err(|e| anyhow!("{e}"))?;
             let logits_owned = fixed
                 .is_none()
-                .then(|| be.alloc(m * c.vocab * 4, BufferUsage::Staging))
+                .then(|| be.alloc(logits_rows * c.vocab * 4, BufferUsage::Staging))
                 .transpose()
                 .map_err(|e| anyhow!("{e}"))?;
             let h_owned = (want_h && fixed.is_none())
@@ -8123,7 +8175,7 @@ fn generate_dense_backend_inner(
                 .transpose()
                 .map_err(|e| anyhow!("{e}"))?;
             let out_ids_owned = (gpu_verify_ids && fixed.is_none())
-                .then(|| be.alloc(m * 4, BufferUsage::Readback))
+                .then(|| be.alloc(logits_rows * 4, BufferUsage::Readback))
                 .transpose()
                 .map_err(|e| anyhow!("{e}"))?;
             let ids_buf = fixed
@@ -8246,7 +8298,7 @@ fn generate_dense_backend_inner(
             let (vg, vh) = build(
                 m,
                 start,
-                m,
+                logits_rows,
                 false,
                 None,
                 false,
@@ -8307,11 +8359,11 @@ fn generate_dense_backend_inner(
             let vf_t0 = std::time::Instant::now();
 
             if let (Some(out_ids), Some(buf)) = (verify_ids, out_ids_buf) {
-                out_ids.resize(m, 0);
+                out_ids.resize(logits_rows, 0);
                 be.download(buf, bytemuck::cast_slice_mut(out_ids))
                     .map_err(|e| anyhow!("{e}"))?;
             } else {
-                out_logits.resize(m * c.vocab, 0.0);
+                out_logits.resize(logits_rows * c.vocab, 0.0);
                 be.download(logits_buf, bytemuck::cast_slice_mut(out_logits))
                     .map_err(|e| anyhow!("{e}"))?;
             }
@@ -8324,7 +8376,7 @@ fn generate_dense_backend_inner(
             if ec.prof.stages || infr_core::pager_profile::active() {
                 let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
                 tracing::info!(
-                    "[qwen4 mtp verify] m={m} start={start} io={:.2}ms ple={:.2}ms build={:.2}ms exec={:.2}ms readback={:.2}ms total={:.2}ms",
+                    "[qwen4 mtp verify] m={m} logits_rows={logits_rows} start={start} io={:.2}ms ple={:.2}ms build={:.2}ms exec={:.2}ms readback={:.2}ms total={:.2}ms",
                     ms(vf_alloc), ms(vf_ple), ms(vf_build), ms(vf_exec),
                     ms(vf_t0.elapsed()), ms(verify_t0.elapsed()),
                 );

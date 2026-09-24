@@ -1304,38 +1304,66 @@ impl Qwen4MtpRuntime {
             self.trunk.is_none(),
             self.max_ctx,
         )?;
-        let (prime_ids, prime_h) = super::run_verify_with_finish(
-            vk,
-            &*target_bind,
-            model.gguf(),
-            cfg,
-            ec,
-            model.embd(),
-            &prompt_tokens,
-            &mut self.trunk,
-            self.max_ctx,
-            finish_fixed_allocations.as_deref(),
-        )?;
         let p = prompt_tokens.len();
-        anyhow::ensure!(
-            prime_ids.len() == p && prime_h.len() == p * h_width,
-            "Qwen3.8 MTP prime returned {} ids and {} hidden values for {p} rows",
-            prime_ids.len(),
-            prime_h.len()
-        );
-        let mut shifted_h = vec![0.0f32; p * h_width];
-        if p > 1 {
-            shifted_h[h_width..].copy_from_slice(&prime_h[..(p - 1) * h_width]);
+        let prime_chunk = crate::seam::ubatch_rows(ec).max(1);
+        let mut pending_token = None;
+        // MTP row i consumes target hidden row i-1. Stream prompt-prime hidden rows through the
+        // detached head one ubatch at a time instead of materializing two full-context arrays.
+        // At 200k context the old `prime_h` plus `shifted_h` pair occupied about 15 GiB on the
+        // host, and its single 7.6 GiB GPU readback could not fit any frozen arena shard.
+        let mut previous_h = vec![0.0f32; h_width];
+        for chunk_start in (0..p).step_by(prime_chunk) {
+            if crate::sampling::abort_requested(req) {
+                bail!("aborted: shutdown requested");
+            }
+            let chunk_end = (chunk_start + prime_chunk).min(p);
+            let rows = chunk_end - chunk_start;
+            let finish = if chunk_start == 0 {
+                finish_fixed_allocations.as_deref()
+            } else {
+                None
+            };
+            let (frontier, chunk_h) = super::run_qwen4_prime_frontier_with_finish(
+                vk,
+                &*target_bind,
+                model.gguf(),
+                cfg,
+                ec,
+                model.embd(),
+                &prompt_tokens[..chunk_end],
+                &mut self.trunk,
+                self.max_ctx,
+                finish,
+            )?;
+            anyhow::ensure!(
+                chunk_h.len() == rows * h_width,
+                "Qwen3.8 MTP prime returned {} hidden values for {rows} rows",
+                chunk_h.len()
+            );
+
+            let mut shifted_h = vec![0.0f32; rows * h_width];
+            shifted_h[..h_width].copy_from_slice(&previous_h);
+            if rows > 1 {
+                shifted_h[h_width..].copy_from_slice(&chunk_h[..(rows - 1) * h_width]);
+            }
+            {
+                let shared = self
+                    .trunk
+                    .as_ref()
+                    .expect("target prime initialized a trunk")
+                    .mtp_shared_weights();
+                self.head.catch_up(
+                    vk,
+                    &prompt_tokens[chunk_start..chunk_end],
+                    &shifted_h,
+                    chunk_start,
+                    shared,
+                )?;
+            }
+            previous_h.copy_from_slice(&chunk_h[(rows - 1) * h_width..]);
+            pending_token = Some(frontier);
         }
-        {
-            let shared = self
-                .trunk
-                .as_ref()
-                .expect("target prime initialized a trunk")
-                .mtp_shared_weights();
-            self.head
-                .catch_up(vk, &prompt_tokens, &shifted_h, 0, shared)?;
-        }
+        let mut pending_token = pending_token.expect("non-empty prompt has a frontier token");
         self.trunk
             .as_mut()
             .expect("target prime initialized a trunk")
@@ -1346,8 +1374,7 @@ impl Qwen4MtpRuntime {
         // Keep the target's already-known next token one row ahead of the committed trunk state.
         // The next VERIFY consumes it as row zero, so every batch commits at least one token and
         // rejection never needs a separate correction forward or MTP-head catch-up.
-        let mut pending_token = prime_ids[p - 1];
-        let mut pending_h = prime_h[(p - 1) * h_width..].to_vec();
+        let mut pending_h = previous_h;
         let mut acc = Vec::new();
         let mut printed = 0usize;
         let mut generated = 0usize;
