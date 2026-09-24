@@ -601,9 +601,17 @@ if ($setupMode -eq 'manual') {
     Write-Host 'Hardware stays auto-detected, with tighter RAM/VRAM headroom, a larger Ubatch and a wider Submit cap search.' -ForegroundColor DarkGray
     Write-Host '适合追求吞吐且能接受更高资源压力；启动失败或系统换页时请改用保守档。' -ForegroundColor Yellow
     Write-Host 'Use conservative mode if allocation fails or Windows starts paging.' -ForegroundColor DarkGray
+    $context = Read-TextValue -Label '上下文窗口，留空为自动 / Context window, blank for auto' -Default $context
+    $kvPreset = 'q8'
+    $kvTypeK = 'q8_0'
+    $kvTypeV = 'q8_0'
 } else {
-    Write-Host "`n将自动探测 GPU、上下文、显存和 RAM；不覆盖引擎默认值。" -ForegroundColor DarkGray
-    Write-Host 'GPU, context, VRAM and RAM will be detected automatically; engine defaults stay intact.' -ForegroundColor DarkGray
+    Write-Host "`n将自动探测 GPU、显存和 RAM；上下文留空时由引擎自动确定。" -ForegroundColor DarkGray
+    Write-Host 'GPU, VRAM and RAM will be detected automatically; leave context blank for engine sizing.' -ForegroundColor DarkGray
+    $context = Read-TextValue -Label '上下文窗口，留空为自动 / Context window, blank for auto' -Default $context
+    $kvPreset = 'q8'
+    $kvTypeK = 'q8_0'
+    $kvTypeV = 'q8_0'
 }
 
 $vramBudget = [string](Get-SavedValue 'vram_budget' '')
@@ -846,16 +854,16 @@ $nativeArgs = [System.Collections.Generic.List[string]]::new()
 if ($setupMode -eq 'manual') {
     if (-not [string]::IsNullOrWhiteSpace($configPath)) { [void]$nativeArgs.Add('--config'); [void]$nativeArgs.Add($configPath) }
     if (-not [string]::IsNullOrWhiteSpace($device)) { [void]$nativeArgs.Add('--dev'); [void]$nativeArgs.Add($device) }
-    if (-not [string]::IsNullOrWhiteSpace($context)) { [void]$nativeArgs.Add('--ctx'); [void]$nativeArgs.Add($context) }
     if (-not [string]::IsNullOrWhiteSpace($ubatch)) { [void]$nativeArgs.Add('--ubatch'); [void]$nativeArgs.Add($ubatch) }
     if (-not [string]::IsNullOrWhiteSpace($threads)) { [void]$nativeArgs.Add('--threads'); [void]$nativeArgs.Add($threads) }
 }
+if (-not [string]::IsNullOrWhiteSpace($context)) { [void]$nativeArgs.Add('--ctx'); [void]$nativeArgs.Add($context) }
 
 if ($setupMode -eq 'conservative' -or $setupMode -eq 'aggressive') {
     Add-SetArgument $nativeArgs 'device.auto_profile' $setupMode
 }
 
-if ($setupMode -eq 'manual' -and $kvPreset -ne 'auto') {
+if ($kvPreset -ne 'auto') {
     Add-SetArgument $nativeArgs 'kv.type_k' $kvTypeK
     Add-SetArgument $nativeArgs 'kv.type_v' $kvTypeV
 }
