@@ -273,6 +273,21 @@ fn allocate_parallel_prefill_rows(available: &[usize], ubatch: usize) -> Vec<usi
     rows
 }
 
+/// Select the next QSA prefill lane. Large prefills intentionally run to completion one session
+/// at a time; decode is not inserted between them because the pager ring and expert residency are
+/// rebuilt at the prefill/decode boundary. Keeping one lane here also means prefill never needs the
+/// Vulkan independent multi-session attention workspace.
+fn parallel_prefill_group(
+    cursors: &[usize],
+    targets: &[usize],
+    qsa_threshold: usize,
+) -> Option<(bool, Vec<usize>)> {
+    debug_assert_eq!(cursors.len(), targets.len());
+    let lane = (0..cursors.len()).find(|&lane| cursors[lane] < targets[lane])?;
+    let sparse = cursors[lane].saturating_add(1) > qsa_threshold;
+    Some((sparse, vec![lane]))
+}
+
 fn parallel_prefill_progress(
     prompt_tokens: usize,
     cached_prompt_tokens: usize,
@@ -7365,16 +7380,12 @@ fn generate_dense_backend_inner(
         }
         let t0 = std::time::Instant::now();
 
-        while let Some(first_lane) = (0..lanes).find(|&lane| cursors[lane] < targets[lane]) {
+        while let Some((sparse, prefill_lanes)) =
+            parallel_prefill_group(&cursors, &targets, qsa_threshold)
+        {
             if crate::sampling::abort_requested(req) {
                 break;
             }
-            let sparse = cursors[first_lane] + 1 > qsa_threshold;
-            let prefill_lanes = (0..lanes)
-                .filter(|&lane| {
-                    cursors[lane] < targets[lane] && (cursors[lane] + 1 > qsa_threshold) == sparse
-                })
-                .collect::<Vec<_>>();
             let final_ranges = prefill_lanes
                 .iter()
                 .map(|&lane| {
@@ -10812,8 +10823,9 @@ fn generate_dense_backend_inner(
 mod tests {
     use super::{
         allocate_parallel_prefill_rows, dense_request_exceeds_capacity, full_mrope_positions,
-        mrope_rows_are_plain_rope, mrope_token_position, parallel_prefill_progress,
-        recurrent_extension_start, resident_after_gen, sampling_suffix_start, validate_token_ids,
+        mrope_rows_are_plain_rope, mrope_token_position, parallel_prefill_group,
+        parallel_prefill_progress, recurrent_extension_start, resident_after_gen,
+        sampling_suffix_start, validate_token_ids,
     };
 
     #[test]
@@ -10926,6 +10938,23 @@ mod tests {
         );
         assert_eq!(allocate_parallel_prefill_rows(&[10, 20], 1_024), [10, 20]);
         assert!(allocate_parallel_prefill_rows(&[], 1_024).is_empty());
+    }
+
+    #[test]
+    fn parallel_prefill_finishes_each_lane_before_starting_the_next() {
+        assert_eq!(
+            parallel_prefill_group(&[0, 0], &[8_000, 8_000], 2_051),
+            Some((false, vec![0]))
+        );
+        assert_eq!(
+            parallel_prefill_group(&[2_051, 0], &[8_000, 8_000], 2_051),
+            Some((true, vec![0]))
+        );
+        assert_eq!(
+            parallel_prefill_group(&[8_000, 0], &[8_000, 8_000], 2_051),
+            Some((false, vec![1]))
+        );
+        assert_eq!(parallel_prefill_group(&[7, 9], &[7, 9], 2_051), None);
     }
 
     #[test]

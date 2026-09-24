@@ -1057,15 +1057,17 @@ fn q8_prefill_scratch_bytes(
         .fold(0u64, u64::saturating_add)
 }
 
-/// Extra split-attention workspace used only by Qwen3.8's independent multi-session rows.
-/// Single-sequence prefill can use FlashAttention, while a parallel cohort lowers each sequence
-/// separately through `independent_split_{pm,pl,pacc}`. The dense QSA prefix is bounded by the
-/// indexer threshold; sparse QSA gathers a compact prefix and no longer takes this path.
-fn parallel_prefill_attention_scratch_bytes(cfg: &Config, want_ctx: usize, ubatch: usize) -> u64 {
-    if placement_slots() <= 1 || !cfg.qwen4exp || want_ctx == 0 || ubatch == 0 {
+/// Split-attention workspace retained by Qwen3.8's independent token-row decode cohort.
+///
+/// Multi-session prefill intentionally finishes one session before starting the next, so it never
+/// reaches the ordinary independent-attention path. Decode does reach that path, but each sequence
+/// contributes exactly one row and the Vulkan pool reuses one maximum-sized set of partials across
+/// lanes. Pricing this at the prefill ubatch used to strand several GiB in every multi-slot server
+/// even when only one request was active.
+fn parallel_token_attention_scratch_bytes(cfg: &Config, want_ctx: usize) -> u64 {
+    if placement_slots() <= 1 || !cfg.qwen4exp || want_ctx == 0 {
         return 0;
     }
-    let rows = ubatch.min(want_ctx).max(1).next_multiple_of(64) as u64;
     let ratio = cfg
         .compress_ratios
         .iter()
@@ -1081,9 +1083,7 @@ fn parallel_prefill_attention_scratch_bytes(cfg: &Config, want_ctx: usize, ubatc
     // correct if a model exposes a larger dense threshold.
     let chunk = (visible / 32).clamp(64, 512);
     let chunks = visible.div_ceil(chunk) as u64;
-    let partials = rows
-        .saturating_mul(cfg.n_head as u64)
-        .saturating_mul(chunks);
+    let partials = (cfg.n_head as u64).saturating_mul(chunks);
     partials
         .saturating_mul((cfg.max_head_dim().saturating_add(2)) as u64)
         .saturating_mul(4)
@@ -1130,9 +1130,7 @@ pub(crate) fn runtime_reserve_at(
         .saturating_add(q8_prefill_scratch_bytes(
             cfg, want_ctx, ring, ubatch, k_fmt, v_fmt,
         ))
-        .saturating_add(parallel_prefill_attention_scratch_bytes(
-            cfg, want_ctx, ubatch,
-        ))
+        .saturating_add(parallel_token_attention_scratch_bytes(cfg, want_ctx))
         .saturating_add(qsa_indexer_scratch_bytes(cfg, want_ctx, ubatch))
 }
 
@@ -6738,7 +6736,7 @@ mod seam_helper_tests {
     }
 
     #[test]
-    fn parallel_qwen38_reserves_independent_attention_partials() {
+    fn parallel_qwen38_reserves_only_token_row_attention_partials() {
         let cfg = Config {
             qwen4exp: true,
             n_head: 48,
@@ -6747,18 +6745,18 @@ mod seam_helper_tests {
             compress_ratios: vec![4],
             ..Default::default()
         };
-        let expected = 3072u64 * 48 * 33 * (128 + 2) * 4;
+        let expected = 48u64 * 33 * (128 + 2) * 4;
         {
             let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::for_slots(1)));
             assert_eq!(
-                super::parallel_prefill_attention_scratch_bytes(&cfg, 163_840, 3072),
+                super::parallel_token_attention_scratch_bytes(&cfg, 163_840),
                 0
             );
         }
         {
             let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::for_slots(2)));
             assert_eq!(
-                super::parallel_prefill_attention_scratch_bytes(&cfg, 163_840, 3072),
+                super::parallel_token_attention_scratch_bytes(&cfg, 163_840),
                 expected
             );
         }
