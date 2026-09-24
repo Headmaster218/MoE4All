@@ -24,7 +24,9 @@ use infr_core::{TensorInfo, WeightSource};
 use infr_gguf::Gguf;
 
 mod backends;
+mod qwen4;
 pub use backends::*;
+pub use qwen4::*;
 
 /// One resolved-and-shape-checked tensor: its GGUF metadata (name/shape/dtype/offset), kept around
 /// so Phase 2's `wload` can re-derive the bytes from `.name` without this module re-reading the
@@ -2086,6 +2088,24 @@ fn run_verify(
     state: &mut Option<crate::seam::SeamKv>,
     max_ctx: usize,
 ) -> Result<(Vec<u32>, Vec<f32>)> {
+    run_verify_with_finish(
+        be, bind, g, cfg, ec, token_embd, tokens, state, max_ctx, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_verify_with_finish(
+    be: &dyn Backend,
+    bind: &BindWeightFn,
+    g: &Gguf,
+    cfg: &crate::Config,
+    ec: &crate::EngineConfig,
+    token_embd: crate::seam::TokenEmbd<'_>,
+    tokens: &[u32],
+    state: &mut Option<crate::seam::SeamKv>,
+    max_ctx: usize,
+    finish_fixed_allocations: Option<&dyn Fn() -> Result<()>>,
+) -> Result<(Vec<u32>, Vec<f32>)> {
     let mut logits = Vec::new();
     let mut ids = Vec::new();
     let mut h = Vec::new();
@@ -2110,12 +2130,13 @@ fn run_verify(
         None,
         None,
         None,
-        None,
+        finish_fixed_allocations,
         None,
     )?;
     if ids.is_empty() {
         // Host fallback: the runner downloaded the m×vocab logits instead (see this fn's doc).
-        let m = h.len() / cfg.n_embd;
+        let h_width = cfg.n_embd * if cfg.qwen4exp { cfg.hc_mult } else { 1 };
+        let m = h.len() / h_width;
         anyhow::ensure!(
             logits.len() == m * cfg.vocab,
             "run_verify: host-logits fallback expected {}*{} logits, got {}",
@@ -2128,6 +2149,60 @@ fn run_verify(
             .collect();
     }
     Ok((ids, h))
+}
+
+/// Qwen3.8 prompt prime needs every target hidden row for detached-head catch-up, but only the
+/// final target prediction becomes the first pending token. Keep the trunk forward fully batched
+/// while limiting the vocabulary projection and argmax to that frontier row.
+#[allow(clippy::too_many_arguments)]
+fn run_qwen4_prime_frontier_with_finish(
+    be: &dyn Backend,
+    bind: &BindWeightFn,
+    g: &Gguf,
+    cfg: &crate::Config,
+    ec: &crate::EngineConfig,
+    token_embd: crate::seam::TokenEmbd<'_>,
+    tokens: &[u32],
+    state: &mut Option<crate::seam::SeamKv>,
+    max_ctx: usize,
+    finish_fixed_allocations: Option<&dyn Fn() -> Result<()>>,
+) -> Result<(u32, Vec<f32>)> {
+    anyhow::ensure!(cfg.qwen4exp, "Qwen3.8 frontier prime requires qwen4exp");
+    let mut logits = Vec::new();
+    let mut ids = Vec::new();
+    let mut h = Vec::new();
+    crate::seam::generate_dense_backend_verify_frontier(
+        be,
+        bind,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        tokens,
+        state,
+        max_ctx,
+        &mut logits,
+        &mut ids,
+        &mut h,
+        finish_fixed_allocations,
+    )?;
+    let id = if let Some(&id) = ids.first() {
+        anyhow::ensure!(
+            ids.len() == 1,
+            "Qwen3.8 frontier prime returned {} ids",
+            ids.len()
+        );
+        id
+    } else {
+        anyhow::ensure!(
+            logits.len() == cfg.vocab,
+            "Qwen3.8 frontier prime expected {} fallback logits, got {}",
+            cfg.vocab,
+            logits.len()
+        );
+        argmax_row(&logits)
+    };
+    Ok((id, h))
 }
 
 /// Full-distribution VERIFY forward — the temperature-aware MTP accept rule's twin of
@@ -2241,10 +2316,11 @@ fn run_prime_last(
         None,
         None,
     )?;
+    let h_width = cfg.n_embd * if cfg.qwen4exp { cfg.hc_mult } else { 1 };
     anyhow::ensure!(
-        ids.len() == 1 && h.len() == cfg.n_embd,
+        ids.len() == 1 && h.len() == h_width,
         "run_prime_last: expected 1 id and {} h floats, got {} ids, {} h floats",
-        cfg.n_embd,
+        h_width,
         ids.len(),
         h.len()
     );

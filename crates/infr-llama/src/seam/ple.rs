@@ -157,6 +157,7 @@ struct WorkerState {
     offsets: Vec<u64>,
     vocab_sizes: Vec<u64>,
     gather_threads: usize,
+    single_row_parallel: bool,
     gather_pool: ThreadPool,
     output_pool: Arc<PleOutputPool>,
     context_scratch: Vec<u64>,
@@ -166,7 +167,7 @@ struct WorkerState {
 }
 
 impl PleWorker {
-    pub(super) fn new(g: &Gguf, cfg: &Config) -> Result<Option<Self>> {
+    pub(super) fn new(g: &Gguf, cfg: &Config, single_row_parallel: bool) -> Result<Option<Self>> {
         if !cfg.qwen4exp || !cfg.ple_layers.iter().any(|&v| v) {
             return Ok(None);
         }
@@ -228,6 +229,7 @@ impl PleWorker {
             offsets: cfg.ple_head_offsets.clone(),
             vocab_sizes: cfg.ple_head_vocab_sizes.clone(),
             gather_threads,
+            single_row_parallel,
             gather_pool,
             output_pool: Arc::new(PleOutputPool::new()),
             context_scratch: Vec::with_capacity(cfg.ple_ngram_size),
@@ -405,9 +407,15 @@ impl WorkerState {
             len: output_len,
         };
         let independent_batch = spans.len() > 1;
+        let multirow_span = spans.iter().any(|span| span.rows > 1);
         let parallel = self.gather_threads > 1
             && (self.groups.len() >= PARALLEL_MIN_UNIQUE_ROWS
-                || (independent_batch && self.groups.len() > 1));
+                || ((independent_batch || multirow_span)
+                    && self.groups.len() >= self.gather_threads * 2)
+                || (self.single_row_parallel
+                    && !independent_batch
+                    && !multirow_span
+                    && self.groups.len() >= self.gather_threads * 2));
         let work_t0 = profile.then(std::time::Instant::now);
         let table: &[u8] = &self.table;
         let requests = &self.requests;
@@ -416,11 +424,11 @@ impl WorkerState {
         let row_bytes = self.row_bytes;
         let row_dim = self.row_dim;
         if parallel {
-            let task_count = if independent_batch {
-                self.gather_threads.min(spans.len()).min(groups.len())
-            } else {
-                self.gather_threads.min(groups.len())
-            };
+            // Row groups own disjoint output ranges, so an independent multi-slot batch is not
+            // limited by its number of request spans. Capping this at spans.len() left a two-slot
+            // decode using only two workers from the four-thread pool, even with dozens of row
+            // groups ready to gather.
+            let task_count = self.gather_threads.min(groups.len());
             let groups_per_task = groups.len().div_ceil(task_count);
             self.gather_pool.install(|| {
                 groups

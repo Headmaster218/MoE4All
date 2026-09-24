@@ -53,20 +53,20 @@ float qread(uint i) {
 }
 
 #ifdef KV_SEGMENTED
-uint64_t k_segment_address(uint elem) {
+uint64_t k_segment_address(uint segment) {
     uvec2 address = uvec2(0u);
     if (subgroupElect()) {
-        address = k_segments[kv_segment(elem, pc.segment_shift)];
+        address = k_segments[segment];
     }
     address.x = subgroupBroadcastFirst(address.x);
     address.y = subgroupBroadcastFirst(address.y);
     return kv_segment_base(address);
 }
 
-uint64_t v_segment_address(uint elem) {
+uint64_t v_segment_address(uint segment) {
     uvec2 address = uvec2(0u);
     if (subgroupElect()) {
-        address = v_segments[kv_segment(elem, pc.segment_shift)];
+        address = v_segments[segment];
     }
     address.x = subgroupBroadcastFirst(address.x);
     address.y = subgroupBroadcastFirst(address.y);
@@ -182,16 +182,26 @@ void main() {
 
     float local_max = -3.402823466e+38;
     float local_sum = 0.0;
+#ifdef KV_SEGMENTED
+    uint segment_elems = 1u << pc.segment_shift;
+    uint cached_segment = 0xffffffffu;
+    uint64_t k_address = 0ul;
+    uint64_t v_address = 0ul;
+#endif
     for (uint logical = subgroup; logical < keys; logical += SUBGROUPS) {
         uint src_row = source_row(row, logical, selected, complete);
         uint kbase = (src_row * pc.n_kv + kv_head) * pc.head_dim;
 #ifdef KV_SEGMENTED
         // A physical segment contains whole 32K-token rows, so one selected KV row never crosses
-        // its boundary. Resolve each table entry once per wave instead of once per element.
-        uint segment_elems = 1u << pc.segment_shift;
+        // its boundary. Selected blocks are chronological, so retain both table entries until the
+        // wave advances into another segment instead of resolving them again for every key.
+        uint segment = kv_segment(kbase, pc.segment_shift);
+        if (segment != cached_segment) {
+            k_address = k_segment_address(segment);
+            v_address = v_segment_address(segment);
+            cached_segment = segment;
+        }
         uint local_base = kv_segment_local(kbase, pc.segment_shift);
-        uint64_t k_address = k_segment_address(kbase);
-        uint64_t v_address = v_segment_address(kbase);
 #endif
         float dot = 0.0;
         for (uint component = 0u; component < 8u; ++component) {
@@ -206,8 +216,13 @@ void main() {
         }
         float score = subgroupAdd(dot) * pc.scale;
         float next_max = max(local_max, score);
-        float previous_scale = local_sum == 0.0 ? 0.0 : exp(local_max - next_max);
-        float value_scale = exp(score - next_max);
+        float previous_scale = 1.0;
+        float value_scale = 1.0;
+        if (score > local_max) {
+            previous_scale = local_sum == 0.0 ? 0.0 : exp(local_max - score);
+        } else {
+            value_scale = exp(score - local_max);
+        }
         local_sum = local_sum * previous_scale + value_scale;
         for (uint component = 0u; component < 8u; ++component) {
             uint d = lane + component * SUBGROUP_WIDTH;

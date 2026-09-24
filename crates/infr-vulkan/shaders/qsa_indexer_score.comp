@@ -1,6 +1,7 @@
 #version 460
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
 #ifdef KV_SEGMENTED
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
@@ -47,18 +48,30 @@ float qread(uint i) {
     return unpackHalf2x16(h).x;
 }
 
-float block_read(uint i) {
 #ifdef KV_SEGMENTED
-    uint local = kv_segment_local(i, pc.block_shift);
-    uint64_t base = kv_segment_base(block_segments[kv_segment(i, pc.block_shift)]);
-    return kv_f32(base, local);
-#else
-    return block_k[i];
-#endif
+uint64_t block_segment_address(uint segment) {
+    uvec2 address = uvec2(0u);
+    if (subgroupElect()) {
+        address = block_segments[segment];
+    }
+    address.x = subgroupBroadcastFirst(address.x);
+    address.y = subgroupBroadcastFirst(address.y);
+    return kv_segment_base(address);
 }
+
+float block_read_local(uint64_t base, uint local) {
+    return kv_f32(base, local);
+}
+#else
+float block_read(uint i) {
+    return block_k[i];
+}
+#endif
 
 void main() {
     uint t = gl_LocalInvocationID.x;
+    uint sg = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
     uint row_base = gl_WorkGroupID.y * QUERY_TILE;
     uint block_base = gl_WorkGroupID.x * BLOCK_TILE;
     uint max_blocks = pc.kv_len / pc.ratio;
@@ -72,6 +85,32 @@ void main() {
             ? qread((row * pc.n_head + h) * pc.head_dim + d)
             : 0.0;
     }
+#ifdef KV_SEGMENTED
+#ifdef QSA_SCORE_DECODE8
+    uint load_bs = sg;
+    uint d_base = 0u;
+    const uint LOAD_COMPONENTS = 4u;
+#else
+    uint load_bs = sg >> 1u;
+    uint d_base = (sg & 1u) * 64u;
+    const uint LOAD_COMPONENTS = 2u;
+#endif
+    uint load_block = block_base + load_bs;
+    if (load_block < max_blocks) {
+        uint elem = load_block * pc.head_dim;
+        uint64_t base = block_segment_address(kv_segment(elem, pc.block_shift));
+        uint local_base = kv_segment_local(elem, pc.block_shift);
+        for (uint component = 0u; component < LOAD_COMPONENTS; ++component) {
+            uint d = d_base + lane + component * 32u;
+            ktile[load_bs][d] = block_read_local(base, local_base + d);
+        }
+    } else {
+        for (uint component = 0u; component < LOAD_COMPONENTS; ++component) {
+            uint d = d_base + lane + component * 32u;
+            ktile[load_bs][d] = 0.0;
+        }
+    }
+#else
     for (uint i = t; i < BLOCK_TILE * 128u; i += 256u) {
         uint d = i & 127u;
         uint bs = i >> 7u;
@@ -80,9 +119,9 @@ void main() {
             ? block_read(block * pc.head_dim + d)
             : 0.0;
     }
+#endif
     barrier();
 
-    uint sg = gl_SubgroupID;
     uint qr = sg / BLOCK_TILE;
     uint bs = sg % BLOCK_TILE;
     uint row = row_base + qr;
@@ -91,8 +130,22 @@ void main() {
     uint visible = pc.kv_len - pc.rows + row + 1u;
     if (block >= visible / pc.ratio) { return; }
 
-    uint lane = gl_SubgroupInvocationID;
     float score = 0.0;
+#ifdef QSA_SCORE_H4
+    vec4 part = vec4(0.0);
+    for (uint d = lane; d < 128u; d += 32u) {
+        float key = ktile[bs][d];
+        part += vec4(
+            qtile[qr][0][d],
+            qtile[qr][1][d],
+            qtile[qr][2][d],
+            qtile[qr][3][d]
+        ) * key;
+    }
+    vec4 heads = subgroupAdd(part);
+    score = max(heads.x, 0.0) + max(heads.y, 0.0)
+        + max(heads.z, 0.0) + max(heads.w, 0.0);
+#else
     for (uint h = 0u; h < pc.n_head; ++h) {
         float part = 0.0;
         for (uint d = lane; d < pc.head_dim; d += 32u) {
@@ -100,6 +153,7 @@ void main() {
         }
         score += max(subgroupAdd(part), 0.0);
     }
+#endif
     if (lane == 0u) {
         scores[row * max_blocks + block] = score * pc.scale;
     }

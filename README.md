@@ -1,141 +1,178 @@
 # MoE4All
 
-只需约 10 MiB，Windows 免安装，拖入模型即下即用！
+**让游戏显卡跑起远超显存容量的大模型。AMD、NVIDIA、Intel，均已跑通。**
 
-**让 A 卡用户也能在本地运行大型 MoE AI**
-*Making huge MoE LLMs accessible to AMD users.*
+Windows 免安装，程序 13 MiB。下载 GGUF、选择自动配置，即可本地聊天，
+或通过 OpenAI 兼容接口接入现有客户端。显存、内存与 SSD 协同加载 MoE 专家权重。
 
-[下载最新版 Windows 程序](https://github.com/Headmaster218/MoE4All/releases/latest) |
-[快速开始](GETTING_STARTED.md) |
+**0.8.0 发布实测**：RX 7900 XTX 24 GiB + 64 GiB DDR4，自动配置：激进性能。
+下表为实测生成速度，单位 tok/s；完整配置与分段结果见[实测结果](#实测结果)。
+
+| 主推模型与量化 | MTP | 20K 输入 | 150K 输入 |
+| --- | --- | ---: | ---: |
+| **Qwen3.6-35B-A3B · APEX-I-Balanced** | 关闭 | **65.6** | **39.9** |
+| **Qwen3.8-Flash-Next · AD-4.27bpw-Q4_K_M-M64** | 开启 | **60.2** | **48.1** |
+
+[下载已发布的 Windows 版本](https://github.com/Headmaster218/MoE4All/releases/latest) |
+[快速使用](#快速使用) |
+[实测结果](#实测结果) |
+[社区实测](#社区实测) |
 [English](README_EN.md) |
-[技术文档](https://github.com/Headmaster218/MoE4All/blob/main/docs/README.md)
+[技术文档](docs/README.md)
 
-MoE4All 是一个面向 AMD 显卡和 Windows 11 的本地大模型运行项目。它让
-MoE 模型的专家权重按需在显存、内存和 SSD 之间流动，因此模型不必全部塞进
-显存，也能在消费级 A 卡上运行。
+## 快速使用
 
-无需理解分页、KV Cache 或 Vulkan。下载发布包，准备好 GGUF 模型，
-双击启动向导并选择“自动配置：保守”，就可以开始聊天；确认机器余量充足后可改用
-“自动配置：激进性能”。
+### 1. 下载程序
 
-> 当前主要开发和实测平台是原生 Windows 11、AMD Radeon RX 7900 XTX 和
-> Vulkan。其他 Vulkan GPU 可能可用，但不是 MoE4All 当前的重点验证平台。
+打开 [MoE4All Releases](https://github.com/Headmaster218/MoE4All/releases)，
+下载对应版本的 `MoE4All-Windows-x86_64-v*.zip`。本页新功能与实测对应待发布的 **0.8.0**。
 
-## 0.7.0：视觉、并发服务与 SSD 会话缓存
 
-0.7.0 在完整 Qwen3.8-Flash-Next 文本路径上增加了原生 Vulkan 视觉推理、并发请求
-调度和可持久化会话 K/V。Q2_K_XL、IQ4_XS 与 Q4_K_M 均已在 Windows 11 上完成
-实测，大模型可以在受限进程 RAM 预算下继续从 SSD 分页运行。
+### 2. 解压
 
-- **视觉聊天**：加载匹配的 `mmproj*.gguf`，通过标准 OpenAI image content parts
-  输入图片；相同图片可复用解码后的 embedding，同一多模态会话可复用驻留 K/V。
-- **并发服务**：`infr serve --parallel N` 使用独立 K/V 槽，并对兼容的 Qwen3.8
-  prefill、decode、PLE 与采样工作进行批处理；终端表格显示每个槽位的实时状态和速度。
-- **SSD 会话缓存**：启用后，空闲的动态 Q8 K/V 会话可写入带校验的 SSD 缓存，
-  并在进程重启后恢复。默认上限为 5 GiB，保留 24 小时，正常退出时会主动保存驻留会话。
-- **推理控制**：终端和 OpenAI 兼容 API 支持模型默认、开关思考以及原生
-  `reasoning_effort`。
+将 ZIP **完整解压**到一个目录，例如 `D:\MoE4All`。
 
-当前稳定分支的代表性 Qwen3.8 成绩如下。测试主机为 RX 7900 XTX 24 GiB、
-Ryzen 5 5600X、64 GiB DDR4；两项均使用 Q8 K/V 和 `ubatch=3072`：
+### 3. 下载 GGUF 模型
 
-| 模型与负载 | 关键条件 | 结果 |
-| --- | --- | ---: |
-| IQ4_XS，131K synthetic depth 后 prefill 3,072 | 49.33 GiB 专家 RAM cache，3 次平均 | **750.7 tok/s** |
-| Q4_K_M 4.27 bpw，32K + 8K 错峰双路 decode | 24 GiB VRAM + 48 GiB RAM，间隔 8 秒，6 次平均 | **56.9 tok/s 合计** |
+当前版本围绕以下两种量化进行优化与实测，建议直接使用对应文件。模型单独下载到本地 SSD。
 
-更多历史稳定成绩与测试条件见[实测结果](#实测结果)和
-[Windows 本地大模型代表性性能记录](docs/perf/windows-local-model-matrix-20260829.md)。
-Decode 仍会随上下文长度、并发形态和专家 RAM/SSD 覆盖率变化。
+| 模型 / 组件 | 下载链接 | 文件与用途 |
+| --- | --- | --- |
+| **Qwen3.6 35B 本体** | [下载 APEX-I-Balanced](https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/resolve/main/Qwen3.6-35B-A3B-APEX-I-Balanced.gguf?download=true) | `Qwen3.6-35B-A3B-APEX-I-Balanced.gguf`；35B 下载这一个文件即可 |
+| **Flash-Next 主模型** | [下载 AD-4.27bpw-Q4_K_M-M64 全部分片](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/tree/main/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64) | 该目录下的 **33 个 GGUF 分片**，全部放在同一文件夹 |
+| **Flash-Next 视觉** | [下载 F16 视觉文件](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/mmproj-Qwen3.8-Flash-Next-F16.gguf?download=true) | `mmproj-Qwen3.8-Flash-Next-F16.gguf`；图片理解时加载 |
+| **Flash-Next MTP** | [下载 shared Q4_K_M MTP 头](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf?download=true) | `mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf`；本页实测使用的文本加速组件 |
 
-## 三步开始
+Flash-Next 启动时选择第一片：`Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00033.gguf`。
+视觉与 MTP 文件可放在主模型目录，在向导中按用途选择。
 
-### 1. 下载
+### 4. 运行
 
-打开 [最新 Release](https://github.com/Headmaster218/MoE4All/releases/latest)，
-下载 `MoE4All-Windows-x86_64-v*.zip` 并完整解压。
+1. 双击解压目录中的 **`Start-INFR-Wizard.cmd`**。
+2. 选择“终端聊天”或“OpenAI 兼容 API”，将主模型 GGUF 拖入窗口，按 Enter。
+3. 选择自动配置档位：**激进性能**是本页实测使用的档位；**保守**适合首次试运行或后台程序较多时使用。
+4. 上下文留空由引擎自动确定，确认启动。复现实测时，20K 输入设置 `32768`，150K 输入设置 `163840`。
 
-发布包已经包含 `infr.exe` 和中英双语启动向导。运行发布版不需要安装 Rust、
-Visual Studio 或 Vulkan SDK，只需要正常的 64 位 AMD 显卡驱动及其 Vulkan
-运行时。
+自动档默认使用 Q8 K/V，显存、内存、专家缓存与 Ubatch 由引擎规划。
+35B 加载本体即可聊天。Flash-Next 可按用途选择：
 
-### 2. 准备模型
+- **文本 MTP 加速**：启用“Qwen3.8 MTP 单路加速”，选择上表的 MTP 头，验证宽度选 `4`。
+  使用 greedy（`temperature=0`）和单会话生成。
+- **图片理解**：选择 API 模式，MTP 选择关闭，启用“视觉图片理解”，选择上表的 F16 视觉文件。
 
-模型需要是当前支持架构的 GGUF 文件，发布包不包含模型。分片 GGUF 的所有
-分片必须放在同一个目录；加载器可以从其中任意一片找到完整模型。
+API 默认地址为 `http://127.0.0.1:8080/v1`。完整配置项见[配置参考](docs/config.md)。
 
-建议第一次先用小模型确认环境，再尝试几十到上百 GiB 的大型 MoE。模型下载、
-分片和量化选择见[快速开始](GETTING_STARTED.md)。
+## 实测结果
 
-### 3. 启动
+### 0.8.0：Qwen3.8-Flash-Next，20K 与 150K 输入对照
 
-双击：
+两组都使用**自动配置：激进性能**。测试指定上下文、Q8 K/V 和采样方式，
+其余资源由引擎规划，最终自动选用 `ubatch=4096`。
 
-```text
-Start-INFR-Wizard.cmd
-```
+- **硬件与系统**：RX 7900 XTX 24 GiB、Ryzen 5 5600X、64 GiB DDR4、Windows 11。
+- **模型**：`Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64`；MTP 使用匹配的
+  `mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf`。
+- **共同设置**：Q8 K/V、greedy、关闭思考、单路生成、自动激进资源策略。
+- **上下文容量**：20K 输入使用 32K 容量；150K 输入使用 `ctx=163840`。
 
-选择终端聊天、OpenAI 兼容 API 或性能测试，然后输入或拖入 GGUF 路径。
-普通用户建议使用“自动配置：保守”：MoE4All 会探测 GPU、可用显存和系统内存，
-并自动规划 KV Cache、运行时空间和专家缓存。“激进性能”仍使用自动探测和硬性
-资源保护，但会减少部分 RAM/VRAM 余量，并尝试更大的 Ubatch 和 Submit cap。
+Prefill 为处理输入的速度，Decode 为全程生成速度，单位均为 tok/s。
 
-向导启动时会用很短的网络请求检查 GitHub Release；发现新版本时只显示下载
-链接，不会自动修改程序。断网不会阻止启动。
+| 测试负载 | 模式 | 20K Prefill | 20K Decode | 150K Prefill | 150K Decode |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 复杂问题 | MTP | 937 | **39.9** | 766 | **33.4** |
+| 复杂问题 | 无 MTP | 1,034 | **35.0** | 889 | **30.8** |
+| 简单问题（高接受率） | MTP | 936 | **60.2** | 769 | **48.1** |
+| 简单问题（高接受率） | 无 MTP | 1,035 | **37.7** | 888 | **32.4** |
+
+- **长输入下仍保持生成速度**：从 20K 增至 150K，各组全程 Decode 保留约 **80%–88%**。
+- **MTP 收益随内容变化**：复杂问题在 20K / 150K 时分别提速约 **14.0% / 8.4%**；
+  简单问题分别约 **59.7% / 48.5%**。
+- **输入与输出分别计时**：本组 MTP 的 Prefill 开销有所增加；整次请求耗时由输入处理
+  与输出生成两部分共同决定。
+
+<details>
+<summary>展开完整分段结果、MTP 接受率与长上下文变化</summary>
+
+以下速度单位均为 tok/s。中段指生成 token 的 25%–62.5%，后段为 62.5%–100%；
+Alpha 为 MTP 草稿接受率。
+
+| 输入规模 | 模式与负载 | Prefill | Decode 全程 | 中段 | 后段 | Alpha |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 20K | MTP 简单问题 | 936 | 60.2 | 61.4 | 61.3 | 0.994 |
+| 20K | MTP 复杂问题 | 937 | 39.9 | 42.0 | 39.7 | 0.594 |
+| 20K | 无 MTP 简单问题 | 1,035 | 37.7 | 38.6 | 37.8 | — |
+| 20K | 无 MTP 复杂问题 | 1,034 | 35.0 | 35.1 | 36.8 | — |
+| 150K | MTP 简单问题 | 769 | 48.1 | 49.2 | 46.8 | 0.979 |
+| 150K | MTP 复杂问题 | 766 | 33.4 | 35.5 | 34.3 | 0.642 |
+| 150K | 无 MTP 简单问题 | 888 | 32.4 | 32.0 | 32.9 | — |
+| 150K | 无 MTP 复杂问题 | 889 | 30.8 | 31.4 | 31.2 | — |
+
+实际输入长度：20K 简单问题 / 复杂问题为 **19,988 / 20,019** token；
+150K 简单问题 / 复杂问题为 **149,849 / 149,857** token。
+
+| 模式与负载 | 150K 相对 20K 的 Prefill 变化 | 全程 Decode 变化 |
+| --- | ---: | ---: |
+| MTP 简单问题 | -17.8% | -20.1% |
+| MTP 复杂问题 | -18.2% | -16.3% |
+| 无 MTP 简单问题 | -14.2% | -14.1% |
+| 无 MTP 复杂问题 | -14.0% | -12.0% |
+
+[20K 测试条件、结果与分析](docs/perf/qwen38-mtp-20k-comparison-20260924.md)。
+
+</details>
+
+### 0.8.0：Qwen3.6 35B · 无 MTP
+
+**复杂问题在 20K 输入下生成 59.1 tok/s，150K 输入下生成 39.0 tok/s。**
+
+- **模型**：`Qwen3.6-35B-A3B-APEX-I-Balanced`，不启用 MTP。
+- **硬件与系统**：与上组相同，RX 7900 XTX 24 GiB、Ryzen 5 5600X、64 GiB DDR4、Windows 11。
+- **测试条件**：同样使用自动配置的激进性能策略、Q8 K/V、greedy、关闭思考、单路生成。
+  20K 输入使用 32K 上下文容量，150K 输入使用 `ctx=163840`。
+
+Prompt 为实际输入 token 数；Prefill 与 Decode 的单位均为 tok/s。
+中段、后段分别为生成 token 的 25%–62.5%、62.5%–100%。
+
+| 输入规模 / 任务 | Prompt | Prefill | Decode 全程 | 中段 | 后段 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 20K 简单问题 | 20,041 | 2,484 | **65.6** | 66.7 | 66.8 |
+| 20K 复杂问题 | 20,049 | 2,421 | **59.1** | 59.5 | 62.6 |
+| 150K 简单问题 | 149,849 | 1,135 | **39.9** | 40.3 | 39.9 |
+| 150K 复杂问题 | 149,857 | 1,140 | **39.0** | 39.6 | 39.8 |
+
+## 社区实测
+
+**AMD、NVIDIA RTX 和 Intel Arc 均已有用户实测，具体配置与速度如下。**
+
+
+| GPU 与内存 | 模型与条件 | 生成速度 | 版本与来源 |
+| --- | --- | ---: | --- |
+| **AMD RX 7700 XT 12GB + 64GB RAM** | Ornith 1.5 35B-A3B，`serve`，131K 上下文容量 | **41.5–42.7 tok/s** | v0.5.2 社区基线，[PR #21](https://github.com/Headmaster218/MoE4All/pull/21) |
+| **Intel Arc A770 16GB + 64GB DDR4-3200** | Ornith 1.5 35B Q4_K_M，F16 KV，96K 上下文容量，REAL 负载三次测试 | **30.15–30.28 tok/s** | v0.6.0-beta.1，[Issue #41](https://github.com/Headmaster218/MoE4All/issues/41) |
+| **NVIDIA RTX 3090 Ti + 64GB RAM** | 社区成功运行反馈；原评论未注明模型、量化和上下文 | **约 29 tok/s** | 版本未注明，[B站用户反馈](https://www.bilibili.com/video/BV1ALha63Eyd/)（rpid `318146261056`） |
+
+
+欢迎在 [Discussions](https://github.com/Headmaster218/MoE4All/discussions) 分享成功配置，
+或通过 [Issues](https://github.com/Headmaster218/MoE4All/issues) 报告问题。
+附上 GPU/显存、RAM、系统与驱动、程序版本、模型量化、上下文、自动档位或启动命令，
+以及 Prefill/Decode 速度，就能帮助更多相同硬件的用户复现。
 
 ## 它能做什么
 
-- **让大模型跨显存运行**：按需使用 VRAM、RAM 和 SSD，不要求整个 MoE
-  模型常驻显存。
-- **原生 AMD Vulkan**：Windows 下不依赖 CUDA，也不要求通过 WSL 启动。
+- **让大模型跨显存运行**：按需使用 VRAM、RAM 和 SSD，协同缓存与加载 MoE 专家权重。
+- **Vulkan 推理**：在 Windows 下直接通过显卡驱动执行 Vulkan 计算；
+  AMD 主力验证，NVIDIA 与 Intel 已有社区实测。
 - **直接聊天**：终端中保持上下文进行多轮对话，可选择模型默认、开启或关闭
   思考模式。
 - **兼容现有客户端**：提供 OpenAI 兼容的聊天与 Embedding API。
 - **并发服务**：多个独立 K/V 槽可处理先后到达、上下文长度不同的请求。
 - **会话持久化**：可选的 SSD 缓存能转存空闲文本 K/V，并在服务重启后恢复。
 - **长上下文**：支持量化 KV Cache、KV 溢出和长上下文性能测试。
+- **Qwen3.8 MTP（0.8.0 预览）**：可选的单路投机解码，收益取决于草稿接受率，
+  使用方式见[快速使用](#快速使用)。
 - **可测量、可调试**：内置 prefill/decode benchmark、synthetic depth 和分页
   统计工具。
 
-## 需要什么
-
-| 项目     | 说明                                                        |
-| -------- | ----------------------------------------------------------- |
-| 操作系统 | 主要测试于 64 位 Windows 11                                 |
-| GPU      | 当前重点支持 AMD Vulkan；显存越大，可常驻的权重和 KV 越多   |
-| 驱动     | 安装 AMD 官方稳定驱动，`infr.exe devices` 应能看到显卡    |
-| 内存     | 大型 MoE 会利用系统 RAM；模型远大于 RAM 时可继续从 SSD 分页 |
-| 存储     | 建议高速本地 SSD，并为模型全部分片留足空间                  |
-| 模型     | 自备受支持架构的 GGUF，单文件或完整分片组                   |
-
-能运行多大的模型取决于模型量化、固定权重、上下文、显存、RAM 和 SSD。MoE4All
-的目标是尽量利用现有硬件，而不是承诺任意模型都能在任意 A 卡上达到同样速度。
-
-## 实测结果
-
-以下代表值来自 RX 7900 XTX 24 GiB、Ryzen 5 5600X、64 GiB DDR4、Windows 11
-主机的历史稳定测试。已排除进入系统分页的资源压力诊断结果；各行测试日期、模型量化、
-上下文和缓存条件不同，不能直接横向比较。
-
-| 模型与负载                                        | 关键条件                                    |                    结果 |
-| ------------------------------------------------- | ------------------------------------------- | ----------------------: |
-| Qwen3.8-Flash-Next IQ4_XS，131K 后 prefill 3,072 | Q8 K/V，49.33 GiB 专家 RAM cache，3 次平均  |  **750.7 tok/s** |
-| Qwen3.8-Flash-Next Q4_K_M，32K + 8K 双路 decode  | Q8 K/V，24+48 GiB，`ubatch=3072`，错峰 8 秒，6 次平均 | **56.9 tok/s 合计** |
-| Qwen3.6-35B-A3B，250K synthetic depth 后 decode   | Q8 K/V，生成 1,000 token                    |    **41.2 tok/s** |
-| Qwen3.6-35B-A3B，250K 后 prefill 4,096            | Q8 K/V                                      |   **477.9 tok/s** |
-| Qwen3.6-35B-A3B，depth 0 prefill 4,096            | Q8 K/V                                      | **2,855.6 tok/s** |
-| Qwen3.5-122B-A10B，depth 0 decode                 | F16 K/V，45 GiB bounded RAM，3 次重复       |    **23.2 tok/s** |
-| Qwen3.8-Flash-Next Q2_K_XL，250K 后 decode        | Q8 K/V，40 GiB bounded RAM，tg128，3 次平均 |   **22.82 tok/s** |
-| Qwen3.8-Flash-Next Q2_K_XL，250K 后 prefill 1,024 | Q8 K/V，40 GiB bounded RAM，3 次平均        |  **152.27 tok/s** |
-| Qwen3.8-Flash-Next IQ4_XS，250K 后 decode         | Q8 K/V，40 GiB bounded RAM，tg128，3 次平均 |   **15.26 tok/s** |
-| Qwen3.8-Flash-Next IQ4_XS，250K 后 prefill 1,024  | Q8 K/V，40 GiB bounded RAM，3 次平均        |  **239.00 tok/s** |
-
-完整条件和优化历史见：
-
-- [Windows 本地大模型代表性性能记录](docs/perf/windows-local-model-matrix-20260829.md)
-- [Qwen3.6 RX 7900 XTX 优化记录](https://github.com/Headmaster218/MoE4All/blob/main/docs/perf/qwen36-rx7900xtx-optimization-history-20260819.md)
-- [统一显存验收记录](https://github.com/Headmaster218/MoE4All/blob/main/docs/unified-vram-elastic-acceptance-20260824.md)
-- [DeepSeek V4 Flash 收尾记录](https://github.com/Headmaster218/MoE4All/blob/main/docs/perf/deepseek-v4-flash-rx7900xtx-closeout-20260824.md)
 
 ## 当前模型支持
 
@@ -151,75 +188,13 @@ Start-INFR-Wizard.cmd
 | DiffusionGemma          | `diffusion-gemma`                | 文本扩散推理                                                          |
 | Embedding GGUF          | 受支持的 Embedding 架构            | 原生 CPU/Vulkan OpenAI Embedding API                                  |
 
-同一架构上的微调模型通常可以直接复用现有实现，但 GGUF metadata、量化格式和
-chat template 仍必须完整。项目不会仅凭模型名称假定兼容。
+同一架构上的微调模型通常可以复用现有实现。兼容性取决于 GGUF metadata、
+量化格式与 chat template，模型文件应包含完整的推理元数据。
 
-## 三种日常用法
-
-### 终端聊天
-
-启动向导中选择“实时终端对话”，或者直接运行：
-
-```powershell
-.\infr.exe run 'D:\Models\model.gguf'
-```
-
-### OpenAI 兼容 API
-
-```powershell
-.\infr.exe serve --addr 127.0.0.1:8080 'D:\Models\model.gguf'
-```
-
-API Base URL 为 `http://127.0.0.1:8080/v1`。对局域网开放前请配置 API key，
-不要把无鉴权服务直接暴露到公网。
-
-#### Qwen3.8 视觉聊天
-
-将匹配的视觉 projector 放在文本模型旁边，启动向导可自动发现唯一的
-`mmproj*.gguf`；也可以直接指定：
-
-```powershell
-.\infr.exe serve --mmproj 'D:\Models\mmproj-Qwen3.8-Flash-Next-Q8_0.gguf' `
-  --addr 127.0.0.1:8080 'D:\Models\Qwen3.8-Flash-Next.gguf'
-```
-
-调用 `/v1/chat/completions` 时使用标准 OpenAI content parts，并将图片作为 data URI
-或裸 base64 放入 `image_url`：
-
-```json
-{
-  "model": "Qwen3.8-Flash-Next",
-  "messages": [{
-    "role": "user",
-    "content": [
-      {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}},
-      {"type": "text", "text": "请描述这张图片。"}
-    ]
-  }]
-}
-```
-
-当前原生视觉路径仅支持 Vulkan `qwen4exp`。为避免服务端代取 URL 带来的安全风险，
-不直接下载 HTTP(S) 图片；客户端应先编码图片。相同图片通过内容指纹复用预处理后的
-embedding，延续同一多模态会话时可复用驻留 K/V；多模态 K/V 暂不写入 SSD 冷缓存。
-
-### 性能测试
-
-```powershell
-# Prefill
-.\infr.exe bench -p 1024 -n 0 -r 1 'D:\Models\model.gguf'
-
-# Decode
-.\infr.exe bench -p 0 -n 128 -r 1 'D:\Models\model.gguf'
-```
-
-更多参数和“已有长上下文后再测”的 synthetic depth 用法见
-[快速开始](GETTING_STARTED.md)。
 
 ## 为什么能跑超过显存的模型
 
-大型 MoE 每个 token 通常只激活全部专家中的一小部分。MoE4All 不要求所有
-专家一直留在 GPU，而是维护三级存储：
+大型 MoE 每个 token 通常只激活全部专家中的一小部分。MoE4All 维护三级存储：
 
 ```text
 SSD 上的完整 GGUF
@@ -228,7 +203,7 @@ SSD 上的完整 GGUF
         ↓
 弹性 GPU expert cache
         ↓
-AMD Vulkan 计算
+Vulkan GPU 计算
 ```
 
 常用专家尽量留在显存，RAM 作为更大的热数据层，剩余内容继续由 SSD 提供。
@@ -239,27 +214,17 @@ prefill 与 decode 切换时可以重新分配弹性空间。
 [技术文档索引](https://github.com/Headmaster218/MoE4All/blob/main/docs/README.md) 和
 [MoE4All Wiki](https://github.com/Headmaster218/MoE4All/blob/main/infr-fork-wiki/README.md)。
 
-## 当前限制
-
-- 首次加载大型模型或 RAM cache 尚未预热时，SSD 读取可能让开头几轮明显变慢。
-- 大模型 prefill 的 SSD 到 RAM 异步预读仍有优化空间。
-- Host DMA 受 Windows 驱动可导入内存范围影响，未导入区域会自动回退到 CPU
-  写入 ReBAR。
-- 自动预算以“尽量可靠启动”为目标，不保证对每台机器都是最高吞吐配置。
-- 当前 Windows 发布包以命令行向导为主；浏览器 GUI 仍属于源码开发入口。
 
 ## 项目与署名
 
 MoE4All 由 John / [Headmaster218](https://github.com/Headmaster218) 维护。
 项目基于 kryptic.sh 的 Pure-Rust、Vulkan-first 推理引擎
 [infr](https://github.com/kryptic-sh/infr)。上游项目的原始说明请直接阅读
-[infr README](https://github.com/kryptic-sh/infr#readme)，不再在本仓库中重复
-嵌入。
+[infr README](https://github.com/kryptic-sh/infr#readme)。
 
 本项目的架构决策、性能调查和验收由维护者主导，并广泛使用 AI coding agents
 辅助 Rust、Vulkan、测试和文档工作。
 
 MoE4All 的修改与整体发行采用 [Apache License 2.0](LICENSE)。继承自上游
 infr 的代码保留其原始 [MIT License](LICENSE-MIT) 和版权声明；详细归属见
-[NOTICE](NOTICE)。同时保留两个许可证文件是为了分别说明本项目与上游代码的
-许可来源，并不表示用户必须在二者中二选一。
+[NOTICE](NOTICE)。两个许可证文件分别记录本项目与上游代码的许可来源。

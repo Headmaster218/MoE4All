@@ -738,8 +738,18 @@ fn main() {
         ("qsa_indexer_score", "qsa_indexer_score", &[]),
         (
             "qsa_indexer_score",
+            "qsa_indexer_score_h4",
+            &["-DQSA_SCORE_H4"],
+        ),
+        (
+            "qsa_indexer_score",
             "qsa_indexer_score_seg",
             &["-DKV_SEGMENTED"],
+        ),
+        (
+            "qsa_indexer_score",
+            "qsa_indexer_score_h4_seg",
+            &["-DKV_SEGMENTED", "-DQSA_SCORE_H4"],
         ),
         (
             "qsa_indexer_score",
@@ -748,8 +758,18 @@ fn main() {
         ),
         (
             "qsa_indexer_score",
+            "qsa_indexer_score_decode8_h4",
+            &["-DQSA_SCORE_DECODE8", "-DQSA_SCORE_H4"],
+        ),
+        (
+            "qsa_indexer_score",
             "qsa_indexer_score_decode8_seg",
             &["-DQSA_SCORE_DECODE8", "-DKV_SEGMENTED"],
+        ),
+        (
+            "qsa_indexer_score",
+            "qsa_indexer_score_decode8_h4_seg",
+            &["-DQSA_SCORE_DECODE8", "-DQSA_SCORE_H4", "-DKV_SEGMENTED"],
         ),
         ("qsa_indexer_topk", "qsa_indexer_topk", &[]),
         ("qsa_indexer_topk_hist", "qsa_indexer_topk_hist", &[]),
@@ -834,7 +854,9 @@ fn main() {
         ("deltanet_norm", "deltanet_norm", &[]),
         ("deltanet_gates_seq", "deltanet_gates_seq", &[]),
         ("deltanet_seq", "deltanet_seq", &[]),
+        ("deltanet_seq_trace", "deltanet_seq_trace", &[]),
         ("conv1d_silu", "conv1d_silu", &[]),
+        ("conv1d_silu_trace", "conv1d_silu_trace", &[]),
         ("conv1d_silu_par", "conv1d_silu_par", &[]),
         ("conv1d_shift", "conv1d_shift", &[]),
         ("copy_strided", "copy_strided", &[]),
@@ -1385,6 +1407,11 @@ fn main() {
         // Multi-row GEMV (m = 2..8: spec verify / short suffix prefill) — mainstream dense
         // projection formats only; the rest fall back to the tiled GEMM.
         ("native_gemv_mrow", "native_mrow_q8_0", &["-DFMT_Q8_0"]),
+        (
+            "native_gemv_mrow",
+            "native_mrow_q8_0_m2",
+            &["-DFMT_Q8_0", "-DMR=2"],
+        ),
         ("native_gemv_mrow", "native_mrow_bf16", &["-DFMT_BF16"]),
         ("native_gemv_mrow", "native_mrow_q4_0", &["-DFMT_Q4_0"]),
         ("native_gemv_mrow", "native_mrow_q4_1", &["-DFMT_Q4_1"]),
@@ -1728,8 +1755,8 @@ fn main() {
             &["-DFMT_IQ4XS", "-DPAGED"],
         ),
         // Qwen shared-expert decode: routed slots keep their native quant while the final slot
-        // reads one fixed Q8_0 shared-expert matrix by BDA. These are deliberately limited to the
-        // routed formats present in Qwen3.5/3.6 APEX-I models.
+        // reads one fixed Q8_0 shared-expert matrix by BDA. Keep the format set aligned with
+        // `paged_moe_shared_at`; Qwen3.8 uses IQ2_S/IQ4_NL/IQ3_S across its mixed-quant banks.
         (
             "native_gemv_id_multi",
             "native_idm_q5k_paged_shexp",
@@ -1744,6 +1771,21 @@ fn main() {
             "native_gemv_id_multi",
             "native_idm_iq4xs_paged_shexp",
             &["-DFMT_IQ4XS", "-DPAGED", "-DSHARED_Q8"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq4nl_paged_shexp",
+            &["-DFMT_IQ4NL", "-DPAGED", "-DSHARED_Q8"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_paged_shexp",
+            &["-DFMT_IQ2S", "-DUSE_GRID", "-DPAGED", "-DSHARED_Q8"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3s_paged_shexp",
+            &["-DFMT_IQ3S", "-DUSE_GRID", "-DPAGED", "-DSHARED_Q8"],
         ),
         (
             "native_gemv_id_multi",
@@ -1784,6 +1826,21 @@ fn main() {
             "native_gemv_id_multi",
             "native_idm_iq2s_paged",
             &["-DFMT_IQ2S", "-DUSE_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_nr2_paged",
+            &["-DFMT_IQ2S", "-DUSE_GRID", "-DNR=2", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_nr4_paged",
+            &["-DFMT_IQ2S", "-DUSE_GRID", "-DNR=4", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_nr8_paged",
+            &["-DFMT_IQ2S", "-DUSE_GRID", "-DNR=8", "-DPAGED"],
         ),
         (
             "native_gemv_id_multi",
@@ -1954,6 +2011,39 @@ fn main() {
             "native_gemv_id_multi_sg",
             "native_idm_iq3s_sg8_paged",
             &["-DFMT_IQ3S", "-DUSE_GRID", "-DNR=8", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_iq3s_sg2_paged_shexp",
+            &[
+                "-DFMT_IQ3S",
+                "-DUSE_GRID",
+                "-DNR=2",
+                "-DPAGED",
+                "-DSHARED_Q8",
+            ],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_iq3s_sg4_paged_shexp",
+            &[
+                "-DFMT_IQ3S",
+                "-DUSE_GRID",
+                "-DNR=4",
+                "-DPAGED",
+                "-DSHARED_Q8",
+            ],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_iq3s_sg8_paged_shexp",
+            &[
+                "-DFMT_IQ3S",
+                "-DUSE_GRID",
+                "-DNR=8",
+                "-DPAGED",
+                "-DSHARED_Q8",
+            ],
         ),
         // Qwen3.8's paged 2560x640 IQ2_XS gate/up banks: NR=8 stages the 4 KiB codebook once
         // for eight output rows. Both routed-only and routed+fixed-Q8-shared variants are kept;
@@ -3865,7 +3955,7 @@ fn main() {
             // BDA address and dispatch this STREAMED build directly (the old bound-SSBO resident
             // build is dead), same as linear_f16/linear_bf16 above. (e2b_proj — the per-layer PROJ
             // counterpart — is gone entirely: see the base builds list above.)
-            "conv1d_silu" | "conv1d_silu_par" | "e2b_gate" => true,
+            "conv1d_silu" | "conv1d_silu_trace" | "conv1d_silu_par" | "e2b_gate" => true,
             // The coopmat f16/repacked-quant projection GEMM (prefill C=A·Wᵀ): the quant arms ride
             // along on the shared WQ() seam — see gemm_proj.comp's STREAMED doc.
             "gemm_proj" | "gemm_proj_warp" => true,

@@ -38,6 +38,17 @@ void main() {
     uint blocks = (pc.kv_len - pc.rows + row + 1u) / pc.ratio;
     uint score_base = row * pc.max_blocks;
     uint dst_base = row * pc.top_k;
+
+    // A batch may straddle QSA's dense-to-sparse boundary. Before that boundary every
+    // complete block is retained, so preserve chronological order directly and skip a radix
+    // selection whose requested rank would exceed the number of candidates.
+    if (blocks <= pc.top_k) {
+        for (uint j = t; j < blocks; j += 256u) {
+            dst[dst_base + j] = j;
+        }
+        return;
+    }
+
     uint prefix_score = 0u;
     uint rank = pc.top_k;
 

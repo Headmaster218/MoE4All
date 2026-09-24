@@ -313,6 +313,7 @@ fn compile_shader(name: &str, source: &str) -> Vec<u32> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn create_buffer(
     instance: &ash::Instance,
     device: &ash::Device,

@@ -19,7 +19,6 @@ $requiredPaths = @(
     $launcherPath
     (Join-Path $PackageRoot 'README.md')
     (Join-Path $PackageRoot 'README_EN.md')
-    (Join-Path $PackageRoot 'GETTING_STARTED.md')
     (Join-Path $PackageRoot 'LICENSE')
     (Join-Path $PackageRoot 'LICENSE-MIT')
     (Join-Path $PackageRoot 'NOTICE')

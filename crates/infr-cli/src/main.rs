@@ -736,7 +736,17 @@ fn main() -> anyhow::Result<()> {
         sets: cli.set.clone(),
         flags: cli_flag_layer(&cmd)?,
     };
-    let cfg = Arc::new(Config::load(&overrides)?);
+    let mut cfg = Config::load(&overrides)?;
+    if let Some(frozen) = infr_core::hostmem::freeze_automatic_ram_budget(&mut cfg) {
+        tracing::info!(
+            auto_profile = %frozen.profile,
+            startup_available_host_bytes = ?frozen.startup_available_bytes,
+            total_host_bytes = ?frozen.total_bytes,
+            total_process_ram_budget_bytes = frozen.budget_bytes,
+            "automatic RAM budget frozen at process startup; applying explicit total-process budget semantics"
+        );
+    }
+    let cfg = Arc::new(cfg);
     install_shutdown_file_watcher(cfg.serve.shutdown_file.as_deref())?;
     publish_thread_count(&cfg);
     publish_profile_out(&cfg);
@@ -2411,6 +2421,7 @@ fn tool_parsing_allowed(tools: Option<&serde_json::Value>, tool_choice: Option<&
 /// concurrent calls therefore share nothing: that is what makes request A's `temperature` unable to
 /// leak into request B (the old thread-local could not offer that guarantee once one thread stepped
 /// several sequences).
+#[allow(clippy::too_many_arguments)]
 fn run_chat(
     be: &dyn GenBackend,
     messages: &[infr_engine::ChatMessage],
@@ -4506,6 +4517,7 @@ fn apply_model_sampling_defaults(
     Arc::new(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_serve(
     model: &str,
     mmproj: Option<&Path>,
@@ -4536,8 +4548,18 @@ fn cmd_serve(
     // (`infr_core::parse_size`, which is also what the `INFR_CTX` env layer parses).
     let is_dg = infr_llama::diffusion::is_diffusion_gemma(&gguf);
     let is_vulkan = !is_dg && matches!(selected_backend(cfg)?, Backend::Vulkan(_));
+    // Qwen3.8 MTP v1 owns one persistent target slot plus one fixed detached-head runtime. Route
+    // it through the serialized ChatModel adapter even when the selected device is Vulkan; the
+    // ordinary Vulkan serve path below is ParallelSeam and would otherwise bypass MTP entirely.
+    let serialized_vulkan_mtp = is_vulkan && cfg.spec.mtp && cfg.spec.draft.is_some();
     if mmproj.is_some() && !is_vulkan {
         anyhow::bail!("--mmproj currently requires the Vulkan qwen4exp serve path");
+    }
+    if serialized_vulkan_mtp && mmproj.is_some() {
+        anyhow::bail!("Qwen3.8 MTP v1 does not yet support vision requests");
+    }
+    if serialized_vulkan_mtp && embedding_model.is_some() {
+        anyhow::bail!("Qwen3.8 MTP v1 cannot host the embedding sidecar in the same process yet");
     }
     if let Some(path) = mmproj {
         if !path.is_file() {
@@ -4561,7 +4583,7 @@ fn cmd_serve(
     // ── the CONCURRENT path: dense/MoE/qwen35 on the Vulkan seam ────────────────────────────────
     // N KV slots off ONE weight upload, round-robin on the GPU at token granularity. This is the
     // default `infr serve` engine.
-    if is_vulkan {
+    if is_vulkan && !serialized_vulkan_mtp {
         let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
         // `--ctx` (or INFR_CTX) is the PER-SLOT window: an explicit token count is used verbatim,
         // a `%` is a fraction of the fitted per-slot context after all slot state is priced, and
@@ -4655,8 +4677,8 @@ fn cmd_serve(
     // CPU/Metal/diffusion serve would otherwise print a spurious "ignored" note.
     if matches!(parallel_explicit, Some(n) if n > 1) {
         tracing::warn!(
-            "note: --parallel {} ignored on the CPU/Metal/diffusion backends (no multi-slot \
-             engine); serving 1 request at a time. The Vulkan seam is the concurrent engine.",
+            "note: --parallel {} ignored on this serialized backend (CPU/Metal/diffusion or \
+             Qwen3.8 MTP v1); serving 1 request at a time.",
             parallel_explicit.unwrap()
         );
     }

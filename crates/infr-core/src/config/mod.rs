@@ -50,9 +50,9 @@ use partial::cfg_struct;
 
 /// Policy used when a resource or execution knob is left to automatic selection.
 ///
-/// Explicit values always win over this profile. `Conservative` is the shipped default and keeps
-/// the pre-profile behavior; `Aggressive` spends more of the measured RAM/VRAM headroom and lets
-/// startup calibration explore higher-throughput execution shapes.
+/// Explicit values always win over this profile. `Conservative` is the ordinary automatic mode:
+/// it sizes from live RAM/VRAM availability. `Aggressive` uses larger total-capacity targets and
+/// lets startup calibration explore higher-throughput execution shapes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AutoProfile {
     #[default]
@@ -93,8 +93,7 @@ cfg_struct! {
         /// `INFR_CTX`: context length (the shared size grammar).
         ctx: Option<SizeSpec> = None,
         /// `INFR_AUTO_PROFILE`: policy for values left on automatic selection. Explicit RAM/VRAM,
-        /// ubatch and submit-splitter values remain authoritative. The conservative default is the
-        /// behavior shipped before profiles were introduced.
+        /// ubatch and submit-splitter values remain authoritative.
         auto_profile: AutoProfile = AutoProfile::Conservative,
         /// `INFR_VRAM_BUDGET`: total device-memory budget for this backend. Unlike
         /// `paging.cache`, this includes resident weights, KV, runtime scratch and paging arenas.
@@ -109,7 +108,7 @@ cfg_struct! {
         /// budget, on top of the Vulkan allocator's built-in safety guard. Percentages resolve
         /// against total device-local memory.
         vram_reserve: Option<SizeSpec> = None,
-        /// `INFR_UBATCH`: prefill micro-batch rows. `None` = no usable value; the 1024 /
+        /// `INFR_UBATCH`: prefill micro-batch rows. `None` = no usable value; the profile /
         /// iGPU-adaptive fallback chain stays at its call site (R5).
         ubatch: Option<usize> = None,
         /// Was `INFR_UBATCH` / `--ubatch` supplied AT ALL, usable or not? The PRESENCE half of
@@ -123,7 +122,10 @@ cfg_struct! {
         /// resolved it here.
         ubatch_specified: bool = false,
         /// `INFR_UBATCH_PARALLEL`: prefill chunk for a sequence sharing the GPU (`serve -np N`).
-        ubatch_parallel: usize = 256,
+        ubatch_parallel: usize = 1024,
+        /// Whether the parallel-prefill chunk was explicitly configured. When it was not, parallel
+        /// prefill inherits the same profile/placement-selected chunk as a single request.
+        ubatch_parallel_specified: bool = false,
         /// `INFR_SUBMIT_DISPATCHES`: submit-splitter cap (`0` = never split). `None` = the
         /// measured `initial_submit_dispatch_cap(integrated)` default.
         submit_dispatches: Option<usize> = None,
@@ -293,6 +295,8 @@ cfg_struct! {
         sg_maxout: usize = 8192,
         /// `INFR_GEMV_SG_NR`.
         sg_nr: u32 = 2,
+        /// `INFR_GEMV_ID_GRID_NR`: output rows handled per 64-thread paged IQ id-GEMV workgroup.
+        id_grid_nr: u32 = 8,
         /// The selected GEMV variant, COMPUTED from two keys exactly as `GemvKnobs::resolve`
         /// does it: `INFR_NO_GEMV_REG` present ⇒ `None` (and it silently wins over
         /// `INFR_GEMV_VARIANT`); otherwise `INFR_GEMV_VARIANT`, else `Some("reg")`.
@@ -582,6 +586,8 @@ cfg_struct! {
             qkv_fuse: bool = true,
             /// `INFR_NO_GATED_RMSNORM` (inverted), ANDed with `caps.gated_rmsnorm` at the site.
             gated_rmsnorm: bool = true,
+            /// `INFR_NO_PLE_SINGLE_PAR` (inverted): use the persistent gather pool for one row.
+            ple_single_parallel: bool = true,
         }
     }
 }
@@ -598,6 +604,8 @@ cfg_struct! {
         mtp_reprime: bool = true,
         /// `INFR_NO_MTP_DRAFT_CHAIN` (inverted).
         mtp_draft_chain: bool = true,
+        /// `INFR_NO_MTP_PLE_OVERLAP` (inverted): run VERIFY layer 0 while PLE rows are gathered.
+        mtp_ple_overlap: bool = true,
         /// `INFR_SPEC_DRAFT`: draft-model path.
         draft: Option<PathBuf> = None,
         /// `INFR_SPEC_K`: draft-length upper bound.

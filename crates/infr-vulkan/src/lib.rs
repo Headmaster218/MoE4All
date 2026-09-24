@@ -267,12 +267,10 @@ impl VramInfo {
     /// Bytes a new device-local allocation may still take before [`VulkanBackend::check_vram_budget`]
     /// REFUSES it: this snapshot's free figure minus the guard's own [`GUARD_HEADROOM`].
     ///
-    /// **The ONE ceiling every sizing decision budgets against** — the context-fit math
-    /// (`SeamModel::kv_fit_ctx_fmt`) and the placement sweeps (`vulkan_moe_binder`'s residency /
-    /// streaming / MoE-expert budgets) all derive their budget from THIS function, so a planner
-    /// cannot place bytes the allocator will refuse. Budgeting against the raw `available` plans
-    /// 256 MiB past what can ever be handed out, which surfaces as an allocation failure
-    /// mid-prefill — the worst possible place to find out.
+    /// This is the physical foundation for every sizing decision. Automatic profile headroom and
+    /// explicit budget/reserve knobs are layered over it by `unified_vram_room_for_profile`, so a
+    /// planner and the allocation guard use the same final ceiling. Budgeting against raw
+    /// `available` would plan 256 MiB past even this mandatory guard.
     ///
     /// It is a method on the SNAPSHOT rather than on the backend so the seam's placement helpers
     /// are unit-testable without a GPU (they take a `VramInfo` and derive the ceiling themselves);
@@ -4680,9 +4678,10 @@ impl VulkanBackend {
     }
 
     /// Bytes a new device-local allocation may still take before [`check_vram_budget`] REFUSES it.
-    /// This is the smaller of the live physical room and the configured per-backend total budget,
-    /// after `device.vram_reserve` has been held aside. With both unified-budget knobs unset this is
-    /// exactly [`VramInfo::alloc_room`], preserving the historical behavior.
+    /// This is the smaller of live physical room and the configured/automatic per-backend target,
+    /// after any explicit `device.vram_reserve` has been held aside. With both explicit knobs unset,
+    /// the automatic profile retains 1 GiB of current free VRAM or caps the backend at total VRAM
+    /// minus 2 GiB.
     ///
     /// Sizing math must budget against this, not against `vram().available` — the guard enforces
     /// `used + want <= total - GUARD_HEADROOM`, so the last 256 MiB of "free" VRAM is reserved and
@@ -4697,12 +4696,13 @@ impl VulkanBackend {
     pub fn alloc_room(&self) -> u64 {
         let vram = self.vram();
         let tracked_used = self.shared.device_used.load(Ordering::Relaxed);
-        infr_core::budget::unified_vram_room(
+        infr_core::budget::unified_vram_room_for_profile(
             vram.total,
             backend_physical_alloc_room(vram, tracked_used),
             tracked_used,
             self.cfg.device.vram_budget,
             self.cfg.device.vram_reserve,
+            self.cfg.device.auto_profile,
         )
     }
 
@@ -5644,9 +5644,7 @@ impl VulkanBackend {
             }
 
             let mut pending = Vec::with_capacity(requests.len());
-            for ((buffer_idx, index, bytes), handle) in
-                requests.into_iter().zip(handles.into_iter())
-            {
+            for ((buffer_idx, index, bytes), handle) in requests.into_iter().zip(handles) {
                 let segment = self.unified_sub_buffer(handle, bytes)?;
                 let addr = segment
                     .device_addr()
@@ -6852,6 +6850,81 @@ impl Backend for VulkanBackend {
                 size: bytes as u64,
             };
             self.shared.device.cmd_copy_buffer(cmd, sb, db, &[region]);
+        })
+    }
+
+    fn copy_buffers(&self, copies: &[(&dyn Buffer, &dyn Buffer, usize)]) -> Result<()> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        let mut prepared = Vec::with_capacity(copies.len());
+        for &(src, dst, bytes) in copies {
+            let (s, d) = (as_vk_buf(src)?, as_vk_buf(dst)?);
+            check_extent("copy_buffers", "out of", bytes, s.size)?;
+            check_extent("copy_buffers", "into", bytes, d.size)?;
+            prepared.push((
+                s.buffer,
+                d.buffer,
+                s.sub_offset as u64,
+                d.sub_offset as u64,
+                bytes as u64,
+            ));
+        }
+        self.one_shot(move |cmd| unsafe {
+            for (src, dst, src_offset, dst_offset, size) in prepared {
+                self.shared.device.cmd_copy_buffer(
+                    cmd,
+                    src,
+                    dst,
+                    &[vk::BufferCopy {
+                        src_offset,
+                        dst_offset,
+                        size,
+                    }],
+                );
+            }
+        })
+    }
+
+    fn copy_buffer_ranges(
+        &self,
+        copies: &[(&dyn Buffer, usize, &dyn Buffer, usize, usize)],
+    ) -> Result<()> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        let mut prepared = Vec::with_capacity(copies.len());
+        for &(src, src_offset, dst, dst_offset, bytes) in copies {
+            let (s, d) = (as_vk_buf(src)?, as_vk_buf(dst)?);
+            let src_end = src_offset
+                .checked_add(bytes)
+                .ok_or_else(|| be("copy_buffer_ranges source range overflow"))?;
+            let dst_end = dst_offset
+                .checked_add(bytes)
+                .ok_or_else(|| be("copy_buffer_ranges destination range overflow"))?;
+            check_extent("copy_buffer_ranges", "out of", src_end, s.size)?;
+            check_extent("copy_buffer_ranges", "into", dst_end, d.size)?;
+            prepared.push((
+                s.buffer,
+                d.buffer,
+                s.sub_offset as u64 + src_offset as u64,
+                d.sub_offset as u64 + dst_offset as u64,
+                bytes as u64,
+            ));
+        }
+        self.one_shot(move |cmd| unsafe {
+            for (src, dst, src_offset, dst_offset, size) in prepared {
+                self.shared.device.cmd_copy_buffer(
+                    cmd,
+                    src,
+                    dst,
+                    &[vk::BufferCopy {
+                        src_offset,
+                        dst_offset,
+                        size,
+                    }],
+                );
+            }
         })
     }
 

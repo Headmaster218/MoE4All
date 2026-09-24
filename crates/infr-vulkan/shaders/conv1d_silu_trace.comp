@@ -1,0 +1,49 @@
+#version 460
+// Causal depthwise conv + SiLU with a row-by-row recurrent-state trace. Qwen3.8 speculative
+// VERIFY uses the trace to restore the state after the accepted prefix without replaying tokens.
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint rows; uint trace_rows; uint cc; uint kconv; uint arena_lo; uint arena_hi;
+} pc;
+
+layout(binding = 0) readonly buffer XB { float qkv[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ArenaW { float v[]; };
+uint64_t w_ptr = 0ul;
+#define WV(i) ArenaW(w_ptr).v[i]
+layout(binding = 2) buffer SB { float cstate[]; };
+layout(binding = 3) writeonly buffer OB { float outp[]; };
+layout(binding = 4) writeonly buffer TB { float trace[]; };
+
+void main() {
+    uint ch = gl_GlobalInvocationID.x;
+    if (ch >= pc.cc) {
+        return;
+    }
+    w_ptr = (uint64_t(pc.arena_hi) << 32) | uint64_t(pc.arena_lo);
+    uint km1 = pc.kconv - 1u;
+    uint state_elems = km1 * pc.cc;
+    for (uint tk = 0u; tk < pc.rows; tk++) {
+        float acc = 0.0;
+        for (uint k = 0u; k < km1; k++) {
+            acc += cstate[k * pc.cc + ch] * WV(ch * pc.kconv + k);
+        }
+        float cur = qkv[tk * pc.cc + ch];
+        acc += cur * WV(ch * pc.kconv + km1);
+        outp[tk * pc.cc + ch] = acc / (1.0 + exp(-acc));
+
+        for (uint k = 0u; k + 1u < km1; k++) {
+            cstate[k * pc.cc + ch] = cstate[(k + 1u) * pc.cc + ch];
+        }
+        if (km1 >= 1u) {
+            cstate[(km1 - 1u) * pc.cc + ch] = cur;
+        }
+        if (tk < pc.trace_rows) {
+            for (uint k = 0u; k < km1; k++) {
+                trace[tk * state_elems + k * pc.cc + ch] = cstate[k * pc.cc + ch];
+            }
+        }
+    }
+}

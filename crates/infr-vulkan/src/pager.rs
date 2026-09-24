@@ -364,7 +364,7 @@ impl GpuPager {
         }
         let mut slots: Vec<UnifiedSlot> = Vec::with_capacity(n_slots);
         let mut arenas: Vec<ArenaShard> = Vec::with_capacity(n_slots);
-        for slot in 0..n_slots {
+        for (slot, placement) in placements.iter().enumerate() {
             let allocation = pool
                 .claim_expert_slot(ExpertSlotId {
                     pool: pool_index,
@@ -372,7 +372,6 @@ impl GpuPager {
                 })
                 .ok_or_else(|| be("unified VRAM arena cannot claim a planned expert slot"))?;
             let range = allocation.range();
-            let placement = placements[slot];
             if (range.shard, range.offset, range.len)
                 != (placement.shard, placement.offset, placement.len)
             {
@@ -3418,7 +3417,8 @@ impl MoePagerSession {
         role_buf_ids: &[usize],
         local_id: u32,
     ) -> Result<PreparedHostPush> {
-        let mut by_pool: BTreeMap<usize, Vec<(usize, u32, Option<usize>, usize)>> = BTreeMap::new();
+        type PrefetchEntry = (usize, u32, Option<usize>, usize);
+        let mut by_pool: BTreeMap<usize, Vec<PrefetchEntry>> = BTreeMap::new();
         let mut seen = HashSet::with_capacity(role_buf_ids.len());
         for &buf_id in role_buf_ids {
             if !seen.insert(buf_id) {

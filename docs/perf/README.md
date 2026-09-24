@@ -26,6 +26,10 @@ headline.
 - **[vulkan-review.md](vulkan-review.md)** — multi-vendor review of the Vulkan
   backend: what is RDNA3-tuned versus genuinely portable, and the per-vendor
   gaps (Intel Arc, NVIDIA) that follow from it.
+- **[qwen38-mtp-20k-comparison-20260924.md](qwen38-mtp-20k-comparison-20260924.md)**
+  — Qwen3.8 Flash Next MTP versus ordinary decode with 20K actual input,
+  including Prefill, full and segmented Decode, acceptance rate, and the
+  automatic aggressive-profile resource plan.
 - **[deepseek-v4-flash-rx7900xtx-closeout-20260824.md](deepseek-v4-flash-rx7900xtx-closeout-20260824.md)**
   — DeepSeek V4 Flash bring-up and performance closeout: commit impact audit, retained and rejected
   optimizations, cache trace provenance, full-shadow decision and capacity simulations.

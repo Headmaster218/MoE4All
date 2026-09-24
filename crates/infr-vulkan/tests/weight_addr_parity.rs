@@ -305,6 +305,26 @@ fn mrow_offset_invariant() {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
+fn mrow_q8_two_rows_offset_invariant() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let (in_f, out_f, rows) = (256usize, 8usize, 2usize);
+    let c = run_case_offset_invariant(
+        &be,
+        "mrow Q8_0 rows=2 specialization".into(),
+        DType::Q8_0,
+        in_f,
+        out_f,
+        rows * out_f,
+        &|rec, addr, x, y| rec.linear_native_mrow_at(DType::Q8_0, addr, 0, x, y, rows, in_f, out_f),
+    );
+    assert_offset_invariant(&c);
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
 fn rm_offset_invariant() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");

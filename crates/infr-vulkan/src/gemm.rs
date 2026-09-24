@@ -136,7 +136,10 @@ pub(crate) fn native_streamed_build_spv(
 /// directly with an explicit arena address (`tests/weight_addr_parity.rs`). `None` for a dtype
 /// without an mrow build.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mrow_spv(dtype: infr_core::DType) -> Option<(&'static str, &'static [u32])> {
+pub(crate) fn native_mrow_spv(
+    dtype: infr_core::DType,
+    rows: usize,
+) -> Option<(&'static str, &'static [u32])> {
     use infr_core::DType::*;
     macro_rules! v {
         ($name:literal) => {{
@@ -149,21 +152,22 @@ pub(crate) fn native_mrow_spv(dtype: infr_core::DType) -> Option<(&'static str, 
             Some(($name, s))
         }};
     }
-    match dtype {
-        Q8_0 => v!("native_mrow_q8_0"),
-        Bf16 => v!("native_mrow_bf16"),
-        Q4_0 => v!("native_mrow_q4_0"),
-        Q4_1 => v!("native_mrow_q4_1"),
-        Q5_0 => v!("native_mrow_q5_0"),
-        Q5_1 => v!("native_mrow_q5_1"),
-        Q2K => v!("native_mrow_q2k"),
-        Q3K => v!("native_mrow_q3k"),
-        Q4K => v!("native_mrow_q4k"),
-        Q5K => v!("native_mrow_q5k"),
-        Q6K => v!("native_mrow_q6k"),
-        Iq4Nl => v!("native_mrow_iq4nl"),
-        Iq4Xs => v!("native_mrow_iq4xs"),
-        Q2_0 => v!("native_mrow_q2_0"),
+    match (dtype, rows) {
+        (Q8_0, 2) => v!("native_mrow_q8_0_m2"),
+        (Q8_0, _) => v!("native_mrow_q8_0"),
+        (Bf16, _) => v!("native_mrow_bf16"),
+        (Q4_0, _) => v!("native_mrow_q4_0"),
+        (Q4_1, _) => v!("native_mrow_q4_1"),
+        (Q5_0, _) => v!("native_mrow_q5_0"),
+        (Q5_1, _) => v!("native_mrow_q5_1"),
+        (Q2K, _) => v!("native_mrow_q2k"),
+        (Q3K, _) => v!("native_mrow_q3k"),
+        (Q4K, _) => v!("native_mrow_q4k"),
+        (Q5K, _) => v!("native_mrow_q5k"),
+        (Q6K, _) => v!("native_mrow_q6k"),
+        (Iq4Nl, _) => v!("native_mrow_iq4nl"),
+        (Iq4Xs, _) => v!("native_mrow_iq4xs"),
+        (Q2_0, _) => v!("native_mrow_q2_0"),
         _ => None,
     }
 }
@@ -388,6 +392,32 @@ pub(crate) fn native_idm_paged_build_spv(dtype: infr_core::DType) -> Option<&'st
     })
 }
 
+/// Multi-output-row 64-thread tree variant for paged IQ2_S. It keeps the established reduction
+/// order while amortizing one grid-codebook initialization across `nr` output rows.
+pub(crate) fn native_idm_grid_nr_paged_build_spv(
+    dtype: infr_core::DType,
+    nr: u32,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
+        }};
+    }
+    match (dtype, nr) {
+        (Iq2S, 2) => v!("native_idm_iq2s_nr2_paged"),
+        (Iq2S, 4) => v!("native_idm_iq2s_nr4_paged"),
+        (Iq2S, 8) => v!("native_idm_iq2s_nr8_paged"),
+        _ => None,
+    }
+}
+
 /// Hybrid paged-Qwen decode GEMV: routed slots use `dtype`, while the final slot reads a fixed
 /// dense Q8_0 shared-expert matrix. Kept separate from the ordinary paged table so unsupported
 /// graphs cannot accidentally select the larger push-constant ABI.
@@ -409,6 +439,9 @@ pub(crate) fn native_idm_paged_shared_build_spv(
     match dtype {
         Q5K => v!("native_idm_q5k_paged_shexp"),
         Q6K => v!("native_idm_q6k_paged_shexp"),
+        Iq2S => v!("native_idm_iq2s_paged_shexp"),
+        Iq3S => v!("native_idm_iq3s_paged_shexp"),
+        Iq4Nl => v!("native_idm_iq4nl_paged_shexp"),
         Iq4Xs => v!("native_idm_iq4xs_paged_shexp"),
         _ => None,
     }
@@ -637,6 +670,12 @@ pub(crate) fn native_idm_sg_paged_shared_build_spv(
         (Q5K, 2, true) => v!("native_idm_q5k_sg2_paged_shexp_sg16"),
         (Q5K, 4, true) => v!("native_idm_q5k_sg4_paged_shexp_sg16"),
         (Q5K, 8, true) => v!("native_idm_q5k_sg8_paged_shexp_sg16"),
+        (Iq3S, 2, false) => v!("native_idm_iq3s_sg2_paged_shexp"),
+        (Iq3S, 4, false) => v!("native_idm_iq3s_sg4_paged_shexp"),
+        (Iq3S, 8, false) => v!("native_idm_iq3s_sg8_paged_shexp"),
+        (Iq3S, 2, true) => v!("native_idm_iq3s_sg2_paged_shexp_sg16"),
+        (Iq3S, 4, true) => v!("native_idm_iq3s_sg4_paged_shexp_sg16"),
+        (Iq3S, 8, true) => v!("native_idm_iq3s_sg8_paged_shexp_sg16"),
         (Iq2Xs, 8, false) => v!("native_idm_iq2xs_sg8_paged_shexp"),
         (Iq2Xs, 8, true) => v!("native_idm_iq2xs_sg8_paged_shexp_sg16"),
         _ => None,
@@ -2017,6 +2056,8 @@ const DELTANET_NORM_SPV_BYTES: &[u8] =
 const DELTANET_GATES_SEQ_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_gates_seq.spv"));
 const DELTANET_SEQ_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_seq.spv"));
+const DELTANET_SEQ_TRACE_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_seq_trace.spv"));
 const CONV1D_SHIFT_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_shift.spv"));
 const COPY_STRIDED_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/copy_strided.spv"));
 const MUL_SIGMOID_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_sigmoid.spv"));
@@ -3357,9 +3398,19 @@ qsa_spv!(
     "qsa_indexer_compress_mrope_seg"
 );
 qsa_spv!(qsa_indexer_score_seg_spv, "qsa_indexer_score_seg");
+qsa_spv!(qsa_indexer_score_h4_spv, "qsa_indexer_score_h4");
+qsa_spv!(qsa_indexer_score_h4_seg_spv, "qsa_indexer_score_h4_seg");
 qsa_spv!(
     qsa_indexer_score_decode8_seg_spv,
     "qsa_indexer_score_decode8_seg"
+);
+qsa_spv!(
+    qsa_indexer_score_decode8_h4_spv,
+    "qsa_indexer_score_decode8_h4"
+);
+qsa_spv!(
+    qsa_indexer_score_decode8_h4_seg_spv,
+    "qsa_indexer_score_decode8_h4_seg"
 );
 qsa_spv!(qsa_gather_spv, "qsa_gather");
 qsa_spv!(qsa_gather_kq8_spv, "qsa_gather_kq8");
@@ -3437,6 +3488,13 @@ pub(crate) fn deltanet_seq_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(DELTANET_SEQ_SPV_BYTES))
 }
+
+/// MTP VERIFY twin of [`deltanet_seq_spv`] that snapshots recurrent state after every row.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn deltanet_seq_trace_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(DELTANET_SEQ_TRACE_SPV_BYTES))
+}
 /// SPIR-V for the CHUNKED gated-DeltaNet prefill (chunkwise delta rule, C=32).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn deltanet_chunked_spv() -> &'static [u32] {
@@ -3457,6 +3515,13 @@ pub(crate) fn conv1d_shift_spv() -> &'static [u32] {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn conv1d_silu_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_silu.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// MTP VERIFY conv1d variant that writes one post-row recurrent-state snapshot.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn conv1d_silu_trace_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_silu_trace.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }

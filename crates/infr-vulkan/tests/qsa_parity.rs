@@ -17,7 +17,7 @@ fn mrope_plane(pair: usize, sections: [usize; 4]) -> usize {
         1
     } else if sector % 3 == 2 && sector < 3 * sections[2] {
         2
-    } else if sector % 3 == 0 && sector < 3 * sections[0] {
+    } else if sector.is_multiple_of(3) && sector < 3 * sections[0] {
         0
     } else {
         3
@@ -374,7 +374,7 @@ fn multimodal_rope_and_qsa_use_distinct_position_planes() {
     rec.finish().unwrap();
     let mut got = vec![0u8; rows * nh * hd * 2];
     be.download(out.as_ref(), &mut got).unwrap();
-    for row in 0..rows {
+    for (row, &position) in positions.iter().enumerate().take(rows) {
         for head in 0..nh {
             let base = (row * nh + head) * hd;
             let mut want = xv[base..base + hd].to_vec();
@@ -384,7 +384,7 @@ fn multimodal_rope_and_qsa_use_distinct_position_planes() {
             for (value, &weight) in want.iter_mut().zip(&norm) {
                 *value *= inv * weight;
             }
-            rotate_half_in_place(&mut want, rope_dim, theta, positions[row], sections);
+            rotate_half_in_place(&mut want, rope_dim, theta, position, sections);
             for (d, &expected) in want.iter().enumerate() {
                 let expected = half::f16::from_f32(expected).to_f32();
                 let actual = h(&got, base + d);
@@ -513,9 +513,12 @@ fn qsa_batched_rows_match_causal_reference() {
         return;
     };
     let (rows, ratio, index_hd, index_heads, rope_dim, top) =
-        (3usize, 4usize, 128usize, 4usize, 64usize, 3usize);
+        (6usize, 4usize, 128usize, 4usize, 64usize, 3usize);
     let (n_head, n_kv, attn_hd) = (4usize, 2usize, 256usize);
-    let kv_len = 26usize;
+    // Visible lengths 13..=18 cross the top*ratio+ratio-1 == 15 dense-to-sparse
+    // boundary. The first three rows retain every complete block in chronological order;
+    // the final three exercise score-based top-k selection in the same dispatch.
+    let kv_len = 18usize;
     let max_blocks = kv_len / ratio;
     let theta = 10_000.0f32;
     let eps = 1e-6f32;

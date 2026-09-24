@@ -1884,7 +1884,7 @@ impl Backend for CpuBackend {
                             1
                         } else if sector % 3 == 2 && sector < 3 * section_widths[2] {
                             2
-                        } else if sector % 3 == 0 && sector < 3 * section_widths[0] {
+                        } else if sector.is_multiple_of(3) && sector < 3 * section_widths[0] {
                             0
                         } else {
                             3
@@ -2328,7 +2328,7 @@ impl Backend for CpuBackend {
                             1
                         } else if sector % 3 == 2 && sector < 3 * section_widths[2] {
                             2
-                        } else if sector % 3 == 0 && sector < 3 * section_widths[0] {
+                        } else if sector.is_multiple_of(3) && sector < 3 * section_widths[0] {
                             0
                         } else {
                             3
@@ -3958,6 +3958,7 @@ impl Backend for CpuBackend {
                     x,
                     weight: w,
                     state,
+                    state_trace: _,
                     dst,
                     rows,
                     channels,
@@ -4015,6 +4016,7 @@ impl Backend for CpuBackend {
                     a_coef,
                     dt_bias,
                     state,
+                    state_trace: _,
                     dst,
                     rows,
                     n_vhead,

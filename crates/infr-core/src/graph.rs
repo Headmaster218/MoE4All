@@ -1265,6 +1265,11 @@ pub enum Op {
         x: TensorId,
         weight: TensorId,
         state: TensorId,
+        /// Optional `[trace_rows, (kernel-1)*channels]` snapshots of the recurrent history after
+        /// each of the first `trace_rows <= rows` inputs. Qwen3.8 MTP VERIFY uses these to commit an
+        /// accepted prefix without replaying the target trunk. Ordinary decode/prefill leaves this
+        /// `None`.
+        state_trace: Option<TensorId>,
         dst: TensorId,
         rows: u32,
         channels: u32,
@@ -1290,6 +1295,10 @@ pub enum Op {
         a_coef: TensorId,
         dt_bias: TensorId,
         state: TensorId,
+        /// Optional `[trace_rows, n_vhead*head_k*head_v]` snapshots of `state` after each of the
+        /// first `trace_rows <= rows` inputs. This is populated only by speculative VERIFY so a
+        /// rejected suffix can restore the last accepted row directly instead of recomputing it.
+        state_trace: Option<TensorId>,
         dst: TensorId,
         rows: u32,
         n_vhead: u32,
@@ -1661,9 +1670,14 @@ impl Op {
                 x,
                 weight,
                 state,
+                state_trace,
                 dst,
                 ..
-            } => (vec![x, weight, state], vec![state, dst]),
+            } => {
+                let mut writes = vec![state, dst];
+                writes.extend(state_trace);
+                (vec![x, weight, state], writes)
+            }
             Op::DeltaNet {
                 q,
                 k,
@@ -1673,12 +1687,14 @@ impl Op {
                 a_coef,
                 dt_bias,
                 state,
+                state_trace,
                 dst,
                 ..
-            } => (
-                vec![q, k, v, b, a, a_coef, dt_bias, state],
-                vec![state, dst],
-            ),
+            } => {
+                let mut writes = vec![state, dst];
+                writes.extend(state_trace);
+                (vec![q, k, v, b, a, a_coef, dt_bias, state], writes)
+            }
             Op::Kda {
                 qkv,
                 forget,

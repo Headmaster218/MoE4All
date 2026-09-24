@@ -8,16 +8,17 @@ use super::sc::{
 use super::segmented_kv::{PlaneKind, SegmentedKvLayout};
 use super::weights::{
     alloc_segmented_plane, AttnW, DeltaW, Dsv4CompressedW, Dsv4CompressorW, Dsv4IndexerW, Dsv4W,
-    FfnW, HcTriple, IndexerW, KdaW, LayerHcW, LayerW, MixerW, MlaW, MoeSharedW, QsaW, QwenHcW,
-    QwenLayerHcW, QwenPleW, SeamKv, SeamWeights, SegmentedKvState, SessionStable,
-    TurnRecurrentCkpt,
+    FfnW, HcTriple, IndexerW, KdaW, LayerHcW, LayerW, MixerW, MlaW, MoeSharedW, MtpDeltaCkpt, QsaW,
+    QwenHcW, QwenLayerHcW, QwenMtpVerifyBuffers, QwenPleW, SeamKv, SeamWeights, SegmentedKvState,
+    SessionStable, TurnRecurrentCkpt,
 };
 use super::{
-    common_prefix_len, e2b_ipl_rows, kv_forces_static, BindWeight, TurnCheckpoint, WBytes,
+    common_prefix_len, e2b_ipl_rows, kv_forces_static, BindWeight, ParallelSampledOutput,
+    TurnCheckpoint, WBytes,
 };
 use crate::seam::TokenEmbd;
 use crate::{Config, EngineConfig, GenStats, PerLayerEmbd};
-use anyhow::{anyhow, Result as AResult};
+use anyhow::{anyhow, Context, Result as AResult};
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage};
 use infr_core::graph::{
     Activation, AttnMask, Dsv4CacheFormat, Graph, HyperGates, MoePrefetchHint, Op, SequenceSpan,
@@ -195,6 +196,55 @@ fn mrope_rows_are_plain_rope(
     true
 }
 
+fn full_mrope_positions(
+    plan: Option<&crate::seam::MropePlan>,
+    prompt_len: usize,
+    max_ctx: usize,
+) -> AResult<Vec<i32>> {
+    let mut positions = Vec::with_capacity(max_ctx * 4);
+    if let Some(plan) = plan {
+        let plan_prompt_len = plan.prompt_pos4.len() / 4;
+        if plan.prompt_pos4.len() % 4 != 0 || plan_prompt_len > prompt_len {
+            return Err(anyhow!(
+                "multimodal position table has {} values but the current sequence has only {prompt_len} tokens",
+                plan.prompt_pos4.len(),
+            ));
+        }
+        positions.extend_from_slice(&plan.prompt_pos4);
+        for token in plan_prompt_len..max_ctx {
+            let delta = i32::try_from(token - plan_prompt_len)
+                .map_err(|_| anyhow!("multimodal context exceeds i32 position range"))?;
+            let pos = plan
+                .decode_base
+                .checked_add(delta)
+                .ok_or_else(|| anyhow!("multimodal decode position overflow"))?;
+            positions.extend_from_slice(&[pos, pos, pos, 0]);
+        }
+    } else {
+        for token in 0..max_ctx {
+            let pos = i32::try_from(token)
+                .map_err(|_| anyhow!("text context exceeds i32 position range"))?;
+            positions.extend_from_slice(&[pos, pos, pos, 0]);
+        }
+    }
+    Ok(positions)
+}
+
+fn mrope_token_position(plan: Option<&crate::seam::MropePlan>, token: usize) -> AResult<i32> {
+    let Some(plan) = plan else {
+        return i32::try_from(token).map_err(|_| anyhow!("text position exceeds i32"));
+    };
+    let prompt_len = plan.prompt_pos4.len() / 4;
+    if token < prompt_len {
+        return Ok(plan.prompt_pos4[token * 4]);
+    }
+    let delta = i32::try_from(token - prompt_len)
+        .map_err(|_| anyhow!("multimodal decode position exceeds i32"))?;
+    plan.decode_base
+        .checked_add(delta)
+        .ok_or_else(|| anyhow!("multimodal decode position overflow"))
+}
+
 fn allocate_parallel_prefill_rows(available: &[usize], ubatch: usize) -> Vec<usize> {
     let mut rows = vec![0; available.len()];
     let mut budget = ubatch.min(available.iter().sum());
@@ -221,6 +271,21 @@ fn allocate_parallel_prefill_rows(available: &[usize], ubatch: usize) -> Vec<usi
         budget -= granted;
     }
     rows
+}
+
+/// Select the next QSA prefill lane. Large prefills intentionally run to completion one session
+/// at a time; decode is not inserted between them because the pager ring and expert residency are
+/// rebuilt at the prefill/decode boundary. Keeping one lane here also means prefill never needs the
+/// Vulkan independent multi-session attention workspace.
+fn parallel_prefill_group(
+    cursors: &[usize],
+    targets: &[usize],
+    qsa_threshold: usize,
+) -> Option<(bool, Vec<usize>)> {
+    debug_assert_eq!(cursors.len(), targets.len());
+    let lane = (0..cursors.len()).find(|&lane| cursors[lane] < targets[lane])?;
+    let sparse = cursors[lane].saturating_add(1) > qsa_threshold;
+    Some((sparse, vec![lane]))
 }
 
 fn parallel_prefill_progress(
@@ -434,6 +499,30 @@ fn bind_layer_io<'a>(
     }
 }
 
+fn bind_mtp_recurrent_traces<'a>(
+    b: &mut Bindings<'a>,
+    h: &DecodeHandles,
+    checkpoint: &'a Option<MtpDeltaCkpt>,
+) {
+    let Some(checkpoint) = checkpoint.as_ref() else {
+        debug_assert!(h.mtp_k_trace.iter().all(Option::is_none));
+        debug_assert!(h.mtp_v_trace.iter().all(Option::is_none));
+        debug_assert!(h.mtp_ple_trace.is_none());
+        return;
+    };
+    for (i, &layer) in checkpoint.layers.iter().enumerate() {
+        if let Some(id) = h.mtp_k_trace[layer] {
+            b.bind(id, checkpoint.trace_kbufs[i].as_ref());
+        }
+        if let Some(id) = h.mtp_v_trace[layer] {
+            b.bind(id, checkpoint.trace_vbufs[i].as_ref());
+        }
+    }
+    if let (Some(id), Some(buffer)) = (h.mtp_ple_trace, checkpoint.trace_ple_state.as_deref()) {
+        b.bind(id, buffer);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn bind_parallel_layer_io<'a>(
     b: &mut Bindings<'a>,
@@ -446,6 +535,7 @@ fn bind_parallel_layer_io<'a>(
     qsa_kbufs: &'a [Option<Box<dyn Buffer>>],
     qsa_cbufs: &'a [Option<Box<dyn Buffer>>],
     mrope_history_buf: &'a Option<Box<dyn Buffer>>,
+    peer_mrope_history_bufs: Option<&'a [Box<dyn Buffer>]>,
     wbufs: &'a [Box<dyn Buffer>],
     primary_wide: &'a Option<Box<dyn Buffer>>,
     primary_ple_embd: &'a Option<Box<dyn Buffer>>,
@@ -491,6 +581,30 @@ fn bind_parallel_layer_io<'a>(
             1,
             "a shared-row binding requires exactly one sequence lane"
         );
+    }
+    if let (Some(id), Some(peer_buffers)) = (h.mrope_history, peer_mrope_history_bufs) {
+        assert_eq!(
+            peer_buffers.len(),
+            peers.len(),
+            "each peer lane needs one MRoPE history buffer"
+        );
+        let rows = lanes
+            .iter()
+            .map(|&lane| {
+                if lane == 0 {
+                    mrope_history_buf
+                        .as_deref()
+                        .expect("MRoPE handle requires primary history")
+                } else {
+                    peer_buffers[lane - 1].as_ref()
+                }
+            })
+            .collect::<Vec<_>>();
+        if independent_rows {
+            b.bind_rows(id, rows);
+        } else {
+            b.bind(id, rows[0]);
+        }
     }
     for layer in 0..n_layer {
         let mut k_rows: Vec<&dyn Buffer> = Vec::with_capacity(lanes.len());
@@ -780,11 +894,9 @@ pub(super) struct DecodeHandles {
     // `None` for headless builds (`logits_rows == 0` — the batched-prefill chunks, whose logits
     // nothing consumes); `Some` everywhere else.
     logits: Option<TensorId>,
-    // MTP Phase 1 (issue #33, docs/mtp.md): the LM-head INPUT — the same rows `logits` was
-    // computed from, one op earlier (post-`output_norm`, pre-`w_lm`). `Some` only when `build`
-    // was called with `h_tap: true`; `None` for every ordinary caller (no extra op, no extra
-    // download). This is the primitive Phase 2's MTP head needs (`h_p` in `docs/mtp.md`'s forward
-    // pseudocode) — Phase 1 only exposes the tap, no head graph reads it yet.
+    // MTP target hidden output. This normally covers the rows projected by the LM head; Qwen3.8
+    // prompt prime deliberately taps every four-stream residual row while projecting only the
+    // frontier. `Some` only when `build` was called with `h_tap: true`.
     h_out: Option<TensorId>,
     // GPU embed gather (`use_ids` on `build`): the I32 token-id Input the driver binds instead
     // of uploading embedded f32 rows into `hidden` (which is then an Internal fed by the
@@ -805,6 +917,9 @@ pub(super) struct DecodeHandles {
     ple_state: Option<TensorId>,
     k_cache: Vec<TensorId>,
     v_cache: Vec<TensorId>,
+    mtp_k_trace: Vec<Option<TensorId>>,
+    mtp_v_trace: Vec<Option<TensorId>>,
+    mtp_ple_trace: Option<TensorId>,
     qsa_k_cache: Vec<Option<TensorId>>,
     qsa_block_cache: Vec<Option<TensorId>>,
     weights: Vec<TensorId>, // flat, in declaration == upload order
@@ -1061,6 +1176,7 @@ fn finish_pending_seam_slot(
         },
         ple_embd_buf: pending.ple_embd_buf,
         ple_state_buf: pending.ple_state_buf,
+        mtp_verify_bufs: None,
         max_ctx: want_ctx,
         kv_ring,
         cached: Vec::new(),
@@ -1080,6 +1196,7 @@ struct ParallelDecodeRequest<'a> {
     prompts: &'a [Vec<u32>],
     prompt_ends: &'a [usize],
     checkpoint_boundaries: &'a [Option<usize>],
+    mrope_plans: &'a [Option<&'a crate::seam::MropePlan>],
     peers: &'a mut [SeamKv],
     peer_outputs: &'a mut Vec<Vec<u32>>,
     prompt_secs: &'a mut Vec<f64>,
@@ -1147,6 +1264,56 @@ pub(crate) fn generate_dense_backend(
         mm,
         None,
         None,
+        false,
+    )
+}
+
+/// Prime Qwen3.8 MTP over every uncached prompt row while projecting only the frontier row
+/// through the vocabulary head. The detached head needs every target hidden row, but the driver
+/// consumes only the final target token prediction; computing `[m, vocab]` logits here wastes
+/// work and can exceed a Vulkan arena shard for a large prompt.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_dense_backend_verify_frontier(
+    be: &dyn Backend,
+    bind_weight: &BindWeight,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    prompt: &[u32],
+    state: &mut Option<SeamKv>,
+    want_ctx: usize,
+    verify: &mut Vec<f32>,
+    verify_ids: &mut Vec<u32>,
+    h_out: &mut Vec<f32>,
+    finish_fixed_allocations: Option<&dyn Fn() -> AResult<()>>,
+) -> AResult<(Vec<u32>, GenStats)> {
+    generate_dense_backend_inner(
+        be,
+        bind_weight,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        None,
+        prompt,
+        0,
+        |_| {},
+        state,
+        want_ctx,
+        None,
+        Some(verify),
+        Some(verify_ids),
+        None,
+        Some(h_out),
+        None,
+        None,
+        None,
+        finish_fixed_allocations,
+        None,
+        None,
+        None,
+        true,
     )
 }
 
@@ -1164,6 +1331,7 @@ pub(crate) fn generate_dense_backend_parallel_sampled(
     prompts: &[Vec<u32>],
     prompt_ends: &[usize],
     checkpoint_boundaries: &[Option<usize>],
+    mrope_plans: &[Option<&crate::seam::MropePlan>],
     max_steps: usize,
     primary: &mut Option<SeamKv>,
     peers: &mut [SeamKv],
@@ -1172,17 +1340,19 @@ pub(crate) fn generate_dense_backend_parallel_sampled(
     on_token: &mut dyn FnMut(usize, u32) -> bool,
     yield_requested: Option<&std::sync::atomic::AtomicBool>,
     req: Option<&crate::sampling::RequestCtx>,
-) -> AResult<(Vec<Vec<u32>>, Vec<f64>, Vec<f64>)> {
+) -> AResult<ParallelSampledOutput> {
     if prompts.len() != peers.len() + 1
         || prompt_ends.len() != prompts.len()
         || checkpoint_boundaries.len() != prompts.len()
+        || mrope_plans.len() != prompts.len()
         || samplers.len() != prompts.len()
     {
         return Err(anyhow!(
-            "parallel token step has {} prompts, {} prompt ends, {} checkpoints, {} slots and {} samplers",
+            "parallel token step has {} prompts, {} prompt ends, {} checkpoints, {} MRoPE plans, {} slots and {} samplers",
             prompts.len(),
             prompt_ends.len(),
             checkpoint_boundaries.len(),
+            mrope_plans.len(),
             peers.len() + 1,
             samplers.len()
         ));
@@ -1194,6 +1364,7 @@ pub(crate) fn generate_dense_backend_parallel_sampled(
         prompts,
         prompt_ends,
         checkpoint_boundaries,
+        mrope_plans,
         peers,
         peer_outputs: &mut peer_outputs,
         prompt_secs: &mut prompt_secs,
@@ -1224,9 +1395,10 @@ pub(crate) fn generate_dense_backend_parallel_sampled(
         None,
         req,
         None,
-        None,
+        mrope_plans[0],
         Some(&mut parallel),
         None,
+        false,
     )?;
     let mut outputs = Vec::with_capacity(prompts.len());
     outputs.push(first);
@@ -1294,6 +1466,7 @@ pub(crate) fn generate_dense_backend_parallel_prefill(
         None,
         None,
         Some(&mut parallel),
+        false,
     )?;
     let mut stats = Vec::with_capacity(prompts.len());
     stats.push(primary_stats);
@@ -1337,12 +1510,10 @@ fn generate_dense_backend_inner(
     // MoE-incompatible — see its guard below) this rides the existing rows==1 per-token loop, so
     // it works for MoE/diffusion-gemma models too.
     mut logits_out: Option<&mut Vec<f32>>,
-    // MTP Phase 1 (issue #33, docs/mtp.md): captures the LM-head INPUT rows (post-`output_norm`,
-    // pre-`w_lm` — `DecodeHandles::h_out`'s doc) for the SAME row(s) `logits_out`/`verify` came
-    // from: `[ne]` for the per-token decode loop's frontier row, `[m * ne]` for speculative
-    // VERIFY's `m` rows. `None` everywhere else (no extra op, no extra download — see `h_tap`'s
-    // doc on `build`). This is Phase 2's MTP driver primitive (`h_p` in `docs/mtp.md`); Phase 1
-    // only exposes it for validation (`lm_head(h_row) == logits_row`).
+    // MTP Phase 1 (issue #33, docs/mtp.md): captures the target hidden rows consumed by the MTP
+    // head. Ordinary decode captures the frontier row and speculative VERIFY captures all rows.
+    // Qwen3.8 prompt prime also captures all rows while projecting only its frontier through the
+    // vocabulary head. `None` everywhere else (no extra op or download).
     mut h_out: Option<&mut Vec<f32>>,
     // Phase-2 DiffusionGemma canvas denoise (see `DenoiseReq`'s doc). `None` everywhere else.
     denoise_req: Option<DenoiseReq>,
@@ -1365,8 +1536,9 @@ fn generate_dense_backend_inner(
     finish_fixed_allocations: Option<&dyn Fn() -> AResult<()>>,
     // Vision request plan. `None` keeps every existing text-only graph and upload unchanged.
     mm: Option<&crate::seam::MropePlan>,
-    mut parallel_decode: Option<&mut ParallelDecodeRequest<'_>>,
+    parallel_decode: Option<&mut ParallelDecodeRequest<'_>>,
     mut parallel_prefill: Option<&mut ParallelPrefillRequest<'_>>,
+    verify_frontier_only: bool,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
     let state_trace = ec.debug.state_trace;
@@ -1624,6 +1796,7 @@ fn generate_dense_backend_inner(
             }
             out
         };
+        let wload_count = std::cell::Cell::new(0usize);
         let mut wload = |names: &[&str]| -> AResult<()> {
             let info = |name: &str| {
                 g.tensors()
@@ -1761,9 +1934,11 @@ fn generate_dense_backend_inner(
             };
             // bind_weight returns the EFFECTIVE dtype the buffer holds (the GPU binder may convert float
             // weights to f16), so the graph declares the handle to match what the backend will read.
-            let (buf, eff_dt) = bind_weight(names[0], bytes, dt, numel)?;
+            let (buf, eff_dt) = bind_weight(names[0], bytes, dt, numel)
+                .with_context(|| format!("bind fixed weight `{}`", names[0]))?;
             wbufs.push(buf);
             wspecs.push((eff_dt, numel));
+            wload_count.set(wload_count.get() + 1);
             Ok(())
         };
         for l in 0..c.n_layer {
@@ -2088,6 +2263,7 @@ fn generate_dense_backend_inner(
         }
         // LM head = `output.weight`, or (tied) the quantized `token_embd.weight` mapped from the
         // mmap and dequantized per-row by `Op::Linear` — same f32 values as the host embedding.
+        let mtp_lm_head_index = wload_count.get();
         if g.tensors().iter().any(|t| t.name == "output.weight") {
             wload(&["output.weight"])?;
         } else {
@@ -2105,7 +2281,9 @@ fn generate_dense_backend_inner(
         // GPU embed gather: untied models upload the quantized token_embd as one extra weight
         // slot (tied models reuse the lm_head slot above — same tensor). Order-sensitive:
         // mirrors `build`'s `w_embd` wpush, right after `w_lm`.
+        let mut mtp_token_embd_index = mtp_lm_head_index;
         if gpu_embed && untied_lm {
+            mtp_token_embd_index = wload_count.get();
             wload(&["token_embd.weight"])?;
         }
         // gemma4-E2B on-device per-layer gather: the (large, quantized) per-layer token
@@ -2366,6 +2544,18 @@ fn generate_dense_backend_inner(
                 &[],
             )?;
         }
+        let mtp_delta_ckpt = if ec.spec.mtp && c.qwen4exp {
+            MtpDeltaCkpt::allocate_before_dynamic_kv(
+                be,
+                c,
+                &kbufs,
+                &vbufs,
+                ple_state_buf.as_deref(),
+                crate::mtp::DRAFT_TOKENS.saturating_sub(1),
+            )?
+        } else {
+            None
+        };
 
         // A paged serve engine must make every sibling slot's pool-external lifetime allocation
         // visible to the driver's live-budget query below. Their unified runtime storage is
@@ -2442,6 +2632,39 @@ fn generate_dense_backend_inner(
         } else {
             None
         };
+        let mtp_verify_bufs = if ec.spec.mtp && c.qwen4exp {
+            let rows = crate::mtp::DRAFT_TOKENS;
+            let h_width = c.hc_mult * ne;
+            let ple_row = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram * c.ple_head_dim;
+            Some(QwenMtpVerifyBuffers {
+                ids: be
+                    .alloc(rows * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?,
+                positions: be
+                    .alloc(rows * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?,
+                hidden: be
+                    .alloc_uninit(rows * ne * 4, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+                wide: be
+                    .alloc_uninit(rows * h_width * 4, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+                ple: be
+                    .alloc(rows * ple_row * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?,
+                logits: be
+                    .alloc(rows * c.vocab * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?,
+                h_out: be
+                    .alloc(rows * h_width * 4, BufferUsage::Readback)
+                    .map_err(|e| anyhow!("{e}"))?,
+                out_ids: be
+                    .alloc(rows * 4, BufferUsage::Readback)
+                    .map_err(|e| anyhow!("{e}"))?,
+            })
+        } else {
+            None
+        };
 
         if let Some(finish) = finish_fixed_allocations {
             finish()?;
@@ -2499,7 +2722,8 @@ fn generate_dense_backend_inner(
         } else {
             None
         };
-        let ple_worker = super::ple::PleWorker::new(g, c)?.map(std::sync::Arc::new);
+        let ple_worker = super::ple::PleWorker::new(g, c, ec.kernels.ple_single_parallel)?
+            .map(std::sync::Arc::new);
         let weights = std::sync::Arc::new(SeamWeights {
             wbufs,
             wspecs,
@@ -2508,6 +2732,8 @@ fn generate_dense_backend_inner(
             layer_has_epb,
             layer_fused_experts,
             ple_worker,
+            mtp_token_embd_index,
+            mtp_lm_head_index,
         });
         let mut preallocated_siblings = Vec::with_capacity(pending_siblings.len());
         for pending in pending_siblings {
@@ -2550,6 +2776,7 @@ fn generate_dense_backend_inner(
             qwen_wide_buf,
             ple_embd_buf,
             ple_state_buf,
+            mtp_verify_bufs,
             max_ctx: want_ctx,
             kv_ring,
             cached: Vec::new(),
@@ -2559,7 +2786,7 @@ fn generate_dense_backend_inner(
             sc_ping: None,
             sc_ping_write: 0,
             sc_temp_inv_buf: None,
-            mtp_delta_ckpt: None,
+            mtp_delta_ckpt,
             turn_recurrent_ckpt,
             preallocated_siblings,
         });
@@ -2637,6 +2864,7 @@ fn generate_dense_backend_inner(
     } else {
         None
     };
+    let mtp_trace = state.as_mut().and_then(SeamKv::mtp_take_delta_trace);
     let SeamKv {
         weights,
         // The session-stable derivations are already read via the `stable` local above (cloned
@@ -2656,6 +2884,7 @@ fn generate_dense_backend_inner(
         qwen_wide_buf,
         ple_embd_buf,
         ple_state_buf,
+        mtp_verify_bufs,
         max_ctx,
         cached,
         denoise_cache,
@@ -2664,7 +2893,7 @@ fn generate_dense_backend_inner(
         sc_ping,
         sc_ping_write,
         sc_temp_inv_buf,
-        mtp_delta_ckpt: _,
+        mtp_delta_ckpt,
         turn_recurrent_ckpt,
         preallocated_siblings: _,
         // The env-derived local `kv_ring` above is this same value on every call (stable env),
@@ -2680,6 +2909,7 @@ fn generate_dense_backend_inner(
         layer_has_epb,
         layer_fused_experts,
         ple_worker,
+        ..
     } = weights.as_ref();
     let max_ctx = *max_ctx;
     // In a parallel token call `max_new` is a step budget containing both the uncached prompt tail
@@ -2730,12 +2960,11 @@ fn generate_dense_backend_inner(
                 "multimodal RoPE is currently supported only by qwen4exp"
             ));
         }
-        if plan.prompt_pos4.len() != prompt.len() * 4 {
+        if plan.prompt_pos4.len() % 4 != 0 || plan.prompt_pos4.len() / 4 > prompt.len() {
             return Err(anyhow!(
-                "multimodal position table has {} values for {} prompt tokens (expected {})",
+                "multimodal position table has {} values but the current sequence has only {} tokens",
                 plan.prompt_pos4.len(),
                 prompt.len(),
-                prompt.len() * 4
             ));
         }
         if c.rope_sections.iter().sum::<u32>() == 0 {
@@ -2770,17 +2999,7 @@ fn generate_dense_backend_inner(
                 plan.decode_base
             ));
         }
-        let mut all_positions = Vec::with_capacity(max_ctx * 4);
-        all_positions.extend_from_slice(&plan.prompt_pos4);
-        for token in prompt.len()..max_ctx {
-            let delta = i32::try_from(token - prompt.len())
-                .map_err(|_| anyhow!("multimodal context exceeds i32 position range"))?;
-            let pos = plan
-                .decode_base
-                .checked_add(delta)
-                .ok_or_else(|| anyhow!("multimodal decode position overflow"))?;
-            all_positions.extend_from_slice(&[pos, pos, pos, 0]);
-        }
+        let all_positions = full_mrope_positions(Some(plan), prompt.len(), max_ctx)?;
         let _gp = req.and_then(|r| r.gate_pass());
         let buffer = be
             .alloc_uninit(all_positions.len() * 4, BufferUsage::Staging)
@@ -2923,10 +3142,11 @@ fn generate_dense_backend_inner(
         start
     };
     if state_trace {
-        let qsa_ratio = c
-            .qwen4exp
-            .then(|| c.compress_ratios.iter().copied().max().unwrap_or(4).max(1))
-            .unwrap_or(1);
+        let qsa_ratio = if c.qwen4exp {
+            c.compress_ratios.iter().copied().max().unwrap_or(4).max(1)
+        } else {
+            1
+        };
         tracing::warn!(
             "[state trace] cold_slot={} recurrent={} prompt={} cached_before={} common={} live_start={:?} checkpoint_attempted={} checkpoint_start={:?} path={} start_before_ring={} start={} checkpoint_boundary={:?} kv_ring={} segmented_kv={} qsa_ratio={} start_mod_qsa={} prompt_mod_qsa={} start_mod_32k={} prompt_mod_32k={}",
             state_was_cold,
@@ -3272,6 +3492,12 @@ fn generate_dense_backend_inner(
             let hist = (c.ple_conv_kernel - 1) * c.ple_ngram_size;
             g.input(f32d(hist * c.hc_mult * ne))
         });
+        let trace_recurrent = mtp_verify && mtp_trace.is_some_and(|(rows, _)| rows == batch);
+        let mtp_trace_rows = mtp_trace.map_or(0, |(_, trace_rows)| trace_rows);
+        let mtp_ple_trace = (trace_recurrent && span_has_ple).then(|| {
+            let hist = (c.ple_conv_kernel - 1) * c.ple_ngram_size;
+            g.input(f32d(mtp_trace_rows * hist * c.hc_mult * ne))
+        });
         let rope_freqs = rf_buf.as_ref().map(|(_, n)| g.input(f32d(*n)));
         // DeepSeek V2+ YaRN per-pair frequency divisors (qk_rope_dim/2 floats) — a per-step f32
         // Input like `rope_freqs` (uploaded once into `yff_buf`, rebound every execute).
@@ -3315,6 +3541,8 @@ fn generate_dense_backend_inner(
         // `generate_dense_backend` and `MixerW::DeltaNet`'s use of them below).
         let mut k_cache = Vec::new();
         let mut v_cache = Vec::new();
+        let mut mtp_k_trace = Vec::new();
+        let mut mtp_v_trace = Vec::new();
         let mut qsa_k_cache = Vec::new();
         let mut qsa_block_cache = Vec::new();
         for l in 0..c.n_layer {
@@ -3323,6 +3551,9 @@ fn generate_dense_backend_inner(
                 let s_elems = c.recurrent_state_elems();
                 k_cache.push(g.input(f32d(conv_elems)));
                 v_cache.push(g.input(f32d(s_elems)));
+                mtp_k_trace
+                    .push(trace_recurrent.then(|| g.input(f32d(mtp_trace_rows * conv_elems))));
+                mtp_v_trace.push(trace_recurrent.then(|| g.input(f32d(mtp_trace_rows * s_elems))));
                 qsa_k_cache.push(None);
                 qsa_block_cache.push(None);
                 continue;
@@ -3337,6 +3568,8 @@ fn generate_dense_backend_inner(
                     vec![layout.state_bytes.div_ceil(4)],
                     DType::U32,
                 )));
+                mtp_k_trace.push(None);
+                mtp_v_trace.push(None);
                 qsa_k_cache.push(None);
                 qsa_block_cache.push(None);
                 continue;
@@ -3349,6 +3582,8 @@ fn generate_dense_backend_inner(
             let rows_l = crate::seam::kv_rows(c, l, max_ctx, kv_ring, ec);
             k_cache.push(g.input(kd(crate::seam::kv_side_elems(rows_l * k_row))));
             v_cache.push(g.input(vd(crate::seam::kv_side_elems(rows_l * v_row))));
+            mtp_k_trace.push(None);
+            mtp_v_trace.push(None);
             qsa_k_cache.push(
                 (crate::seam::qsa_raw_cache_bytes(c, l, max_ctx) > 0)
                     .then(|| g.input(f16d(max_ctx * c.indexer_head_size))),
@@ -3731,24 +3966,24 @@ fn generate_dense_backend_inner(
         // hand-off. Keep an explicit directory so layer 0 can still name layer 1's router and
         // expert banks; it stays empty for prefill and every architecture without the validated
         // one-layer-ahead predictor.
-        let prefetch_targets: Vec<Option<(TensorId, TensorId, TensorId, TensorId, bool)>> =
-            if expert_prefetch && batch == 1 {
-                lw.iter()
-                    .map(|layer| match &layer.ffn {
-                        FfnW::Moe {
-                            router,
-                            gate_exps,
-                            up_exps,
-                            down_exps,
-                            fused_gate_up,
-                            ..
-                        } => Some((*router, *gate_exps, *up_exps, *down_exps, *fused_gate_up)),
-                        _ => None,
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+        type PrefetchTarget = (TensorId, TensorId, TensorId, TensorId, bool);
+        let prefetch_targets: Vec<Option<PrefetchTarget>> = if expert_prefetch && batch == 1 {
+            lw.iter()
+                .map(|layer| match &layer.ffn {
+                    FfnW::Moe {
+                        router,
+                        gate_exps,
+                        up_exps,
+                        down_exps,
+                        fused_gate_up,
+                        ..
+                    } => Some((*router, *gate_exps, *up_exps, *down_exps, *fused_gate_up)),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let qwen_hc_head = c.qwen4exp.then(|| QwenHcW {
             norm: wpush(&mut g, &mut weights),
             down: wpush(&mut g, &mut weights),
@@ -4549,6 +4784,7 @@ fn generate_dense_backend_inner(
                     x: ple_key,
                     weight: pw.conv,
                     state,
+                    state_trace: mtp_ple_trace,
                     dst: ple_conv,
                     rows: batch as u32,
                     channels: hcw as u32,
@@ -4674,6 +4910,7 @@ fn generate_dense_backend_inner(
                     x: dn_qkvbuf,
                     weight: dw.conv1d,
                     state: k_cache[l],
+                    state_trace: mtp_k_trace[l],
                     dst: dn_convout,
                     rows: batch as u32,
                     channels: q35_cc as u32,
@@ -4749,6 +4986,7 @@ fn generate_dense_backend_inner(
                     a_coef: dw.ssm_a,
                     dt_bias: dw.dt_bias,
                     state: v_cache[l],
+                    state_trace: mtp_v_trace[l],
                     dst: dn_out,
                     rows: batch as u32,
                     n_vhead: q35_nv as u32,
@@ -4829,6 +5067,7 @@ fn generate_dense_backend_inner(
                     x: dn_qkvbuf,
                     weight: kw.conv,
                     state: k_cache[l],
+                    state_trace: None,
                     dst: dn_convout,
                     rows: batch as u32,
                     channels: packed as u32,
@@ -6145,15 +6384,10 @@ fn generate_dense_backend_inner(
                 };
                 let visible = max_visible;
                 let qsa_threshold = c.indexer_top_k + qsa_ratio - 1;
-                let batched_qsa = batch > 1
-                    && qsa_query.is_some()
-                    && visible > qsa_threshold
-                    && min_start + 1 > qsa_threshold;
+                // A crossing batch stays whole: QsaIndexer emits chronological identity indices
+                // for dense-prefix rows, then exact top-k indices once each row becomes sparse.
+                let batched_qsa = batch > 1 && qsa_query.is_some() && visible > qsa_threshold;
                 if batched_qsa {
-                    assert!(
-                        min_start + 1 > qsa_threshold,
-                        "a batched QSA span must not cross the dense-to-sparse boundary"
-                    );
                     let (ix_q, ix_k, ix_blocks, ix_norm) = qsa_query.expect("batched QSA query");
                     let selected = c.indexer_top_k / qsa_ratio;
                     g.push(Op::QsaIndexer {
@@ -7003,13 +7237,22 @@ fn generate_dense_backend_inner(
             // after `output_norm` in `qwen35.cpp`). A plain Copy into a fresh Output, so this never
             // disturbs `lm_in`'s existing consumer (the `Op::Linear` below).
             let h_out = if h_tap {
-                let ho = g.output(f32d(ne * logits_rows));
+                // Qwen3.8's detached MTP layer consumes the four-stream residual before the
+                // model head collapses it. Other MTP architectures consume the LM-head input.
+                let h_width = if c.qwen4exp { c.hc_mult * ne } else { ne };
+                let h_rows = if c.qwen4exp { batch } else { logits_rows };
+                let h_src = if c.qwen4exp {
+                    qwen_wide.expect("qwen4exp MTP tap needs qwen_wide")
+                } else {
+                    lm_in
+                };
+                let ho = g.output(f32d(h_width * h_rows));
                 g.push(Op::Copy {
-                    src: lm_in,
-                    src_off: 0,
+                    src: h_src,
+                    src_off: ((batch - h_rows) * h_width) as u32,
                     dst: ho,
                     dst_off: 0,
-                    n: (ne * logits_rows) as u32,
+                    n: (h_width * h_rows) as u32,
                 });
                 Some(ho)
             } else {
@@ -7091,6 +7334,9 @@ fn generate_dense_backend_inner(
                 ple_state,
                 k_cache,
                 v_cache,
+                mtp_k_trace,
+                mtp_v_trace,
+                mtp_ple_trace,
                 qsa_k_cache,
                 qsa_block_cache,
                 weights,
@@ -7100,9 +7346,7 @@ fn generate_dense_backend_inner(
 
     // ── layer-synchronous multi-session prefill ─────────────────────────────────────────────
     if let Some(prepared) = parallel_prepared.as_ref() {
-        let parallel = parallel_prefill
-            .as_deref_mut()
-            .expect("prepared parallel prefill retains its request");
+        let parallel = parallel_prefill.expect("prepared parallel prefill retains its request");
         if !gpu_embed {
             return Err(anyhow!("parallel prefill requires Vulkan GPU embedding"));
         }
@@ -7136,16 +7380,12 @@ fn generate_dense_backend_inner(
         }
         let t0 = std::time::Instant::now();
 
-        while let Some(first_lane) = (0..lanes).find(|&lane| cursors[lane] < targets[lane]) {
+        while let Some((sparse, prefill_lanes)) =
+            parallel_prefill_group(&cursors, &targets, qsa_threshold)
+        {
             if crate::sampling::abort_requested(req) {
                 break;
             }
-            let sparse = cursors[first_lane] + 1 > qsa_threshold;
-            let prefill_lanes = (0..lanes)
-                .filter(|&lane| {
-                    cursors[lane] < targets[lane] && (cursors[lane] + 1 > qsa_threshold) == sparse
-                })
-                .collect::<Vec<_>>();
             let final_ranges = prefill_lanes
                 .iter()
                 .map(|&lane| {
@@ -7285,6 +7525,7 @@ fn generate_dense_backend_inner(
                 &qsa_kbufs[..],
                 &qsa_cbufs[..],
                 &mrope_history_buf,
+                None,
                 &wbufs[..],
                 qwen_wide_buf,
                 ple_embd_buf,
@@ -7344,6 +7585,7 @@ fn generate_dense_backend_inner(
                 &qsa_kbufs[..],
                 &qsa_cbufs[..],
                 &mrope_history_buf,
+                None,
                 &wbufs[..],
                 qwen_wide_buf,
                 ple_embd_buf,
@@ -7421,7 +7663,7 @@ fn generate_dense_backend_inner(
             })
             .collect::<Vec<_>>();
         parallel.peer_stats.extend(stats.iter().skip(1).cloned());
-        return Ok((Vec::new(), stats[0].clone()));
+        return Ok((Vec::new(), stats[0]));
     }
 
     // ── Phase-2 DiffusionGemma canvas denoise (see `DenoiseReq`'s doc) ───────────────────────
@@ -7866,12 +8108,301 @@ fn generate_dense_backend_inner(
     }
 
     // ── speculative VERIFY ──────────────────────────────────────────────────────────
-    // One batched forward over the un-cached suffix with the LM head on EVERY row: returns
-    // [m, vocab] logits (the distribution after each suffix token) and generates nothing.
+    // One batched forward over the un-cached suffix with the LM head on every VERIFY row. Qwen3.8
+    // prompt prime uses the same trunk path but requests only the frontier logits while retaining
+    // every hidden row for detached-head catch-up.
     // The suffix-prefill contract doubles as the accept/rollback mechanism: the caller
     // truncates its committed token list and the next call's prefix diff overwrites the
     // stale KV rows. Dense non-E2B models only (mirrors the batched-prefill guard).
     if let Some(out_logits) = verify {
+        if c.qwen4exp {
+            if !gpu_embed {
+                return Err(anyhow!(
+                    "Qwen3.8 MTP verify requires the backend's GPU embedding gather"
+                ));
+            }
+            let verify_t0 = std::time::Instant::now();
+            let m = prompt.len() - start;
+            let logits_rows = if verify_frontier_only { 1 } else { m };
+            if let Some((verify_rows, _)) = mtp_trace {
+                anyhow::ensure!(
+                    verify_rows == m,
+                    "Qwen3.8 MTP recurrent trace armed for {verify_rows} rows, VERIFY has {m}"
+                );
+            }
+            let h_width = c.hc_mult * ne;
+            let ple_row = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram * c.ple_head_dim;
+            let ids = prompt[start..]
+                .iter()
+                .map(|&token| token as i32)
+                .collect::<Vec<_>>();
+            let positions = (start as i32..(start + m) as i32).collect::<Vec<_>>();
+            let ticket = ple_worker
+                .as_ref()
+                .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?
+                .submit_range(prompt, start, m, c.ple_ngram_size)?;
+
+            let want_h = h_out.is_some();
+            let gpu_verify_ids = verify_ids.is_some()
+                && constraint.is_none()
+                && caps.argmax_rows
+                && ec.spec.gpu_argmax
+                && ec.spec.gpu_mtp_accept;
+            let overlap_ple = ec.spec.mtp_ple_overlap && c.n_layer > 1;
+            let fixed = (m <= crate::mtp::DRAFT_TOKENS)
+                .then_some(mtp_verify_bufs.as_ref())
+                .flatten();
+            let ids_owned = fixed
+                .is_none()
+                .then(|| be.alloc(m * 4, BufferUsage::Staging))
+                .transpose()
+                .map_err(|e| anyhow!("{e}"))?;
+            let pos_owned = fixed
+                .is_none()
+                .then(|| be.alloc(m * 4, BufferUsage::Staging))
+                .transpose()
+                .map_err(|e| anyhow!("{e}"))?;
+            let hidden_owned = (overlap_ple && fixed.is_none())
+                .then(|| be.alloc_uninit(m * ne * 4, BufferUsage::Activations))
+                .transpose()
+                .map_err(|e| anyhow!("{e}"))?;
+            let wide_owned = fixed
+                .is_none()
+                .then(|| be.alloc_uninit(m * h_width * 4, BufferUsage::Activations))
+                .transpose()
+                .map_err(|e| anyhow!("{e}"))?;
+            let ple_owned = fixed
+                .is_none()
+                .then(|| be.alloc(m * ple_row * 4, BufferUsage::Staging))
+                .transpose()
+                .map_err(|e| anyhow!("{e}"))?;
+            let logits_owned = fixed
+                .is_none()
+                .then(|| be.alloc(logits_rows * c.vocab * 4, BufferUsage::Staging))
+                .transpose()
+                .map_err(|e| anyhow!("{e}"))?;
+            let h_owned = (want_h && fixed.is_none())
+                .then(|| be.alloc(m * h_width * 4, BufferUsage::Readback))
+                .transpose()
+                .map_err(|e| anyhow!("{e}"))?;
+            let out_ids_owned = (gpu_verify_ids && fixed.is_none())
+                .then(|| be.alloc(logits_rows * 4, BufferUsage::Readback))
+                .transpose()
+                .map_err(|e| anyhow!("{e}"))?;
+            let ids_buf = fixed
+                .map(|bufs| bufs.ids.as_ref())
+                .or(ids_owned.as_deref())
+                .expect("fixed or temporary MTP ids buffer");
+            let pos_buf = fixed
+                .map(|bufs| bufs.positions.as_ref())
+                .or(pos_owned.as_deref())
+                .expect("fixed or temporary MTP position buffer");
+            let hidden_verify_buf = overlap_ple.then(|| {
+                fixed
+                    .map(|bufs| bufs.hidden.as_ref())
+                    .or(hidden_owned.as_deref())
+                    .expect("fixed or temporary MTP hidden buffer")
+            });
+            let wide_buf = fixed
+                .map(|bufs| bufs.wide.as_ref())
+                .or(wide_owned.as_deref())
+                .expect("fixed or temporary MTP wide buffer");
+            let ple_buf = fixed
+                .map(|bufs| bufs.ple.as_ref())
+                .or(ple_owned.as_deref())
+                .expect("fixed or temporary MTP PLE buffer");
+            let logits_buf = fixed
+                .map(|bufs| bufs.logits.as_ref())
+                .or(logits_owned.as_deref())
+                .expect("fixed or temporary MTP logits buffer");
+            let h_buf = want_h.then(|| {
+                fixed
+                    .map(|bufs| bufs.h_out.as_ref())
+                    .or(h_owned.as_deref())
+                    .expect("fixed or temporary MTP hidden output buffer")
+            });
+            let out_ids_buf = gpu_verify_ids.then(|| {
+                fixed
+                    .map(|bufs| bufs.out_ids.as_ref())
+                    .or(out_ids_owned.as_deref())
+                    .expect("fixed or temporary MTP id output buffer")
+            });
+            be.upload(ids_buf, bytemuck::cast_slice(&ids))
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(pos_buf, bytemuck::cast_slice(&positions))
+                .map_err(|e| anyhow!("{e}"))?;
+            ensure_kv_depth!(start + m);
+            let vf_alloc = verify_t0.elapsed();
+            let mut vf_build = std::time::Duration::ZERO;
+            let mut vf_exec = std::time::Duration::ZERO;
+
+            if overlap_ple {
+                let vf_t0 = std::time::Instant::now();
+                let (vg0, vh0) = build(
+                    m,
+                    start,
+                    0,
+                    false,
+                    None,
+                    false,
+                    false,
+                    false,
+                    false,
+                    true,
+                    true,
+                    false,
+                    None,
+                    Some(0..1),
+                );
+                let vplan0 = be.compile(&vg0).map_err(|e| anyhow!("{e}"))?;
+                let mut vb0 = Bindings::new();
+                vb0.bind(vh0.tok_ids.expect("GPU embedding needs token ids"), ids_buf);
+                vb0.bind(
+                    vh0.hidden,
+                    hidden_verify_buf.expect("PLE overlap has a hidden buffer"),
+                );
+                vb0.bind(vh0.positions, pos_buf);
+                bind_layer_io(
+                    &mut vb0,
+                    &vh0,
+                    c.n_layer,
+                    rf_buf,
+                    yff_buf,
+                    &kbufs[..],
+                    &vbufs[..],
+                    &qsa_kbufs[..],
+                    &qsa_cbufs[..],
+                    &mrope_history_buf,
+                    &wbufs[..],
+                    qwen_wide_buf,
+                    ple_embd_buf,
+                    ple_state_buf,
+                );
+                vb0.bind(
+                    vh0.qwen_wide.expect("Qwen VERIFY head has a wide residual"),
+                    wide_buf,
+                );
+                bind_mtp_recurrent_traces(&mut vb0, &vh0, mtp_delta_ckpt);
+                vf_build += vf_t0.elapsed();
+                let vf_t0 = std::time::Instant::now();
+                be.execute(vplan0.as_ref(), &vb0)
+                    .map_err(|e| anyhow!("{e}"))?;
+                vf_exec += vf_t0.elapsed();
+            }
+
+            let vf_t0 = std::time::Instant::now();
+            let ple_rows = ticket.wait()?;
+            if ple_rows.len() != m * ple_row {
+                return Err(anyhow!(
+                    "qwen4exp verify PLE produced {} values, expected {}",
+                    ple_rows.len(),
+                    m * ple_row
+                ));
+            }
+            be.upload(ple_buf, bytemuck::cast_slice(ple_rows.as_slice()))
+                .map_err(|e| anyhow!("{e}"))?;
+
+            let vf_ple = vf_t0.elapsed();
+            let vf_t0 = std::time::Instant::now();
+            // With overlap enabled, layer 0 has already initialized hidden/wide state while the
+            // PLE worker gathered these rows. The tail starts at the first PLE-bearing layer.
+            let (vg, vh) = build(
+                m,
+                start,
+                logits_rows,
+                false,
+                None,
+                false,
+                want_h,
+                gpu_verify_ids,
+                false,
+                !overlap_ple,
+                true,
+                false,
+                None,
+                overlap_ple.then_some(1..c.n_layer),
+            );
+            let vplan = be.compile(&vg).map_err(|e| anyhow!("{e}"))?;
+            let mut vb = Bindings::new();
+            if overlap_ple {
+                vb.bind(
+                    vh.hidden,
+                    hidden_verify_buf.expect("PLE overlap has a hidden buffer"),
+                );
+            } else {
+                vb.bind(vh.tok_ids.expect("GPU embedding needs token ids"), ids_buf);
+            }
+            vb.bind(vh.positions, pos_buf);
+            bind_layer_io(
+                &mut vb,
+                &vh,
+                c.n_layer,
+                rf_buf,
+                yff_buf,
+                &kbufs[..],
+                &vbufs[..],
+                &qsa_kbufs[..],
+                &qsa_cbufs[..],
+                &mrope_history_buf,
+                &wbufs[..],
+                qwen_wide_buf,
+                ple_embd_buf,
+                ple_state_buf,
+            );
+            vb.bind(
+                vh.qwen_wide.expect("Qwen VERIFY has a wide residual"),
+                wide_buf,
+            );
+            vb.bind(vh.ple_embd.expect("Qwen VERIFY has PLE input"), ple_buf);
+            bind_mtp_recurrent_traces(&mut vb, &vh, mtp_delta_ckpt);
+            vb.bind(vh.logits.expect("verify build has logits"), logits_buf);
+            if let (Some(id), Some(buf)) = (vh.tok_id, out_ids_buf) {
+                vb.bind(id, buf);
+            }
+            if let (Some(id), Some(buf)) = (vh.h_out, h_buf) {
+                vb.bind(id, buf);
+            }
+            vf_build += vf_t0.elapsed();
+            let vf_t0 = std::time::Instant::now();
+            be.execute(vplan.as_ref(), &vb)
+                .map_err(|e| anyhow!("{e}"))?;
+            vf_exec += vf_t0.elapsed();
+            let vf_t0 = std::time::Instant::now();
+
+            if let (Some(out_ids), Some(buf)) = (verify_ids, out_ids_buf) {
+                out_ids.resize(logits_rows, 0);
+                be.download(buf, bytemuck::cast_slice_mut(out_ids))
+                    .map_err(|e| anyhow!("{e}"))?;
+            } else {
+                out_logits.resize(logits_rows * c.vocab, 0.0);
+                be.download(logits_buf, bytemuck::cast_slice_mut(out_logits))
+                    .map_err(|e| anyhow!("{e}"))?;
+            }
+            if let (Some(out), Some(buf)) = (h_out.take(), h_buf) {
+                out.resize(m * h_width, 0.0);
+                be.download(buf, bytemuck::cast_slice_mut(out))
+                    .map_err(|e| anyhow!("{e}"))?;
+            }
+            cached.extend_from_slice(&prompt[start..]);
+            if ec.prof.stages || infr_core::pager_profile::active() {
+                let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+                tracing::info!(
+                    "[qwen4 mtp verify] m={m} logits_rows={logits_rows} start={start} io={:.2}ms ple={:.2}ms build={:.2}ms exec={:.2}ms readback={:.2}ms total={:.2}ms",
+                    ms(vf_alloc), ms(vf_ple), ms(vf_build), ms(vf_exec),
+                    ms(vf_t0.elapsed()), ms(verify_t0.elapsed()),
+                );
+            }
+            return Ok((
+                Vec::new(),
+                GenStats {
+                    n_prompt: m,
+                    n_cached: start,
+                    prompt_secs: verify_t0.elapsed().as_secs_f64(),
+                    n_gen: 0,
+                    decode_secs: 0.0,
+                },
+            ));
+        }
         if c.moe.is_some() || ple.is_some() {
             return Err(anyhow!("speculative verify: dense non-E2B models only"));
         }
@@ -8034,14 +8565,9 @@ fn generate_dense_backend_inner(
     }
 
     // ── drive ───────────────────────────────────────────────────────────────────────
-    if let Some(parallel) = parallel_decode.as_deref_mut() {
+    if let Some(parallel) = parallel_decode {
         if !c.qwen4exp {
             return Err(anyhow!("parallel decode currently supports qwen4exp only"));
-        }
-        if mm.is_some() {
-            return Err(anyhow!(
-                "parallel decode does not yet support multimodal position rows"
-            ));
         }
         if !gpu_embed {
             return Err(anyhow!("parallel decode requires Vulkan GPU embedding"));
@@ -8054,6 +8580,18 @@ fn generate_dense_backend_inner(
             return Err(anyhow!(
                 "parallel decode has {lanes} lanes but {} samplers",
                 parallel.samplers.len()
+            ));
+        }
+        if parallel.mrope_plans.len() != lanes {
+            return Err(anyhow!(
+                "parallel decode has {lanes} lanes but {} MRoPE plans",
+                parallel.mrope_plans.len()
+            ));
+        }
+        let has_multimodal_lane = parallel.mrope_plans.iter().any(Option::is_some);
+        if has_multimodal_lane != mm.is_some() {
+            return Err(anyhow!(
+                "a multimodal parallel cohort must place a multimodal lane first"
             ));
         }
         if parallel.prompt_ends.len() != lanes || parallel.checkpoint_boundaries.len() != lanes {
@@ -8112,18 +8650,6 @@ fn generate_dense_backend_inner(
                 "parallel token lanes must be ordered by descending remaining prefill"
             ));
         }
-        let qsa_ratio = c.compress_ratios.iter().copied().max().unwrap_or(4).max(1);
-        let qsa_threshold = c.indexer_top_k + qsa_ratio - 1;
-        let sparse = lane_starts[0] + 1 > qsa_threshold;
-        if lane_starts
-            .iter()
-            .any(|&lane_start| (lane_start + 1 > qsa_threshold) != sparse)
-        {
-            return Err(anyhow!(
-                "parallel decode cannot mix dense and sparse QSA rows in one graph"
-            ));
-        }
-
         let profile_cohort = infr_core::pager_profile::active();
         let profile_cohort_t0 = profile_cohort.then(std::time::Instant::now);
         let profile_before = profile_cohort.then(infr_core::pager_profile::snapshot);
@@ -8134,6 +8660,23 @@ fn generate_dense_backend_inner(
         let profile_once_t0 = profile_cohort.then(std::time::Instant::now);
         let ple_heads = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram;
         let ple_row = ple_heads * c.ple_head_dim;
+        let peer_mrope_history_bufs = if has_multimodal_lane {
+            let _gp = req.and_then(|request| request.gate_pass());
+            let mut buffers = Vec::with_capacity(lanes.saturating_sub(1));
+            for (lane_prompt, plan) in parallel.prompts[1..].iter().zip(&parallel.mrope_plans[1..])
+            {
+                let positions = full_mrope_positions(*plan, lane_prompt.len(), max_ctx)?;
+                let buffer = be
+                    .alloc_uninit(positions.len() * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("allocate parallel MRoPE position table: {e}"))?;
+                be.upload(buffer.as_ref(), bytemuck::cast_slice(&positions))
+                    .map_err(|e| anyhow!("upload parallel MRoPE position table: {e}"))?;
+                buffers.push(buffer);
+            }
+            Some(buffers)
+        } else {
+            None
+        };
         let (
             ids_buf,
             pos_batch,
@@ -8217,8 +8760,9 @@ fn generate_dense_backend_inner(
                 .collect::<Vec<_>>();
             let position_rows = positions
                 .iter()
-                .map(|&position| position as i32)
-                .collect::<Vec<_>>();
+                .zip(parallel.mrope_plans)
+                .map(|(&position, plan)| mrope_token_position(*plan, position))
+                .collect::<AResult<Vec<_>>>()?;
             be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids))
                 .map_err(|e| anyhow!("{e}"))?;
             be.upload(pos_batch.as_ref(), bytemuck::cast_slice(&position_rows))
@@ -8280,6 +8824,7 @@ fn generate_dense_backend_inner(
                 &qsa_kbufs[..],
                 &qsa_cbufs[..],
                 &mrope_history_buf,
+                peer_mrope_history_bufs.as_deref(),
                 &wbufs[..],
                 qwen_wide_buf,
                 ple_embd_buf,
@@ -8354,6 +8899,7 @@ fn generate_dense_backend_inner(
                 &qsa_kbufs[..],
                 &qsa_cbufs[..],
                 &mrope_history_buf,
+                peer_mrope_history_bufs.as_deref(),
                 &wbufs[..],
                 qwen_wide_buf,
                 ple_embd_buf,
@@ -8869,9 +9415,14 @@ fn generate_dense_backend_inner(
     // graph + compile + bind) vs execute (record + submit + GPU + wait) to guide the
     // record-once-replay decision. Hoisted here, ABOVE the loop — the old read was a `getenv` on
     // EVERY decode step (R6/§10.9).
-    let prof_dec = ec.prof.stages;
+    let profile_single = c.qwen4exp && infr_core::pager_profile::active();
+    let prof_dec = ec.prof.stages || profile_single;
     let mut dec_setup = std::time::Duration::ZERO;
     let mut dec_exec = std::time::Duration::ZERO;
+    let mut dec_layer0 = std::time::Duration::ZERO;
+    let mut dec_ple = std::time::Duration::ZERO;
+    let mut dec_id_readback = std::time::Duration::ZERO;
+    let mut decode_profile_before = None;
 
     // ── batched prefill (dense + adapter-covered MoE; non-E2B models only) ────────────────────
     // Process all-but-the-last prompt tokens in a single graph execution: each Op::Linear runs
@@ -8933,13 +9484,10 @@ fn generate_dense_backend_inner(
         // this chunk height — see `kv_rows`' correctness bound.
         // Prefill vs in-flight decodes (`infr serve --parallel N`): the chunk is the unit of GPU
         // ownership, so a chunk is exactly how long a newly-admitted request's prefill can stall
-        // everyone else's decode. The default ubatch (INFR_UBATCH, 1024 rows) is ~100ms+ of
-        // unpreemptible GPU on a 14B — enough to visibly hitch 3 other streams. Under a gate we
-        // therefore cap the chunk (INFR_UBATCH_PARALLEL, default 256 rows), yield the baton between
-        // chunks, and let the round-robin interleave prefill chunks with the other sequences' decode
-        // steps. This is llama.cpp's "chunked prefill interleaved with decode" without the shared
-        // batch: same starvation bound, no batching win. A sole request (`req` None, or `-np 1`)
-        // keeps the full 1024-row chunk — prefill throughput is UNCHANGED there.
+        // everyone else's decode. Automatic parallel prefill now uses the same profile-selected
+        // chunk as a single request (2048 ordinary, 4096 aggressive); INFR_UBATCH_PARALLEL remains
+        // the explicit latency-oriented cap. Yield the baton between chunks so the round-robin can
+        // interleave prefill with other sequences' decode steps.
         let ubatch: usize = if req.is_some_and(crate::sampling::RequestCtx::shares_gpu) {
             crate::seam::ubatch_rows(ec).min(crate::seam::ubatch_rows_parallel(ec))
         } else {
@@ -8973,18 +9521,9 @@ fn generate_dense_backend_inner(
         let chunks: Vec<(usize, usize)> = {
             let mut v = Vec::new();
             let mut cs = start;
-            let qsa_boundary = c.qwen4exp.then(|| {
-                let ratio = c.compress_ratios.iter().copied().max().unwrap_or(4).max(1);
-                c.indexer_top_k + ratio - 1
-            });
             while cs < pf_end {
                 let mut ce = (cs + ubatch).min(pf_end);
                 if let Some(boundary) = turn_checkpoint_boundary {
-                    if cs < boundary && boundary < ce {
-                        ce = boundary;
-                    }
-                }
-                if let Some(boundary) = qsa_boundary {
                     if cs < boundary && boundary < ce {
                         ce = boundary;
                     }
@@ -9673,6 +10212,15 @@ fn generate_dense_backend_inner(
                 // Backend declined (e.g. adapter fell back to static) — per-token path below.
             }
         }
+        // Sample only after prefill, at a drained single-sequence decode boundary.
+        if profile_single && pos + 1 >= prompt.len() && decode_profile_before.is_none() {
+            decode_profile_before = Some((
+                infr_core::pager_profile::snapshot(),
+                infr_core::pager_profile::device_timeline_snapshot(),
+                infr_core::pager_profile::paged_moe_layer_snapshot(),
+            ));
+            tracing::info!("[single-decode-begin] pos={pos} max_new={max_new}");
+        }
         let step_t0 = std::time::Instant::now();
         let tok = cur[pos] as usize;
         let image_row = mm.and_then(|plan| {
@@ -9764,9 +10312,10 @@ fn generate_dense_backend_inner(
         // logits — same row `h_out` (when requested) captures. `dyn_replay` already excludes
         // `h_out.is_some()` (see its doc), so this is always the rebuild (`else`) branch below.
         let want_h = h_out.is_some() && is_decode && at_frontier;
+        let h_width = ne * if c.qwen4exp { c.hc_mult } else { 1 };
         let h_tap_buf = if want_h {
             Some(
-                be.alloc(ne * 4, BufferUsage::Staging)
+                be.alloc(h_width * 4, BufferUsage::Staging)
                     .map_err(|e| anyhow!("{e}"))?,
             )
         } else {
@@ -9774,6 +10323,8 @@ fn generate_dense_backend_inner(
         };
         let t_setup = std::time::Instant::now();
         let (setup_el, exec_el);
+        let mut layer0_el = std::time::Duration::ZERO;
+        let mut ple_el = std::time::Duration::ZERO;
         if let Some((plan, b)) = &ro {
             // Record-once path: reuse the single compiled plan + bindings (no per-token rebuild).
             setup_el = t_setup.elapsed();
@@ -9837,6 +10388,7 @@ fn generate_dense_backend_inner(
             be.execute(plan0.as_ref(), &b0)
                 .map_err(|e| anyhow!("{e}"))?;
             let exec0 = t_exec0.elapsed();
+            layer0_el = exec0;
 
             let t_setup1 = std::time::Instant::now();
             let ple_rows = ticket.wait()?;
@@ -9855,6 +10407,9 @@ fn generate_dense_backend_inner(
                 .map_err(|e| anyhow!("{e}"))?;
             if let Some(elapsed) = infr_core::pager_profile::elapsed(upload_t0) {
                 infr_core::pager_profile::record_ple_upload(ple_rows.len() * 4, elapsed);
+            }
+            if profile_single {
+                ple_el = t_setup1.elapsed();
             }
 
             let (g1, h1) = build(
@@ -9984,6 +10539,17 @@ fn generate_dense_backend_inner(
         if prof_dec && pos + 1 >= prompt.len() {
             dec_setup += setup_el;
             dec_exec += exec_el;
+            dec_layer0 += layer0_el;
+            dec_ple += ple_el;
+            if profile_single {
+                tracing::info!(
+                    "[single-decode-forward] pos={pos} setup={:.3}ms exec={:.3}ms layer0={:.3}ms ple={:.3}ms",
+                    setup_el.as_secs_f64() * 1e3,
+                    exec_el.as_secs_f64() * 1e3,
+                    layer0_el.as_secs_f64() * 1e3,
+                    ple_el.as_secs_f64() * 1e3,
+                );
+            }
         }
 
         if is_decode && at_frontier {
@@ -10002,7 +10568,7 @@ fn generate_dense_backend_inner(
             }
             // MTP Phase 1 h-tap (see `want_h` above): same row, one op earlier than `logits`.
             if let (Some(out), Some(hb)) = (h_out.take(), &h_tap_buf) {
-                let mut hrow = vec![0f32; ne];
+                let mut hrow = vec![0f32; h_width];
                 be.download(hb.as_ref(), bytemuck::cast_slice_mut(&mut hrow))
                     .map_err(|e| anyhow!("{e}"))?;
                 *out = hrow;
@@ -10036,7 +10602,11 @@ fn generate_dense_backend_inner(
                 let next = if gpu_argmax || gpu_sample {
                     // Device-side sampling (Op::Argmax / Op::Sample): read back the 4-byte id.
                     let mut idb = [0u8; 4];
+                    let readback_t0 = profile_single.then(std::time::Instant::now);
                     be.download(id_out, &mut idb).map_err(|e| anyhow!("{e}"))?;
+                    if let Some(t0) = readback_t0 {
+                        dec_id_readback += t0.elapsed();
+                    }
                     u32::from_le_bytes(idb)
                 } else {
                     // Serve-only: repetition penalties patch the row in place (no-op allocation-wise
@@ -10119,6 +10689,74 @@ fn generate_dense_backend_inner(
             dec_exec.as_secs_f64() * 1e3 / decode_n as f64,
         );
     }
+    if let Some((before, timeline_before, layers_before)) = decode_profile_before {
+        let after = infr_core::pager_profile::snapshot();
+        let timeline = infr_core::pager_profile::device_timeline_snapshot();
+        let delta = |a: u64, b: u64| a.saturating_sub(b);
+        let ms = |a: u64, b: u64| delta(a, b) as f64 / 1e6;
+        let mib = |a: u64, b: u64| delta(a, b) as f64 / 1048576.0;
+        // Pager timers overlap execution and one another; they are not additive stalls.
+        tracing::info!(
+            "[single-decode-summary] tokens={decode_n} wall={:.3}ms setup={:.3}ms exec={:.3}ms layer0={:.3}ms ple={:.3}ms id_readback={:.3}ms",
+            decode_t.as_secs_f64() * 1e3,
+            dec_setup.as_secs_f64() * 1e3,
+            dec_exec.as_secs_f64() * 1e3,
+            dec_layer0.as_secs_f64() * 1e3,
+            dec_ple.as_secs_f64() * 1e3,
+            dec_id_readback.as_secs_f64() * 1e3,
+        );
+        tracing::info!(
+            "[single-decode-pager] hits={} misses={} evictions={} push={:.3}MiB/{:.3}ms dma={:.3}MiB dma_submits={} submits={} submit_cpu={:.3}ms record={:.3}ms sync={:.3}ms paging_calls={} paging_sync={:.3}ms backend_setup={:.3}ms scratch={:.3}ms layout={:.3}ms scan={:.3}ms host_reads={} mmap_reads={}",
+            delta(after.gpu_hits, before.gpu_hits),
+            delta(after.gpu_misses, before.gpu_misses),
+            delta(after.gpu_evictions, before.gpu_evictions),
+            mib(after.memcpy_bytes, before.memcpy_bytes),
+            ms(after.memcpy_ns, before.memcpy_ns),
+            mib(after.dedicated_transfer_bytes, before.dedicated_transfer_bytes),
+            delta(after.dedicated_transfer_submits, before.dedicated_transfer_submits),
+            delta(after.queue_submits, before.queue_submits),
+            ms(after.queue_submit_ns, before.queue_submit_ns),
+            ms(after.command_record_ns, before.command_record_ns),
+            ms(after.sync_wait_ns, before.sync_wait_ns),
+            delta(after.paging_sync_waits, before.paging_sync_waits),
+            ms(after.paging_sync_wait_ns, before.paging_sync_wait_ns),
+            ms(after.backend_setup_ns, before.backend_setup_ns),
+            ms(after.backend_setup_phase_scratch_ns, before.backend_setup_phase_scratch_ns),
+            ms(after.backend_setup_layout_ns, before.backend_setup_layout_ns),
+            ms(after.backend_setup_paged_moe_scan_ns, before.backend_setup_paged_moe_scan_ns),
+            delta(after.host_reads, before.host_reads),
+            delta(after.mmap_fallbacks, before.mmap_fallbacks),
+        );
+        tracing::info!(
+            "[single-decode-device] main_busy={:.3}ms dma_busy={:.3}ms dma_timed={} ple_work={:.3}ms ple_wait={:.3}ms hit_windows={} overlap_lower_bound={:.3}ms",
+            ms(timeline.main_busy_ns, timeline_before.main_busy_ns),
+            ms(timeline.dma_busy_ns, timeline_before.dma_busy_ns),
+            delta(after.dedicated_transfer_gpu_timed_submits, before.dedicated_transfer_gpu_timed_submits),
+            ms(after.ple_work_ns, before.ple_work_ns),
+            ms(after.ple_wait_ns, before.ple_wait_ns),
+            delta(after.prefetch_windows, before.prefetch_windows),
+            ms(after.prefetch_confirmed_overlap_ns, before.prefetch_confirmed_overlap_ns),
+        );
+        for (layer, after) in infr_core::pager_profile::paged_moe_layer_snapshot()
+            .into_iter()
+            .enumerate()
+        {
+            let stats = after.saturating_sub(layers_before.get(layer).copied().unwrap_or_default());
+            if stats.calls == 0 {
+                continue;
+            }
+            tracing::info!(
+                "[single-decode-layer] layer={layer} calls={} wall={:.3}ms paging_calls={} paging_sync={:.3}ms hits={} misses={} push={:.3}MiB/{:.3}ms dma={:.3}MiB submits={} submit_cpu={:.3}ms record={:.3}ms",
+                stats.calls, stats.wall_ns as f64 / 1e6,
+                stats.paging_sync_waits, stats.paging_sync_wait_ns as f64 / 1e6,
+                stats.gpu_hits, stats.gpu_misses,
+                stats.memcpy_bytes as f64 / 1048576.0, stats.memcpy_ns as f64 / 1e6,
+                stats.dedicated_transfer_bytes as f64 / 1048576.0,
+                stats.queue_submits, stats.queue_submit_ns as f64 / 1e6,
+                stats.command_record_ns as f64 / 1e6,
+            );
+        }
+    }
     // Record what the KV cache now holds for the next turn's prefix diff, straight from the
     // per-step `last_written` bookkeeping (`resident_after_gen`): exactly the tokens whose KV rows
     // were actually written by a kept token. This excludes the final sampled token (pushed to
@@ -10184,7 +10822,8 @@ fn generate_dense_backend_inner(
 #[cfg(test)]
 mod tests {
     use super::{
-        allocate_parallel_prefill_rows, dense_request_exceeds_capacity, mrope_rows_are_plain_rope,
+        allocate_parallel_prefill_rows, dense_request_exceeds_capacity, full_mrope_positions,
+        mrope_rows_are_plain_rope, mrope_token_position, parallel_prefill_group,
         parallel_prefill_progress, recurrent_extension_start, resident_after_gen,
         sampling_suffix_start, validate_token_ids,
     };
@@ -10223,6 +10862,30 @@ mod tests {
             [11, 11, 10, 0],
             32
         ));
+    }
+
+    #[test]
+    fn parallel_mrope_history_preserves_vision_and_text_lane_positions() {
+        let plan = crate::seam::MropePlan {
+            prompt_pos4: vec![0, 0, 0, 0, 5, 2, 3, 0],
+            spans: Vec::new(),
+            decode_base: 6,
+        };
+        assert_eq!(
+            full_mrope_positions(Some(&plan), 2, 4).unwrap(),
+            [0, 0, 0, 0, 5, 2, 3, 0, 6, 6, 6, 0, 7, 7, 7, 0]
+        );
+        assert_eq!(mrope_token_position(Some(&plan), 1).unwrap(), 5);
+        assert_eq!(mrope_token_position(Some(&plan), 3).unwrap(), 7);
+        assert_eq!(
+            full_mrope_positions(Some(&plan), 3, 4).unwrap(),
+            [0, 0, 0, 0, 5, 2, 3, 0, 6, 6, 6, 0, 7, 7, 7, 0]
+        );
+        assert_eq!(
+            full_mrope_positions(None, 2, 3).unwrap(),
+            [0, 0, 0, 0, 1, 1, 1, 0, 2, 2, 2, 0]
+        );
+        assert_eq!(mrope_token_position(None, 29_772).unwrap(), 29_772);
     }
 
     #[test]
@@ -10275,6 +10938,23 @@ mod tests {
         );
         assert_eq!(allocate_parallel_prefill_rows(&[10, 20], 1_024), [10, 20]);
         assert!(allocate_parallel_prefill_rows(&[], 1_024).is_empty());
+    }
+
+    #[test]
+    fn parallel_prefill_finishes_each_lane_before_starting_the_next() {
+        assert_eq!(
+            parallel_prefill_group(&[0, 0], &[8_000, 8_000], 2_051),
+            Some((false, vec![0]))
+        );
+        assert_eq!(
+            parallel_prefill_group(&[2_051, 0], &[8_000, 8_000], 2_051),
+            Some((true, vec![0]))
+        );
+        assert_eq!(
+            parallel_prefill_group(&[8_000, 0], &[8_000, 8_000], 2_051),
+            Some((false, vec![1]))
+        );
+        assert_eq!(parallel_prefill_group(&[7, 9], &[7, 9], 2_051), None);
     }
 
     #[test]

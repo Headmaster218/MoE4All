@@ -1390,47 +1390,7 @@ fn bytes_to_f32(bytes: &[u8], dtype: DType) -> Vec<f32> {
 
 /// Stable op label for the profiler.
 fn op_name(op: &Op) -> &'static str {
-    match op {
-        Op::RmsNorm { .. } => "RmsNorm",
-        Op::RmsNormAdd { .. } => "RmsNormAdd",
-        Op::LayerNorm { .. } => "LayerNorm",
-        Op::Softmax { .. } => "Softmax",
-        Op::Linear { .. } => "Linear",
-        Op::QkNorm { .. } => "QkNorm",
-        Op::GatedRmsNorm { .. } => "GatedRmsNorm",
-        Op::Rope { .. } => "Rope",
-        Op::QkNormRope { .. } => "QkNormRope",
-        Op::WriteKv { .. } => "WriteKv",
-        Op::Attention { .. } => "Attention",
-        Op::Mla { .. } => "Mla",
-        Op::LightningIndexer { .. } => "LightningIndexer",
-        Op::TopkMask { .. } => "TopkMask",
-        Op::HyperConnectMix { .. } => "HyperConnectMix",
-        Op::HyperConnectPre { .. } => "HyperConnectPre",
-        Op::HyperConnectPost { .. } => "HyperConnectPost",
-        Op::GatedAct { .. } => "GatedAct",
-        Op::GatedActFused { .. } => "GatedActFused",
-        Op::Add { .. } => "Add",
-        Op::AddBias { .. } => "AddBias",
-        Op::Scale { .. } => "Scale",
-        Op::Silu { .. } => "Silu",
-        Op::QwenHcMix { .. } => "QwenHcMix",
-        Op::QwenHcInject { .. } => "QwenHcInject",
-        Op::QwenPleGate { .. } => "QwenPleGate",
-        Op::MulVec { .. } => "MulVec",
-        Op::Softcap { .. } => "Softcap",
-        Op::Argmax { .. } => "Argmax",
-        Op::ArgmaxProb { .. } => "ArgmaxProb",
-        Op::Sample { .. } => "Sample",
-        Op::EmbedGather { .. } => "EmbedGather",
-        Op::GatherI32 { .. } => "GatherI32",
-        Op::Copy { .. } => "Copy",
-        Op::CopyStrided { .. } => "CopyStrided",
-        Op::MoeFfn { .. } => "MoeFfn",
-        Op::Conv1dSilu { .. } => "Conv1dSilu",
-        Op::DeltaNet { .. } => "DeltaNet",
-        Op::MoeSharedExpertAdd { .. } => "MoeSharedExpertAdd",
-    }
+    op.kind()
 }
 
 /// Refuse a stream count wider than the fixed-size private array `hyper_mix_f32` holds a token's
@@ -5053,6 +5013,7 @@ impl MetalBackend {
                 x,
                 weight,
                 state,
+                state_trace: _,
                 dst,
                 rows,
                 channels,
@@ -5149,6 +5110,7 @@ impl MetalBackend {
                 a_coef,
                 dt_bias,
                 state,
+                state_trace: _,
                 dst,
                 rows,
                 n_vhead,
@@ -5810,6 +5772,23 @@ impl MetalBackend {
                     "Metal Op::MoeSharedExpertAdd (qwen35moe shared expert) not yet implemented"
                         .into(),
                 ));
+            }
+            Op::Rope2D { .. }
+            | Op::QkNormMrope { .. }
+            | Op::Dsv4Compress { .. }
+            | Op::Dsv4CacheWrite { .. }
+            | Op::Dsv4Indexer { .. }
+            | Op::Dsv4Gather { .. }
+            | Op::QsaIndexer { .. }
+            | Op::QsaGather { .. }
+            | Op::QsaBatchAttention { .. }
+            | Op::Gelu { .. }
+            | Op::HeadwiseSigmoidMul { .. }
+            | Op::Kda { .. } => {
+                return Err(Error::Unsupported(format!(
+                    "Metal Op::{} is not yet implemented",
+                    op.kind()
+                )));
             }
             Op::Silu { .. }
             | Op::QwenHcMix { .. }

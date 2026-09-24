@@ -28,11 +28,15 @@ mod segmented_kv;
 mod session_state;
 mod weights;
 
-pub(crate) use runner::{generate_dense_backend, PreparedParallelPrompt};
+pub(crate) use runner::{
+    generate_dense_backend, generate_dense_backend_verify_frontier, PreparedParallelPrompt,
+};
 pub(crate) use sc::DenoiseReq;
 pub use sc::{DenoiseOutcome, EbReduced};
 pub(crate) use session_state::{SessionBuffer, SessionBufferKey, SessionStateMeta};
 pub(crate) use weights::SeamKv;
+
+pub(crate) type ParallelSampledOutput = (Vec<Vec<u32>>, Vec<f64>, Vec<f64>);
 
 /// A LAZILY-dequantized host f32 token-embedding table, threaded through the seam runners in place
 /// of a `&[f32]`.
@@ -179,11 +183,13 @@ fn cpu_paged_store(
         .map(|t| t.nbytes as u64)
         .sum();
     let available = infr_core::hostmem::available_bytes();
+    let total = infr_core::hostmem::total_bytes();
     let process_resident = infr_core::hostmem::process_resident_bytes();
-    let arena_plan = infr_core::hostmem::cpu_arena_plan_for_profile(
+    let arena_plan = infr_core::hostmem::cpu_arena_plan_for_snapshot(
         ec.device.auto_profile,
         ram_request,
         available,
+        total,
         process_resident,
         pageable,
     );
@@ -299,12 +305,14 @@ fn vulkan_host_tier(
     // `0` is the explicit OFF switch, not "unset" — preserve it through request resolution.
     let ram_request = host_ram_request(ec);
     let available = infr_core::hostmem::available_bytes();
+    let total = infr_core::hostmem::total_bytes();
     let process_resident = infr_core::hostmem::process_resident_bytes();
     let pageable: u64 = classes.iter().map(|&(s, n)| (s * n) as u64).sum();
-    let arena_plan = infr_core::hostmem::streaming_arena_plan_for_profile(
+    let arena_plan = infr_core::hostmem::streaming_arena_plan_for_snapshot(
         ec.device.auto_profile,
         ram_request,
         available,
+        total,
         process_resident,
         unified,
         pageable,
@@ -762,6 +770,7 @@ pub(crate) fn generate_dense_vulkan_parallel_sampled_session(
     prompts: &[Vec<u32>],
     prompt_ends: &[usize],
     checkpoint_boundaries: &[Option<usize>],
+    mrope_plans: &[Option<&MropePlan>],
     max_steps: usize,
     primary: &mut Option<SeamKv>,
     peers: &mut [SeamKv],
@@ -770,7 +779,7 @@ pub(crate) fn generate_dense_vulkan_parallel_sampled_session(
     on_token: &mut dyn FnMut(usize, u32) -> bool,
     yield_requested: Option<&std::sync::atomic::AtomicBool>,
     req: Option<&crate::sampling::RequestCtx>,
-) -> AResult<(Vec<Vec<u32>>, Vec<f64>, Vec<f64>)> {
+) -> AResult<ParallelSampledOutput> {
     if primary.is_none() {
         return Err(anyhow!(
             "sampled parallel Vulkan decode requires an initialized primary session"
@@ -790,6 +799,7 @@ pub(crate) fn generate_dense_vulkan_parallel_sampled_session(
         prompts,
         prompt_ends,
         checkpoint_boundaries,
+        mrope_plans,
         max_steps,
         primary,
         peers,
@@ -862,7 +872,7 @@ pub(crate) fn generate_dense_vulkan_parallel_prefill_session(
 /// Honest activation/scratch reservation for a DENSE model's placement decision: the transient
 /// VRAM a resident session needs BEYOND weights + KV, at the largest shape it will ever run — a
 /// full prefill chunk of `rows = min(ubatch, want_ctx)` rows (the runner chunks batched prefill at
-/// INFR_UBATCH, default 1024; decode's single row is dwarfed by this).
+/// INFR_UBATCH, profile-selected by default; decode's single row is dwarfed by this).
 ///
 /// Every term is per ROW of the prefill chunk, and the whole estimate is now checked against the
 /// backend's own high-water mark of live activation bytes at the end of every generation (see
@@ -1047,15 +1057,17 @@ fn q8_prefill_scratch_bytes(
         .fold(0u64, u64::saturating_add)
 }
 
-/// Extra split-attention workspace used only by Qwen3.8's independent multi-session rows.
-/// Single-sequence prefill can use FlashAttention, while a parallel cohort lowers each sequence
-/// separately through `independent_split_{pm,pl,pacc}`. The dense QSA prefix is bounded by the
-/// indexer threshold; sparse QSA gathers a compact prefix and no longer takes this path.
-fn parallel_prefill_attention_scratch_bytes(cfg: &Config, want_ctx: usize, ubatch: usize) -> u64 {
-    if placement_slots() <= 1 || !cfg.qwen4exp || want_ctx == 0 || ubatch == 0 {
+/// Split-attention workspace retained by Qwen3.8's independent token-row decode cohort.
+///
+/// Multi-session prefill intentionally finishes one session before starting the next, so it never
+/// reaches the ordinary independent-attention path. Decode does reach that path, but each sequence
+/// contributes exactly one row and the Vulkan pool reuses one maximum-sized set of partials across
+/// lanes. Pricing this at the prefill ubatch used to strand several GiB in every multi-slot server
+/// even when only one request was active.
+fn parallel_token_attention_scratch_bytes(cfg: &Config, want_ctx: usize) -> u64 {
+    if placement_slots() <= 1 || !cfg.qwen4exp || want_ctx == 0 {
         return 0;
     }
-    let rows = ubatch.min(want_ctx).max(1).next_multiple_of(64) as u64;
     let ratio = cfg
         .compress_ratios
         .iter()
@@ -1071,9 +1083,7 @@ fn parallel_prefill_attention_scratch_bytes(cfg: &Config, want_ctx: usize, ubatc
     // correct if a model exposes a larger dense threshold.
     let chunk = (visible / 32).clamp(64, 512);
     let chunks = visible.div_ceil(chunk) as u64;
-    let partials = rows
-        .saturating_mul(cfg.n_head as u64)
-        .saturating_mul(chunks);
+    let partials = (cfg.n_head as u64).saturating_mul(chunks);
     partials
         .saturating_mul((cfg.max_head_dim().saturating_add(2)) as u64)
         .saturating_mul(4)
@@ -1120,9 +1130,7 @@ pub(crate) fn runtime_reserve_at(
         .saturating_add(q8_prefill_scratch_bytes(
             cfg, want_ctx, ring, ubatch, k_fmt, v_fmt,
         ))
-        .saturating_add(parallel_prefill_attention_scratch_bytes(
-            cfg, want_ctx, ubatch,
-        ))
+        .saturating_add(parallel_token_attention_scratch_bytes(cfg, want_ctx))
         .saturating_add(qsa_indexer_scratch_bytes(cfg, want_ctx, ubatch))
 }
 
@@ -1237,9 +1245,9 @@ const ACT_RESERVE_PAD: (u64, u64) = (3, 2);
 const QWEN4_PLAN_OVERLAP_RESERVE: u64 = 64 * 1024 * 1024;
 
 /// Batched-prefill micro-batch: rows per prefill chunk (`device.ubatch` / `INFR_UBATCH`, default
-/// 1024 — but see [`default_ubatch_rows`] for the INTEGRATED-GPU default). ONE reader funnel — the
-/// prefill loop, the activation reserve, and the SWA ring sizing below all derive from this,
-/// because the ring's correctness bound is "window + one whole prefill chunk".
+/// 2048/4096 by profile — but see [`default_ubatch_rows`] for the INTEGRATED-GPU default). ONE
+/// reader funnel — the prefill loop, the activation reserve, and the SWA ring sizing below all
+/// derive from this, because the ring's correctness bound is "window + one whole prefill chunk".
 ///
 /// **`ubatch_specified` IS needed** (the S0 report's open question; §10's `INFR_UBATCH=abc` note).
 /// `INFR_UBATCH` is a §6.12 two-consumer knob — the VALUE here, and the PRESENCE the placement
@@ -1283,18 +1291,33 @@ pub(crate) fn user_pinned_ubatch(ec: &EngineConfig) -> bool {
 }
 
 /// The SHRINK ladder the dense placement sweeps walk when the selected prefill chunk's activation
-/// reserve is what tips a model out of residency: 2048 → 1024 → 512 → 256 → 128 rows. A shorter
-/// chunk shrinks
+/// reserve is what tips a model out of residency. It uses 256, 512 and 1024 rows, then 512-row
+/// steps above 1024: 3072 → 2560 → 2048 → 1536 → 1024 → 512 → 256. A shorter chunk shrinks
 /// both the activation reserve (whole-chunk scratch scales with rows) and the SWA ring rows
 /// (`window + chunk`), and resident-at-512 decodes ~10x faster than streaming at the PCIe ceiling
 /// — so trading prefill chunk height for residency is strictly the right call.
 ///
-/// 128 is the floor: below it the per-dispatch launch overhead dominates prefill entirely.
-pub(crate) const DENSE_UBATCH_LADDER: [usize; 4] = [1024, 512, 256, 128];
+/// 256 is the floor: below it the per-dispatch launch overhead dominates prefill entirely.
+fn ubatch_fallbacks_below(now: usize) -> Vec<usize> {
+    let mut rows = Vec::new();
+    if now > 1024 {
+        let mut candidate = (now - 1) / 512 * 512;
+        while candidate >= 1024 {
+            rows.push(candidate);
+            candidate -= 512;
+        }
+    }
+    for row in [1024, 512, 256] {
+        if row < now && !rows.contains(&row) {
+            rows.push(row);
+        }
+    }
+    rows
+}
 
 /// Every prefill chunk height a dense placement decision is allowed to settle on, TALLEST FIRST:
-/// the current/default height ([`ubatch_rows`]) followed by the [`DENSE_UBATCH_LADDER`] rungs
-/// BELOW it. A user-pinned `INFR_UBATCH` is authoritative — the sweeps skip themselves — so the
+/// the current/default height ([`ubatch_rows`]) followed by [`ubatch_fallbacks_below`] it. A
+/// user-pinned `INFR_UBATCH` is authoritative — the sweeps skip themselves — so the
 /// list is then just that one height.
 ///
 /// **One ladder, two readers.** `vulkan_moe_binder`'s residency / auto-q8 / streaming sweeps walk
@@ -1312,7 +1335,7 @@ pub(crate) fn ubatch_candidates(ec: &EngineConfig) -> Vec<usize> {
     let now = ubatch_rows(ec);
     let mut cands = vec![now];
     if !user_pinned_ubatch(ec) {
-        cands.extend(DENSE_UBATCH_LADDER.into_iter().filter(|&c| c < now));
+        cands.extend(ubatch_fallbacks_below(now));
     }
     cands
 }
@@ -1322,28 +1345,26 @@ pub(crate) fn ubatch_candidates(ec: &EngineConfig) -> Vec<usize> {
 /// activation reserve leaves less than one complete whole-layer Prefill lane. This is a viability
 /// fallback, not a throughput/residency policy sweep.
 fn moe_ubatch_fallback_candidates(ec: &EngineConfig) -> Vec<usize> {
-    const FALLBACKS: [usize; 5] = [2048, 1024, 512, 256, 128];
     let now = ubatch_rows(ec);
     let mut candidates = vec![now];
-    candidates.extend(FALLBACKS.into_iter().filter(|&rows| rows < now));
+    candidates.extend(ubatch_fallbacks_below(now));
     candidates
 }
 
-/// The prefill chunk when neither INFR_UBATCH nor the placement sweep pinned one: 1024 rows in the
-/// conservative profile and 2048 in the aggressive profile, EXCEPT on an integrated GPU, where a
+/// The prefill chunk when neither INFR_UBATCH nor the placement sweep pinned one: 2048 rows in the
+/// conservative profile and 4096 in the aggressive profile, EXCEPT on an integrated GPU, where a
 /// chunk that big is a single multi-second command buffer and trips
 /// the ~10 s GPU watchdog (`ring gfx_0.0.0 timeout` -> `VK_ERROR_DEVICE_LOST`). See
 /// [`infr_core::integrated_ubatch_rows`] for the measurements behind the smaller default.
 ///
 /// A DISCRETE device (and a CPU/Metal run, where no Vulkan backend was constructed and
-/// `device_class()` is `None`) uses the profile default. Conservative remains byte-identical to
-/// the pre-profile behavior.
+/// `device_class()` is `None`) uses the profile default.
 fn default_ubatch_rows(profile: infr_core::config::AutoProfile) -> usize {
     match infr_vulkan::device_class() {
         Some(d) if d.integrated => infr_core::integrated_ubatch_rows(d.compute_units),
         _ => match profile {
-            infr_core::config::AutoProfile::Conservative => 1024,
-            infr_core::config::AutoProfile::Aggressive => 2048,
+            infr_core::config::AutoProfile::Conservative => 2048,
+            infr_core::config::AutoProfile::Aggressive => 4096,
         },
     }
 }
@@ -1351,16 +1372,16 @@ fn default_ubatch_rows(profile: infr_core::config::AutoProfile) -> usize {
 /// Prefill chunk (rows) for a sequence SHARING the GPU with other in-flight sequences
 /// (`infr serve --parallel N`, i.e. the runner's `req` carries a `StepGate`).
 ///
-/// A prefill chunk is unpreemptible GPU: the whole chunk holds the baton, so it is exactly how long
-/// a newly-admitted request's prefill stalls every in-flight decode. The solo default (1024 rows,
-/// [`ubatch_rows`]) is ~100ms+ on a 14B — a visible hitch across 3 other streams. 256 rows bounds
-/// that to ~25-30ms (about the cost of ~4 decode steps) at a small prefill-throughput cost, which
-/// is the right trade when N clients are streaming. Never applies to a sole request: `infr run`,
-/// `bench`, the goldens, and a `-np 1` server all keep the full [`ubatch_rows`] chunk, so prefill
-/// throughput there is UNCHANGED. INFR_UBATCH_PARALLEL overrides; it only ever SHRINKS the chunk
-/// (the runner takes the `min` with [`ubatch_rows`]).
+/// Unset inherits [`ubatch_rows`], including the ordinary/aggressive profile default and any
+/// placement-selected lower rung. `device.ubatch_parallel` can explicitly request a smaller
+/// shared-GPU chunk when decode latency matters more than prefill throughput. The runner takes the
+/// `min` of this value and [`ubatch_rows`].
 pub(crate) fn ubatch_rows_parallel(ec: &EngineConfig) -> usize {
-    ec.device.ubatch_parallel
+    if !ec.device.ubatch_parallel_specified {
+        ubatch_rows(ec)
+    } else {
+        ec.device.ubatch_parallel
+    }
 }
 
 /// The two placement decisions the VRAM ladder pins for a session and then keeps STABLE for its
@@ -2077,22 +2098,23 @@ pub(crate) const MIN_SESSION_CTX: usize = 1024;
 // The context-fit math ([`kv_fit_ctx_for`], via `SeamModel::kv_fit_ctx_fmt`) and the placement
 // sweeps (`vulkan_moe_binder`'s residency / auto-q8 / streaming / MoE-expert budgets) are two
 // readers of ONE question: what still fits this device? Every helper below takes the raw
-// [`infr_vulkan::VramInfo`] snapshot and derives its ceiling from [`VramInfo::alloc_room`] —
-// the allocator's own limit — so neither family can plan bytes `check_vram_budget` will refuse.
+// [`infr_vulkan::VramInfo`] snapshot and derives the same profile-aware ceiling as the allocator,
+// starting from [`VramInfo::alloc_room`], so neither family can plan bytes the guard will refuse.
 // `budgets_agree_with_the_allocator_ceiling` and `fit_math_and_placement_pick_the_same_rung`
 // guard the drift.
 
 /// Placement-time view of the unified device-memory budget. Placement runs before this model has
 /// committed its weights, so `tracked_used=0`; the allocator applies the same helper later with its
 /// live per-backend allocation tally. The physical side starts at `VramInfo::alloc_room()` (already
-/// net of Vulkan's mandatory guard), then applies the caller's additional reserve.
+/// net of Vulkan's mandatory guard), then applies the automatic profile or explicit knobs.
 fn planned_vram_room(vram: &infr_vulkan::VramInfo, ec: &EngineConfig) -> u64 {
-    infr_core::budget::unified_vram_room(
+    infr_core::budget::unified_vram_room_for_profile(
         vram.total,
         vram.alloc_room(),
         0,
         ec.device.vram_budget,
         ec.device.vram_reserve,
+        ec.device.auto_profile,
     )
 }
 
@@ -2971,8 +2993,7 @@ pub(crate) fn reclamp_ctx_to_live_room(
     // Walk the chunk ladder HERE too, and price each rung on its own: a shorter chunk shrinks both
     // the activation reserve and the SWA ring, so it buys context, and the rung the pre-load sweep
     // pinned was chosen against weight bytes that turned out to be ~2% light. Pricing only the
-    // pinned rung leaves that context on the floor (measured on gemma-4-31B: 10 440 tokens at the
-    // pinned 256-row chunk against 15 440 at 128). Tallest-first, so a rung is only lowered when
+    // pinned rung can leave context on the floor. Tallest-first, so a rung is only lowered when
     // the taller one genuinely cannot serve the window.
     let cands = ubatch_candidates(ec);
     // MoE: the pager's arenas are already allocated by the binder at this point, so the live room
@@ -3098,15 +3119,11 @@ enum MoeHostBacking {
     Bounded { bytes: usize },
 }
 
-/// Aggressive auto mode may spend down to this much currently-available host memory when doing so
-/// removes the runtime SSD expert tier entirely. Partial caches retain the normal profile-aware
-/// headroom: the extra pressure is worthwhile only at the full-residency discontinuity.
-const AGGRESSIVE_MOE_FULL_FIT_HEADROOM: u64 = 4 << 30;
-
 fn moe_host_backing(
     profile: infr_core::config::AutoProfile,
     ram_request: infr_core::hostmem::RamRequest,
     available: Option<u64>,
+    total: Option<u64>,
     process_resident: Option<u64>,
     commit_ceiling: Option<u64>,
     payload_bytes: usize,
@@ -3126,17 +3143,14 @@ fn moe_host_backing(
         infr_core::hostmem::RamRequest::Bypass => 0,
         infr_core::hostmem::RamRequest::Auto => available
             .map(|available| {
-                let payload = payload_bytes as u64;
-                let aggressive_full_fit =
-                    matches!(profile, infr_core::config::AutoProfile::Aggressive)
-                        && payload
-                            .checked_add(AGGRESSIVE_MOE_FULL_FIT_HEADROOM)
-                            .is_some_and(|required| required <= available);
-                if aggressive_full_fit {
-                    payload
-                } else {
-                    infr_core::hostmem::auto_cache_bytes_for_profile(profile, available, 0, payload)
-                }
+                infr_core::hostmem::auto_cache_bytes_for_snapshot(
+                    profile,
+                    available,
+                    total,
+                    process_resident,
+                    0,
+                    payload_bytes as u64,
+                )
             })
             .unwrap_or(0),
     };
@@ -3302,7 +3316,11 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // working set, not a persistent owner of the process RAM budget.
         reclaimable_fixed_host_source_bytes = fp.dense;
         let vram = vk.vram();
-        let room = planned_vram_room(&vram, ec);
+        // Usually this binder is the backend's first owner, making `planned_vram_room`'s
+        // tracked_used=0 assumption exact. A detached MTP head is intentionally resident before
+        // the target, however, so use the backend's live accounting here. This keeps the
+        // provisional placement consistent with the final post-fixed `vk.alloc_room()` query.
+        let room = vk.alloc_room();
         // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows`), so a mostly-SWA
         // model's KV prices far below n_layer * ctx. Price the actual per-side Vulkan formats:
         // explicit Q8 and F16 choices must change the expert remainder just like the allocation.
@@ -3335,9 +3353,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let kv_bytes = total_slot_state_bytes(kv_bytes_at(selected_ubatch));
         let persistent_state = kv_bytes.saturating_sub(dynamic_kv_reserve);
         // Reserve the workspace for the chunk this session will actually execute. A user selecting
-        // 4096 rows still gets the full 4K reserve; the default 1024-row session no longer strands
-        // the difference behind a permanent 2 GiB/4K assumption. Prefill's layer ring already
-        // borrows only cold Decode arena ranges and returns them on `enter_decode`.
+        // 4096 rows still gets the full 4K reserve; a lower selected rung no longer strands the
+        // difference behind a permanent 2 GiB/4K assumption. Prefill's layer ring already borrows
+        // only cold Decode arena ranges and returns them on `enter_decode`.
         let runtime_reserve =
             runtime_reserve_at(cfg, &caps, want_ctx, ring, selected_ubatch, k_fmt, v_fmt);
         let packing_margin = resident_weight_packing_margin(fp.dense);
@@ -3673,6 +3691,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
             let ram_request = host_ram_request(ec);
             let auto_profile = ec.device.auto_profile;
             let planned_host_available = infr_core::hostmem::available_bytes();
+            let planned_host_total = infr_core::hostmem::total_bytes();
             let planned_process_resident = infr_core::hostmem::process_resident_bytes();
             let host_classes: Vec<(usize, usize)> = logical_pools
                 .iter()
@@ -3947,6 +3966,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     auto_profile,
                     ram_request,
                     host_available,
+                    planned_host_total,
                     process_resident,
                     automatic_commit_ceiling,
                     host_bytes,
@@ -5885,6 +5905,7 @@ mod seam_helper_tests {
                 infr_core::config::AutoProfile::Conservative,
                 RamRequest::LegacyCacheBudget(payload as u64),
                 None,
+                None,
                 Some(0),
                 None,
                 payload,
@@ -5896,6 +5917,7 @@ mod seam_helper_tests {
             super::moe_host_backing(
                 infr_core::config::AutoProfile::Conservative,
                 RamRequest::LegacyCacheBudget((40 * GIB) as u64),
+                None,
                 None,
                 Some(0),
                 None,
@@ -5909,6 +5931,7 @@ mod seam_helper_tests {
                 infr_core::config::AutoProfile::Conservative,
                 RamRequest::Auto,
                 Some((64 * GIB) as u64),
+                None,
                 Some(0),
                 None,
                 payload,
@@ -5928,6 +5951,7 @@ mod seam_helper_tests {
                 infr_core::config::AutoProfile::Conservative,
                 RamRequest::LegacyCacheBudget((23 * GIB) as u64),
                 None,
+                None,
                 Some(0),
                 None,
                 payload,
@@ -5939,6 +5963,7 @@ mod seam_helper_tests {
                 infr_core::config::AutoProfile::Conservative,
                 RamRequest::Auto,
                 Some((25 * GIB) as u64),
+                None,
                 Some(0),
                 None,
                 payload,
@@ -5950,6 +5975,7 @@ mod seam_helper_tests {
                 infr_core::config::AutoProfile::Conservative,
                 RamRequest::TotalProcessBudget(0),
                 Some((64 * GIB) as u64),
+                None,
                 Some(0),
                 None,
                 payload,
@@ -5961,6 +5987,7 @@ mod seam_helper_tests {
                 infr_core::config::AutoProfile::Conservative,
                 RamRequest::Bypass,
                 Some((64 * GIB) as u64),
+                None,
                 Some(0),
                 None,
                 payload,
@@ -5970,7 +5997,7 @@ mod seam_helper_tests {
     }
 
     #[test]
-    fn aggressive_moe_auto_spends_to_four_gib_only_for_a_complete_host_store() {
+    fn aggressive_moe_auto_targets_total_minus_fourteen_gib() {
         use infr_core::config::AutoProfile;
         use infr_core::hostmem::RamRequest;
 
@@ -5979,20 +6006,22 @@ mod seam_helper_tests {
             super::moe_host_backing(
                 AutoProfile::Aggressive,
                 RamRequest::Auto,
-                Some((payload + 4 * GIB) as u64),
-                Some(0),
+                Some((26 * GIB) as u64),
+                Some((41 * GIB) as u64),
+                Some((3 * GIB) as u64),
                 None,
                 payload,
             ),
             super::MoeHostBacking::Full,
-            "aggressive auto should remove SSD when the complete payload leaves four GiB"
+            "41 GiB total minus 14 GiB reserve and 3 GiB resident leaves the 24 GiB payload"
         );
         assert!(matches!(
             super::moe_host_backing(
                 AutoProfile::Aggressive,
                 RamRequest::Auto,
-                Some((payload + 4 * GIB - 1) as u64),
-                Some(0),
+                Some((26 * GIB) as u64),
+                Some((41 * GIB) as u64),
+                Some((3 * GIB + 1) as u64),
                 None,
                 payload,
             ),
@@ -6002,7 +6031,8 @@ mod seam_helper_tests {
             super::moe_host_backing(
                 AutoProfile::Conservative,
                 RamRequest::Auto,
-                Some((payload + 4 * GIB) as u64),
+                Some((payload + 3 * GIB - 1) as u64),
+                Some((64 * GIB) as u64),
                 Some(0),
                 None,
                 payload,
@@ -6016,12 +6046,13 @@ mod seam_helper_tests {
                 AutoProfile::Aggressive,
                 RamRequest::Auto,
                 Some((40 * GIB) as u64),
-                Some(0),
+                Some((64 * GIB) as u64),
+                Some((2 * GIB) as u64),
                 None,
                 large_payload,
             ),
-            super::MoeHostBacking::Bounded { bytes: 32 * GIB },
-            "below full fit, MoE must still use the selected profile's ordinary headroom"
+            super::MoeHostBacking::Bounded { bytes: 48 * GIB },
+            "below full fit, MoE uses the same total-process target"
         );
     }
 
@@ -6035,6 +6066,7 @@ mod seam_helper_tests {
                 infr_core::config::AutoProfile::Conservative,
                 RamRequest::TotalProcessBudget((50 * GIB) as u64),
                 Some((48 * GIB) as u64),
+                None,
                 Some((2 * GIB) as u64),
                 None,
                 payload,
@@ -6049,6 +6081,7 @@ mod seam_helper_tests {
                 infr_core::config::AutoProfile::Aggressive,
                 RamRequest::TotalProcessBudget((50 * GIB) as u64),
                 Some((48 * GIB) as u64),
+                None,
                 Some((2 * GIB) as u64),
                 None,
                 payload,
@@ -6063,6 +6096,7 @@ mod seam_helper_tests {
                 infr_core::config::AutoProfile::Aggressive,
                 RamRequest::Auto,
                 None,
+                Some((64 * GIB) as u64),
                 Some(0),
                 None,
                 payload,
@@ -6083,6 +6117,7 @@ mod seam_helper_tests {
                 infr_core::config::AutoProfile::Aggressive,
                 RamRequest::Auto,
                 Some((56 * GIB) as u64),
+                Some((64 * GIB) as u64),
                 Some(0),
                 Some(ceiling as u64),
                 payload,
@@ -6095,6 +6130,7 @@ mod seam_helper_tests {
                 infr_core::config::AutoProfile::Aggressive,
                 RamRequest::TotalProcessBudget((50 * GIB) as u64),
                 Some((56 * GIB) as u64),
+                None,
                 Some(0),
                 Some(ceiling as u64),
                 payload,
@@ -6107,6 +6143,7 @@ mod seam_helper_tests {
                 infr_core::config::AutoProfile::Aggressive,
                 RamRequest::TotalProcessBudget((48 * GIB) as u64),
                 Some((56 * GIB) as u64),
+                None,
                 Some(128 << 20),
                 Some((40 * GIB) as u64),
                 47 * GIB,
@@ -6188,15 +6225,15 @@ mod seam_helper_tests {
         assert!(!super::user_pinned_ubatch(&unset));
         assert_eq!(
             super::ubatch_rows(&unset),
-            1024,
-            "no pin, no iGPU: the 1024 default"
+            2048,
+            "no pin, no iGPU: the conservative 2048 default"
         );
 
         let mut aggressive = EngineConfig::default();
         aggressive.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
         assert_eq!(
             super::ubatch_rows(&aggressive),
-            2048,
+            4096,
             "the aggressive discrete default uses a larger prefill chunk"
         );
 
@@ -6226,9 +6263,27 @@ mod seam_helper_tests {
         );
         assert_eq!(
             super::ubatch_rows(&adaptive),
-            1024,
+            2048,
             "…and the height falls back"
         );
+    }
+
+    #[test]
+    fn explicit_ubatch_also_governs_parallel_prefill_unless_overridden() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let mut ec = EngineConfig::default();
+        assert_eq!(super::ubatch_rows_parallel(&ec), 2048);
+
+        ec.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
+        assert_eq!(super::ubatch_rows_parallel(&ec), 4096);
+
+        ec.device.ubatch = Some(3072);
+        ec.device.ubatch_specified = true;
+        assert_eq!(super::ubatch_rows_parallel(&ec), 3072);
+
+        ec.device.ubatch_parallel = 512;
+        ec.device.ubatch_parallel_specified = true;
+        assert_eq!(super::ubatch_rows_parallel(&ec), 512);
     }
 
     #[test]
@@ -6245,7 +6300,7 @@ mod seam_helper_tests {
         assert_eq!(super::ubatch_rows(&explicit), 2048);
         assert_eq!(
             super::moe_ubatch_fallback_candidates(&explicit),
-            vec![2048, 1024, 512, 256, 128]
+            vec![2048, 1536, 1024, 512, 256]
         );
 
         let explicit_3072 = EngineConfig {
@@ -6258,7 +6313,7 @@ mod seam_helper_tests {
         };
         assert_eq!(
             super::moe_ubatch_fallback_candidates(&explicit_3072),
-            vec![3072, 2048, 1024, 512, 256, 128]
+            vec![3072, 2560, 2048, 1536, 1024, 512, 256]
         );
 
         super::repin_ubatch_lower(512);
@@ -6681,7 +6736,7 @@ mod seam_helper_tests {
     }
 
     #[test]
-    fn parallel_qwen38_reserves_independent_attention_partials() {
+    fn parallel_qwen38_reserves_only_token_row_attention_partials() {
         let cfg = Config {
             qwen4exp: true,
             n_head: 48,
@@ -6690,18 +6745,18 @@ mod seam_helper_tests {
             compress_ratios: vec![4],
             ..Default::default()
         };
-        let expected = 3072u64 * 48 * 33 * (128 + 2) * 4;
+        let expected = 48u64 * 33 * (128 + 2) * 4;
         {
             let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::for_slots(1)));
             assert_eq!(
-                super::parallel_prefill_attention_scratch_bytes(&cfg, 163_840, 3072),
+                super::parallel_token_attention_scratch_bytes(&cfg, 163_840),
                 0
             );
         }
         {
             let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::for_slots(2)));
             assert_eq!(
-                super::parallel_prefill_attention_scratch_bytes(&cfg, 163_840, 3072),
+                super::parallel_token_attention_scratch_bytes(&cfg, 163_840),
                 expected
             );
         }
@@ -7009,10 +7064,10 @@ mod seam_helper_tests {
     /// Live FREE bytes on an idle XTX (~23.94 GiB) — the raw `VramInfo::available` figure, which is
     /// NOT the budget: see [`XTX_ROOM`].
     const XTX_FREE: u64 = 25_701_257_216;
-    /// What `VramInfo::alloc_room()` yields for that snapshot: live free minus the allocator
-    /// guard's own 256 MiB headroom. Anything a fit or placement decision plans past this the VRAM
-    /// guard will refuse, so this — not the raw free figure — is the budget.
-    const XTX_ROOM: u64 = XTX_FREE - 256 * 1024 * 1024;
+    /// Physical room after the Vulkan allocator's mandatory 256 MiB guard.
+    const XTX_PHYSICAL_ROOM: u64 = XTX_FREE - 256 * 1024 * 1024;
+    /// Ordinary automatic room after retaining the remaining 768 MiB of its 1 GiB VRAM reserve.
+    const XTX_ROOM: u64 = XTX_PHYSICAL_ROOM - 768 * 1024 * 1024;
 
     /// That box's VRAM snapshot at an arbitrary free figure, as the backend would report it.
     fn xtx(available: u64) -> infr_vulkan::VramInfo {
@@ -7188,16 +7243,9 @@ mod seam_helper_tests {
     }
 
     /// **Regression, the reported case.** gemma-3-12b at its trained 131072 window on a 24 GiB
-    /// XTX fits at f16 — it never needed the q8 cache the clamp used to pin. What used to make it
-    /// miss is priced here explicitly: the DEFAULT 1024-row prefill chunk's activation reserve
-    /// does not fit, a SHORTER rung of the same ladder the dense placement sweep walks does, and
-    /// the sweep would have shrunk to it anyway. Pricing only the default chunk decided the KV
-    /// format against an assumption the very next step abandoned.
-    ///
-    /// Deliberately does not name the winning rung. Which one it is moves with the reserve's own
-    /// coefficients and that is not what this is guarding — the invariant is "the default chunk
-    /// misses, a lower rung on the SHARED ladder saves it, and f16 therefore reaches the trained
-    /// window".
+    /// XTX fits at f16 — it never needed the q8 cache the clamp used to pin. The winning rung can
+    /// move with the profile default and reserve coefficients; the invariant is that context-fit
+    /// checks the same complete ladder as placement and accepts f16 when any rung fits.
     ///
     /// (Whole-run confirmation is `infr bench -d 120000` on the real model, which peaks at
     /// 17.5 GiB of 24.0 GiB — GPU + 8 GiB of weights, so not something a unit test can host.)
@@ -7213,12 +7261,9 @@ mod seam_helper_tests {
                 + super::dense_act_reserve_at(&cfg, &conservative_caps(), want, ub)
         };
         let cands = super::ubatch_candidates(&ec);
-        assert_eq!(cands[0], 1024, "the default chunk leads the ladder");
-        // With the measured reserve this model now fits at the DEFAULT chunk — it no longer needs
-        // a shorter rung to reach its trained window, which is a strictly better outcome than the
-        // one this test was written for (and matches the device: `infr bench -p 131056` runs at
-        // ubatch 1024, 780 t/s, peaking 4735 MiB of activations against a 7146 MiB reserve).
-        // What still has to hold is that SOME rung of the shared ladder serves it.
+        assert_eq!(cands[0], 2048, "the default chunk leads the ladder");
+        // The profile default may change independently of this regression. What has to hold is
+        // that some rung of the shared ladder serves the trained window.
         assert!(
             cands.iter().any(|&ub| need(ub) <= XTX_ROOM),
             "a rung of the shared ladder must serve the trained window: {:?}",
@@ -7461,16 +7506,22 @@ mod seam_helper_tests {
     #[test]
     fn dense_ubatch_ladder_is_the_only_one() {
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
-        assert_eq!(super::DENSE_UBATCH_LADDER, [1024, 512, 256, 128]);
         let unset = EngineConfig::default();
-        assert_eq!(super::ubatch_rows(&unset), 1024);
-        assert_eq!(super::ubatch_candidates(&unset), vec![1024, 512, 256, 128]);
+        assert_eq!(super::ubatch_rows(&unset), 2048);
+        assert_eq!(
+            super::ubatch_candidates(&unset),
+            vec![2048, 1536, 1024, 512, 256]
+        );
 
         let mut aggressive = EngineConfig::default();
         aggressive.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
         assert_eq!(
             super::ubatch_candidates(&aggressive),
-            vec![2048, 1024, 512, 256, 128]
+            vec![4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
+        );
+        assert_eq!(
+            super::ubatch_fallbacks_below(3072),
+            vec![2560, 2048, 1536, 1024, 512, 256]
         );
 
         // Rungs at or above the current height are filtered out — a SHRINK ladder must never
@@ -7488,20 +7539,19 @@ mod seam_helper_tests {
     }
 
     /// **Drift guard (backlog B11).** Every VRAM budget in this file — the residency predicate, the
-    /// streaming budget, the MoE expert budget — must be taken against the ALLOCATOR's ceiling
-    /// (`VramInfo::alloc_room` = free minus the guard's 256 MiB headroom), never the raw free
-    /// figure. The placement sweeps used to compare against `vram.available`, so they could declare
-    /// a model resident, or hand a pager an arena, 256 MiB past anything `check_vram_budget` will
-    /// ever allocate — which surfaces as a failed activation alloc mid-prefill.
+    /// streaming budget, the MoE expert budget — must use the same profile-aware ceiling as the
+    /// allocator. The physical base is `VramInfo::alloc_room` (free minus the mandatory 256 MiB
+    /// guard); ordinary automatic mode then retains another 768 MiB. The placement sweeps once
+    /// compared against raw `vram.available`, which could declare a model resident past the guard.
     ///
-    /// Each assertion below is placed ONE BYTE either side of the ceiling, so restoring any
-    /// `vram.available` comparison flips it: the raw figure accepts every "must not" case here.
+    /// Each assertion below is placed ONE BYTE either side of the final policy ceiling, so using
+    /// either raw free space or only the physical guard flips it.
     #[test]
     fn budgets_agree_with_the_allocator_ceiling() {
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let vram = xtx(XTX_FREE);
         const GUARD: u64 = 256 * 1024 * 1024;
-        assert_eq!(vram.alloc_room(), XTX_ROOM);
+        assert_eq!(vram.alloc_room(), XTX_PHYSICAL_ROOM);
         assert_eq!(
             vram.available - vram.alloc_room(),
             GUARD,
@@ -7536,14 +7586,14 @@ mod seam_helper_tests {
         );
         assert!(
             !fits(exact + 1),
-            "one byte PAST the guard's ceiling must not be placed resident"
+            "one byte past the automatic policy ceiling must not be placed resident"
         );
         assert!(
             exact + 1 + kv_and_act <= vram.available,
-            "…and that byte is one the raw free figure would have accepted, which is the bug"
+            "the raw free figure would have accepted that byte"
         );
 
-        // Streaming budget: exhausted at the ceiling, and it never offers the guard's headroom.
+        // Streaming budget: exhausted at the ceiling, and it never offers policy headroom.
         // Chunk-major is the default and needs no cross-layer residual reservation.
         let lm = super::layer_major_act_bytes(&cfg, ctx, ub);
         assert!(
@@ -7607,11 +7657,11 @@ mod seam_helper_tests {
         assert_eq!(
             super::ModelMemoryPlan::new(XTX_ROOM, XTX_ROOM + 1, 0, 0),
             None,
-            "a dense half past the ceiling is a hard error, not a 256 MiB overdraft"
+            "a dense half past the policy ceiling is a hard error"
         );
         assert!(
             XTX_ROOM < vram.available,
-            "…again a case the raw free figure would have waved through"
+            "the raw free figure is intentionally larger than the policy ceiling"
         );
     }
 
@@ -7815,7 +7865,7 @@ mod seam_helper_tests {
             "a measured deficit rounds up and skips directly past it"
         );
         assert_eq!(
-            super::next_auto_moe_arena_budget(current, 2 * GIB64, 1 * MIB),
+            super::next_auto_moe_arena_budget(current, 2 * GIB64, MIB),
             Some(current - 64 * MIB),
             "a small measured deficit must not trigger the conservative five-percent step"
         );
@@ -7921,9 +7971,9 @@ mod seam_helper_tests {
         // A shape where the ladder is genuinely WALKED — otherwise "they agree" would be satisfied
         // by both picking the default rung and the guard would prove nothing. Derived, not
         // hardcoded: the heaviest weights that still fit at the 512-row rung, which by construction
-        // cannot fit at 1024. (The reported gemma-3-12b @131072 case no longer needs a shorter rung
-        // at all — the measured reserve is small enough that the default chunk holds it — so the
-        // agreement is checked here and the trained-window outcome in
+        // cannot fit at any taller rung. (The reported gemma-3-12b @131072 case no longer needs a
+        // shorter rung at its measured 1024-row setting, so the agreement is checked here and the
+        // trained-window outcome in
         // `kv_fit_walks_the_placement_chunk_ladder_gemma3_12b`.)
         let want = cfg.n_ctx_train;
         let heavy = XTX_ROOM
@@ -7934,7 +7984,10 @@ mod seam_helper_tests {
                 + super::kv_bytes_estimate_fmt(&cfg, want, true, ub, k, v)
                 + super::dense_act_reserve_at(&cfg, &conservative_caps(), want, ub)
         };
-        assert!(need_heavy(1024) > XTX_ROOM, "the default chunk must miss");
+        assert!(
+            need_heavy(cands[0]) > XTX_ROOM,
+            "the default chunk must miss"
+        );
         assert!(
             need_heavy(512) <= XTX_ROOM,
             "…and the 512-row rung must save it"

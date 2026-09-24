@@ -3451,7 +3451,8 @@ impl<'a> Recorder<'a> {
         debug_assert!((2..=8).contains(&rows));
         assert_native_k("linear_native_mrow_at", in_f);
         self.label_gemv("mrow_streamed", rows, in_f, out_f);
-        let (name, spv) = crate::gemm::native_mrow_spv(dtype).expect("native mrow streamed spv");
+        let (name, spv) =
+            crate::gemm::native_mrow_spv(dtype, rows).expect("native mrow streamed spv");
         let k = self.be.kernel(name, spv, 3, 24);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
@@ -9274,7 +9275,37 @@ impl<'a> Recorder<'a> {
 
         let decode8 = rows == 1 && self.vk().qsa_score_decode8;
         let segmented = segment_shifts.is_some();
-        let (score_name, score_spv, block_tile, query_tile) = if decode8 && segmented {
+        let h4 = rows > 1 && n_head == 4 && head_dim == 128;
+        let decode8_h4 = decode8 && n_head == 4 && head_dim == 128;
+        let (score_name, score_spv, block_tile, query_tile) = if decode8_h4 && segmented {
+            (
+                "qsa_indexer_score_decode8_h4_seg",
+                crate::gemm::qsa_indexer_score_decode8_h4_seg_spv(),
+                8,
+                1,
+            )
+        } else if decode8_h4 {
+            (
+                "qsa_indexer_score_decode8_h4",
+                crate::gemm::qsa_indexer_score_decode8_h4_spv(),
+                8,
+                1,
+            )
+        } else if h4 && segmented {
+            (
+                "qsa_indexer_score_h4_seg",
+                crate::gemm::qsa_indexer_score_h4_seg_spv(),
+                4,
+                2,
+            )
+        } else if h4 {
+            (
+                "qsa_indexer_score_h4",
+                crate::gemm::qsa_indexer_score_h4_spv(),
+                4,
+                2,
+            )
+        } else if decode8 && segmented {
             (
                 "qsa_indexer_score_decode8_seg",
                 crate::gemm::qsa_indexer_score_decode8_seg_spv(),
@@ -10043,7 +10074,7 @@ impl<'a> Recorder<'a> {
     ) {
         self.deltanet_seq_split_off(
             q, k, v, blog, alpha, acoef, dtbias, state, out, kn, qn, bet, dec, rows, nv, nk, kd,
-            vd, eps, 0, 0, 0, 0, 0, 0,
+            vd, eps, 0, 0, 0, 0, 0, 0, None,
         );
     }
 
@@ -10077,6 +10108,7 @@ impl<'a> Recorder<'a> {
         blog_off: usize,
         alpha_off: usize,
         out_off: usize,
+        state_trace: Option<&dyn Buffer>,
     ) {
         debug_assert_eq!(
             kd, 128,
@@ -10133,28 +10165,53 @@ impl<'a> Recorder<'a> {
             (rows * nv).div_ceil(256) as u32,
         );
         // pass 3: seq scan — one 32-lane workgroup per (value head, state column)
-        let ks = self
-            .be
-            .kernel_sg("deltanet_seq", crate::gemm::deltanet_seq_spv(), 7, 20, 32);
-        let mut p3 = [0u8; 20];
-        p3[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
-        p3[4..8].copy_from_slice(&(nv as u32).to_ne_bytes());
-        p3[8..12].copy_from_slice(&(nk as u32).to_ne_bytes());
-        p3[12..16].copy_from_slice(&(kd as u32).to_ne_bytes());
-        p3[16..20].copy_from_slice(&(vd as u32).to_ne_bytes());
+        let ks = if state_trace.is_some() {
+            self.be.kernel_sg(
+                "deltanet_seq_trace",
+                crate::gemm::deltanet_seq_trace_spv(),
+                8,
+                24,
+                32,
+            )
+        } else {
+            self.be
+                .kernel_sg("deltanet_seq", crate::gemm::deltanet_seq_spv(), 7, 20, 32)
+        };
+        let mut bindings = vec![
+            Self::vkb(kn),
+            Self::vkb(qn),
+            Self::vkb_off(v, v_off),
+            Self::vkb(bet),
+            Self::vkb(dec),
+            Self::vkb(state),
+            Self::vkb_off(out, out_off),
+        ];
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        let (n_out, push_len) = if let Some(trace) = state_trace {
+            bindings.push(Self::vkb(trace));
+            let state_bytes = nv * kd * vd * 4;
+            debug_assert_eq!(trace.len_bytes() % state_bytes, 0);
+            let trace_rows = trace.len_bytes() / state_bytes;
+            debug_assert!(trace_rows <= rows);
+            push[4..8].copy_from_slice(&(trace_rows as u32).to_ne_bytes());
+            push[8..12].copy_from_slice(&(nv as u32).to_ne_bytes());
+            push[12..16].copy_from_slice(&(nk as u32).to_ne_bytes());
+            push[16..20].copy_from_slice(&(kd as u32).to_ne_bytes());
+            push[20..24].copy_from_slice(&(vd as u32).to_ne_bytes());
+            (3, 24)
+        } else {
+            push[4..8].copy_from_slice(&(nv as u32).to_ne_bytes());
+            push[8..12].copy_from_slice(&(nk as u32).to_ne_bytes());
+            push[12..16].copy_from_slice(&(kd as u32).to_ne_bytes());
+            push[16..20].copy_from_slice(&(vd as u32).to_ne_bytes());
+            (2, 20)
+        };
         self.dispatch(
             ks,
-            &[
-                Self::vkb(kn),
-                Self::vkb(qn),
-                Self::vkb_off(v, v_off),
-                Self::vkb(bet),
-                Self::vkb(dec),
-                Self::vkb(state),
-                Self::vkb_off(out, out_off),
-            ],
-            2, // state (in/out) + out
-            &p3,
+            &bindings,
+            n_out,
+            &push[..push_len],
             (nv * (vd / DN_SEQ_NCOL)) as u32,
         );
     }
@@ -10177,6 +10234,54 @@ impl<'a> Recorder<'a> {
             .device_addr()
             .expect("resident-BDA weight: conv1d_silu requires a u64 BDA device address");
         self.conv1d_silu_at(qkv, arena_addr, state, out, rows, cc, kconv);
+    }
+
+    /// Sequential conv1d used by MTP VERIFY, additionally writing the complete recurrent history
+    /// after each row represented by the capacity of `state_trace`.
+    pub fn conv1d_silu_trace(
+        &self,
+        qkv: &dyn Buffer,
+        w: &dyn Buffer,
+        state: &dyn Buffer,
+        state_trace: &dyn Buffer,
+        out: &dyn Buffer,
+        rows: usize,
+        cc: usize,
+        kconv: usize,
+    ) {
+        let arena_addr = w
+            .device_addr()
+            .expect("resident-BDA weight: conv1d_silu_trace requires a u64 BDA device address");
+        let kern = self.be.kernel(
+            "conv1d_silu_trace",
+            crate::gemm::conv1d_silu_trace_spv(),
+            5,
+            24,
+        );
+        let state_bytes = (kconv - 1) * cc * 4;
+        debug_assert_eq!(state_trace.len_bytes() % state_bytes, 0);
+        let trace_rows = state_trace.len_bytes() / state_bytes;
+        debug_assert!(trace_rows <= rows);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(trace_rows as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(cc as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(kconv as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch(
+            kern,
+            &[
+                Self::vkb(qkv),
+                Self::vkb(qkv),
+                Self::vkb(state),
+                Self::vkb(out),
+                Self::vkb(state_trace),
+            ],
+            3,
+            &push,
+            (cc as u32).div_ceil(256),
+        );
     }
 
     /// BATCH depthwise conv1d + SiLU (rows ≥ kconv-1): pass 1 computes ALL rows·cc outputs in
@@ -11592,6 +11697,15 @@ impl<'a> Recorder<'a> {
             Self::vkb(lut),
             Self::vkb(y),
         ];
+        if rows > 1 {
+            let nr = self.gemv().id_grid_nr;
+            if let Some((name, spv)) = crate::gemm::native_idm_grid_nr_paged_build_spv(dtype, nr) {
+                let k = self.be.kernel(name, spv, 5, 44);
+                let groups = (rows * n_used * out_f.div_ceil(nr as usize)) as u32;
+                self.dispatch_wide(k, &bufs, 1, &push, groups);
+                return;
+            }
+        }
         if rows == 1 {
             if let Some(nr) = native_id_sg_choice(dtype, in_f, out_f, self.gemv()) {
                 if let Some((name, spv)) =
@@ -13691,6 +13805,94 @@ mod tests {
                 "phase {phase}: segmented QSA block cache diverges at 32K: {block_err:e}"
             );
         }
+
+        // Batched prefill uses the four-head score specialization. Compare its flat and segmented
+        // variants over two causal rows so the production segmented route stays covered.
+        const SCORE_ROWS: usize = 2;
+        let q2v = qv
+            .iter()
+            .copied()
+            .cycle()
+            .take(SCORE_ROWS * HEADS * HD)
+            .collect::<Vec<_>>();
+        let q2 = upf16(&be, &q2v);
+        let scores2_flat = be
+            .alloc(SCORE_ROWS * blocks * 4, BufferUsage::Readback)
+            .unwrap();
+        let scores2_segmented = be
+            .alloc(SCORE_ROWS * blocks * 4, BufferUsage::Readback)
+            .unwrap();
+        let ids2_flat = be
+            .alloc(SCORE_ROWS * TOP * 4, BufferUsage::Readback)
+            .unwrap();
+        let ids2_segmented = be
+            .alloc(SCORE_ROWS * TOP * 4, BufferUsage::Readback)
+            .unwrap();
+        let rec = be.recorder().unwrap();
+        for (raw, block, scores, ids, shifts) in [
+            (
+                raw_flat.as_ref(),
+                block_flat.as_ref(),
+                scores2_flat.as_ref(),
+                ids2_flat.as_ref(),
+                None,
+            ),
+            (
+                raw_virtual.table_buffer(),
+                block_virtual.table_buffer(),
+                scores2_segmented.as_ref(),
+                ids2_segmented.as_ref(),
+                segment_shifts,
+            ),
+        ] {
+            rec.qsa_indexer(
+                q2.as_ref(),
+                raw,
+                block,
+                nw.as_ref(),
+                scores,
+                None,
+                ids,
+                SCORE_ROWS as u32,
+                kv_len as u32,
+                blocks as u32,
+                HEADS as u32,
+                HD as u32,
+                TOP as u32,
+                RATIO as u32,
+                64,
+                10_000.0,
+                1e-6,
+                1.0 / (HD as f32).sqrt(),
+                shifts,
+                None,
+            );
+        }
+        rec.finish().unwrap();
+
+        let flat_scores2 = download_f32(&be, scores2_flat.as_ref(), SCORE_ROWS * blocks);
+        let segmented_scores2 = download_f32(&be, scores2_segmented.as_ref(), SCORE_ROWS * blocks);
+        for row in 0..SCORE_ROWS {
+            let visible_blocks = (kv_len - SCORE_ROWS + row + 1) / RATIO;
+            let score_err = flat_scores2[row * blocks..row * blocks + visible_blocks]
+                .iter()
+                .zip(&segmented_scores2[row * blocks..row * blocks + visible_blocks])
+                .map(|(flat, segmented)| (flat - segmented).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                score_err < 1e-5,
+                "batched segmented QSA score row {row} diverges at 32K: {score_err:e}"
+            );
+        }
+        let mut flat_ids2 = vec![0u8; SCORE_ROWS * TOP * 4];
+        let mut segmented_ids2 = vec![0u8; SCORE_ROWS * TOP * 4];
+        be.download(ids2_flat.as_ref(), &mut flat_ids2).unwrap();
+        be.download(ids2_segmented.as_ref(), &mut segmented_ids2)
+            .unwrap();
+        assert_eq!(
+            segmented_ids2, flat_ids2,
+            "batched segmented QSA selected different blocks across 32K"
+        );
 
         // The production default is planar Q8 K/V, whose scale plane is local to each physical
         // segment. Exercise a single write that straddles the exact 32K cut, then read those rows

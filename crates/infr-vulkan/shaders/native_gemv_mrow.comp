@@ -7,8 +7,9 @@
 // over-K shape — one workgroup per OUTPUT, 64 threads own whole 32-elem sub-blocks, decode each
 // weight sub-block once (dqblk), then dot it against ALL rows' activations (L2-resident: m·k·4 is
 // a few hundred KiB) — so the per-call cost stays near the m=1 GEMV for every m ≤ 8.
-// -DFMT_* selects the format (shared native_decode.glsl). MR is fixed at 8; the r-loops are
-// compile-time unrolled with uniform `r < pc.rows` guards, keeping acc[] in registers.
+// -DFMT_* selects the format (shared native_decode.glsl). MR defaults to 8; hot fixed-row builds
+// may lower it at compile time so inactive rows do not consume accumulators/registers. The
+// r-loops remain compile-time unrolled with uniform `r < pc.rows` guards.
 // Reduction: per-row subgroupAdd within each wave + one shared combine across the gl_NumSubgroups
 // waves (one barrier total, wave-size-agnostic — same pattern as rmsnorm.comp/mul_mat_vec_q.comp)
 // — replaces the old 8-row shared-tree reduce (6 levels / 7 barriers over 2 KiB of LDS). The m=1
@@ -33,9 +34,12 @@ layout(push_constant) uniform PC {
 layout(binding = 1) readonly buffer XB { vec4 x4[]; };
 layout(binding = 2) buffer YB { float y_buf[]; };
 
-const uint MR = 8u;
+#ifndef MR
+#define MR 8
+#endif
+const uint MAX_ROWS = MR;
 const uint MAX_SG = 8u;             // 64 threads / min 8-wide subgroup
-shared float part[MR * MAX_SG];     // one partial per (row, subgroup)
+shared float part[MAX_ROWS * MAX_SG]; // one partial per (row, subgroup)
 
 #include "native_weight_addr.glsl"
 #define NW(i) arena_word(i)
@@ -53,8 +57,8 @@ void main() {
     uint wbase = pc.w_base + o * pc.in_f;
     uint nsub = pc.in_f / 32u;
     uint in_f4 = pc.in_f >> 2u;
-    float acc[MR];
-    for (uint r = 0u; r < MR; r++) { acc[r] = 0.0; }
+    float acc[MAX_ROWS];
+    for (uint r = 0u; r < MAX_ROWS; r++) { acc[r] = 0.0; }
     for (uint s = t; s < nsub; s += 64u) {
         float v[32];
         dqblk(wbase + s * 32u, v);
@@ -64,7 +68,7 @@ void main() {
             v4[w4] = vec4(v[4u * w4], v[4u * w4 + 1u], v[4u * w4 + 2u], v[4u * w4 + 3u]);
         }
         uint xo4 = s * 8u;
-        for (uint r = 0u; r < MR; r++) {
+        for (uint r = 0u; r < MAX_ROWS; r++) {
             if (r < pc.rows) {
                 uint b = r * in_f4 + xo4;
                 vec4 a = v4[0] * x4[b] + v4[1] * x4[b + 1u];
@@ -75,7 +79,7 @@ void main() {
             }
         }
     }
-    for (uint r = 0u; r < MR; r++) {
+    for (uint r = 0u; r < MAX_ROWS; r++) {
         if (r < pc.rows) {
             float sg = subgroupAdd(acc[r]);
             if (subgroupElect()) { part[r * MAX_SG + gl_SubgroupID] = sg; }

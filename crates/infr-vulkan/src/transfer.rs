@@ -1420,7 +1420,7 @@ mod tests {
 
     #[test]
     fn frozen_import_plan_resolves_only_its_imported_prefix() {
-        let host = vec![0u8; 128];
+        let host = [0u8; 128];
         let plan = SessionTransferPlan::new(vec![ImportedHostAllocation {
             base: host.as_ptr() as usize,
             logical_len: host.len(),
@@ -1457,7 +1457,7 @@ mod tests {
 
     #[test]
     fn shedding_an_idle_import_tail_preserves_the_remaining_prefix() {
-        let host = vec![0u8; 64];
+        let host = [0u8; 64];
         let plan = SessionTransferPlan::new(vec![ImportedHostAllocation {
             base: host.as_ptr() as usize,
             logical_len: host.len(),
@@ -1483,7 +1483,7 @@ mod tests {
 
     #[test]
     fn shedding_does_not_release_a_tail_retained_by_a_command() {
-        let host = vec![0u8; 64];
+        let host = [0u8; 64];
         let tail: Arc<dyn Buffer> = Arc::new(DummyBuffer(32));
         let command_keepalive = Arc::clone(&tail);
         let plan = SessionTransferPlan::new(vec![ImportedHostAllocation {

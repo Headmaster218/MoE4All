@@ -300,6 +300,41 @@ function Select-EmbeddingModelPath {
     }
 }
 
+function Select-MtpModelPath {
+    param([AllowEmptyString()][string]$Default = '')
+
+    while ($true) {
+        $inputPath = Read-TextValue -Label 'MTP 头 GGUF 文件或目录 / MTP-head GGUF file or directory' -Default $Default -Required
+        try {
+            $path = ConvertTo-FullPath $inputPath
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+                if ([System.IO.Path]::GetExtension($path) -ine '.gguf') {
+                    throw '文件扩展名不是 .gguf。The file extension is not .gguf.'
+                }
+                return $path
+            }
+            if (Test-Path -LiteralPath $path -PathType Container) {
+                $models = @(Get-ChildItem -LiteralPath $path -File | Where-Object {
+                    $_.Extension -ieq '.gguf' -and
+                    $_.Name -notlike 'mmproj*' -and
+                    ($_.Name -notmatch '-\d{5}-of-\d{5}\.gguf$' -or $_.Name -match '-00001-of-\d{5}\.gguf$')
+                } | Sort-Object Name)
+                if ($models.Count -eq 1) {
+                    return $models[0].FullName
+                }
+                if ($models.Count -eq 0) {
+                    throw '目录中没有 MTP GGUF 文件。The directory contains no MTP GGUF file.'
+                }
+                throw "目录中有 $($models.Count) 个候选 MTP GGUF，请输入具体文件路径。The directory contains $($models.Count) MTP GGUF candidates; enter the exact file path."
+            }
+            throw '路径不存在。The path does not exist.'
+        } catch {
+            Write-Host $_.Exception.Message -ForegroundColor Yellow
+            $Default = ''
+        }
+    }
+}
+
 function Find-VisionProjectorPath {
     param([Parameter(Mandatory = $true)][string]$ModelPath)
 
@@ -481,8 +516,8 @@ $banner = @'
 
 Write-Host $banner -ForegroundColor Green
 Write-Host "  MoE4All v$productVersion" -ForegroundColor Green
-Write-Host '  Making huge MoE LLMs accessible to AMD users.'
-Write-Host '  让 A 卡用户也能在本地运行大型 MoE AI！'
+Write-Host '  Run models far larger than VRAM on gaming GPUs.'
+Write-Host '  让游戏显卡跑起远超显存容量的大模型。'
 Write-Host '  John / Headmaster218  https://github.com/Headmaster218/MoE4All' -ForegroundColor DarkGray
 Write-Host '============================================================' -ForegroundColor Green
 Write-Host 'MoE4All 启动向导 / MoE4All Launch Wizard' -ForegroundColor Green
@@ -566,9 +601,17 @@ if ($setupMode -eq 'manual') {
     Write-Host 'Hardware stays auto-detected, with tighter RAM/VRAM headroom, a larger Ubatch and a wider Submit cap search.' -ForegroundColor DarkGray
     Write-Host '适合追求吞吐且能接受更高资源压力；启动失败或系统换页时请改用保守档。' -ForegroundColor Yellow
     Write-Host 'Use conservative mode if allocation fails or Windows starts paging.' -ForegroundColor DarkGray
+    $context = Read-TextValue -Label '上下文窗口，留空为自动 / Context window, blank for auto' -Default $context
+    $kvPreset = 'q8'
+    $kvTypeK = 'q8_0'
+    $kvTypeV = 'q8_0'
 } else {
-    Write-Host "`n将自动探测 GPU、上下文、显存和 RAM；不覆盖引擎默认值。" -ForegroundColor DarkGray
-    Write-Host 'GPU, context, VRAM and RAM will be detected automatically; engine defaults stay intact.' -ForegroundColor DarkGray
+    Write-Host "`n将自动探测 GPU、显存和 RAM；上下文留空时由引擎自动确定。" -ForegroundColor DarkGray
+    Write-Host 'GPU, VRAM and RAM will be detected automatically; leave context blank for engine sizing.' -ForegroundColor DarkGray
+    $context = Read-TextValue -Label '上下文窗口，留空为自动 / Context window, blank for auto' -Default $context
+    $kvPreset = 'q8'
+    $kvTypeK = 'q8_0'
+    $kvTypeV = 'q8_0'
 }
 
 $vramBudget = [string](Get-SavedValue 'vram_budget' '')
@@ -662,6 +705,9 @@ if ([string]::IsNullOrWhiteSpace($visionProjectorPath) -or -not (Test-Path -Lite
 $serverEmbedding = [bool](Get-SavedValue 'server_embedding' $false)
 $embeddingModelPath = [string](Get-SavedValue 'embedding_model' '')
 $embeddingIdleTimeout = [string](Get-SavedValue 'embedding_idle_timeout' '300')
+$mtpEnabled = [bool](Get-SavedValue 'mtp_enabled' $false)
+$mtpModelPath = [string](Get-SavedValue 'mtp_model' '')
+$mtpVerifyTokens = [string](Get-SavedValue 'mtp_verify_tokens' '4')
 
 if ($launchMode -eq 'benchmark') {
     $benchKind = Read-Choice -Label '测试类型 / Benchmark type' -DefaultValue $benchKind -Options @(
@@ -726,34 +772,60 @@ if ($launchMode -eq 'benchmark') {
         $seed = Read-IntegerValue -Label '随机种子，留空为随机 / Seed, blank for random' -Default $seed -Minimum 0 -AllowBlank
     }
 
+    $mtpEnabled = Read-YesNo -Label '启用 Qwen3.8 MTP 单路加速？/ Enable Qwen3.8 MTP single-stream acceleration?' -Default $mtpEnabled
+    if ($mtpEnabled) {
+        Write-Host 'MTP 当前仅支持 Qwen3.8 Vulkan、greedy 解码和单并发；API 请求指定非零 temperature 时会自动回退普通 decode。' -ForegroundColor Yellow
+        Write-Host 'MTP currently supports Qwen3.8 Vulkan, greedy decoding and one request at a time. API requests with non-zero temperature fall back to ordinary decode.' -ForegroundColor DarkGray
+        $mtpModelPath = Select-MtpModelPath -Default $mtpModelPath
+        $mtpVerifyTokens = Read-Choice -Label 'MTP 批量验证宽度 / MTP batched verification width' -DefaultValue $mtpVerifyTokens -Options @(
+            [pscustomobject]@{ Key = '1'; Value = '4'; Label = '4 tokens（推荐）/ 4 tokens (recommended)' }
+            [pscustomobject]@{ Key = '2'; Value = '3'; Label = '3 tokens' }
+            [pscustomobject]@{ Key = '3'; Value = '2'; Label = '2 tokens' }
+        )
+    }
+
     if ($launchMode -eq 'server') {
         Write-Host "`nAPI 服务器 / API server" -ForegroundColor Cyan
         Write-Host '本机使用 127.0.0.1；局域网访问可用 0.0.0.0，但应启用 API key。' -ForegroundColor DarkGray
         Write-Host 'Use 127.0.0.1 locally. For LAN access use 0.0.0.0 and enable an API key.' -ForegroundColor DarkGray
         $serverAddr = Read-ListenAddress -Label '监听地址（IP:端口）/ Listen address (IP:port)' -Default $serverAddr
-        $serverParallel = Read-IntegerValue -Label '并发会话数（每个会话有独立 KV）/ Concurrent slots (one KV cache each)' -Default $serverParallel -Minimum 1
-        $serverSessionCache = Read-YesNo -Label '将闲置会话 KV 缓存到 SSD？/ Cache idle-session KV on SSD?' -Default $serverSessionCache
-        if ($serverSessionCache) {
-            Write-Host '闲置会话会在后台写入 SSD 并释放显存；再次访问时自动恢复。仅支持动态分段 Q8 KV。' -ForegroundColor DarkGray
-            Write-Host 'Idle sessions are written to SSD in the background and restored on demand. Dynamic segmented Q8 KV is required.' -ForegroundColor DarkGray
-            $sessionCacheDir = Read-TextValue -Label 'KV 缓存目录 / KV cache directory' -Default $sessionCacheDir -Required
-            $sessionCacheDir = ConvertTo-FullPath $sessionCacheDir
-            $sessionIdleSecs = Read-IntegerValue -Label '会话闲置多少秒后写入 SSD / Spill after idle seconds' -Default $sessionIdleSecs -Minimum 0
-            $sessionCacheMax = Read-TextValue -Label 'SSD KV 缓存总上限（绝对大小）/ Total SSD KV cache limit (absolute size)' -Default $sessionCacheMax -Required
-            $sessionCacheTtlHours = Read-IntegerValue -Label '缓存保留小时数，0 为不按时间清理 / Cache TTL hours, 0 disables age expiry' -Default $sessionCacheTtlHours -Minimum 0
+        if ($mtpEnabled) {
+            $serverParallel = '1'
+            $serverSessionCache = $false
+            Write-Host 'MTP v1 使用串行单会话服务；并发数固定为 1，SSD 会话 KV 缓存关闭。' -ForegroundColor Yellow
+            Write-Host 'MTP v1 uses the serialized single-session server; parallelism is fixed at 1 and the SSD session cache is disabled.' -ForegroundColor DarkGray
+        } else {
+            $serverParallel = Read-IntegerValue -Label '并发会话数（每个会话有独立 KV）/ Concurrent slots (one KV cache each)' -Default $serverParallel -Minimum 1
+            $serverSessionCache = Read-YesNo -Label '将闲置会话 KV 缓存到 SSD？/ Cache idle-session KV on SSD?' -Default $serverSessionCache
+            if ($serverSessionCache) {
+                Write-Host '闲置会话会在后台写入 SSD 并释放显存；再次访问时自动恢复。仅支持动态分段 Q8 KV。' -ForegroundColor DarkGray
+                Write-Host 'Idle sessions are written to SSD in the background and restored on demand. Dynamic segmented Q8 KV is required.' -ForegroundColor DarkGray
+                $sessionCacheDir = Read-TextValue -Label 'KV 缓存目录 / KV cache directory' -Default $sessionCacheDir -Required
+                $sessionCacheDir = ConvertTo-FullPath $sessionCacheDir
+                $sessionIdleSecs = Read-IntegerValue -Label '会话闲置多少秒后写入 SSD / Spill after idle seconds' -Default $sessionIdleSecs -Minimum 0
+                $sessionCacheMax = Read-TextValue -Label 'SSD KV 缓存总上限（绝对大小）/ Total SSD KV cache limit (absolute size)' -Default $sessionCacheMax -Required
+                $sessionCacheTtlHours = Read-IntegerValue -Label '缓存保留小时数，0 为不按时间清理 / Cache TTL hours, 0 disables age expiry' -Default $sessionCacheTtlHours -Minimum 0
+            }
         }
-        $serverVision = Read-YesNo -Label '启用视觉图片理解？/ Enable image understanding?' -Default $serverVision
-        if ($serverVision) {
-            Write-Host '视觉权重按图片请求从 SSD 临时载入统一显存，处理完全部图片后立即释放。API 图片请使用 data URI 或 base64。' -ForegroundColor DarkGray
-            Write-Host 'Vision weights use request-scoped unified VRAM and are released after the image batch. API images must be data URIs or base64.' -ForegroundColor DarkGray
-            $visionProjectorPath = Select-VisionProjectorPath -Default $visionProjectorPath
-        }
-        $serverEmbedding = Read-YesNo -Label '同时提供 Embedding API？/ Also serve the Embedding API?' -Default $serverEmbedding
-        if ($serverEmbedding) {
-            Write-Host 'Embedding 首次请求时从 GGUF/SSD 载入统一显存；空闲超时后释放，不建立额外 RAM 权重缓存。' -ForegroundColor DarkGray
-            Write-Host 'Weights load from GGUF/SSD into unified VRAM on demand and are released after the idle timeout; no extra RAM weight cache is kept.' -ForegroundColor DarkGray
-            $embeddingModelPath = Select-EmbeddingModelPath -Default $embeddingModelPath
-            $embeddingIdleTimeout = Read-IntegerValue -Label 'Embedding 空闲释放秒数，0 为服务期间常驻 / Idle eviction seconds, 0 keeps resident' -Default $embeddingIdleTimeout -Minimum 0
+        if ($mtpEnabled) {
+            $serverVision = $false
+            $serverEmbedding = $false
+            Write-Host 'MTP v1 暂不与视觉或同进程 Embedding API 同时启用。' -ForegroundColor Yellow
+            Write-Host 'MTP v1 cannot currently be combined with vision or the in-process Embedding API.' -ForegroundColor DarkGray
+        } else {
+            $serverVision = Read-YesNo -Label '启用视觉图片理解？/ Enable image understanding?' -Default $serverVision
+            if ($serverVision) {
+                Write-Host '视觉权重按图片请求从 SSD 临时载入统一显存，处理完全部图片后立即释放。API 图片请使用 data URI 或 base64。' -ForegroundColor DarkGray
+                Write-Host 'Vision weights use request-scoped unified VRAM and are released after the image batch. API images must be data URIs or base64.' -ForegroundColor DarkGray
+                $visionProjectorPath = Select-VisionProjectorPath -Default $visionProjectorPath
+            }
+            $serverEmbedding = Read-YesNo -Label '同时提供 Embedding API？/ Also serve the Embedding API?' -Default $serverEmbedding
+            if ($serverEmbedding) {
+                Write-Host 'Embedding 首次请求时从 GGUF/SSD 载入统一显存；空闲超时后释放，不建立额外 RAM 权重缓存。' -ForegroundColor DarkGray
+                Write-Host 'Weights load from GGUF/SSD into unified VRAM on demand and are released after the idle timeout; no extra RAM weight cache is kept.' -ForegroundColor DarkGray
+                $embeddingModelPath = Select-EmbeddingModelPath -Default $embeddingModelPath
+                $embeddingIdleTimeout = Read-IntegerValue -Label 'Embedding 空闲释放秒数，0 为服务期间常驻 / Idle eviction seconds, 0 keeps resident' -Default $embeddingIdleTimeout -Minimum 0
+            }
         }
         $serverAuth = Read-YesNo -Label '启用 Bearer API key 鉴权？/ Enable Bearer API-key authentication?' -Default $serverAuth
         if ($serverAuth) {
@@ -782,16 +854,16 @@ $nativeArgs = [System.Collections.Generic.List[string]]::new()
 if ($setupMode -eq 'manual') {
     if (-not [string]::IsNullOrWhiteSpace($configPath)) { [void]$nativeArgs.Add('--config'); [void]$nativeArgs.Add($configPath) }
     if (-not [string]::IsNullOrWhiteSpace($device)) { [void]$nativeArgs.Add('--dev'); [void]$nativeArgs.Add($device) }
-    if (-not [string]::IsNullOrWhiteSpace($context)) { [void]$nativeArgs.Add('--ctx'); [void]$nativeArgs.Add($context) }
     if (-not [string]::IsNullOrWhiteSpace($ubatch)) { [void]$nativeArgs.Add('--ubatch'); [void]$nativeArgs.Add($ubatch) }
     if (-not [string]::IsNullOrWhiteSpace($threads)) { [void]$nativeArgs.Add('--threads'); [void]$nativeArgs.Add($threads) }
 }
+if (-not [string]::IsNullOrWhiteSpace($context)) { [void]$nativeArgs.Add('--ctx'); [void]$nativeArgs.Add($context) }
 
 if ($setupMode -eq 'conservative' -or $setupMode -eq 'aggressive') {
     Add-SetArgument $nativeArgs 'device.auto_profile' $setupMode
 }
 
-if ($setupMode -eq 'manual' -and $kvPreset -ne 'auto') {
+if ($kvPreset -ne 'auto') {
     Add-SetArgument $nativeArgs 'kv.type_k' $kvTypeK
     Add-SetArgument $nativeArgs 'kv.type_v' $kvTypeV
 }
@@ -834,6 +906,13 @@ if ($setupMode -eq 'manual' -and -not [string]::IsNullOrWhiteSpace($customSets))
         Add-SetArgument $nativeArgs $settingPath $entry.Substring($equals + 1).Trim()
     }
 }
+if ($launchMode -ne 'benchmark') {
+    Add-SetArgument $nativeArgs 'spec.mtp' $mtpEnabled.ToString().ToLowerInvariant()
+    if ($mtpEnabled) {
+        Add-SetArgument $nativeArgs 'spec.draft' $mtpModelPath
+        Add-SetArgument $nativeArgs 'spec.k' $mtpVerifyTokens
+    }
+}
 
 if ($launchMode -eq 'benchmark') {
     if ($benchKind -eq 'mixed') {
@@ -857,7 +936,9 @@ if ($launchMode -eq 'benchmark') {
         [void]$nativeArgs.Add('--reasoning-effort'); [void]$nativeArgs.Add($reasoningEffort)
     }
     if ($maxNew) { [void]$nativeArgs.Add('--max-new'); [void]$nativeArgs.Add($maxNew) }
-    if ($configureSampling) {
+    if ($mtpEnabled) {
+        [void]$nativeArgs.Add('--temp'); [void]$nativeArgs.Add('0')
+    } elseif ($configureSampling) {
         if ($temperature) { [void]$nativeArgs.Add('--temp'); [void]$nativeArgs.Add($temperature) }
         if ($topK) { [void]$nativeArgs.Add('--top-k'); [void]$nativeArgs.Add($topK) }
         if ($topP) { [void]$nativeArgs.Add('--top-p'); [void]$nativeArgs.Add($topP) }
@@ -914,6 +995,7 @@ $state = [ordered]@{
     server_vision = $serverVision; vision_projector = $visionProjectorPath
     server_embedding = $serverEmbedding; embedding_model = $embeddingModelPath
     embedding_idle_timeout = $embeddingIdleTimeout
+    mtp_enabled = $mtpEnabled; mtp_model = $mtpModelPath; mtp_verify_tokens = $mtpVerifyTokens
     custom_sets = $customSets; last_command = $commandText
 }
 New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
