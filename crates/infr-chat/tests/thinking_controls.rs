@@ -231,3 +231,83 @@ fn generation_and_stable_history_use_the_same_effort() {
     assert_ne!(history[1], history[2]);
     assert_ne!(history[0], history[2]);
 }
+
+#[test]
+fn qwen38_system_and_tools_render_as_a_branchable_prompt_prefix() {
+    let system = json!({"role":"system", "content":"Follow the agent policy."});
+    let tools = json!([{
+        "type": "function",
+        "function": {
+            "name": "lookup",
+            "description": "Look up a value",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            }
+        }
+    }]);
+    let options = ChatTemplateOptions::default();
+    let render_probe = |content: &str| {
+        render_template_with_options(
+            QWEN38,
+            vec![system.clone(), json!({"role":"user", "content":content})],
+            tools.clone(),
+            "",
+            "",
+            false,
+            &options,
+        )
+        .unwrap()
+    };
+    let left = render_probe("A_INFR_REUSABLE_PREFIX_PROBE");
+    let right = render_probe("Z_INFR_REUSABLE_PREFIX_PROBE");
+    let prefix = left
+        .chars()
+        .zip(right.chars())
+        .take_while(|(left, right)| left == right)
+        .map(|(character, _)| character)
+        .collect::<String>();
+    let prompt = render_template_with_options(
+        QWEN38,
+        vec![system, json!({"role":"user", "content":"Do the task."})],
+        tools,
+        "",
+        "",
+        true,
+        &options,
+    )
+    .unwrap();
+    assert!(prompt.starts_with(&prefix));
+    assert!(prefix.contains("# Tools"));
+    assert!(prefix.ends_with("<|im_start|>user\n"));
+}
+
+#[test]
+fn qwen38_latest_user_edit_keeps_the_complete_prior_history_prefix() {
+    let options = ChatTemplateOptions::default();
+    let history = vec![
+        json!({"role":"system", "content":"Follow the policy."}),
+        json!({"role":"user", "content":"First question"}),
+        json!({"role":"assistant", "content":"First answer"}),
+    ];
+    let render_probe = |content: &str| {
+        let mut messages = history.clone();
+        messages.push(json!({"role":"user", "content":content}));
+        render_template_with_options(QWEN38, messages, Value::Null, "", "", true, &options).unwrap()
+    };
+    let left = render_probe("A_INFR_EDIT_PREFIX_PROBE");
+    let right = render_probe("Z_INFR_EDIT_PREFIX_PROBE");
+    let prefix = left
+        .chars()
+        .zip(right.chars())
+        .take_while(|(left, right)| left == right)
+        .map(|(character, _)| character)
+        .collect::<String>();
+    let edited = render_probe("Completely different final question");
+
+    assert!(edited.starts_with(&prefix));
+    assert!(prefix.contains("First question"));
+    assert!(prefix.contains("First answer"));
+    assert!(prefix.ends_with("<|im_start|>user\n"));
+}

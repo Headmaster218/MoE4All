@@ -18,7 +18,7 @@ pub(crate) struct SessionStateMeta {
     pub v_fmt: DType,
     pub committed_tokens: usize,
     pub cached: Vec<u32>,
-    pub checkpoint_tokens: Option<Vec<u32>>,
+    pub checkpoint_tokens: [Option<Vec<u32>>; super::TURN_CHECKPOINT_COUNT],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -28,9 +28,9 @@ pub(crate) enum SessionBufferKey {
     QsaRaw(u32),
     QsaBlock(u32),
     PleState,
-    CheckpointK(u32),
-    CheckpointV(u32),
-    CheckpointPle,
+    CheckpointK(u8, u32),
+    CheckpointV(u8, u32),
+    CheckpointPle(u8),
 }
 
 pub(crate) struct SessionBuffer<'a> {
@@ -47,11 +47,12 @@ impl SeamKv {
             v_fmt: self.v_fmt,
             committed_tokens: self.segmented_kv.committed_tokens,
             cached: self.cached.clone(),
-            checkpoint_tokens: self
-                .turn_recurrent_ckpt
-                .as_ref()
-                .filter(|checkpoint| checkpoint.valid)
-                .map(|checkpoint| checkpoint.tokens.clone()),
+            checkpoint_tokens: std::array::from_fn(|index| {
+                self.turn_recurrent_ckpts[index]
+                    .as_ref()
+                    .filter(|checkpoint| checkpoint.valid)
+                    .map(|checkpoint| checkpoint.tokens.clone())
+            }),
         }
     }
 
@@ -98,27 +99,31 @@ impl SeamKv {
         if let Some(buffer) = self.ple_state_buf.as_deref() {
             push_buffer(&mut out, be, SessionBufferKey::PleState, buffer)?;
         }
-        if let Some(checkpoint) = self
-            .turn_recurrent_ckpt
-            .as_ref()
-            .filter(|checkpoint| checkpoint.valid)
-        {
-            for (index, &layer) in checkpoint.layers.iter().enumerate() {
-                push_buffer(
-                    &mut out,
-                    be,
-                    SessionBufferKey::CheckpointK(layer as u32),
-                    checkpoint.kbufs[index].as_ref(),
-                )?;
-                push_buffer(
-                    &mut out,
-                    be,
-                    SessionBufferKey::CheckpointV(layer as u32),
-                    checkpoint.vbufs[index].as_ref(),
-                )?;
-            }
-            if let Some(buffer) = checkpoint.ple_state.as_deref() {
-                push_buffer(&mut out, be, SessionBufferKey::CheckpointPle, buffer)?;
+        for (checkpoint_index, checkpoint) in self.turn_recurrent_ckpts.iter().enumerate() {
+            if let Some(checkpoint) = checkpoint.as_ref().filter(|checkpoint| checkpoint.valid) {
+                let checkpoint_index = checkpoint_index as u8;
+                for (index, &layer) in checkpoint.layers.iter().enumerate() {
+                    push_buffer(
+                        &mut out,
+                        be,
+                        SessionBufferKey::CheckpointK(checkpoint_index, layer as u32),
+                        checkpoint.kbufs[index].as_ref(),
+                    )?;
+                    push_buffer(
+                        &mut out,
+                        be,
+                        SessionBufferKey::CheckpointV(checkpoint_index, layer as u32),
+                        checkpoint.vbufs[index].as_ref(),
+                    )?;
+                }
+                if let Some(buffer) = checkpoint.ple_state.as_deref() {
+                    push_buffer(
+                        &mut out,
+                        be,
+                        SessionBufferKey::CheckpointPle(checkpoint_index),
+                        buffer,
+                    )?;
+                }
             }
         }
         Ok(out)
@@ -163,19 +168,21 @@ impl SeamKv {
             &self.qsa_cbufs,
             meta.committed_tokens.max(meta.cached.len()),
         )?;
-        if let Some(checkpoint) = self.turn_recurrent_ckpt.as_mut() {
+        for checkpoint in self.turn_recurrent_ckpts.iter_mut().flatten() {
             checkpoint.invalidate();
         }
-        if let Some(tokens) = meta.checkpoint_tokens.as_deref() {
-            TurnRecurrentCkpt::begin(
-                &mut self.turn_recurrent_ckpt,
-                be,
-                cfg,
-                &self.kbufs,
-                &self.vbufs,
-                self.ple_state_buf.as_deref(),
-                tokens,
-            )?;
+        for (index, tokens) in meta.checkpoint_tokens.iter().enumerate() {
+            if let Some(tokens) = tokens.as_deref() {
+                TurnRecurrentCkpt::begin(
+                    &mut self.turn_recurrent_ckpts[index],
+                    be,
+                    cfg,
+                    &self.kbufs,
+                    &self.vbufs,
+                    self.ple_state_buf.as_deref(),
+                    tokens,
+                )?;
+            }
         }
         Ok(())
     }
@@ -188,19 +195,26 @@ impl SeamKv {
             SessionBufferKey::QsaRaw(index) => self.qsa_kbufs.get(layer(index)?)?.as_deref(),
             SessionBufferKey::QsaBlock(index) => self.qsa_cbufs.get(layer(index)?)?.as_deref(),
             SessionBufferKey::PleState => self.ple_state_buf.as_deref(),
-            SessionBufferKey::CheckpointK(index) => checkpoint_buffer(
-                self.turn_recurrent_ckpt.as_ref()?,
+            SessionBufferKey::CheckpointK(checkpoint, index) => checkpoint_buffer(
+                self.turn_recurrent_ckpts
+                    .get(checkpoint as usize)?
+                    .as_ref()?,
                 index,
                 |checkpoint, position| checkpoint.kbufs[position].as_ref(),
             ),
-            SessionBufferKey::CheckpointV(index) => checkpoint_buffer(
-                self.turn_recurrent_ckpt.as_ref()?,
+            SessionBufferKey::CheckpointV(checkpoint, index) => checkpoint_buffer(
+                self.turn_recurrent_ckpts
+                    .get(checkpoint as usize)?
+                    .as_ref()?,
                 index,
                 |checkpoint, position| checkpoint.vbufs[position].as_ref(),
             ),
-            SessionBufferKey::CheckpointPle => {
-                self.turn_recurrent_ckpt.as_ref()?.ple_state.as_deref()
-            }
+            SessionBufferKey::CheckpointPle(checkpoint) => self
+                .turn_recurrent_ckpts
+                .get(checkpoint as usize)?
+                .as_ref()?
+                .ple_state
+                .as_deref(),
         }
     }
 
@@ -213,26 +227,28 @@ impl SeamKv {
             .into_iter()
             .map(|buffer| (buffer.key, buffer.committed_bytes))
             .collect::<Vec<_>>();
-        if let Some(checkpoint) = self
-            .turn_recurrent_ckpt
-            .as_ref()
-            .filter(|checkpoint| !checkpoint.valid && !checkpoint.tokens.is_empty())
-        {
-            for (index, &layer) in checkpoint.layers.iter().enumerate() {
-                specs.push((
-                    SessionBufferKey::CheckpointK(layer as u32),
-                    be.buffer_committed_bytes(checkpoint.kbufs[index].as_ref())?,
-                ));
-                specs.push((
-                    SessionBufferKey::CheckpointV(layer as u32),
-                    be.buffer_committed_bytes(checkpoint.vbufs[index].as_ref())?,
-                ));
-            }
-            if let Some(buffer) = checkpoint.ple_state.as_deref() {
-                specs.push((
-                    SessionBufferKey::CheckpointPle,
-                    be.buffer_committed_bytes(buffer)?,
-                ));
+        for (checkpoint_index, checkpoint) in self.turn_recurrent_ckpts.iter().enumerate() {
+            if let Some(checkpoint) = checkpoint
+                .as_ref()
+                .filter(|checkpoint| !checkpoint.valid && !checkpoint.tokens.is_empty())
+            {
+                let checkpoint_index = checkpoint_index as u8;
+                for (index, &layer) in checkpoint.layers.iter().enumerate() {
+                    specs.push((
+                        SessionBufferKey::CheckpointK(checkpoint_index, layer as u32),
+                        be.buffer_committed_bytes(checkpoint.kbufs[index].as_ref())?,
+                    ));
+                    specs.push((
+                        SessionBufferKey::CheckpointV(checkpoint_index, layer as u32),
+                        be.buffer_committed_bytes(checkpoint.vbufs[index].as_ref())?,
+                    ));
+                }
+                if let Some(buffer) = checkpoint.ple_state.as_deref() {
+                    specs.push((
+                        SessionBufferKey::CheckpointPle(checkpoint_index),
+                        be.buffer_committed_bytes(buffer)?,
+                    ));
+                }
             }
         }
         specs.sort_unstable_by_key(|&(key, _)| key);
@@ -242,19 +258,21 @@ impl SeamKv {
     pub(crate) fn finish_session_restore(&mut self, meta: SessionStateMeta) -> Result<()> {
         self.cached = meta.cached;
         self.segmented_kv.committed_tokens = meta.committed_tokens;
-        match (meta.checkpoint_tokens, self.turn_recurrent_ckpt.as_mut()) {
-            (Some(tokens), Some(checkpoint)) => {
-                checkpoint.tokens = tokens;
-                checkpoint.copied.fill(true);
-                checkpoint.ple_copied = true;
-                checkpoint.valid = true;
-            }
-            (None, Some(checkpoint)) => checkpoint.invalidate(),
-            (None, None) => {}
-            _ => {
-                return Err(anyhow!(
-                    "cold session checkpoint shape changed during restore"
-                ))
+        for (index, tokens) in meta.checkpoint_tokens.into_iter().enumerate() {
+            match (tokens, self.turn_recurrent_ckpts[index].as_mut()) {
+                (Some(tokens), Some(checkpoint)) => {
+                    checkpoint.tokens = tokens;
+                    checkpoint.copied.fill(true);
+                    checkpoint.ple_copied = true;
+                    checkpoint.valid = true;
+                }
+                (None, Some(checkpoint)) => checkpoint.invalidate(),
+                (None, None) => {}
+                _ => {
+                    return Err(anyhow!(
+                        "cold session checkpoint shape changed during restore"
+                    ))
+                }
             }
         }
         Ok(())
@@ -278,7 +296,7 @@ impl SeamKv {
         // of trusting the stale committed-depth counter and reading a released address.
         self.segmented_kv.committed_tokens = 0;
         self.cached.clear();
-        if let Some(checkpoint) = self.turn_recurrent_ckpt.as_mut() {
+        for checkpoint in self.turn_recurrent_ckpts.iter_mut().flatten() {
             checkpoint.invalidate();
         }
         for plane in layout.planes {
@@ -306,10 +324,15 @@ impl SessionStateMeta {
         let live = (live_score > 0
             && (live_score == self.cached.len() || live_score == prompt.len()))
         .then_some(live_score);
-        let checkpoint = self.checkpoint_tokens.as_deref().and_then(|tokens| {
-            (!tokens.is_empty() && tokens.len() < prompt.len() && prompt.starts_with(tokens))
-                .then_some(tokens.len())
-        });
+        let checkpoint = self
+            .checkpoint_tokens
+            .iter()
+            .flatten()
+            .filter_map(|tokens| {
+                (!tokens.is_empty() && tokens.len() < prompt.len() && prompt.starts_with(tokens))
+                    .then_some(tokens.len())
+            })
+            .max();
         live.into_iter().chain(checkpoint).max()
     }
 }
@@ -356,20 +379,20 @@ fn common_prefix_len(left: &[u32], right: &[u32]) -> usize {
 mod tests {
     use super::*;
 
-    fn meta(cached: &[u32], checkpoint: Option<&[u32]>) -> SessionStateMeta {
+    fn meta(cached: &[u32], checkpoints: [Option<&[u32]>; 2]) -> SessionStateMeta {
         SessionStateMeta {
             max_ctx: 1024,
             k_fmt: DType::Q8_0,
             v_fmt: DType::Q8_0,
             committed_tokens: 1024,
             cached: cached.to_vec(),
-            checkpoint_tokens: checkpoint.map(<[u32]>::to_vec),
+            checkpoint_tokens: checkpoints.map(|tokens| tokens.map(<[u32]>::to_vec)),
         }
     }
 
     #[test]
     fn cold_metadata_uses_the_same_live_continuation_rule() {
-        let state = meta(&[1, 2, 3], None);
+        let state = meta(&[1, 2, 3], [None, None]);
         assert_eq!(state.continuation_prefix_len(&[1, 2, 3, 4]), Some(3));
         assert_eq!(state.continuation_prefix_len(&[1, 2, 9]), None);
         assert_eq!(state.continuation_prefix_len(&[1, 2]), Some(2));
@@ -377,8 +400,9 @@ mod tests {
 
     #[test]
     fn cold_metadata_can_resume_a_strict_checkpoint_extension() {
-        let state = meta(&[1, 9, 9], Some(&[1, 2]));
+        let state = meta(&[1, 9, 9], [Some(&[1]), Some(&[1, 2])]);
         assert_eq!(state.continuation_prefix_len(&[1, 2, 3]), Some(2));
-        assert_eq!(state.continuation_prefix_len(&[1, 2]), None);
+        assert_eq!(state.continuation_prefix_len(&[1, 2]), Some(1));
+        assert_eq!(state.continuation_prefix_len(&[9]), None);
     }
 }

@@ -345,7 +345,7 @@ fn recurrent_extension_start(cached: &[u32], prompt: &[u32]) -> Option<usize> {
 #[derive(Clone, Copy)]
 pub(crate) struct PreparedParallelPrompt {
     pub(crate) start: usize,
-    pub(crate) checkpoint_boundary: Option<usize>,
+    pub(crate) checkpoint_boundaries: [Option<usize>; super::TURN_CHECKPOINT_COUNT],
 }
 
 /// Prepare one recurrent slot for a layer-synchronous prefill cohort. This mirrors the ordinary
@@ -391,7 +391,7 @@ fn prepare_parallel_prompt_state(
                 be.upload(state.as_ref(), &zeros)
                     .map_err(|error| anyhow!("{error}"))?;
             }
-            if let Some(checkpoint) = kv.turn_recurrent_ckpt.as_mut() {
+            for checkpoint in kv.turn_recurrent_ckpts.iter_mut().flatten() {
                 checkpoint.invalidate();
             }
             kv.cached.clear();
@@ -415,29 +415,33 @@ fn prepare_parallel_prompt_state(
         }
     }
 
-    let checkpoint_boundary = turn_checkpoint
-        .and_then(|checkpoint| match checkpoint {
-            TurnCheckpoint::Enable => None,
-            TurnCheckpoint::Boundary(boundary) => Some(boundary),
-        })
-        .filter(|&boundary| {
-            recurrent_model && boundary > start && boundary < prompt.len() && boundary <= kv.max_ctx
-        });
-    if let Some(boundary) = checkpoint_boundary {
-        TurnRecurrentCkpt::begin(
-            &mut kv.turn_recurrent_ckpt,
-            be,
-            c,
-            &kv.kbufs,
-            &kv.vbufs,
-            kv.ple_state_buf.as_deref(),
-            &prompt[..boundary],
-        )?;
+    let mut checkpoint_boundaries = [None; super::TURN_CHECKPOINT_COUNT];
+    if let Some(checkpoint) = turn_checkpoint {
+        for (index, boundary) in checkpoint.boundaries().into_iter().enumerate() {
+            let boundary = boundary.filter(|&boundary| {
+                recurrent_model
+                    && boundary > start
+                    && boundary < prompt.len()
+                    && boundary <= kv.max_ctx
+            });
+            checkpoint_boundaries[index] = boundary;
+            if let Some(boundary) = boundary {
+                TurnRecurrentCkpt::begin(
+                    &mut kv.turn_recurrent_ckpts[index],
+                    be,
+                    c,
+                    &kv.kbufs,
+                    &kv.vbufs,
+                    kv.ple_state_buf.as_deref(),
+                    &prompt[..boundary],
+                )?;
+            }
+        }
     }
     kv.cached.truncate(start);
     Ok(PreparedParallelPrompt {
         start,
-        checkpoint_boundary,
+        checkpoint_boundaries,
     })
 }
 
@@ -951,7 +955,7 @@ struct PendingSeamSlot {
     logits_buf: Box<dyn Buffer>,
     ple_embd_buf: Option<Box<dyn Buffer>>,
     ple_state_buf: Option<Box<dyn Buffer>>,
-    turn_recurrent_ckpt: Option<TurnRecurrentCkpt>,
+    turn_recurrent_ckpts: [Option<TurnRecurrentCkpt>; super::TURN_CHECKPOINT_COUNT],
     mtp_delta_ckpt: Option<MtpDeltaCkpt>,
     mtp_verify_bufs: Option<QwenMtpVerifyBuffers>,
 }
@@ -1048,17 +1052,19 @@ fn allocate_pending_seam_slot(
     } else {
         None
     };
-    let mut turn_recurrent_ckpt = None;
+    let mut turn_recurrent_ckpts = std::array::from_fn(|_| None);
     if checkpoint && (cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3) {
-        TurnRecurrentCkpt::begin_before_dynamic_kv(
-            &mut turn_recurrent_ckpt,
-            be,
-            cfg,
-            &kbufs,
-            &vbufs,
-            ple_state_buf.as_deref(),
-            &[],
-        )?;
+        for checkpoint in &mut turn_recurrent_ckpts {
+            TurnRecurrentCkpt::begin_before_dynamic_kv(
+                checkpoint,
+                be,
+                cfg,
+                &kbufs,
+                &vbufs,
+                ple_state_buf.as_deref(),
+                &[],
+            )?;
+        }
     }
     let mtp_delta_ckpt = if ec.spec.mtp && cfg.qwen4exp {
         MtpDeltaCkpt::allocate_before_dynamic_kv(
@@ -1115,7 +1121,7 @@ fn allocate_pending_seam_slot(
         logits_buf,
         ple_embd_buf,
         ple_state_buf,
-        turn_recurrent_ckpt,
+        turn_recurrent_ckpts,
         mtp_delta_ckpt,
         mtp_verify_bufs,
     })
@@ -1218,7 +1224,7 @@ fn finish_pending_seam_slot(
         sc_ping_write: 0,
         sc_temp_inv_buf: None,
         mtp_delta_ckpt: pending.mtp_delta_ckpt,
-        turn_recurrent_ckpt: pending.turn_recurrent_ckpt,
+        turn_recurrent_ckpts: pending.turn_recurrent_ckpts,
         preallocated_siblings: Vec::new(),
     })
 }
@@ -1226,7 +1232,7 @@ fn finish_pending_seam_slot(
 struct ParallelDecodeRequest<'a> {
     prompts: &'a [Vec<u32>],
     prompt_ends: &'a [usize],
-    checkpoint_boundaries: &'a [Option<usize>],
+    checkpoint_boundaries: &'a [[Option<usize>; super::TURN_CHECKPOINT_COUNT]],
     mrope_plans: &'a [Option<&'a crate::seam::MropePlan>],
     peers: &'a mut [SeamKv],
     peer_outputs: &'a mut Vec<Vec<u32>>,
@@ -1427,7 +1433,7 @@ pub(crate) fn generate_dense_backend_parallel_sampled(
     ple: Option<&PerLayerEmbd>,
     prompts: &[Vec<u32>],
     prompt_ends: &[usize],
-    checkpoint_boundaries: &[Option<usize>],
+    checkpoint_boundaries: &[[Option<usize>; super::TURN_CHECKPOINT_COUNT]],
     mrope_plans: &[Option<&crate::seam::MropePlan>],
     max_steps: usize,
     primary: &mut Option<SeamKv>,
@@ -1608,7 +1614,7 @@ pub(crate) fn generate_dense_backend_parallel_mtp_verify(
         .chain(peers.iter().map(SeamKv::cached_len))
         .map(|start| PreparedParallelPrompt {
             start,
-            checkpoint_boundary: None,
+            checkpoint_boundaries: [None; super::TURN_CHECKPOINT_COUNT],
         })
         .collect::<Vec<_>>();
     let mut request = ParallelMtpVerifyRequest {
@@ -2697,7 +2703,7 @@ fn generate_dense_backend_inner(
         }
 
         // Fixed recurrent state is a real owner, unlike the Expert filler. Place Qwen3.8's PLE
-        // history and the rolling conversation checkpoint before the deferred Vulkan arena too.
+        // history and both conversation checkpoints before the deferred Vulkan arena too.
         let ple_state_buf = if c.qwen4exp {
             let hist = (c.ple_conv_kernel - 1) * c.ple_ngram_size;
             let b = be
@@ -2709,17 +2715,19 @@ fn generate_dense_backend_inner(
         } else {
             None
         };
-        let mut turn_recurrent_ckpt = None;
+        let mut turn_recurrent_ckpts = std::array::from_fn(|_| None);
         if turn_checkpoint.is_some() && (c.qwen35 || c.qwen4exp || c.bailingmoe3) {
-            TurnRecurrentCkpt::begin_before_dynamic_kv(
-                &mut turn_recurrent_ckpt,
-                be,
-                c,
-                &kbufs,
-                &vbufs,
-                ple_state_buf.as_deref(),
-                &[],
-            )?;
+            for checkpoint in &mut turn_recurrent_ckpts {
+                TurnRecurrentCkpt::begin_before_dynamic_kv(
+                    checkpoint,
+                    be,
+                    c,
+                    &kbufs,
+                    &vbufs,
+                    ple_state_buf.as_deref(),
+                    &[],
+                )?;
+            }
         }
         let mtp_delta_ckpt = if ec.spec.mtp && c.qwen4exp {
             MtpDeltaCkpt::allocate_before_dynamic_kv(
@@ -2940,7 +2948,7 @@ fn generate_dense_backend_inner(
             sc_ping_write: 0,
             sc_temp_inv_buf: None,
             mtp_delta_ckpt,
-            turn_recurrent_ckpt,
+            turn_recurrent_ckpts,
             preallocated_siblings,
         });
     }
@@ -3072,7 +3080,7 @@ fn generate_dense_backend_inner(
         sc_ping_write,
         sc_temp_inv_buf,
         mtp_delta_ckpt,
-        turn_recurrent_ckpt,
+        turn_recurrent_ckpts,
         preallocated_siblings: _,
         // The env-derived local `kv_ring` above is this same value on every call (stable env),
         // so the struct field is only read by fork/seed (which have no backend caps at hand).
@@ -3257,7 +3265,7 @@ fn generate_dense_backend_inner(
             // This cache is now being rebuilt for a different token stream. A checkpoint from
             // the old stream contains only recurrent/PLE state; restoring it later beside the
             // attention/QSA rows overwritten below would create a mixed, invalid model state.
-            if let Some(ck) = turn_recurrent_ckpt.as_mut() {
+            for ck in turn_recurrent_ckpts.iter_mut().flatten() {
                 ck.invalidate();
             }
             cached.clear();
@@ -3276,33 +3284,32 @@ fn generate_dense_backend_inner(
     // Only a strict, newly processed prefix can become a checkpoint. If the hint is malformed,
     // tokenization did not preserve the rendered string prefix, or the state already lies past it,
     // leave the previous checkpoint intact and use the ordinary generation path.
-    let turn_checkpoint_boundary = parallel_prepared.as_ref().map_or_else(
-        || {
-            turn_checkpoint
-                .and_then(|checkpoint| match checkpoint {
-                    TurnCheckpoint::Enable => None,
-                    TurnCheckpoint::Boundary(boundary) => Some(boundary),
-                })
-                .filter(|&boundary| {
-                    (c.qwen35 || c.qwen4exp || c.bailingmoe3)
-                        && boundary > start
-                        && boundary < prompt.len()
-                        && boundary <= max_ctx
-                })
-        },
-        |prepared| prepared[0].checkpoint_boundary,
-    );
+    let mut turn_checkpoint_boundaries = [None; super::TURN_CHECKPOINT_COUNT];
+    if let Some(prepared) = parallel_prepared.as_ref() {
+        turn_checkpoint_boundaries = prepared[0].checkpoint_boundaries;
+    } else if let Some(checkpoint) = turn_checkpoint {
+        for (index, boundary) in checkpoint.boundaries().into_iter().enumerate() {
+            turn_checkpoint_boundaries[index] = boundary.filter(|&boundary| {
+                (c.qwen35 || c.qwen4exp || c.bailingmoe3)
+                    && boundary > start
+                    && boundary < prompt.len()
+                    && boundary <= max_ctx
+            });
+        }
+    }
     if parallel_prepared.is_none() {
-        if let Some(boundary) = turn_checkpoint_boundary {
-            TurnRecurrentCkpt::begin(
-                turn_recurrent_ckpt,
-                be,
-                c,
-                &kbufs[..],
-                &vbufs[..],
-                ple_state_buf.as_deref(),
-                &prompt[..boundary],
-            )?;
+        for (index, boundary) in turn_checkpoint_boundaries.into_iter().enumerate() {
+            if let Some(boundary) = boundary {
+                TurnRecurrentCkpt::begin(
+                    &mut turn_recurrent_ckpts[index],
+                    be,
+                    c,
+                    &kbufs[..],
+                    &vbufs[..],
+                    ple_state_buf.as_deref(),
+                    &prompt[..boundary],
+                )?;
+            }
         }
     }
     // SWA ring rewind guard: a ring layer RETAINS only its last `rows_l` positions — rows for
@@ -3338,7 +3345,7 @@ fn generate_dense_backend_inner(
             1
         };
         tracing::warn!(
-            "[state trace] cold_slot={} recurrent={} prompt={} cached_before={} common={} live_start={:?} checkpoint_attempted={} checkpoint_start={:?} path={} start_before_ring={} start={} checkpoint_boundary={:?} kv_ring={} segmented_kv={} qsa_ratio={} start_mod_qsa={} prompt_mod_qsa={} start_mod_32k={} prompt_mod_32k={}",
+            "[state trace] cold_slot={} recurrent={} prompt={} cached_before={} common={} live_start={:?} checkpoint_attempted={} checkpoint_start={:?} path={} start_before_ring={} start={} checkpoint_boundaries={:?} kv_ring={} segmented_kv={} qsa_ratio={} start_mod_qsa={} prompt_mod_qsa={} start_mod_32k={} prompt_mod_32k={}",
             state_was_cold,
             recurrent_model,
             prompt.len(),
@@ -3350,7 +3357,7 @@ fn generate_dense_backend_inner(
             state_path,
             start_before_ring,
             start,
-            turn_checkpoint_boundary,
+            turn_checkpoint_boundaries,
             kv_ring,
             segmented_kv_enabled,
             qsa_ratio,
@@ -7589,10 +7596,15 @@ fn generate_dense_backend_inner(
                     if !sparse {
                         end = end.min(qsa_threshold);
                     }
-                    if let Some(boundary) = prepared[lane].checkpoint_boundary {
-                        if begin < boundary {
-                            end = end.min(boundary);
-                        }
+                    if let Some(boundary) = prepared[lane]
+                        .checkpoint_boundaries
+                        .iter()
+                        .flatten()
+                        .copied()
+                        .filter(|&boundary| begin < boundary)
+                        .min()
+                    {
+                        end = end.min(boundary);
                     }
                     begin..end
                 })
@@ -7796,25 +7808,27 @@ fn generate_dense_backend_inner(
 
             for (&lane, range) in prefill_lanes.iter().zip(&prefill_ranges) {
                 cursors[lane] = range.end;
-                if Some(range.end) == prepared[lane].checkpoint_boundary {
-                    if lane == 0 {
-                        if let Some(checkpoint) = turn_recurrent_ckpt.as_mut() {
-                            checkpoint.snapshot_all(
-                                be,
-                                &kbufs[..],
-                                &vbufs[..],
-                                ple_state_buf.as_deref(),
-                            )?;
-                        }
-                    } else {
-                        let slot = &mut parallel.peers[lane - 1];
-                        if let Some(checkpoint) = slot.turn_recurrent_ckpt.as_mut() {
-                            checkpoint.snapshot_all(
-                                be,
-                                &slot.kbufs,
-                                &slot.vbufs,
-                                slot.ple_state_buf.as_deref(),
-                            )?;
+                for (index, boundary) in prepared[lane].checkpoint_boundaries.iter().enumerate() {
+                    if Some(range.end) == *boundary {
+                        if lane == 0 {
+                            if let Some(checkpoint) = turn_recurrent_ckpts[index].as_mut() {
+                                checkpoint.snapshot_all(
+                                    be,
+                                    &kbufs[..],
+                                    &vbufs[..],
+                                    ple_state_buf.as_deref(),
+                                )?;
+                            }
+                        } else {
+                            let slot = &mut parallel.peers[lane - 1];
+                            if let Some(checkpoint) = slot.turn_recurrent_ckpts[index].as_mut() {
+                                checkpoint.snapshot_all(
+                                    be,
+                                    &slot.kbufs,
+                                    &slot.vbufs,
+                                    slot.ple_state_buf.as_deref(),
+                                )?;
+                            }
                         }
                     }
                 }
@@ -9516,25 +9530,27 @@ fn generate_dense_backend_inner(
                 *written = Some(position);
             }
             for lane in 0..lanes {
-                if Some(positions[lane] + 1) == parallel.checkpoint_boundaries[lane] {
-                    if lane == 0 {
-                        if let Some(checkpoint) = turn_recurrent_ckpt.as_mut() {
-                            checkpoint.snapshot_all(
-                                be,
-                                &kbufs[..],
-                                &vbufs[..],
-                                ple_state_buf.as_deref(),
-                            )?;
-                        }
-                    } else {
-                        let slot = &mut parallel.peers[lane - 1];
-                        if let Some(checkpoint) = slot.turn_recurrent_ckpt.as_mut() {
-                            checkpoint.snapshot_all(
-                                be,
-                                &slot.kbufs,
-                                &slot.vbufs,
-                                slot.ple_state_buf.as_deref(),
-                            )?;
+                for (index, boundary) in parallel.checkpoint_boundaries[lane].iter().enumerate() {
+                    if Some(positions[lane] + 1) == *boundary {
+                        if lane == 0 {
+                            if let Some(checkpoint) = turn_recurrent_ckpts[index].as_mut() {
+                                checkpoint.snapshot_all(
+                                    be,
+                                    &kbufs[..],
+                                    &vbufs[..],
+                                    ple_state_buf.as_deref(),
+                                )?;
+                            }
+                        } else {
+                            let slot = &mut parallel.peers[lane - 1];
+                            if let Some(checkpoint) = slot.turn_recurrent_ckpts[index].as_mut() {
+                                checkpoint.snapshot_all(
+                                    be,
+                                    &slot.kbufs,
+                                    &slot.vbufs,
+                                    slot.ple_state_buf.as_deref(),
+                                )?;
+                            }
                         }
                     }
                 }
@@ -10071,10 +10087,14 @@ fn generate_dense_backend_inner(
             let mut cs = start;
             while cs < pf_end {
                 let mut ce = (cs + ubatch).min(pf_end);
-                if let Some(boundary) = turn_checkpoint_boundary {
-                    if cs < boundary && boundary < ce {
-                        ce = boundary;
-                    }
+                if let Some(boundary) = turn_checkpoint_boundaries
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .filter(|&boundary| cs < boundary && boundary < ce)
+                    .min()
+                {
+                    ce = boundary;
                 }
                 v.push((cs, ce));
                 cs = ce;
@@ -10431,8 +10451,11 @@ fn generate_dense_backend_inner(
                         );
                         be.execute(pf_plan.as_ref(), &pf_b)
                             .map_err(|e| anyhow!("{e}"))?;
-                        if Some(cend) == turn_checkpoint_boundary {
-                            if let Some(ck) = turn_recurrent_ckpt.as_mut() {
+                        for (index, boundary) in turn_checkpoint_boundaries.iter().enumerate() {
+                            if Some(cend) == *boundary {
+                                let Some(ck) = turn_recurrent_ckpts[index].as_mut() else {
+                                    continue;
+                                };
                                 if layer_major {
                                     ck.snapshot_layer(be, &kbufs[..], &vbufs[..], span.start)?;
                                     if c.qwen4exp && span.clone().any(|layer| c.is_ple_layer(layer))
@@ -11079,9 +11102,11 @@ fn generate_dense_backend_inner(
         // excluded from `last_written` — the fix for the `max_new==0` frontier and the
         // constrained-break unfed-forced-token cache-corruption cases.
         last_written = Some(pos);
-        if Some(pos + 1) == turn_checkpoint_boundary {
-            if let Some(ck) = turn_recurrent_ckpt.as_mut() {
-                ck.snapshot_all(be, &kbufs[..], &vbufs[..], ple_state_buf.as_deref())?;
+        for (index, boundary) in turn_checkpoint_boundaries.iter().enumerate() {
+            if Some(pos + 1) == *boundary {
+                if let Some(ck) = turn_recurrent_ckpts[index].as_mut() {
+                    ck.snapshot_all(be, &kbufs[..], &vbufs[..], ple_state_buf.as_deref())?;
+                }
             }
         }
         if prof_dec && pos + 1 >= prompt.len() {

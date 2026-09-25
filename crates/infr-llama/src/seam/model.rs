@@ -813,10 +813,33 @@ impl SeamModel {
         stable_prefix: Option<&str>,
         constraint: Option<&mut crate::grammar::Constraint>,
         req: Option<&crate::sampling::RequestCtx>,
+        on_piece: impl FnMut(&str),
+    ) -> Result<crate::GenStats> {
+        self.generate_vulkan_session_turn_with_checkpoints_constrained(
+            session,
+            prompt,
+            max_new,
+            crate::seam::TurnCheckpointPrefixes::edit(stable_prefix),
+            constraint,
+            req,
+            on_piece,
+        )
+    }
+
+    /// Server-facing stateful generation with both the reusable agent prefix and the prefix before
+    /// the latest editable message retained as recurrent checkpoints.
+    pub fn generate_vulkan_session_turn_with_checkpoints_constrained(
+        &self,
+        session: &mut DenseVulkanSession,
+        prompt: &str,
+        max_new: usize,
+        checkpoint_prefixes: crate::seam::TurnCheckpointPrefixes<'_>,
+        constraint: Option<&mut crate::grammar::Constraint>,
+        req: Option<&crate::sampling::RequestCtx>,
         mut on_piece: impl FnMut(&str),
     ) -> Result<crate::GenStats> {
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
-        let turn_checkpoint = self.turn_checkpoint(&prompt_tokens, stable_prefix)?;
+        let turn_checkpoint = self.turn_checkpoints(&prompt_tokens, checkpoint_prefixes)?;
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
         let slot = session
@@ -860,22 +883,27 @@ impl SeamModel {
         Ok(stats)
     }
 
-    pub(crate) fn turn_checkpoint(
+    pub(crate) fn turn_checkpoints(
         &self,
         prompt_tokens: &[u32],
-        stable_prefix: Option<&str>,
+        prefixes: crate::seam::TurnCheckpointPrefixes<'_>,
     ) -> Result<Option<crate::seam::TurnCheckpoint>> {
-        let Some(stable_prefix) = stable_prefix else {
+        if prefixes.agent.is_none() && prefixes.edit.is_none() {
             return Ok(None);
+        }
+        let boundary = |prefix: Option<&str>| -> Result<Option<usize>> {
+            let Some(prefix) = prefix else {
+                return Ok(None);
+            };
+            let tokens = self.encode(prefix)?;
+            Ok((!tokens.is_empty()
+                && tokens.len() < prompt_tokens.len()
+                && prompt_tokens.starts_with(&tokens))
+            .then_some(tokens.len()))
         };
-        let stable_tokens = self.encode(stable_prefix)?;
-        let boundary = (!stable_tokens.is_empty()
-            && stable_tokens.len() < prompt_tokens.len()
-            && prompt_tokens.starts_with(&stable_tokens))
-        .then_some(stable_tokens.len());
-        Ok(Some(boundary.map_or(
-            crate::seam::TurnCheckpoint::Enable,
-            crate::seam::TurnCheckpoint::Boundary,
+        Ok(Some(crate::seam::TurnCheckpoint::new(
+            boundary(prefixes.agent)?,
+            boundary(prefixes.edit)?,
         )))
     }
 
