@@ -96,6 +96,33 @@ fn apply_placement(lut_host: &mut [u32], id: BlockId, slot: u32, evicted: Option
     }
 }
 
+fn protect_routed_lut_slots(
+    protected: &mut HashSet<ExpertSlotId>,
+    pool: usize,
+    slots: &[u32],
+    ids: &[u32],
+) -> Result<()> {
+    for &expert in ids {
+        let expert = expert as usize;
+        let &slot = slots.get(expert).ok_or_else(|| {
+            be(format!(
+                "moe pager: routed expert {expert} is outside a {}-expert LUT window",
+                slots.len()
+            ))
+        })?;
+        if slot == NOT_RESIDENT {
+            return Err(be(format!(
+                "moe pager: routed expert {expert} is not resident while freezing its LUT window"
+            )));
+        }
+        protected.insert(ExpertSlotId {
+            pool,
+            slot: slot as usize,
+        });
+    }
+    Ok(())
+}
+
 /// Fixed-budget evictable VRAM cache of uniform `slot_bytes` blocks. See the module doc.
 struct ArenaShard {
     buffer: Arc<dyn Buffer>,
@@ -1843,6 +1870,10 @@ pub struct MoePagerSession {
     /// a full drain).
     tape: Box<dyn Buffer>,
     tape_words: usize,
+    /// Physical Decode slots named by LUT windows in the current, not-yet-drained command stream.
+    /// Unified runtime claims may retire other Expert filler, but moving one of these slots would
+    /// leave the immutable tape address pointing at its former contents.
+    frozen_lut_slots: HashSet<ExpertSlotId>,
     print_stats: bool,
     trace: Option<PagerTrace>,
     /// Physical interpretation of every pool arena. Prefill owns slot 0..n_expert as one
@@ -2109,6 +2140,7 @@ impl MoePagerSession {
             sources: HashMap::new(),
             tape,
             tape_words,
+            frozen_lut_slots: HashSet::new(),
             print_stats: vk.cfg().paging.stats,
             trace: vk.cfg().paging.trace.clone().map(PagerTrace::new),
             mode: MoeArenaMode::DecodeLru,
@@ -2355,24 +2387,35 @@ impl MoePagerSession {
         Ok(src.bank_bytes)
     }
 
-    /// Exchange cells already parked inside the physical Decode floor. Persistent KV/runtime
-    /// claims must preserve them; the phase-exclusive Prefill ring deliberately uses a separate
-    /// unprotected claim path and restores the same spare before returning to Decode.
+    /// Expert cells that a unified claim must not move: exchange cells parked inside the physical
+    /// Decode floor, plus every slot named by a frozen LUT window in the current command stream.
+    /// The phase-exclusive Prefill ring uses separate allocations and contributes no LUT slots.
     pub(crate) fn protected_expert_slots(&self) -> Vec<ExpertSlotId> {
         let Some(layout) = self.unified_pool.expert_layout() else {
             return Vec::new();
         };
-        self.pools
-            .iter()
-            .enumerate()
-            .filter_map(|(pool, item)| {
-                item.exchange_slot.map(|slot| ExpertSlotId {
-                    pool,
-                    slot: slot as usize,
+        let mut protected = self.frozen_lut_slots.clone();
+        protected.extend(
+            self.pools
+                .iter()
+                .enumerate()
+                .filter_map(|(pool, item)| {
+                    item.exchange_slot.map(|slot| ExpertSlotId {
+                        pool,
+                        slot: slot as usize,
+                    })
                 })
-            })
-            .filter(|&id| layout.slot_is_in_floor(id))
-            .collect()
+                .filter(|&id| layout.slot_is_in_floor(id)),
+        );
+        let mut protected = protected.into_iter().collect::<Vec<_>>();
+        protected.sort_unstable_by_key(|id| (id.pool, id.slot));
+        protected
+    }
+
+    /// Release command-stream slot protection only after every dispatch that can read the current
+    /// LUT tape has drained. The adapter resets the tape cursor at the same boundary.
+    pub(crate) fn clear_frozen_lut_slots(&mut self) {
+        self.frozen_lut_slots.clear();
     }
 
     /// Retire exactly the Expert filler cells selected by the arena manager, then commit every
@@ -3639,6 +3682,22 @@ impl MoePagerSession {
         Ok(w)
     }
 
+    /// Protect only the resident slots that the dispatch's routed local ids can dereference from
+    /// its frozen LUT window. Protecting the full window would pin the pool's entire cache even
+    /// though zero-count experts are never read, leaving no filler available for later runtime
+    /// workspace claims in the same command stream.
+    pub fn protect_lut_ids(&mut self, buf_id: usize, ids: &[u32]) -> Result<()> {
+        let (_, pool, source) = self
+            .sources
+            .get(&buf_id)
+            .ok_or_else(|| be("moe pager: protect_lut_ids on an unregistered buffer"))?;
+        let pool = *pool;
+        let block_base = source.block_base as usize;
+        let n_expert = source.bank_bytes / source.stride_bytes;
+        let slots = self.pools[pool].pager.lut_words(block_base, n_expert);
+        protect_routed_lut_slots(&mut self.frozen_lut_slots, pool, slots, ids)
+    }
+
     fn pool_of(&self, buf_id: usize) -> Result<&Pool> {
         let (_, pool, _) = self
             .sources
@@ -4357,6 +4416,25 @@ mod tests {
             "evicted block must clear to NOT_RESIDENT"
         );
         assert_eq!(lut[6], 5, "new block records the reused slot index");
+    }
+
+    #[test]
+    fn frozen_lut_protection_covers_only_routed_resident_slots() {
+        let slots = [7, NOT_RESIDENT, 3, 11, 5];
+        let mut protected = HashSet::new();
+
+        protect_routed_lut_slots(&mut protected, 2, &slots, &[4, 0, 2, 4]).unwrap();
+
+        assert_eq!(
+            protected,
+            HashSet::from([
+                ExpertSlotId { pool: 2, slot: 3 },
+                ExpertSlotId { pool: 2, slot: 5 },
+                ExpertSlotId { pool: 2, slot: 7 },
+            ])
+        );
+        assert!(protect_routed_lut_slots(&mut protected, 2, &slots, &[1]).is_err());
+        assert!(protect_routed_lut_slots(&mut protected, 2, &slots, &[5]).is_err());
     }
 
     #[test]

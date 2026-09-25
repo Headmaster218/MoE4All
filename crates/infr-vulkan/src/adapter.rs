@@ -1627,6 +1627,189 @@ fn paged_deltanet_scratch_requests(
     .collect()
 }
 
+fn record_scratch_max(maxima: &mut HashMap<&'static str, usize>, tag: &'static str, bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    maxima
+        .entry(tag)
+        .and_modify(|capacity| *capacity = (*capacity).max(bytes))
+        .or_insert(bytes);
+}
+
+fn sample_candidate_scratch_bytes(rows: u32, top_k: u32) -> usize {
+    2 * rows as usize * 256 * top_k as usize * 4
+}
+
+fn independent_attention_scratch_bytes(
+    graph: &Graph,
+    rows: usize,
+    nh: usize,
+    hd: usize,
+    mask: &AttnMask,
+) -> Result<[usize; 3]> {
+    let window = match mask {
+        AttnMask::Causal => 0,
+        AttnMask::SlidingWindow(window) => *window,
+        AttnMask::Canvas { .. } => {
+            return Err(be(
+                "independent-row attention does not support a canvas mask",
+            ));
+        }
+    };
+    let mut max_partials = 0usize;
+    for sequence in sequence_spans(graph, rows)? {
+        let sequence_pos = sequence.start_pos as usize;
+        let sequence_rows = sequence.rows as usize;
+        let sequence_kv_len = sequence_pos + sequence_rows;
+        let span_start = if window > 0 {
+            (sequence_pos + 1).saturating_sub(window)
+        } else {
+            0
+        };
+        let visible = sequence_kv_len.saturating_sub(span_start);
+        if visible == 0 {
+            return Err(be("independent-row attention has an empty KV span"));
+        }
+        let chunk = split_k_chunk_count_cap(
+            visible,
+            infr_core::tier::adaptive_chunk(visible, &ATTN_SPLIT),
+        );
+        let n_chunks = visible.div_ceil(chunk);
+        max_partials = max_partials.max(sequence_rows * nh * n_chunks);
+    }
+    Ok([max_partials * 4, max_partials * 4, max_partials * hd * 4])
+}
+
+/// Reserve the small/static tail of a paged forward before its first expert LUT is frozen.
+/// Qwen3.8 reaches these ops after routed layers: static split attention is used by ordinary
+/// Decode and MTP VERIFY, while sampling/argmax is the graph tail. Growing any of these buffers
+/// lazily can loan an expert slot whose address is already present in the command buffer's LUT
+/// tape. The row ceiling covers the complete small-batch split-attention tier (ordinary Decode,
+/// multi-lane MTP VERIFY and short suffix Prefill); independent-row serving is planned from its
+/// exact per-lane spans without that ceiling.
+fn paged_tail_scratch_requests(
+    be_: &VulkanBackend,
+    graph: &Graph,
+) -> Result<Vec<(&'static str, usize)>> {
+    const MAX_SMALL_STATIC_ROWS: usize = 63;
+
+    let mut maxima = HashMap::<&'static str, usize>::new();
+    for op in &graph.ops {
+        match op {
+            Op::Attention {
+                q,
+                k_cache,
+                v_cache,
+                dst,
+                rows,
+                kv_len,
+                n_head,
+                n_kv,
+                head_dim,
+                scale,
+                mask,
+                pos,
+                sinks,
+            } if sinks.is_none() => {
+                let (rows, kv_len, nh, nkv, hd) = (
+                    *rows as usize,
+                    *kv_len as usize,
+                    *n_head as usize,
+                    *n_kv as usize,
+                    *head_dim as usize,
+                );
+                let external = |tensor: TensorId| {
+                    !matches!(
+                        graph.tensors[tensor.0 as usize].kind,
+                        TensorKind::Internal | TensorKind::Output
+                    )
+                };
+                if graph.independent_rows && external(*k_cache) && external(*v_cache) {
+                    let [pm, pl, pacc] =
+                        independent_attention_scratch_bytes(graph, rows, nh, hd, mask)?;
+                    record_scratch_max(&mut maxima, "independent_split_pm", pm);
+                    record_scratch_max(&mut maxima, "independent_split_pl", pl);
+                    record_scratch_max(&mut maxima, "independent_split_pacc", pacc);
+                    continue;
+                }
+
+                let kdt = graph.desc(*k_cache).dtype;
+                let vdt = graph.desc(*v_cache).dtype;
+                let cap_rows = graph.desc(*k_cache).numel() / (nkv * hd).max(1);
+                let ne = kv_len.min(cap_rows) * nkv * hd;
+                if rows > 1 && (matches!(kdt, infr_core::DType::Q8_0) || is_kv_prepass(kdt)) {
+                    record_scratch_max(&mut maxima, "kvdeq_k", ne * 2);
+                }
+                if rows > 1 && (matches!(vdt, infr_core::DType::Q8_0) || is_kv_prepass(vdt)) {
+                    record_scratch_max(&mut maxima, "kvdeq_v", ne * 2);
+                }
+
+                let flash_min_rows = be_.cfg().kernels.vulkan.flash_min_rows;
+                let flash_hd = hd == 128
+                    || (hd == 256
+                        && be_.max_shared_memory_bytes() >= crate::FLASH_HD256_BM16_SHARED);
+                let flash_capacity_ok = if hd == 256 {
+                    kv_len <= cap_rows
+                } else {
+                    kv_len.div_ceil(64) * 64 <= cap_rows
+                };
+                let flash_possible = (rows >= 64 || (rows >= flash_min_rows && kv_len >= 8192))
+                    && flash_hd
+                    && flash_capacity_ok
+                    && matches!(mask, AttnMask::Causal)
+                    && (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6
+                    && be_.caps().f16_coopmat()
+                    && matches!(graph.tensors[q.0 as usize].kind, TensorKind::Internal)
+                    && matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
+                if flash_possible {
+                    let mpad = rows.div_ceil(64) * 64;
+                    record_scratch_max(&mut maxima, "flash_po", 8 * mpad * nh * hd * 4);
+                    record_scratch_max(&mut maxima, "flash_pm", 8 * mpad * nh * 4);
+                    record_scratch_max(&mut maxima, "flash_pl", 8 * mpad * nh * 4);
+                }
+
+                if rows == 0 || rows > MAX_SMALL_STATIC_ROWS || hd % 4 != 0 || hd > 512 {
+                    continue;
+                }
+
+                // Every static split policy uses a chunk of at least ATTN_SPLIT.min_chunk.
+                // Planning from that floor is therefore an upper bound even for Q8-HD256,
+                // forced mrows, ring and Canvas variants. Segmented decode deliberately uses the
+                // split kernel with one chunk, so keep the request when span <= the chunk floor.
+                let window = match mask {
+                    AttnMask::SlidingWindow(window) => *window,
+                    _ => 0,
+                };
+                let span_start = if window > 0 {
+                    (*pos as usize + 1).saturating_sub(window)
+                } else {
+                    0
+                };
+                let span = kv_len.saturating_sub(span_start).max(1);
+                let chunk = split_k_chunk_count_cap(span, ATTN_SPLIT.min_chunk);
+                let n_chunks = span.div_ceil(chunk);
+                let partials = rows * nh * n_chunks;
+                record_scratch_max(&mut maxima, "split_pm", partials * 4);
+                record_scratch_max(&mut maxima, "split_pl", partials * 4);
+                record_scratch_max(&mut maxima, "split_pacc", partials * hd * 4);
+            }
+            Op::Sample { rows, top_k, .. } => record_scratch_max(
+                &mut maxima,
+                "sample_cand",
+                sample_candidate_scratch_bytes(*rows, *top_k),
+            ),
+            Op::Argmax { .. } => record_scratch_max(&mut maxima, "argmax_part", 512 * 4),
+            Op::ArgmaxProb { .. } => record_scratch_max(&mut maxima, "argmax_prob_part", 768 * 4),
+            _ => {}
+        }
+    }
+
+    let mut requests = maxima.into_iter().collect::<Vec<_>>();
+    requests.sort_unstable_by_key(|&(tag, _)| tag);
+    Ok(requests)
+}
+
 fn paged_phase_scratch_requests(
     be_: &VulkanBackend,
     graph: &Graph,
@@ -1636,6 +1819,7 @@ fn paged_phase_scratch_requests(
         .into_iter()
         .chain(paged_moe_scratch_requests(be_, graph))
         .chain(paged_deltanet_scratch_requests(be_, graph))
+        .chain(paged_tail_scratch_requests(be_, graph)?)
     {
         maxima
             .entry(tag)
@@ -4692,7 +4876,6 @@ fn lower_op(
                 let k_rows = resolve_rows(bindings, *k_cache, spans.len())?;
                 let v_rows = resolve_rows(bindings, *v_cache, spans.len())?;
                 let mut geometries = Vec::with_capacity(spans.len());
-                let mut max_partials = 0usize;
                 for sequence in spans {
                     let sequence_pos = sequence.start_pos as usize;
                     let sequence_rows = sequence.rows as usize;
@@ -4711,12 +4894,13 @@ fn lower_op(
                         infr_core::tier::adaptive_chunk(visible, &ATTN_SPLIT),
                     );
                     let n_chunks = visible.div_ceil(chunk);
-                    max_partials = max_partials.max(sequence_rows * nh * n_chunks);
                     geometries.push((sequence_pos, sequence_kv_len, chunk, n_chunks));
                 }
-                let pm = pooled(pool, be_, "independent_split_pm", max_partials * 4)?;
-                let pl = pooled(pool, be_, "independent_split_pl", max_partials * 4)?;
-                let pacc = pooled(pool, be_, "independent_split_pacc", max_partials * hd * 4)?;
+                let [pm_bytes, pl_bytes, pacc_bytes] =
+                    independent_attention_scratch_bytes(graph, rows, nh, hd, mask)?;
+                let pm = pooled(pool, be_, "independent_split_pm", pm_bytes)?;
+                let pl = pooled(pool, be_, "independent_split_pl", pl_bytes)?;
+                let pacc = pooled(pool, be_, "independent_split_pacc", pacc_bytes)?;
                 let q_row_bytes = nh * hd * 2;
                 let o_row_bytes = nh * hd * 4;
                 for (lane, sequence) in spans.iter().enumerate() {
@@ -6438,7 +6622,7 @@ fn lower_op(
                 pool,
                 be_,
                 "sample_cand",
-                2 * *rows as usize * 256 * *top_k as usize * 4,
+                sample_candidate_scratch_bytes(*rows, *top_k),
             )?;
             match mode {
                 // Record-once/self-advancing path (single-shot `execute` OR chained
@@ -8395,6 +8579,22 @@ fn complete_decode_prefetch_handoffs(be_: &VulkanBackend) {
     }
 }
 
+fn clear_frozen_moe_lut_slots(be_: &VulkanBackend) {
+    if let Some(session) = be_.moe_pager().lock().unwrap().as_mut() {
+        session.clear_frozen_lut_slots();
+    }
+}
+
+/// Declared before every execute-local recorder/segment so error unwinding drains their GPU work
+/// first, then releases the physical Expert slots protected by frozen LUT windows.
+struct FrozenMoeLutGuard<'a>(&'a VulkanBackend);
+
+impl Drop for FrozenMoeLutGuard<'_> {
+    fn drop(&mut self) {
+        clear_frozen_moe_lut_slots(self.0);
+    }
+}
+
 /// Per-execute static recording: prepare zeroed `Internal` scratch, record every op via `lower_op`
 /// (Static mode — pos as a push constant read from `positions[0]`), submit + wait. Paged plans
 /// retain shape-stable scratch within one decode/prefill phase; other plans allocate it per call.
@@ -8417,6 +8617,10 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
 }
 
 fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Result<()> {
+    // A previous errored execute may have left protection until its recorder/segments dropped.
+    // We are now inside the same unified execution gate, so no old command can still reference it.
+    clear_frozen_moe_lut_slots(be_);
+    let _frozen_lut_guard = FrozenMoeLutGuard(be_);
     let setup_t0 = infr_core::pager_profile::start();
     let setup_part_t0 = infr_core::pager_profile::start();
     let layout = scratch_layout(graph)?;
@@ -9227,6 +9431,7 @@ fn sync_stream<'a>(
     ps.drain()?; // fences already signaled (queue idle) — releases their transient objects
     ps.cursor = 0;
     ps.tape_cursor = 0;
+    clear_frozen_moe_lut_slots(be_);
     *rec = Some(be_.recorder()?);
     if let Some(elapsed) = infr_core::pager_profile::elapsed(sync_t0) {
         infr_core::pager_profile::record_paging_sync_wait(elapsed);
@@ -9358,6 +9563,7 @@ fn stage_and_window<'a>(
     ps: &mut PagedStream,
     buf_id: usize,
     ids: &[u32],
+    lut_ids: &[u32],
     n_expert: usize,
     scan: bool,
     batch_open: bool,
@@ -9384,6 +9590,7 @@ fn stage_and_window<'a>(
     }
     let mut guard = be_.moe_pager().lock().unwrap();
     let sess = guard.as_mut().expect("paged execution requires a session");
+    sess.protect_lut_ids(buf_id, lut_ids)?;
     sess.lut_window(&mut ps.tape_cursor, buf_id, n_expert)
 }
 
@@ -10190,9 +10397,9 @@ fn execute_paged_moe<'a>(
         sync_stream(be_, rec, ps)?;
     }
 
-    // Unified VRAM may loan cold expert cells to runtime scratch. Acquire the complete workspace
-    // before freezing any LUT address for this op; otherwise a later lazy allocation can retire a
-    // slot that the just-recorded LUT still names, turning the expert pointer into scratch memory.
+    // Acquire this op's reusable MoE workspace before freezing its LUT addresses. Phase-level
+    // preflight covers the common graph-wide buffers, while frozen-slot protection below makes any
+    // genuinely lazy later allocation preserve addresses already recorded into the command stream.
     let mmq_requests = paged_mmq_scratch_requests(be_, graph, op);
     let moe_scratch = if let Some(requests) = mmq_requests {
         let mut keys = pooled_batch(pool, be_, &requests)?.into_iter();
@@ -10322,11 +10529,39 @@ fn execute_paged_moe<'a>(
                 push.complete_without_recorder(be_)?;
             }
             if role_batches_open {
-                let gate_hit_w =
-                    stage_and_window(be_, rec, ps, gate_id, &[], n_expert, false, true)?;
-                let up_hit_w = stage_and_window(be_, rec, ps, up_id, &[], n_expert, false, true)?;
-                let down_hit_w =
-                    stage_and_window(be_, rec, ps, down_id, &[], n_expert, false, true)?;
+                let gate_hit_w = stage_and_window(
+                    be_,
+                    rec,
+                    ps,
+                    gate_id,
+                    &[],
+                    &hit_ids[..hit_count],
+                    n_expert,
+                    false,
+                    true,
+                )?;
+                let up_hit_w = stage_and_window(
+                    be_,
+                    rec,
+                    ps,
+                    up_id,
+                    &[],
+                    &hit_ids[..hit_count],
+                    n_expert,
+                    false,
+                    true,
+                )?;
+                let down_hit_w = stage_and_window(
+                    be_,
+                    rec,
+                    ps,
+                    down_id,
+                    &[],
+                    &hit_ids[..hit_count],
+                    n_expert,
+                    false,
+                    true,
+                )?;
                 let PagedMoeScratch::Small(scratch) = &moe_scratch else {
                     unreachable!("hit-first path always uses small-m scratch")
                 };
@@ -10551,6 +10786,13 @@ fn execute_paged_moe<'a>(
     } else {
         stage_ids.as_slice()
     };
+    // The all-resident fast path leaves router ids on the GPU and therefore has no exact CPU list.
+    // Protect that layer's complete LUT; every other Decode path protects only routed ids.
+    let all_resident_lut_ids =
+        (!layer_stream && stage_ids.is_empty()).then(|| (0..n_expert as u32).collect::<Vec<_>>());
+    let role_lut_ids = all_resident_lut_ids
+        .as_deref()
+        .unwrap_or(stage_ids.as_slice());
     let gate_w = if layer_stream {
         stage_layer_and_window(be_, rec, ps, gate_id, n_expert)?
     } else {
@@ -10560,6 +10802,7 @@ fn execute_paged_moe<'a>(
             ps,
             gate_id,
             role_stage_ids,
+            role_lut_ids,
             n_expert,
             touch_all,
             roles_batched,
@@ -10576,6 +10819,7 @@ fn execute_paged_moe<'a>(
             ps,
             up_id,
             role_stage_ids,
+            role_lut_ids,
             n_expert,
             touch_all,
             roles_batched,
@@ -10590,6 +10834,7 @@ fn execute_paged_moe<'a>(
             ps,
             down_id,
             role_stage_ids,
+            role_lut_ids,
             n_expert,
             touch_all,
             roles_batched,
@@ -11064,6 +11309,36 @@ mod tests {
 
         graph.sequence_spans[1].rows = 2;
         assert_eq!(decode_token_rows(&graph), None);
+    }
+
+    #[test]
+    fn paged_tail_sizes_sampling_for_the_active_lane_count() {
+        assert_eq!(sample_candidate_scratch_bytes(1, 20), 40_960);
+        assert_eq!(sample_candidate_scratch_bytes(2, 20), 81_920);
+        assert_eq!(sample_candidate_scratch_bytes(4, 64), 524_288);
+    }
+
+    #[test]
+    fn paged_tail_sizes_independent_attention_from_the_deepest_lane() {
+        let mut graph = Graph::new();
+        graph.independent_rows = true;
+        graph.sequence_spans = vec![
+            SequenceSpan {
+                row_start: 0,
+                rows: 1,
+                start_pos: 52,
+            },
+            SequenceSpan {
+                row_start: 1,
+                rows: 1,
+                start_pos: 52,
+            },
+        ];
+
+        assert_eq!(
+            independent_attention_scratch_bytes(&graph, 2, 24, 256, &AttnMask::Causal).unwrap(),
+            [96, 96, 24_576]
+        );
     }
 
     #[test]
