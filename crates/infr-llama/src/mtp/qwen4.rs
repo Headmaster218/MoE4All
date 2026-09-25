@@ -11,6 +11,18 @@ use super::{BindWeightFn, MtpTensor};
 
 pub const DRAFT_TOKENS: usize = 4;
 
+fn generation_budget(prompt_rows: usize, requested: usize, max_ctx: usize) -> Result<usize> {
+    let reserved = prompt_rows
+        .checked_add(DRAFT_TOKENS)
+        .ok_or_else(|| anyhow!("Qwen3.8 MTP context row count overflow"))?;
+    if reserved > max_ctx {
+        bail!(
+            "Qwen3.8 MTP needs at least {reserved} context rows for a {prompt_rows}-token prompt, but its fixed runtime has {max_ctx}"
+        );
+    }
+    Ok(requested.min(max_ctx - reserved))
+}
+
 type SharedWeight<'a> = (&'a dyn Buffer, DType, usize);
 type SharedWeights<'a> = (SharedWeight<'a>, SharedWeight<'a>);
 
@@ -1478,13 +1490,9 @@ impl Qwen4MtpRuntime {
         if prompt_tokens.is_empty() {
             bail!("Qwen3.8 MTP received an empty prompt");
         }
-        if prompt_tokens.len() + max_new + DRAFT_TOKENS > self.max_ctx {
-            bail!(
-                "Qwen3.8 MTP needs {} context rows, but its fixed runtime has {}",
-                prompt_tokens.len() + max_new + DRAFT_TOKENS,
-                self.max_ctx
-            );
-        }
+        // `max_new` is a ceiling, not a capacity demand. Match ordinary decode by clipping it to
+        // the remaining window while retaining the four rows a full VERIFY cycle may touch.
+        let max_new = generation_budget(prompt_tokens.len(), max_new, self.max_ctx)?;
         self.reset();
 
         let t_prime = std::time::Instant::now();
@@ -1728,5 +1736,28 @@ impl Qwen4MtpRuntime {
             },
             timing,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generation_budget;
+
+    #[test]
+    fn generation_budget_clips_a_large_reply_to_the_remaining_context() {
+        assert_eq!(
+            generation_budget(200_000, 102_400, 262_144).unwrap(),
+            62_140
+        );
+    }
+
+    #[test]
+    fn generation_budget_preserves_a_reply_that_fits() {
+        assert_eq!(generation_budget(150_000, 512, 262_144).unwrap(), 512);
+    }
+
+    #[test]
+    fn generation_budget_rejects_a_prompt_without_verify_room() {
+        assert!(generation_budget(262_141, 1, 262_144).is_err());
     }
 }
