@@ -30,7 +30,6 @@ use std::{
 use std::time::SystemTime;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmbeddingConfig {
@@ -228,10 +227,10 @@ impl LlamaCppEmbeddingEngine {
         let child = command.spawn().with_context(|| {
             format!("start llama.cpp embedding runner {}", runner_path.display())
         })?;
-        let client = Client::builder()
-            .no_proxy()
-            .timeout(REQUEST_TIMEOUT)
-            .build()?;
+        // Large batches and a cold model load can legitimately run for longer than ten minutes.
+        // Keep the explicit two-second readiness probes below, but do not impose a whole-request
+        // deadline on an embedding job that the caller is still waiting for.
+        let client = Client::builder().no_proxy().build()?;
         let tier = if device.wants_vulkan() {
             MemoryTier::Vram
         } else {
