@@ -667,6 +667,9 @@ struct VulkanShared {
     /// pager's one existing allocation; it does not create a GTT mirror or consume the VRAM budget.
     external_memory_host: Option<ash::ext::external_memory_host::Device>,
     host_import_alignment: usize,
+    /// A platform safety ceiling for external host-memory aliases. This limits only the DMA view;
+    /// the complete RAM pager store remains available through direct/staged uploads.
+    host_dma_import_limit: Option<usize>,
     /// The transport plan shared with the pager. Keeping this handle below the pager abstraction
     /// lets queue-submit recovery shed unused imported-host aliases without taking the pager lock
     /// or changing logical residency state.
@@ -4020,6 +4023,10 @@ impl VulkanBackend {
                 has_dma_buf: has_ext_mem_dma_buf,
                 external_memory_host,
                 host_import_alignment,
+                host_dma_import_limit: crate::caps::host_dma_import_limit(
+                    device_probe.vendor_id,
+                    cfg!(target_os = "windows"),
+                ),
                 session_transfer_plan: RwLock::new(None),
                 external_semaphore_fd,
                 kernels: Mutex::new(HashMap::new()),
@@ -4138,20 +4145,34 @@ impl VulkanBackend {
 
         let arena_count = pending.len();
         let mut limit_error = None;
-        while let Some(index) = proportional_import_index(
-            &pending
-                .iter()
-                .map(|state| (state.offset.min(state.logical_len), state.logical_len))
-                .collect::<Vec<_>>(),
-        ) {
+        let import_limit = self.shared.host_dma_import_limit;
+        let mut imported_bytes = 0usize;
+        let mut policy_limit_reached = false;
+        loop {
+            let Some(index) = proportional_import_index(
+                &pending
+                    .iter()
+                    .map(|state| (state.offset.min(state.logical_len), state.logical_len))
+                    .collect::<Vec<_>>(),
+            ) else {
+                break;
+            };
             let state = &pending[index];
             let remaining = state.owner.allocated_len() - state.offset;
-            let mut len = remaining.min(max_shard);
+            let budget_remaining = import_limit
+                .map(|limit| limit.saturating_sub(imported_bytes))
+                .unwrap_or(usize::MAX);
+            if budget_remaining < state.quantum {
+                policy_limit_reached = import_limit.is_some();
+                break;
+            }
+            let mut len = remaining.min(max_shard).min(budget_remaining);
             if len < remaining {
                 len = len / state.quantum * state.quantum;
             }
             if len == 0 {
-                len = remaining.min(max_shard);
+                policy_limit_reached = import_limit.is_some();
+                break;
             }
             let minimum = state.quantum.min(len);
             let mut reduced = false;
@@ -4163,6 +4184,7 @@ impl VulkanBackend {
                         let state = &mut pending[index];
                         state.shards.push(shard);
                         state.offset += len;
+                        imported_bytes += len;
                         if reduced {
                             // The first large allocation failure marks the WDDM capacity edge.
                             // Keep the recovered tail but do not create a long run of tiny external
@@ -4206,6 +4228,12 @@ impl VulkanBackend {
         if let Some(err) = limit_error {
             tracing::warn!(
                 "[infr] host DMA import reached the driver limit at {:.2}/{:.2} GiB ({err}); remaining RAM uses the arena's direct/staged upload fallback",
+                total_imported as f64 / (1u64 << 30) as f64,
+                total_logical as f64 / (1u64 << 30) as f64,
+            );
+        } else if policy_limit_reached {
+            tracing::info!(
+                "[infr] host DMA import capped at {:.2}/{:.2} GiB by the NVIDIA Windows safety limit; remaining RAM uses the arena's direct/staged upload fallback",
                 total_imported as f64 / (1u64 << 30) as f64,
                 total_logical as f64 / (1u64 << 30) as f64,
             );
