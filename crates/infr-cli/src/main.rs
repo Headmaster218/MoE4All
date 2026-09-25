@@ -4548,17 +4548,15 @@ fn cmd_serve(
     // (`infr_core::parse_size`, which is also what the `INFR_CTX` env layer parses).
     let is_dg = infr_llama::diffusion::is_diffusion_gemma(&gguf);
     let is_vulkan = !is_dg && matches!(selected_backend(cfg)?, Backend::Vulkan(_));
-    // Keep the established one-slot MTP path unchanged. Two slots use the batched MTP scheduler.
+    // Keep the established one-slot text-only MTP path unchanged. Vision needs ParallelSeam's
+    // multimodal slot state, so even one MTP slot uses the batched scheduler when mmproj is set.
     let vulkan_mtp = is_vulkan && cfg.spec.mtp && cfg.spec.draft.is_some();
-    let serialized_vulkan_mtp = vulkan_mtp && parallel == 1;
+    let serialized_vulkan_mtp = vulkan_mtp && parallel == 1 && mmproj.is_none();
     if vulkan_mtp && parallel > 2 {
         anyhow::bail!("Qwen3.8 concurrent MTP currently supports at most two slots");
     }
     if mmproj.is_some() && !is_vulkan {
         anyhow::bail!("--mmproj currently requires the Vulkan qwen4exp serve path");
-    }
-    if vulkan_mtp && mmproj.is_some() {
-        anyhow::bail!("Qwen3.8 MTP does not yet support vision requests");
     }
     if vulkan_mtp && embedding_model.is_some() {
         anyhow::bail!("Qwen3.8 MTP cannot host the embedding sidecar in the same process yet");

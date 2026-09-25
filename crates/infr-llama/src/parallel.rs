@@ -160,6 +160,21 @@ fn expand_multimodal_prompt(
     ))
 }
 
+fn multimodal_token_position(plan: Option<&crate::seam::MropePlan>, token: usize) -> Result<i32> {
+    let Some(plan) = plan else {
+        return i32::try_from(token).map_err(|_| anyhow!("text position exceeds i32"));
+    };
+    let prompt_len = plan.prompt_pos4.len() / 4;
+    if token < prompt_len {
+        return Ok(plan.prompt_pos4[token * 4]);
+    }
+    let delta = i32::try_from(token - prompt_len)
+        .map_err(|_| anyhow!("multimodal decode position exceeds i32"))?;
+    plan.decode_base
+        .checked_add(delta)
+        .ok_or_else(|| anyhow!("multimodal decode position overflow"))
+}
+
 /// Pure continuation-slot selection (the "this conversation continuing" case of [`checkout`], and
 /// the twin of `seam::model::SlotPool::pick`'s first arm). Given `(slot_idx, prefix_score,
 /// cached_len)` for each candidate free slot and the `prompt_len`, pick the qualifying slot with
@@ -304,6 +319,7 @@ struct BatchWork {
     checkpoint_boundary: Option<usize>,
     turn_checkpoint: Option<crate::seam::TurnCheckpoint>,
     mrope_plan: Option<crate::seam::MropePlan>,
+    multimodal_key: Option<MultimodalKey>,
     finished: bool,
     sampling: RequestSampling,
     sampler: Option<ParallelSampler>,
@@ -315,6 +331,7 @@ struct MtpSlotState {
     cached: Vec<u32>,
     last_h: Vec<f32>,
     pending_id: Option<u32>,
+    multimodal_key: Option<MultimodalKey>,
 }
 
 impl BatchWork {
@@ -602,8 +619,8 @@ pub struct ParallelSeam {
     /// Set only when the scheduler has new work to admit. The runner polls it once per
     /// aggregated token; an empty steady-state decode takes no queue lock.
     batch_interrupt: Arc<AtomicBool>,
-    /// The GPU baton. `None` when `n_slots == 1`: a lone sequence must not pay even a mutex per
-    /// token, and single-request decode speed is a hard non-regression requirement.
+    /// The GPU baton. Ordinary one-slot serving keeps this absent; one-slot MTP uses it to hand
+    /// work to the persistent speculative scheduler.
     gate: Option<Arc<StepGate>>,
     /// Opt-in disk-backed conversation catalog. `None` keeps the pre-existing checkout path
     /// byte-for-byte isolated from file I/O and cache locking.
@@ -692,11 +709,11 @@ impl ParallelSeam {
         let pins = Arc::new(crate::seam::PlacementPins::for_slots(n_slots));
         let scope = crate::seam::PlacementScope::enter(pins.clone());
         let max_ctx = model.vulkan_slot_ctx(&vk, n_slots, want_ctx)?;
-        let mtp_heads = if n_slots > 1 && model.engine_cfg().spec.mtp && model.config().qwen4exp {
+        let mtp_heads = if model.engine_cfg().spec.mtp && model.config().qwen4exp {
             let sampler = crate::sampling::Sampler::from_cfg(&model.engine_cfg().sampling);
             if sampler.temp > 0.0 && sampler.top_k != 1 {
                 tracing::warn!(
-                    "Qwen3.8 concurrent MTP is greedy-only; requests use ordinary decode unless temperature is 0 or top_k is 1"
+                    "Qwen3.8 MTP scheduler is greedy-only; requests use ordinary decode unless temperature is 0 or top_k is 1"
                 );
             }
             let sidecar = model
@@ -719,12 +736,14 @@ impl ParallelSeam {
                     cached: Vec::new(),
                     last_h: vec![0.0; model.config().hc_mult * model.config().n_embd],
                     pending_id: None,
+                    multimodal_key: None,
                 });
             }
             Some(Arc::new(Mutex::new(heads)))
         } else {
             None
         };
+        let scheduler_enabled = n_slots > 1 || mtp_heads.is_some();
         let session_idle = Duration::from_secs(model.engine_cfg().kv.session_idle_secs);
         let mut engine = Self {
             scheduler_worker: None,
@@ -739,9 +758,9 @@ impl ParallelSeam {
             decode_batch: Arc::new(Mutex::new(DecodeBatchQueue::default())),
             decode_ready: Arc::new(Condvar::new()),
             batch_interrupt: Arc::new(AtomicBool::new(false)),
-            // A 1-slot server has nothing to take turns with — keep it on the exact uncontended
-            // path `infr run` takes (see `RequestCtx::gate_pass`: `None` constructs nothing).
-            gate: (n_slots > 1).then(|| Arc::new(StepGate::new())),
+            // Ordinary one-slot serving has no scheduler. MTP needs the gate even with one slot
+            // because the request thread hands ownership to the persistent speculative worker.
+            gate: scheduler_enabled.then(|| Arc::new(StepGate::new())),
             session_cache: None,
             session_idle,
             max_ctx,
@@ -2135,6 +2154,7 @@ impl ParallelSeam {
         let lane = &mut heads[work.slot];
         let prompt = &work.prompt[..work.prompt_end];
         let reusable = lane.pending_id.is_some()
+            && lane.multimodal_key == work.multimodal_key
             && lane.cached == work.kv().cached_tokens()
             && prompt.starts_with(&lane.cached);
         if !reusable {
@@ -2142,6 +2162,7 @@ impl ParallelSeam {
             lane.cached.clear();
             lane.last_h.fill(0.0);
             lane.pending_id = None;
+            lane.multimodal_key = None;
         }
         let start = lane.cached.len();
         work.prefill_start = start;
@@ -2171,6 +2192,7 @@ impl ParallelSeam {
                 &prompt[..chunk_end],
                 &mut work.kv,
                 self.max_ctx,
+                work.mrope_plan.as_ref(),
                 finish.as_deref(),
             )?;
             anyhow::ensure!(
@@ -2188,6 +2210,7 @@ impl ParallelSeam {
                 &prompt[chunk_start..chunk_end],
                 &shifted,
                 chunk_start,
+                work.mrope_plan.as_ref(),
                 work.kv().mtp_shared_weights(),
             )?;
             lane.last_h.copy_from_slice(&hidden[(rows - 1) * h_width..]);
@@ -2195,6 +2218,7 @@ impl ParallelSeam {
             lane.cached
                 .extend_from_slice(&prompt[chunk_start..chunk_end]);
         }
+        lane.multimodal_key = work.multimodal_key;
         anyhow::ensure!(lane.pending_id.is_some(), "MTP prime has no frontier token");
         work.kv
             .as_mut()
@@ -2267,7 +2291,7 @@ impl ParallelSeam {
                 continue;
             }
             let mut indices = (0..active.len()).collect::<Vec<_>>();
-            indices.sort_by_key(|&index| active[index].slot);
+            indices.sort_by_key(|&index| (active[index].mrope_plan.is_none(), active[index].slot));
             if let Err(error) = self.run_mtp_verify_cycle(&mut active, &indices, req) {
                 self.fail_unified_scheduler(&mut active, error);
                 return;
@@ -2305,11 +2329,15 @@ impl ParallelSeam {
                 let work = &mut active[index];
                 let lane = &mut heads[work.slot];
                 let pending = lane.pending_id.expect("primed MTP lane has a frontier");
+                let physical_position = work.kv().cached_len();
+                let rope_position =
+                    multimodal_token_position(work.mrope_plan.as_ref(), physical_position)?;
                 let candidates = lane.head.draft(
                     self.vk.as_ref(),
                     pending,
                     &lane.last_h,
-                    work.kv().cached_len(),
+                    physical_position,
+                    rope_position,
                     rows,
                     work.kv().mtp_shared_weights(),
                 )?;
@@ -2328,6 +2356,14 @@ impl ParallelSeam {
 
         let (verify_ids, verify_hidden) = {
             let _gate = req.gate_pass();
+            let mut owned_mrope_plans = indices
+                .iter()
+                .map(|&index| active[index].mrope_plan.take())
+                .collect::<Vec<_>>();
+            let mrope_plans = owned_mrope_plans
+                .iter()
+                .map(Option::as_ref)
+                .collect::<Vec<_>>();
             let mut primary = active[indices[0]].kv.take();
             let mut peers = indices[1..]
                 .iter()
@@ -2340,6 +2376,7 @@ impl ParallelSeam {
                 ec,
                 self.model.embd(),
                 &feeds,
+                &mrope_plans,
                 &mut primary,
                 &mut peers,
                 self.max_ctx,
@@ -2347,6 +2384,10 @@ impl ParallelSeam {
             active[indices[0]].kv = primary;
             for (&index, kv) in indices[1..].iter().zip(peers) {
                 active[index].kv = Some(kv);
+            }
+            drop(mrope_plans);
+            for (&index, plan) in indices.iter().zip(owned_mrope_plans.drain(..)) {
+                active[index].mrope_plan = plan;
             }
             result?
         };
@@ -2627,6 +2668,7 @@ impl ParallelSeam {
             checkpoint_boundary: None,
             turn_checkpoint,
             mrope_plan: None,
+            multimodal_key: None,
             finished: false,
             sampling: req.sampling().clone(),
             sampler: Some(sampler),
@@ -2730,13 +2772,75 @@ impl ParallelSeam {
             decode_base = plan.decode_base,
             "multimodal prompt prepared"
         );
+        let mtp_eligible = self.mtp_heads.as_ref().is_some_and(|_| {
+            let base = crate::sampling::Sampler::from_cfg(&self.model.engine_cfg().sampling);
+            let effective =
+                crate::sampling::Sampler::resolve(Some(req), &self.model.engine_cfg().sampling);
+            self.gate.is_some()
+                && max_new > 0
+                && (base.temp <= 0.0 || base.top_k == 1)
+                && (effective.temp <= 0.0 || effective.top_k == 1)
+                && !req.sampling().penalties_active()
+        });
+        if mtp_eligible {
+            let sampler = ParallelSampler::new(req, &self.model.engine_cfg().sampling);
+            let mut queue = self
+                .decode_batch
+                .lock()
+                .expect("decode batch queue poisoned");
+            let (event_tx, event_rx) = mpsc::sync_channel(0);
+            let (ack_tx, ack_rx) = mpsc::sync_channel(0);
+            queue.waiting.push_back(BatchWork {
+                slot: guard.idx,
+                kv: Some(guard.detach()),
+                prompt: prompt_tokens,
+                prompt_end: plan.prompt_pos4.len() / 4,
+                max_new,
+                generated: 0,
+                stats: GenStats::default(),
+                phase: BatchPhase::Unprepared,
+                prefill_start: 0,
+                checkpoint_boundary: None,
+                turn_checkpoint,
+                mrope_plan: Some(plan),
+                multimodal_key: Some(key),
+                finished: false,
+                sampling: req.sampling().clone(),
+                sampler: Some(sampler),
+                channels: Some(BatchChannels {
+                    events: event_tx,
+                    acknowledgements: ack_rx,
+                }),
+            });
+            self.batch_interrupt.store(true, Ordering::Release);
+            self.decode_ready.notify_all();
+            drop(queue);
+            return self.wait_for_decode_batch(
+                &mut guard,
+                event_rx,
+                ack_tx,
+                req,
+                &mut acc,
+                &mut printed,
+                &mut on_piece,
+            );
+        }
+        if let Some(heads) = &self.mtp_heads {
+            let mut heads = heads.lock().expect("MTP heads poisoned");
+            heads[guard.idx].pending_id = None;
+            heads[guard.idx].multimodal_key = None;
+        }
         let frontier = prompt_tokens.len().saturating_sub(1);
         let frontier_is_image = plan.spans.iter().any(|span| {
             frontier >= span.start && frontier < span.start.saturating_add(span.n_tokens)
         });
         // Consume image embedding rows on the legacy path, but leave the final text frontier and
         // every sampled token to the unified scheduler so multimodal and text decodes can batch.
-        let legacy_max_new = if frontier_is_image { max_new } else { 0 };
+        let legacy_max_new = if frontier_is_image || self.mtp_heads.is_some() {
+            max_new
+        } else {
+            0
+        };
         let result = crate::seam::generate_dense_vulkan_session(
             &self.vk,
             self.model.gguf(),
@@ -2803,6 +2907,7 @@ impl ParallelSeam {
             checkpoint_boundary: None,
             turn_checkpoint: None,
             mrope_plan: Some(plan),
+            multimodal_key: Some(key),
             finished: false,
             sampling: req.sampling().clone(),
             sampler: Some(sampler),
@@ -2829,9 +2934,9 @@ impl ParallelSeam {
 #[cfg(test)]
 mod tests {
     use super::{
-        expand_multimodal_prompt, mtp_accepted_rows, multimodal_key, phase_for_remaining_prefill,
-        pick_continuation, scheduler_mode, BatchPhase, MultimodalEmbedding, SchedulerMode,
-        SHORT_PREFILL_TOKENS,
+        expand_multimodal_prompt, mtp_accepted_rows, multimodal_key, multimodal_token_position,
+        phase_for_remaining_prefill, pick_continuation, scheduler_mode, BatchPhase,
+        MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
     };
     use std::sync::Arc;
 
@@ -2936,6 +3041,9 @@ mod tests {
             &[1, 1, 1, 0, 1, 1, 2, 0, 1, 2, 1, 0, 1, 2, 2, 0]
         );
         assert_eq!(plan.decode_base, 8);
+        assert_eq!(multimodal_token_position(Some(&plan), 9).unwrap(), 7);
+        assert_eq!(multimodal_token_position(Some(&plan), 10).unwrap(), 8);
+        assert_eq!(multimodal_token_position(Some(&plan), 13).unwrap(), 11);
     }
 
     #[test]

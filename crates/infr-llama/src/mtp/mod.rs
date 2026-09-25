@@ -2165,6 +2165,7 @@ pub(crate) fn run_qwen4_prime_frontier_with_finish(
     tokens: &[u32],
     state: &mut Option<crate::seam::SeamKv>,
     max_ctx: usize,
+    mm: Option<&crate::seam::MropePlan>,
     finish_fixed_allocations: Option<&dyn Fn() -> Result<()>>,
 ) -> Result<(u32, Vec<f32>)> {
     anyhow::ensure!(cfg.qwen4exp, "Qwen3.8 frontier prime requires qwen4exp");
@@ -2184,6 +2185,7 @@ pub(crate) fn run_qwen4_prime_frontier_with_finish(
         &mut logits,
         &mut ids,
         &mut h,
+        mm,
         finish_fixed_allocations,
     )?;
     let id = if let Some(&id) = ids.first() {
