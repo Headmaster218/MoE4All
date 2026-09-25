@@ -36,7 +36,14 @@ pub use sc::{DenoiseOutcome, EbReduced};
 pub(crate) use session_state::{SessionBuffer, SessionBufferKey, SessionStateMeta};
 pub(crate) use weights::SeamKv;
 
-pub(crate) type ParallelSampledOutput = (Vec<Vec<u32>>, Vec<f64>, Vec<f64>);
+pub(crate) struct ParallelSampledOutput {
+    pub(crate) tokens: Vec<Vec<u32>>,
+    pub(crate) prompt_secs: Vec<f64>,
+    pub(crate) decode_secs: Vec<f64>,
+    /// Target hidden rows in lane-major order. Empty unless the caller requested an MTP
+    /// synchronization trace.
+    pub(crate) hidden: Vec<Vec<f32>>,
+}
 
 /// A LAZILY-dequantized host f32 token-embedding table, threaded through the seam runners in place
 /// of a `&[f32]`.
@@ -779,6 +786,7 @@ pub(crate) fn generate_dense_vulkan_parallel_sampled_session(
     on_token: &mut dyn FnMut(usize, u32) -> bool,
     yield_requested: Option<&std::sync::atomic::AtomicBool>,
     req: Option<&crate::sampling::RequestCtx>,
+    capture_hidden: bool,
 ) -> AResult<ParallelSampledOutput> {
     if primary.is_none() {
         return Err(anyhow!(
@@ -808,6 +816,7 @@ pub(crate) fn generate_dense_vulkan_parallel_sampled_session(
         on_token,
         yield_requested,
         req,
+        capture_hidden,
     )?;
     vk.print_moe_pager_stats();
     vk.print_dense_pager_stats();
