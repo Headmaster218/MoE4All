@@ -452,12 +452,10 @@ pub(crate) struct SeamKv {
     /// rewind by cache truncation the way a per-position KV cache can — see the `c.qwen35` branch in
     /// `generate_dense_backend`'s `start` computation). `None` for every non-MTP caller.
     pub(super) mtp_delta_ckpt: Option<MtpDeltaCkpt>,
-    /// Rolling conversation checkpoint for append-only recurrent mixers. Unlike the MTP rollback
-    /// checkpoint above, this snapshot is taken at the stable rendered-history boundary BEFORE
-    /// the assistant generation prompt. The next turn can therefore restore that exact state and
-    /// prefill only the prior visible answer plus the new user turn, even when chat-history
-    /// normalization makes the newly rendered prompt diverge from `cached`.
-    pub(super) turn_recurrent_ckpt: Option<TurnRecurrentCkpt>,
+    /// Two conversation checkpoints for append-only recurrent mixers: the reusable agent prefix
+    /// and the prefix immediately before the latest user message. Attention/QSA rows remain in
+    /// their ordinary cache; only the fixed recurrent/PLE summaries are duplicated here.
+    pub(super) turn_recurrent_ckpts: [Option<TurnRecurrentCkpt>; super::TURN_CHECKPOINT_COUNT],
     /// Additional serve slots whose persistent device allocations were materialized beside slot
     /// 0 before the unified arena consumed the measured remainder. Startup drains this vector
     /// immediately; ordinary one-shot/session paths always keep it empty.
@@ -1067,11 +1065,16 @@ impl SeamKv {
         let live = (live_score > 0
             && (live_score == self.cached.len() || live_score == prompt.len()))
         .then_some(live_score);
-        let checkpoint = self.turn_recurrent_ckpt.as_ref().and_then(|ck| {
-            ck.valid
-                .then(|| checkpoint_extension_start(&ck.tokens, prompt))
-                .flatten()
-        });
+        let checkpoint = self
+            .turn_recurrent_ckpts
+            .iter()
+            .flatten()
+            .filter_map(|ck| {
+                ck.valid
+                    .then(|| checkpoint_extension_start(&ck.tokens, prompt))
+                    .flatten()
+            })
+            .max();
         live.into_iter().chain(checkpoint).max()
     }
 
@@ -1209,7 +1212,7 @@ impl SeamKv {
     }
 
     fn invalidate_turn_checkpoint(&mut self) {
-        if let Some(ck) = self.turn_recurrent_ckpt.as_mut() {
+        for ck in self.turn_recurrent_ckpts.iter_mut().flatten() {
             ck.invalidate();
         }
     }
@@ -1222,16 +1225,38 @@ impl SeamKv {
         be: &dyn Backend,
         prompt: &[u32],
     ) -> AResult<Option<usize>> {
-        let Some(ck) = self.turn_recurrent_ckpt.as_ref() else {
+        let selected = self
+            .turn_recurrent_ckpts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, checkpoint)| {
+                let checkpoint = checkpoint.as_ref()?;
+                checkpoint
+                    .valid
+                    .then(|| checkpoint_extension_start(&checkpoint.tokens, prompt))
+                    .flatten()
+                    .map(|len| (index, len))
+            })
+            .max_by_key(|&(_, len)| len);
+        let Some((selected, len)) = selected else {
             return Ok(None);
         };
-        let Some(len) = ck
-            .valid
-            .then(|| checkpoint_extension_start(&ck.tokens, prompt))
-            .flatten()
-        else {
-            return Ok(None);
-        };
+
+        // A divergent branch overwrites every attention/QSA row after the selected boundary.
+        // Any checkpoint from the old branch that is not itself a prefix of this prompt would
+        // otherwise retain a valid recurrent summary beside invalid per-token cache rows.
+        for (index, checkpoint) in self.turn_recurrent_ckpts.iter_mut().enumerate() {
+            if index != selected {
+                if let Some(checkpoint) = checkpoint.as_mut() {
+                    if checkpoint.valid && !prompt.starts_with(&checkpoint.tokens) {
+                        checkpoint.invalidate();
+                    }
+                }
+            }
+        }
+        let ck = self.turn_recurrent_ckpts[selected]
+            .as_ref()
+            .expect("selected recurrent checkpoint exists");
         for (i, &l) in ck.layers.iter().enumerate() {
             be.copy_buffer(
                 ck.kbufs[i].as_ref(),
@@ -1537,17 +1562,19 @@ impl SeamKv {
         } else {
             None
         };
-        let mut turn_recurrent_ckpt = None;
+        let mut turn_recurrent_ckpts = std::array::from_fn(|_| None);
         if cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3 {
-            TurnRecurrentCkpt::begin(
-                &mut turn_recurrent_ckpt,
-                be,
-                cfg,
-                &kbufs,
-                &vbufs,
-                ple_state_buf.as_deref(),
-                &[],
-            )?;
+            for checkpoint in &mut turn_recurrent_ckpts {
+                TurnRecurrentCkpt::begin(
+                    checkpoint,
+                    be,
+                    cfg,
+                    &kbufs,
+                    &vbufs,
+                    ple_state_buf.as_deref(),
+                    &[],
+                )?;
+            }
         }
         let mtp_delta_ckpt = if self.mtp_delta_ckpt.is_some() {
             MtpDeltaCkpt::allocate_for_fork(
@@ -1637,7 +1664,7 @@ impl SeamKv {
             sc_ping_write: 0,
             sc_temp_inv_buf: None,
             mtp_delta_ckpt,
-            turn_recurrent_ckpt,
+            turn_recurrent_ckpts,
             preallocated_siblings: Vec::new(),
         })
     }

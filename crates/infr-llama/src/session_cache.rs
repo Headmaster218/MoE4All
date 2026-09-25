@@ -12,20 +12,22 @@ use infr_core::backend::Backend;
 use infr_core::{DType, SizeSpec};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAGIC: [u8; 8] = *b"INFRKV01";
-const VERSION: u32 = 1;
-const HEADER_BYTES: u64 = 104;
+const VERSION: u32 = 2;
+const HEADER_BYTES: u64 = 112;
 const RECORD_HEADER_BYTES: u64 = 16;
 const CHECKSUM_BYTES: u64 = 32;
 const STREAM_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RECORDS: u32 = 16_384;
-const FLAG_CHECKPOINT: u32 = 1;
+const FLAG_AGENT_CHECKPOINT: u32 = 1;
+const FLAG_EDIT_CHECKPOINT: u32 = 2;
+const CHECKPOINT_FLAGS: u32 = FLAG_AGENT_CHECKPOINT | FLAG_EDIT_CHECKPOINT;
 const MIN_STALE_TEMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 static FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -56,12 +58,12 @@ struct Header {
     max_ctx: u64,
     committed_tokens: u64,
     cached_count: u64,
-    checkpoint_count: u64,
+    checkpoint_counts: [u64; crate::seam::TURN_CHECKPOINT_COUNT],
     record_count: u32,
     k_fmt: DType,
     v_fmt: DType,
     data_bytes: u64,
-    has_checkpoint: bool,
+    has_checkpoints: [bool; crate::seam::TURN_CHECKPOINT_COUNT],
 }
 
 impl SessionCache {
@@ -267,7 +269,7 @@ impl SessionCache {
 
     pub(crate) fn restore(
         &mut self,
-        entry: ColdEntry,
+        mut entry: ColdEntry,
         kv: &mut SeamKv,
         backend: &dyn Backend,
         model_cfg: &Config,
@@ -294,19 +296,26 @@ impl SessionCache {
                 kv.reset();
             }
         }
-        if let Err(error) = fs::remove_file(&path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path = %path.display(), "cold KV cache: cannot remove consumed entry: {error}");
-            }
-        }
         if result.is_ok() {
+            // Cold entries are immutable snapshots. Keep a validated entry available so several
+            // conversations can branch from the same system/tool checkpoint instead of consuming
+            // it on the first restore. Size and age GC remain the eviction authority.
+            entry.saved_at = unix_secs();
+            if let Ok(file) = OpenOptions::new().write(true).open(&path) {
+                let _ = file.set_times(FileTimes::new().set_modified(SystemTime::now()));
+            }
+            self.return_entry(entry);
             tracing::info!(
                 tokens,
                 bytes = file_bytes,
                 gib = file_bytes as f64 / (1u64 << 30) as f64,
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "restored conversation KV from cold storage"
+                "restored reusable conversation KV from cold storage"
             );
+        } else if let Err(error) = fs::remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %path.display(), "cold KV cache: cannot remove failed entry: {error}");
+            }
         }
         result
     }
@@ -351,23 +360,38 @@ impl Header {
                 .len()
                 .try_into()
                 .context("cached token count exceeds u64")?,
-            checkpoint_count: meta.checkpoint_tokens.as_ref().map_or(Ok(0), |tokens| {
-                tokens
-                    .len()
-                    .try_into()
-                    .context("checkpoint token count exceeds u64")
-            })?,
+            checkpoint_counts: [
+                meta.checkpoint_tokens[0].as_ref().map_or(Ok(0), |tokens| {
+                    tokens
+                        .len()
+                        .try_into()
+                        .context("agent checkpoint token count exceeds u64")
+                })?,
+                meta.checkpoint_tokens[1].as_ref().map_or(Ok(0), |tokens| {
+                    tokens
+                        .len()
+                        .try_into()
+                        .context("edit checkpoint token count exceeds u64")
+                })?,
+            ],
             record_count: record_count
                 .try_into()
                 .context("cold KV record count exceeds u32")?,
             k_fmt: meta.k_fmt,
             v_fmt: meta.v_fmt,
             data_bytes,
-            has_checkpoint: meta.checkpoint_tokens.is_some(),
+            has_checkpoints: meta
+                .checkpoint_tokens
+                .each_ref()
+                .map(|tokens| tokens.is_some()),
         })
     }
 
-    fn meta(&self, cached: Vec<u32>, checkpoint: Option<Vec<u32>>) -> Result<SessionStateMeta> {
+    fn meta(
+        &self,
+        cached: Vec<u32>,
+        checkpoints: [Option<Vec<u32>>; crate::seam::TURN_CHECKPOINT_COUNT],
+    ) -> Result<SessionStateMeta> {
         Ok(SessionStateMeta {
             max_ctx: self
                 .max_ctx
@@ -380,7 +404,7 @@ impl Header {
                 .try_into()
                 .context("committed token count exceeds usize")?,
             cached,
-            checkpoint_tokens: checkpoint,
+            checkpoint_tokens: checkpoints,
         })
     }
 }
@@ -401,7 +425,7 @@ fn write_session_file(
     let mut hasher = Sha256::new();
     write_hashed(&mut writer, &mut hasher, &encode_header(header))?;
     write_tokens(&mut writer, &mut hasher, &meta.cached)?;
-    if let Some(tokens) = meta.checkpoint_tokens.as_deref() {
+    for tokens in meta.checkpoint_tokens.iter().flatten() {
         write_tokens(&mut writer, &mut hasher, tokens)?;
     }
     let mut scratch = vec![0u8; STREAM_BYTES];
@@ -457,17 +481,18 @@ fn restore_session_file(
         ));
     }
     let cached = read_tokens_hashed(&mut reader, &mut hasher, header.cached_count, max_ctx)?;
-    let checkpoint = if header.has_checkpoint {
-        Some(read_tokens_hashed(
-            &mut reader,
-            &mut hasher,
-            header.checkpoint_count,
-            max_ctx,
-        )?)
-    } else {
-        None
-    };
-    let meta = header.meta(cached, checkpoint)?;
+    let mut checkpoints = std::array::from_fn(|_| None);
+    for (index, checkpoint) in checkpoints.iter_mut().enumerate() {
+        if header.has_checkpoints[index] {
+            *checkpoint = Some(read_tokens_hashed(
+                &mut reader,
+                &mut hasher,
+                header.checkpoint_counts[index],
+                max_ctx,
+            )?);
+        }
+    }
+    let meta = header.meta(cached, checkpoints)?;
     if meta.cached.len() > meta.committed_tokens {
         return Err(anyhow!(
             "cold KV token depth exceeds its committed physical depth"
@@ -557,15 +582,20 @@ fn read_catalog_entry(
         return Ok(None);
     }
     let cached = read_tokens(&mut reader, header.cached_count, max_ctx)?;
-    let checkpoint = if header.has_checkpoint {
-        Some(read_tokens(&mut reader, header.checkpoint_count, max_ctx)?)
-    } else {
-        None
-    };
+    let mut checkpoints = std::array::from_fn(|_| None);
+    for (index, checkpoint) in checkpoints.iter_mut().enumerate() {
+        if header.has_checkpoints[index] {
+            *checkpoint = Some(read_tokens(
+                &mut reader,
+                header.checkpoint_counts[index],
+                max_ctx,
+            )?);
+        }
+    }
     Ok(Some(ColdEntry {
         path: path.to_path_buf(),
         saved_at: header.saved_at,
-        meta: header.meta(cached, checkpoint)?,
+        meta: header.meta(cached, checkpoints)?,
         file_bytes,
     }))
 }
@@ -574,10 +604,14 @@ fn validate_header(header: &Header, file_bytes: u64) -> Result<()> {
     if header.record_count > MAX_RECORDS {
         return Err(anyhow!("cold KV record count is implausibly large"));
     }
+    let invalid_checkpoint = header
+        .checkpoint_counts
+        .iter()
+        .zip(header.has_checkpoints)
+        .any(|(&count, present)| count > header.max_ctx || present != (count != 0));
     if header.cached_count > header.max_ctx
-        || header.checkpoint_count > header.max_ctx
         || header.committed_tokens > header.max_ctx
-        || (header.has_checkpoint != (header.checkpoint_count != 0))
+        || invalid_checkpoint
     {
         return Err(anyhow!("cold KV header has inconsistent token counts"));
     }
@@ -591,9 +625,14 @@ fn validate_header(header: &Header, file_bytes: u64) -> Result<()> {
 }
 
 fn checked_file_bytes(header: &Header) -> Result<u64> {
+    let checkpoint_tokens = header
+        .checkpoint_counts
+        .iter()
+        .try_fold(0u64, |total, &count| total.checked_add(count))
+        .ok_or_else(|| anyhow!("cold KV checkpoint metadata size overflow"))?;
     let token_bytes = header
         .cached_count
-        .checked_add(header.checkpoint_count)
+        .checked_add(checkpoint_tokens)
         .and_then(|tokens| tokens.checked_mul(4))
         .ok_or_else(|| anyhow!("cold KV token metadata size overflow"))?;
     HEADER_BYTES
@@ -608,18 +647,22 @@ fn encode_header(header: &Header) -> [u8; HEADER_BYTES as usize] {
     let mut out = Vec::with_capacity(HEADER_BYTES as usize);
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
-    let flags = if header.has_checkpoint {
-        FLAG_CHECKPOINT
-    } else {
-        0
-    };
+    let flags = header
+        .has_checkpoints
+        .iter()
+        .enumerate()
+        .fold(0u32, |flags, (index, &present)| {
+            flags | (u32::from(present) << index)
+        });
     out.extend_from_slice(&flags.to_le_bytes());
     out.extend_from_slice(&header.fingerprint);
     out.extend_from_slice(&header.saved_at.to_le_bytes());
     out.extend_from_slice(&header.max_ctx.to_le_bytes());
     out.extend_from_slice(&header.committed_tokens.to_le_bytes());
     out.extend_from_slice(&header.cached_count.to_le_bytes());
-    out.extend_from_slice(&header.checkpoint_count.to_le_bytes());
+    for count in header.checkpoint_counts {
+        out.extend_from_slice(&count.to_le_bytes());
+    }
     out.extend_from_slice(&header.record_count.to_le_bytes());
     out.extend_from_slice(&encode_dtype(header.k_fmt).to_le_bytes());
     out.extend_from_slice(&encode_dtype(header.v_fmt).to_le_bytes());
@@ -638,7 +681,7 @@ fn decode_header(bytes: &[u8; HEADER_BYTES as usize]) -> Result<Header> {
         return Err(anyhow!("unsupported cold KV format version {version}"));
     }
     let flags = u32::from_le_bytes(take(bytes, &mut cursor)?);
-    if flags & !FLAG_CHECKPOINT != 0 {
+    if flags & !CHECKPOINT_FLAGS != 0 {
         return Err(anyhow!("cold KV header has unknown flags"));
     }
     let fingerprint = take(bytes, &mut cursor)?;
@@ -646,7 +689,10 @@ fn decode_header(bytes: &[u8; HEADER_BYTES as usize]) -> Result<Header> {
     let max_ctx = u64::from_le_bytes(take(bytes, &mut cursor)?);
     let committed_tokens = u64::from_le_bytes(take(bytes, &mut cursor)?);
     let cached_count = u64::from_le_bytes(take(bytes, &mut cursor)?);
-    let checkpoint_count = u64::from_le_bytes(take(bytes, &mut cursor)?);
+    let checkpoint_counts = [
+        u64::from_le_bytes(take(bytes, &mut cursor)?),
+        u64::from_le_bytes(take(bytes, &mut cursor)?),
+    ];
     let record_count = u32::from_le_bytes(take(bytes, &mut cursor)?);
     let k_fmt = decode_dtype(u16::from_le_bytes(take(bytes, &mut cursor)?))?;
     let v_fmt = decode_dtype(u16::from_le_bytes(take(bytes, &mut cursor)?))?;
@@ -658,12 +704,15 @@ fn decode_header(bytes: &[u8; HEADER_BYTES as usize]) -> Result<Header> {
         max_ctx,
         committed_tokens,
         cached_count,
-        checkpoint_count,
+        checkpoint_counts,
         record_count,
         k_fmt,
         v_fmt,
         data_bytes,
-        has_checkpoint: flags & FLAG_CHECKPOINT != 0,
+        has_checkpoints: [
+            flags & FLAG_AGENT_CHECKPOINT != 0,
+            flags & FLAG_EDIT_CHECKPOINT != 0,
+        ],
     })
 }
 
@@ -674,9 +723,9 @@ fn encode_record(key: SessionBufferKey, len: u64) -> [u8; RECORD_HEADER_BYTES as
         SessionBufferKey::QsaRaw(layer) => (2, layer),
         SessionBufferKey::QsaBlock(layer) => (3, layer),
         SessionBufferKey::PleState => (4, u32::MAX),
-        SessionBufferKey::CheckpointK(layer) => (5, layer),
-        SessionBufferKey::CheckpointV(layer) => (6, layer),
-        SessionBufferKey::CheckpointPle => (7, u32::MAX),
+        SessionBufferKey::CheckpointK(checkpoint, layer) => (5 + checkpoint * 3, layer),
+        SessionBufferKey::CheckpointV(checkpoint, layer) => (6 + checkpoint * 3, layer),
+        SessionBufferKey::CheckpointPle(checkpoint) => (7 + checkpoint * 3, u32::MAX),
     };
     let mut out = [0u8; RECORD_HEADER_BYTES as usize];
     out[0] = kind;
@@ -696,9 +745,12 @@ fn decode_record(bytes: &[u8; RECORD_HEADER_BYTES as usize]) -> Result<(SessionB
         2 => SessionBufferKey::QsaRaw(layer),
         3 => SessionBufferKey::QsaBlock(layer),
         4 if layer == u32::MAX => SessionBufferKey::PleState,
-        5 => SessionBufferKey::CheckpointK(layer),
-        6 => SessionBufferKey::CheckpointV(layer),
-        7 if layer == u32::MAX => SessionBufferKey::CheckpointPle,
+        5 => SessionBufferKey::CheckpointK(0, layer),
+        6 => SessionBufferKey::CheckpointV(0, layer),
+        7 if layer == u32::MAX => SessionBufferKey::CheckpointPle(0),
+        8 => SessionBufferKey::CheckpointK(1, layer),
+        9 => SessionBufferKey::CheckpointV(1, layer),
+        10 if layer == u32::MAX => SessionBufferKey::CheckpointPle(1),
         kind => return Err(anyhow!("unknown cold KV record kind {kind}")),
     };
     let len = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
@@ -1084,17 +1136,17 @@ mod tests {
             max_ctx: 131_072,
             committed_tokens: 65_536,
             cached_count: 42,
-            checkpoint_count: 17,
+            checkpoint_counts: [17, 29],
             record_count: 12,
             k_fmt: DType::Q8_0,
             v_fmt: DType::F16,
             data_bytes: 98_765,
-            has_checkpoint: true,
+            has_checkpoints: [true, true],
         };
         assert_eq!(decode_header(&encode_header(&header)).unwrap(), header);
         assert_eq!(
             checked_file_bytes(&header).unwrap(),
-            HEADER_BYTES + (42 + 17) * 4 + 12 * RECORD_HEADER_BYTES + 98_765 + CHECKSUM_BYTES
+            HEADER_BYTES + (42 + 17 + 29) * 4 + 12 * RECORD_HEADER_BYTES + 98_765 + CHECKSUM_BYTES
         );
     }
 
@@ -1106,9 +1158,12 @@ mod tests {
             SessionBufferKey::QsaRaw(6),
             SessionBufferKey::QsaBlock(7),
             SessionBufferKey::PleState,
-            SessionBufferKey::CheckpointK(8),
-            SessionBufferKey::CheckpointV(9),
-            SessionBufferKey::CheckpointPle,
+            SessionBufferKey::CheckpointK(0, 8),
+            SessionBufferKey::CheckpointV(0, 9),
+            SessionBufferKey::CheckpointPle(0),
+            SessionBufferKey::CheckpointK(1, 10),
+            SessionBufferKey::CheckpointV(1, 11),
+            SessionBufferKey::CheckpointPle(1),
         ];
         for key in keys {
             assert_eq!(decode_record(&encode_record(key, 99)).unwrap(), (key, 99));

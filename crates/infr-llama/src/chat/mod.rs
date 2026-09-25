@@ -122,6 +122,38 @@ pub trait ChatModel {
         self.generate_constrained(prompt, max_new, constraint, req, on_piece)
     }
 
+    /// Serve-only turn hook carrying both recurrent branch points. Stateless backends use the
+    /// latest-edit prefix as their ordinary stable prefix; the Vulkan seam overrides this to keep
+    /// both device-resident checkpoints.
+    fn generate_with_checkpoints(
+        &mut self,
+        prompt: &str,
+        checkpoint_prefixes: crate::seam::TurnCheckpointPrefixes<'_>,
+        max_new: usize,
+        constraint: Option<&mut crate::grammar::Constraint>,
+        req: Option<&crate::sampling::RequestCtx>,
+        on_piece: &mut dyn FnMut(&str),
+    ) -> Result<GenStats> {
+        match constraint {
+            Some(constraint) => self.generate_constrained_turn(
+                prompt,
+                checkpoint_prefixes.edit,
+                max_new,
+                constraint,
+                req,
+                on_piece,
+            ),
+            None => self.generate_turn_with_step_hook(
+                prompt,
+                checkpoint_prefixes.edit,
+                max_new,
+                req,
+                on_piece,
+                None,
+            ),
+        }
+    }
+
     /// Optional REPL status (e.g. dense returns `ctx N/MAX`); `None` for stateless backends.
     fn status(&self) -> Option<String> {
         None
@@ -340,6 +372,33 @@ pub struct OaiRenderer {
     ecfg: std::sync::Arc<crate::EngineConfig>,
 }
 
+// A tiny system message is cheaper to prefill again than to make it the recurrent branch point.
+// This byte threshold is intentionally conservative; token-level prefix validation still happens
+// in `SeamModel::turn_checkpoint` before any state is captured.
+const MIN_REUSABLE_INSTRUCTION_PREFIX_BYTES: usize = 2 * 1024;
+
+fn leading_instruction_messages(messages: &[infr_chat::ChatMessage]) -> usize {
+    messages
+        .iter()
+        .take_while(|message| {
+            message.role.eq_ignore_ascii_case("system")
+                || message.role.eq_ignore_ascii_case("developer")
+        })
+        .count()
+}
+
+fn common_rendered_prefix<'a>(left: &'a str, right: &str) -> &'a str {
+    let mut bytes = left
+        .bytes()
+        .zip(right.bytes())
+        .take_while(|(left, right)| left == right)
+        .count();
+    while !left.is_char_boundary(bytes) {
+        bytes -= 1;
+    }
+    &left[..bytes]
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl OaiRenderer {
     pub fn open(path: &std::path::Path, ecfg: std::sync::Arc<crate::EngineConfig>) -> Result<Self> {
@@ -395,6 +454,73 @@ impl OaiRenderer {
             self.render_mode_with_options(messages, tools, true, options)?,
             self.render_mode_with_options(messages, tools, false, options)?,
         ))
+    }
+
+    /// Render the stable instruction/tool prefix shared by otherwise independent agent runs.
+    /// Two probe user turns keep templates that require a query valid; their rendered common
+    /// prefix ends immediately before request-specific user content. Callers still confirm that
+    /// the result is an exact prefix of the real prompt.
+    pub fn render_reusable_prefix_with_options(
+        &self,
+        messages: &[infr_chat::ChatMessage],
+        tools: Option<&serde_json::Value>,
+        options: &infr_chat::ChatTemplateOptions,
+    ) -> Option<String> {
+        let count = leading_instruction_messages(messages);
+        let has_tools = tools
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|tools| !tools.is_empty());
+        if (count == 0 && !has_tools)
+            || messages[..count]
+                .iter()
+                .any(|message| !message.images.is_empty())
+            || messages
+                .get(count)
+                .is_none_or(|message| !message.role.eq_ignore_ascii_case("user"))
+        {
+            return None;
+        }
+        let mut probe = messages[..count].to_vec();
+        probe.push(infr_chat::ChatMessage {
+            role: "user".into(),
+            content: "A_INFR_REUSABLE_PREFIX_PROBE".into(),
+            ..Default::default()
+        });
+        let left = self
+            .render_mode_with_options(&probe, tools, false, options)
+            .ok()?;
+        probe.last_mut()?.content = "Z_INFR_REUSABLE_PREFIX_PROBE".into();
+        let right = self
+            .render_mode_with_options(&probe, tools, false, options)
+            .ok()?;
+        let prefix = common_rendered_prefix(&left, &right);
+        (prefix.len() >= MIN_REUSABLE_INSTRUCTION_PREFIX_BYTES).then(|| prefix.to_string())
+    }
+
+    /// Render the prefix immediately before the latest user message's content. Replacing that
+    /// message with two distinct probes lets the template itself define the exact role markers and
+    /// separators; their common prefix is therefore safe across custom GGUF chat templates.
+    pub fn render_latest_edit_prefix_with_options(
+        &self,
+        messages: &[infr_chat::ChatMessage],
+        tools: Option<&serde_json::Value>,
+        options: &infr_chat::ChatTemplateOptions,
+    ) -> Option<String> {
+        let last = messages.len().checked_sub(1)?;
+        if !messages[last].role.eq_ignore_ascii_case("user") || !messages[last].images.is_empty() {
+            return None;
+        }
+        let mut probe = messages.to_vec();
+        probe[last].content = "A_INFR_EDIT_PREFIX_PROBE".into();
+        let left = self
+            .render_mode_with_options(&probe, tools, true, options)
+            .ok()?;
+        probe[last].content = "Z_INFR_EDIT_PREFIX_PROBE".into();
+        let right = self
+            .render_mode_with_options(&probe, tools, true, options)
+            .ok()?;
+        let prefix = common_rendered_prefix(&left, &right);
+        (!prefix.is_empty()).then(|| prefix.to_string())
     }
 
     fn render_mode(
@@ -461,6 +587,27 @@ impl OaiRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reusable_prefix_stops_before_the_first_conversation_message() {
+        let message = |role: &str| infr_chat::ChatMessage {
+            role: role.into(),
+            ..Default::default()
+        };
+        let messages = [
+            message("system"),
+            message("developer"),
+            message("user"),
+            message("system"),
+        ];
+        assert_eq!(leading_instruction_messages(&messages), 2);
+        assert_eq!(leading_instruction_messages(&messages[2..]), 0);
+        assert_eq!(
+            common_rendered_prefix("system\nuser: Alpha", "system\nuser: Zulu"),
+            "system\nuser: "
+        );
+        assert_eq!(common_rendered_prefix("系统甲", "系统乙"), "系统");
+    }
 
     /// A scripted [`ChatModel`] that records every rendered prompt and replies with a canned string
     /// (optionally wrapped in `<think>`). Proves the shared [`Chat`] orchestration WITHOUT a model:

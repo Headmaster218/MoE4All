@@ -639,13 +639,47 @@ pub(crate) fn generate_dense_vulkan(
 /// [`generate_dense_vulkan`] with a caller-held [`SeamKv`]: hold `state` (+ a `want_ctx` capacity)
 /// across calls and each turn prefills only the suffix that differs from the cached tokens —
 /// ChatSession-style KV reuse on the agnostic seam.
-#[derive(Clone, Copy)]
-pub(crate) enum TurnCheckpoint {
-    /// Allocate the rolling recurrent snapshot before session allocation finalization, without
-    /// taking a snapshot during this warmup call.
-    Enable,
-    /// Allocate if needed and capture state after this many prompt tokens.
-    Boundary(usize),
+pub(crate) const TURN_CHECKPOINT_COUNT: usize = 2;
+
+/// Rendered text prefixes whose recurrent state should remain reusable. The engine validates each
+/// one again after tokenization; a string prefix that does not remain an exact token prefix is
+/// ignored rather than risking mixed conversation state.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TurnCheckpointPrefixes<'a> {
+    pub agent: Option<&'a str>,
+    pub edit: Option<&'a str>,
+}
+
+impl<'a> TurnCheckpointPrefixes<'a> {
+    pub const fn edit(edit: Option<&'a str>) -> Self {
+        Self { agent: None, edit }
+    }
+}
+
+/// Recurrent boundaries retained by one conversation slot. Index 0 is the reusable
+/// system/developer/tools prefix; index 1 is the prefix immediately before the latest user
+/// message, so editing that message only re-prefills the changed tail.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TurnCheckpoint {
+    boundaries: [Option<usize>; TURN_CHECKPOINT_COUNT],
+}
+
+impl TurnCheckpoint {
+    /// Allocate both snapshots before session allocation finalization without capturing either
+    /// during this warmup call.
+    pub(crate) const ENABLED: Self = Self {
+        boundaries: [None; TURN_CHECKPOINT_COUNT],
+    };
+
+    pub(crate) const fn new(agent: Option<usize>, edit: Option<usize>) -> Self {
+        Self {
+            boundaries: [agent, edit],
+        }
+    }
+
+    pub(crate) const fn boundaries(self) -> [Option<usize>; TURN_CHECKPOINT_COUNT] {
+        self.boundaries
+    }
 }
 
 /// One expanded image span consumed by the text-model prefill. Its rows replace the ordinary
@@ -776,7 +810,7 @@ pub(crate) fn generate_dense_vulkan_parallel_sampled_session(
     ple: Option<&PerLayerEmbd>,
     prompts: &[Vec<u32>],
     prompt_ends: &[usize],
-    checkpoint_boundaries: &[Option<usize>],
+    checkpoint_boundaries: &[[Option<usize>; TURN_CHECKPOINT_COUNT]],
     mrope_plans: &[Option<&MropePlan>],
     max_steps: usize,
     primary: &mut Option<SeamKv>,
@@ -2047,7 +2081,9 @@ pub(crate) fn kv_bytes_estimate_fmt(
         0
     };
     primary
-        .saturating_add(recurrent_checkpoint_bytes(cfg))
+        .saturating_add(
+            recurrent_checkpoint_bytes(cfg).saturating_mul(TURN_CHECKPOINT_COUNT as u64),
+        )
         .saturating_add(qwen4_extra)
 }
 
@@ -2078,17 +2114,27 @@ pub(crate) fn qsa_cache_bytes(cfg: &Config, layer: usize, ctx: usize) -> usize {
     qsa_raw_cache_bytes(cfg, layer, ctx).saturating_add(qsa_block_cache_bytes(cfg, layer, ctx))
 }
 
-/// One rolling copy of every append-only recurrent layer's fixed f32 state. Stateful Vulkan chat
-/// allocates this lazily at the first stable conversation boundary, but placement must reserve it
-/// up front so the allocation cannot unexpectedly consume the last expert/activation bytes.
+/// One copy of every append-only recurrent layer's fixed f32 state. Stateful Vulkan chat owns two
+/// copies (agent prefix + latest editable-message prefix); callers multiply this per-copy figure
+/// by [`TURN_CHECKPOINT_COUNT`] when pricing the complete slot.
 pub(crate) fn recurrent_checkpoint_bytes(cfg: &Config) -> u64 {
-    (0..cfg.n_layer)
+    let layers = (0..cfg.n_layer)
         .filter(|&l| cfg.is_recurrent_layer(l))
         .map(|l| {
             let (k_bytes, v_bytes) = layer_state_bytes(cfg, l, 1, false, 1, DType::F16, DType::F16);
             (k_bytes + v_bytes) as u64
         })
-        .sum()
+        .sum::<u64>();
+    let ple = if cfg.qwen4exp {
+        (cfg.ple_conv_kernel.saturating_sub(1))
+            .saturating_mul(cfg.ple_ngram_size)
+            .saturating_mul(cfg.hc_mult)
+            .saturating_mul(cfg.n_embd)
+            .saturating_mul(4) as u64
+    } else {
+        0
+    };
+    layers.saturating_add(ple)
 }
 
 /// Read-only KV footprint estimate for control planes and launch planners. This is the same
@@ -6986,7 +7032,9 @@ mod seam_helper_tests {
         assert_eq!(checkpoint, 30 * delta_bytes);
         assert_eq!(
             estimate,
-            10 * attention_bytes + 30 * delta_bytes + checkpoint
+            10 * attention_bytes
+                + 30 * delta_bytes
+                + super::TURN_CHECKPOINT_COUNT as u64 * checkpoint
         );
         assert!(
             estimate < 40 * attention_bytes,

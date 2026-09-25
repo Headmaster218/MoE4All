@@ -2188,7 +2188,7 @@ trait GenBackend: Send + Sync {
     fn generate(
         &self,
         prompt: &str,
-        stable_prefix: Option<&str>,
+        checkpoint_prefixes: infr_llama::seam::TurnCheckpointPrefixes<'_>,
         max_new: usize,
         constraint: Option<&mut infr_llama::grammar::Constraint>,
         req: &infr_llama::sampling::RequestCtx,
@@ -2198,7 +2198,7 @@ trait GenBackend: Send + Sync {
     fn generate_multimodal(
         &self,
         _prompt: &str,
-        _stable_prefix: Option<&str>,
+        _checkpoint_prefixes: infr_llama::seam::TurnCheckpointPrefixes<'_>,
         _images: &[String],
         _max_new: usize,
         _req: &infr_llama::sampling::RequestCtx,
@@ -2235,31 +2235,21 @@ impl GenBackend for SeamGenerator {
     fn generate(
         &self,
         prompt: &str,
-        stable_prefix: Option<&str>,
+        checkpoint_prefixes: infr_llama::seam::TurnCheckpointPrefixes<'_>,
         max_new: usize,
         constraint: Option<&mut infr_llama::grammar::Constraint>,
         req: &infr_llama::sampling::RequestCtx,
         on_piece: &mut dyn FnMut(&str),
     ) -> anyhow::Result<infr_llama::GenStats> {
         let mut model = self.model.lock().expect("serve generator poisoned");
-        match constraint {
-            Some(c) => model.generate_constrained_turn(
-                prompt,
-                stable_prefix,
-                max_new,
-                c,
-                Some(req),
-                on_piece,
-            ),
-            None => model.generate_turn_with_step_hook(
-                prompt,
-                stable_prefix,
-                max_new,
-                Some(req),
-                on_piece,
-                None,
-            ),
-        }
+        model.generate_with_checkpoints(
+            prompt,
+            checkpoint_prefixes,
+            max_new,
+            constraint,
+            Some(req),
+            on_piece,
+        )
     }
 
     fn reset(&self) {
@@ -2289,22 +2279,26 @@ impl GenBackend for ParallelGenerator {
     fn generate(
         &self,
         prompt: &str,
-        stable_prefix: Option<&str>,
+        checkpoint_prefixes: infr_llama::seam::TurnCheckpointPrefixes<'_>,
         max_new: usize,
         constraint: Option<&mut infr_llama::grammar::Constraint>,
         req: &infr_llama::sampling::RequestCtx,
         on_piece: &mut dyn FnMut(&str),
     ) -> anyhow::Result<infr_llama::GenStats> {
-        self.engine
-            .generate_turn(prompt, stable_prefix, max_new, constraint, req, |p| {
-                on_piece(p)
-            })
+        self.engine.generate_turn_with_checkpoints(
+            prompt,
+            checkpoint_prefixes,
+            max_new,
+            constraint,
+            req,
+            |p| on_piece(p),
+        )
     }
 
     fn generate_multimodal(
         &self,
         prompt: &str,
-        stable_prefix: Option<&str>,
+        checkpoint_prefixes: infr_llama::seam::TurnCheckpointPrefixes<'_>,
         images: &[String],
         max_new: usize,
         req: &infr_llama::sampling::RequestCtx,
@@ -2330,7 +2324,7 @@ impl GenBackend for ParallelGenerator {
             .collect();
         self.engine.generate_multimodal_turn(
             prompt,
-            stable_prefix,
+            checkpoint_prefixes.edit,
             embeddings,
             max_new,
             req,
@@ -2448,6 +2442,38 @@ fn run_chat(
             .iter()
             .flat_map(|message| message.images.iter().cloned())
             .collect::<Vec<_>>();
+        let reusable_prefix = images
+            .is_empty()
+            .then(|| {
+                be.renderer().render_reusable_prefix_with_options(
+                    messages,
+                    tools,
+                    &params.chat_template_options,
+                )
+            })
+            .flatten()
+            .filter(|prefix| prompt.starts_with(prefix));
+        let edit_prefix = images
+            .is_empty()
+            .then(|| {
+                be.renderer().render_latest_edit_prefix_with_options(
+                    messages,
+                    tools,
+                    &params.chat_template_options,
+                )
+            })
+            .flatten()
+            .filter(|prefix| prompt.starts_with(prefix));
+        let checkpoint_prefixes = infr_llama::seam::TurnCheckpointPrefixes {
+            agent: reusable_prefix.as_deref(),
+            edit: edit_prefix.as_deref().or(Some(stable_prefix.as_str())),
+        };
+        if let Some(prefix) = reusable_prefix.as_deref() {
+            tracing::debug!(
+                prefix_bytes = prefix.len(),
+                "using reusable agent instruction prefix for KV checkpoint"
+            );
+        }
         // The request's `max_tokens`/`max_completion_tokens` wins; `sampling.max_new`
         // (INFR_MAX_NEW, default 2048) is the server-side default for requests that don't set one.
         let max_new = params
@@ -2476,7 +2502,7 @@ fn run_chat(
             let mut cached_tokens = 0u32;
             let emitted = match be.generate(
                 &primed,
-                Some(&stable_prefix),
+                checkpoint_prefixes,
                 max_new,
                 Some(&mut constraint),
                 &req,
@@ -2564,7 +2590,7 @@ fn run_chat(
             let stats = if images.is_empty() {
                 be.generate(
                     &prompt,
-                    Some(&stable_prefix),
+                    checkpoint_prefixes,
                     max_new,
                     None,
                     &req,
@@ -2573,7 +2599,7 @@ fn run_chat(
             } else {
                 be.generate_multimodal(
                     &prompt,
-                    Some(&stable_prefix),
+                    checkpoint_prefixes,
                     &images,
                     max_new,
                     &req,

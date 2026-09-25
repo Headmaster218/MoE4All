@@ -317,7 +317,7 @@ struct BatchWork {
     stats: GenStats,
     phase: BatchPhase,
     prefill_start: usize,
-    checkpoint_boundary: Option<usize>,
+    checkpoint_boundaries: [Option<usize>; crate::seam::TURN_CHECKPOINT_COUNT],
     turn_checkpoint: Option<crate::seam::TurnCheckpoint>,
     mrope_plan: Option<crate::seam::MropePlan>,
     multimodal_key: Option<MultimodalKey>,
@@ -959,7 +959,7 @@ impl ParallelSeam {
                 |_| {},
                 &mut slot0,
                 self.max_ctx,
-                Some(crate::seam::TurnCheckpoint::Enable),
+                Some(crate::seam::TurnCheckpoint::ENABLED),
                 None, // constraint
                 None, // req: startup, not a request — env sampling, no gate
                 None, // multimodal plan
@@ -1273,6 +1273,11 @@ impl ParallelSeam {
                     .then(|| cache.take_best_continuation(prompt))
                     .flatten();
                 if let (Some(entry), Some(kv)) = (cold, target_kv.as_mut()) {
+                    tracing::info!(
+                        slot = target,
+                        cached_prefix_tokens = cold_prefix,
+                        "cold KV reusable prefix hit"
+                    );
                     let mut released = false;
                     if kv.cached_len() != 0 {
                         match cache.spill(kv, self.vk.as_ref(), cfg) {
@@ -1791,7 +1796,7 @@ impl ParallelSeam {
             )?
         };
         work.prefill_start = prepared.start;
-        work.checkpoint_boundary = prepared.checkpoint_boundary;
+        work.checkpoint_boundaries = prepared.checkpoint_boundaries;
         work.stats.n_prompt = work
             .stats
             .n_prompt
@@ -1832,7 +1837,7 @@ impl ParallelSeam {
             .iter()
             .map(|work| crate::seam::PreparedParallelPrompt {
                 start: work.prefill_start,
-                checkpoint_boundary: work.checkpoint_boundary,
+                checkpoint_boundaries: work.checkpoint_boundaries,
             })
             .collect::<Vec<_>>();
         let progress_senders = long
@@ -1907,7 +1912,7 @@ impl ParallelSeam {
         for (work, stats) in long.iter_mut().zip(stats) {
             work.stats.prompt_secs += stats.prompt_secs;
             work.phase = BatchPhase::Decode;
-            work.checkpoint_boundary = None;
+            work.checkpoint_boundaries = [None; crate::seam::TURN_CHECKPOINT_COUNT];
             let progress = infr_core::GenerationProgress {
                 phase: infr_core::GenerationPhase::Prefill,
                 prompt_tokens: work.prompt_end as u64,
@@ -2144,7 +2149,7 @@ impl ParallelSeam {
             .collect::<Vec<_>>();
         let checkpoints = indices
             .iter()
-            .map(|&index| active[index].checkpoint_boundary)
+            .map(|&index| active[index].checkpoint_boundaries)
             .collect::<Vec<_>>();
         let mut owned_mrope_plans = indices
             .iter()
@@ -2274,11 +2279,11 @@ impl ParallelSeam {
             work.generated += outputs[lane].len();
             work.stats.n_gen += outputs[lane].len();
             work.prompt.extend_from_slice(&outputs[lane]);
-            if work
-                .checkpoint_boundary
-                .is_some_and(|boundary| work.kv().cached_len() >= boundary)
-            {
-                work.checkpoint_boundary = None;
+            let cached_len = work.kv().cached_len();
+            for boundary in &mut work.checkpoint_boundaries {
+                if boundary.is_some_and(|boundary| cached_len >= boundary) {
+                    *boundary = None;
+                }
             }
             work.phase = phase_for_remaining_prefill(work.remaining_prefill());
             let eos = outputs[lane].last().is_some_and(|token| {
@@ -2844,6 +2849,25 @@ impl ParallelSeam {
         max_new: usize,
         constraint: Option<&mut crate::grammar::Constraint>,
         req: &RequestCtx,
+        on_piece: impl FnMut(&str),
+    ) -> Result<GenStats> {
+        self.generate_turn_with_checkpoints(
+            prompt,
+            crate::seam::TurnCheckpointPrefixes::edit(stable_prefix),
+            max_new,
+            constraint,
+            req,
+            on_piece,
+        )
+    }
+
+    pub fn generate_turn_with_checkpoints(
+        &self,
+        prompt: &str,
+        checkpoint_prefixes: crate::seam::TurnCheckpointPrefixes<'_>,
+        max_new: usize,
+        constraint: Option<&mut crate::grammar::Constraint>,
+        req: &RequestCtx,
         mut on_piece: impl FnMut(&str),
     ) -> Result<GenStats> {
         let mtp_eligible = self.mtp_heads.as_ref().is_none_or(|_| {
@@ -2861,7 +2885,9 @@ impl ParallelSeam {
             && max_new > 0;
         let mut registration = initially_eligible.then(|| BatchRegistration::new(self));
         let prompt_tokens = self.model.encode(prompt)?;
-        let turn_checkpoint = self.model.turn_checkpoint(&prompt_tokens, stable_prefix)?;
+        let turn_checkpoint = self
+            .model
+            .turn_checkpoints(&prompt_tokens, checkpoint_prefixes)?;
         let max_new = max_new.min(self.max_ctx.saturating_sub(prompt_tokens.len() + 1));
         let batch_candidate = initially_eligible && max_new > 0;
         if !batch_candidate {
@@ -2930,7 +2956,7 @@ impl ParallelSeam {
             stats: GenStats::default(),
             phase: BatchPhase::Unprepared,
             prefill_start: 0,
-            checkpoint_boundary: None,
+            checkpoint_boundaries: [None; crate::seam::TURN_CHECKPOINT_COUNT],
             turn_checkpoint,
             mrope_plan: None,
             multimodal_key: None,
@@ -3020,10 +3046,7 @@ impl ParallelSeam {
                         && prompt_tokens.starts_with(tokens)
                 })
                 .map(|tokens| tokens.len());
-            boundary.map_or(
-                crate::seam::TurnCheckpoint::Enable,
-                crate::seam::TurnCheckpoint::Boundary,
-            )
+            crate::seam::TurnCheckpoint::new(None, boundary)
         });
         let mut guard = self.checkout_multimodal(&prompt_tokens, key, req);
         let max_new = max_new.min(self.max_ctx.saturating_sub(prompt_tokens.len() + 1));
@@ -3065,7 +3088,7 @@ impl ParallelSeam {
                 stats: GenStats::default(),
                 phase: BatchPhase::Unprepared,
                 prefill_start: 0,
-                checkpoint_boundary: None,
+                checkpoint_boundaries: [None; crate::seam::TURN_CHECKPOINT_COUNT],
                 turn_checkpoint,
                 mrope_plan: Some(plan),
                 multimodal_key: Some(key),
@@ -3172,7 +3195,7 @@ impl ParallelSeam {
             stats,
             phase: phase_for_remaining_prefill(remaining_prefill),
             prefill_start,
-            checkpoint_boundary: None,
+            checkpoint_boundaries: [None; crate::seam::TURN_CHECKPOINT_COUNT],
             turn_checkpoint: None,
             mrope_plan: Some(plan),
             multimodal_key: Some(key),
