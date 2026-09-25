@@ -35,7 +35,7 @@ use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{
-        sse::{Event, Sse},
+        sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
     routing::{get, post},
@@ -46,6 +46,11 @@ use infr_engine::{ChatMessage, ChatTemplateOptions, Delta, ToolCall, IMAGE_PART_
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
+
+#[cfg(not(test))]
+const SSE_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const SSE_KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(25);
 
 // ---------------------------------------------------------------------------
 // Coordinated terminal output
@@ -2744,199 +2749,234 @@ async fn streaming(
     // (a few thousand short strings, worst case), which is the right trade.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
 
-    // Same per-model admission gate as the non-streaming path — the (N+1)'th concurrent stream to
-    // this model queues here. Taken BEFORE the SSE response is returned, so a queued client simply
-    // waits for its first byte rather than being handed an open-but-silent stream.
-    let queued = QueuedGuard::new(stats.clone());
-    let Ok(permit) = entry.slots.clone().acquire_owned().await else {
-        stats.fold_failure();
-        tracing::warn!(req = req_id, "rejected — server shutting down");
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "server shutting down".into(),
-        );
-    };
-    drop(queued);
-    let active = ActiveGuard::new(stats.clone());
-    let engine_arc = entry.engine.clone();
-    // Clone sender + strings for use inside the on_delta callback closure.
-    let tx_cb = tx.clone();
-    let cid_cb = cid.clone();
-    let model_cb = model_id.clone();
-    let stats_cb = stats.clone();
-    let progress = Arc::new(RequestProgress::new(
-        req_id,
-        model_id.clone(),
-        progress_interval,
-        stats.clone(),
-    ));
-    let display = dashboard.claim_chat(&model_id, req_id, progress.clone());
-    let progress_cb = progress.clone();
-
-    // Per-request abort latch: set as soon as the client-owned SSE response is dropped, with failed
-    // sends retained as a belt-and-suspenders fallback. The generator polls it at natural work
-    // boundaries so a disconnected client does not keep a GPU slot through the rest of a long
-    // prefill or decode (audit finding 2).
+    // Return the SSE response before slot admission so its keep-alive covers queueing too.
     let cancel = Arc::new(AtomicBool::new(false));
-    let cancel_cb = cancel.clone();
+    let task_cancel = cancel.clone();
+    let (disconnect_tx, mut disconnect_rx) = tokio::sync::oneshot::channel::<()>();
 
-    // Wall-clock deadline. Unlike the non-streaming path, nothing here awaits the generation's join
-    // — the SSE response is returned as soon as the stream exists — so the timer needs its own
-    // task, and that task needs an off switch. [`arm_deadline`] hands back a sender whose DROP is
-    // that switch; it is moved into the blocking closure below, so the watchdog dies with the
-    // generation (normally or by panic) instead of accumulating one sleeper per request.
-    //
-    // `deadline_hit` is separate from `cancel` because `cancel` is ALSO latched by a client
-    // disconnect, and the finish chunk must not report a timeout as a hangup or vice versa.
-    let deadline_hit = Arc::new(AtomicBool::new(false));
-    let deadline_hit_cb = deadline_hit.clone();
-    let done_tx = deadline.map(|d| arm_deadline(d, cancel.clone(), deadline_hit.clone()));
-
-    tokio::task::spawn_blocking(move || {
-        // Held for exactly this generation; freed for the next queued request on return. The
-        // `active` gauge is released by the same return (or unwind).
-        let _permit = permit;
-        let _active = active;
-        let _display = display;
-        // Disarms the deadline watchdog when this task ends — see [`arm_deadline`]. `None` when no
-        // deadline was configured, in which case there is no watchdog to disarm.
-        let _done_tx = done_tx;
-        // Closes the stream exactly once, however this closure ends. It emits `[DONE]` always, and
-        // — unless `settled()` says a terminal frame already went out — reports the generation as a
-        // failure. Both matter on an unwinding panic, which skips every arm below (B23).
-        let mut done = DoneGuard {
-            tx: tx.clone(),
-            req_id,
-            stats: stats.clone(),
-            settled: false,
-        };
-
-        // First chunk: role delta (mirrors the Python shim's opening chunk).
-        let _ = tx.send(Ok(sse_chunk(
-            &cid,
-            &model_id,
-            created,
-            DeltaPayload {
-                role: Some("assistant".into()),
-                ..Default::default()
+    // Same per-model admission gate as the non-streaming path, but wait in a detached async task.
+    // The SSE response and its keep-alive are already live. A disconnect races the FIFO semaphore
+    // acquire so an abandoned queued request cannot wake later and consume a GPU slot.
+    tokio::spawn(async move {
+        let queued = QueuedGuard::new(stats.clone());
+        let slot_wait = entry.slots.clone().acquire_owned();
+        tokio::pin!(slot_wait);
+        let permit = tokio::select! {
+            biased;
+            _ = &mut disconnect_rx => return,
+            result = &mut slot_wait => match result {
+                Ok(permit) => permit,
+                Err(_) => {
+                    let mut done = DoneGuard {
+                        tx: tx.clone(),
+                        req_id,
+                        stats: stats.clone(),
+                        settled: false,
+                    };
+                    done.fail("server shutting down");
+                    return;
+                }
             },
-            None,
-        )));
-
-        let Some(engine) = engine_arc else {
-            // `fail` sends the error frame, folds the statistic and logs; `DoneGuard` then closes
-            // the stream with `[DONE]`.
-            done.fail("no engine loaded");
+        };
+        drop(queued);
+        if task_cancel.load(Ordering::Relaxed) {
             return;
-        };
-
-        let mut tc_index = 0usize;
-        let mut saw_tool_call = false;
-        // Per-request tally: plain locals inside the generation, folded in once below.
-        let mut tally = ReqTally::new();
-        let model_progress = progress_cb.callback();
-
-        let res = engine.chat(
-            &messages,
-            tools.as_ref(),
-            tool_choice.as_deref(),
-            &params,
-            &cancel_cb,
-            Some(model_progress),
-            &mut |delta| {
-                let payload = match delta {
-                    Delta::Reasoning(t) => {
-                        tally.on_text_delta_progress(&stats_cb, &progress_cb);
-                        DeltaPayload {
-                            reasoning_content: Some(t),
-                            ..Default::default()
-                        }
-                    }
-                    Delta::Content(t) => {
-                        tally.on_text_delta_progress(&stats_cb, &progress_cb);
-                        DeltaPayload {
-                            content: Some(t),
-                            ..Default::default()
-                        }
-                    }
-                    Delta::ToolCall { name, arguments } => {
-                        let tc = OAIToolCall {
-                            index: tc_index,
-                            id: format!("call_{cid_cb}_{tc_index}"),
-                            kind: "function",
-                            function: OAIFunction { name, arguments },
-                        };
-                        tc_index += 1;
-                        saw_tool_call = true;
-                        DeltaPayload {
-                            tool_calls: Some(vec![tc]),
-                            ..Default::default()
-                        }
-                    }
-                };
-                // A failed send means the receiver (the client's stream) is gone. Latch the abort so
-                // the decode loop stops at its next poll and returns the slot.
-                if tx_cb
-                    .send(Ok(sse_chunk(&cid_cb, &model_cb, created, payload, None)))
-                    .is_err()
-                {
-                    cancel_cb.store(true, Ordering::Relaxed);
-                }
-            },
-        );
-
-        match res {
-            Ok(outcome) => {
-                // Same honesty rule as the non-streaming path: the generator saw only an abort and
-                // reports `Stop`, so the deadline has to relabel it "length" — the budget ran out,
-                // the model did not finish. A tool call still wins.
-                let finish = if saw_tool_call {
-                    Finish::ToolCalls
-                } else if deadline_hit_cb.load(Ordering::Relaxed) {
-                    Finish::Length
-                } else {
-                    outcome.finish
-                };
-                let finished_progress = progress_cb.finish(outcome);
-                let rec = tally.finish_with_progress(outcome, finish, finished_progress);
-                // The terminal frame carries authoritative token counts and timings. This is sent
-                // even when the client omitted stream_options.include_usage: local harnesses need
-                // the counts to display context depth and thinking-token throughput truthfully.
-                let _ = tx.send(Ok(sse_final_chunk(
-                    &cid,
-                    &model_id,
-                    created,
-                    finish,
-                    UsageInfo::from_outcome(outcome),
-                    TimingInfo::from_record(&rec),
-                )));
-                // Fold the request's tallies in ONCE, here, and log its completion line. The finish
-                // chunk above IS this stream's terminal frame, so the guard must not also report a
-                // failure when it drops.
-                stats.fold_completion(&rec);
-                log_request_done(req_id, &model_id, stream, &rec);
-                done.settled();
-            }
-            Err(e) => {
-                // A mid-stream failure is NOT a clean `stop` — the error frame lets the client tell
-                // this apart from success (matching the non-streaming 500). `[DONE]` still follows,
-                // via `DoneGuard` (audit finding 1).
-                if invalid_template_input(&e) {
-                    done.fail_with_type(&e.to_string(), "invalid_request_error");
-                } else {
-                    done.fail(&e.to_string());
-                }
-            }
         }
-        // `DoneGuard` drops here (or on an unwinding panic). It sends `[DONE]`, and if nothing
-        // above settled the stream it first reports the request as failed (B23).
+        let active = ActiveGuard::new(stats.clone());
+        let engine_arc = entry.engine.clone();
+        // Clone sender + strings for use inside the on_delta callback closure.
+        let tx_cb = tx.clone();
+        let cid_cb = cid.clone();
+        let model_cb = model_id.clone();
+        let stats_cb = stats.clone();
+        let progress = Arc::new(RequestProgress::new(
+            req_id,
+            model_id.clone(),
+            progress_interval,
+            stats.clone(),
+        ));
+        let display = dashboard.claim_chat(&model_id, req_id, progress.clone());
+        let progress_cb = progress.clone();
+
+        // Per-request abort latch: set as soon as the client-owned SSE response is dropped, with failed
+        // sends retained as a belt-and-suspenders fallback. The generator polls it at natural work
+        // boundaries so a disconnected client does not keep a GPU slot through the rest of a long
+        // prefill or decode (audit finding 2).
+        let cancel_cb = task_cancel.clone();
+
+        // Wall-clock deadline. Unlike the non-streaming path, nothing here awaits the generation's join
+        // — the SSE response is returned as soon as the stream exists — so the timer needs its own
+        // task, and that task needs an off switch. [`arm_deadline`] hands back a sender whose DROP is
+        // that switch; it is moved into the blocking closure below, so the watchdog dies with the
+        // generation (normally or by panic) instead of accumulating one sleeper per request.
+        //
+        // `deadline_hit` is separate from `cancel` because `cancel` is ALSO latched by a client
+        // disconnect, and the finish chunk must not report a timeout as a hangup or vice versa.
+        let deadline_hit = Arc::new(AtomicBool::new(false));
+        let deadline_hit_cb = deadline_hit.clone();
+        let done_tx = deadline.map(|d| arm_deadline(d, task_cancel.clone(), deadline_hit.clone()));
+
+        tokio::task::spawn_blocking(move || {
+            // Held for exactly this generation; freed for the next queued request on return. The
+            // `active` gauge is released by the same return (or unwind).
+            let _permit = permit;
+            let _active = active;
+            let _display = display;
+            // Disarms the deadline watchdog when this task ends — see [`arm_deadline`]. `None` when no
+            // deadline was configured, in which case there is no watchdog to disarm.
+            let _done_tx = done_tx;
+            // Closes the stream exactly once, however this closure ends. It emits `[DONE]` always, and
+            // — unless `settled()` says a terminal frame already went out — reports the generation as a
+            // failure. Both matter on an unwinding panic, which skips every arm below (B23).
+            let mut done = DoneGuard {
+                tx: tx.clone(),
+                req_id,
+                stats: stats.clone(),
+                settled: false,
+            };
+
+            // First chunk: role delta (mirrors the Python shim's opening chunk).
+            let _ = tx.send(Ok(sse_chunk(
+                &cid,
+                &model_id,
+                created,
+                DeltaPayload {
+                    role: Some("assistant".into()),
+                    ..Default::default()
+                },
+                None,
+            )));
+
+            let Some(engine) = engine_arc else {
+                // `fail` sends the error frame, folds the statistic and logs; `DoneGuard` then closes
+                // the stream with `[DONE]`.
+                done.fail("no engine loaded");
+                return;
+            };
+
+            let mut tc_index = 0usize;
+            let mut saw_tool_call = false;
+            // Per-request tally: plain locals inside the generation, folded in once below.
+            let mut tally = ReqTally::new();
+            let model_progress = progress_cb.callback();
+
+            let res = engine.chat(
+                &messages,
+                tools.as_ref(),
+                tool_choice.as_deref(),
+                &params,
+                &cancel_cb,
+                Some(model_progress),
+                &mut |delta| {
+                    let payload = match delta {
+                        Delta::Reasoning(t) => {
+                            tally.on_text_delta_progress(&stats_cb, &progress_cb);
+                            DeltaPayload {
+                                reasoning_content: Some(t),
+                                ..Default::default()
+                            }
+                        }
+                        Delta::Content(t) => {
+                            tally.on_text_delta_progress(&stats_cb, &progress_cb);
+                            DeltaPayload {
+                                content: Some(t),
+                                ..Default::default()
+                            }
+                        }
+                        Delta::ToolCall { name, arguments } => {
+                            let tc = OAIToolCall {
+                                index: tc_index,
+                                id: format!("call_{cid_cb}_{tc_index}"),
+                                kind: "function",
+                                function: OAIFunction { name, arguments },
+                            };
+                            tc_index += 1;
+                            saw_tool_call = true;
+                            DeltaPayload {
+                                tool_calls: Some(vec![tc]),
+                                ..Default::default()
+                            }
+                        }
+                    };
+                    // A failed send means the receiver (the client's stream) is gone. Latch the abort so
+                    // the decode loop stops at its next poll and returns the slot.
+                    if tx_cb
+                        .send(Ok(sse_chunk(&cid_cb, &model_cb, created, payload, None)))
+                        .is_err()
+                    {
+                        cancel_cb.store(true, Ordering::Relaxed);
+                    }
+                },
+            );
+
+            match res {
+                Ok(outcome) => {
+                    // Same honesty rule as the non-streaming path: the generator saw only an abort and
+                    // reports `Stop`, so the deadline has to relabel it "length" — the budget ran out,
+                    // the model did not finish. A tool call still wins.
+                    let finish = if saw_tool_call {
+                        Finish::ToolCalls
+                    } else if deadline_hit_cb.load(Ordering::Relaxed) {
+                        Finish::Length
+                    } else {
+                        outcome.finish
+                    };
+                    let finished_progress = progress_cb.finish(outcome);
+                    let rec = tally.finish_with_progress(outcome, finish, finished_progress);
+                    // The terminal frame carries authoritative token counts and timings. This is sent
+                    // even when the client omitted stream_options.include_usage: local harnesses need
+                    // the counts to display context depth and thinking-token throughput truthfully.
+                    let _ = tx.send(Ok(sse_final_chunk(
+                        &cid,
+                        &model_id,
+                        created,
+                        finish,
+                        UsageInfo::from_outcome(outcome),
+                        TimingInfo::from_record(&rec),
+                    )));
+                    // Fold the request's tallies in ONCE, here, and log its completion line. The finish
+                    // chunk above IS this stream's terminal frame, so the guard must not also report a
+                    // failure when it drops.
+                    stats.fold_completion(&rec);
+                    log_request_done(req_id, &model_id, stream, &rec);
+                    done.settled();
+                }
+                Err(e) => {
+                    // A mid-stream failure is NOT a clean `stop` — the error frame lets the client tell
+                    // this apart from success (matching the non-streaming 500). `[DONE]` still follows,
+                    // via `DoneGuard` (audit finding 1).
+                    if invalid_template_input(&e) {
+                        done.fail_with_type(&e.to_string(), "invalid_request_error");
+                    } else {
+                        done.fail(&e.to_string());
+                    }
+                }
+            }
+            // `DoneGuard` drops here (or on an unwinding panic). It sends `[DONE]`, and if nothing
+            // above settled the stream it first reports the request as failed (B23).
+        });
     });
 
     // The response body owns this stream. Axum drops it immediately when the client disconnects,
     // including during a long prefill where no token has been sent yet.
-    let stream = CancelOnDropStream { rx, cancel };
+    let stream = CancelOnDropStream {
+        rx,
+        cancel,
+        disconnect: Some(disconnect_tx),
+    };
 
-    Sse::new(stream).into_response()
+    // Tool calls are deliberately buffered until their JSON is complete. A large `write` call can
+    // therefore spend several minutes decoding without producing an SSE event, long enough for
+    // Undici's default 300-second response-body timeout to tear down an otherwise healthy request.
+    // SSE comments are wire activity but not OpenAI deltas, so they keep transports alive without
+    // exposing partial tool JSON or changing any client-visible message semantics.
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(SSE_KEEP_ALIVE_INTERVAL)
+                .text("keep-alive"),
+        )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -2950,6 +2990,7 @@ async fn streaming(
 struct CancelOnDropStream {
     rx: tokio::sync::mpsc::UnboundedReceiver<Result<Event, Infallible>>,
     cancel: Arc<AtomicBool>,
+    disconnect: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl futures_util::Stream for CancelOnDropStream {
@@ -2963,6 +3004,9 @@ impl futures_util::Stream for CancelOnDropStream {
 impl Drop for CancelOnDropStream {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+        if let Some(disconnect) = self.disconnect.take() {
+            let _ = disconnect.send(());
+        }
     }
 }
 
@@ -5079,6 +5123,72 @@ mod tests {
         assert!(text.contains("[DONE]"), "sentinel missing: {text}");
     }
 
+    /// A stream waiting behind a busy slot must still produce wire activity. If that client leaves,
+    /// its FIFO acquire is cancelled before it can ever invoke the generator.
+    #[tokio::test]
+    async fn queued_stream_gets_heartbeats_and_disconnects_before_admission() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let entry = deadline_entry(Arc::new(SilentLoopGen {
+            stopped: stopped.clone(),
+        }));
+        let held = entry.slots.clone().acquire_owned().await.unwrap();
+        let ctx = test_ctx(None, true);
+        let stats = ctx.stats.clone();
+
+        let resp = tokio::time::timeout(
+            Duration::from_millis(250),
+            streaming(
+                entry.clone(),
+                user_msg(),
+                None,
+                None,
+                GenParams::default(),
+                ctx,
+            ),
+        )
+        .await
+        .expect("a queued stream must return its SSE response before admission");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while stats.queued.load(Ordering::Relaxed) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the request never entered the slot queue");
+
+        let mut body = resp.into_body();
+        let frame = tokio::time::timeout(Duration::from_secs(1), body.frame())
+            .await
+            .expect("a queued stream emitted no keep-alive")
+            .expect("the queued SSE body ended")
+            .expect("the queued SSE body failed");
+        let data = frame.into_data().expect("the keep-alive must be data");
+        assert!(
+            String::from_utf8_lossy(&data).contains("keep-alive"),
+            "the first queued frame was not an SSE keep-alive: {data:?}"
+        );
+
+        drop(body);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while stats.queued.load(Ordering::Relaxed) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("disconnect did not remove the request from the slot queue");
+        assert_eq!(entry.slots.available_permits(), 0, "the held slot changed");
+
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(entry.slots.available_permits(), 1);
+        assert!(
+            !stopped.load(Ordering::Relaxed),
+            "a disconnected queued request must never invoke the generator"
+        );
+    }
+
     /// Dropping the HTTP response must cancel generation even before the first content delta. This
     /// is the long-prefill case behind a frontend Stop button appearing to do nothing.
     #[tokio::test]
@@ -5097,6 +5207,13 @@ mod tests {
         )
         .await;
 
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while entry.slots.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the streaming request was never admitted");
         drop(resp);
         tokio::time::timeout(Duration::from_secs(2), async {
             while !stopped.load(Ordering::Relaxed) {
