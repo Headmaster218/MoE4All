@@ -18,3 +18,4 @@ target-prof/
 /gui-data/
 /artifacts/context-resource-matrix/
 /tests/context-resource/matrix.local.json
+bili_report_work/*
