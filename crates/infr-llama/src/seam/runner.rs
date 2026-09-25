@@ -940,6 +940,8 @@ struct PendingSeamSlot {
     ple_embd_buf: Option<Box<dyn Buffer>>,
     ple_state_buf: Option<Box<dyn Buffer>>,
     turn_recurrent_ckpt: Option<TurnRecurrentCkpt>,
+    mtp_delta_ckpt: Option<MtpDeltaCkpt>,
+    mtp_verify_bufs: Option<QwenMtpVerifyBuffers>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1046,6 +1048,21 @@ fn allocate_pending_seam_slot(
             &[],
         )?;
     }
+    let mtp_delta_ckpt = if ec.spec.mtp && cfg.qwen4exp {
+        MtpDeltaCkpt::allocate_before_dynamic_kv(
+            be,
+            cfg,
+            &kbufs,
+            &vbufs,
+            ple_state_buf.as_deref(),
+            crate::mtp::DRAFT_TOKENS.saturating_sub(1),
+        )?
+    } else {
+        None
+    };
+    let mtp_verify_bufs = (ec.spec.mtp && cfg.qwen4exp)
+        .then(|| QwenMtpVerifyBuffers::allocate(be, cfg))
+        .transpose()?;
 
     let npl = cfg.n_embd_per_layer.max(1);
     let hidden_buf = be
@@ -1087,6 +1104,8 @@ fn allocate_pending_seam_slot(
         ple_embd_buf,
         ple_state_buf,
         turn_recurrent_ckpt,
+        mtp_delta_ckpt,
+        mtp_verify_bufs,
     })
 }
 
@@ -1176,7 +1195,7 @@ fn finish_pending_seam_slot(
         },
         ple_embd_buf: pending.ple_embd_buf,
         ple_state_buf: pending.ple_state_buf,
-        mtp_verify_bufs: None,
+        mtp_verify_bufs: pending.mtp_verify_bufs,
         max_ctx: want_ctx,
         kv_ring,
         cached: Vec::new(),
@@ -1186,7 +1205,7 @@ fn finish_pending_seam_slot(
         sc_ping: None,
         sc_ping_write: 0,
         sc_temp_inv_buf: None,
-        mtp_delta_ckpt: None,
+        mtp_delta_ckpt: pending.mtp_delta_ckpt,
         turn_recurrent_ckpt: pending.turn_recurrent_ckpt,
         preallocated_siblings: Vec::new(),
     })
@@ -1212,6 +1231,67 @@ struct ParallelPrefillRequest<'a> {
     prepared: &'a [PreparedParallelPrompt],
     peer_stats: &'a mut Vec<GenStats>,
     on_progress: Option<&'a dyn Fn(usize, infr_core::GenerationProgress)>,
+}
+
+fn bind_parallel_mtp_traces<'a>(
+    bindings: &mut Bindings<'a>,
+    handles: &DecodeHandles,
+    primary: &'a Option<MtpDeltaCkpt>,
+    peers: &'a [SeamKv],
+) {
+    let checkpoints = std::iter::once(primary.as_ref().expect("MTP primary checkpoint"))
+        .chain(
+            peers
+                .iter()
+                .map(|peer| peer.mtp_delta_ckpt.as_ref().expect("MTP peer checkpoint")),
+        )
+        .collect::<Vec<_>>();
+    for layer in 0..handles.mtp_k_trace.len() {
+        let Some(k_id) = handles.mtp_k_trace[layer] else {
+            continue;
+        };
+        let v_id = handles.mtp_v_trace[layer].expect("paired MTP V trace");
+        let k_rows = checkpoints
+            .iter()
+            .map(|ckpt| {
+                let index = ckpt.layers.iter().position(|&item| item == layer).unwrap();
+                ckpt.trace_kbufs[index].as_ref()
+            })
+            .collect::<Vec<_>>();
+        let v_rows = checkpoints
+            .iter()
+            .map(|ckpt| {
+                let index = ckpt.layers.iter().position(|&item| item == layer).unwrap();
+                ckpt.trace_vbufs[index].as_ref()
+            })
+            .collect::<Vec<_>>();
+        if peers.is_empty() {
+            bindings.bind(k_id, k_rows[0]);
+            bindings.bind(v_id, v_rows[0]);
+        } else {
+            bindings.bind_rows(k_id, k_rows);
+            bindings.bind_rows(v_id, v_rows);
+        }
+    }
+    if let Some(id) = handles.mtp_ple_trace {
+        let rows = checkpoints
+            .iter()
+            .map(|ckpt| ckpt.trace_ple_state.as_deref().expect("MTP PLE trace"))
+            .collect::<Vec<_>>();
+        if peers.is_empty() {
+            bindings.bind(id, rows[0]);
+        } else {
+            bindings.bind_rows(id, rows);
+        }
+    }
+}
+
+struct ParallelMtpVerifyRequest<'a> {
+    feeds: &'a [Vec<u32>],
+    peers: &'a mut [SeamKv],
+    prepared: &'a [PreparedParallelPrompt],
+    ids: &'a mut Vec<Vec<u32>>,
+    hidden: &'a mut Vec<Vec<f32>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1264,6 +1344,7 @@ pub(crate) fn generate_dense_backend(
         mm,
         None,
         None,
+        None,
         false,
     )
 }
@@ -1310,6 +1391,7 @@ pub(crate) fn generate_dense_backend_verify_frontier(
         None,
         None,
         finish_fixed_allocations,
+        None,
         None,
         None,
         None,
@@ -1398,6 +1480,7 @@ pub(crate) fn generate_dense_backend_parallel_sampled(
         mrope_plans[0],
         Some(&mut parallel),
         None,
+        None,
         false,
     )?;
     let mut outputs = Vec::with_capacity(prompts.len());
@@ -1466,12 +1549,77 @@ pub(crate) fn generate_dense_backend_parallel_prefill(
         None,
         None,
         Some(&mut parallel),
+        None,
         false,
     )?;
     let mut stats = Vec::with_capacity(prompts.len());
     stats.push(primary_stats);
     stats.append(&mut peer_stats);
     Ok(stats)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_dense_backend_parallel_mtp_verify(
+    be: &dyn Backend,
+    bind_weight: &BindWeight,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    feeds: &[Vec<u32>],
+    primary: &mut Option<SeamKv>,
+    peers: &mut [SeamKv],
+    want_ctx: usize,
+    ids: &mut Vec<Vec<u32>>,
+    hidden: &mut Vec<Vec<f32>>,
+) -> AResult<()> {
+    anyhow::ensure!(
+        !feeds.is_empty() && feeds.len() == peers.len() + 1 && primary.is_some(),
+        "parallel MTP VERIFY needs one initialized target per feed"
+    );
+    let prepared = std::iter::once(primary.as_ref().unwrap().cached_len())
+        .chain(peers.iter().map(SeamKv::cached_len))
+        .map(|start| PreparedParallelPrompt {
+            start,
+            checkpoint_boundary: None,
+        })
+        .collect::<Vec<_>>();
+    let mut request = ParallelMtpVerifyRequest {
+        feeds,
+        peers,
+        prepared: &prepared,
+        ids,
+        hidden,
+    };
+    generate_dense_backend_inner(
+        be,
+        bind_weight,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        None,
+        &feeds[0],
+        0,
+        |_| {},
+        primary,
+        want_ctx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(&mut request),
+        false,
+    )?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1538,6 +1686,7 @@ fn generate_dense_backend_inner(
     mm: Option<&crate::seam::MropePlan>,
     parallel_decode: Option<&mut ParallelDecodeRequest<'_>>,
     mut parallel_prefill: Option<&mut ParallelPrefillRequest<'_>>,
+    mut parallel_mtp_verify: Option<&mut ParallelMtpVerifyRequest<'_>>,
     verify_frontier_only: bool,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
@@ -2632,39 +2781,15 @@ fn generate_dense_backend_inner(
         } else {
             None
         };
-        let mtp_verify_bufs = if ec.spec.mtp && c.qwen4exp {
-            let rows = crate::mtp::DRAFT_TOKENS;
-            let h_width = c.hc_mult * ne;
-            let ple_row = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram * c.ple_head_dim;
-            Some(QwenMtpVerifyBuffers {
-                ids: be
-                    .alloc(rows * 4, BufferUsage::Staging)
-                    .map_err(|e| anyhow!("{e}"))?,
-                positions: be
-                    .alloc(rows * 4, BufferUsage::Staging)
-                    .map_err(|e| anyhow!("{e}"))?,
-                hidden: be
-                    .alloc_uninit(rows * ne * 4, BufferUsage::Activations)
-                    .map_err(|e| anyhow!("{e}"))?,
-                wide: be
-                    .alloc_uninit(rows * h_width * 4, BufferUsage::Activations)
-                    .map_err(|e| anyhow!("{e}"))?,
-                ple: be
-                    .alloc(rows * ple_row * 4, BufferUsage::Staging)
-                    .map_err(|e| anyhow!("{e}"))?,
-                logits: be
-                    .alloc(rows * c.vocab * 4, BufferUsage::Staging)
-                    .map_err(|e| anyhow!("{e}"))?,
-                h_out: be
-                    .alloc(rows * h_width * 4, BufferUsage::Readback)
-                    .map_err(|e| anyhow!("{e}"))?,
-                out_ids: be
-                    .alloc(rows * 4, BufferUsage::Readback)
-                    .map_err(|e| anyhow!("{e}"))?,
+        let mtp_verify_bufs = (ec.spec.mtp && c.qwen4exp)
+            .then(|| {
+                QwenMtpVerifyBuffers::allocate_rows(
+                    be,
+                    c,
+                    crate::mtp::DRAFT_TOKENS * super::placement_slots() as usize,
+                )
             })
-        } else {
-            None
-        };
+            .transpose()?;
 
         if let Some(finish) = finish_fixed_allocations {
             finish()?;
@@ -2825,6 +2950,31 @@ fn generate_dense_backend_inner(
                     tokens.len()
                 ));
             }
+        }
+        Some(parallel.prepared.to_vec())
+    } else if let Some(parallel) = parallel_mtp_verify.as_deref() {
+        anyhow::ensure!(
+            c.qwen4exp
+                && mm.is_none()
+                && parallel.feeds.len() == parallel.peers.len() + 1
+                && parallel.feeds.first().map(Vec::as_slice) == Some(prompt),
+            "invalid parallel Qwen3.8 MTP VERIFY layout"
+        );
+        for (lane, (feed, slot)) in parallel
+            .feeds
+            .iter()
+            .zip(std::iter::once(state.as_ref().unwrap()).chain(parallel.peers.iter()))
+            .enumerate()
+        {
+            let start = parallel.prepared[lane].start;
+            anyhow::ensure!(
+                start == slot.cached_len()
+                    && feed.len() == start + crate::mtp::DRAFT_TOKENS
+                    && feed[..start] == slot.cached[..]
+                    && feed.len() <= slot.max_ctx(),
+                "parallel MTP lane {lane} does not extend its committed target state by four rows"
+            );
+            validate_token_ids(feed, c.vocab)?;
         }
         Some(parallel.prepared.to_vec())
     } else {
@@ -3317,6 +3467,7 @@ fn generate_dense_backend_inner(
             ));
         }
     }
+    let parallel_mtp_trace = parallel_mtp_verify.is_some();
     let build = |batch: usize,
                  start_pos: usize,
                  logits_rows: usize,
@@ -3492,7 +3643,10 @@ fn generate_dense_backend_inner(
             let hist = (c.ple_conv_kernel - 1) * c.ple_ngram_size;
             g.input(f32d(hist * c.hc_mult * ne))
         });
-        let trace_recurrent = mtp_verify && mtp_trace.is_some_and(|(rows, _)| rows == batch);
+        let trace_recurrent = mtp_verify
+            && mtp_trace.is_some_and(|(rows, _)| {
+                rows == batch || (parallel_mtp_trace && rows == crate::mtp::DRAFT_TOKENS)
+            });
         let mtp_trace_rows = mtp_trace.map_or(0, |(_, trace_rows)| trace_rows);
         let mtp_ple_trace = (trace_recurrent && span_has_ple).then(|| {
             let hist = (c.ple_conv_kernel - 1) * c.ple_ngram_size;
@@ -7345,8 +7499,9 @@ fn generate_dense_backend_inner(
     };
 
     // ── layer-synchronous multi-session prefill ─────────────────────────────────────────────
-    if let Some(prepared) = parallel_prepared.as_ref() {
-        let parallel = parallel_prefill.expect("prepared parallel prefill retains its request");
+    if let (Some(prepared), Some(parallel)) =
+        (parallel_prepared.as_ref(), parallel_prefill.as_deref_mut())
+    {
         if !gpu_embed {
             return Err(anyhow!("parallel prefill requires Vulkan GPU embedding"));
         }
@@ -8114,6 +8269,220 @@ fn generate_dense_backend_inner(
     // The suffix-prefill contract doubles as the accept/rollback mechanism: the caller
     // truncates its committed token list and the next call's prefix diff overwrites the
     // stale KV rows. Dense non-E2B models only (mirrors the batched-prefill guard).
+    if let Some(parallel) = parallel_mtp_verify.as_deref_mut() {
+        let lanes = parallel.feeds.len();
+        let rows_per_lane = crate::mtp::DRAFT_TOKENS;
+        let batch = lanes * rows_per_lane;
+        anyhow::ensure!(
+            mtp_trace == Some((rows_per_lane, rows_per_lane - 1)),
+            "primary MTP recurrent trace was not armed for four rows"
+        );
+        for (lane, peer) in parallel.peers.iter_mut().enumerate() {
+            anyhow::ensure!(
+                peer.mtp_take_delta_trace() == mtp_trace,
+                "parallel MTP lane {} recurrent trace was not armed",
+                lane + 1
+            );
+        }
+        let fixed = mtp_verify_bufs
+            .as_ref()
+            .ok_or_else(|| anyhow!("parallel MTP VERIFY has no fixed buffers"))?;
+        anyhow::ensure!(
+            fixed.ids.len_bytes() >= batch * 4
+                && fixed.h_out.len_bytes() >= batch * c.hc_mult * ne * 4,
+            "parallel MTP VERIFY primary slot lacks {batch}-row fixed buffers"
+        );
+        let h_width = c.hc_mult * ne;
+        let ple_row = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram * c.ple_head_dim;
+        let mut ids = Vec::with_capacity(batch);
+        let mut positions = Vec::with_capacity(batch);
+        let mut spans = Vec::with_capacity(lanes);
+        let mut tickets = Vec::with_capacity(lanes);
+        let worker = ple_worker
+            .as_ref()
+            .ok_or_else(|| anyhow!("parallel MTP VERIFY has no PLE worker"))?;
+        for lane in 0..lanes {
+            let start_pos = parallel.prepared[lane].start;
+            let end = start_pos + rows_per_lane;
+            if lane == 0 {
+                ensure_kv_depth!(end);
+            } else {
+                parallel.peers[lane - 1].ensure_segmented_depth(be, c, end)?;
+            }
+            ids.extend(
+                parallel.feeds[lane][start_pos..end]
+                    .iter()
+                    .map(|&id| id as i32),
+            );
+            positions.extend((start_pos..end).map(|pos| pos as i32));
+            spans.push(SequenceSpan {
+                row_start: (lane * rows_per_lane) as u32,
+                rows: rows_per_lane as u32,
+                start_pos: start_pos as u32,
+            });
+            tickets.push(worker.submit_range(
+                &parallel.feeds[lane],
+                start_pos,
+                rows_per_lane,
+                c.ple_ngram_size,
+            )?);
+        }
+        be.upload(fixed.ids.as_ref(), bytemuck::cast_slice(&ids))
+            .map_err(|e| anyhow!("{e}"))?;
+        be.upload(fixed.positions.as_ref(), bytemuck::cast_slice(&positions))
+            .map_err(|e| anyhow!("{e}"))?;
+        let independent = lanes > 1;
+        let spans = independent.then_some(spans.as_slice());
+        let (g0, h0) = build(
+            batch,
+            parallel.prepared[0].start,
+            0,
+            false,
+            None,
+            false,
+            false,
+            false,
+            false,
+            true,
+            true,
+            independent,
+            spans,
+            Some(0..1),
+        );
+        let plan0 = be.compile(&g0).map_err(|e| anyhow!("{e}"))?;
+        let mut bindings0 = Bindings::new();
+        bindings0.bind(h0.tok_ids.expect("MTP GPU embedding"), fixed.ids.as_ref());
+        bindings0.bind(h0.hidden, fixed.hidden.as_ref());
+        bindings0.bind(h0.positions, fixed.positions.as_ref());
+        bind_parallel_layer_io(
+            &mut bindings0,
+            &h0,
+            c.n_layer,
+            rf_buf,
+            yff_buf,
+            &kbufs[..],
+            &vbufs[..],
+            &qsa_kbufs[..],
+            &qsa_cbufs[..],
+            &mrope_history_buf,
+            None,
+            &wbufs[..],
+            qwen_wide_buf,
+            ple_embd_buf,
+            ple_state_buf,
+            fixed.wide.as_ref(),
+            None,
+            &*parallel.peers,
+            None,
+            independent,
+        );
+        bind_parallel_mtp_traces(&mut bindings0, &h0, mtp_delta_ckpt, parallel.peers);
+        be.execute(plan0.as_ref(), &bindings0)
+            .map_err(|e| anyhow!("{e}"))?;
+
+        let mut ple_rows = Vec::with_capacity(batch * ple_row);
+        for ticket in tickets {
+            let rows = ticket.wait()?;
+            ple_rows.extend_from_slice(rows.as_slice());
+        }
+        anyhow::ensure!(
+            ple_rows.len() == batch * ple_row,
+            "parallel MTP PLE produced {} rows, expected {batch}",
+            ple_rows.len() / ple_row
+        );
+        be.upload(fixed.ple.as_ref(), bytemuck::cast_slice(&ple_rows))
+            .map_err(|e| anyhow!("{e}"))?;
+        let gpu_ids = caps.argmax_rows && ec.spec.gpu_argmax && ec.spec.gpu_mtp_accept;
+        let (g1, h1) = build(
+            batch,
+            parallel.prepared[0].start,
+            batch,
+            false,
+            None,
+            false,
+            true,
+            gpu_ids,
+            false,
+            false,
+            true,
+            independent,
+            spans,
+            Some(1..c.n_layer),
+        );
+        let plan1 = be.compile(&g1).map_err(|e| anyhow!("{e}"))?;
+        let mut bindings1 = Bindings::new();
+        bindings1.bind(h1.hidden, fixed.hidden.as_ref());
+        bindings1.bind(h1.positions, fixed.positions.as_ref());
+        bind_parallel_layer_io(
+            &mut bindings1,
+            &h1,
+            c.n_layer,
+            rf_buf,
+            yff_buf,
+            &kbufs[..],
+            &vbufs[..],
+            &qsa_kbufs[..],
+            &qsa_cbufs[..],
+            &mrope_history_buf,
+            None,
+            &wbufs[..],
+            qwen_wide_buf,
+            ple_embd_buf,
+            ple_state_buf,
+            fixed.wide.as_ref(),
+            Some(fixed.ple.as_ref()),
+            &*parallel.peers,
+            None,
+            independent,
+        );
+        bind_parallel_mtp_traces(&mut bindings1, &h1, mtp_delta_ckpt, parallel.peers);
+        bindings1.bind(h1.logits.expect("MTP VERIFY logits"), fixed.logits.as_ref());
+        bindings1.bind(h1.h_out.expect("MTP VERIFY hidden"), fixed.h_out.as_ref());
+        if let Some(id) = h1.tok_id {
+            bindings1.bind(id, fixed.out_ids.as_ref());
+        }
+        be.execute(plan1.as_ref(), &bindings1)
+            .map_err(|e| anyhow!("{e}"))?;
+        let mut all_ids = vec![0u32; batch];
+        if gpu_ids {
+            be.download(
+                fixed.out_ids.as_ref(),
+                bytemuck::cast_slice_mut(&mut all_ids),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+        } else {
+            let mut logits = vec![0.0f32; batch * c.vocab];
+            be.download(fixed.logits.as_ref(), bytemuck::cast_slice_mut(&mut logits))
+                .map_err(|e| anyhow!("{e}"))?;
+            for (row, id) in all_ids.iter_mut().enumerate() {
+                *id = crate::mtp::argmax_row(&logits[row * c.vocab..(row + 1) * c.vocab]);
+            }
+        }
+        let mut all_hidden = vec![0.0f32; batch * h_width];
+        be.download(
+            fixed.h_out.as_ref(),
+            bytemuck::cast_slice_mut(&mut all_hidden),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+        parallel.ids.clear();
+        parallel.hidden.clear();
+        for lane in 0..lanes {
+            let row = lane * rows_per_lane;
+            parallel
+                .ids
+                .push(all_ids[row..row + rows_per_lane].to_vec());
+            parallel
+                .hidden
+                .push(all_hidden[row * h_width..(row + rows_per_lane) * h_width].to_vec());
+        }
+        cached.extend_from_slice(&parallel.feeds[0][parallel.prepared[0].start..]);
+        for (lane, peer) in parallel.peers.iter_mut().enumerate() {
+            peer.cached
+                .extend_from_slice(&parallel.feeds[lane + 1][parallel.prepared[lane + 1].start..]);
+        }
+        return Ok((Vec::new(), GenStats::default()));
+    }
+
     if let Some(out_logits) = verify {
         if c.qwen4exp {
             if !gpu_embed {

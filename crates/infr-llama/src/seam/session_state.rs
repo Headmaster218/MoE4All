@@ -163,7 +163,6 @@ impl SeamKv {
             &self.qsa_cbufs,
             meta.committed_tokens.max(meta.cached.len()),
         )?;
-        self.mtp_delta_ckpt = None;
         if let Some(checkpoint) = self.turn_recurrent_ckpt.as_mut() {
             checkpoint.invalidate();
         }
@@ -279,7 +278,6 @@ impl SeamKv {
         // of trusting the stale committed-depth counter and reading a released address.
         self.segmented_kv.committed_tokens = 0;
         self.cached.clear();
-        self.mtp_delta_ckpt = None;
         if let Some(checkpoint) = self.turn_recurrent_ckpt.as_mut() {
             checkpoint.invalidate();
         }

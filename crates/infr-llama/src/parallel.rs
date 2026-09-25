@@ -282,6 +282,15 @@ fn phase_for_remaining_prefill(tokens: usize) -> BatchPhase {
     }
 }
 
+fn mtp_accepted_rows(candidates: &[u32], verified: &[u32]) -> usize {
+    debug_assert_eq!(verified.len(), candidates.len() + 1);
+    1 + candidates
+        .iter()
+        .zip(verified)
+        .take_while(|(candidate, target)| candidate == target)
+        .count()
+}
+
 struct BatchWork {
     slot: usize,
     kv: Option<SeamKv>,
@@ -299,6 +308,13 @@ struct BatchWork {
     sampling: RequestSampling,
     sampler: Option<ParallelSampler>,
     channels: Option<BatchChannels>,
+}
+
+struct MtpSlotState {
+    head: crate::mtp::Qwen4MtpSession,
+    cached: Vec<u32>,
+    last_h: Vec<f32>,
+    pending_id: Option<u32>,
 }
 
 impl BatchWork {
@@ -600,6 +616,7 @@ pub struct ParallelSeam {
     /// current [`crate::seam::PlacementScope`] around placement (construction/warmup) and every
     /// request's decode; concurrent requests on THIS engine all point at this one shared cell.
     pins: Arc<crate::seam::PlacementPins>,
+    mtp_heads: Option<Arc<Mutex<Vec<MtpSlotState>>>>,
 }
 
 impl ParallelSeam {
@@ -666,12 +683,48 @@ impl ParallelSeam {
         vk: infr_vulkan::VulkanBackend,
     ) -> Result<Self> {
         let n_slots = n_slots.max(1);
+        if model.engine_cfg().spec.mtp && model.config().qwen4exp && n_slots > 2 {
+            return Err(anyhow!("Qwen3.8 concurrent MTP supports at most two slots"));
+        }
         // This engine's own placement pins, entered as the current scope for the whole
         // placement phase (the clamp inside `vulkan_slot_ctx` + the `init_slots` warmup, which is
         // where the binder pins the prefill chunk / auto-q8 KV). See `PlacementPins`.
         let pins = Arc::new(crate::seam::PlacementPins::for_slots(n_slots));
         let scope = crate::seam::PlacementScope::enter(pins.clone());
         let max_ctx = model.vulkan_slot_ctx(&vk, n_slots, want_ctx)?;
+        let mtp_heads = if n_slots > 1 && model.engine_cfg().spec.mtp && model.config().qwen4exp {
+            let sampler = crate::sampling::Sampler::from_cfg(&model.engine_cfg().sampling);
+            if sampler.temp > 0.0 && sampler.top_k != 1 {
+                tracing::warn!(
+                    "Qwen3.8 concurrent MTP is greedy-only; requests use ordinary decode unless temperature is 0 or top_k is 1"
+                );
+            }
+            let sidecar = model
+                .engine_cfg()
+                .spec
+                .draft
+                .as_deref()
+                .ok_or_else(|| anyhow!("Qwen3.8 MTP needs a draft sidecar"))?;
+            let fixed =
+                crate::mtp::Qwen4MtpSession::load_fixed_vulkan(&vk, sidecar, model.config())?;
+            let mut heads = Vec::with_capacity(n_slots);
+            for _ in 0..n_slots {
+                heads.push(MtpSlotState {
+                    head: crate::mtp::Qwen4MtpSession::with_fixed(
+                        &vk,
+                        Arc::clone(&fixed),
+                        max_ctx,
+                        crate::seam::ubatch_rows(model.engine_cfg()),
+                    )?,
+                    cached: Vec::new(),
+                    last_h: vec![0.0; model.config().hc_mult * model.config().n_embd],
+                    pending_id: None,
+                });
+            }
+            Some(Arc::new(Mutex::new(heads)))
+        } else {
+            None
+        };
         let session_idle = Duration::from_secs(model.engine_cfg().kv.session_idle_secs);
         let mut engine = Self {
             scheduler_worker: None,
@@ -693,6 +746,7 @@ impl ParallelSeam {
             session_idle,
             max_ctx,
             pins,
+            mtp_heads,
         };
         engine.init_slots(n_slots)?;
         engine.init_session_cache()?;
@@ -784,6 +838,7 @@ impl ParallelSeam {
             session_idle: self.session_idle,
             max_ctx: self.max_ctx,
             pins: Arc::clone(&self.pins),
+            mtp_heads: self.mtp_heads.as_ref().map(Arc::clone),
         }
     }
 
@@ -816,7 +871,11 @@ impl ParallelSeam {
         let req = RequestCtx::with_gate(crate::sampling::RequestSampling::default(), gate);
         let _scope = crate::seam::PlacementScope::enter(Arc::clone(&self.pins));
         while let Some(work) = self.wait_for_scheduler_work(stop.as_ref()) {
-            self.run_unified_batch(work, &req);
+            if self.mtp_heads.is_some() {
+                self.run_mtp_batch(work, &req);
+            } else {
+                self.run_unified_batch(work, &req);
+            }
         }
         self.close_decode_batch(Some("parallel scheduler is shutting down"));
     }
@@ -2064,6 +2123,318 @@ impl ParallelSeam {
         tracing::warn!(%error, "parallel scheduler batch failed");
     }
 
+    fn prime_mtp_work(&self, work: &mut BatchWork, req: &RequestCtx) -> Result<()> {
+        if work.phase != BatchPhase::Unprepared {
+            return Ok(());
+        }
+        let cfg = self.model.config();
+        let ec = self.model.engine_cfg();
+        let h_width = cfg.hc_mult * cfg.n_embd;
+        let heads = self.mtp_heads.as_ref().expect("MTP scheduler has heads");
+        let mut heads = heads.lock().expect("MTP heads poisoned");
+        let lane = &mut heads[work.slot];
+        let prompt = &work.prompt[..work.prompt_end];
+        let reusable = lane.pending_id.is_some()
+            && lane.cached == work.kv().cached_tokens()
+            && prompt.starts_with(&lane.cached);
+        if !reusable {
+            work.kv.as_mut().expect("MTP work has target KV").reset();
+            lane.cached.clear();
+            lane.last_h.fill(0.0);
+            lane.pending_id = None;
+        }
+        let start = lane.cached.len();
+        work.prefill_start = start;
+        work.stats.n_cached += start;
+        work.stats.n_prompt += prompt.len() - start;
+        let t0 = Instant::now();
+        let _gate = req.gate_pass();
+        let (bind, finish) = crate::seam::vulkan_moe_binder(
+            self.vk.as_ref(),
+            self.model.gguf(),
+            cfg,
+            ec,
+            false,
+            self.max_ctx,
+        )?;
+        let chunk = crate::seam::ubatch_rows(ec).max(1);
+        for chunk_start in (start..prompt.len()).step_by(chunk) {
+            let chunk_end = (chunk_start + chunk).min(prompt.len());
+            let rows = chunk_end - chunk_start;
+            let (pending, hidden) = crate::mtp::run_qwen4_prime_frontier_with_finish(
+                self.vk.as_ref(),
+                &*bind,
+                self.model.gguf(),
+                cfg,
+                ec,
+                self.model.embd(),
+                &prompt[..chunk_end],
+                &mut work.kv,
+                self.max_ctx,
+                finish.as_deref(),
+            )?;
+            anyhow::ensure!(
+                hidden.len() == rows * h_width,
+                "MTP prime returned {} hidden values for {rows} rows",
+                hidden.len()
+            );
+            let mut shifted = vec![0.0f32; rows * h_width];
+            shifted[..h_width].copy_from_slice(&lane.last_h);
+            if rows > 1 {
+                shifted[h_width..].copy_from_slice(&hidden[..(rows - 1) * h_width]);
+            }
+            lane.head.catch_up(
+                self.vk.as_ref(),
+                &prompt[chunk_start..chunk_end],
+                &shifted,
+                chunk_start,
+                work.kv().mtp_shared_weights(),
+            )?;
+            lane.last_h.copy_from_slice(&hidden[(rows - 1) * h_width..]);
+            lane.pending_id = Some(pending);
+            lane.cached
+                .extend_from_slice(&prompt[chunk_start..chunk_end]);
+        }
+        anyhow::ensure!(lane.pending_id.is_some(), "MTP prime has no frontier token");
+        work.kv
+            .as_mut()
+            .expect("MTP work has target KV")
+            .mtp_snapshot_delta(self.vk.as_ref(), cfg)?;
+        work.stats.prompt_secs += t0.elapsed().as_secs_f64();
+        work.phase = BatchPhase::Decode;
+        work.turn_checkpoint = None;
+        Ok(())
+    }
+
+    fn run_mtp_batch(&self, work: Vec<BatchWork>, req: &RequestCtx) {
+        let mut active = work;
+        loop {
+            let capacity = MAX_DECODE_BATCH.saturating_sub(active.len());
+            active.extend(self.take_pending_batch_work(capacity, false));
+            if active.is_empty() {
+                match self.refill_batch() {
+                    Some(work) => active = work,
+                    None => return,
+                }
+            }
+            for work in &mut active {
+                let was_unprepared = work.phase == BatchPhase::Unprepared;
+                if let Err(error) = self.prime_mtp_work(work, req) {
+                    self.fail_unified_scheduler(&mut active, error);
+                    return;
+                }
+                if was_unprepared {
+                    let progress = infr_core::GenerationProgress {
+                        phase: infr_core::GenerationPhase::Prefill,
+                        prompt_tokens: work.prompt_end as u64,
+                        cached_prompt_tokens: work.prefill_start as u64,
+                        prefill_tokens: (work.prompt_end - work.prefill_start) as u64,
+                        completion_tokens: 0,
+                        context_tokens: work.prompt_end as u64,
+                        context_limit: self.max_ctx as u64,
+                    };
+                    if work.channels.as_ref().is_none_or(|channels| {
+                        channels
+                            .events
+                            .send(BatchEvent::Progress { progress })
+                            .is_err()
+                    }) {
+                        work.finished = true;
+                    }
+                }
+            }
+            self.retire_finished_work(&mut active);
+            if active.is_empty() {
+                continue;
+            }
+            let fallback = (0..active.len())
+                .filter(|&index| {
+                    active[index].kv().cached_len() + crate::mtp::DRAFT_TOKENS > self.max_ctx
+                })
+                .collect::<Vec<_>>();
+            if !fallback.is_empty() {
+                if let Err(error) = self.run_token_group(&mut active, &fallback, 1) {
+                    self.fail_unified_scheduler(&mut active, error);
+                    return;
+                }
+                if let Some(heads) = &self.mtp_heads {
+                    let mut heads = heads.lock().expect("MTP heads poisoned");
+                    for &index in &fallback {
+                        heads[active[index].slot].pending_id = None;
+                    }
+                }
+                self.retire_finished_work(&mut active);
+                continue;
+            }
+            let mut indices = (0..active.len()).collect::<Vec<_>>();
+            indices.sort_by_key(|&index| active[index].slot);
+            if let Err(error) = self.run_mtp_verify_cycle(&mut active, &indices, req) {
+                self.fail_unified_scheduler(&mut active, error);
+                return;
+            }
+            let before = active.len();
+            self.retire_finished_work(&mut active);
+            if active.len() < before {
+                self.vk.release_primary_runtime_after_cohort_shrink();
+            }
+        }
+    }
+
+    fn run_mtp_verify_cycle(
+        &self,
+        active: &mut [BatchWork],
+        indices: &[usize],
+        req: &RequestCtx,
+    ) -> Result<()> {
+        let cfg = self.model.config();
+        let ec = self.model.engine_cfg();
+        let h_width = cfg.hc_mult * cfg.n_embd;
+        let rows = crate::mtp::DRAFT_TOKENS;
+        let t0 = Instant::now();
+        let (feeds, predictions) = {
+            let _gate = req.gate_pass();
+            let mut heads = self
+                .mtp_heads
+                .as_ref()
+                .expect("MTP scheduler has heads")
+                .lock()
+                .expect("MTP heads poisoned");
+            let mut feeds = Vec::with_capacity(indices.len());
+            let mut predictions = Vec::with_capacity(indices.len());
+            for &index in indices {
+                let work = &mut active[index];
+                let lane = &mut heads[work.slot];
+                let pending = lane.pending_id.expect("primed MTP lane has a frontier");
+                let candidates = lane.head.draft(
+                    self.vk.as_ref(),
+                    pending,
+                    &lane.last_h,
+                    work.kv().cached_len(),
+                    rows,
+                    work.kv().mtp_shared_weights(),
+                )?;
+                let mut feed = work.kv().cached_tokens().to_vec();
+                feed.push(pending);
+                feed.extend_from_slice(&candidates);
+                work.kv
+                    .as_mut()
+                    .expect("MTP work has target KV")
+                    .mtp_arm_delta_trace(rows)?;
+                feeds.push(feed);
+                predictions.push(candidates);
+            }
+            (feeds, predictions)
+        };
+
+        let (verify_ids, verify_hidden) = {
+            let _gate = req.gate_pass();
+            let mut primary = active[indices[0]].kv.take();
+            let mut peers = indices[1..]
+                .iter()
+                .map(|&index| active[index].kv.take().expect("MTP peer has target KV"))
+                .collect::<Vec<_>>();
+            let result = crate::seam::generate_dense_vulkan_parallel_mtp_verify_session(
+                self.vk.as_ref(),
+                self.model.gguf(),
+                cfg,
+                ec,
+                self.model.embd(),
+                &feeds,
+                &mut primary,
+                &mut peers,
+                self.max_ctx,
+            );
+            active[indices[0]].kv = primary;
+            for (&index, kv) in indices[1..].iter().zip(peers) {
+                active[index].kv = Some(kv);
+            }
+            result?
+        };
+        anyhow::ensure!(
+            verify_ids.len() == indices.len() && verify_hidden.len() == indices.len(),
+            "parallel MTP VERIFY returned inconsistent lane counts"
+        );
+        let compute_secs = t0.elapsed().as_secs_f64();
+
+        for (lane_index, &index) in indices.iter().enumerate() {
+            let work = &mut active[index];
+            let old_len = feeds[lane_index].len() - rows;
+            let ids = &verify_ids[lane_index];
+            let hidden = &verify_hidden[lane_index];
+            anyhow::ensure!(
+                ids.len() == rows && hidden.len() == rows * h_width,
+                "parallel MTP VERIFY lane {lane_index} returned incomplete rows"
+            );
+            let accepted = mtp_accepted_rows(&predictions[lane_index], ids);
+            let available = accepted.min(work.max_new.saturating_sub(work.generated));
+            let mut committed = 0usize;
+            let mut stopped = false;
+            for &token in &feeds[lane_index][old_len..old_len + available] {
+                let eos =
+                    !ec.sampling.ignore_eos && (cfg.eos_ids.contains(&token) || token == cfg.eos);
+                if eos {
+                    committed += 1;
+                    stopped = true;
+                    break;
+                }
+                let progress = self.batch_decode_progress(
+                    work.prompt_end,
+                    work.prefill_start,
+                    work.generated + committed + 1,
+                );
+                let Some(channels) = work.channels.as_ref() else {
+                    stopped = true;
+                    break;
+                };
+                if channels
+                    .events
+                    .send(BatchEvent::Token {
+                        id: token,
+                        progress,
+                    })
+                    .is_err()
+                {
+                    stopped = true;
+                    break;
+                }
+                committed += 1;
+                if !channels.acknowledgements.recv().unwrap_or(false) {
+                    stopped = true;
+                    break;
+                }
+            }
+            let restore_t0 = Instant::now();
+            {
+                let _gate = req.gate_pass();
+                let kv = work.kv.as_mut().expect("MTP lane has target KV");
+                if committed < rows {
+                    kv.mtp_restore_delta_row(self.vk.as_ref(), committed)?;
+                }
+                kv.mtp_snapshot_delta(self.vk.as_ref(), cfg)?;
+                let mut heads = self
+                    .mtp_heads
+                    .as_ref()
+                    .expect("MTP scheduler has heads")
+                    .lock()
+                    .expect("MTP heads poisoned");
+                let lane = &mut heads[work.slot];
+                lane.cached = kv.cached_tokens().to_vec();
+                if committed > 0 {
+                    lane.pending_id = Some(ids[committed - 1]);
+                    lane.last_h
+                        .copy_from_slice(&hidden[(committed - 1) * h_width..committed * h_width]);
+                }
+            }
+            work.prompt
+                .extend_from_slice(&feeds[lane_index][old_len..old_len + committed]);
+            work.generated += committed;
+            work.stats.n_gen += committed;
+            work.stats.decode_secs += compute_secs + restore_t0.elapsed().as_secs_f64();
+            work.finished = stopped || work.generated >= work.max_new;
+        }
+        Ok(())
+    }
+
     fn run_unified_batch(&self, work: Vec<BatchWork>, req: &RequestCtx) {
         let mut active = Vec::with_capacity(MAX_DECODE_BATCH);
         active.extend(work);
@@ -2173,9 +2544,18 @@ impl ParallelSeam {
         req: &RequestCtx,
         mut on_piece: impl FnMut(&str),
     ) -> Result<GenStats> {
+        let mtp_eligible = self.mtp_heads.as_ref().is_none_or(|_| {
+            let base = crate::sampling::Sampler::from_cfg(&self.model.engine_cfg().sampling);
+            let effective =
+                crate::sampling::Sampler::resolve(Some(req), &self.model.engine_cfg().sampling);
+            (base.temp <= 0.0 || base.top_k == 1)
+                && (effective.temp <= 0.0 || effective.top_k == 1)
+                && !req.sampling().penalties_active()
+        });
         let initially_eligible = self.model.config().qwen4exp
             && constraint.is_none()
             && self.gate.is_some()
+            && mtp_eligible
             && max_new > 0;
         let mut registration = initially_eligible.then(|| BatchRegistration::new(self));
         let prompt_tokens = self.model.encode(prompt)?;
@@ -2191,6 +2571,9 @@ impl ParallelSeam {
         let mut printed = 0usize;
         let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
         if !batch_candidate {
+            if let Some(heads) = &self.mtp_heads {
+                heads.lock().expect("MTP heads poisoned")[guard.idx].pending_id = None;
+            }
             let (_, stats) = crate::seam::generate_dense_vulkan_session(
                 self.vk.as_ref(),
                 self.model.gguf(),
@@ -2446,8 +2829,9 @@ impl ParallelSeam {
 #[cfg(test)]
 mod tests {
     use super::{
-        expand_multimodal_prompt, multimodal_key, phase_for_remaining_prefill, pick_continuation,
-        scheduler_mode, BatchPhase, MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
+        expand_multimodal_prompt, mtp_accepted_rows, multimodal_key, phase_for_remaining_prefill,
+        pick_continuation, scheduler_mode, BatchPhase, MultimodalEmbedding, SchedulerMode,
+        SHORT_PREFILL_TOKENS,
     };
     use std::sync::Arc;
 
@@ -2463,6 +2847,16 @@ mod tests {
             phase_for_remaining_prefill(SHORT_PREFILL_TOKENS + 1),
             BatchPhase::LongPrefill
         );
+    }
+
+    #[test]
+    fn mtp_accepts_each_lane_independently() {
+        let candidates = [11, 12, 13];
+        assert_eq!(mtp_accepted_rows(&candidates, &[99, 0, 0, 0]), 1);
+        assert_eq!(mtp_accepted_rows(&candidates, &[11, 99, 0, 0]), 2);
+        assert_eq!(mtp_accepted_rows(&candidates, &[11, 12, 99, 0]), 3);
+        assert_eq!(mtp_accepted_rows(&candidates, &[11, 12, 13, 99]), 4);
+        assert_eq!(mtp_accepted_rows(&[5, 6, 7], &[5, 6, 7, 8]), 4);
     }
 
     #[test]

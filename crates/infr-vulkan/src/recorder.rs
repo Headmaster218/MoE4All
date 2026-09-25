@@ -10249,6 +10249,22 @@ impl<'a> Recorder<'a> {
         cc: usize,
         kconv: usize,
     ) {
+        self.conv1d_silu_trace_off(qkv, w, state, state_trace, out, rows, cc, kconv, 0);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_silu_trace_off(
+        &self,
+        qkv: &dyn Buffer,
+        w: &dyn Buffer,
+        state: &dyn Buffer,
+        state_trace: &dyn Buffer,
+        out: &dyn Buffer,
+        rows: usize,
+        cc: usize,
+        kconv: usize,
+        row_off: usize,
+    ) {
         let arena_addr = w
             .device_addr()
             .expect("resident-BDA weight: conv1d_silu_trace requires a u64 BDA device address");
@@ -10272,10 +10288,10 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             kern,
             &[
-                Self::vkb(qkv),
-                Self::vkb(qkv),
+                Self::vkb_off(qkv, row_off * cc),
+                Self::vkb_off(qkv, row_off * cc),
                 Self::vkb(state),
-                Self::vkb(out),
+                Self::vkb_off(out, row_off * cc),
                 Self::vkb(state_trace),
             ],
             3,
