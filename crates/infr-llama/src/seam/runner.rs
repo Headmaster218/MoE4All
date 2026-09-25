@@ -1235,6 +1235,7 @@ struct ParallelDecodeRequest<'a> {
     samplers: &'a mut [crate::sampling::ParallelSampler],
     on_token: &'a mut dyn FnMut(usize, u32) -> bool,
     yield_requested: Option<&'a std::sync::atomic::AtomicBool>,
+    hidden: Option<&'a mut [Vec<f32>]>,
 }
 
 struct ParallelPrefillRequest<'a> {
@@ -1436,6 +1437,7 @@ pub(crate) fn generate_dense_backend_parallel_sampled(
     on_token: &mut dyn FnMut(usize, u32) -> bool,
     yield_requested: Option<&std::sync::atomic::AtomicBool>,
     req: Option<&crate::sampling::RequestCtx>,
+    capture_hidden: bool,
 ) -> AResult<ParallelSampledOutput> {
     if prompts.len() != peers.len() + 1
         || prompt_ends.len() != prompts.len()
@@ -1456,6 +1458,7 @@ pub(crate) fn generate_dense_backend_parallel_sampled(
     let mut peer_outputs = Vec::new();
     let mut prompt_secs = Vec::new();
     let mut decode_secs = Vec::new();
+    let mut hidden = capture_hidden.then(|| vec![Vec::new(); prompts.len()]);
     let mut parallel = ParallelDecodeRequest {
         prompts,
         prompt_ends,
@@ -1468,6 +1471,7 @@ pub(crate) fn generate_dense_backend_parallel_sampled(
         samplers,
         on_token,
         yield_requested,
+        hidden: hidden.as_deref_mut(),
     };
     let (first, _) = generate_dense_backend_inner(
         be,
@@ -1500,7 +1504,12 @@ pub(crate) fn generate_dense_backend_parallel_sampled(
     let mut outputs = Vec::with_capacity(prompts.len());
     outputs.push(first);
     outputs.append(&mut peer_outputs);
-    Ok((outputs, prompt_secs, decode_secs))
+    Ok(ParallelSampledOutput {
+        tokens: outputs,
+        prompt_secs,
+        decode_secs,
+        hidden: hidden.unwrap_or_default(),
+    })
 }
 
 /// Prefill independent Qwen3.8 sessions in shared layer-synchronous activation batches. Each
@@ -9222,6 +9231,17 @@ fn generate_dense_backend_inner(
                     .map_err(|e| anyhow!("{e}"))?,
             )
         };
+        let capture_hidden = parallel.hidden.is_some();
+        let hidden_width = c.hc_mult * ne;
+        let hidden_out = if capture_hidden {
+            Some(
+                be.alloc_uninit(lanes * hidden_width * 4, BufferUsage::Readback)
+                    .map_err(|e| anyhow!("{e}"))?,
+            )
+        } else {
+            None
+        };
+        let mut hidden_step = vec![0.0f32; usize::from(capture_hidden) * lanes * hidden_width];
 
         let mut curs = parallel.prompts.to_vec();
         let mut generated = vec![Vec::<u32>::with_capacity(max_new); lanes];
@@ -9390,7 +9410,7 @@ fn generate_dense_backend_inner(
                 false,
                 None,
                 false,
-                false,
+                capture_hidden,
                 batch_argmax,
                 batch_gpu_sample,
                 false,
@@ -9454,6 +9474,9 @@ fn generate_dense_backend_inner(
                     ids_out.as_ref(),
                 );
             }
+            if let (Some(id), Some(buffer)) = (h1.h_out, hidden_out.as_deref()) {
+                b1.bind(id, buffer);
+            }
             if let Some(t0) = profile_main_setup_t0 {
                 profile_main_setup += t0.elapsed();
             }
@@ -9465,6 +9488,16 @@ fn generate_dense_backend_inner(
             }
 
             let profile_tail_t0 = profile_cohort.then(std::time::Instant::now);
+            if let (Some(buffer), Some(hidden)) =
+                (hidden_out.as_deref(), parallel.hidden.as_deref_mut())
+            {
+                be.download(buffer, bytemuck::cast_slice_mut(&mut hidden_step))
+                    .map_err(|e| anyhow!("{e}"))?;
+                for (lane, rows) in hidden.iter_mut().enumerate() {
+                    let start = lane * hidden_width;
+                    rows.extend_from_slice(&hidden_step[start..start + hidden_width]);
+                }
+            }
             let mut next = vec![0u32; logits_rows];
             if batch_argmax || batch_gpu_sample {
                 be.download(ids_out.as_ref(), bytemuck::cast_slice_mut(&mut next))

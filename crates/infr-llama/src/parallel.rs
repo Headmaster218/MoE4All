@@ -49,6 +49,7 @@ const DECODE_BATCH_WAIT: Duration = Duration::from_secs(1);
 const PREFILL_COHORT_WAIT: Duration = Duration::from_millis(50);
 const MAX_DECODE_BATCH: usize = 8;
 const SHORT_PREFILL_TOKENS: usize = 96;
+const MTP_PLAIN_SYNC_QUANTUM: usize = 1024;
 
 /// One projector result handed to the text model. Kept backend-neutral so `infr-llama` does not
 /// depend on the optional vision crate.
@@ -331,6 +332,11 @@ struct MtpSlotState {
     cached: Vec<u32>,
     last_h: Vec<f32>,
     pending_id: Option<u32>,
+    /// Whether `pending_id` has already been streamed by ordinary decode. MTP still has to feed
+    /// that row into the target, but must not stream or count it a second time.
+    pending_emitted: bool,
+    /// Ordinary decode advances the live recurrent state beyond the last speculative checkpoint.
+    target_snapshot_dirty: bool,
     multimodal_key: Option<MultimodalKey>,
 }
 
@@ -736,6 +742,8 @@ impl ParallelSeam {
                     cached: Vec::new(),
                     last_h: vec![0.0; model.config().hc_mult * model.config().n_embd],
                     pending_id: None,
+                    pending_emitted: false,
+                    target_snapshot_dirty: false,
                     multimodal_key: None,
                 });
             }
@@ -1927,12 +1935,186 @@ impl ParallelSeam {
         Ok(())
     }
 
+    fn materialize_mtp_frontiers(&self, active: &mut [BatchWork], indices: &[usize]) -> Result<()> {
+        let heads = self.mtp_heads.as_ref().expect("MTP scheduler has heads");
+        for &index in indices {
+            let (pending, already_emitted) = {
+                let heads = heads.lock().expect("MTP heads poisoned");
+                let work = &active[index];
+                let lane = &heads[work.slot];
+                anyhow::ensure!(
+                    lane.cached.as_slice() == work.kv().cached_tokens(),
+                    "MTP lane {} target and head prefixes diverged before plain decode",
+                    work.slot
+                );
+                let pending = lane.pending_id.ok_or_else(|| {
+                    anyhow!("MTP lane {} has no frontier for plain decode", work.slot)
+                })?;
+                if lane.pending_emitted {
+                    anyhow::ensure!(
+                        work.prompt.len() == lane.cached.len() + 1
+                            && work.prompt.last() == Some(&pending),
+                        "MTP lane {} has an invalid emitted frontier",
+                        work.slot
+                    );
+                } else {
+                    anyhow::ensure!(
+                        work.prompt.as_slice() == lane.cached.as_slice(),
+                        "MTP lane {} has an invalid uncommitted frontier",
+                        work.slot
+                    );
+                }
+                (pending, lane.pending_emitted)
+            };
+            if already_emitted {
+                continue;
+            }
+
+            let work = &mut active[index];
+            let eos = !self.model.engine_cfg().sampling.ignore_eos
+                && (self.model.config().eos_ids.contains(&pending)
+                    || pending == self.model.config().eos);
+            let mut committed = eos;
+            let mut stopped = eos;
+            if !eos {
+                let progress = self.batch_decode_progress(
+                    work.prompt_end,
+                    work.prefill_start,
+                    work.generated + 1,
+                );
+                let Some(channels) = work.channels.as_ref() else {
+                    work.finished = true;
+                    continue;
+                };
+                if channels
+                    .events
+                    .send(BatchEvent::Token {
+                        id: pending,
+                        progress,
+                    })
+                    .is_ok()
+                {
+                    committed = true;
+                    stopped = !channels.acknowledgements.recv().unwrap_or(false);
+                } else {
+                    stopped = true;
+                }
+            }
+            if committed {
+                work.prompt.push(pending);
+                work.generated += 1;
+                work.stats.n_gen += 1;
+                heads.lock().expect("MTP heads poisoned")[work.slot].pending_emitted = true;
+            }
+            work.finished = stopped || work.generated >= work.max_new;
+        }
+        Ok(())
+    }
+
+    fn sync_mtp_after_plain_decode(
+        &self,
+        active: &[BatchWork],
+        indices: &[usize],
+        outputs: &[Vec<u32>],
+        hidden: &[Vec<f32>],
+    ) -> Result<()> {
+        let cfg = self.model.config();
+        let h_width = cfg.hc_mult * cfg.n_embd;
+        anyhow::ensure!(
+            outputs.len() == indices.len() && hidden.len() == indices.len(),
+            "plain decode returned an incomplete MTP synchronization trace"
+        );
+        let mut heads = self
+            .mtp_heads
+            .as_ref()
+            .expect("MTP scheduler has heads")
+            .lock()
+            .expect("MTP heads poisoned");
+        for (lane_index, &index) in indices.iter().enumerate() {
+            let work = &active[index];
+            let lane = &mut heads[work.slot];
+            anyhow::ensure!(
+                lane.pending_emitted,
+                "MTP lane {} entered plain decode with an unstreamed frontier",
+                work.slot
+            );
+            let target = work.kv().cached_tokens();
+            anyhow::ensure!(
+                target.starts_with(&lane.cached),
+                "MTP lane {} target no longer extends the head prefix",
+                work.slot
+            );
+            let start = lane.cached.len();
+            let rows = target.len() - start;
+            anyhow::ensure!(
+                rows > 0
+                    && outputs[lane_index].len() == rows
+                    && hidden[lane_index].len() == rows * h_width,
+                "MTP lane {} plain synchronization has rows={rows}, outputs={}, hidden={} (width {h_width})",
+                work.slot,
+                outputs[lane_index].len(),
+                hidden[lane_index].len()
+            );
+            let mut shifted = vec![0.0f32; rows * h_width];
+            shifted[..h_width].copy_from_slice(&lane.last_h);
+            if rows > 1 {
+                shifted[h_width..].copy_from_slice(&hidden[lane_index][..(rows - 1) * h_width]);
+            }
+            let catch_up_t0 = Instant::now();
+            lane.head.catch_up(
+                self.vk.as_ref(),
+                &target[start..],
+                &shifted,
+                start,
+                work.mrope_plan.as_ref(),
+                work.kv().mtp_shared_weights(),
+            )?;
+            tracing::debug!(
+                slot = work.slot,
+                rows,
+                elapsed_ms = catch_up_t0.elapsed().as_secs_f64() * 1e3,
+                "synchronized MTP head after ordinary concurrent decode"
+            );
+            lane.cached.extend_from_slice(&target[start..]);
+            lane.last_h
+                .copy_from_slice(&hidden[lane_index][(rows - 1) * h_width..]);
+            lane.pending_id = outputs[lane_index].last().copied();
+            lane.pending_emitted = true;
+            lane.target_snapshot_dirty = true;
+        }
+        Ok(())
+    }
+
+    fn refresh_mtp_snapshots(&self, active: &mut [BatchWork], indices: &[usize]) -> Result<()> {
+        let cfg = self.model.config();
+        let mut heads = self
+            .mtp_heads
+            .as_ref()
+            .expect("MTP scheduler has heads")
+            .lock()
+            .expect("MTP heads poisoned");
+        for &index in indices {
+            let work = &mut active[index];
+            let lane = &mut heads[work.slot];
+            if !lane.target_snapshot_dirty {
+                continue;
+            }
+            work.kv
+                .as_mut()
+                .expect("MTP work has target KV")
+                .mtp_snapshot_delta(self.vk.as_ref(), cfg)?;
+            lane.target_snapshot_dirty = false;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_token_group(
         &self,
         active: &mut [BatchWork],
         indices: &[usize],
         quantum: usize,
+        sync_mtp: bool,
     ) -> Result<()> {
         if indices.is_empty() {
             return Ok(());
@@ -2051,6 +2233,7 @@ impl ParallelSeam {
             &mut stream,
             Some(&self.batch_interrupt),
             Some(&group_req),
+            sync_mtp,
         );
 
         active[indices[0]].kv = primary;
@@ -2068,7 +2251,10 @@ impl ParallelSeam {
             active[index].mrope_plan = plan;
         }
 
-        let (outputs, prompt_secs, decode_secs) = result?;
+        let result = result?;
+        let outputs = result.tokens;
+        let prompt_secs = result.prompt_secs;
+        let decode_secs = result.decode_secs;
         if outputs.len() != indices.len()
             || prompt_secs.len() != indices.len()
             || decode_secs.len() != indices.len()
@@ -2076,6 +2262,9 @@ impl ParallelSeam {
             return Err(anyhow!(
                 "parallel token runner returned inconsistent lane counts"
             ));
+        }
+        if sync_mtp {
+            self.sync_mtp_after_plain_decode(active, indices, &outputs, &result.hidden)?;
         }
         let cfg = self.model.config();
         for (lane, &index) in indices.iter().enumerate() {
@@ -2162,6 +2351,8 @@ impl ParallelSeam {
             lane.cached.clear();
             lane.last_h.fill(0.0);
             lane.pending_id = None;
+            lane.pending_emitted = false;
+            lane.target_snapshot_dirty = false;
             lane.multimodal_key = None;
         }
         let start = lane.cached.len();
@@ -2215,6 +2406,7 @@ impl ParallelSeam {
             )?;
             lane.last_h.copy_from_slice(&hidden[(rows - 1) * h_width..]);
             lane.pending_id = Some(pending);
+            lane.pending_emitted = false;
             lane.cached
                 .extend_from_slice(&prompt[chunk_start..chunk_end]);
         }
@@ -2224,6 +2416,7 @@ impl ParallelSeam {
             .as_mut()
             .expect("MTP work has target KV")
             .mtp_snapshot_delta(self.vk.as_ref(), cfg)?;
+        lane.target_snapshot_dirty = false;
         work.stats.prompt_secs += t0.elapsed().as_secs_f64();
         work.phase = BatchPhase::Decode;
         work.turn_checkpoint = None;
@@ -2232,6 +2425,7 @@ impl ParallelSeam {
 
     fn run_mtp_batch(&self, work: Vec<BatchWork>, req: &RequestCtx) {
         let mut active = work;
+        let mut concurrent_plain = false;
         loop {
             let capacity = MAX_DECODE_BATCH.saturating_sub(active.len());
             active.extend(self.take_pending_batch_work(capacity, false));
@@ -2271,21 +2465,67 @@ impl ParallelSeam {
             if active.is_empty() {
                 continue;
             }
+            if active.len() > 1 {
+                if !concurrent_plain {
+                    tracing::info!(
+                        lanes = active.len(),
+                        "MTP scheduler switching concurrent decode to the ordinary batched path"
+                    );
+                    concurrent_plain = true;
+                }
+                let mut indices = (0..active.len()).collect::<Vec<_>>();
+                indices
+                    .sort_by_key(|&index| (active[index].mrope_plan.is_none(), active[index].slot));
+                if let Err(error) = self.materialize_mtp_frontiers(&mut active, &indices) {
+                    self.fail_unified_scheduler(&mut active, error);
+                    return;
+                }
+                let before = active.len();
+                self.retire_finished_work(&mut active);
+                if active.len() < before {
+                    self.vk.release_primary_runtime_after_cohort_shrink();
+                }
+                if active.len() < 2 {
+                    continue;
+                }
+                indices = (0..active.len()).collect::<Vec<_>>();
+                indices
+                    .sort_by_key(|&index| (active[index].mrope_plan.is_none(), active[index].slot));
+                if let Err(error) =
+                    self.run_token_group(&mut active, &indices, MTP_PLAIN_SYNC_QUANTUM, true)
+                {
+                    self.fail_unified_scheduler(&mut active, error);
+                    return;
+                }
+                let before = active.len();
+                self.retire_finished_work(&mut active);
+                if active.len() < before {
+                    self.vk.release_primary_runtime_after_cohort_shrink();
+                }
+                continue;
+            }
+            if concurrent_plain {
+                tracing::info!("MTP scheduler returning the surviving lane to speculative decode");
+                concurrent_plain = false;
+            }
             let fallback = (0..active.len())
                 .filter(|&index| {
                     active[index].kv().cached_len() + crate::mtp::DRAFT_TOKENS > self.max_ctx
                 })
                 .collect::<Vec<_>>();
             if !fallback.is_empty() {
-                if let Err(error) = self.run_token_group(&mut active, &fallback, 1) {
+                if let Err(error) = self.materialize_mtp_frontiers(&mut active, &fallback) {
                     self.fail_unified_scheduler(&mut active, error);
                     return;
                 }
-                if let Some(heads) = &self.mtp_heads {
-                    let mut heads = heads.lock().expect("MTP heads poisoned");
-                    for &index in &fallback {
-                        heads[active[index].slot].pending_id = None;
-                    }
+                self.retire_finished_work(&mut active);
+                if active.is_empty() {
+                    continue;
+                }
+                let fallback = (0..active.len()).collect::<Vec<_>>();
+                if let Err(error) = self.run_token_group(&mut active, &fallback, 1, true) {
+                    self.fail_unified_scheduler(&mut active, error);
+                    return;
                 }
                 self.retire_finished_work(&mut active);
                 continue;
@@ -2314,6 +2554,7 @@ impl ParallelSeam {
         let ec = self.model.engine_cfg();
         let h_width = cfg.hc_mult * cfg.n_embd;
         let rows = crate::mtp::DRAFT_TOKENS;
+        self.refresh_mtp_snapshots(active, indices)?;
         let t0 = Instant::now();
         let (feeds, predictions) = {
             let _gate = req.gate_pass();
@@ -2399,6 +2640,13 @@ impl ParallelSeam {
 
         for (lane_index, &index) in indices.iter().enumerate() {
             let work = &mut active[index];
+            let pending_emitted = self
+                .mtp_heads
+                .as_ref()
+                .expect("MTP scheduler has heads")
+                .lock()
+                .expect("MTP heads poisoned")[work.slot]
+                .pending_emitted;
             let old_len = feeds[lane_index].len() - rows;
             let ids = &verify_ids[lane_index];
             let hidden = &verify_hidden[lane_index];
@@ -2407,10 +2655,19 @@ impl ParallelSeam {
                 "parallel MTP VERIFY lane {lane_index} returned incomplete rows"
             );
             let accepted = mtp_accepted_rows(&predictions[lane_index], ids);
-            let available = accepted.min(work.max_new.saturating_sub(work.generated));
-            let mut committed = 0usize;
+            let already_emitted = usize::from(pending_emitted);
+            anyhow::ensure!(
+                already_emitted <= accepted
+                    && (!pending_emitted
+                        || (work.prompt.last() == Some(&feeds[lane_index][old_len]))),
+                "MTP lane {} lost its emitted frontier before VERIFY",
+                work.slot
+            );
+            let available = already_emitted
+                + (accepted - already_emitted).min(work.max_new.saturating_sub(work.generated));
+            let mut committed = already_emitted;
             let mut stopped = false;
-            for &token in &feeds[lane_index][old_len..old_len + available] {
+            for &token in &feeds[lane_index][old_len + already_emitted..old_len + available] {
                 let eos =
                     !ec.sampling.ignore_eos && (cfg.eos_ids.contains(&token) || token == cfg.eos);
                 if eos {
@@ -2421,7 +2678,7 @@ impl ParallelSeam {
                 let progress = self.batch_decode_progress(
                     work.prompt_end,
                     work.prefill_start,
-                    work.generated + committed + 1,
+                    work.generated + committed - already_emitted + 1,
                 );
                 let Some(channels) = work.channels.as_ref() else {
                     stopped = true;
@@ -2462,14 +2719,18 @@ impl ParallelSeam {
                 lane.cached = kv.cached_tokens().to_vec();
                 if committed > 0 {
                     lane.pending_id = Some(ids[committed - 1]);
+                    lane.pending_emitted = false;
+                    lane.target_snapshot_dirty = false;
                     lane.last_h
                         .copy_from_slice(&hidden[(committed - 1) * h_width..committed * h_width]);
                 }
             }
-            work.prompt
-                .extend_from_slice(&feeds[lane_index][old_len..old_len + committed]);
-            work.generated += committed;
-            work.stats.n_gen += committed;
+            work.prompt.extend_from_slice(
+                &feeds[lane_index][old_len + already_emitted..old_len + committed],
+            );
+            let emitted = committed - already_emitted;
+            work.generated += emitted;
+            work.stats.n_gen += emitted;
             work.stats.decode_secs += compute_secs + restore_t0.elapsed().as_secs_f64();
             work.finished = stopped || work.generated >= work.max_new;
         }
@@ -2540,7 +2801,7 @@ impl ParallelSeam {
                     std::cmp::Reverse(active[index].remaining_prefill()),
                 )
             });
-            if let Err(error) = self.run_token_group(&mut active, &indices, usize::MAX) {
+            if let Err(error) = self.run_token_group(&mut active, &indices, usize::MAX, false) {
                 self.fail_unified_scheduler(&mut active, error);
                 return;
             }
@@ -2613,7 +2874,11 @@ impl ParallelSeam {
         let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
         if !batch_candidate {
             if let Some(heads) = &self.mtp_heads {
-                heads.lock().expect("MTP heads poisoned")[guard.idx].pending_id = None;
+                let mut heads = heads.lock().expect("MTP heads poisoned");
+                let lane = &mut heads[guard.idx];
+                lane.pending_id = None;
+                lane.pending_emitted = false;
+                lane.target_snapshot_dirty = false;
             }
             let (_, stats) = crate::seam::generate_dense_vulkan_session(
                 self.vk.as_ref(),
@@ -2827,8 +3092,11 @@ impl ParallelSeam {
         }
         if let Some(heads) = &self.mtp_heads {
             let mut heads = heads.lock().expect("MTP heads poisoned");
-            heads[guard.idx].pending_id = None;
-            heads[guard.idx].multimodal_key = None;
+            let lane = &mut heads[guard.idx];
+            lane.pending_id = None;
+            lane.pending_emitted = false;
+            lane.target_snapshot_dirty = false;
+            lane.multimodal_key = None;
         }
         let frontier = prompt_tokens.len().saturating_sub(1);
         let frontier_is_image = plan.spans.iter().any(|span| {

@@ -1213,12 +1213,9 @@ impl Qwen4MtpSession {
         }
         if let Some(plan) = mrope {
             anyhow::ensure!(
-                plan.prompt_pos4.len().is_multiple_of(4)
-                    && start_pos + tokens.len() <= plan.prompt_pos4.len() / 4,
-                "Qwen3.8 MTP catch-up range {}..{} exceeds the multimodal position table's {} rows",
-                start_pos,
-                start_pos + tokens.len(),
-                plan.prompt_pos4.len() / 4,
+                plan.prompt_pos4.len().is_multiple_of(4),
+                "Qwen3.8 MTP multimodal position table has {} values",
+                plan.prompt_pos4.len(),
             );
             anyhow::ensure!(
                 self.cfg.rope_sections.iter().sum::<u32>() > 0,
@@ -1236,13 +1233,32 @@ impl Qwen4MtpSession {
                 .iter()
                 .map(|&token| token as i32)
                 .collect::<Vec<_>>();
-            let positions = if let Some(plan) = mrope {
-                plan.prompt_pos4[pos * 4..(pos + rows) * 4]
-                    .chunks_exact(4)
-                    .map(|row| row[0])
-                    .collect::<Vec<_>>()
+            let positions4 = if let Some(plan) = mrope {
+                let prompt_rows = plan.prompt_pos4.len() / 4;
+                (pos..pos + rows)
+                    .map(|position| {
+                        if position < prompt_rows {
+                            Ok(plan.prompt_pos4[position * 4..position * 4 + 4]
+                                .try_into()
+                                .expect("MRoPE row has four positions"))
+                        } else {
+                            let offset = i32::try_from(position - prompt_rows)
+                                .map_err(|_| anyhow!("Qwen3.8 MTP decode position exceeds i32"))?;
+                            let position = plan
+                                .decode_base
+                                .checked_add(offset)
+                                .ok_or_else(|| anyhow!("Qwen3.8 MTP decode position overflow"))?;
+                            Ok([position, position, position, 0])
+                        }
+                    })
+                    .collect::<Result<Vec<[i32; 4]>>>()?
             } else {
+                Vec::new()
+            };
+            let positions = if positions4.is_empty() {
                 (pos as i32..(pos + rows) as i32).collect::<Vec<_>>()
+            } else {
+                positions4.iter().map(|row| row[0]).collect::<Vec<_>>()
             };
             let mut override_ranges = Vec::new();
             let mut override_values = Vec::new();
@@ -1280,10 +1296,10 @@ impl Qwen4MtpSession {
                 bytemuck::cast_slice(&positions),
             )
             .map_err(|e| anyhow!("{e}"))?;
-            if let Some(plan) = mrope {
+            if mrope.is_some() {
                 be.upload(
                     self.catch_positions4.as_ref(),
-                    bytemuck::cast_slice(&plan.prompt_pos4[pos * 4..(pos + rows) * 4]),
+                    bytemuck::cast_slice(&positions4),
                 )
                 .map_err(|e| anyhow!("{e}"))?;
             }
