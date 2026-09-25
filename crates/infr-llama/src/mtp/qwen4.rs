@@ -471,6 +471,7 @@ fn emit_bridge(
     h_in: TensorId,
     weights: &GraphW,
     scratch: &StepScratch,
+    embedding_overrides: Option<(TensorId, &[(usize, usize)])>,
 ) {
     let ne = cfg.n_embd;
     let hcw = cfg.hc_mult * ne;
@@ -482,6 +483,22 @@ fn emit_bridge(
         ne: ne as u32,
         scale: 1.0,
     });
+    if let Some((source, ranges)) = embedding_overrides {
+        let mut source_row = 0usize;
+        for &(row_start, range_rows) in ranges {
+            g.push(Op::CopyStrided {
+                src: source,
+                src_off: (source_row * ne) as u32,
+                src_stride: ne as u32,
+                dst: scratch.e,
+                dst_off: (row_start * ne) as u32,
+                dst_stride: ne as u32,
+                rows: range_rows as u32,
+                n: ne as u32,
+            });
+            source_row += range_rows;
+        }
+    }
     g.push(Op::RmsNorm {
         x: scratch.e,
         weight: weights.enorm,
@@ -545,6 +562,7 @@ fn emit_attention_kv(
     rows: usize,
     start_pos: usize,
     positions: TensorId,
+    positions4: Option<TensorId>,
     k_cache: TensorId,
     v_cache: TensorId,
     weights: &GraphW,
@@ -598,20 +616,37 @@ fn emit_attention_kv(
         out_f: kvrow as u32,
         w_off: 0,
     });
-    g.push(Op::QkNormRope {
-        x: scratch.k,
-        weight: weights.k_norm,
-        positions,
-        dst: scratch.k16,
-        rows: rows as u32,
-        n_head: cfg.n_kv as u32,
-        head_dim: cfg.head_dim as u32,
-        rope_dim: cfg.rope_dim as u32,
-        theta: cfg.rope_theta,
-        eps: cfg.rms_eps,
-        freq_factors: None,
-        x_stride: 0,
-    });
+    if let Some(positions4) = positions4 {
+        g.push(Op::QkNormMrope {
+            x: scratch.k,
+            weight: weights.k_norm,
+            positions4,
+            dst: scratch.k16,
+            rows: rows as u32,
+            n_head: cfg.n_kv as u32,
+            head_dim: cfg.head_dim as u32,
+            rope_dim: cfg.rope_dim as u32,
+            theta: cfg.rope_theta,
+            eps: cfg.rms_eps,
+            sections: cfg.rope_sections,
+            x_stride: 0,
+        });
+    } else {
+        g.push(Op::QkNormRope {
+            x: scratch.k,
+            weight: weights.k_norm,
+            positions,
+            dst: scratch.k16,
+            rows: rows as u32,
+            n_head: cfg.n_kv as u32,
+            head_dim: cfg.head_dim as u32,
+            rope_dim: cfg.rope_dim as u32,
+            theta: cfg.rope_theta,
+            eps: cfg.rms_eps,
+            freq_factors: None,
+            x_stride: 0,
+        });
+    }
     g.push(Op::WriteKv {
         src: scratch.k16,
         cache: k_cache,
@@ -645,7 +680,7 @@ fn emit_full_step(
     let qrow = cfg.n_head * cfg.head_dim;
     let moe = cfg.moe.expect("validated Qwen3.8 MoE config");
     emit_attention_kv(
-        g, cfg, 1, start_pos, positions, k_cache, v_cache, weights, scratch, true,
+        g, cfg, 1, start_pos, positions, None, k_cache, v_cache, weights, scratch, true,
     );
     g.push(Op::QkNormRope {
         x: scratch.qg,
@@ -821,6 +856,8 @@ struct CatchHandles {
     ids: TensorId,
     h: TensorId,
     positions: TensorId,
+    positions4: Option<TensorId>,
+    embedding_overrides: Option<TensorId>,
     k_cache: TensorId,
     v_cache: TensorId,
     weights: Vec<TensorId>,
@@ -835,6 +872,8 @@ fn build_catch_graph(
     max_ctx: usize,
     rows: usize,
     start_pos: usize,
+    embedding_overrides: &[(usize, usize)],
+    mrope: bool,
 ) -> (Graph, CatchHandles) {
     let mut g = Graph::new();
     let hcw = cfg.hc_mult * cfg.n_embd;
@@ -842,13 +881,34 @@ fn build_catch_graph(
     let ids = g.input(TensorDesc::new(vec![rows], DType::I32));
     let h = g.input(TensorDesc::new(vec![rows * hcw], DType::F32));
     let positions = g.input(TensorDesc::new(vec![rows], DType::I32));
+    let positions4 = mrope.then(|| g.input(TensorDesc::new(vec![rows, 4], DType::I32)));
+    let override_rows = embedding_overrides
+        .iter()
+        .map(|&(_, range_rows)| range_rows)
+        .sum::<usize>();
+    let embedding_override_input = (override_rows > 0).then(|| {
+        g.input(TensorDesc::new(
+            vec![override_rows * cfg.n_embd],
+            DType::F32,
+        ))
+    });
     let k_cache = g.input(TensorDesc::new(vec![max_ctx * kvrow], DType::F16));
     let v_cache = g.input(TensorDesc::new(vec![max_ctx * kvrow], DType::F16));
     let (weights, handles) = declare_weights(&mut g, specs, shared[0], shared[1]);
     let scratch = step_scratch(&mut g, cfg, rows);
-    emit_bridge(&mut g, cfg, rows, ids, h, &weights, &scratch);
+    emit_bridge(
+        &mut g,
+        cfg,
+        rows,
+        ids,
+        h,
+        &weights,
+        &scratch,
+        embedding_override_input.map(|input| (input, embedding_overrides)),
+    );
     emit_attention_kv(
-        &mut g, cfg, rows, start_pos, positions, k_cache, v_cache, &weights, &scratch, false,
+        &mut g, cfg, rows, start_pos, positions, positions4, k_cache, v_cache, &weights, &scratch,
+        false,
     );
     (
         g,
@@ -856,6 +916,8 @@ fn build_catch_graph(
             ids,
             h,
             positions,
+            positions4,
+            embedding_overrides: embedding_override_input,
             k_cache,
             v_cache,
             weights: handles,
@@ -902,7 +964,7 @@ fn build_draft_graph(
     let mut prev_h = h;
     let mut out_ids = Vec::with_capacity(steps.saturating_sub(1));
     for (step, &position) in positions.iter().enumerate() {
-        emit_bridge(&mut g, cfg, 1, prev_id, prev_h, &weights, &scratch);
+        emit_bridge(&mut g, cfg, 1, prev_id, prev_h, &weights, &scratch, None);
         let h_next = g.internal(f32d(hcw));
         emit_full_step(
             &mut g,
@@ -990,6 +1052,8 @@ pub(crate) struct Qwen4MtpSession {
     catch_ids: Box<dyn Buffer>,
     catch_h: Box<dyn Buffer>,
     catch_positions: Box<dyn Buffer>,
+    catch_positions4: Box<dyn Buffer>,
+    catch_embedding_overrides: Box<dyn Buffer>,
     draft_id: Box<dyn Buffer>,
     draft_h: Box<dyn Buffer>,
     draft_positions: [Box<dyn Buffer>; DRAFT_TOKENS],
@@ -1073,6 +1137,8 @@ impl Qwen4MtpSession {
         let catch_ids = alloc(max_batch * 4, BufferUsage::Staging)?;
         let catch_h = alloc(max_batch * hcw * 4, BufferUsage::Staging)?;
         let catch_positions = alloc(max_batch * 4, BufferUsage::Staging)?;
+        let catch_positions4 = alloc(max_batch * 4 * 4, BufferUsage::Staging)?;
+        let catch_embedding_overrides = alloc(max_batch * cfg.n_embd * 4, BufferUsage::Staging)?;
         let draft_id = alloc(4, BufferUsage::Staging)?;
         let draft_h = alloc(hcw * 4, BufferUsage::Staging)?;
         let draft_positions = [
@@ -1103,6 +1169,8 @@ impl Qwen4MtpSession {
             catch_ids,
             catch_h,
             catch_positions,
+            catch_positions4,
+            catch_embedding_overrides,
             draft_id,
             draft_h,
             draft_positions,
@@ -1132,6 +1200,7 @@ impl Qwen4MtpSession {
         tokens: &[u32],
         h: &[f32],
         start_pos: usize,
+        mrope: Option<&crate::seam::MropePlan>,
         shared: SharedWeights<'_>,
     ) -> Result<()> {
         let hcw = self.cfg.hc_mult * self.cfg.n_embd;
@@ -1140,6 +1209,20 @@ impl Qwen4MtpSession {
                 "Qwen3.8 MTP catch-up got {} hidden values for {} tokens (width {hcw})",
                 h.len(),
                 tokens.len()
+            );
+        }
+        if let Some(plan) = mrope {
+            anyhow::ensure!(
+                plan.prompt_pos4.len().is_multiple_of(4)
+                    && start_pos + tokens.len() <= plan.prompt_pos4.len() / 4,
+                "Qwen3.8 MTP catch-up range {}..{} exceeds the multimodal position table's {} rows",
+                start_pos,
+                start_pos + tokens.len(),
+                plan.prompt_pos4.len() / 4,
+            );
+            anyhow::ensure!(
+                self.cfg.rope_sections.iter().sum::<u32>() > 0,
+                "Qwen3.8 MTP multimodal RoPE sections are empty"
             );
         }
         for (chunk, token_rows) in tokens.chunks(self.max_batch).enumerate() {
@@ -1153,7 +1236,38 @@ impl Qwen4MtpSession {
                 .iter()
                 .map(|&token| token as i32)
                 .collect::<Vec<_>>();
-            let positions = (pos as i32..(pos + rows) as i32).collect::<Vec<_>>();
+            let positions = if let Some(plan) = mrope {
+                plan.prompt_pos4[pos * 4..(pos + rows) * 4]
+                    .chunks_exact(4)
+                    .map(|row| row[0])
+                    .collect::<Vec<_>>()
+            } else {
+                (pos as i32..(pos + rows) as i32).collect::<Vec<_>>()
+            };
+            let mut override_ranges = Vec::new();
+            let mut override_values = Vec::new();
+            if let Some(plan) = mrope {
+                for (index, span) in plan.spans.iter().enumerate() {
+                    let span_end = span.start.checked_add(span.n_tokens).ok_or_else(|| {
+                        anyhow!("Qwen3.8 MTP image span #{index} overflows token indices")
+                    })?;
+                    anyhow::ensure!(
+                        span.embeds.len() == span.n_tokens * self.cfg.n_embd,
+                        "Qwen3.8 MTP image span #{index} has {} embedding values, expected {}",
+                        span.embeds.len(),
+                        span.n_tokens * self.cfg.n_embd,
+                    );
+                    let lo = span.start.max(pos);
+                    let hi = span_end.min(pos + rows);
+                    if lo >= hi {
+                        continue;
+                    }
+                    let source_start = (lo - span.start) * self.cfg.n_embd;
+                    let source_end = (hi - span.start) * self.cfg.n_embd;
+                    override_ranges.push((lo - pos, hi - lo));
+                    override_values.extend_from_slice(&span.embeds[source_start..source_end]);
+                }
+            }
             be.upload(self.catch_ids.as_ref(), bytemuck::cast_slice(&ids))
                 .map_err(|e| anyhow!("{e}"))?;
             be.upload(
@@ -1166,14 +1280,42 @@ impl Qwen4MtpSession {
                 bytemuck::cast_slice(&positions),
             )
             .map_err(|e| anyhow!("{e}"))?;
+            if let Some(plan) = mrope {
+                be.upload(
+                    self.catch_positions4.as_ref(),
+                    bytemuck::cast_slice(&plan.prompt_pos4[pos * 4..(pos + rows) * 4]),
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+            }
+            if !override_values.is_empty() {
+                be.upload(
+                    self.catch_embedding_overrides.as_ref(),
+                    bytemuck::cast_slice(&override_values),
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+            }
             let specs = [(shared.0 .1, shared.0 .2), (shared.1 .1, shared.1 .2)];
-            let (graph, handles) =
-                build_catch_graph(&self.cfg, &self.fixed.specs, specs, self.max_ctx, rows, pos);
+            let (graph, handles) = build_catch_graph(
+                &self.cfg,
+                &self.fixed.specs,
+                specs,
+                self.max_ctx,
+                rows,
+                pos,
+                &override_ranges,
+                mrope.is_some(),
+            );
             let plan = be.compile(&graph).map_err(|e| anyhow!("{e}"))?;
             let mut bindings = Bindings::new();
             bindings.bind(handles.ids, self.catch_ids.as_ref());
             bindings.bind(handles.h, self.catch_h.as_ref());
             bindings.bind(handles.positions, self.catch_positions.as_ref());
+            if let Some(id) = handles.positions4 {
+                bindings.bind(id, self.catch_positions4.as_ref());
+            }
+            if let Some(id) = handles.embedding_overrides {
+                bindings.bind(id, self.catch_embedding_overrides.as_ref());
+            }
             bindings.bind(handles.k_cache, self.k_cache.as_ref());
             bindings.bind(handles.v_cache, self.v_cache.as_ref());
             self.bind_common(
@@ -1196,6 +1338,7 @@ impl Qwen4MtpSession {
         token: u32,
         h: &[f32],
         start_pos: usize,
+        rope_start_pos: i32,
         verify_tokens: usize,
         shared: SharedWeights<'_>,
     ) -> Result<Vec<u32>> {
@@ -1218,11 +1361,13 @@ impl Qwen4MtpSession {
         be.upload(self.draft_h.as_ref(), bytemuck::cast_slice(h))
             .map_err(|e| anyhow!("{e}"))?;
         for (step, buffer) in self.draft_positions[..verify_tokens].iter().enumerate() {
-            be.upload(
-                buffer.as_ref(),
-                bytemuck::bytes_of(&((start_pos + step) as i32)),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
+            let step = i32::try_from(step)
+                .map_err(|_| anyhow!("Qwen3.8 MTP draft position exceeds i32"))?;
+            let position = rope_start_pos
+                .checked_add(step)
+                .ok_or_else(|| anyhow!("Qwen3.8 MTP draft position overflow"))?;
+            be.upload(buffer.as_ref(), bytemuck::bytes_of(&position))
+                .map_err(|e| anyhow!("{e}"))?;
         }
         let specs = [(shared.0 .1, shared.0 .2), (shared.1 .1, shared.1 .2)];
         let (graph, handles) = build_draft_graph(
@@ -1364,6 +1509,7 @@ impl Qwen4MtpRuntime {
                 &prompt_tokens[..chunk_end],
                 &mut self.trunk,
                 self.max_ctx,
+                None,
                 finish,
             )?;
             anyhow::ensure!(
@@ -1388,6 +1534,7 @@ impl Qwen4MtpRuntime {
                     &prompt_tokens[chunk_start..chunk_end],
                     &shifted_h,
                     chunk_start,
+                    None,
                     shared,
                 )?;
             }
@@ -1429,8 +1576,16 @@ impl Qwen4MtpRuntime {
                     .as_ref()
                     .expect("target trunk remains initialized")
                     .mtp_shared_weights();
-                self.head
-                    .draft(vk, pending_token, &pending_h, n_past, verify_tokens, shared)?
+                self.head.draft(
+                    vk,
+                    pending_token,
+                    &pending_h,
+                    n_past,
+                    i32::try_from(n_past)
+                        .map_err(|_| anyhow!("Qwen3.8 MTP position exceeds i32"))?,
+                    verify_tokens,
+                    shared,
+                )?
             };
             let draft_secs = t_draft.elapsed().as_secs_f64();
             timing.draft_secs += draft_secs;

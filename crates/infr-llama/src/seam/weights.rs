@@ -397,8 +397,10 @@ pub(crate) struct SeamKv {
     pub(super) ple_embd_buf: Option<Box<dyn Buffer>>,
     /// Persistent PLE dilated-convolution history (9 x hc*n_embd f32 on the released model).
     pub(super) ple_state_buf: Option<Box<dyn Buffer>>,
-    /// Fixed four-row Qwen3.8 MTP VERIFY IO. These buffers are allocated before the deferred
-    /// Vulkan pager measures the remaining room, then replayed by every speculative cycle.
+    /// Fixed Qwen3.8 MTP VERIFY IO. A single slot needs four rows; parallel serving reserves the
+    /// whole four-rows-per-lane cohort so whichever slot becomes the primary can own the graph.
+    /// These buffers are allocated before the deferred Vulkan pager measures the remaining room,
+    /// then replayed by every speculative cycle.
     pub(super) mtp_verify_bufs: Option<QwenMtpVerifyBuffers>,
     /// The context this slot's KV cache was ACTUALLY allocated for. Usually the `want_ctx` the
     /// caller asked for; smaller when the cold init's live-room re-clamp shrank it (see
@@ -465,6 +467,7 @@ pub(crate) struct SeamKv {
 pub(super) struct QwenMtpVerifyBuffers {
     pub(super) ids: Box<dyn Buffer>,
     pub(super) positions: Box<dyn Buffer>,
+    pub(super) positions4: Box<dyn Buffer>,
     pub(super) hidden: Box<dyn Buffer>,
     pub(super) wide: Box<dyn Buffer>,
     pub(super) ple: Box<dyn Buffer>,
@@ -475,7 +478,15 @@ pub(super) struct QwenMtpVerifyBuffers {
 
 impl QwenMtpVerifyBuffers {
     pub(super) fn allocate(be: &dyn Backend, cfg: &Config) -> AResult<Self> {
-        Self::allocate_rows(be, cfg, crate::mtp::DRAFT_TOKENS)
+        Self::allocate_rows(
+            be,
+            cfg,
+            crate::mtp::DRAFT_TOKENS * super::placement_slots() as usize,
+        )
+    }
+
+    fn rows(&self) -> usize {
+        self.ids.len_bytes() / std::mem::size_of::<u32>()
     }
 
     pub(super) fn allocate_rows(be: &dyn Backend, cfg: &Config, rows: usize) -> AResult<Self> {
@@ -485,6 +496,7 @@ impl QwenMtpVerifyBuffers {
         Ok(Self {
             ids: alloc(rows * 4, BufferUsage::Staging)?,
             positions: alloc(rows * 4, BufferUsage::Staging)?,
+            positions4: alloc(rows * 4 * 4, BufferUsage::Staging)?,
             hidden: be
                 .alloc_uninit(rows * cfg.n_embd * 4, BufferUsage::Activations)
                 .map_err(|e| anyhow!("{e}"))?,
@@ -1552,7 +1564,10 @@ impl SeamKv {
         let mtp_verify_bufs = self
             .mtp_verify_bufs
             .as_ref()
-            .map(|_| QwenMtpVerifyBuffers::allocate(be, cfg))
+            // Parallel MTP sorts a visual lane first so that lane owns the MRoPE bindings. That
+            // lane is not necessarily slot 0, therefore every fork must preserve the root slot's
+            // full-cohort capacity rather than falling back to the per-lane four-row default.
+            .map(|source| QwenMtpVerifyBuffers::allocate_rows(be, cfg, source.rows()))
             .transpose()?;
         Ok(SeamKv {
             weights: std::sync::Arc::clone(&self.weights),
