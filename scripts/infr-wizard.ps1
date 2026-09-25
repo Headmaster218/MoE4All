@@ -772,10 +772,10 @@ if ($launchMode -eq 'benchmark') {
         $seed = Read-IntegerValue -Label '随机种子，留空为随机 / Seed, blank for random' -Default $seed -Minimum 0 -AllowBlank
     }
 
-    $mtpEnabled = Read-YesNo -Label '启用 Qwen3.8 MTP 单路加速？/ Enable Qwen3.8 MTP single-stream acceleration?' -Default $mtpEnabled
+    $mtpEnabled = Read-YesNo -Label '启用 Qwen3.8 MTP 加速？/ Enable Qwen3.8 MTP acceleration?' -Default $mtpEnabled
     if ($mtpEnabled) {
-        Write-Host 'MTP 当前仅支持 Qwen3.8 Vulkan、greedy 解码和单并发；API 请求指定非零 temperature 时会自动回退普通 decode。' -ForegroundColor Yellow
-        Write-Host 'MTP currently supports Qwen3.8 Vulkan, greedy decoding and one request at a time. API requests with non-zero temperature fall back to ordinary decode.' -ForegroundColor DarkGray
+        Write-Host 'MTP 当前仅支持 Qwen3.8 Vulkan 和 greedy 解码；非 greedy API 请求会回退普通 decode。' -ForegroundColor Yellow
+        Write-Host 'MTP currently supports Qwen3.8 Vulkan and greedy decoding. Non-greedy API requests fall back to ordinary decode.' -ForegroundColor DarkGray
         $mtpModelPath = Select-MtpModelPath -Default $mtpModelPath
         $mtpVerifyTokens = Read-Choice -Label 'MTP 批量验证宽度 / MTP batched verification width' -DefaultValue $mtpVerifyTokens -Options @(
             [pscustomobject]@{ Key = '1'; Value = '4'; Label = '4 tokens（推荐）/ 4 tokens (recommended)' }
@@ -790,12 +790,22 @@ if ($launchMode -eq 'benchmark') {
         Write-Host 'Use 127.0.0.1 locally. For LAN access use 0.0.0.0 and enable an API key.' -ForegroundColor DarkGray
         $serverAddr = Read-ListenAddress -Label '监听地址（IP:端口）/ Listen address (IP:port)' -Default $serverAddr
         if ($mtpEnabled) {
-            $serverParallel = '1'
-            $serverSessionCache = $false
-            Write-Host 'MTP v1 使用串行单会话服务；并发数固定为 1，SSD 会话 KV 缓存关闭。' -ForegroundColor Yellow
-            Write-Host 'MTP v1 uses the serialized single-session server; parallelism is fixed at 1 and the SSD session cache is disabled.' -ForegroundColor DarkGray
+            $mtpParallelDefault = if ($serverParallel -eq '2') { '2' } else { '1' }
+            $serverParallel = Read-Choice -Label 'MTP 并发会话数 / MTP concurrent slots' -DefaultValue $mtpParallelDefault -Options @(
+                [pscustomobject]@{ Key = '1'; Value = '1'; Label = '单路 / Single stream' }
+                [pscustomobject]@{ Key = '2'; Value = '2'; Label = '双路 / Two concurrent streams' }
+            )
+            if ($serverParallel -eq '2' -and $mtpVerifyTokens -ne '4') {
+                $mtpVerifyTokens = '4'
+                Write-Host '双路 MTP 固定使用 4-token 验证。Two-stream MTP uses fixed 4-token verification.' -ForegroundColor Yellow
+            }
         } else {
             $serverParallel = Read-IntegerValue -Label '并发会话数（每个会话有独立 KV）/ Concurrent slots (one KV cache each)' -Default $serverParallel -Minimum 1
+        }
+        if ($mtpEnabled -and $serverParallel -eq '1') {
+            $serverSessionCache = $false
+            Write-Host '单路 MTP 沿用串行服务，SSD 会话 KV 缓存关闭。Single-stream MTP keeps the serialized server and disables SSD session caching.' -ForegroundColor DarkGray
+        } else {
             $serverSessionCache = Read-YesNo -Label '将闲置会话 KV 缓存到 SSD？/ Cache idle-session KV on SSD?' -Default $serverSessionCache
             if ($serverSessionCache) {
                 Write-Host '闲置会话会在后台写入 SSD 并释放显存；再次访问时自动恢复。仅支持动态分段 Q8 KV。' -ForegroundColor DarkGray
@@ -810,8 +820,8 @@ if ($launchMode -eq 'benchmark') {
         if ($mtpEnabled) {
             $serverVision = $false
             $serverEmbedding = $false
-            Write-Host 'MTP v1 暂不与视觉或同进程 Embedding API 同时启用。' -ForegroundColor Yellow
-            Write-Host 'MTP v1 cannot currently be combined with vision or the in-process Embedding API.' -ForegroundColor DarkGray
+            Write-Host 'MTP 暂不与视觉或同进程 Embedding API 同时启用。' -ForegroundColor Yellow
+            Write-Host 'MTP cannot currently be combined with vision or the in-process Embedding API.' -ForegroundColor DarkGray
         } else {
             $serverVision = Read-YesNo -Label '启用视觉图片理解？/ Enable image understanding?' -Default $serverVision
             if ($serverVision) {
