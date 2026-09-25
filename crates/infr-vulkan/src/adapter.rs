@@ -5787,9 +5787,23 @@ fn lower_op(
         } => {
             if let Some(trace) = state_trace {
                 if graph.independent_rows {
-                    return Err(be(
-                        "recurrent state tracing does not support independent rows",
-                    ));
+                    let spans = sequence_spans(graph, *rows as usize)?;
+                    let states = resolve_rows(bindings, *state, spans.len())?;
+                    let traces = resolve_rows(bindings, *trace, spans.len())?;
+                    for ((span, &state), &trace) in spans.iter().zip(states).zip(traces) {
+                        rec.conv1d_silu_trace_off(
+                            r(*x)?,
+                            r(*weight)?,
+                            state,
+                            trace,
+                            r(*dst)?,
+                            span.rows as usize,
+                            *channels as usize,
+                            *kernel as usize,
+                            span.row_start as usize,
+                        );
+                    }
+                    return Ok(());
                 }
                 rec.conv1d_silu_trace(
                     r(*x)?,
@@ -5909,8 +5923,7 @@ fn lower_op(
                 *head_v as usize,
             );
             if let Some(trace) = state_trace {
-                if graph.independent_rows
-                    || rows_ < 2
+                if rows_ < 2
                     || !be_.cfg().kernels.vulkan.dn_chunk
                     || kd_ != 128
                     || !vd_.is_multiple_of(crate::recorder::DN_SEQ_NCOL)
@@ -5925,6 +5938,57 @@ fn lower_op(
                 let qn = pooled(pool, be_, "dn_seq_qn", rows_ * nk_ * kd_ * 4)?;
                 let bet = pooled(pool, be_, "dn_seq_bet", rows_ * nv_ * 4)?;
                 let dec = pooled(pool, be_, "dn_seq_dec", rows_ * nv_ * 4)?;
+                if graph.independent_rows {
+                    let spans = sequence_spans(graph, rows_)?;
+                    let states = resolve_rows(bindings, *state, spans.len())?;
+                    let traces = resolve_rows(bindings, *trace, spans.len())?;
+                    let qkv_stride = 2 * nk_ * kd_ + nv_ * vd_;
+                    let strided = *q == *k && *k == *v && be_.cfg().kernels.vulkan.delta_strided;
+                    for ((span, &state), &trace) in spans.iter().zip(states).zip(traces) {
+                        let row = span.row_start as usize;
+                        let count = span.rows as usize;
+                        if count < 2 {
+                            return Err(be(
+                                "MTP independent trace needs at least two rows per lane",
+                            ));
+                        }
+                        let q_off = if strided {
+                            row * qkv_stride
+                        } else {
+                            row * nk_ * kd_
+                        };
+                        let v_off = if strided { q_off } else { row * nv_ * vd_ };
+                        rec.deltanet_seq_split_off(
+                            r(*q)?,
+                            r(*k)?,
+                            r(*v)?,
+                            r(*b)?,
+                            r(*a)?,
+                            r(*a_coef)?,
+                            r(*dt_bias)?,
+                            state,
+                            r(*dst)?,
+                            pool[&kn].as_ref(),
+                            pool[&qn].as_ref(),
+                            pool[&bet].as_ref(),
+                            pool[&dec].as_ref(),
+                            count,
+                            nv_,
+                            nk_,
+                            kd_,
+                            vd_,
+                            *eps,
+                            q_off,
+                            q_off,
+                            v_off,
+                            row * nv_,
+                            row * nv_,
+                            row * nv_ * vd_,
+                            Some(trace),
+                        );
+                    }
+                    return Ok(());
+                }
                 rec.deltanet_seq_split_off(
                     r(*q)?,
                     r(*k)?,

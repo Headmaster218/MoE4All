@@ -473,6 +473,32 @@ pub(super) struct QwenMtpVerifyBuffers {
     pub(super) out_ids: Box<dyn Buffer>,
 }
 
+impl QwenMtpVerifyBuffers {
+    pub(super) fn allocate(be: &dyn Backend, cfg: &Config) -> AResult<Self> {
+        Self::allocate_rows(be, cfg, crate::mtp::DRAFT_TOKENS)
+    }
+
+    pub(super) fn allocate_rows(be: &dyn Backend, cfg: &Config, rows: usize) -> AResult<Self> {
+        let h_width = cfg.hc_mult * cfg.n_embd;
+        let ple_row = (cfg.ple_ngram_size - 1) * cfg.ple_heads_per_ngram * cfg.ple_head_dim;
+        let alloc = |bytes, usage| be.alloc(bytes, usage).map_err(|e| anyhow!("{e}"));
+        Ok(Self {
+            ids: alloc(rows * 4, BufferUsage::Staging)?,
+            positions: alloc(rows * 4, BufferUsage::Staging)?,
+            hidden: be
+                .alloc_uninit(rows * cfg.n_embd * 4, BufferUsage::Activations)
+                .map_err(|e| anyhow!("{e}"))?,
+            wide: be
+                .alloc_uninit(rows * h_width * 4, BufferUsage::Activations)
+                .map_err(|e| anyhow!("{e}"))?,
+            ple: alloc(rows * ple_row * 4, BufferUsage::Staging)?,
+            logits: alloc(rows * cfg.vocab * 4, BufferUsage::Staging)?,
+            h_out: alloc(rows * h_width * 4, BufferUsage::Readback)?,
+            out_ids: alloc(rows * 4, BufferUsage::Readback)?,
+        })
+    }
+}
+
 #[derive(Default)]
 pub(super) struct SegmentedKvState {
     pub(super) enabled: bool,
@@ -610,6 +636,24 @@ pub(super) struct MtpDeltaCkpt {
 }
 
 impl MtpDeltaCkpt {
+    fn allocate_for_fork(
+        be: &dyn Backend,
+        cfg: &Config,
+        src_k: &[Box<dyn Buffer>],
+        src_v: &[Box<dyn Buffer>],
+        src_ple: Option<&dyn Buffer>,
+        trace_rows: usize,
+    ) -> AResult<Option<Self>> {
+        Self::allocate_sized(
+            be,
+            cfg,
+            |layer| Some(src_k[layer].len_bytes()),
+            |layer| Some(src_v[layer].len_bytes()),
+            src_ple.map(Buffer::len_bytes),
+            trace_rows,
+        )
+    }
+
     pub(super) fn allocate_before_dynamic_kv(
         be: &dyn Backend,
         cfg: &Config,
@@ -1032,6 +1076,10 @@ impl SeamKv {
     /// Number of token ids materialized in this slot's KV cache.
     pub(crate) fn cached_len(&self) -> usize {
         self.cached.len()
+    }
+
+    pub(crate) fn cached_tokens(&self) -> &[u32] {
+        &self.cached
     }
 
     /// Forget the materialized tokens (the KV rows become dead; the next prompt prefills from
@@ -1489,6 +1537,23 @@ impl SeamKv {
                 &[],
             )?;
         }
+        let mtp_delta_ckpt = if self.mtp_delta_ckpt.is_some() {
+            MtpDeltaCkpt::allocate_for_fork(
+                be,
+                cfg,
+                &kbufs,
+                &vbufs,
+                ple_state_buf.as_deref(),
+                crate::mtp::DRAFT_TOKENS.saturating_sub(1),
+            )?
+        } else {
+            None
+        };
+        let mtp_verify_bufs = self
+            .mtp_verify_bufs
+            .as_ref()
+            .map(|_| QwenMtpVerifyBuffers::allocate(be, cfg))
+            .transpose()?;
         Ok(SeamKv {
             weights: std::sync::Arc::clone(&self.weights),
             stable: std::sync::Arc::clone(&self.stable),
@@ -1538,7 +1603,7 @@ impl SeamKv {
                 None
             },
             ple_state_buf,
-            mtp_verify_bufs: None,
+            mtp_verify_bufs,
             max_ctx: self.max_ctx,
             kv_ring: self.kv_ring,
             cached: Vec::new(),
@@ -1556,7 +1621,7 @@ impl SeamKv {
             sc_ping: None,
             sc_ping_write: 0,
             sc_temp_inv_buf: None,
-            mtp_delta_ckpt: None,
+            mtp_delta_ckpt,
             turn_recurrent_ckpt,
             preallocated_siblings: Vec::new(),
         })

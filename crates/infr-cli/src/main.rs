@@ -4548,18 +4548,20 @@ fn cmd_serve(
     // (`infr_core::parse_size`, which is also what the `INFR_CTX` env layer parses).
     let is_dg = infr_llama::diffusion::is_diffusion_gemma(&gguf);
     let is_vulkan = !is_dg && matches!(selected_backend(cfg)?, Backend::Vulkan(_));
-    // Qwen3.8 MTP v1 owns one persistent target slot plus one fixed detached-head runtime. Route
-    // it through the serialized ChatModel adapter even when the selected device is Vulkan; the
-    // ordinary Vulkan serve path below is ParallelSeam and would otherwise bypass MTP entirely.
-    let serialized_vulkan_mtp = is_vulkan && cfg.spec.mtp && cfg.spec.draft.is_some();
+    // Keep the established one-slot MTP path unchanged. Two slots use the batched MTP scheduler.
+    let vulkan_mtp = is_vulkan && cfg.spec.mtp && cfg.spec.draft.is_some();
+    let serialized_vulkan_mtp = vulkan_mtp && parallel == 1;
+    if vulkan_mtp && parallel > 2 {
+        anyhow::bail!("Qwen3.8 concurrent MTP currently supports at most two slots");
+    }
     if mmproj.is_some() && !is_vulkan {
         anyhow::bail!("--mmproj currently requires the Vulkan qwen4exp serve path");
     }
-    if serialized_vulkan_mtp && mmproj.is_some() {
-        anyhow::bail!("Qwen3.8 MTP v1 does not yet support vision requests");
+    if vulkan_mtp && mmproj.is_some() {
+        anyhow::bail!("Qwen3.8 MTP does not yet support vision requests");
     }
-    if serialized_vulkan_mtp && embedding_model.is_some() {
-        anyhow::bail!("Qwen3.8 MTP v1 cannot host the embedding sidecar in the same process yet");
+    if vulkan_mtp && embedding_model.is_some() {
+        anyhow::bail!("Qwen3.8 MTP cannot host the embedding sidecar in the same process yet");
     }
     if let Some(path) = mmproj {
         if !path.is_file() {

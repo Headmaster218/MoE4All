@@ -869,6 +869,50 @@ pub(crate) fn generate_dense_vulkan_parallel_prefill_session(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_dense_vulkan_parallel_mtp_verify_session(
+    vk: &infr_vulkan::VulkanBackend,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    feeds: &[Vec<u32>],
+    primary: &mut Option<SeamKv>,
+    peers: &mut [SeamKv],
+    want_ctx: usize,
+) -> AResult<(Vec<Vec<u32>>, Vec<Vec<f32>>)> {
+    let bind: Box<BindWeight<'_>> = Box::new(|name: &str, _tb, _dt, _n| {
+        Err(anyhow!("warm parallel MTP session must not re-bind {name}"))
+    });
+    let mut ids = Vec::new();
+    let mut hidden = Vec::new();
+    let result = runner::generate_dense_backend_parallel_mtp_verify(
+        vk,
+        &*bind,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        feeds,
+        primary,
+        peers,
+        want_ctx,
+        &mut ids,
+        &mut hidden,
+    );
+    if result.is_err() {
+        if let Some(slot) = primary.as_mut() {
+            slot.reset();
+        }
+        for slot in peers {
+            slot.reset();
+        }
+        vk.release_moe_load_reservation();
+    }
+    result?;
+    Ok((ids, hidden))
+}
+
 /// Honest activation/scratch reservation for a DENSE model's placement decision: the transient
 /// VRAM a resident session needs BEYOND weights + KV, at the largest shape it will ever run — a
 /// full prefill chunk of `rows = min(ubatch, want_ctx)` rows (the runner chunks batched prefill at

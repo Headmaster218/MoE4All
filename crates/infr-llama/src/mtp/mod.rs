@@ -2155,7 +2155,7 @@ fn run_verify_with_finish(
 /// final target prediction becomes the first pending token. Keep the trunk forward fully batched
 /// while limiting the vocabulary projection and argmax to that frontier row.
 #[allow(clippy::too_many_arguments)]
-fn run_qwen4_prime_frontier_with_finish(
+pub(crate) fn run_qwen4_prime_frontier_with_finish(
     be: &dyn Backend,
     bind: &BindWeightFn,
     g: &Gguf,
@@ -2420,7 +2420,7 @@ enum LeadingPred {
 /// Greedy argmax over one `[vocab]` logits row (unlike [`top1_softmax`], no probability needed —
 /// `spec_accept`/the verify-round check only reads the winning id).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-fn argmax_row(row: &[f32]) -> u32 {
+pub(crate) fn argmax_row(row: &[f32]) -> u32 {
     let mut bi = 0usize;
     let mut bv = f32::NEG_INFINITY;
     for (i, &v) in row.iter().enumerate() {

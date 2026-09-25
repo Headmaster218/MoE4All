@@ -5,6 +5,7 @@ use infr_core::tensor::{DType, TensorDesc, TensorId};
 use infr_core::{TensorInfo, WeightSource};
 use infr_gguf::Gguf;
 use std::path::Path;
+use std::sync::Arc;
 
 use super::{BindWeightFn, MtpTensor};
 
@@ -973,12 +974,17 @@ fn build_draft_graph(
     )
 }
 
+pub(crate) struct Qwen4MtpFixed {
+    cfg: crate::Config,
+    weights: Vec<Box<dyn Buffer>>,
+    specs: Vec<(DType, usize)>,
+}
+
 pub(crate) struct Qwen4MtpSession {
     cfg: crate::Config,
     max_ctx: usize,
     max_batch: usize,
-    weights: Vec<Box<dyn Buffer>>,
-    specs: Vec<(DType, usize)>,
+    fixed: Arc<Qwen4MtpFixed>,
     k_cache: Box<dyn Buffer>,
     v_cache: Box<dyn Buffer>,
     catch_ids: Box<dyn Buffer>,
@@ -991,14 +997,30 @@ pub(crate) struct Qwen4MtpSession {
 }
 
 impl Qwen4MtpSession {
-    pub(crate) fn new(
+    pub(crate) fn load_fixed_vulkan(
+        vk: &infr_vulkan::VulkanBackend,
+        sidecar_path: &Path,
+        cfg: &crate::Config,
+    ) -> Result<Arc<Qwen4MtpFixed>> {
+        let bind: &BindWeightFn = &|_name, bytes, dtype, _numel| {
+            let materialized = bytes.materialize();
+            let padded = infr_vulkan::linear::pad_to_u32_align(&materialized);
+            let buffer = vk
+                .alloc(padded.len(), BufferUsage::Weights)
+                .map_err(|e| anyhow!("{e}"))?;
+            vk.upload(buffer.as_ref(), &padded)
+                .map_err(|e| anyhow!("{e}"))?;
+            Ok((buffer, dtype))
+        };
+        Self::load_fixed(vk, bind, sidecar_path, cfg)
+    }
+
+    pub(crate) fn load_fixed(
         be: &dyn Backend,
         bind: &BindWeightFn,
         sidecar_path: &Path,
         cfg: &crate::Config,
-        max_ctx: usize,
-        max_batch: usize,
-    ) -> Result<Self> {
+    ) -> Result<Arc<Qwen4MtpFixed>> {
         let sidecar = Gguf::open(sidecar_path)
             .with_context(|| format!("open Qwen3.8 MTP sidecar {}", sidecar_path.display()))?;
         let found = Qwen4MtpWeights::load(&sidecar, cfg)?;
@@ -1027,6 +1049,21 @@ impl Qwen4MtpSession {
         weights.push(ones_buf);
         specs.push((DType::F32, ones.len()));
 
+        Ok(Arc::new(Qwen4MtpFixed {
+            cfg: cfg.clone(),
+            weights,
+            specs,
+        }))
+    }
+
+    pub(crate) fn with_fixed(
+        be: &dyn Backend,
+        fixed: Arc<Qwen4MtpFixed>,
+        max_ctx: usize,
+        max_batch: usize,
+    ) -> Result<Self> {
+        let cfg = &fixed.cfg;
+
         let kvrow = cfg.n_kv * cfg.head_dim;
         let hcw = cfg.hc_mult * cfg.n_embd;
         let max_batch = max_batch.max(DRAFT_TOKENS).min(max_ctx.max(1));
@@ -1051,7 +1088,6 @@ impl Qwen4MtpSession {
             alloc(4, BufferUsage::Readback)?,
         ];
         tracing::info!(
-            path = %sidecar_path.display(),
             draft_tokens = DRAFT_TOKENS,
             max_ctx,
             catch_batch = max_batch,
@@ -1061,8 +1097,7 @@ impl Qwen4MtpSession {
             cfg: cfg.clone(),
             max_ctx,
             max_batch,
-            weights,
-            specs,
+            fixed,
             k_cache,
             v_cache,
             catch_ids,
@@ -1084,7 +1119,7 @@ impl Qwen4MtpSession {
         embd: &'a dyn Buffer,
         lm_head: &'a dyn Buffer,
     ) {
-        for (id, buffer) in weights.iter().copied().zip(&self.weights) {
+        for (id, buffer) in weights.iter().copied().zip(&self.fixed.weights) {
             bindings.bind(id, buffer.as_ref());
         }
         bindings.bind(embd_id, embd);
@@ -1133,7 +1168,7 @@ impl Qwen4MtpSession {
             .map_err(|e| anyhow!("{e}"))?;
             let specs = [(shared.0 .1, shared.0 .2), (shared.1 .1, shared.1 .2)];
             let (graph, handles) =
-                build_catch_graph(&self.cfg, &self.specs, specs, self.max_ctx, rows, pos);
+                build_catch_graph(&self.cfg, &self.fixed.specs, specs, self.max_ctx, rows, pos);
             let plan = be.compile(&graph).map_err(|e| anyhow!("{e}"))?;
             let mut bindings = Bindings::new();
             bindings.bind(handles.ids, self.catch_ids.as_ref());
@@ -1192,7 +1227,7 @@ impl Qwen4MtpSession {
         let specs = [(shared.0 .1, shared.0 .2), (shared.1 .1, shared.1 .2)];
         let (graph, handles) = build_draft_graph(
             &self.cfg,
-            &self.specs,
+            &self.fixed.specs,
             specs,
             self.max_ctx,
             start_pos,
@@ -1246,19 +1281,9 @@ impl Qwen4MtpRuntime {
         sidecar_path: &Path,
         max_ctx: usize,
     ) -> Result<Self> {
-        let bind: &BindWeightFn = &|_name, bytes, dtype, _numel| {
-            let bytes = bytes.materialize();
-            let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
-            let buffer = vk
-                .alloc(padded.len(), BufferUsage::Weights)
-                .map_err(|e| anyhow!("{e}"))?;
-            vk.upload(buffer.as_ref(), &padded)
-                .map_err(|e| anyhow!("{e}"))?;
-            Ok((buffer, dtype))
-        };
         let catch_batch = crate::seam::ubatch_rows(model.engine_cfg());
-        let head =
-            Qwen4MtpSession::new(vk, bind, sidecar_path, model.config(), max_ctx, catch_batch)?;
+        let fixed = Qwen4MtpSession::load_fixed_vulkan(vk, sidecar_path, model.config())?;
+        let head = Qwen4MtpSession::with_fixed(vk, fixed, max_ctx, catch_batch)?;
         Ok(Self {
             head,
             trunk: None,
