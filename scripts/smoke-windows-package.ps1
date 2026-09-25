@@ -94,6 +94,10 @@ $embeddingDirectory = Join-Path $PackageRoot 'ci embedding model'
 $embeddingPath = Join-Path $embeddingDirectory 'ci embed.gguf'
 New-Item -ItemType Directory -Path $embeddingDirectory -Force | Out-Null
 [System.IO.File]::WriteAllBytes($embeddingPath, [byte[]]::new(0))
+$mtpPath = Join-Path $PackageRoot 'ci mtp.gguf'
+$visionPath = Join-Path $PackageRoot 'mmproj-ci.gguf'
+[System.IO.File]::WriteAllBytes($mtpPath, [byte[]]::new(0))
+[System.IO.File]::WriteAllBytes($visionPath, [byte[]]::new(0))
 $dataDirectory = Join-Path $PackageRoot 'gui-data'
 New-Item -ItemType Directory -Path $dataDirectory -Force | Out-Null
 
@@ -103,7 +107,9 @@ function Invoke-WizardDryRun {
         [Parameter(Mandatory = $true)][string]$ExpectedCommand,
         [string]$ModelSelection = '',
         [switch]$PassModelArgument,
-        [switch]$EnableEmbedding
+        [switch]$EnableEmbedding,
+        [switch]$EnableMtp,
+        [switch]$EnableVision
     )
 
     $state = [ordered]@{
@@ -114,11 +120,16 @@ function Invoke-WizardDryRun {
         max_new = ''
         configure_sampling = $false
         server_addr = '127.0.0.1:8080'
-        server_parallel = '1'
+        server_parallel = $(if ($EnableMtp) { '2' } else { '1' })
         server_auth = $false
+        server_vision = [bool]$EnableVision
+        vision_projector = $(if ($EnableVision) { $visionPath } else { '' })
         server_embedding = [bool]$EnableEmbedding
         embedding_model = $(if ($EnableEmbedding) { $embeddingDirectory } else { '' })
         embedding_idle_timeout = '17'
+        mtp_enabled = [bool]$EnableMtp
+        mtp_model = $(if ($EnableMtp) { $mtpPath } else { '' })
+        mtp_verify_tokens = '4'
         bench_kind = 'decode'
         gen_tokens = '1'
         depth_mode = 'none'
@@ -192,15 +203,30 @@ function Invoke-WizardDryRun {
             throw "Wizard $Mode did not preserve the embedding idle timeout.`n$stdout"
         }
     }
+    if ($EnableMtp) {
+        foreach ($argument in @('--set spec.mtp=true', "--set 'spec.draft=$mtpPath'", '--set spec.k=4', '--parallel 2', '--temp 0')) {
+            if ($stdout -notmatch [regex]::Escape($argument)) {
+                throw "Wizard $Mode did not generate the opportunistic MTP argument '$argument'.`n$stdout"
+            }
+        }
+        if ($stdout -notmatch 'Two active decodes automatically use ordinary batched decode') {
+            throw "Wizard $Mode did not explain the opportunistic two-slot MTP policy.`n$stdout"
+        }
+    }
+    if ($EnableVision -and $stdout -notmatch [regex]::Escape("--mmproj '$visionPath'")) {
+        throw "Wizard $Mode did not preserve the vision projector while MTP was enabled.`n$stdout"
+    }
 }
 
 $quotedModelPath = '"' + $modelPath + '"'
 $powerShellDrop = "& '$modelPath'"
 Invoke-WizardDryRun -Mode 'chat' -ExpectedCommand 'run' -PassModelArgument
-Invoke-WizardDryRun -Mode 'server' -ExpectedCommand 'serve' -ModelSelection $powerShellDrop -EnableEmbedding
+Invoke-WizardDryRun -Mode 'server' -ExpectedCommand 'serve' -ModelSelection $powerShellDrop -EnableEmbedding -EnableMtp -EnableVision
 Invoke-WizardDryRun -Mode 'benchmark' -ExpectedCommand 'bench' -ModelSelection $quotedModelPath
 
 Remove-Item -LiteralPath $modelPath -Force
 Remove-Item -LiteralPath $embeddingDirectory -Recurse -Force
+Remove-Item -LiteralPath $mtpPath -Force
+Remove-Item -LiteralPath $visionPath -Force
 Remove-Item -LiteralPath $dataDirectory -Recurse -Force
 Write-Host "Windows package smoke test passed: $PackageRoot"

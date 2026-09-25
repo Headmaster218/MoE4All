@@ -791,13 +791,17 @@ if ($launchMode -eq 'benchmark') {
         $serverAddr = Read-ListenAddress -Label '监听地址（IP:端口）/ Listen address (IP:port)' -Default $serverAddr
         if ($mtpEnabled) {
             $mtpParallelDefault = if ($serverParallel -eq '2') { '2' } else { '1' }
-            $serverParallel = Read-Choice -Label 'MTP 并发会话数 / MTP concurrent slots' -DefaultValue $mtpParallelDefault -Options @(
-                [pscustomobject]@{ Key = '1'; Value = '1'; Label = '单路 / Single stream' }
-                [pscustomobject]@{ Key = '2'; Value = '2'; Label = '双路 / Two concurrent streams' }
+            $serverParallel = Read-Choice -Label 'API 并发会话数 / Concurrent API slots' -DefaultValue $mtpParallelDefault -Options @(
+                [pscustomobject]@{ Key = '1'; Value = '1'; Label = '单路 MTP / Single-stream MTP' }
+                [pscustomobject]@{ Key = '2'; Value = '2'; Label = '双槽机会式 MTP（推荐）/ Two slots, opportunistic MTP (recommended)' }
             )
             if ($serverParallel -eq '2' -and $mtpVerifyTokens -ne '4') {
                 $mtpVerifyTokens = '4'
-                Write-Host '双路 MTP 固定使用 4-token 验证。Two-stream MTP uses fixed 4-token verification.' -ForegroundColor Yellow
+                Write-Host '双槽机会式 MTP 固定使用 4-token 验证。Two-slot opportunistic MTP uses fixed 4-token verification.' -ForegroundColor Yellow
+            }
+            if ($serverParallel -eq '2') {
+                Write-Host '只有一个活跃会话时使用 MTP；两个会话同时解码时自动切换普通批量 decode，恢复单会话后切回 MTP。' -ForegroundColor Cyan
+                Write-Host 'MTP is used with one active request. Two active decodes automatically use ordinary batched decode, then return to MTP when one remains.' -ForegroundColor DarkGray
             }
         } else {
             $serverParallel = Read-IntegerValue -Label '并发会话数（每个会话有独立 KV）/ Concurrent slots (one KV cache each)' -Default $serverParallel -Minimum 1
@@ -817,25 +821,18 @@ if ($launchMode -eq 'benchmark') {
                 $sessionCacheTtlHours = Read-IntegerValue -Label '缓存保留小时数，0 为不按时间清理 / Cache TTL hours, 0 disables age expiry' -Default $sessionCacheTtlHours -Minimum 0
             }
         }
-        if ($mtpEnabled) {
-            $serverVision = $false
-            $serverEmbedding = $false
-            Write-Host 'MTP 暂不与视觉或同进程 Embedding API 同时启用。' -ForegroundColor Yellow
-            Write-Host 'MTP cannot currently be combined with vision or the in-process Embedding API.' -ForegroundColor DarkGray
-        } else {
-            $serverVision = Read-YesNo -Label '启用视觉图片理解？/ Enable image understanding?' -Default $serverVision
-            if ($serverVision) {
-                Write-Host '视觉权重按图片请求从 SSD 临时载入统一显存，处理完全部图片后立即释放。API 图片请使用 data URI 或 base64。' -ForegroundColor DarkGray
-                Write-Host 'Vision weights use request-scoped unified VRAM and are released after the image batch. API images must be data URIs or base64.' -ForegroundColor DarkGray
-                $visionProjectorPath = Select-VisionProjectorPath -Default $visionProjectorPath
-            }
-            $serverEmbedding = Read-YesNo -Label '同时提供 Embedding API？/ Also serve the Embedding API?' -Default $serverEmbedding
-            if ($serverEmbedding) {
-                Write-Host 'Embedding 首次请求时从 GGUF/SSD 载入统一显存；空闲超时后释放，不建立额外 RAM 权重缓存。' -ForegroundColor DarkGray
-                Write-Host 'Weights load from GGUF/SSD into unified VRAM on demand and are released after the idle timeout; no extra RAM weight cache is kept.' -ForegroundColor DarkGray
-                $embeddingModelPath = Select-EmbeddingModelPath -Default $embeddingModelPath
-                $embeddingIdleTimeout = Read-IntegerValue -Label 'Embedding 空闲释放秒数，0 为服务期间常驻 / Idle eviction seconds, 0 keeps resident' -Default $embeddingIdleTimeout -Minimum 0
-            }
+        $serverVision = Read-YesNo -Label '启用视觉图片理解？/ Enable image understanding?' -Default $serverVision
+        if ($serverVision) {
+            Write-Host '视觉权重按图片请求从 SSD 临时载入统一显存，处理完全部图片后立即释放。API 图片请使用 data URI 或 base64。' -ForegroundColor DarkGray
+            Write-Host 'Vision weights use request-scoped unified VRAM and are released after the image batch. API images must be data URIs or base64.' -ForegroundColor DarkGray
+            $visionProjectorPath = Select-VisionProjectorPath -Default $visionProjectorPath
+        }
+        $serverEmbedding = Read-YesNo -Label '同时提供 Embedding API？/ Also serve the Embedding API?' -Default $serverEmbedding
+        if ($serverEmbedding) {
+            Write-Host 'Embedding 首次请求时从 GGUF/SSD 载入统一显存；空闲超时后释放，不建立额外 RAM 权重缓存。' -ForegroundColor DarkGray
+            Write-Host 'Weights load from GGUF/SSD into unified VRAM on demand and are released after the idle timeout; no extra RAM weight cache is kept.' -ForegroundColor DarkGray
+            $embeddingModelPath = Select-EmbeddingModelPath -Default $embeddingModelPath
+            $embeddingIdleTimeout = Read-IntegerValue -Label 'Embedding 空闲释放秒数，0 为服务期间常驻 / Idle eviction seconds, 0 keeps resident' -Default $embeddingIdleTimeout -Minimum 0
         }
         $serverAuth = Read-YesNo -Label '启用 Bearer API key 鉴权？/ Enable Bearer API-key authentication?' -Default $serverAuth
         if ($serverAuth) {
