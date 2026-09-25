@@ -153,6 +153,63 @@ function Read-Choice {
     }
 }
 
+function Get-VulkanDeviceOptions {
+    $process = $null
+    try {
+        $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = $infrPath
+        $startInfo.Arguments = 'devices'
+        $startInfo.WorkingDirectory = [System.IO.Path]::GetDirectoryName($infrPath)
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+
+        $process = [System.Diagnostics.Process]::new()
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) {
+            throw 'process did not start'
+        }
+        $stdout = $process.StandardOutput.ReadToEnd()
+        $stderr = $process.StandardError.ReadToEnd()
+        $process.WaitForExit()
+        $exitCode = $process.ExitCode
+    } catch {
+        Write-Warning "无法枚举 Vulkan 设备，将保留引擎自动选择：$($_.Exception.Message) / Could not enumerate Vulkan devices; engine auto-selection remains available."
+        return @()
+    } finally {
+        if ($null -ne $process) {
+            $process.Dispose()
+        }
+    }
+    if ($exitCode -ne 0) {
+        $detail = $stderr.Trim()
+        if ($detail) { $detail = ": $detail" }
+        Write-Warning "Vulkan 设备枚举失败（退出码 $exitCode）$detail。将保留引擎自动选择。Vulkan device enumeration failed (exit code $exitCode); engine auto-selection remains available."
+        return @()
+    }
+
+    $options = [System.Collections.Generic.List[object]]::new()
+    $lines = @($stdout -split '\r?\n')
+    foreach ($line in $lines) {
+        $text = [string]$line
+        if ($text -notmatch '^\s*(Vulkan\d+):\s+(.+?)\s+\[([^\]]+)\](\s+<-\s+default)?\s*$') {
+            continue
+        }
+        $value = $Matches[1]
+        $name = $Matches[2]
+        $details = $Matches[3]
+        $isDefault = -not [string]::IsNullOrWhiteSpace($Matches[4])
+        [void]$options.Add([pscustomobject]@{
+            Key = ($options.Count + 1).ToString()
+            Value = $value
+            Label = ('{0}: {1} [{2}]' -f $value, $name, $details)
+            IsDefault = $isDefault
+        })
+    }
+    return $options.ToArray()
+}
+
 function ConvertTo-FullPath {
     param([Parameter(Mandatory = $true)][string]$Value)
     $value = $Value.Trim()
@@ -532,6 +589,24 @@ $launchMode = Read-Choice -Label '你想做什么？/ What would you like to do?
 )
 $modelPath = Select-ModelPath -InitialPath $InitialModelPath
 
+$savedDevice = [string](Get-SavedValue 'device' '')
+$device = ''
+$deviceOptions = @(Get-VulkanDeviceOptions)
+if ($deviceOptions.Count -eq 1) {
+    $device = [string]$deviceOptions[0].Value
+    Write-Host "`n设备 / Device" -ForegroundColor Cyan
+    Write-Host "  $($deviceOptions[0].Label)"
+} elseif ($deviceOptions.Count -gt 1) {
+    $availableDevice = $deviceOptions | Where-Object { $_.Value -eq $savedDevice } | Select-Object -First 1
+    if ($null -eq $availableDevice) {
+        $availableDevice = $deviceOptions | Where-Object { $_.IsDefault } | Select-Object -First 1
+    }
+    if ($null -eq $availableDevice) {
+        $availableDevice = $deviceOptions[0]
+    }
+    $device = Read-Choice -Label '计算设备 / Compute device' -DefaultValue ([string]$availableDevice.Value) -Options $deviceOptions
+}
+
 $setupModeDefault = 'conservative'
 if ($null -ne $script:Saved) {
     $savedSetupMode = $script:Saved.PSObject.Properties['setup_mode']
@@ -555,7 +630,6 @@ $setupMode = Read-Choice -Label '配置方式 / Configuration' -DefaultValue $se
     [pscustomobject]@{ Key = '3'; Value = 'manual'; Label = '全手动配置 / Fully manual configuration' }
 )
 
-$device = [string](Get-SavedValue 'device' '')
 $context = [string](Get-SavedValue 'context' '')
 $ubatch = [string](Get-SavedValue 'ubatch' '')
 $threads = [string](Get-SavedValue 'threads' '')
@@ -568,7 +642,9 @@ $configureMemory = [bool](Get-SavedValue 'configure_memory' $false)
 if ($setupMode -eq 'manual') {
     Write-Host "`n高级通用设置 / Advanced common settings" -ForegroundColor Cyan
     Write-Host '各项留空即可继续使用引擎的硬件探测与自动预算。Leave values blank to keep engine auto-detection.' -ForegroundColor DarkGray
-    $device = Read-TextValue -Label '设备，留空为自动 / Device, blank for auto' -Default $device
+    if ($deviceOptions.Count -eq 0) {
+        $device = Read-TextValue -Label '设备，留空为自动 / Device, blank for auto' -Default $savedDevice
+    }
     $context = Read-TextValue -Label '上下文窗口，留空为自动 / Context window, blank for auto' -Default $context
     $ubatch = Read-IntegerValue -Label 'Ubatch，留空为自动 / Ubatch, blank for auto' -Default $ubatch -Minimum 1 -AllowBlank
     $threads = Read-IntegerValue -Label 'CPU 线程，留空为全部 / CPU threads, blank for all' -Default $threads -Minimum 1 -AllowBlank
@@ -858,9 +934,9 @@ $nativeArgs = [System.Collections.Generic.List[string]]::new()
     'server' { 'serve' }
     default { 'run' }
 }))
+if (-not [string]::IsNullOrWhiteSpace($device)) { [void]$nativeArgs.Add('--dev'); [void]$nativeArgs.Add($device) }
 if ($setupMode -eq 'manual') {
     if (-not [string]::IsNullOrWhiteSpace($configPath)) { [void]$nativeArgs.Add('--config'); [void]$nativeArgs.Add($configPath) }
-    if (-not [string]::IsNullOrWhiteSpace($device)) { [void]$nativeArgs.Add('--dev'); [void]$nativeArgs.Add($device) }
     if (-not [string]::IsNullOrWhiteSpace($ubatch)) { [void]$nativeArgs.Add('--ubatch'); [void]$nativeArgs.Add($ubatch) }
     if (-not [string]::IsNullOrWhiteSpace($threads)) { [void]$nativeArgs.Add('--threads'); [void]$nativeArgs.Add($threads) }
 }
