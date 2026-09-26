@@ -1239,6 +1239,7 @@ struct ParallelDecodeRequest<'a> {
     prompt_secs: &'a mut Vec<f64>,
     decode_secs: &'a mut Vec<f64>,
     samplers: &'a mut [crate::sampling::ParallelSampler],
+    reasoning_guards: &'a mut [crate::sampling::Qwen4ReasoningEosGuard],
     on_token: &'a mut dyn FnMut(usize, u32) -> bool,
     yield_requested: Option<&'a std::sync::atomic::AtomicBool>,
     hidden: Option<&'a mut [Vec<f32>]>,
@@ -1311,6 +1312,7 @@ struct ParallelMtpVerifyRequest<'a> {
     peers: &'a mut [SeamKv],
     prepared: &'a [PreparedParallelPrompt],
     ids: &'a mut Vec<Vec<u32>>,
+    logits: &'a mut Vec<Vec<f32>>,
     hidden: &'a mut Vec<Vec<f32>>,
 }
 
@@ -1440,6 +1442,7 @@ pub(crate) fn generate_dense_backend_parallel_sampled(
     peers: &mut [SeamKv],
     want_ctx: usize,
     samplers: &mut [crate::sampling::ParallelSampler],
+    reasoning_guards: &mut [crate::sampling::Qwen4ReasoningEosGuard],
     on_token: &mut dyn FnMut(usize, u32) -> bool,
     yield_requested: Option<&std::sync::atomic::AtomicBool>,
     req: Option<&crate::sampling::RequestCtx>,
@@ -1450,6 +1453,7 @@ pub(crate) fn generate_dense_backend_parallel_sampled(
         || checkpoint_boundaries.len() != prompts.len()
         || mrope_plans.len() != prompts.len()
         || samplers.len() != prompts.len()
+        || reasoning_guards.len() != prompts.len()
     {
         return Err(anyhow!(
             "parallel token step has {} prompts, {} prompt ends, {} checkpoints, {} MRoPE plans, {} slots and {} samplers",
@@ -1475,6 +1479,7 @@ pub(crate) fn generate_dense_backend_parallel_sampled(
         prompt_secs: &mut prompt_secs,
         decode_secs: &mut decode_secs,
         samplers,
+        reasoning_guards,
         on_token,
         yield_requested,
         hidden: hidden.as_deref_mut(),
@@ -1601,6 +1606,7 @@ pub(crate) fn generate_dense_backend_parallel_mtp_verify(
     peers: &mut [SeamKv],
     want_ctx: usize,
     ids: &mut Vec<Vec<u32>>,
+    logits: &mut Vec<Vec<f32>>,
     hidden: &mut Vec<Vec<f32>>,
 ) -> AResult<()> {
     anyhow::ensure!(
@@ -1623,6 +1629,7 @@ pub(crate) fn generate_dense_backend_parallel_mtp_verify(
         peers,
         prepared: &prepared,
         ids,
+        logits,
         hidden,
     };
     generate_dense_backend_inner(
@@ -8534,18 +8541,34 @@ fn generate_dense_backend_inner(
         be.execute(plan1.as_ref(), &bindings1)
             .map_err(|e| anyhow!("{e}"))?;
         let mut all_ids = vec![0u32; batch];
+        let mut all_logits = Vec::new();
         if gpu_ids {
             be.download(
                 fixed.out_ids.as_ref(),
                 bytemuck::cast_slice_mut(&mut all_ids),
             )
             .map_err(|e| anyhow!("{e}"))?;
-        } else {
-            let mut logits = vec![0.0f32; batch * c.vocab];
-            be.download(fixed.logits.as_ref(), bytemuck::cast_slice_mut(&mut logits))
+            if c.qwen4_think_start.is_some()
+                && all_ids
+                    .iter()
+                    .any(|id| *id == c.eos || c.eos_ids.contains(id))
+            {
+                all_logits.resize(batch * c.vocab, 0.0);
+                be.download(
+                    fixed.logits.as_ref(),
+                    bytemuck::cast_slice_mut(&mut all_logits),
+                )
                 .map_err(|e| anyhow!("{e}"))?;
+            }
+        } else {
+            all_logits.resize(batch * c.vocab, 0.0);
+            be.download(
+                fixed.logits.as_ref(),
+                bytemuck::cast_slice_mut(&mut all_logits),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
             for (row, id) in all_ids.iter_mut().enumerate() {
-                *id = crate::mtp::argmax_row(&logits[row * c.vocab..(row + 1) * c.vocab]);
+                *id = crate::mtp::argmax_row(&all_logits[row * c.vocab..(row + 1) * c.vocab]);
             }
         }
         let mut all_hidden = vec![0.0f32; batch * h_width];
@@ -8555,12 +8578,18 @@ fn generate_dense_backend_inner(
         )
         .map_err(|e| anyhow!("{e}"))?;
         parallel.ids.clear();
+        parallel.logits.clear();
         parallel.hidden.clear();
         for lane in 0..lanes {
             let row = lane * rows_per_lane;
             parallel
                 .ids
                 .push(all_ids[row..row + rows_per_lane].to_vec());
+            parallel.logits.push(if all_logits.is_empty() {
+                Vec::new()
+            } else {
+                all_logits[row * c.vocab..(row + rows_per_lane) * c.vocab].to_vec()
+            });
             parallel
                 .hidden
                 .push(all_hidden[row * h_width..(row + rows_per_lane) * h_width].to_vec());
@@ -8911,6 +8940,15 @@ fn generate_dense_backend_inner(
                 out_ids.resize(logits_rows, 0);
                 be.download(buf, bytemuck::cast_slice_mut(out_ids))
                     .map_err(|e| anyhow!("{e}"))?;
+                if c.qwen4_think_start.is_some()
+                    && out_ids
+                        .iter()
+                        .any(|id| *id == c.eos || c.eos_ids.contains(id))
+                {
+                    out_logits.resize(logits_rows * c.vocab, 0.0);
+                    be.download(logits_buf, bytemuck::cast_slice_mut(out_logits))
+                        .map_err(|e| anyhow!("{e}"))?;
+                }
             } else {
                 out_logits.resize(logits_rows * c.vocab, 0.0);
                 be.download(logits_buf, bytemuck::cast_slice_mut(out_logits))
@@ -9067,6 +9105,15 @@ fn generate_dense_backend_inner(
             out_ids.resize(m, 0);
             be.download(ib.as_ref(), bytemuck::cast_slice_mut(out_ids))
                 .map_err(|e| anyhow!("{e}"))?;
+            if c.qwen4_think_start.is_some()
+                && out_ids
+                    .iter()
+                    .any(|id| *id == c.eos || c.eos_ids.contains(id))
+            {
+                out_logits.resize(m * c.vocab, 0.0);
+                be.download(vf_logits_buf.as_ref(), bytemuck::cast_slice_mut(out_logits))
+                    .map_err(|e| anyhow!("{e}"))?;
+            }
         } else {
             out_logits.resize(m * c.vocab, 0.0);
             be.download(vf_logits_buf.as_ref(), bytemuck::cast_slice_mut(out_logits))
@@ -9118,6 +9165,12 @@ fn generate_dense_backend_inner(
             return Err(anyhow!(
                 "parallel decode has {lanes} lanes but {} samplers",
                 parallel.samplers.len()
+            ));
+        }
+        if parallel.reasoning_guards.len() != lanes {
+            return Err(anyhow!(
+                "parallel decode has {lanes} lanes but {} reasoning guards",
+                parallel.reasoning_guards.len()
             ));
         }
         if parallel.mrope_plans.len() != lanes {
@@ -9516,14 +9569,49 @@ fn generate_dense_backend_inner(
             if batch_argmax || batch_gpu_sample {
                 be.download(ids_out.as_ref(), bytemuck::cast_slice_mut(&mut next))
                     .map_err(|e| anyhow!("{e}"))?;
+                let needs_reasoning_repair = next.iter().enumerate().any(|(row, &token)| {
+                    parallel.reasoning_guards[sample_from + row].blocks(
+                        c,
+                        token,
+                        ec.sampling.ignore_eos,
+                    )
+                });
+                if needs_reasoning_repair {
+                    let mut logits = vec![0f32; logits_rows * c.vocab];
+                    be.download(logits_batch.as_ref(), bytemuck::cast_slice_mut(&mut logits))
+                        .map_err(|e| anyhow!("{e}"))?;
+                    for row in 0..logits_rows {
+                        let lane = sample_from + row;
+                        if !parallel.reasoning_guards[lane].blocks(
+                            c,
+                            next[row],
+                            ec.sampling.ignore_eos,
+                        ) {
+                            continue;
+                        }
+                        let blocked = next[row];
+                        let logits = &mut logits[row * c.vocab..(row + 1) * c.vocab];
+                        parallel.reasoning_guards[lane].mask_eos(c, logits);
+                        next[row] = parallel.samplers[lane].sample(logits);
+                        tracing::warn!(
+                            lane,
+                            blocked_token = blocked,
+                            replacement_token = next[row],
+                            "Qwen3.8 suppressed premature EOS inside an open reasoning block"
+                        );
+                    }
+                }
             } else if logits_rows > 0 {
                 let mut logits = vec![0f32; logits_rows * c.vocab];
                 be.download(logits_batch.as_ref(), bytemuck::cast_slice_mut(&mut logits))
                     .map_err(|e| anyhow!("{e}"))?;
                 for row in 0..logits_rows {
                     let lane = sample_from + row;
-                    next[row] = parallel.samplers[lane]
-                        .sample(&mut logits[row * c.vocab..(row + 1) * c.vocab]);
+                    let logits = &mut logits[row * c.vocab..(row + 1) * c.vocab];
+                    if !ec.sampling.ignore_eos {
+                        parallel.reasoning_guards[lane].mask_eos(c, logits);
+                    }
+                    next[row] = parallel.samplers[lane].sample(logits);
                 }
             }
             for (written, &position) in last_written.iter_mut().zip(&positions) {
@@ -9566,6 +9654,7 @@ fn generate_dense_backend_inner(
             for (row, &token) in next.iter().enumerate() {
                 let lane = sample_from + row;
                 generated[lane].push(token);
+                parallel.reasoning_guards[lane].observe(c, token);
                 let is_eos =
                     !ec.sampling.ignore_eos && (c.eos_ids.contains(&token) || token == c.eos);
                 let keep_going = !is_eos && (parallel.on_token)(lane, token);
@@ -10641,6 +10730,7 @@ fn generate_dense_backend_inner(
     // instantly on a dummy context (gemma at depth) otherwise "finishes" 64 tokens in one step
     // and the reported tok/s is fiction. llama-bench ignores EOS the same way.
     let ignore_eos = ec.sampling.ignore_eos;
+    let mut reasoning_eos_guard = crate::sampling::Qwen4ReasoningEosGuard::from_prompt(c, prompt);
     // Chained decode (Vulkan): run N decode iterations in ONE submission — the sampled id feeds
     // the next iteration's embed gather on-device (shared `id_out` slot), params self-advance,
     // and the N ids come back from the replay's id ring in one readback. Falls back to the
@@ -11129,9 +11219,11 @@ fn generate_dense_backend_inner(
             // GPU-sampled paths (argmax or stochastic): skip the [vocab] logits download
             // entirely — the sampled id is read below (4 bytes). The one-time `logits_out` hook
             // still wants the full row.
+            let mut have_frontier_logits = false;
             if !(gpu_argmax || gpu_sample) || logits_out.is_some() {
                 be.download(logits_buf.as_ref(), bytemuck::cast_slice_mut(&mut logits))
                     .map_err(|e| anyhow!("{e}"))?;
+                have_frontier_logits = true;
             }
             // Phase-1 DiffusionGemma validation hook (see the param doc): this is the FIRST
             // is_decode row — the causal prefill's last-token logits — captured before sampling
@@ -11147,6 +11239,9 @@ fn generate_dense_backend_inner(
                 *out = hrow;
             }
             if let Some(cst) = constraint.as_deref_mut() {
+                if !ignore_eos {
+                    reasoning_eos_guard.mask_eos(c, &mut logits);
+                }
                 // Grammar-forced span (serve's tool_choice "required"/named): the shared
                 // llguidance step. Empty step ⇒ the constrained span ended.
                 let (step, done) = crate::grammar::constrained_step(
@@ -11165,6 +11260,7 @@ fn generate_dense_backend_inner(
                     out.push(t);
                     on_token(t);
                     cur.push(t);
+                    reasoning_eos_guard.observe(c, t);
                     decode_n += 1;
                 }
                 report_progress(infr_core::GenerationPhase::Decode, prompt_work, decode_n);
@@ -11172,7 +11268,7 @@ fn generate_dense_backend_inner(
                     break;
                 }
             } else {
-                let next = if gpu_argmax || gpu_sample {
+                let mut next = if gpu_argmax || gpu_sample {
                     // Device-side sampling (Op::Argmax / Op::Sample): read back the 4-byte id.
                     let mut idb = [0u8; 4];
                     let readback_t0 = profile_single.then(std::time::Instant::now);
@@ -11187,11 +11283,29 @@ fn generate_dense_backend_inner(
                     if let Some(p) = penalties.as_ref() {
                         p.apply(&mut logits);
                     }
+                    if !ignore_eos {
+                        reasoning_eos_guard.mask_eos(c, &mut logits);
+                    }
                     crate::sampling::sample_logits(&logits, sampler, &mut rng)
                 };
+                if reasoning_eos_guard.blocks(c, next, ignore_eos) {
+                    if !have_frontier_logits {
+                        be.download(logits_buf.as_ref(), bytemuck::cast_slice_mut(&mut logits))
+                            .map_err(|e| anyhow!("{e}"))?;
+                    }
+                    reasoning_eos_guard.mask_eos(c, &mut logits);
+                    let blocked = next;
+                    next = crate::sampling::sample_logits(&logits, sampler, &mut rng);
+                    tracing::warn!(
+                        blocked_token = blocked,
+                        replacement_token = next,
+                        "Qwen3.8 suppressed premature EOS inside an open reasoning block"
+                    );
+                }
                 if let Some(p) = penalties.as_mut() {
                     p.observe(next);
                 }
+                reasoning_eos_guard.observe(c, next);
                 let is_eos = !ignore_eos && (c.eos_ids.contains(&next) || next == c.eos);
                 out.push(next);
                 decode_t += step_t0.elapsed();

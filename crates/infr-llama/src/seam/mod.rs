@@ -818,6 +818,7 @@ pub(crate) fn generate_dense_vulkan_parallel_sampled_session(
     peers: &mut [SeamKv],
     want_ctx: usize,
     samplers: &mut [crate::sampling::ParallelSampler],
+    reasoning_guards: &mut [crate::sampling::Qwen4ReasoningEosGuard],
     on_token: &mut dyn FnMut(usize, u32) -> bool,
     yield_requested: Option<&std::sync::atomic::AtomicBool>,
     req: Option<&crate::sampling::RequestCtx>,
@@ -848,6 +849,7 @@ pub(crate) fn generate_dense_vulkan_parallel_sampled_session(
         peers,
         want_ctx,
         samplers,
+        reasoning_guards,
         on_token,
         yield_requested,
         req,
@@ -925,11 +927,12 @@ pub(crate) fn generate_dense_vulkan_parallel_mtp_verify_session(
     primary: &mut Option<SeamKv>,
     peers: &mut [SeamKv],
     want_ctx: usize,
-) -> AResult<(Vec<Vec<u32>>, Vec<Vec<f32>>)> {
+) -> AResult<(Vec<Vec<u32>>, Vec<Vec<f32>>, Vec<Vec<f32>>)> {
     let bind: Box<BindWeight<'_>> = Box::new(|name: &str, _tb, _dt, _n| {
         Err(anyhow!("warm parallel MTP session must not re-bind {name}"))
     });
     let mut ids = Vec::new();
+    let mut logits = Vec::new();
     let mut hidden = Vec::new();
     let result = runner::generate_dense_backend_parallel_mtp_verify(
         vk,
@@ -944,6 +947,7 @@ pub(crate) fn generate_dense_vulkan_parallel_mtp_verify_session(
         peers,
         want_ctx,
         &mut ids,
+        &mut logits,
         &mut hidden,
     );
     if result.is_err() {
@@ -956,7 +960,7 @@ pub(crate) fn generate_dense_vulkan_parallel_mtp_verify_session(
         vk.release_moe_load_reservation();
     }
     result?;
-    Ok((ids, hidden))
+    Ok((ids, logits, hidden))
 }
 
 /// Honest activation/scratch reservation for a DENSE model's placement decision: the transient

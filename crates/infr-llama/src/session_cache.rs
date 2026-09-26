@@ -5,6 +5,7 @@
 //! and directory maintenance. No code on the ordinary generation path reaches this module when
 //! `kv.session_cache_dir` is unset.
 
+use crate::mtp::{Qwen4MtpCacheState, Qwen4MtpCheckpointState, Qwen4MtpSession};
 use crate::seam::{SeamKv, SessionBufferKey, SessionStateMeta};
 use crate::{Config, EngineConfig};
 use anyhow::{anyhow, Context, Result};
@@ -23,6 +24,17 @@ const VERSION: u32 = 2;
 const HEADER_BYTES: u64 = 112;
 const RECORD_HEADER_BYTES: u64 = 16;
 const CHECKSUM_BYTES: u64 = 32;
+const MTP_MAGIC: [u8; 8] = *b"INFRMT01";
+const MTP_VERSION: u32 = 1;
+const MTP_HEADER_BYTES: u64 = 112;
+const MTP_FLAG_AGENT_CHECKPOINT: u32 = 1;
+const MTP_FLAG_EDIT_CHECKPOINT: u32 = 2;
+const MTP_FLAG_PENDING: u32 = 4;
+const MTP_FLAG_PENDING_EMITTED: u32 = 8;
+const MTP_FLAGS: u32 = MTP_FLAG_AGENT_CHECKPOINT
+    | MTP_FLAG_EDIT_CHECKPOINT
+    | MTP_FLAG_PENDING
+    | MTP_FLAG_PENDING_EMITTED;
 const STREAM_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RECORDS: u32 = 16_384;
 const FLAG_AGENT_CHECKPOINT: u32 = 1;
@@ -51,6 +63,11 @@ pub(crate) struct ColdEntry {
     file_bytes: u64,
 }
 
+pub(crate) struct MtpCacheSource<'a> {
+    pub(crate) head: &'a Qwen4MtpSession,
+    pub(crate) state: &'a Qwen4MtpCacheState,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Header {
     fingerprint: [u8; 32],
@@ -64,6 +81,21 @@ struct Header {
     v_fmt: DType,
     data_bytes: u64,
     has_checkpoints: [bool; crate::seam::TURN_CHECKPOINT_COUNT],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MtpHeader {
+    fingerprint: [u8; 32],
+    max_ctx: u64,
+    cached_count: u64,
+    h_width: u64,
+    checkpoint_counts: [u64; crate::seam::TURN_CHECKPOINT_COUNT],
+    pending_id: u32,
+    kv_bytes_per_side: u64,
+    data_bytes: u64,
+    has_checkpoints: [bool; crate::seam::TURN_CHECKPOINT_COUNT],
+    has_pending: bool,
+    pending_emitted: bool,
 }
 
 impl SessionCache {
@@ -132,7 +164,7 @@ impl SessionCache {
                         path = %path.display(),
                         "cold KV cache: removing invalid catalog entry: {error}"
                     );
-                    let _ = fs::remove_file(&path);
+                    remove_cache_pair(&path);
                 }
             }
         }
@@ -193,6 +225,7 @@ impl SessionCache {
         kv: &mut SeamKv,
         backend: &dyn Backend,
         model_cfg: &Config,
+        mtp: Option<MtpCacheSource<'_>>,
     ) -> Result<bool> {
         let meta = kv.session_state_meta();
         if meta.cached.is_empty() {
@@ -221,7 +254,26 @@ impl SessionCache {
                 .ok_or_else(|| anyhow!("cold KV payload size overflow"))
         })?;
         let header = Header::new(self.fingerprint, &meta, buffers.len(), data_bytes)?;
-        let file_bytes = checked_file_bytes(&header)?;
+        let main_file_bytes = checked_file_bytes(&header)?;
+        let mtp_header = mtp
+            .as_ref()
+            .map(|source| {
+                MtpHeader::new(
+                    self.fingerprint,
+                    self.max_ctx,
+                    source.state,
+                    source.head.kv_prefix_bytes(source.state.cached.len())?,
+                )
+            })
+            .transpose()?;
+        let mtp_file_bytes = mtp_header
+            .as_ref()
+            .map(checked_mtp_file_bytes)
+            .transpose()?
+            .unwrap_or(0);
+        let file_bytes = main_file_bytes
+            .checked_add(mtp_file_bytes)
+            .ok_or_else(|| anyhow!("cold KV snapshot byte count overflow"))?;
         if file_bytes > self.max_bytes {
             return Err(anyhow!(
                 "one cold KV session needs {:.2} GiB, exceeding kv.session_cache_max {:.2} GiB",
@@ -230,29 +282,65 @@ impl SessionCache {
             ));
         }
 
-        let (temporary, final_path) = self.new_paths();
-        let write_result = write_session_file(&temporary, &header, &meta, &buffers, backend);
+        let paths = self.new_paths();
+        if let (Some(source), Some(mtp_header)) = (mtp.as_ref(), mtp_header.as_ref()) {
+            if let Err(error) = write_mtp_file(
+                &paths.mtp_temporary,
+                mtp_header,
+                source.state,
+                source.head,
+                backend,
+            ) {
+                let _ = fs::remove_file(&paths.mtp_temporary);
+                return Err(error);
+            }
+        }
+        let write_result =
+            write_session_file(&paths.main_temporary, &header, &meta, &buffers, backend);
         drop(buffers);
         if let Err(error) = write_result {
-            let _ = fs::remove_file(&temporary);
+            let _ = fs::remove_file(&paths.main_temporary);
+            let _ = fs::remove_file(&paths.mtp_temporary);
             return Err(error);
         }
-        if let Err(error) = fs::rename(&temporary, &final_path) {
-            let _ = fs::remove_file(&temporary);
+        if mtp_header.is_some() {
+            if let Err(error) = fs::rename(&paths.mtp_temporary, &paths.mtp_final) {
+                let _ = fs::remove_file(&paths.main_temporary);
+                let _ = fs::remove_file(&paths.mtp_temporary);
+                return Err(error).with_context(|| {
+                    format!(
+                        "publish cold MTP sidecar {} -> {}",
+                        paths.mtp_temporary.display(),
+                        paths.mtp_final.display()
+                    )
+                });
+            }
+        }
+        if let Err(error) = fs::rename(&paths.main_temporary, &paths.main_final) {
+            let _ = fs::remove_file(&paths.main_temporary);
+            let _ = fs::remove_file(&paths.mtp_final);
             return Err(error).with_context(|| {
                 format!(
                     "publish cold KV session {} -> {}",
-                    temporary.display(),
-                    final_path.display()
+                    paths.main_temporary.display(),
+                    paths.main_final.display()
                 )
             });
         }
         if let Err(error) = kv.release_session_state(backend, model_cfg) {
-            let _ = fs::remove_file(&final_path);
+            let _ = fs::remove_file(&paths.main_final);
+            let _ = fs::remove_file(&paths.mtp_final);
             return Err(error.context("release resident KV after durable spill"));
         }
+        if let Some(source) = mtp.as_ref() {
+            if let Err(error) = source.head.release_kv(backend) {
+                tracing::warn!(
+                    "cold KV cache: main state was released but MTP head KV release failed: {error}"
+                );
+            }
+        }
         self.entries.push(ColdEntry {
-            path: final_path,
+            path: paths.main_final,
             saved_at: header.saved_at,
             meta,
             file_bytes,
@@ -273,7 +361,8 @@ impl SessionCache {
         kv: &mut SeamKv,
         backend: &dyn Backend,
         model_cfg: &Config,
-    ) -> Result<()> {
+        mtp_head: Option<&Qwen4MtpSession>,
+    ) -> Result<Option<Qwen4MtpCacheState>> {
         let started = Instant::now();
         let tokens = entry.meta.cached.len();
         let file_bytes = entry.file_bytes;
@@ -297,11 +386,39 @@ impl SessionCache {
             }
         }
         if result.is_ok() {
+            let mtp_path = mtp_path_for(&path);
+            let mtp_state = if let Some(head) = mtp_head.filter(|_| mtp_path.is_file()) {
+                match restore_mtp_file(
+                    &mtp_path,
+                    self.fingerprint,
+                    self.max_ctx,
+                    &entry.meta.cached,
+                    head,
+                    backend,
+                ) {
+                    Ok(state) => Some(state),
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %mtp_path.display(),
+                            "cold KV cache: MTP sidecar restore failed; preserving the restored main KV and using ordinary decode: {error}"
+                        );
+                        let sidecar_bytes = fs::metadata(&mtp_path).map_or(0, |meta| meta.len());
+                        entry.file_bytes = entry.file_bytes.saturating_sub(sidecar_bytes);
+                        let _ = fs::remove_file(&mtp_path);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             // Cold entries are immutable snapshots. Keep a validated entry available so several
             // conversations can branch from the same system/tool checkpoint instead of consuming
             // it on the first restore. Size and age GC remain the eviction authority.
             entry.saved_at = unix_secs();
             if let Ok(file) = OpenOptions::new().write(true).open(&path) {
+                let _ = file.set_times(FileTimes::new().set_modified(SystemTime::now()));
+            }
+            if let Ok(file) = OpenOptions::new().write(true).open(&mtp_path) {
                 let _ = file.set_times(FileTimes::new().set_modified(SystemTime::now()));
             }
             self.return_entry(entry);
@@ -312,12 +429,11 @@ impl SessionCache {
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "restored reusable conversation KV from cold storage"
             );
-        } else if let Err(error) = fs::remove_file(&path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path = %path.display(), "cold KV cache: cannot remove failed entry: {error}");
-            }
+            return Ok(mtp_state);
+        } else {
+            remove_cache_pair(&path);
         }
-        result
+        result.map(|()| None)
     }
 
     pub(crate) fn gc(&mut self) -> Result<()> {
@@ -326,18 +442,27 @@ impl SessionCache {
         Ok(())
     }
 
-    fn new_paths(&self) -> (PathBuf, PathBuf) {
+    fn new_paths(&self) -> SessionPaths {
         let now = unix_secs();
         let sequence = FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let stem = format!(
             "session-{now:016x}-{:08x}-{sequence:016x}",
             std::process::id()
         );
-        (
-            self.model_dir.join(format!(".{stem}.tmp")),
-            self.model_dir.join(format!("{stem}.infrkv")),
-        )
+        SessionPaths {
+            main_temporary: self.model_dir.join(format!(".{stem}.kv.tmp")),
+            mtp_temporary: self.model_dir.join(format!(".{stem}.mtp.tmp")),
+            main_final: self.model_dir.join(format!("{stem}.infrkv")),
+            mtp_final: self.model_dir.join(format!("{stem}.infrmtp")),
+        }
     }
+}
+
+struct SessionPaths {
+    main_temporary: PathBuf,
+    mtp_temporary: PathBuf,
+    main_final: PathBuf,
+    mtp_final: PathBuf,
 }
 
 impl Header {
@@ -409,6 +534,230 @@ impl Header {
     }
 }
 
+impl MtpHeader {
+    fn new(
+        fingerprint: [u8; 32],
+        max_ctx: usize,
+        state: &Qwen4MtpCacheState,
+        kv_bytes_per_side: usize,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            !state.cached.is_empty() && state.cached.len() <= max_ctx,
+            "cold MTP state has an invalid cached-token depth"
+        );
+        let h_width = state.last_h.len();
+        anyhow::ensure!(h_width != 0, "cold MTP state has an empty hidden frontier");
+        for checkpoint in state.turn_checkpoints.iter().flatten() {
+            anyhow::ensure!(
+                !checkpoint.tokens.is_empty()
+                    && state.cached.starts_with(&checkpoint.tokens)
+                    && checkpoint.last_h.len() == h_width,
+                "cold MTP checkpoint is not a complete prefix of its live state"
+            );
+        }
+        anyhow::ensure!(
+            !state.pending_emitted || state.pending_id.is_some(),
+            "cold MTP state marks a missing frontier as emitted"
+        );
+        let checkpoint_counts = state.turn_checkpoints.each_ref().map(|checkpoint| {
+            checkpoint
+                .as_ref()
+                .map_or(Ok(0), |checkpoint| checkpoint.tokens.len().try_into())
+                .context("cold MTP checkpoint token count exceeds u64")
+        });
+        let [agent_checkpoint_count, edit_checkpoint_count] = checkpoint_counts;
+        let checkpoint_counts = [agent_checkpoint_count?, edit_checkpoint_count?];
+        let cached_count: u64 = state
+            .cached
+            .len()
+            .try_into()
+            .context("cold MTP token count exceeds u64")?;
+        let h_width: u64 = h_width
+            .try_into()
+            .context("cold MTP hidden width exceeds u64")?;
+        let kv_bytes_per_side: u64 = kv_bytes_per_side
+            .try_into()
+            .context("cold MTP KV byte count exceeds u64")?;
+        let checkpoint_tokens = checkpoint_counts
+            .iter()
+            .try_fold(0u64, |total, &count| total.checked_add(count))
+            .ok_or_else(|| anyhow!("cold MTP checkpoint metadata size overflow"))?;
+        let hidden_rows = 1u64
+            .checked_add(state.turn_checkpoints.iter().flatten().count() as u64)
+            .ok_or_else(|| anyhow!("cold MTP hidden row count overflow"))?;
+        let data_bytes = cached_count
+            .checked_add(checkpoint_tokens)
+            .and_then(|tokens| tokens.checked_mul(4))
+            .and_then(|bytes| {
+                h_width
+                    .checked_mul(hidden_rows)
+                    .and_then(|values| values.checked_mul(4))
+                    .and_then(|hidden| bytes.checked_add(hidden))
+            })
+            .and_then(|bytes| {
+                kv_bytes_per_side
+                    .checked_mul(2)
+                    .and_then(|kv| bytes.checked_add(kv))
+            })
+            .ok_or_else(|| anyhow!("cold MTP payload size overflow"))?;
+        Ok(Self {
+            fingerprint,
+            max_ctx: max_ctx.try_into().context("max context exceeds u64")?,
+            cached_count,
+            h_width,
+            checkpoint_counts,
+            pending_id: state.pending_id.unwrap_or(0),
+            kv_bytes_per_side,
+            data_bytes,
+            has_checkpoints: state
+                .turn_checkpoints
+                .each_ref()
+                .map(|checkpoint| checkpoint.is_some()),
+            has_pending: state.pending_id.is_some(),
+            pending_emitted: state.pending_emitted,
+        })
+    }
+}
+
+fn checked_mtp_file_bytes(header: &MtpHeader) -> Result<u64> {
+    MTP_HEADER_BYTES
+        .checked_add(header.data_bytes)
+        .and_then(|bytes| bytes.checked_add(CHECKSUM_BYTES))
+        .ok_or_else(|| anyhow!("cold MTP file size overflow"))
+}
+
+fn encode_mtp_header(header: &MtpHeader) -> [u8; MTP_HEADER_BYTES as usize] {
+    let mut out = Vec::with_capacity(MTP_HEADER_BYTES as usize);
+    out.extend_from_slice(&MTP_MAGIC);
+    out.extend_from_slice(&MTP_VERSION.to_le_bytes());
+    let checkpoint_flags = header
+        .has_checkpoints
+        .iter()
+        .enumerate()
+        .fold(0u32, |flags, (index, &present)| {
+            flags | (u32::from(present) << index)
+        });
+    let flags = checkpoint_flags
+        | (u32::from(header.has_pending) * MTP_FLAG_PENDING)
+        | (u32::from(header.pending_emitted) * MTP_FLAG_PENDING_EMITTED);
+    out.extend_from_slice(&flags.to_le_bytes());
+    out.extend_from_slice(&header.fingerprint);
+    out.extend_from_slice(&header.max_ctx.to_le_bytes());
+    out.extend_from_slice(&header.cached_count.to_le_bytes());
+    out.extend_from_slice(&header.h_width.to_le_bytes());
+    for count in header.checkpoint_counts {
+        out.extend_from_slice(&count.to_le_bytes());
+    }
+    out.extend_from_slice(&header.pending_id.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&header.kv_bytes_per_side.to_le_bytes());
+    out.extend_from_slice(&header.data_bytes.to_le_bytes());
+    out.try_into().expect("fixed cold MTP header size")
+}
+
+fn decode_mtp_header(bytes: &[u8; MTP_HEADER_BYTES as usize]) -> Result<MtpHeader> {
+    let mut cursor = 0usize;
+    if take::<8>(bytes, &mut cursor)? != MTP_MAGIC {
+        return Err(anyhow!("not an infr cold MTP file"));
+    }
+    let version = u32::from_le_bytes(take(bytes, &mut cursor)?);
+    if version != MTP_VERSION {
+        return Err(anyhow!("unsupported cold MTP format version {version}"));
+    }
+    let flags = u32::from_le_bytes(take(bytes, &mut cursor)?);
+    if flags & !MTP_FLAGS != 0 {
+        return Err(anyhow!("cold MTP header has unknown flags"));
+    }
+    let fingerprint = take(bytes, &mut cursor)?;
+    let max_ctx = u64::from_le_bytes(take(bytes, &mut cursor)?);
+    let cached_count = u64::from_le_bytes(take(bytes, &mut cursor)?);
+    let h_width = u64::from_le_bytes(take(bytes, &mut cursor)?);
+    let checkpoint_counts = [
+        u64::from_le_bytes(take(bytes, &mut cursor)?),
+        u64::from_le_bytes(take(bytes, &mut cursor)?),
+    ];
+    let pending_id = u32::from_le_bytes(take(bytes, &mut cursor)?);
+    let reserved = u32::from_le_bytes(take(bytes, &mut cursor)?);
+    if reserved != 0 {
+        return Err(anyhow!("cold MTP header has non-zero reserved bytes"));
+    }
+    let kv_bytes_per_side = u64::from_le_bytes(take(bytes, &mut cursor)?);
+    let data_bytes = u64::from_le_bytes(take(bytes, &mut cursor)?);
+    debug_assert_eq!(cursor, MTP_HEADER_BYTES as usize);
+    Ok(MtpHeader {
+        fingerprint,
+        max_ctx,
+        cached_count,
+        h_width,
+        checkpoint_counts,
+        pending_id,
+        kv_bytes_per_side,
+        data_bytes,
+        has_checkpoints: [
+            flags & MTP_FLAG_AGENT_CHECKPOINT != 0,
+            flags & MTP_FLAG_EDIT_CHECKPOINT != 0,
+        ],
+        has_pending: flags & MTP_FLAG_PENDING != 0,
+        pending_emitted: flags & MTP_FLAG_PENDING_EMITTED != 0,
+    })
+}
+
+fn validate_mtp_header(header: &MtpHeader, file_bytes: u64) -> Result<()> {
+    let invalid_checkpoint = header
+        .checkpoint_counts
+        .iter()
+        .zip(header.has_checkpoints)
+        .any(|(&count, present)| count > header.cached_count || present != (count != 0));
+    if header.cached_count == 0
+        || header.cached_count > header.max_ctx
+        || header.h_width == 0
+        || header.h_width > 1_048_576
+        || invalid_checkpoint
+        || (header.pending_emitted && !header.has_pending)
+    {
+        return Err(anyhow!("cold MTP header has inconsistent state geometry"));
+    }
+    let checkpoint_tokens = header
+        .checkpoint_counts
+        .iter()
+        .try_fold(0u64, |total, &count| total.checked_add(count))
+        .ok_or_else(|| anyhow!("cold MTP checkpoint metadata size overflow"))?;
+    let hidden_rows = 1u64
+        + header
+            .has_checkpoints
+            .iter()
+            .filter(|&&present| present)
+            .count() as u64;
+    let expected_data_bytes = header
+        .cached_count
+        .checked_add(checkpoint_tokens)
+        .and_then(|tokens| tokens.checked_mul(4))
+        .and_then(|bytes| {
+            header
+                .h_width
+                .checked_mul(hidden_rows)
+                .and_then(|values| values.checked_mul(4))
+                .and_then(|hidden| bytes.checked_add(hidden))
+        })
+        .and_then(|bytes| {
+            header
+                .kv_bytes_per_side
+                .checked_mul(2)
+                .and_then(|kv| bytes.checked_add(kv))
+        })
+        .ok_or_else(|| anyhow!("cold MTP payload size overflow"))?;
+    if expected_data_bytes != header.data_bytes {
+        return Err(anyhow!("cold MTP header has an inconsistent payload size"));
+    }
+    if checked_mtp_file_bytes(header)? != file_bytes {
+        return Err(anyhow!(
+            "cold MTP file size is {file_bytes}, expected {} from its header",
+            checked_mtp_file_bytes(header)?
+        ));
+    }
+    Ok(())
+}
+
 fn write_session_file(
     path: &Path,
     header: &Header,
@@ -449,6 +798,151 @@ fn write_session_file(
     writer.flush()?;
     writer.get_ref().sync_all()?;
     Ok(())
+}
+
+fn write_mtp_file(
+    path: &Path,
+    header: &MtpHeader,
+    state: &Qwen4MtpCacheState,
+    head: &Qwen4MtpSession,
+    backend: &dyn Backend,
+) -> Result<()> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("create cold MTP temporary file {}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    let mut hasher = Sha256::new();
+    write_hashed(&mut writer, &mut hasher, &encode_mtp_header(header))?;
+    write_tokens(&mut writer, &mut hasher, &state.cached)?;
+    for checkpoint in state.turn_checkpoints.iter().flatten() {
+        write_tokens(&mut writer, &mut hasher, &checkpoint.tokens)?;
+    }
+    write_f32s(&mut writer, &mut hasher, &state.last_h)?;
+    for checkpoint in state.turn_checkpoints.iter().flatten() {
+        write_f32s(&mut writer, &mut hasher, &checkpoint.last_h)?;
+    }
+    let kv = head.kv_prefix(backend, state.cached.len())?;
+    anyhow::ensure!(
+        kv.bytes_per_side() as u64 == header.kv_bytes_per_side,
+        "cold MTP KV byte count changed while spilling"
+    );
+    let mut scratch = vec![0u8; STREAM_BYTES];
+    for (name, buffer) in [("K", kv.k()), ("V", kv.v())] {
+        let mut offset = 0usize;
+        while offset < kv.bytes_per_side() {
+            let count = (kv.bytes_per_side() - offset).min(scratch.len());
+            backend
+                .download_range(buffer, offset, &mut scratch[..count])
+                .map_err(|error| anyhow!("download cold MTP {name} at {offset}: {error}"))?;
+            write_hashed(&mut writer, &mut hasher, &scratch[..count])?;
+            offset += count;
+        }
+    }
+    let checksum = hasher.finalize();
+    writer.write_all(checksum.as_ref())?;
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    Ok(())
+}
+
+fn restore_mtp_file(
+    path: &Path,
+    fingerprint: [u8; 32],
+    max_ctx: usize,
+    main_cached: &[u32],
+    head: &Qwen4MtpSession,
+    backend: &dyn Backend,
+) -> Result<Qwen4MtpCacheState> {
+    let file =
+        File::open(path).with_context(|| format!("open cold MTP state {}", path.display()))?;
+    let file_bytes = file.metadata()?.len();
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut header_bytes = [0u8; MTP_HEADER_BYTES as usize];
+    read_hashed(&mut reader, &mut hasher, &mut header_bytes)?;
+    let header = decode_mtp_header(&header_bytes)?;
+    validate_mtp_header(&header, file_bytes)?;
+    if header.fingerprint != fingerprint
+        || header.max_ctx != max_ctx as u64
+        || header.h_width != head.h_width() as u64
+    {
+        return Err(anyhow!(
+            "cold MTP file belongs to a different model or slot geometry"
+        ));
+    }
+    let cached = read_tokens_hashed(&mut reader, &mut hasher, header.cached_count, max_ctx)?;
+    if cached != main_cached {
+        return Err(anyhow!(
+            "cold MTP token prefix differs from the restored main KV"
+        ));
+    }
+    let mut turn_checkpoints = std::array::from_fn(|_| None);
+    for (index, checkpoint) in turn_checkpoints.iter_mut().enumerate() {
+        if header.has_checkpoints[index] {
+            let tokens = read_tokens_hashed(
+                &mut reader,
+                &mut hasher,
+                header.checkpoint_counts[index],
+                max_ctx,
+            )?;
+            if tokens.is_empty() || !cached.starts_with(&tokens) {
+                return Err(anyhow!(
+                    "cold MTP checkpoint {index} is not a live-prefix checkpoint"
+                ));
+            }
+            *checkpoint = Some(Qwen4MtpCheckpointState {
+                tokens,
+                last_h: Vec::new(),
+            });
+        }
+    }
+    let h_width: usize = header
+        .h_width
+        .try_into()
+        .context("cold MTP hidden width exceeds usize")?;
+    let last_h = read_f32s_hashed(&mut reader, &mut hasher, h_width)?;
+    for checkpoint in turn_checkpoints.iter_mut().flatten() {
+        checkpoint.last_h = read_f32s_hashed(&mut reader, &mut hasher, h_width)?;
+    }
+    let kv = head.kv_prefix(backend, cached.len())?;
+    anyhow::ensure!(
+        kv.bytes_per_side() as u64 == header.kv_bytes_per_side,
+        "cold MTP KV geometry differs from its target slot"
+    );
+    let mut scratch = vec![0u8; STREAM_BYTES];
+    for (name, buffer) in [("K", kv.k()), ("V", kv.v())] {
+        let mut offset = 0usize;
+        while offset < kv.bytes_per_side() {
+            let count = (kv.bytes_per_side() - offset).min(scratch.len());
+            read_hashed(&mut reader, &mut hasher, &mut scratch[..count])?;
+            backend
+                .upload_range(buffer, offset, &scratch[..count])
+                .map_err(|error| anyhow!("upload cold MTP {name} at {offset}: {error}"))?;
+            offset += count;
+        }
+    }
+    let mut stored_checksum = [0u8; CHECKSUM_BYTES as usize];
+    reader.read_exact(&mut stored_checksum)?;
+    let calculated = hasher.finalize();
+    if calculated.as_slice() != stored_checksum {
+        return Err(anyhow!("cold MTP checksum mismatch"));
+    }
+    let mut trailing = [0u8; 1];
+    if reader.read(&mut trailing)? != 0 {
+        return Err(anyhow!("cold MTP file has trailing data"));
+    }
+    backend
+        .sync()
+        .map_err(|error| anyhow!("sync restored cold MTP state: {error}"))?;
+    Ok(Qwen4MtpCacheState {
+        cached,
+        last_h,
+        turn_checkpoints,
+        pending_id: header.has_pending.then_some(header.pending_id),
+        pending_emitted: header.pending_emitted,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -568,12 +1062,12 @@ fn read_catalog_entry(
     v_fmt: DType,
 ) -> Result<Option<ColdEntry>> {
     let file = File::open(path)?;
-    let file_bytes = file.metadata()?.len();
+    let main_file_bytes = file.metadata()?.len();
     let mut reader = BufReader::new(file);
     let mut bytes = [0u8; HEADER_BYTES as usize];
     reader.read_exact(&mut bytes)?;
     let header = decode_header(&bytes)?;
-    validate_header(&header, file_bytes)?;
+    validate_header(&header, main_file_bytes)?;
     if header.fingerprint != fingerprint
         || header.max_ctx != max_ctx as u64
         || header.k_fmt != k_fmt
@@ -596,7 +1090,8 @@ fn read_catalog_entry(
         path: path.to_path_buf(),
         saved_at: header.saved_at,
         meta: header.meta(cached, checkpoints)?,
-        file_bytes,
+        file_bytes: main_file_bytes
+            .saturating_add(fs::metadata(mtp_path_for(path)).map_or(0, |metadata| metadata.len())),
     }))
 }
 
@@ -769,6 +1264,18 @@ fn write_tokens(writer: &mut impl Write, hasher: &mut Sha256, tokens: &[u32]) ->
     Ok(())
 }
 
+fn write_f32s(writer: &mut impl Write, hasher: &mut Sha256, values: &[f32]) -> Result<()> {
+    let mut bytes = Vec::with_capacity(values.len().min(8192) * 4);
+    for chunk in values.chunks(8192) {
+        bytes.clear();
+        for &value in chunk {
+            bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        write_hashed(writer, hasher, &bytes)?;
+    }
+    Ok(())
+}
+
 fn read_tokens(reader: &mut impl Read, count: u64, max_ctx: usize) -> Result<Vec<u32>> {
     let count: usize = count.try_into().context("token count exceeds usize")?;
     if count > max_ctx {
@@ -803,6 +1310,18 @@ fn read_tokens_hashed(
     Ok(bytes
         .chunks_exact(4)
         .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect())
+}
+
+fn read_f32s_hashed(reader: &mut impl Read, hasher: &mut Sha256, count: usize) -> Result<Vec<f32>> {
+    let byte_count = count
+        .checked_mul(4)
+        .ok_or_else(|| anyhow!("cold MTP hidden byte count overflow"))?;
+    let mut bytes = vec![0u8; byte_count];
+    read_hashed(reader, hasher, &mut bytes)?;
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|bytes| f32::from_bits(u32::from_le_bytes(bytes.try_into().unwrap())))
         .collect())
 }
 
@@ -876,6 +1395,7 @@ fn gc_root(root: &Path, max_bytes: u64, ttl: Option<Duration>) -> Result<()> {
         root,
         ttl.unwrap_or(MIN_STALE_TEMP_AGE).max(MIN_STALE_TEMP_AGE),
     )?;
+    remove_orphan_mtp_files(root)?;
     let mut files = collect_cache_files(root)?;
     let now = SystemTime::now();
     if let Some(ttl) = ttl {
@@ -998,22 +1518,68 @@ fn push_cache_file(files: &mut Vec<CacheFile>, path: PathBuf) {
         return;
     };
     files.push(CacheFile {
+        len: metadata
+            .len()
+            .saturating_add(fs::metadata(mtp_path_for(&path)).map_or(0, |meta| meta.len())),
         path,
-        len: metadata.len(),
         modified: metadata.modified().unwrap_or(UNIX_EPOCH),
         removed: false,
     });
 }
 
 fn remove_cache_file(path: &Path) -> bool {
-    match fs::remove_file(path) {
+    let removed = match fs::remove_file(path) {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
         Err(error) => {
             tracing::warn!(path = %path.display(), "cold KV cache: cannot remove expired entry: {error}");
             false
         }
+    };
+    if removed && is_cache_file(path) {
+        let sidecar = mtp_path_for(path);
+        if let Err(error) = fs::remove_file(&sidecar) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %sidecar.display(), "cold KV cache: cannot remove paired MTP sidecar: {error}");
+            }
+        }
     }
+    removed
+}
+
+fn remove_cache_pair(path: &Path) {
+    let _ = remove_cache_file(path);
+}
+
+fn mtp_path_for(path: &Path) -> PathBuf {
+    path.with_extension("infrmtp")
+}
+
+fn remove_orphan_mtp_files(root: &Path) -> Result<()> {
+    for item in
+        fs::read_dir(root).with_context(|| format!("scan cold KV cache root {}", root.display()))?
+    {
+        let item = match item {
+            Ok(item) => item,
+            Err(_) => continue,
+        };
+        if item.file_type().is_ok_and(|kind| kind.is_dir()) {
+            let Ok(children) = fs::read_dir(item.path()) else {
+                continue;
+            };
+            for child in children.flatten() {
+                let path = child.path();
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "infrmtp")
+                    && !path.with_extension("infrkv").is_file()
+                {
+                    let _ = fs::remove_file(path);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn is_cache_file(path: &Path) -> bool {
@@ -1151,6 +1717,35 @@ mod tests {
     }
 
     #[test]
+    fn mtp_header_round_trips_and_prices_the_complete_sidecar() {
+        let state = Qwen4MtpCacheState {
+            cached: vec![1, 2, 3, 4],
+            last_h: vec![0.25; 8],
+            turn_checkpoints: [
+                Some(Qwen4MtpCheckpointState {
+                    tokens: vec![1, 2],
+                    last_h: vec![0.5; 8],
+                }),
+                None,
+            ],
+            pending_id: Some(9),
+            pending_emitted: true,
+        };
+        let header = MtpHeader::new([3; 32], 4096, &state, 8192).unwrap();
+        assert_eq!(
+            decode_mtp_header(&encode_mtp_header(&header)).unwrap(),
+            header
+        );
+        let expected_payload = (4 + 2) * 4 + (8 + 8) * 4 + 2 * 8192;
+        assert_eq!(header.data_bytes, expected_payload);
+        assert_eq!(
+            checked_mtp_file_bytes(&header).unwrap(),
+            MTP_HEADER_BYTES + expected_payload + CHECKSUM_BYTES
+        );
+        validate_mtp_header(&header, checked_mtp_file_bytes(&header).unwrap()).unwrap();
+    }
+
+    #[test]
     fn record_keys_round_trip() {
         let keys = [
             SessionBufferKey::K(4),
@@ -1187,6 +1782,23 @@ mod tests {
             .sum::<u64>();
         assert!(cache_bytes <= 15);
         assert!(model.join("keep.txt").is_file());
+    }
+
+    #[test]
+    fn gc_counts_and_removes_main_and_mtp_as_one_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let model = temp.path().join("model");
+        fs::create_dir(&model).unwrap();
+        let main = model.join("session.infrkv");
+        let mtp = model.join("session.infrmtp");
+        fs::write(&main, [0u8; 10]).unwrap();
+        fs::write(&mtp, [0u8; 20]).unwrap();
+        let files = collect_cache_files(temp.path()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].len, 30);
+        gc_root(temp.path(), 0, None).unwrap();
+        assert!(!main.exists());
+        assert!(!mtp.exists());
     }
 
     #[test]
