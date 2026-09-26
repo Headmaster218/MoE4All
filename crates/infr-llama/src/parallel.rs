@@ -307,6 +307,22 @@ fn mtp_accepted_rows(candidates: &[u32], verified: &[u32]) -> usize {
         .count()
 }
 
+fn mtp_prime_chunk_end(
+    start: usize,
+    prompt_len: usize,
+    chunk: usize,
+    checkpoint_boundaries: &[Option<usize>; crate::seam::TURN_CHECKPOINT_COUNT],
+) -> usize {
+    let natural_end = start.saturating_add(chunk).min(prompt_len);
+    checkpoint_boundaries
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|&boundary| start < boundary && boundary <= natural_end)
+        .min()
+        .unwrap_or(natural_end)
+}
+
 struct BatchWork {
     slot: usize,
     kv: Option<SeamKv>,
@@ -331,6 +347,7 @@ struct MtpSlotState {
     head: crate::mtp::Qwen4MtpSession,
     cached: Vec<u32>,
     last_h: Vec<f32>,
+    turn_checkpoints: [Option<MtpHeadCheckpoint>; crate::seam::TURN_CHECKPOINT_COUNT],
     pending_id: Option<u32>,
     /// Whether `pending_id` has already been streamed by ordinary decode. MTP still has to feed
     /// that row into the target, but must not stream or count it a second time.
@@ -338,6 +355,11 @@ struct MtpSlotState {
     /// Ordinary decode advances the live recurrent state beyond the last speculative checkpoint.
     target_snapshot_dirty: bool,
     multimodal_key: Option<MultimodalKey>,
+}
+
+struct MtpHeadCheckpoint {
+    tokens: Vec<u32>,
+    last_h: Vec<f32>,
 }
 
 impl BatchWork {
@@ -741,6 +763,7 @@ impl ParallelSeam {
                     )?,
                     cached: Vec::new(),
                     last_h: vec![0.0; model.config().hc_mult * model.config().n_embd],
+                    turn_checkpoints: std::array::from_fn(|_| None),
                     pending_id: None,
                     pending_emitted: false,
                     target_snapshot_dirty: false,
@@ -1556,6 +1579,18 @@ impl ParallelSeam {
             .kv
             .take()
             .expect("completed decode work owns a KV slot");
+        if self.model.engine_cfg().debug.state_trace {
+            let checkpoints = kv
+                .session_state_meta()
+                .checkpoint_tokens
+                .map(|tokens| tokens.map(|tokens| tokens.len()));
+            tracing::warn!(
+                "[parallel state trace] slot={} complete target={} recurrent_checkpoints={:?}",
+                work.slot,
+                kv.cached_len(),
+                checkpoints,
+            );
+        }
         let Some(channels) = work.channels.take() else {
             self.return_detached_slot(work.slot, kv);
             return;
@@ -2343,15 +2378,73 @@ impl ParallelSeam {
         let cfg = self.model.config();
         let ec = self.model.engine_cfg();
         let h_width = cfg.hc_mult * cfg.n_embd;
+        let prompt = &work.prompt[..work.prompt_end];
+        let _gate = req.gate_pass();
+        let prepared = crate::seam::prepare_dense_vulkan_parallel_prompt_session(
+            self.vk.as_ref(),
+            cfg,
+            ec,
+            work.kv.as_mut().expect("MTP work has target KV"),
+            prompt,
+            work.turn_checkpoint,
+        )?;
         let heads = self.mtp_heads.as_ref().expect("MTP scheduler has heads");
         let mut heads = heads.lock().expect("MTP heads poisoned");
         let lane = &mut heads[work.slot];
-        let prompt = &work.prompt[..work.prompt_end];
+        if ec.debug.state_trace {
+            let recurrent = work
+                .kv()
+                .session_state_meta()
+                .checkpoint_tokens
+                .map(|tokens| tokens.map(|tokens| tokens.len()));
+            let head = lane.turn_checkpoints.each_ref().map(|checkpoint| {
+                checkpoint
+                    .as_ref()
+                    .map(|checkpoint| checkpoint.tokens.len())
+            });
+            tracing::warn!(
+                "[MTP state trace] slot={} target={} head_live={} recurrent_checkpoints={:?} head_checkpoints={:?}",
+                work.slot,
+                work.kv().cached_len(),
+                lane.cached.len(),
+                recurrent,
+                head,
+            );
+        }
+        for checkpoint in &mut lane.turn_checkpoints {
+            if checkpoint
+                .as_ref()
+                .is_some_and(|checkpoint| !prompt.starts_with(&checkpoint.tokens))
+            {
+                *checkpoint = None;
+            }
+        }
+        let target_prefix = work.kv().cached_tokens();
         let reusable = lane.pending_id.is_some()
             && lane.multimodal_key == work.multimodal_key
-            && lane.cached == work.kv().cached_tokens()
+            && lane.cached == target_prefix
             && prompt.starts_with(&lane.cached);
-        if !reusable {
+        let restored_head = (!reusable && lane.multimodal_key == work.multimodal_key)
+            .then(|| {
+                lane.turn_checkpoints.iter().flatten().find(|checkpoint| {
+                    checkpoint.tokens.as_slice() == target_prefix
+                        && lane.cached.starts_with(&checkpoint.tokens)
+                })
+            })
+            .flatten()
+            .map(|checkpoint| (checkpoint.tokens.clone(), checkpoint.last_h.clone()));
+        if let Some((tokens, last_h)) = restored_head {
+            lane.cached = tokens;
+            lane.last_h = last_h;
+            lane.pending_id = None;
+            lane.pending_emitted = false;
+            lane.target_snapshot_dirty = false;
+            tracing::debug!(
+                slot = work.slot,
+                cached_tokens = lane.cached.len(),
+                "restored MTP head turn checkpoint"
+            );
+        } else if !reusable {
             work.kv.as_mut().expect("MTP work has target KV").reset();
             lane.cached.clear();
             lane.last_h.fill(0.0);
@@ -2364,8 +2457,24 @@ impl ParallelSeam {
         work.prefill_start = start;
         work.stats.n_cached += start;
         work.stats.n_prompt += prompt.len() - start;
+        let progress_events = work
+            .channels
+            .as_ref()
+            .map(|channels| channels.events.clone());
+        if let Some(events) = progress_events.as_ref() {
+            let _ = events.send(BatchEvent::Progress {
+                progress: infr_core::GenerationProgress {
+                    phase: infr_core::GenerationPhase::Prefill,
+                    prompt_tokens: work.prompt_end as u64,
+                    cached_prompt_tokens: start as u64,
+                    prefill_tokens: 0,
+                    completion_tokens: 0,
+                    context_tokens: start as u64,
+                    context_limit: self.max_ctx as u64,
+                },
+            });
+        }
         let t0 = Instant::now();
-        let _gate = req.gate_pass();
         let (bind, finish) = crate::seam::vulkan_moe_binder(
             self.vk.as_ref(),
             self.model.gguf(),
@@ -2375,8 +2484,11 @@ impl ParallelSeam {
             self.max_ctx,
         )?;
         let chunk = crate::seam::ubatch_rows(ec).max(1);
-        for chunk_start in (start..prompt.len()).step_by(chunk) {
-            let chunk_end = (chunk_start + chunk).min(prompt.len());
+        let checkpoint_boundaries = prepared.checkpoint_boundaries;
+        let mut chunk_start = start;
+        while chunk_start < prompt.len() {
+            let chunk_end =
+                mtp_prime_chunk_end(chunk_start, prompt.len(), chunk, &checkpoint_boundaries);
             let rows = chunk_end - chunk_start;
             let (pending, hidden) = crate::mtp::run_qwen4_prime_frontier_with_finish(
                 self.vk.as_ref(),
@@ -2409,11 +2521,55 @@ impl ParallelSeam {
                 work.mrope_plan.as_ref(),
                 work.kv().mtp_shared_weights(),
             )?;
+            for (index, boundary) in checkpoint_boundaries.iter().copied().enumerate() {
+                let Some(boundary) =
+                    boundary.filter(|&boundary| boundary > chunk_start && boundary <= chunk_end)
+                else {
+                    continue;
+                };
+                let hidden_row = boundary - chunk_start - 1;
+                work.kv
+                    .as_mut()
+                    .expect("MTP work has target KV")
+                    .capture_turn_recurrent(self.vk.as_ref(), cfg, index, &prompt[..boundary])?;
+                lane.turn_checkpoints[index] = Some(MtpHeadCheckpoint {
+                    tokens: prompt[..boundary].to_vec(),
+                    last_h: hidden[hidden_row * h_width..(hidden_row + 1) * h_width].to_vec(),
+                });
+                if ec.debug.state_trace {
+                    let recurrent = work
+                        .kv()
+                        .session_state_meta()
+                        .checkpoint_tokens
+                        .map(|tokens| tokens.map(|tokens| tokens.len()));
+                    tracing::warn!(
+                        "[MTP state trace] slot={} captured_head_checkpoint={} tokens={} recurrent_checkpoints={:?}",
+                        work.slot,
+                        index,
+                        boundary,
+                        recurrent,
+                    );
+                }
+            }
             lane.last_h.copy_from_slice(&hidden[(rows - 1) * h_width..]);
             lane.pending_id = Some(pending);
             lane.pending_emitted = false;
             lane.cached
                 .extend_from_slice(&prompt[chunk_start..chunk_end]);
+            if let Some(events) = progress_events.as_ref() {
+                let _ = events.send(BatchEvent::Progress {
+                    progress: infr_core::GenerationProgress {
+                        phase: infr_core::GenerationPhase::Prefill,
+                        prompt_tokens: work.prompt_end as u64,
+                        cached_prompt_tokens: start as u64,
+                        prefill_tokens: chunk_end.saturating_sub(start) as u64,
+                        completion_tokens: 0,
+                        context_tokens: chunk_end as u64,
+                        context_limit: self.max_ctx as u64,
+                    },
+                });
+            }
+            chunk_start = chunk_end;
         }
         lane.multimodal_key = work.multimodal_key;
         anyhow::ensure!(lane.pending_id.is_some(), "MTP prime has no frontier token");
@@ -2421,6 +2577,19 @@ impl ParallelSeam {
             .as_mut()
             .expect("MTP work has target KV")
             .mtp_snapshot_delta(self.vk.as_ref(), cfg)?;
+        if ec.debug.state_trace {
+            let recurrent = work
+                .kv()
+                .session_state_meta()
+                .checkpoint_tokens
+                .map(|tokens| tokens.map(|tokens| tokens.len()));
+            tracing::warn!(
+                "[MTP state trace] slot={} prime_complete target={} recurrent_checkpoints={:?}",
+                work.slot,
+                work.kv().cached_len(),
+                recurrent,
+            );
+        }
         lane.target_snapshot_dirty = false;
         work.stats.prompt_secs += t0.elapsed().as_secs_f64();
         work.phase = BatchPhase::Decode;
@@ -3225,9 +3394,9 @@ impl ParallelSeam {
 #[cfg(test)]
 mod tests {
     use super::{
-        expand_multimodal_prompt, mtp_accepted_rows, multimodal_key, multimodal_token_position,
-        phase_for_remaining_prefill, pick_continuation, scheduler_mode, BatchPhase,
-        MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
+        expand_multimodal_prompt, mtp_accepted_rows, mtp_prime_chunk_end, multimodal_key,
+        multimodal_token_position, phase_for_remaining_prefill, pick_continuation, scheduler_mode,
+        BatchPhase, MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
     };
     use std::sync::Arc;
 
@@ -3253,6 +3422,14 @@ mod tests {
         assert_eq!(mtp_accepted_rows(&candidates, &[11, 12, 99, 0]), 3);
         assert_eq!(mtp_accepted_rows(&candidates, &[11, 12, 13, 99]), 4);
         assert_eq!(mtp_accepted_rows(&[5, 6, 7], &[5, 6, 7, 8]), 4);
+    }
+
+    #[test]
+    fn mtp_prime_stops_exactly_at_each_turn_checkpoint() {
+        let checkpoints = [Some(789), Some(2405)];
+        assert_eq!(mtp_prime_chunk_end(0, 4064, 2048, &checkpoints), 789);
+        assert_eq!(mtp_prime_chunk_end(789, 4064, 2048, &checkpoints), 2405);
+        assert_eq!(mtp_prime_chunk_end(2405, 4064, 2048, &checkpoints), 4064);
     }
 
     #[test]
