@@ -478,6 +478,25 @@ impl BatchWork {
     }
 }
 
+fn token_lane_sort_key(
+    has_mrope: bool,
+    remaining_prefill: usize,
+    slot: usize,
+) -> (bool, std::cmp::Reverse<usize>, usize) {
+    (!has_mrope, std::cmp::Reverse(remaining_prefill), slot)
+}
+
+fn sort_token_lane_indices(active: &[BatchWork], indices: &mut [usize]) {
+    indices.sort_by_key(|&index| {
+        let work = &active[index];
+        token_lane_sort_key(
+            work.mrope_plan.is_some(),
+            work.remaining_prefill(),
+            work.slot,
+        )
+    });
+}
+
 struct BatchChannels {
     events: SyncSender<BatchEvent>,
     acknowledgements: Receiver<bool>,
@@ -3101,8 +3120,7 @@ impl ParallelSeam {
                     continue;
                 }
                 let mut indices = (0..active.len()).collect::<Vec<_>>();
-                indices
-                    .sort_by_key(|&index| (active[index].mrope_plan.is_none(), active[index].slot));
+                sort_token_lane_indices(&active, &mut indices);
                 let sync_mtp = indices.iter().any(|&index| active[index].mtp_ready);
                 if let Err(error) =
                     self.run_token_group(&mut active, &indices, MTP_PLAIN_SYNC_QUANTUM, sync_mtp)
@@ -3453,12 +3471,7 @@ impl ParallelSeam {
             // following graph is rebuilt with the correct per-lane QSA geometry.
             let mut indices = (0..active.len()).collect::<Vec<_>>();
             // The primary lane decides whether the shared graph carries MRoPE history.
-            indices.sort_by_key(|&index| {
-                (
-                    active[index].mrope_plan.is_none(),
-                    std::cmp::Reverse(active[index].remaining_prefill()),
-                )
-            });
+            sort_token_lane_indices(&active, &mut indices);
             if let Err(error) = self.run_token_group(&mut active, &indices, usize::MAX, false) {
                 self.fail_unified_scheduler(&mut active, error);
                 return;
@@ -3888,7 +3901,7 @@ mod tests {
     use super::{
         expand_multimodal_prompt, mtp_accepted_rows, mtp_prime_chunk_end, multimodal_key,
         multimodal_token_position, phase_for_remaining_prefill, pick_continuation, scheduler_mode,
-        BatchPhase, MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
+        token_lane_sort_key, BatchPhase, MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
     };
     use std::sync::Arc;
 
@@ -3904,6 +3917,15 @@ mod tests {
             phase_for_remaining_prefill(SHORT_PREFILL_TOKENS + 1),
             BatchPhase::LongPrefill
         );
+    }
+
+    #[test]
+    fn token_lanes_put_longer_prefill_before_decode() {
+        let mut lanes = [(0usize, false, 0usize), (1, false, 37)];
+        lanes.sort_by_key(|&(slot, has_mrope, remaining)| {
+            token_lane_sort_key(has_mrope, remaining, slot)
+        });
+        assert_eq!(lanes.map(|lane| lane.0), [1, 0]);
     }
 
     #[test]
