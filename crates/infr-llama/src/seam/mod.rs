@@ -25,6 +25,7 @@ mod ple;
 mod runner;
 mod sc;
 mod segmented_kv;
+pub(crate) use segmented_kv::KV_GROW_ROWS;
 mod session_state;
 mod weights;
 
@@ -3474,7 +3475,19 @@ pub(crate) fn vulkan_moe_binder<'a>(
             .as_ref()
             .map(|layout| layout.committed_bytes(want_ctx))
             .unwrap_or(0);
-        let dynamic_kv_reserve = total_slot_state_bytes(dynamic_kv_reserve_per_slot);
+        let mtp_kv_spec = (ec.spec.mtp && cfg.qwen4exp)
+            .then(|| crate::mtp::qwen4_mtp_kv_spec(cfg, want_ctx))
+            .transpose()?;
+        let mtp_dynamic_reserve_per_slot = mtp_kv_spec
+            .map(|spec| {
+                (spec.segment_bytes as u64)
+                    .saturating_mul(spec.max_segments as u64)
+                    .saturating_mul(2)
+            })
+            .unwrap_or(0);
+        let dynamic_kv_reserve = total_slot_state_bytes(
+            dynamic_kv_reserve_per_slot.saturating_add(mtp_dynamic_reserve_per_slot),
+        );
         dynamic_state_max_allocation_bytes = dynamic_layout
             .as_ref()
             .and_then(|layout| {
@@ -3484,13 +3497,19 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     .map(|plane| plane.segment_bytes() as u64)
                     .max()
             })
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max(
+                mtp_kv_spec
+                    .map(|spec| spec.segment_bytes as u64)
+                    .unwrap_or(0),
+            );
         let kv_bytes_at =
             |ubatch| kv_state_reserve_bytes(cfg, ec, want_ctx, ring, ubatch, k_fmt, v_fmt);
         let initial_ubatch = ubatch_rows(ec);
         let mut selected_ubatch = initial_ubatch;
         let kv_bytes = total_slot_state_bytes(kv_bytes_at(selected_ubatch));
-        let persistent_state = kv_bytes.saturating_sub(dynamic_kv_reserve);
+        let persistent_state =
+            kv_bytes.saturating_sub(total_slot_state_bytes(dynamic_kv_reserve_per_slot));
         // Reserve the workspace for the chunk this session will actually execute. A user selecting
         // 4096 rows still gets the full 4K reserve; a lower selected rung no longer strands the
         // difference behind a permanent 2 GiB/4K assumption. Prefill's layer ring already borrows
@@ -3531,7 +3550,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
         if paged_target.is_some_and(|bytes| bytes < prefill_floor) {
             for candidate in moe_ubatch_fallback_candidates(ec).into_iter().skip(1) {
                 let candidate_kv = total_slot_state_bytes(kv_bytes_at(candidate));
-                let candidate_persistent = candidate_kv.saturating_sub(dynamic_kv_reserve);
+                let candidate_persistent = candidate_kv
+                    .saturating_sub(total_slot_state_bytes(dynamic_kv_reserve_per_slot));
                 let candidate_runtime =
                     runtime_reserve_at(cfg, &caps, want_ctx, ring, candidate, k_fmt, v_fmt);
                 let Some(candidate_plan) = ModelMemoryPlan::new_with_dynamic_reserve(
@@ -3621,6 +3641,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
         }
         let cache_layout = if cfg.deepseek4 {
             "fp8-kv+mxfp4-index".to_string()
+        } else if mtp_dynamic_reserve_per_slot > 0 && dynamic_kv_reserve_per_slot > 0 {
+            format!("dynamic-32k target={k_fmt:?}/{v_fmt:?} + mtp=F16/F16")
+        } else if mtp_dynamic_reserve_per_slot > 0 {
+            "dynamic-32k mtp=F16/F16".to_string()
         } else if dynamic_kv_reserve > 0 {
             format!("dynamic-32k k={k_fmt:?}, v={v_fmt:?}")
         } else {
