@@ -1109,6 +1109,32 @@ impl SeamKv {
         live.into_iter().chain(checkpoint).max()
     }
 
+    /// Longest prefix this slot can copy into another slot without replaying model work. Hybrid
+    /// recurrent models can only export their live frontier or a captured turn checkpoint; an
+    /// arbitrary token LCP has no matching recurrent/PLE summary.
+    pub(crate) fn seedable_prefix_len(&self, cfg: &Config, prompt: &[u32]) -> usize {
+        if cfg.qwen35 || cfg.bailingmoe3 || cfg.deepseek4 {
+            return 0;
+        }
+        if !cfg.qwen4exp {
+            return self.prefix_score(prompt);
+        }
+        let live = (!self.cached.is_empty() && prompt.starts_with(&self.cached))
+            .then_some(self.cached.len());
+        let checkpoint = self
+            .turn_recurrent_ckpts
+            .iter()
+            .flatten()
+            .filter(|checkpoint| {
+                checkpoint.valid
+                    && self.cached.starts_with(&checkpoint.tokens)
+                    && prompt.starts_with(&checkpoint.tokens)
+            })
+            .map(|checkpoint| checkpoint.tokens.len())
+            .max();
+        live.into_iter().chain(checkpoint).max().unwrap_or(0)
+    }
+
     /// Forget the materialized tokens WITHOUT dropping weights or buffers: the next call
     /// re-prefills from position 0 into the same session. Bench reps use this so each rep
     /// measures a full prefill while weights/pipelines/repack caches stay warm.
@@ -1749,13 +1775,16 @@ impl SeamKv {
         ec: &crate::EngineConfig,
         src: &SeamKv,
         p: usize,
-    ) -> AResult<()> {
-        if cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3 || cfg.deepseek4 {
-            return Ok(());
+    ) -> AResult<usize> {
+        if cfg.qwen35 || cfg.bailingmoe3 || cfg.deepseek4 {
+            return Ok(0);
+        }
+        if cfg.qwen4exp {
+            return self.seed_qwen4_from(be, cfg, ec, src, p);
         }
         let p = p.min(src.cached.len()).min(self.max_ctx);
         if p == 0 {
-            return Ok(());
+            return Ok(0);
         }
         // SWA ring caches: positions [0, p) sit at rows [0, p) ONLY while the source hasn't
         // wrapped (cached_len <= ring rows) — a wrapped ring recycled exactly those early rows,
@@ -1770,7 +1799,7 @@ impl SeamKv {
                 .map(|l| crate::seam::kv_rows(cfg, l, self.max_ctx, true, ec))
                 .any(|rows_l| src.cached.len() > rows_l);
             if wrapped {
-                return Ok(());
+                return Ok(0);
             }
         }
         for l in 0..cfg.n_layer {
@@ -1796,7 +1825,195 @@ impl SeamKv {
             }
         }
         self.cached = src.cached[..p].to_vec();
-        Ok(())
+        Ok(p)
+    }
+
+    fn seed_qwen4_from(
+        &mut self,
+        be: &dyn Backend,
+        cfg: &Config,
+        ec: &crate::EngineConfig,
+        src: &SeamKv,
+        requested: usize,
+    ) -> AResult<usize> {
+        let requested = requested.min(src.cached.len()).min(self.max_ctx);
+        let live = (requested == src.cached.len() && requested != 0).then_some((requested, None));
+        let checkpoint = src
+            .turn_recurrent_ckpts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, checkpoint)| {
+                let checkpoint = checkpoint.as_ref()?;
+                (checkpoint.valid
+                    && !checkpoint.tokens.is_empty()
+                    && checkpoint.tokens.len() <= requested
+                    && src.cached.starts_with(&checkpoint.tokens))
+                .then_some((checkpoint.tokens.len(), Some(index)))
+            })
+            .max_by_key(|&(tokens, _)| tokens);
+        let Some((tokens, recurrent_checkpoint)) = live
+            .into_iter()
+            .chain(checkpoint)
+            .max_by_key(|&(tokens, _)| tokens)
+        else {
+            return Ok(0);
+        };
+
+        if self.kv_ring {
+            let wrapped = (0..cfg.n_layer)
+                .filter(|&layer| cfg.is_swa_layer(layer))
+                .map(|layer| crate::seam::kv_rows(cfg, layer, self.max_ctx, true, ec))
+                .any(|rows| src.cached.len() > rows);
+            if wrapped {
+                return Ok(0);
+            }
+        }
+
+        self.ensure_segmented_depth(be, cfg, tokens)?;
+        let mut copies: Vec<(&dyn Buffer, usize, &dyn Buffer, usize, usize)> = Vec::new();
+        for layer in 0..cfg.n_layer {
+            if cfg.is_recurrent_layer(layer) {
+                let (src_k, src_v) = if let Some(index) = recurrent_checkpoint {
+                    let checkpoint = src.turn_recurrent_ckpts[index]
+                        .as_ref()
+                        .expect("selected Qwen3.8 checkpoint exists");
+                    let position = checkpoint
+                        .layers
+                        .iter()
+                        .position(|&candidate| candidate == layer)
+                        .ok_or_else(|| {
+                            anyhow!("Qwen3.8 checkpoint has no recurrent layer {layer}")
+                        })?;
+                    (
+                        checkpoint.kbufs[position].as_ref(),
+                        checkpoint.vbufs[position].as_ref(),
+                    )
+                } else {
+                    (src.kbufs[layer].as_ref(), src.vbufs[layer].as_ref())
+                };
+                copies.push((src_k, 0, self.kbufs[layer].as_ref(), 0, src_k.len_bytes()));
+                copies.push((src_v, 0, self.vbufs[layer].as_ref(), 0, src_v.len_bytes()));
+                continue;
+            }
+
+            let (k_row, v_row) = crate::seam::kv_row_elems(cfg, layer);
+            let k_bytes = kv_fmt_bytes(self.k_fmt, tokens * k_row);
+            if k_bytes != 0 {
+                copies.push((
+                    src.kbufs[layer].as_ref(),
+                    0,
+                    self.kbufs[layer].as_ref(),
+                    0,
+                    k_bytes,
+                ));
+            }
+            let v_bytes = kv_fmt_bytes(self.v_fmt, tokens * v_row);
+            if v_bytes != 0 {
+                copies.push((
+                    src.vbufs[layer].as_ref(),
+                    0,
+                    self.vbufs[layer].as_ref(),
+                    0,
+                    v_bytes,
+                ));
+            }
+            if let (Some(src_raw), Some(dst_raw)) = (
+                src.qsa_kbufs[layer].as_deref(),
+                self.qsa_kbufs[layer].as_deref(),
+            ) {
+                let bytes = tokens
+                    .saturating_mul(cfg.indexer_head_size)
+                    .saturating_mul(2);
+                if bytes != 0 {
+                    copies.push((src_raw, 0, dst_raw, 0, bytes));
+                }
+            }
+            if let (Some(src_blocks), Some(dst_blocks)) = (
+                src.qsa_cbufs[layer].as_deref(),
+                self.qsa_cbufs[layer].as_deref(),
+            ) {
+                let rows = tokens / cfg.layer_compress_ratio(layer).max(1);
+                let bytes = rows.saturating_mul(cfg.indexer_head_size).saturating_mul(4);
+                if bytes != 0 {
+                    copies.push((src_blocks, 0, dst_blocks, 0, bytes));
+                }
+            }
+        }
+        if let (Some(src_ple), Some(dst_ple)) = (
+            recurrent_checkpoint
+                .and_then(|index| src.turn_recurrent_ckpts[index].as_ref())
+                .and_then(|checkpoint| checkpoint.ple_state.as_deref())
+                .or(src.ple_state_buf.as_deref()),
+            self.ple_state_buf.as_deref(),
+        ) {
+            copies.push((src_ple, 0, dst_ple, 0, src_ple.len_bytes()));
+        }
+        be.copy_buffer_ranges(&copies)
+            .map_err(|error| anyhow!("seed Qwen3.8 live state: {error}"))?;
+        drop(copies);
+
+        for checkpoint in self.turn_recurrent_ckpts.iter_mut().flatten() {
+            checkpoint.invalidate();
+        }
+        let selected_tokens = &src.cached[..tokens];
+        for index in 0..super::TURN_CHECKPOINT_COUNT {
+            let Some(source) = src.turn_recurrent_ckpts[index]
+                .as_ref()
+                .filter(|checkpoint| {
+                    checkpoint.valid && selected_tokens.starts_with(&checkpoint.tokens)
+                })
+            else {
+                continue;
+            };
+            if self.turn_recurrent_ckpts[index].is_none() {
+                TurnRecurrentCkpt::begin(
+                    &mut self.turn_recurrent_ckpts[index],
+                    be,
+                    cfg,
+                    &self.kbufs,
+                    &self.vbufs,
+                    self.ple_state_buf.as_deref(),
+                    &source.tokens,
+                )?;
+            }
+            let target = self.turn_recurrent_ckpts[index]
+                .as_mut()
+                .expect("Qwen3.8 fork has recurrent checkpoint storage");
+            let mut checkpoint_copies = Vec::with_capacity(
+                source.layers.len() * 2 + usize::from(source.ple_state.is_some()),
+            );
+            for (position, &layer) in source.layers.iter().enumerate() {
+                let target_position = target
+                    .layers
+                    .iter()
+                    .position(|&candidate| candidate == layer)
+                    .ok_or_else(|| anyhow!("Qwen3.8 seed target has no recurrent layer {layer}"))?;
+                checkpoint_copies.push((
+                    source.kbufs[position].as_ref(),
+                    target.kbufs[target_position].as_ref(),
+                    source.kbufs[position].len_bytes(),
+                ));
+                checkpoint_copies.push((
+                    source.vbufs[position].as_ref(),
+                    target.vbufs[target_position].as_ref(),
+                    source.vbufs[position].len_bytes(),
+                ));
+            }
+            if let (Some(source), Some(target)) =
+                (source.ple_state.as_deref(), target.ple_state.as_deref())
+            {
+                checkpoint_copies.push((source, target, source.len_bytes()));
+            }
+            be.copy_buffers(&checkpoint_copies)
+                .map_err(|error| anyhow!("seed Qwen3.8 turn checkpoint {index}: {error}"))?;
+            target.tokens.clone_from(&source.tokens);
+            target.copied.fill(true);
+            target.ple_copied = true;
+            target.valid = true;
+        }
+        self.cached.clear();
+        self.cached.extend_from_slice(selected_tokens);
+        Ok(tokens)
     }
 }
 

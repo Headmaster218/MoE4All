@@ -34,7 +34,7 @@
 
 use crate::sampling::{ParallelSampler, RequestCtx, RequestSampling, StepGate};
 use crate::seam::SeamKv;
-use crate::session_cache::SessionCache;
+use crate::session_cache::{MtpCacheSource, SessionCache};
 use crate::{Config, GenStats, SeamModel};
 use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
@@ -340,6 +340,8 @@ struct BatchWork {
     finished: bool,
     sampling: RequestSampling,
     sampler: Option<ParallelSampler>,
+    reasoning_guard: crate::sampling::Qwen4ReasoningEosGuard,
+    mtp_ready: bool,
     channels: Option<BatchChannels>,
 }
 
@@ -347,7 +349,8 @@ struct MtpSlotState {
     head: crate::mtp::Qwen4MtpSession,
     cached: Vec<u32>,
     last_h: Vec<f32>,
-    turn_checkpoints: [Option<MtpHeadCheckpoint>; crate::seam::TURN_CHECKPOINT_COUNT],
+    turn_checkpoints:
+        [Option<crate::mtp::Qwen4MtpCheckpointState>; crate::seam::TURN_CHECKPOINT_COUNT],
     pending_id: Option<u32>,
     /// Whether `pending_id` has already been streamed by ordinary decode. MTP still has to feed
     /// that row into the target, but must not stream or count it a second time.
@@ -355,11 +358,108 @@ struct MtpSlotState {
     /// Ordinary decode advances the live recurrent state beyond the last speculative checkpoint.
     target_snapshot_dirty: bool,
     multimodal_key: Option<MultimodalKey>,
+    live_valid: bool,
 }
 
-struct MtpHeadCheckpoint {
-    tokens: Vec<u32>,
-    last_h: Vec<f32>,
+impl MtpSlotState {
+    fn invalidate_all(&mut self) {
+        self.cached.clear();
+        self.last_h.fill(0.0);
+        self.turn_checkpoints.fill(None);
+        self.pending_id = None;
+        self.pending_emitted = false;
+        self.target_snapshot_dirty = false;
+        self.multimodal_key = None;
+        self.live_valid = false;
+    }
+
+    fn invalidate_live(&mut self) {
+        self.pending_id = None;
+        self.pending_emitted = false;
+        self.target_snapshot_dirty = false;
+        self.live_valid = false;
+    }
+
+    fn cache_state_for(&self, target: &[u32]) -> Option<crate::mtp::Qwen4MtpCacheState> {
+        (self.live_valid && self.multimodal_key.is_none() && self.cached == target).then(|| {
+            crate::mtp::Qwen4MtpCacheState {
+                cached: self.cached.clone(),
+                last_h: self.last_h.clone(),
+                turn_checkpoints: self.turn_checkpoints.clone(),
+                pending_id: self.pending_id,
+                pending_emitted: self.pending_emitted,
+            }
+        })
+    }
+
+    fn install_cache_state(&mut self, state: crate::mtp::Qwen4MtpCacheState) {
+        self.cached = state.cached;
+        self.last_h = state.last_h;
+        self.turn_checkpoints = state.turn_checkpoints;
+        self.pending_id = state.pending_id;
+        self.pending_emitted = state.pending_emitted;
+        self.target_snapshot_dirty = false;
+        self.multimodal_key = None;
+        self.live_valid = true;
+    }
+
+    fn seed_from(
+        &mut self,
+        backend: &dyn infr_core::backend::Backend,
+        source: &MtpSlotState,
+        tokens: &[u32],
+    ) -> Result<bool> {
+        if source.multimodal_key.is_some() || tokens.is_empty() {
+            self.invalidate_all();
+            return Ok(false);
+        }
+        let live = (source.live_valid && source.cached == tokens).then(|| {
+            (
+                source.last_h.clone(),
+                source.pending_id,
+                source.pending_emitted,
+            )
+        });
+        let checkpoint = source
+            .turn_checkpoints
+            .iter()
+            .flatten()
+            .find(|checkpoint| checkpoint.tokens == tokens)
+            .map(|checkpoint| (checkpoint.last_h.clone(), None, false));
+        let Some((last_h, pending_id, pending_emitted)) = live.or(checkpoint) else {
+            self.invalidate_all();
+            return Ok(false);
+        };
+        self.head
+            .copy_prefix_from(backend, &source.head, tokens.len())?;
+        self.cached.clear();
+        self.cached.extend_from_slice(tokens);
+        self.last_h = last_h;
+        self.turn_checkpoints = source.turn_checkpoints.clone().map(|checkpoint| {
+            checkpoint.filter(|checkpoint| tokens.starts_with(&checkpoint.tokens))
+        });
+        self.pending_id = pending_id;
+        self.pending_emitted = pending_emitted;
+        self.target_snapshot_dirty = false;
+        self.multimodal_key = None;
+        self.live_valid = true;
+        Ok(true)
+    }
+}
+
+fn mtp_slot_pair_mut(
+    slots: &mut [MtpSlotState],
+    target: usize,
+    source: usize,
+) -> (&mut MtpSlotState, &MtpSlotState) {
+    debug_assert_ne!(target, source);
+    if target < source {
+        let (left, right) = slots.split_at_mut(source);
+        (&mut left[target], &right[0])
+    } else {
+        let (left, right) = slots.split_at_mut(target);
+        (&mut right[0], &left[source])
+    }
 }
 
 impl BatchWork {
@@ -530,6 +630,7 @@ fn cold_session_worker(
     cache: Arc<Mutex<SessionCache>>,
     backend: Arc<infr_vulkan::VulkanBackend>,
     gate: Option<Arc<StepGate>>,
+    mtp_heads: Option<Arc<Mutex<Vec<MtpSlotState>>>>,
     model_cfg: Config,
     idle_for: Duration,
     stop: Arc<AtomicBool>,
@@ -594,12 +695,38 @@ fn cold_session_worker(
         };
 
         let _gate = gate.as_deref().map(StepGate::enter);
+        let mut heads = mtp_heads.as_ref().map(|heads| {
+            heads
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
         let mut cache = match cache.lock() {
             Ok(cache) => cache,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let spill_failed = match cache.spill(&mut kv, backend.as_ref(), &model_cfg) {
-            Ok(true) => false,
+        let mtp_state = heads
+            .as_ref()
+            .and_then(|heads| heads[index].cache_state_for(kv.cached_tokens()));
+        let mtp_source = heads
+            .as_ref()
+            .zip(mtp_state.as_ref())
+            .map(|(heads, state)| MtpCacheSource {
+                head: &heads[index].head,
+                state,
+            });
+        let spill_failed = match cache.spill(&mut kv, backend.as_ref(), &model_cfg, mtp_source) {
+            Ok(true) => {
+                if let Some(heads) = heads.as_mut() {
+                    if let Err(error) = heads[index].head.release_kv(backend.as_ref()) {
+                        tracing::warn!(
+                            slot = index,
+                            "cold KV idle spill could not release stale MTP head KV: {error}"
+                        );
+                    }
+                    heads[index].invalidate_all();
+                }
+                false
+            }
             Ok(false) => kv.cached_len() != 0,
             Err(error) => {
                 tracing::warn!(
@@ -613,6 +740,7 @@ fn cold_session_worker(
             tracing::warn!("cold KV cache maintenance failed: {error}");
         }
         drop(cache);
+        drop(heads);
         drop(_gate);
 
         let mut pool_guard = match pool.lock() {
@@ -774,6 +902,7 @@ impl ParallelSeam {
                     pending_emitted: false,
                     target_snapshot_dirty: false,
                     multimodal_key: None,
+                    live_valid: false,
                 });
             }
             Some(Arc::new(Mutex::new(heads)))
@@ -852,6 +981,7 @@ impl ParallelSeam {
         let backend = Arc::clone(&self.vk);
         let gate = self.gate.as_ref().map(Arc::clone);
         let model_cfg = self.model.config().clone();
+        let mtp_heads = self.mtp_heads.as_ref().map(Arc::clone);
         let idle = self.session_idle;
         let thread = std::thread::Builder::new()
             .name("infr-kv-cold".into())
@@ -862,6 +992,7 @@ impl ParallelSeam {
                     cache,
                     backend,
                     gate,
+                    mtp_heads,
                     model_cfg,
                     idle,
                     worker_stop,
@@ -1128,7 +1259,8 @@ impl ParallelSeam {
                 if s.multimodal_key.is_some() {
                     0
                 } else {
-                    s.kv.as_ref().map_or(0, |k| k.prefix_score(prompt))
+                    s.kv.as_ref()
+                        .map_or(0, |k| k.seedable_prefix_len(cfg, prompt))
                 }
             };
             // 1. This conversation continuing: the free slot with the LONGEST reusable prefix among
@@ -1179,12 +1311,35 @@ impl ParallelSeam {
                         let src = p.slots[best].kv.take().expect("scored slot is Some");
                         let mut dst = p.slots[target].kv.take();
                         drop(p);
-                        let r = {
+                        let r: Result<usize> = {
                             let _gp = req.gate_pass();
-                            match dst.as_mut() {
+                            let seeded = match dst.as_mut() {
                                 Some(dst) => dst.seed_from(self.vk.as_ref(), cfg, ec, &src, best_s),
-                                None => Ok(()),
-                            }
+                                None => Ok(0),
+                            };
+                            seeded.map(|seeded| {
+                                if seeded != 0 {
+                                    if let Some(heads) = &self.mtp_heads {
+                                        let mut heads = heads.lock().expect("MTP heads poisoned");
+                                        let tokens = &src.cached_tokens()[..seeded];
+                                        let (target_lane, source_lane) =
+                                            mtp_slot_pair_mut(&mut heads, target, best);
+                                        if let Err(error) = target_lane.seed_from(
+                                            self.vk.as_ref(),
+                                            source_lane,
+                                            tokens,
+                                        ) {
+                                            target_lane.invalidate_all();
+                                            tracing::warn!(
+                                                slot = target,
+                                                source_slot = best,
+                                                "MTP prefix seed failed; preserving the seeded main KV and using ordinary decode: {error}"
+                                            );
+                                        }
+                                    }
+                                }
+                                seeded
+                            })
                         };
                         p = self.pool.lock().expect("pool poisoned");
                         // Return the source slot's KV and release its reservation; `target` stays
@@ -1195,6 +1350,12 @@ impl ParallelSeam {
                         // A failed seed costs only the prefix reuse — the slot re-prefills from
                         // scratch and the answer is identical. Never fail the request for it.
                         if let Err(e) = r {
+                            if let Some(kv) = p.slots[target].kv.as_mut() {
+                                kv.reset();
+                            }
+                            if let Some(heads) = &self.mtp_heads {
+                                heads.lock().expect("MTP heads poisoned")[target].invalidate_all();
+                            }
                             tracing::warn!(
                                 "kv slots: prefix seed failed ({e}); re-prefilling instead"
                             );
@@ -1213,6 +1374,9 @@ impl ParallelSeam {
             if incompatible {
                 if let Some(kv) = kv.as_mut() {
                     kv.reset();
+                }
+                if let Some(heads) = &self.mtp_heads {
+                    heads.lock().expect("MTP heads poisoned")[target].invalidate_all();
                 }
             }
             return Ok(SlotGuard {
@@ -1255,7 +1419,7 @@ impl ParallelSeam {
                 }),
                 prompt.len(),
             );
-            let resident_prefix = continuation
+            let continuation_prefix = continuation
                 .and_then(|index| {
                     pool.slots[index]
                         .kv
@@ -1273,6 +1437,26 @@ impl ParallelSeam {
                     })
                     .expect("free is non-empty")
             });
+            let seed_source = continuation
+                .is_none()
+                .then(|| {
+                    free.iter()
+                        .copied()
+                        .filter(|&index| {
+                            index != target && pool.slots[index].multimodal_key.is_none()
+                        })
+                        .filter_map(|index| {
+                            let prefix = pool.slots[index]
+                                .kv
+                                .as_ref()
+                                .map_or(0, |kv| kv.seedable_prefix_len(cfg, prompt));
+                            (prefix >= 16).then_some((index, prefix))
+                        })
+                        .max_by_key(|&(_, prefix)| prefix)
+                })
+                .flatten();
+            let resident_prefix =
+                continuation_prefix.max(seed_source.map_or(0, |(_, prefix)| prefix));
 
             pool.tick += 1;
             let tick = pool.tick;
@@ -1281,12 +1465,25 @@ impl ParallelSeam {
             pool.slots[target].idle_since = None;
             let incompatible = pool.slots[target].multimodal_key.take().is_some();
             let mut target_kv = pool.slots[target].kv.take();
+            let mut seed_kv = seed_source.map(|(source, prefix)| {
+                pool.slots[source].busy = true;
+                pool.slots[source].idle_since = None;
+                let kv = pool.slots[source]
+                    .kv
+                    .take()
+                    .expect("scored cold-cache seed slot has KV");
+                (source, prefix, kv)
+            });
             drop(pool);
 
             {
                 // One pass owns both the inference baton and the cache catalog. No other request
                 // can submit against a state buffer while it is being downloaded or restored.
                 let _gate = req.gate_pass();
+                let mut heads = self
+                    .mtp_heads
+                    .as_ref()
+                    .map(|heads| heads.lock().expect("MTP heads poisoned"));
                 let mut cache = match cache_mutex.lock() {
                     Ok(cache) => cache,
                     Err(poisoned) => poisoned.into_inner(),
@@ -1294,6 +1491,9 @@ impl ParallelSeam {
                 if incompatible {
                     if let Some(kv) = target_kv.as_mut() {
                         kv.reset();
+                    }
+                    if let Some(heads) = heads.as_mut() {
+                        heads[target].invalidate_all();
                     }
                 }
 
@@ -1309,8 +1509,24 @@ impl ParallelSeam {
                     );
                     let mut released = false;
                     if kv.cached_len() != 0 {
-                        match cache.spill(kv, self.vk.as_ref(), cfg) {
-                            Ok(true) => released = true,
+                        let mtp_state = heads
+                            .as_ref()
+                            .and_then(|heads| heads[target].cache_state_for(kv.cached_tokens()));
+                        let mtp_source =
+                            heads
+                                .as_ref()
+                                .zip(mtp_state.as_ref())
+                                .map(|(heads, state)| MtpCacheSource {
+                                    head: &heads[target].head,
+                                    state,
+                                });
+                        match cache.spill(kv, self.vk.as_ref(), cfg, mtp_source) {
+                            Ok(true) => {
+                                released = true;
+                                if let Some(heads) = heads.as_mut() {
+                                    heads[target].invalidate_all();
+                                }
+                            }
                             Ok(false) => {}
                             Err(error) => {
                                 tracing::warn!(
@@ -1318,6 +1534,9 @@ impl ParallelSeam {
                                     "cold KV replacement spill failed; recycling the slot: {error}"
                                 );
                                 kv.reset();
+                                if let Some(heads) = heads.as_mut() {
+                                    heads[target].invalidate_all();
+                                }
                             }
                         }
                     }
@@ -1326,12 +1545,36 @@ impl ParallelSeam {
                             || kv.release_session_state(self.vk.as_ref(), cfg).is_ok();
                     }
                     if released {
-                        match cache.restore(entry, kv, self.vk.as_ref(), cfg) {
-                            Ok(()) => {}
-                            Err(error) => tracing::warn!(
-                                slot = target,
-                                "cold KV restore failed; re-prefilling the request: {error}"
-                            ),
+                        if let Some(heads) = heads.as_mut() {
+                            if let Err(error) = heads[target].head.release_kv(self.vk.as_ref()) {
+                                tracing::warn!(
+                                    slot = target,
+                                    "cold KV replacement could not release stale MTP head KV: {error}"
+                                );
+                            }
+                            heads[target].invalidate_all();
+                        }
+                        let mtp_head = heads.as_ref().map(|heads| &heads[target].head);
+                        match cache.restore(entry, kv, self.vk.as_ref(), cfg, mtp_head) {
+                            Ok(Some(state)) => {
+                                if let Some(heads) = heads.as_mut() {
+                                    heads[target].install_cache_state(state);
+                                }
+                            }
+                            Ok(None) => {
+                                if let Some(heads) = heads.as_mut() {
+                                    heads[target].invalidate_all();
+                                }
+                            }
+                            Err(error) => {
+                                if let Some(heads) = heads.as_mut() {
+                                    heads[target].invalidate_all();
+                                }
+                                tracing::warn!(
+                                    slot = target,
+                                    "cold KV restore failed; re-prefilling the request: {error}"
+                                );
+                            }
                         }
                     } else {
                         tracing::warn!(
@@ -1340,21 +1583,96 @@ impl ParallelSeam {
                         );
                         cache.return_entry(entry);
                         kv.reset();
+                        if let Some(heads) = heads.as_mut() {
+                            heads[target].invalidate_all();
+                        }
                     }
                 } else if continuation.is_none() {
                     if let Some(kv) = target_kv.as_mut().filter(|kv| kv.cached_len() != 0) {
-                        if let Err(error) = cache.spill(kv, self.vk.as_ref(), cfg) {
+                        let mtp_state = heads
+                            .as_ref()
+                            .and_then(|heads| heads[target].cache_state_for(kv.cached_tokens()));
+                        let mtp_source =
+                            heads
+                                .as_ref()
+                                .zip(mtp_state.as_ref())
+                                .map(|(heads, state)| MtpCacheSource {
+                                    head: &heads[target].head,
+                                    state,
+                                });
+                        if let Err(error) = cache.spill(kv, self.vk.as_ref(), cfg, mtp_source) {
                             tracing::warn!(
                                 slot = target,
                                 "cold KV replacement spill failed; forgetting the old conversation: {error}"
                             );
                             kv.reset();
+                            if let Some(heads) = heads.as_mut() {
+                                heads[target].invalidate_all();
+                            }
+                        } else if let Some(heads) = heads.as_mut() {
+                            if let Err(error) = heads[target].head.release_kv(self.vk.as_ref()) {
+                                tracing::warn!(
+                                    slot = target,
+                                    "cold KV seed target could not release stale MTP head KV: {error}"
+                                );
+                            }
+                            heads[target].invalidate_all();
+                        }
+                    }
+                    if let (Some(kv), Some((source, prefix, source_kv))) =
+                        (target_kv.as_mut(), seed_kv.as_ref())
+                    {
+                        match kv.seed_from(
+                            self.vk.as_ref(),
+                            cfg,
+                            self.model.engine_cfg(),
+                            source_kv,
+                            *prefix,
+                        ) {
+                            Ok(seeded) if seeded != 0 => {
+                                if let Some(heads) = heads.as_mut() {
+                                    let tokens = &source_kv.cached_tokens()[..seeded];
+                                    let (target_lane, source_lane) =
+                                        mtp_slot_pair_mut(heads, target, *source);
+                                    if let Err(error) =
+                                        target_lane.seed_from(self.vk.as_ref(), source_lane, tokens)
+                                    {
+                                        target_lane.invalidate_all();
+                                        tracing::warn!(
+                                            slot = target,
+                                            source_slot = *source,
+                                            "cold-cache MTP prefix seed failed; preserving the seeded main KV and using ordinary decode: {error}"
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                kv.reset();
+                                if let Some(heads) = heads.as_mut() {
+                                    heads[target].invalidate_all();
+                                }
+                                tracing::warn!(
+                                    slot = target,
+                                    source_slot = *source,
+                                    "cold-cache resident prefix seed failed; re-prefilling instead: {error}"
+                                );
+                            }
                         }
                     }
                 }
                 if let Err(error) = cache.gc() {
                     tracing::warn!("cold KV cache maintenance failed: {error}");
                 }
+            }
+
+            if let Some((source, _, source_kv)) = seed_kv.take() {
+                let mut pool = self.pool.lock().expect("pool poisoned");
+                pool.slots[source].kv = Some(source_kv);
+                pool.slots[source].busy = false;
+                pool.slots[source].idle_since = Some(Instant::now());
+                drop(pool);
+                self.freed.notify_all();
             }
 
             return Ok(SlotGuard {
@@ -1421,6 +1739,9 @@ impl ParallelSeam {
                     if let Some(kv) = kv.as_mut() {
                         kv.reset();
                     }
+                    if let Some(heads) = &self.mtp_heads {
+                        heads.lock().expect("MTP heads poisoned")[target].invalidate_all();
+                    }
                 }
                 return SlotGuard {
                     engine: self,
@@ -1484,14 +1805,32 @@ impl ParallelSeam {
                     if let Some(kv) = kv.as_mut().filter(|kv| kv.cached_len() != 0) {
                         if old_key.is_some() {
                             kv.reset();
+                            if let Some(heads) = &self.mtp_heads {
+                                heads.lock().expect("MTP heads poisoned")[target].invalidate_all();
+                            }
                         } else {
                             let _gate = req.gate_pass();
+                            let mut heads = self
+                                .mtp_heads
+                                .as_ref()
+                                .map(|heads| heads.lock().expect("MTP heads poisoned"));
                             let mut cache = match cache_mutex.lock() {
                                 Ok(cache) => cache,
                                 Err(poisoned) => poisoned.into_inner(),
                             };
+                            let mtp_state = heads.as_ref().and_then(|heads| {
+                                heads[target].cache_state_for(kv.cached_tokens())
+                            });
+                            let mtp_source =
+                                heads
+                                    .as_ref()
+                                    .zip(mtp_state.as_ref())
+                                    .map(|(heads, state)| MtpCacheSource {
+                                        head: &heads[target].head,
+                                        state,
+                                    });
                             if let Err(error) =
-                                cache.spill(kv, self.vk.as_ref(), self.model.config())
+                                cache.spill(kv, self.vk.as_ref(), self.model.config(), mtp_source)
                             {
                                 tracing::warn!(
                                     slot = target,
@@ -1499,12 +1838,25 @@ impl ParallelSeam {
                                 );
                                 kv.reset();
                             }
+                            if let Some(heads) = heads.as_mut() {
+                                if let Err(error) = heads[target].head.release_kv(self.vk.as_ref())
+                                {
+                                    tracing::warn!(
+                                        slot = target,
+                                        "multimodal checkout could not release stale MTP head KV: {error}"
+                                    );
+                                }
+                                heads[target].invalidate_all();
+                            }
                             if let Err(error) = cache.gc() {
                                 tracing::warn!("cold KV cache maintenance failed: {error}");
                             }
                         }
                     } else if let Some(kv) = kv.as_mut() {
                         kv.reset();
+                        if let Some(heads) = &self.mtp_heads {
+                            heads.lock().expect("MTP heads poisoned")[target].invalidate_all();
+                        }
                     }
                 }
                 return SlotGuard {
@@ -2048,6 +2400,7 @@ impl ParallelSeam {
             }
             if committed {
                 work.prompt.push(pending);
+                work.reasoning_guard.observe(self.model.config(), pending);
                 work.generated += 1;
                 work.stats.n_gen += 1;
                 heads.lock().expect("MTP heads poisoned")[work.slot].pending_emitted = true;
@@ -2078,6 +2431,9 @@ impl ParallelSeam {
             .expect("MTP heads poisoned");
         for (lane_index, &index) in indices.iter().enumerate() {
             let work = &active[index];
+            if !work.mtp_ready {
+                continue;
+            }
             let lane = &mut heads[work.slot];
             anyhow::ensure!(
                 lane.pending_emitted,
@@ -2127,6 +2483,7 @@ impl ParallelSeam {
             lane.pending_id = outputs[lane_index].last().copied();
             lane.pending_emitted = true;
             lane.target_snapshot_dirty = true;
+            lane.live_valid = true;
         }
         Ok(())
     }
@@ -2219,6 +2576,10 @@ impl ParallelSeam {
                     .expect("parallel token work owns a sampler")
             })
             .collect::<Vec<_>>();
+        let mut reasoning_guards = indices
+            .iter()
+            .map(|&index| active[index].reasoning_guard)
+            .collect::<Vec<_>>();
         let mut channels = indices
             .iter()
             .map(|&index| active[index].channels.take())
@@ -2276,6 +2637,7 @@ impl ParallelSeam {
             &mut peers,
             self.max_ctx,
             &mut samplers,
+            &mut reasoning_guards,
             &mut stream,
             Some(&self.batch_interrupt),
             Some(&group_req),
@@ -2288,6 +2650,9 @@ impl ParallelSeam {
         }
         for (&index, sampler) in indices.iter().zip(samplers) {
             active[index].sampler = Some(sampler);
+        }
+        for (&index, guard) in indices.iter().zip(reasoning_guards) {
+            active[index].reasoning_guard = guard;
         }
         for (&index, channel) in indices.iter().zip(channels) {
             active[index].channels = channel;
@@ -2369,6 +2734,12 @@ impl ParallelSeam {
 
     fn fail_unified_scheduler(&self, active: &mut Vec<BatchWork>, error: anyhow::Error) {
         let message = error.to_string();
+        if let Some(heads) = &self.mtp_heads {
+            let mut heads = heads.lock().expect("MTP heads poisoned");
+            for work in active.iter() {
+                heads[work.slot].invalidate_live();
+            }
+        }
         for work in active.drain(..) {
             self.fail_batch_work(work, &message);
         }
@@ -2426,7 +2797,7 @@ impl ParallelSeam {
             }
         }
         let target_prefix = work.kv().cached_tokens();
-        let reusable = lane.pending_id.is_some()
+        let reusable = lane.live_valid
             && lane.multimodal_key == work.multimodal_key
             && lane.cached == target_prefix
             && prompt.starts_with(&lane.cached);
@@ -2445,21 +2816,45 @@ impl ParallelSeam {
             lane.pending_id = None;
             lane.pending_emitted = false;
             lane.target_snapshot_dirty = false;
+            lane.live_valid = true;
             tracing::debug!(
                 slot = work.slot,
                 cached_tokens = lane.cached.len(),
                 "restored MTP head turn checkpoint"
             );
+        } else if !reusable && target_prefix.is_empty() {
+            lane.invalidate_all();
+            lane.multimodal_key = work.multimodal_key;
+            lane.live_valid = true;
         } else if !reusable {
-            work.kv.as_mut().expect("MTP work has target KV").reset();
-            lane.cached.clear();
-            lane.last_h.fill(0.0);
-            lane.pending_id = None;
-            lane.pending_emitted = false;
-            lane.target_snapshot_dirty = false;
-            lane.multimodal_key = None;
+            let start = prepared.start;
+            work.prefill_start = start;
+            work.stats.n_cached = work.stats.n_cached.saturating_add(start);
+            work.stats.n_prompt = work
+                .stats
+                .n_prompt
+                .saturating_add(prompt.len().saturating_sub(start));
+            work.checkpoint_boundaries = prepared.checkpoint_boundaries;
+            work.phase = phase_for_remaining_prefill(work.remaining_prefill());
+            work.turn_checkpoint = None;
+            work.mtp_ready = false;
+            lane.invalidate_live();
+            tracing::info!(
+                slot = work.slot,
+                cached_tokens = start,
+                prompt_tokens = prompt.len(),
+                "MTP side state is unavailable for the reusable main KV; using ordinary decode for this turn"
+            );
+            return Ok(());
         }
         let start = lane.cached.len();
+        anyhow::ensure!(
+            start == prepared.start,
+            "MTP lane {} restored {} tokens while the main KV restored {}",
+            work.slot,
+            start,
+            prepared.start
+        );
         work.prefill_start = start;
         work.stats.n_cached += start;
         work.stats.n_prompt += prompt.len() - start;
@@ -2496,19 +2891,41 @@ impl ParallelSeam {
             let chunk_end =
                 mtp_prime_chunk_end(chunk_start, prompt.len(), chunk, &checkpoint_boundaries);
             let rows = chunk_end - chunk_start;
-            let (pending, hidden) = crate::mtp::run_qwen4_prime_frontier_with_finish(
-                self.vk.as_ref(),
-                &*bind,
-                self.model.gguf(),
-                cfg,
-                ec,
-                self.model.embd(),
-                &prompt[..chunk_end],
-                &mut work.kv,
-                self.max_ctx,
-                work.mrope_plan.as_ref(),
-                finish.as_deref(),
-            )?;
+            let (mut pending, mut pending_logits, hidden) =
+                crate::mtp::run_qwen4_prime_frontier_with_finish(
+                    self.vk.as_ref(),
+                    &*bind,
+                    self.model.gguf(),
+                    cfg,
+                    ec,
+                    self.model.embd(),
+                    &prompt[..chunk_end],
+                    &mut work.kv,
+                    self.max_ctx,
+                    work.mrope_plan.as_ref(),
+                    finish.as_deref(),
+                )?;
+            if chunk_end == prompt.len()
+                && work
+                    .reasoning_guard
+                    .blocks(cfg, pending, ec.sampling.ignore_eos)
+            {
+                anyhow::ensure!(
+                    pending_logits.len() == cfg.vocab,
+                    "Qwen3.8 MTP prime EOS repair expected {} logits, got {}",
+                    cfg.vocab,
+                    pending_logits.len()
+                );
+                work.reasoning_guard.mask_eos(cfg, &mut pending_logits);
+                let blocked = pending;
+                pending = crate::mtp::argmax_row(&pending_logits);
+                tracing::warn!(
+                    slot = work.slot,
+                    blocked_token = blocked,
+                    replacement_token = pending,
+                    "Qwen3.8 MTP suppressed premature EOS inside an open reasoning block"
+                );
+            }
             anyhow::ensure!(
                 hidden.len() == rows * h_width,
                 "MTP prime returned {} hidden values for {rows} rows",
@@ -2538,7 +2955,7 @@ impl ParallelSeam {
                     .as_mut()
                     .expect("MTP work has target KV")
                     .capture_turn_recurrent(self.vk.as_ref(), cfg, index, &prompt[..boundary])?;
-                lane.turn_checkpoints[index] = Some(MtpHeadCheckpoint {
+                lane.turn_checkpoints[index] = Some(crate::mtp::Qwen4MtpCheckpointState {
                     tokens: prompt[..boundary].to_vec(),
                     last_h: hidden[hidden_row * h_width..(hidden_row + 1) * h_width].to_vec(),
                 });
@@ -2597,9 +3014,11 @@ impl ParallelSeam {
             );
         }
         lane.target_snapshot_dirty = false;
+        lane.live_valid = true;
         work.stats.prompt_secs += t0.elapsed().as_secs_f64();
         work.phase = BatchPhase::Decode;
         work.turn_checkpoint = None;
+        work.mtp_ready = true;
         Ok(())
     }
 
@@ -2621,7 +3040,7 @@ impl ParallelSeam {
                     self.fail_unified_scheduler(&mut active, error);
                     return;
                 }
-                if was_unprepared {
+                if was_unprepared && work.mtp_ready {
                     let progress = infr_core::GenerationProgress {
                         phase: infr_core::GenerationPhase::Prefill,
                         prompt_tokens: work.prompt_end as u64,
@@ -2645,6 +3064,17 @@ impl ParallelSeam {
             if active.is_empty() {
                 continue;
             }
+            if active
+                .iter()
+                .any(|work| work.phase == BatchPhase::LongPrefill)
+            {
+                if let Err(error) = self.run_long_prefill_phase(&mut active, req) {
+                    self.fail_unified_scheduler(&mut active, error);
+                    return;
+                }
+                self.retire_finished_work(&mut active);
+                continue;
+            }
             if active.len() > 1 {
                 if !concurrent_plain {
                     tracing::info!(
@@ -2653,10 +3083,12 @@ impl ParallelSeam {
                     );
                     concurrent_plain = true;
                 }
-                let mut indices = (0..active.len()).collect::<Vec<_>>();
-                indices
+                let mut mtp_indices = (0..active.len())
+                    .filter(|&index| active[index].mtp_ready)
+                    .collect::<Vec<_>>();
+                mtp_indices
                     .sort_by_key(|&index| (active[index].mrope_plan.is_none(), active[index].slot));
-                if let Err(error) = self.materialize_mtp_frontiers(&mut active, &indices) {
+                if let Err(error) = self.materialize_mtp_frontiers(&mut active, &mtp_indices) {
                     self.fail_unified_scheduler(&mut active, error);
                     return;
                 }
@@ -2668,11 +3100,12 @@ impl ParallelSeam {
                 if active.len() < 2 {
                     continue;
                 }
-                indices = (0..active.len()).collect::<Vec<_>>();
+                let mut indices = (0..active.len()).collect::<Vec<_>>();
                 indices
                     .sort_by_key(|&index| (active[index].mrope_plan.is_none(), active[index].slot));
+                let sync_mtp = indices.iter().any(|&index| active[index].mtp_ready);
                 if let Err(error) =
-                    self.run_token_group(&mut active, &indices, MTP_PLAIN_SYNC_QUANTUM, true)
+                    self.run_token_group(&mut active, &indices, MTP_PLAIN_SYNC_QUANTUM, sync_mtp)
                 {
                     self.fail_unified_scheduler(&mut active, error);
                     return;
@@ -2685,8 +3118,22 @@ impl ParallelSeam {
                 continue;
             }
             if concurrent_plain {
-                tracing::info!("MTP scheduler returning the surviving lane to speculative decode");
+                if active[0].mtp_ready {
+                    tracing::info!(
+                        "MTP scheduler returning the surviving lane to speculative decode"
+                    );
+                }
                 concurrent_plain = false;
+            }
+            if !active[0].mtp_ready {
+                if let Err(error) =
+                    self.run_token_group(&mut active, &[0], MTP_PLAIN_SYNC_QUANTUM, false)
+                {
+                    self.fail_unified_scheduler(&mut active, error);
+                    return;
+                }
+                self.retire_finished_work(&mut active);
+                continue;
             }
             let fallback = (0..active.len())
                 .filter(|&index| {
@@ -2775,7 +3222,7 @@ impl ParallelSeam {
             (feeds, predictions)
         };
 
-        let (verify_ids, verify_hidden) = {
+        let (mut verify_ids, mut verify_logits, verify_hidden) = {
             let _gate = req.gate_pass();
             let mut owned_mrope_plans = indices
                 .iter()
@@ -2813,7 +3260,9 @@ impl ParallelSeam {
             result?
         };
         anyhow::ensure!(
-            verify_ids.len() == indices.len() && verify_hidden.len() == indices.len(),
+            verify_ids.len() == indices.len()
+                && verify_logits.len() == indices.len()
+                && verify_hidden.len() == indices.len(),
             "parallel MTP VERIFY returned inconsistent lane counts"
         );
         let compute_secs = t0.elapsed().as_secs_f64();
@@ -2828,12 +3277,37 @@ impl ParallelSeam {
                 .expect("MTP heads poisoned")[work.slot]
                 .pending_emitted;
             let old_len = feeds[lane_index].len() - rows;
-            let ids = &verify_ids[lane_index];
+            let ids = &mut verify_ids[lane_index];
+            let logits = &mut verify_logits[lane_index];
             let hidden = &verify_hidden[lane_index];
             anyhow::ensure!(
                 ids.len() == rows && hidden.len() == rows * h_width,
                 "parallel MTP VERIFY lane {lane_index} returned incomplete rows"
             );
+            let mut verify_guard = work.reasoning_guard;
+            for row in 0..rows {
+                verify_guard.observe(cfg, feeds[lane_index][old_len + row]);
+                if !verify_guard.blocks(cfg, ids[row], ec.sampling.ignore_eos) {
+                    continue;
+                }
+                anyhow::ensure!(
+                    logits.len() == rows * cfg.vocab,
+                    "parallel MTP EOS repair lane {lane_index} expected {} logits, got {}",
+                    rows * cfg.vocab,
+                    logits.len()
+                );
+                let row_logits = &mut logits[row * cfg.vocab..(row + 1) * cfg.vocab];
+                verify_guard.mask_eos(cfg, row_logits);
+                let blocked = ids[row];
+                ids[row] = crate::mtp::argmax_row(row_logits);
+                tracing::warn!(
+                    slot = work.slot,
+                    row,
+                    blocked_token = blocked,
+                    replacement_token = ids[row],
+                    "Qwen3.8 MTP suppressed premature EOS inside an open reasoning block"
+                );
+            }
             let accepted = mtp_accepted_rows(&predictions[lane_index], ids);
             let already_emitted = usize::from(pending_emitted);
             anyhow::ensure!(
@@ -2897,6 +3371,7 @@ impl ParallelSeam {
                     .expect("MTP heads poisoned");
                 let lane = &mut heads[work.slot];
                 lane.cached = kv.cached_tokens().to_vec();
+                lane.live_valid = true;
                 if committed > 0 {
                     lane.pending_id = Some(ids[committed - 1]);
                     lane.pending_emitted = false;
@@ -2908,6 +3383,9 @@ impl ParallelSeam {
             work.prompt.extend_from_slice(
                 &feeds[lane_index][old_len + already_emitted..old_len + committed],
             );
+            for &token in &feeds[lane_index][old_len + already_emitted..old_len + committed] {
+                work.reasoning_guard.observe(cfg, token);
+            }
             let emitted = committed - already_emitted;
             work.generated += emitted;
             work.stats.n_gen += emitted;
@@ -3076,10 +3554,7 @@ impl ParallelSeam {
         if !batch_candidate {
             if let Some(heads) = &self.mtp_heads {
                 let mut heads = heads.lock().expect("MTP heads poisoned");
-                let lane = &mut heads[guard.idx];
-                lane.pending_id = None;
-                lane.pending_emitted = false;
-                lane.target_snapshot_dirty = false;
+                heads[guard.idx].invalidate_live();
             }
             let (_, stats) = crate::seam::generate_dense_vulkan_session(
                 self.vk.as_ref(),
@@ -3124,6 +3599,10 @@ impl ParallelSeam {
         queue.waiting.push_back(BatchWork {
             slot: guard.idx,
             kv: Some(guard.detach()),
+            reasoning_guard: crate::sampling::Qwen4ReasoningEosGuard::from_prompt(
+                self.model.config(),
+                &prompt_tokens,
+            ),
             prompt_end: prompt_tokens.len(),
             prompt: prompt_tokens,
             max_new,
@@ -3138,6 +3617,7 @@ impl ParallelSeam {
             finished: false,
             sampling: req.sampling().clone(),
             sampler: Some(sampler),
+            mtp_ready: false,
             channels: Some(BatchChannels {
                 events: event_tx,
                 acknowledgements: ack_rx,
@@ -3256,6 +3736,10 @@ impl ParallelSeam {
             queue.waiting.push_back(BatchWork {
                 slot: guard.idx,
                 kv: Some(guard.detach()),
+                reasoning_guard: crate::sampling::Qwen4ReasoningEosGuard::from_prompt(
+                    self.model.config(),
+                    &prompt_tokens,
+                ),
                 prompt: prompt_tokens,
                 prompt_end: plan.prompt_pos4.len() / 4,
                 max_new,
@@ -3270,6 +3754,7 @@ impl ParallelSeam {
                 finished: false,
                 sampling: req.sampling().clone(),
                 sampler: Some(sampler),
+                mtp_ready: false,
                 channels: Some(BatchChannels {
                     events: event_tx,
                     acknowledgements: ack_rx,
@@ -3290,11 +3775,7 @@ impl ParallelSeam {
         }
         if let Some(heads) = &self.mtp_heads {
             let mut heads = heads.lock().expect("MTP heads poisoned");
-            let lane = &mut heads[guard.idx];
-            lane.pending_id = None;
-            lane.pending_emitted = false;
-            lane.target_snapshot_dirty = false;
-            lane.multimodal_key = None;
+            heads[guard.idx].invalidate_live();
         }
         let frontier = prompt_tokens.len().saturating_sub(1);
         let frontier_is_image = plan.spans.iter().any(|span| {
@@ -3363,6 +3844,10 @@ impl ParallelSeam {
         queue.waiting.push_back(BatchWork {
             slot: guard.idx,
             kv: Some(guard.detach()),
+            reasoning_guard: crate::sampling::Qwen4ReasoningEosGuard::from_prompt(
+                self.model.config(),
+                &prompt_tokens,
+            ),
             prompt: prompt_tokens,
             prompt_end,
             max_new,
@@ -3377,6 +3862,7 @@ impl ParallelSeam {
             finished: false,
             sampling: req.sampling().clone(),
             sampler: Some(sampler),
+            mtp_ready: false,
             channels: Some(BatchChannels {
                 events: event_tx,
                 acknowledgements: ack_rx,

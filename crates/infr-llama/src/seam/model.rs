@@ -292,8 +292,10 @@ impl SlotPool {
             self.last_used.push(self.tick);
             return Ok(0);
         }
-        let score =
-            |st: &Option<crate::seam::SeamKv>| st.as_ref().map_or(0, |s| s.prefix_score(prompt));
+        let score = |st: &Option<crate::seam::SeamKv>| {
+            st.as_ref()
+                .map_or(0, |s| s.seedable_prefix_len(cfg, prompt))
+        };
         // A slot whose cache the prompt EXTENDS (or equals) is this conversation continuing — pick
         // the one with the LONGEST reusable prefix, not merely the first (see `pick_continuation`).
         let cont = pick_continuation(
@@ -362,10 +364,11 @@ impl SlotPool {
             // only when it beats whatever prefix the slot already shares with the prompt.
             if best_s > score(&self.slots[target]) {
                 let src = self.slots[best_i].take().expect("scored slot is Some");
-                if let Some(dst) = self.slots[target].as_mut() {
-                    dst.seed_from(be, cfg, ec, &src, best_s)?;
-                }
+                let seeded = self.slots[target]
+                    .as_mut()
+                    .map_or(Ok(0), |dst| dst.seed_from(be, cfg, ec, &src, best_s));
                 self.slots[best_i] = Some(src);
+                seeded?;
             }
         }
         self.last_used[target] = self.tick;
@@ -412,6 +415,15 @@ impl SeamModel {
             None => build_tokenizer(&g)?,
         };
         add_chat_eos(&mut cfg, &tokenizer);
+        if cfg.qwen4exp {
+            cfg.qwen4_think_start = tokenizer.token_to_id("<think>");
+            cfg.qwen4_think_end = tokenizer.token_to_id("</think>");
+            if cfg.qwen4_think_start.is_none() || cfg.qwen4_think_end.is_none() {
+                tracing::warn!(
+                    "Qwen3.8 reasoning EOS guard disabled because the tokenizer has no atomic <think>/</think> tokens"
+                );
+            }
+        }
         // `token_embd.weight` is NOT dequantized here — see the field's doc. `Config::from_gguf`
         // above already read its shape, so a model missing the tensor still fails at load, not on
         // the lazy path below.

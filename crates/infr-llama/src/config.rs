@@ -38,6 +38,10 @@ pub struct Config {
     /// All tokens that end generation (the GGUF eos plus `<|im_end|>` / `<|endoftext|>` when present
     /// in the vocab). A chat model can emit any of these; stopping only on `eos` lets it ramble.
     pub eos_ids: Vec<u32>,
+    /// Qwen3.8's template-level reasoning delimiters. These stay `None` for every other
+    /// architecture and are resolved from the tokenizer after the GGUF config is parsed.
+    pub qwen4_think_start: Option<u32>,
+    pub qwen4_think_end: Option<u32>,
     /// Qwen3-style per-head RMSNorm on Q and K before RoPE.
     pub qk_norm: bool,
     /// Qwen2/2.5 add a learned bias to the q/k/v projections (`Wx + b`); Qwen3 dropped them. o-proj
@@ -1816,6 +1820,8 @@ impl Config {
             vocab,
             eos,
             eos_ids: vec![eos],
+            qwen4_think_start: None,
+            qwen4_think_end: None,
             qk_norm,
             qkv_bias,
             permute_qk_neox,

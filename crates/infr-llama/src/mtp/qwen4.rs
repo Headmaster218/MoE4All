@@ -1076,6 +1076,41 @@ struct Qwen4MtpKvCache {
     committed_tokens: usize,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Qwen4MtpCheckpointState {
+    pub(crate) tokens: Vec<u32>,
+    pub(crate) last_h: Vec<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Qwen4MtpCacheState {
+    pub(crate) cached: Vec<u32>,
+    pub(crate) last_h: Vec<f32>,
+    pub(crate) turn_checkpoints:
+        [Option<Qwen4MtpCheckpointState>; crate::seam::TURN_CHECKPOINT_COUNT],
+    pub(crate) pending_id: Option<u32>,
+    pub(crate) pending_emitted: bool,
+}
+
+pub(crate) struct Qwen4MtpKvView<'a> {
+    kv: MutexGuard<'a, Qwen4MtpKvCache>,
+    bytes_per_side: usize,
+}
+
+impl Qwen4MtpKvView<'_> {
+    pub(crate) fn k(&self) -> &dyn Buffer {
+        self.kv.k.as_ref()
+    }
+
+    pub(crate) fn v(&self) -> &dyn Buffer {
+        self.kv.v.as_ref()
+    }
+
+    pub(crate) fn bytes_per_side(&self) -> usize {
+        self.bytes_per_side
+    }
+}
+
 pub(crate) struct Qwen4MtpSession {
     cfg: crate::Config,
     max_ctx: usize,
@@ -1120,6 +1155,10 @@ fn mtp_kv_spec(row_elements: usize, max_ctx: usize) -> Result<SegmentedKvSpec> {
 }
 
 impl Qwen4MtpSession {
+    pub(crate) fn h_width(&self) -> usize {
+        self.cfg.hc_mult * self.cfg.n_embd
+    }
+
     pub(crate) fn load_fixed_vulkan(
         vk: &infr_vulkan::VulkanBackend,
         sidecar_path: &Path,
@@ -1339,6 +1378,75 @@ impl Qwen4MtpSession {
             "expanded Qwen3.8 MTP head KV cache"
         );
         Ok(kv)
+    }
+
+    pub(crate) fn kv_prefix_bytes(&self, tokens: usize) -> Result<usize> {
+        anyhow::ensure!(
+            tokens <= self.max_ctx,
+            "Qwen3.8 MTP KV depth {tokens} exceeds the session capacity {}",
+            self.max_ctx
+        );
+        let row_bytes = self
+            .kv_spec
+            .logical_bytes
+            .checked_div(self.max_ctx)
+            .ok_or_else(|| anyhow!("Qwen3.8 MTP KV row byte count is undefined"))?;
+        tokens
+            .checked_mul(row_bytes)
+            .ok_or_else(|| anyhow!("Qwen3.8 MTP KV prefix byte count overflow"))
+    }
+
+    pub(crate) fn kv_prefix<'a>(
+        &'a self,
+        be: &dyn Backend,
+        tokens: usize,
+    ) -> Result<Qwen4MtpKvView<'a>> {
+        let bytes_per_side = self.kv_prefix_bytes(tokens)?;
+        let kv = self.kv_for_depth(be, tokens)?;
+        Ok(Qwen4MtpKvView { kv, bytes_per_side })
+    }
+
+    pub(crate) fn copy_prefix_from(
+        &self,
+        be: &dyn Backend,
+        src: &Qwen4MtpSession,
+        tokens: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.max_ctx == src.max_ctx && self.kv_spec == src.kv_spec,
+            "Qwen3.8 MTP seed source has incompatible KV geometry"
+        );
+        anyhow::ensure!(
+            !std::ptr::eq(self, src),
+            "Qwen3.8 MTP cannot seed a session from itself"
+        );
+        let src = src.kv_prefix(be, tokens)?;
+        let dst = self.kv_prefix(be, tokens)?;
+        let bytes = src.bytes_per_side();
+        anyhow::ensure!(
+            bytes == dst.bytes_per_side(),
+            "Qwen3.8 MTP seed byte count changed between slots"
+        );
+        be.copy_buffers(&[(src.k(), dst.k(), bytes), (src.v(), dst.v(), bytes)])
+            .map_err(|error| anyhow!("copy Qwen3.8 MTP head KV prefix: {error}"))
+    }
+
+    pub(crate) fn release_kv(&self, be: &dyn Backend) -> Result<()> {
+        be.sync()
+            .map_err(|error| anyhow!("sync before Qwen3.8 MTP KV release: {error}"))?;
+        let mut kv = self
+            .kv
+            .lock()
+            .map_err(|_| anyhow!("Qwen3.8 MTP KV state poisoned"))?;
+        if !kv.segmented || kv.committed_tokens == 0 {
+            return Ok(());
+        }
+        be.release_segmented_kv(kv.k.as_ref())
+            .map_err(|error| anyhow!("release Qwen3.8 MTP K cache: {error}"))?;
+        be.release_segmented_kv(kv.v.as_ref())
+            .map_err(|error| anyhow!("release Qwen3.8 MTP V cache: {error}"))?;
+        kv.committed_tokens = 0;
+        Ok(())
     }
 
     fn bind_common<'a>(
@@ -1657,8 +1765,11 @@ impl Qwen4MtpRuntime {
             self.max_ctx,
         )?;
         let p = prompt_tokens.len();
+        let mut reasoning_eos_guard =
+            crate::sampling::Qwen4ReasoningEosGuard::from_prompt(cfg, &prompt_tokens);
         let prime_chunk = crate::seam::ubatch_rows(ec).max(1);
         let mut pending_token = None;
+        let mut pending_logits = Vec::new();
         // MTP row i consumes target hidden row i-1. Stream prompt-prime hidden rows through the
         // detached head one ubatch at a time instead of materializing two full-context arrays.
         // At 200k context the old `prime_h` plus `shifted_h` pair occupied about 15 GiB on the
@@ -1675,7 +1786,7 @@ impl Qwen4MtpRuntime {
             } else {
                 None
             };
-            let (frontier, chunk_h) = super::run_qwen4_prime_frontier_with_finish(
+            let (frontier, frontier_logits, chunk_h) = super::run_qwen4_prime_frontier_with_finish(
                 vk,
                 &*target_bind,
                 model.gguf(),
@@ -1716,8 +1827,25 @@ impl Qwen4MtpRuntime {
             }
             previous_h.copy_from_slice(&chunk_h[(rows - 1) * h_width..]);
             pending_token = Some(frontier);
+            pending_logits = frontier_logits;
         }
         let mut pending_token = pending_token.expect("non-empty prompt has a frontier token");
+        if reasoning_eos_guard.blocks(cfg, pending_token, ec.sampling.ignore_eos) {
+            anyhow::ensure!(
+                pending_logits.len() == cfg.vocab,
+                "Qwen3.8 MTP prime EOS repair expected {} logits, got {}",
+                cfg.vocab,
+                pending_logits.len()
+            );
+            reasoning_eos_guard.mask_eos(cfg, &mut pending_logits);
+            let blocked = pending_token;
+            pending_token = super::argmax_row(&pending_logits);
+            tracing::warn!(
+                blocked_token = blocked,
+                replacement_token = pending_token,
+                "Qwen3.8 MTP suppressed premature EOS inside an open reasoning block"
+            );
+        }
         self.trunk
             .as_mut()
             .expect("target prime initialized a trunk")
@@ -1785,7 +1913,7 @@ impl Qwen4MtpRuntime {
                 self.trunk.is_none(),
                 self.max_ctx,
             )?;
-            let (verify_ids, verify_h) = super::run_verify_with_finish(
+            let (mut verify_ids, mut verify_logits, verify_h) = super::run_verify_with_finish(
                 vk,
                 &*target_bind,
                 model.gguf(),
@@ -1807,6 +1935,30 @@ impl Qwen4MtpRuntime {
                 verify_ids.len(),
                 verify_h.len()
             );
+
+            let mut verify_guard = reasoning_eos_guard;
+            for row in 0..verify_tokens {
+                verify_guard.observe(cfg, feed[n_past + row]);
+                if !verify_guard.blocks(cfg, verify_ids[row], ec.sampling.ignore_eos) {
+                    continue;
+                }
+                anyhow::ensure!(
+                    verify_logits.len() == verify_tokens * cfg.vocab,
+                    "Qwen3.8 MTP EOS repair expected {} logits, got {}",
+                    verify_tokens * cfg.vocab,
+                    verify_logits.len()
+                );
+                let logits = &mut verify_logits[row * cfg.vocab..(row + 1) * cfg.vocab];
+                verify_guard.mask_eos(cfg, logits);
+                let blocked = verify_ids[row];
+                verify_ids[row] = super::argmax_row(logits);
+                tracing::warn!(
+                    row,
+                    blocked_token = blocked,
+                    replacement_token = verify_ids[row],
+                    "Qwen3.8 MTP suppressed premature EOS inside an open reasoning block"
+                );
+            }
 
             let accepted_spec = (0..verify_tokens - 1)
                 .take_while(|&i| candidates[i] == verify_ids[i])
@@ -1850,6 +2002,7 @@ impl Qwen4MtpRuntime {
             for token in emitted {
                 let eos = hit_eos(token);
                 generated += 1;
+                reasoning_eos_guard.observe(cfg, token);
                 if !eos {
                     crate::stream_token(
                         model.tokenizer(),

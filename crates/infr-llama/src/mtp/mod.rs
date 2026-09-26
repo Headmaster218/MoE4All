@@ -2088,9 +2088,10 @@ fn run_verify(
     state: &mut Option<crate::seam::SeamKv>,
     max_ctx: usize,
 ) -> Result<(Vec<u32>, Vec<f32>)> {
-    run_verify_with_finish(
+    let (ids, _, h) = run_verify_with_finish(
         be, bind, g, cfg, ec, token_embd, tokens, state, max_ctx, None,
-    )
+    )?;
+    Ok((ids, h))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2105,7 +2106,7 @@ fn run_verify_with_finish(
     state: &mut Option<crate::seam::SeamKv>,
     max_ctx: usize,
     finish_fixed_allocations: Option<&dyn Fn() -> Result<()>>,
-) -> Result<(Vec<u32>, Vec<f32>)> {
+) -> Result<(Vec<u32>, Vec<f32>, Vec<f32>)> {
     let mut logits = Vec::new();
     let mut ids = Vec::new();
     let mut h = Vec::new();
@@ -2148,7 +2149,7 @@ fn run_verify_with_finish(
             .map(|j| argmax_row(&logits[j * cfg.vocab..(j + 1) * cfg.vocab]))
             .collect();
     }
-    Ok((ids, h))
+    Ok((ids, logits, h))
 }
 
 /// Qwen3.8 prompt prime needs every target hidden row for detached-head catch-up, but only the
@@ -2167,7 +2168,7 @@ pub(crate) fn run_qwen4_prime_frontier_with_finish(
     max_ctx: usize,
     mm: Option<&crate::seam::MropePlan>,
     finish_fixed_allocations: Option<&dyn Fn() -> Result<()>>,
-) -> Result<(u32, Vec<f32>)> {
+) -> Result<(u32, Vec<f32>, Vec<f32>)> {
     anyhow::ensure!(cfg.qwen4exp, "Qwen3.8 frontier prime requires qwen4exp");
     let mut logits = Vec::new();
     let mut ids = Vec::new();
@@ -2204,7 +2205,7 @@ pub(crate) fn run_qwen4_prime_frontier_with_finish(
         );
         argmax_row(&logits)
     };
-    Ok((id, h))
+    Ok((id, logits, h))
 }
 
 /// Full-distribution VERIFY forward — the temperature-aware MTP accept rule's twin of
