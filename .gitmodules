@@ -1,0 +1,3 @@
+[submodule "harness/plugins/dsh-llm-moe4all"]
+	path = harness/plugins/dsh-llm-moe4all
+	url = https://github.com/Headmaster218/dsh-llm-moe4all.git
