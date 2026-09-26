@@ -107,6 +107,8 @@ function Invoke-WizardDryRun {
         [Parameter(Mandatory = $true)][string]$ExpectedCommand,
         [string]$ModelSelection = '',
         [switch]$PassModelArgument,
+        [switch]$NoSavedModel,
+        [switch]$ExpectRecommendations,
         [switch]$EnableEmbedding,
         [switch]$EnableMtp,
         [switch]$EnableVision
@@ -115,12 +117,16 @@ function Invoke-WizardDryRun {
     $state = [ordered]@{
         launch_mode = $Mode
         setup_mode = 'quick'
-        model = $modelPath
+        model = $(if ($NoSavedModel) { '' } else { $modelPath })
         think_mode = 'default'
         max_new = ''
         configure_sampling = $false
         server_addr = '127.0.0.1:8080'
         server_parallel = $(if ($EnableMtp) { '2' } else { '1' })
+        server_session_cache = ($Mode -eq 'server')
+        session_idle_secs = '120'
+        session_cache_max = '5GiB'
+        session_cache_ttl_hours = '24'
         server_auth = $false
         server_vision = [bool]$EnableVision
         vision_projector = $(if ($EnableVision) { $visionPath } else { '' })
@@ -195,6 +201,25 @@ function Invoke-WizardDryRun {
     if ($PassModelArgument -and $stdout -notmatch 'Model selected from launcher argument') {
         throw "Wizard $Mode did not accept the model passed by CMD/drag-and-drop.`n$stdout"
     }
+    if ($ExpectRecommendations) {
+        foreach ($expectedText in @(
+            'Official recommended models',
+            'https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/resolve/main/Qwen3.6-35B-A3B-APEX-I-Balanced.gguf?download=true',
+            'https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/tree/main/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64',
+            'https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/mmproj-Qwen3.8-Flash-Next-F16.gguf?download=true',
+            'https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf?download=true'
+        )) {
+            if ($stdout -notmatch [regex]::Escape($expectedText)) {
+                throw "Wizard $Mode did not display the expected recommendation '$expectedText'.`n$stdout"
+            }
+        }
+    }
+    if ($Mode -eq 'server') {
+        $expectedCacheDirectory = Join-Path $PackageRoot 'kv-sessions'
+        if ($stdout -notmatch [regex]::Escape("kv.session_cache_dir=$expectedCacheDirectory")) {
+            throw "Wizard server mode did not use the package-local KV cache directory.`n$stdout"
+        }
+    }
     if ($EnableEmbedding) {
         if ($stdout -notmatch [regex]::Escape("--embedding-model '$embeddingPath'")) {
             throw "Wizard $Mode did not resolve the embedding directory to its GGUF.`n$stdout"
@@ -221,8 +246,9 @@ function Invoke-WizardDryRun {
 $quotedModelPath = '"' + $modelPath + '"'
 $powerShellDrop = "& '$modelPath'"
 Invoke-WizardDryRun -Mode 'chat' -ExpectedCommand 'run' -PassModelArgument
-Invoke-WizardDryRun -Mode 'server' -ExpectedCommand 'serve' -ModelSelection $powerShellDrop -EnableEmbedding -EnableMtp -EnableVision
+Invoke-WizardDryRun -Mode 'server' -ExpectedCommand 'serve' -ModelSelection $powerShellDrop -NoSavedModel -ExpectRecommendations -EnableEmbedding -EnableMtp -EnableVision
 Invoke-WizardDryRun -Mode 'benchmark' -ExpectedCommand 'bench' -ModelSelection $quotedModelPath
+Invoke-WizardDryRun -Mode 'benchmark' -ExpectedCommand 'bench' -ModelSelection 'R' -ExpectRecommendations
 
 Remove-Item -LiteralPath $modelPath -Force
 Remove-Item -LiteralPath $embeddingDirectory -Recurse -Force

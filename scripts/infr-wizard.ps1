@@ -242,6 +242,35 @@ function ConvertTo-FullPath {
     return [System.IO.Path]::GetFullPath((Join-Path $repoRoot $value))
 }
 
+function Show-RecommendedModelDownloads {
+    $downloads = @(
+        [pscustomobject]@{
+            Name = 'Qwen3.6 35B APEX-I-Balanced'
+            Url = 'https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/resolve/main/Qwen3.6-35B-A3B-APEX-I-Balanced.gguf?download=true'
+        }
+        [pscustomobject]@{
+            Name = 'Qwen3.8 Flash-Next AD-4.27bpw-Q4_K_M-M64（33 个主模型分片 / 33 main-model shards）'
+            Url = 'https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/tree/main/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64'
+        }
+        [pscustomobject]@{
+            Name = 'Qwen3.8 Flash-Next F16 视觉文件 / vision projector'
+            Url = 'https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/mmproj-Qwen3.8-Flash-Next-F16.gguf?download=true'
+        }
+        [pscustomobject]@{
+            Name = 'Qwen3.8 Flash-Next shared Q4_K_M MTP 头 / MTP head'
+            Url = 'https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf?download=true'
+        }
+    )
+
+    Write-Host "`n官方推荐的模型 / Official recommended models" -ForegroundColor Cyan
+    foreach ($download in $downloads) {
+        Write-Host " $($download.Name)"
+        Write-Host "   $($download.Url)" -ForegroundColor DarkGray
+    }
+    Write-Host '下载后请输入主模型 GGUF 路径；视觉与 MTP 文件可在后续步骤选择。' -ForegroundColor DarkGray
+    Write-Host 'After downloading, enter the main-model GGUF path; vision and MTP files are selected later.' -ForegroundColor DarkGray
+}
+
 function Select-ModelPath {
     param([AllowEmptyString()][string]$InitialPath = '')
 
@@ -285,17 +314,22 @@ function Select-ModelPath {
     }
 
     if ($models.Count -gt 0) {
-        Write-Host "`n模型 / Model" -ForegroundColor Cyan
-        for ($i = 0; $i -lt $models.Count; $i++) {
-            Write-Host (" [{0}] {1}" -f ($i + 1), $models[$i])
-        }
-        Write-Host ' [N] 输入新路径，或直接粘贴路径 / Enter a new path, or paste it directly'
         while ($true) {
+            Write-Host "`n模型 / Model" -ForegroundColor Cyan
+            for ($i = 0; $i -lt $models.Count; $i++) {
+                Write-Host (" [{0}] {1}" -f ($i + 1), $models[$i])
+            }
+            Write-Host ' [R] 官方推荐的模型 / Official recommended models'
+            Write-Host ' [N] 输入新路径，或直接粘贴路径 / Enter a new path, or paste it directly'
             $choice = (Read-Host '选择模型 [1] / Select model [1]').Trim()
             if ([string]::IsNullOrWhiteSpace($choice)) { return $models[0] }
             $index = 0
             if ([int]::TryParse($choice, [ref]$index) -and $index -ge 1 -and $index -le $models.Count) {
                 return $models[$index - 1]
+            }
+            if ($choice -match '^(r|recommended|推荐)$') {
+                Show-RecommendedModelDownloads
+                continue
             }
             if ($choice -match '^(n|new|新)$') { break }
             try {
@@ -308,6 +342,8 @@ function Select-ModelPath {
             }
             Write-Host '选择无效或找不到该模型文件。Invalid selection or model file not found.' -ForegroundColor Yellow
         }
+    } else {
+        Show-RecommendedModelDownloads
     }
 
     while ($true) {
@@ -765,9 +801,13 @@ $topP = [string](Get-SavedValue 'top_p' '')
 $seed = [string](Get-SavedValue 'seed' '')
 $serverAddr = [string](Get-SavedValue 'server_addr' '127.0.0.1:8080')
 $serverParallel = [string](Get-SavedValue 'server_parallel' '1')
-$defaultSessionCacheDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'MoE4All\kv-sessions'
+$defaultSessionCacheDir = Join-Path $repoRoot 'kv-sessions'
+$legacySessionCacheDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'MoE4All\kv-sessions'
 $serverSessionCache = [bool](Get-SavedValue 'server_session_cache' $false)
 $sessionCacheDir = [string](Get-SavedValue 'session_cache_dir' $defaultSessionCacheDir)
+if ([string]::Equals($sessionCacheDir, $legacySessionCacheDir, [System.StringComparison]::OrdinalIgnoreCase)) {
+    $sessionCacheDir = $defaultSessionCacheDir
+}
 $sessionIdleSecs = [string](Get-SavedValue 'session_idle_secs' '120')
 $sessionCacheMax = [string](Get-SavedValue 'session_cache_max' '5GiB')
 $sessionCacheTtlHours = [string](Get-SavedValue 'session_cache_ttl_hours' '24')
