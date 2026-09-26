@@ -752,14 +752,20 @@ impl ParallelSeam {
                 .ok_or_else(|| anyhow!("Qwen3.8 MTP needs a draft sidecar"))?;
             let fixed =
                 crate::mtp::Qwen4MtpSession::load_fixed_vulkan(&vk, sidecar, model.config())?;
+            let catch = crate::mtp::Qwen4MtpSession::shared_catch_workspace(
+                &vk,
+                &fixed,
+                max_ctx,
+                crate::seam::ubatch_rows(model.engine_cfg()),
+            )?;
             let mut heads = Vec::with_capacity(n_slots);
             for _ in 0..n_slots {
                 heads.push(MtpSlotState {
-                    head: crate::mtp::Qwen4MtpSession::with_fixed(
+                    head: crate::mtp::Qwen4MtpSession::with_fixed_and_catch(
                         &vk,
                         Arc::clone(&fixed),
                         max_ctx,
-                        crate::seam::ubatch_rows(model.engine_cfg()),
+                        Arc::clone(&catch),
                     )?,
                     cached: Vec::new(),
                     last_h: vec![0.0; model.config().hc_mult * model.config().n_embd],

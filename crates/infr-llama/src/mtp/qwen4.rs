@@ -1,11 +1,11 @@
 use anyhow::{anyhow, bail, Context, Result};
-use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage};
+use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, SegmentedKvSpec};
 use infr_core::graph::{Activation, AttnMask, Graph, Op};
 use infr_core::tensor::{DType, TensorDesc, TensorId};
 use infr_core::{TensorInfo, WeightSource};
 use infr_gguf::Gguf;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::{BindWeightFn, MtpTensor};
 
@@ -1054,22 +1054,69 @@ pub(crate) struct Qwen4MtpFixed {
     specs: Vec<(DType, usize)>,
 }
 
+struct Qwen4MtpCatchBuffers {
+    max_batch: usize,
+    ids: Box<dyn Buffer>,
+    h: Box<dyn Buffer>,
+    positions: Box<dyn Buffer>,
+    positions4: Box<dyn Buffer>,
+    embedding_overrides: Box<dyn Buffer>,
+}
+
+pub(crate) struct Qwen4MtpCatchWorkspace {
+    h_width: usize,
+    n_embd: usize,
+    buffers: Mutex<Qwen4MtpCatchBuffers>,
+}
+
+struct Qwen4MtpKvCache {
+    k: Box<dyn Buffer>,
+    v: Box<dyn Buffer>,
+    segmented: bool,
+    committed_tokens: usize,
+}
+
 pub(crate) struct Qwen4MtpSession {
     cfg: crate::Config,
     max_ctx: usize,
-    max_batch: usize,
     fixed: Arc<Qwen4MtpFixed>,
-    k_cache: Box<dyn Buffer>,
-    v_cache: Box<dyn Buffer>,
-    catch_ids: Box<dyn Buffer>,
-    catch_h: Box<dyn Buffer>,
-    catch_positions: Box<dyn Buffer>,
-    catch_positions4: Box<dyn Buffer>,
-    catch_embedding_overrides: Box<dyn Buffer>,
+    kv_spec: SegmentedKvSpec,
+    kv: Mutex<Qwen4MtpKvCache>,
+    catch: Arc<Qwen4MtpCatchWorkspace>,
     draft_id: Box<dyn Buffer>,
     draft_h: Box<dyn Buffer>,
     draft_positions: [Box<dyn Buffer>; DRAFT_TOKENS],
     draft_ids: [Box<dyn Buffer>; DRAFT_TOKENS],
+}
+
+pub(crate) fn qwen4_mtp_kv_spec(cfg: &crate::Config, max_ctx: usize) -> Result<SegmentedKvSpec> {
+    let row_elements = cfg
+        .n_kv
+        .checked_mul(cfg.head_dim)
+        .ok_or_else(|| anyhow!("Qwen3.8 MTP KV row width overflow"))?;
+    mtp_kv_spec(row_elements, max_ctx)
+}
+
+fn mtp_kv_spec(row_elements: usize, max_ctx: usize) -> Result<SegmentedKvSpec> {
+    anyhow::ensure!(max_ctx > 0, "Qwen3.8 MTP needs a non-zero context capacity");
+    let segment_elements = crate::seam::KV_GROW_ROWS
+        .checked_mul(row_elements)
+        .ok_or_else(|| anyhow!("Qwen3.8 MTP KV segment element count overflow"))?;
+    anyhow::ensure!(
+        segment_elements.is_power_of_two(),
+        "Qwen3.8 MTP segmented KV needs a power-of-two segment width; got {segment_elements} elements"
+    );
+    Ok(SegmentedKvSpec {
+        logical_bytes: max_ctx
+            .checked_mul(row_elements)
+            .and_then(|elements| elements.checked_mul(2))
+            .ok_or_else(|| anyhow!("Qwen3.8 MTP logical KV byte count overflow"))?,
+        segment_bytes: segment_elements
+            .checked_mul(2)
+            .ok_or_else(|| anyhow!("Qwen3.8 MTP KV segment byte count overflow"))?,
+        segment_elements,
+        max_segments: max_ctx.div_ceil(crate::seam::KV_GROW_ROWS),
+    })
 }
 
 impl Qwen4MtpSession {
@@ -1138,19 +1185,67 @@ impl Qwen4MtpSession {
         max_ctx: usize,
         max_batch: usize,
     ) -> Result<Self> {
-        let cfg = &fixed.cfg;
+        let catch = Self::shared_catch_workspace(be, &fixed, max_ctx, max_batch)?;
+        Self::with_fixed_and_catch(be, fixed, max_ctx, catch)
+    }
 
-        let kvrow = cfg.n_kv * cfg.head_dim;
+    pub(crate) fn shared_catch_workspace(
+        be: &dyn Backend,
+        fixed: &Qwen4MtpFixed,
+        max_ctx: usize,
+        max_batch: usize,
+    ) -> Result<Arc<Qwen4MtpCatchWorkspace>> {
+        let cfg = &fixed.cfg;
         let hcw = cfg.hc_mult * cfg.n_embd;
         let max_batch = max_batch.max(DRAFT_TOKENS).min(max_ctx.max(1));
         let alloc = |bytes, usage| be.alloc(bytes, usage).map_err(|e| anyhow!("{e}"));
-        let k_cache = alloc(max_ctx * kvrow * 2, BufferUsage::KvCache)?;
-        let v_cache = alloc(max_ctx * kvrow * 2, BufferUsage::KvCache)?;
-        let catch_ids = alloc(max_batch * 4, BufferUsage::Staging)?;
-        let catch_h = alloc(max_batch * hcw * 4, BufferUsage::Staging)?;
-        let catch_positions = alloc(max_batch * 4, BufferUsage::Staging)?;
-        let catch_positions4 = alloc(max_batch * 4 * 4, BufferUsage::Staging)?;
-        let catch_embedding_overrides = alloc(max_batch * cfg.n_embd * 4, BufferUsage::Staging)?;
+        Ok(Arc::new(Qwen4MtpCatchWorkspace {
+            h_width: hcw,
+            n_embd: cfg.n_embd,
+            buffers: Mutex::new(Qwen4MtpCatchBuffers {
+                max_batch,
+                ids: alloc(max_batch * 4, BufferUsage::Staging)?,
+                h: alloc(max_batch * hcw * 4, BufferUsage::Staging)?,
+                positions: alloc(max_batch * 4, BufferUsage::Staging)?,
+                positions4: alloc(max_batch * 4 * 4, BufferUsage::Staging)?,
+                embedding_overrides: alloc(max_batch * cfg.n_embd * 4, BufferUsage::Staging)?,
+            }),
+        }))
+    }
+
+    pub(crate) fn with_fixed_and_catch(
+        be: &dyn Backend,
+        fixed: Arc<Qwen4MtpFixed>,
+        max_ctx: usize,
+        catch: Arc<Qwen4MtpCatchWorkspace>,
+    ) -> Result<Self> {
+        let cfg = &fixed.cfg;
+        let hcw = cfg.hc_mult * cfg.n_embd;
+        anyhow::ensure!(
+            catch.h_width == hcw && catch.n_embd == cfg.n_embd,
+            "Qwen3.8 MTP catch workspace belongs to an incompatible model"
+        );
+        let alloc = |bytes, usage| be.alloc(bytes, usage).map_err(|e| anyhow!("{e}"));
+        let kv_spec = qwen4_mtp_kv_spec(cfg, max_ctx)?;
+        let (k_cache, v_cache, segmented_kv) = match be
+            .alloc_segmented_kv(kv_spec)
+            .map_err(|e| anyhow!("{e}"))?
+        {
+            Some(k_cache) => {
+                let v_cache = be
+                    .alloc_segmented_kv(kv_spec)
+                    .map_err(|e| anyhow!("{e}"))?
+                    .ok_or_else(|| {
+                        anyhow!("Qwen3.8 MTP segmented KV support disappeared during allocation")
+                    })?;
+                (k_cache, v_cache, true)
+            }
+            None => (
+                alloc(kv_spec.logical_bytes, BufferUsage::KvCache)?,
+                alloc(kv_spec.logical_bytes, BufferUsage::KvCache)?,
+                false,
+            ),
+        };
         let draft_id = alloc(4, BufferUsage::Staging)?;
         let draft_h = alloc(hcw * 4, BufferUsage::Staging)?;
         let draft_positions = [
@@ -1165,29 +1260,85 @@ impl Qwen4MtpSession {
             alloc(4, BufferUsage::Readback)?,
             alloc(4, BufferUsage::Readback)?,
         ];
+        let catch_batch = catch
+            .buffers
+            .lock()
+            .map_err(|_| anyhow!("Qwen3.8 MTP catch workspace poisoned"))?
+            .max_batch;
         tracing::info!(
             draft_tokens = DRAFT_TOKENS,
             max_ctx,
-            catch_batch = max_batch,
+            catch_batch,
+            kv_mode = if segmented_kv {
+                "segmented-32k"
+            } else {
+                "flat"
+            },
             "loaded fixed Qwen3.8 MTP sidecar runtime"
         );
         Ok(Self {
             cfg: cfg.clone(),
             max_ctx,
-            max_batch,
             fixed,
-            k_cache,
-            v_cache,
-            catch_ids,
-            catch_h,
-            catch_positions,
-            catch_positions4,
-            catch_embedding_overrides,
+            kv_spec,
+            kv: Mutex::new(Qwen4MtpKvCache {
+                k: k_cache,
+                v: v_cache,
+                segmented: segmented_kv,
+                committed_tokens: 0,
+            }),
+            catch,
             draft_id,
             draft_h,
             draft_positions,
             draft_ids,
         })
+    }
+
+    fn kv_for_depth<'a>(
+        &'a self,
+        be: &dyn Backend,
+        tokens: usize,
+    ) -> Result<MutexGuard<'a, Qwen4MtpKvCache>> {
+        anyhow::ensure!(
+            tokens <= self.max_ctx,
+            "Qwen3.8 MTP KV depth {tokens} exceeds the session capacity {}",
+            self.max_ctx
+        );
+        let mut kv = self
+            .kv
+            .lock()
+            .map_err(|_| anyhow!("Qwen3.8 MTP KV state poisoned"))?;
+        if kv.segmented && !be.segmented_kv_available() {
+            let alloc = || {
+                be.alloc(self.kv_spec.logical_bytes, BufferUsage::KvCache)
+                    .map_err(|e| anyhow!("{e}"))
+            };
+            let k = alloc()?;
+            let v = alloc()?;
+            kv.k = k;
+            kv.v = v;
+            kv.segmented = false;
+            tracing::info!(
+                bytes_per_side = self.kv_spec.logical_bytes,
+                "Qwen3.8 MTP head KV uses flat storage because no unified VRAM arena is active"
+            );
+        }
+        if !kv.segmented || tokens <= kv.committed_tokens {
+            return Ok(kv);
+        }
+        let segments = tokens.div_ceil(crate::seam::KV_GROW_ROWS);
+        be.ensure_segmented_kv_batch(&[kv.k.as_ref(), kv.v.as_ref()], segments)
+            .map_err(|e| anyhow!("commit Qwen3.8 MTP segmented KV growth: {e}"))?;
+        let committed_tokens = (segments * crate::seam::KV_GROW_ROWS).min(self.max_ctx);
+        kv.committed_tokens = committed_tokens;
+        tracing::info!(
+            requested_tokens = tokens,
+            committed_tokens,
+            segments,
+            "expanded Qwen3.8 MTP head KV cache"
+        );
+        Ok(kv)
     }
 
     fn bind_common<'a>(
@@ -1234,13 +1385,19 @@ impl Qwen4MtpSession {
                 "Qwen3.8 MTP multimodal RoPE sections are empty"
             );
         }
-        for (chunk, token_rows) in tokens.chunks(self.max_batch).enumerate() {
-            let off = chunk * self.max_batch;
+        let catch = self
+            .catch
+            .buffers
+            .lock()
+            .map_err(|_| anyhow!("Qwen3.8 MTP catch workspace poisoned"))?;
+        for (chunk, token_rows) in tokens.chunks(catch.max_batch).enumerate() {
+            let off = chunk * catch.max_batch;
             let rows = token_rows.len();
             let pos = start_pos + off;
             if pos + rows > self.max_ctx {
                 bail!("Qwen3.8 MTP catch-up exceeds {} token cache", self.max_ctx);
             }
+            let kv = self.kv_for_depth(be, pos + rows)?;
             let ids = token_rows
                 .iter()
                 .map(|&token| token as i32)
@@ -1296,28 +1453,22 @@ impl Qwen4MtpSession {
                     override_values.extend_from_slice(&span.embeds[source_start..source_end]);
                 }
             }
-            be.upload(self.catch_ids.as_ref(), bytemuck::cast_slice(&ids))
+            be.upload(catch.ids.as_ref(), bytemuck::cast_slice(&ids))
                 .map_err(|e| anyhow!("{e}"))?;
             be.upload(
-                self.catch_h.as_ref(),
+                catch.h.as_ref(),
                 bytemuck::cast_slice(&h[off * hcw..(off + rows) * hcw]),
             )
             .map_err(|e| anyhow!("{e}"))?;
-            be.upload(
-                self.catch_positions.as_ref(),
-                bytemuck::cast_slice(&positions),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
-            if mrope.is_some() {
-                be.upload(
-                    self.catch_positions4.as_ref(),
-                    bytemuck::cast_slice(&positions4),
-                )
+            be.upload(catch.positions.as_ref(), bytemuck::cast_slice(&positions))
                 .map_err(|e| anyhow!("{e}"))?;
+            if mrope.is_some() {
+                be.upload(catch.positions4.as_ref(), bytemuck::cast_slice(&positions4))
+                    .map_err(|e| anyhow!("{e}"))?;
             }
             if !override_values.is_empty() {
                 be.upload(
-                    self.catch_embedding_overrides.as_ref(),
+                    catch.embedding_overrides.as_ref(),
                     bytemuck::cast_slice(&override_values),
                 )
                 .map_err(|e| anyhow!("{e}"))?;
@@ -1335,17 +1486,17 @@ impl Qwen4MtpSession {
             );
             let plan = be.compile(&graph).map_err(|e| anyhow!("{e}"))?;
             let mut bindings = Bindings::new();
-            bindings.bind(handles.ids, self.catch_ids.as_ref());
-            bindings.bind(handles.h, self.catch_h.as_ref());
-            bindings.bind(handles.positions, self.catch_positions.as_ref());
+            bindings.bind(handles.ids, catch.ids.as_ref());
+            bindings.bind(handles.h, catch.h.as_ref());
+            bindings.bind(handles.positions, catch.positions.as_ref());
             if let Some(id) = handles.positions4 {
-                bindings.bind(id, self.catch_positions4.as_ref());
+                bindings.bind(id, catch.positions4.as_ref());
             }
             if let Some(id) = handles.embedding_overrides {
-                bindings.bind(id, self.catch_embedding_overrides.as_ref());
+                bindings.bind(id, catch.embedding_overrides.as_ref());
             }
-            bindings.bind(handles.k_cache, self.k_cache.as_ref());
-            bindings.bind(handles.v_cache, self.v_cache.as_ref());
+            bindings.bind(handles.k_cache, kv.k.as_ref());
+            bindings.bind(handles.v_cache, kv.v.as_ref());
             self.bind_common(
                 &mut bindings,
                 &handles.weights,
@@ -1384,6 +1535,7 @@ impl Qwen4MtpSession {
         if start_pos + verify_tokens > self.max_ctx {
             bail!("Qwen3.8 MTP draft exceeds {} token cache", self.max_ctx);
         }
+        let kv = self.kv_for_depth(be, start_pos + verify_tokens)?;
         be.upload(self.draft_id.as_ref(), bytemuck::bytes_of(&(token as i32)))
             .map_err(|e| anyhow!("{e}"))?;
         be.upload(self.draft_h.as_ref(), bytemuck::cast_slice(h))
@@ -1410,8 +1562,8 @@ impl Qwen4MtpSession {
         let mut bindings = Bindings::new();
         bindings.bind(handles.id, self.draft_id.as_ref());
         bindings.bind(handles.h, self.draft_h.as_ref());
-        bindings.bind(handles.k_cache, self.k_cache.as_ref());
-        bindings.bind(handles.v_cache, self.v_cache.as_ref());
+        bindings.bind(handles.k_cache, kv.k.as_ref());
+        bindings.bind(handles.v_cache, kv.v.as_ref());
         for (id, buffer) in handles.positions.into_iter().zip(&self.draft_positions) {
             bindings.bind(id, buffer.as_ref());
         }
@@ -1741,7 +1893,7 @@ impl Qwen4MtpRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::generation_budget;
+    use super::{generation_budget, mtp_kv_spec};
 
     #[test]
     fn generation_budget_clips_a_large_reply_to_the_remaining_context() {
@@ -1759,5 +1911,14 @@ mod tests {
     #[test]
     fn generation_budget_rejects_a_prompt_without_verify_room() {
         assert!(generation_budget(262_141, 1, 262_144).is_err());
+    }
+
+    #[test]
+    fn head_kv_uses_independent_32k_f16_segments() {
+        let spec = mtp_kv_spec(2 * 256, 163_840).unwrap();
+        assert_eq!(spec.logical_bytes, 163_840 * 512 * 2);
+        assert_eq!(spec.segment_bytes, 32 * 1024 * 512 * 2);
+        assert_eq!(spec.segment_elements, 32 * 1024 * 512);
+        assert_eq!(spec.max_segments, 5);
     }
 }
