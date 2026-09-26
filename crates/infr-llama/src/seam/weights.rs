@@ -938,18 +938,19 @@ impl TurnRecurrentCkpt {
             return Ok(());
         }
         let layer = self.layers[i];
-        be.copy_buffer(
-            src_k[layer].as_ref(),
-            self.kbufs[i].as_ref(),
-            src_k[layer].len_bytes(),
-        )
-        .map_err(|e| anyhow!("{e}"))?;
-        be.copy_buffer(
-            src_v[layer].as_ref(),
-            self.vbufs[i].as_ref(),
-            src_v[layer].len_bytes(),
-        )
-        .map_err(|e| anyhow!("{e}"))?;
+        let copies = [
+            (
+                src_k[layer].as_ref(),
+                self.kbufs[i].as_ref(),
+                src_k[layer].len_bytes(),
+            ),
+            (
+                src_v[layer].as_ref(),
+                self.vbufs[i].as_ref(),
+                src_v[layer].len_bytes(),
+            ),
+        ];
+        be.copy_buffers(&copies).map_err(|e| anyhow!("{e}"))?;
         self.copied[i] = true;
         self.refresh_valid();
         Ok(())
@@ -992,10 +993,40 @@ impl TurnRecurrentCkpt {
         src_v: &[Box<dyn Buffer>],
         src_ple: Option<&dyn Buffer>,
     ) -> AResult<()> {
-        for i in 0..self.layers.len() {
-            self.snapshot_index(be, src_k, src_v, i)?;
+        if self.ple_state.is_some() != src_ple.is_some() {
+            return Err(anyhow!(
+                "stable recurrent checkpoint PLE source differs from its allocation"
+            ));
         }
-        self.snapshot_ple(be, src_ple)?;
+
+        let mut copies =
+            Vec::with_capacity(self.layers.len() * 2 + usize::from(self.ple_state.is_some()));
+        for (i, &layer) in self.layers.iter().enumerate() {
+            if self.copied[i] {
+                continue;
+            }
+            copies.push((
+                src_k[layer].as_ref(),
+                self.kbufs[i].as_ref(),
+                src_k[layer].len_bytes(),
+            ));
+            copies.push((
+                src_v[layer].as_ref(),
+                self.vbufs[i].as_ref(),
+                src_v[layer].len_bytes(),
+            ));
+        }
+        if !self.ple_copied {
+            if let (Some(src), Some(dst)) = (src_ple, self.ple_state.as_deref()) {
+                copies.push((src, dst, src.len_bytes()));
+            }
+        }
+        be.copy_buffers(&copies).map_err(|e| anyhow!("{e}"))?;
+        drop(copies);
+
+        self.copied.fill(true);
+        self.ple_copied = true;
+        self.refresh_valid();
         Ok(())
     }
 }
@@ -1257,24 +1288,22 @@ impl SeamKv {
         let ck = self.turn_recurrent_ckpts[selected]
             .as_ref()
             .expect("selected recurrent checkpoint exists");
+        let mut copies =
+            Vec::with_capacity(ck.layers.len() * 2 + usize::from(ck.ple_state.is_some()));
         for (i, &l) in ck.layers.iter().enumerate() {
-            be.copy_buffer(
+            copies.push((
                 ck.kbufs[i].as_ref(),
                 self.kbufs[l].as_ref(),
                 ck.kbufs[i].len_bytes(),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
-            be.copy_buffer(
+            ));
+            copies.push((
                 ck.vbufs[i].as_ref(),
                 self.vbufs[l].as_ref(),
                 ck.vbufs[i].len_bytes(),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
+            ));
         }
         match (ck.ple_state.as_ref(), self.ple_state_buf.as_deref()) {
-            (Some(src), Some(dst)) => be
-                .copy_buffer(src.as_ref(), dst, src.len_bytes())
-                .map_err(|e| anyhow!("{e}"))?,
+            (Some(src), Some(dst)) => copies.push((src.as_ref(), dst, src.len_bytes())),
             (Some(_), None) | (None, Some(_)) => {
                 return Err(anyhow!(
                     "stable recurrent checkpoint PLE target differs from its snapshot"
@@ -1282,8 +1311,42 @@ impl SeamKv {
             }
             (None, None) => {}
         }
+        be.copy_buffers(&copies).map_err(|e| anyhow!("{e}"))?;
+        drop(copies);
         self.cached.clone_from(&ck.tokens);
         Ok(Some(len))
+    }
+
+    /// Capture a turn checkpoint once an external batched path has stopped exactly at that token
+    /// boundary. Qwen3.8 MTP prime uses its own batched-verify forward and therefore returns before
+    /// the ordinary runner's snapshot sites. Re-arm here because its first cold chunk correctly
+    /// resets the recurrent state and invalidates any checkpoint prepared before that reset.
+    pub(crate) fn capture_turn_recurrent(
+        &mut self,
+        be: &dyn Backend,
+        cfg: &Config,
+        index: usize,
+        tokens: &[u32],
+    ) -> AResult<()> {
+        let slot = self
+            .turn_recurrent_ckpts
+            .get_mut(index)
+            .ok_or_else(|| anyhow!("turn checkpoint index {index} is out of range"))?;
+        TurnRecurrentCkpt::begin(
+            slot,
+            be,
+            cfg,
+            &self.kbufs,
+            &self.vbufs,
+            self.ple_state_buf.as_deref(),
+            tokens,
+        )?;
+        let checkpoint = self
+            .turn_recurrent_ckpts
+            .get_mut(index)
+            .and_then(Option::as_mut)
+            .ok_or_else(|| anyhow!("turn checkpoint {index} has no recurrent layers"))?;
+        checkpoint.snapshot_all(be, &self.kbufs, &self.vbufs, self.ple_state_buf.as_deref())
     }
 
     /// Fork a fresh conversation slot: same (Arc-shared) weights, its own zero KV + IO buffers.

@@ -121,6 +121,26 @@ fn pick_continuation(
         .map(|(idx, _, _)| idx)
 }
 
+/// Map a separately-tokenized rendered prefix back onto the actual prompt token stream.
+/// Tokenizers may merge a few tokens across the prefix/body boundary, so an exact token prefix
+/// is preferred but a small mismatch confined to the hint's tail is still a stable checkpoint.
+fn checkpoint_boundary(prompt: &[u32], hint: &[u32]) -> Option<usize> {
+    const MAX_TOKENIZER_BOUNDARY_TAIL: usize = 8;
+
+    if hint.is_empty() {
+        return None;
+    }
+    let common = prompt
+        .iter()
+        .zip(hint)
+        .take_while(|(actual, expected)| actual == expected)
+        .count();
+    (common > 0
+        && common < prompt.len()
+        && hint.len().saturating_sub(common) <= MAX_TOKENIZER_BOUNDARY_TAIL)
+        .then_some(common)
+}
+
 /// Open a Vulkan backend on physical device `dev`: `Some(idx)` pins `VulkanN`
 /// ([`infr_vulkan::VulkanBackend::new_on_with`], bypassing `device.dev`/the discrete-default rule
 /// for the multi-device path), `None` is the historical default
@@ -896,10 +916,7 @@ impl SeamModel {
                 return Ok(None);
             };
             let tokens = self.encode(prefix)?;
-            Ok((!tokens.is_empty()
-                && tokens.len() < prompt_tokens.len()
-                && prompt_tokens.starts_with(&tokens))
-            .then_some(tokens.len()))
+            Ok(checkpoint_boundary(prompt_tokens, &tokens))
         };
         Ok(Some(crate::seam::TurnCheckpoint::new(
             boundary(prefixes.agent)?,
@@ -2698,5 +2715,41 @@ mod pick_continuation_tests {
         assert_eq!(pick_continuation(candidates, 100), None);
         // Empty candidate set.
         assert_eq!(pick_continuation(std::iter::empty(), 100), None);
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_boundary_tests {
+    use super::checkpoint_boundary;
+
+    #[test]
+    fn accepts_an_exact_strict_prefix() {
+        assert_eq!(checkpoint_boundary(&[10, 20, 30], &[10, 20]), Some(2));
+    }
+
+    #[test]
+    fn trims_a_small_tokenizer_boundary_mismatch() {
+        assert_eq!(
+            checkpoint_boundary(&[10, 20, 30, 40, 50], &[10, 20, 31, 41]),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn rejects_an_early_or_large_mismatch() {
+        assert_eq!(
+            checkpoint_boundary(
+                &[10, 99, 30, 40, 50, 60, 70, 80, 90, 100, 110],
+                &[10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn requires_a_nonempty_strict_prompt_prefix() {
+        assert_eq!(checkpoint_boundary(&[10, 20], &[]), None);
+        assert_eq!(checkpoint_boundary(&[10, 20], &[10, 20]), None);
+        assert_eq!(checkpoint_boundary(&[10, 20], &[99]), None);
     }
 }
