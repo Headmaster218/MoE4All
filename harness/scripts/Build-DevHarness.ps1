@@ -68,6 +68,18 @@ try {
         Pop-Location
     }
 
+    $providerPath = Join-Path $harnessRoot 'plugins\dsh-llm-moe4all'
+    Push-Location $providerPath
+    try {
+        & $node $npmCli ci --registry $Registry --no-audit --no-fund --ignore-scripts --legacy-peer-deps
+        if ($LASTEXITCODE -ne 0) { throw 'Installing the MoE4All provider build dependencies failed.' }
+
+        & $node $npmCli run build
+        if ($LASTEXITCODE -ne 0) { throw 'Building the MoE4All provider plugin failed.' }
+    } finally {
+        Pop-Location
+    }
+
     New-Item -ItemType Directory -Path $pluginPackRoot -Force | Out-Null
     $pluginNames = @(
         'dsh-market-moe4all',
