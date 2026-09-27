@@ -33,7 +33,7 @@ use std::{
 
 use axum::{
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -2970,13 +2970,25 @@ async fn streaming(
     // Undici's default 300-second response-body timeout to tear down an otherwise healthy request.
     // SSE comments are wire activity but not OpenAI deltas, so they keep transports alive without
     // exposing partial tool JSON or changing any client-visible message semantics.
-    Sse::new(stream)
+    let mut response = Sse::new(stream)
         .keep_alive(
             KeepAlive::new()
                 .interval(SSE_KEEP_ALIVE_INTERVAL)
                 .text("keep-alive"),
         )
-        .into_response()
+        .into_response();
+
+    // Keep intermediaries from buffering several heartbeat comments into one downstream write.
+    // `no-transform` is the standard cache directive; `X-Accel-Buffering` covers nginx and
+    // compatible reverse proxies without adding HTTP/1-only hop-by-hop headers.
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-transform"),
+    );
+    response
+        .headers_mut()
+        .insert("x-accel-buffering", HeaderValue::from_static("no"));
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -5149,6 +5161,18 @@ mod tests {
         .await
         .expect("a queued stream must return its SSE response before admission");
         assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-cache, no-transform")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("x-accel-buffering")
+                .and_then(|value| value.to_str().ok()),
+            Some("no")
+        );
 
         tokio::time::timeout(Duration::from_secs(1), async {
             while stats.queued.load(Ordering::Relaxed) != 1 {
@@ -5186,6 +5210,68 @@ mod tests {
         assert!(
             !stopped.load(Ordering::Relaxed),
             "a disconnected queued request must never invoke the generator"
+        );
+    }
+
+    /// Once admitted, an otherwise silent generator models KV restore, vision processing,
+    /// prefill, and buffered tool-call decoding. Those phases must keep producing wire activity
+    /// even though no OpenAI delta is available yet.
+    #[tokio::test]
+    async fn admitted_silent_stream_keeps_heartbeating_before_first_delta() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let entry = deadline_entry(Arc::new(SilentLoopGen {
+            stopped: stopped.clone(),
+        }));
+        let resp = streaming(
+            entry.clone(),
+            user_msg(),
+            None,
+            None,
+            GenParams::default(),
+            test_ctx(None, true),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while entry.slots.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the streaming request was never admitted");
+
+        let mut body = resp.into_body();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let frame = body
+                    .frame()
+                    .await
+                    .expect("the admitted SSE body ended")
+                    .expect("the admitted SSE body failed");
+                let Ok(data) = frame.into_data() else {
+                    continue;
+                };
+                if String::from_utf8_lossy(&data).contains("keep-alive") {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("an admitted silent stream emitted no keep-alive");
+
+        drop(body);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !stopped.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("dropping the admitted SSE body did not cancel the generator");
+        assert_eq!(
+            entry.slots.available_permits(),
+            1,
+            "the cancelled generation must release its GPU slot"
         );
     }
 
