@@ -142,10 +142,19 @@ pub(super) struct DeltaW {
     pub(super) out: TensorId,
 }
 
-/// Ling KDA mixer weights. Q/K/V projection and causal-conv banks are concatenated once at load,
-/// matching the packed activation consumed by [`infr_core::Op::Kda`].
+/// Ling KDA Q/K/V projections. Most GGUFs use one dtype for all three and keep the single fused
+/// projection. Ling 3.0 Tiny Q4_K_M stores Q/K as Q4_K but V as Q6_K, so that model keeps a fused
+/// Q/K bank plus a separate V bank and packs their activations before the causal convolution.
+#[derive(Clone, Copy)]
+pub(super) enum KdaQkvW {
+    Fused(TensorId),
+    QkV { qk: TensorId, v: TensorId },
+}
+
+/// Ling KDA mixer weights. The causal-conv banks are concatenated once at load, matching the
+/// packed activation consumed by [`infr_core::Op::Kda`].
 pub(super) struct KdaW {
-    pub(super) qkv: TensorId,
+    pub(super) qkv: KdaQkvW,
     pub(super) conv: TensorId,
     pub(super) forget: TensorId,
     pub(super) beta: TensorId,
@@ -363,6 +372,8 @@ pub(crate) struct SessionStable {
     pub(super) fuse_gu: bool,
     /// Combined QKV upload decision.
     pub(super) fuse_qkv: bool,
+    /// Per-layer Ling KDA QKV layout: true for one fused bank, false for QK + V.
+    pub(super) kda_qkv_fused: Vec<bool>,
     /// Whether the MoE expert banks all have a dp4a-mmq kernel (batched-prefill eligibility).
     pub(super) moe_batched_ok: bool,
 }

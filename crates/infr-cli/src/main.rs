@@ -4465,6 +4465,9 @@ fn arch_sampling(arch: &str, no_think: bool) -> (f32, usize, f32) {
         // the family publishes no per-arch recommendation, so all four arch strings stay on the
         // same neutral values rather than on invented ones.
         DEEPSEEK | DEEPSEEK2 | DEEPSEEK32 | DEEPSEEK4 => (0.6, 20, 0.95),
+        // Ling 3.0 Tiny and Flash publish this profile in generation_config.json and in the
+        // official GGUF metadata. GGUF-only installs have no sibling JSON, so pin it here too.
+        BAILINGMOE3 => (1.0, 20, 0.95),
         _ => (0.6, 20, 0.95),
     }
 }
@@ -5654,6 +5657,7 @@ mod tests {
         assert_eq!(arch_sampling(QWEN2, false), (0.7, 20, 0.8));
         // Gemma: high temp, wide top_k.
         assert_eq!(arch_sampling(GEMMA4, false), (1.0, 64, 0.95));
+        assert_eq!(arch_sampling(BAILINGMOE3, false), (1.0, 20, 0.95));
         // Llama: top_k off (0 = keep all), top_p 0.9.
         assert_eq!(arch_sampling(LLAMA, false), (0.6, 0, 0.9));
     }
