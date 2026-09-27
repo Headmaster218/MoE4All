@@ -3979,7 +3979,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        assert_native_k("linear_add_native_at", in_f);
+        assert_native_gemv_k("linear_add_native_at", dtype, in_f);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
