@@ -153,12 +153,15 @@ impl DeviceArena {
                 bytes,
             }));
         }
+        let arena = Self { backing, shards };
+        let regions = arena.vulkan_regions()?;
+        vk.materialize_unified_arena(&regions)?;
         tracing::debug!(
             "[infr] device arena: {} bytes across {} shard(s), backing={backing:?}",
             shard_sizes.iter().sum::<usize>(),
-            shards.len(),
+            arena.shards.len(),
         );
-        Ok(Self { backing, shards })
+        Ok(arena)
     }
 
     pub(crate) fn backing(&self) -> DeviceArenaBacking {
@@ -171,6 +174,20 @@ impl DeviceArena {
 
     pub(crate) fn shard_sizes(&self) -> Vec<usize> {
         self.shards.iter().map(|shard| shard.bytes()).collect()
+    }
+
+    pub(crate) fn verify_residency(&self, vk: &VulkanBackend) -> Result<()> {
+        vk.verify_unified_arena_residency(&self.vulkan_regions()?)
+    }
+
+    fn vulkan_regions(&self) -> Result<Vec<(vk::Buffer, u64)>> {
+        self.shards
+            .iter()
+            .map(|shard| {
+                let buffer = as_vk_buf(shard.buffer())?;
+                Ok((buffer.buffer, crate::fill_span(shard.bytes())))
+            })
+            .collect()
     }
 }
 

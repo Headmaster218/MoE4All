@@ -1234,6 +1234,69 @@ impl VulkanShared {
         Err(self.make_queue_unusable(last, context))
     }
 
+    /// Submit an initialization-only residency probe without poisoning the runtime queue state.
+    /// No pager copy has been promised when the arena-construction probe runs, so an OOM may be
+    /// returned to the placement loop, which drops the empty arena and retries at a smaller size.
+    /// The final session probe may additionally retire every unused Host DMA tail before giving up.
+    fn queue_submit_residency_probe(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        context: &str,
+        shed_host_dma: bool,
+    ) -> std::result::Result<(), vk::Result> {
+        let _queue = self.queue_access.lock().unwrap();
+        if let Some(error) = self.queue_submit_failure() {
+            return Err(error);
+        }
+        let mut attempts = 1usize;
+        let mut last = match self.queue_submit_once(submits, vk::Fence::null(), None) {
+            Ok(()) => return Ok(()),
+            Err(error) if retryable_queue_submit_error(error) => error,
+            Err(error) => return Err(error),
+        };
+
+        for delay_ms in MEMORY_OOM_RETRY_DELAYS_MS {
+            self.drain_queue_for_submit_retry()?;
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            attempts += 1;
+            match self.queue_submit_once(submits, vk::Fence::null(), None) {
+                Ok(()) => {
+                    tracing::warn!(
+                        "[infr] {context} recovered after {attempts} residency-probe attempts"
+                    );
+                    return Ok(());
+                }
+                Err(error) if retryable_queue_submit_error(error) => last = error,
+                Err(error) => return Err(error),
+            }
+        }
+
+        while shed_host_dma {
+            self.drain_queue_for_submit_retry()?;
+            let released = self.shed_host_dma_imports(HOST_DMA_SHED_STEP_BYTES);
+            if released == 0 {
+                break;
+            }
+            tracing::warn!(
+                "[infr] {context} still cannot submit; released {:.2} GiB of idle Host DMA mappings before retrying the final residency probe",
+                released as f64 / (1u64 << 30) as f64,
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            attempts += 1;
+            match self.queue_submit_once(submits, vk::Fence::null(), None) {
+                Ok(()) => {
+                    tracing::warn!(
+                        "[infr] {context} recovered after {attempts} residency-probe attempts"
+                    );
+                    return Ok(());
+                }
+                Err(error) if retryable_queue_submit_error(error) => last = error,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last)
+    }
+
     pub(crate) fn queue_wait_idle_serialized(&self) -> std::result::Result<(), vk::Result> {
         let _queue = self.queue_access.lock().unwrap();
         unsafe { self.device.queue_wait_idle(self.queue) }
@@ -6619,6 +6682,100 @@ impl VulkanBackend {
         })
     }
 
+    fn residency_probe_one_shot(
+        &self,
+        context: &str,
+        shed_host_dma: bool,
+        f: impl FnOnce(vk::CommandBuffer),
+    ) -> Result<()> {
+        let device = &self.shared.device;
+        let pool_guard = self.shared.cmd_pool.lock().unwrap();
+        let pool = *pool_guard;
+        let cmd = unsafe {
+            device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }
+        .map_err(|error| be(format!("{context}: allocate command buffer: {error}")))?[0];
+        let _command = OneShotCommand { device, pool, cmd };
+
+        unsafe {
+            device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+        }
+        .map_err(|error| be(format!("{context}: begin command buffer: {error}")))?;
+        f(cmd);
+        unsafe { device.end_command_buffer(cmd) }
+            .map_err(|error| be(format!("{context}: end command buffer: {error}")))?;
+
+        let commands = [cmd];
+        let submit = vk::SubmitInfo::default().command_buffers(&commands);
+        self.shared
+            .queue_submit_residency_probe(&[submit], context, shed_host_dma)
+            .map_err(|error| be(format!("{context}: {error}")))?;
+        self.shared
+            .queue_wait_idle_serialized()
+            .map_err(|error| be(format!("{context}: queue wait: {error}")))
+    }
+
+    pub(crate) fn materialize_unified_arena(&self, shards: &[(vk::Buffer, u64)]) -> Result<()> {
+        if shards.is_empty() {
+            return Err(be("unified arena materialization needs physical shards"));
+        }
+        let shared = Arc::clone(&self.shared);
+        self.residency_probe_one_shot(
+            "unified-arena materialization",
+            false,
+            move |command| unsafe {
+                for &(buffer, bytes) in shards {
+                    shared.device.cmd_fill_buffer(command, buffer, 0, bytes, 0);
+                }
+            },
+        )
+    }
+
+    pub(crate) fn verify_unified_arena_residency(
+        &self,
+        shards: &[(vk::Buffer, u64)],
+    ) -> Result<()> {
+        if shards.is_empty() {
+            return Err(be(
+                "unified arena residency verification needs physical shards",
+            ));
+        }
+        let sink = self.make_buf(
+            shards.len() * std::mem::size_of::<u32>(),
+            MemoryLocation::GpuToCpu,
+            "unified_residency_probe",
+        )?;
+        let sink_buffer = sink.buffer;
+        let shared = Arc::clone(&self.shared);
+        self.residency_probe_one_shot(
+            "final unified-arena residency verification",
+            true,
+            move |command| unsafe {
+                for (index, &(buffer, _)) in shards.iter().enumerate() {
+                    shared.device.cmd_copy_buffer(
+                        command,
+                        buffer,
+                        sink_buffer,
+                        &[vk::BufferCopy {
+                            src_offset: 0,
+                            dst_offset: (index * std::mem::size_of::<u32>()) as u64,
+                            size: std::mem::size_of::<u32>() as u64,
+                        }],
+                    );
+                }
+            },
+        )
+    }
+
     /// Record a single command into a one-shot command buffer, submit it to the
     /// compute queue, and block until idle.
     ///
@@ -7287,6 +7444,9 @@ impl Backend for VulkanBackend {
                 .expect("MoE pager disappeared during session finalization")
                 .install_transfer_plan(Arc::clone(&plan));
             *self.shared.session_transfer_plan.write().unwrap() = Some(Arc::downgrade(&plan));
+        }
+        if let Some(pool) = self.unified_vram() {
+            pool.verify_final_residency(self)?;
         }
         Ok(())
     }
@@ -8422,6 +8582,10 @@ mod tests {
             .map(|i| (i as u8).wrapping_mul(31))
             .collect();
         be.upload(b.as_ref(), &bytes).expect("unified upload");
+        pool.verify_final_residency(&be)
+            .expect("final residency verification");
+        pool.verify_final_residency(&be)
+            .expect("idempotent final residency verification");
         let mut back = vec![0; bytes.len()];
         be.download(b.as_ref(), &mut back)
             .expect("unified download");
