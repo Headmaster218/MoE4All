@@ -631,6 +631,9 @@ struct VulkanShared {
     /// Architecture bucket retained for narrow Vulkan kernel-policy decisions that must not leak
     /// vendor-specific flags into infr-core's backend-neutral `Capabilities`.
     device_arch: crate::caps::DeviceArch,
+    /// Windows NVIDIA drivers can expose the BAR/ReBAR aperture as a second DEVICE_LOCAL heap
+    /// backed by the same framebuffer. Count only the largest local heap for physical VRAM.
+    largest_device_local_heap_only: bool,
     /// VK_EXT_memory_budget enabled → `vram()` can report live free bytes (else total only).
     has_mem_budget: bool,
     /// `maxMemoryAllocationSize` — the largest single `vkAllocateMemory` this device accepts
@@ -2046,14 +2049,57 @@ fn device_type_str(t: vk::PhysicalDeviceType) -> &'static str {
     }
 }
 
+fn uses_largest_device_local_heap_only(
+    vendor_id: u32,
+    device_type: vk::PhysicalDeviceType,
+    windows: bool,
+) -> bool {
+    windows
+        && vendor_id == crate::caps::VENDOR_NVIDIA
+        && device_type == vk::PhysicalDeviceType::DISCRETE_GPU
+}
+
+fn physical_vram_heap_mask(
+    mp: &vk::PhysicalDeviceMemoryProperties,
+    uma: bool,
+    largest_device_local_heap_only: bool,
+) -> u32 {
+    let heap_count = mp.memory_heap_count as usize;
+    if uma {
+        return (0..heap_count).fold(0, |mask, index| mask | (1 << index));
+    }
+
+    let device_local = |index: usize| {
+        mp.memory_heaps[index]
+            .flags
+            .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+    };
+    if largest_device_local_heap_only {
+        return (0..heap_count)
+            .filter(|&index| device_local(index))
+            .max_by_key(|&index| mp.memory_heaps[index].size)
+            .map_or(0, |index| 1 << index);
+    }
+
+    (0..heap_count)
+        .filter(|&index| device_local(index))
+        .fold(0, |mask, index| mask | (1 << index))
+}
+
 fn device_local_heap_bytes(instance: &ash::Instance, pd: vk::PhysicalDevice) -> u64 {
+    let properties = unsafe { instance.get_physical_device_properties(pd) };
     let mp = unsafe { instance.get_physical_device_memory_properties(pd) };
+    let heap_mask = physical_vram_heap_mask(
+        &mp,
+        false,
+        uses_largest_device_local_heap_only(
+            properties.vendor_id,
+            properties.device_type,
+            cfg!(target_os = "windows"),
+        ),
+    );
     (0..mp.memory_heap_count as usize)
-        .filter(|&h| {
-            mp.memory_heaps[h]
-                .flags
-                .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
-        })
+        .filter(|&h| heap_mask & (1 << h) != 0)
         .map(|h| mp.memory_heaps[h].size)
         .sum()
 }
@@ -2084,7 +2130,8 @@ pub struct DeviceInfo {
     pub name: String,
     pub device_type: &'static str,
     pub integrated: bool,
-    /// Sum of DEVICE_LOCAL heap sizes (a UMA part reports its GTT-backed heap here).
+    /// Physical DEVICE_LOCAL capacity used for device selection. Windows NVIDIA discrete GPUs
+    /// count only the largest heap so a BAR/ReBAR alias is not added to framebuffer capacity.
     pub vram_bytes: u64,
     /// Capacity paired with `vram_available_bytes`: device-local heaps on a discrete GPU and all
     /// physical-memory heaps on a unified-memory device.
@@ -2447,10 +2494,14 @@ impl UnifiedPhaseRegistry {
 /// what lets bytes actually LAND there once the device-local heap is full. Above the summed budget
 /// the failure mode is the same on both classes (the driver oversubscribes and starts evicting),
 /// which is why the guard exists at all — it just now guards the right number on each.
+///
+/// Windows NVIDIA is a narrower exception: the BAR/ReBAR aperture can be exposed as another
+/// DEVICE_LOCAL heap backed by the same framebuffer, so only the largest local heap counts there.
 fn physical_vram_info(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
     uma: bool,
+    largest_device_local_heap_only: bool,
     has_mem_budget: bool,
     tracked_used: u64,
 ) -> VramInfo {
@@ -2468,11 +2519,9 @@ fn physical_vram_info(
     // same DDR is exactly the thing a UMA guard must see.
     let mut total = 0u64;
     let mut available = 0u64;
+    let heap_mask = physical_vram_heap_mask(&mp, uma, largest_device_local_heap_only);
     for i in 0..mp.memory_heap_count as usize {
-        let device_local = mp.memory_heaps[i]
-            .flags
-            .contains(vk::MemoryHeapFlags::DEVICE_LOCAL);
-        if uma || device_local {
+        if heap_mask & (1 << i) != 0 {
             total += mp.memory_heaps[i].size;
             available += if has_mem_budget {
                 // Live free = budget - usage (the budget is a CEILING, not free bytes). Clamped to
@@ -2506,6 +2555,7 @@ fn vram_info(s: &VulkanShared) -> VramInfo {
         &s.instance,
         s.physical_device,
         s.caps.unified_memory,
+        s.largest_device_local_heap_only,
         s.has_mem_budget,
         s.device_used.load(Ordering::Relaxed),
     )
@@ -2732,8 +2782,18 @@ impl VulkanBackend {
                         .any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) == name })
                 };
                 let integrated = p.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
-                let vram =
-                    physical_vram_info(&instance, pd, integrated, has(c"VK_EXT_memory_budget"), 0);
+                let vram = physical_vram_info(
+                    &instance,
+                    pd,
+                    integrated,
+                    uses_largest_device_local_heap_only(
+                        p.vendor_id,
+                        p.device_type,
+                        cfg!(target_os = "windows"),
+                    ),
+                    has(c"VK_EXT_memory_budget"),
+                    0,
+                );
                 let flash_attention_hd256 = probe_flash_attention_hd256(
                     &entry,
                     &instance,
@@ -4039,6 +4099,11 @@ impl VulkanBackend {
                 allocator: ManuallyDrop::new(Mutex::new(allocator)),
                 caps,
                 device_arch,
+                largest_device_local_heap_only: uses_largest_device_local_heap_only(
+                    device_probe.vendor_id,
+                    props.device_type,
+                    cfg!(target_os = "windows"),
+                ),
                 has_mem_budget,
                 max_mem_alloc_size,
                 max_push_constants: props.limits.max_push_constants_size,
@@ -7609,6 +7674,45 @@ mod tests {
 
         let integrated_only = [(vk::PhysicalDeviceType::INTEGRATED_GPU, 64 * gib)];
         assert_eq!(preferred_device_index(&integrated_only), 0);
+    }
+
+    #[test]
+    fn windows_nvidia_discrete_vram_excludes_the_bar_alias_heap() {
+        let gib = 1u64 << 30;
+        let mut mp = vk::PhysicalDeviceMemoryProperties::default();
+        mp.memory_heap_count = 3;
+        mp.memory_heaps[0] = vk::MemoryHeap {
+            size: 32 * gib,
+            flags: vk::MemoryHeapFlags::DEVICE_LOCAL,
+        };
+        mp.memory_heaps[1] = vk::MemoryHeap {
+            size: 64 * gib,
+            flags: vk::MemoryHeapFlags::empty(),
+        };
+        mp.memory_heaps[2] = vk::MemoryHeap {
+            size: 16 * gib,
+            flags: vk::MemoryHeapFlags::DEVICE_LOCAL,
+        };
+
+        assert!(uses_largest_device_local_heap_only(
+            crate::caps::VENDOR_NVIDIA,
+            vk::PhysicalDeviceType::DISCRETE_GPU,
+            true,
+        ));
+        assert!(!uses_largest_device_local_heap_only(
+            crate::caps::VENDOR_AMD,
+            vk::PhysicalDeviceType::DISCRETE_GPU,
+            true,
+        ));
+        assert!(!uses_largest_device_local_heap_only(
+            crate::caps::VENDOR_NVIDIA,
+            vk::PhysicalDeviceType::DISCRETE_GPU,
+            false,
+        ));
+
+        assert_eq!(physical_vram_heap_mask(&mp, false, true), 0b001);
+        assert_eq!(physical_vram_heap_mask(&mp, false, false), 0b101);
+        assert_eq!(physical_vram_heap_mask(&mp, true, true), 0b111);
     }
 
     fn submit_sample(gpu_ns: u64, dispatches: usize) -> SubmitRoundStats {
