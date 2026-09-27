@@ -3047,15 +3047,7 @@ impl VulkanBackend {
         for (i, &pd) in pdevices.iter().enumerate() {
             let p = unsafe { instance.get_physical_device_properties(pd) };
             let name = unsafe { CStr::from_ptr(p.device_name.as_ptr()) }.to_string_lossy();
-            let mp = unsafe { instance.get_physical_device_memory_properties(pd) };
-            let dev_local: u64 = (0..mp.memory_heap_count as usize)
-                .filter(|&h| {
-                    mp.memory_heaps[h]
-                        .flags
-                        .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
-                })
-                .map(|h| mp.memory_heaps[h].size)
-                .sum();
+            let dev_local = device_local_heap_bytes(&instance, pd);
             tracing::info!(
                 "[infr] vulkan device Vulkan{i}: {name} ({}, {})",
                 device_type_str(p.device_type),
