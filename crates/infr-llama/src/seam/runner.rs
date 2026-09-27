@@ -8,9 +8,9 @@ use super::sc::{
 use super::segmented_kv::{PlaneKind, SegmentedKvLayout};
 use super::weights::{
     alloc_segmented_plane, AttnW, DeltaW, Dsv4CompressedW, Dsv4CompressorW, Dsv4IndexerW, Dsv4W,
-    FfnW, HcTriple, IndexerW, KdaW, LayerHcW, LayerW, MixerW, MlaW, MoeSharedW, MtpDeltaCkpt, QsaW,
-    QwenHcW, QwenLayerHcW, QwenMtpVerifyBuffers, QwenPleW, SeamKv, SeamWeights, SegmentedKvState,
-    SessionStable, TurnRecurrentCkpt,
+    FfnW, HcTriple, IndexerW, KdaQkvW, KdaW, LayerHcW, LayerW, MixerW, MlaW, MoeSharedW,
+    MtpDeltaCkpt, QsaW, QwenHcW, QwenLayerHcW, QwenMtpVerifyBuffers, QwenPleW, SeamKv, SeamWeights,
+    SegmentedKvState, SessionStable, TurnRecurrentCkpt,
 };
 use super::{
     common_prefix_len, e2b_ipl_rows, kv_forces_static, BindWeight, ParallelSampledOutput,
@@ -78,6 +78,45 @@ pub(crate) fn fuse_qkv_decision(
                 && c.layer_n_kv(l) == c.n_kv
                 && c.has_own_kv(l)
         })
+}
+
+/// Ling KDA normally uploads Q/K/V as one fused projection. The official Tiny Q4_K_M GGUF uses
+/// Q4_K for Q/K and Q6_K for V; preserve both native formats by splitting only that layout into a
+/// fused Q/K projection plus V. Q and K must still match because their packed two-bank fast path is
+/// the compatibility boundary implemented below.
+fn kda_qkv_is_fused(g: &Gguf, layer: usize) -> AResult<bool> {
+    let dtype = |suffix: &str| {
+        let name = format!("blk.{layer}.{suffix}");
+        g.tensors()
+            .iter()
+            .find(|t| t.name == name)
+            .map(|t| t.dtype)
+            .ok_or_else(|| anyhow!("tensor not found: {name}"))
+    };
+    let q = dtype("attn_q.weight")?;
+    let k = dtype("attn_k.weight")?;
+    let v = dtype("attn_v.weight")?;
+    if q != k {
+        return Err(anyhow!(
+            "Ling KDA layer {layer} requires matching Q/K dtypes, got {q:?} and {k:?}"
+        ));
+    }
+    Ok(q == v)
+}
+
+/// Ling Flash GGUFs use `ssm_{f,g}.weight`; the official Tiny converter emits
+/// `ssm_{f,g}_a.weight` for the same projection shapes. Resolve the compatibility alias without
+/// changing the graph's weight order.
+fn kda_projection_name(g: &Gguf, layer: usize, primary: &str, tiny_alias: &str) -> AResult<String> {
+    for suffix in [primary, tiny_alias] {
+        let name = format!("blk.{layer}.{suffix}");
+        if g.tensors().iter().any(|t| t.name == name) {
+            return Ok(name);
+        }
+    }
+    Err(anyhow!(
+        "tensor not found: blk.{layer}.{{{primary},{tiny_alias}}}"
+    ))
 }
 
 /// Range-check externally-supplied token ids against the vocabulary BEFORE they index the
@@ -837,6 +876,19 @@ fn session_stable(
     // split form. INFR_NO_QKV_FUSE forces the split form for A/B (default unset = fuse; the split
     // form is bit-identical — same dots, same fixed-order sums).
     let fuse_qkv = fuse_qkv_decision(caps.combined_gu, g, c, ec);
+    let kda_qkv_fused = if c.bailingmoe3 {
+        (0..c.n_layer)
+            .map(|l| {
+                if c.is_bailing_mla_layer(l) {
+                    Ok(false)
+                } else {
+                    kda_qkv_is_fused(g, l)
+                }
+            })
+            .collect::<AResult<Vec<_>>>()?
+    } else {
+        vec![false; c.n_layer]
+    };
     // Batched-prefill eligibility for MoE: every layer's expert banks must have a dp4a-mmq kernel
     // (`MOE_MMQ_DTYPES`) — see the decode_start call site's comment for the full rationale.
     // Scanned over the layers that actually HOLD expert banks (`Config::is_moe_layer`), not every
@@ -876,6 +928,7 @@ fn session_stable(
         yarn_ff,
         fuse_gu,
         fuse_qkv,
+        kda_qkv_fused,
         moe_batched_ok,
     })
 }
@@ -1784,6 +1837,7 @@ fn generate_dense_backend_inner(
     let dec_out_scale = &stable.dec_out_scale;
     let fuse_gu = stable.fuse_gu;
     let fuse_qkv = stable.fuse_qkv;
+    let kda_qkv_fused = &stable.kda_qkv_fused;
     let moe_batched_ok = stable.moe_batched_ok;
 
     // qwen35 DeltaNet silu-gated RMSNorm fusion (decode op-fusion campaign): QkNorm's per-head
@@ -2248,22 +2302,29 @@ fn generate_dense_backend_inner(
                     }
                 }
             } else if is_kda {
-                wload(&[
-                    &p("attn_q.weight"),
-                    &p("attn_k.weight"),
-                    &p("attn_v.weight"),
-                ])?;
+                if kda_qkv_fused[l] {
+                    wload(&[
+                        &p("attn_q.weight"),
+                        &p("attn_k.weight"),
+                        &p("attn_v.weight"),
+                    ])?;
+                } else {
+                    wload(&[&p("attn_q.weight"), &p("attn_k.weight")])?;
+                    wload(&[&p("attn_v.weight")])?;
+                }
                 wload(&[
                     &p("ssm_conv1d_q.weight"),
                     &p("ssm_conv1d_k.weight"),
                     &p("ssm_conv1d_v.weight"),
                 ])?;
-                wload(&[&p("ssm_f.weight")])?;
+                let forget = kda_projection_name(g, l, "ssm_f.weight", "ssm_f_a.weight")?;
+                wload(&[&forget])?;
                 wload(&[&p("ssm_beta.weight")])?;
                 wload(&[&p("ssm_a")])?;
                 wload(&[&p("ssm_dt.bias")])?;
                 wload(&[&p("ssm_norm.weight")])?;
-                wload(&[&p("ssm_g.weight")])?;
+                let gate = kda_projection_name(g, l, "ssm_g.weight", "ssm_g_a.weight")?;
+                wload(&[&gate])?;
                 wload(&[&p("attn_output.weight")])?;
             } else if is_delta {
                 wload(&[&p("attn_qkv.weight")])?;
@@ -3900,8 +3961,16 @@ fn generate_dense_backend_inner(
                     indexer,
                 })
             } else if is_kda {
+                let qkv = if kda_qkv_fused[l] {
+                    KdaQkvW::Fused(wpush(&mut g, &mut weights))
+                } else {
+                    KdaQkvW::QkV {
+                        qk: wpush(&mut g, &mut weights),
+                        v: wpush(&mut g, &mut weights),
+                    }
+                };
                 MixerW::Kda(KdaW {
-                    qkv: wpush(&mut g, &mut weights),
+                    qkv,
                     conv: wpush(&mut g, &mut weights),
                     forget: wpush(&mut g, &mut weights),
                     beta: wpush(&mut g, &mut weights),
@@ -5052,9 +5121,9 @@ fn generate_dense_backend_inner(
             };
             // gemma4 proportional-RoPE applies only on full-attention layers.
             let layer_ff = if gemma4 && !swa { rope_freqs } else { None };
-            // DeepSeek V4's per-layer SwiGLU clamps: `swiglu_clamp_exp[il]` on the ROUTED experts
-            // and `swiglu_clamp_shexp[il]` on the shared one — two different hparam arrays, so the
-            // two can differ within a layer. `infr_core::graph::swiglu_clamp` owns the
+            // DeepSeek V4 / Ling per-layer SwiGLU clamps: `swiglu_clamp_exp[il]` on the routed
+            // experts and `swiglu_clamp_shexp[il]` on the shared one. Ling Tiny stores zeroes
+            // because its GGUF omits both optional keys. `infr_core::graph::swiglu_clamp` owns the
             // `limit > 1e-6` disabled gate; passing a non-clamping layer's raw 0.0 through as
             // `Some(0.0)` would clamp that whole FFN to zero. `None` for every other arch.
             let (clamp_exp, clamp_shexp) = if c.deepseek4 || c.bailingmoe3 {
@@ -5262,15 +5331,60 @@ fn generate_dense_backend_inner(
             } else if let MixerW::Kda(kw) = &lw.mixer {
                 let inner = c.n_head * c.kda_head_dim;
                 let packed = 3 * inner;
-                g.push(Op::Linear {
-                    x: hn,
-                    weight: kw.qkv,
-                    dst: dn_qkvbuf,
-                    m: batch as u32,
-                    in_f: ne as u32,
-                    out_f: packed as u32,
-                    w_off: 0,
-                });
+                match kw.qkv {
+                    KdaQkvW::Fused(weight) => g.push(Op::Linear {
+                        x: hn,
+                        weight,
+                        dst: dn_qkvbuf,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: packed as u32,
+                        w_off: 0,
+                    }),
+                    KdaQkvW::QkV { qk, v } => {
+                        // Tiny Q4_K_M keeps Q/K and V in their native Q4_K/Q6_K formats. Reuse
+                        // `dn_convout` and `kda_forget` as temporary projection buffers; both are
+                        // overwritten only after these two copies have packed the convolution input.
+                        g.push(Op::Linear {
+                            x: hn,
+                            weight: qk,
+                            dst: dn_convout,
+                            m: batch as u32,
+                            in_f: ne as u32,
+                            out_f: (2 * inner) as u32,
+                            w_off: 0,
+                        });
+                        g.push(Op::Linear {
+                            x: hn,
+                            weight: v,
+                            dst: kda_forget,
+                            m: batch as u32,
+                            in_f: ne as u32,
+                            out_f: inner as u32,
+                            w_off: 0,
+                        });
+                        g.push(Op::CopyStrided {
+                            src: dn_convout,
+                            src_off: 0,
+                            src_stride: (2 * inner) as u32,
+                            dst: dn_qkvbuf,
+                            dst_off: 0,
+                            dst_stride: packed as u32,
+                            rows: batch as u32,
+                            n: (2 * inner) as u32,
+                        });
+                        g.push(Op::CopyStrided {
+                            src: kda_forget,
+                            src_off: 0,
+                            src_stride: inner as u32,
+                            dst: dn_qkvbuf,
+                            dst_off: (2 * inner) as u32,
+                            dst_stride: packed as u32,
+                            rows: batch as u32,
+                            n: inner as u32,
+                        });
+                    }
+                }
                 g.push(Op::Conv1dSilu {
                     x: dn_qkvbuf,
                     weight: kw.conv,

@@ -453,13 +453,14 @@ pub fn parse_hermes_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
     (clean.trim().to_owned(), calls)
 }
 
-/// Parse one `<tool_call>` body into a [`ToolCall`]. Two body dialects exist in the wild:
+/// Parse one `<tool_call>` body into a [`ToolCall`]. Three body dialects exist in the wild:
 /// - Hermes/Qwen3 JSON: `{"name":..,"arguments":..}` (`arguments` tolerated as a nested object
 ///   or an embedded JSON string);
 /// - the XML-parameter format Qwen3.5/3.6-class templates mandate (llama.cpp's "qwen3-coder"
 ///   handler): `<function=NAME><parameter=KEY>VALUE</parameter>…</function>` — the model follows
 ///   its template, so a JSON-only parser silently DROPPED these calls (empty serve replies with
-///   `finish_reason:"stop"`, found via hrdr against Qwen3.6-27B).
+///   `finish_reason:"stop"`, found via hrdr against Qwen3.6-27B);
+/// - Ling 3.0: `NAME<arg_key>KEY</arg_key><arg_value>VALUE</arg_value>…`.
 fn parse_hermes_body(body: &str) -> Option<ToolCall> {
     if let Ok(v) = serde_json::from_str::<Value>(body) {
         let name = v.get("name")?.as_str()?.to_owned();
@@ -470,7 +471,7 @@ fn parse_hermes_body(body: &str) -> Option<ToolCall> {
         };
         return Some(ToolCall { name, arguments });
     }
-    parse_xml_function_body(body)
+    parse_xml_function_body(body).or_else(|| parse_ling_xml_body(body))
 }
 
 /// The XML-parameter dialect: `<function=NAME>` then zero or more
@@ -510,10 +511,55 @@ fn parse_xml_function_body(body: &str) -> Option<ToolCall> {
     })
 }
 
+/// Ling 3.0's XML-pair dialect: the function name is the first text in the body, followed by
+/// zero or more `<arg_key>KEY</arg_key><arg_value>VALUE</arg_value>` pairs. Values may span lines
+/// and use JSON for structured arguments; plain text remains a string.
+fn parse_ling_xml_body(body: &str) -> Option<ToolCall> {
+    const KEY_OPEN: &str = "<arg_key>";
+    const KEY_CLOSE: &str = "</arg_key>";
+    const VALUE_OPEN: &str = "<arg_value>";
+    const VALUE_CLOSE: &str = "</arg_value>";
+
+    let body = body.trim();
+    let name_end = body.find(KEY_OPEN).unwrap_or(body.len());
+    let name = body[..name_end].trim();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+    {
+        return None;
+    }
+
+    let mut args = serde_json::Map::new();
+    let mut rest = body[name_end..].trim();
+    while !rest.is_empty() {
+        let after_key_open = rest.strip_prefix(KEY_OPEN)?;
+        let key_end = after_key_open.find(KEY_CLOSE)?;
+        let key = after_key_open[..key_end].trim();
+        if key.is_empty() {
+            return None;
+        }
+        let after_key = after_key_open[key_end + KEY_CLOSE.len()..].trim_start();
+        let after_value_open = after_key.strip_prefix(VALUE_OPEN)?;
+        let value_end = after_value_open.find(VALUE_CLOSE)?;
+        let raw = after_value_open[..value_end].trim();
+        let value =
+            serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_owned()));
+        args.insert(key.to_owned(), value);
+        rest = after_value_open[value_end + VALUE_CLOSE.len()..].trim();
+    }
+
+    Some(ToolCall {
+        name: name.to_owned(),
+        arguments: Value::Object(args),
+    })
+}
+
 /// Dialect-aware tool-call extraction — THE entry point consumers should use. Supported models
 /// emit three tool-call dialects, per their GGUF chat templates:
-/// - Hermes/Qwen3 JSON and the Qwen3.5/3.6 XML-parameter body, both inside `<tool_call>` tags
-///   ([`parse_hermes_tool_calls`]);
+/// - Hermes/Qwen3 JSON, Qwen3.5/3.6 XML parameters, and Ling 3.0 XML key/value pairs, all inside
+///   `<tool_call>` tags ([`parse_hermes_tool_calls`]);
 /// - the gemma-4 / E2B / DiffusionGemma pipe-marker form `<|tool_call>call:NAME{..}<tool_call|>`
 ///   ([`parse_tool_calls`]) — serve previously never tried this one, silently dropping those
 ///   models' calls;
@@ -956,6 +1002,28 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "ls");
         assert_eq!(calls[0].arguments["path"], serde_json::json!("."));
+    }
+
+    #[test]
+    fn parses_ling3_xml_key_value_tool_call() {
+        let text = "<tool_call>write_file\n<arg_key>path</arg_key>\n<arg_value>/tmp/x.txt</arg_value>\n<arg_key>options</arg_key>\n<arg_value>{\"append\":true}</arg_value>\n</tool_call>";
+        let (clean, calls) = parse_hermes_tool_calls(text);
+        assert!(clean.is_empty(), "clean: {clean:?}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "write_file");
+        assert_eq!(calls[0].arguments["path"], serde_json::json!("/tmp/x.txt"));
+        assert_eq!(
+            calls[0].arguments["options"],
+            serde_json::json!({"append": true})
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_ling3_xml_pairs() {
+        let text = "<tool_call>write_file<arg_key>path</arg_key></tool_call>";
+        let (clean, calls) = parse_hermes_tool_calls(text);
+        assert!(clean.is_empty(), "clean: {clean:?}");
+        assert!(calls.is_empty());
     }
 
     #[test]

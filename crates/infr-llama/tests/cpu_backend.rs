@@ -1313,6 +1313,52 @@ fn qwen35_08b() -> Option<PathBuf> {
     find_gguf("unsloth--Qwen3.5-0.8B-GGUF", "Qwen3.5-0.8B-Q4_K_M.gguf")
 }
 
+fn ling3_tiny_q4km() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("INFR_TEST_LING3_TINY") {
+        return Some(PathBuf::from(path));
+    }
+    find_gguf(
+        "inclusionAI--Ling-3.0-tiny-GGUF",
+        "Ling-3.0-tiny-Q4_K_M.gguf",
+    )
+}
+
+/// The official Tiny GGUF is `bailingmoe3`, like Ling Flash, but omits both optional SwiGLU clamp
+/// arrays because the corresponding HF config values are null. Its smaller geometry must stay
+/// metadata-driven rather than inheriting Flash's 42-layer/512-expert assumptions.
+#[test]
+fn ling3_tiny_q4km_config_parses() {
+    let path = need_model!(ling3_tiny_q4km(), "Ling-3.0-tiny Q4_K_M");
+    let g = infr_gguf::Gguf::open(&path).expect("open Ling-3.0-tiny GGUF");
+    let cfg = infr_llama::Config::from_gguf(&g).expect("parse Ling-3.0-tiny config");
+
+    assert!(cfg.bailingmoe3);
+    assert!(!cfg.is_lite);
+    assert_eq!(cfg.n_layer, 24);
+    assert_eq!(cfg.n_layer_nextn, 0);
+    assert_eq!(cfg.n_embd, 1536);
+    assert_eq!(cfg.n_head, 16);
+    assert_eq!(cfg.n_layer_dense_lead, 1);
+    assert_eq!(cfg.kda_head_dim, 128);
+    assert_eq!(cfg.q_lora_rank, 256);
+    assert_eq!(cfg.kv_lora_rank, 512);
+    assert_eq!(
+        cfg.bailing_mla_layers
+            .iter()
+            .enumerate()
+            .filter_map(|(layer, &mla)| mla.then_some(layer))
+            .collect::<Vec<_>>(),
+        vec![3, 7, 11, 15, 19, 23]
+    );
+    let moe = cfg.moe.expect("Ling Tiny is MoE");
+    assert_eq!(moe.n_expert, 128);
+    assert_eq!(moe.n_used, 8);
+    assert_eq!(moe.n_ff_exp, 512);
+    assert_eq!(cfg.shexp_ff, 512);
+    assert_eq!(cfg.swiglu_clamp_exp, vec![0.0; 24]);
+    assert_eq!(cfg.swiglu_clamp_shexp, vec![0.0; 24]);
+}
+
 // Captured + verified coherent (qwen35 / Qwen3-Next: gated-DeltaNet + gated full-attention): "The
 // capital of France is **Paris**. It is the largest city …", a knight story ("Elara … Aethelgard").
 // Renders with thinking ON (the infr-wide default; INFR_NO_THINK turns it off).
