@@ -114,6 +114,20 @@ try {
     try {
         & $node $pnpmCli install --no-frozen-lockfile --store-dir $pnpmStore --fetch-timeout 300000 --fetch-retries 5
         if ($LASTEXITCODE -ne 0) { throw 'Installing the isolated web profile failed.' }
+
+        # Local tarballs keep stable filenames. Refresh their lockfile integrity
+        # explicitly so a rebuilt package cannot leave stale bytes installed.
+        $updateArgs = @('update') + $pluginNames + @(
+            '--force'
+            '--store-dir'
+            $pnpmStore
+            '--fetch-timeout'
+            '300000'
+            '--fetch-retries'
+            '5'
+        )
+        & $node $pnpmCli @updateArgs
+        if ($LASTEXITCODE -ne 0) { throw 'Refreshing the isolated local plugin packages failed.' }
     } finally {
         Pop-Location
     }
