@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use infr_core::backend::Buffer;
@@ -1328,6 +1328,7 @@ pub struct UnifiedVramPool {
     arena: DeviceArena,
     expert_layout: Option<ExpertArenaLayout>,
     kv_reservations: Arc<Mutex<KvReservationState>>,
+    residency_verified: AtomicBool,
 }
 
 impl UnifiedVramPool {
@@ -1389,7 +1390,22 @@ impl UnifiedVramPool {
             arena,
             expert_layout,
             kv_reservations: Arc::new(Mutex::new(KvReservationState::default())),
+            residency_verified: AtomicBool::new(false),
         }))
+    }
+
+    pub(crate) fn verify_final_residency(&self, vk: &VulkanBackend) -> Result<()> {
+        if self.residency_verified.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.arena.verify_residency(vk)?;
+        self.residency_verified.store(true, Ordering::Release);
+        tracing::info!(
+            arena_bytes = self.ranges.stats().capacity_bytes,
+            shards = self.arena.shard_sizes().len(),
+            "[infr] unified VRAM physical residency verified"
+        );
+        Ok(())
     }
 
     pub(crate) fn expert_layout(&self) -> Option<&ExpertArenaLayout> {
