@@ -296,6 +296,18 @@ fn expert_stride_bytes(dtype: infr_core::DType, stride: usize) -> u32 {
     bytes as u32
 }
 
+/// The base streamed GEMV has a scalar BF16 tail for projection widths such as Qwen3.8 Vision's
+/// 4304-element FFN. All block-quantized formats and all other native kernels stay on the strict
+/// 32-element grid.
+#[track_caller]
+fn assert_native_gemv_k(kernel: &str, dtype: infr_core::DType, in_f: usize) {
+    assert!(
+        in_f != 0 && (in_f.is_multiple_of(32) || dtype == infr_core::DType::Bf16),
+        "{kernel}: native-block K must be a nonzero multiple of 32 unless the base streamed GEMV \
+         is decoding BF16 (got dtype={dtype:?}, in_f={in_f})"
+    );
+}
+
 /// Reject a native-block dispatch whose K axis is off the 32-element sub-block grid.
 ///
 /// Every `native_decode.glsl` consumer walks K as `nsub = in_f / 32` whole 32-element sub-blocks —
@@ -309,11 +321,10 @@ fn expert_stride_bytes(dtype: infr_core::DType, stride: usize) -> u32 {
 /// (`embed_gather` differs in shape only — it writes inside the sub-block loop, so a short row
 /// leaves `dst` untouched instead — not in consequence.)
 ///
-/// No GGUF reaches either case — quant block sizes are 32/64/256, and every float projection width
-/// in a real model is 32-aligned — so this guards the floor rather than lifting it with a masked
-/// tail block across the whole shader family. A hard `assert!` and not a `debug_assert!`: the
-/// failure being guarded is a plausible-looking RELEASE-build result, which is exactly what a
-/// debug-only check does not catch. Cost is two integer ops in front of a GPU dispatch.
+/// Quant block sizes are 32/64/256, so every block-quantized path must retain this strict guard.
+/// The base BF16 streamed GEMV is the one explicit exception: it has a scalar tail for dense
+/// projection widths such as Qwen3.8 Vision's 4304. A hard `assert!` and not a `debug_assert!`:
+/// the failure being guarded is a plausible-looking release-build result.
 #[track_caller]
 fn assert_native_k(kernel: &str, in_f: usize) {
     assert!(
@@ -3361,7 +3372,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        assert_native_k("linear_native_at", in_f);
+        assert_native_gemv_k("linear_native_at", dtype, in_f);
         self.label_gemv("gemv_streamed", rows, in_f, out_f);
         let (name, spv) =
             crate::gemm::native_streamed_build_spv(dtype, false).expect("native streamed GEMV spv");
