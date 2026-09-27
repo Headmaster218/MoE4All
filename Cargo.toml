@@ -88,7 +88,7 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 # `strftime_now` in HF chat templates (Llama-3.x stamps "Today Date:") — llama.cpp-minja parity.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["chrono", "env-filter"] }
 ash = "0.38"
 gpu-allocator = { version = "0.27", features = ["vulkan"] }
 metal = "0.33"
