@@ -110,6 +110,34 @@ fn gpu_weight_columns(
         .collect()
 }
 
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn bf16_native_gemv_preserves_ragged_k_tail() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+
+    // Qwen3.8 Vision's FFN width: 134 complete native blocks plus a 16-element tail.
+    const IN_F: usize = 4304;
+    const OUT_F: usize = 7;
+    let mut bytes = Vec::with_capacity(IN_F * OUT_F * 2);
+    let mut host = Vec::with_capacity(IN_F * OUT_F);
+    for i in 0..IN_F * OUT_F {
+        let value = ((i * 17 % 193) as f32 - 96.0) / 32.0;
+        let bits = (value.to_bits() >> 16) as u16;
+        bytes.extend_from_slice(&bits.to_le_bytes());
+        host.push(f32::from_bits((bits as u32) << 16));
+    }
+
+    // Cover complete-block boundaries, the last complete element, and both ends of the tail.
+    let cols = [0, 31, 32, 4287, 4288, 4303];
+    let gpu = gpu_weight_columns(&be, DType::Bf16, &bytes, IN_F, OUT_F, &cols);
+    let mut diff = Diff::default();
+    diff.accumulate("ragged BF16", &gpu, &host, IN_F, OUT_F, &cols);
+    diff.assert_bit_identical("ragged BF16");
+}
+
 /// Running worst-case disagreement between the GPU's decoded weights and `dequant_block`'s, plus
 /// the count of elements that were not bit-identical.
 #[derive(Default)]
