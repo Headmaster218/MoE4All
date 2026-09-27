@@ -1,7 +1,10 @@
 [CmdletBinding()]
 param(
     [string]$NodeVersion = '24.9.0',
-    [string]$Registry = 'https://registry.npmmirror.com'
+    [string]$Registry = 'https://registry.npmmirror.com',
+    [string]$ProductionHome = "$env:APPDATA\dsh-desktop\harness",
+    [string]$WorkspaceRoot = 'D:\AISuperAssistant\DSH',
+    [switch]$RefreshConfig
 )
 
 $ErrorActionPreference = 'Stop'
@@ -20,9 +23,12 @@ $pnpmStore = Join-Path $runtimeRoot 'pnpm-store'
 $pluginPackRoot = Join-Path $runtimeRoot 'plugin-packs'
 $devProfile = Join-Path $harnessRoot 'dev-state\home\profiles\web'
 
-if (-not (Test-Path -LiteralPath (Join-Path $devProfile 'package.json'))) {
-    & (Join-Path $PSScriptRoot 'Initialize-DevHarness.ps1')
+$initializeParams = @{
+    ProductionHome = $ProductionHome
+    WorkspaceRoot = $WorkspaceRoot
 }
+if ($RefreshConfig) { $initializeParams.Refresh = $true }
+& (Join-Path $PSScriptRoot '_Initialize-DevHarness.ps1') @initializeParams
 
 if (-not (Test-Path -LiteralPath $node)) {
     New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null

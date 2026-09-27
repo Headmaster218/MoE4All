@@ -18,12 +18,12 @@ $node = Get-ChildItem -LiteralPath (Join-Path $harnessRoot 'runtime') -Filter no
     Where-Object { $_.FullName -match 'node-v[^\\]+-win-x64\\node\.exe$' } |
     Select-Object -First 1 -ExpandProperty FullName
 
-if ($null -eq $node) { throw 'Isolated Node runtime is missing. Run Install-DevHarness.ps1 first.' }
+if ($null -eq $node) { throw 'Isolated Node runtime is missing. Run Build-DevHarness.ps1 first.' }
 if (-not (Test-Path -LiteralPath (Join-Path $dshRoot 'apps\cli\lib\bin.js'))) {
-    throw 'The DSH source checkout has not been built. Run Install-DevHarness.ps1 first.'
+    throw 'The DSH source checkout has not been built. Run Build-DevHarness.ps1 first.'
 }
 if (-not (Test-Path -LiteralPath (Join-Path $devHome 'profiles\web\node_modules'))) {
-    throw 'The isolated profile dependencies are missing. Run Install-DevHarness.ps1 first.'
+    throw 'The isolated profile dependencies are missing. Run Build-DevHarness.ps1 first.'
 }
 if (-not (Test-Path -LiteralPath $WorkspaceRoot -PathType Container)) {
     throw "Workspace directory not found: $WorkspaceRoot"

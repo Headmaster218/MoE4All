@@ -9,22 +9,27 @@ This directory keeps the maintained DSH source and bundled plugins separate from
 
 Each maintained repository starts with an exact upstream source checkpoint. Upstream commit history is intentionally not imported; `UPSTREAM.md` records the original repository, release or commit, license, and attribution before MoE4All changes begin.
 
-Initialize the isolated profile from the current production configuration:
+There are two user-facing entry points. Double-click the first one after cloning or after changing DSH or plugin source:
 
-```powershell
-.\harness\scripts\Initialize-DevHarness.ps1
+```text
+harness\1-Build-or-Initialize.cmd
 ```
 
-Install and build the source workspace, then install the local plugin packages:
+It initializes the isolated profile when needed, builds DSH, packs every local plugin, and installs the resulting packages into that profile. It does not start DSH.
 
-```powershell
-.\harness\scripts\Install-DevHarness.ps1
+Double-click the second one when you only want to start the already-built development harness:
+
+```text
+harness\2-Start.cmd
 ```
 
-Run the Web harness from the locally built source checkout:
+The equivalent PowerShell commands are:
 
 ```powershell
+.\harness\scripts\Build-DevHarness.ps1
 .\harness\scripts\Run-DevHarness.ps1
 ```
+
+The build command preserves the existing isolated configuration. Use `Build-DevHarness.ps1 -RefreshConfig` only when you intentionally want to copy the current production settings into it again.
 
 The initializer copies settings, credentials, the profile patch, and the workspace registry. It deliberately does not copy sessions, attachments, session projection caches, installed `node_modules`, or remote-device authorization state. Existing workspace records continue to point at their real directories; project files are not duplicated.
