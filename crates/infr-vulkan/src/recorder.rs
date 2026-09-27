@@ -296,15 +296,17 @@ fn expert_stride_bytes(dtype: infr_core::DType, stride: usize) -> u32 {
     bytes as u32
 }
 
-/// The base streamed GEMV has a scalar BF16 tail for projection widths such as Qwen3.8 Vision's
-/// 4304-element FFN. All block-quantized formats and all other native kernels stay on the strict
-/// 32-element grid.
+/// The base streamed GEMV has a scalar F16/BF16 tail for projection widths such as Qwen3.8
+/// Vision's 4304-element FFN. All block-quantized formats and all other native kernels stay on the
+/// strict 32-element grid.
 #[track_caller]
 fn assert_native_gemv_k(kernel: &str, dtype: infr_core::DType, in_f: usize) {
     assert!(
-        in_f != 0 && (in_f.is_multiple_of(32) || dtype == infr_core::DType::Bf16),
+        in_f != 0
+            && (in_f.is_multiple_of(32)
+                || matches!(dtype, infr_core::DType::F16 | infr_core::DType::Bf16)),
         "{kernel}: native-block K must be a nonzero multiple of 32 unless the base streamed GEMV \
-         is decoding BF16 (got dtype={dtype:?}, in_f={in_f})"
+         is decoding F16/BF16 (got dtype={dtype:?}, in_f={in_f})"
     );
 }
 
@@ -322,7 +324,7 @@ fn assert_native_gemv_k(kernel: &str, dtype: infr_core::DType, in_f: usize) {
 /// leaves `dst` untouched instead — not in consequence.)
 ///
 /// Quant block sizes are 32/64/256, so every block-quantized path must retain this strict guard.
-/// The base BF16 streamed GEMV is the one explicit exception: it has a scalar tail for dense
+/// The base F16/BF16 streamed GEMV is the one explicit exception: it has a scalar tail for dense
 /// projection widths such as Qwen3.8 Vision's 4304. A hard `assert!` and not a `debug_assert!`:
 /// the failure being guarded is a plausible-looking release-build result.
 #[track_caller]

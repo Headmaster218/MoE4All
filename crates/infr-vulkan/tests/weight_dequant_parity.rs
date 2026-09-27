@@ -138,6 +138,33 @@ fn bf16_native_gemv_preserves_ragged_k_tail() {
     diff.assert_bit_identical("ragged BF16");
 }
 
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn f16_native_gemv_preserves_ragged_k_tail() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+
+    // The F16 Qwen3.8 projector uses the same 134 complete blocks plus 16-element tail.
+    const IN_F: usize = 4304;
+    const OUT_F: usize = 7;
+    let mut bytes = Vec::with_capacity(IN_F * OUT_F * 2);
+    let mut host = Vec::with_capacity(IN_F * OUT_F);
+    for i in 0..IN_F * OUT_F {
+        let value = ((i * 17 % 193) as f32 - 96.0) / 32.0;
+        let rounded = half::f16::from_f32(value);
+        bytes.extend_from_slice(&rounded.to_bits().to_le_bytes());
+        host.push(rounded.to_f32());
+    }
+
+    let cols = [0, 31, 32, 4287, 4288, 4303];
+    let gpu = gpu_weight_columns(&be, DType::F16, &bytes, IN_F, OUT_F, &cols);
+    let mut diff = Diff::default();
+    diff.accumulate("ragged F16", &gpu, &host, IN_F, OUT_F, &cols);
+    diff.assert_bit_identical("ragged F16");
+}
+
 /// Running worst-case disagreement between the GPU's decoded weights and `dequant_block`'s, plus
 /// the count of elements that were not bit-identical.
 #[derive(Default)]
