@@ -335,6 +335,18 @@ fn assert_native_k(kernel: &str, in_f: usize) {
     );
 }
 
+fn splitk_reduce_extents(m: usize, n: usize) -> (usize, usize) {
+    let output_elems = m
+        .checked_mul(n)
+        .expect("split-K output element count overflow");
+    let plane_elems = m
+        .div_ceil(64)
+        .checked_mul(64)
+        .and_then(|rows| rows.checked_mul(n))
+        .expect("split-K partial plane element count overflow");
+    (output_elems, plane_elems)
+}
+
 /// A batched-MoE expert-GEMM kernel variant: `(kernel name, SPIR-V)`.
 type MmqKern = (&'static str, &'static [u32]);
 
@@ -2619,22 +2631,44 @@ impl<'a> Recorder<'a> {
             &push[..push_size as usize],
             groups,
         );
-        // reduce: out[i] = Σ_s partials[s·plane + i]
+        // Reduce only the logical m*n output. Partial planes keep their padded mpad*n stride.
         self.label_gemm("splitk_reduce", m, k, n);
         let rk = self
             .be
             .kernel("splitk_reduce", crate::gemm::splitk_reduce_spv(), 2, 12);
-        let n_elems = mpad * n;
+        let (output_elems, plane_elems) = splitk_reduce_extents(m, n);
+        debug_assert_eq!(plane_elems, mpad * n);
+        let partial_bytes = splits
+            .checked_mul(plane_elems)
+            .and_then(|elems| elems.checked_mul(size_of::<f32>()))
+            .expect("split-K partial buffer size overflow");
+        let output_bytes = output_elems
+            .checked_mul(size_of::<f32>())
+            .expect("split-K output buffer size overflow");
+        assert!(
+            partials.len_bytes() >= partial_bytes,
+            "split-K partial buffer is too small: need {partial_bytes} bytes, got {}",
+            partials.len_bytes()
+        );
+        assert!(
+            c.len_bytes() >= output_bytes,
+            "split-K output buffer is too small: need {output_bytes} bytes, got {}",
+            c.len_bytes()
+        );
+        let output_elems = u32::try_from(output_elems)
+            .expect("split-K output element count exceeds shader push-constant range");
+        let plane_elems = u32::try_from(plane_elems)
+            .expect("split-K partial plane exceeds shader push-constant range");
         let mut rp = [0u8; 12];
-        rp[0..4].copy_from_slice(&(n_elems as u32).to_ne_bytes());
+        rp[0..4].copy_from_slice(&output_elems.to_ne_bytes());
         rp[4..8].copy_from_slice(&(splits as u32).to_ne_bytes());
-        rp[8..12].copy_from_slice(&(n_elems as u32).to_ne_bytes());
+        rp[8..12].copy_from_slice(&plane_elems.to_ne_bytes());
         self.dispatch(
             rk,
             &[Self::vkb(partials), Self::vkb(c)],
             1,
             &rp,
-            (n_elems as u32).div_ceil(64),
+            output_elems.div_ceil(64),
         );
     }
 
@@ -13068,6 +13102,13 @@ mod tests {
     use infr_core::{backend::BufferUsage, Backend};
 
     #[test]
+    fn splitk_reduce_uses_logical_output_and_padded_partial_stride() {
+        assert_eq!(splitk_reduce_extents(169, 2560), (432_640, 491_520));
+        assert_eq!(splitk_reduce_extents(169, 640), (108_160, 122_880));
+        assert_eq!(splitk_reduce_extents(192, 2560), (491_520, 491_520));
+    }
+
+    #[test]
     fn deep_q8_flash_split_hint_preserves_other_policies() {
         assert_eq!(flash_split_count(None, 2048, 200_000, true), 8);
         assert_eq!(flash_split_count(None, 2048, 65_535, true), 1);
@@ -15813,7 +15854,7 @@ mod tests {
         let pk = be
             .alloc(splits * mpad * n * 4, BufferUsage::Activations)
             .unwrap();
-        let bc = be.alloc(mpad * n * 4, BufferUsage::Readback).unwrap();
+        let bc = be.alloc(m * n * 4, BufferUsage::Readback).unwrap();
         let rec = be.recorder().unwrap();
         rec.matmul_native_splitk(
             infr_core::DType::F16,
@@ -15829,7 +15870,7 @@ mod tests {
             false,
         );
         rec.finish().unwrap();
-        let mut bytes = vec![0u8; mpad * n * 4];
+        let mut bytes = vec![0u8; m * n * 4];
         be.download(bc.as_ref(), &mut bytes).unwrap();
         let got: &[f32] = bytemuck::cast_slice(&bytes);
         let mut e = 0f32;
