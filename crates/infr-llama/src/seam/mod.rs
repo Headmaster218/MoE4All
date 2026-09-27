@@ -3583,7 +3583,13 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // Prepare both source descriptions before binding. The final Full-vs-Bounded decision is
         // intentionally deferred until fixed Vulkan allocations have landed and Windows can
         // report the real remaining WDDM/system commit headroom.
-        const HOST_CHUNK_MAX: usize = 2 * 1024 * 1024 * 1024;
+        //
+        // The cap exists to avoid one enormous single host allocation — it is a heuristic, NOT a
+        // physical limit (each chunk is a host `Vec<u8>` addressed by 64-bit `usize` offsets, so
+        // a larger chunk is safe). It must exceed the WIDEST single expert layer the model
+        // carries, or `Full` mode hard-errors: Ling-3.0-flash (512 experts) has a 2.06 GiB layer,
+        // which the old 2 GiB cap rejected. 4 GiB covers every shipping architecture with margin.
+        const HOST_CHUNK_MAX: usize = 4 * 1024 * 1024 * 1024;
         let oversized_host_layer = host_layers
             .iter()
             .map(|&(start, end)| end - start)
