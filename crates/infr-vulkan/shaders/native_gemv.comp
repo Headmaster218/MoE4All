@@ -58,8 +58,8 @@ void main() {
     for (uint s = t; s < nsub; s += 64u) {
         acc += dqsub(wbase + s * 32u, xbase + s * 32u);
     }
-#ifdef FMT_BF16
-    // Dense BF16 projections can have a ragged K (Qwen3.8 Vision uses 4304 = 134*32 + 16).
+#if defined(FMT_F16) || defined(FMT_BF16)
+    // Dense F16/BF16 projections can have a ragged K (Qwen3.8 Vision uses 4304 = 134*32 + 16).
     // Quantized formats remain block-aligned and never compile this scalar tail.
     uint tail = nsub * 32u;
     for (uint i = tail + t; i < pc.in_f; i += 64u) {

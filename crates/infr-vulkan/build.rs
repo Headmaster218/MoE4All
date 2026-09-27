@@ -1162,6 +1162,8 @@ fn main() {
         ),
         // Native-block dequant GEMVs: one .spv per (quant format, residual) from one source.
         ("native_gemv", "native_q8_0", &["-DFMT_Q8_0"]),
+        ("native_gemv", "native_f16", &["-DFMT_F16"]),
+        ("native_gemv", "native_f16_res", &["-DFMT_F16", "-DUSE_RES"]),
         ("native_gemv", "native_bf16", &["-DFMT_BF16"]),
         (
             "native_gemv",

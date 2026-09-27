@@ -78,6 +78,8 @@ pub(crate) fn native_streamed_build_spv(
     match (dtype, res) {
         (Q8_0, false) => v!("native_q8_0"),
         (Q8_0, true) => v!("native_q8_0_res"),
+        (F16, false) => v!("native_f16"),
+        (F16, true) => v!("native_f16_res"),
         (Bf16, false) => v!("native_bf16"),
         (Bf16, true) => v!("native_bf16_res"),
         (Q4_0, false) => v!("native_q4_0"),
