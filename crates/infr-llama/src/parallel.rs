@@ -176,6 +176,15 @@ fn multimodal_token_position(plan: Option<&crate::seam::MropePlan>, token: usize
         .ok_or_else(|| anyhow!("multimodal decode position overflow"))
 }
 
+fn should_handoff_multimodal_to_scheduler(
+    scheduler_available: bool,
+    mtp_heads_present: bool,
+    frontier_is_image: bool,
+    max_new: usize,
+) -> bool {
+    scheduler_available && !mtp_heads_present && !frontier_is_image && max_new > 0
+}
+
 /// Pure continuation-slot selection (the "this conversation continuing" case of [`checkout`], and
 /// the twin of `seam::model::SlotPool::pick`'s first arm). Given `(slot_idx, prefix_score,
 /// cached_len)` for each candidate free slot and the `prompt_len`, pick the qualifying slot with
@@ -3794,13 +3803,15 @@ impl ParallelSeam {
         let frontier_is_image = plan.spans.iter().any(|span| {
             frontier >= span.start && frontier < span.start.saturating_add(span.n_tokens)
         });
-        // Consume image embedding rows on the legacy path, but leave the final text frontier and
-        // every sampled token to the unified scheduler so multimodal and text decodes can batch.
-        let legacy_max_new = if frontier_is_image || self.mtp_heads.is_some() {
-            max_new
-        } else {
-            0
-        };
+        // A one-slot non-MTP engine has no scheduler worker, so its visual turn must stay on the
+        // legacy runner. Multi-slot serving retains the handoff that batches visual and text decode.
+        let handoff = should_handoff_multimodal_to_scheduler(
+            self.gate.is_some(),
+            self.mtp_heads.is_some(),
+            frontier_is_image,
+            max_new,
+        );
+        let legacy_max_new = if handoff { 0 } else { max_new };
         let result = crate::seam::generate_dense_vulkan_session(
             &self.vk,
             self.model.gguf(),
@@ -3832,7 +3843,7 @@ impl ParallelSeam {
             }
         }
         let (legacy_ids, stats) = result?;
-        if legacy_max_new > 0 || max_new == 0 || crate::sampling::abort_requested(Some(req)) {
+        if !handoff || crate::sampling::abort_requested(Some(req)) {
             return Ok(stats);
         }
         debug_assert!(legacy_ids.is_empty());
@@ -3901,7 +3912,8 @@ mod tests {
     use super::{
         expand_multimodal_prompt, mtp_accepted_rows, mtp_prime_chunk_end, multimodal_key,
         multimodal_token_position, phase_for_remaining_prefill, pick_continuation, scheduler_mode,
-        token_lane_sort_key, BatchPhase, MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
+        should_handoff_multimodal_to_scheduler, token_lane_sort_key, BatchPhase,
+        MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
     };
     use std::sync::Arc;
 
@@ -3917,6 +3929,25 @@ mod tests {
             phase_for_remaining_prefill(SHORT_PREFILL_TOKENS + 1),
             BatchPhase::LongPrefill
         );
+    }
+
+    #[test]
+    fn multimodal_handoff_requires_a_scheduler_worker() {
+        assert!(!should_handoff_multimodal_to_scheduler(
+            false, false, false, 16
+        ));
+        assert!(should_handoff_multimodal_to_scheduler(
+            true, false, false, 16
+        ));
+        assert!(!should_handoff_multimodal_to_scheduler(
+            true, true, false, 16
+        ));
+        assert!(!should_handoff_multimodal_to_scheduler(
+            true, false, true, 16
+        ));
+        assert!(!should_handoff_multimodal_to_scheduler(
+            true, false, false, 0
+        ));
     }
 
     #[test]
