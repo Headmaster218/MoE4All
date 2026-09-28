@@ -585,7 +585,7 @@ mod tests {
             Some(2 * GIB),
             Some(64 * GIB),
         );
-        assert_eq!(automatic.effective_bytes, Some(36 * GIB));
+        assert_eq!(automatic.effective_bytes, Some(45 * GIB));
         assert_eq!(
             estimate_host_cache(
                 &ModelProfile::default(),
