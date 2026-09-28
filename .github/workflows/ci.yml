@@ -32,10 +32,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: stable
-          components: rustfmt
           cache: false
-      - run: rustup update --no-self-update stable
       - run: cargo fmt --all -- --check
 
   clippy:
@@ -47,10 +44,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y glslc
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: stable
-          components: clippy
           cache: false
-      - run: rustup update --no-self-update stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -63,9 +57,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y glslc
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: stable
           cache: false
-      - run: rustup update --no-self-update stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
@@ -104,9 +96,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y glslc
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: stable
           cache: false
-      - run: rustup update --no-self-update stable
       - uses: Swatinem/rust-cache@v2
       # Cache the downloaded GGUFs across runs. The key encodes the exact model
       # set + quant, so it only re-downloads when that list changes (bump the
@@ -135,9 +125,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y glslc
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: stable
           cache: false
-      - run: rustup update --no-self-update stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --workspace --locked
 
@@ -155,10 +143,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y glslc
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: stable
           target: aarch64-apple-darwin
           cache: false
-      - run: rustup update --no-self-update stable
       - run: rustup target add aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       - run: cargo check -p infr-metal --all-targets --locked --target aarch64-apple-darwin
@@ -182,9 +168,7 @@ jobs:
         run: brew install shaderc
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: stable
           cache: false
-      - run: rustup update --no-self-update stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --locked
       - run: cargo test -p infr-metal --locked -- --include-ignored --nocapture
