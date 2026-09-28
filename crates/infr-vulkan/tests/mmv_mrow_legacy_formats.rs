@@ -198,11 +198,15 @@ fn mmv_mrow_legacy_formats_match_host_reference() {
                 .map(|&b| b as i8 as i32)
                 .collect();
             let da_h: Vec<f32> = read(dact.as_ref(), m * nblk * 2)
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| f16v(c[0], c[1]))
                 .collect();
             let sa_h: Vec<f32> = read(sact.as_ref(), m * nblk * 2)
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| f16v(c[0], c[1]))
                 .collect();
             let got: Vec<f32> =

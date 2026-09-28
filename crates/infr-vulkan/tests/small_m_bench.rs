@@ -119,7 +119,7 @@ fn mrow_matches_single_row_gemv() {
     let mut wsrc: Vec<u8> = (0..wbytes)
         .map(|i| ((i as u32).wrapping_mul(2654435761) >> 24) as u8)
         .collect();
-    for blk in wsrc.chunks_exact_mut(144) {
+    for blk in wsrc.as_chunks_mut::<144>().0 {
         blk[0..2].copy_from_slice(&[0x00, 0x1C]); // d    = 2^-8
         blk[2..4].copy_from_slice(&[0x00, 0x1C]); // dmin = 2^-8
     }

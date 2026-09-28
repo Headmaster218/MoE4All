@@ -48,7 +48,12 @@ pub(crate) fn quantize_q8(x: &[f32]) -> Q8 {
                 .sum();
         }
     }
-    let bsums = bsums16.chunks_exact(2).map(|p| p[0] + p[1]).collect();
+    let bsums = bsums16
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|p| p[0] + p[1])
+        .collect();
     Q8 {
         qs,
         d,

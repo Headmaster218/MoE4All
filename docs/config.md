@@ -288,7 +288,7 @@ And host-side stage timing was five knobs, one per pipeline (`INFR_PROF`,
 all `stages`. Old spellings were dropped cleanly and are simply no longer read.
 
 **`[serve]`** — `api_key` (bearer token; an **empty** value means no auth — it
-gates `/v1/chat/completions`, `/v1/embeddings`, and `/v1/models`, never `/health`),
+gates `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`, and `/v1/models`, never `/health`),
 `max_tokens_cap`, `request_timeout_secs` (per-request wall-clock deadline in
 seconds; `0`, the default, means no deadline — a deadline truncates a legitimate
 slow reply, so it is opt-in), and `stats_interval_secs` (`INFR_SERVE_STATS_SECS`,
@@ -319,6 +319,36 @@ object. `timings.context_n` is the full prompt plus completion depth,
 tokens from `prompt_n` tokens actually evaluated. Streaming metrics are emitted
 unconditionally so clients that do not send `stream_options.include_usage` do
 not silently record zero tokens.
+
+`POST /v1/responses` provides a stateless Responses API over the same model
+dispatch and request limits. It accepts text messages, replayed function calls
+and outputs, custom function tools, and typed SSE with `stream=true`.
+With a vision-capable model and its projector loaded, `input_image` accepts a
+base64 `data:` URL; remote HTTP(S) URLs and file IDs are not fetched. Clients
+must replay prior items in `input` for another turn. Server-side conversation
+state (`previous_response_id`, `conversation`, `store=true`), file inputs,
+hosted tools, structured output modes, and automatic truncation return 400.
+`instructions` and leading `system`/`developer` input messages are combined into
+one initial system message for GGUF template portability; an instruction role
+after a conversation turn returns 400 rather than being silently moved.
+`user` (up to 64 characters), empty `include: []`,
+`include: ["reasoning.encrypted_content"]`, and `service_tier: "auto"` or
+`"default"` are accepted; the local tier is always reported as `"default"`.
+The reasoning include selector is a compatibility hint only: the local backend
+has no encrypted reasoning state to return. Other `include` values, other tiers,
+and other non-null unknown request fields return 400. Only plain text with
+default `text.verbosity: "medium"` is supported; `low` and `high` return 400.
+`reasoning.effort: "minimal"` is approximated by the local `low` level and the
+response reports `low`; a model template that lacks effort controls still
+rejects it. `max_output_tokens` in the response echoes the requested limit,
+while the generation path applies the configured safety cap. The backend has
+no separate hidden-reasoning meter, so `usage.output_tokens_details.reasoning_tokens`
+is 0; visible thinking is counted in `output_tokens`.
+Streaming responses use `Cache-Control: no-store` and `X-Accel-Buffering: no`,
+and report a typed `response.failed` if generation fails after response creation.
+These HTTP cache headers do not disable the model's KV-prefix prompt cache.
+Non-streaming translation retains a 16 MiB chat-response safety limit and
+returns a clear 502 if the body cannot be translated within it.
 
 **`[hub]`** — model acquisition (`infr pull`, and the auto-pull `infr run` /
 `infr serve` do when a model is missing). `endpoint` (`INFR_HF_ENDPOINT`) selects the

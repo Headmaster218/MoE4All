@@ -2317,7 +2317,9 @@ impl MetalBackend {
             (
                 "linear_quik4",
                 f.codes
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|p| p[0] | (p[1] << 4))
                     .collect(),
             )
@@ -2326,7 +2328,9 @@ impl MetalBackend {
             (
                 "linear_quik6",
                 f.codes
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .flat_map(|c| {
                         [
                             c[0] | (c[1] << 6),
