@@ -3636,7 +3636,9 @@ fn attention_sinks_are_denominator_only() {
             .collect()
     };
     let deq = |b: &[u8]| -> Vec<f32> {
-        b.chunks_exact(2)
+        b.as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
             .collect()
     };

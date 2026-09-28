@@ -2367,6 +2367,8 @@ impl DiffusionGemmaMetalSession {
             None,
             None,
             None,
+            None,
+            None,
         )?;
         Ok(())
     }
@@ -2409,6 +2411,7 @@ impl DiffusionGemmaMetalSession {
                 sample_temp_inv: 0.0,
                 reduced: &mut reduced,
             }),
+            None,
             None,
             None,
             None,

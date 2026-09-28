@@ -585,8 +585,10 @@ fn dequant_q5_1_into(bytes: &[u8], out: &mut [f32]) -> Result<()> {
         );
     }
     for (block, values) in bytes
-        .chunks_exact(BLOCK_BYTES)
-        .zip(out.chunks_exact_mut(BLOCK_ELEMS))
+        .as_chunks::<BLOCK_BYTES>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<BLOCK_ELEMS>().0.iter_mut())
     {
         let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
         let m = half::f16::from_le_bytes([block[2], block[3]]).to_f32();
@@ -738,7 +740,7 @@ mod tests {
             *byte = i.wrapping_mul(37).wrapping_add(11) as u8;
         }
         // Keep both f16 scale fields finite for every block.
-        for block in bytes.chunks_exact_mut(24) {
+        for block in bytes.as_chunks_mut::<24>().0 {
             block[0..2].copy_from_slice(&half::f16::from_f32(0.125).to_le_bytes());
             block[2..4].copy_from_slice(&half::f16::from_f32(-0.75).to_le_bytes());
         }
@@ -787,8 +789,8 @@ mod tests {
         const ROW_DIM: usize = 160;
         const ROW_BYTES: usize = 120;
         let mut table = vec![0u8; 4 * ROW_BYTES];
-        for (row, row_bytes) in table.chunks_exact_mut(ROW_BYTES).enumerate() {
-            for (block_index, block) in row_bytes.chunks_exact_mut(24).enumerate() {
+        for (row, row_bytes) in table.as_chunks_mut::<ROW_BYTES>().0.iter_mut().enumerate() {
+            for (block_index, block) in row_bytes.as_chunks_mut::<24>().0.iter_mut().enumerate() {
                 block[0..2].copy_from_slice(&half::f16::from_f32(0.125 + row as f32).to_le_bytes());
                 block[2..4].copy_from_slice(&half::f16::from_f32(block_index as f32).to_le_bytes());
                 for (i, byte) in block[4..].iter_mut().enumerate() {

@@ -7,6 +7,7 @@
 //!   GET  /health                -> 200 OK                                              (open)
 //!   GET  /v1/models             -> { object: "list", data: [{ id, object, owned_by }] } (auth)
 //!   POST /v1/chat/completions   -> chat.completion | SSE chat.completion.chunk stream   (auth)
+//!   POST /v1/responses          -> stateless Responses JSON | typed SSE stream         (auth)
 //!   POST /v1/embeddings         -> OpenAI-compatible normalized float embeddings         (auth)
 //!
 //! Two process-level limits bound one request's hold on a `--parallel` slot: `serve.max_tokens_cap`
@@ -51,6 +52,8 @@ use tokio::sync::Semaphore;
 const SSE_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 #[cfg(test)]
 const SSE_KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(25);
+
+mod responses;
 
 // ---------------------------------------------------------------------------
 // Coordinated terminal output
@@ -2140,6 +2143,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health_handler))
         .route("/v1/models", get(models_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))
+        .route("/v1/responses", post(responses::handler))
         .route("/v1/embeddings", post(embeddings_handler))
         .with_state(state)
 }
@@ -2414,6 +2418,10 @@ async fn chat_completions_handler(
         Ok(j) => j,
         Err(e) => return param_error(None, e.body_text()),
     };
+    dispatch_chat(state, req, "/v1/chat/completions").await
+}
+
+async fn dispatch_chat(state: AppState, req: ChatRequest, route: &'static str) -> Response {
     let mut params = match GenParams::from_request(&req) {
         Ok(p) => p,
         Err(e) => return param_error(Some(e.param), e.message),
@@ -2463,7 +2471,7 @@ async fn chat_completions_handler(
     };
     log_request_start(
         ctx.id,
-        "/v1/chat/completions",
+        route,
         &ctx.model_id,
         messages.len(),
         messages.iter().map(|m| m.content.len()).sum(),

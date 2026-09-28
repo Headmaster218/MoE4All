@@ -13,8 +13,10 @@ use super::{as_vk_buf, VulkanBackend};
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn spv_words(bytes: &[u8]) -> Vec<u32> {
     bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect()
 }
 

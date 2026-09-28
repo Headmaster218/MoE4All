@@ -2173,8 +2173,10 @@ impl Backend for CpuBackend {
                         }
                         encode(&mut bytes);
                         vals[cache.0 as usize] = bytes
-                            .chunks_exact(4)
-                            .map(|b| f32::from_bits(u32::from_le_bytes(b.try_into().unwrap())))
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|b| f32::from_bits(u32::from_le_bytes(*b)))
                             .collect();
                     }
                 }
@@ -5051,7 +5053,7 @@ mod tests {
         let got = bytemuck::cast_slice::<u8, f32>(&bytes);
         let p0 = std::f32::consts::E / (std::f32::consts::E + 1.0);
         let expected = [10.0 * p0, 20.0 * (1.0 - p0)];
-        for row in got.chunks_exact(2) {
+        for row in got.as_chunks::<2>().0 {
             assert!((row[0] - expected[0]).abs() < 1e-5, "{row:?}");
             assert!((row[1] - expected[1]).abs() < 1e-5, "{row:?}");
         }
