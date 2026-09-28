@@ -21,15 +21,16 @@ per-segment results.
 [Measured results](#measured-results) |
 [Community results](#community-results) |
 [简体中文](README.md) |
-[Technical documentation](docs/README.md)
+[Technical documentation](documentation/README.md)
 
 ## Quick start
 
 ### 1. Download the program
 
 Open [MoE4All Releases](https://github.com/Headmaster218/MoE4All/releases) and
-download the matching `MoE4All-Windows-x86_64-v*.zip`. The features and
-measurements on this page correspond to the upcoming **0.8.0** release.
+download the matching `MoE4All-Windows-x86_64-v*.zip`. The speed table on this
+page is historical **0.8.0** evidence; current source and architecture facts in
+the documentation are pinned to the **0.9.0** tag.
 
 ### 2. Extract it
 
@@ -37,8 +38,8 @@ Fully extract the ZIP into a directory such as `D:\MoE4All`.
 
 ### 3. Download a GGUF model
 
-The current release is optimized and measured with the following two
-quantizations. Store the model files on a local SSD.
+The historical 0.8.0 measurements above used the following two
+quantizations. Store the model files on a local SSD when reproducing them.
 
 | Model / component | Download | File and purpose |
 | --- | --- | --- |
@@ -65,7 +66,7 @@ for their respective modes in the wizard.
 
 Automatic profiles use Q8 K/V by default and plan VRAM, system RAM, expert
 cache, and Ubatch. The 35B model is ready for chat with its main GGUF alone.
-Flash-Next offers two optional paths:
+For the **historical 0.8.0 measurements above**, Flash-Next used these paths:
 
 - **MTP text acceleration:** enable “Qwen3.8 MTP single-stream acceleration,”
   select the MTP head above, and use verification width `4`. This path uses
@@ -73,8 +74,8 @@ Flash-Next offers two optional paths:
 - **Image understanding:** choose API mode, leave MTP disabled, enable vision,
   and select the F16 vision projector above.
 
-The default API base URL is `http://127.0.0.1:8080/v1`. See the
-[configuration reference](docs/config.md) for all available settings.
+Version 0.9.0 also supports Vision and MTP together; see the [capability matrix](documentation/reference/model-capabilities.md). The default API base URL is `http://127.0.0.1:8080/v1`. See the [API guide](documentation/guide/serving/api-quickstart.md) and the
+[configuration reference](documentation/reference/configuration.md) for all available settings.
 
 ## Measured results
 
@@ -136,7 +137,7 @@ tokens; the 150K inputs contain **149,849 / 149,857** tokens.
 | No-MTP simple prompt | -14.2% | -14.1% |
 | No-MTP complex prompt | -14.0% | -12.0% |
 
-[20K test setup, results, and analysis](docs/perf/qwen38-mtp-20k-comparison-20260924.md).
+[20K test setup, results, and analysis](documentation/evidence/benchmarks/2026-09-24-qwen38-mtp-20k.md).
 
 </details>
 
@@ -238,10 +239,8 @@ tier, and SSD supplies the rest. Fixed model weights, KV Cache, runtime scratch,
 and the expert cache share a coordinated VRAM budget. Elastic space can be
 reassigned when execution switches between prefill and decode.
 
-Implementation details are available in the
-[technical documentation index](https://github.com/Headmaster218/MoE4All/blob/main/docs/README.md)
-and the
-[MoE4All Wiki](https://github.com/Headmaster218/MoE4All/blob/main/infr-fork-wiki/README.md).
+Implementation details are in the [documentation index](documentation/README.md);
+historical optimization decisions are in the [change records](documentation/evidence/changes/README.md).
 
 ## Project and attribution
 
