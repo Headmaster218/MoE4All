@@ -2086,6 +2086,14 @@ pub struct DeviceInfo {
     pub integrated: bool,
     /// Sum of DEVICE_LOCAL heap sizes (a UMA part reports its GTT-backed heap here).
     pub vram_bytes: u64,
+    /// Capacity paired with `vram_available_bytes`: device-local heaps on a discrete GPU and all
+    /// physical-memory heaps on a unified-memory device.
+    pub vram_total_bytes: u64,
+    /// Live bytes currently available to a new process when `vram_live` is true. Without
+    /// `VK_EXT_memory_budget` this falls back to `vram_bytes` and must not be used as an idle test.
+    pub vram_available_bytes: u64,
+    /// Whether `vram_available_bytes` accounts for allocations owned by other processes.
+    pub vram_live: bool,
     /// True for the device `VulkanBackend::new()` would bind today (`INFR_DEV`, else the largest
     /// discrete GPU by device-local memory, else device 0).
     pub is_default_pick: bool,
@@ -2439,18 +2447,20 @@ impl UnifiedPhaseRegistry {
 /// what lets bytes actually LAND there once the device-local heap is full. Above the summed budget
 /// the failure mode is the same on both classes (the driver oversubscribes and starts evicting),
 /// which is why the guard exists at all — it just now guards the right number on each.
-fn vram_info(s: &VulkanShared) -> VramInfo {
+fn physical_vram_info(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    uma: bool,
+    has_mem_budget: bool,
+    tracked_used: u64,
+) -> VramInfo {
     let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
     let mut props2 = vk::PhysicalDeviceMemoryProperties2::default();
-    if s.has_mem_budget {
+    if has_mem_budget {
         props2 = props2.push_next(&mut budget);
     }
-    unsafe {
-        s.instance
-            .get_physical_device_memory_properties2(s.physical_device, &mut props2)
-    };
+    unsafe { instance.get_physical_device_memory_properties2(physical_device, &mut props2) };
     let mp = props2.memory_properties;
-    let uma = s.caps.unified_memory;
 
     // Discrete: device-local heaps only. UMA: every heap (they are one pool of DDR). The live
     // VK_EXT_memory_budget figure is used on BOTH — it is what accounts for other processes, and
@@ -2464,7 +2474,7 @@ fn vram_info(s: &VulkanShared) -> VramInfo {
             .contains(vk::MemoryHeapFlags::DEVICE_LOCAL);
         if uma || device_local {
             total += mp.memory_heaps[i].size;
-            available += if s.has_mem_budget {
+            available += if has_mem_budget {
                 // Live free = budget - usage (the budget is a CEILING, not free bytes). Clamped to
                 // the heap size so a driver that reports usage past the heap (RADV on an APU, once
                 // something has oversubscribed the synthetic split) can't hand back a bogus figure.
@@ -2476,10 +2486,9 @@ fn vram_info(s: &VulkanShared) -> VramInfo {
             };
         }
     }
-    let mut live = s.has_mem_budget;
+    let mut live = has_mem_budget;
     if let Some(profile) = infr_core::test_resource::active() {
-        (total, available) =
-            profile.cap_vram(total, available, s.device_used.load(Ordering::Relaxed));
+        (total, available) = profile.cap_vram(total, available, tracked_used);
         // The synthetic free figure already subtracts this backend's tracked allocations. Mark it
         // live so fallback accounting does not subtract them a second time.
         live = true;
@@ -2490,6 +2499,16 @@ fn vram_info(s: &VulkanShared) -> VramInfo {
         live,
         uma,
     }
+}
+
+fn vram_info(s: &VulkanShared) -> VramInfo {
+    physical_vram_info(
+        &s.instance,
+        s.physical_device,
+        s.caps.unified_memory,
+        s.has_mem_budget,
+        s.device_used.load(Ordering::Relaxed),
+    )
 }
 
 /// RAII scope for a weight-load progress bar (see [`VulkanBackend::weight_progress`]). While alive,
@@ -2712,6 +2731,9 @@ impl VulkanBackend {
                     exts.iter()
                         .any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) == name })
                 };
+                let integrated = p.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
+                let vram =
+                    physical_vram_info(&instance, pd, integrated, has(c"VK_EXT_memory_budget"), 0);
                 let flash_attention_hd256 = probe_flash_attention_hd256(
                     &entry,
                     &instance,
@@ -2724,8 +2746,11 @@ impl VulkanBackend {
                     index,
                     name,
                     device_type: device_type_str(p.device_type),
-                    integrated: p.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU,
+                    integrated,
                     vram_bytes,
+                    vram_total_bytes: vram.total,
+                    vram_available_bytes: vram.available,
+                    vram_live: vram.live,
                     is_default_pick: default_pick == Some(pd),
                     external_memory: has(c"VK_KHR_external_memory"),
                     external_memory_fd: has(c"VK_KHR_external_memory_fd"),

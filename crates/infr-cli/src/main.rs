@@ -350,6 +350,12 @@ enum Cmd {
     /// device the default (no `--dev`) path binds. The index is the `--dev VulkanN` / `INFR_DEV`
     /// handle. Reports each device's external-memory extensions (GPU↔GPU / dma-buf feasibility).
     Devices,
+    /// Print current host RAM and selected-device VRAM availability as JSON without loading a
+    /// model. Launchers can use this to decide whether starting an engine is safe.
+    Resources {
+        #[command(flatten)]
+        device: DeviceOpts,
+    },
     /// Render a chat history with the model tokenizer and fill it to a precise token depth.
     #[command(name = "__test-plan-prompt", hide = true)]
     TestPlanPrompt {
@@ -787,6 +793,9 @@ fn cli_flag_layer(cmd: &Cmd) -> anyhow::Result<PartialConfig> {
         Cmd::ServeEmbedding { device, .. } => {
             device.overrides(&mut layer)?;
         }
+        Cmd::Resources { device } => {
+            device.overrides(&mut layer)?;
+        }
         Cmd::Bench { device, .. } => {
             device.overrides(&mut layer)?;
             // Benchmarks decode a FIXED, deterministic token count (llama-bench semantics): greedy
@@ -809,6 +818,7 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
     match cmd {
         Cmd::Pull { model } => cmd_pull(&model, cfg),
         Cmd::Devices => cmd_devices(cfg),
+        Cmd::Resources { .. } => cmd_resources(cfg),
         Cmd::TestPlanPrompt {
             model,
             messages,
@@ -1268,6 +1278,27 @@ fn cmd_test_plan_prompt(
             "target_tokens": target,
             "filler_repeats": best.0,
             "output": output,
+        })
+    );
+    Ok(())
+}
+
+fn cmd_resources(cfg: &Config) -> anyhow::Result<()> {
+    let devices = infr_vulkan::VulkanBackend::enumerate_devices(cfg).map_err(|e| anyhow!("{e}"))?;
+    let selected = devices
+        .iter()
+        .find(|device| device.is_default_pick)
+        .ok_or_else(|| anyhow!("no Vulkan physical devices found"))?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "ram_total_bytes": infr_core::hostmem::total_bytes(),
+            "ram_available_bytes": infr_core::hostmem::available_bytes(),
+            "vram_total_bytes": selected.vram_total_bytes,
+            "vram_available_bytes": selected.vram_available_bytes,
+            "vram_live": selected.vram_live,
+            "device": format!("Vulkan{}", selected.index),
+            "device_name": selected.name,
         })
     );
     Ok(())
@@ -5465,6 +5496,15 @@ mod tests {
         assert_eq!(synthetic_depth, Some(100000));
         assert_eq!(n_prompt, 0);
         assert_eq!(n_gen, 128);
+    }
+
+    #[test]
+    fn resources_parses_selected_device() {
+        let cli = Cli::try_parse_from(["infr", "resources", "--dev", "Vulkan1"]).unwrap();
+        let Some(Cmd::Resources { device }) = cli.cmd else {
+            panic!("expected resources command");
+        };
+        assert_eq!(device.dev.as_deref(), Some("Vulkan1"));
     }
 
     #[test]
