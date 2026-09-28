@@ -73,7 +73,38 @@ foreach ($file in $rootFiles) {
     }
     Copy-Item -LiteralPath $sourcePath -Destination (Join-Path $stagingPath $file)
 }
-Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts\infr-wizard.ps1') -Destination (Join-Path $stagingPath 'scripts\infr-wizard.ps1')
+$packagedScripts = @(
+    'infr-wizard.ps1'
+    'moe4all-update-common.ps1'
+    'apply-engine-update.ps1'
+)
+foreach ($script in $packagedScripts) {
+    $sourcePath = Join-Path $repoRoot "scripts\$script"
+    if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+        throw "Required release script is missing: $sourcePath"
+    }
+    Copy-Item -LiteralPath $sourcePath -Destination (Join-Path $stagingPath "scripts\$script")
+}
+
+$manifestFiles = foreach ($file in (Get-ChildItem -LiteralPath $stagingPath -File -Recurse | Sort-Object FullName)) {
+    $relative = $file.FullName.Substring($stagingPath.Length + 1).Replace('\', '/')
+    [ordered]@{
+        path = $relative
+        size = [long]$file.Length
+        sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+}
+$installManifest = [ordered]@{
+    schema_version = 1
+    updater_protocol = 1
+    product = 'moe4all-engine'
+    version = $Version
+    tag = "release-$Version"
+    generated_at = [DateTimeOffset]::UtcNow.ToString('o')
+    files = @($manifestFiles)
+}
+$manifestJson = $installManifest | ConvertTo-Json -Depth 5
+[System.IO.File]::WriteAllText((Join-Path $stagingPath 'install-manifest.json'), "$manifestJson`n", [System.Text.UTF8Encoding]::new($false))
 
 $archivePath = Join-Path $outputFullPath "$packageName.zip"
 $checksumPath = "$archivePath.sha256"
