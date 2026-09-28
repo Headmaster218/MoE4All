@@ -964,8 +964,10 @@ fn synthetic_deepseek2_round_trips_through_the_real_loader() {
         .tensor_bytes_arc("blk.2.exp_probs_b.bias")
         .expect("bias bytes");
     let got: Vec<f32> = raw
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect();
     assert_eq!(got, FORCE_BIAS.to_vec());
 
@@ -2490,8 +2492,10 @@ fn synthetic_deepseek4_routing_table_is_i32_on_disk() {
         .expect("routing table bytes")
         .to_vec();
     let ids: Vec<i32> = raw
-        .chunks_exact(4)
-        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| i32::from_le_bytes(*c))
         .collect();
     assert_eq!(ids.len(), d.n_used * d.vocab);
     assert!(

@@ -2223,7 +2223,7 @@ mod tests {
         cache
             .materialize_stream(1, 4, 16, &mut bank)
             .expect("materialize Prefill bank");
-        for (block, bytes) in bank.chunks_exact(16).enumerate() {
+        for (block, bytes) in bank.as_chunks::<16>().0.iter().enumerate() {
             assert_eq!(bytes, &[(block + 1) as u8; 16]);
         }
         assert_eq!(

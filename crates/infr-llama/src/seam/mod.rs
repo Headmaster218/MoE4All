@@ -5368,6 +5368,7 @@ pub(crate) fn generate_dense_metal_session(
         None,
         req,
         None,
+        None,
     )
 }
 
@@ -5406,6 +5407,7 @@ pub(crate) fn verify_dense_metal2(
         want_ctx,
         None,
         Some(&mut logits),
+        None,
         None,
         None,
         None,

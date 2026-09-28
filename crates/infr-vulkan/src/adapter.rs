@@ -12742,7 +12742,9 @@ mod tests {
         let mut y16 = vec![0u8; nh * hd * 2];
         be_.download(yb.as_ref(), &mut y16).unwrap();
         let got: Vec<f32> = y16
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
             .collect();
         for i in 0..nh * hd {
@@ -12773,7 +12775,9 @@ mod tests {
                 .collect()
         };
         let deq = |b: &[u8]| -> Vec<f32> {
-            b.chunks_exact(2)
+            b.as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
                 .collect()
         };
@@ -12861,7 +12865,9 @@ mod tests {
         let mut got16 = vec![0u8; n * 2];
         be_.download(yb.as_ref(), &mut got16).unwrap();
         let got: Vec<f32> = got16
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
             .collect();
         for i in 0..n {
@@ -12890,7 +12896,9 @@ mod tests {
                 .collect()
         };
         let deq = |b: &[u8]| -> Vec<f32> {
-            b.chunks_exact(2)
+            b.as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
                 .collect()
         };
@@ -13125,7 +13133,9 @@ mod tests {
                 .collect()
         };
         let deq = |b: &[u8]| -> Vec<f32> {
-            b.chunks_exact(2)
+            b.as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
                 .collect()
         };
@@ -13357,7 +13367,9 @@ mod tests {
                 .collect()
         };
         let deq = |b: &[u8]| -> Vec<f32> {
-            b.chunks_exact(2)
+            b.as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
                 .collect()
         };
@@ -13491,7 +13503,9 @@ mod tests {
         };
         let deq = |bytes: &[u8]| -> Vec<f32> {
             bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
                 .collect()
         };
@@ -13642,7 +13656,9 @@ mod tests {
         };
         let deq = |bytes: &[u8]| -> Vec<f32> {
             bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
                 .collect()
         };
@@ -13816,7 +13832,9 @@ mod tests {
         };
         let deq = |bytes: &[u8]| -> Vec<f32> {
             bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
                 .collect()
         };

@@ -4181,11 +4181,15 @@ fn read_llama_debug_dump(bin: &std::path::Path) -> (Vec<u32>, Vec<f32>) {
     assert_eq!(raw.len() % 4, 0, "logits dump is not a whole f32 array");
     assert_eq!(raw_tok.len() % 4, 0, "token dump is not a whole i32 array");
     let logits = raw
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     let tokens = raw_tok
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     (tokens, logits)

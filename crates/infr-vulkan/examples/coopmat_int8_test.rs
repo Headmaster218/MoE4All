@@ -334,7 +334,9 @@ fn compile_glsl(src: &str, tag: &str) -> Result<Vec<u32>, String> {
     }
     let bytes = std::fs::read(&spv_path).map_err(|e| format!("read spv: {e}"))?;
     let words: Vec<u32> = bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     Ok(words)
@@ -812,7 +814,9 @@ fn main() {
             unsafe { dispatch_one(&ctx, &spv, None, &a_bytes, &b_bytes, 64 * 4, (1, 1, 1)) };
         let correct = data.map(|bytes| {
             let c: Vec<f32> = bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             c.iter()
@@ -865,7 +869,9 @@ fn main() {
         let cpu_c = cpu_matmul16(&a_get, &b_get);
         let correct = data.map(|bytes| {
             let c: Vec<f32> = bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             c.iter()
@@ -931,7 +937,9 @@ fn main() {
         };
         let correct = data.map(|bytes| {
             let c: Vec<i32> = bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| i32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             c == cpu_c
@@ -995,7 +1003,9 @@ fn main() {
         };
         let correct = data.map(|bytes| {
             let c: Vec<i32> = bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| i32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             c == cpu_c
@@ -1043,7 +1053,9 @@ fn main() {
             Outcome::Completed(_) => {
                 let bytes = data.unwrap();
                 let vals: Vec<i32> = bytes
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|c| i32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
                     .collect();
                 let len = vals[0];
@@ -1111,7 +1123,9 @@ fn main() {
     let cpu_c = cpu_matmul16(&a_get, &b_get);
     let correct = data.map(|bytes| {
         let c: Vec<i32> = bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| i32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         c == cpu_c

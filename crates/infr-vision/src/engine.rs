@@ -712,7 +712,7 @@ impl NativeVisionEngine {
         let n_tokens = image.grid_nx * image.grid_ny;
         let patch_grid_x = image.grid_nx * self.cfg.spatial_merge_size;
         let mut pos_hw = vec![0i32; n * 2];
-        for (index, position) in pos_hw.chunks_exact_mut(2).enumerate() {
+        for (index, position) in pos_hw.as_chunks_mut::<2>().0.iter_mut().enumerate() {
             let (y, x) = merge_major_pos(index, patch_grid_x, self.cfg.spatial_merge_size);
             position[0] = y as i32;
             position[1] = x as i32;

@@ -14483,7 +14483,9 @@ mod tests {
         let mut bytes = vec![0u8; y_len * 2];
         be.download(by.as_ref(), &mut bytes).unwrap();
         let got: Vec<f32> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
             .collect();
         let want = qk_norm_rope_cpu(

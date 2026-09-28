@@ -171,7 +171,7 @@ fn iq4nl_block(x: &[f32], dst: &mut [u8]) {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn quantize_row(dt: DType, src: &[f32], dst: &mut [u8]) {
     let bb = infr_gguf::nbytes(dt, QK);
-    for (b, chunk) in src.chunks_exact(QK).enumerate() {
+    for (b, chunk) in src.as_chunks::<QK>().0.iter().enumerate() {
         let blk = &mut dst[b * bb..(b + 1) * bb];
         match dt {
             DType::Q4_0 => q4_0_block(chunk, blk),
