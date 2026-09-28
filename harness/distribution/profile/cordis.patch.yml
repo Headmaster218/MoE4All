@@ -4,7 +4,7 @@
   config:
     searchProvider: brave-search
 
-- id: dsh-mneme
+- id: dsh-mneme-moe4all
   config:
     autoSummarize: true
     distillEngine: v2
@@ -25,4 +25,4 @@
     provider: moe4all-title
     model: Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00033
 
-# remote-web-ui.publicBaseUrl is intentionally absent. It is installation-specific product config.
+# dsh-remote-web-ui-moe4all.publicBaseUrl is intentionally absent. It is installation-specific.

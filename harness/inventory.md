@@ -1,7 +1,22 @@
 # DSH source inventory
 
-This inventory describes the local DSH installation used as the MoE4All agent baseline on
-2026-09-23. Exact fetch metadata lives in `sources.lock.json`.
+This inventory records the local DSH installation that was used to establish the MoE4All Agent
+baseline on 2026-09-23. It is provenance for the migration, not the active dependency lock. The
+current tested sources are the Git submodules pinned by the root repository; each maintained
+repository records its original source, version, commit, license, and attribution in `UPSTREAM.md`.
+
+## Maintained source layout
+
+| Component | Maintained repository | Status |
+|---|---|---|
+| DeepSeek Harness | `harness/dsh` | Imported as the `dsh-moe4all` source checkpoint. |
+| MoE4All engine provider | `harness/plugins/dsh-llm-moe4all` | Active Agent integration and guided engine setup. |
+| Profile plugins | `harness/plugins/*-moe4all` | Independent repositories pinned as submodules. |
+| DSH Desktop shell | Not yet created | The old fixed-port patch remains migration evidence only. |
+| Web file uploader | Not yet created | The hardened candidate remains on the archived v1 branch. |
+
+The tables below preserve the source versions observed before the maintained repositories were
+created.
 
 ## Runtime and desktop
 

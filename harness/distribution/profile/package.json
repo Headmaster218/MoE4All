@@ -2,26 +2,28 @@
   "name": "moe4all-agent-profile-web",
   "private": true,
   "dependencies": {
-    "@deads-inc/dsh-web-search-brave": "1.0.0",
-    "@dsh-external/dsh-plugin-tts": "github:1624318455/dsh-plugin-tts#ff26f361df77605599896fa2ba76eb875eddc1d2",
-    "@linxin666/dsh-remote-web-ui": "0.3.17",
-    "@modusensus/dsh-mneme": "0.7.29",
-    "dsh-easyrewrite": "2.4.1",
-    "dsh-plugin-cron-scheduler": "0.2.7",
-    "dshmarket": "1.45.1"
+    "dsh-easyrewrite-moe4all": "2.4.1-moe4all.1",
+    "dsh-llm-moe4all": "0.1.0-alpha.7",
+    "dsh-market-moe4all": "1.45.1-moe4all.1",
+    "dsh-mneme-moe4all": "0.7.29-moe4all.1",
+    "dsh-plugin-cron-moe4all": "0.2.7-moe4all.1",
+    "dsh-plugin-tts-moe4all": "0.3.1-moe4all.1",
+    "dsh-remote-web-ui-moe4all": "0.3.17-moe4all.1",
+    "dsh-web-search-brave-moe4all": "1.0.0-moe4all.1"
   },
   "dsh": {
     "profile": {
       "bundles": [
         "@deepseek-ai/dsh-base",
         "@deepseek-ai/dsh-web-app",
-        "dshmarket",
-        "@deads-inc/dsh-web-search-brave",
-        "@modusensus/dsh-mneme",
-        "dsh-easyrewrite",
-        "@linxin666/dsh-remote-web-ui",
-        "dsh-plugin-cron-scheduler",
-        "@dsh-external/dsh-plugin-tts"
+        "dsh-llm-moe4all",
+        "dsh-market-moe4all",
+        "dsh-web-search-brave-moe4all",
+        "dsh-mneme-moe4all",
+        "dsh-easyrewrite-moe4all",
+        "dsh-remote-web-ui-moe4all",
+        "dsh-plugin-cron-moe4all",
+        "dsh-plugin-tts-moe4all"
       ]
     }
   },
