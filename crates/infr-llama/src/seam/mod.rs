@@ -916,6 +916,7 @@ pub(crate) fn generate_dense_vulkan_parallel_prefill_session(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 pub(crate) fn generate_dense_vulkan_parallel_mtp_verify_session(
     vk: &infr_vulkan::VulkanBackend,
     g: &Gguf,

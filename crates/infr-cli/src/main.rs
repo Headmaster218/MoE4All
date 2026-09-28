@@ -1290,6 +1290,7 @@ fn cmd_resources(cfg: &Config) -> anyhow::Result<()> {
         .iter()
         .find(|device| device.is_default_pick)
         .ok_or_else(|| anyhow!("no Vulkan physical devices found"))?;
+    // print-ok: machine-readable output of the hidden resource-probing command.
     println!(
         "{}",
         serde_json::json!({

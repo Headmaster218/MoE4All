@@ -1271,27 +1271,29 @@ impl VulkanShared {
             }
         }
 
-        while shed_host_dma {
-            self.drain_queue_for_submit_retry()?;
-            let released = self.shed_host_dma_imports(HOST_DMA_SHED_STEP_BYTES);
-            if released == 0 {
-                break;
-            }
-            tracing::warn!(
-                "[infr] {context} still cannot submit; released {:.2} GiB of idle Host DMA mappings before retrying the final residency probe",
-                released as f64 / (1u64 << 30) as f64,
-            );
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            attempts += 1;
-            match self.queue_submit_once(submits, vk::Fence::null(), None) {
-                Ok(()) => {
-                    tracing::warn!(
-                        "[infr] {context} recovered after {attempts} residency-probe attempts"
-                    );
-                    return Ok(());
+        if shed_host_dma {
+            loop {
+                self.drain_queue_for_submit_retry()?;
+                let released = self.shed_host_dma_imports(HOST_DMA_SHED_STEP_BYTES);
+                if released == 0 {
+                    break;
                 }
-                Err(error) if retryable_queue_submit_error(error) => last = error,
-                Err(error) => return Err(error),
+                tracing::warn!(
+                    "[infr] {context} still cannot submit; released {:.2} GiB of idle Host DMA mappings before retrying the final residency probe",
+                    released as f64 / (1u64 << 30) as f64,
+                );
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                attempts += 1;
+                match self.queue_submit_once(submits, vk::Fence::null(), None) {
+                    Ok(()) => {
+                        tracing::warn!(
+                            "[infr] {context} recovered after {attempts} residency-probe attempts"
+                        );
+                        return Ok(());
+                    }
+                    Err(error) if retryable_queue_submit_error(error) => last = error,
+                    Err(error) => return Err(error),
+                }
             }
         }
         Err(last)
@@ -4293,15 +4295,12 @@ impl VulkanBackend {
         let import_limit = self.shared.host_dma_import_limit;
         let mut imported_bytes = 0usize;
         let mut policy_limit_reached = false;
-        loop {
-            let Some(index) = proportional_import_index(
-                &pending
-                    .iter()
-                    .map(|state| (state.offset.min(state.logical_len), state.logical_len))
-                    .collect::<Vec<_>>(),
-            ) else {
-                break;
-            };
+        while let Some(index) = proportional_import_index(
+            &pending
+                .iter()
+                .map(|state| (state.offset.min(state.logical_len), state.logical_len))
+                .collect::<Vec<_>>(),
+        ) {
             let state = &pending[index];
             let remaining = state.owner.allocated_len() - state.offset;
             let budget_remaining = import_limit
@@ -7831,8 +7830,10 @@ mod tests {
     #[test]
     fn windows_nvidia_discrete_vram_excludes_the_bar_alias_heap() {
         let gib = 1u64 << 30;
-        let mut mp = vk::PhysicalDeviceMemoryProperties::default();
-        mp.memory_heap_count = 3;
+        let mut mp = vk::PhysicalDeviceMemoryProperties {
+            memory_heap_count: 3,
+            ..Default::default()
+        };
         mp.memory_heaps[0] = vk::MemoryHeap {
             size: 32 * gib,
             flags: vk::MemoryHeapFlags::DEVICE_LOCAL,

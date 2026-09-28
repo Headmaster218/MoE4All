@@ -475,6 +475,7 @@ fn step_scratch(g: &mut Graph, cfg: &crate::Config, rows: usize) -> StepScratch 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_bridge(
     g: &mut Graph,
     cfg: &crate::Config,
@@ -877,6 +878,7 @@ struct CatchHandles {
     lm_head: TensorId,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_catch_graph(
     cfg: &crate::Config,
     specs: &[(DType, usize)],
@@ -1619,6 +1621,7 @@ impl Qwen4MtpSession {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn draft(
         &self,
         be: &dyn Backend,

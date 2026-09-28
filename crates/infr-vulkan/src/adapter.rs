@@ -11414,7 +11414,7 @@ mod tests {
             return;
         };
         let (lanes, heads, head_dim, ratio, top_blocks, capacity) =
-            (2usize, 4usize, 128usize, 4usize, 2usize, 24usize);
+            (2usize, 4usize, 128usize, 4usize, 64usize, 24usize);
         let spans = vec![
             SequenceSpan {
                 row_start: 0,
