@@ -37,8 +37,11 @@ use std::sync::{Arc, Condvar, Mutex};
 /// native targets, matching the old zero-filled arena without eagerly touching a multi-GiB cache.
 pub struct AlignedHostBuffer {
     ptr: NonNull<u8>,
+    allocation_ptr: NonNull<u8>,
     len: usize,
     allocated_len: usize,
+    #[cfg(unix)]
+    allocation_len: usize,
 }
 
 // SAFETY: the allocation is plain bytes with a stable address. Users establish non-overlap and
@@ -56,8 +59,11 @@ impl AlignedHostBuffer {
         if len == 0 {
             return Ok(Arc::new(Self {
                 ptr: NonNull::dangling(),
+                allocation_ptr: NonNull::dangling(),
                 len: 0,
                 allocated_len: 0,
+                #[cfg(unix)]
+                allocation_len: 0,
             }));
         }
         let allocated_len = len
@@ -66,7 +72,7 @@ impl AlignedHostBuffer {
             .ok_or_else(|| Error::backend("aligned host allocation size overflow".to_string()))?;
 
         #[cfg(windows)]
-        let ptr = {
+        let (ptr, allocation_ptr) = {
             use windows::Win32::System::Memory::{
                 VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE,
             };
@@ -78,19 +84,26 @@ impl AlignedHostBuffer {
                     PAGE_READWRITE,
                 )
             };
-            NonNull::new(raw.cast::<u8>()).ok_or_else(|| {
+            let ptr = NonNull::new(raw.cast::<u8>()).ok_or_else(|| {
                 Error::backend(format!(
                     "VirtualAlloc could not reserve {allocated_len} bytes for the host pager"
                 ))
-            })?
+            })?;
+            (ptr, ptr)
         };
 
         #[cfg(unix)]
-        let ptr = {
+        let (ptr, allocation_ptr, allocation_len) = {
+            // `mmap` guarantees page alignment, which is commonly only 4 KiB on Unix. Reserve one
+            // extra alignment unit and expose an aligned window inside it; keep the original span
+            // so `Drop` can release the complete mapping.
+            let allocation_len = allocated_len
+                .checked_add(Self::ALIGNMENT)
+                .ok_or_else(|| Error::backend("aligned host mapping size overflow".to_string()))?;
             let raw = unsafe {
                 libc::mmap(
                     std::ptr::null_mut(),
-                    allocated_len,
+                    allocation_len,
                     libc::PROT_READ | libc::PROT_WRITE,
                     libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                     -1,
@@ -99,29 +112,38 @@ impl AlignedHostBuffer {
             };
             if raw == libc::MAP_FAILED {
                 return Err(Error::backend(format!(
-                    "mmap could not reserve {allocated_len} bytes for the host pager"
+                    "mmap could not reserve {allocation_len} bytes for the host pager"
                 )));
             }
-            NonNull::new(raw.cast::<u8>()).expect("mmap success returned null")
+            let allocation_ptr =
+                NonNull::new(raw.cast::<u8>()).expect("mmap success returned null");
+            let aligned = (raw as usize + Self::ALIGNMENT - 1) & !(Self::ALIGNMENT - 1);
+            let ptr = NonNull::new(aligned as *mut u8).expect("aligned mmap address is non-null");
+            (ptr, allocation_ptr, allocation_len)
         };
 
         #[cfg(not(any(windows, unix)))]
-        let ptr = {
+        let (ptr, allocation_ptr) = {
             let layout = std::alloc::Layout::from_size_align(allocated_len, Self::ALIGNMENT)
                 .map_err(|e| {
                     Error::backend(format!("invalid host pager allocation layout: {e}"))
                 })?;
-            NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) }).ok_or_else(|| {
-                Error::backend(format!(
-                    "allocator could not reserve {allocated_len} bytes for the host pager"
-                ))
-            })?
+            let ptr =
+                NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) }).ok_or_else(|| {
+                    Error::backend(format!(
+                        "allocator could not reserve {allocated_len} bytes for the host pager"
+                    ))
+                })?;
+            (ptr, ptr)
         };
 
         Ok(Arc::new(Self {
             ptr,
+            allocation_ptr,
             len,
             allocated_len,
+            #[cfg(unix)]
+            allocation_len,
         }))
     }
 
@@ -176,17 +198,17 @@ impl Drop for AlignedHostBuffer {
         #[cfg(windows)]
         unsafe {
             use windows::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
-            let _ = VirtualFree(self.ptr.as_ptr().cast(), 0, MEM_RELEASE);
+            let _ = VirtualFree(self.allocation_ptr.as_ptr().cast(), 0, MEM_RELEASE);
         }
         #[cfg(unix)]
         unsafe {
-            libc::munmap(self.ptr.as_ptr().cast(), self.allocated_len);
+            libc::munmap(self.allocation_ptr.as_ptr().cast(), self.allocation_len);
         }
         #[cfg(not(any(windows, unix)))]
         unsafe {
             let layout =
                 std::alloc::Layout::from_size_align_unchecked(self.allocated_len, Self::ALIGNMENT);
-            std::alloc::dealloc(self.ptr.as_ptr(), layout);
+            std::alloc::dealloc(self.allocation_ptr.as_ptr(), layout);
         }
     }
 }
