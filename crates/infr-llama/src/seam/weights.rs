@@ -142,10 +142,19 @@ pub(super) struct DeltaW {
     pub(super) out: TensorId,
 }
 
-/// Ling KDA mixer weights. Q/K/V projection and causal-conv banks are concatenated once at load,
-/// matching the packed activation consumed by [`infr_core::Op::Kda`].
+/// Ling KDA Q/K/V projections. Most GGUFs use one dtype for all three and keep the single fused
+/// projection. Ling 3.0 Tiny Q4_K_M stores Q/K as Q4_K but V as Q6_K, so that model keeps a fused
+/// Q/K bank plus a separate V bank and packs their activations before the causal convolution.
+#[derive(Clone, Copy)]
+pub(super) enum KdaQkvW {
+    Fused(TensorId),
+    QkV { qk: TensorId, v: TensorId },
+}
+
+/// Ling KDA mixer weights. The causal-conv banks are concatenated once at load, matching the
+/// packed activation consumed by [`infr_core::Op::Kda`].
 pub(super) struct KdaW {
-    pub(super) qkv: TensorId,
+    pub(super) qkv: KdaQkvW,
     pub(super) conv: TensorId,
     pub(super) forget: TensorId,
     pub(super) beta: TensorId,
@@ -363,6 +372,8 @@ pub(crate) struct SessionStable {
     pub(super) fuse_gu: bool,
     /// Combined QKV upload decision.
     pub(super) fuse_qkv: bool,
+    /// Per-layer Ling KDA QKV layout: true for one fused bank, false for QK + V.
+    pub(super) kda_qkv_fused: Vec<bool>,
     /// Whether the MoE expert banks all have a dp4a-mmq kernel (batched-prefill eligibility).
     pub(super) moe_batched_ok: bool,
 }
@@ -397,8 +408,10 @@ pub(crate) struct SeamKv {
     pub(super) ple_embd_buf: Option<Box<dyn Buffer>>,
     /// Persistent PLE dilated-convolution history (9 x hc*n_embd f32 on the released model).
     pub(super) ple_state_buf: Option<Box<dyn Buffer>>,
-    /// Fixed four-row Qwen3.8 MTP VERIFY IO. These buffers are allocated before the deferred
-    /// Vulkan pager measures the remaining room, then replayed by every speculative cycle.
+    /// Fixed Qwen3.8 MTP VERIFY IO. A single slot needs four rows; parallel serving reserves the
+    /// whole four-rows-per-lane cohort so whichever slot becomes the primary can own the graph.
+    /// These buffers are allocated before the deferred Vulkan pager measures the remaining room,
+    /// then replayed by every speculative cycle.
     pub(super) mtp_verify_bufs: Option<QwenMtpVerifyBuffers>,
     /// The context this slot's KV cache was ACTUALLY allocated for. Usually the `want_ctx` the
     /// caller asked for; smaller when the cold init's live-room re-clamp shrank it (see
@@ -450,12 +463,10 @@ pub(crate) struct SeamKv {
     /// rewind by cache truncation the way a per-position KV cache can — see the `c.qwen35` branch in
     /// `generate_dense_backend`'s `start` computation). `None` for every non-MTP caller.
     pub(super) mtp_delta_ckpt: Option<MtpDeltaCkpt>,
-    /// Rolling conversation checkpoint for append-only recurrent mixers. Unlike the MTP rollback
-    /// checkpoint above, this snapshot is taken at the stable rendered-history boundary BEFORE
-    /// the assistant generation prompt. The next turn can therefore restore that exact state and
-    /// prefill only the prior visible answer plus the new user turn, even when chat-history
-    /// normalization makes the newly rendered prompt diverge from `cached`.
-    pub(super) turn_recurrent_ckpt: Option<TurnRecurrentCkpt>,
+    /// Two conversation checkpoints for append-only recurrent mixers: the reusable agent prefix
+    /// and the prefix immediately before the latest user message. Attention/QSA rows remain in
+    /// their ordinary cache; only the fixed recurrent/PLE summaries are duplicated here.
+    pub(super) turn_recurrent_ckpts: [Option<TurnRecurrentCkpt>; super::TURN_CHECKPOINT_COUNT],
     /// Additional serve slots whose persistent device allocations were materialized beside slot
     /// 0 before the unified arena consumed the measured remainder. Startup drains this vector
     /// immediately; ordinary one-shot/session paths always keep it empty.
@@ -465,12 +476,48 @@ pub(crate) struct SeamKv {
 pub(super) struct QwenMtpVerifyBuffers {
     pub(super) ids: Box<dyn Buffer>,
     pub(super) positions: Box<dyn Buffer>,
+    pub(super) positions4: Box<dyn Buffer>,
     pub(super) hidden: Box<dyn Buffer>,
     pub(super) wide: Box<dyn Buffer>,
     pub(super) ple: Box<dyn Buffer>,
     pub(super) logits: Box<dyn Buffer>,
     pub(super) h_out: Box<dyn Buffer>,
     pub(super) out_ids: Box<dyn Buffer>,
+}
+
+impl QwenMtpVerifyBuffers {
+    pub(super) fn allocate(be: &dyn Backend, cfg: &Config) -> AResult<Self> {
+        Self::allocate_rows(
+            be,
+            cfg,
+            crate::mtp::DRAFT_TOKENS * super::placement_slots() as usize,
+        )
+    }
+
+    fn rows(&self) -> usize {
+        self.ids.len_bytes() / std::mem::size_of::<u32>()
+    }
+
+    pub(super) fn allocate_rows(be: &dyn Backend, cfg: &Config, rows: usize) -> AResult<Self> {
+        let h_width = cfg.hc_mult * cfg.n_embd;
+        let ple_row = (cfg.ple_ngram_size - 1) * cfg.ple_heads_per_ngram * cfg.ple_head_dim;
+        let alloc = |bytes, usage| be.alloc(bytes, usage).map_err(|e| anyhow!("{e}"));
+        Ok(Self {
+            ids: alloc(rows * 4, BufferUsage::Staging)?,
+            positions: alloc(rows * 4, BufferUsage::Staging)?,
+            positions4: alloc(rows * 4 * 4, BufferUsage::Staging)?,
+            hidden: be
+                .alloc_uninit(rows * cfg.n_embd * 4, BufferUsage::Activations)
+                .map_err(|e| anyhow!("{e}"))?,
+            wide: be
+                .alloc_uninit(rows * h_width * 4, BufferUsage::Activations)
+                .map_err(|e| anyhow!("{e}"))?,
+            ple: alloc(rows * ple_row * 4, BufferUsage::Staging)?,
+            logits: alloc(rows * cfg.vocab * 4, BufferUsage::Staging)?,
+            h_out: alloc(rows * h_width * 4, BufferUsage::Readback)?,
+            out_ids: alloc(rows * 4, BufferUsage::Readback)?,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -610,6 +657,24 @@ pub(super) struct MtpDeltaCkpt {
 }
 
 impl MtpDeltaCkpt {
+    fn allocate_for_fork(
+        be: &dyn Backend,
+        cfg: &Config,
+        src_k: &[Box<dyn Buffer>],
+        src_v: &[Box<dyn Buffer>],
+        src_ple: Option<&dyn Buffer>,
+        trace_rows: usize,
+    ) -> AResult<Option<Self>> {
+        Self::allocate_sized(
+            be,
+            cfg,
+            |layer| Some(src_k[layer].len_bytes()),
+            |layer| Some(src_v[layer].len_bytes()),
+            src_ple.map(Buffer::len_bytes),
+            trace_rows,
+        )
+    }
+
     pub(super) fn allocate_before_dynamic_kv(
         be: &dyn Backend,
         cfg: &Config,
@@ -884,18 +949,19 @@ impl TurnRecurrentCkpt {
             return Ok(());
         }
         let layer = self.layers[i];
-        be.copy_buffer(
-            src_k[layer].as_ref(),
-            self.kbufs[i].as_ref(),
-            src_k[layer].len_bytes(),
-        )
-        .map_err(|e| anyhow!("{e}"))?;
-        be.copy_buffer(
-            src_v[layer].as_ref(),
-            self.vbufs[i].as_ref(),
-            src_v[layer].len_bytes(),
-        )
-        .map_err(|e| anyhow!("{e}"))?;
+        let copies = [
+            (
+                src_k[layer].as_ref(),
+                self.kbufs[i].as_ref(),
+                src_k[layer].len_bytes(),
+            ),
+            (
+                src_v[layer].as_ref(),
+                self.vbufs[i].as_ref(),
+                src_v[layer].len_bytes(),
+            ),
+        ];
+        be.copy_buffers(&copies).map_err(|e| anyhow!("{e}"))?;
         self.copied[i] = true;
         self.refresh_valid();
         Ok(())
@@ -938,10 +1004,40 @@ impl TurnRecurrentCkpt {
         src_v: &[Box<dyn Buffer>],
         src_ple: Option<&dyn Buffer>,
     ) -> AResult<()> {
-        for i in 0..self.layers.len() {
-            self.snapshot_index(be, src_k, src_v, i)?;
+        if self.ple_state.is_some() != src_ple.is_some() {
+            return Err(anyhow!(
+                "stable recurrent checkpoint PLE source differs from its allocation"
+            ));
         }
-        self.snapshot_ple(be, src_ple)?;
+
+        let mut copies =
+            Vec::with_capacity(self.layers.len() * 2 + usize::from(self.ple_state.is_some()));
+        for (i, &layer) in self.layers.iter().enumerate() {
+            if self.copied[i] {
+                continue;
+            }
+            copies.push((
+                src_k[layer].as_ref(),
+                self.kbufs[i].as_ref(),
+                src_k[layer].len_bytes(),
+            ));
+            copies.push((
+                src_v[layer].as_ref(),
+                self.vbufs[i].as_ref(),
+                src_v[layer].len_bytes(),
+            ));
+        }
+        if !self.ple_copied {
+            if let (Some(src), Some(dst)) = (src_ple, self.ple_state.as_deref()) {
+                copies.push((src, dst, src.len_bytes()));
+            }
+        }
+        be.copy_buffers(&copies).map_err(|e| anyhow!("{e}"))?;
+        drop(copies);
+
+        self.copied.fill(true);
+        self.ple_copied = true;
+        self.refresh_valid();
         Ok(())
     }
 }
@@ -1011,12 +1107,43 @@ impl SeamKv {
         let live = (live_score > 0
             && (live_score == self.cached.len() || live_score == prompt.len()))
         .then_some(live_score);
-        let checkpoint = self.turn_recurrent_ckpt.as_ref().and_then(|ck| {
-            ck.valid
-                .then(|| checkpoint_extension_start(&ck.tokens, prompt))
-                .flatten()
-        });
+        let checkpoint = self
+            .turn_recurrent_ckpts
+            .iter()
+            .flatten()
+            .filter_map(|ck| {
+                ck.valid
+                    .then(|| checkpoint_extension_start(&ck.tokens, prompt))
+                    .flatten()
+            })
+            .max();
         live.into_iter().chain(checkpoint).max()
+    }
+
+    /// Longest prefix this slot can copy into another slot without replaying model work. Hybrid
+    /// recurrent models can only export their live frontier or a captured turn checkpoint; an
+    /// arbitrary token LCP has no matching recurrent/PLE summary.
+    pub(crate) fn seedable_prefix_len(&self, cfg: &Config, prompt: &[u32]) -> usize {
+        if cfg.qwen35 || cfg.bailingmoe3 || cfg.deepseek4 {
+            return 0;
+        }
+        if !cfg.qwen4exp {
+            return self.prefix_score(prompt);
+        }
+        let live = (!self.cached.is_empty() && prompt.starts_with(&self.cached))
+            .then_some(self.cached.len());
+        let checkpoint = self
+            .turn_recurrent_ckpts
+            .iter()
+            .flatten()
+            .filter(|checkpoint| {
+                checkpoint.valid
+                    && self.cached.starts_with(&checkpoint.tokens)
+                    && prompt.starts_with(&checkpoint.tokens)
+            })
+            .map(|checkpoint| checkpoint.tokens.len())
+            .max();
+        live.into_iter().chain(checkpoint).max().unwrap_or(0)
     }
 
     /// Forget the materialized tokens WITHOUT dropping weights or buffers: the next call
@@ -1032,6 +1159,10 @@ impl SeamKv {
     /// Number of token ids materialized in this slot's KV cache.
     pub(crate) fn cached_len(&self) -> usize {
         self.cached.len()
+    }
+
+    pub(crate) fn cached_tokens(&self) -> &[u32] {
+        &self.cached
     }
 
     /// Forget the materialized tokens (the KV rows become dead; the next prompt prefills from
@@ -1149,7 +1280,7 @@ impl SeamKv {
     }
 
     fn invalidate_turn_checkpoint(&mut self) {
-        if let Some(ck) = self.turn_recurrent_ckpt.as_mut() {
+        for ck in self.turn_recurrent_ckpts.iter_mut().flatten() {
             ck.invalidate();
         }
     }
@@ -1162,34 +1293,54 @@ impl SeamKv {
         be: &dyn Backend,
         prompt: &[u32],
     ) -> AResult<Option<usize>> {
-        let Some(ck) = self.turn_recurrent_ckpt.as_ref() else {
+        let selected = self
+            .turn_recurrent_ckpts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, checkpoint)| {
+                let checkpoint = checkpoint.as_ref()?;
+                checkpoint
+                    .valid
+                    .then(|| checkpoint_extension_start(&checkpoint.tokens, prompt))
+                    .flatten()
+                    .map(|len| (index, len))
+            })
+            .max_by_key(|&(_, len)| len);
+        let Some((selected, len)) = selected else {
             return Ok(None);
         };
-        let Some(len) = ck
-            .valid
-            .then(|| checkpoint_extension_start(&ck.tokens, prompt))
-            .flatten()
-        else {
-            return Ok(None);
-        };
+
+        // A divergent branch overwrites every attention/QSA row after the selected boundary.
+        // Any checkpoint from the old branch that is not itself a prefix of this prompt would
+        // otherwise retain a valid recurrent summary beside invalid per-token cache rows.
+        for (index, checkpoint) in self.turn_recurrent_ckpts.iter_mut().enumerate() {
+            if index != selected {
+                if let Some(checkpoint) = checkpoint.as_mut() {
+                    if checkpoint.valid && !prompt.starts_with(&checkpoint.tokens) {
+                        checkpoint.invalidate();
+                    }
+                }
+            }
+        }
+        let ck = self.turn_recurrent_ckpts[selected]
+            .as_ref()
+            .expect("selected recurrent checkpoint exists");
+        let mut copies =
+            Vec::with_capacity(ck.layers.len() * 2 + usize::from(ck.ple_state.is_some()));
         for (i, &l) in ck.layers.iter().enumerate() {
-            be.copy_buffer(
+            copies.push((
                 ck.kbufs[i].as_ref(),
                 self.kbufs[l].as_ref(),
                 ck.kbufs[i].len_bytes(),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
-            be.copy_buffer(
+            ));
+            copies.push((
                 ck.vbufs[i].as_ref(),
                 self.vbufs[l].as_ref(),
                 ck.vbufs[i].len_bytes(),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
+            ));
         }
         match (ck.ple_state.as_ref(), self.ple_state_buf.as_deref()) {
-            (Some(src), Some(dst)) => be
-                .copy_buffer(src.as_ref(), dst, src.len_bytes())
-                .map_err(|e| anyhow!("{e}"))?,
+            (Some(src), Some(dst)) => copies.push((src.as_ref(), dst, src.len_bytes())),
             (Some(_), None) | (None, Some(_)) => {
                 return Err(anyhow!(
                     "stable recurrent checkpoint PLE target differs from its snapshot"
@@ -1197,8 +1348,42 @@ impl SeamKv {
             }
             (None, None) => {}
         }
+        be.copy_buffers(&copies).map_err(|e| anyhow!("{e}"))?;
+        drop(copies);
         self.cached.clone_from(&ck.tokens);
         Ok(Some(len))
+    }
+
+    /// Capture a turn checkpoint once an external batched path has stopped exactly at that token
+    /// boundary. Qwen3.8 MTP prime uses its own batched-verify forward and therefore returns before
+    /// the ordinary runner's snapshot sites. Re-arm here because its first cold chunk correctly
+    /// resets the recurrent state and invalidates any checkpoint prepared before that reset.
+    pub(crate) fn capture_turn_recurrent(
+        &mut self,
+        be: &dyn Backend,
+        cfg: &Config,
+        index: usize,
+        tokens: &[u32],
+    ) -> AResult<()> {
+        let slot = self
+            .turn_recurrent_ckpts
+            .get_mut(index)
+            .ok_or_else(|| anyhow!("turn checkpoint index {index} is out of range"))?;
+        TurnRecurrentCkpt::begin(
+            slot,
+            be,
+            cfg,
+            &self.kbufs,
+            &self.vbufs,
+            self.ple_state_buf.as_deref(),
+            tokens,
+        )?;
+        let checkpoint = self
+            .turn_recurrent_ckpts
+            .get_mut(index)
+            .and_then(Option::as_mut)
+            .ok_or_else(|| anyhow!("turn checkpoint {index} has no recurrent layers"))?;
+        checkpoint.snapshot_all(be, &self.kbufs, &self.vbufs, self.ple_state_buf.as_deref())
     }
 
     /// Fork a fresh conversation slot: same (Arc-shared) weights, its own zero KV + IO buffers.
@@ -1477,18 +1662,40 @@ impl SeamKv {
         } else {
             None
         };
-        let mut turn_recurrent_ckpt = None;
+        let mut turn_recurrent_ckpts = std::array::from_fn(|_| None);
         if cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3 {
-            TurnRecurrentCkpt::begin(
-                &mut turn_recurrent_ckpt,
+            for checkpoint in &mut turn_recurrent_ckpts {
+                TurnRecurrentCkpt::begin(
+                    checkpoint,
+                    be,
+                    cfg,
+                    &kbufs,
+                    &vbufs,
+                    ple_state_buf.as_deref(),
+                    &[],
+                )?;
+            }
+        }
+        let mtp_delta_ckpt = if self.mtp_delta_ckpt.is_some() {
+            MtpDeltaCkpt::allocate_for_fork(
                 be,
                 cfg,
                 &kbufs,
                 &vbufs,
                 ple_state_buf.as_deref(),
-                &[],
-            )?;
-        }
+                crate::mtp::DRAFT_TOKENS.saturating_sub(1),
+            )?
+        } else {
+            None
+        };
+        let mtp_verify_bufs = self
+            .mtp_verify_bufs
+            .as_ref()
+            // Parallel MTP sorts a visual lane first so that lane owns the MRoPE bindings. That
+            // lane is not necessarily slot 0, therefore every fork must preserve the root slot's
+            // full-cohort capacity rather than falling back to the per-lane four-row default.
+            .map(|source| QwenMtpVerifyBuffers::allocate_rows(be, cfg, source.rows()))
+            .transpose()?;
         Ok(SeamKv {
             weights: std::sync::Arc::clone(&self.weights),
             stable: std::sync::Arc::clone(&self.stable),
@@ -1538,7 +1745,7 @@ impl SeamKv {
                 None
             },
             ple_state_buf,
-            mtp_verify_bufs: None,
+            mtp_verify_bufs,
             max_ctx: self.max_ctx,
             kv_ring: self.kv_ring,
             cached: Vec::new(),
@@ -1556,8 +1763,8 @@ impl SeamKv {
             sc_ping: None,
             sc_ping_write: 0,
             sc_temp_inv_buf: None,
-            mtp_delta_ckpt: None,
-            turn_recurrent_ckpt,
+            mtp_delta_ckpt,
+            turn_recurrent_ckpts,
             preallocated_siblings: Vec::new(),
         })
     }
@@ -1579,13 +1786,16 @@ impl SeamKv {
         ec: &crate::EngineConfig,
         src: &SeamKv,
         p: usize,
-    ) -> AResult<()> {
-        if cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3 || cfg.deepseek4 {
-            return Ok(());
+    ) -> AResult<usize> {
+        if cfg.qwen35 || cfg.bailingmoe3 || cfg.deepseek4 {
+            return Ok(0);
+        }
+        if cfg.qwen4exp {
+            return self.seed_qwen4_from(be, cfg, ec, src, p);
         }
         let p = p.min(src.cached.len()).min(self.max_ctx);
         if p == 0 {
-            return Ok(());
+            return Ok(0);
         }
         // SWA ring caches: positions [0, p) sit at rows [0, p) ONLY while the source hasn't
         // wrapped (cached_len <= ring rows) — a wrapped ring recycled exactly those early rows,
@@ -1600,7 +1810,7 @@ impl SeamKv {
                 .map(|l| crate::seam::kv_rows(cfg, l, self.max_ctx, true, ec))
                 .any(|rows_l| src.cached.len() > rows_l);
             if wrapped {
-                return Ok(());
+                return Ok(0);
             }
         }
         for l in 0..cfg.n_layer {
@@ -1626,7 +1836,195 @@ impl SeamKv {
             }
         }
         self.cached = src.cached[..p].to_vec();
-        Ok(())
+        Ok(p)
+    }
+
+    fn seed_qwen4_from(
+        &mut self,
+        be: &dyn Backend,
+        cfg: &Config,
+        ec: &crate::EngineConfig,
+        src: &SeamKv,
+        requested: usize,
+    ) -> AResult<usize> {
+        let requested = requested.min(src.cached.len()).min(self.max_ctx);
+        let live = (requested == src.cached.len() && requested != 0).then_some((requested, None));
+        let checkpoint = src
+            .turn_recurrent_ckpts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, checkpoint)| {
+                let checkpoint = checkpoint.as_ref()?;
+                (checkpoint.valid
+                    && !checkpoint.tokens.is_empty()
+                    && checkpoint.tokens.len() <= requested
+                    && src.cached.starts_with(&checkpoint.tokens))
+                .then_some((checkpoint.tokens.len(), Some(index)))
+            })
+            .max_by_key(|&(tokens, _)| tokens);
+        let Some((tokens, recurrent_checkpoint)) = live
+            .into_iter()
+            .chain(checkpoint)
+            .max_by_key(|&(tokens, _)| tokens)
+        else {
+            return Ok(0);
+        };
+
+        if self.kv_ring {
+            let wrapped = (0..cfg.n_layer)
+                .filter(|&layer| cfg.is_swa_layer(layer))
+                .map(|layer| crate::seam::kv_rows(cfg, layer, self.max_ctx, true, ec))
+                .any(|rows| src.cached.len() > rows);
+            if wrapped {
+                return Ok(0);
+            }
+        }
+
+        self.ensure_segmented_depth(be, cfg, tokens)?;
+        let mut copies: Vec<(&dyn Buffer, usize, &dyn Buffer, usize, usize)> = Vec::new();
+        for layer in 0..cfg.n_layer {
+            if cfg.is_recurrent_layer(layer) {
+                let (src_k, src_v) = if let Some(index) = recurrent_checkpoint {
+                    let checkpoint = src.turn_recurrent_ckpts[index]
+                        .as_ref()
+                        .expect("selected Qwen3.8 checkpoint exists");
+                    let position = checkpoint
+                        .layers
+                        .iter()
+                        .position(|&candidate| candidate == layer)
+                        .ok_or_else(|| {
+                            anyhow!("Qwen3.8 checkpoint has no recurrent layer {layer}")
+                        })?;
+                    (
+                        checkpoint.kbufs[position].as_ref(),
+                        checkpoint.vbufs[position].as_ref(),
+                    )
+                } else {
+                    (src.kbufs[layer].as_ref(), src.vbufs[layer].as_ref())
+                };
+                copies.push((src_k, 0, self.kbufs[layer].as_ref(), 0, src_k.len_bytes()));
+                copies.push((src_v, 0, self.vbufs[layer].as_ref(), 0, src_v.len_bytes()));
+                continue;
+            }
+
+            let (k_row, v_row) = crate::seam::kv_row_elems(cfg, layer);
+            let k_bytes = kv_fmt_bytes(self.k_fmt, tokens * k_row);
+            if k_bytes != 0 {
+                copies.push((
+                    src.kbufs[layer].as_ref(),
+                    0,
+                    self.kbufs[layer].as_ref(),
+                    0,
+                    k_bytes,
+                ));
+            }
+            let v_bytes = kv_fmt_bytes(self.v_fmt, tokens * v_row);
+            if v_bytes != 0 {
+                copies.push((
+                    src.vbufs[layer].as_ref(),
+                    0,
+                    self.vbufs[layer].as_ref(),
+                    0,
+                    v_bytes,
+                ));
+            }
+            if let (Some(src_raw), Some(dst_raw)) = (
+                src.qsa_kbufs[layer].as_deref(),
+                self.qsa_kbufs[layer].as_deref(),
+            ) {
+                let bytes = tokens
+                    .saturating_mul(cfg.indexer_head_size)
+                    .saturating_mul(2);
+                if bytes != 0 {
+                    copies.push((src_raw, 0, dst_raw, 0, bytes));
+                }
+            }
+            if let (Some(src_blocks), Some(dst_blocks)) = (
+                src.qsa_cbufs[layer].as_deref(),
+                self.qsa_cbufs[layer].as_deref(),
+            ) {
+                let rows = tokens / cfg.layer_compress_ratio(layer).max(1);
+                let bytes = rows.saturating_mul(cfg.indexer_head_size).saturating_mul(4);
+                if bytes != 0 {
+                    copies.push((src_blocks, 0, dst_blocks, 0, bytes));
+                }
+            }
+        }
+        if let (Some(src_ple), Some(dst_ple)) = (
+            recurrent_checkpoint
+                .and_then(|index| src.turn_recurrent_ckpts[index].as_ref())
+                .and_then(|checkpoint| checkpoint.ple_state.as_deref())
+                .or(src.ple_state_buf.as_deref()),
+            self.ple_state_buf.as_deref(),
+        ) {
+            copies.push((src_ple, 0, dst_ple, 0, src_ple.len_bytes()));
+        }
+        be.copy_buffer_ranges(&copies)
+            .map_err(|error| anyhow!("seed Qwen3.8 live state: {error}"))?;
+        drop(copies);
+
+        for checkpoint in self.turn_recurrent_ckpts.iter_mut().flatten() {
+            checkpoint.invalidate();
+        }
+        let selected_tokens = &src.cached[..tokens];
+        for index in 0..super::TURN_CHECKPOINT_COUNT {
+            let Some(source) = src.turn_recurrent_ckpts[index]
+                .as_ref()
+                .filter(|checkpoint| {
+                    checkpoint.valid && selected_tokens.starts_with(&checkpoint.tokens)
+                })
+            else {
+                continue;
+            };
+            if self.turn_recurrent_ckpts[index].is_none() {
+                TurnRecurrentCkpt::begin(
+                    &mut self.turn_recurrent_ckpts[index],
+                    be,
+                    cfg,
+                    &self.kbufs,
+                    &self.vbufs,
+                    self.ple_state_buf.as_deref(),
+                    &source.tokens,
+                )?;
+            }
+            let target = self.turn_recurrent_ckpts[index]
+                .as_mut()
+                .expect("Qwen3.8 fork has recurrent checkpoint storage");
+            let mut checkpoint_copies = Vec::with_capacity(
+                source.layers.len() * 2 + usize::from(source.ple_state.is_some()),
+            );
+            for (position, &layer) in source.layers.iter().enumerate() {
+                let target_position = target
+                    .layers
+                    .iter()
+                    .position(|&candidate| candidate == layer)
+                    .ok_or_else(|| anyhow!("Qwen3.8 seed target has no recurrent layer {layer}"))?;
+                checkpoint_copies.push((
+                    source.kbufs[position].as_ref(),
+                    target.kbufs[target_position].as_ref(),
+                    source.kbufs[position].len_bytes(),
+                ));
+                checkpoint_copies.push((
+                    source.vbufs[position].as_ref(),
+                    target.vbufs[target_position].as_ref(),
+                    source.vbufs[position].len_bytes(),
+                ));
+            }
+            if let (Some(source), Some(target)) =
+                (source.ple_state.as_deref(), target.ple_state.as_deref())
+            {
+                checkpoint_copies.push((source, target, source.len_bytes()));
+            }
+            be.copy_buffers(&checkpoint_copies)
+                .map_err(|error| anyhow!("seed Qwen3.8 turn checkpoint {index}: {error}"))?;
+            target.tokens.clone_from(&source.tokens);
+            target.copied.fill(true);
+            target.ple_copied = true;
+            target.valid = true;
+        }
+        self.cached.clear();
+        self.cached.extend_from_slice(selected_tokens);
+        Ok(tokens)
     }
 }
 

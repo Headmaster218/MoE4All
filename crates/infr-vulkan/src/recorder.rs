@@ -296,6 +296,20 @@ fn expert_stride_bytes(dtype: infr_core::DType, stride: usize) -> u32 {
     bytes as u32
 }
 
+/// The base streamed GEMV has a scalar F16/BF16 tail for projection widths such as Qwen3.8
+/// Vision's 4304-element FFN. All block-quantized formats and all other native kernels stay on the
+/// strict 32-element grid.
+#[track_caller]
+fn assert_native_gemv_k(kernel: &str, dtype: infr_core::DType, in_f: usize) {
+    assert!(
+        in_f != 0
+            && (in_f.is_multiple_of(32)
+                || matches!(dtype, infr_core::DType::F16 | infr_core::DType::Bf16)),
+        "{kernel}: native-block K must be a nonzero multiple of 32 unless the base streamed GEMV \
+         is decoding F16/BF16 (got dtype={dtype:?}, in_f={in_f})"
+    );
+}
+
 /// Reject a native-block dispatch whose K axis is off the 32-element sub-block grid.
 ///
 /// Every `native_decode.glsl` consumer walks K as `nsub = in_f / 32` whole 32-element sub-blocks —
@@ -309,11 +323,10 @@ fn expert_stride_bytes(dtype: infr_core::DType, stride: usize) -> u32 {
 /// (`embed_gather` differs in shape only — it writes inside the sub-block loop, so a short row
 /// leaves `dst` untouched instead — not in consequence.)
 ///
-/// No GGUF reaches either case — quant block sizes are 32/64/256, and every float projection width
-/// in a real model is 32-aligned — so this guards the floor rather than lifting it with a masked
-/// tail block across the whole shader family. A hard `assert!` and not a `debug_assert!`: the
-/// failure being guarded is a plausible-looking RELEASE-build result, which is exactly what a
-/// debug-only check does not catch. Cost is two integer ops in front of a GPU dispatch.
+/// Quant block sizes are 32/64/256, so every block-quantized path must retain this strict guard.
+/// The base F16/BF16 streamed GEMV is the one explicit exception: it has a scalar tail for dense
+/// projection widths such as Qwen3.8 Vision's 4304. A hard `assert!` and not a `debug_assert!`:
+/// the failure being guarded is a plausible-looking release-build result.
 #[track_caller]
 fn assert_native_k(kernel: &str, in_f: usize) {
     assert!(
@@ -322,6 +335,18 @@ fn assert_native_k(kernel: &str, in_f: usize) {
          shaders loop `nsub = in_f / 32` whole sub-blocks, so an off-grid K silently drops the \
          tail, and in_f < 32 silently yields all-zero output"
     );
+}
+
+fn splitk_reduce_extents(m: usize, n: usize) -> (usize, usize) {
+    let output_elems = m
+        .checked_mul(n)
+        .expect("split-K output element count overflow");
+    let plane_elems = m
+        .div_ceil(64)
+        .checked_mul(64)
+        .and_then(|rows| rows.checked_mul(n))
+        .expect("split-K partial plane element count overflow");
+    (output_elems, plane_elems)
 }
 
 /// A batched-MoE expert-GEMM kernel variant: `(kernel name, SPIR-V)`.
@@ -2608,22 +2633,44 @@ impl<'a> Recorder<'a> {
             &push[..push_size as usize],
             groups,
         );
-        // reduce: out[i] = Σ_s partials[s·plane + i]
+        // Reduce only the logical m*n output. Partial planes keep their padded mpad*n stride.
         self.label_gemm("splitk_reduce", m, k, n);
         let rk = self
             .be
             .kernel("splitk_reduce", crate::gemm::splitk_reduce_spv(), 2, 12);
-        let n_elems = mpad * n;
+        let (output_elems, plane_elems) = splitk_reduce_extents(m, n);
+        debug_assert_eq!(plane_elems, mpad * n);
+        let partial_bytes = splits
+            .checked_mul(plane_elems)
+            .and_then(|elems| elems.checked_mul(size_of::<f32>()))
+            .expect("split-K partial buffer size overflow");
+        let output_bytes = output_elems
+            .checked_mul(size_of::<f32>())
+            .expect("split-K output buffer size overflow");
+        assert!(
+            partials.len_bytes() >= partial_bytes,
+            "split-K partial buffer is too small: need {partial_bytes} bytes, got {}",
+            partials.len_bytes()
+        );
+        assert!(
+            c.len_bytes() >= output_bytes,
+            "split-K output buffer is too small: need {output_bytes} bytes, got {}",
+            c.len_bytes()
+        );
+        let output_elems = u32::try_from(output_elems)
+            .expect("split-K output element count exceeds shader push-constant range");
+        let plane_elems = u32::try_from(plane_elems)
+            .expect("split-K partial plane exceeds shader push-constant range");
         let mut rp = [0u8; 12];
-        rp[0..4].copy_from_slice(&(n_elems as u32).to_ne_bytes());
+        rp[0..4].copy_from_slice(&output_elems.to_ne_bytes());
         rp[4..8].copy_from_slice(&(splits as u32).to_ne_bytes());
-        rp[8..12].copy_from_slice(&(n_elems as u32).to_ne_bytes());
+        rp[8..12].copy_from_slice(&plane_elems.to_ne_bytes());
         self.dispatch(
             rk,
             &[Self::vkb(partials), Self::vkb(c)],
             1,
             &rp,
-            (n_elems as u32).div_ceil(64),
+            output_elems.div_ceil(64),
         );
     }
 
@@ -3361,7 +3408,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        assert_native_k("linear_native_at", in_f);
+        assert_native_gemv_k("linear_native_at", dtype, in_f);
         self.label_gemv("gemv_streamed", rows, in_f, out_f);
         let (name, spv) =
             crate::gemm::native_streamed_build_spv(dtype, false).expect("native streamed GEMV spv");
@@ -3932,7 +3979,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        assert_native_k("linear_add_native_at", in_f);
+        assert_native_gemv_k("linear_add_native_at", dtype, in_f);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
@@ -10249,6 +10296,22 @@ impl<'a> Recorder<'a> {
         cc: usize,
         kconv: usize,
     ) {
+        self.conv1d_silu_trace_off(qkv, w, state, state_trace, out, rows, cc, kconv, 0);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_silu_trace_off(
+        &self,
+        qkv: &dyn Buffer,
+        w: &dyn Buffer,
+        state: &dyn Buffer,
+        state_trace: &dyn Buffer,
+        out: &dyn Buffer,
+        rows: usize,
+        cc: usize,
+        kconv: usize,
+        row_off: usize,
+    ) {
         let arena_addr = w
             .device_addr()
             .expect("resident-BDA weight: conv1d_silu_trace requires a u64 BDA device address");
@@ -10272,10 +10335,10 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             kern,
             &[
-                Self::vkb(qkv),
-                Self::vkb(qkv),
+                Self::vkb_off(qkv, row_off * cc),
+                Self::vkb_off(qkv, row_off * cc),
                 Self::vkb(state),
-                Self::vkb(out),
+                Self::vkb_off(out, row_off * cc),
                 Self::vkb(state_trace),
             ],
             3,
@@ -13041,6 +13104,13 @@ mod tests {
     use infr_core::{backend::BufferUsage, Backend};
 
     #[test]
+    fn splitk_reduce_uses_logical_output_and_padded_partial_stride() {
+        assert_eq!(splitk_reduce_extents(169, 2560), (432_640, 491_520));
+        assert_eq!(splitk_reduce_extents(169, 640), (108_160, 122_880));
+        assert_eq!(splitk_reduce_extents(192, 2560), (491_520, 491_520));
+    }
+
+    #[test]
     fn deep_q8_flash_split_hint_preserves_other_policies() {
         assert_eq!(flash_split_count(None, 2048, 200_000, true), 8);
         assert_eq!(flash_split_count(None, 2048, 65_535, true), 1);
@@ -15788,7 +15858,7 @@ mod tests {
         let pk = be
             .alloc(splits * mpad * n * 4, BufferUsage::Activations)
             .unwrap();
-        let bc = be.alloc(mpad * n * 4, BufferUsage::Readback).unwrap();
+        let bc = be.alloc(m * n * 4, BufferUsage::Readback).unwrap();
         let rec = be.recorder().unwrap();
         rec.matmul_native_splitk(
             infr_core::DType::F16,
@@ -15804,7 +15874,7 @@ mod tests {
             false,
         );
         rec.finish().unwrap();
-        let mut bytes = vec![0u8; mpad * n * 4];
+        let mut bytes = vec![0u8; m * n * 4];
         be.download(bc.as_ref(), &mut bytes).unwrap();
         let got: &[f32] = bytemuck::cast_slice(&bytes);
         let mut e = 0f32;

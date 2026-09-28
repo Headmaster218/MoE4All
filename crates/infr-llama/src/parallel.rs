@@ -34,7 +34,7 @@
 
 use crate::sampling::{ParallelSampler, RequestCtx, RequestSampling, StepGate};
 use crate::seam::SeamKv;
-use crate::session_cache::SessionCache;
+use crate::session_cache::{MtpCacheSource, SessionCache};
 use crate::{Config, GenStats, SeamModel};
 use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
@@ -49,6 +49,7 @@ const DECODE_BATCH_WAIT: Duration = Duration::from_secs(1);
 const PREFILL_COHORT_WAIT: Duration = Duration::from_millis(50);
 const MAX_DECODE_BATCH: usize = 8;
 const SHORT_PREFILL_TOKENS: usize = 96;
+const MTP_PLAIN_SYNC_QUANTUM: usize = 1024;
 
 /// One projector result handed to the text model. Kept backend-neutral so `infr-llama` does not
 /// depend on the optional vision crate.
@@ -158,6 +159,30 @@ fn expand_multimodal_prompt(
             decode_base: cursor,
         },
     ))
+}
+
+fn multimodal_token_position(plan: Option<&crate::seam::MropePlan>, token: usize) -> Result<i32> {
+    let Some(plan) = plan else {
+        return i32::try_from(token).map_err(|_| anyhow!("text position exceeds i32"));
+    };
+    let prompt_len = plan.prompt_pos4.len() / 4;
+    if token < prompt_len {
+        return Ok(plan.prompt_pos4[token * 4]);
+    }
+    let delta = i32::try_from(token - prompt_len)
+        .map_err(|_| anyhow!("multimodal decode position exceeds i32"))?;
+    plan.decode_base
+        .checked_add(delta)
+        .ok_or_else(|| anyhow!("multimodal decode position overflow"))
+}
+
+fn should_handoff_multimodal_to_scheduler(
+    scheduler_available: bool,
+    mtp_heads_present: bool,
+    frontier_is_image: bool,
+    max_new: usize,
+) -> bool {
+    scheduler_available && !mtp_heads_present && !frontier_is_image && max_new > 0
 }
 
 /// Pure continuation-slot selection (the "this conversation continuing" case of [`checkout`], and
@@ -282,6 +307,31 @@ fn phase_for_remaining_prefill(tokens: usize) -> BatchPhase {
     }
 }
 
+fn mtp_accepted_rows(candidates: &[u32], verified: &[u32]) -> usize {
+    debug_assert_eq!(verified.len(), candidates.len() + 1);
+    1 + candidates
+        .iter()
+        .zip(verified)
+        .take_while(|(candidate, target)| candidate == target)
+        .count()
+}
+
+fn mtp_prime_chunk_end(
+    start: usize,
+    prompt_len: usize,
+    chunk: usize,
+    checkpoint_boundaries: &[Option<usize>; crate::seam::TURN_CHECKPOINT_COUNT],
+) -> usize {
+    let natural_end = start.saturating_add(chunk).min(prompt_len);
+    checkpoint_boundaries
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|&boundary| start < boundary && boundary <= natural_end)
+        .min()
+        .unwrap_or(natural_end)
+}
+
 struct BatchWork {
     slot: usize,
     kv: Option<SeamKv>,
@@ -292,13 +342,133 @@ struct BatchWork {
     stats: GenStats,
     phase: BatchPhase,
     prefill_start: usize,
-    checkpoint_boundary: Option<usize>,
+    checkpoint_boundaries: [Option<usize>; crate::seam::TURN_CHECKPOINT_COUNT],
     turn_checkpoint: Option<crate::seam::TurnCheckpoint>,
     mrope_plan: Option<crate::seam::MropePlan>,
+    multimodal_key: Option<MultimodalKey>,
     finished: bool,
     sampling: RequestSampling,
     sampler: Option<ParallelSampler>,
+    reasoning_guard: crate::sampling::Qwen4ReasoningEosGuard,
+    mtp_ready: bool,
     channels: Option<BatchChannels>,
+}
+
+struct MtpSlotState {
+    head: crate::mtp::Qwen4MtpSession,
+    cached: Vec<u32>,
+    last_h: Vec<f32>,
+    turn_checkpoints:
+        [Option<crate::mtp::Qwen4MtpCheckpointState>; crate::seam::TURN_CHECKPOINT_COUNT],
+    pending_id: Option<u32>,
+    /// Whether `pending_id` has already been streamed by ordinary decode. MTP still has to feed
+    /// that row into the target, but must not stream or count it a second time.
+    pending_emitted: bool,
+    /// Ordinary decode advances the live recurrent state beyond the last speculative checkpoint.
+    target_snapshot_dirty: bool,
+    multimodal_key: Option<MultimodalKey>,
+    live_valid: bool,
+}
+
+impl MtpSlotState {
+    fn invalidate_all(&mut self) {
+        self.cached.clear();
+        self.last_h.fill(0.0);
+        self.turn_checkpoints.fill(None);
+        self.pending_id = None;
+        self.pending_emitted = false;
+        self.target_snapshot_dirty = false;
+        self.multimodal_key = None;
+        self.live_valid = false;
+    }
+
+    fn invalidate_live(&mut self) {
+        self.pending_id = None;
+        self.pending_emitted = false;
+        self.target_snapshot_dirty = false;
+        self.live_valid = false;
+    }
+
+    fn cache_state_for(&self, target: &[u32]) -> Option<crate::mtp::Qwen4MtpCacheState> {
+        (self.live_valid && self.multimodal_key.is_none() && self.cached == target).then(|| {
+            crate::mtp::Qwen4MtpCacheState {
+                cached: self.cached.clone(),
+                last_h: self.last_h.clone(),
+                turn_checkpoints: self.turn_checkpoints.clone(),
+                pending_id: self.pending_id,
+                pending_emitted: self.pending_emitted,
+            }
+        })
+    }
+
+    fn install_cache_state(&mut self, state: crate::mtp::Qwen4MtpCacheState) {
+        self.cached = state.cached;
+        self.last_h = state.last_h;
+        self.turn_checkpoints = state.turn_checkpoints;
+        self.pending_id = state.pending_id;
+        self.pending_emitted = state.pending_emitted;
+        self.target_snapshot_dirty = false;
+        self.multimodal_key = None;
+        self.live_valid = true;
+    }
+
+    fn seed_from(
+        &mut self,
+        backend: &dyn infr_core::backend::Backend,
+        source: &MtpSlotState,
+        tokens: &[u32],
+    ) -> Result<bool> {
+        if source.multimodal_key.is_some() || tokens.is_empty() {
+            self.invalidate_all();
+            return Ok(false);
+        }
+        let live = (source.live_valid && source.cached == tokens).then(|| {
+            (
+                source.last_h.clone(),
+                source.pending_id,
+                source.pending_emitted,
+            )
+        });
+        let checkpoint = source
+            .turn_checkpoints
+            .iter()
+            .flatten()
+            .find(|checkpoint| checkpoint.tokens == tokens)
+            .map(|checkpoint| (checkpoint.last_h.clone(), None, false));
+        let Some((last_h, pending_id, pending_emitted)) = live.or(checkpoint) else {
+            self.invalidate_all();
+            return Ok(false);
+        };
+        self.head
+            .copy_prefix_from(backend, &source.head, tokens.len())?;
+        self.cached.clear();
+        self.cached.extend_from_slice(tokens);
+        self.last_h = last_h;
+        self.turn_checkpoints = source.turn_checkpoints.clone().map(|checkpoint| {
+            checkpoint.filter(|checkpoint| tokens.starts_with(&checkpoint.tokens))
+        });
+        self.pending_id = pending_id;
+        self.pending_emitted = pending_emitted;
+        self.target_snapshot_dirty = false;
+        self.multimodal_key = None;
+        self.live_valid = true;
+        Ok(true)
+    }
+}
+
+fn mtp_slot_pair_mut(
+    slots: &mut [MtpSlotState],
+    target: usize,
+    source: usize,
+) -> (&mut MtpSlotState, &MtpSlotState) {
+    debug_assert_ne!(target, source);
+    if target < source {
+        let (left, right) = slots.split_at_mut(source);
+        (&mut left[target], &right[0])
+    } else {
+        let (left, right) = slots.split_at_mut(target);
+        (&mut right[0], &left[source])
+    }
 }
 
 impl BatchWork {
@@ -315,6 +485,25 @@ impl BatchWork {
     fn next_qsa_position(&self) -> usize {
         self.kv().cached_len() + 1
     }
+}
+
+fn token_lane_sort_key(
+    has_mrope: bool,
+    remaining_prefill: usize,
+    slot: usize,
+) -> (bool, std::cmp::Reverse<usize>, usize) {
+    (!has_mrope, std::cmp::Reverse(remaining_prefill), slot)
+}
+
+fn sort_token_lane_indices(active: &[BatchWork], indices: &mut [usize]) {
+    indices.sort_by_key(|&index| {
+        let work = &active[index];
+        token_lane_sort_key(
+            work.mrope_plan.is_some(),
+            work.remaining_prefill(),
+            work.slot,
+        )
+    });
 }
 
 struct BatchChannels {
@@ -469,6 +658,7 @@ fn cold_session_worker(
     cache: Arc<Mutex<SessionCache>>,
     backend: Arc<infr_vulkan::VulkanBackend>,
     gate: Option<Arc<StepGate>>,
+    mtp_heads: Option<Arc<Mutex<Vec<MtpSlotState>>>>,
     model_cfg: Config,
     idle_for: Duration,
     stop: Arc<AtomicBool>,
@@ -533,12 +723,38 @@ fn cold_session_worker(
         };
 
         let _gate = gate.as_deref().map(StepGate::enter);
+        let mut heads = mtp_heads.as_ref().map(|heads| {
+            heads
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
         let mut cache = match cache.lock() {
             Ok(cache) => cache,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let spill_failed = match cache.spill(&mut kv, backend.as_ref(), &model_cfg) {
-            Ok(true) => false,
+        let mtp_state = heads
+            .as_ref()
+            .and_then(|heads| heads[index].cache_state_for(kv.cached_tokens()));
+        let mtp_source = heads
+            .as_ref()
+            .zip(mtp_state.as_ref())
+            .map(|(heads, state)| MtpCacheSource {
+                head: &heads[index].head,
+                state,
+            });
+        let spill_failed = match cache.spill(&mut kv, backend.as_ref(), &model_cfg, mtp_source) {
+            Ok(true) => {
+                if let Some(heads) = heads.as_mut() {
+                    if let Err(error) = heads[index].head.release_kv(backend.as_ref()) {
+                        tracing::warn!(
+                            slot = index,
+                            "cold KV idle spill could not release stale MTP head KV: {error}"
+                        );
+                    }
+                    heads[index].invalidate_all();
+                }
+                false
+            }
             Ok(false) => kv.cached_len() != 0,
             Err(error) => {
                 tracing::warn!(
@@ -552,6 +768,7 @@ fn cold_session_worker(
             tracing::warn!("cold KV cache maintenance failed: {error}");
         }
         drop(cache);
+        drop(heads);
         drop(_gate);
 
         let mut pool_guard = match pool.lock() {
@@ -586,8 +803,8 @@ pub struct ParallelSeam {
     /// Set only when the scheduler has new work to admit. The runner polls it once per
     /// aggregated token; an empty steady-state decode takes no queue lock.
     batch_interrupt: Arc<AtomicBool>,
-    /// The GPU baton. `None` when `n_slots == 1`: a lone sequence must not pay even a mutex per
-    /// token, and single-request decode speed is a hard non-regression requirement.
+    /// The GPU baton. Ordinary one-slot serving keeps this absent; one-slot MTP uses it to hand
+    /// work to the persistent speculative scheduler.
     gate: Option<Arc<StepGate>>,
     /// Opt-in disk-backed conversation catalog. `None` keeps the pre-existing checkout path
     /// byte-for-byte isolated from file I/O and cache locking.
@@ -600,6 +817,7 @@ pub struct ParallelSeam {
     /// current [`crate::seam::PlacementScope`] around placement (construction/warmup) and every
     /// request's decode; concurrent requests on THIS engine all point at this one shared cell.
     pins: Arc<crate::seam::PlacementPins>,
+    mtp_heads: Option<Arc<Mutex<Vec<MtpSlotState>>>>,
 }
 
 impl ParallelSeam {
@@ -666,12 +884,60 @@ impl ParallelSeam {
         vk: infr_vulkan::VulkanBackend,
     ) -> Result<Self> {
         let n_slots = n_slots.max(1);
+        if model.engine_cfg().spec.mtp && model.config().qwen4exp && n_slots > 2 {
+            return Err(anyhow!("Qwen3.8 concurrent MTP supports at most two slots"));
+        }
         // This engine's own placement pins, entered as the current scope for the whole
         // placement phase (the clamp inside `vulkan_slot_ctx` + the `init_slots` warmup, which is
         // where the binder pins the prefill chunk / auto-q8 KV). See `PlacementPins`.
         let pins = Arc::new(crate::seam::PlacementPins::for_slots(n_slots));
         let scope = crate::seam::PlacementScope::enter(pins.clone());
         let max_ctx = model.vulkan_slot_ctx(&vk, n_slots, want_ctx)?;
+        let mtp_heads = if model.engine_cfg().spec.mtp && model.config().qwen4exp {
+            let sampler = crate::sampling::Sampler::from_cfg(&model.engine_cfg().sampling);
+            if sampler.temp > 0.0 && sampler.top_k != 1 {
+                tracing::warn!(
+                    "Qwen3.8 MTP scheduler is greedy-only; requests use ordinary decode unless temperature is 0 or top_k is 1"
+                );
+            }
+            let sidecar = model
+                .engine_cfg()
+                .spec
+                .draft
+                .as_deref()
+                .ok_or_else(|| anyhow!("Qwen3.8 MTP needs a draft sidecar"))?;
+            let fixed =
+                crate::mtp::Qwen4MtpSession::load_fixed_vulkan(&vk, sidecar, model.config())?;
+            let catch = crate::mtp::Qwen4MtpSession::shared_catch_workspace(
+                &vk,
+                &fixed,
+                max_ctx,
+                crate::seam::ubatch_rows(model.engine_cfg()),
+            )?;
+            let mut heads = Vec::with_capacity(n_slots);
+            for _ in 0..n_slots {
+                heads.push(MtpSlotState {
+                    head: crate::mtp::Qwen4MtpSession::with_fixed_and_catch(
+                        &vk,
+                        Arc::clone(&fixed),
+                        max_ctx,
+                        Arc::clone(&catch),
+                    )?,
+                    cached: Vec::new(),
+                    last_h: vec![0.0; model.config().hc_mult * model.config().n_embd],
+                    turn_checkpoints: std::array::from_fn(|_| None),
+                    pending_id: None,
+                    pending_emitted: false,
+                    target_snapshot_dirty: false,
+                    multimodal_key: None,
+                    live_valid: false,
+                });
+            }
+            Some(Arc::new(Mutex::new(heads)))
+        } else {
+            None
+        };
+        let scheduler_enabled = n_slots > 1 || mtp_heads.is_some();
         let session_idle = Duration::from_secs(model.engine_cfg().kv.session_idle_secs);
         let mut engine = Self {
             scheduler_worker: None,
@@ -686,13 +952,14 @@ impl ParallelSeam {
             decode_batch: Arc::new(Mutex::new(DecodeBatchQueue::default())),
             decode_ready: Arc::new(Condvar::new()),
             batch_interrupt: Arc::new(AtomicBool::new(false)),
-            // A 1-slot server has nothing to take turns with — keep it on the exact uncontended
-            // path `infr run` takes (see `RequestCtx::gate_pass`: `None` constructs nothing).
-            gate: (n_slots > 1).then(|| Arc::new(StepGate::new())),
+            // Ordinary one-slot serving has no scheduler. MTP needs the gate even with one slot
+            // because the request thread hands ownership to the persistent speculative worker.
+            gate: scheduler_enabled.then(|| Arc::new(StepGate::new())),
             session_cache: None,
             session_idle,
             max_ctx,
             pins,
+            mtp_heads,
         };
         engine.init_slots(n_slots)?;
         engine.init_session_cache()?;
@@ -742,6 +1009,7 @@ impl ParallelSeam {
         let backend = Arc::clone(&self.vk);
         let gate = self.gate.as_ref().map(Arc::clone);
         let model_cfg = self.model.config().clone();
+        let mtp_heads = self.mtp_heads.as_ref().map(Arc::clone);
         let idle = self.session_idle;
         let thread = std::thread::Builder::new()
             .name("infr-kv-cold".into())
@@ -752,6 +1020,7 @@ impl ParallelSeam {
                     cache,
                     backend,
                     gate,
+                    mtp_heads,
                     model_cfg,
                     idle,
                     worker_stop,
@@ -784,6 +1053,7 @@ impl ParallelSeam {
             session_idle: self.session_idle,
             max_ctx: self.max_ctx,
             pins: Arc::clone(&self.pins),
+            mtp_heads: self.mtp_heads.as_ref().map(Arc::clone),
         }
     }
 
@@ -816,7 +1086,11 @@ impl ParallelSeam {
         let req = RequestCtx::with_gate(crate::sampling::RequestSampling::default(), gate);
         let _scope = crate::seam::PlacementScope::enter(Arc::clone(&self.pins));
         while let Some(work) = self.wait_for_scheduler_work(stop.as_ref()) {
-            self.run_unified_batch(work, &req);
+            if self.mtp_heads.is_some() {
+                self.run_mtp_batch(work, &req);
+            } else {
+                self.run_unified_batch(work, &req);
+            }
         }
         self.close_decode_batch(Some("parallel scheduler is shutting down"));
     }
@@ -873,7 +1147,7 @@ impl ParallelSeam {
                 |_| {},
                 &mut slot0,
                 self.max_ctx,
-                Some(crate::seam::TurnCheckpoint::Enable),
+                Some(crate::seam::TurnCheckpoint::ENABLED),
                 None, // constraint
                 None, // req: startup, not a request — env sampling, no gate
                 None, // multimodal plan
@@ -1013,7 +1287,8 @@ impl ParallelSeam {
                 if s.multimodal_key.is_some() {
                     0
                 } else {
-                    s.kv.as_ref().map_or(0, |k| k.prefix_score(prompt))
+                    s.kv.as_ref()
+                        .map_or(0, |k| k.seedable_prefix_len(cfg, prompt))
                 }
             };
             // 1. This conversation continuing: the free slot with the LONGEST reusable prefix among
@@ -1064,12 +1339,34 @@ impl ParallelSeam {
                         let src = p.slots[best].kv.take().expect("scored slot is Some");
                         let mut dst = p.slots[target].kv.take();
                         drop(p);
-                        let r = {
+                        let r: Result<usize> = {
                             let _gp = req.gate_pass();
-                            match dst.as_mut() {
+                            let seeded = match dst.as_mut() {
                                 Some(dst) => dst.seed_from(self.vk.as_ref(), cfg, ec, &src, best_s),
-                                None => Ok(()),
-                            }
+                                None => Ok(0),
+                            };
+                            seeded.inspect(|&seeded| {
+                                if seeded != 0 {
+                                    if let Some(heads) = &self.mtp_heads {
+                                        let mut heads = heads.lock().expect("MTP heads poisoned");
+                                        let tokens = &src.cached_tokens()[..seeded];
+                                        let (target_lane, source_lane) =
+                                            mtp_slot_pair_mut(&mut heads, target, best);
+                                        if let Err(error) = target_lane.seed_from(
+                                            self.vk.as_ref(),
+                                            source_lane,
+                                            tokens,
+                                        ) {
+                                            target_lane.invalidate_all();
+                                            tracing::warn!(
+                                                slot = target,
+                                                source_slot = best,
+                                                "MTP prefix seed failed; preserving the seeded main KV and using ordinary decode: {error}"
+                                            );
+                                        }
+                                    }
+                                }
+                            })
                         };
                         p = self.pool.lock().expect("pool poisoned");
                         // Return the source slot's KV and release its reservation; `target` stays
@@ -1080,6 +1377,12 @@ impl ParallelSeam {
                         // A failed seed costs only the prefix reuse — the slot re-prefills from
                         // scratch and the answer is identical. Never fail the request for it.
                         if let Err(e) = r {
+                            if let Some(kv) = p.slots[target].kv.as_mut() {
+                                kv.reset();
+                            }
+                            if let Some(heads) = &self.mtp_heads {
+                                heads.lock().expect("MTP heads poisoned")[target].invalidate_all();
+                            }
                             tracing::warn!(
                                 "kv slots: prefix seed failed ({e}); re-prefilling instead"
                             );
@@ -1098,6 +1401,9 @@ impl ParallelSeam {
             if incompatible {
                 if let Some(kv) = kv.as_mut() {
                     kv.reset();
+                }
+                if let Some(heads) = &self.mtp_heads {
+                    heads.lock().expect("MTP heads poisoned")[target].invalidate_all();
                 }
             }
             return Ok(SlotGuard {
@@ -1140,7 +1446,7 @@ impl ParallelSeam {
                 }),
                 prompt.len(),
             );
-            let resident_prefix = continuation
+            let continuation_prefix = continuation
                 .and_then(|index| {
                     pool.slots[index]
                         .kv
@@ -1158,6 +1464,26 @@ impl ParallelSeam {
                     })
                     .expect("free is non-empty")
             });
+            let seed_source = continuation
+                .is_none()
+                .then(|| {
+                    free.iter()
+                        .copied()
+                        .filter(|&index| {
+                            index != target && pool.slots[index].multimodal_key.is_none()
+                        })
+                        .filter_map(|index| {
+                            let prefix = pool.slots[index]
+                                .kv
+                                .as_ref()
+                                .map_or(0, |kv| kv.seedable_prefix_len(cfg, prompt));
+                            (prefix >= 16).then_some((index, prefix))
+                        })
+                        .max_by_key(|&(_, prefix)| prefix)
+                })
+                .flatten();
+            let resident_prefix =
+                continuation_prefix.max(seed_source.map_or(0, |(_, prefix)| prefix));
 
             pool.tick += 1;
             let tick = pool.tick;
@@ -1166,12 +1492,25 @@ impl ParallelSeam {
             pool.slots[target].idle_since = None;
             let incompatible = pool.slots[target].multimodal_key.take().is_some();
             let mut target_kv = pool.slots[target].kv.take();
+            let mut seed_kv = seed_source.map(|(source, prefix)| {
+                pool.slots[source].busy = true;
+                pool.slots[source].idle_since = None;
+                let kv = pool.slots[source]
+                    .kv
+                    .take()
+                    .expect("scored cold-cache seed slot has KV");
+                (source, prefix, kv)
+            });
             drop(pool);
 
             {
                 // One pass owns both the inference baton and the cache catalog. No other request
                 // can submit against a state buffer while it is being downloaded or restored.
                 let _gate = req.gate_pass();
+                let mut heads = self
+                    .mtp_heads
+                    .as_ref()
+                    .map(|heads| heads.lock().expect("MTP heads poisoned"));
                 let mut cache = match cache_mutex.lock() {
                     Ok(cache) => cache,
                     Err(poisoned) => poisoned.into_inner(),
@@ -1180,6 +1519,9 @@ impl ParallelSeam {
                     if let Some(kv) = target_kv.as_mut() {
                         kv.reset();
                     }
+                    if let Some(heads) = heads.as_mut() {
+                        heads[target].invalidate_all();
+                    }
                 }
 
                 let cold_prefix = cache.best_continuation_len(prompt);
@@ -1187,10 +1529,31 @@ impl ParallelSeam {
                     .then(|| cache.take_best_continuation(prompt))
                     .flatten();
                 if let (Some(entry), Some(kv)) = (cold, target_kv.as_mut()) {
+                    tracing::info!(
+                        slot = target,
+                        cached_prefix_tokens = cold_prefix,
+                        "cold KV reusable prefix hit"
+                    );
                     let mut released = false;
                     if kv.cached_len() != 0 {
-                        match cache.spill(kv, self.vk.as_ref(), cfg) {
-                            Ok(true) => released = true,
+                        let mtp_state = heads
+                            .as_ref()
+                            .and_then(|heads| heads[target].cache_state_for(kv.cached_tokens()));
+                        let mtp_source =
+                            heads
+                                .as_ref()
+                                .zip(mtp_state.as_ref())
+                                .map(|(heads, state)| MtpCacheSource {
+                                    head: &heads[target].head,
+                                    state,
+                                });
+                        match cache.spill(kv, self.vk.as_ref(), cfg, mtp_source) {
+                            Ok(true) => {
+                                released = true;
+                                if let Some(heads) = heads.as_mut() {
+                                    heads[target].invalidate_all();
+                                }
+                            }
                             Ok(false) => {}
                             Err(error) => {
                                 tracing::warn!(
@@ -1198,6 +1561,9 @@ impl ParallelSeam {
                                     "cold KV replacement spill failed; recycling the slot: {error}"
                                 );
                                 kv.reset();
+                                if let Some(heads) = heads.as_mut() {
+                                    heads[target].invalidate_all();
+                                }
                             }
                         }
                     }
@@ -1206,12 +1572,36 @@ impl ParallelSeam {
                             || kv.release_session_state(self.vk.as_ref(), cfg).is_ok();
                     }
                     if released {
-                        match cache.restore(entry, kv, self.vk.as_ref(), cfg) {
-                            Ok(()) => {}
-                            Err(error) => tracing::warn!(
-                                slot = target,
-                                "cold KV restore failed; re-prefilling the request: {error}"
-                            ),
+                        if let Some(heads) = heads.as_mut() {
+                            if let Err(error) = heads[target].head.release_kv(self.vk.as_ref()) {
+                                tracing::warn!(
+                                    slot = target,
+                                    "cold KV replacement could not release stale MTP head KV: {error}"
+                                );
+                            }
+                            heads[target].invalidate_all();
+                        }
+                        let mtp_head = heads.as_ref().map(|heads| &heads[target].head);
+                        match cache.restore(entry, kv, self.vk.as_ref(), cfg, mtp_head) {
+                            Ok(Some(state)) => {
+                                if let Some(heads) = heads.as_mut() {
+                                    heads[target].install_cache_state(state);
+                                }
+                            }
+                            Ok(None) => {
+                                if let Some(heads) = heads.as_mut() {
+                                    heads[target].invalidate_all();
+                                }
+                            }
+                            Err(error) => {
+                                if let Some(heads) = heads.as_mut() {
+                                    heads[target].invalidate_all();
+                                }
+                                tracing::warn!(
+                                    slot = target,
+                                    "cold KV restore failed; re-prefilling the request: {error}"
+                                );
+                            }
                         }
                     } else {
                         tracing::warn!(
@@ -1220,21 +1610,96 @@ impl ParallelSeam {
                         );
                         cache.return_entry(entry);
                         kv.reset();
+                        if let Some(heads) = heads.as_mut() {
+                            heads[target].invalidate_all();
+                        }
                     }
                 } else if continuation.is_none() {
                     if let Some(kv) = target_kv.as_mut().filter(|kv| kv.cached_len() != 0) {
-                        if let Err(error) = cache.spill(kv, self.vk.as_ref(), cfg) {
+                        let mtp_state = heads
+                            .as_ref()
+                            .and_then(|heads| heads[target].cache_state_for(kv.cached_tokens()));
+                        let mtp_source =
+                            heads
+                                .as_ref()
+                                .zip(mtp_state.as_ref())
+                                .map(|(heads, state)| MtpCacheSource {
+                                    head: &heads[target].head,
+                                    state,
+                                });
+                        if let Err(error) = cache.spill(kv, self.vk.as_ref(), cfg, mtp_source) {
                             tracing::warn!(
                                 slot = target,
                                 "cold KV replacement spill failed; forgetting the old conversation: {error}"
                             );
                             kv.reset();
+                            if let Some(heads) = heads.as_mut() {
+                                heads[target].invalidate_all();
+                            }
+                        } else if let Some(heads) = heads.as_mut() {
+                            if let Err(error) = heads[target].head.release_kv(self.vk.as_ref()) {
+                                tracing::warn!(
+                                    slot = target,
+                                    "cold KV seed target could not release stale MTP head KV: {error}"
+                                );
+                            }
+                            heads[target].invalidate_all();
+                        }
+                    }
+                    if let (Some(kv), Some((source, prefix, source_kv))) =
+                        (target_kv.as_mut(), seed_kv.as_ref())
+                    {
+                        match kv.seed_from(
+                            self.vk.as_ref(),
+                            cfg,
+                            self.model.engine_cfg(),
+                            source_kv,
+                            *prefix,
+                        ) {
+                            Ok(seeded) if seeded != 0 => {
+                                if let Some(heads) = heads.as_mut() {
+                                    let tokens = &source_kv.cached_tokens()[..seeded];
+                                    let (target_lane, source_lane) =
+                                        mtp_slot_pair_mut(heads, target, *source);
+                                    if let Err(error) =
+                                        target_lane.seed_from(self.vk.as_ref(), source_lane, tokens)
+                                    {
+                                        target_lane.invalidate_all();
+                                        tracing::warn!(
+                                            slot = target,
+                                            source_slot = *source,
+                                            "cold-cache MTP prefix seed failed; preserving the seeded main KV and using ordinary decode: {error}"
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                kv.reset();
+                                if let Some(heads) = heads.as_mut() {
+                                    heads[target].invalidate_all();
+                                }
+                                tracing::warn!(
+                                    slot = target,
+                                    source_slot = *source,
+                                    "cold-cache resident prefix seed failed; re-prefilling instead: {error}"
+                                );
+                            }
                         }
                     }
                 }
                 if let Err(error) = cache.gc() {
                     tracing::warn!("cold KV cache maintenance failed: {error}");
                 }
+            }
+
+            if let Some((source, _, source_kv)) = seed_kv.take() {
+                let mut pool = self.pool.lock().expect("pool poisoned");
+                pool.slots[source].kv = Some(source_kv);
+                pool.slots[source].busy = false;
+                pool.slots[source].idle_since = Some(Instant::now());
+                drop(pool);
+                self.freed.notify_all();
             }
 
             return Ok(SlotGuard {
@@ -1301,6 +1766,9 @@ impl ParallelSeam {
                     if let Some(kv) = kv.as_mut() {
                         kv.reset();
                     }
+                    if let Some(heads) = &self.mtp_heads {
+                        heads.lock().expect("MTP heads poisoned")[target].invalidate_all();
+                    }
                 }
                 return SlotGuard {
                     engine: self,
@@ -1364,14 +1832,32 @@ impl ParallelSeam {
                     if let Some(kv) = kv.as_mut().filter(|kv| kv.cached_len() != 0) {
                         if old_key.is_some() {
                             kv.reset();
+                            if let Some(heads) = &self.mtp_heads {
+                                heads.lock().expect("MTP heads poisoned")[target].invalidate_all();
+                            }
                         } else {
                             let _gate = req.gate_pass();
+                            let mut heads = self
+                                .mtp_heads
+                                .as_ref()
+                                .map(|heads| heads.lock().expect("MTP heads poisoned"));
                             let mut cache = match cache_mutex.lock() {
                                 Ok(cache) => cache,
                                 Err(poisoned) => poisoned.into_inner(),
                             };
+                            let mtp_state = heads.as_ref().and_then(|heads| {
+                                heads[target].cache_state_for(kv.cached_tokens())
+                            });
+                            let mtp_source =
+                                heads
+                                    .as_ref()
+                                    .zip(mtp_state.as_ref())
+                                    .map(|(heads, state)| MtpCacheSource {
+                                        head: &heads[target].head,
+                                        state,
+                                    });
                             if let Err(error) =
-                                cache.spill(kv, self.vk.as_ref(), self.model.config())
+                                cache.spill(kv, self.vk.as_ref(), self.model.config(), mtp_source)
                             {
                                 tracing::warn!(
                                     slot = target,
@@ -1379,12 +1865,25 @@ impl ParallelSeam {
                                 );
                                 kv.reset();
                             }
+                            if let Some(heads) = heads.as_mut() {
+                                if let Err(error) = heads[target].head.release_kv(self.vk.as_ref())
+                                {
+                                    tracing::warn!(
+                                        slot = target,
+                                        "multimodal checkout could not release stale MTP head KV: {error}"
+                                    );
+                                }
+                                heads[target].invalidate_all();
+                            }
                             if let Err(error) = cache.gc() {
                                 tracing::warn!("cold KV cache maintenance failed: {error}");
                             }
                         }
                     } else if let Some(kv) = kv.as_mut() {
                         kv.reset();
+                        if let Some(heads) = &self.mtp_heads {
+                            heads.lock().expect("MTP heads poisoned")[target].invalidate_all();
+                        }
                     }
                 }
                 return SlotGuard {
@@ -1465,6 +1964,18 @@ impl ParallelSeam {
             .kv
             .take()
             .expect("completed decode work owns a KV slot");
+        if self.model.engine_cfg().debug.state_trace {
+            let checkpoints = kv
+                .session_state_meta()
+                .checkpoint_tokens
+                .map(|tokens| tokens.map(|tokens| tokens.len()));
+            tracing::warn!(
+                "[parallel state trace] slot={} complete target={} recurrent_checkpoints={:?}",
+                work.slot,
+                kv.cached_len(),
+                checkpoints,
+            );
+        }
         let Some(channels) = work.channels.take() else {
             self.return_detached_slot(work.slot, kv);
             return;
@@ -1705,7 +2216,7 @@ impl ParallelSeam {
             )?
         };
         work.prefill_start = prepared.start;
-        work.checkpoint_boundary = prepared.checkpoint_boundary;
+        work.checkpoint_boundaries = prepared.checkpoint_boundaries;
         work.stats.n_prompt = work
             .stats
             .n_prompt
@@ -1746,7 +2257,7 @@ impl ParallelSeam {
             .iter()
             .map(|work| crate::seam::PreparedParallelPrompt {
                 start: work.prefill_start,
-                checkpoint_boundary: work.checkpoint_boundary,
+                checkpoint_boundaries: work.checkpoint_boundaries,
             })
             .collect::<Vec<_>>();
         let progress_senders = long
@@ -1821,7 +2332,7 @@ impl ParallelSeam {
         for (work, stats) in long.iter_mut().zip(stats) {
             work.stats.prompt_secs += stats.prompt_secs;
             work.phase = BatchPhase::Decode;
-            work.checkpoint_boundary = None;
+            work.checkpoint_boundaries = [None; crate::seam::TURN_CHECKPOINT_COUNT];
             let progress = infr_core::GenerationProgress {
                 phase: infr_core::GenerationPhase::Prefill,
                 prompt_tokens: work.prompt_end as u64,
@@ -1849,12 +2360,191 @@ impl ParallelSeam {
         Ok(())
     }
 
+    fn materialize_mtp_frontiers(&self, active: &mut [BatchWork], indices: &[usize]) -> Result<()> {
+        let heads = self.mtp_heads.as_ref().expect("MTP scheduler has heads");
+        for &index in indices {
+            let (pending, already_emitted) = {
+                let heads = heads.lock().expect("MTP heads poisoned");
+                let work = &active[index];
+                let lane = &heads[work.slot];
+                anyhow::ensure!(
+                    lane.cached.as_slice() == work.kv().cached_tokens(),
+                    "MTP lane {} target and head prefixes diverged before plain decode",
+                    work.slot
+                );
+                let pending = lane.pending_id.ok_or_else(|| {
+                    anyhow!("MTP lane {} has no frontier for plain decode", work.slot)
+                })?;
+                if lane.pending_emitted {
+                    anyhow::ensure!(
+                        work.prompt.len() == lane.cached.len() + 1
+                            && work.prompt.last() == Some(&pending),
+                        "MTP lane {} has an invalid emitted frontier",
+                        work.slot
+                    );
+                } else {
+                    anyhow::ensure!(
+                        work.prompt.as_slice() == lane.cached.as_slice(),
+                        "MTP lane {} has an invalid uncommitted frontier",
+                        work.slot
+                    );
+                }
+                (pending, lane.pending_emitted)
+            };
+            if already_emitted {
+                continue;
+            }
+
+            let work = &mut active[index];
+            let eos = !self.model.engine_cfg().sampling.ignore_eos
+                && (self.model.config().eos_ids.contains(&pending)
+                    || pending == self.model.config().eos);
+            let mut committed = eos;
+            let mut stopped = eos;
+            if !eos {
+                let progress = self.batch_decode_progress(
+                    work.prompt_end,
+                    work.prefill_start,
+                    work.generated + 1,
+                );
+                let Some(channels) = work.channels.as_ref() else {
+                    work.finished = true;
+                    continue;
+                };
+                if channels
+                    .events
+                    .send(BatchEvent::Token {
+                        id: pending,
+                        progress,
+                    })
+                    .is_ok()
+                {
+                    committed = true;
+                    stopped = !channels.acknowledgements.recv().unwrap_or(false);
+                } else {
+                    stopped = true;
+                }
+            }
+            if committed {
+                work.prompt.push(pending);
+                work.reasoning_guard.observe(self.model.config(), pending);
+                work.generated += 1;
+                work.stats.n_gen += 1;
+                heads.lock().expect("MTP heads poisoned")[work.slot].pending_emitted = true;
+            }
+            work.finished = stopped || work.generated >= work.max_new;
+        }
+        Ok(())
+    }
+
+    fn sync_mtp_after_plain_decode(
+        &self,
+        active: &[BatchWork],
+        indices: &[usize],
+        outputs: &[Vec<u32>],
+        hidden: &[Vec<f32>],
+    ) -> Result<()> {
+        let cfg = self.model.config();
+        let h_width = cfg.hc_mult * cfg.n_embd;
+        anyhow::ensure!(
+            outputs.len() == indices.len() && hidden.len() == indices.len(),
+            "plain decode returned an incomplete MTP synchronization trace"
+        );
+        let mut heads = self
+            .mtp_heads
+            .as_ref()
+            .expect("MTP scheduler has heads")
+            .lock()
+            .expect("MTP heads poisoned");
+        for (lane_index, &index) in indices.iter().enumerate() {
+            let work = &active[index];
+            if !work.mtp_ready {
+                continue;
+            }
+            let lane = &mut heads[work.slot];
+            anyhow::ensure!(
+                lane.pending_emitted,
+                "MTP lane {} entered plain decode with an unstreamed frontier",
+                work.slot
+            );
+            let target = work.kv().cached_tokens();
+            anyhow::ensure!(
+                target.starts_with(&lane.cached),
+                "MTP lane {} target no longer extends the head prefix",
+                work.slot
+            );
+            let start = lane.cached.len();
+            let rows = target.len() - start;
+            anyhow::ensure!(
+                rows > 0
+                    && outputs[lane_index].len() == rows
+                    && hidden[lane_index].len() == rows * h_width,
+                "MTP lane {} plain synchronization has rows={rows}, outputs={}, hidden={} (width {h_width})",
+                work.slot,
+                outputs[lane_index].len(),
+                hidden[lane_index].len()
+            );
+            let mut shifted = vec![0.0f32; rows * h_width];
+            shifted[..h_width].copy_from_slice(&lane.last_h);
+            if rows > 1 {
+                shifted[h_width..].copy_from_slice(&hidden[lane_index][..(rows - 1) * h_width]);
+            }
+            let catch_up_t0 = Instant::now();
+            lane.head.catch_up(
+                self.vk.as_ref(),
+                &target[start..],
+                &shifted,
+                start,
+                work.mrope_plan.as_ref(),
+                work.kv().mtp_shared_weights(),
+            )?;
+            tracing::debug!(
+                slot = work.slot,
+                rows,
+                elapsed_ms = catch_up_t0.elapsed().as_secs_f64() * 1e3,
+                "synchronized MTP head after ordinary concurrent decode"
+            );
+            lane.cached.extend_from_slice(&target[start..]);
+            lane.last_h
+                .copy_from_slice(&hidden[lane_index][(rows - 1) * h_width..]);
+            lane.pending_id = outputs[lane_index].last().copied();
+            lane.pending_emitted = true;
+            lane.target_snapshot_dirty = true;
+            lane.live_valid = true;
+        }
+        Ok(())
+    }
+
+    fn refresh_mtp_snapshots(&self, active: &mut [BatchWork], indices: &[usize]) -> Result<()> {
+        let cfg = self.model.config();
+        let mut heads = self
+            .mtp_heads
+            .as_ref()
+            .expect("MTP scheduler has heads")
+            .lock()
+            .expect("MTP heads poisoned");
+        for &index in indices {
+            let work = &mut active[index];
+            let lane = &mut heads[work.slot];
+            if !lane.target_snapshot_dirty {
+                continue;
+            }
+            work.kv
+                .as_mut()
+                .expect("MTP work has target KV")
+                .mtp_snapshot_delta(self.vk.as_ref(), cfg)?;
+            lane.target_snapshot_dirty = false;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_token_group(
         &self,
         active: &mut [BatchWork],
         indices: &[usize],
         quantum: usize,
+        sync_mtp: bool,
     ) -> Result<()> {
         if indices.is_empty() {
             return Ok(());
@@ -1884,7 +2574,7 @@ impl ParallelSeam {
             .collect::<Vec<_>>();
         let checkpoints = indices
             .iter()
-            .map(|&index| active[index].checkpoint_boundary)
+            .map(|&index| active[index].checkpoint_boundaries)
             .collect::<Vec<_>>();
         let mut owned_mrope_plans = indices
             .iter()
@@ -1912,6 +2602,10 @@ impl ParallelSeam {
                     .take()
                     .expect("parallel token work owns a sampler")
             })
+            .collect::<Vec<_>>();
+        let mut reasoning_guards = indices
+            .iter()
+            .map(|&index| active[index].reasoning_guard)
             .collect::<Vec<_>>();
         let mut channels = indices
             .iter()
@@ -1970,9 +2664,11 @@ impl ParallelSeam {
             &mut peers,
             self.max_ctx,
             &mut samplers,
+            &mut reasoning_guards,
             &mut stream,
             Some(&self.batch_interrupt),
             Some(&group_req),
+            sync_mtp,
         );
 
         active[indices[0]].kv = primary;
@@ -1982,6 +2678,9 @@ impl ParallelSeam {
         for (&index, sampler) in indices.iter().zip(samplers) {
             active[index].sampler = Some(sampler);
         }
+        for (&index, guard) in indices.iter().zip(reasoning_guards) {
+            active[index].reasoning_guard = guard;
+        }
         for (&index, channel) in indices.iter().zip(channels) {
             active[index].channels = channel;
         }
@@ -1990,7 +2689,10 @@ impl ParallelSeam {
             active[index].mrope_plan = plan;
         }
 
-        let (outputs, prompt_secs, decode_secs) = result?;
+        let result = result?;
+        let outputs = result.tokens;
+        let prompt_secs = result.prompt_secs;
+        let decode_secs = result.decode_secs;
         if outputs.len() != indices.len()
             || prompt_secs.len() != indices.len()
             || decode_secs.len() != indices.len()
@@ -1998,6 +2700,9 @@ impl ParallelSeam {
             return Err(anyhow!(
                 "parallel token runner returned inconsistent lane counts"
             ));
+        }
+        if sync_mtp {
+            self.sync_mtp_after_plain_decode(active, indices, &outputs, &result.hidden)?;
         }
         let cfg = self.model.config();
         for (lane, &index) in indices.iter().enumerate() {
@@ -2007,11 +2712,11 @@ impl ParallelSeam {
             work.generated += outputs[lane].len();
             work.stats.n_gen += outputs[lane].len();
             work.prompt.extend_from_slice(&outputs[lane]);
-            if work
-                .checkpoint_boundary
-                .is_some_and(|boundary| work.kv().cached_len() >= boundary)
-            {
-                work.checkpoint_boundary = None;
+            let cached_len = work.kv().cached_len();
+            for boundary in &mut work.checkpoint_boundaries {
+                if boundary.is_some_and(|boundary| cached_len >= boundary) {
+                    *boundary = None;
+                }
             }
             work.phase = phase_for_remaining_prefill(work.remaining_prefill());
             let eos = outputs[lane].last().is_some_and(|token| {
@@ -2056,12 +2761,664 @@ impl ParallelSeam {
 
     fn fail_unified_scheduler(&self, active: &mut Vec<BatchWork>, error: anyhow::Error) {
         let message = error.to_string();
+        if let Some(heads) = &self.mtp_heads {
+            let mut heads = heads.lock().expect("MTP heads poisoned");
+            for work in active.iter() {
+                heads[work.slot].invalidate_live();
+            }
+        }
         for work in active.drain(..) {
             self.fail_batch_work(work, &message);
         }
         self.close_decode_batch(Some(&message));
         self.vk.release_primary_runtime_after_cohort_shrink();
         tracing::warn!(%error, "parallel scheduler batch failed");
+    }
+
+    fn prime_mtp_work(&self, work: &mut BatchWork, req: &RequestCtx) -> Result<()> {
+        if work.phase != BatchPhase::Unprepared {
+            return Ok(());
+        }
+        let cfg = self.model.config();
+        let ec = self.model.engine_cfg();
+        let h_width = cfg.hc_mult * cfg.n_embd;
+        let prompt = &work.prompt[..work.prompt_end];
+        let _gate = req.gate_pass();
+        let prepared = crate::seam::prepare_dense_vulkan_parallel_prompt_session(
+            self.vk.as_ref(),
+            cfg,
+            ec,
+            work.kv.as_mut().expect("MTP work has target KV"),
+            prompt,
+            work.turn_checkpoint,
+        )?;
+        let heads = self.mtp_heads.as_ref().expect("MTP scheduler has heads");
+        let mut heads = heads.lock().expect("MTP heads poisoned");
+        let lane = &mut heads[work.slot];
+        if ec.debug.state_trace {
+            let recurrent = work
+                .kv()
+                .session_state_meta()
+                .checkpoint_tokens
+                .map(|tokens| tokens.map(|tokens| tokens.len()));
+            let head = lane.turn_checkpoints.each_ref().map(|checkpoint| {
+                checkpoint
+                    .as_ref()
+                    .map(|checkpoint| checkpoint.tokens.len())
+            });
+            tracing::warn!(
+                "[MTP state trace] slot={} target={} head_live={} recurrent_checkpoints={:?} head_checkpoints={:?}",
+                work.slot,
+                work.kv().cached_len(),
+                lane.cached.len(),
+                recurrent,
+                head,
+            );
+        }
+        for checkpoint in &mut lane.turn_checkpoints {
+            if checkpoint
+                .as_ref()
+                .is_some_and(|checkpoint| !prompt.starts_with(&checkpoint.tokens))
+            {
+                *checkpoint = None;
+            }
+        }
+        let target_prefix = work.kv().cached_tokens();
+        let reusable = lane.live_valid
+            && lane.multimodal_key == work.multimodal_key
+            && lane.cached == target_prefix
+            && prompt.starts_with(&lane.cached);
+        let restored_head = (!reusable && lane.multimodal_key == work.multimodal_key)
+            .then(|| {
+                lane.turn_checkpoints.iter().flatten().find(|checkpoint| {
+                    checkpoint.tokens.as_slice() == target_prefix
+                        && lane.cached.starts_with(&checkpoint.tokens)
+                })
+            })
+            .flatten()
+            .map(|checkpoint| (checkpoint.tokens.clone(), checkpoint.last_h.clone()));
+        if let Some((tokens, last_h)) = restored_head {
+            lane.cached = tokens;
+            lane.last_h = last_h;
+            lane.pending_id = None;
+            lane.pending_emitted = false;
+            lane.target_snapshot_dirty = false;
+            lane.live_valid = true;
+            tracing::debug!(
+                slot = work.slot,
+                cached_tokens = lane.cached.len(),
+                "restored MTP head turn checkpoint"
+            );
+        } else if !reusable && target_prefix.is_empty() {
+            lane.invalidate_all();
+            lane.multimodal_key = work.multimodal_key;
+            lane.live_valid = true;
+        } else if !reusable {
+            let start = prepared.start;
+            work.prefill_start = start;
+            work.stats.n_cached = work.stats.n_cached.saturating_add(start);
+            work.stats.n_prompt = work
+                .stats
+                .n_prompt
+                .saturating_add(prompt.len().saturating_sub(start));
+            work.checkpoint_boundaries = prepared.checkpoint_boundaries;
+            work.phase = phase_for_remaining_prefill(work.remaining_prefill());
+            work.turn_checkpoint = None;
+            work.mtp_ready = false;
+            lane.invalidate_live();
+            tracing::info!(
+                slot = work.slot,
+                cached_tokens = start,
+                prompt_tokens = prompt.len(),
+                "MTP side state is unavailable for the reusable main KV; using ordinary decode for this turn"
+            );
+            return Ok(());
+        }
+        let start = lane.cached.len();
+        anyhow::ensure!(
+            start == prepared.start,
+            "MTP lane {} restored {} tokens while the main KV restored {}",
+            work.slot,
+            start,
+            prepared.start
+        );
+        work.prefill_start = start;
+        work.stats.n_cached += start;
+        work.stats.n_prompt += prompt.len() - start;
+        let progress_events = work
+            .channels
+            .as_ref()
+            .map(|channels| channels.events.clone());
+        if let Some(events) = progress_events.as_ref() {
+            let _ = events.send(BatchEvent::Progress {
+                progress: infr_core::GenerationProgress {
+                    phase: infr_core::GenerationPhase::Prefill,
+                    prompt_tokens: work.prompt_end as u64,
+                    cached_prompt_tokens: start as u64,
+                    prefill_tokens: 0,
+                    completion_tokens: 0,
+                    context_tokens: start as u64,
+                    context_limit: self.max_ctx as u64,
+                },
+            });
+        }
+        let t0 = Instant::now();
+        let (bind, finish) = crate::seam::vulkan_moe_binder(
+            self.vk.as_ref(),
+            self.model.gguf(),
+            cfg,
+            ec,
+            false,
+            self.max_ctx,
+        )?;
+        let chunk = crate::seam::ubatch_rows(ec).max(1);
+        let checkpoint_boundaries = prepared.checkpoint_boundaries;
+        let mut chunk_start = start;
+        while chunk_start < prompt.len() {
+            let chunk_end =
+                mtp_prime_chunk_end(chunk_start, prompt.len(), chunk, &checkpoint_boundaries);
+            let rows = chunk_end - chunk_start;
+            let (mut pending, mut pending_logits, hidden) =
+                crate::mtp::run_qwen4_prime_frontier_with_finish(
+                    self.vk.as_ref(),
+                    &*bind,
+                    self.model.gguf(),
+                    cfg,
+                    ec,
+                    self.model.embd(),
+                    &prompt[..chunk_end],
+                    &mut work.kv,
+                    self.max_ctx,
+                    work.mrope_plan.as_ref(),
+                    finish.as_deref(),
+                )?;
+            if chunk_end == prompt.len()
+                && work
+                    .reasoning_guard
+                    .blocks(cfg, pending, ec.sampling.ignore_eos)
+            {
+                anyhow::ensure!(
+                    pending_logits.len() == cfg.vocab,
+                    "Qwen3.8 MTP prime EOS repair expected {} logits, got {}",
+                    cfg.vocab,
+                    pending_logits.len()
+                );
+                work.reasoning_guard.mask_eos(cfg, &mut pending_logits);
+                let blocked = pending;
+                pending = crate::mtp::argmax_row(&pending_logits);
+                tracing::warn!(
+                    slot = work.slot,
+                    blocked_token = blocked,
+                    replacement_token = pending,
+                    "Qwen3.8 MTP suppressed premature EOS inside an open reasoning block"
+                );
+            }
+            anyhow::ensure!(
+                hidden.len() == rows * h_width,
+                "MTP prime returned {} hidden values for {rows} rows",
+                hidden.len()
+            );
+            let mut shifted = vec![0.0f32; rows * h_width];
+            shifted[..h_width].copy_from_slice(&lane.last_h);
+            if rows > 1 {
+                shifted[h_width..].copy_from_slice(&hidden[..(rows - 1) * h_width]);
+            }
+            lane.head.catch_up(
+                self.vk.as_ref(),
+                &prompt[chunk_start..chunk_end],
+                &shifted,
+                chunk_start,
+                work.mrope_plan.as_ref(),
+                work.kv().mtp_shared_weights(),
+            )?;
+            for (index, boundary) in checkpoint_boundaries.iter().copied().enumerate() {
+                let Some(boundary) =
+                    boundary.filter(|&boundary| boundary > chunk_start && boundary <= chunk_end)
+                else {
+                    continue;
+                };
+                let hidden_row = boundary - chunk_start - 1;
+                work.kv
+                    .as_mut()
+                    .expect("MTP work has target KV")
+                    .capture_turn_recurrent(self.vk.as_ref(), cfg, index, &prompt[..boundary])?;
+                lane.turn_checkpoints[index] = Some(crate::mtp::Qwen4MtpCheckpointState {
+                    tokens: prompt[..boundary].to_vec(),
+                    last_h: hidden[hidden_row * h_width..(hidden_row + 1) * h_width].to_vec(),
+                });
+                if ec.debug.state_trace {
+                    let recurrent = work
+                        .kv()
+                        .session_state_meta()
+                        .checkpoint_tokens
+                        .map(|tokens| tokens.map(|tokens| tokens.len()));
+                    tracing::warn!(
+                        "[MTP state trace] slot={} captured_head_checkpoint={} tokens={} recurrent_checkpoints={:?}",
+                        work.slot,
+                        index,
+                        boundary,
+                        recurrent,
+                    );
+                }
+            }
+            lane.last_h.copy_from_slice(&hidden[(rows - 1) * h_width..]);
+            lane.pending_id = Some(pending);
+            lane.pending_emitted = false;
+            lane.cached
+                .extend_from_slice(&prompt[chunk_start..chunk_end]);
+            if let Some(events) = progress_events.as_ref() {
+                let _ = events.send(BatchEvent::Progress {
+                    progress: infr_core::GenerationProgress {
+                        phase: infr_core::GenerationPhase::Prefill,
+                        prompt_tokens: work.prompt_end as u64,
+                        cached_prompt_tokens: start as u64,
+                        prefill_tokens: chunk_end.saturating_sub(start) as u64,
+                        completion_tokens: 0,
+                        context_tokens: chunk_end as u64,
+                        context_limit: self.max_ctx as u64,
+                    },
+                });
+            }
+            chunk_start = chunk_end;
+        }
+        lane.multimodal_key = work.multimodal_key;
+        anyhow::ensure!(lane.pending_id.is_some(), "MTP prime has no frontier token");
+        work.kv
+            .as_mut()
+            .expect("MTP work has target KV")
+            .mtp_snapshot_delta(self.vk.as_ref(), cfg)?;
+        if ec.debug.state_trace {
+            let recurrent = work
+                .kv()
+                .session_state_meta()
+                .checkpoint_tokens
+                .map(|tokens| tokens.map(|tokens| tokens.len()));
+            tracing::warn!(
+                "[MTP state trace] slot={} prime_complete target={} recurrent_checkpoints={:?}",
+                work.slot,
+                work.kv().cached_len(),
+                recurrent,
+            );
+        }
+        lane.target_snapshot_dirty = false;
+        lane.live_valid = true;
+        work.stats.prompt_secs += t0.elapsed().as_secs_f64();
+        work.phase = BatchPhase::Decode;
+        work.turn_checkpoint = None;
+        work.mtp_ready = true;
+        Ok(())
+    }
+
+    fn run_mtp_batch(&self, work: Vec<BatchWork>, req: &RequestCtx) {
+        let mut active = work;
+        let mut concurrent_plain = false;
+        loop {
+            let capacity = MAX_DECODE_BATCH.saturating_sub(active.len());
+            active.extend(self.take_pending_batch_work(capacity, false));
+            if active.is_empty() {
+                match self.refill_batch() {
+                    Some(work) => active = work,
+                    None => return,
+                }
+            }
+            for work in &mut active {
+                let was_unprepared = work.phase == BatchPhase::Unprepared;
+                if let Err(error) = self.prime_mtp_work(work, req) {
+                    self.fail_unified_scheduler(&mut active, error);
+                    return;
+                }
+                if was_unprepared && work.mtp_ready {
+                    let progress = infr_core::GenerationProgress {
+                        phase: infr_core::GenerationPhase::Prefill,
+                        prompt_tokens: work.prompt_end as u64,
+                        cached_prompt_tokens: work.prefill_start as u64,
+                        prefill_tokens: (work.prompt_end - work.prefill_start) as u64,
+                        completion_tokens: 0,
+                        context_tokens: work.prompt_end as u64,
+                        context_limit: self.max_ctx as u64,
+                    };
+                    if work.channels.as_ref().is_none_or(|channels| {
+                        channels
+                            .events
+                            .send(BatchEvent::Progress { progress })
+                            .is_err()
+                    }) {
+                        work.finished = true;
+                    }
+                }
+            }
+            self.retire_finished_work(&mut active);
+            if active.is_empty() {
+                continue;
+            }
+            if active
+                .iter()
+                .any(|work| work.phase == BatchPhase::LongPrefill)
+            {
+                if let Err(error) = self.run_long_prefill_phase(&mut active, req) {
+                    self.fail_unified_scheduler(&mut active, error);
+                    return;
+                }
+                self.retire_finished_work(&mut active);
+                continue;
+            }
+            if active.len() > 1 {
+                if !concurrent_plain {
+                    tracing::info!(
+                        lanes = active.len(),
+                        "MTP scheduler switching concurrent decode to the ordinary batched path"
+                    );
+                    concurrent_plain = true;
+                }
+                let mut mtp_indices = (0..active.len())
+                    .filter(|&index| active[index].mtp_ready)
+                    .collect::<Vec<_>>();
+                mtp_indices
+                    .sort_by_key(|&index| (active[index].mrope_plan.is_none(), active[index].slot));
+                if let Err(error) = self.materialize_mtp_frontiers(&mut active, &mtp_indices) {
+                    self.fail_unified_scheduler(&mut active, error);
+                    return;
+                }
+                let before = active.len();
+                self.retire_finished_work(&mut active);
+                if active.len() < before {
+                    self.vk.release_primary_runtime_after_cohort_shrink();
+                }
+                if active.len() < 2 {
+                    continue;
+                }
+                let mut indices = (0..active.len()).collect::<Vec<_>>();
+                sort_token_lane_indices(&active, &mut indices);
+                let sync_mtp = indices.iter().any(|&index| active[index].mtp_ready);
+                if let Err(error) =
+                    self.run_token_group(&mut active, &indices, MTP_PLAIN_SYNC_QUANTUM, sync_mtp)
+                {
+                    self.fail_unified_scheduler(&mut active, error);
+                    return;
+                }
+                let before = active.len();
+                self.retire_finished_work(&mut active);
+                if active.len() < before {
+                    self.vk.release_primary_runtime_after_cohort_shrink();
+                }
+                continue;
+            }
+            if concurrent_plain {
+                if active[0].mtp_ready {
+                    tracing::info!(
+                        "MTP scheduler returning the surviving lane to speculative decode"
+                    );
+                }
+                concurrent_plain = false;
+            }
+            if !active[0].mtp_ready {
+                if let Err(error) =
+                    self.run_token_group(&mut active, &[0], MTP_PLAIN_SYNC_QUANTUM, false)
+                {
+                    self.fail_unified_scheduler(&mut active, error);
+                    return;
+                }
+                self.retire_finished_work(&mut active);
+                continue;
+            }
+            let fallback = (0..active.len())
+                .filter(|&index| {
+                    active[index].kv().cached_len() + crate::mtp::DRAFT_TOKENS > self.max_ctx
+                })
+                .collect::<Vec<_>>();
+            if !fallback.is_empty() {
+                if let Err(error) = self.materialize_mtp_frontiers(&mut active, &fallback) {
+                    self.fail_unified_scheduler(&mut active, error);
+                    return;
+                }
+                self.retire_finished_work(&mut active);
+                if active.is_empty() {
+                    continue;
+                }
+                let fallback = (0..active.len()).collect::<Vec<_>>();
+                if let Err(error) = self.run_token_group(&mut active, &fallback, 1, true) {
+                    self.fail_unified_scheduler(&mut active, error);
+                    return;
+                }
+                self.retire_finished_work(&mut active);
+                continue;
+            }
+            let mut indices = (0..active.len()).collect::<Vec<_>>();
+            indices.sort_by_key(|&index| (active[index].mrope_plan.is_none(), active[index].slot));
+            if let Err(error) = self.run_mtp_verify_cycle(&mut active, &indices, req) {
+                self.fail_unified_scheduler(&mut active, error);
+                return;
+            }
+            let before = active.len();
+            self.retire_finished_work(&mut active);
+            if active.len() < before {
+                self.vk.release_primary_runtime_after_cohort_shrink();
+            }
+        }
+    }
+
+    fn run_mtp_verify_cycle(
+        &self,
+        active: &mut [BatchWork],
+        indices: &[usize],
+        req: &RequestCtx,
+    ) -> Result<()> {
+        let cfg = self.model.config();
+        let ec = self.model.engine_cfg();
+        let h_width = cfg.hc_mult * cfg.n_embd;
+        let rows = crate::mtp::DRAFT_TOKENS;
+        self.refresh_mtp_snapshots(active, indices)?;
+        let t0 = Instant::now();
+        let (feeds, predictions) = {
+            let _gate = req.gate_pass();
+            let mut heads = self
+                .mtp_heads
+                .as_ref()
+                .expect("MTP scheduler has heads")
+                .lock()
+                .expect("MTP heads poisoned");
+            let mut feeds = Vec::with_capacity(indices.len());
+            let mut predictions = Vec::with_capacity(indices.len());
+            for &index in indices {
+                let work = &mut active[index];
+                let lane = &mut heads[work.slot];
+                let pending = lane.pending_id.expect("primed MTP lane has a frontier");
+                let physical_position = work.kv().cached_len();
+                let rope_position =
+                    multimodal_token_position(work.mrope_plan.as_ref(), physical_position)?;
+                let candidates = lane.head.draft(
+                    self.vk.as_ref(),
+                    pending,
+                    &lane.last_h,
+                    physical_position,
+                    rope_position,
+                    rows,
+                    work.kv().mtp_shared_weights(),
+                )?;
+                let mut feed = work.kv().cached_tokens().to_vec();
+                feed.push(pending);
+                feed.extend_from_slice(&candidates);
+                work.kv
+                    .as_mut()
+                    .expect("MTP work has target KV")
+                    .mtp_arm_delta_trace(rows)?;
+                feeds.push(feed);
+                predictions.push(candidates);
+            }
+            (feeds, predictions)
+        };
+
+        let (mut verify_ids, mut verify_logits, verify_hidden) = {
+            let _gate = req.gate_pass();
+            let mut owned_mrope_plans = indices
+                .iter()
+                .map(|&index| active[index].mrope_plan.take())
+                .collect::<Vec<_>>();
+            let mrope_plans = owned_mrope_plans
+                .iter()
+                .map(Option::as_ref)
+                .collect::<Vec<_>>();
+            let mut primary = active[indices[0]].kv.take();
+            let mut peers = indices[1..]
+                .iter()
+                .map(|&index| active[index].kv.take().expect("MTP peer has target KV"))
+                .collect::<Vec<_>>();
+            let result = crate::seam::generate_dense_vulkan_parallel_mtp_verify_session(
+                self.vk.as_ref(),
+                self.model.gguf(),
+                cfg,
+                ec,
+                self.model.embd(),
+                &feeds,
+                &mrope_plans,
+                &mut primary,
+                &mut peers,
+                self.max_ctx,
+            );
+            active[indices[0]].kv = primary;
+            for (&index, kv) in indices[1..].iter().zip(peers) {
+                active[index].kv = Some(kv);
+            }
+            drop(mrope_plans);
+            for (&index, plan) in indices.iter().zip(owned_mrope_plans.drain(..)) {
+                active[index].mrope_plan = plan;
+            }
+            result?
+        };
+        anyhow::ensure!(
+            verify_ids.len() == indices.len()
+                && verify_logits.len() == indices.len()
+                && verify_hidden.len() == indices.len(),
+            "parallel MTP VERIFY returned inconsistent lane counts"
+        );
+        let compute_secs = t0.elapsed().as_secs_f64();
+
+        for (lane_index, &index) in indices.iter().enumerate() {
+            let work = &mut active[index];
+            let pending_emitted = self
+                .mtp_heads
+                .as_ref()
+                .expect("MTP scheduler has heads")
+                .lock()
+                .expect("MTP heads poisoned")[work.slot]
+                .pending_emitted;
+            let old_len = feeds[lane_index].len() - rows;
+            let ids = &mut verify_ids[lane_index];
+            let logits = &mut verify_logits[lane_index];
+            let hidden = &verify_hidden[lane_index];
+            anyhow::ensure!(
+                ids.len() == rows && hidden.len() == rows * h_width,
+                "parallel MTP VERIFY lane {lane_index} returned incomplete rows"
+            );
+            let mut verify_guard = work.reasoning_guard;
+            for row in 0..rows {
+                verify_guard.observe(cfg, feeds[lane_index][old_len + row]);
+                if !verify_guard.blocks(cfg, ids[row], ec.sampling.ignore_eos) {
+                    continue;
+                }
+                anyhow::ensure!(
+                    logits.len() == rows * cfg.vocab,
+                    "parallel MTP EOS repair lane {lane_index} expected {} logits, got {}",
+                    rows * cfg.vocab,
+                    logits.len()
+                );
+                let row_logits = &mut logits[row * cfg.vocab..(row + 1) * cfg.vocab];
+                verify_guard.mask_eos(cfg, row_logits);
+                let blocked = ids[row];
+                ids[row] = crate::mtp::argmax_row(row_logits);
+                tracing::warn!(
+                    slot = work.slot,
+                    row,
+                    blocked_token = blocked,
+                    replacement_token = ids[row],
+                    "Qwen3.8 MTP suppressed premature EOS inside an open reasoning block"
+                );
+            }
+            let accepted = mtp_accepted_rows(&predictions[lane_index], ids);
+            let already_emitted = usize::from(pending_emitted);
+            anyhow::ensure!(
+                already_emitted <= accepted
+                    && (!pending_emitted
+                        || (work.prompt.last() == Some(&feeds[lane_index][old_len]))),
+                "MTP lane {} lost its emitted frontier before VERIFY",
+                work.slot
+            );
+            let available = already_emitted
+                + (accepted - already_emitted).min(work.max_new.saturating_sub(work.generated));
+            let mut committed = already_emitted;
+            let mut stopped = false;
+            for &token in &feeds[lane_index][old_len + already_emitted..old_len + available] {
+                let eos =
+                    !ec.sampling.ignore_eos && (cfg.eos_ids.contains(&token) || token == cfg.eos);
+                if eos {
+                    committed += 1;
+                    stopped = true;
+                    break;
+                }
+                let progress = self.batch_decode_progress(
+                    work.prompt_end,
+                    work.prefill_start,
+                    work.generated + committed - already_emitted + 1,
+                );
+                let Some(channels) = work.channels.as_ref() else {
+                    stopped = true;
+                    break;
+                };
+                if channels
+                    .events
+                    .send(BatchEvent::Token {
+                        id: token,
+                        progress,
+                    })
+                    .is_err()
+                {
+                    stopped = true;
+                    break;
+                }
+                committed += 1;
+                if !channels.acknowledgements.recv().unwrap_or(false) {
+                    stopped = true;
+                    break;
+                }
+            }
+            let restore_t0 = Instant::now();
+            {
+                let _gate = req.gate_pass();
+                let kv = work.kv.as_mut().expect("MTP lane has target KV");
+                if committed < rows {
+                    kv.mtp_restore_delta_row(self.vk.as_ref(), committed)?;
+                }
+                kv.mtp_snapshot_delta(self.vk.as_ref(), cfg)?;
+                let mut heads = self
+                    .mtp_heads
+                    .as_ref()
+                    .expect("MTP scheduler has heads")
+                    .lock()
+                    .expect("MTP heads poisoned");
+                let lane = &mut heads[work.slot];
+                lane.cached = kv.cached_tokens().to_vec();
+                lane.live_valid = true;
+                if committed > 0 {
+                    lane.pending_id = Some(ids[committed - 1]);
+                    lane.pending_emitted = false;
+                    lane.target_snapshot_dirty = false;
+                    lane.last_h
+                        .copy_from_slice(&hidden[(committed - 1) * h_width..committed * h_width]);
+                }
+            }
+            work.prompt.extend_from_slice(
+                &feeds[lane_index][old_len + already_emitted..old_len + committed],
+            );
+            for &token in &feeds[lane_index][old_len + already_emitted..old_len + committed] {
+                work.reasoning_guard.observe(cfg, token);
+            }
+            let emitted = committed - already_emitted;
+            work.generated += emitted;
+            work.stats.n_gen += emitted;
+            work.stats.decode_secs += compute_secs + restore_t0.elapsed().as_secs_f64();
+            work.finished = stopped || work.generated >= work.max_new;
+        }
+        Ok(())
     }
 
     fn run_unified_batch(&self, work: Vec<BatchWork>, req: &RequestCtx) {
@@ -2122,13 +3479,8 @@ impl ParallelSeam {
             // following graph is rebuilt with the correct per-lane QSA geometry.
             let mut indices = (0..active.len()).collect::<Vec<_>>();
             // The primary lane decides whether the shared graph carries MRoPE history.
-            indices.sort_by_key(|&index| {
-                (
-                    active[index].mrope_plan.is_none(),
-                    std::cmp::Reverse(active[index].remaining_prefill()),
-                )
-            });
-            if let Err(error) = self.run_token_group(&mut active, &indices, usize::MAX) {
+            sort_token_lane_indices(&active, &mut indices);
+            if let Err(error) = self.run_token_group(&mut active, &indices, usize::MAX, false) {
                 self.fail_unified_scheduler(&mut active, error);
                 return;
             }
@@ -2171,15 +3523,45 @@ impl ParallelSeam {
         max_new: usize,
         constraint: Option<&mut crate::grammar::Constraint>,
         req: &RequestCtx,
+        on_piece: impl FnMut(&str),
+    ) -> Result<GenStats> {
+        self.generate_turn_with_checkpoints(
+            prompt,
+            crate::seam::TurnCheckpointPrefixes::edit(stable_prefix),
+            max_new,
+            constraint,
+            req,
+            on_piece,
+        )
+    }
+
+    pub fn generate_turn_with_checkpoints(
+        &self,
+        prompt: &str,
+        checkpoint_prefixes: crate::seam::TurnCheckpointPrefixes<'_>,
+        max_new: usize,
+        constraint: Option<&mut crate::grammar::Constraint>,
+        req: &RequestCtx,
         mut on_piece: impl FnMut(&str),
     ) -> Result<GenStats> {
+        let mtp_eligible = self.mtp_heads.as_ref().is_none_or(|_| {
+            let base = crate::sampling::Sampler::from_cfg(&self.model.engine_cfg().sampling);
+            let effective =
+                crate::sampling::Sampler::resolve(Some(req), &self.model.engine_cfg().sampling);
+            (base.temp <= 0.0 || base.top_k == 1)
+                && (effective.temp <= 0.0 || effective.top_k == 1)
+                && !req.sampling().penalties_active()
+        });
         let initially_eligible = self.model.config().qwen4exp
             && constraint.is_none()
             && self.gate.is_some()
+            && mtp_eligible
             && max_new > 0;
         let mut registration = initially_eligible.then(|| BatchRegistration::new(self));
         let prompt_tokens = self.model.encode(prompt)?;
-        let turn_checkpoint = self.model.turn_checkpoint(&prompt_tokens, stable_prefix)?;
+        let turn_checkpoint = self
+            .model
+            .turn_checkpoints(&prompt_tokens, checkpoint_prefixes)?;
         let max_new = max_new.min(self.max_ctx.saturating_sub(prompt_tokens.len() + 1));
         let batch_candidate = initially_eligible && max_new > 0;
         if !batch_candidate {
@@ -2191,6 +3573,10 @@ impl ParallelSeam {
         let mut printed = 0usize;
         let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
         if !batch_candidate {
+            if let Some(heads) = &self.mtp_heads {
+                let mut heads = heads.lock().expect("MTP heads poisoned");
+                heads[guard.idx].invalidate_live();
+            }
             let (_, stats) = crate::seam::generate_dense_vulkan_session(
                 self.vk.as_ref(),
                 self.model.gguf(),
@@ -2234,6 +3620,10 @@ impl ParallelSeam {
         queue.waiting.push_back(BatchWork {
             slot: guard.idx,
             kv: Some(guard.detach()),
+            reasoning_guard: crate::sampling::Qwen4ReasoningEosGuard::from_prompt(
+                self.model.config(),
+                &prompt_tokens,
+            ),
             prompt_end: prompt_tokens.len(),
             prompt: prompt_tokens,
             max_new,
@@ -2241,12 +3631,14 @@ impl ParallelSeam {
             stats: GenStats::default(),
             phase: BatchPhase::Unprepared,
             prefill_start: 0,
-            checkpoint_boundary: None,
+            checkpoint_boundaries: [None; crate::seam::TURN_CHECKPOINT_COUNT],
             turn_checkpoint,
             mrope_plan: None,
+            multimodal_key: None,
             finished: false,
             sampling: req.sampling().clone(),
             sampler: Some(sampler),
+            mtp_ready: false,
             channels: Some(BatchChannels {
                 events: event_tx,
                 acknowledgements: ack_rx,
@@ -2330,10 +3722,7 @@ impl ParallelSeam {
                         && prompt_tokens.starts_with(tokens)
                 })
                 .map(|tokens| tokens.len());
-            boundary.map_or(
-                crate::seam::TurnCheckpoint::Enable,
-                crate::seam::TurnCheckpoint::Boundary,
-            )
+            crate::seam::TurnCheckpoint::new(None, boundary)
         });
         let mut guard = self.checkout_multimodal(&prompt_tokens, key, req);
         let max_new = max_new.min(self.max_ctx.saturating_sub(prompt_tokens.len() + 1));
@@ -2347,13 +3736,81 @@ impl ParallelSeam {
             decode_base = plan.decode_base,
             "multimodal prompt prepared"
         );
+        let mtp_eligible = self.mtp_heads.as_ref().is_some_and(|_| {
+            let base = crate::sampling::Sampler::from_cfg(&self.model.engine_cfg().sampling);
+            let effective =
+                crate::sampling::Sampler::resolve(Some(req), &self.model.engine_cfg().sampling);
+            self.gate.is_some()
+                && max_new > 0
+                && (base.temp <= 0.0 || base.top_k == 1)
+                && (effective.temp <= 0.0 || effective.top_k == 1)
+                && !req.sampling().penalties_active()
+        });
+        if mtp_eligible {
+            let sampler = ParallelSampler::new(req, &self.model.engine_cfg().sampling);
+            let mut queue = self
+                .decode_batch
+                .lock()
+                .expect("decode batch queue poisoned");
+            let (event_tx, event_rx) = mpsc::sync_channel(0);
+            let (ack_tx, ack_rx) = mpsc::sync_channel(0);
+            queue.waiting.push_back(BatchWork {
+                slot: guard.idx,
+                kv: Some(guard.detach()),
+                reasoning_guard: crate::sampling::Qwen4ReasoningEosGuard::from_prompt(
+                    self.model.config(),
+                    &prompt_tokens,
+                ),
+                prompt: prompt_tokens,
+                prompt_end: plan.prompt_pos4.len() / 4,
+                max_new,
+                generated: 0,
+                stats: GenStats::default(),
+                phase: BatchPhase::Unprepared,
+                prefill_start: 0,
+                checkpoint_boundaries: [None; crate::seam::TURN_CHECKPOINT_COUNT],
+                turn_checkpoint,
+                mrope_plan: Some(plan),
+                multimodal_key: Some(key),
+                finished: false,
+                sampling: req.sampling().clone(),
+                sampler: Some(sampler),
+                mtp_ready: false,
+                channels: Some(BatchChannels {
+                    events: event_tx,
+                    acknowledgements: ack_rx,
+                }),
+            });
+            self.batch_interrupt.store(true, Ordering::Release);
+            self.decode_ready.notify_all();
+            drop(queue);
+            return self.wait_for_decode_batch(
+                &mut guard,
+                event_rx,
+                ack_tx,
+                req,
+                &mut acc,
+                &mut printed,
+                &mut on_piece,
+            );
+        }
+        if let Some(heads) = &self.mtp_heads {
+            let mut heads = heads.lock().expect("MTP heads poisoned");
+            heads[guard.idx].invalidate_live();
+        }
         let frontier = prompt_tokens.len().saturating_sub(1);
         let frontier_is_image = plan.spans.iter().any(|span| {
             frontier >= span.start && frontier < span.start.saturating_add(span.n_tokens)
         });
-        // Consume image embedding rows on the legacy path, but leave the final text frontier and
-        // every sampled token to the unified scheduler so multimodal and text decodes can batch.
-        let legacy_max_new = if frontier_is_image { max_new } else { 0 };
+        // A one-slot non-MTP engine has no scheduler worker, so its visual turn must stay on the
+        // legacy runner. Multi-slot serving retains the handoff that batches visual and text decode.
+        let handoff = should_handoff_multimodal_to_scheduler(
+            self.gate.is_some(),
+            self.mtp_heads.is_some(),
+            frontier_is_image,
+            max_new,
+        );
+        let legacy_max_new = if handoff { 0 } else { max_new };
         let result = crate::seam::generate_dense_vulkan_session(
             &self.vk,
             self.model.gguf(),
@@ -2385,7 +3842,7 @@ impl ParallelSeam {
             }
         }
         let (legacy_ids, stats) = result?;
-        if legacy_max_new > 0 || max_new == 0 || crate::sampling::abort_requested(Some(req)) {
+        if !handoff || crate::sampling::abort_requested(Some(req)) {
             return Ok(stats);
         }
         debug_assert!(legacy_ids.is_empty());
@@ -2410,6 +3867,10 @@ impl ParallelSeam {
         queue.waiting.push_back(BatchWork {
             slot: guard.idx,
             kv: Some(guard.detach()),
+            reasoning_guard: crate::sampling::Qwen4ReasoningEosGuard::from_prompt(
+                self.model.config(),
+                &prompt_tokens,
+            ),
             prompt: prompt_tokens,
             prompt_end,
             max_new,
@@ -2417,12 +3878,14 @@ impl ParallelSeam {
             stats,
             phase: phase_for_remaining_prefill(remaining_prefill),
             prefill_start,
-            checkpoint_boundary: None,
+            checkpoint_boundaries: [None; crate::seam::TURN_CHECKPOINT_COUNT],
             turn_checkpoint: None,
             mrope_plan: Some(plan),
+            multimodal_key: Some(key),
             finished: false,
             sampling: req.sampling().clone(),
             sampler: Some(sampler),
+            mtp_ready: false,
             channels: Some(BatchChannels {
                 events: event_tx,
                 acknowledgements: ack_rx,
@@ -2446,8 +3909,10 @@ impl ParallelSeam {
 #[cfg(test)]
 mod tests {
     use super::{
-        expand_multimodal_prompt, multimodal_key, phase_for_remaining_prefill, pick_continuation,
-        scheduler_mode, BatchPhase, MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
+        expand_multimodal_prompt, mtp_accepted_rows, mtp_prime_chunk_end, multimodal_key,
+        multimodal_token_position, phase_for_remaining_prefill, pick_continuation, scheduler_mode,
+        should_handoff_multimodal_to_scheduler, token_lane_sort_key, BatchPhase,
+        MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
     };
     use std::sync::Arc;
 
@@ -2463,6 +3928,52 @@ mod tests {
             phase_for_remaining_prefill(SHORT_PREFILL_TOKENS + 1),
             BatchPhase::LongPrefill
         );
+    }
+
+    #[test]
+    fn multimodal_handoff_requires_a_scheduler_worker() {
+        assert!(!should_handoff_multimodal_to_scheduler(
+            false, false, false, 16
+        ));
+        assert!(should_handoff_multimodal_to_scheduler(
+            true, false, false, 16
+        ));
+        assert!(!should_handoff_multimodal_to_scheduler(
+            true, true, false, 16
+        ));
+        assert!(!should_handoff_multimodal_to_scheduler(
+            true, false, true, 16
+        ));
+        assert!(!should_handoff_multimodal_to_scheduler(
+            true, false, false, 0
+        ));
+    }
+
+    #[test]
+    fn token_lanes_put_longer_prefill_before_decode() {
+        let mut lanes = [(0usize, false, 0usize), (1, false, 37)];
+        lanes.sort_by_key(|&(slot, has_mrope, remaining)| {
+            token_lane_sort_key(has_mrope, remaining, slot)
+        });
+        assert_eq!(lanes.map(|lane| lane.0), [1, 0]);
+    }
+
+    #[test]
+    fn mtp_accepts_each_lane_independently() {
+        let candidates = [11, 12, 13];
+        assert_eq!(mtp_accepted_rows(&candidates, &[99, 0, 0, 0]), 1);
+        assert_eq!(mtp_accepted_rows(&candidates, &[11, 99, 0, 0]), 2);
+        assert_eq!(mtp_accepted_rows(&candidates, &[11, 12, 99, 0]), 3);
+        assert_eq!(mtp_accepted_rows(&candidates, &[11, 12, 13, 99]), 4);
+        assert_eq!(mtp_accepted_rows(&[5, 6, 7], &[5, 6, 7, 8]), 4);
+    }
+
+    #[test]
+    fn mtp_prime_stops_exactly_at_each_turn_checkpoint() {
+        let checkpoints = [Some(789), Some(2405)];
+        assert_eq!(mtp_prime_chunk_end(0, 4064, 2048, &checkpoints), 789);
+        assert_eq!(mtp_prime_chunk_end(789, 4064, 2048, &checkpoints), 2405);
+        assert_eq!(mtp_prime_chunk_end(2405, 4064, 2048, &checkpoints), 4064);
     }
 
     #[test]
@@ -2542,6 +4053,9 @@ mod tests {
             &[1, 1, 1, 0, 1, 1, 2, 0, 1, 2, 1, 0, 1, 2, 2, 0]
         );
         assert_eq!(plan.decode_base, 8);
+        assert_eq!(multimodal_token_position(Some(&plan), 9).unwrap(), 7);
+        assert_eq!(multimodal_token_position(Some(&plan), 10).unwrap(), 8);
+        assert_eq!(multimodal_token_position(Some(&plan), 13).unwrap(), 11);
     }
 
     #[test]

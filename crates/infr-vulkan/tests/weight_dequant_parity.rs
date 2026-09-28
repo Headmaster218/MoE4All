@@ -110,6 +110,152 @@ fn gpu_weight_columns(
         .collect()
 }
 
+/// Decode one weight column through the fused residual path. This is the ragged-K twin of
+/// [`gpu_weight_columns`]: one-hot input isolates the selected weight while a mixed-sign residual
+/// proves `-DUSE_RES` is the shader that actually ran.
+fn gpu_weight_column_with_residual(
+    be: &VulkanBackend,
+    dtype: DType,
+    w_bytes: &[u8],
+    in_f: usize,
+    out_f: usize,
+    col: usize,
+    residual: &[f32],
+) -> Vec<f32> {
+    let mut x = vec![0f32; in_f];
+    x[col] = 1.0;
+    let x_buf = be.alloc(x.len() * 4, BufferUsage::Activations).unwrap();
+    be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+    let residual_buf = be
+        .alloc(residual.len() * 4, BufferUsage::Activations)
+        .unwrap();
+    be.upload(residual_buf.as_ref(), bytemuck::cast_slice(residual))
+        .unwrap();
+    let y_buf = be.alloc(out_f * 4, BufferUsage::Activations).unwrap();
+    let (arena, addr) = be.alloc_arena_bda(w_bytes.len()).unwrap();
+    be.upload(arena.as_ref(), w_bytes).unwrap();
+
+    let rec = be.recorder().unwrap();
+    rec.linear_add_native_at(
+        dtype,
+        addr,
+        x_buf.as_ref(),
+        residual_buf.as_ref(),
+        y_buf.as_ref(),
+        1,
+        in_f,
+        out_f,
+    );
+    rec.finish().unwrap();
+
+    let mut out = vec![0u8; out_f * 4];
+    be.download(y_buf.as_ref(), &mut out).unwrap();
+    bytemuck::cast_slice(&out).to_vec()
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn bf16_native_gemv_preserves_ragged_k_tail() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+
+    // Qwen3.8 Vision's FFN width: 134 complete native blocks plus a 16-element tail.
+    const IN_F: usize = 4304;
+    const OUT_F: usize = 7;
+    let mut bytes = Vec::with_capacity(IN_F * OUT_F * 2);
+    let mut host = Vec::with_capacity(IN_F * OUT_F);
+    for i in 0..IN_F * OUT_F {
+        let value = ((i * 17 % 193) as f32 - 96.0) / 32.0;
+        let bits = (value.to_bits() >> 16) as u16;
+        bytes.extend_from_slice(&bits.to_le_bytes());
+        host.push(f32::from_bits((bits as u32) << 16));
+    }
+
+    // Cover complete-block boundaries, the last complete element, and both ends of the tail.
+    let cols = [0, 31, 32, 4287, 4288, 4303];
+    let gpu = gpu_weight_columns(&be, DType::Bf16, &bytes, IN_F, OUT_F, &cols);
+    let mut diff = Diff::default();
+    diff.accumulate("ragged BF16", &gpu, &host, IN_F, OUT_F, &cols);
+    diff.assert_bit_identical("ragged BF16");
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn f16_native_gemv_preserves_ragged_k_tail() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+
+    // The F16 Qwen3.8 projector uses the same 134 complete blocks plus 16-element tail.
+    const IN_F: usize = 4304;
+    const OUT_F: usize = 7;
+    let mut bytes = Vec::with_capacity(IN_F * OUT_F * 2);
+    let mut host = Vec::with_capacity(IN_F * OUT_F);
+    for i in 0..IN_F * OUT_F {
+        let value = ((i * 17 % 193) as f32 - 96.0) / 32.0;
+        let rounded = half::f16::from_f32(value);
+        bytes.extend_from_slice(&rounded.to_bits().to_le_bytes());
+        host.push(rounded.to_f32());
+    }
+
+    let cols = [0, 31, 32, 4287, 4288, 4303];
+    let gpu = gpu_weight_columns(&be, DType::F16, &bytes, IN_F, OUT_F, &cols);
+    let mut diff = Diff::default();
+    diff.accumulate("ragged F16", &gpu, &host, IN_F, OUT_F, &cols);
+    diff.assert_bit_identical("ragged F16");
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn f16_bf16_residual_gemv_preserves_ragged_k_tail() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+
+    const IN_F: usize = 4304;
+    const OUT_F: usize = 7;
+    const COL: usize = IN_F - 1;
+    let residual = (0..OUT_F)
+        .map(|i| (i as f32 - 3.0) * 0.25)
+        .collect::<Vec<_>>();
+
+    for dtype in [DType::F16, DType::Bf16] {
+        let mut bytes = Vec::with_capacity(IN_F * OUT_F * 2);
+        let mut host = Vec::with_capacity(IN_F * OUT_F);
+        for i in 0..IN_F * OUT_F {
+            let value = ((i * 17 % 193) as f32 - 96.0) / 32.0;
+            match dtype {
+                DType::F16 => {
+                    let rounded = half::f16::from_f32(value);
+                    bytes.extend_from_slice(&rounded.to_bits().to_le_bytes());
+                    host.push(rounded.to_f32());
+                }
+                DType::Bf16 => {
+                    let bits = (value.to_bits() >> 16) as u16;
+                    bytes.extend_from_slice(&bits.to_le_bytes());
+                    host.push(f32::from_bits((bits as u32) << 16));
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        let gpu = gpu_weight_column_with_residual(&be, dtype, &bytes, IN_F, OUT_F, COL, &residual);
+        for o in 0..OUT_F {
+            let expected = residual[o] + host[o * IN_F + COL];
+            assert_eq!(
+                gpu[o].to_bits(),
+                expected.to_bits(),
+                "ragged {dtype:?} residual output {o}: gpu={} expected={expected}",
+                gpu[o]
+            );
+        }
+    }
+}
+
 /// Running worst-case disagreement between the GPU's decoded weights and `dequant_block`'s, plus
 /// the count of elements that were not bit-identical.
 #[derive(Default)]

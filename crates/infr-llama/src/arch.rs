@@ -51,9 +51,9 @@ pub const QWEN35_MOE: &str = "qwen35moe";
 /// gated-DeltaNet/full-attention hybrid with four low-rank gated residual streams, a 512-expert
 /// MoE, and one SSD-sized PLE n-gram embedding table.
 pub const QWEN4EXP: &str = "qwen4exp";
-/// Ling 3.0 Flash: a 42-layer hybrid with per-layer KDA or MLA token mixers and a DeepSeek-style
-/// routed MoE after two dense lead layers. KDA is a distinct recurrent operator; the MLA and MoE
-/// portions reuse the existing DeepSeek machinery where their tensor layouts match.
+/// Ling 3.0: a hybrid with per-layer KDA or MLA token mixers and a DeepSeek-style routed MoE after
+/// one or more dense lead layers. Covers the 24-layer Tiny and 42-layer Flash variants. KDA is a
+/// distinct recurrent operator; MLA and MoE reuse DeepSeek machinery where their layouts match.
 pub const BAILINGMOE3: &str = "bailingmoe3";
 /// DiffusionGemma: block text-diffusion MoE on a Gemma-4 backbone (shares gemma4's heterogeneous
 /// per-layer dims, V-norm, freq_factors, softcap, sandwich norms), plus a per-layer DUAL FFN

@@ -175,7 +175,7 @@ impl DenseSeamChat {
     fn generate_turn_impl(
         &mut self,
         prompt: &str,
-        stable_prefix: Option<&str>,
+        checkpoint_prefixes: crate::seam::TurnCheckpointPrefixes<'_>,
         max_new: usize,
         req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
@@ -203,14 +203,42 @@ impl DenseSeamChat {
             .map(|(stats, _)| stats);
         }
         self.ensure_session()?;
-        self.model.generate_vulkan_session_turn(
-            self.session.as_mut().unwrap(),
-            prompt,
-            stable_prefix,
-            max_new,
-            req,
-            |p| on_piece(p),
-        )
+        self.model
+            .generate_vulkan_session_turn_with_checkpoints_constrained(
+                self.session.as_mut().unwrap(),
+                prompt,
+                max_new,
+                checkpoint_prefixes,
+                None,
+                req,
+                |p| on_piece(p),
+            )
+    }
+
+    pub fn generate_serve_turn(
+        &mut self,
+        prompt: &str,
+        checkpoint_prefixes: crate::seam::TurnCheckpointPrefixes<'_>,
+        max_new: usize,
+        constraint: Option<&mut crate::grammar::Constraint>,
+        req: Option<&crate::sampling::RequestCtx>,
+        on_piece: &mut dyn FnMut(&str),
+    ) -> Result<GenStats> {
+        if let Some(constraint) = constraint {
+            self.ensure_session()?;
+            return self
+                .model
+                .generate_vulkan_session_turn_with_checkpoints_constrained(
+                    self.session.as_mut().unwrap(),
+                    prompt,
+                    max_new,
+                    checkpoint_prefixes,
+                    Some(constraint),
+                    req,
+                    |piece| on_piece(piece),
+                );
+        }
+        self.generate_turn_impl(prompt, checkpoint_prefixes, max_new, req, on_piece)
     }
 }
 
@@ -235,7 +263,13 @@ impl ChatModel for DenseSeamChat {
         // The shared session warmup (throwaway generate + reset so the first real prompt prefills
         // clean slots from row 0), wrapped in the INFR_PROF_OPS suppression the Vulkan recorders need.
         crate::with_profiling_suppressed(|| {
-            self.generate_turn_impl("Hi", Some(""), 2, None, &mut |_| {})?;
+            self.generate_turn_impl(
+                "Hi",
+                crate::seam::TurnCheckpointPrefixes::edit(Some("")),
+                2,
+                None,
+                &mut |_| {},
+            )?;
             self.reset_kv();
             Ok(())
         })
@@ -248,7 +282,13 @@ impl ChatModel for DenseSeamChat {
         req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
-        self.generate_turn_impl(prompt, None, max_new, req, on_piece)
+        self.generate_turn_impl(
+            prompt,
+            crate::seam::TurnCheckpointPrefixes::default(),
+            max_new,
+            req,
+            on_piece,
+        )
     }
 
     fn generate_turn_with_step_hook(
@@ -260,7 +300,13 @@ impl ChatModel for DenseSeamChat {
         on_piece: &mut dyn FnMut(&str),
         _on_step: Option<&mut dyn FnMut(crate::diffusion::StepView)>,
     ) -> Result<GenStats> {
-        self.generate_turn_impl(prompt, stable_prefix, max_new, req, on_piece)
+        self.generate_turn_impl(
+            prompt,
+            crate::seam::TurnCheckpointPrefixes::edit(stable_prefix),
+            max_new,
+            req,
+            on_piece,
+        )
     }
 
     fn generate_constrained_turn(
@@ -273,14 +319,34 @@ impl ChatModel for DenseSeamChat {
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
         self.ensure_session()?;
-        self.model.generate_vulkan_session_turn_constrained(
-            self.session.as_mut().unwrap(),
+        self.model
+            .generate_vulkan_session_turn_with_checkpoints_constrained(
+                self.session.as_mut().unwrap(),
+                prompt,
+                max_new,
+                crate::seam::TurnCheckpointPrefixes::edit(stable_prefix),
+                Some(constraint),
+                req,
+                |p| on_piece(p),
+            )
+    }
+
+    fn generate_with_checkpoints(
+        &mut self,
+        prompt: &str,
+        checkpoint_prefixes: crate::seam::TurnCheckpointPrefixes<'_>,
+        max_new: usize,
+        constraint: Option<&mut crate::grammar::Constraint>,
+        req: Option<&crate::sampling::RequestCtx>,
+        on_piece: &mut dyn FnMut(&str),
+    ) -> Result<GenStats> {
+        self.generate_serve_turn(
             prompt,
+            checkpoint_prefixes,
             max_new,
-            stable_prefix,
-            Some(constraint),
+            constraint,
             req,
-            |p| on_piece(p),
+            on_piece,
         )
     }
 

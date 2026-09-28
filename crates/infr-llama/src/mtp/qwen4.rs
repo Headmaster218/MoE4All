@@ -1,14 +1,27 @@
 use anyhow::{anyhow, bail, Context, Result};
-use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage};
+use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, SegmentedKvSpec};
 use infr_core::graph::{Activation, AttnMask, Graph, Op};
 use infr_core::tensor::{DType, TensorDesc, TensorId};
 use infr_core::{TensorInfo, WeightSource};
 use infr_gguf::Gguf;
 use std::path::Path;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::{BindWeightFn, MtpTensor};
 
 pub const DRAFT_TOKENS: usize = 4;
+
+fn generation_budget(prompt_rows: usize, requested: usize, max_ctx: usize) -> Result<usize> {
+    let reserved = prompt_rows
+        .checked_add(DRAFT_TOKENS)
+        .ok_or_else(|| anyhow!("Qwen3.8 MTP context row count overflow"))?;
+    if reserved > max_ctx {
+        bail!(
+            "Qwen3.8 MTP needs at least {reserved} context rows for a {prompt_rows}-token prompt, but its fixed runtime has {max_ctx}"
+        );
+    }
+    Ok(requested.min(max_ctx - reserved))
+}
 
 type SharedWeight<'a> = (&'a dyn Buffer, DType, usize);
 type SharedWeights<'a> = (SharedWeight<'a>, SharedWeight<'a>);
@@ -462,6 +475,7 @@ fn step_scratch(g: &mut Graph, cfg: &crate::Config, rows: usize) -> StepScratch 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_bridge(
     g: &mut Graph,
     cfg: &crate::Config,
@@ -470,6 +484,7 @@ fn emit_bridge(
     h_in: TensorId,
     weights: &GraphW,
     scratch: &StepScratch,
+    embedding_overrides: Option<(TensorId, &[(usize, usize)])>,
 ) {
     let ne = cfg.n_embd;
     let hcw = cfg.hc_mult * ne;
@@ -481,6 +496,22 @@ fn emit_bridge(
         ne: ne as u32,
         scale: 1.0,
     });
+    if let Some((source, ranges)) = embedding_overrides {
+        let mut source_row = 0usize;
+        for &(row_start, range_rows) in ranges {
+            g.push(Op::CopyStrided {
+                src: source,
+                src_off: (source_row * ne) as u32,
+                src_stride: ne as u32,
+                dst: scratch.e,
+                dst_off: (row_start * ne) as u32,
+                dst_stride: ne as u32,
+                rows: range_rows as u32,
+                n: ne as u32,
+            });
+            source_row += range_rows;
+        }
+    }
     g.push(Op::RmsNorm {
         x: scratch.e,
         weight: weights.enorm,
@@ -544,6 +575,7 @@ fn emit_attention_kv(
     rows: usize,
     start_pos: usize,
     positions: TensorId,
+    positions4: Option<TensorId>,
     k_cache: TensorId,
     v_cache: TensorId,
     weights: &GraphW,
@@ -597,20 +629,37 @@ fn emit_attention_kv(
         out_f: kvrow as u32,
         w_off: 0,
     });
-    g.push(Op::QkNormRope {
-        x: scratch.k,
-        weight: weights.k_norm,
-        positions,
-        dst: scratch.k16,
-        rows: rows as u32,
-        n_head: cfg.n_kv as u32,
-        head_dim: cfg.head_dim as u32,
-        rope_dim: cfg.rope_dim as u32,
-        theta: cfg.rope_theta,
-        eps: cfg.rms_eps,
-        freq_factors: None,
-        x_stride: 0,
-    });
+    if let Some(positions4) = positions4 {
+        g.push(Op::QkNormMrope {
+            x: scratch.k,
+            weight: weights.k_norm,
+            positions4,
+            dst: scratch.k16,
+            rows: rows as u32,
+            n_head: cfg.n_kv as u32,
+            head_dim: cfg.head_dim as u32,
+            rope_dim: cfg.rope_dim as u32,
+            theta: cfg.rope_theta,
+            eps: cfg.rms_eps,
+            sections: cfg.rope_sections,
+            x_stride: 0,
+        });
+    } else {
+        g.push(Op::QkNormRope {
+            x: scratch.k,
+            weight: weights.k_norm,
+            positions,
+            dst: scratch.k16,
+            rows: rows as u32,
+            n_head: cfg.n_kv as u32,
+            head_dim: cfg.head_dim as u32,
+            rope_dim: cfg.rope_dim as u32,
+            theta: cfg.rope_theta,
+            eps: cfg.rms_eps,
+            freq_factors: None,
+            x_stride: 0,
+        });
+    }
     g.push(Op::WriteKv {
         src: scratch.k16,
         cache: k_cache,
@@ -644,7 +693,7 @@ fn emit_full_step(
     let qrow = cfg.n_head * cfg.head_dim;
     let moe = cfg.moe.expect("validated Qwen3.8 MoE config");
     emit_attention_kv(
-        g, cfg, 1, start_pos, positions, k_cache, v_cache, weights, scratch, true,
+        g, cfg, 1, start_pos, positions, None, k_cache, v_cache, weights, scratch, true,
     );
     g.push(Op::QkNormRope {
         x: scratch.qg,
@@ -820,6 +869,8 @@ struct CatchHandles {
     ids: TensorId,
     h: TensorId,
     positions: TensorId,
+    positions4: Option<TensorId>,
+    embedding_overrides: Option<TensorId>,
     k_cache: TensorId,
     v_cache: TensorId,
     weights: Vec<TensorId>,
@@ -827,6 +878,7 @@ struct CatchHandles {
     lm_head: TensorId,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_catch_graph(
     cfg: &crate::Config,
     specs: &[(DType, usize)],
@@ -834,6 +886,8 @@ fn build_catch_graph(
     max_ctx: usize,
     rows: usize,
     start_pos: usize,
+    embedding_overrides: &[(usize, usize)],
+    mrope: bool,
 ) -> (Graph, CatchHandles) {
     let mut g = Graph::new();
     let hcw = cfg.hc_mult * cfg.n_embd;
@@ -841,13 +895,34 @@ fn build_catch_graph(
     let ids = g.input(TensorDesc::new(vec![rows], DType::I32));
     let h = g.input(TensorDesc::new(vec![rows * hcw], DType::F32));
     let positions = g.input(TensorDesc::new(vec![rows], DType::I32));
+    let positions4 = mrope.then(|| g.input(TensorDesc::new(vec![rows, 4], DType::I32)));
+    let override_rows = embedding_overrides
+        .iter()
+        .map(|&(_, range_rows)| range_rows)
+        .sum::<usize>();
+    let embedding_override_input = (override_rows > 0).then(|| {
+        g.input(TensorDesc::new(
+            vec![override_rows * cfg.n_embd],
+            DType::F32,
+        ))
+    });
     let k_cache = g.input(TensorDesc::new(vec![max_ctx * kvrow], DType::F16));
     let v_cache = g.input(TensorDesc::new(vec![max_ctx * kvrow], DType::F16));
     let (weights, handles) = declare_weights(&mut g, specs, shared[0], shared[1]);
     let scratch = step_scratch(&mut g, cfg, rows);
-    emit_bridge(&mut g, cfg, rows, ids, h, &weights, &scratch);
+    emit_bridge(
+        &mut g,
+        cfg,
+        rows,
+        ids,
+        h,
+        &weights,
+        &scratch,
+        embedding_override_input.map(|input| (input, embedding_overrides)),
+    );
     emit_attention_kv(
-        &mut g, cfg, rows, start_pos, positions, k_cache, v_cache, &weights, &scratch, false,
+        &mut g, cfg, rows, start_pos, positions, positions4, k_cache, v_cache, &weights, &scratch,
+        false,
     );
     (
         g,
@@ -855,6 +930,8 @@ fn build_catch_graph(
             ids,
             h,
             positions,
+            positions4,
+            embedding_overrides: embedding_override_input,
             k_cache,
             v_cache,
             weights: handles,
@@ -901,7 +978,7 @@ fn build_draft_graph(
     let mut prev_h = h;
     let mut out_ids = Vec::with_capacity(steps.saturating_sub(1));
     for (step, &position) in positions.iter().enumerate() {
-        emit_bridge(&mut g, cfg, 1, prev_id, prev_h, &weights, &scratch);
+        emit_bridge(&mut g, cfg, 1, prev_id, prev_h, &weights, &scratch, None);
         let h_next = g.internal(f32d(hcw));
         emit_full_step(
             &mut g,
@@ -973,32 +1050,141 @@ fn build_draft_graph(
     )
 }
 
+pub(crate) struct Qwen4MtpFixed {
+    cfg: crate::Config,
+    weights: Vec<Box<dyn Buffer>>,
+    specs: Vec<(DType, usize)>,
+}
+
+struct Qwen4MtpCatchBuffers {
+    max_batch: usize,
+    ids: Box<dyn Buffer>,
+    h: Box<dyn Buffer>,
+    positions: Box<dyn Buffer>,
+    positions4: Box<dyn Buffer>,
+    embedding_overrides: Box<dyn Buffer>,
+}
+
+pub(crate) struct Qwen4MtpCatchWorkspace {
+    h_width: usize,
+    n_embd: usize,
+    buffers: Mutex<Qwen4MtpCatchBuffers>,
+}
+
+struct Qwen4MtpKvCache {
+    k: Box<dyn Buffer>,
+    v: Box<dyn Buffer>,
+    segmented: bool,
+    committed_tokens: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Qwen4MtpCheckpointState {
+    pub(crate) tokens: Vec<u32>,
+    pub(crate) last_h: Vec<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Qwen4MtpCacheState {
+    pub(crate) cached: Vec<u32>,
+    pub(crate) last_h: Vec<f32>,
+    pub(crate) turn_checkpoints:
+        [Option<Qwen4MtpCheckpointState>; crate::seam::TURN_CHECKPOINT_COUNT],
+    pub(crate) pending_id: Option<u32>,
+    pub(crate) pending_emitted: bool,
+}
+
+pub(crate) struct Qwen4MtpKvView<'a> {
+    kv: MutexGuard<'a, Qwen4MtpKvCache>,
+    bytes_per_side: usize,
+}
+
+impl Qwen4MtpKvView<'_> {
+    pub(crate) fn k(&self) -> &dyn Buffer {
+        self.kv.k.as_ref()
+    }
+
+    pub(crate) fn v(&self) -> &dyn Buffer {
+        self.kv.v.as_ref()
+    }
+
+    pub(crate) fn bytes_per_side(&self) -> usize {
+        self.bytes_per_side
+    }
+}
+
 pub(crate) struct Qwen4MtpSession {
     cfg: crate::Config,
     max_ctx: usize,
-    max_batch: usize,
-    weights: Vec<Box<dyn Buffer>>,
-    specs: Vec<(DType, usize)>,
-    k_cache: Box<dyn Buffer>,
-    v_cache: Box<dyn Buffer>,
-    catch_ids: Box<dyn Buffer>,
-    catch_h: Box<dyn Buffer>,
-    catch_positions: Box<dyn Buffer>,
+    fixed: Arc<Qwen4MtpFixed>,
+    kv_spec: SegmentedKvSpec,
+    kv: Mutex<Qwen4MtpKvCache>,
+    catch: Arc<Qwen4MtpCatchWorkspace>,
     draft_id: Box<dyn Buffer>,
     draft_h: Box<dyn Buffer>,
     draft_positions: [Box<dyn Buffer>; DRAFT_TOKENS],
     draft_ids: [Box<dyn Buffer>; DRAFT_TOKENS],
 }
 
+pub(crate) fn qwen4_mtp_kv_spec(cfg: &crate::Config, max_ctx: usize) -> Result<SegmentedKvSpec> {
+    let row_elements = cfg
+        .n_kv
+        .checked_mul(cfg.head_dim)
+        .ok_or_else(|| anyhow!("Qwen3.8 MTP KV row width overflow"))?;
+    mtp_kv_spec(row_elements, max_ctx)
+}
+
+fn mtp_kv_spec(row_elements: usize, max_ctx: usize) -> Result<SegmentedKvSpec> {
+    anyhow::ensure!(max_ctx > 0, "Qwen3.8 MTP needs a non-zero context capacity");
+    let segment_elements = crate::seam::KV_GROW_ROWS
+        .checked_mul(row_elements)
+        .ok_or_else(|| anyhow!("Qwen3.8 MTP KV segment element count overflow"))?;
+    anyhow::ensure!(
+        segment_elements.is_power_of_two(),
+        "Qwen3.8 MTP segmented KV needs a power-of-two segment width; got {segment_elements} elements"
+    );
+    Ok(SegmentedKvSpec {
+        logical_bytes: max_ctx
+            .checked_mul(row_elements)
+            .and_then(|elements| elements.checked_mul(2))
+            .ok_or_else(|| anyhow!("Qwen3.8 MTP logical KV byte count overflow"))?,
+        segment_bytes: segment_elements
+            .checked_mul(2)
+            .ok_or_else(|| anyhow!("Qwen3.8 MTP KV segment byte count overflow"))?,
+        segment_elements,
+        max_segments: max_ctx.div_ceil(crate::seam::KV_GROW_ROWS),
+    })
+}
+
 impl Qwen4MtpSession {
-    pub(crate) fn new(
+    pub(crate) fn h_width(&self) -> usize {
+        self.cfg.hc_mult * self.cfg.n_embd
+    }
+
+    pub(crate) fn load_fixed_vulkan(
+        vk: &infr_vulkan::VulkanBackend,
+        sidecar_path: &Path,
+        cfg: &crate::Config,
+    ) -> Result<Arc<Qwen4MtpFixed>> {
+        let bind: &BindWeightFn = &|_name, bytes, dtype, _numel| {
+            let materialized = bytes.materialize();
+            let padded = infr_vulkan::linear::pad_to_u32_align(&materialized);
+            let buffer = vk
+                .alloc(padded.len(), BufferUsage::Weights)
+                .map_err(|e| anyhow!("{e}"))?;
+            vk.upload(buffer.as_ref(), &padded)
+                .map_err(|e| anyhow!("{e}"))?;
+            Ok((buffer, dtype))
+        };
+        Self::load_fixed(vk, bind, sidecar_path, cfg)
+    }
+
+    pub(crate) fn load_fixed(
         be: &dyn Backend,
         bind: &BindWeightFn,
         sidecar_path: &Path,
         cfg: &crate::Config,
-        max_ctx: usize,
-        max_batch: usize,
-    ) -> Result<Self> {
+    ) -> Result<Arc<Qwen4MtpFixed>> {
         let sidecar = Gguf::open(sidecar_path)
             .with_context(|| format!("open Qwen3.8 MTP sidecar {}", sidecar_path.display()))?;
         let found = Qwen4MtpWeights::load(&sidecar, cfg)?;
@@ -1027,15 +1213,80 @@ impl Qwen4MtpSession {
         weights.push(ones_buf);
         specs.push((DType::F32, ones.len()));
 
-        let kvrow = cfg.n_kv * cfg.head_dim;
+        Ok(Arc::new(Qwen4MtpFixed {
+            cfg: cfg.clone(),
+            weights,
+            specs,
+        }))
+    }
+
+    pub(crate) fn with_fixed(
+        be: &dyn Backend,
+        fixed: Arc<Qwen4MtpFixed>,
+        max_ctx: usize,
+        max_batch: usize,
+    ) -> Result<Self> {
+        let catch = Self::shared_catch_workspace(be, &fixed, max_ctx, max_batch)?;
+        Self::with_fixed_and_catch(be, fixed, max_ctx, catch)
+    }
+
+    pub(crate) fn shared_catch_workspace(
+        be: &dyn Backend,
+        fixed: &Qwen4MtpFixed,
+        max_ctx: usize,
+        max_batch: usize,
+    ) -> Result<Arc<Qwen4MtpCatchWorkspace>> {
+        let cfg = &fixed.cfg;
         let hcw = cfg.hc_mult * cfg.n_embd;
         let max_batch = max_batch.max(DRAFT_TOKENS).min(max_ctx.max(1));
         let alloc = |bytes, usage| be.alloc(bytes, usage).map_err(|e| anyhow!("{e}"));
-        let k_cache = alloc(max_ctx * kvrow * 2, BufferUsage::KvCache)?;
-        let v_cache = alloc(max_ctx * kvrow * 2, BufferUsage::KvCache)?;
-        let catch_ids = alloc(max_batch * 4, BufferUsage::Staging)?;
-        let catch_h = alloc(max_batch * hcw * 4, BufferUsage::Staging)?;
-        let catch_positions = alloc(max_batch * 4, BufferUsage::Staging)?;
+        Ok(Arc::new(Qwen4MtpCatchWorkspace {
+            h_width: hcw,
+            n_embd: cfg.n_embd,
+            buffers: Mutex::new(Qwen4MtpCatchBuffers {
+                max_batch,
+                ids: alloc(max_batch * 4, BufferUsage::Staging)?,
+                h: alloc(max_batch * hcw * 4, BufferUsage::Staging)?,
+                positions: alloc(max_batch * 4, BufferUsage::Staging)?,
+                positions4: alloc(max_batch * 4 * 4, BufferUsage::Staging)?,
+                embedding_overrides: alloc(max_batch * cfg.n_embd * 4, BufferUsage::Staging)?,
+            }),
+        }))
+    }
+
+    pub(crate) fn with_fixed_and_catch(
+        be: &dyn Backend,
+        fixed: Arc<Qwen4MtpFixed>,
+        max_ctx: usize,
+        catch: Arc<Qwen4MtpCatchWorkspace>,
+    ) -> Result<Self> {
+        let cfg = &fixed.cfg;
+        let hcw = cfg.hc_mult * cfg.n_embd;
+        anyhow::ensure!(
+            catch.h_width == hcw && catch.n_embd == cfg.n_embd,
+            "Qwen3.8 MTP catch workspace belongs to an incompatible model"
+        );
+        let alloc = |bytes, usage| be.alloc(bytes, usage).map_err(|e| anyhow!("{e}"));
+        let kv_spec = qwen4_mtp_kv_spec(cfg, max_ctx)?;
+        let (k_cache, v_cache, segmented_kv) = match be
+            .alloc_segmented_kv(kv_spec)
+            .map_err(|e| anyhow!("{e}"))?
+        {
+            Some(k_cache) => {
+                let v_cache = be
+                    .alloc_segmented_kv(kv_spec)
+                    .map_err(|e| anyhow!("{e}"))?
+                    .ok_or_else(|| {
+                        anyhow!("Qwen3.8 MTP segmented KV support disappeared during allocation")
+                    })?;
+                (k_cache, v_cache, true)
+            }
+            None => (
+                alloc(kv_spec.logical_bytes, BufferUsage::KvCache)?,
+                alloc(kv_spec.logical_bytes, BufferUsage::KvCache)?,
+                false,
+            ),
+        };
         let draft_id = alloc(4, BufferUsage::Staging)?;
         let draft_h = alloc(hcw * 4, BufferUsage::Staging)?;
         let draft_positions = [
@@ -1050,29 +1301,154 @@ impl Qwen4MtpSession {
             alloc(4, BufferUsage::Readback)?,
             alloc(4, BufferUsage::Readback)?,
         ];
+        let catch_batch = catch
+            .buffers
+            .lock()
+            .map_err(|_| anyhow!("Qwen3.8 MTP catch workspace poisoned"))?
+            .max_batch;
         tracing::info!(
-            path = %sidecar_path.display(),
             draft_tokens = DRAFT_TOKENS,
             max_ctx,
-            catch_batch = max_batch,
+            catch_batch,
+            kv_mode = if segmented_kv {
+                "segmented-32k"
+            } else {
+                "flat"
+            },
             "loaded fixed Qwen3.8 MTP sidecar runtime"
         );
         Ok(Self {
             cfg: cfg.clone(),
             max_ctx,
-            max_batch,
-            weights,
-            specs,
-            k_cache,
-            v_cache,
-            catch_ids,
-            catch_h,
-            catch_positions,
+            fixed,
+            kv_spec,
+            kv: Mutex::new(Qwen4MtpKvCache {
+                k: k_cache,
+                v: v_cache,
+                segmented: segmented_kv,
+                committed_tokens: 0,
+            }),
+            catch,
             draft_id,
             draft_h,
             draft_positions,
             draft_ids,
         })
+    }
+
+    fn kv_for_depth<'a>(
+        &'a self,
+        be: &dyn Backend,
+        tokens: usize,
+    ) -> Result<MutexGuard<'a, Qwen4MtpKvCache>> {
+        anyhow::ensure!(
+            tokens <= self.max_ctx,
+            "Qwen3.8 MTP KV depth {tokens} exceeds the session capacity {}",
+            self.max_ctx
+        );
+        let mut kv = self
+            .kv
+            .lock()
+            .map_err(|_| anyhow!("Qwen3.8 MTP KV state poisoned"))?;
+        if kv.segmented && !be.segmented_kv_available() {
+            let alloc = || {
+                be.alloc(self.kv_spec.logical_bytes, BufferUsage::KvCache)
+                    .map_err(|e| anyhow!("{e}"))
+            };
+            let k = alloc()?;
+            let v = alloc()?;
+            kv.k = k;
+            kv.v = v;
+            kv.segmented = false;
+            tracing::info!(
+                bytes_per_side = self.kv_spec.logical_bytes,
+                "Qwen3.8 MTP head KV uses flat storage because no unified VRAM arena is active"
+            );
+        }
+        if !kv.segmented || tokens <= kv.committed_tokens {
+            return Ok(kv);
+        }
+        let segments = tokens.div_ceil(crate::seam::KV_GROW_ROWS);
+        be.ensure_segmented_kv_batch(&[kv.k.as_ref(), kv.v.as_ref()], segments)
+            .map_err(|e| anyhow!("commit Qwen3.8 MTP segmented KV growth: {e}"))?;
+        let committed_tokens = (segments * crate::seam::KV_GROW_ROWS).min(self.max_ctx);
+        kv.committed_tokens = committed_tokens;
+        tracing::info!(
+            requested_tokens = tokens,
+            committed_tokens,
+            segments,
+            "expanded Qwen3.8 MTP head KV cache"
+        );
+        Ok(kv)
+    }
+
+    pub(crate) fn kv_prefix_bytes(&self, tokens: usize) -> Result<usize> {
+        anyhow::ensure!(
+            tokens <= self.max_ctx,
+            "Qwen3.8 MTP KV depth {tokens} exceeds the session capacity {}",
+            self.max_ctx
+        );
+        let row_bytes = self
+            .kv_spec
+            .logical_bytes
+            .checked_div(self.max_ctx)
+            .ok_or_else(|| anyhow!("Qwen3.8 MTP KV row byte count is undefined"))?;
+        tokens
+            .checked_mul(row_bytes)
+            .ok_or_else(|| anyhow!("Qwen3.8 MTP KV prefix byte count overflow"))
+    }
+
+    pub(crate) fn kv_prefix<'a>(
+        &'a self,
+        be: &dyn Backend,
+        tokens: usize,
+    ) -> Result<Qwen4MtpKvView<'a>> {
+        let bytes_per_side = self.kv_prefix_bytes(tokens)?;
+        let kv = self.kv_for_depth(be, tokens)?;
+        Ok(Qwen4MtpKvView { kv, bytes_per_side })
+    }
+
+    pub(crate) fn copy_prefix_from(
+        &self,
+        be: &dyn Backend,
+        src: &Qwen4MtpSession,
+        tokens: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.max_ctx == src.max_ctx && self.kv_spec == src.kv_spec,
+            "Qwen3.8 MTP seed source has incompatible KV geometry"
+        );
+        anyhow::ensure!(
+            !std::ptr::eq(self, src),
+            "Qwen3.8 MTP cannot seed a session from itself"
+        );
+        let src = src.kv_prefix(be, tokens)?;
+        let dst = self.kv_prefix(be, tokens)?;
+        let bytes = src.bytes_per_side();
+        anyhow::ensure!(
+            bytes == dst.bytes_per_side(),
+            "Qwen3.8 MTP seed byte count changed between slots"
+        );
+        be.copy_buffers(&[(src.k(), dst.k(), bytes), (src.v(), dst.v(), bytes)])
+            .map_err(|error| anyhow!("copy Qwen3.8 MTP head KV prefix: {error}"))
+    }
+
+    pub(crate) fn release_kv(&self, be: &dyn Backend) -> Result<()> {
+        be.sync()
+            .map_err(|error| anyhow!("sync before Qwen3.8 MTP KV release: {error}"))?;
+        let mut kv = self
+            .kv
+            .lock()
+            .map_err(|_| anyhow!("Qwen3.8 MTP KV state poisoned"))?;
+        if !kv.segmented || kv.committed_tokens == 0 {
+            return Ok(());
+        }
+        be.release_segmented_kv(kv.k.as_ref())
+            .map_err(|error| anyhow!("release Qwen3.8 MTP K cache: {error}"))?;
+        be.release_segmented_kv(kv.v.as_ref())
+            .map_err(|error| anyhow!("release Qwen3.8 MTP V cache: {error}"))?;
+        kv.committed_tokens = 0;
+        Ok(())
     }
 
     fn bind_common<'a>(
@@ -1084,7 +1460,7 @@ impl Qwen4MtpSession {
         embd: &'a dyn Buffer,
         lm_head: &'a dyn Buffer,
     ) {
-        for (id, buffer) in weights.iter().copied().zip(&self.weights) {
+        for (id, buffer) in weights.iter().copied().zip(&self.fixed.weights) {
             bindings.bind(id, buffer.as_ref());
         }
         bindings.bind(embd_id, embd);
@@ -1097,6 +1473,7 @@ impl Qwen4MtpSession {
         tokens: &[u32],
         h: &[f32],
         start_pos: usize,
+        mrope: Option<&crate::seam::MropePlan>,
         shared: SharedWeights<'_>,
     ) -> Result<()> {
         let hcw = self.cfg.hc_mult * self.cfg.n_embd;
@@ -1107,40 +1484,129 @@ impl Qwen4MtpSession {
                 tokens.len()
             );
         }
-        for (chunk, token_rows) in tokens.chunks(self.max_batch).enumerate() {
-            let off = chunk * self.max_batch;
+        if let Some(plan) = mrope {
+            anyhow::ensure!(
+                plan.prompt_pos4.len().is_multiple_of(4),
+                "Qwen3.8 MTP multimodal position table has {} values",
+                plan.prompt_pos4.len(),
+            );
+            anyhow::ensure!(
+                self.cfg.rope_sections.iter().sum::<u32>() > 0,
+                "Qwen3.8 MTP multimodal RoPE sections are empty"
+            );
+        }
+        let catch = self
+            .catch
+            .buffers
+            .lock()
+            .map_err(|_| anyhow!("Qwen3.8 MTP catch workspace poisoned"))?;
+        for (chunk, token_rows) in tokens.chunks(catch.max_batch).enumerate() {
+            let off = chunk * catch.max_batch;
             let rows = token_rows.len();
             let pos = start_pos + off;
             if pos + rows > self.max_ctx {
                 bail!("Qwen3.8 MTP catch-up exceeds {} token cache", self.max_ctx);
             }
+            let kv = self.kv_for_depth(be, pos + rows)?;
             let ids = token_rows
                 .iter()
                 .map(|&token| token as i32)
                 .collect::<Vec<_>>();
-            let positions = (pos as i32..(pos + rows) as i32).collect::<Vec<_>>();
-            be.upload(self.catch_ids.as_ref(), bytemuck::cast_slice(&ids))
+            let positions4 = if let Some(plan) = mrope {
+                let prompt_rows = plan.prompt_pos4.len() / 4;
+                (pos..pos + rows)
+                    .map(|position| {
+                        if position < prompt_rows {
+                            Ok(plan.prompt_pos4[position * 4..position * 4 + 4]
+                                .try_into()
+                                .expect("MRoPE row has four positions"))
+                        } else {
+                            let offset = i32::try_from(position - prompt_rows)
+                                .map_err(|_| anyhow!("Qwen3.8 MTP decode position exceeds i32"))?;
+                            let position = plan
+                                .decode_base
+                                .checked_add(offset)
+                                .ok_or_else(|| anyhow!("Qwen3.8 MTP decode position overflow"))?;
+                            Ok([position, position, position, 0])
+                        }
+                    })
+                    .collect::<Result<Vec<[i32; 4]>>>()?
+            } else {
+                Vec::new()
+            };
+            let positions = if positions4.is_empty() {
+                (pos as i32..(pos + rows) as i32).collect::<Vec<_>>()
+            } else {
+                positions4.iter().map(|row| row[0]).collect::<Vec<_>>()
+            };
+            let mut override_ranges = Vec::new();
+            let mut override_values = Vec::new();
+            if let Some(plan) = mrope {
+                for (index, span) in plan.spans.iter().enumerate() {
+                    let span_end = span.start.checked_add(span.n_tokens).ok_or_else(|| {
+                        anyhow!("Qwen3.8 MTP image span #{index} overflows token indices")
+                    })?;
+                    anyhow::ensure!(
+                        span.embeds.len() == span.n_tokens * self.cfg.n_embd,
+                        "Qwen3.8 MTP image span #{index} has {} embedding values, expected {}",
+                        span.embeds.len(),
+                        span.n_tokens * self.cfg.n_embd,
+                    );
+                    let lo = span.start.max(pos);
+                    let hi = span_end.min(pos + rows);
+                    if lo >= hi {
+                        continue;
+                    }
+                    let source_start = (lo - span.start) * self.cfg.n_embd;
+                    let source_end = (hi - span.start) * self.cfg.n_embd;
+                    override_ranges.push((lo - pos, hi - lo));
+                    override_values.extend_from_slice(&span.embeds[source_start..source_end]);
+                }
+            }
+            be.upload(catch.ids.as_ref(), bytemuck::cast_slice(&ids))
                 .map_err(|e| anyhow!("{e}"))?;
             be.upload(
-                self.catch_h.as_ref(),
+                catch.h.as_ref(),
                 bytemuck::cast_slice(&h[off * hcw..(off + rows) * hcw]),
             )
             .map_err(|e| anyhow!("{e}"))?;
-            be.upload(
-                self.catch_positions.as_ref(),
-                bytemuck::cast_slice(&positions),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
+            be.upload(catch.positions.as_ref(), bytemuck::cast_slice(&positions))
+                .map_err(|e| anyhow!("{e}"))?;
+            if mrope.is_some() {
+                be.upload(catch.positions4.as_ref(), bytemuck::cast_slice(&positions4))
+                    .map_err(|e| anyhow!("{e}"))?;
+            }
+            if !override_values.is_empty() {
+                be.upload(
+                    catch.embedding_overrides.as_ref(),
+                    bytemuck::cast_slice(&override_values),
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+            }
             let specs = [(shared.0 .1, shared.0 .2), (shared.1 .1, shared.1 .2)];
-            let (graph, handles) =
-                build_catch_graph(&self.cfg, &self.specs, specs, self.max_ctx, rows, pos);
+            let (graph, handles) = build_catch_graph(
+                &self.cfg,
+                &self.fixed.specs,
+                specs,
+                self.max_ctx,
+                rows,
+                pos,
+                &override_ranges,
+                mrope.is_some(),
+            );
             let plan = be.compile(&graph).map_err(|e| anyhow!("{e}"))?;
             let mut bindings = Bindings::new();
-            bindings.bind(handles.ids, self.catch_ids.as_ref());
-            bindings.bind(handles.h, self.catch_h.as_ref());
-            bindings.bind(handles.positions, self.catch_positions.as_ref());
-            bindings.bind(handles.k_cache, self.k_cache.as_ref());
-            bindings.bind(handles.v_cache, self.v_cache.as_ref());
+            bindings.bind(handles.ids, catch.ids.as_ref());
+            bindings.bind(handles.h, catch.h.as_ref());
+            bindings.bind(handles.positions, catch.positions.as_ref());
+            if let Some(id) = handles.positions4 {
+                bindings.bind(id, catch.positions4.as_ref());
+            }
+            if let Some(id) = handles.embedding_overrides {
+                bindings.bind(id, catch.embedding_overrides.as_ref());
+            }
+            bindings.bind(handles.k_cache, kv.k.as_ref());
+            bindings.bind(handles.v_cache, kv.v.as_ref());
             self.bind_common(
                 &mut bindings,
                 &handles.weights,
@@ -1155,12 +1621,14 @@ impl Qwen4MtpSession {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn draft(
         &self,
         be: &dyn Backend,
         token: u32,
         h: &[f32],
         start_pos: usize,
+        rope_start_pos: i32,
         verify_tokens: usize,
         shared: SharedWeights<'_>,
     ) -> Result<Vec<u32>> {
@@ -1178,21 +1646,24 @@ impl Qwen4MtpSession {
         if start_pos + verify_tokens > self.max_ctx {
             bail!("Qwen3.8 MTP draft exceeds {} token cache", self.max_ctx);
         }
+        let kv = self.kv_for_depth(be, start_pos + verify_tokens)?;
         be.upload(self.draft_id.as_ref(), bytemuck::bytes_of(&(token as i32)))
             .map_err(|e| anyhow!("{e}"))?;
         be.upload(self.draft_h.as_ref(), bytemuck::cast_slice(h))
             .map_err(|e| anyhow!("{e}"))?;
         for (step, buffer) in self.draft_positions[..verify_tokens].iter().enumerate() {
-            be.upload(
-                buffer.as_ref(),
-                bytemuck::bytes_of(&((start_pos + step) as i32)),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
+            let step = i32::try_from(step)
+                .map_err(|_| anyhow!("Qwen3.8 MTP draft position exceeds i32"))?;
+            let position = rope_start_pos
+                .checked_add(step)
+                .ok_or_else(|| anyhow!("Qwen3.8 MTP draft position overflow"))?;
+            be.upload(buffer.as_ref(), bytemuck::bytes_of(&position))
+                .map_err(|e| anyhow!("{e}"))?;
         }
         let specs = [(shared.0 .1, shared.0 .2), (shared.1 .1, shared.1 .2)];
         let (graph, handles) = build_draft_graph(
             &self.cfg,
-            &self.specs,
+            &self.fixed.specs,
             specs,
             self.max_ctx,
             start_pos,
@@ -1202,8 +1673,8 @@ impl Qwen4MtpSession {
         let mut bindings = Bindings::new();
         bindings.bind(handles.id, self.draft_id.as_ref());
         bindings.bind(handles.h, self.draft_h.as_ref());
-        bindings.bind(handles.k_cache, self.k_cache.as_ref());
-        bindings.bind(handles.v_cache, self.v_cache.as_ref());
+        bindings.bind(handles.k_cache, kv.k.as_ref());
+        bindings.bind(handles.v_cache, kv.v.as_ref());
         for (id, buffer) in handles.positions.into_iter().zip(&self.draft_positions) {
             bindings.bind(id, buffer.as_ref());
         }
@@ -1246,19 +1717,9 @@ impl Qwen4MtpRuntime {
         sidecar_path: &Path,
         max_ctx: usize,
     ) -> Result<Self> {
-        let bind: &BindWeightFn = &|_name, bytes, dtype, _numel| {
-            let bytes = bytes.materialize();
-            let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
-            let buffer = vk
-                .alloc(padded.len(), BufferUsage::Weights)
-                .map_err(|e| anyhow!("{e}"))?;
-            vk.upload(buffer.as_ref(), &padded)
-                .map_err(|e| anyhow!("{e}"))?;
-            Ok((buffer, dtype))
-        };
         let catch_batch = crate::seam::ubatch_rows(model.engine_cfg());
-        let head =
-            Qwen4MtpSession::new(vk, bind, sidecar_path, model.config(), max_ctx, catch_batch)?;
+        let fixed = Qwen4MtpSession::load_fixed_vulkan(vk, sidecar_path, model.config())?;
+        let head = Qwen4MtpSession::with_fixed(vk, fixed, max_ctx, catch_batch)?;
         Ok(Self {
             head,
             trunk: None,
@@ -1292,13 +1753,9 @@ impl Qwen4MtpRuntime {
         if prompt_tokens.is_empty() {
             bail!("Qwen3.8 MTP received an empty prompt");
         }
-        if prompt_tokens.len() + max_new + DRAFT_TOKENS > self.max_ctx {
-            bail!(
-                "Qwen3.8 MTP needs {} context rows, but its fixed runtime has {}",
-                prompt_tokens.len() + max_new + DRAFT_TOKENS,
-                self.max_ctx
-            );
-        }
+        // `max_new` is a ceiling, not a capacity demand. Match ordinary decode by clipping it to
+        // the remaining window while retaining the four rows a full VERIFY cycle may touch.
+        let max_new = generation_budget(prompt_tokens.len(), max_new, self.max_ctx)?;
         self.reset();
 
         let t_prime = std::time::Instant::now();
@@ -1311,8 +1768,11 @@ impl Qwen4MtpRuntime {
             self.max_ctx,
         )?;
         let p = prompt_tokens.len();
+        let mut reasoning_eos_guard =
+            crate::sampling::Qwen4ReasoningEosGuard::from_prompt(cfg, &prompt_tokens);
         let prime_chunk = crate::seam::ubatch_rows(ec).max(1);
         let mut pending_token = None;
+        let mut pending_logits = Vec::new();
         // MTP row i consumes target hidden row i-1. Stream prompt-prime hidden rows through the
         // detached head one ubatch at a time instead of materializing two full-context arrays.
         // At 200k context the old `prime_h` plus `shifted_h` pair occupied about 15 GiB on the
@@ -1329,7 +1789,7 @@ impl Qwen4MtpRuntime {
             } else {
                 None
             };
-            let (frontier, chunk_h) = super::run_qwen4_prime_frontier_with_finish(
+            let (frontier, frontier_logits, chunk_h) = super::run_qwen4_prime_frontier_with_finish(
                 vk,
                 &*target_bind,
                 model.gguf(),
@@ -1339,6 +1799,7 @@ impl Qwen4MtpRuntime {
                 &prompt_tokens[..chunk_end],
                 &mut self.trunk,
                 self.max_ctx,
+                None,
                 finish,
             )?;
             anyhow::ensure!(
@@ -1363,13 +1824,31 @@ impl Qwen4MtpRuntime {
                     &prompt_tokens[chunk_start..chunk_end],
                     &shifted_h,
                     chunk_start,
+                    None,
                     shared,
                 )?;
             }
             previous_h.copy_from_slice(&chunk_h[(rows - 1) * h_width..]);
             pending_token = Some(frontier);
+            pending_logits = frontier_logits;
         }
         let mut pending_token = pending_token.expect("non-empty prompt has a frontier token");
+        if reasoning_eos_guard.blocks(cfg, pending_token, ec.sampling.ignore_eos) {
+            anyhow::ensure!(
+                pending_logits.len() == cfg.vocab,
+                "Qwen3.8 MTP prime EOS repair expected {} logits, got {}",
+                cfg.vocab,
+                pending_logits.len()
+            );
+            reasoning_eos_guard.mask_eos(cfg, &mut pending_logits);
+            let blocked = pending_token;
+            pending_token = super::argmax_row(&pending_logits);
+            tracing::warn!(
+                blocked_token = blocked,
+                replacement_token = pending_token,
+                "Qwen3.8 MTP suppressed premature EOS inside an open reasoning block"
+            );
+        }
         self.trunk
             .as_mut()
             .expect("target prime initialized a trunk")
@@ -1404,8 +1883,16 @@ impl Qwen4MtpRuntime {
                     .as_ref()
                     .expect("target trunk remains initialized")
                     .mtp_shared_weights();
-                self.head
-                    .draft(vk, pending_token, &pending_h, n_past, verify_tokens, shared)?
+                self.head.draft(
+                    vk,
+                    pending_token,
+                    &pending_h,
+                    n_past,
+                    i32::try_from(n_past)
+                        .map_err(|_| anyhow!("Qwen3.8 MTP position exceeds i32"))?,
+                    verify_tokens,
+                    shared,
+                )?
             };
             let draft_secs = t_draft.elapsed().as_secs_f64();
             timing.draft_secs += draft_secs;
@@ -1429,7 +1916,7 @@ impl Qwen4MtpRuntime {
                 self.trunk.is_none(),
                 self.max_ctx,
             )?;
-            let (verify_ids, verify_h) = super::run_verify_with_finish(
+            let (mut verify_ids, mut verify_logits, verify_h) = super::run_verify_with_finish(
                 vk,
                 &*target_bind,
                 model.gguf(),
@@ -1451,6 +1938,30 @@ impl Qwen4MtpRuntime {
                 verify_ids.len(),
                 verify_h.len()
             );
+
+            let mut verify_guard = reasoning_eos_guard;
+            for row in 0..verify_tokens {
+                verify_guard.observe(cfg, feed[n_past + row]);
+                if !verify_guard.blocks(cfg, verify_ids[row], ec.sampling.ignore_eos) {
+                    continue;
+                }
+                anyhow::ensure!(
+                    verify_logits.len() == verify_tokens * cfg.vocab,
+                    "Qwen3.8 MTP EOS repair expected {} logits, got {}",
+                    verify_tokens * cfg.vocab,
+                    verify_logits.len()
+                );
+                let logits = &mut verify_logits[row * cfg.vocab..(row + 1) * cfg.vocab];
+                verify_guard.mask_eos(cfg, logits);
+                let blocked = verify_ids[row];
+                verify_ids[row] = super::argmax_row(logits);
+                tracing::warn!(
+                    row,
+                    blocked_token = blocked,
+                    replacement_token = verify_ids[row],
+                    "Qwen3.8 MTP suppressed premature EOS inside an open reasoning block"
+                );
+            }
 
             let accepted_spec = (0..verify_tokens - 1)
                 .take_while(|&i| candidates[i] == verify_ids[i])
@@ -1494,6 +2005,7 @@ impl Qwen4MtpRuntime {
             for token in emitted {
                 let eos = hit_eos(token);
                 generated += 1;
+                reasoning_eos_guard.observe(cfg, token);
                 if !eos {
                     crate::stream_token(
                         model.tokenizer(),
@@ -1532,5 +2044,37 @@ impl Qwen4MtpRuntime {
             },
             timing,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{generation_budget, mtp_kv_spec};
+
+    #[test]
+    fn generation_budget_clips_a_large_reply_to_the_remaining_context() {
+        assert_eq!(
+            generation_budget(200_000, 102_400, 262_144).unwrap(),
+            62_140
+        );
+    }
+
+    #[test]
+    fn generation_budget_preserves_a_reply_that_fits() {
+        assert_eq!(generation_budget(150_000, 512, 262_144).unwrap(), 512);
+    }
+
+    #[test]
+    fn generation_budget_rejects_a_prompt_without_verify_room() {
+        assert!(generation_budget(262_141, 1, 262_144).is_err());
+    }
+
+    #[test]
+    fn head_kv_uses_independent_32k_f16_segments() {
+        let spec = mtp_kv_spec(2 * 256, 163_840).unwrap();
+        assert_eq!(spec.logical_bytes, 163_840 * 512 * 2);
+        assert_eq!(spec.segment_bytes, 32 * 1024 * 512 * 2);
+        assert_eq!(spec.segment_elements, 32 * 1024 * 512);
+        assert_eq!(spec.max_segments, 5);
     }
 }

@@ -17,9 +17,15 @@ try {
 }
 
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$updateCommonPath = Join-Path $PSScriptRoot 'moe4all-update-common.ps1'
+if (-not (Test-Path -LiteralPath $updateCommonPath -PathType Leaf)) {
+    throw "Missing update support file: $updateCommonPath"
+}
+. $updateCommonPath
 $releaseInfrPath = Join-Path $repoRoot 'infr.exe'
 $sourceInfrPath = Join-Path $repoRoot 'target\release\infr.exe'
-$infrPath = if (Test-Path -LiteralPath $releaseInfrPath -PathType Leaf) {
+$script:IsPackagedInstall = Test-Path -LiteralPath $releaseInfrPath -PathType Leaf
+$infrPath = if ($script:IsPackagedInstall) {
     $releaseInfrPath
 } else {
     $sourceInfrPath
@@ -153,6 +159,63 @@ function Read-Choice {
     }
 }
 
+function Get-VulkanDeviceOptions {
+    $process = $null
+    try {
+        $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = $infrPath
+        $startInfo.Arguments = 'devices'
+        $startInfo.WorkingDirectory = [System.IO.Path]::GetDirectoryName($infrPath)
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+
+        $process = [System.Diagnostics.Process]::new()
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) {
+            throw 'process did not start'
+        }
+        $stdout = $process.StandardOutput.ReadToEnd()
+        $stderr = $process.StandardError.ReadToEnd()
+        $process.WaitForExit()
+        $exitCode = $process.ExitCode
+    } catch {
+        Write-Warning "无法枚举 Vulkan 设备，将保留引擎自动选择：$($_.Exception.Message) / Could not enumerate Vulkan devices; engine auto-selection remains available."
+        return @()
+    } finally {
+        if ($null -ne $process) {
+            $process.Dispose()
+        }
+    }
+    if ($exitCode -ne 0) {
+        $detail = $stderr.Trim()
+        if ($detail) { $detail = ": $detail" }
+        Write-Warning "Vulkan 设备枚举失败（退出码 $exitCode）$detail。将保留引擎自动选择。Vulkan device enumeration failed (exit code $exitCode); engine auto-selection remains available."
+        return @()
+    }
+
+    $options = [System.Collections.Generic.List[object]]::new()
+    $lines = @($stdout -split '\r?\n')
+    foreach ($line in $lines) {
+        $text = [string]$line
+        if ($text -notmatch '^\s*(Vulkan\d+):\s+(.+?)\s+\[([^\]]+)\](\s+<-\s+default)?\s*$') {
+            continue
+        }
+        $value = $Matches[1]
+        $name = $Matches[2]
+        $details = $Matches[3]
+        $isDefault = -not [string]::IsNullOrWhiteSpace($Matches[4])
+        [void]$options.Add([pscustomobject]@{
+            Key = ($options.Count + 1).ToString()
+            Value = $value
+            Label = ('{0}: {1} [{2}]' -f $value, $name, $details)
+            IsDefault = $isDefault
+        })
+    }
+    return $options.ToArray()
+}
+
 function ConvertTo-FullPath {
     param([Parameter(Mandatory = $true)][string]$Value)
     $value = $Value.Trim()
@@ -183,6 +246,35 @@ function ConvertTo-FullPath {
         return [System.IO.Path]::GetFullPath($value)
     }
     return [System.IO.Path]::GetFullPath((Join-Path $repoRoot $value))
+}
+
+function Show-RecommendedModelDownloads {
+    $downloads = @(
+        [pscustomobject]@{
+            Name = 'Qwen3.6 35B APEX-I-Balanced'
+            Url = 'https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/resolve/main/Qwen3.6-35B-A3B-APEX-I-Balanced.gguf?download=true'
+        }
+        [pscustomobject]@{
+            Name = 'Qwen3.8 Flash-Next AD-4.27bpw-Q4_K_M-M64（33 个主模型分片 / 33 main-model shards）'
+            Url = 'https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/tree/main/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64'
+        }
+        [pscustomobject]@{
+            Name = 'Qwen3.8 Flash-Next F16 视觉文件 / vision projector'
+            Url = 'https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/mmproj-Qwen3.8-Flash-Next-F16.gguf?download=true'
+        }
+        [pscustomobject]@{
+            Name = 'Qwen3.8 Flash-Next shared Q4_K_M MTP 头 / MTP head'
+            Url = 'https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf?download=true'
+        }
+    )
+
+    Write-Host "`n官方推荐的模型 / Official recommended models" -ForegroundColor Cyan
+    foreach ($download in $downloads) {
+        Write-Host " $($download.Name)"
+        Write-Host "   $($download.Url)" -ForegroundColor DarkGray
+    }
+    Write-Host '下载后请输入主模型 GGUF 路径；视觉与 MTP 文件可在后续步骤选择。' -ForegroundColor DarkGray
+    Write-Host 'After downloading, enter the main-model GGUF path; vision and MTP files are selected later.' -ForegroundColor DarkGray
 }
 
 function Select-ModelPath {
@@ -228,17 +320,22 @@ function Select-ModelPath {
     }
 
     if ($models.Count -gt 0) {
-        Write-Host "`n模型 / Model" -ForegroundColor Cyan
-        for ($i = 0; $i -lt $models.Count; $i++) {
-            Write-Host (" [{0}] {1}" -f ($i + 1), $models[$i])
-        }
-        Write-Host ' [N] 输入新路径，或直接粘贴路径 / Enter a new path, or paste it directly'
         while ($true) {
+            Write-Host "`n模型 / Model" -ForegroundColor Cyan
+            for ($i = 0; $i -lt $models.Count; $i++) {
+                Write-Host (" [{0}] {1}" -f ($i + 1), $models[$i])
+            }
+            Write-Host ' [R] 官方推荐的模型 / Official recommended models'
+            Write-Host ' [N] 输入新路径，或直接粘贴路径 / Enter a new path, or paste it directly'
             $choice = (Read-Host '选择模型 [1] / Select model [1]').Trim()
             if ([string]::IsNullOrWhiteSpace($choice)) { return $models[0] }
             $index = 0
             if ([int]::TryParse($choice, [ref]$index) -and $index -ge 1 -and $index -le $models.Count) {
                 return $models[$index - 1]
+            }
+            if ($choice -match '^(r|recommended|推荐)$') {
+                Show-RecommendedModelDownloads
+                continue
             }
             if ($choice -match '^(n|new|新)$') { break }
             try {
@@ -251,6 +348,8 @@ function Select-ModelPath {
             }
             Write-Host '选择无效或找不到该模型文件。Invalid selection or model file not found.' -ForegroundColor Yellow
         }
+    } else {
+        Show-RecommendedModelDownloads
     }
 
     while ($true) {
@@ -460,42 +559,189 @@ function Get-EngineVersion {
     return 'unknown'
 }
 
-function ConvertTo-ComparableVersion {
-    param([Parameter(Mandatory = $true)][string]$Value)
-    if ($Value -match '(\d+)\.(\d+)\.(\d+)') {
-        return [version]::new([int]$Matches[1], [int]$Matches[2], [int]$Matches[3])
+function Get-LatestEngineRelease {
+    param([Parameter(Mandatory = $true)][string]$CurrentVersion)
+
+    $headers = @{
+        Accept = 'application/vnd.github+json'
+        'User-Agent' = "MoE4All-Wizard/$CurrentVersion"
+        'X-GitHub-Api-Version' = '2022-11-28'
     }
-    return $null
+    $response = Invoke-RestMethod -Uri 'https://api.github.com/repos/Headmaster218/MoE4All/releases?per_page=30' -Headers $headers -TimeoutSec 5 -ErrorAction Stop
+    $release = Select-Moe4AllEngineRelease -Releases @($response)
+    if ($null -eq $release) {
+        throw 'No stable Engine release with a Windows archive and SHA-256 file was found.'
+    }
+    return $release
+}
+
+function Show-EngineReleaseNotes {
+    param([Parameter(Mandatory = $true)]$Release)
+
+    Write-Host "`n$($Release.Name)" -ForegroundColor Cyan
+    if (-not [string]::IsNullOrWhiteSpace([string]$Release.PublishedAt)) {
+        Write-Host "Published: $($Release.PublishedAt)" -ForegroundColor DarkGray
+    }
+    Write-Host (Format-Moe4AllReleaseNotes -Notes ([string]$Release.Notes))
+    Write-Host "`n$($Release.Url)" -ForegroundColor Cyan
+}
+
+function Read-EngineUpdateAction {
+    param([Parameter(Mandatory = $true)]$Release)
+
+    while ($true) {
+        Write-Host "`n发现新版本 / Update available: $($Release.Tag)" -ForegroundColor Yellow
+        Write-Host '   [1] 查看更新说明 / View release notes'
+        Write-Host '   [2] 下载并更新 / Download and update'
+        Write-Host '   [3] 暂不更新 / Not now'
+        $value = (Read-Host '选择 / Select').Trim().ToLowerInvariant()
+        switch ($value) {
+            { $_ -in @('1', 'r', 'release', 'notes') } {
+                Show-EngineReleaseNotes -Release $Release
+                continue
+            }
+            { $_ -in @('2', 'y', 'yes', 'update') } { return 'update' }
+            { $_ -in @('3', 'n', 'no', 'later') } { return 'skip' }
+            default {
+                Write-Host '请选择 1、2 或 3；此处没有默认选项。Select 1, 2 or 3; there is no default.' -ForegroundColor Yellow
+            }
+        }
+    }
+}
+
+function Test-EngineProcessRunning {
+    foreach ($process in @(Get-Process -Name 'infr' -ErrorAction SilentlyContinue)) {
+        try {
+            if ($process.Path -and ([System.IO.Path]::GetFullPath($process.Path)).Equals($releaseInfrPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $true
+            }
+        } catch {
+            # Process paths can be inaccessible across integrity levels.
+        }
+    }
+    return $false
+}
+
+function Invoke-EngineSelfUpdate {
+    param([Parameter(Mandatory = $true)]$Release)
+
+    if (-not $script:IsPackagedInstall) {
+        Write-Host '源码工作区不会自动覆盖；请更新源码后重新构建。Source checkouts are not overwritten automatically.' -ForegroundColor Yellow
+        Write-Host $Release.Url -ForegroundColor Cyan
+        return $false
+    }
+    if (Test-EngineProcessRunning) {
+        Write-Host '当前安装目录中的 infr.exe 正在运行；请停止服务后重试。The installed infr.exe is running; stop it and try again.' -ForegroundColor Yellow
+        return $false
+    }
+
+    $updateRoot = Join-Path $repoRoot '.update'
+    $runRoot = Join-Path $updateRoot ("staging-" + [guid]::NewGuid().ToString('N'))
+    $archivePath = Join-Path $runRoot $Release.ArchiveName
+    $checksumPath = Join-Path $runRoot $Release.ChecksumName
+    $extractRoot = Join-Path $runRoot 'extracted'
+    New-Item -ItemType Directory -Path $runRoot -Force | Out-Null
+
+    try {
+        $headers = @{ 'User-Agent' = "MoE4All-Wizard/$productVersion" }
+        Write-Host "`n正在下载 $($Release.ArchiveName) / Downloading $($Release.ArchiveName)..." -ForegroundColor Cyan
+        Invoke-WebRequest -Uri $Release.ArchiveUrl -Headers $headers -OutFile $archivePath -UseBasicParsing -TimeoutSec 900
+        Invoke-WebRequest -Uri $Release.ChecksumUrl -Headers $headers -OutFile $checksumPath -UseBasicParsing -TimeoutSec 60
+
+        if ($Release.ArchiveSize -gt 0 -and (Get-Item -LiteralPath $archivePath).Length -ne $Release.ArchiveSize) {
+            throw 'Downloaded archive size does not match the GitHub release asset.'
+        }
+        $checksumText = Get-Content -LiteralPath $checksumPath -Raw -Encoding UTF8
+        $checksumPattern = '(?im)^\s*([a-f0-9]{64})\s+\*?' + [regex]::Escape($Release.ArchiveName) + '\s*$'
+        if ($checksumText -notmatch $checksumPattern) {
+            throw "The SHA-256 file does not contain an entry for $($Release.ArchiveName)."
+        }
+        $expectedHash = $Matches[1]
+        $actualHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash
+        if (-not $actualHash.Equals($expectedHash, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Downloaded archive failed SHA-256 verification.'
+        }
+
+        Write-Host '正在校验更新包 / Validating update package...' -ForegroundColor Cyan
+        Expand-Archive -LiteralPath $archivePath -DestinationPath $extractRoot -Force
+        $manifests = @(Get-ChildItem -LiteralPath $extractRoot -Filter 'install-manifest.json' -File -Recurse)
+        if ($manifests.Count -ne 1) { throw 'The update archive must contain exactly one install-manifest.json.' }
+        $packageRoot = $manifests[0].Directory.FullName
+        $manifest = Read-Moe4AllInstallManifest -ManifestPath $manifests[0].FullName -PackageRoot $packageRoot -VerifyFiles
+        if ([string]$manifest.version -ne [string]$Release.Version) {
+            throw "Release version $($Release.Version) does not match package version $($manifest.version)."
+        }
+        $stagedBinary = Join-Path $packageRoot 'infr.exe'
+        $versionOutput = (& $stagedBinary --version 2>$null | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0 -or $versionOutput -notmatch [regex]::Escape("infr $($Release.Version)")) {
+            throw "The staged engine failed version validation: $versionOutput"
+        }
+
+        $stagedHelper = Join-Path $packageRoot 'scripts\apply-engine-update.ps1'
+        $temporaryHelper = Join-Path ([System.IO.Path]::GetTempPath()) ("MoE4All-Engine-Updater-" + [guid]::NewGuid().ToString('N') + '.ps1')
+        Copy-Item -LiteralPath $stagedHelper -Destination $temporaryHelper -Force
+        $argumentText = @(
+            '-NoLogo'
+            '-NoProfile'
+            '-File'
+            ('"' + $temporaryHelper + '"')
+            '-InstallRoot'
+            ('"' + $repoRoot + '"')
+            '-StagedPackageRoot'
+            ('"' + $packageRoot + '"')
+            '-ExpectedVersion'
+            ('"' + $Release.Version + '"')
+            '-ParentProcessId'
+            ([string]$PID)
+            '-CleanupRoot'
+            ('"' + $runRoot + '"')
+            '-DeleteSelf'
+        ) -join ' '
+        Start-Process -FilePath 'powershell.exe' -ArgumentList $argumentText -WorkingDirectory $repoRoot -WindowStyle Normal | Out-Null
+        Write-Host '更新包已准备完成，向导将退出并由更新助手完成替换。Update is staged; the helper will finish after this wizard exits.' -ForegroundColor Green
+        exit 42
+    } catch {
+        if (Test-Path -LiteralPath $runRoot) {
+            Remove-Item -LiteralPath $runRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Write-Host "更新失败，现有安装未改变。Update failed; the current installation was not changed.`n$($_.Exception.Message)" -ForegroundColor Red
+        Write-Host $Release.Url -ForegroundColor Cyan
+        return $false
+    }
+}
+
+function Show-PendingUpdateResult {
+    $resultPath = Join-Path $repoRoot '.update\last-update-result.json'
+    if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) { return }
+    try {
+        $result = Get-Content -LiteralPath $resultPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $color = if ([string]$result.status -eq 'success') { 'Green' } else { 'Red' }
+        Write-Host ([string]$result.message) -ForegroundColor $color
+    } catch {
+        Write-Host '上次更新留下了无法读取的结果。The previous update left an unreadable result.' -ForegroundColor Yellow
+    } finally {
+        Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Show-UpdateStatus {
     param([Parameter(Mandatory = $true)][string]$CurrentVersion)
 
     $disabled = [Environment]::GetEnvironmentVariable('MOE4ALL_NO_UPDATE_CHECK', 'Process')
-    if ($SkipUpdateCheck -or $disabled -match '^(1|true|yes|on)$') {
-        return
-    }
-    $current = ConvertTo-ComparableVersion $CurrentVersion
-    if ($null -eq $current) {
-        return
-    }
+    if ($SkipUpdateCheck -or $disabled -match '^(1|true|yes|on)$') { return }
+    $current = ConvertTo-Moe4AllSemVer $CurrentVersion
+    if ($null -eq $current) { return }
 
     try {
-        $headers = @{
-            Accept = 'application/vnd.github+json'
-            'User-Agent' = "MoE4All-Wizard/$CurrentVersion"
-        }
-        $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/Headmaster218/MoE4All/releases/latest' -Headers $headers -TimeoutSec 3 -ErrorAction Stop
-        $latestText = [string]$release.tag_name
-        $latest = ConvertTo-ComparableVersion $latestText
-        if ($null -ne $latest -and $latest -gt $current) {
-            Write-Host "发现新版本 / Update available: $latestText" -ForegroundColor Yellow
-            Write-Host ([string]$release.html_url) -ForegroundColor Cyan
-        } elseif ($null -ne $latest) {
+        $release = Get-LatestEngineRelease -CurrentVersion $CurrentVersion
+        if ((Compare-Moe4AllSemVer $release.SemVer $current) -gt 0) {
+            $action = Read-EngineUpdateAction -Release $release
+            if ($action -eq 'update') { [void](Invoke-EngineSelfUpdate -Release $release) }
+        } else {
             Write-Host "更新检查 / Update check: v$CurrentVersion is current" -ForegroundColor DarkGray
         }
     } catch {
-        Write-Host '更新检查不可用，继续离线启动。Update check unavailable; continuing offline.' -ForegroundColor DarkGray
+        Write-Host "更新检查不可用，继续离线启动。Update check unavailable; continuing offline. $($_.Exception.Message)" -ForegroundColor DarkGray
     }
 }
 
@@ -523,6 +769,7 @@ Write-Host '============================================================' -Foreg
 Write-Host 'MoE4All 启动向导 / MoE4All Launch Wizard' -ForegroundColor Green
 Write-Host '上次设置会作为默认值；直接回车即可复用。Press Enter to reuse the previous value.'
 Write-Host "引擎 / Engine: $infrPath" -ForegroundColor DarkGray
+Show-PendingUpdateResult
 Show-UpdateStatus -CurrentVersion $productVersion
 
 $launchMode = Read-Choice -Label '你想做什么？/ What would you like to do?' -DefaultValue ([string](Get-SavedValue 'launch_mode' 'chat')) -Options @(
@@ -531,6 +778,24 @@ $launchMode = Read-Choice -Label '你想做什么？/ What would you like to do?
     [pscustomobject]@{ Key = '3'; Value = 'benchmark'; Label = '性能测试 / Benchmark' }
 )
 $modelPath = Select-ModelPath -InitialPath $InitialModelPath
+
+$savedDevice = [string](Get-SavedValue 'device' '')
+$device = ''
+$deviceOptions = @(Get-VulkanDeviceOptions)
+if ($deviceOptions.Count -eq 1) {
+    $device = [string]$deviceOptions[0].Value
+    Write-Host "`n设备 / Device" -ForegroundColor Cyan
+    Write-Host "  $($deviceOptions[0].Label)"
+} elseif ($deviceOptions.Count -gt 1) {
+    $availableDevice = $deviceOptions | Where-Object { $_.Value -eq $savedDevice } | Select-Object -First 1
+    if ($null -eq $availableDevice) {
+        $availableDevice = $deviceOptions | Where-Object { $_.IsDefault } | Select-Object -First 1
+    }
+    if ($null -eq $availableDevice) {
+        $availableDevice = $deviceOptions[0]
+    }
+    $device = Read-Choice -Label '计算设备 / Compute device' -DefaultValue ([string]$availableDevice.Value) -Options $deviceOptions
+}
 
 $setupModeDefault = 'conservative'
 if ($null -ne $script:Saved) {
@@ -555,7 +820,6 @@ $setupMode = Read-Choice -Label '配置方式 / Configuration' -DefaultValue $se
     [pscustomobject]@{ Key = '3'; Value = 'manual'; Label = '全手动配置 / Fully manual configuration' }
 )
 
-$device = [string](Get-SavedValue 'device' '')
 $context = [string](Get-SavedValue 'context' '')
 $ubatch = [string](Get-SavedValue 'ubatch' '')
 $threads = [string](Get-SavedValue 'threads' '')
@@ -568,7 +832,9 @@ $configureMemory = [bool](Get-SavedValue 'configure_memory' $false)
 if ($setupMode -eq 'manual') {
     Write-Host "`n高级通用设置 / Advanced common settings" -ForegroundColor Cyan
     Write-Host '各项留空即可继续使用引擎的硬件探测与自动预算。Leave values blank to keep engine auto-detection.' -ForegroundColor DarkGray
-    $device = Read-TextValue -Label '设备，留空为自动 / Device, blank for auto' -Default $device
+    if ($deviceOptions.Count -eq 0) {
+        $device = Read-TextValue -Label '设备，留空为自动 / Device, blank for auto' -Default $savedDevice
+    }
     $context = Read-TextValue -Label '上下文窗口，留空为自动 / Context window, blank for auto' -Default $context
     $ubatch = Read-IntegerValue -Label 'Ubatch，留空为自动 / Ubatch, blank for auto' -Default $ubatch -Minimum 1 -AllowBlank
     $threads = Read-IntegerValue -Label 'CPU 线程，留空为全部 / CPU threads, blank for all' -Default $threads -Minimum 1 -AllowBlank
@@ -689,9 +955,13 @@ $topP = [string](Get-SavedValue 'top_p' '')
 $seed = [string](Get-SavedValue 'seed' '')
 $serverAddr = [string](Get-SavedValue 'server_addr' '127.0.0.1:8080')
 $serverParallel = [string](Get-SavedValue 'server_parallel' '1')
-$defaultSessionCacheDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'MoE4All\kv-sessions'
+$defaultSessionCacheDir = Join-Path $repoRoot 'kv-sessions'
+$legacySessionCacheDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'MoE4All\kv-sessions'
 $serverSessionCache = [bool](Get-SavedValue 'server_session_cache' $false)
 $sessionCacheDir = [string](Get-SavedValue 'session_cache_dir' $defaultSessionCacheDir)
+if ([string]::Equals($sessionCacheDir, $legacySessionCacheDir, [System.StringComparison]::OrdinalIgnoreCase)) {
+    $sessionCacheDir = $defaultSessionCacheDir
+}
 $sessionIdleSecs = [string](Get-SavedValue 'session_idle_secs' '120')
 $sessionCacheMax = [string](Get-SavedValue 'session_cache_max' '5GiB')
 $sessionCacheTtlHours = [string](Get-SavedValue 'session_cache_ttl_hours' '24')
@@ -772,10 +1042,10 @@ if ($launchMode -eq 'benchmark') {
         $seed = Read-IntegerValue -Label '随机种子，留空为随机 / Seed, blank for random' -Default $seed -Minimum 0 -AllowBlank
     }
 
-    $mtpEnabled = Read-YesNo -Label '启用 Qwen3.8 MTP 单路加速？/ Enable Qwen3.8 MTP single-stream acceleration?' -Default $mtpEnabled
+    $mtpEnabled = Read-YesNo -Label '启用 Qwen3.8 MTP 加速？/ Enable Qwen3.8 MTP acceleration?' -Default $mtpEnabled
     if ($mtpEnabled) {
-        Write-Host 'MTP 当前仅支持 Qwen3.8 Vulkan、greedy 解码和单并发；API 请求指定非零 temperature 时会自动回退普通 decode。' -ForegroundColor Yellow
-        Write-Host 'MTP currently supports Qwen3.8 Vulkan, greedy decoding and one request at a time. API requests with non-zero temperature fall back to ordinary decode.' -ForegroundColor DarkGray
+        Write-Host 'MTP 当前仅支持 Qwen3.8 Vulkan 和 greedy 解码；非 greedy API 请求会回退普通 decode。' -ForegroundColor Yellow
+        Write-Host 'MTP currently supports Qwen3.8 Vulkan and greedy decoding. Non-greedy API requests fall back to ordinary decode.' -ForegroundColor DarkGray
         $mtpModelPath = Select-MtpModelPath -Default $mtpModelPath
         $mtpVerifyTokens = Read-Choice -Label 'MTP 批量验证宽度 / MTP batched verification width' -DefaultValue $mtpVerifyTokens -Options @(
             [pscustomobject]@{ Key = '1'; Value = '4'; Label = '4 tokens（推荐）/ 4 tokens (recommended)' }
@@ -790,12 +1060,26 @@ if ($launchMode -eq 'benchmark') {
         Write-Host 'Use 127.0.0.1 locally. For LAN access use 0.0.0.0 and enable an API key.' -ForegroundColor DarkGray
         $serverAddr = Read-ListenAddress -Label '监听地址（IP:端口）/ Listen address (IP:port)' -Default $serverAddr
         if ($mtpEnabled) {
-            $serverParallel = '1'
-            $serverSessionCache = $false
-            Write-Host 'MTP v1 使用串行单会话服务；并发数固定为 1，SSD 会话 KV 缓存关闭。' -ForegroundColor Yellow
-            Write-Host 'MTP v1 uses the serialized single-session server; parallelism is fixed at 1 and the SSD session cache is disabled.' -ForegroundColor DarkGray
+            $mtpParallelDefault = if ($serverParallel -eq '2') { '2' } else { '1' }
+            $serverParallel = Read-Choice -Label 'API 并发会话数 / Concurrent API slots' -DefaultValue $mtpParallelDefault -Options @(
+                [pscustomobject]@{ Key = '1'; Value = '1'; Label = '单路 MTP / Single-stream MTP' }
+                [pscustomobject]@{ Key = '2'; Value = '2'; Label = '双槽机会式 MTP（推荐）/ Two slots, opportunistic MTP (recommended)' }
+            )
+            if ($serverParallel -eq '2' -and $mtpVerifyTokens -ne '4') {
+                $mtpVerifyTokens = '4'
+                Write-Host '双槽机会式 MTP 固定使用 4-token 验证。Two-slot opportunistic MTP uses fixed 4-token verification.' -ForegroundColor Yellow
+            }
+            if ($serverParallel -eq '2') {
+                Write-Host '只有一个活跃会话时使用 MTP；两个会话同时解码时自动切换普通批量 decode，恢复单会话后切回 MTP。' -ForegroundColor Cyan
+                Write-Host 'MTP is used with one active request. Two active decodes automatically use ordinary batched decode, then return to MTP when one remains.' -ForegroundColor DarkGray
+            }
         } else {
             $serverParallel = Read-IntegerValue -Label '并发会话数（每个会话有独立 KV）/ Concurrent slots (one KV cache each)' -Default $serverParallel -Minimum 1
+        }
+        if ($mtpEnabled -and $serverParallel -eq '1') {
+            $serverSessionCache = $false
+            Write-Host '单路 MTP 沿用串行服务，SSD 会话 KV 缓存关闭。Single-stream MTP keeps the serialized server and disables SSD session caching.' -ForegroundColor DarkGray
+        } else {
             $serverSessionCache = Read-YesNo -Label '将闲置会话 KV 缓存到 SSD？/ Cache idle-session KV on SSD?' -Default $serverSessionCache
             if ($serverSessionCache) {
                 Write-Host '闲置会话会在后台写入 SSD 并释放显存；再次访问时自动恢复。仅支持动态分段 Q8 KV。' -ForegroundColor DarkGray
@@ -807,25 +1091,18 @@ if ($launchMode -eq 'benchmark') {
                 $sessionCacheTtlHours = Read-IntegerValue -Label '缓存保留小时数，0 为不按时间清理 / Cache TTL hours, 0 disables age expiry' -Default $sessionCacheTtlHours -Minimum 0
             }
         }
-        if ($mtpEnabled) {
-            $serverVision = $false
-            $serverEmbedding = $false
-            Write-Host 'MTP v1 暂不与视觉或同进程 Embedding API 同时启用。' -ForegroundColor Yellow
-            Write-Host 'MTP v1 cannot currently be combined with vision or the in-process Embedding API.' -ForegroundColor DarkGray
-        } else {
-            $serverVision = Read-YesNo -Label '启用视觉图片理解？/ Enable image understanding?' -Default $serverVision
-            if ($serverVision) {
-                Write-Host '视觉权重按图片请求从 SSD 临时载入统一显存，处理完全部图片后立即释放。API 图片请使用 data URI 或 base64。' -ForegroundColor DarkGray
-                Write-Host 'Vision weights use request-scoped unified VRAM and are released after the image batch. API images must be data URIs or base64.' -ForegroundColor DarkGray
-                $visionProjectorPath = Select-VisionProjectorPath -Default $visionProjectorPath
-            }
-            $serverEmbedding = Read-YesNo -Label '同时提供 Embedding API？/ Also serve the Embedding API?' -Default $serverEmbedding
-            if ($serverEmbedding) {
-                Write-Host 'Embedding 首次请求时从 GGUF/SSD 载入统一显存；空闲超时后释放，不建立额外 RAM 权重缓存。' -ForegroundColor DarkGray
-                Write-Host 'Weights load from GGUF/SSD into unified VRAM on demand and are released after the idle timeout; no extra RAM weight cache is kept.' -ForegroundColor DarkGray
-                $embeddingModelPath = Select-EmbeddingModelPath -Default $embeddingModelPath
-                $embeddingIdleTimeout = Read-IntegerValue -Label 'Embedding 空闲释放秒数，0 为服务期间常驻 / Idle eviction seconds, 0 keeps resident' -Default $embeddingIdleTimeout -Minimum 0
-            }
+        $serverVision = Read-YesNo -Label '启用视觉图片理解？/ Enable image understanding?' -Default $serverVision
+        if ($serverVision) {
+            Write-Host '视觉权重按图片请求从 SSD 临时载入统一显存，处理完全部图片后立即释放。API 图片请使用 data URI 或 base64。' -ForegroundColor DarkGray
+            Write-Host 'Vision weights use request-scoped unified VRAM and are released after the image batch. API images must be data URIs or base64.' -ForegroundColor DarkGray
+            $visionProjectorPath = Select-VisionProjectorPath -Default $visionProjectorPath
+        }
+        $serverEmbedding = Read-YesNo -Label '同时提供 Embedding API？/ Also serve the Embedding API?' -Default $serverEmbedding
+        if ($serverEmbedding) {
+            Write-Host 'Embedding 首次请求时从 GGUF/SSD 载入统一显存；空闲超时后释放，不建立额外 RAM 权重缓存。' -ForegroundColor DarkGray
+            Write-Host 'Weights load from GGUF/SSD into unified VRAM on demand and are released after the idle timeout; no extra RAM weight cache is kept.' -ForegroundColor DarkGray
+            $embeddingModelPath = Select-EmbeddingModelPath -Default $embeddingModelPath
+            $embeddingIdleTimeout = Read-IntegerValue -Label 'Embedding 空闲释放秒数，0 为服务期间常驻 / Idle eviction seconds, 0 keeps resident' -Default $embeddingIdleTimeout -Minimum 0
         }
         $serverAuth = Read-YesNo -Label '启用 Bearer API key 鉴权？/ Enable Bearer API-key authentication?' -Default $serverAuth
         if ($serverAuth) {
@@ -851,9 +1128,9 @@ $nativeArgs = [System.Collections.Generic.List[string]]::new()
     'server' { 'serve' }
     default { 'run' }
 }))
+if (-not [string]::IsNullOrWhiteSpace($device)) { [void]$nativeArgs.Add('--dev'); [void]$nativeArgs.Add($device) }
 if ($setupMode -eq 'manual') {
     if (-not [string]::IsNullOrWhiteSpace($configPath)) { [void]$nativeArgs.Add('--config'); [void]$nativeArgs.Add($configPath) }
-    if (-not [string]::IsNullOrWhiteSpace($device)) { [void]$nativeArgs.Add('--dev'); [void]$nativeArgs.Add($device) }
     if (-not [string]::IsNullOrWhiteSpace($ubatch)) { [void]$nativeArgs.Add('--ubatch'); [void]$nativeArgs.Add($ubatch) }
     if (-not [string]::IsNullOrWhiteSpace($threads)) { [void]$nativeArgs.Add('--threads'); [void]$nativeArgs.Add($threads) }
 }

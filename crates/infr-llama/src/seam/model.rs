@@ -121,6 +121,26 @@ fn pick_continuation(
         .map(|(idx, _, _)| idx)
 }
 
+/// Map a separately-tokenized rendered prefix back onto the actual prompt token stream.
+/// Tokenizers may merge a few tokens across the prefix/body boundary, so an exact token prefix
+/// is preferred but a small mismatch confined to the hint's tail is still a stable checkpoint.
+fn checkpoint_boundary(prompt: &[u32], hint: &[u32]) -> Option<usize> {
+    const MAX_TOKENIZER_BOUNDARY_TAIL: usize = 8;
+
+    if hint.is_empty() {
+        return None;
+    }
+    let common = prompt
+        .iter()
+        .zip(hint)
+        .take_while(|(actual, expected)| actual == expected)
+        .count();
+    (common > 0
+        && common < prompt.len()
+        && hint.len().saturating_sub(common) <= MAX_TOKENIZER_BOUNDARY_TAIL)
+        .then_some(common)
+}
+
 /// Open a Vulkan backend on physical device `dev`: `Some(idx)` pins `VulkanN`
 /// ([`infr_vulkan::VulkanBackend::new_on_with`], bypassing `device.dev`/the discrete-default rule
 /// for the multi-device path), `None` is the historical default
@@ -272,8 +292,10 @@ impl SlotPool {
             self.last_used.push(self.tick);
             return Ok(0);
         }
-        let score =
-            |st: &Option<crate::seam::SeamKv>| st.as_ref().map_or(0, |s| s.prefix_score(prompt));
+        let score = |st: &Option<crate::seam::SeamKv>| {
+            st.as_ref()
+                .map_or(0, |s| s.seedable_prefix_len(cfg, prompt))
+        };
         // A slot whose cache the prompt EXTENDS (or equals) is this conversation continuing — pick
         // the one with the LONGEST reusable prefix, not merely the first (see `pick_continuation`).
         let cont = pick_continuation(
@@ -342,10 +364,11 @@ impl SlotPool {
             // only when it beats whatever prefix the slot already shares with the prompt.
             if best_s > score(&self.slots[target]) {
                 let src = self.slots[best_i].take().expect("scored slot is Some");
-                if let Some(dst) = self.slots[target].as_mut() {
-                    dst.seed_from(be, cfg, ec, &src, best_s)?;
-                }
+                let seeded = self.slots[target]
+                    .as_mut()
+                    .map_or(Ok(0), |dst| dst.seed_from(be, cfg, ec, &src, best_s));
                 self.slots[best_i] = Some(src);
+                seeded?;
             }
         }
         self.last_used[target] = self.tick;
@@ -392,6 +415,15 @@ impl SeamModel {
             None => build_tokenizer(&g)?,
         };
         add_chat_eos(&mut cfg, &tokenizer);
+        if cfg.qwen4exp {
+            cfg.qwen4_think_start = tokenizer.token_to_id("<think>");
+            cfg.qwen4_think_end = tokenizer.token_to_id("</think>");
+            if cfg.qwen4_think_start.is_none() || cfg.qwen4_think_end.is_none() {
+                tracing::warn!(
+                    "Qwen3.8 reasoning EOS guard disabled because the tokenizer has no atomic <think>/</think> tokens"
+                );
+            }
+        }
         // `token_embd.weight` is NOT dequantized here — see the field's doc. `Config::from_gguf`
         // above already read its shape, so a model missing the tensor still fails at load, not on
         // the lazy path below.
@@ -813,10 +845,33 @@ impl SeamModel {
         stable_prefix: Option<&str>,
         constraint: Option<&mut crate::grammar::Constraint>,
         req: Option<&crate::sampling::RequestCtx>,
+        on_piece: impl FnMut(&str),
+    ) -> Result<crate::GenStats> {
+        self.generate_vulkan_session_turn_with_checkpoints_constrained(
+            session,
+            prompt,
+            max_new,
+            crate::seam::TurnCheckpointPrefixes::edit(stable_prefix),
+            constraint,
+            req,
+            on_piece,
+        )
+    }
+
+    /// Server-facing stateful generation with both the reusable agent prefix and the prefix before
+    /// the latest editable message retained as recurrent checkpoints.
+    pub fn generate_vulkan_session_turn_with_checkpoints_constrained(
+        &self,
+        session: &mut DenseVulkanSession,
+        prompt: &str,
+        max_new: usize,
+        checkpoint_prefixes: crate::seam::TurnCheckpointPrefixes<'_>,
+        constraint: Option<&mut crate::grammar::Constraint>,
+        req: Option<&crate::sampling::RequestCtx>,
         mut on_piece: impl FnMut(&str),
     ) -> Result<crate::GenStats> {
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
-        let turn_checkpoint = self.turn_checkpoint(&prompt_tokens, stable_prefix)?;
+        let turn_checkpoint = self.turn_checkpoints(&prompt_tokens, checkpoint_prefixes)?;
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
         let slot = session
@@ -860,22 +915,24 @@ impl SeamModel {
         Ok(stats)
     }
 
-    pub(crate) fn turn_checkpoint(
+    pub(crate) fn turn_checkpoints(
         &self,
         prompt_tokens: &[u32],
-        stable_prefix: Option<&str>,
+        prefixes: crate::seam::TurnCheckpointPrefixes<'_>,
     ) -> Result<Option<crate::seam::TurnCheckpoint>> {
-        let Some(stable_prefix) = stable_prefix else {
+        if prefixes.agent.is_none() && prefixes.edit.is_none() {
             return Ok(None);
+        }
+        let boundary = |prefix: Option<&str>| -> Result<Option<usize>> {
+            let Some(prefix) = prefix else {
+                return Ok(None);
+            };
+            let tokens = self.encode(prefix)?;
+            Ok(checkpoint_boundary(prompt_tokens, &tokens))
         };
-        let stable_tokens = self.encode(stable_prefix)?;
-        let boundary = (!stable_tokens.is_empty()
-            && stable_tokens.len() < prompt_tokens.len()
-            && prompt_tokens.starts_with(&stable_tokens))
-        .then_some(stable_tokens.len());
-        Ok(Some(boundary.map_or(
-            crate::seam::TurnCheckpoint::Enable,
-            crate::seam::TurnCheckpoint::Boundary,
+        Ok(Some(crate::seam::TurnCheckpoint::new(
+            boundary(prefixes.agent)?,
+            boundary(prefixes.edit)?,
         )))
     }
 
@@ -2673,5 +2730,41 @@ mod pick_continuation_tests {
         assert_eq!(pick_continuation(candidates, 100), None);
         // Empty candidate set.
         assert_eq!(pick_continuation(std::iter::empty(), 100), None);
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_boundary_tests {
+    use super::checkpoint_boundary;
+
+    #[test]
+    fn accepts_an_exact_strict_prefix() {
+        assert_eq!(checkpoint_boundary(&[10, 20, 30], &[10, 20]), Some(2));
+    }
+
+    #[test]
+    fn trims_a_small_tokenizer_boundary_mismatch() {
+        assert_eq!(
+            checkpoint_boundary(&[10, 20, 30, 40, 50], &[10, 20, 31, 41]),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn rejects_an_early_or_large_mismatch() {
+        assert_eq!(
+            checkpoint_boundary(
+                &[10, 99, 30, 40, 50, 60, 70, 80, 90, 100, 110],
+                &[10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn requires_a_nonempty_strict_prompt_prefix() {
+        assert_eq!(checkpoint_boundary(&[10, 20], &[]), None);
+        assert_eq!(checkpoint_boundary(&[10, 20], &[10, 20]), None);
+        assert_eq!(checkpoint_boundary(&[10, 20], &[99]), None);
     }
 }

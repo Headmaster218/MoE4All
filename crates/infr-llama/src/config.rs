@@ -38,6 +38,10 @@ pub struct Config {
     /// All tokens that end generation (the GGUF eos plus `<|im_end|>` / `<|endoftext|>` when present
     /// in the vocab). A chat model can emit any of these; stopping only on `eos` lets it ramble.
     pub eos_ids: Vec<u32>,
+    /// Qwen3.8's template-level reasoning delimiters. These stay `None` for every other
+    /// architecture and are resolved from the tokenizer after the GGUF config is parsed.
+    pub qwen4_think_start: Option<u32>,
+    pub qwen4_think_end: Option<u32>,
     /// Qwen3-style per-head RMSNorm on Q and K before RoPE.
     pub qk_norm: bool,
     /// Qwen2/2.5 add a learned bias to the q/k/v projections (`Wx + b`); Qwen3 dropped them. o-proj
@@ -119,7 +123,7 @@ pub struct Config {
     /// Qwen3.8 Flash Next (`qwen4exp`): Qwen-style recurrent/full attention wrapped in four
     /// low-rank gated residual streams, plus PLE and a routed/shared-expert MoE.
     pub qwen4exp: bool,
-    /// Ling 3.0 Flash (`bailingmoe3`): hybrid KDA/MLA mixer and DeepSeek-style MoE.
+    /// Ling 3.0 (`bailingmoe3`): hybrid KDA/MLA mixer and DeepSeek-style MoE.
     pub bailingmoe3: bool,
     /// Per-layer mixer selector for `bailingmoe3`: true is MLA, false is KDA. Empty elsewhere.
     pub bailing_mla_layers: Vec<bool>,
@@ -236,15 +240,15 @@ pub struct Config {
     /// through [`Config::layer_compress_ratio`], which is the accessor every consumer should use.
     /// Empty for every model that is neither `deepseek4` nor qwen4exp.
     pub compress_ratios: Vec<usize>,
-    /// DeepSeek V4 (`{arch}.swiglu_clamp_exp`): per-layer clamp on the routed experts' SwiGLU. The
-    /// GGUF may carry ONE value (broadcast to every layer) or a full array, which is why this is a
-    /// `Vec` even for a uniform model — same shape as [`Config::n_ff_layers`]. Empty for every
-    /// non-`deepseek4` model. **V4 clamps the gate PRE-SiLU** where every other arch clamps
-    /// post-SiLU; the graph slice owns that difference.
+    /// DeepSeek V4 / Ling (`{arch}.swiglu_clamp_exp`): per-layer clamp on the routed experts'
+    /// SwiGLU. The GGUF may carry one value (broadcast to every layer) or a full array. Ling makes
+    /// the key optional; an absent key is represented by per-layer zeroes and disables clamping.
+    /// **V4 clamps the gate PRE-SiLU** where Ling clamps post-SiLU; the graph slice owns that
+    /// difference.
     pub swiglu_clamp_exp: Vec<f32>,
-    /// DeepSeek V4 (`{arch}.swiglu_clamp_shexp`): the same clamp for the SHARED expert. The
-    /// reference falls back to [`Config::swiglu_clamp_exp`] when the key is absent, so these two are
-    /// equal on a GGUF that declares only the routed one. Empty for every non-`deepseek4` model.
+    /// DeepSeek V4 / Ling (`{arch}.swiglu_clamp_shexp`): the same clamp for the shared expert.
+    /// DeepSeek V4 falls back to [`Config::swiglu_clamp_exp`] when absent; Ling treats this key as
+    /// independently optional and uses zeroes when it is absent.
     pub swiglu_clamp_shexp: Vec<f32>,
     /// DeepSeek V4 (`{arch}.hash_layer_count`): the first this-many layers are HASH-routed — they
     /// carry a `ffn_gate_tid2eid` token-id→expert-id table INSTEAD of the `exp_probs_b` router bias
@@ -1052,13 +1056,34 @@ impl Config {
                 other => other.as_f64().map(|f| vec![f as f32; n_layer]),
             }
         };
-        let (swiglu_clamp_exp, swiglu_clamp_shexp) = if deepseek4 || bailingmoe3 {
+        let (swiglu_clamp_exp, swiglu_clamp_shexp) = if deepseek4 {
             let key = mk("swiglu_clamp_exp");
             let exp = clamp_arr("swiglu_clamp_exp").with_context(|| format!("{key} missing"))?;
             if exp.len() < n_layer {
                 bail!("{key} has {} entries for {n_layer} layers", exp.len());
             }
             let shexp = clamp_arr("swiglu_clamp_shexp").unwrap_or_else(|| exp.clone());
+            if shexp.len() < n_layer {
+                bail!(
+                    "{} has {} entries for {n_layer} layers",
+                    mk("swiglu_clamp_shexp"),
+                    shexp.len()
+                );
+            }
+            (exp, shexp)
+        } else if bailingmoe3 {
+            // llama.cpp's bailingmoe3 loader reads both keys with `required = false`. Ling 3.0
+            // Tiny publishes neither because its HF clamp lists are null; Flash GGUFs may publish
+            // either independently. A zero limit is the graph's explicit "clamp disabled" value.
+            let exp = clamp_arr("swiglu_clamp_exp").unwrap_or_else(|| vec![0.0; n_layer]);
+            if exp.len() < n_layer {
+                bail!(
+                    "{} has {} entries for {n_layer} layers",
+                    mk("swiglu_clamp_exp"),
+                    exp.len()
+                );
+            }
+            let shexp = clamp_arr("swiglu_clamp_shexp").unwrap_or_else(|| vec![0.0; n_layer]);
             if shexp.len() < n_layer {
                 bail!(
                     "{} has {} entries for {n_layer} layers",
@@ -1115,11 +1140,11 @@ impl Config {
         // (`deepseek2.cpp::load_arch_hparams`), which misclassifies any other model with the same
         // depth; the tensors say it directly.
         // V3.2 is never lite — `deepseek32.cpp` reads `q_lora_rank` unconditionally and its tensor
-        // loader has no `attn_q` arm at all — so the presence test does not run for it. Without
-        // this a V3.2 file that happened to carry a `blk.0.attn_q.weight` would drop the whole
-        // wq_a/q_a_norm/wq_b path the model actually has.
+        // loader has no `attn_q` arm at all — so the presence test does not run for it. Ling is
+        // hybrid: layer 0 may be KDA and therefore legitimately has `attn_q.weight`, while its MLA
+        // layers still use the full LoRA triple. The lite convention belongs only to DeepSeek2.
         let is_lite =
-            mla_arch && !deepseek32 && g.tensors().iter().any(|t| t.name == "blk.0.attn_q.weight");
+            deepseek2 && !deepseek32 && g.tensors().iter().any(|t| t.name == "blk.0.attn_q.weight");
         let n_embd = meta_u64(g, &mk("embedding_length")).context("embedding_length")? as usize;
         let n_head = positive_model_dimension(
             &mk("attention.head_count"),
@@ -1816,6 +1841,8 @@ impl Config {
             vocab,
             eos,
             eos_ids: vec![eos],
+            qwen4_think_start: None,
+            qwen4_think_end: None,
             qk_norm,
             qkv_bias,
             permute_qk_neox,

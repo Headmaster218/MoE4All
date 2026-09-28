@@ -115,6 +115,15 @@ pub(crate) const VENDOR_AMD: u32 = 0x1002;
 pub(crate) const VENDOR_INTEL: u32 = 0x8086;
 pub(crate) const VENDOR_NVIDIA: u32 = 0x10de;
 
+/// NVIDIA's Windows driver can accept roughly 29-31 GiB of external host-memory aliases and then
+/// lose the device on the first real transfer. Stop below that cliff; unaliased RAM remains fully
+/// usable through the pager's direct/staged upload fallback.
+pub(crate) const NVIDIA_WINDOWS_HOST_DMA_IMPORT_LIMIT: usize = 28 * (1 << 30);
+
+pub(crate) fn host_dma_import_limit(vendor_id: u32, windows: bool) -> Option<usize> {
+    (windows && vendor_id == VENDOR_NVIDIA).then_some(NVIDIA_WINDOWS_HOST_DMA_IMPORT_LIMIT)
+}
+
 /// The GPU architecture generation, bucketed the way llama.cpp's `get_device_architecture` buckets
 /// it (`ggml/src/ggml-vulkan/ggml-vulkan.cpp:404`, read at pin 030ebb5) — from PROBES, never from
 /// PCI device ids. infr uses it for one thing today: deciding whether a driver's cooperative-matrix
@@ -646,6 +655,17 @@ pub(crate) fn check_push_constant_size(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_dma_import_limit_only_applies_to_nvidia_on_windows() {
+        assert_eq!(
+            host_dma_import_limit(VENDOR_NVIDIA, true),
+            Some(28 * (1 << 30))
+        );
+        assert_eq!(host_dma_import_limit(VENDOR_AMD, true), None);
+        assert_eq!(host_dma_import_limit(VENDOR_INTEL, true), None);
+        assert_eq!(host_dma_import_limit(VENDOR_NVIDIA, false), None);
+    }
 
     // ── tile selection ──────────────────────────────────────────────────────────────────────────
 

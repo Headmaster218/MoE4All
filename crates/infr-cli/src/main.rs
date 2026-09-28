@@ -350,6 +350,12 @@ enum Cmd {
     /// device the default (no `--dev`) path binds. The index is the `--dev VulkanN` / `INFR_DEV`
     /// handle. Reports each device's external-memory extensions (GPU↔GPU / dma-buf feasibility).
     Devices,
+    /// Print current host RAM and selected-device VRAM availability as JSON without loading a
+    /// model. Launchers can use this to decide whether starting an engine is safe.
+    Resources {
+        #[command(flatten)]
+        device: DeviceOpts,
+    },
     /// Render a chat history with the model tokenizer and fill it to a precise token depth.
     #[command(name = "__test-plan-prompt", hide = true)]
     TestPlanPrompt {
@@ -696,6 +702,7 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(infr_server::terminal_log_writer)
         .with_ansi(stderr_is_terminal)
+        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::rfc_3339())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
@@ -787,6 +794,9 @@ fn cli_flag_layer(cmd: &Cmd) -> anyhow::Result<PartialConfig> {
         Cmd::ServeEmbedding { device, .. } => {
             device.overrides(&mut layer)?;
         }
+        Cmd::Resources { device } => {
+            device.overrides(&mut layer)?;
+        }
         Cmd::Bench { device, .. } => {
             device.overrides(&mut layer)?;
             // Benchmarks decode a FIXED, deterministic token count (llama-bench semantics): greedy
@@ -809,6 +819,7 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
     match cmd {
         Cmd::Pull { model } => cmd_pull(&model, cfg),
         Cmd::Devices => cmd_devices(cfg),
+        Cmd::Resources { .. } => cmd_resources(cfg),
         Cmd::TestPlanPrompt {
             model,
             messages,
@@ -1268,6 +1279,28 @@ fn cmd_test_plan_prompt(
             "target_tokens": target,
             "filler_repeats": best.0,
             "output": output,
+        })
+    );
+    Ok(())
+}
+
+fn cmd_resources(cfg: &Config) -> anyhow::Result<()> {
+    let devices = infr_vulkan::VulkanBackend::enumerate_devices(cfg).map_err(|e| anyhow!("{e}"))?;
+    let selected = devices
+        .iter()
+        .find(|device| device.is_default_pick)
+        .ok_or_else(|| anyhow!("no Vulkan physical devices found"))?;
+    // print-ok: machine-readable output of the hidden resource-probing command.
+    println!(
+        "{}",
+        serde_json::json!({
+            "ram_total_bytes": infr_core::hostmem::total_bytes(),
+            "ram_available_bytes": infr_core::hostmem::available_bytes(),
+            "vram_total_bytes": selected.vram_total_bytes,
+            "vram_available_bytes": selected.vram_available_bytes,
+            "vram_live": selected.vram_live,
+            "device": format!("Vulkan{}", selected.index),
+            "device_name": selected.name,
         })
     );
     Ok(())
@@ -2188,7 +2221,7 @@ trait GenBackend: Send + Sync {
     fn generate(
         &self,
         prompt: &str,
-        stable_prefix: Option<&str>,
+        checkpoint_prefixes: infr_llama::seam::TurnCheckpointPrefixes<'_>,
         max_new: usize,
         constraint: Option<&mut infr_llama::grammar::Constraint>,
         req: &infr_llama::sampling::RequestCtx,
@@ -2198,7 +2231,7 @@ trait GenBackend: Send + Sync {
     fn generate_multimodal(
         &self,
         _prompt: &str,
-        _stable_prefix: Option<&str>,
+        _checkpoint_prefixes: infr_llama::seam::TurnCheckpointPrefixes<'_>,
         _images: &[String],
         _max_new: usize,
         _req: &infr_llama::sampling::RequestCtx,
@@ -2235,31 +2268,21 @@ impl GenBackend for SeamGenerator {
     fn generate(
         &self,
         prompt: &str,
-        stable_prefix: Option<&str>,
+        checkpoint_prefixes: infr_llama::seam::TurnCheckpointPrefixes<'_>,
         max_new: usize,
         constraint: Option<&mut infr_llama::grammar::Constraint>,
         req: &infr_llama::sampling::RequestCtx,
         on_piece: &mut dyn FnMut(&str),
     ) -> anyhow::Result<infr_llama::GenStats> {
         let mut model = self.model.lock().expect("serve generator poisoned");
-        match constraint {
-            Some(c) => model.generate_constrained_turn(
-                prompt,
-                stable_prefix,
-                max_new,
-                c,
-                Some(req),
-                on_piece,
-            ),
-            None => model.generate_turn_with_step_hook(
-                prompt,
-                stable_prefix,
-                max_new,
-                Some(req),
-                on_piece,
-                None,
-            ),
-        }
+        model.generate_with_checkpoints(
+            prompt,
+            checkpoint_prefixes,
+            max_new,
+            constraint,
+            Some(req),
+            on_piece,
+        )
     }
 
     fn reset(&self) {
@@ -2289,22 +2312,26 @@ impl GenBackend for ParallelGenerator {
     fn generate(
         &self,
         prompt: &str,
-        stable_prefix: Option<&str>,
+        checkpoint_prefixes: infr_llama::seam::TurnCheckpointPrefixes<'_>,
         max_new: usize,
         constraint: Option<&mut infr_llama::grammar::Constraint>,
         req: &infr_llama::sampling::RequestCtx,
         on_piece: &mut dyn FnMut(&str),
     ) -> anyhow::Result<infr_llama::GenStats> {
-        self.engine
-            .generate_turn(prompt, stable_prefix, max_new, constraint, req, |p| {
-                on_piece(p)
-            })
+        self.engine.generate_turn_with_checkpoints(
+            prompt,
+            checkpoint_prefixes,
+            max_new,
+            constraint,
+            req,
+            |p| on_piece(p),
+        )
     }
 
     fn generate_multimodal(
         &self,
         prompt: &str,
-        stable_prefix: Option<&str>,
+        checkpoint_prefixes: infr_llama::seam::TurnCheckpointPrefixes<'_>,
         images: &[String],
         max_new: usize,
         req: &infr_llama::sampling::RequestCtx,
@@ -2330,7 +2357,7 @@ impl GenBackend for ParallelGenerator {
             .collect();
         self.engine.generate_multimodal_turn(
             prompt,
-            stable_prefix,
+            checkpoint_prefixes.edit,
             embeddings,
             max_new,
             req,
@@ -2448,6 +2475,38 @@ fn run_chat(
             .iter()
             .flat_map(|message| message.images.iter().cloned())
             .collect::<Vec<_>>();
+        let reusable_prefix = images
+            .is_empty()
+            .then(|| {
+                be.renderer().render_reusable_prefix_with_options(
+                    messages,
+                    tools,
+                    &params.chat_template_options,
+                )
+            })
+            .flatten()
+            .filter(|prefix| prompt.starts_with(prefix));
+        let edit_prefix = images
+            .is_empty()
+            .then(|| {
+                be.renderer().render_latest_edit_prefix_with_options(
+                    messages,
+                    tools,
+                    &params.chat_template_options,
+                )
+            })
+            .flatten()
+            .filter(|prefix| prompt.starts_with(prefix));
+        let checkpoint_prefixes = infr_llama::seam::TurnCheckpointPrefixes {
+            agent: reusable_prefix.as_deref(),
+            edit: edit_prefix.as_deref().or(Some(stable_prefix.as_str())),
+        };
+        if let Some(prefix) = reusable_prefix.as_deref() {
+            tracing::debug!(
+                prefix_bytes = prefix.len(),
+                "using reusable agent instruction prefix for KV checkpoint"
+            );
+        }
         // The request's `max_tokens`/`max_completion_tokens` wins; `sampling.max_new`
         // (INFR_MAX_NEW, default 2048) is the server-side default for requests that don't set one.
         let max_new = params
@@ -2476,7 +2535,7 @@ fn run_chat(
             let mut cached_tokens = 0u32;
             let emitted = match be.generate(
                 &primed,
-                Some(&stable_prefix),
+                checkpoint_prefixes,
                 max_new,
                 Some(&mut constraint),
                 &req,
@@ -2564,7 +2623,7 @@ fn run_chat(
             let stats = if images.is_empty() {
                 be.generate(
                     &prompt,
-                    Some(&stable_prefix),
+                    checkpoint_prefixes,
                     max_new,
                     None,
                     &req,
@@ -2573,7 +2632,7 @@ fn run_chat(
             } else {
                 be.generate_multimodal(
                     &prompt,
-                    Some(&stable_prefix),
+                    checkpoint_prefixes,
                     &images,
                     max_new,
                     &req,
@@ -4407,6 +4466,9 @@ fn arch_sampling(arch: &str, no_think: bool) -> (f32, usize, f32) {
         // the family publishes no per-arch recommendation, so all four arch strings stay on the
         // same neutral values rather than on invented ones.
         DEEPSEEK | DEEPSEEK2 | DEEPSEEK32 | DEEPSEEK4 => (0.6, 20, 0.95),
+        // Ling 3.0 Tiny and Flash publish this profile in generation_config.json and in the
+        // official GGUF metadata. GGUF-only installs have no sibling JSON, so pin it here too.
+        BAILINGMOE3 => (1.0, 20, 0.95),
         _ => (0.6, 20, 0.95),
     }
 }
@@ -4548,18 +4610,17 @@ fn cmd_serve(
     // (`infr_core::parse_size`, which is also what the `INFR_CTX` env layer parses).
     let is_dg = infr_llama::diffusion::is_diffusion_gemma(&gguf);
     let is_vulkan = !is_dg && matches!(selected_backend(cfg)?, Backend::Vulkan(_));
-    // Qwen3.8 MTP v1 owns one persistent target slot plus one fixed detached-head runtime. Route
-    // it through the serialized ChatModel adapter even when the selected device is Vulkan; the
-    // ordinary Vulkan serve path below is ParallelSeam and would otherwise bypass MTP entirely.
-    let serialized_vulkan_mtp = is_vulkan && cfg.spec.mtp && cfg.spec.draft.is_some();
+    // Keep the established one-slot text-only MTP path unchanged. Auxiliary Vulkan services need
+    // ParallelSeam's shared unified arena, so even one MTP slot uses the scheduler when vision or
+    // embedding is enabled.
+    let vulkan_mtp = is_vulkan && cfg.spec.mtp && cfg.spec.draft.is_some();
+    let serialized_vulkan_mtp =
+        vulkan_mtp && parallel == 1 && mmproj.is_none() && embedding_model.is_none();
+    if vulkan_mtp && parallel > 2 {
+        anyhow::bail!("Qwen3.8 concurrent MTP currently supports at most two slots");
+    }
     if mmproj.is_some() && !is_vulkan {
         anyhow::bail!("--mmproj currently requires the Vulkan qwen4exp serve path");
-    }
-    if serialized_vulkan_mtp && mmproj.is_some() {
-        anyhow::bail!("Qwen3.8 MTP v1 does not yet support vision requests");
-    }
-    if serialized_vulkan_mtp && embedding_model.is_some() {
-        anyhow::bail!("Qwen3.8 MTP v1 cannot host the embedding sidecar in the same process yet");
     }
     if let Some(path) = mmproj {
         if !path.is_file() {
@@ -5443,6 +5504,15 @@ mod tests {
     }
 
     #[test]
+    fn resources_parses_selected_device() {
+        let cli = Cli::try_parse_from(["infr", "resources", "--dev", "Vulkan1"]).unwrap();
+        let Some(Cmd::Resources { device }) = cli.cmd else {
+            panic!("expected resources command");
+        };
+        assert_eq!(device.dev.as_deref(), Some("Vulkan1"));
+    }
+
+    #[test]
     fn serve_parses_embedding_idle_timeout() {
         let cli = Cli::try_parse_from([
             "infr",
@@ -5588,6 +5658,7 @@ mod tests {
         assert_eq!(arch_sampling(QWEN2, false), (0.7, 20, 0.8));
         // Gemma: high temp, wide top_k.
         assert_eq!(arch_sampling(GEMMA4, false), (1.0, 64, 0.95));
+        assert_eq!(arch_sampling(BAILINGMOE3, false), (1.0, 20, 0.95));
         // Llama: top_k off (0 = keep all), top_p 0.9.
         assert_eq!(arch_sampling(LLAMA, false), (0.6, 0, 0.9));
     }

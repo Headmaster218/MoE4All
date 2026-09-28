@@ -631,6 +631,9 @@ struct VulkanShared {
     /// Architecture bucket retained for narrow Vulkan kernel-policy decisions that must not leak
     /// vendor-specific flags into infr-core's backend-neutral `Capabilities`.
     device_arch: crate::caps::DeviceArch,
+    /// Windows NVIDIA drivers can expose the BAR/ReBAR aperture as a second DEVICE_LOCAL heap
+    /// backed by the same framebuffer. Count only the largest local heap for physical VRAM.
+    largest_device_local_heap_only: bool,
     /// VK_EXT_memory_budget enabled → `vram()` can report live free bytes (else total only).
     has_mem_budget: bool,
     /// `maxMemoryAllocationSize` — the largest single `vkAllocateMemory` this device accepts
@@ -667,6 +670,9 @@ struct VulkanShared {
     /// pager's one existing allocation; it does not create a GTT mirror or consume the VRAM budget.
     external_memory_host: Option<ash::ext::external_memory_host::Device>,
     host_import_alignment: usize,
+    /// A platform safety ceiling for external host-memory aliases. This limits only the DMA view;
+    /// the complete RAM pager store remains available through direct/staged uploads.
+    host_dma_import_limit: Option<usize>,
     /// The transport plan shared with the pager. Keeping this handle below the pager abstraction
     /// lets queue-submit recovery shed unused imported-host aliases without taking the pager lock
     /// or changing logical residency state.
@@ -1226,6 +1232,71 @@ impl VulkanShared {
             }
         }
         Err(self.make_queue_unusable(last, context))
+    }
+
+    /// Submit an initialization-only residency probe without poisoning the runtime queue state.
+    /// No pager copy has been promised when the arena-construction probe runs, so an OOM may be
+    /// returned to the placement loop, which drops the empty arena and retries at a smaller size.
+    /// The final session probe may additionally retire every unused Host DMA tail before giving up.
+    fn queue_submit_residency_probe(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        context: &str,
+        shed_host_dma: bool,
+    ) -> std::result::Result<(), vk::Result> {
+        let _queue = self.queue_access.lock().unwrap();
+        if let Some(error) = self.queue_submit_failure() {
+            return Err(error);
+        }
+        let mut attempts = 1usize;
+        let mut last = match self.queue_submit_once(submits, vk::Fence::null(), None) {
+            Ok(()) => return Ok(()),
+            Err(error) if retryable_queue_submit_error(error) => error,
+            Err(error) => return Err(error),
+        };
+
+        for delay_ms in MEMORY_OOM_RETRY_DELAYS_MS {
+            self.drain_queue_for_submit_retry()?;
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            attempts += 1;
+            match self.queue_submit_once(submits, vk::Fence::null(), None) {
+                Ok(()) => {
+                    tracing::warn!(
+                        "[infr] {context} recovered after {attempts} residency-probe attempts"
+                    );
+                    return Ok(());
+                }
+                Err(error) if retryable_queue_submit_error(error) => last = error,
+                Err(error) => return Err(error),
+            }
+        }
+
+        if shed_host_dma {
+            loop {
+                self.drain_queue_for_submit_retry()?;
+                let released = self.shed_host_dma_imports(HOST_DMA_SHED_STEP_BYTES);
+                if released == 0 {
+                    break;
+                }
+                tracing::warn!(
+                    "[infr] {context} still cannot submit; released {:.2} GiB of idle Host DMA mappings before retrying the final residency probe",
+                    released as f64 / (1u64 << 30) as f64,
+                );
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                attempts += 1;
+                match self.queue_submit_once(submits, vk::Fence::null(), None) {
+                    Ok(()) => {
+                        tracing::warn!(
+                            "[infr] {context} recovered after {attempts} residency-probe attempts"
+                        );
+                        return Ok(());
+                    }
+                    Err(error) if retryable_queue_submit_error(error) => last = error,
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Err(last)
     }
 
     pub(crate) fn queue_wait_idle_serialized(&self) -> std::result::Result<(), vk::Result> {
@@ -2043,14 +2114,57 @@ fn device_type_str(t: vk::PhysicalDeviceType) -> &'static str {
     }
 }
 
+fn uses_largest_device_local_heap_only(
+    vendor_id: u32,
+    device_type: vk::PhysicalDeviceType,
+    windows: bool,
+) -> bool {
+    windows
+        && vendor_id == crate::caps::VENDOR_NVIDIA
+        && device_type == vk::PhysicalDeviceType::DISCRETE_GPU
+}
+
+fn physical_vram_heap_mask(
+    mp: &vk::PhysicalDeviceMemoryProperties,
+    uma: bool,
+    largest_device_local_heap_only: bool,
+) -> u32 {
+    let heap_count = mp.memory_heap_count as usize;
+    if uma {
+        return (0..heap_count).fold(0, |mask, index| mask | (1 << index));
+    }
+
+    let device_local = |index: usize| {
+        mp.memory_heaps[index]
+            .flags
+            .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+    };
+    if largest_device_local_heap_only {
+        return (0..heap_count)
+            .filter(|&index| device_local(index))
+            .max_by_key(|&index| mp.memory_heaps[index].size)
+            .map_or(0, |index| 1 << index);
+    }
+
+    (0..heap_count)
+        .filter(|&index| device_local(index))
+        .fold(0, |mask, index| mask | (1 << index))
+}
+
 fn device_local_heap_bytes(instance: &ash::Instance, pd: vk::PhysicalDevice) -> u64 {
+    let properties = unsafe { instance.get_physical_device_properties(pd) };
     let mp = unsafe { instance.get_physical_device_memory_properties(pd) };
+    let heap_mask = physical_vram_heap_mask(
+        &mp,
+        false,
+        uses_largest_device_local_heap_only(
+            properties.vendor_id,
+            properties.device_type,
+            cfg!(target_os = "windows"),
+        ),
+    );
     (0..mp.memory_heap_count as usize)
-        .filter(|&h| {
-            mp.memory_heaps[h]
-                .flags
-                .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
-        })
+        .filter(|&h| heap_mask & (1 << h) != 0)
         .map(|h| mp.memory_heaps[h].size)
         .sum()
 }
@@ -2081,8 +2195,17 @@ pub struct DeviceInfo {
     pub name: String,
     pub device_type: &'static str,
     pub integrated: bool,
-    /// Sum of DEVICE_LOCAL heap sizes (a UMA part reports its GTT-backed heap here).
+    /// Physical DEVICE_LOCAL capacity used for device selection. Windows NVIDIA discrete GPUs
+    /// count only the largest heap so a BAR/ReBAR alias is not added to framebuffer capacity.
     pub vram_bytes: u64,
+    /// Capacity paired with `vram_available_bytes`: device-local heaps on a discrete GPU and all
+    /// physical-memory heaps on a unified-memory device.
+    pub vram_total_bytes: u64,
+    /// Live bytes currently available to a new process when `vram_live` is true. Without
+    /// `VK_EXT_memory_budget` this falls back to `vram_bytes` and must not be used as an idle test.
+    pub vram_available_bytes: u64,
+    /// Whether `vram_available_bytes` accounts for allocations owned by other processes.
+    pub vram_live: bool,
     /// True for the device `VulkanBackend::new()` would bind today (`INFR_DEV`, else the largest
     /// discrete GPU by device-local memory, else device 0).
     pub is_default_pick: bool,
@@ -2436,18 +2559,24 @@ impl UnifiedPhaseRegistry {
 /// what lets bytes actually LAND there once the device-local heap is full. Above the summed budget
 /// the failure mode is the same on both classes (the driver oversubscribes and starts evicting),
 /// which is why the guard exists at all — it just now guards the right number on each.
-fn vram_info(s: &VulkanShared) -> VramInfo {
+///
+/// Windows NVIDIA is a narrower exception: the BAR/ReBAR aperture can be exposed as another
+/// DEVICE_LOCAL heap backed by the same framebuffer, so only the largest local heap counts there.
+fn physical_vram_info(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    uma: bool,
+    largest_device_local_heap_only: bool,
+    has_mem_budget: bool,
+    tracked_used: u64,
+) -> VramInfo {
     let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
     let mut props2 = vk::PhysicalDeviceMemoryProperties2::default();
-    if s.has_mem_budget {
+    if has_mem_budget {
         props2 = props2.push_next(&mut budget);
     }
-    unsafe {
-        s.instance
-            .get_physical_device_memory_properties2(s.physical_device, &mut props2)
-    };
+    unsafe { instance.get_physical_device_memory_properties2(physical_device, &mut props2) };
     let mp = props2.memory_properties;
-    let uma = s.caps.unified_memory;
 
     // Discrete: device-local heaps only. UMA: every heap (they are one pool of DDR). The live
     // VK_EXT_memory_budget figure is used on BOTH — it is what accounts for other processes, and
@@ -2455,13 +2584,11 @@ fn vram_info(s: &VulkanShared) -> VramInfo {
     // same DDR is exactly the thing a UMA guard must see.
     let mut total = 0u64;
     let mut available = 0u64;
+    let heap_mask = physical_vram_heap_mask(&mp, uma, largest_device_local_heap_only);
     for i in 0..mp.memory_heap_count as usize {
-        let device_local = mp.memory_heaps[i]
-            .flags
-            .contains(vk::MemoryHeapFlags::DEVICE_LOCAL);
-        if uma || device_local {
+        if heap_mask & (1 << i) != 0 {
             total += mp.memory_heaps[i].size;
-            available += if s.has_mem_budget {
+            available += if has_mem_budget {
                 // Live free = budget - usage (the budget is a CEILING, not free bytes). Clamped to
                 // the heap size so a driver that reports usage past the heap (RADV on an APU, once
                 // something has oversubscribed the synthetic split) can't hand back a bogus figure.
@@ -2473,10 +2600,9 @@ fn vram_info(s: &VulkanShared) -> VramInfo {
             };
         }
     }
-    let mut live = s.has_mem_budget;
+    let mut live = has_mem_budget;
     if let Some(profile) = infr_core::test_resource::active() {
-        (total, available) =
-            profile.cap_vram(total, available, s.device_used.load(Ordering::Relaxed));
+        (total, available) = profile.cap_vram(total, available, tracked_used);
         // The synthetic free figure already subtracts this backend's tracked allocations. Mark it
         // live so fallback accounting does not subtract them a second time.
         live = true;
@@ -2487,6 +2613,17 @@ fn vram_info(s: &VulkanShared) -> VramInfo {
         live,
         uma,
     }
+}
+
+fn vram_info(s: &VulkanShared) -> VramInfo {
+    physical_vram_info(
+        &s.instance,
+        s.physical_device,
+        s.caps.unified_memory,
+        s.largest_device_local_heap_only,
+        s.has_mem_budget,
+        s.device_used.load(Ordering::Relaxed),
+    )
 }
 
 /// RAII scope for a weight-load progress bar (see [`VulkanBackend::weight_progress`]). While alive,
@@ -2709,6 +2846,19 @@ impl VulkanBackend {
                     exts.iter()
                         .any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) == name })
                 };
+                let integrated = p.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
+                let vram = physical_vram_info(
+                    &instance,
+                    pd,
+                    integrated,
+                    uses_largest_device_local_heap_only(
+                        p.vendor_id,
+                        p.device_type,
+                        cfg!(target_os = "windows"),
+                    ),
+                    has(c"VK_EXT_memory_budget"),
+                    0,
+                );
                 let flash_attention_hd256 = probe_flash_attention_hd256(
                     &entry,
                     &instance,
@@ -2721,8 +2871,11 @@ impl VulkanBackend {
                     index,
                     name,
                     device_type: device_type_str(p.device_type),
-                    integrated: p.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU,
+                    integrated,
                     vram_bytes,
+                    vram_total_bytes: vram.total,
+                    vram_available_bytes: vram.available,
+                    vram_live: vram.live,
                     is_default_pick: default_pick == Some(pd),
                     external_memory: has(c"VK_KHR_external_memory"),
                     external_memory_fd: has(c"VK_KHR_external_memory_fd"),
@@ -2896,15 +3049,7 @@ impl VulkanBackend {
         for (i, &pd) in pdevices.iter().enumerate() {
             let p = unsafe { instance.get_physical_device_properties(pd) };
             let name = unsafe { CStr::from_ptr(p.device_name.as_ptr()) }.to_string_lossy();
-            let mp = unsafe { instance.get_physical_device_memory_properties(pd) };
-            let dev_local: u64 = (0..mp.memory_heap_count as usize)
-                .filter(|&h| {
-                    mp.memory_heaps[h]
-                        .flags
-                        .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
-                })
-                .map(|h| mp.memory_heaps[h].size)
-                .sum();
+            let dev_local = device_local_heap_bytes(&instance, pd);
             tracing::info!(
                 "[infr] vulkan device Vulkan{i}: {name} ({}, {})",
                 device_type_str(p.device_type),
@@ -4011,6 +4156,11 @@ impl VulkanBackend {
                 allocator: ManuallyDrop::new(Mutex::new(allocator)),
                 caps,
                 device_arch,
+                largest_device_local_heap_only: uses_largest_device_local_heap_only(
+                    device_probe.vendor_id,
+                    props.device_type,
+                    cfg!(target_os = "windows"),
+                ),
                 has_mem_budget,
                 max_mem_alloc_size,
                 max_push_constants: props.limits.max_push_constants_size,
@@ -4020,6 +4170,10 @@ impl VulkanBackend {
                 has_dma_buf: has_ext_mem_dma_buf,
                 external_memory_host,
                 host_import_alignment,
+                host_dma_import_limit: crate::caps::host_dma_import_limit(
+                    device_probe.vendor_id,
+                    cfg!(target_os = "windows"),
+                ),
                 session_transfer_plan: RwLock::new(None),
                 external_semaphore_fd,
                 kernels: Mutex::new(HashMap::new()),
@@ -4138,6 +4292,9 @@ impl VulkanBackend {
 
         let arena_count = pending.len();
         let mut limit_error = None;
+        let import_limit = self.shared.host_dma_import_limit;
+        let mut imported_bytes = 0usize;
+        let mut policy_limit_reached = false;
         while let Some(index) = proportional_import_index(
             &pending
                 .iter()
@@ -4146,12 +4303,20 @@ impl VulkanBackend {
         ) {
             let state = &pending[index];
             let remaining = state.owner.allocated_len() - state.offset;
-            let mut len = remaining.min(max_shard);
+            let budget_remaining = import_limit
+                .map(|limit| limit.saturating_sub(imported_bytes))
+                .unwrap_or(usize::MAX);
+            if budget_remaining < state.quantum {
+                policy_limit_reached = import_limit.is_some();
+                break;
+            }
+            let mut len = remaining.min(max_shard).min(budget_remaining);
             if len < remaining {
                 len = len / state.quantum * state.quantum;
             }
             if len == 0 {
-                len = remaining.min(max_shard);
+                policy_limit_reached = import_limit.is_some();
+                break;
             }
             let minimum = state.quantum.min(len);
             let mut reduced = false;
@@ -4163,6 +4328,7 @@ impl VulkanBackend {
                         let state = &mut pending[index];
                         state.shards.push(shard);
                         state.offset += len;
+                        imported_bytes += len;
                         if reduced {
                             // The first large allocation failure marks the WDDM capacity edge.
                             // Keep the recovered tail but do not create a long run of tiny external
@@ -4206,6 +4372,12 @@ impl VulkanBackend {
         if let Some(err) = limit_error {
             tracing::warn!(
                 "[infr] host DMA import reached the driver limit at {:.2}/{:.2} GiB ({err}); remaining RAM uses the arena's direct/staged upload fallback",
+                total_imported as f64 / (1u64 << 30) as f64,
+                total_logical as f64 / (1u64 << 30) as f64,
+            );
+        } else if policy_limit_reached {
+            tracing::info!(
+                "[infr] host DMA import capped at {:.2}/{:.2} GiB by the NVIDIA Windows safety limit; remaining RAM uses the arena's direct/staged upload fallback",
                 total_imported as f64 / (1u64 << 30) as f64,
                 total_logical as f64 / (1u64 << 30) as f64,
             );
@@ -6501,6 +6673,100 @@ impl VulkanBackend {
         })
     }
 
+    fn residency_probe_one_shot(
+        &self,
+        context: &str,
+        shed_host_dma: bool,
+        f: impl FnOnce(vk::CommandBuffer),
+    ) -> Result<()> {
+        let device = &self.shared.device;
+        let pool_guard = self.shared.cmd_pool.lock().unwrap();
+        let pool = *pool_guard;
+        let cmd = unsafe {
+            device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }
+        .map_err(|error| be(format!("{context}: allocate command buffer: {error}")))?[0];
+        let _command = OneShotCommand { device, pool, cmd };
+
+        unsafe {
+            device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+        }
+        .map_err(|error| be(format!("{context}: begin command buffer: {error}")))?;
+        f(cmd);
+        unsafe { device.end_command_buffer(cmd) }
+            .map_err(|error| be(format!("{context}: end command buffer: {error}")))?;
+
+        let commands = [cmd];
+        let submit = vk::SubmitInfo::default().command_buffers(&commands);
+        self.shared
+            .queue_submit_residency_probe(&[submit], context, shed_host_dma)
+            .map_err(|error| be(format!("{context}: {error}")))?;
+        self.shared
+            .queue_wait_idle_serialized()
+            .map_err(|error| be(format!("{context}: queue wait: {error}")))
+    }
+
+    pub(crate) fn materialize_unified_arena(&self, shards: &[(vk::Buffer, u64)]) -> Result<()> {
+        if shards.is_empty() {
+            return Err(be("unified arena materialization needs physical shards"));
+        }
+        let shared = Arc::clone(&self.shared);
+        self.residency_probe_one_shot(
+            "unified-arena materialization",
+            false,
+            move |command| unsafe {
+                for &(buffer, bytes) in shards {
+                    shared.device.cmd_fill_buffer(command, buffer, 0, bytes, 0);
+                }
+            },
+        )
+    }
+
+    pub(crate) fn verify_unified_arena_residency(
+        &self,
+        shards: &[(vk::Buffer, u64)],
+    ) -> Result<()> {
+        if shards.is_empty() {
+            return Err(be(
+                "unified arena residency verification needs physical shards",
+            ));
+        }
+        let sink = self.make_buf(
+            shards.len() * std::mem::size_of::<u32>(),
+            MemoryLocation::GpuToCpu,
+            "unified_residency_probe",
+        )?;
+        let sink_buffer = sink.buffer;
+        let shared = Arc::clone(&self.shared);
+        self.residency_probe_one_shot(
+            "final unified-arena residency verification",
+            true,
+            move |command| unsafe {
+                for (index, &(buffer, _)) in shards.iter().enumerate() {
+                    shared.device.cmd_copy_buffer(
+                        command,
+                        buffer,
+                        sink_buffer,
+                        &[vk::BufferCopy {
+                            src_offset: 0,
+                            dst_offset: (index * std::mem::size_of::<u32>()) as u64,
+                            size: std::mem::size_of::<u32>() as u64,
+                        }],
+                    );
+                }
+            },
+        )
+    }
+
     /// Record a single command into a one-shot command buffer, submit it to the
     /// compute queue, and block until idle.
     ///
@@ -7170,6 +7436,9 @@ impl Backend for VulkanBackend {
                 .install_transfer_plan(Arc::clone(&plan));
             *self.shared.session_transfer_plan.write().unwrap() = Some(Arc::downgrade(&plan));
         }
+        if let Some(pool) = self.unified_vram() {
+            pool.verify_final_residency(self)?;
+        }
         Ok(())
     }
 
@@ -7556,6 +7825,47 @@ mod tests {
 
         let integrated_only = [(vk::PhysicalDeviceType::INTEGRATED_GPU, 64 * gib)];
         assert_eq!(preferred_device_index(&integrated_only), 0);
+    }
+
+    #[test]
+    fn windows_nvidia_discrete_vram_excludes_the_bar_alias_heap() {
+        let gib = 1u64 << 30;
+        let mut mp = vk::PhysicalDeviceMemoryProperties {
+            memory_heap_count: 3,
+            ..Default::default()
+        };
+        mp.memory_heaps[0] = vk::MemoryHeap {
+            size: 32 * gib,
+            flags: vk::MemoryHeapFlags::DEVICE_LOCAL,
+        };
+        mp.memory_heaps[1] = vk::MemoryHeap {
+            size: 64 * gib,
+            flags: vk::MemoryHeapFlags::empty(),
+        };
+        mp.memory_heaps[2] = vk::MemoryHeap {
+            size: 16 * gib,
+            flags: vk::MemoryHeapFlags::DEVICE_LOCAL,
+        };
+
+        assert!(uses_largest_device_local_heap_only(
+            crate::caps::VENDOR_NVIDIA,
+            vk::PhysicalDeviceType::DISCRETE_GPU,
+            true,
+        ));
+        assert!(!uses_largest_device_local_heap_only(
+            crate::caps::VENDOR_AMD,
+            vk::PhysicalDeviceType::DISCRETE_GPU,
+            true,
+        ));
+        assert!(!uses_largest_device_local_heap_only(
+            crate::caps::VENDOR_NVIDIA,
+            vk::PhysicalDeviceType::DISCRETE_GPU,
+            false,
+        ));
+
+        assert_eq!(physical_vram_heap_mask(&mp, false, true), 0b001);
+        assert_eq!(physical_vram_heap_mask(&mp, false, false), 0b101);
+        assert_eq!(physical_vram_heap_mask(&mp, true, true), 0b111);
     }
 
     fn submit_sample(gpu_ns: u64, dispatches: usize) -> SubmitRoundStats {
@@ -8265,6 +8575,10 @@ mod tests {
             .map(|i| (i as u8).wrapping_mul(31))
             .collect();
         be.upload(b.as_ref(), &bytes).expect("unified upload");
+        pool.verify_final_residency(&be)
+            .expect("final residency verification");
+        pool.verify_final_residency(&be)
+            .expect("idempotent final residency verification");
         let mut back = vec![0; bytes.len()];
         be.download(b.as_ref(), &mut back)
             .expect("unified download");

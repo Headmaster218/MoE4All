@@ -25,6 +25,7 @@ mod ple;
 mod runner;
 mod sc;
 mod segmented_kv;
+pub(crate) use segmented_kv::KV_GROW_ROWS;
 mod session_state;
 mod weights;
 
@@ -36,7 +37,14 @@ pub use sc::{DenoiseOutcome, EbReduced};
 pub(crate) use session_state::{SessionBuffer, SessionBufferKey, SessionStateMeta};
 pub(crate) use weights::SeamKv;
 
-pub(crate) type ParallelSampledOutput = (Vec<Vec<u32>>, Vec<f64>, Vec<f64>);
+pub(crate) struct ParallelSampledOutput {
+    pub(crate) tokens: Vec<Vec<u32>>,
+    pub(crate) prompt_secs: Vec<f64>,
+    pub(crate) decode_secs: Vec<f64>,
+    /// Target hidden rows in lane-major order. Empty unless the caller requested an MTP
+    /// synchronization trace.
+    pub(crate) hidden: Vec<Vec<f32>>,
+}
 
 /// A LAZILY-dequantized host f32 token-embedding table, threaded through the seam runners in place
 /// of a `&[f32]`.
@@ -632,13 +640,47 @@ pub(crate) fn generate_dense_vulkan(
 /// [`generate_dense_vulkan`] with a caller-held [`SeamKv`]: hold `state` (+ a `want_ctx` capacity)
 /// across calls and each turn prefills only the suffix that differs from the cached tokens —
 /// ChatSession-style KV reuse on the agnostic seam.
-#[derive(Clone, Copy)]
-pub(crate) enum TurnCheckpoint {
-    /// Allocate the rolling recurrent snapshot before session allocation finalization, without
-    /// taking a snapshot during this warmup call.
-    Enable,
-    /// Allocate if needed and capture state after this many prompt tokens.
-    Boundary(usize),
+pub(crate) const TURN_CHECKPOINT_COUNT: usize = 2;
+
+/// Rendered text prefixes whose recurrent state should remain reusable. The engine validates each
+/// one again after tokenization; a string prefix that does not remain an exact token prefix is
+/// ignored rather than risking mixed conversation state.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TurnCheckpointPrefixes<'a> {
+    pub agent: Option<&'a str>,
+    pub edit: Option<&'a str>,
+}
+
+impl<'a> TurnCheckpointPrefixes<'a> {
+    pub const fn edit(edit: Option<&'a str>) -> Self {
+        Self { agent: None, edit }
+    }
+}
+
+/// Recurrent boundaries retained by one conversation slot. Index 0 is the reusable
+/// system/developer/tools prefix; index 1 is the prefix immediately before the latest user
+/// message, so editing that message only re-prefills the changed tail.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TurnCheckpoint {
+    boundaries: [Option<usize>; TURN_CHECKPOINT_COUNT],
+}
+
+impl TurnCheckpoint {
+    /// Allocate both snapshots before session allocation finalization without capturing either
+    /// during this warmup call.
+    pub(crate) const ENABLED: Self = Self {
+        boundaries: [None; TURN_CHECKPOINT_COUNT],
+    };
+
+    pub(crate) const fn new(agent: Option<usize>, edit: Option<usize>) -> Self {
+        Self {
+            boundaries: [agent, edit],
+        }
+    }
+
+    pub(crate) const fn boundaries(self) -> [Option<usize>; TURN_CHECKPOINT_COUNT] {
+        self.boundaries
+    }
 }
 
 /// One expanded image span consumed by the text-model prefill. Its rows replace the ordinary
@@ -769,16 +811,18 @@ pub(crate) fn generate_dense_vulkan_parallel_sampled_session(
     ple: Option<&PerLayerEmbd>,
     prompts: &[Vec<u32>],
     prompt_ends: &[usize],
-    checkpoint_boundaries: &[Option<usize>],
+    checkpoint_boundaries: &[[Option<usize>; TURN_CHECKPOINT_COUNT]],
     mrope_plans: &[Option<&MropePlan>],
     max_steps: usize,
     primary: &mut Option<SeamKv>,
     peers: &mut [SeamKv],
     want_ctx: usize,
     samplers: &mut [crate::sampling::ParallelSampler],
+    reasoning_guards: &mut [crate::sampling::Qwen4ReasoningEosGuard],
     on_token: &mut dyn FnMut(usize, u32) -> bool,
     yield_requested: Option<&std::sync::atomic::AtomicBool>,
     req: Option<&crate::sampling::RequestCtx>,
+    capture_hidden: bool,
 ) -> AResult<ParallelSampledOutput> {
     if primary.is_none() {
         return Err(anyhow!(
@@ -805,9 +849,11 @@ pub(crate) fn generate_dense_vulkan_parallel_sampled_session(
         peers,
         want_ctx,
         samplers,
+        reasoning_guards,
         on_token,
         yield_requested,
         req,
+        capture_hidden,
     )?;
     vk.print_moe_pager_stats();
     vk.print_dense_pager_stats();
@@ -867,6 +913,55 @@ pub(crate) fn generate_dense_vulkan_parallel_prefill_session(
     vk.print_moe_pager_stats();
     vk.print_dense_pager_stats();
     Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn generate_dense_vulkan_parallel_mtp_verify_session(
+    vk: &infr_vulkan::VulkanBackend,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    feeds: &[Vec<u32>],
+    mrope_plans: &[Option<&MropePlan>],
+    primary: &mut Option<SeamKv>,
+    peers: &mut [SeamKv],
+    want_ctx: usize,
+) -> AResult<(Vec<Vec<u32>>, Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+    let bind: Box<BindWeight<'_>> = Box::new(|name: &str, _tb, _dt, _n| {
+        Err(anyhow!("warm parallel MTP session must not re-bind {name}"))
+    });
+    let mut ids = Vec::new();
+    let mut logits = Vec::new();
+    let mut hidden = Vec::new();
+    let result = runner::generate_dense_backend_parallel_mtp_verify(
+        vk,
+        &*bind,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        feeds,
+        mrope_plans,
+        primary,
+        peers,
+        want_ctx,
+        &mut ids,
+        &mut logits,
+        &mut hidden,
+    );
+    if result.is_err() {
+        if let Some(slot) = primary.as_mut() {
+            slot.reset();
+        }
+        for slot in peers {
+            slot.reset();
+        }
+        vk.release_moe_load_reservation();
+    }
+    result?;
+    Ok((ids, logits, hidden))
 }
 
 /// Honest activation/scratch reservation for a DENSE model's placement decision: the transient
@@ -1349,6 +1444,20 @@ fn moe_ubatch_fallback_candidates(ec: &EngineConfig) -> Vec<usize> {
     let mut candidates = vec![now];
     candidates.extend(ubatch_fallbacks_below(now));
     candidates
+}
+
+/// Try MoE ubatch placements from tallest to shortest. `Ok(None)` means the candidate was valid
+/// arithmetically but could not be placed physically; only a successful probe ends the sweep.
+fn first_successful_moe_ubatch<T, E>(
+    candidates: &[(usize, u64)],
+    mut attempt: impl FnMut(usize, usize, u64) -> std::result::Result<Option<T>, E>,
+) -> std::result::Result<Option<T>, E> {
+    for (index, &(rows, runtime_reserve)) in candidates.iter().enumerate() {
+        if let Some(selected) = attempt(index, rows, runtime_reserve)? {
+            return Ok(Some(selected));
+        }
+    }
+    Ok(None)
 }
 
 /// The prefill chunk when neither INFR_UBATCH nor the placement sweep pinned one: 2048 rows in the
@@ -1992,7 +2101,9 @@ pub(crate) fn kv_bytes_estimate_fmt(
         0
     };
     primary
-        .saturating_add(recurrent_checkpoint_bytes(cfg))
+        .saturating_add(
+            recurrent_checkpoint_bytes(cfg).saturating_mul(TURN_CHECKPOINT_COUNT as u64),
+        )
         .saturating_add(qwen4_extra)
 }
 
@@ -2023,17 +2134,27 @@ pub(crate) fn qsa_cache_bytes(cfg: &Config, layer: usize, ctx: usize) -> usize {
     qsa_raw_cache_bytes(cfg, layer, ctx).saturating_add(qsa_block_cache_bytes(cfg, layer, ctx))
 }
 
-/// One rolling copy of every append-only recurrent layer's fixed f32 state. Stateful Vulkan chat
-/// allocates this lazily at the first stable conversation boundary, but placement must reserve it
-/// up front so the allocation cannot unexpectedly consume the last expert/activation bytes.
+/// One copy of every append-only recurrent layer's fixed f32 state. Stateful Vulkan chat owns two
+/// copies (agent prefix + latest editable-message prefix); callers multiply this per-copy figure
+/// by [`TURN_CHECKPOINT_COUNT`] when pricing the complete slot.
 pub(crate) fn recurrent_checkpoint_bytes(cfg: &Config) -> u64 {
-    (0..cfg.n_layer)
+    let layers = (0..cfg.n_layer)
         .filter(|&l| cfg.is_recurrent_layer(l))
         .map(|l| {
             let (k_bytes, v_bytes) = layer_state_bytes(cfg, l, 1, false, 1, DType::F16, DType::F16);
             (k_bytes + v_bytes) as u64
         })
-        .sum()
+        .sum::<u64>();
+    let ple = if cfg.qwen4exp {
+        (cfg.ple_conv_kernel.saturating_sub(1))
+            .saturating_mul(cfg.ple_ngram_size)
+            .saturating_mul(cfg.hc_mult)
+            .saturating_mul(cfg.n_embd)
+            .saturating_mul(4) as u64
+    } else {
+        0
+    };
+    layers.saturating_add(ple)
 }
 
 /// Read-only KV footprint estimate for control planes and launch planners. This is the same
@@ -2732,18 +2853,42 @@ fn moe_pool_slot_counts(
 
 const AUTO_MOE_ARENA_SHRINK_MIN: u64 = 256 * 1024 * 1024;
 const AUTO_MOE_ARENA_MAX_ATTEMPTS: usize = 16;
+const AUTO_MOE_ARENA_STEP_ALIGN: u64 = 64 * 1024 * 1024;
+
+/// Find the lowest 64-MiB probe that the real arena layout accepts. The validator owns details
+/// such as KV shard-packing slack, so the retry floor cannot drift when that layout changes.
+fn lowest_valid_auto_moe_arena_budget(
+    current: u64,
+    minimum: u64,
+    mut valid: impl FnMut(u64) -> bool,
+) -> u64 {
+    let mut lowest = current;
+    loop {
+        let next = lowest
+            .saturating_sub(AUTO_MOE_ARENA_STEP_ALIGN)
+            .max(minimum);
+        if next >= lowest || !valid(next) {
+            return lowest;
+        }
+        lowest = next;
+    }
+}
 
 /// Next automatic mapped-arena probe. An allocation failure has no trustworthy byte shortfall,
 /// so retire 5% (at least 256 MiB); a successful allocation whose live budget is short can name
 /// the exact deficit and skips directly past it. Explicit cache budgets never call this helper.
 fn next_auto_moe_arena_budget(current: u64, minimum: u64, shortfall: u64) -> Option<u64> {
-    const STEP_ALIGN: u64 = 64 * 1024 * 1024;
     let step = if shortfall == 0 {
         (current / 20).max(AUTO_MOE_ARENA_SHRINK_MIN)
     } else {
-        shortfall.div_ceil(STEP_ALIGN).saturating_mul(STEP_ALIGN)
+        shortfall
+            .div_ceil(AUTO_MOE_ARENA_STEP_ALIGN)
+            .saturating_mul(AUTO_MOE_ARENA_STEP_ALIGN)
     };
-    let next = current.saturating_sub(step);
+    // When less than one normal shrink step remains above the safety floor, probe the floor once
+    // instead of giving up without trying it. This is common after fixed MTP allocations leave a
+    // small shard-sized shortfall, and still cannot cross the complete-Prefill-layer minimum.
+    let next = current.saturating_sub(step).max(minimum);
     (next >= minimum && next < current).then_some(next)
 }
 
@@ -3335,7 +3480,19 @@ pub(crate) fn vulkan_moe_binder<'a>(
             .as_ref()
             .map(|layout| layout.committed_bytes(want_ctx))
             .unwrap_or(0);
-        let dynamic_kv_reserve = total_slot_state_bytes(dynamic_kv_reserve_per_slot);
+        let mtp_kv_spec = (ec.spec.mtp && cfg.qwen4exp)
+            .then(|| crate::mtp::qwen4_mtp_kv_spec(cfg, want_ctx))
+            .transpose()?;
+        let mtp_dynamic_reserve_per_slot = mtp_kv_spec
+            .map(|spec| {
+                (spec.segment_bytes as u64)
+                    .saturating_mul(spec.max_segments as u64)
+                    .saturating_mul(2)
+            })
+            .unwrap_or(0);
+        let dynamic_kv_reserve = total_slot_state_bytes(
+            dynamic_kv_reserve_per_slot.saturating_add(mtp_dynamic_reserve_per_slot),
+        );
         dynamic_state_max_allocation_bytes = dynamic_layout
             .as_ref()
             .and_then(|layout| {
@@ -3345,13 +3502,19 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     .map(|plane| plane.segment_bytes() as u64)
                     .max()
             })
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max(
+                mtp_kv_spec
+                    .map(|spec| spec.segment_bytes as u64)
+                    .unwrap_or(0),
+            );
         let kv_bytes_at =
             |ubatch| kv_state_reserve_bytes(cfg, ec, want_ctx, ring, ubatch, k_fmt, v_fmt);
         let initial_ubatch = ubatch_rows(ec);
         let mut selected_ubatch = initial_ubatch;
         let kv_bytes = total_slot_state_bytes(kv_bytes_at(selected_ubatch));
-        let persistent_state = kv_bytes.saturating_sub(dynamic_kv_reserve);
+        let persistent_state =
+            kv_bytes.saturating_sub(total_slot_state_bytes(dynamic_kv_reserve_per_slot));
         // Reserve the workspace for the chunk this session will actually execute. A user selecting
         // 4096 rows still gets the full 4K reserve; a lower selected rung no longer strands the
         // difference behind a permanent 2 GiB/4K assumption. Prefill's layer ring already borrows
@@ -3392,7 +3555,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
         if paged_target.is_some_and(|bytes| bytes < prefill_floor) {
             for candidate in moe_ubatch_fallback_candidates(ec).into_iter().skip(1) {
                 let candidate_kv = total_slot_state_bytes(kv_bytes_at(candidate));
-                let candidate_persistent = candidate_kv.saturating_sub(dynamic_kv_reserve);
+                let candidate_persistent = candidate_kv
+                    .saturating_sub(total_slot_state_bytes(dynamic_kv_reserve_per_slot));
                 let candidate_runtime =
                     runtime_reserve_at(cfg, &caps, want_ctx, ring, candidate, k_fmt, v_fmt);
                 let Some(candidate_plan) = ModelMemoryPlan::new_with_dynamic_reserve(
@@ -3482,6 +3646,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
         }
         let cache_layout = if cfg.deepseek4 {
             "fp8-kv+mxfp4-index".to_string()
+        } else if mtp_dynamic_reserve_per_slot > 0 && dynamic_kv_reserve_per_slot > 0 {
+            format!("dynamic-32k target={k_fmt:?}/{v_fmt:?} + mtp=F16/F16")
+        } else if mtp_dynamic_reserve_per_slot > 0 {
+            "dynamic-32k mtp=F16/F16".to_string()
         } else if dynamic_kv_reserve > 0 {
             format!("dynamic-32k k={k_fmt:?}, v={v_fmt:?}")
         } else {
@@ -3743,92 +3911,282 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     }
                 }
 
-                let live_alloc_room = vk.alloc_room();
-                let measured_room = live_alloc_room.saturating_sub(POST_KV_DEVICE_RESERVE);
                 let dynamic_state_reserve = provisional_plan.dynamic_state_reserve_bytes;
-                let mut measured_choice = None;
                 let mut last_layout_error = None;
-                for &(rows, runtime_reserve) in &measured_moe_ubatch_candidates {
-                    let elastic_reserve = dynamic_state_reserve.saturating_add(runtime_reserve);
-                    let candidate_budget = moe_arena_budget_after_fixed(
-                        live_alloc_room,
-                        POST_KV_DEVICE_RESERVE,
-                        requested_cache_bytes,
-                        elastic_reserve,
-                    );
-                    let minimum_pager_budget = elastic_reserve.saturating_add(physical_pool_floor);
-                    if candidate_budget < minimum_pager_budget {
-                        continue;
-                    }
-                    let Some(candidate_slots) = moe_pool_slot_counts(
-                        &logical_pools,
-                        candidate_budget,
-                        n_expert,
-                        size_cache_bias,
-                    ) else {
-                        continue;
-                    };
-                    let specs: Vec<(usize, usize, usize)> = logical_pools
-                        .iter()
-                        .zip(&candidate_slots)
-                        .zip(&physical_pool_floors)
-                        .map(|((&(slot_bytes, ..), &n_slots), &floor_slots)| {
-                            (slot_bytes, n_slots, floor_slots)
-                        })
-                        .collect();
-                    match vk.validate_moe_unified_vram(
-                        &specs,
-                        dynamic_state_reserve,
-                        dynamic_state_max_allocation_bytes,
-                        prefill_min_lane_bytes,
-                        runtime_reserve,
-                    ) {
-                        Ok(physical_bytes) => {
-                            debug_assert_eq!(
-                                physical_bytes as u64,
-                                moe_pool_capacity_bytes(&logical_pools, &candidate_slots)
+                let mut last_physical_error = None;
+                let mut last_measured_room = 0u64;
+                let measured_choice = first_successful_moe_ubatch(
+                    &measured_moe_ubatch_candidates,
+                    |candidate_index, rows, runtime_reserve| -> AResult<Option<_>> {
+                        // Every lower ubatch starts from a fresh driver-budget snapshot. A failed
+                        // mapped allocation can change WDDM's reported commit even after the empty
+                        // probe is dropped, so reusing the first snapshot would only repeat the same
+                        // over-sized request with a smaller runtime corridor.
+                        let live_alloc_room = vk.alloc_room();
+                        let measured_room = live_alloc_room.saturating_sub(POST_KV_DEVICE_RESERVE);
+                        last_measured_room = measured_room;
+                        let elastic_reserve = dynamic_state_reserve.saturating_add(runtime_reserve);
+                        let mut candidate_budget = moe_arena_budget_after_fixed(
+                            live_alloc_room,
+                            POST_KV_DEVICE_RESERVE,
+                            requested_cache_bytes,
+                            elastic_reserve,
+                        );
+                        let hard_minimum_pager_budget =
+                            elastic_reserve.saturating_add(physical_pool_floor);
+                        if candidate_budget < hard_minimum_pager_budget {
+                            return Ok(None);
+                        }
+                        let Some(candidate_slots) = moe_pool_slot_counts(
+                            &logical_pools,
+                            candidate_budget,
+                            n_expert,
+                            size_cache_bias,
+                        ) else {
+                            return Ok(None);
+                        };
+                        let specs: Vec<(usize, usize, usize)> = logical_pools
+                            .iter()
+                            .zip(&candidate_slots)
+                            .zip(&physical_pool_floors)
+                            .map(|((&(slot_bytes, ..), &n_slots), &floor_slots)| {
+                                (slot_bytes, n_slots, floor_slots)
+                            })
+                            .collect();
+                        let minimum_pager_budget = match vk.validate_moe_unified_vram(
+                            &specs,
+                            dynamic_state_reserve,
+                            dynamic_state_max_allocation_bytes,
+                            prefill_min_lane_bytes,
+                            runtime_reserve,
+                        ) {
+                            Ok(physical_bytes) => {
+                                debug_assert_eq!(
+                                    physical_bytes as u64,
+                                    moe_pool_capacity_bytes(&logical_pools, &candidate_slots)
+                                );
+                                let minimum_pager_budget = if adaptive_arena {
+                                    lowest_valid_auto_moe_arena_budget(
+                                        candidate_budget,
+                                        hard_minimum_pager_budget,
+                                        |probe_budget| {
+                                            let Some(probe_slots) = moe_pool_slot_counts(
+                                                &logical_pools,
+                                                probe_budget,
+                                                n_expert,
+                                                size_cache_bias,
+                                            ) else {
+                                                return false;
+                                            };
+                                            let physical_bytes = moe_pool_capacity_bytes(
+                                                &logical_pools,
+                                                &probe_slots,
+                                            );
+                                            if physical_bytes.saturating_sub(elastic_reserve)
+                                                < physical_pool_floor
+                                            {
+                                                return false;
+                                            }
+                                            let probe_specs = logical_pools
+                                            .iter()
+                                            .zip(&probe_slots)
+                                            .zip(&physical_pool_floors)
+                                            .map(|((&(slot_bytes, ..), &n_slots), &floor_slots)| {
+                                                (slot_bytes, n_slots, floor_slots)
+                                            })
+                                            .collect::<Vec<_>>();
+                                            vk.validate_moe_unified_vram(
+                                                &probe_specs,
+                                                dynamic_state_reserve,
+                                                dynamic_state_max_allocation_bytes,
+                                                prefill_min_lane_bytes,
+                                                runtime_reserve,
+                                            )
+                                            .is_ok()
+                                        },
+                                    )
+                                } else {
+                                    hard_minimum_pager_budget
+                                };
+                                minimum_pager_budget
+                            }
+                            Err(error) => {
+                                last_layout_error = Some(format!("ubatch {rows}: {error}"));
+                                return Ok(None);
+                            }
+                        };
+
+                        let mut attempts = 0usize;
+                        let allocation = loop {
+                            attempts += 1;
+                            let Some(candidate_slots) = moe_pool_slot_counts(
+                                &logical_pools,
+                                candidate_budget,
+                                n_expert,
+                                size_cache_bias,
+                            ) else {
+                                last_layout_error = Some(format!(
+                                    "ubatch {rows}: MoE arena budget ({:.2} MiB) cannot hold one \
+                                 complete Prefill layer plus runtime/dynamic state",
+                                    candidate_budget as f64 / MIB_F64,
+                                ));
+                                break None;
+                            };
+                            let physical_bytes =
+                                moe_pool_capacity_bytes(&logical_pools, &candidate_slots);
+                            if physical_bytes.saturating_sub(elastic_reserve) < physical_pool_floor
+                            {
+                                last_layout_error = Some(format!(
+                                    "ubatch {rows}: MoE device arena cannot retain one complete \
+                                 Prefill layer after its runtime/dynamic reserve (arena {:.2} MiB, \
+                                 elastic {:.2} MiB, expert floor {:.2} MiB)",
+                                    physical_bytes as f64 / MIB_F64,
+                                    elastic_reserve as f64 / MIB_F64,
+                                    physical_pool_floor as f64 / MIB_F64,
+                                ));
+                                break None;
+                            }
+                            let specs: Vec<(usize, usize, usize)> = logical_pools
+                                .iter()
+                                .zip(&candidate_slots)
+                                .zip(&physical_pool_floors)
+                                .map(|((&(slot_bytes, ..), &n_slots), &floor_slots)| {
+                                    (slot_bytes, n_slots, floor_slots)
+                                })
+                                .collect();
+
+                            let failure = match vk.prepare_moe_unified_vram(
+                                &specs,
+                                dynamic_state_reserve,
+                                dynamic_state_max_allocation_bytes,
+                                prefill_min_lane_bytes,
+                                runtime_reserve,
+                            ) {
+                                Ok(committed) => {
+                                    debug_assert_eq!(committed as u64, physical_bytes);
+                                    let live_room = vk.alloc_room();
+                                    if live_room >= POST_KV_DEVICE_RESERVE {
+                                        break Some((candidate_slots, physical_bytes));
+                                    }
+                                    let shortfall = POST_KV_DEVICE_RESERVE - live_room;
+                                    vk.discard_empty_moe_unified_vram().map_err(|e| {
+                                        anyhow!("discarding MoE allocation probe: {e}")
+                                    })?;
+                                    (
+                                        shortfall,
+                                        format!(
+                                        "the arena left {:.2} MiB live, {:.2} MiB short of the \
+                                         post-load reserve",
+                                        live_room as f64 / MIB_F64,
+                                        shortfall as f64 / MIB_F64,
+                                    ),
+                                    )
+                                }
+                                Err(error) => (0, error.to_string()),
+                            };
+
+                            if !adaptive_arena {
+                                last_physical_error = Some(format!(
+                                "ubatch {rows}: explicit MoE expert arena {:.2} MiB did not fit \
+                                 this device: {}",
+                                physical_bytes as f64 / MIB_F64,
+                                failure.1,
+                            ));
+                                break None;
+                            }
+                            let Some(next) = (attempts < AUTO_MOE_ARENA_MAX_ATTEMPTS)
+                                .then(|| {
+                                    next_auto_moe_arena_budget(
+                                        candidate_budget,
+                                        minimum_pager_budget,
+                                        failure.0,
+                                    )
+                                })
+                                .flatten()
+                            else {
+                                last_physical_error = Some(format!(
+                                    "ubatch {rows}: automatic MoE arena exhausted its safe range \
+                                 after {attempts} attempt(s): {}",
+                                    failure.1,
+                                ));
+                                break None;
+                            };
+                            tracing::warn!(
+                                ubatch = rows,
+                                attempt = attempts,
+                                old_bytes = candidate_budget,
+                                new_bytes = next,
+                                reason = %failure.1,
+                                "automatic MoE arena allocation retry"
                             );
-                            measured_choice = Some((
+                            candidate_budget = next;
+                        };
+
+                        if let Some((slot_counts, physical_bytes)) = allocation {
+                            return Ok(Some((
                                 rows,
                                 runtime_reserve,
                                 elastic_reserve,
-                                candidate_budget,
-                                minimum_pager_budget,
-                            ));
-                            break;
+                                slot_counts,
+                                physical_bytes,
+                                measured_room,
+                            )));
                         }
-                        Err(error) => last_layout_error = Some(error.to_string()),
-                    }
-                }
+
+                        if let Some(&(next_ubatch, _)) =
+                            measured_moe_ubatch_candidates.get(candidate_index + 1)
+                        {
+                            tracing::warn!(
+                                failed_ubatch = rows,
+                                next_ubatch,
+                                reason = %last_physical_error.as_deref().unwrap_or("layout no longer fits"),
+                                "MoE physical arena did not fit; lowering Prefill chunk and re-querying device room"
+                            );
+                        }
+                        Ok(None)
+                    },
+                )?;
+
                 let Some((
                     final_ubatch,
                     runtime_reserve,
                     elastic_reserve,
-                    mut candidate_budget,
-                    minimum_pager_budget,
+                    slot_counts,
+                    physical_bytes,
+                    measured_room,
                 )) = measured_choice
                 else {
-                    let suffix = last_layout_error
-                        .map(|error| format!("; last layout error: {error}"))
-                        .unwrap_or_default();
+                    let mut details = Vec::new();
+                    if let Some(error) = last_layout_error {
+                        details.push(format!("last layout error: {error}"));
+                    }
+                    if let Some(error) = last_physical_error {
+                        details.push(format!("last physical error: {error}"));
+                    }
+                    let suffix = if details.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; {}", details.join("; "))
+                    };
                     return Err(anyhow!(
                         "after every fixed allocation, {:.2} MiB is available for the MoE unified \
-                         arena, but no Prefill chunk from {:?} can retain dynamic state plus one \
-                         complete Expert layer{suffix}",
-                        measured_room as f64 / MIB_F64,
+                         arena, but no Prefill chunk from {:?} could be placed physically while \
+                         retaining dynamic state, one complete Expert layer, and the post-load \
+                         reserve{suffix}",
+                        last_measured_room as f64 / MIB_F64,
                         measured_moe_ubatch_candidates
                             .iter()
                             .map(|&(rows, _)| rows)
                             .collect::<Vec<_>>(),
                     ));
                 };
+
                 if final_ubatch < requested_moe_ubatch {
                     cap_moe_ubatch(final_ubatch);
                     tracing::warn!(
                         "MoE measured placement: lowered the Prefill chunk from \
-                         {requested_moe_ubatch} \
-                         to {final_ubatch} rows after all fixed Vulkan allocations became resident; \
-                         measured arena room {:.2} GiB",
+                         {requested_moe_ubatch} to {final_ubatch} rows after fixed allocations and \
+                         physical arena probes; measured arena room {:.2} GiB",
                         measured_room as f64 / GIB_F64,
                     );
                 } else if provisional_moe_ubatch < requested_moe_ubatch {
@@ -3846,103 +4204,6 @@ pub(crate) fn vulkan_moe_binder<'a>(
                          arena room",
                         measured_room as f64 / GIB_F64,
                     );
-                }
-
-                let mut attempts = 0usize;
-                let (slot_counts, physical_bytes) = loop {
-                    attempts += 1;
-                    let Some(candidate_slots) = moe_pool_slot_counts(
-                        &logical_pools,
-                        candidate_budget,
-                        n_expert,
-                        size_cache_bias,
-                    ) else {
-                        return Err(anyhow!(
-                            "MoE arena budget ({:.2} MiB) cannot hold one complete Prefill layer \
-                             plus runtime/dynamic state",
-                            candidate_budget as f64 / MIB_F64,
-                        ));
-                    };
-                    let physical_bytes = moe_pool_capacity_bytes(&logical_pools, &candidate_slots);
-                    if physical_bytes.saturating_sub(elastic_reserve) < physical_pool_floor {
-                        return Err(anyhow!(
-                            "MoE device arena cannot retain one complete Prefill layer after its \
-                             runtime/dynamic reserve (arena {:.2} MiB, elastic {:.2} MiB, expert \
-                             floor {:.2} MiB)",
-                            physical_bytes as f64 / MIB_F64,
-                            elastic_reserve as f64 / MIB_F64,
-                            physical_pool_floor as f64 / MIB_F64,
-                        ));
-                    }
-                    let specs: Vec<(usize, usize, usize)> = logical_pools
-                        .iter()
-                        .zip(&candidate_slots)
-                        .zip(&physical_pool_floors)
-                        .map(|((&(slot_bytes, ..), &n_slots), &floor_slots)| {
-                            (slot_bytes, n_slots, floor_slots)
-                        })
-                        .collect();
-
-                    let failure = match vk.prepare_moe_unified_vram(
-                        &specs,
-                        dynamic_state_reserve,
-                        dynamic_state_max_allocation_bytes,
-                        prefill_min_lane_bytes,
-                        runtime_reserve,
-                    ) {
-                        Ok(committed) => {
-                            debug_assert_eq!(committed as u64, physical_bytes);
-                            let live_room = vk.alloc_room();
-                            if live_room >= POST_KV_DEVICE_RESERVE {
-                                break (candidate_slots, physical_bytes);
-                            }
-                            let shortfall = POST_KV_DEVICE_RESERVE - live_room;
-                            vk.discard_empty_moe_unified_vram()
-                                .map_err(|e| anyhow!("discarding MoE allocation probe: {e}"))?;
-                            (
-                                shortfall,
-                                format!(
-                                    "the arena left {:.2} MiB live, {:.2} MiB short of the \
-                                     post-load reserve",
-                                    live_room as f64 / MIB_F64,
-                                    shortfall as f64 / MIB_F64,
-                                ),
-                            )
-                        }
-                        Err(error) => (0, error.to_string()),
-                    };
-
-                    if !adaptive_arena {
-                        return Err(anyhow!(
-                            "explicit MoE expert arena {:.2} MiB did not fit this device: {}",
-                            physical_bytes as f64 / MIB_F64,
-                            failure.1,
-                        ));
-                    }
-                    let next = (attempts < AUTO_MOE_ARENA_MAX_ATTEMPTS)
-                        .then(|| {
-                            next_auto_moe_arena_budget(
-                                candidate_budget,
-                                minimum_pager_budget,
-                                failure.0,
-                            )
-                        })
-                        .flatten()
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "automatic MoE arena could not find a device-safe size after \
-                                 {attempts} attempt(s): {}",
-                                failure.1,
-                            )
-                        })?;
-                    tracing::warn!(
-                        attempt = attempts,
-                        old_bytes = candidate_budget,
-                        new_bytes = next,
-                        reason = %failure.1,
-                        "automatic MoE arena allocation retry"
-                    );
-                    candidate_budget = next;
                 };
 
                 let automatic_host_budget =
@@ -6330,6 +6591,21 @@ mod seam_helper_tests {
         assert_eq!(super::ubatch_rows(&explicit), 1024);
     }
 
+    #[test]
+    fn physical_moe_probe_falls_back_to_the_next_ubatch() {
+        let candidates = [(2560, 30), (2048, 20), (1536, 10)];
+        let mut attempted = Vec::new();
+        let selected =
+            super::first_successful_moe_ubatch(&candidates, |index, rows, runtime_reserve| {
+                attempted.push((index, rows, runtime_reserve));
+                Ok::<_, ()>((rows == 2048).then_some((rows, runtime_reserve)))
+            })
+            .unwrap();
+
+        assert_eq!(selected, Some((2048, 20)));
+        assert_eq!(attempted, vec![(0, 2560, 30), (1, 2048, 20)]);
+    }
+
     /// The `*_specified` rule (§11 decision 8): an UNRECOGNIZED KV format name still suppresses
     /// auto-q8 (it was supplied) while yielding no dtype, and it is not ring-capable either.
     #[test]
@@ -6933,7 +7209,9 @@ mod seam_helper_tests {
         assert_eq!(checkpoint, 30 * delta_bytes);
         assert_eq!(
             estimate,
-            10 * attention_bytes + 30 * delta_bytes + checkpoint
+            10 * attention_bytes
+                + 30 * delta_bytes
+                + super::TURN_CHECKPOINT_COUNT as u64 * checkpoint
         );
         assert!(
             estimate < 40 * attention_bytes,
@@ -7852,6 +8130,24 @@ mod seam_helper_tests {
     }
 
     #[test]
+    fn automatic_moe_arena_floor_uses_the_real_layout_validator() {
+        const MIB: u64 = 1024 * 1024;
+        let threshold = 705 * MIB;
+        assert_eq!(
+            super::lowest_valid_auto_moe_arena_budget(1024 * MIB, 512 * MIB, |bytes| {
+                bytes >= threshold
+            }),
+            768 * MIB,
+            "the floor is the last aligned probe accepted by the allocator"
+        );
+        assert_eq!(
+            super::lowest_valid_auto_moe_arena_budget(700 * MIB, 650 * MIB, |_| false),
+            700 * MIB,
+            "a failing first lower probe leaves the known-good budget intact"
+        );
+    }
+
+    #[test]
     fn automatic_moe_arena_retry_is_bounded_and_honors_the_floor() {
         const MIB: u64 = 1024 * 1024;
         const GIB64: u64 = 1024 * MIB;
@@ -7875,6 +8171,11 @@ mod seam_helper_tests {
             super::next_auto_moe_arena_budget(2 * GIB64, 2 * GIB64, 0),
             None,
             "the runtime plus one-layer floor is never crossed"
+        );
+        assert_eq!(
+            super::next_auto_moe_arena_budget(2 * GIB64 + 128 * MIB, 2 * GIB64, 0),
+            Some(2 * GIB64),
+            "the final sub-step remainder is probed exactly at the safety floor"
         );
     }
 

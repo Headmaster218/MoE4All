@@ -448,6 +448,71 @@ pub(crate) struct ParallelSampler {
     penalties: Option<Penalties>,
 }
 
+/// Per-sequence guard for Qwen3.8 occasionally sampling a chat EOS while its reasoning block is
+/// still open. It is intentionally model-specific and inert for every other architecture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Qwen4ReasoningEosGuard {
+    enabled: bool,
+    open: bool,
+}
+
+impl Qwen4ReasoningEosGuard {
+    pub(crate) fn from_prompt(cfg: &crate::Config, tokens: &[u32]) -> Self {
+        let (Some(start), Some(end)) = (cfg.qwen4_think_start, cfg.qwen4_think_end) else {
+            return Self::default();
+        };
+        let mut guard = Self {
+            enabled: cfg.qwen4exp,
+            open: false,
+        };
+        for &token in tokens {
+            if token == start {
+                guard.open = true;
+            } else if token == end {
+                guard.open = false;
+            }
+        }
+        guard
+    }
+
+    pub(crate) fn observe(&mut self, cfg: &crate::Config, token: u32) {
+        if !self.enabled {
+            return;
+        }
+        if Some(token) == cfg.qwen4_think_start {
+            self.open = true;
+        } else if Some(token) == cfg.qwen4_think_end {
+            self.open = false;
+        }
+    }
+
+    pub(crate) fn blocks(&self, cfg: &crate::Config, token: u32, ignore_eos: bool) -> bool {
+        self.enabled
+            && self.open
+            && !ignore_eos
+            && (token == cfg.eos || cfg.eos_ids.contains(&token))
+    }
+
+    pub(crate) fn mask_eos(&self, cfg: &crate::Config, logits: &mut [f32]) {
+        if !(self.enabled && self.open) {
+            return;
+        }
+        if let Some(logit) = logits.get_mut(cfg.eos as usize) {
+            *logit = f32::NEG_INFINITY;
+        }
+        for &token in &cfg.eos_ids {
+            if let Some(logit) = logits.get_mut(token as usize) {
+                *logit = f32::NEG_INFINITY;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn is_open(self) -> bool {
+        self.open
+    }
+}
+
 impl ParallelSampler {
     pub(crate) fn new(req: &RequestCtx, cfg: &infr_core::config::SamplingCfg) -> Self {
         Self {
@@ -787,6 +852,46 @@ mod tests {
     /// (or perturb) `INFR_TEMP`/`INFR_SEED` at all and run in parallel with everything else.
     fn scfg() -> infr_core::config::SamplingCfg {
         infr_core::config::SamplingCfg::default()
+    }
+
+    fn qwen4_guard_cfg() -> crate::Config {
+        crate::Config {
+            qwen4exp: true,
+            vocab: 16,
+            eos: 2,
+            eos_ids: vec![2, 3],
+            qwen4_think_start: Some(10),
+            qwen4_think_end: Some(11),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn qwen4_reasoning_guard_tracks_the_latest_delimiter() {
+        let cfg = qwen4_guard_cfg();
+        let mut guard = Qwen4ReasoningEosGuard::from_prompt(&cfg, &[1, 10, 7]);
+        assert!(guard.is_open());
+        assert!(guard.blocks(&cfg, 2, false));
+        assert!(guard.blocks(&cfg, 3, false));
+        assert!(!guard.blocks(&cfg, 4, false));
+        assert!(!guard.blocks(&cfg, 2, true));
+
+        guard.observe(&cfg, 11);
+        assert!(!guard.is_open());
+        assert!(!guard.blocks(&cfg, 2, false));
+        guard.observe(&cfg, 10);
+        assert!(guard.is_open());
+    }
+
+    #[test]
+    fn qwen4_reasoning_guard_masks_every_chat_eos() {
+        let cfg = qwen4_guard_cfg();
+        let guard = Qwen4ReasoningEosGuard::from_prompt(&cfg, &[10]);
+        let mut logits = (0..cfg.vocab).map(|value| value as f32).collect::<Vec<_>>();
+        guard.mask_eos(&cfg, &mut logits);
+        assert_eq!(logits[2], f32::NEG_INFINITY);
+        assert_eq!(logits[3], f32::NEG_INFINITY);
+        assert_eq!(argmax(&logits), 15);
     }
 
     /// `Sampler::from_cfg`'s doc contract, pinned as a value: nothing set ⇒ GREEDY. This is what
