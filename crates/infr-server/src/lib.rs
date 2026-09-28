@@ -5283,6 +5283,61 @@ mod tests {
         );
     }
 
+    /// The Responses adapter consumes the Chat SSE stream internally. Its wire stream must retain
+    /// comment heartbeats after the initial lifecycle events instead of becoming silent again.
+    #[tokio::test]
+    async fn responses_stream_forwards_heartbeats_during_silent_generation() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let state = AppState::new(
+            Arc::new(SilentLoopGen {
+                stopped: stopped.clone(),
+            }),
+            "m",
+            1,
+            Arc::new(Config::default()),
+        );
+        let resp = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"m","input":"hi","stream":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut body = resp.into_body();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let frame = body
+                    .frame()
+                    .await
+                    .expect("the Responses SSE body ended")
+                    .expect("the Responses SSE body failed");
+                let Ok(data) = frame.into_data() else {
+                    continue;
+                };
+                if String::from_utf8_lossy(&data).contains("keep-alive") {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the Responses adapter swallowed the Chat SSE keep-alive");
+
+        drop(body);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !stopped.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("dropping the Responses SSE body did not cancel generation");
+    }
+
     /// Dropping the HTTP response must cancel generation even before the first content delta. This
     /// is the long-prefill case behind a frontend Stop button appearing to do nothing.
     #[tokio::test]

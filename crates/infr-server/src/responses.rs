@@ -916,10 +916,18 @@ impl StreamState {
     fn consume_frames(&mut self) {
         while let Some(end) = self.buffer.windows(2).position(|w| w == b"\n\n") {
             let frame: Vec<u8> = self.buffer.drain(..end + 2).collect();
+            let mut has_data = false;
+            let mut has_comment = false;
             for line in frame.split(|b| *b == b'\n') {
                 if let Some(data) = line.strip_prefix(b"data: ") {
+                    has_data = true;
                     self.consume(data.strip_suffix(b"\r").unwrap_or(data));
+                } else if line.starts_with(b":") {
+                    has_comment = true;
                 }
+            }
+            if has_comment && !has_data {
+                self.pending.push_back(Bytes::from(frame));
             }
         }
     }
