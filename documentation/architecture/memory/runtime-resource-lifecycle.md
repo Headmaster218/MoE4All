@@ -70,6 +70,8 @@ pool 永久 pin 住。
 - Host DMA 可将部分 RAM arena 导入 Vulkan；超出驱动 import limit 的范围回退到 staged/CPU push 路径。
 - 传输方案在 session 建立时按硬件能力冻结，普通热路径不反复猜测 backend。
 
+这里的判断是从总进程 RAM 预算扣除当时其他常驻占用后，以可供专家的预算 `R` 对比 routed expert payload `E`：`R >= E` 时完整 Host Store 覆盖专家、运行期不需 SSD demand read；`R < E` 时按池预加载可用容量，其余由只读 GGUF/SSD 按需填充。bounded tier 保留 inclusive shadow；clean expert 淘汰不做 GPU→RAM 回写。Host DMA 导入需要满足设备的 `minImportedHostPointerAlignment`，导入缓冲区只是原 RAM 的 Vulkan view，再以 `vkCmdCopyBuffer` 搬到显存；不能再为它预留一份完整的 Host Store 副本。
+
 ## 自动策略
 
 自动 RAM 预算在启动时按当时系统状态冻结。显式预算类似手动配置，不应在运行中随系统 available 值漂移。

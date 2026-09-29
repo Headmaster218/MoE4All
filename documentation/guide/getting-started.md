@@ -42,6 +42,12 @@ Start-INFR-Wizard.cmd
 
 API 默认使用 loopback。对局域网开放时应设置 Bearer API key，不要把无鉴权服务暴露到公网。
 
+## 模型引用与共享缓存
+
+CLI 的 `infr pull` 可预先下载模型；`run` 和 `serve` 遇到未缓存的 Hugging Face 引用也会自动拉取。模型参数可以是本地 GGUF 路径，或 `org/repo[:quant]`、`org/repo:filename.gguf`；`hf:` 和 `huggingface:` 前缀可省略。未指定量化时默认选择 `Q4_K_M`。分片 GGUF 仍须保持同组文件完整。
+
+下载使用标准 Hugging Face Hub 缓存，而非另建一份模型仓库：位置依次由 `HF_HUB_CACHE`、`HF_HOME/hub`、系统 cache 目录下的 `huggingface/hub` 决定。受限仓库可通过 `HF_TOKEN` 授权。路径和选择规则以 0.9.0 的 `infr-hub` 实现为准；不要把旧计划中的 Unix `~/.cache` 写法当作 Windows 的固定路径。
+
 ## 自动策略
 
 - **保守**：启动时以系统当前可用 RAM 减 3 GiB 作为总进程 RAM 预算；VRAM 按当前可用量保留合计约 1 GiB（含 Vulkan 分配器 256 MiB guard）。离散 GPU 默认 Prefill ubatch 从 2048 行起选。

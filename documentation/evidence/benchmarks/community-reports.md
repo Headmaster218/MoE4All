@@ -34,6 +34,8 @@ evidence: historical-sample
 | Arc A770 15.9 GB；64 GB DDR4-3200 | Ornith 1.5 35B Q4_K_M，F16 KV，ctx 96K，四类任务 | v0.6：约 29.2–31.5；v0.7：约 22.7–25.7 tok/s，回退 12.0%–24.6% | Issue #41；v0.7 同时降低工作集与空闲 RAM 占用，需将内存收益和速度回退并列看待 |
 | Radeon Pro R9700 31.9 GB；128 GB RAM | Qwen3.8 UD-Q4_K_XL，111 GB，ctx 64K，RAM budget 对照 | budget 55%：RAM 约 80 GB、加载约 1.3 GB/s；58%：full RAM store，RAM 127.7/128 GB、NVMe 100%，加载约 10 分钟 | Issue #34；启动/加载与系统压力数据，不是 Decode benchmark |
 
+早期 README 另摘录过同一 Arc A770 上 v0.6.0-beta.1 的三次 REAL workload 样本 30.15–30.28 tok/s。该子样本落在上表更广的 v0.6 区间内；原摘录未附完整命令、GGUF hash 或逐轮日志，不能将两种汇总口径合并为额外重复次数。
+
 ## 其他社区自报
 
 以下数据有一定设备/模型信息，但缺少完整命令、版本、量化或重复样本，属于 B 或 B− 级历史样本：
@@ -44,7 +46,7 @@ evidence: historical-sample
 | RX 7700 XT + 64 GB RAM | Ornith 1.5 35B-A3B，OpenCode | 最高约 40 tok/s | 上下文和完整配置未给 |
 | Ryzen AI Max+ 395，128 GB UMA | Qwen3.8 Flash，权重占用 80 GB+ | 27 tok/s | 参数未给 |
 | RX 9070 + 32 GB DDR5 | Qwen3.8 27B IQ3_XS，108K | 约 30 tok/s | 报告显存占用约 14.8 GB |
-| RTX 3090 Ti + 64 GB RAM | Qwen3.8 Flash Next | 约 29 tok/s | 模型量化、context 和命令未给 |
+| RTX 3090 Ti + 64 GB RAM | Qwen3.8 Flash Next | 约 29 tok/s | [原视频反馈](https://www.bilibili.com/video/BV1ALha63Eyd/)的评论标识 `318146261056`；模型量化、context 和命令未给 |
 | 2× RTX 3080 20 GB + 32 GB DDR4 | Qwen3.8 | 约 5 tok/s | 报告称最初发生交换，之后调参；不可解释为双卡上限 |
 | RTX 4090 48 GB | Qwen3.8 / Qwen3.6 35B | 约 40+ / 120 tok/s | 参数和上下文未给 |
 

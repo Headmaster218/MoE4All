@@ -9,6 +9,8 @@ evidence_level: historical-sample
 
 这组 `infr-vulkan` 专项集成测试使用实际分页专家内核、`MoePagerSession`、完整/包容式 RAM 路径和 `FileBlockIo`，不包含 CLI、模型图、KV、Attention 或服务器。因而下面的微秒数不能直接折算成端到端 Decode tok/s。35B 的 Q5_K/Q6_K 块为 0.688/0.820 MiB；122B 的 IQ4_XS/Q5_K/Q6_K 块为 1.594/2.063/2.461 MiB。SSD 读使用不重叠的首次触碰 1 GiB 窗口，避免把 OS cache 命中计作磁盘性能。
 
+阶段记录注明增量编译耗时 2.66 s，5 次筛选运行合计 14.1 s；原报告标识为 `moe-schedule-cost-final2-20260824-203548/report.md`。这两项是测试开销和产物溯源，不是模型推理耗时；原报告本身未随文档分支保存。
+
 ## 完整 UGD 计算，单位 µs
 
 | 权重池 / 专家数 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |

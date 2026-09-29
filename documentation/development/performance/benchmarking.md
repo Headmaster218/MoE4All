@@ -19,6 +19,14 @@ infr bench "$M" -p 0 -n 64 -r 3         # Decode 64 个 token
 infr bench "$M" -p 0 -n 64 -d 2048      # 在 2048 上下文深度下测 Decode（-d 只预热，不计时）
 ```
 
+## 数字口径与可比性
+
+`ppN` 是 N token Prefill，`tgN` 是 N token Decode；`dK` 是测试前已有的 KV 深度。`--synthetic-depth` 会构造并初始化测试用 KV，让 Attention 扫描指定深度，却没有真正执行此前 K token 的文本 Prefill，也不能验证长对话质量或真实专家路由。报告 `cache` 大小时须说明它是旧专家缓存限制还是总 VRAM budget；命中率须注明 GPU hit、RAM 条件 hit 或其他分母。GB/s 与 GiB/s 不可混写。
+
+比较代码变更时至少固定 GGUF/量化、KV 类型、上下文与深度、VRAM/RAM 预算、ubatch、Prefill/Decode token 数、提交上限、预热与 profiler 状态；优先交错 A-B-B-A，并报告逐次样本及离散程度。区分新进程冷启动、benchmark 预热、连续会话和稳态。逐算子时间戳、有序 Pager CSV 与 RGP 捕获用于归因，最终 tok/s 应在关闭插桩后复测。原始记录还应包含提交或二进制 hash、GPU/驱动、完整命令及产物位置；缺项时只标历史样本，不补造可复现性。
+
+例如，122B 冷进程 2K 的 11.2 tok/s 与热缓存 tg256 的 23.2 tok/s 不是补丁 A/B，不能据此宣称 107% 提速；35B 的 14 GiB 纯 Decode 数字也不能证明 250K 对话可安全运行。模拟的槽位命中、理论 `bytes / bandwidth` 和硬件实测必须分别标注。
+
 使用 `INFR_PROF_OPS=1` **剖析**逐算子 GPU 时间（时间戳查询）。每次派发都会自动加时间戳并以**内核名称**标记（另有 `expert_gateup`/`expert_down` 等少数角色覆盖），无需手动标记。它会为每次提交输出一个区块，并在进程退出时输出一份汇总的 `INFR_PROF_OPS GPU report`（各内核总计、次数、平均值，以及所有计时提交中的 GPU 百分比；预热运行不做剖析）。添加 `INFR_PROF_OP_SHAPES=1` 可获得按形状细分的 GEMV/GEMM 桶（`mmvr:m4:1536x24576`）。解码重放带不携带时间戳；使用 `INFR_SEAM_NO_REPLAY=1` 剖析解码。详见 [`playbook.md`](optimization-playbook.md)。
 
 ```bash

@@ -73,7 +73,10 @@ MCP 或 OS sandbox。
 
 早期 profile 端口覆盖曾与桌面 watchdog 等待端口不一致；正式产品必须让 launcher、健康检查、UI 和远程入口读取同一配置。上传插件当时不在启用 bundles 清单中，不能因找到工作区 diff 就宣称已启用或已完成安全验收。旧 remote-web-ui 的 manifest 要求比本机 harness 更高的 dsh 版本，不能长期依赖注入 fallback 维持协议兼容。记忆插件的 Embedding 后端应是显式可选依赖，而非静默 stub。
 
+插件应通过 Product Host 请求引擎的 Embedding capability；不能各自启动第二套 ONNX 或 llama worker，绕开 Engine Manager 的 GPU 预算与生命周期所有权。
+
 ## 与当前 Rust 整理的关系
 
 Agent 接入不要求先完成全仓 crate 重写。优先让 `infr-engine` 承接稳定生成/能力契约，保持
 `infr-server` 为协议适配，逐步拆清 `infr-llama` 内部模型/会话/调度器/MTP 边界。
+`infr-cli` 的命令、组合与呈现也可渐进拆开，不让 Agent 工作等待一次全仓重构；小 crate 的保留与否应由依赖和发布边界决定，而非代码行数。

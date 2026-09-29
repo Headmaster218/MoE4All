@@ -10,6 +10,8 @@ evidence_level: commit-and-historical-measurement
 
 本页按决策变化整理早期派生版本的 89 个提交，而不是描述 `release-0.9.0` 的全部现状。当前实现以[系统总览](../../architecture/system-overview.md)和[资源生命周期](../../architecture/memory/runtime-resource-lifecycle.md)为准。合并基点为 `d7f320e7b8936fd6e1860115c5dd579c4572a27f`，本段终点为 `311ed4c`。实验数值只对应各自的历史条件。
 
+该 89 提交范围以 fork 相对 `upstream/main` 的差集定义，不以作者姓名划界；阶段材料中 John(Desktop) 与 Zhuohang Wu 的相关工作均计入，不把上游原有能力算作 fork 增量。
+
 | 日期 | 当时引入的机制 | 随后修正的假设 |
 |---|---|---|
 | 8 月 15 日 | Windows native、可用 RAM 探测、可选 Pager profiling、O(1) LRU、合成上下文深度 | 先使 100K-250K 深度 A/B 可重复，合成深度不等于真实长 Prefill |
@@ -20,6 +22,8 @@ evidence_level: commit-and-historical-measurement
 | 8 月 23 日 | RAM/SSD 第三级、Ling/DeepSeek V4、批量 Host 提升 | 初版排他式 RAM/SSD 后改为 inclusive shadow；VRAM→RAM 回写约 44 MB/s，不适合作 miss 热路径 |
 | 8 月 24 日 | full-RAM 与 bounded 两路 host backing、弹性 arena、有序 trace、共享专家融合 | Qwen 122B 的 recurrent state 必须随 KV 清空；复杂 UG→D 按 tier 分支经微基准否决，见[122B 追踪](../benchmarks/2026-08-24-qwen35-122b-cold-trace.md)与[微基准](../benchmarks/2026-08-25-moe-pager-microbench.md) |
 | 8 月 25 日 | `VK_EXT_external_memory_host` 原地导入和按池比例分配 import 额度 | 驱动只导入约 29 GiB，未导入尾段继续 CPU push；122B 热 tg256 从 19.2 到 23.2 tok/s，不替代冷长追踪 |
+
+hd256 FlashAttention 的早期 Balanced pp512 历史对照为 100K 约 164→320 tok/s（1.95 倍）、200K 约 89→229 tok/s（2.57 倍）；这是引入 BM16 阶段的代表样本，不等于 0.9.0 各量化和真实长提示的普遍增幅。Host DMA 阶段的大块复制约 25 GiB/s，相对当时生产 CPU push 的 14–19 GiB/s 曾被估作约 30%–70% 的通道潜力；它不是单专家 miss 或端到端 Decode 的实测提速。
 
 ## 关键设计转折
 

@@ -25,7 +25,7 @@ tag 的相关 Git tree 为 85 项：三个根入口继续保留，其余 82 项�
 | Agent/DSH、训练及其他未交付方向 | 不写作 tag 当前能力 | `roadmap/` 标为提案；tag 后提交另见[基线审计](2026-09-28-release-0.9.0-baseline-and-new-commits.md) |
 | 发版与性能方法 | `development/` | 固定运行的数字保留在 `evidence/benchmarks/`，不混入方法页 |
 
-Wiki 中独有的长 commit/hash 和小数数值，排除旧目录后与新体系做 token 交叉检查，缺项为 0。82 份 tag 来源的首轮检查只发现两处旧索引文件名中的日期写法 `20260924`；对应的 20K MTP benchmark 已按新命名收入[基准测试](../benchmarks/2026-09-24-qwen38-mtp-20k.md)，不是测量缺失。说明这一改名后，比较时统一千位分隔符，长 hash 和小数数值无缺项。该检查能发现漏掉的提交和历史数字，**不能证明语义逐句等价**。迁移中重点人工核对了 122B 冷/热口径、Qwen3.6 的合成深度限制、未采用的缓存和内核策略，以及曾被标为暂缓而后来落地的动态 KV。
+本轮最初的 Wiki token 检查过度概括了覆盖程度：排除旧归档后，122B 追踪的两条 SHA-256 与若干派生数字、实验开销并未保留。因此当时的“长 hash 和小数缺项为 0”结论撤回。2026-09-29 对当前工作区 100 份未跟踪草稿的逐篇去向、补遗和复核见[草稿覆盖审计](2026-09-29-old-draft-coverage.md)。token 检查只用于发现候选缺口，**不能证明语义逐句等价**。迁移中重点人工核对了 122B 冷/热口径、Qwen3.6 的合成深度限制、未采用的缓存和内核策略，以及曾被标为暂缓而后来落地的动态 KV。
 
 ## 版本与证据边界
 
@@ -34,4 +34,4 @@ Wiki 中独有的长 commit/hash 和小数数值，排除旧目录后与新体�
 - ignored trace、含完整 prompt/reasoning/output 的逐轮 JSON 与本机绝对路径不纳入文档库；仅保留可读报告、脱敏指标与必要的产物校验信息。
 - 本次只处理文档和性能/稳定性资料，没有运行 Rust 构建、测试或 GPU benchmark，也没有修改运行时代码。源码和配置注释中仍可能有旧 `docs/` 字面路径，超出本次修改范围。
 
-清除旧目录并移出 benchmark 原件后复查：`documentation/archive/` 不存在；目录外的 Markdown/Mermaid/文档产物只有根 README、README_EN、CHANGELOG。87 篇 Markdown（含三个根入口）的 222 条本地链接无断链，首页可达全部非根页面。原始报告、DOCX、指标 JSON 和追踪 ZIP 转入本机 Git 忽略的 `benchmark-data/`；`documentation/` 仅保留提炼结论、证据限制与必要校验值。`architecture/` 下的 Markdown 均标为 `current`，提案与历史变化不在此目录。Git 变更范围仅文档、旧文档删除和三个根入口；Rust 代码未改。此次扫描仍不包含原始 Git 版本中的旧链接，因为旧文档只通过 Git 历史恢复。
+当日清除旧目录并移出 benchmark 原件后复查：`documentation/archive/` 不存在；目录外的 Markdown/Mermaid/文档产物只有根 README、README_EN、CHANGELOG。当时 87 篇 Markdown（含三个根入口）的 222 条本地链接无断链，首页可达全部非根页面；后续新增页面应以新审计的计数为准。原始报告、DOCX、指标 JSON 和追踪 ZIP 转入本机 Git 忽略的 `benchmark-data/`；`documentation/` 仅保留提炼结论、证据限制与必要校验值。`architecture/` 下的 Markdown 均标为 `current`，提案与历史变化不在此目录。Git 变更范围仅文档、旧文档删除和三个根入口；Rust 代码未改。此次扫描仍不包含原始 Git 版本中的旧链接，因为旧文档只通过 Git 历史恢复。
