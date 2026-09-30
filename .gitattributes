@@ -3,3 +3,4 @@
 # Linguist doesn't classify it, so ~312 KB of shader code fell out of the language
 # stats — making Metal look larger than the Vulkan shaders when the reverse is true.
 *.comp linguist-language=GLSL
+scripts/perf-sweep.sh text eol=lf

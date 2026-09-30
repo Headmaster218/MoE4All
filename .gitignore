@@ -18,6 +18,7 @@ target-prof/
 /gui-data/
 /kv-sessions/
 /artifacts/context-resource-matrix/
+/benchmark-data/
 /tests/context-resource/matrix.local.json
 bili_report_work/*
 followtasks.txt
