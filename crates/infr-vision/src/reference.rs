@@ -186,7 +186,7 @@ pub(crate) fn encode(path: &Path, image: &PreparedImage) -> Result<Vec<f32>> {
 
     let patch_grid_x = image.grid_nx * cfg.spatial_merge_size;
     let mut positions = vec![0i32; rows * 2];
-    for (index, pair) in positions.chunks_exact_mut(2).enumerate() {
+    for (index, pair) in positions.as_chunks_mut::<2>().0.iter_mut().enumerate() {
         let (y, x) = merge_major_pos(index, patch_grid_x, cfg.spatial_merge_size);
         pair.copy_from_slice(&[y as i32, x as i32]);
     }

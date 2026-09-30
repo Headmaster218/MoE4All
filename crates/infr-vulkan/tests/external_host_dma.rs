@@ -1,3 +1,5 @@
+#![cfg(target_os = "windows")]
+
 //! DMA bandwidth probe for ordinary host allocations imported with
 //! `VK_EXT_external_memory_host`.
 //!

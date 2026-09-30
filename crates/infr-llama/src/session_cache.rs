@@ -1287,8 +1287,10 @@ fn read_tokens(reader: &mut impl Read, count: u64, max_ctx: usize) -> Result<Vec
     let mut bytes = vec![0u8; byte_count];
     reader.read_exact(&mut bytes)?;
     Ok(bytes
-        .chunks_exact(4)
-        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| u32::from_le_bytes(*bytes))
         .collect())
 }
 
@@ -1308,8 +1310,10 @@ fn read_tokens_hashed(
     let mut bytes = vec![0u8; byte_count];
     read_hashed(reader, hasher, &mut bytes)?;
     Ok(bytes
-        .chunks_exact(4)
-        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| u32::from_le_bytes(*bytes))
         .collect())
 }
 

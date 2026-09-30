@@ -387,7 +387,9 @@ fn compile_glsl(src: &str, tag: &str) -> Result<Vec<u32>, String> {
     }
     let bytes = std::fs::read(&spv_path).map_err(|e| format!("read spv: {e}"))?;
     let words: Vec<u32> = bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     Ok(words)
@@ -1004,7 +1006,9 @@ fn compile_or_die(src: &str, tag: &str) -> Vec<u32> {
 
 fn as_f32(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
         .collect()
 }

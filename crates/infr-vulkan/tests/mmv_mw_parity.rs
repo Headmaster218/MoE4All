@@ -316,7 +316,9 @@ fn mmv_mw_q2k_q3k_match_host_reference() {
                 .map(|&b| b as i8)
                 .collect();
             let dact_h: Vec<f32> = read_bytes(dact.as_ref(), nblk * 2)
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| f16v(c[0], c[1]))
                 .collect();
             let got: Vec<f32> =
@@ -472,11 +474,15 @@ fn mmv_mw_q5k_match_host_reference() {
                 .map(|&b| b as i8)
                 .collect();
             let dact_h: Vec<f32> = read_bytes(dact.as_ref(), nblk * 2)
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| f16v(c[0], c[1]))
                 .collect();
             let sact_h: Vec<f32> = read_bytes(sact.as_ref(), nblk * 2)
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| f16v(c[0], c[1]))
                 .collect();
             let got: Vec<f32> =

@@ -6,6 +6,42 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-28
+
+### Added
+
+- Stateless `POST /v1/responses` with JSON and typed SSE output. It rejects server-side conversation state, remote image URLs, and unsupported hosted-tool fields.
+- Qwen3.8 MTP verification and batched decode across two slots, including multimodal serving and coexistence with the Vision and Embedding services.
+- Ling 3.0 Tiny Q4_K_M support and a transactional Windows Engine self-update path in the wizard.
+
+### Changed
+
+- Session continuation can reuse Agent and edited-turn recurrent checkpoints. Concurrent MTP shares staging resources and grows head KV lazily.
+- Streaming requests send keep-alives while queued or waiting for long-running generation.
+- The wizard exposes two-slot MTP serving, local model recommendations, and local cache controls.
+
+### Fixed
+
+- Protected frozen expert LUT slots until their GPU command streams finish; automatic MoE arena placement can retry at a lower ubatch.
+- Preserved reasoning and MTP state across supported session continuations, and bounded MTP generation by remaining long-context capacity.
+- Corrected Vulkan residency reporting and several ragged GEMV and split-K paths; removed the former fixed Embedding request deadline.
+
+## [0.8.0] - 2026-09-25
+
+### Added
+
+- Fixed four-token Qwen3.8 MTP drafting with batched target verification and accepted-prefix state restoration.
+- Native Embedding support and MTP selection in the Windows wizard; automatic modes expose context sizing.
+
+### Changed
+
+- Automatic RAM budgets are calculated once at startup. Conservative and aggressive Prefill ubatch candidates begin at 2048 and 4096 rows on discrete GPUs, subject to placement fallback.
+- Qwen3.8 Decode, parallel QSA/PLE, MTP verification, and prompt priming received targeted performance work.
+
+### Fixed
+
+- Parallel Prefill honors an explicitly selected ubatch and avoids impossible scratch reservations.
+
 ## [0.7.0] - 2026-09-20
 
 ### Highlights
@@ -350,7 +386,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   address their weight by pointer, and `w_off` is row-aligned), which is what
   lets the grouped output projection run there at all; and V4 is excluded from
   the record-once decode replay tape, like `deepseek2`, because its ops have no
-  dynamic twins. See `docs/deepseek.md` § Stage 4.
+  dynamic twins. See `documentation/evidence/changes/models/deepseek-family.md` § Stage 4.
 - **DeepSeek V4 hash-routed MoE and per-layer SwiGLU clamping** (stage 4, op
   level). `Op::MoeFfn` gains `expert_ids`: an optional pre-gathered
   `[rows, n_expert_used]` I32 handle (llama.cpp's `selected_experts_in`,
@@ -366,7 +402,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   through as a real clamp. V4 clamps `up` symmetrically and the gate one-sided
   and **pre**-activation, where every other arch clamps post-SiLU. All of it
   runs on CPU, Vulkan and Metal; `None` leaves every existing model's numerics
-  bit-identical. See `docs/deepseek.md` § Stage 4.
+  bit-identical. See `documentation/evidence/changes/models/deepseek-family.md` § Stage 4.
 - **DeepSeek V4 Sinkhorn hyper-connections** (stage 4, op level): three new ops
   that replace `x = x + f(x)` with `hc_mult` parallel residual streams.
   `Op::HyperConnectMix` turns the mixing matmul's output into the `pre` collapse
@@ -378,7 +414,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (llama.cpp's `build_hc_head`), which is the same arithmetic over a narrower
   `mixes`. All three run on CPU, Vulkan and Metal; `hc_mult` is accepted in
   `1..=infr_core::graph::HYPER_CONNECT_MAX_MULT` (8) and refused loudly on the
-  host beyond that. See `docs/deepseek.md` § "Sinkhorn hyper-connections".
+  host beyond that. See `documentation/evidence/changes/models/deepseek-family.md` § "Sinkhorn hyper-connections".
 - **DeepSeek V4 attention primitives** (stage 4, op level): `Op::QkNorm`'s
   `weight` became optional, so a weightless per-head RMSNorm is expressible
   without a fake ones-vector operand; `Op::Attention` gained an optional
@@ -397,7 +433,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   sqrt-softplus), `expert_weights_norm`, group-limited routing fields, and
   `rope_yarn_log_mul` (with the convert-script ÷0.1 fix). Added
   `MoeGating::SqrtSoftplus` variant and wired it in CPU + Vulkan backends. See
-  `docs/deepseek.md` § Stage 2.
+  `documentation/evidence/changes/models/deepseek-family.md` § Stage 2.
 
 - **MLA attention kernels** (DeepSeek V2/V3 absorbed form, `Op::Mla`): Vulkan
   `mla.comp` and Metal `mla_f16kv` compute kernels implement the full per-head
@@ -425,7 +461,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   softmax-gated MoE with ungated shared expert, following llama.cpp's
   `src/models/deepseek.cpp`. First `n_layer_dense_lead` layers are dense FFN,
   the rest are MoE. Tokenizer pre-processing added for `deepseek-llm`,
-  `deepseek-coder`, and `deepseek-v3` pre-types (see `docs/deepseek.md` § Stage
+  `deepseek-coder`, and `deepseek-v3` pre-types (see `documentation/evidence/changes/models/deepseek-family.md` § Stage
   1). Works on CPU + Vulkan backend via the existing `FfnW::Moe` with `shexp`
   path (same as llama4's plain-summed shared expert).
 
@@ -466,7 +502,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   small to seat a weight class leaves that class mapped and says so.
   - **CPU backend**: every weight above 1 MiB. Measured on a memory-capped
     Llama-3.2-1B F16: decode 2.06x faster at a 1.5 GB cap with 210x fewer major
-    faults, prefill 3-7.5% slower (`docs/perf/results.md`).
+    faults, prefill 3-7.5% slower (`documentation/evidence/benchmarks/2026-08-03-validated-models.md`).
   - **Vulkan backend**: a third tier under both dense weight streaming and the
     paged MoE expert cache, so a VRAM miss resolves against the arena and
     reaches the file only when that misses too. MoE pages ONE EXPERT at a time
@@ -476,7 +512,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     under a forced 2 GB VRAM budget: **decode 2.17x faster than the mmap path it
     replaces** at an 8 GB cap with a 7 GB arena (1.41x with a 3 GB one), 38x
     fewer major faults, 232 → 110 GB read, and parity when memory is plentiful
-    (`docs/perf/results.md`). The arena budget is the dominant factor — 3 GB → 7
+    (`documentation/evidence/benchmarks/2026-08-03-validated-models.md`). The arena budget is the dominant factor — 3 GB → 7
     GB is worth 1.6x on its own — which is why it is now sized automatically
     rather than left to a guess. The measurement covers one GPU, one drive and
     Linux only.

@@ -110,6 +110,7 @@ jobs:
     # quietly burning a six-hour runner.
     timeout-minutes: 45
     env:
+      RUSTUP_TOOLCHAIN: nightly
       MIRIFLAGS:
         -Zmiri-disable-isolation -Zmiri-tree-borrows -Zmiri-ignore-leaks
     steps:
@@ -117,10 +118,8 @@ jobs:
       # No glslc step, unlike every job in ci.yml: `infr-cpu`'s graph does not
       # include `infr-vulkan`, so nothing here compiles a shader.
       #
-      # No `RUSTUP_TOOLCHAIN: nightly` either, which hjkl and crcbl both set on
-      # their miri jobs — they carry a `rust-toolchain.toml` that claims authority
-      # over rustup and would otherwise refuse the channel. This repo has no such
-      # file. Add the override here if one ever lands.
+      # Miri remains on nightly even though ordinary builds are pinned by
+      # rust-toolchain.toml.
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: nightly

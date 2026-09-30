@@ -17,9 +17,15 @@ try {
 }
 
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$updateCommonPath = Join-Path $PSScriptRoot 'moe4all-update-common.ps1'
+if (-not (Test-Path -LiteralPath $updateCommonPath -PathType Leaf)) {
+    throw "Missing update support file: $updateCommonPath"
+}
+. $updateCommonPath
 $releaseInfrPath = Join-Path $repoRoot 'infr.exe'
 $sourceInfrPath = Join-Path $repoRoot 'target\release\infr.exe'
-$infrPath = if (Test-Path -LiteralPath $releaseInfrPath -PathType Leaf) {
+$script:IsPackagedInstall = Test-Path -LiteralPath $releaseInfrPath -PathType Leaf
+$infrPath = if ($script:IsPackagedInstall) {
     $releaseInfrPath
 } else {
     $sourceInfrPath
@@ -553,42 +559,189 @@ function Get-EngineVersion {
     return 'unknown'
 }
 
-function ConvertTo-ComparableVersion {
-    param([Parameter(Mandatory = $true)][string]$Value)
-    if ($Value -match '(\d+)\.(\d+)\.(\d+)') {
-        return [version]::new([int]$Matches[1], [int]$Matches[2], [int]$Matches[3])
+function Get-LatestEngineRelease {
+    param([Parameter(Mandatory = $true)][string]$CurrentVersion)
+
+    $headers = @{
+        Accept = 'application/vnd.github+json'
+        'User-Agent' = "MoE4All-Wizard/$CurrentVersion"
+        'X-GitHub-Api-Version' = '2022-11-28'
     }
-    return $null
+    $response = Invoke-RestMethod -Uri 'https://api.github.com/repos/Headmaster218/MoE4All/releases?per_page=30' -Headers $headers -TimeoutSec 5 -ErrorAction Stop
+    $release = Select-Moe4AllEngineRelease -Releases @($response)
+    if ($null -eq $release) {
+        throw 'No stable Engine release with a Windows archive and SHA-256 file was found.'
+    }
+    return $release
+}
+
+function Show-EngineReleaseNotes {
+    param([Parameter(Mandatory = $true)]$Release)
+
+    Write-Host "`n$($Release.Name)" -ForegroundColor Cyan
+    if (-not [string]::IsNullOrWhiteSpace([string]$Release.PublishedAt)) {
+        Write-Host "Published: $($Release.PublishedAt)" -ForegroundColor DarkGray
+    }
+    Write-Host (Format-Moe4AllReleaseNotes -Notes ([string]$Release.Notes))
+    Write-Host "`n$($Release.Url)" -ForegroundColor Cyan
+}
+
+function Read-EngineUpdateAction {
+    param([Parameter(Mandatory = $true)]$Release)
+
+    while ($true) {
+        Write-Host "`n发现新版本 / Update available: $($Release.Tag)" -ForegroundColor Yellow
+        Write-Host '   [1] 查看更新说明 / View release notes'
+        Write-Host '   [2] 下载并更新 / Download and update'
+        Write-Host '   [3] 暂不更新 / Not now'
+        $value = (Read-Host '选择 / Select').Trim().ToLowerInvariant()
+        switch ($value) {
+            { $_ -in @('1', 'r', 'release', 'notes') } {
+                Show-EngineReleaseNotes -Release $Release
+                continue
+            }
+            { $_ -in @('2', 'y', 'yes', 'update') } { return 'update' }
+            { $_ -in @('3', 'n', 'no', 'later') } { return 'skip' }
+            default {
+                Write-Host '请选择 1、2 或 3；此处没有默认选项。Select 1, 2 or 3; there is no default.' -ForegroundColor Yellow
+            }
+        }
+    }
+}
+
+function Test-EngineProcessRunning {
+    foreach ($process in @(Get-Process -Name 'infr' -ErrorAction SilentlyContinue)) {
+        try {
+            if ($process.Path -and ([System.IO.Path]::GetFullPath($process.Path)).Equals($releaseInfrPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $true
+            }
+        } catch {
+            # Process paths can be inaccessible across integrity levels.
+        }
+    }
+    return $false
+}
+
+function Invoke-EngineSelfUpdate {
+    param([Parameter(Mandatory = $true)]$Release)
+
+    if (-not $script:IsPackagedInstall) {
+        Write-Host '源码工作区不会自动覆盖；请更新源码后重新构建。Source checkouts are not overwritten automatically.' -ForegroundColor Yellow
+        Write-Host $Release.Url -ForegroundColor Cyan
+        return $false
+    }
+    if (Test-EngineProcessRunning) {
+        Write-Host '当前安装目录中的 infr.exe 正在运行；请停止服务后重试。The installed infr.exe is running; stop it and try again.' -ForegroundColor Yellow
+        return $false
+    }
+
+    $updateRoot = Join-Path $repoRoot '.update'
+    $runRoot = Join-Path $updateRoot ("staging-" + [guid]::NewGuid().ToString('N'))
+    $archivePath = Join-Path $runRoot $Release.ArchiveName
+    $checksumPath = Join-Path $runRoot $Release.ChecksumName
+    $extractRoot = Join-Path $runRoot 'extracted'
+    New-Item -ItemType Directory -Path $runRoot -Force | Out-Null
+
+    try {
+        $headers = @{ 'User-Agent' = "MoE4All-Wizard/$productVersion" }
+        Write-Host "`n正在下载 $($Release.ArchiveName) / Downloading $($Release.ArchiveName)..." -ForegroundColor Cyan
+        Invoke-WebRequest -Uri $Release.ArchiveUrl -Headers $headers -OutFile $archivePath -UseBasicParsing -TimeoutSec 900
+        Invoke-WebRequest -Uri $Release.ChecksumUrl -Headers $headers -OutFile $checksumPath -UseBasicParsing -TimeoutSec 60
+
+        if ($Release.ArchiveSize -gt 0 -and (Get-Item -LiteralPath $archivePath).Length -ne $Release.ArchiveSize) {
+            throw 'Downloaded archive size does not match the GitHub release asset.'
+        }
+        $checksumText = Get-Content -LiteralPath $checksumPath -Raw -Encoding UTF8
+        $checksumPattern = '(?im)^\s*([a-f0-9]{64})\s+\*?' + [regex]::Escape($Release.ArchiveName) + '\s*$'
+        if ($checksumText -notmatch $checksumPattern) {
+            throw "The SHA-256 file does not contain an entry for $($Release.ArchiveName)."
+        }
+        $expectedHash = $Matches[1]
+        $actualHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash
+        if (-not $actualHash.Equals($expectedHash, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Downloaded archive failed SHA-256 verification.'
+        }
+
+        Write-Host '正在校验更新包 / Validating update package...' -ForegroundColor Cyan
+        Expand-Archive -LiteralPath $archivePath -DestinationPath $extractRoot -Force
+        $manifests = @(Get-ChildItem -LiteralPath $extractRoot -Filter 'install-manifest.json' -File -Recurse)
+        if ($manifests.Count -ne 1) { throw 'The update archive must contain exactly one install-manifest.json.' }
+        $packageRoot = $manifests[0].Directory.FullName
+        $manifest = Read-Moe4AllInstallManifest -ManifestPath $manifests[0].FullName -PackageRoot $packageRoot -VerifyFiles
+        if ([string]$manifest.version -ne [string]$Release.Version) {
+            throw "Release version $($Release.Version) does not match package version $($manifest.version)."
+        }
+        $stagedBinary = Join-Path $packageRoot 'infr.exe'
+        $versionOutput = (& $stagedBinary --version 2>$null | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0 -or $versionOutput -notmatch [regex]::Escape("infr $($Release.Version)")) {
+            throw "The staged engine failed version validation: $versionOutput"
+        }
+
+        $stagedHelper = Join-Path $packageRoot 'scripts\apply-engine-update.ps1'
+        $temporaryHelper = Join-Path ([System.IO.Path]::GetTempPath()) ("MoE4All-Engine-Updater-" + [guid]::NewGuid().ToString('N') + '.ps1')
+        Copy-Item -LiteralPath $stagedHelper -Destination $temporaryHelper -Force
+        $argumentText = @(
+            '-NoLogo'
+            '-NoProfile'
+            '-File'
+            ('"' + $temporaryHelper + '"')
+            '-InstallRoot'
+            ('"' + $repoRoot + '"')
+            '-StagedPackageRoot'
+            ('"' + $packageRoot + '"')
+            '-ExpectedVersion'
+            ('"' + $Release.Version + '"')
+            '-ParentProcessId'
+            ([string]$PID)
+            '-CleanupRoot'
+            ('"' + $runRoot + '"')
+            '-DeleteSelf'
+        ) -join ' '
+        Start-Process -FilePath 'powershell.exe' -ArgumentList $argumentText -WorkingDirectory $repoRoot -WindowStyle Normal | Out-Null
+        Write-Host '更新包已准备完成，向导将退出并由更新助手完成替换。Update is staged; the helper will finish after this wizard exits.' -ForegroundColor Green
+        exit 42
+    } catch {
+        if (Test-Path -LiteralPath $runRoot) {
+            Remove-Item -LiteralPath $runRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Write-Host "更新失败，现有安装未改变。Update failed; the current installation was not changed.`n$($_.Exception.Message)" -ForegroundColor Red
+        Write-Host $Release.Url -ForegroundColor Cyan
+        return $false
+    }
+}
+
+function Show-PendingUpdateResult {
+    $resultPath = Join-Path $repoRoot '.update\last-update-result.json'
+    if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) { return }
+    try {
+        $result = Get-Content -LiteralPath $resultPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $color = if ([string]$result.status -eq 'success') { 'Green' } else { 'Red' }
+        Write-Host ([string]$result.message) -ForegroundColor $color
+    } catch {
+        Write-Host '上次更新留下了无法读取的结果。The previous update left an unreadable result.' -ForegroundColor Yellow
+    } finally {
+        Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Show-UpdateStatus {
     param([Parameter(Mandatory = $true)][string]$CurrentVersion)
 
     $disabled = [Environment]::GetEnvironmentVariable('MOE4ALL_NO_UPDATE_CHECK', 'Process')
-    if ($SkipUpdateCheck -or $disabled -match '^(1|true|yes|on)$') {
-        return
-    }
-    $current = ConvertTo-ComparableVersion $CurrentVersion
-    if ($null -eq $current) {
-        return
-    }
+    if ($SkipUpdateCheck -or $disabled -match '^(1|true|yes|on)$') { return }
+    $current = ConvertTo-Moe4AllSemVer $CurrentVersion
+    if ($null -eq $current) { return }
 
     try {
-        $headers = @{
-            Accept = 'application/vnd.github+json'
-            'User-Agent' = "MoE4All-Wizard/$CurrentVersion"
-        }
-        $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/Headmaster218/MoE4All/releases/latest' -Headers $headers -TimeoutSec 3 -ErrorAction Stop
-        $latestText = [string]$release.tag_name
-        $latest = ConvertTo-ComparableVersion $latestText
-        if ($null -ne $latest -and $latest -gt $current) {
-            Write-Host "发现新版本 / Update available: $latestText" -ForegroundColor Yellow
-            Write-Host ([string]$release.html_url) -ForegroundColor Cyan
-        } elseif ($null -ne $latest) {
+        $release = Get-LatestEngineRelease -CurrentVersion $CurrentVersion
+        if ((Compare-Moe4AllSemVer $release.SemVer $current) -gt 0) {
+            $action = Read-EngineUpdateAction -Release $release
+            if ($action -eq 'update') { [void](Invoke-EngineSelfUpdate -Release $release) }
+        } else {
             Write-Host "更新检查 / Update check: v$CurrentVersion is current" -ForegroundColor DarkGray
         }
     } catch {
-        Write-Host '更新检查不可用，继续离线启动。Update check unavailable; continuing offline.' -ForegroundColor DarkGray
+        Write-Host "更新检查不可用，继续离线启动。Update check unavailable; continuing offline. $($_.Exception.Message)" -ForegroundColor DarkGray
     }
 }
 
@@ -616,6 +769,7 @@ Write-Host '============================================================' -Foreg
 Write-Host 'MoE4All 启动向导 / MoE4All Launch Wizard' -ForegroundColor Green
 Write-Host '上次设置会作为默认值；直接回车即可复用。Press Enter to reuse the previous value.'
 Write-Host "引擎 / Engine: $infrPath" -ForegroundColor DarkGray
+Show-PendingUpdateResult
 Show-UpdateStatus -CurrentVersion $productVersion
 
 $launchMode = Read-Choice -Label '你想做什么？/ What would you like to do?' -DefaultValue ([string](Get-SavedValue 'launch_mode' 'chat')) -Options @(

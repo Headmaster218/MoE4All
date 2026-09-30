@@ -11,11 +11,17 @@ Set-StrictMode -Version Latest
 $PackageRoot = [System.IO.Path]::GetFullPath($PackageRoot)
 $binaryPath = Join-Path $PackageRoot 'infr.exe'
 $wizardPath = Join-Path $PackageRoot 'scripts\infr-wizard.ps1'
+$updateCommonPath = Join-Path $PackageRoot 'scripts\moe4all-update-common.ps1'
+$updateHelperPath = Join-Path $PackageRoot 'scripts\apply-engine-update.ps1'
+$manifestPath = Join-Path $PackageRoot 'install-manifest.json'
 $launcherPath = Join-Path $PackageRoot 'Start-INFR-Wizard.cmd'
 
 $requiredPaths = @(
     $binaryPath
     $wizardPath
+    $updateCommonPath
+    $updateHelperPath
+    $manifestPath
     $launcherPath
     (Join-Path $PackageRoot 'README.md')
     (Join-Path $PackageRoot 'README_EN.md')
@@ -27,6 +33,46 @@ foreach ($requiredPath in $requiredPaths) {
     if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
         throw "Required package file is missing: $requiredPath"
     }
+}
+
+. $updateCommonPath
+$manifest = Read-Moe4AllInstallManifest -ManifestPath $manifestPath -PackageRoot $PackageRoot -VerifyFiles
+if ($ExpectedVersion -and [string]$manifest.version -ne $ExpectedVersion) {
+    throw "Expected install manifest version $ExpectedVersion, got $($manifest.version)"
+}
+$requiredManagedPaths = @(
+    'infr.exe'
+    'Start-INFR-Wizard.cmd'
+    'scripts/infr-wizard.ps1'
+    'scripts/moe4all-update-common.ps1'
+    'scripts/apply-engine-update.ps1'
+)
+$managedPaths = @($manifest.files | ForEach-Object { [string]$_.path })
+foreach ($requiredManagedPath in $requiredManagedPaths) {
+    if ($requiredManagedPath -notin $managedPaths) {
+        throw "Install manifest does not own required file: $requiredManagedPath"
+    }
+}
+
+$releaseFixture = @(
+    [pscustomobject]@{
+        tag_name = 'agent-9.0.0'; name = 'Agent'; html_url = 'https://example.test/agent'; body = 'agent';
+        draft = $false; prerelease = $false; published_at = '2026-01-02T00:00:00Z'; assets = @()
+    },
+    [pscustomobject]@{
+        tag_name = 'release-1.2.3'; name = 'Engine'; html_url = 'https://example.test/engine'; body = '# Engine notes';
+        draft = $false; prerelease = $false; published_at = '2026-01-01T00:00:00Z'; assets = @(
+            [pscustomobject]@{ name = 'MoE4All-Windows-x86_64-v1.2.3.zip'; browser_download_url = 'https://example.test/engine.zip'; size = 123 },
+            [pscustomobject]@{ name = 'MoE4All-Windows-x86_64-v1.2.3.zip.sha256'; browser_download_url = 'https://example.test/engine.zip.sha256'; size = 64 }
+        )
+    }
+)
+$selectedFixture = Select-Moe4AllEngineRelease -Releases $releaseFixture
+if ($null -eq $selectedFixture -or $selectedFixture.Tag -ne 'release-1.2.3') {
+    throw 'Engine release selection did not isolate release-* from agent-* releases.'
+}
+if ((Compare-Moe4AllSemVer (ConvertTo-Moe4AllSemVer '1.2.3') (ConvertTo-Moe4AllSemVer '1.2.3-rc.1')) -le 0) {
+    throw 'Semantic version comparison did not rank a stable release above its prerelease.'
 }
 
 function Invoke-Infr {
@@ -42,6 +88,78 @@ function Invoke-Infr {
 $versionOutput = Invoke-Infr @('--version')
 if ($ExpectedVersion -and $versionOutput -notmatch [regex]::Escape("infr $ExpectedVersion")) {
     throw "Expected infr $ExpectedVersion, got: $($versionOutput.Trim())"
+}
+
+$updateTestRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("moe4all-update-smoke-" + [guid]::NewGuid().ToString('N'))
+try {
+    New-Item -ItemType Directory -Path $updateTestRoot -Force | Out-Null
+    $legacyPath = Join-Path $updateTestRoot 'legacy-managed.txt'
+    [System.IO.File]::WriteAllText($legacyPath, 'old managed content', [System.Text.UTF8Encoding]::new($false))
+    $legacyInfo = Get-Item -LiteralPath $legacyPath
+    $oldManifest = [ordered]@{
+        schema_version = 1
+        updater_protocol = 1
+        product = 'moe4all-engine'
+        version = '0.0.1'
+        tag = 'release-0.0.1'
+        files = @([ordered]@{
+            path = 'legacy-managed.txt'
+            size = [long]$legacyInfo.Length
+            sha256 = (Get-FileHash -LiteralPath $legacyPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        })
+    }
+    [System.IO.File]::WriteAllText(
+        (Join-Path $updateTestRoot 'install-manifest.json'),
+        (($oldManifest | ConvertTo-Json -Depth 5) + "`n"),
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    New-Item -ItemType Directory -Path (Join-Path $updateTestRoot 'gui-data') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $updateTestRoot 'kv-sessions') -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $updateTestRoot 'gui-data\wizard-state.json'), '{"custom":true}', [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText((Join-Path $updateTestRoot 'kv-sessions\keep.bin'), 'kv', [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText((Join-Path $updateTestRoot 'infr.toml'), 'custom = true', [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText((Join-Path $updateTestRoot 'custom-user-file.txt'), 'keep me', [System.Text.UTF8Encoding]::new($false))
+
+    $targetVersion = [string]$manifest.version
+    $nativeArgs = @(
+        '-NoLogo'
+        '-NoProfile'
+        '-NonInteractive'
+        '-File'
+        $updateHelperPath
+        '-InstallRoot'
+        $updateTestRoot
+        '-StagedPackageRoot'
+        $PackageRoot
+        '-ExpectedVersion'
+        $targetVersion
+        '-NoRelaunch'
+    )
+    $updateOutput = & powershell.exe @nativeArgs 2>&1 | Out-String
+    $updateExitCode = $LASTEXITCODE
+    if ($updateExitCode -ne 0) {
+        throw "Engine update transaction smoke test failed with exit code $updateExitCode`n$updateOutput"
+    }
+    foreach ($preservedPath in @(
+        'gui-data\wizard-state.json'
+        'kv-sessions\keep.bin'
+        'infr.toml'
+        'custom-user-file.txt'
+    )) {
+        if (-not (Test-Path -LiteralPath (Join-Path $updateTestRoot $preservedPath) -PathType Leaf)) {
+            throw "Engine update did not preserve user-owned path: $preservedPath"
+        }
+    }
+    if (Test-Path -LiteralPath $legacyPath) {
+        throw 'Engine update did not remove a product-owned file absent from the new manifest.'
+    }
+    [void](Read-Moe4AllInstallManifest -ManifestPath (Join-Path $updateTestRoot 'install-manifest.json') -PackageRoot $updateTestRoot -VerifyFiles)
+    $backupLegacy = Get-ChildItem -LiteralPath (Join-Path $updateTestRoot '.update\backups') -Filter 'legacy-managed.txt' -File -Recurse | Select-Object -First 1
+    if ($null -eq $backupLegacy) { throw 'Engine update did not retain a rollback copy of the old managed file.' }
+} finally {
+    if (Test-Path -LiteralPath $updateTestRoot) {
+        Remove-Item -LiteralPath $updateTestRoot -Recurse -Force
+    }
 }
 
 [void](Invoke-Infr @('--help'))
@@ -85,8 +203,10 @@ if (-not $SkipDependencyCheck) {
 }
 
 # Parse with Windows PowerShell before exercising the CMD wrapper that end users double-click.
-$wizardSource = Get-Content -LiteralPath $wizardPath -Raw -Encoding UTF8
-[void][scriptblock]::Create($wizardSource)
+foreach ($scriptPath in @($wizardPath, $updateCommonPath, $updateHelperPath)) {
+    $scriptSource = Get-Content -LiteralPath $scriptPath -Raw -Encoding UTF8
+    [void][scriptblock]::Create($scriptSource)
+}
 
 $modelPath = Join-Path $PackageRoot 'ci smoke model.gguf'
 [System.IO.File]::WriteAllBytes($modelPath, [byte[]]::new(0))

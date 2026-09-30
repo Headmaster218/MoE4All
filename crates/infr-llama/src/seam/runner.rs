@@ -1780,7 +1780,7 @@ fn generate_dense_backend_inner(
     mm: Option<&crate::seam::MropePlan>,
     parallel_decode: Option<&mut ParallelDecodeRequest<'_>>,
     mut parallel_prefill: Option<&mut ParallelPrefillRequest<'_>>,
-    mut parallel_mtp_verify: Option<&mut ParallelMtpVerifyRequest<'_>>,
+    parallel_mtp_verify: Option<&mut ParallelMtpVerifyRequest<'_>>,
     verify_frontier_only: bool,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
@@ -7667,9 +7667,7 @@ fn generate_dense_backend_inner(
     };
 
     // ── layer-synchronous multi-session prefill ─────────────────────────────────────────────
-    if let (Some(prepared), Some(parallel)) =
-        (parallel_prepared.as_ref(), parallel_prefill.as_deref_mut())
-    {
+    if let (Some(prepared), Some(parallel)) = (parallel_prepared.as_ref(), parallel_prefill) {
         if !gpu_embed {
             return Err(anyhow!("parallel prefill requires Vulkan GPU embedding"));
         }
@@ -8444,7 +8442,7 @@ fn generate_dense_backend_inner(
     // The suffix-prefill contract doubles as the accept/rollback mechanism: the caller
     // truncates its committed token list and the next call's prefix diff overwrites the
     // stale KV rows. Dense non-E2B models only (mirrors the batched-prefill guard).
-    if let Some(parallel) = parallel_mtp_verify.as_deref_mut() {
+    if let Some(parallel) = parallel_mtp_verify {
         let lanes = parallel.feeds.len();
         let has_multimodal_lane = parallel.mrope_plans.iter().any(Option::is_some);
         anyhow::ensure!(

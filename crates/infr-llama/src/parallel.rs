@@ -1345,7 +1345,7 @@ impl ParallelSeam {
                                 Some(dst) => dst.seed_from(self.vk.as_ref(), cfg, ec, &src, best_s),
                                 None => Ok(0),
                             };
-                            seeded.map(|seeded| {
+                            seeded.inspect(|&seeded| {
                                 if seeded != 0 {
                                     if let Some(heads) = &self.mtp_heads {
                                         let mut heads = heads.lock().expect("MTP heads poisoned");
@@ -1366,7 +1366,6 @@ impl ParallelSeam {
                                         }
                                     }
                                 }
-                                seeded
                             })
                         };
                         p = self.pool.lock().expect("pool poisoned");

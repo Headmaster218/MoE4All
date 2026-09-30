@@ -17,6 +17,7 @@ Cargo.lock.bak
 target-prof/
 /gui-data/
 /kv-sessions/
+/.update/
 /artifacts/context-resource-matrix/
 /benchmark-data/
 /tests/context-resource/matrix.local.json

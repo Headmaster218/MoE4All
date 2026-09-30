@@ -916,6 +916,7 @@ pub(crate) fn generate_dense_vulkan_parallel_prefill_session(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 pub(crate) fn generate_dense_vulkan_parallel_mtp_verify_session(
     vk: &infr_vulkan::VulkanBackend,
     g: &Gguf,
@@ -5628,6 +5629,7 @@ pub(crate) fn generate_dense_metal_session(
         None,
         req,
         None,
+        None,
     )
 }
 
@@ -5666,6 +5668,7 @@ pub(crate) fn verify_dense_metal2(
         want_ctx,
         None,
         Some(&mut logits),
+        None,
         None,
         None,
         None,

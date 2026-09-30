@@ -308,8 +308,10 @@ fn compile_shader(name: &str, source: &str) -> Vec<u32> {
     let bytes = std::fs::read(dst).expect("read overlap SPIR-V");
     assert_eq!(bytes.len() % 4, 0);
     bytes
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes(*b))
         .collect()
 }
 
