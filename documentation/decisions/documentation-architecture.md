@@ -27,7 +27,7 @@ verified_commit: ed62393068679573afe94a1472454efe7eae0f15
 1. 使用发布版、API 或命令行的用户。
 2. 调试模型、显存、分页和并发行为的维护者。
 3. 做性能实验、正确性验证和发版验收的开发者。
-4. 维护未来 Agent、Harness、插件和 Engine Manager 的产品开发者。
+4. 维护未来 MoE4All 品牌 DSH、插件和引擎接入的产品开发者。
 
 目录按读者任务和内容生命周期组织，不按某一次重构或某个作者的工作笔记组织。
 
@@ -134,9 +134,9 @@ Evidence 还应记录日期、提交、模型、量化、硬件、配置、命�
 
 ## 产品扩展
 
-智能体发行版继续沿用同一结构：Harness、智能体、工具、审批、插件和 Web UI 的当前机制进入
-`architecture/product/`；Engine Manager 与 worker 协议进入 `architecture/services/`；插件兼容与安全验证进入
-`development/` 和 `evidence/`。不为 Agent 另建一套平行文档树。
+智能体发行版继续沿用同一结构：DSH 的 Agent、工具、审批、插件和 Web UI 的当前机制进入
+`architecture/product/`；MoE4All Provider 插件与独立引擎的接入进入 `architecture/services/`；
+插件兼容与安全验证进入 `development/` 和 `evidence/`。不为 Agent 另建一套平行文档树。
 
 ## 维护门槛
 

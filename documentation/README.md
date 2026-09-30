@@ -41,7 +41,7 @@ verified_commit: ed62393068679573afe94a1472454efe7eae0f15
 - [模型能力矩阵](reference/model-capabilities.md)
 - [API 使用](guide/serving/api-quickstart.md)
 
-Agent 发行版仍是提案，且来源于 tag 之后的开发历史，见[Agent 发行版边界](roadmap/agent-distribution.md)和[基线审计](evidence/audits/2026-09-28-release-0.9.0-baseline-and-new-commits.md)。
+Agent 发行版仍是提案，且来源于 tag 之后的开发历史，见[MoE4All Agent 发行版](roadmap/agent-distribution.md)和[基线审计](evidence/audits/2026-09-28-release-0.9.0-baseline-and-new-commits.md)。
 
 带日期的记录保留当时的论证和数据，不自动代表当前 `HEAD`。已核实机制与变化过程分开导航；原分支的旧文件不作为本目录的第二事实源。
 

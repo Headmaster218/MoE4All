@@ -84,4 +84,4 @@ Host DMA、ReBAR CPU push 或 staged upload 由硬件能力和冻结的 transfer
 - [并发调度](runtime/parallel-scheduler.md)
 - [运行时资源生命周期](memory/runtime-resource-lifecycle.md)
 - [服务与冷 KV 会话](services/server-and-session-cache.md)
-- [Agent 发行版边界](../roadmap/agent-distribution.md)
+- [MoE4All Agent 发行版](../roadmap/agent-distribution.md)
