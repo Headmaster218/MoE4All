@@ -6217,12 +6217,11 @@ mod seam_helper_tests {
     fn moe_host_backing_clamps_an_explicit_budget_to_the_spare() {
         use infr_core::hostmem::RamRequest;
 
-        // The exact shape that OOM-killed this box TWICE: `paging.dram = 47GiB` on a 60 GiB box
-        // with ~46 GiB available must NOT become a 47 GiB arena. The dense path clamps inside
-        // `streaming_arena_plan_for_snapshot`; the MoE path sizes here and used to trust the
-        // explicit value verbatim. The ceiling is 2/5 of PHYSICAL RAM (24 GiB here) because a
-        // `MemoryMax` on infr alone did not contain the OOM — the machine's other processes
-        // still pushed it over.
+        // The rule is DYNAMIC: requested + in-use <= 90% of MemTotal, where in-use is
+        // `MemTotal - MemAvailable`. On a BUSY 60 GiB box (46 GiB available => 14 GiB in use)
+        // the ceiling is 54 - 14 = 40 GiB, so the 47 GiB request that OOM-killed this box twice
+        // is clamped. The dense path clamps inside `streaming_arena_plan_for_snapshot`; the MoE
+        // path sizes here and used to trust the explicit value verbatim.
         assert_eq!(
             super::moe_host_backing(
                 infr_core::config::AutoProfile::Aggressive,
@@ -6234,9 +6233,25 @@ mod seam_helper_tests {
                 usize::MAX, // payload bigger than any budget: force Bounded, not Full
             ),
             super::MoeHostBacking::Bounded {
-                bytes: (60 * GIB) / 5 * 2
+                bytes: (60 * GIB) / 10 * 9 - (60 * GIB - 46 * GIB)
             },
-            "an explicit budget past the physical-RAM ceiling must be clamped, not trusted"
+            "a request that would put the box past 90% must be clamped, not trusted"
+        );
+
+        // And DYNAMIC in the other direction: on the SAME box with everything else stopped
+        // (57 GiB available => 3 GiB in use) the ceiling is 54 - 3 = 51 GiB, so the same 47 GiB
+        // request is admitted. This is what the previous static 2/5-of-RAM rule got wrong.
+        assert_eq!(
+            super::moe_host_backing(
+                infr_core::config::AutoProfile::Aggressive,
+                RamRequest::LegacyCacheBudget((47 * GIB) as u64),
+                Some((57 * GIB) as u64),
+                Some((60 * GIB) as u64),
+                None,
+                None,
+                usize::MAX,
+            ),
+            super::MoeHostBacking::Bounded { bytes: 47 * GIB }
         );
 
         // A budget inside the ceiling is untouched — this is not a blanket haircut.

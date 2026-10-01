@@ -527,30 +527,24 @@ pub fn streaming_arena_plan_for_profile(
 /// `paging.dram` verbatim is therefore not a slow run — it is a MACHINE-WIDE OOM. MEASURED on this
 /// 60 GiB box: tiers of 47 GiB and then 31 GiB both tripped the GLOBAL OOM killer, reaping the
 /// desktop session, ssh/gpg agents and a VM, and once cascading into udev and a failed `amdgpu`
-/// probe (error -22) that took the box down until a reboot.
+/// probe (error -22) that took the box down until a reboot. `MemoryMax` on `infr` alone did not
+/// contain it: 44 GiB for infr plus ~14 GiB of unrelated processes still exceeded RAM.
 ///
-/// `MemoryMax` on `infr` alone did NOT contain it: 44 GiB for infr plus ~14 GiB of unrelated
-/// processes still exceeded RAM. So cap against PHYSICAL RAM rather than a small tail off
-/// `available` — at most `2/5` of `MemTotal`, and never more than `available` minus a quarter of
-/// `MemTotal`. A request below the ceiling passes through untouched.
+/// The rule is **requested + already-in-use ≤ 90% of `MemTotal`**, where \"in use\" is the
+/// kernel's own estimate `MemTotal - MemAvailable` — so reclaimable page cache is not counted
+/// twice against us. Equivalently: ask for at most `MemAvailable - 10% of MemTotal`.
+///
+/// This is deliberately DYNAMIC: free memory lets a larger arena through (a quiet 60 GiB box
+/// admits ~51 GiB), while a busy one clamps even a modest request. A request below the ceiling
+/// passes through untouched.
 pub fn clamp_arena_to_spare(bytes: u64, available: Option<u64>, total: Option<u64>) -> u64 {
-    let mut ceiling = bytes;
-    match (available, total) {
-        (Some(available), Some(total)) => {
-            // Never more than 2/5 of physical RAM, and never past available minus a quarter of
-            // it. Both bounds are needed: the first stops a big box being filled by one arena,
-            // the second stops a busy box from being pushed over by a modest one.
-            ceiling = ceiling.min(total / 5 * 2);
-            ceiling = ceiling.min(available.saturating_sub(total / 4));
-        }
-        // No total probe (unusual outside Linux/Windows): the explicit spare tail is all that
-        // can be justified, and the caller still sees the effective size in its own log.
-        (Some(available), None) => {
-            ceiling = ceiling.min(available.saturating_sub(AUTO_AVAILABLE_RESERVE));
-        }
-        _ => {}
-    }
-    ceiling
+    let Some(total) = total else {
+        // No physical-RAM probe (unusual outside Linux/Windows): nothing to bound against.
+        return bytes;
+    };
+    let used = available.map_or(0, |available| total.saturating_sub(available));
+    let ceiling = (total / 10 * 9).saturating_sub(used);
+    bytes.min(ceiling)
 }
 
 /// Profile-aware arena planning with the complete host-memory snapshot.
