@@ -3314,7 +3314,12 @@ fn moe_host_backing(
         // that one to what the box can actually spare. `streaming_arena_plan_for_snapshot` does
         // the same for the dense tier.
         infr_core::hostmem::RamRequest::LegacyCacheBudget(_) => {
-            infr_core::hostmem::clamp_arena_to_spare(requested_budget, available, total)
+            infr_core::hostmem::clamp_arena_to_spare(
+                requested_budget,
+                available,
+                total,
+                payload_bytes as u64,
+            )
         }
         infr_core::hostmem::RamRequest::TotalProcessBudget(_)
         | infr_core::hostmem::RamRequest::Bypass => requested_budget,
@@ -6217,11 +6222,12 @@ mod seam_helper_tests {
     fn moe_host_backing_clamps_an_explicit_budget_to_the_spare() {
         use infr_core::hostmem::RamRequest;
 
-        // The rule is DYNAMIC: requested + in-use <= 90% of MemTotal, where in-use is
-        // `MemTotal - MemAvailable`. On a BUSY 60 GiB box (46 GiB available => 14 GiB in use)
-        // the ceiling is 54 - 14 = 40 GiB, so the 47 GiB request that OOM-killed this box twice
-        // is clamped. The dense path clamps inside `streaming_arena_plan_for_snapshot`; the MoE
-        // path sizes here and used to trust the explicit value verbatim.
+        // The rule is DYNAMIC and counts the FILL CHURN: `arena + in-use + churn <= 90%` of
+        // MemTotal, where in-use is `MemTotal - MemAvailable` and churn is the page cache the
+        // fill rebuilds (about the arena size here; payload is `usize::MAX`). On a BUSY 60 GiB box
+        // (46 GiB available => 14 GiB in use) the budget is 54 - 14 = 40 GiB and the arena is at
+        // most half of it. The dense path clamps inside `streaming_arena_plan_for_snapshot`; the
+        // MoE path sizes here and used to trust the explicit value verbatim.
         assert_eq!(
             super::moe_host_backing(
                 infr_core::config::AutoProfile::Aggressive,
@@ -6233,14 +6239,17 @@ mod seam_helper_tests {
                 usize::MAX, // payload bigger than any budget: force Bounded, not Full
             ),
             super::MoeHostBacking::Bounded {
-                bytes: (60 * GIB) / 10 * 9 - (60 * GIB - 46 * GIB)
+                bytes: ((60 * GIB) / 10 * 9 - 14 * GIB) / 2
             },
             "a request that would put the box past 90% must be clamped, not trusted"
         );
 
-        // And DYNAMIC in the other direction: on the SAME box with everything else stopped
-        // (57 GiB available => 3 GiB in use) the ceiling is 54 - 3 = 51 GiB, so the same 47 GiB
-        // request is admitted. This is what the previous static 2/5-of-RAM rule got wrong.
+        // DYNAMIC in the other direction: on the SAME box with everything else stopped (57 GiB
+        // available => 3 GiB in use) the budget rises to 54 - 3 = 51 GiB, so the same 47 GiB
+        // request gets a larger arena — 25.5 GiB, not the old static 24 GiB. It still cannot be
+        // ADMITTED whole: 47 GiB of anonymous arena plus the ~47 GiB its fill streams back
+        // through the page cache does not fit a 60 GiB machine, which is what the churn term,
+        // and the third OOM, taught us.
         assert_eq!(
             super::moe_host_backing(
                 infr_core::config::AutoProfile::Aggressive,
@@ -6251,7 +6260,9 @@ mod seam_helper_tests {
                 None,
                 usize::MAX,
             ),
-            super::MoeHostBacking::Bounded { bytes: 47 * GIB }
+            super::MoeHostBacking::Bounded {
+                bytes: ((60 * GIB) / 10 * 9 - 3 * GIB) / 2
+            }
         );
 
         // A budget inside the ceiling is untouched — this is not a blanket haircut.

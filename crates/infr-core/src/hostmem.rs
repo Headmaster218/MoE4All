@@ -520,31 +520,38 @@ pub fn streaming_arena_plan_for_profile(
     )
 }
 
-/// Never hand a host arena more than the machine can spare.
+/// The rule is **`arena + in-use + fill-churn <= 90% of MemTotal`**:
 ///
-/// A host arena is ANONYMOUS, unreclaimable memory, and it shares the machine with the OS, the
-/// page cache the model streams through, and every other process. Trusting an explicit
-/// `paging.dram` verbatim is therefore not a slow run — it is a MACHINE-WIDE OOM. MEASURED on this
-/// 60 GiB box: tiers of 47 GiB and then 31 GiB both tripped the GLOBAL OOM killer, reaping the
-/// desktop session, ssh/gpg agents and a VM, and once cascading into udev and a failed `amdgpu`
-/// probe (error -22) that took the box down until a reboot. `MemoryMax` on `infr` alone did not
-/// contain it: 44 GiB for infr plus ~14 GiB of unrelated processes still exceeded RAM.
+/// * `in-use` is the kernel's own estimate `MemTotal - MemAvailable`, so reclaimable page cache
+///   is not counted twice against us;
+/// * `fill-churn` is the page cache a FILL will rebuild. Filling the arena streams the source
+///   blocks back through the page cache, so the machine transiently needs room for both — and on
+///   a fast fill the kernel cannot reclaim one fast enough to make space for the other. That term
+///   is why a 47 GiB fall-through still OOM'd on a 58 GiB-available box, cap and cgroup and all.
 ///
-/// The rule is **requested + already-in-use ≤ 90% of `MemTotal`**, where \"in use\" is the
-/// kernel's own estimate `MemTotal - MemAvailable` — so reclaimable page cache is not counted
-/// twice against us. Equivalently: ask for at most `MemAvailable - 10% of MemTotal`.
-///
-/// This is deliberately DYNAMIC: free memory lets a larger arena through (a quiet 60 GiB box
-/// admits ~51 GiB), while a busy one clamps even a modest request. A request below the ceiling
-/// passes through untouched.
-pub fn clamp_arena_to_spare(bytes: u64, available: Option<u64>, total: Option<u64>) -> u64 {
+/// This is deliberately DYNAMIC: free memory admits a larger arena, a busy machine clamps even a
+/// modest one, and a request well inside the ceiling passes through untouched. On a quiet 60 GiB
+/// box (`used` ~3 GiB) it settles near `(54 - 3) / 2` ~ 25 GiB.
+pub fn clamp_arena_to_spare(
+    bytes: u64,
+    available: Option<u64>,
+    total: Option<u64>,
+    fill_churn_bytes: u64,
+) -> u64 {
     let Some(total) = total else {
         // No physical-RAM probe (unusual outside Linux/Windows): nothing to bound against.
         return bytes;
     };
     let used = available.map_or(0, |available| total.saturating_sub(available));
-    let ceiling = (total / 10 * 9).saturating_sub(used);
-    bytes.min(ceiling)
+    let budget = (total / 10 * 9).saturating_sub(used);
+    // Never more churn than we take, and never a ceiling that double-counts it: solving
+    // Solve `arena + min(churn, arena) <= budget` for the largest admissible arena: at most half
+    // the budget, tightened further to `budget - churn` once the churn is the smaller term.
+    let mut ceiling = bytes.min(budget / 2);
+    if fill_churn_bytes < ceiling {
+        ceiling = ceiling.min(budget.saturating_sub(fill_churn_bytes));
+    }
+    ceiling
 }
 
 /// Profile-aware arena planning with the complete host-memory snapshot.
@@ -577,7 +584,7 @@ pub fn streaming_arena_plan_for_snapshot(
         }
         RamRequest::LegacyCacheBudget(0) => return ArenaPlan::Skip(Skip::Disabled),
         RamRequest::LegacyCacheBudget(bytes) => {
-            return ArenaPlan::Take(clamp_arena_to_spare(bytes, available, total));
+            return ArenaPlan::Take(clamp_arena_to_spare(bytes, available, total, pageable));
         }
         RamRequest::Auto => {}
     }
