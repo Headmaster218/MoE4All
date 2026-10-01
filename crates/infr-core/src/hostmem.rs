@@ -520,6 +520,39 @@ pub fn streaming_arena_plan_for_profile(
     )
 }
 
+/// Never hand a host arena more than the machine can spare.
+///
+/// A host arena is ANONYMOUS, unreclaimable memory, and it shares the machine with the OS, the
+/// page cache the model streams through, and every other process. Trusting an explicit
+/// `paging.dram` verbatim is therefore not a slow run — it is a MACHINE-WIDE OOM. MEASURED on this
+/// 60 GiB box: tiers of 47 GiB and then 31 GiB both tripped the GLOBAL OOM killer, reaping the
+/// desktop session, ssh/gpg agents and a VM, and once cascading into udev and a failed `amdgpu`
+/// probe (error -22) that took the box down until a reboot.
+///
+/// `MemoryMax` on `infr` alone did NOT contain it: 44 GiB for infr plus ~14 GiB of unrelated
+/// processes still exceeded RAM. So cap against PHYSICAL RAM rather than a small tail off
+/// `available` — at most `2/5` of `MemTotal`, and never more than `available` minus a quarter of
+/// `MemTotal`. A request below the ceiling passes through untouched.
+pub fn clamp_arena_to_spare(bytes: u64, available: Option<u64>, total: Option<u64>) -> u64 {
+    let mut ceiling = bytes;
+    match (available, total) {
+        (Some(available), Some(total)) => {
+            // Never more than 2/5 of physical RAM, and never past available minus a quarter of
+            // it. Both bounds are needed: the first stops a big box being filled by one arena,
+            // the second stops a busy box from being pushed over by a modest one.
+            ceiling = ceiling.min(total / 5 * 2);
+            ceiling = ceiling.min(available.saturating_sub(total / 4));
+        }
+        // No total probe (unusual outside Linux/Windows): the explicit spare tail is all that
+        // can be justified, and the caller still sees the effective size in its own log.
+        (Some(available), None) => {
+            ceiling = ceiling.min(available.saturating_sub(AUTO_AVAILABLE_RESERVE));
+        }
+        _ => {}
+    }
+    ceiling
+}
+
 /// Profile-aware arena planning with the complete host-memory snapshot.
 pub fn streaming_arena_plan_for_snapshot(
     profile: crate::config::AutoProfile,
@@ -537,6 +570,10 @@ pub fn streaming_arena_plan_for_snapshot(
         RamRequest::Bypass => return ArenaPlan::StreamOnly,
         RamRequest::TotalProcessBudget(0) => return ArenaPlan::Skip(Skip::Disabled),
         RamRequest::TotalProcessBudget(total) => {
+            // An explicit total-process budget keeps its documented meaning: the user is stating
+            // what the PROCESS may use, so `cache_bytes_for_total_budget` already nets out the
+            // resident set and its own future reserve. Do not second-guess it here —
+            // `an_oversized_explicit_budget_bypasses_automatic_headroom` pins that contract.
             let bytes = cache_bytes_for_total_budget(total, process_resident, pageable);
             return if bytes == 0 {
                 ArenaPlan::Skip(Skip::TooLittle)
@@ -545,7 +582,9 @@ pub fn streaming_arena_plan_for_snapshot(
             };
         }
         RamRequest::LegacyCacheBudget(0) => return ArenaPlan::Skip(Skip::Disabled),
-        RamRequest::LegacyCacheBudget(bytes) => return ArenaPlan::Take(bytes),
+        RamRequest::LegacyCacheBudget(bytes) => {
+            return ArenaPlan::Take(clamp_arena_to_spare(bytes, available, total));
+        }
         RamRequest::Auto => {}
     }
     if unified {

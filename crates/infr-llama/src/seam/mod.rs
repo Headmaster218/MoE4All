@@ -3306,8 +3306,17 @@ fn moe_host_backing(
         infr_core::hostmem::RamRequest::Auto => {
             requested_budget.min(commit_ceiling.unwrap_or(u64::MAX))
         }
+        // An explicit `device.ram_budget` is a TOTAL-PROCESS target and stays authoritative (its
+        // own netting of the resident set is pinned by tests). The legacy raw-cache spelling is
+        // different: `paging.dram` names the CACHE alone and used to be trusted verbatim, which
+        // is what took this 61 GiB box down twice — a 47 GiB tier reaped `infr` and then udev,
+        // the desktop session and a VM with it, once leaving `amdgpu` unable to probe. Clamp
+        // that one to what the box can actually spare. `streaming_arena_plan_for_snapshot` does
+        // the same for the dense tier.
+        infr_core::hostmem::RamRequest::LegacyCacheBudget(_) => {
+            infr_core::hostmem::clamp_arena_to_spare(requested_budget, available, total)
+        }
         infr_core::hostmem::RamRequest::TotalProcessBudget(_)
-        | infr_core::hostmem::RamRequest::LegacyCacheBudget(_)
         | infr_core::hostmem::RamRequest::Bypass => requested_budget,
     } as usize;
     if budget >= payload_bytes {
@@ -6201,6 +6210,47 @@ mod seam_helper_tests {
             ),
             super::MoeHostBacking::Full,
             "automatic sizing must select the full store when its post-headroom budget fits"
+        );
+    }
+
+    #[test]
+    fn moe_host_backing_clamps_an_explicit_budget_to_the_spare() {
+        use infr_core::hostmem::RamRequest;
+
+        // The exact shape that OOM-killed this box TWICE: `paging.dram = 47GiB` on a 60 GiB box
+        // with ~46 GiB available must NOT become a 47 GiB arena. The dense path clamps inside
+        // `streaming_arena_plan_for_snapshot`; the MoE path sizes here and used to trust the
+        // explicit value verbatim. The ceiling is 2/5 of PHYSICAL RAM (24 GiB here) because a
+        // `MemoryMax` on infr alone did not contain the OOM — the machine's other processes
+        // still pushed it over.
+        assert_eq!(
+            super::moe_host_backing(
+                infr_core::config::AutoProfile::Aggressive,
+                RamRequest::LegacyCacheBudget((47 * GIB) as u64),
+                Some((46 * GIB) as u64),
+                Some((60 * GIB) as u64),
+                None,
+                None,
+                usize::MAX, // payload bigger than any budget: force Bounded, not Full
+            ),
+            super::MoeHostBacking::Bounded {
+                bytes: (60 * GIB) / 5 * 2
+            },
+            "an explicit budget past the physical-RAM ceiling must be clamped, not trusted"
+        );
+
+        // A budget inside the ceiling is untouched — this is not a blanket haircut.
+        assert_eq!(
+            super::moe_host_backing(
+                infr_core::config::AutoProfile::Aggressive,
+                RamRequest::LegacyCacheBudget((10 * GIB) as u64),
+                Some((46 * GIB) as u64),
+                Some((60 * GIB) as u64),
+                None,
+                None,
+                usize::MAX,
+            ),
+            super::MoeHostBacking::Bounded { bytes: 10 * GIB }
         );
     }
 
