@@ -62,6 +62,45 @@ Flash-Next 启动时选择第一片：`Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-
 
 API 默认地址为 `http://127.0.0.1:8080/v1`。完整配置项见[配置参考](docs/config.md)。
 
+## 从源码构建（Linux）
+
+发布包目前只有 Windows 版；Linux 请从源码构建，产物为 `target/release/infr`。
+
+**前置条件**
+
+- **Rust**：仓库的 `rust-toolchain.toml` 固定 **1.97.1**（含 `rustfmt`、`clippy`），
+  `rustup` 会在首次构建时自动安装。
+- **`glslc`（shaderc）**：compute shader 在构建期编译。dp4a shader 需要
+  `GL_EXT_integer_dot_product`，因此编译器须为 **shaderc 2025 或更新**；
+  Ubuntu 24.04 自带的 shaderc 2023.8 过旧，Ubuntu 26.04 自带的版本可用。
+- **Vulkan 驱动只在运行阶段需要**：`ash` 通过 `dlopen` 在运行时加载 `libvulkan`，
+  因此构建不需要驱动。AMD 平台即 RADV（Mesa）。
+
+```sh
+sudo apt-get update && sudo apt-get install -y glslc
+git clone https://github.com/Headmaster218/MoE4All.git
+cd MoE4All
+cargo build --release --locked -p infr-cli
+```
+
+**运行**
+
+```sh
+./target/release/infr devices                # 列出可见 Vulkan 设备及其显存
+./target/release/infr run   <第一片.gguf>    # 终端聊天（模型缺失时自动拉取）
+./target/release/infr serve <第一片.gguf>    # OpenAI 兼容 API
+```
+
+**注意事项**
+
+- `.cargo/config.toml` 默认使用 `-C target-cpu=native`（CPU 后端依赖它自动向量化），
+  产物因而与本机 ISA 绑定；需要跨机分发时请覆盖该设置。
+- GPU 集成测试默认 `#[ignore]`（需要真实 Vulkan 设备）：
+  `cargo test --workspace --locked -- --include-ignored`
+- 大 MoE 模型会把宿主层映射进 GPU 孔径；AMD 上可能需要更大的 GTT，可在
+  `/etc/modprobe.d/` 中设置 `options amdgpu gttsize=<MiB>`（仅在 amdgpu 模块
+  加载时生效，需重启）。
+
 ## 实测结果
 
 ### 0.8.0：Qwen3.8-Flash-Next，20K 与 150K 输入对照
