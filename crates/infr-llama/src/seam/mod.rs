@@ -302,6 +302,20 @@ fn cpu_paged_store(
 /// merely double-counted, it is strictly worse than making that arena bigger. So auto-sizing
 /// declines on unified memory and says why; an explicit `device.ram_budget` is still honoured,
 /// because a user asking for it by name may be working around something this does not model.
+///
+/// # Non-Windows targets: the GPU-aliased host tier is a net LOSS
+///
+/// Off unified memory, this tier is made GPU-addressable by aliasing it through
+/// `VK_EXT_external_memory_host` (`paging.host_dma`). On a non-Windows kernel that alias is
+/// charged on EVERY command submission, in proportion to the size of the aliased range, because
+/// the submission must make the whole imported range device-visible. MEASURED on amdgpu (RX 7900
+/// XTX, RADV Mesa 26.0.8 AND AMDVLK v-2025.Q2.1 — so it is the kernel, not the userspace driver):
+/// ~6.8 ms per GiB of arena, per submit; a 22 GiB tier costs ~145 ms/submit and the paged MoE
+/// emits ~170 submits per decode token, i.e. 0.07 tok/s — against 29 tok/s for the same model with
+/// no host cache at all. The same engine submits a dense model in 0.4 ms because none of its
+/// buffers are aliased. So on these targets the AUTO host cache is declined exactly as on unified
+/// memory (streaming straight from disk into VRAM); an explicit `device.ram_budget` or legacy
+/// `paging.dram` still wins, which remains the escape hatch for a platform whose aliasing is cheap
 fn vulkan_host_tier(
     ec: &EngineConfig,
     g: &Gguf,
@@ -316,13 +330,18 @@ fn vulkan_host_tier(
     let total = infr_core::hostmem::total_bytes();
     let process_resident = infr_core::hostmem::process_resident_bytes();
     let pageable: u64 = classes.iter().map(|&(s, n)| (s * n) as u64).sum();
+    // See the doc comment above: on a non-Windows kernel the aliased host cache is billed per
+    // submission in proportion to its size, so the AUTO tier decision must decline it the same
+    // way unified memory does. Explicit budgets bypass this and are still honoured below.
+    let host_alias_is_lossy = cfg!(target_os = "linux");
+    let effective_unified = unified || host_alias_is_lossy;
     let arena_plan = infr_core::hostmem::streaming_arena_plan_for_snapshot(
         ec.device.auto_profile,
         ram_request,
         available,
         total,
         process_resident,
-        unified,
+        effective_unified,
         pageable,
     );
     let cache_bytes = match arena_plan {
@@ -339,12 +358,18 @@ fn vulkan_host_tier(
                 infr_core::blockio::FileBlockIo::open_shards(&g.shards())
                     .map_err(|e| anyhow!("{e}"))?,
             );
+            let why = if host_alias_is_lossy && !unified {
+                "this platform bills the GPU-aliased host tier (VK_EXT_external_memory_host) on \
+                 every command submission in proportion to the aliased range, which makes it far \
+                 slower than streaming"
+            } else {
+                "this device's memory IS host memory, so the pools above are already the only \
+                 useful cache and a second one would hold bytes the GPU cannot read in place"
+            };
             tracing::info!(
-                "{what} host tier: streaming DISK -> GPU-accessible RAM with no host cache — \
-                     this device's memory IS host memory, so the {} pool(s) above are already the \
-                     only useful cache and a second one would hold bytes the GPU cannot read in \
-                     place. Raise INFR_CACHE to cache more; INFR_RAM_BUDGET forces a host arena",
-                classes.len(),
+                "{what} host tier: streaming DISK -> VRAM with no host cache — {why}. Raise \
+                 INFR_CACHE to cache more in VRAM; INFR_RAM_BUDGET (or INFR_NO_HOST_DMA) forces \
+                 a host arena back"
             );
             let mut out = Vec::with_capacity(classes.len());
             for &(slot_bytes, _) in classes {
