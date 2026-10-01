@@ -267,6 +267,42 @@ fn cpu_paged_store(
     Ok(Some(std::sync::Arc::new(store)))
 }
 
+/// Read every shard once, on a background thread, so the OS page cache is hot before the first
+/// request. See `paging.warm_page_cache`.
+///
+/// Only worth having because Linux's default is `paging.dram_bypass`: with no host store, the page
+/// cache IS the resident weight tier, and a cold one costs ~5x on prefill (measured 73 vs
+/// 890 tok/s on Qwen3.8-Flash-Next against ~937 on Windows). One pass over the shards, detached,
+/// so it never delays load beyond the I/O it shares with it.
+fn spawn_page_cache_warmup(shards: &[(impl AsRef<std::path::Path>, u64)]) {
+    let paths: Vec<std::path::PathBuf> = shards
+        .iter()
+        .map(|(path, _)| path.as_ref().to_path_buf())
+        .collect();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let start = std::time::Instant::now();
+        let mut total = 0u64;
+        let mut buf = vec![0u8; 8 << 20];
+        for path in &paths {
+            let Ok(mut file) = std::fs::File::open(path) else {
+                continue;
+            };
+            loop {
+                match file.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => total += n as u64,
+                }
+            }
+        }
+        tracing::info!(
+            "page-cache warm-up: read {:.2} GiB in {:.1}s (the first request will not pay it)",
+            total as f64 / (1u64 << 30) as f64,
+            start.elapsed().as_secs_f64(),
+        );
+    });
+}
+
 /// Build the BOUNDED MoE host tier.
 ///
 /// On Linux the tier must NOT be a `VK_EXT_external_memory_host` alias: that import is a userptr
@@ -3492,7 +3528,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
     vk: &'a infr_vulkan::VulkanBackend,
     g: &'a Gguf,
     cfg: &'a Config,
-    ec: &EngineConfig,
+    ec: &'a EngineConfig,
     first_load: bool,
     want_ctx: usize,
 ) -> AResult<(Box<BindWeight<'a>>, Option<Box<FinishFixedAllocations<'a>>>)> {
@@ -4433,6 +4469,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     infr_core::blockio::FileBlockIo::open_shards(&g.shards())
                         .map_err(|e| anyhow!("{e}"))?,
                 );
+                if ec.paging.warm_page_cache {
+                    spawn_page_cache_warmup(&g.shards());
+                }
                 let (host_tier, host_store_io) = if let MoeHostBacking::Bounded {
                     bytes: host_cache_budget,
                 } = host_backing
