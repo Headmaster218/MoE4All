@@ -179,6 +179,29 @@ fn sampling_suffix_start(positions: &[usize], prompt_ends: &[usize]) -> AResult<
     Ok(start)
 }
 
+/// Which `(T, H, W, E)` plane the frequency pair `pair` rotates by, mirroring the llama.cpp
+/// `is_imrope` branch — the same cascade the Vulkan shader (`qk_norm_rope_mrope.comp`) and the CPU
+/// op implement. Kept as a standalone pure fn so the mapping itself is unit-testable: those three
+/// kernels are only as consistent as these four conditions, and a dead or transposed arm is
+/// invisible at runtime — image rows would silently collapse to plain 1D rope and lose their
+/// spatial structure while every shape check still passed.
+fn mrope_plane_for(pair: usize, widths: [usize; 4]) -> usize {
+    let total = widths.iter().sum::<usize>();
+    if total == 0 {
+        return 3;
+    }
+    let sector = pair % total;
+    if sector % 3 == 1 && sector < 3 * widths[1] {
+        1
+    } else if sector % 3 == 2 && sector < 3 * widths[2] {
+        2
+    } else if sector.is_multiple_of(3) && sector < 3 * widths[0] {
+        0
+    } else {
+        3
+    }
+}
+
 /// Whether a contiguous slice of Qwen IMROPE rows is exactly representable by ordinary 1D RoPE.
 /// The Vulkan 1D kernel receives the first position and advances it once per row, so both the
 /// selected IMROPE plane and the row-to-row position sequence must agree with that layout.
@@ -217,16 +240,7 @@ fn mrope_rows_are_plain_rope(
             return false;
         }
         for pair in 0..rope_pairs {
-            let sector = pair % section_total;
-            let plane = if sector % 3 == 1 && sector < 3 * widths[1] {
-                1
-            } else if sector % 3 == 2 && sector < 3 * widths[2] {
-                2
-            } else if sector % 3 == 0 && sector < 3 * widths[0] {
-                0
-            } else {
-                3
-            };
+            let plane = mrope_plane_for(pair, widths);
             if row[plane] != row[0] {
                 return false;
             }
@@ -3211,9 +3225,12 @@ fn generate_dense_backend_inner(
     // linear text positions, so fill them once now instead of mutating another persistent cache on
     // every decode step. Text-only calls allocate nothing.
     let (mrope_history_buf, mrope_positions) = if let Some(plan) = mm {
-        if !c.qwen4exp {
+        // qwen35/qwen35moe share qwen4exp's M-RoPE skeleton: the sectioned plane table and the
+        // `QkNormMrope` op are parameterised by `c.rope_sections`, which this family reads from
+        // `{arch}.rope.dimension_sections`. Other arches have no sections and are rejected below.
+        if !(c.qwen35 || c.qwen4exp) {
             return Err(anyhow!(
-                "multimodal RoPE is currently supported only by qwen4exp"
+                "multimodal RoPE requires a Qwen3.5/3.6 hybrid or Qwen3.8 model"
             ));
         }
         let plan_prompt_len = plan.prompt_pos4.len() / 4;
@@ -3229,7 +3246,9 @@ fn generate_dense_backend_inner(
             ));
         }
         if c.rope_sections.iter().sum::<u32>() == 0 {
-            return Err(anyhow!("qwen4exp multimodal RoPE sections are empty"));
+            return Err(anyhow!(
+                "multimodal RoPE sections are empty (the GGUF has no rope.dimension_sections)"
+            ));
         }
         let mut previous_end = 0usize;
         for (index, span) in plan.spans.iter().enumerate() {
@@ -11622,7 +11641,7 @@ fn generate_dense_backend_inner(
 mod tests {
     use super::{
         allocate_parallel_prefill_rows, dense_request_exceeds_capacity, full_mrope_positions,
-        mrope_rows_are_plain_rope, mrope_token_position, parallel_prefill_group,
+        mrope_plane_for, mrope_rows_are_plain_rope, mrope_token_position, parallel_prefill_group,
         parallel_prefill_progress, recurrent_extension_start, resident_after_gen,
         sampling_suffix_start, validate_token_ids,
     };
@@ -11647,6 +11666,61 @@ mod tests {
             0,
             1,
             [11, 11, 10, 0],
+            32
+        ));
+    }
+
+    /// qwen35moe ships `rope.dimension_sections = [11,11,10,0]` with `rope_dim = 64`, i.e. 32
+    /// frequency pairs. A permuted array keeps the total at 32 and still produces plausible-looking
+    /// rotations, so assert the per-plane PAIR COUNTS and the explicit cycle rather than merely that
+    /// some rows "differ" — a boolean collapse test cannot see either bug.
+    #[test]
+    fn qwen35moe_sections_assign_every_pair_to_the_trained_plane() {
+        let widths = [11usize, 11, 10, 0];
+        let planes: Vec<usize> = (0..32).map(|pair| mrope_plane_for(pair, widths)).collect();
+        let mut counts = [0usize; 4];
+        for &plane in &planes {
+            counts[plane] += 1;
+        }
+        // Exactly the declared section widths, in (T, H, W, E) order; E contributes nothing.
+        assert_eq!(counts, [11, 11, 10, 0]);
+        // The (T, H, W) cycle itself — transposing the H and W arms fails here.
+        assert_eq!(&planes[0..6], &[0, 1, 2, 0, 1, 2]);
+        assert_eq!(planes[29], 2);
+        assert_eq!(planes[30], 0);
+        assert_eq!(planes[31], 1);
+    }
+
+    /// The image-row cases where exactly ONE of H/W differs. If either arm were dead or
+    /// mis-indexed its comparison would degenerate to `row[0] != row[0]`, the function would return
+    /// true, and the graph would emit plain 1D rope for image tokens — spatial structure silently
+    /// dropped, no error anywhere. The pre-existing image test uses H and W differing together, so
+    /// it passes even with one arm broken.
+    #[test]
+    fn both_h_and_w_planes_are_consulted_for_image_rows() {
+        let sections = [11u32, 11, 10, 0];
+        // H differs only — plane 1 must be live.
+        assert!(!mrope_rows_are_plain_rope(
+            &[100, 4, 100, 0],
+            0,
+            1,
+            sections,
+            32
+        ));
+        // W differs only — plane 2 must be live.
+        assert!(!mrope_rows_are_plain_rope(
+            &[100, 100, 7, 0],
+            0,
+            1,
+            sections,
+            32
+        ));
+        // All three planes equal — text still collapses to the plain kernel (no text regression).
+        assert!(mrope_rows_are_plain_rope(
+            &[100, 100, 100, 0],
+            0,
+            1,
+            sections,
             32
         ));
     }

@@ -142,9 +142,41 @@ The SSM recurrence on CPU is NOT the bottleneck once matmuls are on GPU.
 5. CPU-reference speedups regardless: rayon-parallel `matvec`, then quantized
    matvec.
 
+## Vision (image input)
+
+`qwen35` and `qwen35moe` accept images when a matching `--mmproj` (projector type
+`qwen3vl_merger`) is supplied alongside the text GGUF. This works on Vulkan and
+CPU; Metal has no `Op::QkNormMrope` and will reject an image turn.
+
+Image spans use **M-RoPE** (llama.cpp `LLAMA_ROPE_TYPE_IMROPE`): each token gets a
+4-plane `(T, H, W, E)` position instead of a single index, and the per-head
+QK-norm is fused with the rotation in `Op::QkNormMrope`
+(`crates/infr-vulkan/shaders/qk_norm_rope_mrope.comp`). The plane a frequency pair
+rotates by comes from `rope.dimension_sections` — `[11,11,10,0]` for the qwen35
+family, i.e. 11 T pairs, 11 H, 10 W, none for E, out of `rope_dim/2 = 32`.
+
+Two properties make this safe for the hybrid skeleton:
+
+- **The DeltaNet layers ignore positions entirely.** `Op::Conv1dSilu` and
+  `Op::DeltaNet` carry no position operand — token order reaches them only through
+  the causal conv's rolling state and the append-only recurrent state. M-RoPE is
+  consumed only by the full-attention layers, i.e. those where
+  `(il+1) % full_attention_interval == 0`.
+- **Text-only requests are unaffected.** A row whose T, H and W are equal is
+  exactly representable by 1-D rope, and `mrope_rows_are_plain_rope` detects that
+  and emits the ordinary `Op::QkNormRope` instead. So generated tokens after an
+  image — and every request without an image — take the original kernel.
+
+Caveats: batch-cooperative visual decode (the `--parallel N>1` scheduler) remains
+`qwen4exp`-only, so a `qwen35moe` image turn runs on the single-slot runner. The
+recurrent state cannot rewind, so an image prompt must arrive as part of one
+prefill (zero state) or an exact extension.
+
 ## References (read for math, reimplement — both MIT)
 
 - HF transformers `modeling_qwen3_next` (recurrence: fused_recurrent +
   chunk_gated_delta_rule)
 - llama.cpp `src/models/qwen3next.cpp` (GGUF tensor→role mapping, ggml_ssm_conv
   usage)
+- llama.cpp `ggml_mrope_cache_init` (`is_imrope` branch) for the M-RoPE plane
+  cascade above

@@ -398,7 +398,8 @@ enum Cmd {
     /// Start the OpenAI-compatible HTTP API (auto-pulls if missing).
     Serve {
         model: String,
-        /// Optional Qwen3.8 vision projector GGUF. Image parts are accepted through the OpenAI
+        /// Optional vision projector GGUF (`qwen3vl_merger`), for a qwen35moe or Qwen3.8 model
+        /// that ships `rope.dimension_sections`. Image parts are accepted through the OpenAI
         /// chat API as data URIs or base64 strings; projector weights are request-scoped.
         #[arg(long, value_name = "PATH")]
         mmproj: Option<PathBuf>,
@@ -4620,7 +4621,7 @@ fn cmd_serve(
         anyhow::bail!("Qwen3.8 concurrent MTP currently supports at most two slots");
     }
     if mmproj.is_some() && !is_vulkan {
-        anyhow::bail!("--mmproj currently requires the Vulkan qwen4exp serve path");
+        anyhow::bail!("--mmproj currently requires the Vulkan serve path");
     }
     if let Some(path) = mmproj {
         if !path.is_file() {

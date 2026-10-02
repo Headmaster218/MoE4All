@@ -8,6 +8,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Qwen3.5 / Qwen3.6 (`qwen35`, `qwen35moe`) accept image input through `--mmproj` with a
+  `qwen3vl_merger` projector. Image spans use M-RoPE on the full-attention layers; text-only
+  turns keep the ordinary 1D RoPE path.
 - The image decoder accepts gif, bmp, tiff and ico in addition to png, jpeg and webp.
 
 ### Fixed
