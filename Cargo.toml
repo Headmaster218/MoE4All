@@ -105,7 +105,7 @@ dirs = "5"
 tokenizers = "0.20"
 llguidance = "1"
 toktrie_hf_tokenizers = "1"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff", "ico"] }
 base64 = "0.22"
 
 # `cargo test` builds dev (-O0); the CPU interpreter, GGUF dequant, and f16 conversions at -O0 are
