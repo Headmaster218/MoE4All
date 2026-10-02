@@ -6,6 +6,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Chat and Responses requests larger than 2 MiB are no longer rejected before reaching the
+  handler. The buffered body limit is now 256 MiB, which a multimodal turn carrying base64
+  image parts, or a client replaying the whole conversation, can exceed.
+
 ## [0.7.0] - 2026-09-20
 
 ### Highlights
