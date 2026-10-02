@@ -6,6 +6,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Qwen3.5 / Qwen3.6 (`qwen35`, `qwen35moe`) accept image input through `--mmproj` with a
+  `qwen3vl_merger` projector. Image spans use M-RoPE on the full-attention layers; text-only
+  turns keep the ordinary 1D RoPE path.
+- The image decoder accepts gif, bmp, tiff and ico in addition to png, jpeg and webp.
+
+### Fixed
+
+- Chat and Responses requests larger than 2 MiB are no longer rejected before reaching the
+  handler. The buffered body limit is now 256 MiB, which a multimodal turn carrying base64
+  image parts, or a client replaying the whole conversation, can exceed.
+- An image payload that cannot be decoded now reports the guessed format, the leading magic
+  bytes, and whether the payload is printable text (a URL supplied instead of a data URI),
+  rather than a bare `decoding image`.
+
 ## [0.7.0] - 2026-09-20
 
 ### Highlights

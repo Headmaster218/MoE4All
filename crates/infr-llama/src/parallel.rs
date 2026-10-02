@@ -176,13 +176,19 @@ fn multimodal_token_position(plan: Option<&crate::seam::MropePlan>, token: usize
         .ok_or_else(|| anyhow!("multimodal decode position overflow"))
 }
 
+/// Whether a visual turn may hand its decode off to the batched scheduler.
+///
+/// `scheduler_worker_present` must be the LIVE WORKER HANDLE, never `gate.is_some()` — the gate
+/// exists on every `--parallel N>1` engine but `ParallelSeam::start_scheduler_worker` only spawns
+/// the draining thread for qwen4exp. Passing `true` with no worker queues a batch nobody drains and
+/// wedges the request thread in `wait_for_decode_batch`.
 fn should_handoff_multimodal_to_scheduler(
-    scheduler_available: bool,
+    scheduler_worker_present: bool,
     mtp_heads_present: bool,
     frontier_is_image: bool,
     max_new: usize,
 ) -> bool {
-    scheduler_available && !mtp_heads_present && !frontier_is_image && max_new > 0
+    scheduler_worker_present && !mtp_heads_present && !frontier_is_image && max_new > 0
 }
 
 /// Pure continuation-slot selection (the "this conversation continuing" case of [`checkout`], and
@@ -3658,8 +3664,9 @@ impl ParallelSeam {
         )
     }
 
-    /// Generate one Qwen3.8 vision turn. Projector execution is completed by the caller before
-    /// entering here, so its request-scoped weights have already returned to the unified arena.
+    /// Generate one Qwen vision turn (qwen4exp, or the qwen35/qwen35moe hybrid family).
+    /// Projector execution is completed by the caller before entering here, so its
+    /// request-scoped weights have already returned to the unified arena.
     pub fn generate_multimodal_turn(
         &self,
         prompt: &str,
@@ -3669,9 +3676,13 @@ impl ParallelSeam {
         req: &RequestCtx,
         mut on_piece: impl FnMut(&str),
     ) -> Result<GenStats> {
-        if !self.model.config().qwen4exp {
+        // qwen35 (dense) and qwen35moe share qwen4exp's M-RoPE / hybrid-attention skeleton, and
+        // the Vulkan `QkNormMrope` kernel is written for exactly their geometry (partial rope
+        // `rope_dim=64 < hd=256`, interleaved q+gate via `x_stride`). Any other arch carries no
+        // `rope.dimension_sections` and is rejected by the empty-sections check downstream.
+        if !(self.model.config().qwen35 || self.model.config().qwen4exp) {
             return Err(anyhow!(
-                "vision text integration currently supports qwen4exp models only"
+                "vision text integration requires a Qwen3.5/3.6 hybrid or Qwen3.8 model"
             ));
         }
         if images.is_empty() {
@@ -3804,8 +3815,16 @@ impl ParallelSeam {
         });
         // A one-slot non-MTP engine has no scheduler worker, so its visual turn must stay on the
         // legacy runner. Multi-slot serving retains the handoff that batches visual and text decode.
+        //
+        // The predicate is the WORKER HANDLE, not `gate.is_some()`: `--parallel N>1` allocates the
+        // gate for every arch, but `start_scheduler_worker` starts a thread only for qwen4exp (its
+        // own parallel prefill additionally refuses multimodal position rows). Handing a batch to a
+        // queue that no thread drains blocks `wait_for_decode_batch` forever — the event channel's
+        // sender stays alive inside the queued `BatchWork`, so it never observes a disconnect. A
+        // qwen35moe image turn under `--parallel N>1` would therefore HANG rather than error, which
+        // is why this checks for the worker itself.
         let handoff = should_handoff_multimodal_to_scheduler(
-            self.gate.is_some(),
+            self.scheduler_worker.is_some(),
             self.mtp_heads.is_some(),
             frontier_is_image,
             max_new,

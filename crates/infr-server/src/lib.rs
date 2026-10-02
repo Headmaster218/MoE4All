@@ -33,7 +33,7 @@ use std::{
 };
 
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -2137,6 +2137,22 @@ impl AppState {
 // Router
 // ---------------------------------------------------------------------------
 
+/// The largest buffered request body the server will accept.
+///
+/// Axum's own default is 2 MiB, and a legitimate chat turn passes that long before it is
+/// unreasonable: a vision turn carries base64 `image_url` parts (a single photo is already several
+/// MiB once encoded), and a client such as Open WebUI replays the whole conversation on every
+/// request. The rejection comes from the `Json` extractor BEFORE the handler is entered, so it
+/// reaches the client as `HTTP 400 … Failed to buffer the request body: length limit exceeded`
+/// while the server's own request log shows nothing at all — which is what makes it worth a named
+/// constant rather than an inline literal.
+///
+/// 256 MiB clears a realistic multimodal turn with two orders of magnitude to spare, while still
+/// bounding what ONE in-flight request can pin in host RAM. Leaving it unbounded is not free: when
+/// `serve.api_key` is unset (the default, and the common loopback case) any local process could
+/// otherwise hand the server an arbitrarily large body before admission control ever sees it.
+const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024 * 1024;
+
 /// Build the axum [`Router`].  Extracted so tests can call it with a [`AppState::headless`] state.
 pub fn build_router(state: AppState) -> Router {
     Router::new()
@@ -2145,6 +2161,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(chat_completions_handler))
         .route("/v1/responses", post(responses::handler))
         .route("/v1/embeddings", post(embeddings_handler))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
 
