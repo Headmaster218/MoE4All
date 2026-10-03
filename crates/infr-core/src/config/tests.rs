@@ -172,6 +172,7 @@ fn default_config_matches_documented_defaults() {
     assert!(d.spec.mtp_ckpt && d.spec.mtp_reprime && d.spec.mtp_draft_chain);
     assert!(d.spec.mtp_ple_overlap);
     assert_eq!(d.spec.k, 6);
+    assert_eq!(d.spec.mtp_context, 32 * 1024);
     assert_eq!(d.spec.decode_chain, 8);
 }
 

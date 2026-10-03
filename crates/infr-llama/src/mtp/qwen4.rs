@@ -681,6 +681,7 @@ fn emit_full_step(
     g: &mut Graph,
     cfg: &crate::Config,
     start_pos: usize,
+    attention_window: usize,
     positions: TensorId,
     k_cache: TensorId,
     v_cache: TensorId,
@@ -720,7 +721,7 @@ fn emit_full_step(
         n_kv: cfg.n_kv as u32,
         head_dim: cfg.head_dim as u32,
         scale: 1.0 / (cfg.head_dim as f32).sqrt(),
-        mask: AttnMask::Causal,
+        mask: AttnMask::SlidingWindow(attention_window),
         pos: start_pos as u32,
         sinks: None,
     });
@@ -883,7 +884,7 @@ fn build_catch_graph(
     cfg: &crate::Config,
     specs: &[(DType, usize)],
     shared: [(DType, usize); 2],
-    max_ctx: usize,
+    kv_capacity: usize,
     rows: usize,
     start_pos: usize,
     embedding_overrides: &[(usize, usize)],
@@ -906,8 +907,8 @@ fn build_catch_graph(
             DType::F32,
         ))
     });
-    let k_cache = g.input(TensorDesc::new(vec![max_ctx * kvrow], DType::F16));
-    let v_cache = g.input(TensorDesc::new(vec![max_ctx * kvrow], DType::F16));
+    let k_cache = g.input(TensorDesc::new(vec![kv_capacity * kvrow], DType::F16));
+    let v_cache = g.input(TensorDesc::new(vec![kv_capacity * kvrow], DType::F16));
     let (weights, handles) = declare_weights(&mut g, specs, shared[0], shared[1]);
     let scratch = step_scratch(&mut g, cfg, rows);
     emit_bridge(
@@ -957,7 +958,8 @@ fn build_draft_graph(
     cfg: &crate::Config,
     specs: &[(DType, usize)],
     shared: [(DType, usize); 2],
-    max_ctx: usize,
+    kv_capacity: usize,
+    attention_window: usize,
     start_pos: usize,
     steps: usize,
 ) -> (Graph, DraftHandles) {
@@ -970,8 +972,8 @@ fn build_draft_graph(
     let positions = (0..steps)
         .map(|_| g.input(TensorDesc::new(vec![1], DType::I32)))
         .collect::<Vec<_>>();
-    let k_cache = g.input(TensorDesc::new(vec![max_ctx * kvrow], DType::F16));
-    let v_cache = g.input(TensorDesc::new(vec![max_ctx * kvrow], DType::F16));
+    let k_cache = g.input(TensorDesc::new(vec![kv_capacity * kvrow], DType::F16));
+    let v_cache = g.input(TensorDesc::new(vec![kv_capacity * kvrow], DType::F16));
     let (weights, handles) = declare_weights(&mut g, specs, shared[0], shared[1]);
     let scratch = step_scratch(&mut g, cfg, 1);
     let mut prev_id = id;
@@ -984,6 +986,7 @@ fn build_draft_graph(
             &mut g,
             cfg,
             start_pos + step,
+            attention_window,
             position,
             k_cache,
             v_cache,
@@ -1116,6 +1119,8 @@ impl Qwen4MtpKvView<'_> {
 pub(crate) struct Qwen4MtpSession {
     cfg: crate::Config,
     max_ctx: usize,
+    attention_window: usize,
+    kv_capacity: usize,
     fixed: Arc<Qwen4MtpFixed>,
     kv_spec: SegmentedKvSpec,
     kv: Mutex<Qwen4MtpKvCache>,
@@ -1126,16 +1131,19 @@ pub(crate) struct Qwen4MtpSession {
     draft_ids: [Box<dyn Buffer>; DRAFT_TOKENS],
 }
 
-pub(crate) fn qwen4_mtp_kv_spec(cfg: &crate::Config, max_ctx: usize) -> Result<SegmentedKvSpec> {
+pub(crate) fn qwen4_mtp_kv_spec(
+    cfg: &crate::Config,
+    kv_capacity: usize,
+) -> Result<SegmentedKvSpec> {
     let row_elements = cfg
         .n_kv
         .checked_mul(cfg.head_dim)
         .ok_or_else(|| anyhow!("Qwen3.8 MTP KV row width overflow"))?;
-    mtp_kv_spec(row_elements, max_ctx)
+    mtp_kv_spec(row_elements, kv_capacity)
 }
 
-fn mtp_kv_spec(row_elements: usize, max_ctx: usize) -> Result<SegmentedKvSpec> {
-    anyhow::ensure!(max_ctx > 0, "Qwen3.8 MTP needs a non-zero context capacity");
+fn mtp_kv_spec(row_elements: usize, kv_capacity: usize) -> Result<SegmentedKvSpec> {
+    anyhow::ensure!(kv_capacity > 0, "Qwen3.8 MTP needs a non-zero KV capacity");
     let segment_elements = crate::seam::KV_GROW_ROWS
         .checked_mul(row_elements)
         .ok_or_else(|| anyhow!("Qwen3.8 MTP KV segment element count overflow"))?;
@@ -1144,7 +1152,7 @@ fn mtp_kv_spec(row_elements: usize, max_ctx: usize) -> Result<SegmentedKvSpec> {
         "Qwen3.8 MTP segmented KV needs a power-of-two segment width; got {segment_elements} elements"
     );
     Ok(SegmentedKvSpec {
-        logical_bytes: max_ctx
+        logical_bytes: kv_capacity
             .checked_mul(row_elements)
             .and_then(|elements| elements.checked_mul(2))
             .ok_or_else(|| anyhow!("Qwen3.8 MTP logical KV byte count overflow"))?,
@@ -1152,7 +1160,7 @@ fn mtp_kv_spec(row_elements: usize, max_ctx: usize) -> Result<SegmentedKvSpec> {
             .checked_mul(2)
             .ok_or_else(|| anyhow!("Qwen3.8 MTP KV segment byte count overflow"))?,
         segment_elements,
-        max_segments: max_ctx.div_ceil(crate::seam::KV_GROW_ROWS),
+        max_segments: kv_capacity.div_ceil(crate::seam::KV_GROW_ROWS),
     })
 }
 
@@ -1225,9 +1233,10 @@ impl Qwen4MtpSession {
         fixed: Arc<Qwen4MtpFixed>,
         max_ctx: usize,
         max_batch: usize,
+        attention_window: usize,
     ) -> Result<Self> {
         let catch = Self::shared_catch_workspace(be, &fixed, max_ctx, max_batch)?;
-        Self::with_fixed_and_catch(be, fixed, max_ctx, catch)
+        Self::with_fixed_and_catch(be, fixed, max_ctx, catch, attention_window)
     }
 
     pub(crate) fn shared_catch_workspace(
@@ -1259,6 +1268,7 @@ impl Qwen4MtpSession {
         fixed: Arc<Qwen4MtpFixed>,
         max_ctx: usize,
         catch: Arc<Qwen4MtpCatchWorkspace>,
+        attention_window: usize,
     ) -> Result<Self> {
         let cfg = &fixed.cfg;
         let hcw = cfg.hc_mult * cfg.n_embd;
@@ -1266,8 +1276,14 @@ impl Qwen4MtpSession {
             catch.h_width == hcw && catch.n_embd == cfg.n_embd,
             "Qwen3.8 MTP catch workspace belongs to an incompatible model"
         );
+        anyhow::ensure!(
+            attention_window > 0,
+            "Qwen3.8 MTP attention context must be non-zero"
+        );
+        let attention_window = attention_window.min(max_ctx);
+        let kv_capacity = attention_window;
         let alloc = |bytes, usage| be.alloc(bytes, usage).map_err(|e| anyhow!("{e}"));
-        let kv_spec = qwen4_mtp_kv_spec(cfg, max_ctx)?;
+        let kv_spec = qwen4_mtp_kv_spec(cfg, kv_capacity)?;
         let (k_cache, v_cache, segmented_kv) = match be
             .alloc_segmented_kv(kv_spec)
             .map_err(|e| anyhow!("{e}"))?
@@ -1309,9 +1325,11 @@ impl Qwen4MtpSession {
         tracing::info!(
             draft_tokens = DRAFT_TOKENS,
             max_ctx,
+            attention_window,
+            kv_capacity,
             catch_batch,
             kv_mode = if segmented_kv {
-                "segmented-32k"
+                "segmented-ring"
             } else {
                 "flat"
             },
@@ -1320,6 +1338,8 @@ impl Qwen4MtpSession {
         Ok(Self {
             cfg: cfg.clone(),
             max_ctx,
+            attention_window,
+            kv_capacity,
             fixed,
             kv_spec,
             kv: Mutex::new(Qwen4MtpKvCache {
@@ -1365,16 +1385,18 @@ impl Qwen4MtpSession {
                 "Qwen3.8 MTP head KV uses flat storage because no unified VRAM arena is active"
             );
         }
-        if !kv.segmented || tokens <= kv.committed_tokens {
+        let physical_tokens = tokens.min(self.kv_capacity);
+        if !kv.segmented || physical_tokens <= kv.committed_tokens {
             return Ok(kv);
         }
-        let segments = tokens.div_ceil(crate::seam::KV_GROW_ROWS);
+        let segments = physical_tokens.div_ceil(crate::seam::KV_GROW_ROWS);
         be.ensure_segmented_kv_batch(&[kv.k.as_ref(), kv.v.as_ref()], segments)
             .map_err(|e| anyhow!("commit Qwen3.8 MTP segmented KV growth: {e}"))?;
-        let committed_tokens = (segments * crate::seam::KV_GROW_ROWS).min(self.max_ctx);
+        let committed_tokens = (segments * crate::seam::KV_GROW_ROWS).min(self.kv_capacity);
         kv.committed_tokens = committed_tokens;
         tracing::info!(
             requested_tokens = tokens,
+            resident_tokens = physical_tokens,
             committed_tokens,
             segments,
             "expanded Qwen3.8 MTP head KV cache"
@@ -1391,11 +1413,16 @@ impl Qwen4MtpSession {
         let row_bytes = self
             .kv_spec
             .logical_bytes
-            .checked_div(self.max_ctx)
+            .checked_div(self.kv_capacity)
             .ok_or_else(|| anyhow!("Qwen3.8 MTP KV row byte count is undefined"))?;
         tokens
+            .min(self.kv_capacity)
             .checked_mul(row_bytes)
             .ok_or_else(|| anyhow!("Qwen3.8 MTP KV prefix byte count overflow"))
+    }
+
+    pub(crate) fn retains_rewind_prefix(&self, current: usize, target: usize) -> bool {
+        target == current || (current <= self.kv_capacity && target <= current)
     }
 
     pub(crate) fn kv_prefix<'a>(
@@ -1588,7 +1615,7 @@ impl Qwen4MtpSession {
                 &self.cfg,
                 &self.fixed.specs,
                 specs,
-                self.max_ctx,
+                self.kv_capacity,
                 rows,
                 pos,
                 &override_ranges,
@@ -1665,7 +1692,8 @@ impl Qwen4MtpSession {
             &self.cfg,
             &self.fixed.specs,
             specs,
-            self.max_ctx,
+            self.kv_capacity,
+            self.attention_window,
             start_pos,
             verify_tokens,
         );
@@ -1719,7 +1747,13 @@ impl Qwen4MtpRuntime {
     ) -> Result<Self> {
         let catch_batch = crate::seam::ubatch_rows(model.engine_cfg());
         let fixed = Qwen4MtpSession::load_fixed_vulkan(vk, sidecar_path, model.config())?;
-        let head = Qwen4MtpSession::with_fixed(vk, fixed, max_ctx, catch_batch)?;
+        let head = Qwen4MtpSession::with_fixed(
+            vk,
+            fixed,
+            max_ctx,
+            catch_batch,
+            model.engine_cfg().spec.mtp_context,
+        )?;
         Ok(Self {
             head,
             trunk: None,
@@ -2070,11 +2104,11 @@ mod tests {
     }
 
     #[test]
-    fn head_kv_uses_independent_32k_f16_segments() {
-        let spec = mtp_kv_spec(2 * 256, 163_840).unwrap();
-        assert_eq!(spec.logical_bytes, 163_840 * 512 * 2);
+    fn head_kv_ring_uses_independent_32k_f16_segments() {
+        let spec = mtp_kv_spec(2 * 256, 32_768).unwrap();
+        assert_eq!(spec.logical_bytes, 32_768 * 512 * 2);
         assert_eq!(spec.segment_bytes, 32 * 1024 * 512 * 2);
         assert_eq!(spec.segment_elements, 32 * 1024 * 512);
-        assert_eq!(spec.max_segments, 5);
+        assert_eq!(spec.max_segments, 1);
     }
 }

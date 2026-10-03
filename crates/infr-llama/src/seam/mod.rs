@@ -1338,6 +1338,7 @@ pub(crate) fn layer_major_prefill(
 /// already builds rather than re-deriving them here (backlog B8).
 const ACT_RESERVE_PAD: (u64, u64) = (3, 2);
 const QWEN4_PLAN_OVERLAP_RESERVE: u64 = 64 * 1024 * 1024;
+const QWEN4_MTP_AUTO_UBATCH_MAX: usize = 2048;
 
 /// Batched-prefill micro-batch: rows per prefill chunk (`device.ubatch` / `INFR_UBATCH`, default
 /// 2048/4096 by profile — but see [`default_ubatch_rows`] for the INTEGRATED-GPU default). ONE
@@ -1372,6 +1373,14 @@ pub(crate) fn ubatch_rows(ec: &EngineConfig) -> usize {
     let selected = configured
         .or(placed)
         .unwrap_or_else(|| default_ubatch_rows(ec.device.auto_profile));
+    // Qwen3.8 MTP prefill regresses above 2048 rows on RDNA3 even when the smaller head KV ring
+    // leaves enough arena room for a taller chunk. Keep explicit usable heights authoritative;
+    // this only prevents automatic placement from turning freed MTP KV space into slower prefill.
+    let selected = if ec.spec.mtp && configured.is_none() {
+        selected.min(QWEN4_MTP_AUTO_UBATCH_MAX)
+    } else {
+        selected
+    };
     match moe_cap {
         Some(cap) => selected.min(cap),
         None => selected,
@@ -3481,7 +3490,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
             .map(|layout| layout.committed_bytes(want_ctx))
             .unwrap_or(0);
         let mtp_kv_spec = (ec.spec.mtp && cfg.qwen4exp)
-            .then(|| crate::mtp::qwen4_mtp_kv_spec(cfg, want_ctx))
+            .then(|| crate::mtp::qwen4_mtp_kv_spec(cfg, want_ctx.min(ec.spec.mtp_context)))
             .transpose()?;
         let mtp_dynamic_reserve_per_slot = mtp_kv_spec
             .map(|spec| {
@@ -6547,6 +6556,24 @@ mod seam_helper_tests {
         ec.device.ubatch_parallel = 512;
         ec.device.ubatch_parallel_specified = true;
         assert_eq!(super::ubatch_rows_parallel(&ec), 512);
+    }
+
+    #[test]
+    fn automatic_mtp_ubatch_is_capped_but_an_explicit_height_is_preserved() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let mut automatic = EngineConfig::default();
+        automatic.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
+        automatic.spec.mtp = true;
+        assert_eq!(super::ubatch_rows(&automatic), 2048);
+        assert_eq!(
+            super::ubatch_candidates(&automatic),
+            vec![2048, 1536, 1024, 512, 256]
+        );
+
+        automatic.device.ubatch = Some(3072);
+        automatic.device.ubatch_specified = true;
+        assert_eq!(super::ubatch_rows(&automatic), 3072);
+        assert_eq!(super::ubatch_candidates(&automatic), vec![3072]);
     }
 
     #[test]

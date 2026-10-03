@@ -1943,6 +1943,7 @@ enum RopeMode<'a> {
 /// shared [`infr_core::tier::cap_chunk_count`] / [`infr_core::tier::baked_chunk`] policy is
 /// parameterized by.
 const ATTN_MAX_CHUNKS: usize = 1024;
+const SEGMENTED_KV_RING_FLAG: u32 = 1 << 31;
 
 /// Flash-decoding split-K chunk policy: ~32 chunks/head, each 64..512 keys, floor-rounded (the
 /// measured Vulkan `attn_partial` shape — see [`infr_core::tier::ChunkRounding`] for why the
@@ -3454,31 +3455,48 @@ fn lower_op(
                     let src_row = span.row_start as usize;
                     let src_off = src_row * rs;
                     if let Some((table, segment_shift)) = segmented_kv_view(cache_buf) {
-                        let off = span_pos * rs;
-                        if cache_q8 {
-                            rec.store_q8_segmented(
-                                s,
-                                table,
-                                span_rows * rs,
-                                off,
-                                src_f16,
-                                src_off,
-                                segment_shift,
-                            );
-                        } else if cache_dt == infr_core::DType::F16 {
-                            rec.store_f16_off_segmented(
-                                s,
-                                table,
-                                span_rows * rs,
-                                off,
-                                src_off,
-                                segment_shift,
-                                src_f16,
-                            );
+                        let dst_row = if cap_rows > 0 {
+                            span_pos % cap_rows
                         } else {
-                            return Err(be(format!(
-                                "independent-row segmented KV write does not support {cache_dt:?} cache"
-                            )));
+                            span_pos
+                        };
+                        let segments = if cap_rows > 0 && dst_row + span_rows > cap_rows {
+                            let first = cap_rows - dst_row;
+                            [(0usize, dst_row, first), (first, 0, span_rows - first)]
+                        } else {
+                            [(0usize, dst_row, span_rows), (0, 0, 0)]
+                        };
+                        for &(source_row, target_row, segment_rows) in
+                            segments.iter().filter(|&&(_, _, count)| count > 0)
+                        {
+                            let source = src_off + source_row * rs;
+                            let target = target_row * rs;
+                            let elems = segment_rows * rs;
+                            if cache_q8 {
+                                rec.store_q8_segmented(
+                                    s,
+                                    table,
+                                    elems,
+                                    target,
+                                    src_f16,
+                                    source,
+                                    segment_shift,
+                                );
+                            } else if cache_dt == infr_core::DType::F16 {
+                                rec.store_f16_off_segmented(
+                                    s,
+                                    table,
+                                    elems,
+                                    target,
+                                    source,
+                                    segment_shift,
+                                    src_f16,
+                                );
+                            } else {
+                                return Err(be(format!(
+                                    "independent-row segmented KV write does not support {cache_dt:?} cache"
+                                )));
+                            }
                         }
                         continue;
                     }
@@ -3529,15 +3547,45 @@ fn lower_op(
                         "vulkan adapter: segmented KV writes require the static recording path",
                     ));
                 }
-                let off = pos * rs;
-                if cache_q8 {
-                    rec.store_q8_segmented(s, table, n, off, src_f16, 0, segment_shift);
-                } else if cache_dt == infr_core::DType::F16 {
-                    rec.store_f16_off_segmented(s, table, n, off, 0, segment_shift, src_f16);
+                let cap_rows = cap / rs.max(1);
+                let pos_r = if cap_rows > 0 { pos % cap_rows } else { pos };
+                let segments = if cap_rows > 0 && pos_r + rows > cap_rows {
+                    let first = cap_rows - pos_r;
+                    [(0usize, pos_r, first), (first, 0, rows - first)]
                 } else {
-                    return Err(be(format!(
-                        "vulkan adapter: segmented KV cache dtype {cache_dt:?} is unsupported"
-                    )));
+                    [(0usize, pos_r, rows), (0, 0, 0)]
+                };
+                for &(source_row, target_row, segment_rows) in
+                    segments.iter().filter(|&&(_, _, count)| count > 0)
+                {
+                    let source = source_row * rs;
+                    let target = target_row * rs;
+                    let elems = segment_rows * rs;
+                    if cache_q8 {
+                        rec.store_q8_segmented(
+                            s,
+                            table,
+                            elems,
+                            target,
+                            src_f16,
+                            source,
+                            segment_shift,
+                        );
+                    } else if cache_dt == infr_core::DType::F16 {
+                        rec.store_f16_off_segmented(
+                            s,
+                            table,
+                            elems,
+                            target,
+                            source,
+                            segment_shift,
+                            src_f16,
+                        );
+                    } else {
+                        return Err(be(format!(
+                            "vulkan adapter: segmented KV cache dtype {cache_dt:?} is unsupported"
+                        )));
+                    }
                 }
                 return Ok(());
             }
@@ -5774,7 +5822,7 @@ fn lower_op(
                                 window,
                                 k_q8_eff,
                                 v_q8_eff,
-                                ks,
+                                ks | if ring_past { SEGMENTED_KV_RING_FLAG } else { 0 },
                             );
                         }
                         (Some(_), Some(_)) => {

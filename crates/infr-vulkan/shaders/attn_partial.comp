@@ -126,6 +126,8 @@ layout(binding = 0) readonly buffer QB { f16vec4 q4[]; };    // [rows, nh, hd] a
 // original local f16 or planar-Q8 layout, so only the address calculation changes below.
 layout(binding = 1) readonly buffer KB { uvec2 k_segments[]; };
 layout(binding = 2) readonly buffer VB { uvec2 v_segments[]; };
+#define SEGMENT_SHIFT (pc.cap & 31u)
+#define SEGMENTED_RING ((pc.cap & 0x80000000u) != 0u)
 #endif
 // PLANAR Q8_0 KV cache (per-side): codes int8[cap] then scales f16[cap/32] (see store_q8), read as
 // `uint` words — each `f16vec4` load becomes ONE aligned u32 (4 codes) + one scale word shared by the
@@ -143,11 +145,11 @@ vec4 kvec4_ml(uint i4) { return dqv4(i4 << 2u); }
 #ifdef KV_SEGMENTED
 vec4 kvec4(uint i4) {
     uint elem = i4 << 2u;
-    uint local = kv_segment_local(elem, pc.cap);
-    uint64_t base = kv_segment_base(k_segments[kv_segment(elem, pc.cap)]);
+    uint local = kv_segment_local(elem, SEGMENT_SHIFT);
+    uint64_t base = kv_segment_base(k_segments[kv_segment(elem, SEGMENT_SHIFT)]);
     int cw = int(kv_word(base, local >> 2u));
     uint bk = local >> 5u;
-    uint seg_elems = 1u << pc.cap;
+    uint seg_elems = 1u << SEGMENT_SHIFT;
     float d = unpackHalf2x16(kv_word(base, (seg_elems >> 2u) + (bk >> 1u)))[bk & 1u];
     return d * vec4(bitfieldExtract(cw, 0, 8), bitfieldExtract(cw, 8, 8),
                     bitfieldExtract(cw, 16, 8), bitfieldExtract(cw, 24, 8));
@@ -180,8 +182,8 @@ vec4 kvec4(uint i4) {
 #ifdef KV_SEGMENTED
 vec4 kread4(uint i4) {
     uint elem = i4 << 2u;
-    uint local = kv_segment_local(elem, pc.cap);
-    uint64_t base = kv_segment_base(k_segments[kv_segment(elem, pc.cap)]);
+    uint local = kv_segment_local(elem, SEGMENT_SHIFT);
+    uint64_t base = kv_segment_base(k_segments[kv_segment(elem, SEGMENT_SHIFT)]);
     uvec2 w = KV2(base, local >> 1u);
     return vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y));
 }
@@ -210,11 +212,11 @@ vec4 vvec4_ml(uint i4) { return dqv4(i4 << 2u); }
 #ifdef KV_SEGMENTED
 vec4 vvec4(uint i4) {
     uint elem = i4 << 2u;
-    uint local = kv_segment_local(elem, pc.cap);
-    uint64_t base = kv_segment_base(v_segments[kv_segment(elem, pc.cap)]);
+    uint local = kv_segment_local(elem, SEGMENT_SHIFT);
+    uint64_t base = kv_segment_base(v_segments[kv_segment(elem, SEGMENT_SHIFT)]);
     int cw = int(kv_word(base, local >> 2u));
     uint bk = local >> 5u;
-    uint seg_elems = 1u << pc.cap;
+    uint seg_elems = 1u << SEGMENT_SHIFT;
     float d = unpackHalf2x16(kv_word(base, (seg_elems >> 2u) + (bk >> 1u)))[bk & 1u];
     return d * vec4(bitfieldExtract(cw, 0, 8), bitfieldExtract(cw, 8, 8),
                     bitfieldExtract(cw, 16, 8), bitfieldExtract(cw, 24, 8));
@@ -244,8 +246,8 @@ vec4 vvec4(uint i4) {
 #ifdef KV_SEGMENTED
 vec4 vread4(uint i4) {
     uint elem = i4 << 2u;
-    uint local = kv_segment_local(elem, pc.cap);
-    uint64_t base = kv_segment_base(v_segments[kv_segment(elem, pc.cap)]);
+    uint local = kv_segment_local(elem, SEGMENT_SHIFT);
+    uint64_t base = kv_segment_base(v_segments[kv_segment(elem, SEGMENT_SHIFT)]);
     uvec2 w = KV2(base, local >> 1u);
     return vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y));
 }
@@ -376,7 +378,8 @@ void main() {
     // positions the sliding-window mask (lo/j0) already excludes, so this mapping is exact. On a
     // full-context cache every processed j < kv_len <= rcap, so RROW is an identity there.
 #ifdef KV_SEGMENTED
-#define RROW(j) (j)
+    uint rcap = SEGMENTED_RING ? pc.window : 0u;
+#define RROW(j) ((rcap > 0u) ? ((j) % rcap) : (j))
 #else
     uint rcap = (pc.cap > 0u) ? pc.cap / (pc.nkv * hd) : 0u;
 #define RROW(j) ((rcap > 0u) ? ((j) % rcap) : (j))

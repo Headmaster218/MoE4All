@@ -610,6 +610,9 @@ cfg_struct! {
         draft: Option<PathBuf> = None,
         /// `INFR_SPEC_K`: draft-length upper bound.
         k: usize = 6,
+        /// Maximum attention horizon for the Qwen3.8 MTP head. The target model keeps its full
+        /// context; this only bounds the detached draft head's attention work.
+        mtp_context: usize = 32768,
         /// `INFR_SPEC_DEBUG`.
         debug: bool = false,
         /// `INFR_DECODE_CHAIN`: decode iterations per submission.

@@ -433,7 +433,12 @@ impl MtpSlotState {
             .turn_checkpoints
             .iter()
             .flatten()
-            .find(|checkpoint| checkpoint.tokens == tokens)
+            .find(|checkpoint| {
+                checkpoint.tokens == tokens
+                    && source
+                        .head
+                        .retains_rewind_prefix(source.cached.len(), checkpoint.tokens.len())
+            })
             .map(|checkpoint| (checkpoint.last_h.clone(), None, false));
         let Some((last_h, pending_id, pending_emitted)) = live.or(checkpoint) else {
             self.invalidate_all();
@@ -922,6 +927,7 @@ impl ParallelSeam {
                         Arc::clone(&fixed),
                         max_ctx,
                         Arc::clone(&catch),
+                        model.engine_cfg().spec.mtp_context,
                     )?,
                     cached: Vec::new(),
                     last_h: vec![0.0; model.config().hc_mult * model.config().n_embd],
@@ -2833,6 +2839,9 @@ impl ParallelSeam {
                 lane.turn_checkpoints.iter().flatten().find(|checkpoint| {
                     checkpoint.tokens.as_slice() == target_prefix
                         && lane.cached.starts_with(&checkpoint.tokens)
+                        && lane
+                            .head
+                            .retains_rewind_prefix(lane.cached.len(), checkpoint.tokens.len())
                 })
             })
             .flatten()
