@@ -1336,6 +1336,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_UBATCH",
         "INFR_VRAM_BUDGET",
         "INFR_VRAM_RESERVE",
+        "INFR_WARM_PAGE_CACHE",
         "INFR_UBATCH_PARALLEL",
     ];
 
