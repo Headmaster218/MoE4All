@@ -18,14 +18,14 @@ Windows 免安装，程序 13 MiB。下载 GGUF、选择自动配置，即可本
 [实测结果](#实测结果) |
 [社区实测](#社区实测) |
 [English](README_EN.md) |
-[技术文档](docs/README.md)
+[技术文档](documentation/README.md)
 
 ## 快速使用
 
 ### 1. 下载程序
 
 打开 [MoE4All Releases](https://github.com/Headmaster218/MoE4All/releases)，
-下载对应版本的 `MoE4All-Windows-x86_64-v*.zip`。本页新功能与实测对应待发布的 **0.8.0**。
+下载对应版本的 `MoE4All-Windows-x86_64-v*.zip`。本页速度表是 **0.8.0** 历史实测；当前文档与源码事实以 **0.9.0** tag 为准。
 
 
 ### 2. 解压
@@ -34,7 +34,7 @@ Windows 免安装，程序 13 MiB。下载 GGUF、选择自动配置，即可本
 
 ### 3. 下载 GGUF 模型
 
-当前版本围绕以下两种量化进行优化与实测，建议直接使用对应文件。模型单独下载到本地 SSD。
+上方 0.8.0 历史实测使用以下两种量化；复现这些数字时请使用对应文件。模型单独下载到本地 SSD。
 
 | 模型 / 组件 | 下载链接 | 文件与用途 |
 | --- | --- | --- |
@@ -54,13 +54,13 @@ Flash-Next 启动时选择第一片：`Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-
 4. 上下文留空由引擎自动确定，确认启动。复现实测时，20K 输入设置 `32768`，150K 输入设置 `163840`。
 
 自动档默认使用 Q8 K/V，显存、内存、专家缓存与 Ubatch 由引擎规划。
-35B 加载本体即可聊天。Flash-Next 可按用途选择：
+35B 加载本体即可聊天。以下 Flash-Next 选项用于复现上方 **0.8.0 历史实测**：
 
 - **文本 MTP 加速**：启用“Qwen3.8 MTP 单路加速”，选择上表的 MTP 头，验证宽度选 `4`。
   使用 greedy（`temperature=0`）和单会话生成。
 - **图片理解**：选择 API 模式，MTP 选择关闭，启用“视觉图片理解”，选择上表的 F16 视觉文件。
 
-API 默认地址为 `http://127.0.0.1:8080/v1`。完整配置项见[配置参考](docs/config.md)。
+0.9.0 已支持服务端 Vision 与 MTP 组合，组合能力和限制见[模型能力矩阵](documentation/reference/model-capabilities.md)。API 默认地址为 `http://127.0.0.1:8080/v1`；请求示例见[API 使用](documentation/guide/serving/api-quickstart.md)，完整配置项见[配置参考](documentation/reference/configuration.md)。
 
 ## 实测结果
 
@@ -117,7 +117,7 @@ Alpha 为 MTP 草稿接受率。
 | 无 MTP 简单问题 | -14.2% | -14.1% |
 | 无 MTP 复杂问题 | -14.0% | -12.0% |
 
-[20K 测试条件、结果与分析](docs/perf/qwen38-mtp-20k-comparison-20260924.md)。
+[20K 测试条件、结果与分析](documentation/evidence/benchmarks/2026-09-24-qwen38-mtp-20k.md)。
 
 </details>
 
@@ -210,9 +210,7 @@ Vulkan GPU 计算
 显存中的模型固定部分、KV Cache、运行时 scratch 和专家缓存由统一预算协调，
 prefill 与 decode 切换时可以重新分配弹性空间。
 
-更深入的实现说明在
-[技术文档索引](https://github.com/Headmaster218/MoE4All/blob/main/docs/README.md) 和
-[MoE4All Wiki](https://github.com/Headmaster218/MoE4All/blob/main/infr-fork-wiki/README.md)。
+更深入的实现说明见[技术文档索引](documentation/README.md)；历史优化和取舍见[变化记录](documentation/evidence/changes/README.md)。
 
 
 ## 项目与署名
