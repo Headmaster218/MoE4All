@@ -77,6 +77,48 @@ For the **historical 0.8.0 measurements above**, Flash-Next used these paths:
 Version 0.9.0 also supports Vision and MTP together; see the [capability matrix](documentation/reference/model-capabilities.md). The default API base URL is `http://127.0.0.1:8080/v1`. See the [API guide](documentation/guide/serving/api-quickstart.md) and the
 [configuration reference](documentation/reference/configuration.md) for all available settings.
 
+## Build from source (Linux)
+
+The release archives are Windows-only; on Linux, build from source. The result is
+`target/release/infr`.
+
+**Prerequisites**
+
+- **Rust** — `rust-toolchain.toml` pins **1.97.1** (with `rustfmt` and `clippy`);
+  `rustup` installs it automatically on the first build.
+- **`glslc` (shaderc)** — the compute shaders are compiled at build time. The
+  dp4a shaders need `GL_EXT_integer_dot_product`, so the compiler must be
+  **shaderc 2025 or newer**; Ubuntu 24.04 ships shaderc 2023.8, which is too old
+  (Ubuntu 26.04 ships a usable one).
+- **A Vulkan driver is needed to run, not to build** — `ash` loads `libvulkan` at
+  runtime via `dlopen`. On AMD that means RADV (Mesa).
+
+```sh
+sudo apt-get update && sudo apt-get install -y glslc
+git clone https://github.com/Headmaster218/MoE4All.git
+cd MoE4All
+cargo build --release --locked -p infr-cli
+```
+
+**Run**
+
+```sh
+./target/release/infr devices                    # list visible Vulkan devices + VRAM
+./target/release/infr run   <shard-00001.gguf>   # terminal chat (auto-pulls)
+./target/release/infr serve <shard-00001.gguf>   # OpenAI-compatible API
+```
+
+**Notes**
+
+- `.cargo/config.toml` sets `-C target-cpu=native` (the CPU backend leans on it
+  to autovectorize), so the binary is ISA-specific to the build machine; override
+  it when distributing across machines.
+- The GPU integration tests are `#[ignore]`d (they need a real Vulkan device):
+  `cargo test --workspace --locked -- --include-ignored`
+- Large MoE models map a host tier into the GPU aperture; on AMD you may need a
+  larger GTT — set `options amdgpu gttsize=<MiB>` under `/etc/modprobe.d/`
+  (applied when the amdgpu module loads; needs a reboot).
+
 ## Measured results
 
 ### 0.8.0: Qwen3.8-Flash-Next, 20K versus 150K input
