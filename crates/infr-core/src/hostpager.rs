@@ -42,6 +42,10 @@ pub struct AlignedHostBuffer {
     allocated_len: usize,
     #[cfg(unix)]
     allocation_len: usize,
+    /// False for a BORROWED arena: a budget a device backend allocated and owns (a plain
+    /// host-visible Vulkan buffer on Linux — see [`Self::borrowed`]). Those bytes belong to that
+    /// owner and must NOT be freed here.
+    owned: bool,
 }
 
 // SAFETY: the allocation is plain bytes with a stable address. Users establish non-overlap and
@@ -64,6 +68,7 @@ impl AlignedHostBuffer {
                 allocated_len: 0,
                 #[cfg(unix)]
                 allocation_len: 0,
+                owned: true,
             }));
         }
         let allocated_len = len
@@ -144,6 +149,35 @@ impl AlignedHostBuffer {
             allocated_len,
             #[cfg(unix)]
             allocation_len,
+            owned: true,
+        }))
+    }
+
+    /// Borrow `[ptr, ptr+len)` as an arena this type must NOT free.
+    ///
+    /// The caller keeps ownership (typically a `VkDeviceMemory` the CPU can write through) and
+    /// must outlive every clone. `len` is the usable extent; `allocated_len` is reported as the
+    /// same ALIGNMENT-rounded value a native [`Self::new`] would give, so the host-DMA import and
+    /// transfer math do not have to special-case a borrowed arena.
+    ///
+    /// # Safety
+    /// `ptr` must be a valid, writable, page-stable mapping of at least `len` bytes, and must stay
+    /// valid for as long as any clone of the returned handle is alive.
+    pub unsafe fn borrowed(ptr: *mut u8, len: usize) -> Result<Arc<Self>> {
+        let ptr = NonNull::new(ptr)
+            .ok_or_else(|| Error::backend("borrowed host arena pointer is null".to_string()))?;
+        let allocated_len = len
+            .checked_add(Self::ALIGNMENT - 1)
+            .map(|n| n / Self::ALIGNMENT * Self::ALIGNMENT)
+            .ok_or_else(|| Error::backend("borrowed host arena size overflow".to_string()))?;
+        Ok(Arc::new(Self {
+            ptr,
+            allocation_ptr: ptr,
+            len,
+            allocated_len,
+            #[cfg(unix)]
+            allocation_len: 0,
+            owned: false,
         }))
     }
 
@@ -192,7 +226,7 @@ impl AlignedHostBuffer {
 
 impl Drop for AlignedHostBuffer {
     fn drop(&mut self) {
-        if self.allocated_len == 0 {
+        if !self.owned || self.allocated_len == 0 {
             return;
         }
         #[cfg(windows)]
@@ -278,6 +312,27 @@ impl Arena {
         let total = n_slots * slot_bytes;
         Ok(Self {
             allocation: AlignedHostBuffer::new(total)?,
+            total,
+            slot_bytes,
+        })
+    }
+
+    /// As [`Self::new`], but over an allocation the CALLER owns and keeps alive (a borrowed
+    /// backend arena — see [`AlignedHostBuffer::borrowed`]).
+    fn with_allocation(
+        allocation: Arc<AlignedHostBuffer>,
+        n_slots: usize,
+        slot_bytes: usize,
+    ) -> Result<Self> {
+        let total = n_slots * slot_bytes;
+        if allocation.len() < total {
+            return Err(Error::backend(format!(
+                "borrowed host arena holds {} bytes, need {total} for {n_slots} x {slot_bytes}",
+                allocation.len()
+            )));
+        }
+        Ok(Self {
+            allocation,
             total,
             slot_bytes,
         })
@@ -494,11 +549,73 @@ impl InclusiveHostTier {
         io: Arc<dyn BlockIo>,
     ) -> Result<Self> {
         let slots = plan_slots(budget_bytes, classes);
+        let mut make = |n_slots: usize, slot_bytes: usize| {
+            InclusiveHostCache::new(n_slots, slot_bytes, io.clone())
+        };
+        Self::build(budget_bytes, classes, &slots, &mut make)
+    }
+
+    /// As [`Self::new`], but a size class's slots may live in an allocation the CALLER owns — a
+    /// plain host-visible Vulkan buffer on Linux (see [`AlignedHostBuffer::borrowed`]), which the
+    /// GPU reads without the per-submit cost a process-RAM import pays there. `allocations` is
+    /// keyed by `slot_bytes`; a class with no entry (or a zero-slot SSD-through class) falls back
+    /// to a native allocation.
+    pub fn with_allocations(
+        budget_bytes: usize,
+        classes: &[(usize, usize)],
+        io: Arc<dyn BlockIo>,
+        allocations: &BTreeMap<usize, Arc<AlignedHostBuffer>>,
+    ) -> Result<Self> {
+        let slots = plan_slots(budget_bytes, classes);
+        let mut make = |n_slots: usize, slot_bytes: usize| match allocations.get(&slot_bytes) {
+            Some(allocation) if n_slots > 0 => InclusiveHostCache::with_allocation(
+                n_slots,
+                slot_bytes,
+                io.clone(),
+                Arc::clone(allocation),
+            ),
+            _ => InclusiveHostCache::new(n_slots, slot_bytes, io.clone()),
+        };
+        Self::build(budget_bytes, classes, &slots, &mut make)
+    }
+
+    /// Per-class arena sizes this tier WILL allocate, as `(slot_bytes, arena_bytes)` with the size
+    /// rounded up exactly as [`Self::new`] would. A backend that wants to OWN the arenas sizes its
+    /// buffers from this before the tier exists. Zero-slot (SSD-through) classes are omitted.
+    pub fn planned_arena_bytes(
+        budget_bytes: usize,
+        classes: &[(usize, usize)],
+    ) -> Vec<(usize, usize)> {
+        let slots = plan_slots(budget_bytes, classes);
+        classes
+            .iter()
+            .zip(&slots)
+            .filter(|(&(slot_bytes, _), &n_slots)| slot_bytes != 0 && n_slots != 0)
+            .map(|(&(slot_bytes, _), &n_slots)| {
+                let total = n_slots * slot_bytes;
+                let align = AlignedHostBuffer::ALIGNMENT;
+                (
+                    slot_bytes,
+                    total
+                        .checked_add(align - 1)
+                        .map(|n| n / align * align)
+                        .unwrap_or(total),
+                )
+            })
+            .collect()
+    }
+
+    fn build(
+        budget_bytes: usize,
+        classes: &[(usize, usize)],
+        slots: &[usize],
+        make: &mut dyn FnMut(usize, usize) -> Result<InclusiveHostCache>,
+    ) -> Result<Self> {
         let mut plans = Vec::with_capacity(classes.len());
         let mut caches = BTreeMap::new();
         let mut arena_bytes = 0usize;
 
-        for (&(slot_bytes, n_blocks), &n_slots) in classes.iter().zip(&slots) {
+        for (&(slot_bytes, n_blocks), &n_slots) in classes.iter().zip(slots) {
             if slot_bytes == 0 {
                 return Err(Error::backend(
                     "inclusive host tier needs non-zero size classes".to_string(),
@@ -509,7 +626,7 @@ impl InclusiveHostTier {
                     "inclusive host tier received duplicate {slot_bytes}-byte size classes"
                 )));
             }
-            let cache = Arc::new(InclusiveHostCache::new(n_slots, slot_bytes, io.clone())?);
+            let cache = Arc::new(make(n_slots, slot_bytes)?);
             arena_bytes = arena_bytes
                 .checked_add(cache.arena_bytes())
                 .ok_or_else(|| Error::backend("inclusive host tier size overflow".to_string()))?;
@@ -566,7 +683,31 @@ impl InclusiveHostCache {
                 "inclusive host cache needs a non-zero block stride".to_string(),
             ));
         }
-        Ok(Self {
+        let arena = Arena::new(n_slots, slot_bytes)?;
+        Ok(Self::build(n_slots, slot_bytes, io, arena))
+    }
+
+    /// As [`Self::new`], but the slots live in an allocation the CALLER owns — a plain
+    /// host-visible Vulkan buffer on Linux (see [`AlignedHostBuffer::borrowed`]), which the GPU
+    /// reads WITHOUT the per-submit cost a process-RAM import (`VK_EXT_external_memory_host`)
+    /// pays there. `allocation` must cover `n_slots * slot_bytes`.
+    pub fn with_allocation(
+        n_slots: usize,
+        slot_bytes: usize,
+        io: Arc<dyn BlockIo>,
+        allocation: Arc<AlignedHostBuffer>,
+    ) -> Result<Self> {
+        if slot_bytes == 0 {
+            return Err(Error::backend(
+                "inclusive host cache needs a non-zero block stride".to_string(),
+            ));
+        }
+        let arena = Arena::with_allocation(allocation, n_slots, slot_bytes)?;
+        Ok(Self::build(n_slots, slot_bytes, io, arena))
+    }
+
+    fn build(n_slots: usize, slot_bytes: usize, io: Arc<dyn BlockIo>, arena: Arena) -> Self {
+        Self {
             inner: Mutex::new(InclusiveInner {
                 pager: (n_slots > 0).then(|| Pager::new(n_slots)),
                 state: HashMap::new(),
@@ -575,7 +716,7 @@ impl InclusiveHostCache {
                 scratch: vec![0u8; slot_bytes].into_boxed_slice(),
             }),
             ready: Condvar::new(),
-            arena: Arena::new(n_slots, slot_bytes)?,
+            arena,
             io,
             slot_bytes,
             preload_reads: AtomicU64::new(0),
@@ -588,7 +729,7 @@ impl InclusiveHostCache {
             shadow_releases: AtomicU64::new(0),
             bytes_read: AtomicU64::new(0),
             bytes_promoted: AtomicU64::new(0),
-        })
+        }
     }
 
     pub fn register(&self, desc: BlockDesc) -> Result<()> {
