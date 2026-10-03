@@ -20,6 +20,7 @@ target-prof/
 /.update/
 /artifacts/context-resource-matrix/
 /benchmark-data/
+/harness/agent-state/
 /tests/context-resource/matrix.local.json
 bili_report_work/*
 followtasks.txt

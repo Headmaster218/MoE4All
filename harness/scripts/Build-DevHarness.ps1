@@ -4,7 +4,9 @@ param(
     [string]$Registry = 'https://registry.npmmirror.com',
     [string]$ProductionHome = "$env:APPDATA\dsh-desktop\harness",
     [string]$WorkspaceRoot = 'D:\AISuperAssistant\DSH',
-    [switch]$RefreshConfig
+    [switch]$RefreshConfig,
+    [switch]$SkipInitialize,
+    [string]$ProfileDir
 )
 
 $ErrorActionPreference = 'Stop'
@@ -21,14 +23,18 @@ $pnpmCli = Join-Path $pnpmRoot 'node_modules\pnpm\bin\pnpm.cjs'
 $pnpmBin = Join-Path $pnpmRoot 'node_modules\.bin'
 $pnpmStore = Join-Path $runtimeRoot 'pnpm-store'
 $pluginPackRoot = Join-Path $runtimeRoot 'plugin-packs'
-$devProfile = Join-Path $harnessRoot 'dev-state\home\profiles\web'
+$devProfile = if ($ProfileDir) { [System.IO.Path]::GetFullPath($ProfileDir) } else { Join-Path $harnessRoot 'dev-state\home\profiles\web' }
 
-$initializeParams = @{
-    ProductionHome = $ProductionHome
-    WorkspaceRoot = $WorkspaceRoot
+if (-not $SkipInitialize) {
+    $initializeParams = @{
+        ProductionHome = $ProductionHome
+        WorkspaceRoot = $WorkspaceRoot
+    }
+    if ($RefreshConfig) { $initializeParams.Refresh = $true }
+    & (Join-Path $PSScriptRoot '_Initialize-DevHarness.ps1') @initializeParams
+} elseif (-not (Test-Path -LiteralPath (Join-Path $devProfile 'package.json') -PathType Leaf)) {
+    throw "Isolated profile is not initialized: $devProfile"
 }
-if ($RefreshConfig) { $initializeParams.Refresh = $true }
-& (Join-Path $PSScriptRoot '_Initialize-DevHarness.ps1') @initializeParams
 
 if (-not (Test-Path -LiteralPath $node)) {
     New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
@@ -91,10 +97,16 @@ try {
         'dsh-llm-moe4all',
         'dsh-plugin-tts-moe4all'
     )
+    $packedDependencies = @{}
     foreach ($pluginName in $pluginNames) {
         $pluginPath = Join-Path $harnessRoot "plugins\$pluginName"
         if (-not (Test-Path -LiteralPath (Join-Path $pluginPath 'package.json'))) {
             throw "Plugin source is missing a package manifest: $pluginPath"
+        }
+
+        if ($pluginName -eq 'dsh-mneme-moe4all') {
+            & $node (Join-Path $pluginPath 'scripts\sync-lib.js')
+            if ($LASTEXITCODE -ne 0) { throw 'Syncing Mneme source into its runtime failed.' }
         }
 
         $packOutput = & $node $npmCli pack $pluginPath --pack-destination $pluginPackRoot --ignore-scripts --json
@@ -108,7 +120,20 @@ try {
         if (-not $generatedPack.Equals($stablePack, [System.StringComparison]::OrdinalIgnoreCase)) {
             Copy-Item -LiteralPath $generatedPack -Destination $stablePack -Force
         }
+        $digest = (Get-FileHash -LiteralPath $stablePack -Algorithm SHA256).Hash.Substring(0, 16).ToLowerInvariant()
+        $contentPack = Join-Path $pluginPackRoot "$pluginName-$digest.tgz"
+        if (-not (Test-Path -LiteralPath $contentPack -PathType Leaf)) {
+            Copy-Item -LiteralPath $stablePack -Destination $contentPack
+        }
+        $packedDependencies[$pluginName] = "file:../../../../runtime/plugin-packs/$pluginName-$digest.tgz"
     }
+
+    $manifestPath = Join-Path $devProfile 'package.json'
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    foreach ($pluginName in $pluginNames) {
+        $manifest.dependencies.PSObject.Properties[$pluginName].Value = $packedDependencies[$pluginName]
+    }
+    [System.IO.File]::WriteAllText($manifestPath, (($manifest | ConvertTo-Json -Depth 12) + "`n"), (New-Object System.Text.UTF8Encoding($false)))
 
     Push-Location $devProfile
     try {

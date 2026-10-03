@@ -3,7 +3,7 @@
   "private": true,
   "dependencies": {
     "dsh-easyrewrite-moe4all": "2.4.1-moe4all.1",
-    "dsh-llm-moe4all": "0.1.0-alpha.7",
+    "dsh-llm-moe4all": "0.2.0-alpha.19",
     "dsh-market-moe4all": "1.45.1-moe4all.1",
     "dsh-mneme-moe4all": "0.7.29-moe4all.1",
     "dsh-plugin-cron-moe4all": "0.2.7-moe4all.1",
