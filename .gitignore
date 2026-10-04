@@ -19,6 +19,7 @@ target-prof/
 /kv-sessions/
 /.update/
 /artifacts/context-resource-matrix/
+/artifacts/agent-release/
 /benchmark-data/
 /harness/agent-state/
 /MoE4All.exe
