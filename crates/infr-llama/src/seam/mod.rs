@@ -30,7 +30,8 @@ mod session_state;
 mod weights;
 
 pub(crate) use runner::{
-    generate_dense_backend, generate_dense_backend_verify_frontier, PreparedParallelPrompt,
+    generate_dense_backend, generate_dense_backend_mtp_prime, MtpPrefillHiddenSink,
+    PreparedParallelPrompt,
 };
 pub(crate) use sc::DenoiseReq;
 pub use sc::{DenoiseOutcome, EbReduced};

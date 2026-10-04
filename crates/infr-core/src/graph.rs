@@ -401,6 +401,26 @@ pub enum Op {
         row_stride: u32,
         pos: u32,
     },
+    /// Qwen3.8 QSA projection prepare. `qk` contains one concatenated
+    /// `[indexer query heads, raw index key]` row per token. The op writes the raw key into the
+    /// persistent F16 ring and emits the RMS-normalised, RoPE-applied F16 query in one pass.
+    /// `positions4` selects IMROPE; otherwise `positions` supplies ordinary text positions.
+    QsaPrepare {
+        qk: TensorId,
+        q_norm: TensorId,
+        positions: TensorId,
+        positions4: Option<TensorId>,
+        k_cache: TensorId,
+        q_dst: TensorId,
+        rows: u32,
+        n_head: u32,
+        head_dim: u32,
+        rope_dim: u32,
+        theta: f32,
+        eps: f32,
+        sections: [u32; 4],
+        pos: u32,
+    },
     /// DeepSeek V4 compressor state update and, on a block boundary, per-channel softmax pooling.
     /// `state` is an opaque byte-addressed cache buffer; the two offsets name its f32 value and
     /// score rings. The projected rows are f32 and have width `dim` (HCA) or `2*dim` (overlapping
@@ -995,6 +1015,32 @@ pub enum Op {
         hc: u32,
         n_embd: u32,
     },
+    /// Qwen3.8 grouped RMSNorm over each residual stream followed by its stream-specific gamma.
+    /// `norm` has `[hc,n_embd]` values instead of the shared `[n_embd]` vector used by RmsNorm.
+    QwenHcNorm {
+        x: TensorId,
+        norm: TensorId,
+        dst: TensorId,
+        rows: u32,
+        hc: u32,
+        n_embd: u32,
+        eps: f32,
+    },
+    /// Qwen3.8 residual injection followed immediately by its grouped RMSNorm and per-stream
+    /// normalization weight. `residual_dst` preserves the injected wide residual for the matching
+    /// post-HC update, while `normed_dst` feeds the low-rank HC projection.
+    QwenHcInjectNorm {
+        residual: TensorId,
+        block: TensorId,
+        gate: TensorId,
+        norm: TensorId,
+        residual_dst: TensorId,
+        normed_dst: TensorId,
+        rows: u32,
+        hc: u32,
+        n_embd: u32,
+        eps: f32,
+    },
     /// Qwen3.8 PLE query-dependent value gate. `key` and `query` are grouped-normalized
     /// `[rows,hc,n_embd]`; `value` is `[rows,n_embd]`. For each stream, reduce
     /// `dot(key,query)/sqrt(n_embd)`, apply signed sqrt then sigmoid, and broadcast-multiply the
@@ -1367,6 +1413,7 @@ impl Op {
             Op::QkNormRope { .. } => "QkNormRope",
             Op::QkNormMrope { .. } => "QkNormMrope",
             Op::WriteKv { .. } => "WriteKv",
+            Op::QsaPrepare { .. } => "QsaPrepare",
             Op::Dsv4Compress { .. } => "Dsv4Compress",
             Op::Dsv4CacheWrite { .. } => "Dsv4CacheWrite",
             Op::Dsv4Indexer { .. } => "Dsv4Indexer",
@@ -1389,7 +1436,9 @@ impl Op {
             Op::Silu { .. } => "Silu",
             Op::Gelu { .. } => "Gelu",
             Op::QwenHcMix { .. } => "QwenHcMix",
+            Op::QwenHcNorm { .. } => "QwenHcNorm",
             Op::QwenHcInject { .. } => "QwenHcInject",
+            Op::QwenHcInjectNorm { .. } => "QwenHcInjectNorm",
             Op::QwenPleGate { .. } => "QwenPleGate",
             Op::MulVec { .. } => "MulVec",
             Op::HeadwiseSigmoidMul { .. } => "HeadwiseSigmoidMul",
@@ -1487,6 +1536,19 @@ impl Op {
                 ..
             } => (vec![x, weight, positions4], vec![dst]),
             Op::WriteKv { src, cache, .. } => (vec![src, cache], vec![cache]),
+            Op::QsaPrepare {
+                qk,
+                q_norm,
+                positions,
+                positions4,
+                k_cache,
+                q_dst,
+                ..
+            } => {
+                let mut reads = vec![qk, q_norm, positions, k_cache];
+                reads.extend(positions4);
+                (reads, vec![k_cache, q_dst])
+            }
             Op::Dsv4Compress {
                 values,
                 scores,
@@ -1616,6 +1678,7 @@ impl Op {
             Op::Silu { x, dst, .. } => (vec![x], vec![dst]),
             Op::Gelu { x, dst, .. } => (vec![x], vec![dst]),
             Op::QwenHcMix { x, gate, dst, .. } => (vec![x, gate], vec![dst]),
+            Op::QwenHcNorm { x, norm, dst, .. } => (vec![x, norm], vec![dst]),
             Op::QwenHcInject {
                 residual,
                 block,
@@ -1623,6 +1686,18 @@ impl Op {
                 dst,
                 ..
             } => (vec![residual, block, gate], vec![dst]),
+            Op::QwenHcInjectNorm {
+                residual,
+                block,
+                gate,
+                norm,
+                residual_dst,
+                normed_dst,
+                ..
+            } => (
+                vec![residual, block, gate, norm],
+                vec![residual_dst, normed_dst],
+            ),
             Op::QwenPleGate {
                 key,
                 query,
@@ -1830,6 +1905,9 @@ impl Graph {
                 match op {
                     Op::WriteKv { cache, .. } => {
                         set.insert(*cache);
+                    }
+                    Op::QsaPrepare { k_cache, .. } => {
+                        set.insert(*k_cache);
                     }
                     Op::Dsv4Compress { state, .. } => {
                         set.insert(*state);
@@ -2132,6 +2210,22 @@ mod tests {
             pos: 0,
             sinks: None,
         });
+        g.push(Op::QsaPrepare {
+            qk: t(10),
+            q_norm: t(11),
+            positions: t(12),
+            positions4: None,
+            k_cache: t(13),
+            q_dst: t(14),
+            rows: 1,
+            n_head: 1,
+            head_dim: 8,
+            rope_dim: 8,
+            theta: 10_000.0,
+            eps: 1e-6,
+            sections: [2, 1, 1, 0],
+            pos: 0,
+        });
         // A non-KV op must NOT contribute any in-place input.
         g.push(Op::Add {
             a: t(9),
@@ -2140,7 +2234,7 @@ mod tests {
             n: 8,
         });
 
-        let want: std::collections::HashSet<TensorId> = [t(6), t(8)].into_iter().collect();
+        let want: std::collections::HashSet<TensorId> = [t(6), t(8), t(13)].into_iter().collect();
         let first = g.in_place_inputs();
         assert_eq!(first, &want);
 

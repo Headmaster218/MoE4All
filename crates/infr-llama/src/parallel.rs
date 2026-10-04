@@ -327,26 +327,14 @@ fn concurrent_mtp_ready(enabled: bool, plain_selected: bool, all_lanes_ready: bo
     enabled && !plain_selected && all_lanes_ready
 }
 
+fn mtp_context_profitable(max_context: usize, visible_tokens: usize) -> bool {
+    max_context == 0 || visible_tokens <= max_context
+}
+
 #[derive(Default)]
 struct MtpBatchCycleStats {
     accepted: usize,
     drafted: usize,
-}
-
-fn mtp_prime_chunk_end(
-    start: usize,
-    prompt_len: usize,
-    chunk: usize,
-    checkpoint_boundaries: &[Option<usize>; crate::seam::TURN_CHECKPOINT_COUNT],
-) -> usize {
-    let natural_end = start.saturating_add(chunk).min(prompt_len);
-    checkpoint_boundaries
-        .iter()
-        .flatten()
-        .copied()
-        .filter(|&boundary| start < boundary && boundary <= natural_end)
-        .min()
-        .unwrap_or(natural_end)
 }
 
 struct BatchWork {
@@ -2460,6 +2448,38 @@ impl ParallelSeam {
         Ok(())
     }
 
+    fn deactivate_mtp_lanes(
+        &self,
+        active: &mut [BatchWork],
+        indices: &[usize],
+        reason: &'static str,
+    ) -> Result<()> {
+        let ready = indices
+            .iter()
+            .copied()
+            .filter(|&index| active[index].mtp_ready)
+            .collect::<Vec<_>>();
+        self.materialize_mtp_frontiers(active, &ready)?;
+
+        let mut heads = self
+            .mtp_heads
+            .as_ref()
+            .expect("MTP scheduler has heads")
+            .lock()
+            .expect("MTP heads poisoned");
+        for &index in indices {
+            let work = &mut active[index];
+            heads[work.slot].invalidate_live();
+            work.mtp_ready = false;
+        }
+        tracing::info!(
+            lanes = indices.len(),
+            reason,
+            "Qwen3.8 MTP switched to ordinary decode"
+        );
+        Ok(())
+    }
+
     fn sync_mtp_after_plain_decode(
         &self,
         active: &[BatchWork],
@@ -2804,7 +2824,6 @@ impl ParallelSeam {
         }
         let cfg = self.model.config();
         let ec = self.model.engine_cfg();
-        let h_width = cfg.hc_mult * cfg.n_embd;
         let prompt = &work.prompt[..work.prompt_end];
         let _gate = req.gate_pass();
         let prepared = crate::seam::prepare_dense_vulkan_parallel_prompt_session(
@@ -2937,101 +2956,9 @@ impl ParallelSeam {
             false,
             self.max_ctx,
         )?;
-        let chunk = crate::seam::ubatch_rows(ec).max(1);
         let checkpoint_boundaries = prepared.checkpoint_boundaries;
-        let mut chunk_start = start;
-        while chunk_start < prompt.len() {
-            let chunk_end =
-                mtp_prime_chunk_end(chunk_start, prompt.len(), chunk, &checkpoint_boundaries);
-            let rows = chunk_end - chunk_start;
-            let (mut pending, mut pending_logits, hidden) =
-                crate::mtp::run_qwen4_prime_frontier_with_finish(
-                    self.vk.as_ref(),
-                    &*bind,
-                    self.model.gguf(),
-                    cfg,
-                    ec,
-                    self.model.embd(),
-                    &prompt[..chunk_end],
-                    &mut work.kv,
-                    self.max_ctx,
-                    work.mrope_plan.as_ref(),
-                    finish.as_deref(),
-                )?;
-            if chunk_end == prompt.len()
-                && work
-                    .reasoning_guard
-                    .blocks(cfg, pending, ec.sampling.ignore_eos)
-            {
-                anyhow::ensure!(
-                    pending_logits.len() == cfg.vocab,
-                    "Qwen3.8 MTP prime EOS repair expected {} logits, got {}",
-                    cfg.vocab,
-                    pending_logits.len()
-                );
-                work.reasoning_guard.mask_eos(cfg, &mut pending_logits);
-                let blocked = pending;
-                pending = crate::mtp::argmax_row(&pending_logits);
-                tracing::warn!(
-                    slot = work.slot,
-                    blocked_token = blocked,
-                    replacement_token = pending,
-                    "Qwen3.8 MTP suppressed premature EOS inside an open reasoning block"
-                );
-            }
-            anyhow::ensure!(
-                hidden.len() == rows * h_width,
-                "MTP prime returned {} hidden values for {rows} rows",
-                hidden.len()
-            );
-            let mut shifted = vec![0.0f32; rows * h_width];
-            shifted[..h_width].copy_from_slice(&lane.last_h);
-            if rows > 1 {
-                shifted[h_width..].copy_from_slice(&hidden[..(rows - 1) * h_width]);
-            }
-            lane.head.catch_up(
-                self.vk.as_ref(),
-                &prompt[chunk_start..chunk_end],
-                &shifted,
-                chunk_start,
-                work.mrope_plan.as_ref(),
-                work.kv().mtp_shared_weights(),
-            )?;
-            for (index, boundary) in checkpoint_boundaries.iter().copied().enumerate() {
-                let Some(boundary) =
-                    boundary.filter(|&boundary| boundary > chunk_start && boundary <= chunk_end)
-                else {
-                    continue;
-                };
-                let hidden_row = boundary - chunk_start - 1;
-                work.kv
-                    .as_mut()
-                    .expect("MTP work has target KV")
-                    .capture_turn_recurrent(self.vk.as_ref(), cfg, index, &prompt[..boundary])?;
-                lane.turn_checkpoints[index] = Some(crate::mtp::Qwen4MtpCheckpointState {
-                    tokens: prompt[..boundary].to_vec(),
-                    last_h: hidden[hidden_row * h_width..(hidden_row + 1) * h_width].to_vec(),
-                });
-                if ec.debug.state_trace {
-                    let recurrent = work
-                        .kv()
-                        .session_state_meta()
-                        .checkpoint_tokens
-                        .map(|tokens| tokens.map(|tokens| tokens.len()));
-                    tracing::warn!(
-                        "[MTP state trace] slot={} captured_head_checkpoint={} tokens={} recurrent_checkpoints={:?}",
-                        work.slot,
-                        index,
-                        boundary,
-                        recurrent,
-                    );
-                }
-            }
-            lane.last_h.copy_from_slice(&hidden[(rows - 1) * h_width..]);
-            lane.pending_id = Some(pending);
-            lane.pending_emitted = false;
-            lane.cached
-                .extend_from_slice(&prompt[chunk_start..chunk_end]);
+        let initial_h = lane.last_h.clone();
+        let report_prime_progress = |chunk_end: usize| {
             if let Some(events) = progress_events.as_ref() {
                 let _ = events.send(BatchEvent::Progress {
                     progress: infr_core::GenerationProgress {
@@ -3045,8 +2972,61 @@ impl ParallelSeam {
                     },
                 });
             }
-            chunk_start = chunk_end;
+        };
+        let mut prime_sink = crate::mtp::Qwen4MtpPrimeSink::new(
+            &lane.head,
+            &initial_h,
+            checkpoint_boundaries,
+            Some(&report_prime_progress),
+        )?;
+        let (mut pending, mut pending_logits) = crate::mtp::run_qwen4_prime_frontier_with_finish(
+            self.vk.as_ref(),
+            &*bind,
+            self.model.gguf(),
+            cfg,
+            ec,
+            self.model.embd(),
+            prompt,
+            &mut work.kv,
+            self.max_ctx,
+            work.mrope_plan.as_ref(),
+            finish.as_deref(),
+            &mut prime_sink,
+            Some(prepared),
+        )?;
+        if work
+            .reasoning_guard
+            .blocks(cfg, pending, ec.sampling.ignore_eos)
+        {
+            anyhow::ensure!(
+                pending_logits.len() == cfg.vocab,
+                "Qwen3.8 MTP prime EOS repair expected {} logits, got {}",
+                cfg.vocab,
+                pending_logits.len()
+            );
+            work.reasoning_guard.mask_eos(cfg, &mut pending_logits);
+            let blocked = pending;
+            pending = crate::mtp::argmax_row(&pending_logits);
+            tracing::warn!(
+                slot = work.slot,
+                blocked_token = blocked,
+                replacement_token = pending,
+                "Qwen3.8 MTP suppressed premature EOS inside an open reasoning block"
+            );
         }
+        let prime_capture = prime_sink.finish(self.vk.as_ref())?;
+        lane.last_h = prime_capture.last_h;
+        for (index, checkpoint_h) in prime_capture.checkpoint_h.into_iter().enumerate() {
+            if let (Some(boundary), Some(last_h)) = (checkpoint_boundaries[index], checkpoint_h) {
+                lane.turn_checkpoints[index] = Some(crate::mtp::Qwen4MtpCheckpointState {
+                    tokens: prompt[..boundary].to_vec(),
+                    last_h,
+                });
+            }
+        }
+        lane.pending_id = Some(pending);
+        lane.pending_emitted = false;
+        lane.cached.extend_from_slice(&prompt[start..]);
         lane.multimodal_key = work.multimodal_key;
         anyhow::ensure!(lane.pending_id.is_some(), "MTP prime has no frontier token");
         work.kv
@@ -3099,9 +3079,54 @@ impl ParallelSeam {
                     None => return,
                 }
             }
+            let force_plain_concurrent =
+                active.len() > 1 && !self.model.engine_cfg().spec.mtp_concurrent;
+            if force_plain_concurrent {
+                let ready = (0..active.len())
+                    .filter(|&index| active[index].mtp_ready)
+                    .collect::<Vec<_>>();
+                if !ready.is_empty() {
+                    if let Err(error) =
+                        self.deactivate_mtp_lanes(&mut active, &ready, "multiple active lanes")
+                    {
+                        self.fail_unified_scheduler(&mut active, error);
+                        return;
+                    }
+                }
+            }
             for work in &mut active {
                 let was_unprepared = work.phase == BatchPhase::Unprepared;
-                if let Err(error) = self.prime_mtp_work(work, req) {
+                let use_mtp = !force_plain_concurrent
+                    && mtp_context_profitable(
+                        self.model.engine_cfg().spec.mtp_max_context,
+                        work.prompt_end,
+                    );
+                let prepared = if use_mtp {
+                    self.prime_mtp_work(work, req)
+                } else {
+                    if was_unprepared {
+                        let mut heads = self
+                            .mtp_heads
+                            .as_ref()
+                            .expect("MTP scheduler has heads")
+                            .lock()
+                            .expect("MTP heads poisoned");
+                        heads[work.slot].invalidate_live();
+                        tracing::info!(
+                            slot = work.slot,
+                            prompt_tokens = work.prompt_end,
+                            max_context = self.model.engine_cfg().spec.mtp_max_context,
+                            reason = if force_plain_concurrent {
+                                "multiple active lanes"
+                            } else {
+                                "context cutoff"
+                            },
+                            "Qwen3.8 MTP prime skipped"
+                        );
+                    }
+                    self.prepare_unified_work(work, req)
+                };
+                if let Err(error) = prepared {
                     self.fail_unified_scheduler(&mut active, error);
                     return;
                 }
@@ -3199,6 +3224,26 @@ impl ParallelSeam {
                 concurrent_probe_cycles = 0;
                 concurrent_accepted = 0;
                 concurrent_drafted = 0;
+            }
+            let context_fallback = (0..active.len())
+                .filter(|&index| {
+                    active[index].mtp_ready
+                        && !mtp_context_profitable(
+                            self.model.engine_cfg().spec.mtp_max_context,
+                            active[index]
+                                .kv()
+                                .cached_len()
+                                .saturating_add(crate::mtp::DRAFT_TOKENS),
+                        )
+                })
+                .collect::<Vec<_>>();
+            if !context_fallback.is_empty() {
+                if let Err(error) =
+                    self.deactivate_mtp_lanes(&mut active, &context_fallback, "context cutoff")
+                {
+                    self.fail_unified_scheduler(&mut active, error);
+                    return;
+                }
             }
             if !active[0].mtp_ready {
                 if let Err(error) =
@@ -4001,7 +4046,7 @@ impl ParallelSeam {
 mod tests {
     use super::{
         concurrent_mtp_profitable, concurrent_mtp_ready, expand_multimodal_prompt,
-        mtp_accepted_rows, mtp_prime_chunk_end, multimodal_key, multimodal_token_position,
+        mtp_accepted_rows, mtp_context_profitable, multimodal_key, multimodal_token_position,
         phase_for_remaining_prefill, pick_continuation, scheduler_mode,
         should_handoff_multimodal_to_scheduler, token_lane_sort_key, BatchPhase,
         MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
@@ -4077,11 +4122,10 @@ mod tests {
     }
 
     #[test]
-    fn mtp_prime_stops_exactly_at_each_turn_checkpoint() {
-        let checkpoints = [Some(789), Some(2405)];
-        assert_eq!(mtp_prime_chunk_end(0, 4064, 2048, &checkpoints), 789);
-        assert_eq!(mtp_prime_chunk_end(789, 4064, 2048, &checkpoints), 2405);
-        assert_eq!(mtp_prime_chunk_end(2405, 4064, 2048, &checkpoints), 4064);
+    fn mtp_context_cutoff_can_be_bounded_or_disabled() {
+        assert!(mtp_context_profitable(48 * 1024, 48 * 1024));
+        assert!(!mtp_context_profitable(48 * 1024, 48 * 1024 + 1));
+        assert!(mtp_context_profitable(0, usize::MAX));
     }
 
     #[test]

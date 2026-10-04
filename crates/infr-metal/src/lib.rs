@@ -374,6 +374,7 @@ impl Backend for MetalBackend {
             // One fused [2*nff, ne] gate+up Linear + GatedActFused per FFN — one dispatch and
             // one contiguous weight stream instead of two.
             combined_gu: true,
+            qsa_prepare: false,
             // Op::EmbedGather runs on-device (embed_gather.metal, DEC16_* native decode) for
             // F16/BF16/Q8_0/Q4_0/Q5_0/Q4_K/Q6_K/IQ4_NL/IQ4_XS token_embd tables; the runner
             // additionally format-gates via the shared embed_gather_supported list (see the

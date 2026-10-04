@@ -383,6 +383,9 @@ cfg_struct! {
         moe_topk_sg: bool = true,
         /// Fill all eight wave32 subgroups when QSA scores a single decode row.
         qsa_score_decode8: bool = true,
+        /// Experimental Qwen3.8 QSA prepare fusion. Concatenates the indexer Q/K projections and
+        /// fuses raw-K cache write with query norm/RoPE. Kept off until model-level A/B validation.
+        qsa_prepare_fused: bool = false,
         /// Multi-workgroup exact radix selection for deep single-row QSA decode.
         qsa_topk_parallel: bool = true,
         /// `INFR_CANVAS_CHUNK_N` (`tier::EnvRows`, floored at 1).
@@ -613,9 +616,13 @@ cfg_struct! {
         /// Maximum attention horizon for the Qwen3.8 MTP head. The target model keeps its full
         /// context; this only bounds the detached draft head's attention work.
         mtp_context: usize = 32768,
-        /// Let two active Qwen3.8 lanes probe batched MTP VERIFY and retain it only while measured
-        /// draft acceptance is high enough to beat ordinary batched decode.
-        mtp_concurrent: bool = true,
+        /// Maximum target context at which automatic Qwen3.8 MTP remains enabled. Above this
+        /// boundary the target verification cost exceeds the saved decode work on the reference
+        /// RDNA3 configuration. Zero disables this automatic cutoff.
+        mtp_max_context: usize = 49152,
+        /// Let two active Qwen3.8 lanes probe batched MTP VERIFY. Disabled by default because the
+        /// ordinary batched path is faster and does not need to maintain detached side state.
+        mtp_concurrent: bool = false,
         /// `INFR_SPEC_DEBUG`.
         debug: bool = false,
         /// `INFR_DECODE_CHAIN`: decode iterations per submission.

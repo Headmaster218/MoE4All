@@ -2152,9 +2152,8 @@ fn run_verify_with_finish(
     Ok((ids, logits, h))
 }
 
-/// Qwen3.8 prompt prime needs every target hidden row for detached-head catch-up, but only the
-/// final target prediction becomes the first pending token. Keep the trunk forward fully batched
-/// while limiting the vocabulary projection and argmax to that frontier row.
+/// Qwen3.8 prompt prime through the ordinary chunked-Prefill path. Completed target hidden chunks
+/// are consumed synchronously by `sink` on device; only the frontier logits cross to the host.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_qwen4_prime_frontier_with_finish(
     be: &dyn Backend,
@@ -2168,12 +2167,12 @@ pub(crate) fn run_qwen4_prime_frontier_with_finish(
     max_ctx: usize,
     mm: Option<&crate::seam::MropePlan>,
     finish_fixed_allocations: Option<&dyn Fn() -> Result<()>>,
-) -> Result<(u32, Vec<f32>, Vec<f32>)> {
+    sink: &mut dyn crate::seam::MtpPrefillHiddenSink,
+    prepared: Option<crate::seam::PreparedParallelPrompt>,
+) -> Result<(u32, Vec<f32>)> {
     anyhow::ensure!(cfg.qwen4exp, "Qwen3.8 frontier prime requires qwen4exp");
     let mut logits = Vec::new();
-    let mut ids = Vec::new();
-    let mut h = Vec::new();
-    crate::seam::generate_dense_backend_verify_frontier(
+    crate::seam::generate_dense_backend_mtp_prime(
         be,
         bind,
         g,
@@ -2184,28 +2183,18 @@ pub(crate) fn run_qwen4_prime_frontier_with_finish(
         state,
         max_ctx,
         &mut logits,
-        &mut ids,
-        &mut h,
+        sink,
+        prepared,
         mm,
         finish_fixed_allocations,
     )?;
-    let id = if let Some(&id) = ids.first() {
-        anyhow::ensure!(
-            ids.len() == 1,
-            "Qwen3.8 frontier prime returned {} ids",
-            ids.len()
-        );
-        id
-    } else {
-        anyhow::ensure!(
-            logits.len() == cfg.vocab,
-            "Qwen3.8 frontier prime expected {} fallback logits, got {}",
-            cfg.vocab,
-            logits.len()
-        );
-        argmax_row(&logits)
-    };
-    Ok((id, logits, h))
+    anyhow::ensure!(
+        logits.len() == cfg.vocab,
+        "Qwen3.8 frontier prime expected {} logits, got {}",
+        cfg.vocab,
+        logits.len()
+    );
+    Ok((argmax_row(&logits), logits))
 }
 
 /// Full-distribution VERIFY forward — the temperature-aware MTP accept rule's twin of

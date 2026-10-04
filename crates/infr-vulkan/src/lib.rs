@@ -3865,6 +3865,7 @@ impl VulkanBackend {
             // kernels); the runner compiles the eligible qwen3 decode graph once.
             decode_replay: true,
             combined_gu: true,
+            qsa_prepare: true,
             embed_gather: true,
             gpu_sample: true,
             sample_rows: true,
@@ -7351,6 +7352,12 @@ impl Backend for VulkanBackend {
 
     fn activation_peak(&self) -> Option<u64> {
         Some(self.shared.act_peak.load(Ordering::Relaxed))
+    }
+
+    fn release_transient_runtime(&self) {
+        self.with_unified_exclusive(|| {
+            self.runtime_phase.lock().unwrap().release_phase();
+        });
     }
 
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>> {

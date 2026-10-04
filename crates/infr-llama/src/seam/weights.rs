@@ -124,6 +124,7 @@ pub(super) struct QsaW {
     pub(super) k_proj: TensorId,
     pub(super) q_norm: TensorId,
     pub(super) q_proj: TensorId,
+    pub(super) fused_prepare: bool,
 }
 
 /// qwen35 gated-DeltaNet linear-attention mixer weights (see `docs/qwen35.md`). Unlike `AttnW` this
@@ -372,6 +373,8 @@ pub(crate) struct SessionStable {
     pub(super) fuse_gu: bool,
     /// Combined QKV upload decision.
     pub(super) fuse_qkv: bool,
+    /// Experimental combined QSA query/key projection and prepare decision.
+    pub(super) fuse_qsa_prepare: bool,
     /// Per-layer Ling KDA QKV layout: true for one fused bank, false for QK + V.
     pub(super) kda_qkv_fused: Vec<bool>,
     /// Whether the MoE expert banks all have a dp4a-mmq kernel (batched-prefill eligibility).
@@ -1352,38 +1355,6 @@ impl SeamKv {
         drop(copies);
         self.cached.clone_from(&ck.tokens);
         Ok(Some(len))
-    }
-
-    /// Capture a turn checkpoint once an external batched path has stopped exactly at that token
-    /// boundary. Qwen3.8 MTP prime uses its own batched-verify forward and therefore returns before
-    /// the ordinary runner's snapshot sites. Re-arm here because its first cold chunk correctly
-    /// resets the recurrent state and invalidates any checkpoint prepared before that reset.
-    pub(crate) fn capture_turn_recurrent(
-        &mut self,
-        be: &dyn Backend,
-        cfg: &Config,
-        index: usize,
-        tokens: &[u32],
-    ) -> AResult<()> {
-        let slot = self
-            .turn_recurrent_ckpts
-            .get_mut(index)
-            .ok_or_else(|| anyhow!("turn checkpoint index {index} is out of range"))?;
-        TurnRecurrentCkpt::begin(
-            slot,
-            be,
-            cfg,
-            &self.kbufs,
-            &self.vbufs,
-            self.ple_state_buf.as_deref(),
-            tokens,
-        )?;
-        let checkpoint = self
-            .turn_recurrent_ckpts
-            .get_mut(index)
-            .and_then(Option::as_mut)
-            .ok_or_else(|| anyhow!("turn checkpoint {index} has no recurrent layers"))?;
-        checkpoint.snapshot_all(be, &self.kbufs, &self.vbufs, self.ple_state_buf.as_deref())
     }
 
     /// Fork a fresh conversation slot: same (Arc-shared) weights, its own zero KV + IO buffers.

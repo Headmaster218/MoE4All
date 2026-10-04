@@ -1,9 +1,10 @@
 use anyhow::{anyhow, bail, Context, Result};
-use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, SegmentedKvSpec};
+use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Plan, SegmentedKvSpec};
 use infr_core::graph::{Activation, AttnMask, Graph, Op};
 use infr_core::tensor::{DType, TensorDesc, TensorId};
 use infr_core::{TensorInfo, WeightSource};
 use infr_gguf::Gguf;
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -23,8 +24,8 @@ fn generation_budget(prompt_rows: usize, requested: usize, max_ctx: usize) -> Re
     Ok(requested.min(max_ctx - reserved))
 }
 
-type SharedWeight<'a> = (&'a dyn Buffer, DType, usize);
-type SharedWeights<'a> = (SharedWeight<'a>, SharedWeight<'a>);
+pub(crate) type SharedWeight<'a> = (&'a dyn Buffer, DType, usize);
+pub(crate) type SharedWeights<'a> = (SharedWeight<'a>, SharedWeight<'a>);
 
 struct PhaseProfile {
     name: &'static str,
@@ -243,7 +244,6 @@ struct GraphW {
     enorm: TensorId,
     hnorm: TensorId,
     head_hc: HcW,
-    ones: TensorId,
     embd: TensorId,
     lm_head: TensorId,
 }
@@ -299,7 +299,6 @@ fn declare_weights(
         up: next(),
         inject: None,
     };
-    let ones = next();
     debug_assert_eq!(i, specs.len());
     let embd_id = g.weight(TensorDesc::new(vec![embd.1], embd.0));
     let lm_id = g.weight(TensorDesc::new(vec![lm_head.1], lm_head.0));
@@ -325,7 +324,6 @@ fn declare_weights(
             enorm,
             hnorm,
             head_hc,
-            ones,
             embd: embd_id,
             lm_head: lm_id,
         },
@@ -346,28 +344,37 @@ fn emit_hc_mix(
     cfg: &crate::Config,
     rows: usize,
     weights: HcW,
-    ones: TensorId,
     residual: TensorId,
     dst: TensorId,
     scratch: HcScratch,
+    injection: Option<(TensorId, TensorId, TensorId)>,
 ) {
     let ne = cfg.n_embd;
     let hcw = cfg.hc_mult * ne;
-    g.push(Op::RmsNorm {
-        x: residual,
-        weight: ones,
-        dst: scratch.normed,
-        rows: (rows * cfg.hc_mult) as u32,
-        dim: ne as u32,
-        eps: cfg.rms_eps,
-    });
-    g.push(Op::MulVec {
-        x: scratch.normed,
-        vec: weights.norm,
-        dst: scratch.normed,
-        rows: rows as u32,
-        n: hcw as u32,
-    });
+    if let Some((source_residual, block, gate)) = injection {
+        g.push(Op::QwenHcInjectNorm {
+            residual: source_residual,
+            block,
+            gate,
+            norm: weights.norm,
+            residual_dst: residual,
+            normed_dst: scratch.normed,
+            rows: rows as u32,
+            hc: cfg.hc_mult as u32,
+            n_embd: ne as u32,
+            eps: cfg.rms_eps,
+        });
+    } else {
+        g.push(Op::QwenHcNorm {
+            x: residual,
+            norm: weights.norm,
+            dst: scratch.normed,
+            rows: rows as u32,
+            hc: cfg.hc_mult as u32,
+            n_embd: ne as u32,
+            eps: cfg.rms_eps,
+        });
+    }
     g.push(Op::Linear {
         x: scratch.normed,
         weight: weights.down,
@@ -487,7 +494,6 @@ fn emit_bridge(
     embedding_overrides: Option<(TensorId, &[(usize, usize)])>,
 ) {
     let ne = cfg.n_embd;
-    let hcw = cfg.hc_mult * ne;
     g.push(Op::EmbedGather {
         ids,
         table: weights.embd,
@@ -520,20 +526,14 @@ fn emit_bridge(
         dim: ne as u32,
         eps: cfg.rms_eps,
     });
-    g.push(Op::RmsNorm {
+    g.push(Op::QwenHcNorm {
         x: h_in,
-        weight: weights.ones,
-        dst: scratch.h_norm,
-        rows: (rows * cfg.hc_mult) as u32,
-        dim: ne as u32,
-        eps: cfg.rms_eps,
-    });
-    g.push(Op::MulVec {
-        x: scratch.h_norm,
-        vec: weights.hnorm,
+        norm: weights.hnorm,
         dst: scratch.h_norm,
         rows: rows as u32,
-        n: hcw as u32,
+        hc: cfg.hc_mult as u32,
+        n_embd: ne as u32,
+        eps: cfg.rms_eps,
     });
     for row in 0..rows {
         g.push(Op::CopyStrided {
@@ -590,7 +590,6 @@ fn emit_attention_kv(
         cfg,
         rows,
         weights.attn_hc,
-        weights.ones,
         scratch.residual,
         scratch.hidden,
         HcScratch {
@@ -599,6 +598,7 @@ fn emit_attention_kv(
             gate: scratch.hc.gate,
             inject: scratch.hc.inject,
         },
+        None,
     );
     if full {
         g.push(Op::Linear {
@@ -747,21 +747,11 @@ fn emit_full_step(
         out_f: ne as u32,
         w_off: 0,
     });
-    g.push(Op::QwenHcInject {
-        residual: scratch.residual,
-        block: scratch.block,
-        gate: scratch.hc.inject,
-        dst: scratch.alt,
-        rows: 1,
-        hc: cfg.hc_mult as u32,
-        n_embd: ne as u32,
-    });
     emit_hc_mix(
         g,
         cfg,
         1,
         weights.ffn_hc,
-        weights.ones,
         scratch.alt,
         scratch.hidden,
         HcScratch {
@@ -770,6 +760,7 @@ fn emit_full_step(
             gate: scratch.hc.gate,
             inject: scratch.hc.inject,
         },
+        Some((scratch.residual, scratch.block, scratch.hc.inject)),
     );
     g.push(Op::MoeFfn {
         x: scratch.hidden,
@@ -877,6 +868,149 @@ struct CatchHandles {
     weights: Vec<TensorId>,
     embd: TensorId,
     lm_head: TensorId,
+}
+
+#[derive(Clone)]
+struct DeviceCatchHandles {
+    ids: TensorId,
+    target_h: TensorId,
+    previous_h: TensorId,
+    last_h: TensorId,
+    positions: TensorId,
+    positions4: Option<TensorId>,
+    embedding_overrides: Option<TensorId>,
+    k_cache: TensorId,
+    v_cache: TensorId,
+    weights: Vec<TensorId>,
+    embd: TensorId,
+    lm_head: TensorId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DeviceCatchPlanKey {
+    rows: usize,
+    start_pos: usize,
+    kv_capacity: usize,
+    mrope: bool,
+    embedding_overrides: Vec<(usize, usize)>,
+    shared: [(DType, usize); 2],
+}
+
+struct DeviceCatchPlan {
+    key: DeviceCatchPlanKey,
+    plan: Arc<dyn Plan>,
+    handles: DeviceCatchHandles,
+}
+
+const DEVICE_CATCH_PLAN_CACHE: usize = 64;
+
+fn push_bounded<T>(cache: &mut VecDeque<T>, value: T, capacity: usize) {
+    if capacity == 0 {
+        return;
+    }
+    while cache.len() >= capacity {
+        cache.pop_front();
+    }
+    cache.push_back(value);
+}
+
+fn hidden_shift_copy_lengths(rows: usize, h_width: usize) -> (usize, usize) {
+    (h_width, rows.saturating_sub(1) * h_width)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_device_catch_graph(
+    cfg: &crate::Config,
+    specs: &[(DType, usize)],
+    shared: [(DType, usize); 2],
+    kv_capacity: usize,
+    rows: usize,
+    start_pos: usize,
+    embedding_overrides: &[(usize, usize)],
+    mrope: bool,
+) -> (Graph, DeviceCatchHandles) {
+    let mut g = Graph::new();
+    let hcw = cfg.hc_mult * cfg.n_embd;
+    let kvrow = cfg.n_kv * cfg.head_dim;
+    let ids = g.input(TensorDesc::new(vec![rows], DType::I32));
+    let target_h = g.input(TensorDesc::new(vec![rows * hcw], DType::F32));
+    let previous_h = g.input(TensorDesc::new(vec![hcw], DType::F32));
+    let last_h = g.output(TensorDesc::new(vec![hcw], DType::F32));
+    let shifted_h = g.internal(TensorDesc::new(vec![rows * hcw], DType::F32));
+    let positions = g.input(TensorDesc::new(vec![rows], DType::I32));
+    let positions4 = mrope.then(|| g.input(TensorDesc::new(vec![rows, 4], DType::I32)));
+    let override_rows = embedding_overrides
+        .iter()
+        .map(|&(_, range_rows)| range_rows)
+        .sum::<usize>();
+    let embedding_override_input = (override_rows > 0).then(|| {
+        g.input(TensorDesc::new(
+            vec![override_rows * cfg.n_embd],
+            DType::F32,
+        ))
+    });
+    let k_cache = g.input(TensorDesc::new(vec![kv_capacity * kvrow], DType::F16));
+    let v_cache = g.input(TensorDesc::new(vec![kv_capacity * kvrow], DType::F16));
+    let (weights, handles) = declare_weights(&mut g, specs, shared[0], shared[1]);
+    let scratch = step_scratch(&mut g, cfg, rows);
+
+    let (previous_len, shifted_tail_len) = hidden_shift_copy_lengths(rows, hcw);
+    g.push(Op::Copy {
+        src: previous_h,
+        src_off: 0,
+        dst: shifted_h,
+        dst_off: 0,
+        n: previous_len as u32,
+    });
+    if shifted_tail_len != 0 {
+        g.push(Op::Copy {
+            src: target_h,
+            src_off: 0,
+            dst: shifted_h,
+            dst_off: hcw as u32,
+            n: shifted_tail_len as u32,
+        });
+    }
+    emit_bridge(
+        &mut g,
+        cfg,
+        rows,
+        ids,
+        shifted_h,
+        &weights,
+        &scratch,
+        embedding_override_input.map(|input| (input, embedding_overrides)),
+    );
+    emit_attention_kv(
+        &mut g, cfg, rows, start_pos, positions, positions4, k_cache, v_cache, &weights, &scratch,
+        false,
+    );
+    // This runs after the first-row copy above. `previous_h` and `last_h` may therefore bind the
+    // same persistent buffer without overwriting the value consumed by this chunk.
+    g.push(Op::Copy {
+        src: target_h,
+        src_off: ((rows - 1) * hcw) as u32,
+        dst: last_h,
+        dst_off: 0,
+        n: hcw as u32,
+    });
+    (
+        g,
+        DeviceCatchHandles {
+            ids,
+            target_h,
+            previous_h,
+            last_h,
+            positions,
+            positions4,
+            embedding_overrides: embedding_override_input,
+            k_cache,
+            v_cache,
+            weights: handles,
+            embd: weights.embd,
+            lm_head: weights.lm_head,
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1006,7 +1140,6 @@ fn build_draft_graph(
             cfg,
             1,
             weights.head_hc,
-            weights.ones,
             h_next,
             head_hidden,
             HcScratch {
@@ -1015,6 +1148,7 @@ fn build_draft_graph(
                 gate: scratch.hc.gate,
                 inject: scratch.hc.inject,
             },
+            None,
         );
         let logits = g.internal(f32d(cfg.vocab));
         g.push(Op::Linear {
@@ -1057,6 +1191,7 @@ pub(crate) struct Qwen4MtpFixed {
     cfg: crate::Config,
     weights: Vec<Box<dyn Buffer>>,
     specs: Vec<(DType, usize)>,
+    device_catch_plans: Mutex<VecDeque<Arc<DeviceCatchPlan>>>,
 }
 
 struct Qwen4MtpCatchBuffers {
@@ -1125,10 +1260,101 @@ pub(crate) struct Qwen4MtpSession {
     kv_spec: SegmentedKvSpec,
     kv: Mutex<Qwen4MtpKvCache>,
     catch: Arc<Qwen4MtpCatchWorkspace>,
+    prime_last_h: Box<dyn Buffer>,
     draft_id: Box<dyn Buffer>,
     draft_h: Box<dyn Buffer>,
     draft_positions: [Box<dyn Buffer>; DRAFT_TOKENS],
     draft_ids: [Box<dyn Buffer>; DRAFT_TOKENS],
+}
+
+pub(crate) struct Qwen4MtpPrimeCapture {
+    pub(crate) last_h: Vec<f32>,
+    pub(crate) checkpoint_h: [Option<Vec<f32>>; crate::seam::TURN_CHECKPOINT_COUNT],
+}
+
+/// Request-scoped bridge from the trunk's ordinary Prefill path into one detached MTP head.
+/// Only the previous target row persists on device; host readback is limited to the final row and
+/// the two optional conversation checkpoints.
+pub(crate) struct Qwen4MtpPrimeSink<'a> {
+    head: &'a Qwen4MtpSession,
+    initial_h: Vec<f32>,
+    checkpoint_boundaries: [Option<usize>; crate::seam::TURN_CHECKPOINT_COUNT],
+    checkpoint_h: [Option<Vec<f32>>; crate::seam::TURN_CHECKPOINT_COUNT],
+    progress: Option<&'a dyn Fn(usize)>,
+    next_pos: Option<usize>,
+}
+
+impl<'a> Qwen4MtpPrimeSink<'a> {
+    pub(crate) fn new(
+        head: &'a Qwen4MtpSession,
+        initial_h: &[f32],
+        checkpoint_boundaries: [Option<usize>; crate::seam::TURN_CHECKPOINT_COUNT],
+        progress: Option<&'a dyn Fn(usize)>,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            initial_h.len() == head.h_width(),
+            "Qwen3.8 MTP prime starts with {} hidden values, expected {}",
+            initial_h.len(),
+            head.h_width(),
+        );
+        Ok(Self {
+            head,
+            initial_h: initial_h.to_vec(),
+            checkpoint_boundaries,
+            checkpoint_h: std::array::from_fn(|_| None),
+            progress,
+            next_pos: None,
+        })
+    }
+
+    pub(crate) fn finish(self, be: &dyn Backend) -> Result<Qwen4MtpPrimeCapture> {
+        anyhow::ensure!(
+            self.next_pos.is_some(),
+            "Qwen3.8 MTP prime produced no hidden rows"
+        );
+        Ok(Qwen4MtpPrimeCapture {
+            last_h: self.head.device_prime_last_h(be)?,
+            checkpoint_h: self.checkpoint_h,
+        })
+    }
+}
+
+impl crate::seam::MtpPrefillHiddenSink for Qwen4MtpPrimeSink<'_> {
+    fn consume(
+        &mut self,
+        be: &dyn Backend,
+        tokens: &[u32],
+        target_hidden: &dyn Buffer,
+        start_pos: usize,
+        mrope: Option<&crate::seam::MropePlan>,
+        shared: SharedWeights<'_>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !tokens.is_empty(),
+            "Qwen3.8 MTP prime received an empty hidden chunk"
+        );
+        if let Some(next_pos) = self.next_pos {
+            anyhow::ensure!(
+                start_pos == next_pos,
+                "Qwen3.8 MTP hidden chunks are not contiguous: expected {next_pos}, got {start_pos}",
+            );
+        } else {
+            self.head.begin_device_prime(be, &self.initial_h)?;
+        }
+        self.head
+            .catch_up_from_target(be, tokens, target_hidden, start_pos, mrope, shared)?;
+        let end = start_pos + tokens.len();
+        for (index, boundary) in self.checkpoint_boundaries.iter().copied().enumerate() {
+            if boundary == Some(end) {
+                self.checkpoint_h[index] = Some(self.head.device_prime_last_h(be)?);
+            }
+        }
+        if let Some(progress) = self.progress {
+            progress(end);
+        }
+        self.next_pos = Some(end);
+        Ok(())
+    }
 }
 
 pub(crate) fn qwen4_mtp_kv_spec(
@@ -1184,11 +1410,10 @@ impl Qwen4MtpSession {
                 .map_err(|e| anyhow!("{e}"))?;
             Ok((buffer, dtype))
         };
-        Self::load_fixed(vk, bind, sidecar_path, cfg)
+        Self::load_fixed(bind, sidecar_path, cfg)
     }
 
     pub(crate) fn load_fixed(
-        be: &dyn Backend,
         bind: &BindWeightFn,
         sidecar_path: &Path,
         cfg: &crate::Config,
@@ -1196,8 +1421,8 @@ impl Qwen4MtpSession {
         let sidecar = Gguf::open(sidecar_path)
             .with_context(|| format!("open Qwen3.8 MTP sidecar {}", sidecar_path.display()))?;
         let found = Qwen4MtpWeights::load(&sidecar, cfg)?;
-        let mut weights = Vec::with_capacity(29);
-        let mut specs = Vec::with_capacity(29);
+        let mut weights = Vec::with_capacity(28);
+        let mut specs = Vec::with_capacity(28);
         for tensor in found.ordered() {
             let bytes = sidecar
                 .tensor_bytes_arc(&tensor.name)
@@ -1212,19 +1437,11 @@ impl Qwen4MtpSession {
             weights.push(buffer);
             specs.push((dtype, numel));
         }
-        let ones = vec![1.0f32; cfg.n_embd];
-        let ones_buf = be
-            .alloc(ones.len() * 4, BufferUsage::Weights)
-            .map_err(|e| anyhow!("{e}"))?;
-        be.upload(ones_buf.as_ref(), bytemuck::cast_slice(&ones))
-            .map_err(|e| anyhow!("{e}"))?;
-        weights.push(ones_buf);
-        specs.push((DType::F32, ones.len()));
-
         Ok(Arc::new(Qwen4MtpFixed {
             cfg: cfg.clone(),
             weights,
             specs,
+            device_catch_plans: Mutex::new(VecDeque::new()),
         }))
     }
 
@@ -1305,6 +1522,7 @@ impl Qwen4MtpSession {
         };
         let draft_id = alloc(4, BufferUsage::Staging)?;
         let draft_h = alloc(hcw * 4, BufferUsage::Staging)?;
+        let prime_last_h = alloc(hcw * 4, BufferUsage::Activations)?;
         let draft_positions = [
             alloc(4, BufferUsage::Staging)?,
             alloc(4, BufferUsage::Staging)?,
@@ -1349,6 +1567,7 @@ impl Qwen4MtpSession {
                 committed_tokens: 0,
             }),
             catch,
+            prime_last_h,
             draft_id,
             draft_h,
             draft_positions,
@@ -1648,6 +1867,237 @@ impl Qwen4MtpSession {
         Ok(())
     }
 
+    fn begin_device_prime(&self, be: &dyn Backend, previous_h: &[f32]) -> Result<()> {
+        anyhow::ensure!(
+            previous_h.len() == self.h_width(),
+            "Qwen3.8 MTP device prime got {} previous-hidden values, expected {}",
+            previous_h.len(),
+            self.h_width(),
+        );
+        be.upload(self.prime_last_h.as_ref(), bytemuck::cast_slice(previous_h))
+            .map_err(|e| anyhow!("{e}"))
+    }
+
+    fn device_prime_last_h(&self, be: &dyn Backend) -> Result<Vec<f32>> {
+        let mut last_h = vec![0.0f32; self.h_width()];
+        be.download(
+            self.prime_last_h.as_ref(),
+            bytemuck::cast_slice_mut(&mut last_h),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+        Ok(last_h)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn device_catch_plan(
+        &self,
+        be: &dyn Backend,
+        rows: usize,
+        start_pos: usize,
+        embedding_overrides: &[(usize, usize)],
+        mrope: bool,
+        shared: [(DType, usize); 2],
+    ) -> Result<Arc<DeviceCatchPlan>> {
+        let key = DeviceCatchPlanKey {
+            rows,
+            start_pos,
+            kv_capacity: self.kv_capacity,
+            mrope,
+            embedding_overrides: embedding_overrides.to_vec(),
+            shared,
+        };
+        {
+            let plans = self
+                .fixed
+                .device_catch_plans
+                .lock()
+                .map_err(|_| anyhow!("Qwen3.8 MTP device catch plan cache poisoned"))?;
+            if let Some(plan) = plans.iter().find(|plan| plan.key == key) {
+                return Ok(Arc::clone(plan));
+            }
+        }
+
+        let (graph, handles) = build_device_catch_graph(
+            &self.cfg,
+            &self.fixed.specs,
+            shared,
+            self.kv_capacity,
+            rows,
+            start_pos,
+            embedding_overrides,
+            mrope,
+        );
+        let compiled = Arc::new(DeviceCatchPlan {
+            key,
+            plan: Arc::from(be.compile(&graph).map_err(|e| anyhow!("{e}"))?),
+            handles,
+        });
+
+        let mut plans = self
+            .fixed
+            .device_catch_plans
+            .lock()
+            .map_err(|_| anyhow!("Qwen3.8 MTP device catch plan cache poisoned"))?;
+        if let Some(plan) = plans.iter().find(|plan| plan.key == compiled.key) {
+            return Ok(Arc::clone(plan));
+        }
+        push_bounded(&mut plans, Arc::clone(&compiled), DEVICE_CATCH_PLAN_CACHE);
+        Ok(compiled)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn catch_up_from_target(
+        &self,
+        be: &dyn Backend,
+        tokens: &[u32],
+        target_h: &dyn Buffer,
+        start_pos: usize,
+        mrope: Option<&crate::seam::MropePlan>,
+        shared: SharedWeights<'_>,
+    ) -> Result<()> {
+        let rows = tokens.len();
+        anyhow::ensure!(
+            rows > 0,
+            "Qwen3.8 MTP device catch-up needs at least one row"
+        );
+        let hcw = self.h_width();
+        let hidden_bytes = rows
+            .checked_mul(hcw)
+            .and_then(|values| values.checked_mul(4))
+            .ok_or_else(|| anyhow!("Qwen3.8 MTP device hidden byte count overflow"))?;
+        anyhow::ensure!(
+            target_h.len_bytes() >= hidden_bytes,
+            "Qwen3.8 MTP device catch-up needs {hidden_bytes} hidden bytes, buffer has {}",
+            target_h.len_bytes(),
+        );
+        anyhow::ensure!(
+            start_pos + rows <= self.max_ctx,
+            "Qwen3.8 MTP catch-up exceeds {} token cache",
+            self.max_ctx,
+        );
+        if let Some(plan) = mrope {
+            anyhow::ensure!(
+                plan.prompt_pos4.len().is_multiple_of(4),
+                "Qwen3.8 MTP multimodal position table has {} values",
+                plan.prompt_pos4.len(),
+            );
+        }
+
+        let catch = self
+            .catch
+            .buffers
+            .lock()
+            .map_err(|_| anyhow!("Qwen3.8 MTP catch workspace poisoned"))?;
+        anyhow::ensure!(
+            rows <= catch.max_batch,
+            "Qwen3.8 MTP device catch-up batch {rows} exceeds workspace {}",
+            catch.max_batch,
+        );
+        let positions4 = if let Some(plan) = mrope {
+            let prompt_rows = plan.prompt_pos4.len() / 4;
+            (start_pos..start_pos + rows)
+                .map(|position| {
+                    if position < prompt_rows {
+                        Ok(plan.prompt_pos4[position * 4..position * 4 + 4]
+                            .try_into()
+                            .expect("MRoPE row has four positions"))
+                    } else {
+                        let offset = i32::try_from(position - prompt_rows)
+                            .map_err(|_| anyhow!("Qwen3.8 MTP decode position exceeds i32"))?;
+                        let position = plan
+                            .decode_base
+                            .checked_add(offset)
+                            .ok_or_else(|| anyhow!("Qwen3.8 MTP decode position overflow"))?;
+                        Ok([position, position, position, 0])
+                    }
+                })
+                .collect::<Result<Vec<[i32; 4]>>>()?
+        } else {
+            Vec::new()
+        };
+        let positions = if positions4.is_empty() {
+            (start_pos as i32..(start_pos + rows) as i32).collect::<Vec<_>>()
+        } else {
+            positions4.iter().map(|row| row[0]).collect::<Vec<_>>()
+        };
+        let mut override_ranges = Vec::new();
+        let mut override_values = Vec::new();
+        if let Some(plan) = mrope {
+            for (index, span) in plan.spans.iter().enumerate() {
+                let span_end = span.start.checked_add(span.n_tokens).ok_or_else(|| {
+                    anyhow!("Qwen3.8 MTP image span #{index} overflows token indices")
+                })?;
+                anyhow::ensure!(
+                    span.embeds.len() == span.n_tokens * self.cfg.n_embd,
+                    "Qwen3.8 MTP image span #{index} has {} embedding values, expected {}",
+                    span.embeds.len(),
+                    span.n_tokens * self.cfg.n_embd,
+                );
+                let lo = span.start.max(start_pos);
+                let hi = span_end.min(start_pos + rows);
+                if lo >= hi {
+                    continue;
+                }
+                let source_start = (lo - span.start) * self.cfg.n_embd;
+                let source_end = (hi - span.start) * self.cfg.n_embd;
+                override_ranges.push((lo - start_pos, hi - lo));
+                override_values.extend_from_slice(&span.embeds[source_start..source_end]);
+            }
+        }
+        let ids = tokens.iter().map(|&token| token as i32).collect::<Vec<_>>();
+        be.upload(catch.ids.as_ref(), bytemuck::cast_slice(&ids))
+            .map_err(|e| anyhow!("{e}"))?;
+        be.upload(catch.positions.as_ref(), bytemuck::cast_slice(&positions))
+            .map_err(|e| anyhow!("{e}"))?;
+        if mrope.is_some() {
+            be.upload(catch.positions4.as_ref(), bytemuck::cast_slice(&positions4))
+                .map_err(|e| anyhow!("{e}"))?;
+        }
+        if !override_values.is_empty() {
+            be.upload(
+                catch.embedding_overrides.as_ref(),
+                bytemuck::cast_slice(&override_values),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+        }
+
+        let kv = self.kv_for_depth(be, start_pos + rows)?;
+        let specs = [(shared.0 .1, shared.0 .2), (shared.1 .1, shared.1 .2)];
+        let plan = self.device_catch_plan(
+            be,
+            rows,
+            start_pos,
+            &override_ranges,
+            mrope.is_some(),
+            specs,
+        )?;
+        let handles = &plan.handles;
+        let mut bindings = Bindings::new();
+        bindings.bind(handles.ids, catch.ids.as_ref());
+        bindings.bind(handles.target_h, target_h);
+        bindings.bind(handles.previous_h, self.prime_last_h.as_ref());
+        bindings.bind(handles.last_h, self.prime_last_h.as_ref());
+        bindings.bind(handles.positions, catch.positions.as_ref());
+        if let Some(id) = handles.positions4 {
+            bindings.bind(id, catch.positions4.as_ref());
+        }
+        if let Some(id) = handles.embedding_overrides {
+            bindings.bind(id, catch.embedding_overrides.as_ref());
+        }
+        bindings.bind(handles.k_cache, kv.k.as_ref());
+        bindings.bind(handles.v_cache, kv.v.as_ref());
+        self.bind_common(
+            &mut bindings,
+            &handles.weights,
+            handles.embd,
+            handles.lm_head,
+            shared.0 .0,
+            shared.1 .0,
+        );
+        be.execute(plan.plan.as_ref(), &bindings)
+            .map_err(|e| anyhow!("{e}"))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn draft(
         &self,
@@ -1804,69 +2254,29 @@ impl Qwen4MtpRuntime {
         let p = prompt_tokens.len();
         let mut reasoning_eos_guard =
             crate::sampling::Qwen4ReasoningEosGuard::from_prompt(cfg, &prompt_tokens);
-        let prime_chunk = crate::seam::ubatch_rows(ec).max(1);
-        let mut pending_token = None;
-        let mut pending_logits = Vec::new();
-        // MTP row i consumes target hidden row i-1. Stream prompt-prime hidden rows through the
-        // detached head one ubatch at a time instead of materializing two full-context arrays.
-        // At 200k context the old `prime_h` plus `shifted_h` pair occupied about 15 GiB on the
-        // host, and its single 7.6 GiB GPU readback could not fit any frozen arena shard.
-        let mut previous_h = vec![0.0f32; h_width];
-        for chunk_start in (0..p).step_by(prime_chunk) {
-            if crate::sampling::abort_requested(req) {
-                bail!("aborted: shutdown requested");
-            }
-            let chunk_end = (chunk_start + prime_chunk).min(p);
-            let rows = chunk_end - chunk_start;
-            let finish = if chunk_start == 0 {
-                finish_fixed_allocations.as_deref()
-            } else {
-                None
-            };
-            let (frontier, frontier_logits, chunk_h) = super::run_qwen4_prime_frontier_with_finish(
-                vk,
-                &*target_bind,
-                model.gguf(),
-                cfg,
-                ec,
-                model.embd(),
-                &prompt_tokens[..chunk_end],
-                &mut self.trunk,
-                self.max_ctx,
-                None,
-                finish,
-            )?;
-            anyhow::ensure!(
-                chunk_h.len() == rows * h_width,
-                "Qwen3.8 MTP prime returned {} hidden values for {rows} rows",
-                chunk_h.len()
-            );
-
-            let mut shifted_h = vec![0.0f32; rows * h_width];
-            shifted_h[..h_width].copy_from_slice(&previous_h);
-            if rows > 1 {
-                shifted_h[h_width..].copy_from_slice(&chunk_h[..(rows - 1) * h_width]);
-            }
-            {
-                let shared = self
-                    .trunk
-                    .as_ref()
-                    .expect("target prime initialized a trunk")
-                    .mtp_shared_weights();
-                self.head.catch_up(
-                    vk,
-                    &prompt_tokens[chunk_start..chunk_end],
-                    &shifted_h,
-                    chunk_start,
-                    None,
-                    shared,
-                )?;
-            }
-            previous_h.copy_from_slice(&chunk_h[(rows - 1) * h_width..]);
-            pending_token = Some(frontier);
-            pending_logits = frontier_logits;
-        }
-        let mut pending_token = pending_token.expect("non-empty prompt has a frontier token");
+        let initial_h = vec![0.0f32; h_width];
+        let mut prime_sink = Qwen4MtpPrimeSink::new(
+            &self.head,
+            &initial_h,
+            [None; crate::seam::TURN_CHECKPOINT_COUNT],
+            None,
+        )?;
+        let (mut pending_token, mut pending_logits) = super::run_qwen4_prime_frontier_with_finish(
+            vk,
+            &*target_bind,
+            model.gguf(),
+            cfg,
+            ec,
+            model.embd(),
+            &prompt_tokens,
+            &mut self.trunk,
+            self.max_ctx,
+            None,
+            finish_fixed_allocations.as_deref(),
+            &mut prime_sink,
+            None,
+        )?;
+        let prime_capture = prime_sink.finish(vk)?;
         if reasoning_eos_guard.blocks(cfg, pending_token, ec.sampling.ignore_eos) {
             anyhow::ensure!(
                 pending_logits.len() == cfg.vocab,
@@ -1893,7 +2303,7 @@ impl Qwen4MtpRuntime {
         // Keep the target's already-known next token one row ahead of the committed trunk state.
         // The next VERIFY consumes it as row zero, so every batch commits at least one token and
         // rejection never needs a separate correction forward or MTP-head catch-up.
-        let mut pending_h = previous_h;
+        let mut pending_h = prime_capture.last_h;
         let mut acc = Vec::new();
         let mut printed = 0usize;
         let mut generated = 0usize;
@@ -2083,7 +2493,11 @@ impl Qwen4MtpRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::{generation_budget, mtp_kv_spec};
+    use super::{
+        generation_budget, hidden_shift_copy_lengths, mtp_kv_spec, push_bounded, DeviceCatchPlanKey,
+    };
+    use infr_core::tensor::DType;
+    use std::collections::VecDeque;
 
     #[test]
     fn generation_budget_clips_a_large_reply_to_the_remaining_context() {
@@ -2110,5 +2524,45 @@ mod tests {
         assert_eq!(spec.segment_bytes, 32 * 1024 * 512 * 2);
         assert_eq!(spec.segment_elements, 32 * 1024 * 512);
         assert_eq!(spec.max_segments, 1);
+    }
+
+    #[test]
+    fn device_prime_shift_handles_single_and_multirow_chunks() {
+        assert_eq!(hidden_shift_copy_lengths(1, 10_240), (10_240, 0));
+        assert_eq!(hidden_shift_copy_lengths(4, 10_240), (10_240, 3 * 10_240));
+    }
+
+    #[test]
+    fn device_catch_plan_key_separates_graph_shapes_and_positions() {
+        let base = DeviceCatchPlanKey {
+            rows: 2_048,
+            start_pos: 32_768,
+            kv_capacity: 65_536,
+            mrope: false,
+            embedding_overrides: Vec::new(),
+            shared: [(DType::F16, 2_560), (DType::Q8_0, 2_560)],
+        };
+        let mut changed = base.clone();
+        changed.rows = 1;
+        assert_ne!(base, changed);
+        let mut changed = base.clone();
+        changed.start_pos += 2_048;
+        assert_ne!(base, changed);
+        let mut changed = base.clone();
+        changed.mrope = true;
+        changed.embedding_overrides = vec![(5, 32)];
+        assert_ne!(base, changed);
+        let mut changed = base.clone();
+        changed.shared[1].0 = DType::F16;
+        assert_ne!(base, changed);
+    }
+
+    #[test]
+    fn bounded_plan_cache_evicts_the_oldest_entry() {
+        let mut cache = VecDeque::from([1, 2, 3]);
+        push_bounded(&mut cache, 4, 3);
+        assert_eq!(cache, VecDeque::from([2, 3, 4]));
+        push_bounded(&mut cache, 5, 0);
+        assert_eq!(cache, VecDeque::from([2, 3, 4]));
     }
 }

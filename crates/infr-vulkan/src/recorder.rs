@@ -4628,6 +4628,74 @@ impl<'a> Recorder<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn qwen_hc_norm(
+        &self,
+        x: &dyn Buffer,
+        norm: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: u32,
+        hc: u32,
+        n_embd: u32,
+        eps: f32,
+    ) {
+        let kernel = self
+            .be
+            .kernel_sg("qwen_hc_norm", crate::gemm::qwen_hc_norm_spv(), 3, 12, 32);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&hc.to_ne_bytes());
+        push[4..8].copy_from_slice(&n_embd.to_ne_bytes());
+        push[8..12].copy_from_slice(&eps.to_ne_bytes());
+        self.dispatch(
+            kernel,
+            &[Self::vkb(x), Self::vkb(norm), Self::vkb(dst)],
+            1,
+            &push,
+            rows * hc,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen_hc_inject_norm(
+        &self,
+        residual: &dyn Buffer,
+        block: &dyn Buffer,
+        gate: &dyn Buffer,
+        norm: &dyn Buffer,
+        residual_dst: &dyn Buffer,
+        normed_dst: &dyn Buffer,
+        rows: u32,
+        hc: u32,
+        n_embd: u32,
+        eps: f32,
+    ) {
+        let kernel = self.be.kernel_sg(
+            "qwen_hc_inject_norm",
+            crate::gemm::qwen_hc_inject_norm_spv(),
+            6,
+            12,
+            32,
+        );
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&hc.to_ne_bytes());
+        push[4..8].copy_from_slice(&n_embd.to_ne_bytes());
+        push[8..12].copy_from_slice(&eps.to_ne_bytes());
+        self.dispatch(
+            kernel,
+            &[
+                Self::vkb(residual),
+                Self::vkb(block),
+                Self::vkb(gate),
+                Self::vkb(norm),
+                Self::vkb(residual_dst),
+                Self::vkb(normed_dst),
+            ],
+            1,
+            &push,
+            rows * hc,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn qwen_ple_gate(
         &self,
         key: &dyn Buffer,
@@ -9163,6 +9231,68 @@ impl<'a> Recorder<'a> {
             1,
             &push,
             total_pairs.div_ceil(256),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn qsa_prepare_off(
+        &self,
+        qk: &dyn Buffer,
+        norm: &dyn Buffer,
+        positions: &dyn Buffer,
+        raw_cache: &dyn Buffer,
+        query: &dyn Buffer,
+        rows: u32,
+        n_head: u32,
+        head_dim: u32,
+        rope_dim: u32,
+        theta: f32,
+        eps: f32,
+        pos: u32,
+        cap_rows: u32,
+        segment_shift: Option<u32>,
+        mrope_sections: Option<[u32; 4]>,
+        qk_byte_off: usize,
+        positions_byte_off: usize,
+        query_byte_off: usize,
+    ) {
+        let (name, spv) = match (segment_shift, mrope_sections) {
+            (Some(_), Some(_)) => (
+                "qsa_prepare_mrope_seg",
+                crate::gemm::qsa_prepare_mrope_seg_spv(),
+            ),
+            (None, Some(_)) => ("qsa_prepare_mrope", crate::gemm::qsa_prepare_mrope_spv()),
+            (Some(_), None) => ("qsa_prepare_seg", crate::gemm::qsa_prepare_seg_spv()),
+            (None, None) => ("qsa_prepare", crate::gemm::qsa_prepare_spv()),
+        };
+        let kernel = self.be.kernel(name, spv, 5, 52);
+        let mut push = [0u8; 52];
+        push[0..4].copy_from_slice(&rows.to_ne_bytes());
+        push[4..8].copy_from_slice(&n_head.to_ne_bytes());
+        push[8..12].copy_from_slice(&head_dim.to_ne_bytes());
+        push[12..16].copy_from_slice(&rope_dim.to_ne_bytes());
+        push[16..20].copy_from_slice(&theta.to_ne_bytes());
+        push[20..24].copy_from_slice(&eps.to_ne_bytes());
+        push[24..28].copy_from_slice(&pos.to_ne_bytes());
+        push[28..32].copy_from_slice(&cap_rows.to_ne_bytes());
+        push[32..36].copy_from_slice(&segment_shift.unwrap_or(0).to_ne_bytes());
+        if let Some(sections) = mrope_sections {
+            for (i, section) in sections.into_iter().enumerate() {
+                push[36 + i * 4..40 + i * 4].copy_from_slice(&section.to_ne_bytes());
+            }
+        }
+        self.dispatch_wide(
+            kernel,
+            &[
+                Self::vkb_byte_off(qk, qk_byte_off),
+                Self::vkb(norm),
+                Self::vkb_byte_off(positions, positions_byte_off),
+                Self::vkb(raw_cache),
+                Self::vkb_byte_off(query, query_byte_off),
+            ],
+            1,
+            &push,
+            rows * n_head,
         );
     }
 

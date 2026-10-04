@@ -834,6 +834,7 @@ impl Backend for CpuBackend {
             // must be rebuilt per token — no record-once replay.
             decode_replay: false,
             combined_gu: false,
+            qsa_prepare: false,
             embed_gather: true,
             gpu_sample: true,
             sample_rows: true,
@@ -2031,6 +2032,116 @@ impl Backend for CpuBackend {
                         }
                     }
                 }
+                Op::QsaPrepare {
+                    qk,
+                    q_norm,
+                    positions,
+                    positions4,
+                    k_cache,
+                    q_dst,
+                    rows,
+                    n_head,
+                    head_dim,
+                    rope_dim,
+                    theta,
+                    eps,
+                    sections,
+                    pos,
+                } => {
+                    let (rows, nh, hd, rd, pos) = (
+                        rows as usize,
+                        n_head as usize,
+                        head_dim as usize,
+                        rope_dim as usize,
+                        pos as usize,
+                    );
+                    let q_width = nh * hd;
+                    let stride = q_width + hd;
+                    let src = &vals[qk.0 as usize];
+                    let norm = weight(q_norm);
+
+                    let cache_buf = bindings
+                        .get(k_cache)
+                        .expect("cpu backend: unbound QSA raw-key cache");
+                    let mut cache = cpu_buf(cache_buf).owned();
+                    let cap_rows = g.desc(k_cache).numel() / hd.max(1);
+                    for row in 0..rows {
+                        let dst_row = if cap_rows > 0 {
+                            (pos + row) % cap_rows
+                        } else {
+                            pos + row
+                        };
+                        let key = &src[row * stride + q_width..row * stride + stride];
+                        let base = dst_row * hd;
+                        match g.desc(k_cache).dtype {
+                            DType::F16 => {
+                                let dst: &mut [u16] = bytemuck::cast_slice_mut(&mut cache);
+                                for i in 0..hd {
+                                    dst[base + i] = half::f16::from_f32(key[i]).to_bits();
+                                }
+                            }
+                            DType::F32 => {
+                                let dst: &mut [f32] = bytemuck::cast_slice_mut(&mut cache);
+                                dst[base..base + hd].copy_from_slice(key);
+                            }
+                            dt => panic!("cpu QsaPrepare raw-key cache dtype {dt:?} unsupported"),
+                        }
+                    }
+
+                    let linear_positions = &vals[positions.0 as usize];
+                    let multimodal_positions = positions4.map(|id| vals[id.0 as usize].as_slice());
+                    let half = rd / 2;
+                    let section_widths = sections.map(|v| v as usize);
+                    let section_total: usize = section_widths.iter().sum();
+                    let plane_for = |pair: usize| {
+                        let sector = pair % section_total;
+                        if sector % 3 == 1 && sector < 3 * section_widths[1] {
+                            1
+                        } else if sector % 3 == 2 && sector < 3 * section_widths[2] {
+                            2
+                        } else if sector.is_multiple_of(3) && sector < 3 * section_widths[0] {
+                            0
+                        } else {
+                            3
+                        }
+                    };
+                    assert!(rd <= hd && rd.is_multiple_of(2));
+                    assert!(multimodal_positions.is_none() || section_total > 0);
+
+                    let mut out = vec![0.0; rows * q_width];
+                    self.pool()
+                        .for_chunks_mut(&mut out, q_width, 1, &|row, out_row| {
+                            let q_row = &src[row * stride..row * stride + q_width];
+                            let angles = (0..half)
+                                .map(|pair| {
+                                    let p = multimodal_positions
+                                        .map_or(linear_positions[row], |p4| {
+                                            p4[row * 4 + plane_for(pair)]
+                                        });
+                                    let angle = p * theta.powf(-2.0 * pair as f32 / rd as f32);
+                                    angle.sin_cos()
+                                })
+                                .collect::<Vec<_>>();
+                            for head in 0..nh {
+                                let base = head * hd;
+                                let mean_sq = (0..hd)
+                                    .map(|i| q_row[base + i] * q_row[base + i])
+                                    .sum::<f32>()
+                                    / hd as f32;
+                                let scale = 1.0 / (mean_sq + eps).sqrt();
+                                for i in 0..hd {
+                                    out_row[base + i] = q_row[base + i] * scale * norm[i];
+                                }
+                                for (pair, &(sin, cos)) in angles.iter().enumerate() {
+                                    let (i0, i1) = (base + pair, base + pair + half);
+                                    let (a, b) = (out_row[i0], out_row[i1]);
+                                    out_row[i0] = a * cos - b * sin;
+                                    out_row[i1] = a * sin + b * cos;
+                                }
+                            }
+                        });
+                    vals[q_dst.0 as usize] = out;
+                }
                 Op::Dsv4Compress {
                     values,
                     scores,
@@ -2902,6 +3013,33 @@ impl Backend for CpuBackend {
                     });
                     vals[dst.0 as usize] = out;
                 }
+                Op::QwenHcNorm {
+                    x,
+                    norm,
+                    dst,
+                    rows,
+                    hc,
+                    n_embd,
+                    eps,
+                } => {
+                    let (rr, hc, ne) = (rows as usize, hc as usize, n_embd as usize);
+                    let xs = &vals[x.0 as usize];
+                    let ns = weight(norm);
+                    let mut out = vec![0.0f32; rr * hc * ne];
+                    for rh in 0..rr * hc {
+                        let base = rh * ne;
+                        let sum_sq = xs[base..base + ne]
+                            .iter()
+                            .map(|value| value * value)
+                            .sum::<f32>();
+                        let scale = (sum_sq / ne as f32 + eps).sqrt().recip();
+                        let norm_base = (rh % hc) * ne;
+                        for d in 0..ne {
+                            out[base + d] = xs[base + d] * scale * ns[norm_base + d];
+                        }
+                    }
+                    vals[dst.0 as usize] = out;
+                }
                 Op::QwenHcInject {
                     residual,
                     block,
@@ -2926,6 +3064,44 @@ impl Backend for CpuBackend {
                         }
                     });
                     vals[dst.0 as usize] = out;
+                }
+                Op::QwenHcInjectNorm {
+                    residual,
+                    block,
+                    gate,
+                    norm,
+                    residual_dst,
+                    normed_dst,
+                    rows,
+                    hc,
+                    n_embd,
+                    eps,
+                } => {
+                    let (rr, hc, ne) = (rows as usize, hc as usize, n_embd as usize);
+                    let rs = &vals[residual.0 as usize];
+                    let bs = &vals[block.0 as usize];
+                    let gs = &vals[gate.0 as usize];
+                    let ns = weight(norm);
+                    let mut injected = vec![0.0f32; rr * hc * ne];
+                    let mut normed = vec![0.0f32; rr * hc * ne];
+                    for r in 0..rr {
+                        for h in 0..hc {
+                            let base = (r * hc + h) * ne;
+                            let scale = 2.0 / (1.0 + (-(gs[r * hc + h] / hc as f32)).exp());
+                            let mut sum_sq = 0.0f32;
+                            for d in 0..ne {
+                                let value = rs[base + d] + bs[r * ne + d] * scale;
+                                injected[base + d] = value;
+                                sum_sq += value * value;
+                            }
+                            let rms = (sum_sq / ne as f32 + eps).sqrt().recip();
+                            for d in 0..ne {
+                                normed[base + d] = injected[base + d] * rms * ns[h * ne + d];
+                            }
+                        }
+                    }
+                    vals[residual_dst.0 as usize] = injected;
+                    vals[normed_dst.0 as usize] = normed;
                 }
                 Op::QwenPleGate {
                     key,
@@ -4853,6 +5029,191 @@ mod tests {
             .map(|(x, y)| (x - y).abs())
             .fold(0.0f32, f32::max);
         assert!(max_error < 1e-6, "text-plane collapse error {max_error}");
+    }
+
+    fn qsa_prepare_matches_split_path(mrope: bool) {
+        let backend = CpuBackend::new();
+        let (rows, n_head, head_dim, cap_rows, start_pos) =
+            (3usize, 2usize, 8usize, 4usize, 3usize);
+        let q_width = n_head * head_dim;
+        let q = (0..rows * q_width)
+            .map(|i| ((i * 17 % 41) as f32 - 20.0) / 13.0)
+            .collect::<Vec<_>>();
+        let key = (0..rows * head_dim)
+            .map(|i| ((i * 11 % 29) as f32 - 14.0) / 9.0)
+            .collect::<Vec<_>>();
+        let mut qk = Vec::with_capacity(rows * (q_width + head_dim));
+        for row in 0..rows {
+            qk.extend_from_slice(&q[row * q_width..(row + 1) * q_width]);
+            qk.extend_from_slice(&key[row * head_dim..(row + 1) * head_dim]);
+        }
+        let norm = (0..head_dim)
+            .map(|i| 0.75 + i as f32 * 0.07)
+            .collect::<Vec<_>>();
+        let positions = [11i32, 12, 13];
+        let positions4 = [11i32, 11, 11, 0, 12, 4, 5, 6, 13, 8, 9, 10];
+        let sections = [2, 1, 1, 0];
+
+        let mut graph = Graph::new();
+        let qi = graph.input(TensorDesc::new(vec![rows, q_width], DType::F32));
+        let ki = graph.input(TensorDesc::new(vec![rows, head_dim], DType::F32));
+        let qki = graph.input(TensorDesc::new(vec![rows, q_width + head_dim], DType::F32));
+        let nw = graph.weight(TensorDesc::new(vec![head_dim], DType::F32));
+        let pi = graph.input(TensorDesc::new(vec![rows], DType::I32));
+        let p4i = graph.input(TensorDesc::new(vec![rows, 4], DType::I32));
+        let split_cache = graph.input(TensorDesc::new(vec![cap_rows, head_dim], DType::F16));
+        let fused_cache = graph.input(TensorDesc::new(vec![cap_rows, head_dim], DType::F16));
+        let split_q = graph.output(TensorDesc::new(vec![rows, q_width], DType::F32));
+        let fused_q = graph.output(TensorDesc::new(vec![rows, q_width], DType::F32));
+        graph.push(Op::WriteKv {
+            src: ki,
+            cache: split_cache,
+            rows: rows as u32,
+            row_stride: head_dim as u32,
+            pos: start_pos as u32,
+        });
+        if mrope {
+            graph.push(Op::QkNormMrope {
+                x: qi,
+                weight: nw,
+                positions4: p4i,
+                dst: split_q,
+                rows: rows as u32,
+                n_head: n_head as u32,
+                head_dim: head_dim as u32,
+                rope_dim: head_dim as u32,
+                theta: 10_000.0,
+                eps: 1e-6,
+                sections,
+                x_stride: 0,
+            });
+        } else {
+            graph.push(Op::QkNormRope {
+                x: qi,
+                weight: nw,
+                positions: pi,
+                dst: split_q,
+                rows: rows as u32,
+                n_head: n_head as u32,
+                head_dim: head_dim as u32,
+                rope_dim: head_dim as u32,
+                theta: 10_000.0,
+                eps: 1e-6,
+                freq_factors: None,
+                x_stride: 0,
+            });
+        }
+        graph.push(Op::QsaPrepare {
+            qk: qki,
+            q_norm: nw,
+            positions: pi,
+            positions4: mrope.then_some(p4i),
+            k_cache: fused_cache,
+            q_dst: fused_q,
+            rows: rows as u32,
+            n_head: n_head as u32,
+            head_dim: head_dim as u32,
+            rope_dim: head_dim as u32,
+            theta: 10_000.0,
+            eps: 1e-6,
+            sections,
+            pos: start_pos as u32,
+        });
+
+        let plan = backend
+            .compile(&graph)
+            .expect("compile QSA prepare parity graph");
+        let alloc = |bytes, usage| backend.alloc(bytes, usage).expect("allocate test buffer");
+        let qb = alloc(q.len() * 4, BufferUsage::Activations);
+        let kb = alloc(key.len() * 4, BufferUsage::Activations);
+        let qkb = alloc(qk.len() * 4, BufferUsage::Activations);
+        let nb = alloc(norm.len() * 4, BufferUsage::Weights);
+        let pb = alloc(positions.len() * 4, BufferUsage::Activations);
+        let p4b = alloc(positions4.len() * 4, BufferUsage::Activations);
+        let cache_bytes = cap_rows * head_dim * 2;
+        let split_cb = alloc(cache_bytes, BufferUsage::KvCache);
+        let fused_cb = alloc(cache_bytes, BufferUsage::KvCache);
+        let split_ob = alloc(rows * q_width * 4, BufferUsage::Readback);
+        let fused_ob = alloc(rows * q_width * 4, BufferUsage::Readback);
+        backend
+            .upload(qb.as_ref(), bytemuck::cast_slice(&q))
+            .unwrap();
+        backend
+            .upload(kb.as_ref(), bytemuck::cast_slice(&key))
+            .unwrap();
+        backend
+            .upload(qkb.as_ref(), bytemuck::cast_slice(&qk))
+            .unwrap();
+        backend
+            .upload(nb.as_ref(), bytemuck::cast_slice(&norm))
+            .unwrap();
+        backend
+            .upload(pb.as_ref(), bytemuck::cast_slice(&positions))
+            .unwrap();
+        backend
+            .upload(p4b.as_ref(), bytemuck::cast_slice(&positions4))
+            .unwrap();
+        let initial_cache = (0..cap_rows * head_dim)
+            .map(|i| half::f16::from_f32(-10.0 - i as f32 * 0.01).to_bits())
+            .collect::<Vec<_>>();
+        backend
+            .upload(split_cb.as_ref(), bytemuck::cast_slice(&initial_cache))
+            .unwrap();
+        backend
+            .upload(fused_cb.as_ref(), bytemuck::cast_slice(&initial_cache))
+            .unwrap();
+        let mut bindings = Bindings::new();
+        bindings
+            .bind(qi, qb.as_ref())
+            .bind(ki, kb.as_ref())
+            .bind(qki, qkb.as_ref())
+            .bind(nw, nb.as_ref())
+            .bind(pi, pb.as_ref())
+            .bind(p4i, p4b.as_ref())
+            .bind(split_cache, split_cb.as_ref())
+            .bind(fused_cache, fused_cb.as_ref())
+            .bind(split_q, split_ob.as_ref())
+            .bind(fused_q, fused_ob.as_ref());
+        backend
+            .execute(plan.as_ref(), &bindings)
+            .expect("execute QSA prepare parity graph");
+
+        let mut split = vec![0.0f32; rows * q_width];
+        let mut fused = vec![0.0f32; rows * q_width];
+        backend
+            .download(split_ob.as_ref(), bytemuck::cast_slice_mut(&mut split))
+            .unwrap();
+        backend
+            .download(fused_ob.as_ref(), bytemuck::cast_slice_mut(&mut fused))
+            .unwrap();
+        let max_error = split
+            .iter()
+            .zip(&fused)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_error < 1e-6,
+            "QSA prepare query mismatch: {max_error:e}"
+        );
+
+        let mut split_cache_bytes = vec![0u8; cache_bytes];
+        let mut fused_cache_bytes = vec![0u8; cache_bytes];
+        backend
+            .download(split_cb.as_ref(), &mut split_cache_bytes)
+            .unwrap();
+        backend
+            .download(fused_cb.as_ref(), &mut fused_cache_bytes)
+            .unwrap();
+        assert_eq!(
+            split_cache_bytes, fused_cache_bytes,
+            "QSA raw-key ring mismatch"
+        );
+    }
+
+    #[test]
+    fn qsa_prepare_matches_split_text_and_mrope_across_ring_wrap() {
+        qsa_prepare_matches_split_path(false);
+        qsa_prepare_matches_split_path(true);
     }
 
     #[test]

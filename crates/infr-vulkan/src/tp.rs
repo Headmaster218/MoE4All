@@ -688,6 +688,7 @@ impl Backend for TensorParallelBackend {
         c.argmax_rows = false;
         c.argmax_prob = false;
         c.combined_gu = false;
+        c.qsa_prepare = false;
         c.gated_rmsnorm = false;
         // The lowering rewrites the graph per rank and gathers the sharded results, so a caller
         // cannot count on its own `Input` buffer holding what the ops wrote.

@@ -132,6 +132,7 @@ fn default_config_matches_documented_defaults() {
     assert_eq!(d.kernels.vulkan.mmv_mw, None);
     assert_eq!(d.kernels.vulkan.flash_min_rows, 24);
     assert_eq!(d.kernels.vulkan.moe_small_m, 8);
+    assert!(!d.kernels.vulkan.qsa_prepare_fused);
     assert_eq!(d.kernels.vulkan.canvas_chunk_n, 3);
     assert!(
         d.kernels.vulkan.delta_strided,
@@ -173,7 +174,8 @@ fn default_config_matches_documented_defaults() {
     assert!(d.spec.mtp_ple_overlap);
     assert_eq!(d.spec.k, 6);
     assert_eq!(d.spec.mtp_context, 32 * 1024);
-    assert!(d.spec.mtp_concurrent);
+    assert_eq!(d.spec.mtp_max_context, 48 * 1024);
+    assert!(!d.spec.mtp_concurrent);
     assert_eq!(d.spec.decode_chain, 8);
 }
 

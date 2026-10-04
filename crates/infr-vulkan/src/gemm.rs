@@ -2683,6 +2683,16 @@ pub(crate) fn qwen_hc_mix_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/qwen_hc_mix.spv"))))
 }
+/// SPIR-V for Qwen3.8 grouped residual-stream normalization.
+pub(crate) fn qwen_hc_norm_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/qwen_hc_norm.spv"
+        )))
+    })
+}
 /// SPIR-V for Qwen3.8's per-stream block injection.
 pub(crate) fn qwen_hc_inject_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
@@ -2690,6 +2700,16 @@ pub(crate) fn qwen_hc_inject_spv() -> &'static [u32] {
         spv_words(include_bytes!(concat!(
             env!("OUT_DIR"),
             "/qwen_hc_inject.spv"
+        )))
+    })
+}
+/// SPIR-V for fused Qwen3.8 residual injection and grouped normalization.
+pub(crate) fn qwen_hc_inject_norm_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/qwen_hc_inject_norm.spv"
         )))
     })
 }
@@ -3392,6 +3412,10 @@ macro_rules! qsa_spv {
         }
     };
 }
+qsa_spv!(qsa_prepare_spv, "qsa_prepare");
+qsa_spv!(qsa_prepare_mrope_spv, "qsa_prepare_mrope");
+qsa_spv!(qsa_prepare_seg_spv, "qsa_prepare_seg");
+qsa_spv!(qsa_prepare_mrope_seg_spv, "qsa_prepare_mrope_seg");
 qsa_spv!(qsa_indexer_topk_hist_spv, "qsa_indexer_topk_hist");
 qsa_spv!(qsa_indexer_topk_select_spv, "qsa_indexer_topk_select");
 qsa_spv!(qsa_indexer_topk_collect_spv, "qsa_indexer_topk_collect");

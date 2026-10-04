@@ -231,6 +231,7 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
             | Op::Dsv4CacheWrite { .. }
             | Op::Dsv4Indexer { .. }
             | Op::Dsv4Gather { .. }
+            | Op::QsaPrepare { .. }
             | Op::QsaIndexer { .. }
             | Op::QsaGather { .. }
             | Op::QsaBatchAttention { .. }
@@ -3203,6 +3204,15 @@ fn lower_op(
             hc,
             n_embd,
         } => rec.qwen_hc_mix(r(*x)?, r(*gate)?, r(*dst)?, *rows, *hc, *n_embd),
+        Op::QwenHcNorm {
+            x,
+            norm,
+            dst,
+            rows,
+            hc,
+            n_embd,
+            eps,
+        } => rec.qwen_hc_norm(r(*x)?, r(*norm)?, r(*dst)?, *rows, *hc, *n_embd, *eps),
         Op::QwenHcInject {
             residual,
             block,
@@ -3219,6 +3229,29 @@ fn lower_op(
             *rows,
             *hc,
             *n_embd,
+        ),
+        Op::QwenHcInjectNorm {
+            residual,
+            block,
+            gate,
+            norm,
+            residual_dst,
+            normed_dst,
+            rows,
+            hc,
+            n_embd,
+            eps,
+        } => rec.qwen_hc_inject_norm(
+            r(*residual)?,
+            r(*block)?,
+            r(*gate)?,
+            r(*norm)?,
+            r(*residual_dst)?,
+            r(*normed_dst)?,
+            *rows,
+            *hc,
+            *n_embd,
+            *eps,
         ),
         Op::QwenPleGate {
             key,
@@ -3786,6 +3819,111 @@ fn lower_op(
                 *head_dim,
                 *raw_window,
                 indices.is_some(),
+            );
+        }
+        Op::QsaPrepare {
+            qk,
+            q_norm,
+            positions,
+            positions4,
+            k_cache,
+            q_dst,
+            rows,
+            n_head,
+            head_dim,
+            rope_dim,
+            theta,
+            eps,
+            sections,
+            pos,
+        } => {
+            let q_width = *n_head as usize * *head_dim as usize;
+            let qk_stride = q_width + *head_dim as usize;
+            let cap_rows = graph.desc(*k_cache).numel() / (*head_dim as usize).max(1);
+            if *rows == 0
+                || *n_head == 0
+                || *n_head > 4
+                || *head_dim != 128
+                || *rope_dim == 0
+                || *rope_dim > *head_dim
+                || !rope_dim.is_multiple_of(2)
+                || cap_rows == 0
+                || graph.desc(*qk).dtype != infr_core::DType::F32
+                || graph.desc(*q_norm).dtype != infr_core::DType::F32
+                || graph.desc(*positions).dtype != infr_core::DType::I32
+                || graph.desc(*k_cache).dtype != infr_core::DType::F16
+                || graph.desc(*q_dst).dtype != infr_core::DType::F16
+                || graph.desc(*qk).numel() < *rows as usize * qk_stride
+                || graph.desc(*q_dst).numel() < *rows as usize * q_width
+                || positions4.is_some_and(|id| {
+                    graph.desc(id).dtype != infr_core::DType::I32
+                        || sections.iter().sum::<u32>() == 0
+                })
+            {
+                return Err(be(format!(
+                    "vulkan Op::QsaPrepare requires f32 qk/norm, f16 raw cache/query, I32 positions, \
+                     head_dim=128, 1..=4 heads and nonzero even rope_dim; got rows={rows} \
+                     n_head={n_head} head_dim={head_dim} rope_dim={rope_dim} cap_rows={cap_rows}"
+                )));
+            }
+            let position_id = positions4.unwrap_or(*positions);
+            let position_width = if positions4.is_some() { 4 } else { 1 };
+            let mrope = positions4.map(|_| *sections);
+            if graph.independent_rows {
+                let spans = sequence_spans(graph, *rows as usize)?;
+                let caches = resolve_rows(bindings, *k_cache, spans.len())?;
+                for (lane, span) in spans.iter().enumerate() {
+                    let (cache_binding, shift) = match segmented_kv_view(caches[lane]) {
+                        Some((table, shift)) => (table, Some(shift)),
+                        None => (caches[lane], None),
+                    };
+                    rec.qsa_prepare_off(
+                        r(*qk)?,
+                        r(*q_norm)?,
+                        r(position_id)?,
+                        cache_binding,
+                        r(*q_dst)?,
+                        span.rows,
+                        *n_head,
+                        *head_dim,
+                        *rope_dim,
+                        *theta,
+                        *eps,
+                        span.start_pos,
+                        cap_rows as u32,
+                        shift,
+                        mrope,
+                        span.row_start as usize * qk_stride * 4,
+                        span.row_start as usize * position_width * 4,
+                        span.row_start as usize * q_width * 2,
+                    );
+                }
+                return Ok(());
+            }
+            let cache = r(*k_cache)?;
+            let (cache_binding, shift) = match segmented_kv_view(cache) {
+                Some((table, shift)) => (table, Some(shift)),
+                None => (cache, None),
+            };
+            rec.qsa_prepare_off(
+                r(*qk)?,
+                r(*q_norm)?,
+                r(position_id)?,
+                cache_binding,
+                r(*q_dst)?,
+                *rows,
+                *n_head,
+                *head_dim,
+                *rope_dim,
+                *theta,
+                *eps,
+                *pos,
+                cap_rows as u32,
+                shift,
+                mrope,
+                0,
+                0,
+                0,
             );
         }
         Op::QsaIndexer {

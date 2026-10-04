@@ -5783,6 +5783,7 @@ impl MetalBackend {
             | Op::Dsv4CacheWrite { .. }
             | Op::Dsv4Indexer { .. }
             | Op::Dsv4Gather { .. }
+            | Op::QsaPrepare { .. }
             | Op::QsaIndexer { .. }
             | Op::QsaGather { .. }
             | Op::QsaBatchAttention { .. }
@@ -5796,7 +5797,9 @@ impl MetalBackend {
             }
             Op::Silu { .. }
             | Op::QwenHcMix { .. }
+            | Op::QwenHcNorm { .. }
             | Op::QwenHcInject { .. }
+            | Op::QwenHcInjectNorm { .. }
             | Op::QwenPleGate { .. } => {
                 return Err(Error::Unsupported(
                     "Metal Qwen3.8 hyper-connection/PLE primitives are not implemented; use \

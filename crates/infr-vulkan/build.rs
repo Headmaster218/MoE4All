@@ -719,6 +719,14 @@ fn main() {
         ("dsv4_indexer_score", "dsv4_indexer_score", &[]),
         ("dsv4_indexer_topk", "dsv4_indexer_topk", &[]),
         ("dsv4_gather", "dsv4_gather", &[]),
+        ("qsa_prepare", "qsa_prepare", &[]),
+        ("qsa_prepare", "qsa_prepare_mrope", &["-DQSA_MROPE"]),
+        ("qsa_prepare", "qsa_prepare_seg", &["-DKV_SEGMENTED"]),
+        (
+            "qsa_prepare",
+            "qsa_prepare_mrope_seg",
+            &["-DQSA_MROPE", "-DKV_SEGMENTED"],
+        ),
         ("qsa_indexer_compress", "qsa_indexer_compress", &[]),
         (
             "qsa_indexer_compress",
@@ -835,7 +843,9 @@ fn main() {
         ("gelu", "gelu", &[]),
         ("qk_norm_rope_mrope", "qk_norm_rope_mrope", &[]),
         ("qwen_hc_mix", "qwen_hc_mix", &[]),
+        ("qwen_hc_norm", "qwen_hc_norm", &[]),
         ("qwen_hc_inject", "qwen_hc_inject", &[]),
+        ("qwen_hc_inject_norm", "qwen_hc_inject_norm", &[]),
         ("qwen_ple_gate", "qwen_ple_gate", &[]),
         ("softmax", "softmax", &[]),
         // DiffusionGemma denoise self-conditioning perf: scale read from a device buffer instead

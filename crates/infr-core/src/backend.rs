@@ -162,6 +162,9 @@ pub struct Capabilities {
     /// Costs an owned copy of both weights at load, so zero-copy mmap backends (CPU) leave this
     /// false and keep the separate-tensor form.
     pub combined_gu: bool,
+    /// The backend lowers [`crate::Op::QsaPrepare`] and can therefore consume the concatenated
+    /// Qwen3.8 indexer query/key projection used by that experimental fusion.
+    pub qsa_prepare: bool,
     /// The backend executes [`crate::Op::EmbedGather`] (dequantize embedding-table rows selected
     /// by a device-side id buffer). When set, the runner uploads TOKEN IDS (4 bytes each) instead
     /// of host-dequantized f32 embedding rows — decode feeds 4B/token, prefill 4B/token instead
@@ -674,6 +677,13 @@ pub trait Backend: Send + Sync {
     fn activation_peak(&self) -> Option<u64> {
         None
     }
+    /// Release retained transient graph workspace at an explicit serial handoff. Persistent model
+    /// state, KV and weights remain resident. Backends without a phase arena keep this as a no-op.
+    ///
+    /// This is narrower than ending a request: the next graph is about to run immediately, so an
+    /// elastic backend should leave expert slots borrowed instead of eagerly refilling them into
+    /// space the next graph will need.
+    fn release_transient_runtime(&self) {}
     /// Open a weight-load progress scope: while the returned guard lives, this backend's weight
     /// allocations (`BufferUsage::Weights`/`HostWeights`) advance a visible progress display;
     /// dropping the guard finishes and clears it. The ticking lives in each backend's `alloc`, so
