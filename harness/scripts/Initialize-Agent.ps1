@@ -64,6 +64,7 @@ $utf8 = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText($manifestPath, (($manifest | ConvertTo-Json -Depth 12) + "`n"), $utf8)
 [System.IO.File]::WriteAllText((Join-Path $profile 'cordis.yml'), "[]`n", $utf8)
 
+$basePatch = Get-Content -LiteralPath (Join-Path $sourceProfile 'cordis.patch.yml') -Raw -Encoding UTF8
 $patch = @'
 - id: agent-default-model
   config:
@@ -73,13 +74,12 @@ $patch = @'
 - id: llm-deepseek
   disabled: true
 
-- id: web
-  config:
-    searchProvider: brave-search
-
 - id: remote-web-ui-moe4all
   config:
     cookieName: moe4all_pair
+    autoTunnel: false
+    relay: false
+    telemetry: false
 
 - id: dsh-market-moe4all
   config:
@@ -87,12 +87,12 @@ $patch = @'
 
 - id: moe4all-engine
   config:
-    mode: connect
+    mode: prompt
     endpoint: __ENGINE_ENDPOINT__
-    allowRemoteEndpoint: true
+    allowRemoteEndpoint: false
 '@
 $patch = $patch.Replace('__ENGINE_ENDPOINT__', $endpoint.AbsoluteUri.TrimEnd('/'))
-[System.IO.File]::WriteAllText((Join-Path $profile 'cordis.patch.yml'), "$patch`n", $utf8)
+[System.IO.File]::WriteAllText((Join-Path $profile 'cordis.patch.yml'), "$($basePatch.TrimEnd())`n`n$patch`n", $utf8)
 
 $workspaceYaml = @'
 packages:
