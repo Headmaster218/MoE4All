@@ -442,6 +442,9 @@ cfg_struct! {
         q8_decode_gqa2: bool = true,
         /// Reuse each Q8 K/V read across four adjacent GQA query heads when occupancy permits.
         q8_decode_gqa4: bool = true,
+        /// Number of adjacent QSA Prefill query heads sharing each Q8 K/V read. Supported values
+        /// are 1 and 2; unsupported values fall back to one head.
+        qsa_prefill_gqa: usize = 2,
         /// Wave32 max/sum reduction for the coupled Q8 hd256 decode combine pass.
         q8_decode_combine_sg: bool = true,
         /// `INFR_NO_MROWS_ATTN` / `INFR_MROWS_ATTN`, an ASYMMETRIC tri-state: `Some(false)` (the

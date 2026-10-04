@@ -9689,36 +9689,50 @@ impl<'a> Recorder<'a> {
         dst_byte_off: usize,
     ) {
         let segmented = segment_shift.is_some();
-        let (name, spv) = match (k_q8, v_q8, segmented) {
-            (false, false, true) => (
+        let requested_gqa = self.vk().qsa_prefill_gqa;
+        let grouped = if k_q8 && v_q8 && segmented {
+            let group = n_head / n_kv.max(1);
+            match requested_gqa {
+                2 if group.is_multiple_of(2) => 2,
+                _ => 1,
+            }
+        } else {
+            1
+        };
+        let (name, spv) = match (k_q8, v_q8, segmented, grouped) {
+            (true, true, true, 2) => (
+                "qsa_attention_batch_q8_seg_gqa2",
+                crate::gemm::qsa_attention_batch_q8_seg_gqa2_spv(),
+            ),
+            (false, false, true, _) => (
                 "qsa_attention_batch_seg",
                 crate::gemm::qsa_attention_batch_seg_spv(),
             ),
-            (true, false, true) => (
+            (true, false, true, _) => (
                 "qsa_attention_batch_kq8_seg",
                 crate::gemm::qsa_attention_batch_kq8_seg_spv(),
             ),
-            (false, true, true) => (
+            (false, true, true, _) => (
                 "qsa_attention_batch_vq8_seg",
                 crate::gemm::qsa_attention_batch_vq8_seg_spv(),
             ),
-            (true, true, true) => (
+            (true, true, true, _) => (
                 "qsa_attention_batch_q8_seg",
                 crate::gemm::qsa_attention_batch_q8_seg_spv(),
             ),
-            (false, false, false) => (
+            (false, false, false, _) => (
                 "qsa_attention_batch",
                 crate::gemm::qsa_attention_batch_spv(),
             ),
-            (true, false, false) => (
+            (true, false, false, _) => (
                 "qsa_attention_batch_kq8",
                 crate::gemm::qsa_attention_batch_kq8_spv(),
             ),
-            (false, true, false) => (
+            (false, true, false, _) => (
                 "qsa_attention_batch_vq8",
                 crate::gemm::qsa_attention_batch_vq8_spv(),
             ),
-            (true, true, false) => (
+            (true, true, false, _) => (
                 "qsa_attention_batch_q8",
                 crate::gemm::qsa_attention_batch_q8_spv(),
             ),
@@ -9757,7 +9771,7 @@ impl<'a> Recorder<'a> {
             ],
             1,
             &push[..push_bytes as usize],
-            rows.saturating_mul(n_head),
+            rows.saturating_mul(n_head / grouped),
         );
     }
 
@@ -14316,9 +14330,14 @@ mod tests {
         }
         let flat_attention = download_f32(&be, attn_flat.as_ref(), N_HEAD * ATTN_HD);
         let segmented_attention = download_f32(&be, attn_segmented.as_ref(), N_HEAD * ATTN_HD);
-        assert_eq!(
-            segmented_attention, flat_attention,
-            "segmented Q8 QSA attention differs across 32K"
+        let attention_err = segmented_attention
+            .iter()
+            .zip(&flat_attention)
+            .map(|(segmented, flat)| (segmented - flat).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            attention_err <= 1e-6,
+            "segmented grouped-Q8 QSA attention differs across 32K: {attention_err:e}"
         );
     }
 

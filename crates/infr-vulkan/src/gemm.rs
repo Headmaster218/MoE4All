@@ -3469,6 +3469,10 @@ qsa_spv!(
     "qsa_attention_batch_vq8_seg"
 );
 qsa_spv!(qsa_attention_batch_q8_seg_spv, "qsa_attention_batch_q8_seg");
+qsa_spv!(
+    qsa_attention_batch_q8_seg_gqa2_spv,
+    "qsa_attention_batch_q8_seg_gqa2"
+);
 /// SPIR-V for Ling KDA recurrent attention.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn kda_spv() -> &'static [u32] {

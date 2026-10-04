@@ -831,6 +831,11 @@ fn main() {
             "qsa_attention_batch_q8_seg",
             &["-DKQ8", "-DVQ8", "-DKV_SEGMENTED"],
         ),
+        (
+            "qsa_attention_batch",
+            "qsa_attention_batch_q8_seg_gqa2",
+            &["-DKQ8", "-DVQ8", "-DKV_SEGMENTED", "-DGQA_HEADS=2"],
+        ),
         // DeepSeek V4 Sinkhorn hyper-connections (Op::HyperConnectMix / Pre / Post). `-DGATES`
         // adds the `post` + `comb` outputs; without it the mix kernel is `build_hc_head`'s
         // pre-only form, whose `mixes` is the pre chunk alone.
