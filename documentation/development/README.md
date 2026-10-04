@@ -9,6 +9,7 @@ verified_commit: ed62393068679573afe94a1472454efe7eae0f15
 # 开发手册
 
 - [新增 GGUF 模型家族](model-porting.md)
+- [从源码构建](building-from-source.md)：工具链与 glslc 版本要求、二进制可移植性、GPU 测试与 GTT 注意。
 
 ## 性能
 

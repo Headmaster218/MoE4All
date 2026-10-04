@@ -62,6 +62,21 @@ Flash-Next 启动时选择第一片：`Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-
 
 0.9.0 已支持服务端 Vision 与 MTP 组合，组合能力和限制见[模型能力矩阵](documentation/reference/model-capabilities.md)。API 默认地址为 `http://127.0.0.1:8080/v1`；请求示例见[API 使用](documentation/guide/serving/api-quickstart.md)，完整配置项见[配置参考](documentation/reference/configuration.md)。
 
+## 从源码构建（Linux）
+
+发布包目前只有 Windows 版；Linux 从源码构建：
+
+```sh
+sudo apt-get update && sudo apt-get install -y glslc
+git clone https://github.com/Headmaster218/MoE4All.git && cd MoE4All
+cargo build --release --locked -p infr-cli
+./Start-INFR-Wizard-Linux.sh      # 交互式启动；加 --dry-run 只打印命令
+```
+
+需要 Rust 1.97.1（`rust-toolchain.toml` 会自动安装）与 shaderc 2025 及以上的
+`glslc`。完整指南见 [在 Linux 上构建并运行](documentation/guide/linux-build-and-run.md)，
+工具链与平台细节见 [从源码构建](documentation/development/building-from-source.md)。
+
 ## 实测结果
 
 ### 0.8.0：Qwen3.8-Flash-Next，20K 与 150K 输入对照

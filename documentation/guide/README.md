@@ -9,6 +9,7 @@ verified_commit: ed62393068679573afe94a1472454efe7eae0f15
 # 用户指南
 
 - [快速开始](getting-started.md)：Windows 发布包、模型和第一次启动。
+- [在 Linux 上构建并运行](linux-build-and-run.md)：从源码构建后的启动向导、CLI 用法与平台注意。
 - [API 使用](serving/api-quickstart.md)：Chat、Responses、图片、Embedding 与鉴权。
 - [思考模式控制](serving/thinking-controls.md)：CLI、Wizard 和 Chat Completions API。
 - [配置参考](../reference/configuration.md)：完整 TOML、环境变量和 `--set` 规则。
