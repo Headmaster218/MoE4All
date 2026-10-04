@@ -81,6 +81,28 @@ internal static class MoE4All
         }
     }
 
+    private static void StartUpdateChecker(string root)
+    {
+        string manifest = Path.Combine(root, "harness", "distribution", "agent-release.json");
+        string script = Path.Combine(root, "harness", "scripts", "Check-AgentUpdate.ps1");
+        if (!File.Exists(manifest) || !File.Exists(script)) return;
+        var start = new ProcessStartInfo("powershell.exe");
+        start.Arguments = "-NoLogo -NoProfile -NonInteractive -File " + Quote(script)
+            + " -InstallRoot " + Quote(root) + " -ParentPid " + Process.GetCurrentProcess().Id;
+        start.WorkingDirectory = Directory.GetParent(root).FullName;
+        start.UseShellExecute = false;
+        start.CreateNoWindow = true;
+        start.WindowStyle = ProcessWindowStyle.Hidden;
+        try
+        {
+            using (var checker = Process.Start(start)) { }
+        }
+        catch (Exception error)
+        {
+            Console.Error.WriteLine("Agent update check could not start: " + error.Message);
+        }
+    }
+
     private static int Main()
     {
         Console.OutputEncoding = new UTF8Encoding(false);
@@ -120,6 +142,7 @@ internal static class MoE4All
                     if (built != 0 || !Directory.Exists(profile)) return built != 0 ? built : 3;
                 }
                 Console.WriteLine("MoE4All Agent is starting. Close this window to stop it.");
+                StartUpdateChecker(root);
                 return RunScript(job, root, script, " -StateRoot " + Quote(state) + " -Open");
             }
             finally
