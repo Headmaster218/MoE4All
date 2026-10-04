@@ -4,6 +4,7 @@ param(
     [string]$WorkspaceRoot,
     [string]$HostAddress = '127.0.0.1',
     [int]$Port = 17373,
+    [string]$CliPath,
     [switch]$AllowSharedWorkspace,
     [switch]$Open
 )
@@ -63,7 +64,9 @@ $node = Get-ChildItem -LiteralPath (Join-Path $harnessRoot 'runtime') -Filter no
     Where-Object { $_.FullName -match 'node-v[^\\]+-win-x64\\node\.exe$' } |
     Select-Object -First 1 -ExpandProperty FullName
 if (-not $node) { throw 'MoE4All Node runtime is missing. Run Build-Agent.ps1 first.' }
-$entry = Join-Path $harnessRoot 'dsh\apps\cli\lib\bin.js'
+if (-not $CliPath) { $CliPath = Join-Path $harnessRoot 'dsh\apps\cli\lib\bin.js' }
+$entry = [System.IO.Path]::GetFullPath($CliPath)
+if (-not (Test-Path -LiteralPath $entry -PathType Leaf)) { throw "MoE4All CLI entry not found: $entry" }
 $oldHome = $env:DSH_HOME
 $oldAgentsHome = $env:DSH_AGENTS_HOME
 $oldPath = $env:PATH

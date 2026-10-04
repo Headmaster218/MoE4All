@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$StateRoot,
-    [string]$EngineEndpoint = ''
+    [string]$EngineEndpoint = '',
+    [switch]$DiscoverLocalModel
 )
 
 $ErrorActionPreference = 'Stop'
@@ -84,10 +85,21 @@ $patch = @'
 - id: dsh-market-moe4all
   config:
     allowRestart: false
+    bundledPackages:
+      - dsh-market-moe4all
+      - dsh-web-search-brave-moe4all
+      - dsh-mneme-moe4all
+      - dsh-easyrewrite-moe4all
+      - dsh-remote-web-ui-moe4all
+      - dsh-plugin-cron-moe4all
+      - dsh-llm-moe4all
+      - dsh-plugin-tts-moe4all
 
 - id: moe4all-engine
   config:
     mode: prompt
+    bundledDistribution: true
+    bootstrapEngineOnStart: false
     endpoint: __ENGINE_ENDPOINT__
     allowRemoteEndpoint: false
 '@
@@ -119,15 +131,17 @@ ignore-scripts=true
 Copy-Item -LiteralPath (Join-Path $sourceProfile 'stubs') -Destination $profile -Recurse
 
 $settings = "ui-theme:`n  preference: dark`n"
-try {
-    $models = Invoke-RestMethod -Uri ($endpoint.AbsoluteUri.TrimEnd('/') + '/models') -TimeoutSec 5
-    $model = $models.data | Where-Object { $_.id -and $_.id -notmatch '(?i)embed' } | Select-Object -First 1
-    if ($null -ne $model) {
-        $modelId = ConvertTo-Json -InputObject ([string]$model.id) -Compress
-        $settings += "agent-default-model:`n  provider: moe4all`n  model: $modelId`n"
+if ($DiscoverLocalModel) {
+    try {
+        $models = Invoke-RestMethod -Uri ($endpoint.AbsoluteUri.TrimEnd('/') + '/models') -TimeoutSec 5
+        $model = $models.data | Where-Object { $_.id -and $_.id -notmatch '(?i)embed' } | Select-Object -First 1
+        if ($null -ne $model) {
+            $modelId = ConvertTo-Json -InputObject ([string]$model.id) -Compress
+            $settings += "agent-default-model:`n  provider: moe4all`n  model: $modelId`n"
+        }
+    } catch {
+        Write-Warning 'Model discovery is unavailable; select a model in the MoE4All UI after startup.'
     }
-} catch {
-    Write-Warning 'Model discovery is unavailable; select a model in the MoE4All UI after startup.'
 }
 [System.IO.File]::WriteAllText((Join-Path $agentHome 'settings.yaml'), $settings, $utf8)
 

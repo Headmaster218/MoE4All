@@ -25,6 +25,5 @@
     maxInputBytes: 4096
     maxOutputTokens: 64
     timeoutMs: 60000
-    provider: moe4all-title
 
 # dsh-remote-web-ui-moe4all.publicBaseUrl is intentionally absent. It is installation-specific.

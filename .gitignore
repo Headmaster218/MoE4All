@@ -21,6 +21,7 @@ target-prof/
 /artifacts/context-resource-matrix/
 /benchmark-data/
 /harness/agent-state/
+/MoE4All.exe
 /tests/context-resource/matrix.local.json
 bili_report_work/*
 followtasks.txt
