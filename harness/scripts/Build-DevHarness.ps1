@@ -3,7 +3,7 @@ param(
     [string]$NodeVersion = '24.9.0',
     [string]$Registry = 'https://registry.npmmirror.com',
     [string]$ProductionHome = "$env:APPDATA\dsh-desktop\harness",
-    [string]$WorkspaceRoot = 'D:\AISuperAssistant\DSH',
+    [string]$WorkspaceRoot = "$env:USERPROFILE\Documents\DSH",
     [switch]$RefreshConfig,
     [switch]$SkipInitialize,
     [string]$ProfileDir

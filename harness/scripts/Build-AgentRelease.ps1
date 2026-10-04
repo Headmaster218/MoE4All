@@ -38,7 +38,17 @@ foreach ($relative in $submodules) {
 
 New-Item -ItemType Directory -Path $output, $stage -Force | Out-Null
 $temp = Join-Path $output "$name-source.zip"
-& git -C $root archive '--format=zip' ("--output=$temp") HEAD harness
+$agentPaths = @(
+    'harness/distribution/profile',
+    'harness/launcher/MoE4All.cs',
+    'harness/scripts/AgentUpdateVersion.ps1',
+    'harness/scripts/Build-Agent.ps1',
+    'harness/scripts/Build-DevHarness.ps1',
+    'harness/scripts/Check-AgentUpdate.ps1',
+    'harness/scripts/Initialize-Agent.ps1',
+    'harness/scripts/Run-Agent.ps1'
+)
+& git -C $root archive '--format=zip' ("--output=$temp") HEAD @agentPaths
 if ($LASTEXITCODE -ne 0) { throw 'Archiving Agent scripts failed.' }
 Expand-Archive -LiteralPath $temp -DestinationPath $stage
 
