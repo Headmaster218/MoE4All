@@ -85,6 +85,23 @@ Flash-Next has these optional components:
 See the [capability matrix](documentation/reference/model-capabilities.md) for combination limits. The default API base URL is `http://127.0.0.1:8080/v1`. See the [API guide](documentation/guide/serving/api-quickstart.md) and the
 [configuration reference](documentation/reference/configuration.md) for all available settings.
 
+## Build from source (Linux)
+
+The release archives are Windows-only; on Linux, build from source:
+
+```sh
+sudo apt-get update && sudo apt-get install -y glslc
+git clone https://github.com/Headmaster218/MoE4All.git && cd MoE4All
+cargo build --release --locked -p infr-cli
+./Start-INFR-Wizard-Linux.sh      # interactive launcher; --dry-run prints only
+```
+
+Requires Rust 1.97.1 (installed by `rustup` from `rust-toolchain.toml`) and
+`glslc` from shaderc 2025 or newer. The full guide is
+[Build and run on Linux](documentation/guide/linux-build-and-run.md); toolchain
+and platform details are in
+[Building from source](documentation/development/building-from-source.md).
+
 ## Measured results
 
 ### 0.10.0: 30K / 150K measurements
