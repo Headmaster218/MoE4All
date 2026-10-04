@@ -50,6 +50,8 @@ const PREFILL_COHORT_WAIT: Duration = Duration::from_millis(50);
 const MAX_DECODE_BATCH: usize = 8;
 const SHORT_PREFILL_TOKENS: usize = 96;
 const MTP_PLAIN_SYNC_QUANTUM: usize = 1024;
+const MTP_CONCURRENT_PROBE_CYCLES: usize = 8;
+const MTP_CONCURRENT_MIN_ACCEPT_PERCENT: usize = 80;
 
 /// One projector result handed to the text model. Kept backend-neutral so `infr-llama` does not
 /// depend on the optional vision crate.
@@ -314,6 +316,21 @@ fn mtp_accepted_rows(candidates: &[u32], verified: &[u32]) -> usize {
         .zip(verified)
         .take_while(|(candidate, target)| candidate == target)
         .count()
+}
+
+fn concurrent_mtp_profitable(accepted: usize, drafted: usize) -> bool {
+    drafted > 0
+        && accepted.saturating_mul(100) >= drafted.saturating_mul(MTP_CONCURRENT_MIN_ACCEPT_PERCENT)
+}
+
+fn concurrent_mtp_ready(enabled: bool, plain_selected: bool, all_lanes_ready: bool) -> bool {
+    enabled && !plain_selected && all_lanes_ready
+}
+
+#[derive(Default)]
+struct MtpBatchCycleStats {
+    accepted: usize,
+    drafted: usize,
 }
 
 fn mtp_prime_chunk_end(
@@ -3061,9 +3078,21 @@ impl ParallelSeam {
     fn run_mtp_batch(&self, work: Vec<BatchWork>, req: &RequestCtx) {
         let mut active = work;
         let mut concurrent_plain = false;
+        let mut concurrent_probe_cycles = 0usize;
+        let mut concurrent_accepted = 0usize;
+        let mut concurrent_drafted = 0usize;
+        let mut concurrent_reported_plain = None;
         loop {
             let capacity = MAX_DECODE_BATCH.saturating_sub(active.len());
-            active.extend(self.take_pending_batch_work(capacity, false));
+            let pending = self.take_pending_batch_work(capacity, false);
+            if !pending.is_empty() && !active.is_empty() {
+                concurrent_plain = false;
+                concurrent_probe_cycles = 0;
+                concurrent_accepted = 0;
+                concurrent_drafted = 0;
+                concurrent_reported_plain = None;
+            }
+            active.extend(pending);
             if active.is_empty() {
                 match self.refill_batch() {
                     Some(work) => active = work,
@@ -3111,7 +3140,13 @@ impl ParallelSeam {
                 self.retire_finished_work(&mut active);
                 continue;
             }
-            if active.len() > 1 {
+            if active.len() > 1
+                && !concurrent_mtp_ready(
+                    self.model.engine_cfg().spec.mtp_concurrent,
+                    concurrent_plain,
+                    active.iter().all(|work| work.mtp_ready),
+                )
+            {
                 if !concurrent_plain {
                     tracing::info!(
                         lanes = active.len(),
@@ -3160,6 +3195,11 @@ impl ParallelSeam {
                 }
                 concurrent_plain = false;
             }
+            if active.len() == 1 {
+                concurrent_probe_cycles = 0;
+                concurrent_accepted = 0;
+                concurrent_drafted = 0;
+            }
             if !active[0].mtp_ready {
                 if let Err(error) =
                     self.run_token_group(&mut active, &[0], MTP_PLAIN_SYNC_QUANTUM, false)
@@ -3194,9 +3234,46 @@ impl ParallelSeam {
             }
             let mut indices = (0..active.len()).collect::<Vec<_>>();
             indices.sort_by_key(|&index| (active[index].mrope_plan.is_none(), active[index].slot));
-            if let Err(error) = self.run_mtp_verify_cycle(&mut active, &indices, req) {
-                self.fail_unified_scheduler(&mut active, error);
-                return;
+            let cycle = match self.run_mtp_verify_cycle(&mut active, &indices, req) {
+                Ok(cycle) => cycle,
+                Err(error) => {
+                    self.fail_unified_scheduler(&mut active, error);
+                    return;
+                }
+            };
+            if active.len() > 1 && self.model.engine_cfg().spec.mtp_concurrent {
+                concurrent_probe_cycles += 1;
+                concurrent_accepted += cycle.accepted;
+                concurrent_drafted += cycle.drafted;
+                if concurrent_probe_cycles >= MTP_CONCURRENT_PROBE_CYCLES {
+                    let alpha = concurrent_accepted as f64 / concurrent_drafted.max(1) as f64;
+                    let next_plain =
+                        !concurrent_mtp_profitable(concurrent_accepted, concurrent_drafted);
+                    if concurrent_reported_plain != Some(next_plain) {
+                        tracing::info!(
+                            cycles = concurrent_probe_cycles,
+                            accepted = concurrent_accepted,
+                            drafted = concurrent_drafted,
+                            alpha,
+                            mode = if next_plain { "plain" } else { "mtp" },
+                            "Qwen3.8 concurrent MTP acceptance window selected decode mode"
+                        );
+                        concurrent_reported_plain = Some(next_plain);
+                    } else {
+                        tracing::debug!(
+                            cycles = concurrent_probe_cycles,
+                            accepted = concurrent_accepted,
+                            drafted = concurrent_drafted,
+                            alpha,
+                            mode = if next_plain { "plain" } else { "mtp" },
+                            "Qwen3.8 concurrent MTP acceptance window retained decode mode"
+                        );
+                    }
+                    concurrent_plain = next_plain;
+                    concurrent_probe_cycles = 0;
+                    concurrent_accepted = 0;
+                    concurrent_drafted = 0;
+                }
             }
             let before = active.len();
             self.retire_finished_work(&mut active);
@@ -3211,7 +3288,7 @@ impl ParallelSeam {
         active: &mut [BatchWork],
         indices: &[usize],
         req: &RequestCtx,
-    ) -> Result<()> {
+    ) -> Result<MtpBatchCycleStats> {
         let cfg = self.model.config();
         let ec = self.model.engine_cfg();
         let h_width = cfg.hc_mult * cfg.n_embd;
@@ -3231,7 +3308,9 @@ impl ParallelSeam {
             for &index in indices {
                 let work = &mut active[index];
                 let lane = &mut heads[work.slot];
-                let pending = lane.pending_id.expect("primed MTP lane has a frontier");
+                let pending = lane.pending_id.ok_or_else(|| {
+                    anyhow!("MTP lane {} entered VERIFY without a frontier", work.slot)
+                })?;
                 let physical_position = work.kv().cached_len();
                 let rope_position =
                     multimodal_token_position(work.mrope_plan.as_ref(), physical_position)?;
@@ -3302,6 +3381,7 @@ impl ParallelSeam {
         );
         let compute_secs = t0.elapsed().as_secs_f64();
 
+        let mut cycle = MtpBatchCycleStats::default();
         for (lane_index, &index) in indices.iter().enumerate() {
             let work = &mut active[index];
             let pending_emitted = self
@@ -3344,6 +3424,8 @@ impl ParallelSeam {
                 );
             }
             let accepted = mtp_accepted_rows(&predictions[lane_index], ids);
+            cycle.accepted += accepted.saturating_sub(1);
+            cycle.drafted += predictions[lane_index].len();
             let already_emitted = usize::from(pending_emitted);
             anyhow::ensure!(
                 already_emitted <= accepted
@@ -3427,7 +3509,7 @@ impl ParallelSeam {
             work.stats.decode_secs += compute_secs + restore_t0.elapsed().as_secs_f64();
             work.finished = stopped || work.generated >= work.max_new;
         }
-        Ok(())
+        Ok(cycle)
     }
 
     fn run_unified_batch(&self, work: Vec<BatchWork>, req: &RequestCtx) {
@@ -3918,8 +4000,9 @@ impl ParallelSeam {
 #[cfg(test)]
 mod tests {
     use super::{
-        expand_multimodal_prompt, mtp_accepted_rows, mtp_prime_chunk_end, multimodal_key,
-        multimodal_token_position, phase_for_remaining_prefill, pick_continuation, scheduler_mode,
+        concurrent_mtp_profitable, concurrent_mtp_ready, expand_multimodal_prompt,
+        mtp_accepted_rows, mtp_prime_chunk_end, multimodal_key, multimodal_token_position,
+        phase_for_remaining_prefill, pick_continuation, scheduler_mode,
         should_handoff_multimodal_to_scheduler, token_lane_sort_key, BatchPhase,
         MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
     };
@@ -3975,6 +4058,22 @@ mod tests {
         assert_eq!(mtp_accepted_rows(&candidates, &[11, 12, 99, 0]), 3);
         assert_eq!(mtp_accepted_rows(&candidates, &[11, 12, 13, 99]), 4);
         assert_eq!(mtp_accepted_rows(&[5, 6, 7], &[5, 6, 7, 8]), 4);
+    }
+
+    #[test]
+    fn concurrent_mtp_requires_eighty_percent_acceptance() {
+        assert!(concurrent_mtp_profitable(24, 30));
+        assert!(concurrent_mtp_profitable(25, 30));
+        assert!(!concurrent_mtp_profitable(23, 30));
+        assert!(!concurrent_mtp_profitable(0, 0));
+    }
+
+    #[test]
+    fn concurrent_mtp_requires_every_lane_to_be_ready() {
+        assert!(concurrent_mtp_ready(true, false, true));
+        assert!(!concurrent_mtp_ready(false, false, true));
+        assert!(!concurrent_mtp_ready(true, true, true));
+        assert!(!concurrent_mtp_ready(true, false, false));
     }
 
     #[test]

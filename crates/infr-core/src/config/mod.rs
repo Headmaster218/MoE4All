@@ -613,6 +613,9 @@ cfg_struct! {
         /// Maximum attention horizon for the Qwen3.8 MTP head. The target model keeps its full
         /// context; this only bounds the detached draft head's attention work.
         mtp_context: usize = 32768,
+        /// Let two active Qwen3.8 lanes probe batched MTP VERIFY and retain it only while measured
+        /// draft acceptance is high enough to beat ordinary batched decode.
+        mtp_concurrent: bool = true,
         /// `INFR_SPEC_DEBUG`.
         debug: bool = false,
         /// `INFR_DECODE_CHAIN`: decode iterations per submission.
