@@ -8,11 +8,13 @@ verified_commit: ed62393068679573afe94a1472454efe7eae0f15
 
 # 使用本地 API
 
-先在 Windows 向导中选择“OpenAI 兼容 API”，或用 `infr serve` 启动模型。下面以本机默认地址为例；若启动时指定了 `--addr`，请替换地址。客户端的 Base URL 为 `http://127.0.0.1:8080/v1`。
+先用启动向导选择“OpenAI 兼容 API”——Windows 是 `Start-INFR-Wizard.cmd`，Linux 是 [`Start-INFR-Wizard-Linux.sh`](../../../Start-INFR-Wizard-Linux.sh)——或直接用 `infr serve` 启动模型。下面以本机默认地址为例；若启动时指定了 `--addr`，请替换地址。客户端的 Base URL 为 `http://127.0.0.1:8080/v1`。
 
 ## 查找模型与鉴权
 
 `GET /health` 无需鉴权。设置了非空 `serve.api_key` 时，`/v1/models` 和生成、嵌入接口都要求 `Authorization: Bearer <key>`；空字符串等于未启用鉴权。
+
+**本机使用 `127.0.0.1`；局域网访问可用 `0.0.0.0`，但应启用 API key。** 不带鉴权地把服务绑定到非回环地址（例如 `--addr 0.0.0.0:8080`），等于把本机的模型能力开放给同网段的所有人。
 
 ```powershell
 $base = 'http://127.0.0.1:8080'
