@@ -3244,6 +3244,7 @@ fn main() {
         ("moe_scatter_reduce", "moe_scatter_reduce", &[]),
         ("moe_topk", "moe_topk", &[]),
         ("moe_topk", "moe_topk_sg", &["-DSUBGROUP_REDUCE"]),
+        ("moe_topk_sigmoid_wave32", "moe_topk_sigmoid_wave32", &[]),
         // Embedding-row gather+dequant (Op::EmbedGather): one .spv per table format.
         ("embed_gather", "embed_gather_q8_0", &["-DFMT_Q8_0"]),
         ("embed_gather", "embed_gather_bf16", &["-DFMT_BF16"]),
