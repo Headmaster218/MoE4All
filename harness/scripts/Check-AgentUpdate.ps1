@@ -61,8 +61,15 @@ if ($testMode) {
         $zip = @($release.assets | Where-Object name -eq $zipName | Select-Object -First 1)[0]
         $sum = @($release.assets | Where-Object name -eq "$zipName.sha256" | Select-Object -First 1)[0]
         if ($null -eq $zip -or $null -eq $sum) { continue }
-        if (([Uri]$zip.browser_download_url).Host -ne 'github.com' -or
-            ([Uri]$sum.browser_download_url).Host -ne 'github.com') { continue }
+        try {
+            $zipUri = [Uri]$zip.browser_download_url
+            $sumUri = [Uri]$sum.browser_download_url
+        } catch { continue }
+        $prefix = "/Headmaster218/MoE4All/releases/download/$tag/"
+        if ($zipUri.Scheme -ne 'https' -or $sumUri.Scheme -ne 'https' -or
+            $zipUri.Host -ne 'github.com' -or $sumUri.Host -ne 'github.com' -or
+            -not $zipUri.AbsolutePath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -or
+            -not $sumUri.AbsolutePath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { continue }
         $best, $zipAsset, $sumAsset = $release, $zip, $sum
     }
 }
@@ -99,6 +106,18 @@ try {
     $actualHash = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash
     if ($actualHash -ne $Matches[1]) { throw 'Agent archive SHA256 mismatch.' }
     $phase = 'extract'
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $reader = [IO.Compression.ZipFile]::OpenRead($download)
+    try {
+        $expectedTop = [IO.Path]::GetFileNameWithoutExtension($zipAsset.name)
+        foreach ($entry in $reader.Entries) {
+            $parts = $entry.FullName -split '[\\/]'
+            if ($parts.Count -lt 2 -or $parts[0] -ne $expectedTop -or
+                $parts -contains '..' -or $entry.FullName.Contains(':')) {
+                throw "Unexpected path in Agent archive: $($entry.FullName)"
+            }
+        }
+    } finally { $reader.Dispose() }
     Expand-Archive -LiteralPath $download -DestinationPath $expanded
     $nextManifest = Join-Path $newRoot 'harness\distribution\agent-release.json'
     if (-not (Test-Path -LiteralPath (Join-Path $newRoot 'MoE4All.exe') -PathType Leaf) -or
