@@ -65,7 +65,7 @@ try {
 
     Push-Location $dshRoot
     try {
-        & $node $pnpmCli install --frozen-lockfile --store-dir $pnpmStore --fetch-timeout 300000 --fetch-retries 5
+        & $node $pnpmCli "--config.registry=$Registry" install --frozen-lockfile --store-dir $pnpmStore --fetch-timeout 300000 --fetch-retries 5
         if ($LASTEXITCODE -ne 0) { throw 'Installing the DSH source workspace failed.' }
 
         & $node $pnpmCli "--config.store-dir=$pnpmStore" run build
@@ -137,12 +137,12 @@ try {
 
     Push-Location $devProfile
     try {
-        & $node $pnpmCli install --no-frozen-lockfile --store-dir $pnpmStore --fetch-timeout 300000 --fetch-retries 5
+        & $node $pnpmCli "--config.registry=$Registry" install --no-frozen-lockfile --store-dir $pnpmStore --fetch-timeout 300000 --fetch-retries 5
         if ($LASTEXITCODE -ne 0) { throw 'Installing the isolated web profile failed.' }
 
         # Local tarballs keep stable filenames. Refresh their lockfile integrity
         # explicitly so a rebuilt package cannot leave stale bytes installed.
-        $updateArgs = @('update') + $pluginNames + @(
+        $updateArgs = @("--config.registry=$Registry", 'update') + $pluginNames + @(
             '--force'
             '--store-dir'
             $pnpmStore
