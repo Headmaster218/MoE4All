@@ -3249,7 +3249,7 @@ impl VulkanBackend {
         // The same transfer-only queue consumes either imported host RAM or a temporary
         // host-visible staging buffer. It therefore remains useful on devices that cannot expose
         // their expert arena through ReBAR or VK_EXT_external_memory_host (notably RDNA2).
-        let dedicated_transfer_family_index = (cfg.paging.host_dma
+        let dedicated_transfer_family_index = (cfg.paging.dedicated_transfer
             && timeline_feat.timeline_semaphore != 0)
             .then_some(dedicated_transfer_family_index)
             .flatten();
@@ -4083,14 +4083,12 @@ impl VulkanBackend {
                 submit_timestamp_period_ns,
             ) {
                 Ok(queue) => {
-                    tracing::info!(
-                        "[infr] host DMA: dedicated transfer queue family {family} enabled"
-                    );
+                    tracing::info!("[infr] pager: dedicated transfer queue family {family} enabled");
                     Some(Mutex::new(queue))
                 }
                 Err(error) => {
                     tracing::warn!(
-                        "[infr] host DMA: dedicated transfer queue unavailable ({error}); using the main queue"
+                        "[infr] pager: dedicated transfer queue unavailable ({error}); using the main queue"
                     );
                     None
                 }

@@ -241,6 +241,27 @@ fn expert_prefetch_is_default_off_and_explicitly_enableable() {
 }
 
 #[test]
+fn host_dma_and_dedicated_transfer_are_independent() {
+    let defaults = Config::default();
+    assert!(defaults.paging.host_dma);
+    assert!(defaults.paging.dedicated_transfer);
+
+    let import_without_dedicated_queue = Config::load_from_layers(&[cli_layer(&[
+        "paging.host_dma=true",
+        "paging.dedicated_transfer=false",
+    ])]);
+    assert!(import_without_dedicated_queue.paging.host_dma);
+    assert!(!import_without_dedicated_queue.paging.dedicated_transfer);
+
+    let dedicated_queue_without_import = Config::load_from_layers(&[cli_layer(&[
+        "paging.host_dma=false",
+        "paging.dedicated_transfer=true",
+    ])]);
+    assert!(!dedicated_queue_without_import.paging.host_dma);
+    assert!(dedicated_queue_without_import.paging.dedicated_transfer);
+}
+
+#[test]
 fn cold_session_cache_parses_from_every_configuration_layer() {
     let from_file = Config::load_from_layers(&[file_layer(
         "[kv]\nsession_cache_dir = 'cold-kv'\nsession_idle_secs = 30\nsession_cache_max = '12GiB'\nsession_cache_ttl_hours = 6\n",
