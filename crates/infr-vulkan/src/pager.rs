@@ -2733,6 +2733,12 @@ impl MoePagerSession {
             }
             let candidate_bytes = prefill_lane_bytes(&lane_bank_bytes);
             if candidate_bytes.is_none_or(|bytes| bytes > self.prefill_cache_bytes) {
+                tracing::debug!(
+                    candidate_lanes,
+                    candidate_bytes = ?candidate_bytes,
+                    prefill_cache_bytes = self.prefill_cache_bytes,
+                    "[moe-prefill] candidate exceeds configured ring budget"
+                );
                 continue;
             }
 
@@ -2751,6 +2757,13 @@ impl MoePagerSession {
             ) {
                 Ok(plan) => plan,
                 Err(error) => {
+                    tracing::debug!(
+                        candidate_lanes,
+                        requested_bytes = requested.iter().copied().sum::<usize>(),
+                        requested_ranges = requested.len(),
+                        error = %error,
+                        "[moe-prefill] candidate unified claim failed"
+                    );
                     last_error = Some(error.to_string());
                     continue;
                 }
@@ -2759,6 +2772,13 @@ impl MoePagerSession {
             let allocations = match self.commit_unified_claim(executor, plan) {
                 Ok(allocations) => allocations,
                 Err(error) => {
+                    tracing::debug!(
+                        candidate_lanes,
+                        requested_bytes = requested.iter().copied().sum::<usize>(),
+                        requested_ranges = requested.len(),
+                        error = %error,
+                        "[moe-prefill] candidate physical allocation failed"
+                    );
                     last_error = Some(error.to_string());
                     continue;
                 }

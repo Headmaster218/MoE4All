@@ -969,6 +969,14 @@ impl RuntimePhaseArena {
         let (pool_keys, pool_missing) = self.pool.plan_batch(pool_requests)?;
         let mut sizes = capacities.clone();
         sizes.extend(pool_missing.iter().map(|(_, bytes)| *bytes));
+        tracing::debug!(
+            phase = ?self.phase,
+            graph_scratch_bytes = layout.iter().flatten().copied().sum::<usize>(),
+            pool_scratch_bytes = pool_requests.iter().map(|(_, bytes)| *bytes).sum::<usize>(),
+            allocation_bytes = sizes.iter().copied().sum::<usize>(),
+            allocations = sizes.len(),
+            "[infr] runtime phase workspace growth"
+        );
         let mut buffers = be_
             .alloc_zeroed_batch(&sizes, BufferUsage::Activations)?
             .into_iter();
