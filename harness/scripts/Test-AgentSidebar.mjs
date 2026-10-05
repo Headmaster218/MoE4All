@@ -32,6 +32,7 @@ try {
       footer: rectOf(footer),
       clock: rectOf(clock),
       phone: rectOf(phone),
+      phoneText: phone?.textContent?.trim() ?? '',
     }
   })
 
@@ -49,6 +50,7 @@ try {
   if (Math.abs(collapsed.clock.x + collapsed.clock.width / 2 - collapsed.phone.x - collapsed.phone.width / 2) > 3) {
     process.exitCode = 1
   }
+  if (wide.phoneText !== '远程访问' || collapsed.phoneText !== '') process.exitCode = 1
 } finally {
   await browser.close()
 }
