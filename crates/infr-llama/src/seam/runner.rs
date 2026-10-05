@@ -4537,11 +4537,19 @@ fn generate_dense_backend_inner(
         //   hc_pre / hc_post   [batch, hc]      collapse weights / per-stream output gates
         //   hc_comb    [batch, hc, hc]          Sinkhorn-normalised mixing matrix
         let hcw = c.hc_mult * ne;
-        let hcr = [
-            g.internal(f32d(batch * hcw.max(1))),
-            g.internal(f32d(batch * hcw.max(1))),
-        ];
-        let hc_normed = g.internal(f32d(batch * hcw.max(1)));
+        let (hcr, hc_normed) = if c.deepseek4 {
+            (
+                [
+                    g.internal(f32d(batch * hcw.max(1))),
+                    g.internal(f32d(batch * hcw.max(1))),
+                ],
+                g.internal(f32d(batch * hcw.max(1))),
+            )
+        } else {
+            // Qwen3.8 has the same four-stream width but uses the qwen_* scratch below. Keeping
+            // DeepSeek V4's independent ping-pong rows would strand three more 10,240-wide rows.
+            ([hn, hn], hn)
+        };
         let hc_mixes = g.internal(f32d(batch * ((2 + c.hc_mult) * c.hc_mult).max(1)));
         let hc_hmixes = g.internal(f32d(batch * c.hc_mult.max(1)));
         let hc_pre = g.internal(f32d(batch * c.hc_mult.max(1)));
@@ -4555,9 +4563,16 @@ fn generate_dense_backend_inner(
         //   d4_og      [batch, o_lora_rank]     that group's low-rank output
         //   d4_oa      [batch, o_group_count*o_lora_rank]  all groups' outputs, concatenated
         let d4_qa = g.internal(f32d(batch * c.q_lora_rank.max(1)));
-        let d4_kv = g.internal(f32d(batch * c.head_dim.max(1)));
-        let d4_rq = g.internal(f32d(batch * (nh.max(c.indexer_n_head) * c.rope_dim).max(1)));
-        let d4_rkv = g.internal(f32d(batch * c.rope_dim.max(1)));
+        let (d4_kv, d4_rq, d4_rkv) = if c.deepseek4 {
+            (
+                g.internal(f32d(batch * c.head_dim.max(1))),
+                g.internal(f32d(batch * (nh.max(c.indexer_n_head) * c.rope_dim).max(1))),
+                g.internal(f32d(batch * c.rope_dim.max(1))),
+            )
+        } else {
+            // Qwen3.8 shares the attention/indexer dimensions but never executes the DSV4 mixer.
+            (hn, hn, hn)
+        };
         // `o_group_count` is 0 on every non-V4 model (and refused as 0 on a V4 one), so this is
         // the harmless-allocation guard the rest of this block uses, not a real division.
         let d4_hdg = (nh * c.head_dim).checked_div(c.o_group_count).unwrap_or(0);
@@ -4589,7 +4604,11 @@ fn generate_dense_backend_inner(
         let d4_hca_rows = (start_pos + batch) / 128;
         let d4_comp_selected = d4_hca_rows.max(d4_top_k);
         let d4_gather_rows = d4_raw_rows + d4_comp_selected;
-        let d4_gather = g.internal(f16d((d4_gather_rows * c.head_dim).max(1)));
+        let d4_gather = if c.deepseek4 {
+            g.internal(f16d((d4_gather_rows * c.head_dim).max(1)))
+        } else {
+            q16
+        };
         // deepseek32 lightning-indexer scratch. All f32: the k row is LayerNormed (so it never
         // leaves f16 range) but staying f32 also keeps the `Rope → WriteKv` peephole off it —
         // that fusion only fires on an f16 rope dst, and its fused kernels have no NEOX build.
@@ -4632,30 +4651,47 @@ fn generate_dense_backend_inner(
         let actbuf = g.internal(f32d(batch * nff));
         let sub = g.internal(f32d(batch * ne));
         // E2B per-layer embed scratch: gate `[npl]` and projected `[ne]`.
-        let plg = g.internal(f32d(batch * npl.max(1)));
-        let plp = g.internal(f32d(batch * ne));
+        let (plg, plp) = if e2b {
+            (
+                g.internal(f32d(batch * npl.max(1))),
+                g.internal(f32d(batch * ne)),
+            )
+        } else {
+            (hn, hn)
+        };
 
         // diffusion-gemma dual-FFN scratch (see docs/diffusion-gemma.md's FFN wiring): the dense
         // branch's own output (`d_out`, before summing with the MoE branch), the router's own
         // input row (`router_tmp` — a DIFFERENT normalization of `attn_out` than either FFN
-        // branch reads), the MoE branch's input (`moe_in`) and raw output (`moe_out`). Harmlessly
-        // allocated (but unused) on every other arch, like the E2B/qwen35 scratch above.
-        let d_out = g.internal(f32d(batch * ne));
-        let router_tmp = g.internal(f32d(batch * ne));
-        let moe_in = g.internal(f32d(batch * ne));
-        let moe_out = g.internal(f32d(batch * ne));
+        // branch reads), the MoE branch's input (`moe_in`) and raw output (`moe_out`).
+        let (d_out, router_tmp, moe_in, moe_out) = if c.dual_moe() {
+            (
+                g.internal(f32d(batch * ne)),
+                g.internal(f32d(batch * ne)),
+                g.internal(f32d(batch * ne)),
+                g.internal(f32d(batch * ne)),
+            )
+        } else {
+            (hn, hn, hn, hn)
+        };
         // qwen35moe shared-expert gate scratch: one raw (pre-sigmoid) logit per token, the
         // `Op::Linear(out_f=1)` output that `Op::MoeSharedExpertAdd` sigmoids — see its doc.
         // Harmlessly allocated (but unused) on every other arch, like the scratch above.
         let shexp_gate = g.internal(f32d(batch));
 
+        // Qwen3.8 HC/PLE scratch. The wide residual itself is caller-owned (`qwen_wide`); these
+        // three wide buffers are reused by PLE, DeltaNet and both HC modules in every layer.
+        let qwen_alt = g.internal(f32d(batch * hcw.max(1)));
+        let qwen_normed = g.internal(f32d(batch * hcw.max(1)));
+        let qwen_low = g.internal(f32d(batch * c.hc_low_rank.max(1)));
+        let qwen_gate = g.internal(f32d(batch * hcw.max(1)));
+        let qwen_inject = g.internal(f32d(batch * c.hc_mult.max(1)));
+
         // qwen35 attention out-gate scratch (the interleaved q+gate trap — see docs/qwen35.md):
         // `qg` holds the RAW `attn_q` projection (`[batch, nh*2*hd]`, q and gate interleaved per
-        // head); `gate_a` holds the split-out gate, packed like `q` (`[batch, nh*hd]`), consumed by
-        // the post-attention `GatedAct(Sigmoid)`. Unused (but harmlessly allocated) on every other
-        // arch, exactly like the E2B scratch above.
+        // head). QkNormRope and GatedAct read their strided half directly, so no separately packed
+        // gate row is needed.
         let qg = g.internal(f32d(batch * max_qrow * 2));
-        let _gate_a = g.internal(f32d(batch * max_qrow));
 
         // qwen35 gated-DeltaNet mixer scratch (see docs/qwen35.md), reused across every DeltaNet
         // layer exactly like `hn`/`sub` above (qwen35's SSM dims are uniform across layers, unlike
@@ -4668,31 +4704,46 @@ fn generate_dense_backend_inner(
         let q35_nv = c.q35_num_v_heads();
         let q35_vd = c.q35_head_v_dim();
         let q35_keydim = q35_nk * q35_kd;
-        let dn_qkvbuf = g.internal(f32d(batch * q35_cc.max(1)));
-        let dn_zbuf = g.internal(f32d(batch * q35_di.max(1)));
-        let dn_convout = g.internal(f32d(batch * q35_cc.max(1)));
-        let dn_qbuf = g.internal(f32d(batch * q35_keydim.max(1)));
-        let dn_kbuf = g.internal(f32d(batch * q35_keydim.max(1)));
-        let dn_vbuf = g.internal(f32d(batch * (q35_nv * q35_vd).max(1)));
+        // Qwen3.8's recurrent mixer is serial with HC/PLE. Its qkv, z and conv output can borrow
+        // those three wide rows; the following HC pass fully overwrites them. Qwen3.5 has no
+        // compatible HC storage and keeps dedicated buffers.
+        let (dn_qkvbuf, dn_zbuf, dn_convout) = if c.qwen4exp {
+            debug_assert!(hcw >= q35_cc && hcw >= q35_di);
+            (qwen_alt, qwen_gate, qwen_normed)
+        } else {
+            (
+                g.internal(f32d(batch * q35_cc.max(1))),
+                g.internal(f32d(batch * q35_di.max(1))),
+                g.internal(f32d(batch * q35_cc.max(1))),
+            )
+        };
+        let q35_vdim = q35_nv * q35_vd;
+        let (dn_qbuf, dn_kbuf, dn_vbuf, dn_out) = if c.qwen4exp {
+            // Recurrent and attention mixers occupy disjoint layers. Borrow the two attention
+            // output rows and qg for packed q/k/v, then overwrite the dead qkv row with DeltaNet's
+            // output. All four values are consumed before the following HC pass.
+            debug_assert!(max_qrow >= q35_keydim);
+            debug_assert!(2 * max_qrow >= q35_vdim);
+            debug_assert!(hcw >= q35_vdim);
+            (q, attn, qg, qwen_alt)
+        } else {
+            (
+                g.internal(f32d(batch * q35_keydim.max(1))),
+                g.internal(f32d(batch * q35_keydim.max(1))),
+                g.internal(f32d(batch * q35_vdim.max(1))),
+                g.internal(f32d(batch * q35_vdim.max(1))),
+            )
+        };
         let dn_bbuf = g.internal(f32d(batch * q35_nv.max(1)));
         let dn_abuf = g.internal(f32d(batch * q35_nv.max(1)));
-        let dn_out = g.internal(f32d(batch * (q35_nv * q35_vd).max(1)));
         // Ling KDA adds a vector forget projection, while its MLA layers add one gate scalar per
         // head. Both are shared scratch across mutually-exclusive layer mixer arms.
-        let kda_forget = g.internal(f32d(batch * c.ssm_d_inner.max(1)));
+        let kda_forget = if c.bailingmoe3 {
+            g.internal(f32d(batch * c.ssm_d_inner.max(1)))
+        } else {
+            hn
+        };
         let mla_gate = g.internal(f32d(batch * c.n_head.max(1)));
-
-        // Qwen3.8 HC/PLE scratch. The wide residual itself is caller-owned (`qwen_wide`); these
-        // buffers are reused serially by each layer and by both HC modules in that layer.
-        let qwen_alt = g.internal(f32d(batch * hcw.max(1)));
-        let qwen_normed = g.internal(f32d(batch * hcw.max(1)));
-        let qwen_low = g.internal(f32d(batch * c.hc_low_rank.max(1)));
-        let qwen_gate = g.internal(f32d(batch * hcw.max(1)));
-        let qwen_inject = g.internal(f32d(batch * c.hc_mult.max(1)));
-        let ple_key = g.internal(f32d(batch * hcw.max(1)));
-        let ple_query = g.internal(f32d(batch * hcw.max(1)));
-        let ple_gated = g.internal(f32d(batch * hcw.max(1)));
-        let ple_conv = g.internal(f32d(batch * hcw.max(1)));
 
         let eps = c.rms_eps;
 
@@ -5085,7 +5136,7 @@ fn generate_dense_backend_inner(
                 g.push(Op::Linear {
                     x: embd,
                     weight: pw.key,
-                    dst: ple_key,
+                    dst: qwen_normed,
                     m: batch as u32,
                     in_f: ple_in as u32,
                     out_f: hcw as u32,
@@ -5101,9 +5152,9 @@ fn generate_dense_backend_inner(
                     w_off: 0,
                 });
                 g.push(Op::QwenHcNorm {
-                    x: ple_key,
+                    x: qwen_normed,
                     norm: pw.norm_key,
-                    dst: ple_key,
+                    dst: qwen_normed,
                     rows: batch as u32,
                     hc: c.hc_mult as u32,
                     n_embd: ne as u32,
@@ -5112,51 +5163,51 @@ fn generate_dense_backend_inner(
                 g.push(Op::QwenHcNorm {
                     x: wide,
                     norm: pw.norm_query,
-                    dst: ple_query,
+                    dst: qwen_gate,
                     rows: batch as u32,
                     hc: c.hc_mult as u32,
                     n_embd: ne as u32,
                     eps,
                 });
                 g.push(Op::QwenPleGate {
-                    key: ple_key,
-                    query: ple_query,
+                    key: qwen_normed,
+                    query: qwen_gate,
                     value: hn,
-                    dst: ple_gated,
+                    dst: qwen_alt,
                     rows: batch as u32,
                     hc: c.hc_mult as u32,
                     n_embd: ne as u32,
                 });
-                // Preserve the unnormalised gated value for the residual add; ple_key is dead
-                // after the gate reduction and can hold the convolution input.
+                // Preserve qwen_alt's unnormalised gated value for the residual add. The old key
+                // and query are dead, so qwen_normed/qwen_gate become conv input/output.
                 g.push(Op::QwenHcNorm {
-                    x: ple_gated,
+                    x: qwen_alt,
                     norm: pw.norm_conv,
-                    dst: ple_key,
+                    dst: qwen_normed,
                     rows: batch as u32,
                     hc: c.hc_mult as u32,
                     n_embd: ne as u32,
                     eps,
                 });
                 g.push(Op::Conv1dSilu {
-                    x: ple_key,
+                    x: qwen_normed,
                     weight: pw.conv,
                     state,
                     state_trace: mtp_ple_trace,
-                    dst: ple_conv,
+                    dst: qwen_gate,
                     rows: batch as u32,
                     channels: hcw as u32,
                     kernel: ((c.ple_conv_kernel - 1) * c.ple_ngram_size + 1) as u32,
                 });
                 g.push(Op::Add {
                     a: wide,
-                    b: ple_gated,
-                    dst: qwen_alt,
+                    b: qwen_alt,
+                    dst: qwen_normed,
                     n: (batch * hcw) as u32,
                 });
                 g.push(Op::Add {
-                    a: qwen_alt,
-                    b: ple_conv,
+                    a: qwen_normed,
+                    b: qwen_gate,
                     dst: wide,
                     n: (batch * hcw) as u32,
                 });

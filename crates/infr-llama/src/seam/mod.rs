@@ -995,7 +995,8 @@ pub(crate) fn generate_dense_vulkan_parallel_mtp_verify_session(
 ///   single-pass flash tier: no score tiles, only the (negligible) flash_pm/pl partials — term
 ///   skipped when no SWA layer remains.
 ///
-/// Times [`ACT_RESERVE_PAD`]. What is deliberately NOT here any more: a fixed 256 MiB that stood
+/// Times [`ACT_RESERVE_PAD`], or Qwen3.8's measured [`QWEN4_ACT_RESERVE_PAD`]. What is deliberately
+/// NOT here any more: a fixed 256 MiB that stood
 /// in for gpu-allocator block granularity, retained upload staging and weight-buffer padding.
 /// Those are not activations at all — they are exactly what the runner's post-load re-clamp
 /// ([`reclamp_ctx_to_live_room`]) prices by ASKING the device, so carrying an estimate of them
@@ -1081,27 +1082,60 @@ pub(crate) fn dense_act_reserve_at(
     // one makes big: qwen35 interleaves q and gate in one projection, so `qg` is DOUBLE the q
     // width and the umbrella's n_embd term no longer covers the three of them.
     let deltanet = if cfg.qwen35 || cfg.qwen4exp {
-        4 * (2 * cfg.q35_conv_channels()
-            + cfg.ssm_d_inner
-            + 2 * cfg.q35_num_k_heads() * cfg.q35_head_k_dim()
-            + 2 * cfg.q35_num_v_heads() * cfg.q35_head_v_dim()
-            + 2 * cfg.q35_num_v_heads())
-            + 12 * cfg.n_head * cfg.max_head_dim()
+        // Qwen3.8 aliases qkv, z and conv output onto its three HC-wide scratch rows. Qwen3.5 has
+        // no HC storage to borrow and retains the three dedicated DeltaNet rows.
+        let dedicated_rows = if cfg.qwen4exp {
+            // qkv/z/conv borrow HC rows; q/k/v/out borrow mutually-exclusive attention rows.
+            2 * cfg.q35_num_v_heads()
+        } else {
+            2 * cfg.q35_conv_channels()
+                + cfg.ssm_d_inner
+                + 2 * cfg.q35_num_k_heads() * cfg.q35_head_k_dim()
+                + 2 * cfg.q35_num_v_heads() * cfg.q35_head_v_dim()
+                + 2 * cfg.q35_num_v_heads()
+        };
+        4 * dedicated_rows
+            // The attention projection retains one interleaved q+gate row. Both consumers read
+            // strided views directly, so the former separately-packed gate row no longer exists.
+            + 8 * cfg.n_head * cfg.max_head_dim()
     } else {
         0
     };
-    // Qwen3.8's caller-owned wide residual; qwen_alt/normed/gate scratch; and PLE
-    // key/query/gated/conv rows are eight f32 `[rows, hc*n_embd]` buffers in total. The low-rank
-    // projection and per-stream injection are f32 too. The generic n_embd umbrella cannot absorb
-    // these hc-wide tensors.
+    // Qwen3.8's caller-owned wide residual plus qwen_alt/normed/gate are four f32
+    // `[rows, hc*n_embd]` buffers in total. PLE now reuses the three HC scratch rows: key/query are
+    // dead after the gate, then normed/gate carry the conv input/output while alt preserves the
+    // gated residual. The low-rank projection and per-stream injection are f32 too. The generic
+    // n_embd umbrella cannot absorb these hc-wide tensors.
     let qwen4_hc = if cfg.qwen4exp {
-        32 * cfg.hc_mult * cfg.n_embd + 4 * cfg.hc_low_rank + 4 * cfg.hc_mult
+        16 * cfg.hc_mult * cfg.n_embd + 4 * cfg.hc_low_rank + 4 * cfg.hc_mult
     } else {
         0
+    };
+    // The generic 96*n_embd envelope includes several architecture-specific rows. Qwen3.8 used
+    // to allocate them because it shares HC, indexer and recurrent dimensions with those models:
+    // three DSV4 HC rows (48*n_embd), four dual-FFN rows (16*n_embd), one E2B row (4*n_embd),
+    // KDA's forget row and DSV4's kv/rope rows. Its own HC/QSA/DeltaNet storage is priced above.
+    let generic_n_embd = if cfg.qwen4exp {
+        let dsv4_rows = 4usize.saturating_mul(
+            cfg.head_dim
+                .saturating_add(cfg.n_head.max(cfg.indexer_n_head) * cfg.rope_dim)
+                .saturating_add(cfg.rope_dim),
+        );
+        (48 * cfg.n_embd)
+            .saturating_sub(20 * cfg.n_embd)
+            .saturating_sub(4 * cfg.ssm_d_inner)
+            .saturating_sub(dsv4_rows)
+    } else {
+        96 * cfg.n_embd
     };
     let per_row =
-        (12 * cfg.n_ff + 96 * cfg.n_embd + attn_pv + attn_s + moe + deltanet + qwen4_hc) as u64;
-    let row_reserve = rows * per_row * ACT_RESERVE_PAD.0 / ACT_RESERVE_PAD.1;
+        (12 * cfg.n_ff + generic_n_embd + attn_pv + attn_s + moe + deltanet + qwen4_hc) as u64;
+    let pad = if cfg.qwen4exp {
+        QWEN4_ACT_RESERVE_PAD
+    } else {
+        ACT_RESERVE_PAD
+    };
+    let row_reserve = rows * per_row * pad.0 / pad.1;
     // Qwen3.8 keeps its scalar decode graph live while a separately compiled batched-prefill
     // graph owns the row-scaled pools above. Two real runs at d4096 measured the fixed intercept
     // at 54.6 MiB (64 rows: 143.6 MiB peak; 128 rows: 232.7 MiB), so round it up to 64 MiB.
@@ -1338,6 +1372,10 @@ pub(crate) fn layer_major_prefill(
 /// is still the largest — which is the argument for deriving these bytes from the graph the runner
 /// already builds rather than re-deriving them here (backlog B8).
 const ACT_RESERVE_PAD: (u64, u64) = (3, 2);
+// Qwen3.8's graph and pooled Prefill workspace measured 2.56 GiB at ubatch 4096 / ctx 160K after
+// cross-architecture rows were removed, versus a 5.67 GiB runtime reserve. Keep a full third over
+// the modeled row set while avoiding the generic model's historical 1.5x over-reservation.
+const QWEN4_ACT_RESERVE_PAD: (u64, u64) = (4, 3);
 const QWEN4_PLAN_OVERLAP_RESERVE: u64 = 64 * 1024 * 1024;
 
 /// Batched-prefill micro-batch: rows per prefill chunk (`device.ubatch` / `INFR_UBATCH`, default
@@ -7000,6 +7038,7 @@ mod seam_helper_tests {
 
     #[test]
     fn qwen38_activation_reserve_tracks_the_real_prefill_batch() {
+        assert_eq!(super::QWEN4_ACT_RESERVE_PAD, (4, 3));
         let cfg = Config {
             qwen4exp: true,
             n_layer: 48,
@@ -7028,10 +7067,11 @@ mod seam_helper_tests {
         };
         let half = super::dense_act_reserve_at(&cfg, &conservative_caps(), 4096, 512);
         let full = super::dense_act_reserve_at(&cfg, &conservative_caps(), 4096, 1024);
-        assert_eq!(
-            full - super::QWEN4_PLAN_OVERLAP_RESERVE,
-            2 * (half - super::QWEN4_PLAN_OVERLAP_RESERVE),
-            "only the row-scaled part doubles; the retained decode plan is fixed"
+        let full_rows = full - super::QWEN4_PLAN_OVERLAP_RESERVE;
+        let twice_half_rows = 2 * (half - super::QWEN4_PLAN_OVERLAP_RESERVE);
+        assert!(
+            full_rows.abs_diff(twice_half_rows) <= 1,
+            "only the row-scaled part doubles apart from integer division rounding; the retained decode plan is fixed"
         );
     }
 
