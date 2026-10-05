@@ -690,9 +690,14 @@ fn main() {
         // Decode twin of `rmsnorm`: 1024 threads + vec4 loads in the single rows==1 workgroup, to
         // buy back the memory-level parallelism the 256-thread build lacks (see rmsnorm.comp).
         ("rmsnorm", "rmsnorm_wide", &["-DWIDE"]),
-        // Fused per-head RMSNorm + SiLU gate multiply (qwen35 DeltaNet z-gate, Op::GatedRmsNorm) —
-        // same reduction as `rmsnorm`, one extra buffer + the gate multiply on store.
+        // Fused per-head RMSNorm + gate multiply (Op::GatedRmsNorm): Qwen3.5 uses SiLU and
+        // Qwen3.8 uses Sigmoid. Both preserve the base reduction and fold the gate into the store.
         ("rmsnorm", "rmsnorm_gate", &["-DGATE"]),
+        (
+            "rmsnorm",
+            "rmsnorm_gate_sigmoid",
+            &["-DGATE", "-DGATE_SIGMOID"],
+        ),
         ("rmsnorm", "rmsnorm_add", &["-DADD"]),
         // f16-in/f16-out RMSNorm (llama4's post-rope weightless Q/K L2-norm, `Op::QkNorm` on the
         // f16 rope scratch — `w` stays f32).

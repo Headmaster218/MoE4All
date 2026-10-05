@@ -4937,6 +4937,38 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Qwen3.8 variant of [`Self::rmsnorm_gate`], using a Sigmoid rather than SiLU gate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_gate_sigmoid(
+        &self,
+        x: &dyn Buffer,
+        w: &dyn Buffer,
+        z: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) {
+        let k = self.be.kernel_sg(
+            "rmsnorm_gate_sigmoid",
+            crate::gemm::rmsnorm_gate_sigmoid_spv(),
+            4,
+            12,
+            32,
+        );
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&eps.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(w), Self::vkb(z), Self::vkb(y)],
+            1,
+            &push,
+            rows as u32,
+        );
+    }
+
     /// Row-wise softmax: `y[r,:] = softmax(x[r,:] * scale)` over `dim` columns, one workgroup per
     /// row (diffusion-gemma's in-graph self-conditioning — see docs/diffusion-gemma.md's Phase-B
     /// and the reference's `dg_canvas_embed`). Same 256-thread subgroup-reduction shape as

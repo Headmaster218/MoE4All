@@ -1101,9 +1101,9 @@ impl Backend for CpuBackend {
                     }
                     vals[dst.0 as usize] = out;
                 }
-                // Fused per-head RMSNorm + SiLU gate multiply (qwen35 DeltaNet z-gate). Reduction
+                // Fused per-head RMSNorm + gate multiply. Reduction
                 // structure is IDENTICAL to the `QkNorm` arm above (bit-stable normalization); the
-                // gate multiply is the extra elementwise step `GatedAct(Silu)` would otherwise do
+                // gate multiply is the extra elementwise `GatedAct` step that would otherwise run
                 // as a second op.
                 Op::GatedRmsNorm {
                     x,
@@ -1114,6 +1114,7 @@ impl Backend for CpuBackend {
                     n_head,
                     head_dim,
                     eps,
+                    act,
                 } => {
                     let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
                     let xs = &vals[x.0 as usize];
@@ -1129,8 +1130,17 @@ impl Backend for CpuBackend {
                             for i in 0..hd {
                                 let normed = xs[b + i] * s * ws[i];
                                 let zv = zs[b + i];
-                                let silu = zv / (1.0 + (-zv).exp());
-                                out[b + i] = normed * silu;
+                                let gate = match act {
+                                    Activation::Silu => zv / (1.0 + (-zv).exp()),
+                                    Activation::Sigmoid => 1.0 / (1.0 + (-zv).exp()),
+                                    Activation::Gelu => {
+                                        0.5 * zv
+                                            * (1.0
+                                                + (0.797_884_6 * (zv + 0.044715 * zv * zv * zv))
+                                                    .tanh())
+                                    }
+                                };
+                                out[b + i] = normed * gate;
                             }
                         }
                     }
@@ -4946,6 +4956,98 @@ fn deltanet_scan(
 mod tests {
     use super::*;
     use infr_core::tensor::TensorDesc;
+
+    #[test]
+    fn gated_rmsnorm_matches_split_graph() {
+        let (rows, n_head, head_dim) = (3usize, 4usize, 8usize);
+        let n = rows * n_head * head_dim;
+        let values: Vec<f32> = (0..n).map(|i| (i as f32 * 0.17).sin()).collect();
+        let gates: Vec<f32> = (0..n).map(|i| (i as f32 * 0.31).cos()).collect();
+        let weights: Vec<f32> = (0..head_dim).map(|i| 0.75 + i as f32 * 0.05).collect();
+
+        for act in [Activation::Silu, Activation::Sigmoid] {
+            let backend = CpuBackend::new();
+            let mut graph = Graph::new();
+            let x = graph.input(TensorDesc::new(vec![rows, n_head, head_dim], DType::F32));
+            let gate = graph.input(TensorDesc::new(vec![rows, n_head, head_dim], DType::F32));
+            let weight = graph.weight(TensorDesc::new(vec![head_dim], DType::F32));
+            let normed = graph.internal(TensorDesc::new(vec![rows, n_head, head_dim], DType::F32));
+            let fused = graph.output(TensorDesc::new(vec![rows, n_head, head_dim], DType::F32));
+            let split = graph.output(TensorDesc::new(vec![rows, n_head, head_dim], DType::F32));
+            graph.push(Op::GatedRmsNorm {
+                x,
+                weight,
+                gate,
+                dst: fused,
+                rows: rows as u32,
+                n_head: n_head as u32,
+                head_dim: head_dim as u32,
+                eps: 1e-6,
+                act,
+            });
+            graph.push(Op::QkNorm {
+                x,
+                weight: Some(weight),
+                dst: normed,
+                rows: rows as u32,
+                n_head: n_head as u32,
+                head_dim: head_dim as u32,
+                eps: 1e-6,
+                x_stride: 0,
+            });
+            graph.push(Op::GatedAct {
+                gate,
+                up: normed,
+                dst: split,
+                rows: rows as u32,
+                nff: (n_head * head_dim) as u32,
+                act,
+                up_off: 0,
+                up_stride: 0,
+                gate_stride: 0,
+                gate_block_width: 0,
+                swiglu_clamp: None,
+            });
+
+            let plan = backend.compile(&graph).expect("compile");
+            let xb = backend.alloc(n * 4, BufferUsage::Activations).expect("x");
+            let gb = backend
+                .alloc(n * 4, BufferUsage::Activations)
+                .expect("gate");
+            let wb = backend
+                .alloc(head_dim * 4, BufferUsage::Weights)
+                .expect("weight");
+            let fb = backend.alloc(n * 4, BufferUsage::Readback).expect("fused");
+            let sb = backend.alloc(n * 4, BufferUsage::Readback).expect("split");
+            backend
+                .upload(xb.as_ref(), bytemuck::cast_slice(&values))
+                .unwrap();
+            backend
+                .upload(gb.as_ref(), bytemuck::cast_slice(&gates))
+                .unwrap();
+            backend
+                .upload(wb.as_ref(), bytemuck::cast_slice(&weights))
+                .unwrap();
+            let mut bindings = Bindings::new();
+            bindings
+                .bind(x, xb.as_ref())
+                .bind(gate, gb.as_ref())
+                .bind(weight, wb.as_ref())
+                .bind(fused, fb.as_ref())
+                .bind(split, sb.as_ref());
+            backend.execute(plan.as_ref(), &bindings).expect("execute");
+
+            let mut fused_bytes = vec![0u8; n * 4];
+            let mut split_bytes = vec![0u8; n * 4];
+            backend.download(fb.as_ref(), &mut fused_bytes).unwrap();
+            backend.download(sb.as_ref(), &mut split_bytes).unwrap();
+            assert_eq!(
+                bytemuck::cast_slice::<u8, f32>(&fused_bytes),
+                bytemuck::cast_slice::<u8, f32>(&split_bytes),
+                "GatedRmsNorm {act:?} differs from split QkNorm/GatedAct"
+            );
+        }
+    }
 
     #[test]
     fn multimodal_rope_matches_plain_rope_when_text_planes_are_equal() {

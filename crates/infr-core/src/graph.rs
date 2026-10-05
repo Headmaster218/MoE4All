@@ -259,10 +259,10 @@ pub enum Op {
         /// per-head CopyStrided dispatch.
         x_stride: u32,
     },
-    /// Fused per-head RMSNorm + SiLU gate multiply: `QkNorm` immediately followed by an
-    /// `Op::GatedAct` (`Activation::Silu`) consuming QkNorm's own output (qwen35's DeltaNet
-    /// silu-gated RMSNorm — see docs/qwen35.md). One pass: for each of `rows * n_head` heads,
-    /// `dst[i] = (x[i] * rms_scale * weight[i]) * silu(gate[i])` where `rms_scale =
+    /// Fused per-head RMSNorm + gate multiply: `QkNorm` immediately followed by an
+    /// `Op::GatedAct` consuming QkNorm's own output. Qwen3.5 uses `Activation::Silu`; Qwen3.8
+    /// uses `Activation::Sigmoid`. One pass: for each of `rows * n_head` heads,
+    /// `dst[i] = (x[i] * rms_scale * weight[i]) * act(gate[i])` where `rms_scale =
     /// 1/sqrt(mean_head(x^2) + eps)` and `i` ranges over the head's `head_dim` elements. `gate` is
     /// a same-shape `[rows, n_head*head_dim]` buffer, indexed by the SAME flat element position as
     /// `x` (not a separate per-head layout). In place when `dst == x`.
@@ -282,6 +282,7 @@ pub enum Op {
         n_head: u32,
         head_dim: u32,
         eps: f32,
+        act: Activation,
     },
     /// RoPE over the first `rope_dim` of each head; dims past `rope_dim` pass through unrotated.
     /// `positions` is an i32 tensor of length `rows`. `freq_factors`, if present, divides per-pair

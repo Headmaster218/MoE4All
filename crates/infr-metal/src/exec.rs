@@ -267,6 +267,8 @@ mod tests {
         let src = include_str!("../shaders/elementwise_norms.metal");
         assert!(src.contains("kernel void gated_rmsnorm_f32"));
         assert!(src.contains("float silu = z / (1.0f + exp(-z))"));
+        assert!(src.contains("kernel void gated_rmsnorm_sigmoid_f32"));
+        assert!(src.contains("float sigmoid = 1.0f / (1.0f + exp(-z))"));
     }
 
     /// Match a shader tripwire on TOKENS, not on exact source formatting — the same helper the
@@ -555,6 +557,7 @@ mod tests {
             n_head: 1,
             head_dim: 64,
             eps: 1e-6,
+            act: infr_core::graph::Activation::Silu,
         });
 
         let q = g.input(TensorDesc::new(vec![1, 1, 64], DType::F32));
@@ -2680,13 +2683,21 @@ impl MetalBackend {
                 n_head,
                 head_dim,
                 eps,
+                act,
             } => {
                 let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
                 let bx = self.ensure_device(r, x);
                 let bw = self.weight_buf(weight, g, bindings)?;
                 let bg = self.ensure_device(r, gate);
                 let bd = self.dev_dst(r, dst, rows * nh * hd);
-                let pso = self.pipelines.get("gated_rmsnorm_f32")?;
+                let kernel = match act {
+                    infr_core::graph::Activation::Silu => "gated_rmsnorm_f32",
+                    infr_core::graph::Activation::Sigmoid => "gated_rmsnorm_sigmoid_f32",
+                    infr_core::graph::Activation::Gelu => {
+                        return Err(Error::backend("Metal GatedRmsNorm Gelu unsupported"))
+                    }
+                };
+                let pso = self.pipelines.get(kernel)?;
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(nh as u32).to_ne_bytes());
                 p.extend_from_slice(&(hd as u32).to_ne_bytes());

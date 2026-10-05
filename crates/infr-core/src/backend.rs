@@ -189,8 +189,8 @@ pub struct Capabilities {
     /// instead of the `[vocab]` logits + host argmax/softmax scan). Backends without the kernel
     /// leave this false and the MTP driver keeps the host-logits `top1_softmax` path.
     pub argmax_prob: bool,
-    /// The backend executes [`crate::Op::GatedRmsNorm`] (fused per-head RMSNorm + SiLU gate
-    /// multiply — qwen35's DeltaNet z-gate, one dispatch instead of `QkNorm`→`GatedAct`'s two).
+    /// The backend executes [`crate::Op::GatedRmsNorm`] (fused per-head RMSNorm + SiLU/Sigmoid
+    /// gate multiply, one dispatch instead of `QkNorm`→`GatedAct`'s two).
     /// False = the runner keeps emitting the split pair (identical math, one extra
     /// read-after-write barrier on backends that have one).
     pub gated_rmsnorm: bool,

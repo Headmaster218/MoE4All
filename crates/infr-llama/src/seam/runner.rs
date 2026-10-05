@@ -5354,11 +5354,10 @@ fn generate_dense_backend_inner(
                     eps: 1e-6,
                     src_stride: 0,
                 });
-                // silu-gated RMSNorm per v-head: rmsnorm(out, ssm_norm) then * silu(z). Fused into
-                // ONE dispatch when the backend supports it (see `fuse_gated_rmsnorm`'s doc) — the
-                // split form's GatedAct reads QkNorm's freshly-written `dn_out`, a real
-                // read-after-write hazard the fusion removes.
-                if fuse_gated_rmsnorm && !c.qwen4exp {
+                // Gated RMSNorm per v-head: qwen35 uses SiLU and qwen4exp uses Sigmoid. Fuse the
+                // norm and gate into one dispatch when supported, removing the split form's
+                // read-after-write hazard on `dn_out`.
+                if fuse_gated_rmsnorm {
                     g.push(Op::GatedRmsNorm {
                         x: dn_out,
                         weight: dw.ssm_norm,
@@ -5368,6 +5367,11 @@ fn generate_dense_backend_inner(
                         n_head: q35_nv as u32,
                         head_dim: q35_vd as u32,
                         eps,
+                        act: if c.qwen4exp {
+                            Activation::Sigmoid
+                        } else {
+                            Activation::Silu
+                        },
                     });
                 } else {
                     g.push(Op::QkNorm {

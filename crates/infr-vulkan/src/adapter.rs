@@ -6133,8 +6133,9 @@ fn lower_op(
             n_head,
             head_dim,
             eps,
+            act,
         } => {
-            rec.rmsnorm_gate(
+            let args = (
                 r(*x)?,
                 r(*weight)?,
                 r(*gate)?,
@@ -6143,6 +6144,17 @@ fn lower_op(
                 *head_dim as usize,
                 *eps,
             );
+            match act {
+                Activation::Silu => {
+                    rec.rmsnorm_gate(args.0, args.1, args.2, args.3, args.4, args.5, args.6)
+                }
+                Activation::Sigmoid => {
+                    rec.rmsnorm_gate_sigmoid(args.0, args.1, args.2, args.3, args.4, args.5, args.6)
+                }
+                Activation::Gelu => {
+                    return Err(be("vulkan adapter: GatedRmsNorm Gelu unsupported"))
+                }
+            }
         }
         // Qwen3-Next SSM: depthwise causal conv + SiLU (rolling conv `state` mutated in place).
         Op::Conv1dSilu {
@@ -12977,10 +12989,9 @@ mod tests {
         }
     }
 
-    /// A one-op `GatedRmsNorm` graph (fused per-head RMSNorm + SiLU gate, qwen35 DeltaNet z-gate)
-    /// through the seam must match `rmsnorm(x,w) * silu(z)` computed in two host passes — i.e.
-    /// the SAME thing the split `QkNorm`→`GatedAct` pair produces. Multi-head (n_head=2) shape so
-    /// the per-head reduction boundary is exercised, not just a single-row rmsnorm.
+    /// A one-op `GatedRmsNorm` graph through the seam must match the split
+    /// `QkNorm`→`GatedAct` pair for both supported gates. Multi-row and multi-head geometry
+    /// exercises the per-head reduction boundaries used by Decode and Prefill.
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn gated_rmsnorm_graph_matches_host() {
@@ -12992,58 +13003,64 @@ mod tests {
         let x: Vec<f32> = (0..rows * dim).map(|i| i as f32 * 0.1 - 0.4).collect();
         let w: Vec<f32> = (0..head_dim).map(|i| 1.0 + i as f32 * 0.05).collect();
         let z: Vec<f32> = (0..rows * dim).map(|i| (i as f32 * 0.37).sin()).collect();
-        let silu = |v: f32| v / (1.0 + (-v).exp());
-        // host reference: per-head rmsnorm, then elementwise silu(z) gate — the split-op semantics.
-        let mut want = vec![0f32; rows * dim];
-        for r in 0..rows {
-            for h in 0..n_head {
-                let b = (r * n_head + h) * head_dim;
-                let ss = (0..head_dim).map(|i| x[b + i] * x[b + i]).sum::<f32>() / head_dim as f32;
-                let s = 1.0 / (ss + eps).sqrt();
-                for i in 0..head_dim {
-                    want[b + i] = x[b + i] * s * w[i] * silu(z[b + i]);
+        for act in [Activation::Silu, Activation::Sigmoid] {
+            let mut want = vec![0f32; rows * dim];
+            for r in 0..rows {
+                for h in 0..n_head {
+                    let b = (r * n_head + h) * head_dim;
+                    let ss =
+                        (0..head_dim).map(|i| x[b + i] * x[b + i]).sum::<f32>() / head_dim as f32;
+                    let s = 1.0 / (ss + eps).sqrt();
+                    for i in 0..head_dim {
+                        let zv = z[b + i];
+                        let gate = match act {
+                            Activation::Silu => zv / (1.0 + (-zv).exp()),
+                            Activation::Sigmoid => 1.0 / (1.0 + (-zv).exp()),
+                            Activation::Gelu => unreachable!(),
+                        };
+                        want[b + i] = x[b + i] * s * w[i] * gate;
+                    }
                 }
             }
-        }
-        let mut g = Graph::new();
-        let xi = g.input(TensorDesc::new(vec![rows, dim], DType::F32));
-        let wi = g.weight(TensorDesc::new(vec![head_dim], DType::F32));
-        let zi = g.input(TensorDesc::new(vec![rows, dim], DType::F32));
-        let yi = g.output(TensorDesc::new(vec![rows, dim], DType::F32));
-        g.push(Op::GatedRmsNorm {
-            x: xi,
-            weight: wi,
-            gate: zi,
-            dst: yi,
-            rows: rows as u32,
-            n_head: n_head as u32,
-            head_dim: head_dim as u32,
-            eps,
-        });
-        let xb = be_.alloc(rows * dim * 4, BufferUsage::Activations).unwrap();
-        let wb = be_.alloc(head_dim * 4, BufferUsage::Weights).unwrap();
-        let zb = be_.alloc(rows * dim * 4, BufferUsage::Activations).unwrap();
-        let yb = be_.alloc(rows * dim * 4, BufferUsage::Activations).unwrap();
-        be_.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
-        be_.upload(wb.as_ref(), bytemuck::cast_slice(&w)).unwrap();
-        be_.upload(zb.as_ref(), bytemuck::cast_slice(&z)).unwrap();
-        let plan = be_.compile(&g).unwrap();
-        let mut bind = Bindings::new();
-        bind.bind(xi, xb.as_ref());
-        bind.bind(wi, wb.as_ref());
-        bind.bind(zi, zb.as_ref());
-        bind.bind(yi, yb.as_ref());
-        be_.execute(plan.as_ref(), &bind).unwrap();
-        let mut got = vec![0f32; rows * dim];
-        be_.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
-            .unwrap();
-        for i in 0..rows * dim {
-            assert!(
-                (got[i] - want[i]).abs() < 1e-3,
-                "gated_rmsnorm mismatch at {i}: got {} want {}",
-                got[i],
-                want[i]
-            );
+
+            let mut g = Graph::new();
+            let xi = g.input(TensorDesc::new(vec![rows, dim], DType::F32));
+            let wi = g.weight(TensorDesc::new(vec![head_dim], DType::F32));
+            let zi = g.input(TensorDesc::new(vec![rows, dim], DType::F32));
+            g.push(Op::GatedRmsNorm {
+                x: xi,
+                weight: wi,
+                gate: zi,
+                dst: xi,
+                rows: rows as u32,
+                n_head: n_head as u32,
+                head_dim: head_dim as u32,
+                eps,
+                act,
+            });
+            let xb = be_.alloc(rows * dim * 4, BufferUsage::Activations).unwrap();
+            let wb = be_.alloc(head_dim * 4, BufferUsage::Weights).unwrap();
+            let zb = be_.alloc(rows * dim * 4, BufferUsage::Activations).unwrap();
+            be_.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+            be_.upload(wb.as_ref(), bytemuck::cast_slice(&w)).unwrap();
+            be_.upload(zb.as_ref(), bytemuck::cast_slice(&z)).unwrap();
+            let plan = be_.compile(&g).unwrap();
+            let mut bind = Bindings::new();
+            bind.bind(xi, xb.as_ref());
+            bind.bind(wi, wb.as_ref());
+            bind.bind(zi, zb.as_ref());
+            be_.execute(plan.as_ref(), &bind).unwrap();
+            let mut got = vec![0f32; rows * dim];
+            be_.download(xb.as_ref(), bytemuck::cast_slice_mut(&mut got))
+                .unwrap();
+            for i in 0..rows * dim {
+                assert!(
+                    (got[i] - want[i]).abs() < 1e-3,
+                    "gated_rmsnorm {act:?} mismatch at {i}: got {} want {}",
+                    got[i],
+                    want[i]
+                );
+            }
         }
     }
 

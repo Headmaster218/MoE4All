@@ -264,6 +264,31 @@ kernel void gated_rmsnorm_f32(device const float* x    [[buffer(0)]],
     }
 }
 
+// Qwen3.8 variant of gated_rmsnorm_f32: identical RMSNorm reduction with a Sigmoid output gate.
+kernel void gated_rmsnorm_sigmoid_f32(device const float* x    [[buffer(0)]],
+                                      device const float* w    [[buffer(1)]],
+                                      device const float* gate [[buffer(2)]],
+                                      device float*       dst  [[buffer(3)]],
+                                      constant QkNormParams& p [[buffer(4)]],
+                                      uint gid  [[thread_position_in_grid]],
+                                      uint lane [[thread_index_in_simdgroup]]) {
+    uint grp = gid / 32u;
+    if (grp >= p.rows * p.n_head) return;
+    uint base = grp * p.head_dim;
+    float ss = 0.0f;
+    for (uint i = lane; i < p.head_dim; i += 32u) {
+        float v = x[base + i];
+        ss += v * v;
+    }
+    float s = 1.0f / sqrt(simd_sum(ss) / (float)p.head_dim + p.eps);
+    for (uint i = lane; i < p.head_dim; i += 32u) {
+        uint at = base + i;
+        float z = gate[at];
+        float sigmoid = 1.0f / (1.0f + exp(-z));
+        dst[at] = x[at] * s * w[i] * sigmoid;
+    }
+}
+
 // Greedy argmax over `n` logits → token id (one 256-thread threadgroup, strided scan +
 // threadgroup tree-reduce). Strict > keeps the lowest index on ties, matching the host argmax
 // (same contract as the Vulkan argmax.comp). The id is written as a u32 bit-pattern into the

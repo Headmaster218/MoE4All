@@ -2053,6 +2053,8 @@ const ATTN_PV_REDUCE_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_pv_reduce.spv"));
 const RMSNORM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rmsnorm.spv"));
 const RMSNORM_GATE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rmsnorm_gate.spv"));
+const RMSNORM_GATE_SIGMOID_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/rmsnorm_gate_sigmoid.spv"));
 const DELTANET_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/deltanet.spv"));
 const DELTANET_CHUNKED_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_chunked.spv"));
@@ -2566,6 +2568,12 @@ pub(crate) fn rmsnorm_wide_spv() -> &'static [u32] {
 pub(crate) fn rmsnorm_gate_spv() -> &'static [u32] {
     static RMSNORM_GATE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     RMSNORM_GATE_SPV.get_or_init(|| spv_words(RMSNORM_GATE_SPV_BYTES))
+}
+/// SPIR-V for the Qwen3.8 fused per-head RMSNorm + Sigmoid gate multiply.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn rmsnorm_gate_sigmoid_spv() -> &'static [u32] {
+    static RMSNORM_GATE_SIGMOID_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+    RMSNORM_GATE_SIGMOID_SPV.get_or_init(|| spv_words(RMSNORM_GATE_SIGMOID_SPV_BYTES))
 }
 /// SPIR-V for fused RMSNorm + in-place add (`rmsnorm.comp`'s -DADD build, `Op::RmsNormAdd`).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
