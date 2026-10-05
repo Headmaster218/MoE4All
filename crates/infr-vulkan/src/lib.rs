@@ -290,6 +290,27 @@ fn backend_physical_alloc_room(vram: VramInfo, tracked_used: u64) -> u64 {
     }
 }
 
+/// Windows Xe1's mapped-VRAM path slows down before WDDM's reported budget is exhausted. The
+/// A770 sweep in issue #41 measured its best conservative point at 12 GiB of a 15.88 GiB heap and
+/// a stable higher-capacity point at 13.5 GiB. Keep this device policy inside Vulkan, and leave
+/// every explicit user limit and every other architecture on the shared automatic policy.
+fn automatic_device_vram_budget_cap(
+    total: u64,
+    arch: crate::caps::DeviceArch,
+    profile: infr_core::config::AutoProfile,
+    explicit_limit: bool,
+    windows: bool,
+) -> Option<u64> {
+    if explicit_limit || !windows || arch != crate::caps::DeviceArch::IntelXe1 {
+        return None;
+    }
+    let percent = match profile {
+        infr_core::config::AutoProfile::Conservative => 75,
+        infr_core::config::AutoProfile::Aggressive => 85,
+    };
+    Some(total.saturating_mul(percent) / 100)
+}
+
 const AUTO_SUBMIT_INITIAL_CAP: usize = 16;
 const AUTO_SUBMIT_SAMPLES_PER_CAP: usize = 2;
 const AUTO_SUBMIT_MAX_ROUNDS: usize = 12;
@@ -4869,14 +4890,24 @@ impl VulkanBackend {
     pub fn alloc_room(&self) -> u64 {
         let vram = self.vram();
         let tracked_used = self.shared.device_used.load(Ordering::Relaxed);
-        infr_core::budget::unified_vram_room_for_profile(
+        let room = infr_core::budget::unified_vram_room_for_profile(
             vram.total,
             backend_physical_alloc_room(vram, tracked_used),
             tracked_used,
             self.cfg.device.vram_budget,
             self.cfg.device.vram_reserve,
             self.cfg.device.auto_profile,
+        );
+        let explicit_limit =
+            self.cfg.device.vram_budget.is_some() || self.cfg.device.vram_reserve.is_some();
+        automatic_device_vram_budget_cap(
+            vram.total,
+            self.shared.device_arch,
+            self.cfg.device.auto_profile,
+            explicit_limit,
+            cfg!(target_os = "windows"),
         )
+        .map_or(room, |cap| room.min(cap.saturating_sub(tracked_used)))
     }
 
     /// Device-memory budget guard: hard-error BEFORE a device-local allocation of `want` bytes
@@ -7813,6 +7844,51 @@ fn probe_flash_attention_hd256(
 mod tests {
     use super::*;
     use infr_core::Backend;
+
+    #[test]
+    fn windows_xe1_automatic_vram_caps_are_architecture_scoped() {
+        const GIB: u64 = 1 << 30;
+        let total = 16 * GIB;
+
+        assert_eq!(
+            automatic_device_vram_budget_cap(
+                total,
+                crate::caps::DeviceArch::IntelXe1,
+                infr_core::config::AutoProfile::Conservative,
+                false,
+                true,
+            ),
+            Some(12 * GIB),
+        );
+        assert_eq!(
+            automatic_device_vram_budget_cap(
+                total,
+                crate::caps::DeviceArch::IntelXe1,
+                infr_core::config::AutoProfile::Aggressive,
+                false,
+                true,
+            ),
+            Some(total * 85 / 100),
+        );
+
+        for (arch, explicit, windows) in [
+            (crate::caps::DeviceArch::AmdRdna3, false, true),
+            (crate::caps::DeviceArch::IntelXe2, false, true),
+            (crate::caps::DeviceArch::IntelXe1, true, true),
+            (crate::caps::DeviceArch::IntelXe1, false, false),
+        ] {
+            assert_eq!(
+                automatic_device_vram_budget_cap(
+                    total,
+                    arch,
+                    infr_core::config::AutoProfile::Conservative,
+                    explicit,
+                    windows,
+                ),
+                None,
+            );
+        }
+    }
 
     #[test]
     fn default_device_prefers_the_largest_discrete_gpu() {
