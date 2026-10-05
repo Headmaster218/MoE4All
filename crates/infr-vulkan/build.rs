@@ -760,6 +760,16 @@ fn main() {
             &["-DKV_SEGMENTED", "-DQSA_SCORE_H4"],
         ),
         (
+            "qsa_indexer_score_tile8",
+            "qsa_indexer_score_h4_t32_seg",
+            &["-DBLOCK_TILE=32", "-DKV_SEGMENTED"],
+        ),
+        (
+            "qsa_indexer_score_tile8",
+            "qsa_indexer_score_h4_t64_seg",
+            &["-DBLOCK_TILE=64", "-DKV_SEGMENTED"],
+        ),
+        (
             "qsa_indexer_score",
             "qsa_indexer_score_decode8",
             &["-DQSA_SCORE_DECODE8"],
@@ -835,6 +845,26 @@ fn main() {
             "qsa_attention_batch",
             "qsa_attention_batch_q8_seg_gqa2",
             &["-DKQ8", "-DVQ8", "-DKV_SEGMENTED", "-DGQA_HEADS=2"],
+        ),
+        (
+            "qsa_attention_batch_gqa12",
+            "qsa_attention_batch_q8_seg_gqa12",
+            &[],
+        ),
+        (
+            "qsa_attention_batch_gqa12_flash",
+            "qsa_attention_batch_q8_seg_gqa12_flash",
+            &[],
+        ),
+        (
+            "qsa_attention_batch_gqa12_flash",
+            "qsa_attention_batch_q8_seg_gqa12_flash_cm_qk",
+            &["-DCOOP_QK"],
+        ),
+        (
+            "qsa_attention_batch_gqa12_flash",
+            "qsa_attention_batch_q8_seg_gqa12_flash_cm_qk_pv",
+            &["-DCOOP_QK", "-DCOOP_PV"],
         ),
         // DeepSeek V4 Sinkhorn hyper-connections (Op::HyperConnectMix / Pre / Post). `-DGATES`
         // adds the `post` + `comb` outputs; without it the mix kernel is `build_hc_head`'s

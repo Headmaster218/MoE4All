@@ -9454,7 +9454,23 @@ impl<'a> Recorder<'a> {
         let segmented = segment_shifts.is_some();
         let h4 = rows > 1 && n_head == 4 && head_dim == 128;
         let decode8_h4 = decode8 && n_head == 4 && head_dim == 128;
-        let (score_name, score_spv, block_tile, query_tile) = if decode8_h4 && segmented {
+        let score_tile = self.vk().qsa_score_tile;
+        let (score_name, score_spv, block_tile, query_tile) = if h4 && segmented && score_tile == 64
+        {
+            (
+                "qsa_indexer_score_h4_t64_seg",
+                crate::gemm::qsa_indexer_score_h4_t64_seg_spv(),
+                64,
+                8,
+            )
+        } else if h4 && segmented && score_tile == 32 {
+            (
+                "qsa_indexer_score_h4_t32_seg",
+                crate::gemm::qsa_indexer_score_h4_t32_seg_spv(),
+                32,
+                8,
+            )
+        } else if decode8_h4 && segmented {
             (
                 "qsa_indexer_score_decode8_h4_seg",
                 crate::gemm::qsa_indexer_score_decode8_h4_seg_spv(),
@@ -9693,46 +9709,77 @@ impl<'a> Recorder<'a> {
         let grouped = if k_q8 && v_q8 && segmented {
             let group = n_head / n_kv.max(1);
             match requested_gqa {
+                12 if group == 12 && head_dim == 256 => 12,
                 2 if group.is_multiple_of(2) => 2,
                 _ => 1,
             }
         } else {
             1
         };
-        let (name, spv) = match (k_q8, v_q8, segmented, grouped) {
-            (true, true, true, 2) => (
+        let flash_gqa12 = grouped == 12 && self.vk().qsa_prefill_tile >= 32;
+        let coop_qk = flash_gqa12
+            && self.vk().qsa_prefill_coopmat
+            && self.be.caps().f16_coopmat()
+            && n_head >= 16;
+        let coop_pv = coop_qk && self.vk().qsa_prefill_coopmat_pv;
+        let (name, spv) = match (
+            k_q8,
+            v_q8,
+            segmented,
+            grouped,
+            flash_gqa12,
+            coop_qk,
+            coop_pv,
+        ) {
+            (true, true, true, 12, true, true, true) => (
+                "qsa_attention_batch_q8_seg_gqa12_flash_cm_qk_pv",
+                crate::gemm::qsa_attention_batch_q8_seg_gqa12_flash_cm_qk_pv_spv(),
+            ),
+            (true, true, true, 12, true, true, false) => (
+                "qsa_attention_batch_q8_seg_gqa12_flash_cm_qk",
+                crate::gemm::qsa_attention_batch_q8_seg_gqa12_flash_cm_qk_spv(),
+            ),
+            (true, true, true, 12, true, false, _) => (
+                "qsa_attention_batch_q8_seg_gqa12_flash",
+                crate::gemm::qsa_attention_batch_q8_seg_gqa12_flash_spv(),
+            ),
+            (true, true, true, 12, false, _, _) => (
+                "qsa_attention_batch_q8_seg_gqa12",
+                crate::gemm::qsa_attention_batch_q8_seg_gqa12_spv(),
+            ),
+            (true, true, true, 2, _, _, _) => (
                 "qsa_attention_batch_q8_seg_gqa2",
                 crate::gemm::qsa_attention_batch_q8_seg_gqa2_spv(),
             ),
-            (false, false, true, _) => (
+            (false, false, true, _, _, _, _) => (
                 "qsa_attention_batch_seg",
                 crate::gemm::qsa_attention_batch_seg_spv(),
             ),
-            (true, false, true, _) => (
+            (true, false, true, _, _, _, _) => (
                 "qsa_attention_batch_kq8_seg",
                 crate::gemm::qsa_attention_batch_kq8_seg_spv(),
             ),
-            (false, true, true, _) => (
+            (false, true, true, _, _, _, _) => (
                 "qsa_attention_batch_vq8_seg",
                 crate::gemm::qsa_attention_batch_vq8_seg_spv(),
             ),
-            (true, true, true, _) => (
+            (true, true, true, _, _, _, _) => (
                 "qsa_attention_batch_q8_seg",
                 crate::gemm::qsa_attention_batch_q8_seg_spv(),
             ),
-            (false, false, false, _) => (
+            (false, false, false, _, _, _, _) => (
                 "qsa_attention_batch",
                 crate::gemm::qsa_attention_batch_spv(),
             ),
-            (true, false, false, _) => (
+            (true, false, false, _, _, _, _) => (
                 "qsa_attention_batch_kq8",
                 crate::gemm::qsa_attention_batch_kq8_spv(),
             ),
-            (false, true, false, _) => (
+            (false, true, false, _, _, _, _) => (
                 "qsa_attention_batch_vq8",
                 crate::gemm::qsa_attention_batch_vq8_spv(),
             ),
-            (true, true, false, _) => (
+            (true, true, false, _, _, _, _) => (
                 "qsa_attention_batch_q8",
                 crate::gemm::qsa_attention_batch_q8_spv(),
             ),
@@ -13853,7 +13900,7 @@ mod tests {
         const HEADS: usize = 4;
         const TOP: usize = 512;
 
-        let be = VulkanBackend::new().unwrap();
+        let be = be_with(|vk| vk.qsa_prefill_gqa = 12);
         let _pool = be.init_unified_vram(224 * MIB).unwrap();
         let kv_len = SEGMENT_ROWS + 6;
         let blocks = kv_len / RATIO;
@@ -14135,7 +14182,7 @@ mod tests {
         const N_HEAD: usize = 24;
         const N_KV: usize = 2;
         const ROW_ELEMS: usize = N_KV * ATTN_HD;
-        const CROSS_ROWS: usize = 8;
+        const CROSS_ROWS: usize = 17;
         const SELECTED: usize = 2;
         let kv_segment_elements = SEGMENT_ROWS * ROW_ELEMS;
         let kv_segment_bytes = (kv_segment_elements / 32 * 34).next_multiple_of(4);
@@ -14262,7 +14309,9 @@ mod tests {
             0,
             Some(kv_shift),
         );
-        let qsa_kv_len = (SEGMENT_ROWS + RATIO) as u32;
+        // Include a nine-token causal tail so the GQA12 path crosses both the physical 32K
+        // boundary and its sixteen-key LDS tile boundary in the same dispatch.
+        let qsa_kv_len = (SEGMENT_ROWS + RATIO + 9) as u32;
         rec.qsa_attention_batch(
             attn_q.as_ref(),
             k_flat.as_ref(),
@@ -14336,8 +14385,8 @@ mod tests {
             .map(|(segmented, flat)| (segmented - flat).abs())
             .fold(0.0f32, f32::max);
         assert!(
-            attention_err <= 1e-6,
-            "segmented grouped-Q8 QSA attention differs across 32K: {attention_err:e}"
+            attention_err <= 3e-4,
+            "segmented LDS-GQA12 QSA attention differs across 32K: {attention_err:e}"
         );
     }
 

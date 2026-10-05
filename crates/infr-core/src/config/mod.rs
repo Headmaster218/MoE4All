@@ -442,9 +442,21 @@ cfg_struct! {
         q8_decode_gqa2: bool = true,
         /// Reuse each Q8 K/V read across four adjacent GQA query heads when occupancy permits.
         q8_decode_gqa4: bool = true,
-        /// Number of adjacent QSA Prefill query heads sharing each Q8 K/V read. Supported values
-        /// are 1 and 2; unsupported values fall back to one head.
-        qsa_prefill_gqa: usize = 2,
+        /// QSA Prefill Q8 K/V reuse mode. `2` keeps two heads in registers; `12` uses the
+        /// Qwen3.8-specific LDS-tiled full-GQA path. Unsupported shapes fall back safely.
+        qsa_prefill_gqa: usize = 12,
+        /// K/V tile used by the Qwen3.8 LDS GQA12 path. `16` keeps per-key online softmax;
+        /// `32` uses a FlashAttention-style tile merge.
+        qsa_prefill_tile: usize = 32,
+        /// Use F16 cooperative-matrix QK inside the Qwen3.8 Flash32 QSA Prefill path when the
+        /// active Vulkan device exposes the trusted 16x16x16 shape.
+        qsa_prefill_coopmat: bool = true,
+        /// Also use cooperative-matrix PV in that path. Kept separate so QK-only remains an
+        /// exact runtime A/B fallback on drivers where F16 probability staging is not profitable.
+        qsa_prefill_coopmat_pv: bool = true,
+        /// Block width of the Qwen3.8 Prefill indexer scorer's 8-query F32 tile. Supported values
+        /// are 32 and 64; other values keep the established 2-query x 4-block path.
+        qsa_score_tile: usize = 32,
         /// Wave32 max/sum reduction for the coupled Q8 hd256 decode combine pass.
         q8_decode_combine_sg: bool = true,
         /// `INFR_NO_MROWS_ATTN` / `INFR_MROWS_ATTN`, an ASYMMETRIC tri-state: `Some(false)` (the

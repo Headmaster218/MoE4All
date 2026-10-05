@@ -3436,6 +3436,14 @@ qsa_spv!(qsa_indexer_score_seg_spv, "qsa_indexer_score_seg");
 qsa_spv!(qsa_indexer_score_h4_spv, "qsa_indexer_score_h4");
 qsa_spv!(qsa_indexer_score_h4_seg_spv, "qsa_indexer_score_h4_seg");
 qsa_spv!(
+    qsa_indexer_score_h4_t32_seg_spv,
+    "qsa_indexer_score_h4_t32_seg"
+);
+qsa_spv!(
+    qsa_indexer_score_h4_t64_seg_spv,
+    "qsa_indexer_score_h4_t64_seg"
+);
+qsa_spv!(
     qsa_indexer_score_decode8_seg_spv,
     "qsa_indexer_score_decode8_seg"
 );
@@ -3472,6 +3480,22 @@ qsa_spv!(qsa_attention_batch_q8_seg_spv, "qsa_attention_batch_q8_seg");
 qsa_spv!(
     qsa_attention_batch_q8_seg_gqa2_spv,
     "qsa_attention_batch_q8_seg_gqa2"
+);
+qsa_spv!(
+    qsa_attention_batch_q8_seg_gqa12_spv,
+    "qsa_attention_batch_q8_seg_gqa12"
+);
+qsa_spv!(
+    qsa_attention_batch_q8_seg_gqa12_flash_spv,
+    "qsa_attention_batch_q8_seg_gqa12_flash"
+);
+qsa_spv!(
+    qsa_attention_batch_q8_seg_gqa12_flash_cm_qk_spv,
+    "qsa_attention_batch_q8_seg_gqa12_flash_cm_qk"
+);
+qsa_spv!(
+    qsa_attention_batch_q8_seg_gqa12_flash_cm_qk_pv_spv,
+    "qsa_attention_batch_q8_seg_gqa12_flash_cm_qk_pv"
 );
 /// SPIR-V for Ling KDA recurrent attention.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
