@@ -1318,6 +1318,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_KV_TYPE_V",
         "INFR_MTP",
         "INFR_NO_DYNAMIC_KV",
+        "INFR_NO_DELTA_AB_FUSE",
         "INFR_NO_GATED_RMSNORM",
         "INFR_NO_GPU_ARGMAX",
         "INFR_NO_GPU_DRAFT_PROB",

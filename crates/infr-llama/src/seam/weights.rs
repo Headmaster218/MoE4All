@@ -381,6 +381,8 @@ pub(crate) struct SessionStable {
     pub(super) fuse_qkv: bool,
     /// Experimental combined QSA query/key projection and prepare decision.
     pub(super) fuse_qsa_prepare: bool,
+    /// Adjacent F32 DeltaNet alpha/beta projections execute as one backend dispatch.
+    pub(super) fuse_delta_ab: bool,
     /// Per-layer Ling KDA QKV layout: true for one fused bank, false for QK + V.
     pub(super) kda_qkv_fused: Vec<bool>,
     /// Whether the MoE expert banks all have a dp4a-mmq kernel (batched-prefill eligibility).

@@ -145,6 +145,32 @@ fn fuse_qsa_prepare_decision(
         })
 }
 
+/// DeltaNet alpha/beta projection fusion eligibility. Both projections are kept as independent
+/// weights and outputs; only a backend command is shared. The decision is session-wide so warm
+/// graph rebuilds cannot change shape, and it stays off when any layer exposes a non-F32 or
+/// incomplete pair.
+fn fuse_delta_ab_decision(backend_support: bool, g: &Gguf, c: &Config, ec: &EngineConfig) -> bool {
+    if !backend_support || !ec.kernels.delta_ab_fuse {
+        return false;
+    }
+    let dtype = |layer: usize, suffix: &str| {
+        let name = format!("blk.{layer}.{suffix}");
+        g.tensors().iter().find(|t| t.name == name).map(|t| t.dtype)
+    };
+    let mut found = false;
+    for layer in 0..c.n_layer {
+        match (
+            dtype(layer, "ssm_alpha.weight"),
+            dtype(layer, "ssm_beta.weight"),
+        ) {
+            (None, None) => {}
+            (Some(DType::F32), Some(DType::F32)) => found = true,
+            _ => return false,
+        }
+    }
+    found
+}
+
 /// Ling KDA normally uploads Q/K/V as one fused projection. The official Tiny Q4_K_M GGUF uses
 /// Q4_K for Q/K and Q6_K for V; preserve both native formats by splitting only that layout into a
 /// fused Q/K projection plus V. Q and K must still match because their packed two-bank fast path is
@@ -942,6 +968,7 @@ fn session_stable(
     // form is bit-identical — same dots, same fixed-order sums).
     let fuse_qkv = fuse_qkv_decision(caps.combined_gu, g, c, ec);
     let fuse_qsa_prepare = fuse_qsa_prepare_decision(caps.qsa_prepare, g, c, ec);
+    let fuse_delta_ab = fuse_delta_ab_decision(caps.linear_pair_f32, g, c, ec);
     let kda_qkv_fused = if c.bailingmoe3 {
         (0..c.n_layer)
             .map(|l| {
@@ -995,6 +1022,7 @@ fn session_stable(
         fuse_gu,
         fuse_qkv,
         fuse_qsa_prepare,
+        fuse_delta_ab,
         kda_qkv_fused,
         moe_batched_ok,
     })
@@ -1910,6 +1938,7 @@ fn generate_dense_backend_inner(
     let fuse_gu = stable.fuse_gu;
     let fuse_qkv = stable.fuse_qkv;
     let fuse_qsa_prepare = stable.fuse_qsa_prepare;
+    let fuse_delta_ab = stable.fuse_delta_ab;
     let kda_qkv_fused = &stable.kda_qkv_fused;
     let moe_batched_ok = stable.moe_batched_ok;
 
@@ -5359,24 +5388,37 @@ fn generate_dense_backend_inner(
                         n: (q35_nv * q35_vd) as u32,
                     });
                 }
-                g.push(Op::Linear {
-                    x: hn,
-                    weight: dw.beta,
-                    dst: dn_bbuf,
-                    m: batch as u32,
-                    in_f: ne as u32,
-                    out_f: q35_nv as u32,
-                    w_off: 0,
-                });
-                g.push(Op::Linear {
-                    x: hn,
-                    weight: dw.alpha,
-                    dst: dn_abuf,
-                    m: batch as u32,
-                    in_f: ne as u32,
-                    out_f: q35_nv as u32,
-                    w_off: 0,
-                });
+                if fuse_delta_ab {
+                    g.push(Op::LinearPair {
+                        x: hn,
+                        weight_a: dw.beta,
+                        weight_b: dw.alpha,
+                        dst_a: dn_bbuf,
+                        dst_b: dn_abuf,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: q35_nv as u32,
+                    });
+                } else {
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: dw.beta,
+                        dst: dn_bbuf,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: q35_nv as u32,
+                        w_off: 0,
+                    });
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: dw.alpha,
+                        dst: dn_abuf,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: q35_nv as u32,
+                        w_off: 0,
+                    });
+                }
                 let (q_src, k_src, v_src) = if delta_strided {
                     (dn_convout, dn_convout, dn_convout)
                 } else {

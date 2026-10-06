@@ -2087,6 +2087,79 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Two independent F32 projections over the same activation in one dispatch. The paired
+    /// shader doubles the logical output-column grid but retains the exact scalar/vec4/MROW
+    /// variant selected by two standalone [`Self::linear_f32`] calls.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_f32_pair(
+        &self,
+        w_a: &dyn Buffer,
+        w_b: &dyn Buffer,
+        x: &dyn Buffer,
+        y_a: &dyn Buffer,
+        y_b: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.label_gemv("lin_f32_pair", rows, in_f, out_f * 2);
+        let addr_a = w_a
+            .device_addr()
+            .expect("resident-BDA weight: linear_f32_pair weight_a needs a device address");
+        let addr_b = w_b
+            .device_addr()
+            .expect("resident-BDA weight: linear_f32_pair weight_b needs a device address");
+        let use_mrow = rows > 1 && self.vk().f32_mrow;
+        let use_v4 = in_f.is_multiple_of(4) && self.vk().f32_v4;
+        let (name, spv, groups) = if use_v4 && rows == 1 {
+            (
+                "linear_f32r_pair_v4",
+                crate::gemm::linear_f32r_pair_v4_spv(),
+                (out_f * 2) as u32,
+            )
+        } else if use_v4 && rows <= 4 {
+            (
+                "linear_f32r_pair_mrow4_v4",
+                crate::gemm::linear_f32r_pair_mrow4_v4_spv(),
+                (out_f * 2 * rows.div_ceil(4)) as u32,
+            )
+        } else if use_v4 {
+            (
+                "linear_f32r_pair_mrow8_v4",
+                crate::gemm::linear_f32r_pair_mrow8_v4_spv(),
+                (out_f * 2 * rows.div_ceil(8)) as u32,
+            )
+        } else if use_mrow {
+            (
+                "linear_f32r_pair_mrow8",
+                crate::gemm::linear_f32r_pair_mrow8_spv(),
+                (out_f * 2 * rows.div_ceil(8)) as u32,
+            )
+        } else {
+            (
+                "linear_f32r_pair",
+                crate::gemm::linear_f32r_pair_spv(),
+                (rows * out_f * 2) as u32,
+            )
+        };
+        let k = self.be.kernel(name, spv, 4, 28);
+        let mut push = [0u8; 28];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(addr_a as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&((addr_a >> 32) as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&(addr_b as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&((addr_b >> 32) as u32).to_ne_bytes());
+        self.dispatch_wide(
+            k,
+            &[Self::vkb(x), Self::vkb(x), Self::vkb(y_a), Self::vkb(y_b)],
+            2,
+            &push,
+            groups,
+        );
+    }
+
     /// Arena-addressed body of [`Self::linear_add`] (fused-residual f16 GEMV, `linear_res.comp`).
     /// Production routes here through [`Self::linear_add`] (the weight's own BDA address); parity
     /// tests call it directly with an explicit arena address.

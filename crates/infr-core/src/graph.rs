@@ -210,6 +210,21 @@ pub enum Op {
         /// its slices. Must be row-aligned (`w_off % in_f == 0`) and block-aligned for quants.
         w_off: u32,
     },
+    /// Two same-shape F32 projections over one activation: `dst_a = x * weight_a^T` and
+    /// `dst_b = x * weight_b^T`. The independent dot products keep the same reduction order as
+    /// two [`Op::Linear`] operations; a capable backend only folds their command submission and
+    /// shared activation binding into one dispatch. Used by DeltaNet's adjacent alpha/beta
+    /// projections. Backends without `Capabilities::linear_pair_f32` keep the split graph.
+    LinearPair {
+        x: TensorId,
+        weight_a: TensorId,
+        weight_b: TensorId,
+        dst_a: TensorId,
+        dst_b: TensorId,
+        m: u32,
+        in_f: u32,
+        out_f: u32,
+    },
     /// Row-wise softmax: `dst[r, :] = softmax(x[r, :] * scale)` over `dim` columns, `rows` rows.
     /// diffusion-gemma's in-graph self-conditioning (see `docs/diffusion-gemma.md`'s Phase-B and
     /// the reference's `dg_canvas_embed`): softmaxes the previous step's canvas logits over the
@@ -1407,6 +1422,7 @@ impl Op {
             Op::LayerNorm { .. } => "LayerNorm",
             Op::Softmax { .. } => "Softmax",
             Op::Linear { .. } => "Linear",
+            Op::LinearPair { .. } => "LinearPair",
             Op::QkNorm { .. } => "QkNorm",
             Op::GatedRmsNorm { .. } => "GatedRmsNorm",
             Op::Rope { .. } => "Rope",
@@ -1486,6 +1502,14 @@ impl Op {
                 (r, vec![dst])
             }
             Op::Linear { x, weight, dst, .. } => (vec![x, weight], vec![dst]),
+            Op::LinearPair {
+                x,
+                weight_a,
+                weight_b,
+                dst_a,
+                dst_b,
+                ..
+            } => (vec![x, weight_a, weight_b], vec![dst_a, dst_b]),
             Op::QkNorm { x, weight, dst, .. } => {
                 let mut r = vec![x];
                 r.extend(weight);

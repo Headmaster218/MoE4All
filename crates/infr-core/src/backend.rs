@@ -194,6 +194,10 @@ pub struct Capabilities {
     /// False = the runner keeps emitting the split pair (identical math, one extra
     /// read-after-write barrier on backends that have one).
     pub gated_rmsnorm: bool,
+    /// The backend executes two same-shape F32 projections from one activation as one dispatch.
+    /// This saves one command and the inter-op scheduling boundary; it does not concatenate or
+    /// duplicate either weight and adds no persistent device allocation.
+    pub linear_pair_f32: bool,
     /// The backend treats every KV cache buffer as a RING over its allocated row count: `WriteKv`
     /// lands row `pos % cap_rows` and `Attention` reads key/value position `j` at row
     /// `j % cap_rows`, where `cap_rows = declared cache elements / row width`. A full-context

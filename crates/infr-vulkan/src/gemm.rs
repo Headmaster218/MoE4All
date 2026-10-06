@@ -1217,6 +1217,38 @@ pub(crate) fn linear_f32r_mrow8_v4_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// Paired two-weight/two-output twins of the F32 projection family. They preserve the scalar,
+/// vec4 and row-tiled reduction shapes above while sharing one command submission.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn linear_f32r_pair_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32r_pair.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn linear_f32r_pair_v4_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32r_pair_v4.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn linear_f32r_pair_mrow8_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32r_pair_mrow8.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn linear_f32r_pair_mrow4_v4_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32r_pair_mrow4_v4.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn linear_f32r_pair_mrow8_v4_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32r_pair_mrow8_v4.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// `-DSTREAMED` twin SPIR-V of `linear_res` (slice A4; see the shader's
 /// STREAMED doc — weight read through a typed 64-bit buffer_reference). Parity-test entry.
 #[cfg_attr(infr_profile, infr_prof::instrument)]

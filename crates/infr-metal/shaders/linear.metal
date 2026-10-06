@@ -22,6 +22,37 @@ kernel void linear_f32(device const float* x   [[buffer(0)]],
     if (lane == 0u) dst[sg] = acc;
 }
 
+// Two same-shape F32 projections over one activation. Workgroups are the concatenation of the
+// two independent output grids, so each dot keeps linear_f32's exact lane/reduction order while
+// command encoding and dispatch happen once.
+kernel void linear_pair_f32(device const float* x      [[buffer(0)]],
+                            device const float* w_a    [[buffer(1)]],
+                            device const float* w_b    [[buffer(2)]],
+                            device float*       dst_a  [[buffer(3)]],
+                            device float*       dst_b  [[buffer(4)]],
+                            constant LinearParams& p   [[buffer(5)]],
+                            uint gid [[thread_position_in_grid]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+    uint sg = gid / 32u;
+    uint total_out = p.out_f * 2u;
+    if (sg >= p.m * total_out) return;
+    uint r = sg / total_out;
+    uint slot = sg % total_out;
+    uint projection = slot / p.out_f;
+    uint o = slot % p.out_f;
+    device const float* xr = x + (ulong)r * p.in_f;
+    device const float* w = projection == 0u ? w_a : w_b;
+    device const float* wo = w + (ulong)o * p.in_f;
+    float acc = 0.0f;
+    for (uint i = lane; i < p.in_f; i += 32u) acc += xr[i] * wo[i];
+    acc = simd_sum(acc);
+    if (lane == 0u) {
+        uint index = r * p.out_f + o;
+        if (projection == 0u) dst_a[index] = acc;
+        else dst_b[index] = acc;
+    }
+}
+
 // Native f16-weight twin of linear_f32. Activations and accumulation stay f32; only the bound
 // weight stream is half-width, matching the GGUF value exactly without a host f16->f32 cache.
 kernel void linear_f16(device const float* x   [[buffer(0)]],

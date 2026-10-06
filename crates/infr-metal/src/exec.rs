@@ -1237,6 +1237,7 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings, m: &MetalCfg) 
             Op::RmsNorm { .. }
             | Op::RmsNormAdd { .. }
             | Op::Linear { .. }
+            | Op::LinearPair { .. }
             | Op::GatedAct { .. }
             | Op::GatedActFused { .. }
             | Op::Add { .. }
@@ -2712,6 +2713,60 @@ impl MetalBackend {
                     32,
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
+            }
+            Op::LinearPair {
+                x,
+                weight_a,
+                weight_b,
+                dst_a,
+                dst_b,
+                m,
+                in_f,
+                out_f,
+            } => {
+                if g.desc(weight_a).dtype != DType::F32 || g.desc(weight_b).dtype != DType::F32 {
+                    return Err(Error::Unsupported(
+                        "metal LinearPair requires two F32 weights".into(),
+                    ));
+                }
+                let (m, in_f, out_f) = (m as usize, in_f as usize, out_f as usize);
+                let bx = self.ensure_device(r, x);
+                let bwa = metal_buf(
+                    bindings
+                        .get(weight_a)
+                        .expect("metal backend: unbound LinearPair weight_a"),
+                );
+                let bwb = metal_buf(
+                    bindings
+                        .get(weight_b)
+                        .expect("metal backend: unbound LinearPair weight_b"),
+                );
+                let bda = self.dev_dst(r, dst_a, m * out_f);
+                let bdb = self.dev_dst(r, dst_b, m * out_f);
+                let mut p = (m as u32).to_ne_bytes().to_vec();
+                p.extend_from_slice(&(in_f as u32).to_ne_bytes());
+                p.extend_from_slice(&(out_f as u32).to_ne_bytes());
+                let pso = self.pipelines.get("linear_pair_f32")?;
+                if self.counter_set.is_some() {
+                    r.cur_op = "linear_pair_f32";
+                }
+                self.encode_tg_off(
+                    r,
+                    &pso,
+                    &[
+                        (bx.as_ref(), 0),
+                        (&bwa.raw, 0),
+                        (&bwb.raw, 0),
+                        (bda.as_ref(), 0),
+                        (bdb.as_ref(), 0),
+                    ],
+                    (1 << 3) | (1 << 4),
+                    &p,
+                    m * out_f * 2 * 32,
+                    32,
+                );
+                r.loc[dst_a.0 as usize] = Loc::Device;
+                r.loc[dst_b.0 as usize] = Loc::Device;
             }
             Op::Linear {
                 x,

@@ -391,6 +391,8 @@ impl Backend for MetalBackend {
             argmax_prob: false,
             // One 32-lane per-head reduction with the SiLU gate folded into its store pass.
             gated_rmsnorm: true,
+            // The paired F32 projection kernel binds both weights and outputs in one command.
+            linear_pair_f32: true,
             // Metal's KV kernels index rows directly by position — no ring mapping; the runner
             // keeps full-context KV allocations for SWA layers here.
             kv_swa_ring: false,

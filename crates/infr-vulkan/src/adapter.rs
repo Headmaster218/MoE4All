@@ -2280,6 +2280,37 @@ fn lower_op(
         // GEMV (or f16 GEMV). Prefill (m>1) with a native-quant weight uses the TILED coopmat GEMM
         // `matmul_native` (decode each weight element ONCE, reuse across the 64-row tile) instead
         // of the GEMV (which re-reads every weight row per output row) — the prefill perf win.
+        Op::LinearPair {
+            x,
+            weight_a,
+            weight_b,
+            dst_a,
+            dst_b,
+            m,
+            in_f,
+            out_f,
+        } => {
+            if wsub.is_some() {
+                return Err(be(
+                    "vulkan adapter: streamed weight substitution is unsupported for LinearPair",
+                ));
+            }
+            if graph.desc(*weight_a).dtype != infr_core::DType::F32
+                || graph.desc(*weight_b).dtype != infr_core::DType::F32
+            {
+                return Err(be("vulkan adapter: LinearPair requires two F32 weights"));
+            }
+            rec.linear_f32_pair(
+                r(*weight_a)?,
+                r(*weight_b)?,
+                r(*x)?,
+                r(*dst_a)?,
+                r(*dst_b)?,
+                *m as usize,
+                *in_f as usize,
+                *out_f as usize,
+            );
+        }
         Op::Linear {
             x,
             weight,
@@ -13125,6 +13156,77 @@ mod tests {
                 got[o],
                 want[o]
             );
+        }
+    }
+
+    /// `LinearPair` preserves both independent F32 projections across the decode, short-row and
+    /// MROW8 paths. The non-divisible width also covers the scalar (non-vec4) shader family.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn linear_pair_f32_matches_host() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return;
+        };
+        for (rows, in_f) in [(1usize, 32usize), (4, 32), (9, 32), (3, 30)] {
+            let out_f = 7usize;
+            let x: Vec<f32> = (0..rows * in_f)
+                .map(|i| (i as f32 * 0.071).sin() * 0.5)
+                .collect();
+            let wa: Vec<f32> = (0..out_f * in_f)
+                .map(|i| (i as f32 * 0.037).cos() * 0.3)
+                .collect();
+            let wb: Vec<f32> = (0..out_f * in_f)
+                .map(|i| (i as f32 * 0.053).sin() * 0.2)
+                .collect();
+            let want_a = infr_testkit::ref_linear(&x, &wa, rows, in_f, out_f);
+            let want_b = infr_testkit::ref_linear(&x, &wb, rows, in_f, out_f);
+            let mut g = Graph::new();
+            let xi = g.input(TensorDesc::new(vec![rows, in_f], DType::F32));
+            let wai = g.weight(TensorDesc::new(vec![out_f, in_f], DType::F32));
+            let wbi = g.weight(TensorDesc::new(vec![out_f, in_f], DType::F32));
+            let ya = g.output(TensorDesc::new(vec![rows, out_f], DType::F32));
+            let yb = g.output(TensorDesc::new(vec![rows, out_f], DType::F32));
+            g.push(Op::LinearPair {
+                x: xi,
+                weight_a: wai,
+                weight_b: wbi,
+                dst_a: ya,
+                dst_b: yb,
+                m: rows as u32,
+                in_f: in_f as u32,
+                out_f: out_f as u32,
+            });
+            let xb = be_.alloc(x.len() * 4, BufferUsage::Activations).unwrap();
+            let wab = be_.alloc(wa.len() * 4, BufferUsage::Weights).unwrap();
+            let wbb = be_.alloc(wb.len() * 4, BufferUsage::Weights).unwrap();
+            let yab = be_.alloc(rows * out_f * 4, BufferUsage::Readback).unwrap();
+            let ybb = be_.alloc(rows * out_f * 4, BufferUsage::Readback).unwrap();
+            be_.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+            be_.upload(wab.as_ref(), bytemuck::cast_slice(&wa)).unwrap();
+            be_.upload(wbb.as_ref(), bytemuck::cast_slice(&wb)).unwrap();
+            let plan = be_.compile(&g).unwrap();
+            let mut bindings = Bindings::new();
+            bindings
+                .bind(xi, xb.as_ref())
+                .bind(wai, wab.as_ref())
+                .bind(wbi, wbb.as_ref())
+                .bind(ya, yab.as_ref())
+                .bind(yb, ybb.as_ref());
+            be_.execute(plan.as_ref(), &bindings).unwrap();
+            let mut got_a = vec![0f32; rows * out_f];
+            let mut got_b = vec![0f32; rows * out_f];
+            be_.download(yab.as_ref(), bytemuck::cast_slice_mut(&mut got_a))
+                .unwrap();
+            be_.download(ybb.as_ref(), bytemuck::cast_slice_mut(&mut got_b))
+                .unwrap();
+            for (projection, got, want) in [("A", &got_a, &want_a), ("B", &got_b, &want_b)] {
+                for (i, (&got, &want)) in got.iter().zip(want).enumerate() {
+                    assert!(
+                        (got - want).abs() < 2e-3,
+                        "rows={rows} in_f={in_f} projection={projection} index={i}: got {got} want {want}"
+                    );
+                }
+            }
         }
     }
 

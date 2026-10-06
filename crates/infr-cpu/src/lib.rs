@@ -845,6 +845,9 @@ impl Backend for CpuBackend {
             // `QkNorm`→`GatedAct` pair here — no GPU barrier to save on a scalar interpreter, and
             // it keeps the CPU oracle's op sequence matching the pre-fusion baseline.
             gated_rmsnorm: false,
+            // The interpreter implements the op as a parity oracle below, but has no command
+            // submission boundary to save, so production graphs retain two ordinary Linears.
+            linear_pair_f32: false,
             // The interpreter's WriteKv/Attention honor ring KV caches (row = pos % cap_rows), so
             // the runner may window-size SWA layers' caches here.
             kv_swa_ring: true,
@@ -1145,6 +1148,42 @@ impl Backend for CpuBackend {
                         }
                     }
                     vals[dst.0 as usize] = out;
+                }
+                Op::LinearPair {
+                    x,
+                    weight_a,
+                    weight_b,
+                    dst_a,
+                    dst_b,
+                    m,
+                    in_f,
+                    out_f,
+                } => {
+                    let (m, in_f, out_f) = (m as usize, in_f as usize, out_f as usize);
+                    assert_eq!(g.desc(weight_a).dtype, DType::F32);
+                    assert_eq!(g.desc(weight_b).dtype, DType::F32);
+                    let xs = &vals[x.0 as usize];
+                    let buf_a = bindings
+                        .get(weight_a)
+                        .expect("cpu backend: unbound LinearPair weight_a");
+                    let buf_b = bindings
+                        .get(weight_b)
+                        .expect("cpu backend: unbound LinearPair weight_b");
+                    let bytes_a = cpu_buf(buf_a).read();
+                    let bytes_b = cpu_buf(buf_b).read();
+                    let wa: &[f32] = bytemuck::cast_slice(&bytes_a);
+                    let wb: &[f32] = bytemuck::cast_slice(&bytes_b);
+                    let mut out_a = vec![0f32; m * out_f];
+                    let mut out_b = vec![0f32; m * out_f];
+                    for r in 0..m {
+                        let xr = &xs[r * in_f..(r + 1) * in_f];
+                        for o in 0..out_f {
+                            out_a[r * out_f + o] = dot(&wa[o * in_f..(o + 1) * in_f], xr);
+                            out_b[r * out_f + o] = dot(&wb[o * in_f..(o + 1) * in_f], xr);
+                        }
+                    }
+                    vals[dst_a.0 as usize] = out_a;
+                    vals[dst_b.0 as usize] = out_b;
                 }
                 Op::Linear {
                     x,
@@ -5046,6 +5085,94 @@ mod tests {
                 bytemuck::cast_slice::<u8, f32>(&split_bytes),
                 "GatedRmsNorm {act:?} differs from split QkNorm/GatedAct"
             );
+        }
+    }
+
+    #[test]
+    fn linear_pair_f32_matches_split_linears() {
+        for rows in [1usize, 4, 9] {
+            let (in_f, out_f) = (32usize, 7usize);
+            let x_data: Vec<f32> = (0..rows * in_f)
+                .map(|i| (i as f32 * 0.071).sin() * 0.5)
+                .collect();
+            let wa_data: Vec<f32> = (0..out_f * in_f)
+                .map(|i| (i as f32 * 0.037).cos() * 0.3)
+                .collect();
+            let wb_data: Vec<f32> = (0..out_f * in_f)
+                .map(|i| (i as f32 * 0.053).sin() * 0.2)
+                .collect();
+            let backend = CpuBackend::new();
+            let mut graph = Graph::new();
+            let x = graph.input(TensorDesc::new(vec![rows, in_f], DType::F32));
+            let wa = graph.weight(TensorDesc::new(vec![out_f, in_f], DType::F32));
+            let wb = graph.weight(TensorDesc::new(vec![out_f, in_f], DType::F32));
+            let pair_a = graph.output(TensorDesc::new(vec![rows, out_f], DType::F32));
+            let pair_b = graph.output(TensorDesc::new(vec![rows, out_f], DType::F32));
+            let split_a = graph.output(TensorDesc::new(vec![rows, out_f], DType::F32));
+            let split_b = graph.output(TensorDesc::new(vec![rows, out_f], DType::F32));
+            graph.push(Op::LinearPair {
+                x,
+                weight_a: wa,
+                weight_b: wb,
+                dst_a: pair_a,
+                dst_b: pair_b,
+                m: rows as u32,
+                in_f: in_f as u32,
+                out_f: out_f as u32,
+            });
+            for (weight, dst) in [(wa, split_a), (wb, split_b)] {
+                graph.push(Op::Linear {
+                    x,
+                    weight,
+                    dst,
+                    m: rows as u32,
+                    in_f: in_f as u32,
+                    out_f: out_f as u32,
+                    w_off: 0,
+                });
+            }
+            let plan = backend.compile(&graph).expect("compile");
+            let xb = backend
+                .alloc(x_data.len() * 4, BufferUsage::Activations)
+                .unwrap();
+            let wab = backend
+                .alloc(wa_data.len() * 4, BufferUsage::Weights)
+                .unwrap();
+            let wbb = backend
+                .alloc(wb_data.len() * 4, BufferUsage::Weights)
+                .unwrap();
+            let outputs: Vec<_> = (0..4)
+                .map(|_| {
+                    backend
+                        .alloc(rows * out_f * 4, BufferUsage::Readback)
+                        .unwrap()
+                })
+                .collect();
+            backend
+                .upload(xb.as_ref(), bytemuck::cast_slice(&x_data))
+                .unwrap();
+            backend
+                .upload(wab.as_ref(), bytemuck::cast_slice(&wa_data))
+                .unwrap();
+            backend
+                .upload(wbb.as_ref(), bytemuck::cast_slice(&wb_data))
+                .unwrap();
+            let mut bindings = Bindings::new();
+            bindings
+                .bind(x, xb.as_ref())
+                .bind(wa, wab.as_ref())
+                .bind(wb, wbb.as_ref())
+                .bind(pair_a, outputs[0].as_ref())
+                .bind(pair_b, outputs[1].as_ref())
+                .bind(split_a, outputs[2].as_ref())
+                .bind(split_b, outputs[3].as_ref());
+            backend.execute(plan.as_ref(), &bindings).unwrap();
+            let mut got: Vec<Vec<u8>> = (0..4).map(|_| vec![0; rows * out_f * 4]).collect();
+            for (buf, bytes) in outputs.iter().zip(&mut got) {
+                backend.download(buf.as_ref(), bytes).unwrap();
+            }
+            assert_eq!(got[0], got[2], "rows={rows} projection A");
+            assert_eq!(got[1], got[3], "rows={rows} projection B");
         }
     }
 

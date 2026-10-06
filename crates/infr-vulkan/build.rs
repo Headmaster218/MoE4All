@@ -1063,6 +1063,23 @@ fn main() {
             "linear_f32r_mrow8_v4",
             &["-DMROW=8", "-DVEC4"],
         ),
+        ("linear_f32r", "linear_f32r_pair", &["-DPAIR"]),
+        ("linear_f32r", "linear_f32r_pair_v4", &["-DPAIR", "-DVEC4"]),
+        (
+            "linear_f32r",
+            "linear_f32r_pair_mrow8",
+            &["-DPAIR", "-DMROW=8"],
+        ),
+        (
+            "linear_f32r",
+            "linear_f32r_pair_mrow4_v4",
+            &["-DPAIR", "-DMROW=4", "-DVEC4"],
+        ),
+        (
+            "linear_f32r",
+            "linear_f32r_pair_mrow8_v4",
+            &["-DPAIR", "-DMROW=8", "-DVEC4"],
+        ),
         ("e2b_gate", "e2b_gate", &[]),
         // e2b_proj (fused E2B per-layer proj GEMV+RMSNorm+Add) landed but was NEVER wired into
         // production — the E2B proj side runs unfused; only tests/weight_addr_parity.rs's
