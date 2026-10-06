@@ -128,6 +128,7 @@ fn default_config_matches_documented_defaults() {
 
     // §6.5 / §10.2: the mmv tier is ON by default — `INFR_NO_MMV` is presence-INV.
     assert!(d.kernels.vulkan.mmv);
+    assert!(d.kernels.vulkan.qwen_hc_down_prefetch);
     assert!(!d.kernels.vulkan.mmv_decode);
     assert_eq!(d.kernels.vulkan.mmv_mw, None);
     assert_eq!(d.kernels.vulkan.flash_min_rows, 24);
@@ -1320,6 +1321,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_NO_DYNAMIC_KV",
         "INFR_NO_DELTA_AB_FUSE",
         "INFR_NO_QWEN_HC_DOWN_INJECT",
+        "INFR_NO_QWEN_HC_DOWN_PREFETCH",
         "INFR_NO_GATED_RMSNORM",
         "INFR_NO_GPU_ARGMAX",
         "INFR_NO_GPU_DRAFT_PROB",

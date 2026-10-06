@@ -2729,6 +2729,12 @@ impl VulkanBackend {
         cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
     }
 
+    /// The Qwen3.8 HC-down PF4 layout measured on Windows/Navi 31. Other drivers and architectures
+    /// retain the established kernel until separately validated.
+    pub(crate) fn prefers_qwen_hc_down_prefetch4(&self) -> bool {
+        cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+    }
+
     /// Borrowed engine configuration — every knob this backend (and the seam code holding it)
     /// steers on. A REFERENCE, never a clone: the adapter reads it inside per-op lowering
     /// (`docs/config-plan.md` R6).

@@ -1,4 +1,5 @@
 #version 460
+#extension GL_EXT_control_flow_attributes : require
 // Qwen3.8 single-row HC bottleneck: one Q8_0 down projection followed by scaled SiLU, plus the
 // tiny independent F32 inject projection. One workgroup owns one output row from either weight.
 // The Q8 arm mirrors native_gemv.comp; the F32 arm mirrors linear_f32r.comp -DVEC4.
@@ -38,6 +39,55 @@ float q8_sub(uint gstart, uint xoff) {
     return a;
 }
 
+#ifdef HC_PF
+struct Q8Raw {
+    float d;
+    uint qsh;
+    uvec4 qa;
+    uvec4 qb;
+    uint tail;
+};
+
+Q8Raw q8_load(uint gstart) {
+    uint bd = (gstart / 32u) * 34u;
+    Q8Raw q;
+    q.d = f16tof32(ru16(bd));
+    uint qoff = bd + 2u;
+    uint qwb = qoff >> 2u;
+    q.qsh = (qoff & 3u) << 3u;
+    q.qa = NW4(qwb);
+    q.qb = NW4(qwb + 4u);
+    q.tail = q.qsh == 0u ? 0u : NW(qwb + 8u);
+    return q;
+}
+
+void q8_decode(Q8Raw q, out float v[32]) {
+    for (uint w8 = 0u; w8 < 8u; ++w8) {
+        uint qcur = w8 < 4u ? q.qa[w8] : q.qb[w8 - 4u];
+        uint packed = qcur;
+        if (q.qsh != 0u) {
+            uint w1 = w8 + 1u;
+            uint qnext = w1 < 4u ? q.qa[w1] : (w1 < 8u ? q.qb[w1 - 4u] : q.tail);
+            packed = (qcur >> q.qsh) | (qnext << (32u - q.qsh));
+        }
+        for (uint b = 0u; b < 4u; ++b) {
+            v[w8 * 4u + b] =
+                q.d * float(bitfieldExtract(int(packed), int(8u * b), 8));
+        }
+    }
+}
+
+float q8_dot(Q8Raw q, uint xoff) {
+    float v[32];
+    q8_decode(q, v);
+    float a = 0.0;
+    for (uint w = 0u; w < 32u; ++w) {
+        a += v[w] * x_buf[xoff + w];
+    }
+    return a;
+}
+#endif
+
 void main() {
     GRID_INIT;
     uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
@@ -49,9 +99,25 @@ void main() {
         w_addr = arena_base(pc.down_lo, pc.down_hi);
         uint wbase = unit * pc.in_f;
         uint nsub = pc.in_f / 32u;
+#ifdef HC_PF
+        for (uint s0 = t; s0 < nsub; s0 += 64u * uint(HC_PF)) {
+            Q8Raw prefetched[HC_PF];
+            bool valid[HC_PF];
+            [[unroll]] for (uint p = 0u; p < uint(HC_PF); ++p) {
+                uint s = s0 + p * 64u;
+                valid[p] = s < nsub;
+                if (valid[p]) { prefetched[p] = q8_load(wbase + s * 32u); }
+            }
+            [[unroll]] for (uint p = 0u; p < uint(HC_PF); ++p) {
+                uint s = s0 + p * 64u;
+                if (valid[p]) { acc += q8_dot(prefetched[p], s * 32u); }
+            }
+        }
+#else
         for (uint s = t; s < nsub; s += 64u) {
             acc += q8_sub(wbase + s * 32u, s * 32u);
         }
+#endif
     } else {
         uint o = unit - pc.low_rank;
         uint64_t inject_addr = arena_base(pc.inject_lo, pc.inject_hi);

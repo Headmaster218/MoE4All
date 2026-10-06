@@ -2770,6 +2770,15 @@ pub(crate) fn qwen_hc_down_inject_spv() -> &'static [u32] {
         )))
     })
 }
+pub(crate) fn qwen_hc_down_inject_pf4_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/qwen_hc_down_inject_pf4.spv"
+        )))
+    })
+}
 /// SPIR-V for Qwen3.8 PLE's signed-sqrt dot-product gate.
 pub(crate) fn qwen_ple_gate_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();

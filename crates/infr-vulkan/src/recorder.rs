@@ -4683,18 +4683,87 @@ impl<'a> Recorder<'a> {
         hc: u32,
         silu_scale: f32,
     ) {
+        let pf4 = self.be.cfg().kernels.vulkan.qwen_hc_down_prefetch
+            && self.be.prefers_qwen_hc_down_prefetch4()
+            && in_f == 10_240
+            && low_rank == 320;
+        let (name, spv) = if pf4 {
+            (
+                "qwen_hc_down_inject_pf4",
+                crate::gemm::qwen_hc_down_inject_pf4_spv(),
+            )
+        } else {
+            (
+                "qwen_hc_down_inject",
+                crate::gemm::qwen_hc_down_inject_spv(),
+            )
+        };
+        self.qwen_hc_down_inject_kernel(
+            name,
+            spv,
+            x,
+            down_weight,
+            inject_weight,
+            low_dst,
+            inject_dst,
+            in_f,
+            low_rank,
+            hc,
+            silu_scale,
+        );
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn qwen_hc_down_inject_prefetch(
+        &self,
+        x: &dyn Buffer,
+        down_weight: &dyn Buffer,
+        inject_weight: &dyn Buffer,
+        low_dst: &dyn Buffer,
+        inject_dst: &dyn Buffer,
+        in_f: u32,
+        low_rank: u32,
+        hc: u32,
+        silu_scale: f32,
+    ) {
+        self.qwen_hc_down_inject_kernel(
+            "qwen_hc_down_inject_pf4",
+            crate::gemm::qwen_hc_down_inject_pf4_spv(),
+            x,
+            down_weight,
+            inject_weight,
+            low_dst,
+            inject_dst,
+            in_f,
+            low_rank,
+            hc,
+            silu_scale,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn qwen_hc_down_inject_kernel(
+        &self,
+        kernel_name: &'static str,
+        spv: &'static [u32],
+        x: &dyn Buffer,
+        down_weight: &dyn Buffer,
+        inject_weight: &dyn Buffer,
+        low_dst: &dyn Buffer,
+        inject_dst: &dyn Buffer,
+        in_f: u32,
+        low_rank: u32,
+        hc: u32,
+        silu_scale: f32,
+    ) {
         let down_addr = down_weight
             .device_addr()
             .expect("Qwen HC down weight requires a device address");
         let inject_addr = inject_weight
             .device_addr()
             .expect("Qwen HC inject weight requires a device address");
-        let kernel = self.be.kernel(
-            "qwen_hc_down_inject",
-            crate::gemm::qwen_hc_down_inject_spv(),
-            3,
-            32,
-        );
+        let kernel = self.be.kernel(kernel_name, spv, 3, 32);
         let mut push = [0u8; 32];
         push[0..4].copy_from_slice(&in_f.to_ne_bytes());
         push[4..8].copy_from_slice(&low_rank.to_ne_bytes());

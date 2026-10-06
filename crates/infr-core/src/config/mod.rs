@@ -348,6 +348,9 @@ cfg_struct! {
         bm16: bool = true,
         /// `INFR_NO_MMQ` (inverted).
         mmq: bool = true,
+        /// `INFR_NO_QWEN_HC_DOWN_PREFETCH` (inverted): use the measured PF4 HC-down kernel on
+        /// Windows RDNA3 for Qwen3.8's exact Q8_0 single-row shape.
+        qwen_hc_down_prefetch: bool = true,
         /// `INFR_NO_MMQ_FALLBACK` (inverted).
         mmq_fallback: bool = true,
         /// `INFR_NO_MMV` (inverted). NOT a presence knob — both sites are `is_err()`. Getting

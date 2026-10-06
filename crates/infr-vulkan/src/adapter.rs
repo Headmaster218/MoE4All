@@ -13387,6 +13387,173 @@ mod tests {
                 "HC inject mismatch at {i}"
             );
         }
+        let expected = if be_.cfg().kernels.vulkan.qwen_hc_down_prefetch
+            && be_.prefers_qwen_hc_down_prefetch4()
+        {
+            "qwen_hc_down_inject_pf4"
+        } else {
+            "qwen_hc_down_inject"
+        };
+        assert!(
+            be_.built_kernel_names().contains(&expected),
+            "Qwen HC down selected the wrong kernel; expected {expected}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU (perf micro-bench)"]
+    fn qwen_hc_down_inject_prefetch_probe() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return;
+        };
+        let (in_f, low_rank, hc) = (10_240usize, 320usize, 4usize);
+        let scale = 1.0 / hc as f32;
+        let x: Vec<f32> = (0..in_f).map(|i| (i as f32 * 0.017).sin() * 0.25).collect();
+        let down = infr_testkit::synth_weight(DType::Q8_0, in_f * low_rank, 0x4843_444e);
+        let inject: Vec<f32> = (0..in_f * hc)
+            .map(|i| (i as f32 * 0.023).cos() * 0.125)
+            .collect();
+        let xb = be_.alloc(x.len() * 4, BufferUsage::Activations).unwrap();
+        let inject_b = be_.alloc(inject.len() * 4, BufferUsage::Weights).unwrap();
+        be_.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+        be_.upload(inject_b.as_ref(), bytemuck::cast_slice(&inject))
+            .unwrap();
+
+        let working_set = 128usize << 20;
+        let n_weights = working_set.div_ceil(down.len()).max(4);
+        let weights: Vec<Box<dyn infr_core::backend::Buffer>> = (0..n_weights)
+            .map(|_| {
+                let w = be_.alloc(down.len(), BufferUsage::Weights).unwrap();
+                be_.upload(w.as_ref(), &down).unwrap();
+                w
+            })
+            .collect();
+        let outputs: Vec<_> = (0..2)
+            .map(|_| {
+                (
+                    be_.alloc(low_rank * 4, BufferUsage::Readback).unwrap(),
+                    be_.alloc(hc * 4, BufferUsage::Readback).unwrap(),
+                )
+            })
+            .collect();
+
+        let run_one = |prefetch: bool, w: &dyn infr_core::backend::Buffer, out: usize| {
+            let rec = be_.recorder().unwrap();
+            if prefetch {
+                rec.qwen_hc_down_inject_prefetch(
+                    xb.as_ref(),
+                    w,
+                    inject_b.as_ref(),
+                    outputs[out].0.as_ref(),
+                    outputs[out].1.as_ref(),
+                    in_f as u32,
+                    low_rank as u32,
+                    hc as u32,
+                    scale,
+                );
+            } else {
+                rec.qwen_hc_down_inject_kernel(
+                    "qwen_hc_down_inject",
+                    crate::gemm::qwen_hc_down_inject_spv(),
+                    xb.as_ref(),
+                    w,
+                    inject_b.as_ref(),
+                    outputs[out].0.as_ref(),
+                    outputs[out].1.as_ref(),
+                    in_f as u32,
+                    low_rank as u32,
+                    hc as u32,
+                    scale,
+                );
+            }
+            rec.finish().unwrap();
+        };
+        for (out, prefetch) in [false, true].into_iter().enumerate() {
+            run_one(prefetch, weights[0].as_ref(), out);
+        }
+        let read = |out: usize| {
+            let mut low = vec![0.0f32; low_rank];
+            let mut inject = vec![0.0f32; hc];
+            be_.download(outputs[out].0.as_ref(), bytemuck::cast_slice_mut(&mut low))
+                .unwrap();
+            be_.download(
+                outputs[out].1.as_ref(),
+                bytemuck::cast_slice_mut(&mut inject),
+            )
+            .unwrap();
+            (low, inject)
+        };
+        let baseline = read(0);
+        for out in [1usize] {
+            let got = read(out);
+            for (i, (&a, &b)) in baseline.0.iter().zip(&got.0).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "HC down PF mismatch at {i}");
+            }
+            for (i, (&a, &b)) in baseline.1.iter().zip(&got.1).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "HC inject PF mismatch at {i}");
+            }
+        }
+
+        let reps = n_weights * 8;
+        let bench = |prefetch: bool, out: usize| {
+            let rec = be_.recorder().unwrap();
+            for i in 0..reps {
+                let w = weights[i % n_weights].as_ref();
+                if prefetch {
+                    rec.qwen_hc_down_inject_prefetch(
+                        xb.as_ref(),
+                        w,
+                        inject_b.as_ref(),
+                        outputs[out].0.as_ref(),
+                        outputs[out].1.as_ref(),
+                        in_f as u32,
+                        low_rank as u32,
+                        hc as u32,
+                        scale,
+                    );
+                } else {
+                    rec.qwen_hc_down_inject_kernel(
+                        "qwen_hc_down_inject",
+                        crate::gemm::qwen_hc_down_inject_spv(),
+                        xb.as_ref(),
+                        w,
+                        inject_b.as_ref(),
+                        outputs[out].0.as_ref(),
+                        outputs[out].1.as_ref(),
+                        in_f as u32,
+                        low_rank as u32,
+                        hc as u32,
+                        scale,
+                    );
+                }
+            }
+            let start = std::time::Instant::now();
+            rec.finish().unwrap();
+            start.elapsed().as_secs_f64() * 1e6 / reps as f64
+        };
+        for (out, prefetch) in [false, true].into_iter().enumerate() {
+            let _ = bench(prefetch, out);
+        }
+        let mut best = [f64::INFINITY; 2];
+        let variants = [false, true];
+        for round in 0..4 {
+            if round % 2 == 0 {
+                for i in 0..2 {
+                    best[i] = best[i].min(bench(variants[i], i));
+                }
+            } else {
+                for i in (0..2).rev() {
+                    best[i] = best[i].min(bench(variants[i], i));
+                }
+            }
+        }
+        println!(
+            "Qwen3.8 HC down+inject 10240x320, {} MiB rotating weights: base={:.2} us, pf4={:.2} us ({:+.1}%)",
+            n_weights * down.len() / (1 << 20),
+            best[0],
+            best[1],
+            (best[1] / best[0] - 1.0) * 100.0,
+        );
     }
 
     /// A fused F16 weight can expose a row-aligned projection through `Linear::w_off` without

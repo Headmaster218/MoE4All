@@ -193,6 +193,7 @@ knobs! {
     "INFR_NO_SMALL_BM"      => "kernels.vulkan.small_bm",       PresenceInv, Ignored, "1",  migrated;
     "INFR_NO_BM16"          => "kernels.vulkan.bm16",           PresenceInv, Ignored, "1",  migrated;
     "INFR_NO_MMQ"           => "kernels.vulkan.mmq",            PresenceInv, Ignored, "1",  migrated;
+    "INFR_NO_QWEN_HC_DOWN_PREFETCH" => "kernels.vulkan.qwen_hc_down_prefetch", PresenceInv, Ignored, "1", migrated;
     "INFR_NO_MMQ_FALLBACK"  => "kernels.vulkan.mmq_fallback",   PresenceInv, Ignored, "1",  migrated;
     "INFR_NO_MMV"           => "kernels.vulkan.mmv",            PresenceInv, Ignored, "1",  migrated;
     "INFR_MMV_DECODE"       => "kernels.vulkan.mmv_decode",     Presence,    Ignored, "1",  migrated;
