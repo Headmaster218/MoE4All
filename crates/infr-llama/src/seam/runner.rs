@@ -7987,6 +7987,14 @@ fn generate_dense_backend_inner(
             }
             let batch_lanes = prefill_lanes.clone();
             let ranges = prefill_ranges.clone();
+            let mut cursors_after = cursors.clone();
+            for (&lane, range) in prefill_lanes.iter().zip(&prefill_ranges) {
+                cursors_after[lane] = range.end;
+            }
+            let prefill_next_chunk = ec.paging.prefill_cross_chunk
+                && parallel_prefill_group(&cursors_after, &targets, qsa_threshold).is_some_and(
+                    |(_, next_lanes)| next_lanes.iter().all(|lane| prefill_lanes.contains(lane)),
+                );
             let mut spans = Vec::with_capacity(batch_lanes.len());
             let mut row_start = 0usize;
             for range in &ranges {
@@ -8116,7 +8124,7 @@ fn generate_dense_backend_inner(
             be.upload(ple_batch.as_ref(), bytemuck::cast_slice(&ple_rows))
                 .map_err(|error| anyhow!("{error}"))?;
 
-            let (g1, h1) = build(
+            let (mut g1, h1) = build(
                 batch,
                 ranges[0].start,
                 0,
@@ -8132,6 +8140,7 @@ fn generate_dense_backend_inner(
                 independent_rows.then_some(spans.as_slice()),
                 Some(1..c.n_layer),
             );
+            g1.prefill_next_chunk = prefill_next_chunk;
             let plan1 = be.compile(&g1).map_err(|error| anyhow!("{error}"))?;
             let mut bindings1 = Bindings::new();
             bindings1.bind(h1.hidden, hidden_batch.as_ref());
@@ -10810,7 +10819,7 @@ fn generate_dense_backend_inner(
                         // never taps `h`. The MTP catch-up driver needs `h` for EVERY prefill row; wiring
                         // that requires this path to carry `logits_rows == pf_m` on demand, which Phase 2
                         // will add alongside the actual head forward.
-                        let (pf_g, pf_h) = build(
+                        let (mut pf_g, pf_h) = build(
                             ch.m,
                             cstart,
                             0,
@@ -10828,6 +10837,8 @@ fn generate_dense_backend_inner(
                             None,  // independent spans
                             Some(span.clone()),
                         );
+                        pf_g.prefill_next_chunk =
+                            ec.paging.prefill_cross_chunk && !layer_major && ci + 1 < chunks.len();
                         let t_build = pf_t0.elapsed();
                         let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
                         let t_compile = pf_t0.elapsed();

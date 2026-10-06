@@ -230,6 +230,9 @@ cfg_struct! {
         /// Upload future streamed MoE layers on the host worker while the GPU computes the current
         /// layer. `INFR_SYNC_PREFILL_UPLOAD` disables the overlap for diagnostics.
         prefill_upload_async: bool = true,
+        /// Keep the streamed-MoE lane pipeline warm across consecutive Prefill chunks. The final
+        /// layers upload the next chunk's opening layers without executing that chunk early.
+        prefill_cross_chunk: bool = true,
         /// Predict the next Qwen3.8 Decode router from the current layer input and admit useful
         /// expert blocks at the cold LRU edge while the GPU executes intervening work.
         /// Experimental and opt-in: `INFR_EXPERT_PREFETCH` enables it for A/B diagnostics.

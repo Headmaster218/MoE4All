@@ -1925,6 +1925,10 @@ pub struct Graph {
     /// for prefill by ALSO unlocking it for MTP verify — which is what broke token-identity. See
     /// `infr_vulkan::adapter`'s `mrow_int8_dtype_ok` for the consumer.
     pub mtp_verify: bool,
+    /// This graph is a Prefill chunk followed immediately by another chunk in the same pager
+    /// phase. Backends may use the hint to pre-position weights only; model execution and state
+    /// updates remain strictly chunk ordered.
+    pub prefill_next_chunk: bool,
     /// Memoized [`Self::in_place_inputs`] — a graph invariant (which KV-cache `Input`s the ops
     /// mutate in place), computed lazily on first query and reused. `execute` calls it PER TOKEN;
     /// without this it re-scanned every op and re-allocated a `HashSet` each call. Interior-mutable

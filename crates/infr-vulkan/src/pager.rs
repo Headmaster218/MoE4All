@@ -1812,6 +1812,22 @@ fn prefill_lane_bytes(lanes: &[Vec<usize>]) -> Option<u64> {
         .try_fold(0u64, |sum, &bytes| sum.checked_add(bytes as u64))
 }
 
+fn prefill_replacement_index(
+    current: usize,
+    layer_count: usize,
+    lanes: usize,
+    next_chunk: bool,
+) -> Option<usize> {
+    if lanes == 0 {
+        return None;
+    }
+    let next = current.checked_add(lanes)?;
+    if next < layer_count {
+        return Some(next);
+    }
+    next_chunk.then_some(current % lanes)
+}
+
 fn loan_preserves_pool_floor(enabled: usize, loaned: usize, floor: usize) -> bool {
     enabled
         .checked_sub(loaned)
@@ -3076,7 +3092,11 @@ impl MoePagerSession {
     /// Initial free-lane fill plus the future layer that replaces the current layer's lane once
     /// its GPU segment signals completion. This is a producer/consumer ring: topology chooses the
     /// depth, but actual Attention/DeltaNet completion timing drives every refill.
-    pub fn prefill_successors(&self, buf_id: usize) -> Result<(Vec<usize>, Option<usize>)> {
+    pub fn prefill_successors(
+        &self,
+        buf_id: usize,
+        next_chunk: bool,
+    ) -> Result<(Vec<usize>, Option<usize>)> {
         let layer_base = self
             .prefill_placement
             .get(&buf_id)
@@ -3098,10 +3118,10 @@ impl MoePagerSession {
         } else {
             Vec::new()
         };
-        let replacement = self
-            .prefill_layers
-            .get(idx.saturating_add(lanes))
-            .and_then(|layer| layer.banks.first().copied());
+        let replacement =
+            prefill_replacement_index(idx, self.prefill_layers.len(), lanes, next_chunk)
+                .and_then(|next| self.prefill_layers.get(next))
+                .and_then(|layer| layer.banks.first().copied());
         Ok((initial, replacement))
     }
 
@@ -4385,6 +4405,18 @@ mod tests {
         let three_lanes = &four_lanes[..3];
         assert_eq!(prefill_lane_bytes(three_lanes), Some(1800));
         assert!(prefill_lane_bytes(three_lanes).unwrap() <= 2000);
+    }
+
+    #[test]
+    fn prefill_replacement_wraps_to_the_same_lane_only_between_chunks() {
+        assert_eq!(prefill_replacement_index(43, 48, 4, true), Some(47));
+        assert_eq!(prefill_replacement_index(44, 48, 4, false), None);
+        assert_eq!(prefill_replacement_index(44, 48, 4, true), Some(0));
+        assert_eq!(prefill_replacement_index(47, 48, 4, true), Some(3));
+
+        assert_eq!(prefill_replacement_index(45, 48, 3, true), Some(0));
+        assert_eq!(prefill_replacement_index(47, 48, 3, true), Some(2));
+        assert_eq!(prefill_replacement_index(0, 48, 0, true), None);
     }
 
     #[test]

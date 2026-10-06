@@ -9950,6 +9950,7 @@ fn prefetch_next_moe_layer<'a>(
     rec: &mut Option<Recorder<'a>>,
     ps: &mut PagedStream,
     current_gate_id: usize,
+    next_chunk: bool,
 ) -> Result<()> {
     ps.poll_prefill_uploads(be_)?;
     // Dense streaming can attach staging-ring lifetime to this same segment. A transfer endpoint
@@ -9972,7 +9973,7 @@ fn prefetch_next_moe_layer<'a>(
         let mut guard = be_.moe_pager().lock().unwrap();
         let sess = guard.as_mut().expect("paged execution requires a session");
         sess.enter_prefill_layer(be_)?;
-        sess.prefill_successors(current_gate_id)?
+        sess.prefill_successors(current_gate_id, next_chunk)?
     };
     let (initial_jobs, replacement_job) = {
         let mut guard = be_.moe_pager().lock().unwrap();
@@ -11367,7 +11368,7 @@ fn execute_paged_moe<'a>(
             *weight_before,
         );
         if layer_stream {
-            prefetch_next_moe_layer(be_, rec, ps, gate_id)?;
+            prefetch_next_moe_layer(be_, rec, ps, gate_id, graph.prefill_next_chunk)?;
         }
         return Ok(current_layer); // recorded inline; the ambient segment stays open
     }
@@ -11587,7 +11588,7 @@ fn execute_paged_moe<'a>(
         }
     }
     if layer_stream {
-        prefetch_next_moe_layer(be_, rec, ps, gate_id)?;
+        prefetch_next_moe_layer(be_, rec, ps, gate_id, graph.prefill_next_chunk)?;
     }
     Ok(current_layer) // recorded inline; the ambient segment stays open
 }
