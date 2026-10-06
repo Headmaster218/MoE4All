@@ -944,6 +944,72 @@ unsafe fn run_pair(
     median_pair(&samples)
 }
 
+unsafe fn run_cpu_push_with_gpu(
+    device: &ash::Device,
+    source_addr: usize,
+    target_addr: usize,
+    bytes: usize,
+    jobs: &[(QueueRef, &TimedCommand)],
+    period_ns: f64,
+) -> (f64, Vec<f64>, f64) {
+    let gate = unsafe { create_timeline(device, 0) };
+    let fences = jobs
+        .iter()
+        .map(|_| unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) })
+        .collect::<Result<Vec<_>, _>>()
+        .expect("create CPU/GPU overlap fences");
+    let mut samples = Vec::with_capacity(SAMPLES);
+    for sample in 0..WARMUPS + SAMPLES {
+        let value = sample as u64 + 1;
+        unsafe { device.reset_fences(&fences) }.expect("reset CPU/GPU overlap fences");
+        for (_, command) in jobs {
+            unsafe { reset_timed(device, command) };
+        }
+        for ((queue, command), &fence) in jobs.iter().zip(&fences) {
+            unsafe { submit_waiting_on_gate(device, queue.queue, command.cmd, gate, value, fence) };
+        }
+        let ready = Barrier::new(2);
+        let wall = Instant::now();
+        let cpu_duration = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                ready.wait();
+                let t0 = Instant::now();
+                let src = unsafe { std::slice::from_raw_parts(source_addr as *const u8, bytes) };
+                parallel_copy(src, target_addr as *mut u8);
+                t0.elapsed()
+            });
+            unsafe { signal_timeline(device, gate, value) };
+            ready.wait();
+            unsafe { device.wait_for_fences(&fences, true, u64::MAX) }
+                .expect("wait CPU/GPU overlap fences");
+            worker.join().unwrap()
+        });
+        let gpu_us = jobs
+            .iter()
+            .map(|(_, command)| unsafe { read_interval(device, command, period_ns).us })
+            .collect::<Vec<_>>();
+        if sample >= WARMUPS {
+            samples.push((
+                cpu_duration.as_secs_f64() * 1e6,
+                gpu_us,
+                wall.elapsed().as_secs_f64() * 1e6,
+            ));
+        }
+    }
+    let cpu_us = median(samples.iter().map(|sample| sample.0).collect());
+    let gpu_us = (0..jobs.len())
+        .map(|job| median(samples.iter().map(|sample| sample.1[job]).collect()))
+        .collect();
+    let wall_us = median(samples.iter().map(|sample| sample.2).collect());
+    unsafe {
+        for fence in fences {
+            device.destroy_fence(fence, None);
+        }
+        device.destroy_semaphore(gate, None);
+    }
+    (cpu_us, gpu_us, wall_us)
+}
+
 unsafe fn submit_gate_and_signal(
     device: &ash::Device,
     queue: vk::Queue,
@@ -1799,6 +1865,61 @@ fn windows_vulkan_overlap_matrix() {
                 print_pipeline(&label, transfer_only, pipe_transfer);
             }
         }
+
+        println!("\nCPU ReBAR PUSH + TRANSFER DMA (+ COMPUTE)");
+        let dedicated_h2d = h2d_commands
+            .iter()
+            .find(|case| case.experts == 8 && case.queue.family == transfer_only.family)
+            .expect("transfer-only eight-expert H2D command");
+        let source_addr = h2d_host.ptr as usize;
+        let target_addr = rebar.mapped.unwrap() as usize;
+        let cpu_solo = bench_cpu_copy(
+            std::slice::from_raw_parts(source_addr as *const u8, COPY_BUFFER_BYTES),
+            target_addr as *mut u8,
+            true,
+        )
+        .as_secs_f64()
+            * 1e6;
+        let transfer_bytes = payload_bytes(8);
+        let transfer_jobs = [(transfer_only, &dedicated_h2d.command)];
+        let (cpu_us, gpu_us, wall_us) = run_cpu_push_with_gpu(
+            &device,
+            source_addr,
+            target_addr,
+            COPY_BUFFER_BYTES,
+            &transfer_jobs,
+            period_ns,
+        );
+        let aggregate_gib = (COPY_BUFFER_BYTES + transfer_bytes) as f64 / GIB;
+        println!(
+            "CPU+DMA: cpu={cpu_us:.1} us ({:.2}x) dma={:.1} us ({:.2}x) wall={wall_us:.1} us aggregate={:.2} GiB/s",
+            cpu_us / cpu_solo,
+            gpu_us[0],
+            gpu_us[0] / dedicated_h2d.solo.gpu_us,
+            aggregate_gib / (wall_us * 1e-6),
+        );
+
+        let triple_jobs = [
+            (main, &compute_medium),
+            (transfer_only, &dedicated_h2d.command),
+        ];
+        let (cpu_us, gpu_us, wall_us) = run_cpu_push_with_gpu(
+            &device,
+            source_addr,
+            target_addr,
+            COPY_BUFFER_BYTES,
+            &triple_jobs,
+            period_ns,
+        );
+        println!(
+            "CPU+DMA+compute256: cpu={cpu_us:.1} us ({:.2}x) dma={:.1} us ({:.2}x) compute={:.1} us ({:.2}x) wall={wall_us:.1} us aggregate={:.2} GiB/s",
+            cpu_us / cpu_solo,
+            gpu_us[1],
+            gpu_us[1] / dedicated_h2d.solo.gpu_us,
+            gpu_us[0],
+            gpu_us[0] / medium_solo.gpu_us,
+            aggregate_gib / (wall_us * 1e-6),
+        );
 
         println!("\nCPU ReBAR PUSH + COMPUTE (coarse host/GPU overlap)");
         let gate = create_timeline(&device, 0);
