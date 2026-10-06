@@ -185,8 +185,9 @@ pub fn unified_vram_room(
 
 /// Profile-aware form of [`unified_vram_room`] used when the budget and reserve may both be left
 /// to automatic policy. Conservative mode leaves 1 GiB below current free VRAM in total: the
-/// caller's 256 MiB allocator guard plus another 768 MiB here. Aggressive mode caps this backend
-/// at total VRAM minus 2 GiB while still respecting the live physical room.
+/// caller's 256 MiB allocator guard plus another 768 MiB here. Aggressive mode uses all of the
+/// live physical room left after the allocator guard. Fixed allocations, physical arena probes,
+/// and the ubatch fallback ladder remain authoritative for both profiles.
 pub fn unified_vram_room_for_profile(
     total: u64,
     guarded_available: u64,
@@ -196,18 +197,13 @@ pub fn unified_vram_room_for_profile(
     profile: crate::config::AutoProfile,
 ) -> u64 {
     const CONSERVATIVE_RESERVE_AFTER_GUARD: u64 = 768 << 20;
-    const AGGRESSIVE_TOTAL_RESERVE: u64 = 2 << 30;
 
     if budget.is_none() && reserve.is_none() {
         return match profile {
             crate::config::AutoProfile::Conservative => {
                 guarded_available.saturating_sub(CONSERVATIVE_RESERVE_AFTER_GUARD)
             }
-            crate::config::AutoProfile::Aggressive => guarded_available.min(
-                total
-                    .saturating_sub(AGGRESSIVE_TOTAL_RESERVE)
-                    .saturating_sub(tracked_used),
-            ),
+            crate::config::AutoProfile::Aggressive => guarded_available,
         };
     }
     unified_vram_room(total, guarded_available, tracked_used, budget, reserve)
@@ -588,24 +584,25 @@ mod tests {
         assert_eq!(
             unified_vram_room_for_profile(
                 24 * GIB,
-                20 * GIB,
+                23 * GIB,
                 0,
                 None,
                 None,
                 crate::config::AutoProfile::Conservative,
             ),
-            20 * GIB - 768 * MIB,
+            23 * GIB - 768 * MIB,
         );
         assert_eq!(
             unified_vram_room_for_profile(
                 24 * GIB,
-                20 * GIB,
+                23 * GIB,
                 0,
                 None,
                 None,
                 crate::config::AutoProfile::Aggressive,
             ),
-            20 * GIB,
+            23 * GIB,
+            "aggressive automatic placement must use the current guarded free VRAM",
         );
         assert_eq!(
             unified_vram_room(

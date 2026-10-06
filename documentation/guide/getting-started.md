@@ -50,8 +50,8 @@ CLI 的 `infr pull` 可预先下载模型；`run` 和 `serve` 遇到未缓存的
 
 ## 自动策略
 
-- **保守**：启动时以系统当前可用 RAM 减 3 GiB 作为总进程 RAM 预算；VRAM 按当前可用量保留合计约 1 GiB（含 Vulkan 分配器 256 MiB guard）。离散 GPU 默认 Prefill ubatch 从 2048 行起选。
-- **激进**：启动时以总物理 RAM 减 14 GiB 为总进程 RAM 预算；GPU 总显存减 2 GiB 为进程上限，但仍受设备实时剩余量约束。离散 GPU 默认从 4096 行起选。
+- **保守**：启动时以系统当前可用 RAM 减 3 GiB 作为总进程 RAM 预算；VRAM 按当前可用量保留合计约 1 GiB（含 Vulkan 分配器 256 MiB guard）。离散 GPU 默认 Prefill ubatch 从 4096 行起选，并按真实放置能力自动下调。
+- **激进**：启动时以总物理 RAM 减 14 GiB 为总进程 RAM 预算；VRAM 使用设备当前可用量（仍保留 Vulkan 分配器的 256 MiB guard），并由真实分配探测与 Ubatch 降档兜底。离散 GPU 默认从 4096 行起选。
 - **手动**：用于固定实验条件；显式 RAM、VRAM、Ubatch 和 submit 设置优先于自动策略。
 
 RAM 自动预算启动时冻结；显式值优先。ubatch 可按实际放置能力下调；iGPU 有单独的较小默认值，并发 ubatch 未显式指定时继承该次选出的值。这些预算不是最终专家缓存大小，固定分配后的真实显存余量仍会决定 arena。

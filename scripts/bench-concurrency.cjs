@@ -40,12 +40,15 @@ if (process.env.BENCH_TOKENS) {
 }
 const env = { ...process.env };
 const single = process.env.BENCH_SINGLE === '1';
+const automaticBudgets = process.env.BENCH_AUTO_BUDGETS === '1';
 for (const key of Object.keys(env)) if (key.startsWith('INFR_')) delete env[key];
 Object.assign(env, {
   RUST_LOG: 'info,infr_llama::parallel=debug',
-  INFR_RAM_BUDGET: '48g', INFR_VRAM_BUDGET: '24g', INFR_UBATCH_PARALLEL: '256',
   INFR_MTP: mode === 'mtp' ? '1' : '0', INFR_SERVE_STATS_SECS: '1',
 });
+if (!automaticBudgets) {
+  Object.assign(env, { INFR_RAM_BUDGET: '48g', INFR_VRAM_BUDGET: '24g', INFR_UBATCH_PARALLEL: '256' });
+}
 if (mode === 'mtp') env.INFR_SPEC_DRAFT = head;
 if (process.env.BENCH_GRID_NR) env.INFR_GEMV_ID_GRID_NR = process.env.BENCH_GRID_NR;
 if (process.env.BENCH_NO_SHARED_SLOT) env.INFR_NO_MOE_SHARED_SLOT = '1';

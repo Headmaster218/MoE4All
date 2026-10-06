@@ -1366,7 +1366,7 @@ const QWEN4_ACT_RESERVE_PAD: (u64, u64) = (4, 3);
 const QWEN4_PLAN_OVERLAP_RESERVE: u64 = 64 * 1024 * 1024;
 
 /// Batched-prefill micro-batch: rows per prefill chunk (`device.ubatch` / `INFR_UBATCH`, default
-/// 2048/4096 by profile — but see [`default_ubatch_rows`] for the INTEGRATED-GPU default). ONE
+/// 4096 on a discrete GPU — but see [`default_ubatch_rows`] for the INTEGRATED-GPU default). ONE
 /// reader funnel — the prefill loop, the activation reserve, and the SWA ring sizing below all
 /// derive from this, because the ring's correctness bound is "window + one whole prefill chunk".
 ///
@@ -1486,21 +1486,18 @@ fn first_successful_moe_ubatch<T, E>(
     Ok(None)
 }
 
-/// The prefill chunk when neither INFR_UBATCH nor the placement sweep pinned one: 2048 rows in the
-/// conservative profile and 4096 in the aggressive profile, EXCEPT on an integrated GPU, where a
-/// chunk that big is a single multi-second command buffer and trips
+/// The prefill chunk when neither INFR_UBATCH nor the placement sweep pinned one: 4096 rows on a
+/// discrete GPU in both profiles, EXCEPT on an integrated GPU, where a chunk that big is a single
+/// multi-second command buffer and trips
 /// the ~10 s GPU watchdog (`ring gfx_0.0.0 timeout` -> `VK_ERROR_DEVICE_LOST`). See
 /// [`infr_core::integrated_ubatch_rows`] for the measurements behind the smaller default.
 ///
 /// A DISCRETE device (and a CPU/Metal run, where no Vulkan backend was constructed and
 /// `device_class()` is `None`) uses the profile default.
-fn default_ubatch_rows(profile: infr_core::config::AutoProfile) -> usize {
+fn default_ubatch_rows(_profile: infr_core::config::AutoProfile) -> usize {
     match infr_vulkan::device_class() {
         Some(d) if d.integrated => infr_core::integrated_ubatch_rows(d.compute_units),
-        _ => match profile {
-            infr_core::config::AutoProfile::Conservative => 2048,
-            infr_core::config::AutoProfile::Aggressive => 4096,
-        },
+        _ => 4096,
     }
 }
 
@@ -2610,13 +2607,10 @@ const DEEPSEEK4_LOAD_DRIVER_RESERVE: u64 = 1536 * 1024 * 1024;
 const WINDOWS_LARGE_REBAR_LOAD_DRIVER_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Cold WDDM startup and the first queue use of imported host-memory aliases have heap-budget
-/// movement beyond the measured large-ReBAR load reserve above. Automatic placement should favor a
-/// reliable first launch over the last few Expert slots. An explicit total VRAM budget/reserve
-/// remains authoritative and opts out of this extra policy margin.
+/// movement beyond the measured large-ReBAR load reserve above. Conservative automatic placement
+/// favors a reliable first launch over the last few Expert slots. Aggressive and explicit placement
+/// rely on the live allocation probe and its ubatch fallback instead of adding this policy margin.
 const WINDOWS_LARGE_REBAR_AUTO_STARTUP_RESERVE: u64 = 1024 * 1024 * 1024;
-/// The performance profile still keeps half of the observed cold-start fluctuation. The live
-/// allocation-feedback retry remains the final authority if this tighter margin proves optimistic.
-const WINDOWS_LARGE_REBAR_AGGRESSIVE_STARTUP_RESERVE: u64 = 512 * 1024 * 1024;
 
 fn load_driver_reserve(cfg: &Config) -> u64 {
     if cfg.deepseek4 {
@@ -2638,9 +2632,9 @@ fn session_load_driver_reserve(cfg: &Config, ec: &EngineConfig) -> u64 {
             infr_core::config::AutoProfile::Conservative => {
                 WINDOWS_LARGE_REBAR_AUTO_STARTUP_RESERVE
             }
-            infr_core::config::AutoProfile::Aggressive => {
-                WINDOWS_LARGE_REBAR_AGGRESSIVE_STARTUP_RESERVE
-            }
+            // Aggressive placement relies on the live physical allocation probe and its ubatch
+            // fallback ladder instead of reserving the same startup fluctuation twice.
+            infr_core::config::AutoProfile::Aggressive => 0,
         }
     } else {
         0
@@ -6514,8 +6508,8 @@ mod seam_helper_tests {
         assert!(!super::user_pinned_ubatch(&unset));
         assert_eq!(
             super::ubatch_rows(&unset),
-            2048,
-            "no pin, no iGPU: the conservative 2048 default"
+            4096,
+            "no pin, no iGPU: both profiles start at 4096 and let placement fall back"
         );
 
         let mut aggressive = EngineConfig::default();
@@ -6552,7 +6546,7 @@ mod seam_helper_tests {
         );
         assert_eq!(
             super::ubatch_rows(&adaptive),
-            2048,
+            4096,
             "…and the height falls back"
         );
     }
@@ -6561,7 +6555,7 @@ mod seam_helper_tests {
     fn explicit_ubatch_also_governs_parallel_prefill_unless_overridden() {
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let mut ec = EngineConfig::default();
-        assert_eq!(super::ubatch_rows_parallel(&ec), 2048);
+        assert_eq!(super::ubatch_rows_parallel(&ec), 4096);
 
         ec.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
         assert_eq!(super::ubatch_rows_parallel(&ec), 4096);
@@ -6581,7 +6575,11 @@ mod seam_helper_tests {
         let mut automatic = EngineConfig::default();
         automatic.spec.mtp = true;
 
-        assert_eq!(super::ubatch_rows(&automatic), 2048);
+        assert_eq!(super::ubatch_rows(&automatic), 4096);
+        assert_eq!(
+            super::ubatch_candidates(&automatic),
+            vec![4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
+        );
 
         automatic.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
         assert_eq!(super::ubatch_rows(&automatic), 4096);
@@ -7590,7 +7588,11 @@ mod seam_helper_tests {
                 + super::dense_act_reserve_at(&cfg, &conservative_caps(), want, ub)
         };
         let cands = super::ubatch_candidates(&ec);
-        assert_eq!(cands[0], 2048, "the default chunk leads the ladder");
+        assert_eq!(
+            cands[0],
+            super::ubatch_rows(&ec),
+            "the current default chunk leads the ladder"
+        );
         // The profile default may change independently of this regression. What has to hold is
         // that some rung of the shared ladder serves the trained window.
         assert!(
@@ -7836,10 +7838,10 @@ mod seam_helper_tests {
     fn dense_ubatch_ladder_is_the_only_one() {
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let unset = EngineConfig::default();
-        assert_eq!(super::ubatch_rows(&unset), 2048);
+        assert_eq!(super::ubatch_rows(&unset), 4096);
         assert_eq!(
             super::ubatch_candidates(&unset),
-            vec![2048, 1536, 1024, 512, 256]
+            vec![4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
         );
 
         let mut aggressive = EngineConfig::default();
@@ -8070,11 +8072,7 @@ mod seam_helper_tests {
         aggressive.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
         assert_eq!(
             super::session_load_driver_reserve(&cfg, &aggressive),
-            if cfg!(windows) {
-                2 * GIB + 512 * MIB
-            } else {
-                0
-            }
+            if cfg!(windows) { 2 * GIB } else { 0 }
         );
         let mut explicit = EngineConfig::default();
         explicit.device.vram_reserve = Some(infr_core::SizeSpec::Bytes(512 * MIB));
@@ -8569,9 +8567,13 @@ mod seam_helper_tests {
         let (k, v) = (DType::F16, DType::F16);
         let want = 32768;
         let ubatch = super::ubatch_rows(&ec);
-        let kv = super::kv_bytes_estimate_fmt(&cfg, want, true, ubatch, k, v);
+        let kv_floor = super::ubatch_candidates(&ec)
+            .into_iter()
+            .map(|candidate| super::kv_bytes_estimate_fmt(&cfg, want, true, candidate, k, v))
+            .min()
+            .expect("ubatch candidate ladder is never empty");
         let activation = super::dense_act_reserve_at(&cfg, &caps, want, ubatch);
-        let physical_room = kv + super::POST_KV_DEVICE_RESERVE;
+        let physical_room = kv_floor + super::POST_KV_DEVICE_RESERVE;
 
         let without_elastic = super::reclamp_ctx_to_live_room(
             &RoomOnly(Some(physical_room), None),
