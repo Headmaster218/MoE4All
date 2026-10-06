@@ -1726,6 +1726,48 @@ impl PrefillCopyJob {
         Ok(())
     }
 
+    /// Use the existing session transfer plan on the transfer-only queue. Imported host ranges
+    /// become DMA copies, while sources outside those ranges keep the mapped-ReBAR CPU fallback
+    /// selected by `prepare_upload`. Tiered SSD/RAM materialization is likewise filled directly
+    /// because it has no stable imported source buffer.
+    pub(crate) fn execute_on_background(
+        self,
+        executor: &BackgroundTransferExecutor,
+    ) -> Result<Option<u64>> {
+        let mut prepared = PreparedTransfer::default();
+        for copy in self.copies {
+            match copy {
+                PrefillCopy::Memory { src, len, target } => {
+                    let src = unsafe { std::slice::from_raw_parts(src as *const u8, len) };
+                    self.transfer_plan
+                        .prepare_upload(executor, src, &target, &mut prepared)?;
+                }
+                PrefillCopy::Tiered {
+                    host,
+                    block_base,
+                    n_blocks,
+                    block_bytes,
+                    target,
+                } => {
+                    let len = n_blocks
+                        .checked_mul(block_bytes)
+                        .ok_or_else(|| be("moe pager: tiered Prefill bank byte size overflow"))?;
+                    if len != target.len() {
+                        return Err(be("moe pager: tiered Prefill target size mismatch"));
+                    }
+                    self.transfer_plan.fill_on_host_worker(&target, |bytes| {
+                        host.materialize_stream(block_base, n_blocks, block_bytes, bytes)
+                    })?;
+                }
+            }
+        }
+        let value = prepared.submit_background(executor)?;
+        if let Some(value) = value {
+            executor.wait(value)?;
+        }
+        Ok(value)
+    }
+
     pub(crate) fn execute<E: TransferExecutor>(self, executor: &E) -> Result<()> {
         for copy in self.copies {
             match copy {

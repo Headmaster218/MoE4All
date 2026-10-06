@@ -9405,6 +9405,7 @@ struct PrefillUploadCommand {
 
 struct PrefillUploadCompletion {
     buf_id: usize,
+    transfer_value: u64,
     result: std::result::Result<(), String>,
 }
 
@@ -9415,7 +9416,7 @@ struct PrefillUploader {
 }
 
 impl PrefillUploader {
-    fn new() -> Self {
+    fn new(executor: Option<crate::transfer::BackgroundTransferExecutor>) -> Self {
         let (tx, jobs) = std::sync::mpsc::channel::<Option<PrefillUploadCommand>>();
         let (done, rx) = std::sync::mpsc::channel::<PrefillUploadCompletion>();
         let thread = std::thread::Builder::new()
@@ -9423,17 +9424,26 @@ impl PrefillUploader {
             .spawn(move || {
                 while let Ok(Some(command)) = jobs.recv() {
                     let buf_id = command.job.buf_id();
-                    let result = command
+                    let dependency = command
                         .after
                         .map_or(Ok(()), |segment| segment.wait().map_err(|e| e.to_string()));
-                    let result = result.and_then(|()| {
-                        command
-                            .job
-                            .execute_on_host_worker()
-                            .map_err(|e| e.to_string())
+                    let outcome = dependency.and_then(|()| {
+                        match executor.as_ref() {
+                            Some(executor) => command.job.execute_on_background(executor),
+                            None => command.job.execute_on_host_worker().map(|()| None),
+                        }
+                        .map_err(|e| e.to_string())
                     });
+                    let (transfer_value, result) = match outcome {
+                        Ok(value) => (value.unwrap_or(0), Ok(())),
+                        Err(error) => (0, Err(error)),
+                    };
                     if done
-                        .send(PrefillUploadCompletion { buf_id, result })
+                        .send(PrefillUploadCompletion {
+                            buf_id,
+                            transfer_value,
+                            result,
+                        })
                         .is_err()
                     {
                         break;
@@ -9484,6 +9494,10 @@ struct PagedStream {
     /// while waiting for a ring lane to become reusable, so upload progress is independent from
     /// graph recording and from whether the active layer is Attention or DeltaNet.
     prefill_uploader: Option<PrefillUploader>,
+    /// Completed transfer-queue timelines that must also be attached to the compute submission.
+    /// The host worker waits before publishing completion; this GPU dependency supplies the Vulkan
+    /// memory-visibility edge between the two queue families without delaying graph recording.
+    prefill_transfer_waits: std::collections::HashMap<usize, u64>,
 }
 
 impl PagedStream {
@@ -9509,6 +9523,7 @@ impl PagedStream {
     }
 
     fn apply_prefill_completion(
+        &mut self,
         be_: &VulkanBackend,
         completion: PrefillUploadCompletion,
     ) -> Result<()> {
@@ -9520,15 +9535,26 @@ impl PagedStream {
             .unwrap()
             .as_mut()
             .expect("paged execution requires a session")
-            .complete_prefill_layer_cpu(completion.buf_id)
+            .complete_prefill_layer_cpu(completion.buf_id)?;
+        if completion.transfer_value != 0 {
+            self.prefill_transfer_waits
+                .insert(completion.buf_id, completion.transfer_value);
+        }
+        Ok(())
     }
 
     fn poll_prefill_uploads(&mut self, be_: &VulkanBackend) -> Result<()> {
-        let Some(uploader) = self.prefill_uploader.as_ref() else {
-            return Ok(());
-        };
-        while let Ok(completion) = uploader.rx.try_recv() {
-            Self::apply_prefill_completion(be_, completion)?;
+        loop {
+            let completion = {
+                let Some(uploader) = self.prefill_uploader.as_ref() else {
+                    return Ok(());
+                };
+                uploader.rx.try_recv()
+            };
+            let Ok(completion) = completion else {
+                break;
+            };
+            self.apply_prefill_completion(be_, completion)?;
         }
         Ok(())
     }
@@ -9567,17 +9593,23 @@ impl PagedStream {
             if let Some(elapsed) = infr_core::pager_profile::elapsed(wait_t0) {
                 infr_core::pager_profile::record_staging_wait(elapsed);
             }
-            Self::apply_prefill_completion(be_, completion)?;
+            self.apply_prefill_completion(be_, completion)?;
         }
     }
 
     fn enqueue_prefill_upload(
         &mut self,
+        be_: &VulkanBackend,
         job: crate::pager::PrefillCopyJob,
         after: Option<crate::recorder::PendingSegment>,
     ) -> Result<()> {
+        if self.prefill_uploader.is_none() {
+            let executor = crate::transfer::BackgroundTransferExecutor::from_backend(be_);
+            self.prefill_uploader = Some(PrefillUploader::new(executor));
+        }
         self.prefill_uploader
-            .get_or_insert_with(PrefillUploader::new)
+            .as_ref()
+            .expect("Prefill uploader was initialized")
             .enqueue(PrefillUploadCommand { job, after })
     }
 
@@ -9587,7 +9619,7 @@ impl PagedStream {
         };
         uploader.finish();
         while let Ok(completion) = uploader.rx.try_recv() {
-            Self::apply_prefill_completion(be_, completion)?;
+            self.apply_prefill_completion(be_, completion)?;
         }
         Ok(())
     }
@@ -9873,7 +9905,7 @@ fn stage_and_window<'a>(
 /// load-time-contiguous layer; the other role windows reuse it. No expert pager/LRU is touched.
 fn stage_layer_and_window<'a>(
     be_: &'a VulkanBackend,
-    _rec: &mut Option<Recorder<'a>>,
+    rec: &mut Option<Recorder<'a>>,
     ps: &mut PagedStream,
     buf_id: usize,
     n_expert: usize,
@@ -9884,6 +9916,11 @@ fn stage_layer_and_window<'a>(
         sess.enter_prefill_layer(be_)?;
     }
     let already_current = ps.wait_prefill_layer(be_, buf_id)?;
+    if let Some(value) = ps.prefill_transfer_waits.remove(&buf_id) {
+        rec.as_ref()
+            .expect("segment always Some while staging a Prefill layer")
+            .wait_for_dedicated_transfer(value);
+    }
     let mut guard = be_.moe_pager().lock().unwrap();
     let sess = guard.as_mut().expect("paged execution requires a session");
     if !already_current {
@@ -9969,10 +10006,10 @@ fn prefetch_next_moe_layer<'a>(
         }
     } else {
         for job in initial_jobs {
-            ps.enqueue_prefill_upload(job, None)?;
+            ps.enqueue_prefill_upload(be_, job, None)?;
         }
         if let Some(job) = replacement_job {
-            ps.enqueue_prefill_upload(job, Some(segment))?;
+            ps.enqueue_prefill_upload(be_, job, Some(segment))?;
         } else {
             retain_prefill_compute(ps, segment)?;
         }
