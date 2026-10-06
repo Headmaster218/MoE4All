@@ -1082,39 +1082,27 @@ pub(crate) fn dense_act_reserve_at(
     // one makes big: qwen35 interleaves q and gate in one projection, so `qg` is DOUBLE the q
     // width and the umbrella's n_embd term no longer covers the three of them.
     let deltanet = if cfg.qwen35 || cfg.qwen4exp {
-        // Qwen3.8 aliases qkv, z and conv output onto its three HC-wide scratch rows. Qwen3.5 has
-        // no HC storage to borrow and retains the three dedicated DeltaNet rows.
-        let dedicated_rows = if cfg.qwen4exp {
-            // qkv/z/conv borrow HC rows; q/k/v/out borrow mutually-exclusive attention rows.
-            2 * cfg.q35_num_v_heads()
-        } else {
-            2 * cfg.q35_conv_channels()
-                + cfg.ssm_d_inner
-                + 2 * cfg.q35_num_k_heads() * cfg.q35_head_k_dim()
-                + 2 * cfg.q35_num_v_heads() * cfg.q35_head_v_dim()
-                + 2 * cfg.q35_num_v_heads()
-        };
-        4 * dedicated_rows
-            // The attention projection retains one interleaved q+gate row. Both consumers read
-            // strided views directly, so the former separately-packed gate row no longer exists.
-            + 8 * cfg.n_head * cfg.max_head_dim()
+        4 * (2 * cfg.q35_conv_channels()
+            + cfg.ssm_d_inner
+            + 2 * cfg.q35_num_k_heads() * cfg.q35_head_k_dim()
+            + 2 * cfg.q35_num_v_heads() * cfg.q35_head_v_dim()
+            + 2 * cfg.q35_num_v_heads())
+            + 12 * cfg.n_head * cfg.max_head_dim()
     } else {
         0
     };
-    // Qwen3.8's caller-owned wide residual plus qwen_alt/normed/gate are four f32
-    // `[rows, hc*n_embd]` buffers in total. PLE now reuses the three HC scratch rows: key/query are
-    // dead after the gate, then normed/gate carry the conv input/output while alt preserves the
-    // gated residual. The low-rank projection and per-stream injection are f32 too. The generic
-    // n_embd umbrella cannot absorb these hc-wide tensors.
+    // Qwen3.8's caller-owned wide residual; qwen_alt/normed/gate scratch; and PLE
+    // key/query/gated/conv rows are eight f32 `[rows, hc*n_embd]` buffers in total. The low-rank
+    // projection and per-stream injection are f32 too. The generic n_embd umbrella cannot absorb
+    // these hc-wide tensors.
     let qwen4_hc = if cfg.qwen4exp {
-        16 * cfg.hc_mult * cfg.n_embd + 4 * cfg.hc_low_rank + 4 * cfg.hc_mult
+        32 * cfg.hc_mult * cfg.n_embd + 4 * cfg.hc_low_rank + 4 * cfg.hc_mult
     } else {
         0
     };
-    // The generic 96*n_embd envelope includes several architecture-specific rows. Qwen3.8 used
-    // to allocate them because it shares HC, indexer and recurrent dimensions with those models:
-    // three DSV4 HC rows (48*n_embd), four dual-FFN rows (16*n_embd), one E2B row (4*n_embd),
-    // KDA's forget row and DSV4's kv/rope rows. Its own HC/QSA/DeltaNet storage is priced above.
+    // Qwen3.8 retains the two full-width outputs used by its routed + shared-expert FFN, while
+    // buffers belonging only to DSV4, E2B, dual-MoE input/router and KDA become one-element
+    // placeholders. Its actual HC/QSA/DeltaNet rows are priced explicitly above.
     let generic_n_embd = if cfg.qwen4exp {
         let dsv4_rows = 4usize.saturating_mul(
             cfg.head_dim
@@ -1122,7 +1110,7 @@ pub(crate) fn dense_act_reserve_at(
                 .saturating_add(cfg.rope_dim),
         );
         (48 * cfg.n_embd)
-            .saturating_sub(20 * cfg.n_embd)
+            .saturating_sub(12 * cfg.n_embd)
             .saturating_sub(4 * cfg.ssm_d_inner)
             .saturating_sub(dsv4_rows)
     } else {
@@ -1372,9 +1360,8 @@ pub(crate) fn layer_major_prefill(
 /// is still the largest — which is the argument for deriving these bytes from the graph the runner
 /// already builds rather than re-deriving them here (backlog B8).
 const ACT_RESERVE_PAD: (u64, u64) = (3, 2);
-// Qwen3.8's graph and pooled Prefill workspace measured 2.56 GiB at ubatch 4096 / ctx 160K after
-// cross-architecture rows were removed, versus a 5.67 GiB runtime reserve. Keep a full third over
-// the modeled row set while avoiding the generic model's historical 1.5x over-reservation.
+// The compact Qwen3.8 graph keeps its required shared-expert outputs but drops full-size buffers
+// belonging exclusively to other architectures. Keep a full third over the modeled row set.
 const QWEN4_ACT_RESERVE_PAD: (u64, u64) = (4, 3);
 const QWEN4_PLAN_OVERLAP_RESERVE: u64 = 64 * 1024 * 1024;
 

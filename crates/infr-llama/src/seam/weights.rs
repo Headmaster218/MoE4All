@@ -83,6 +83,12 @@ pub(super) enum FfnW {
     },
 }
 
+impl FfnW {
+    pub(super) fn has_shared_expert(&self) -> bool {
+        matches!(self, Self::Moe { shexp: Some(_), .. })
+    }
+}
+
 /// qwen35moe (Qwen3.6 MoE) Qwen2-MoE-style shared-expert weights (see `FfnW::Moe`'s `shexp`
 /// field): a dense SwiGLU FFN run on the same input as the routed bank, gated by a per-token
 /// sigmoid on `gate_inp`'s (scalar) output. `Copy` (all `TensorId` fields) so `FfnW::Moe` stays
@@ -2001,7 +2007,34 @@ impl SeamKv {
 
 #[cfg(test)]
 mod tests {
-    use super::{checkpoint_extension_start, TurnRecurrentCkpt};
+    use super::{checkpoint_extension_start, FfnW, MoeSharedW, TurnRecurrentCkpt};
+    use infr_core::tensor::TensorId;
+
+    fn moe_ffn(shexp: Option<MoeSharedW>) -> FfnW {
+        let t = TensorId(0);
+        FfnW::Moe {
+            router: t,
+            gate_exps: t,
+            up_exps: t,
+            down_exps: t,
+            fused_gate_up: true,
+            shexp,
+            exp_probs_b: None,
+            tid2eid: None,
+        }
+    }
+
+    #[test]
+    fn shared_expert_requires_separate_dense_and_routed_outputs() {
+        assert!(!moe_ffn(None).has_shared_expert());
+        assert!(moe_ffn(Some(MoeSharedW {
+            gate_inp: Some(TensorId(1)),
+            wgate: TensorId(2),
+            wup: TensorId(3),
+            wdown: TensorId(4),
+        }))
+        .has_shared_expert());
+    }
 
     #[test]
     fn recurrent_checkpoint_requires_a_nonempty_strict_extension() {
