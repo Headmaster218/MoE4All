@@ -7932,6 +7932,18 @@ fn generate_dense_backend_inner(
             if crate::sampling::abort_requested(req) {
                 break;
             }
+            let _gp = req.and_then(|request| request.gate_pass());
+            // Prefill may borrow every uncommitted future KV segment. Materialize the selected
+            // slot's complete prompt depth before its first chunk so the ring is built around the
+            // exact live footprint. Other slots remain at their current committed depth until the
+            // serial scheduler selects them; their first growth retires and rebuilds the ring.
+            for &lane in &prefill_lanes {
+                if lane == 0 {
+                    ensure_kv_depth!(targets[lane]);
+                } else {
+                    parallel.peers[lane - 1].ensure_segmented_depth(be, c, targets[lane])?;
+                }
+            }
             let final_ranges = prefill_lanes
                 .iter()
                 .map(|&lane| {
@@ -7991,7 +8003,6 @@ fn generate_dense_backend_inner(
             // the parallel scheduler. Keeping it on the single-sequence graph also preserves the
             // sparse-QSA gather path used by a final one-row prefill tail.
             let independent_rows = batch_lanes.len() > 1;
-            let _gp = req.and_then(|request| request.gate_pass());
             for (&lane, range) in batch_lanes.iter().zip(&ranges) {
                 if lane == 0 {
                     ensure_kv_depth!(range.end);
