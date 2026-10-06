@@ -3448,7 +3448,6 @@ pub(crate) fn vulkan_moe_binder<'a>(
     let mut pager_memory_plan = None;
     let mut dynamic_state_max_allocation_bytes = 0u64;
     let mut reclaimable_fixed_host_source_bytes = 0u64;
-    let mut expert_payload_bytes = 0u64;
     let mut requested_cache_bytes = None;
     let mut requested_moe_ubatch = 0usize;
     let mut provisional_moe_ubatch = 0usize;
@@ -3475,7 +3474,6 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // `infr_vulkan::linear::moe_expert_dtype_ok` is true for all of them; the invariant is
         // pinned by `moe_expert_floor_covers_dense_set` in infr-vulkan's linear.rs tests.
         let fp = crate::weights::weight_footprint(g);
-        expert_payload_bytes = fp.expert;
         // These are clean GGUF mapping pages used only as the source of fixed GPU uploads. The
         // bounded Expert arena is populated after those uploads finish, so they are load-time
         // working set, not a persistent owner of the process RAM budget.
@@ -4316,9 +4314,6 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     ),
                 }
 
-                let expert_cache_bytes = physical_bytes
-                    .saturating_sub(elastic_reserve)
-                    .min(expert_payload_bytes);
                 let pool_floors = moe_pool_batch_slot_floors(&logical_pools, n_expert);
                 let pools: Vec<infr_vulkan::pager::MoePoolSpec> = logical_pools
                     .iter()
@@ -4407,7 +4402,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
                             .collect()
                     },
                     prefill_target_lanes,
-                    prefill_cache_bytes: expert_cache_bytes,
+                    // Prefill is phase-exclusive and may borrow uncommitted segmented-KV cells.
+                    // Runtime remains fixed at the high end; live KV allocations are enforced by
+                    // the unified allocator when the ring is built.
+                    prefill_cache_bytes: physical_bytes.saturating_sub(runtime_reserve),
                 })
                 .map_err(|e| anyhow!("{e}"))?;
 

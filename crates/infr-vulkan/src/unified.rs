@@ -41,9 +41,9 @@ pub(crate) struct ExpertSlotPlacement {
 ///
 /// The arena has four priority corridors:
 ///
-/// - `[0, kv_reserve_bytes)` is reserved for lazy low-address KV growth;
+/// - `[0, kv_reserve_bytes)` supplies stable coordinates for lazy low-address KV growth;
 /// - one middle band retains every pool's physical dispatch floor;
-/// - the remaining middle corridor is available to the fixed Prefill lane while active;
+/// - Prefill may borrow every uncommitted range below the runtime suffix while active;
 /// - the high suffix is the planned runtime reserve.
 ///
 /// Surplus Expert cells initially fill the elastic corridors and are disabled only as their bytes
@@ -332,11 +332,11 @@ impl ExpertArenaLayout {
         0..self.floor_corridor.start
     }
 
-    pub(crate) fn prefill_corridor(&self) -> Range<usize> {
-        // Prefill and Decode are mutually exclusive phases. The whole-layer ring may therefore
-        // evict and borrow Decode-floor cells; release restores those physical slots before the
-        // next Decode dispatch. KV and runtime owners continue to exclude the floor.
-        self.floor_corridor.start..self.total_bytes - self.runtime_reserve_bytes
+    pub(crate) fn prefill_loan_corridor(&self) -> Range<usize> {
+        // Segmented KV owns only its committed ranges. Future 32K segments retain stable reserved
+        // coordinates, but Prefill may borrow those currently empty cells because the ring is
+        // released before any later KV growth. Runtime keeps its high-address corridor throughout.
+        0..self.total_bytes - self.runtime_reserve_bytes
     }
 
     pub(crate) fn runtime_corridor(&self) -> Range<usize> {
@@ -915,7 +915,7 @@ impl UnifiedVramClass {
                 "Expert filler must be claimed from the frozen slot directory",
             )),
             Self::KvCache => Ok((layout.kv_corridor(), ClaimDirection::Low)),
-            Self::Prefill => Ok((layout.prefill_corridor(), ClaimDirection::Low)),
+            Self::Prefill => Ok((layout.prefill_loan_corridor(), ClaimDirection::Low)),
             Self::LlmRuntime
             | Self::EmbeddingWeights
             | Self::EmbeddingRuntime
@@ -1438,8 +1438,8 @@ impl UnifiedVramPool {
 
     /// Plan one logical owner without exposing corridor or growth-direction policy to callers.
     /// The class fixes those choices at session construction: KV grows from low addresses,
-    /// Prefill uses its phase-exclusive middle corridor, and variable phase owners grow down from
-    /// high addresses. Expert filler remains a separate fixed-slot operation.
+    /// Prefill borrows uncommitted ranges below the runtime suffix, and variable phase owners grow
+    /// down from high addresses. Expert filler remains a separate fixed-slot operation.
     pub(crate) fn plan_owner_claim(
         &self,
         requested: &[usize],
@@ -1738,11 +1738,11 @@ mod tests {
     }
 
     #[test]
-    fn arena_corridors_align_and_leave_the_middle_for_experts_and_prefill() {
+    fn arena_corridors_align_and_leave_runtime_outside_the_prefill_loan() {
         let layout = ExpertArenaLayout::build(&[(256, 20, 0)], 4096, 257, 0, 0, 513).unwrap();
         assert_eq!(layout.kv_corridor(), 0..512);
         assert_eq!(layout.runtime_corridor(), 4352..5120);
-        assert_eq!(layout.prefill_corridor(), 512..4352);
+        assert_eq!(layout.prefill_loan_corridor(), 0..4352);
     }
 
     #[test]
@@ -1754,7 +1754,9 @@ mod tests {
         assert!(matches!(kv_direction, ClaimDirection::Low));
 
         let (prefill, prefill_direction) = UnifiedVramClass::Prefill.placement(&layout).unwrap();
-        assert_eq!(prefill, layout.prefill_corridor());
+        assert_eq!(prefill, layout.prefill_loan_corridor());
+        assert_eq!(prefill.start, 0, "Prefill may borrow uncommitted KV cells");
+        assert_eq!(prefill.end, layout.runtime_corridor().start);
         assert!(matches!(prefill_direction, ClaimDirection::Low));
 
         for class in [
@@ -1780,31 +1782,32 @@ mod tests {
     }
 
     #[test]
-    fn persistent_corridors_preserve_floor_while_prefill_may_borrow_it() {
+    fn prefill_may_borrow_reserved_kv_coordinates_but_not_live_kv() {
         let layout =
             ExpertArenaLayout::build(&[(256, 4, 4), (512, 8, 2)], 4096, 1024, 0, 512, 512).unwrap();
         let floor = layout.floor_corridor();
         assert_eq!(floor, 1024..3072);
-        assert_eq!(layout.prefill_corridor(), 1024..4608);
+        assert_eq!(layout.prefill_loan_corridor(), 0..4608);
         assert!(layout.slots(0).unwrap().iter().all(|slot| {
             slot.logical_offset >= floor.start && slot.logical_offset + slot.len <= floor.end
         }));
 
         let ranges = UnifiedRangePool::new(layout.shard_sizes().iter().copied()).unwrap();
-        let _leases: Vec<_> = layout
+        let mut experts: HashMap<_, _> = layout
             .slots_by_pool
             .iter()
             .flatten()
             .map(|slot| {
-                ranges
+                let lease = ranges
                     .try_claim_exact(slot.shard, slot.offset, slot.len, UnifiedVramClass::Expert)
-                    .unwrap()
+                    .unwrap();
+                (slot.id, lease)
             })
             .collect();
         let kv = layout
             .plan_claim(
                 &ranges.allocations(),
-                &[1024],
+                &[512],
                 UnifiedVramClass::KvCache,
                 layout.kv_corridor(),
                 ClaimDirection::Low,
@@ -1817,12 +1820,36 @@ mod tests {
                 &ranges.allocations(),
                 &[512],
                 UnifiedVramClass::Prefill,
-                layout.prefill_corridor(),
+                layout.prefill_loan_corridor(),
                 ClaimDirection::Low,
                 &[],
             )
             .unwrap();
-        assert!(prefill.victims.iter().any(|victim| victim.pool == 0));
+        assert_eq!(prefill.ranges(), kv.ranges());
+
+        for victim in kv.victims() {
+            drop(experts.remove(victim).unwrap());
+        }
+        let kv_ranges = kv.ranges().to_vec();
+        let _kv = ranges
+            .try_claim_planned(UnifiedVramClass::KvCache, &kv_ranges)
+            .unwrap();
+        let after_commit = layout
+            .plan_claim(
+                &ranges.allocations(),
+                &[512],
+                UnifiedVramClass::Prefill,
+                layout.prefill_loan_corridor(),
+                ClaimDirection::Low,
+                &[],
+            )
+            .unwrap();
+        assert!(!ranges_overlap(
+            after_commit.ranges()[0].offset,
+            after_commit.ranges()[0].len,
+            kv_ranges[0].offset,
+            kv_ranges[0].len,
+        ));
         let runtime = layout
             .plan_claim(
                 &ranges.allocations(),
@@ -1837,14 +1864,21 @@ mod tests {
     }
 
     #[test]
-    fn prefill_corridor_starts_on_a_clean_shard_after_the_expert_floor() {
+    fn prefill_loan_corridor_spans_the_kv_and_middle_shards() {
         let layout =
             ExpertArenaLayout::build(&[(256, 4, 4), (512, 8, 2)], 4096, 1024, 0, 512, 512).unwrap();
-        let pieces = layout.physical_pieces(layout.prefill_corridor());
+        let pieces = layout.physical_pieces(layout.prefill_loan_corridor());
 
         assert!(!pieces.is_empty());
         assert_eq!(pieces[0].start, 0);
-        assert_eq!(pieces[0].end - pieces[0].start, 3584);
+        assert_eq!(pieces[0].end - pieces[0].start, 1024);
+        assert_eq!(
+            pieces
+                .iter()
+                .map(|piece| piece.end - piece.start)
+                .sum::<usize>(),
+            4608
+        );
     }
 
     #[test]

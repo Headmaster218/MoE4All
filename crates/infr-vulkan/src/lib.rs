@@ -5768,6 +5768,24 @@ impl VulkanBackend {
             let pool = self
                 .unified_vram()
                 .ok_or_else(|| be("segmented KV lost its unified VRAM arena"))?;
+            if pool.expert_layout().is_some() {
+                // Prefill may temporarily borrow uncommitted coordinates from the frozen KV
+                // corridor. Growing a slot is a serial phase boundary: retire that transient ring
+                // first, then claim the slot's original exact ranges. The next Prefill execute
+                // rebuilds its ring around every now-live KV segment.
+                let released = self
+                    .moe_pager
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .is_some_and(crate::pager::MoePagerSession::enter_decode);
+                if released {
+                    tracing::debug!(
+                        requested_ranges = requests.len(),
+                        "released Prefill KV loan before segmented-cache growth"
+                    );
+                }
+            }
             let sizes: Vec<_> = requests.iter().map(|&(_, _, bytes)| bytes).collect();
             let handles = if pool.expert_layout().is_some() {
                 let protected = self.protected_unified_experts();

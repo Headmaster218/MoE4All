@@ -1958,7 +1958,8 @@ pub struct MoePagerLayout {
     /// Model-topology target for the Prefill whole-layer streaming ring. Runtime construction
     /// caps it by the number of complete lanes that fit every physical pool.
     pub prefill_target_lanes: usize,
-    /// Maximum bytes the Prefill ring may retain from the shared Expert/runtime arena.
+    /// Maximum bytes the Prefill ring may retain below the fixed runtime corridor. Live KV claims
+    /// remain blockers, while uncommitted future segmented-KV coordinates are phase-loanable.
     pub prefill_cache_bytes: u64,
 }
 
@@ -2711,9 +2712,11 @@ impl MoePagerSession {
             layers.push((layer_base, packed, prefill_align(offset)));
         }
 
-        // Prefill addresses every bank directly, so its ring uses the global middle corridor rather
-        // than pretending each Decode size class is a separate contiguous virtual arena. Each bank
-        // stays inside one physical Vulkan shard; Gate/Up/Down may occupy unrelated shards.
+        // Prefill addresses every bank directly, so its ring uses every phase-loanable range below
+        // the runtime corridor rather than pretending each Decode size class is a separate
+        // contiguous virtual arena. Live KV remains a blocker, but uncommitted future segmented-KV
+        // coordinates are available until their next growth boundary. Each bank stays inside one
+        // physical Vulkan shard; Gate/Up/Down may occupy unrelated shards.
         let requested_lanes = self.prefill_target_lanes.min(layers.len()).max(1);
         let mut chosen_layout = None;
         let mut last_error = None;
