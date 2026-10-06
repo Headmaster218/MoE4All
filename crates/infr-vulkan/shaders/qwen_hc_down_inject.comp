@@ -1,0 +1,86 @@
+#version 460
+// Qwen3.8 single-row HC bottleneck: one Q8_0 down projection followed by scaled SiLU, plus the
+// tiny independent F32 inject projection. One workgroup owns one output row from either weight.
+// The Q8 arm mirrors native_gemv.comp; the F32 arm mirrors linear_f32r.comp -DVEC4.
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint in_f;
+    uint low_rank;
+    uint hc;
+    float silu_scale;
+    uint down_lo;
+    uint down_hi;
+    uint inject_lo;
+    uint inject_hi;
+} pc;
+
+layout(binding = 0) readonly buffer XB { float x_buf[]; };
+layout(binding = 1) writeonly buffer LowB { float low_buf[]; };
+layout(binding = 2) writeonly buffer InjectB { float inject_buf[]; };
+
+shared float red[64];
+
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+#define FMT_Q8_0
+#include "native_decode.glsl"
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer F32W { vec4 v[]; };
+
+float q8_sub(uint gstart, uint xoff) {
+    float v[32];
+    dqblk(gstart, v);
+    float a = 0.0;
+    for (uint w = 0u; w < 32u; w++) { a += v[w] * x_buf[xoff + w]; }
+    return a;
+}
+
+void main() {
+    GRID_INIT;
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (unit >= pc.low_rank + pc.hc) { return; }
+    uint t = gl_LocalInvocationID.x;
+    float acc = 0.0;
+
+    if (unit < pc.low_rank) {
+        w_addr = arena_base(pc.down_lo, pc.down_hi);
+        uint wbase = unit * pc.in_f;
+        uint nsub = pc.in_f / 32u;
+        for (uint s = t; s < nsub; s += 64u) {
+            acc += q8_sub(wbase + s * 32u, s * 32u);
+        }
+    } else {
+        uint o = unit - pc.low_rank;
+        uint64_t inject_addr = arena_base(pc.inject_lo, pc.inject_hi);
+        F32W weights = F32W(inject_addr);
+        uint nv = pc.in_f / 4u;
+        uint wbase = o * nv;
+        vec4 vacc = vec4(0.0);
+        for (uint i = t; i < nv; i += 64u) {
+            uint xbase = i * 4u;
+            vec4 xv = vec4(
+                x_buf[xbase], x_buf[xbase + 1u], x_buf[xbase + 2u], x_buf[xbase + 3u]
+            );
+            vacc += weights.v[wbase + i] * xv;
+        }
+        acc = (vacc.x + vacc.y) + (vacc.z + vacc.w);
+    }
+
+    red[t] = acc;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) { red[t] += red[t + stride]; }
+        barrier();
+    }
+    if (t == 0u) {
+        if (unit < pc.low_rank) {
+            float v = red[0] * pc.silu_scale;
+            low_buf[unit] = v / (1.0 + exp(-v));
+        } else {
+            inject_buf[unit - pc.low_rank] = red[0];
+        }
+    }
+}

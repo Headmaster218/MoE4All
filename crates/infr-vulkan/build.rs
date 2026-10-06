@@ -886,6 +886,7 @@ fn main() {
         ("qwen_hc_norm", "qwen_hc_norm", &[]),
         ("qwen_hc_inject", "qwen_hc_inject", &[]),
         ("qwen_hc_inject_norm", "qwen_hc_inject_norm", &[]),
+        ("qwen_hc_down_inject", "qwen_hc_down_inject", &[]),
         ("qwen_ple_gate", "qwen_ple_gate", &[]),
         ("softmax", "softmax", &[]),
         // DiffusionGemma denoise self-conditioning perf: scale read from a device buffer instead

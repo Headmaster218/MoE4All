@@ -292,6 +292,7 @@ knobs! {
     "INFR_NO_QKV_FUSE"      => "kernels.qkv_fuse",      PresenceInv, Ignored, "1", migrated;
     "INFR_NO_GATED_RMSNORM" => "kernels.gated_rmsnorm", PresenceInv, Ignored, "1", migrated;
     "INFR_NO_DELTA_AB_FUSE"  => "kernels.delta_ab_fuse", PresenceInv, Ignored, "1", migrated;
+    "INFR_NO_QWEN_HC_DOWN_INJECT" => "kernels.qwen_hc_down_inject", PresenceInv, Ignored, "1", migrated;
     "INFR_NO_PLE_SINGLE_PAR" => "kernels.ple_single_parallel", PresenceInv, Ignored, "1", migrated;
 
     // ── spec (§6.8) ──────────────────────────────────────────────────────────

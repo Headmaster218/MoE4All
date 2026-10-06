@@ -4667,6 +4667,52 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Qwen3.8 decode HC fast path. The Q8_0 down projection, its scaled SiLU, and the four-row
+    /// F32 inject projection share the input and one dispatch. Both weights remain independently
+    /// addressable, so this adds no packed copy or persistent allocation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen_hc_down_inject(
+        &self,
+        x: &dyn Buffer,
+        down_weight: &dyn Buffer,
+        inject_weight: &dyn Buffer,
+        low_dst: &dyn Buffer,
+        inject_dst: &dyn Buffer,
+        in_f: u32,
+        low_rank: u32,
+        hc: u32,
+        silu_scale: f32,
+    ) {
+        let down_addr = down_weight
+            .device_addr()
+            .expect("Qwen HC down weight requires a device address");
+        let inject_addr = inject_weight
+            .device_addr()
+            .expect("Qwen HC inject weight requires a device address");
+        let kernel = self.be.kernel(
+            "qwen_hc_down_inject",
+            crate::gemm::qwen_hc_down_inject_spv(),
+            3,
+            32,
+        );
+        let mut push = [0u8; 32];
+        push[0..4].copy_from_slice(&in_f.to_ne_bytes());
+        push[4..8].copy_from_slice(&low_rank.to_ne_bytes());
+        push[8..12].copy_from_slice(&hc.to_ne_bytes());
+        push[12..16].copy_from_slice(&silu_scale.to_ne_bytes());
+        push[16..20].copy_from_slice(&(down_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((down_addr >> 32) as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&(inject_addr as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&((inject_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch_wide(
+            kernel,
+            &[Self::vkb(x), Self::vkb(low_dst), Self::vkb(inject_dst)],
+            2,
+            &push,
+            low_rank + hc,
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn qwen_hc_inject(
         &self,

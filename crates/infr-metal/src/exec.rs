@@ -5862,6 +5862,7 @@ impl MetalBackend {
                 )));
             }
             Op::Silu { .. }
+            | Op::QwenHcDownInject { .. }
             | Op::QwenHcMix { .. }
             | Op::QwenHcNorm { .. }
             | Op::QwenHcInject { .. }

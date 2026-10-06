@@ -347,6 +347,7 @@ fn emit_hc_mix(
     residual: TensorId,
     dst: TensorId,
     scratch: HcScratch,
+    fuse_down_inject: bool,
     injection: Option<(TensorId, TensorId, TensorId)>,
 ) {
     let ne = cfg.n_embd;
@@ -375,21 +376,43 @@ fn emit_hc_mix(
             eps: cfg.rms_eps,
         });
     }
-    g.push(Op::Linear {
-        x: scratch.normed,
-        weight: weights.down,
-        dst: scratch.low,
-        m: rows as u32,
-        in_f: hcw as u32,
-        out_f: cfg.hc_low_rank as u32,
-        w_off: 0,
-    });
-    g.push(Op::Silu {
-        x: scratch.low,
-        dst: scratch.low,
-        n: (rows * cfg.hc_low_rank) as u32,
-        scale: 1.0 / cfg.hc_mult as f32,
-    });
+    let inject = weights.inject;
+    let fused_down_inject = fuse_down_inject
+        && rows == 1
+        && inject.is_some_and(|inject| {
+            g.desc(weights.down).dtype == DType::Q8_0
+                && g.desc(inject).dtype == DType::F32
+                && hcw % 32 == 0
+        });
+    if let Some(inject) = inject.filter(|_| fused_down_inject) {
+        g.push(Op::QwenHcDownInject {
+            x: scratch.normed,
+            down_weight: weights.down,
+            inject_weight: inject,
+            low_dst: scratch.low,
+            inject_dst: scratch.inject,
+            in_f: hcw as u32,
+            low_rank: cfg.hc_low_rank as u32,
+            hc: cfg.hc_mult as u32,
+            silu_scale: 1.0 / cfg.hc_mult as f32,
+        });
+    } else {
+        g.push(Op::Linear {
+            x: scratch.normed,
+            weight: weights.down,
+            dst: scratch.low,
+            m: rows as u32,
+            in_f: hcw as u32,
+            out_f: cfg.hc_low_rank as u32,
+            w_off: 0,
+        });
+        g.push(Op::Silu {
+            x: scratch.low,
+            dst: scratch.low,
+            n: (rows * cfg.hc_low_rank) as u32,
+            scale: 1.0 / cfg.hc_mult as f32,
+        });
+    }
     g.push(Op::Linear {
         x: scratch.low,
         weight: weights.up,
@@ -407,7 +430,7 @@ fn emit_hc_mix(
         hc: cfg.hc_mult as u32,
         n_embd: ne as u32,
     });
-    if let Some(inject) = weights.inject {
+    if let Some(inject) = inject.filter(|_| !fused_down_inject) {
         g.push(Op::Linear {
             x: scratch.normed,
             weight: inject,
@@ -580,6 +603,7 @@ fn emit_attention_kv(
     v_cache: TensorId,
     weights: &GraphW,
     scratch: &StepScratch,
+    fuse_down_inject: bool,
     full: bool,
 ) {
     let ne = cfg.n_embd;
@@ -598,6 +622,7 @@ fn emit_attention_kv(
             gate: scratch.hc.gate,
             inject: scratch.hc.inject,
         },
+        fuse_down_inject,
         None,
     );
     if full {
@@ -688,13 +713,25 @@ fn emit_full_step(
     weights: &GraphW,
     scratch: &StepScratch,
     h_next: TensorId,
+    fuse_down_inject: bool,
 ) {
     let ne = cfg.n_embd;
     let hcw = cfg.hc_mult * ne;
     let qrow = cfg.n_head * cfg.head_dim;
     let moe = cfg.moe.expect("validated Qwen3.8 MoE config");
     emit_attention_kv(
-        g, cfg, 1, start_pos, positions, None, k_cache, v_cache, weights, scratch, true,
+        g,
+        cfg,
+        1,
+        start_pos,
+        positions,
+        None,
+        k_cache,
+        v_cache,
+        weights,
+        scratch,
+        fuse_down_inject,
+        true,
     );
     g.push(Op::QkNormRope {
         x: scratch.qg,
@@ -760,6 +797,7 @@ fn emit_full_step(
             gate: scratch.hc.gate,
             inject: scratch.hc.inject,
         },
+        fuse_down_inject,
         Some((scratch.residual, scratch.block, scratch.hc.inject)),
     );
     g.push(Op::MoeFfn {
@@ -928,6 +966,7 @@ fn build_device_catch_graph(
     start_pos: usize,
     embedding_overrides: &[(usize, usize)],
     mrope: bool,
+    fuse_down_inject: bool,
 ) -> (Graph, DeviceCatchHandles) {
     let mut g = Graph::new();
     let hcw = cfg.hc_mult * cfg.n_embd;
@@ -982,7 +1021,17 @@ fn build_device_catch_graph(
         embedding_override_input.map(|input| (input, embedding_overrides)),
     );
     emit_attention_kv(
-        &mut g, cfg, rows, start_pos, positions, positions4, k_cache, v_cache, &weights, &scratch,
+        &mut g,
+        cfg,
+        rows,
+        start_pos,
+        positions,
+        positions4,
+        k_cache,
+        v_cache,
+        &weights,
+        &scratch,
+        fuse_down_inject,
         false,
     );
     // This runs after the first-row copy above. `previous_h` and `last_h` may therefore bind the
@@ -1023,6 +1072,7 @@ fn build_catch_graph(
     start_pos: usize,
     embedding_overrides: &[(usize, usize)],
     mrope: bool,
+    fuse_down_inject: bool,
 ) -> (Graph, CatchHandles) {
     let mut g = Graph::new();
     let hcw = cfg.hc_mult * cfg.n_embd;
@@ -1056,7 +1106,17 @@ fn build_catch_graph(
         embedding_override_input.map(|input| (input, embedding_overrides)),
     );
     emit_attention_kv(
-        &mut g, cfg, rows, start_pos, positions, positions4, k_cache, v_cache, &weights, &scratch,
+        &mut g,
+        cfg,
+        rows,
+        start_pos,
+        positions,
+        positions4,
+        k_cache,
+        v_cache,
+        &weights,
+        &scratch,
+        fuse_down_inject,
         false,
     );
     (
@@ -1096,6 +1156,7 @@ fn build_draft_graph(
     attention_window: usize,
     start_pos: usize,
     steps: usize,
+    fuse_down_inject: bool,
 ) -> (Graph, DraftHandles) {
     let mut g = Graph::new();
     let f32d = |n| TensorDesc::new(vec![n], DType::F32);
@@ -1127,6 +1188,7 @@ fn build_draft_graph(
             &weights,
             &scratch,
             h_next,
+            fuse_down_inject,
         );
         // The last step is needed to commit the final verified token to the MTP KV cache, but its
         // prediction is not part of this target batch. Avoid an unused HC mix, vocab projection,
@@ -1148,6 +1210,7 @@ fn build_draft_graph(
                 gate: scratch.hc.gate,
                 inject: scratch.hc.inject,
             },
+            fuse_down_inject,
             None,
         );
         let logits = g.internal(f32d(cfg.vocab));
@@ -1191,6 +1254,7 @@ pub(crate) struct Qwen4MtpFixed {
     cfg: crate::Config,
     weights: Vec<Box<dyn Buffer>>,
     specs: Vec<(DType, usize)>,
+    fuse_down_inject: bool,
     device_catch_plans: Mutex<VecDeque<Arc<DeviceCatchPlan>>>,
 }
 
@@ -1410,13 +1474,19 @@ impl Qwen4MtpSession {
                 .map_err(|e| anyhow!("{e}"))?;
             Ok((buffer, dtype))
         };
-        Self::load_fixed(bind, sidecar_path, cfg)
+        Self::load_fixed(
+            bind,
+            sidecar_path,
+            cfg,
+            vk.capabilities().qwen_hc_down_inject && vk.cfg().kernels.qwen_hc_down_inject,
+        )
     }
 
     pub(crate) fn load_fixed(
         bind: &BindWeightFn,
         sidecar_path: &Path,
         cfg: &crate::Config,
+        fuse_down_inject: bool,
     ) -> Result<Arc<Qwen4MtpFixed>> {
         let sidecar = Gguf::open(sidecar_path)
             .with_context(|| format!("open Qwen3.8 MTP sidecar {}", sidecar_path.display()))?;
@@ -1441,6 +1511,7 @@ impl Qwen4MtpSession {
             cfg: cfg.clone(),
             weights,
             specs,
+            fuse_down_inject,
             device_catch_plans: Mutex::new(VecDeque::new()),
         }))
     }
@@ -1839,6 +1910,7 @@ impl Qwen4MtpSession {
                 pos,
                 &override_ranges,
                 mrope.is_some(),
+                self.fixed.fuse_down_inject,
             );
             let plan = be.compile(&graph).map_err(|e| anyhow!("{e}"))?;
             let mut bindings = Bindings::new();
@@ -1926,6 +1998,7 @@ impl Qwen4MtpSession {
             start_pos,
             embedding_overrides,
             mrope,
+            self.fixed.fuse_down_inject,
         );
         let compiled = Arc::new(DeviceCatchPlan {
             key,
@@ -2146,6 +2219,7 @@ impl Qwen4MtpSession {
             self.attention_window,
             start_pos,
             verify_tokens,
+            self.fixed.fuse_down_inject,
         );
         let plan = be.compile(&graph).map_err(|e| anyhow!("{e}"))?;
         let mut bindings = Bindings::new();

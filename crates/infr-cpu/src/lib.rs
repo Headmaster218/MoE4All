@@ -21,7 +21,7 @@ mod repack;
 
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, GraphPlan, Plan};
 use infr_core::config::Config;
-use infr_core::error::Result;
+use infr_core::error::{Error, Result};
 use infr_core::exec::Provision;
 use infr_core::graph::{Activation, AttnMask, Dsv4CacheFormat, Graph, MoeGating, Op, TensorKind};
 use infr_core::tensor::{DType, TensorId};
@@ -848,6 +848,8 @@ impl Backend for CpuBackend {
             // The interpreter implements the op as a parity oracle below, but has no command
             // submission boundary to save, so production graphs retain two ordinary Linears.
             linear_pair_f32: false,
+            // Vulkan-only mixed Q8_0/F32 launch fusion; the CPU keeps the split oracle graph.
+            qwen_hc_down_inject: false,
             // The interpreter's WriteKv/Attention honor ring KV caches (row = pos % cap_rows), so
             // the runner may window-size SWA layers' caches here.
             kv_swa_ring: true,
@@ -3020,6 +3022,11 @@ impl Backend for CpuBackend {
                         }
                     });
                     vals[dst.0 as usize] = out;
+                }
+                Op::QwenHcDownInject { .. } => {
+                    return Err(Error::Unsupported(
+                        "CPU QwenHcDownInject is a Vulkan-only launch fusion".into(),
+                    ));
                 }
                 Op::Gelu { x, dst, rows, cols } => {
                     let n = (rows * cols) as usize;

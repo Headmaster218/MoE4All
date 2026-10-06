@@ -198,6 +198,10 @@ pub struct Capabilities {
     /// This saves one command and the inter-op scheduling boundary; it does not concatenate or
     /// duplicate either weight and adds no persistent device allocation.
     pub linear_pair_f32: bool,
+    /// The backend executes Qwen3.8's one-row Q8_0 HC down projection, scaled SiLU, and tiny F32
+    /// inject projection in one dispatch. Multi-row Prefill/Verify and other weight types retain
+    /// the split graph.
+    pub qwen_hc_down_inject: bool,
     /// The backend treats every KV cache buffer as a RING over its allocated row count: `WriteKv`
     /// lands row `pos % cap_rows` and `Attention` reads key/value position `j` at row
     /// `j % cap_rows`, where `cap_rows = declared cache elements / row width`. A full-context

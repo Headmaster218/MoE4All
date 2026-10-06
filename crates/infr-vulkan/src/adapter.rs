@@ -2311,6 +2311,44 @@ fn lower_op(
                 *out_f as usize,
             );
         }
+        Op::QwenHcDownInject {
+            x,
+            down_weight,
+            inject_weight,
+            low_dst,
+            inject_dst,
+            in_f,
+            low_rank,
+            hc,
+            silu_scale,
+        } => {
+            if graph.desc(*x).dtype != infr_core::DType::F32
+                || graph.desc(*low_dst).dtype != infr_core::DType::F32
+                || graph.desc(*inject_dst).dtype != infr_core::DType::F32
+                || graph.desc(*down_weight).dtype != infr_core::DType::Q8_0
+                || graph.desc(*inject_weight).dtype != infr_core::DType::F32
+            {
+                return Err(be(
+                    "vulkan adapter: QwenHcDownInject requires F32 activations, Q8_0 down and F32 inject",
+                ));
+            }
+            if *in_f == 0 || *low_rank == 0 || *hc == 0 || *in_f % 32 != 0 || *in_f % 4 != 0 {
+                return Err(be(
+                    "vulkan adapter: QwenHcDownInject requires non-zero outputs and in_f divisible by 32",
+                ));
+            }
+            rec.qwen_hc_down_inject(
+                r(*x)?,
+                r(*down_weight)?,
+                r(*inject_weight)?,
+                r(*low_dst)?,
+                r(*inject_dst)?,
+                *in_f,
+                *low_rank,
+                *hc,
+                *silu_scale,
+            );
+        }
         Op::Linear {
             x,
             weight,
@@ -13227,6 +13265,127 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Qwen3.8's production HC dimensions and dtypes: the fused one-row launch must match the
+    /// existing Q8_0 Linear -> scaled SiLU plus independent four-row F32 Linear graph.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn qwen_hc_down_inject_matches_split_graph() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return;
+        };
+        let (in_f, low_rank, hc) = (10_240usize, 320usize, 4usize);
+        let scale = 1.0 / hc as f32;
+        let x: Vec<f32> = (0..in_f).map(|i| (i as f32 * 0.017).sin() * 0.25).collect();
+        let down = infr_testkit::synth_weight(DType::Q8_0, in_f * low_rank, 0x4843_444e);
+        let inject: Vec<f32> = (0..in_f * hc)
+            .map(|i| (i as f32 * 0.023).cos() * 0.125)
+            .collect();
+
+        let mut g = Graph::new();
+        let xi = g.input(TensorDesc::new(vec![1, in_f], DType::F32));
+        let down_w = g.weight(TensorDesc::new(vec![low_rank, in_f], DType::Q8_0));
+        let inject_w = g.weight(TensorDesc::new(vec![hc, in_f], DType::F32));
+        let fused_low = g.output(TensorDesc::new(vec![1, low_rank], DType::F32));
+        let fused_inject = g.output(TensorDesc::new(vec![1, hc], DType::F32));
+        let split_raw = g.internal(TensorDesc::new(vec![1, low_rank], DType::F32));
+        let split_low = g.output(TensorDesc::new(vec![1, low_rank], DType::F32));
+        let split_inject = g.output(TensorDesc::new(vec![1, hc], DType::F32));
+        g.push(Op::QwenHcDownInject {
+            x: xi,
+            down_weight: down_w,
+            inject_weight: inject_w,
+            low_dst: fused_low,
+            inject_dst: fused_inject,
+            in_f: in_f as u32,
+            low_rank: low_rank as u32,
+            hc: hc as u32,
+            silu_scale: scale,
+        });
+        g.push(Op::Linear {
+            x: xi,
+            weight: down_w,
+            dst: split_raw,
+            m: 1,
+            in_f: in_f as u32,
+            out_f: low_rank as u32,
+            w_off: 0,
+        });
+        g.push(Op::Silu {
+            x: split_raw,
+            dst: split_low,
+            n: low_rank as u32,
+            scale,
+        });
+        g.push(Op::Linear {
+            x: xi,
+            weight: inject_w,
+            dst: split_inject,
+            m: 1,
+            in_f: in_f as u32,
+            out_f: hc as u32,
+            w_off: 0,
+        });
+
+        let xb = be_.alloc(x.len() * 4, BufferUsage::Activations).unwrap();
+        let down_b = be_.alloc(down.len(), BufferUsage::Weights).unwrap();
+        let inject_b = be_.alloc(inject.len() * 4, BufferUsage::Weights).unwrap();
+        let fused_low_b = be_.alloc(low_rank * 4, BufferUsage::Readback).unwrap();
+        let fused_inject_b = be_.alloc(hc * 4, BufferUsage::Readback).unwrap();
+        let split_low_b = be_.alloc(low_rank * 4, BufferUsage::Readback).unwrap();
+        let split_inject_b = be_.alloc(hc * 4, BufferUsage::Readback).unwrap();
+        be_.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+        be_.upload(down_b.as_ref(), &down).unwrap();
+        be_.upload(inject_b.as_ref(), bytemuck::cast_slice(&inject))
+            .unwrap();
+        let plan = be_.compile(&g).unwrap();
+        let mut bindings = Bindings::new();
+        bindings
+            .bind(xi, xb.as_ref())
+            .bind(down_w, down_b.as_ref())
+            .bind(inject_w, inject_b.as_ref())
+            .bind(fused_low, fused_low_b.as_ref())
+            .bind(fused_inject, fused_inject_b.as_ref())
+            .bind(split_low, split_low_b.as_ref())
+            .bind(split_inject, split_inject_b.as_ref());
+        be_.execute(plan.as_ref(), &bindings).unwrap();
+
+        let mut got_fused_low = vec![0.0f32; low_rank];
+        let mut got_split_low = vec![0.0f32; low_rank];
+        let mut got_fused_inject = vec![0.0f32; hc];
+        let mut got_split_inject = vec![0.0f32; hc];
+        be_.download(
+            fused_low_b.as_ref(),
+            bytemuck::cast_slice_mut(&mut got_fused_low),
+        )
+        .unwrap();
+        be_.download(
+            split_low_b.as_ref(),
+            bytemuck::cast_slice_mut(&mut got_split_low),
+        )
+        .unwrap();
+        be_.download(
+            fused_inject_b.as_ref(),
+            bytemuck::cast_slice_mut(&mut got_fused_inject),
+        )
+        .unwrap();
+        be_.download(
+            split_inject_b.as_ref(),
+            bytemuck::cast_slice_mut(&mut got_split_inject),
+        )
+        .unwrap();
+
+        for (i, (&fused, &split)) in got_fused_low.iter().zip(&got_split_low).enumerate() {
+            assert_eq!(fused.to_bits(), split.to_bits(), "HC down mismatch at {i}");
+        }
+        for (i, (&fused, &split)) in got_fused_inject.iter().zip(&got_split_inject).enumerate() {
+            assert_eq!(
+                fused.to_bits(),
+                split.to_bits(),
+                "HC inject mismatch at {i}"
+            );
         }
     }
 

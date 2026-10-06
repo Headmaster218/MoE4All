@@ -969,6 +969,7 @@ fn session_stable(
     let fuse_qkv = fuse_qkv_decision(caps.combined_gu, g, c, ec);
     let fuse_qsa_prepare = fuse_qsa_prepare_decision(caps.qsa_prepare, g, c, ec);
     let fuse_delta_ab = fuse_delta_ab_decision(caps.linear_pair_f32, g, c, ec);
+    let fuse_qwen_hc_down_inject = caps.qwen_hc_down_inject && ec.kernels.qwen_hc_down_inject;
     let kda_qkv_fused = if c.bailingmoe3 {
         (0..c.n_layer)
             .map(|l| {
@@ -1023,6 +1024,7 @@ fn session_stable(
         fuse_qkv,
         fuse_qsa_prepare,
         fuse_delta_ab,
+        fuse_qwen_hc_down_inject,
         kda_qkv_fused,
         moe_batched_ok,
     })
@@ -1939,6 +1941,7 @@ fn generate_dense_backend_inner(
     let fuse_qkv = stable.fuse_qkv;
     let fuse_qsa_prepare = stable.fuse_qsa_prepare;
     let fuse_delta_ab = stable.fuse_delta_ab;
+    let fuse_qwen_hc_down_inject = stable.fuse_qwen_hc_down_inject;
     let kda_qkv_fused = &stable.kda_qkv_fused;
     let moe_batched_ok = stable.moe_batched_ok;
 
@@ -4855,21 +4858,43 @@ fn generate_dense_backend_inner(
                         eps,
                     });
                 }
-                g.push(Op::Linear {
-                    x: qwen_normed,
-                    weight: t.down,
-                    dst: qwen_low,
-                    m: batch as u32,
-                    in_f: hcw as u32,
-                    out_f: c.hc_low_rank as u32,
-                    w_off: 0,
-                });
-                g.push(Op::Silu {
-                    x: qwen_low,
-                    dst: qwen_low,
-                    n: (batch * c.hc_low_rank) as u32,
-                    scale: 1.0 / c.hc_mult as f32,
-                });
+                let inject = t.inject;
+                let fused_down_inject = fuse_qwen_hc_down_inject
+                    && batch == 1
+                    && inject.is_some_and(|inject| {
+                        g.desc(t.down).dtype == DType::Q8_0
+                            && g.desc(inject).dtype == DType::F32
+                            && hcw % 32 == 0
+                    });
+                if let Some(inject) = inject.filter(|_| fused_down_inject) {
+                    g.push(Op::QwenHcDownInject {
+                        x: qwen_normed,
+                        down_weight: t.down,
+                        inject_weight: inject,
+                        low_dst: qwen_low,
+                        inject_dst: qwen_inject,
+                        in_f: hcw as u32,
+                        low_rank: c.hc_low_rank as u32,
+                        hc: c.hc_mult as u32,
+                        silu_scale: 1.0 / c.hc_mult as f32,
+                    });
+                } else {
+                    g.push(Op::Linear {
+                        x: qwen_normed,
+                        weight: t.down,
+                        dst: qwen_low,
+                        m: batch as u32,
+                        in_f: hcw as u32,
+                        out_f: c.hc_low_rank as u32,
+                        w_off: 0,
+                    });
+                    g.push(Op::Silu {
+                        x: qwen_low,
+                        dst: qwen_low,
+                        n: (batch * c.hc_low_rank) as u32,
+                        scale: 1.0 / c.hc_mult as f32,
+                    });
+                }
                 g.push(Op::Linear {
                     x: qwen_low,
                     weight: t.up,
@@ -4887,7 +4912,7 @@ fn generate_dense_backend_inner(
                     hc: c.hc_mult as u32,
                     n_embd: ne as u32,
                 });
-                if let Some(inject) = t.inject {
+                if let Some(inject) = inject.filter(|_| !fused_down_inject) {
                     g.push(Op::Linear {
                         x: qwen_normed,
                         weight: inject,

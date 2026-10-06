@@ -225,6 +225,20 @@ pub enum Op {
         in_f: u32,
         out_f: u32,
     },
+    /// Qwen3.8 one-row HC bottleneck fast path. Computes the Q8_0 `down` projection followed by
+    /// `silu(x * silu_scale)` and the independent F32 stream-injection projection in one dispatch.
+    /// The two weights and two outputs remain separate; this adds no packed-weight allocation.
+    QwenHcDownInject {
+        x: TensorId,
+        down_weight: TensorId,
+        inject_weight: TensorId,
+        low_dst: TensorId,
+        inject_dst: TensorId,
+        in_f: u32,
+        low_rank: u32,
+        hc: u32,
+        silu_scale: f32,
+    },
     /// Row-wise softmax: `dst[r, :] = softmax(x[r, :] * scale)` over `dim` columns, `rows` rows.
     /// diffusion-gemma's in-graph self-conditioning (see `docs/diffusion-gemma.md`'s Phase-B and
     /// the reference's `dg_canvas_embed`): softmaxes the previous step's canvas logits over the
@@ -1423,6 +1437,7 @@ impl Op {
             Op::Softmax { .. } => "Softmax",
             Op::Linear { .. } => "Linear",
             Op::LinearPair { .. } => "LinearPair",
+            Op::QwenHcDownInject { .. } => "QwenHcDownInject",
             Op::QkNorm { .. } => "QkNorm",
             Op::GatedRmsNorm { .. } => "GatedRmsNorm",
             Op::Rope { .. } => "Rope",
@@ -1510,6 +1525,17 @@ impl Op {
                 dst_b,
                 ..
             } => (vec![x, weight_a, weight_b], vec![dst_a, dst_b]),
+            Op::QwenHcDownInject {
+                x,
+                down_weight,
+                inject_weight,
+                low_dst,
+                inject_dst,
+                ..
+            } => (
+                vec![x, down_weight, inject_weight],
+                vec![low_dst, inject_dst],
+            ),
             Op::QkNorm { x, weight, dst, .. } => {
                 let mut r = vec![x];
                 r.extend(weight);

@@ -393,6 +393,8 @@ impl Backend for MetalBackend {
             gated_rmsnorm: true,
             // The paired F32 projection kernel binds both weights and outputs in one command.
             linear_pair_f32: true,
+            // Qwen3.8 HC primitives are not implemented on Metal yet.
+            qwen_hc_down_inject: false,
             // Metal's KV kernels index rows directly by position — no ring mapping; the runner
             // keeps full-context KV allocations for SWA layers here.
             kv_swa_ring: false,

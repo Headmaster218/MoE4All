@@ -606,6 +606,8 @@ cfg_struct! {
             gated_rmsnorm: bool = true,
             /// `INFR_NO_DELTA_AB_FUSE` (inverted), ANDed with `caps.linear_pair_f32` at the site.
             delta_ab_fuse: bool = true,
+            /// `INFR_NO_QWEN_HC_DOWN_INJECT` (inverted), ANDed with the Vulkan-only capability.
+            qwen_hc_down_inject: bool = true,
             /// `INFR_NO_PLE_SINGLE_PAR` (inverted): use the persistent gather pool for one row.
             ple_single_parallel: bool = true,
         }
