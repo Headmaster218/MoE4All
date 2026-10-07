@@ -313,6 +313,16 @@ fn automatic_device_vram_budget_cap(
 }
 
 const AUTO_SUBMIT_INITIAL_CAP: usize = 16;
+fn use_paged_grid_buffer(
+    requested: Option<bool>,
+    measured_device: bool,
+    k: usize,
+    n: usize,
+    rows: usize,
+) -> bool {
+    requested.unwrap_or(measured_device && k == 2560 && n == 640 && (1..=3).contains(&rows))
+}
+
 const AUTO_SUBMIT_SAMPLES_PER_CAP: usize = 2;
 const AUTO_SUBMIT_MAX_ROUNDS: usize = 12;
 const AGGRESSIVE_SUBMIT_BUDGET_NS: u64 = 500_000_000;
@@ -2466,6 +2476,8 @@ pub struct VulkanBackend {
     /// whole device for a paged-MoE session before `moe_pager` was moved off it — see
     /// `backend_drop_frees_device_after_moe_pager`.
     bda_weight_arena: Mutex<Option<BdaWeightArena>>,
+    iq2s_grid: Option<Arc<dyn Buffer>>,
+    iq3s_grid: Option<Arc<dyn Buffer>>,
     /// Service-level elastic VRAM arena. Kept on backend handles rather than `VulkanShared`
     /// because its physical shard buffers retain `Arc<VulkanShared>` and would otherwise form a
     /// device-leaking reference cycle.
@@ -2740,6 +2752,20 @@ impl VulkanBackend {
     /// retain the established kernel until separately validated.
     pub(crate) fn prefers_qwen_hc_down_prefetch4(&self) -> bool {
         cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+    }
+
+    fn measured_decode_kernel_device(&self) -> bool {
+        cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+    }
+
+    pub(crate) fn use_paged_grid_buffer(&self, k: usize, n: usize, rows: usize) -> bool {
+        use_paged_grid_buffer(
+            self.cfg().kernels.vulkan.gemv.id_grid_buffer,
+            self.measured_decode_kernel_device(),
+            k,
+            n,
+            rows,
+        )
     }
 
     /// Borrowed engine configuration — every knob this backend (and the seam code holding it)
@@ -4172,13 +4198,15 @@ impl VulkanBackend {
 
         let runtime_phase = Arc::new(Mutex::new(adapter::RuntimePhaseArena::default()));
         let unified_phases = UnifiedPhaseRegistry::new(&runtime_phase);
-        let backend = Self {
+        let mut backend = Self {
             decode_prefetch: Mutex::new(None),
             moe_pager: Arc::new(Mutex::new(None)),
             session_finalization_deferred: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             dense_pager: Mutex::new(None),
             runtime_phase,
             bda_weight_arena: Mutex::new(None),
+            iq2s_grid: None,
+            iq3s_grid: None,
             unified_pool: Arc::new(Mutex::new(None)),
             unified_exec: Arc::new(RwLock::new(())),
             unified_phases,
@@ -4249,6 +4277,29 @@ impl VulkanBackend {
         // The int8 coopmat tier's accumulator-layout check — a real dispatch, so it can only run
         // once the backend exists. No-op unless that tier is actually asked for.
         backend.verify_i8_coopmat_layout();
+
+        if backend
+            .cfg()
+            .kernels
+            .vulkan
+            .gemv
+            .id_grid_buffer
+            .unwrap_or(backend.measured_decode_kernel_device())
+        {
+            let words: Vec<u32> = infr_core::iquant_grids::IQ2S_GRID
+                .iter()
+                .flat_map(|&word| [word as u32, (word >> 32) as u32])
+                .collect();
+            let grid = backend.make_buf(words.len() * 4, MemoryLocation::GpuOnly, "iq2s-grid")?;
+            backend.upload(&grid, bytemuck::cast_slice(&words))?;
+            backend.iq2s_grid = Some(Arc::new(grid));
+            let grid = backend.make_buf(2048, MemoryLocation::GpuOnly, "iq3s-grid")?;
+            backend.upload(
+                &grid,
+                bytemuck::cast_slice(&infr_core::iquant_grids::IQ3S_GRID),
+            )?;
+            backend.iq3s_grid = Some(Arc::new(grid));
+        }
 
         Ok(backend)
     }
@@ -5525,6 +5576,8 @@ impl VulkanBackend {
             dense_pager: Mutex::new(None),
             runtime_phase,
             bda_weight_arena: Mutex::new(None),
+            iq2s_grid: self.iq2s_grid.clone(),
+            iq3s_grid: self.iq3s_grid.clone(),
             unified_pool: Arc::clone(&self.unified_pool),
             unified_exec: Arc::clone(&self.unified_exec),
             unified_phases: Arc::clone(&self.unified_phases),
@@ -7890,6 +7943,41 @@ fn probe_flash_attention_hd256(
 mod tests {
     use super::*;
     use infr_core::Backend;
+
+    #[test]
+    fn paged_grid_buffer_auto_is_device_and_shape_scoped() {
+        for measured_device in [false, true] {
+            for (k, n, rows) in [
+                (2560, 640, 1),
+                (2560, 640, 2),
+                (2560, 640, 3),
+                (2560, 640, 0),
+                (2560, 640, 4),
+                (2560, 640, 2048),
+                (768, 640, 1),
+                (2560, 641, 1),
+            ] {
+                assert_eq!(
+                    use_paged_grid_buffer(None, measured_device, k, n, rows),
+                    measured_device && k == 2560 && n == 640 && (1..=3).contains(&rows)
+                );
+                assert!(!use_paged_grid_buffer(
+                    Some(false),
+                    measured_device,
+                    k,
+                    n,
+                    rows
+                ));
+                assert!(use_paged_grid_buffer(
+                    Some(true),
+                    measured_device,
+                    k,
+                    n,
+                    rows
+                ));
+            }
+        }
+    }
 
     #[test]
     fn windows_xe1_automatic_vram_caps_are_architecture_scoped() {

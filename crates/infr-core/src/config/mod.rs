@@ -300,6 +300,10 @@ cfg_struct! {
         sg_nr: u32 = 2,
         /// `INFR_GEMV_ID_GRID_NR`: output rows handled per 64-thread paged IQ id-GEMV workgroup.
         id_grid_nr: u32 = 8,
+        /// Output rows per immutable-codebook paged IQ2_S/IQ3_S workgroup.
+        id_grid_buffer_nr: u32 = 4,
+        /// Immutable IQ codebooks. None selects measured Windows/RDNA3 Decode shapes only.
+        id_grid_buffer: Option<bool> = None,
         /// The selected GEMV variant, COMPUTED from two keys exactly as `GemvKnobs::resolve`
         /// does it: `INFR_NO_GEMV_REG` present ⇒ `None` (and it silently wins over
         /// `INFR_GEMV_VARIANT`); otherwise `INFR_GEMV_VARIANT`, else `Some("reg")`.

@@ -12262,6 +12262,32 @@ impl<'a> Recorder<'a> {
             Self::vkb(lut),
             Self::vkb(y),
         ];
+        if matches!(dtype, infr_core::DType::Iq2S | infr_core::DType::Iq3S)
+            && self.be.use_paged_grid_buffer(in_f, out_f, rows)
+        {
+            let nr = self.gemv().id_grid_buffer_nr;
+            let grid = if dtype == infr_core::DType::Iq2S {
+                &self.be.iq2s_grid
+            } else {
+                &self.be.iq3s_grid
+            };
+            if let Some(grid) = grid.as_ref() {
+                let build = crate::gemm::native_idm_grid_buffer_paged_spv(dtype, nr);
+                if let Some((name, spv)) = build {
+                    let k = self.be.kernel(name, spv, 5, 44);
+                    let mut grid_bufs = bufs;
+                    grid_bufs[0] = Self::vkb(grid.as_ref());
+                    self.dispatch_wide(
+                        k,
+                        &grid_bufs,
+                        1,
+                        &push,
+                        (rows * n_used * out_f.div_ceil(nr as usize)) as u32,
+                    );
+                    return;
+                }
+            }
+        }
         if rows > 1 {
             let nr = self.gemv().id_grid_nr;
             if let Some((name, spv)) = crate::gemm::native_idm_grid_nr_paged_build_spv(dtype, nr) {
@@ -12349,6 +12375,32 @@ impl<'a> Recorder<'a> {
                 let groups = (rows * n_used * out_f.div_ceil(nr as usize)) as u32;
                 self.dispatch_wide(k, &bufs, 1, &push, groups);
                 return;
+            }
+        }
+        if matches!(dtype, infr_core::DType::Iq2S | infr_core::DType::Iq3S)
+            && self.be.use_paged_grid_buffer(in_f, out_f, rows)
+        {
+            let nr = self.gemv().id_grid_buffer_nr;
+            let grid = if dtype == infr_core::DType::Iq2S {
+                &self.be.iq2s_grid
+            } else {
+                &self.be.iq3s_grid
+            };
+            if let Some(grid) = grid.as_ref() {
+                let build = crate::gemm::native_idm_grid_buffer_shared_spv(dtype, nr);
+                if let Some((name, spv)) = build {
+                    let k = self.be.kernel(name, spv, 5, 56);
+                    let mut grid_bufs = bufs;
+                    grid_bufs[0] = Self::vkb(grid.as_ref());
+                    self.dispatch_wide(
+                        k,
+                        &grid_bufs,
+                        1,
+                        &push,
+                        (rows * n_used * out_f.div_ceil(nr as usize)) as u32,
+                    );
+                    return;
+                }
             }
         }
         let (name, spv) = crate::gemm::native_idm_paged_shared_build_spv(dtype)
@@ -16271,6 +16323,163 @@ mod tests {
         }
         println!("native_gemm_mmq_q6k max_err={e:e}");
         assert!(e < 2e-2, "native_gemm_mmq_q6k mismatch: {e}"); // int8 activation quant tolerance
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU; IQ grid/bounds/grouping parity and probe"]
+    fn iq2s_shared_grid_grouping_probe() {
+        use infr_core::backend::{Backend, BufferUsage};
+        let mut references = std::collections::HashMap::new();
+        for dtype in [infr_core::DType::Iq2S, infr_core::DType::Iq3S] {
+            for (buffer_grid, nr) in [false, true]
+                .into_iter()
+                .flat_map(|buffer| [1u32, 2, 4, 8].map(move |nr| (buffer, nr)))
+            {
+                let mut cfg = infr_core::config::Config::default();
+                cfg.kernels.vulkan.gemv.id_grid_buffer_nr = nr;
+                cfg.kernels.vulkan.gemv.id_grid_nr = nr;
+                cfg.kernels.vulkan.gemv.id_grid_buffer = Some(buffer_grid);
+                let be = VulkanBackend::new_on_with(1, std::sync::Arc::new(cfg)).unwrap();
+                for (k, n) in [(2560usize, 641usize), (768, 2561)] {
+                    for rows in [1usize, 2, 3] {
+                        for (with_shared, per_slot) in
+                            [false, true].into_iter().flat_map(|shared| {
+                                [false, true].map(move |per_slot| (shared, per_slot))
+                            })
+                        {
+                            // The ragged output also exercises the last grouped workgroup.
+                            let (experts, used) = (10usize, 10usize);
+                            let width = used + usize::from(with_shared);
+                            let weight_bytes =
+                                infr_testkit::synth_weight(dtype, k * n * experts, 456);
+                            let stride = infr_testkit::synth_weight(dtype, k * n, 456).len();
+                            let weight = be.upload_weight_bytes(&weight_bytes).unwrap();
+                            let shared = be
+                                .upload_weight_bytes(&infr_testkit::synth_weight(
+                                    infr_core::DType::Q8_0,
+                                    k * n,
+                                    457,
+                                ))
+                                .unwrap();
+                            let lut_words = (0..experts)
+                                .flat_map(|e| {
+                                    let address =
+                                        weight.device_addr().unwrap() + (e * stride) as u64;
+                                    [address as u32, (address >> 32) as u32]
+                                })
+                                .collect::<Vec<_>>();
+                            let mut ids = (0..rows)
+                                .flat_map(|r| {
+                                    (0..used).map(move |s| ((s + r * 3) % experts) as u32)
+                                })
+                                .collect::<Vec<_>>();
+                            for r in 0..rows {
+                                ids.push(((1u32 << width) - 1) & !(1 << (r + 2)));
+                            }
+                            let x = (0..rows * (if per_slot { width } else { 1 }) * k)
+                                .map(|i| (i as f32 * 0.031).sin() * 0.2)
+                                .collect::<Vec<_>>();
+                            let input = be.alloc(x.len() * 4, BufferUsage::Activations).unwrap();
+                            let lut = be
+                                .alloc(lut_words.len() * 4, BufferUsage::Activations)
+                                .unwrap();
+                            let ids_b = be.alloc(ids.len() * 4, BufferUsage::Activations).unwrap();
+                            let output = be
+                                .alloc(rows * width * n * 4, BufferUsage::Readback)
+                                .unwrap();
+                            be.upload(input.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+                            be.upload(lut.as_ref(), bytemuck::cast_slice(&lut_words))
+                                .unwrap();
+                            be.upload(ids_b.as_ref(), bytemuck::cast_slice(&ids))
+                                .unwrap();
+                            be.upload(output.as_ref(), &vec![0; output.len_bytes()])
+                                .unwrap();
+                            let run = |reps| {
+                                let rec = be.recorder().unwrap();
+                                for _ in 0..reps {
+                                    if with_shared {
+                                        rec.linear_native_id_multi_paged_shared(
+                                            dtype,
+                                            weight.device_addr().unwrap(),
+                                            stride as u32,
+                                            lut.as_ref(),
+                                            ids_b.as_ref(),
+                                            used,
+                                            0,
+                                            shared.as_ref(),
+                                            input.as_ref(),
+                                            per_slot,
+                                            output.as_ref(),
+                                            k,
+                                            n,
+                                            rows,
+                                            0,
+                                            1,
+                                        );
+                                    } else {
+                                        rec.linear_native_id_multi_paged(
+                                            dtype,
+                                            weight.device_addr().unwrap(),
+                                            stride as u32,
+                                            lut.as_ref(),
+                                            ids_b.as_ref(),
+                                            used,
+                                            0,
+                                            input.as_ref(),
+                                            per_slot,
+                                            output.as_ref(),
+                                            k,
+                                            n,
+                                            rows,
+                                            0,
+                                            1,
+                                        );
+                                    }
+                                }
+                                let start = std::time::Instant::now();
+                                rec.finish().unwrap();
+                                start.elapsed().as_secs_f64() * 1e6 / reps as f64
+                            };
+                            run(1);
+                            if buffer_grid {
+                                let effective_nr = nr;
+                                let (expected, _) = if with_shared {
+                                    crate::gemm::native_idm_grid_buffer_shared_spv(
+                                        dtype,
+                                        effective_nr,
+                                    )
+                                    .unwrap()
+                                } else {
+                                    crate::gemm::native_idm_grid_buffer_paged_spv(
+                                        dtype,
+                                        effective_nr,
+                                    )
+                                    .unwrap()
+                                };
+                                assert!(
+                                    be.built_kernel_names().contains(&expected),
+                                    "grid probe took a fallback instead of {expected}"
+                                );
+                            }
+                            let mut values = vec![0u8; output.len_bytes()];
+                            be.download(output.as_ref(), &mut values).unwrap();
+                            if nr == 1 && !buffer_grid {
+                                references
+                                    .insert((dtype, k, n, rows, per_slot, with_shared), values);
+                            } else {
+                                assert_eq!(
+                            &values,
+                            &references[&(dtype, k, n, rows, per_slot, with_shared)],
+                                "{dtype:?} K={k}, N={n}, shared={with_shared}, buffer={buffer_grid}, nr={nr}, rows={rows}, per_slot={per_slot}"
+                        );
+                            }
+                            let measurements = (0..4).map(|_| run(64)).collect::<Vec<_>>();
+                            println!("{dtype:?} K={k}, N={n}, shared={with_shared}, buffer={buffer_grid}, nr={nr}, rows={rows}, per_slot={per_slot}, warm_us={measurements:?}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Q8_0 BN=64/BK=64 A_GLOBAL tile used by Qwen3.8's N=320 recurrent projections. The

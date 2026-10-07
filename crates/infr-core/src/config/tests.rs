@@ -21,6 +21,23 @@ fn env_layer(pairs: &[(&str, &str)]) -> PartialConfig {
     try_env_layer(pairs).expect("env layer rejected a valid synthetic environment")
 }
 
+#[test]
+fn paged_iq_grid_override_preserves_auto_and_explicit_modes() {
+    for (value, expected) in [("none", None), ("true", Some(true)), ("false", Some(false))] {
+        let mut layer = PartialConfig::default();
+        layer
+            .set_path("kernels.vulkan.gemv.id_grid_buffer", value)
+            .unwrap();
+        layer
+            .set_path("kernels.vulkan.gemv.id_grid_buffer_nr", "4")
+            .unwrap();
+        let mut cfg = Config::default();
+        layer.apply(&mut cfg);
+        assert_eq!(cfg.kernels.vulkan.gemv.id_grid_buffer, expected);
+        assert_eq!(cfg.kernels.vulkan.gemv.id_grid_buffer_nr, 4);
+    }
+}
+
 fn try_env_layer(pairs: &[(&str, &str)]) -> Result<PartialConfig, ConfigError> {
     let map: HashMap<String, String> = pairs
         .iter()

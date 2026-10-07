@@ -91,7 +91,13 @@ uint rw1(uint bo) {
 // indexing is a per-invocation-scratch catastrophe on RADV/ACO). Every includer runs `GRID_INIT;`
 // at the TOP of main(): it contains a barrier(), so it must precede any early return / divergent
 // flow. Non-grid builds expand it to an empty statement — byte-identical SPIR-V.
-#ifdef USE_GRID
+#if defined(IQ2_GRID_BUFFER)
+layout(binding = 0) readonly buffer IQ2GridB { uint G_IQ2S[]; };
+#define GRID_INIT
+#elif defined(IQ3_GRID_BUFFER)
+layout(binding = 0) readonly buffer IQ3GridB { uint G_IQ3S[]; };
+#define GRID_INIT
+#elif defined(USE_GRID)
 #include "native_grids.glsl"
 #define GRID_INIT grid_init()
 #else
@@ -901,7 +907,7 @@ float dq(uint g) {
 void dqblk(uint gstart, out float v[32]) {
     uint bd = (gstart / 256u) * 82u; uint ib32 = (gstart % 256u) / 32u;
     float d = f16tof32(ru16(bd));
-#ifdef STREAMED
+#if defined(STREAMED)
     // Wide-fetch restructure (STREAMED only — the descriptor twin's rb()/ru32u already vectorize
     // and get SGPR-descriptor addressing for free; don't perturb its codegen). IQ2_S has no
     // adjacent qs word-PAIR to fuse (d@0, qs@2+4i, signs@34+4i, qh@66+i, sc@74+i — all mutually

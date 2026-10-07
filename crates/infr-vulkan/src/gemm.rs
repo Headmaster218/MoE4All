@@ -425,6 +425,36 @@ pub(crate) fn native_idm_grid_nr_paged_build_spv(
 /// Hybrid paged-Qwen decode GEMV: routed slots use `dtype`, while the final slot reads a fixed
 /// dense Q8_0 shared-expert matrix. Kept separate from the ordinary paged table so unsupported
 /// graphs cannot accidentally select the larger push-constant ABI.
+pub(crate) fn native_idm_grid_buffer_paged_spv(
+    dtype: infr_core::DType,
+    nr: u32,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! variant {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            Some((
+                $name,
+                S.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            ))
+        }};
+    }
+    match (dtype, nr) {
+        (Iq2S, 1) => variant!("native_idm_iq2s_buffer_paged"),
+        (Iq2S, 2) => variant!("native_idm_iq2s_buffer_nr2_paged"),
+        (Iq2S, 4) => variant!("native_idm_iq2s_buffer_nr4_paged"),
+        (Iq2S, 8) => variant!("native_idm_iq2s_buffer_nr8_paged"),
+        (Iq3S, 1) => variant!("native_idm_iq3s_buffer_paged"),
+        (Iq3S, 2) => variant!("native_idm_iq3s_buffer_nr2_paged"),
+        (Iq3S, 4) => variant!("native_idm_iq3s_buffer_nr4_paged"),
+        (Iq3S, 8) => variant!("native_idm_iq3s_buffer_nr8_paged"),
+        _ => None,
+    }
+}
+
 pub(crate) fn native_idm_paged_shared_build_spv(
     dtype: infr_core::DType,
 ) -> Option<(&'static str, &'static [u32])> {
@@ -447,6 +477,36 @@ pub(crate) fn native_idm_paged_shared_build_spv(
         Iq3S => v!("native_idm_iq3s_paged_shexp"),
         Iq4Nl => v!("native_idm_iq4nl_paged_shexp"),
         Iq4Xs => v!("native_idm_iq4xs_paged_shexp"),
+        _ => None,
+    }
+}
+
+pub(crate) fn native_idm_grid_buffer_shared_spv(
+    dtype: infr_core::DType,
+    nr: u32,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! variant {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            Some((
+                $name,
+                S.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            ))
+        }};
+    }
+    match (dtype, nr) {
+        (Iq2S, 1) => variant!("native_idm_iq2s_buffer_paged_shexp"),
+        (Iq2S, 2) => variant!("native_idm_iq2s_buffer_nr2_paged_shexp"),
+        (Iq2S, 4) => variant!("native_idm_iq2s_buffer_nr4_paged_shexp"),
+        (Iq2S, 8) => variant!("native_idm_iq2s_buffer_nr8_paged_shexp"),
+        (Iq3S, 1) => variant!("native_idm_iq3s_buffer_paged_shexp"),
+        (Iq3S, 2) => variant!("native_idm_iq3s_buffer_nr2_paged_shexp"),
+        (Iq3S, 4) => variant!("native_idm_iq3s_buffer_nr4_paged_shexp"),
+        (Iq3S, 8) => variant!("native_idm_iq3s_buffer_nr8_paged_shexp"),
         _ => None,
     }
 }

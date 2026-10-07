@@ -1834,6 +1834,123 @@ fn main() {
             "native_idm_iq4xs_paged",
             &["-DFMT_IQ4XS", "-DPAGED"],
         ),
+        // Paged IQ codebooks shared by workgroups instead of repeated LDS initialization.
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_buffer_paged",
+            &["-DFMT_IQ2S", "-DIQ2_GRID_BUFFER", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_buffer_nr2_paged",
+            &["-DFMT_IQ2S", "-DIQ2_GRID_BUFFER", "-DPAGED", "-DNR=2"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_buffer_nr4_paged",
+            &["-DFMT_IQ2S", "-DIQ2_GRID_BUFFER", "-DPAGED", "-DNR=4"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_buffer_nr8_paged",
+            &["-DFMT_IQ2S", "-DIQ2_GRID_BUFFER", "-DPAGED", "-DNR=8"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_buffer_paged_shexp",
+            &["-DFMT_IQ2S", "-DIQ2_GRID_BUFFER", "-DPAGED", "-DSHARED_Q8"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_buffer_nr2_paged_shexp",
+            &[
+                "-DFMT_IQ2S",
+                "-DIQ2_GRID_BUFFER",
+                "-DPAGED",
+                "-DSHARED_Q8",
+                "-DNR=2",
+            ],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_buffer_nr4_paged_shexp",
+            &[
+                "-DFMT_IQ2S",
+                "-DIQ2_GRID_BUFFER",
+                "-DPAGED",
+                "-DSHARED_Q8",
+                "-DNR=4",
+            ],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_buffer_nr8_paged_shexp",
+            &[
+                "-DFMT_IQ2S",
+                "-DIQ2_GRID_BUFFER",
+                "-DPAGED",
+                "-DSHARED_Q8",
+                "-DNR=8",
+            ],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3s_buffer_paged",
+            &["-DFMT_IQ3S", "-DIQ3_GRID_BUFFER", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3s_buffer_nr2_paged",
+            &["-DFMT_IQ3S", "-DIQ3_GRID_BUFFER", "-DPAGED", "-DNR=2"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3s_buffer_nr4_paged",
+            &["-DFMT_IQ3S", "-DIQ3_GRID_BUFFER", "-DPAGED", "-DNR=4"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3s_buffer_nr8_paged",
+            &["-DFMT_IQ3S", "-DIQ3_GRID_BUFFER", "-DPAGED", "-DNR=8"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3s_buffer_paged_shexp",
+            &["-DFMT_IQ3S", "-DIQ3_GRID_BUFFER", "-DPAGED", "-DSHARED_Q8"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3s_buffer_nr2_paged_shexp",
+            &[
+                "-DFMT_IQ3S",
+                "-DIQ3_GRID_BUFFER",
+                "-DPAGED",
+                "-DSHARED_Q8",
+                "-DNR=2",
+            ],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3s_buffer_nr4_paged_shexp",
+            &[
+                "-DFMT_IQ3S",
+                "-DIQ3_GRID_BUFFER",
+                "-DPAGED",
+                "-DSHARED_Q8",
+                "-DNR=4",
+            ],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3s_buffer_nr8_paged_shexp",
+            &[
+                "-DFMT_IQ3S",
+                "-DIQ3_GRID_BUFFER",
+                "-DPAGED",
+                "-DSHARED_Q8",
+                "-DNR=8",
+            ],
+        ),
         // Qwen shared-expert decode: routed slots keep their native quant while the final slot
         // reads one fixed Q8_0 shared-expert matrix by BDA. Keep the format set aligned with
         // `paged_moe_shared_at`; Qwen3.8 uses IQ2_S/IQ4_NL/IQ3_S across its mixed-quant banks.
