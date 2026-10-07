@@ -382,7 +382,7 @@ fn emit_hc_mix(
         && inject.is_some_and(|inject| {
             g.desc(weights.down).dtype == DType::Q8_0
                 && g.desc(inject).dtype == DType::F32
-                && hcw % 32 == 0
+                && hcw.is_multiple_of(32)
         });
     if let Some(inject) = inject.filter(|_| fused_down_inject) {
         g.push(Op::QwenHcDownInject {
@@ -1148,6 +1148,7 @@ struct DraftHandles {
     ids: Vec<TensorId>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_draft_graph(
     cfg: &crate::Config,
     specs: &[(DType, usize)],
