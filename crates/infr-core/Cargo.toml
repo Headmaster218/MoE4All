@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
 infr-prof.workspace = true
 infr-prof-rt.workspace = true
 thiserror.workspace = true
@@ -21,7 +22,7 @@ tracing.workspace = true
 rayon.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = ["Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+windows = { version = "0.58", features = ["Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_Performance"] }
 
 [dev-dependencies]
 tempfile = "3"

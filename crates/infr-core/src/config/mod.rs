@@ -768,6 +768,14 @@ cfg_struct! {
         /// Runtime-only wall timing, deliberately separate from `INFR_PROF_OPS` because Vulkan
         /// timestamp profiling changes the paged ring's nowait behaviour.
         pager_profile: bool = false,
+        /// Bounded asynchronous Decode trace; independent of the blocking per-op profiler.
+        timeline_path: Option<PathBuf> = None,
+        timeline_skip_steps: usize = 64,
+        timeline_steps: usize = 16,
+        timeline_stride: usize = 128,
+        timeline_windows: usize = 12,
+        /// Zero captures any cohort size; otherwise capture exactly this many Decode lanes.
+        timeline_lanes: usize = 0,
         /// `INFR_PROF_OUT`: write the exit report as JSON to this path, in addition to stderr.
         /// (`INFR_PROFILE` — the BUILD-time host-instrumentation input read by `build.rs` — is
         /// deliberately NOT config; see [`manifest::NOT_MIGRATED`].)
