@@ -479,6 +479,7 @@ impl SessionTransferPlan {
             return Ok(());
         }
         if let Some(dst) = target.mapped_ptr() {
+            let _timeline_copy = infr_core::timeline::span("expert_mapped_copy");
             let started = pager_profile::active().then(std::time::Instant::now);
             parallel_copy_to_mapped(src, dst);
             if let Some(t0) = started {
@@ -544,6 +545,7 @@ impl SessionTransferPlan {
         }
 
         if !mapped.is_empty() {
+            let _timeline_copy = infr_core::timeline::span("expert_mapped_copy");
             let started = pager_profile::active().then(std::time::Instant::now);
             parallel_copy_to_mapped_batch(&mapped);
             if let Some(t0) = started {
