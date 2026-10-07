@@ -22,6 +22,7 @@ pub mod pager;
 mod pcache;
 pub mod pipeline;
 mod recorder;
+mod timeline;
 pub mod tp;
 pub mod tp_allreduce;
 pub mod tp_sem;
@@ -758,6 +759,8 @@ struct VulkanShared {
     submit_auto_tuner: Mutex<Option<SubmitAutoTuner>>,
     submit_timestamp_period_ns: f32,
     submit_timestamp_valid_bits: u32,
+    timeline_clock: Option<crate::timeline::Clock>,
+    timeline_query_pools: Arc<Mutex<Vec<vk::QueryPool>>>,
     /// UNIFIED-MEMORY parts only (`None` on every discrete GPU): the host-visible memory type on
     /// the non-device-local heap that `GpuOnly` allocations SPILL into once the device-local heap
     /// is full. See [`probe_host_visible_non_device_local_type`] for why counting that heap in the
@@ -1017,6 +1020,7 @@ impl VulkanShared {
     }
 
     fn wait_dedicated_transfer(&self, value: u64) -> Result<()> {
+        let _timeline_wait = infr_core::timeline::span("dma_timeline_wait");
         if value == 0 {
             return Ok(());
         }
@@ -1576,6 +1580,9 @@ impl Drop for VulkanShared {
             }
             if let Some(queue) = self.dedicated_transfer.take() {
                 queue.into_inner().unwrap().destroy(&self.device);
+            }
+            for pool in self.timeline_query_pools.lock().unwrap().drain(..) {
+                self.device.destroy_query_pool(pool, None);
             }
             // Destroy command pool.
             let pool = self.cmd_pool.lock().unwrap();
@@ -3602,6 +3609,11 @@ impl VulkanBackend {
         if has_push_descriptor {
             ext_ptrs.push(c"VK_KHR_push_descriptor".as_ptr());
         }
+        let has_timeline_clock =
+            infr_core::timeline::enabled() && has_ext(c"VK_EXT_calibrated_timestamps");
+        if has_timeline_clock {
+            ext_ptrs.push(c"VK_EXT_calibrated_timestamps".as_ptr());
+        }
         // The int8 dp4a decode GEMVs (native_mmv.comp, native_mmv_mrow.comp, native_mmv_id_q4k.comp,
         // mul_mat_vec_q.comp's dotPacked builtins) compile to SPIR-V with the DotProduct /
         // DotProductInput4x8BitPacked capabilities, which VUID-VkShaderModuleCreateInfo-pCode-08740
@@ -3739,6 +3751,9 @@ impl VulkanBackend {
         // Register the device so any Err below (subgroup-32/env guards, allocator build) destroys
         // it instead of leaking it — see `InstanceCleanup` above.
         cleanup.device = Some(device.clone());
+        let timeline_clock = has_timeline_clock
+            .then(|| crate::timeline::Clock::new(&entry, &instance, &device, physical_device))
+            .flatten();
 
         let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
@@ -4222,6 +4237,8 @@ impl VulkanBackend {
                 submit_auto_tuner: Mutex::new(submit_auto_tuner),
                 submit_timestamp_period_ns,
                 submit_timestamp_valid_bits,
+                timeline_clock,
+                timeline_query_pools: Arc::new(Mutex::new(Vec::new())),
                 uma_overflow_type,
                 host_overflow_type,
                 kv_spill: SpillTally::default(),

@@ -34,6 +34,7 @@ struct DedicatedTransferCommandSlot {
     keepalive: Vec<Arc<dyn Buffer>>,
     profile_pending: bool,
     profile_bytes: u64,
+    timeline_query: Option<crate::timeline::Query>,
 }
 
 /// Transfer-family stream for imported host RAM to device-arena copies. The timeline value is
@@ -138,6 +139,7 @@ impl DedicatedTransferQueue {
                     keepalive: Vec::new(),
                     profile_pending: false,
                     profile_bytes: 0,
+                    timeline_query: None,
                 })
                 .collect(),
             cursor: 0,
@@ -156,6 +158,9 @@ impl DedicatedTransferQueue {
         slot_index: usize,
         slot: &mut DedicatedTransferCommandSlot,
     ) {
+        if let Some(query) = slot.timeline_query.take() {
+            query.resolve();
+        }
         if query_pool == vk::QueryPool::null() || !slot.profile_pending {
             return;
         }
@@ -208,6 +213,7 @@ impl DedicatedTransferQueue {
         shared: &crate::VulkanShared,
         batches: &[TransferCopyBatch],
     ) -> Result<u64> {
+        let _timeline_transfer = infr_core::timeline::span("dma_prepare_submit");
         debug_assert!(!batches.is_empty());
         let slot_index = self.cursor;
         let slot = &mut self.slots[slot_index];
@@ -215,6 +221,7 @@ impl DedicatedTransferQueue {
             let semaphores = [self.timeline];
             let values = [slot.pending_value];
             let wait_t0 = pager_profile::start();
+            let wait_span = infr_core::timeline::span("dma_slot_wait");
             let wait = unsafe {
                 shared.device.wait_semaphores(
                     &vk::SemaphoreWaitInfo::default()
@@ -223,6 +230,7 @@ impl DedicatedTransferQueue {
                     u64::MAX,
                 )
             };
+            drop(wait_span);
             if let Some(elapsed) = pager_profile::elapsed(wait_t0) {
                 pager_profile::record_dedicated_transfer_slot_wait(elapsed);
             }
@@ -251,6 +259,12 @@ impl DedicatedTransferQueue {
             )
         }
         .map_err(|error| be(format!("begin dedicated transfer command buffer: {error}")))?;
+        let mut timeline_query = crate::timeline::Query::new(
+            shared,
+            slot.cmd,
+            "dma",
+            self.profile_timestamp_valid_bits,
+        )?;
 
         let profile_active = pager_profile::active();
         let profile_queries = profile_active && self.profile_query_pool != vk::QueryPool::null();
@@ -300,6 +314,14 @@ impl DedicatedTransferQueue {
                     query_base + 1,
                 );
             }
+            if let Some(query) = timeline_query.as_mut() {
+                let bytes = batches
+                    .iter()
+                    .flat_map(|batch| &batch.regions)
+                    .map(|region| region.size)
+                    .sum();
+                query.close(0, 0, self.next_value, bytes);
+            }
             shared
                 .device
                 .end_command_buffer(slot.cmd)
@@ -320,7 +342,13 @@ impl DedicatedTransferQueue {
             .command_buffers(&commands)
             .signal_semaphores(&signals)
             .push_next(&mut timeline);
+        let submit_span = infr_core::timeline::span("dma_queue_submit");
+        if let Some(query) = timeline_query.as_mut() {
+            query.submitted();
+        }
         shared.submit_dedicated_transfer(self.queue, &submit)?;
+        drop(submit_span);
+        slot.timeline_query = timeline_query;
 
         let profile_bytes = if profile_active {
             let (regions, bytes) = batches.iter().fold((0u64, 0u64), |totals, batch| {

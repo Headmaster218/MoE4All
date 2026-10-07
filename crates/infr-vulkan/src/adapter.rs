@@ -2203,6 +2203,7 @@ fn lower_op(
     // before the loop).
     wsub: Option<u64>,
 ) -> Result<()> {
+    let _timeline_lower = infr_core::timeline::span(op.kind());
     let memo_prev = mmv_memo.take();
     let r = |id: TensorId| resolve(scratch, bindings, id);
     match op {
@@ -8875,6 +8876,7 @@ impl Drop for FrozenMoeLutGuard<'_> {
 /// retain shape-stable scratch within one decode/prefill phase; other plans allocate it per call.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Result<()> {
+    let _timeline_execute = infr_core::timeline::span("backend_execute");
     let profile_t0 = infr_core::pager_profile::start();
     let result = match execute_static_inner(be_, graph, bindings) {
         Ok(()) => Ok(()),
@@ -8892,6 +8894,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
 }
 
 fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Result<()> {
+    let timeline_setup = infr_core::timeline::span("backend_setup");
     // A previous errored execute may have left protection until its recorder/segments dropped.
     // We are now inside the same unified execution gate, so no old command can still reference it.
     clear_frozen_moe_lut_slots(be_);
@@ -9107,6 +9110,7 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
     if let Some(elapsed) = infr_core::pager_profile::elapsed(setup_t0) {
         infr_core::pager_profile::record_backend_setup(elapsed);
     }
+    drop(timeline_setup);
     let mut rec = Some(be_.recorder()?);
     if reset_retained_scratch {
         // Restore only true read-before-write scratch in the first useful command stream. Queue
@@ -9730,6 +9734,7 @@ fn sync_stream<'a>(
     rec: &mut Option<Recorder<'a>>,
     ps: &mut PagedStream,
 ) -> Result<()> {
+    let _timeline_sync = infr_core::timeline::span("router_sync_stream");
     let sync_t0 = infr_core::pager_profile::start();
     rec.take()
         .expect("segment always Some between ops")
@@ -10598,6 +10603,8 @@ fn execute_paged_moe<'a>(
         .as_ref()
         .expect("paged execution requires a session")
         .registered_layer(gate_id, n_expert)?;
+    let _timeline_layer = infr_core::timeline::layer(current_layer as usize);
+    let _timeline_experts = infr_core::timeline::span("expert_layer");
     if let Some((hint, _, _)) = prefetch_gpu.as_ref() {
         if hint.source_layer != current_layer {
             return Err(be(format!(
@@ -10674,11 +10681,13 @@ fn execute_paged_moe<'a>(
                 active_prefetch_finished = true;
             }
             stage_ids.resize(n_slots, 0);
+            let readback_span = infr_core::timeline::span("router_readback");
             be_.download(
                 pool[&ids_key].as_ref(),
                 bytemuck::cast_slice_mut(stage_ids.as_mut_slice()),
             )
             .map_err(|e| be(e.to_string()))?;
+            drop(readback_span);
         }
     }
     if (prefetch_gpu.is_some() || close_active_prefetch) && !stream_synced_for_cpu_push {
@@ -11048,6 +11057,7 @@ fn execute_paged_moe<'a>(
         } else {
             None
         };
+        let prepare_span = infr_core::timeline::span("expert_prepare");
         let push = {
             let mut guard = be_.moe_pager().lock().unwrap();
             guard
@@ -11063,6 +11073,7 @@ fn execute_paged_moe<'a>(
                     touch_all,
                 )?
         };
+        drop(prepare_span);
         let bytes = push.bytes();
         let prepared_profile = if let Some((probe, compute_live_at_start, started)) = overlap {
             Some((
@@ -11075,7 +11086,9 @@ fn execute_paged_moe<'a>(
         } else {
             None
         };
+        let enqueue_span = infr_core::timeline::span("expert_enqueue");
         push.record(rec.as_ref().expect("segment always Some between ops"))?;
+        drop(enqueue_span);
         if let Some((
             probe,
             compute_live_at_start,

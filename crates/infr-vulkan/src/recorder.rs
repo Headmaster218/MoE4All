@@ -968,6 +968,8 @@ pub struct Recorder<'a> {
     submit_query_pool: std::cell::Cell<vk::QueryPool>,
     submit_timing_token: std::cell::Cell<Option<crate::SubmitTimingToken>>,
     submit_pager_profile: std::cell::Cell<bool>,
+    timeline_query: RefCell<Option<crate::timeline::Query>>,
+    timeline_lifetime: RefCell<Option<infr_core::timeline::Span>>,
     ts_labels: RefCell<Vec<&'static str>>,
     /// Dispatches past the query-pool capacity: counted (and reported) instead of stamped.
     ts_dropped: std::cell::Cell<usize>,
@@ -1042,6 +1044,7 @@ impl<'a> Recorder<'a> {
     }
 
     fn new_inner(backend: &'a VulkanBackend, persistent: bool) -> Result<Self> {
+        let _timeline_acquire = infr_core::timeline::span("recorder_acquire");
         let profile_acquire_t0 = pager_profile::start();
         let device = &backend.shared.device;
         let cmd_pool = backend.shared.cmd_pool.lock().unwrap();
@@ -1165,6 +1168,34 @@ impl<'a> Recorder<'a> {
         if let Some(elapsed) = pager_profile::elapsed(profile_acquire_t0) {
             pager_profile::record_command_recorder_acquire(elapsed);
         }
+        let timeline_query = if persistent {
+            None
+        } else {
+            match crate::timeline::Query::new(
+                &backend.shared,
+                cmd,
+                "main",
+                backend.shared.submit_timestamp_valid_bits,
+            ) {
+                Ok(query) => query,
+                Err(error) => {
+                    unsafe {
+                        if query_pool != vk::QueryPool::null() {
+                            device.destroy_query_pool(query_pool, None);
+                        }
+                    }
+                    backend.shared.return_submit_timing_query(submit_query_pool);
+                    backend.shared.recorder_cmds.lock().unwrap().push(cmd);
+                    backend
+                        .shared
+                        .recorder_desc_pools
+                        .lock()
+                        .unwrap()
+                        .push(pool);
+                    return Err(error);
+                }
+            }
+        };
         Ok(Self {
             be: backend,
             cmd,
@@ -1186,6 +1217,8 @@ impl<'a> Recorder<'a> {
             submit_query_pool: std::cell::Cell::new(submit_query_pool),
             submit_timing_token: std::cell::Cell::new(submit_timing_token),
             submit_pager_profile: std::cell::Cell::new(submit_pager_profile),
+            timeline_query: RefCell::new(timeline_query),
+            timeline_lifetime: RefCell::new(infr_core::timeline::span("recorder_lifetime")),
             ts_labels: RefCell::new(Vec::new()),
             ts_dropped: std::cell::Cell::new(0),
             next_label: std::cell::Cell::new(None),
@@ -1329,6 +1362,9 @@ impl<'a> Recorder<'a> {
     /// longer stamp by hand (use [`label_next`](Self::label_next) to override a too-generic
     /// kernel name).
     fn stamp(&self, label: &'static str) {
+        if let Some(query) = self.timeline_query.borrow_mut().as_mut() {
+            query.mark(crate::timeline::group(label));
+        }
         // Every dispatch funnels through here, so this is also where the recorder counts them —
         // the submit splitter (`Recorder::dispatches`) needs the count whether or not INFR_PROF_OPS
         // is on.
@@ -1556,6 +1592,7 @@ impl<'a> Recorder<'a> {
         args: vk::Buffer,
         args_off: u64,
     ) {
+        let _timeline_encode = infr_core::timeline::span("command_encode");
         // Auto-label (INFR_PROF_OPS): every dispatch stamps a timestamp tagged with its kernel name
         // — the chokepoint knows the kernel, so no op method needs a manual stamp call. Placed
         // before `sync` so a barrier's cost lands in the op it fences (same as the old
@@ -1610,6 +1647,7 @@ impl<'a> Recorder<'a> {
         gy: u32,
         gz: u32,
     ) {
+        let _timeline_encode = infr_core::timeline::span("command_encode");
         // Auto-label (INFR_PROF_OPS): see `dispatch_indirect` — kernel-name timestamp per dispatch.
         self.stamp(k.name);
         // The last `n_out` bound buffers are outputs; the rest are inputs. Inputs keep in-place
@@ -12762,6 +12800,15 @@ impl<'a> Recorder<'a> {
     }
 
     fn close_submit_timing(&self) {
+        self.timeline_lifetime.borrow_mut().take();
+        if let Some(query) = self.timeline_query.borrow_mut().as_mut() {
+            query.close(
+                self.dispatches.get(),
+                self.dedicated_transfer_wait.get(),
+                0,
+                0,
+            );
+        }
         let pool = self.submit_query_pool.get();
         if pool != vk::QueryPool::null() {
             unsafe {
@@ -12844,6 +12891,10 @@ impl<'a> Recorder<'a> {
             self.free_transient();
             return Err(be(format!("end cmd: {e}")));
         }
+        let submit_span = infr_core::timeline::span("queue_submit");
+        if let Some(query) = self.timeline_query.borrow_mut().as_mut() {
+            query.submitted();
+        }
         let submit = self.be.shared.queue_submit_commands_recovering(
             std::slice::from_ref(&self.cmd),
             vk::Fence::null(),
@@ -12851,12 +12902,15 @@ impl<'a> Recorder<'a> {
             "forward queue_submit",
             self.dedicated_transfer_wait.get(),
         );
+        drop(submit_span);
         if let Err(e) = submit {
             self.free_transient();
             return Err(be(format!("queue_submit: {e}")));
         }
         let wait_t0 = prof.then(std::time::Instant::now);
+        let wait_span = infr_core::timeline::span("queue_idle_wait");
         let wait = self.be.shared.queue_wait_idle_serialized();
+        drop(wait_span);
         if let Some(t0) = wait_t0 {
             pager_profile::record_sync_wait(pager_profile::SyncKind::QueueIdle, t0.elapsed());
         }
@@ -12877,6 +12931,9 @@ impl<'a> Recorder<'a> {
             self.report_timestamps();
         }
         self.resolve_submit_timing(dispatches);
+        if let Some(query) = self.timeline_query.borrow_mut().take() {
+            query.resolve();
+        }
         self.free_transient();
         Ok(())
     }
@@ -12927,6 +12984,7 @@ impl<'a> Recorder<'a> {
                 submit_timing_token: None,
                 submit_pager_profile: false,
                 dispatches,
+                timeline_query: None,
             });
         }
         if pager_profile::active() {
@@ -12958,6 +13016,10 @@ impl<'a> Recorder<'a> {
                 }
             },
         };
+        let submit_span = infr_core::timeline::span("queue_submit");
+        if let Some(query) = self.timeline_query.borrow_mut().as_mut() {
+            query.submitted();
+        }
         let submit = self.be.shared.queue_submit_commands_recovering(
             std::slice::from_ref(&self.cmd),
             fence,
@@ -12965,6 +13027,7 @@ impl<'a> Recorder<'a> {
             "pipelined queue_submit",
             self.dedicated_transfer_wait.get(),
         );
+        drop(submit_span);
         if let Err(e) = submit {
             self.be.shared.recorder_fences.lock().unwrap().push(fence);
             self.free_transient();
@@ -12987,6 +13050,7 @@ impl<'a> Recorder<'a> {
             submit_timing_token,
             submit_pager_profile,
             dispatches,
+            timeline_query: self.timeline_query.borrow_mut().take(),
         })
     }
 
@@ -13305,6 +13369,7 @@ pub struct PendingSegment {
     submit_pager_profile: bool,
     /// Dispatches this segment carried; consumed by the submit profiler and finite GPU tuner.
     dispatches: usize,
+    timeline_query: Option<crate::timeline::Query>,
 }
 
 impl PendingSegment {
@@ -13336,7 +13401,17 @@ impl PendingSegment {
         };
         let device = &self.shared.device;
         let wait_t0 = pager_profile::start();
+        let wait_span = infr_core::timeline::span_with_submit(
+            "fence_wait",
+            self.timeline_query.as_ref().map_or(0, |query| query.id),
+        );
         let waited = unsafe { device.wait_for_fences(&[fence], true, u64::MAX) };
+        drop(wait_span);
+        if waited.is_ok() {
+            if let Some(query) = self.timeline_query.take() {
+                query.resolve();
+            }
+        }
         if let Some(elapsed) = pager_profile::elapsed(wait_t0) {
             pager_profile::record_sync_wait(pager_profile::SyncKind::Fence, elapsed);
         }

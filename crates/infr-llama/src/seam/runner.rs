@@ -9693,6 +9693,12 @@ fn generate_dense_backend_inner(
                 .map(|&lane_start| lane_start + step)
                 .collect::<Vec<_>>();
             let sample_from = sampling_suffix_start(&positions, parallel.prompt_ends)?;
+            let _timeline_step = if sample_from == 0 {
+                infr_core::timeline::begin_step(&positions)
+            } else {
+                None
+            };
+            let timeline_front = infr_core::timeline::span("step_front");
             let logits_rows = lanes - sample_from;
             let batch_argmax = logits_rows > 0
                 && caps.argmax_rows
@@ -9797,6 +9803,7 @@ fn generate_dense_backend_inner(
             if let Some(t0) = profile_front_t0 {
                 profile_front += t0.elapsed();
             }
+            drop(timeline_front);
             let profile_layer0_t0 = profile_cohort.then(std::time::Instant::now);
             be.execute(plan0.as_ref(), &b0)
                 .map_err(|e| anyhow!("{e}"))?;
@@ -9805,10 +9812,12 @@ fn generate_dense_backend_inner(
             }
 
             let profile_ple_wait_t0 = profile_cohort.then(std::time::Instant::now);
+            let timeline_ple_wait = infr_core::timeline::span("PLE_wait");
             let ple_rows = ple_ticket.wait()?;
             if let Some(t0) = profile_ple_wait_t0 {
                 profile_ple_wait += t0.elapsed();
             }
+            drop(timeline_ple_wait);
             let expected_ple_values = lanes * ple_row;
             if ple_rows.len() != expected_ple_values {
                 return Err(anyhow!(
@@ -9912,6 +9921,7 @@ fn generate_dense_backend_inner(
             }
 
             let profile_tail_t0 = profile_cohort.then(std::time::Instant::now);
+            let _timeline_tail = infr_core::timeline::span("step_tail");
             if let (Some(buffer), Some(hidden)) =
                 (hidden_out.as_deref(), parallel.hidden.as_deref_mut())
             {
@@ -10273,6 +10283,67 @@ fn generate_dense_backend_inner(
                 ns_ms(delta(
                     after.backend_setup_paged_moe_scan_ns,
                     before.backend_setup_paged_moe_scan_ns
+                )),
+            );
+            let prefetch_ram_bytes = delta(
+                after.decode_prefetch_ram_bytes,
+                before.decode_prefetch_ram_bytes,
+            );
+            let prefetch_ram_ns =
+                delta(after.decode_prefetch_ram_ns, before.decode_prefetch_ram_ns);
+            tracing::info!(
+                "[parallel-token-prefetch] calibrations={} candidates={} resident={} loading={} ram_experts={} ram={:.1}MiB/{:.1}ms effective_bw={:.2}GiB/s deadline_stops={} overruns={} target_finishes={} finish_wall={:.1}ms quiesce_lock={}({:.1}ms)",
+                delta(
+                    after.decode_prefetch_calibrations,
+                    before.decode_prefetch_calibrations
+                ),
+                delta(
+                    after.decode_prefetch_candidates,
+                    before.decode_prefetch_candidates
+                ),
+                delta(
+                    after.decode_prefetch_vram_resident,
+                    before.decode_prefetch_vram_resident
+                ),
+                delta(
+                    after.decode_prefetch_host_loading,
+                    before.decode_prefetch_host_loading
+                ),
+                delta(
+                    after.decode_prefetch_ram_experts,
+                    before.decode_prefetch_ram_experts
+                ),
+                mib(prefetch_ram_bytes),
+                ns_ms(prefetch_ram_ns),
+                if prefetch_ram_ns == 0 {
+                    0.0
+                } else {
+                    prefetch_ram_bytes as f64 * 1e9
+                        / ((1u64 << 30) as f64 * prefetch_ram_ns as f64)
+                },
+                delta(
+                    after.decode_prefetch_deadline_stops,
+                    before.decode_prefetch_deadline_stops
+                ),
+                delta(
+                    after.decode_prefetch_overruns,
+                    before.decode_prefetch_overruns
+                ),
+                delta(
+                    after.decode_prefetch_target_finishes,
+                    before.decode_prefetch_target_finishes
+                ),
+                ns_ms(delta(
+                    after.decode_prefetch_target_finish_ns,
+                    before.decode_prefetch_target_finish_ns
+                )),
+                delta(
+                    after.decode_prefetch_quiesce_lock_waits,
+                    before.decode_prefetch_quiesce_lock_waits
+                ),
+                ns_ms(delta(
+                    after.decode_prefetch_quiesce_lock_wait_ns,
+                    before.decode_prefetch_quiesce_lock_wait_ns
                 )),
             );
             for (layer, layer_after) in layers_after.into_iter().enumerate() {
@@ -11281,6 +11352,11 @@ fn generate_dense_backend_inner(
             tracing::info!("[single-decode-begin] pos={pos} max_new={max_new}");
         }
         let step_t0 = std::time::Instant::now();
+        let _timeline_step = if pos + 1 >= prompt.len() {
+            infr_core::timeline::begin_step(&[pos])
+        } else {
+            None
+        };
         let tok = cur[pos] as usize;
         let image_row = mm.and_then(|plan| {
             plan.spans.iter().find_map(|span| {
