@@ -893,6 +893,11 @@ fn main() {
             &["-DHC_PF=4"],
         ),
         ("qwen_ple_gate", "qwen_ple_gate", &[]),
+        (
+            "qwen_hc_down_inject",
+            "qwen_hc_down_inject_q8",
+            &["-DHC_INJECT_Q8"],
+        ),
         ("softmax", "softmax", &[]),
         // DiffusionGemma denoise self-conditioning perf: scale read from a device buffer instead
         // of a push constant (see `Op::Softmax::scale_buf`'s doc + `Recorder::softmax_dyn`).

@@ -226,7 +226,7 @@ pub enum Op {
         out_f: u32,
     },
     /// Qwen3.8 one-row HC bottleneck fast path. Computes the Q8_0 `down` projection followed by
-    /// `silu(x * silu_scale)` and the independent F32 stream-injection projection in one dispatch.
+    /// `silu(x * silu_scale)` and the independent F32/Q8_0 injection in one dispatch.
     /// The two weights and two outputs remain separate; this adds no packed-weight allocation.
     QwenHcDownInject {
         x: TensorId,

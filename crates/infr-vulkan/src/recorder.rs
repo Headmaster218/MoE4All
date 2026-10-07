@@ -4721,11 +4721,45 @@ impl<'a> Recorder<'a> {
         hc: u32,
         silu_scale: f32,
     ) {
+        self.qwen_hc_down_inject_quantized(
+            x,
+            down_weight,
+            inject_weight,
+            low_dst,
+            inject_dst,
+            in_f,
+            low_rank,
+            hc,
+            silu_scale,
+            infr_core::DType::F32,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen_hc_down_inject_quantized(
+        &self,
+        x: &dyn Buffer,
+        down_weight: &dyn Buffer,
+        inject_weight: &dyn Buffer,
+        low_dst: &dyn Buffer,
+        inject_dst: &dyn Buffer,
+        in_f: u32,
+        low_rank: u32,
+        hc: u32,
+        silu_scale: f32,
+        inject_dtype: infr_core::DType,
+    ) {
         let pf4 = self.be.cfg().kernels.vulkan.qwen_hc_down_prefetch
             && self.be.prefers_qwen_hc_down_prefetch4()
             && in_f == 10_240
             && low_rank == 320;
-        let (name, spv) = if pf4 {
+        // The Q8-inject fusion measured best with the base layout; PF4 remains F32-only.
+        let (name, spv) = if inject_dtype == infr_core::DType::Q8_0 {
+            (
+                "qwen_hc_down_inject_q8",
+                crate::gemm::qwen_hc_down_inject_q8_spv(),
+            )
+        } else if pf4 {
             (
                 "qwen_hc_down_inject_pf4",
                 crate::gemm::qwen_hc_down_inject_pf4_spv(),

@@ -2327,10 +2327,13 @@ fn lower_op(
                 || graph.desc(*low_dst).dtype != infr_core::DType::F32
                 || graph.desc(*inject_dst).dtype != infr_core::DType::F32
                 || graph.desc(*down_weight).dtype != infr_core::DType::Q8_0
-                || graph.desc(*inject_weight).dtype != infr_core::DType::F32
+                || !matches!(
+                    graph.desc(*inject_weight).dtype,
+                    infr_core::DType::F32 | infr_core::DType::Q8_0
+                )
             {
                 return Err(be(
-                    "vulkan adapter: QwenHcDownInject requires F32 activations, Q8_0 down and F32 inject",
+                    "vulkan adapter: QwenHcDownInject requires F32 activations, Q8_0 down and F32/Q8_0 inject",
                 ));
             }
             if *in_f == 0 || *low_rank == 0 || *hc == 0 || *in_f % 32 != 0 || *in_f % 4 != 0 {
@@ -2338,7 +2341,13 @@ fn lower_op(
                     "vulkan adapter: QwenHcDownInject requires non-zero outputs and in_f divisible by 32",
                 ));
             }
-            rec.qwen_hc_down_inject(
+            if graph.desc(*x).numel() != *in_f as usize
+                || graph.desc(*low_dst).numel() != *low_rank as usize
+                || graph.desc(*inject_dst).numel() != *hc as usize
+            {
+                return Err(be("vulkan adapter: QwenHcDownInject row geometry mismatch"));
+            }
+            rec.qwen_hc_down_inject_quantized(
                 r(*x)?,
                 r(*down_weight)?,
                 r(*inject_weight)?,
@@ -2348,6 +2357,7 @@ fn lower_op(
                 *low_rank,
                 *hc,
                 *silu_scale,
+                graph.desc(*inject_weight).dtype,
             );
         }
         Op::Linear {
@@ -13449,6 +13459,104 @@ mod tests {
             be_.built_kernel_names().contains(&expected),
             "Qwen HC down selected the wrong kernel; expected {expected}"
         );
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU; HC quantization and cohort parity"]
+    fn qwen_hc_down_inject_quantizations_match_split() {
+        for prefetch in [false, true] {
+            let mut cfg = infr_core::config::Config::default();
+            cfg.kernels.vulkan.qwen_hc_down_prefetch = prefetch;
+            let be_ = VulkanBackend::new_with(std::sync::Arc::new(cfg)).unwrap();
+            for inject_dtype in [DType::F32, DType::Q8_0] {
+                for rows in [1usize] {
+                    if inject_dtype == DType::F32 && rows > 1 {
+                        continue;
+                    }
+                    let (in_f, rank, hc) = (10240usize, 320usize, 4usize);
+                    let x = (0..rows * in_f)
+                        .map(|i| (i as f32 * 0.017).sin() * 0.25)
+                        .collect::<Vec<_>>();
+                    let down = infr_testkit::synth_weight(DType::Q8_0, in_f * rank, 0x4843_444e);
+                    let inject = infr_testkit::synth_weight(inject_dtype, in_f * hc, 0x4843_494e);
+                    let mut g = Graph::new();
+                    let xi = g.input(TensorDesc::new(vec![rows, in_f], DType::F32));
+                    let dw = g.weight(TensorDesc::new(vec![rank, in_f], DType::Q8_0));
+                    let iw = g.weight(TensorDesc::new(vec![hc, in_f], inject_dtype));
+                    let sizes = [rows * rank, rows * hc, rows * rank, rows * hc];
+                    let outputs =
+                        sizes.map(|size| g.output(TensorDesc::new(vec![size], DType::F32)));
+                    let raw = g.internal(TensorDesc::new(vec![rows, rank], DType::F32));
+                    g.push(Op::QwenHcDownInject {
+                        x: xi,
+                        down_weight: dw,
+                        inject_weight: iw,
+                        low_dst: outputs[0],
+                        inject_dst: outputs[1],
+                        in_f: in_f as u32,
+                        low_rank: rank as u32,
+                        hc: hc as u32,
+                        silu_scale: 0.25,
+                    });
+                    g.push(Op::Linear {
+                        x: xi,
+                        weight: dw,
+                        dst: raw,
+                        m: rows as u32,
+                        in_f: in_f as u32,
+                        out_f: rank as u32,
+                        w_off: 0,
+                    });
+                    g.push(Op::Silu {
+                        x: raw,
+                        dst: outputs[2],
+                        n: sizes[2] as u32,
+                        scale: 0.25,
+                    });
+                    g.push(Op::Linear {
+                        x: xi,
+                        weight: iw,
+                        dst: outputs[3],
+                        m: rows as u32,
+                        in_f: in_f as u32,
+                        out_f: hc as u32,
+                        w_off: 0,
+                    });
+                    let xb = be_.alloc(x.len() * 4, BufferUsage::Activations).unwrap();
+                    let db = be_.alloc(down.len(), BufferUsage::Weights).unwrap();
+                    let ib = be_.alloc(inject.len(), BufferUsage::Weights).unwrap();
+                    be_.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+                    be_.upload(db.as_ref(), &down).unwrap();
+                    be_.upload(ib.as_ref(), &inject).unwrap();
+                    let buffers =
+                        sizes.map(|size| be_.alloc(size * 4, BufferUsage::Readback).unwrap());
+                    let mut bindings = Bindings::new();
+                    bindings
+                        .bind(xi, xb.as_ref())
+                        .bind(dw, db.as_ref())
+                        .bind(iw, ib.as_ref());
+                    for (id, buffer) in outputs.iter().zip(&buffers) {
+                        bindings.bind(*id, buffer.as_ref());
+                    }
+                    let plan = be_.compile(&g).unwrap();
+                    be_.execute(plan.as_ref(), &bindings).unwrap();
+                    let mut values = Vec::new();
+                    for (size, buffer) in sizes.iter().zip(&buffers) {
+                        let mut v = vec![0f32; *size];
+                        be_.download(buffer.as_ref(), bytemuck::cast_slice_mut(&mut v))
+                            .unwrap();
+                        values.push(v);
+                    }
+                    for (a, b) in [(0, 2), (1, 3)] {
+                        for (index, (fused, split)) in values[a].iter().zip(&values[b]).enumerate()
+                        {
+                            assert_eq!(fused.to_bits(), split.to_bits(),
+                                "HC parity prefetch={prefetch} inject={inject_dtype:?} rows={rows} output={a} index={index}: {fused} vs {split}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
