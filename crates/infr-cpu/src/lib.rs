@@ -3096,6 +3096,41 @@ impl Backend for CpuBackend {
                     }
                     vals[dst.0 as usize] = out;
                 }
+                // In place: `x` and `dst` are the same wide residual, so the reference rewrites a
+                // copy of it and hands the whole store entry back — the same value the GPU kernel
+                // leaves in the buffer it read. The projection strength comes from `scale_buf` when
+                // present (the per-request uncensor switch — see `Op::UncensorProject`'s doc), read
+                // exactly like `Op::Softmax`'s dynamic scale; `0.0` leaves every row bit-identical.
+                Op::UncensorProject {
+                    x,
+                    dir,
+                    dst,
+                    rows,
+                    hc,
+                    n_embd,
+                    dir_off,
+                    scale,
+                    scale_buf,
+                } => {
+                    let (rr, hc, ne) = (rows as usize, hc as usize, n_embd as usize);
+                    let scale = match scale_buf {
+                        Some(sb) => vals[sb.0 as usize][0],
+                        None => scale,
+                    };
+                    let vs = &vals[dir.0 as usize];
+                    let off = dir_off as usize;
+                    let v = &vs[off..off + ne];
+                    let mut out = vals[x.0 as usize].clone();
+                    for rh in 0..rr * hc {
+                        let base = rh * ne;
+                        let row = &mut out[base..base + ne];
+                        let dot = row.iter().zip(v.iter()).map(|(a, b)| a * b).sum::<f32>();
+                        for (a, b) in row.iter_mut().zip(v.iter()) {
+                            *a -= (scale * dot) * *b;
+                        }
+                    }
+                    vals[dst.0 as usize] = out;
+                }
                 Op::QwenHcInject {
                     residual,
                     block,

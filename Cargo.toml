@@ -17,6 +17,7 @@ members = [
     "crates/infr-prof",
     "crates/infr-prof-rt",
     "crates/infr-testkit",
+    "crates/infr-uncensor",
     "crates/infr-vision",
 ]
 
@@ -40,6 +41,7 @@ infr-embedding = { path = "crates/infr-embedding" }
 infr-server = { path = "crates/infr-server" }
 infr-prof = { path = "crates/infr-prof" }
 infr-prof-rt = { path = "crates/infr-prof-rt" }
+infr-uncensor = { path = "crates/infr-uncensor" }
 infr-vision = { path = "crates/infr-vision" }
 # Test-support only — a `[dev-dependencies]` entry in the backends, never a production dep.
 infr-testkit = { path = "crates/infr-testkit" }

@@ -6,6 +6,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Uncensor: a `controlvector` GGUF named by `INFR_UNCENSOR_VECTOR` projects one refusal direction out of each projected layer of the Qwen3.8 wide residual (`INFR_UNCENSOR_FIRST_LAYER` / `INFR_UNCENSOR_LAST_LAYER` set the range, default 4-44). Implemented in the new `crates/infr-uncensor` crate with one CPU arm and one Vulkan kernel; Metal reports it as unsupported. Without the variable nothing is allocated and generation is bit-for-bit what it was.
+- Per-request `uncensor: true|false` on `/v1/chat/completions` and `/v1/responses`, with `experimental_speed_projection` accepted as an alias and a 400 when the two disagree. The switch is a device-side scalar, so the compiled plan survives; flipping a slot drops its materialized KV and re-reads the prompt.
+- The launch wizard asks for the projection at startup, remembers an interactive choice in `gui-data/uncensor.txt`, and accepts `-uncensor on|off|<PATH>` / `-no-uncensor` for a single run.
+
 ## [0.9.0] - 2026-09-28
 
 ### Added

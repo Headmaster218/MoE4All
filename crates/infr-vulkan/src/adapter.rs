@@ -3273,6 +3273,42 @@ fn lower_op(
             }
             rec.gelu(r(*x)?, r(*dst)?, *rows * *cols);
         }
+        // The uncensor projection reads and writes ONE buffer (a workgroup must own its row while
+        // it rewrites it), so like `Op::Scale` a graph that keeps `x` and `dst` apart needs the
+        // copy; the graphs built for this op pass the same wide residual and skip it. `scale_buf`
+        // is the per-request on/off switch (see `Op::UncensorProject`'s doc): flipping it is a
+        // 4-byte upload, not a plan rebuild, and `0.0` leaves the residual exactly as it was.
+        Op::UncensorProject {
+            x,
+            dir,
+            dst,
+            rows,
+            hc,
+            n_embd,
+            dir_off,
+            scale,
+            scale_buf,
+        } => {
+            if x != dst {
+                let n = *rows as usize * *hc as usize * *n_embd as usize;
+                let eb = graph.desc(*dst).dtype.dense_bytes(1).unwrap_or(4);
+                rec.copy(r(*x)?, 0, r(*dst)?, 0, n * eb);
+            }
+            match scale_buf {
+                Some(sb) => rec.uncensor_project_dyn(
+                    r(*dst)?,
+                    r(*dir)?,
+                    r(*sb)?,
+                    *rows,
+                    *hc,
+                    *n_embd,
+                    *dir_off,
+                ),
+                None => {
+                    rec.uncensor_project(r(*dst)?, r(*dir)?, *rows, *hc, *n_embd, *dir_off, *scale)
+                }
+            }
+        }
         Op::QwenHcMix {
             x,
             gate,

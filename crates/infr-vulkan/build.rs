@@ -897,6 +897,15 @@ fn main() {
         // DiffusionGemma denoise self-conditioning perf: scale read from a device buffer instead
         // of a push constant (see `Op::Softmax::scale_buf`'s doc + `Recorder::softmax_dyn`).
         ("softmax", "softmax_dyn", &["-DUSE_SCALE_BUF"]),
+        // Uncensor projection (`crates/infr-uncensor`, `Op::UncensorProject`): the plain build
+        // bakes the projection strength into a push constant, the `_dyn` twin reads the session's
+        // current on/off value off the device, so a per-request flip never rebuilds a cached plan.
+        ("uncensor_project", "uncensor_project", &[]),
+        (
+            "uncensor_project",
+            "uncensor_project_dyn",
+            &["-DUSE_SCALE_BUF"],
+        ),
         ("deltanet", "deltanet", &[]),
         ("kda", "kda", &[]),
         // Strided variant: q/k/v read from single convout buffer with offsets (env-gated).

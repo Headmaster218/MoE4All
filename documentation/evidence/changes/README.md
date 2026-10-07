@@ -19,7 +19,7 @@ verified_commit: ed62393068679573afe94a1472454efe7eae0f15
 ## 历史技术过程
 
 - 内存：[统一内存的目标与阶段](memory/unified-memory.md)、[三级专家分页演化](memory/tiered-weight-paging.md)
-- 模型：[Qwen3.5/3.6](models/qwen35-qwen36.md)、[Qwen3.5 MTP](models/qwen35-mtp.md)、[Ling 3.0 Flash 与 KDA](models/ling3-flash.md)、[DeepSeek 系列](models/deepseek-family.md)、[DiffusionGemma](models/diffusion-gemma.md)
+- 模型：[Qwen3.5/3.6](models/qwen35-qwen36.md)、[Qwen3.5 MTP](models/qwen35-mtp.md)、[Ling 3.0 Flash 与 KDA](models/ling3-flash.md)、[DeepSeek 系列](models/deepseek-family.md)、[DiffusionGemma](models/diffusion-gemma.md)、[Qwen3.8 拒绝方向投影（去审查）](models/qwen38-uncensor.md)
 - 后端：[Metal](backends/metal.md)、[iGPU](backends/integrated-gpu.md)
 - 产品：[浏览器控制面演化](product/browser-control-plane.md)
 

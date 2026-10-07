@@ -3845,6 +3845,11 @@ dyn_spv!(
 // record-once decode replay's pos/kv_len — see `Op::Softmax::scale_buf`'s doc and `Recorder::
 // softmax_dyn`.
 dyn_spv!(softmax_dyn_spv, "softmax_dyn");
+// Uncensor projection (`crates/infr-uncensor`, `Op::UncensorProject`): the plain build takes the
+// projection strength from a push constant, the `_dyn` twin (`-DUSE_SCALE_BUF`) reads the session's
+// current on/off value off the device — see `Recorder::uncensor_project_dyn`.
+dyn_spv!(uncensor_project_spv, "uncensor_project");
+dyn_spv!(uncensor_project_dyn_spv, "uncensor_project_dyn");
 dyn_spv!(rope_f16_spv, "rope_f16");
 dyn_spv!(rope_f16_dyn_spv, "rope_f16_dyn");
 dyn_spv!(store_f16_dyn_spv, "store_f16_dyn");

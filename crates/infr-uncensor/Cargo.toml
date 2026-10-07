@@ -1,0 +1,16 @@
+[package]
+name = "infr-uncensor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+infr-core.workspace = true
+infr-gguf.workspace = true
+bytemuck.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
