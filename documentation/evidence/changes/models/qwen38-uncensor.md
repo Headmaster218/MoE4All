@@ -19,7 +19,7 @@ h ← h − (h·v)v          v 为每层一个的单位方向，h 为残差
 
 三种做法的取舍是明确的：**微调**改变权重、污染知识且不可逆；**提示注入**（"请不要拒绝"）不稳定、占用上下文，也解释不了模型为什么拒绝；**投影**只减去一个方向，保留权重、知识和语法，代价可测（Qwen3.8 实测约占 token 时间的 0.2–0.4%）。llama.cpp 的等价参数是 `--cvec-mode project --cvec-dir per-layer --control-vector-layer-range 4 44`。
 
-方向文件是 `general.architecture = controlvector` 的 GGUF，每层一行 `direction.N`（`[n_embd]` 的 f32）。**文件里的层号从 1 开始，本引擎的层号从 0 开始**，这个差一是移植时最容易出错的地方，因此加载期归一化与层号映射都有专门的单元测试。
+方向文件是 `general.architecture = controlvector` 的 GGUF，每层一行 `direction.N`（`[n_embd]` 的 f32）。**`direction.N` 对应第 N 层**，而第 0 层没有方向（llama.cpp 的加载器显式拒绝 `direction.0`，且"layer 0 从来没有张量"）：本引擎把第 0 层保留为全零行，对零方向的投影即恒等，于是层号就是行号、引擎侧不需要任何偏移。加载期归一化与层号映射都有专门的单元测试。
 
 对 `qwen4exp` 而言 `h` 不是单条残差而是**宽残差里的每一条 hyper-connection 流**：投影必须对 `hc_mult` 条流各做一次，位置在 `QwenHcInject` **之后**、对 `qwen_wide` **原地**执行——"第 N 层之后"的含义就是下一层的 `QwenHcMix` 读到已投影的残差，而该注入正是本层对宽残差的最后一次写。
 
@@ -90,11 +90,12 @@ h ← h − (h·v)v          v 为每层一个的单位方向，h 为残差
 - 基线：改动前 `cargo check --workspace --all-targets` 通过，之后的报错才都归因于本次改动。
 - `cargo check --workspace --all-targets` 通过，且**没有新增警告**——`DecodeHandles` 里两个 uncensor 句柄与 15 个绑定调用点都被真实读取，这排除了"声明了但忘了绑"。
 - `cargo build --release -p infr-cli` 通过，产出 `target/release/infr.exe`；两个 SPIR-V 变体（静态 scale 与 `USE_SCALE_BUF`）均在构建期编译过。
-- 单元测试 18 项（`infr-uncensor`）：`config.rs` 6 项（默认关闭、空串=关闭、未设的边界保留默认、非数字层号拒绝启动、特性关闭时边界仍被校验）、`lib.rs` 8 项（层范围与文件覆盖、无文件即关、架构检查先于读文件、本模型没有那么多层则报错、两种拼写的合并与冲突、缺省跟随会话而非默认、`scale` 的两个取值、翻转以"上次真跑的是哪边"为准）、`vectors.rs` 4 项（加载并逐行单位归一化、行宽不符、不是 `controlvector`、全零方向）——本地已运行：**18 通过 / 0 失败**。`infr-core` 的 `config` 46 项同样通过，含 `manifest_matches_the_tree` 与 `no_infr_env_reads_outside_the_config_layer` 两道防漂移测试（说明三个 `INFR_UNCENSOR_*` 的 `NOT_MIGRATED` 登记既必要又够用）。CI 中本地可复现的门槛也都干净：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --locked -- -D warnings`，以及 `cargo check -p infr-metal --all-targets --locked --target aarch64-apple-darwin`——最后这条尤其值得跑，因为 Windows 上 `infr-metal` 整个 crate 被 `#![cfg(target_os = "macos")]` 关成空模块，新增的那条 `Unsupported` 分支只有交叉检查能证明它编得过。
+- 单元测试 18 项（`infr-uncensor`）：`config.rs` 6 项（默认关闭、空串=关闭、未设的边界保留默认、非数字层号拒绝启动、特性关闭时边界仍被校验）、`lib.rs` 8 项（层范围与文件覆盖、无文件即关、架构检查先于读文件、本模型没有那么多层则报错、两种拼写的合并与冲突、缺省跟随会话而非默认、`scale` 的两个取值、翻转以"上次真跑的是哪边"为准）、`vectors.rs` 4 项（`direction.N` 落到第 N 行且第 0 行为零、行宽不符、不是 `controlvector`、全零方向）——本地已运行：**18 通过 / 0 失败**。`infr-core` 的 `config` 46 项同样通过，含 `manifest_matches_the_tree` 与 `no_infr_env_reads_outside_the_config_layer` 两道防漂移测试（说明三个 `INFR_UNCENSOR_*` 的 `NOT_MIGRATED` 登记既必要又够用）。CI 中本地可复现的门槛也都干净：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --locked -- -D warnings`，以及 `cargo check -p infr-metal --all-targets --locked --target aarch64-apple-darwin`——最后这条尤其值得跑，因为 Windows 上 `infr-metal` 整个 crate 被 `#![cfg(target_os = "macos")]` 关成空模块，新增的那条 `Unsupported` 分支只有交叉检查能证明它编得过。
 
-过程中值得留下的两个坑（第一版也踩过）：
+过程中值得留下的三个坑（第一版也踩过）：
 
 1. 手写 GGUF 时**值类型标签必须是 u32**，写成 1 字节会让整段 KV 解析错位，症状是难解的 `unknown value type 3336`。
 2. `span()` 只夹紧**上限**。把下限也夹紧会让"投影第 4 层起"在三层模型上变成"投影第 2 层"——一个谁都没要求的投影。
+3. **层号映射不能靠"名字从 1 起、索引从 0 起"来推**。llama.cpp 的 `common_control_vector_load_one` 把 `direction.N` 写到 `data + n_embd * (N - 1)`，而 `llama_adapter_cvec::apply` 又把 `data` 的第 `i` 块交给 `tensors[i + 1]`，两处约定叠加的结果是 **`direction.N` 对应第 N 层**（不是第 N−1 层），且第 0 层从没有方向。第一版按"减一"把 `direction.1` 放进第 0 行，于是每一层都用到了邻居层的方向。修法是第 0 层留一个全零行（对零方向的投影是恒等），层号即行号。
 
 **验证边界**：加载器、层范围算术、请求语义、CPU 投影数学与编译期接线都有测试或编译证据；**Vulkan 内核未在真实 GPU + 真实 `qwen4exp` 模型 + 真实方向文件上运行过**，per-request 翻转与并行路径（多 lane 共享一次投影）也未实机验证。首次实机运行建议先 `--dev cpu` 确认行为，再切 Vulkan；并特意跑一次"同一会话里交替 `uncensor: true/false`"，用来观察热前缀被丢弃、prompt 重读是否符合预期（代价是重读，收益是不串模型）。
