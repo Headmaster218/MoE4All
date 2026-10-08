@@ -5200,6 +5200,67 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Uncensor projection, IN PLACE on `x`: `x -= scale * (x·v) v` over `rows * hc` wide-residual
+    /// streams, each `n_embd` elements, against the unit direction at `dir[dir_off ..]`
+    /// (`Op::UncensorProject`, `crates/infr-uncensor`). One workgroup owns one stream outright,
+    /// which is what lets it reduce over the row and then rewrite it.
+    pub fn uncensor_project(
+        &self,
+        x: &dyn Buffer,
+        dir: &dyn Buffer,
+        rows: u32,
+        hc: u32,
+        n_embd: u32,
+        dir_off: u32,
+        scale: f32,
+    ) {
+        let kernel = self.be.kernel_sg(
+            "uncensor_project",
+            crate::gemm::uncensor_project_spv(),
+            2,
+            8,
+            32,
+        );
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&n_embd.to_ne_bytes());
+        push[4..8].copy_from_slice(&dir_off.to_ne_bytes());
+        push[8..12].copy_from_slice(&scale.to_ne_bytes());
+        self.dispatch(kernel, &[Self::vkb(dir), Self::vkb(x)], 1, &push, rows * hc);
+    }
+
+    /// Like [`Self::uncensor_project`], but the strength comes from `scale_buf[0]` (a 1-element
+    /// device buffer, refreshed by a tiny 4-byte `upload`) instead of a push constant — the
+    /// per-request uncensor switch, so a plan compiled/cached with the projection in it runs both
+    /// ways. `scale_buf == 0.0` leaves the residual bit-for-bit untouched.
+    pub fn uncensor_project_dyn(
+        &self,
+        x: &dyn Buffer,
+        dir: &dyn Buffer,
+        scale_buf: &dyn Buffer,
+        rows: u32,
+        hc: u32,
+        n_embd: u32,
+        dir_off: u32,
+    ) {
+        let kernel = self.be.kernel_sg(
+            "uncensor_project_dyn",
+            crate::gemm::uncensor_project_dyn_spv(),
+            3,
+            8,
+            32,
+        );
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&n_embd.to_ne_bytes());
+        push[4..8].copy_from_slice(&dir_off.to_ne_bytes());
+        self.dispatch(
+            kernel,
+            &[Self::vkb(dir), Self::vkb(scale_buf), Self::vkb(x)],
+            1,
+            &push,
+            rows * hc,
+        );
+    }
+
     /// RoPE in place is allowed (`x` and `y` may be the same buffer). `pos_offset` shifts the
     /// absolute position of the first row (for cached decode).
     #[allow(clippy::too_many_arguments)]

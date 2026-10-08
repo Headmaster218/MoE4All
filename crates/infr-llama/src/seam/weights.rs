@@ -390,6 +390,86 @@ pub(crate) struct SessionStable {
     pub(super) moe_batched_ok: bool,
 }
 
+/// This slot's uncensor projection (`crates/infr-uncensor`): every layer's unit direction in one
+/// buffer, and the 4-byte scale the graph reads to run projected or not.
+///
+/// The directions are session constants — uploaded once and never rewritten, and identical across
+/// the slots of one model, so a fork re-uploads them instead of device-copying. The scale is the
+/// per-request switch: `1.0` projects the refusal direction out, `0.0` computes `h - 0·v` and
+/// leaves the residual bit-for-bit alone, which is what lets one compiled/cached plan serve both
+/// ways (the same `scale_buf` mechanism as `Op::Softmax`'s dynamic temperature).
+///
+/// `uploaded` and `ran` live here because both outlive a single forward pass. `uploaded` keeps the
+/// 4-byte host→device transfer to the moments the value actually changes; `ran` records what this
+/// slot's RESIDUAL state was built with, which is what a request-less pass (an MTP draft, a
+/// verifier step) inherits, and what tells the caller its cached KV prefix is stale.
+pub(super) struct UncensorState {
+    pub(super) proj: infr_uncensor::Projection,
+    pub(super) dirs_buf: Box<dyn Buffer>,
+    pub(super) scale_buf: Box<dyn Buffer>,
+    /// The value currently in `scale_buf`, so [`Self::select`] uploads only on a real change.
+    uploaded: f32,
+    /// What this slot last really ran; `None` before its first forward pass — including a slot
+    /// whose KV was RESTORED from disk, whose producing setting nobody recorded.
+    ran: Option<bool>,
+}
+
+impl UncensorState {
+    /// Allocate and fill both buffers for a freshly resolved projection, carrying `ran` from the
+    /// state this slot begins with (a cold slot has none; a fork inherits its parent's, because a
+    /// forked conversation starts from the parent's KV rows).
+    pub(super) fn new(
+        be: &dyn Backend,
+        proj: infr_uncensor::Projection,
+        ran: Option<bool>,
+    ) -> anyhow::Result<Self> {
+        let dirs_buf = be
+            .alloc(proj.byte_len(), BufferUsage::Weights)
+            .map_err(|e| anyhow!("{e}"))?;
+        let scale_buf = be
+            .alloc(4, BufferUsage::Staging)
+            .map_err(|e| anyhow!("{e}"))?;
+        // A fresh slot runs the default (`effective(None, None)`): naming a direction file IS the
+        // request for the projection.
+        let uploaded = infr_uncensor::scale(ran.unwrap_or(true));
+        be.upload(dirs_buf.as_ref(), proj.bytes())
+            .map_err(|e| anyhow!("{e}"))?;
+        be.upload(scale_buf.as_ref(), &uploaded.to_le_bytes())
+            .map_err(|e| anyhow!("{e}"))?;
+        Ok(Self {
+            proj,
+            dirs_buf,
+            scale_buf,
+            uploaded,
+            ran,
+        })
+    }
+
+    /// What this slot last really ran.
+    pub(super) fn ran(&self) -> Option<bool> {
+        self.ran
+    }
+
+    /// Run the projection `on` for the requests that follow, and report whether this slot's
+    /// existing KV was produced under a DIFFERENT setting (and must therefore be dropped).
+    ///
+    /// The two writes are deliberately separate. The scale slot is refreshed only when the value in
+    /// it changes, because a 4-byte upload is not free on every request; `ran` records the state
+    /// the cached activations came from, and it is that state — not the transfer — that makes the
+    /// cached prefix unusable.
+    pub(super) fn select(&mut self, be: &dyn Backend, on: bool) -> anyhow::Result<bool> {
+        let stale = infr_uncensor::flipped(self.ran, on);
+        let want = infr_uncensor::scale(on);
+        if self.uploaded != want {
+            be.upload(self.scale_buf.as_ref(), &want.to_le_bytes())
+                .map_err(|e| anyhow!("{e}"))?;
+            self.uploaded = want;
+        }
+        self.ran = Some(on);
+        Ok(stale)
+    }
+}
+
 pub(crate) struct SeamKv {
     /// The uploaded weights, SHARED across slots (Arc): forking a new conversation slot costs
     /// only its KV + IO buffers, never a re-upload.
@@ -420,6 +500,10 @@ pub(crate) struct SeamKv {
     pub(super) ple_embd_buf: Option<Box<dyn Buffer>>,
     /// Persistent PLE dilated-convolution history (9 x hc*n_embd f32 on the released model).
     pub(super) ple_state_buf: Option<Box<dyn Buffer>>,
+    /// The uncensor projection this slot runs, when the session loaded a direction file at all
+    /// (see [`UncensorState`] and `crates/infr-uncensor`). `None` is the ordinary case and costs
+    /// nothing: no buffer, no op in the graph, and the model runs exactly as it did before.
+    pub(super) uncensor: Option<UncensorState>,
     /// Fixed Qwen3.8 MTP VERIFY IO. A single slot needs four rows; parallel serving reserves the
     /// whole four-rows-per-lane cohort so whichever slot becomes the primary can own the graph.
     /// These buffers are allocated before the deferred Vulkan pager measures the remaining room,
@@ -1715,6 +1799,14 @@ impl SeamKv {
             } else {
                 None
             },
+            // The directions are a session constant, so the fork re-uploads the same bytes into its
+            // own buffer; `ran` carries over because the fork STARTS from this slot's KV rows, and
+            // those rows came out of a run whose setting has to stay true of the child too.
+            uncensor: self
+                .uncensor
+                .as_ref()
+                .map(|u| UncensorState::new(be, u.proj.clone(), u.ran))
+                .transpose()?,
             ple_embd_buf: if cfg.qwen4exp {
                 let heads = (cfg.ple_ngram_size - 1) * cfg.ple_heads_per_ngram;
                 Some(

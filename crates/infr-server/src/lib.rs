@@ -325,6 +325,17 @@ pub struct ChatRequest {
     /// llama.cpp extension (1.0 = off).
     #[serde(default)]
     pub repeat_penalty: Option<f32>,
+    /// Uncensor (`crates/infr-uncensor`): per-request switch for the refusal-direction projection
+    /// the session loaded at startup. `false` asks for the model as published, `true` for the
+    /// projected one, ABSENT keeps this slot running whatever it is running now. Only meaningful
+    /// when a direction file was named at startup; without one the field is accepted and ignored,
+    /// since there is nothing to switch.
+    #[serde(default)]
+    pub uncensor: Option<bool>,
+    /// Strata's spelling of the same switch, accepted as an alias. Sending both with different
+    /// values is a 400 rather than a silent winner (`infr_uncensor::api_merge`).
+    #[serde(default)]
+    pub experimental_speed_projection: Option<bool>,
 }
 
 /// The validated, per-request generation config handed to [`ChatGenerator::chat`]. `None` fields
@@ -341,6 +352,9 @@ pub struct GenParams {
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
     pub repeat_penalty: Option<f32>,
+    /// Already normalised: `None` = the request had no opinion about the uncensor projection,
+    /// `Some(_)` = it asked to run that way for this call. See [`ChatRequest::uncensor`].
+    pub uncensor: Option<bool>,
     /// Already normalised: empty strings dropped (an empty stop would fire on the first token).
     pub stop: Vec<String>,
 }
@@ -442,6 +456,14 @@ impl GenParams {
             }
         }
 
+        // Uncensor (`crates/infr-uncensor`) owns the rule for the two spellings of the switch, so
+        // the wire layer only turns a disagreement into the OpenAI-shaped 400.
+        let uncensor = infr_uncensor::api_merge(req.uncensor, req.experimental_speed_projection)
+            .map_err(|c| ParamError {
+                param: infr_uncensor::API_FIELD,
+                message: c.to_string(),
+            })?;
+
         Ok(Self {
             chat_template_options,
             // OpenAI renamed `max_tokens` -> `max_completion_tokens`; the new name wins.
@@ -453,6 +475,7 @@ impl GenParams {
             presence_penalty: rng("presence_penalty", req.presence_penalty, -2.0, 2.0)?,
             frequency_penalty: rng("frequency_penalty", req.frequency_penalty, -2.0, 2.0)?,
             repeat_penalty: req.repeat_penalty,
+            uncensor,
             stop,
         })
     }

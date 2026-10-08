@@ -50,6 +50,13 @@ pub(super) struct ResponsesRequest {
     include: Option<Vec<String>>,
     #[serde(default)]
     service_tier: Option<String>,
+    /// Not an OpenAI Responses field: the same per-request uncensor switch `/v1/chat/completions`
+    /// takes. It must be a declared field here, because every unknown non-null key of a Responses
+    /// body is rejected as "unsupported request field".
+    #[serde(default)]
+    uncensor: Option<bool>,
+    #[serde(default)]
+    experimental_speed_projection: Option<bool>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
@@ -538,6 +545,8 @@ impl ResponsesRequest {
             presence_penalty: None,
             frequency_penalty: None,
             repeat_penalty: None,
+            uncensor: self.uncensor,
+            experimental_speed_projection: self.experimental_speed_projection,
         };
         let meta = Meta {
             instructions: self.instructions,

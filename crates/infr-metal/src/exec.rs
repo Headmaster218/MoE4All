@@ -5874,6 +5874,16 @@ impl MetalBackend {
                         .into(),
                 ));
             }
+            Op::UncensorProject { .. } => {
+                // The uncensor projection (`crates/infr-uncensor`) has a Vulkan kernel and a CPU arm
+                // only. It rides the qwen4exp wide residual, which this backend refuses anyway, so
+                // naming it here costs nothing and beats the generic message it would otherwise get.
+                return Err(Error::Unsupported(
+                    "Metal Op::UncensorProject (uncensor refusal-direction projection) is not \
+                     implemented; use Vulkan or CPU"
+                        .into(),
+                ));
+            }
             Op::GatherI32 { .. } => {
                 // DeepSeek V4's hash-routing gather (`ffn_gate_tid2eid` by token id) — CPU +
                 // Vulkan only. No Metal kernel, and no host arm either: a V4 MoE layer cannot run

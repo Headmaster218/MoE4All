@@ -262,6 +262,36 @@ pub enum Op {
         /// compile-time constant, unmodified.
         scale_buf: Option<TensorId>,
     },
+    /// `dst[r, :] -= (x[r, h] · v) · v` for EACH of the `hc` hyper-connection streams a token
+    /// carries in a wide-residual model: the uncensor projection, whose semantics, file format and
+    /// on/off rules all live in `crates/infr-uncensor`. `x` is the wide row (`hc * n_embd`
+    /// elements), `dir` holds one unit direction per layer (`dir_off` selects this layer's), and
+    /// each of the `hc` streams is projected against that same direction in place.
+    ///
+    /// Deliberately not called `QwenHc*`: projecting a direction out of a residual is not specific
+    /// to one architecture, and the op stays correct for any `hc >= 1`.
+    ///
+    /// `scale` is the compile-time constant, used when `scale_buf` is `None`. When `scale_buf` is
+    /// `Some`, the backend reads ONE f32 from its bound buffer at dispatch time and uses THAT —
+    /// same mechanism as [`Op::Softmax::scale_buf`], same reason: the session's projection is
+    /// switched per request by a 4-byte upload, so a cached/replayed plan survives the switch
+    /// instead of being rebuilt. `0.0` computes `h - 0·v`, i.e. the untouched residual bit for bit,
+    /// which is what makes "off" free of a graph change; `1.0` removes the whole component.
+    UncensorProject {
+        /// Wide residual, `rows × (hc * n_embd)`. In place when `dst == x`.
+        x: TensorId,
+        /// `[n_layer_dirs][n_embd]` f32 unit directions, uploaded once per session.
+        dir: TensorId,
+        dst: TensorId,
+        rows: u32,
+        /// Residual streams per token (`hc_mult`); see [`HYPER_CONNECT_MAX_MULT`].
+        hc: u32,
+        n_embd: u32,
+        /// ELEMENT offset of this layer's direction inside `dir` (`layer * n_embd`).
+        dir_off: u32,
+        scale: f32,
+        scale_buf: Option<TensorId>,
+    },
     /// Per-head RMSNorm of `x` (`rows × n_head × head_dim`) with a per-`head_dim` `weight`
     /// (Qwen3 / Gemma Q-norm and K-norm). In place when `dst == x`.
     QkNorm {
@@ -1472,6 +1502,7 @@ impl Op {
             Op::QwenHcInject { .. } => "QwenHcInject",
             Op::QwenHcInjectNorm { .. } => "QwenHcInjectNorm",
             Op::QwenPleGate { .. } => "QwenPleGate",
+            Op::UncensorProject { .. } => "UncensorProject",
             Op::MulVec { .. } => "MulVec",
             Op::HeadwiseSigmoidMul { .. } => "HeadwiseSigmoidMul",
             Op::Softcap { .. } => "Softcap",
@@ -1513,6 +1544,17 @@ impl Op {
                 x, dst, scale_buf, ..
             } => {
                 let mut r = vec![x];
+                r.extend(scale_buf);
+                (r, vec![dst])
+            }
+            Op::UncensorProject {
+                x,
+                dir,
+                dst,
+                scale_buf,
+                ..
+            } => {
+                let mut r = vec![x, dir];
                 r.extend(scale_buf);
                 (r, vec![dst])
             }

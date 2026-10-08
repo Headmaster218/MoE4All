@@ -391,6 +391,25 @@ pub const NOT_MIGRATED: &[(&str, &str)] = &[
          It is backend-private and deliberately remains a direct presence check rather than user \
          configuration.",
     ),
+    (
+        "INFR_UNCENSOR_VECTOR",
+        "launch parameter, not a knob: `crates/infr-uncensor` reads it once at model load, and the \
+         direction file it names cannot change without a restart (the projection is allocated into \
+         the session then or never). The feature owns its own parsing (`infr_uncensor::Config`), \
+         which reads through an injected lookup rather than `env::var`, so a TOML field, a `--set` \
+         path and a CLI flag would all describe a setting nothing can change at runtime. Per-request \
+         control of the same switch is the `uncensor` field of the API, not a config key.",
+    ),
+    (
+        "INFR_UNCENSOR_FIRST_LAYER",
+        "See INFR_UNCENSOR_VECTOR: the layer range is fixed when the projection is allocated, so it \
+         is a launch parameter read by `crates/infr-uncensor`. Named `*_LAYER` exactly as v1 named \
+         it, so one launcher script drives either engine.",
+    ),
+    (
+        "INFR_UNCENSOR_LAST_LAYER",
+        "See INFR_UNCENSOR_FIRST_LAYER.",
+    ),
 ];
 
 /// `INFR_*` spellings that the §6.0 filter drops and that are NOT knobs at all.

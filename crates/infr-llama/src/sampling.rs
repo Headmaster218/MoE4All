@@ -84,6 +84,12 @@ pub struct RequestSampling {
     /// for tokens seen in the last [`repeat_last_n`](Self::repeat_last_n) generated tokens.
     pub repeat_penalty: f32,
     pub repeat_last_n: usize,
+    /// Uncensor (`crates/infr-uncensor`): `None` = run whatever this slot is already running (the
+    /// startup default, or the last explicit answer on this slot). `Some(on)` projects the refusal
+    /// direction out of the wide residual (`Some(false)` leaves it in). Not a sampling knob — it
+    /// changes what the model computes — but it rides the same per-sequence scope, which is the only
+    /// place a per-request switch can live once N sequences share one engine.
+    pub uncensor: Option<bool>,
 }
 
 impl Default for RequestSampling {
@@ -100,6 +106,7 @@ impl Default for RequestSampling {
             frequency_penalty: 0.0,
             repeat_penalty: 1.0,
             repeat_last_n: 64,
+            uncensor: None,
         }
     }
 }

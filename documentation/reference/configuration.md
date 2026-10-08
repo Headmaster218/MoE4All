@@ -28,6 +28,14 @@ infr 只有一个配置值：启动时从四个层级解析一次，然后显式
 - **每个已文档化的 `INFR_*` 变量仍然可用。** 引入 `Config` 的优化专项改变了 _值的去向_，而不是输入内容。现有的 `INFR_PROF_OPS=1 infr bench …` 脚本不受影响。
 - **标志优先于继承的环境变量**，因为 CLI 层位于环境变量层之上。`INFR_CTX=32k infr run … --ctx 8192` 会以 8192 运行。
 
+## 例外：`INFR_UNCENSOR_*` 不走 `Config`
+
+去审查投影（Qwen3.8 拒绝方向投影）是这套规则目前唯一的例外：`INFR_UNCENSOR_VECTOR`、`INFR_UNCENSOR_FIRST_LAYER`、`INFR_UNCENSOR_LAST_LAYER` 由 `crates/infr-uncensor` 在自己的模块里解析，**没有** `[uncensor]` 配置段、没有 `--uncensor` 标志、也没有 `--set uncensor.…` 路径。
+
+理由不是省事：这三项决定的是"这次会话要不要存在这个特性"，而不是"运行到一半调节它"。方向文件在模型加载时被读一次、投影缓冲在会话建立时分配或根本不分配，所以一个可以被 `--set`、被热重载、被会话缓存复用的配置字段会承诺一种实际不存在的能力。它登记在 `crates/infr-core/src/config/manifest.rs` 的 `NOT_MIGRATED` 清单里（防漂移测试因此仍然覆盖这三个键）。
+
+真正运行期可改的那一半不在配置层：每次 API 请求的 `uncensor` 字段（Strata 拼写 `experimental_speed_projection` 亦可）。见[去审查集成记录](../evidence/changes/models/qwen38-uncensor.md)。
+
 ## 配置文件
 
 ### 查找
