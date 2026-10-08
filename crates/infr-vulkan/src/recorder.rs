@@ -9193,6 +9193,43 @@ impl<'a> Recorder<'a> {
         n: usize,
         clamp: Option<f32>,
     ) {
+        self.silu_mul_at(gate, up, y, n, 0, clamp);
+    }
+
+    pub(crate) fn silu_mul_masked(
+        &self,
+        gate: &dyn Buffer,
+        up: &dyn Buffer,
+        y: &dyn Buffer,
+        width: usize,
+        mut mask: u32,
+        clamp: Option<f32>,
+    ) {
+        debug_assert!(width.is_multiple_of(64));
+        while mask != 0 {
+            let first = mask.trailing_zeros();
+            let count = (mask >> first).trailing_ones();
+            self.silu_mul_at(
+                gate,
+                up,
+                y,
+                width * count as usize,
+                width * first as usize,
+                clamp,
+            );
+            mask &= !((((u32::MAX >> (32 - count)) as u64) << first) as u32);
+        }
+    }
+
+    fn silu_mul_at(
+        &self,
+        gate: &dyn Buffer,
+        up: &dyn Buffer,
+        y: &dyn Buffer,
+        n: usize,
+        offset: usize,
+        clamp: Option<f32>,
+    ) {
         let k = self
             .be
             .kernel("silu_mul", crate::gemm::silu_mul_spv(), 3, 36);
@@ -9200,9 +9237,16 @@ impl<'a> Recorder<'a> {
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&(u32::from(clamp.is_some())).to_ne_bytes());
         push[32..36].copy_from_slice(&clamp.unwrap_or(0.0).to_ne_bytes());
+        let binding = |buffer| {
+            if offset == 0 {
+                Self::vkb(buffer)
+            } else {
+                Self::vkb_off(buffer, offset)
+            }
+        };
         self.dispatch(
             k,
-            &[Self::vkb(gate), Self::vkb(up), Self::vkb(y)],
+            &[binding(gate), binding(up), binding(y)],
             1,
             &push,
             (n as u32).div_ceil(64),
@@ -13755,6 +13799,52 @@ mod chunk_math_tests {
 mod tests {
     use super::*;
     use infr_core::{backend::BufferUsage, Backend};
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn masked_silu_preserves_inactive_slots_and_matches_dense() {
+        let be_ = VulkanBackend::new().unwrap();
+        for width in [64, 640] {
+            let n = 32 * width;
+            let gate: Vec<_> = (0..n).map(|i| (i % 113) as f32 * 0.1 - 5.6).collect();
+            let up: Vec<_> = (0..n).map(|i| (i % 43) as f32 * 0.05 - 1.0).collect();
+            let g = be_.alloc(n * 4, BufferUsage::Staging).unwrap();
+            let u = be_.alloc(n * 4, BufferUsage::Staging).unwrap();
+            let y = be_.alloc(n * 4, BufferUsage::Readback).unwrap();
+            let dense = be_.alloc(n * 4, BufferUsage::Readback).unwrap();
+            be_.upload(g.as_ref(), bytemuck::cast_slice(&gate)).unwrap();
+            be_.upload(u.as_ref(), bytemuck::cast_slice(&up)).unwrap();
+            for clamp in [None, Some(0.5)] {
+                let rec = be_.recorder().unwrap();
+                rec.silu_mul(g.as_ref(), u.as_ref(), dense.as_ref(), n, clamp);
+                rec.finish().unwrap();
+                let mut expected = vec![0.0f32; n];
+                be_.download(dense.as_ref(), bytemuck::cast_slice_mut(&mut expected))
+                    .unwrap();
+                let masks = [0, 1, 1 << 31, u32::MAX, 0xaaaaaaaa, 0x7ff & !(1 << 5)];
+                for mask in masks {
+                    let mut actual = vec![-999.0f32; n];
+                    be_.upload(y.as_ref(), bytemuck::cast_slice(&actual))
+                        .unwrap();
+                    let rec = be_.recorder().unwrap();
+                    rec.silu_mul_masked(g.as_ref(), u.as_ref(), y.as_ref(), width, mask, clamp);
+                    rec.finish().unwrap();
+                    be_.download(y.as_ref(), bytemuck::cast_slice_mut(&mut actual))
+                        .unwrap();
+                    for i in 0..n {
+                        assert_eq!(
+                            actual[i].to_bits(),
+                            if mask & (1 << (i / width)) == 0 {
+                                (-999.0f32).to_bits()
+                            } else {
+                                expected[i].to_bits()
+                            },
+                            "width={width} mask={mask:x} i={i}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn splitk_reduce_uses_logical_output_and_padded_partial_stride() {

@@ -3162,21 +3162,20 @@ impl MoePagerSession {
         if ids.len() > u32::BITS as usize {
             return Err(be("moe pager: routed residency mask exceeds 32 slots"));
         }
-        let mut resolved = Vec::with_capacity(buf_ids.len());
+        let mut mask = if ids.len() == 32 {
+            u32::MAX
+        } else {
+            (1u32 << ids.len()) - 1
+        };
         for &buf_id in buf_ids {
             let (_, pool, src) = self
                 .sources
                 .get(&buf_id)
                 .ok_or_else(|| be("moe pager: residency mask queried an unregistered buffer"))?;
-            resolved.push((*pool, src.block_base));
-        }
-        let mut mask = 0u32;
-        for (slot, &expert) in ids.iter().enumerate() {
-            if resolved
-                .iter()
-                .all(|&(pool, block_base)| self.pools[pool].pager.is_resident(block_base + expert))
-            {
-                mask |= 1u32 << slot;
+            for (slot, &expert) in ids.iter().enumerate() {
+                if !self.pools[*pool].pager.is_resident(src.block_base + expert) {
+                    mask &= !(1u32 << slot);
+                }
             }
         }
         Ok(mask)
@@ -3310,6 +3309,55 @@ impl MoePagerSession {
             self.pools[pool_idx].pager.begin_batch();
         }
         Ok(true)
+    }
+
+    /// Demand-touch a known-resident routed set without building host-transfer plans.
+    /// The caller holds the pager lock across validation and all touches.
+    pub(crate) fn touch_routed_hits(&mut self, buf_ids: &[usize], ids: &[u32]) -> Result<()> {
+        for &buf_id in buf_ids {
+            let (_, pool, src) = self
+                .sources
+                .get(&buf_id)
+                .ok_or_else(|| be("moe pager: routed hit on an unregistered buffer"))?;
+            if src.stride_bytes == 0 || !src.bank_bytes.is_multiple_of(src.stride_bytes) {
+                return Err(be("moe pager: invalid routed hit bank geometry"));
+            }
+            let n_expert = src.bank_bytes / src.stride_bytes;
+            let slots = self.pools[*pool]
+                .pager
+                .lut_words(src.block_base as usize, n_expert);
+            if ids.iter().any(|&id| {
+                slots
+                    .get(id as usize)
+                    .is_none_or(|&slot| slot == NOT_RESIDENT)
+            }) {
+                return Err(be("moe pager: routed hit set contains a missing expert"));
+            }
+        }
+        let call = self.trace.as_mut().map(PagerTrace::begin_call);
+        for &buf_id in buf_ids {
+            let (role, pool, src) = &self.sources[&buf_id];
+            let n_expert = src.bank_bytes / src.stride_bytes;
+            for &expert in ids {
+                let id = src.block_base + expert;
+                let plan = self.pools[*pool].pager.plan_cpu_push(id, false)?;
+                debug_assert!(plan.is_none(), "validated resident set cannot be promoted");
+                if let (Some(trace), Some(call)) = (self.trace.as_mut(), call) {
+                    trace.records.push(PagerTraceRecord {
+                        call,
+                        pool: *pool as u32,
+                        layer: src.layer_base / n_expert as u32,
+                        expert,
+                        block_id: id,
+                        bytes: src.stride_bytes.min(u32::MAX as usize) as u32,
+                        evicted: TRACE_NO_EVICTION,
+                        role: *role,
+                        gpu_hit: true,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn down_overlap_supported(&self, gate: usize, up: usize, down: usize) -> bool {
@@ -3783,6 +3831,59 @@ impl MoePagerSession {
         let w = *tape_cursor as u32;
         *tape_cursor += n_expert;
         Ok(w)
+    }
+
+    /// A masked Decode dispatch can only dereference these routed ids. Retain the ordinary
+    /// expert-indexed layout, but do not resolve/copy hundreds of unused addresses per role.
+    pub(crate) fn routed_lut_window(
+        &mut self,
+        tape_cursor: &mut usize,
+        buf_id: usize,
+        n_expert: usize,
+        ids: &[u32],
+    ) -> Result<u32> {
+        let (_, pool, source) = self
+            .sources
+            .get(&buf_id)
+            .ok_or_else(|| be("moe pager: routed LUT on an unregistered buffer"))?;
+        if tape_cursor
+            .checked_add(n_expert)
+            .is_none_or(|end| end > self.tape_words)
+        {
+            return Err(be("moe pager: routed LUT tape overflow"));
+        }
+        let pager = &self.pools[*pool].pager;
+        let slots = pager.lut_words(source.block_base as usize, n_expert);
+        // Validate before publishing or protecting anything; holes are never read by the mask.
+        for &id in ids {
+            if slots
+                .get(id as usize)
+                .is_none_or(|slot| *slot == NOT_RESIDENT)
+            {
+                return Err(be(
+                    "moe pager: routed LUT id is outside the bank or not resident",
+                ));
+            }
+        }
+        let base = as_vk_buf(self.tape.as_ref())?
+            .mapped_ptr()
+            .ok_or_else(|| be("pager LUT tape is not persistently mapped"))?;
+        for &id in ids {
+            let slot = slots[id as usize];
+            let address = pager.slot_addr(slot)?;
+            unsafe {
+                base.add((*tape_cursor + id as usize) * 8)
+                    .cast::<u64>()
+                    .write_unaligned(address);
+            }
+            self.frozen_lut_slots.insert(ExpertSlotId {
+                pool: *pool,
+                slot: slot as usize,
+            });
+        }
+        let window = *tape_cursor as u32;
+        *tape_cursor += n_expert;
+        Ok(window)
     }
 
     /// Protect only the resident slots that the dispatch's routed local ids can dereference from

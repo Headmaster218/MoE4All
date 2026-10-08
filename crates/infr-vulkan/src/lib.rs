@@ -332,6 +332,18 @@ fn use_decode_down_overlap(
     requested.unwrap_or(measured_device && matches!(rows, 2 | 3) && min_context >= 131072)
 }
 
+fn use_small_decode_policy(
+    requested: Option<bool>,
+    measured_device: bool,
+    rows: usize,
+    decode_rows: Option<usize>,
+    mtp_verify: bool,
+) -> bool {
+    requested.unwrap_or(
+        measured_device && !mtp_verify && (1..=3).contains(&rows) && decode_rows == Some(rows),
+    )
+}
+
 fn use_qsa_topk_scan(
     requested: Option<bool>,
     measured_device: bool,
@@ -2793,6 +2805,36 @@ impl VulkanBackend {
             self.measured_decode_kernel_device(),
             rows,
             min_context,
+        )
+    }
+
+    pub(crate) fn use_decode_sparse_lut(
+        &self,
+        rows: usize,
+        decode_rows: Option<usize>,
+        mtp_verify: bool,
+    ) -> bool {
+        use_small_decode_policy(
+            self.cfg().kernels.vulkan.decode_sparse_lut,
+            self.measured_decode_kernel_device(),
+            rows,
+            decode_rows,
+            mtp_verify,
+        )
+    }
+
+    pub(crate) fn use_decode_early_submit(
+        &self,
+        rows: usize,
+        decode_rows: Option<usize>,
+        mtp_verify: bool,
+    ) -> bool {
+        use_small_decode_policy(
+            self.cfg().kernels.vulkan.decode_early_submit,
+            self.measured_decode_kernel_device(),
+            rows,
+            decode_rows,
+            mtp_verify,
         )
     }
 
@@ -7979,6 +8021,35 @@ fn probe_flash_attention_hd256(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn early_ffn_submit_auto_is_decode_and_measured_device_scoped() {
+        for measured in [false, true] {
+            for rows in 1..=8 {
+                for decode_rows in [None, Some(1), Some(2), Some(3), Some(4)] {
+                    for verify in [false, true] {
+                        assert_eq!(
+                            use_small_decode_policy(None, measured, rows, decode_rows, verify),
+                            measured && rows <= 3 && decode_rows == Some(rows) && !verify
+                        );
+                        assert!(!use_small_decode_policy(
+                            Some(false),
+                            measured,
+                            rows,
+                            decode_rows,
+                            verify
+                        ));
+                        assert!(use_small_decode_policy(
+                            Some(true),
+                            measured,
+                            rows,
+                            decode_rows,
+                            verify
+                        ));
+                    }
+                }
+            }
+        }
+    }
     use super::*;
     use infr_core::Backend;
 

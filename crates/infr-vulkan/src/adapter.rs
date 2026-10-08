@@ -9502,6 +9502,7 @@ struct PagedStream {
     cursor: usize,
     /// Words used in the session's LUT tape (reset only after full drains — `sync_stream`).
     tape_cursor: usize,
+    small_m_lut: bool,
     /// Prefill compute segments that do not consume a staging-ring region.
     compute_pending: std::collections::VecDeque<crate::recorder::PendingSegment>,
     /// Dedicated producer for whole-layer Host -> mapped-device-arena copies. It owns the layer fence
@@ -9912,6 +9913,9 @@ fn stage_and_window<'a>(
     }
     let mut guard = be_.moe_pager().lock().unwrap();
     let sess = guard.as_mut().expect("paged execution requires a session");
+    if ps.small_m_lut && !scan && lut_ids.len() < n_expert {
+        return sess.routed_lut_window(&mut ps.tape_cursor, buf_id, n_expert, lut_ids);
+    }
     sess.protect_lut_ids(buf_id, lut_ids)?;
     sess.lut_window(&mut ps.tape_cursor, buf_id, n_expert)
 }
@@ -10633,28 +10637,43 @@ fn execute_paged_moe<'a>(
     // Layer-LOCAL ids to stage; empty = residency already guaranteed (all-resident inline path).
     let mut stage_ids: Vec<u32> = Vec::new();
     let mut stream_synced_for_cpu_push = false;
+    if !layer_stream && !touch_all {
+        let changed = be_
+            .moe_pager()
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("paged execution requires a session")
+            .enter_decode();
+        if changed && infr_core::pager_profile::active() {
+            tracing::info!(
+                rows,
+                n_used,
+                n_expert,
+                "[moe-prefill] arena switched to decode-LRU"
+            );
+        }
+    }
+    // Acquire small-m scratch before the host-dependent router readback launch interval.
+    let small_workspace = if paged_mmq_scratch_requests(be_, graph, op).is_none() {
+        Some(PagedSmallScratch {
+            gbuf: pooled(pool, be_, "moe_paged_g", physical_slots * gu_width * 4)?,
+            ubuf: if *fused_gate_up {
+                None
+            } else {
+                Some(pooled(pool, be_, "moe_paged_u", physical_slots * nff * 4)?)
+            },
+            abuf: pooled(pool, be_, "moe_paged_a", physical_slots * nff * 4)?,
+            ybuf: pooled(pool, be_, "moe_paged_y", physical_slots * ne * 4)?,
+        })
+    } else {
+        None
+    };
     if layer_stream {
         // Whole-layer staging below bypasses expert-level LRU bookkeeping entirely.
     } else if touch_all {
         stage_ids = (0..n_expert as u32).collect();
     } else {
-        // A preceding prefill may have reinterpreted the arena as contiguous layer storage.
-        // The prior execute drained before returning, so it is safe to invalidate its mappings.
-        {
-            let mut guard = be_.moe_pager().lock().unwrap();
-            let changed = guard
-                .as_mut()
-                .expect("paged execution requires a session")
-                .enter_decode();
-            if changed && infr_core::pager_profile::active() {
-                tracing::info!(
-                    rows,
-                    n_used,
-                    n_expert,
-                    "[moe-prefill] arena switched to decode-LRU"
-                );
-            }
-        }
         let inline_ok = {
             let guard = be_.moe_pager().lock().unwrap();
             let sess = guard
@@ -10729,9 +10748,7 @@ fn execute_paged_moe<'a>(
         sync_stream(be_, rec, ps)?;
     }
 
-    // Acquire this op's reusable MoE workspace before freezing its LUT addresses. Phase-level
-    // preflight covers the common graph-wide buffers, while frozen-slot protection below makes any
-    // genuinely lazy later allocation preserve addresses already recorded into the command stream.
+    // Batched Prefill still acquires its workspace here; small-m scratch is already prepared.
     let mmq_requests = paged_mmq_scratch_requests(be_, graph, op);
     let moe_scratch = if let Some(requests) = mmq_requests {
         let mut keys = pooled_batch(pool, be_, &requests)?.into_iter();
@@ -10758,21 +10775,26 @@ fn execute_paged_moe<'a>(
             ye: next(),
         })
     } else {
-        PagedMoeScratch::Small(PagedSmallScratch {
-            gbuf: pooled(pool, be_, "moe_paged_g", physical_slots * gu_width * 4)?,
-            ubuf: if *fused_gate_up {
-                None
-            } else {
-                Some(pooled(pool, be_, "moe_paged_u", physical_slots * nff * 4)?)
-            },
-            abuf: pooled(pool, be_, "moe_paged_a", physical_slots * nff * 4)?,
-            ybuf: pooled(pool, be_, "moe_paged_y", physical_slots * ne * 4)?,
-        })
+        PagedMoeScratch::Small(small_workspace.expect("small-m workspace prepared before routing"))
     };
+    let measured_decode_rows = (ne == 2560
+        && nff == 640
+        && n_expert == 512
+        && n_used == 10
+        && matches!(gdt, infr_core::DType::Iq2S | infr_core::DType::Iq3S)
+        && udt == gdt
+        && ddt == infr_core::DType::Iq4Nl
+        && !*fused_gate_up
+        && !*weight_before)
+        .then(|| decode_token_rows(graph))
+        .flatten();
+    ps.small_m_lut = matches!(&moe_scratch, PagedMoeScratch::Small(_))
+        && be_.use_decode_sparse_lut(rows, measured_decode_rows, graph.mtp_verify);
     let mut active_mask = all_active_mask;
     let mut row_mask_bank = MOE_ROW_MASK_NONE;
     let mut role_batches_preopened = false;
     let mut promotion_probe = None;
+    let mut narrow_hit_activation = false;
     // Small-m hit-first schedule: launch complete resident Gate/Up/Down triplets while every
     // missing triplet is promoted. A scalar decode uses the original push-constant mask; a short
     // multi-row batch appends one mask per row for each half to the immutable ids buffer. The
@@ -10840,7 +10862,10 @@ fn execute_paged_moe<'a>(
                 let mut guard = be_.moe_pager().lock().unwrap();
                 let sess = guard.as_mut().expect("paged execution requires a session");
                 let role_batches_open = sess.begin_role_batches(&[gate_id, up_id, down_id])?;
-                let push = if role_batches_open && hit_count > 0 {
+                let push = if role_batches_open && ps.small_m_lut {
+                    sess.touch_routed_hits(&[gate_id, up_id, down_id], &hit_ids[..hit_count])?;
+                    None
+                } else if role_batches_open && hit_count > 0 {
                     Some(sess.push_roles_cpu(
                         be_,
                         &[
@@ -10861,39 +10886,67 @@ fn execute_paged_moe<'a>(
                 push.complete_without_recorder(be_)?;
             }
             if role_batches_open {
-                let gate_hit_w = stage_and_window(
-                    be_,
-                    rec,
-                    ps,
-                    gate_id,
-                    &[],
-                    &hit_ids[..hit_count],
-                    n_expert,
-                    false,
-                    true,
-                )?;
-                let up_hit_w = stage_and_window(
-                    be_,
-                    rec,
-                    ps,
-                    up_id,
-                    &[],
-                    &hit_ids[..hit_count],
-                    n_expert,
-                    false,
-                    true,
-                )?;
-                let down_hit_w = stage_and_window(
-                    be_,
-                    rec,
-                    ps,
-                    down_id,
-                    &[],
-                    &hit_ids[..hit_count],
-                    n_expert,
-                    false,
-                    true,
-                )?;
+                let sparse_hit_windows = if ps.small_m_lut {
+                    let mut guard = be_.moe_pager().lock().unwrap();
+                    let sess = guard.as_mut().expect("paged execution requires a session");
+                    let mut windows = [0u32; 3];
+                    for (role, buf) in [gate_id, up_id, down_id].into_iter().enumerate() {
+                        windows[role] = sess.routed_lut_window(
+                            &mut ps.tape_cursor,
+                            buf,
+                            n_expert,
+                            &hit_ids[..hit_count],
+                        )?;
+                    }
+                    Some(windows)
+                } else {
+                    None
+                };
+                let gate_hit_w = if let Some(windows) = sparse_hit_windows {
+                    windows[0]
+                } else {
+                    stage_and_window(
+                        be_,
+                        rec,
+                        ps,
+                        gate_id,
+                        &[],
+                        &hit_ids[..hit_count],
+                        n_expert,
+                        false,
+                        true,
+                    )?
+                };
+                let up_hit_w = if let Some(windows) = sparse_hit_windows {
+                    windows[1]
+                } else {
+                    stage_and_window(
+                        be_,
+                        rec,
+                        ps,
+                        up_id,
+                        &[],
+                        &hit_ids[..hit_count],
+                        n_expert,
+                        false,
+                        true,
+                    )?
+                };
+                let down_hit_w = if let Some(windows) = sparse_hit_windows {
+                    windows[2]
+                } else {
+                    stage_and_window(
+                        be_,
+                        rec,
+                        ps,
+                        down_id,
+                        &[],
+                        &hit_ids[..hit_count],
+                        n_expert,
+                        false,
+                        true,
+                    )?
+                };
                 let PagedMoeScratch::Small(scratch) = &moe_scratch else {
                     unreachable!("hit-first path always uses small-m scratch")
                 };
@@ -10906,9 +10959,15 @@ fn execute_paged_moe<'a>(
                     scratch.ybuf,
                 );
                 let rec2 = rec.as_ref().expect("segment always Some between ops");
-                rec2.zero(pool[&gbuf].as_ref(), physical_slots * gu_width);
-                rec2.zero(pool[&ubuf].as_ref(), physical_slots * nff);
-                rec2.zero(pool[&ybuf].as_ref(), physical_slots * ne);
+                narrow_hit_activation = rows == 1
+                    && miss_count == 1
+                    && nff.is_multiple_of(64)
+                    && matches!(act, Activation::Silu);
+                if !narrow_hit_activation {
+                    rec2.zero(pool[&gbuf].as_ref(), physical_slots * gu_width);
+                    rec2.zero(pool[&ubuf].as_ref(), physical_slots * nff);
+                }
+                // Hit Down and miss Down/result-copy cover every routed/shared output slot.
                 rec2.arena_stream_barrier();
                 let xb = r(*x)?;
                 let first_mask = if row_hit_masks {
@@ -10965,6 +11024,14 @@ fn execute_paged_moe<'a>(
                 }
                 let n_act = physical_slots * nff;
                 match act {
+                    Activation::Silu if narrow_hit_activation => rec2.silu_mul_masked(
+                        pool[&gbuf].as_ref(),
+                        pool[&ubuf].as_ref(),
+                        pool[&abuf].as_ref(),
+                        nff,
+                        first_mask,
+                        *swiglu_clamp,
+                    ),
                     Activation::Silu => rec2.silu_mul(
                         pool[&gbuf].as_ref(),
                         pool[&ubuf].as_ref(),
@@ -11606,6 +11673,14 @@ fn execute_paged_moe<'a>(
         }
         match &ubuf {
             Some(ubuf) => match act {
+                Activation::Silu if narrow_hit_activation => rec2.silu_mul_masked(
+                    pool[&gbuf].as_ref(),
+                    pool[ubuf].as_ref(),
+                    pool[&abuf].as_ref(),
+                    nff,
+                    active_mask,
+                    *swiglu_clamp,
+                ),
                 Activation::Silu => rec2.silu_mul(
                     pool[&gbuf].as_ref(),
                     pool[ubuf].as_ref(),
@@ -11727,12 +11802,142 @@ fn execute_paged_moe<'a>(
     }
     if layer_stream {
         prefetch_next_moe_layer(be_, rec, ps, gate_id, graph.prefill_next_chunk)?;
+    } else if rows <= MOE_HIT_FIRST_MAX_ROWS
+        && be_.use_decode_early_submit(
+            rows,
+            if be_.cfg().paging.expert_prefetch {
+                None
+            } else {
+                measured_decode_rows
+            },
+            graph.mtp_verify,
+        )
+    {
+        submit_prefill_compute(rec, ps)?;
+        let fresh = be_.recorder()?;
+        fresh.seed_barrier();
+        fresh.arena_stream_barrier();
+        *rec = Some(fresh);
     }
     Ok(current_layer) // recorded inline; the ambient segment stays open
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires a Vulkan GPU; run explicitly"]
+    fn sparse_routed_lut_validates_hits_and_preserves_expert_indexed_addresses() {
+        use super::*;
+        use crate::pager::{ExpertSource, MoeHostChunkSpec, MoePagerLayout, MoePoolSpec, Role};
+        use infr_core::blockio::{BlockDesc, BlockExtent, BlockIo};
+        struct FixtureIo;
+        impl BlockIo for FixtureIo {
+            fn read_block(&self, desc: &BlockDesc, dst: &mut [u8]) -> Result<()> {
+                dst[..desc.nbytes()].fill(desc.id as u8 + 1);
+                Ok(())
+            }
+        }
+        let be_ = VulkanBackend::new().unwrap();
+        const SLOT: usize = 65536;
+        be_.init_moe_pager(MoePagerLayout {
+            load_reserve_bytes: 0,
+            n_blocks: 2,
+            pools: vec![MoePoolSpec {
+                slot_bytes: SLOT,
+                n_slots: 16,
+                min_enabled_slots: 8,
+            }],
+            host_tier: None,
+            host_store_io: Some(Arc::new(FixtureIo)),
+            dynamic_state_reserve_bytes: 0,
+            dynamic_state_max_allocation_bytes: 0,
+            prefill_min_lane_bytes: 0,
+            runtime_reserve_bytes: 0,
+            host_chunks: vec![MoeHostChunkSpec {
+                base_offset: 0,
+                bytes: SLOT * 6,
+            }],
+            prefill_target_lanes: 1,
+            prefill_cache_bytes: (SLOT * 16) as u64,
+        })
+        .unwrap();
+        let roles = [101, 102, 103];
+        {
+            let mut pager = be_.moe_pager().lock().unwrap();
+            let session = pager.as_mut().unwrap();
+            for (i, role) in [Role::Gate, Role::Up, Role::Down].into_iter().enumerate() {
+                session
+                    .register(
+                        role,
+                        roles[i],
+                        ExpertSource {
+                            bank: Arc::new(vec![0u8; SLOT * 2]),
+                            stride_bytes: SLOT,
+                            layer_base: 0,
+                            host_offset: SLOT * 2 * i,
+                            file: Some(BlockDesc {
+                                id: i as u32,
+                                extents: vec![BlockExtent {
+                                    offset: 0,
+                                    len: SLOT * 2,
+                                }],
+                            }),
+                        },
+                        2,
+                    )
+                    .unwrap();
+            }
+        }
+        {
+            let mut pager = be_.moe_pager().lock().unwrap();
+            let session = pager.as_mut().unwrap();
+            session.begin_role_batches(&roles).unwrap();
+            session
+                .push_roles_cpu(&be_, &roles.map(|role| (role, &[1u32][..])), false)
+                .unwrap()
+                .complete_without_recorder(&be_)
+                .unwrap();
+            session.touch_routed_hits(&roles, &[1, 1]).unwrap();
+            session.touch_routed_hits(&roles, &[]).unwrap();
+            assert!(session.touch_routed_hits(&roles, &[0]).is_err());
+            assert!(session.touch_routed_hits(&roles, &[2]).is_err());
+            assert!(session.touch_routed_hits(&[usize::MAX], &[1]).is_err());
+            assert_eq!(
+                session.routed_roles_resident_mask(&roles, &[0, 1]).unwrap(),
+                0b10
+            );
+            let mut cursor = 0;
+            for role in roles {
+                let dense = session.lut_window(&mut cursor, role, 2).unwrap();
+                let sparse = session
+                    .routed_lut_window(&mut cursor, role, 2, &[1, 1])
+                    .unwrap();
+                let ptr = crate::as_vk_buf(session.tape())
+                    .unwrap()
+                    .mapped_ptr()
+                    .unwrap()
+                    .cast::<u64>();
+                unsafe {
+                    assert_eq!(
+                        ptr.add(dense as usize + 1).read_unaligned(),
+                        ptr.add(sparse as usize + 1).read_unaligned()
+                    );
+                }
+                let previous = cursor;
+                assert!(session
+                    .routed_lut_window(&mut cursor, role, 2, &[0])
+                    .is_err());
+                assert!(session
+                    .routed_lut_window(&mut cursor, role, 2, &[2])
+                    .is_err());
+                assert_eq!(cursor, previous);
+                session
+                    .routed_lut_window(&mut cursor, role, 2, &[])
+                    .unwrap();
+            }
+            session.clear_frozen_lut_slots();
+        }
+    }
     use super::*;
     use infr_core::graph::Graph;
     use infr_core::tensor::TensorDesc;

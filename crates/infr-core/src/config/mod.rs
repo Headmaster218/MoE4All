@@ -398,6 +398,10 @@ cfg_struct! {
         qsa_prepare_fused: bool = false,
         /// Down promotion overlap. None selects measured Windows/RDNA3 deep two/three-row Decode.
         decode_down_overlap: Option<bool> = None,
+        /// Sparse routed LUTs. None selects measured Windows/RDNA3 Qwen3.8 scalar/parallel Decode.
+        decode_sparse_lut: Option<bool> = None,
+        /// Earlier FFN submit. None selects measured Qwen3.8 Decode without expert prefetch.
+        decode_early_submit: Option<bool> = None,
         /// Multi-workgroup exact radix selection for deep single-row QSA decode.
         qsa_topk_parallel: bool = true,
         /// Exact QSA count prefixes. None selects the measured Windows RDNA3 parallel top-512 path.
