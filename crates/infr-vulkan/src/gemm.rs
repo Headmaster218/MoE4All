@@ -3554,6 +3554,15 @@ qsa_spv!(qsa_prepare_mrope_seg_spv, "qsa_prepare_mrope_seg");
 qsa_spv!(qsa_indexer_topk_hist_spv, "qsa_indexer_topk_hist");
 qsa_spv!(qsa_indexer_topk_select_spv, "qsa_indexer_topk_select");
 qsa_spv!(qsa_indexer_topk_collect_spv, "qsa_indexer_topk_collect");
+qsa_spv!(qsa_indexer_topk_scan_spv, "qsa_indexer_topk_scan");
+qsa_spv!(
+    qsa_indexer_topk_select_scan_spv,
+    "qsa_indexer_topk_select_scan"
+);
+qsa_spv!(
+    qsa_indexer_topk_collect_scan_spv,
+    "qsa_indexer_topk_collect_scan"
+);
 qsa_spv!(qsa_indexer_compress_seg_spv, "qsa_indexer_compress_seg");
 qsa_spv!(qsa_indexer_compress_mrope_spv, "qsa_indexer_compress_mrope");
 qsa_spv!(

@@ -400,6 +400,8 @@ cfg_struct! {
         decode_down_overlap: Option<bool> = None,
         /// Multi-workgroup exact radix selection for deep single-row QSA decode.
         qsa_topk_parallel: bool = true,
+        /// Exact QSA count prefixes. None selects the measured Windows RDNA3 parallel top-512 path.
+        qsa_topk_scan: Option<bool> = None,
         /// `INFR_CANVAS_CHUNK_N` (`tier::EnvRows`, floored at 1).
         canvas_chunk_n: usize = 3,
 

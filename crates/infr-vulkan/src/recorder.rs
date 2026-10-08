@@ -9847,6 +9847,38 @@ impl<'a> Recorder<'a> {
             1,
         );
 
+        self.qsa_indexer_topk(
+            scores,
+            topk_work,
+            dst,
+            blocks,
+            top_blocks,
+            rows,
+            kv_len,
+            ratio,
+            dst_byte_off,
+            self.be.use_qsa_topk_scan(
+                rows as usize,
+                top_blocks as usize,
+                topk_work.is_some() && self.vk().qsa_topk_parallel,
+            ),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_indexer_topk(
+        &self,
+        scores: &dyn Buffer,
+        topk_work: Option<&dyn Buffer>,
+        dst: &dyn Buffer,
+        blocks: u32,
+        top_blocks: u32,
+        rows: u32,
+        kv_len: u32,
+        ratio: u32,
+        dst_byte_off: usize,
+        scan: bool,
+    ) {
         if let Some(work) = topk_work.filter(|_| rows == 1 && self.vk().qsa_topk_parallel) {
             let groups = blocks.div_ceil(1024).clamp(1, QSA_TOPK_PARALLEL_MAX_GROUPS);
             let state_base = groups * 256;
@@ -9856,12 +9888,22 @@ impl<'a> Recorder<'a> {
                 2,
                 20,
             );
-            let select_k = self.be.kernel(
-                "qsa_indexer_topk_select",
-                crate::gemm::qsa_indexer_topk_select_spv(),
-                1,
-                20,
-            );
+            let select_k = if scan {
+                self.be.kernel_sg(
+                    "qsa_indexer_topk_select_scan",
+                    crate::gemm::qsa_indexer_topk_select_scan_spv(),
+                    1,
+                    20,
+                    32,
+                )
+            } else {
+                self.be.kernel(
+                    "qsa_indexer_topk_select",
+                    crate::gemm::qsa_indexer_topk_select_spv(),
+                    1,
+                    20,
+                )
+            };
             let mut radix_push = [0u8; 20];
             radix_push[0..4].copy_from_slice(&blocks.to_ne_bytes());
             radix_push[4..8].copy_from_slice(&top_blocks.to_ne_bytes());
@@ -9879,12 +9921,22 @@ impl<'a> Recorder<'a> {
                 self.dispatch(select_k, &[Self::vkb(work)], 1, &radix_push, 1);
             }
 
-            let collect_k = self.be.kernel(
-                "qsa_indexer_topk_collect",
-                crate::gemm::qsa_indexer_topk_collect_spv(),
-                3,
-                12,
-            );
+            let collect_k = if scan {
+                self.be.kernel_sg(
+                    "qsa_indexer_topk_collect_scan",
+                    crate::gemm::qsa_indexer_topk_collect_scan_spv(),
+                    3,
+                    12,
+                    32,
+                )
+            } else {
+                self.be.kernel(
+                    "qsa_indexer_topk_collect",
+                    crate::gemm::qsa_indexer_topk_collect_spv(),
+                    3,
+                    12,
+                )
+            };
             let mut collect_push = [0u8; 12];
             collect_push[0..4].copy_from_slice(&blocks.to_ne_bytes());
             collect_push[4..8].copy_from_slice(&top_blocks.to_ne_bytes());
@@ -9901,12 +9953,22 @@ impl<'a> Recorder<'a> {
                 1,
             );
         } else {
-            let topk_k = self.be.kernel(
-                "qsa_indexer_topk",
-                crate::gemm::qsa_indexer_topk_spv(),
-                2,
-                20,
-            );
+            let topk_k = if scan {
+                self.be.kernel_sg(
+                    "qsa_indexer_topk_scan",
+                    crate::gemm::qsa_indexer_topk_scan_spv(),
+                    2,
+                    20,
+                    32,
+                )
+            } else {
+                self.be.kernel(
+                    "qsa_indexer_topk",
+                    crate::gemm::qsa_indexer_topk_spv(),
+                    2,
+                    20,
+                )
+            };
             let mut topk_push = [0u8; 20];
             topk_push[0..4].copy_from_slice(&blocks.to_ne_bytes());
             topk_push[4..8].copy_from_slice(&top_blocks.to_ne_bytes());
@@ -14769,6 +14831,175 @@ mod tests {
             attention_err <= 3e-4,
             "segmented LDS-GQA12 QSA attention differs across 32K: {attention_err:e}"
         );
+    }
+
+    #[test]
+    #[ignore = "requires Vulkan GPU"]
+    fn qsa_scan_default_uses_the_actual_parallel_workspace() {
+        let be = VulkanBackend::new().expect("QSA automatic scan probe needs Vulkan");
+        assert!(be.cfg().kernels.vulkan.qsa_topk_scan.is_none());
+        assert!(!be.use_qsa_topk_scan(1, 512, false));
+        let zero = |bytes: usize| {
+            let buffer = be.alloc(bytes, BufferUsage::Activations).unwrap();
+            be.upload(buffer.as_ref(), &vec![0u8; bytes]).unwrap();
+            buffer
+        };
+        let q = zero(8 * 2);
+        let norm = be.alloc(8 * 4, BufferUsage::Weights).unwrap();
+        be.upload(norm.as_ref(), bytemuck::cast_slice(&[1.0f32; 8]))
+            .unwrap();
+        let work = zero(QSA_TOPK_PARALLEL_WORK_BYTES);
+        for blocks in [4095usize, 4096] {
+            let raw = zero(blocks * 8 * 8 * 2);
+            let compressed = zero(blocks * 8 * 4);
+            let scores = zero(blocks * 4);
+            let output = be.alloc(512 * 4, BufferUsage::Readback).unwrap();
+            let rec = be.recorder().unwrap();
+            rec.qsa_indexer(
+                q.as_ref(),
+                raw.as_ref(),
+                compressed.as_ref(),
+                norm.as_ref(),
+                scores.as_ref(),
+                (blocks == 4096).then_some(work.as_ref()),
+                output.as_ref(),
+                1,
+                (blocks * 8) as u32,
+                blocks as u32,
+                1,
+                8,
+                512,
+                8,
+                8,
+                10_000.0,
+                1e-6,
+                1.0,
+                None,
+                None,
+            );
+            rec.finish().unwrap();
+            let mut got = vec![0u32; 512];
+            be.download(output.as_ref(), bytemuck::cast_slice_mut(&mut got))
+                .unwrap();
+            assert_eq!(got, (0..512u32).collect::<Vec<_>>());
+        }
+        let names = be.built_kernel_names();
+        assert!(names.contains(&"qsa_indexer_topk"));
+        let select = if be.use_qsa_topk_scan(1, 512, true) {
+            "qsa_indexer_topk_select_scan"
+        } else {
+            "qsa_indexer_topk_select"
+        };
+        assert!(
+            names.contains(&select),
+            "missing automatic selection {select}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Vulkan GPU"]
+    fn qsa_topk_prefix_scan_matches_original_and_host_order() {
+        let Ok(be) = VulkanBackend::new() else {
+            panic!("QSA scan probe needs a Vulkan GPU");
+        };
+        let mut cases = 0;
+        for blocks in [512usize, 513, 4095, 4096, 18750, 65536] {
+            for rows in [1usize, 3] {
+                for top in [1usize, 511, 512] {
+                    for kind in 0..3usize {
+                        let kv_len = blocks * 8 + kind;
+                        let scores: Vec<f32> = (0..blocks * rows)
+                            .map(|i| match kind {
+                                0 => 0.25,
+                                1 => {
+                                    (((i as u32).wrapping_mul(1664525).wrapping_add(1013904223)
+                                        >> 8)
+                                        % 8192) as f32
+                                        / 512.0
+                                        - 8.0
+                                }
+                                _ => match i % 8 {
+                                    0 => -0.0,
+                                    1 => 0.0,
+                                    2 => f32::NEG_INFINITY,
+                                    3 => f32::INFINITY,
+                                    4 => -f32::NAN,
+                                    5 => f32::NAN,
+                                    _ => (i % 13) as f32 * 0.01,
+                                },
+                            })
+                            .collect();
+                        let sb = be
+                            .alloc(scores.len() * 4, BufferUsage::Activations)
+                            .unwrap();
+                        be.upload(sb.as_ref(), bytemuck::cast_slice(&scores))
+                            .unwrap();
+                        let work = be
+                            .alloc(QSA_TOPK_PARALLEL_WORK_BYTES, BufferUsage::Activations)
+                            .unwrap();
+                        for parallel in [false, true] {
+                            if parallel && (rows != 1 || blocks <= top) {
+                                continue;
+                            }
+                            let mut expected = vec![0xa5a5a5a5u32; rows * top + 8];
+                            for row in 0..rows {
+                                let visible = (kv_len - rows + row + 1) / 8;
+                                let mut indices: Vec<usize> = (0..visible).collect();
+                                indices.sort_unstable_by(|&a, &b| {
+                                    scores[row * blocks + b]
+                                        .total_cmp(&scores[row * blocks + a])
+                                        .then_with(|| a.cmp(&b))
+                                });
+                                indices.truncate(top);
+                                indices.sort_unstable();
+                                for (slot, value) in indices.iter().enumerate() {
+                                    expected[4 + row * top + slot] = *value as u32;
+                                }
+                            }
+                            for scan in [false, true] {
+                                let output =
+                                    be.alloc(expected.len() * 4, BufferUsage::Readback).unwrap();
+                                be.upload(
+                                    output.as_ref(),
+                                    bytemuck::cast_slice(&vec![0xa5a5a5a5u32; expected.len()]),
+                                )
+                                .unwrap();
+                                let rec = be.recorder().unwrap();
+                                rec.qsa_indexer_topk(
+                                    sb.as_ref(),
+                                    parallel.then_some(work.as_ref()),
+                                    output.as_ref(),
+                                    blocks as u32,
+                                    top as u32,
+                                    rows as u32,
+                                    kv_len as u32,
+                                    8,
+                                    16,
+                                    scan,
+                                );
+                                rec.finish().unwrap();
+                                let mut got = vec![0u32; expected.len()];
+                                be.download(output.as_ref(), bytemuck::cast_slice_mut(&mut got))
+                                    .unwrap();
+                                assert_eq!(got, expected, "blocks={blocks} rows={rows} top={top} kind={kind} parallel={parallel} scan={scan}");
+                            }
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        for name in [
+            "qsa_indexer_topk_scan",
+            "qsa_indexer_topk_select_scan",
+            "qsa_indexer_topk_collect_scan",
+        ] {
+            assert!(
+                be.built_kernel_names().contains(&name),
+                "missing actual scan kernel {name}"
+            );
+        }
+        eprintln!("QSA integer prefix exact cases={cases} (two GPU paths each, host ordered oracle, guarded offsets)");
     }
 
     /// A cached multi-token continuation must be causal: every row must match a scalar forward at

@@ -332,6 +332,16 @@ fn use_decode_down_overlap(
     requested.unwrap_or(measured_device && matches!(rows, 2 | 3) && min_context >= 131072)
 }
 
+fn use_qsa_topk_scan(
+    requested: Option<bool>,
+    measured_device: bool,
+    rows: usize,
+    top: usize,
+    parallel: bool,
+) -> bool {
+    requested.unwrap_or(measured_device && parallel && rows == 1 && top == 512)
+}
+
 const AUTO_SUBMIT_SAMPLES_PER_CAP: usize = 2;
 const AUTO_SUBMIT_MAX_ROUNDS: usize = 12;
 const AGGRESSIVE_SUBMIT_BUDGET_NS: u64 = 500_000_000;
@@ -2783,6 +2793,16 @@ impl VulkanBackend {
             self.measured_decode_kernel_device(),
             rows,
             min_context,
+        )
+    }
+
+    pub(crate) fn use_qsa_topk_scan(&self, rows: usize, top: usize, parallel: bool) -> bool {
+        use_qsa_topk_scan(
+            self.cfg().kernels.vulkan.qsa_topk_scan,
+            self.measured_decode_kernel_device(),
+            rows,
+            top,
+            parallel,
         )
     }
 
@@ -8018,6 +8038,30 @@ mod tests {
                         rows,
                         context
                     ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn qsa_scan_auto_keeps_unmeasured_shapes_on_the_original_path() {
+        for measured in [false, true] {
+            for rows in [0, 1, 2, 3, 4, 4096] {
+                for top in [0, 1, 511, 512] {
+                    for parallel in [false, true] {
+                        assert_eq!(
+                            use_qsa_topk_scan(None, measured, rows, top, parallel),
+                            measured && parallel && rows == 1 && top == 512
+                        );
+                        assert!(!use_qsa_topk_scan(
+                            Some(false),
+                            measured,
+                            rows,
+                            top,
+                            parallel
+                        ));
+                        assert!(use_qsa_topk_scan(Some(true), measured, rows, top, parallel));
+                    }
                 }
             }
         }
