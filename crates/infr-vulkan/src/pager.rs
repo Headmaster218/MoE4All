@@ -3312,6 +3312,24 @@ impl MoePagerSession {
         Ok(true)
     }
 
+    pub(crate) fn down_overlap_supported(&self, gate: usize, up: usize, down: usize) -> bool {
+        let (Some(gate), Some(up), Some(down)) = (
+            self.sources.get(&gate),
+            self.sources.get(&up),
+            self.sources.get(&down),
+        ) else {
+            return false;
+        };
+        // Bounded host promotion may recycle an upload source; a shared GPU pool may evict
+        // an in-flight Gate/Up block. Keep the upload sources and physical pools independent.
+        self._host_tier.is_none()
+            && gate.2.host_chunk.is_some()
+            && up.2.host_chunk.is_some()
+            && down.2.host_chunk.is_some()
+            && down.1 != gate.1
+            && down.1 != up.1
+    }
+
     /// Open one epoch for several roles only when they share a logical size pool. This is the
     /// original combined-role path used by ordinary paging; cross-pool batching is reserved for
     /// the Decode hit-first schedule that explicitly protects every involved pool.
@@ -3336,8 +3354,8 @@ impl MoePagerSession {
     }
 
     /// Runtime Decode upload path backed by the unique CPU expert store. Every miss targets its
-    /// final LRU slot and is submitted through the frozen session transfer plan. The caller must
-    /// have drained earlier arena readers first.
+    /// final LRU slot and is submitted through the frozen session transfer plan. Earlier readers
+    /// must be drained or protected by the current role epoch and immutable LUT windows.
     pub(crate) fn push_role_cpu<E: TransferExecutor>(
         &mut self,
         executor: &E,

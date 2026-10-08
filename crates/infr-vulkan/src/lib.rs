@@ -323,6 +323,15 @@ fn use_paged_grid_buffer(
     requested.unwrap_or(measured_device && k == 2560 && n == 640 && (1..=3).contains(&rows))
 }
 
+fn use_decode_down_overlap(
+    requested: Option<bool>,
+    measured_device: bool,
+    rows: usize,
+    min_context: u32,
+) -> bool {
+    requested.unwrap_or(measured_device && rows == 3 && min_context >= 131072)
+}
+
 const AUTO_SUBMIT_SAMPLES_PER_CAP: usize = 2;
 const AUTO_SUBMIT_MAX_ROUNDS: usize = 12;
 const AGGRESSIVE_SUBMIT_BUDGET_NS: u64 = 500_000_000;
@@ -2765,6 +2774,15 @@ impl VulkanBackend {
             k,
             n,
             rows,
+        )
+    }
+
+    pub(crate) fn use_decode_down_overlap(&self, rows: usize, min_context: u32) -> bool {
+        use_decode_down_overlap(
+            self.cfg().kernels.vulkan.decode_down_overlap,
+            self.measured_decode_kernel_device(),
+            rows,
+            min_context,
         )
     }
 
@@ -7975,6 +7993,32 @@ mod tests {
                     n,
                     rows
                 ));
+            }
+        }
+    }
+
+    #[test]
+    fn down_overlap_auto_keeps_unmeasured_cohorts_on_the_original_path() {
+        for measured_device in [false, true] {
+            for rows in 0..=4 {
+                for context in [0, 30000, 131071, 131072, 150000] {
+                    assert_eq!(
+                        use_decode_down_overlap(None, measured_device, rows, context),
+                        measured_device && rows == 3 && context >= 131072
+                    );
+                    assert!(!use_decode_down_overlap(
+                        Some(false),
+                        measured_device,
+                        rows,
+                        context
+                    ));
+                    assert!(use_decode_down_overlap(
+                        Some(true),
+                        measured_device,
+                        rows,
+                        context
+                    ));
+                }
             }
         }
     }

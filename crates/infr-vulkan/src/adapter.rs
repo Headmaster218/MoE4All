@@ -11042,8 +11042,44 @@ fn execute_paged_moe<'a>(
     rec.as_ref()
         .expect("segment always Some between ops")
         .arena_stream_barrier();
+    let down_overlap = be_.use_decode_down_overlap(
+        rows,
+        graph
+            .sequence_spans
+            .iter()
+            .map(|span| span.start_pos)
+            .min()
+            .unwrap_or(0),
+    ) && !layer_stream
+        && graph.independent_rows
+        && decode_token_rows(graph) == Some(rows)
+        && (2..=3).contains(&rows)
+        && matches!(&moe_scratch, PagedMoeScratch::Small(_))
+        && !*fused_gate_up
+        && !*weight_before
+        && swiglu_clamp.is_none()
+        && matches!(act, Activation::Silu)
+        && ne == 2560
+        && nff == 640
+        && !stage_ids.is_empty()
+        && stage_ids.len() < u32::BITS as usize
+        && {
+            let guard = be_.moe_pager().lock().unwrap();
+            let sess = guard.as_ref().expect("paged execution requires a session");
+            sess.down_overlap_supported(gate_id, up_id, down_id)
+                && sess.routed_roles_resident_mask(&[down_id], &stage_ids)?
+                    != (1u32 << stage_ids.len()) - 1
+        };
+    let mut pipelined_gate_up = None;
     let roles_batched = if role_batches_preopened {
         true
+    } else if down_overlap {
+        be_.moe_pager()
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("paged execution requires a session")
+            .begin_role_batches(&[gate_id, up_id, down_id])?
     } else if !layer_stream && !stage_ids.is_empty() && !*fused_gate_up {
         let mut guard = be_.moe_pager().lock().unwrap();
         let sess = guard.as_mut().expect("paged execution requires a session");
@@ -11070,16 +11106,17 @@ fn execute_paged_moe<'a>(
         let prepare_span = infr_core::timeline::span("expert_prepare");
         let push = {
             let mut guard = be_.moe_pager().lock().unwrap();
+            let roles = [
+                (gate_id, stage_ids.as_slice()),
+                (up_id, stage_ids.as_slice()),
+                (down_id, stage_ids.as_slice()),
+            ];
             guard
                 .as_mut()
                 .expect("paged execution requires a session")
                 .push_roles_cpu(
                     be_,
-                    &[
-                        (gate_id, stage_ids.as_slice()),
-                        (up_id, stage_ids.as_slice()),
-                        (down_id, stage_ids.as_slice()),
-                    ],
+                    if down_overlap { &roles[..2] } else { &roles },
                     touch_all,
                 )?
         };
@@ -11116,6 +11153,78 @@ fn execute_paged_moe<'a>(
                 enqueue_started.elapsed(),
             );
         }
+        if down_overlap {
+            let gate_w = stage_and_window(
+                be_,
+                rec,
+                ps,
+                gate_id,
+                &[],
+                &stage_ids,
+                n_expert,
+                false,
+                true,
+            )?;
+            let up_w =
+                stage_and_window(be_, rec, ps, up_id, &[], &stage_ids, n_expert, false, true)?;
+            let PagedMoeScratch::Small(scratch) = &moe_scratch else {
+                unreachable!("Down overlap requires small-m scratch")
+            };
+            let ubuf = scratch.ubuf.expect("Down overlap excludes fused Gate/Up");
+            let rc = rec.as_ref().expect("segment always Some between ops");
+            rc.arena_stream_barrier();
+            {
+                let guard = be_.moe_pager().lock().unwrap();
+                let sess = guard.as_ref().expect("paged execution requires a session");
+                for (dt, id, window, shared_w, dst) in [
+                    (gdt, gate_id, gate_w, shared_wgate, scratch.gbuf),
+                    (udt, up_id, up_w, shared_wup, ubuf),
+                ] {
+                    linear_paged_maybe_shared(
+                        rc,
+                        dt,
+                        sess.arena_addr(id)?,
+                        sess.slot_bytes(id)? as u32,
+                        sess.tape(),
+                        pool[&ids_key].as_ref(),
+                        n_used,
+                        window as usize,
+                        shared_w,
+                        r(*x)?,
+                        false,
+                        pool[&dst].as_ref(),
+                        ne,
+                        nff,
+                        rows,
+                        active_mask,
+                        row_mask_bank,
+                    );
+                }
+            }
+            rc.silu_mul(
+                pool[&scratch.gbuf].as_ref(),
+                pool[&ubuf].as_ref(),
+                pool[&scratch.abuf].as_ref(),
+                physical_slots * nff,
+                None,
+            );
+            submit_prefill_compute(rec, ps)?;
+            let fresh = be_.recorder()?;
+            fresh.seed_barrier();
+            fresh.arena_stream_barrier();
+            *rec = Some(fresh);
+            let span = infr_core::timeline::span("expert_down_prepare");
+            let push = be_
+                .moe_pager()
+                .lock()
+                .unwrap()
+                .as_mut()
+                .expect("paged execution requires a session")
+                .push_roles_cpu(be_, &[(down_id, stage_ids.as_slice())], touch_all)?;
+            drop(span);
+            push.record(rec.as_ref().expect("fresh recorder"))?;
+            pipelined_gate_up = Some((gate_w, up_w));
+        }
     }
     let role_stage_ids = if roles_batched {
         &[][..]
@@ -11129,7 +11238,9 @@ fn execute_paged_moe<'a>(
     let role_lut_ids = all_resident_lut_ids
         .as_deref()
         .unwrap_or(stage_ids.as_slice());
-    let gate_w = if layer_stream {
+    let gate_w = if let Some((gate, _)) = pipelined_gate_up {
+        gate
+    } else if layer_stream {
         stage_layer_and_window(be_, rec, ps, gate_id, n_expert)?
     } else {
         stage_and_window(
@@ -11144,7 +11255,9 @@ fn execute_paged_moe<'a>(
             roles_batched,
         )?
     };
-    let up_w = if *fused_gate_up {
+    let up_w = if let Some((_, up)) = pipelined_gate_up {
+        up
+    } else if *fused_gate_up {
         gate_w // never dispatched (no Up GEMV on the fused shape) — placeholder
     } else if layer_stream {
         stage_layer_and_window(be_, rec, ps, up_id, n_expert)?
@@ -11421,7 +11534,9 @@ fn execute_paged_moe<'a>(
         && udt == infr_core::DType::Iq2Xs
         && ne == 2560
         && nff == 640;
-    if fused_decode_swiglu {
+    if pipelined_gate_up.is_some() {
+        // Gate/Up and activation were submitted before the independent Down pool upload.
+    } else if fused_decode_swiglu {
         let guard = be_.moe_pager().lock().unwrap();
         let sess = guard.as_ref().expect("checked above");
         rec2.linear_native_id_swiglu_iq2xs_paged(

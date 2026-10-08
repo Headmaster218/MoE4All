@@ -396,6 +396,8 @@ cfg_struct! {
         /// Experimental Qwen3.8 QSA prepare fusion. Concatenates the indexer Q/K projections and
         /// fuses raw-K cache write with query norm/RoPE. Kept off until model-level A/B validation.
         qsa_prepare_fused: bool = false,
+        /// Down promotion overlap. None selects measured Windows/RDNA3 deep three-row Decode.
+        decode_down_overlap: Option<bool> = None,
         /// Multi-workgroup exact radix selection for deep single-row QSA decode.
         qsa_topk_parallel: bool = true,
         /// `INFR_CANVAS_CHUNK_N` (`tier::EnvRows`, floored at 1).
