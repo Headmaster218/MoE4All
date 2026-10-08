@@ -329,7 +329,7 @@ fn use_decode_down_overlap(
     rows: usize,
     min_context: u32,
 ) -> bool {
-    requested.unwrap_or(measured_device && rows == 3 && min_context >= 131072)
+    requested.unwrap_or(measured_device && matches!(rows, 2 | 3) && min_context >= 131072)
 }
 
 const AUTO_SUBMIT_SAMPLES_PER_CAP: usize = 2;
@@ -8004,7 +8004,7 @@ mod tests {
                 for context in [0, 30000, 131071, 131072, 150000] {
                     assert_eq!(
                         use_decode_down_overlap(None, measured_device, rows, context),
-                        measured_device && rows == 3 && context >= 131072
+                        measured_device && matches!(rows, 2 | 3) && context >= 131072
                     );
                     assert!(!use_decode_down_overlap(
                         Some(false),
