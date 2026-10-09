@@ -285,6 +285,10 @@ function Invoke-WizardDryRun {
     $process = [System.Diagnostics.Process]::Start($processInfo)
     $stdoutTask = $process.StandardOutput.ReadToEndAsync()
     $stderrTask = $process.StandardError.ReadToEndAsync()
+    # Decline direct reuse so the smoke still exercises the interactive configuration flow.
+    if (-not $NoSavedModel -and -not $PassModelArgument) {
+        $process.StandardInput.WriteLine('n')
+    }
     # Keep the saved launch mode. Without a launcher argument, exercise the same Read-Host model
     # prompt used when a path is pasted into an already-open terminal.
     $process.StandardInput.WriteLine('')

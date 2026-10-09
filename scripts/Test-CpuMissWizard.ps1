@@ -28,11 +28,11 @@ function Read-Host {
 }
 
 $statements = @($ast.EndBlock.Statements)
-$start = $statements | Where-Object { $_.Extent.Text.StartsWith('$cpuMissEnabled = Read-YesNo') } | Select-Object -First 1
-$end = $statements | Where-Object { $_.Extent.Text.StartsWith('$customSets =') } | Select-Object -First 1
-if ($null -eq $start -or $null -eq $end) { throw 'Missing CPU wizard prompts' }
-$text = Get-Content -LiteralPath $wizardPath -Raw -Encoding UTF8
-$prompts = [scriptblock]::Create($text.Substring($start.Extent.StartOffset, $end.Extent.StartOffset - $start.Extent.StartOffset))
+$start = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and $node.Extent.Text.StartsWith('$cpuMissEnabled = Read-YesNo') }, $true) | Select-Object -First 1
+if ($null -eq $start) { throw 'Missing CPU wizard prompts' }
+$promptStatements = @($start.Parent.Statements)
+$promptIndex = [array]::IndexOf($promptStatements, $start)
+$prompts = [scriptblock]::Create($start.Extent.Text + "`n" + $promptStatements[$promptIndex + 1].Extent.Text)
 $argumentStart = $statements | Where-Object { $_.Extent.Text.StartsWith('Add-SetArgument $nativeArgs ''kernels.vulkan.cpu_miss_threads''') } | Select-Object -First 1
 $argumentIndex = [array]::IndexOf($statements, $argumentStart)
 if ($argumentIndex -lt 0) { throw 'Missing CPU command arguments' }
@@ -49,6 +49,8 @@ function Test-Case {
     $script:Topology = [pscustomobject]@{ Physical = $Physical; Preferred = $Preferred; Detected = $true }
     $script:Answers = [System.Collections.Generic.Queue[string]]::new()
     foreach ($inputValue in $Inputs) { $script:Answers.Enqueue($inputValue) }
+    $cpuMissMax = [string](Get-SavedValue 'cpu_miss_max' '1')
+    $cpuMissCores = [string](Get-SavedValue 'cpu_miss_cores' '')
     . $prompts
     if ($script:Answers.Count) { throw "$Name did not consume its input" }
     $nativeArgs = [System.Collections.Generic.List[string]]::new()

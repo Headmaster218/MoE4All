@@ -242,7 +242,7 @@ function Get-VulkanDeviceOptions {
         $process.WaitForExit()
         $exitCode = $process.ExitCode
     } catch {
-        Write-Warning "无法枚举 Vulkan 设备，将保留引擎自动选择：$($_.Exception.Message) / Could not enumerate Vulkan devices; engine auto-selection remains available."
+        Write-Warning "无法枚举 Vulkan 设备，仍可选择 CPU：$($_.Exception.Message) / Could not enumerate Vulkan devices; CPU remains available."
         return @()
     } finally {
         if ($null -ne $process) {
@@ -252,7 +252,7 @@ function Get-VulkanDeviceOptions {
     if ($exitCode -ne 0) {
         $detail = $stderr.Trim()
         if ($detail) { $detail = ": $detail" }
-        Write-Warning "Vulkan 设备枚举失败（退出码 $exitCode）$detail。将保留引擎自动选择。Vulkan device enumeration failed (exit code $exitCode); engine auto-selection remains available."
+        Write-Warning "Vulkan 设备枚举失败（退出码 $exitCode）$detail。仍可选择 CPU。Vulkan device enumeration failed (exit code $exitCode); CPU remains available."
         return @()
     }
 
@@ -275,6 +275,104 @@ function Get-VulkanDeviceOptions {
         })
     }
     return $options.ToArray()
+}
+
+function Read-ComputeDevice {
+    param([AllowEmptyString()][string]$Default = '')
+
+    $options = @(Get-VulkanDeviceOptions)
+    $cpuName = 'CPU'
+    try {
+        $cpuName = [string]((Get-CimInstance Win32_Processor | Select-Object -First 1).Name)
+    } catch { }
+    $options += [pscustomobject]@{
+        Key = ($options.Count + 1).ToString(); Value = 'cpu'
+        Label = "CPU: $cpuName (reference backend)"; IsDefault = ($options.Count -eq 0)
+    }
+    $selected = $options | Where-Object { $_.Value -eq $Default } | Select-Object -First 1
+    if ($null -eq $selected) {
+        $selected = $options | Where-Object { $_.IsDefault } | Select-Object -First 1
+    }
+    if ($null -eq $selected) { $selected = $options[0] }
+    return Read-Choice -Label '运行设备 / Compute device' -DefaultValue ([string]$selected.Value) -Options $options
+}
+
+function Get-ModelReasoningEfforts {
+    param([Parameter(Mandatory = $true)][string]$ModelPath)
+
+    try {
+        if (-not ('Moe4All.WizardModelMetadata' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Text;
+namespace Moe4All {
+    public static class WizardModelMetadata {
+        private static string Text(BinaryReader reader) {
+            ulong length = reader.ReadUInt64();
+            if (length > 16 * 1024 * 1024 || length > (ulong)(reader.BaseStream.Length - reader.BaseStream.Position))
+                throw new InvalidDataException("Invalid GGUF string");
+            return Encoding.UTF8.GetString(reader.ReadBytes((int)length));
+        }
+        private static void Skip(BinaryReader reader, uint type, int depth) {
+            if (depth > 8) throw new InvalidDataException("Nested GGUF array");
+            int size;
+            switch (type) {
+                case 0: case 1: case 7: size = 1; break;
+                case 2: case 3: size = 2; break;
+                case 4: case 5: case 6: size = 4; break;
+                case 10: case 11: case 12: size = 8; break;
+                case 8:
+                    ulong length = reader.ReadUInt64();
+                    if (length > (ulong)(reader.BaseStream.Length - reader.BaseStream.Position))
+                        throw new InvalidDataException("Invalid GGUF string");
+                    reader.BaseStream.Seek((long)length, SeekOrigin.Current);
+                    return;
+                case 9:
+                    uint element = reader.ReadUInt32();
+                    ulong count = reader.ReadUInt64();
+                    if (count > 1000000) throw new InvalidDataException("Oversized GGUF array");
+                    for (ulong i = 0; i < count; i++) Skip(reader, element, depth + 1);
+                    return;
+                default: throw new InvalidDataException("Unknown GGUF type");
+            }
+            if (size > reader.BaseStream.Length - reader.BaseStream.Position)
+                throw new EndOfStreamException();
+            reader.BaseStream.Seek(size, SeekOrigin.Current);
+        }
+        public static string[] Read(string path) {
+            using (var stream = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var reader = new BinaryReader(stream)) {
+                if (reader.ReadUInt32() != 0x46554747) throw new InvalidDataException("Not GGUF");
+                uint version = reader.ReadUInt32();
+                if (version < 2 || version > 3) throw new InvalidDataException("Unknown GGUF version");
+                reader.ReadUInt64();
+                ulong count = reader.ReadUInt64();
+                if (count > 1000000) throw new InvalidDataException("Oversized GGUF metadata");
+                string arch = "", template = "";
+                for (ulong i = 0; i < count; i++) {
+                    string key = Text(reader);
+                    uint type = reader.ReadUInt32();
+                    if (type == 8 && (key == "general.architecture" || key == "tokenizer.chat_template")) {
+                        string value = Text(reader);
+                        if (key == "general.architecture") arch = value; else template = value;
+                    } else Skip(reader, type, 0);
+                }
+                return new string[] { arch, template };
+            }
+        }
+    }
+}
+'@
+        }
+        $metadata = [Moe4All.WizardModelMetadata]::Read($ModelPath)
+        if ($metadata[1] -notmatch '\breasoning_effort\b') { return @() }
+        if ($metadata[0] -eq 'qwen4exp') { return @('low', 'medium', 'xhigh') }
+        return @('low', 'medium', 'high', 'max')
+    } catch {
+        Write-Warning '无法读取模型的思考强度能力，保留模板默认。Could not read reasoning-effort support; keeping the template default.'
+        return @()
+    }
 }
 
 function ConvertTo-FullPath {
@@ -310,32 +408,47 @@ function ConvertTo-FullPath {
 }
 
 function Show-RecommendedModelDownloads {
+    param([ValidateSet('all', 'llm', 'mtp', 'vision', 'embedding')][string]$Kind = 'all')
     $downloads = @(
         [pscustomobject]@{
+            Kind = 'llm'
             Name = 'Qwen3.6 35B APEX-I-Balanced'
             Url = 'https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/resolve/main/Qwen3.6-35B-A3B-APEX-I-Balanced.gguf?download=true'
         }
         [pscustomobject]@{
+            Kind = 'llm'
             Name = 'Qwen3.8 Flash-Next AD-4.27bpw-Q4_K_M-M64（33 个主模型分片 / 33 main-model shards）'
             Url = 'https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/tree/main/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64'
         }
         [pscustomobject]@{
+            Kind = 'vision'
             Name = 'Qwen3.8 Flash-Next F16 视觉文件 / vision projector'
             Url = 'https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/mmproj-Qwen3.8-Flash-Next-F16.gguf?download=true'
         }
         [pscustomobject]@{
+            Kind = 'mtp'
             Name = 'Qwen3.8 Flash-Next shared Q4_K_M MTP 头 / MTP head'
             Url = 'https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf?download=true'
+        }
+        [pscustomobject]@{
+            Kind = 'embedding'
+            Name = 'Qwen3-Embedding 0.6B GGUF'
+            Url = 'https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/tree/main'
         }
     )
 
     Write-Host "`n官方推荐的模型 / Official recommended models" -ForegroundColor Cyan
     foreach ($download in $downloads) {
+        if ($Kind -ne 'all' -and $download.Kind -ne $Kind) { continue }
         Write-Host " $($download.Name)"
         Write-Host "   $($download.Url)" -ForegroundColor DarkGray
     }
-    Write-Host '下载后请输入主模型 GGUF 路径；视觉与 MTP 文件可在后续步骤选择。' -ForegroundColor DarkGray
-    Write-Host 'After downloading, enter the main-model GGUF path; vision and MTP files are selected later.' -ForegroundColor DarkGray
+    if ($Kind -eq 'all' -or $Kind -eq 'llm') {
+        Write-Host '下载后请输入主模型 GGUF 路径；视觉与 MTP 文件可在后续步骤选择。' -ForegroundColor DarkGray
+        Write-Host 'After downloading, enter the main-model GGUF path; vision and MTP files are selected later.' -ForegroundColor DarkGray
+    } else {
+        Write-Host '下载后请输入对应的 GGUF 文件路径。After downloading, enter the corresponding GGUF path.' -ForegroundColor DarkGray
+    }
 }
 
 function Select-ModelPath {
@@ -430,8 +543,10 @@ function Select-ModelPath {
 function Select-EmbeddingModelPath {
     param([AllowEmptyString()][string]$Default = '')
 
+    if (-not $Default) { Show-RecommendedModelDownloads -Kind 'embedding' }
     while ($true) {
-        $inputPath = Read-TextValue -Label 'Embedding GGUF 文件或目录 / GGUF file or directory' -Default $Default -Required
+        $inputPath = Read-TextValue -Label 'Embedding GGUF 文件或目录，R 查看推荐 / GGUF file or directory, R for recommendations' -Default $Default -Required
+        if ($inputPath -match '^(r|recommended|推荐)$') { Show-RecommendedModelDownloads -Kind 'embedding'; continue }
         try {
             $path = ConvertTo-FullPath $inputPath
             if (Test-Path -LiteralPath $path -PathType Leaf) {
@@ -463,8 +578,10 @@ function Select-EmbeddingModelPath {
 function Select-MtpModelPath {
     param([AllowEmptyString()][string]$Default = '')
 
+    if (-not $Default) { Show-RecommendedModelDownloads -Kind 'mtp' }
     while ($true) {
-        $inputPath = Read-TextValue -Label 'MTP 头 GGUF 文件或目录 / MTP-head GGUF file or directory' -Default $Default -Required
+        $inputPath = Read-TextValue -Label 'MTP 头 GGUF 文件或目录，R 查看推荐 / MTP-head GGUF file or directory, R for recommendations' -Default $Default -Required
+        if ($inputPath -match '^(r|recommended|推荐)$') { Show-RecommendedModelDownloads -Kind 'mtp'; continue }
         try {
             $path = ConvertTo-FullPath $inputPath
             if (Test-Path -LiteralPath $path -PathType Leaf) {
@@ -515,8 +632,10 @@ function Find-VisionProjectorPath {
 function Select-VisionProjectorPath {
     param([AllowEmptyString()][string]$Default = '')
 
+    if (-not $Default) { Show-RecommendedModelDownloads -Kind 'vision' }
     while ($true) {
-        $inputPath = Read-TextValue -Label '视觉 mmproj GGUF 文件或目录 / Vision mmproj GGUF file or directory' -Default $Default -Required
+        $inputPath = Read-TextValue -Label '视觉 mmproj GGUF 文件或目录，R 查看推荐 / Vision mmproj GGUF file or directory, R for recommendations' -Default $Default -Required
+        if ($inputPath -match '^(r|recommended|推荐)$') { Show-RecommendedModelDownloads -Kind 'vision'; continue }
         try {
             $path = ConvertTo-FullPath $inputPath
             if (Test-Path -LiteralPath $path -PathType Leaf) {
@@ -654,8 +773,9 @@ function Read-EngineUpdateAction {
         Write-Host "`n发现新版本 / Update available: $($Release.Tag)" -ForegroundColor Yellow
         Write-Host '   [1] 查看更新说明 / View release notes'
         Write-Host '   [2] 下载并更新 / Download and update'
-        Write-Host '   [3] 暂不更新 / Not now'
-        $value = (Read-Host '选择 / Select').Trim().ToLowerInvariant()
+        Write-Host ' * [3] 暂不更新（默认）/ Not now (default)'
+        $value = (Read-Host '选择 [3] / Select [3]').Trim().ToLowerInvariant()
+        if (-not $value) { return 'skip' }
         switch ($value) {
             { $_ -in @('1', 'r', 'release', 'notes') } {
                 Show-EngineReleaseNotes -Release $Release
@@ -664,7 +784,7 @@ function Read-EngineUpdateAction {
             { $_ -in @('2', 'y', 'yes', 'update') } { return 'update' }
             { $_ -in @('3', 'n', 'no', 'later') } { return 'skip' }
             default {
-                Write-Host '请选择 1、2 或 3；此处没有默认选项。Select 1, 2 or 3; there is no default.' -ForegroundColor Yellow
+                Write-Host '请选择 1、2 或 3；回车暂不更新。Select 1, 2 or 3; Enter skips the update.' -ForegroundColor Yellow
             }
         }
     }
@@ -833,31 +953,18 @@ Write-Host "引擎 / Engine: $infrPath" -ForegroundColor DarkGray
 Show-PendingUpdateResult
 Show-UpdateStatus -CurrentVersion $productVersion
 
-$launchMode = Read-Choice -Label '你想做什么？/ What would you like to do?' -DefaultValue ([string](Get-SavedValue 'launch_mode' 'chat')) -Options @(
-    [pscustomobject]@{ Key = '1'; Value = 'chat'; Label = '实时终端对话（推荐）/ Interactive terminal chat (recommended)' }
-    [pscustomobject]@{ Key = '2'; Value = 'server'; Label = '启动 OpenAI 兼容 API / Start OpenAI-compatible API server' }
-    [pscustomobject]@{ Key = '3'; Value = 'benchmark'; Label = '性能测试 / Benchmark' }
-)
-$modelPath = Select-ModelPath -InitialPath $InitialModelPath
-
-$savedDevice = [string](Get-SavedValue 'device' '')
-$device = ''
-$deviceOptions = @(Get-VulkanDeviceOptions)
-if ($deviceOptions.Count -eq 1) {
-    $device = [string]$deviceOptions[0].Value
-    Write-Host "`n设备 / Device" -ForegroundColor Cyan
-    Write-Host "  $($deviceOptions[0].Label)"
-} elseif ($deviceOptions.Count -gt 1) {
-    $availableDevice = $deviceOptions | Where-Object { $_.Value -eq $savedDevice } | Select-Object -First 1
-    if ($null -eq $availableDevice) {
-        $availableDevice = $deviceOptions | Where-Object { $_.IsDefault } | Select-Object -First 1
+$reuseSavedSettings = $false
+$savedModel = [string](Get-SavedValue 'model' '')
+if ($null -ne $script:Saved -and -not $InitialModelPath -and $savedModel) {
+    if (Test-Path -LiteralPath $savedModel -PathType Leaf) {
+        $reuseSavedSettings = Read-YesNo -Label '是否按上次设置直接启动？/ Start with the previous settings?' -Default $true
+    } else {
+        Write-Warning '上次模型路径已不存在，请重新选择。The previous model is missing; choose a model again.'
     }
-    if ($null -eq $availableDevice) {
-        $availableDevice = $deviceOptions[0]
-    }
-    $device = Read-Choice -Label '计算设备 / Compute device' -DefaultValue ([string]$availableDevice.Value) -Options $deviceOptions
 }
 
+$launchMode = [string](Get-SavedValue 'launch_mode' 'chat')
+$modelPath = $savedModel
 $setupModeDefault = 'conservative'
 if ($null -ne $script:Saved) {
     $savedSetupMode = $script:Saved.PSObject.Properties['setup_mode']
@@ -875,71 +982,16 @@ if ($null -ne $script:Saved) {
         }
     }
 }
-$setupMode = Read-Choice -Label '配置方式 / Configuration' -DefaultValue $setupModeDefault -Options @(
-    [pscustomobject]@{ Key = '1'; Value = 'conservative'; Label = '自动配置：保守（推荐）/ Automatic: conservative (recommended)' }
-    [pscustomobject]@{ Key = '2'; Value = 'aggressive'; Label = '自动配置：激进性能 / Automatic: aggressive performance' }
-    [pscustomobject]@{ Key = '3'; Value = 'manual'; Label = '全手动配置 / Fully manual configuration' }
-)
-
+$setupMode = $setupModeDefault
+$device = [string](Get-SavedValue 'device' '')
 $context = [string](Get-SavedValue 'context' '')
 $ubatch = [string](Get-SavedValue 'ubatch' '')
 $threads = [string](Get-SavedValue 'threads' '')
 $configPath = [string](Get-SavedValue 'config_path' '')
-$kvPreset = [string](Get-SavedValue 'kv_preset' 'auto')
+$kvPreset = [string](Get-SavedValue 'kv_preset' 'q8')
 $kvTypeK = [string](Get-SavedValue 'kv_type_k' 'q8_0')
 $kvTypeV = [string](Get-SavedValue 'kv_type_v' 'q8_0')
 $configureMemory = [bool](Get-SavedValue 'configure_memory' $false)
-
-if ($setupMode -eq 'manual') {
-    Write-Host "`n高级通用设置 / Advanced common settings" -ForegroundColor Cyan
-    Write-Host '各项留空即可继续使用引擎的硬件探测与自动预算。Leave values blank to keep engine auto-detection.' -ForegroundColor DarkGray
-    if ($deviceOptions.Count -eq 0) {
-        $device = Read-TextValue -Label '设备，留空为自动 / Device, blank for auto' -Default $savedDevice
-    }
-    $context = Read-TextValue -Label '上下文窗口，留空为自动 / Context window, blank for auto' -Default $context
-    $ubatch = Read-IntegerValue -Label 'Ubatch，留空为自动 / Ubatch, blank for auto' -Default $ubatch -Minimum 1 -AllowBlank
-    $threads = Read-IntegerValue -Label 'CPU 线程，留空为全部 / CPU threads, blank for all' -Default $threads -Minimum 1 -AllowBlank
-    $configPath = Read-TextValue -Label '配置 TOML，留空使用默认查找 / Config TOML, blank for default lookup' -Default $configPath
-    if (-not [string]::IsNullOrWhiteSpace($configPath)) {
-        $configPath = ConvertTo-FullPath $configPath
-        if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
-            throw "找不到配置文件 / Config file not found: $configPath"
-        }
-    }
-
-    $kvPreset = Read-Choice -Label 'KV Cache 类型 / KV cache type' -DefaultValue $kvPreset -Options @(
-        [pscustomobject]@{ Key = '1'; Value = 'auto'; Label = '引擎自动（推荐）/ Engine default (recommended)' }
-        [pscustomobject]@{ Key = '2'; Value = 'q8'; Label = 'Q8_0 K + Q8_0 V' }
-        [pscustomobject]@{ Key = '3'; Value = 'f16'; Label = 'F16 K + F16 V' }
-        [pscustomobject]@{ Key = '4'; Value = 'custom'; Label = '分别指定 / Custom K and V' }
-    )
-    switch ($kvPreset) {
-        'q8' { $kvTypeK = 'q8_0'; $kvTypeV = 'q8_0' }
-        'f16' { $kvTypeK = 'f16'; $kvTypeV = 'f16' }
-        'custom' {
-            $kvTypeK = Read-TextValue -Label 'K cache 类型 / K cache dtype' -Default $kvTypeK -Required
-            $kvTypeV = Read-TextValue -Label 'V cache 类型 / V cache dtype' -Default $kvTypeV -Required
-        }
-    }
-
-    $configureMemory = Read-YesNo -Label '设置显存、内存和分页参数？/ Configure memory and paging?' -Default $configureMemory
-} elseif ($setupMode -eq 'aggressive') {
-    Write-Host "`n将自动探测硬件，并减少 RAM/VRAM 保留、提高 Ubatch、探索更大的 Submit cap。" -ForegroundColor Yellow
-    Write-Host 'Hardware stays auto-detected, with tighter RAM/VRAM headroom, a larger Ubatch and a wider Submit cap search.' -ForegroundColor DarkGray
-    Write-Host '适合追求吞吐且能接受更高资源压力；启动失败或系统换页时请改用保守档。' -ForegroundColor Yellow
-    Write-Host 'Use conservative mode if allocation fails or Windows starts paging.' -ForegroundColor DarkGray
-    $context = Read-TextValue -Label '上下文窗口，留空为自动 / Context window, blank for auto' -Default $context
-    $kvPreset = 'q8'
-    $kvTypeK = 'q8_0'
-    $kvTypeV = 'q8_0'
-} else {
-    Write-Host "`n将自动探测 GPU、显存和 RAM；上下文留空时由引擎自动确定。" -ForegroundColor DarkGray
-    Write-Host 'GPU, VRAM and RAM will be detected automatically; leave context blank for engine sizing.' -ForegroundColor DarkGray
-    $context = Read-TextValue -Label '上下文窗口，留空为自动 / Context window, blank for auto' -Default $context
-    $kvPreset = 'q8'
-    $kvTypeK = 'q8_0'
-    $kvTypeV = 'q8_0'
-}
 
 $vramBudget = [string](Get-SavedValue 'vram_budget' '')
 $vramReserve = [string](Get-SavedValue 'vram_reserve' '')
@@ -955,50 +1007,13 @@ $hostDma = [bool](Get-SavedValue 'host_dma' $true)
 $kvOverflow = [bool](Get-SavedValue 'kv_overflow' $false)
 $kvOverflowVram = [string](Get-SavedValue 'kv_overflow_vram_mb' '')
 $kvOverflowReserve = [string](Get-SavedValue 'kv_overflow_reserve_mb' '')
-if ($setupMode -eq 'manual' -and $configureMemory) {
-    Write-Host '大小可写 21GiB、512MiB、80%；留空表示自动。Sizes accept 21GiB, 512MiB or 80%; blank means auto.' -ForegroundColor DarkGray
-    $vramBudget = Read-TextValue -Label '总显存预算 / Total VRAM budget' -Default $vramBudget
-    $vramReserve = Read-TextValue -Label '额外显存保留 / Additional VRAM reserve' -Default $vramReserve
-    $expertCache = Read-TextValue -Label 'GPU 专家缓存 / GPU expert cache' -Default $expertCache
-    $ramBudget = Read-TextValue -Label '进程总 RAM 预算，0 为禁用 RAM tier / Total process RAM budget, 0 disables RAM tier' -Default $ramBudget
-    $hostDma = Read-YesNo -Label '启用 RAM 到 VRAM Host DMA？/ Enable RAM-to-VRAM Host DMA?' -Default $hostDma
-    $pagerRing = Read-TextValue -Label 'Pager staging ring，留空为自动 / Pager staging ring, blank for auto' -Default $pagerRing
-    $pagerRingSlots = Read-IntegerValue -Label 'Pager ring slots，留空为默认 / Pager ring slots, blank for default' -Default $pagerRingSlots -Minimum 2 -AllowBlank
-    $kvOverflow = Read-YesNo -Label '允许 KV 溢出到 RAM？/ Allow KV overflow to RAM?' -Default $kvOverflow
-    if ($kvOverflow) {
-        $kvOverflowVram = Read-IntegerValue -Label 'KV 显存上限 MiB，留空为自动 / KV VRAM ceiling MiB, blank for auto' -Default $kvOverflowVram -Minimum 1 -AllowBlank
-        $kvOverflowReserve = Read-IntegerValue -Label 'KV 之外保留 MiB，留空为自动 / Non-KV reserve MiB, blank for auto' -Default $kvOverflowReserve -Minimum 1 -AllowBlank
-    }
-}
-
 $submitMode = [string](Get-SavedValue 'submit_mode' 'auto')
 $submitCap = [string](Get-SavedValue 'submit_cap' '64')
-if ($setupMode -eq 'manual') {
-    $submitMode = Read-Choice -Label 'Submit splitter' -DefaultValue $submitMode -Options @(
-        [pscustomobject]@{ Key = '1'; Value = 'auto'; Label = '自动反馈 / Automatic feedback' }
-        [pscustomobject]@{ Key = '2'; Value = 'disabled'; Label = '禁用，no-split / Disabled, no-split' }
-        [pscustomobject]@{ Key = '3'; Value = 'fixed'; Label = '固定 cap / Fixed cap' }
-    )
-    if ($submitMode -eq 'fixed') {
-        $submitCap = Read-IntegerValue -Label '固定 dispatch cap / Fixed dispatch cap' -Default $submitCap -Minimum 1
-    }
-}
-
 $configureDiagnostics = [bool](Get-SavedValue 'configure_diagnostics' $false)
 $pagerStats = [bool](Get-SavedValue 'pager_stats' $false)
 $pagerProfile = [bool](Get-SavedValue 'pager_profile' $false)
 $stageProfile = [bool](Get-SavedValue 'stage_profile' $false)
 $vramProfile = [bool](Get-SavedValue 'vram_profile' $false)
-if ($setupMode -eq 'manual') {
-    $configureDiagnostics = Read-YesNo -Label '设置统计或 profiler？/ Configure statistics or profilers?' -Default $configureDiagnostics
-}
-if ($setupMode -eq 'manual' -and $configureDiagnostics) {
-    $pagerStats = Read-YesNo -Label '输出 pager 命中统计？/ Print pager hit statistics?' -Default $pagerStats
-    $pagerProfile = Read-YesNo -Label '启用聚合 pager profiler？/ Enable aggregate pager profiler?' -Default $pagerProfile
-    $stageProfile = Read-YesNo -Label '启用阶段计时？/ Enable stage timings?' -Default $stageProfile
-    $vramProfile = Read-YesNo -Label '输出实时显存信息？/ Print live VRAM information?' -Default $vramProfile
-}
-
 $benchKind = [string](Get-SavedValue 'bench_kind' 'decode')
 $promptTokens = [string](Get-SavedValue 'prompt_tokens' '1024')
 $genTokens = [string](Get-SavedValue 'gen_tokens' '128')
@@ -1008,7 +1023,7 @@ $reps = [string](Get-SavedValue 'reps' '1')
 $jsonOutput = [bool](Get-SavedValue 'json_output' $false)
 $thinkMode = [string](Get-SavedValue 'think_mode' 'default')
 $reasoningEffort = [string](Get-SavedValue 'reasoning_effort' 'default')
-$maxNew = [string](Get-SavedValue 'max_new' '')
+$maxNew = [string](Get-SavedValue 'max_new' '65536')
 $configureSampling = [bool](Get-SavedValue 'configure_sampling' $false)
 $temperature = [string](Get-SavedValue 'temperature' '')
 $topK = [string](Get-SavedValue 'top_k' '')
@@ -1030,9 +1045,6 @@ $serverAuth = [bool](Get-SavedValue 'server_auth' $false)
 $serverApiKey = ''
 $serverVision = [bool](Get-SavedValue 'server_vision' $false)
 $visionProjectorPath = [string](Get-SavedValue 'vision_projector' '')
-if ([string]::IsNullOrWhiteSpace($visionProjectorPath) -or -not (Test-Path -LiteralPath $visionProjectorPath -PathType Leaf)) {
-    $visionProjectorPath = Find-VisionProjectorPath -ModelPath $modelPath
-}
 $serverEmbedding = [bool](Get-SavedValue 'server_embedding' $false)
 $embeddingModelPath = [string](Get-SavedValue 'embedding_model' '')
 $embeddingIdleTimeout = [string](Get-SavedValue 'embedding_idle_timeout' '300')
@@ -1040,86 +1052,195 @@ $mtpEnabled = [bool](Get-SavedValue 'mtp_enabled' $false)
 $mtpModelPath = [string](Get-SavedValue 'mtp_model' '')
 $mtpVerifyTokens = [string](Get-SavedValue 'mtp_verify_tokens' '4')
 
-if ($launchMode -eq 'benchmark') {
-    $benchKind = Read-Choice -Label '测试类型 / Benchmark type' -DefaultValue $benchKind -Options @(
-        [pscustomobject]@{ Key = '1'; Value = 'decode'; Label = 'Decode：-p 0 -n N' }
-        [pscustomobject]@{ Key = '2'; Value = 'prefill'; Label = 'Prefill：-p N -n 0' }
-        [pscustomobject]@{ Key = '3'; Value = 'mixed'; Label = '组合轮次 / Combined turn：--pg P,G' }
-        [pscustomobject]@{ Key = '4'; Value = 'custom'; Label = '自定义 -p/-n / Custom -p/-n' }
-    )
-    switch ($benchKind) {
-        'decode' {
-            $promptTokens = '0'
-            $genTokens = Read-IntegerValue -Label 'Decode token 数 / Decode tokens' -Default $genTokens -Minimum 1
-        }
-        'prefill' {
-            $promptTokens = Read-IntegerValue -Label 'Prefill token 数 / Prefill tokens' -Default $promptTokens -Minimum 1
-            $genTokens = '0'
-        }
-        'mixed' {
-            $promptTokens = Read-IntegerValue -Label '本轮 prompt token 数 / Turn prompt tokens' -Default $promptTokens -Minimum 1
-            $genTokens = Read-IntegerValue -Label '本轮生成 token 数 / Turn generation tokens' -Default $genTokens -Minimum 1
-        }
-        'custom' {
-            $promptTokens = Read-IntegerValue -Label 'Prompt token 数 / Prompt tokens' -Default $promptTokens -Minimum 0
-            $genTokens = Read-IntegerValue -Label 'Generation token 数 / Generation tokens' -Default $genTokens -Minimum 0
-        }
-    }
-    $depthMode = Read-Choice -Label '测量前的上下文深度 / Context depth before measurement' -DefaultValue $depthMode -Options @(
-        [pscustomobject]@{ Key = '1'; Value = 'none'; Label = '无 / None' }
-        [pscustomobject]@{ Key = '2'; Value = 'real'; Label = '真实 warmup：-d / Real warmup: -d' }
-        [pscustomobject]@{ Key = '3'; Value = 'synthetic'; Label = '快速 synthetic depth / Fast synthetic depth' }
-    )
-    if ($depthMode -ne 'none') {
-        $depthTokens = Read-IntegerValue -Label '上下文深度 token 数 / Context depth tokens' -Default $depthTokens -Minimum 1
-    } else {
-        $depthTokens = '0'
-    }
-    $reps = Read-IntegerValue -Label '重复次数 / Repetitions' -Default $reps -Minimum 1
-    $jsonOutput = Read-YesNo -Label '输出 JSON？/ Emit JSON?' -Default $jsonOutput
-} else {
-    $thinkMode = Read-Choice -Label '思考模式 / Reasoning mode' -DefaultValue $thinkMode -Options @(
-        [pscustomobject]@{ Key = '1'; Value = 'default'; Label = '模型默认 / Model default' }
-        [pscustomobject]@{ Key = '2'; Value = 'think'; Label = '强制开启思考 / Force reasoning on' }
-        [pscustomobject]@{ Key = '3'; Value = 'no-think'; Label = '关闭思考 / Disable reasoning' }
-    )
-    if ($thinkMode -ne 'no-think') {
-        Write-Host 'Qwen3.8: low / medium / xhigh. Other models may support different levels or none.' -ForegroundColor DarkGray
-        $reasoningEffort = Read-Choice -Label '思考强度 / Reasoning effort' -DefaultValue $reasoningEffort -Options @(
-            [pscustomobject]@{ Key = '1'; Value = 'default'; Label = '模板默认 / Template default' }
-            [pscustomobject]@{ Key = '2'; Value = 'low'; Label = 'Low' }
-            [pscustomobject]@{ Key = '3'; Value = 'medium'; Label = 'Medium' }
-            [pscustomobject]@{ Key = '4'; Value = 'xhigh'; Label = 'Xhigh (Qwen3.8)' }
-            [pscustomobject]@{ Key = '5'; Value = 'high'; Label = 'High (only if supported by model)' }
-            [pscustomobject]@{ Key = '6'; Value = 'max'; Label = 'Max (only if supported by model)' }
-        )
-    }
-    $maxNew = Read-IntegerValue -Label '每轮最大生成 token，留空为模型默认 / Max new tokens per reply, blank for model default' -Default $maxNew -Minimum 1 -AllowBlank
-    $configureSampling = Read-YesNo -Label '设置采样参数？/ Configure sampling?' -Default $configureSampling
-    if ($configureSampling) {
-        $temperature = Read-TextValue -Label 'Temperature，留空为模型默认 / blank for model default' -Default $temperature
-        $topK = Read-IntegerValue -Label 'Top-K，留空为模型默认 / blank for model default' -Default $topK -Minimum 0 -AllowBlank
-        $topP = Read-TextValue -Label 'Top-P，留空为模型默认 / blank for model default' -Default $topP
-        $seed = Read-IntegerValue -Label '随机种子，留空为随机 / Seed, blank for random' -Default $seed -Minimum 0 -AllowBlank
-    }
+$configureThinking = [bool](Get-SavedValue 'configure_thinking' ($thinkMode -ne 'default' -or $reasoningEffort -ne 'default'))
+$cpuMissEnabled = [bool](Get-SavedValue 'cpu_miss_enabled' $false)
+$cpuMissMax = [string](Get-SavedValue 'cpu_miss_max' '1')
+$cpuMissCores = [string](Get-SavedValue 'cpu_miss_cores' '')
+$customSets = [string](Get-SavedValue 'custom_sets' '')
 
-    $mtpEnabled = Read-YesNo -Label '启用 Qwen3.8 MTP 加速？/ Enable Qwen3.8 MTP acceleration?' -Default $mtpEnabled
-    if ($mtpEnabled) {
-        Write-Host 'MTP 当前仅支持 Qwen3.8 Vulkan 和 greedy 解码；非 greedy API 请求会回退普通 decode。' -ForegroundColor Yellow
-        Write-Host 'MTP currently supports Qwen3.8 Vulkan and greedy decoding. Non-greedy API requests fall back to ordinary decode.' -ForegroundColor DarkGray
-        $mtpModelPath = Select-MtpModelPath -Default $mtpModelPath
-        $mtpVerifyTokens = Read-Choice -Label 'MTP 批量验证宽度 / MTP batched verification width' -DefaultValue $mtpVerifyTokens -Options @(
-            [pscustomobject]@{ Key = '1'; Value = '4'; Label = '4 tokens（推荐）/ 4 tokens (recommended)' }
-            [pscustomobject]@{ Key = '2'; Value = '3'; Label = '3 tokens' }
-            [pscustomobject]@{ Key = '3'; Value = '2'; Label = '2 tokens' }
-        )
-    }
+if (-not $reuseSavedSettings) {
+    $launchMode = Read-Choice -Label '你想做什么？/ What would you like to do?' -DefaultValue ([string](Get-SavedValue 'launch_mode' 'chat')) -Options @(
+        [pscustomobject]@{ Key = '1'; Value = 'chat'; Label = '实时终端对话（推荐）/ Interactive terminal chat (recommended)' }
+        [pscustomobject]@{ Key = '2'; Value = 'server'; Label = '启动 OpenAI 兼容 API / Start OpenAI-compatible API server' }
+        [pscustomobject]@{ Key = '3'; Value = 'benchmark'; Label = '性能测试 / Benchmark' }
+    )
+    $modelPath = Select-ModelPath -InitialPath $InitialModelPath
+    if ($launchMode -ne 'benchmark') {
+        $mtpEnabled = Read-YesNo -Label '启用 Qwen3.8 MTP 加速？/ Enable Qwen3.8 MTP acceleration?' -Default $mtpEnabled
+        if ($mtpEnabled) {
+            Write-Host 'MTP 当前仅支持 Qwen3.8 Vulkan 和 greedy 解码；非 greedy API 请求会回退普通 decode。' -ForegroundColor Yellow
+            Write-Host 'MTP currently supports Qwen3.8 Vulkan and greedy decoding. Non-greedy API requests fall back to ordinary decode.' -ForegroundColor DarkGray
+            $mtpModelPath = Select-MtpModelPath -Default $mtpModelPath
+            $mtpVerifyTokens = Read-Choice -Label 'MTP 批量验证宽度 / MTP batched verification width' -DefaultValue $mtpVerifyTokens -Options @(
+                [pscustomobject]@{ Key = '1'; Value = '4'; Label = '4 tokens（推荐）/ 4 tokens (recommended)' }
+                [pscustomobject]@{ Key = '2'; Value = '3'; Label = '3 tokens' }
+                [pscustomobject]@{ Key = '3'; Value = '2'; Label = '2 tokens' }
+            )
+        }
 
+    }
     if ($launchMode -eq 'server') {
-        Write-Host "`nAPI 服务器 / API server" -ForegroundColor Cyan
-        Write-Host '本机使用 127.0.0.1；局域网访问可用 0.0.0.0，但应启用 API key。' -ForegroundColor DarkGray
-        Write-Host 'Use 127.0.0.1 locally. For LAN access use 0.0.0.0 and enable an API key.' -ForegroundColor DarkGray
-        $serverAddr = Read-ListenAddress -Label '监听地址（IP:端口）/ Listen address (IP:port)' -Default $serverAddr
+        if (-not $visionProjectorPath -or -not (Test-Path -LiteralPath $visionProjectorPath -PathType Leaf)) {
+            $visionProjectorPath = Find-VisionProjectorPath -ModelPath $modelPath
+        }
+        $serverVision = Read-YesNo -Label '启用视觉图片理解？/ Enable image understanding?' -Default $serverVision
+        if ($serverVision) {
+            Write-Host '视觉权重按图片请求从 SSD 临时载入统一显存，处理完全部图片后立即释放。API 图片请使用 data URI 或 base64。' -ForegroundColor DarkGray
+            Write-Host 'Vision weights use request-scoped unified VRAM and are released after the image batch. API images must be data URIs or base64.' -ForegroundColor DarkGray
+            $visionProjectorPath = Select-VisionProjectorPath -Default $visionProjectorPath
+        }
+        $serverEmbedding = Read-YesNo -Label '同时提供 Embedding API？/ Also serve the Embedding API?' -Default $serverEmbedding
+        if ($serverEmbedding) {
+            Write-Host 'Embedding 首次请求时从 GGUF/SSD 载入统一显存；空闲超时后释放，不建立额外 RAM 权重缓存。' -ForegroundColor DarkGray
+            Write-Host 'Weights load from GGUF/SSD into unified VRAM on demand and are released after the idle timeout; no extra RAM weight cache is kept.' -ForegroundColor DarkGray
+            $embeddingModelPath = Select-EmbeddingModelPath -Default $embeddingModelPath
+            $embeddingIdleTimeout = Read-IntegerValue -Label 'Embedding 空闲释放秒数，0 为服务期间常驻 / Idle eviction seconds, 0 keeps resident' -Default $embeddingIdleTimeout -Minimum 0
+        }
+    }
+
+    $device = Read-ComputeDevice -Default $device
+    $setupMode = Read-Choice -Label '配置方式 / Configuration' -DefaultValue $setupModeDefault -Options @(
+        [pscustomobject]@{ Key = '1'; Value = 'conservative'; Label = '自动配置：保守（推荐）/ Automatic: conservative (recommended)' }
+        [pscustomobject]@{ Key = '2'; Value = 'aggressive'; Label = '自动配置：激进性能 / Automatic: aggressive performance' }
+        [pscustomobject]@{ Key = '3'; Value = 'manual'; Label = '全手动配置 / Fully manual configuration' }
+    )
+    if ($setupMode -eq 'manual') {
+        Write-Host "`n高级通用设置 / Advanced common settings" -ForegroundColor Cyan
+        Write-Host '各项留空即可继续使用引擎的硬件探测与自动预算。Leave values blank to keep engine auto-detection.' -ForegroundColor DarkGray
+        $ubatch = Read-IntegerValue -Label 'Ubatch，留空为自动 / Ubatch, blank for auto' -Default $ubatch -Minimum 1 -AllowBlank
+        $threads = Read-IntegerValue -Label 'CPU 线程，留空为全部 / CPU threads, blank for all' -Default $threads -Minimum 1 -AllowBlank
+        $configPath = Read-TextValue -Label '配置 TOML，留空使用默认查找 / Config TOML, blank for default lookup' -Default $configPath
+        if (-not [string]::IsNullOrWhiteSpace($configPath)) {
+            $configPath = ConvertTo-FullPath $configPath
+            if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
+                throw "找不到配置文件 / Config file not found: $configPath"
+            }
+        }
+
+        $kvPreset = Read-Choice -Label 'KV Cache 类型 / KV cache type' -DefaultValue $kvPreset -Options @(
+            [pscustomobject]@{ Key = '1'; Value = 'auto'; Label = '引擎自动（推荐）/ Engine default (recommended)' }
+            [pscustomobject]@{ Key = '2'; Value = 'q8'; Label = 'Q8_0 K + Q8_0 V' }
+            [pscustomobject]@{ Key = '3'; Value = 'f16'; Label = 'F16 K + F16 V' }
+            [pscustomobject]@{ Key = '4'; Value = 'custom'; Label = '分别指定 / Custom K and V' }
+        )
+        switch ($kvPreset) {
+            'q8' { $kvTypeK = 'q8_0'; $kvTypeV = 'q8_0' }
+            'f16' { $kvTypeK = 'f16'; $kvTypeV = 'f16' }
+            'custom' {
+                $kvTypeK = Read-TextValue -Label 'K cache 类型 / K cache dtype' -Default $kvTypeK -Required
+                $kvTypeV = Read-TextValue -Label 'V cache 类型 / V cache dtype' -Default $kvTypeV -Required
+            }
+        }
+
+        $configureMemory = Read-YesNo -Label '设置显存、内存和分页参数？/ Configure memory and paging?' -Default $configureMemory
+    } elseif ($setupMode -eq 'aggressive') {
+        Write-Host "`n将自动探测硬件，并减少 RAM/VRAM 保留、提高 Ubatch、探索更大的 Submit cap。" -ForegroundColor Yellow
+        Write-Host 'Hardware stays auto-detected, with tighter RAM/VRAM headroom, a larger Ubatch and a wider Submit cap search.' -ForegroundColor DarkGray
+        Write-Host '适合追求吞吐且能接受更高资源压力；启动失败或系统换页时请改用保守档。' -ForegroundColor Yellow
+        Write-Host 'Use conservative mode if allocation fails or Windows starts paging.' -ForegroundColor DarkGray
+        $kvPreset = 'q8'
+        $kvTypeK = 'q8_0'
+        $kvTypeV = 'q8_0'
+    } else {
+        Write-Host "`n将自动预算所选设备的显存和 RAM；上下文留空时由引擎自动确定。" -ForegroundColor DarkGray
+        Write-Host 'VRAM and RAM budgets use the selected device; leave context blank for engine sizing.' -ForegroundColor DarkGray
+        $kvPreset = 'q8'
+        $kvTypeK = 'q8_0'
+        $kvTypeV = 'q8_0'
+    }
+    if ($setupMode -eq 'manual' -and $configureMemory) {
+        Write-Host '大小可写 21GiB、512MiB、80%；留空表示自动。Sizes accept 21GiB, 512MiB or 80%; blank means auto.' -ForegroundColor DarkGray
+        $vramBudget = Read-TextValue -Label '总显存预算 / Total VRAM budget' -Default $vramBudget
+        $vramReserve = Read-TextValue -Label '额外显存保留 / Additional VRAM reserve' -Default $vramReserve
+        $expertCache = Read-TextValue -Label 'GPU 专家缓存 / GPU expert cache' -Default $expertCache
+        $ramBudget = Read-TextValue -Label '进程总 RAM 预算，0 为禁用 RAM tier / Total process RAM budget, 0 disables RAM tier' -Default $ramBudget
+        $hostDma = Read-YesNo -Label '启用 RAM 到 VRAM Host DMA？/ Enable RAM-to-VRAM Host DMA?' -Default $hostDma
+        $pagerRing = Read-TextValue -Label 'Pager staging ring，留空为自动 / Pager staging ring, blank for auto' -Default $pagerRing
+        $pagerRingSlots = Read-IntegerValue -Label 'Pager ring slots，留空为默认 / Pager ring slots, blank for default' -Default $pagerRingSlots -Minimum 2 -AllowBlank
+        $kvOverflow = Read-YesNo -Label '允许 KV 溢出到 RAM？/ Allow KV overflow to RAM?' -Default $kvOverflow
+        if ($kvOverflow) {
+            $kvOverflowVram = Read-IntegerValue -Label 'KV 显存上限 MiB，留空为自动 / KV VRAM ceiling MiB, blank for auto' -Default $kvOverflowVram -Minimum 1 -AllowBlank
+            $kvOverflowReserve = Read-IntegerValue -Label 'KV 之外保留 MiB，留空为自动 / Non-KV reserve MiB, blank for auto' -Default $kvOverflowReserve -Minimum 1 -AllowBlank
+        }
+    }
+    if ($setupMode -eq 'manual') {
+        $submitMode = Read-Choice -Label 'Submit splitter' -DefaultValue $submitMode -Options @(
+            [pscustomobject]@{ Key = '1'; Value = 'auto'; Label = '自动反馈 / Automatic feedback' }
+            [pscustomobject]@{ Key = '2'; Value = 'disabled'; Label = '禁用，no-split / Disabled, no-split' }
+            [pscustomobject]@{ Key = '3'; Value = 'fixed'; Label = '固定 cap / Fixed cap' }
+        )
+        if ($submitMode -eq 'fixed') {
+            $submitCap = Read-IntegerValue -Label '固定 dispatch cap / Fixed dispatch cap' -Default $submitCap -Minimum 1
+        }
+    }
+    if ($setupMode -eq 'manual') {
+        $configureDiagnostics = Read-YesNo -Label '设置统计或 profiler？/ Configure statistics or profilers?' -Default $configureDiagnostics
+    }
+    if ($setupMode -eq 'manual' -and $configureDiagnostics) {
+        $pagerStats = Read-YesNo -Label '输出 pager 命中统计？/ Print pager hit statistics?' -Default $pagerStats
+        $pagerProfile = Read-YesNo -Label '启用聚合 pager profiler？/ Enable aggregate pager profiler?' -Default $pagerProfile
+        $stageProfile = Read-YesNo -Label '启用阶段计时？/ Enable stage timings?' -Default $stageProfile
+        $vramProfile = Read-YesNo -Label '输出实时显存信息？/ Print live VRAM information?' -Default $vramProfile
+    }
+    if ($setupMode -eq 'manual') {
+        $customSets = Read-TextValue -Label '额外 --set，以分号分隔，留空为无 / Extra --set entries separated by semicolons, blank for none' -Default $customSets
+    }
+
+    if ($launchMode -ne 'benchmark') {
+        $configureThinking = Read-YesNo -Label '是否配置默认思考？/ Configure default reasoning?' -Default $configureThinking
+        if ($configureThinking) {
+            $thinkingEnabled = Read-YesNo -Label '默认开启思考？/ Enable reasoning by default?' -Default ($thinkMode -ne 'no-think')
+            $thinkMode = if ($thinkingEnabled) { 'think' } else { 'no-think' }
+            $reasoningEffort = 'default'
+            if ($thinkingEnabled) {
+                $efforts = @(Get-ModelReasoningEfforts -ModelPath $modelPath)
+                if ($efforts.Count) {
+                    $effortDefault = [string](Get-SavedValue 'reasoning_effort' 'default')
+                    if ($effortDefault -ne 'default' -and $effortDefault -notin $efforts) { $effortDefault = 'default' }
+                    $effortOptions = @([pscustomobject]@{ Key = '1'; Value = 'default'; Label = '模板默认 / Template default' })
+                    foreach ($effort in $efforts) {
+                        $effortOptions += [pscustomobject]@{ Key = ($effortOptions.Count + 1).ToString(); Value = $effort; Label = $effort }
+                    }
+                    $reasoningEffort = Read-Choice -Label '默认思考强度 / Default reasoning effort' -DefaultValue $effortDefault -Options $effortOptions
+                }
+            }
+        } else {
+            $thinkMode = 'default'
+            $reasoningEffort = 'default'
+        }
+        if (-not $maxNew) { $maxNew = '65536' }
+        $maxNew = Read-IntegerValue -Label '每轮最大生成 token（思考与正文合计）/ Max generated tokens per reply (reasoning + answer)' -Default $maxNew -Minimum 1
+        $configureSampling = Read-YesNo -Label '设置默认采样参数？/ Configure default sampling?' -Default $configureSampling
+        if ($configureSampling) {
+            $temperature = Read-TextValue -Label 'Temperature，留空为模型默认 / blank for model default' -Default $temperature
+            $topK = Read-IntegerValue -Label 'Top-K，留空为模型默认 / blank for model default' -Default $topK -Minimum 0 -AllowBlank
+            $topP = Read-TextValue -Label 'Top-P，留空为模型默认 / blank for model default' -Default $topP
+            $seed = Read-IntegerValue -Label '随机种子，留空为随机 / Seed, blank for random' -Default $seed -Minimum 0 -AllowBlank
+        }
+    }
+
+    $cpuMissEnabled = Read-YesNo -Label '启用实验性 CPU 专家 miss 计算？/ Enable experimental CPU expert-miss computation?' -Default ([bool](Get-SavedValue 'cpu_miss_enabled' $false))
+    if ($cpuMissEnabled) {
+        $cpuTopology = Get-CpuMissTopology
+        $defaultCpuMissCores = [Math]::Max(1, $cpuTopology.Preferred - 2)
+        Write-Host ('物理核心 {0}，优先性能核心 {1}；默认计算核数为 max(1, 性能物理核数 - 2) = {2}。' -f $cpuTopology.Physical, $cpuTopology.Preferred, $defaultCpuMissCores) -ForegroundColor DarkGray
+        Write-Host ('Physical cores: {0}; preferred performance cores: {1}; default compute cores: max(1, preferred - 2) = {2}.' -f $cpuTopology.Physical, $cpuTopology.Preferred, $defaultCpuMissCores) -ForegroundColor DarkGray
+        if (-not $cpuTopology.Detected) {
+            Write-Warning '未能识别大小核，默认按总物理核心计算；请确认核心数。Hybrid-core detection unavailable; confirm the compute-core count.'
+        }
+        $parsedCores = 0
+        if (-not [int]::TryParse($cpuMissCores, [ref]$parsedCores) -or $parsedCores -lt 1 -or $parsedCores -gt $cpuTopology.Physical) {
+            $cpuMissCores = $defaultCpuMissCores.ToString()
+        }
+        $parsedMissMax = 0
+        if (-not [int]::TryParse($cpuMissMax, [ref]$parsedMissMax) -or $parsedMissMax -lt 1 -or $parsedMissMax -gt 3) { $cpuMissMax = '1' }
+        $cpuMissMax = Read-IntegerValue -Label '最多交给 CPU 的 miss 数（1-3）/ Maximum CPU miss count (1-3)' -Default $cpuMissMax -Minimum 1 -Maximum 3
+        $cpuMissCores = Read-IntegerValue -Label 'CPU 计算核心数 / CPU compute cores' -Default $cpuMissCores -Minimum 1 -Maximum $cpuTopology.Physical
+        Write-Host '要求 AVX2 + FMA3、支持的量化和完整 RAM 专家缓存；超出 miss 上限或其他不支持工况自动使用 GPU。' -ForegroundColor DarkGray
+        Write-Host 'Requires AVX2 + FMA3, supported quantization and full-RAM experts; unsupported cases or larger miss sets use GPU.' -ForegroundColor DarkGray
+        Write-Host '性能收益尚未保证；2/3 miss 未做整机性能验收。Performance gains are not guaranteed; 2/3-miss model throughput is unvalidated.' -ForegroundColor Yellow
+    }
+    if ($launchMode -eq 'server') {
         if ($mtpEnabled) {
             $mtpParallelDefault = if ($serverParallel -eq '2') { '2' } else { '1' }
             $serverParallel = Read-Choice -Label 'API 并发会话数 / Concurrent API slots' -DefaultValue $mtpParallelDefault -Options @(
@@ -1137,14 +1258,16 @@ if ($launchMode -eq 'benchmark') {
         } else {
             $serverParallel = Read-IntegerValue -Label '并发会话数（每个会话有独立 KV）/ Concurrent slots (one KV cache each)' -Default $serverParallel -Minimum 1
         }
-        if ($mtpEnabled -and $serverParallel -eq '1') {
+    }
+
+    $context = Read-TextValue -Label '上下文窗口，留空为自动 / Context window, blank for auto' -Default $context
+    if ($launchMode -eq 'server') {
+        if ($mtpEnabled -and $serverParallel -eq '1' -and -not $serverVision -and -not $serverEmbedding) {
             $serverSessionCache = $false
-            Write-Host '单路 MTP 沿用串行服务，SSD 会话 KV 缓存关闭。Single-stream MTP keeps the serialized server and disables SSD session caching.' -ForegroundColor DarkGray
+            Write-Host '单路纯文本 MTP 使用串行服务，SSD 会话缓存关闭。Single-stream text-only MTP disables SSD session caching.' -ForegroundColor DarkGray
         } else {
             $serverSessionCache = Read-YesNo -Label '将闲置会话 KV 缓存到 SSD？/ Cache idle-session KV on SSD?' -Default $serverSessionCache
-            if ($serverSessionCache) {
-                Write-Host '闲置会话会在后台写入 SSD 并释放显存；再次访问时自动恢复。仅支持动态分段 Q8 KV。' -ForegroundColor DarkGray
-                Write-Host 'Idle sessions are written to SSD in the background and restored on demand. Dynamic segmented Q8 KV is required.' -ForegroundColor DarkGray
+            if ($serverSessionCache -and (Read-YesNo -Label '修改 SSD KV 缓存参数？/ Customize SSD KV cache settings?' -Default $false)) {
                 $sessionCacheDir = Read-TextValue -Label 'KV 缓存目录 / KV cache directory' -Default $sessionCacheDir -Required
                 $sessionCacheDir = ConvertTo-FullPath $sessionCacheDir
                 $sessionIdleSecs = Read-IntegerValue -Label '会话闲置多少秒后写入 SSD / Spill after idle seconds' -Default $sessionIdleSecs -Minimum 0
@@ -1152,59 +1275,63 @@ if ($launchMode -eq 'benchmark') {
                 $sessionCacheTtlHours = Read-IntegerValue -Label '缓存保留小时数，0 为不按时间清理 / Cache TTL hours, 0 disables age expiry' -Default $sessionCacheTtlHours -Minimum 0
             }
         }
-        $serverVision = Read-YesNo -Label '启用视觉图片理解？/ Enable image understanding?' -Default $serverVision
-        if ($serverVision) {
-            Write-Host '视觉权重按图片请求从 SSD 临时载入统一显存，处理完全部图片后立即释放。API 图片请使用 data URI 或 base64。' -ForegroundColor DarkGray
-            Write-Host 'Vision weights use request-scoped unified VRAM and are released after the image batch. API images must be data URIs or base64.' -ForegroundColor DarkGray
-            $visionProjectorPath = Select-VisionProjectorPath -Default $visionProjectorPath
-        }
-        $serverEmbedding = Read-YesNo -Label '同时提供 Embedding API？/ Also serve the Embedding API?' -Default $serverEmbedding
-        if ($serverEmbedding) {
-            Write-Host 'Embedding 首次请求时从 GGUF/SSD 载入统一显存；空闲超时后释放，不建立额外 RAM 权重缓存。' -ForegroundColor DarkGray
-            Write-Host 'Weights load from GGUF/SSD into unified VRAM on demand and are released after the idle timeout; no extra RAM weight cache is kept.' -ForegroundColor DarkGray
-            $embeddingModelPath = Select-EmbeddingModelPath -Default $embeddingModelPath
-            $embeddingIdleTimeout = Read-IntegerValue -Label 'Embedding 空闲释放秒数，0 为服务期间常驻 / Idle eviction seconds, 0 keeps resident' -Default $embeddingIdleTimeout -Minimum 0
-        }
+
+        Write-Host "`nAPI 服务器 / API server" -ForegroundColor Cyan
+        $serverAddr = Read-ListenAddress -Label '监听地址（IP:端口）/ Listen address (IP:port)' -Default $serverAddr
         $serverAuth = Read-YesNo -Label '启用 Bearer API key 鉴权？/ Enable Bearer API-key authentication?' -Default $serverAuth
-        if ($serverAuth) {
-            $serverApiKey = Read-SecretValue -Label 'API key（隐藏输入且不会保存）/ API key (hidden and not saved)'
-        } elseif (-not (Test-IsLoopbackAddress $serverAddr)) {
-            Write-Host '警告：该监听地址可能被其他设备访问，且当前未启用鉴权。' -ForegroundColor Yellow
-            Write-Host 'Warning: this address may be reachable by other devices and authentication is disabled.' -ForegroundColor Yellow
-            if (-not (Read-YesNo -Label '仍然继续？/ Continue anyway?' -Default $false)) {
-                exit 0
+    }
+
+    if ($launchMode -eq 'benchmark') {
+        $benchKind = Read-Choice -Label '测试类型 / Benchmark type' -DefaultValue $benchKind -Options @(
+            [pscustomobject]@{ Key = '1'; Value = 'decode'; Label = 'Decode：-p 0 -n N' }
+            [pscustomobject]@{ Key = '2'; Value = 'prefill'; Label = 'Prefill：-p N -n 0' }
+            [pscustomobject]@{ Key = '3'; Value = 'mixed'; Label = '组合轮次 / Combined turn：--pg P,G' }
+            [pscustomobject]@{ Key = '4'; Value = 'custom'; Label = '自定义 -p/-n / Custom -p/-n' }
+        )
+        switch ($benchKind) {
+            'decode' {
+                $promptTokens = '0'
+                $genTokens = Read-IntegerValue -Label 'Decode token 数 / Decode tokens' -Default $genTokens -Minimum 1
+            }
+            'prefill' {
+                $promptTokens = Read-IntegerValue -Label 'Prefill token 数 / Prefill tokens' -Default $promptTokens -Minimum 1
+                $genTokens = '0'
+            }
+            'mixed' {
+                $promptTokens = Read-IntegerValue -Label '本轮 prompt token 数 / Turn prompt tokens' -Default $promptTokens -Minimum 1
+                $genTokens = Read-IntegerValue -Label '本轮生成 token 数 / Turn generation tokens' -Default $genTokens -Minimum 1
+            }
+            'custom' {
+                $promptTokens = Read-IntegerValue -Label 'Prompt token 数 / Prompt tokens' -Default $promptTokens -Minimum 0
+                $genTokens = Read-IntegerValue -Label 'Generation token 数 / Generation tokens' -Default $genTokens -Minimum 0
             }
         }
+        $depthMode = Read-Choice -Label '测量前的上下文深度 / Context depth before measurement' -DefaultValue $depthMode -Options @(
+            [pscustomobject]@{ Key = '1'; Value = 'none'; Label = '无 / None' }
+            [pscustomobject]@{ Key = '2'; Value = 'real'; Label = '真实 warmup：-d / Real warmup: -d' }
+            [pscustomobject]@{ Key = '3'; Value = 'synthetic'; Label = '快速 synthetic depth / Fast synthetic depth' }
+        )
+        if ($depthMode -ne 'none') {
+            $depthTokens = Read-IntegerValue -Label '上下文深度 token 数 / Context depth tokens' -Default $depthTokens -Minimum 1
+        } else {
+            $depthTokens = '0'
+        }
+        $reps = Read-IntegerValue -Label '重复次数 / Repetitions' -Default $reps -Minimum 1
+        $jsonOutput = Read-YesNo -Label '输出 JSON？/ Emit JSON?' -Default $jsonOutput
     }
 }
 
-$cpuMissEnabled = Read-YesNo -Label '启用实验性 CPU 专家 miss 计算？/ Enable experimental CPU expert-miss computation?' -Default ([bool](Get-SavedValue 'cpu_miss_enabled' $false))
-$cpuMissMax = [string](Get-SavedValue 'cpu_miss_max' '1')
-$cpuMissCores = [string](Get-SavedValue 'cpu_miss_cores' '')
-if ($cpuMissEnabled) {
-    $cpuTopology = Get-CpuMissTopology
-    $defaultCpuMissCores = [Math]::Max(1, $cpuTopology.Preferred - 2)
-    Write-Host ('物理核心 {0}，优先性能核心 {1}；默认计算核数为 max(1, 性能物理核数 - 2) = {2}。' -f $cpuTopology.Physical, $cpuTopology.Preferred, $defaultCpuMissCores) -ForegroundColor DarkGray
-    Write-Host ('Physical cores: {0}; preferred performance cores: {1}; default compute cores: max(1, preferred - 2) = {2}.' -f $cpuTopology.Physical, $cpuTopology.Preferred, $defaultCpuMissCores) -ForegroundColor DarkGray
-    if (-not $cpuTopology.Detected) {
-        Write-Warning '未能识别大小核，默认按总物理核心计算；请确认核心数。Hybrid-core detection unavailable; confirm the compute-core count.'
-    }
-    $parsedCores = 0
-    if (-not [int]::TryParse($cpuMissCores, [ref]$parsedCores) -or $parsedCores -lt 1 -or $parsedCores -gt $cpuTopology.Physical) {
-        $cpuMissCores = $defaultCpuMissCores.ToString()
-    }
-    $parsedMissMax = 0
-    if (-not [int]::TryParse($cpuMissMax, [ref]$parsedMissMax) -or $parsedMissMax -lt 1 -or $parsedMissMax -gt 3) { $cpuMissMax = '1' }
-    $cpuMissMax = Read-IntegerValue -Label '最多交给 CPU 的 miss 数（1-3）/ Maximum CPU miss count (1-3)' -Default $cpuMissMax -Minimum 1 -Maximum 3
-    $cpuMissCores = Read-IntegerValue -Label 'CPU 计算核心数 / CPU compute cores' -Default $cpuMissCores -Minimum 1 -Maximum $cpuTopology.Physical
-    Write-Host '要求 AVX2 + FMA3、支持的量化和完整 RAM 专家缓存；超出 miss 上限或其他不支持工况自动使用 GPU。' -ForegroundColor DarkGray
-    Write-Host 'Requires AVX2 + FMA3, supported quantization and full-RAM experts; unsupported cases or larger miss sets use GPU.' -ForegroundColor DarkGray
-    Write-Host '性能收益尚未保证；2/3 miss 未做整机性能验收。Performance gains are not guaranteed; 2/3-miss model throughput is unvalidated.' -ForegroundColor Yellow
+if ($mtpEnabled -and $launchMode -ne 'benchmark' -and $device -and $device -notmatch '^Vulkan') {
+    throw 'Qwen3.8 MTP 需要 Vulkan 设备。Qwen3.8 MTP requires a Vulkan device.'
 }
-
-$customSets = [string](Get-SavedValue 'custom_sets' '')
-if ($setupMode -eq 'manual') {
-    $customSets = Read-TextValue -Label '额外 --set，以分号分隔，留空为无 / Extra --set entries separated by semicolons, blank for none' -Default $customSets
+if ($launchMode -eq 'server') {
+    if ($serverAuth) {
+        $serverApiKey = Read-SecretValue -Label 'API key（隐藏输入且不会保存）/ API key (hidden and not saved)'
+    } elseif (-not (Test-IsLoopbackAddress $serverAddr)) {
+        Write-Host '警告：该监听地址可能被其他设备访问，且当前未启用鉴权。' -ForegroundColor Yellow
+        Write-Host 'Warning: this address may be reachable by other devices and authentication is disabled.' -ForegroundColor Yellow
+        if (-not (Read-YesNo -Label '仍然继续？/ Continue anyway?' -Default $false)) { exit 0 }
+    }
 }
 
 $nativeArgs = [System.Collections.Generic.List[string]]::new()
@@ -1360,7 +1487,8 @@ $state = [ordered]@{
     pager_profile = $pagerProfile; stage_profile = $stageProfile; vram_profile = $vramProfile
     bench_kind = $benchKind; prompt_tokens = $promptTokens; gen_tokens = $genTokens
     depth_mode = $depthMode; depth_tokens = $depthTokens; reps = $reps; json_output = $jsonOutput
-    think_mode = $thinkMode; max_new = $maxNew; configure_sampling = $configureSampling
+    think_mode = $thinkMode; configure_thinking = $configureThinking
+    max_new = $maxNew; configure_sampling = $configureSampling
     reasoning_effort = $reasoningEffort
     temperature = $temperature; top_k = $topK; top_p = $topP; seed = $seed
     server_addr = $serverAddr; server_parallel = $serverParallel; server_auth = $serverAuth
@@ -1374,25 +1502,23 @@ $state = [ordered]@{
     cpu_miss_enabled = $cpuMissEnabled; cpu_miss_max = $cpuMissMax; cpu_miss_cores = $cpuMissCores
     custom_sets = $customSets; last_command = $commandText
 }
-New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
-$state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statePath -Encoding UTF8
-
 Write-Host "`n最终命令 / Final command" -ForegroundColor Green
 Write-Host $commandText -ForegroundColor White
 if ($launchMode -eq 'server' -and $serverAuth) {
     Write-Host 'API key 将通过当前子进程环境传入，未显示在命令中，也不会保存。' -ForegroundColor DarkGray
     Write-Host 'The API key is passed through the child-process environment; it is hidden above and not saved.' -ForegroundColor DarkGray
 }
+$startLabel = if ($launchMode -eq 'server') { '现在启动服务器？/ Start the server now?' } else { '现在启动？/ Start now?' }
+if (-not $DryRun -and -not $reuseSavedSettings -and -not (Read-YesNo -Label $startLabel -Default $true)) {
+    exit 0
+}
+New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
+$state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statePath -Encoding UTF8
 Write-Host "`n设置已保存 / Settings saved: $statePath" -ForegroundColor DarkGray
 if ($DryRun) {
     Write-Host 'DryRun：未启动。DryRun: command was not started.' -ForegroundColor Yellow
     exit 0
 }
-$startLabel = if ($launchMode -eq 'server') { '现在启动服务器？/ Start the server now?' } else { '现在启动？/ Start now?' }
-if (-not (Read-YesNo -Label $startLabel -Default $true)) {
-    exit 0
-}
-
 if ($launchMode -eq 'server') {
     $clientAddress = Get-ClientAddress $serverAddr
     Write-Host "`nAPI 地址 / API base URL: http://$clientAddress/v1" -ForegroundColor Cyan
