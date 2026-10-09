@@ -303,6 +303,8 @@ knobs! {
     "INFR_NO_MTP_DRAFT_CHAIN" => "spec.mtp_draft_chain", PresenceInv, Ignored, "1",         migrated;
     "INFR_NO_MTP_PLE_OVERLAP" => "spec.mtp_ple_overlap", PresenceInv, Ignored, "1",         migrated;
     "INFR_NO_MTP_ADAPTIVE_WIDTH" => "spec.mtp_adaptive_width", PresenceInv, Ignored, "1",   migrated;
+    "INFR_MTP_AUTO_OFF" => "spec.mtp_auto_off", Presence, Ignored, "1",                     migrated;
+    "INFR_MTP_PLAIN_BASELINE" => "spec.mtp_plain_baseline", Float, Ignored, "40",           migrated;
     "INFR_SPEC_DRAFT"         => "spec.draft",           Path,        Ignored, "/tmp/d.gguf", migrated;
     "INFR_SPEC_K"             => "spec.k",               Int,         Ignored, "4",         migrated;
     "INFR_SPEC_DEBUG"         => "spec.debug",           Presence,    Ignored, "1",         migrated;

@@ -65,6 +65,21 @@ pub(crate) fn select_verify_width(
     best
 }
 
+/// Whether the auto-off gate should trip after a calibration (issue #70 §7 follow-up).
+///
+/// `pred_rate` is the selected width's predicted tokens/second. `floor_rate` is the in-loop
+/// no-speculation floor: the affine cost fit extrapolated to a single VERIFY row (`1 / T(1)`),
+/// which is an UPPER bound on ordinary decode's rate because the MTP loop's one-row forward still
+/// pays the delta-trace arm/restore/snapshot overhead. Without an external measurement the gate
+/// only trips when MTP loses even to that pessimistic floor — a false-negative-safe rule: it can
+/// keep a losing MTP on, but never switches off a winning one. `external` (from
+/// `spec.mtp_plain_baseline`, measured ordinary decode) replaces the floor with the true number.
+/// The 5% margin stops a coin-flip calibration from flapping the path across turns.
+pub(crate) fn auto_off_fires(pred_rate: f64, floor_rate: f64, external: Option<f64>) -> bool {
+    let baseline = external.unwrap_or(floor_rate);
+    baseline > 0.0 && pred_rate < baseline * 0.95
+}
+
 fn generation_budget(prompt_rows: usize, requested: usize, max_ctx: usize) -> Result<usize> {
     let reserved = prompt_rows
         .checked_add(DRAFT_TOKENS)
@@ -2313,6 +2328,10 @@ pub(crate) struct Qwen4MtpRuntime {
     head: Qwen4MtpSession,
     trunk: Option<crate::seam::SeamKv>,
     max_ctx: usize,
+    /// Set once by the width calibration when it predicts ordinary decode beats MTP for THIS
+    /// draft head (issue #70 §7 follow-up). Lives on the runtime, which `DenseSeamChat` keeps
+    /// across turns, so the first long turn calibrates and later turns skip the MTP path entirely.
+    auto_off: bool,
 }
 
 impl Qwen4MtpRuntime {
@@ -2335,7 +2354,13 @@ impl Qwen4MtpRuntime {
             head,
             trunk: None,
             max_ctx,
+            auto_off: false,
         })
+    }
+
+    /// Whether the calibration on an earlier turn decided MTP loses to ordinary decode here.
+    pub(crate) fn auto_off(&self) -> bool {
+        self.auto_off
     }
 
     pub(crate) fn reset(&mut self) {
@@ -2453,6 +2478,11 @@ impl Qwen4MtpRuntime {
         let mut calib_probe_n = 0usize;
         let mut calib_two_secs = 0.0f64;
         let mut calib_two_n = 0usize;
+        // Draft + arm time sampled across BOTH calibration arms: the auto-off floor subtracts them
+        // from the fit's T(1), because a one-row cycle would run neither, and ordinary decode
+        // runs neither at all.
+        let mut calib_overhead_secs = 0.0f64;
+        let mut calib_overhead_n = 0usize;
         let t_decode = std::time::Instant::now();
         let hit_eos = |token: u32| {
             !ec.sampling.ignore_eos && (cfg.eos_ids.contains(&token) || token == cfg.eos)
@@ -2499,10 +2529,12 @@ impl Qwen4MtpRuntime {
             feed.extend_from_slice(&committed);
             feed.push(pending_token);
             feed.extend_from_slice(&candidates[..verify_tokens - 1]);
+            let t_arm = std::time::Instant::now();
             self.trunk
                 .as_mut()
                 .expect("target trunk remains initialized")
                 .mtp_arm_delta_trace(verify_tokens)?;
+            let arm_secs = t_arm.elapsed().as_secs_f64();
             let t_verify = std::time::Instant::now();
             let verify_profile = PhaseProfile::new("verify");
             let (target_bind, finish_fixed_allocations) = crate::seam::vulkan_moe_binder(
@@ -2580,12 +2612,14 @@ impl Qwen4MtpRuntime {
             committed.extend_from_slice(new_tokens);
             pending_token = verify_ids[accepted - 1];
             pending_h = verify_h[(accepted - 1) * h_width..accepted * h_width].to_vec();
+            let t_snapshot = std::time::Instant::now();
             let snapshot_profile = PhaseProfile::new("snapshot");
             self.trunk
                 .as_mut()
                 .expect("target trunk remains initialized")
                 .mtp_snapshot_delta(vk, cfg)?;
             drop(snapshot_profile);
+            let snapshot_secs = t_snapshot.elapsed().as_secs_f64();
             let emitted = new_tokens.to_vec();
             let catchup_secs = t_catchup.elapsed().as_secs_f64();
             timing.catchup_secs += catchup_secs;
@@ -2601,22 +2635,30 @@ impl Qwen4MtpRuntime {
             }
             if calibrating {
                 let cycle_secs = draft_secs + verify_secs + catchup_secs;
-                if cycle > MTP_CALIB_WARMUP && cycle <= MTP_CALIB_WARMUP + MTP_CALIB_CYCLES {
+                let in_probe =
+                    cycle > MTP_CALIB_WARMUP && cycle <= MTP_CALIB_WARMUP + MTP_CALIB_CYCLES;
+                let in_two = cycle > 2 * MTP_CALIB_WARMUP + MTP_CALIB_CYCLES
+                    && cycle <= 2 * MTP_CALIB_WARMUP + 2 * MTP_CALIB_CYCLES;
+                if in_probe {
                     calib_hist[accepted_spec] += 1;
                     calib_probe_secs += cycle_secs;
                     calib_probe_n += 1;
-                } else if cycle > 2 * MTP_CALIB_WARMUP + MTP_CALIB_CYCLES
-                    && cycle <= 2 * MTP_CALIB_WARMUP + 2 * MTP_CALIB_CYCLES
-                {
+                } else if in_two {
                     calib_two_secs += cycle_secs;
                     calib_two_n += 1;
                 }
+                if in_probe || in_two {
+                    calib_overhead_secs += draft_secs + arm_secs + snapshot_secs;
+                    calib_overhead_n += 1;
+                }
                 if cycle >= 2 * MTP_CALIB_WARMUP + 2 * MTP_CALIB_CYCLES {
+                    let t_probe = calib_probe_secs / calib_probe_n.max(1) as f64;
+                    let t_two = calib_two_secs / calib_two_n.max(1) as f64;
                     let (selected, pred_committed, pred_rate) = select_verify_width(
                         &calib_hist,
                         calib_probe_n,
-                        calib_probe_secs / calib_probe_n.max(1) as f64,
-                        calib_two_secs / calib_two_n.max(1) as f64,
+                        t_probe,
+                        t_two,
                         probe_width,
                     );
                     verify_tokens = selected;
@@ -2625,11 +2667,44 @@ impl Qwen4MtpRuntime {
                         "[qwen4 mtp adaptive] probe={probe_width} selected={selected} \
                          (predicted {pred_committed:.2} tok/cycle @ {pred_rate:.1} tok/s); \
                          T(probe)={:.1}ms T(2)={:.1}ms over {}/{} cycles",
-                        1e3 * calib_probe_secs / calib_probe_n.max(1) as f64,
-                        1e3 * calib_two_secs / calib_two_n.max(1) as f64,
+                        1e3 * t_probe,
+                        1e3 * t_two,
                         calib_probe_n,
                         calib_two_n,
                     );
+                    // Auto-off gate (issue #70 §7 follow-up): the same fit extrapolated to one
+                    // VERIFY row, minus the speculation-only work a plain step never runs (draft
+                    // head, delta-trace arm, snapshot), is the in-loop no-speculation floor. If
+                    // the selected arm cannot beat it (or the externally measured ordinary decode,
+                    // when supplied), the head is too weak to pay for speculation; remember it and
+                    // let later turns take the ordinary path. This turn keeps running — exiting
+                    // mid-turn would re-prime the prompt for no gain.
+                    if ec.spec.mtp_auto_off && !self.auto_off {
+                        let marginal = if probe_width > 2 {
+                            (t_probe - t_two) / (probe_width - 2) as f64
+                        } else {
+                            0.0
+                        };
+                        let overhead = calib_overhead_secs / calib_overhead_n.max(1) as f64;
+                        let floor_secs = (t_two - marginal - overhead).max(1e-6);
+                        let floor_rate = 1.0 / floor_secs;
+                        if auto_off_fires(
+                            pred_rate,
+                            floor_rate,
+                            ec.spec.mtp_plain_baseline.map(f64::from),
+                        ) {
+                            self.auto_off = true;
+                            tracing::info!(
+                                "[qwen4 mtp auto-off] predicted {pred_rate:.1} tok/s loses to the \
+                                 no-speculation floor {:.1} tok/s (external baseline {:?}); the \
+                                 head is too weak to pay for speculation (telemetry-only — \
+                                 switching later turns to ordinary decode needs single-backend \
+                                 reuse, not yet wired)",
+                                floor_rate,
+                                ec.spec.mtp_plain_baseline,
+                            );
+                        }
+                    }
                 }
             }
             for token in emitted {
@@ -2684,7 +2759,7 @@ impl Qwen4MtpRuntime {
 #[cfg(test)]
 mod tests {
     use super::{
-        generation_budget, hidden_shift_copy_lengths, mtp_kv_spec, push_bounded,
+        auto_off_fires, generation_budget, hidden_shift_copy_lengths, mtp_kv_spec, push_bounded,
         select_verify_width, DeviceCatchPlanKey,
     };
     use infr_core::tensor::DType;
@@ -2711,6 +2786,27 @@ mod tests {
         assert_eq!(w, 4);
         assert!((committed - 4.0).abs() < 1e-9);
         assert!((rate - 4.0 / 68.8e-3).abs() < 1e-6);
+    }
+
+    /// The Flash-Next numbers: the fit's T(1) = 45.0 - 11.9 = 33.1 ms, minus ~8 ms of
+    /// speculation-only work (draft + arm + snapshot), floors ordinary decode at ~39.8 tok/s. The
+    /// weak head's selected arm predicts 36.3, which loses even after the 5% margin, so the gate
+    /// must trip. A strong head at 58 tok/s must not.
+    #[test]
+    fn auto_off_trips_for_a_weak_head_and_holds_for_a_strong_one() {
+        let t_probe = 68.8e-3f64;
+        let t_two = 45.0e-3f64;
+        let marginal = (t_probe - t_two) / 2.0;
+        let overhead = 8.0e-3f64;
+        let floor_rate = 1.0 / (t_two - marginal - overhead);
+        assert!((floor_rate - 39.8).abs() < 0.5);
+        assert!(auto_off_fires(36.3, floor_rate, None));
+        assert!(!auto_off_fires(58.1, floor_rate, None));
+        // A coin-flip inside the 5% margin must not flap the path.
+        assert!(!auto_off_fires(floor_rate * 0.97, floor_rate, None));
+        // An external baseline replaces the floor when supplied.
+        assert!(auto_off_fires(36.3, 100.0, Some(41.7)));
+        assert!(!auto_off_fires(36.3, 100.0, Some(30.0)));
     }
 
     /// Degenerate calibration input (no samples, a probe-only width, or non-positive timings) must

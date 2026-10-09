@@ -643,6 +643,16 @@ cfg_struct! {
         /// `INFR_NO_MTP_ADAPTIVE_WIDTH` (inverted): calibrate the Qwen3.8 MTP VERIFY width at
         /// runtime and lock the throughput-optimal one instead of the configured `spec.k`.
         mtp_adaptive_width: bool = true,
+        /// `INFR_MTP_AUTO_OFF` (opt-in): when the width calibration predicts MTP cannot beat
+        /// ordinary decode for this draft head, LOG that the head is too weak to pay for
+        /// speculation. Actually switching later turns to ordinary decode is NOT yet wired — the
+        /// ordinary path builds its own `VulkanBackend` and double-loads the weights, so a real
+        /// switch-off needs single-backend reuse first. Until then this only reports the verdict.
+        mtp_auto_off: bool = false,
+        /// `INFR_MTP_PLAIN_BASELINE`: measured ordinary-decode tokens/second. The auto-off gate
+        /// compares the calibrated MTP throughput against this number; unset, the gate only fires
+        /// when MTP loses to its own no-speculation floor.
+        mtp_plain_baseline: Option<f32> = None,
         /// `INFR_SPEC_DRAFT`: draft-model path.
         draft: Option<PathBuf> = None,
         /// `INFR_SPEC_K`: draft-length upper bound.
