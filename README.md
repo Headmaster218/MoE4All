@@ -25,7 +25,8 @@ Windows 免安装，程序 13 MiB。下载 GGUF、选择自动配置，即可本
 ### 1. 下载程序
 
 打开 [MoE4All Releases](https://github.com/Headmaster218/MoE4All/releases)，
-下载对应版本的 `MoE4All-Windows-x86_64-v*.zip`。本页速度表是 **0.8.0** 历史实测；当前文档与源码事实以 **0.9.0** tag 为准。
+下载对应版本的 `MoE4All-Windows-x86_64-v*.zip`。顶部速度表是 **0.8.0** 历史实测；
+下方另有 **2026-10-09** 的并发实测。技术文档的源码范围仍以 **0.9.0** tag 为准。
 
 
 ### 2. 解压
@@ -63,6 +64,52 @@ Flash-Next 启动时选择第一片：`Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-
 0.9.0 已支持服务端 Vision 与 MTP 组合，组合能力和限制见[模型能力矩阵](documentation/reference/model-capabilities.md)。API 默认地址为 `http://127.0.0.1:8080/v1`；请求示例见[API 使用](documentation/guide/serving/api-quickstart.md)，完整配置项见[配置参考](documentation/reference/configuration.md)。
 
 ## 实测结果
+
+### 2026-10-09：Flash-Next，30K / 150K 与 1 / 2 / 3 路并发
+
+本组来自升级到 0.10.0 前的 **0.9.0 本地服务**，不是 0.10.0 重跑结果。
+硬件为 RX 7900 XTX 24 GiB、Ryzen 5 5600X、64 GiB DDR4、Windows 11；
+模型为 `Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64`。
+使用自动激进配置、Q8 K/V、`ctx=163840`，配置三个槽位，分别同时占用 1 / 2 / 3 槽；
+**MTP 与 CPU miss 均关闭**，greedy、关闭思考，各路使用不同的长技术背景提示词。
+
+速度单位均为 tok/s。Prefill 为首轮所有请求均未命中 KV 时的组吞吐：总输入 token
+除以最后一路完成 Prefill 的组阶段耗时，包含调度和等待，不是各路速度相加。
+Decode 为随后复用 KV 的三轮均值，每轮各路生成 512 token；总速是各路 API 最终
+`predicted_per_second` 之和，**不是终端瞬时值**。多个大 Prefill 按顺序完成，然后并发 Decode。
+
+| 每路输入 | 同时生成路数 | 冷 Prefill 总速 | Decode 总速 | Decode 每路约 |
+| --- | ---: | ---: | ---: | ---: |
+| 30K | 1 | 1,093 | **42.8** | 42.8 |
+| 30K | 2 | 960 | **59.7** | 29.9 |
+| 30K | 3 | 1,033 | **70.2** | 23.4 |
+| 150K | 1 | 752 | **39.5** | 39.5 |
+| 150K | 2 | 958 | **48.1** | 24.0 |
+| 150K | 3 | 1,049 | **40.4** | 13.5 |
+
+服务未在各组间重启，结果也反映了空闲槽的 KV 驻留和 SSD 写回影响：
+150K 单路首次只有一条专家 Prefill lane，释放其他空闲槽后，另组完整 Prefill 达到
+**1,313–1,316 tok/s**。30K 双路记录含一次约 1 秒暂停；150K 三路 Decode 三轮为
+**37.6–43.1 tok/s**。这些是有限轮次的服务实测，不是隔离 kernel 跑分或长期稳定性保证。
+
+<details>
+<summary>相同与不同提示词对并发 Decode 的影响</summary>
+
+另两组对照都使用 greedy、关闭思考，各取三轮 KV 复用后的均值。
+不同提示词组使用三个技术主题；相同提示词组的完整输入、seed 和生成结果均相同。
+以下仍为 Decode **总速**，单位 tok/s，不应把相同输出的最佳吞吐当作任意 Agent 任务速度。
+
+| 每路输入 | 同时生成路数 | 不同提示词 | 完全相同提示词 |
+| --- | ---: | ---: | ---: |
+| 30K | 2 | 61.5 | **69.9** |
+| 30K | 3 | 69.5 | **84.9** |
+| 150K | 2 | 48.6 | **59.8** |
+| 150K | 3 | 44.5 | **64.4** |
+
+这是独立的提示词对照组，与上表的全冷 Prefill 组不混算；相同提示词也不代表并发首轮
+一定只需做一次 Prefill。
+
+</details>
 
 ### 0.8.0：Qwen3.8-Flash-Next，20K 与 150K 输入对照
 
@@ -170,6 +217,8 @@ Prompt 为实际输入 token 数；Prefill 与 Decode 的单位均为 tok/s。
 - **长上下文**：支持量化 KV Cache、KV 溢出和长上下文性能测试。
 - **Qwen3.8 MTP（0.8.0 预览）**：可选的单路投机解码，收益取决于草稿接受率，
   使用方式见[快速使用](#快速使用)。
+- **实验性 CPU miss 计算**：默认关闭，支持 AVX2 + FMA3 CPU；Ryzen 5 5600X 使用
+  4 核处理 1 miss 时，端到端速度与 GPU 路径基本相同，更强 CPU 可能提速，需本机实测。
 - **可测量、可调试**：内置 prefill/decode benchmark、synthetic depth 和分页
   统计工具。
 

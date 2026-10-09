@@ -28,9 +28,10 @@ per-segment results.
 ### 1. Download the program
 
 Open [MoE4All Releases](https://github.com/Headmaster218/MoE4All/releases) and
-download the matching `MoE4All-Windows-x86_64-v*.zip`. The speed table on this
-page is historical **0.8.0** evidence; current source and architecture facts in
-the documentation are pinned to the **0.9.0** tag.
+download the matching `MoE4All-Windows-x86_64-v*.zip`. The top speed table is
+historical **0.8.0** evidence; the results below also include concurrency tests
+from **2026-10-09**. The technical documentation's source scope remains pinned
+to the **0.9.0** tag.
 
 ### 2. Extract it
 
@@ -78,6 +79,63 @@ Version 0.9.0 also supports Vision and MTP together; see the [capability matrix]
 [configuration reference](documentation/reference/configuration.md) for all available settings.
 
 ## Measured results
+
+### 2026-10-09: Flash-Next, 30K / 150K and 1 / 2 / 3 active streams
+
+These measurements used the local **0.9.0 service before the 0.10.0 upgrade**;
+they are not a new 0.10.0 benchmark. Hardware: RX 7900 XTX 24 GiB, Ryzen 5 5600X,
+64 GiB DDR4, Windows 11. Model: `Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64`.
+The service used the automatic aggressive profile, Q8 K/V, `ctx=163840`, and
+three configured slots with 1 / 2 / 3 simultaneously active. **MTP and CPU miss
+offload were disabled.** Sampling was greedy with thinking off, and each lane
+received a different long technical-background prompt.
+
+All speeds are tok/s. Cold Prefill is the first-round group throughput with no
+KV hits on any request: total input tokens divided by the group phase through
+the last lane's Prefill completion. It includes scheduling and waiting; it is
+not a sum of lane rates. Decode averages three subsequent KV-reuse rounds,
+each generating 512 tokens per lane. Total Decode sums the final API
+`predicted_per_second` rates, **not terminal instantaneous rates**. Large
+Prefills run sequentially, followed by concurrent Decode.
+
+| Input per lane | Active streams | Cold Prefill total | Decode total | Approx. Decode per lane |
+| --- | ---: | ---: | ---: | ---: |
+| 30K | 1 | 1,093 | **42.8** | 42.8 |
+| 30K | 2 | 960 | **59.7** | 29.9 |
+| 30K | 3 | 1,033 | **70.2** | 23.4 |
+| 150K | 1 | 752 | **39.5** | 39.5 |
+| 150K | 2 | 958 | **48.1** | 24.0 |
+| 150K | 3 | 1,049 | **40.4** | 13.5 |
+
+The service was not restarted between cells, so resident idle-slot KV and SSD
+spill also affect these results. The first 150K single-stream Prefill had only
+one expert Prefill lane; after other idle slots were released, separate full
+Prefills reached **1,313-1,316 tok/s**. The 30K two-stream measurements include
+one approximately one-second pause; 150K three-stream Decode ranged from
+**37.6 to 43.1 tok/s** across its three rounds. This is a finite live-service
+test, not an isolated kernel benchmark or a long-term stability guarantee.
+
+<details>
+<summary>Identical versus different prompts in concurrent Decode</summary>
+
+Two separate control suites also used greedy sampling with thinking off and
+averaged three KV-reuse rounds. Different prompts cover three technical topics;
+identical prompts use the same complete input, seed, and generated output.
+The following rates are still **total Decode** in tok/s. Identical-output peak
+throughput should not be treated as general Agent-workload performance.
+
+| Input per lane | Active streams | Different prompts | Identical complete prompts |
+| --- | ---: | ---: | ---: |
+| 30K | 2 | 61.5 | **69.9** |
+| 30K | 3 | 69.5 | **84.9** |
+| 150K | 2 | 48.6 | **59.8** |
+| 150K | 3 | 44.5 | **64.4** |
+
+These are independent prompt-control suites, not pooled with the all-cold
+Prefill suite above. Identical prompts do not guarantee that concurrent first
+requests require only one Prefill.
+
+</details>
 
 ### 0.8.0: Qwen3.8-Flash-Next, 20K versus 150K input
 
@@ -198,6 +256,9 @@ context, automatic profile or launch command, and Prefill/Decode speeds.
   performance tests.
 - **Qwen3.8 MTP (0.8.0 preview):** optional single-stream speculative decoding;
   gains depend on draft acceptance. Setup is covered in [Quick start](#quick-start).
+- **Experimental CPU miss offload:** disabled by default, requiring AVX2 + FMA3.
+  On a Ryzen 5 5600X, four cores handling one miss delivered roughly the same
+  end-to-end speed as the GPU path. A stronger CPU may help; benchmark locally.
 - **Measurement and diagnostics:** built-in prefill/decode benchmarks, synthetic
   depth, and paging statistics.
 
