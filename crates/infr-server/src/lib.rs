@@ -33,7 +33,7 @@ use std::{
 };
 
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -54,6 +54,8 @@ const SSE_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const SSE_KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(25);
 
 mod responses;
+
+const REQUEST_BODY_LIMIT: usize = 64 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Coordinated terminal output
@@ -2242,6 +2244,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(chat_completions_handler))
         .route("/v1/responses", post(responses::handler))
         .route("/v1/embeddings", post(embeddings_handler))
+        .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT))
         .with_state(state)
 }
 
@@ -2419,7 +2422,7 @@ async fn embeddings_handler(
     }
     let Json(req) = match body {
         Ok(j) => j,
-        Err(e) => return param_error(None, e.body_text()),
+        Err(e) => return json_body_error(e),
     };
     if !matches!(req.encoding_format.as_deref(), None | Some("float")) {
         return param_error(
@@ -2512,7 +2515,7 @@ async fn chat_completions_handler(
     // Malformed JSON / wrong types: an OpenAI-shaped 400, not axum's default 422 text body.
     let Json(req) = match body {
         Ok(j) => j,
-        Err(e) => return param_error(None, e.body_text()),
+        Err(e) => return json_body_error(e),
     };
     dispatch_chat(state, req, "/v1/chat/completions").await
 }
@@ -3292,6 +3295,21 @@ fn param_error(param: Option<&str>, msg: String) -> Response {
     (StatusCode::BAD_REQUEST, Json(body)).into_response()
 }
 
+fn json_body_error(error: axum::extract::rejection::JsonRejection) -> Response {
+    if error.status() != StatusCode::PAYLOAD_TOO_LARGE {
+        return param_error(None, error.body_text());
+    }
+    let mut response = param_error(
+        None,
+        format!(
+            "Request body exceeds the {} MiB limit",
+            REQUEST_BODY_LIMIT / (1024 * 1024)
+        ),
+    );
+    *response.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
+    response
+}
+
 /// Process-monotonic tie-breaker so two requests in the SAME millisecond (routine under
 /// `--parallel N`) never mint the same completion `id` — which also keeps the derived
 /// `call_{cid}_{idx}` tool-call ids unique (audit finding 4).
@@ -3576,6 +3594,95 @@ mod tests {
             "test-model",
             Arc::new(Config::default()),
         ))
+    }
+
+    const BODY_LIMIT_REQUESTS: [(&str, &str); 3] = [
+        (
+            "/v1/chat/completions",
+            r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        ("/v1/responses", r#"{"model":"test-model","input":"hi"}"#),
+        ("/v1/embeddings", r#"{"model":"test-model","input":"hi"}"#),
+    ];
+
+    #[tokio::test]
+    async fn request_body_limit_accepts_large_json_and_exact_boundary() {
+        for size in [2 * 1024 * 1024 + 1, REQUEST_BODY_LIMIT] {
+            for (path, json) in BODY_LIMIT_REQUESTS {
+                let mut body = json.as_bytes().to_vec();
+                body.resize(size, b' ');
+                let mut state = AppState::headless("test-model", Arc::new(Config::default()));
+                state.models = Arc::new(Vec::new());
+                let response = build_router(state)
+                    .oneshot(
+                        Request::post(path)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                // Headless routing proves JSON extraction succeeded without invoking a model.
+                assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}: {size}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn request_body_limit_rejects_chunked_boundary_plus_one_with_413() {
+        use axum::body::Bytes;
+        use futures_util::{stream, StreamExt};
+
+        for (path, json) in BODY_LIMIT_REQUESTS {
+            let chunk = Bytes::from(vec![b' '; 1024 * 1024]);
+            let remaining = REQUEST_BODY_LIMIT + 1 - json.len();
+            let full_chunks = remaining / chunk.len();
+            let tail = chunk.slice(..remaining % chunk.len());
+            let chunks = stream::iter(
+                std::iter::once(Bytes::from_static(json.as_bytes()))
+                    .chain(std::iter::repeat_n(chunk, full_chunks))
+                    .chain(std::iter::once(tail)),
+            )
+            .map(Ok::<_, io::Error>);
+            let response = test_router()
+                .oneshot(
+                    Request::post(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from_stream(chunks))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+            let body = body_json(response).await;
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            assert_eq!(body["error"]["param"], serde_json::Value::Null);
+            assert_eq!(body["error"]["code"], serde_json::Value::Null);
+            assert!(body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("64 MiB"));
+        }
+    }
+
+    #[tokio::test]
+    async fn request_body_limit_preserves_malformed_json_400() {
+        for (path, _) in BODY_LIMIT_REQUESTS {
+            let response = test_router()
+                .oneshot(
+                    Request::post(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            assert_eq!(
+                body_json(response).await["error"]["type"],
+                "invalid_request_error"
+            );
+        }
     }
 
     #[test]
