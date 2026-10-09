@@ -901,7 +901,7 @@ fn next_req_id() -> u64 {
 /// additions to these counters. Presentation state is protected by a separate per-request mutex,
 /// never by a global lock shared between generations.
 ///
-/// The four `interval_*` counters are DRAINED (swapped to zero) by each report, which is what makes
+/// The `interval_*` counters are DRAINED (swapped to zero) by each report, which is what makes
 /// the reported numbers cover the interval rather than the process lifetime. There is deliberately
 /// no cumulative total kept alongside them: a total nobody drains is the thing that silently turns
 /// a rate into an average-since-boot.
@@ -910,6 +910,9 @@ struct ServeStats {
     /// Prompt tokens PREFILLED in this interval. Exact runners add completed chunks live; legacy
     /// generators without progress callbacks fold the authoritative count at completion.
     interval_prompt_tokens: AtomicU64,
+    /// Prompt tokens without live chunk callbacks, including embeddings. These retain interval
+    /// display rates while progress-aware Prefill uses its measured chunk timings.
+    interval_legacy_prompt_tokens: AtomicU64,
     /// Tokens GENERATED in this interval, live. Exact runners add model tokens directly, including
     /// reasoning tokens. Legacy generators count text deltas and reconcile at completion against
     /// `ChatOutcome::completion_tokens`; the correction is signed, hence `i64`.
@@ -936,6 +939,12 @@ impl ServeStats {
     /// natural Prefill work unit, so a long context load appears in the interval where it ran.
     fn bump_prompt(&self, n: u64) {
         self.interval_prompt_tokens.fetch_add(n, Ordering::Relaxed);
+    }
+
+    fn bump_legacy_prompt(&self, n: u64) {
+        self.bump_prompt(n);
+        self.interval_legacy_prompt_tokens
+            .fetch_add(n, Ordering::Relaxed);
     }
 
     /// One decoded piece. The ONE call on the hot path — a single relaxed add.
@@ -965,10 +974,9 @@ impl ServeStats {
     /// arriving at completion.
     fn fold_completion(&self, rec: &ReqRecord) {
         if !rec.progress_accounted {
-            self.interval_prompt_tokens.fetch_add(
-                u64::from(rec.prompt_tokens.saturating_sub(rec.cached_prompt_tokens)),
-                Ordering::Relaxed,
-            );
+            self.bump_legacy_prompt(u64::from(
+                rec.prompt_tokens.saturating_sub(rec.cached_prompt_tokens),
+            ));
             let correction = i64::from(rec.gen_tokens) - rec.deltas as i64;
             if correction > 0 {
                 self.bump_gen(correction);
@@ -998,6 +1006,9 @@ impl ServeStats {
         StatsWindow {
             elapsed,
             prompt_tokens: self.interval_prompt_tokens.swap(0, Ordering::Relaxed),
+            legacy_prompt_tokens: self
+                .interval_legacy_prompt_tokens
+                .swap(0, Ordering::Relaxed),
             gen_tokens: self.interval_gen_tokens.swap(0, Ordering::Relaxed).max(0) as u64,
             completed: self.interval_completed.swap(0, Ordering::Relaxed),
             failed: self.interval_failed.swap(0, Ordering::Relaxed),
@@ -1014,6 +1025,7 @@ impl ServeStats {
 struct StatsWindow {
     elapsed: Duration,
     prompt_tokens: u64,
+    legacy_prompt_tokens: u64,
     gen_tokens: u64,
     completed: u64,
     failed: u64,
@@ -1107,6 +1119,58 @@ impl Drop for ActiveGuard {
     }
 }
 
+#[derive(Debug, Default)]
+struct PrefillDisplayRate {
+    chunks: [(u64, Duration); 3],
+    next: usize,
+    last_boundary: Duration,
+}
+
+impl PrefillDisplayRate {
+    fn reset(&mut self, elapsed: Duration) {
+        *self = Self {
+            last_boundary: elapsed,
+            ..Self::default()
+        };
+    }
+
+    fn record(&mut self, tokens: u64, elapsed: Duration) {
+        if tokens == 0 {
+            return;
+        }
+        let duration = elapsed.saturating_sub(self.last_boundary);
+        self.last_boundary = elapsed;
+        if duration.is_zero() {
+            return;
+        }
+        self.chunks[self.next] = (tokens, duration);
+        self.next = (self.next + 1) % self.chunks.len();
+    }
+
+    fn speed(&self, elapsed: Duration) -> f64 {
+        let last = (self.next + self.chunks.len() - 1) % self.chunks.len();
+        // A chunk can span many redraws. Hold its rate through normal work, but don't show it
+        // indefinitely after a stalled callback stream.
+        let stale_after = self.chunks[last]
+            .1
+            .saturating_mul(3)
+            .max(Duration::from_secs(5));
+        if elapsed.saturating_sub(self.last_boundary) > stale_after {
+            return 0.0;
+        }
+        let (tokens, duration) = self.chunks.iter().fold(
+            (0_u64, Duration::ZERO),
+            |(tokens, duration), &(chunk_tokens, chunk_duration)| {
+                (
+                    tokens.saturating_add(chunk_tokens),
+                    duration.saturating_add(chunk_duration),
+                )
+            },
+        );
+        per_second(tokens, duration)
+    }
+}
+
 #[derive(Debug)]
 struct RequestProgressState {
     latest: Option<infr_core::GenerationProgress>,
@@ -1114,7 +1178,7 @@ struct RequestProgressState {
     last_log_elapsed: Duration,
     accounted_prefill: u64,
     accounted_decode: u64,
-    display_prefill_tokens: u64,
+    prefill_rate: PrefillDisplayRate,
     display_decode_tokens: u64,
 }
 
@@ -1165,7 +1229,7 @@ impl RequestProgress {
                 last_log_elapsed: Duration::ZERO,
                 accounted_prefill: 0,
                 accounted_decode: 0,
-                display_prefill_tokens: 0,
+                prefill_rate: PrefillDisplayRate::default(),
                 display_decode_tokens: 0,
             }),
         }
@@ -1181,8 +1245,11 @@ impl RequestProgress {
     }
 
     fn observe(&self, progress: infr_core::GenerationProgress) {
+        self.observe_at(progress, self.started.elapsed());
+    }
+
+    fn observe_at(&self, progress: infr_core::GenerationProgress, elapsed: Duration) {
         self.seen.store(true, Ordering::Relaxed);
-        let elapsed = self.started.elapsed();
         let (emit, prefill_elapsed) = {
             let mut state = self.state.lock().expect("request progress poisoned");
             let restarted = state.latest.is_some_and(|previous| {
@@ -1214,8 +1281,6 @@ impl RequestProgress {
             self.stats.bump_prompt(prefill_delta);
             self.stats
                 .bump_gen(decode_delta.min(i64::MAX as u64) as i64);
-            state.display_prefill_tokens =
-                state.display_prefill_tokens.saturating_add(prefill_delta);
             state.display_decode_tokens = state.display_decode_tokens.saturating_add(decode_delta);
             state.accounted_prefill = progress.prefill_tokens;
             state.accounted_decode = progress.completion_tokens;
@@ -1224,6 +1289,17 @@ impl RequestProgress {
             let phase_changed = state
                 .latest
                 .is_some_and(|previous| previous.phase != progress.phase);
+            if restarted
+                || ((first || phase_changed)
+                    && progress.phase == infr_core::GenerationPhase::Prefill)
+            {
+                state.prefill_rate.reset(if prefill_delta == 0 {
+                    elapsed
+                } else {
+                    Duration::ZERO
+                });
+            }
+            state.prefill_rate.record(prefill_delta, elapsed);
             if progress.phase == infr_core::GenerationPhase::Decode
                 && state.prefill_elapsed.is_none()
             {
@@ -1278,8 +1354,13 @@ impl RequestProgress {
         );
     }
 
-    /// Sample only the live table's counters; API and completion accounting remain cumulative.
+    /// Prefill uses completed chunk timings; Decode uses the latest refresh interval.
+    /// API and completion accounting remain cumulative.
     fn display_snapshot(&self, interval: Duration) -> RequestDisplay {
+        self.display_snapshot_at(interval, self.started.elapsed())
+    }
+
+    fn display_snapshot_at(&self, interval: Duration, elapsed: Duration) -> RequestDisplay {
         let mut state = self.state.lock().expect("request progress poisoned");
         let Some(progress) = state.latest else {
             return RequestDisplay {
@@ -1289,18 +1370,19 @@ impl RequestProgress {
                 context_limit: None,
             };
         };
-        let (phase, tokens) = match progress.phase {
-            infr_core::GenerationPhase::Prefill => ("Prefill", state.display_prefill_tokens),
-            infr_core::GenerationPhase::Decode => ("Decode", state.display_decode_tokens),
+        let (phase, speed) = match progress.phase {
+            infr_core::GenerationPhase::Prefill => ("Prefill", state.prefill_rate.speed(elapsed)),
+            infr_core::GenerationPhase::Decode => {
+                ("Decode", per_second(state.display_decode_tokens, interval))
+            }
         };
         // An initial zero-duration draw is not a sampling window and must not consume progress.
         if !interval.is_zero() {
-            state.display_prefill_tokens = 0;
             state.display_decode_tokens = 0;
         }
         RequestDisplay {
             phase,
-            speed: per_second(tokens, interval),
+            speed,
             context_tokens: Some(progress.context_tokens),
             context_limit: Some(progress.context_limit),
         }
@@ -1321,7 +1403,7 @@ impl RequestProgress {
         if target_prefill > state.accounted_prefill {
             let delta = target_prefill - state.accounted_prefill;
             self.stats.bump_prompt(delta);
-            state.display_prefill_tokens = state.display_prefill_tokens.saturating_add(delta);
+            state.prefill_rate.record(delta, elapsed);
             state.accounted_prefill = target_prefill;
         }
         if target_decode > state.accounted_decode {
@@ -1542,6 +1624,7 @@ fn render_activity_table(slots: &[DashboardSlot], window: &StatsWindow) -> Strin
         "Context",
     ));
     out.push_str(BORDER);
+    let mut live_prefill = 0.0;
     for slot in slots {
         let slot_name = match slot.kind {
             DashboardSlotKind::Chat => format!("KV {}/{}", slot.ordinal, slot.capacity),
@@ -1553,6 +1636,9 @@ fn render_activity_table(slots: &[DashboardSlot], window: &StatsWindow) -> Strin
         let (work, state, speed, context) = match slot.activity.as_ref() {
             Some(DashboardActivity::Chat { req_id, progress }) => {
                 let live = progress.display_snapshot(window.elapsed);
+                if live.phase == "Prefill" {
+                    live_prefill += live.speed;
+                }
                 let speed = if live.phase != "Starting" {
                     format!("{:.1} tok/s", live.speed)
                 } else {
@@ -1593,7 +1679,7 @@ fn render_activity_table(slots: &[DashboardSlot], window: &StatsWindow) -> Strin
     out.push_str(BORDER);
     out.push_str(&format!(
         "Total: prefill {:.1} tok/s | decode {:.1} tok/s | active {} | queued {} | done {} | failed {}",
-        window.prefill_tps(),
+        live_prefill + per_second(window.legacy_prompt_tokens, window.elapsed),
         window.decode_tps(),
         window.active,
         window.queued,
@@ -1853,17 +1939,17 @@ impl Drop for TerminalDashboardGuard {
     }
 }
 
-const DASHBOARD_REFRESH: Duration = Duration::from_millis(500);
+const DASHBOARD_REFRESH: Duration = Duration::from_millis(1500);
 
 fn stats_report_period(configured: Duration, dashboard_enabled: bool) -> Duration {
     if dashboard_enabled {
-        configured.min(DASHBOARD_REFRESH)
+        DASHBOARD_REFRESH
     } else {
         configured
     }
 }
 
-/// Interactive tables sample both per-slot and aggregate throughput every 500 ms. Redirected
+/// Interactive tables sample Decode every 1.5 seconds and retain recent Prefill chunk rates. Redirected
 /// stderr keeps the configured activity-only structured log cadence.
 ///
 /// **Shutdown.** It polls the same process-wide latch [`shutdown_latched`] does, at the same 50 ms
@@ -2385,8 +2471,7 @@ async fn embeddings_handler(
         Ok(outcome) => {
             state
                 .stats
-                .interval_prompt_tokens
-                .fetch_add(u64::from(outcome.prompt_tokens), Ordering::Relaxed);
+                .bump_legacy_prompt(u64::from(outcome.prompt_tokens));
             state
                 .stats
                 .interval_completed
@@ -3541,7 +3626,7 @@ mod tests {
                 last_log_elapsed: Duration::ZERO,
                 accounted_prefill: 1_000,
                 accounted_decode: 57,
-                display_prefill_tokens: 0,
+                prefill_rate: PrefillDisplayRate::default(),
                 display_decode_tokens: 20,
             }),
         });
@@ -3605,7 +3690,7 @@ mod tests {
         for context in [30_000, 150_000] {
             for count in 1..=3 {
                 let stats = Arc::new(ServeStats::default());
-                let interval = Duration::from_millis(500);
+                let interval = DASHBOARD_REFRESH;
                 let lanes: Vec<_> = (0..count)
                     .map(|lane| {
                         let progress =
@@ -3619,7 +3704,7 @@ mod tests {
                 stats.drain(interval);
 
                 for (index, lane) in lanes.iter().enumerate() {
-                    let added = (index as u64 + 1) * 10;
+                    let added = (index as u64 + 1) * 30;
                     lane.observe(live_progress_snapshot(
                         Decode,
                         context,
@@ -3636,7 +3721,7 @@ mod tests {
                     assert_eq!(live.speed, (index + 1) as f64 * 20.0);
                     assert_eq!(
                         live.context_tokens,
-                        Some(context + 1_000 + (index as u64 + 1) * 10)
+                        Some(context + 1_000 + (index as u64 + 1) * 30)
                     );
                     total += live.speed;
                 }
@@ -3649,7 +3734,7 @@ mod tests {
                 }
 
                 for (index, lane) in lanes.iter().enumerate() {
-                    let decoded = 1_005 + (index as u64 + 1) * 10;
+                    let decoded = 1_015 + (index as u64 + 1) * 30;
                     lane.observe(live_progress_snapshot(Decode, context, context, 0, decoded));
                 }
                 let slower = stats.drain(interval);
@@ -3666,22 +3751,34 @@ mod tests {
         use infr_core::GenerationPhase::{Decode, Prefill};
         let stats = Arc::new(ServeStats::default());
         let progress = RequestProgress::new(1, "model".into(), None, stats.clone());
-        progress.observe(live_progress_snapshot(Prefill, 150_000, 148_000, 0, 0));
+        progress.observe_at(
+            live_progress_snapshot(Prefill, 150_000, 148_000, 0, 0),
+            Duration::ZERO,
+        );
         let restored = progress.display_snapshot(Duration::from_millis(500));
         assert_eq!(restored.speed, 0.0);
         assert_eq!(restored.context_tokens, Some(148_000));
         assert_eq!(stats.drain(Duration::from_millis(500)).prompt_tokens, 0);
 
-        progress.observe(live_progress_snapshot(Prefill, 150_000, 148_000, 2_000, 0));
+        progress.observe_at(
+            live_progress_snapshot(Prefill, 150_000, 148_000, 2_000, 0),
+            Duration::from_millis(750),
+        );
         let delayed = stats.drain(Duration::from_millis(750));
-        let live = progress.display_snapshot(delayed.elapsed);
+        let live = progress.display_snapshot_at(delayed.elapsed, Duration::from_millis(750));
         assert_eq!(live.phase, "Prefill");
         assert_eq!(live.speed, 2_000.0 / 0.75);
         assert_eq!(live.speed, delayed.prefill_tps());
         assert_eq!(live.context_tokens, Some(150_000));
 
         let pause = stats.drain(Duration::from_millis(500));
-        assert_eq!(progress.display_snapshot(pause.elapsed).speed, 0.0);
+        assert_eq!(
+            progress
+                .display_snapshot_at(pause.elapsed, Duration::from_millis(1250))
+                .speed,
+            live.speed,
+            "redraws between chunks must not zero the last measured Prefill rate"
+        );
         progress.observe(live_progress_snapshot(Decode, 150_000, 148_000, 2_000, 4));
         let draft = stats.drain(Duration::from_millis(500));
         let live = progress.display_snapshot(draft.elapsed);
@@ -3692,6 +3789,134 @@ mod tests {
         );
         assert_eq!(live.speed, draft.decode_tps());
         assert_eq!(draft.prompt_tokens, 0);
+    }
+
+    #[test]
+    fn prefill_display_averages_only_the_last_three_completed_chunks() {
+        let mut rate = PrefillDisplayRate::default();
+        assert_eq!(rate.speed(Duration::from_secs(1)), 0.0);
+        rate.record(4_096, Duration::from_secs(4));
+        assert_eq!(rate.speed(Duration::from_millis(5500)), 1_024.0);
+        rate.record(2_048, Duration::from_secs(6));
+        assert_eq!(rate.speed(Duration::from_secs(7)), 1_024.0);
+        rate.record(4_096, Duration::from_secs(14));
+        assert_eq!(rate.speed(Duration::from_secs(20)), 10_240.0 / 14.0);
+        rate.record(1_024, Duration::from_secs(15));
+        assert_eq!(rate.speed(Duration::from_secs(16)), 7_168.0 / 11.0);
+    }
+
+    #[test]
+    fn prefill_display_holds_long_chunks_but_expires_stalled_progress() {
+        let mut rate = PrefillDisplayRate::default();
+        rate.record(3_584, Duration::from_secs(10));
+        // Slow chunks need more grace than a fixed five-second stall cutoff.
+        assert_eq!(rate.speed(Duration::from_secs(35)), 358.4);
+        assert_eq!(rate.speed(Duration::from_millis(40001)), 0.0);
+        rate.record(3_584, Duration::from_secs(41));
+        assert_eq!(rate.speed(Duration::from_secs(41)), 7_168.0 / 41.0);
+
+        rate.reset(Duration::from_secs(42));
+        assert_eq!(rate.speed(Duration::from_secs(42)), 0.0);
+        rate.record(1_000, Duration::from_secs(43));
+        assert_eq!(rate.speed(Duration::from_secs(48)), 1_000.0);
+        assert_eq!(rate.speed(Duration::from_millis(48001)), 0.0);
+    }
+
+    #[test]
+    fn prefill_display_does_not_count_restore_time_or_zero_progress_callbacks() {
+        use infr_core::GenerationPhase::Prefill;
+        let stats = Arc::new(ServeStats::default());
+        let progress = RequestProgress::new(1, "model".into(), None, stats.clone());
+        progress.observe_at(
+            live_progress_snapshot(Prefill, 150_000, 146_416, 0, 0),
+            Duration::from_secs(10),
+        );
+        progress.observe_at(
+            live_progress_snapshot(Prefill, 150_000, 146_416, 0, 0),
+            Duration::from_secs(12),
+        );
+        assert_eq!(stats.drain(Duration::from_secs(12)).prompt_tokens, 0);
+        progress.observe_at(
+            live_progress_snapshot(Prefill, 150_000, 146_416, 3_584, 0),
+            Duration::from_secs(14),
+        );
+        let draw = progress.display_snapshot_at(DASHBOARD_REFRESH, Duration::from_secs(15));
+        assert_eq!(draw.speed, 896.0);
+        assert_eq!(draw.context_tokens, Some(150_000));
+        let window = stats.drain(Duration::from_secs(2));
+        assert_eq!(window.prompt_tokens, 3_584);
+        assert_eq!(window.legacy_prompt_tokens, 0);
+    }
+
+    #[test]
+    fn prefill_table_total_matches_chunk_rates_for_one_two_and_three_slots() {
+        use infr_core::GenerationPhase::Prefill;
+        for context in [30_000, 150_000] {
+            for count in 1..=3 {
+                let slots: Vec<_> = (0..count)
+                    .map(|lane| {
+                        let mut progress =
+                            RequestProgress::new(lane, "model".into(), None, Arc::default());
+                        progress.started = Instant::now() - Duration::from_secs(5);
+                        progress.observe_at(
+                            live_progress_snapshot(Prefill, context, context - 3_584, 0, 0),
+                            Duration::ZERO,
+                        );
+                        progress.observe_at(
+                            live_progress_snapshot(Prefill, context, context - 3_584, 3_584, 0),
+                            Duration::from_secs(4),
+                        );
+                        DashboardSlot {
+                            kind: DashboardSlotKind::Chat,
+                            ordinal: lane as usize + 1,
+                            capacity: count as usize,
+                            model: Arc::from("model"),
+                            activity: Some(DashboardActivity::Chat {
+                                req_id: lane,
+                                progress: Arc::new(progress),
+                            }),
+                        }
+                    })
+                    .collect();
+                for (prompt_tokens, legacy_prompt_tokens) in
+                    [(3_584 * count, 0), (0, 0), (600, 600)]
+                {
+                    let frame = render_activity_table(
+                        &slots,
+                        &StatsWindow {
+                            elapsed: DASHBOARD_REFRESH,
+                            prompt_tokens,
+                            legacy_prompt_tokens,
+                            ..StatsWindow::default()
+                        },
+                    );
+                    assert_eq!(
+                        frame
+                            .lines()
+                            .filter(|line| line.starts_with('|') && line.contains("896.0 tok/s"))
+                            .count(),
+                        count as usize
+                    );
+                    assert!(frame.contains(&format!(
+                        "Total: prefill {:.1} tok/s | decode 0.0 tok/s",
+                        896.0 * count as f64 + per_second(legacy_prompt_tokens, DASHBOARD_REFRESH)
+                    )));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn live_total_preserves_legacy_and_embedding_prompt_counters() {
+        let stats = ServeStats::default();
+        stats.bump_prompt(3_584);
+        stats.bump_legacy_prompt(600);
+        let window = stats.drain(DASHBOARD_REFRESH);
+        assert_eq!(window.prompt_tokens, 4_184);
+        assert_eq!(window.legacy_prompt_tokens, 600);
+        assert!(render_activity_table(&[], &window)
+            .contains("Total: prefill 400.0 tok/s | decode 0.0 tok/s"));
+        assert_eq!(stats.drain(DASHBOARD_REFRESH).legacy_prompt_tokens, 0);
     }
 
     #[test]
@@ -3722,13 +3947,27 @@ mod tests {
         use infr_core::GenerationPhase::Prefill;
         let stats = Arc::new(ServeStats::default());
         let progress = RequestProgress::new(1, "model".into(), None, stats.clone());
-        progress.observe(live_progress_snapshot(Prefill, 100, 0, 50, 0));
+        progress.observe_at(
+            live_progress_snapshot(Prefill, 100, 0, 50, 0),
+            Duration::from_secs(1),
+        );
         let first = stats.drain(Duration::from_secs(1));
-        assert_eq!(progress.display_snapshot(first.elapsed).speed, 50.0);
-        progress.observe(live_progress_snapshot(Prefill, 90, 20, 0, 0));
-        progress.observe(live_progress_snapshot(Prefill, 90, 20, 70, 0));
+        assert_eq!(
+            progress
+                .display_snapshot_at(first.elapsed, Duration::from_secs(1))
+                .speed,
+            50.0
+        );
+        progress.observe_at(
+            live_progress_snapshot(Prefill, 90, 20, 0, 0),
+            Duration::from_secs(1),
+        );
+        progress.observe_at(
+            live_progress_snapshot(Prefill, 90, 20, 70, 0),
+            Duration::from_secs(2),
+        );
         let restarted = stats.drain(Duration::from_secs(1));
-        let live = progress.display_snapshot(restarted.elapsed);
+        let live = progress.display_snapshot_at(restarted.elapsed, Duration::from_secs(2));
         assert_eq!(live.speed, 70.0);
         assert_eq!(live.speed, restarted.prefill_tps());
         assert_eq!(live.context_tokens, Some(90));
@@ -6026,14 +6265,15 @@ mod tests {
     }
 
     #[test]
-    fn live_stats_sample_and_redraw_every_half_second_without_changing_redirected_logs() {
-        assert_eq!(DASHBOARD_REFRESH, Duration::from_millis(500));
+    fn live_stats_sample_and_redraw_every_one_and_half_seconds_without_changing_redirected_logs() {
+        assert_eq!(DASHBOARD_REFRESH, Duration::from_millis(1500));
         for configured in [Duration::from_secs(5), Duration::from_secs(30)] {
             assert_eq!(stats_report_period(configured, true), DASHBOARD_REFRESH);
             assert_eq!(stats_report_period(configured, false), configured);
         }
         let faster = Duration::from_millis(100);
-        assert_eq!(stats_report_period(faster, true), faster);
+        assert_eq!(stats_report_period(faster, true), DASHBOARD_REFRESH);
+        assert_eq!(stats_report_period(faster, false), faster);
     }
 
     /// KV slot occupancy is `busy/total` across every hosted model — the number the periodic line
