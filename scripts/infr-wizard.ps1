@@ -82,6 +82,7 @@ function Read-IntegerValue {
         [Parameter(Mandatory = $true)][string]$Label,
         [AllowEmptyString()][string]$Default = '',
         [long]$Minimum = 0,
+        [long]$Maximum = [long]::MaxValue,
         [switch]$AllowBlank
     )
     while ($true) {
@@ -90,10 +91,70 @@ function Read-IntegerValue {
             return ''
         }
         $parsed = 0L
-        if ([long]::TryParse($value, [ref]$parsed) -and $parsed -ge $Minimum) {
+        if ([long]::TryParse($value, [ref]$parsed) -and $parsed -ge $Minimum -and $parsed -le $Maximum) {
             return $parsed.ToString()
         }
-        Write-Host "请输入不小于 $Minimum 的整数。Enter an integer greater than or equal to $Minimum." -ForegroundColor Yellow
+        if ($Maximum -eq [long]::MaxValue) {
+            Write-Host "请输入不小于 $Minimum 的整数。Enter an integer greater than or equal to $Minimum." -ForegroundColor Yellow
+        } else {
+            Write-Host "请输入 $Minimum 到 $Maximum 之间的整数。Enter an integer between $Minimum and $Maximum." -ForegroundColor Yellow
+        }
+    }
+}
+
+function Get-CpuMissTopology {
+    try {
+        if (-not ('Moe4All.WizardCpuTopology' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+namespace Moe4All {
+    public static class WizardCpuTopology {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetLogicalProcessorInformationEx(int relation, IntPtr buffer, ref uint length);
+        public static int[] Counts() {
+            if (IntPtr.Size != 8) throw new NotSupportedException("64-bit topology query required");
+            uint length = 0;
+            GetLogicalProcessorInformationEx(0, IntPtr.Zero, ref length);
+            if (length == 0) throw new InvalidOperationException("CPU topology unavailable");
+            IntPtr buffer = Marshal.AllocHGlobal(checked((int)length));
+            try {
+                uint capacity = length;
+                if (!GetLogicalProcessorInformationEx(0, buffer, ref length) || length > capacity)
+                    throw new InvalidOperationException("CPU topology query failed");
+                var classes = new List<byte>();
+                for (int offset = 0; offset < length;) {
+                    if ((long)offset + 8 > length) throw new InvalidOperationException("Truncated CPU topology");
+                    int size = Marshal.ReadInt32(buffer, offset + 4);
+                    if (size < 8 || (long)offset + size > length) throw new InvalidOperationException("Invalid CPU topology");
+                    if (Marshal.ReadInt32(buffer, offset) == 0) {
+                        if (size < 48 || Marshal.ReadInt16(buffer, offset + 30) != 1 || Marshal.ReadInt64(buffer, offset + 32) == 0)
+                            throw new InvalidOperationException("Invalid physical core");
+                        classes.Add(Marshal.ReadByte(buffer, offset + 9));
+                    }
+                    offset += size;
+                }
+                if (classes.Count == 0) throw new InvalidOperationException("No physical cores");
+                byte fastest = 0;
+                foreach (byte value in classes) fastest = Math.Max(fastest, value);
+                int preferred = 0;
+                foreach (byte value in classes) if (value == fastest) preferred++;
+                return new int[] { classes.Count, preferred };
+            } finally { Marshal.FreeHGlobal(buffer); }
+        }
+    }
+}
+'@
+        }
+        $counts = [Moe4All.WizardCpuTopology]::Counts()
+        return [pscustomobject]@{ Physical = $counts[0]; Preferred = $counts[1]; Detected = $true }
+    } catch {
+        $physical = 1
+        try {
+            $physical = [Math]::Max(1, [int]((Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfCores -Sum).Sum))
+        } catch { }
+        return [pscustomobject]@{ Physical = $physical; Preferred = $physical; Detected = $false }
     }
 }
 
@@ -1117,6 +1178,30 @@ if ($launchMode -eq 'benchmark') {
     }
 }
 
+$cpuMissEnabled = Read-YesNo -Label '启用实验性 CPU 专家 miss 计算？/ Enable experimental CPU expert-miss computation?' -Default ([bool](Get-SavedValue 'cpu_miss_enabled' $false))
+$cpuMissMax = [string](Get-SavedValue 'cpu_miss_max' '1')
+$cpuMissCores = [string](Get-SavedValue 'cpu_miss_cores' '')
+if ($cpuMissEnabled) {
+    $cpuTopology = Get-CpuMissTopology
+    $defaultCpuMissCores = [Math]::Max(1, $cpuTopology.Preferred - 2)
+    Write-Host ('物理核心 {0}，优先性能核心 {1}；默认计算核数为 max(1, 性能物理核数 - 2) = {2}。' -f $cpuTopology.Physical, $cpuTopology.Preferred, $defaultCpuMissCores) -ForegroundColor DarkGray
+    Write-Host ('Physical cores: {0}; preferred performance cores: {1}; default compute cores: max(1, preferred - 2) = {2}.' -f $cpuTopology.Physical, $cpuTopology.Preferred, $defaultCpuMissCores) -ForegroundColor DarkGray
+    if (-not $cpuTopology.Detected) {
+        Write-Warning '未能识别大小核，默认按总物理核心计算；请确认核心数。Hybrid-core detection unavailable; confirm the compute-core count.'
+    }
+    $parsedCores = 0
+    if (-not [int]::TryParse($cpuMissCores, [ref]$parsedCores) -or $parsedCores -lt 1 -or $parsedCores -gt $cpuTopology.Physical) {
+        $cpuMissCores = $defaultCpuMissCores.ToString()
+    }
+    $parsedMissMax = 0
+    if (-not [int]::TryParse($cpuMissMax, [ref]$parsedMissMax) -or $parsedMissMax -lt 1 -or $parsedMissMax -gt 3) { $cpuMissMax = '1' }
+    $cpuMissMax = Read-IntegerValue -Label '最多交给 CPU 的 miss 数（1-3）/ Maximum CPU miss count (1-3)' -Default $cpuMissMax -Minimum 1 -Maximum 3
+    $cpuMissCores = Read-IntegerValue -Label 'CPU 计算核心数 / CPU compute cores' -Default $cpuMissCores -Minimum 1 -Maximum $cpuTopology.Physical
+    Write-Host '要求 AVX2 + FMA3、支持的量化和完整 RAM 专家缓存；超出 miss 上限或其他不支持工况自动使用 GPU。' -ForegroundColor DarkGray
+    Write-Host 'Requires AVX2 + FMA3, supported quantization and full-RAM experts; unsupported cases or larger miss sets use GPU.' -ForegroundColor DarkGray
+    Write-Host '性能收益尚未保证；2/3 miss 未做整机性能验收。Performance gains are not guaranteed; 2/3-miss model throughput is unvalidated.' -ForegroundColor Yellow
+}
+
 $customSets = [string](Get-SavedValue 'custom_sets' '')
 if ($setupMode -eq 'manual') {
     $customSets = Read-TextValue -Label '额外 --set，以分号分隔，留空为无 / Extra --set entries separated by semicolons, blank for none' -Default $customSets
@@ -1168,6 +1253,14 @@ if ($setupMode -eq 'manual' -and $configureDiagnostics) {
     Add-SetArgument $nativeArgs 'prof.stages' $stageProfile.ToString().ToLowerInvariant()
     Add-SetArgument $nativeArgs 'prof.vram' $vramProfile.ToString().ToLowerInvariant()
 }
+Add-SetArgument $nativeArgs 'kernels.vulkan.cpu_miss_threads' $(if ($cpuMissEnabled) { $cpuMissCores } else { '0' })
+if ($cpuMissEnabled) {
+    Add-SetArgument $nativeArgs 'kernels.vulkan.cpu_miss_max' $cpuMissMax
+    Add-SetArgument $nativeArgs 'kernels.vulkan.cpu_miss_push' 'true'
+    Add-SetArgument $nativeArgs 'kernels.vulkan.cpu_miss_host_result' 'true'
+    Add-SetArgument $nativeArgs 'kernels.vulkan.cpu_miss_token_park' 'true'
+    Add-SetArgument $nativeArgs 'kernels.vulkan.cpu_miss_spin' '262144'
+}
 if ($setupMode -eq 'manual' -and -not [string]::IsNullOrWhiteSpace($customSets)) {
     foreach ($entry in $customSets.Split(';')) {
         $entry = $entry.Trim()
@@ -1179,6 +1272,11 @@ if ($setupMode -eq 'manual' -and -not [string]::IsNullOrWhiteSpace($customSets))
         $settingPath = $entry.Substring(0, $equals).Trim()
         if ($launchMode -eq 'server' -and $settingPath -eq 'serve.api_key') {
             throw '服务器 API key 请使用专用提示输入，以免密钥出现在命令和历史记录中。Use the server API-key prompt so the secret is not exposed in commands or history.'
+        }
+        if ($settingPath.StartsWith('kernels.vulkan.cpu_miss_', [System.StringComparison]::Ordinal) -and
+            @($nativeArgs | Where-Object { $_.StartsWith("$settingPath=", [System.StringComparison]::Ordinal) }).Count -gt 0) {
+            Write-Warning "CPU-miss 参数 $settingPath 已由向导设置，忽略同名额外配置。The wizard controls this CPU-miss setting; the duplicate extra setting is ignored."
+            continue
         }
         Add-SetArgument $nativeArgs $settingPath $entry.Substring($equals + 1).Trim()
     }
@@ -1273,6 +1371,7 @@ $state = [ordered]@{
     server_embedding = $serverEmbedding; embedding_model = $embeddingModelPath
     embedding_idle_timeout = $embeddingIdleTimeout
     mtp_enabled = $mtpEnabled; mtp_model = $mtpModelPath; mtp_verify_tokens = $mtpVerifyTokens
+    cpu_miss_enabled = $cpuMissEnabled; cpu_miss_max = $cpuMissMax; cpu_miss_cores = $cpuMissCores
     custom_sets = $customSets; last_command = $commandText
 }
 New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
