@@ -2,21 +2,26 @@
 
 **Run models far larger than VRAM on gaming GPUs. AMD, NVIDIA, and Intel are all working.**
 
-The portable Windows package is about 14 MiB. Download a GGUF, choose automatic
+The portable Windows download is about 14 MiB. Download a GGUF, choose automatic
 configuration, and start local chat or an OpenAI-compatible API. MoE expert
 weights are coordinated across VRAM, system RAM, and SSD.
 
-**0.10.0 performance reference:** RX 7900 XTX 24 GiB, Ryzen 5 5600X, 64 GiB
-DDR4, automatic aggressive profile. Qwen3.8-Flash-Next, AD-4.27bpw-Q4_K_M-M64,
-three configured slots, MTP and CPU miss offload disabled. The table uses the
-2026-10-09 test records in tok/s; see [Measured results](#measured-results) for
-their provenance and measurement definitions.
+**0.10.0 peak-speed reference:** RX 7900 XTX 24 GiB, Ryzen 5 5600X, 64 GiB
+DDR4, automatic aggressive profile. Flash-Next 4.27bpw peaks at about
+**1,446 tok/s Prefill** and **79.4 tok/s total Decode** with three active streams;
+35B Balanced peaks at **65.4 tok/s Decode** with one active stream at 30K.
+Three configured slots, MTP and CPU miss offload disabled.
+The table shows 2026-10-09 measured peaks in tok/s; see
+[Measured results](#measured-results) for measurement definitions.
 
-| Active streams | 30K Prefill | 30K Decode total | 150K Prefill | 150K Decode total |
-| --- | ---: | ---: | ---: | ---: |
-| 1 | 1,093 | **42.8** | 752 | **39.5** |
-| 2 | 960 | **59.7** | 958 | **48.1** |
-| 3 | 1,033 | **70.2** | 1,049 | **40.4** |
+| Model | Active streams | 30K Prefill peak | 30K Decode total peak | 150K Prefill peak | 150K Decode total peak |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash-Next 4.27bpw | 1 | 1,439.4 | **47.7** | 1,444.6 | **44.7** |
+| Flash-Next 4.27bpw | 2 | 1,445.2 | **71.3** | 1,446.3 | **63.6** |
+| Flash-Next 4.27bpw | 3 | 1,437.0 | **79.4** | 1,434.2 | **62.5** |
+| 35B Balanced | 1 | 3,824.8 | **65.4** | 3,981.7 | **36.7** |
+
+<sub>Peak means the highest speed within a 1.5-second rolling window. Prefill peaks interpolate completed-chunk progress.</sub>
 
 [Released Windows builds](https://github.com/Headmaster218/MoE4All/releases/latest) |
 [Quick start](#quick-start) |
@@ -41,7 +46,7 @@ Fully extract the ZIP into a directory such as `D:\MoE4All`.
 ### 3. Download a GGUF model
 
 The following models and components are recommended. Store the model files on
-a local SSD. The performance table above uses the Flash-Next main model without MTP.
+a local SSD.
 
 | Model / component | Download | File and purpose |
 | --- | --- | --- |
@@ -67,9 +72,6 @@ for their respective modes in the wizard.
    these measurements, configure three slots and `ctx=163840`, with MTP and
    experimental CPU offload disabled.
 
-If saved settings exist, you can launch directly with them. The wizard checks
-for updates first, but updating is opt-in.
-
 Automatic profiles use Q8 K/V by default and plan VRAM, system RAM, expert
 cache, and Ubatch. The 35B model is ready for chat with its main GGUF alone.
 Flash-Next has these optional components:
@@ -85,73 +87,73 @@ See the [capability matrix](documentation/reference/model-capabilities.md) for c
 
 ## Measured results
 
-### 0.10.0: Flash-Next, 30K / 150K and 1 / 2 / 3 active streams
+### 0.10.0: 30K / 150K measurements
 
-These measurements used the local **0.9.0 service before the 0.10.0 upgrade**;
-they are not a new 0.10.0 benchmark. Hardware: RX 7900 XTX 24 GiB, Ryzen 5 5600X,
-64 GiB DDR4, Windows 11. Model: `Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64`.
+Measured on **2026-10-09** using the generic x86-64 0.10.0 release build,
+source commit `53afa86f3`. Hardware: RX 7900 XTX 24 GiB, Ryzen 5 5600X,
+64 GiB DDR4, Windows 11. Models: `Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64`
+and `Qwen3.6-35B-A3B-APEX-I-Balanced`.
 The service used the automatic aggressive profile, Q8 K/V, `ctx=163840`, and
 three configured slots with 1 / 2 / 3 simultaneously active. **MTP and CPU miss
-offload were disabled.** Sampling was greedy with thinking off, and each lane
-received a different long technical-background prompt.
+offload were disabled.** Sampling and thinking used model defaults. Vision and
+Embedding APIs were enabled; the table uses text-only requests, each with a
+different long technical background and a normal question.
 
-All speeds are tok/s. Cold Prefill is the first-round group throughput with no
-KV hits on any request: total input tokens divided by the group phase through
-the last lane's Prefill completion. It includes scheduling and waiting; it is
-not a sum of lane rates. Decode averages three subsequent KV-reuse rounds,
-each generating 512 tokens per lane. Total Decode sums the final API
-`predicted_per_second` rates, **not terminal instantaneous rates**. Large
-Prefills run sequentially, followed by concurrent Decode.
+Each cell starts a fresh server: one cold Prefill round followed by two KV-reuse
+rounds, generating 768 tokens per stream per round. All speeds are tok/s.
+Prefill measures group token progress from the first Prefill sample to the last
+prompt completion, excluding startup before that sample; it is not a sum of
+stream rates. Decode averages three rounds over the interval when all streams are
+decoding, excluding pauses for another request's Prefill. Approximate per-stream
+Decode divides the total mean by the number of streams. Peak is the maximum
+1.5-second rolling window. Prefill peaks and thirds interpolate chunk-completion
+progress, not precise instantaneous GPU speeds.
 
-| Input per lane | Active streams | Cold Prefill total | Decode total | Approx. Decode per lane |
-| --- | ---: | ---: | ---: | ---: |
-| 30K | 1 | 1,093 | **42.8** | 42.8 |
-| 30K | 2 | 960 | **59.7** | 29.9 |
-| 30K | 3 | 1,033 | **70.2** | 23.4 |
-| 150K | 1 | 752 | **39.5** | 39.5 |
-| 150K | 2 | 958 | **48.1** | 24.0 |
-| 150K | 3 | 1,049 | **40.4** | 13.5 |
+| Model | Input per stream | Active streams | Cold Prefill mean / peak | Decode total mean / peak | Approx. Decode per stream |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Flash-Next 4.27bpw | 30K | 1 | 1,280.4 / 1,439.4 | **42.8** / 47.7 | 42.8 |
+| Flash-Next 4.27bpw | 30K | 2 | 1,288.2 / 1,445.2 | **60.7** / 71.3 | 30.3 |
+| Flash-Next 4.27bpw | 30K | 3 | 1,283.9 / 1,437.0 | **64.0** / 79.4 | 21.3 |
+| Flash-Next 4.27bpw | 150K | 1 | 1,307.5 / 1,444.6 | **39.4** / 44.7 | 39.4 |
+| Flash-Next 4.27bpw | 150K | 2 | 1,301.9 / 1,446.3 | **52.8** / 63.6 | 26.4 |
+| Flash-Next 4.27bpw | 150K | 3 | 1,228.3 / 1,434.2 | **45.4** / 62.5 | 15.1 |
+| 35B Balanced | 30K | 1 | 2,579.9 / 3,824.8 | **63.2** / 65.4 | 63.2 |
+| 35B Balanced | 150K | 1 | 1,164.9 / 3,981.7 | **35.9** / 36.7 | 35.9 |
 
-The service was not restarted between cells, so resident idle-slot KV and SSD
-spill also affect these results. The first 150K single-stream Prefill had only
-one expert Prefill lane; after other idle slots were released, separate full
-Prefills reached **1,313-1,316 tok/s**. The 30K two-stream measurements include
-one approximately one-second pause; 150K three-stream Decode ranged from
-**37.6 to 43.1 tok/s** across its three rounds. This is a finite live-service
-test, not an isolated kernel benchmark or a long-term stability guarantee.
+Front / middle / late split each measured interval into equal wall-time thirds;
+Decode thirds also average three rounds.
 
-<details>
-<summary>Identical versus different prompts in concurrent Decode</summary>
+| Model | Input per stream | Active streams | Prefill front / middle / late | Decode total front / middle / late |
+| --- | --- | ---: | ---: | ---: |
+| Flash-Next 4.27bpw | 30K | 1 | 1,225.1 / 1,414.3 / 1,201.9 | 40.8 / 42.2 / 45.3 |
+| Flash-Next 4.27bpw | 30K | 2 | 1,315.6 / 1,214.0 / 1,335.0 | 58.5 / 63.3 / 60.2 |
+| Flash-Next 4.27bpw | 30K | 3 | 1,302.4 / 1,285.8 / 1,263.3 | 65.5 / 62.6 / 63.8 |
+| Flash-Next 4.27bpw | 150K | 1 | 1,358.2 / 1,345.7 / 1,218.8 | 36.3 / 40.4 / 41.5 |
+| Flash-Next 4.27bpw | 150K | 2 | 1,353.4 / 1,281.4 / 1,270.8 | 50.3 / 55.7 / 52.4 |
+| Flash-Next 4.27bpw | 150K | 3 | 1,303.6 / 1,263.0 / 1,118.3 | 44.0 / 46.7 / 45.4 |
+| 35B Balanced | 30K | 1 | 3,254.9 / 2,797.3 / 1,687.6 | 63.6 / 62.6 / 63.4 |
+| 35B Balanced | 150K | 1 | 1,829.5 / 968.9 / 696.4 | 35.8 / 36.0 / 35.8 |
 
-Two separate control suites also used greedy sampling with thinking off and
-averaged three KV-reuse rounds. Different prompts cover three technical topics;
-identical prompts use the same complete input, seed, and generated output.
-The following rates are still **total Decode** in tok/s. Identical-output peak
-throughput should not be treated as general Agent-workload performance.
-
-| Input per lane | Active streams | Different prompts | Identical complete prompts |
-| --- | ---: | ---: | ---: |
-| 30K | 2 | 61.5 | **69.9** |
-| 30K | 3 | 69.5 | **84.9** |
-| 150K | 2 | 48.6 | **59.8** |
-| 150K | 3 | 44.5 | **64.4** |
-
-These are independent prompt-control suites, not pooled with the all-cold
-Prefill suite above. Identical prompts do not guarantee that concurrent first
-requests require only one Prefill.
-
-</details>
+At 150K, Flash-Next's three-stream total is lower than its two-stream total;
+concurrency gains are not linear. The full matrix completed 36 rounds and 72
+stream responses without request failures; both warm rounds hit the expected
+KV cache. Flash-Next ran with tight Windows commit headroom, which
+can also affect reproducibility.
 
 ## Community results
 
 **AMD, NVIDIA RTX, and Intel Arc all have user-tested configurations and
 generation-speed reports.**
 
-| GPU and memory | Model and conditions | Generation speed | Version and source |
-| --- | --- | ---: | --- |
-| **AMD RX 7700 XT 12GB + 64GB RAM** | Ornith 1.5 35B-A3B, `serve`, 131K context capacity | **41.5–42.7 tok/s** | v0.5.2 community baseline, [PR #21](https://github.com/Headmaster218/MoE4All/pull/21) |
-| **Intel Arc A770 16GB + 64GB DDR4-3200** | Ornith 1.5 35B Q4_K_M, F16 KV, 96K context capacity, three REAL-workload runs | **30.15–30.28 tok/s** | v0.6.0-beta.1, [Issue #41](https://github.com/Headmaster218/MoE4All/issues/41) |
-| **NVIDIA RTX 3090 Ti + 64GB RAM** | Successful community run; model, quantization, and context were not included in the original comment | **about 29 tok/s** | Version not reported, [Bilibili user report](https://www.bilibili.com/video/BV1ALha63Eyd/) (rpid `318146261056`) |
+| GPU / CPU and memory | Model and conditions | Prefill | Decode | Version and source |
+| --- | --- | ---: | ---: | --- |
+| **AMD R9700 + Ryzen 9 9950X3D + 48GB RAM** | Flash-Next; quantization and context not reported | **800-1,100 tok/s** | **20-50 tok/s** | v0.10.0, user report |
+| **Intel Arc A770 16GB + 64GB DDR4-3200** | Flash-Next, three runs; quantization and context not reported | Not reported | **17.44 / 17.30 / 17.45 tok/s** | v0.10.0, user report |
+| **AMD RX 7700 XT 12GB + 64GB RAM** | Ornith 1.5 35B-A3B, `serve`, 131K context capacity | Not reported | **41.5–42.7 tok/s** | v0.5.2 community baseline, [PR #21](https://github.com/Headmaster218/MoE4All/pull/21) |
+| **Intel Arc A770 16GB + 64GB DDR4-3200** | Ornith 1.5 35B Q4_K_M, F16 KV, 96K context capacity, three REAL-workload runs | Not reported | **30.15–30.28 tok/s** | v0.6.0-beta.1, [Issue #41](https://github.com/Headmaster218/MoE4All/issues/41) |
+| **NVIDIA RTX 3090 Ti + 64GB RAM** | Successful community run; model, quantization, and context were not included in the original comment | Not reported | **about 29 tok/s** | Version not reported, [Bilibili user report](https://www.bilibili.com/video/BV1ALha63Eyd/) (rpid `318146261056`) |
+
+Community speeds retain the users' original definitions and were not independently retested. Average versus peak was not specified, so they are not directly comparable to the fixed-window peak table above.
 
 Share successful configurations in
 [Discussions](https://github.com/Headmaster218/MoE4All/discussions), or report
