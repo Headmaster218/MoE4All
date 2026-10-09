@@ -14,5 +14,6 @@ verified_commit: ed62393068679573afe94a1472454efe7eae0f15
 - [2026-09-28 文档归并与去重审计](2026-09-28-documentation-consolidation.md)
 - [2026-09-29 旧草稿逐篇覆盖审计](2026-09-29-old-draft-coverage.md)
 - [2026-10-03 Qwen3.8 服务 48 小时运行审计](2026-10-03-48h-service-soak-audit.md)
+- [2026-10-10 HEIC 与 AVIF 解码库体积](2026-10-10-image-codec-package-size.md)
 
 审计页面保持当时基线，不通过删除已修项来冒充实时 backlog。
