@@ -87,7 +87,9 @@ See the [capability matrix](documentation/reference/model-capabilities.md) for c
 
 ## Build from source (Linux)
 
-The release archives are Windows-only; on Linux, build from source:
+The release archives are Windows-only; on Linux, build from source. The package
+installation command below targets Ubuntu 26.04; other distributions need
+`glslc` from shaderc 2025 or newer first:
 
 ```sh
 sudo apt-get update && sudo apt-get install -y glslc

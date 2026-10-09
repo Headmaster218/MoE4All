@@ -73,7 +73,8 @@ Flash-Next 启动时选择第一片：`Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-
 
 ## 从源码构建（Linux）
 
-发布包目前只有 Windows 版；Linux 从源码构建：
+发布包目前只有 Windows 版；Linux 从源码构建。以下安装命令适用于 Ubuntu 26.04；
+其他发行版请先准备 shaderc 2025 或更新的 `glslc`：
 
 ```sh
 sudo apt-get update && sudo apt-get install -y glslc

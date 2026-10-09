@@ -26,6 +26,8 @@ verified_commit: 41345e6f2caace03869cc0d2e2e89a577650ee46
 
 ## 构建
 
+以下安装命令适用于 Ubuntu 26.04；其他发行版先按上述要求安装较新的 `glslc`。
+
 ```sh
 sudo apt-get update && sudo apt-get install -y glslc
 git clone https://github.com/Headmaster218/MoE4All.git

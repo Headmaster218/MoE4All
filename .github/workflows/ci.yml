@@ -53,6 +53,8 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
+      - name: Linux wizard smoke
+        run: bash scripts/smoke-linux-wizard.sh
       - name: Install glslc (shaderc)
         run: sudo apt-get update && sudo apt-get install -y glslc
       - uses: actions-rust-lang/setup-rust-toolchain@v1

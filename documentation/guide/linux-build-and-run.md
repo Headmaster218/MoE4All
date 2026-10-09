@@ -29,6 +29,10 @@ verified_commit: 41345e6f2caace03869cc0d2e2e89a577650ee46
 向导会在启动前打印最终命令并要求确认。选择记录在
 `${XDG_CONFIG_HOME:-~/.config}/infr/wizard.conf`，下次直接复用。命令行参数优先于
 记忆值；`--no-mtp`、`--no-mmproj`、`--no-embedding` 用于清除已记住的可选项。
+已保存的视觉与 Embedding 路径在询问时作为默认值，直接回车不会清空。
+显式指定的上下文和资源参数在自动档也生效。非交互启动需要 `--yes`；
+非本机监听且未启用鉴权时默认拒绝启动，交互模式需要明确确认。
+`--no-api-key` 会清除传给子进程的 `INFR_API_KEY`，密钥不写入保存文件。
 
 `--dry-run` 只打印命令、不启动，且不依赖终端，便于脚本化：
 

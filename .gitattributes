@@ -4,3 +4,5 @@
 # stats — making Metal look larger than the Vulkan shaders when the reverse is true.
 *.comp linguist-language=GLSL
 scripts/perf-sweep.sh text eol=lf
+Start-INFR-Wizard-Linux.sh text eol=lf
+scripts/smoke-linux-wizard.sh text eol=lf
