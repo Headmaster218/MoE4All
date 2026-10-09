@@ -640,6 +640,9 @@ cfg_struct! {
         mtp_draft_chain: bool = true,
         /// `INFR_NO_MTP_PLE_OVERLAP` (inverted): run VERIFY layer 0 while PLE rows are gathered.
         mtp_ple_overlap: bool = true,
+        /// `INFR_NO_MTP_ADAPTIVE_WIDTH` (inverted): calibrate the Qwen3.8 MTP VERIFY width at
+        /// runtime and lock the throughput-optimal one instead of the configured `spec.k`.
+        mtp_adaptive_width: bool = true,
         /// `INFR_SPEC_DRAFT`: draft-model path.
         draft: Option<PathBuf> = None,
         /// `INFR_SPEC_K`: draft-length upper bound.

@@ -12,6 +12,59 @@ use super::{BindWeightFn, MtpTensor};
 
 pub const DRAFT_TOKENS: usize = 4;
 
+/// Cycles sampled per arm by the adaptive VERIFY-width calibration (issue #70 §7). 24 cycles cost
+/// roughly a second of decode and put enough mass in the accept-length tail to score every
+/// candidate width; a turn must run at least four times this to break even on calibrating.
+pub(crate) const MTP_CALIB_CYCLES: usize = 24;
+
+/// Cycles excluded from both calibration arms: the first VERIFY/draft graph compiles and the
+/// arena settles, and those costs would bias the arm means.
+pub(crate) const MTP_CALIB_WARMUP: usize = 4;
+
+/// Throughput-optimal Qwen3.8 MTP VERIFY width from a two-arm calibration (issue #70 §7).
+///
+/// `hist[i]` counts probe-wide cycles (out of `n`) that accepted `i` draft tokens; the top bucket
+/// stands for "every drafted row survived". The draft chain is prefix-stable — a wider VERIFY never
+/// changes how many of the first rows the target agrees with — so the SAME accept-length
+/// distribution governs every narrower width, and one histogram scores them all: a width-`w` cycle
+/// commits `1 + sum_{k in 1..w} P(L >= k)` tokens.
+///
+/// Cycle cost is the two-point affine fit `T(w) = t_two + (w - 2) * (t_probe - t_two) /
+/// (probe - 2)`, in seconds. Returns the argmax width over `2..=probe`, its predicted committed
+/// tokens per cycle, and the predicted tokens/second. Degenerate input keeps the probe width.
+pub(crate) fn select_verify_width(
+    hist: &[usize],
+    n: usize,
+    t_probe: f64,
+    t_two: f64,
+    probe: usize,
+) -> (usize, f64, f64) {
+    let committed = |w: usize| -> f64 {
+        let mut c = 1.0f64;
+        for k in 1..w {
+            let tail: usize = hist.iter().skip(k.min(hist.len())).sum();
+            c += tail as f64 / n.max(1) as f64;
+        }
+        c
+    };
+    if probe < 3 || n == 0 || t_probe <= 0.0 || t_two <= 0.0 {
+        let c = committed(probe);
+        let rate = if t_probe > 0.0 { c / t_probe } else { 0.0 };
+        return (probe, c, rate);
+    }
+    let marginal = (t_probe - t_two) / (probe - 2) as f64;
+    let cost = |w: usize| t_two + (w as f64 - 2.0) * marginal;
+    let mut best = (probe, committed(probe), committed(probe) / cost(probe));
+    for w in 2..probe {
+        let c = committed(w);
+        let r = c / cost(w);
+        if r > best.2 {
+            best = (w, c, r);
+        }
+    }
+    best
+}
+
 fn generation_budget(prompt_rows: usize, requested: usize, max_ctx: usize) -> Result<usize> {
     let reserved = prompt_rows
         .checked_add(DRAFT_TOKENS)
@@ -2305,7 +2358,14 @@ impl Qwen4MtpRuntime {
         let ec = model.engine_cfg();
         // The fixed MTP runtime supports two through four VERIFY rows. Keep the configured width
         // effective so kernel improvements can change the best batch size without a hidden cap.
-        let verify_tokens = ec.spec.k.clamp(2, DRAFT_TOKENS);
+        let probe_width = ec.spec.k.clamp(2, DRAFT_TOKENS);
+        // Issue #70 §7: on a weak draft head a wide VERIFY costs more than it commits, and the
+        // cheapest arm is not the best either. When the turn is long enough to pay for it, sample
+        // the probe width and a two-row arm, fit the linear cycle cost, and lock the
+        // throughput-optimal width for the rest of the turn. Short turns and `spec.k <= 2` keep the
+        // configured width exactly as before.
+        let adaptive = ec.spec.mtp_adaptive_width && probe_width > 2;
+        let mut verify_tokens = probe_width;
         let h_width = cfg.hc_mult * cfg.n_embd;
         let prompt_tokens = model.encode(prompt)?;
         if prompt_tokens.is_empty() {
@@ -2383,6 +2443,16 @@ impl Qwen4MtpRuntime {
         let mut generated = 0usize;
         let mut timing = super::MtpTiming::default();
         let mut cycle = 0usize;
+        // Adaptive-width calibration state. Calibration spans two warmups plus two sample arms
+        // (2 * MTP_CALIB_WARMUP + 2 * MTP_CALIB_CYCLES cycles); a turn must be at least four times
+        // that long to pay for it. Shorter turns keep the configured width untouched.
+        let calib_span = 2 * MTP_CALIB_WARMUP + 2 * MTP_CALIB_CYCLES;
+        let mut calibrating = adaptive && max_new >= 4 * calib_span;
+        let mut calib_hist = [0usize; DRAFT_TOKENS];
+        let mut calib_probe_secs = 0.0f64;
+        let mut calib_probe_n = 0usize;
+        let mut calib_two_secs = 0.0f64;
+        let mut calib_two_n = 0usize;
         let t_decode = std::time::Instant::now();
         let hit_eos = |token: u32| {
             !ec.sampling.ignore_eos && (cfg.eos_ids.contains(&token) || token == cfg.eos)
@@ -2392,6 +2462,11 @@ impl Qwen4MtpRuntime {
         {
             cycle += 1;
             let n_past = committed.len();
+            // Switch to the two-row arm at the start of its window; the decision below reads the
+            // probe arm's accept histogram, which the prefix-stable draft chain also governs.
+            if calibrating && cycle == MTP_CALIB_WARMUP + MTP_CALIB_CYCLES + 1 {
+                verify_tokens = 2;
+            }
 
             let t_draft = std::time::Instant::now();
             let candidates = {
@@ -2415,6 +2490,10 @@ impl Qwen4MtpRuntime {
             let draft_secs = t_draft.elapsed().as_secs_f64();
             timing.draft_secs += draft_secs;
             timing.total_drafted += verify_tokens - 1;
+            // Issue #70 §7: the width histogram records what each cycle actually paid — under the
+            // adaptive selector `verify_tokens` changes mid-turn, and without this the bench arms
+            // could not be separated. It must be recorded even when every draft is rejected.
+            timing.record_verify_width(verify_tokens);
 
             let mut feed = Vec::with_capacity(committed.len() + verify_tokens);
             feed.extend_from_slice(&committed);
@@ -2520,6 +2599,39 @@ impl Qwen4MtpRuntime {
                     catchup_secs * 1e3,
                 );
             }
+            if calibrating {
+                let cycle_secs = draft_secs + verify_secs + catchup_secs;
+                if cycle > MTP_CALIB_WARMUP && cycle <= MTP_CALIB_WARMUP + MTP_CALIB_CYCLES {
+                    calib_hist[accepted_spec] += 1;
+                    calib_probe_secs += cycle_secs;
+                    calib_probe_n += 1;
+                } else if cycle > 2 * MTP_CALIB_WARMUP + MTP_CALIB_CYCLES
+                    && cycle <= 2 * MTP_CALIB_WARMUP + 2 * MTP_CALIB_CYCLES
+                {
+                    calib_two_secs += cycle_secs;
+                    calib_two_n += 1;
+                }
+                if cycle >= 2 * MTP_CALIB_WARMUP + 2 * MTP_CALIB_CYCLES {
+                    let (selected, pred_committed, pred_rate) = select_verify_width(
+                        &calib_hist,
+                        calib_probe_n,
+                        calib_probe_secs / calib_probe_n.max(1) as f64,
+                        calib_two_secs / calib_two_n.max(1) as f64,
+                        probe_width,
+                    );
+                    verify_tokens = selected;
+                    calibrating = false;
+                    tracing::info!(
+                        "[qwen4 mtp adaptive] probe={probe_width} selected={selected} \
+                         (predicted {pred_committed:.2} tok/cycle @ {pred_rate:.1} tok/s); \
+                         T(probe)={:.1}ms T(2)={:.1}ms over {}/{} cycles",
+                        1e3 * calib_probe_secs / calib_probe_n.max(1) as f64,
+                        1e3 * calib_two_secs / calib_two_n.max(1) as f64,
+                        calib_probe_n,
+                        calib_two_n,
+                    );
+                }
+            }
             for token in emitted {
                 let eos = hit_eos(token);
                 generated += 1;
@@ -2541,14 +2653,18 @@ impl Qwen4MtpRuntime {
 
         if ec.prof.stages || infr_core::pager_profile::active() {
             let (draft_pct, verify_pct, catchup_pct) = timing.phase_shares();
+            let alpha = timing.alpha();
+            let mean_accept = timing.mean_accepted();
+            let widths = timing
+                .verify_width_hist()
+                .iter()
+                .map(|(w, n)| format!("{w}:{n}"))
+                .collect::<Vec<_>>()
+                .join(" ");
             tracing::info!(
-                "[qwen4 mtp summary] {cycle} cycles, {}/{} accepted (alpha={:.3}), {generated} tokens generated, phase share: draft {:.0}% verify {:.0}% catchup {:.0}%",
+                "[qwen4 mtp summary] {cycle} cycles, {}/{} accepted (alpha={alpha:.3}, mean accept {mean_accept:.2} tok/cycle), verify widths [{widths}], {generated} tokens generated, phase share: draft {draft_pct:.0}% verify {verify_pct:.0}% catchup {catchup_pct:.0}%",
                 timing.total_accepted,
                 timing.total_drafted,
-                timing.alpha(),
-                draft_pct,
-                verify_pct,
-                catchup_pct,
             );
         }
 
@@ -2568,10 +2684,44 @@ impl Qwen4MtpRuntime {
 #[cfg(test)]
 mod tests {
     use super::{
-        generation_budget, hidden_shift_copy_lengths, mtp_kv_spec, push_bounded, DeviceCatchPlanKey,
+        generation_budget, hidden_shift_copy_lengths, mtp_kv_spec, push_bounded,
+        select_verify_width, DeviceCatchPlanKey,
     };
     use infr_core::tensor::DType;
     use std::collections::VecDeque;
+
+    /// The RX7900XTX cost model measured on Qwen3.8-Flash-Next (issue #70 §7): probe width 4 runs
+    /// 68.8 ms/cycle and the two-row arm 45.0 ms, with the accept histogram `[152,119,72,71]`. The
+    /// fit predicts w=2 at ~36 tok/s and w=4 at ~31.5, so the selector must lock width two.
+    #[test]
+    fn adaptive_width_picks_two_for_a_weak_draft_head() {
+        let hist = [152, 119, 72, 71];
+        let (w, committed, rate) = select_verify_width(&hist, 414, 68.8e-3, 45.0e-3, 4);
+        assert_eq!(w, 2);
+        assert!((committed - 1.633).abs() < 0.01);
+        assert!((rate - 36.3).abs() < 1.0);
+    }
+
+    /// A strong head that always drafts three accepted rows makes the widest arm cheapest per
+    /// committed token, and the selector must keep the probe width.
+    #[test]
+    fn adaptive_width_keeps_the_probe_for_a_strong_draft_head() {
+        let hist = [0, 0, 0, 414];
+        let (w, committed, rate) = select_verify_width(&hist, 414, 68.8e-3, 45.0e-3, 4);
+        assert_eq!(w, 4);
+        assert!((committed - 4.0).abs() < 1e-9);
+        assert!((rate - 4.0 / 68.8e-3).abs() < 1e-6);
+    }
+
+    /// Degenerate calibration input (no samples, a probe-only width, or non-positive timings) must
+    /// keep the configured behaviour instead of panicking or picking a narrower arm.
+    #[test]
+    fn adaptive_width_degenerates_to_the_probe_width() {
+        assert_eq!(select_verify_width(&[0; 4], 0, 0.0, 0.0, 4).0, 4);
+        assert_eq!(select_verify_width(&[10, 0, 0, 0], 10, 0.05, 0.04, 2).0, 2);
+        let (w, _, _) = select_verify_width(&[10, 0, 0, 0], 10, 0.05, 0.04, 4);
+        assert_eq!(w, 2);
+    }
 
     #[test]
     fn generation_budget_clips_a_large_reply_to_the_remaining_context() {

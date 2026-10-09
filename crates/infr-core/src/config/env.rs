@@ -377,6 +377,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.spec.mtp_reprime = presence_inv(get, "INFR_NO_MTP_REPRIME");
     p.spec.mtp_draft_chain = presence_inv(get, "INFR_NO_MTP_DRAFT_CHAIN");
     p.spec.mtp_ple_overlap = presence_inv(get, "INFR_NO_MTP_PLE_OVERLAP");
+    p.spec.mtp_adaptive_width = presence_inv(get, "INFR_NO_MTP_ADAPTIVE_WIDTH");
     p.spec.draft = opt_path(get, "INFR_SPEC_DRAFT");
     p.spec.k = num(get, "INFR_SPEC_K");
     p.spec.debug = presence(get, "INFR_SPEC_DEBUG");

@@ -190,6 +190,7 @@ fn default_config_matches_documented_defaults() {
     assert!(!d.spec.mtp);
     assert!(d.spec.mtp_ckpt && d.spec.mtp_reprime && d.spec.mtp_draft_chain);
     assert!(d.spec.mtp_ple_overlap);
+    assert!(d.spec.mtp_adaptive_width);
     assert_eq!(d.spec.k, 6);
     assert_eq!(d.spec.mtp_context, 32 * 1024);
     assert_eq!(d.spec.mtp_max_context, 48 * 1024);
@@ -1349,6 +1350,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_NO_MTP_CKPT",
         "INFR_NO_MTP_DRAFT_CHAIN",
         "INFR_NO_MTP_PLE_OVERLAP",
+        "INFR_NO_MTP_ADAPTIVE_WIDTH",
         "INFR_NO_MTP_REPRIME",
         "INFR_NO_QKV_FUSE",
         "INFR_PIPELINE",
