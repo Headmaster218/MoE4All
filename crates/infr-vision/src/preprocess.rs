@@ -361,7 +361,14 @@ mod tests {
 
         let encode = |format: image::ImageFormat| {
             let mut buf = Cursor::new(Vec::new());
-            img.write_to(&mut buf, format).expect("encode fixture");
+            if format == image::ImageFormat::Ico {
+                image::DynamicImage::ImageRgb8(img.clone())
+                    .to_rgba8()
+                    .write_to(&mut buf, format)
+                    .expect("encode RGBA icon fixture");
+            } else {
+                img.write_to(&mut buf, format).expect("encode fixture");
+            }
             buf.into_inner()
         };
 
@@ -373,6 +380,7 @@ mod tests {
             image::ImageFormat::Gif,
             image::ImageFormat::Bmp,
             image::ImageFormat::Tiff,
+            image::ImageFormat::Ico,
         ] {
             let got = prepare_image_bytes(&encode(format), &cfg, &pos_table)
                 .unwrap_or_else(|e| panic!("{format:?} must prepare: {e:#}"));
