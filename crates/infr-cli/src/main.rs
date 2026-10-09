@@ -2834,6 +2834,15 @@ struct MtpBenchStats {
     draft_pct: f64,
     verify_pct: f64,
     catchup_pct: f64,
+    /// Issue #70 §7: verify cycles run, and the mean tokens COMMITTED per cycle (`alpha` cannot
+    /// express the per-iteration win — a 0-accept cycle still earns the target's bonus token).
+    cycles: usize,
+    mean_accepted: f64,
+    /// `(VERIFY rows, cycles)` this arm really paid, folded over all reps (issue #70 §7): the cost
+    /// side of speculative decode, which `alpha` and the phase shares both leave out. No new
+    /// baseline field is needed — the MTP-OFF baseline IS this bench call's `avg_ts`, measured in
+    /// the same process on the same machine, and `mtp_ratio` is already their ratio.
+    verify_widths: Vec<(usize, usize)>,
 }
 
 /// The one sentence (~10 tokens/rep) every MTP measurement decodes from, on BOTH engines
@@ -2891,6 +2900,9 @@ fn bench_mtp_tg(
         draft_pct,
         verify_pct,
         catchup_pct,
+        cycles: timing.cycles,
+        mean_accepted: timing.mean_accepted(),
+        verify_widths: timing.verify_width_hist(),
     })
 }
 
@@ -2928,9 +2940,15 @@ fn print_bench_avg_mtp(
         String::new()
     };
     // print-ok: program OUTPUT — an `infr bench` result line (`--json` shape included).
+    let widths = m
+        .verify_widths
+        .iter()
+        .map(|(w, n)| format!("{w}:{n}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     println!(
-        "{label}{d}: {avg:.1} t/s | mtp{}: {:.1} t/s ({ratio:.2}x, alpha={:.2}, draft {:.0}% verify {:.0}% catchup {:.0}%)  ({reps} reps{}){}",
-        m.n_gen, m.ts, m.alpha, m.draft_pct, m.verify_pct, m.catchup_pct,
+        "{label}{d}: {avg:.1} t/s | mtp{}: {:.1} t/s ({ratio:.2}x, alpha={:.2}, mean {:.2} tok/cycle, widths [{widths}], draft {:.0}% verify {:.0}% catchup {:.0}%)  ({reps} reps{}){}",
+        m.n_gen, m.ts, m.alpha, m.mean_accepted, m.draft_pct, m.verify_pct, m.catchup_pct,
         spread_note(samples, avg),
         placement_note(placement),
     );
@@ -2953,15 +2971,29 @@ fn bench_json_line(
     let avg = samples.iter().sum::<f64>() / samples.len().max(1) as f64;
     let reps_ts: Vec<String> = samples.iter().map(|s| format!("{s:.2}")).collect();
     let mtp_fields = match mtp {
-        Some(m) => format!(
-            ", \"mtp_ts\": {:.2}, \"mtp_ratio\": {:.4}, \"alpha\": {:.4}, \"draft_pct\": {:.1}, \"verify_pct\": {:.1}, \"catchup_pct\": {:.1}",
-            m.ts,
-            m.ts / avg.max(1e-9),
-            m.alpha,
-            m.draft_pct,
-            m.verify_pct,
-            m.catchup_pct
-        ),
+        Some(m) => {
+            // Issue #70 §7: `mtp_cycles` + `mtp_mean_accepted` + `mtp_verify_widths` (pairs of
+            // `[rows, cycles]`) are the per-iteration win and the VERIFY cost side, without which a
+            // "MTP got slower" number cannot be attributed to α, to accept length, or to width. The
+            // MTP-OFF baseline needs no new key: `avg_ts` above IS the same-process baseline.
+            let widths = m
+                .verify_widths
+                .iter()
+                .map(|(w, n)| format!("[{w},{n}]"))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                ", \"mtp_ts\": {:.2}, \"mtp_ratio\": {:.4}, \"alpha\": {:.4}, \"draft_pct\": {:.1}, \"verify_pct\": {:.1}, \"catchup_pct\": {:.1}, \"mtp_cycles\": {}, \"mtp_mean_accepted\": {:.4}, \"mtp_verify_widths\": [{widths}]",
+                m.ts,
+                m.ts / avg.max(1e-9),
+                m.alpha,
+                m.draft_pct,
+                m.verify_pct,
+                m.catchup_pct,
+                m.cycles,
+                m.mean_accepted,
+            )
+        }
         None => String::new(),
     };
     let place = match placement {
@@ -5684,6 +5716,9 @@ mod tests {
             draft_pct: 30.0,
             verify_pct: 60.0,
             catchup_pct: 10.0,
+            cycles: 96,
+            mean_accepted: 1.4375,
+            verify_widths: vec![(2, 4), (4, 92)],
         };
         let place = infr_llama::BenchPlacement {
             ubatch: 256,
@@ -5723,12 +5758,26 @@ mod tests {
         assert_eq!(v[0]["kv_layout"].as_str(), Some("q8_0"));
         assert_eq!(v[0]["submit_cap"].as_u64(), Some(112));
         assert_eq!(v[0]["mtp_ts"].as_f64(), Some(150.0));
+        // Issue #70 §7: the per-iteration win and the VERIFY width distribution have to survive into
+        // the machine-readable shape, not only the human-readable line — an archived `mtp_ratio`
+        // without them cannot say whether MTP lost because α fell or because the VERIFY got wider.
+        assert_eq!(v[0]["mtp_cycles"].as_u64(), Some(96));
+        assert_eq!(v[0]["mtp_mean_accepted"].as_f64(), Some(1.4375));
+        assert_eq!(
+            v[0]["mtp_verify_widths"].as_array().map(|a| a.len()),
+            Some(2),
+            "every VERIFY width reached is reported"
+        );
+        assert_eq!(v[0]["mtp_verify_widths"][1][0].as_u64(), Some(4));
+        assert_eq!(v[0]["mtp_verify_widths"][1][1].as_u64(), Some(92));
         // The CPU/Metal arms have no Vulkan placement: those keys must be ABSENT, not zeroed —
         // a `submit_cap: 0` there would read as "measured, unlimited" instead of "not applicable".
         let bare: serde_json::Value =
             serde_json::from_str(&bench_json_line(&samples, None, None)).unwrap();
         assert!(bare[0]["ubatch"].is_null());
         assert!(bare[0]["submit_cap"].is_null());
+        assert!(bare[0]["mtp_cycles"].is_null());
+        assert!(bare[0]["mtp_verify_widths"].is_null());
     }
 
     /// The spread note is the anti-average: it must show the peak-to-peak range, and say nothing
