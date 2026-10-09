@@ -807,8 +807,8 @@ impl Index<&ScratchKey> for ScratchPool {
     }
 }
 
-/// Lifetime of the pooled scratch used by paged static execution. Paged models rebuild their
-/// graph plan for every token, so this cache belongs to the model backend rather than the plan.
+/// Lifetime of pooled scratch for paged models and auxiliary static graphs. The cache belongs
+/// to each backend client rather than an individual graph plan.
 /// A phase transition drops the old pool before the new phase allocates its differently-sized
 /// workspace; repeated executes in one phase keep the same buffers and therefore keep any expert
 /// slots loaned to LLM runtime stable.
@@ -816,6 +816,7 @@ impl Index<&ScratchKey> for ScratchPool {
 enum RuntimePhase {
     Decode,
     Prefill,
+    Auxiliary,
 }
 
 #[derive(Default)]
@@ -846,7 +847,7 @@ impl RuntimePhaseArena {
     // Prefill shapes never enter this cache (the phase transition below releases all of them).
     const MAX_DECODE_SCRATCH_TOPOLOGIES: usize = 6;
 
-    /// Enter one Decode or Prefill execute. The arena owns every graph and pooled runtime buffer
+    /// Enter one execute. The arena owns every graph and pooled runtime buffer
     /// for that phase even though the physical ranges may be split across Vulkan arena shards.
     fn begin_execute(&mut self, phase: RuntimePhase, layout: &ScratchLayout) -> RuntimePhaseStart {
         let previous = self.phase;
@@ -864,8 +865,9 @@ impl RuntimePhaseArena {
         // will themselves need a larger capacity later in this execute. Keeping them while the
         // graph scratch grows creates an artificial old-pool + new-graph peak that the steady-
         // state runtime reserve neither needs nor prices. Equal-shape prefill still retains its
-        // high-water pool, and Decode keeps the established alternating-topology cache.
-        if phase == RuntimePhase::Prefill
+        // high-water pool, and Decode keeps the established alternating-topology cache. Auxiliary
+        // shapes follow the same bounded high-water policy as Prefill.
+        if phase != RuntimePhase::Decode
             && !scratch_reused
             && (topology_changed || reset_retained_scratch)
         {
@@ -887,11 +889,11 @@ impl RuntimePhaseArena {
             return false;
         }
 
-        // Alternating graph retention is a Decode-only optimization. Prefill workspaces are
+        // Alternating graph retention is a Decode-only optimization. Other workspaces can be
         // several GiB at a wide ubatch, so carrying the previous topology into the next allocation
         // creates an artificial old+new peak. The preceding execute has drained before this call,
         // making it safe to return both prior topologies to the unified arena immediately.
-        if phase == RuntimePhase::Prefill {
+        if phase != RuntimePhase::Decode {
             self.scratch.clear();
             self.scratch_layout = layout.iter().map(|_| None).collect();
             self.scratch = (0..layout.len()).map(|_| None).collect();
@@ -1014,9 +1016,8 @@ impl RuntimePhaseArena {
         self.pool.finish_execute();
     }
 
-    /// Release one client's complete phase workspace at a service-level workload switch. This is
-    /// never called between consecutive tokens of the same client; the shared execution gate
-    /// guarantees that no command still references these buffers when another client takes over.
+    /// Release one client's complete workspace on phase changes, idle expiry or allocation
+    /// pressure. The shared execution gate guarantees that no commands still reference it.
     pub(crate) fn release_phase(&mut self) {
         self.release_workspace();
         self.phase = None;
@@ -1028,6 +1029,22 @@ impl RuntimePhaseArena {
         self.scratch_layout.clear();
         self.parked_scratch.clear();
         self.pool.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_workspace(&mut self, buffer: Box<dyn Buffer>) {
+        let layout = vec![Some(buffer.len_bytes())];
+        self.begin_execute(RuntimePhase::Auxiliary, &layout);
+        self.install_scratch(&layout, vec![Some(buffer)]);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scratch_test_address(&self) -> Option<u64> {
+        self.scratch
+            .iter()
+            .flatten()
+            .next()
+            .and_then(|buffer| buffer.device_addr())
     }
 }
 
@@ -7981,8 +7998,9 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
     // Dense layer streaming forces the static path for a different reason than MoE (no readback
     // exists — layer order is deterministic — but the per-token ring staging + per-slot weight
     // offsets can't live inside a record-once tape whose descriptor sets and push constants are
-    // frozen at record time).
-    if !plan.eligible || be_.moe_paged() || be_.dense_paged() {
+    // frozen at record time). Auxiliary plans use the independent, expiring runtime cache rather
+    // than retaining buffer references inside a replay tape beyond that cache's deadline.
+    if !plan.eligible || be_.unified_client.is_some() || be_.moe_paged() || be_.dense_paged() {
         return execute_static(be_, &plan.graph, bindings);
     }
 
@@ -8023,7 +8041,13 @@ pub(crate) fn execute_chain(
     let Some(plan) = plan.as_any().downcast_ref::<VkDecodePlan>() else {
         return Ok(None);
     };
-    if !plan.eligible || n == 0 || n > 64 || be_.moe_paged() || be_.dense_paged() {
+    if !plan.eligible
+        || n == 0
+        || n > 64
+        || be_.unified_client.is_some()
+        || be_.moe_paged()
+        || be_.dense_paged()
+    {
         return Ok(None);
     }
     let mut guard = plan.replay.lock().unwrap();
@@ -8894,7 +8918,7 @@ impl Drop for FrozenMoeLutGuard<'_> {
 
 /// Per-execute static recording: prepare zeroed `Internal` scratch, record every op via `lower_op`
 /// (Static mode — pos as a push constant read from `positions[0]`), submit + wait. Paged plans
-/// retain shape-stable scratch within one decode/prefill phase; other plans allocate it per call.
+/// retain scratch within one decode/prefill phase; auxiliary clients retain it until idle expiry.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Result<()> {
     let _timeline_execute = infr_core::timeline::span("backend_execute");
@@ -8937,7 +8961,13 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
     // existing unified execution gate serializes this model's executes, so the mutex is only a
     // lifetime container rather than a hot-path contention point.
     let mut reset_retained_scratch = false;
-    let mut phase_arena = if be_.moe_paged() {
+    let mut phase_arena = if be_.unified_client.is_some() {
+        let mut arena = be_.runtime_phase.lock().unwrap();
+        let start = arena.begin_execute(RuntimePhase::Auxiliary, &layout);
+        reset_retained_scratch = start.reset_retained_scratch;
+        arena.grow_workspace(be_, &layout, &[])?;
+        Some(arena)
+    } else if be_.moe_paged() {
         if let Some(phase) = paged_static_phase(graph) {
             if phase == RuntimePhase::Prefill {
                 cancel_decode_prefetch(be_)?;
@@ -8963,6 +8993,9 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
                     }
                     RuntimePhase::Decode => {
                         sess.enter_decode();
+                    }
+                    RuntimePhase::Auxiliary => {
+                        unreachable!("auxiliary clients do not change the MoE phase")
                     }
                 }
             }
@@ -13305,7 +13338,7 @@ mod tests {
     }
 
     #[test]
-    fn service_client_transition_releases_the_whole_inactive_phase() {
+    fn explicit_runtime_release_frees_the_whole_phase() {
         let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut arena = RuntimePhaseArena::default();
         let layout = vec![Some(4)];
@@ -13363,6 +13396,34 @@ mod tests {
         assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert!(arena.scratch[0].is_some());
         assert!(arena.pool.buffers.is_empty());
+    }
+
+    #[test]
+    fn runtime_phase_auxiliary_reuses_high_water_and_bounds_topology_growth() {
+        let mut arena = RuntimePhaseArena::default();
+        let layout = vec![Some(64), None];
+        arena.begin_execute(RuntimePhase::Auxiliary, &layout);
+        arena.install_scratch(&layout, vec![Some(Box::new(TestBuffer(64))), None]);
+        arena
+            .pool
+            .buffers
+            .insert(("aux_pool", 64), Box::new(TestBuffer(64)));
+        for layout in [vec![Some(64), None], vec![Some(32), None]] {
+            let start = arena.begin_execute(RuntimePhase::Auxiliary, &layout);
+            assert!(start.scratch_reused);
+            assert!(start.reset_retained_scratch);
+            assert_eq!(arena.pool.buffers.len(), 1);
+        }
+        let start = arena.begin_execute(RuntimePhase::Auxiliary, &vec![Some(128), None]);
+        assert!(!start.scratch_reused);
+        assert!(arena.pool.buffers.is_empty());
+        let changed = vec![None, Some(64)];
+        arena.begin_execute(RuntimePhase::Auxiliary, &changed);
+        assert!(arena.scratch.iter().all(Option::is_none));
+        assert!(
+            arena.parked_scratch.is_empty(),
+            "auxiliary clients retain just one graph family"
+        );
     }
 
     #[test]
