@@ -360,7 +360,7 @@ struct BatchWork {
 }
 
 struct MtpSlotState {
-    head: crate::mtp::Qwen4MtpSession,
+    head: Arc<crate::mtp::Qwen4MtpSession>,
     cached: Vec<u32>,
     last_h: Vec<f32>,
     turn_checkpoints:
@@ -732,29 +732,36 @@ fn cold_session_worker(
             break;
         };
 
-        let _gate = gate.as_deref().map(StepGate::enter);
-        let mut heads = mtp_heads.as_ref().map(|heads| {
-            heads
+        // This slot stays busy until publication. Own its immutable source independently of the
+        // other MTP lanes and use the inference gate only for bounded GPU transfers/release.
+        let mtp_snapshot = mtp_heads.as_ref().and_then(|heads| {
+            let heads = heads
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            heads[index]
+                .cache_state_for(kv.cached_tokens())
+                .map(|state| (Arc::clone(&heads[index].head), state))
         });
-        let mut cache = match cache.lock() {
-            Ok(cache) => cache,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let mtp_state = heads
+        let mut writer = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .spill_writer();
+        let mtp_source = mtp_snapshot
             .as_ref()
-            .and_then(|heads| heads[index].cache_state_for(kv.cached_tokens()));
-        let mtp_source = heads
-            .as_ref()
-            .zip(mtp_state.as_ref())
-            .map(|(heads, state)| MtpCacheSource {
-                head: &heads[index].head,
-                state,
-            });
-        let spill_failed = match cache.spill(&mut kv, backend.as_ref(), &model_cfg, mtp_source) {
+            .map(|(head, state)| MtpCacheSource { head, state });
+        let spill_failed = match writer.spill_with_gate(
+            &mut kv,
+            backend.as_ref(),
+            &model_cfg,
+            mtp_source,
+            gate.as_deref(),
+        ) {
             Ok(true) => {
-                if let Some(heads) = heads.as_mut() {
+                let _gate = gate.as_deref().map(StepGate::enter);
+                if let Some(heads) = mtp_heads.as_ref() {
+                    let mut heads = heads
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     if let Err(error) = heads[index].head.release_kv(backend.as_ref()) {
                         tracing::warn!(
                             slot = index,
@@ -774,12 +781,16 @@ fn cold_session_worker(
                 true
             }
         };
-        if let Err(error) = cache.gc() {
-            tracing::warn!("cold KV cache maintenance failed: {error}");
+        {
+            // Serialize GC with restores/catalog publication, but never hold the GPU gate here.
+            let mut cache = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.publish_spills(writer);
+            if let Err(error) = cache.gc() {
+                tracing::warn!("cold KV cache maintenance failed: {error}");
+            }
         }
-        drop(cache);
-        drop(heads);
-        drop(_gate);
 
         let mut pool_guard = match pool.lock() {
             Ok(pool) => pool,
@@ -927,13 +938,13 @@ impl ParallelSeam {
             let mut heads = Vec::with_capacity(n_slots);
             for _ in 0..n_slots {
                 heads.push(MtpSlotState {
-                    head: crate::mtp::Qwen4MtpSession::with_fixed_and_catch(
+                    head: Arc::new(crate::mtp::Qwen4MtpSession::with_fixed_and_catch(
                         &vk,
                         Arc::clone(&fixed),
                         max_ctx,
                         Arc::clone(&catch),
                         model.engine_cfg().spec.mtp_context,
-                    )?,
+                    )?),
                     cached: Vec::new(),
                     last_h: vec![0.0; model.config().hc_mult * model.config().n_embd],
                     turn_checkpoints: std::array::from_fn(|_| None),
@@ -1592,7 +1603,7 @@ impl ParallelSeam {
                             }
                             heads[target].invalidate_all();
                         }
-                        let mtp_head = heads.as_ref().map(|heads| &heads[target].head);
+                        let mtp_head = heads.as_ref().map(|heads| heads[target].head.as_ref());
                         match cache.restore(entry, kv, self.vk.as_ref(), cfg, mtp_head) {
                             Ok(Some(state)) => {
                                 if let Some(heads) = heads.as_mut() {
