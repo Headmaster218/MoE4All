@@ -415,6 +415,10 @@ fn decode_token_rows(graph: &Graph) -> Option<usize> {
         .then_some(graph.sequence_spans.len())
 }
 
+fn cpu_miss_decode_graph(graph: &Graph) -> bool {
+    !graph.mtp_verify && decode_token_rows(graph) == Some(1)
+}
+
 fn qsa_topk_workspace_needed(
     rows: u32,
     blocks: u32,
@@ -9204,11 +9208,13 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
         // Crossing the cap therefore closes the segment at the next op boundary.
         if cap > 0 && rec.as_ref().is_some_and(|r| r.dispatches() >= cap) {
             splitter_splits += 1;
+            pstream.finish_cpu_miss(be_, pool)?;
             let seg = rec
                 .take()
                 .expect("segment always Some between ops")
                 .finish_nowait()
                 .map_err(|e| be(e.to_string()))?;
+            pstream.start_cpu_promotion(be_)?;
             submitted_dispatches += seg.dispatches();
             segments.push_back(seg);
             // Retire the oldest in-flight segment once the window is full. Queue execution is
@@ -9279,7 +9285,7 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
                     .as_ref()
                     .is_some_and(|s| s.is_streamed(wid));
                 if streamed {
-                    let arena_addr = stage_dense_linear(be_, &mut rec, &mut pstream, wid)?;
+                    let arena_addr = stage_dense_linear(be_, &mut rec, &mut pstream, pool, wid)?;
                     if let Err(e) = lower_op(
                         be_,
                         graph,
@@ -9341,12 +9347,14 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
     // Non-paged static execution keeps the established per-call lifetime: move its buffers beside
     // the other transient allocations until the final submit drains. Paged buffers remain in the
     // backend cache and are dropped only on a decode/prefill transition or model teardown.
+    pstream.finish_cpu_miss(be_, pool)?;
     if !using_phase_arena {
         transient.extend(pool.drain_values());
     }
     let last = rec.take().expect("segment always Some at loop end");
     submitted_dispatches += last.dispatches();
-    last.finish().map_err(|e| be(e.to_string()))?;
+    last.finish_after_submit(|| pstream.start_cpu_promotion(be_))
+        .map_err(|e| be(e.to_string()))?;
     // The blocking finish above already waited the queue idle — draining just releases the
     // pipelined segments' command buffers/fences (every buffer they referenced outlives this
     // call: pooled scratch in `transient`, ring/tape/arenas on the session).
@@ -9354,6 +9362,12 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
         seg.wait().map_err(|e| be(e.to_string()))?;
     }
     pstream.drain()?;
+    pstream.wait_cpu_promotion(be_)?;
+    if pstream.cpu_transfer_wait != 0 {
+        let acquire = be_.recorder()?;
+        pstream.acquire_cpu_promotion(&acquire);
+        acquire.finish()?;
+    }
     pstream.finish_prefill_uploads(be_)?;
     if using_phase_arena {
         // All queue work and asynchronous Prefill uploads that can reference pooled buffers have
@@ -9362,6 +9376,9 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
             .as_mut()
             .expect("phase arena exists when cached runtime is active")
             .finish_execute();
+    }
+    if let Some(abort) = pstream.cpu_promotion_abort.as_mut() {
+        abort.complete = true;
     }
     // Every recorder and pager-owned pending segment has now resolved its two GPU timestamps.
     // Fold this complete sample into the finite auto-tuner; dropping the guard on an earlier error
@@ -9377,6 +9394,13 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
         );
     }
     complete_decode_prefetch_handoffs(be_);
+    if be_.cfg().kernels.vulkan.cpu_miss_token_park && pstream.cpu_miss_controller.is_some() {
+        // All result readers and cache promotions drained; avoid private spin crossing into
+        // the next forward's PLE work while preserving warm phase/layer handoffs within this one.
+        if let Some(worker) = be_.cpu_miss_worker() {
+            worker.finish_burst()?;
+        }
+    }
     Ok(())
 }
 
@@ -9492,8 +9516,73 @@ impl Drop for PrefillUploader {
     }
 }
 
+enum CpuPromotionPending {
+    Push(Option<crate::cpu_miss::PromotionJob>),
+    Dma(crate::transfer::BackgroundTransferExecutor, Option<u64>),
+}
+
+impl CpuPromotionPending {
+    fn wait(&mut self) -> Result<()> {
+        match self {
+            Self::Push(job) => job.take().map_or(Ok(()), |job| job.wait()),
+            Self::Dma(executor, value) => value.take().map_or(Ok(()), |value| executor.wait(value)),
+        }
+    }
+}
+
+impl Drop for CpuPromotionPending {
+    fn drop(&mut self) {
+        let _ = self.wait();
+    }
+}
+
+struct CpuMissPromotion {
+    roles: [usize; 3],
+    ids: Vec<u32>,
+    layer: usize,
+    sources: Vec<crate::cpu_miss::Expert>,
+    started: bool,
+    pending: Option<CpuPromotionPending>,
+}
+
+struct CpuPromotionAbortGuard {
+    pager: Arc<crate::pager::MoePagerCell>,
+    experts: Vec<([usize; 3], u32)>,
+    complete: bool,
+}
+
+impl Drop for CpuPromotionAbortGuard {
+    fn drop(&mut self) {
+        if !self.complete {
+            if let Ok(mut pager) = self.pager.lock() {
+                if let Some(session) = pager.as_mut() {
+                    for &(roles, id) in &self.experts {
+                        session.discard_cpu_miss(roles, &[id]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Drop for CpuMissPromotion {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending.as_mut() {
+            let _ = pending.wait();
+        }
+    }
+}
+
 #[derive(Default)]
 struct PagedStream {
+    /// Sparse tape entries are only legal for the small-m shaders, never bucketed MMQ.
+    small_m_lut: bool,
+    /// Result copies can be encoded immediately; host writes must complete before submission or
+    /// the next pager epoch. Keeping the scratch key avoids a borrowed/raw mapped pointer.
+    cpu_miss: Option<(crate::cpu_miss::Job, CpuMissResultTarget, usize)>,
+    cpu_miss_controller: Option<crate::cpu_miss::AffinityGuard>,
+    cpu_promotion: Option<CpuMissPromotion>,
+    cpu_transfer_wait: u64,
     /// Per-ring-region in-flight segment (the one whose recorded copies read that region).
     pending: Vec<Option<crate::recorder::PendingSegment>>,
     /// Which ring region `cursor` allocates from.
@@ -9502,7 +9591,6 @@ struct PagedStream {
     cursor: usize,
     /// Words used in the session's LUT tape (reset only after full drains — `sync_stream`).
     tape_cursor: usize,
-    small_m_lut: bool,
     /// Prefill compute segments that do not consume a staging-ring region.
     compute_pending: std::collections::VecDeque<crate::recorder::PendingSegment>,
     /// Dedicated producer for whole-layer Host -> mapped-device-arena copies. It owns the layer fence
@@ -9513,9 +9601,177 @@ struct PagedStream {
     /// The host worker waits before publishing completion; this GPU dependency supplies the Vulkan
     /// memory-visibility edge between the two queue families without delaying graph recording.
     prefill_transfer_waits: std::collections::HashMap<usize, u64>,
+    // Drop last: canceled DMA must finish before invalidation, and its discarded acquire
+    // dependency must never leave newly promoted experts reusable by a later forward.
+    cpu_promotion_abort: Option<CpuPromotionAbortGuard>,
+}
+
+enum CpuMissResultTarget {
+    Staging(ScratchKey),
+    Mapped {
+        key: ScratchKey,
+        row_elements: usize,
+    },
 }
 
 impl PagedStream {
+    fn finish_cpu_miss(&mut self, be_: &VulkanBackend, pool: &ScratchPool) -> Result<()> {
+        if let Some((job, result_buf, layer)) = self.cpu_miss.take() {
+            let _layer = infr_core::timeline::layer(layer);
+            let wait_span = infr_core::timeline::span("cpu_miss_wait");
+            let output = job.wait()?;
+            drop(wait_span);
+            let _result_span = infr_core::timeline::span("cpu_miss_result");
+            match result_buf {
+                CpuMissResultTarget::Staging(key) => {
+                    be_.upload(pool[&key].as_ref(), bytemuck::cast_slice(&output.values))?;
+                }
+                CpuMissResultTarget::Mapped { key, row_elements } => {
+                    let target = crate::as_vk_buf(pool[&key].as_ref())?;
+                    let ptr = target
+                        .mapped_ptr()
+                        .ok_or_else(|| be("CPU result mapping disappeared"))?;
+                    let row_bytes = row_elements
+                        .checked_mul(4)
+                        .ok_or_else(|| be("CPU result row overflow"))?;
+                    if row_elements == 0
+                        || output.slots.len().checked_mul(row_elements) != Some(output.values.len())
+                        || output.slots.iter().any(|&slot| {
+                            slot.checked_add(1)
+                                .and_then(|n| n.checked_mul(row_bytes))
+                                .is_none_or(|end| end > target.size)
+                        })
+                    {
+                        return Err(be("CPU result slots exceed their mapped output"));
+                    }
+                    for (&slot, values) in output
+                        .slots
+                        .iter()
+                        .zip(output.values.chunks_exact(row_elements))
+                    {
+                        // Only CPU-owned miss slots are written. Hit/Shared stores may still be
+                        // in flight in other disjoint rows; queue submit publishes these writes.
+                        crate::copy_to_mapped(bytemuck::cast_slice(values), unsafe {
+                            ptr.add(slot * row_bytes)
+                        });
+                    }
+                }
+            }
+            if let Some(promotion) = self.cpu_promotion.as_mut() {
+                promotion.sources = output.experts;
+            }
+        }
+        Ok(())
+    }
+
+    fn start_cpu_promotion(&mut self, be_: &VulkanBackend) -> Result<()> {
+        let Some(promotion) = self.cpu_promotion.as_mut() else {
+            return Ok(());
+        };
+        if promotion.started || promotion.sources.is_empty() {
+            return Ok(());
+        }
+        let _layer = infr_core::timeline::layer(promotion.layer);
+        let _span = infr_core::timeline::span("cpu_miss_promotion_start");
+        promotion.started = true;
+        let abort = self
+            .cpu_promotion_abort
+            .get_or_insert_with(|| CpuPromotionAbortGuard {
+                pager: Arc::clone(&be_.moe_pager),
+                experts: Vec::new(),
+                complete: false,
+            });
+        abort
+            .experts
+            .extend(promotion.ids.iter().map(|&id| (promotion.roles, id)));
+        let result = (|| {
+            if be_.cfg().kernels.vulkan.cpu_miss_push {
+                be_.moe_pager()
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .prepare_cpu_miss_push(
+                        promotion.roles,
+                        &promotion.ids,
+                        &mut promotion.sources,
+                    )?;
+                let job = be_
+                    .cpu_miss_worker()
+                    .expect("compute worker exists")
+                    .promote(std::mem::take(&mut promotion.sources));
+                promotion.pending = Some(CpuPromotionPending::Push(Some(job)));
+            } else {
+                let push = be_
+                    .moe_pager()
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .push_roles_cpu(
+                        be_,
+                        &promotion.roles.map(|role| (role, promotion.ids.as_slice())),
+                        false,
+                    )?;
+                if let Some(executor) = be_
+                    .background_expert_transfer_executor()
+                    .filter(|_| push.background_compatible())
+                {
+                    if let Some(value) = push.submit_background(&executor)? {
+                        self.cpu_transfer_wait = self.cpu_transfer_wait.max(value);
+                        promotion.pending = Some(CpuPromotionPending::Dma(executor, Some(value)));
+                    }
+                } else {
+                    push.complete_without_recorder(be_)?;
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            be_.moe_pager()
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .discard_cpu_miss(promotion.roles, &promotion.ids);
+        }
+        result
+    }
+
+    fn wait_cpu_promotion(&mut self, be_: &VulkanBackend) -> Result<()> {
+        // Unsubmitted results have not admitted any cache slots yet. Keep their source handles
+        // until the segment containing the result copy has actually reached the GPU queue.
+        if self
+            .cpu_promotion
+            .as_ref()
+            .is_some_and(|promotion| !promotion.started)
+        {
+            return Ok(());
+        }
+        if let Some(mut promotion) = self.cpu_promotion.take() {
+            let _layer = infr_core::timeline::layer(promotion.layer);
+            let _span = infr_core::timeline::span("cpu_miss_promotion_wait");
+            if let Some(pending) = promotion.pending.as_mut() {
+                if let Err(error) = pending.wait() {
+                    be_.moe_pager()
+                        .lock()
+                        .unwrap()
+                        .as_mut()
+                        .unwrap()
+                        .discard_cpu_miss(promotion.roles, &promotion.ids);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn acquire_cpu_promotion(&mut self, rec: &Recorder<'_>) {
+        if self.cpu_transfer_wait != 0 {
+            rec.wait_for_dedicated_transfer(std::mem::take(&mut self.cpu_transfer_wait));
+        }
+    }
+
     fn ensure_slots(&mut self, slots: usize) {
         debug_assert!(slots >= 2);
         if self.pending.is_empty() {
@@ -9648,13 +9904,16 @@ fn rotate_stream<'a>(
     be_: &'a VulkanBackend,
     rec: &mut Option<Recorder<'a>>,
     ps: &mut PagedStream,
+    pool: &ScratchPool,
 ) -> Result<()> {
     let acquire_t0 = infr_core::pager_profile::start();
+    ps.finish_cpu_miss(be_, pool)?;
     let seg = rec
         .take()
         .expect("segment always Some between ops")
         .finish_nowait()
         .map_err(|e| be(e.to_string()))?;
+    ps.start_cpu_promotion(be_)?;
     debug_assert!(!ps.pending.is_empty());
     ps.pending[ps.half] = Some(seg);
     ps.half = (ps.half + 1) % ps.pending.len();
@@ -9711,14 +9970,18 @@ fn prefetch_compute_live(ps: &PagedStream, probe: PrefetchComputeProbe) -> Resul
 }
 
 fn submit_prefill_compute<'a>(
+    be_: &VulkanBackend,
     rec: &mut Option<Recorder<'a>>,
     ps: &mut PagedStream,
+    pool: &ScratchPool,
 ) -> Result<PrefetchComputeProbe> {
+    ps.finish_cpu_miss(be_, pool)?;
     let seg = rec
         .take()
         .expect("segment always Some between ops")
         .finish_nowait()
         .map_err(|e| be(e.to_string()))?;
+    ps.start_cpu_promotion(be_)?;
     if ps.cursor > 0 {
         let slot = ps.half;
         debug_assert!(ps.pending[ps.half].is_none());
@@ -9744,18 +10007,23 @@ fn sync_stream<'a>(
     be_: &'a VulkanBackend,
     rec: &mut Option<Recorder<'a>>,
     ps: &mut PagedStream,
+    pool: &ScratchPool,
 ) -> Result<()> {
     let _timeline_sync = infr_core::timeline::span("router_sync_stream");
     let sync_t0 = infr_core::pager_profile::start();
+    ps.finish_cpu_miss(be_, pool)?;
     rec.take()
         .expect("segment always Some between ops")
-        .finish()
+        .finish_after_submit(|| ps.start_cpu_promotion(be_))
         .map_err(|e| be(e.to_string()))?;
     ps.drain()?; // fences already signaled (queue idle) — releases their transient objects
+    ps.wait_cpu_promotion(be_)?;
     ps.cursor = 0;
     ps.tape_cursor = 0;
     clear_frozen_moe_lut_slots(be_);
-    *rec = Some(be_.recorder()?);
+    let fresh = be_.recorder()?;
+    ps.acquire_cpu_promotion(&fresh);
+    *rec = Some(fresh);
     if let Some(elapsed) = infr_core::pager_profile::elapsed(sync_t0) {
         infr_core::pager_profile::record_paging_sync_wait(elapsed);
     }
@@ -9841,6 +10109,7 @@ fn stage_dense_linear<'a>(
     be_: &'a VulkanBackend,
     rec: &mut Option<Recorder<'a>>,
     ps: &mut PagedStream,
+    pool: &ScratchPool,
     wid: usize,
 ) -> Result<u64> {
     loop {
@@ -9873,7 +10142,7 @@ fn stage_dense_linear<'a>(
                     .arena_stream_barrier();
                 return Ok(arena_addr);
             }
-            None => rotate_stream(be_, rec, ps)?,
+            None => rotate_stream(be_, rec, ps, pool)?,
         }
     }
 }
@@ -9968,9 +10237,12 @@ fn prefetch_next_moe_layer<'a>(
     be_: &'a VulkanBackend,
     rec: &mut Option<Recorder<'a>>,
     ps: &mut PagedStream,
+    pool: &ScratchPool,
     current_gate_id: usize,
     next_chunk: bool,
 ) -> Result<()> {
+    ps.finish_cpu_miss(be_, pool)?;
+    ps.wait_cpu_promotion(be_)?;
     ps.poll_prefill_uploads(be_)?;
     // Dense streaming can attach staging-ring lifetime to this same segment. A transfer endpoint
     // that cannot run on the existing host producer also takes the synchronous correctness path.
@@ -10557,6 +10829,39 @@ fn execute_paged_moe<'a>(
     } else {
         None
     };
+    let mut cpu_miss_input = None;
+    let cpu_cfg = &be_.cfg().kernels.vulkan;
+    let cpu_input_eligible = cpu_cfg.cpu_miss_threads != 0
+        && crate::cpu_miss::within_limit(1, cpu_cfg.cpu_miss_max)
+        && crate::cpu_miss::supported(cpu_cfg.cpu_miss_threads)
+        && crate::cpu_miss::geometry(rows, 1, ne, nff, gdt, udt, ddt)
+        && (gdt != infr_core::DType::Iq3S || cpu_cfg.cpu_miss_iq3)
+        && cpu_miss_decode_graph(graph)
+        && !*fused_gate_up
+        && !*weight_before
+        && graph.desc(*x).dtype == infr_core::DType::F32
+        && swiglu_clamp.is_none()
+        && matches!(act, Activation::Silu)
+        && {
+            let roles = [
+                buffer_identity(r(*gate_exps)?),
+                buffer_identity(r(*up_exps)?),
+                buffer_identity(r(*down_exps)?),
+            ];
+            let guard = be_.moe_pager().lock().unwrap();
+            let sess = guard.as_ref().unwrap();
+            crate::cpu_miss::decode_layer(sess.registered_layer(roles[0], n_expert)?)
+                && sess.cpu_miss_source_supported(roles, true)
+        };
+    if cpu_input_eligible && cpu_cfg.cpu_miss_input_tap && !has_bias && !hash {
+        cpu_miss_input = Some(pooled_usage(
+            pool,
+            be_,
+            "moe_cpu_miss_input",
+            ne * 4,
+            BufferUsage::Readback,
+        )?);
+    }
     {
         let rc = rec.as_ref().expect("segment always Some between ops");
         let rxb = r(*router_x)?;
@@ -10577,7 +10882,10 @@ fn execute_paged_moe<'a>(
             Some(id) => r(*id)?,
             None => pool[dummy_key.as_ref().expect("absent hash ids allocated dummy")].as_ref(),
         };
-        rc.moe_topk(
+        let tap = cpu_miss_input
+            .map(|key| -> Result<_> { Ok((r(*x)?, pool[&key].as_ref())) })
+            .transpose()?;
+        rc.moe_topk_with_tap(
             pool[&logits].as_ref(),
             pool[&ids_key].as_ref(),
             pool[&wts].as_ref(),
@@ -10593,6 +10901,7 @@ fn execute_paged_moe<'a>(
             *n_expert_groups_used,
             hash_buf,
             hash,
+            tap,
         );
         if let Some(shared) = shared {
             // One scalar raw gate logit per row. It is independent of top-k and remains a tiny
@@ -10637,6 +10946,12 @@ fn execute_paged_moe<'a>(
     // Layer-LOCAL ids to stage; empty = residency already guaranteed (all-resident inline path).
     let mut stage_ids: Vec<u32> = Vec::new();
     let mut stream_synced_for_cpu_push = false;
+    let mut cpu_miss_result = None;
+    // A submitted promotion can still own mapped slots; drain before any residency changes.
+    // Unsubmitted result copies retain their sources until sync_stream submits them.
+    ps.finish_cpu_miss(be_, pool)?;
+    ps.wait_cpu_promotion(be_)?;
+    ps.acquire_cpu_promotion(rec.as_ref().expect("ambient segment exists"));
     if !layer_stream && !touch_all {
         let changed = be_
             .moe_pager()
@@ -10654,7 +10969,8 @@ fn execute_paged_moe<'a>(
             );
         }
     }
-    // Acquire small-m scratch before the host-dependent router readback launch interval.
+    // Keep workspace preparation off the router-readback critical path, but never allocate
+    // before the previous promotion drained or before the Prefill arena changed ownership.
     let small_workspace = if paged_mmq_scratch_requests(be_, graph, op).is_none() {
         Some(PagedSmallScratch {
             gbuf: pooled(pool, be_, "moe_paged_g", physical_slots * gu_width * 4)?,
@@ -10698,7 +11014,34 @@ fn execute_paged_moe<'a>(
             // Split: the router's routing is host-unknown and some routed expert may be absent —
             // block once, read the ids off the mapped Staging buffer, stage exactly the routed
             // set into the fresh ambient segment (which then stays open for the layers after).
-            sync_stream(be_, rec, ps)?;
+            if cpu_input_eligible {
+                let key = if let Some(key) = cpu_miss_input {
+                    key
+                } else {
+                    pooled_usage(
+                        pool,
+                        be_,
+                        "moe_cpu_miss_input",
+                        ne * 4,
+                        BufferUsage::Readback,
+                    )?
+                };
+                cpu_miss_result = Some(pooled_usage(
+                    pool,
+                    be_,
+                    "moe_cpu_miss_result",
+                    ne * 4 * cpu_cfg.cpu_miss_max,
+                    BufferUsage::Staging,
+                )?);
+                let _ = be_.cpu_miss_worker();
+                if cpu_miss_input.is_none() {
+                    let rc = rec.as_ref().expect("segment always Some between ops");
+                    rc.label_next("cpu_miss_input_copy");
+                    rc.copy(r(*x)?, 0, pool[&key].as_ref(), 0, ne * 4);
+                }
+                cpu_miss_input = Some(key);
+            }
+            sync_stream(be_, rec, ps, pool)?;
             stream_synced_for_cpu_push = true;
             if close_active_prefetch {
                 let value = finish_decode_prefetch_target(be_, current_layer)?;
@@ -10720,7 +11063,7 @@ fn execute_paged_moe<'a>(
         }
     }
     if (prefetch_gpu.is_some() || close_active_prefetch) && !stream_synced_for_cpu_push {
-        sync_stream(be_, rec, ps)?;
+        sync_stream(be_, rec, ps, pool)?;
         stream_synced_for_cpu_push = true;
     }
     if close_active_prefetch && !active_prefetch_finished {
@@ -10745,10 +11088,11 @@ fn execute_paged_moe<'a>(
     // drain earlier arena readers before overwriting LRU slots. Normal Prefill uses fenced dynamic
     // lanes; Decode already synced above in order to read router ids.
     if !layer_stream && !stage_ids.is_empty() && !stream_synced_for_cpu_push {
-        sync_stream(be_, rec, ps)?;
+        sync_stream(be_, rec, ps, pool)?;
     }
 
-    // Batched Prefill still acquires its workspace here; small-m scratch is already prepared.
+    // Workspace acquisition is below only for batched Prefill. Small-m workspace was acquired
+    // before router readback, outside the host-dependent launch interval.
     let mmq_requests = paged_mmq_scratch_requests(be_, graph, op);
     let moe_scratch = if let Some(requests) = mmq_requests {
         let mut keys = pooled_batch(pool, be_, &requests)?.into_iter();
@@ -10794,6 +11138,8 @@ fn execute_paged_moe<'a>(
     let mut row_mask_bank = MOE_ROW_MASK_NONE;
     let mut role_batches_preopened = false;
     let mut promotion_probe = None;
+    let mut cpu_miss_job = None;
+    let mut cpu_promoted = false;
     let mut narrow_hit_activation = false;
     // Small-m hit-first schedule: launch complete resident Gate/Up/Down triplets while every
     // missing triplet is promoted. A scalar decode uses the original push-constant mask; a short
@@ -10857,6 +11203,62 @@ fn execute_paged_moe<'a>(
                     bytemuck::cast_slice(&ids_and_masks[..n_slots + 2 * rows]),
                 )
                 .map_err(|e| be(e.to_string()))?;
+            }
+            // Full-RAM computation does not admit/overwrite GPU cache slots. Start it before
+            // LRU maintenance and command recording, which can overlap the CPU's GU phase.
+            let cpu_cfg = &be_.cfg().kernels.vulkan;
+            if cpu_input_eligible
+                && crate::cpu_miss::within_limit(miss_count, cpu_cfg.cpu_miss_max)
+                && cpu_miss_input.is_some()
+            {
+                if let Some(worker) = be_.cpu_miss_worker() {
+                    let slots: Vec<_> = (0..n_used)
+                        .filter(|&slot| miss_masks[0] & (1 << slot) != 0)
+                        .collect();
+                    let experts = be_
+                        .moe_pager()
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .cpu_miss_experts(
+                            [gate_id, up_id, down_id],
+                            &miss_ids[..miss_count],
+                            &slots,
+                            true,
+                        );
+                    if let Some(experts) = experts {
+                        if ps.cpu_miss_controller.is_none() {
+                            ps.cpu_miss_controller = worker.controller_guard();
+                        }
+                        let result_buf =
+                            cpu_miss_result.expect("input/result scratch prepared together");
+                        let input_span = infr_core::timeline::span("cpu_miss_input");
+                        let mut input = vec![0.0f32; ne];
+                        be_.download(
+                            pool[&cpu_miss_input.unwrap()].as_ref(),
+                            bytemuck::cast_slice_mut(&mut input),
+                        )?;
+                        drop(input_span);
+                        if !cpu_cfg.cpu_miss_validate {
+                            debug_assert!(ps.cpu_promotion.is_none());
+                            ps.cpu_promotion = Some(CpuMissPromotion {
+                                roles: [gate_id, up_id, down_id],
+                                ids: miss_ids[..miss_count].to_vec(),
+                                layer: current_layer as usize,
+                                sources: Vec::new(),
+                                started: false,
+                                pending: None,
+                            });
+                            cpu_promoted = true;
+                        }
+                        cpu_miss_job = Some((
+                            worker.submit(experts, gdt, input),
+                            result_buf,
+                            miss_masks[0],
+                        ));
+                    }
+                }
             }
             let (role_batches_open, hit_push) = {
                 let mut guard = be_.moe_pager().lock().unwrap();
@@ -11084,7 +11486,7 @@ fn execute_paged_moe<'a>(
                         first_row_mask_bank,
                     );
                 }
-                promotion_probe = Some(submit_prefill_compute(rec, ps)?);
+                promotion_probe = Some(submit_prefill_compute(be_, rec, ps, pool)?);
                 let fresh = be_.recorder()?;
                 fresh.seed_barrier();
                 fresh.arena_stream_barrier();
@@ -11118,6 +11520,7 @@ fn execute_paged_moe<'a>(
             .min()
             .unwrap_or(0),
     ) && !layer_stream
+        && cpu_miss_job.is_none()
         && graph.independent_rows
         && decode_token_rows(graph) == Some(rows)
         && (2..=3).contains(&rows)
@@ -11156,7 +11559,7 @@ fn execute_paged_moe<'a>(
     };
     // Resolve every role under its size pool's epoch, then combine all full-RAM, bounded-RAM or
     // SSD-backed moves into one transfer batch.
-    if roles_batched {
+    if roles_batched && !cpu_promoted {
         let overlap = if let Some(probe) = promotion_probe {
             if infr_core::pager_profile::active() {
                 Some((
@@ -11275,7 +11678,7 @@ fn execute_paged_moe<'a>(
                 physical_slots * nff,
                 None,
             );
-            submit_prefill_compute(rec, ps)?;
+            submit_prefill_compute(be_, rec, ps, pool)?;
             let fresh = be_.recorder()?;
             fresh.seed_barrier();
             fresh.arena_stream_barrier();
@@ -11298,6 +11701,7 @@ fn execute_paged_moe<'a>(
     } else {
         stage_ids.as_slice()
     };
+    let cpu_offload = cpu_miss_job.is_some() && !be_.cfg().kernels.vulkan.cpu_miss_validate;
     // The all-resident fast path leaves router ids on the GPU and therefore has no exact CPU list.
     // Protect that layer's complete LUT; every other Decode path protects only routed ids.
     let all_resident_lut_ids =
@@ -11305,7 +11709,9 @@ fn execute_paged_moe<'a>(
     let role_lut_ids = all_resident_lut_ids
         .as_deref()
         .unwrap_or(stage_ids.as_slice());
-    let gate_w = if let Some((gate, _)) = pipelined_gate_up {
+    let gate_w = if cpu_offload {
+        0 // CPU miss outputs do not read routed GPU weights or their LUT windows.
+    } else if let Some((gate, _)) = pipelined_gate_up {
         gate
     } else if layer_stream {
         stage_layer_and_window(be_, rec, ps, gate_id, n_expert)?
@@ -11322,7 +11728,9 @@ fn execute_paged_moe<'a>(
             roles_batched,
         )?
     };
-    let up_w = if let Some((_, up)) = pipelined_gate_up {
+    let up_w = if cpu_offload {
+        0
+    } else if let Some((_, up)) = pipelined_gate_up {
         up
     } else if *fused_gate_up {
         gate_w // never dispatched (no Up GEMV on the fused shape) — placeholder
@@ -11341,7 +11749,9 @@ fn execute_paged_moe<'a>(
             roles_batched,
         )?
     };
-    let down_w = if layer_stream {
+    let down_w = if cpu_offload {
+        0
+    } else if layer_stream {
         stage_layer_and_window(be_, rec, ps, down_id, n_expert)?
     } else {
         stage_and_window(
@@ -11571,7 +11981,7 @@ fn execute_paged_moe<'a>(
             *weight_before,
         );
         if layer_stream {
-            prefetch_next_moe_layer(be_, rec, ps, gate_id, graph.prefill_next_chunk)?;
+            prefetch_next_moe_layer(be_, rec, ps, pool, gate_id, graph.prefill_next_chunk)?;
         }
         return Ok(current_layer); // recorded inline; the ambient segment stays open
     }
@@ -11601,7 +12011,9 @@ fn execute_paged_moe<'a>(
         && udt == infr_core::DType::Iq2Xs
         && ne == 2560
         && nff == 640;
-    if pipelined_gate_up.is_some() {
+    if cpu_offload {
+        // Hit+Shared already ran. Their clears/activation must not run again over the miss slots.
+    } else if pipelined_gate_up.is_some() {
         // Gate/Up and activation were submitted before the independent Down pool upload.
     } else if fused_decode_swiglu {
         let guard = be_.moe_pager().lock().unwrap();
@@ -11737,7 +12149,7 @@ fn execute_paged_moe<'a>(
         }
     }
     let rec2 = rec.as_ref().expect("segment always Some between ops");
-    {
+    if !cpu_offload {
         let guard = be_.moe_pager().lock().unwrap();
         let sess = guard.as_ref().expect("checked above");
         linear_paged_maybe_shared(
@@ -11760,11 +12172,85 @@ fn execute_paged_moe<'a>(
             row_mask_bank,
         );
     }
+    let mut host_cpu_result = None;
+    if let Some((job, result_buf, miss_mask)) = cpu_miss_job {
+        if be_.cfg().kernels.vulkan.cpu_miss_validate {
+            let wait_span = infr_core::timeline::span("cpu_miss_wait");
+            let output = job.wait()?;
+            drop(wait_span);
+            sync_stream(be_, rec, ps, pool)?;
+            let mut gpu = vec![0.0f32; physical_slots * ne];
+            be_.download(pool[&ybuf].as_ref(), bytemuck::cast_slice_mut(&mut gpu))?;
+            for (index, &slot) in output.slots.iter().enumerate() {
+                for (&cpu, &gpu) in output.values[index * ne..(index + 1) * ne]
+                    .iter()
+                    .zip(&gpu[slot * ne..(slot + 1) * ne])
+                {
+                    if !cpu.is_finite()
+                        || !gpu.is_finite()
+                        || (cpu - gpu).abs() > 0.003 + gpu.abs() * 0.002
+                    {
+                        return Err(be(format!("CPU miss parity failure: layer={current_layer} slot={slot} cpu={cpu} gpu={gpu}")));
+                    }
+                }
+            }
+        } else {
+            let rc = rec.as_ref().expect("segment always Some between ops");
+            rc.arena_stream_barrier();
+            let direct = be_.cfg().kernels.vulkan.cpu_miss_direct_result
+                && crate::as_vk_buf(pool[&ybuf].as_ref())?
+                    .mapped_ptr()
+                    .is_some();
+            let target = if be_.cfg().kernels.vulkan.cpu_miss_host_result
+                && shared.is_some()
+                && miss_mask.count_ones() == 1
+            {
+                debug_assert_eq!(rows, 1);
+                host_cpu_result = Some((result_buf, miss_mask.trailing_zeros() as usize));
+                CpuMissResultTarget::Staging(result_buf)
+            } else if direct {
+                CpuMissResultTarget::Mapped {
+                    key: ybuf,
+                    row_elements: ne,
+                }
+            } else {
+                let mut index = 0;
+                for slot in 0..n_used {
+                    if miss_mask & (1 << slot) == 0 {
+                        continue;
+                    }
+                    rc.copy(
+                        pool[&result_buf].as_ref(),
+                        index * ne * 4,
+                        pool[&ybuf].as_ref(),
+                        slot * ne * 4,
+                        ne * 4,
+                    );
+                    index += 1;
+                }
+                CpuMissResultTarget::Staging(result_buf)
+            };
+            debug_assert!(ps.cpu_miss.is_none());
+            ps.cpu_miss = Some((job, target, current_layer as usize));
+        }
+    }
+    let rec2 = rec.as_ref().expect("segment always Some between ops");
     let dstb = match shared {
         Some(shared) => r(shared.dst)?,
         None => r(*dst)?,
     };
-    if let Some(shared) = shared {
+    if let (Some(shared), Some((result, slot))) = (shared, host_cpu_result) {
+        rec2.moe_accumulate_shared_cpu(
+            pool[&ybuf].as_ref(),
+            pool[&wts].as_ref(),
+            r(shared.gate)?,
+            dstb,
+            pool[&result].as_ref(),
+            ne,
+            n_used,
+            slot,
+        );
+    } else if let Some(shared) = shared {
         rec2.moe_accumulate_shared(
             pool[&ybuf].as_ref(),
             pool[&wts].as_ref(),
@@ -11801,19 +12287,21 @@ fn execute_paged_moe<'a>(
         }
     }
     if layer_stream {
-        prefetch_next_moe_layer(be_, rec, ps, gate_id, graph.prefill_next_chunk)?;
+        prefetch_next_moe_layer(be_, rec, ps, pool, gate_id, graph.prefill_next_chunk)?;
     } else if rows <= MOE_HIT_FIRST_MAX_ROWS
-        && be_.use_decode_early_submit(
-            rows,
-            if be_.cfg().paging.expert_prefetch {
-                None
-            } else {
-                measured_decode_rows
-            },
-            graph.mtp_verify,
-        )
+        && ((cpu_offload && be_.cfg().kernels.vulkan.cpu_miss_early_submit)
+            || (!cpu_offload
+                && be_.use_decode_early_submit(
+                    rows,
+                    if be_.cfg().paging.expert_prefetch {
+                        None
+                    } else {
+                        measured_decode_rows
+                    },
+                    graph.mtp_verify,
+                )))
     {
-        submit_prefill_compute(rec, ps)?;
+        submit_prefill_compute(be_, rec, ps, pool)?;
         let fresh = be_.recorder()?;
         fresh.seed_barrier();
         fresh.arena_stream_barrier();
@@ -11938,6 +12426,288 @@ mod tests {
             session.clear_frozen_lut_slots();
         }
     }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU and AVX2+FMA; run explicitly"]
+    fn deferred_cpu_miss_abort_invalidates_only_promoted_experts_after_drain() {
+        use super::*;
+        use crate::pager::{ExpertSource, MoeHostChunkSpec, MoePagerLayout, MoePoolSpec, Role};
+        use infr_core::blockio::{BlockDesc, BlockExtent, BlockIo};
+        struct FixtureIo;
+        impl BlockIo for FixtureIo {
+            fn read_block(&self, desc: &BlockDesc, dst: &mut [u8]) -> Result<()> {
+                dst[..desc.nbytes()].fill(desc.id as u8 + 1);
+                Ok(())
+            }
+        }
+        let Some(worker) = crate::cpu_miss::Worker::new(4, true) else {
+            return;
+        };
+        let be_ = VulkanBackend::new().unwrap();
+        const SLOT: usize = 65536;
+        be_.init_moe_pager(MoePagerLayout {
+            load_reserve_bytes: 0,
+            n_blocks: 2,
+            pools: vec![MoePoolSpec {
+                slot_bytes: SLOT,
+                n_slots: 16,
+                min_enabled_slots: 8,
+            }],
+            host_tier: None,
+            host_store_io: Some(Arc::new(FixtureIo)),
+            dynamic_state_reserve_bytes: 0,
+            dynamic_state_max_allocation_bytes: 0,
+            prefill_min_lane_bytes: 0,
+            runtime_reserve_bytes: 0,
+            host_chunks: vec![MoeHostChunkSpec {
+                base_offset: 0,
+                bytes: SLOT * 6,
+            }],
+            prefill_target_lanes: 1,
+            prefill_cache_bytes: (SLOT * 16) as u64,
+        })
+        .unwrap();
+        let roles = [101, 102, 103];
+        {
+            let mut pager = be_.moe_pager().lock().unwrap();
+            let session = pager.as_mut().unwrap();
+            for (i, role) in [Role::Gate, Role::Up, Role::Down].into_iter().enumerate() {
+                session
+                    .register(
+                        role,
+                        roles[i],
+                        ExpertSource {
+                            bank: Arc::new(vec![0u8; SLOT * 2]),
+                            stride_bytes: SLOT,
+                            layer_base: 0,
+                            host_offset: SLOT * 2 * i,
+                            file: Some(BlockDesc {
+                                id: i as u32,
+                                extents: vec![BlockExtent {
+                                    offset: 0,
+                                    len: SLOT * 2,
+                                }],
+                            }),
+                        },
+                        2,
+                    )
+                    .unwrap();
+            }
+        }
+        {
+            let mut pager = be_.moe_pager().lock().unwrap();
+            let session = pager.as_mut().unwrap();
+            session.begin_role_batches(&roles).unwrap();
+            session
+                .push_roles_cpu(&be_, &roles.map(|role| (role, &[1u32][..])), false)
+                .unwrap()
+                .complete_without_recorder(&be_)
+                .unwrap();
+            session.touch_routed_hits(&roles, &[1, 1]).unwrap();
+            session.touch_routed_hits(&roles, &[]).unwrap();
+            assert!(session.touch_routed_hits(&roles, &[0]).is_err());
+            assert!(session.touch_routed_hits(&roles, &[2]).is_err());
+            assert!(session.touch_routed_hits(&[usize::MAX], &[1]).is_err());
+            assert_eq!(
+                session.routed_roles_resident_mask(&roles, &[0, 1]).unwrap(),
+                0b10
+            );
+            let mut cursor = 0;
+            assert!(session.cpu_miss_source_supported(roles, true));
+            assert!(!session.cpu_miss_source_supported([roles[0], roles[1], usize::MAX], true));
+            for role in roles {
+                let dense = session.lut_window(&mut cursor, role, 2).unwrap();
+                let sparse = session
+                    .routed_lut_window(&mut cursor, role, 2, &[1, 1])
+                    .unwrap();
+                let ptr = crate::as_vk_buf(session.tape())
+                    .unwrap()
+                    .mapped_ptr()
+                    .unwrap()
+                    .cast::<u64>();
+                unsafe {
+                    assert_eq!(
+                        ptr.add(dense as usize + 1).read_unaligned(),
+                        ptr.add(sparse as usize + 1).read_unaligned()
+                    );
+                }
+                let previous = cursor;
+                assert!(session
+                    .routed_lut_window(&mut cursor, role, 2, &[0])
+                    .is_err());
+                assert!(session
+                    .routed_lut_window(&mut cursor, role, 2, &[2])
+                    .is_err());
+                assert_eq!(cursor, previous);
+                session
+                    .routed_lut_window(&mut cursor, role, 2, &[])
+                    .unwrap();
+            }
+            session.clear_frozen_lut_slots();
+        }
+        for (complete, already_joined) in [(true, true), (false, false), (false, true)] {
+            let mut experts = {
+                let mut pager = be_.moe_pager().lock().unwrap();
+                let session = pager.as_mut().unwrap();
+                session.discard_cpu_miss(roles, &[0]);
+                session.begin_role_batches(&roles).unwrap();
+                let experts = session.cpu_miss_experts(roles, &[0], &[3], true).unwrap();
+                session
+                    .push_roles_cpu(&be_, &roles.map(|role| (role, &[1u32][..])), false)
+                    .unwrap()
+                    .complete_without_recorder(&be_)
+                    .unwrap();
+                experts
+            };
+            be_.moe_pager()
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .prepare_cpu_miss_push(roles, &[0], &mut experts)
+                .unwrap();
+            let mut ps = PagedStream::default();
+            ps.cpu_promotion_abort = Some(CpuPromotionAbortGuard {
+                pager: Arc::clone(&be_.moe_pager),
+                experts: vec![(roles, 0)],
+                complete,
+            });
+            ps.cpu_promotion = Some(CpuMissPromotion {
+                roles,
+                ids: vec![0],
+                layer: 8,
+                sources: Vec::new(),
+                started: true,
+                pending: Some(CpuPromotionPending::Push(Some(worker.promote(experts)))),
+            });
+            if already_joined {
+                ps.wait_cpu_promotion(&be_).unwrap();
+            }
+            drop(ps);
+            let pager = be_.moe_pager().lock().unwrap();
+            let session = pager.as_ref().unwrap();
+            assert_eq!(
+                session.routed_roles_resident_mask(&roles, &[0, 1]).unwrap(),
+                if complete { 0b11 } else { 0b10 }
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU; run explicitly"]
+    fn deferred_cpu_miss_fills_staging_before_all_submit_boundaries() {
+        use super::*;
+        use infr_core::backend::{Backend, BufferUsage};
+        let be_ = VulkanBackend::new().unwrap();
+        for (boundary, direct) in ["sync", "hit_first", "rotate", "final"]
+            .into_iter()
+            .flat_map(|boundary| [false, true].map(|direct| (boundary, direct)))
+        {
+            let mut pool = ScratchPool::default();
+            let key = pooled_usage(
+                &mut pool,
+                &be_,
+                "moe_cpu_miss_result",
+                20480,
+                BufferUsage::Staging,
+            )
+            .unwrap();
+            let dst = be_.alloc(20480, BufferUsage::Activations).unwrap();
+            let expected: Vec<f32> = (0..5120).map(|i| i as f32 * 0.001 - 2.0).collect();
+            let values = expected.clone();
+            let mapped_key = if direct {
+                let key = pooled_usage(
+                    &mut pool,
+                    &be_,
+                    "direct_result_y",
+                    8 * 2560 * 4,
+                    BufferUsage::Staging,
+                )
+                .unwrap();
+                be_.upload(
+                    pool[&key].as_ref(),
+                    bytemuck::cast_slice(&vec![-17.0f32; 8 * 2560]),
+                )
+                .unwrap();
+                Some(key)
+            } else {
+                None
+            };
+            let target = mapped_key.map_or(CpuMissResultTarget::Staging(key), |key| {
+                CpuMissResultTarget::Mapped {
+                    key,
+                    row_elements: 2560,
+                }
+            });
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let producer = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                sender
+                    .send(Ok(crate::cpu_miss::Output {
+                        slots: vec![2, 7],
+                        values,
+                        tasks: Vec::new(),
+                        experts: Vec::new(),
+                    }))
+                    .unwrap();
+            });
+            let mut ps = PagedStream::default();
+            ps.ensure_slots(2);
+            ps.cpu_miss = Some((crate::cpu_miss::Job::test_receiver(receiver), target, 8));
+            let mut rec = Some(be_.recorder().unwrap());
+            if let Some(key) = mapped_key {
+                let rc = rec.as_ref().unwrap();
+                rc.arena_stream_barrier();
+                for (index, slot) in [2usize, 7].into_iter().enumerate() {
+                    rc.copy(
+                        pool[&key].as_ref(),
+                        slot * 2560 * 4,
+                        dst.as_ref(),
+                        index * 2560 * 4,
+                        2560 * 4,
+                    );
+                }
+            } else {
+                rec.as_ref()
+                    .unwrap()
+                    .copy(pool[&key].as_ref(), 0, dst.as_ref(), 0, 20480);
+            }
+            match boundary {
+                "sync" => sync_stream(&be_, &mut rec, &mut ps, &pool).unwrap(),
+                "hit_first" => {
+                    submit_prefill_compute(&be_, &mut rec, &mut ps, &pool).unwrap();
+                }
+                "rotate" => rotate_stream(&be_, &mut rec, &mut ps, &pool).unwrap(),
+                _ => {
+                    ps.finish_cpu_miss(&be_, &pool).unwrap();
+                    rec.take().unwrap().finish().unwrap();
+                }
+            }
+            if let Some(rec) = rec.take() {
+                rec.discard().unwrap();
+            }
+            ps.drain().unwrap();
+            producer.join().unwrap();
+            assert!(ps.cpu_miss.is_none());
+            let mut actual = vec![0.0f32; 5120];
+            be_.download(dst.as_ref(), bytemuck::cast_slice_mut(&mut actual))
+                .unwrap();
+            assert_eq!(
+                actual, expected,
+                "submit boundary {boundary}, direct={direct}"
+            );
+            if let Some(key) = mapped_key {
+                let mut whole = vec![0.0f32; 8 * 2560];
+                be_.download(pool[&key].as_ref(), bytemuck::cast_slice_mut(&mut whole))
+                    .unwrap();
+                for (slot, values) in whole.chunks_exact(2560).enumerate() {
+                    if ![2, 7].contains(&slot) {
+                        assert!(values.iter().all(|&v| v == -17.0));
+                    }
+                }
+            }
+        }
+    }
     use super::*;
     use infr_core::graph::Graph;
     use infr_core::tensor::TensorDesc;
@@ -11965,6 +12735,29 @@ mod tests {
 
         graph.sequence_spans[1].rows = 2;
         assert_eq!(decode_token_rows(&graph), None);
+    }
+
+    #[test]
+    fn cpu_miss_decode_excludes_one_row_verify_and_parallel_decode() {
+        let mut graph = Graph::new();
+        assert!(cpu_miss_decode_graph(&graph));
+        graph.mtp_verify = true;
+        assert!(!cpu_miss_decode_graph(&graph));
+        graph.mtp_verify = false;
+        graph.independent_rows = true;
+        graph.sequence_spans = vec![
+            SequenceSpan {
+                row_start: 0,
+                rows: 1,
+                start_pos: 30_000,
+            },
+            SequenceSpan {
+                row_start: 1,
+                rows: 1,
+                start_pos: 31_000,
+            },
+        ];
+        assert!(!cpu_miss_decode_graph(&graph));
     }
 
     #[test]

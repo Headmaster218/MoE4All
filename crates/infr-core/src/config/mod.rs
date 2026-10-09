@@ -402,6 +402,40 @@ cfg_struct! {
         decode_sparse_lut: Option<bool> = None,
         /// Earlier FFN submit. None selects measured Qwen3.8 Decode without expert prefetch.
         decode_early_submit: Option<bool> = None,
+        /// Submit a CPU-miss result/merge immediately instead of waiting for the next router (A/B).
+        cpu_miss_early_submit: bool = false,
+        /// Fuse the one-row F32 CPU input readback into routing, avoiding a separate copy.
+        cpu_miss_input_tap: bool = false,
+        /// Write completed CPU outputs into disjoint mapped miss slots, avoiding staging copies.
+        cpu_miss_direct_result: bool = false,
+        /// Experimental single-miss merge reads the small host result without a scatter copy.
+        cpu_miss_host_result: bool = false,
+        /// Experimental scalar Decode offload, excluding the PLE layer. AVX2+FMA is required;
+        /// zero or unsupported geometry/source tiers keep GPU. Counts are physical workers.
+        cpu_miss_threads: usize = 0,
+        /// Offload the whole missing set only when its assignment count is within 1..=this cap.
+        /// Supported caps are 1-3; invalid values disable offload rather than pruning experts.
+        cpu_miss_max: usize = 1,
+        /// IQ3_S remains GPU-only unless explicitly included for diagnostic comparison.
+        cpu_miss_iq3: bool = false,
+        /// Bounded idle spin for the private miss pool only (iterations, not microseconds).
+        cpu_miss_spin: u32 = 16384,
+        /// Bounded coordinator polling inside a Decode burst; zero retains channel sleeping.
+        cpu_miss_poll: u32 = 0,
+        /// Park private helpers after publishing compute/promotion, without an empty pool job.
+        cpu_miss_idle_park: bool = false,
+        /// End the private CPU burst once per completed forward, freeing helpers for next PLE.
+        cpu_miss_token_park: bool = false,
+        /// Promote miss weights with the private CPU pool after submitting the result, not DMA.
+        cpu_miss_push: bool = false,
+        /// Diagnostic only: retain GPU miss computation and compare its raw output to the CPU.
+        cpu_miss_validate: bool = false,
+        /// Experimental independent FMA chains; changes reduction order, never activation dtype.
+        cpu_miss_split_acc: bool = false,
+        /// Experimental scale-grouped F32 dot; changes rounding, not activation precision.
+        cpu_miss_grouped_dot: bool = false,
+        /// Match GPU denormal flushing inside CPU miss tasks only, restoring each thread's MXCSR.
+        cpu_miss_flush_denormals: bool = false,
         /// Multi-workgroup exact radix selection for deep single-row QSA decode.
         qsa_topk_parallel: bool = true,
         /// Exact QSA count prefixes. None selects the measured Windows RDNA3 parallel top-512 path.
@@ -782,6 +816,8 @@ cfg_struct! {
         pager_profile: bool = false,
         /// Bounded asynchronous Decode trace; independent of the blocking per-op profiler.
         timeline_path: Option<PathBuf> = None,
+        /// Optional one-shot CPU-miss weight/input fixture for local kernel diagnostics.
+        cpu_miss_fixture_dir: Option<PathBuf> = None,
         timeline_skip_steps: usize = 64,
         timeline_steps: usize = 16,
         timeline_stride: usize = 128,

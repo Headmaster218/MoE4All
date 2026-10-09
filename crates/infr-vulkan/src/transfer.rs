@@ -781,6 +781,10 @@ pub(crate) struct PreparedTransfer {
 }
 
 impl PreparedTransfer {
+    pub(crate) fn background_compatible(&self) -> bool {
+        self.copies.iter().all(|copy| copy.dedicated)
+    }
+
     pub(crate) fn append(&mut self, mut other: Self) {
         self.copies.append(&mut other.copies);
     }

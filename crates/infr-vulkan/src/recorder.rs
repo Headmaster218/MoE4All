@@ -11230,6 +11230,50 @@ impl<'a> Recorder<'a> {
         hash_ids: &dyn Buffer,
         hash: bool,
     ) {
+        self.moe_topk_with_tap(
+            logits,
+            ids,
+            wts,
+            bias,
+            n_tokens,
+            n_expert,
+            n_used,
+            scale,
+            gating,
+            norm_w,
+            has_bias,
+            n_expert_groups,
+            n_expert_groups_used,
+            hash_ids,
+            hash,
+            None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn moe_topk_with_tap(
+        &self,
+        logits: &dyn Buffer,
+        ids: &dyn Buffer,
+        wts: &dyn Buffer,
+        bias: &dyn Buffer,
+        n_tokens: usize,
+        n_expert: usize,
+        n_used: usize,
+        scale: f32,
+        gating: u32,
+        norm_w: bool,
+        has_bias: bool,
+        n_expert_groups: u32,
+        n_expert_groups_used: u32,
+        hash_ids: &dyn Buffer,
+        hash: bool,
+        input_tap: Option<(&dyn Buffer, &dyn Buffer)>,
+    ) {
+        if let Some((input, output)) = input_tap {
+            assert!(n_tokens == 1 && !has_bias && !hash);
+            assert!(input.len_bytes() >= 2560 * 4 && output.len_bytes() >= 2560 * 4);
+        }
         let fast_sigmoid_wave32 = self.vk().moe_topk_sg
             && n_tokens == 1
             && gating == 1
@@ -11242,19 +11286,32 @@ impl<'a> Recorder<'a> {
             && n_used > 0
             && n_used <= 32;
         let k = if fast_sigmoid_wave32 {
-            self.be.kernel_sg(
-                "moe_topk_sigmoid_wave32",
-                crate::gemm::moe_topk_sigmoid_wave32_spv(),
-                5,
-                36,
-                32,
-            )
+            let (name, spv) = if input_tap.is_some() {
+                (
+                    "moe_topk_sigmoid_wave32_tap",
+                    crate::gemm::moe_topk_sigmoid_wave32_tap_spv(),
+                )
+            } else {
+                (
+                    "moe_topk_sigmoid_wave32",
+                    crate::gemm::moe_topk_sigmoid_wave32_spv(),
+                )
+            };
+            self.be.kernel_sg(name, spv, 5, 36, 32)
         } else if self.vk().moe_topk_sg {
-            self.be
-                .kernel_sg("moe_topk_sg", crate::gemm::moe_topk_sg_spv(), 5, 36, 32)
+            let (name, spv) = if input_tap.is_some() {
+                ("moe_topk_sg_tap", crate::gemm::moe_topk_sg_tap_spv())
+            } else {
+                ("moe_topk_sg", crate::gemm::moe_topk_sg_spv())
+            };
+            self.be.kernel_sg(name, spv, 5, 36, 32)
         } else {
-            self.be
-                .kernel("moe_topk", crate::gemm::moe_topk_spv(), 5, 36)
+            let (name, spv) = if input_tap.is_some() {
+                ("moe_topk_tap", crate::gemm::moe_topk_tap_spv())
+            } else {
+                ("moe_topk", crate::gemm::moe_topk_spv())
+            };
+            self.be.kernel(name, spv, 5, 36)
         };
         let mut push = [0u8; 36];
         push[0..4].copy_from_slice(&(n_expert as u32).to_ne_bytes());
@@ -11270,12 +11327,12 @@ impl<'a> Recorder<'a> {
             k,
             &[
                 Self::vkb(logits),
-                Self::vkb(bias),
-                Self::vkb(hash_ids),
+                Self::vkb(input_tap.map_or(bias, |(input, _)| input)),
+                Self::vkb(input_tap.map_or(hash_ids, |(_, output)| output)),
                 Self::vkb(ids),
                 Self::vkb(wts),
             ],
-            2,
+            if input_tap.is_some() { 3 } else { 2 },
             &push,
             n_tokens as u32,
         );
@@ -12761,6 +12818,47 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn moe_accumulate_shared_cpu(
+        &self,
+        down: &dyn Buffer,
+        wts: &dyn Buffer,
+        shared_gate: &dyn Buffer,
+        hidden: &dyn Buffer,
+        cpu_result: &dyn Buffer,
+        ne: usize,
+        routed_used: usize,
+        cpu_slot: usize,
+    ) {
+        assert!(cpu_slot < routed_used);
+        let kernel = self.be.kernel(
+            "moe_accumulate_shared_cpu",
+            crate::gemm::moe_accumulate_shared_cpu_spv(),
+            5,
+            16,
+        );
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(ne as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(routed_used as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&1u32.to_ne_bytes());
+        push[12..16].copy_from_slice(&(cpu_slot as u32).to_ne_bytes());
+        self.dispatch3(
+            kernel,
+            &[
+                Self::vkb(down),
+                Self::vkb(wts),
+                Self::vkb(shared_gate),
+                Self::vkb(cpu_result),
+                Self::vkb(hidden),
+            ],
+            1,
+            &push,
+            (ne as u32).div_ceil(64),
+            1,
+            1,
+        );
+    }
+
     /// `acc += wts[slot] * x` (indexed axpy) — the scale is read from a GPU buffer (the on-GPU router
     /// weights), so the weighted MoE expert accumulate needs no host scale.
     pub fn add_scaled_id(
@@ -13055,6 +13153,14 @@ impl<'a> Recorder<'a> {
 
     /// End recording, submit once, wait, and release transient objects.
     pub fn finish(self) -> Result<()> {
+        self.finish_after_submit(|| Ok(()))
+    }
+
+    /// Start host-side work only after submission; always drain GPU readers even if it fails.
+    pub(crate) fn finish_after_submit(
+        self,
+        after_submit: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         let device = &self.be.shared.device;
         let dispatches = self.dispatches.get();
         let t_record = self.t0.elapsed();
@@ -13099,6 +13205,8 @@ impl<'a> Recorder<'a> {
             self.free_transient();
             return Err(be(format!("queue_submit: {e}")));
         }
+        let host_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(after_submit))
+            .unwrap_or_else(|_| Err(be("post-submit host work panicked")));
         let wait_t0 = prof.then(std::time::Instant::now);
         let wait_span = infr_core::timeline::span("queue_idle_wait");
         let wait = self.be.shared.queue_wait_idle_serialized();
@@ -13127,7 +13235,7 @@ impl<'a> Recorder<'a> {
             query.resolve();
         }
         self.free_transient();
-        Ok(())
+        host_result
     }
 
     /// Abandon a partially recorded command buffer WITHOUT submitting it, releasing exactly what
@@ -13799,6 +13907,253 @@ mod chunk_math_tests {
 mod tests {
     use super::*;
     use infr_core::{backend::BufferUsage, Backend};
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn fused_host_miss_accumulation_matches_scatter_for_every_slot_and_tail() {
+        let backend = VulkanBackend::new().unwrap();
+        for ne in [63, 64, 2560] {
+            for used in [8, 10] {
+                let down: Vec<_> = (0..(used + 1) * ne)
+                    .map(|i| (i % 113) as f32 * 0.01 - 0.56)
+                    .collect();
+                let weights: Vec<_> = (0..used).map(|i| (i + 1) as f32 / 55.0).collect();
+                let cpu_values: Vec<_> = (0..ne).map(|i| (i % 29) as f32 * 0.03 - 0.4).collect();
+                let gpu_down = backend
+                    .alloc(down.len() * 4, BufferUsage::Activations)
+                    .unwrap();
+                let gpu_weights = backend.alloc(used * 4, BufferUsage::Staging).unwrap();
+                let gate = backend.alloc(4, BufferUsage::Staging).unwrap();
+                let host = backend.alloc(ne * 4, BufferUsage::Staging).unwrap();
+                let original = backend.alloc(ne * 4, BufferUsage::Readback).unwrap();
+                let fused = backend.alloc(ne * 4, BufferUsage::Readback).unwrap();
+                backend
+                    .upload(gpu_weights.as_ref(), bytemuck::cast_slice(&weights))
+                    .unwrap();
+                backend
+                    .upload(host.as_ref(), bytemuck::cast_slice(&cpu_values))
+                    .unwrap();
+                for slot in 0..used {
+                    backend
+                        .upload(gpu_down.as_ref(), bytemuck::cast_slice(&down))
+                        .unwrap();
+                    for shared_gate in [-10.0f32, 0.0, 10.0] {
+                        backend
+                            .upload(gate.as_ref(), bytemuck::bytes_of(&shared_gate))
+                            .unwrap();
+                        let rec = backend.recorder().unwrap();
+                        rec.moe_accumulate_shared_cpu(
+                            gpu_down.as_ref(),
+                            gpu_weights.as_ref(),
+                            gate.as_ref(),
+                            fused.as_ref(),
+                            host.as_ref(),
+                            ne,
+                            used,
+                            slot,
+                        );
+                        rec.finish().unwrap();
+                        let mut actual = vec![0.0f32; ne];
+                        backend
+                            .download(fused.as_ref(), bytemuck::cast_slice_mut(&mut actual))
+                            .unwrap();
+                        let rec = backend.recorder().unwrap();
+                        rec.copy(host.as_ref(), 0, gpu_down.as_ref(), slot * ne * 4, ne * 4);
+                        rec.moe_accumulate_shared(
+                            gpu_down.as_ref(),
+                            gpu_weights.as_ref(),
+                            gate.as_ref(),
+                            original.as_ref(),
+                            ne,
+                            used,
+                            1,
+                        );
+                        rec.finish().unwrap();
+                        let mut expected = vec![0.0f32; ne];
+                        backend
+                            .download(original.as_ref(), bytemuck::cast_slice_mut(&mut expected))
+                            .unwrap();
+                        assert_eq!(
+                            actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            "ne={ne} used={used} slot={slot} gate={shared_gate}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU; isolated host timeline readiness experiment"]
+    fn host_timeline_readiness_preserves_prefix_and_releases_on_host_error() {
+        struct Release<'a> {
+            device: &'a ash::Device,
+            semaphore: vk::Semaphore,
+            value: u64,
+            armed: bool,
+        }
+        impl Release<'_> {
+            fn signal(&mut self) -> std::time::Duration {
+                let start = std::time::Instant::now();
+                if unsafe {
+                    self.device.signal_semaphore(
+                        &vk::SemaphoreSignalInfo::default()
+                            .semaphore(self.semaphore)
+                            .value(self.value),
+                    )
+                }
+                .is_err()
+                {
+                    // A submitted wait cannot be cancelled. This isolated probe must not
+                    // hang its destructor; runtime adoption needs a separate fatal-error policy.
+                    std::process::abort();
+                }
+                self.armed = false;
+                start.elapsed()
+            }
+        }
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.signal();
+                }
+            }
+        }
+        let backend = VulkanBackend::new().unwrap();
+        assert!(backend.shared.dedicated_transfer.is_some());
+        let device = &backend.shared.device;
+        let make_timeline = || {
+            let mut kind =
+                vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+            unsafe {
+                device.create_semaphore(
+                    &vk::SemaphoreCreateInfo::default().push_next(&mut kind),
+                    None,
+                )
+            }
+            .unwrap()
+        };
+        let witness = make_timeline();
+        let ready = make_timeline();
+        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
+        let src = backend.alloc(4, BufferUsage::Staging).unwrap();
+        let hit = backend.alloc(4, BufferUsage::Readback).unwrap();
+        let cpu = backend.alloc(4, BufferUsage::Staging).unwrap();
+        let out = backend.alloc(4, BufferUsage::Readback).unwrap();
+        backend
+            .upload(src.as_ref(), bytemuck::bytes_of(&14.0f32))
+            .unwrap();
+        let prefix = backend.recorder_persistent().unwrap();
+        prefix.copy(src.as_ref(), 0, hit.as_ref(), 0, 4);
+        unsafe {
+            device.cmd_pipeline_barrier(
+                prefix.cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)],
+                &[],
+                &[],
+            );
+        }
+        let prefix = prefix.finish_record().unwrap();
+        let merge = backend.recorder_persistent().unwrap();
+        merge.seed_barrier();
+        merge.add(hit.as_ref(), cpu.as_ref(), out.as_ref(), 1);
+        let merge = merge.finish_record().unwrap();
+        let hit_ptr = as_vk_buf(hit.as_ref()).unwrap().mapped_ptr().unwrap() as *const f32;
+        let cpu_ptr = as_vk_buf(cpu.as_ref()).unwrap().mapped_ptr().unwrap();
+        let mut signals = Vec::new();
+        let mut submits = Vec::new();
+        for value in 1..=96u64 {
+            unsafe { device.reset_fences(&[fence]) }.unwrap();
+            let prefix_cmd = [prefix.segments[0].cmd];
+            let merge_cmd = [merge.segments[0].cmd];
+            let witness_sems = [witness];
+            let ready_sems = [ready];
+            let values = [value];
+            let stages = [vk::PipelineStageFlags::ALL_COMMANDS];
+            let mut prefix_timeline =
+                vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&values);
+            let mut merge_timeline =
+                vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&values);
+            let batch = [
+                vk::SubmitInfo::default()
+                    .command_buffers(&prefix_cmd)
+                    .signal_semaphores(&witness_sems)
+                    .push_next(&mut prefix_timeline),
+                vk::SubmitInfo::default()
+                    .command_buffers(&merge_cmd)
+                    .wait_semaphores(&ready_sems)
+                    .wait_dst_stage_mask(&stages)
+                    .push_next(&mut merge_timeline),
+            ];
+            let start = std::time::Instant::now();
+            backend
+                .shared
+                .queue_submit_recovering(&batch, fence, None, "host readiness probe")
+                .unwrap();
+            submits.push(start.elapsed().as_secs_f64() * 1e6);
+            let mut release = Release {
+                device,
+                semaphore: ready,
+                value,
+                armed: true,
+            };
+            unsafe {
+                device.wait_semaphores(
+                    &vk::SemaphoreWaitInfo::default()
+                        .semaphores(&witness_sems)
+                        .values(&values),
+                    5_000_000_000,
+                )
+            }
+            .unwrap();
+            assert_eq!(
+                unsafe { *hit_ptr },
+                14.0,
+                "prefix must execute before CPU readiness"
+            );
+            assert!(unsafe { device.get_semaphore_counter_value(ready) }.unwrap() < value);
+            // The explicit HOST_WRITE barrier is essential: these writes occur after submit.
+            crate::copy_to_mapped(bytemuck::bytes_of(&0.0f32), cpu_ptr);
+            let mode = value % 3;
+            let host = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                if mode == 1 {
+                    return Err(be("injected CPU failure"));
+                }
+                if mode == 2 {
+                    panic!("injected CPU panic");
+                }
+                crate::copy_to_mapped(bytemuck::bytes_of(&7.0f32), cpu_ptr);
+                Ok(())
+            }));
+            signals.push(release.signal().as_secs_f64() * 1e6);
+            drop(release);
+            unsafe { device.wait_for_fences(&[fence], true, 5_000_000_000) }.unwrap();
+            let mut actual = [0.0f32];
+            backend
+                .download(out.as_ref(), bytemuck::cast_slice_mut(&mut actual))
+                .unwrap();
+            assert_eq!(actual[0], if mode == 0 { 21.0 } else { 14.0 });
+            assert_eq!(matches!(host, Ok(Ok(()))), mode == 0);
+        }
+        submits.sort_by(f64::total_cmp);
+        signals.sort_by(f64::total_cmp);
+        println!("HOST_TIMELINE samples=96 submit_p50_us={:.2} submit_p90_us={:.2} signal_p50_us={:.2} signal_p90_us={:.2}",
+            submits[48], submits[86], signals[48], signals[86]);
+        drop(merge);
+        drop(prefix);
+        unsafe {
+            device.destroy_fence(fence, None);
+            device.destroy_semaphore(ready, None);
+            device.destroy_semaphore(witness, None);
+        }
+    }
+
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn masked_silu_preserves_inactive_slots_and_matches_dense() {
@@ -13843,6 +14198,31 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn deferred_cpu_miss_host_callback_error_still_drains_gpu_copy() {
+        let be_ = VulkanBackend::new().unwrap();
+        for panic in [false, true] {
+            let src = be_.alloc(4096, BufferUsage::Staging).unwrap();
+            let dst = be_.alloc(4096, BufferUsage::Activations).unwrap();
+            let expected = vec![0x39; 4096];
+            be_.upload(src.as_ref(), &expected).unwrap();
+            let rec = be_.recorder().unwrap();
+            rec.copy(src.as_ref(), 0, dst.as_ref(), 0, 4096);
+            assert!(rec
+                .finish_after_submit(|| {
+                    if panic {
+                        panic!("test post-submit panic");
+                    }
+                    Err(be("test post-submit failure"))
+                })
+                .is_err());
+            let mut actual = vec![0; 4096];
+            be_.download(dst.as_ref(), &mut actual).unwrap();
+            assert_eq!(actual, expected);
         }
     }
 
@@ -17367,6 +17747,66 @@ mod tests {
         let wts: &[f32] = bytemuck::cast_slice(&weight_bits);
         assert!(wts.iter().all(|w| w.is_finite() && *w > 0.0));
         assert!((wts.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn router_input_tap_preserves_routing_and_every_input_bit() {
+        let input_bits: Vec<u32> = (0..2560u32).map(|i| i.wrapping_mul(2654435761)).collect();
+        for wave32 in [false, true] {
+            let be = be_with(|cfg| cfg.moe_topk_sg = wave32);
+            let input = be.alloc(2560 * 4, BufferUsage::Activations).unwrap();
+            be.upload(input.as_ref(), bytemuck::cast_slice(&input_bits))
+                .unwrap();
+            let tap = be.alloc(2560 * 4, BufferUsage::Readback).unwrap();
+            let dummy = upf32(&be, &[0.0]);
+            for (n_expert, n_used) in [(512usize, 10usize), (512, 32), (129, 7), (1024, 10)] {
+                let logits: Vec<f32> = (0..n_expert)
+                    .map(|i| (i % 61) as f32 * 0.02 - 0.6)
+                    .collect();
+                let blog = upf32(&be, &logits);
+                for gating in 0..=2 {
+                    let mut routes = Vec::new();
+                    for enabled in [false, true] {
+                        let ids = be.alloc(n_used * 4, BufferUsage::Readback).unwrap();
+                        let weights = be.alloc(n_used * 4, BufferUsage::Readback).unwrap();
+                        let rec = be.recorder().unwrap();
+                        rec.moe_topk_with_tap(
+                            blog.as_ref(),
+                            ids.as_ref(),
+                            weights.as_ref(),
+                            dummy.as_ref(),
+                            1,
+                            n_expert,
+                            n_used,
+                            1.0,
+                            gating,
+                            true,
+                            false,
+                            0,
+                            0,
+                            dummy.as_ref(),
+                            false,
+                            enabled.then_some((input.as_ref(), tap.as_ref())),
+                        );
+                        rec.finish().unwrap();
+                        let mut id_bytes = vec![0u8; n_used * 4];
+                        let mut weight_bytes = vec![0u8; n_used * 4];
+                        be.download(ids.as_ref(), &mut id_bytes).unwrap();
+                        be.download(weights.as_ref(), &mut weight_bytes).unwrap();
+                        routes.push((id_bytes, weight_bytes));
+                    }
+                    assert_eq!(
+                        routes[0], routes[1],
+                        "tap changed routing wave32={wave32} gating={gating}"
+                    );
+                    let mut actual = vec![0u32; 2560];
+                    be.download(tap.as_ref(), bytemuck::cast_slice_mut(&mut actual))
+                        .unwrap();
+                    assert_eq!(actual, input_bits);
+                }
+            }
+        }
     }
 
     /// MLA (DeepSeek V2/V3 absorbed form) on the REAL Vulkan path, vs a CPU reference — the

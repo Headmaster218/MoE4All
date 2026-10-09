@@ -1460,6 +1460,7 @@ dependencies = [
  "half",
  "indicatif",
  "infr-core",
+ "infr-cpu",
  "infr-gguf",
  "infr-prof",
  "infr-prof-rt",

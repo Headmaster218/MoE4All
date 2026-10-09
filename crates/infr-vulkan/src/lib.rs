@@ -12,6 +12,7 @@
 mod adapter;
 mod arena;
 mod caps;
+mod cpu_miss;
 pub mod ep;
 mod gemm;
 pub mod linear;
@@ -2467,6 +2468,7 @@ pub struct VulkanBackend {
     // NOTE: the prefetch worker is declared before `moe_pager` and `shared`, so it is stopped and
     // joined before either dependency drops. The pager itself likewise drops before `shared`.
     decode_prefetch: Mutex<Option<adapter::DecodePrefetchScheduler>>,
+    cpu_miss: std::sync::OnceLock<Option<cpu_miss::Worker>>,
     /// Paged MoE expert cache (see `pager::MoePagerSession`) — `Some` only when the loaded model's
     /// expert banks don't fit VRAM and the seam's placement policy chose paging over the legacy
     /// host-visible split (see `infr-llama`'s `generate_dense_vulkan_session`). `None` is the
@@ -2836,6 +2838,29 @@ impl VulkanBackend {
             decode_rows,
             mtp_verify,
         )
+    }
+
+    pub(crate) fn cpu_miss_worker(&self) -> Option<&cpu_miss::Worker> {
+        let cfg = &self.cfg().kernels.vulkan;
+        self.cpu_miss
+            .get_or_init(|| {
+                cpu_miss::Worker::new_options(
+                    cfg.cpu_miss_threads,
+                    cfg.cpu_miss_push,
+                    cfg.cpu_miss_split_acc,
+                    cfg.cpu_miss_flush_denormals,
+                    cfg.cpu_miss_spin,
+                    cfg.cpu_miss_grouped_dot,
+                    cfg.cpu_miss_idle_park,
+                    if cfg.cpu_miss_token_park {
+                        cfg.cpu_miss_poll
+                    } else {
+                        0
+                    },
+                    self.cfg().prof.cpu_miss_fixture_dir.clone(),
+                )
+            })
+            .as_ref()
     }
 
     pub(crate) fn use_qsa_topk_scan(&self, rows: usize, top: usize, parallel: bool) -> bool {
@@ -4280,6 +4305,7 @@ impl VulkanBackend {
         let unified_phases = UnifiedPhaseRegistry::new(&runtime_phase);
         let mut backend = Self {
             decode_prefetch: Mutex::new(None),
+            cpu_miss: std::sync::OnceLock::new(),
             moe_pager: Arc::new(Mutex::new(None)),
             session_finalization_deferred: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             dense_pager: Mutex::new(None),
@@ -5651,6 +5677,7 @@ impl VulkanBackend {
         let unified_phase_id = self.unified_phases.register(&runtime_phase);
         Ok(Self {
             decode_prefetch: Mutex::new(None),
+            cpu_miss: std::sync::OnceLock::new(),
             moe_pager: Arc::clone(&self.moe_pager),
             session_finalization_deferred: Arc::clone(&self.session_finalization_deferred),
             dense_pager: Mutex::new(None),
@@ -8021,35 +8048,6 @@ fn probe_flash_attention_hd256(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn early_ffn_submit_auto_is_decode_and_measured_device_scoped() {
-        for measured in [false, true] {
-            for rows in 1..=8 {
-                for decode_rows in [None, Some(1), Some(2), Some(3), Some(4)] {
-                    for verify in [false, true] {
-                        assert_eq!(
-                            use_small_decode_policy(None, measured, rows, decode_rows, verify),
-                            measured && rows <= 3 && decode_rows == Some(rows) && !verify
-                        );
-                        assert!(!use_small_decode_policy(
-                            Some(false),
-                            measured,
-                            rows,
-                            decode_rows,
-                            verify
-                        ));
-                        assert!(use_small_decode_policy(
-                            Some(true),
-                            measured,
-                            rows,
-                            decode_rows,
-                            verify
-                        ));
-                    }
-                }
-            }
-        }
-    }
     use super::*;
     use infr_core::Backend;
 
@@ -8109,6 +8107,36 @@ mod tests {
                         rows,
                         context
                     ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn early_ffn_submit_auto_is_decode_and_measured_device_scoped() {
+        for measured in [false, true] {
+            for rows in 1..=8 {
+                for decode_rows in [None, Some(1), Some(2), Some(3), Some(4)] {
+                    for verify in [false, true] {
+                        assert_eq!(
+                            use_small_decode_policy(None, measured, rows, decode_rows, verify),
+                            measured && rows <= 3 && decode_rows == Some(rows) && !verify
+                        );
+                        assert!(!use_small_decode_policy(
+                            Some(false),
+                            measured,
+                            rows,
+                            decode_rows,
+                            verify
+                        ));
+                        assert!(use_small_decode_policy(
+                            Some(true),
+                            measured,
+                            rows,
+                            decode_rows,
+                            verify
+                        ));
+                    }
                 }
             }
         }

@@ -2284,6 +2284,11 @@ fn main() {
         ("moe_accumulate", "moe_accumulate", &[]),
         ("moe_accumulate_scaled", "moe_accumulate_scaled", &[]),
         ("moe_accumulate_shared", "moe_accumulate_shared", &[]),
+        (
+            "moe_accumulate_shared",
+            "moe_accumulate_shared_cpu",
+            &["-DCPU_MISS_RESULT"],
+        ),
         ("native_mmv_id_q4k", "native_mmv_id_q4k", &[]),
         // Int8 dp4a decode GEMV (m=1, NUM_ROWS=2): one .spv per (format, residual).
         ("native_mmv", "native_mmv_q4k", &["-DFMT_Q4K"]),
@@ -3444,7 +3449,18 @@ fn main() {
         ("moe_scatter_reduce", "moe_scatter_reduce", &[]),
         ("moe_topk", "moe_topk", &[]),
         ("moe_topk", "moe_topk_sg", &["-DSUBGROUP_REDUCE"]),
+        ("moe_topk", "moe_topk_tap", &["-DCPU_INPUT_TAP"]),
+        (
+            "moe_topk",
+            "moe_topk_sg_tap",
+            &["-DSUBGROUP_REDUCE", "-DCPU_INPUT_TAP"],
+        ),
         ("moe_topk_sigmoid_wave32", "moe_topk_sigmoid_wave32", &[]),
+        (
+            "moe_topk_sigmoid_wave32",
+            "moe_topk_sigmoid_wave32_tap",
+            &["-DCPU_INPUT_TAP"],
+        ),
         // Embedding-row gather+dequant (Op::EmbedGather): one .spv per table format.
         ("embed_gather", "embed_gather_q8_0", &["-DFMT_Q8_0"]),
         ("embed_gather", "embed_gather_bf16", &["-DFMT_BF16"]),

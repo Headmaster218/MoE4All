@@ -1559,6 +1559,10 @@ pub struct PreparedHostPush {
 }
 
 impl PreparedHostPush {
+    pub(crate) fn background_compatible(&self) -> bool {
+        self.transfer.background_compatible()
+    }
+
     pub(crate) fn record(self, rec: &crate::Recorder<'_>) -> Result<usize> {
         self.transfer.record(rec)?;
         Ok(self.requested)
@@ -3399,6 +3403,105 @@ impl MoePagerSession {
         };
         self.pools[pool_idx].pager.begin_batch();
         Ok(true)
+    }
+
+    pub(crate) fn cpu_miss_source_supported(&self, roles: [usize; 3], push: bool) -> bool {
+        roles.into_iter().all(|role| {
+            let Some((_, pool, src)) = self.sources.get(&role) else {
+                return false;
+            };
+            let pager = &self.pools[*pool].pager;
+            let owner = src.host_chunk.and_then(|chunk| self.host_store.get(chunk));
+            self.pools[*pool].host.is_none()
+                && src.stride_bytes != 0
+                && owner.is_some_and(|owner| {
+                    src.host_offset
+                        .checked_add(src.bank_bytes)
+                        .is_some_and(|end| end <= owner.bytes.len())
+                })
+                && (!push
+                    || pager.unified.as_ref().map_or_else(
+                        || {
+                            pager.arenas.iter().all(|arena| {
+                                crate::as_vk_buf(arena.buffer.as_ref())
+                                    .ok()
+                                    .and_then(|buf| buf.mapped_ptr())
+                                    .is_some()
+                            })
+                        },
+                        |backing| backing.pool.cpu_miss_push_mapped(),
+                    ))
+        })
+    }
+
+    /// Borrow only permanent full-RAM sources; their owners outlive asynchronous CPU jobs.
+    pub(crate) fn cpu_miss_experts(
+        &self,
+        role_ids: [usize; 3],
+        ids: &[u32],
+        slots: &[usize],
+        push: bool,
+    ) -> Option<Vec<crate::cpu_miss::Expert>> {
+        if ids.len() != slots.len()
+            || !(1..=3).contains(&ids.len())
+            || !self.cpu_miss_source_supported(role_ids, push)
+        {
+            return None;
+        }
+        let mut experts = Vec::with_capacity(ids.len());
+        for (&id, &slot) in ids.iter().zip(slots) {
+            let [gate, up, down] = role_ids.map(|role| {
+                let (_, _, src) = self.sources.get(&role)?;
+                if id as usize >= src.bank_bytes / src.stride_bytes {
+                    return None;
+                }
+                let owner = Arc::clone(&self.host_store.get(src.host_chunk?)?.bytes);
+                let offset = src
+                    .host_offset
+                    .checked_add(id as usize * src.stride_bytes)?;
+                crate::cpu_miss::Weight::new(owner, offset, src.stride_bytes)
+            });
+            experts.push(crate::cpu_miss::Expert {
+                slot,
+                weights: [gate?, up?, down?],
+            });
+        }
+        Some(experts)
+    }
+
+    /// Same admission/LRU as ordinary promotion. The CPU worker copies the full packed payload
+    /// only after its computed result was submitted; all live GPU hits are epoch-protected.
+    pub(crate) fn prepare_cpu_miss_push(
+        &mut self,
+        role_ids: [usize; 3],
+        ids: &[u32],
+        experts: &mut [crate::cpu_miss::Expert],
+    ) -> Result<()> {
+        for (r, role_id) in role_ids.into_iter().enumerate() {
+            let (_, pool, src) = self.sources.get(&role_id).expect("CPU sources validated");
+            for (&id, expert) in ids.iter().zip(experts.iter_mut()) {
+                if let Some(plan) = self.pools[*pool]
+                    .pager
+                    .plan_cpu_push(src.block_base + id, false)?
+                {
+                    expert.weights[r].set_target(plan.target)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn discard_cpu_miss(&mut self, roles: [usize; 3], ids: &[u32]) {
+        for role in roles {
+            let (_, pool, src) = &self.sources[&role];
+            let pager = &mut self.pools[*pool].pager;
+            for &id in ids {
+                let block = src.block_base + id;
+                pager.pager.evict(block);
+                pager.lut_host[block as usize] = NOT_RESIDENT;
+                pager.lut_dirty = true;
+            }
+        }
     }
 
     /// Runtime Decode upload path backed by the unique CPU expert store. Every miss targets its

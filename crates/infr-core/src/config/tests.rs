@@ -38,6 +38,41 @@ fn paged_iq_grid_override_preserves_auto_and_explicit_modes() {
     }
 }
 
+#[test]
+fn cpu_miss_fixture_is_optional_and_uses_the_typed_profiler_layer() {
+    assert!(Config::default().prof.cpu_miss_fixture_dir.is_none());
+    let mut layer = PartialConfig::default();
+    layer
+        .set_path("prof.cpu_miss_fixture_dir", "local-fixture")
+        .unwrap();
+    let mut cfg = Config::default();
+    layer.apply(&mut cfg);
+    assert_eq!(
+        cfg.prof.cpu_miss_fixture_dir.as_deref(),
+        Some(Path::new("local-fixture"))
+    );
+}
+
+#[test]
+fn cpu_miss_launcher_settings_use_typed_config_and_remain_opt_in() {
+    let defaults = Config::default();
+    assert_eq!(defaults.kernels.vulkan.cpu_miss_threads, 0);
+    assert_eq!(defaults.kernels.vulkan.cpu_miss_max, 1);
+    for maximum in 1..=3 {
+        let mut patch = PartialConfig::default();
+        patch
+            .set_path("kernels.vulkan.cpu_miss_threads", "8")
+            .unwrap();
+        patch
+            .set_path("kernels.vulkan.cpu_miss_max", &maximum.to_string())
+            .unwrap();
+        let mut cfg = Config::default();
+        patch.apply(&mut cfg);
+        assert_eq!(cfg.kernels.vulkan.cpu_miss_threads, 8);
+        assert_eq!(cfg.kernels.vulkan.cpu_miss_max, maximum);
+    }
+}
+
 fn try_env_layer(pairs: &[(&str, &str)]) -> Result<PartialConfig, ConfigError> {
     let map: HashMap<String, String> = pairs
         .iter()
