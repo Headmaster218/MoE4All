@@ -377,7 +377,7 @@ esac
 [ -n "$KV_V" ]   && cmd+=(--set "kv.type_v=$KV_V")
 
 if [ -n "$MTP" ]; then
-    cmd+=(--set spec.mtp=1 --set "spec.draft=$MTP" --set "spec.k=$MTP_K")
+    cmd+=(--set spec.mtp=1 --set "spec.draft=$MTP" --set "spec.k=$MTP_K" --temp 0)
 fi
 
 if [ "$MODE" = serve ]; then

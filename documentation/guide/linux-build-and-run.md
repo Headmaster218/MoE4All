@@ -23,14 +23,14 @@ verified_commit: 41345e6f2caace03869cc0d2e2e89a577650ee46
 - 模型：本地 `.gguf` 路径，或 `org/repo[:quant]` 形式的 Hugging Face 引用；
 - 资源档位：`aggressive` / `conservative` / `manual`；
 - `manual` 档位下再问上下文、Ubatch、KV 格式、RAM 与 VRAM 预算；
-- MTP 头（可选，留空即关闭）；
+- MTP 头（可选，留空即关闭；启用时设置 `temperature=0`）；
 - API 模式下问监听地址、并行槽位，以及可选的视觉投影（mmproj）与嵌入模型。
 
 向导会在启动前打印最终命令并要求确认。选择记录在
 `${XDG_CONFIG_HOME:-~/.config}/infr/wizard.conf`，下次直接复用。命令行参数优先于
 记忆值；`--no-mtp`、`--no-mmproj`、`--no-embedding` 用于清除已记住的可选项。
 已保存的视觉与 Embedding 路径在询问时作为默认值，直接回车不会清空。
-显式指定的上下文和资源参数在自动档也生效。非交互启动需要 `--yes`；
+显式指定的上下文和资源参数在自动档也生效。无输入的非交互启动需要 `--yes`；
 非本机监听且未启用鉴权时默认拒绝启动，交互模式需要明确确认。
 `--no-api-key` 会清除传给子进程的 `INFR_API_KEY`，密钥不写入保存文件。
 

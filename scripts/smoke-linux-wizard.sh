@@ -129,6 +129,7 @@ expect_absent '--no-mtp clears the saved MTP head'           'spec.mtp=1'       
 expect_absent '--no-mmproj clears the saved projector'       '--mmproj /tmp/saved-mmproj.gguf'           --mode serve --model "$model" --profile conservative --no-mmproj
 expect_absent '--no-embedding clears the saved embedding'    '--embedding-model /tmp/saved-embed.gguf'   --mode serve --model "$model" --profile conservative --no-embedding
 expect 'explicit MTP width beats saved value' 'spec.k=2' --mtp-k 2
+expect 'MTP selects greedy sampling' '--temp 0' --mode serve
 
 printf '\n== corrupt state ==\n'
 printf 'MODE=serve\nMODEL=%s\nPROFILE=whimsical\n' "$model" > "$XDG_CONFIG_HOME/infr/wizard.conf"
