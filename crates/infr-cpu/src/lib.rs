@@ -12,6 +12,7 @@
 pub mod kvquant;
 pub mod paged;
 mod pool;
+pub mod task_pool;
 pub mod turbo;
 
 mod kernels;
