@@ -2,19 +2,20 @@
 kind: development-guide
 status: current
 scope: build-from-source
-last_verified: 2026-10-04
-verified_commit: 41345e6f2caace03869cc0d2e2e89a577650ee46
+last_verified: 2026-10-10
+verification: local-launcher-and-package-tests; Linux-release-CI-pending
 ---
 
 # 从源码构建
 
-发布包目前只有 Windows 版；Linux（以及其他平台）从源码构建。跑起来的部分见
+Linux x86_64 的发包 CI 已加入；首次完整 CI 与 GPU 验收尚待执行。源码构建与运行见
 [在 Linux 上构建并运行](../guide/linux-build-and-run.md)。
 
 ## 前置条件
 
 - **Rust**：`rust-toolchain.toml` 固定 **1.97.1**（含 `rustfmt`、`clippy`），
   `rustup` 会在首次构建时自动安装，不需要手动 `rustup toolchain install`。
+- **Python 3.8+ 与 Bash**：启动向导、打包和更新器只使用 Python 标准库，不需 pip 包。
 - **`glslc`（shaderc）**：compute shader 在**构建期**编译。dp4a 系列的 shader 需要
   `GL_EXT_integer_dot_product`，因此编译器必须是 **shaderc 2025 或更新**。
   - Ubuntu 24.04 自带的 shaderc 2023.8 **过旧**，构建会失败；
@@ -29,13 +30,22 @@ verified_commit: 41345e6f2caace03869cc0d2e2e89a577650ee46
 以下安装命令适用于 Ubuntu 26.04；其他发行版先按上述要求安装较新的 `glslc`。
 
 ```sh
-sudo apt-get update && sudo apt-get install -y glslc
+sudo apt-get update && sudo apt-get install -y glslc python3 build-essential
 git clone https://github.com/Headmaster218/MoE4All.git
 cd MoE4All
 cargo build --release --locked -p infr-cli
 ```
 
 产物是 `target/release/infr`。
+
+Ubuntu 22.04/24.04 可以保留旧 glibc，并单独编译新版 shaderc：
+
+```sh
+sudo apt-get install -y cmake ninja-build build-essential python3 git
+bash scripts/install-shaderc-linux.sh "$HOME/.local/moe4all-shaderc"
+export PATH="$HOME/.local/moe4all-shaderc/bin:$PATH"
+cargo build --release --locked -p infr-cli
+```
 
 ### 为什么 CI 钉 `ubuntu-26.04`
 
@@ -53,11 +63,32 @@ cargo build --release --locked -p infr-cli
 RUSTFLAGS="-C target-cpu=x86-64" cargo build --release --locked -p infr-cli
 ```
 
+`.github/workflows/release-linux.yml` 在 Ubuntu 22.04 构建，目标为 Linux x86_64、
+glibc 2.35+，独立构建 shaderc 2026.3 并覆盖 `target-cpu=native`。不适用于 Alpine/musl、
+ARM64 或旧于该 glibc 的系统。AVX2 + FMA3 的 CPU-miss 内核仍由运行时检测后启用。
+首次 CI 实际执行前，以上是构建目标而非已通过的跨发行版验收。
+
+构建后打包（版本必须与 `infr --version` 相同）：
+
+```sh
+python3 scripts/linux_release.py package --version 0.10.0
+```
+
+产物为 `dist/MoE4All-Linux-x86_64-v0.10.0.tar.gz` 及 `.sha256`；只打包引擎、
+向导/更新脚本、公开文档与许可证，不包含 `infr.toml`、保存设置、模型和 KV 缓存。
+推送 `release-<版本>` 标签时 CI 构建并上传；手动执行工作流只生成 artifact，不发布。
+
 ## 测试
 
 ```sh
 cargo test --workspace --locked                          # 默认：纯 CPU 套件
 cargo test --workspace --locked -- --include-ignored     # 额外跑真实 GPU 测试
+```
+
+不编译引擎、不占显卡的 Linux 向导/打包/更新测试：
+
+```sh
+bash scripts/smoke-linux-wizard.sh
 ```
 
 Vulkan 集成测试都标了 `#[ignore]`，因为它们需要一块真实的 Vulkan 设备并会占用大量

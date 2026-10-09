@@ -1,0 +1,107 @@
+name: Linux Release (Experimental)
+
+on:
+  push:
+    tags:
+      - 'release-*'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  RUSTFLAGS: '-C target-cpu=x86-64'
+
+jobs:
+  package:
+    name: Build experimental Linux x86_64 package (glibc 2.35 baseline)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-release-x86-64-glibc235
+      - name: Install shader compiler build tools
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build build-essential python3
+      - name: Cache shaderc
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/shaderc-2026.3
+          key: shaderc-linux-ubuntu2204-v2026.3
+      - name: Install recent glslc on the old-glibc builder
+        run: |
+          bash scripts/install-shaderc-linux.sh "$RUNNER_TEMP/shaderc-2026.3"
+          echo "$RUNNER_TEMP/shaderc-2026.3/bin" >> "$GITHUB_PATH"
+      - name: Resolve release version
+        id: release
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "infr-cli"))')
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_NAME" != "release-$version" ]]; then
+            echo 'Release tag does not match Cargo version' >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "archive=MoE4All-Linux-x86_64-v$version.tar.gz" >> "$GITHUB_OUTPUT"
+      - name: Test launcher and updater without a GPU
+        run: bash scripts/smoke-linux-wizard.sh
+      - name: Build portable engine
+        run: cargo build --release --locked -p infr-cli
+      - name: Package and smoke-test extracted release
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          ./target/release/infr --version
+          ldd ./target/release/infr | tee "$RUNNER_TEMP/infr-ldd.txt"
+          ! grep -q 'not found' "$RUNNER_TEMP/infr-ldd.txt"
+          python3 scripts/linux_release.py package --version "$VERSION"
+          smoke=$(mktemp -d)
+          tar -xzf "dist/MoE4All-Linux-x86_64-v$VERSION.tar.gz" -C "$smoke"
+          package="$smoke/MoE4All-Linux-x86_64-v$VERSION"
+          "$package/infr" --version | grep -F "$VERSION"
+          "$package/infr" --help
+          cd "$RUNNER_TEMP"
+          XDG_CONFIG_HOME="$smoke/config" bash "$package/Start-INFR-Wizard-Linux.sh" \
+            --dry-run --mode serve --model '/tmp/model with spaces.gguf' --profile aggressive
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: MoE4All-Linux-x86_64-v${{ steps.release.outputs.version }}
+          path: |
+            dist/${{ steps.release.outputs.archive }}
+            dist/${{ steps.release.outputs.archive }}.sha256
+          if-no-files-found: error
+          retention-days: 14
+      - name: Publish Linux assets
+        if: startsWith(github.ref, 'refs/tags/release-')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+          ARCHIVE: ${{ steps.release.outputs.archive }}
+        run: |
+          tag="release-$VERSION"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            # Windows may create the same release concurrently; tolerate that race.
+            gh release create "$tag" --verify-tag --title "MoE4All v$VERSION" --generate-notes || gh release view "$tag"
+          fi
+          gh release upload "$tag" "dist/$ARCHIVE" "dist/$ARCHIVE.sha256" --clobber
+          notes=$(gh release view "$tag" --json body --jq .body)
+          if [[ "$notes" != *'<!-- moe4all-linux-experimental -->'* ]]; then
+            printf '%s\n\n%s\n%s\n' "$notes" \
+              '<!-- moe4all-linux-experimental -->' \
+              'Linux x86_64 is experimental: requires glibc 2.35+, Bash, Python 3.8+ and a Vulkan GPU driver. GPU inference and upgrading across real systems need community validation. / Linux 包为实验性版本，请反馈驱动、推理及更新兼容性问题。' \
+              > "$RUNNER_TEMP/linux-release-notes.md"
+            gh release edit "$tag" --notes-file "$RUNNER_TEMP/linux-release-notes.md"
+          fi

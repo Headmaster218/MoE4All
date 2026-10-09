@@ -128,5 +128,13 @@ jobs:
             & gh release edit $tag --title "MoE4All v${{ steps.release.outputs.version }}" @releaseFlags
           } else {
             & gh release create $tag @assets --verify-tag --title "MoE4All v${{ steps.release.outputs.version }}" --generate-notes @releaseFlags
+            if ($LASTEXITCODE -ne 0) {
+              # Linux may have created the shared release after our initial view.
+              & gh release view $tag *> $null
+              if ($LASTEXITCODE -ne 0) { throw 'GitHub Release creation failed.' }
+              & gh release upload $tag @assets --clobber
+              if ($LASTEXITCODE -ne 0) { throw 'GitHub Release upload failed.' }
+              & gh release edit $tag --title "MoE4All v${{ steps.release.outputs.version }}" @releaseFlags
+            }
           }
           if ($LASTEXITCODE -ne 0) { throw "GitHub Release publish failed with exit code $LASTEXITCODE" }

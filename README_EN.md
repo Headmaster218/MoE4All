@@ -87,12 +87,14 @@ See the [capability matrix](documentation/reference/model-capabilities.md) for c
 
 ## Build from source (Linux)
 
-The release archives are Windows-only; on Linux, build from source. The package
-installation command below targets Ubuntu 26.04; other distributions need
+Experimental Linux x86_64 packages ship alongside the Windows release; feedback is welcome. Source builds remain recommended
+until the first CI validation. Once a `.tar.gz` asset is available, extract it and run
+`Start-INFR-Wizard-Linux.sh` inside the package; Rust and glslc are not needed.
+The source installation command below targets Ubuntu 26.04; other distributions need
 `glslc` from shaderc 2025 or newer first:
 
 ```sh
-sudo apt-get update && sudo apt-get install -y glslc
+sudo apt-get update && sudo apt-get install -y glslc python3
 git clone https://github.com/Headmaster218/MoE4All.git && cd MoE4All
 cargo build --release --locked -p infr-cli
 ./Start-INFR-Wizard-Linux.sh      # interactive launcher; --dry-run prints only

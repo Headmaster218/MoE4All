@@ -73,11 +73,13 @@ Flash-Next 启动时选择第一片：`Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-
 
 ## 从源码构建（Linux）
 
-发布包目前只有 Windows 版；Linux 从源码构建。以下安装命令适用于 Ubuntu 26.04；
+Linux x86_64 实验性发行包与 Windows 同版发包，欢迎试用反馈；首次 CI 验证完成前仍建议从源码构建。
+发布页提供 `.tar.gz` 后可直接解压，运行包内 `Start-INFR-Wizard-Linux.sh`，无需 Rust 或 glslc。
+以下源码安装命令适用于 Ubuntu 26.04；
 其他发行版请先准备 shaderc 2025 或更新的 `glslc`：
 
 ```sh
-sudo apt-get update && sudo apt-get install -y glslc
+sudo apt-get update && sudo apt-get install -y glslc python3
 git clone https://github.com/Headmaster218/MoE4All.git && cd MoE4All
 cargo build --release --locked -p infr-cli
 ./Start-INFR-Wizard-Linux.sh      # 交互式启动；加 --dry-run 只打印命令
