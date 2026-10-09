@@ -692,6 +692,12 @@ pub trait Backend: Send + Sync {
     /// elastic backend should leave expert slots borrowed instead of eagerly refilling them into
     /// space the next graph will need.
     fn release_transient_runtime(&self) {}
+    /// Select a Prefill chunk from tallest-first `(rows, runtime reserve bytes)` candidates after the prompt's
+    /// persistent KV is resident. Called only at a serial phase boundary, before chunk buffers
+    /// exist. Backends without a shared expert arena leave the caller's chunk unchanged.
+    fn prepare_prefill(&self, _candidates: &[(usize, u64)]) -> Result<Option<usize>> {
+        Ok(None)
+    }
     /// Open a weight-load progress scope: while the returned guard lives, this backend's weight
     /// allocations (`BufferUsage::Weights`/`HostWeights`) advance a visible progress display;
     /// dropping the guard finishes and clears it. The ticking lives in each backend's `alloc`, so

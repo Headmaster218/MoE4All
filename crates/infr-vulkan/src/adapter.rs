@@ -455,10 +455,16 @@ fn qsa_indexer_score_capacity_bytes(
     current_blocks: u32,
     block_cache_elements: usize,
     head_dim: u32,
+    target_blocks: Option<usize>,
 ) -> usize {
     let capacity_blocks = block_cache_elements / head_dim.max(1) as usize;
     (rows as usize)
-        .saturating_mul(capacity_blocks.max(current_blocks as usize))
+        .saturating_mul(
+            target_blocks
+                .unwrap_or(capacity_blocks)
+                .min(capacity_blocks)
+                .max(current_blocks as usize),
+        )
         .saturating_mul(4)
 }
 
@@ -1450,15 +1456,16 @@ fn paged_qsa_scratch_requests(graph: &Graph) -> Result<Vec<(&'static str, usize)
             .transpose()?;
         let ratio = (*ratio).max(1);
         let blocks = qsa_indexer_blocks(*kv_len, independent_spans, ratio);
-        // The cache declaration describes the complete configured context even when its dynamic
-        // segmented binding has committed only the current 32K prefix. Reserve that full score
-        // width now: growing this pooled matrix at every context step can strand its old high-water
-        // neighbours and fail despite the runtime corridor having priced the final capacity.
+        // Keep one score width for the complete current transaction, not a width that grows on
+        // every chunk or the full configured context. Decode/verify keep the capacity fallback.
         score_bytes = score_bytes.max(qsa_indexer_score_capacity_bytes(
             *rows,
             blocks,
             graph.desc(*block_cache).numel(),
             *head_dim,
+            graph
+                .prefill_target_tokens
+                .map(|tokens| tokens / ratio as usize),
         ));
         needs_topk_work |= qsa_topk_workspace_needed(*rows, blocks, independent_spans, ratio);
     }
@@ -8854,7 +8861,7 @@ fn issue_decode_prefetch(
         })
 }
 
-fn cancel_decode_prefetch(be_: &VulkanBackend) -> Result<()> {
+pub(crate) fn cancel_decode_prefetch(be_: &VulkanBackend) -> Result<()> {
     be_.decode_prefetch_scheduler()
         .lock()
         .unwrap()
@@ -8950,7 +8957,10 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
                     .as_mut()
                     .ok_or_else(|| be("paged static execution requires a MoE pager session"))?;
                 match pager_phase {
-                    RuntimePhase::Prefill => sess.enter_prefill_layer(be_)?,
+                    RuntimePhase::Prefill => {
+                        sess.configure_prefill_runtime(graph.prefill_runtime_reserve_bytes)?;
+                        sess.enter_prefill_layer(be_)?;
+                    }
                     RuntimePhase::Decode => {
                         sess.enter_decode();
                     }
@@ -12836,9 +12846,95 @@ mod tests {
         assert_eq!(qsa_indexer_blocks(0, Some(&spans), 4), 16_384);
         assert_eq!(qsa_indexer_blocks(65_536, None, 4), 16_384);
         assert_eq!(
-            qsa_indexer_score_capacity_bytes(3_072, 16_384, 40_960 * 128, 128),
+            qsa_indexer_score_capacity_bytes(3_072, 16_384, 40_960 * 128, 128, None),
             3_072 * 40_960 * 4,
         );
+    }
+
+    #[test]
+    fn qsa_prefill_scores_price_transaction_depth_and_guard_current_blocks() {
+        for target in [30_000, 32_768, 32_769, 90_000, 150_000, 163_840] {
+            for rows in [256, 512, 1024, 3072, 4096, 5120] {
+                let blocks = target / 4;
+                assert_eq!(
+                    qsa_indexer_score_capacity_bytes(rows, 1024, 40_960 * 128, 128, Some(blocks)),
+                    rows as usize * blocks * 4
+                );
+            }
+        }
+        assert_eq!(
+            qsa_indexer_score_capacity_bytes(512, 8192, 40_960 * 128, 128, Some(1024)),
+            512 * 8192 * 4
+        );
+        assert_eq!(
+            qsa_indexer_score_capacity_bytes(512, 8192, 40_960 * 128, 128, Some(80_000)),
+            512 * 40_960 * 4
+        );
+    }
+
+    #[test]
+    fn qsa_transaction_scratch_stays_stable_across_chunks_and_mixed_lanes() {
+        let rows = 512;
+        let mut graph = Graph::new();
+        let q = graph.input(TensorDesc::new(vec![rows, 4, 128], DType::F16));
+        let k_cache = graph.input(TensorDesc::new(vec![163840, 128], DType::F16));
+        let block_cache = graph.input(TensorDesc::new(vec![40960, 128], DType::F32));
+        let k_norm = graph.input(TensorDesc::new(vec![128], DType::F32));
+        let dst = graph.output(TensorDesc::new(vec![rows, 512], DType::I32));
+        graph.push(Op::QsaIndexer {
+            q,
+            k_cache,
+            block_cache,
+            k_norm,
+            positions4: None,
+            dst,
+            rows: rows as u32,
+            kv_len: 8192,
+            compress_from: 0,
+            n_head: 4,
+            head_dim: 128,
+            top_blocks: 512,
+            ratio: 4,
+            rope_dim: 64,
+            theta: 10000.0,
+            eps: 1e-6,
+            scale: 1.0,
+            sections: [0; 4],
+        });
+        let scores = |graph: &Graph| {
+            paged_qsa_scratch_requests(graph)
+                .unwrap()
+                .into_iter()
+                .find(|(tag, _)| *tag == "qsa_indexer_scores")
+                .unwrap()
+                .1
+        };
+        for target in [30_000, 90_000, 150_000] {
+            graph.prefill_target_tokens = Some(target);
+            for depth in [8192, target] {
+                if let Op::QsaIndexer { kv_len, .. } = &mut graph.ops[0] {
+                    *kv_len = depth as u32;
+                }
+                assert_eq!(scores(&graph), rows * (target / 4) * 4);
+            }
+        }
+        graph.independent_rows = true;
+        graph.sequence_spans = vec![
+            SequenceSpan {
+                row_start: 0,
+                rows: 256,
+                start_pos: 30000,
+            },
+            SequenceSpan {
+                row_start: 256,
+                rows: 256,
+                start_pos: 90000,
+            },
+        ];
+        graph.prefill_target_tokens = Some(90_256);
+        assert_eq!(scores(&graph), rows * (90_256 / 4) * 4);
+        graph.prefill_target_tokens = None;
+        assert_eq!(scores(&graph), rows * 40960 * 4);
     }
 
     #[test]

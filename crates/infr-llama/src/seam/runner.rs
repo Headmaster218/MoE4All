@@ -59,6 +59,42 @@ fn prefill_chunk_end(
         .unwrap_or(natural_end)
 }
 
+fn prefill_runtime_candidates(
+    c: &Config,
+    ec: &EngineConfig,
+    caps: &infr_core::backend::Capabilities,
+    max_ctx: usize,
+    target: usize,
+    ring: bool,
+    max_rows: usize,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> Vec<(usize, u64)> {
+    let mut rows = vec![max_rows];
+    if !super::user_pinned_ubatch(ec) {
+        rows.extend(super::ubatch_fallbacks_below(max_rows));
+    }
+    rows.into_iter()
+        .map(|rows| {
+            // Only remove unused QSA width; preserve the other context-priced scratch and pads.
+            let reserve = super::runtime_reserve_at(c, caps, max_ctx, ring, rows, k_fmt, v_fmt)
+                .saturating_sub(super::qsa_indexer_scratch_bytes(c, max_ctx, rows))
+                .saturating_add(super::qsa_indexer_scratch_bytes(
+                    c,
+                    target.min(max_ctx),
+                    rows,
+                ));
+            (rows, reserve)
+        })
+        .collect()
+}
+
+fn prefill_uses_layer_ring(c: &Config, remaining: usize, ubatch: usize) -> bool {
+    c.moe.as_ref().is_some_and(|moe| {
+        remaining.min(ubatch).saturating_mul(moe.n_used) >= 3usize.saturating_mul(moe.n_expert)
+    })
+}
+
 /// Combined gate+up FFN upload decision (one GEMV/GEMM + GatedActFused instead of two Linears +
 /// GatedAct). Requires the backend to opt in (`Capabilities::combined_gu` — Vulkan; the CPU keeps
 /// zero-copy separate tensors) AND every dense layer's gate/up to share a dtype (the concat is
@@ -7904,7 +7940,10 @@ fn generate_dense_backend_inner(
             .map(|tokens| tokens.len().saturating_sub(1))
             .collect::<Vec<_>>();
         let mut cursors = starts.clone();
-        let ubatch = crate::seam::ubatch_rows(ec).max(lanes);
+        let max_ubatch = crate::seam::ubatch_rows(ec).max(lanes);
+        let mut planned_group = Vec::new();
+        let mut ubatch = max_ubatch;
+        let mut prefill_runtime_reserve = None;
         let ple_row = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram * c.ple_head_dim;
         let qsa_ratio = c.compress_ratios.iter().copied().max().unwrap_or(4).max(1);
         let qsa_threshold = c.indexer_top_k + qsa_ratio - 1;
@@ -7943,6 +7982,40 @@ fn generate_dense_backend_inner(
                 } else {
                     parallel.peers[lane - 1].ensure_segmented_depth(be, c, targets[lane])?;
                 }
+            }
+            let prefill_target = prefill_lanes
+                .iter()
+                .map(|&lane| targets[lane] + 1)
+                .max()
+                .unwrap_or(1);
+            let remaining = prefill_lanes
+                .iter()
+                .map(|&lane| targets[lane].saturating_sub(cursors[lane]))
+                .sum();
+            if be.moe_paged()
+                && planned_group != prefill_lanes
+                && prefill_uses_layer_ring(c, remaining, max_ubatch)
+            {
+                let candidates = prefill_runtime_candidates(
+                    c,
+                    ec,
+                    &caps,
+                    max_ctx,
+                    prefill_target,
+                    kv_ring,
+                    max_ubatch,
+                    k_fmt,
+                    v_fmt,
+                );
+                let selected = be.prepare_prefill(&candidates)?;
+                ubatch = selected.unwrap_or(max_ubatch).max(prefill_lanes.len());
+                prefill_runtime_reserve = selected.and_then(|rows| {
+                    candidates
+                        .iter()
+                        .find(|&&(candidate, _)| candidate == rows)
+                        .map(|&(_, reserve)| reserve)
+                });
+                planned_group.clone_from(&prefill_lanes);
             }
             let final_ranges = prefill_lanes
                 .iter()
@@ -8060,7 +8133,7 @@ fn generate_dense_backend_inner(
             be.upload(pos_batch.as_ref(), bytemuck::cast_slice(&positions))
                 .map_err(|error| anyhow!("{error}"))?;
 
-            let (g0, h0) = build(
+            let (mut g0, h0) = build(
                 batch,
                 ranges[0].start,
                 0,
@@ -8076,6 +8149,8 @@ fn generate_dense_backend_inner(
                 independent_rows.then_some(spans.as_slice()),
                 Some(0..1),
             );
+            g0.prefill_target_tokens = Some(prefill_target);
+            g0.prefill_runtime_reserve_bytes = prefill_runtime_reserve;
             let plan0 = be.compile(&g0).map_err(|error| anyhow!("{error}"))?;
             let mut bindings0 = Bindings::new();
             bindings0.bind(
@@ -8141,6 +8216,8 @@ fn generate_dense_backend_inner(
                 Some(1..c.n_layer),
             );
             g1.prefill_next_chunk = prefill_next_chunk;
+            g1.prefill_target_tokens = Some(prefill_target);
+            g1.prefill_runtime_reserve_bytes = prefill_runtime_reserve;
             let plan1 = be.compile(&g1).map_err(|error| anyhow!("{error}"))?;
             let mut bindings1 = Bindings::new();
             bindings1.bind(h1.hidden, hidden_batch.as_ref());
@@ -10569,12 +10646,36 @@ fn generate_dense_backend_inner(
         // chunk as a single request (2048 ordinary, 4096 aggressive); INFR_UBATCH_PARALLEL remains
         // the explicit latency-oriented cap. Yield the baton between chunks so the round-robin can
         // interleave prefill with other sequences' decode steps.
-        let ubatch: usize = if req.is_some_and(crate::sampling::RequestCtx::shares_gpu) {
+        let mut ubatch: usize = if req.is_some_and(crate::sampling::RequestCtx::shares_gpu) {
             crate::seam::ubatch_rows(ec).min(crate::seam::ubatch_rows_parallel(ec))
         } else {
             crate::seam::ubatch_rows(ec)
         };
         let pf_end = prompt.len() - 1;
+        let mut prefill_runtime_reserve = None;
+        if be.moe_paged() && prefill_uses_layer_ring(c, pf_end.saturating_sub(start), ubatch) {
+            let _gp = req.and_then(|request| request.gate_pass());
+            ensure_kv_depth!(pf_end);
+            let candidates = prefill_runtime_candidates(
+                c,
+                ec,
+                &caps,
+                max_ctx,
+                prompt.len(),
+                kv_ring,
+                ubatch,
+                k_fmt,
+                v_fmt,
+            );
+            let selected = be.prepare_prefill(&candidates)?;
+            ubatch = selected.unwrap_or(ubatch);
+            prefill_runtime_reserve = selected.and_then(|rows| {
+                candidates
+                    .iter()
+                    .find(|&&(candidate, _)| candidate == rows)
+                    .map(|&(_, reserve)| reserve)
+            });
+        }
         // ── prefill work list: (layer span, chunk), in EXECUTION order ───────────────────────
         // Chunk-major is one whole-model span per chunk, so every chunk drags the entire weight
         // set past the pager again — free when the weights are resident, and the whole prefill
@@ -10910,6 +11011,8 @@ fn generate_dense_backend_inner(
                         );
                         pf_g.prefill_next_chunk =
                             ec.paging.prefill_cross_chunk && !layer_major && ci + 1 < chunks.len();
+                        pf_g.prefill_target_tokens = Some(prompt.len());
+                        pf_g.prefill_runtime_reserve_bytes = prefill_runtime_reserve;
                         let t_build = pf_t0.elapsed();
                         let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
                         let t_compile = pf_t0.elapsed();
@@ -12015,6 +12118,101 @@ mod tests {
         recurrent_extension_start, resident_after_gen, sampling_suffix_start, validate_token_ids,
     };
     use infr_core::DType;
+
+    #[test]
+    fn prefill_planning_does_not_touch_decode_sized_suffixes() {
+        let cfg = crate::Config {
+            moe: Some(crate::MoeConfig {
+                n_expert: 512,
+                n_used: 10,
+                n_ff_exp: 640,
+                scale: 1.0,
+                gating: infr_core::graph::MoeGating::Sigmoid,
+                norm_w: true,
+                weight_before: false,
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
+            }),
+            ..Default::default()
+        };
+        assert!(!super::prefill_uses_layer_ring(&cfg, 153, 4096));
+        assert!(super::prefill_uses_layer_ring(&cfg, 154, 4096));
+        assert!(!super::prefill_uses_layer_ring(&cfg, 150000, 128));
+        assert!(super::prefill_uses_layer_ring(&cfg, 150000, 256));
+        assert!(!super::prefill_uses_layer_ring(
+            &crate::Config::default(),
+            150000,
+            4096
+        ));
+    }
+
+    #[test]
+    fn prefill_runtime_budget_removes_only_unused_qsa_scores() {
+        let cfg = crate::Config {
+            qwen4exp: true,
+            n_layer: 48,
+            n_head: 24,
+            n_kv: 4,
+            n_embd: 2560,
+            n_ff: 640,
+            head_dim: 256,
+            hc_mult: 4,
+            hc_low_rank: 320,
+            ssm_d_inner: 6144,
+            ssm_n_group: 16,
+            ssm_dt_rank: 48,
+            ssm_d_state: 128,
+            indexer_top_k: 2048,
+            compress_ratios: vec![4; 48],
+            ..Default::default()
+        };
+        let ec = crate::EngineConfig::default();
+        let caps = infr_core::backend::Capabilities::default();
+        for target in [30_000, 32_768, 32_769, 90_000, 150_000, 262_144] {
+            let candidates = super::prefill_runtime_candidates(
+                &cfg,
+                &ec,
+                &caps,
+                262_144,
+                target,
+                false,
+                4096,
+                DType::Q8_0,
+                DType::Q8_0,
+            );
+            assert_eq!(candidates[0].0, 4096);
+            assert!(candidates.iter().all(|&(rows, _)| rows <= 4096));
+            for (rows, reserve) in candidates {
+                let original = crate::seam::runtime_reserve_at(
+                    &cfg,
+                    &caps,
+                    262_144,
+                    false,
+                    rows,
+                    DType::Q8_0,
+                    DType::Q8_0,
+                );
+                let saved = crate::seam::qsa_indexer_scratch_bytes(&cfg, 262_144, rows)
+                    - crate::seam::qsa_indexer_scratch_bytes(&cfg, target, rows);
+                assert_eq!(reserve, original - saved);
+            }
+        }
+        let mut manual = ec.clone();
+        manual.device.ubatch_specified = true;
+        let candidates = super::prefill_runtime_candidates(
+            &cfg,
+            &manual,
+            &caps,
+            262144,
+            30000,
+            false,
+            3072,
+            DType::F16,
+            DType::F16,
+        );
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, 3072);
+    }
 
     #[test]
     fn qsa_prepare_fusion_requires_matching_native_projection_dtypes() {

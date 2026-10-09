@@ -7597,6 +7597,21 @@ impl Backend for VulkanBackend {
         });
     }
 
+    fn prepare_prefill(&self, candidates: &[(usize, u64)]) -> Result<Option<usize>> {
+        if !self.cfg().paging.moe_layer_stream {
+            return Ok(None);
+        }
+        self.with_unified_exclusive(|| {
+            adapter::cancel_decode_prefetch(self)?;
+            self.runtime_phase.lock().unwrap().release_phase();
+            let mut guard = self.moe_pager().lock().unwrap();
+            let Some(session) = guard.as_mut() else {
+                return Ok(None);
+            };
+            session.plan_prefill(candidates).map(Some)
+        })
+    }
+
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>> {
         adapter::compile(self, graph)
     }

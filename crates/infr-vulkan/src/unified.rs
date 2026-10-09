@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use infr_core::backend::Buffer;
@@ -337,6 +337,17 @@ impl ExpertArenaLayout {
         // coordinates, but Prefill may borrow those currently empty cells because the ring is
         // released before any later KV growth. Runtime keeps its high-address corridor throughout.
         0..self.total_bytes - self.runtime_reserve_bytes
+    }
+
+    fn prefill_corridor_with_reserve(&self, reserve: usize) -> Result<Range<usize>> {
+        let reserve = align_up(reserve, UNIFIED_ALIGN)
+            .ok_or_else(|| be("Prefill runtime reserve overflow"))?;
+        if reserve > self.runtime_reserve_bytes {
+            return Err(be(
+                "Prefill runtime reserve exceeds the startup safety envelope",
+            ));
+        }
+        Ok(0..self.total_bytes - reserve)
     }
 
     pub(crate) fn runtime_corridor(&self) -> Range<usize> {
@@ -1329,6 +1340,7 @@ pub struct UnifiedVramPool {
     expert_layout: Option<ExpertArenaLayout>,
     kv_reservations: Arc<Mutex<KvReservationState>>,
     residency_verified: AtomicBool,
+    prefill_runtime_reserve: AtomicUsize,
 }
 
 impl UnifiedVramPool {
@@ -1389,12 +1401,16 @@ impl UnifiedVramPool {
             shard_sizes.iter().sum::<usize>(),
             shard_sizes.len(),
         );
+        let prefill_runtime_reserve = expert_layout
+            .as_ref()
+            .map_or(0, |layout| layout.runtime_reserve_bytes);
         Ok(Arc::new(Self {
             ranges,
             arena,
             expert_layout,
             kv_reservations: Arc::new(Mutex::new(KvReservationState::default())),
             residency_verified: AtomicBool::new(false),
+            prefill_runtime_reserve: AtomicUsize::new(prefill_runtime_reserve),
         }))
     }
 
@@ -1414,6 +1430,32 @@ impl UnifiedVramPool {
 
     pub(crate) fn expert_layout(&self) -> Option<&ExpertArenaLayout> {
         self.expert_layout.as_ref()
+    }
+
+    pub(crate) fn set_prefill_runtime_reserve(&self, bytes: usize) -> Result<()> {
+        let layout = self
+            .expert_layout
+            .as_ref()
+            .ok_or_else(|| be("Prefill requires an expert layout"))?;
+        let corridor = layout.prefill_corridor_with_reserve(bytes)?;
+        self.prefill_runtime_reserve
+            .store(layout.total_bytes - corridor.end, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn prefill_loan_bytes(&self) -> usize {
+        self.expert_layout.as_ref().map_or(0, |layout| {
+            layout
+                .total_bytes
+                .saturating_sub(self.prefill_runtime_reserve.load(Ordering::Acquire))
+        })
+    }
+
+    pub(crate) fn reset_prefill_runtime_reserve(&self) {
+        if let Some(layout) = self.expert_layout.as_ref() {
+            self.prefill_runtime_reserve
+                .store(layout.runtime_reserve_bytes, Ordering::Release);
+        }
     }
 
     pub(crate) fn claim_expert_slot(
@@ -1454,7 +1496,10 @@ impl UnifiedVramPool {
             .expert_layout
             .as_ref()
             .ok_or_else(|| be("owner claims require an expert-aware unified VRAM layout"))?;
-        let (corridor, direction) = class.placement(layout)?;
+        let (mut corridor, direction) = class.placement(layout)?;
+        if class == UnifiedVramClass::Prefill {
+            corridor = 0..self.prefill_loan_bytes();
+        }
         layout.plan_claim(
             &self.ranges.allocations(),
             requested,
@@ -1783,6 +1828,65 @@ mod tests {
     fn arena_corridors_reject_reserves_larger_than_the_physical_pool() {
         let error = ExpertArenaLayout::build(&[(256, 4, 0)], 4096, 768, 0, 0, 512).unwrap_err();
         assert!(error.to_string().contains("below its"));
+    }
+
+    #[test]
+    fn prefill_runtime_reserve_only_loans_unused_suffix_with_alignment() {
+        let layout = ExpertArenaLayout::build(&[(256, 20, 0)], 4096, 512, 0, 0, 1024).unwrap();
+        assert_eq!(
+            layout.prefill_corridor_with_reserve(1024).unwrap(),
+            layout.prefill_loan_corridor()
+        );
+        assert_eq!(layout.prefill_corridor_with_reserve(513).unwrap(), 0..4352);
+        assert_eq!(layout.prefill_corridor_with_reserve(512).unwrap(), 0..4608);
+        assert!(layout.prefill_corridor_with_reserve(1025).is_err());
+        assert!(layout.prefill_corridor_with_reserve(usize::MAX).is_err());
+        assert_eq!(layout.runtime_corridor(), 4096..5120);
+    }
+
+    #[test]
+    fn resized_prefill_corridor_uses_real_shards_and_keeps_live_kv_runtime() {
+        let layout = ExpertArenaLayout::build(&[(256, 30, 0)], 4096, 512, 0, 0, 1024).unwrap();
+        let ranges = UnifiedRangePool::new(layout.shard_sizes().iter().copied()).unwrap();
+        let runtime_shard = layout.shard_sizes().len() - 1;
+        let runtime_offset = layout.shard_sizes()[runtime_shard] - 512;
+        let _kv = ranges
+            .try_claim_exact(0, 0, 512, UnifiedVramClass::KvCache)
+            .unwrap();
+        let _runtime = ranges
+            .try_claim_exact(
+                runtime_shard,
+                runtime_offset,
+                512,
+                UnifiedVramClass::LlmRuntime,
+            )
+            .unwrap();
+        let plan = |sizes: &[usize], corridor| {
+            layout.plan_claim(
+                &ranges.allocations(),
+                sizes,
+                UnifiedVramClass::Prefill,
+                corridor,
+                ClaimDirection::Low,
+                &[],
+            )
+        };
+        let requested = [layout.shard_sizes()[1], runtime_offset];
+        assert!(plan(&requested, layout.prefill_loan_corridor()).is_err());
+        let expanded = layout.prefill_corridor_with_reserve(512).unwrap();
+        let claim = plan(&requested, expanded.clone()).unwrap();
+        assert_eq!(claim.ranges().len(), 2);
+        assert!(claim
+            .ranges()
+            .iter()
+            .all(|range| range.shard != 0 || range.offset >= 512));
+        assert!(claim.ranges().iter().all(
+            |range| range.shard != runtime_shard || range.offset + range.len <= runtime_offset
+        ));
+        assert!(
+            plan(&[requested.iter().sum()], expanded).is_err(),
+            "total free space does not guarantee a contiguous bank"
+        );
     }
 
     #[test]

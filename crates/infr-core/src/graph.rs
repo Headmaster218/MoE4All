@@ -1929,6 +1929,12 @@ pub struct Graph {
     /// phase. Backends may use the hint to pre-position weights only; model execution and state
     /// updates remain strictly chunk ordered.
     pub prefill_next_chunk: bool,
+    /// Final context depth of this Prefill transaction, including a reused prefix. Allows scratch
+    /// to stay stable across chunks without pricing the whole configured context window.
+    pub prefill_target_tokens: Option<usize>,
+    /// Runtime envelope selected at the transaction boundary. Reapplied after a small dense-prefix
+    /// chunk or an auxiliary graph temporarily returns the pager to Decode interpretation.
+    pub prefill_runtime_reserve_bytes: Option<u64>,
     /// Memoized [`Self::in_place_inputs`] — a graph invariant (which KV-cache `Input`s the ops
     /// mutate in place), computed lazily on first query and reused. `execute` calls it PER TOKEN;
     /// without this it re-scanned every op and re-allocated a `HashSet` each call. Interior-mutable
