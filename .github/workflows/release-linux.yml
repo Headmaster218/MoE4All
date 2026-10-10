@@ -50,7 +50,7 @@ jobs:
         id: release
         run: |
           version=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "infr-cli"))')
-          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_NAME" != "release-$version" ]]; then
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "release-$version" ]]; then
             echo 'Release tag does not match Cargo version' >&2
             exit 1
           fi

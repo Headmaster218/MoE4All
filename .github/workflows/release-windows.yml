@@ -51,7 +51,7 @@ jobs:
           if ($null -eq $package) { throw 'infr-cli is missing from cargo metadata.' }
           $version = [string]$package.version
           $expectedTag = "release-$version"
-          if ('${{ github.event_name }}' -eq 'push' -and '${{ github.ref_name }}' -ne $expectedTag) {
+          if ('${{ github.event_name }}' -eq 'push' -and '${{ github.ref_type }}' -eq 'tag' -and '${{ github.ref_name }}' -ne $expectedTag) {
             throw "Tag '${{ github.ref_name }}' does not match Cargo version '$expectedTag'."
           }
           $packageName = "MoE4All-Windows-x86_64-v$version"
