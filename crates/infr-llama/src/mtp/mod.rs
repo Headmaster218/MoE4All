@@ -2326,6 +2326,12 @@ fn run_prime_last(
 /// cycle's three timed sections (the SAME three the `[mtp cycle N]` debug line prints); the one-time
 /// prompt-prime VERIFY forward is deliberately excluded — it's already `GenStats::prompt_secs`, not
 /// part of the steady-state decode this breakdown characterizes.
+/// Bins of [`MtpTiming::verify_widths`] — big enough for every VERIFY width either engine can pay
+/// (qwen4exp's is pinned to `qwen4::DRAFT_TOKENS + 1` at compile time, qwen35's is `n_max`-bounded),
+/// small enough to stay a fixed array so `MtpTiming` remains `Copy`. The LAST bin is saturating:
+/// a caller-chosen draft depth must not panic the telemetry path, it may only land in `>= BINS-1`.
+pub const MTP_VERIFY_WIDTH_BINS: usize = 16;
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MtpTiming {
     pub draft_secs: f64,
@@ -2333,6 +2339,19 @@ pub struct MtpTiming {
     pub catchup_secs: f64,
     pub total_drafted: usize,
     pub total_accepted: usize,
+    /// Verify cycles run (issue #70 §7). `total_accepted` over `total_drafted` is llama.cpp's
+    /// `alpha`, and `alpha` alone cannot attribute a t/s change: "drafted 3, accepted 0" and
+    /// "drafted 3, accepted 3" are both reported by the same counter pair at different rep counts,
+    /// and neither says how many rows the VERIFY forward actually paid for. `cycles` is the
+    /// denominator that turns both into per-iteration rates (see [`MtpTiming::mean_accepted`]).
+    pub cycles: usize,
+    /// Issue #70 §7: histogram of the VERIFY widths this run actually paid — bin `w` counts the
+    /// cycles whose VERIFY forward processed `w` rows (qwen4.rs records its per-cycle
+    /// `verify_tokens`, which the adaptive-width selector may change mid-turn; qwen35's driver
+    /// records `m`, the rows the trunk returned after prefix-diff re-prefill).
+    /// Speculative decode costs the VERIFY width and earns the accepted length; without this
+    /// histogram the two cannot be separated, e.g. when a width-4 VERIFY regresses but α holds.
+    pub verify_widths: [usize; MTP_VERIFY_WIDTH_BINS],
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -2345,11 +2364,59 @@ impl MtpTiming {
         self.catchup_secs += other.catchup_secs;
         self.total_drafted += other.total_drafted;
         self.total_accepted += other.total_accepted;
+        self.cycles += other.cycles;
+        for (mine, theirs) in self.verify_widths.iter_mut().zip(other.verify_widths) {
+            *mine += theirs;
+        }
     }
 
     /// Draft acceptance rate (`accepted / drafted`) — llama.cpp's `alpha`.
     pub fn alpha(&self) -> f64 {
         self.total_accepted as f64 / self.total_drafted.max(1) as f64
+    }
+
+    /// Histogram bin for a VERIFY feed width: exact below the last bin, saturating at it (see
+    /// [`MTP_VERIFY_WIDTH_BINS`]). Exposed so a driver that keeps its own counters (qwen35's
+    /// `generate_mtp_spec_core` builds its [`MtpTiming`] after the loop) bins identically.
+    pub const fn verify_width_bin(width: usize) -> usize {
+        // Plain comparison, not `width.min(..)`: `Ord` isn't a const trait, so the method form
+        // fails to compile inside a `const fn` (and `const` keeps this off the profiler's hot list,
+        // which `infr_prof::instrument` skips for `const fn` anyway).
+        if width < MTP_VERIFY_WIDTH_BINS {
+            width
+        } else {
+            MTP_VERIFY_WIDTH_BINS - 1
+        }
+    }
+
+    /// Count one cycle's VERIFY forward width. Call it exactly once per cycle, beside the
+    /// `total_drafted`/`total_accepted` updates, so `cycles` and the histogram share their
+    /// denominator with `alpha` instead of drifting when a cycle exits early.
+    pub fn record_verify_width(&mut self, width: usize) {
+        self.cycles += 1;
+        self.verify_widths[Self::verify_width_bin(width)] += 1;
+    }
+
+    /// Mean tokens COMMITTED per verify cycle — the number that actually moves t/s (issue #70 §7).
+    /// Both engines' `total_accepted` counts only accepted DRAFTS (qwen4.rs's `accepted_spec`,
+    /// qwen35's `spec_accept` return value), while every cycle also commits the target's own bonus
+    /// prediction, which no counter tracks; it must be added back per cycle:
+    /// `(total_accepted + cycles) / cycles`. `alpha` cannot substitute: a 0-accept cycle still
+    /// earns 1 token, and a fully-accepted width-4 cycle earns 4 for the same VERIFY price.
+    pub fn mean_accepted(&self) -> f64 {
+        (self.total_accepted + self.cycles) as f64 / self.cycles.max(1) as f64
+    }
+
+    /// `(width, cycles)` for every VERIFY width reached at least once, ascending — the archivable
+    /// form of [`MtpTiming::verify_widths`] for the summary lines and `infr bench --json`. Zero
+    /// bins are dropped: they'd add noise to an archived number without saying anything.
+    pub fn verify_width_hist(&self) -> Vec<(usize, usize)> {
+        self.verify_widths
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| **n > 0)
+            .map(|(w, n)| (w, *n))
+            .collect()
     }
 
     /// `(draft%, verify%, catchup%)` of the three phases' summed wall time — the breakdown that
@@ -2585,6 +2652,10 @@ fn generate_mtp_spec_core(
     let mut cycle = 0usize;
     let mut total_drafted = 0usize;
     let mut total_accepted = 0usize;
+    // Issue #70 §7: this loop keeps its own counters and builds the `MtpTiming` after it exits, so
+    // the VERIFY width histogram lives here too (binned through `MtpTiming::verify_width_bin`, the
+    // same bin the `record_verify_width` path uses).
+    let mut verify_widths = [0usize; MTP_VERIFY_WIDTH_BINS];
     // Phase 4 (issue #33): the SAME per-cycle sections `INFR_PROF_STAGES`'s `eprintln!` below already
     // times, summed across the whole run — this is what `MtpTiming`'s return threads out.
     let mut sum_draft_secs = 0.0f64;
@@ -2711,6 +2782,9 @@ fn generate_mtp_spec_core(
         };
         total_drafted += cand.len();
         total_accepted += accepted;
+        // The VERIFY rows this cycle really processed (`m`, post prefix-diff re-prefill), not the
+        // draft count — the two differ exactly when a re-prime widened the feed (issue #70 §7).
+        verify_widths[MtpTiming::verify_width_bin(m)] += 1;
 
         // DeltaNet rollback bookkeeping (see `mtp_ckpt`'s doc). A fully-accepted cycle leaves the
         // trunk's recurrent state on a clean committed prefix (`cached == committed ++ cand`, every
@@ -2884,13 +2958,24 @@ fn generate_mtp_spec_core(
         catchup_secs: sum_catchup_secs,
         total_drafted,
         total_accepted,
+        // Every iteration of the loop reached the histogram update above (`break 'cycles` sits
+        // after it, `n_max_round == 0` exits before `cycle += 1`), so `cycle` is the exact count.
+        cycles: cycle,
+        verify_widths,
     };
     if time_mtp {
         let (dp, vp, cp) = timing.phase_shares();
+        let alpha = timing.alpha();
+        let mean_accept = timing.mean_accepted();
+        let widths = timing
+            .verify_width_hist()
+            .iter()
+            .map(|(w, n)| format!("{w}:{n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let n_gen = out.len();
         tracing::info!(
-            "[mtp summary] {cycle} cycles, {total_accepted}/{total_drafted} accepted (alpha={:.3}), {} tokens generated, phase share: draft {dp:.0}% verify {vp:.0}% catchup {cp:.0}%",
-            timing.alpha(),
-            out.len()
+            "[mtp summary] {cycle} cycles, {total_accepted}/{total_drafted} accepted (alpha={alpha:.3}, mean accept {mean_accept:.2} tok/cycle), verify widths [{widths}], {n_gen} tokens generated, phase share: draft {dp:.0}% verify {vp:.0}% catchup {cp:.0}%"
         );
     }
 
@@ -2908,7 +2993,7 @@ fn generate_mtp_spec_core(
 
 #[cfg(test)]
 mod tests {
-    use super::nonleading_base;
+    use super::{nonleading_base, MtpTiming, MTP_VERIFY_WIDTH_BINS};
 
     /// AUDIT #4: the non-leading `base = m - (cand.len()+1)` subtraction must return an `Err` (not
     /// wrap `usize` and panic on the subsequent slice) when the trunk hands back too few rows.
@@ -2923,5 +3008,58 @@ mod tests {
         assert!(nonleading_base(6, 6).is_err());
         assert!(nonleading_base(0, 0).is_err());
         assert!(nonleading_base(3, 6).is_err());
+    }
+
+    /// Issue #70 §7: `mean_accepted` is the per-iteration win, and it depends on the bonus token
+    /// every cycle commits but neither engine's `total_accepted` counts. The same run must read
+    /// alpha 0.5 (the llama.cpp number) AND 2.5 committed tok/cycle — the two diverge exactly the
+    /// way a width/accept-length regression needs them to. An empty run says 0, not NaN.
+    #[test]
+    fn mtp_timing_mean_accepted_adds_one_bonus_token_per_cycle() {
+        // Ten width-4 cycles (3 drafts each), the realistic mix of accepted draft counts.
+        let accepts: [usize; 10] = [0, 0, 1, 1, 1, 2, 2, 2, 3, 3];
+        let mut t = MtpTiming::default();
+        for a in accepts {
+            t.total_drafted += 3;
+            t.total_accepted += a;
+            t.record_verify_width(4);
+        }
+        assert_eq!(t.cycles, 10);
+        assert!((t.alpha() - 0.5).abs() < 1e-9);
+        assert!((t.mean_accepted() - 2.5).abs() < 1e-9);
+        assert_eq!(t.verify_width_hist(), vec![(4, 10)]);
+        // A run that never decoded says nothing, in both forms.
+        assert_eq!(MtpTiming::default().mean_accepted(), 0.0);
+        assert!(MtpTiming::default().verify_width_hist().is_empty());
+    }
+
+    /// `infr bench` folds reps through `add`, so the two new counters must merge exactly like the
+    /// old ones — a rep that dropped its histogram would under-report the width distribution while
+    /// every rate still looked plausible. Widths past the table saturate into the last bin instead
+    /// of panicking the telemetry path (qwen35's draft depth is a caller parameter).
+    #[test]
+    fn mtp_timing_add_folds_the_new_counters_and_the_histogram_saturates() {
+        let mut a = MtpTiming::default();
+        a.total_accepted += 1;
+        a.record_verify_width(2);
+        let mut b = MtpTiming::default();
+        b.record_verify_width(3);
+        b.record_verify_width(MTP_VERIFY_WIDTH_BINS + 7);
+        a.add(&b);
+        assert_eq!(a.cycles, 3);
+        assert_eq!(
+            a.verify_width_hist(),
+            vec![(2, 1), (3, 1), (MTP_VERIFY_WIDTH_BINS - 1, 1)]
+        );
+        assert!((a.mean_accepted() - 4.0 / 3.0).abs() < 1e-9);
+        assert_eq!(MtpTiming::verify_width_bin(0), 0);
+        assert_eq!(
+            MtpTiming::verify_width_bin(MTP_VERIFY_WIDTH_BINS - 1),
+            MTP_VERIFY_WIDTH_BINS - 1
+        );
+        assert_eq!(
+            MtpTiming::verify_width_bin(usize::MAX),
+            MTP_VERIFY_WIDTH_BINS - 1
+        );
     }
 }

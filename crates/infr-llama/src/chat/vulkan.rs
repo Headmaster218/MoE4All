@@ -32,6 +32,10 @@ pub struct DenseSeamChat {
     /// Qwen3.8's detached MTP head and target slot. Created before the target's first forward so
     /// the fixed head weights/runtime precede unified expert-pool finalization.
     qwen4_mtp: Option<crate::mtp::Qwen4MtpRuntime>,
+    /// Latched once Qwen3.8's width calibration predicts ordinary decode wins (issue #70 §7
+    /// follow-up). Cleared with the MTP runtime's VRAM (including `mtp_vk`) so the ordinary
+    /// session can claim the whole arena; every later turn takes the ordinary path.
+    qwen4_auto_off: bool,
     /// Physical device this chat's session pins: `Some(idx)` = `VulkanN` (the multi-device path,
     /// `new_on`), `None` = the default device (`new`, byte-identical to before). Threaded into
     /// [`ensure_session`](Self::ensure_session) and [`ensure_mtp_backend`](Self::ensure_mtp_backend)
@@ -49,6 +53,7 @@ impl DenseSeamChat {
             mtp_checked: false,
             mtp_vk: None,
             qwen4_mtp: None,
+            qwen4_auto_off: false,
             dev: None,
         }
     }
@@ -64,6 +69,7 @@ impl DenseSeamChat {
             mtp_checked: false,
             mtp_vk: None,
             qwen4_mtp: None,
+            qwen4_auto_off: false,
             dev: Some(idx),
         }
     }
@@ -131,8 +137,11 @@ impl DenseSeamChat {
         Ok(())
     }
 
-    fn wants_qwen4_mtp(&self, req: Option<&crate::sampling::RequestCtx>) -> Result<bool> {
+    fn wants_qwen4_mtp(&mut self, req: Option<&crate::sampling::RequestCtx>) -> Result<bool> {
         if !self.model.config().qwen4exp || !self.model.engine_cfg().spec.mtp {
+            return Ok(false);
+        }
+        if self.qwen4_auto_off {
             return Ok(false);
         }
         if self.model.engine_cfg().spec.draft.is_none() {
@@ -182,11 +191,26 @@ impl DenseSeamChat {
     ) -> Result<GenStats> {
         if self.wants_qwen4_mtp(req)? {
             self.ensure_qwen4_mtp()?;
-            let vk = self.mtp_vk.as_ref().expect("ensure_qwen4_mtp set it");
-            let runtime = self.qwen4_mtp.as_mut().expect("ensure_qwen4_mtp set it");
-            return runtime
-                .generate_vulkan(vk, &self.model, prompt, max_new, req, |p| on_piece(p))
-                .map(|(stats, _)| stats);
+            let (stats, auto_off) = {
+                let vk = self.mtp_vk.as_ref().expect("ensure_qwen4_mtp set it");
+                let runtime = self.qwen4_mtp.as_mut().expect("ensure_qwen4_mtp set it");
+                let (stats, _) =
+                    runtime
+                        .generate_vulkan(vk, &self.model, prompt, max_new, req, |p| on_piece(p))?;
+                (stats, runtime.auto_off())
+            };
+            if auto_off {
+                // The gate's decision is already logged by the runtime. We deliberately do NOT
+                // drop the MTP backend or flip `qwen4_auto_off` here: the ordinary path builds its
+                // OWN `VulkanBackend`, and `self.model` still holds the MTP backend's weight
+                // buffers alive, so a second backend double-loads the 8.47 GiB weights and blows a
+                // 24 GB card at long context (observed: turn 2 "no usable KV cache fits" — 11.07
+                // GiB free minus 8.47 GiB fixed cannot seat the 4.64 GiB KV). A safe switch-off
+                // needs single-backend reuse (ordinary decode running ON the MTP backend), tracked
+                // as the next change. Auto-off is telemetry-only until then.
+                tracing::debug!("[qwen4 mtp auto-off] gate tripped; keeping MTP (telemetry-only)");
+            }
+            return Ok(stats);
         }
         if self.wants_mtp()? {
             self.ensure_mtp_backend()?;
