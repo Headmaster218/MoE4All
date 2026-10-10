@@ -1,7 +1,7 @@
 @echo off
 setlocal
 title MoE4All Launch Wizard
-powershell.exe -NoLogo -NoProfile -File "%~dp0scripts\infr-wizard.ps1" %*
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\infr-wizard.ps1" %*
 set "MOE4ALL_WIZARD_EXIT=%ERRORLEVEL%"
 if "%MOE4ALL_WIZARD_EXIT%"=="42" exit /b 0
 echo.
