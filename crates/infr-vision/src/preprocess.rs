@@ -182,7 +182,7 @@ fn describe_undecodable(bytes: &[u8], guessed: Option<image::ImageFormat>) -> St
          data: URI or base64 payload"
     } else if guessed.is_none() {
         " — unrecognised image magic; this build decodes png, jpeg, webp, gif, bmp, tiff and ico \
-         (convert others, e.g. AVIF/HEIC, before upload)"
+         plus heic and avif when the bundled image codecs are installed"
     } else {
         ""
     };
@@ -206,13 +206,17 @@ pub fn prepare_image_bytes(
     cfg: &ClipConfig,
     pos_table_f32: &[f32],
 ) -> Result<PreparedImage> {
-    let reader = ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .context("guessing image format")?;
-    let guessed = reader.format();
-    let img = reader
-        .decode()
-        .with_context(|| describe_undecodable(bytes, guessed))?;
+    let img = if crate::heif::recognizes(bytes) {
+        crate::heif::decode(bytes)?
+    } else {
+        let reader = ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .context("guessing image format")?;
+        let guessed = reader.format();
+        reader
+            .decode()
+            .with_context(|| describe_undecodable(bytes, guessed))?
+    };
     let (w, h) = img.dimensions();
     let (rw, rh) = smart_resize(w, h, cfg.merge_factor() as u32, cfg.patch_size);
     tracing::debug!(from = ?(w, h), to = ?(rw, rh), "vision smart-resize");
@@ -295,6 +299,36 @@ mod tests {
             is_deepstack_layers: vec![false; 2],
             base_grid: 2,
         }
+    }
+
+    #[test]
+    #[ignore = "requires the pinned decoder bundle and upstream fixtures"]
+    fn bundled_codecs_prepare_matches_png() -> Result<()> {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("INFR_IMAGE_CODEC_FIXTURES").context("missing fixture root")?,
+        );
+        let cfg = test_cfg();
+        let positions = [0.0; 32];
+        for file in [
+            "examples/example.heic",
+            "examples/example.avif",
+            "fuzzing/data/corpus/colors-with-alpha.heic",
+        ] {
+            let bytes = std::fs::read(root.join(file))?;
+            let uri = format!(
+                "data:image/heif;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(&bytes)
+            );
+            let input = decode_image_input(&uri)?;
+            let got = prepare_image_bytes(&input, &cfg, &positions)?;
+            let rgb = crate::heif::decode(&bytes)?.to_rgb8();
+            let want = prepare_image_bytes(&png_of(&rgb), &cfg, &positions)?;
+            assert_eq!((got.grid_nx, got.grid_ny), (want.grid_nx, want.grid_ny));
+            assert_eq!(got.patches, want.patches);
+            assert_eq!(got.pos_embed, want.pos_embed);
+            assert!(got.patches.iter().all(|v| v.is_finite()));
+        }
+        Ok(())
     }
 
     /// Encode a solid/procedural RGB image as PNG bytes in memory.

@@ -57,6 +57,12 @@ Invoke-RestMethod -Method Post -Uri "$base/v1/responses" -Headers $headers -Cont
 
 启用 Vision 并加载兼容的 mmproj 后，Chat Completions 的 `content` 可交错包含文本和 `image_url`。图片须为 data URI 或 base64；远程 HTTP URL 不受支持。以下示例读取本地 PNG：
 
+支持 PNG、JPEG、WebP、GIF、BMP、TIFF、ICO；带 `image-codecs/` 的 Windows/Linux
+发行包还支持 HEIC/HEIF（HEVC）和 AVIF。按文件内容识别，不依赖 MIME 或扩展名；
+HEIF/AVIF 使用主图并应用文件内裁剪、旋转、镜像，再走同一视觉预处理。
+不新增远程 URL 获取或动画播放。HEIF/AVIF 限制每边不超过 8192、面积不超过
+64 Mi 像素、压缩数据不超过 256 MiB；损坏或不支持的编码会明确报错。
+
 ```powershell
 $image = [Convert]::ToBase64String([IO.File]::ReadAllBytes('D:\Images\example.png'))
 $request = @{

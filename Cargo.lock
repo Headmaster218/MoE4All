@@ -1470,6 +1470,7 @@ dependencies = [
  "infr-core",
  "infr-gguf",
  "infr-vulkan",
+ "libloading",
  "rayon",
  "sha2",
  "tracing",
