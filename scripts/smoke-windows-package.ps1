@@ -2,7 +2,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$PackageRoot,
     [string]$ExpectedVersion = '',
-    [switch]$SkipDependencyCheck
+    [switch]$SkipDependencyCheck,
+    [switch]$SkipInteractiveDeviceChecks
 )
 
 $ErrorActionPreference = 'Stop'
@@ -231,12 +232,14 @@ function Invoke-WizardDryRun {
         [switch]$ExpectRecommendations,
         [switch]$EnableEmbedding,
         [switch]$EnableMtp,
-        [switch]$EnableVision
+        [switch]$EnableVision,
+        [switch]$ReuseSavedSettings
     )
 
     $state = [ordered]@{
         launch_mode = $Mode
         setup_mode = 'quick'
+        device = 'Vulkan0'
         model = $(if ($NoSavedModel) { '' } else { $modelPath })
         think_mode = 'default'
         max_new = ''
@@ -285,8 +288,9 @@ function Invoke-WizardDryRun {
     $process = [System.Diagnostics.Process]::Start($processInfo)
     $stdoutTask = $process.StandardOutput.ReadToEndAsync()
     $stderrTask = $process.StandardError.ReadToEndAsync()
-    # Decline direct reuse so the smoke still exercises the interactive configuration flow.
-    if (-not $NoSavedModel -and -not $PassModelArgument) {
+    # GPU-free runners exercise the real CMD through saved-state reuse; device prompts
+    # are covered separately with fixtures, without changing the shipped wizard.
+    if (-not $NoSavedModel -and -not $PassModelArgument -and -not $ReuseSavedSettings) {
         $process.StandardInput.WriteLine('n')
     }
     # Keep the saved launch mode. Without a launcher argument, exercise the same Read-Host model
@@ -369,10 +373,16 @@ function Invoke-WizardDryRun {
 
 $quotedModelPath = '"' + $modelPath + '"'
 $powerShellDrop = "& '$modelPath'"
-Invoke-WizardDryRun -Mode 'chat' -ExpectedCommand 'run' -PassModelArgument
-Invoke-WizardDryRun -Mode 'server' -ExpectedCommand 'serve' -ModelSelection $powerShellDrop -NoSavedModel -ExpectRecommendations -EnableEmbedding -EnableMtp -EnableVision
-Invoke-WizardDryRun -Mode 'benchmark' -ExpectedCommand 'bench' -ModelSelection $quotedModelPath
-Invoke-WizardDryRun -Mode 'benchmark' -ExpectedCommand 'bench' -ModelSelection 'R' -ExpectRecommendations
+if ($SkipInteractiveDeviceChecks) {
+    Invoke-WizardDryRun -Mode 'chat' -ExpectedCommand 'run' -ReuseSavedSettings
+    Invoke-WizardDryRun -Mode 'server' -ExpectedCommand 'serve' -ReuseSavedSettings
+    Invoke-WizardDryRun -Mode 'benchmark' -ExpectedCommand 'bench' -ReuseSavedSettings
+} else {
+    Invoke-WizardDryRun -Mode 'chat' -ExpectedCommand 'run' -PassModelArgument
+    Invoke-WizardDryRun -Mode 'server' -ExpectedCommand 'serve' -ModelSelection $powerShellDrop -NoSavedModel -ExpectRecommendations -EnableEmbedding -EnableMtp -EnableVision
+    Invoke-WizardDryRun -Mode 'benchmark' -ExpectedCommand 'bench' -ModelSelection $quotedModelPath
+    Invoke-WizardDryRun -Mode 'benchmark' -ExpectedCommand 'bench' -ModelSelection 'R' -ExpectRecommendations
+}
 
 Remove-Item -LiteralPath $modelPath -Force
 Remove-Item -LiteralPath $embeddingDirectory -Recurse -Force

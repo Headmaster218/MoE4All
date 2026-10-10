@@ -40,6 +40,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: windows-release-x86-64
+          cache-on-failure: true
 
       - name: Resolve and validate release version
         id: release
@@ -94,6 +95,12 @@ jobs:
       - name: Test Windows platform code
         shell: pwsh
         run: |
+          powershell.exe -NoLogo -NoProfile -File .\scripts\Test-LaunchWizard.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoLogo -NoProfile -File .\scripts\Test-CpuMissWizard.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoLogo -NoProfile -File .\scripts\Test-WizardEntryPolicy.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo check --locked -p infr-hub --all-targets
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p infr-hub model_ref::tests::
@@ -112,7 +119,7 @@ jobs:
           $extractPath = Join-Path $env:RUNNER_TEMP 'infr-package-smoke'
           Expand-Archive -LiteralPath '.\dist\${{ steps.release.outputs.archive_name }}' -DestinationPath $extractPath
           $packageRoot = Join-Path $extractPath '${{ steps.release.outputs.package_name }}'
-          .\scripts\smoke-windows-package.ps1 -PackageRoot $packageRoot -ExpectedVersion '${{ steps.release.outputs.version }}'
+          .\scripts\smoke-windows-package.ps1 -PackageRoot $packageRoot -ExpectedVersion '${{ steps.release.outputs.version }}' -SkipInteractiveDeviceChecks
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v6
