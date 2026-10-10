@@ -2294,7 +2294,9 @@ mod tests {
         if !supported(4) {
             return;
         }
-        for (threads, polls) in (4..=6).flat_map(|threads| [0, 32768].map(|polls| (threads, polls)))
+        for (threads, polls) in (4..=6)
+            .filter(|&threads| supported(threads))
+            .flat_map(|threads| [0, 32768].map(|polls| (threads, polls)))
         {
             let worker =
                 Worker::new_tuned_with_poll(threads, false, 262144, 1, false, polls).unwrap();
