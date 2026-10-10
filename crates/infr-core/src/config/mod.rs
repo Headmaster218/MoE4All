@@ -249,6 +249,15 @@ cfg_struct! {
         /// memory and written after generation so tracing does not add per-expert file I/O to the
         /// critical path.
         trace: Option<PathBuf> = None,
+        /// `INFR_WARM_PAGE_CACHE`: after load, read the model's shards once on a background
+        /// thread so the OS page cache is hot before the first request.
+        ///
+        /// This is the Linux counterpart of a resident host store. With `paging.dram_bypass` as
+        /// the default there, the PAGE CACHE is what actually holds the weights between
+        /// requests — and a cold one costs ~5x on prefill (measured on Qwen3.8-Flash-Next:
+        /// 73 tok/s cold vs 890 tok/s warm, against ~937 on Windows). Off by default: it is a
+        /// full pass over the shards (~90 s for 89 GiB on this box) and real I/O.
+        warm_page_cache: bool = false,
         /// Legacy raw host-cache override: `INFR_DRAM_CACHE` / `paging.dram`. New configurations
         /// should use `device.ram_budget`, whose value covers the whole process. This field retains
         /// its historical cache-only meaning so existing benchmark scripts remain reproducible.
