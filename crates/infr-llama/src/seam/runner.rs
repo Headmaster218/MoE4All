@@ -281,6 +281,29 @@ fn resident_after_gen(cur: &[u32], last_written: Option<usize>) -> Vec<u32> {
     }
 }
 
+fn lm_head_sampling_input(
+    graph: &mut Graph,
+    hidden: TensorId,
+    batch: usize,
+    logits_rows: usize,
+    dim: usize,
+) -> TensorId {
+    assert!(logits_rows > 0 && logits_rows <= batch);
+    if logits_rows == batch {
+        return hidden;
+    }
+    // Prefill rows come first; only the contiguous sampling suffix belongs to the LM head.
+    let suffix = graph.internal(TensorDesc::new(vec![logits_rows * dim], DType::F32));
+    graph.push(Op::Copy {
+        src: hidden,
+        src_off: ((batch - logits_rows) * dim) as u32,
+        dst: suffix,
+        dst_off: 0,
+        n: (logits_rows * dim) as u32,
+    });
+    suffix
+}
+
 fn sampling_suffix_start(positions: &[usize], prompt_ends: &[usize]) -> AResult<usize> {
     if positions.len() != prompt_ends.len() {
         return Err(anyhow!(
@@ -7798,23 +7821,7 @@ fn generate_dense_backend_inner(
                     eps,
                 });
             }
-            // For batch > 1 with logits_rows == 1: the LM head runs only on the LAST token's
-            // hidden state — extract it via Op::Copy before the projection so the logits output is
-            // [vocab]. Speculative verify passes logits_rows == batch and runs the head over every
-            // row instead (no Copy).
-            let lm_in = if batch > 1 && logits_rows == 1 {
-                let hn_last = g.internal(f32d(ne));
-                g.push(Op::Copy {
-                    src: hn,
-                    src_off: ((batch - 1) * ne) as u32,
-                    dst: hn_last,
-                    dst_off: 0,
-                    n: ne as u32,
-                });
-                hn_last
-            } else {
-                hn
-            };
+            let lm_in = lm_head_sampling_input(&mut g, hn, batch, logits_rows, ne);
             // MTP Phase 1 (issue #33): `lm_in` IS the tap target — exactly the rows `logits` is about
             // to be computed from, one op earlier (the reference's `res->t_h_nextn`, captured right
             // after `output_norm` in `qwen35.cpp`). A plain Copy into a fresh Output, so this never
@@ -12111,6 +12118,67 @@ fn generate_dense_backend_inner(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lm_head_projects_sampling_suffix_for_every_batch_shape() {
+        use infr_core::backend::{Backend, Bindings, BufferUsage};
+        use infr_core::graph::{Graph, Op};
+        use infr_core::tensor::TensorDesc;
+
+        let backend = infr_cpu::CpuBackend::new();
+        let dim = 3;
+        for batch in 1..=8 {
+            for rows in 1..=batch {
+                let mut graph = Graph::new();
+                let hidden = graph.input(TensorDesc::new(vec![batch * dim], DType::F32));
+                let input = super::lm_head_sampling_input(&mut graph, hidden, batch, rows, dim);
+                assert_eq!(graph.ops.len(), usize::from(rows < batch));
+                let weight = graph.weight(TensorDesc::new(vec![dim * dim], DType::F32));
+                let out = graph.output(TensorDesc::new(vec![rows * dim], DType::F32));
+                graph.push(Op::Linear {
+                    x: input,
+                    weight,
+                    dst: out,
+                    m: rows as u32,
+                    in_f: dim as u32,
+                    out_f: dim as u32,
+                    w_off: 0,
+                });
+                let values: Vec<f32> = (0..batch * dim).map(|i| i as f32 + 1.0).collect();
+                let identity = [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+                let hb = backend
+                    .alloc(values.len() * 4, BufferUsage::Activations)
+                    .unwrap();
+                let wb = backend
+                    .alloc(identity.len() * 4, BufferUsage::Weights)
+                    .unwrap();
+                let ob = backend
+                    .alloc(rows * dim * 4, BufferUsage::Readback)
+                    .unwrap();
+                backend
+                    .upload(hb.as_ref(), bytemuck::cast_slice(&values))
+                    .unwrap();
+                backend
+                    .upload(wb.as_ref(), bytemuck::cast_slice(&identity))
+                    .unwrap();
+                let mut bindings = Bindings::new();
+                bindings.bind(hidden, hb.as_ref());
+                bindings.bind(weight, wb.as_ref());
+                bindings.bind(out, ob.as_ref());
+                let plan = backend.compile(&graph).unwrap();
+                backend.execute(plan.as_ref(), &bindings).unwrap();
+                let mut actual = vec![0.0f32; rows * dim];
+                backend
+                    .download(ob.as_ref(), bytemuck::cast_slice_mut(&mut actual))
+                    .unwrap();
+                assert_eq!(
+                    actual,
+                    values[(batch - rows) * dim..],
+                    "batch={batch}, logits_rows={rows}"
+                );
+            }
+        }
+    }
+
     use super::{
         allocate_parallel_prefill_rows, dense_request_exceeds_capacity, full_mrope_positions,
         mrope_rows_are_plain_rope, mrope_token_position, parallel_prefill_group,
