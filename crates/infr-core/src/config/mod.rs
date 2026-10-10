@@ -230,6 +230,9 @@ cfg_struct! {
         /// Upload future streamed MoE layers on the host worker while the GPU computes the current
         /// layer. `INFR_SYNC_PREFILL_UPLOAD` disables the overlap for diagnostics.
         prefill_upload_async: bool = true,
+        /// Keep the streamed-MoE lane pipeline warm across consecutive Prefill chunks. The final
+        /// layers upload the next chunk's opening layers without executing that chunk early.
+        prefill_cross_chunk: bool = true,
         /// Predict the next Qwen3.8 Decode router from the current layer input and admit useful
         /// expert blocks at the cold LRU edge while the GPU executes intervening work.
         /// Experimental and opt-in: `INFR_EXPERT_PREFETCH` enables it for A/B diagnostics.
@@ -297,6 +300,10 @@ cfg_struct! {
         sg_nr: u32 = 2,
         /// `INFR_GEMV_ID_GRID_NR`: output rows handled per 64-thread paged IQ id-GEMV workgroup.
         id_grid_nr: u32 = 8,
+        /// Output rows per immutable-codebook paged IQ2_S/IQ3_S workgroup.
+        id_grid_buffer_nr: u32 = 4,
+        /// Immutable IQ codebooks. None selects measured Windows/RDNA3 Decode shapes only.
+        id_grid_buffer: Option<bool> = None,
         /// The selected GEMV variant, COMPUTED from two keys exactly as `GemvKnobs::resolve`
         /// does it: `INFR_NO_GEMV_REG` present ⇒ `None` (and it silently wins over
         /// `INFR_GEMV_VARIANT`); otherwise `INFR_GEMV_VARIANT`, else `Some("reg")`.
@@ -348,6 +355,9 @@ cfg_struct! {
         bm16: bool = true,
         /// `INFR_NO_MMQ` (inverted).
         mmq: bool = true,
+        /// `INFR_NO_QWEN_HC_DOWN_PREFETCH` (inverted): use the measured PF4 HC-down kernel on
+        /// Windows RDNA3 for Qwen3.8's exact Q8_0 single-row shape.
+        qwen_hc_down_prefetch: bool = true,
         /// `INFR_NO_MMQ_FALLBACK` (inverted).
         mmq_fallback: bool = true,
         /// `INFR_NO_MMV` (inverted). NOT a presence knob — both sites are `is_err()`. Getting
@@ -383,8 +393,53 @@ cfg_struct! {
         moe_topk_sg: bool = true,
         /// Fill all eight wave32 subgroups when QSA scores a single decode row.
         qsa_score_decode8: bool = true,
+        /// Experimental Qwen3.8 QSA prepare fusion. Concatenates the indexer Q/K projections and
+        /// fuses raw-K cache write with query norm/RoPE. Kept off until model-level A/B validation.
+        qsa_prepare_fused: bool = false,
+        /// Down promotion overlap. None selects measured Windows/RDNA3 deep two/three-row Decode.
+        decode_down_overlap: Option<bool> = None,
+        /// Sparse routed LUTs. None selects measured Windows/RDNA3 Qwen3.8 scalar/parallel Decode.
+        decode_sparse_lut: Option<bool> = None,
+        /// Earlier FFN submit. None selects measured Qwen3.8 Decode without expert prefetch.
+        decode_early_submit: Option<bool> = None,
+        /// Submit a CPU-miss result/merge immediately instead of waiting for the next router (A/B).
+        cpu_miss_early_submit: bool = false,
+        /// Fuse the one-row F32 CPU input readback into routing, avoiding a separate copy.
+        cpu_miss_input_tap: bool = false,
+        /// Write completed CPU outputs into disjoint mapped miss slots, avoiding staging copies.
+        cpu_miss_direct_result: bool = false,
+        /// Experimental single-miss merge reads the small host result without a scatter copy.
+        cpu_miss_host_result: bool = false,
+        /// Experimental scalar Decode offload, excluding the PLE layer. AVX2+FMA is required;
+        /// zero or unsupported geometry/source tiers keep GPU. Counts are physical workers.
+        cpu_miss_threads: usize = 0,
+        /// Offload the whole missing set only when its assignment count is within 1..=this cap.
+        /// Supported caps are 1-3; invalid values disable offload rather than pruning experts.
+        cpu_miss_max: usize = 1,
+        /// IQ3_S remains GPU-only unless explicitly included for diagnostic comparison.
+        cpu_miss_iq3: bool = false,
+        /// Bounded idle spin for the private miss pool only (iterations, not microseconds).
+        cpu_miss_spin: u32 = 16384,
+        /// Bounded coordinator polling inside a Decode burst; zero retains channel sleeping.
+        cpu_miss_poll: u32 = 0,
+        /// Park private helpers after publishing compute/promotion, without an empty pool job.
+        cpu_miss_idle_park: bool = false,
+        /// End the private CPU burst once per completed forward, freeing helpers for next PLE.
+        cpu_miss_token_park: bool = false,
+        /// Promote miss weights with the private CPU pool after submitting the result, not DMA.
+        cpu_miss_push: bool = false,
+        /// Diagnostic only: retain GPU miss computation and compare its raw output to the CPU.
+        cpu_miss_validate: bool = false,
+        /// Experimental independent FMA chains; changes reduction order, never activation dtype.
+        cpu_miss_split_acc: bool = false,
+        /// Experimental scale-grouped F32 dot; changes rounding, not activation precision.
+        cpu_miss_grouped_dot: bool = false,
+        /// Match GPU denormal flushing inside CPU miss tasks only, restoring each thread's MXCSR.
+        cpu_miss_flush_denormals: bool = false,
         /// Multi-workgroup exact radix selection for deep single-row QSA decode.
         qsa_topk_parallel: bool = true,
+        /// Exact QSA count prefixes. None selects the measured Windows RDNA3 parallel top-512 path.
+        qsa_topk_scan: Option<bool> = None,
         /// `INFR_CANVAS_CHUNK_N` (`tier::EnvRows`, floored at 1).
         canvas_chunk_n: usize = 3,
 
@@ -439,6 +494,21 @@ cfg_struct! {
         q8_decode_gqa2: bool = true,
         /// Reuse each Q8 K/V read across four adjacent GQA query heads when occupancy permits.
         q8_decode_gqa4: bool = true,
+        /// QSA Prefill Q8 K/V reuse mode. `2` keeps two heads in registers; `12` uses the
+        /// Qwen3.8-specific LDS-tiled full-GQA path. Unsupported shapes fall back safely.
+        qsa_prefill_gqa: usize = 12,
+        /// K/V tile used by the Qwen3.8 LDS GQA12 path. `16` keeps per-key online softmax;
+        /// `32` uses a FlashAttention-style tile merge.
+        qsa_prefill_tile: usize = 32,
+        /// Use F16 cooperative-matrix QK inside the Qwen3.8 Flash32 QSA Prefill path when the
+        /// active Vulkan device exposes the trusted 16x16x16 shape.
+        qsa_prefill_coopmat: bool = true,
+        /// Also use cooperative-matrix PV in that path. Kept separate so QK-only remains an
+        /// exact runtime A/B fallback on drivers where F16 probability staging is not profitable.
+        qsa_prefill_coopmat_pv: bool = true,
+        /// Block width of the Qwen3.8 Prefill indexer scorer's 8-query F32 tile. Supported values
+        /// are 32 and 64; other values keep the established 2-query x 4-block path.
+        qsa_score_tile: usize = 32,
         /// Wave32 max/sum reduction for the coupled Q8 hd256 decode combine pass.
         q8_decode_combine_sg: bool = true,
         /// `INFR_NO_MROWS_ATTN` / `INFR_MROWS_ATTN`, an ASYMMETRIC tri-state: `Some(false)` (the
@@ -586,6 +656,10 @@ cfg_struct! {
             qkv_fuse: bool = true,
             /// `INFR_NO_GATED_RMSNORM` (inverted), ANDed with `caps.gated_rmsnorm` at the site.
             gated_rmsnorm: bool = true,
+            /// `INFR_NO_DELTA_AB_FUSE` (inverted), ANDed with `caps.linear_pair_f32` at the site.
+            delta_ab_fuse: bool = true,
+            /// `INFR_NO_QWEN_HC_DOWN_INJECT` (inverted), ANDed with the Vulkan-only capability.
+            qwen_hc_down_inject: bool = true,
             /// `INFR_NO_PLE_SINGLE_PAR` (inverted): use the persistent gather pool for one row.
             ple_single_parallel: bool = true,
         }
@@ -610,6 +684,16 @@ cfg_struct! {
         draft: Option<PathBuf> = None,
         /// `INFR_SPEC_K`: draft-length upper bound.
         k: usize = 6,
+        /// Maximum attention horizon for the Qwen3.8 MTP head. The target model keeps its full
+        /// context; this only bounds the detached draft head's attention work.
+        mtp_context: usize = 32768,
+        /// Maximum target context at which automatic Qwen3.8 MTP remains enabled. Above this
+        /// boundary the target verification cost exceeds the saved decode work on the reference
+        /// RDNA3 configuration. Zero disables this automatic cutoff.
+        mtp_max_context: usize = 49152,
+        /// Let two active Qwen3.8 lanes probe batched MTP VERIFY. Disabled by default because the
+        /// ordinary batched path is faster and does not need to maintain detached side state.
+        mtp_concurrent: bool = false,
         /// `INFR_SPEC_DEBUG`.
         debug: bool = false,
         /// `INFR_DECODE_CHAIN`: decode iterations per submission.
@@ -730,6 +814,16 @@ cfg_struct! {
         /// Runtime-only wall timing, deliberately separate from `INFR_PROF_OPS` because Vulkan
         /// timestamp profiling changes the paged ring's nowait behaviour.
         pager_profile: bool = false,
+        /// Bounded asynchronous Decode trace; independent of the blocking per-op profiler.
+        timeline_path: Option<PathBuf> = None,
+        /// Optional one-shot CPU-miss weight/input fixture for local kernel diagnostics.
+        cpu_miss_fixture_dir: Option<PathBuf> = None,
+        timeline_skip_steps: usize = 64,
+        timeline_steps: usize = 16,
+        timeline_stride: usize = 128,
+        timeline_windows: usize = 12,
+        /// Zero captures any cohort size; otherwise capture exactly this many Decode lanes.
+        timeline_lanes: usize = 0,
         /// `INFR_PROF_OUT`: write the exit report as JSON to this path, in addition to stderr.
         /// (`INFR_PROFILE` — the BUILD-time host-instrumentation input read by `build.rs` — is
         /// deliberately NOT config; see [`manifest::NOT_MIGRATED`].)

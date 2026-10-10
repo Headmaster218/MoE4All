@@ -210,6 +210,35 @@ pub enum Op {
         /// its slices. Must be row-aligned (`w_off % in_f == 0`) and block-aligned for quants.
         w_off: u32,
     },
+    /// Two same-shape F32 projections over one activation: `dst_a = x * weight_a^T` and
+    /// `dst_b = x * weight_b^T`. The independent dot products keep the same reduction order as
+    /// two [`Op::Linear`] operations; a capable backend only folds their command submission and
+    /// shared activation binding into one dispatch. Used by DeltaNet's adjacent alpha/beta
+    /// projections. Backends without `Capabilities::linear_pair_f32` keep the split graph.
+    LinearPair {
+        x: TensorId,
+        weight_a: TensorId,
+        weight_b: TensorId,
+        dst_a: TensorId,
+        dst_b: TensorId,
+        m: u32,
+        in_f: u32,
+        out_f: u32,
+    },
+    /// Qwen3.8 one-row HC bottleneck fast path. Computes the Q8_0 `down` projection followed by
+    /// `silu(x * silu_scale)` and the independent F32/Q8_0 injection in one dispatch.
+    /// The two weights and two outputs remain separate; this adds no packed-weight allocation.
+    QwenHcDownInject {
+        x: TensorId,
+        down_weight: TensorId,
+        inject_weight: TensorId,
+        low_dst: TensorId,
+        inject_dst: TensorId,
+        in_f: u32,
+        low_rank: u32,
+        hc: u32,
+        silu_scale: f32,
+    },
     /// Row-wise softmax: `dst[r, :] = softmax(x[r, :] * scale)` over `dim` columns, `rows` rows.
     /// diffusion-gemma's in-graph self-conditioning (see `docs/diffusion-gemma.md`'s Phase-B and
     /// the reference's `dg_canvas_embed`): softmaxes the previous step's canvas logits over the
@@ -259,10 +288,10 @@ pub enum Op {
         /// per-head CopyStrided dispatch.
         x_stride: u32,
     },
-    /// Fused per-head RMSNorm + SiLU gate multiply: `QkNorm` immediately followed by an
-    /// `Op::GatedAct` (`Activation::Silu`) consuming QkNorm's own output (qwen35's DeltaNet
-    /// silu-gated RMSNorm — see docs/qwen35.md). One pass: for each of `rows * n_head` heads,
-    /// `dst[i] = (x[i] * rms_scale * weight[i]) * silu(gate[i])` where `rms_scale =
+    /// Fused per-head RMSNorm + gate multiply: `QkNorm` immediately followed by an
+    /// `Op::GatedAct` consuming QkNorm's own output. Qwen3.5 uses `Activation::Silu`; Qwen3.8
+    /// uses `Activation::Sigmoid`. One pass: for each of `rows * n_head` heads,
+    /// `dst[i] = (x[i] * rms_scale * weight[i]) * act(gate[i])` where `rms_scale =
     /// 1/sqrt(mean_head(x^2) + eps)` and `i` ranges over the head's `head_dim` elements. `gate` is
     /// a same-shape `[rows, n_head*head_dim]` buffer, indexed by the SAME flat element position as
     /// `x` (not a separate per-head layout). In place when `dst == x`.
@@ -282,6 +311,7 @@ pub enum Op {
         n_head: u32,
         head_dim: u32,
         eps: f32,
+        act: Activation,
     },
     /// RoPE over the first `rope_dim` of each head; dims past `rope_dim` pass through unrotated.
     /// `positions` is an i32 tensor of length `rows`. `freq_factors`, if present, divides per-pair
@@ -399,6 +429,26 @@ pub enum Op {
         cache: TensorId,
         rows: u32,
         row_stride: u32,
+        pos: u32,
+    },
+    /// Qwen3.8 QSA projection prepare. `qk` contains one concatenated
+    /// `[indexer query heads, raw index key]` row per token. The op writes the raw key into the
+    /// persistent F16 ring and emits the RMS-normalised, RoPE-applied F16 query in one pass.
+    /// `positions4` selects IMROPE; otherwise `positions` supplies ordinary text positions.
+    QsaPrepare {
+        qk: TensorId,
+        q_norm: TensorId,
+        positions: TensorId,
+        positions4: Option<TensorId>,
+        k_cache: TensorId,
+        q_dst: TensorId,
+        rows: u32,
+        n_head: u32,
+        head_dim: u32,
+        rope_dim: u32,
+        theta: f32,
+        eps: f32,
+        sections: [u32; 4],
         pos: u32,
     },
     /// DeepSeek V4 compressor state update and, on a block boundary, per-channel softmax pooling.
@@ -995,6 +1045,32 @@ pub enum Op {
         hc: u32,
         n_embd: u32,
     },
+    /// Qwen3.8 grouped RMSNorm over each residual stream followed by its stream-specific gamma.
+    /// `norm` has `[hc,n_embd]` values instead of the shared `[n_embd]` vector used by RmsNorm.
+    QwenHcNorm {
+        x: TensorId,
+        norm: TensorId,
+        dst: TensorId,
+        rows: u32,
+        hc: u32,
+        n_embd: u32,
+        eps: f32,
+    },
+    /// Qwen3.8 residual injection followed immediately by its grouped RMSNorm and per-stream
+    /// normalization weight. `residual_dst` preserves the injected wide residual for the matching
+    /// post-HC update, while `normed_dst` feeds the low-rank HC projection.
+    QwenHcInjectNorm {
+        residual: TensorId,
+        block: TensorId,
+        gate: TensorId,
+        norm: TensorId,
+        residual_dst: TensorId,
+        normed_dst: TensorId,
+        rows: u32,
+        hc: u32,
+        n_embd: u32,
+        eps: f32,
+    },
     /// Qwen3.8 PLE query-dependent value gate. `key` and `query` are grouped-normalized
     /// `[rows,hc,n_embd]`; `value` is `[rows,n_embd]`. For each stream, reduce
     /// `dot(key,query)/sqrt(n_embd)`, apply signed sqrt then sigmoid, and broadcast-multiply the
@@ -1360,6 +1436,8 @@ impl Op {
             Op::LayerNorm { .. } => "LayerNorm",
             Op::Softmax { .. } => "Softmax",
             Op::Linear { .. } => "Linear",
+            Op::LinearPair { .. } => "LinearPair",
+            Op::QwenHcDownInject { .. } => "QwenHcDownInject",
             Op::QkNorm { .. } => "QkNorm",
             Op::GatedRmsNorm { .. } => "GatedRmsNorm",
             Op::Rope { .. } => "Rope",
@@ -1367,6 +1445,7 @@ impl Op {
             Op::QkNormRope { .. } => "QkNormRope",
             Op::QkNormMrope { .. } => "QkNormMrope",
             Op::WriteKv { .. } => "WriteKv",
+            Op::QsaPrepare { .. } => "QsaPrepare",
             Op::Dsv4Compress { .. } => "Dsv4Compress",
             Op::Dsv4CacheWrite { .. } => "Dsv4CacheWrite",
             Op::Dsv4Indexer { .. } => "Dsv4Indexer",
@@ -1389,7 +1468,9 @@ impl Op {
             Op::Silu { .. } => "Silu",
             Op::Gelu { .. } => "Gelu",
             Op::QwenHcMix { .. } => "QwenHcMix",
+            Op::QwenHcNorm { .. } => "QwenHcNorm",
             Op::QwenHcInject { .. } => "QwenHcInject",
+            Op::QwenHcInjectNorm { .. } => "QwenHcInjectNorm",
             Op::QwenPleGate { .. } => "QwenPleGate",
             Op::MulVec { .. } => "MulVec",
             Op::HeadwiseSigmoidMul { .. } => "HeadwiseSigmoidMul",
@@ -1436,6 +1517,25 @@ impl Op {
                 (r, vec![dst])
             }
             Op::Linear { x, weight, dst, .. } => (vec![x, weight], vec![dst]),
+            Op::LinearPair {
+                x,
+                weight_a,
+                weight_b,
+                dst_a,
+                dst_b,
+                ..
+            } => (vec![x, weight_a, weight_b], vec![dst_a, dst_b]),
+            Op::QwenHcDownInject {
+                x,
+                down_weight,
+                inject_weight,
+                low_dst,
+                inject_dst,
+                ..
+            } => (
+                vec![x, down_weight, inject_weight],
+                vec![low_dst, inject_dst],
+            ),
             Op::QkNorm { x, weight, dst, .. } => {
                 let mut r = vec![x];
                 r.extend(weight);
@@ -1487,6 +1587,19 @@ impl Op {
                 ..
             } => (vec![x, weight, positions4], vec![dst]),
             Op::WriteKv { src, cache, .. } => (vec![src, cache], vec![cache]),
+            Op::QsaPrepare {
+                qk,
+                q_norm,
+                positions,
+                positions4,
+                k_cache,
+                q_dst,
+                ..
+            } => {
+                let mut reads = vec![qk, q_norm, positions, k_cache];
+                reads.extend(positions4);
+                (reads, vec![k_cache, q_dst])
+            }
             Op::Dsv4Compress {
                 values,
                 scores,
@@ -1616,6 +1729,7 @@ impl Op {
             Op::Silu { x, dst, .. } => (vec![x], vec![dst]),
             Op::Gelu { x, dst, .. } => (vec![x], vec![dst]),
             Op::QwenHcMix { x, gate, dst, .. } => (vec![x, gate], vec![dst]),
+            Op::QwenHcNorm { x, norm, dst, .. } => (vec![x, norm], vec![dst]),
             Op::QwenHcInject {
                 residual,
                 block,
@@ -1623,6 +1737,18 @@ impl Op {
                 dst,
                 ..
             } => (vec![residual, block, gate], vec![dst]),
+            Op::QwenHcInjectNorm {
+                residual,
+                block,
+                gate,
+                norm,
+                residual_dst,
+                normed_dst,
+                ..
+            } => (
+                vec![residual, block, gate, norm],
+                vec![residual_dst, normed_dst],
+            ),
             Op::QwenPleGate {
                 key,
                 query,
@@ -1799,6 +1925,16 @@ pub struct Graph {
     /// for prefill by ALSO unlocking it for MTP verify — which is what broke token-identity. See
     /// `infr_vulkan::adapter`'s `mrow_int8_dtype_ok` for the consumer.
     pub mtp_verify: bool,
+    /// This graph is a Prefill chunk followed immediately by another chunk in the same pager
+    /// phase. Backends may use the hint to pre-position weights only; model execution and state
+    /// updates remain strictly chunk ordered.
+    pub prefill_next_chunk: bool,
+    /// Final context depth of this Prefill transaction, including a reused prefix. Allows scratch
+    /// to stay stable across chunks without pricing the whole configured context window.
+    pub prefill_target_tokens: Option<usize>,
+    /// Runtime envelope selected at the transaction boundary. Reapplied after a small dense-prefix
+    /// chunk or an auxiliary graph temporarily returns the pager to Decode interpretation.
+    pub prefill_runtime_reserve_bytes: Option<u64>,
     /// Memoized [`Self::in_place_inputs`] — a graph invariant (which KV-cache `Input`s the ops
     /// mutate in place), computed lazily on first query and reused. `execute` calls it PER TOKEN;
     /// without this it re-scanned every op and re-allocated a `HashSet` each call. Interior-mutable
@@ -1830,6 +1966,9 @@ impl Graph {
                 match op {
                     Op::WriteKv { cache, .. } => {
                         set.insert(*cache);
+                    }
+                    Op::QsaPrepare { k_cache, .. } => {
+                        set.insert(*k_cache);
                     }
                     Op::Dsv4Compress { state, .. } => {
                         set.insert(*state);
@@ -2132,6 +2271,22 @@ mod tests {
             pos: 0,
             sinks: None,
         });
+        g.push(Op::QsaPrepare {
+            qk: t(10),
+            q_norm: t(11),
+            positions: t(12),
+            positions4: None,
+            k_cache: t(13),
+            q_dst: t(14),
+            rows: 1,
+            n_head: 1,
+            head_dim: 8,
+            rope_dim: 8,
+            theta: 10_000.0,
+            eps: 1e-6,
+            sections: [2, 1, 1, 0],
+            pos: 0,
+        });
         // A non-KV op must NOT contribute any in-place input.
         g.push(Op::Add {
             a: t(9),
@@ -2140,7 +2295,7 @@ mod tests {
             n: 8,
         });
 
-        let want: std::collections::HashSet<TensorId> = [t(6), t(8)].into_iter().collect();
+        let want: std::collections::HashSet<TensorId> = [t(6), t(8), t(13)].into_iter().collect();
         let first = g.in_place_inputs();
         assert_eq!(first, &want);
 

@@ -1,0 +1,27 @@
+[submodule "harness/plugins/dsh-llm-moe4all"]
+	path = harness/plugins/dsh-llm-moe4all
+	url = https://github.com/Headmaster218/dsh-llm-moe4all.git
+[submodule "harness/plugins/dsh-web-search-brave-moe4all"]
+	path = harness/plugins/dsh-web-search-brave-moe4all
+	url = https://github.com/Headmaster218/dsh-web-search-brave-moe4all.git
+[submodule "harness/plugins/dsh-plugin-tts-moe4all"]
+	path = harness/plugins/dsh-plugin-tts-moe4all
+	url = https://github.com/Headmaster218/dsh-plugin-tts-moe4all.git
+[submodule "harness/plugins/dsh-remote-web-ui-moe4all"]
+	path = harness/plugins/dsh-remote-web-ui-moe4all
+	url = https://github.com/Headmaster218/dsh-remote-web-ui-moe4all.git
+[submodule "harness/plugins/dsh-mneme-moe4all"]
+	path = harness/plugins/dsh-mneme-moe4all
+	url = https://github.com/Headmaster218/dsh-mneme-moe4all.git
+[submodule "harness/plugins/dsh-easyrewrite-moe4all"]
+	path = harness/plugins/dsh-easyrewrite-moe4all
+	url = https://github.com/Headmaster218/dsh-easyrewrite-moe4all.git
+[submodule "harness/plugins/dsh-plugin-cron-moe4all"]
+	path = harness/plugins/dsh-plugin-cron-moe4all
+	url = https://github.com/Headmaster218/dsh-plugin-cron-moe4all.git
+[submodule "harness/plugins/dsh-market-moe4all"]
+	path = harness/plugins/dsh-market-moe4all
+	url = https://github.com/Headmaster218/dsh-market-moe4all.git
+[submodule "harness/dsh"]
+	path = harness/dsh
+	url = https://github.com/Headmaster218/dsh-moe4all.git

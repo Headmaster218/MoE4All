@@ -35,6 +35,7 @@ pub mod shutdown;
 pub mod tensor;
 pub mod test_resource;
 pub mod tier;
+pub mod timeline;
 
 pub use backend::{
     initial_submit_dispatch_cap, integrated_ubatch_rows, submit_cap_from_measurement,

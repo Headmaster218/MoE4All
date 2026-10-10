@@ -76,7 +76,7 @@ pool 永久 pin 住。
 
 自动 RAM 预算在启动时按当时系统状态冻结。显式预算类似手动配置，不应在运行中随系统 available 值漂移。
 保守档使用启动时可用 RAM 减 3 GiB，激进档使用总物理 RAM 减 14 GiB，均写入进程总 RAM 预算。
-保守 VRAM 在分配器 256 MiB guard 外再留 768 MiB；激进档将总进程显存限制为设备总量减 2 GiB，同时受实时可用量约束。两档都先真实分配固定资源，再测量剩余空间建立 arena；Windows 大型 ReBAR 模型还可能应用额外启动保留与失败重试。
-离散 GPU 的默认 Prefill ubatch 分别从 2048/4096 行开始，放置不足时按档位下调；iGPU 使用独立默认值。
+保守 VRAM 在分配器 256 MiB guard 外再留 768 MiB；激进档直接使用扣除 guard 后的设备当前可用量。两档都先真实分配固定资源，再测量剩余空间建立 arena；物理分配失败时缩小 arena 或下调 ubatch 后重新探测，Windows 大型 ReBAR 模型还可能应用额外启动保留。
+离散 GPU 两档的默认 Prefill ubatch 都从 4096 行开始，放置不足时按档位下调；iGPU 使用独立默认值。
 
 更完整的历史设计见 [分层统一内存](../../evidence/changes/memory/unified-memory.md) 和 [Tiered weight paging](../../evidence/changes/memory/tiered-weight-paging.md)。

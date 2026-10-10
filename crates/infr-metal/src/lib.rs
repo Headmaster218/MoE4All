@@ -374,6 +374,7 @@ impl Backend for MetalBackend {
             // One fused [2*nff, ne] gate+up Linear + GatedActFused per FFN — one dispatch and
             // one contiguous weight stream instead of two.
             combined_gu: true,
+            qsa_prepare: false,
             // Op::EmbedGather runs on-device (embed_gather.metal, DEC16_* native decode) for
             // F16/BF16/Q8_0/Q4_0/Q5_0/Q4_K/Q6_K/IQ4_NL/IQ4_XS token_embd tables; the runner
             // additionally format-gates via the shared embed_gather_supported list (see the
@@ -390,6 +391,10 @@ impl Backend for MetalBackend {
             argmax_prob: false,
             // One 32-lane per-head reduction with the SiLU gate folded into its store pass.
             gated_rmsnorm: true,
+            // The paired F32 projection kernel binds both weights and outputs in one command.
+            linear_pair_f32: true,
+            // Qwen3.8 HC primitives are not implemented on Metal yet.
+            qwen_hc_down_inject: false,
             // Metal's KV kernels index rows directly by position — no ring mapping; the runner
             // keeps full-context KV allocations for SWA layers here.
             kv_swa_ring: false,

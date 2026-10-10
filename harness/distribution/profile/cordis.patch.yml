@@ -1,0 +1,28 @@
+# Portable overrides from the locally used profile. Machine addresses and credentials are omitted.
+
+- id: web
+  config:
+    searchProvider: brave-search
+
+- id: dsh-mneme-moe4all
+  config:
+    autoSummarize: true
+    distillEngine: v2
+    dreamMode: v2
+    distillMaxTokens: 32768
+    distillReasoningEffort: medium
+    entityExtractionEnabled: false
+    memoryQualityFilter:
+      enabled: false
+
+- id: session-title-llm
+  config:
+    targetWords: 5
+    targetCjkCharacters: 10
+    maxInputBytes: 4096
+    maxOutputTokens: 64
+    timeoutMs: 60000
+    provider: moe4all-title
+    model: Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00033
+
+# dsh-remote-web-ui-moe4all.publicBaseUrl is intentionally absent. It is installation-specific.

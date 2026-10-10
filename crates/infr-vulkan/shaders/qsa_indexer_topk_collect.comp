@@ -16,6 +16,9 @@ layout(binding = 2) writeonly buffer DB { uint dst[]; };
 shared uint selected_count;
 shared uint tie_prefix[256];
 shared uint chosen[512];
+#ifdef PARALLEL_SCAN
+#include "qsa_prefix_scan.glsl"
+#endif
 
 uint ordered_float(float x) {
     uint bits = floatBitsToUint(x);
@@ -24,6 +27,9 @@ uint ordered_float(float x) {
 
 void main() {
     uint t = gl_LocalInvocationID.x;
+#ifdef PARALLEL_SCAN
+    t = scan_thread();
+#endif
     uint prefix_score = work[pc.state_base];
     uint rank = work[pc.state_base + 1u];
     uint begin = pc.blocks * t / 256u;
@@ -33,6 +39,11 @@ void main() {
     for (uint j = begin; j < end; ++j) {
         local_ties += uint(ordered_float(scores[j]) == prefix_score);
     }
+#ifdef PARALLEL_SCAN
+    uint tie_ordinal = exclusive_count_prefix(local_ties);
+    if (t == 0u) { selected_count = 0u; }
+    barrier();
+#else
     tie_prefix[t] = local_ties;
     barrier();
     if (t == 0u) {
@@ -47,6 +58,7 @@ void main() {
     barrier();
 
     uint tie_ordinal = tie_prefix[t];
+#endif
     for (uint j = begin; j < end; ++j) {
         uint score_key = ordered_float(scores[j]);
         bool equal = score_key == prefix_score;

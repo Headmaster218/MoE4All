@@ -1,0 +1,37 @@
+#version 460
+// Qwen3.8 per-stream RMSNorm with a distinct gamma row for every HC stream.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC { uint hc; uint n_embd; float eps; } pc;
+layout(binding = 0) readonly buffer XB { float x[]; };
+layout(binding = 1) readonly buffer NB { float norm[]; };
+layout(binding = 2) writeonly buffer DB { float dst[]; };
+
+shared float part[8];
+
+void main() {
+    uint rh = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationIndex;
+    uint h = rh % pc.hc;
+    uint base = rh * pc.n_embd;
+    float ss = 0.0;
+    for (uint d = t; d < pc.n_embd; d += 256u) {
+        float value = x[base + d];
+        ss += value * value;
+    }
+    ss = subgroupAdd(ss);
+    if (subgroupElect()) { part[gl_SubgroupID] = ss; }
+    barrier();
+
+    float total = 0.0;
+    for (uint subgroup = 0u; subgroup < gl_NumSubgroups; ++subgroup) {
+        total += part[subgroup];
+    }
+    float scale = inversesqrt(total / float(pc.n_embd) + pc.eps);
+    uint norm_base = h * pc.n_embd;
+    for (uint d = t; d < pc.n_embd; d += 256u) {
+        dst[base + d] = x[base + d] * scale * norm[norm_base + d];
+    }
+}

@@ -1,5 +1,6 @@
 # Rust
 /target
+/scripts/__pycache__/
 **/*.rs.bk
 Cargo.lock.bak
 
@@ -19,6 +20,9 @@ target-prof/
 /kv-sessions/
 /.update/
 /artifacts/context-resource-matrix/
+/benchmark-data/
+/upstream-research/
+/harness/agent-state/
 /tests/context-resource/matrix.local.json
 bili_report_work/*
 followtasks.txt

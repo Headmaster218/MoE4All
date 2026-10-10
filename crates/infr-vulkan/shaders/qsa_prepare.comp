@@ -1,0 +1,114 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#ifdef KV_SEGMENTED
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#endif
+
+// Qwen3.8 QSA indexer prepare. The preceding GEMM writes one row containing all query heads
+// followed by the raw key. This kernel stores the raw key in its F16 ring and emits the
+// RMS-normalised, RoPE-applied F16 query. One workgroup owns one (row, query-head) pair.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint nheads;
+    uint hd;
+    uint rope_dim;
+    float theta;
+    float eps;
+    uint pos;
+    uint cap_rows;
+    uint raw_shift;
+    uint s0;
+    uint s1;
+    uint s2;
+    uint s3;
+} pc;
+
+layout(binding = 0) readonly buffer QKB { float qk[]; };
+layout(binding = 1) readonly buffer NB { float norm[]; };
+layout(binding = 2) readonly buffer PB { int positions[]; };
+#ifdef KV_SEGMENTED
+layout(binding = 3) readonly buffer KB { uvec2 raw_segments[]; };
+#include "kv_addr.glsl"
+#else
+layout(binding = 3) buffer KB { float16_t raw_k[]; };
+#endif
+layout(binding = 4) buffer QB { float16_t query[]; };
+
+shared float qv[512];
+shared float red[64];
+
+void store_key(uint element, float value) {
+#ifdef KV_SEGMENTED
+    uint local = kv_segment_local(element, pc.raw_shift);
+    uint64_t base = kv_segment_base(raw_segments[kv_segment(element, pc.raw_shift)]);
+    kv_store_half(base, local, value);
+#else
+    raw_k[element] = float16_t(value);
+#endif
+}
+
+uint mrope_plane(uint pair) {
+    uint sector = pair % (pc.s0 + pc.s1 + pc.s2 + pc.s3);
+    if (sector % 3u == 1u && sector < 3u * pc.s1) { return 1u; }
+    if (sector % 3u == 2u && sector < 3u * pc.s2) { return 2u; }
+    if (sector % 3u == 0u && sector < 3u * pc.s0) { return 0u; }
+    return 3u;
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (unit >= pc.rows * pc.nheads) { return; }
+    uint head = unit % pc.nheads;
+    uint row = unit / pc.nheads;
+    uint query_width = pc.nheads * pc.hd;
+    uint stride = query_width + pc.hd;
+    uint row_base = row * stride;
+
+    if (head == 0u) {
+        uint cache_row = (pc.pos + row) % pc.cap_rows;
+        for (uint i = t; i < pc.hd; i += 64u) {
+            store_key(cache_row * pc.hd + i, qk[row_base + query_width + i]);
+        }
+    }
+
+    uint q_base = row_base + head * pc.hd;
+    float partial = 0.0;
+    for (uint i = t; i < pc.hd; i += 64u) {
+        float value = qk[q_base + i];
+        qv[i] = value;
+        partial += value * value;
+    }
+    red[t] = partial;
+    barrier();
+    for (uint step = 32u; step > 0u; step >>= 1u) {
+        if (t < step) { red[t] += red[t + step]; }
+        barrier();
+    }
+    float scale = inversesqrt(red[0] / float(pc.hd) + pc.eps);
+    uint out_base = (row * pc.nheads + head) * pc.hd;
+    uint half_rope = pc.rope_dim >> 1u;
+    for (uint pair = t; pair < half_rope; pair += 64u) {
+        uint i0 = pair;
+        uint i1 = pair + half_rope;
+        float a = qv[i0] * scale * norm[i0];
+        float b = qv[i1] * scale * norm[i1];
+#ifdef QSA_MROPE
+        float position = float(positions[row * 4u + mrope_plane(pair)]);
+#else
+        float position = float(positions[row]);
+#endif
+        float angle = position * pow(pc.theta, -2.0 * float(pair) / float(pc.rope_dim));
+        float s = sin(angle);
+        float c = cos(angle);
+        query[out_base + i0] = float16_t(a * c - b * s);
+        query[out_base + i1] = float16_t(a * s + b * c);
+    }
+    for (uint i = pc.rope_dim + t; i < pc.hd; i += 64u) {
+        query[out_base + i] = float16_t(qv[i] * scale * norm[i]);
+    }
+}

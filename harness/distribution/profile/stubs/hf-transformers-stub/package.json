@@ -1,0 +1,7 @@
+{
+  "name": "@huggingface/transformers",
+  "version": "4.2.0",
+  "description": "MoE4All profile stub: Mneme embeddings are provided by the native OpenAI-compatible endpoint.",
+  "main": "index.js",
+  "private": true
+}

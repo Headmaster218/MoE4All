@@ -162,6 +162,9 @@ pub struct Capabilities {
     /// Costs an owned copy of both weights at load, so zero-copy mmap backends (CPU) leave this
     /// false and keep the separate-tensor form.
     pub combined_gu: bool,
+    /// The backend lowers [`crate::Op::QsaPrepare`] and can therefore consume the concatenated
+    /// Qwen3.8 indexer query/key projection used by that experimental fusion.
+    pub qsa_prepare: bool,
     /// The backend executes [`crate::Op::EmbedGather`] (dequantize embedding-table rows selected
     /// by a device-side id buffer). When set, the runner uploads TOKEN IDS (4 bytes each) instead
     /// of host-dequantized f32 embedding rows — decode feeds 4B/token, prefill 4B/token instead
@@ -186,11 +189,19 @@ pub struct Capabilities {
     /// instead of the `[vocab]` logits + host argmax/softmax scan). Backends without the kernel
     /// leave this false and the MTP driver keeps the host-logits `top1_softmax` path.
     pub argmax_prob: bool,
-    /// The backend executes [`crate::Op::GatedRmsNorm`] (fused per-head RMSNorm + SiLU gate
-    /// multiply — qwen35's DeltaNet z-gate, one dispatch instead of `QkNorm`→`GatedAct`'s two).
+    /// The backend executes [`crate::Op::GatedRmsNorm`] (fused per-head RMSNorm + SiLU/Sigmoid
+    /// gate multiply, one dispatch instead of `QkNorm`→`GatedAct`'s two).
     /// False = the runner keeps emitting the split pair (identical math, one extra
     /// read-after-write barrier on backends that have one).
     pub gated_rmsnorm: bool,
+    /// The backend executes two same-shape F32 projections from one activation as one dispatch.
+    /// This saves one command and the inter-op scheduling boundary; it does not concatenate or
+    /// duplicate either weight and adds no persistent device allocation.
+    pub linear_pair_f32: bool,
+    /// The backend executes Qwen3.8's one-row Q8_0 HC down projection, scaled SiLU, and tiny F32
+    /// inject projection in one dispatch. Multi-row Prefill/Verify and other weight types retain
+    /// the split graph.
+    pub qwen_hc_down_inject: bool,
     /// The backend treats every KV cache buffer as a RING over its allocated row count: `WriteKv`
     /// lands row `pos % cap_rows` and `Attention` reads key/value position `j` at row
     /// `j % cap_rows`, where `cap_rows = declared cache elements / row width`. A full-context
@@ -673,6 +684,19 @@ pub trait Backend: Send + Sync {
     /// on some other model.
     fn activation_peak(&self) -> Option<u64> {
         None
+    }
+    /// Release retained transient graph workspace at an explicit serial handoff. Persistent model
+    /// state, KV and weights remain resident. Backends without a phase arena keep this as a no-op.
+    ///
+    /// This is narrower than ending a request: the next graph is about to run immediately, so an
+    /// elastic backend should leave expert slots borrowed instead of eagerly refilling them into
+    /// space the next graph will need.
+    fn release_transient_runtime(&self) {}
+    /// Select a Prefill chunk from tallest-first `(rows, runtime reserve bytes)` candidates after the prompt's
+    /// persistent KV is resident. Called only at a serial phase boundary, before chunk buffers
+    /// exist. Backends without a shared expert arena leave the caller's chunk unchanged.
+    fn prepare_prefill(&self, _candidates: &[(usize, u64)]) -> Result<Option<usize>> {
+        Ok(None)
     }
     /// Open a weight-load progress scope: while the returned guard lives, this backend's weight
     /// allocations (`BufferUsage::Weights`/`HostWeights`) advance a visible progress display;

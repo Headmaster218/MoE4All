@@ -1,0 +1,35 @@
+{
+  "name": "moe4all-agent-profile-web",
+  "private": true,
+  "dependencies": {
+    "dsh-easyrewrite-moe4all": "2.4.1-moe4all.1",
+    "dsh-llm-moe4all": "0.2.0-alpha.19",
+    "dsh-market-moe4all": "1.45.1-moe4all.1",
+    "dsh-mneme-moe4all": "0.7.29-moe4all.1",
+    "dsh-plugin-cron-moe4all": "0.2.7-moe4all.1",
+    "dsh-plugin-tts-moe4all": "0.3.1-moe4all.1",
+    "dsh-remote-web-ui-moe4all": "0.3.17-moe4all.1",
+    "dsh-web-search-brave-moe4all": "1.0.0-moe4all.1"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "dsh-llm-moe4all",
+        "dsh-market-moe4all",
+        "dsh-web-search-brave-moe4all",
+        "dsh-mneme-moe4all",
+        "dsh-easyrewrite-moe4all",
+        "dsh-remote-web-ui-moe4all",
+        "dsh-plugin-cron-moe4all",
+        "dsh-plugin-tts-moe4all"
+      ]
+    }
+  },
+  "pnpm": {
+    "overrides": {
+      "@huggingface/transformers": "link:./stubs/hf-transformers-stub"
+    }
+  }
+}

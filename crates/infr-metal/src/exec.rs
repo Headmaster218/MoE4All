@@ -267,6 +267,8 @@ mod tests {
         let src = include_str!("../shaders/elementwise_norms.metal");
         assert!(src.contains("kernel void gated_rmsnorm_f32"));
         assert!(src.contains("float silu = z / (1.0f + exp(-z))"));
+        assert!(src.contains("kernel void gated_rmsnorm_sigmoid_f32"));
+        assert!(src.contains("float sigmoid = 1.0f / (1.0f + exp(-z))"));
     }
 
     /// Match a shader tripwire on TOKENS, not on exact source formatting — the same helper the
@@ -555,6 +557,7 @@ mod tests {
             n_head: 1,
             head_dim: 64,
             eps: 1e-6,
+            act: infr_core::graph::Activation::Silu,
         });
 
         let q = g.input(TensorDesc::new(vec![1, 1, 64], DType::F32));
@@ -1234,6 +1237,7 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings, m: &MetalCfg) 
             Op::RmsNorm { .. }
             | Op::RmsNormAdd { .. }
             | Op::Linear { .. }
+            | Op::LinearPair { .. }
             | Op::GatedAct { .. }
             | Op::GatedActFused { .. }
             | Op::Add { .. }
@@ -2680,13 +2684,21 @@ impl MetalBackend {
                 n_head,
                 head_dim,
                 eps,
+                act,
             } => {
                 let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
                 let bx = self.ensure_device(r, x);
                 let bw = self.weight_buf(weight, g, bindings)?;
                 let bg = self.ensure_device(r, gate);
                 let bd = self.dev_dst(r, dst, rows * nh * hd);
-                let pso = self.pipelines.get("gated_rmsnorm_f32")?;
+                let kernel = match act {
+                    infr_core::graph::Activation::Silu => "gated_rmsnorm_f32",
+                    infr_core::graph::Activation::Sigmoid => "gated_rmsnorm_sigmoid_f32",
+                    infr_core::graph::Activation::Gelu => {
+                        return Err(Error::backend("Metal GatedRmsNorm Gelu unsupported"))
+                    }
+                };
+                let pso = self.pipelines.get(kernel)?;
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(nh as u32).to_ne_bytes());
                 p.extend_from_slice(&(hd as u32).to_ne_bytes());
@@ -2701,6 +2713,60 @@ impl MetalBackend {
                     32,
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
+            }
+            Op::LinearPair {
+                x,
+                weight_a,
+                weight_b,
+                dst_a,
+                dst_b,
+                m,
+                in_f,
+                out_f,
+            } => {
+                if g.desc(weight_a).dtype != DType::F32 || g.desc(weight_b).dtype != DType::F32 {
+                    return Err(Error::Unsupported(
+                        "metal LinearPair requires two F32 weights".into(),
+                    ));
+                }
+                let (m, in_f, out_f) = (m as usize, in_f as usize, out_f as usize);
+                let bx = self.ensure_device(r, x);
+                let bwa = metal_buf(
+                    bindings
+                        .get(weight_a)
+                        .expect("metal backend: unbound LinearPair weight_a"),
+                );
+                let bwb = metal_buf(
+                    bindings
+                        .get(weight_b)
+                        .expect("metal backend: unbound LinearPair weight_b"),
+                );
+                let bda = self.dev_dst(r, dst_a, m * out_f);
+                let bdb = self.dev_dst(r, dst_b, m * out_f);
+                let mut p = (m as u32).to_ne_bytes().to_vec();
+                p.extend_from_slice(&(in_f as u32).to_ne_bytes());
+                p.extend_from_slice(&(out_f as u32).to_ne_bytes());
+                let pso = self.pipelines.get("linear_pair_f32")?;
+                if self.counter_set.is_some() {
+                    r.cur_op = "linear_pair_f32";
+                }
+                self.encode_tg_off(
+                    r,
+                    &pso,
+                    &[
+                        (bx.as_ref(), 0),
+                        (&bwa.raw, 0),
+                        (&bwb.raw, 0),
+                        (bda.as_ref(), 0),
+                        (bdb.as_ref(), 0),
+                    ],
+                    (1 << 3) | (1 << 4),
+                    &p,
+                    m * out_f * 2 * 32,
+                    32,
+                );
+                r.loc[dst_a.0 as usize] = Loc::Device;
+                r.loc[dst_b.0 as usize] = Loc::Device;
             }
             Op::Linear {
                 x,
@@ -5783,6 +5849,7 @@ impl MetalBackend {
             | Op::Dsv4CacheWrite { .. }
             | Op::Dsv4Indexer { .. }
             | Op::Dsv4Gather { .. }
+            | Op::QsaPrepare { .. }
             | Op::QsaIndexer { .. }
             | Op::QsaGather { .. }
             | Op::QsaBatchAttention { .. }
@@ -5795,8 +5862,11 @@ impl MetalBackend {
                 )));
             }
             Op::Silu { .. }
+            | Op::QwenHcDownInject { .. }
             | Op::QwenHcMix { .. }
+            | Op::QwenHcNorm { .. }
             | Op::QwenHcInject { .. }
+            | Op::QwenHcInjectNorm { .. }
             | Op::QwenPleGate { .. } => {
                 return Err(Error::Unsupported(
                     "Metal Qwen3.8 hyper-connection/PLE primitives are not implemented; use \

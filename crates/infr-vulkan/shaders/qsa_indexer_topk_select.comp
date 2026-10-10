@@ -12,9 +12,21 @@ layout(push_constant) uniform PC {
 layout(binding = 0) buffer WB { uint work[]; };
 
 shared uint bucket[256];
+#ifdef PARALLEL_SCAN
+#include "qsa_prefix_scan.glsl"
+shared uint input_rank;
+shared uint input_prefix;
+#endif
 
 void main() {
     uint t = gl_LocalInvocationID.x;
+#ifdef PARALLEL_SCAN
+    t = scan_thread();
+    if (t == 0u) {
+        input_rank = pc.level == 0u ? pc.top_k : work[pc.state_base + 1u];
+        input_prefix = pc.level == 0u ? 0u : work[pc.state_base];
+    }
+#endif
     uint total = 0u;
     for (uint group = 0u; group < pc.groups; ++group) {
         total += work[group * 256u + t];
@@ -22,6 +34,16 @@ void main() {
     bucket[t] = total;
     barrier();
 
+#ifdef PARALLEL_SCAN
+    uint rank = input_rank;
+    uint prefix = input_prefix;
+    uint count = bucket[255u - t];
+    uint above = exclusive_count_prefix(count);
+    if (above < rank && above + count >= rank) {
+        work[pc.state_base] = prefix | ((255u - t) << (24u - pc.level * 8u));
+        work[pc.state_base + 1u] = rank - above;
+    }
+#else
     if (t == 0u) {
         uint rank = pc.level == 0u ? pc.top_k : work[pc.state_base + 1u];
         uint above = 0u;
@@ -40,4 +62,5 @@ void main() {
         work[pc.state_base] = prefix | (digit << (24u - pc.level * 8u));
         work[pc.state_base + 1u] = next_rank;
     }
+#endif
 }

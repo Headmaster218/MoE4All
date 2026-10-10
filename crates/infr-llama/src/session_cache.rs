@@ -6,6 +6,7 @@
 //! `kv.session_cache_dir` is unset.
 
 use crate::mtp::{Qwen4MtpCacheState, Qwen4MtpCheckpointState, Qwen4MtpSession};
+use crate::sampling::StepGate;
 use crate::seam::{SeamKv, SessionBufferKey, SessionStateMeta};
 use crate::{Config, EngineConfig};
 use anyhow::{anyhow, Context, Result};
@@ -227,6 +228,39 @@ impl SessionCache {
         model_cfg: &Config,
         mtp: Option<MtpCacheSource<'_>>,
     ) -> Result<bool> {
+        self.spill_with_gate(kv, backend, model_cfg, mtp, None)
+    }
+
+    // A private catalog lets the idle worker write without holding the shared restore index.
+    pub(crate) fn spill_writer(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+            model_dir: self.model_dir.clone(),
+            fingerprint: self.fingerprint,
+            max_bytes: self.max_bytes,
+            ttl: self.ttl,
+            max_ctx: self.max_ctx,
+            k_fmt: self.k_fmt,
+            v_fmt: self.v_fmt,
+            entries: Vec::new(),
+        }
+    }
+
+    pub(crate) fn publish_spills(&mut self, writer: Self) {
+        self.entries.retain(|entry| entry.path.is_file());
+        for entry in writer.entries {
+            self.return_entry(entry);
+        }
+    }
+
+    pub(crate) fn spill_with_gate(
+        &mut self,
+        kv: &mut SeamKv,
+        backend: &dyn Backend,
+        model_cfg: &Config,
+        mtp: Option<MtpCacheSource<'_>>,
+        gate: Option<&StepGate>,
+    ) -> Result<bool> {
         let meta = kv.session_state_meta();
         if meta.cached.is_empty() {
             return Ok(false);
@@ -244,9 +278,12 @@ impl SessionCache {
 
         let started = Instant::now();
 
-        backend
-            .sync()
-            .map_err(|error| anyhow!("sync before cold KV spill: {error}"))?;
+        {
+            let _gate = gate.map(StepGate::enter);
+            backend
+                .sync()
+                .map_err(|error| anyhow!("sync before cold KV spill: {error}"))?;
+        }
         let buffers = kv.session_state_buffers(backend)?;
         let data_bytes = buffers.iter().try_fold(0u64, |total, buffer| {
             total
@@ -290,13 +327,20 @@ impl SessionCache {
                 source.state,
                 source.head,
                 backend,
+                gate,
             ) {
                 let _ = fs::remove_file(&paths.mtp_temporary);
                 return Err(error);
             }
         }
-        let write_result =
-            write_session_file(&paths.main_temporary, &header, &meta, &buffers, backend);
+        let write_result = write_session_file(
+            &paths.main_temporary,
+            &header,
+            &meta,
+            &buffers,
+            backend,
+            gate,
+        );
         drop(buffers);
         if let Err(error) = write_result {
             let _ = fs::remove_file(&paths.main_temporary);
@@ -327,6 +371,7 @@ impl SessionCache {
                 )
             });
         }
+        let _gate = gate.map(StepGate::enter);
         if let Err(error) = kv.release_session_state(backend, model_cfg) {
             let _ = fs::remove_file(&paths.main_final);
             let _ = fs::remove_file(&paths.mtp_final);
@@ -764,6 +809,7 @@ fn write_session_file(
     meta: &SessionStateMeta,
     buffers: &[crate::seam::SessionBuffer<'_>],
     backend: &dyn Backend,
+    gate: Option<&StepGate>,
 ) -> Result<()> {
     let file = OpenOptions::new()
         .write(true)
@@ -781,22 +827,46 @@ fn write_session_file(
     for buffer in buffers {
         let record = encode_record(buffer.key, buffer.committed_bytes as u64);
         write_hashed(&mut writer, &mut hasher, &record)?;
-        let mut offset = 0usize;
-        while offset < buffer.committed_bytes {
-            let count = (buffer.committed_bytes - offset).min(scratch.len());
-            backend
-                .download_range(buffer.buffer, offset, &mut scratch[..count])
-                .map_err(|error| {
-                    anyhow!("download cold KV {:?} at {offset}: {error}", buffer.key)
-                })?;
-            write_hashed(&mut writer, &mut hasher, &scratch[..count])?;
-            offset += count;
-        }
+        write_device_payload(
+            &mut writer,
+            &mut hasher,
+            buffer.buffer,
+            buffer.committed_bytes,
+            backend,
+            gate,
+            &mut scratch,
+        )
+        .with_context(|| format!("spill cold KV {:?}", buffer.key))?;
     }
     let checksum = hasher.finalize();
     writer.write_all(checksum.as_ref())?;
     writer.flush()?;
     writer.get_ref().sync_all()?;
+    Ok(())
+}
+
+fn write_device_payload(
+    writer: &mut impl Write,
+    hasher: &mut Sha256,
+    buffer: &dyn infr_core::backend::Buffer,
+    bytes: usize,
+    backend: &dyn Backend,
+    gate: Option<&StepGate>,
+    scratch: &mut [u8],
+) -> Result<()> {
+    anyhow::ensure!(!scratch.is_empty(), "cold KV transfer scratch is empty");
+    let mut offset = 0;
+    while offset < bytes {
+        let count = (bytes - offset).min(scratch.len());
+        {
+            let _gate = gate.map(StepGate::enter);
+            backend
+                .download_range(buffer, offset, &mut scratch[..count])
+                .map_err(|error| anyhow!("download cold KV payload at {offset}: {error}"))?;
+        }
+        write_hashed(writer, hasher, &scratch[..count])?;
+        offset += count;
+    }
     Ok(())
 }
 
@@ -806,6 +876,7 @@ fn write_mtp_file(
     state: &Qwen4MtpCacheState,
     head: &Qwen4MtpSession,
     backend: &dyn Backend,
+    gate: Option<&StepGate>,
 ) -> Result<()> {
     let file = OpenOptions::new()
         .write(true)
@@ -823,22 +894,26 @@ fn write_mtp_file(
     for checkpoint in state.turn_checkpoints.iter().flatten() {
         write_f32s(&mut writer, &mut hasher, &checkpoint.last_h)?;
     }
-    let kv = head.kv_prefix(backend, state.cached.len())?;
+    let kv = {
+        let _gate = gate.map(StepGate::enter);
+        head.kv_prefix(backend, state.cached.len())?
+    };
     anyhow::ensure!(
         kv.bytes_per_side() as u64 == header.kv_bytes_per_side,
         "cold MTP KV byte count changed while spilling"
     );
     let mut scratch = vec![0u8; STREAM_BYTES];
     for (name, buffer) in [("K", kv.k()), ("V", kv.v())] {
-        let mut offset = 0usize;
-        while offset < kv.bytes_per_side() {
-            let count = (kv.bytes_per_side() - offset).min(scratch.len());
-            backend
-                .download_range(buffer, offset, &mut scratch[..count])
-                .map_err(|error| anyhow!("download cold MTP {name} at {offset}: {error}"))?;
-            write_hashed(&mut writer, &mut hasher, &scratch[..count])?;
-            offset += count;
-        }
+        write_device_payload(
+            &mut writer,
+            &mut hasher,
+            buffer,
+            kv.bytes_per_side(),
+            backend,
+            gate,
+            &mut scratch,
+        )
+        .with_context(|| format!("spill cold MTP {name}"))?;
     }
     let checksum = hasher.finalize();
     writer.write_all(checksum.as_ref())?;
@@ -1697,6 +1772,176 @@ fn decode_dtype(value: u16) -> Result<DType> {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    struct GateCheckingWriter {
+        gate: std::sync::Arc<StepGate>,
+        bytes: Vec<u8>,
+        writes: usize,
+        fail_after: Option<usize>,
+    }
+
+    impl Write for GateCheckingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let gate = self.gate.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let _pass = gate.enter();
+                let _ = tx.send(());
+            });
+            rx.recv_timeout(Duration::from_secs(2))
+                .map_err(|_| std::io::Error::other("SSD write held the inference gate"))?;
+            thread.join().unwrap();
+            if self.fail_after == Some(self.writes) {
+                return Err(std::io::Error::other("injected SSD write failure"));
+            }
+            self.writes += 1;
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn spill_payload_yields_inference_gate_between_downloads_and_ssd_writes() {
+        use infr_core::backend::BufferUsage;
+        let backend = infr_cpu::CpuBackend::new_with(std::sync::Arc::new(EngineConfig::default()));
+        let gate = std::sync::Arc::new(StepGate::new());
+        let payload: Vec<_> = (0..83).collect();
+        let buffer = backend.alloc(payload.len(), BufferUsage::KvCache).unwrap();
+        backend.upload(buffer.as_ref(), &payload).unwrap();
+        let mut writer = GateCheckingWriter {
+            gate: gate.clone(),
+            bytes: Vec::new(),
+            writes: 0,
+            fail_after: None,
+        };
+        let mut hasher = Sha256::new();
+        write_device_payload(
+            &mut writer,
+            &mut hasher,
+            buffer.as_ref(),
+            payload.len(),
+            &backend,
+            Some(&gate),
+            &mut [0; 17],
+        )
+        .unwrap();
+        assert_eq!(writer.bytes, payload);
+        assert_eq!(writer.writes, 5);
+        assert_eq!(hasher.finalize(), Sha256::digest(&payload));
+        writer.fail_after = Some(5);
+        assert!(write_device_payload(
+            &mut writer,
+            &mut Sha256::new(),
+            buffer.as_ref(),
+            payload.len(),
+            &backend,
+            Some(&gate),
+            &mut [0; 17]
+        )
+        .is_err());
+        assert!(write_device_payload(
+            &mut Vec::new(),
+            &mut Sha256::new(),
+            buffer.as_ref(),
+            payload.len() + 17,
+            &backend,
+            Some(&gate),
+            &mut [0; 17]
+        )
+        .is_err());
+        let _pass = gate.enter();
+    }
+
+    #[test]
+    fn gated_spill_file_preserves_layout_checkpoints_and_checksum() {
+        use infr_core::backend::BufferUsage;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("roundtrip.infrkv");
+        let backend = infr_cpu::CpuBackend::new_with(std::sync::Arc::new(EngineConfig::default()));
+        let payload: Vec<u8> = (0..127).collect();
+        let buffer = backend.alloc(payload.len(), BufferUsage::KvCache).unwrap();
+        backend.upload(buffer.as_ref(), &payload).unwrap();
+        let meta = SessionStateMeta {
+            max_ctx: 32768,
+            k_fmt: DType::Q8_0,
+            v_fmt: DType::Q8_0,
+            committed_tokens: 32768,
+            cached: vec![1, 2, 3],
+            checkpoint_tokens: [Some(vec![1]), Some(vec![1, 2])],
+        };
+        let header = Header::new([7; 32], &meta, 1, payload.len() as u64).unwrap();
+        let records = [crate::seam::SessionBuffer {
+            key: SessionBufferKey::K(0),
+            buffer: buffer.as_ref(),
+            committed_bytes: payload.len(),
+        }];
+        write_session_file(
+            &path,
+            &header,
+            &meta,
+            &records,
+            &backend,
+            Some(&StepGate::new()),
+        )
+        .unwrap();
+        let file = fs::read(&path).unwrap();
+        assert_eq!(file.len() as u64, checked_file_bytes(&header).unwrap());
+        let data_end = file.len() - CHECKSUM_BYTES as usize;
+        assert_eq!(
+            &file[data_end..],
+            Sha256::digest(&file[..data_end]).as_slice()
+        );
+        assert_eq!(&file[data_end - payload.len()..data_end], payload);
+        let entry = read_catalog_entry(&path, [7; 32], meta.max_ctx, meta.k_fmt, meta.v_fmt)
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.meta.cached, meta.cached);
+        assert_eq!(entry.meta.checkpoint_tokens, meta.checkpoint_tokens);
+    }
+
+    #[test]
+    fn detached_spill_publication_preserves_existing_entries_and_prunes_gc_victims() {
+        let temp = tempfile::tempdir().unwrap();
+        let make_entry = |name: &str, token| {
+            let path = temp.path().join(name);
+            fs::write(&path, [0u8; 10]).unwrap();
+            ColdEntry {
+                path,
+                saved_at: 0,
+                file_bytes: 10,
+                meta: SessionStateMeta {
+                    max_ctx: 32768,
+                    k_fmt: DType::Q8_0,
+                    v_fmt: DType::Q8_0,
+                    committed_tokens: 32768,
+                    cached: vec![token],
+                    checkpoint_tokens: [None, None],
+                },
+            }
+        };
+        let mut cache = SessionCache {
+            root: temp.path().to_path_buf(),
+            model_dir: temp.path().to_path_buf(),
+            fingerprint: [0; 32],
+            max_bytes: 1000,
+            ttl: None,
+            max_ctx: 32768,
+            k_fmt: DType::Q8_0,
+            v_fmt: DType::Q8_0,
+            entries: vec![make_entry("old.infrkv", 1), make_entry("victim.infrkv", 2)],
+        };
+        let mut writer = cache.spill_writer();
+        assert!(writer.entries.is_empty());
+        writer.entries.push(make_entry("new.infrkv", 3));
+        fs::remove_file(&cache.entries[1].path).unwrap();
+        cache.publish_spills(writer);
+        assert_eq!(cache.entries.len(), 2);
+        assert!(cache.entries.iter().any(|entry| entry.meta.cached == [1]));
+        assert!(cache.entries.iter().any(|entry| entry.meta.cached == [3]));
+    }
 
     #[test]
     fn header_round_trips_and_has_a_checked_size() {

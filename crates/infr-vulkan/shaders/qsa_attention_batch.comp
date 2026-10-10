@@ -13,6 +13,10 @@
 // independent online-softmax states; one final reduction combines those states. This avoids both
 // the old second QK pass and its per-key workgroup barriers. Each subgroup lane owns four elements
 // of a 128-wide head or eight elements of a 256-wide head.
+#ifndef GQA_HEADS
+#define GQA_HEADS 1
+#endif
+
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
@@ -42,9 +46,9 @@ layout(binding = 4) writeonly buffer DB { float dst[]; };
 
 const uint SUBGROUP_WIDTH = 32u;
 const uint SUBGROUPS = 4u;
-shared float subgroup_max[SUBGROUPS];
-shared float subgroup_sum[SUBGROUPS];
-shared float subgroup_out[SUBGROUPS][256];
+shared float subgroup_max[SUBGROUPS][GQA_HEADS];
+shared float subgroup_sum[SUBGROUPS][GQA_HEADS];
+shared float subgroup_out[SUBGROUPS][GQA_HEADS][256];
 
 float qread(uint i) {
     uint w = q[i >> 1u];
@@ -158,30 +162,39 @@ uint source_row(uint row, uint logical, uint selected, uint complete) {
 
 void main() {
     uint job = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
-    uint row = job / pc.n_head;
-    uint head = job - row * pc.n_head;
+    uint head_jobs = pc.n_head / GQA_HEADS;
+    uint row = job / head_jobs;
+    uint head_base = (job - row * head_jobs) * GQA_HEADS;
     if (row >= pc.rows || (pc.head_dim != 128u && pc.head_dim != 256u)) { return; }
     uint subgroup = gl_SubgroupID;
     uint lane = gl_SubgroupInvocationID;
     uint group = pc.n_head / pc.n_kv;
-    uint kv_head = head / group;
+    uint kv_head = head_base / group;
     uint visible = pc.kv_len - pc.rows + row + 1u;
     uint complete = visible / pc.ratio;
     uint tail = visible - complete * pc.ratio;
     uint selected = min(pc.top_blocks, complete);
     uint keys = selected * pc.ratio + tail;
-    uint qbase = (row * pc.n_head + head) * pc.head_dim;
+    uint qbase = (row * pc.n_head + head_base) * pc.head_dim;
 
-    float qv[8];
-    float accum[8];
-    for (uint component = 0u; component < 8u; ++component) {
-        uint d = lane + component * SUBGROUP_WIDTH;
-        qv[component] = d < pc.head_dim ? qread(qbase + d) : 0.0;
-        accum[component] = 0.0;
+    float qv[GQA_HEADS][8];
+    float accum[GQA_HEADS][8];
+    for (uint query = 0u; query < GQA_HEADS; ++query) {
+        for (uint component = 0u; component < 8u; ++component) {
+            uint d = lane + component * SUBGROUP_WIDTH;
+            qv[query][component] = d < pc.head_dim
+                ? qread(qbase + query * pc.head_dim + d)
+                : 0.0;
+            accum[query][component] = 0.0;
+        }
     }
 
-    float local_max = -3.402823466e+38;
-    float local_sum = 0.0;
+    float local_max[GQA_HEADS];
+    float local_sum[GQA_HEADS];
+    for (uint query = 0u; query < GQA_HEADS; ++query) {
+        local_max[query] = -3.402823466e+38;
+        local_sum[query] = 0.0;
+    }
 #ifdef KV_SEGMENTED
     uint segment_elems = 1u << pc.segment_shift;
     uint cached_segment = 0xffffffffu;
@@ -203,27 +216,41 @@ void main() {
         }
         uint local_base = kv_segment_local(kbase, pc.segment_shift);
 #endif
-        float dot = 0.0;
+        float dot[GQA_HEADS];
+        for (uint query = 0u; query < GQA_HEADS; ++query) {
+            dot[query] = 0.0;
+        }
         for (uint component = 0u; component < 8u; ++component) {
             uint d = lane + component * SUBGROUP_WIDTH;
             if (d < pc.head_dim) {
 #ifdef KV_SEGMENTED
-                dot += qv[component] * kread_local(k_address, local_base + d, segment_elems);
+                float key = kread_local(k_address, local_base + d, segment_elems);
 #else
-                dot += qv[component] * kread(kbase + d);
+                float key = kread(kbase + d);
 #endif
+                for (uint query = 0u; query < GQA_HEADS; ++query) {
+                    dot[query] += qv[query][component] * key;
+                }
             }
         }
-        float score = subgroupAdd(dot) * pc.scale;
-        float next_max = max(local_max, score);
-        float previous_scale = 1.0;
-        float value_scale = 1.0;
-        if (score > local_max) {
-            previous_scale = local_sum == 0.0 ? 0.0 : exp(local_max - score);
-        } else {
-            value_scale = exp(score - local_max);
+        float score[GQA_HEADS];
+        float next_max[GQA_HEADS];
+        float previous_scale[GQA_HEADS];
+        float value_scale[GQA_HEADS];
+        for (uint query = 0u; query < GQA_HEADS; ++query) {
+            score[query] = subgroupAdd(dot[query]) * pc.scale;
+            next_max[query] = max(local_max[query], score[query]);
+            previous_scale[query] = 1.0;
+            value_scale[query] = 1.0;
+            if (score[query] > local_max[query]) {
+                previous_scale[query] = local_sum[query] == 0.0
+                    ? 0.0
+                    : exp(local_max[query] - score[query]);
+            } else {
+                value_scale[query] = exp(score[query] - local_max[query]);
+            }
+            local_sum[query] = local_sum[query] * previous_scale[query] + value_scale[query];
         }
-        local_sum = local_sum * previous_scale + value_scale;
         for (uint component = 0u; component < 8u; ++component) {
             uint d = lane + component * SUBGROUP_WIDTH;
             if (d < pc.head_dim) {
@@ -232,47 +259,57 @@ void main() {
 #else
                 float value = vread(kbase + d);
 #endif
-                accum[component] = accum[component] * previous_scale
-                    + value_scale * value;
+                for (uint query = 0u; query < GQA_HEADS; ++query) {
+                    accum[query][component] = accum[query][component] * previous_scale[query]
+                        + value_scale[query] * value;
+                }
             }
         }
-        local_max = next_max;
+        for (uint query = 0u; query < GQA_HEADS; ++query) {
+            local_max[query] = next_max[query];
+        }
     }
 
     if (lane == 0u) {
-        subgroup_max[subgroup] = local_max;
-        subgroup_sum[subgroup] = local_sum;
+        for (uint query = 0u; query < GQA_HEADS; ++query) {
+            subgroup_max[subgroup][query] = local_max[query];
+            subgroup_sum[subgroup][query] = local_sum[query];
+        }
     }
-    for (uint component = 0u; component < 8u; ++component) {
-        uint d = lane + component * SUBGROUP_WIDTH;
-        if (d < pc.head_dim) {
-            subgroup_out[subgroup][d] = accum[component];
+    for (uint query = 0u; query < GQA_HEADS; ++query) {
+        for (uint component = 0u; component < 8u; ++component) {
+            uint d = lane + component * SUBGROUP_WIDTH;
+            if (d < pc.head_dim) {
+                subgroup_out[subgroup][query][d] = accum[query][component];
+            }
         }
     }
     barrier();
 
     if (subgroup != 0u) { return; }
-    float merged_max = max(
-        max(subgroup_max[0], subgroup_max[1]),
-        max(subgroup_max[2], subgroup_max[3])
-    );
-    float merge_scale[SUBGROUPS];
-    float merged_sum = 0.0;
-    for (uint source = 0u; source < SUBGROUPS; ++source) {
-        merge_scale[source] = subgroup_sum[source] == 0.0
-            ? 0.0
-            : exp(subgroup_max[source] - merged_max);
-        merged_sum += subgroup_sum[source] * merge_scale[source];
-    }
-    uint out_base = (row * pc.n_head + head) * pc.head_dim;
-    for (uint component = 0u; component < 8u; ++component) {
-        uint d = lane + component * SUBGROUP_WIDTH;
-        if (d < pc.head_dim) {
-            float merged = 0.0;
-            for (uint source = 0u; source < SUBGROUPS; ++source) {
-                merged += subgroup_out[source][d] * merge_scale[source];
+    for (uint query = 0u; query < GQA_HEADS; ++query) {
+        float merged_max = max(
+            max(subgroup_max[0][query], subgroup_max[1][query]),
+            max(subgroup_max[2][query], subgroup_max[3][query])
+        );
+        float merge_scale[SUBGROUPS];
+        float merged_sum = 0.0;
+        for (uint source = 0u; source < SUBGROUPS; ++source) {
+            merge_scale[source] = subgroup_sum[source][query] == 0.0
+                ? 0.0
+                : exp(subgroup_max[source][query] - merged_max);
+            merged_sum += subgroup_sum[source][query] * merge_scale[source];
+        }
+        uint out_base = (row * pc.n_head + head_base + query) * pc.head_dim;
+        for (uint component = 0u; component < 8u; ++component) {
+            uint d = lane + component * SUBGROUP_WIDTH;
+            if (d < pc.head_dim) {
+                float merged = 0.0;
+                for (uint source = 0u; source < SUBGROUPS; ++source) {
+                    merged += subgroup_out[source][query][d] * merge_scale[source];
+                }
+                dst[out_base + d] = merged / merged_sum;
             }
-            dst[out_base + d] = merged / merged_sum;
         }
     }
 }

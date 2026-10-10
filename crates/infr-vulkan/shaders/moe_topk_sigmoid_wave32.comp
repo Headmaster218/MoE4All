@@ -1,0 +1,111 @@
+#version 460
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+// Fast Qwen MoE router: one wave32 per token, up to 512 experts and top-32.
+//
+// This is the common bias-free, group-free sigmoid + selected-weight-renormalization path. Each
+// lane owns 16 experts and keeps their logits/live mask in registers. Sigmoid is monotonic, so
+// ranking raw logits is identical while avoiding 512 exp() calls and a second 16-float register
+// array per token. Only the ten winners need sigmoid for their final weights. All top-k passes use
+// wave shuffles only; unlike the generic 128-thread router there are no cross-wave shared
+// reductions or workgroup barriers. Selection ties and the rank-ordered weight sum match the
+// generic kernel.
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint n_expert;
+    uint n_used;
+    float scale;
+    uint gating;
+    uint norm_w;
+    uint has_bias;
+    uint n_expert_groups;
+    uint n_expert_groups_used;
+    uint hash;
+} pc;
+
+layout(binding = 0) readonly buffer LB { float logits[]; };
+#ifdef CPU_INPUT_TAP
+layout(binding = 1) readonly buffer BB { uint raw_input[]; };
+layout(binding = 2) writeonly buffer HB { uint cpu_input[]; };
+#else
+layout(binding = 1) readonly buffer BB { float bias[]; };
+layout(binding = 2) readonly buffer HB { uint hash_ids[]; };
+#endif
+layout(binding = 3) writeonly buffer IB { uint ids[]; };
+layout(binding = 4) writeonly buffer WB { float wts[]; };
+
+#define MAX_PER_LANE 16u
+
+float sigmoid(float x) {
+    return 1.0 / (1.0 + exp(-x));
+}
+
+void main() {
+    uint tok = gl_WorkGroupID.x;
+    uint lane = gl_SubgroupInvocationID;
+    uint lbase = tok * pc.n_expert;
+    uint obase = tok * pc.n_used;
+
+    float raw[MAX_PER_LANE];
+    uint live = 0u;
+    for (uint j = 0u; j < MAX_PER_LANE; j++) {
+        uint e = lane + 32u * j;
+        if (e < pc.n_expert) {
+            float v = logits[lbase + e];
+            raw[j] = v;
+            live |= 1u << j;
+        } else {
+            raw[j] = -1e30;
+        }
+    }
+
+    uint my_id = 0u;
+    float my_logit = 0.0;
+    for (uint rank = 0u; rank < pc.n_used; rank++) {
+        float best = -1e30;
+        uint best_id = 0xFFFFFFFFu;
+        for (uint j = 0u; j < MAX_PER_LANE; j++) {
+            if ((live & (1u << j)) != 0u) {
+                uint e = lane + 32u * j;
+                float s = raw[j];
+                if (s > best) {
+                    best = s;
+                    best_id = e;
+                }
+            }
+        }
+
+        float wave_best = subgroupMax(best);
+        uint winner = subgroupMin(best == wave_best ? best_id : 0xFFFFFFFFu);
+        winner = min(winner, pc.n_expert - 1u);
+        uint owner = winner & 31u;
+        uint owner_j = winner >> 5u;
+        float owner_logit = lane == owner ? raw[owner_j] : 0.0;
+        float winner_logit = subgroupBroadcast(owner_logit, owner);
+
+        if (lane == rank) {
+            my_id = winner;
+            my_logit = winner_logit;
+        }
+        if (lane == owner) { live &= ~(1u << owner_j); }
+    }
+
+    float my_weight = lane < pc.n_used ? sigmoid(my_logit) : 0.0;
+    float sum = 0.0;
+    for (uint rank = 0u; rank < pc.n_used; rank++) {
+        sum += subgroupBroadcast(my_weight, rank);
+    }
+    sum = max(sum, 1e-20);
+    if (lane < pc.n_used) {
+        ids[obase + lane] = my_id;
+        wts[obase + lane] = my_weight / sum * pc.scale;
+    }
+#ifdef CPU_INPUT_TAP
+    for (uint i = lane; i < 2560u; i += 32u) {
+        cpu_input[i] = raw_input[i];
+    }
+#endif
+}

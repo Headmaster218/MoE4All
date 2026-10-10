@@ -25,6 +25,9 @@ shared uint remaining_rank;
 shared uint selected_count;
 shared uint tie_prefix[256];
 shared uint chosen[512];
+#ifdef PARALLEL_SCAN
+#include "qsa_prefix_scan.glsl"
+#endif
 
 uint ordered_float(float x) {
     uint bits = floatBitsToUint(x);
@@ -33,6 +36,9 @@ uint ordered_float(float x) {
 
 void main() {
     uint t = gl_LocalInvocationID.x;
+#ifdef PARALLEL_SCAN
+    t = scan_thread();
+#endif
     uint row = gl_WorkGroupID.x;
     if (row >= pc.rows) { return; }
     uint blocks = (pc.kv_len - pc.rows + row + 1u) / pc.ratio;
@@ -66,6 +72,14 @@ void main() {
         }
         barrier();
 
+#ifdef PARALLEL_SCAN
+        uint count = bucket[255u - t];
+        uint above = exclusive_count_prefix(count);
+        if (above < rank && above + count >= rank) {
+            selected_digit = 255u - t;
+            remaining_rank = rank - above;
+        }
+#else
         if (t == 0u) {
             uint above = 0u;
             uint digit = 0u;
@@ -82,6 +96,7 @@ void main() {
             selected_digit = digit;
             remaining_rank = next_rank;
         }
+#endif
         barrier();
 
         prefix_score |= selected_digit << (24u - level * 8u);
@@ -99,6 +114,9 @@ void main() {
     for (uint j = begin; j < end; ++j) {
         local_ties += uint(ordered_float(scores[score_base + j]) == prefix_score);
     }
+#ifdef PARALLEL_SCAN
+    uint tie_ordinal = exclusive_count_prefix(local_ties);
+#else
     tie_prefix[t] = local_ties;
     barrier();
     if (t == 0u) {
@@ -110,10 +128,13 @@ void main() {
         }
     }
     barrier();
+#endif
 
     if (t == 0u) { selected_count = 0u; }
     barrier();
+#ifndef PARALLEL_SCAN
     uint tie_ordinal = tie_prefix[t];
+#endif
     for (uint j = begin; j < end; ++j) {
         uint score_key = ordered_float(scores[score_base + j]);
         bool equal = score_key == prefix_score;

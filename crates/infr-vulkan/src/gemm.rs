@@ -425,6 +425,36 @@ pub(crate) fn native_idm_grid_nr_paged_build_spv(
 /// Hybrid paged-Qwen decode GEMV: routed slots use `dtype`, while the final slot reads a fixed
 /// dense Q8_0 shared-expert matrix. Kept separate from the ordinary paged table so unsupported
 /// graphs cannot accidentally select the larger push-constant ABI.
+pub(crate) fn native_idm_grid_buffer_paged_spv(
+    dtype: infr_core::DType,
+    nr: u32,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! variant {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            Some((
+                $name,
+                S.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            ))
+        }};
+    }
+    match (dtype, nr) {
+        (Iq2S, 1) => variant!("native_idm_iq2s_buffer_paged"),
+        (Iq2S, 2) => variant!("native_idm_iq2s_buffer_nr2_paged"),
+        (Iq2S, 4) => variant!("native_idm_iq2s_buffer_nr4_paged"),
+        (Iq2S, 8) => variant!("native_idm_iq2s_buffer_nr8_paged"),
+        (Iq3S, 1) => variant!("native_idm_iq3s_buffer_paged"),
+        (Iq3S, 2) => variant!("native_idm_iq3s_buffer_nr2_paged"),
+        (Iq3S, 4) => variant!("native_idm_iq3s_buffer_nr4_paged"),
+        (Iq3S, 8) => variant!("native_idm_iq3s_buffer_nr8_paged"),
+        _ => None,
+    }
+}
+
 pub(crate) fn native_idm_paged_shared_build_spv(
     dtype: infr_core::DType,
 ) -> Option<(&'static str, &'static [u32])> {
@@ -447,6 +477,36 @@ pub(crate) fn native_idm_paged_shared_build_spv(
         Iq3S => v!("native_idm_iq3s_paged_shexp"),
         Iq4Nl => v!("native_idm_iq4nl_paged_shexp"),
         Iq4Xs => v!("native_idm_iq4xs_paged_shexp"),
+        _ => None,
+    }
+}
+
+pub(crate) fn native_idm_grid_buffer_shared_spv(
+    dtype: infr_core::DType,
+    nr: u32,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! variant {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            Some((
+                $name,
+                S.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            ))
+        }};
+    }
+    match (dtype, nr) {
+        (Iq2S, 1) => variant!("native_idm_iq2s_buffer_paged_shexp"),
+        (Iq2S, 2) => variant!("native_idm_iq2s_buffer_nr2_paged_shexp"),
+        (Iq2S, 4) => variant!("native_idm_iq2s_buffer_nr4_paged_shexp"),
+        (Iq2S, 8) => variant!("native_idm_iq2s_buffer_nr8_paged_shexp"),
+        (Iq3S, 1) => variant!("native_idm_iq3s_buffer_paged_shexp"),
+        (Iq3S, 2) => variant!("native_idm_iq3s_buffer_nr2_paged_shexp"),
+        (Iq3S, 4) => variant!("native_idm_iq3s_buffer_nr4_paged_shexp"),
+        (Iq3S, 8) => variant!("native_idm_iq3s_buffer_nr8_paged_shexp"),
         _ => None,
     }
 }
@@ -1217,6 +1277,38 @@ pub(crate) fn linear_f32r_mrow8_v4_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// Paired two-weight/two-output twins of the F32 projection family. They preserve the scalar,
+/// vec4 and row-tiled reduction shapes above while sharing one command submission.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn linear_f32r_pair_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32r_pair.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn linear_f32r_pair_v4_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32r_pair_v4.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn linear_f32r_pair_mrow8_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32r_pair_mrow8.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn linear_f32r_pair_mrow4_v4_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32r_pair_mrow4_v4.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn linear_f32r_pair_mrow8_v4_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32r_pair_mrow8_v4.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// `-DSTREAMED` twin SPIR-V of `linear_res` (slice A4; see the shader's
 /// STREAMED doc — weight read through a typed 64-bit buffer_reference). Parity-test entry.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -1438,6 +1530,11 @@ pub(crate) fn moe_accumulate_shared_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+pub(crate) fn moe_accumulate_shared_cpu_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_accumulate_shared_cpu.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the MoE weighted-accumulate with a per-expert down-output scale (diffusion-gemma
 /// `ffn_down_exps.scale`).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -1457,6 +1554,29 @@ pub(crate) fn moe_topk_spv() -> &'static [u32] {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn moe_topk_sg_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_topk_sg.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// Wave32 register-resident router for bias-free Qwen sigmoid top-k.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn moe_topk_sigmoid_wave32_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_topk_sigmoid_wave32.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+pub(crate) fn moe_topk_tap_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_topk_tap.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+pub(crate) fn moe_topk_sg_tap_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_topk_sg_tap.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+pub(crate) fn moe_topk_sigmoid_wave32_tap_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/moe_topk_sigmoid_wave32_tap.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
@@ -2046,6 +2166,8 @@ const ATTN_PV_REDUCE_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_pv_reduce.spv"));
 const RMSNORM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rmsnorm.spv"));
 const RMSNORM_GATE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rmsnorm_gate.spv"));
+const RMSNORM_GATE_SIGMOID_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/rmsnorm_gate_sigmoid.spv"));
 const DELTANET_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/deltanet.spv"));
 const DELTANET_CHUNKED_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_chunked.spv"));
@@ -2560,6 +2682,12 @@ pub(crate) fn rmsnorm_gate_spv() -> &'static [u32] {
     static RMSNORM_GATE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     RMSNORM_GATE_SPV.get_or_init(|| spv_words(RMSNORM_GATE_SPV_BYTES))
 }
+/// SPIR-V for the Qwen3.8 fused per-head RMSNorm + Sigmoid gate multiply.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn rmsnorm_gate_sigmoid_spv() -> &'static [u32] {
+    static RMSNORM_GATE_SIGMOID_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+    RMSNORM_GATE_SIGMOID_SPV.get_or_init(|| spv_words(RMSNORM_GATE_SIGMOID_SPV_BYTES))
+}
 /// SPIR-V for fused RMSNorm + in-place add (`rmsnorm.comp`'s -DADD build, `Op::RmsNormAdd`).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn rmsnorm_add_spv() -> &'static [u32] {
@@ -2683,6 +2811,16 @@ pub(crate) fn qwen_hc_mix_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/qwen_hc_mix.spv"))))
 }
+/// SPIR-V for Qwen3.8 grouped residual-stream normalization.
+pub(crate) fn qwen_hc_norm_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/qwen_hc_norm.spv"
+        )))
+    })
+}
 /// SPIR-V for Qwen3.8's per-stream block injection.
 pub(crate) fn qwen_hc_inject_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
@@ -2690,6 +2828,44 @@ pub(crate) fn qwen_hc_inject_spv() -> &'static [u32] {
         spv_words(include_bytes!(concat!(
             env!("OUT_DIR"),
             "/qwen_hc_inject.spv"
+        )))
+    })
+}
+/// SPIR-V for fused Qwen3.8 residual injection and grouped normalization.
+pub(crate) fn qwen_hc_inject_norm_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/qwen_hc_inject_norm.spv"
+        )))
+    })
+}
+/// SPIR-V for Qwen3.8's one-row Q8_0 HC down + scaled SiLU + F32 inject projection.
+pub(crate) fn qwen_hc_down_inject_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/qwen_hc_down_inject.spv"
+        )))
+    })
+}
+pub(crate) fn qwen_hc_down_inject_pf4_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/qwen_hc_down_inject_pf4.spv"
+        )))
+    })
+}
+pub(crate) fn qwen_hc_down_inject_q8_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/qwen_hc_down_inject_q8.spv"
         )))
     })
 }
@@ -3392,9 +3568,22 @@ macro_rules! qsa_spv {
         }
     };
 }
+qsa_spv!(qsa_prepare_spv, "qsa_prepare");
+qsa_spv!(qsa_prepare_mrope_spv, "qsa_prepare_mrope");
+qsa_spv!(qsa_prepare_seg_spv, "qsa_prepare_seg");
+qsa_spv!(qsa_prepare_mrope_seg_spv, "qsa_prepare_mrope_seg");
 qsa_spv!(qsa_indexer_topk_hist_spv, "qsa_indexer_topk_hist");
 qsa_spv!(qsa_indexer_topk_select_spv, "qsa_indexer_topk_select");
 qsa_spv!(qsa_indexer_topk_collect_spv, "qsa_indexer_topk_collect");
+qsa_spv!(qsa_indexer_topk_scan_spv, "qsa_indexer_topk_scan");
+qsa_spv!(
+    qsa_indexer_topk_select_scan_spv,
+    "qsa_indexer_topk_select_scan"
+);
+qsa_spv!(
+    qsa_indexer_topk_collect_scan_spv,
+    "qsa_indexer_topk_collect_scan"
+);
 qsa_spv!(qsa_indexer_compress_seg_spv, "qsa_indexer_compress_seg");
 qsa_spv!(qsa_indexer_compress_mrope_spv, "qsa_indexer_compress_mrope");
 qsa_spv!(
@@ -3404,6 +3593,14 @@ qsa_spv!(
 qsa_spv!(qsa_indexer_score_seg_spv, "qsa_indexer_score_seg");
 qsa_spv!(qsa_indexer_score_h4_spv, "qsa_indexer_score_h4");
 qsa_spv!(qsa_indexer_score_h4_seg_spv, "qsa_indexer_score_h4_seg");
+qsa_spv!(
+    qsa_indexer_score_h4_t32_seg_spv,
+    "qsa_indexer_score_h4_t32_seg"
+);
+qsa_spv!(
+    qsa_indexer_score_h4_t64_seg_spv,
+    "qsa_indexer_score_h4_t64_seg"
+);
 qsa_spv!(
     qsa_indexer_score_decode8_seg_spv,
     "qsa_indexer_score_decode8_seg"
@@ -3438,6 +3635,26 @@ qsa_spv!(
     "qsa_attention_batch_vq8_seg"
 );
 qsa_spv!(qsa_attention_batch_q8_seg_spv, "qsa_attention_batch_q8_seg");
+qsa_spv!(
+    qsa_attention_batch_q8_seg_gqa2_spv,
+    "qsa_attention_batch_q8_seg_gqa2"
+);
+qsa_spv!(
+    qsa_attention_batch_q8_seg_gqa12_spv,
+    "qsa_attention_batch_q8_seg_gqa12"
+);
+qsa_spv!(
+    qsa_attention_batch_q8_seg_gqa12_flash_spv,
+    "qsa_attention_batch_q8_seg_gqa12_flash"
+);
+qsa_spv!(
+    qsa_attention_batch_q8_seg_gqa12_flash_cm_qk_spv,
+    "qsa_attention_batch_q8_seg_gqa12_flash_cm_qk"
+);
+qsa_spv!(
+    qsa_attention_batch_q8_seg_gqa12_flash_cm_qk_pv_spv,
+    "qsa_attention_batch_q8_seg_gqa12_flash_cm_qk_pv"
+);
 /// SPIR-V for Ling KDA recurrent attention.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn kda_spv() -> &'static [u32] {

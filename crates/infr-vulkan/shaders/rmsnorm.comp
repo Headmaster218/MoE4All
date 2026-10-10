@@ -1,6 +1,7 @@
 #version 460
 // RMSNorm: y[i] = x[i] * inversesqrt(mean(x²) + eps) * w[i], one workgroup per row.
-// -DGATE build (`rmsnorm_gate`): fuses in the qwen35 DeltaNet z-gate multiply
+// -DGATE build (`rmsnorm_gate`): fuses in the qwen35 DeltaNet SiLU z-gate multiply
+// -DGATE -DGATE_SIGMOID build (`rmsnorm_gate_sigmoid`): qwen4exp's Sigmoid z-gate
 // -DADD build (`rmsnorm_add`): fuses in an in-place add to dst: dst[i] += norm_result[i]
 // -DF16IO build (`rmsnorm_f16`): x/y are f16 instead of f32 (llama4's post-rope weightless Q/K
 // L2-norm, `Op::QkNorm` on the f16 rope scratch — `w` stays f32 either way). Mutually exclusive
@@ -116,7 +117,11 @@ void main() {
 #elif defined(GATE)
     for (uint i = t; i < pc.dim; i += NTHREAD) {
         float zv = z[base + i];
+#ifdef GATE_SIGMOID
+        float gate = 1.0 / (1.0 + exp(-zv));
+#else
         float gate = zv / (1.0 + exp(-zv));
+#endif
         y[base + i] = x[base + i] * scale * w[i] * gate;
     }
 #elif defined(ADD)
