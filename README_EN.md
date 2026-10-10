@@ -94,7 +94,7 @@ The source installation command below targets Ubuntu 26.04; other distributions 
 `glslc` from shaderc 2025 or newer first:
 
 ```sh
-sudo apt-get update && sudo apt-get install -y glslc python3
+sudo apt-get update && sudo apt-get install -y glslc
 git clone https://github.com/Headmaster218/MoE4All.git && cd MoE4All
 cargo build --release --locked -p infr-cli
 ./Start-INFR-Wizard-Linux.sh      # interactive launcher; --dry-run prints only

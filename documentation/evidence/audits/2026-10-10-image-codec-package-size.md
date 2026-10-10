@@ -76,3 +76,56 @@ ZIP 里的许可证文本不等于完成最终分发合规检查，接入发包�
 上游：[libheif](https://github.com/strukturag/libheif/releases/tag/v1.23.6)、
 [libde265](https://github.com/strukturag/libde265/releases/tag/v1.1.3)、
 [dav1d](https://code.videolan.org/videolan/dav1d/-/tags/1.5.4)。
+
+## 实际接入与整包验证（追加）
+
+接入在 `infr-vision/src/heif.rs`，只在识别到 HEIF/AVIF 文件头时加载包内动态库。
+不依赖系统图像扩展，也不改变 GPU、KV、MTP 或调度。默认转换主图为 RGB8，应用
+容器内裁剪、旋转、镜像，再复用已有 resize/patchify。上下文按请求独立，解码线程为 2。
+保留 libheif 原有安全限制，并收紧面积为 64 Mi 像素；每边上限 8192、压缩数据上限
+256 MiB。缺库、损坏文件、不支持的编码明确报错。
+
+Windows 使用通用 x86_64、静态 CRT 的同一新引擎，分别打包以下三个变体。
+基线包含新 glue，但不带原生解码库；差值是解码库及许可证的整包增量，
+不是与旧版引擎的全部版本差异。
+
+| 完整 Windows ZIP | 字节 | MiB |
+| --- | ---: | ---: |
+| 不带新增解码库 | 14,801,869 | 14.12 |
+| HEIC | 15,836,729 | 15.10 |
+| HEIC + AVIF | 16,652,700 | 15.88 |
+
+HEIC 增加 1,034,860 字节；AVIF 再增加 815,971 字节（0.78 MiB）。
+解码库按独立可替换动态库交付，附完整许可证和源码说明；对应源码附件单独提供，
+不进入主 ZIP。源代码包能在无 Git 元数据的目录中重建，允许用户修改后编译。
+
+Windows 验证：15 项普通单元测试、2 项真实解码/预处理测试通过；覆盖 HEIC/AVIF
+RGB golden SHA、透明图、裁剪、旋转/镜像、1x1 图、尺寸越界、截断数据和 4 路并行
+上下文。HEIF/AVIF 的完整预处理输出与相同 RGB 的 PNG 逐浮点值一致。
+将测试可执行文件置于解压包、清除 codec 目录环境变量并从其他目录运行，也通过。
+完整 Windows 包通过现有启动、manifest、更新替换/回滚与 CRT 依赖检查。
+CMD 在下载标记和父进程 Restricted 策略下通过进程级 Bypass 测试，无提权。
+
+Linux 向导/打包/更新：13 项 Python 开发工具测试与 83 项单 SH 检查通过。
+`actionlint` 通过两个 release 工作流。实际发现并修正 shaderc 安装脚本误用库目标
+`glslc` 的问题，改为可执行目标 `glslc_exe`；参见
+[固定版本上游 CMake](https://github.com/google/shaderc/blob/v2026.3/glslc/CMakeLists.txt)。
+Windows 与 Linux 工作流均构建固定版本解码器并携带源码附件。
+
+Linux 实际构建与打包也完成：15 项普通单元测试、2 项真实解码/预处理测试通过；
+解压包后清除 codec 环境变量、从其他目录执行图片测试，2 项仍通过。
+真实 `infr --version`、`--help`、SH DryRun、所有动态库 `ldd` 与 SH manifest/extract
+校验通过，包内没有 Python 文件。对应源码附件实际解压后，无 Git 元数据重建三库通过。
+HEIC + AVIF 完整 Linux tar.gz 为 50,717,778 字节（48.37 MiB），源码附件约 4.32 MiB，
+另行下载、不进入主包。完整 Linux 包含公开 documentation；保留 release 调试行号。
+
+本模块 `cargo clippy --no-deps -- -D warnings` 通过。
+连带检查依赖时被既有 Vulkan CPU-miss 的 4 条 lint 阻挡（adapter 的 unnecessary unwrap、
+kernels 的 range loop、cpu_miss 的 2 处取模），未借本轮修改无关内核。
+
+本机 WSL 为 Ubuntu 24.04；即便本地通过，也不替代 Ubuntu 22.04/glibc 2.35 的
+GitHub runner 或真实 Linux GPU 验收。本地包 manifest 保守标明构建机 glibc 2.39，
+不能当成 CI 的 2.35 包发布。未推送分支、未触发远端工作流、未使用 release 标签公开发布。
+
+原始构建与整包工件：`target/release-image-20261010/`、
+`target/linux-tools-validation/`（Git 忽略）。没有把其他未提交引擎实验带进发行构建。

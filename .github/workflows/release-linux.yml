@@ -35,7 +35,7 @@ jobs:
         with:
           shared-key: linux-release-x86-64-glibc235
       - name: Install shader compiler build tools
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build build-essential python3
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build build-essential python3 meson nasm pkg-config
       - name: Cache shaderc
         uses: actions/cache@v4
         with:
@@ -57,6 +57,15 @@ jobs:
           echo "archive=MoE4All-Linux-x86_64-v$version.tar.gz" >> "$GITHUB_OUTPUT"
       - name: Test launcher and updater without a GPU
         run: bash scripts/smoke-linux-wizard.sh
+      - name: Build bundled HEIC and AVIF decoders
+        run: python3 scripts/build-image-codecs.py
+      - name: Verify image decoding without a GPU
+        env:
+          INFR_IMAGE_CODEC_DIR: ${{ github.workspace }}/target/image-codecs
+          INFR_IMAGE_CODEC_FIXTURES: ${{ github.workspace }}/target/image-codec-build/sources/libheif
+        run: |
+          cargo test --locked -p infr-vision --lib
+          cargo test --locked -p infr-vision bundled_codecs -- --ignored
       - name: Build portable engine
         run: cargo build --release --locked -p infr-cli
       - name: Package and smoke-test extracted release
@@ -66,12 +75,16 @@ jobs:
           ./target/release/infr --version
           ldd ./target/release/infr | tee "$RUNNER_TEMP/infr-ldd.txt"
           ! grep -q 'not found' "$RUNNER_TEMP/infr-ldd.txt"
-          python3 scripts/linux_release.py package --version "$VERSION"
+          python3 scripts/linux_release.py package --version "$VERSION" --codecs target/image-codecs
           smoke=$(mktemp -d)
           tar -xzf "dist/MoE4All-Linux-x86_64-v$VERSION.tar.gz" -C "$smoke"
           package="$smoke/MoE4All-Linux-x86_64-v$VERSION"
           "$package/infr" --version | grep -F "$VERSION"
           "$package/infr" --help
+          for library in "$package"/image-codecs/*.so.*; do
+            ldd "$library" | tee "$RUNNER_TEMP/codec-ldd.txt"
+            ! grep -q 'not found' "$RUNNER_TEMP/codec-ldd.txt"
+          done
           cd "$RUNNER_TEMP"
           XDG_CONFIG_HOME="$smoke/config" bash "$package/Start-INFR-Wizard-Linux.sh" \
             --dry-run --mode serve --model '/tmp/model with spaces.gguf' --profile aggressive
@@ -82,6 +95,7 @@ jobs:
           path: |
             dist/${{ steps.release.outputs.archive }}
             dist/${{ steps.release.outputs.archive }}.sha256
+            dist/image-codec-sources.tar.gz
           if-no-files-found: error
           retention-days: 14
       - name: Publish Linux assets
@@ -96,12 +110,12 @@ jobs:
             # Windows may create the same release concurrently; tolerate that race.
             gh release create "$tag" --verify-tag --title "MoE4All v$VERSION" --generate-notes || gh release view "$tag"
           fi
-          gh release upload "$tag" "dist/$ARCHIVE" "dist/$ARCHIVE.sha256" --clobber
+          gh release upload "$tag" "dist/$ARCHIVE" "dist/$ARCHIVE.sha256" dist/image-codec-sources.tar.gz --clobber
           notes=$(gh release view "$tag" --json body --jq .body)
           if [[ "$notes" != *'<!-- moe4all-linux-experimental -->'* ]]; then
             printf '%s\n\n%s\n%s\n' "$notes" \
               '<!-- moe4all-linux-experimental -->' \
-              'Linux x86_64 is experimental: requires glibc 2.35+, Bash, Python 3.8+ and a Vulkan GPU driver. GPU inference and upgrading across real systems need community validation. / Linux 包为实验性版本，请反馈驱动、推理及更新兼容性问题。' \
+              'Linux x86_64 is experimental: requires glibc 2.35+, Bash 4.3+, standard Linux utilities and a Vulkan GPU driver; no Python or jq is needed to launch. GPU inference and upgrading across real systems need community validation. / Linux 包为实验性版本，请反馈驱动、推理及更新兼容性问题。' \
               > "$RUNNER_TEMP/linux-release-notes.md"
             gh release edit "$tag" --notes-file "$RUNNER_TEMP/linux-release-notes.md"
           fi

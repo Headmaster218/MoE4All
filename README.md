@@ -79,7 +79,7 @@ Linux x86_64 实验性发行包与 Windows 同版发包，欢迎试用反馈；�
 其他发行版请先准备 shaderc 2025 或更新的 `glslc`：
 
 ```sh
-sudo apt-get update && sudo apt-get install -y glslc python3
+sudo apt-get update && sudo apt-get install -y glslc
 git clone https://github.com/Headmaster218/MoE4All.git && cd MoE4All
 cargo build --release --locked -p infr-cli
 ./Start-INFR-Wizard-Linux.sh      # 交互式启动；加 --dry-run 只打印命令

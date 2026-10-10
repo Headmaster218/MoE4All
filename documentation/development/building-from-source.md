@@ -15,7 +15,8 @@ Linux x86_64 的发包 CI 已加入；首次完整 CI 与 GPU 验收尚待执行
 
 - **Rust**：`rust-toolchain.toml` 固定 **1.97.1**（含 `rustfmt`、`clippy`），
   `rustup` 会在首次构建时自动安装，不需要手动 `rustup toolchain install`。
-- **Python 3.8+ 与 Bash**：启动向导、打包和更新器只使用 Python 标准库，不需 pip 包。
+- **Bash 4.3+**：Linux 启动和更新仅使用单个 SH 与系统基础工具，不依赖 Python 或 jq。
+- **Python 3.8+（仅开发侧）**：CI 打包、包夹具测试及从源码构建 shaderc 使用标准库，不需 pip 包；发行包不包含 Python 文件。
 - **`glslc`（shaderc）**：compute shader 在**构建期**编译。dp4a 系列的 shader 需要
   `GL_EXT_integer_dot_product`，因此编译器必须是 **shaderc 2025 或更新**。
   - Ubuntu 24.04 自带的 shaderc 2023.8 **过旧**，构建会失败；
@@ -30,7 +31,7 @@ Linux x86_64 的发包 CI 已加入；首次完整 CI 与 GPU 验收尚待执行
 以下安装命令适用于 Ubuntu 26.04；其他发行版先按上述要求安装较新的 `glslc`。
 
 ```sh
-sudo apt-get update && sudo apt-get install -y glslc python3 build-essential
+sudo apt-get update && sudo apt-get install -y glslc build-essential
 git clone https://github.com/Headmaster218/MoE4All.git
 cd MoE4All
 cargo build --release --locked -p infr-cli
@@ -71,11 +72,16 @@ ARM64 或旧于该 glibc 的系统。AVX2 + FMA3 的 CPU-miss 内核仍由运行
 构建后打包（版本必须与 `infr --version` 相同）：
 
 ```sh
-python3 scripts/linux_release.py package --version 0.10.0
+python3 scripts/build-image-codecs.py
+python3 scripts/linux_release.py package --version 0.10.0 --codecs target/image-codecs
 ```
 
 产物为 `dist/MoE4All-Linux-x86_64-v0.10.0.tar.gz` 及 `.sha256`；只打包引擎、
-向导/更新脚本、公开文档与许可证，不包含 `infr.toml`、保存设置、模型和 KV 缓存。
+单个 SH 向导（含更新）、HEIC/AVIF 解码动态库、公开文档与许可证，不包含 Python、`infr.toml`、保存设置、模型和 KV 缓存。
+解码库构建还需要 CMake、Ninja、Git；AVIF 需要 Meson、NASM。这些仅为开发/CI 依赖，
+最终用户不需要安装 Python 或系统 HEIC/AVIF 库。Windows 在 x64 MSVC 开发环境运行相同
+`scripts/build-image-codecs.py` 后使用 `scripts/package-windows.ps1` 打包；可用 `--heic-only`
+生成不含 AVIF 的解码库。对应源码包 `image-codec-sources.tar.gz` 作为独立发布附件提供。
 推送 `release-<版本>` 标签时 CI 构建并上传；手动执行工作流只生成 artifact，不发布。
 
 ## 测试

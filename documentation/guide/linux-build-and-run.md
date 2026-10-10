@@ -25,8 +25,9 @@ bash ./Start-INFR-Wizard-Linux.sh
 
 版本号按实际下载包替换。发行包目标是 x86_64、glibc 2.35+（Ubuntu 22.04 或更新的
 兼容系统），不包含 GPU 驱动，也不适用于 Alpine/musl 或 ARM64。
-需要 Bash、Python 3.8+（仅标准库）和可用的 Vulkan loader/GPU 驱动；
-发行包用户不需要 Rust、C++ 编译器或 glslc。Ubuntu 可安装 `python3 libvulkan1`，
+需要 Bash 4.3+、系统自带的 awk/coreutils/findutils 和可用的 Vulkan loader/GPU 驱动；
+更新使用 curl、GNU tar/gzip 与 flock（util-linux），没有 Python、jq 或 pip 依赖。
+发行包用户不需要 Rust、C++ 编译器或 glslc。Ubuntu 可安装 `libvulkan1`，
 AMD/Intel 还需对应 Mesa Vulkan 驱动，NVIDIA 使用其 Vulkan 驱动。
 
 ## 源码目录与相对路径
@@ -36,12 +37,10 @@ AMD/Intel 还需对应 Mesa Vulkan 驱动，NVIDIA 使用其 Vulkan 驱动。
 ```text
 MoE4All/
   Start-INFR-Wizard-Linux.sh
-  scripts/linux_wizard.py
-  scripts/linux_release.py
   target/release/infr
 ```
 
-发行包结构相同，但 `infr` 在包根目录。不能只移动启动脚本：它需要相邻的 `scripts/`。
+发行包结构相同，但 `infr` 在包根目录。启动、交互和更新都在这一个 SH 中，不需要相邻的 `scripts/`。
 向导优先找自身目录下的 `infr`，然后找 `target/release/infr`，最后查找 PATH。
 可以从任意工作目录用绝对路径调用向导；模型、配置与缓存的相对路径均以**向导所在目录**
 为基准，启动引擎时工作目录也切到该目录。带空格的路径作为独立参数传递，不经过 `eval`。
@@ -75,7 +74,8 @@ CPU-miss 核数默认 `max(1, 可用物理核心数 - 2)`；Linux 当前仅设�
 
 向导会在启动前打印最终命令并要求确认。选择记录在
 `${XDG_CONFIG_HOME:-~/.config}/infr/wizard-state.json`，首次兼容导入旧 `wizard.conf`，
-旧文件不修改。缺少的新字段采用默认值，未知字段忽略。命令行参数优先于记忆值；
+旧文件不修改。缺少的新字段采用默认值，未知字段忽略；配置只作为数据读取，绝不执行。
+JSON 解析器直接内嵌在 SH 中。命令行参数优先于记忆值；
 `--no-mtp`、`--no-mmproj`、`--no-embedding` 用于清除已记住的可选项。
 已保存的视觉与 Embedding 路径在询问时作为默认值，直接回车不会清空。
 显式指定的上下文和资源参数在自动档也生效；交互式重新选择自动档会清除旧手动覆盖。

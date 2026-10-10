@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Linux package/checksum/update tooling. No third-party Python dependencies."""
+"""Developer-only Linux package/checksum fixtures; not shipped in release packages."""
 import argparse
 import hashlib
 import json
@@ -19,7 +19,9 @@ ROOT_FILES = {
     "infr", "Start-INFR-Wizard-Linux.sh", "README.md", "README_EN.md", "CHANGELOG.md",
     "infr.example.toml", "LICENSE", "LICENSE-MIT", "NOTICE",
 }
-SCRIPT_FILES = {"scripts/linux_wizard.py", "scripts/linux_release.py"}
+SCRIPT_FILES = set()
+CODEC_FILES = {"libheif.so.1", "libde265.so.0", "libdav1d.so.7", "libheif-LICENSE.txt",
+               "libde265-LICENSE.txt", "dav1d-LICENSE.txt", "SOURCES.txt"}
 MAX_BYTES = 1024 * 1024 * 1024
 
 
@@ -63,7 +65,7 @@ def managed(name):
     path = PurePosixPath(name)
     if not name or "\\" in name or path.is_absolute() or any(p in (".", "..") for p in name.split("/")):
         return False
-    return name in ROOT_FILES | SCRIPT_FILES | {"install-manifest.json"} or (
+    return name in ROOT_FILES | SCRIPT_FILES | {"install-manifest.json"} or name in {"image-codecs/" + n for n in CODEC_FILES} or (
         name.startswith("documentation/") and path.suffix.lower() in {".md", ".png", ".jpg", ".svg", ".webp"})
 
 
@@ -108,7 +110,7 @@ def validate_package(root, version):
     return manifest
 
 
-def package(root, binary, output, version):
+def package(root, binary, output, version, codecs=None):
     name = package_name(version)
     if not binary.is_file():
         raise ValueError("Release binary not found: " + str(binary))
@@ -124,6 +126,18 @@ def package(root, binary, output, version):
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
         shutil.copyfile(binary, stage / "infr")
+        if codecs is not None:
+            required = CODEC_FILES - {"libdav1d.so.7", "dav1d-LICENSE.txt"}
+            if (codecs / "libdav1d.so.7").exists():
+                required = CODEC_FILES
+            for codec_name in sorted(required):
+                source = codecs / codec_name
+                if not source.is_file():
+                    raise ValueError("Missing codec bundle file: " + codec_name)
+                target = stage / "image-codecs" / codec_name
+                target.parent.mkdir(exist_ok=True)
+                shutil.copyfile(source, target)
+            shutil.copyfile(codecs.parent / "image-codec-sources.tar.gz", output / "image-codec-sources.tar.gz")
         for source in sorted((root / "documentation").rglob("*")):
             relative = source.relative_to(root).as_posix()
             if source.is_file() and managed(relative):
@@ -140,7 +154,7 @@ def package(root, binary, output, version):
                 files.append({"path": relative, "size": path.stat().st_size, "sha256": sha256(path)})
         manifest = {"schema_version": 1, "updater_protocol": 1, "product": "moe4all-engine",
                     "platform": PLATFORM, "version": version, "tag": "release-" + version,
-                    "glibc_min": "2.35", "stability": "experimental", "files": files}
+                    "glibc_min": platform.libc_ver()[1] or "2.35", "stability": "experimental", "files": files}
         write_json_atomic(stage / "install-manifest.json", manifest)
         validate_package(stage, version)
         archive = output / (name + ".tar.gz")
@@ -163,7 +177,7 @@ def extract_package(archive, destination, version):
         for member in members:
             parts = member.name.split("/")
             if parts[0] != prefix or "\\" in member.name or any(p in ("", ".", "..") for p in parts):
-                raise ValueError("Unsafe archive path")
+                raise ValueError("Unsafe archive path: " + member.name)
             if member.name in seen or not (member.isdir() or member.isfile()):
                 raise ValueError("Duplicate entry, link or special file in archive")
             seen.add(member.name)
@@ -328,11 +342,13 @@ def main():
     pack.add_argument("--binary", type=Path, default=Path("target/release/infr"))
     pack.add_argument("--output", type=Path, default=Path("dist"))
     pack.add_argument("--version", required=True)
+    pack.add_argument("--codecs", type=Path)
     options = parser.parse_args()
     root = options.root.resolve()
     binary = options.binary if options.binary.is_absolute() else root / options.binary
     output = options.output if options.output.is_absolute() else root / options.output
-    print(package(root, binary, output.resolve(), options.version))
+    print(package(root, binary, output.resolve(), options.version,
+                  options.codecs.resolve() if options.codecs else None))
 
 
 if __name__ == "__main__":
