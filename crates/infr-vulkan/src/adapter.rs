@@ -11250,10 +11250,11 @@ fn execute_paged_moe<'a>(
             // Full-RAM computation does not admit/overwrite GPU cache slots. Start it before
             // LRU maintenance and command recording, which can overlap the CPU's GU phase.
             let cpu_cfg = &be_.cfg().kernels.vulkan;
-            if cpu_input_eligible
-                && crate::cpu_miss::within_limit(miss_count, cpu_cfg.cpu_miss_max)
-                && cpu_miss_input.is_some()
-            {
+            if let (true, Some(cpu_miss_input)) = (
+                cpu_input_eligible
+                    && crate::cpu_miss::within_limit(miss_count, cpu_cfg.cpu_miss_max),
+                cpu_miss_input,
+            ) {
                 if let Some(worker) = be_.cpu_miss_worker() {
                     let slots: Vec<_> = (0..n_used)
                         .filter(|&slot| miss_masks[0] & (1 << slot) != 0)
@@ -11279,7 +11280,7 @@ fn execute_paged_moe<'a>(
                         let input_span = infr_core::timeline::span("cpu_miss_input");
                         let mut input = vec![0.0f32; ne];
                         be_.download(
-                            pool[&cpu_miss_input.unwrap()].as_ref(),
+                            pool[&cpu_miss_input].as_ref(),
                             bytemuck::cast_slice_mut(&mut input),
                         )?;
                         drop(input_span);
@@ -12609,20 +12610,22 @@ mod tests {
                 .unwrap()
                 .prepare_cpu_miss_push(roles, &[0], &mut experts)
                 .unwrap();
-            let mut ps = PagedStream::default();
-            ps.cpu_promotion_abort = Some(CpuPromotionAbortGuard {
-                pager: Arc::clone(&be_.moe_pager),
-                experts: vec![(roles, 0)],
-                complete,
-            });
-            ps.cpu_promotion = Some(CpuMissPromotion {
-                roles,
-                ids: vec![0],
-                layer: 8,
-                sources: Vec::new(),
-                started: true,
-                pending: Some(CpuPromotionPending::Push(Some(worker.promote(experts)))),
-            });
+            let mut ps = PagedStream {
+                cpu_promotion_abort: Some(CpuPromotionAbortGuard {
+                    pager: Arc::clone(&be_.moe_pager),
+                    experts: vec![(roles, 0)],
+                    complete,
+                }),
+                cpu_promotion: Some(CpuMissPromotion {
+                    roles,
+                    ids: vec![0],
+                    layer: 8,
+                    sources: Vec::new(),
+                    started: true,
+                    pending: Some(CpuPromotionPending::Push(Some(worker.promote(experts)))),
+                }),
+                ..Default::default()
+            };
             if already_joined {
                 ps.wait_cpu_promotion(&be_).unwrap();
             }

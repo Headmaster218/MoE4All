@@ -59,26 +59,6 @@ const fn half_table() -> [u32; 65536] {
 }
 static HALF_TABLE: [u32; 65536] = half_table();
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn half_scales_match_all_65536_half_values() {
-        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
-            return;
-        }
-        for bits in 0..=u16::MAX {
-            let bytes = bits.to_le_bytes();
-            let actual = unsafe { super::scale(bytes.as_ptr()) };
-            let expected = half::f16::from_bits(bits).to_f32();
-            if expected.is_nan() {
-                assert!(actual.is_nan());
-            } else {
-                assert_eq!(actual.to_bits(), expected.to_bits());
-            }
-        }
-    }
-}
-
 #[target_feature(enable = "avx2,fma")]
 #[inline]
 unsafe fn scale(p: *const u8) -> f32 {
@@ -501,6 +481,8 @@ unsafe fn lookup<const KIND: u8, const NR: usize, const COMPACT: bool>(
                 } else {
                     s0
                 };
+                // Lane indices also address packed weight groups; keep the fixed SIMD layout.
+                #[allow(clippy::needless_range_loop)]
                 for l in 0..4 {
                     let (value, signs) = if KIND == 2 {
                         let index = *p.add(2 + group * 4 + l) as usize
@@ -553,4 +535,24 @@ unsafe fn lookup<const KIND: u8, const NR: usize, const COMPACT: bool>(
         _mm256_storeu_ps(values.as_mut_ptr(), acc[r]);
         values.iter().sum()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn half_scales_match_all_65536_half_values() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        for bits in 0..=u16::MAX {
+            let bytes = bits.to_le_bytes();
+            let actual = unsafe { super::scale(bytes.as_ptr()) };
+            let expected = half::f16::from_bits(bits).to_f32();
+            if expected.is_nan() {
+                assert!(actual.is_nan());
+            } else {
+                assert_eq!(actual.to_bits(), expected.to_bits());
+            }
+        }
+    }
 }

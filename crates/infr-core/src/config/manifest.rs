@@ -371,6 +371,15 @@ knobs! {
 /// "someone added a knob and forgot the manifest".
 pub const NOT_MIGRATED: &[(&str, &str)] = &[
     (
+        "INFR_IMAGE_CODEC_DIR",
+        "source-build/test override for bundled native decoder discovery; release builds use \
+         the executable-relative image-codecs directory, independent of runtime Config.",
+    ),
+    (
+        "INFR_IMAGE_CODEC_FIXTURES",
+        "test-only fixture directory for ignored native image decoder parity tests.",
+    ),
+    (
         "INFR_PROFILE",
         "build-time input: read by build.rs in core/cpu/gguf/llama/vulkan to set cfg(infr_profile). \
          A runtime Config cannot exist when it is read (§5.3).",

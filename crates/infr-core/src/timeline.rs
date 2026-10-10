@@ -445,9 +445,11 @@ mod tests {
     }
     #[test]
     fn blocking_profilers_and_invalid_windows_are_rejected() {
-        let mut cfg = crate::config::ProfCfg::default();
-        cfg.timeline_path = Some("unused.json".into());
-        cfg.ops = true;
+        let mut cfg = crate::config::ProfCfg {
+            timeline_path: Some("unused.json".into()),
+            ops: true,
+            ..Default::default()
+        };
         assert!(configure(&cfg).unwrap_err().contains("asynchronous"));
         cfg.ops = false;
         cfg.timeline_stride = 1;

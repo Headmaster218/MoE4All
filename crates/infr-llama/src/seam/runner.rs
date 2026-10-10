@@ -4900,7 +4900,7 @@ fn generate_dense_backend_inner(
                     && inject.is_some_and(|inject| {
                         g.desc(t.down).dtype == DType::Q8_0
                             && matches!(g.desc(inject).dtype, DType::F32 | DType::Q8_0)
-                            && hcw % 32 == 0
+                            && hcw.is_multiple_of(32)
                     });
                 if let Some(inject) = inject.filter(|_| fused_down_inject) {
                     g.push(Op::QwenHcDownInject {

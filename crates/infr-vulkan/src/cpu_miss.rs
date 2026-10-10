@@ -901,10 +901,10 @@ fn compute_chunked_down_tile<
     context: Option<infr_core::timeline::Context>,
 ) -> Output {
     const {
-        assert!(640 % GU_CHUNK == 0 && GU_CHUNK % 2 == 0);
+        assert!(640 % GU_CHUNK == 0 && GU_CHUNK.is_multiple_of(2));
     }
     const {
-        assert!(2560 % DOWN_CHUNK == 0 && DOWN_CHUNK % 2 == 0);
+        assert!(2560 % DOWN_CHUNK == 0 && DOWN_CHUNK.is_multiple_of(2));
     }
     let gu_count = 640 / GU_CHUNK;
     let down_count = 2560 / DOWN_CHUNK;
@@ -1746,7 +1746,7 @@ mod tests {
                     let bytes = model.tensor_bytes(&name).unwrap();
                     let owner = AlignedHostBuffer::new(bytes.len()).unwrap();
                     unsafe {
-                        owner.copy_from_slice(0, &bytes);
+                        owner.copy_from_slice(0, bytes);
                     }
                     (owner, stride, info.dtype)
                 })

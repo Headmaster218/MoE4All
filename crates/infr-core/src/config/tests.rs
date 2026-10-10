@@ -1020,6 +1020,8 @@ fn no_infr_env_reads_outside_the_config_layer() {
         "INFR_EMBEDDING_TEST_VULKAN",
         "INFR_LLAMA_DIFFUSION_CLI",
         "INFR_NO_MOE_SHARED_SLOT",
+        "INFR_IMAGE_CODEC_DIR",
+        "INFR_IMAGE_CODEC_FIXTURES",
     ];
 
     let Some(crates) = repo_crates_dir() else {
