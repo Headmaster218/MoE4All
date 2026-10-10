@@ -2120,7 +2120,13 @@ impl MoePagerSession {
                 .ok_or_else(|| be("moe pager: host-store chunk range overflow"))?;
             host_store.push(HostStoreChunk {
                 base_offset: spec.base_offset,
-                bytes: AlignedHostBuffer::new(spec.bytes)?,
+                bytes: AlignedHostBuffer::new(spec.bytes).map_err(|error| {
+                    let allocated: usize = host_store.iter().map(HostStoreChunk::len).sum();
+                    be(format!(
+                        "MoE host-store chunk {} failed after {allocated} committed bytes: {error}",
+                        host_store.len(),
+                    ))
+                })?,
             });
             previous_end = end;
         }
