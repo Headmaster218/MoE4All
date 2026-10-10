@@ -6,22 +6,23 @@ The portable Windows download is about 14 MiB. Download a GGUF, choose automatic
 configuration, and start local chat or an OpenAI-compatible API. MoE expert
 weights are coordinated across VRAM, system RAM, and SSD.
 
-**0.10.0 peak-speed reference:** RX 7900 XTX 24 GiB, Ryzen 5 5600X, 64 GiB
-DDR4, automatic aggressive profile. Flash-Next 4.27bpw peaks at about
-**1,446 tok/s Prefill** and **79.4 tok/s total Decode** with three active streams;
-35B Balanced peaks at **65.4 tok/s Decode** with one active stream at 30K.
+**0.10.0 fastest-third speed reference:** RX 7900 XTX 24 GiB, Ryzen 5 5600X, 64 GiB
+DDR4, automatic aggressive profile. At 30K, Flash-Next 4.27bpw reaches
+**1,414.3 tok/s Prefill** with one active stream and
+**65.5 tok/s total Decode** with three active streams;
+35B Balanced reaches **63.6 tok/s Decode** with one active stream at 30K.
 Three configured slots, MTP and CPU miss offload disabled.
-The table shows 2026-10-09 measured peaks in tok/s; see
+The table takes the highest average speed among the front, middle, and late thirds measured on 2026-10-09, in tok/s; see
 [Measured results](#measured-results) for measurement definitions.
 
-| Model | Active streams | 30K Prefill peak | 30K Decode total peak | 150K Prefill peak | 150K Decode total peak |
+| Model | Active streams | 30K Prefill | 30K Decode | 150K Prefill | 150K Decode |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Flash-Next 4.27bpw | 1 | 1,439.4 | **47.7** | 1,444.6 | **44.7** |
-| Flash-Next 4.27bpw | 2 | 1,445.2 | **71.3** | 1,446.3 | **63.6** |
-| Flash-Next 4.27bpw | 3 | 1,437.0 | **79.4** | 1,434.2 | **62.5** |
-| 35B Balanced | 1 | 3,824.8 | **65.4** | 3,981.7 | **36.7** |
+| Flash-Next 4.27bpw | 1 | 1,414.3 | **45.3** | 1,358.2 | **41.5** |
+| Flash-Next 4.27bpw | 2 | 1,335.0 | **63.3** | 1,353.4 | **55.7** |
+| Flash-Next 4.27bpw | 3 | 1,302.4 | **65.5** | 1,303.6 | **46.7** |
+| 35B Balanced | 1 | 3,254.9 | **63.6** | 1,829.5 | **36.0** |
 
-<sub>Peak means the highest speed within a 1.5-second rolling window. Prefill peaks interpolate completed-chunk progress.</sub>
+<sub>Each measured interval is split into equal wall-time thirds; values are the highest third's average. Decode thirds average three rounds; Prefill thirds interpolate completed-chunk progress.</sub>
 
 [Released Windows builds](https://github.com/Headmaster218/MoE4All/releases/latest) |
 [Quick start](#quick-start) |
@@ -174,7 +175,7 @@ generation-speed reports.**
 | **Intel Arc A770 16GB + 64GB DDR4-3200** | Ornith 1.5 35B Q4_K_M, F16 KV, 96K context capacity, three REAL-workload runs | Not reported | **30.15–30.28 tok/s** | v0.6.0-beta.1, [Issue #41](https://github.com/Headmaster218/MoE4All/issues/41) |
 | **NVIDIA RTX 3090 Ti + 64GB RAM** | Successful community run; model, quantization, and context were not included in the original comment | Not reported | **about 29 tok/s** | Version not reported, [Bilibili user report](https://www.bilibili.com/video/BV1ALha63Eyd/) (rpid `318146261056`) |
 
-Community speeds retain the users' original definitions and were not independently retested. Average versus peak was not specified, so they are not directly comparable to the fixed-window peak table above.
+Community speeds retain the users' original definitions and were not independently retested. Average versus peak was not specified, so they are not directly comparable to the fastest-third speed table above.
 
 Share successful configurations in
 [Discussions](https://github.com/Headmaster218/MoE4All/discussions), or report
