@@ -80,12 +80,12 @@ jobs:
           choco install nasm --version=2.16.03 --yes --no-progress
           "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Build bundled HEIC and AVIF decoders
-        run: python scripts/build-image-codecs.py
+        run: python scripts/build-image-codecs.py --work "${{ runner.temp }}/image-codec-build"
       - name: Verify image decoding without a GPU
         shell: pwsh
         env:
           INFR_IMAGE_CODEC_DIR: ${{ github.workspace }}\target\image-codecs
-          INFR_IMAGE_CODEC_FIXTURES: ${{ github.workspace }}\target\image-codec-build\sources\libheif
+          INFR_IMAGE_CODEC_FIXTURES: ${{ runner.temp }}\image-codec-build\sources\libheif
         run: |
           cargo test --locked -p infr-vision --lib
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

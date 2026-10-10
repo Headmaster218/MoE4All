@@ -59,11 +59,11 @@ jobs:
       - name: Test launcher and updater without a GPU
         run: bash scripts/smoke-linux-wizard.sh
       - name: Build bundled HEIC and AVIF decoders
-        run: python3 scripts/build-image-codecs.py
+        run: python3 scripts/build-image-codecs.py --work "$RUNNER_TEMP/image-codec-build"
       - name: Verify image decoding without a GPU
         env:
           INFR_IMAGE_CODEC_DIR: ${{ github.workspace }}/target/image-codecs
-          INFR_IMAGE_CODEC_FIXTURES: ${{ github.workspace }}/target/image-codec-build/sources/libheif
+          INFR_IMAGE_CODEC_FIXTURES: ${{ runner.temp }}/image-codec-build/sources/libheif
         run: |
           cargo test --locked -p infr-vision --lib
           cargo test --locked -p infr-vision bundled_codecs -- --ignored
