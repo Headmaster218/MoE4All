@@ -242,7 +242,7 @@ function Get-VulkanDeviceOptions {
         $process.WaitForExit()
         $exitCode = $process.ExitCode
     } catch {
-        Write-Warning "无法枚举 Vulkan 设备，仍可选择 CPU：$($_.Exception.Message) / Could not enumerate Vulkan devices; CPU remains available."
+        Write-Warning "无法枚举 Vulkan 设备，请检查显卡驱动：$($_.Exception.Message) / Could not enumerate Vulkan devices; check the GPU driver."
         return @()
     } finally {
         if ($null -ne $process) {
@@ -252,7 +252,7 @@ function Get-VulkanDeviceOptions {
     if ($exitCode -ne 0) {
         $detail = $stderr.Trim()
         if ($detail) { $detail = ": $detail" }
-        Write-Warning "Vulkan 设备枚举失败（退出码 $exitCode）$detail。仍可选择 CPU。Vulkan device enumeration failed (exit code $exitCode); CPU remains available."
+        Write-Warning "Vulkan 设备枚举失败（退出码 $exitCode）$detail。请检查显卡驱动。Vulkan device enumeration failed (exit code $exitCode); check the GPU driver."
         return @()
     }
 
@@ -281,13 +281,8 @@ function Read-ComputeDevice {
     param([AllowEmptyString()][string]$Default = '')
 
     $options = @(Get-VulkanDeviceOptions)
-    $cpuName = 'CPU'
-    try {
-        $cpuName = [string]((Get-CimInstance Win32_Processor | Select-Object -First 1).Name)
-    } catch { }
-    $options += [pscustomobject]@{
-        Key = ($options.Count + 1).ToString(); Value = 'cpu'
-        Label = "CPU: $cpuName (reference backend)"; IsDefault = ($options.Count -eq 0)
+    if ($options.Count -eq 0) {
+        throw '未发现可用的 Vulkan GPU，请检查显卡驱动。No Vulkan GPU was found; check the GPU driver.'
     }
     $selected = $options | Where-Object { $_.Value -eq $Default } | Select-Object -First 1
     if ($null -eq $selected) {
@@ -1222,9 +1217,13 @@ if (-not $reuseSavedSettings) {
     $cpuMissEnabled = Read-YesNo -Label '启用实验性 CPU 专家 miss 计算？/ Enable experimental CPU expert-miss computation?' -Default ([bool](Get-SavedValue 'cpu_miss_enabled' $false))
     if ($cpuMissEnabled) {
         $cpuTopology = Get-CpuMissTopology
-        $defaultCpuMissCores = [Math]::Max(1, $cpuTopology.Preferred - 2)
-        Write-Host ('物理核心 {0}，优先性能核心 {1}；默认计算核数为 max(1, 性能物理核数 - 2) = {2}。' -f $cpuTopology.Physical, $cpuTopology.Preferred, $defaultCpuMissCores) -ForegroundColor DarkGray
-        Write-Host ('Physical cores: {0}; preferred performance cores: {1}; default compute cores: max(1, preferred - 2) = {2}.' -f $cpuTopology.Physical, $cpuTopology.Preferred, $defaultCpuMissCores) -ForegroundColor DarkGray
+        $defaultCpuMissCores = [Math]::Max(1, $cpuTopology.Physical - 2)
+        Write-Host ('物理核心 {0}，性能核心 {1}；默认计算核数为 max(1, 总物理核数 - 2) = {2}。' -f $cpuTopology.Physical, $cpuTopology.Preferred, $defaultCpuMissCores) -ForegroundColor DarkGray
+        Write-Host ('Physical cores: {0}; performance cores: {1}; default compute cores: max(1, physical - 2) = {2}.' -f $cpuTopology.Physical, $cpuTopology.Preferred, $defaultCpuMissCores) -ForegroundColor DarkGray
+        if ($cpuTopology.Preferred -lt $cpuTopology.Physical) {
+            Write-Host '大小核 CPU 优先预留两个大核：其余大核 → 小核 → 预留大核；选满不预留。' -ForegroundColor DarkGray
+            Write-Host 'Hybrid CPU: other performance cores, then efficiency cores, then the two reserved performance cores; selecting all cores leaves no reserve.' -ForegroundColor DarkGray
+        }
         if (-not $cpuTopology.Detected) {
             Write-Warning '未能识别大小核，默认按总物理核心计算；请确认核心数。Hybrid-core detection unavailable; confirm the compute-core count.'
         }

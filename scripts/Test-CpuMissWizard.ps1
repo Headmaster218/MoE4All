@@ -85,7 +85,8 @@ function Test-Case {
 
 Test-Case -Name 'disabled by default' -Physical 6 -Preferred 6 -Inputs @('') -ExpectedCores 0
 Test-Case -Name 'homogeneous default' -Physical 6 -Preferred 6 -Inputs @('y', '', '') -ExpectedCores 4 -ExpectedMax 1
-Test-Case -Name 'hybrid performance-core default' -Physical 24 -Preferred 8 -Inputs @('y', '', '') -ExpectedCores 6 -ExpectedMax 1
+Test-Case -Name 'hybrid reserves two performance cores by default' -Physical 24 -Preferred 8 -Inputs @('y', '', '') -ExpectedCores 22 -ExpectedMax 1
+Test-Case -Name 'hybrid all-core override' -Physical 24 -Preferred 8 -Inputs @('y', '', '24') -ExpectedCores 24 -ExpectedMax 1
 Test-Case -Name 'custom three misses and seven cores' -Physical 12 -Preferred 8 -Inputs @('y', '3', '7') -ExpectedCores 7 -ExpectedMax 3
 Test-Case -Name 'small CPU retains a usable minimum' -Physical 2 -Preferred 2 -Inputs @('y', '', '') -ExpectedCores 1 -ExpectedMax 1
 Test-Case -Name 'saved settings' -Saved ([pscustomobject]@{ cpu_miss_enabled = $true; cpu_miss_max = '2'; cpu_miss_cores = '3' }) -Physical 8 -Preferred 8 -Inputs @('', '', '') -ExpectedCores 3 -ExpectedMax 2

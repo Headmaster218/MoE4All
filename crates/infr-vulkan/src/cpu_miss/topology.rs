@@ -27,11 +27,11 @@ pub(super) fn worker_limit() -> usize {
     }
 }
 
-pub(super) fn worker_affinities(offset: usize) -> Vec<Affinity> {
-    ordered_affinities(cores(), offset)
+pub(super) fn affinity_plan(threads: usize, offset: usize) -> (Vec<Affinity>, Option<Affinity>) {
+    select_affinities(cores(), threads, offset)
 }
 
-fn ordered_affinities(cores: &[Core], offset: usize) -> Vec<Affinity> {
+fn ordered_cores(cores: &[Core], offset: usize) -> Vec<Core> {
     let mut ordered = cores.to_vec();
     // Higher EfficiencyClass means faster cores, not higher power efficiency.
     ordered.sort_by_key(|core| std::cmp::Reverse(core.efficiency));
@@ -41,8 +41,28 @@ fn ordered_affinities(cores: &[Core], offset: usize) -> Vec<Affinity> {
             .take_while(|c| c.efficiency == first.efficiency)
             .count();
         ordered[..preferred].rotate_left(offset % preferred);
+        if preferred < ordered.len() {
+            // Keep two fast physical cores for submission/system work until needed.
+            let reserved = preferred.min(2);
+            ordered[preferred - reserved..].rotate_left(reserved);
+        }
     }
-    ordered.into_iter().map(|core| core.affinity).collect()
+    ordered
+}
+
+fn select_affinities(
+    cores: &[Core],
+    threads: usize,
+    offset: usize,
+) -> (Vec<Affinity>, Option<Affinity>) {
+    let ordered = ordered_cores(cores, offset);
+    let used = threads.min(ordered.len());
+    let controller = ordered[used..]
+        .iter()
+        .min_by_key(|core| std::cmp::Reverse(core.efficiency))
+        .map(|core| core.affinity);
+    let workers = ordered[..used].iter().map(|core| core.affinity).collect();
+    (workers, controller)
 }
 
 fn parse_core_records(bytes: &[u8]) -> Option<Vec<Core>> {
@@ -161,26 +181,120 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_selection_uses_one_smt_thread_and_performance_cores_first() {
+    fn hybrid_selection_reserves_fast_cores_and_uses_one_smt_thread() {
         let bytes = [record(3, 0, 2), record(4, 0, 0), record(24, 1, 2)].concat();
         let cores = parse_core_records(&bytes).unwrap();
-        let selected = ordered_affinities(&cores, 1);
+        let (selected, controller) = select_affinities(&cores, 1, 1);
         assert_eq!(
             selected
                 .iter()
                 .map(|a| (a.group, a.mask))
                 .collect::<Vec<_>>(),
-            [(1, 8), (0, 1), (0, 4)]
+            [(0, 4)]
         );
-        assert_eq!(ordered_affinities(&cores, 0)[0].mask, 1);
+        assert_eq!(controller.unwrap(), cores[2].affinity);
+        let (selected, controller) = select_affinities(&cores, 3, 1);
+        assert_eq!(
+            selected,
+            [cores[1].affinity, cores[2].affinity, cores[0].affinity]
+        );
+        assert!(controller.is_none());
+    }
+
+    #[test]
+    fn hybrid_worker_counts_use_other_fast_cores_then_small_cores_then_reserved() {
+        let cores: Vec<_> = (0..24)
+            .map(|index| Core {
+                affinity: Affinity {
+                    mask: 1 << index,
+                    ..Affinity::default()
+                },
+                efficiency: if index < 8 { 2 } else { 0 },
+            })
+            .collect();
+        for threads in 0..=24 {
+            let (workers, controller) = select_affinities(&cores, threads, 1);
+            assert_eq!(workers.len(), threads);
+            let fast = workers.iter().filter(|a| a.mask < (1 << 8)).count();
+            assert_eq!(fast, threads.min(6) + threads.saturating_sub(22));
+            if threads < 24 {
+                let controller = controller.unwrap();
+                assert!(controller.mask < (1 << 8));
+                assert!(!workers.contains(&controller));
+            } else {
+                assert!(controller.is_none());
+            }
+        }
+        let (workers, controller) = select_affinities(&cores, 22, 1);
+        assert!(!workers.contains(&cores[0].affinity));
+        assert!(!workers.contains(&cores[7].affinity));
+        assert_eq!(controller.unwrap(), cores[7].affinity);
+    }
+
+    #[test]
+    fn hybrid_with_one_fast_core_keeps_it_for_the_controller_until_full() {
+        let cores =
+            parse_core_records(&[record(3, 0, 2), record(4, 0, 0), record(8, 0, 0)].concat())
+                .unwrap();
+        let (workers, controller) = select_affinities(&cores, 2, 0);
+        assert_eq!(workers, [cores[1].affinity, cores[2].affinity]);
+        assert_eq!(controller.unwrap(), cores[0].affinity);
+        let (workers, controller) = select_affinities(&cores, 3, 0);
+        assert_eq!(workers.len(), 3);
+        assert!(controller.is_none());
+    }
+
+    #[test]
+    fn homogeneous_counts_select_distinct_physical_cores_before_smt() {
+        let bytes: Vec<_> = (0..6)
+            .flat_map(|index| record(3 << (index * 2), 0, 0))
+            .collect();
+        let cores = parse_core_records(&bytes).unwrap();
+        for threads in 1..=6 {
+            let (workers, controller) = select_affinities(&cores, threads, 1);
+            let expected: Vec<_> = (0..threads)
+                .map(|index| cores[(index + 1) % 6].affinity)
+                .collect();
+            assert_eq!(workers, expected);
+            assert_eq!(
+                controller,
+                (threads < 6).then(|| cores[(threads + 1) % 6].affinity)
+            );
+        }
+    }
+
+    #[test]
+    fn multiple_efficiency_classes_keep_lower_classes_in_performance_order() {
+        let cores = parse_core_records(
+            &[
+                record(1, 0, 3),
+                record(2, 0, 0),
+                record(4, 0, 3),
+                record(8, 0, 1),
+                record(16, 0, 3),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let (workers, controller) = select_affinities(&cores, 3, 0);
+        assert_eq!(
+            workers,
+            [cores[0].affinity, cores[3].affinity, cores[1].affinity]
+        );
+        assert_eq!(controller.unwrap(), cores[2].affinity);
     }
 
     #[test]
     fn homogeneous_empty_and_malformed_topologies_are_safe() {
-        assert!(ordered_affinities(&[], 1).is_empty());
+        assert_eq!(select_affinities(&[], 4, 1), (vec![], None));
         let bytes = [record(1, 0, 0), record(2, 0, 0)].concat();
         let cores = parse_core_records(&bytes).unwrap();
-        assert_eq!(ordered_affinities(&cores, 3)[0].mask, 2);
+        let (workers, controller) = select_affinities(&cores, 1, 3);
+        assert_eq!(workers, [cores[1].affinity]);
+        assert_eq!(controller.unwrap(), cores[0].affinity);
+        let (workers, controller) = select_affinities(&cores, 2, 3);
+        assert_eq!(workers, [cores[1].affinity, cores[0].affinity]);
+        assert!(controller.is_none());
         for length in 1..record(1, 0, 0).len() {
             assert!(parse_core_records(&record(1, 0, 0)[..length]).is_none());
         }
@@ -192,7 +306,8 @@ mod tests {
     #[test]
     fn detected_worker_limit_is_bounded_and_affinities_are_distinct() {
         assert!(worker_limit() >= 1);
-        let selected = worker_affinities(1);
+        let (selected, controller) = affinity_plan(worker_limit(), 1);
+        assert!(controller.is_none());
         for (index, affinity) in selected.iter().enumerate() {
             assert_eq!(affinity.mask.count_ones(), 1);
             assert!(!selected[..index].contains(affinity));

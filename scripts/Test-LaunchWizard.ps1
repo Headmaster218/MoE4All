@@ -38,7 +38,7 @@ function Write-Host {
 }
 function Get-VulkanDeviceOptions { return $script:Devices }
 function Get-CimInstance { return [pscustomobject]@{ Name = 'Fixture CPU' } }
-function Get-CpuMissTopology { return [pscustomobject]@{ Physical = 6; Preferred = 6; Detected = $true } }
+function Get-CpuMissTopology { return $script:CpuTopology }
 
 function Assert {
     param([bool]$Condition, [string]$Message)
@@ -112,6 +112,7 @@ try {
     New-ModelFixture $model35 'qwen35moe' '{{ enable_thinking }}'
     New-ModelFixture $aux 'qwen3' '{{ messages }}'
     $script:Devices = @([pscustomobject]@{ Key = '1'; Value = 'Vulkan0'; Label = 'Vulkan0: Fixture GPU [24 GiB]'; IsDefault = $true })
+    $script:CpuTopology = [pscustomobject]@{ Physical = 6; Preferred = 6; Detected = $true }
 
     if ($ChildFixture) {
         $script:Saved = $null
@@ -152,8 +153,25 @@ try {
         Assert ('65536' -in $nativeArgs -and 'kv.type_k=q8_0' -in $nativeArgs) 'Fresh defaults changed'
         Assert (-not ('--think' -in $nativeArgs) -and -not ('--reasoning-effort' -in $nativeArgs)) 'Default reasoning should be inherited'
         Assert (@($script:Events | Where-Object { $_ -match 'Compute device' }).Count -eq 1) 'One GPU still needs manual selection'
-        Assert (($script:Output -join "`n") -match 'CPU: Fixture CPU') 'CPU was omitted from the device list'
+        Assert (($script:Output -join "`n") -notmatch 'CPU: Fixture CPU') 'CPU must not be a compute-device option'
     }
+    Test-Flow 'homogeneous CPU miss defaults to physical minus two' -Inputs @('', $model, '', '', '', '', '', '', 'y', '', '', '') -Check {
+        Assert ('kernels.vulkan.cpu_miss_threads=4' -in $nativeArgs) 'Six physical cores should default to four compute cores'
+        Assert ('kernels.vulkan.cpu_miss_max=1' -in $nativeArgs) 'CPU miss count default changed'
+    }
+    $script:CpuTopology = [pscustomobject]@{ Physical = 24; Preferred = 8; Detected = $true }
+    Test-Flow 'hybrid CPU miss defaults to total physical minus two' -Inputs @('', $model, '', '', '', '', '', '', 'y', '', '', '') -Check {
+        Assert ('kernels.vulkan.cpu_miss_threads=22' -in $nativeArgs) 'Hybrid default should include efficiency cores while reserving two performance cores'
+    }
+    Test-Flow 'hybrid CPU miss allows selecting all physical cores' -Inputs @('', $model, '', '', '', '', '', '', 'y', '', '24', '') -Check {
+        Assert ('kernels.vulkan.cpu_miss_threads=24' -in $nativeArgs) 'Explicit all-core selection must be honored'
+    }
+    $cpuSaved = [pscustomobject]@{ launch_mode = 'chat'; setup_mode = 'conservative'; model = $model; device = 'Vulkan0'; cpu_miss_enabled = $true; cpu_miss_cores = '8'; cpu_miss_max = '2' }
+    Test-Flow 'saved CPU miss count survives reconfiguration' -Saved $cpuSaved -Inputs @('n', '', '', '', '', '', '', '', '', '', '', '', '') -Check {
+        Assert ('kernels.vulkan.cpu_miss_threads=8' -in $nativeArgs) 'Saved custom CPU core count lost'
+        Assert ('kernels.vulkan.cpu_miss_max=2' -in $nativeArgs) 'Saved CPU miss limit lost'
+    }
+    $script:CpuTopology = [pscustomobject]@{ Physical = 6; Preferred = 6; Detected = $true }
     Test-Flow 'aggressive API three slots and local cache' -Inputs @('2', $model, '', '', '', '', '2', '', '', '', '', '3', '100k', 'y', '', '', '') -Check {
         Assert ($nativeArgs[0] -eq 'serve' -and 'device.auto_profile=aggressive' -in $nativeArgs) 'Expected aggressive API'
         Assert ($state.server_parallel -eq '3' -and $state.context -eq '100k') 'Parallel/context prompts shifted'
@@ -235,15 +253,25 @@ try {
     $script:Output.Clear()
     $selected = Read-ComputeDevice -Default 'Vulkan2'
     Assert ($selected -eq 'Vulkan2') 'Saved device should be the default selection'
-    foreach ($name in @('Vulkan0', 'Vulkan1', 'Vulkan2', 'CPU')) {
+    foreach ($name in @('Vulkan0', 'Vulkan1', 'Vulkan2')) {
         Assert (($script:Output -join "`n") -match $name) "Device list omitted $name"
     }
+    Assert (($script:Output -join "`n") -notmatch 'CPU') 'CPU must not be listed as a device'
     $script:Passed++
-    Microsoft.PowerShell.Utility\Write-Host 'PASS all GPUs and CPU listed, saved device selected'
+    Microsoft.PowerShell.Utility\Write-Host 'PASS only GPUs listed, saved device selected'
+    $script:Answers.Enqueue('')
+    $selected = Read-ComputeDevice -Default 'cpu'
+    Assert ($selected -eq 'Vulkan1') 'A saved CPU selection must fall back to the default GPU'
+    $script:Passed++
+    Microsoft.PowerShell.Utility\Write-Host 'PASS saved CPU selection falls back to GPU'
     $script:Devices = @()
-    Test-Flow 'CPU-only machine still asks for device' -Inputs @('', $model35, '', '', '', '', '', '', '', '') -Check {
-        Assert ($state.device -eq 'cpu' -and '--dev' -in $nativeArgs) 'CPU-only device fallback failed'
-    }
+    $script:Events.Clear()
+    $deviceError = ''
+    try { Read-ComputeDevice | Out-Null } catch { $deviceError = $_.Exception.Message }
+    Assert ($deviceError -match 'No Vulkan GPU was found') 'No GPU must produce a clear error'
+    Assert ($script:Events.Count -eq 0) 'No GPU must not offer a CPU fallback or ask for a device'
+    $script:Passed++
+    Microsoft.PowerShell.Utility\Write-Host 'PASS no GPU stops device selection without CPU fallback'
     foreach ($kind in @('mtp', 'vision', 'embedding')) {
         $script:Answers = [System.Collections.Generic.Queue[string]]::new()
         $script:Answers.Enqueue('R')

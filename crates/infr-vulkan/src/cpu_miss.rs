@@ -290,8 +290,7 @@ impl Worker {
         let min_spin = min_spin.clamp(1, 1 << 20);
         #[cfg(target_arch = "x86_64")]
         let _ = kernels::tables();
-        let masks = topology::worker_affinities(core_offset);
-        let controller_mask = masks.get(threads).copied();
+        let (masks, controller_mask) = topology::affinity_plan(threads, core_offset);
         let stats = Arc::new(Mutex::new(Stats::default()));
         let worker_stats = Arc::clone(&stats);
         let (sender, jobs) = mpsc::sync_channel::<Option<Work>>(1);
