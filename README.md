@@ -5,19 +5,19 @@
 Windows 免安装，下载约 14 MiB。下载 GGUF、选择自动配置，即可本地聊天，
 或通过 OpenAI 兼容接口接入现有客户端。显存、内存与 SSD 协同加载 MoE 专家权重。
 
-**0.10.0 峰值速度参考**：RX 7900 XTX 24 GiB + Ryzen 5 5600X + 64 GiB DDR4，自动激进配置。
-Flash-Next 4.27bpw 的 Prefill 峰值约 **1,446 tok/s**，三路 Decode 总峰值 **79.4 tok/s**；
-35B Balanced 在 30K 下单路 Decode 峰值 **65.4 tok/s**。
-MTP / CPU miss 关闭，配置三个槽位。以下为 2026-10-09 实测峰值，单位 tok/s；统计口径见[实测结果](#实测结果)。
+**0.10.0 最快分段速度参考**：RX 7900 XTX 24 GiB + Ryzen 5 5600X + 64 GiB DDR4，自动激进配置。
+Flash-Next 4.27bpw 在 30K 下单路 Prefill 为 **1,414.3 tok/s**，三路 Decode 为 **65.5 tok/s**；
+35B Balanced 在 30K 下单路 Decode 为 **63.6 tok/s**。
+MTP / CPU miss 关闭，配置三个槽位。以下取 2026-10-09 实测前 / 中 / 后三段中最快一段的平均速度，单位 tok/s；统计口径见[实测结果](#实测结果)。
 
-| 模型 | 同时生成路数 | 30K Prefill 峰值 | 30K Decode 总峰值 | 150K Prefill 峰值 | 150K Decode 总峰值 |
+| 模型 | 同时生成路数 | 30K Prefill  | 30K Decode  | 150K Prefill  | 150K Decode  |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Flash-Next 4.27bpw | 1 | 1,439.4 | **47.7** | 1,444.6 | **44.7** |
-| Flash-Next 4.27bpw | 2 | 1,445.2 | **71.3** | 1,446.3 | **63.6** |
-| Flash-Next 4.27bpw | 3 | 1,437.0 | **79.4** | 1,434.2 | **62.5** |
-| 35B Balanced | 1 | 3,824.8 | **65.4** | 3,981.7 | **36.7** |
+| Flash-Next 4.27bpw | 1 | 1,414.3 | **45.3** | 1,358.2 | **41.5** |
+| Flash-Next 4.27bpw | 2 | 1,335.0 | **63.3** | 1,353.4 | **55.7** |
+| Flash-Next 4.27bpw | 3 | 1,302.4 | **65.5** | 1,303.6 | **46.7** |
+| 35B Balanced | 1 | 3,254.9 | **63.6** | 1,829.5 | **36.0** |
 
-<sub>峰值为 1.5 秒滚动窗口内的最高速度。Prefill 峰值由 chunk 完成进度插值估算。</sub>
+<sub>各统计区间按时间三等分，取三段中最高的平均速度。Decode 分段值为三轮均值；Prefill 分段速度由 chunk 完成进度插值估算。</sub>
 
 [下载已发布的 Windows 版本](https://github.com/Headmaster218/MoE4All/releases/latest) |
 [快速使用](#快速使用) |
@@ -146,7 +146,7 @@ Flash-Next 在 150K 下三路总速低于双路，并发收益不是线性的。
 | **Intel Arc A770 16GB + 64GB DDR4-3200** | Ornith 1.5 35B Q4_K_M，F16 KV，96K 上下文容量，REAL 负载三次测试 | 未提供 | **30.15–30.28 tok/s** | v0.6.0-beta.1，[Issue #41](https://github.com/Headmaster218/MoE4All/issues/41) |
 | **NVIDIA RTX 3090 Ti + 64GB RAM** | 社区成功运行反馈；原评论未注明模型、量化和上下文 | 未提供 | **约 29 tok/s** | 版本未注明，[B站用户反馈](https://www.bilibili.com/video/BV1ALha63Eyd/)（rpid `318146261056`） |
 
-社区速度保留用户原始口径，未独立复测；未说明是否为均值或峰值，不能直接与上方统一窗口的峰值表比较。
+社区速度保留用户原始口径，未独立复测；未说明是否为均值或峰值，不能直接与上方最快分段速度表比较。
 
 
 欢迎在 [Discussions](https://github.com/Headmaster218/MoE4All/discussions) 分享成功配置，
