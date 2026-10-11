@@ -1136,3 +1136,143 @@ Seven analyzer tests pass, including unknown post-miss boundaries; both charts
 pass six-track/three-boundary desktop/mobile pixel, overflow, drag and zoom
 checks. All benchmark services have stopped normally; the production binary
 and production session cache were not touched.
+
+### Queue the next frontend before retiring old chunks
+
+The next default-off experiment delays `submit_early_recovery()` until the
+paused FFN and the following unconditional frontend have been encoded, stopping
+before the next `MoeFfn`, graph end, or explicit dispatch cap. Old LUT readers,
+fences, producer ACKs and immutable notice/control storage remain alive until
+retirement. Missing expert destinations remain protected under one pager lock.
+This does not change LRU ownership, model arithmetic, MTP or Prefill scheduling.
+
+Important submission detail, checked against both source and actual submit IDs:
+the existing `decode_early_submit` still flushes the miss FFN itself. With this
+test's automatic AMD setting, the new helper queues the following frontend
+before retiring old chunks, but does **not** combine the FFN and frontend into
+one command buffer. All 156 / 157 captured recoveries use a distinct subsequent
+frontend submission. The gain is overlapping retirement with that useful
+frontend, not an already-proven saving from eliminating a submit. The code also
+handles the early-submit-disabled path, but that variant has no performance
+result yet. No claim is made that turning early-submit off globally is better.
+
+243 infr-core and 215 infr-vulkan non-ignored tests pass; 107 Vulkan tests are
+ignored. A dedicated ignored GPU fixture passes for rows 1/2, first/last-layer
+misses, full hits, subsequent full hits, mapped/nonmapped journals and the
+dispatch-cap=1 fallback (40.99 seconds). This focused fixture is not the entire
+ignored GPU matrix. Release build took 6m50s. Frozen binary:
+`target/gpu-resident-experiment/release/infr-recovery-frontend.exe`, SHA256
+`da96c58535169d00c2d402d8bdcab1b8e12175f3b66d54c0a63340cd07025666`.
+
+Same-binary, unprofiled screen `stage4-recovery-frontend-screen`: two configured
+slots, one active, 384 generated tokens, two regenerated rounds per depth.
+All four batches match both the resident control and earlier ordinary golden
+output hashes and cache state.
+
+| API predicted rate, mean of two rounds tok/s | Resident control | Queued frontend |
+|---|---:|---:|
+| 30K | 45.007 (44.619 / 45.394) | 46.407 (45.792 / 47.021), +3.11% |
+| 150K | 40.225 (38.407 / 42.043) | 42.400 (41.832 / 42.969), +5.41% |
+
+These are screening results, not proof of sustained >=50 tok/s or dual-active
+benefit. The cold first 150K round is slower than its second round; do not
+silently present its average as a steady-state number.
+
+GPU-only `stage4-recovery-frontend-gpu-trace` again contains twelve matching
+positions per depth and matching output/cache state for all four batches:
+
+| Mean diagnostic | 30K | 150K |
+|---|---:|---:|
+| Forward wall ms | 20.414 | 22.231 |
+| Main queue envelope union ms | 15.496 | 16.326 |
+| Actual miss layers across twelve forwards | 156 | 157 |
+| DMA-bearing miss layers | 105 | 126 |
+| Both hit and DMA done -> miss FFN start, us / DMA-bearing miss | 61.24 | 66.05 |
+| All hit end -> miss FFN start, ms / forward | 2.562 | 2.731 |
+| Miss FFN end -> next recorded main GPU interval, ms / forward | 0.191 | 0.354 |
+| Sum of disjoint before/after miss gaps, ms / forward | 2.752 | 3.085 |
+| Before first GPU work, ms / forward | 0.586 | 0.689 |
+| L0 graph end -> L1 tail first GPU submit, ms / forward | 0.888 | 1.109 |
+| After last GPU work, ms / forward | 0.298 | 0.412 |
+
+The earlier original GPU-only gaps sum to 4.582 / 4.405 ms, and the rejected
+miss-only-early experiment sums to 5.094 / 6.062 ms. This version avoids moving
+the saved wait behind the miss FFN. GPU diagnostics use separate frozen builds
+and small selected windows; they do not replace the unprofiled comparisons.
+Completion-interval gaps can include GPU barriers and scheduling, not just host
+delay. Outer boundary differences are not attributed to this patch, which does
+not change the L0/tail graph split or sampling/output delivery.
+
+By actual transfer path, hit-end to miss-start mean is 163.36 / 176.41 us for
+DMA-bearing misses and 266.44 / 339.98 us for mapped-push-only misses
+(30K / 150K). Those are path-group diagnostics with potentially different
+expert counts and bytes, not a bandwidth-only A/B. They justify investigating
+the unimported-RAM fallback as well as the notice/admission-to-DMA-start delay;
+they do not establish a specific CPU copy or driver cost without further
+instrumentation. The separate frontend submissions begin soon after the miss
+FFN, so saving a submission alone is no longer the largest measured gap.
+
+New chart, preserving earlier charts and all six measured tracks:
+`D:\AIinfr\infr\benchmark-data\artifacts\decode-timeline-20261011-gpu-miss-recovery-frontend\timeline.html`.
+Raw logs, traces, correctness and frozen source manifests are copied alongside
+it; no KV payloads are copied. Seven analyzer tests pass; desktop 1440/mobile
+390 checks confirm six nonblank measured tracks, three boundary rows, no page
+overflow, wheel zoom and pointer dragging. Screenshots are preserved.
+
+### Completed ordinary-control matrix for queued frontend recovery
+
+`stage4-recovery-frontend-ordinary-matrix` compares the same frozen binary with
+ordinary Decode against the resident preset plus queued frontend recovery.
+Configured two slots; 30K/150K x one/two active; 512 generated tokens per
+request, three regenerated rounds, no profiler. All twelve candidate batches
+match a whole-batch ordinary output hash and identical prompt/generated/cache
+state. Candidate cold-start rounds may match an ordinary warm round when the
+cache state agrees; neither hash matching nor throughput is claimed against
+an incompatible cold cache state.
+
+The table uses only regenerated rounds 1 and 2 (zero-based), with the first
+round excluded consistently for both cases. Per-lane means are API predicted
+rates, averaged across those two rounds and all active lanes. Aggregate is the
+mean of fully contained all-active Decode windows from existing server stats,
+not merely per-lane rate multiplied by the lane count. Raw one-second bins
+remain available; those window rates are rounded to 0.1 tok/s by the server.
+
+| Context / active lanes | Ordinary per lane | Resident + queued frontend per lane | Change | Ordinary aggregate | Resident aggregate |
+|---|---:|---:|---:|---:|---:|
+| 30K / 1 | 43.247 | 47.766 | +10.45% | 43.199 | 47.925 |
+| 30K / 2 | 32.279 | 33.459 | +3.66% | 64.646 | 66.818 |
+| 150K / 1 | 40.179 | 43.171 | +7.45% | 40.235 | 43.545 |
+| 150K / 2 | 24.433 | 24.979 | +2.23% | 48.855 | 50.037 |
+
+Those deltas include the existing resident path as well as this new recovery
+change. Only the earlier same-binary resident-control screen (+3.11% / +5.41%)
+isolates the additional queued recovery against resident control; no isolation
+claim is made for the dual-active deltas. Both warm rounds improve in each
+case, but these are two warm repeats, not a confidence interval or a 24-hour
+soak result. Default-off gates are retained; other GPUs/drivers are unvalidated.
+
+| Warm request bins, per lane: front / middle / late tok/s | Ordinary | Resident + queued frontend |
+|---|---|---|
+| 30K / 1 | 42.37 / 44.20 / 42.91 | 46.86 / 48.53 / 47.86 |
+| 30K / 2 | 32.41 / 32.72 / 31.59 | 33.54 / 34.27 / 32.39 |
+| 150K / 1 | 39.39 / 40.62 / 40.28 | 42.15 / 43.94 / 43.18 |
+| 150K / 2 | 25.31 / 23.80 / 24.03 | 26.28 / 24.55 / 24.17 |
+
+Bins are grouped by token-midpoint thirds using the existing one-second
+progress sampling, then averaged over the two warm rounds/all active requests.
+They are not exact individual-token timestamp distributions. First-round
+ordinary dual-active cold Prefill is excluded from the Decode comparison.
+Neither 50.037 aggregate in the last row nor a faster short GPU-trace sample
+establishes >=50 single-lane throughput: that goal remains unmet.
+
+Final aggregate test-cache size is 20,916,434,288 bytes, below 30 GiB. Services
+stopped normally. No production executable/service/cache was replaced. Next
+priorities remain the independent L0/tail graph setup boundary and pre-recovery
+miss transfer/admission, especially unimported-RAM mapped pushes. The front and
+tail gaps remain separately measured; they are not automatically removable.
+
+Runtime implementation is local commit `86898f496`. The frozen executable was
+built at `0a43785ee` plus the source patch archived in each manifest; before
+commit only the recovery comment was corrected to describe the actual separate
+early submissions. The ordinary matrix and screening evidence are also copied
+under the new chart directory's `full-matrix/` and `resident-screen/` folders.
