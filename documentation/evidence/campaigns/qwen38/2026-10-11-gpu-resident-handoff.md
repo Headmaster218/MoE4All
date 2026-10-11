@@ -2004,3 +2004,161 @@ following the user's narrowed focus. Preserve the default-off trial and frozen
 source/binary for subsequent CPU-push critical-path diagnosis alongside DMA.
 Raw manifest, source patch, logs and correctness file share the tag above;
 `stage4-mapped-copy-summary.json` contains all warmed values and module passes.
+
+### Host-enabled miss-boundary diagnosis, 2026-10-11 +08:00
+
+Tag `stage4-miss-boundary-diagnostic` retains the same frozen mapped-copy
+control binary and settings (threshold=0, staging/full-graph/owned/inline off).
+Two regenerated 512-token requests per depth; twelve forwards from the middle
+of the warmed second request. All four outputs match the same-cache control,
+without exclusions. Maximum reported clock deviation is 18 ns.
+
+| Per-miss median us | 30K DMA/mixed | 150K DMA/mixed | 30K mapped-only | 150K mapped-only |
+| --- | ---: | ---: | ---: | ---: |
+| Notice to admission | 5.66 | 5.56 | 5.75 | 6.08 |
+| Admission envelope | 18.10 | 17.70 | 171.80 | 183.30 |
+| Producer submit envelope | 35.80 | 33.20 | 0.20 | 0.20 |
+| Notice to DMA start | 83.80 | 83.82 | n/a | n/a |
+| Readiness to resumed GPU FFN | 59.34 | 58.50 | 133.99 | 140.03 |
+| Ready to submit API entry | 0 | 0 | 82.50 | 93.10 |
+| Submit API overlap after ready | 0 | 0 | 33.60 | 33.50 |
+| API return/readiness to GPU start | 47.37 | 49.76 | 11.64 | 11.18 |
+
+Counts across twelve forwards are 105/126 DMA-or-mixed and 51/31 mapped-only.
+Readiness is the latest of hit completion, producer submit return and relevant
+DMA completion. `host_submit_ns` is stamped **before** the queue-submit API;
+the older `queuedUs` includes API time and must not be called pure GPU delay.
+`postReadyApi` partitions the interval using the measured API entry/return.
+Individual column medians do not add. Post-return time can still include GPU
+dependencies and scheduling, not only driver latency.
+
+Mapped-only admission includes CPU writes; producer submit then has no DMA.
+The old worker deliberately suppresses ordinary host spans, so the absence of
+an `expert_mapped_copy` bar was not evidence that the copy did not occur.
+New explicit background spans cover pager-lock acquisition, import lookup,
+mapped copy, DMA preparation and its submit API, without enabling ordinary
+uploader spans or changing synchronization. GPU-only tracing remains off for
+these host spans. The analyzer's four tests cover interval clipping, nested
+worker spans, prequeued dependencies and GPU start before submit API return.
+
+Outer front/tail means are 598.91/340.35 us at 30K and 603.42/369.81 us at
+150K. First captured query-pool creation contributes a ~1.1 ms measurement
+spike; the front measurement median is only ~29-31 us. Keep that sample and
+label it as profiling overhead. Mapped recovery preparation also includes
+query readback (~37-41 us in representative intervals); do not treat the
+whole 83-93 us as production control work. Front graph preparation/binding
+is ~174-185 us mean; the final graph/plan destruction is outside `step_tail`
+but inside the forward boundary. These are candidates, not measured gains.
+
+### CPU-push transport screens: do not promote
+
+Explicit AVX2 streaming stores: six alternating passes, 1/2/3/4/8 complete
+expert payloads, parallel/serial x temporal/non-temporal. All 120 GPU payload
+checks pass. Mean differences are below 1%, including 155.40 -> 154.51 us
+for one expert in parallel mode. The explicit non-temporal runtime is removed;
+`stage4-mapped-nt-module-{source.patch,archive.json}` and frozen unit binary
+preserve the rejected implementation and exact provenance.
+
+Bounded host staging/DMA (`stage4-mapped-staging-module`): six alternating
+passes, four warmups plus 64 timed iterations per pass; ten Rayon threads.
+The prototype routes only notice-worker unimported mapped misses, keeps
+imported DMA unchanged, retains at most 32 MiB in its pool and falls back to
+direct push when live leases exhaust it. A completed transfer timeline value
+permits releasing command-slot buffer references; never release live leases
+or wait for the GPU under the pool lock. Allocation alignment can transiently
+allocate a rejected buffer before physical-byte accounting rejects retention.
+This is not a full host-tier mirror and allocates no additional device VRAM.
+
+| Complete experts | Mapped default total us | Mapped serial total us | Staging prepare us | Staging total us |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 153.19 | 140.74 | 112.98 | 287.54 |
+| 2 | 309.05 | 382.27 | 220.22 | 487.29 |
+| 3 | 458.10 | 435.02 | 353.10 | 858.46 |
+| 4 | 579.28 | 563.32 | 456.61 | 1020.01 |
+| 8 | 1147.74 | 1127.07 | 906.66 | 1789.94 |
+
+Total includes source preparation, submission and host completion wait;
+there is no hit-FFN/CPU-encode overlap in this fixture. Five simultaneously
+prepared distinct 1 MiB payloads and ninety guarded GPU readbacks pass;
+every staged timed batch actually uses DMA. All passes are retained, including
+the slower two-expert serial case. The faster preparation alone does not make
+the end-to-end path faster. Leave the experimental runtime **default off and
+uncommitted**; do not launch a full matrix or claim inference gains from this
+screen. A future staged trial needs GPU completion timing and a demonstrated
+overlap budget sufficient to cover the extra copy/submit cost first.
+
+The source patch and frozen unit executable hash are in the module archive;
+test binary SHA256 is
+`3eed5c9bbe1a8afcee021e0c2184ca5b8dff666039752fa2587689e4f7973ba9`.
+Current core/Vulkan non-ignored suites pass 244/223 tests (111 Vulkan tests
+ignored); the mapped fixture now uses the existing typed device selection,
+not an unregistered ambient runtime environment knob. These are module
+checks, not sustained single-lane >=50 tok/s or a long-term stability result.
+
+### Detailed-worker confirmation, 2026-10-11 22:32-22:35 +08:00
+
+Tag `stage4-miss-detail-diagnostic`, frozen build
+`infr-stage4-miss-detail-build.exe`, SHA256
+`b20846176ea0ef8499588429e2f4690a89d401f65fb378d2412e1428f32ac6eb`.
+Build provenance is `stage4-miss-detail-build.json`: 428 runtime source hashes,
+source patch, Rust 1.97.1/native flags and pre-build HEAD `cfe335d22`.
+The measurement-only code is separately committed as `ea4d86e0c`;
+the binary also contains existing uncommitted A/B code, all disabled in this
+capture. In particular the staging candidate is explicitly false.
+
+Both depths retain twelve forwards; all four 512-token outputs match the
+same-cache previous control, with no exclusions. The new worker events
+confirm no mixed mapped writes in the 105/126 DMA cases. Every mapped-only
+case has a measured copy event (51/31). A phase measured as zero at clock
+resolution is retained as zero, not mislabeled missing.
+
+| Worker median us | 30K | 150K |
+| --- | ---: | ---: |
+| Pager lock wait, DMA cases | 0.10 | 0.10 |
+| Import lookup, DMA cases | 0.70 | 0.70 |
+| DMA preparation including submit API | 36.90 | 34.45 |
+| Dedicated submit API, nested in preparation | 18.10 | 17.20 |
+| Actual mapped-copy batch, mapped-only cases | 172.20 | 164.80 |
+| Total mapped admission | 194.60 | 189.30 |
+| Mapped readiness to main submit API entry | 89.50 | 93.00 |
+| Mapped main submit API overlap | 35.60 | 35.10 |
+| Mapped API return to GPU start | 10.74 | 10.84 |
+
+These are nested/overlapping per-case medians, not additive components.
+CPU writes dominate mapped admission; lock/import lookup do not. Microtests
+move complete three-bank expert payloads, whereas a real miss can need only
+some banks: do not substitute complete-expert fixture times for every miss.
+One 30K mapped notice-to-admission interval is 5.427 ms versus a 6.42 us
+median; it is retained, its cause is not established, and it must not define
+the typical notice response. Dedicated preparation has a 394.7 us 150K
+outlier; retain it rather than silently dropping it.
+
+The front/tail medians are 563.54/400.77 us at 30K and 523.83/333.14 us at
+150K. First-capture query creation/measurement spikes remain (1.088/2.653 ms),
+so front means are 670.05/783.25 us and cannot represent unprofiled overhead.
+Outer CPU graph preparation/binding means are 210.40/194.95 us; tail graph
+cleanup remains an uninstrumented component within `lowering_other`.
+Do not remove synchronization or call profiler cleanup an inference win.
+
+Warmed whole-request rates are 47.325/43.342 tok/s. This is a short
+host-enabled diagnostic, not a matched unprofiled performance comparison;
+single-lane >=50 remains unmet. Both services exit normally; aggregate shared
+test cache ends at 19,049,843,128 bytes, below 30 GiB. Production executable,
+service and KV cache are unchanged.
+
+Next bounded implementation candidates, respecting the narrowed scope:
+
+1. Separate mapped admission/address planning from the host copy, letting the
+   main thread record recovery while the worker copies. Publish destination
+   addresses early, but submit only after copy readiness; retain source pins,
+   destination readers and failure semantics. This can hide preparation,
+   not eliminate the physical PCIe write.
+2. For DMA, reduce actual command preparation/recovery work; distinguish its
+   ~17-18 us API cost from dependency/scheduling latency. A wait-stage change
+   needs scoped consumer/barrier proof and resumed-FFN timing, not an earlier
+   TOP timestamp that merely moves the plotted wait.
+3. For outer boundaries, isolate repeated graph build/clone/drop and final
+   result handling, then screen one change at a time without profiling.
+   Previous owned-graph correctness exclusions still forbid broad promotion.
+
+Do not retune L0/L1, full-hit gaps, kernels, LRU or MTP in this focused round.

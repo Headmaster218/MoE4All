@@ -34,9 +34,11 @@ function breakdown(events, start, end) {
 }
 
 function phaseDuration(events, name, start, end) {
-  const ranges = events.filter(e => e.name === name).map(e => [Math.max(start, e.start_ns), Math.min(end, e.end_ns)])
+  const matching = events.filter(e => e.name === name &&
+    (e.start_ns === e.end_ns ? e.start_ns >= start && e.end_ns <= end : e.start_ns < end && e.end_ns > start));
+  if (!matching.length) return null;
+  const ranges = matching.map(e => [Math.max(start, e.start_ns), Math.min(end, e.end_ns)])
     .filter(([a, b]) => b > a).sort((a, b) => a[0] - b[0]);
-  if (!ranges.length) return null;
   let total = 0, cursor = start;
   for (const [a, b] of ranges) { total += Math.max(0, b - Math.max(a, cursor)); cursor = Math.max(cursor, b); }
   return us(total);

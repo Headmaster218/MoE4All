@@ -8,6 +8,8 @@ test('worker phase duration clips intervals and does not double-count overlaps',
   assert.equal(phaseDuration(events, 'copy', 10000, 70000), 60);
   assert.equal(phaseDuration(events, 'missing', 0, 100000), null);
   assert.equal(phaseDuration(events, 'copy', 90000, 100000), null);
+  assert.equal(phaseDuration([event('lookup', 10000, 10000)], 'lookup', 0, 100000), 0);
+  assert.equal(phaseDuration([event('lookup', 10000, 10000)], 'lookup', 20000, 100000), null);
 });
 
 test('submit stamp is before API return and GPU may start before return', () => {
