@@ -10069,9 +10069,12 @@ impl ResidentNoticeProducer {
                     experts: misses.iter().map(|&id| (entry.roles, id)).collect(),
                     complete: false,
                 };
+                let lock_wait =
+                    ResidentProducerTrace::begin("resident_producer_lock_wait", trace_context);
                 let mut guard = pager
                     .lock()
                     .map_err(|_| be("notice producer pager poisoned"))?;
+                drop(lock_wait);
                 let session = guard
                     .as_mut()
                     .ok_or_else(|| be("notice producer pager missing"))?;

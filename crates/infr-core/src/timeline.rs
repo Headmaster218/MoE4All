@@ -326,6 +326,38 @@ pub fn span_with_submit(name: &'static str, submit: u64) -> Option<Span> {
     })
 }
 
+fn background_context() -> Option<Context> {
+    if LOCAL_HOST_SPANS.with(Cell::get) {
+        None
+    } else {
+        CONTEXT.with(Cell::get)
+    }
+}
+
+/// Explicit worker phases use the global recorder; normal uploader spans remain suppressed.
+pub struct BackgroundSpan {
+    name: &'static str,
+    context: Context,
+    start_ns: u64,
+}
+
+pub fn background_span(name: &'static str) -> Option<BackgroundSpan> {
+    if !host_enabled() {
+        return None;
+    }
+    background_context().map(|context| BackgroundSpan {
+        name,
+        context,
+        start_ns: clock_ns(),
+    })
+}
+
+impl Drop for BackgroundSpan {
+    fn drop(&mut self) {
+        record_cpu_miss(self.name, self.context, self.start_ns, clock_ns());
+    }
+}
+
 impl Drop for Span {
     fn drop(&mut self) {
         let end_ns = clock_ns();
@@ -494,6 +526,7 @@ mod tests {
     #[test]
     fn background_context_restores_tls_without_cpu_spans() {
         assert!(LOCAL_HOST_SPANS.with(Cell::get));
+        assert!(background_context().is_none());
         {
             let _scope = scoped_context(Some(Context {
                 step: 91,
@@ -502,14 +535,17 @@ mod tests {
             }));
             assert_eq!(CONTEXT.with(Cell::get).unwrap().step, 91);
             assert!(!LOCAL_HOST_SPANS.with(Cell::get));
+            assert_eq!(background_context().unwrap().layer, 7);
             {
                 let _nested = scoped_context(None);
                 assert!(CONTEXT.with(Cell::get).is_none());
+                assert!(background_context().is_none());
             }
             assert_eq!(CONTEXT.with(Cell::get).unwrap().layer, 7);
         }
         assert!(CONTEXT.with(Cell::get).is_none());
         assert!(LOCAL_HOST_SPANS.with(Cell::get));
+        assert!(background_context().is_none());
     }
     #[test]
     fn device_phase_scopes_restore_nested_state() {

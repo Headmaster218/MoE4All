@@ -214,6 +214,7 @@ impl DedicatedTransferQueue {
         batches: &[TransferCopyBatch],
     ) -> Result<u64> {
         let _timeline_transfer = infr_core::timeline::span("dma_prepare_submit");
+        let _worker_prepare = infr_core::timeline::background_span("resident_producer_dma_prepare");
         debug_assert!(!batches.is_empty());
         let slot_index = self.cursor;
         let slot = &mut self.slots[slot_index];
@@ -343,10 +344,13 @@ impl DedicatedTransferQueue {
             .signal_semaphores(&signals)
             .push_next(&mut timeline);
         let submit_span = infr_core::timeline::span("dma_queue_submit");
+        let worker_submit =
+            infr_core::timeline::background_span("resident_producer_dma_queue_submit");
         if let Some(query) = timeline_query.as_mut() {
             query.submitted();
         }
         shared.submit_dedicated_transfer(self.queue, &submit)?;
+        drop(worker_submit);
         drop(submit_span);
         slot.timeline_query = timeline_query;
 
@@ -480,6 +484,8 @@ impl SessionTransferPlan {
         }
         if let Some(dst) = target.mapped_ptr() {
             let _timeline_copy = infr_core::timeline::span("expert_mapped_copy");
+            let _worker_copy =
+                infr_core::timeline::background_span("resident_producer_mapped_copy");
             let started = pager_profile::active().then(std::time::Instant::now);
             parallel_copy_to_mapped(src, dst);
             if let Some(t0) = started {
@@ -546,6 +552,8 @@ impl SessionTransferPlan {
 
         if !mapped.is_empty() {
             let _timeline_copy = infr_core::timeline::span("expert_mapped_copy");
+            let _worker_copy =
+                infr_core::timeline::background_span("resident_producer_mapped_copy");
             let started = pager_profile::active().then(std::time::Instant::now);
             parallel_copy_to_mapped_batch(&mapped);
             if let Some(t0) = started {
@@ -586,6 +594,7 @@ impl SessionTransferPlan {
     }
 
     fn imported_ranges(&self, src: &[u8]) -> Option<Vec<crate::ImportedHostRange>> {
+        let _lookup = infr_core::timeline::background_span("resident_producer_import_lookup");
         self.imports
             .read()
             .unwrap()
