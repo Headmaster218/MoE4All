@@ -2570,6 +2570,30 @@ impl MoePagerSession {
         }
     }
 
+    /// Old chunks have retired; a queued masked miss FFN can still read only these triplets.
+    /// Resolve and replace protection under one pager lock, without an unprotected claim window.
+    pub(crate) fn clear_frozen_except_routed(
+        &mut self,
+        roles: &[usize],
+        ids: &[u32],
+    ) -> Result<()> {
+        let mut retained = HashSet::new();
+        for &buf_id in roles {
+            let (_, pool, source) = self
+                .sources
+                .get(&buf_id)
+                .ok_or_else(|| be("in-flight LUT protection on an unregistered bank"))?;
+            let slots = self.pools[*pool].pager.lut_words(
+                source.block_base as usize,
+                source.bank_bytes / source.stride_bytes,
+            );
+            protect_routed_lut_slots(&mut retained, *pool, slots, ids)?;
+        }
+        self.clear_frozen_lut_slots();
+        self.frozen_lut_slots = retained;
+        Ok(())
+    }
+
     /// Retire exactly the Expert filler cells selected by the arena manager, then commit every
     /// higher-priority range as one allocator transaction. The manager owns geometry; the pager
     /// remains the sole owner of LRU/LUT and bounded-RAM shadow semantics.

@@ -9226,6 +9226,26 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
     let mut live_pos: usize = 0;
     loop {
         if let Some(chunk) = resident_chunk.as_mut() {
+            if let Some((op_idx, _)) = chunk.recovery_op {
+                if resident_recovery_submit_due(
+                    pstream.resume_ids.is_some(),
+                    live_ops.get(live_pos).map(|(_, op)| *op),
+                    cap > 0 && rec.as_ref().is_some_and(|r| r.dispatches() >= cap),
+                ) {
+                    submitted_dispatches += chunk.submit_early_recovery(
+                        be_,
+                        op_idx,
+                        &mut rec,
+                        &mut pstream,
+                        &mut segments,
+                    )?;
+                }
+            }
+        }
+        if let Some(chunk) = resident_chunk
+            .as_mut()
+            .filter(|chunk| chunk.recovery_op.is_none())
+        {
             if (chunk.producer.is_some() || live_pos.is_multiple_of(8)) && chunk.notices.is_some() {
                 chunk.poll_notices(be_, &mut pstream, None)?;
             }
@@ -9250,8 +9270,10 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
                     pstream.resume_ids = Some(ids);
                     mmv_memo = None;
                 }
-                while let Some(segment) = segments.pop_front() {
-                    segment.wait()?;
+                if chunk.recovery_op.is_none() {
+                    while let Some(segment) = segments.pop_front() {
+                        segment.wait()?;
+                    }
                 }
             } else if chunk.submit_due()
                 || (chunk.recording
@@ -9778,6 +9800,9 @@ struct ResidentChunk {
     control: std::sync::Arc<dyn Buffer>,
     journal: std::sync::Arc<dyn Buffer>,
     entries: Vec<ResidentJournalEntry>,
+    early_recovery: bool,
+    /// Op to resume and the first LUT word owned by its queued miss FFN.
+    recovery_op: Option<(usize, usize)>,
     limit: usize,
     recording: bool,
     submit_layers: usize,
@@ -10163,6 +10188,27 @@ fn resident_submit_due(entries: usize, submitted: usize, interval: usize, limit:
     interval != 0 && entries < limit && entries.saturating_sub(submitted) >= interval.min(limit)
 }
 
+fn resident_early_recovery_eligible(
+    requested: bool,
+    producer: bool,
+    submit_layers: usize,
+    inflight: usize,
+    indirect: bool,
+) -> bool {
+    requested && producer && submit_layers == 1 && inflight == 1 && !indirect
+}
+
+fn resident_recovery_submit_due(
+    resume_pending: bool,
+    next: Option<&Op>,
+    at_dispatch_cap: bool,
+) -> bool {
+    // Encode the missing FFN and the unconditional next frontend before retirement. Stop
+    // before the next router/LUT/journal can reuse old metadata, or at the splitter boundary.
+    !resume_pending
+        && (at_dispatch_cap || next.is_none() || matches!(next, Some(Op::MoeFfn { .. })))
+}
+
 fn resident_chunk_status(words: [u32; 4], recorded: usize) -> Result<Option<usize>> {
     let [run, stopped, reached, invalid] = words;
     if invalid != 0 || reached as usize > recorded || run > 1 {
@@ -10405,6 +10451,14 @@ impl ResidentChunk {
             control: std::sync::Arc::clone(&buffers.control),
             journal: std::sync::Arc::clone(&buffers.journal),
             entries: Vec::with_capacity(limit),
+            early_recovery: resident_early_recovery_eligible(
+                cfg.decode_gpu_resident_early_recovery,
+                buffers.producer.is_some(),
+                cfg.decode_gpu_resident_submit_layers,
+                cfg.decode_gpu_resident_inflight,
+                buffers.indirect.is_some(),
+            ),
+            recovery_op: None,
             limit,
             recording: false,
             submit_layers: cfg.decode_gpu_resident_submit_layers,
@@ -10681,7 +10735,11 @@ impl ResidentChunk {
             self.send_producer_jobs(&mut pending, self.entries.len())?;
             self.poll_notices(be_, ps, Some(&pending))?;
             // Error paths drain through PendingSegment::drop before phase storage disappears.
-            pending.wait()?;
+            if self.early_recovery && self.notice_resume.is_some() {
+                segments.push_back(pending);
+            } else {
+                pending.wait()?;
+            }
         } else {
             assert!(
                 self.notice_resume.is_some() || self.notice_stop,
@@ -10701,11 +10759,29 @@ impl ResidentChunk {
             }
             // The published miss belongs to an existing submission. Waiting those fences
             // drains its hit readers without submitting a new empty command buffer.
-            while let Some(segment) = segments.pop_front() {
-                segment.wait()?;
+            if !self.early_recovery {
+                while let Some(segment) = segments.pop_front() {
+                    segment.wait()?;
+                }
             }
         }
         let resume = self.notice_resume.take();
+        if self.early_recovery {
+            if let Some((op_idx, _)) = &resume {
+                // The miss LUT is appended, never written over the hit-reader windows. The
+                // first next-layer window will fit below it; rolling cap 1 retires this miss
+                // segment before a second next-layer window can reuse these coordinates.
+                if ps.tape_cursor < 3 * 512 || segments.is_empty() {
+                    return Err(be("early recovery has no retained hit/LUT submission"));
+                }
+                self.recovery_op = Some((*op_idx, ps.tape_cursor));
+                let fresh = be_.recorder()?;
+                fresh.seed_barrier();
+                ps.acquire_cpu_promotion(&fresh);
+                *rec = Some(fresh);
+                return Ok(resume);
+            }
+        }
         ps.drain()?;
         if let Some(producer) = &self.producer {
             while self.notice_cursor < self.notices_sent {
@@ -10765,6 +10841,76 @@ impl ResidentChunk {
             indirect.reset_after_drain();
         }
         Ok(resume)
+    }
+
+    fn submit_early_recovery<'a>(
+        &mut self,
+        be_: &'a VulkanBackend,
+        op_idx: usize,
+        rec: &mut Option<Recorder<'a>>,
+        ps: &mut PagedStream,
+        segments: &mut std::collections::VecDeque<crate::recorder::PendingSegment>,
+    ) -> Result<usize> {
+        let (expected_op, miss_tape_start) = self.recovery_op.take().expect("pending recovery");
+        if op_idx != expected_op || miss_tape_start < 3 * 512 || ps.resume_ids.is_some() {
+            return Err(be("early recovery resumed the wrong FFN or LUT window"));
+        }
+        let retire = segments.len();
+        let pending = rec
+            .take()
+            .expect("miss recovery recorder")
+            .finish_nowait()?;
+        let dispatches = pending.dispatches();
+        segments.push_back(pending);
+        // Queue the next frontend before CPU retirement. Decode early-submit may already have
+        // queued the miss FFN separately; this larger useful interval still covers cleanup.
+        // Queue order and the transfer semaphore protect both the residual and missing weights.
+        for _ in 0..retire {
+            segments.pop_front().expect("retained hit segment").wait()?;
+        }
+        ps.drain()?;
+        if let Some(producer) = &self.producer {
+            while self.notice_cursor < self.notices_sent {
+                let (ordinal, result) = producer.receive(true)?.expect("producer tail result");
+                if ordinal != self.notice_cursor || result?.words[31] != 0 {
+                    return Err(be("early recovery producer tail was not skipped in order"));
+                }
+                self.notice_cursor += 1;
+            }
+        }
+        let mut status = [0u32; 4];
+        be_.download(self.control.as_ref(), bytemuck::cast_slice_mut(&mut status))?;
+        let stopped = resident_chunk_status(status, self.entries.len())?;
+        if stopped.map(|ordinal| self.entries[ordinal].op_idx) != Some(expected_op) {
+            return Err(be("early recovery notice and final control disagree"));
+        }
+        // The queued miss owns only the appended LUT window. Low coordinates may now be
+        // recycled for one next layer, but its expert destinations remain protected.
+        ps.cursor = 0;
+        ps.tape_cursor = 0;
+        let promotion = ps
+            .cpu_promotion
+            .as_ref()
+            .ok_or_else(|| be("queued early recovery lost its protected promotion"))?;
+        be_.moe_pager()
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .clear_frozen_except_routed(&promotion.roles, &promotion.ids)?;
+        let fresh = be_.recorder()?;
+        fresh.seed_barrier();
+        *rec = Some(fresh);
+        self.entries.clear();
+        self.recording = false;
+        self.submitted_entries = 0;
+        self.notice_cursor = 0;
+        self.notices_sent = 0;
+        self.notice_stop = false;
+        if let Some(producer) = &self.producer {
+            producer.reset_after_drain();
+        }
+        Ok(dispatches)
     }
 }
 
@@ -13755,6 +13901,77 @@ fn execute_paged_moe<'a>(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn recovery_submits_at_next_moe_end_or_cap_but_never_before_missing_ffn() {
+        use super::*;
+        let id = TensorId(0);
+        let frontend = Op::Add {
+            a: id,
+            b: id,
+            dst: id,
+            n: 1,
+        };
+        let moe = Op::MoeFfn {
+            x: id,
+            router_x: id,
+            router: id,
+            gate_exps: id,
+            up_exps: id,
+            down_exps: id,
+            dst: id,
+            ne: 2560,
+            n_expert: 512,
+            n_used: 10,
+            n_ff_exp: 640,
+            down_scale: None,
+            fused_gate_up: false,
+            scale: 1.,
+            act: Activation::Silu,
+            gating: infr_core::graph::MoeGating::Softmax,
+            norm_w: true,
+            weight_before: false,
+            ep_band: None,
+            exp_probs_b: None,
+            n_expert_groups: 0,
+            n_expert_groups_used: 0,
+            swiglu_clamp: None,
+            expert_ids: None,
+        };
+        for pending in [false, true] {
+            for cap in [false, true] {
+                for next in [None, Some(&frontend), Some(&moe)] {
+                    assert_eq!(
+                        resident_recovery_submit_due(pending, next, cap),
+                        !pending
+                            && (cap || next.is_none() || matches!(next, Some(Op::MoeFfn { .. })))
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn early_recovery_requires_a_single_layer_rolling_retirement_boundary() {
+        for requested in [false, true] {
+            for producer in [false, true] {
+                for interval in [0, 1, 2, 16] {
+                    for inflight in [1, 2] {
+                        for indirect in [false, true] {
+                            assert_eq!(
+                                super::resident_early_recovery_eligible(
+                                    requested, producer, interval, inflight, indirect
+                                ),
+                                requested
+                                    && producer
+                                    && interval == 1
+                                    && inflight == 1
+                                    && !indirect,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
     fn resident_notice_preserves_row_slot_order_and_rejects_stale_metadata() {
         for count in [10, 20] {
             for miss_slot in 0..count {
@@ -13793,6 +14010,16 @@ mod tests {
     #[test]
     #[ignore = "requires an idle Vulkan GPU and about 3 GiB temporary RAM"]
     fn gpu_resident_graph_resumes_ffn_without_repeating_frontend() {
+        gpu_resident_recovery_fixture(false);
+    }
+
+    #[test]
+    #[ignore = "requires an idle Vulkan GPU and about 3 GiB temporary RAM"]
+    fn gpu_resident_recovery_frontend_matches_ordinary_rows_and_misses() {
+        gpu_resident_recovery_fixture(true);
+    }
+
+    fn gpu_resident_recovery_fixture(recovery_only: bool) {
         use super::*;
         use crate::pager::{ExpertSource, MoeHostChunkSpec, MoePagerLayout, MoePoolSpec, Role};
         use infr_core::blockio::{BlockDesc, BlockExtent, BlockIo};
@@ -13823,6 +14050,9 @@ mod tests {
         let down = Arc::new(vec![0u8; DOWN * EXP]);
         let mut expected = HashMap::new();
         for (indirect, mapped_journal) in [(false, false), (true, false), (false, true)] {
+            if recovery_only && indirect {
+                continue;
+            }
             for (
                 enabled,
                 limit,
@@ -13853,10 +14083,14 @@ mod tests {
                 (true, 2, 1, true, true, true, true, true, false),
                 (true, 1, 0, true, true, true, true, true, false),
                 (true, 3, 1, true, false, true, true, true, true),
+                (true, 1, 1, true, false, true, true, true, true),
                 (true, 3, 2, true, false, true, true, true, true),
                 (true, 2, 0, false, true, true, true, false, true),
                 (true, 1, 0, true, true, true, true, true, true),
             ] {
+                if recovery_only && enabled && !(producer && submit_layers == 1) {
+                    continue;
+                }
                 for rows in [1, 2] {
                     let mut cfg = infr_core::config::Config::default();
                     cfg.kernels.vulkan.decode_gpu_resident = enabled;
@@ -13870,6 +14104,8 @@ mod tests {
                     cfg.kernels.vulkan.decode_gpu_resident_waiter = hit_first;
                     cfg.kernels.vulkan.decode_gpu_resident_immutable_predicates = immutable;
                     cfg.kernels.vulkan.decode_gpu_resident_notice_thread = producer;
+                    cfg.kernels.vulkan.decode_gpu_resident_early_recovery = producer;
+                    cfg.kernels.vulkan.decode_gpu_resident_inflight = 1;
                     cfg.kernels.vulkan.decode_gpu_resident_indirect_predicates =
                         enabled && indirect;
                     if producer && limit == 1 {
@@ -14067,12 +14303,14 @@ mod tests {
                         })
                         .collect();
                     if enabled {
-                        assert!(
-                            ResidentChunk::new(&backend, &graph, true, &mut None)
-                                .unwrap()
-                                .is_some(),
-                            "GPU recovery fixture must exercise resident execution, not fallback"
+                        let resident = ResidentChunk::new(&backend, &graph, true, &mut None)
+                            .unwrap()
+                            .expect("GPU recovery fixture must exercise resident execution, not fallback");
+                        assert_eq!(
+                            resident.early_recovery,
+                            producer && submit_layers == 1 && !indirect
                         );
+                        drop(resident);
                         for (next_chunk, target_tokens) in [(true, None), (false, Some(1))] {
                             let mut prefill = graph.clone();
                             prefill.prefill_next_chunk = next_chunk;

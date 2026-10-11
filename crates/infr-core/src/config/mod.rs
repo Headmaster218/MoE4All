@@ -426,6 +426,8 @@ cfg_struct! {
         decode_gpu_resident_immutable_predicates: bool = false,
         /// Receive GPU notices and prepare miss uploads on a separate host producer thread (A/B).
         decode_gpu_resident_notice_thread: bool = false,
+        /// Experimental queued miss recovery before retiring old resident chunks (rolling cap 1).
+        decode_gpu_resident_early_recovery: bool = false,
         /// A/B GPU-produced indirect dispatch sizes instead of conditional-rendering commands.
         decode_gpu_resident_indirect_predicates: bool = false,
         /// Submit a CPU-miss result/merge immediately instead of waiting for the next router (A/B).
