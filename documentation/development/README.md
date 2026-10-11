@@ -18,7 +18,7 @@ verified_commit: ed62393068679573afe94a1472454efe7eae0f15
 
 ## 验证与发布
 
-- [长上下文资源矩阵](validation/context-resource-matrix.md)
-- [发版前长上下文验证](release/long-context-validation.md)
+旧的 Windows 固定资源矩阵及其发版门禁手册已退役，不再作为当前版本的验证入口。
+提示词规划器 `__test-plan-prompt` 和测试资源模拟能力仍保留，供其他基准测试使用。
 
 不可变的运行结果和 campaign 放在 [工程证据](../evidence/README.md)，不要把新的数字继续追加进方法论页面。

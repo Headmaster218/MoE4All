@@ -19,10 +19,11 @@ target-prof/
 /gui-data/
 /kv-sessions/
 /.update/
-/artifacts/context-resource-matrix/
 /benchmark-data/
 /upstream-research/
 /harness/agent-state/
+# Preserve local data from the retired resource-matrix harness.
+/artifacts/context-resource-matrix/
 /tests/context-resource/matrix.local.json
 bili_report_work/*
 followtasks.txt
