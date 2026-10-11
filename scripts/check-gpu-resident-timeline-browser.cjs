@@ -40,7 +40,7 @@ async function checkGpuOnly(name, width, height) {
   }))`);
   assert.equal(metrics.width, width);
   assert.ok(metrics.documentWidth <= width, 'GPU-only page overflow');
-  assert.equal(metrics.cases, 2); assert.equal(metrics.steps, 12); assert.equal(metrics.rows, 5);
+  assert.equal(metrics.cases, 2); assert.equal(metrics.steps, 12); assert.equal(metrics.rows, 6);
   assert.ok(metrics.misses > 0 && metrics.canvasWidth > 200);
   const colored = await evaluate(`(() => {
     const c = document.getElementById('timeline'), p = c.getContext('2d').getImageData(0,0,c.width,c.height).data;
@@ -63,7 +63,7 @@ async function checkGpuOnly(name, width, height) {
   await evaluate("document.getElementById('reset').click()");
   for (let i=0;i<2;i++) {
     const rows = await evaluate(`window.timelineReady.then(api=> { document.getElementById('case').value=${i};api.choose();return api.getRows().map(r=>r.length); })`);
-    assert.equal(rows[2], 48); assert.ok(rows[3] > 0);
+    assert.equal(rows[2], 47); assert.ok(rows[4] > 0);
   }
   const capture = await send('Page.captureScreenshot', {format:'png',captureBeyondViewport:false});
   fs.writeFileSync(path.join(root,`timeline-${name}.png`),Buffer.from(capture.data,'base64'));

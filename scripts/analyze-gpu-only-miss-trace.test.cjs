@@ -41,7 +41,7 @@ function fixture(dma) {
 test('GPU-only analysis matches conditional notices and DMA dependency without double counting', t => {
   const f = fixture(true); t.after(() => fs.rmSync(f.dir, { recursive: true }));
   const a = analyze(f.dir), p = a.points[0], m = p.misses[0];
-  assert.equal(p.rows[2].length, 48); assert.equal(p.rows[4].length, 1);
+  assert.equal(p.rows[2].length, 48); assert.equal(p.rows[5].length, 1);
   assert.equal(m.hits, 9); assert.equal(m.missing, 1); assert.equal(m.dmaBytes, 1048576);
   assert.equal(m.hitToResumeGapMs, .039); assert.equal(m.readyToResumeGapMs, .015);
   assert.equal(m.uncoveredDmaTailMs, .024); assert.equal(m.dmaOverlapHitMs, 0);
@@ -57,4 +57,13 @@ test('missing or unsynchronized DMA is never accepted as a measured resume depen
   const f = fixture(true); t.after(() => fs.rmSync(f.dir, { recursive: true }));
   f.trace.device_events.find(e => e.name === 'DMA_copy').transfer_signal = 8; f.write();
   assert.throws(() => analyze(f.dir), /dependency not carried/);
+});
+test('PLE split requires 47 resident layers and real ordinary L0 GPU evidence', t => {
+  const f = fixture(true); t.after(() => fs.rmSync(f.dir, { recursive: true }));
+  f.trace.resident_notices = f.trace.resident_notices.filter(n => n.context.layer !== 0);
+  f.trace.device_events = f.trace.device_events.filter(e => e.context.layer !== 0 || e.name === 'resident_hit_FFN');
+  f.trace.device_events.find(e => e.context.layer === 0).name = 'MoE_completion_interval';
+  f.write(); assert.equal(analyze(f.dir).points[0].rows[2].length, 47);
+  f.trace.device_events = f.trace.device_events.filter(e => e.context.layer !== 0);
+  f.write(); assert.throws(() => analyze(f.dir), /ordinary layer-0 GPU evidence missing/);
 });

@@ -915,3 +915,104 @@ probe immediate, retain completed-without-notice/error detection, and require
 unprofiled A/B before keeping a changed interval. The measured journal/LRU/prep
 costs alone do not establish the 50 tok/s target. This diagnostic's profiled
 request rates and best sampled step are not new unprofiled throughput claims.
+
+## GPU-only miss critical-path capture
+
+The user's next direction supersedes the proposed event/fence polling trial:
+keep the already-good full-hit continuation and first measure miss recovery.
+No polling interval or inference arithmetic/scheduling was changed here.
+
+`c97fb0740` adds opt-in `prof.timeline_gpu_only=true` (mutually exclusive with
+CPU-only tracing). Host phase clocks are disabled, not just hidden by the chart.
+Forward position/origin, CPU submit instant and calibrated clock pairs remain
+as the minimum metadata needed to compare the two GPU queues. A scoped trace
+context propagates into the notice uploader so real dedicated-DMA queries are
+no longer missing. Background host spans remain suppressed rather than being
+misclassified as inference-thread work.
+
+Per-marker layer context and FFN labels distinguish router notice, hit/shared
+FFN and resumed miss FFN. GPU journal status and hit masks identify conditionally
+skipped FFNs; unconditional timestamp markers do not prove that their kernels
+executed. The PLE overlap runner executes L0 in its ordinary graph and L1-L47
+in the resident tail. The analyzer requires all 47 resident notices/FFNs plus
+ordinary L0 GPU MoE evidence per forward (or 48 notices for an unsplit graph),
+checks each captured DMA signal against the resumed submission's wait value,
+and refuses incomplete or ambiguous captures. Other GPU stage intervals remain
+completion milestones, not isolated kernel or ALU busy time. Mapped CPU push
+has no GPU copy timestamp and must not be fabricated as a DMA interval.
+
+Validation before capture: core/Vulkan default tests passed (242/213; 106 GPU
+tests ignored); the final six timeline tests include context restoration and
+CPU/GPU-mode rejection, and three synthetic analyzer tests cover skipped FFNs,
+DMA dependencies and mapped-push/non-GPU rejection. The bounded capture uses
+30K/150K, two configured slots/one active, the selected inflight-one preset,
+384 tokens twice and 12 forwards in the second round. Every candidate batch
+must match the previous ordinary 384-token baseline on whole-batch KV state
+and output. This is a diagnostic window, not a new sustained-throughput claim.
+
+Capture completed with frozen `infr-gpu-only-miss-trace.exe`, SHA256
+`5c71f0eb427b3927d4407282097140da7c97f42552375758190de21b04adccd3`.
+The four whole-batch cache/output checks match the previous ordinary baseline.
+Each depth has 12 steps, zero host phase events, zero dropped events, all 47
+resident layers and ordinary L0 GPU evidence. Every captured producer DMA signal
+is carried into its corresponding miss-resume wait. Max reported calibration
+deviation is 19/21 ns. Services shut down normally; central cache aggregate
+finished at 20,916,430,380 bytes, below the 30 GiB rolling budget. Production
+service/executable/cache were not used or replaced.
+
+| GPU diagnostic mean | 30K | 150K |
+| --- | ---: | ---: |
+| Step wall ms | 22.180 | 22.726 |
+| Main queue envelope union ms / step | 15.582 | 16.544 |
+| Miss layers / step | 13.000 | 13.083 |
+| Routed experts missing / miss layer | 1.282 | 1.268 |
+| Partial-hit/shared FFN interval us / miss layer | 74.97 | 74.13 |
+| Miss-resume FFN interval us / miss layer | 33.42 | 32.86 |
+| DMA interval us / DMA-bearing miss layer | 98.55 | 101.49 |
+| Router-notice completion to DMA start us / DMA-bearing miss | 89.37 | 88.21 |
+| DMA/hit overlap ms / step | 0.014 | 0.012 |
+| Hit completion to resumed FFN start us / all miss layers | 278.69 | 280.21 |
+| Same gap us / DMA-bearing miss layers | 246.62 | 241.37 |
+| Same gap us / mapped-push-only miss layers | 344.72 | 438.06 |
+| Both hit and DMA complete to resumed FFN start us / DMA-bearing miss | 132.05 | 124.83 |
+| Total hit-to-resume gaps ms / step | 3.623 | 3.666 |
+| Uncovered DMA tail after hit completion ms / step | 1.002 | 1.224 |
+| Both-ready-to-resume gaps ms / step, DMA-bearing misses only | 1.155 | 1.311 |
+
+The 30K window has 156 miss layers (105 DMA-bearing, 51 mapped-push-only); 150K
+has 157 (126/31). No DMA duration is inferred for CPU push. A DMA-bearing miss
+may additionally contain mapped copies; its timestamps cover only the DMA
+portion. Table rows overlap: especially total miss gaps already contain exposed
+transfer tails and post-ready gaps. They must not be added or indiscriminately
+subtracted from unprofiled throughput. The query intervals also include barriers
+and scheduling stalls, not just arithmetic. The 12-step workload is intentionally
+small and not a long-term miss distribution.
+
+The critical-path priority is now concrete:
+
+1. Reduce ready-to-resume handoff. `finish_with_notice()` currently drains old
+   segments/producer ACKs, verifies final control, clears/rebuilds frozen LUT
+   windows and then re-encodes/submits recovery. Separate retirement from the
+   recover command, keep old command/fence/event/tape resources alive, and use
+   immutable IDs/masks/LUT windows rather than overwriting hit-reader buffers.
+   Do not remove the existing ACK/fence ownership guarantees in place.
+2. Prebuild/cache the miss-only GPU FFN path and consume the notice/prepared
+   promotion directly. Avoid repeated generic control readback, whole-tape
+   reconstruction and lowering on the recovery critical path where correctness
+   permits. Main-thread CPU, driver and semaphore contributions cannot be
+   individually assigned from this GPU-only capture.
+3. Advance DMA start. At about 89 us after the notice it usually starts after
+   the 75 us hit FFN, leaving almost no useful overlap. Compact producer
+   admission/transfer preparation is worth testing after recovery is shortened.
+   This trace does not prove that simultaneous transfer slows computation: the
+   two scarcely overlap here. Faster bulk copy alone misses the larger handoff.
+
+Standalone artifact:
+`D:\AIinfr\infr\benchmark-data\artifacts\decode-timeline-20261011-gpu-miss\timeline.html`.
+The directory includes raw traces/results/logs, frozen-build manifest, matching
+correctness evidence and analysis JSON, not KV cache payloads. Six tracks show
+main GPU envelopes, other completion milestones, actual hit FFN, miss FFN, DMA
+and skipped FFN. Pointer drag/wheel zoom, desktop 1440/mobile 390 canvas pixels
+and no-page-overflow checks pass. Four analyzer tests now additionally cover
+the 47-layer PLE split and missing L0 evidence. This capture does not establish
+the >=50 tok/s goal; resident execution remains opt-in.

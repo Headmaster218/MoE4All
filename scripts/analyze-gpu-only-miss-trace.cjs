@@ -22,8 +22,15 @@ function analyze(dir) {
   const points = trace.steps.map(step => {
     const gpu = mapped.filter(e => e.context.step === step.id).sort((a, b) => a.start - b.start);
     const notices = trace.resident_notices.filter(n => n.context.step === step.id);
-    if (notices.filter(n => n.status === 1 || n.status === 2).length !== 48) {
-      throw new Error(`Expected exactly 48 executed notices at step ${step.id}`);
+    const executed = notices.filter(n => n.status === 1 || n.status === 2);
+    // The PLE overlap runner executes layer 0 as a separate ordinary graph, then layers 1..47
+    // through the resident tail. Require evidence for layer 0 rather than accepting lost notices.
+    const firstResidentLayer = executed.some(n => n.context.layer === 0) ? 0 : 1;
+    const expectedLayers = Array.from({ length: 48 - firstResidentLayer }, (_, i) => i + firstResidentLayer);
+    const actualLayers = executed.map(n => n.context.layer).sort((a, b) => a - b);
+    if (JSON.stringify(actualLayers) !== JSON.stringify(expectedLayers) ||
+        (firstResidentLayer === 1 && !gpu.some(e => e.context.layer === 0 && e.name === 'MoE_completion_interval'))) {
+      throw new Error(`Executed resident notices or ordinary layer-0 GPU evidence missing at step ${step.id}`);
     }
     const phases = gpu.filter(e => e.name === 'resident_hit_FFN' || e.name === 'resident_full_hit_FFN');
     const consumed = new Map();
@@ -41,7 +48,7 @@ function analyze(dir) {
       const annotated = { ...e, status: notice.status, hits: notice.hit_masks.map(popcount).reduce((a, b) => a + b), count: notice.count };
       (notice.status === 0 ? skipped : actual).push(annotated);
     }
-    if (actual.length !== 48 || consumed.size !== 48 || [...byLayer].some(([l, n]) => consumed.get(l) !== n.length)) {
+    if (actual.length !== expectedLayers.length || consumed.size !== expectedLayers.length || [...byLayer].some(([l, n]) => consumed.get(l) !== n.length)) {
       throw new Error(`Conditional GPU markers did not match journals at step ${step.id}`);
     }
     const dma = gpu.filter(e => e.queue !== 'main');
@@ -82,8 +89,8 @@ function analyze(dir) {
     return { id: step.id, positions: step.positions, wallMs: ms(step.end_ns - step.start_ns),
       mainMs: ms(length(main)), dmaMs: ms(length(dmaIntervals)),
       dmaOverlapMainMs: ms(length(intersection(main, dmaIntervals))), misses,
-      rows: [envelopes.map(view), gpu.filter(e => e.name !== 'queue_envelope' && e.queue === 'main' && !e.name.startsWith('resident_hit') && e.name !== 'resident_full_hit_FFN').map(view),
-        actual.map(view), dma.map(view), skipped.map(view)],
+      rows: [envelopes.map(view), gpu.filter(e => e.name !== 'queue_envelope' && e.queue === 'main' && !e.name.startsWith('resident_hit') && e.name !== 'resident_full_hit_FFN' && e.name !== 'resident_miss_resume_FFN').map(view),
+        actual.map(view), gpu.filter(e => e.name === 'resident_miss_resume_FFN').map(view), dma.map(view), skipped.map(view)],
       skippedCount: skipped.length };
   });
   const missList = points.flatMap(p => p.misses);
@@ -101,6 +108,21 @@ function main() {
     .map(e => analyze(path.join(input, e.name))).sort((a, b) => a.depth - b.depth);
   if (cases.length !== 2 || cases[0].depth !== 30000 || cases[1].depth !== 150000 || cases.some(c => c.points.length !== 12)) {
     throw new Error('Expected two 12-step single-active cases, 30K and 150K');
+  }
+  if (output !== input) {
+    for (const c of cases) {
+      const destination = path.join(output, c.case);
+      fs.mkdirSync(destination, { recursive: true });
+      for (const file of ['trace.json', 'result.json', 'stderr.log', 'stdout.log']) {
+        const source = path.join(input, c.case, file);
+        if (fs.existsSync(source)) fs.copyFileSync(source, path.join(destination, file));
+      }
+    }
+    for (const entry of fs.readdirSync(input, { withFileTypes: true })) {
+      if (entry.isFile() && entry.name.startsWith(`${prefix}-`)) {
+        fs.copyFileSync(path.join(input, entry.name), path.join(output, entry.name));
+      }
+    }
   }
   fs.writeFileSync(path.join(output, 'analysis.json'), JSON.stringify(cases, null, 2));
   const payload = zlib.gzipSync(Buffer.from(JSON.stringify(cases))).toString('base64');
