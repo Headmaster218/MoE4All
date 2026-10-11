@@ -61,6 +61,15 @@ build_command; has_arg --pg; has_arg --synthetic-depth; has_arg --json; ! has_ar
 reset; S[model]=$'model "quote" \\ space\nline\t.g g u f'; S[mtp_model]='$(touch SENTINEL)'; S[think_mode]=think; S[reasoning_effort]=medium
 save_state; original=${S[model]}; defaults; load_state
 [[ ${S[model]} == "$original" && ${S[mtp_model]} == '$(touch SENTINEL)' && ! -e $ROOT/SENTINEL ]]; pass
+# Ubuntu commonly provides mawk as /usr/bin/awk. Exercise it explicitly even
+# when the test host has selected gawk as its default alternative.
+mawk_path=$(command -v mawk) || { printf 'mawk is required for the Linux wizard test\n' >&2; exit 1; }
+(
+    awk() { command "$mawk_path" "$@"; }
+    defaults; S[model]='mawk model.gguf'; S[server_auth]=true; save_state
+    defaults; load_state
+    [[ ${S[model]} == 'mawk model.gguf' && ${S[server_auth]} == true ]]
+); pass
 printf '{"model":"\u4e2d\u6587 \ud83d\ude00.gguf", "unknown": [1,2]}' > "$STATE"
 defaults; load_state; [[ ${S[model]} != *'\u'* && ${S[model]} == *.gguf ]]; pass
 printf '{"model":"a", "model":"b"}' > "$STATE"; reject load_state

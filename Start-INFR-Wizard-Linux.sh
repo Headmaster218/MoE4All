@@ -446,6 +446,21 @@ function is_value(a1) { #{{{1
 	return 1
 }
 
+# The launcher always uses STREAM=1, so these JSON.awk extension hooks are never
+# called. mawk still resolves every referenced function while compiling the
+# program, unlike gawk, and rejects the parser when the optional hooks are absent.
+function cb_jpaths(a, n, k) { for (k in a) break }
+function cb_fails(a, n, k) { for (k in a) break }
+function cb_append_jpath_component(a, b) { return "" }
+function cb_append_jpath_value(a, b) { return "" }
+function cb_parse_array_empty(a) { return "[]" }
+function cb_parse_array_enter(a) {}
+function cb_parse_array_exit(a, b) {}
+function cb_parse_object_empty(a) { return "{}" }
+function cb_parse_object_enter(a) {}
+function cb_parse_object_exit(a, b) {}
+function cb_fail1(a) { return 0 }
+
 # vim:fdm=marker:
 MOE4ALL_JSON_AWK
 
