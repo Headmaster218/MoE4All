@@ -46,6 +46,7 @@ test('GPU-only analysis matches conditional notices and DMA dependency without d
   assert.equal(m.hits, 9); assert.equal(m.missing, 1); assert.equal(m.dmaBytes, 1048576);
   assert.equal(m.hitToResumeGapMs, .039); assert.equal(m.readyToResumeGapMs, .015);
   assert.equal(m.uncoveredDmaTailMs, .024); assert.equal(m.dmaOverlapHitMs, 0);
+  assert.equal(m.resumeToNextGpuGapMs, .027);
 });
 test('mapped push has no fabricated GPU transfer duration; malformed trace is rejected', t => {
   const f = fixture(false); t.after(() => fs.rmSync(f.dir, { recursive: true }));
@@ -86,4 +87,15 @@ test('missing envelopes and invalid forward clocks cannot fabricate a boundary',
   assert.throws(() => gpuBoundaries([], step, 0), /requires main queue envelopes/);
   assert.throws(() => gpuBoundaries([{ name: 'queue_envelope', queue: 'main', start: -1, end: 100 }], step, 0), /outside/);
   assert.throws(() => gpuBoundaries([{ name: 'queue_envelope', queue: 'main', start: 1, end: 1001 }], step, 0), /outside/);
+});
+test('a final resumed FFN without following GPU evidence has an unknown post-miss gap', t => {
+  const f = fixture(false); t.after(() => fs.rmSync(f.dir, { recursive: true }));
+  const n = f.trace.resident_notices.find(n => n.context.layer === 47);
+  n.status = 2; n.hit_masks[0] = 511;
+  f.trace.device_events.find(e => e.context.layer === 47 && e.name === 'queue_envelope').end_tick = 4770000;
+  f.trace.device_events.push({ name: 'resident_miss_resume_FFN', context: { step: 0, lanes: 1, layer: 47 },
+    queue: 'main', submit: 49, host_submit_ns: 0, start_tick: 4760000, end_tick: 4770000,
+    valid_bits: 64, period_ns: 1, transfer_wait: 0, transfer_signal: 0, bytes: 0 });
+  f.write();
+  assert.equal(analyze(f.dir).points[0].misses.find(m => m.layer === 47).resumeToNextGpuGapMs, null);
 });

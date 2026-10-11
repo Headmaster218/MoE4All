@@ -1069,3 +1069,70 @@ The existing GPU-only HTML now includes a three-row per-sample/mean/P50 boundary
 table with these limitations. The six measured tracks, drag and wheel behavior
 are preserved; six analyzer tests and desktop/mobile browser checks pass. No
 GPU service was launched for this boundary audit.
+
+### Early miss-only submission: correct, but no throughput benefit
+
+Default-off, uncommitted runtime experiment `decode_gpu_resident_early_recovery`
+submits the recovery FFN before retiring old chunks/producer ACKs. Eligibility
+is producer-enabled rolling `submit_layers=1`, `inflight=1`, no indirect
+predicates. It appends recovery LUT windows and atomically preserves missing
+expert slot protection; old fences/events/journals are still retired normally.
+Neither inference arithmetic nor the LRU owner changes, and MTP remains off.
+
+The scalar eligibility test, 243 infr-core and 214 infr-vulkan non-ignored tests
+pass (106 Vulkan tests ignored). The explicit ignored GPU recovery fixture also
+passes, including rows 1/2, full hits, first/second-layer misses and fallback
+configurations, in 471.39 seconds. Release build took 7m08s. Frozen binary:
+`target/gpu-resident-experiment/release/infr-early-recovery.exe`, SHA256
+`4f455e1be9328a12f928294780160b506afbbf1530e689a5332b047d82fff25e`.
+
+Unprofiled screen `stage4-early-recovery-screen`: same binary, configured two
+slots with one active, ordinary technical questions, 384 tokens, two complete
+regenerated rounds per depth. Both rounds have matching cache state and output
+hashes against the same-binary control and the earlier ordinary goldens.
+
+| API predicted rate, mean of two rounds tok/s | Control | Early recovery |
+|---|---:|---:|
+| 30K | 41.076 (42.105 / 40.046) | 40.927 (40.274 / 41.580) |
+| 150K | 41.760 (41.458 / 42.063) | 38.704 (38.406 / 39.002) |
+
+30K is effectively inconclusive, not a positive result; 150K regresses 7.3%.
+No dual-active performance screen or larger matrix was run for this version.
+The target >=50 tok/s is still unmet. Keep this experiment default-off and do
+not commit it as a successful optimization.
+
+GPU-only follow-up `stage4-early-recovery-gpu-trace` contains the same 12 positions
+per depth as the earlier capture; all four batches again match ordinary output
+and cache state. Compare diagnostic intervals, not sustained throughput:
+
+| Mean measured GPU gaps | 30K old / early | 150K old / early |
+|---|---:|---:|
+| Both hit and DMA done -> recovery start, us / DMA-bearing miss | 132.05 / 68.25 | 124.83 / 73.39 |
+| All hit end -> recovery start, ms / forward | 3.623 / 2.874 | 3.666 / 3.459 |
+| Recovery FFN end -> subsequent main GPU work, ms / forward | 0.959 / 2.220 | 0.739 / 2.603 |
+| Sum of those disjoint before/after-recovery gaps, ms / forward | 4.582 / 5.094 | 4.405 / 6.062 |
+
+Miss counts agree exactly (156 / 157 across twelve forwards). The new post-FFN
+metric is the gap to the next positive-duration main GPU completion interval;
+it does not invent a precise next-layer start. No following recorded work means
+unknown, not zero. The GPU-only old/new captures use different frozen binaries,
+so they diagnose the path, not replace the same-binary unprofiled comparison.
+
+Recovery starts earlier, but the additional standalone short submission leaves
+more waiting before subsequent GPU work. Thus shortening the pre-miss interval
+alone is insufficient. The next candidate is to record recovery plus the next
+layer's unconditional frontend into one submission, then retire old metadata
+while that larger useful GPU interval executes. Retain old LUT destinations,
+ACK/fence ownership and avoid resetting control/journal until old readers are
+finished; this combined candidate is not yet implemented or tested.
+
+New diagnostic chart:
+`D:\AIinfr\infr\benchmark-data\artifacts\decode-timeline-20261011-gpu-miss-early-recovery\timeline.html`.
+The original GPU-only chart is retained and includes the additional post-miss
+gap column as well as the three forward boundaries. Frozen manifests, source
+patches, correctness results and raw traces are preserved outside test caches.
+Aggregate test cache after both runs is 20,916,428,760 bytes, below 30 GiB.
+Seven analyzer tests pass, including unknown post-miss boundaries; both charts
+pass six-track/three-boundary desktop/mobile pixel, overflow, drag and zoom
+checks. All benchmark services have stopped normally; the production binary
+and production session cache were not touched.

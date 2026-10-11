@@ -89,6 +89,8 @@ function analyze(dir) {
       const dmaIntervals = merge(transfers.map(e => [e.start, e.end]));
       const dmaEnd = transfers.length ? Math.max(...transfers.map(e => e.end)) : null;
       const dmaStart = transfers.length ? Math.min(...transfers.map(e => e.start)) : null;
+      const nextGpu = gpu.find(e => e.queue === 'main' && e.name !== 'queue_envelope' &&
+        e.start >= resume.end && e.end > e.start);
       return { layer, hits: hit.hits, missing: hit.count - hit.hits,
         route: transfers.length ? 'DMA or mixed' : 'mapped CPU push (no DMA)',
         noticeMs: ms(notice.end - step.start_ns), hitStartMs: ms(hit.start - step.start_ns), hitEndMs: ms(hit.end - step.start_ns),
@@ -100,6 +102,7 @@ function analyze(dir) {
         hitToResumeGapMs: ms(Math.max(0, resume.start - hit.end)),
         uncoveredDmaTailMs: dmaEnd === null ? null : ms(Math.max(0, dmaEnd - hit.end)),
         readyToResumeGapMs: dmaEnd === null ? null : ms(Math.max(0, resume.start - Math.max(hit.end, dmaEnd))),
+        resumeToNextGpuGapMs: nextGpu ? ms(nextGpu.start - resume.end) : null,
         transfers: transfers.map(t => ({ start: ms(t.start - step.start_ns), end: ms(t.end - step.start_ns), signal: t.transfer_signal, bytes: t.bytes })) };
     });
     const envelopes = gpu.filter(e => e.name === 'queue_envelope');
@@ -117,7 +120,7 @@ function analyze(dir) {
       skippedCount: skipped.length };
   });
   const missList = points.flatMap(p => p.misses);
-  const metrics = ['hitMs', 'missMs', 'dmaMs', 'dmaStartAfterNoticeMs', 'dmaOverlapHitMs', 'hitToResumeGapMs', 'uncoveredDmaTailMs', 'readyToResumeGapMs'];
+  const metrics = ['hitMs', 'missMs', 'dmaMs', 'dmaStartAfterNoticeMs', 'dmaOverlapHitMs', 'hitToResumeGapMs', 'uncoveredDmaTailMs', 'readyToResumeGapMs', 'resumeToNextGpuGapMs'];
   return { case: path.basename(dir), depth: result.depth, binaryHash: result.binaryHash, points,
     wall: stats(points.map(p => p.wallMs)), main: stats(points.map(p => p.mainMs)), dma: stats(points.map(p => p.dmaMs)),
     missCount: missList.length, dmaMissCount: missList.filter(m => m.transfers.length).length,

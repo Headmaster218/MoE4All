@@ -10,6 +10,9 @@ if (!process.env.RESIDENT_EXE) throw new Error('RESIDENT_EXE must name the froze
 if (fs.existsSync(path.join(artifacts, `${tag}-manifest.json`))) throw new Error('Use a fresh tag');
 const selected = structuredClone(reference.cases.find(c => c.enabled));
 selected.sets.push('prof.timeline_gpu_only=true');
+if (process.env.RESIDENT_EARLY_RECOVERY === '1') {
+  selected.sets.push('kernels.vulkan.decode_gpu_resident_early_recovery=true');
+}
 const child = spawnSync(process.execPath, [path.join(__dirname, 'gpu-resident-decode-benchmark.cjs')], {
   cwd: root, windowsHide: true, stdio: 'inherit', env: {
     ...process.env, RESIDENT_MODEL: reference.model, RESIDENT_TAG: tag,

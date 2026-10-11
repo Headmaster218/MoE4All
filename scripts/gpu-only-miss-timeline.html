@@ -19,7 +19,7 @@ body{font:14px system-ui;margin:24px;color:#20252c;background:white}h1{font-size
 <div class="legend"><span style="border-color:#315f93">主队列</span><span style="border-color:#37a173">全 hit FFN</span><span style="border-color:#bb8c35">部分 hit FFN</span><span style="border-color:#c45b59">miss resume</span><span style="border-color:#238f8a">DMA</span><span style="border-color:#bdc4cc">条件跳过</span></div>
 <canvas id="timeline" aria-label="GPU 主队列、执行阶段、hit、DMA 与跳过阶段时间线"></canvas>
 <small>横轴为当前前向 CPU 起点后的校准墙钟时间；各轨并行，不能纵向求和。不是估算层边界。L0 起编号，只有 FFN 与 router notice 标注精确所属层；其他跨层提交保留提交口径。</small>
-<div class="wrap"><table><thead><tr><th>Miss 层</th><th>Hit / 总数</th><th>路径</th><th>Hit ms</th><th>Miss ms</th><th>DMA MiB</th><th>DMA ms</th><th>Notice→DMA ms</th><th>DMA 覆盖 hit ms</th><th>Hit→Miss gap ms</th><th>未覆盖 DMA 尾部 ms</th><th>都 ready→Miss ms</th></tr></thead><tbody id="misses"></tbody></table></div>
+<div class="wrap"><table><thead><tr><th>Miss 层</th><th>Hit / 总数</th><th>路径</th><th>Hit ms</th><th>Miss ms</th><th>DMA MiB</th><th>DMA ms</th><th>Notice→DMA ms</th><th>DMA 覆盖 hit ms</th><th>Hit→Miss gap ms</th><th>未覆盖 DMA 尾部 ms</th><th>都 ready→Miss ms</th><th>Miss 后 GPU gap ms</th></tr></thead><tbody id="misses"></tbody></table></div>
 <script id="payload" type="application/octet-stream">__PAYLOAD__</script>
 <script>
 window.timelineReady=(async()=>{
@@ -37,7 +37,7 @@ function choose(){
 }
 function select(){const c=data[+cs.value];current=c.points[+ss.value];reset();document.getElementById('detail').textContent='Step #'+current.id+' · position '+current.positions.join(', ')+' · '+fmt(current.wallMs)+' ms · miss '+current.misses.length+' 层 · 跳过 '+current.skippedCount+' 个已编码 FFN';
 document.getElementById('boundaries').innerHTML=[['首个 GPU 工作之前','frontMs'],['L0 图 → L1 尾图','l0ToL1GapMs'],['最后 GPU 工作之后','tailMs']].map(([label,key])=>'<tr>'+[label,fmt(current.boundaries[key]),fmt(c.boundaryMetrics[key].mean),fmt(c.boundaryMetrics[key].median)].map(v=>'<td>'+v+'</td>').join('')+'</tr>').join('');
-document.getElementById('misses').innerHTML=current.misses.map(m=>'<tr>'+['L'+m.layer,m.hits+'/'+(m.hits+m.missing),m.route,fmt(m.hitMs),fmt(m.missMs),fmt(m.dmaBytes/1024**2),fmt(m.dmaMs),fmt(m.dmaStartAfterNoticeMs),fmt(m.dmaOverlapHitMs),fmt(m.hitToResumeGapMs),fmt(m.uncoveredDmaTailMs),fmt(m.readyToResumeGapMs)].map(v=>'<td>'+v+'</td>').join('')+'</tr>').join('');}
+document.getElementById('misses').innerHTML=current.misses.map(m=>'<tr>'+['L'+m.layer,m.hits+'/'+(m.hits+m.missing),m.route,fmt(m.hitMs),fmt(m.missMs),fmt(m.dmaBytes/1024**2),fmt(m.dmaMs),fmt(m.dmaStartAfterNoticeMs),fmt(m.dmaOverlapHitMs),fmt(m.hitToResumeGapMs),fmt(m.uncoveredDmaTailMs),fmt(m.readyToResumeGapMs),fmt(m.resumeToNextGpuGapMs)].map(v=>'<td>'+v+'</td>').join('')+'</tr>').join('');}
 function reset(){viewport={start:0,span:current.wallMs};draw();}
 function color(e,row){if(row===0)return '#315f93';if(row===2)return e.status===1?'#37a173':'#bb8c35';if(row===3)return '#c45b59';if(row===4)return '#238f8a';if(row===5)return '#bdc4cc';if(e.name==='resident_router_notice')return '#8865a6';if(e.name.includes('QSA'))return '#597bb0';if(e.name.includes('GDN'))return '#6ca58d';return '#7c8996';}
 function draw(){const w=el.clientWidth,r=devicePixelRatio||1;el.width=Math.round(w*r);el.height=Math.round(420*r);const x=el.getContext('2d');x.scale(r,r);x.clearRect(0,0,w,420);x.font='12px system-ui';const width=w-left-right,scale=width/viewport.span;
