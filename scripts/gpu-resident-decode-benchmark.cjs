@@ -44,6 +44,7 @@ const sourceFiles = [
   'crates/infr-vulkan/src/adapter.rs', 'crates/infr-vulkan/src/gemm.rs',
   'crates/infr-vulkan/src/lib.rs', 'crates/infr-vulkan/src/pager.rs',
   'crates/infr-vulkan/src/recorder.rs', 'crates/infr-vulkan/shaders/gpu_resident_check.comp',
+  'crates/infr-vulkan/src/transfer.rs',
   'crates/infr-vulkan/shaders/zero_words.comp',
   'crates/infr-vulkan/shaders/gpu_resident_hit_check.comp',
   'crates/infr-vulkan/shaders/gpu_resident_silu.comp',
@@ -58,6 +59,7 @@ const sourceFiles = [
   'scripts/run-gpu-resident-owned-graph.cjs',
   'scripts/run-gpu-resident-inline-io.cjs',
   'scripts/run-gpu-resident-notice-poll.cjs',
+  'scripts/run-gpu-resident-mapped-copy.cjs',
 ];
 const manifest = {
   sourceRoot, benchRoot, cache, cacheBudgetGiB: budgetGiB, model, exe, binaryHash: hash(fs.readFileSync(exe)),

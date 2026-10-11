@@ -1845,3 +1845,94 @@ tested inline-I/O matrix source hashes exactly after restoration (see
 model matrix remain applicable; the temporary poll tests' 245/220 results
 describe the archived experiment, not the restored source. No 150K or dual
 poll throughput claim is made, and the >=50 single-lane target remains unmet.
+
+### Small mapped miss-copy threshold experiment
+
+The next candidate targets CPU-push-only miss preparation, not imported Host
+DMA bandwidth. `prepare_upload_batch()` previously sent every multi-range
+mapped batch through Rayon, including three sub-MiB role banks for one expert.
+An experimental notice-producer executor now supports a total mapped-byte
+threshold: at or below the threshold copy synchronously on that producer;
+larger batches preserve Rayon. The control value is zero; the configuration
+is in KiB and capped at 8192. Only the resident notice producer installs it;
+ordinary/Prefill uploads and other background executors keep zero. Imported
+DMA selection, slot admission, LRU, ownership, ACK and resume waits are intact.
+
+Pure tests cover empty/single/multiple batches, threshold equality, integer
+overflow, exact payloads and untouched guards. An opt-in Vulkan module benchmark
+uses real DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT destinations, three different
+role sizes, 1/2/3/4/8 experts, alternating order over six passes, and 96 copies
+per timing. Each measurement is followed by HOST->TRANSFER synchronization and
+actual GPU readback to cached staging to verify the payload. Timing covers host
+copy preparation only, not that verification, inference or concurrent DMA.
+The module uses an explicit 10-thread Rayon pool; it is not a full-model notice
+thread scheduling benchmark. No throughput benefit is accepted from this test
+alone. The same-executable model runner preserves strict same-cache whole-batch
+output checks and separately records cold unmatched first rounds.
+
+220 Vulkan non-ignored tests pass (110 ignored), including the new pure cases;
+the explicit GPU module fixture then passes all 60 payload checks in 3.82 s.
+Native Rust 1.97.1 build of the CLI completes in 7m32s. Module executable SHA256:
+`ac068daa2d92b1b6a551320f6624d788320844f8c7c2272f1799b653062e6f1c`.
+Frozen experimental CLI `infr-mapped-copy.exe` SHA256:
+`9fdb19eea4c6589dde98f5b5648150c795764aff0e856a0932417b70f2391fc7`.
+
+| Expert triples | Batch MiB | Rayon mean us | Serial mean us | Preparation reduction |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 2.094 | 155.726 | 139.632 | 10.33% |
+| 2 | 4.188 | 301.165 | 278.366 | 7.57% |
+| 3 | 6.281 | 443.618 | 424.663 | 4.27% |
+| 4 | 8.375 | 583.905 | 566.618 | 2.96% |
+| 8 | 16.750 | 1153.840 | 1141.088 | 1.11% |
+
+Every pass is retained, including the higher three-expert serial measurement;
+no outlier is removed. These are module results on RX 7900 XTX/5600X, not
+confirmed inference improvements. A 6144 KiB model screen would target the
+one/two-expert cohorts and preserve parallelism above that limit; it has not
+been run and is not a selected production parameter. The user requested a
+new stable timeline at this checkpoint, so full-model A/B remains pending and
+the candidate stays default-off/uncommitted. The new chart uses the already
+validated recovery-frontend binary, not this candidate.
+
+Test caches remain under the shared repository `test-kv-cache/`; the pre-test
+aggregate is 18,599,738,192 bytes. No production service, executable or cache
+has been touched. Raw module data: `stage4-mapped-copy-module.log` and generated
+`stage4-mapped-copy-summary.json` in the campaign artifact directory.
+
+### Fresh stable evening GPU timeline, 2026-10-11 21:20-21:23 +08:00
+
+Following the user's checkpoint request, capture a new ordinary two-slot /
+one-active 30K/150K timeline using the validated frozen recovery-frontend
+binary from `86898f496` (SHA256 `da96c58535169d00c2d402d8bdcab1b8e12175f3b66d54c0a63340cd07025666`).
+The current mapped-copy/inline-I/O/owned/full-graph trials are not included.
+An unrelated three-slot VRAM pressure service was detected; the user explicitly
+authorized stopping it, its executable/port identity was checked, and process
+exit was confirmed before the capture. This was not the production service.
+
+Tag: `stage4-stable-current-gpu-trace-night`. Four 384-token requests (two
+regenerated rounds per depth) match the same-cache ordinary whole-output golden;
+no cold exclusions or failures. Twelve consecutive forwards from each second
+round are plotted, with host stage/pager instrumentation off. Both cases have
+all 47 resident-layer journals plus actual ordinary L0 GPU evidence; every
+recorded DMA signal is carried into its corresponding resume dependency.
+
+| Context | Mean forward ms | P50 ms | Main envelope mean ms | Front mean ms | L0/L1 mean ms | Tail mean ms | Hit-to-miss gaps sum mean ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 30K | 21.313 | 20.660 | 15.461 | 0.611 | 1.081 | 0.364 | 2.721 |
+| 150K | 21.892 | 21.223 | 16.304 | 0.654 | 1.054 | 0.358 | 2.702 |
+
+Miss counts are 156/157 across twelve forwards; 105/126 have DMA evidence.
+Max reported clock-calibration deviation is 19 ns in both cases. Means retain
+all samples, including slower outer-boundary observations; no performance
+outlier is removed. Main envelopes include barriers/waits; DMA overlaps other
+tracks, so these columns are not disjoint components to add. This short
+profiled capture is not a new sustained-throughput gain or >=50 tok/s claim.
+
+Standalone artifact:
+`D:\AIinfr\infr\benchmark-data\artifacts\decode-timeline-20261011-gpu-stable-night\timeline.html`.
+Raw logs/traces, analysis, frozen build record, correctness results and source
+patches accompany it; no KV payloads are copied. Seven analyzer tests pass;
+desktop 1440/mobile 390 browser checks verify two contexts, twelve samples,
+six nonblank measured tracks, boundary rows, drag/wheel zoom and no page
+overflow. Both test services have stopped; production executable/cache remain
+untouched. Shared test-cache aggregate ends at 19,533,032,628 bytes, below 30 GiB.
