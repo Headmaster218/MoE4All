@@ -7,6 +7,7 @@ use std::sync::{Mutex, OnceLock};
 use serde::Serialize;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+static DEVICE_TIMESTAMPS: AtomicBool = AtomicBool::new(false);
 static NEXT_STEP: AtomicU64 = AtomicU64::new(0);
 static NEXT_SUBMIT: AtomicU64 = AtomicU64::new(1);
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
@@ -146,6 +147,7 @@ pub fn configure(cfg: &crate::config::ProfCfg) -> Result<(), String> {
             dropped: 0,
         }))
         .map_err(|_| "timeline already configured".to_string())?;
+    DEVICE_TIMESTAMPS.store(wants_device_timestamps(cfg), Ordering::Relaxed);
     ENABLED.store(true, Ordering::Release);
     Ok(())
 }
@@ -153,6 +155,15 @@ pub fn configure(cfg: &crate::config::ProfCfg) -> Result<(), String> {
 #[inline]
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
+}
+
+fn wants_device_timestamps(cfg: &crate::config::ProfCfg) -> bool {
+    cfg.timeline_path.is_some() && !cfg.timeline_cpu_only
+}
+
+#[inline]
+pub fn device_enabled() -> bool {
+    ENABLED.load(Ordering::Acquire) && DEVICE_TIMESTAMPS.load(Ordering::Relaxed)
 }
 
 #[inline]
@@ -378,6 +389,7 @@ pub fn flush() -> std::io::Result<()> {
     let document = serde_json::json!({"traceEvents":trace,"displayTimeUnit":"ms",
         "origin_ns":origin,"steps":state.steps,"host_events":state.events,"device_events":state.device,
         "clock_samples":state.clocks,"dropped_events":state.dropped,
+        "device_timestamps":DEVICE_TIMESTAMPS.load(Ordering::Relaxed),
         "gpu_interval_semantics":"TOP/BOTTOM queue envelope; includes dependencies and stalls, not ALU busy time"});
     if let Some(parent) = state.path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
@@ -413,6 +425,19 @@ fn map_tick(tick: u64, bits: u32, sample: ClockSample) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cpu_only_tracing_never_requests_device_queries() {
+        for path in [None, Some(PathBuf::from("unused.json"))] {
+            for cpu_only in [false, true] {
+                let cfg = crate::config::ProfCfg {
+                    timeline_path: path.clone(),
+                    timeline_cpu_only: cpu_only,
+                    ..Default::default()
+                };
+                assert_eq!(wants_device_timestamps(&cfg), path.is_some() && !cpu_only);
+            }
+        }
+    }
     #[test]
     fn windows_are_bounded_and_skip_warmup() {
         let ids = (0..100)

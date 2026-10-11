@@ -38,6 +38,7 @@ const runGit = args => {
 };
 const sourceFiles = [
   'crates/infr-core/src/config/mod.rs', 'crates/infr-vulkan/build.rs',
+  'crates/infr-core/src/timeline.rs', 'crates/infr-vulkan/src/timeline.rs',
   'crates/infr-vulkan/src/adapter.rs', 'crates/infr-vulkan/src/gemm.rs',
   'crates/infr-vulkan/src/lib.rs', 'crates/infr-vulkan/src/pager.rs',
   'crates/infr-vulkan/src/recorder.rs', 'crates/infr-vulkan/shaders/gpu_resident_check.comp',

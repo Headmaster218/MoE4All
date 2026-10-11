@@ -698,3 +698,48 @@ do not report the best round as its mean or claim 50 tok/s. Spare-slot allocatio
 does not explain the remaining target gap in this sample. This is distinct from
 the two-configured-slot matrix, not a replacement for it. Cache bytes remain
 20,916,434,288. The authorized temporary 100 GiB limit was never used.
+
+## CPU-only timing diagnostic
+
+`stage4-cpu-only-diagnostic` uses `infr-cpu-only-timeline.exe`, SHA256
+`b6384b9f966a087d50e1a6454d15162dd85e539e247de72524a01ca10dfd92a0`,
+two configured slots, one active, 30K, 384 generated tokens and three rounds.
+The new default-off `prof.timeline_cpu_only` disables timeline device queries
+and calibrated-clock probing, not the engine's ordinary submit tuner. Each trace
+contains 12 forwards at exactly positions 30103 through 30114, with zero device
+events/clock samples and `device_timestamps=false`. This avoids extra timeline
+GPU commands but CPU span instrumentation still costs time. Do not use these
+profiled rates as an unprofiled throughput result.
+
+| Main-thread span per sampled forward | Ordinary ms | Resident ms |
+| --- | ---: | ---: |
+| backend_execute (both main and output head) | 22.1590 | 20.0260 |
+| backend_setup | 0.4760 | 0.3904 |
+| command_encode | 1.6992 | 2.8253 |
+| queue_submit | 2.3075 | 1.4801 |
+| recorder_acquire | 0.2652 | 0.2555 |
+| gpu_resident_lut_freeze | 0 | 0.3505 |
+| gpu_resident_notice_producer_wait | 0 | 1.0473 |
+| fence_wait | 0.1012 | 4.1625 |
+| queue_idle_wait | 13.2873 | 0.7131 |
+
+Spans are nested: this table is not a disjoint partition and must not be summed.
+Blocking waits are not CPU execution. The notice producer runs without the main
+thread's timeline context; its own prepare/upload costs are absent, so reduced
+main-thread expert_prepare does not mean all preparation work disappeared.
+Without device events these spans do not establish the GPU critical path.
+
+Resident averages 216.5 LUT freeze calls (three per encoded MoE layer), implying
+72.17 encoded layers versus 48 executed model layers. Speculative recording after
+a miss is a concrete candidate for reduction. Main queue_submit calls average
+89.25 versus ordinary 111.33; recorder_acquire averages 102.42 versus 111.33.
+The 0.35 ms aggregate LUT freeze and 0.39 ms setup do not justify assuming either
+is the dominant remaining bottleneck. First screen the existing inflight bound
+one against two, with profiling disabled, before changing ownership or replay.
+
+`stage4-inflight-screen` subsequently completed using the same B638 binary with
+profiling disabled. Ordinary warm mean is 42.7422 tok/s; inflight two is 43.7357,
+inflight one 44.8735 (+2.6% versus two). All six candidate batches match ordinary
+cache state and output; all services exited normally. This is a small screening
+result, not proof of 50 tok/s or of improved dual-active/150K behavior. Final cache
+usage is 20,466,326,552 bytes; the 100 GiB exception remains unused.

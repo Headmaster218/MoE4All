@@ -97,6 +97,9 @@ impl Query {
         queue: &'static str,
         bits: u32,
     ) -> crate::Result<Option<Self>> {
+        if !timeline::device_enabled() {
+            return Ok(None);
+        }
         let Some(ctx) = timeline::context() else {
             return Ok(None);
         };

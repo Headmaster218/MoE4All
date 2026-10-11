@@ -3870,7 +3870,7 @@ impl VulkanBackend {
             ext_ptrs.push(c"VK_EXT_conditional_rendering".as_ptr());
         }
         let has_timeline_clock =
-            infr_core::timeline::enabled() && has_ext(c"VK_EXT_calibrated_timestamps");
+            infr_core::timeline::device_enabled() && has_ext(c"VK_EXT_calibrated_timestamps");
         if has_timeline_clock {
             ext_ptrs.push(c"VK_EXT_calibrated_timestamps".as_ptr());
         }

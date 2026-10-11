@@ -132,7 +132,7 @@ async function run(count, depth) {
   for (const entry of JSON.parse(process.env.TRACE_EXTRA_SETS || '[]')) nativeArgs.push('--set', entry);
   if (traceEnabled) nativeArgs.push('--set', `prof.timeline_path=${trace}`, '--set', `prof.timeline_lanes=${count}`,
     '--set', `prof.timeline_skip_steps=${process.env.TRACE_SKIP || 64}`, '--set', `prof.timeline_steps=${process.env.TRACE_STEPS || 16}`,
-    '--set', `prof.timeline_stride=${process.env.TRACE_STRIDE || 128}`, '--set', 'prof.timeline_windows=12');
+    '--set', `prof.timeline_stride=${process.env.TRACE_STRIDE || 128}`, '--set', `prof.timeline_windows=${process.env.TRACE_WINDOWS || 12}`);
   const stdout = fs.createWriteStream(path.join(dir, 'stdout.log'));
   const stderr = fs.createWriteStream(path.join(dir, 'stderr.log'));
   const logsFinished = Promise.all([finished(stdout), finished(stderr)]);

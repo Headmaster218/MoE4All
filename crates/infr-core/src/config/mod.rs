@@ -842,6 +842,8 @@ cfg_struct! {
         pager_profile: bool = false,
         /// Bounded asynchronous Decode trace; independent of the blocking per-op profiler.
         timeline_path: Option<PathBuf> = None,
+        /// Capture host spans without Vulkan timestamp queries or clock calibration.
+        timeline_cpu_only: bool = false,
         /// Optional one-shot CPU-miss weight/input fixture for local kernel diagnostics.
         cpu_miss_fixture_dir: Option<PathBuf> = None,
         timeline_skip_steps: usize = 64,
