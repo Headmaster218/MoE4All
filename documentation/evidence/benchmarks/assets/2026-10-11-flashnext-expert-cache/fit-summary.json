@@ -1,0 +1,436 @@
+{
+  "absoluteTolerancePercentagePoints": 0.05,
+  "relativeTolerancePercent": 1,
+  "intervalGiB": [
+    4,
+    48
+  ],
+  "formula": "missPercent = amplitudePercent * exp(-decayPerGiB * (capacityGiB-lowGiB))",
+  "scope": "Continuous endpoint interpolation; tolerances are checked only at the recorded 0.1 GiB samples.",
+  "metrics": {
+    "samples": 441,
+    "rSquared": 0.9999993402965556,
+    "rmsErrorPercentagePoints": 0.009417185396387683,
+    "maxErrorPercentagePoints": 0.03934211540349963,
+    "maxRelativeErrorPercent": 0.9222078424601056
+  },
+  "segments": [
+    {
+      "lowGiB": 4,
+      "highGiB": 5,
+      "amplitudePercent": 46.505459547760296,
+      "decayPerGiB": 0.12394482506449685,
+      "metrics": {
+        "samples": 11,
+        "rSquared": 0.9998904058275558,
+        "rmsErrorPercentagePoints": 0.01789615510230627,
+        "maxErrorPercentagePoints": 0.03934211540349963,
+        "maxRelativeErrorPercent": 0.08897570420219442
+      }
+    },
+    {
+      "lowGiB": 5,
+      "highGiB": 6.3,
+      "amplitudePercent": 41.0842522139111,
+      "decayPerGiB": 0.11689042074418468,
+      "metrics": {
+        "samples": 14,
+        "rSquared": 0.999909814630313,
+        "rmsErrorPercentagePoints": 0.01704988400004093,
+        "maxErrorPercentagePoints": 0.031457968063456576,
+        "maxRelativeErrorPercent": 0.07936504763720573
+      }
+    },
+    {
+      "lowGiB": 6.3,
+      "highGiB": 7,
+      "amplitudePercent": 35.29238941191643,
+      "decayPerGiB": 0.12321872166785557,
+      "metrics": {
+        "samples": 8,
+        "rSquared": 0.9997082748312921,
+        "rmsErrorPercentagePoints": 0.016320044954094032,
+        "maxErrorPercentagePoints": 0.0343966201020649,
+        "maxRelativeErrorPercent": 0.1022811407150709
+      }
+    },
+    {
+      "lowGiB": 7,
+      "highGiB": 8.7,
+      "amplitudePercent": 32.37589738629524,
+      "decayPerGiB": 0.1194332118848474,
+      "metrics": {
+        "samples": 18,
+        "rSquared": 0.9999833159163863,
+        "rmsErrorPercentagePoints": 0.007411743351055169,
+        "maxErrorPercentagePoints": 0.017189212840435175,
+        "maxRelativeErrorPercent": 0.057069420656493175
+      }
+    },
+    {
+      "lowGiB": 8.7,
+      "highGiB": 9.1,
+      "amplitudePercent": 26.42677703980741,
+      "decayPerGiB": 0.10677794773620354,
+      "metrics": {
+        "samples": 5,
+        "rSquared": 0.9994886798182429,
+        "rmsErrorPercentagePoints": 0.008855029821277387,
+        "maxErrorPercentagePoints": 0.016502061294204395,
+        "maxRelativeErrorPercent": 0.06383307192066118
+      }
+    },
+    {
+      "lowGiB": 9.1,
+      "highGiB": 10.9,
+      "amplitudePercent": 25.32182314504342,
+      "decayPerGiB": 0.10020229399919514,
+      "metrics": {
+        "samples": 19,
+        "rSquared": 0.9996444025002872,
+        "rmsErrorPercentagePoints": 0.02385507538782409,
+        "maxErrorPercentagePoints": 0.039174496495974154,
+        "maxRelativeErrorPercent": 0.17592042311136544
+      }
+    },
+    {
+      "lowGiB": 10.9,
+      "highGiB": 12.1,
+      "amplitudePercent": 21.142864435560142,
+      "decayPerGiB": 0.11937139480135237,
+      "metrics": {
+        "samples": 13,
+        "rSquared": 0.9998970251114587,
+        "rmsErrorPercentagePoints": 0.008980403086053603,
+        "maxErrorPercentagePoints": 0.01753580712203373,
+        "maxRelativeErrorPercent": 0.08487145622400766
+      }
+    },
+    {
+      "lowGiB": 12.1,
+      "highGiB": 14.2,
+      "amplitudePercent": 18.3211621958559,
+      "decayPerGiB": 0.10774308810651814,
+      "metrics": {
+        "samples": 22,
+        "rSquared": 0.9998405964788771,
+        "rmsErrorPercentagePoints": 0.014126364703153189,
+        "maxErrorPercentagePoints": 0.02411217826346501,
+        "maxRelativeErrorPercent": 0.13723463722104134
+      }
+    },
+    {
+      "lowGiB": 14.2,
+      "highGiB": 16.6,
+      "amplitudePercent": 14.611316202390165,
+      "decayPerGiB": 0.11066899671669285,
+      "metrics": {
+        "samples": 25,
+        "rSquared": 0.9999620903105094,
+        "rmsErrorPercentagePoints": 0.006321013850374932,
+        "maxErrorPercentagePoints": 0.01155464082650326,
+        "maxRelativeErrorPercent": 0.0884125356894256
+      }
+    },
+    {
+      "lowGiB": 16.6,
+      "highGiB": 18.3,
+      "amplitudePercent": 11.203102162324821,
+      "decayPerGiB": 0.11328762231622937,
+      "metrics": {
+        "samples": 18,
+        "rSquared": 0.9999409046850166,
+        "rmsErrorPercentagePoints": 0.004600441901431517,
+        "maxErrorPercentagePoints": 0.010442854228557508,
+        "maxRelativeErrorPercent": 0.10332599523971027
+      }
+    },
+    {
+      "lowGiB": 18.3,
+      "highGiB": 19.3,
+      "amplitudePercent": 9.240553262832087,
+      "decayPerGiB": 0.12419847829679333,
+      "metrics": {
+        "samples": 11,
+        "rSquared": 0.9999601469378089,
+        "rmsErrorPercentagePoints": 0.0021547491835270664,
+        "maxErrorPercentagePoints": 0.004059478869802291,
+        "maxRelativeErrorPercent": 0.047352306555913666
+      }
+    },
+    {
+      "lowGiB": 19.3,
+      "highGiB": 19.9,
+      "amplitudePercent": 8.161298469607084,
+      "decayPerGiB": 0.12950724243760572,
+      "metrics": {
+        "samples": 7,
+        "rSquared": 0.9997615528292187,
+        "rmsErrorPercentagePoints": 0.0031245086503251408,
+        "maxErrorPercentagePoints": 0.006160815159613975,
+        "maxRelativeErrorPercent": 0.0784172317692236
+      }
+    },
+    {
+      "lowGiB": 19.9,
+      "highGiB": 20.2,
+      "amplitudePercent": 7.551142958473046,
+      "decayPerGiB": 0.1732459391088323,
+      "metrics": {
+        "samples": 4,
+        "rSquared": 0.996195283596129,
+        "rmsErrorPercentagePoints": 0.008842687886993604,
+        "maxErrorPercentagePoints": 0.015344212281009462,
+        "maxRelativeErrorPercent": 0.2063283394646683
+      }
+    },
+    {
+      "lowGiB": 20.2,
+      "highGiB": 20.8,
+      "amplitudePercent": 7.168705936720832,
+      "decayPerGiB": 0.25439661769133104,
+      "metrics": {
+        "samples": 7,
+        "rSquared": 0.996196482493595,
+        "rmsErrorPercentagePoints": 0.021220308870290437,
+        "maxErrorPercentagePoints": 0.03425745308019934,
+        "maxRelativeErrorPercent": 0.48779680575796963
+      }
+    },
+    {
+      "lowGiB": 20.8,
+      "highGiB": 21.2,
+      "amplitudePercent": 6.153907123205228,
+      "decayPerGiB": 0.2167907994282297,
+      "metrics": {
+        "samples": 5,
+        "rSquared": 0.9930463728924869,
+        "rmsErrorPercentagePoints": 0.015296004434127094,
+        "maxErrorPercentagePoints": 0.023663027197854625,
+        "maxRelativeErrorPercent": 0.4120505668707573
+      }
+    },
+    {
+      "lowGiB": 21.2,
+      "highGiB": 23.1,
+      "amplitudePercent": 5.642746217006276,
+      "decayPerGiB": 0.1269099702101098,
+      "metrics": {
+        "samples": 20,
+        "rSquared": 0.999515089870371,
+        "rmsErrorPercentagePoints": 0.007943538871221848,
+        "maxErrorPercentagePoints": 0.017918028026424615,
+        "maxRelativeErrorPercent": 0.3267681925057343
+      }
+    },
+    {
+      "lowGiB": 23.1,
+      "highGiB": 24.8,
+      "amplitudePercent": 4.433733126988222,
+      "decayPerGiB": 0.15090331114250952,
+      "metrics": {
+        "samples": 18,
+        "rSquared": 0.9994498572721411,
+        "rmsErrorPercentagePoints": 0.007251615951388867,
+        "maxErrorPercentagePoints": 0.016186759827541586,
+        "maxRelativeErrorPercent": 0.4328688811257783
+      }
+    },
+    {
+      "lowGiB": 24.8,
+      "highGiB": 27.2,
+      "amplitudePercent": 3.430500924254148,
+      "decayPerGiB": 0.15862579752089806,
+      "metrics": {
+        "samples": 25,
+        "rSquared": 0.9999329302017463,
+        "rmsErrorPercentagePoints": 0.0026599143562986674,
+        "maxErrorPercentagePoints": 0.005288079238755294,
+        "maxRelativeErrorPercent": 0.16982887412684314
+      }
+    },
+    {
+      "lowGiB": 27.2,
+      "highGiB": 34.6,
+      "amplitudePercent": 2.3443410927693233,
+      "decayPerGiB": 0.16450422216193514,
+      "metrics": {
+        "samples": 75,
+        "rSquared": 0.9998136313388378,
+        "rmsErrorPercentagePoints": 0.006500290050161548,
+        "maxErrorPercentagePoints": 0.014496605522247075,
+        "maxRelativeErrorPercent": 0.9222078424601056
+      }
+    },
+    {
+      "lowGiB": 34.6,
+      "highGiB": 36.5,
+      "amplitudePercent": 0.6939697790387757,
+      "decayPerGiB": 0.17098661462305134,
+      "metrics": {
+        "samples": 20,
+        "rSquared": 0.9997982844101937,
+        "rmsErrorPercentagePoints": 0.0008232818884934528,
+        "maxErrorPercentagePoints": 0.0013582595044273615,
+        "maxRelativeErrorPercent": 0.22861023575071795
+      }
+    },
+    {
+      "lowGiB": 36.5,
+      "highGiB": 39.6,
+      "amplitudePercent": 0.5014750451379932,
+      "decayPerGiB": 0.1885887834034766,
+      "metrics": {
+        "samples": 32,
+        "rSquared": 0.9997404598222283,
+        "rmsErrorPercentagePoints": 0.0010715423386662712,
+        "maxErrorPercentagePoints": 0.0021212959136583387,
+        "maxRelativeErrorPercent": 0.6696033997933376
+      }
+    },
+    {
+      "lowGiB": 39.6,
+      "highGiB": 43.7,
+      "amplitudePercent": 0.27947940847734504,
+      "decayPerGiB": 0.17250789652012477,
+      "metrics": {
+        "samples": 42,
+        "rSquared": 0.9998024463679055,
+        "rmsErrorPercentagePoints": 0.000585028568979369,
+        "maxErrorPercentagePoints": 0.0009491386787635614,
+        "maxRelativeErrorPercent": 0.6068226799387916
+      }
+    },
+    {
+      "lowGiB": 43.7,
+      "highGiB": 44.8,
+      "amplitudePercent": 0.137778350958645,
+      "decayPerGiB": 0.1565045482227538,
+      "metrics": {
+        "samples": 12,
+        "rSquared": 0.9986421500164516,
+        "rmsErrorPercentagePoints": 0.00025621144899907187,
+        "maxErrorPercentagePoints": 0.0004756111656705475,
+        "maxRelativeErrorPercent": 0.36049011500509603
+      }
+    },
+    {
+      "lowGiB": 44.8,
+      "highGiB": 45.5,
+      "amplitudePercent": 0.11598852205313387,
+      "decayPerGiB": 0.13417327241738633,
+      "metrics": {
+        "samples": 8,
+        "rSquared": 0.9992354740511497,
+        "rmsErrorPercentagePoints": 0.0000941654918875656,
+        "maxErrorPercentagePoints": 0.00022615142328431814,
+        "maxRelativeErrorPercent": 0.20615172798196654
+      }
+    },
+    {
+      "lowGiB": 45.5,
+      "highGiB": 45.9,
+      "amplitudePercent": 0.10559066288367293,
+      "decayPerGiB": 0.0877169400483484,
+      "metrics": {
+        "samples": 5,
+        "rSquared": 0.9933865018209944,
+        "rmsErrorPercentagePoints": 0.00010617636355543308,
+        "maxErrorPercentagePoints": 0.00017277641769485041,
+        "maxRelativeErrorPercent": 0.168274239054512
+      }
+    },
+    {
+      "lowGiB": 45.9,
+      "highGiB": 46.5,
+      "amplitudePercent": 0.10195006878170407,
+      "decayPerGiB": 0.0261182857135191,
+      "metrics": {
+        "samples": 7,
+        "rSquared": 0.9378523460358883,
+        "rmsErrorPercentagePoints": 0.000135338699994502,
+        "maxErrorPercentagePoints": 0.0002118376315722731,
+        "maxRelativeErrorPercent": 0.20985965336744067
+      }
+    },
+    {
+      "lowGiB": 46.5,
+      "highGiB": 48,
+      "amplitudePercent": 0.10036486544579143,
+      "decayPerGiB": 0,
+      "metrics": {
+        "samples": 16,
+        "rSquared": 1,
+        "rmsErrorPercentagePoints": 0,
+        "maxErrorPercentagePoints": 0,
+        "maxRelativeErrorPercent": 0
+      }
+    }
+  ],
+  "singleExponential": [
+    {
+      "referenceGiB": 15.50828957945101,
+      "amplitudePercent": 10.720622170664914,
+      "decayPerGiB": 0.13449813599582114,
+      "intervalGiB": [
+        0.5,
+        48
+      ],
+      "metrics": {
+        "samples": 476,
+        "rSquared": 0.9804734720166981,
+        "rmsErrorPercentagePoints": 2.640452139066675,
+        "maxErrorPercentagePoints": 23.525533736039222,
+        "maxRelativeErrorPercent": 80.16127410272074
+      }
+    },
+    {
+      "referenceGiB": 15.50828957945101,
+      "amplitudePercent": 11.960855211321176,
+      "decayPerGiB": 0.11815385522831137,
+      "intervalGiB": [
+        4,
+        48
+      ],
+      "metrics": {
+        "samples": 441,
+        "rSquared": 0.9981901009988148,
+        "rmsErrorPercentagePoints": 0.49325774692392915,
+        "maxErrorPercentagePoints": 0.7000576863535655,
+        "maxRelativeErrorPercent": 227.4575924929807
+      }
+    },
+    {
+      "referenceGiB": 15.50828957945101,
+      "amplitudePercent": 12.622897867196457,
+      "decayPerGiB": 0.109759339421355,
+      "intervalGiB": [
+        12,
+        18
+      ],
+      "metrics": {
+        "samples": 61,
+        "rSquared": 0.9999103499494947,
+        "rmsErrorPercentagePoints": 0.0248083095825907,
+        "maxErrorPercentagePoints": 0.04407782089504941,
+        "maxRelativeErrorPercent": 0.4611409561743053
+      }
+    },
+    {
+      "referenceGiB": 15.50828957945101,
+      "amplitudePercent": 15.783049205115168,
+      "decayPerGiB": 0.16402901142659915,
+      "intervalGiB": [
+        24,
+        48
+      ],
+      "metrics": {
+        "samples": 241,
+        "rSquared": 0.9997524847909167,
+        "rmsErrorPercentagePoints": 0.015893713017437014,
+        "maxErrorPercentagePoints": 0.05952943000797539,
+        "maxRelativeErrorPercent": 23.791984009230468
+      }
+    }
+  ]
+}

@@ -248,6 +248,9 @@ reassigned when execution switches between prefill and decode.
 Implementation details are in the [documentation index](documentation/README.md);
 historical optimization decisions are in the [change records](documentation/evidence/changes/README.md).
 
+How much VRAM should the expert cache retain? See [FlashNext expert-cache capacity and miss rate](documentation/evidence/benchmarks/2026-10-11-flashnext-expert-cache-capacity.md)
+for a 0.5-48 GiB offline replay of real accesses, a continuous piecewise exponential approximation, and its limitations (Chinese documentation).
+
 ## Project and attribution
 
 MoE4All is maintained by John / [Headmaster218](https://github.com/Headmaster218).
