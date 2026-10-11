@@ -1016,3 +1016,56 @@ and skipped FFN. Pointer drag/wheel zoom, desktop 1440/mobile 390 canvas pixels
 and no-page-overflow checks pass. Four analyzer tests now additionally cover
 the 47-layer PLE split and missing L0 evidence. This capture does not establish
 the >=50 tok/s goal; resident execution remains opt-in.
+
+### GPU forward-boundary audit (same capture, no additional GPU run)
+
+The user additionally identified the three boundary regions: before the first
+GPU work, the L0/L1 split, and after the last GPU work. Analyze all 12 forwards
+per depth from the same GPU-only capture, not the selected image alone:
+
+| Boundary, mean ms / forward | 30K | 150K |
+|---|---:|---:|
+| Forward start to first main queue GPU start | 0.584 | 0.597 |
+| Independent L0 graph end to first L1 tail submission GPU start | 1.052 | 0.978 |
+| Last main queue GPU end to forward end | 0.346 | 0.400 |
+| Sum of the three disjoint boundary regions | 1.982 | 1.975 |
+
+These sums are about 8.9% / 8.7% of the profiled forward wall time. Miss
+hit-to-resume gaps total 3.623 / 3.666 ms per forward, so recovery handoff
+remains first priority; the L0/L1 split is the next largest boundary. None of
+these numbers establishes how much unprofiled throughput can be recovered.
+The front/tail gaps include driver scheduling and profiler work as well as
+ordinary host preparation/retirement. The last main GPU boundary includes the
+output head and GPU sampler, not merely the last transformer layer.
+
+The L0/L1 number uses the actual queue envelope containing L1's router/hit
+marker and the last completed independent L0 submission before it. It is not
+the distance to L1's router, which also includes L1 preparation/attention work.
+An unsplit graph has no such split-gap measurement. Missing envelopes or GPU
+intervals outside the forward clock are rejected rather than estimated.
+
+Existing CPU+GPU trace `stage4-new-timeline` corroborates the mechanism, without
+rerunning CPU tracing: across its 12 resident forwards, mean PLE ticket waits
+are 0.000917 ms / 0.001250 ms (30K/150K); L1 `backend_setup` is 0.422 / 0.430
+ms and `step_tail` is 0.134 / 0.150 ms. This is a different profiling capture,
+so these are not subtractions from the GPU-only table. Source confirms:
+
+- `seam/runner.rs` builds/compiles/executes the separate L0 graph, consumes the
+  PLE ticket and uploads rows, then builds/compiles/binds the L1..47 graph.
+- `ResidentChunk::new()` excludes graphs with only one `MoeFfn`, so ordinary
+  L0 still uses CPU router/readback even when all selected experts hit.
+- The tail separately recomputes scratch layout, fusion plan and paging scan,
+  freezes residency, encodes its first chunk and submits it.
+
+Next candidates are early miss submission with old readers retained; then
+removing repeated tail setup or combining L0/tail when PLE readiness permits.
+Moving setup to the front without overlap is not itself a throughput gain.
+For the outer boundaries, separate invariant graph/planning work from genuine
+position-dependent work and unnecessary final drains from required sampling,
+output delivery and resource lifetime. Do not remove these guarantees solely
+because a region is blank in the GPU chart.
+
+The existing GPU-only HTML now includes a three-row per-sample/mean/P50 boundary
+table with these limitations. The six measured tracks, drag and wheel behavior
+are preserved; six analyzer tests and desktop/mobile browser checks pass. No
+GPU service was launched for this boundary audit.

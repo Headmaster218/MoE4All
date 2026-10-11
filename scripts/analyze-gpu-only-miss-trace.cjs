@@ -8,6 +8,28 @@ const output = path.resolve(process.env.TRACE_ANALYSIS_ROOT || input);
 const prefix = process.argv[3] || 'stage4-gpu-only-miss-trace';
 const popcount = n => { let count = 0; for (; n; n &= n - 1) count++; return count; };
 const ms = n => n / 1e6;
+function gpuBoundaries(gpu, step, firstResidentLayer) {
+  const envelopes = gpu.filter(e => e.name === 'queue_envelope' && e.queue === 'main')
+    .sort((a, b) => a.start - b.start);
+  if (!envelopes.length) throw new Error('GPU boundary analysis requires main queue envelopes');
+  const first = envelopes[0], last = envelopes.reduce((a, b) => a.end > b.end ? a : b);
+  if (first.start < step.start_ns || last.end > step.end_ns) throw new Error('GPU envelopes outside the forward clock');
+  let l0ToL1GapMs = null, l0EndMs = null, l1StartMs = null;
+  if (firstResidentLayer === 1) {
+    const hit = gpu.find(e => e.context.layer === 1 &&
+      (e.name === 'resident_hit_FFN' || e.name === 'resident_full_hit_FFN'));
+    const l1 = envelopes.find(e => e.submit === hit?.submit);
+    const l0 = l1 && envelopes.filter(e => e.submit !== l1.submit && e.end <= l1.start)
+      .reduce((a, b) => !a || b.end > a.end ? b : a, null);
+    if (!l0 || !l1) throw new Error('Missing PLE split queue boundary');
+    l0EndMs = ms(l0.end - step.start_ns);
+    l1StartMs = ms(l1.start - step.start_ns);
+    l0ToL1GapMs = ms(l1.start - l0.end);
+  }
+  return { frontMs: ms(first.start - step.start_ns), tailMs: ms(step.end_ns - last.end),
+    firstGpuMs: ms(first.start - step.start_ns), lastGpuMs: ms(last.end - step.start_ns),
+    l0EndMs, l1StartMs, l0ToL1GapMs };
+}
 function analyze(dir) {
   const trace = JSON.parse(fs.readFileSync(path.join(dir, 'trace.json')));
   const result = JSON.parse(fs.readFileSync(path.join(dir, 'result.json')));
@@ -89,6 +111,7 @@ function analyze(dir) {
     return { id: step.id, positions: step.positions, wallMs: ms(step.end_ns - step.start_ns),
       mainMs: ms(length(main)), dmaMs: ms(length(dmaIntervals)),
       dmaOverlapMainMs: ms(length(intersection(main, dmaIntervals))), misses,
+      boundaries: gpuBoundaries(gpu, step, firstResidentLayer),
       rows: [envelopes.map(view), gpu.filter(e => e.name !== 'queue_envelope' && e.queue === 'main' && !e.name.startsWith('resident_hit') && e.name !== 'resident_full_hit_FFN' && e.name !== 'resident_miss_resume_FFN').map(view),
         actual.map(view), gpu.filter(e => e.name === 'resident_miss_resume_FFN').map(view), dma.map(view), skipped.map(view)],
       skippedCount: skipped.length };
@@ -99,6 +122,8 @@ function analyze(dir) {
     wall: stats(points.map(p => p.wallMs)), main: stats(points.map(p => p.mainMs)), dma: stats(points.map(p => p.dmaMs)),
     missCount: missList.length, dmaMissCount: missList.filter(m => m.transfers.length).length,
     missMetrics: Object.fromEntries(metrics.map(k => [k, stats(missList.map(m => m[k]).filter(v => v !== null))])),
+    boundaryMetrics: Object.fromEntries(['frontMs', 'l0ToL1GapMs', 'tailMs'].map(k =>
+      [k, stats(points.map(p => p.boundaries[k]).filter(v => v !== null))])),
     sumsPerStep: Object.fromEntries(metrics.map(k => [k, stats(points.map(p => p.misses.reduce((sum, m) => sum + (m[k] || 0), 0)))])),
     maxClockDeviationNs: Math.max(...trace.clock_samples.map(c => c.deviation_ns)) };
 }
@@ -130,5 +155,5 @@ function main() {
   fs.writeFileSync(path.join(output, 'timeline.html'), html);
   console.log(JSON.stringify(cases.map(({ points, ...summary }) => summary), null, 2));
 }
-module.exports = { analyze };
+module.exports = { analyze, gpuBoundaries };
 if (require.main === module) main();

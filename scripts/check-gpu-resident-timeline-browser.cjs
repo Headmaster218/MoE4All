@@ -36,11 +36,13 @@ async function checkGpuOnly(name, width, height) {
     width: innerWidth, documentWidth: document.documentElement.scrollWidth,
     cases: api.getCases().length, steps: document.getElementById('step').options.length,
     rows: api.getRows().length, misses: document.getElementById('misses').rows.length,
+    boundaries: document.getElementById('boundaries').rows.length,
     canvasWidth: document.getElementById('timeline').clientWidth
   }))`);
   assert.equal(metrics.width, width);
   assert.ok(metrics.documentWidth <= width, 'GPU-only page overflow');
   assert.equal(metrics.cases, 2); assert.equal(metrics.steps, 12); assert.equal(metrics.rows, 6);
+  assert.equal(metrics.boundaries, 3);
   assert.ok(metrics.misses > 0 && metrics.canvasWidth > 200);
   const colored = await evaluate(`(() => {
     const c = document.getElementById('timeline'), p = c.getContext('2d').getImageData(0,0,c.width,c.height).data;

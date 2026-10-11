@@ -13,6 +13,8 @@ body{font:14px system-ui;margin:24px;color:#20252c;background:white}h1{font-size
 <p>L0 为 PLE 重叠而独立执行普通图，GPU 时间仍在主队列 / stages 轨中；条件续跑与 hit/miss 分类统计对应 L1–L47，不把 L0 的普通 MoE 片段强行解释成 GPU journal 命中分类。</p>
 <div class="wrap"><table><thead><tr><th>上下文</th><th>样本</th><th>Step P50 ms</th><th>主队列均值 ms</th><th>Miss / step</th><th>DMA / step ms</th><th>Hit→Miss gap / step ms</th><th>DMA 已完成后 gap / step ms</th></tr></thead><tbody id="summary"></tbody></table></div>
 <label>工况<select id="case"></select></label><label>样本<select id="step"></select></label><button id="reset" aria-label="恢复完整范围" title="恢复完整范围">↺</button>
+<div class="wrap"><table><thead><tr><th>边界</th><th>当前样本 ms</th><th>12 前向均值 ms</th><th>P50 ms</th></tr></thead><tbody id="boundaries"></tbody></table></div>
+<p>边界均由校准 GPU queue envelope 与前向起止墙钟计算：前段含首个提交前的准备与驱动启动；中段是独立 L0 图末尾至 L1 尾图首个 GPU 提交开始，不含 L1 自身计算；后段从最后主队列 GPU 工作（包含输出头 / GPU 采样）结束计至前向结束。空档包含 CPU、驱动与 profiler 收尾等未分解部分，不能据此断言是某个 CPU 操作或全部可消除。</p>
 <div id="detail"></div><div id="hover"></div>
 <div class="legend"><span style="border-color:#315f93">主队列</span><span style="border-color:#37a173">全 hit FFN</span><span style="border-color:#bb8c35">部分 hit FFN</span><span style="border-color:#c45b59">miss resume</span><span style="border-color:#238f8a">DMA</span><span style="border-color:#bdc4cc">条件跳过</span></div>
 <canvas id="timeline" aria-label="GPU 主队列、执行阶段、hit、DMA 与跳过阶段时间线"></canvas>
@@ -33,7 +35,8 @@ function choose(){
  const c=data[+cs.value],sorted=[...c.points].sort((a,b)=>a.wallMs-b.wallMs),p50=sorted.reduce((best,p)=>Math.abs(p.wallMs-c.wall.median)<Math.abs(best.wallMs-c.wall.median)?p:best,sorted[0]);
  ss.innerHTML=c.points.map((p,i)=>'<option value="'+i+'">#'+p.id+(p===p50?' · P50':'')+' · '+fmt(p.wallMs)+' ms</option>').join('');ss.value=c.points.indexOf(p50);select();
 }
-function select(){current=data[+cs.value].points[+ss.value];reset();document.getElementById('detail').textContent='Step #'+current.id+' · position '+current.positions.join(', ')+' · '+fmt(current.wallMs)+' ms · miss '+current.misses.length+' 层 · 跳过 '+current.skippedCount+' 个已编码 FFN';
+function select(){const c=data[+cs.value];current=c.points[+ss.value];reset();document.getElementById('detail').textContent='Step #'+current.id+' · position '+current.positions.join(', ')+' · '+fmt(current.wallMs)+' ms · miss '+current.misses.length+' 层 · 跳过 '+current.skippedCount+' 个已编码 FFN';
+document.getElementById('boundaries').innerHTML=[['首个 GPU 工作之前','frontMs'],['L0 图 → L1 尾图','l0ToL1GapMs'],['最后 GPU 工作之后','tailMs']].map(([label,key])=>'<tr>'+[label,fmt(current.boundaries[key]),fmt(c.boundaryMetrics[key].mean),fmt(c.boundaryMetrics[key].median)].map(v=>'<td>'+v+'</td>').join('')+'</tr>').join('');
 document.getElementById('misses').innerHTML=current.misses.map(m=>'<tr>'+['L'+m.layer,m.hits+'/'+(m.hits+m.missing),m.route,fmt(m.hitMs),fmt(m.missMs),fmt(m.dmaBytes/1024**2),fmt(m.dmaMs),fmt(m.dmaStartAfterNoticeMs),fmt(m.dmaOverlapHitMs),fmt(m.hitToResumeGapMs),fmt(m.uncoveredDmaTailMs),fmt(m.readyToResumeGapMs)].map(v=>'<td>'+v+'</td>').join('')+'</tr>').join('');}
 function reset(){viewport={start:0,span:current.wallMs};draw();}
 function color(e,row){if(row===0)return '#315f93';if(row===2)return e.status===1?'#37a173':'#bb8c35';if(row===3)return '#c45b59';if(row===4)return '#238f8a';if(row===5)return '#bdc4cc';if(e.name==='resident_router_notice')return '#8865a6';if(e.name.includes('QSA'))return '#597bb0';if(e.name.includes('GDN'))return '#6ca58d';return '#7c8996';}

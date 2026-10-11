@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 process.env.TRACE_INPUT_ROOT = os.tmpdir();
-const { analyze } = require('./analyze-gpu-only-miss-trace.cjs');
+const { analyze, gpuBoundaries } = require('./analyze-gpu-only-miss-trace.cjs');
 function fixture(dma) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gpu-only-trace-unit-'));
   const context = layer => ({ step: 0, lanes: 1, layer });
@@ -16,6 +16,7 @@ function fixture(dma) {
   }
   for (let layer = 0; layer < 48; layer++) {
     const start = layer * 100000;
+    event('queue_envelope', layer, start, start + (layer === 2 ? 70000 : 21000));
     if (layer === 3) {
       notices.push({ context: context(layer), ordinal: 3, status: 0, hit_masks: [1023, 0], count: 10 });
       event('resident_hit_FFN', layer, start - 3000, start - 2000);
@@ -61,9 +62,28 @@ test('missing or unsynchronized DMA is never accepted as a measured resume depen
 test('PLE split requires 47 resident layers and real ordinary L0 GPU evidence', t => {
   const f = fixture(true); t.after(() => fs.rmSync(f.dir, { recursive: true }));
   f.trace.resident_notices = f.trace.resident_notices.filter(n => n.context.layer !== 0);
-  f.trace.device_events = f.trace.device_events.filter(e => e.context.layer !== 0 || e.name === 'resident_hit_FFN');
-  f.trace.device_events.find(e => e.context.layer === 0).name = 'MoE_completion_interval';
+  f.trace.device_events = f.trace.device_events.filter(e => e.context.layer !== 0 || ['queue_envelope', 'resident_hit_FFN'].includes(e.name));
+  f.trace.device_events.find(e => e.context.layer === 0 && e.name === 'resident_hit_FFN').name = 'MoE_completion_interval';
   f.write(); assert.equal(analyze(f.dir).points[0].rows[2].length, 47);
   f.trace.device_events = f.trace.device_events.filter(e => e.context.layer !== 0);
   f.write(); assert.throws(() => analyze(f.dir), /ordinary layer-0 GPU evidence missing/);
+});
+test('forward boundaries use actual queue ends and preserve the PLE split gap', t => {
+  const f = fixture(false); t.after(() => fs.rmSync(f.dir, { recursive: true }));
+  f.trace.resident_notices = f.trace.resident_notices.filter(n => n.context.layer !== 0);
+  f.trace.device_events = f.trace.device_events.filter(e => e.context.layer !== 0 || ['queue_envelope', 'resident_hit_FFN'].includes(e.name));
+  f.trace.device_events.find(e => e.context.layer === 0 && e.name === 'resident_hit_FFN').name = 'MoE_completion_interval';
+  f.write();
+  const b = analyze(f.dir).points[0].boundaries;
+  assert.equal(b.frontMs, 0); assert.equal(b.l0ToL1GapMs, .079);
+  assert.equal(b.l0EndMs, .021); assert.equal(b.l1StartMs, .1);
+  assert.equal(b.lastGpuMs, 4.721); assert.equal(b.tailMs, .279);
+  const unsplit = fixture(false); t.after(() => fs.rmSync(unsplit.dir, { recursive: true }));
+  assert.equal(analyze(unsplit.dir).points[0].boundaries.l0ToL1GapMs, null);
+});
+test('missing envelopes and invalid forward clocks cannot fabricate a boundary', () => {
+  const step = { start_ns: 0, end_ns: 1000 };
+  assert.throws(() => gpuBoundaries([], step, 0), /requires main queue envelopes/);
+  assert.throws(() => gpuBoundaries([{ name: 'queue_envelope', queue: 'main', start: -1, end: 100 }], step, 0), /outside/);
+  assert.throws(() => gpuBoundaries([{ name: 'queue_envelope', queue: 'main', start: 1, end: 1001 }], step, 0), /outside/);
 });
