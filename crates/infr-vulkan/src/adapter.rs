@@ -8900,19 +8900,25 @@ fn complete_decode_prefetch_handoffs(be_: &VulkanBackend) {
     }
 }
 
-fn clear_frozen_moe_lut_slots(be_: &VulkanBackend) {
-    if let Some(session) = be_.moe_pager().lock().unwrap().as_mut() {
+fn clear_frozen_moe_lut_slots(pager: &crate::pager::MoePagerCell) -> Result<()> {
+    let mut pager = pager
+        .lock()
+        .map_err(|_| be("Expert pager was poisoned by an earlier panic; reload the model"))?;
+    if let Some(session) = pager.as_mut() {
         session.clear_frozen_lut_slots();
     }
+    Ok(())
 }
 
 /// Declared before every execute-local recorder/segment so error unwinding drains their GPU work
 /// first, then releases the physical Expert slots protected by frozen LUT windows.
-struct FrozenMoeLutGuard<'a>(&'a VulkanBackend);
+struct FrozenMoeLutGuard<'a>(&'a crate::pager::MoePagerCell);
 
 impl Drop for FrozenMoeLutGuard<'_> {
     fn drop(&mut self) {
-        clear_frozen_moe_lut_slots(self.0);
+        // Do not turn a pager panic into a second panic during unwinding. Leave poison sticky:
+        // an inconsistent session must fail the next execute instead of being reused.
+        let _ = clear_frozen_moe_lut_slots(self.0);
     }
 }
 
@@ -8942,8 +8948,8 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
     let timeline_setup = infr_core::timeline::span("backend_setup");
     // A previous errored execute may have left protection until its recorder/segments dropped.
     // We are now inside the same unified execution gate, so no old command can still reference it.
-    clear_frozen_moe_lut_slots(be_);
-    let _frozen_lut_guard = FrozenMoeLutGuard(be_);
+    clear_frozen_moe_lut_slots(be_.moe_pager())?;
+    let _frozen_lut_guard = FrozenMoeLutGuard(be_.moe_pager());
     let setup_t0 = infr_core::pager_profile::start();
     let setup_part_t0 = infr_core::pager_profile::start();
     let layout = scratch_layout(graph)?;
@@ -10063,7 +10069,7 @@ fn sync_stream<'a>(
     ps.wait_cpu_promotion(be_)?;
     ps.cursor = 0;
     ps.tape_cursor = 0;
-    clear_frozen_moe_lut_slots(be_);
+    clear_frozen_moe_lut_slots(be_.moe_pager())?;
     let fresh = be_.recorder()?;
     ps.acquire_cpu_promotion(&fresh);
     *rec = Some(fresh);
@@ -12356,6 +12362,22 @@ fn execute_paged_moe<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn frozen_lut_cleanup_preserves_pager_poison_without_panicking() {
+        use super::*;
+        let pager = crate::pager::MoePagerCell::new(None);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _cleanup = FrozenMoeLutGuard(&pager);
+            let _locked = pager.lock().unwrap();
+            panic!("simulate a cache bookkeeping failure");
+        }));
+        assert!(panic.is_err());
+        assert!(pager.is_poisoned());
+        assert!(clear_frozen_moe_lut_slots(&pager).is_err());
+        drop(FrozenMoeLutGuard(&pager));
+        assert!(pager.is_poisoned());
+    }
+
     #[test]
     #[ignore = "requires a Vulkan GPU; run explicitly"]
     fn sparse_routed_lut_validates_hits_and_preserves_expert_indexed_addresses() {
