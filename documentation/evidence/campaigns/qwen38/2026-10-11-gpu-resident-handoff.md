@@ -1276,3 +1276,572 @@ built at `0a43785ee` plus the source patch archived in each manifest; before
 commit only the recovery comment was corrected to describe the actual separate
 early submissions. The ordinary matrix and screening evidence are also copied
 under the new chart directory's `full-matrix/` and `resident-screen/` folders.
+
+### Full-graph experiment and PLE storage/cache distinction
+
+Frozen experimental binary `infr-full-graph.exe`, SHA256
+`afa999835b28d3fa75e2333d88d887b7be500377d551ee67a9ebf4c7ac776dc7`,
+is built at `1b948ca71` plus the archived full-graph source patch. It keeps the
+same model, fixed allocations, scheduler and existing resident preset. The
+new default-off `kernels.vulkan.decode_gpu_resident_full_graph` prepares PLE
+before executing one L0..L47 graph. Only ordinary text Vulkan FlashNext
+Decode with one/two rows is eligible; partial Prefill, MTP, multimodal,
+expert prefetch and CPU-miss variants retain the original split path.
+Core/llama/Vulkan library tests: 243/210/215 passed; 107 Vulkan GPU tests
+remain ignored. Real model screening and the GPU-only paired trace each
+match all four whole batches against both same-binary split control and
+the prior ordinary golden at identical prompt/generated/cache state.
+
+Same-binary GPU-only capture uses the same twelve forward positions per
+depth as the earlier chart. Split and full paths have respectively 47 and
+48 executed resident FFN notices; the full path's L0 split gap is **not
+applicable**, not an artificially measured zero.
+The paired L1..L47 miss-layer/hit-count sequences are identical at every
+captured position. Full-graph totals add four L0 misses at 30K and three at
+150K; those additional classified layers are not a cache-hit-rate regression.
+
+| Twelve-forward mean, ms | 30K split | 30K full | 150K split | 150K full |
+|---|---:|---:|---:|---:|
+| Wall | 21.349 | 20.372 | 21.656 | 21.246 |
+| Main queue union | 15.457 | 15.528 | 16.324 | 16.305 |
+| Before first GPU work | 0.598 | 1.226 | 0.585 | 1.191 |
+| Independent L0 -> L1 graph gap | 0.912 | N/A | 0.954 | N/A |
+| After last GPU work | 0.398 | 0.287 | 0.392 | 0.354 |
+
+Removing the split does not remove all its time: some preparation moves
+before the first GPU work. The short captured windows improve, but the
+initial two-round unprofiled 384-token screen does not show stable sustained
+gains, especially its second 150K full-graph round. Do not promote that short
+trace improvement to a general throughput or restart/cache guarantee.
+
+PLE is a GGUF mmap tier, not a fully resident RAM/VRAM table. Windows may
+serve those pages from its file cache or fault them from SSD. Restarting the
+service does not guarantee either state; model host-cache allocation, other
+applications and RAM pressure can reclaim cached pages. No system file-cache
+purge was performed. These are **first and repeated request rounds**, not
+controlled cold-SSD/hot-cache benchmarks.
+
+`stage4-full-graph-ple-profile-v3` separately enables only pager aggregate
+timing, with `prof.stages=false`, `prof.ops=false`, no timeline queries.
+All four candidate batches also match same-binary control and ordinary golden.
+Every runner cohort contains 414 processed rows: 30 remaining teacher-forced
+suffix rows plus 384 Decode rows. Times below are totals for that mixed
+cohort, not pure Decode per-token or physical SSD read latencies.
+
+| PLE total ms: gather / residual receiver wait | Split first | Split repeated | Full first | Full repeated |
+|---|---|---|---|---|
+| 30K | 414.0 / 45.3 | 16.1 / 0.1 | 340.5 / 317.2 | 21.1 / 29.1 |
+| 150K | 398.3 / 22.2 | 18.1 / 0.1 | 409.3 / 382.0 | 16.7 / 23.4 |
+
+The gather timer includes mmap access/page faults, copying and dequantization,
+but excludes job-channel scheduling and some output-pool management. The
+receiver wait includes their exposed time and can exceed gather time; it is
+not simply SSD read time. Logical 4KiB pages are not physical SSD I/O bytes.
+The upload timer is separate. Small split-path wait is consistent with L0
+overlap, not proof that the underlying PLE gather was cheap. Full-graph warm
+cache measurements alone cannot justify eliminating this overlap for fresh
+requests or after restarts.
+
+The earlier `ple-profile` launch failed before GPU work because profiling
+arguments were duplicated. `ple-profile-v2` completed with verbose stage
+logging, which produced many per-submit stderr lines and perturbed throughput;
+it is retained as diagnostic evidence, not a release-speed baseline. V3
+removes that logging. Its aggregate profiler throughput is also kept separate
+from the unprofiled matrix. The parser tests distinguish work from wait and
+reject malformed/unpaired cohorts.
+
+Paired charts, preserving all prior charts:
+`D:\AIinfr\infr\benchmark-data\artifacts\decode-timeline-20261011-gpu-full-graph-control\timeline.html`
+and
+`D:\AIinfr\infr\benchmark-data\artifacts\decode-timeline-20261011-gpu-full-graph\timeline.html`.
+The new chart passes desktop/mobile nonblank-pixel, exact layer-set, overflow,
+drag and wheel-zoom checks. A robust follow-up should preserve async PLE/L0
+overlap while reducing duplicate graph/setup work; it must not assume Windows
+file-cache residency. Do not yet enable unconditional full-graph Decode.
+
+### Completed full-graph matrix: no-regression criterion not met
+
+`stage4-full-graph-resident-matrix` uses the same frozen full-graph binary
+for split and full controls, configured two slots, 30K/150K x one/two active,
+512 generated tokens and three regenerated rounds. Profiler and timeline
+queries are disabled. All twelve candidate batches match both the same-binary
+split control and the prior ordinary golden as complete batches, including
+prompt/generated/cache state (24 comparisons). This establishes correctness
+for these cases, not a performance guarantee.
+
+Per-lane rates below average all active lanes and regenerated rounds 1 and 2
+(zero-based), consistently excluding the first round in both cases.
+
+| Context / active lanes | Split per lane tok/s | Full per lane tok/s | Change | Individual warm-round changes |
+|---|---:|---:|---:|---|
+| 30K / 1 | 47.517 | 48.748 | +2.59% | +2.04%, +3.14% |
+| 30K / 2 | 33.220 | 33.081 | -0.42% | +1.02%, -1.84% |
+| 150K / 1 | 43.493 | 41.927 | -3.60% | -4.23%, -2.97% |
+| 150K / 2 | 24.797 | 25.123 | +1.32% | +5.01%, -2.32% |
+
+All four first-round mean per-lane changes are negative (-1.52%, -2.74%,
+-2.58%, -1.69% in table order). Neither the positive 30K single-lane mean nor
+the positive 150K dual-lane mean establishes absence of negative returns.
+The 150K single-lane slowdown appears in both warm repeats, whereas small
+dual-lane differences also contain substantial run variation. The cause of
+the warm 150K slowdown is not isolated: do not attribute all of it to SSD,
+nor conclude that storage hides every scheduling difference. Single-lane
+throughput still falls short of the >=50 tok/s goal.
+
+The full-graph flag remains default-off and is not recommended as a universal
+optimization. Runtime source remains an uncommitted experiment; source patches
+and hashes in the manifests preserve exactly what was measured. Test-cache
+size after the matrix is 20,916,434,288 bytes, below the aggregate 30 GiB limit;
+services stopped normally and production executables/caches were not changed.
+
+### Storage-aware acceptance and next optimization boundary
+
+The acceptance priority is **no reproducible negative return across storage
+conditions**, before claiming a universal speedup. `device.ram_budget`
+controls routed-expert host caching; the current PLE implementation still
+loads its table through `tensor_bytes_arc` (GGUF mmap), not an explicit
+RAM-budget-controlled resident ngram tier. Large free RAM may keep those
+mapped pages resident through the OS cache. RAM capacity alone is therefore
+not a sufficient label for a benchmark cohort.
+
+Future comparisons must distinguish SSD/page-fault-dominated PLE, mixed
+residency under memory pressure, and effectively RAM-resident PLE pages;
+each must use matched one/two-active, 30K/150K prompts and generated outputs.
+This session measured first/repeated rounds but did not control OS-cache
+residency, so those storage cohorts remain unvalidated. Do not purge the
+system cache or assume cache retention over restart to manufacture a result.
+Small differences need matched repeats before being called gains/regressions.
+
+The universal optimization boundary is to reduce duplicate graph preparation,
+bindings and host allocation **while retaining async PLE/L0 overlap**. A single
+prepared plan with separately schedulable L0 and tail segments is a candidate,
+not an implemented or measured gain. It must preserve buffer lifetimes and
+PLE readiness ordering, retain the existing split fallback, avoid added
+per-token checks on the critical path, and pass both correctness and the
+storage-aware no-regression gate before promotion. Storage-specific paths can
+remain opt-in until equivalent guarantees or a measured cheap selector exist.
+
+### Storage-independent shared-expert setup scan
+
+The retained split path's prior pager-only profile reports 102.2 ms of
+`setup_moe_scan` across 414 mixed suffix/Decode steps (about 247 us/step).
+The old recognizer queried `INFR_NO_MOE_SHARED_SLOT` before checking the op
+kind, including every non-MoE op. This is CPU/environment overhead, not SSD
+read or GPU computation. The change samples the escape hatch once per
+execute and runs the unchanged shape recognizer only for `MoeFfn` candidates.
+Paged-buffer eligibility checks, skip indices, GPU math/submissions, PLE/L0
+overlap, scratch allocation and fixed/dynamic memory residency are unchanged.
+The escape hatch is still honored between executes, not cached permanently.
+
+CPU-only release benchmark on Windows / Ryzen 5 5600X / Rust 1.97.1,
+`target-cpu=native`: a synthetic 47-layer, 4089-op graph, 1024 scans per
+measurement, six alternating-order legacy/filtered pairs. The old path uses
+the original per-op environment-check ordering and the same pure recognizer;
+both must find all 47 identical candidates. This is not a true-model graph
+or a throughput extrapolation.
+
+| Pair | Legacy us/scan | Filtered us/scan |
+|---|---:|---:|
+| 0 | 654.741 | 3.912 |
+| 1 | 642.544 | 4.074 |
+| 2 | 637.773 | 3.813 |
+| 3 | 641.502 | 3.884 |
+| 4 | 635.104 | 3.702 |
+| 5 | 637.717 | 4.415 |
+
+The real graph's old scan time above, rather than the larger synthetic delta,
+sets the approximate maximum removable setup cost for that captured cohort.
+Other CPUs/OSes may have different environment-query costs; no Linux speed
+claim is made. Unit tests compare exact candidate structs/indices across
+1/2/4/8/9/32 rows and eight routed dtypes, multiple tails, missing final tail
+ops, an empty graph and an enabled/disabled escape hatch. Vulkan library:
+216 passed, 107 GPU tests ignored plus one opt-in CPU timing test; the latter
+also passes when run explicitly. Raw logs are `stage4-shared-scan-unit.log`
+and `stage4-shared-scan-cpu.log`.
+
+Frozen candidate `infr-shared-scan.exe`, SHA256
+`dc3a12c0cbc4bb32ddfd1bfea87107605528cdcc5b6adb070df31c8893096577`,
+uses the same retained resident preset, with full-graph explicitly disabled.
+The control is the earlier frozen `infr-full-graph.exe` with full-graph also
+disabled, hash `afa999835b28d3fa75e2333d88d887b7be500377d551ee67a9ebf4c7ac776dc7`.
+The benchmark records each case's actual exe/hash and copies the control's
+original build/source manifest, rather than attributing today's source snapshot
+to that older binary. The runtime difference is confined to this CPU scan.
+The first build command used a nonexistent `infr` package and failed before
+compilation; `stage4-shared-scan-build-v2.log` records the successful
+`cargo +1.97.1 build --release -p infr-cli --bin infr` (4m15s).
+
+### Shared-scan end-to-end gate remains pending
+
+`stage4-shared-scan-matrix` runs legacy first, then filtered, with two slots,
+one/two active, 30K/150K, 512 tokens x three regenerated rounds, no profiler.
+The warm means exclude round 0 consistently. Complete-batch output, prompt,
+cache and generated-token checks match the legacy and ordinary golden in all
+twelve candidate batches (24 comparisons).
+
+| Context / active | Legacy tok/s per lane | Filtered tok/s per lane | Change |
+|---|---:|---:|---:|
+| 30K / 1 | 44.322 | 47.665 | +7.54% |
+| 30K / 2 | 33.270 | 33.719 | +1.35% |
+| 150K / 1 | 43.266 | 42.908 | -0.83% |
+| 150K / 2 | 24.983 | 24.665 | -1.27% |
+
+`stage4-shared-scan-reverse-150k` then reverses the case order at 150K,
+retaining all other settings and verifying all six candidate batches against
+both controls (12 comparisons). Warm single-lane legacy/filtered means are
+42.348/43.465 tok/s (+2.64%); dual-lane means are 24.925/24.817 tok/s per
+lane (-0.43%). The changing single-lane sign and stalled segments in some
+rounds prevent assigning every rate difference to the scan. The slight
+negative dual-lane means in both orders also prevent claiming a universal
+no-regression result. No controlled SSD/page-cache residency claim is made.
+The CPU scan improvement is established only at module level; real-model
+phase timing and wider no-regression evidence are still pending. Do not
+promote this experiment or label it stable on these measurements alone.
+
+Aggregate test-cache size fell from 20,916,434,288 to 19,499,948,148 bytes
+after normal service cache management, below the 30 GiB aggregate limit.
+No production cache or executable was touched. Both matrices completed and
+their test services stopped normally.
+
+### Fresh stable GPU-only timeline, 2026-10-11 17:20-17:23 +08:00
+
+The user's fresh-chart request uses the validated queued-frontend recovery
+preset from `86898f496`, not the pending full-graph or shared-scan experiments.
+Frozen `infr-recovery-frontend.exe` SHA256 is
+`da96c58535169d00c2d402d8bdcab1b8e12175f3b66d54c0a63340cd07025666`.
+The new manifest copies the original frozen build manifest; today's source
+snapshot is not falsely attributed to that older binary. Capture tag:
+`stage4-stable-current-gpu-trace`, two configured slots / one active,
+30K/150K, no MTP, 384 tokens x two regenerated rounds. GPU-only queries
+start at step 512 for twelve consecutive forwards, positions 30103-30114
+and 150107-150118. CPU span/stage/pager profiling is disabled.
+
+| Context | Forward mean ms | Forward P50 ms | Main envelope mean ms | Front mean ms | L0/L1 gap mean ms | Tail mean ms | Sum of hit-to-miss gaps mean ms/forward |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 30K | 20.580 | 19.736 | 15.478 | 0.527 | 0.880 | 0.372 | 2.666 |
+| 150K | 21.767 | 21.458 | 16.314 | 0.617 | 0.977 | 0.389 | 2.673 |
+
+Main envelope includes GPU waits/barriers, not isolated compute time. DMA
+overlaps other tracks, and the columns must not be summed as disjoint work.
+These short GPU-query windows are not sustained Decode throughput claims.
+The analyzer validates all 47 resident-layer journals and actual ordinary-L0
+GPU evidence, DMA resume dependencies, calibration and zero dropped events.
+There are 156/157 resident miss layers over twelve forwards; 105/126 have
+DMA evidence. No DMA bar does not provide CPU-push transfer duration.
+
+30K's first request had no cache entry after normal rolling eviction and
+performed fresh Prefill at 1331.49 tok/s; its output hash has no same-cache
+golden and is not claimed output-validated. The initial post-capture checker
+correctly rejected this unmatched state after both services had completed.
+Verification-only processing explicitly records this excluded first round;
+30K round 1 and both 150K rounds match the complete ordinary golden at the
+same prompt/generated/cache state. Both plotted windows are in the validated
+second round; no additional GPU run or weakened hash comparison was used.
+The failure and verification records remain archived. Cache before/after:
+19,499,948,148 / 20,433,242,500 bytes, below 30 GiB. Services stopped normally.
+
+New independent chart, preserving all earlier HTMLs:
+`D:\AIinfr\infr\benchmark-data\artifacts\decode-timeline-20261011-gpu-stable-current\timeline.html`.
+Raw traces, logs, launch arguments, correctness record, build provenance,
+analysis and browser screenshots accompany it. Desktop 1440px and mobile
+390px checks confirm two contexts, twelve samples each, six nonblank GPU
+tracks, three real forward boundaries, all resident layers, no page overflow,
+wheel zoom and pointer dragging. The default sample is nearest the P50;
+all twelve samples remain selectable. GPU submissions keep their true
+cross-layer scope; no estimated GPU layer boundaries replace measurements.
+
+### Actual-model shared-scan phase timing
+
+`stage4-shared-scan-phase-profile` completed the same frozen legacy/filtered
+binary comparison at 30K/150K, two slots / one active, 512 tokens x two rounds.
+Only aggregate pager profiling is enabled; verbose stages, op timestamps and
+timeline queries are off. All four candidate batches match the same-cache
+legacy and ordinary golden as complete batches (eight comparisons). Each
+cohort includes 542 forwards: 512 Decode rows and 30 teacher-forced suffix
+rows. The per-forward normalization below is not a pure Decode latency.
+
+| Context / round | Legacy MoE scan us/forward | Filtered MoE scan us/forward | Removed us/forward |
+|---|---:|---:|---:|
+| 30K / first | 253.506 | 40.590 | 212.915 |
+| 30K / repeat | 245.572 | 33.948 | 211.624 |
+| 150K / first | 292.435 | 37.454 | 254.982 |
+| 150K / repeat | 264.945 | 33.395 | 231.550 |
+
+This confirms the scan's real-model module benefit (84-87% less measured
+scan time), not an equal end-to-end improvement. Other host phases vary
+between runs: repeat main graph construction/compile/bind is 167.5/196.5
+us at 30K and 179.2/194.1 us at 150K for legacy/filtered. Layout/reset scan
+is 122.7/145.4 and 128.6/136.7 us respectively. Those phases' code is
+unchanged in these binaries, so their differences cannot all be attributed
+to the shared-scan patch. The profiler also perturbs throughput; its rates
+are not substituted for the earlier unprofiled gate.
+
+PLE first-round gather totals are 464.9/621.4 ms at 30K and 595.6/536.7 ms
+at 150K, but exposed pager waits are only 7.4/63.6 and 15.8/44.1 ms. Repeat
+gathers are 21.7/24.6 and 24.5/23.0 ms, with exposed wait 0.1-0.2 ms total.
+The unchanged split scheduling still overlaps PLE effectively, including
+first rounds. No physical SSD timing or controlled page-cache residency is
+claimed. Cache after this run is 19,049,842,020 bytes, under 30 GiB; all
+services stopped. The updated parser validates paired host cohorts and uses
+forward count rather than independent row count for CPU setup normalization.
+
+### Owned-graph CPU experiment, awaiting real-model gate
+
+Default-off `kernels.vulkan.decode_owned_graph` selects ownership transfer
+for temporary graphs in the ordinary FlashNext token-row runner. It excludes
+MTP, hidden capture, multimodal lanes and non-Vulkan backends. `Backend`
+adds a default `compile_owned(Graph)` implementation that delegates to the
+existing borrowed compiler; Vulkan overrides it by moving the unchanged
+graph into `VkDecodePlan`. Borrowed compilation remains available and replay
+eligibility uses the same function before ownership transfer. No op, tensor
+ID, allocation, KV shape, PLE order, submission, sampling or scratch policy
+is intentionally changed. The borrowed control retains its original L0
+source graph lifetime; the owned path keeps that allocation in the plan.
+
+Unit coverage verifies object-safe default-backend fallback, tensor/op/span
+allocation identity after moving, graph metadata, memoized in-place input
+contents, empty replay state and both eligibility values across 1/2/4/8/32
+rows. Core focused test passes; Vulkan library has 217 passed and 108
+ignored (107 opt-in GPU tests and the opt-in CPU timing test). The first
+Vulkan test build failed due to the test's misspelled dtype `Q4_K`; it was
+corrected to the existing `Q4K` before tests passed. Both logs are preserved.
+The frozen CLI build and same-binary ordinary 30K/150K x one/two-active
+matrix completed. Frozen `infr-owned-graph.exe` SHA256 is
+`e2c36b99d82a5b8f9f3d6839b4fc4d522e3b457777e58b9e94c01a1e1cefa35a`.
+The full-graph flag is false on both sides; only the owned-graph flag differs.
+The original checker exited with an output mismatch at 30K/two-active,
+round 0. All test services have stopped. No runtime promotion is justified.
+
+### Owned-graph matrix: provisional performance exclusions
+
+After the run the user reported an unstable computer while running compilation,
+and authorized discarding clearly unreasonable rounds from performance analysis.
+No extra GPU measurement is started. Raw manifests, outputs and logs are kept
+unchanged. This is a provisional exclusion based on reported interference and
+large latency excursions, not proof that compilation caused every difference.
+
+Round numbers below are zero-based. All first rounds remain outside the existing
+warmed summary on both sides, regardless of their rates. Exclude the entire
+two-lane batch, not individual tokens or the slower lane. For an excluded warmed
+round, exclude the matching control round too, rather than averaging an unequal
+number of rounds or retaining only the fastest candidate samples.
+
+| Context / active | Owned round | Rates tok/s per lane | Treatment |
+|---|---:|---|---|
+| 30K / two | 0 | 20.327 / 20.457 | Quarantine from performance; already outside warmed summary; preserve output mismatch separately |
+| 150K / two | 1 | 17.431 / 17.430 | Quarantine entire batch and paired control round from provisional performance comparison |
+
+The second exclusion has 29.374 s Decode time per lane, compared with 20.321 s
+in round 2; round 0 is also about 20.5 s. Do not remove the less dramatic
+30K/one-active or 30K/two-active warmed slowdowns solely because they are negative.
+
+| Context / active | Paired retained rounds | Control tok/s per lane | Owned tok/s per lane | Difference |
+|---|---|---:|---:|---:|
+| 30K / one | 1, 2 | 48.446 | 47.546 | -1.859% |
+| 30K / two | 1, 2 | 33.750 | 32.409 | -3.975% |
+| 150K / one | 1, 2 | 43.505 | 43.370 | -0.310% |
+| 150K / two | 2 only | 25.130 | 25.196 | +0.264% |
+
+Rates are arithmetic means of retained request `predicted_per_second` values,
+not aggregate throughput or a pooled tokens/time rate. The 150K/two-active row
+has only one paired round left and is especially weak evidence. These values
+are descriptive only: the machine interference prevents a reliable benefit or
+no-regression decision. Keep the feature default-off, pending controlled tests.
+
+Performance filtering does not change the correctness gate. Owned 30K/two-active
+round 0 has cached counts 29945/29955, matching existing warmed references, but
+lane 0 hash is `e7b00d02e2acce4685a8a764c73ca398be07c38035d08df827eb713a5db7b060`
+instead of `60336787d9b1776d7a7f395049cd66e1db06121e5cd6ae7c7b76720784be7205`.
+Lane 1 and both subsequent rounds match. Matching cache counts alone do not
+prove identical restored checkpoint contents; causality remains unconfirmed.
+The mismatch is preserved as an unresolved correctness finding, not converted
+to a pass by removing the round from a performance average. All other owned
+batches match the existing same-cache reference outputs. The two control first
+rounds with a fresh second lane are not compared against warmed hashes.
+
+Filtering record: `stage4-owned-graph-matrix-performance-filter.json` alongside
+the original matrix in `benchmark-data/artifacts/gpu-resident-decode-20261011/`.
+The fresh stable HTML uses a different, previously validated frozen executable
+and is not replaced by these provisional experimental results.
+
+### Owned-graph cold restore and request-order cross-check
+
+After the user reported the computer idle, two targeted matrices completed:
+`stage4-owned-graph-cache-order-forward` and
+`stage4-owned-graph-cache-order-reverse`. Both use the same frozen owned-graph
+binary SHA256 above, two configured slots / two active, 30K, 512 tokens x two
+regenerated rounds. The first pass starts lanes 0/1 and runs control then owned;
+the second starts lanes 1/0 and runs owned then control. These are launch orders,
+not a guarantee of scheduler/slot order. Returned results remain sorted by lane
+before comparison. Prompts, temperatures, seeds and native execution flags are
+unchanged; no source edit or compilation changes the running frozen binary.
+
+| Pass | Control first / repeat tok/s per lane | Owned first / repeat tok/s per lane | Repeat change |
+|---|---|---|---:|
+| Forward | 32.356 / 32.323 | 32.608 / 33.650 | +4.104% |
+| Reverse | 32.645 / 33.638 | 32.803 / 33.739 | +0.302% |
+
+All eight whole batches (sixteen requests) match the original same-cache ordinary
+golden, including cold-restored first rounds. No batch is excluded. Both prompts'
+JSON hashes match between all four services. The old mismatch is not reproduced;
+it remains an unresolved finding rather than being erased or declared fixed.
+One warmed round per order and the order-sensitive rate difference do not prove
+a stable performance benefit or complete the wider no-regression gate.
+
+The new opt-in read-only cache snapshot records v2 header geometry, live token
+digest, checkpoint token digests, stored footer checksum and separate hashes of
+the actual keyed checkpoint records. It rejects production paths, reparse paths,
+truncated/invalid geometry and files changing during the snapshot. It neither
+modifies entries nor performs cleanup. Reading the stored footer is explicitly
+not full payload checksum validation. Optional checkpoint hashing occurs before
+service startup and after shutdown, not inside measured Decode; it reads sizable
+state payloads (the first snapshot hashed 2,360,770,560 checkpoint bytes across
+ten entries), so no controlled SSD/page-cache residency claim is made.
+
+Across every before/after catalog, candidate files at checkpoint lengths
+29945 and 29955 have identical checkpoint record sets. Canonical keyed-record
+set digests are respectively
+`bac90905b7531d077a2d88a2b9ee7226d63b4417e9c41b7204f1c98b5d1c4077` and
+`dce71f4021efb2a85c0a7648842af8052ad796361bddd773a4c6a2cd521460b5`.
+This establishes the compared recurrent/PLE checkpoint contents, not identical
+full main KV prefix bytes or a dump of the actual GPU restore. It cannot by
+itself locate the original failure. Do not promote owned-graph as stable yet.
+
+Aggregate cache remained under 30 GiB at every before/after check; final size
+was 19,082,929,316 bytes after normal service GC. No production service, cache
+or executable was touched, and all four test services exited. The snapshot's
+four CPU-only tests and strict matched-round tests pass (eight tests total).
+`analyze-gpu-resident-cache-order.cjs` reproduces provenance, hash, checkpoint
+and metric checks from the preserved artifacts without another GPU run.
+
+### Inline op-I/O scratch analysis: complete first model matrix, not promoted
+
+Default-off `kernels.vulkan.scratch_io_inline` replaces per-op heap read/write
+lists in retained-scratch analysis with `SmallVec` lists (eight reads / three
+writes inline). Both `Op::io_inline()` and the original `Op::io()` signature
+instantiate one generic exhaustive variant match. The Vec path directly uses
+boxed-array construction, as the original `vec!` macro did; it does not build
+an inline list first or convert one back into a Vec.
+There is one semantic I/O definition, no duplicate table, no fixed arity limit
+and no change to index order, duplicate handles, optional operands or zero-reset
+policy. Future larger arities spill safely. The existing locked smallvec 1.15.2
+is made a direct core dependency; no dependency version changes are introduced.
+
+Coverage includes one/two/four/eight/thirty-two rows and 2048/4096-row metadata,
+maximal DeltaNet inputs and trace outputs, QSA optional multimodal positions,
+HC optional gates, duplicate handles, routed optional operands, packed/partial
+writes and empty graphs. Core library: 245 passed. Vulkan library: 218 passed,
+109 ignored (107 opt-in GPU tests and two opt-in CPU timing tests). V3 release
+CPU scan timings for 4,089 synthetic ops, six alternating passes of 1,024 scans:
+
+| Metadata rows | Heap scan us | Inline scan us |
+| --- | ---: | ---: |
+| 1 | 281.766-299.641 | 54.642-59.579 |
+| 2 | 277.480-290.420 | 55.288-59.005 |
+
+Reset indices match exactly. This is CPU module timing, not real model time
+or proof of an end-to-end speedup. The fixture has many small ops and is not
+an exact sampled runtime graph. Preliminary v1 timings are rejected as a
+baseline because their compatibility path first constructed an inline list;
+v2 removed that detour but changed Vec construction to iterator collection.
+V3 restores the direct boxed-array construction. All three raw logs are kept.
+
+The separate exact-source probe extracts the original I/O match from HEAD
+`1b948ca714314f8faf2f5ab50d742d09b14cff0b`. V3 checks 3,854 ops per row shape
+against both new APIs, including list and checksum equality. Its standalone
+original function and linked core API have different call/inlining boundaries,
+so their speed ratio is not a production legacy-path regression measurement.
+The completed `stage4-inline-io-matrix` uses frozen `infr-inline-io.exe` SHA256
+`c15149e9601ca9a174752718ba94476a5b6ff6615602d0668ff72b6b1a3989ad` on both
+sides. Full-graph and owned-graph are false; only the scratch-I/O flag differs.
+Configured two slots, one/two active, 30K/150K, 512 generated tokens and three
+regenerated rounds. Both cases retain async PLE/L0 overlap. Profilers and GPU
+queries are disabled, and no compilation runs during throughput measurement.
+
+| Context / active lanes | Heap per lane tok/s | Inline per lane tok/s | Change |
+| --- | ---: | ---: | ---: |
+| 30K / 1 | 47.422 | 46.615 | -1.70% |
+| 30K / 2 | 33.397 | 33.482 | +0.25% |
+| 150K / 1 | 42.867 | 43.126 | +0.61% |
+| 150K / 2 | 24.947 | 25.719 | +3.10% |
+
+Definition: arithmetic mean of per-lane request rates in zero-based rounds
+1 and 2, excluding round 0 identically on both sides. No other rounds are
+discarded. All raw first rounds are preserved, including one 150K control lane
+that had to prefill from an absent test cache. That complete cold batch matches
+the same-state cold ordinary reference; subsequent regenerated rounds match
+the warmed reference. Candidate/control and both ordinary-reference gates all
+pass (12 whole batches per gate, 36 comparisons); no correctness exclusions.
+Cache size after measurement: 20,916,434,288 bytes, below the aggregate 30 GiB
+limit. All eight services stopped normally, without modifying production.
+
+CPU module gain is established by the synthetic scan, but a universal
+end-to-end gain is not: 30K single-lane is slower in both warmed repeats. The
+small/mixed changes and one fixed case order need actual layout-phase profiling
+and reversed matched repeats before attribution or promotion. The 150K dual
+gain alone is not grounds to default-enable the flag. Request-progress thirds
+and steady aggregate rates are retained in raw manifests; merged SSE frames
+cannot be silently treated as one token per frame. Single-lane >=50 tok/s
+remains unmet. This experiment is not enabled by default.
+
+The core API and four dependency/source paths alone are locally committed as
+`b21907a20` (`perf(core): add inline tensor I/O lists with one operand definition`).
+That commit records the host/device/ubatch scope and synthetic measurements;
+it does not include the Vulkan integration/config switch or claim a universal
+Decode gain. Those runtime experiments remain separately uncommitted.
+
+### Notice completion-fence poll experiment: no confirmed gain, removed
+
+`kernels.vulkan.decode_gpu_resident_notice_fence_interval` defaults to 1,
+preserving an event query and completion-fence query on each unsuccessful
+iteration. Opt-in intervals are clamped to 1..64. Event status is still queried
+on every iteration; only the redundant completion-fence safety check is spaced
+out. The first unsuccessful iteration always checks the fence. A completed
+fence still requires an immediate second event query before accepting the
+notice or reporting a missing-notice error. Event-query errors propagate
+immediately; a fence-only error is delayed by at most the remaining bounded
+poll iterations, not masked indefinitely.
+
+Both the producer and controller fallback share a monomorphized wait helper.
+Their spin/yield policy, journal reads, hit/miss handling, retirement fences,
+admission guards, transfer dependencies and producer acknowledgements are
+unchanged. This does not skip the real recovery dependency or allow a slot to
+be overwritten while its GPU work is live. Controller polling without a
+pending segment retains the nonblocking return.
+
+New CPU tests cover ready/delayed events, clamped intervals, exact query counts,
+completion visibility races, completion without a notice, event device errors
+and bounded delayed fence errors. Core tests pass (245); Vulkan tests pass
+(220, with 109 opt-in tests ignored). Compilation began only after the complete
+inline-I/O GPU matrix exited. Its frozen binary is separate from this new
+experiment. Real-model screening holds inline-I/O, full-graph and owned-graph
+off, and changes only fence interval from control 1 to 8/16.
+
+The two completed 30K one-active screening orders use the same frozen
+`infr-notice-poll.exe` SHA256
+`4063ad5cf3c3f91e1921432493d6cc41f2f650625acb934eeaef05bda651f8ce`.
+Forward order has three regenerated rounds per case; reverse has four.
+
+| Order | Control 1 tok/s | Candidate 8 tok/s | Candidate 16 tok/s |
+| --- | ---: | ---: | ---: |
+| 1, 8, 16 | 46.296 | 46.594 (+0.64%) | 46.821 (+1.14%) |
+| 16, 1 | 46.890 | not run | 46.771 (-0.25%) |
+
+Rates average only zero-based rounds after the first, consistently in each
+case/order. No low control round is discarded: the forward control's warmed
+rates are 47.590 and 45.002, larger variation than the apparent gain. All 17
+requests match the ordinary golden and whole-batch controls; no correctness
+exclusions or failed requests. Aggregate test cache after both orders is
+18,599,738,192 bytes. All five services stopped normally.
+
+This does not confirm a throughput benefit, nor isolate the remaining miss
+gap as fence-query contention. The implementation, config field and its two
+tests are removed from active source, preserving the source patches, safety
+logs and frozen binary for reproducibility. The historical runner requires
+that preserved build record; it must not attribute this binary to current
+source. The 20 recorded Rust/Cargo/shader files match the pre-poll, fully
+tested inline-I/O matrix source hashes exactly after restoration (see
+`stage4-notice-poll-restored-source.json`). Its 245/218 unit results and full
+model matrix remain applicable; the temporary poll tests' 245/220 results
+describe the archived experiment, not the restored source. No 150K or dual
+poll throughput claim is made, and the >=50 single-lane target remains unmet.

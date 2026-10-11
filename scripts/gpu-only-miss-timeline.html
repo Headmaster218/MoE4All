@@ -10,7 +10,7 @@ body{font:14px system-ui;margin:24px;color:#20252c;background:white}h1{font-size
 <small id="identity"></small>
 <p>FlashNext 4.27bpw，7900 XTX，2 槽 / 单路，30K 与 150K，各 12 个连续前向。仅 GPU 时间戳：CPU 阶段计时已关闭；保留前向起点、时钟校准、提交与依赖编号。此短窗口不作为持续吞吐跑分。</p>
 <p>命中掩码来自 GPU journal；条件跳过的 FFN 独立置灰。hit FFN 含 shared expert；miss resume 含缺失专家及累加收尾。BOTTOM 时间戳区间包含屏障和停顿，不是孤立 kernel 或 ALU busy 时间。CPU push 没有 DMA 时间戳；没有 DMA 的 miss 不推算其搬运耗时。</p>
-<p>L0 为 PLE 重叠而独立执行普通图，GPU 时间仍在主队列 / stages 轨中；条件续跑与 hit/miss 分类统计对应 L1–L47，不把 L0 的普通 MoE 片段强行解释成 GPU journal 命中分类。</p>
+<p id="graph-scope"></p>
 <div class="wrap"><table><thead><tr><th>上下文</th><th>样本</th><th>Step P50 ms</th><th>主队列均值 ms</th><th>Miss / step</th><th>DMA / step ms</th><th>Hit→Miss gap / step ms</th><th>DMA 已完成后 gap / step ms</th></tr></thead><tbody id="summary"></tbody></table></div>
 <label>工况<select id="case"></select></label><label>样本<select id="step"></select></label><button id="reset" aria-label="恢复完整范围" title="恢复完整范围">↺</button>
 <div class="wrap"><table><thead><tr><th>边界</th><th>当前样本 ms</th><th>12 前向均值 ms</th><th>P50 ms</th></tr></thead><tbody id="boundaries"></tbody></table></div>
@@ -36,6 +36,7 @@ function choose(){
  ss.innerHTML=c.points.map((p,i)=>'<option value="'+i+'">#'+p.id+(p===p50?' · P50':'')+' · '+fmt(p.wallMs)+' ms</option>').join('');ss.value=c.points.indexOf(p50);select();
 }
 function select(){const c=data[+cs.value];current=c.points[+ss.value];reset();document.getElementById('detail').textContent='Step #'+current.id+' · position '+current.positions.join(', ')+' · '+fmt(current.wallMs)+' ms · miss '+current.misses.length+' 层 · 跳过 '+current.skippedCount+' 个已编码 FFN';
+document.getElementById('graph-scope').textContent=current.rows[2].some(e=>e.layer===0)?'完整图模式：条件续跑与 hit/miss 分类覆盖 L0–L47。没有独立 L0 图与 L1 尾图之间的交接，因此该边界为不适用，而不是测得 0 ms。':'拆图模式：L0 为 PLE 重叠而独立执行普通图，GPU 时间仍在主队列 / stages 轨中；条件续跑与 hit/miss 分类统计对应 L1–L47，不把 L0 的普通 MoE 片段强行解释成 GPU journal 命中分类。';
 document.getElementById('boundaries').innerHTML=[['首个 GPU 工作之前','frontMs'],['L0 图 → L1 尾图','l0ToL1GapMs'],['最后 GPU 工作之后','tailMs']].map(([label,key])=>'<tr>'+[label,fmt(current.boundaries[key]),fmt(c.boundaryMetrics[key].mean),fmt(c.boundaryMetrics[key].median)].map(v=>'<td>'+v+'</td>').join('')+'</tr>').join('');
 document.getElementById('misses').innerHTML=current.misses.map(m=>'<tr>'+['L'+m.layer,m.hits+'/'+(m.hits+m.missing),m.route,fmt(m.hitMs),fmt(m.missMs),fmt(m.dmaBytes/1024**2),fmt(m.dmaMs),fmt(m.dmaStartAfterNoticeMs),fmt(m.dmaOverlapHitMs),fmt(m.hitToResumeGapMs),fmt(m.uncoveredDmaTailMs),fmt(m.readyToResumeGapMs),fmt(m.resumeToNextGpuGapMs)].map(v=>'<td>'+v+'</td>').join('')+'</tr>').join('');}
 function reset(){viewport={start:0,span:current.wallMs};draw();}

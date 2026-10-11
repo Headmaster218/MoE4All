@@ -37,8 +37,10 @@ const runGit = args => {
   return value.stdout;
 };
 const sourceFiles = [
-  'crates/infr-core/src/config/mod.rs', 'crates/infr-vulkan/build.rs',
+  'Cargo.toml', 'Cargo.lock', 'crates/infr-core/Cargo.toml', 'crates/infr-core/src/graph.rs',
+  'crates/infr-core/src/config/mod.rs', 'crates/infr-core/src/backend.rs', 'crates/infr-vulkan/build.rs',
   'crates/infr-core/src/timeline.rs', 'crates/infr-vulkan/src/timeline.rs',
+  'crates/infr-llama/src/seam/runner.rs',
   'crates/infr-vulkan/src/adapter.rs', 'crates/infr-vulkan/src/gemm.rs',
   'crates/infr-vulkan/src/lib.rs', 'crates/infr-vulkan/src/pager.rs',
   'crates/infr-vulkan/src/recorder.rs', 'crates/infr-vulkan/shaders/gpu_resident_check.comp',
@@ -49,16 +51,24 @@ const sourceFiles = [
   'scripts/gpu-resident-decode-benchmark.cjs', 'scripts/run-gpu-resident-case.cjs',
   'scripts/gpu-resident-log-metrics.cjs',
   'scripts/gpu-resident-correctness.cjs',
+  'scripts/gpu-resident-cache-identity.cjs',
+  'scripts/run-gpu-resident-full-graph.cjs',
+  'scripts/run-gpu-resident-setup-scan.cjs',
+  'scripts/run-gpu-resident-stable-timeline.cjs',
+  'scripts/run-gpu-resident-owned-graph.cjs',
+  'scripts/run-gpu-resident-inline-io.cjs',
+  'scripts/run-gpu-resident-notice-poll.cjs',
 ];
 const manifest = {
   sourceRoot, benchRoot, cache, cacheBudgetGiB: budgetGiB, model, exe, binaryHash: hash(fs.readFileSync(exe)),
   head: runGit(['rev-parse', 'HEAD']).trim(),
   sourceHashes: Object.fromEntries(sourceFiles.map(file => [file, hash(fs.readFileSync(path.join(sourceRoot, file)))])),
+  sourceSnapshotScope: 'Current workspace; a case with binarySourceManifest uses that frozen build instead',
   configuredSlots, cases, results: [],
 };
-fs.writeFileSync(path.join(artifacts, `${tag}-source.patch`), runGit(['diff', '--binary']));
+fs.writeFileSync(path.join(artifacts, `${tag}-source.patch`), runGit(['diff', '--binary', 'HEAD']));
 fs.writeFileSync(path.join(artifacts, `${tag}-manifest.json`), JSON.stringify(manifest, null, 2));
-for (const file of sourceFiles.filter(file => file.includes('/shaders/'))) {
+for (const file of sourceFiles.filter(file => file.includes('/shaders/') || file.startsWith('scripts/run-gpu-resident-') && !file.endsWith('case.cjs'))) {
   fs.copyFileSync(path.join(sourceRoot, file), path.join(artifacts, `${tag}-${path.basename(file)}`));
 }
 for (const item of cases) {
@@ -67,8 +77,18 @@ for (const item of cases) {
   // A dual 150K save needs about 6.1 GiB of temporary room before namespace GC.
   if (before > budget - 7 * 1024 ** 3) throw new Error(`Insufficient safe cache write headroom: ${before}`);
   const caseTag = `${tag}-${item.name}`;
+  const caseExe = path.resolve(item.exe || exe);
+  const binaryHash = hash(fs.readFileSync(caseExe));
+  let binarySourceManifest = null;
+  if (item.binarySourceManifest) {
+    const source = path.resolve(item.binarySourceManifest);
+    const build = JSON.parse(fs.readFileSync(source));
+    if (build.binaryHash !== binaryHash) throw new Error(`Frozen build hash differs: ${source}`);
+    binarySourceManifest = { source, hash: hash(fs.readFileSync(source)) };
+    fs.copyFileSync(source, path.join(artifacts, `${caseTag}-binary-source-manifest.json`));
+  }
   const env = {
-    ...process.env, TRACE_ROOT: artifacts, TRACE_EXE: exe, TRACE_MODEL: model, TRACE_TAG: caseTag,
+    ...process.env, TRACE_ROOT: artifacts, TRACE_EXE: caseExe, TRACE_MODEL: model, TRACE_TAG: caseTag,
     TRACE_ENABLED: process.env.RESIDENT_TRACE || '0', TRACE_SLOTS: String(configuredSlots),
     TRACE_COUNTS: item.counts || process.env.RESIDENT_COUNTS || '1,2',
     TRACE_DEPTHS: item.depths || process.env.RESIDENT_DEPTHS || '30000,150000',
@@ -87,7 +107,7 @@ for (const item of cases) {
   if (env.TRACE_COUNTS.split(',').some(count => ![1, 2].includes(Number(count)) || Number(count) > configuredSlots)) {
     throw new Error('Active lane count must fit the configured slots');
   }
-  console.log(JSON.stringify({ case: caseTag, cacheBefore: before, binaryHash: manifest.binaryHash }));
+  console.log(JSON.stringify({ case: caseTag, cacheBefore: before, exe: caseExe, binaryHash }));
   const child = spawnSync(process.execPath, [path.join(__dirname, 'run-gpu-resident-case.cjs')],
     { cwd: benchRoot, env, windowsHide: true, stdio: 'inherit' });
   if (child.status !== 0) throw new Error(`Runner failed: ${caseTag}`);
@@ -103,7 +123,8 @@ for (const item of cases) {
   const correctnessMatches = item.enabled && reference ? verifyMatchedOutputs(matrix, reference.matrix) : [];
   const after = cacheBytes();
   if (after > budget) throw new Error(`Aggregate test cache exceeded budget: ${after}`);
-  manifest.results.push({ name: item.name, cacheBefore: before, cacheAfter: after, correctnessMatches,
+  manifest.results.push({ name: item.name, exe: caseExe, binaryHash, binarySourceManifest,
+    cacheBefore: before, cacheAfter: after, correctnessMatches,
     matrix: matrix.map(row => ({ count: row.count, depth: row.depth,
       serverLogMetrics: row.serverLogMetrics,
       rounds: row.rounds.map(round => round.requests.map(req => ({

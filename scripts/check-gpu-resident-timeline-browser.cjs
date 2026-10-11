@@ -64,8 +64,10 @@ async function checkGpuOnly(name, width, height) {
   assert.ok(dragged.start > zoomed.start);
   await evaluate("document.getElementById('reset').click()");
   for (let i=0;i<2;i++) {
-    const rows = await evaluate(`window.timelineReady.then(api=> { document.getElementById('case').value=${i};api.choose();return api.getRows().map(r=>r.length); })`);
-    assert.equal(rows[2], 47); assert.ok(rows[4] > 0);
+    const rows = await evaluate(`window.timelineReady.then(api=> { document.getElementById('case').value=${i};api.choose();return api.getRows(); })`);
+    const firstLayer = rows[2].some(e=>e.layer===0) ? 0 : 1;
+    assert.deepEqual(rows[2].map(e=>e.layer).sort((a,b)=>a-b), Array.from({length:48-firstLayer},(_,j)=>j+firstLayer));
+    assert.ok(rows[4].length > 0);
   }
   const capture = await send('Page.captureScreenshot', {format:'png',captureBeyondViewport:false});
   fs.writeFileSync(path.join(root,`timeline-${name}.png`),Buffer.from(capture.data,'base64'));

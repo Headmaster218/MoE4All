@@ -5,6 +5,7 @@ const crypto = require('node:crypto');
 const net = require('node:net');
 const { finished } = require('node:stream/promises');
 const { parseLogMetrics } = require('./gpu-resident-log-metrics.cjs');
+const { snapshotTestCache } = require('./gpu-resident-cache-identity.cjs');
 
 const root = path.resolve(process.env.TRACE_ROOT || 'benchmark-data/artifacts/decode-timeline-20261007');
 const slots = Number(process.env.TRACE_SLOTS || 3);
@@ -111,6 +112,16 @@ async function run(count, depth) {
       { role: 'user', content: 'Perform the requested technical analysis. Start immediately with section 1 and continue substantive numbered sections until the response limit.' },
     ] } : value;
   });
+  const requestOrder = process.env.TRACE_LANE_ORDER
+    ? process.env.TRACE_LANE_ORDER.split(',').map(Number)
+    : Array.from({ length: count }, (_, lane) => lane);
+  if (requestOrder.length !== count || new Set(requestOrder).size !== count ||
+      requestOrder.some(lane => !Number.isInteger(lane) || lane < 0 || lane >= count)) {
+    throw new Error('TRACE_LANE_ORDER must be a permutation of the active lanes');
+  }
+  const identityBefore = sharedKv && process.env.TRACE_CACHE_IDENTITY === '1'
+    ? snapshotTestCache(sharedKv, { hashCheckpointRecords: process.env.TRACE_CACHE_CHECKPOINT_DIGEST === '1' }) : null;
+  if (identityBefore) fs.writeFileSync(path.join(dir, 'cache-identity-before.json'), JSON.stringify(identityBefore, null, 2));
   const shutdown = path.join(dir, 'shutdown'); if (fs.existsSync(shutdown)) fs.unlinkSync(shutdown);
   const trace = path.join(dir, 'trace.json');
   const url = `http://127.0.0.1:${await port()}`;
@@ -118,7 +129,8 @@ async function run(count, depth) {
     '--dev', 'Vulkan1', '--temp', '0', '--seed', '1', '--no-think', '--max-new', String(tokens),
     '--set', 'device.auto_profile=aggressive', '--set', 'kv.type_k=q8_0', '--set', 'kv.type_v=q8_0',
     '--set', 'kv.overflow=false', '--set', `kv.session_cache_dir=${sharedKv || ''}`, '--set', 'spec.mtp=false',
-    '--set', 'prof.ops=false', '--set', 'prof.stages=false', '--set', 'prof.pager_profile=false',
+    '--set', 'prof.ops=false', '--set', `prof.stages=${process.env.TRACE_PROFILE_STAGES === '1'}`,
+    '--set', `prof.pager_profile=${process.env.TRACE_PROFILE_PAGER === '1'}`,
     '--set', 'paging.expert_prefetch=false',
     '--set', 'sampling.ignore_eos=true', '--set', `serve.shutdown_file=${shutdown}`];
   nativeArgs.push('--set', 'serve.stats_interval_secs=1');
@@ -152,6 +164,8 @@ async function run(count, depth) {
   const closed = new Promise(resolve => child.once('close', (code, signal) => { exitInfo = { code, signal }; stdout.end(); stderr.end(); resolve(); }));
   const heartbeat = setInterval(() => log({ count, depth, pid: child.pid, latest: last }), 30000);
   const result = { count, depth, slots, repeats, tokens, continuation, systemPrefix, sharedKv,
+    requestOrder, promptHashes: prompt.map(value => hash(JSON.stringify(value.messages))),
+    cacheIdentityBefore: identityBefore ? 'cache-identity-before.json' : null,
     warmRoundSkip: systemPrefix ? 1 : 0, traceEnabled, exe, binaryHash: hash(fs.readFileSync(exe)), args: nativeArgs, rounds: [] };
   log({ start: dir, pid: child.pid });
   try {
@@ -167,8 +181,9 @@ async function run(count, depth) {
     const conversations = prompt.map(value => [...value.messages]);
     for (let round = 0; round < repeats; round++) {
       const startedUnixMs = Date.now();
-      const requests = await Promise.all(Array.from({ length: count }, (_, lane) => request(url, modelId,
-        continuation ? { messages: conversations[lane] } : prompt[lane], lane)));
+      const requests = (await Promise.all(requestOrder.map(lane => request(url, modelId,
+        continuation ? { messages: conversations[lane] } : prompt[lane], lane))))
+        .sort((a, b) => a.lane - b.lane);
       if ((continuation || systemPrefix) && round > 0) {
         for (const req of requests) {
           const initial = result.rounds[0].requests.find(value => value.lane === req.lane).usage.prompt_tokens;
@@ -193,6 +208,11 @@ async function run(count, depth) {
     if (deadlineKill) clearTimeout(deadlineKill);
     result.exitInfo = exitInfo;
     result.serverLogMetrics = parseLogMetrics(fs.readFileSync(path.join(dir, 'stderr.log'), 'utf8'), result.rounds, count);
+    if (identityBefore) {
+      const identityAfter = snapshotTestCache(sharedKv, { hashCheckpointRecords: process.env.TRACE_CACHE_CHECKPOINT_DIGEST === '1' });
+      fs.writeFileSync(path.join(dir, 'cache-identity-after.json'), JSON.stringify(identityAfter, null, 2));
+      result.cacheIdentityAfter = 'cache-identity-after.json';
+    }
     fs.writeFileSync(path.join(dir, 'result.json'), JSON.stringify(result, null, 2));
     log({ stopped: child.pid, status: result.status, trace: fs.existsSync(trace) ? fs.statSync(trace).size : null });
   }

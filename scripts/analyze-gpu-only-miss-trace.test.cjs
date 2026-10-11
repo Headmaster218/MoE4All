@@ -80,7 +80,11 @@ test('forward boundaries use actual queue ends and preserve the PLE split gap', 
   assert.equal(b.l0EndMs, .021); assert.equal(b.l1StartMs, .1);
   assert.equal(b.lastGpuMs, 4.721); assert.equal(b.tailMs, .279);
   const unsplit = fixture(false); t.after(() => fs.rmSync(unsplit.dir, { recursive: true }));
-  assert.equal(analyze(unsplit.dir).points[0].boundaries.l0ToL1GapMs, null);
+  const full = analyze(unsplit.dir);
+  assert.equal(full.points[0].boundaries.l0ToL1GapMs, null);
+  assert.equal(full.boundaryMetrics.l0ToL1GapMs.n, 0);
+  assert.equal(full.boundaryMetrics.l0ToL1GapMs.mean, null);
+  assert.equal(full.boundaryMetrics.l0ToL1GapMs.median, null);
 });
 test('missing envelopes and invalid forward clocks cannot fabricate a boundary', () => {
   const step = { start_ns: 0, end_ns: 1000 };

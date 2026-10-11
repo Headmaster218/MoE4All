@@ -125,8 +125,11 @@ function analyze(dir) {
     wall: stats(points.map(p => p.wallMs)), main: stats(points.map(p => p.mainMs)), dma: stats(points.map(p => p.dmaMs)),
     missCount: missList.length, dmaMissCount: missList.filter(m => m.transfers.length).length,
     missMetrics: Object.fromEntries(metrics.map(k => [k, stats(missList.map(m => m[k]).filter(v => v !== null))])),
-    boundaryMetrics: Object.fromEntries(['frontMs', 'l0ToL1GapMs', 'tailMs'].map(k =>
-      [k, stats(points.map(p => p.boundaries[k]).filter(v => v !== null))])),
+    boundaryMetrics: Object.fromEntries(['frontMs', 'l0ToL1GapMs', 'tailMs'].map(k => {
+      const values = points.map(p => p.boundaries[k]).filter(v => v !== null);
+      return [k, values.length ? stats(values) :
+        { n: 0, mean: null, median: null, p90: null, p95: null, min: null, max: null, stddev: null }];
+    })),
     sumsPerStep: Object.fromEntries(metrics.map(k => [k, stats(points.map(p => p.misses.reduce((sum, m) => sum + (m[k] || 0), 0)))])),
     maxClockDeviationNs: Math.max(...trace.clock_samples.map(c => c.deviation_ns)) };
 }
