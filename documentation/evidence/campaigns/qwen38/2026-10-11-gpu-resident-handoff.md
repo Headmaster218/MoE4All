@@ -1936,3 +1936,71 @@ desktop 1440/mobile 390 browser checks verify two contexts, twelve samples,
 six nonblank measured tracks, boundary rows, drag/wheel zoom and no page
 overflow. Both test services have stopped; production executable/cache remain
 untouched. Shared test-cache aggregate ends at 19,533,032,628 bytes, below 30 GiB.
+
+### User-directed focus after the evening capture
+
+The user narrows subsequent work to miss notification/upload/resume and the
+outer forward boundaries. The reported DMA duration is 70 **us**, not ms.
+The user explicitly includes mapped CPU-push misses as an equal-priority
+branch: split admission, source preparation, mapped writes and recovery
+handoff; absence of a DMA bar does not make that interval pure control cost.
+Do not broaden this round into L0/L1, full-hit inter-layer gaps, kernel tuning,
+LRU migration or MTP. Finish the already-running mapped-copy A/B without
+launching another unrelated performance sweep.
+
+Across the twelve evening forwards, the per-DMA-miss median notice-to-DMA
+start is 86.68 us at 30K and 83.72 us at 150K. Median readiness-to-resumed-FFN
+is 61.51/58.485 us, where readiness is the later of hit completion and DMA
+completion. DMA/hit overlap is almost absent: median zero, mean 1.515/1.762 us
+over all misses (including mapped-only misses). These are distinct intervals;
+the upload itself is not the only unhidden cost. Front/tail means are
+611.369/364.047 us at 30K and 653.703/358.468 us at 150K, about 1 ms per forward.
+
+The GPU-only capture cannot assign these gaps to individual CPU operations.
+The notice producer source still performs event observation, journal read,
+pager admission/source preparation, then background DMA submission. Existing
+`resident_producer_*` host spans can support a bounded diagnostic capture;
+they must not be interpreted as measurements from the host-disabled chart.
+First separate notification observation, lock wait, admission/copy preparation,
+DMA enqueue and queue-start latency; then separate result handoff, recovery
+encoding/submit and GPU dependency wait. Mixed DMA/mapped misses require
+mapped-write readiness as well; DMA completion alone does not prove every
+expert is ready. Preserve pins, reader retirement and transfer dependencies.
+
+For the outer boundaries, separate runner preparation/plan binding and first
+submission from final fence completion/readback/result handling before choosing
+an optimization. The plotted forward boundary is the runner trace scope, not
+the whole API request or all subsequent sampling/serialization. No fence can
+be removed merely because its time falls outside the last GPU envelope.
+
+### Completed mapped-copy model screen, 2026-10-11 evening +08:00
+
+Tag `stage4-mapped-copy-matrix` uses the frozen `infr-mapped-copy.exe` above
+for both threshold 0 and 6144 KiB. Four cohorts per threshold, three regenerated
+512-token rounds each, configured slots=2, no MTP, no profiler. The control runs
+first in every cohort, then the candidate; this is not an alternating-order
+confirmation. Throughput averages zero-based rounds 1 and 2 in every case.
+
+| Context | Active lanes | Control tok/s/lane | 6144 KiB tok/s/lane | Change |
+| --- | ---: | ---: | ---: | ---: |
+| 30K | 1 | 46.974 | 47.740 | +1.63% |
+| 30K | 2 | 33.449 | 33.757 | +0.92% |
+| 150K | 1 | 43.134 | 42.304 | -1.92% |
+| 150K | 2 | 25.403 | 25.945 | +2.13% |
+
+The candidate's warmed 150K single rounds are 40.613 and 43.996 tok/s;
+both are retained. The corresponding control is 43.070/43.199. No slower
+round is filtered or reset. All twelve candidate batches match same-cache
+control whole outputs, and twelve batches per side match an available ordinary
+golden; no unmatched correctness exclusions or failed requests. All eight test
+services exit normally. Sustained single-lane >=50 remains unmet.
+Shared test-cache aggregate is 20,916,434,288 bytes (19.480 GiB), below the
+30 GiB limit. Production service, executable and cache are unchanged.
+
+Do not promote this as a stable overall improvement or enable the threshold
+by default. The module's faster copy does not isolate complete notice-producer
+cost or guarantee inference gains. No reverse-order sweep is appended here,
+following the user's narrowed focus. Preserve the default-off trial and frozen
+source/binary for subsequent CPU-push critical-path diagnosis alongside DMA.
+Raw manifest, source patch, logs and correctness file share the tag above;
+`stage4-mapped-copy-summary.json` contains all warmed values and module passes.
