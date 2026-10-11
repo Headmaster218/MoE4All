@@ -865,3 +865,53 @@ Ordinary samples have 48 inferred CPU and 48 estimated GPU layers. Resident
 speculative replay emits repeated CPU layer spans and unconditional timestamp
 markers even for skipped dispatches; its layer estimates are intentionally
 omitted rather than pretending these are 48 executed-layer timestamps.
+
+## Notice ACK and producer CPU phase diagnostic
+
+`stage4-producer-phase-diagnostic` retains scheduling/arithmetic unchanged and
+adds the missing producer-ACK wait before pending-segment fence recycling,
+nonblocking poll classification, post-wait recycling, and explicit producer
+phase envelopes. Worker events keep the submitted forward's context but do not
+enter the main-thread exclusive partition. They are not transfer-queue GPU
+intervals. The default-off timeline still records nothing outside selected
+forwards. Core 241 / Vulkan 213 default tests pass (106 GPU tests ignored), along
+with six analyzer tests, including ACK classification and worker exclusion.
+
+Frozen `infr-notice-phase-profile.exe` SHA256 is
+`8c878f2d51d3cb9e510d8d2ee6a47e1383c5b10e5485d54b0a12c9d1b90d6c16`.
+The small diagnostic uses two configured slots, one active, 30K, 384 tokens,
+two rounds and CPU-only tracing of 12 forwards at positions 30103-30114. Both
+candidate batches match the preceding ordinary 384-token baseline jointly on
+cache state and output. No events are dropped; there are no GPU events or clocks.
+Cache usage ends at 19,983,136,028 bytes, below 30 GiB.
+
+| Phase | Mean ms / captured forward |
+| --- | ---: |
+| Step wall | 20.406 |
+| Main-thread notice ACK wait | 6.443 |
+| Main-thread nonblocking notice polls | 0.217 |
+| Main-thread post-wait segment recycling | 0.009 |
+| Main-thread remaining lowering/other | 2.913 |
+| Producer total wall envelope | 14.781 |
+| Producer GPU-event wait / driver polling | 12.770 |
+| Producer journal read | 0.367 |
+| Producer hit LRU update | 0.332 |
+| Producer miss admission / RAM copy preparation | 1.033 |
+| Producer CPU DMA submission | 0.244 |
+
+Producer total contains its subphases; neither these rows nor worker/main rows
+may be summed as sequential work. ACK wait was previously unclassified wall
+time, not a measured 6.4 ms CPU setup cost or a freely removable stall. Removing
+it would race fence reuse with the worker's event/fence queries. Worker event
+wait is mostly a polling envelope, not proof that the driver or GPU computation
+individually costs 12.8 ms. The 59.67 producer notices average 34 hit updates and
+13 miss admissions; the rest are skipped speculative notices. This differs
+from the GPU-query-instrumented window's speculative workload, another reason
+not to subtract phase values between these different profilers.
+
+The next narrow candidate is amortizing the redundant fence-status fallback
+inside event polling. Keep event queries on every iteration and the first fence
+probe immediate, retain completed-without-notice/error detection, and require
+unprofiled A/B before keeping a changed interval. The measured journal/LRU/prep
+costs alone do not establish the 50 tok/s target. This diagnostic's profiled
+request rates and best sampled step are not new unprofiled throughput claims.

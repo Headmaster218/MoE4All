@@ -67,6 +67,8 @@ window.timelineReady = (async () => {
     expert_enqueue: 'CPU 将已准备的专家上传操作和依赖接入当前 recorder；嵌套 command_encode 等在互斥图中另计。',
     dma_host_prepare: 'CPU 准备专用 DMA 命令和可复用槽位；嵌套等待、编码、实际提交在互斥图中另计。不是 DMA 实际搬运时间。',
     recorder_acquire: 'CPU 获取或初始化 Vulkan recorder、command buffer 和配套资源的时间，不是 recorder 的整个生命周期。',
+    recorder_recycle: 'fence 和 notice ACK 已完成之后，CPU 归还 command buffer、descriptor pool 和引用的临时资源。不是等待阶段。',
+    notice_poll: '主线程非阻塞检查 producer 结果队列，不代表阻塞等待；ACK 和阻塞接收另计 wait。',
     router_readback: '路由结果已完成同步之后，CPU 读取专家 ID 等路由结果；前面的等待计入 wait。',
     backend_setup: '每次 backend execute 的入口准备与检查；嵌套的其他已命名阶段另计。',
     residency_snapshot: '主线程冻结专家驻留查找表的时间；不等于上传线程维护 LRU 的全部时间。',
@@ -79,7 +81,7 @@ window.timelineReady = (async () => {
   };
   const colors = { command_encode: '#337eb6', wait: '#d26458', submit: '#9669ab', expert_prepare: '#36a080',
     expert_mapped_copy: '#a88736', expert_enqueue: '#247962', dma_host_prepare: '#d39332', recorder_acquire: '#ab7595',
-    router_readback: '#768f34', backend_setup: '#6799a4', scheduler_front_tail: '#909d55', measurement: '#858585',
+    recorder_recycle: '#6f7884', notice_poll: '#758b9a', router_readback: '#768f34', backend_setup: '#6799a4', scheduler_front_tail: '#909d55', measurement: '#858585',
     lowering_other: '#cad1d7', residency_snapshot: '#bb7354', main: '#315f93', dma: '#23916d', pending: '#b38c41' };
   const f = v => Number(v || 0).toFixed(2), fm = v => Number(v || 0).toFixed(4);
   const cs = document.getElementById('case'), ss = document.getElementById('step');

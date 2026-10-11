@@ -9863,6 +9863,34 @@ struct ResidentNoticeJob {
     fence: Option<ash::vk::Fence>,
     entries: Vec<(usize, ResidentJournalEntry)>,
     done: std::sync::mpsc::Sender<()>,
+    trace_context: Option<infr_core::timeline::Context>,
+}
+
+struct ResidentProducerTrace {
+    name: &'static str,
+    context: infr_core::timeline::Context,
+    start_ns: u64,
+}
+
+impl ResidentProducerTrace {
+    fn begin(name: &'static str, context: Option<infr_core::timeline::Context>) -> Option<Self> {
+        context.map(|context| Self {
+            name,
+            context,
+            start_ns: infr_core::timeline::clock_ns(),
+        })
+    }
+}
+
+impl Drop for ResidentProducerTrace {
+    fn drop(&mut self) {
+        infr_core::timeline::record_cpu_miss(
+            self.name,
+            self.context,
+            self.start_ns,
+            infr_core::timeline::clock_ns(),
+        );
+    }
 }
 
 struct NoticeProducerAck(std::sync::mpsc::Sender<()>);
@@ -9904,6 +9932,7 @@ impl ResidentNoticeProducer {
                             *ordinal,
                             entry,
                             &worker_miss,
+                            job.trace_context,
                         );
                         if output.send((*ordinal, notice)).is_err() {
                             return;
@@ -9929,10 +9958,14 @@ impl ResidentNoticeProducer {
         ordinal: usize,
         entry: &ResidentJournalEntry,
         announced_miss: &std::sync::atomic::AtomicUsize,
+        trace_context: Option<infr_core::timeline::Context>,
     ) -> Result<ProducedNotice> {
+        let _produce = ResidentProducerTrace::begin("resident_producer_total", trace_context);
         let device = &notices.shared.device;
         let event = notices.events[ordinal];
         let mut spins = 0;
+        let event_wait =
+            ResidentProducerTrace::begin("resident_producer_event_wait", trace_context);
         while !unsafe { device.get_event_status(event) }
             .map_err(|error| be(format!("producer notice query: {error}")))?
         {
@@ -9954,7 +9987,11 @@ impl ResidentNoticeProducer {
                 std::thread::yield_now();
             }
         }
+        drop(event_wait);
+        let journal_read =
+            ResidentProducerTrace::begin("resident_producer_journal_read", trace_context);
         let words = resident_notice_words(journal, ordinal)?;
+        drop(journal_read);
         let mut notice = ProducedNotice {
             words,
             promotion: None,
@@ -9962,6 +9999,7 @@ impl ResidentNoticeProducer {
         match words[31] {
             0 => (),
             1 => {
+                let _lru = ResidentProducerTrace::begin("resident_producer_lru", trace_context);
                 let mut guard = pager
                     .lock()
                     .map_err(|_| be("notice producer pager poisoned"))?;
@@ -9975,6 +10013,7 @@ impl ResidentNoticeProducer {
                 // Cancel CPU speculation as soon as the GPU notice arrives, not after its
                 // RAM copy/DMA preparation. The result channel still owns upload handoff.
                 announced_miss.store(ordinal, std::sync::atomic::Ordering::Release);
+                let admit = ResidentProducerTrace::begin("resident_producer_admit", trace_context);
                 let (_, hits, misses) = resident_notice_slots(&words, entry.count)?;
                 let abort = CpuPromotionAbortGuard {
                     pager: Arc::clone(pager),
@@ -10001,6 +10040,9 @@ impl ResidentNoticeProducer {
                     session.protect_lut_ids(role, &misses)?;
                 }
                 drop(guard);
+                drop(admit);
+                let _submit =
+                    ResidentProducerTrace::begin("resident_producer_dma_submit", trace_context);
                 let pending = push
                     .submit_background(executor)?
                     .map(|value| CpuPromotionPending::Dma(executor.clone(), Some(value)));
@@ -10185,6 +10227,7 @@ impl ResidentChunk {
                     .skip(self.notices_sent)
                     .collect(),
                 done,
+                trace_context: infr_core::timeline::context(),
             })
             .map_err(|error| be(format!("submit resident notices: {error}")))?;
         self.notices_sent = count;
@@ -10541,7 +10584,11 @@ impl ResidentChunk {
         let producer = self.producer.as_ref().unwrap();
         self.notice_stop |= producer.stop_recording(self.notices_sent)?;
         while self.notice_cursor < self.notices_sent {
-            let _span = infr_core::timeline::span("gpu_resident_notice_producer_wait");
+            let _span = infr_core::timeline::span(if blocking {
+                "gpu_resident_notice_producer_wait"
+            } else {
+                "resident_notice_poll"
+            });
             let Some((ordinal, result)) = producer.receive(blocking)? else {
                 return Ok(());
             };

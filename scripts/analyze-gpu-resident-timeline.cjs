@@ -36,12 +36,14 @@ function intersection(a, b) {
 function classify(name) {
   if (name.startsWith('trace_')) return [200, 'measurement'];
   if (['queue_idle_wait', 'fence_wait', 'dma_slot_wait', 'dma_timeline_wait', 'PLE_wait',
-    'gpu_resident_notice_wait', 'gpu_resident_notice_producer_wait'].includes(name)) return [100, 'wait'];
+    'gpu_resident_notice_wait', 'gpu_resident_notice_producer_wait', 'resident_notice_ack_wait'].includes(name)) return [100, 'wait'];
   if (name === 'command_encode') return [90, 'command_encode'];
   if (name === 'queue_submit' || name === 'dma_queue_submit') return [80, 'submit'];
   if (name === 'dma_prepare_submit') return [70, 'dma_host_prepare'];
   if (name === 'expert_mapped_copy') return [75, 'expert_mapped_copy'];
   if (name === 'recorder_acquire') return [60, 'recorder_acquire'];
+  if (name === 'resident_segment_recycle') return [60, 'recorder_recycle'];
+  if (name === 'resident_notice_poll') return [50, 'notice_poll'];
   if (name === 'router_readback') return [60, 'router_readback'];
   if (name === 'backend_setup') return [50, 'backend_setup'];
   if (name === 'gpu_resident_lut_freeze') return [50, 'residency_snapshot'];
@@ -49,6 +51,9 @@ function classify(name) {
   if (name === 'expert_enqueue') return [50, 'expert_enqueue'];
   if (name === 'step_front' || name === 'step_tail') return [20, 'scheduler_front_tail'];
   return [0, 'lowering_other'];
+}
+function inferenceEvents(events) {
+  return events.filter(e => !e.name.startsWith('resident_producer_'));
 }
 function partition(events, start, end) {
   const edges = [[start, 0, null], [end, 0, null]], active = new Set(), result = [];
@@ -97,7 +102,7 @@ function analyze(dir) {
   }
   const resident = result.args.includes('kernels.vulkan.decode_gpu_resident=true');
   const hostByStep = new Map(), gpuByStep = new Map();
-  for (const event of data.host_events) {
+  for (const event of inferenceEvents(data.host_events)) {
     if (!hostByStep.has(event.context.step)) hostByStep.set(event.context.step, []);
     hostByStep.get(event.context.step).push(event);
   }
@@ -138,7 +143,7 @@ function analyze(dir) {
       mappedOutsideMainMs: (length(mapped) - length(intersection(mapped, main))) / 1e6,
       waitMainOverlapMs: waitOverlap, waitOutsideMainMs: (cpu.wait || 0) - waitOverlap,
       waitSpansMs: Object.fromEntries(['queue_idle_wait','fence_wait','dma_slot_wait','dma_timeline_wait','PLE_wait',
-        'gpu_resident_notice_wait','gpu_resident_notice_producer_wait'].map(name => [name,
+        'gpu_resident_notice_wait','gpu_resident_notice_producer_wait','resident_notice_ack_wait'].map(name => [name,
         length(merge(host.filter(e => e.name === name).map(e => [Math.max(step.start_ns,e.start_ns),Math.min(step.end_ns,e.end_ns)]))) / 1e6])),
       recorderLifetimeMs: length(merge(host.filter(e => e.name === 'recorder_lifetime').map(e => [e.start_ns, e.end_ns]))) / 1e6,
       mainSubmits: gpu.filter(e => e.name === 'queue_envelope').length,
@@ -187,7 +192,7 @@ for (const depth of [30000, 150000]) {
 }
 fs.writeFileSync(path.join(outputRoot, 'analysis.json'), JSON.stringify(cases));
 const labels = ['command_encode','wait','submit','expert_prepare','expert_mapped_copy','expert_enqueue',
-  'dma_host_prepare','recorder_acquire','router_readback','backend_setup','residency_snapshot',
+  'dma_host_prepare','recorder_acquire','recorder_recycle','notice_poll','router_readback','backend_setup','residency_snapshot',
   'scheduler_front_tail','measurement','lowering_other','main','dma','pending'];
 const { layerRanges, gpuLayerRanges } = require('./gpu-resident-timeline-layers.cjs');
 const markers = {}, gpuMarkers = {};
@@ -223,5 +228,5 @@ const html = fs.readFileSync(path.join(__dirname, 'gpu-resident-timeline-view.ht
 fs.writeFileSync(path.join(outputRoot, 'timeline.html'), html);
 console.log(JSON.stringify(cases.map(({points, outputHashes, profilerEnabledTimings, ...summary}) => summary), null, 2));
 }
-module.exports = { merge, intersection, length, partition, deviceTime, stats, analyze };
+module.exports = { merge, intersection, length, partition, deviceTime, stats, analyze, inferenceEvents };
 if (require.main === module) main();

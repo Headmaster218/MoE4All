@@ -14237,6 +14237,10 @@ impl PendingSegment {
     fn drain(&mut self) -> Result<()> {
         if let Some(done) = self.notice_producer.take() {
             // No producer can query this fence after it is recycled, including Drop/error paths.
+            let _ack_wait = infr_core::timeline::span_with_submit(
+                "resident_notice_ack_wait",
+                self.timeline_query.as_ref().map_or(0, |query| query.id),
+            );
             let _ = done.recv();
         }
         let Some(fence) = self.fence.take() else {
@@ -14278,6 +14282,7 @@ impl PendingSegment {
                 self.shared.return_submit_timing_query(submit_pool);
             }
         }
+        let _recycle = infr_core::timeline::span("resident_segment_recycle");
         self.shared.recorder_fences.lock().unwrap().push(fence);
         self.shared.recorder_cmds.lock().unwrap().push(self.cmd);
         self.shared

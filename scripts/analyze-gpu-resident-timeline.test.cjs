@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
 process.env.TRACE_INPUT_ROOT = process.env.TRACE_INPUT_ROOT || process.cwd();
-const { partition, deviceTime, merge, intersection, length } = require('./analyze-gpu-resident-timeline.cjs');
+const { partition, deviceTime, merge, intersection, length, inferenceEvents } = require('./analyze-gpu-resident-timeline.cjs');
 const { gpuLayerRanges } = require('./gpu-resident-timeline-layers.cjs');
 
 test('producer wait is waiting, nested submit takes wait priority, partition closes', () => {
@@ -13,6 +13,16 @@ test('producer wait is waiting, nested submit takes wait priority, partition clo
   assert.deepEqual(result, [[0, 10, 'lowering_other'], [10, 60, 'wait'],
     [60, 70, 'lowering_other'], [70, 90, 'residency_snapshot'], [90, 100, 'lowering_other']]);
   assert.equal(result.reduce((n, [a, b]) => n + b - a, 0), 100);
+});
+
+test('ACK wait is main-thread waiting; worker envelopes never enter its exclusive partition', () => {
+  const events = inferenceEvents([
+    { name: 'resident_notice_ack_wait', start_ns: 0, end_ns: 100 },
+    { name: 'resident_producer_dma_submit', start_ns: 20, end_ns: 50 },
+    { name: 'resident_producer_admit', start_ns: 10, end_ns: 60 },
+  ]);
+  assert.equal(events.length, 1);
+  assert.deepEqual(partition(events, 0, 100), [[0, 100, 'wait']]);
 });
 
 test('GPU work and dependency intervals use calibrated time, not host encode', () => {

@@ -354,7 +354,7 @@ pub fn flush() -> std::io::Result<()> {
         );
     }
     for event in &state.events {
-        trace.push(serde_json::json!({"name":event.name,"ph":"X","pid":1,"tid":if event.name == "recorder_lifetime" {2} else if matches!(event.name, "cpu_miss_ffn_one" | "cpu_miss_ffn_two" | "cpu_miss_ffn_three" | "cpu_miss_gu" | "cpu_miss_down") {3} else {1},
+        trace.push(serde_json::json!({"name":event.name,"ph":"X","pid":1,"tid":if event.name == "recorder_lifetime" {2} else if event.name.starts_with("resident_producer_") {4} else if matches!(event.name, "cpu_miss_ffn_one" | "cpu_miss_ffn_two" | "cpu_miss_ffn_three" | "cpu_miss_gu" | "cpu_miss_down") {3} else {1},
             "ts":event.start_ns.saturating_sub(origin) as f64 / 1000.0,
             "dur":event.end_ns.saturating_sub(event.start_ns) as f64 / 1000.0,
             "args":{"step":event.context.step,"layer":event.context.layer,"submit":event.submit}}));
@@ -383,6 +383,7 @@ pub fn flush() -> std::io::Result<()> {
     trace.push(serde_json::json!({"name":"thread_name","ph":"M","pid":1,"tid":1,"args":{"name":"CPU inference"}}));
     trace.push(serde_json::json!({"name":"thread_name","ph":"M","pid":1,"tid":2,"args":{"name":"Recorder lifetimes"}}));
     trace.push(serde_json::json!({"name":"thread_name","ph":"M","pid":1,"tid":3,"args":{"name":"CPU miss worker phase envelopes"}}));
+    trace.push(serde_json::json!({"name":"thread_name","ph":"M","pid":1,"tid":4,"args":{"name":"Resident notice producer phase envelopes (not GPU DMA)"}}));
     trace.push(serde_json::json!({"name":"thread_name","ph":"M","pid":2,"tid":1,"args":{"name":"GPU main queue envelopes"}}));
     trace.push(serde_json::json!({"name":"thread_name","ph":"M","pid":2,"tid":2,"args":{"name":"GPU dedicated DMA"}}));
     trace.push(serde_json::json!({"name":"thread_name","ph":"M","pid":2,"tid":3,"args":{"name":"GPU completion milestones (not isolated kernel times)"}}));
