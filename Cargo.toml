@@ -49,6 +49,7 @@ thiserror = "2"
 anyhow = "1"
 half = "2"
 bytemuck = "1"
+smallvec = "1"
 serde = { version = "1", features = ["derive"] }
 # preserve_order: chat templates `tojson` the request's tool definitions into the prompt — HF
 # transformers and llama.cpp-minja both keep the author's key order, so infr must too (BTreeMap
