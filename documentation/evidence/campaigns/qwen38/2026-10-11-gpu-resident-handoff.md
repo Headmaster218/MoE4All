@@ -809,3 +809,59 @@ small (+2.8% at 30K, +1.3% at 150K), while dual-active still regresses. Keep the
 master switch default off; do not promote the screened best round to a claimed
 production rate. Cache usage ends at 20,916,434,288 bytes. No temporary 100 GiB
 limit was needed, and production caches/executable were not changed.
+
+## Short calibrated timeline comparison
+
+The requested small follow-up is `stage4-new-timeline`: ordinary/resident,
+30K/150K, two configured slots and one active, MTP off, 384 tokens and two rounds.
+Each case captures only 12 consecutive forwards in the second round, at
+positions 30103-30114 or 150107-150118. All four candidate batches match ordinary
+cache state and output; all services finish normally. No query warnings or
+dropped events occur; maximum clock calibration deviation is 18 ns. Test caches
+end at 19,049,841,080 bytes, below the aggregate 30 GiB limit.
+
+The standalone HTML, full traces, results, logs and source/throughput manifests
+are preserved under the original checkout's
+`benchmark-data/artifacts/decode-timeline-20261011-gpu-resident/`.
+`scripts/run-gpu-resident-timeline.cjs` reproduces the capture;
+`scripts/analyze-gpu-resident-timeline.cjs` accepts explicit input/output roots
+and the independent unprofiled throughput manifest. The historical October 7
+HTML and renderer are unchanged. Browser checks pass at 1440 and 390 px,
+including canvas pixels, all four case selections, real wheel zoom, drag,
+reset, layer hover and page-overflow checks. Five focused analyzer tests pass.
+
+| Short-window mean per forward | 30K ordinary | 30K resident | 150K ordinary | 150K resident |
+| --- | ---: | ---: | ---: | ---: |
+| Step wall ms | 24.818 | 21.661 | 26.097 | 22.922 |
+| Main-queue envelope union ms | 14.990 | 15.632 | 15.810 | 16.521 |
+| Main submits | 111.33 | 77.17 | 111.33 | 77.17 |
+| Exclusive command encoding ms | 1.612 | 2.052 | 1.646 | 2.415 |
+| Exclusive main-thread submit API ms | 2.160 | 1.829 | 2.230 | 1.998 |
+| Exclusive measurement ms | 2.576 | 2.663 | 2.584 | 2.688 |
+| Pending interval union ms | 6.416 | 10.606 | 6.662 | 10.817 |
+| Pending overlapping main work ms | 2.613 | 8.624 | 2.653 | 8.781 |
+
+These are localized profiled windows, not throughput evidence or independent
+phase medians. Main queue intervals include dependencies and barriers, not
+just arithmetic. The improved submit count is real, but added speculative
+encoding and a slightly larger main envelope oppose it. Longer pending mostly
+overlaps queued main work; it cannot all be called wasted time. The much larger
+main-thread `lowering_other` on the resident path is not established CPU busy
+time: polling/control and uninstrumented delays remain mixed there. Neither
+these short samples nor subtracting explicit measurement overhead proves 50.
+
+The producer thread does not inherit the TLS trace context. Its preparation,
+mapped copies and transfer-queue GPU intervals are absent, so a resident empty
+DMA track does not mean zero transfer, and reduced main-thread preparation is
+not eliminated work. A future precise miss critical-path audit needs producer
+context instrumentation, not another throughput matrix inferred from this gap.
+
+Ordinary CPU layer ranges remain graph-order-derived. Early submit now separates
+MoE from the final HC, so the old same-submit MoE/HC GPU-boundary algorithm no
+longer works. The new estimator associates each final HC's actual recorder and
+host submit with its first GPU HC interval, rejects missing/ambiguous/shared
+anchors, and uses isolated HC duration to split merged injection/norm intervals.
+Ordinary samples have 48 inferred CPU and 48 estimated GPU layers. Resident
+speculative replay emits repeated CPU layer spans and unconditional timestamp
+markers even for skipped dispatches; its layer estimates are intentionally
+omitted rather than pretending these are 48 executed-layer timestamps.
