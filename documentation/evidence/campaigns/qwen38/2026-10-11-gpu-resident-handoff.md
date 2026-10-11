@@ -743,3 +743,69 @@ inflight one 44.8735 (+2.6% versus two). All six candidate batches match ordinar
 cache state and output; all services exited normally. This is a small screening
 result, not proof of 50 tok/s or of improved dual-active/150K behavior. Final cache
 usage is 20,466,326,552 bytes; the 100 GiB exception remains unused.
+
+## Rejected asynchronous main-queue submit experiment
+
+A separate FIFO submit worker moved driver calls out of command encoding. Each
+pending segment retained its command/pools/buffers until both a successful submit
+receipt and GPU fence completion. Notice/fence workers waited the same receipt;
+failed enqueue/submit never waited an unsignaled fence. A host panic drained the
+queue and made subsequent submits fail before releasing its command storage.
+The optional worker was disabled during timeline capture to avoid falsely marking
+an enqueued command as submitted. It did not change shader arithmetic or LRU.
+
+Core 240 / Vulkan 215 default tests passed, including multi-observer and abandoned
+receipt tests. The expanded actual GPU fixture, with asynchronous submit and an
+inflight bound of one, passed synchronization validation in 113.61 seconds. The
+frozen executable `infr-submit-worker.exe` has SHA256
+`ff53e2e2eb25168f45e71bcbdee413d169f4dc413529d51a85677a70c79a9ec2`.
+
+`stage4-submit-worker-screen` completed all four cases on that same executable,
+30K, two configured/one active, 384 tokens, three rounds, no profiling or build
+overlap. All nine candidate batches match ordinary cache state and output.
+
+| Variant | Warm whole-request tok/s |
+| --- | ---: |
+| Ordinary | 42.6036 |
+| Synchronous submit, inflight one | 45.4462 |
+| Asynchronous submit, inflight one | 44.6494 |
+| Asynchronous submit, inflight two | 44.1012 |
+
+Moving the driver call to another thread alone is not a measured win here: both
+asynchronous variants regress versus synchronous inflight one. The causal shares
+of wakeup/handoff, encoding and GPU execution are not separately measured by this
+unprofiled screen. Do not claim all queue_submit time was critical-path time.
+Reject the worker addition; retain its frozen EXE, exact source patch and hashes
+in the artifact directory for future research, without another production knob.
+Final cache usage is 20,949,515,028 bytes, below 30 GiB; no 100 GiB increase.
+
+## Final inflight-one matrix
+
+`stage4-final-inflight1-matrix` completed eight service instances, each with
+512 tokens and three rounds, profiling off, on the same B638 executable. All
+12 resident batches match an ordinary batch jointly on prompt length, cached
+length, output length and output hash. Two slots are configured throughout.
+The table excludes round zero and averages the two warm rounds; dual-active
+per-lane rates average both lanes. Aggregate rates use fully contained Decode
+windows, not summed request rates. Front/middle/late use one-second progress
+bins grouped by token midpoint thirds, rounded by the existing log format.
+
+| Context / active | Ordinary per-lane tok/s | Resident per-lane tok/s | Ordinary aggregate | Resident aggregate |
+| --- | ---: | ---: | ---: | ---: |
+| 30K / 1 | 43.16 | 44.39 | 43.14 | 44.46 |
+| 30K / 2 | 32.07 | 31.24 | 64.14 | 62.40 |
+| 150K / 1 | 38.99 | 39.49 | 39.14 | 39.51 |
+| 150K / 2 | 24.23 | 23.73 | 48.43 | 47.29 |
+
+| Context / active | Ordinary front / middle / late | Resident front / middle / late |
+| --- | ---: | ---: |
+| 30K / 1 | 42.07 / 44.13 / 43.02 | 42.81 / 46.57 / 43.80 |
+| 30K / 2 | 32.27 / 32.35 / 31.49 | 31.56 / 31.67 / 30.24 |
+| 150K / 1 | 37.81 / 39.28 / 39.77 | 38.71 / 39.39 / 40.20 |
+| 150K / 2 | 24.89 / 23.74 / 23.92 | 24.37 / 22.93 / 23.74 |
+
+The full matrix does not confirm the 50 tok/s target. Single-active gains are
+small (+2.8% at 30K, +1.3% at 150K), while dual-active still regresses. Keep the
+master switch default off; do not promote the screened best round to a claimed
+production rate. Cache usage ends at 20,916,434,288 bytes. No temporary 100 GiB
+limit was needed, and production caches/executable were not changed.
