@@ -211,6 +211,8 @@ prefill 与 decode 切换时可以重新分配弹性空间。
 
 更深入的实现说明见[技术文档索引](documentation/README.md)；历史优化和取舍见[变化记录](documentation/evidence/changes/README.md)。
 
+专家缓存留多少显存才够？参见 [FlashNext 专家缓存容量与 Miss 率](documentation/evidence/benchmarks/2026-10-11-flashnext-expert-cache-capacity.md)：真实访问序列的 0.5～48 GiB 离线回放曲线、连续分段指数函数及适用限制。
+
 
 ## 项目与署名
 
