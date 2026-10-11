@@ -13984,6 +13984,12 @@ mod tests {
                         })
                         .collect();
                     if enabled {
+                        assert!(
+                            ResidentChunk::new(&backend, &graph, true, &mut None)
+                                .unwrap()
+                                .is_some(),
+                            "GPU recovery fixture must exercise resident execution, not fallback"
+                        );
                         for (next_chunk, target_tokens) in [(true, None), (false, Some(1))] {
                             let mut prefill = graph.clone();
                             prefill.prefill_next_chunk = next_chunk;
