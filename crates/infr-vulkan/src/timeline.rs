@@ -80,7 +80,7 @@ pub(crate) struct Query {
     pub(crate) id: u64,
     ctx: Context,
     queue: &'static str,
-    labels: Vec<&'static str>,
+    labels: Vec<(&'static str, Context)>,
     host_submit_ns: u64,
     period: f32,
     bits: u32,
@@ -151,7 +151,13 @@ impl Query {
     }
 
     pub(crate) fn mark(&mut self, name: &'static str) {
-        if self.queue != "main" || self.labels.last() == Some(&name) {
+        let name = timeline::device_phase().unwrap_or(name);
+        let ctx = timeline::context().unwrap_or(self.ctx);
+        if self.queue != "main"
+            || self.labels.last().is_some_and(|&(label, previous)| {
+                label == name && previous.layer == ctx.layer && previous.step == ctx.step
+            })
+        {
             return;
         }
         let _span = timeline::span("trace_marker_encode");
@@ -166,7 +172,7 @@ impl Query {
                 self.labels.len() as u32 + 1,
             );
         }
-        self.labels.push(name);
+        self.labels.push((name, ctx));
     }
 
     pub(crate) fn close(&mut self, dispatches: usize, wait: u64, signal: u64, bytes: u64) {
@@ -208,9 +214,10 @@ impl Query {
                     },
                     ticks[0],
                     *ticks.last().unwrap(),
+                    self.ctx,
                 );
-                for (index, label) in self.labels.iter().enumerate() {
-                    self.event(label, ticks[index + 1], ticks[index + 2]);
+                for (index, &(label, ctx)) in self.labels.iter().enumerate() {
+                    self.event(label, ticks[index + 1], ticks[index + 2], ctx);
                 }
                 self.pools.lock().unwrap().push(self.pool);
                 self.pool = vk::QueryPool::null();
@@ -219,11 +226,11 @@ impl Query {
         }
     }
 
-    fn event(&self, name: &'static str, start: u64, end: u64) {
+    fn event(&self, name: &'static str, start: u64, end: u64, context: Context) {
         timeline::record_device(DeviceEvent {
             name,
             queue: self.queue,
-            context: self.ctx,
+            context,
             submit: self.id,
             host_submit_ns: self.host_submit_ns,
             start_tick: start,

@@ -9874,6 +9874,9 @@ struct ResidentProducerTrace {
 
 impl ResidentProducerTrace {
     fn begin(name: &'static str, context: Option<infr_core::timeline::Context>) -> Option<Self> {
+        if !infr_core::timeline::host_enabled() {
+            return None;
+        }
         context.map(|context| Self {
             name,
             context,
@@ -9992,6 +9995,27 @@ impl ResidentNoticeProducer {
             ResidentProducerTrace::begin("resident_producer_journal_read", trace_context);
         let words = resident_notice_words(journal, ordinal)?;
         drop(journal_read);
+        let trace_context = if let Some(mut context) = trace_context {
+            if infr_core::timeline::device_enabled() {
+                context.layer = pager
+                    .lock()
+                    .map_err(|_| be("trace notice pager poisoned"))?
+                    .as_ref()
+                    .ok_or_else(|| be("trace notice pager missing"))?
+                    .registered_layer(entry.roles[0], 512)? as i32;
+                infr_core::timeline::record_resident_notice(infr_core::timeline::ResidentNotice {
+                    context,
+                    ordinal,
+                    status: words[31],
+                    hit_masks: [words[24], words[25]],
+                    count: entry.count,
+                });
+            }
+            Some(context)
+        } else {
+            None
+        };
+        let _trace_context = infr_core::timeline::scoped_context(trace_context);
         let mut notice = ProducedNotice {
             words,
             promotion: None,
@@ -12214,6 +12238,8 @@ fn execute_paged_moe<'a>(
         let rc = rec.as_ref().unwrap();
         rc.end_conditional();
         {
+            let _notice_phase = infr_core::timeline::device_enabled()
+                .then(|| infr_core::timeline::device_phase_scope("resident_router_notice"));
             let params = [
                 n_slots as u32,
                 n_expert as u32,
@@ -12272,6 +12298,13 @@ fn execute_paged_moe<'a>(
             MOE_ROW_MASK_NONE
         };
         let xb = r(*x)?;
+        let hit_phase = infr_core::timeline::device_enabled().then(|| {
+            infr_core::timeline::device_phase_scope(if route.notice.is_some() {
+                "resident_hit_FFN"
+            } else {
+                "resident_full_hit_FFN"
+            })
+        });
         for (dtype, bank, window, shared_weight, output) in [
             (gdt, banks[0], windows[0], shared_wgate, workspace.gbuf),
             (
@@ -12338,6 +12371,7 @@ fn execute_paged_moe<'a>(
             route_mask,
             route_bank,
         );
+        drop(hit_phase);
         if route.notice.is_some() {
             rc.end_conditional();
             if route.control.len_bytes() == crate::recorder::RESIDENT_CONTROL_BYTES {
@@ -12373,6 +12407,8 @@ fn execute_paged_moe<'a>(
         }
         return Ok(current_layer);
     }
+    let _miss_phase = (precomputed_hit_masks.is_some() && infr_core::timeline::device_enabled())
+        .then(|| infr_core::timeline::device_phase_scope("resident_miss_resume_FFN"));
     if let Some(ids) = resume_ids {
         stage_ids = ids;
         // Router, top-k and shared gate belong to the paused layer. Its frontend must not rerun.

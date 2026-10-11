@@ -6,6 +6,7 @@ const { pathToFileURL } = require('node:url');
 
 if (!process.env.TRACE_ANALYSIS_ROOT) throw new Error('TRACE_ANALYSIS_ROOT must name the new chart');
 const root = path.resolve(process.env.TRACE_ANALYSIS_ROOT);
+const gpuOnly = process.env.GPU_ONLY_TRACE === '1';
 const profile = path.join(root, `edge-cdp-${Date.now()}`);
 const child = spawn('C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe', [
   '--headless=new', '--disable-gpu', '--disable-extensions', '--disable-background-networking',
@@ -28,6 +29,45 @@ async function evaluate(expression) {
   const result = await send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true });
   assert.equal(result.exceptionDetails, undefined);
   return result.result.value;
+}
+
+async function checkGpuOnly(name, width, height) {
+  const metrics = await evaluate(`window.timelineReady.then(api => ({
+    width: innerWidth, documentWidth: document.documentElement.scrollWidth,
+    cases: api.getCases().length, steps: document.getElementById('step').options.length,
+    rows: api.getRows().length, misses: document.getElementById('misses').rows.length,
+    canvasWidth: document.getElementById('timeline').clientWidth
+  }))`);
+  assert.equal(metrics.width, width);
+  assert.ok(metrics.documentWidth <= width, 'GPU-only page overflow');
+  assert.equal(metrics.cases, 2); assert.equal(metrics.steps, 12); assert.equal(metrics.rows, 5);
+  assert.ok(metrics.misses > 0 && metrics.canvasWidth > 200);
+  const colored = await evaluate(`(() => {
+    const c = document.getElementById('timeline'), p = c.getContext('2d').getImageData(0,0,c.width,c.height).data;
+    let count = 0; for (let i=0;i<p.length;i+=4) if (p[i+3] && Math.max(p[i],p[i+1],p[i+2])-Math.min(p[i],p[i+1],p[i+2])>20) count++;
+    return count;
+  })()`);
+  assert.ok(colored > 1000, 'GPU-only blank canvas');
+  await evaluate("document.getElementById('timeline').scrollIntoView({block:'center'})");
+  const original = await evaluate('window.timelineReady.then(api=>api.getViewport())');
+  const at = await evaluate(`(() => { const r=document.getElementById('timeline').getBoundingClientRect(); return {x:r.left+110+(r.width-124)/2,y:r.top+70};})()`);
+  await send('Input.dispatchMouseEvent', { type: 'mouseWheel', ...at, deltaX: 0, deltaY: -400 });
+  await delay(100);
+  const zoomed = await evaluate('window.timelineReady.then(api=>api.getViewport())');
+  assert.ok(zoomed.span < original.span && zoomed.start > 0);
+  await send('Input.dispatchMouseEvent', { type: 'mousePressed', ...at, button:'left',buttons:1,clickCount:1 });
+  await send('Input.dispatchMouseEvent', { type:'mouseMoved',x:at.x-30,y:at.y,button:'left',buttons:1 });
+  await send('Input.dispatchMouseEvent', { type:'mouseReleased',x:at.x-30,y:at.y,button:'left',buttons:0,clickCount:1 });
+  const dragged = await evaluate('window.timelineReady.then(api=>api.getViewport())');
+  assert.ok(dragged.start > zoomed.start);
+  await evaluate("document.getElementById('reset').click()");
+  for (let i=0;i<2;i++) {
+    const rows = await evaluate(`window.timelineReady.then(api=> { document.getElementById('case').value=${i};api.choose();return api.getRows().map(r=>r.length); })`);
+    assert.equal(rows[2], 48); assert.ok(rows[3] > 0);
+  }
+  const capture = await send('Page.captureScreenshot', {format:'png',captureBeyondViewport:false});
+  fs.writeFileSync(path.join(root,`timeline-${name}.png`),Buffer.from(capture.data,'base64'));
+  return {name,...metrics,colored,original,zoomed,dragged};
 }
 
 (async () => {
@@ -63,6 +103,10 @@ async function evaluate(expression) {
         ready = await evaluate('window.timelineReady ? window.timelineReady.then(() => true) : false');
       }
       assert.ok(ready, 'timeline did not render');
+      if (gpuOnly) {
+        results.push(await checkGpuOnly(name, width, height));
+        continue;
+      }
       const metrics = await evaluate(`window.timelineReady.then(api => {
         document.getElementById('case').value = 2; api.choose();
         return { width: innerWidth, documentWidth: document.documentElement.scrollWidth,

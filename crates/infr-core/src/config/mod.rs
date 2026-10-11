@@ -844,6 +844,8 @@ cfg_struct! {
         timeline_path: Option<PathBuf> = None,
         /// Capture host spans without Vulkan timestamp queries or clock calibration.
         timeline_cpu_only: bool = false,
+        /// Capture GPU timestamps and routing metadata without CPU phase spans.
+        timeline_gpu_only: bool = false,
         /// Optional one-shot CPU-miss weight/input fixture for local kernel diagnostics.
         cpu_miss_fixture_dir: Option<PathBuf> = None,
         timeline_skip_steps: usize = 64,
