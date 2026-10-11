@@ -29,7 +29,8 @@ The table takes the highest average speed among the front, middle, and late thir
 [Measured results](#measured-results) |
 [Community results](#community-results) |
 [简体中文](README.md) |
-[Technical documentation](documentation/README.md)
+[Technical documentation](documentation/README.md) |
+[Low-weight expert omission experiment (Chinese)](documentation/evidence/campaigns/qwen38/2026-10-11-low-weight-expert-omission.md)
 
 ## Quick start
 

@@ -10,6 +10,7 @@ verified_commit: ed62393068679573afe94a1472454efe7eae0f15
 
 ## Qwen3.8
 
+- [低权重专家跳过与局部误差](qwen38/2026-10-11-low-weight-expert-omission.md)：真实专家输出记录、108 组离线策略、重归一化对照与交互曲面；未启用实际跳过。
 - [MTP 调研](qwen38/2026-09-22-mtp-investigation.md)
 - [MTP 瓶颈](qwen38/2026-09-23-mtp-bottlenecks.md)
 - [普通单序列解码](qwen38/2026-09-23-single-decode.md)

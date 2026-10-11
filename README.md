@@ -24,7 +24,8 @@ MTP / CPU miss 关闭，配置三个槽位。以下取 2026-10-09 实测前 / �
 [实测结果](#实测结果) |
 [社区实测](#社区实测) |
 [English](README_EN.md) |
-[技术文档](documentation/README.md)
+[技术文档](documentation/README.md) |
+[低权重专家跳过实验](documentation/evidence/campaigns/qwen38/2026-10-11-low-weight-expert-omission.md)
 
 ## 快速使用
 

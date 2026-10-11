@@ -8,6 +8,7 @@ verified_commit: ed62393068679573afe94a1472454efe7eae0f15
 
 # 路线图
 
+- [低权重 miss 专家跳过分档](low-weight-expert-omission.md)：基于局部误差筛选的提案，尚未实现，也未测得端到端加速或最终质量损失。
 - [MoE4All Agent 发行版](agent-distribution.md)：tag 之后的产品提案，不属于 0.9.0 当前能力。
 - [遗留积压](legacy-backlog.md)：尚未逐项重新核验的历史问题与调查记录。
 - [训练提案](training.md)：尚未实现的训练方向。
