@@ -402,6 +402,32 @@ cfg_struct! {
         decode_sparse_lut: Option<bool> = None,
         /// Earlier FFN submit. None selects measured Qwen3.8 Decode without expert prefetch.
         decode_early_submit: Option<bool> = None,
+        /// Experimental paged Decode: continue full-hit layers on GPU, pause at the first miss.
+        decode_gpu_resident: bool = false,
+        /// Bound speculative work and missed-layer recovery; ordinary Decode only.
+        decode_gpu_resident_layers: usize = 4,
+        /// Submit every N checked layers while recording the rest of a chunk; zero keeps one submit.
+        decode_gpu_resident_submit_layers: usize = 0,
+        /// Maximum submitted resident segments kept in flight; clamped to one or two.
+        decode_gpu_resident_inflight: usize = 2,
+        /// Keep resident predicates and LUT tape in coherent mapped VRAM when the device supports it.
+        decode_gpu_resident_mapped_metadata: bool = false,
+        /// A/B keep the published routing journal in coherent mapped VRAM instead of host readback.
+        decode_gpu_resident_mapped_journal: bool = false,
+        /// Drain resident chunks to their own fence instead of waiting for the entire queue (A/B).
+        decode_gpu_resident_fence_wait: bool = false,
+        /// Cache immutable physical addresses and use dense slot protection for resident LUTs (A/B).
+        decode_gpu_resident_fast_lut: bool = false,
+        /// Experimental GPU miss notice and hit-first overlap; ordinary resident Decode only.
+        decode_gpu_resident_hit_first: bool = false,
+        /// Wait submitted resident fences on a dedicated host thread (driver scheduling A/B).
+        decode_gpu_resident_waiter: bool = false,
+        /// Give each checked layer immutable predicate words to avoid predicate read/write barriers.
+        decode_gpu_resident_immutable_predicates: bool = false,
+        /// Receive GPU notices and prepare miss uploads on a separate host producer thread (A/B).
+        decode_gpu_resident_notice_thread: bool = false,
+        /// A/B GPU-produced indirect dispatch sizes instead of conditional-rendering commands.
+        decode_gpu_resident_indirect_predicates: bool = false,
         /// Submit a CPU-miss result/merge immediately instead of waiting for the next router (A/B).
         cpu_miss_early_submit: bool = false,
         /// Fuse the one-row F32 CPU input readback into routing, avoiding a separate copy.

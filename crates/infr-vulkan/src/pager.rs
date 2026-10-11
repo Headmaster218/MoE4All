@@ -1930,12 +1930,13 @@ pub struct MoePagerSession {
     /// view — the in-flight-LUT rule that a single mutable device LUT cannot satisfy once
     /// several layers record into one submission. The cursor is the adapter's (reset only after
     /// a full drain).
-    tape: Box<dyn Buffer>,
+    tape: Arc<dyn Buffer>,
     tape_words: usize,
     /// Physical Decode slots named by LUT windows in the current, not-yet-drained command stream.
     /// Unified runtime claims may retire other Expert filler, but moving one of these slots would
     /// leave the immutable tape address pointing at its former contents.
     frozen_lut_slots: HashSet<ExpertSlotId>,
+    resident_lut_cache: Option<ResidentLutCache>,
     print_stats: bool,
     trace: Option<PagerTrace>,
     /// Physical interpretation of every pool arena. Prefill owns slot 0..n_expert as one
@@ -1959,6 +1960,11 @@ pub struct MoePagerSession {
     /// Physical lane-bank leases in the frozen middle corridor. All registered layers assigned to
     /// the same lane/bank share one entry; dropping this vector releases the whole Prefill phase.
     prefill_allocations: Vec<Arc<UnifiedAllocationHandle>>,
+}
+
+struct ResidentLutCache {
+    addresses: Vec<Vec<u64>>,
+    frozen: Vec<Vec<u8>>,
 }
 
 /// One size pool's spec in [`MoePagerLayout`]: slot counts are INDEPENDENT per pool. Each pool's arena
@@ -2221,13 +2227,43 @@ impl MoePagerSession {
         // historical 64k floor for smaller models, while 512-expert models size to their actual
         // global role space instead of overflowing at the 129th window.
         let tape_words = moe_lut_tape_words(layout.n_blocks);
-        let tape = vk.alloc_uninit(tape_words * 8, BufferUsage::Staging)?;
+        let tape = if vk.cfg().kernels.vulkan.decode_gpu_resident
+            && vk.cfg().kernels.vulkan.decode_gpu_resident_mapped_metadata
+        {
+            match vk.alloc_mapped_arena_bda(tape_words * 8) {
+                Ok((buffer, _)) => buffer,
+                Err(error) => {
+                    tracing::warn!(%error, "resident LUT mapped VRAM unavailable; retaining host staging");
+                    vk.alloc_uninit(tape_words * 8, BufferUsage::Staging)?
+                }
+            }
+        } else {
+            vk.alloc_uninit(tape_words * 8, BufferUsage::Staging)?
+        };
         let transfer_plan = SessionTransferPlan::default();
         let prefill_host_worker_ready = pools.iter().try_fold(true, |ready, pool| {
             Ok::<_, infr_core::Error>(
                 ready && pool.pager.supports_prefill_host_worker(&transfer_plan)?,
             )
         })?;
+        let resident_lut_cache = if vk.cfg().kernels.vulkan.decode_gpu_resident_fast_lut {
+            Some(ResidentLutCache {
+                addresses: pools
+                    .iter()
+                    .map(|pool| {
+                        (0..pool.pager.n_slots())
+                            .map(|slot| pool.pager.slot_addr(slot as u32))
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                frozen: pools
+                    .iter()
+                    .map(|pool| vec![0; pool.pager.n_slots()])
+                    .collect(),
+            })
+        } else {
+            None
+        };
         Ok(Self {
             load_reservation,
             pools,
@@ -2241,9 +2277,10 @@ impl MoePagerSession {
             prefill_host_worker_ready,
             pending_transfer_sources: transfer_sources,
             sources: HashMap::new(),
-            tape,
+            tape: Arc::from(tape),
             tape_words,
             frozen_lut_slots: HashSet::new(),
+            resident_lut_cache,
             print_stats: vk.cfg().paging.stats,
             trace: vk.cfg().paging.trace.clone().map(PagerTrace::new),
             mode: MoeArenaMode::DecodeLru,
@@ -2498,6 +2535,13 @@ impl MoePagerSession {
             return Vec::new();
         };
         let mut protected = self.frozen_lut_slots.clone();
+        if let Some(cache) = &self.resident_lut_cache {
+            for (pool, frozen) in cache.frozen.iter().enumerate() {
+                protected.extend(frozen.iter().enumerate().filter_map(|(slot, &used)| {
+                    (used != 0).then_some(ExpertSlotId { pool, slot })
+                }));
+            }
+        }
         protected.extend(
             self.pools
                 .iter()
@@ -2519,6 +2563,11 @@ impl MoePagerSession {
     /// LUT tape has drained. The adapter resets the tape cursor at the same boundary.
     pub(crate) fn clear_frozen_lut_slots(&mut self) {
         self.frozen_lut_slots.clear();
+        if let Some(cache) = self.resident_lut_cache.as_mut() {
+            for frozen in &mut cache.frozen {
+                frozen.fill(0);
+            }
+        }
     }
 
     /// Retire exactly the Expert filler cells selected by the arena manager, then commit every
@@ -3236,6 +3285,10 @@ impl MoePagerSession {
     /// The LUT tape buffer every windowed dispatch binds (see the `tape` field's doc).
     pub fn tape(&self) -> &dyn Buffer {
         self.tape.as_ref()
+    }
+
+    pub(crate) fn retained_tape(&self) -> Arc<dyn Buffer> {
+        Arc::clone(&self.tape)
     }
 
     /// Model-layer index encoded by a registered expert bank's global block range.
@@ -4038,6 +4091,70 @@ impl MoePagerSession {
         let w = *tape_cursor as u32;
         *tape_cursor += n_expert;
         Ok(w)
+    }
+
+    /// GPU routing is not host-known yet. Freeze every present address until the chunk drains.
+    pub(crate) fn resident_lut_window(
+        &mut self,
+        tape_cursor: &mut usize,
+        buf_id: usize,
+        n_expert: usize,
+    ) -> Result<u32> {
+        let _span = infr_core::timeline::span("gpu_resident_lut_freeze");
+        if let Some(cache) = self.resident_lut_cache.as_mut() {
+            let (_, pool, source) = self
+                .sources
+                .get(&buf_id)
+                .ok_or_else(|| be("resident LUT on an unregistered bank"))?;
+            let end = tape_cursor
+                .checked_add(n_expert)
+                .filter(|&end| end <= self.tape_words)
+                .ok_or_else(|| be("resident LUT tape overflow"))?;
+            let slots = self.pools[*pool]
+                .pager
+                .lut_words(source.block_base as usize, n_expert);
+            let base = as_vk_buf(self.tape.as_ref())?
+                .mapped_ptr()
+                .ok_or_else(|| be("resident LUT tape is not mapped"))?;
+            // Physical coordinates are immutable across exact unified leases. Only payload/LRU
+            // ownership changes; freeze those coordinates until all readers have drained.
+            for (expert, &slot) in slots.iter().enumerate() {
+                let address = if slot == NOT_RESIDENT {
+                    0
+                } else {
+                    let address = *cache.addresses[*pool]
+                        .get(slot as usize)
+                        .ok_or_else(|| be("resident LUT contains an invalid physical slot"))?;
+                    cache.frozen[*pool][slot as usize] = 1;
+                    address
+                };
+                unsafe {
+                    base.add((*tape_cursor + expert) * 8)
+                        .cast::<u64>()
+                        .write(address);
+                }
+            }
+            let window = *tape_cursor as u32;
+            *tape_cursor = end;
+            return Ok(window);
+        }
+        let window = self.lut_window(tape_cursor, buf_id, n_expert)?;
+        let (_, pool, source) = self
+            .sources
+            .get(&buf_id)
+            .expect("lut_window validated source");
+        for &slot in self.pools[*pool]
+            .pager
+            .lut_words(source.block_base as usize, n_expert)
+        {
+            if slot != NOT_RESIDENT {
+                self.frozen_lut_slots.insert(ExpertSlotId {
+                    pool: *pool,
+                    slot: slot as usize,
+                });
+            }
+        }
+        Ok(window)
     }
 
     /// A masked Decode dispatch can only dereference these routed ids. Retain the ordinary

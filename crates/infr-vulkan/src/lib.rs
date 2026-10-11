@@ -721,6 +721,7 @@ struct VulkanShared {
     /// `bind_descriptors`) instead of a pooled `alloc_set` + `update_descriptor_sets` +
     /// `cmd_bind_descriptor_sets` per op. `None` falls back to the pooled path.
     push_descriptor: Option<ash::khr::push_descriptor::Device>,
+    conditional_rendering: Option<ash::ext::conditional_rendering::Device>,
     /// `VK_KHR_external_memory_fd` loader (`vkGetMemoryFdKHR` / `vkGetMemoryFdPropertiesKHR`), when
     /// the device enabled it. `Some` is the gate for the host-less cross-device P2P transport (a
     /// buffer's memory exported as an fd on one backend and imported on another — see `p2p.rs`).
@@ -3475,6 +3476,8 @@ impl VulkanBackend {
         // Intel Arc/ANV that RADV runs never reproduce because the classic pools are never created
         // here). Test/diagnosis knob only.
         let has_push_descriptor = has_ext(c"VK_KHR_push_descriptor") && vkcfg.push_desc;
+        let probe_conditional =
+            has_ext(c"VK_EXT_conditional_rendering") && vkcfg.decode_gpu_resident;
 
         // ── probe features (via VK 1.1 get_physical_device_features2) ─────────
         // Memory model and subgroup-size-control are probed rather than assumed: a portability
@@ -3495,6 +3498,7 @@ impl VulkanBackend {
         // all-reduce (a shared timeline signalled on one device, waited on another). Probed so we
         // never try to enable it where absent (which would fail create_device).
         let mut timeline_feat = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+        let mut conditional_feat = vk::PhysicalDeviceConditionalRenderingFeaturesEXT::default();
         let mut feat2 = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut f16_feat)
             .push_next(&mut memmodel_feat)
@@ -3503,6 +3507,9 @@ impl VulkanBackend {
             .push_next(&mut intdot_feat)
             .push_next(&mut bda_feat)
             .push_next(&mut timeline_feat);
+        if probe_conditional {
+            feat2 = feat2.push_next(&mut conditional_feat);
+        }
         unsafe { instance.get_physical_device_features2(physical_device, &mut feat2) };
         // Core Vulkan 1.0 feature (no extension struct — `get_physical_device_features2` always
         // populates the chain's base `.features`). Several KV-cache dequant/attention shaders
@@ -3526,6 +3533,7 @@ impl VulkanBackend {
         // pushed feature struct (incl. `bda_feat`) until its last use, so the pushed structs can
         // only be read once `feat2` itself is done being touched.
         let has_bda = bda_feat.buffer_device_address != 0;
+        let has_conditional = probe_conditional && conditional_feat.conditional_rendering != 0;
         // The external-semaphore all-reduce needs BOTH the fd extension and the timeline feature
         // (read here, after `feat2`'s last use, for the same borrow reason as `has_bda`).
         let has_ext_sem = has_ext_sem_fd && timeline_feat.timeline_semaphore != 0;
@@ -3858,6 +3866,9 @@ impl VulkanBackend {
         if has_push_descriptor {
             ext_ptrs.push(c"VK_KHR_push_descriptor".as_ptr());
         }
+        if has_conditional {
+            ext_ptrs.push(c"VK_EXT_conditional_rendering".as_ptr());
+        }
         let has_timeline_clock =
             infr_core::timeline::enabled() && has_ext(c"VK_EXT_calibrated_timestamps");
         if has_timeline_clock {
@@ -3955,6 +3966,8 @@ impl VulkanBackend {
         // (chained below when `has_ext_sem`).
         let mut timeline_sem_ci =
             vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
+        let mut conditional_ci = vk::PhysicalDeviceConditionalRenderingFeaturesEXT::default()
+            .conditional_rendering(true);
 
         // Core 1.0 features (shaderInt16 — see the probe comment above): passed via
         // `enabled_features`, NOT a pNext-chained `PhysicalDeviceFeatures2` (the two are mutually
@@ -3982,6 +3995,9 @@ impl VulkanBackend {
         }
         if timeline_enabled {
             device_ci = device_ci.push_next(&mut timeline_sem_ci);
+        }
+        if has_conditional {
+            device_ci = device_ci.push_next(&mut conditional_ci);
         }
         // The two post-ash feature structs (see `vkext`): chained by hand, asking for exactly the
         // bits the device reported, and only when their tier is live. Both must outlive
@@ -4347,6 +4363,8 @@ impl VulkanBackend {
         // Built before `instance`/`device` move into `VulkanShared` below.
         let push_descriptor =
             has_push_descriptor.then(|| ash::khr::push_descriptor::Device::new(&instance, &device));
+        let conditional_rendering = has_conditional
+            .then(|| ash::ext::conditional_rendering::Device::new(&instance, &device));
 
         // External-memory fd loader (`vkGetMemoryFdKHR`/`vkGetMemoryFdPropertiesKHR`) — present only
         // when the device extension was enabled above. `Some` here is the sole gate the P2P path
@@ -4467,6 +4485,7 @@ impl VulkanBackend {
                 max_push_constants: props.limits.max_push_constants_size,
                 i8cm_layout_ok: OnceLock::new(),
                 push_descriptor,
+                conditional_rendering,
                 external_memory_fd,
                 has_dma_buf: has_ext_mem_dma_buf,
                 external_memory_host,
@@ -5578,9 +5597,28 @@ impl VulkanBackend {
     /// Requiring DEVICE_LOCAL here is intentional. Falling back to a host-visible system-memory
     /// heap would silently recreate the full GPU-visible HostWeights mirror this path removes.
     pub fn alloc_mapped_arena_bda(&self, bytes: usize) -> Result<(Box<dyn Buffer>, u64)> {
-        let usage = vk::BufferUsageFlags::from_raw(
+        self.alloc_mapped_arena_bda_inner(bytes, false)
+    }
+
+    pub(crate) fn alloc_mapped_predicate(&self, bytes: usize) -> Result<Box<dyn Buffer>> {
+        self.alloc_mapped_arena_bda_inner(bytes, true)
+            .map(|(buffer, _)| buffer)
+    }
+
+    fn alloc_mapped_arena_bda_inner(
+        &self,
+        bytes: usize,
+        predicate: bool,
+    ) -> Result<(Box<dyn Buffer>, u64)> {
+        let mut usage = vk::BufferUsageFlags::from_raw(
             BUFFER_USAGE.as_raw() | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS.as_raw(),
         );
+        if predicate {
+            if self.shared.conditional_rendering.is_none() {
+                return Err(be("mapped predicate requires conditional rendering"));
+            }
+            usage |= vk::BufferUsageFlags::CONDITIONAL_RENDERING_EXT;
+        }
         let queue_families = self.shared.dedicated_transfer_families();
         let mut info = vk::BufferCreateInfo::default()
             .size(fill_span(bytes))
@@ -6498,13 +6536,16 @@ impl VulkanBackend {
         // matching DEVICE_ADDRESS alloc flag — gpu-allocator sets it (built with
         // `buffer_device_address: true`) on the pooled path below, and the UMA-overflow spill passes
         // it through to `alloc_vram_mapped` explicitly.
-        let usage = if device_address {
+        let mut usage = if device_address {
             vk::BufferUsageFlags::from_raw(
                 BUFFER_USAGE.as_raw() | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS.as_raw(),
             )
         } else {
             BUFFER_USAGE
         };
+        if self.shared.conditional_rendering.is_some() && label == "readback" {
+            usage |= vk::BufferUsageFlags::CONDITIONAL_RENDERING_EXT;
+        }
         // Created at the 4-byte-rounded size (`fill_span`) so the device-local zero-init can cover
         // the whole logical extent — see `fill_span`. Identity for any 4-aligned `size` (all current
         // tensors), so `requirements.size`/the address are unchanged on every live path.

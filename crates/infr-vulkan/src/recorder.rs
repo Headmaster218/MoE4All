@@ -11,7 +11,11 @@ use std::collections::HashSet;
 
 use ash::vk;
 
-use infr_core::{backend::Buffer, error::Result, pager_profile};
+use infr_core::{
+    backend::{Backend, Buffer},
+    error::Result,
+    pager_profile,
+};
 
 use super::ops::ComputeKernel;
 use super::{as_vk_buf, be, Backing, VkBuffer, VulkanBackend};
@@ -19,6 +23,61 @@ use super::{as_vk_buf, be, Backing, VkBuffer, VulkanBackend};
 pub(crate) const QSA_TOPK_PARALLEL_MIN_BLOCKS: u32 = 4096;
 pub(crate) const QSA_TOPK_PARALLEL_WORK_BYTES: usize = (64 * 256 + 2) * 4;
 const QSA_TOPK_PARALLEL_MAX_GROUPS: u32 = 64;
+// Shader ABI: five status words, two predicates per checked layer, one immutable seed.
+pub(crate) const RESIDENT_MAX_LAYERS: usize = 16;
+pub(crate) const RESIDENT_SEED_WORD: usize = 5 + 2 * RESIDENT_MAX_LAYERS;
+pub(crate) const RESIDENT_CONTROL_BYTES: usize = (RESIDENT_SEED_WORD + 1) * 4;
+
+const RESIDENT_DISPATCH_CAPACITY: usize = 8192;
+const RESIDENT_REGION_CAPACITY: usize = 4096;
+const RESIDENT_DIMENSIONS_BASE: usize = RESIDENT_REGION_CAPACITY * 4;
+
+pub(crate) struct ResidentIndirect {
+    metadata: std::sync::Arc<dyn Buffer>,
+    commands: std::sync::Arc<dyn Buffer>,
+    dispatch_cursor: std::sync::atomic::AtomicUsize,
+    region_cursor: std::sync::atomic::AtomicUsize,
+}
+
+impl ResidentIndirect {
+    pub(crate) fn new(be_: &VulkanBackend) -> Result<Self> {
+        Ok(Self {
+            metadata: std::sync::Arc::from(be_.alloc_uninit(
+                (RESIDENT_DIMENSIONS_BASE + RESIDENT_DISPATCH_CAPACITY * 3) * 4,
+                infr_core::backend::BufferUsage::Staging,
+            )?),
+            commands: std::sync::Arc::from(be_.alloc_uninit(
+                RESIDENT_DISPATCH_CAPACITY * 12,
+                infr_core::backend::BufferUsage::Activations,
+            )?),
+            dispatch_cursor: std::sync::atomic::AtomicUsize::new(0),
+            region_cursor: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    pub(crate) fn reset_after_drain(&self) {
+        self.dispatch_cursor
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.region_cursor
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn write_words(&self, start: usize, words: &[u32]) {
+        let ptr = as_vk_buf(self.metadata.as_ref())
+            .unwrap()
+            .mapped_ptr()
+            .unwrap();
+        assert!((start + words.len()) * 4 <= self.metadata.len_bytes());
+        // Each region is finalized before submission and retained until its GPU readers drain.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                words.as_ptr(),
+                ptr.add(start * 4).cast::<u32>(),
+                words.len(),
+            );
+        }
+    }
+}
 
 /// Coopmat prefill shmem-staging mode for `attention_prefill_flash` (Levers 2 & 5,
 /// kv-decode-perf-levers). `Off` = the default direct coopMatLoad from the bound descriptor.
@@ -947,6 +1006,10 @@ pub struct Recorder<'a> {
     /// Set while recording an indirect dispatch so `sync` widens the barrier to cover the
     /// indirect-command read of GPU-written dispatch args.
     indirect_pending: std::cell::Cell<bool>,
+    conditional_active: std::cell::Cell<bool>,
+    conditional_mutable: std::cell::Cell<bool>,
+    resident_indirect: RefCell<Option<std::sync::Arc<ResidentIndirect>>>,
+    indirect_region: std::cell::Cell<Option<(usize, usize)>>,
     /// Debug knobs, resolved ONCE at construction from the backend's `Config` — `debug.no_barrier`,
     /// `debug.full_barrier`, `prof.stages` (S5b). Per-dispatch paths read these fields, never a
     /// config tree walk and never the environment.
@@ -1208,6 +1271,10 @@ impl<'a> Recorder<'a> {
             dirty_transfer: std::cell::Cell::new(false),
             barriers: RefCell::new(0),
             indirect_pending: std::cell::Cell::new(false),
+            conditional_active: std::cell::Cell::new(false),
+            conditional_mutable: std::cell::Cell::new(true),
+            resident_indirect: RefCell::new(None),
+            indirect_region: std::cell::Cell::new(None),
             no_barrier: dbgcfg.no_barrier,
             full_barrier: dbgcfg.full_barrier,
             stages: profcfg.stages,
@@ -1592,6 +1659,10 @@ impl<'a> Recorder<'a> {
         args: vk::Buffer,
         args_off: u64,
     ) {
+        assert!(
+            !self.conditional_active.get() || self.resident_indirect.borrow().is_none(),
+            "resident indirect predicates do not nest pre-existing indirect dispatches"
+        );
         let _timeline_encode = infr_core::timeline::span("command_encode");
         // Auto-label (INFR_PROF_OPS): every dispatch stamps a timestamp tagged with its kernel name
         // — the chokepoint knows the kernel, so no op method needs a manual stamp call. Placed
@@ -1675,7 +1746,26 @@ impl<'a> Recorder<'a> {
                     push,
                 );
             }
-            device.cmd_dispatch(self.cmd, gx, gy, gz);
+            if self.conditional_active.get() && self.resident_indirect.borrow().is_some() {
+                let state = self.resident_indirect.borrow();
+                let state = state.as_ref().unwrap();
+                let ordinal = state
+                    .dispatch_cursor
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                assert!(
+                    ordinal < RESIDENT_DISPATCH_CAPACITY,
+                    "resident indirect dispatch tape overflow"
+                );
+                state.write_words(RESIDENT_DIMENSIONS_BASE + ordinal * 3, &[gx, gy, gz]);
+                let buffer = Self::vk_of(state.commands.as_ref());
+                device.cmd_dispatch_indirect(
+                    self.cmd,
+                    buffer.buffer,
+                    (buffer.sub_offset + ordinal * 12) as u64,
+                );
+            } else {
+                device.cmd_dispatch(self.cmd, gx, gy, gz);
+            }
         }
     }
 
@@ -9001,6 +9091,11 @@ impl<'a> Recorder<'a> {
         dst_offset: usize,
         bytes: usize,
     ) {
+        if self.conditional_active.get() {
+            assert_eq!((src_offset | dst_offset | bytes) & 3, 0);
+            self.copy_strided(src, dst, 1, bytes / 4, src_offset / 4, 0, dst_offset / 4, 0);
+            return;
+        }
         // Transfer chokepoint: previously un-stamped, so copy time silently landed in the
         // preceding label's bucket. Distinct from the `copy_strided` compute kernel.
         self.stamp("copy_buffer");
@@ -9040,6 +9135,18 @@ impl<'a> Recorder<'a> {
         regions: &[vk::BufferCopy],
     ) {
         if regions.is_empty() {
+            return;
+        }
+        if self.conditional_active.get() {
+            for region in regions {
+                self.copy(
+                    src,
+                    region.src_offset as usize,
+                    dst,
+                    region.dst_offset as usize,
+                    region.size as usize,
+                );
+            }
             return;
         }
         self.stamp("copy_buffer");
@@ -11755,8 +11862,356 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Zero a buffer's first `n` 4-byte elements (cmd_fill_buffer) — clears the bucket counters.
+    /// Predicate subsequent dispatches on the GPU-written run word.
+    pub(crate) fn begin_conditional(&self, control: &dyn Buffer) {
+        self.begin_conditional_at(control, 0);
+    }
+
+    pub(crate) fn use_resident_indirect(&self, state: std::sync::Arc<ResidentIndirect>) {
+        assert!(!self.conditional_active.get());
+        let mut current = self.resident_indirect.borrow_mut();
+        if current.is_none() {
+            self.retain_buffer(std::sync::Arc::clone(&state.metadata));
+            self.retain_buffer(std::sync::Arc::clone(&state.commands));
+            *current = Some(state);
+        }
+    }
+
+    pub(crate) fn begin_conditional_at(&self, control: &dyn Buffer, word: usize) {
+        self.begin_conditional_inner(control, word, true);
+    }
+
+    /// The caller must keep this predicate unchanged until every submitted reader drains.
+    pub(crate) fn begin_immutable_conditional_at(&self, control: &dyn Buffer, word: usize) {
+        self.begin_conditional_inner(control, word, false);
+    }
+
+    fn begin_conditional_inner(&self, control: &dyn Buffer, word: usize, mutable: bool) {
+        assert!((word + 1) * 4 <= control.len_bytes());
+        assert!(!self.conditional_active.get());
+        if let Some(state) = self.resident_indirect.borrow().as_ref() {
+            let region = state
+                .region_cursor
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                region < RESIDENT_REGION_CAPACITY,
+                "resident indirect region tape overflow"
+            );
+            let start = state
+                .dispatch_cursor
+                .load(std::sync::atomic::Ordering::Relaxed);
+            state.write_words(region * 4, &[start as u32, 0, word as u32, 0]);
+            // The shader descriptor covers the whole tape. Order earlier indirect readers
+            // before its next write, including readers from a preceding rolling segment.
+            let before = vk::MemoryBarrier::default()
+                .src_access_mask(
+                    vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_WRITE,
+                )
+                .dst_access_mask(vk::AccessFlags::SHADER_WRITE);
+            unsafe {
+                self.be.shared.device.cmd_pipeline_barrier(
+                    self.cmd,
+                    vk::PipelineStageFlags::DRAW_INDIRECT | vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[before],
+                    &[],
+                    &[],
+                );
+            }
+            let kernel = self.be.kernel(
+                "gpu_resident_dispatch",
+                crate::gemm::gpu_resident_dispatch_spv(),
+                3,
+                8,
+            );
+            self.dispatch(
+                kernel,
+                &[
+                    Self::vkb(control),
+                    Self::vkb(state.metadata.as_ref()),
+                    Self::vkb(state.commands.as_ref()),
+                ],
+                1,
+                bytemuck::cast_slice(&[region as u32, RESIDENT_DIMENSIONS_BASE as u32]),
+                1,
+            );
+            let buffer = Self::vk_of(state.commands.as_ref());
+            let barrier = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::INDIRECT_COMMAND_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(buffer.buffer)
+                .offset(buffer.sub_offset as u64)
+                .size(state.commands.len_bytes() as u64);
+            unsafe {
+                self.be.shared.device.cmd_pipeline_barrier(
+                    self.cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::DRAW_INDIRECT,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[barrier],
+                    &[],
+                );
+            }
+            self.indirect_region.set(Some((region, start)));
+            self.conditional_active.set(true);
+            return;
+        }
+        assert!(!self.conditional_active.replace(true));
+        self.conditional_mutable.set(mutable);
+        let loader = self
+            .be
+            .shared
+            .conditional_rendering
+            .as_ref()
+            .expect("conditional rendering was feature-checked");
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::CONDITIONAL_RENDERING_READ_EXT);
+        unsafe {
+            self.be.shared.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::CONDITIONAL_RENDERING_EXT,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+            (loader.fp().cmd_begin_conditional_rendering_ext)(
+                self.cmd,
+                &vk::ConditionalRenderingBeginInfoEXT::default()
+                    .buffer(Self::vk_handle(control))
+                    .offset((Self::vk_of(control).sub_offset + word * 4) as u64),
+            );
+        }
+    }
+
+    pub(crate) fn end_conditional(&self) {
+        if !self.conditional_active.replace(false) {
+            return;
+        }
+        if let Some((region, start)) = self.indirect_region.take() {
+            let state = self.resident_indirect.borrow();
+            let state = state.as_ref().unwrap();
+            let end = state
+                .dispatch_cursor
+                .load(std::sync::atomic::Ordering::Relaxed);
+            state.write_words(region * 4 + 1, &[(end - start) as u32]);
+            return;
+        }
+        unsafe {
+            (self
+                .be
+                .shared
+                .conditional_rendering
+                .as_ref()
+                .unwrap()
+                .fp()
+                .cmd_end_conditional_rendering_ext)(self.cmd);
+            if !self.conditional_mutable.get() {
+                return;
+            }
+            let barrier = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::CONDITIONAL_RENDERING_READ_EXT)
+                .dst_access_mask(vk::AccessFlags::SHADER_WRITE);
+            self.be.shared.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::CONDITIONAL_RENDERING_EXT,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+        }
+    }
+
+    pub(crate) fn gpu_resident_check(
+        &self,
+        ids: &dyn Buffer,
+        tape: &dyn Buffer,
+        control: &dyn Buffer,
+        journal: &dyn Buffer,
+        params: [u32; 6],
+    ) {
+        assert!(!self.conditional_active.get());
+        let kernel = self.be.kernel(
+            "gpu_resident_check",
+            crate::gemm::gpu_resident_check_spv(),
+            4,
+            28,
+        );
+        let params = [
+            params[0],
+            params[1],
+            params[2],
+            params[3],
+            params[4],
+            params[5],
+            u32::from(control.len_bytes() == RESIDENT_CONTROL_BYTES),
+        ];
+        self.dispatch(
+            kernel,
+            &[
+                Self::vkb(ids),
+                Self::vkb(tape),
+                Self::vkb(control),
+                Self::vkb(journal),
+            ],
+            2,
+            bytemuck::cast_slice(&params),
+            1,
+        );
+    }
+
+    pub(crate) fn publish_host_reads(&self) {
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ);
+        unsafe {
+            self.be.shared.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+        }
+    }
+
+    pub(crate) fn gpu_resident_hit_check(
+        &self,
+        ids: &dyn Buffer,
+        tape: &dyn Buffer,
+        control: &dyn Buffer,
+        journal: &dyn Buffer,
+        params: [u32; 8],
+        notice: vk::Event,
+    ) {
+        assert!(!self.conditional_active.get());
+        let kernel = self.be.kernel(
+            "gpu_resident_hit_check",
+            crate::gemm::gpu_resident_hit_check_spv(),
+            4,
+            36,
+        );
+        let params = [
+            params[0],
+            params[1],
+            params[2],
+            params[3],
+            params[4],
+            params[5],
+            params[6],
+            params[7],
+            u32::from(control.len_bytes() == RESIDENT_CONTROL_BYTES),
+        ];
+        self.dispatch(
+            kernel,
+            &[
+                Self::vkb(ids),
+                Self::vkb(tape),
+                Self::vkb(control),
+                Self::vkb(journal),
+            ],
+            // Ids is read/write and not trailing. Conservatively mark all bindings as writes
+            // so the following masked GEMVs observe its freshly written row masks.
+            4,
+            bytemuck::cast_slice(&params),
+            1,
+        );
+        let journal_buf = Self::vk_of(journal);
+        let barrier = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(journal_buf.buffer)
+            .offset((journal_buf.sub_offset + params[5] as usize * 32 * 4) as u64)
+            .size(32 * 4);
+        // Early recovery drains existing submissions rather than submitting an empty tail.
+        // Publish its final run/stopped/reached/invalid words in the same notice dependency.
+        let control_buf = Self::vk_of(control);
+        let control_barrier = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(control_buf.buffer)
+            .offset(control_buf.sub_offset as u64)
+            .size(16);
+        unsafe {
+            self.be.shared.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[barrier, control_barrier],
+                &[],
+            );
+        }
+        // Notices are unconditional. Each has its own immutable journal status; skipped
+        // layers publish SKIP rather than reusing an earlier layer's routed IDs.
+        unsafe {
+            self.be.shared.device.cmd_set_event(
+                self.cmd,
+                notice,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+            );
+        }
+    }
+
+    pub(crate) fn gpu_resident_silu(
+        &self,
+        gate: &dyn Buffer,
+        up: &dyn Buffer,
+        ids: &dyn Buffer,
+        out: &dyn Buffer,
+        params: [u32; 4],
+    ) {
+        let kernel = self.be.kernel(
+            "gpu_resident_silu",
+            crate::gemm::gpu_resident_silu_spv(),
+            4,
+            16,
+        );
+        let words = params[0] * params[2] * params[3];
+        self.dispatch(
+            kernel,
+            &[
+                Self::vkb(gate),
+                Self::vkb(up),
+                Self::vkb(ids),
+                Self::vkb(out),
+            ],
+            1,
+            bytemuck::cast_slice(&params),
+            words.div_ceil(128),
+        );
+    }
+
+    /// Zero the first `n` words, using a predicated compute fill inside conditional regions.
     pub fn zero(&self, buf: &dyn Buffer, n: usize) {
+        if self.conditional_active.get() {
+            let kernel = self
+                .be
+                .kernel("zero_words", crate::gemm::zero_words_spv(), 1, 4);
+            self.dispatch(
+                kernel,
+                &[Self::vkb(buf)],
+                1,
+                &(n as u32).to_ne_bytes(),
+                (n as u32).div_ceil(256),
+            );
+            return;
+        }
         // Transfer chokepoint (see `copy`): previously an un-stamped blind spot.
         self.stamp("zero_fill");
         // `cmd_fill_buffer` takes a raw handle + explicit byte offset, not a descriptor — go
@@ -13161,6 +13616,7 @@ impl<'a> Recorder<'a> {
         self,
         after_submit: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
+        self.end_conditional();
         let device = &self.be.shared.device;
         let dispatches = self.dispatches.get();
         let t_record = self.t0.elapsed();
@@ -13252,6 +13708,7 @@ impl<'a> Recorder<'a> {
     /// Only the NOT-yet-submitted buffer is abandoned. Anything already on the queue is still
     /// drained by the caller — a submitted command buffer cannot be cancelled, only waited on.
     pub fn discard(self) -> Result<()> {
+        self.end_conditional();
         let device = &self.be.shared.device;
         let end = unsafe { device.end_command_buffer(self.cmd) };
         self.free_transient();
@@ -13270,6 +13727,7 @@ impl<'a> Recorder<'a> {
     /// per-recorder, so cross-submission RAW/WAR ordering (scratch reuse, arena-slot rewrites vs
     /// a prior segment's reads) is otherwise invisible to it.
     pub fn finish_nowait(self) -> Result<PendingSegment> {
+        self.end_conditional();
         let dispatches = self.dispatches.get();
         if self.stages || self.prof_ops {
             let shared = std::sync::Arc::clone(&self.be.shared);
@@ -13285,6 +13743,8 @@ impl<'a> Recorder<'a> {
                 submit_pager_profile: false,
                 dispatches,
                 timeline_query: None,
+                waiter: None,
+                notice_producer: None,
             });
         }
         if pager_profile::active() {
@@ -13351,6 +13811,8 @@ impl<'a> Recorder<'a> {
             submit_pager_profile,
             dispatches,
             timeline_query: self.timeline_query.borrow_mut().take(),
+            waiter: None,
+            notice_producer: None,
         })
     }
 
@@ -13399,6 +13861,7 @@ impl<'a> Recorder<'a> {
     /// and its own segment is a SEPARATE submit at replay time, so no single submit can trip the
     /// per-submit GPU hang watchdog. A discrete GPU records the whole decode into one segment.
     pub(crate) fn end_segment(self) -> Result<RecordedSegment> {
+        self.end_conditional();
         if self.stages {
             eprintln!("[prof] barriers emitted = {}", self.barriers.borrow());
         }
@@ -13422,6 +13885,7 @@ impl<'a> Recorder<'a> {
     /// fast path taken by every discrete GPU; a device that watchdog-splits its decode builds a
     /// multi-segment [`RecordedCmd`] from [`Self::end_segment`] instead.
     pub fn finish_record(self) -> Result<RecordedCmd> {
+        self.end_conditional();
         let shared = std::sync::Arc::clone(&self.be.shared);
         let seg = self.end_segment()?;
         Ok(RecordedCmd::from_shared_segments(shared, vec![seg]))
@@ -13650,10 +14114,58 @@ impl Drop for RecordedCmd {
     }
 }
 
-/// A submitted-but-unwaited segment from [`Recorder::finish_nowait`]: holds the fence its submit
-/// signals plus the transient objects (command buffer, descriptor pools) that must outlive GPU
-/// execution. [`Self::wait`] blocks on the fence and releases everything; `Drop` does the same
-/// (best-effort) so an error path can never free a command buffer the GPU still owns.
+/// Optional host wait producer. Fence mode leaves the Vulkan queue mutex available to submits;
+/// the queue-idle comparator uses the ordinary serialized gate and can delay further submits.
+pub(crate) struct FenceWaiter {
+    sender: Option<std::sync::mpsc::Sender<FenceWaitJob>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+struct FenceWaitJob {
+    fence: vk::Fence,
+    done: std::sync::mpsc::Sender<std::result::Result<(), vk::Result>>,
+}
+
+impl FenceWaiter {
+    pub(crate) fn new(
+        shared: std::sync::Arc<crate::VulkanShared>,
+        queue_idle: bool,
+    ) -> Result<Self> {
+        let (sender, receiver) = std::sync::mpsc::channel::<FenceWaitJob>();
+        let thread = std::thread::Builder::new()
+            .name("resident-fence-wait".into())
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    let result = if queue_idle {
+                        shared.queue_wait_idle_serialized()
+                    } else {
+                        Ok(())
+                    }
+                    .and_then(|()| unsafe {
+                        shared.device.wait_for_fences(&[job.fence], true, u64::MAX)
+                    });
+                    let _ = job.done.send(result);
+                }
+            })
+            .map_err(|error| be(format!("resident fence waiter: {error}")))?;
+        Ok(Self {
+            sender: Some(sender),
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for FenceWaiter {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// A submitted segment owns its fence and transient objects until GPU completion. Both explicit
+/// waits and Drop drain the optional worker before recycling objects that the GPU can still read.
 pub struct PendingSegment {
     shared: std::sync::Arc<crate::VulkanShared>,
     /// `None` = already drained (the profiling degrade path in `finish_nowait`, or after `wait`).
@@ -13670,9 +14182,36 @@ pub struct PendingSegment {
     /// Dispatches this segment carried; consumed by the submit profiler and finite GPU tuner.
     dispatches: usize,
     timeline_query: Option<crate::timeline::Query>,
+    /// The fence is never reset/recycled until this worker's wait has returned.
+    waiter: Option<std::sync::mpsc::Receiver<std::result::Result<(), vk::Result>>>,
+    notice_producer: Option<std::sync::mpsc::Receiver<()>>,
 }
 
 impl PendingSegment {
+    pub(crate) fn notice_fence(&self) -> Option<vk::Fence> {
+        self.fence
+    }
+
+    pub(crate) fn retain_notice_producer(&mut self, done: std::sync::mpsc::Receiver<()>) {
+        assert!(self.notice_producer.replace(done).is_none());
+    }
+
+    pub(crate) fn start_waiter(&mut self, worker: &FenceWaiter) -> Result<()> {
+        let Some(fence) = self.fence else {
+            return Ok(());
+        };
+        debug_assert!(self.waiter.is_none());
+        let (done, receiver) = std::sync::mpsc::channel();
+        worker
+            .sender
+            .as_ref()
+            .expect("live fence waiter")
+            .send(FenceWaitJob { fence, done })
+            .map_err(|error| be(format!("submit resident fence wait: {error}")))?;
+        self.waiter = Some(receiver);
+        Ok(())
+    }
+
     /// Dispatches recorded into this segment's command buffer.
     pub fn dispatches(&self) -> usize {
         self.dispatches
@@ -13696,6 +14235,10 @@ impl PendingSegment {
     }
 
     fn drain(&mut self) -> Result<()> {
+        if let Some(done) = self.notice_producer.take() {
+            // No producer can query this fence after it is recycled, including Drop/error paths.
+            let _ = done.recv();
+        }
         let Some(fence) = self.fence.take() else {
             return Ok(()); // already drained
         };
@@ -13705,7 +14248,12 @@ impl PendingSegment {
             "fence_wait",
             self.timeline_query.as_ref().map_or(0, |query| query.id),
         );
-        let waited = unsafe { device.wait_for_fences(&[fence], true, u64::MAX) };
+        let waited = match self.waiter.take() {
+            Some(receiver) => receiver
+                .recv()
+                .unwrap_or_else(|_| unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }),
+            None => unsafe { device.wait_for_fences(&[fence], true, u64::MAX) },
+        };
         drop(wait_span);
         if waited.is_ok() {
             if let Some(query) = self.timeline_query.take() {
@@ -14151,6 +14699,478 @@ mod tests {
             device.destroy_fence(fence, None);
             device.destroy_semaphore(ready, None);
             device.destroy_semaphore(witness, None);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn gpu_resident_conditions_preserve_paused_state() {
+        let mut cfg = infr_core::config::Config::default();
+        cfg.kernels.vulkan.decode_gpu_resident = true;
+        let backend = VulkanBackend::new_with(std::sync::Arc::new(cfg)).unwrap();
+        assert!(
+            backend.shared.conditional_rendering.is_some(),
+            "conditional rendering required"
+        );
+        let control = backend.alloc(16, BufferUsage::Readback).unwrap();
+        let journal = backend.alloc(4 * 32 * 4, BufferUsage::Readback).unwrap();
+        let tape = backend.alloc(3 * 16 * 8, BufferUsage::Staging).unwrap();
+        let source = backend.alloc(4, BufferUsage::Staging).unwrap();
+        backend
+            .upload(source.as_ref(), bytemuck::bytes_of(&17u32))
+            .unwrap();
+        let increment = backend.alloc(4, BufferUsage::Staging).unwrap();
+        backend
+            .upload(increment.as_ref(), bytemuck::bytes_of(&1f32))
+            .unwrap();
+        for rows in [1, 2] {
+            for missing_at in [None, Some(0), Some(1), Some(3)] {
+                for missing_role in 0..3 {
+                    let outputs: Vec<_> = (0..4)
+                        .map(|_| backend.alloc(4, BufferUsage::Readback).unwrap())
+                        .collect();
+                    let fronts: Vec<_> = (0..4)
+                        .map(|_| backend.alloc(4, BufferUsage::Readback).unwrap())
+                        .collect();
+                    let cleared: Vec<_> = (0..4)
+                        .map(|_| backend.alloc(4, BufferUsage::Readback).unwrap())
+                        .collect();
+                    let routed: Vec<_> = (0..4)
+                        .map(|_| backend.alloc(rows * 3 * 4, BufferUsage::Staging).unwrap())
+                        .collect();
+                    let mut addresses = vec![1u64; 48];
+                    if let Some(stage) = missing_at {
+                        addresses[missing_role * 16 + stage] = 0;
+                    }
+                    backend
+                        .upload(tape.as_ref(), bytemuck::cast_slice(&addresses))
+                        .unwrap();
+                    for stage in 0..4 {
+                        for buffer in [&outputs[stage], &cleared[stage]] {
+                            backend
+                                .upload(buffer.as_ref(), bytemuck::bytes_of(&99u32))
+                                .unwrap();
+                        }
+                        backend
+                            .upload(fronts[stage].as_ref(), bytemuck::bytes_of(&99f32))
+                            .unwrap();
+                        let ids = vec![stage as u32; rows * 3];
+                        backend
+                            .upload(routed[stage].as_ref(), bytemuck::cast_slice(&ids))
+                            .unwrap();
+                    }
+                    let rec = backend.recorder().unwrap();
+                    rec.gpu_resident_check(
+                        control.as_ref(),
+                        tape.as_ref(),
+                        control.as_ref(),
+                        journal.as_ref(),
+                        [0; 6],
+                    );
+                    rec.begin_conditional(control.as_ref());
+                    for stage in 0..4 {
+                        // Frontend runs up to and including the missed router, but no later state write.
+                        rec.add(
+                            fronts[stage].as_ref(),
+                            increment.as_ref(),
+                            fronts[stage].as_ref(),
+                            1,
+                        );
+                        rec.end_conditional();
+                        rec.gpu_resident_check(
+                            routed[stage].as_ref(),
+                            tape.as_ref(),
+                            control.as_ref(),
+                            journal.as_ref(),
+                            [(rows * 3) as u32, 16, 0, 16, 32, stage as u32],
+                        );
+                        rec.begin_conditional(control.as_ref());
+                        rec.copy(source.as_ref(), 0, outputs[stage].as_ref(), 0, 4);
+                        rec.zero(cleared[stage].as_ref(), 1);
+                    }
+                    rec.finish().unwrap();
+                    let mut status = [0u32; 4];
+                    backend
+                        .download(control.as_ref(), bytemuck::cast_slice_mut(&mut status))
+                        .unwrap();
+                    assert_eq!(
+                        status,
+                        missing_at.map_or([1, u32::MAX, 4, 0], |stage| [
+                            0,
+                            stage as u32,
+                            stage as u32 + 1,
+                            0
+                        ])
+                    );
+                    for stage in 0..4 {
+                        let hit = missing_at.is_none_or(|miss| stage < miss);
+                        let front = missing_at.is_none_or(|miss| stage <= miss);
+                        for (buffer, expected) in [
+                            (&outputs[stage], if hit { 17 } else { 99 }),
+                            (
+                                &fronts[stage],
+                                if front {
+                                    100f32.to_bits()
+                                } else {
+                                    99f32.to_bits()
+                                },
+                            ),
+                            (&cleared[stage], if hit { 0 } else { 99 }),
+                        ] {
+                            let mut actual = [0u32];
+                            backend
+                                .download(buffer.as_ref(), bytemuck::cast_slice_mut(&mut actual))
+                                .unwrap();
+                            assert_eq!(
+                                actual[0], expected,
+                                "rows={rows} miss={missing_at:?} role={missing_role} stage={stage}"
+                            );
+                        }
+                    }
+                    if let Some(missed) = missing_at {
+                        addresses.fill(1);
+                        backend
+                            .upload(tape.as_ref(), bytemuck::cast_slice(&addresses))
+                            .unwrap();
+                        let resumed = backend.recorder().unwrap();
+                        resumed.seed_barrier();
+                        resumed.gpu_resident_check(
+                            control.as_ref(),
+                            tape.as_ref(),
+                            control.as_ref(),
+                            journal.as_ref(),
+                            [0; 6],
+                        );
+                        resumed.begin_conditional(control.as_ref());
+                        for stage in missed..4 {
+                            // Resume at the missed FFN, not at its already-executed frontend.
+                            if stage > missed {
+                                resumed.add(
+                                    fronts[stage].as_ref(),
+                                    increment.as_ref(),
+                                    fronts[stage].as_ref(),
+                                    1,
+                                );
+                            }
+                            resumed.copy(source.as_ref(), 0, outputs[stage].as_ref(), 0, 4);
+                            resumed.zero(cleared[stage].as_ref(), 1);
+                        }
+                        resumed.finish().unwrap();
+                        for stage in 0..4 {
+                            let mut actual = [0f32];
+                            backend
+                                .download(
+                                    fronts[stage].as_ref(),
+                                    bytemuck::cast_slice_mut(&mut actual),
+                                )
+                                .unwrap();
+                            assert_eq!(actual[0], 100., "frontend must execute exactly once");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an idle Vulkan GPU; reports mechanism timings, not model throughput"]
+    fn gpu_resident_handoff_microbenchmark() {
+        let mut cfg = infr_core::config::Config::default();
+        cfg.kernels.vulkan.decode_gpu_resident = true;
+        let backend = VulkanBackend::new_with(std::sync::Arc::new(cfg)).unwrap();
+        assert!(backend.shared.conditional_rendering.is_some());
+        let device = &backend.shared.device;
+        let query = unsafe {
+            device.create_query_pool(
+                &vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(2),
+                None,
+            )
+        }
+        .unwrap();
+        let control = backend.alloc(16, BufferUsage::Readback).unwrap();
+        let journal = backend.alloc(128, BufferUsage::Readback).unwrap();
+        let tape = backend.alloc(512 * 3 * 8, BufferUsage::Staging).unwrap();
+        // One routed triplet: IQ2_S gate/up plus IQ4_NL down, ne=2560, nff=640.
+        let expert_bytes = 2 * (2560 * 640 / 256 * 82) + 2560 * 640 / 32 * 18;
+        let host_bytes = vec![0x3fu8; expert_bytes];
+        let host: std::sync::Arc<dyn Buffer> = std::sync::Arc::from(
+            backend
+                .alloc(expert_bytes, BufferUsage::HostWeights)
+                .unwrap(),
+        );
+        backend.upload(host.as_ref(), &host_bytes).unwrap();
+        let (expert, _) = backend.alloc_mapped_arena_bda(expert_bytes).unwrap();
+        let expert: std::sync::Arc<dyn Buffer> = std::sync::Arc::from(expert);
+        let dma_host: std::sync::Arc<dyn Buffer> = std::sync::Arc::from(
+            backend
+                .alloc(expert_bytes, BufferUsage::HostWeights)
+                .unwrap(),
+        );
+        backend.upload(dma_host.as_ref(), &host_bytes).unwrap();
+        for source in [&host, &dma_host] {
+            let crate::Backing::Pooled(allocation) = &as_vk_buf(source.as_ref()).unwrap().backing
+            else {
+                panic!("microbenchmark source must be allocator-owned host RAM")
+            };
+            let flags = allocation.memory_properties();
+            assert!(
+                !flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL),
+                "expert source must be RAM, not ReBAR VRAM: {flags:?}"
+            );
+            println!("HANDOFF_SOURCE memory={flags:?} bytes={expert_bytes}");
+        }
+        let dummy = backend.alloc(4, BufferUsage::Staging).unwrap();
+        let timestamp = |rec: &Recorder<'_>, index, stage| unsafe {
+            device.cmd_write_timestamp(rec.cmd, stage, query, index);
+        };
+        let ordering = |rec: &Recorder<'_>| unsafe {
+            device.cmd_pipeline_barrier(
+                rec.cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                    .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)],
+                &[],
+                &[],
+            );
+        };
+        for rows in [1, 2] {
+            let input = backend
+                .alloc(rows * 2560 * 4, BufferUsage::Activations)
+                .unwrap();
+            backend
+                .upload(
+                    input.as_ref(),
+                    bytemuck::cast_slice(&vec![1f32; rows * 2560]),
+                )
+                .unwrap();
+            let weight = backend.alloc(512 * 2560 * 4, BufferUsage::Weights).unwrap();
+            let mut weights = vec![0f32; 512 * 2560];
+            for e in 0..512 {
+                weights[e * 2560] = (512 - e) as f32;
+            }
+            backend
+                .upload(weight.as_ref(), bytemuck::cast_slice(&weights))
+                .unwrap();
+            let logits = backend
+                .alloc(rows * 512 * 4, BufferUsage::Activations)
+                .unwrap();
+            let ids = backend.alloc(rows * 10 * 4, BufferUsage::Readback).unwrap();
+            let wts = backend
+                .alloc(rows * 10 * 4, BufferUsage::Activations)
+                .unwrap();
+            let output = backend
+                .alloc(rows * 512 * 4, BufferUsage::Activations)
+                .unwrap();
+            let router = |rec: &Recorder<'_>| {
+                rec.linear_f32(
+                    weight.as_ref(),
+                    input.as_ref(),
+                    logits.as_ref(),
+                    rows,
+                    2560,
+                    512,
+                );
+                rec.moe_topk(
+                    logits.as_ref(),
+                    ids.as_ref(),
+                    wts.as_ref(),
+                    dummy.as_ref(),
+                    rows,
+                    512,
+                    10,
+                    1.,
+                    0,
+                    true,
+                    false,
+                    0,
+                    0,
+                    dummy.as_ref(),
+                    false,
+                );
+            };
+            let mut cases = vec![
+                "cpu_hit",
+                "gpu_hit",
+                "gpu_miss_push",
+                "gpu_miss_dma",
+                "gpu_miss_dedicated",
+            ];
+            if std::env::var_os("MOE4ALL_HANDOFF_REVERSE").is_some() {
+                cases.reverse();
+            }
+            for case in cases {
+                if case == "gpu_miss_dedicated" && backend.shared.dedicated_transfer.is_none() {
+                    continue;
+                }
+                let mut gaps = Vec::new();
+                let mut totals = Vec::new();
+                let mut host_prepare = Vec::new();
+                for sample in 0..112 {
+                    let missing = case.starts_with("gpu_miss");
+                    if missing {
+                        let ptr = as_vk_buf(expert.as_ref()).unwrap().mapped_ptr().unwrap();
+                        crate::copy_to_mapped(&[0u8; 4], unsafe { ptr.add(expert_bytes - 4) });
+                    }
+                    let mut addresses = vec![1u64; 1536];
+                    if missing {
+                        addresses[0] = 0;
+                    }
+                    backend
+                        .upload(tape.as_ref(), bytemuck::cast_slice(&addresses))
+                        .unwrap();
+                    let start = std::time::Instant::now();
+                    let rec = backend.recorder().unwrap();
+                    unsafe {
+                        device.cmd_reset_query_pool(rec.cmd, query, 0, 2);
+                    }
+                    rec.gpu_resident_check(
+                        control.as_ref(),
+                        tape.as_ref(),
+                        control.as_ref(),
+                        journal.as_ref(),
+                        [0; 6],
+                    );
+                    router(&rec);
+                    timestamp(&rec, 0, vk::PipelineStageFlags::BOTTOM_OF_PIPE);
+                    let rec = if case == "cpu_hit" {
+                        rec.publish_host_reads();
+                        rec.finish().unwrap();
+                        let mut routed = vec![0u32; rows * 10];
+                        backend
+                            .download(ids.as_ref(), bytemuck::cast_slice_mut(&mut routed))
+                            .unwrap();
+                        assert!(
+                            routed
+                                .iter()
+                                .all(|&id| (0..3)
+                                    .all(|role| addresses[role * 512 + id as usize] != 0))
+                        );
+                        let resumed = backend.recorder().unwrap();
+                        resumed.seed_barrier();
+                        resumed
+                    } else {
+                        rec.gpu_resident_check(
+                            ids.as_ref(),
+                            tape.as_ref(),
+                            control.as_ref(),
+                            journal.as_ref(),
+                            [(rows * 10) as u32, 512, 0, 512, 1024, 0],
+                        );
+                        if missing {
+                            rec.publish_host_reads();
+                            rec.finish().unwrap();
+                            let mut status = [0u32; 4];
+                            backend
+                                .download(control.as_ref(), bytemuck::cast_slice_mut(&mut status))
+                                .unwrap();
+                            assert_eq!(status, [0, 0, 1, 0]);
+                            let prepare = std::time::Instant::now();
+                            let resumed = backend.recorder().unwrap();
+                            resumed.seed_barrier();
+                            if case == "gpu_miss_push" {
+                                crate::copy_to_mapped(
+                                    &host_bytes,
+                                    as_vk_buf(expert.as_ref()).unwrap().mapped_ptr().unwrap(),
+                                );
+                                resumed.arena_stream_barrier();
+                            } else if case == "gpu_miss_dedicated" {
+                                assert!(resumed
+                                    .submit_dedicated_transfer(&[
+                                        crate::transfer::TransferCopyBatch {
+                                            src: std::sync::Arc::clone(&dma_host),
+                                            dst: std::sync::Arc::clone(&expert),
+                                            regions: vec![
+                                                vk::BufferCopy::default().size(expert_bytes as u64)
+                                            ],
+                                        }
+                                    ])
+                                    .unwrap());
+                            } else {
+                                resumed.copy(host.as_ref(), 0, expert.as_ref(), 0, expert_bytes);
+                            }
+                            addresses[0] = 1;
+                            backend
+                                .upload(tape.as_ref(), bytemuck::cast_slice(&addresses))
+                                .unwrap();
+                            if sample >= 16 {
+                                host_prepare.push(prepare.elapsed().as_secs_f64() * 1e6);
+                            }
+                            resumed.gpu_resident_check(
+                                control.as_ref(),
+                                tape.as_ref(),
+                                control.as_ref(),
+                                journal.as_ref(),
+                                [0; 6],
+                            );
+                            resumed.gpu_resident_check(
+                                ids.as_ref(),
+                                tape.as_ref(),
+                                control.as_ref(),
+                                journal.as_ref(),
+                                [(rows * 10) as u32, 512, 0, 512, 1024, 0],
+                            );
+                            resumed
+                        } else {
+                            rec
+                        }
+                    };
+                    if case != "cpu_hit" {
+                        rec.begin_conditional(control.as_ref());
+                    }
+                    ordering(&rec);
+                    timestamp(&rec, 1, vk::PipelineStageFlags::TOP_OF_PIPE);
+                    // Identical representative downstream compute, outside the handoff interval.
+                    rec.linear_f32(
+                        weight.as_ref(),
+                        input.as_ref(),
+                        output.as_ref(),
+                        rows,
+                        2560,
+                        512,
+                    );
+                    rec.finish().unwrap();
+                    let elapsed = start.elapsed().as_secs_f64() * 1e6;
+                    let mut stamps = [0u64; 2];
+                    unsafe {
+                        device.get_query_pool_results(
+                            query,
+                            0,
+                            &mut stamps,
+                            vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                        )
+                    }
+                    .unwrap();
+                    if sample >= 16 {
+                        gaps.push(
+                            stamps[1].wrapping_sub(stamps[0]) as f64
+                                * backend.shared.submit_timestamp_period_ns as f64
+                                / 1000.,
+                        );
+                        totals.push(elapsed);
+                    }
+                    if missing {
+                        let mut head = [0u8; 4];
+                        backend
+                            .download_range(expert.as_ref(), expert_bytes - 4, &mut head)
+                            .unwrap();
+                        assert_eq!(head, [0x3f; 4]);
+                    }
+                }
+                println!("HANDOFF_SAMPLES {{\"rows\":{rows},\"case\":\"{case}\",\"gap_us\":{gaps:?},\"wall_us\":{totals:?},\"host_prepare_us\":{host_prepare:?}}}");
+                for values in [&mut gaps, &mut totals, &mut host_prepare] {
+                    values.sort_by(f64::total_cmp);
+                }
+                println!("HANDOFF rows={rows} case={case} samples=96 gap_p50_us={:.3} gap_p90_us={:.3} wall_p50_us={:.3} host_prepare_p50_us={:.3} expert_bytes={expert_bytes}",
+                    gaps[48], gaps[86], totals[48], host_prepare.get(48).copied().unwrap_or(0.));
+            }
+        }
+        unsafe {
+            device.destroy_query_pool(query, None);
         }
     }
 
