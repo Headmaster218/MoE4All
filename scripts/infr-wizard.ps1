@@ -361,6 +361,9 @@ namespace Moe4All {
 '@
         }
         $metadata = [Moe4All.WizardModelMetadata]::Read($ModelPath)
+        if ($metadata[0] -in @('qwen35', 'qwen35moe') -and $metadata[1] -match '\benable_thinking\b') {
+            return @('low', 'medium', 'high', 'max')
+        }
         if ($metadata[1] -notmatch '\breasoning_effort\b') { return @() }
         if ($metadata[0] -eq 'qwen4exp') { return @('low', 'medium', 'xhigh') }
         return @('low', 'medium', 'high', 'max')

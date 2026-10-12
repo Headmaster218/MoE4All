@@ -14,7 +14,7 @@ concurrency, device, and measurement interval.
 | 0 | Move the active branch to `D:\AIinfr\infr` | Done | Same branch and dirty state restored in the primary checkout; no merge or branch migration. |
 | 1 | Q8 long-context attention optimization | Done | Commit `8d5a4875b`; XTX-only INT8 Q.K policy and depth-adaptive combine accepted. |
 | 2 | Qwen3.6-35B vision | Done | Qwen3.6 enabled on the existing Qwen-VL MRoPE path. Small/large image recognition and image -> text -> image passed; later long-text Prefill matched the text-only baseline. |
-| 3 | Qwen3.6-35B reasoning effort | Pending | Expose supported reasoning-strength choices through CLI/wizard/API without changing unsupported models. |
+| 3 | Qwen3.6-35B reasoning effort | Done | Model-scoped prompt mapping for Qwen3.5/3.6; CLI, wizard and API request controls validated while default and no-think prompts remain unchanged. |
 | 4 | Review `perf/expert-mtp-optimization` after `release-0.10.0` | Pending | Port only independently useful, architecture-compatible changes with focused tests/A-B. |
 | 5 | Decode front/back bubble overlap | Pending | Pipeline safe pre/post work around the GPU submission; measure 30K and 150K, reject changes without end-to-end gain. |
 | 6 | Expert-miss critical path | Pending | Start DMA/CPU copy immediately after miss IDs, move deferrable work off the transfer path, and overlap independent S5/S6 copies where correctness permits. |
@@ -22,6 +22,15 @@ concurrency, device, and measurement interval.
 | 8 | Recover MTP experiment and automatic splitter | Pending | Audit the MTP branch, reproduce the automatic splitter failure, and produce an implementation-ready repair plan or a validated fix. |
 
 ## Accepted baseline
+
+### Qwen3.6-35B reasoning effort
+
+- The shipped Qwen3.6 template exposes `enable_thinking` but no native `reasoning_effort` variable.
+- Explicit effort therefore maps to a Qwen3.5/3.6-only system instruction. Default requests remain byte-identical; non-Qwen templates still reject unsupported effort values.
+- The wizard exposes `low`, `medium`, `high`, and `max`; the shared API parser also accepts `xhigh`.
+- Actual 35B serving validated default, `low`, `max`, and `enable_thinking=false + max`. Debug-rendered prompts contained only the requested active instruction; no-think omitted it and returned `ready` directly.
+- Unit coverage: 79 `infr-chat` tests and 32 launch-wizard tests passed.
+- Evidence: `benchmark-data/artifacts/qwen36-35b-reasoning-20261013/run-2026-10-12T17-28-27.412Z/results.json` and `stderr.log`.
 
 ### Qwen3.6-35B vision, RX 7900 XTX
 

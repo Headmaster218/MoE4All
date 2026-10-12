@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
-use infr_core::config::Config;
+use infr_core::config::{Config, ReasoningEffort};
 use infr_core::loader::MetaValue;
 use infr_core::WeightSource; // brings `Gguf::metadata()` into scope
 use infr_gguf::Gguf;
@@ -347,6 +347,76 @@ fn message_to_json(m: &ChatMessage) -> Value {
     Value::Object(obj)
 }
 
+fn qwen35_reasoning_instruction(effort: ReasoningEffort) -> &'static str {
+    match effort {
+        ReasoningEffort::Low => {
+            "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration."
+        }
+        ReasoningEffort::Medium => {
+            "Reasoning effort is set to medium. Use a balanced amount of reasoning, checking the main steps and key assumptions without unnecessary exploration."
+        }
+        ReasoningEffort::High => {
+            "Reasoning effort is set to high. Think carefully through the task, validate key assumptions and intermediate steps, and prioritize correctness and clarity."
+        }
+        ReasoningEffort::Xhigh => {
+            "Reasoning effort is set to xhigh. Think deeply through the task, verify intermediate steps, consider plausible alternatives, and resolve ambiguities before answering."
+        }
+        ReasoningEffort::Max => {
+            "Reasoning effort is set to max. Use maximum reasoning effort: explore the task thoroughly, verify intermediate steps and edge cases, compare plausible alternatives, and prioritize correctness over speed."
+        }
+    }
+}
+
+fn prepend_system_instruction(messages: &mut Vec<Value>, instruction: &str) {
+    let initial_system = messages
+        .first_mut()
+        .and_then(Value::as_object_mut)
+        .filter(|message| {
+            message
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| role == "system" || role == "developer")
+        });
+    if let Some(message) = initial_system {
+        if let Some(content) = message.get("content").and_then(Value::as_str) {
+            let merged = if content.trim().is_empty() {
+                instruction.to_owned()
+            } else {
+                format!("{instruction}\n\n{content}")
+            };
+            message.insert("content".into(), merged.into());
+            return;
+        }
+    }
+    messages.insert(
+        0,
+        serde_json::json!({"role": "system", "content": instruction}),
+    );
+}
+
+fn adapt_qwen35_reasoning_effort(
+    architecture: Option<&str>,
+    template_supports_effort: bool,
+    messages: &mut Vec<Value>,
+    options: &mut ChatTemplateOptions,
+) {
+    let qwen35 =
+        architecture.is_some_and(|architecture| matches!(architecture, "qwen35" | "qwen35moe"));
+    if !qwen35 || template_supports_effort {
+        return;
+    }
+    let Some(effort) = options.reasoning_effort.take() else {
+        return;
+    };
+    // Qwen3.5/3.6's released local template exposes only enable_thinking. Its hosted APIs map
+    // effort choices back to that boolean, so local weights need a prompt-level instruction to
+    // make the selected strength meaningful. Keep no-think behavior identical to Qwen3.8: an
+    // effort accompanying enable_thinking=false adds no instruction.
+    if options.enable_thinking != Some(false) {
+        prepend_system_instruction(messages, qwen35_reasoning_instruction(effort));
+    }
+}
+
 /// Core renderer over a GGUF: pull the template + bos/eos out of the metadata, then delegate to
 /// [`render_template`]. Shared by every entry point so template handling lives in ONE place.
 #[allow(clippy::too_many_arguments)]
@@ -354,7 +424,7 @@ fn render_core(
     gguf: &Gguf,
     tokenizer: &Tokenizer,
     eos: u32,
-    msgs: Vec<Value>,
+    mut msgs: Vec<Value>,
     tools: Value,
     add_generation_prompt: bool,
     cfg: &Config,
@@ -378,7 +448,15 @@ fn render_core(
     // ignored by non-thinking templates, and thinking-capable models (Qwen3, Qwen3.5)
     // then behave the same under `infr run`/`serve` regardless of what their template's own
     // default is (Qwen3.5 defaults itself OFF via `enable_thinking is defined and is true`).
-    let options = options.resolve(cfg);
+    let mut options = options.resolve(cfg);
+    let requested_reasoning_effort = options.reasoning_effort.is_some();
+    let template_env = cached_env(template).map_err(TemplateError::Render)?;
+    adapt_qwen35_reasoning_effort(
+        gguf.metadata().str("general.architecture"),
+        template_env.supports_effort,
+        &mut msgs,
+        &mut options,
+    );
     match render_template_with_options(
         template,
         msgs,
@@ -395,10 +473,7 @@ fn render_core(
             Ok(s)
         }
         Err(e) => {
-            if cfg.debug.chat
-                || options.reasoning_effort.is_some()
-                || options.preserve_thinking.is_some()
-            {
+            if cfg.debug.chat || requested_reasoning_effort || options.preserve_thinking.is_some() {
                 tracing::warn!("[chat-template] render error: {e:#}");
             }
             Err(TemplateError::Render(e))
@@ -496,6 +571,81 @@ pub fn render_chat_user(
 #[cfg(test)]
 mod template_tests {
     use super::*;
+
+    #[test]
+    fn qwen35_prompt_effort_is_model_scoped_and_preserves_defaults() {
+        let original = vec![serde_json::json!({"role":"user", "content":"hello"})];
+        let mut messages = original.clone();
+        let mut options = ChatTemplateOptions::default();
+        adapt_qwen35_reasoning_effort(Some("qwen35moe"), false, &mut messages, &mut options);
+        assert_eq!(messages, original);
+
+        let mut messages = original.clone();
+        let mut options = ChatTemplateOptions {
+            enable_thinking: Some(true),
+            reasoning_effort: Some(ReasoningEffort::High),
+            ..Default::default()
+        };
+        adapt_qwen35_reasoning_effort(Some("qwen35moe"), false, &mut messages, &mut options);
+        assert_eq!(options.reasoning_effort, None);
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("set to high"));
+
+        let mut messages = original;
+        let mut options = ChatTemplateOptions {
+            enable_thinking: Some(true),
+            reasoning_effort: Some(ReasoningEffort::High),
+            ..Default::default()
+        };
+        adapt_qwen35_reasoning_effort(Some("llama"), false, &mut messages, &mut options);
+        assert_eq!(options.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(messages.len(), 1);
+    }
+
+    #[test]
+    fn qwen35_prompt_effort_merges_system_and_respects_no_think_or_native_support() {
+        let system = serde_json::json!({"role":"system", "content":"Follow user policy."});
+        let user = serde_json::json!({"role":"user", "content":"hello"});
+        let mut messages = vec![system.clone(), user.clone()];
+        let mut options = ChatTemplateOptions {
+            enable_thinking: Some(true),
+            reasoning_effort: Some(ReasoningEffort::Max),
+            ..Default::default()
+        };
+        adapt_qwen35_reasoning_effort(Some("qwen35moe"), false, &mut messages, &mut options);
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("Reasoning effort is set to max."));
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .ends_with("Follow user policy."));
+
+        for (supports_effort, enabled) in [(false, false), (true, true)] {
+            let mut messages = vec![system.clone(), user.clone()];
+            let mut options = ChatTemplateOptions {
+                enable_thinking: Some(enabled),
+                reasoning_effort: Some(ReasoningEffort::Low),
+                ..Default::default()
+            };
+            adapt_qwen35_reasoning_effort(
+                Some("qwen35moe"),
+                supports_effort,
+                &mut messages,
+                &mut options,
+            );
+            assert_eq!(messages, vec![system.clone(), user.clone()]);
+            assert_eq!(
+                options.reasoning_effort,
+                supports_effort.then_some(ReasoningEffort::Low)
+            );
+        }
+    }
 
     #[test]
     fn only_explicit_template_input_errors_are_classified_as_client_errors() {

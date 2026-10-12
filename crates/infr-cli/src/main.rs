@@ -303,7 +303,8 @@ struct SamplingOpts {
     /// Force reasoning ON, overriding an inherited INFR_NO_THINK (`sampling.no_think = false`).
     #[arg(long)]
     think: bool,
-    /// Native reasoning level (Qwen3.8: low, medium, xhigh). Unset uses the model template default.
+    /// Reasoning level (Qwen3.8: low/medium/xhigh; Qwen3.5/3.6: prompt-mapped low through max).
+    /// Unset uses the model template default.
     #[arg(long, value_name = "LEVEL")]
     reasoning_effort: Option<infr_core::config::ReasoningEffort>,
 }

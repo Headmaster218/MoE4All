@@ -201,8 +201,8 @@ try {
     Test-Flow 'FlashNext native reasoning effort' -Inputs @('', $model, '', '', '', 'y', 'y', '4', '', '', '', '') -Check {
         Assert ('--think' -in $nativeArgs -and 'xhigh' -in $nativeArgs) 'FlashNext reasoning effort was not emitted'
     }
-    Test-Flow '35B supports on-off only' -Inputs @('', $model35, '', '', '', 'y', 'y', '', '', '', '') -Check {
-        Assert ('--think' -in $nativeArgs -and -not ('--reasoning-effort' -in $nativeArgs)) '35B must not receive an unsupported effort'
+    Test-Flow '35B prompt reasoning effort' -Inputs @('', $model35, '', '', '', 'y', 'y', '5', '', '', '', '') -Check {
+        Assert ('--think' -in $nativeArgs -and '--reasoning-effort' -in $nativeArgs -and 'max' -in $nativeArgs) '35B reasoning effort was not emitted'
     }
     Test-Flow 'default reasoning disabled' -Inputs @('', $model, '', '', '', 'y', 'n', '', '', '', '') -Check {
         Assert ('--no-think' -in $nativeArgs -and -not ('--reasoning-effort' -in $nativeArgs)) 'Disable reasoning failed'
@@ -231,9 +231,9 @@ try {
         Assert ($script:Events.Count -eq 2 -and $serverApiKey -eq 'fixture-secret-not-a-real-key') 'Saved authentication prompt changed'
         Assert (-not (($state | ConvertTo-Json) -match 'fixture-secret')) 'Secret leaked into saved settings'
     }
-    Test-Flow 'explicit launcher model overrides previous model' -Saved $chatSettings -InitialPath $model35 -Inputs @('', '', '', '', 'y', 'y', '', '', '', '') -Check {
+    Test-Flow 'explicit launcher model overrides previous model' -Saved $chatSettings -InitialPath $model35 -Inputs @('', '', '', '', 'y', 'y', '', '', '', '', '') -Check {
         Assert (-not $reuseSavedSettings -and $state.model -eq $model35) 'Launcher model must win'
-        Assert (-not ('--reasoning-effort' -in $nativeArgs)) 'Old FlashNext effort must not reach 35B'
+        Assert ('--reasoning-effort' -in $nativeArgs -and 'medium' -in $nativeArgs) 'A reasoning effort supported by both models should survive the switch'
     }
     $missingSettings = [pscustomobject]@{ launch_mode = 'chat'; setup_mode = 'conservative'; model = (Join-Path $testRoot 'missing.gguf') }
     Test-Flow 'missing saved model goes through model selection' -Saved $missingSettings -Inputs @('', $model, '', '', '', '', '', '', '', '') -Check {
