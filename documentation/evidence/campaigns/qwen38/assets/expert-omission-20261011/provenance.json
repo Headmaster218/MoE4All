@@ -115,6 +115,7 @@
     "strategy-grid.csv": "a710bef35299b809ee90f73a69d3d81772e03ed161c2a0f93ceb75fd49d8dc8b"
   },
   "published_data_sha256": {
+    "fast-mode-screen.json": "08b9abfb2b24c4ddc43557d5bc17c57f01143524a6a3dcb3fdd416a3b474b24a",
     "strategy-grid.json": "5ef2e6a242169bef95651db3448485d56bb75e2f5272b9b59452367d1cc4c3f3",
     "summary.json": "28bc0c5b95088b6695207ce7cb6e61ca756e47b0d6d4fb50d638846de2803553",
     "normalization-comparison.json": "499b92c48aaaa6d9bd1d7895ec693176f56f952142cf98477101a494d5bcf8cd",
