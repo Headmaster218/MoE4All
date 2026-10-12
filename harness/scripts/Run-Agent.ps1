@@ -63,8 +63,8 @@ if (-not (Test-Path -LiteralPath $workspace -PathType Container)) {
 $node = Get-ChildItem -LiteralPath (Join-Path $harnessRoot 'runtime') -Filter node.exe -Recurse -ErrorAction SilentlyContinue |
     Where-Object { $_.FullName -match 'node-v[^\\]+-win-x64\\node\.exe$' } |
     Select-Object -First 1 -ExpandProperty FullName
-if (-not $node) { throw 'MoE4All Node runtime is missing. Run Build-Agent.ps1 first.' }
-if (-not $CliPath) { $CliPath = Join-Path $harnessRoot 'dsh\apps\cli\lib\bin.js' }
+if (-not $node) { throw 'The bundled MoE4All Node runtime is missing.' }
+if (-not $CliPath) { $CliPath = Join-Path $harnessRoot 'runtime\dsh\lib\bin.js' }
 $entry = [System.IO.Path]::GetFullPath($CliPath)
 if (-not (Test-Path -LiteralPath $entry -PathType Leaf)) { throw "MoE4All CLI entry not found: $entry" }
 $oldHome = $env:DSH_HOME

@@ -77,7 +77,7 @@ if ($null -eq $best) { return }
 
 if (-not $testMode) {
     Add-Type -AssemblyName System.Windows.Forms
-    $message = "MoE4All Agent $($best.tag_name) is available.`n`nUpdating will verify the full package, stop this Agent, preserve your data, and restart it. DSH and the separate Engine are untouched.`n`nUpdate now?"
+    $message = "MoE4All Agent $($best.tag_name) is available.`n`nUpdating will verify the full package, stop this Agent, preserve your data and installed Engine versions, and restart it.`n`nUpdate now?"
     $choice = [Windows.Forms.MessageBox]::Show($message, 'MoE4All Agent update', 'YesNo', 'Question')
     if ($choice -ne [Windows.Forms.DialogResult]::Yes) { return }
 }
@@ -125,14 +125,6 @@ try {
     $next = Get-Content -LiteralPath $nextManifest -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($next.product -ne 'moe4all-agent' -or $next.version -ne $best.tag_name -or
         [string]$next.sourceCommit -notmatch '^[0-9a-f]{40}$') { throw 'Agent archive manifest does not match the release.' }
-
-    $phase = 'reuse runtime cache'
-    $oldRuntime = Join-Path $root 'harness\runtime'
-    if (Test-Path -LiteralPath $oldRuntime -PathType Container) {
-        $newRuntime = Join-Path $newRoot 'harness\runtime'
-        & robocopy $oldRuntime $newRuntime /E /XJ /XD projects plugin-packs dsh-deploy dsh-deploy-offline dsh-deploy-v2 /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
-        if ($LASTEXITCODE -ge 8) { throw "Copying Agent runtime cache failed (robocopy $LASTEXITCODE)." }
-    }
 
     $phase = 'stop old Agent'
     $process = Get-Process -Id $ParentPid -ErrorAction Stop

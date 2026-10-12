@@ -119,8 +119,8 @@ internal static class MoE4All
             string state = Path.Combine(root, "harness", "agent-state");
             string profile = Path.Combine(state, "home", "profiles", "web", "node_modules");
             string script = Path.Combine(root, "harness", "scripts", "Run-Agent.ps1");
-            string buildScript = Path.Combine(root, "harness", "scripts", "Build-Agent.ps1");
-            if (!File.Exists(script) || !File.Exists(buildScript))
+            string prepareScript = Path.Combine(root, "harness", "scripts", "Prepare-BundledRuntime.ps1");
+            if (!File.Exists(script) || !File.Exists(prepareScript))
             {
                 Console.Error.WriteLine("The bundled Agent runtime is incomplete. Install the full MoE4All package, not MoE4All.exe alone.");
                 return 3;
@@ -136,11 +136,10 @@ internal static class MoE4All
                     throw new Win32Exception(Marshal.GetLastWin32Error());
 
                 if (!Directory.Exists(profile))
-                {
-                    Console.WriteLine("Preparing MoE4All Agent for first launch. This may take several minutes.");
-                    int built = RunScript(job, root, buildScript, " -StateRoot " + Quote(state));
-                    if (built != 0 || !Directory.Exists(profile)) return built != 0 ? built : 3;
-                }
+                    Console.WriteLine("Preparing the bundled MoE4All Agent runtime.");
+                int prepared = RunScript(job, root, prepareScript,
+                    " -InstallRoot " + Quote(root) + " -StateRoot " + Quote(state));
+                if (prepared != 0 || !Directory.Exists(profile)) return prepared != 0 ? prepared : 3;
                 Console.WriteLine("MoE4All Agent is starting. Close this window to stop it.");
                 StartUpdateChecker(root);
                 return RunScript(job, root, script, " -StateRoot " + Quote(state) + " -Open");
