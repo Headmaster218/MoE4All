@@ -20,6 +20,20 @@ test('Decode summary excludes warmup and computes aggregate round metrics', () =
   assert.equal(summary.measured[0].frontAggregateTokensPerSecond, 80);
   assert.equal(summary.measured[0].averageAggregateTokensPerSecond, 100);
   assert.equal(summary.mean.peakAggregateTokensPerSecond, 102);
+  assert.equal(summary.stability.allMeasuredRoundsStable, true);
+  assert.deepEqual(summary.stability.unstableLanes, []);
+});
+
+test('Decode summary records nondeterministic lanes without discarding measurements', () => {
+  const rounds = [0, 1, 2, 3].map(round => ({ round,
+    requests: [request(50, round === 2 ? 'different' : 'same')] }));
+  const row = { status: 'complete', count: 1, depth: 150000, slots: 3, rounds,
+    serverLogMetrics: [metric(1, 1, 1, 2, 3), metric(40, 50, 60, 90, 100),
+      metric(42, 52, 62, 92, 102), metric(44, 54, 64, 94, 104)] };
+  const [summary] = summarizeDecode([row]);
+  assert.equal(summary.stability.allMeasuredRoundsStable, false);
+  assert.equal(summary.stability.unstableLanes[0].lane, 0);
+  assert.deepEqual(summary.stability.unstableLanes[0].hashes, ['same', 'different', 'same']);
 });
 
 test('Prefill summary requires a cold uncached request', () => {

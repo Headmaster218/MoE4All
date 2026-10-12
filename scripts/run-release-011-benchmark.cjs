@@ -100,10 +100,11 @@ function summarizeDecode(matrix) {
         cachedTokens: requests.map(request => request.timings.cached_n),
       };
     });
+    const unstableLanes = [];
     for (let lane = 0; lane < row.count; lane++) {
       const hashes = measured.map(round => round.outputHashes[lane]);
       if (new Set(hashes).size !== 1) {
-        throw new Error(`Nondeterministic Decode output c${row.count} d${row.depth} lane${lane}: ${hashes.join(',')}`);
+        unstableLanes.push({ lane, hashes });
       }
     }
     const fields = ['frontAggregateTokensPerSecond', 'middleAggregateTokensPerSecond',
@@ -115,6 +116,7 @@ function summarizeDecode(matrix) {
         ? values.reduce((sum, value) => sum + value, 0) / values.length : null];
     }));
     return { active: row.count, depth: row.depth, configuredSlots: row.slots,
+      stability: { allMeasuredRoundsStable: unstableLanes.length === 0, unstableLanes },
       warmupRound: { sourceRound: row.rounds[0].round,
         rates: row.rounds[0].requests.map(request => request.timings.predicted_per_second) },
       measured, mean };
