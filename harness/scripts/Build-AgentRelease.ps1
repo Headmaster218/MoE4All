@@ -154,13 +154,38 @@ try {
 }
 
 $deployRoot = [IO.Path]::GetFullPath($deploy).TrimEnd([IO.Path]::DirectorySeparatorChar)
-$links = @()
-foreach ($entry in @(Get-ChildItem -LiteralPath $deployRoot -Recurse -Force -Attributes ReparsePoint)) {
+$buildDshRoot = [IO.Path]::GetFullPath((Join-Path $buildHarness 'dsh')).TrimEnd([IO.Path]::DirectorySeparatorChar)
+$deployLinks = @(Get-ChildItem -LiteralPath $deployRoot -Recurse -Force -Attributes ReparsePoint)
+$externalTargets = @{}
+foreach ($entry in $deployLinks) {
     if (-not $entry.PSIsContainer) { throw "The DSH deployment contains a file symlink: $($entry.FullName)" }
     $targetValue = [string]@($entry.Target)[0]
     $target = [IO.Path]::GetFullPath((Join-Path $entry.Parent.FullName $targetValue))
     if (-not $target.StartsWith($deployRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "The DSH deployment link escapes its root: $($entry.FullName)"
+        $externalTargets[$target] = $true
+    }
+}
+$materializedTargets = @{}
+$materializedRoot = Join-Path $deployRoot '.moe4all-workspace'
+foreach ($target in @($externalTargets.Keys | Sort-Object)) {
+    if (-not $target.StartsWith($buildDshRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "The DSH deployment link escapes the source workspace: $target"
+    }
+    $sourceRelative = Get-RelativePath $buildDshRoot $target
+    $safeName = $sourceRelative -replace '[^0-9A-Za-z._-]', '-'
+    $materialized = Join-Path $materializedRoot $safeName
+    New-Item -ItemType Directory -Path $materialized -Force | Out-Null
+    & robocopy $target $materialized /E /XJ /XD node_modules .git /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "Materializing DSH workspace package $sourceRelative failed (robocopy $LASTEXITCODE)." }
+    $materializedTargets[$target] = $materialized
+}
+$links = @()
+foreach ($entry in $deployLinks) {
+    $targetValue = [string]@($entry.Target)[0]
+    $target = [IO.Path]::GetFullPath((Join-Path $entry.Parent.FullName $targetValue))
+    if (-not $target.StartsWith($deployRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+        $target = [string]$materializedTargets[$target]
+        if (-not $target) { throw "The DSH deployment link was not materialized: $($entry.FullName)" }
     }
     $links += [ordered]@{
         path = Get-RelativePath $deployRoot $entry.FullName
