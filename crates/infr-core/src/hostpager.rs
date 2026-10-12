@@ -85,8 +85,12 @@ impl AlignedHostBuffer {
                 )
             };
             let ptr = NonNull::new(raw.cast::<u8>()).ok_or_else(|| {
+                let error = std::io::Error::last_os_error();
                 Error::backend(format!(
-                    "VirtualAlloc could not reserve {allocated_len} bytes for the host pager"
+                    "VirtualAlloc could not commit {allocated_len} bytes for the host pager: \
+                     {error}; physical_available_bytes={:?}, commit_available_bytes={:?}",
+                    crate::hostmem::available_bytes(),
+                    crate::hostmem::commit_available_bytes(),
                 ))
             })?;
             (ptr, ptr)

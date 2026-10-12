@@ -12,6 +12,7 @@
 mod adapter;
 mod arena;
 mod caps;
+mod cpu_miss;
 pub mod ep;
 mod gemm;
 pub mod linear;
@@ -22,6 +23,7 @@ pub mod pager;
 mod pcache;
 pub mod pipeline;
 mod recorder;
+mod timeline;
 pub mod tp;
 pub mod tp_allreduce;
 pub mod tp_sem;
@@ -57,8 +59,8 @@ use std::collections::HashMap;
 use std::ffi::CStr;
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
+use std::time::{Duration, Instant};
 
 use ash::vk;
 use gpu_allocator::vulkan::{
@@ -290,7 +292,69 @@ fn backend_physical_alloc_room(vram: VramInfo, tracked_used: u64) -> u64 {
     }
 }
 
+/// Windows Xe1's mapped-VRAM path slows down before WDDM's reported budget is exhausted. The
+/// A770 sweep in issue #41 measured its best conservative point at 12 GiB of a 15.88 GiB heap and
+/// a stable higher-capacity point at 13.5 GiB. Keep this device policy inside Vulkan, and leave
+/// every explicit user limit and every other architecture on the shared automatic policy.
+fn automatic_device_vram_budget_cap(
+    total: u64,
+    arch: crate::caps::DeviceArch,
+    profile: infr_core::config::AutoProfile,
+    explicit_limit: bool,
+    windows: bool,
+) -> Option<u64> {
+    if explicit_limit || !windows || arch != crate::caps::DeviceArch::IntelXe1 {
+        return None;
+    }
+    let percent = match profile {
+        infr_core::config::AutoProfile::Conservative => 75,
+        infr_core::config::AutoProfile::Aggressive => 85,
+    };
+    Some(total.saturating_mul(percent) / 100)
+}
+
 const AUTO_SUBMIT_INITIAL_CAP: usize = 16;
+fn use_paged_grid_buffer(
+    requested: Option<bool>,
+    measured_device: bool,
+    k: usize,
+    n: usize,
+    rows: usize,
+) -> bool {
+    requested.unwrap_or(measured_device && k == 2560 && n == 640 && (1..=3).contains(&rows))
+}
+
+fn use_decode_down_overlap(
+    requested: Option<bool>,
+    measured_device: bool,
+    rows: usize,
+    min_context: u32,
+) -> bool {
+    requested.unwrap_or(measured_device && matches!(rows, 2 | 3) && min_context >= 131072)
+}
+
+fn use_small_decode_policy(
+    requested: Option<bool>,
+    measured_device: bool,
+    rows: usize,
+    decode_rows: Option<usize>,
+    mtp_verify: bool,
+) -> bool {
+    requested.unwrap_or(
+        measured_device && !mtp_verify && (1..=3).contains(&rows) && decode_rows == Some(rows),
+    )
+}
+
+fn use_qsa_topk_scan(
+    requested: Option<bool>,
+    measured_device: bool,
+    rows: usize,
+    top: usize,
+    parallel: bool,
+) -> bool {
+    requested.unwrap_or(measured_device && parallel && rows == 1 && top == 512)
+}
+
 const AUTO_SUBMIT_SAMPLES_PER_CAP: usize = 2;
 const AUTO_SUBMIT_MAX_ROUNDS: usize = 12;
 const AGGRESSIVE_SUBMIT_BUDGET_NS: u64 = 500_000_000;
@@ -737,6 +801,8 @@ struct VulkanShared {
     submit_auto_tuner: Mutex<Option<SubmitAutoTuner>>,
     submit_timestamp_period_ns: f32,
     submit_timestamp_valid_bits: u32,
+    timeline_clock: Option<crate::timeline::Clock>,
+    timeline_query_pools: Arc<Mutex<Vec<vk::QueryPool>>>,
     /// UNIFIED-MEMORY parts only (`None` on every discrete GPU): the host-visible memory type on
     /// the non-device-local heap that `GpuOnly` allocations SPILL into once the device-local heap
     /// is full. See [`probe_host_visible_non_device_local_type`] for why counting that heap in the
@@ -996,6 +1062,7 @@ impl VulkanShared {
     }
 
     fn wait_dedicated_transfer(&self, value: u64) -> Result<()> {
+        let _timeline_wait = infr_core::timeline::span("dma_timeline_wait");
         if value == 0 {
             return Ok(());
         }
@@ -1555,6 +1622,9 @@ impl Drop for VulkanShared {
             }
             if let Some(queue) = self.dedicated_transfer.take() {
                 queue.into_inner().unwrap().destroy(&self.device);
+            }
+            for pool in self.timeline_query_pools.lock().unwrap().drain(..) {
+                self.device.destroy_query_pool(pool, None);
             }
             // Destroy command pool.
             let pool = self.cmd_pool.lock().unwrap();
@@ -2398,6 +2468,7 @@ pub struct VulkanBackend {
     // NOTE: the prefetch worker is declared before `moe_pager` and `shared`, so it is stopped and
     // joined before either dependency drops. The pager itself likewise drops before `shared`.
     decode_prefetch: Mutex<Option<adapter::DecodePrefetchScheduler>>,
+    cpu_miss: std::sync::OnceLock<Option<cpu_miss::Worker>>,
     /// Paged MoE expert cache (see `pager::MoePagerSession`) — `Some` only when the loaded model's
     /// expert banks don't fit VRAM and the seam's placement policy chose paging over the legacy
     /// host-visible split (see `infr-llama`'s `generate_dense_vulkan_session`). `None` is the
@@ -2438,6 +2509,8 @@ pub struct VulkanBackend {
     /// whole device for a paged-MoE session before `moe_pager` was moved off it — see
     /// `backend_drop_frees_device_after_moe_pager`.
     bda_weight_arena: Mutex<Option<BdaWeightArena>>,
+    iq2s_grid: Option<Arc<dyn Buffer>>,
+    iq3s_grid: Option<Arc<dyn Buffer>>,
     /// Service-level elastic VRAM arena. Kept on backend handles rather than `VulkanShared`
     /// because its physical shard buffers retain `Arc<VulkanShared>` and would otherwise form a
     /// device-leaking reference cycle.
@@ -2446,10 +2519,10 @@ pub struct VulkanBackend {
     /// the write side because both primary and auxiliary graphs allocate elastic scratch lazily;
     /// the thread-local owner lets those nested allocations reuse the non-reentrant lease.
     unified_exec: Arc<RwLock<()>>,
-    /// Runtime ownership across backend forks. Switching between LLM and an auxiliary client drops
-    /// only the inactive client's phase scratch; same-client token execution stays untouched.
+    /// Independent runtime caches across clients sharing the serialized execution gate.
     unified_phases: Arc<UnifiedPhaseRegistry>,
     unified_phase_id: u64,
+    auxiliary_runtime_reaper: Option<AuxiliaryRuntimeReaper>,
     /// Auxiliary-engine allocation routing. `None` keeps every established LLM allocation path;
     /// an Embedding fork sends only weights and graph activations into the shared elastic arena.
     unified_client: Option<UnifiedClient>,
@@ -2503,28 +2576,146 @@ impl UnifiedPhaseRegistry {
         id
     }
 
-    /// Return true only for a real client transition. The caller holds `unified_exec`, so clearing
-    /// upgraded peer caches outside the registry lock cannot race another activation.
+    /// Track transitions without destroying another client's reusable workspace.
     fn activate(&self, id: u64) -> bool {
-        let peers = {
-            let mut state = self.state.lock().unwrap();
-            state.arenas.retain(|(_, arena)| arena.strong_count() != 0);
-            if state.active == Some(id) {
-                return false;
-            }
-            state.active = Some(id);
-            state
-                .arenas
-                .iter()
-                .filter_map(|&(peer_id, ref arena)| {
-                    (peer_id != id).then(|| arena.upgrade()).flatten()
-                })
-                .collect::<Vec<_>>()
-        };
-        for arena in peers {
-            arena.lock().unwrap().release_phase();
+        let mut state = self.state.lock().unwrap();
+        state.arenas.retain(|(_, arena)| arena.strong_count() != 0);
+        if state.active == Some(id) {
+            return false;
         }
+        state.active = Some(id);
         true
+    }
+
+    /// The caller holds the execution gate. Prefer auxiliary caches, then primary scratch;
+    /// never reclaim the current execute's workspace, which may already be referenced by commands.
+    fn reclaim_candidates(&self, current: u64) -> Vec<Arc<Mutex<adapter::RuntimePhaseArena>>> {
+        let mut state = self.state.lock().unwrap();
+        state.arenas.retain(|(_, arena)| arena.strong_count() != 0);
+        let mut peers = state
+            .arenas
+            .iter()
+            .filter_map(|&(id, ref arena)| {
+                (id != current)
+                    .then(|| arena.upgrade().map(|arena| (id, arena)))
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        peers.sort_by_key(|(id, _)| *id == Self::PRIMARY_ID);
+        peers.into_iter().map(|(_, arena)| arena).collect()
+    }
+
+    fn claim_with_reclaim<T>(
+        &self,
+        current: u64,
+        mut claim: impl FnMut() -> Result<T>,
+    ) -> Result<T> {
+        let mut error = match claim() {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        for arena in self.reclaim_candidates(current) {
+            arena.lock().unwrap().release_phase();
+            match claim() {
+                Ok(value) => return Ok(value),
+                Err(next) => error = next,
+            }
+        }
+        Err(error)
+    }
+}
+
+const AUXILIARY_RUNTIME_IDLE: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct AuxiliaryRuntimeDeadline {
+    deadline: Option<Instant>,
+    stop: bool,
+}
+
+impl AuxiliaryRuntimeDeadline {
+    fn expired(&self, now: Instant) -> bool {
+        self.deadline.is_some_and(|deadline| now >= deadline)
+    }
+}
+
+struct AuxiliaryRuntimeReaper {
+    state: Arc<(Mutex<AuxiliaryRuntimeDeadline>, Condvar)>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AuxiliaryRuntimeReaper {
+    fn spawn(
+        arena: &Arc<Mutex<adapter::RuntimePhaseArena>>,
+        gate: &Arc<RwLock<()>>,
+    ) -> Result<Self> {
+        let state = Arc::new((
+            Mutex::new(AuxiliaryRuntimeDeadline::default()),
+            Condvar::new(),
+        ));
+        let worker_state = Arc::clone(&state);
+        let arena = Arc::downgrade(arena);
+        let gate = Arc::downgrade(gate);
+        let worker = std::thread::Builder::new()
+            .name("infr-aux-runtime-idle".into())
+            .spawn(move || {
+                let (state, changed) = &*worker_state;
+                let mut idle = state.lock().unwrap();
+                loop {
+                    if idle.stop {
+                        return;
+                    }
+                    let Some(deadline) = idle.deadline else {
+                        idle = changed.wait(idle).unwrap();
+                        continue;
+                    };
+                    let now = Instant::now();
+                    if !idle.expired(now) {
+                        idle = changed.wait_timeout(idle, deadline - now).unwrap().0;
+                        continue;
+                    }
+                    let Some(gate) = gate.upgrade() else { return };
+                    // Do not wait on the GPU gate while holding the deadline lock: the executing
+                    // client refreshes its deadline before releasing that same gate.
+                    match gate.try_write() {
+                        Ok(_exclusive) => {
+                            if let Some(arena) = arena.upgrade() {
+                                arena.lock().unwrap().release_phase();
+                            }
+                            idle.deadline = None;
+                        }
+                        Err(std::sync::TryLockError::WouldBlock) => {
+                            idle = changed
+                                .wait_timeout(idle, Duration::from_millis(20))
+                                .unwrap()
+                                .0;
+                        }
+                        Err(std::sync::TryLockError::Poisoned(_)) => return,
+                    };
+                }
+            })
+            .map_err(|error| be(format!("start auxiliary runtime reaper: {error}")))?;
+        Ok(Self {
+            state,
+            worker: Some(worker),
+        })
+    }
+
+    fn arm(&self) {
+        let (state, changed) = &*self.state;
+        state.lock().unwrap().deadline = Some(Instant::now() + AUXILIARY_RUNTIME_IDLE);
+        changed.notify_one();
+    }
+}
+
+impl Drop for AuxiliaryRuntimeReaper {
+    fn drop(&mut self) {
+        let (state, changed) = &*self.state;
+        state.lock().unwrap().stop = true;
+        changed.notify_one();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -2706,6 +2897,98 @@ impl VulkanBackend {
     /// long-context K/V reads while staying within RDNA3's 32 KiB workgroup-memory limit.
     pub(crate) fn prefers_hd256_prefill_br128_f16score(&self) -> bool {
         cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+    }
+
+    /// The Qwen3.8 HC-down PF4 layout measured on Windows/Navi 31. Other drivers and architectures
+    /// retain the established kernel until separately validated.
+    pub(crate) fn prefers_qwen_hc_down_prefetch4(&self) -> bool {
+        cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+    }
+
+    fn measured_decode_kernel_device(&self) -> bool {
+        cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+    }
+
+    pub(crate) fn use_paged_grid_buffer(&self, k: usize, n: usize, rows: usize) -> bool {
+        use_paged_grid_buffer(
+            self.cfg().kernels.vulkan.gemv.id_grid_buffer,
+            self.measured_decode_kernel_device(),
+            k,
+            n,
+            rows,
+        )
+    }
+
+    pub(crate) fn use_decode_down_overlap(&self, rows: usize, min_context: u32) -> bool {
+        use_decode_down_overlap(
+            self.cfg().kernels.vulkan.decode_down_overlap,
+            self.measured_decode_kernel_device(),
+            rows,
+            min_context,
+        )
+    }
+
+    pub(crate) fn use_decode_sparse_lut(
+        &self,
+        rows: usize,
+        decode_rows: Option<usize>,
+        mtp_verify: bool,
+    ) -> bool {
+        use_small_decode_policy(
+            self.cfg().kernels.vulkan.decode_sparse_lut,
+            self.measured_decode_kernel_device(),
+            rows,
+            decode_rows,
+            mtp_verify,
+        )
+    }
+
+    pub(crate) fn use_decode_early_submit(
+        &self,
+        rows: usize,
+        decode_rows: Option<usize>,
+        mtp_verify: bool,
+    ) -> bool {
+        use_small_decode_policy(
+            self.cfg().kernels.vulkan.decode_early_submit,
+            self.measured_decode_kernel_device(),
+            rows,
+            decode_rows,
+            mtp_verify,
+        )
+    }
+
+    pub(crate) fn cpu_miss_worker(&self) -> Option<&cpu_miss::Worker> {
+        let cfg = &self.cfg().kernels.vulkan;
+        self.cpu_miss
+            .get_or_init(|| {
+                cpu_miss::Worker::new_options(
+                    cfg.cpu_miss_threads,
+                    cfg.cpu_miss_push,
+                    cfg.cpu_miss_split_acc,
+                    cfg.cpu_miss_flush_denormals,
+                    cfg.cpu_miss_spin,
+                    cfg.cpu_miss_grouped_dot,
+                    cfg.cpu_miss_idle_park,
+                    if cfg.cpu_miss_token_park {
+                        cfg.cpu_miss_poll
+                    } else {
+                        0
+                    },
+                    self.cfg().prof.cpu_miss_fixture_dir.clone(),
+                )
+            })
+            .as_ref()
+    }
+
+    pub(crate) fn use_qsa_topk_scan(&self, rows: usize, top: usize, parallel: bool) -> bool {
+        use_qsa_topk_scan(
+            self.cfg().kernels.vulkan.qsa_topk_scan,
+            self.measured_decode_kernel_device(),
+            rows,
+            top,
+            parallel,
+        )
     }
 
     /// Borrowed engine configuration — every knob this backend (and the seam code holding it)
@@ -3575,6 +3858,11 @@ impl VulkanBackend {
         if has_push_descriptor {
             ext_ptrs.push(c"VK_KHR_push_descriptor".as_ptr());
         }
+        let has_timeline_clock =
+            infr_core::timeline::enabled() && has_ext(c"VK_EXT_calibrated_timestamps");
+        if has_timeline_clock {
+            ext_ptrs.push(c"VK_EXT_calibrated_timestamps".as_ptr());
+        }
         // The int8 dp4a decode GEMVs (native_mmv.comp, native_mmv_mrow.comp, native_mmv_id_q4k.comp,
         // mul_mat_vec_q.comp's dotPacked builtins) compile to SPIR-V with the DotProduct /
         // DotProductInput4x8BitPacked capabilities, which VUID-VkShaderModuleCreateInfo-pCode-08740
@@ -3712,6 +4000,9 @@ impl VulkanBackend {
         // Register the device so any Err below (subgroup-32/env guards, allocator build) destroys
         // it instead of leaking it — see `InstanceCleanup` above.
         cleanup.device = Some(device.clone());
+        let timeline_clock = has_timeline_clock
+            .then(|| crate::timeline::Clock::new(&entry, &instance, &device, physical_device))
+            .flatten();
 
         let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
@@ -3865,6 +4156,7 @@ impl VulkanBackend {
             // kernels); the runner compiles the eligible qwen3 decode graph once.
             decode_replay: true,
             combined_gu: true,
+            qsa_prepare: true,
             embed_gather: true,
             gpu_sample: true,
             sample_rows: true,
@@ -3875,6 +4167,11 @@ impl VulkanBackend {
             // read-after-write barrier into one dispatch. INFR_NO_GATED_RMSNORM forces the split
             // form for A/B.
             gated_rmsnorm: true,
+            // Two F32 DeltaNet projections share one dispatch while retaining separate weights
+            // and outputs. The paired kernel mirrors every scalar/vec4/mrow shape tier.
+            linear_pair_f32: true,
+            // Qwen3.8 decode-only mixed Q8_0 down + scaled SiLU + F32 inject dispatch.
+            qwen_hc_down_inject: true,
             // Every KV write/read kernel maps position -> row modulo the cache's row capacity
             // (identity on full-context caches), so SWA layers may get window-sized ring caches.
             kv_swa_ring: true,
@@ -4124,17 +4421,21 @@ impl VulkanBackend {
 
         let runtime_phase = Arc::new(Mutex::new(adapter::RuntimePhaseArena::default()));
         let unified_phases = UnifiedPhaseRegistry::new(&runtime_phase);
-        let backend = Self {
+        let mut backend = Self {
             decode_prefetch: Mutex::new(None),
+            cpu_miss: std::sync::OnceLock::new(),
             moe_pager: Arc::new(Mutex::new(None)),
             session_finalization_deferred: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             dense_pager: Mutex::new(None),
             runtime_phase,
             bda_weight_arena: Mutex::new(None),
+            iq2s_grid: None,
+            iq3s_grid: None,
             unified_pool: Arc::new(Mutex::new(None)),
             unified_exec: Arc::new(RwLock::new(())),
             unified_phases,
             unified_phase_id: UnifiedPhaseRegistry::PRIMARY_ID,
+            auxiliary_runtime_reaper: None,
             unified_client: None,
             cfg,
             shared: Arc::new(VulkanShared {
@@ -4189,6 +4490,8 @@ impl VulkanBackend {
                 submit_auto_tuner: Mutex::new(submit_auto_tuner),
                 submit_timestamp_period_ns,
                 submit_timestamp_valid_bits,
+                timeline_clock,
+                timeline_query_pools: Arc::new(Mutex::new(Vec::new())),
                 uma_overflow_type,
                 host_overflow_type,
                 kv_spill: SpillTally::default(),
@@ -4199,6 +4502,29 @@ impl VulkanBackend {
         // The int8 coopmat tier's accumulator-layout check — a real dispatch, so it can only run
         // once the backend exists. No-op unless that tier is actually asked for.
         backend.verify_i8_coopmat_layout();
+
+        if backend
+            .cfg()
+            .kernels
+            .vulkan
+            .gemv
+            .id_grid_buffer
+            .unwrap_or(backend.measured_decode_kernel_device())
+        {
+            let words: Vec<u32> = infr_core::iquant_grids::IQ2S_GRID
+                .iter()
+                .flat_map(|&word| [word as u32, (word >> 32) as u32])
+                .collect();
+            let grid = backend.make_buf(words.len() * 4, MemoryLocation::GpuOnly, "iq2s-grid")?;
+            backend.upload(&grid, bytemuck::cast_slice(&words))?;
+            backend.iq2s_grid = Some(Arc::new(grid));
+            let grid = backend.make_buf(2048, MemoryLocation::GpuOnly, "iq3s-grid")?;
+            backend.upload(
+                &grid,
+                bytemuck::cast_slice(&infr_core::iquant_grids::IQ3S_GRID),
+            )?;
+            backend.iq3s_grid = Some(Arc::new(grid));
+        }
 
         Ok(backend)
     }
@@ -4868,14 +5194,24 @@ impl VulkanBackend {
     pub fn alloc_room(&self) -> u64 {
         let vram = self.vram();
         let tracked_used = self.shared.device_used.load(Ordering::Relaxed);
-        infr_core::budget::unified_vram_room_for_profile(
+        let room = infr_core::budget::unified_vram_room_for_profile(
             vram.total,
             backend_physical_alloc_room(vram, tracked_used),
             tracked_used,
             self.cfg.device.vram_budget,
             self.cfg.device.vram_reserve,
             self.cfg.device.auto_profile,
+        );
+        let explicit_limit =
+            self.cfg.device.vram_budget.is_some() || self.cfg.device.vram_reserve.is_some();
+        automatic_device_vram_budget_cap(
+            vram.total,
+            self.shared.device_arch,
+            self.cfg.device.auto_profile,
+            explicit_limit,
+            cfg!(target_os = "windows"),
         )
+        .map_or(room, |cap| room.min(cap.saturating_sub(tracked_used)))
     }
 
     /// Device-memory budget guard: hard-error BEFORE a device-local allocation of `want` bytes
@@ -5458,17 +5794,23 @@ impl VulkanBackend {
         }
         let runtime_phase = Arc::new(Mutex::new(adapter::RuntimePhaseArena::default()));
         let unified_phase_id = self.unified_phases.register(&runtime_phase);
+        let auxiliary_runtime_reaper =
+            AuxiliaryRuntimeReaper::spawn(&runtime_phase, &self.unified_exec)?;
         Ok(Self {
             decode_prefetch: Mutex::new(None),
+            cpu_miss: std::sync::OnceLock::new(),
             moe_pager: Arc::clone(&self.moe_pager),
             session_finalization_deferred: Arc::clone(&self.session_finalization_deferred),
             dense_pager: Mutex::new(None),
             runtime_phase,
             bda_weight_arena: Mutex::new(None),
+            iq2s_grid: self.iq2s_grid.clone(),
+            iq3s_grid: self.iq3s_grid.clone(),
             unified_pool: Arc::clone(&self.unified_pool),
             unified_exec: Arc::clone(&self.unified_exec),
             unified_phases: Arc::clone(&self.unified_phases),
             unified_phase_id,
+            auxiliary_runtime_reaper: Some(auxiliary_runtime_reaper),
             unified_client: Some(client),
             cfg: Arc::clone(&self.cfg),
             shared: Arc::clone(&self.shared),
@@ -5564,13 +5906,21 @@ impl VulkanBackend {
                 ));
             }
             let protected = self.protected_unified_experts();
-            let mut plan = pool.plan_owner_claim(&[size], class, &protected)?;
+            let mut plan = self
+                .unified_phases
+                .claim_with_reclaim(self.unified_phase_id, || {
+                    pool.plan_owner_claim(&[size], class, &protected)
+                })?;
             if !plan.victims().is_empty() && self.quiesce_decode_prefetch_for_vram_claim()? {
                 // The worker may have changed LRU residency before it was stopped. Physical arena
                 // ownership is unchanged, but recomputing keeps relocation/victim choice based on
                 // the final pager state that this transaction will commit.
                 let protected = self.protected_unified_experts();
-                plan = pool.plan_owner_claim(&[size], class, &protected)?;
+                plan = self
+                    .unified_phases
+                    .claim_with_reclaim(self.unified_phase_id, || {
+                        pool.plan_owner_claim(&[size], class, &protected)
+                    })?;
             }
             let mut handles = self.commit_unified_claim_locked(&pool, plan)?;
             let handle = handles
@@ -5579,13 +5929,17 @@ impl VulkanBackend {
             debug_assert!(handles.is_empty());
             return self.unified_sub_buffer(handle, size);
         }
-        let handle = pool.allocate(size, class).ok_or_else(|| {
-            let stats = pool.stats();
-            be(format!(
+        let handle = self
+            .unified_phases
+            .claim_with_reclaim(self.unified_phase_id, || {
+                pool.allocate(size, class).ok_or_else(|| {
+                    let stats = pool.stats();
+                    be(format!(
                 "unified VRAM arena cannot fit {size} {class:?} bytes ({} free, largest range {})",
                 stats.free_bytes, stats.largest_free_bytes,
             ))
-        })?;
+                })
+            })?;
         self.unified_sub_buffer(handle, size)
     }
 
@@ -5725,6 +6079,24 @@ impl VulkanBackend {
             let pool = self
                 .unified_vram()
                 .ok_or_else(|| be("segmented KV lost its unified VRAM arena"))?;
+            if pool.expert_layout().is_some() {
+                // Prefill may temporarily borrow uncommitted coordinates from the frozen KV
+                // corridor. Growing a slot is a serial phase boundary: retire that transient ring
+                // first, then claim the slot's original exact ranges. The next Prefill execute
+                // rebuilds its ring around every now-live KV segment.
+                let released = self
+                    .moe_pager
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .is_some_and(crate::pager::MoePagerSession::enter_decode);
+                if released {
+                    tracing::debug!(
+                        requested_ranges = requests.len(),
+                        "released Prefill KV loan before segmented-cache growth"
+                    );
+                }
+            }
             let sizes: Vec<_> = requests.iter().map(|&(_, _, bytes)| bytes).collect();
             let handles = if pool.expert_layout().is_some() {
                 let protected = self.protected_unified_experts();
@@ -5753,7 +6125,11 @@ impl VulkanBackend {
                     reserve_starts.push((buffer_idx, start));
                 }
                 if !reserve_sizes.is_empty() {
-                    let owner = pool.reserve_kv_layout(&reserve_sizes, &protected)?;
+                    let owner = self
+                        .unified_phases
+                        .claim_with_reclaim(self.unified_phase_id, || {
+                            pool.reserve_kv_layout(&reserve_sizes, &protected)
+                        })?;
                     debug_assert_eq!(owner.ranges().len(), reserve_sizes.len());
                     for (buffer_idx, start) in reserve_starts {
                         *reservations[buffer_idx] = Some(SegmentedKvReservation {
@@ -5782,18 +6158,26 @@ impl VulkanBackend {
                         Ok(range)
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let mut plan = pool.plan_exact_owner_claim(
-                    &exact_ranges,
-                    crate::unified::UnifiedVramClass::KvCache,
-                    &protected,
-                )?;
+                let mut plan =
+                    self.unified_phases
+                        .claim_with_reclaim(self.unified_phase_id, || {
+                            pool.plan_exact_owner_claim(
+                                &exact_ranges,
+                                crate::unified::UnifiedVramClass::KvCache,
+                                &protected,
+                            )
+                        })?;
                 if !plan.victims().is_empty() && self.quiesce_decode_prefetch_for_vram_claim()? {
                     let protected = self.protected_unified_experts();
-                    plan = pool.plan_exact_owner_claim(
-                        &exact_ranges,
-                        crate::unified::UnifiedVramClass::KvCache,
-                        &protected,
-                    )?;
+                    plan = self
+                        .unified_phases
+                        .claim_with_reclaim(self.unified_phase_id, || {
+                            pool.plan_exact_owner_claim(
+                                &exact_ranges,
+                                crate::unified::UnifiedVramClass::KvCache,
+                                &protected,
+                            )
+                        })?;
                 }
                 debug_assert_eq!(plan.len(), sizes.len());
                 self.commit_unified_claim_locked(&pool, plan)?
@@ -5804,8 +6188,13 @@ impl VulkanBackend {
                 sizes
                     .iter()
                     .map(|&bytes| {
-                        pool.allocate(bytes, crate::unified::UnifiedVramClass::KvCache)
-                            .ok_or_else(|| be("generic unified VRAM cannot fit segmented KV batch"))
+                        self.unified_phases
+                            .claim_with_reclaim(self.unified_phase_id, || {
+                                pool.allocate(bytes, crate::unified::UnifiedVramClass::KvCache)
+                                    .ok_or_else(|| {
+                                        be("generic unified VRAM cannot fit segmented KV batch")
+                                    })
+                            })
                     })
                     .collect::<Result<Vec<_>>>()?
             };
@@ -6303,12 +6692,20 @@ impl VulkanBackend {
             if pool.expert_layout().is_some() {
                 self.with_unified_exclusive(|| {
                     let protected = self.protected_unified_experts();
-                    let mut plan = pool.plan_owner_claim(sizes, class, &protected)?;
+                    let mut plan = self
+                        .unified_phases
+                        .claim_with_reclaim(self.unified_phase_id, || {
+                            pool.plan_owner_claim(sizes, class, &protected)
+                        })?;
                     if !plan.victims().is_empty()
                         && self.quiesce_decode_prefetch_for_vram_claim()?
                     {
                         let protected = self.protected_unified_experts();
-                        plan = pool.plan_owner_claim(sizes, class, &protected)?;
+                        plan = self
+                            .unified_phases
+                            .claim_with_reclaim(self.unified_phase_id, || {
+                                pool.plan_owner_claim(sizes, class, &protected)
+                            })?;
                     }
                     let handles = self.commit_unified_claim_locked(&pool, plan)?;
                     if handles.len() != sizes.len() {
@@ -6555,6 +6952,15 @@ impl VulkanBackend {
     /// tensors (see [`Backing::BdaSub`]) — without it every such tensor would land at the block's
     /// byte 0 and overwrite whatever the previous tensor wrote there.
     fn upload_staged_ring(&self, dst_buf: vk::Buffer, dst_base: u64, src: &[u8]) -> Result<()> {
+        self.with_unified_exclusive(|| self.upload_staged_ring_locked(dst_buf, dst_base, src))
+    }
+
+    fn upload_staged_ring_locked(
+        &self,
+        dst_buf: vk::Buffer,
+        dst_base: u64,
+        src: &[u8],
+    ) -> Result<()> {
         let device = &self.shared.device;
         let mut guard = self.shared.staging_ring.lock().unwrap();
         if guard.is_none() {
@@ -6771,8 +7177,13 @@ impl VulkanBackend {
     /// compute queue, and block until idle.
     ///
     /// The closure receives the command buffer handle to record into.
-    /// All operations are serialised through the `cmd_pool` mutex.
+    /// The execution gate also excludes graph recording on this pool. The pool mutex alone
+    /// cannot protect against a Recorder that released it after allocating its command buffer.
     fn one_shot(&self, f: impl FnOnce(vk::CommandBuffer)) -> Result<()> {
+        self.with_unified_exclusive(|| self.one_shot_locked(f))
+    }
+
+    fn one_shot_locked(&self, f: impl FnOnce(vk::CommandBuffer)) -> Result<()> {
         let device = &self.shared.device;
         // Vulkan command-pool access is externally synchronized. Keep this guard until
         // `OneShotCommand` frees the command buffer on every success/error path.
@@ -7353,12 +7764,45 @@ impl Backend for VulkanBackend {
         Some(self.shared.act_peak.load(Ordering::Relaxed))
     }
 
+    fn release_transient_runtime(&self) {
+        self.with_unified_exclusive(|| {
+            self.runtime_phase.lock().unwrap().release_phase();
+        });
+    }
+
+    fn prepare_prefill(&self, candidates: &[(usize, u64)]) -> Result<Option<usize>> {
+        if !self.cfg().paging.moe_layer_stream {
+            return Ok(None);
+        }
+        self.with_unified_exclusive(|| {
+            adapter::cancel_decode_prefetch(self)?;
+            self.runtime_phase.lock().unwrap().release_phase();
+            self.unified_phases
+                .claim_with_reclaim(self.unified_phase_id, || {
+                    let mut guard = self.moe_pager().lock().unwrap();
+                    let Some(session) = guard.as_mut() else {
+                        return Ok(None);
+                    };
+                    session.plan_prefill(candidates).map(Some)
+                })
+        })
+    }
+
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>> {
         adapter::compile(self, graph)
     }
 
     fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
-        self.with_unified_exclusive(|| adapter::execute(self, plan, bindings))
+        self.with_unified_exclusive(|| {
+            let result = adapter::execute(self, plan, bindings);
+            if let Some(reaper) = &self.auxiliary_runtime_reaper {
+                if result.is_err() {
+                    self.runtime_phase.lock().unwrap().release_phase();
+                }
+                reaper.arm();
+            }
+            result
+        })
     }
 
     /// See `Backend::max_decode_chain`. Persistent decode keeps the established platform cap
@@ -7808,6 +8252,166 @@ mod tests {
     use infr_core::Backend;
 
     #[test]
+    fn paged_grid_buffer_auto_is_device_and_shape_scoped() {
+        for measured_device in [false, true] {
+            for (k, n, rows) in [
+                (2560, 640, 1),
+                (2560, 640, 2),
+                (2560, 640, 3),
+                (2560, 640, 0),
+                (2560, 640, 4),
+                (2560, 640, 2048),
+                (768, 640, 1),
+                (2560, 641, 1),
+            ] {
+                assert_eq!(
+                    use_paged_grid_buffer(None, measured_device, k, n, rows),
+                    measured_device && k == 2560 && n == 640 && (1..=3).contains(&rows)
+                );
+                assert!(!use_paged_grid_buffer(
+                    Some(false),
+                    measured_device,
+                    k,
+                    n,
+                    rows
+                ));
+                assert!(use_paged_grid_buffer(
+                    Some(true),
+                    measured_device,
+                    k,
+                    n,
+                    rows
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn down_overlap_auto_keeps_unmeasured_cohorts_on_the_original_path() {
+        for measured_device in [false, true] {
+            for rows in 0..=4 {
+                for context in [0, 30000, 131071, 131072, 150000] {
+                    assert_eq!(
+                        use_decode_down_overlap(None, measured_device, rows, context),
+                        measured_device && matches!(rows, 2 | 3) && context >= 131072
+                    );
+                    assert!(!use_decode_down_overlap(
+                        Some(false),
+                        measured_device,
+                        rows,
+                        context
+                    ));
+                    assert!(use_decode_down_overlap(
+                        Some(true),
+                        measured_device,
+                        rows,
+                        context
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn early_ffn_submit_auto_is_decode_and_measured_device_scoped() {
+        for measured in [false, true] {
+            for rows in 1..=8 {
+                for decode_rows in [None, Some(1), Some(2), Some(3), Some(4)] {
+                    for verify in [false, true] {
+                        assert_eq!(
+                            use_small_decode_policy(None, measured, rows, decode_rows, verify),
+                            measured && rows <= 3 && decode_rows == Some(rows) && !verify
+                        );
+                        assert!(!use_small_decode_policy(
+                            Some(false),
+                            measured,
+                            rows,
+                            decode_rows,
+                            verify
+                        ));
+                        assert!(use_small_decode_policy(
+                            Some(true),
+                            measured,
+                            rows,
+                            decode_rows,
+                            verify
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn qsa_scan_auto_keeps_unmeasured_shapes_on_the_original_path() {
+        for measured in [false, true] {
+            for rows in [0, 1, 2, 3, 4, 4096] {
+                for top in [0, 1, 511, 512] {
+                    for parallel in [false, true] {
+                        assert_eq!(
+                            use_qsa_topk_scan(None, measured, rows, top, parallel),
+                            measured && parallel && rows == 1 && top == 512
+                        );
+                        assert!(!use_qsa_topk_scan(
+                            Some(false),
+                            measured,
+                            rows,
+                            top,
+                            parallel
+                        ));
+                        assert!(use_qsa_topk_scan(Some(true), measured, rows, top, parallel));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn windows_xe1_automatic_vram_caps_are_architecture_scoped() {
+        const GIB: u64 = 1 << 30;
+        let total = 16 * GIB;
+
+        assert_eq!(
+            automatic_device_vram_budget_cap(
+                total,
+                crate::caps::DeviceArch::IntelXe1,
+                infr_core::config::AutoProfile::Conservative,
+                false,
+                true,
+            ),
+            Some(12 * GIB),
+        );
+        assert_eq!(
+            automatic_device_vram_budget_cap(
+                total,
+                crate::caps::DeviceArch::IntelXe1,
+                infr_core::config::AutoProfile::Aggressive,
+                false,
+                true,
+            ),
+            Some(total * 85 / 100),
+        );
+
+        for (arch, explicit, windows) in [
+            (crate::caps::DeviceArch::AmdRdna3, false, true),
+            (crate::caps::DeviceArch::IntelXe2, false, true),
+            (crate::caps::DeviceArch::IntelXe1, true, true),
+            (crate::caps::DeviceArch::IntelXe1, false, false),
+        ] {
+            assert_eq!(
+                automatic_device_vram_budget_cap(
+                    total,
+                    arch,
+                    infr_core::config::AutoProfile::Conservative,
+                    explicit,
+                    windows,
+                ),
+                None,
+            );
+        }
+    }
+
+    #[test]
     fn default_device_prefers_the_largest_discrete_gpu() {
         let gib = 1u64 << 30;
         let devices = [
@@ -7925,6 +8529,171 @@ mod tests {
         assert!(registry.activate(auxiliary_id));
         assert!(!registry.activate(auxiliary_id));
         assert!(registry.activate(UnifiedPhaseRegistry::PRIMARY_ID));
+    }
+
+    struct RuntimeDropBuffer(Arc<AtomicUsize>);
+
+    impl Buffer for RuntimeDropBuffer {
+        fn len_bytes(&self) -> usize {
+            64
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    impl Drop for RuntimeDropBuffer {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn counted_runtime() -> (Arc<Mutex<adapter::RuntimePhaseArena>>, Arc<AtomicUsize>) {
+        let arena = Arc::new(Mutex::new(adapter::RuntimePhaseArena::default()));
+        let drops = Arc::new(AtomicUsize::new(0));
+        arena
+            .lock()
+            .unwrap()
+            .install_test_workspace(Box::new(RuntimeDropBuffer(Arc::clone(&drops))));
+        (arena, drops)
+    }
+
+    fn expire_runtime_after(reaper: &AuxiliaryRuntimeReaper, delay: Duration) {
+        let (state, changed) = &*reaper.state;
+        state.lock().unwrap().deadline = Some(Instant::now() + delay);
+        changed.notify_one();
+    }
+
+    fn wait_for_runtime_release(drops: &AtomicUsize) {
+        let limit = Instant::now() + Duration::from_secs(2);
+        while drops.load(Ordering::SeqCst) == 0 && Instant::now() < limit {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn unified_phase_registry_retains_all_three_workspaces() {
+        let (primary, primary_drops) = counted_runtime();
+        let (embedding, embedding_drops) = counted_runtime();
+        let (vision, vision_drops) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let embedding_id = registry.register(&embedding);
+        let vision_id = registry.register(&vision);
+        let primary_id = UnifiedPhaseRegistry::PRIMARY_ID;
+        for id in [
+            primary_id,
+            embedding_id,
+            primary_id,
+            vision_id,
+            embedding_id,
+            primary_id,
+        ] {
+            registry.activate(id);
+        }
+        for drops in [&primary_drops, &embedding_drops, &vision_drops] {
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+        }
+        drop(vision);
+        assert_eq!(vision_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.reclaim_candidates(primary_id).len(), 1);
+    }
+
+    #[test]
+    fn unified_workspace_pressure_reclaims_auxiliary_before_primary() {
+        let (primary, primary_drops) = counted_runtime();
+        let (embedding, embedding_drops) = counted_runtime();
+        let (vision, vision_drops) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let current = registry.register(&embedding);
+        registry.register(&vision);
+        assert_eq!(registry.claim_with_reclaim(current, || Ok(7)).unwrap(), 7);
+        assert_eq!(vision_drops.load(Ordering::SeqCst), 0);
+        let claim = || {
+            if vision_drops.load(Ordering::SeqCst) == 1 {
+                Ok(9)
+            } else {
+                Err(be("no room"))
+            }
+        };
+        assert_eq!(registry.claim_with_reclaim(current, claim).unwrap(), 9);
+        assert_eq!(primary_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(embedding_drops.load(Ordering::SeqCst), 0);
+        assert!(registry
+            .claim_with_reclaim::<()>(current, || Err(be("still no room")))
+            .is_err());
+        assert_eq!(primary_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            embedding_drops.load(Ordering::SeqCst),
+            0,
+            "current workspace must never be reclaimed"
+        );
+    }
+
+    #[test]
+    fn auxiliary_runtime_deadline_is_five_seconds_and_refreshes() {
+        let (arena, drops) = counted_runtime();
+        let gate = Arc::new(RwLock::new(()));
+        let reaper = AuxiliaryRuntimeReaper::spawn(&arena, &gate).unwrap();
+        let before = Instant::now();
+        reaper.arm();
+        let first = reaper.state.0.lock().unwrap().deadline.unwrap();
+        assert!(first >= before + Duration::from_secs(5));
+        let deadline = AuxiliaryRuntimeDeadline {
+            deadline: Some(first),
+            stop: false,
+        };
+        assert!(!deadline.expired(first - Duration::from_nanos(1)));
+        assert!(deadline.expired(first));
+        reaper.arm();
+        assert!(reaper.state.0.lock().unwrap().deadline.unwrap() >= first);
+        drop(reaper);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn auxiliary_runtime_reaper_waits_for_gate_and_new_execute_refreshes_deadline() {
+        let (arena, drops) = counted_runtime();
+        let gate = Arc::new(RwLock::new(()));
+        let reaper = AuxiliaryRuntimeReaper::spawn(&arena, &gate).unwrap();
+        let exclusive = gate.write().unwrap();
+        expire_runtime_after(&reaper, Duration::ZERO);
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "in-flight commands retain their buffers"
+        );
+        reaper.arm();
+        drop(exclusive);
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "a new execute cancels stale expiry"
+        );
+        expire_runtime_after(&reaper, Duration::ZERO);
+        wait_for_runtime_release(&drops);
+    }
+
+    #[test]
+    fn auxiliary_runtime_reapers_are_independent_and_do_not_own_backends() {
+        let (embedding, embedding_drops) = counted_runtime();
+        let (vision, vision_drops) = counted_runtime();
+        let gate = Arc::new(RwLock::new(()));
+        let embedding_reaper = AuxiliaryRuntimeReaper::spawn(&embedding, &gate).unwrap();
+        let vision_reaper = AuxiliaryRuntimeReaper::spawn(&vision, &gate).unwrap();
+        assert_eq!(Arc::strong_count(&embedding), 1);
+        assert_eq!(Arc::strong_count(&gate), 1);
+        vision_reaper.arm();
+        expire_runtime_after(&embedding_reaper, Duration::ZERO);
+        wait_for_runtime_release(&embedding_drops);
+        assert_eq!(vision_drops.load(Ordering::SeqCst), 0);
+        drop(vision);
+        assert_eq!(vision_drops.load(Ordering::SeqCst), 1);
+        expire_runtime_after(&vision_reaper, Duration::ZERO);
+        drop(vision_reaper);
+        drop(embedding_reaper);
     }
 
     #[test]
@@ -8596,6 +9365,190 @@ mod tests {
         drop(a);
         drop(b);
         assert_eq!(pool.stats().allocated_bytes, 0);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn auxiliary_workspaces_coexist_reuse_and_expire_on_gpu() {
+        use crate::unified::UnifiedVramClass as Class;
+        use infr_core::graph::{Graph, Op};
+        use infr_core::{DType, TensorDesc};
+
+        let primary = VulkanBackend::new().unwrap();
+        let pool = primary.init_unified_vram(8 * 1024 * 1024).unwrap();
+        let embedding = primary.fork_embedding_client().unwrap();
+        let vision = primary.fork_vision_client().unwrap();
+        let primary_scratch = primary.alloc_unified(4096, Class::LlmRuntime).unwrap();
+        primary
+            .runtime_phase
+            .lock()
+            .unwrap()
+            .install_test_workspace(primary_scratch);
+        let embedding_weights = embedding.alloc_uninit(4096, BufferUsage::Weights).unwrap();
+        let vision_weights = vision.alloc_uninit(4096, BufferUsage::Weights).unwrap();
+        let execute = |backend: &VulkanBackend, n: usize, seed: f32| {
+            let mut graph = Graph::new();
+            let desc = TensorDesc::new(vec![n], DType::F32);
+            let input = graph.input(desc.clone());
+            let scratch = graph.internal(desc.clone());
+            let output = graph.output(desc);
+            // Partial writes must clear stale high-water rows before every cached execute.
+            graph.push(Op::Copy {
+                src: input,
+                src_off: 0,
+                dst: scratch,
+                dst_off: 0,
+                n: (n / 2) as u32,
+            });
+            graph.push(Op::Scale {
+                x: scratch,
+                dst: output,
+                s: 2.0,
+                n: n as u32,
+            });
+            let input_buffer = backend.alloc(n * 4, BufferUsage::Staging).unwrap();
+            let output_buffer = backend.alloc(n * 4, BufferUsage::Readback).unwrap();
+            let values = vec![seed; n];
+            backend
+                .upload(input_buffer.as_ref(), bytemuck::cast_slice(&values))
+                .unwrap();
+            let plan = backend.compile(&graph).unwrap();
+            let mut bindings = Bindings::new();
+            bindings.bind(input, input_buffer.as_ref());
+            bindings.bind(output, output_buffer.as_ref());
+            backend.execute(plan.as_ref(), &bindings).unwrap();
+            let mut actual = vec![0f32; n];
+            backend
+                .download(
+                    output_buffer.as_ref(),
+                    bytemuck::cast_slice_mut(&mut actual),
+                )
+                .unwrap();
+            for (index, &value) in actual.iter().enumerate() {
+                assert_eq!(value, if index < n / 2 { seed * 2.0 } else { 0.0 });
+            }
+        };
+        for n in [65, 256, 64, 1024, 3, 1024] {
+            execute(&embedding, n, 1.25);
+            execute(&vision, n + 2, -0.75);
+            primary.with_unified_exclusive(|| ());
+            let stats = pool.stats();
+            assert!(stats.class_bytes(Class::EmbeddingRuntime) > 0);
+            assert!(stats.class_bytes(Class::VisionRuntime) > 0);
+            assert_eq!(stats.class_bytes(Class::LlmRuntime), 4096);
+        }
+        let retained = pool.stats();
+        let embedding_address = embedding
+            .runtime_phase
+            .lock()
+            .unwrap()
+            .scratch_test_address();
+        execute(&embedding, 1024, 3.0);
+        assert_eq!(
+            embedding
+                .runtime_phase
+                .lock()
+                .unwrap()
+                .scratch_test_address(),
+            embedding_address
+        );
+        assert_eq!(pool.stats().allocated_bytes, retained.allocated_bytes);
+        let deadline = Instant::now() + AUXILIARY_RUNTIME_IDLE + Duration::from_secs(2);
+        loop {
+            let stats = pool.stats();
+            if stats.class_bytes(Class::EmbeddingRuntime) == 0
+                && stats.class_bytes(Class::VisionRuntime) == 0
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "auxiliary runtime did not expire: {stats:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(pool.stats().class_bytes(Class::EmbeddingWeights), 4096);
+        assert_eq!(pool.stats().class_bytes(Class::VisionWeights), 4096);
+        assert_eq!(pool.stats().class_bytes(Class::LlmRuntime), 4096);
+        execute(&vision, 65, 2.0);
+        vision.release_auxiliary_runtime().unwrap();
+        assert_eq!(pool.stats().class_bytes(Class::VisionRuntime), 0);
+        drop(embedding_weights);
+        drop(vision_weights);
+        primary.runtime_phase.lock().unwrap().release_phase();
+        assert_eq!(pool.stats().allocated_bytes, 0);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn auxiliary_workspace_pressure_reclaims_real_unified_ranges() {
+        use crate::unified::UnifiedVramClass as Class;
+        let primary = VulkanBackend::new().unwrap();
+        let pool = primary.init_unified_vram(1024 * 1024).unwrap();
+        let embedding = primary.fork_embedding_client().unwrap();
+        let vision = primary.fork_vision_client().unwrap();
+        for (backend, class, bytes) in [
+            (&primary, Class::LlmRuntime, 200_000),
+            (&embedding, Class::EmbeddingRuntime, 200_000),
+            (&vision, Class::VisionRuntime, 250_000),
+        ] {
+            let scratch = backend.alloc_unified(bytes, class).unwrap();
+            backend
+                .runtime_phase
+                .lock()
+                .unwrap()
+                .install_test_workspace(scratch);
+        }
+        let weights = embedding
+            .alloc_uninit(600_000, BufferUsage::Weights)
+            .unwrap();
+        assert_eq!(pool.stats().class_bytes(Class::VisionRuntime), 0);
+        assert!(pool.stats().class_bytes(Class::LlmRuntime) > 0);
+        assert!(pool.stats().class_bytes(Class::EmbeddingRuntime) > 0);
+        assert!(embedding
+            .alloc_uninit(2 * 1024 * 1024, BufferUsage::Weights)
+            .is_err());
+        assert_eq!(pool.stats().class_bytes(Class::LlmRuntime), 0);
+        assert!(pool.stats().class_bytes(Class::EmbeddingRuntime) > 0);
+        drop(weights);
+        embedding.release_auxiliary_runtime().unwrap();
+        assert_eq!(pool.stats().allocated_bytes, 0);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn staged_state_upload_waits_for_primary_recording_and_allows_nested_copies() {
+        use std::sync::mpsc;
+        let primary = VulkanBackend::new().unwrap();
+        primary.init_unified_vram(8 * 1024 * 1024).unwrap();
+        let auxiliary = primary.fork_vision_client().unwrap();
+        let destination = primary
+            .make_buf(4096, MemoryLocation::GpuOnly, "test-unmapped-state")
+            .unwrap();
+        assert!(destination.mapped_ptr().is_none());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            primary.with_unified_exclusive(|| {
+                let recorder = crate::recorder::Recorder::new(&primary).unwrap();
+                scope.spawn(|| {
+                    started_tx.send(()).unwrap();
+                    auxiliary.upload(&destination, &[19; 4096]).unwrap();
+                    finished_tx.send(()).unwrap();
+                });
+                started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert!(finished_rx
+                    .recv_timeout(Duration::from_millis(100))
+                    .is_err());
+                recorder.finish().unwrap();
+                // Graph lowering also invokes one-shot copies under the same lease.
+                primary.one_shot(|_| {}).unwrap();
+            });
+        });
+        finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut bytes = [0; 4096];
+        primary.download(&destination, &mut bytes).unwrap();
+        assert_eq!(bytes, [19; 4096]);
     }
 
     /// Segmented KV keeps its graph-visible logical extent while committing only the requested

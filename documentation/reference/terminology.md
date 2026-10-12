@@ -2,8 +2,9 @@
 kind: reference
 status: current
 scope: documentation-terminology
-last_verified: 2026-09-28
-verified_commit: ed62393068679573afe94a1472454efe7eae0f15
+last_verified: 2026-10-11
+verified_commit: 7b4a9411e9c7524f8dc6ae2603c62d5f338190dc
+baseline_tag: release-0.10.0
 ---
 
 # 文档术语表
@@ -43,7 +44,7 @@ verified_commit: ed62393068679573afe94a1472454efe7eae0f15
 | benchmark | 基准测试 | 结果或方法均使用此译法。 |
 | campaign | 优化专项 | 指有目标、有基线和结项记录的一组工程工作。 |
 | acceptance | 验收 | 功能或性能达到约定条件的检查记录。 |
-| harness | 测试工具 / 测试框架 | 按实际规模选择；不机械音译。 |
+| harness | 测试工具 / 测试框架；DSH 保留专名 | 工程测试按用途翻译；`harness/` 产品树与 DeepSeek Harness 不等同于 benchmark runner。 |
 | oracle | 参照实现 | 用于正确性或性能对比的实现。 |
 | seam | 接口层 / 适配边界 | 按句意选用；不译作“接缝”。 |
 | autograd | 自动微分 | `tape autograd` 可写“基于计算记录的自动微分”。 |
@@ -65,3 +66,11 @@ verified_commit: ed62393068679573afe94a1472454efe7eae0f15
 | profiler / profiling | 性能分析器 / 性能分析 | 具体工具名和配置键仍保留原文。 |
 
 允许保留的英文还包括自然融入中文句子的业内术语和通用缩写。章节标题、表格标签、方法说明和结论等普通叙述应使用中文；如原文是一条必须逐字引用的日志、提交主题或数据，应保留原文并明确其引用属性。
+
+## 0.10.0 指标与调度用词
+
+- `configured slots`：服务建立的 KV 槽位数；`active lanes`：当前进入计算的请求行；`Prefill lanes`：专家流送缓冲通道。三者不是同一个数量。
+- `VERIFY rows`：一次 target forward 的验证行；Qwen3.8 默认 4 rows 包含一个 leading token 和三个 draft 候选，alpha 的分母只含 draft。
+- `head horizon`：MTP head 的滑动上下文；`target cutoff`：调度器选择是否使用 MTP 的收益边界，不能混同模型最大 context。
+- `interval speed`：统计窗口内 token 增量 / 窗口时长；`whole speed`：完整请求计时；`steady speed`：约定的同时 Decode 区间。最快时间段均速与 rolling peak 分开命名。
+- `CPU miss`：特定缓存 miss 的专家 FFN 由 CPU 计算；专家仍按 pager 计划进入 GPU cache，不等于专家永久卸载到 CPU。

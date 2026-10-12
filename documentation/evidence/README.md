@@ -2,8 +2,9 @@
 kind: index
 status: current
 scope: evidence
-last_verified: 2026-09-28
-verified_commit: ed62393068679573afe94a1472454efe7eae0f15
+last_verified: 2026-10-11
+verified_commit: 7b4a9411e9c7524f8dc6ae2603c62d5f338190dc
+baseline_tag: release-0.10.0
 ---
 
 # 工程证据
@@ -28,4 +29,4 @@ verified_commit: ed62393068679573afe94a1472454efe7eae0f15
 
 不同等级不能在同一表中不加说明地比较。
 
-当前代码架构统一以 `release-0.9.0` 为准；单次运行记录仍各自绑定工件中的精确源码 commit，不因文档基线而改写。
+当前代码架构统一以 `release-0.10.0` 为准；单次运行记录仍各自绑定工件中的精确源码 commit，不因文档基线而改写。

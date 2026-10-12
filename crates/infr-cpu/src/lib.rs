@@ -12,6 +12,7 @@
 pub mod kvquant;
 pub mod paged;
 mod pool;
+pub mod task_pool;
 pub mod turbo;
 
 mod kernels;
@@ -21,7 +22,7 @@ mod repack;
 
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, GraphPlan, Plan};
 use infr_core::config::Config;
-use infr_core::error::Result;
+use infr_core::error::{Error, Result};
 use infr_core::exec::Provision;
 use infr_core::graph::{Activation, AttnMask, Dsv4CacheFormat, Graph, MoeGating, Op, TensorKind};
 use infr_core::tensor::{DType, TensorId};
@@ -834,6 +835,7 @@ impl Backend for CpuBackend {
             // must be rebuilt per token — no record-once replay.
             decode_replay: false,
             combined_gu: false,
+            qsa_prepare: false,
             embed_gather: true,
             gpu_sample: true,
             sample_rows: true,
@@ -844,6 +846,11 @@ impl Backend for CpuBackend {
             // `QkNorm`→`GatedAct` pair here — no GPU barrier to save on a scalar interpreter, and
             // it keeps the CPU oracle's op sequence matching the pre-fusion baseline.
             gated_rmsnorm: false,
+            // The interpreter implements the op as a parity oracle below, but has no command
+            // submission boundary to save, so production graphs retain two ordinary Linears.
+            linear_pair_f32: false,
+            // Vulkan-only mixed Q8_0/F32 launch fusion; the CPU keeps the split oracle graph.
+            qwen_hc_down_inject: false,
             // The interpreter's WriteKv/Attention honor ring KV caches (row = pos % cap_rows), so
             // the runner may window-size SWA layers' caches here.
             kv_swa_ring: true,
@@ -1100,9 +1107,9 @@ impl Backend for CpuBackend {
                     }
                     vals[dst.0 as usize] = out;
                 }
-                // Fused per-head RMSNorm + SiLU gate multiply (qwen35 DeltaNet z-gate). Reduction
+                // Fused per-head RMSNorm + gate multiply. Reduction
                 // structure is IDENTICAL to the `QkNorm` arm above (bit-stable normalization); the
-                // gate multiply is the extra elementwise step `GatedAct(Silu)` would otherwise do
+                // gate multiply is the extra elementwise `GatedAct` step that would otherwise run
                 // as a second op.
                 Op::GatedRmsNorm {
                     x,
@@ -1113,6 +1120,7 @@ impl Backend for CpuBackend {
                     n_head,
                     head_dim,
                     eps,
+                    act,
                 } => {
                     let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
                     let xs = &vals[x.0 as usize];
@@ -1128,12 +1136,57 @@ impl Backend for CpuBackend {
                             for i in 0..hd {
                                 let normed = xs[b + i] * s * ws[i];
                                 let zv = zs[b + i];
-                                let silu = zv / (1.0 + (-zv).exp());
-                                out[b + i] = normed * silu;
+                                let gate = match act {
+                                    Activation::Silu => zv / (1.0 + (-zv).exp()),
+                                    Activation::Sigmoid => 1.0 / (1.0 + (-zv).exp()),
+                                    Activation::Gelu => {
+                                        0.5 * zv
+                                            * (1.0
+                                                + (0.797_884_6 * (zv + 0.044715 * zv * zv * zv))
+                                                    .tanh())
+                                    }
+                                };
+                                out[b + i] = normed * gate;
                             }
                         }
                     }
                     vals[dst.0 as usize] = out;
+                }
+                Op::LinearPair {
+                    x,
+                    weight_a,
+                    weight_b,
+                    dst_a,
+                    dst_b,
+                    m,
+                    in_f,
+                    out_f,
+                } => {
+                    let (m, in_f, out_f) = (m as usize, in_f as usize, out_f as usize);
+                    assert_eq!(g.desc(weight_a).dtype, DType::F32);
+                    assert_eq!(g.desc(weight_b).dtype, DType::F32);
+                    let xs = &vals[x.0 as usize];
+                    let buf_a = bindings
+                        .get(weight_a)
+                        .expect("cpu backend: unbound LinearPair weight_a");
+                    let buf_b = bindings
+                        .get(weight_b)
+                        .expect("cpu backend: unbound LinearPair weight_b");
+                    let bytes_a = cpu_buf(buf_a).read();
+                    let bytes_b = cpu_buf(buf_b).read();
+                    let wa: &[f32] = bytemuck::cast_slice(&bytes_a);
+                    let wb: &[f32] = bytemuck::cast_slice(&bytes_b);
+                    let mut out_a = vec![0f32; m * out_f];
+                    let mut out_b = vec![0f32; m * out_f];
+                    for r in 0..m {
+                        let xr = &xs[r * in_f..(r + 1) * in_f];
+                        for o in 0..out_f {
+                            out_a[r * out_f + o] = dot(&wa[o * in_f..(o + 1) * in_f], xr);
+                            out_b[r * out_f + o] = dot(&wb[o * in_f..(o + 1) * in_f], xr);
+                        }
+                    }
+                    vals[dst_a.0 as usize] = out_a;
+                    vals[dst_b.0 as usize] = out_b;
                 }
                 Op::Linear {
                     x,
@@ -2031,6 +2084,116 @@ impl Backend for CpuBackend {
                         }
                     }
                 }
+                Op::QsaPrepare {
+                    qk,
+                    q_norm,
+                    positions,
+                    positions4,
+                    k_cache,
+                    q_dst,
+                    rows,
+                    n_head,
+                    head_dim,
+                    rope_dim,
+                    theta,
+                    eps,
+                    sections,
+                    pos,
+                } => {
+                    let (rows, nh, hd, rd, pos) = (
+                        rows as usize,
+                        n_head as usize,
+                        head_dim as usize,
+                        rope_dim as usize,
+                        pos as usize,
+                    );
+                    let q_width = nh * hd;
+                    let stride = q_width + hd;
+                    let src = &vals[qk.0 as usize];
+                    let norm = weight(q_norm);
+
+                    let cache_buf = bindings
+                        .get(k_cache)
+                        .expect("cpu backend: unbound QSA raw-key cache");
+                    let mut cache = cpu_buf(cache_buf).owned();
+                    let cap_rows = g.desc(k_cache).numel() / hd.max(1);
+                    for row in 0..rows {
+                        let dst_row = if cap_rows > 0 {
+                            (pos + row) % cap_rows
+                        } else {
+                            pos + row
+                        };
+                        let key = &src[row * stride + q_width..row * stride + stride];
+                        let base = dst_row * hd;
+                        match g.desc(k_cache).dtype {
+                            DType::F16 => {
+                                let dst: &mut [u16] = bytemuck::cast_slice_mut(&mut cache);
+                                for i in 0..hd {
+                                    dst[base + i] = half::f16::from_f32(key[i]).to_bits();
+                                }
+                            }
+                            DType::F32 => {
+                                let dst: &mut [f32] = bytemuck::cast_slice_mut(&mut cache);
+                                dst[base..base + hd].copy_from_slice(key);
+                            }
+                            dt => panic!("cpu QsaPrepare raw-key cache dtype {dt:?} unsupported"),
+                        }
+                    }
+
+                    let linear_positions = &vals[positions.0 as usize];
+                    let multimodal_positions = positions4.map(|id| vals[id.0 as usize].as_slice());
+                    let half = rd / 2;
+                    let section_widths = sections.map(|v| v as usize);
+                    let section_total: usize = section_widths.iter().sum();
+                    let plane_for = |pair: usize| {
+                        let sector = pair % section_total;
+                        if sector % 3 == 1 && sector < 3 * section_widths[1] {
+                            1
+                        } else if sector % 3 == 2 && sector < 3 * section_widths[2] {
+                            2
+                        } else if sector.is_multiple_of(3) && sector < 3 * section_widths[0] {
+                            0
+                        } else {
+                            3
+                        }
+                    };
+                    assert!(rd <= hd && rd.is_multiple_of(2));
+                    assert!(multimodal_positions.is_none() || section_total > 0);
+
+                    let mut out = vec![0.0; rows * q_width];
+                    self.pool()
+                        .for_chunks_mut(&mut out, q_width, 1, &|row, out_row| {
+                            let q_row = &src[row * stride..row * stride + q_width];
+                            let angles = (0..half)
+                                .map(|pair| {
+                                    let p = multimodal_positions
+                                        .map_or(linear_positions[row], |p4| {
+                                            p4[row * 4 + plane_for(pair)]
+                                        });
+                                    let angle = p * theta.powf(-2.0 * pair as f32 / rd as f32);
+                                    angle.sin_cos()
+                                })
+                                .collect::<Vec<_>>();
+                            for head in 0..nh {
+                                let base = head * hd;
+                                let mean_sq = (0..hd)
+                                    .map(|i| q_row[base + i] * q_row[base + i])
+                                    .sum::<f32>()
+                                    / hd as f32;
+                                let scale = 1.0 / (mean_sq + eps).sqrt();
+                                for i in 0..hd {
+                                    out_row[base + i] = q_row[base + i] * scale * norm[i];
+                                }
+                                for (pair, &(sin, cos)) in angles.iter().enumerate() {
+                                    let (i0, i1) = (base + pair, base + pair + half);
+                                    let (a, b) = (out_row[i0], out_row[i1]);
+                                    out_row[i0] = a * cos - b * sin;
+                                    out_row[i1] = a * sin + b * cos;
+                                }
+                            }
+                        });
+                    vals[q_dst.0 as usize] = out;
+                }
                 Op::Dsv4Compress {
                     values,
                     scores,
@@ -2861,6 +3024,11 @@ impl Backend for CpuBackend {
                     });
                     vals[dst.0 as usize] = out;
                 }
+                Op::QwenHcDownInject { .. } => {
+                    return Err(Error::Unsupported(
+                        "CPU QwenHcDownInject is a Vulkan-only launch fusion".into(),
+                    ));
+                }
                 Op::Gelu { x, dst, rows, cols } => {
                     let n = (rows * cols) as usize;
                     let xs = &vals[x.0 as usize];
@@ -2902,6 +3070,33 @@ impl Backend for CpuBackend {
                     });
                     vals[dst.0 as usize] = out;
                 }
+                Op::QwenHcNorm {
+                    x,
+                    norm,
+                    dst,
+                    rows,
+                    hc,
+                    n_embd,
+                    eps,
+                } => {
+                    let (rr, hc, ne) = (rows as usize, hc as usize, n_embd as usize);
+                    let xs = &vals[x.0 as usize];
+                    let ns = weight(norm);
+                    let mut out = vec![0.0f32; rr * hc * ne];
+                    for rh in 0..rr * hc {
+                        let base = rh * ne;
+                        let sum_sq = xs[base..base + ne]
+                            .iter()
+                            .map(|value| value * value)
+                            .sum::<f32>();
+                        let scale = (sum_sq / ne as f32 + eps).sqrt().recip();
+                        let norm_base = (rh % hc) * ne;
+                        for d in 0..ne {
+                            out[base + d] = xs[base + d] * scale * ns[norm_base + d];
+                        }
+                    }
+                    vals[dst.0 as usize] = out;
+                }
                 Op::QwenHcInject {
                     residual,
                     block,
@@ -2926,6 +3121,44 @@ impl Backend for CpuBackend {
                         }
                     });
                     vals[dst.0 as usize] = out;
+                }
+                Op::QwenHcInjectNorm {
+                    residual,
+                    block,
+                    gate,
+                    norm,
+                    residual_dst,
+                    normed_dst,
+                    rows,
+                    hc,
+                    n_embd,
+                    eps,
+                } => {
+                    let (rr, hc, ne) = (rows as usize, hc as usize, n_embd as usize);
+                    let rs = &vals[residual.0 as usize];
+                    let bs = &vals[block.0 as usize];
+                    let gs = &vals[gate.0 as usize];
+                    let ns = weight(norm);
+                    let mut injected = vec![0.0f32; rr * hc * ne];
+                    let mut normed = vec![0.0f32; rr * hc * ne];
+                    for r in 0..rr {
+                        for h in 0..hc {
+                            let base = (r * hc + h) * ne;
+                            let scale = 2.0 / (1.0 + (-(gs[r * hc + h] / hc as f32)).exp());
+                            let mut sum_sq = 0.0f32;
+                            for d in 0..ne {
+                                let value = rs[base + d] + bs[r * ne + d] * scale;
+                                injected[base + d] = value;
+                                sum_sq += value * value;
+                            }
+                            let rms = (sum_sq / ne as f32 + eps).sqrt().recip();
+                            for d in 0..ne {
+                                normed[base + d] = injected[base + d] * rms * ns[h * ne + d];
+                            }
+                        }
+                    }
+                    vals[residual_dst.0 as usize] = injected;
+                    vals[normed_dst.0 as usize] = normed;
                 }
                 Op::QwenPleGate {
                     key,
@@ -4772,6 +5005,186 @@ mod tests {
     use infr_core::tensor::TensorDesc;
 
     #[test]
+    fn gated_rmsnorm_matches_split_graph() {
+        let (rows, n_head, head_dim) = (3usize, 4usize, 8usize);
+        let n = rows * n_head * head_dim;
+        let values: Vec<f32> = (0..n).map(|i| (i as f32 * 0.17).sin()).collect();
+        let gates: Vec<f32> = (0..n).map(|i| (i as f32 * 0.31).cos()).collect();
+        let weights: Vec<f32> = (0..head_dim).map(|i| 0.75 + i as f32 * 0.05).collect();
+
+        for act in [Activation::Silu, Activation::Sigmoid] {
+            let backend = CpuBackend::new();
+            let mut graph = Graph::new();
+            let x = graph.input(TensorDesc::new(vec![rows, n_head, head_dim], DType::F32));
+            let gate = graph.input(TensorDesc::new(vec![rows, n_head, head_dim], DType::F32));
+            let weight = graph.weight(TensorDesc::new(vec![head_dim], DType::F32));
+            let normed = graph.internal(TensorDesc::new(vec![rows, n_head, head_dim], DType::F32));
+            let fused = graph.output(TensorDesc::new(vec![rows, n_head, head_dim], DType::F32));
+            let split = graph.output(TensorDesc::new(vec![rows, n_head, head_dim], DType::F32));
+            graph.push(Op::GatedRmsNorm {
+                x,
+                weight,
+                gate,
+                dst: fused,
+                rows: rows as u32,
+                n_head: n_head as u32,
+                head_dim: head_dim as u32,
+                eps: 1e-6,
+                act,
+            });
+            graph.push(Op::QkNorm {
+                x,
+                weight: Some(weight),
+                dst: normed,
+                rows: rows as u32,
+                n_head: n_head as u32,
+                head_dim: head_dim as u32,
+                eps: 1e-6,
+                x_stride: 0,
+            });
+            graph.push(Op::GatedAct {
+                gate,
+                up: normed,
+                dst: split,
+                rows: rows as u32,
+                nff: (n_head * head_dim) as u32,
+                act,
+                up_off: 0,
+                up_stride: 0,
+                gate_stride: 0,
+                gate_block_width: 0,
+                swiglu_clamp: None,
+            });
+
+            let plan = backend.compile(&graph).expect("compile");
+            let xb = backend.alloc(n * 4, BufferUsage::Activations).expect("x");
+            let gb = backend
+                .alloc(n * 4, BufferUsage::Activations)
+                .expect("gate");
+            let wb = backend
+                .alloc(head_dim * 4, BufferUsage::Weights)
+                .expect("weight");
+            let fb = backend.alloc(n * 4, BufferUsage::Readback).expect("fused");
+            let sb = backend.alloc(n * 4, BufferUsage::Readback).expect("split");
+            backend
+                .upload(xb.as_ref(), bytemuck::cast_slice(&values))
+                .unwrap();
+            backend
+                .upload(gb.as_ref(), bytemuck::cast_slice(&gates))
+                .unwrap();
+            backend
+                .upload(wb.as_ref(), bytemuck::cast_slice(&weights))
+                .unwrap();
+            let mut bindings = Bindings::new();
+            bindings
+                .bind(x, xb.as_ref())
+                .bind(gate, gb.as_ref())
+                .bind(weight, wb.as_ref())
+                .bind(fused, fb.as_ref())
+                .bind(split, sb.as_ref());
+            backend.execute(plan.as_ref(), &bindings).expect("execute");
+
+            let mut fused_bytes = vec![0u8; n * 4];
+            let mut split_bytes = vec![0u8; n * 4];
+            backend.download(fb.as_ref(), &mut fused_bytes).unwrap();
+            backend.download(sb.as_ref(), &mut split_bytes).unwrap();
+            assert_eq!(
+                bytemuck::cast_slice::<u8, f32>(&fused_bytes),
+                bytemuck::cast_slice::<u8, f32>(&split_bytes),
+                "GatedRmsNorm {act:?} differs from split QkNorm/GatedAct"
+            );
+        }
+    }
+
+    #[test]
+    fn linear_pair_f32_matches_split_linears() {
+        for rows in [1usize, 4, 9] {
+            let (in_f, out_f) = (32usize, 7usize);
+            let x_data: Vec<f32> = (0..rows * in_f)
+                .map(|i| (i as f32 * 0.071).sin() * 0.5)
+                .collect();
+            let wa_data: Vec<f32> = (0..out_f * in_f)
+                .map(|i| (i as f32 * 0.037).cos() * 0.3)
+                .collect();
+            let wb_data: Vec<f32> = (0..out_f * in_f)
+                .map(|i| (i as f32 * 0.053).sin() * 0.2)
+                .collect();
+            let backend = CpuBackend::new();
+            let mut graph = Graph::new();
+            let x = graph.input(TensorDesc::new(vec![rows, in_f], DType::F32));
+            let wa = graph.weight(TensorDesc::new(vec![out_f, in_f], DType::F32));
+            let wb = graph.weight(TensorDesc::new(vec![out_f, in_f], DType::F32));
+            let pair_a = graph.output(TensorDesc::new(vec![rows, out_f], DType::F32));
+            let pair_b = graph.output(TensorDesc::new(vec![rows, out_f], DType::F32));
+            let split_a = graph.output(TensorDesc::new(vec![rows, out_f], DType::F32));
+            let split_b = graph.output(TensorDesc::new(vec![rows, out_f], DType::F32));
+            graph.push(Op::LinearPair {
+                x,
+                weight_a: wa,
+                weight_b: wb,
+                dst_a: pair_a,
+                dst_b: pair_b,
+                m: rows as u32,
+                in_f: in_f as u32,
+                out_f: out_f as u32,
+            });
+            for (weight, dst) in [(wa, split_a), (wb, split_b)] {
+                graph.push(Op::Linear {
+                    x,
+                    weight,
+                    dst,
+                    m: rows as u32,
+                    in_f: in_f as u32,
+                    out_f: out_f as u32,
+                    w_off: 0,
+                });
+            }
+            let plan = backend.compile(&graph).expect("compile");
+            let xb = backend
+                .alloc(x_data.len() * 4, BufferUsage::Activations)
+                .unwrap();
+            let wab = backend
+                .alloc(wa_data.len() * 4, BufferUsage::Weights)
+                .unwrap();
+            let wbb = backend
+                .alloc(wb_data.len() * 4, BufferUsage::Weights)
+                .unwrap();
+            let outputs: Vec<_> = (0..4)
+                .map(|_| {
+                    backend
+                        .alloc(rows * out_f * 4, BufferUsage::Readback)
+                        .unwrap()
+                })
+                .collect();
+            backend
+                .upload(xb.as_ref(), bytemuck::cast_slice(&x_data))
+                .unwrap();
+            backend
+                .upload(wab.as_ref(), bytemuck::cast_slice(&wa_data))
+                .unwrap();
+            backend
+                .upload(wbb.as_ref(), bytemuck::cast_slice(&wb_data))
+                .unwrap();
+            let mut bindings = Bindings::new();
+            bindings
+                .bind(x, xb.as_ref())
+                .bind(wa, wab.as_ref())
+                .bind(wb, wbb.as_ref())
+                .bind(pair_a, outputs[0].as_ref())
+                .bind(pair_b, outputs[1].as_ref())
+                .bind(split_a, outputs[2].as_ref())
+                .bind(split_b, outputs[3].as_ref());
+            backend.execute(plan.as_ref(), &bindings).unwrap();
+            let mut got: Vec<Vec<u8>> = (0..4).map(|_| vec![0; rows * out_f * 4]).collect();
+            for (buf, bytes) in outputs.iter().zip(&mut got) {
+                backend.download(buf.as_ref(), bytes).unwrap();
+            }
+            assert_eq!(got[0], got[2], "rows={rows} projection A");
+            assert_eq!(got[1], got[3], "rows={rows} projection B");
+        }
+    }
+
+    #[test]
     fn multimodal_rope_matches_plain_rope_when_text_planes_are_equal() {
         let backend = CpuBackend::new();
         let mut graph = Graph::new();
@@ -4853,6 +5266,191 @@ mod tests {
             .map(|(x, y)| (x - y).abs())
             .fold(0.0f32, f32::max);
         assert!(max_error < 1e-6, "text-plane collapse error {max_error}");
+    }
+
+    fn qsa_prepare_matches_split_path(mrope: bool) {
+        let backend = CpuBackend::new();
+        let (rows, n_head, head_dim, cap_rows, start_pos) =
+            (3usize, 2usize, 8usize, 4usize, 3usize);
+        let q_width = n_head * head_dim;
+        let q = (0..rows * q_width)
+            .map(|i| ((i * 17 % 41) as f32 - 20.0) / 13.0)
+            .collect::<Vec<_>>();
+        let key = (0..rows * head_dim)
+            .map(|i| ((i * 11 % 29) as f32 - 14.0) / 9.0)
+            .collect::<Vec<_>>();
+        let mut qk = Vec::with_capacity(rows * (q_width + head_dim));
+        for row in 0..rows {
+            qk.extend_from_slice(&q[row * q_width..(row + 1) * q_width]);
+            qk.extend_from_slice(&key[row * head_dim..(row + 1) * head_dim]);
+        }
+        let norm = (0..head_dim)
+            .map(|i| 0.75 + i as f32 * 0.07)
+            .collect::<Vec<_>>();
+        let positions = [11i32, 12, 13];
+        let positions4 = [11i32, 11, 11, 0, 12, 4, 5, 6, 13, 8, 9, 10];
+        let sections = [2, 1, 1, 0];
+
+        let mut graph = Graph::new();
+        let qi = graph.input(TensorDesc::new(vec![rows, q_width], DType::F32));
+        let ki = graph.input(TensorDesc::new(vec![rows, head_dim], DType::F32));
+        let qki = graph.input(TensorDesc::new(vec![rows, q_width + head_dim], DType::F32));
+        let nw = graph.weight(TensorDesc::new(vec![head_dim], DType::F32));
+        let pi = graph.input(TensorDesc::new(vec![rows], DType::I32));
+        let p4i = graph.input(TensorDesc::new(vec![rows, 4], DType::I32));
+        let split_cache = graph.input(TensorDesc::new(vec![cap_rows, head_dim], DType::F16));
+        let fused_cache = graph.input(TensorDesc::new(vec![cap_rows, head_dim], DType::F16));
+        let split_q = graph.output(TensorDesc::new(vec![rows, q_width], DType::F32));
+        let fused_q = graph.output(TensorDesc::new(vec![rows, q_width], DType::F32));
+        graph.push(Op::WriteKv {
+            src: ki,
+            cache: split_cache,
+            rows: rows as u32,
+            row_stride: head_dim as u32,
+            pos: start_pos as u32,
+        });
+        if mrope {
+            graph.push(Op::QkNormMrope {
+                x: qi,
+                weight: nw,
+                positions4: p4i,
+                dst: split_q,
+                rows: rows as u32,
+                n_head: n_head as u32,
+                head_dim: head_dim as u32,
+                rope_dim: head_dim as u32,
+                theta: 10_000.0,
+                eps: 1e-6,
+                sections,
+                x_stride: 0,
+            });
+        } else {
+            graph.push(Op::QkNormRope {
+                x: qi,
+                weight: nw,
+                positions: pi,
+                dst: split_q,
+                rows: rows as u32,
+                n_head: n_head as u32,
+                head_dim: head_dim as u32,
+                rope_dim: head_dim as u32,
+                theta: 10_000.0,
+                eps: 1e-6,
+                freq_factors: None,
+                x_stride: 0,
+            });
+        }
+        graph.push(Op::QsaPrepare {
+            qk: qki,
+            q_norm: nw,
+            positions: pi,
+            positions4: mrope.then_some(p4i),
+            k_cache: fused_cache,
+            q_dst: fused_q,
+            rows: rows as u32,
+            n_head: n_head as u32,
+            head_dim: head_dim as u32,
+            rope_dim: head_dim as u32,
+            theta: 10_000.0,
+            eps: 1e-6,
+            sections,
+            pos: start_pos as u32,
+        });
+
+        let plan = backend
+            .compile(&graph)
+            .expect("compile QSA prepare parity graph");
+        let alloc = |bytes, usage| backend.alloc(bytes, usage).expect("allocate test buffer");
+        let qb = alloc(q.len() * 4, BufferUsage::Activations);
+        let kb = alloc(key.len() * 4, BufferUsage::Activations);
+        let qkb = alloc(qk.len() * 4, BufferUsage::Activations);
+        let nb = alloc(norm.len() * 4, BufferUsage::Weights);
+        let pb = alloc(positions.len() * 4, BufferUsage::Activations);
+        let p4b = alloc(positions4.len() * 4, BufferUsage::Activations);
+        let cache_bytes = cap_rows * head_dim * 2;
+        let split_cb = alloc(cache_bytes, BufferUsage::KvCache);
+        let fused_cb = alloc(cache_bytes, BufferUsage::KvCache);
+        let split_ob = alloc(rows * q_width * 4, BufferUsage::Readback);
+        let fused_ob = alloc(rows * q_width * 4, BufferUsage::Readback);
+        backend
+            .upload(qb.as_ref(), bytemuck::cast_slice(&q))
+            .unwrap();
+        backend
+            .upload(kb.as_ref(), bytemuck::cast_slice(&key))
+            .unwrap();
+        backend
+            .upload(qkb.as_ref(), bytemuck::cast_slice(&qk))
+            .unwrap();
+        backend
+            .upload(nb.as_ref(), bytemuck::cast_slice(&norm))
+            .unwrap();
+        backend
+            .upload(pb.as_ref(), bytemuck::cast_slice(&positions))
+            .unwrap();
+        backend
+            .upload(p4b.as_ref(), bytemuck::cast_slice(&positions4))
+            .unwrap();
+        let initial_cache = (0..cap_rows * head_dim)
+            .map(|i| half::f16::from_f32(-10.0 - i as f32 * 0.01).to_bits())
+            .collect::<Vec<_>>();
+        backend
+            .upload(split_cb.as_ref(), bytemuck::cast_slice(&initial_cache))
+            .unwrap();
+        backend
+            .upload(fused_cb.as_ref(), bytemuck::cast_slice(&initial_cache))
+            .unwrap();
+        let mut bindings = Bindings::new();
+        bindings
+            .bind(qi, qb.as_ref())
+            .bind(ki, kb.as_ref())
+            .bind(qki, qkb.as_ref())
+            .bind(nw, nb.as_ref())
+            .bind(pi, pb.as_ref())
+            .bind(p4i, p4b.as_ref())
+            .bind(split_cache, split_cb.as_ref())
+            .bind(fused_cache, fused_cb.as_ref())
+            .bind(split_q, split_ob.as_ref())
+            .bind(fused_q, fused_ob.as_ref());
+        backend
+            .execute(plan.as_ref(), &bindings)
+            .expect("execute QSA prepare parity graph");
+
+        let mut split = vec![0.0f32; rows * q_width];
+        let mut fused = vec![0.0f32; rows * q_width];
+        backend
+            .download(split_ob.as_ref(), bytemuck::cast_slice_mut(&mut split))
+            .unwrap();
+        backend
+            .download(fused_ob.as_ref(), bytemuck::cast_slice_mut(&mut fused))
+            .unwrap();
+        let max_error = split
+            .iter()
+            .zip(&fused)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_error < 1e-6,
+            "QSA prepare query mismatch: {max_error:e}"
+        );
+
+        let mut split_cache_bytes = vec![0u8; cache_bytes];
+        let mut fused_cache_bytes = vec![0u8; cache_bytes];
+        backend
+            .download(split_cb.as_ref(), &mut split_cache_bytes)
+            .unwrap();
+        backend
+            .download(fused_cb.as_ref(), &mut fused_cache_bytes)
+            .unwrap();
+        assert_eq!(
+            split_cache_bytes, fused_cache_bytes,
+            "QSA raw-key ring mismatch"
+        );
+    }
+
+    #[test]
+    fn qsa_prepare_matches_split_text_and_mrope_across_ring_wrap() {
+        qsa_prepare_matches_split_path(false);
+        qsa_prepare_matches_split_path(true);
     }
 
     #[test]

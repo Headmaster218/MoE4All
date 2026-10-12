@@ -2,82 +2,48 @@
 kind: architecture
 status: current
 scope: qwen38-mtp
-last_verified: 2026-09-28
-verified_commit: ed62393068679573afe94a1472454efe7eae0f15
+last_verified: 2026-10-11
+verified_commit: 7b4a9411e9c7524f8dc6ae2603c62d5f338190dc
+baseline_tag: release-0.10.0
 ---
 
-# Qwen3.8 四个 token 的 MTP
+# Qwen3.8 MTP 与机会式调度
 
-## 目标
+## 周期与状态
 
-Qwen3.8 MTP 是自推测解码：轻量 MTP 头每轮最多预测四个后续 token，目标模型用一次批量 VERIFY 检查候选行，
-然后提交已接受前缀。有效预测数会受剩余 context 和 generation 容量限制，末轮不保证始终有四行。接受率高时减少目标模型解码次数；接受率低时收益受 VERIFY 和状态维护开销限制。
-
-## 驻留
-
-并发服务路径（`ParallelSeam`）在统一显存 arena 建立前固定分配 MTP sidecar 权重和各 slot 的 MTP runtime：
-
-1. 主模型与 MTP 固定资源先真实申请。
-2. 查询 Vulkan 设备真实剩余空间。
-3. 用剩余空间建立统一显存 arena。
-
-因此专家缓存会按测得的余量缩小。传统单请求路径则在首个 MTP 请求时
-懒初始化 MTP runtime；不要把并发服务的启动期资源顺序套用到这条路径。两条路径都不能用预估值替代真实显存分配和余量查询。
-
-## 一个周期
+Qwen3.8 的自推测路径用轻量 MTP head 产生候选，再由 target 一次批量 VERIFY。并发调度器的 `DRAFT_TOKENS=4` 是 **VERIFY 总行数**：一个已确定的 leading token 加最多三个 draft 候选，不是四个新候选。传统单请求路径将 `spec.k` 限制在 2..4，末轮还受 generation/context 剩余容量限制。alpha 只统计 draft 候选。
 
 ```text
-committed target state
-        |
-        v
-MTP head drafts up to 4 tokens
-        |
-        v
-target batched VERIFY (up to 4 rows in one forward)
-        |
-        +--> accept prefix
-        +--> reject suffix
-        |
-        v
-restore/commit target and head frontier
+committed target/head frontier
+  -> leading token + draft candidates
+  -> target batched VERIFY
+  -> accept prefix / reject suffix
+  -> commit accepted state and restore the frontier
 ```
 
-拒绝时保留已接受位置对应的前状态，不从头重算整个草稿。VERIFY 写入的推测后缀必须能回退到已接受前沿。
+拒绝时恢复 accepted frontier 对应的 checkpoint，不能重用未接受后缀，也不能从头重算整个草稿。target recurrent state、head KV、pending hidden、checkpoints 与接受前沿按 slot 独立；固定权重共享。VERIFY 引用的专家 LUT 和 runtime claim 在 command stream drain 前不能移动。
 
-## Prefill
+## 固定资源与 Prefill
 
-目标提示词 prime 仍是主要预填充工作。MTP 头需要追赶隐藏行和自己的状态。历史 20K 测量表明，
-目标模型特殊 prime 路径、隐藏行往返和 MTP 固定驻留都可能造成预填充差距；这些是优化专项问题，
-不改变 MTP 的状态语义。
+`ParallelSeam` 在统一 arena 前真实分配 target/head 固定权重及各 slot 的 MTP runtime，再查询剩余 VRAM 并建立 arena；不能拿预估余量替代真实分配。传统单请求路径在首个 MTP 请求时懒初始化 runtime，两者不能混写成相同的启动顺序。
 
-## 并发与多模态
+`spec.mtp_context=32768` 是 head 的滑动历史窗口，限制 head KV 驻留及追赶成本；target 仍保留完整上下文。它不是用户 context 上限，也不同于下面的 target 深度门槛。MTP Prefill 现在跟随普通自动 ubatch 策略，不再隐含下调到 2048。固定驻留、hidden tap 和 head catch-up 仍有开销，不能承诺两者 Prefill 必然同速。
 
-当前实现边界：
+## ParallelSeam 的门槛
 
-- 两个槽位的 Qwen3.8 草稿 VERIFY；
-- 并发槽位的批量 MTP 解码；
-- 多模态推测服务；
-- 长上下文生成容量限制。
+- `spec.mtp=false` 默认关闭；启用后只对 greedy-compatible 请求使用，普通采样回退 ordinary Decode。
+- `spec.mtp_max_context=49152` 是 target 上下文深度 cutoff，0 表示禁用 cutoff。这个参数用于并发调度器；传统单请求 `generate_vulkan` 不读取它。
+- `spec.mtp_concurrent=false` 默认不跑多活跃 lane 的 MTP；有其他工作时走普通 batch，跳过 prime 或使既有 head 失活。不能承诺 lane 减少后自动重新 prime 所有 head。
+- 显式开启并发 MTP 后，用 8 个 probe cycle 和至少 80% 的接受率判断是否继续；head 未全部 ready 或收益不足时回退 ordinary Decode。
+- Vulkan serve 的 MTP draft 配置最多两个 KV slot；不是只在 `mtp_concurrent=true` 时才有限制。
+- 单 slot、纯文本、没有辅助 Vision/Embedding 时保留传统串行 MTP 服务路径；需要共享 arena 的组合走 `ParallelSeam`。
 
-并发 MTP 最多支持两个 slot；只对 greedy-compatible 请求启用，不满足采样条件的请求回退普通 Decode。单 slot、纯文本且
-没有辅助 Vision/Embedding 服务时，serve 保留传统单请求 MTP 路径；需要共享 Vulkan unified arena 的组合则走 `ParallelSeam`。
+多模态 lane 的 mRoPE/KV identity、hidden 和 checkpoint 必须保持一致。普通 token group 优先多模态 lane，再按剩余 Prefill 长度降序及 slot 排序；普通 Decode 同步阶段沿用该顺序。长 Prefill 的 ring 阶段不插入 Decode；ring lane 数不等于请求并发数。
 
-普通并发 token group 的 lane 排序优先多模态 lane，再按剩余 Prefill 长度降序、slot 序号排序；并发 MTP 的普通 Decode
-同步阶段沿用该顺序。该排序不改变长 Prefill 独占 ring、期间不插入 Decode 的规则。
+## 核验与性能解释
 
-固定 target/head 权重共享，每个 slot 的 head KV、pending hidden、target checkpoints 和接受 frontier 必须独立。
-Vision 插入后的 mRoPE/KV identity 也属于 slot state，不能用文本 slot 的普通前缀身份替代。
+覆盖 0/partial/all acceptance、EOS、context 上限、32K segment、QSA boundary、后缀回退以及跨 slot 隔离。Qwen3.5/3.6 的历史 MTP 数值问题及搁置结论不能套用为 Qwen3.8 当前能力。
 
-## 正确性门槛
+性能必须同时写出路径、实际是否启用 MTP、head horizon、target cutoff、VERIFY 行数、alpha、上下文及普通 Decode 对照。150K 下仅写“启用 MTP”不足以证明调度器正在跑 VERIFY。早期 [20K](../../evidence/benchmarks/2026-09-24-qwen38-mtp-20k.md) 和 [150K](../../evidence/benchmarks/2026-09-24-qwen38-mtp-150k.md) 数字保留原基线；新策略的过程见 [0.10.0 Prefill/MTP 专项](../../evidence/campaigns/qwen38/2026-10-06-prefill-and-mtp.md)。
 
-- Greedy 高接受率 workload 应与 ordinary target output 一致。
-- 0/partial/all acceptance 都必须覆盖。
-- VERIFY 跨 32K segment、QSA boundary、EOS 和最大 context 时状态一致。
-- 拒绝后下一 cycle 从 accepted frontier 继续，不复用未接受 suffix。
-- frozen expert LUT 和 runtime claim 不能在 VERIFY command stream drain 前移动被引用 slot。
-
-## 性能解释
-
-MTP tok/s 必须同时报告 alpha、VERIFY 宽度和普通 Decode 基线。高 alpha 的数数任务不能代表普通问题；全程平均也不能替代
-中段和后段。20K 对照见 [Benchmark](../../evidence/benchmarks/2026-09-24-qwen38-mtp-20k.md)，调查过程见
-[Qwen3.8 campaigns](../../evidence/campaigns/qwen38/2026-09-22-mtp-investigation.md)。
+主要源码：`crates/infr-llama/src/parallel.rs`、`seam/runner.rs`、`mtp/mod.rs` 和 `crates/infr-core/src/config/mod.rs`。

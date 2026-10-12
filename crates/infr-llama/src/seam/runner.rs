@@ -27,6 +27,74 @@ use infr_core::tensor::{DType, TensorDesc, TensorId};
 use infr_core::WeightSource;
 use infr_gguf::Gguf;
 
+/// Immediate consumer for Qwen3.8 target hidden rows produced by ordinary Prefill. The buffer is
+/// borrowed only for this call, so implementations must finish any device work before returning.
+/// Keeping the hook device-facing lets MTP prime reuse the normal Prefill graph without downloading
+/// the four-stream residual to the host.
+pub(crate) trait MtpPrefillHiddenSink {
+    fn consume(
+        &mut self,
+        be: &dyn Backend,
+        tokens: &[u32],
+        target_hidden: &dyn Buffer,
+        start_pos: usize,
+        mrope: Option<&crate::seam::MropePlan>,
+        shared: crate::mtp::SharedWeights<'_>,
+    ) -> AResult<()>;
+}
+
+fn prefill_chunk_end(
+    start: usize,
+    end: usize,
+    rows: usize,
+    checkpoint_boundaries: &[Option<usize>; super::TURN_CHECKPOINT_COUNT],
+) -> usize {
+    let natural_end = start.saturating_add(rows).min(end);
+    checkpoint_boundaries
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|&boundary| start < boundary && boundary < natural_end)
+        .min()
+        .unwrap_or(natural_end)
+}
+
+fn prefill_runtime_candidates(
+    c: &Config,
+    ec: &EngineConfig,
+    caps: &infr_core::backend::Capabilities,
+    max_ctx: usize,
+    target: usize,
+    ring: bool,
+    max_rows: usize,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> Vec<(usize, u64)> {
+    let mut rows = vec![max_rows];
+    if !super::user_pinned_ubatch(ec) {
+        rows.extend(super::ubatch_fallbacks_below(max_rows));
+    }
+    rows.into_iter()
+        .map(|rows| {
+            // Only remove unused QSA width; preserve the other context-priced scratch and pads.
+            let reserve = super::runtime_reserve_at(c, caps, max_ctx, ring, rows, k_fmt, v_fmt)
+                .saturating_sub(super::qsa_indexer_scratch_bytes(c, max_ctx, rows))
+                .saturating_add(super::qsa_indexer_scratch_bytes(
+                    c,
+                    target.min(max_ctx),
+                    rows,
+                ));
+            (rows, reserve)
+        })
+        .collect()
+}
+
+fn prefill_uses_layer_ring(c: &Config, remaining: usize, ubatch: usize) -> bool {
+    c.moe.as_ref().is_some_and(|moe| {
+        remaining.min(ubatch).saturating_mul(moe.n_used) >= 3usize.saturating_mul(moe.n_expert)
+    })
+}
+
 /// Combined gate+up FFN upload decision (one GEMV/GEMM + GatedActFused instead of two Linears +
 /// GatedAct). Requires the backend to opt in (`Capabilities::combined_gu` — Vulkan; the CPU keeps
 /// zero-copy separate tensors) AND every dense layer's gate/up to share a dtype (the concat is
@@ -78,6 +146,65 @@ pub(crate) fn fuse_qkv_decision(
                 && c.layer_n_kv(l) == c.n_kv
                 && c.has_own_kv(l)
         })
+}
+
+/// Qwen3.8 QSA prepare fusion eligibility. The query and raw-key projections share one native
+/// weight only when every QSA layer uses the same dtype for both tensors. Keeping this decision
+/// session-wide makes the upload order and graph handles deterministic. The feature remains an
+/// explicit A/B candidate until model-level throughput and token-identity validation are run.
+fn qsa_prepare_pair_supported(query: Option<DType>, key: Option<DType>) -> bool {
+    query.is_some()
+        && query == key
+        && query.is_some_and(infr_vulkan::linear::native_dense_supported)
+}
+
+fn fuse_qsa_prepare_decision(
+    backend_support: bool,
+    g: &Gguf,
+    c: &Config,
+    ec: &EngineConfig,
+) -> bool {
+    let mut layers = (0..c.n_layer).filter(|&l| c.is_qwen_hybrid_attn_layer(l));
+    c.qwen4exp
+        && backend_support
+        && ec.kernels.vulkan.qsa_prepare_fused
+        && layers.clone().next().is_some()
+        && layers.all(|l| {
+            let dtype = |suffix: &str| {
+                let name = format!("blk.{l}.{suffix}");
+                g.tensors().iter().find(|t| t.name == name).map(|t| t.dtype)
+            };
+            qsa_prepare_pair_supported(
+                dtype("indexer.q_proj.weight"),
+                dtype("indexer.k_proj.weight"),
+            )
+        })
+}
+
+/// DeltaNet alpha/beta projection fusion eligibility. Both projections are kept as independent
+/// weights and outputs; only a backend command is shared. The decision is session-wide so warm
+/// graph rebuilds cannot change shape, and it stays off when any layer exposes a non-F32 or
+/// incomplete pair.
+fn fuse_delta_ab_decision(backend_support: bool, g: &Gguf, c: &Config, ec: &EngineConfig) -> bool {
+    if !backend_support || !ec.kernels.delta_ab_fuse {
+        return false;
+    }
+    let dtype = |layer: usize, suffix: &str| {
+        let name = format!("blk.{layer}.{suffix}");
+        g.tensors().iter().find(|t| t.name == name).map(|t| t.dtype)
+    };
+    let mut found = false;
+    for layer in 0..c.n_layer {
+        match (
+            dtype(layer, "ssm_alpha.weight"),
+            dtype(layer, "ssm_beta.weight"),
+        ) {
+            (None, None) => {}
+            (Some(DType::F32), Some(DType::F32)) => found = true,
+            _ => return false,
+        }
+    }
+    found
 }
 
 /// Ling KDA normally uploads Q/K/V as one fused projection. The official Tiny Q4_K_M GGUF uses
@@ -152,6 +279,29 @@ fn resident_after_gen(cur: &[u32], last_written: Option<usize>) -> Vec<u32> {
         Some(p) => cur[..(p + 1).min(cur.len())].to_vec(),
         None => Vec::new(),
     }
+}
+
+fn lm_head_sampling_input(
+    graph: &mut Graph,
+    hidden: TensorId,
+    batch: usize,
+    logits_rows: usize,
+    dim: usize,
+) -> TensorId {
+    assert!(logits_rows > 0 && logits_rows <= batch);
+    if logits_rows == batch {
+        return hidden;
+    }
+    // Prefill rows come first; only the contiguous sampling suffix belongs to the LM head.
+    let suffix = graph.internal(TensorDesc::new(vec![logits_rows * dim], DType::F32));
+    graph.push(Op::Copy {
+        src: hidden,
+        src_off: ((batch - logits_rows) * dim) as u32,
+        dst: suffix,
+        dst_off: 0,
+        n: (logits_rows * dim) as u32,
+    });
+    suffix
 }
 
 fn sampling_suffix_start(positions: &[usize], prompt_ends: &[usize]) -> AResult<usize> {
@@ -876,6 +1026,9 @@ fn session_stable(
     // split form. INFR_NO_QKV_FUSE forces the split form for A/B (default unset = fuse; the split
     // form is bit-identical — same dots, same fixed-order sums).
     let fuse_qkv = fuse_qkv_decision(caps.combined_gu, g, c, ec);
+    let fuse_qsa_prepare = fuse_qsa_prepare_decision(caps.qsa_prepare, g, c, ec);
+    let fuse_delta_ab = fuse_delta_ab_decision(caps.linear_pair_f32, g, c, ec);
+    let fuse_qwen_hc_down_inject = caps.qwen_hc_down_inject && ec.kernels.qwen_hc_down_inject;
     let kda_qkv_fused = if c.bailingmoe3 {
         (0..c.n_layer)
             .map(|l| {
@@ -928,6 +1081,9 @@ fn session_stable(
         yarn_ff,
         fuse_gu,
         fuse_qkv,
+        fuse_qsa_prepare,
+        fuse_delta_ab,
+        fuse_qwen_hc_down_inject,
         kda_qkv_fused,
         moe_batched_ok,
     })
@@ -1420,16 +1576,16 @@ pub(crate) fn generate_dense_backend(
         None,
         None,
         None,
-        false,
+        None,
+        None,
     )
 }
 
-/// Prime Qwen3.8 MTP over every uncached prompt row while projecting only the frontier row
-/// through the vocabulary head. The detached head needs every target hidden row, but the driver
-/// consumes only the final target token prediction; computing `[m, vocab]` logits here wastes
-/// work and can exceed a Vulkan arena shard for a large prompt.
+/// Prime Qwen3.8 through the ordinary chunked-Prefill path while streaming each completed target
+/// hidden chunk directly to the detached MTP head. Only the frontier logits are returned; hidden
+/// rows stay on the device and are consumed synchronously by `sink`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn generate_dense_backend_verify_frontier(
+pub(crate) fn generate_dense_backend_mtp_prime(
     be: &dyn Backend,
     bind_weight: &BindWeight,
     g: &Gguf,
@@ -1439,9 +1595,9 @@ pub(crate) fn generate_dense_backend_verify_frontier(
     prompt: &[u32],
     state: &mut Option<SeamKv>,
     want_ctx: usize,
-    verify: &mut Vec<f32>,
-    verify_ids: &mut Vec<u32>,
-    h_out: &mut Vec<f32>,
+    logits: &mut Vec<f32>,
+    sink: &mut dyn MtpPrefillHiddenSink,
+    prepared: Option<PreparedParallelPrompt>,
     mm: Option<&crate::seam::MropePlan>,
     finish_fixed_allocations: Option<&dyn Fn() -> AResult<()>>,
 ) -> AResult<(Vec<u32>, GenStats)> {
@@ -1454,15 +1610,15 @@ pub(crate) fn generate_dense_backend_verify_frontier(
         token_embd,
         None,
         prompt,
-        0,
+        1,
         |_| {},
         state,
         want_ctx,
         None,
-        Some(verify),
-        Some(verify_ids),
         None,
-        Some(h_out),
+        None,
+        Some(logits),
+        None,
         None,
         None,
         None,
@@ -1471,7 +1627,8 @@ pub(crate) fn generate_dense_backend_verify_frontier(
         None,
         None,
         None,
-        true,
+        prepared,
+        Some(sink),
     )
 }
 
@@ -1563,7 +1720,8 @@ pub(crate) fn generate_dense_backend_parallel_sampled(
         Some(&mut parallel),
         None,
         None,
-        false,
+        None,
+        None,
     )?;
     let mut outputs = Vec::with_capacity(prompts.len());
     outputs.push(first);
@@ -1637,7 +1795,8 @@ pub(crate) fn generate_dense_backend_parallel_prefill(
         None,
         Some(&mut parallel),
         None,
-        false,
+        None,
+        None,
     )?;
     let mut stats = Vec::with_capacity(prompts.len());
     stats.push(primary_stats);
@@ -1711,7 +1870,8 @@ pub(crate) fn generate_dense_backend_parallel_mtp_verify(
         None,
         None,
         Some(&mut request),
-        false,
+        None,
+        None,
     )?;
     Ok(())
 }
@@ -1781,7 +1941,8 @@ fn generate_dense_backend_inner(
     parallel_decode: Option<&mut ParallelDecodeRequest<'_>>,
     mut parallel_prefill: Option<&mut ParallelPrefillRequest<'_>>,
     parallel_mtp_verify: Option<&mut ParallelMtpVerifyRequest<'_>>,
-    verify_frontier_only: bool,
+    prepared_single: Option<PreparedParallelPrompt>,
+    mut mtp_prefill_sink: Option<&mut dyn MtpPrefillHiddenSink>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
     let state_trace = ec.debug.state_trace;
@@ -1837,6 +1998,9 @@ fn generate_dense_backend_inner(
     let dec_out_scale = &stable.dec_out_scale;
     let fuse_gu = stable.fuse_gu;
     let fuse_qkv = stable.fuse_qkv;
+    let fuse_qsa_prepare = stable.fuse_qsa_prepare;
+    let fuse_delta_ab = stable.fuse_delta_ab;
+    let fuse_qwen_hc_down_inject = stable.fuse_qwen_hc_down_inject;
     let kda_qkv_fused = &stable.kda_qkv_fused;
     let moe_batched_ok = stable.moe_batched_ok;
 
@@ -2366,13 +2530,19 @@ fn generate_dense_backend_inner(
                 wload(&[&p("attn_output.weight")])?;
             }
             if c.qwen4exp && c.is_qwen_hybrid_attn_layer(l) {
-                for name in [
-                    "indexer.k_norm.weight",
-                    "indexer.k_proj.weight",
-                    "indexer.q_norm.weight",
-                    "indexer.q_proj.weight",
-                ] {
-                    wload(&[&p(name)])?;
+                if fuse_qsa_prepare {
+                    wload(&[&p("indexer.k_norm.weight")])?;
+                    wload(&[&p("indexer.q_norm.weight")])?;
+                    wload(&[&p("indexer.q_proj.weight"), &p("indexer.k_proj.weight")])?;
+                } else {
+                    for name in [
+                        "indexer.k_norm.weight",
+                        "indexer.k_proj.weight",
+                        "indexer.q_norm.weight",
+                        "indexer.q_proj.weight",
+                    ] {
+                        wload(&[&p(name)])?;
+                    }
                 }
             }
             if c.is_ple_layer(l) {
@@ -2622,20 +2792,6 @@ fn generate_dense_backend_inner(
             wbufs.push(b);
             wspecs.push((DType::F32, c.hc_mult * ne));
         }
-        // Qwen3.8 grouped RMSNorm reduces each n_embd-wide stream independently before applying
-        // its full hc*n_embd affine. One n_embd-wide unit vector supplies the weightless first
-        // half of that operation at every HC and PLE site.
-        if c.qwen4exp {
-            let ones = vec![1.0f32; ne];
-            let b = be
-                .alloc(ones.len() * 4, BufferUsage::Weights)
-                .map_err(|e| anyhow!("{e}"))?;
-            be.upload(b.as_ref(), bytemuck::cast_slice(&ones))
-                .map_err(|e| anyhow!("{e}"))?;
-            wbufs.push(b);
-            wspecs.push((DType::F32, ne));
-        }
-
         // ── re-decide the context against what the device says is LEFT ───────────────────────
         // Every weight this session will hold is resident by now. Paged Vulkan sessions physically
         // escrow their predicted runtime workspace while those allocations land; release it before
@@ -3082,7 +3238,7 @@ fn generate_dense_backend_inner(
         }
         Some(parallel.prepared.to_vec())
     } else {
-        None
+        prepared_single.map(|prepared| vec![prepared])
     };
     // A live append-only recurrent state wins when the new prompt extends it exactly. Otherwise
     // try the last stable conversation checkpoint before taking the unchanged zero-reset path.
@@ -3164,9 +3320,11 @@ fn generate_dense_backend_inner(
         layer_fused_experts,
         ple_worker,
         mtp_token_embd_index,
+        mtp_lm_head_index,
         ..
     } = weights.as_ref();
     let mtp_token_embd_index = *mtp_token_embd_index;
+    let mtp_lm_head_index = *mtp_lm_head_index;
     let max_ctx = *max_ctx;
     // In a parallel token call `max_new` is a step budget containing both the uncached prompt tail
     // and decode. Adding it to the full prompt would count that tail twice. The parallel branch
@@ -3219,7 +3377,7 @@ fn generate_dense_backend_inner(
         let plan_prompt_len = plan.prompt_pos4.len() / 4;
         if plan.prompt_pos4.len() % 4 != 0
             || plan_prompt_len > max_ctx
-            || (!verify_frontier_only && plan_prompt_len > prompt.len())
+            || plan_prompt_len > prompt.len()
         {
             return Err(anyhow!(
                 "multimodal position table has {} values for a {}-token sequence and {}-token context",
@@ -3240,7 +3398,7 @@ fn generate_dense_backend_inner(
             if span.n_tokens == 0
                 || span.start < previous_end
                 || end > plan_prompt_len
-                || (!verify_frontier_only && end > prompt.len())
+                || end > prompt.len()
             {
                 return Err(anyhow!(
                     "invalid image span #{index}: {}..{} for plan length {} and prompt length {}",
@@ -4038,11 +4196,27 @@ fn generate_dense_backend_inner(
                     (None, None)
                 };
                 let wo = wpush(&mut g, &mut weights);
-                let qsa = (c.qwen4exp && c.is_qwen_hybrid_attn_layer(l)).then(|| QsaW {
-                    k_norm: wpush(&mut g, &mut weights),
-                    k_proj: wpush(&mut g, &mut weights),
-                    q_norm: wpush(&mut g, &mut weights),
-                    q_proj: wpush(&mut g, &mut weights),
+                let qsa = (c.qwen4exp && c.is_qwen_hybrid_attn_layer(l)).then(|| {
+                    let k_norm = wpush(&mut g, &mut weights);
+                    if fuse_qsa_prepare {
+                        let q_norm = wpush(&mut g, &mut weights);
+                        let qk_proj = wpush(&mut g, &mut weights);
+                        QsaW {
+                            k_norm,
+                            k_proj: qk_proj,
+                            q_norm,
+                            q_proj: qk_proj,
+                            fused_prepare: true,
+                        }
+                    } else {
+                        QsaW {
+                            k_norm,
+                            k_proj: wpush(&mut g, &mut weights),
+                            q_norm: wpush(&mut g, &mut weights),
+                            q_proj: wpush(&mut g, &mut weights),
+                            fused_prepare: false,
+                        }
+                    }
                 });
                 MixerW::Attn(AttnW {
                     wq,
@@ -4364,11 +4538,6 @@ fn generate_dense_backend_inner(
         } else {
             None
         };
-        let qwen_hc_ones = if c.qwen4exp {
-            Some(wpush(&mut g, &mut weights))
-        } else {
-            None
-        };
         // `logits_rows == 0` (task #27): a HEADLESS graph — the chunked batched-prefill path,
         // whose per-chunk logits nothing ever consumes (the sampler reads the decode loop's own
         // fresh logits for the LAST prompt token; earlier rows' logits were always discarded).
@@ -4397,10 +4566,19 @@ fn generate_dense_backend_inner(
         };
         let (qsa_raw_k, qsa_q, qsa_q16, qsa_indices, qsa_gather_k, qsa_gather_v) = if c.qwen4exp {
             let max_rows = c.indexer_top_k.saturating_add(qsa_ratio - 1);
+            let q_width = c.indexer_n_head * c.indexer_head_size;
+            let qsa_q = g.internal(f32d(
+                batch * (q_width + usize::from(fuse_qsa_prepare) * c.indexer_head_size),
+            ));
+            let qsa_raw_k = if fuse_qsa_prepare {
+                qsa_q
+            } else {
+                g.internal(f32d(batch * c.indexer_head_size))
+            };
             (
-                g.internal(f32d(batch * c.indexer_head_size)),
-                g.internal(f32d(batch * c.indexer_n_head * c.indexer_head_size)),
-                g.internal(f16d(batch * c.indexer_n_head * c.indexer_head_size)),
+                qsa_raw_k,
+                qsa_q,
+                g.internal(f16d(batch * q_width)),
                 g.internal(TensorDesc::new(
                     vec![batch * (c.indexer_top_k / qsa_ratio).max(1)],
                     DType::I32,
@@ -4450,11 +4628,23 @@ fn generate_dense_backend_inner(
         //   hc_pre / hc_post   [batch, hc]      collapse weights / per-stream output gates
         //   hc_comb    [batch, hc, hc]          Sinkhorn-normalised mixing matrix
         let hcw = c.hc_mult * ne;
-        let hcr = [
-            g.internal(f32d(batch * hcw.max(1))),
-            g.internal(f32d(batch * hcw.max(1))),
-        ];
-        let hc_normed = g.internal(f32d(batch * hcw.max(1)));
+        let (hcr, hc_normed) = if c.deepseek4 {
+            (
+                [
+                    g.internal(f32d(batch * hcw.max(1))),
+                    g.internal(f32d(batch * hcw.max(1))),
+                ],
+                g.internal(f32d(batch * hcw.max(1))),
+            )
+        } else {
+            // Preserve one TensorId per logical scratch without reserving DSV4's large buffers on
+            // Qwen3.8. Keeping architecture-specific values distinct also makes future graph
+            // changes less likely to turn an idle alias into a live overwrite.
+            (
+                [g.internal(f32d(1)), g.internal(f32d(1))],
+                g.internal(f32d(1)),
+            )
+        };
         let hc_mixes = g.internal(f32d(batch * ((2 + c.hc_mult) * c.hc_mult).max(1)));
         let hc_hmixes = g.internal(f32d(batch * c.hc_mult.max(1)));
         let hc_pre = g.internal(f32d(batch * c.hc_mult.max(1)));
@@ -4468,9 +4658,19 @@ fn generate_dense_backend_inner(
         //   d4_og      [batch, o_lora_rank]     that group's low-rank output
         //   d4_oa      [batch, o_group_count*o_lora_rank]  all groups' outputs, concatenated
         let d4_qa = g.internal(f32d(batch * c.q_lora_rank.max(1)));
-        let d4_kv = g.internal(f32d(batch * c.head_dim.max(1)));
-        let d4_rq = g.internal(f32d(batch * (nh.max(c.indexer_n_head) * c.rope_dim).max(1)));
-        let d4_rkv = g.internal(f32d(batch * c.rope_dim.max(1)));
+        let (d4_kv, d4_rq, d4_rkv) = if c.deepseek4 {
+            (
+                g.internal(f32d(batch * c.head_dim.max(1))),
+                g.internal(f32d(batch * (nh.max(c.indexer_n_head) * c.rope_dim).max(1))),
+                g.internal(f32d(batch * c.rope_dim.max(1))),
+            )
+        } else {
+            (
+                g.internal(f32d(1)),
+                g.internal(f32d(1)),
+                g.internal(f32d(1)),
+            )
+        };
         // `o_group_count` is 0 on every non-V4 model (and refused as 0 on a V4 one), so this is
         // the harmless-allocation guard the rest of this block uses, not a real division.
         let d4_hdg = (nh * c.head_dim).checked_div(c.o_group_count).unwrap_or(0);
@@ -4502,7 +4702,11 @@ fn generate_dense_backend_inner(
         let d4_hca_rows = (start_pos + batch) / 128;
         let d4_comp_selected = d4_hca_rows.max(d4_top_k);
         let d4_gather_rows = d4_raw_rows + d4_comp_selected;
-        let d4_gather = g.internal(f16d((d4_gather_rows * c.head_dim).max(1)));
+        let d4_gather = if c.deepseek4 {
+            g.internal(f16d((d4_gather_rows * c.head_dim).max(1)))
+        } else {
+            g.internal(f16d(1))
+        };
         // deepseek32 lightning-indexer scratch. All f32: the k row is LayerNormed (so it never
         // leaves f16 range) but staying f32 also keeps the `Rope → WriteKv` peephole off it —
         // that fusion only fires on an f16 rope dst, and its fused kernels have no NEOX build.
@@ -4545,18 +4749,31 @@ fn generate_dense_backend_inner(
         let actbuf = g.internal(f32d(batch * nff));
         let sub = g.internal(f32d(batch * ne));
         // E2B per-layer embed scratch: gate `[npl]` and projected `[ne]`.
-        let plg = g.internal(f32d(batch * npl.max(1)));
-        let plp = g.internal(f32d(batch * ne));
+        let (plg, plp) = if e2b {
+            (
+                g.internal(f32d(batch * npl.max(1))),
+                g.internal(f32d(batch * ne)),
+            )
+        } else {
+            (g.internal(f32d(1)), g.internal(f32d(1)))
+        };
 
         // diffusion-gemma dual-FFN scratch (see docs/diffusion-gemma.md's FFN wiring): the dense
         // branch's own output (`d_out`, before summing with the MoE branch), the router's own
         // input row (`router_tmp` — a DIFFERENT normalization of `attn_out` than either FFN
-        // branch reads), the MoE branch's input (`moe_in`) and raw output (`moe_out`). Harmlessly
-        // allocated (but unused) on every other arch, like the E2B/qwen35 scratch above.
-        let d_out = g.internal(f32d(batch * ne));
-        let router_tmp = g.internal(f32d(batch * ne));
-        let moe_in = g.internal(f32d(batch * ne));
-        let moe_out = g.internal(f32d(batch * ne));
+        // branch reads), the MoE branch's input (`moe_in`) and raw output (`moe_out`). `d_out` and
+        // `moe_out` are also used by ordinary MoE layers with a shared expert; only `router_tmp`
+        // and `moe_in` are exclusive to dual-MoE.
+        let dual = c.dual_moe();
+        let shared_expert = lw.iter().any(|layer| layer.ffn.has_shared_expert());
+        // `d_out` and `moe_out` are also the dense-shared/routed branch outputs for ordinary MoE
+        // layers with a shared expert (Qwen3.8, Qwen3.6 MoE and Llama 4), not DiffusionGemma-only
+        // scratch. Both must remain full rows whenever `FfnW::Moe::shexp` is present.
+        let branch_outputs = dual || shared_expert;
+        let d_out = g.internal(f32d(if branch_outputs { batch * ne } else { 1 }));
+        let router_tmp = g.internal(f32d(if dual { batch * ne } else { 1 }));
+        let moe_in = g.internal(f32d(if dual { batch * ne } else { 1 }));
+        let moe_out = g.internal(f32d(if branch_outputs { batch * ne } else { 1 }));
         // qwen35moe shared-expert gate scratch: one raw (pre-sigmoid) logit per token, the
         // `Op::Linear(out_f=1)` output that `Op::MoeSharedExpertAdd` sigmoids — see its doc.
         // Harmlessly allocated (but unused) on every other arch, like the scratch above.
@@ -4581,18 +4798,26 @@ fn generate_dense_backend_inner(
         let q35_nv = c.q35_num_v_heads();
         let q35_vd = c.q35_head_v_dim();
         let q35_keydim = q35_nk * q35_kd;
+        // Keep the recurrent mixer's simultaneously-live rows distinct. The layer-major graph can
+        // split around routed-expert work, so reusing HC or attention TensorIds here is not merely
+        // a byte-range alias: it changes the boundary/liveness identity seen by the pipeline.
         let dn_qkvbuf = g.internal(f32d(batch * q35_cc.max(1)));
         let dn_zbuf = g.internal(f32d(batch * q35_di.max(1)));
         let dn_convout = g.internal(f32d(batch * q35_cc.max(1)));
+        let q35_vdim = q35_nv * q35_vd;
         let dn_qbuf = g.internal(f32d(batch * q35_keydim.max(1)));
         let dn_kbuf = g.internal(f32d(batch * q35_keydim.max(1)));
-        let dn_vbuf = g.internal(f32d(batch * (q35_nv * q35_vd).max(1)));
+        let dn_vbuf = g.internal(f32d(batch * q35_vdim.max(1)));
         let dn_bbuf = g.internal(f32d(batch * q35_nv.max(1)));
         let dn_abuf = g.internal(f32d(batch * q35_nv.max(1)));
-        let dn_out = g.internal(f32d(batch * (q35_nv * q35_vd).max(1)));
+        let dn_out = g.internal(f32d(batch * q35_vdim.max(1)));
         // Ling KDA adds a vector forget projection, while its MLA layers add one gate scalar per
         // head. Both are shared scratch across mutually-exclusive layer mixer arms.
-        let kda_forget = g.internal(f32d(batch * c.ssm_d_inner.max(1)));
+        let kda_forget = if c.bailingmoe3 {
+            g.internal(f32d(batch * c.ssm_d_inner.max(1)))
+        } else {
+            g.internal(f32d(1))
+        };
         let mla_gate = g.internal(f32d(batch * c.n_head.max(1)));
 
         // Qwen3.8 HC/PLE scratch. The wide residual itself is caller-owned (`qwen_wide`); these
@@ -4662,67 +4887,102 @@ fn generate_dense_backend_inner(
                 n_embd: ne as u32,
             });
         };
-        let qwen_hc_mix = |g: &mut Graph, t: &QwenHcW, res: TensorId, dst: TensorId| {
-            let ones = qwen_hc_ones.expect("qwen4exp build always declares qwen_hc_ones");
-            g.push(Op::RmsNorm {
-                x: res,
-                weight: ones,
-                dst: qwen_normed,
-                rows: (batch * c.hc_mult) as u32,
-                dim: ne as u32,
-                eps,
-            });
-            g.push(Op::MulVec {
-                x: qwen_normed,
-                vec: t.norm,
-                dst: qwen_normed,
-                rows: batch as u32,
-                n: hcw as u32,
-            });
-            g.push(Op::Linear {
-                x: qwen_normed,
-                weight: t.down,
-                dst: qwen_low,
-                m: batch as u32,
-                in_f: hcw as u32,
-                out_f: c.hc_low_rank as u32,
-                w_off: 0,
-            });
-            g.push(Op::Silu {
-                x: qwen_low,
-                dst: qwen_low,
-                n: (batch * c.hc_low_rank) as u32,
-                scale: 1.0 / c.hc_mult as f32,
-            });
-            g.push(Op::Linear {
-                x: qwen_low,
-                weight: t.up,
-                dst: qwen_gate,
-                m: batch as u32,
-                in_f: c.hc_low_rank as u32,
-                out_f: hcw as u32,
-                w_off: 0,
-            });
-            g.push(Op::QwenHcMix {
-                x: qwen_normed,
-                gate: qwen_gate,
-                dst,
-                rows: batch as u32,
-                hc: c.hc_mult as u32,
-                n_embd: ne as u32,
-            });
-            if let Some(inject) = t.inject {
+        let qwen_hc_mix =
+            |g: &mut Graph,
+             t: &QwenHcW,
+             res: TensorId,
+             dst: TensorId,
+             injection: Option<(TensorId, TensorId, TensorId)>| {
+                if let Some((residual, block, gate)) = injection {
+                    g.push(Op::QwenHcInjectNorm {
+                        residual,
+                        block,
+                        gate,
+                        norm: t.norm,
+                        residual_dst: res,
+                        normed_dst: qwen_normed,
+                        rows: batch as u32,
+                        hc: c.hc_mult as u32,
+                        n_embd: ne as u32,
+                        eps,
+                    });
+                } else {
+                    g.push(Op::QwenHcNorm {
+                        x: res,
+                        norm: t.norm,
+                        dst: qwen_normed,
+                        rows: batch as u32,
+                        hc: c.hc_mult as u32,
+                        n_embd: ne as u32,
+                        eps,
+                    });
+                }
+                let inject = t.inject;
+                let fused_down_inject = fuse_qwen_hc_down_inject
+                    && batch == 1
+                    && inject.is_some_and(|inject| {
+                        g.desc(t.down).dtype == DType::Q8_0
+                            && matches!(g.desc(inject).dtype, DType::F32 | DType::Q8_0)
+                            && hcw.is_multiple_of(32)
+                    });
+                if let Some(inject) = inject.filter(|_| fused_down_inject) {
+                    g.push(Op::QwenHcDownInject {
+                        x: qwen_normed,
+                        down_weight: t.down,
+                        inject_weight: inject,
+                        low_dst: qwen_low,
+                        inject_dst: qwen_inject,
+                        in_f: hcw as u32,
+                        low_rank: c.hc_low_rank as u32,
+                        hc: c.hc_mult as u32,
+                        silu_scale: 1.0 / c.hc_mult as f32,
+                    });
+                } else {
+                    g.push(Op::Linear {
+                        x: qwen_normed,
+                        weight: t.down,
+                        dst: qwen_low,
+                        m: batch as u32,
+                        in_f: hcw as u32,
+                        out_f: c.hc_low_rank as u32,
+                        w_off: 0,
+                    });
+                    g.push(Op::Silu {
+                        x: qwen_low,
+                        dst: qwen_low,
+                        n: (batch * c.hc_low_rank) as u32,
+                        scale: 1.0 / c.hc_mult as f32,
+                    });
+                }
                 g.push(Op::Linear {
-                    x: qwen_normed,
-                    weight: inject,
-                    dst: qwen_inject,
+                    x: qwen_low,
+                    weight: t.up,
+                    dst: qwen_gate,
                     m: batch as u32,
-                    in_f: hcw as u32,
-                    out_f: c.hc_mult as u32,
+                    in_f: c.hc_low_rank as u32,
+                    out_f: hcw as u32,
                     w_off: 0,
                 });
-            }
-        };
+                g.push(Op::QwenHcMix {
+                    x: qwen_normed,
+                    gate: qwen_gate,
+                    dst,
+                    rows: batch as u32,
+                    hc: c.hc_mult as u32,
+                    n_embd: ne as u32,
+                });
+                if let Some(inject) = inject.filter(|_| !fused_down_inject) {
+                    g.push(Op::Linear {
+                        x: qwen_normed,
+                        weight: inject,
+                        dst: qwen_inject,
+                        m: batch as u32,
+                        in_f: hcw as u32,
+                        out_f: c.hc_mult as u32,
+                        w_off: 0,
+                    });
+                }
+            };
 
         // Everything from here to the layer loop is the PROLOGUE: it produces the layer stack's
         // input from the token ids, so it belongs to the span that starts at layer 0. A later span
@@ -4981,7 +5241,6 @@ fn generate_dense_backend_inner(
                 let wide = qwen_wide.expect("a qwen4exp PLE layer needs qwen_wide");
                 let embd = ple_embd.expect("a qwen4exp PLE layer needs ple_embd");
                 let state = ple_state.expect("a qwen4exp PLE layer needs ple_state");
-                let ones = qwen_hc_ones.expect("qwen4exp build always declares qwen_hc_ones");
                 let ple_in = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram * c.ple_head_dim;
                 g.push(Op::Linear {
                     x: embd,
@@ -5001,35 +5260,23 @@ fn generate_dense_backend_inner(
                     out_f: ne as u32,
                     w_off: 0,
                 });
-                g.push(Op::RmsNorm {
+                g.push(Op::QwenHcNorm {
                     x: ple_key,
-                    weight: ones,
-                    dst: ple_key,
-                    rows: (batch * c.hc_mult) as u32,
-                    dim: ne as u32,
-                    eps,
-                });
-                g.push(Op::MulVec {
-                    x: ple_key,
-                    vec: pw.norm_key,
+                    norm: pw.norm_key,
                     dst: ple_key,
                     rows: batch as u32,
-                    n: hcw as u32,
+                    hc: c.hc_mult as u32,
+                    n_embd: ne as u32,
+                    eps,
                 });
-                g.push(Op::RmsNorm {
+                g.push(Op::QwenHcNorm {
                     x: wide,
-                    weight: ones,
-                    dst: ple_query,
-                    rows: (batch * c.hc_mult) as u32,
-                    dim: ne as u32,
-                    eps,
-                });
-                g.push(Op::MulVec {
-                    x: ple_query,
-                    vec: pw.norm_query,
+                    norm: pw.norm_query,
                     dst: ple_query,
                     rows: batch as u32,
-                    n: hcw as u32,
+                    hc: c.hc_mult as u32,
+                    n_embd: ne as u32,
+                    eps,
                 });
                 g.push(Op::QwenPleGate {
                     key: ple_key,
@@ -5042,20 +5289,14 @@ fn generate_dense_backend_inner(
                 });
                 // Preserve the unnormalised gated value for the residual add; ple_key is dead
                 // after the gate reduction and can hold the convolution input.
-                g.push(Op::RmsNorm {
+                g.push(Op::QwenHcNorm {
                     x: ple_gated,
-                    weight: ones,
-                    dst: ple_key,
-                    rows: (batch * c.hc_mult) as u32,
-                    dim: ne as u32,
-                    eps,
-                });
-                g.push(Op::MulVec {
-                    x: ple_key,
-                    vec: pw.norm_conv,
+                    norm: pw.norm_conv,
                     dst: ple_key,
                     rows: batch as u32,
-                    n: hcw as u32,
+                    hc: c.hc_mult as u32,
+                    n_embd: ne as u32,
+                    eps,
                 });
                 g.push(Op::Conv1dSilu {
                     x: ple_key,
@@ -5139,7 +5380,7 @@ fn generate_dense_backend_inner(
             // `hc_mult` streams into `hn`, and `attn_norm` then normalises that.
             let attn_in = if let Some(hcl) = &lw.qwen_hc {
                 let wide = qwen_wide.expect("qwen4exp layer needs qwen_wide");
-                qwen_hc_mix(&mut g, &hcl.attn, wide, hn);
+                qwen_hc_mix(&mut g, &hcl.attn, wide, hn, None);
                 hn
             } else if let Some(hcl) = &lw.hc {
                 hc_wrap_pre(&mut g, &hcl.attn, hcr[0], hn);
@@ -5231,24 +5472,37 @@ fn generate_dense_backend_inner(
                         n: (q35_nv * q35_vd) as u32,
                     });
                 }
-                g.push(Op::Linear {
-                    x: hn,
-                    weight: dw.beta,
-                    dst: dn_bbuf,
-                    m: batch as u32,
-                    in_f: ne as u32,
-                    out_f: q35_nv as u32,
-                    w_off: 0,
-                });
-                g.push(Op::Linear {
-                    x: hn,
-                    weight: dw.alpha,
-                    dst: dn_abuf,
-                    m: batch as u32,
-                    in_f: ne as u32,
-                    out_f: q35_nv as u32,
-                    w_off: 0,
-                });
+                if fuse_delta_ab {
+                    g.push(Op::LinearPair {
+                        x: hn,
+                        weight_a: dw.beta,
+                        weight_b: dw.alpha,
+                        dst_a: dn_bbuf,
+                        dst_b: dn_abuf,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: q35_nv as u32,
+                    });
+                } else {
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: dw.beta,
+                        dst: dn_bbuf,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: q35_nv as u32,
+                        w_off: 0,
+                    });
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: dw.alpha,
+                        dst: dn_abuf,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: q35_nv as u32,
+                        w_off: 0,
+                    });
+                }
                 let (q_src, k_src, v_src) = if delta_strided {
                     (dn_convout, dn_convout, dn_convout)
                 } else {
@@ -5273,11 +5527,10 @@ fn generate_dense_backend_inner(
                     eps: 1e-6,
                     src_stride: 0,
                 });
-                // silu-gated RMSNorm per v-head: rmsnorm(out, ssm_norm) then * silu(z). Fused into
-                // ONE dispatch when the backend supports it (see `fuse_gated_rmsnorm`'s doc) — the
-                // split form's GatedAct reads QkNorm's freshly-written `dn_out`, a real
-                // read-after-write hazard the fusion removes.
-                if fuse_gated_rmsnorm && !c.qwen4exp {
+                // Gated RMSNorm per v-head: qwen35 uses SiLU and qwen4exp uses Sigmoid. Fuse the
+                // norm and gate into one dispatch when supported, removing the split form's
+                // read-after-write hazard on `dn_out`.
+                if fuse_gated_rmsnorm {
                     g.push(Op::GatedRmsNorm {
                         x: dn_out,
                         weight: dw.ssm_norm,
@@ -5287,6 +5540,11 @@ fn generate_dense_backend_inner(
                         n_head: q35_nv as u32,
                         head_dim: q35_vd as u32,
                         eps,
+                        act: if c.qwen4exp {
+                            Activation::Sigmoid
+                        } else {
+                            Activation::Silu
+                        },
                     });
                 } else {
                     g.push(Op::QkNorm {
@@ -6644,37 +6902,24 @@ fn generate_dense_backend_inner(
                         .expect("a qwen4exp full-attention layer declares a QSA key cache");
                     let block_cache = qsa_block_cache[l]
                         .expect("a qwen4exp full-attention layer declares a QSA block cache");
-                    g.push(Op::Linear {
-                        x: hn,
-                        weight: qw.k_proj,
-                        dst: qsa_raw_k,
-                        m: batch as u32,
-                        in_f: ne as u32,
-                        out_f: c.indexer_head_size as u32,
-                        w_off: 0,
-                    });
-                    g.push(Op::WriteKv {
-                        src: qsa_raw_k,
-                        cache,
-                        rows: batch as u32,
-                        row_stride: c.indexer_head_size as u32,
-                        pos: start_pos as u32,
-                    });
-                    g.push(Op::Linear {
-                        x: hn,
-                        weight: qw.q_proj,
-                        dst: qsa_q,
-                        m: batch as u32,
-                        in_f: ne as u32,
-                        out_f: (c.indexer_n_head * c.indexer_head_size) as u32,
-                        w_off: 0,
-                    });
-                    if let Some(pos4) = positions4 {
-                        g.push(Op::QkNormMrope {
-                            x: qsa_q,
-                            weight: qw.q_norm,
-                            positions4: pos4,
-                            dst: qsa_q16,
+                    if qw.fused_prepare {
+                        let q_width = c.indexer_n_head * c.indexer_head_size;
+                        g.push(Op::Linear {
+                            x: hn,
+                            weight: qw.q_proj,
+                            dst: qsa_q,
+                            m: batch as u32,
+                            in_f: ne as u32,
+                            out_f: (q_width + c.indexer_head_size) as u32,
+                            w_off: 0,
+                        });
+                        g.push(Op::QsaPrepare {
+                            qk: qsa_q,
+                            q_norm: qw.q_norm,
+                            positions,
+                            positions4,
+                            k_cache: cache,
+                            q_dst: qsa_q16,
                             rows: batch as u32,
                             n_head: c.indexer_n_head as u32,
                             head_dim: c.indexer_head_size as u32,
@@ -6682,23 +6927,65 @@ fn generate_dense_backend_inner(
                             theta,
                             eps,
                             sections: c.rope_sections,
-                            x_stride: 0,
+                            pos: start_pos as u32,
                         });
                     } else {
-                        g.push(Op::QkNormRope {
-                            x: qsa_q,
-                            weight: qw.q_norm,
-                            positions,
-                            dst: qsa_q16,
-                            rows: batch as u32,
-                            n_head: c.indexer_n_head as u32,
-                            head_dim: c.indexer_head_size as u32,
-                            rope_dim: c.rope_dim as u32,
-                            theta,
-                            eps,
-                            freq_factors: layer_ff,
-                            x_stride: 0,
+                        g.push(Op::Linear {
+                            x: hn,
+                            weight: qw.k_proj,
+                            dst: qsa_raw_k,
+                            m: batch as u32,
+                            in_f: ne as u32,
+                            out_f: c.indexer_head_size as u32,
+                            w_off: 0,
                         });
+                        g.push(Op::WriteKv {
+                            src: qsa_raw_k,
+                            cache,
+                            rows: batch as u32,
+                            row_stride: c.indexer_head_size as u32,
+                            pos: start_pos as u32,
+                        });
+                        g.push(Op::Linear {
+                            x: hn,
+                            weight: qw.q_proj,
+                            dst: qsa_q,
+                            m: batch as u32,
+                            in_f: ne as u32,
+                            out_f: (c.indexer_n_head * c.indexer_head_size) as u32,
+                            w_off: 0,
+                        });
+                        if let Some(pos4) = positions4 {
+                            g.push(Op::QkNormMrope {
+                                x: qsa_q,
+                                weight: qw.q_norm,
+                                positions4: pos4,
+                                dst: qsa_q16,
+                                rows: batch as u32,
+                                n_head: c.indexer_n_head as u32,
+                                head_dim: c.indexer_head_size as u32,
+                                rope_dim: c.rope_dim as u32,
+                                theta,
+                                eps,
+                                sections: c.rope_sections,
+                                x_stride: 0,
+                            });
+                        } else {
+                            g.push(Op::QkNormRope {
+                                x: qsa_q,
+                                weight: qw.q_norm,
+                                positions,
+                                dst: qsa_q16,
+                                rows: batch as u32,
+                                n_head: c.indexer_n_head as u32,
+                                head_dim: c.indexer_head_size as u32,
+                                rope_dim: c.rope_dim as u32,
+                                theta,
+                                eps,
+                                freq_factors: layer_ff,
+                                x_stride: 0,
+                            });
+                        }
                     }
                     Some((qsa_q16, cache, block_cache, qw.k_norm))
                 } else {
@@ -6876,16 +7163,13 @@ fn generate_dense_backend_inner(
             // boundary. The FFN's own wrap then collapses the NEW stream into `hn`.
             if let Some(hcl) = &lw.qwen_hc {
                 let wide = qwen_wide.expect("qwen4exp layer needs qwen_wide");
-                g.push(Op::QwenHcInject {
-                    residual: wide,
-                    block: sub,
-                    gate: qwen_inject,
-                    dst: qwen_alt,
-                    rows: batch as u32,
-                    hc: c.hc_mult as u32,
-                    n_embd: ne as u32,
-                });
-                qwen_hc_mix(&mut g, &hcl.ffn, qwen_alt, hn);
+                qwen_hc_mix(
+                    &mut g,
+                    &hcl.ffn,
+                    qwen_alt,
+                    hn,
+                    Some((wide, sub, qwen_inject)),
+                );
             } else if let Some(hcl) = &lw.hc {
                 g.push(Op::HyperConnectPost {
                     x: sub,
@@ -7521,7 +7805,7 @@ fn generate_dense_backend_inner(
         if l_end == c.n_layer {
             if let Some(t) = &qwen_hc_head {
                 let wide = qwen_wide.expect("qwen4exp model head needs qwen_wide");
-                qwen_hc_mix(&mut g, t, wide, hn);
+                qwen_hc_mix(&mut g, t, wide, hn, None);
             }
         }
         // LM-head tail — skipped entirely for headless builds (`logits_rows == 0`, the batched
@@ -7537,23 +7821,7 @@ fn generate_dense_backend_inner(
                     eps,
                 });
             }
-            // For batch > 1 with logits_rows == 1: the LM head runs only on the LAST token's
-            // hidden state — extract it via Op::Copy before the projection so the logits output is
-            // [vocab]. Speculative verify passes logits_rows == batch and runs the head over every
-            // row instead (no Copy).
-            let lm_in = if batch > 1 && logits_rows == 1 {
-                let hn_last = g.internal(f32d(ne));
-                g.push(Op::Copy {
-                    src: hn,
-                    src_off: ((batch - 1) * ne) as u32,
-                    dst: hn_last,
-                    dst_off: 0,
-                    n: ne as u32,
-                });
-                hn_last
-            } else {
-                hn
-            };
+            let lm_in = lm_head_sampling_input(&mut g, hn, batch, logits_rows, ne);
             // MTP Phase 1 (issue #33): `lm_in` IS the tap target — exactly the rows `logits` is about
             // to be computed from, one op earlier (the reference's `res->t_h_nextn`, captured right
             // after `output_norm` in `qwen35.cpp`). A plain Copy into a fresh Output, so this never
@@ -7679,7 +7947,10 @@ fn generate_dense_backend_inner(
             .map(|tokens| tokens.len().saturating_sub(1))
             .collect::<Vec<_>>();
         let mut cursors = starts.clone();
-        let ubatch = crate::seam::ubatch_rows(ec).max(lanes);
+        let max_ubatch = crate::seam::ubatch_rows(ec).max(lanes);
+        let mut planned_group = Vec::new();
+        let mut ubatch = max_ubatch;
+        let mut prefill_runtime_reserve = None;
         let ple_row = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram * c.ple_head_dim;
         let qsa_ratio = c.compress_ratios.iter().copied().max().unwrap_or(4).max(1);
         let qsa_threshold = c.indexer_top_k + qsa_ratio - 1;
@@ -7706,6 +7977,52 @@ fn generate_dense_backend_inner(
         {
             if crate::sampling::abort_requested(req) {
                 break;
+            }
+            let _gp = req.and_then(|request| request.gate_pass());
+            // Prefill may borrow every uncommitted future KV segment. Materialize the selected
+            // slot's complete prompt depth before its first chunk so the ring is built around the
+            // exact live footprint. Other slots remain at their current committed depth until the
+            // serial scheduler selects them; their first growth retires and rebuilds the ring.
+            for &lane in &prefill_lanes {
+                if lane == 0 {
+                    ensure_kv_depth!(targets[lane]);
+                } else {
+                    parallel.peers[lane - 1].ensure_segmented_depth(be, c, targets[lane])?;
+                }
+            }
+            let prefill_target = prefill_lanes
+                .iter()
+                .map(|&lane| targets[lane] + 1)
+                .max()
+                .unwrap_or(1);
+            let remaining = prefill_lanes
+                .iter()
+                .map(|&lane| targets[lane].saturating_sub(cursors[lane]))
+                .sum();
+            if be.moe_paged()
+                && planned_group != prefill_lanes
+                && prefill_uses_layer_ring(c, remaining, max_ubatch)
+            {
+                let candidates = prefill_runtime_candidates(
+                    c,
+                    ec,
+                    &caps,
+                    max_ctx,
+                    prefill_target,
+                    kv_ring,
+                    max_ubatch,
+                    k_fmt,
+                    v_fmt,
+                );
+                let selected = be.prepare_prefill(&candidates)?;
+                ubatch = selected.unwrap_or(max_ubatch).max(prefill_lanes.len());
+                prefill_runtime_reserve = selected.and_then(|rows| {
+                    candidates
+                        .iter()
+                        .find(|&&(candidate, _)| candidate == rows)
+                        .map(|&(_, reserve)| reserve)
+                });
+                planned_group.clone_from(&prefill_lanes);
             }
             let final_ranges = prefill_lanes
                 .iter()
@@ -7750,6 +8067,14 @@ fn generate_dense_backend_inner(
             }
             let batch_lanes = prefill_lanes.clone();
             let ranges = prefill_ranges.clone();
+            let mut cursors_after = cursors.clone();
+            for (&lane, range) in prefill_lanes.iter().zip(&prefill_ranges) {
+                cursors_after[lane] = range.end;
+            }
+            let prefill_next_chunk = ec.paging.prefill_cross_chunk
+                && parallel_prefill_group(&cursors_after, &targets, qsa_threshold).is_some_and(
+                    |(_, next_lanes)| next_lanes.iter().all(|lane| prefill_lanes.contains(lane)),
+                );
             let mut spans = Vec::with_capacity(batch_lanes.len());
             let mut row_start = 0usize;
             for range in &ranges {
@@ -7766,7 +8091,6 @@ fn generate_dense_backend_inner(
             // the parallel scheduler. Keeping it on the single-sequence graph also preserves the
             // sparse-QSA gather path used by a final one-row prefill tail.
             let independent_rows = batch_lanes.len() > 1;
-            let _gp = req.and_then(|request| request.gate_pass());
             for (&lane, range) in batch_lanes.iter().zip(&ranges) {
                 if lane == 0 {
                     ensure_kv_depth!(range.end);
@@ -7816,7 +8140,7 @@ fn generate_dense_backend_inner(
             be.upload(pos_batch.as_ref(), bytemuck::cast_slice(&positions))
                 .map_err(|error| anyhow!("{error}"))?;
 
-            let (g0, h0) = build(
+            let (mut g0, h0) = build(
                 batch,
                 ranges[0].start,
                 0,
@@ -7832,6 +8156,8 @@ fn generate_dense_backend_inner(
                 independent_rows.then_some(spans.as_slice()),
                 Some(0..1),
             );
+            g0.prefill_target_tokens = Some(prefill_target);
+            g0.prefill_runtime_reserve_bytes = prefill_runtime_reserve;
             let plan0 = be.compile(&g0).map_err(|error| anyhow!("{error}"))?;
             let mut bindings0 = Bindings::new();
             bindings0.bind(
@@ -7880,7 +8206,7 @@ fn generate_dense_backend_inner(
             be.upload(ple_batch.as_ref(), bytemuck::cast_slice(&ple_rows))
                 .map_err(|error| anyhow!("{error}"))?;
 
-            let (g1, h1) = build(
+            let (mut g1, h1) = build(
                 batch,
                 ranges[0].start,
                 0,
@@ -7896,6 +8222,9 @@ fn generate_dense_backend_inner(
                 independent_rows.then_some(spans.as_slice()),
                 Some(1..c.n_layer),
             );
+            g1.prefill_next_chunk = prefill_next_chunk;
+            g1.prefill_target_tokens = Some(prefill_target);
+            g1.prefill_runtime_reserve_bytes = prefill_runtime_reserve;
             let plan1 = be.compile(&g1).map_err(|error| anyhow!("{error}"))?;
             let mut bindings1 = Bindings::new();
             bindings1.bind(h1.hidden, hidden_batch.as_ref());
@@ -8723,7 +9052,7 @@ fn generate_dense_backend_inner(
             }
             let verify_t0 = std::time::Instant::now();
             let m = prompt.len() - start;
-            let logits_rows = if verify_frontier_only { 1 } else { m };
+            let logits_rows = m;
             if let Some((verify_rows, _)) = mtp_trace {
                 anyhow::ensure!(
                     verify_rows == m,
@@ -9448,6 +9777,12 @@ fn generate_dense_backend_inner(
                 .map(|&lane_start| lane_start + step)
                 .collect::<Vec<_>>();
             let sample_from = sampling_suffix_start(&positions, parallel.prompt_ends)?;
+            let _timeline_step = if sample_from == 0 {
+                infr_core::timeline::begin_step(&positions)
+            } else {
+                None
+            };
+            let timeline_front = infr_core::timeline::span("step_front");
             let logits_rows = lanes - sample_from;
             let batch_argmax = logits_rows > 0
                 && caps.argmax_rows
@@ -9552,6 +9887,7 @@ fn generate_dense_backend_inner(
             if let Some(t0) = profile_front_t0 {
                 profile_front += t0.elapsed();
             }
+            drop(timeline_front);
             let profile_layer0_t0 = profile_cohort.then(std::time::Instant::now);
             be.execute(plan0.as_ref(), &b0)
                 .map_err(|e| anyhow!("{e}"))?;
@@ -9560,10 +9896,12 @@ fn generate_dense_backend_inner(
             }
 
             let profile_ple_wait_t0 = profile_cohort.then(std::time::Instant::now);
+            let timeline_ple_wait = infr_core::timeline::span("PLE_wait");
             let ple_rows = ple_ticket.wait()?;
             if let Some(t0) = profile_ple_wait_t0 {
                 profile_ple_wait += t0.elapsed();
             }
+            drop(timeline_ple_wait);
             let expected_ple_values = lanes * ple_row;
             if ple_rows.len() != expected_ple_values {
                 return Err(anyhow!(
@@ -9667,6 +10005,7 @@ fn generate_dense_backend_inner(
             }
 
             let profile_tail_t0 = profile_cohort.then(std::time::Instant::now);
+            let _timeline_tail = infr_core::timeline::span("step_tail");
             if let (Some(buffer), Some(hidden)) =
                 (hidden_out.as_deref(), parallel.hidden.as_deref_mut())
             {
@@ -10030,6 +10369,67 @@ fn generate_dense_backend_inner(
                     before.backend_setup_paged_moe_scan_ns
                 )),
             );
+            let prefetch_ram_bytes = delta(
+                after.decode_prefetch_ram_bytes,
+                before.decode_prefetch_ram_bytes,
+            );
+            let prefetch_ram_ns =
+                delta(after.decode_prefetch_ram_ns, before.decode_prefetch_ram_ns);
+            tracing::info!(
+                "[parallel-token-prefetch] calibrations={} candidates={} resident={} loading={} ram_experts={} ram={:.1}MiB/{:.1}ms effective_bw={:.2}GiB/s deadline_stops={} overruns={} target_finishes={} finish_wall={:.1}ms quiesce_lock={}({:.1}ms)",
+                delta(
+                    after.decode_prefetch_calibrations,
+                    before.decode_prefetch_calibrations
+                ),
+                delta(
+                    after.decode_prefetch_candidates,
+                    before.decode_prefetch_candidates
+                ),
+                delta(
+                    after.decode_prefetch_vram_resident,
+                    before.decode_prefetch_vram_resident
+                ),
+                delta(
+                    after.decode_prefetch_host_loading,
+                    before.decode_prefetch_host_loading
+                ),
+                delta(
+                    after.decode_prefetch_ram_experts,
+                    before.decode_prefetch_ram_experts
+                ),
+                mib(prefetch_ram_bytes),
+                ns_ms(prefetch_ram_ns),
+                if prefetch_ram_ns == 0 {
+                    0.0
+                } else {
+                    prefetch_ram_bytes as f64 * 1e9
+                        / ((1u64 << 30) as f64 * prefetch_ram_ns as f64)
+                },
+                delta(
+                    after.decode_prefetch_deadline_stops,
+                    before.decode_prefetch_deadline_stops
+                ),
+                delta(
+                    after.decode_prefetch_overruns,
+                    before.decode_prefetch_overruns
+                ),
+                delta(
+                    after.decode_prefetch_target_finishes,
+                    before.decode_prefetch_target_finishes
+                ),
+                ns_ms(delta(
+                    after.decode_prefetch_target_finish_ns,
+                    before.decode_prefetch_target_finish_ns
+                )),
+                delta(
+                    after.decode_prefetch_quiesce_lock_waits,
+                    before.decode_prefetch_quiesce_lock_waits
+                ),
+                ns_ms(delta(
+                    after.decode_prefetch_quiesce_lock_wait_ns,
+                    before.decode_prefetch_quiesce_lock_wait_ns
+                )),
+            );
             for (layer, layer_after) in layers_after.into_iter().enumerate() {
                 let layer_before = layers_before.get(layer).copied().unwrap_or_default();
                 let stats = layer_after.saturating_sub(layer_before);
@@ -10253,12 +10653,36 @@ fn generate_dense_backend_inner(
         // chunk as a single request (2048 ordinary, 4096 aggressive); INFR_UBATCH_PARALLEL remains
         // the explicit latency-oriented cap. Yield the baton between chunks so the round-robin can
         // interleave prefill with other sequences' decode steps.
-        let ubatch: usize = if req.is_some_and(crate::sampling::RequestCtx::shares_gpu) {
+        let mut ubatch: usize = if req.is_some_and(crate::sampling::RequestCtx::shares_gpu) {
             crate::seam::ubatch_rows(ec).min(crate::seam::ubatch_rows_parallel(ec))
         } else {
             crate::seam::ubatch_rows(ec)
         };
         let pf_end = prompt.len() - 1;
+        let mut prefill_runtime_reserve = None;
+        if be.moe_paged() && prefill_uses_layer_ring(c, pf_end.saturating_sub(start), ubatch) {
+            let _gp = req.and_then(|request| request.gate_pass());
+            ensure_kv_depth!(pf_end);
+            let candidates = prefill_runtime_candidates(
+                c,
+                ec,
+                &caps,
+                max_ctx,
+                prompt.len(),
+                kv_ring,
+                ubatch,
+                k_fmt,
+                v_fmt,
+            );
+            let selected = be.prepare_prefill(&candidates)?;
+            ubatch = selected.unwrap_or(ubatch);
+            prefill_runtime_reserve = selected.and_then(|rows| {
+                candidates
+                    .iter()
+                    .find(|&&(candidate, _)| candidate == rows)
+                    .map(|&(_, reserve)| reserve)
+            });
+        }
         // ── prefill work list: (layer span, chunk), in EXECUTION order ───────────────────────
         // Chunk-major is one whole-model span per chunk, so every chunk drags the entire weight
         // set past the pager again — free when the weights are resident, and the whole prefill
@@ -10287,16 +10711,7 @@ fn generate_dense_backend_inner(
             let mut v = Vec::new();
             let mut cs = start;
             while cs < pf_end {
-                let mut ce = (cs + ubatch).min(pf_end);
-                if let Some(boundary) = turn_checkpoint_boundaries
-                    .iter()
-                    .flatten()
-                    .copied()
-                    .filter(|&boundary| cs < boundary && boundary < ce)
-                    .min()
-                {
-                    ce = boundary;
-                }
+                let ce = prefill_chunk_end(cs, pf_end, ubatch, &turn_checkpoint_boundaries);
                 v.push((cs, ce));
                 cs = ce;
             }
@@ -10583,7 +10998,7 @@ fn generate_dense_backend_inner(
                         // never taps `h`. The MTP catch-up driver needs `h` for EVERY prefill row; wiring
                         // that requires this path to carry `logits_rows == pf_m` on demand, which Phase 2
                         // will add alongside the actual head forward.
-                        let (pf_g, pf_h) = build(
+                        let (mut pf_g, pf_h) = build(
                             ch.m,
                             cstart,
                             0,
@@ -10601,6 +11016,10 @@ fn generate_dense_backend_inner(
                             None,  // independent spans
                             Some(span.clone()),
                         );
+                        pf_g.prefill_next_chunk =
+                            ec.paging.prefill_cross_chunk && !layer_major && ci + 1 < chunks.len();
+                        pf_g.prefill_target_tokens = Some(prompt.len());
+                        pf_g.prefill_runtime_reserve_bytes = prefill_runtime_reserve;
                         let t_build = pf_t0.elapsed();
                         let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
                         let t_compile = pf_t0.elapsed();
@@ -10652,6 +11071,54 @@ fn generate_dense_backend_inner(
                         );
                         be.execute(pf_plan.as_ref(), &pf_b)
                             .map_err(|e| anyhow!("{e}"))?;
+                        let t_target_execute = pf_t0.elapsed();
+                        // The MTP head needs the completed wide residual, but none of the target
+                        // graph's scratch. Release the compiled Prefill plan before compiling the
+                        // catch-up graph; otherwise both plans coexist in LlmRuntime and can exceed
+                        // the frozen arena corridor even though they execute serially.
+                        drop(pf_b);
+                        drop(pf_plan);
+                        drop(pf_g);
+                        if si + 1 == spans.len() {
+                            if let Some(sink) = mtp_prefill_sink.as_deref_mut() {
+                                // Paged Vulkan retains a same-phase Prefill high-water arena after
+                                // execute. The detached MTP head is a different graph family and
+                                // runs strictly after the target, so let it reuse that workspace
+                                // instead of growing beside several GiB of dead target scratch.
+                                be.release_transient_runtime();
+                                // Keep only the tapped residual alive across the handoff. The
+                                // chunk's ids, positions, PLE rows and narrow residual are dead
+                                // after the final target span and would needlessly compete with
+                                // the MTP catch-up workspace.
+                                let mut completed = live[ci]
+                                    .take()
+                                    .expect("the completed Prefill chunk is live");
+                                let target_hidden =
+                                    completed.qwen_wide.take().ok_or_else(|| {
+                                        anyhow!("MTP Prefill tap requires Qwen3.8 wide residual")
+                                    })?;
+                                drop(completed);
+                                sink.consume(
+                                    be,
+                                    &prompt[cstart..cend],
+                                    target_hidden.as_ref(),
+                                    cstart,
+                                    mm,
+                                    (
+                                        (
+                                            wbufs[mtp_token_embd_index].as_ref(),
+                                            wspecs[mtp_token_embd_index].0,
+                                            wspecs[mtp_token_embd_index].1,
+                                        ),
+                                        (
+                                            wbufs[mtp_lm_head_index].as_ref(),
+                                            wspecs[mtp_lm_head_index].0,
+                                            wspecs[mtp_lm_head_index].1,
+                                        ),
+                                    ),
+                                )?;
+                            }
+                        }
                         for (index, boundary) in turn_checkpoint_boundaries.iter().enumerate() {
                             if Some(cend) == *boundary {
                                 let Some(ck) = turn_recurrent_ckpts[index].as_mut() else {
@@ -10680,12 +11147,12 @@ fn generate_dense_backend_inner(
                         if ec.prof.stages {
                             tracing::info!(
                             "[pf prof] m={} l={}..{} build={:.1}ms compile={:.1}ms execute={:.1}ms",
-                            ch.m,
+                            pf_m,
                             span.start,
                             span.end,
                             t_build.as_secs_f64() * 1e3,
                             (t_compile - t_build).as_secs_f64() * 1e3,
-                            (pf_t0.elapsed() - t_compile).as_secs_f64() * 1e3,
+                            (t_target_execute - t_compile).as_secs_f64() * 1e3,
                         );
                         }
                         prompt_t += pf_t0.elapsed();
@@ -10995,6 +11462,11 @@ fn generate_dense_backend_inner(
             tracing::info!("[single-decode-begin] pos={pos} max_new={max_new}");
         }
         let step_t0 = std::time::Instant::now();
+        let _timeline_step = if pos + 1 >= prompt.len() {
+            infr_core::timeline::begin_step(&[pos])
+        } else {
+            None
+        };
         let tok = cur[pos] as usize;
         let image_row = mm.and_then(|plan| {
             plan.spans.iter().find_map(|span| {
@@ -11297,6 +11769,32 @@ fn generate_dense_backend_inner(
             let t_exec = std::time::Instant::now();
             be.execute(plan.as_ref(), &b).map_err(|e| anyhow!("{e}"))?;
             exec_el = t_exec.elapsed();
+        }
+        if pos < prompt.len() {
+            if let Some(sink) = mtp_prefill_sink.as_deref_mut() {
+                let target_hidden = qwen_wide_buf
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("MTP Prefill tap requires Qwen3.8 wide residual"))?;
+                sink.consume(
+                    be,
+                    &cur[pos..pos + 1],
+                    target_hidden,
+                    pos,
+                    mm,
+                    (
+                        (
+                            wbufs[mtp_token_embd_index].as_ref(),
+                            wspecs[mtp_token_embd_index].0,
+                            wspecs[mtp_token_embd_index].1,
+                        ),
+                        (
+                            wbufs[mtp_lm_head_index].as_ref(),
+                            wspecs[mtp_lm_head_index].0,
+                            wspecs[mtp_lm_head_index].1,
+                        ),
+                    ),
+                )?;
+            }
         }
         // This step wrote `cur[pos]`'s KV row (a prompt token, a fed generated token, or a fed
         // grammar-forced token — all kept). The final sampled token and any forced tokens queued
@@ -11620,12 +12118,182 @@ fn generate_dense_backend_inner(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lm_head_projects_sampling_suffix_for_every_batch_shape() {
+        use infr_core::backend::{Backend, Bindings, BufferUsage};
+        use infr_core::graph::{Graph, Op};
+        use infr_core::tensor::TensorDesc;
+
+        let backend = infr_cpu::CpuBackend::new();
+        let dim = 3;
+        for batch in 1..=8 {
+            for rows in 1..=batch {
+                let mut graph = Graph::new();
+                let hidden = graph.input(TensorDesc::new(vec![batch * dim], DType::F32));
+                let input = super::lm_head_sampling_input(&mut graph, hidden, batch, rows, dim);
+                assert_eq!(graph.ops.len(), usize::from(rows < batch));
+                let weight = graph.weight(TensorDesc::new(vec![dim * dim], DType::F32));
+                let out = graph.output(TensorDesc::new(vec![rows * dim], DType::F32));
+                graph.push(Op::Linear {
+                    x: input,
+                    weight,
+                    dst: out,
+                    m: rows as u32,
+                    in_f: dim as u32,
+                    out_f: dim as u32,
+                    w_off: 0,
+                });
+                let values: Vec<f32> = (0..batch * dim).map(|i| i as f32 + 1.0).collect();
+                let identity = [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+                let hb = backend
+                    .alloc(values.len() * 4, BufferUsage::Activations)
+                    .unwrap();
+                let wb = backend
+                    .alloc(identity.len() * 4, BufferUsage::Weights)
+                    .unwrap();
+                let ob = backend
+                    .alloc(rows * dim * 4, BufferUsage::Readback)
+                    .unwrap();
+                backend
+                    .upload(hb.as_ref(), bytemuck::cast_slice(&values))
+                    .unwrap();
+                backend
+                    .upload(wb.as_ref(), bytemuck::cast_slice(&identity))
+                    .unwrap();
+                let mut bindings = Bindings::new();
+                bindings.bind(hidden, hb.as_ref());
+                bindings.bind(weight, wb.as_ref());
+                bindings.bind(out, ob.as_ref());
+                let plan = backend.compile(&graph).unwrap();
+                backend.execute(plan.as_ref(), &bindings).unwrap();
+                let mut actual = vec![0.0f32; rows * dim];
+                backend
+                    .download(ob.as_ref(), bytemuck::cast_slice_mut(&mut actual))
+                    .unwrap();
+                assert_eq!(
+                    actual,
+                    values[(batch - rows) * dim..],
+                    "batch={batch}, logits_rows={rows}"
+                );
+            }
+        }
+    }
+
     use super::{
         allocate_parallel_prefill_rows, dense_request_exceeds_capacity, full_mrope_positions,
         mrope_rows_are_plain_rope, mrope_token_position, parallel_prefill_group,
-        parallel_prefill_progress, recurrent_extension_start, resident_after_gen,
-        sampling_suffix_start, validate_token_ids,
+        parallel_prefill_progress, prefill_chunk_end, qsa_prepare_pair_supported,
+        recurrent_extension_start, resident_after_gen, sampling_suffix_start, validate_token_ids,
     };
+    use infr_core::DType;
+
+    #[test]
+    fn prefill_planning_does_not_touch_decode_sized_suffixes() {
+        let cfg = crate::Config {
+            moe: Some(crate::MoeConfig {
+                n_expert: 512,
+                n_used: 10,
+                n_ff_exp: 640,
+                scale: 1.0,
+                gating: infr_core::graph::MoeGating::Sigmoid,
+                norm_w: true,
+                weight_before: false,
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
+            }),
+            ..Default::default()
+        };
+        assert!(!super::prefill_uses_layer_ring(&cfg, 153, 4096));
+        assert!(super::prefill_uses_layer_ring(&cfg, 154, 4096));
+        assert!(!super::prefill_uses_layer_ring(&cfg, 150000, 128));
+        assert!(super::prefill_uses_layer_ring(&cfg, 150000, 256));
+        assert!(!super::prefill_uses_layer_ring(
+            &crate::Config::default(),
+            150000,
+            4096
+        ));
+    }
+
+    #[test]
+    fn prefill_runtime_budget_removes_only_unused_qsa_scores() {
+        let cfg = crate::Config {
+            qwen4exp: true,
+            n_layer: 48,
+            n_head: 24,
+            n_kv: 4,
+            n_embd: 2560,
+            n_ff: 640,
+            head_dim: 256,
+            hc_mult: 4,
+            hc_low_rank: 320,
+            ssm_d_inner: 6144,
+            ssm_n_group: 16,
+            ssm_dt_rank: 48,
+            ssm_d_state: 128,
+            indexer_top_k: 2048,
+            compress_ratios: vec![4; 48],
+            ..Default::default()
+        };
+        let ec = crate::EngineConfig::default();
+        let caps = infr_core::backend::Capabilities::default();
+        for target in [30_000, 32_768, 32_769, 90_000, 150_000, 262_144] {
+            let candidates = super::prefill_runtime_candidates(
+                &cfg,
+                &ec,
+                &caps,
+                262_144,
+                target,
+                false,
+                4096,
+                DType::Q8_0,
+                DType::Q8_0,
+            );
+            assert_eq!(candidates[0].0, 4096);
+            assert!(candidates.iter().all(|&(rows, _)| rows <= 4096));
+            for (rows, reserve) in candidates {
+                let original = crate::seam::runtime_reserve_at(
+                    &cfg,
+                    &caps,
+                    262_144,
+                    false,
+                    rows,
+                    DType::Q8_0,
+                    DType::Q8_0,
+                );
+                let saved = crate::seam::qsa_indexer_scratch_bytes(&cfg, 262_144, rows)
+                    - crate::seam::qsa_indexer_scratch_bytes(&cfg, target, rows);
+                assert_eq!(reserve, original - saved);
+            }
+        }
+        let mut manual = ec.clone();
+        manual.device.ubatch_specified = true;
+        let candidates = super::prefill_runtime_candidates(
+            &cfg,
+            &manual,
+            &caps,
+            262144,
+            30000,
+            false,
+            3072,
+            DType::F16,
+            DType::F16,
+        );
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, 3072);
+    }
+
+    #[test]
+    fn qsa_prepare_fusion_requires_matching_native_projection_dtypes() {
+        assert!(qsa_prepare_pair_supported(
+            Some(DType::Q4K),
+            Some(DType::Q4K)
+        ));
+        assert!(!qsa_prepare_pair_supported(
+            Some(DType::Q4K),
+            Some(DType::Q6K)
+        ));
+        assert!(!qsa_prepare_pair_supported(None, Some(DType::Q4K)));
+    }
 
     #[test]
     fn generated_mrope_rows_collapse_to_plain_rope() {
@@ -11727,6 +12395,14 @@ mod tests {
         assert_eq!(progress.prefill_tokens, 1_536);
         assert_eq!(progress.context_tokens, 2_560);
         assert_eq!(progress.context_limit, 32_768);
+    }
+
+    #[test]
+    fn ordinary_prefill_chunks_stop_at_turn_checkpoints() {
+        let checkpoints = [Some(789), Some(2405)];
+        assert_eq!(prefill_chunk_end(0, 4063, 2048, &checkpoints), 789);
+        assert_eq!(prefill_chunk_end(789, 4063, 2048, &checkpoints), 2405);
+        assert_eq!(prefill_chunk_end(2405, 4063, 2048, &checkpoints), 4063);
     }
 
     #[test]

@@ -217,6 +217,16 @@ pub fn op_label(op: &Op, g: &Graph) -> String {
             out_f,
             ..
         } => format!("Linear m={m} {in_f}x{out_f} {:?}", g.desc(weight).dtype),
+        Op::LinearPair {
+            weight_a,
+            m,
+            in_f,
+            out_f,
+            ..
+        } => format!(
+            "LinearPair m={m} {in_f}x{out_f} {:?}",
+            g.desc(weight_a).dtype
+        ),
         Op::Attention {
             rows,
             kv_len,

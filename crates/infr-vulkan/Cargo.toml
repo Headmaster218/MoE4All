@@ -21,6 +21,7 @@ infr-prof.workspace = true
 infr-prof-rt.workspace = true
 infr-core.workspace = true
 ash.workspace = true
+infr-cpu.workspace = true
 gpu-allocator.workspace = true
 thiserror.workspace = true
 half.workspace = true

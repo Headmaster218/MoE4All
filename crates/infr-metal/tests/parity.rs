@@ -2233,30 +2233,36 @@ fn qknorm_parity() {
 fn gated_rmsnorm_in_place_parity() {
     let (rows, nh, hd) = (3usize, 16usize, 128usize);
     let n = rows * nh * hd;
-    let mut g = Graph::new();
-    let x = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
-    let w = g.weight(TensorDesc::new(vec![hd], DType::F32));
-    let gate = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
-    g.push(Op::GatedRmsNorm {
-        x,
-        weight: w,
-        gate,
-        dst: x,
-        rows: rows as u32,
-        n_head: nh as u32,
-        head_dim: hd as u32,
-        eps: 1e-6,
-    });
-    let bound = vec![
-        (x, f32_bytes(&rand_f32(n, 107))),
-        (w, f32_bytes(&rand_f32(hd, 108))),
-        (gate, f32_bytes(&rand_f32(n, 109))),
-    ];
-    let cpu = run_multi(&CpuBackend::new(), &g, &bound, &[(x, n)]).remove(0);
-    let metal_be = MetalBackend::new().expect("metal backend");
-    assert!(metal_be.capabilities().gated_rmsnorm);
-    let metal = run_multi(&metal_be, &g, &bound, &[(x, n)]).remove(0);
-    assert_close(&cpu, &metal, 1e-5, "in-place gated rmsnorm");
+    for act in [
+        infr_core::graph::Activation::Silu,
+        infr_core::graph::Activation::Sigmoid,
+    ] {
+        let mut g = Graph::new();
+        let x = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+        let w = g.weight(TensorDesc::new(vec![hd], DType::F32));
+        let gate = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+        g.push(Op::GatedRmsNorm {
+            x,
+            weight: w,
+            gate,
+            dst: x,
+            rows: rows as u32,
+            n_head: nh as u32,
+            head_dim: hd as u32,
+            eps: 1e-6,
+            act,
+        });
+        let bound = vec![
+            (x, f32_bytes(&rand_f32(n, 107))),
+            (w, f32_bytes(&rand_f32(hd, 108))),
+            (gate, f32_bytes(&rand_f32(n, 109))),
+        ];
+        let cpu = run_multi(&CpuBackend::new(), &g, &bound, &[(x, n)]).remove(0);
+        let metal_be = MetalBackend::new().expect("metal backend");
+        assert!(metal_be.capabilities().gated_rmsnorm);
+        let metal = run_multi(&metal_be, &g, &bound, &[(x, n)]).remove(0);
+        assert_close(&cpu, &metal, 1e-5, "in-place gated rmsnorm");
+    }
 }
 
 #[test]

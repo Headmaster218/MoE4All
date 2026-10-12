@@ -2,8 +2,9 @@
 kind: index
 status: current
 scope: documentation-templates
-last_verified: 2026-09-28
-verified_commit: ed62393068679573afe94a1472454efe7eae0f15
+last_verified: 2026-10-11
+verified_commit: 7b4a9411e9c7524f8dc6ae2603c62d5f338190dc
+baseline_tag: release-0.10.0
 ---
 
 # 文档模板

@@ -568,7 +568,7 @@ pub(super) async fn handler(
     }
     let Json(request) = match body {
         Ok(value) => value,
-        Err(e) => return param_error(None, e.body_text()),
+        Err(e) => return json_body_error(e),
     };
     let (chat, meta) = match request.into_chat() {
         Ok(value) => value,

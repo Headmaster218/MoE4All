@@ -2,7 +2,9 @@
 param(
     [string]$BinaryPath = 'target\release\infr.exe',
     [string]$OutputDirectory = 'dist',
-    [string]$Version = ''
+    [string]$Version = '',
+    [string]$CodecDirectory = 'target\image-codecs',
+    [switch]$WithoutImageCodecs
 )
 
 $ErrorActionPreference = 'Stop'
@@ -84,6 +86,19 @@ foreach ($script in $packagedScripts) {
         throw "Required release script is missing: $sourcePath"
     }
     Copy-Item -LiteralPath $sourcePath -Destination (Join-Path $stagingPath "scripts\$script")
+}
+
+if (-not $WithoutImageCodecs) {
+    $codecPath = Resolve-RepoPath $CodecDirectory
+    $codecFiles = @('heif.dll', 'libde265.dll', 'libheif-LICENSE.txt', 'libde265-LICENSE.txt', 'SOURCES.txt')
+    if (Test-Path -LiteralPath (Join-Path $codecPath 'dav1d.dll')) {
+        $codecFiles += @('dav1d.dll', 'dav1d-LICENSE.txt')
+    }
+    New-Item -ItemType Directory -Path (Join-Path $stagingPath 'image-codecs') -Force | Out-Null
+    foreach ($file in $codecFiles) {
+        Copy-Item -LiteralPath (Join-Path $codecPath $file) -Destination (Join-Path $stagingPath "image-codecs\$file")
+    }
+    Copy-Item -LiteralPath (Join-Path (Split-Path $codecPath -Parent) 'image-codec-sources.tar.gz') -Destination $outputFullPath -Force
 }
 
 $manifestFiles = foreach ($file in (Get-ChildItem -LiteralPath $stagingPath -File -Recurse | Sort-Object FullName)) {

@@ -1,0 +1,391 @@
+#version 460
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#ifdef COOP_QK
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#endif
+
+// Qwen3.8 QSA Prefill, FlashAttention-style GQA12 path. One workgroup owns a
+// (query row, KV head), stages a 32-key K tile, computes all twelve score rows,
+// then reuses the same LDS slab for V. A whole tile is merged into the persistent
+// online-softmax state once, avoiding the per-key LDS state traffic of the simpler
+// GQA12 kernel while preserving a bounded 32 KiB workgroup footprint.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint kv_len;
+    uint n_head;
+    uint n_kv;
+    uint head_dim;
+    uint top_blocks;
+    uint ratio;
+    float scale;
+    uint kcap;
+    uint vcap;
+    uint segment_shift;
+} pc;
+
+#ifdef COOP_QK
+layout(binding = 0) readonly buffer QB { float16_t q16[]; };
+#else
+layout(binding = 0) readonly buffer QB { uint q[]; };
+#endif
+layout(binding = 1) readonly buffer KB { uvec2 k_segments[]; };
+layout(binding = 2) readonly buffer VB { uvec2 v_segments[]; };
+layout(binding = 3) readonly buffer IB { uint indices[]; };
+layout(binding = 4) writeonly buffer DB { float dst[]; };
+
+#define KV_SEGMENTED
+#include "kv_addr.glsl"
+
+const uint SUBGROUPS = 4u;
+const uint HEAD_DIM = 256u;
+const uint GQA_HEADS = 12u;
+const uint TILE_KEYS = 32u;
+const uint QUADS = HEAD_DIM / 4u;
+#ifdef COOP_QK
+const uint SCORE_ROWS = 16u;
+#else
+const uint SCORE_ROWS = GQA_HEADS;
+#endif
+
+shared float16_t kv_tile[TILE_KEYS * HEAD_DIM];
+shared float score_tile[SCORE_ROWS * TILE_KEYS];
+#ifdef COOP_PV
+shared float16_t prob_tile[SCORE_ROWS * TILE_KEYS];
+#endif
+shared float output_state[GQA_HEADS * HEAD_DIM];
+shared float softmax_max[GQA_HEADS];
+shared float softmax_sum[GQA_HEADS];
+shared float tile_max[GQA_HEADS];
+shared float tile_sum[GQA_HEADS];
+shared uvec2 tile_k_address[TILE_KEYS];
+shared uvec2 tile_v_address[TILE_KEYS];
+shared uint tile_local_base[TILE_KEYS];
+
+#ifndef COOP_QK
+float qread(uint word_base, uint component) {
+    vec2 pair = unpackHalf2x16(q[word_base + (component >> 1u)]);
+    return (component & 1u) == 0u ? pair.x : pair.y;
+}
+#endif
+
+void stage_q8_quad(uint64_t base, uint local, uint segment_elems, uint dst_base) {
+    int codes = int(kv_word(base, local >> 2u));
+    uint block = local >> 5u;
+    uint scales = kv_word(base, (segment_elems >> 2u) + (block >> 1u));
+    float scale = unpackHalf2x16(scales)[block & 1u];
+    kv_tile[dst_base] = float16_t(float(bitfieldExtract(codes, 0, 8)) * scale);
+    kv_tile[dst_base + 1u] = float16_t(float(bitfieldExtract(codes, 8, 8)) * scale);
+    kv_tile[dst_base + 2u] = float16_t(float(bitfieldExtract(codes, 16, 8)) * scale);
+    kv_tile[dst_base + 3u] = float16_t(float(bitfieldExtract(codes, 24, 8)) * scale);
+}
+
+uint source_row(uint row, uint logical, uint selected, uint complete) {
+    uint selected_rows = selected * pc.ratio;
+    if (logical < selected_rows) {
+        uint slot = logical / pc.ratio;
+        uint block = indices[row * pc.top_blocks + slot];
+        return block * pc.ratio + logical % pc.ratio;
+    }
+    return complete * pc.ratio + logical - selected_rows;
+}
+
+void main() {
+    uint local_id = gl_LocalInvocationIndex;
+    uint subgroup = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint job = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint row = job / pc.n_kv;
+    uint kv_head = job - row * pc.n_kv;
+    uint group = pc.n_head / pc.n_kv;
+    if (row >= pc.rows || pc.head_dim != HEAD_DIM || group != GQA_HEADS) { return; }
+
+    uint head_base = kv_head * GQA_HEADS;
+    uint q_word_base = ((row * pc.n_head + head_base) * HEAD_DIM) >> 1u;
+    for (uint i = local_id; i < GQA_HEADS * HEAD_DIM; i += 128u) {
+        output_state[i] = 0.0;
+    }
+    if (local_id < GQA_HEADS) {
+        softmax_max[local_id] = -3.402823466e+38;
+        softmax_sum[local_id] = 0.0;
+    }
+    barrier();
+
+    uint visible = pc.kv_len - pc.rows + row + 1u;
+    uint complete = visible / pc.ratio;
+    uint tail = visible - complete * pc.ratio;
+    uint selected = min(pc.top_blocks, complete);
+    uint keys = selected * pc.ratio + tail;
+    uint segment_elems = 1u << pc.segment_shift;
+
+    for (uint tile_start = 0u; tile_start < keys; tile_start += TILE_KEYS) {
+        uint tile_count = min(TILE_KEYS, keys - tile_start);
+        if (local_id < tile_count) {
+            uint src_row = source_row(row, tile_start + local_id, selected, complete);
+            uint elem_base = (src_row * pc.n_kv + kv_head) * HEAD_DIM;
+            uint segment = kv_segment(elem_base, pc.segment_shift);
+            tile_k_address[local_id] = k_segments[segment];
+            tile_v_address[local_id] = v_segments[segment];
+            tile_local_base[local_id] = kv_segment_local(elem_base, pc.segment_shift);
+        }
+        barrier();
+
+        uint tile_quads = tile_count * QUADS;
+#ifdef COOP_QK
+        for (uint packed = local_id; packed < TILE_KEYS * QUADS; packed += 128u) {
+            uint key = packed / QUADS;
+            uint quad = packed - key * QUADS;
+            uint dst_base = key * HEAD_DIM + quad * 4u;
+            if (key < tile_count) {
+                stage_q8_quad(
+                    kv_segment_base(tile_k_address[key]),
+                    tile_local_base[key] + quad * 4u,
+                    segment_elems,
+                    dst_base
+                );
+            } else {
+                kv_tile[dst_base] = float16_t(0.0);
+                kv_tile[dst_base + 1u] = float16_t(0.0);
+                kv_tile[dst_base + 2u] = float16_t(0.0);
+                kv_tile[dst_base + 3u] = float16_t(0.0);
+            }
+        }
+#else
+        for (uint packed = local_id; packed < tile_quads; packed += 128u) {
+            uint key = packed / QUADS;
+            uint quad = packed - key * QUADS;
+            stage_q8_quad(
+                kv_segment_base(tile_k_address[key]),
+                tile_local_base[key] + quad * 4u,
+                segment_elems,
+                key * HEAD_DIM + quad * 4u
+            );
+        }
+#endif
+        barrier();
+
+#ifdef COOP_QK
+        if (subgroup < 2u) {
+            uint matrix_head = min(head_base, pc.n_head - 16u);
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> scores =
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            for (uint kf = 0u; kf < HEAD_DIM; kf += 16u) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> queries;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> keys;
+                coopMatLoad(
+                    queries,
+                    q16,
+                    (row * pc.n_head + matrix_head) * HEAD_DIM + kf,
+                    HEAD_DIM,
+                    gl_CooperativeMatrixLayoutRowMajor
+                );
+                coopMatLoad(
+                    keys,
+                    kv_tile,
+                    subgroup * 16u * HEAD_DIM + kf,
+                    HEAD_DIM,
+                    gl_CooperativeMatrixLayoutColumnMajor
+                );
+                scores = coopMatMulAdd(queries, keys, scores);
+            }
+            coopMatStore(
+                scores,
+                score_tile,
+                subgroup * 16u,
+                TILE_KEYS,
+                gl_CooperativeMatrixLayoutRowMajor
+            );
+        }
+#else
+        for (uint head_batch = 0u; head_batch < GQA_HEADS; head_batch += SUBGROUPS) {
+            uint query = head_batch + subgroup;
+            uint query_word_base = q_word_base + (query * HEAD_DIM) / 2u;
+            float qv[8];
+            for (uint component = 0u; component < 8u; ++component) {
+                uint d = lane + component * 32u;
+                qv[component] = qread(query_word_base, d);
+            }
+            for (uint key = 0u; key < tile_count; ++key) {
+                float dot = 0.0;
+                for (uint component = 0u; component < 8u; ++component) {
+                    uint d = lane + component * 32u;
+                    dot += qv[component] * float(kv_tile[key * HEAD_DIM + d]);
+                }
+                float score = subgroupAdd(dot) * pc.scale;
+                if (lane == 0u) {
+                    score_tile[query * TILE_KEYS + key] = score;
+                }
+            }
+        }
+#endif
+        barrier();
+
+#ifdef COOP_PV
+        for (uint i = local_id; i < SCORE_ROWS * TILE_KEYS; i += 128u) {
+            prob_tile[i] = float16_t(0.0);
+        }
+        barrier();
+#endif
+        if (local_id < GQA_HEADS) {
+#ifdef COOP_QK
+            uint matrix_head = min(head_base, pc.n_head - 16u);
+            uint query_row_offset = head_base - matrix_head;
+            uint score_base = (local_id + query_row_offset) * TILE_KEYS;
+#else
+            uint score_base = local_id * TILE_KEYS;
+#endif
+            float block_max = -3.402823466e+38;
+            for (uint key = 0u; key < tile_count; ++key) {
+#ifdef COOP_QK
+                block_max = max(block_max, score_tile[score_base + key] * pc.scale);
+#else
+                block_max = max(block_max, score_tile[score_base + key]);
+#endif
+            }
+            float block_sum = 0.0;
+            for (uint key = 0u; key < tile_count; ++key) {
+#ifdef COOP_QK
+                float weight = exp(score_tile[score_base + key] * pc.scale - block_max);
+#else
+                float weight = exp(score_tile[score_base + key] - block_max);
+#endif
+#ifdef COOP_PV
+                prob_tile[score_base + key] = float16_t(weight);
+#else
+                score_tile[score_base + key] = weight;
+#endif
+                block_sum += weight;
+            }
+            tile_max[local_id] = block_max;
+            tile_sum[local_id] = block_sum;
+        }
+        barrier();
+
+        for (uint packed = local_id; packed < tile_quads; packed += 128u) {
+            uint key = packed / QUADS;
+            uint quad = packed - key * QUADS;
+            stage_q8_quad(
+                kv_segment_base(tile_v_address[key]),
+                tile_local_base[key] + quad * 4u,
+                segment_elems,
+                key * HEAD_DIM + quad * 4u
+            );
+        }
+        barrier();
+
+#ifdef COOP_PV
+        if (local_id < GQA_HEADS) {
+            float old_max = softmax_max[local_id];
+            float old_sum = softmax_sum[local_id];
+            float merged_max = max(old_max, tile_max[local_id]);
+            float old_scale = old_sum == 0.0 ? 0.0 : exp(old_max - merged_max);
+            float block_scale = exp(tile_max[local_id] - merged_max);
+            softmax_max[local_id] = merged_max;
+            softmax_sum[local_id] = old_sum * old_scale + tile_sum[local_id] * block_scale;
+            tile_max[local_id] = old_scale;
+            tile_sum[local_id] = block_scale;
+        }
+        barrier();
+
+        uint matrix_head = min(head_base, pc.n_head - 16u);
+        uint query_row_offset = head_base - matrix_head;
+        for (uint output_base = 0u; output_base < HEAD_DIM; output_base += 32u) {
+            if (subgroup < 2u) {
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> values =
+                    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+                for (uint key_base = 0u; key_base < TILE_KEYS; key_base += 16u) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> probabilities;
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> value_tile;
+                    coopMatLoad(
+                        probabilities,
+                        prob_tile,
+                        key_base,
+                        TILE_KEYS,
+                        gl_CooperativeMatrixLayoutRowMajor
+                    );
+                    coopMatLoad(
+                        value_tile,
+                        kv_tile,
+                        key_base * HEAD_DIM + output_base + subgroup * 16u,
+                        HEAD_DIM,
+                        gl_CooperativeMatrixLayoutRowMajor
+                    );
+                    values = coopMatMulAdd(probabilities, value_tile, values);
+                }
+                coopMatStore(
+                    values,
+                    score_tile,
+                    subgroup * 16u,
+                    32u,
+                    gl_CooperativeMatrixLayoutRowMajor
+                );
+            }
+            barrier();
+
+            for (uint packed = local_id; packed < GQA_HEADS * 32u; packed += 128u) {
+                uint query = packed / 32u;
+                uint d = packed - query * 32u;
+                uint output_index = query * HEAD_DIM + output_base + d;
+                float tile_output = score_tile[(query + query_row_offset) * 32u + d];
+                output_state[output_index] = output_state[output_index] * tile_max[query]
+                    + tile_output * tile_sum[query];
+            }
+            barrier();
+        }
+#else
+        for (uint head_batch = 0u; head_batch < GQA_HEADS; head_batch += SUBGROUPS) {
+            uint query = head_batch + subgroup;
+#ifdef COOP_QK
+            uint matrix_head = min(head_base, pc.n_head - 16u);
+            uint query_row_offset = head_base - matrix_head;
+            uint score_base = (query + query_row_offset) * TILE_KEYS;
+#else
+            uint score_base = query * TILE_KEYS;
+#endif
+            float tile_output[8];
+            for (uint component = 0u; component < 8u; ++component) {
+                tile_output[component] = 0.0;
+            }
+            for (uint key = 0u; key < tile_count; ++key) {
+                float weight = score_tile[score_base + key];
+                for (uint component = 0u; component < 8u; ++component) {
+                    uint d = lane + component * 32u;
+                    tile_output[component] += weight * float(kv_tile[key * HEAD_DIM + d]);
+                }
+            }
+
+            float old_max = softmax_max[query];
+            float old_sum = softmax_sum[query];
+            float merged_max = max(old_max, tile_max[query]);
+            float old_scale = old_sum == 0.0 ? 0.0 : exp(old_max - merged_max);
+            float block_scale = exp(tile_max[query] - merged_max);
+            for (uint component = 0u; component < 8u; ++component) {
+                uint d = lane + component * 32u;
+                uint output_index = query * HEAD_DIM + d;
+                output_state[output_index] = output_state[output_index] * old_scale
+                    + tile_output[component] * block_scale;
+            }
+            if (lane == 0u) {
+                softmax_max[query] = merged_max;
+                softmax_sum[query] = old_sum * old_scale + tile_sum[query] * block_scale;
+            }
+        }
+        barrier();
+#endif
+    }
+
+    for (uint i = local_id; i < GQA_HEADS * HEAD_DIM; i += 128u) {
+        uint query = i / HEAD_DIM;
+        uint d = i - query * HEAD_DIM;
+        uint out_base = (row * pc.n_head + head_base + query) * HEAD_DIM;
+        dst[out_base + d] = output_state[i] / softmax_sum[query];
+    }
+}

@@ -1570,6 +1570,50 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires INFR_QWEN_EMBEDDING_TEST_MODEL and a Vulkan device"]
+    fn real_embedding_workspace_idle_is_independent_of_weights() {
+        use infr_vulkan::unified::UnifiedVramClass as Class;
+        let model = std::env::var("INFR_QWEN_EMBEDDING_TEST_MODEL").unwrap();
+        let primary = infr_vulkan::VulkanBackend::new().unwrap();
+        let pool = primary.init_unified_vram(1536 * 1024 * 1024).unwrap();
+        let engine = NativeEmbeddingEngine::load_vulkan_with_backend(
+            Path::new(&model),
+            primary.fork_embedding_client().unwrap(),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let inputs = vec!["How can local LLM inference be accelerated?".to_owned()];
+        let baseline = engine.embed(&inputs).unwrap();
+        let retained = pool.stats();
+        assert!(retained.class_bytes(Class::EmbeddingRuntime) > 0);
+        let weight_bytes = retained.class_bytes(Class::EmbeddingWeights);
+        assert!(weight_bytes > 0);
+        for _ in 0..3 {
+            let actual = engine.embed(&inputs).unwrap();
+            assert_eq!(actual.prompt_tokens, baseline.prompt_tokens);
+            assert_eq!(actual.embeddings, baseline.embeddings);
+            assert_eq!(pool.stats().allocated_bytes, retained.allocated_bytes);
+        }
+        let deadline = Instant::now() + Duration::from_secs(7);
+        while pool.stats().class_bytes(Class::EmbeddingRuntime) != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "embedding workspace did not expire"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            pool.stats().class_bytes(Class::EmbeddingWeights),
+            weight_bytes
+        );
+        let actual = engine.embed(&inputs).unwrap();
+        assert_eq!(actual.embeddings, baseline.embeddings);
+        assert!(pool.stats().class_bytes(Class::EmbeddingRuntime) > 0);
+        drop(engine);
+        assert_eq!(pool.stats().allocated_bytes, 0);
+    }
+
+    #[test]
     fn real_nomic_vulkan_matches_llama_cpp_when_requested() {
         let (Ok(model), Ok(oracle), Ok(_)) = (
             std::env::var("INFR_EMBEDDING_TEST_MODEL"),

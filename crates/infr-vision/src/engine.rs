@@ -173,7 +173,7 @@ fn image_fingerprint(bytes: &[u8]) -> [u8; 32] {
 ///
 /// Only metadata and the position table remain resident between calls. Each call admits all
 /// projector weights directly from the mmproj file, encodes the complete image batch, then drops
-/// both weights and graph runtime so the same arena ranges return to the expert cache.
+/// weights. Graph workspace is cached independently by the backend until its idle deadline.
 pub struct NativeVisionEngine {
     model_path: PathBuf,
     cfg: ClipConfig,
@@ -666,14 +666,17 @@ impl NativeVisionEngine {
             .map_err(|error| anyhow!(error.to_string()));
         drop(plans);
         drop(resident.take());
-        let release_result = self
-            .backend
-            .release_auxiliary_runtime()
-            .map_err(|error| anyhow!(error.to_string()));
+        let release_result = if result.is_err() || sync_result.is_err() {
+            self.backend
+                .release_auxiliary_runtime()
+                .map_err(|error| anyhow!(error.to_string()))
+        } else {
+            Ok(())
+        };
         self.resource.set_residency(MemoryTier::Ssd, 0);
         tracing::info!(
             weights_mib = self.weight_bytes as f64 / (1u64 << 20) as f64,
-            "vision weights and runtime returned to SSD backing"
+            "vision weights returned to SSD backing; runtime has an independent idle deadline"
         );
 
         match result {
@@ -1074,7 +1077,10 @@ mod tests {
             layout.patch_embd_w_temporal.is_some(),
             "Qwen3-VL projector must retain both temporal Conv3D slices"
         );
-        assert_eq!(bytes, specs.iter().map(|spec| spec.nbytes() as u64).sum());
+        assert_eq!(
+            bytes,
+            specs.iter().map(|spec| spec.nbytes() as u64).sum::<u64>()
+        );
         assert!(specs.iter().any(|spec| spec.desc.dtype == DType::Q8_0));
         for spec in specs {
             let source = gguf.tensor_bytes(&spec.source).unwrap();
@@ -1098,6 +1104,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires MMPROJ_TEST_PATH and a Vulkan device"]
+    fn real_vision_workspace_idle_keeps_request_scoped_weights() {
+        use infr_vulkan::unified::UnifiedVramClass as Class;
+        let path = std::env::var_os("MMPROJ_TEST_PATH").unwrap();
+        let primary = VulkanBackend::new().unwrap();
+        let pool = primary.init_unified_vram(1536 * 1024 * 1024).unwrap();
+        let engine = NativeVisionEngine::load_vulkan_with_backend(
+            Path::new(&path),
+            primary.fork_vision_client().unwrap(),
+        )
+        .unwrap();
+        let image = RgbImage::from_fn(32, 64, |x, y| Rgb([(x * 7) as u8, (y * 3) as u8, 41]));
+        let mut png = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(image)
+            .write_to(&mut png, ImageFormat::Png)
+            .unwrap();
+        let images = vec![png.into_inner()];
+        let baseline = engine.encode_images(&images).unwrap();
+        let retained = pool.stats();
+        assert!(retained.class_bytes(Class::VisionRuntime) > 0);
+        assert_eq!(retained.class_bytes(Class::VisionWeights), 0);
+        // Bypass only the CPU image-result cache so this exercises another real GPU request.
+        *engine.embedding_cache.lock().unwrap() = VisionEmbeddingCache::default();
+        let actual = engine.encode_images(&images).unwrap();
+        assert_eq!(actual[0].values, baseline[0].values);
+        assert_eq!(pool.stats().allocated_bytes, retained.allocated_bytes);
+        assert_eq!(pool.stats().class_bytes(Class::VisionWeights), 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(7);
+        while pool.stats().class_bytes(Class::VisionRuntime) != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "vision workspace did not expire"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(pool.stats().allocated_bytes, 0);
+        *engine.embedding_cache.lock().unwrap() = VisionEmbeddingCache::default();
+        let actual = engine.encode_images(&images).unwrap();
+        assert_eq!(actual[0].values, baseline[0].values);
+        drop(engine);
+        assert_eq!(pool.stats().allocated_bytes, 0);
     }
 
     #[test]

@@ -23,6 +23,9 @@ use std::sync::Arc;
 type Job = &'static (dyn Fn(usize) + Sync);
 
 struct Shared {
+    min_spin: u32,
+    force_park: AtomicBool,
+    park_idle: AtomicBool,
     /// The current job's closure, valid from the `seq` bump until every worker has checked in
     /// (`done == workers`) — `run` does not return (and the borrowed closure cannot die) before
     /// that, so a worker can never observe a stale/torn slot: it only reads `job` after seeing a
@@ -75,10 +78,11 @@ pub(crate) struct SpinPool {
     /// Serializes `run` — the pool holds ONE job; concurrent dispatch is a caller bug
     /// (converted call sites are all reached from the single-threaded `execute` op loop).
     in_run: AtomicBool,
+    private_idle: bool,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-fn worker_loop(me: usize, shared: Arc<Shared>) {
+fn worker_loop<const PRIVATE_IDLE: bool>(me: usize, shared: Arc<Shared>) {
     // Baseline generation is the CONSTRUCTION-time value (0), not a fresh load: a worker whose
     // OS thread starts late — after the first `run()` already bumped `seq` — must still join
     // that in-flight job (its check-in is what `run` is blocked on). Loading `seq` here instead
@@ -91,8 +95,8 @@ fn worker_loop(me: usize, shared: Arc<Shared>) {
     // stretches, MoE's rayon section) → collapse to a near-immediate park. Measured: fixed
     // budgets force a 3-way tradeoff (qwen3 pp 416 vs tg 44 vs DG 2.87s — each best at a
     // DIFFERENT value); the gap history picks the right regime per phase automatically.
-    const MIN_SPIN: u32 = 256;
-    let mut budget = MIN_SPIN;
+    let min_spin = shared.min_spin;
+    let mut budget = min_spin;
     loop {
         // ── Wait for a new generation ────────────────────────────────────────────────
         let mut spins = 0u32;
@@ -107,7 +111,7 @@ fn worker_loop(me: usize, shared: Arc<Shared>) {
                 return;
             }
             spins += 1;
-            if spins < budget {
+            if spins < budget && (!PRIVATE_IDLE || !shared.park_idle.load(Ordering::Relaxed)) {
                 std::hint::spin_loop();
             } else {
                 // Park handshake: publish the flag, RE-CHECK seq/shutdown (SeqCst on both sides
@@ -127,8 +131,10 @@ fn worker_loop(me: usize, shared: Arc<Shared>) {
                 parked = true;
             }
         }
-        budget = if parked {
-            MIN_SPIN
+        budget = if shared.force_park.load(Ordering::Acquire) {
+            0
+        } else if parked {
+            min_spin
         } else {
             (budget * 4).min(shared.budget_cap.load(Ordering::Relaxed))
         };
@@ -177,10 +183,30 @@ impl SpinPool {
     /// never again — see [`SpinPool::spin_limit`].
     pub(crate) fn new(cfg: &CpuCfg) -> Self {
         let n_threads = rayon::current_num_threads().max(1);
+        Self::new_sized(cfg, n_threads)
+    }
+
+    pub(crate) fn new_sized(cfg: &CpuCfg, n_threads: usize) -> Self {
+        Self::new_sized_min_spin(cfg, n_threads, 256)
+    }
+
+    pub(crate) fn new_sized_min_spin(cfg: &CpuCfg, n_threads: usize, min_spin: u32) -> Self {
+        Self::new_sized_impl(cfg, n_threads, min_spin, false)
+    }
+
+    pub(crate) fn new_private_min_spin(cfg: &CpuCfg, n_threads: usize, min_spin: u32) -> Self {
+        Self::new_sized_impl(cfg, n_threads, min_spin, true)
+    }
+
+    fn new_sized_impl(cfg: &CpuCfg, n_threads: usize, min_spin: u32, private_idle: bool) -> Self {
+        let n_threads = n_threads.max(1);
         let workers = n_threads - 1;
         let rayon_fallback = !cfg.spinpool;
         let spin_limit = cfg.spin;
         let shared = Arc::new(Shared {
+            min_spin: min_spin.max(1),
+            force_park: AtomicBool::new(false),
+            park_idle: AtomicBool::new(false),
             job: UnsafeCell::new(None),
             seq: AtomicUsize::new(0),
             cursor: AtomicUsize::new(0),
@@ -196,7 +222,13 @@ impl SpinPool {
                 let sh = shared.clone();
                 std::thread::Builder::new()
                     .name(format!("infr-spin-{me}"))
-                    .spawn(move || worker_loop(me, sh))
+                    .spawn(move || {
+                        if private_idle {
+                            worker_loop::<true>(me, sh);
+                        } else {
+                            worker_loop::<false>(me, sh);
+                        }
+                    })
                     .expect("spin-pool: spawn failed")
             })
             .collect();
@@ -207,7 +239,23 @@ impl SpinPool {
             rayon_fallback,
             spin_limit,
             in_run: AtomicBool::new(false),
+            private_idle,
         }
+    }
+
+    /// End an explicit short burst without spinning across unrelated GPU/control work. The
+    /// check-in makes every worker observe the parking request before restoring the next burst.
+    pub(crate) fn park_workers(&self) {
+        self.shared.force_park.store(true, Ordering::Release);
+        self.run(self.workers + 1, &|_| {});
+        self.shared.force_park.store(false, Ordering::Release);
+    }
+
+    /// Park idle helpers without publishing another generation or waiting for a check-in.
+    /// Running tasks still drain normally; the next real job clears this request before waking.
+    pub(crate) fn park_idle_workers(&self) {
+        debug_assert!(self.private_idle);
+        self.shared.park_idle.store(true, Ordering::Release);
     }
 
     /// Run `f(0..n_tasks)` across the pool (caller participates). Dynamic task claim; returns
@@ -238,6 +286,9 @@ impl SpinPool {
             return;
         }
         let sh = &self.shared;
+        if self.private_idle {
+            sh.park_idle.store(false, Ordering::Release);
+        }
         // SAFETY: lifetime erasure of `f` — sound because this function does not return until
         // every worker has incremented `done`, after which no worker touches the slot again.
         unsafe {
@@ -411,6 +462,62 @@ impl Drop for SpinPool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nonblocking_idle_parking_does_not_publish_a_job_and_remains_reusable() {
+        use super::*;
+        let pool = SpinPool::new_private_min_spin(&CpuCfg::default(), 4, 262144);
+        for round in 0..128 {
+            let count = AtomicUsize::new(0);
+            pool.run(64, &|_| {
+                count.fetch_add(1, Ordering::Relaxed);
+            });
+            assert_eq!(count.load(Ordering::Relaxed), 64);
+            let seq = pool.shared.seq.load(Ordering::Acquire);
+            pool.park_idle_workers();
+            assert_eq!(pool.shared.seq.load(Ordering::Acquire), seq);
+            if round % 16 == 0 {
+                let deadline = std::time::Instant::now();
+                while !pool
+                    .shared
+                    .sleeping
+                    .iter()
+                    .all(|s| s.load(Ordering::SeqCst))
+                {
+                    assert!(deadline.elapsed() < std::time::Duration::from_secs(2));
+                    std::thread::yield_now();
+                }
+            }
+        }
+        pool.run(0, &|_| panic!("zero tasks"));
+        pool.run(1, &|_| {});
+        pool.run(64, &|_| {});
+        assert!(!pool.shared.park_idle.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn explicit_burst_parking_is_reusable() {
+        use super::*;
+        let pool = SpinPool::new_sized_min_spin(&CpuCfg::default(), 4, 16384);
+        for _ in 0..128 {
+            let count = AtomicUsize::new(0);
+            pool.run(64, &|_| {
+                count.fetch_add(1, Ordering::Relaxed);
+            });
+            assert_eq!(count.load(Ordering::Relaxed), 64);
+            pool.park_workers();
+            assert!(!pool.shared.force_park.load(Ordering::Relaxed));
+            let deadline = std::time::Instant::now();
+            while !pool
+                .shared
+                .sleeping
+                .iter()
+                .all(|s| s.load(Ordering::SeqCst))
+            {
+                assert!(deadline.elapsed() < std::time::Duration::from_secs(2));
+                std::thread::yield_now();
+            }
+        }
+    }
     use super::*;
     use std::sync::atomic::AtomicU64;
 

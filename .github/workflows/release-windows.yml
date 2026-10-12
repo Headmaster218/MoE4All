@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - 'release-*'
+  workflow_dispatch: {}
+  workflow_call: {}
 
 permissions:
   contents: read
@@ -38,6 +40,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: windows-release-x86-64
+          cache-on-failure: true
 
       - name: Resolve and validate release version
         id: release
@@ -49,7 +52,7 @@ jobs:
           if ($null -eq $package) { throw 'infr-cli is missing from cargo metadata.' }
           $version = [string]$package.version
           $expectedTag = "release-$version"
-          if ('${{ github.event_name }}' -eq 'push' -and '${{ github.ref_name }}' -ne $expectedTag) {
+          if ('${{ github.event_name }}' -eq 'push' -and '${{ github.ref_type }}' -eq 'tag' -and '${{ github.ref_name }}' -ne $expectedTag) {
             throw "Tag '${{ github.ref_name }}' does not match Cargo version '$expectedTag'."
           }
           $packageName = "MoE4All-Windows-x86_64-v$version"
@@ -67,9 +70,37 @@ jobs:
         shell: pwsh
         run: .\scripts\install-vulkan-sdk-windows.ps1
 
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Install image codec build tools
+        shell: pwsh
+        run: |
+          python -m pip install meson==1.9.1 ninja==1.13.0
+          choco install nasm --version=2.16.03 --yes --no-progress
+          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Build bundled HEIC and AVIF decoders
+        run: python scripts/build-image-codecs.py --work "${{ runner.temp }}/image-codec-build"
+      - name: Verify image decoding without a GPU
+        shell: pwsh
+        env:
+          INFR_IMAGE_CODEC_DIR: ${{ github.workspace }}\target\image-codecs
+          INFR_IMAGE_CODEC_FIXTURES: ${{ runner.temp }}\image-codec-build\sources\libheif
+        run: |
+          cargo test --locked -p infr-vision --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p infr-vision bundled_codecs -- --ignored
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Test Windows platform code
         shell: pwsh
         run: |
+          powershell.exe -NoLogo -NoProfile -File .\scripts\Test-LaunchWizard.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoLogo -NoProfile -File .\scripts\Test-CpuMissWizard.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoLogo -NoProfile -File .\scripts\Test-WizardEntryPolicy.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo check --locked -p infr-hub --all-targets
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p infr-hub model_ref::tests::
@@ -88,7 +119,7 @@ jobs:
           $extractPath = Join-Path $env:RUNNER_TEMP 'infr-package-smoke'
           Expand-Archive -LiteralPath '.\dist\${{ steps.release.outputs.archive_name }}' -DestinationPath $extractPath
           $packageRoot = Join-Path $extractPath '${{ steps.release.outputs.package_name }}'
-          .\scripts\smoke-windows-package.ps1 -PackageRoot $packageRoot -ExpectedVersion '${{ steps.release.outputs.version }}'
+          .\scripts\smoke-windows-package.ps1 -PackageRoot $packageRoot -ExpectedVersion '${{ steps.release.outputs.version }}' -SkipInteractiveDeviceChecks
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v6
@@ -97,17 +128,18 @@ jobs:
           path: |
             dist/${{ steps.release.outputs.archive_name }}
             dist/${{ steps.release.outputs.archive_name }}.sha256
+            dist/image-codec-sources.tar.gz
           if-no-files-found: error
           retention-days: 14
 
       - name: Attest release archive
-        if: startsWith(github.ref, 'refs/tags/release-')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/release-')
         uses: actions/attest-build-provenance@v3
         with:
           subject-path: dist/${{ steps.release.outputs.archive_name }}
 
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/release-')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/release-')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -116,6 +148,7 @@ jobs:
           $assets = @(
             '.\dist\${{ steps.release.outputs.archive_name }}'
             '.\dist\${{ steps.release.outputs.archive_name }}.sha256'
+            '.\dist\image-codec-sources.tar.gz'
           )
           $releaseFlags = @()
           if ('${{ steps.release.outputs.prerelease }}' -eq 'true') {
@@ -128,5 +161,13 @@ jobs:
             & gh release edit $tag --title "MoE4All v${{ steps.release.outputs.version }}" @releaseFlags
           } else {
             & gh release create $tag @assets --verify-tag --title "MoE4All v${{ steps.release.outputs.version }}" --generate-notes @releaseFlags
+            if ($LASTEXITCODE -ne 0) {
+              # Linux may have created the shared release after our initial view.
+              & gh release view $tag *> $null
+              if ($LASTEXITCODE -ne 0) { throw 'GitHub Release creation failed.' }
+              & gh release upload $tag @assets --clobber
+              if ($LASTEXITCODE -ne 0) { throw 'GitHub Release upload failed.' }
+              & gh release edit $tag --title "MoE4All v${{ steps.release.outputs.version }}" @releaseFlags
+            }
           }
           if ($LASTEXITCODE -ne 0) { throw "GitHub Release publish failed with exit code $LASTEXITCODE" }

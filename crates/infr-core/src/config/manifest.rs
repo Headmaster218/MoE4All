@@ -193,6 +193,7 @@ knobs! {
     "INFR_NO_SMALL_BM"      => "kernels.vulkan.small_bm",       PresenceInv, Ignored, "1",  migrated;
     "INFR_NO_BM16"          => "kernels.vulkan.bm16",           PresenceInv, Ignored, "1",  migrated;
     "INFR_NO_MMQ"           => "kernels.vulkan.mmq",            PresenceInv, Ignored, "1",  migrated;
+    "INFR_NO_QWEN_HC_DOWN_PREFETCH" => "kernels.vulkan.qwen_hc_down_prefetch", PresenceInv, Ignored, "1", migrated;
     "INFR_NO_MMQ_FALLBACK"  => "kernels.vulkan.mmq_fallback",   PresenceInv, Ignored, "1",  migrated;
     "INFR_NO_MMV"           => "kernels.vulkan.mmv",            PresenceInv, Ignored, "1",  migrated;
     "INFR_MMV_DECODE"       => "kernels.vulkan.mmv_decode",     Presence,    Ignored, "1",  migrated;
@@ -291,6 +292,8 @@ knobs! {
     // ── kernels — graph shape, `infr-llama` (§6.9) ───────────────────────────
     "INFR_NO_QKV_FUSE"      => "kernels.qkv_fuse",      PresenceInv, Ignored, "1", migrated;
     "INFR_NO_GATED_RMSNORM" => "kernels.gated_rmsnorm", PresenceInv, Ignored, "1", migrated;
+    "INFR_NO_DELTA_AB_FUSE"  => "kernels.delta_ab_fuse", PresenceInv, Ignored, "1", migrated;
+    "INFR_NO_QWEN_HC_DOWN_INJECT" => "kernels.qwen_hc_down_inject", PresenceInv, Ignored, "1", migrated;
     "INFR_NO_PLE_SINGLE_PAR" => "kernels.ple_single_parallel", PresenceInv, Ignored, "1", migrated;
 
     // ── spec (§6.8) ──────────────────────────────────────────────────────────
@@ -367,6 +370,15 @@ knobs! {
 /// configuration (§6.10). Listed here so the drift test can tell "excluded on purpose" from
 /// "someone added a knob and forgot the manifest".
 pub const NOT_MIGRATED: &[(&str, &str)] = &[
+    (
+        "INFR_IMAGE_CODEC_DIR",
+        "source-build/test override for bundled native decoder discovery; release builds use \
+         the executable-relative image-codecs directory, independent of runtime Config.",
+    ),
+    (
+        "INFR_IMAGE_CODEC_FIXTURES",
+        "test-only fixture directory for ignored native image decoder parity tests.",
+    ),
     (
         "INFR_PROFILE",
         "build-time input: read by build.rs in core/cpu/gguf/llama/vulkan to set cfg(infr_profile). \

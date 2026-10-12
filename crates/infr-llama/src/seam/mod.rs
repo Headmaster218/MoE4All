@@ -30,7 +30,8 @@ mod session_state;
 mod weights;
 
 pub(crate) use runner::{
-    generate_dense_backend, generate_dense_backend_verify_frontier, PreparedParallelPrompt,
+    generate_dense_backend, generate_dense_backend_mtp_prime, MtpPrefillHiddenSink,
+    PreparedParallelPrompt,
 };
 pub(crate) use sc::DenoiseReq;
 pub use sc::{DenoiseOutcome, EbReduced};
@@ -994,7 +995,8 @@ pub(crate) fn generate_dense_vulkan_parallel_mtp_verify_session(
 ///   single-pass flash tier: no score tiles, only the (negligible) flash_pm/pl partials — term
 ///   skipped when no SWA layer remains.
 ///
-/// Times [`ACT_RESERVE_PAD`]. What is deliberately NOT here any more: a fixed 256 MiB that stood
+/// Times [`ACT_RESERVE_PAD`], or Qwen3.8's measured [`QWEN4_ACT_RESERVE_PAD`]. What is deliberately
+/// NOT here any more: a fixed 256 MiB that stood
 /// in for gpu-allocator block granularity, retained upload staging and weight-buffer padding.
 /// Those are not activations at all — they are exactly what the runner's post-load re-clamp
 /// ([`reclamp_ctx_to_live_room`]) prices by ASKING the device, so carrying an estimate of them
@@ -1098,9 +1100,30 @@ pub(crate) fn dense_act_reserve_at(
     } else {
         0
     };
+    // Qwen3.8 retains the two full-width outputs used by its routed + shared-expert FFN, while
+    // buffers belonging only to DSV4, E2B, dual-MoE input/router and KDA become one-element
+    // placeholders. Its actual HC/QSA/DeltaNet rows are priced explicitly above.
+    let generic_n_embd = if cfg.qwen4exp {
+        let dsv4_rows = 4usize.saturating_mul(
+            cfg.head_dim
+                .saturating_add(cfg.n_head.max(cfg.indexer_n_head) * cfg.rope_dim)
+                .saturating_add(cfg.rope_dim),
+        );
+        (48 * cfg.n_embd)
+            .saturating_sub(12 * cfg.n_embd)
+            .saturating_sub(4 * cfg.ssm_d_inner)
+            .saturating_sub(dsv4_rows)
+    } else {
+        96 * cfg.n_embd
+    };
     let per_row =
-        (12 * cfg.n_ff + 96 * cfg.n_embd + attn_pv + attn_s + moe + deltanet + qwen4_hc) as u64;
-    let row_reserve = rows * per_row * ACT_RESERVE_PAD.0 / ACT_RESERVE_PAD.1;
+        (12 * cfg.n_ff + generic_n_embd + attn_pv + attn_s + moe + deltanet + qwen4_hc) as u64;
+    let pad = if cfg.qwen4exp {
+        QWEN4_ACT_RESERVE_PAD
+    } else {
+        ACT_RESERVE_PAD
+    };
+    let row_reserve = rows * per_row * pad.0 / pad.1;
     // Qwen3.8 keeps its scalar decode graph live while a separately compiled batched-prefill
     // graph owns the row-scaled pools above. Two real runs at d4096 measured the fixed intercept
     // at 54.6 MiB (64 rows: 143.6 MiB peak; 128 rows: 232.7 MiB), so round it up to 64 MiB.
@@ -1337,10 +1360,13 @@ pub(crate) fn layer_major_prefill(
 /// is still the largest — which is the argument for deriving these bytes from the graph the runner
 /// already builds rather than re-deriving them here (backlog B8).
 const ACT_RESERVE_PAD: (u64, u64) = (3, 2);
+// The compact Qwen3.8 graph keeps its required shared-expert outputs but drops full-size buffers
+// belonging exclusively to other architectures. Keep a full third over the modeled row set.
+const QWEN4_ACT_RESERVE_PAD: (u64, u64) = (4, 3);
 const QWEN4_PLAN_OVERLAP_RESERVE: u64 = 64 * 1024 * 1024;
 
 /// Batched-prefill micro-batch: rows per prefill chunk (`device.ubatch` / `INFR_UBATCH`, default
-/// 2048/4096 by profile — but see [`default_ubatch_rows`] for the INTEGRATED-GPU default). ONE
+/// 4096 on a discrete GPU — but see [`default_ubatch_rows`] for the INTEGRATED-GPU default). ONE
 /// reader funnel — the prefill loop, the activation reserve, and the SWA ring sizing below all
 /// derive from this, because the ring's correctness bound is "window + one whole prefill chunk".
 ///
@@ -1460,21 +1486,18 @@ fn first_successful_moe_ubatch<T, E>(
     Ok(None)
 }
 
-/// The prefill chunk when neither INFR_UBATCH nor the placement sweep pinned one: 2048 rows in the
-/// conservative profile and 4096 in the aggressive profile, EXCEPT on an integrated GPU, where a
-/// chunk that big is a single multi-second command buffer and trips
+/// The prefill chunk when neither INFR_UBATCH nor the placement sweep pinned one: 4096 rows on a
+/// discrete GPU in both profiles, EXCEPT on an integrated GPU, where a chunk that big is a single
+/// multi-second command buffer and trips
 /// the ~10 s GPU watchdog (`ring gfx_0.0.0 timeout` -> `VK_ERROR_DEVICE_LOST`). See
 /// [`infr_core::integrated_ubatch_rows`] for the measurements behind the smaller default.
 ///
 /// A DISCRETE device (and a CPU/Metal run, where no Vulkan backend was constructed and
 /// `device_class()` is `None`) uses the profile default.
-fn default_ubatch_rows(profile: infr_core::config::AutoProfile) -> usize {
+fn default_ubatch_rows(_profile: infr_core::config::AutoProfile) -> usize {
     match infr_vulkan::device_class() {
         Some(d) if d.integrated => infr_core::integrated_ubatch_rows(d.compute_units),
-        _ => match profile {
-            infr_core::config::AutoProfile::Conservative => 2048,
-            infr_core::config::AutoProfile::Aggressive => 4096,
-        },
+        _ => 4096,
     }
 }
 
@@ -2584,13 +2607,10 @@ const DEEPSEEK4_LOAD_DRIVER_RESERVE: u64 = 1536 * 1024 * 1024;
 const WINDOWS_LARGE_REBAR_LOAD_DRIVER_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Cold WDDM startup and the first queue use of imported host-memory aliases have heap-budget
-/// movement beyond the measured large-ReBAR load reserve above. Automatic placement should favor a
-/// reliable first launch over the last few Expert slots. An explicit total VRAM budget/reserve
-/// remains authoritative and opts out of this extra policy margin.
+/// movement beyond the measured large-ReBAR load reserve above. Conservative automatic placement
+/// favors a reliable first launch over the last few Expert slots. Aggressive and explicit placement
+/// rely on the live allocation probe and its ubatch fallback instead of adding this policy margin.
 const WINDOWS_LARGE_REBAR_AUTO_STARTUP_RESERVE: u64 = 1024 * 1024 * 1024;
-/// The performance profile still keeps half of the observed cold-start fluctuation. The live
-/// allocation-feedback retry remains the final authority if this tighter margin proves optimistic.
-const WINDOWS_LARGE_REBAR_AGGRESSIVE_STARTUP_RESERVE: u64 = 512 * 1024 * 1024;
 
 fn load_driver_reserve(cfg: &Config) -> u64 {
     if cfg.deepseek4 {
@@ -2612,9 +2632,9 @@ fn session_load_driver_reserve(cfg: &Config, ec: &EngineConfig) -> u64 {
             infr_core::config::AutoProfile::Conservative => {
                 WINDOWS_LARGE_REBAR_AUTO_STARTUP_RESERVE
             }
-            infr_core::config::AutoProfile::Aggressive => {
-                WINDOWS_LARGE_REBAR_AGGRESSIVE_STARTUP_RESERVE
-            }
+            // Aggressive placement relies on the live physical allocation probe and its ubatch
+            // fallback ladder instead of reserving the same startup fluctuation twice.
+            infr_core::config::AutoProfile::Aggressive => 0,
         }
     } else {
         0
@@ -3428,7 +3448,6 @@ pub(crate) fn vulkan_moe_binder<'a>(
     let mut pager_memory_plan = None;
     let mut dynamic_state_max_allocation_bytes = 0u64;
     let mut reclaimable_fixed_host_source_bytes = 0u64;
-    let mut expert_payload_bytes = 0u64;
     let mut requested_cache_bytes = None;
     let mut requested_moe_ubatch = 0usize;
     let mut provisional_moe_ubatch = 0usize;
@@ -3455,7 +3474,6 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // `infr_vulkan::linear::moe_expert_dtype_ok` is true for all of them; the invariant is
         // pinned by `moe_expert_floor_covers_dense_set` in infr-vulkan's linear.rs tests.
         let fp = crate::weights::weight_footprint(g);
-        expert_payload_bytes = fp.expert;
         // These are clean GGUF mapping pages used only as the source of fixed GPU uploads. The
         // bounded Expert arena is populated after those uploads finish, so they are load-time
         // working set, not a persistent owner of the process RAM budget.
@@ -3481,7 +3499,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
             .map(|layout| layout.committed_bytes(want_ctx))
             .unwrap_or(0);
         let mtp_kv_spec = (ec.spec.mtp && cfg.qwen4exp)
-            .then(|| crate::mtp::qwen4_mtp_kv_spec(cfg, want_ctx))
+            .then(|| crate::mtp::qwen4_mtp_kv_spec(cfg, want_ctx.min(ec.spec.mtp_context)))
             .transpose()?;
         let mtp_dynamic_reserve_per_slot = mtp_kv_spec
             .map(|spec| {
@@ -4296,9 +4314,6 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     ),
                 }
 
-                let expert_cache_bytes = physical_bytes
-                    .saturating_sub(elastic_reserve)
-                    .min(expert_payload_bytes);
                 let pool_floors = moe_pool_batch_slot_floors(&logical_pools, n_expert);
                 let pools: Vec<infr_vulkan::pager::MoePoolSpec> = logical_pools
                     .iter()
@@ -4387,7 +4402,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
                             .collect()
                     },
                     prefill_target_lanes,
-                    prefill_cache_bytes: expert_cache_bytes,
+                    // Prefill is phase-exclusive and may borrow uncommitted segmented-KV cells.
+                    // Runtime remains fixed at the high end; live KV allocations are enforced by
+                    // the unified allocator when the ring is built.
+                    prefill_cache_bytes: physical_bytes.saturating_sub(runtime_reserve),
                 })
                 .map_err(|e| anyhow!("{e}"))?;
 
@@ -6488,8 +6506,8 @@ mod seam_helper_tests {
         assert!(!super::user_pinned_ubatch(&unset));
         assert_eq!(
             super::ubatch_rows(&unset),
-            2048,
-            "no pin, no iGPU: the conservative 2048 default"
+            4096,
+            "no pin, no iGPU: both profiles start at 4096 and let placement fall back"
         );
 
         let mut aggressive = EngineConfig::default();
@@ -6526,7 +6544,7 @@ mod seam_helper_tests {
         );
         assert_eq!(
             super::ubatch_rows(&adaptive),
-            2048,
+            4096,
             "…and the height falls back"
         );
     }
@@ -6535,7 +6553,7 @@ mod seam_helper_tests {
     fn explicit_ubatch_also_governs_parallel_prefill_unless_overridden() {
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let mut ec = EngineConfig::default();
-        assert_eq!(super::ubatch_rows_parallel(&ec), 2048);
+        assert_eq!(super::ubatch_rows_parallel(&ec), 4096);
 
         ec.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
         assert_eq!(super::ubatch_rows_parallel(&ec), 4096);
@@ -6547,6 +6565,31 @@ mod seam_helper_tests {
         ec.device.ubatch_parallel = 512;
         ec.device.ubatch_parallel_specified = true;
         assert_eq!(super::ubatch_rows_parallel(&ec), 512);
+    }
+
+    #[test]
+    fn automatic_mtp_ubatch_uses_the_profile_and_standard_fallback_ladder() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let mut automatic = EngineConfig::default();
+        automatic.spec.mtp = true;
+
+        assert_eq!(super::ubatch_rows(&automatic), 4096);
+        assert_eq!(
+            super::ubatch_candidates(&automatic),
+            vec![4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
+        );
+
+        automatic.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
+        assert_eq!(super::ubatch_rows(&automatic), 4096);
+        assert_eq!(
+            super::ubatch_candidates(&automatic),
+            vec![4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
+        );
+
+        automatic.device.ubatch = Some(3072);
+        automatic.device.ubatch_specified = true;
+        assert_eq!(super::ubatch_rows(&automatic), 3072);
+        assert_eq!(super::ubatch_candidates(&automatic), vec![3072]);
     }
 
     #[test]
@@ -6978,6 +7021,7 @@ mod seam_helper_tests {
 
     #[test]
     fn qwen38_activation_reserve_tracks_the_real_prefill_batch() {
+        assert_eq!(super::QWEN4_ACT_RESERVE_PAD, (4, 3));
         let cfg = Config {
             qwen4exp: true,
             n_layer: 48,
@@ -7006,10 +7050,11 @@ mod seam_helper_tests {
         };
         let half = super::dense_act_reserve_at(&cfg, &conservative_caps(), 4096, 512);
         let full = super::dense_act_reserve_at(&cfg, &conservative_caps(), 4096, 1024);
-        assert_eq!(
-            full - super::QWEN4_PLAN_OVERLAP_RESERVE,
-            2 * (half - super::QWEN4_PLAN_OVERLAP_RESERVE),
-            "only the row-scaled part doubles; the retained decode plan is fixed"
+        let full_rows = full - super::QWEN4_PLAN_OVERLAP_RESERVE;
+        let twice_half_rows = 2 * (half - super::QWEN4_PLAN_OVERLAP_RESERVE);
+        assert!(
+            full_rows.abs_diff(twice_half_rows) <= 1,
+            "only the row-scaled part doubles apart from integer division rounding; the retained decode plan is fixed"
         );
     }
 
@@ -7541,7 +7586,11 @@ mod seam_helper_tests {
                 + super::dense_act_reserve_at(&cfg, &conservative_caps(), want, ub)
         };
         let cands = super::ubatch_candidates(&ec);
-        assert_eq!(cands[0], 2048, "the default chunk leads the ladder");
+        assert_eq!(
+            cands[0],
+            super::ubatch_rows(&ec),
+            "the current default chunk leads the ladder"
+        );
         // The profile default may change independently of this regression. What has to hold is
         // that some rung of the shared ladder serves the trained window.
         assert!(
@@ -7787,10 +7836,10 @@ mod seam_helper_tests {
     fn dense_ubatch_ladder_is_the_only_one() {
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let unset = EngineConfig::default();
-        assert_eq!(super::ubatch_rows(&unset), 2048);
+        assert_eq!(super::ubatch_rows(&unset), 4096);
         assert_eq!(
             super::ubatch_candidates(&unset),
-            vec![2048, 1536, 1024, 512, 256]
+            vec![4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
         );
 
         let mut aggressive = EngineConfig::default();
@@ -8021,11 +8070,7 @@ mod seam_helper_tests {
         aggressive.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
         assert_eq!(
             super::session_load_driver_reserve(&cfg, &aggressive),
-            if cfg!(windows) {
-                2 * GIB + 512 * MIB
-            } else {
-                0
-            }
+            if cfg!(windows) { 2 * GIB } else { 0 }
         );
         let mut explicit = EngineConfig::default();
         explicit.device.vram_reserve = Some(infr_core::SizeSpec::Bytes(512 * MIB));
@@ -8520,9 +8565,13 @@ mod seam_helper_tests {
         let (k, v) = (DType::F16, DType::F16);
         let want = 32768;
         let ubatch = super::ubatch_rows(&ec);
-        let kv = super::kv_bytes_estimate_fmt(&cfg, want, true, ubatch, k, v);
+        let kv_floor = super::ubatch_candidates(&ec)
+            .into_iter()
+            .map(|candidate| super::kv_bytes_estimate_fmt(&cfg, want, true, candidate, k, v))
+            .min()
+            .expect("ubatch candidate ladder is never empty");
         let activation = super::dense_act_reserve_at(&cfg, &caps, want, ubatch);
-        let physical_room = kv + super::POST_KV_DEVICE_RESERVE;
+        let physical_room = kv_floor + super::POST_KV_DEVICE_RESERVE;
 
         let without_elastic = super::reclamp_ctx_to_live_room(
             &RoomOnly(Some(physical_room), None),

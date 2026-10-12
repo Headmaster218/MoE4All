@@ -11,9 +11,17 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 // (base = arena_lo/arena_hi) instead of a bound SSBO — see native_gemv.comp's header for the
 // campaign rationale. The reference is vec4-typed under VEC4 (16-byte loads preserved; every
 // arena tensor offset is 256-aligned so the pointer alignment holds).
+#ifdef PAIR
+layout(push_constant) uniform PC {
+    uint rows; uint in_f; uint out_f;
+    uint arena_a_lo; uint arena_a_hi;
+    uint arena_b_lo; uint arena_b_hi;
+} pc;
+#else
 layout(push_constant) uniform PC {
     uint rows; uint in_f; uint out_f; uint arena_lo; uint arena_hi;
 } pc;
+#endif
 #ifdef VEC4
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer ArenaW { vec4 v[]; };
 layout(binding = 1) readonly buffer XB { vec4 x[]; };      // [rows, in/4]
@@ -24,6 +32,36 @@ layout(binding = 1) readonly buffer XB { float x[]; };     // [rows, in]
 uint64_t w_ptr = 0ul;
 #define WV(i) ArenaW(w_ptr).v[i]
 layout(binding = 2) buffer YB { float y[]; };              // [rows, out]
+#ifdef PAIR
+layout(binding = 3) buffer YB2 { float y2[]; };            // [rows, out]
+#endif
+
+uint total_out_f() {
+#ifdef PAIR
+    return pc.out_f * 2u;
+#else
+    return pc.out_f;
+#endif
+}
+
+void select_weight(uint projection) {
+#ifdef PAIR
+    w_ptr = projection == 0u
+        ? ((uint64_t(pc.arena_a_hi) << 32) | uint64_t(pc.arena_a_lo))
+        : ((uint64_t(pc.arena_b_hi) << 32) | uint64_t(pc.arena_b_lo));
+#else
+    w_ptr = (uint64_t(pc.arena_hi) << 32) | uint64_t(pc.arena_lo);
+#endif
+}
+
+void store_result(uint projection, uint index, float value) {
+#ifdef PAIR
+    if (projection == 0u) { y[index] = value; }
+    else { y2[index] = value; }
+#else
+    y[index] = value;
+#endif
+}
 
 #if defined(MROW) && defined(VEC4)
 // vec4 row-tiled prefill GEMM: same wg mapping as MROW below (one output column × MROW rows,
@@ -40,12 +78,15 @@ void main() {
     // out_f*ceil(rows/MROW), which is caught below.
     uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
     uint row_groups = (pc.rows + uint(MROW) - 1u) / uint(MROW);
-    if (unit >= pc.out_f * row_groups) { return; }
+    uint outputs = total_out_f();
+    if (unit >= outputs * row_groups) { return; }
     uint nv = pc.in_f / 4u;
-    uint o = unit % pc.out_f;
-    uint r0 = (unit / pc.out_f) * uint(MROW);
+    uint slot = unit % outputs;
+    uint projection = slot / pc.out_f;
+    uint o = slot % pc.out_f;
+    uint r0 = (unit / outputs) * uint(MROW);
     uint t = gl_LocalInvocationID.x;
-    w_ptr = (uint64_t(pc.arena_hi) << 32) | uint64_t(pc.arena_lo); // resident tensor base byte address
+    select_weight(projection);
     uint wbase = o * nv;
     vec4 acc[MROW];
     for (uint j = 0u; j < uint(MROW); j++) { acc[j] = vec4(0.0); }
@@ -70,7 +111,7 @@ void main() {
     if (t == 0u) {
         for (uint j = 0u; j < uint(MROW); j++) {
             uint r = r0 + j;
-            if (r < pc.rows) { y[r * pc.out_f + o] = red[j * 64u]; }
+            if (r < pc.rows) { store_result(projection, r * pc.out_f + o, red[j * 64u]); }
         }
     }
 }
@@ -85,11 +126,14 @@ void main() {
     // Flat-index recovery for a possibly-2-D dispatch grid — see linear_f16.comp's main() for why.
     uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
     uint row_groups = (pc.rows + uint(MROW) - 1u) / uint(MROW);
-    if (unit >= pc.out_f * row_groups) { return; }
-    uint o = unit % pc.out_f;
-    uint r0 = (unit / pc.out_f) * uint(MROW);
+    uint outputs = total_out_f();
+    if (unit >= outputs * row_groups) { return; }
+    uint slot = unit % outputs;
+    uint projection = slot / pc.out_f;
+    uint o = slot % pc.out_f;
+    uint r0 = (unit / outputs) * uint(MROW);
     uint t = gl_LocalInvocationID.x;
-    w_ptr = (uint64_t(pc.arena_hi) << 32) | uint64_t(pc.arena_lo); // resident tensor base byte address
+    select_weight(projection);
     uint wbase = o * pc.in_f;
     float acc[MROW];
     for (uint j = 0u; j < uint(MROW); j++) { acc[j] = 0.0; }
@@ -111,7 +155,7 @@ void main() {
     if (t == 0u) {
         for (uint j = 0u; j < uint(MROW); j++) {
             uint r = r0 + j;
-            if (r < pc.rows) { y[r * pc.out_f + o] = red[j * 64u]; }
+            if (r < pc.rows) { store_result(projection, r * pc.out_f + o, red[j * 64u]); }
         }
     }
 }
@@ -123,12 +167,15 @@ shared float red[64];
 
 void main() {
     uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
-    if (unit >= pc.rows * pc.out_f) { return; }
-    uint o = unit % pc.out_f;
-    uint r = unit / pc.out_f;
+    uint outputs = total_out_f();
+    if (unit >= pc.rows * outputs) { return; }
+    uint slot = unit % outputs;
+    uint projection = slot / pc.out_f;
+    uint o = slot % pc.out_f;
+    uint r = unit / outputs;
     uint t = gl_LocalInvocationID.x;
     uint nv = pc.in_f / 4u;
-    w_ptr = (uint64_t(pc.arena_hi) << 32) | uint64_t(pc.arena_lo);
+    select_weight(projection);
     uint wbase = o * nv;
     uint xbase = r * nv;
     vec4 acc = vec4(0.0);
@@ -139,7 +186,7 @@ void main() {
         if (t < stride) { red[t] += red[t + stride]; }
         barrier();
     }
-    if (t == 0u) { y[unit] = red[0]; }
+    if (t == 0u) { store_result(projection, r * pc.out_f + o, red[0]); }
 }
 #else
 shared float red[64];
@@ -147,11 +194,14 @@ shared float red[64];
 void main() {
     // Flat-index recovery for a possibly-2-D dispatch grid — see linear_f16.comp's main() for why.
     uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x; // = r * out_f + o
-    if (unit >= pc.rows * pc.out_f) { return; }
-    uint o = unit % pc.out_f;
-    uint r = unit / pc.out_f;
+    uint outputs = total_out_f();
+    if (unit >= pc.rows * outputs) { return; }
+    uint slot = unit % outputs;
+    uint projection = slot / pc.out_f;
+    uint o = slot % pc.out_f;
+    uint r = unit / outputs;
     uint t = gl_LocalInvocationID.x;
-    w_ptr = (uint64_t(pc.arena_hi) << 32) | uint64_t(pc.arena_lo); // resident tensor base byte address
+    select_weight(projection);
     uint wbase = o * pc.in_f;
     uint xbase = r * pc.in_f;
     float acc = 0.0;
@@ -162,6 +212,6 @@ void main() {
         if (t < stride) { red[t] += red[t + stride]; }
         barrier();
     }
-    if (t == 0u) { y[unit] = red[0]; }
+    if (t == 0u) { store_result(projection, r * pc.out_f + o, red[0]); }
 }
 #endif

@@ -231,6 +231,7 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
             | Op::Dsv4CacheWrite { .. }
             | Op::Dsv4Indexer { .. }
             | Op::Dsv4Gather { .. }
+            | Op::QsaPrepare { .. }
             | Op::QsaIndexer { .. }
             | Op::QsaGather { .. }
             | Op::QsaBatchAttention { .. }
@@ -414,6 +415,10 @@ fn decode_token_rows(graph: &Graph) -> Option<usize> {
         .then_some(graph.sequence_spans.len())
 }
 
+fn cpu_miss_decode_graph(graph: &Graph) -> bool {
+    !graph.mtp_verify && decode_token_rows(graph) == Some(1)
+}
+
 fn qsa_topk_workspace_needed(
     rows: u32,
     blocks: u32,
@@ -450,10 +455,16 @@ fn qsa_indexer_score_capacity_bytes(
     current_blocks: u32,
     block_cache_elements: usize,
     head_dim: u32,
+    target_blocks: Option<usize>,
 ) -> usize {
     let capacity_blocks = block_cache_elements / head_dim.max(1) as usize;
     (rows as usize)
-        .saturating_mul(capacity_blocks.max(current_blocks as usize))
+        .saturating_mul(
+            target_blocks
+                .unwrap_or(capacity_blocks)
+                .min(capacity_blocks)
+                .max(current_blocks as usize),
+        )
         .saturating_mul(4)
 }
 
@@ -796,8 +807,8 @@ impl Index<&ScratchKey> for ScratchPool {
     }
 }
 
-/// Lifetime of the pooled scratch used by paged static execution. Paged models rebuild their
-/// graph plan for every token, so this cache belongs to the model backend rather than the plan.
+/// Lifetime of pooled scratch for paged models and auxiliary static graphs. The cache belongs
+/// to each backend client rather than an individual graph plan.
 /// A phase transition drops the old pool before the new phase allocates its differently-sized
 /// workspace; repeated executes in one phase keep the same buffers and therefore keep any expert
 /// slots loaned to LLM runtime stable.
@@ -805,6 +816,7 @@ impl Index<&ScratchKey> for ScratchPool {
 enum RuntimePhase {
     Decode,
     Prefill,
+    Auxiliary,
 }
 
 #[derive(Default)]
@@ -835,7 +847,7 @@ impl RuntimePhaseArena {
     // Prefill shapes never enter this cache (the phase transition below releases all of them).
     const MAX_DECODE_SCRATCH_TOPOLOGIES: usize = 6;
 
-    /// Enter one Decode or Prefill execute. The arena owns every graph and pooled runtime buffer
+    /// Enter one execute. The arena owns every graph and pooled runtime buffer
     /// for that phase even though the physical ranges may be split across Vulkan arena shards.
     fn begin_execute(&mut self, phase: RuntimePhase, layout: &ScratchLayout) -> RuntimePhaseStart {
         let previous = self.phase;
@@ -853,8 +865,9 @@ impl RuntimePhaseArena {
         // will themselves need a larger capacity later in this execute. Keeping them while the
         // graph scratch grows creates an artificial old-pool + new-graph peak that the steady-
         // state runtime reserve neither needs nor prices. Equal-shape prefill still retains its
-        // high-water pool, and Decode keeps the established alternating-topology cache.
-        if phase == RuntimePhase::Prefill
+        // high-water pool, and Decode keeps the established alternating-topology cache. Auxiliary
+        // shapes follow the same bounded high-water policy as Prefill.
+        if phase != RuntimePhase::Decode
             && !scratch_reused
             && (topology_changed || reset_retained_scratch)
         {
@@ -876,11 +889,11 @@ impl RuntimePhaseArena {
             return false;
         }
 
-        // Alternating graph retention is a Decode-only optimization. Prefill workspaces are
+        // Alternating graph retention is a Decode-only optimization. Other workspaces can be
         // several GiB at a wide ubatch, so carrying the previous topology into the next allocation
         // creates an artificial old+new peak. The preceding execute has drained before this call,
         // making it safe to return both prior topologies to the unified arena immediately.
-        if phase == RuntimePhase::Prefill {
+        if phase != RuntimePhase::Decode {
             self.scratch.clear();
             self.scratch_layout = layout.iter().map(|_| None).collect();
             self.scratch = (0..layout.len()).map(|_| None).collect();
@@ -968,6 +981,14 @@ impl RuntimePhaseArena {
         let (pool_keys, pool_missing) = self.pool.plan_batch(pool_requests)?;
         let mut sizes = capacities.clone();
         sizes.extend(pool_missing.iter().map(|(_, bytes)| *bytes));
+        tracing::debug!(
+            phase = ?self.phase,
+            graph_scratch_bytes = layout.iter().flatten().copied().sum::<usize>(),
+            pool_scratch_bytes = pool_requests.iter().map(|(_, bytes)| *bytes).sum::<usize>(),
+            allocation_bytes = sizes.iter().copied().sum::<usize>(),
+            allocations = sizes.len(),
+            "[infr] runtime phase workspace growth"
+        );
         let mut buffers = be_
             .alloc_zeroed_batch(&sizes, BufferUsage::Activations)?
             .into_iter();
@@ -995,9 +1016,8 @@ impl RuntimePhaseArena {
         self.pool.finish_execute();
     }
 
-    /// Release one client's complete phase workspace at a service-level workload switch. This is
-    /// never called between consecutive tokens of the same client; the shared execution gate
-    /// guarantees that no command still references these buffers when another client takes over.
+    /// Release one client's complete workspace on phase changes, idle expiry or allocation
+    /// pressure. The shared execution gate guarantees that no commands still reference it.
     pub(crate) fn release_phase(&mut self) {
         self.release_workspace();
         self.phase = None;
@@ -1009,6 +1029,22 @@ impl RuntimePhaseArena {
         self.scratch_layout.clear();
         self.parked_scratch.clear();
         self.pool.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_workspace(&mut self, buffer: Box<dyn Buffer>) {
+        let layout = vec![Some(buffer.len_bytes())];
+        self.begin_execute(RuntimePhase::Auxiliary, &layout);
+        self.install_scratch(&layout, vec![Some(buffer)]);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scratch_test_address(&self) -> Option<u64> {
+        self.scratch
+            .iter()
+            .flatten()
+            .next()
+            .and_then(|buffer| buffer.device_addr())
     }
 }
 
@@ -1437,15 +1473,16 @@ fn paged_qsa_scratch_requests(graph: &Graph) -> Result<Vec<(&'static str, usize)
             .transpose()?;
         let ratio = (*ratio).max(1);
         let blocks = qsa_indexer_blocks(*kv_len, independent_spans, ratio);
-        // The cache declaration describes the complete configured context even when its dynamic
-        // segmented binding has committed only the current 32K prefix. Reserve that full score
-        // width now: growing this pooled matrix at every context step can strand its old high-water
-        // neighbours and fail despite the runtime corridor having priced the final capacity.
+        // Keep one score width for the complete current transaction, not a width that grows on
+        // every chunk or the full configured context. Decode/verify keep the capacity fallback.
         score_bytes = score_bytes.max(qsa_indexer_score_capacity_bytes(
             *rows,
             blocks,
             graph.desc(*block_cache).numel(),
             *head_dim,
+            graph
+                .prefill_target_tokens
+                .map(|tokens| tokens / ratio as usize),
         ));
         needs_topk_work |= qsa_topk_workspace_needed(*rows, blocks, independent_spans, ratio);
     }
@@ -1943,6 +1980,7 @@ enum RopeMode<'a> {
 /// shared [`infr_core::tier::cap_chunk_count`] / [`infr_core::tier::baked_chunk`] policy is
 /// parameterized by.
 const ATTN_MAX_CHUNKS: usize = 1024;
+const SEGMENTED_KV_RING_FLAG: u32 = 1 << 31;
 
 /// Flash-decoding split-K chunk policy: ~32 chunks/head, each 64..512 keys, floor-rounded (the
 /// measured Vulkan `attn_partial` shape — see [`infr_core::tier::ChunkRounding`] for why the
@@ -2193,6 +2231,7 @@ fn lower_op(
     // before the loop).
     wsub: Option<u64>,
 ) -> Result<()> {
+    let _timeline_lower = infr_core::timeline::span(op.kind());
     let memo_prev = mmv_memo.take();
     let r = |id: TensorId| resolve(scratch, bindings, id);
     match op {
@@ -2270,6 +2309,85 @@ fn lower_op(
         // GEMV (or f16 GEMV). Prefill (m>1) with a native-quant weight uses the TILED coopmat GEMM
         // `matmul_native` (decode each weight element ONCE, reuse across the 64-row tile) instead
         // of the GEMV (which re-reads every weight row per output row) — the prefill perf win.
+        Op::LinearPair {
+            x,
+            weight_a,
+            weight_b,
+            dst_a,
+            dst_b,
+            m,
+            in_f,
+            out_f,
+        } => {
+            if wsub.is_some() {
+                return Err(be(
+                    "vulkan adapter: streamed weight substitution is unsupported for LinearPair",
+                ));
+            }
+            if graph.desc(*weight_a).dtype != infr_core::DType::F32
+                || graph.desc(*weight_b).dtype != infr_core::DType::F32
+            {
+                return Err(be("vulkan adapter: LinearPair requires two F32 weights"));
+            }
+            rec.linear_f32_pair(
+                r(*weight_a)?,
+                r(*weight_b)?,
+                r(*x)?,
+                r(*dst_a)?,
+                r(*dst_b)?,
+                *m as usize,
+                *in_f as usize,
+                *out_f as usize,
+            );
+        }
+        Op::QwenHcDownInject {
+            x,
+            down_weight,
+            inject_weight,
+            low_dst,
+            inject_dst,
+            in_f,
+            low_rank,
+            hc,
+            silu_scale,
+        } => {
+            if graph.desc(*x).dtype != infr_core::DType::F32
+                || graph.desc(*low_dst).dtype != infr_core::DType::F32
+                || graph.desc(*inject_dst).dtype != infr_core::DType::F32
+                || graph.desc(*down_weight).dtype != infr_core::DType::Q8_0
+                || !matches!(
+                    graph.desc(*inject_weight).dtype,
+                    infr_core::DType::F32 | infr_core::DType::Q8_0
+                )
+            {
+                return Err(be(
+                    "vulkan adapter: QwenHcDownInject requires F32 activations, Q8_0 down and F32/Q8_0 inject",
+                ));
+            }
+            if *in_f == 0 || *low_rank == 0 || *hc == 0 || *in_f % 32 != 0 || *in_f % 4 != 0 {
+                return Err(be(
+                    "vulkan adapter: QwenHcDownInject requires non-zero outputs and in_f divisible by 32",
+                ));
+            }
+            if graph.desc(*x).numel() != *in_f as usize
+                || graph.desc(*low_dst).numel() != *low_rank as usize
+                || graph.desc(*inject_dst).numel() != *hc as usize
+            {
+                return Err(be("vulkan adapter: QwenHcDownInject row geometry mismatch"));
+            }
+            rec.qwen_hc_down_inject_quantized(
+                r(*x)?,
+                r(*down_weight)?,
+                r(*inject_weight)?,
+                r(*low_dst)?,
+                r(*inject_dst)?,
+                *in_f,
+                *low_rank,
+                *hc,
+                *silu_scale,
+                graph.desc(*inject_weight).dtype,
+            );
+        }
         Op::Linear {
             x,
             weight,
@@ -3202,6 +3320,15 @@ fn lower_op(
             hc,
             n_embd,
         } => rec.qwen_hc_mix(r(*x)?, r(*gate)?, r(*dst)?, *rows, *hc, *n_embd),
+        Op::QwenHcNorm {
+            x,
+            norm,
+            dst,
+            rows,
+            hc,
+            n_embd,
+            eps,
+        } => rec.qwen_hc_norm(r(*x)?, r(*norm)?, r(*dst)?, *rows, *hc, *n_embd, *eps),
         Op::QwenHcInject {
             residual,
             block,
@@ -3218,6 +3345,29 @@ fn lower_op(
             *rows,
             *hc,
             *n_embd,
+        ),
+        Op::QwenHcInjectNorm {
+            residual,
+            block,
+            gate,
+            norm,
+            residual_dst,
+            normed_dst,
+            rows,
+            hc,
+            n_embd,
+            eps,
+        } => rec.qwen_hc_inject_norm(
+            r(*residual)?,
+            r(*block)?,
+            r(*gate)?,
+            r(*norm)?,
+            r(*residual_dst)?,
+            r(*normed_dst)?,
+            *rows,
+            *hc,
+            *n_embd,
+            *eps,
         ),
         Op::QwenPleGate {
             key,
@@ -3454,31 +3604,48 @@ fn lower_op(
                     let src_row = span.row_start as usize;
                     let src_off = src_row * rs;
                     if let Some((table, segment_shift)) = segmented_kv_view(cache_buf) {
-                        let off = span_pos * rs;
-                        if cache_q8 {
-                            rec.store_q8_segmented(
-                                s,
-                                table,
-                                span_rows * rs,
-                                off,
-                                src_f16,
-                                src_off,
-                                segment_shift,
-                            );
-                        } else if cache_dt == infr_core::DType::F16 {
-                            rec.store_f16_off_segmented(
-                                s,
-                                table,
-                                span_rows * rs,
-                                off,
-                                src_off,
-                                segment_shift,
-                                src_f16,
-                            );
+                        let dst_row = if cap_rows > 0 {
+                            span_pos % cap_rows
                         } else {
-                            return Err(be(format!(
-                                "independent-row segmented KV write does not support {cache_dt:?} cache"
-                            )));
+                            span_pos
+                        };
+                        let segments = if cap_rows > 0 && dst_row + span_rows > cap_rows {
+                            let first = cap_rows - dst_row;
+                            [(0usize, dst_row, first), (first, 0, span_rows - first)]
+                        } else {
+                            [(0usize, dst_row, span_rows), (0, 0, 0)]
+                        };
+                        for &(source_row, target_row, segment_rows) in
+                            segments.iter().filter(|&&(_, _, count)| count > 0)
+                        {
+                            let source = src_off + source_row * rs;
+                            let target = target_row * rs;
+                            let elems = segment_rows * rs;
+                            if cache_q8 {
+                                rec.store_q8_segmented(
+                                    s,
+                                    table,
+                                    elems,
+                                    target,
+                                    src_f16,
+                                    source,
+                                    segment_shift,
+                                );
+                            } else if cache_dt == infr_core::DType::F16 {
+                                rec.store_f16_off_segmented(
+                                    s,
+                                    table,
+                                    elems,
+                                    target,
+                                    source,
+                                    segment_shift,
+                                    src_f16,
+                                );
+                            } else {
+                                return Err(be(format!(
+                                    "independent-row segmented KV write does not support {cache_dt:?} cache"
+                                )));
+                            }
                         }
                         continue;
                     }
@@ -3529,15 +3696,45 @@ fn lower_op(
                         "vulkan adapter: segmented KV writes require the static recording path",
                     ));
                 }
-                let off = pos * rs;
-                if cache_q8 {
-                    rec.store_q8_segmented(s, table, n, off, src_f16, 0, segment_shift);
-                } else if cache_dt == infr_core::DType::F16 {
-                    rec.store_f16_off_segmented(s, table, n, off, 0, segment_shift, src_f16);
+                let cap_rows = cap / rs.max(1);
+                let pos_r = if cap_rows > 0 { pos % cap_rows } else { pos };
+                let segments = if cap_rows > 0 && pos_r + rows > cap_rows {
+                    let first = cap_rows - pos_r;
+                    [(0usize, pos_r, first), (first, 0, rows - first)]
                 } else {
-                    return Err(be(format!(
-                        "vulkan adapter: segmented KV cache dtype {cache_dt:?} is unsupported"
-                    )));
+                    [(0usize, pos_r, rows), (0, 0, 0)]
+                };
+                for &(source_row, target_row, segment_rows) in
+                    segments.iter().filter(|&&(_, _, count)| count > 0)
+                {
+                    let source = source_row * rs;
+                    let target = target_row * rs;
+                    let elems = segment_rows * rs;
+                    if cache_q8 {
+                        rec.store_q8_segmented(
+                            s,
+                            table,
+                            elems,
+                            target,
+                            src_f16,
+                            source,
+                            segment_shift,
+                        );
+                    } else if cache_dt == infr_core::DType::F16 {
+                        rec.store_f16_off_segmented(
+                            s,
+                            table,
+                            elems,
+                            target,
+                            source,
+                            segment_shift,
+                            src_f16,
+                        );
+                    } else {
+                        return Err(be(format!(
+                            "vulkan adapter: segmented KV cache dtype {cache_dt:?} is unsupported"
+                        )));
+                    }
                 }
                 return Ok(());
             }
@@ -3738,6 +3935,111 @@ fn lower_op(
                 *head_dim,
                 *raw_window,
                 indices.is_some(),
+            );
+        }
+        Op::QsaPrepare {
+            qk,
+            q_norm,
+            positions,
+            positions4,
+            k_cache,
+            q_dst,
+            rows,
+            n_head,
+            head_dim,
+            rope_dim,
+            theta,
+            eps,
+            sections,
+            pos,
+        } => {
+            let q_width = *n_head as usize * *head_dim as usize;
+            let qk_stride = q_width + *head_dim as usize;
+            let cap_rows = graph.desc(*k_cache).numel() / (*head_dim as usize).max(1);
+            if *rows == 0
+                || *n_head == 0
+                || *n_head > 4
+                || *head_dim != 128
+                || *rope_dim == 0
+                || *rope_dim > *head_dim
+                || !rope_dim.is_multiple_of(2)
+                || cap_rows == 0
+                || graph.desc(*qk).dtype != infr_core::DType::F32
+                || graph.desc(*q_norm).dtype != infr_core::DType::F32
+                || graph.desc(*positions).dtype != infr_core::DType::I32
+                || graph.desc(*k_cache).dtype != infr_core::DType::F16
+                || graph.desc(*q_dst).dtype != infr_core::DType::F16
+                || graph.desc(*qk).numel() < *rows as usize * qk_stride
+                || graph.desc(*q_dst).numel() < *rows as usize * q_width
+                || positions4.is_some_and(|id| {
+                    graph.desc(id).dtype != infr_core::DType::I32
+                        || sections.iter().sum::<u32>() == 0
+                })
+            {
+                return Err(be(format!(
+                    "vulkan Op::QsaPrepare requires f32 qk/norm, f16 raw cache/query, I32 positions, \
+                     head_dim=128, 1..=4 heads and nonzero even rope_dim; got rows={rows} \
+                     n_head={n_head} head_dim={head_dim} rope_dim={rope_dim} cap_rows={cap_rows}"
+                )));
+            }
+            let position_id = positions4.unwrap_or(*positions);
+            let position_width = if positions4.is_some() { 4 } else { 1 };
+            let mrope = positions4.map(|_| *sections);
+            if graph.independent_rows {
+                let spans = sequence_spans(graph, *rows as usize)?;
+                let caches = resolve_rows(bindings, *k_cache, spans.len())?;
+                for (lane, span) in spans.iter().enumerate() {
+                    let (cache_binding, shift) = match segmented_kv_view(caches[lane]) {
+                        Some((table, shift)) => (table, Some(shift)),
+                        None => (caches[lane], None),
+                    };
+                    rec.qsa_prepare_off(
+                        r(*qk)?,
+                        r(*q_norm)?,
+                        r(position_id)?,
+                        cache_binding,
+                        r(*q_dst)?,
+                        span.rows,
+                        *n_head,
+                        *head_dim,
+                        *rope_dim,
+                        *theta,
+                        *eps,
+                        span.start_pos,
+                        cap_rows as u32,
+                        shift,
+                        mrope,
+                        span.row_start as usize * qk_stride * 4,
+                        span.row_start as usize * position_width * 4,
+                        span.row_start as usize * q_width * 2,
+                    );
+                }
+                return Ok(());
+            }
+            let cache = r(*k_cache)?;
+            let (cache_binding, shift) = match segmented_kv_view(cache) {
+                Some((table, shift)) => (table, Some(shift)),
+                None => (cache, None),
+            };
+            rec.qsa_prepare_off(
+                r(*qk)?,
+                r(*q_norm)?,
+                r(position_id)?,
+                cache_binding,
+                r(*q_dst)?,
+                *rows,
+                *n_head,
+                *head_dim,
+                *rope_dim,
+                *theta,
+                *eps,
+                *pos,
+                cap_rows as u32,
+                shift,
+                mrope,
+                0,
+                0,
+                0,
             );
         }
         Op::QsaIndexer {
@@ -5774,7 +6076,7 @@ fn lower_op(
                                 window,
                                 k_q8_eff,
                                 v_q8_eff,
-                                ks,
+                                ks | if ring_past { SEGMENTED_KV_RING_FLAG } else { 0 },
                             );
                         }
                         (Some(_), Some(_)) => {
@@ -5947,8 +6249,9 @@ fn lower_op(
             n_head,
             head_dim,
             eps,
+            act,
         } => {
-            rec.rmsnorm_gate(
+            let args = (
                 r(*x)?,
                 r(*weight)?,
                 r(*gate)?,
@@ -5957,6 +6260,17 @@ fn lower_op(
                 *head_dim as usize,
                 *eps,
             );
+            match act {
+                Activation::Silu => {
+                    rec.rmsnorm_gate(args.0, args.1, args.2, args.3, args.4, args.5, args.6)
+                }
+                Activation::Sigmoid => {
+                    rec.rmsnorm_gate_sigmoid(args.0, args.1, args.2, args.3, args.4, args.5, args.6)
+                }
+                Activation::Gelu => {
+                    return Err(be("vulkan adapter: GatedRmsNorm Gelu unsupported"))
+                }
+            }
         }
         // Qwen3-Next SSM: depthwise causal conv + SiLU (rolling conv `state` mutated in place).
         Op::Conv1dSilu {
@@ -7684,8 +7998,9 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
     // Dense layer streaming forces the static path for a different reason than MoE (no readback
     // exists — layer order is deterministic — but the per-token ring staging + per-slot weight
     // offsets can't live inside a record-once tape whose descriptor sets and push constants are
-    // frozen at record time).
-    if !plan.eligible || be_.moe_paged() || be_.dense_paged() {
+    // frozen at record time). Auxiliary plans use the independent, expiring runtime cache rather
+    // than retaining buffer references inside a replay tape beyond that cache's deadline.
+    if !plan.eligible || be_.unified_client.is_some() || be_.moe_paged() || be_.dense_paged() {
         return execute_static(be_, &plan.graph, bindings);
     }
 
@@ -7726,7 +8041,13 @@ pub(crate) fn execute_chain(
     let Some(plan) = plan.as_any().downcast_ref::<VkDecodePlan>() else {
         return Ok(None);
     };
-    if !plan.eligible || n == 0 || n > 64 || be_.moe_paged() || be_.dense_paged() {
+    if !plan.eligible
+        || n == 0
+        || n > 64
+        || be_.unified_client.is_some()
+        || be_.moe_paged()
+        || be_.dense_paged()
+    {
         return Ok(None);
     }
     let mut guard = plan.replay.lock().unwrap();
@@ -8564,7 +8885,7 @@ fn issue_decode_prefetch(
         })
 }
 
-fn cancel_decode_prefetch(be_: &VulkanBackend) -> Result<()> {
+pub(crate) fn cancel_decode_prefetch(be_: &VulkanBackend) -> Result<()> {
     be_.decode_prefetch_scheduler()
         .lock()
         .unwrap()
@@ -8597,9 +8918,10 @@ impl Drop for FrozenMoeLutGuard<'_> {
 
 /// Per-execute static recording: prepare zeroed `Internal` scratch, record every op via `lower_op`
 /// (Static mode — pos as a push constant read from `positions[0]`), submit + wait. Paged plans
-/// retain shape-stable scratch within one decode/prefill phase; other plans allocate it per call.
+/// retain scratch within one decode/prefill phase; auxiliary clients retain it until idle expiry.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Result<()> {
+    let _timeline_execute = infr_core::timeline::span("backend_execute");
     let profile_t0 = infr_core::pager_profile::start();
     let result = match execute_static_inner(be_, graph, bindings) {
         Ok(()) => Ok(()),
@@ -8617,6 +8939,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
 }
 
 fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Result<()> {
+    let timeline_setup = infr_core::timeline::span("backend_setup");
     // A previous errored execute may have left protection until its recorder/segments dropped.
     // We are now inside the same unified execution gate, so no old command can still reference it.
     clear_frozen_moe_lut_slots(be_);
@@ -8638,7 +8961,13 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
     // existing unified execution gate serializes this model's executes, so the mutex is only a
     // lifetime container rather than a hot-path contention point.
     let mut reset_retained_scratch = false;
-    let mut phase_arena = if be_.moe_paged() {
+    let mut phase_arena = if be_.unified_client.is_some() {
+        let mut arena = be_.runtime_phase.lock().unwrap();
+        let start = arena.begin_execute(RuntimePhase::Auxiliary, &layout);
+        reset_retained_scratch = start.reset_retained_scratch;
+        arena.grow_workspace(be_, &layout, &[])?;
+        Some(arena)
+    } else if be_.moe_paged() {
         if let Some(phase) = paged_static_phase(graph) {
             if phase == RuntimePhase::Prefill {
                 cancel_decode_prefetch(be_)?;
@@ -8658,9 +8987,15 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
                     .as_mut()
                     .ok_or_else(|| be("paged static execution requires a MoE pager session"))?;
                 match pager_phase {
-                    RuntimePhase::Prefill => sess.enter_prefill_layer(be_)?,
+                    RuntimePhase::Prefill => {
+                        sess.configure_prefill_runtime(graph.prefill_runtime_reserve_bytes)?;
+                        sess.enter_prefill_layer(be_)?;
+                    }
                     RuntimePhase::Decode => {
                         sess.enter_decode();
+                    }
+                    RuntimePhase::Auxiliary => {
+                        unreachable!("auxiliary clients do not change the MoE phase")
                     }
                 }
             }
@@ -8832,6 +9167,7 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
     if let Some(elapsed) = infr_core::pager_profile::elapsed(setup_t0) {
         infr_core::pager_profile::record_backend_setup(elapsed);
     }
+    drop(timeline_setup);
     let mut rec = Some(be_.recorder()?);
     if reset_retained_scratch {
         // Restore only true read-before-write scratch in the first useful command stream. Queue
@@ -8915,11 +9251,13 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
         // Crossing the cap therefore closes the segment at the next op boundary.
         if cap > 0 && rec.as_ref().is_some_and(|r| r.dispatches() >= cap) {
             splitter_splits += 1;
+            pstream.finish_cpu_miss(be_, pool)?;
             let seg = rec
                 .take()
                 .expect("segment always Some between ops")
                 .finish_nowait()
                 .map_err(|e| be(e.to_string()))?;
+            pstream.start_cpu_promotion(be_)?;
             submitted_dispatches += seg.dispatches();
             segments.push_back(seg);
             // Retire the oldest in-flight segment once the window is full. Queue execution is
@@ -8990,7 +9328,7 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
                     .as_ref()
                     .is_some_and(|s| s.is_streamed(wid));
                 if streamed {
-                    let arena_addr = stage_dense_linear(be_, &mut rec, &mut pstream, wid)?;
+                    let arena_addr = stage_dense_linear(be_, &mut rec, &mut pstream, pool, wid)?;
                     if let Err(e) = lower_op(
                         be_,
                         graph,
@@ -9052,12 +9390,14 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
     // Non-paged static execution keeps the established per-call lifetime: move its buffers beside
     // the other transient allocations until the final submit drains. Paged buffers remain in the
     // backend cache and are dropped only on a decode/prefill transition or model teardown.
+    pstream.finish_cpu_miss(be_, pool)?;
     if !using_phase_arena {
         transient.extend(pool.drain_values());
     }
     let last = rec.take().expect("segment always Some at loop end");
     submitted_dispatches += last.dispatches();
-    last.finish().map_err(|e| be(e.to_string()))?;
+    last.finish_after_submit(|| pstream.start_cpu_promotion(be_))
+        .map_err(|e| be(e.to_string()))?;
     // The blocking finish above already waited the queue idle — draining just releases the
     // pipelined segments' command buffers/fences (every buffer they referenced outlives this
     // call: pooled scratch in `transient`, ring/tape/arenas on the session).
@@ -9065,6 +9405,12 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
         seg.wait().map_err(|e| be(e.to_string()))?;
     }
     pstream.drain()?;
+    pstream.wait_cpu_promotion(be_)?;
+    if pstream.cpu_transfer_wait != 0 {
+        let acquire = be_.recorder()?;
+        pstream.acquire_cpu_promotion(&acquire);
+        acquire.finish()?;
+    }
     pstream.finish_prefill_uploads(be_)?;
     if using_phase_arena {
         // All queue work and asynchronous Prefill uploads that can reference pooled buffers have
@@ -9073,6 +9419,9 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
             .as_mut()
             .expect("phase arena exists when cached runtime is active")
             .finish_execute();
+    }
+    if let Some(abort) = pstream.cpu_promotion_abort.as_mut() {
+        abort.complete = true;
     }
     // Every recorder and pager-owned pending segment has now resolved its two GPU timestamps.
     // Fold this complete sample into the finite auto-tuner; dropping the guard on an earlier error
@@ -9088,6 +9437,13 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
         );
     }
     complete_decode_prefetch_handoffs(be_);
+    if be_.cfg().kernels.vulkan.cpu_miss_token_park && pstream.cpu_miss_controller.is_some() {
+        // All result readers and cache promotions drained; avoid private spin crossing into
+        // the next forward's PLE work while preserving warm phase/layer handoffs within this one.
+        if let Some(worker) = be_.cpu_miss_worker() {
+            worker.finish_burst()?;
+        }
+    }
     Ok(())
 }
 
@@ -9130,6 +9486,7 @@ struct PrefillUploadCommand {
 
 struct PrefillUploadCompletion {
     buf_id: usize,
+    transfer_value: u64,
     result: std::result::Result<(), String>,
 }
 
@@ -9140,7 +9497,7 @@ struct PrefillUploader {
 }
 
 impl PrefillUploader {
-    fn new() -> Self {
+    fn new(executor: Option<crate::transfer::BackgroundTransferExecutor>) -> Self {
         let (tx, jobs) = std::sync::mpsc::channel::<Option<PrefillUploadCommand>>();
         let (done, rx) = std::sync::mpsc::channel::<PrefillUploadCompletion>();
         let thread = std::thread::Builder::new()
@@ -9148,17 +9505,26 @@ impl PrefillUploader {
             .spawn(move || {
                 while let Ok(Some(command)) = jobs.recv() {
                     let buf_id = command.job.buf_id();
-                    let result = command
+                    let dependency = command
                         .after
                         .map_or(Ok(()), |segment| segment.wait().map_err(|e| e.to_string()));
-                    let result = result.and_then(|()| {
-                        command
-                            .job
-                            .execute_on_host_worker()
-                            .map_err(|e| e.to_string())
+                    let outcome = dependency.and_then(|()| {
+                        match executor.as_ref() {
+                            Some(executor) => command.job.execute_on_background(executor),
+                            None => command.job.execute_on_host_worker().map(|()| None),
+                        }
+                        .map_err(|e| e.to_string())
                     });
+                    let (transfer_value, result) = match outcome {
+                        Ok(value) => (value.unwrap_or(0), Ok(())),
+                        Err(error) => (0, Err(error)),
+                    };
                     if done
-                        .send(PrefillUploadCompletion { buf_id, result })
+                        .send(PrefillUploadCompletion {
+                            buf_id,
+                            transfer_value,
+                            result,
+                        })
                         .is_err()
                     {
                         break;
@@ -9193,8 +9559,73 @@ impl Drop for PrefillUploader {
     }
 }
 
+enum CpuPromotionPending {
+    Push(Option<crate::cpu_miss::PromotionJob>),
+    Dma(crate::transfer::BackgroundTransferExecutor, Option<u64>),
+}
+
+impl CpuPromotionPending {
+    fn wait(&mut self) -> Result<()> {
+        match self {
+            Self::Push(job) => job.take().map_or(Ok(()), |job| job.wait()),
+            Self::Dma(executor, value) => value.take().map_or(Ok(()), |value| executor.wait(value)),
+        }
+    }
+}
+
+impl Drop for CpuPromotionPending {
+    fn drop(&mut self) {
+        let _ = self.wait();
+    }
+}
+
+struct CpuMissPromotion {
+    roles: [usize; 3],
+    ids: Vec<u32>,
+    layer: usize,
+    sources: Vec<crate::cpu_miss::Expert>,
+    started: bool,
+    pending: Option<CpuPromotionPending>,
+}
+
+struct CpuPromotionAbortGuard {
+    pager: Arc<crate::pager::MoePagerCell>,
+    experts: Vec<([usize; 3], u32)>,
+    complete: bool,
+}
+
+impl Drop for CpuPromotionAbortGuard {
+    fn drop(&mut self) {
+        if !self.complete {
+            if let Ok(mut pager) = self.pager.lock() {
+                if let Some(session) = pager.as_mut() {
+                    for &(roles, id) in &self.experts {
+                        session.discard_cpu_miss(roles, &[id]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Drop for CpuMissPromotion {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending.as_mut() {
+            let _ = pending.wait();
+        }
+    }
+}
+
 #[derive(Default)]
 struct PagedStream {
+    /// Sparse tape entries are only legal for the small-m shaders, never bucketed MMQ.
+    small_m_lut: bool,
+    /// Result copies can be encoded immediately; host writes must complete before submission or
+    /// the next pager epoch. Keeping the scratch key avoids a borrowed/raw mapped pointer.
+    cpu_miss: Option<(crate::cpu_miss::Job, CpuMissResultTarget, usize)>,
+    cpu_miss_controller: Option<crate::cpu_miss::AffinityGuard>,
+    cpu_promotion: Option<CpuMissPromotion>,
+    cpu_transfer_wait: u64,
     /// Per-ring-region in-flight segment (the one whose recorded copies read that region).
     pending: Vec<Option<crate::recorder::PendingSegment>>,
     /// Which ring region `cursor` allocates from.
@@ -9209,9 +9640,181 @@ struct PagedStream {
     /// while waiting for a ring lane to become reusable, so upload progress is independent from
     /// graph recording and from whether the active layer is Attention or DeltaNet.
     prefill_uploader: Option<PrefillUploader>,
+    /// Completed transfer-queue timelines that must also be attached to the compute submission.
+    /// The host worker waits before publishing completion; this GPU dependency supplies the Vulkan
+    /// memory-visibility edge between the two queue families without delaying graph recording.
+    prefill_transfer_waits: std::collections::HashMap<usize, u64>,
+    // Drop last: canceled DMA must finish before invalidation, and its discarded acquire
+    // dependency must never leave newly promoted experts reusable by a later forward.
+    cpu_promotion_abort: Option<CpuPromotionAbortGuard>,
+}
+
+enum CpuMissResultTarget {
+    Staging(ScratchKey),
+    Mapped {
+        key: ScratchKey,
+        row_elements: usize,
+    },
 }
 
 impl PagedStream {
+    fn finish_cpu_miss(&mut self, be_: &VulkanBackend, pool: &ScratchPool) -> Result<()> {
+        if let Some((job, result_buf, layer)) = self.cpu_miss.take() {
+            let _layer = infr_core::timeline::layer(layer);
+            let wait_span = infr_core::timeline::span("cpu_miss_wait");
+            let output = job.wait()?;
+            drop(wait_span);
+            let _result_span = infr_core::timeline::span("cpu_miss_result");
+            match result_buf {
+                CpuMissResultTarget::Staging(key) => {
+                    be_.upload(pool[&key].as_ref(), bytemuck::cast_slice(&output.values))?;
+                }
+                CpuMissResultTarget::Mapped { key, row_elements } => {
+                    let target = crate::as_vk_buf(pool[&key].as_ref())?;
+                    let ptr = target
+                        .mapped_ptr()
+                        .ok_or_else(|| be("CPU result mapping disappeared"))?;
+                    let row_bytes = row_elements
+                        .checked_mul(4)
+                        .ok_or_else(|| be("CPU result row overflow"))?;
+                    if row_elements == 0
+                        || output.slots.len().checked_mul(row_elements) != Some(output.values.len())
+                        || output.slots.iter().any(|&slot| {
+                            slot.checked_add(1)
+                                .and_then(|n| n.checked_mul(row_bytes))
+                                .is_none_or(|end| end > target.size)
+                        })
+                    {
+                        return Err(be("CPU result slots exceed their mapped output"));
+                    }
+                    for (&slot, values) in output
+                        .slots
+                        .iter()
+                        .zip(output.values.chunks_exact(row_elements))
+                    {
+                        // Only CPU-owned miss slots are written. Hit/Shared stores may still be
+                        // in flight in other disjoint rows; queue submit publishes these writes.
+                        crate::copy_to_mapped(bytemuck::cast_slice(values), unsafe {
+                            ptr.add(slot * row_bytes)
+                        });
+                    }
+                }
+            }
+            if let Some(promotion) = self.cpu_promotion.as_mut() {
+                promotion.sources = output.experts;
+            }
+        }
+        Ok(())
+    }
+
+    fn start_cpu_promotion(&mut self, be_: &VulkanBackend) -> Result<()> {
+        let Some(promotion) = self.cpu_promotion.as_mut() else {
+            return Ok(());
+        };
+        if promotion.started || promotion.sources.is_empty() {
+            return Ok(());
+        }
+        let _layer = infr_core::timeline::layer(promotion.layer);
+        let _span = infr_core::timeline::span("cpu_miss_promotion_start");
+        promotion.started = true;
+        let abort = self
+            .cpu_promotion_abort
+            .get_or_insert_with(|| CpuPromotionAbortGuard {
+                pager: Arc::clone(&be_.moe_pager),
+                experts: Vec::new(),
+                complete: false,
+            });
+        abort
+            .experts
+            .extend(promotion.ids.iter().map(|&id| (promotion.roles, id)));
+        let result = (|| {
+            if be_.cfg().kernels.vulkan.cpu_miss_push {
+                be_.moe_pager()
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .prepare_cpu_miss_push(
+                        promotion.roles,
+                        &promotion.ids,
+                        &mut promotion.sources,
+                    )?;
+                let job = be_
+                    .cpu_miss_worker()
+                    .expect("compute worker exists")
+                    .promote(std::mem::take(&mut promotion.sources));
+                promotion.pending = Some(CpuPromotionPending::Push(Some(job)));
+            } else {
+                let push = be_
+                    .moe_pager()
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .push_roles_cpu(
+                        be_,
+                        &promotion.roles.map(|role| (role, promotion.ids.as_slice())),
+                        false,
+                    )?;
+                if let Some(executor) = be_
+                    .background_expert_transfer_executor()
+                    .filter(|_| push.background_compatible())
+                {
+                    if let Some(value) = push.submit_background(&executor)? {
+                        self.cpu_transfer_wait = self.cpu_transfer_wait.max(value);
+                        promotion.pending = Some(CpuPromotionPending::Dma(executor, Some(value)));
+                    }
+                } else {
+                    push.complete_without_recorder(be_)?;
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            be_.moe_pager()
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .discard_cpu_miss(promotion.roles, &promotion.ids);
+        }
+        result
+    }
+
+    fn wait_cpu_promotion(&mut self, be_: &VulkanBackend) -> Result<()> {
+        // Unsubmitted results have not admitted any cache slots yet. Keep their source handles
+        // until the segment containing the result copy has actually reached the GPU queue.
+        if self
+            .cpu_promotion
+            .as_ref()
+            .is_some_and(|promotion| !promotion.started)
+        {
+            return Ok(());
+        }
+        if let Some(mut promotion) = self.cpu_promotion.take() {
+            let _layer = infr_core::timeline::layer(promotion.layer);
+            let _span = infr_core::timeline::span("cpu_miss_promotion_wait");
+            if let Some(pending) = promotion.pending.as_mut() {
+                if let Err(error) = pending.wait() {
+                    be_.moe_pager()
+                        .lock()
+                        .unwrap()
+                        .as_mut()
+                        .unwrap()
+                        .discard_cpu_miss(promotion.roles, &promotion.ids);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn acquire_cpu_promotion(&mut self, rec: &Recorder<'_>) {
+        if self.cpu_transfer_wait != 0 {
+            rec.wait_for_dedicated_transfer(std::mem::take(&mut self.cpu_transfer_wait));
+        }
+    }
+
     fn ensure_slots(&mut self, slots: usize) {
         debug_assert!(slots >= 2);
         if self.pending.is_empty() {
@@ -9234,6 +9837,7 @@ impl PagedStream {
     }
 
     fn apply_prefill_completion(
+        &mut self,
         be_: &VulkanBackend,
         completion: PrefillUploadCompletion,
     ) -> Result<()> {
@@ -9245,15 +9849,26 @@ impl PagedStream {
             .unwrap()
             .as_mut()
             .expect("paged execution requires a session")
-            .complete_prefill_layer_cpu(completion.buf_id)
+            .complete_prefill_layer_cpu(completion.buf_id)?;
+        if completion.transfer_value != 0 {
+            self.prefill_transfer_waits
+                .insert(completion.buf_id, completion.transfer_value);
+        }
+        Ok(())
     }
 
     fn poll_prefill_uploads(&mut self, be_: &VulkanBackend) -> Result<()> {
-        let Some(uploader) = self.prefill_uploader.as_ref() else {
-            return Ok(());
-        };
-        while let Ok(completion) = uploader.rx.try_recv() {
-            Self::apply_prefill_completion(be_, completion)?;
+        loop {
+            let completion = {
+                let Some(uploader) = self.prefill_uploader.as_ref() else {
+                    return Ok(());
+                };
+                uploader.rx.try_recv()
+            };
+            let Ok(completion) = completion else {
+                break;
+            };
+            self.apply_prefill_completion(be_, completion)?;
         }
         Ok(())
     }
@@ -9292,17 +9907,23 @@ impl PagedStream {
             if let Some(elapsed) = infr_core::pager_profile::elapsed(wait_t0) {
                 infr_core::pager_profile::record_staging_wait(elapsed);
             }
-            Self::apply_prefill_completion(be_, completion)?;
+            self.apply_prefill_completion(be_, completion)?;
         }
     }
 
     fn enqueue_prefill_upload(
         &mut self,
+        be_: &VulkanBackend,
         job: crate::pager::PrefillCopyJob,
         after: Option<crate::recorder::PendingSegment>,
     ) -> Result<()> {
+        if self.prefill_uploader.is_none() {
+            let executor = crate::transfer::BackgroundTransferExecutor::from_backend(be_);
+            self.prefill_uploader = Some(PrefillUploader::new(executor));
+        }
         self.prefill_uploader
-            .get_or_insert_with(PrefillUploader::new)
+            .as_ref()
+            .expect("Prefill uploader was initialized")
             .enqueue(PrefillUploadCommand { job, after })
     }
 
@@ -9312,7 +9933,7 @@ impl PagedStream {
         };
         uploader.finish();
         while let Ok(completion) = uploader.rx.try_recv() {
-            Self::apply_prefill_completion(be_, completion)?;
+            self.apply_prefill_completion(be_, completion)?;
         }
         Ok(())
     }
@@ -9326,13 +9947,16 @@ fn rotate_stream<'a>(
     be_: &'a VulkanBackend,
     rec: &mut Option<Recorder<'a>>,
     ps: &mut PagedStream,
+    pool: &ScratchPool,
 ) -> Result<()> {
     let acquire_t0 = infr_core::pager_profile::start();
+    ps.finish_cpu_miss(be_, pool)?;
     let seg = rec
         .take()
         .expect("segment always Some between ops")
         .finish_nowait()
         .map_err(|e| be(e.to_string()))?;
+    ps.start_cpu_promotion(be_)?;
     debug_assert!(!ps.pending.is_empty());
     ps.pending[ps.half] = Some(seg);
     ps.half = (ps.half + 1) % ps.pending.len();
@@ -9389,14 +10013,18 @@ fn prefetch_compute_live(ps: &PagedStream, probe: PrefetchComputeProbe) -> Resul
 }
 
 fn submit_prefill_compute<'a>(
+    be_: &VulkanBackend,
     rec: &mut Option<Recorder<'a>>,
     ps: &mut PagedStream,
+    pool: &ScratchPool,
 ) -> Result<PrefetchComputeProbe> {
+    ps.finish_cpu_miss(be_, pool)?;
     let seg = rec
         .take()
         .expect("segment always Some between ops")
         .finish_nowait()
         .map_err(|e| be(e.to_string()))?;
+    ps.start_cpu_promotion(be_)?;
     if ps.cursor > 0 {
         let slot = ps.half;
         debug_assert!(ps.pending[ps.half].is_none());
@@ -9422,17 +10050,23 @@ fn sync_stream<'a>(
     be_: &'a VulkanBackend,
     rec: &mut Option<Recorder<'a>>,
     ps: &mut PagedStream,
+    pool: &ScratchPool,
 ) -> Result<()> {
+    let _timeline_sync = infr_core::timeline::span("router_sync_stream");
     let sync_t0 = infr_core::pager_profile::start();
+    ps.finish_cpu_miss(be_, pool)?;
     rec.take()
         .expect("segment always Some between ops")
-        .finish()
+        .finish_after_submit(|| ps.start_cpu_promotion(be_))
         .map_err(|e| be(e.to_string()))?;
     ps.drain()?; // fences already signaled (queue idle) — releases their transient objects
+    ps.wait_cpu_promotion(be_)?;
     ps.cursor = 0;
     ps.tape_cursor = 0;
     clear_frozen_moe_lut_slots(be_);
-    *rec = Some(be_.recorder()?);
+    let fresh = be_.recorder()?;
+    ps.acquire_cpu_promotion(&fresh);
+    *rec = Some(fresh);
     if let Some(elapsed) = infr_core::pager_profile::elapsed(sync_t0) {
         infr_core::pager_profile::record_paging_sync_wait(elapsed);
     }
@@ -9518,6 +10152,7 @@ fn stage_dense_linear<'a>(
     be_: &'a VulkanBackend,
     rec: &mut Option<Recorder<'a>>,
     ps: &mut PagedStream,
+    pool: &ScratchPool,
     wid: usize,
 ) -> Result<u64> {
     loop {
@@ -9550,7 +10185,7 @@ fn stage_dense_linear<'a>(
                     .arena_stream_barrier();
                 return Ok(arena_addr);
             }
-            None => rotate_stream(be_, rec, ps)?,
+            None => rotate_stream(be_, rec, ps, pool)?,
         }
     }
 }
@@ -9590,6 +10225,9 @@ fn stage_and_window<'a>(
     }
     let mut guard = be_.moe_pager().lock().unwrap();
     let sess = guard.as_mut().expect("paged execution requires a session");
+    if ps.small_m_lut && !scan && lut_ids.len() < n_expert {
+        return sess.routed_lut_window(&mut ps.tape_cursor, buf_id, n_expert, lut_ids);
+    }
     sess.protect_lut_ids(buf_id, lut_ids)?;
     sess.lut_window(&mut ps.tape_cursor, buf_id, n_expert)
 }
@@ -9598,7 +10236,7 @@ fn stage_and_window<'a>(
 /// load-time-contiguous layer; the other role windows reuse it. No expert pager/LRU is touched.
 fn stage_layer_and_window<'a>(
     be_: &'a VulkanBackend,
-    _rec: &mut Option<Recorder<'a>>,
+    rec: &mut Option<Recorder<'a>>,
     ps: &mut PagedStream,
     buf_id: usize,
     n_expert: usize,
@@ -9609,6 +10247,11 @@ fn stage_layer_and_window<'a>(
         sess.enter_prefill_layer(be_)?;
     }
     let already_current = ps.wait_prefill_layer(be_, buf_id)?;
+    if let Some(value) = ps.prefill_transfer_waits.remove(&buf_id) {
+        rec.as_ref()
+            .expect("segment always Some while staging a Prefill layer")
+            .wait_for_dedicated_transfer(value);
+    }
     let mut guard = be_.moe_pager().lock().unwrap();
     let sess = guard.as_mut().expect("paged execution requires a session");
     if !already_current {
@@ -9637,8 +10280,12 @@ fn prefetch_next_moe_layer<'a>(
     be_: &'a VulkanBackend,
     rec: &mut Option<Recorder<'a>>,
     ps: &mut PagedStream,
+    pool: &ScratchPool,
     current_gate_id: usize,
+    next_chunk: bool,
 ) -> Result<()> {
+    ps.finish_cpu_miss(be_, pool)?;
+    ps.wait_cpu_promotion(be_)?;
     ps.poll_prefill_uploads(be_)?;
     // Dense streaming can attach staging-ring lifetime to this same segment. A transfer endpoint
     // that cannot run on the existing host producer also takes the synchronous correctness path.
@@ -9660,7 +10307,7 @@ fn prefetch_next_moe_layer<'a>(
         let mut guard = be_.moe_pager().lock().unwrap();
         let sess = guard.as_mut().expect("paged execution requires a session");
         sess.enter_prefill_layer(be_)?;
-        sess.prefill_successors(current_gate_id)?
+        sess.prefill_successors(current_gate_id, next_chunk)?
     };
     let (initial_jobs, replacement_job) = {
         let mut guard = be_.moe_pager().lock().unwrap();
@@ -9694,10 +10341,10 @@ fn prefetch_next_moe_layer<'a>(
         }
     } else {
         for job in initial_jobs {
-            ps.enqueue_prefill_upload(job, None)?;
+            ps.enqueue_prefill_upload(be_, job, None)?;
         }
         if let Some(job) = replacement_job {
-            ps.enqueue_prefill_upload(job, Some(segment))?;
+            ps.enqueue_prefill_upload(be_, job, Some(segment))?;
         } else {
             retain_prefill_compute(ps, segment)?;
         }
@@ -10225,6 +10872,39 @@ fn execute_paged_moe<'a>(
     } else {
         None
     };
+    let mut cpu_miss_input = None;
+    let cpu_cfg = &be_.cfg().kernels.vulkan;
+    let cpu_input_eligible = cpu_cfg.cpu_miss_threads != 0
+        && crate::cpu_miss::within_limit(1, cpu_cfg.cpu_miss_max)
+        && crate::cpu_miss::supported(cpu_cfg.cpu_miss_threads)
+        && crate::cpu_miss::geometry(rows, 1, ne, nff, gdt, udt, ddt)
+        && (gdt != infr_core::DType::Iq3S || cpu_cfg.cpu_miss_iq3)
+        && cpu_miss_decode_graph(graph)
+        && !*fused_gate_up
+        && !*weight_before
+        && graph.desc(*x).dtype == infr_core::DType::F32
+        && swiglu_clamp.is_none()
+        && matches!(act, Activation::Silu)
+        && {
+            let roles = [
+                buffer_identity(r(*gate_exps)?),
+                buffer_identity(r(*up_exps)?),
+                buffer_identity(r(*down_exps)?),
+            ];
+            let guard = be_.moe_pager().lock().unwrap();
+            let sess = guard.as_ref().unwrap();
+            crate::cpu_miss::decode_layer(sess.registered_layer(roles[0], n_expert)?)
+                && sess.cpu_miss_source_supported(roles, true)
+        };
+    if cpu_input_eligible && cpu_cfg.cpu_miss_input_tap && !has_bias && !hash {
+        cpu_miss_input = Some(pooled_usage(
+            pool,
+            be_,
+            "moe_cpu_miss_input",
+            ne * 4,
+            BufferUsage::Readback,
+        )?);
+    }
     {
         let rc = rec.as_ref().expect("segment always Some between ops");
         let rxb = r(*router_x)?;
@@ -10245,7 +10925,10 @@ fn execute_paged_moe<'a>(
             Some(id) => r(*id)?,
             None => pool[dummy_key.as_ref().expect("absent hash ids allocated dummy")].as_ref(),
         };
-        rc.moe_topk(
+        let tap = cpu_miss_input
+            .map(|key| -> Result<_> { Ok((r(*x)?, pool[&key].as_ref())) })
+            .transpose()?;
+        rc.moe_topk_with_tap(
             pool[&logits].as_ref(),
             pool[&ids_key].as_ref(),
             pool[&wts].as_ref(),
@@ -10261,6 +10944,7 @@ fn execute_paged_moe<'a>(
             *n_expert_groups_used,
             hash_buf,
             hash,
+            tap,
         );
         if let Some(shared) = shared {
             // One scalar raw gate logit per row. It is independent of top-k and remains a tiny
@@ -10285,6 +10969,8 @@ fn execute_paged_moe<'a>(
         .as_ref()
         .expect("paged execution requires a session")
         .registered_layer(gate_id, n_expert)?;
+    let _timeline_layer = infr_core::timeline::layer(current_layer as usize);
+    let _timeline_experts = infr_core::timeline::span("expert_layer");
     if let Some((hint, _, _)) = prefetch_gpu.as_ref() {
         if hint.source_layer != current_layer {
             return Err(be(format!(
@@ -10303,28 +10989,50 @@ fn execute_paged_moe<'a>(
     // Layer-LOCAL ids to stage; empty = residency already guaranteed (all-resident inline path).
     let mut stage_ids: Vec<u32> = Vec::new();
     let mut stream_synced_for_cpu_push = false;
+    let mut cpu_miss_result = None;
+    // A submitted promotion can still own mapped slots; drain before any residency changes.
+    // Unsubmitted result copies retain their sources until sync_stream submits them.
+    ps.finish_cpu_miss(be_, pool)?;
+    ps.wait_cpu_promotion(be_)?;
+    ps.acquire_cpu_promotion(rec.as_ref().expect("ambient segment exists"));
+    if !layer_stream && !touch_all {
+        let changed = be_
+            .moe_pager()
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("paged execution requires a session")
+            .enter_decode();
+        if changed && infr_core::pager_profile::active() {
+            tracing::info!(
+                rows,
+                n_used,
+                n_expert,
+                "[moe-prefill] arena switched to decode-LRU"
+            );
+        }
+    }
+    // Keep workspace preparation off the router-readback critical path, but never allocate
+    // before the previous promotion drained or before the Prefill arena changed ownership.
+    let small_workspace = if paged_mmq_scratch_requests(be_, graph, op).is_none() {
+        Some(PagedSmallScratch {
+            gbuf: pooled(pool, be_, "moe_paged_g", physical_slots * gu_width * 4)?,
+            ubuf: if *fused_gate_up {
+                None
+            } else {
+                Some(pooled(pool, be_, "moe_paged_u", physical_slots * nff * 4)?)
+            },
+            abuf: pooled(pool, be_, "moe_paged_a", physical_slots * nff * 4)?,
+            ybuf: pooled(pool, be_, "moe_paged_y", physical_slots * ne * 4)?,
+        })
+    } else {
+        None
+    };
     if layer_stream {
         // Whole-layer staging below bypasses expert-level LRU bookkeeping entirely.
     } else if touch_all {
         stage_ids = (0..n_expert as u32).collect();
     } else {
-        // A preceding prefill may have reinterpreted the arena as contiguous layer storage.
-        // The prior execute drained before returning, so it is safe to invalidate its mappings.
-        {
-            let mut guard = be_.moe_pager().lock().unwrap();
-            let changed = guard
-                .as_mut()
-                .expect("paged execution requires a session")
-                .enter_decode();
-            if changed && infr_core::pager_profile::active() {
-                tracing::info!(
-                    rows,
-                    n_used,
-                    n_expert,
-                    "[moe-prefill] arena switched to decode-LRU"
-                );
-            }
-        }
         let inline_ok = {
             let guard = be_.moe_pager().lock().unwrap();
             let sess = guard
@@ -10349,7 +11057,34 @@ fn execute_paged_moe<'a>(
             // Split: the router's routing is host-unknown and some routed expert may be absent —
             // block once, read the ids off the mapped Staging buffer, stage exactly the routed
             // set into the fresh ambient segment (which then stays open for the layers after).
-            sync_stream(be_, rec, ps)?;
+            if cpu_input_eligible {
+                let key = if let Some(key) = cpu_miss_input {
+                    key
+                } else {
+                    pooled_usage(
+                        pool,
+                        be_,
+                        "moe_cpu_miss_input",
+                        ne * 4,
+                        BufferUsage::Readback,
+                    )?
+                };
+                cpu_miss_result = Some(pooled_usage(
+                    pool,
+                    be_,
+                    "moe_cpu_miss_result",
+                    ne * 4 * cpu_cfg.cpu_miss_max,
+                    BufferUsage::Staging,
+                )?);
+                let _ = be_.cpu_miss_worker();
+                if cpu_miss_input.is_none() {
+                    let rc = rec.as_ref().expect("segment always Some between ops");
+                    rc.label_next("cpu_miss_input_copy");
+                    rc.copy(r(*x)?, 0, pool[&key].as_ref(), 0, ne * 4);
+                }
+                cpu_miss_input = Some(key);
+            }
+            sync_stream(be_, rec, ps, pool)?;
             stream_synced_for_cpu_push = true;
             if close_active_prefetch {
                 let value = finish_decode_prefetch_target(be_, current_layer)?;
@@ -10361,15 +11096,17 @@ fn execute_paged_moe<'a>(
                 active_prefetch_finished = true;
             }
             stage_ids.resize(n_slots, 0);
+            let readback_span = infr_core::timeline::span("router_readback");
             be_.download(
                 pool[&ids_key].as_ref(),
                 bytemuck::cast_slice_mut(stage_ids.as_mut_slice()),
             )
             .map_err(|e| be(e.to_string()))?;
+            drop(readback_span);
         }
     }
     if (prefetch_gpu.is_some() || close_active_prefetch) && !stream_synced_for_cpu_push {
-        sync_stream(be_, rec, ps)?;
+        sync_stream(be_, rec, ps, pool)?;
         stream_synced_for_cpu_push = true;
     }
     if close_active_prefetch && !active_prefetch_finished {
@@ -10394,12 +11131,11 @@ fn execute_paged_moe<'a>(
     // drain earlier arena readers before overwriting LRU slots. Normal Prefill uses fenced dynamic
     // lanes; Decode already synced above in order to read router ids.
     if !layer_stream && !stage_ids.is_empty() && !stream_synced_for_cpu_push {
-        sync_stream(be_, rec, ps)?;
+        sync_stream(be_, rec, ps, pool)?;
     }
 
-    // Acquire this op's reusable MoE workspace before freezing its LUT addresses. Phase-level
-    // preflight covers the common graph-wide buffers, while frozen-slot protection below makes any
-    // genuinely lazy later allocation preserve addresses already recorded into the command stream.
+    // Workspace acquisition is below only for batched Prefill. Small-m workspace was acquired
+    // before router readback, outside the host-dependent launch interval.
     let mmq_requests = paged_mmq_scratch_requests(be_, graph, op);
     let moe_scratch = if let Some(requests) = mmq_requests {
         let mut keys = pooled_batch(pool, be_, &requests)?.into_iter();
@@ -10426,21 +11162,28 @@ fn execute_paged_moe<'a>(
             ye: next(),
         })
     } else {
-        PagedMoeScratch::Small(PagedSmallScratch {
-            gbuf: pooled(pool, be_, "moe_paged_g", physical_slots * gu_width * 4)?,
-            ubuf: if *fused_gate_up {
-                None
-            } else {
-                Some(pooled(pool, be_, "moe_paged_u", physical_slots * nff * 4)?)
-            },
-            abuf: pooled(pool, be_, "moe_paged_a", physical_slots * nff * 4)?,
-            ybuf: pooled(pool, be_, "moe_paged_y", physical_slots * ne * 4)?,
-        })
+        PagedMoeScratch::Small(small_workspace.expect("small-m workspace prepared before routing"))
     };
+    let measured_decode_rows = (ne == 2560
+        && nff == 640
+        && n_expert == 512
+        && n_used == 10
+        && matches!(gdt, infr_core::DType::Iq2S | infr_core::DType::Iq3S)
+        && udt == gdt
+        && ddt == infr_core::DType::Iq4Nl
+        && !*fused_gate_up
+        && !*weight_before)
+        .then(|| decode_token_rows(graph))
+        .flatten();
+    ps.small_m_lut = matches!(&moe_scratch, PagedMoeScratch::Small(_))
+        && be_.use_decode_sparse_lut(rows, measured_decode_rows, graph.mtp_verify);
     let mut active_mask = all_active_mask;
     let mut row_mask_bank = MOE_ROW_MASK_NONE;
     let mut role_batches_preopened = false;
     let mut promotion_probe = None;
+    let mut cpu_miss_job = None;
+    let mut cpu_promoted = false;
+    let mut narrow_hit_activation = false;
     // Small-m hit-first schedule: launch complete resident Gate/Up/Down triplets while every
     // missing triplet is promoted. A scalar decode uses the original push-constant mask; a short
     // multi-row batch appends one mask per row for each half to the immutable ids buffer. The
@@ -10504,11 +11247,71 @@ fn execute_paged_moe<'a>(
                 )
                 .map_err(|e| be(e.to_string()))?;
             }
+            // Full-RAM computation does not admit/overwrite GPU cache slots. Start it before
+            // LRU maintenance and command recording, which can overlap the CPU's GU phase.
+            let cpu_cfg = &be_.cfg().kernels.vulkan;
+            if let (true, Some(cpu_miss_input)) = (
+                cpu_input_eligible
+                    && crate::cpu_miss::within_limit(miss_count, cpu_cfg.cpu_miss_max),
+                cpu_miss_input,
+            ) {
+                if let Some(worker) = be_.cpu_miss_worker() {
+                    let slots: Vec<_> = (0..n_used)
+                        .filter(|&slot| miss_masks[0] & (1 << slot) != 0)
+                        .collect();
+                    let experts = be_
+                        .moe_pager()
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .cpu_miss_experts(
+                            [gate_id, up_id, down_id],
+                            &miss_ids[..miss_count],
+                            &slots,
+                            true,
+                        );
+                    if let Some(experts) = experts {
+                        if ps.cpu_miss_controller.is_none() {
+                            ps.cpu_miss_controller = worker.controller_guard();
+                        }
+                        let result_buf =
+                            cpu_miss_result.expect("input/result scratch prepared together");
+                        let input_span = infr_core::timeline::span("cpu_miss_input");
+                        let mut input = vec![0.0f32; ne];
+                        be_.download(
+                            pool[&cpu_miss_input].as_ref(),
+                            bytemuck::cast_slice_mut(&mut input),
+                        )?;
+                        drop(input_span);
+                        if !cpu_cfg.cpu_miss_validate {
+                            debug_assert!(ps.cpu_promotion.is_none());
+                            ps.cpu_promotion = Some(CpuMissPromotion {
+                                roles: [gate_id, up_id, down_id],
+                                ids: miss_ids[..miss_count].to_vec(),
+                                layer: current_layer as usize,
+                                sources: Vec::new(),
+                                started: false,
+                                pending: None,
+                            });
+                            cpu_promoted = true;
+                        }
+                        cpu_miss_job = Some((
+                            worker.submit(experts, gdt, input),
+                            result_buf,
+                            miss_masks[0],
+                        ));
+                    }
+                }
+            }
             let (role_batches_open, hit_push) = {
                 let mut guard = be_.moe_pager().lock().unwrap();
                 let sess = guard.as_mut().expect("paged execution requires a session");
                 let role_batches_open = sess.begin_role_batches(&[gate_id, up_id, down_id])?;
-                let push = if role_batches_open && hit_count > 0 {
+                let push = if role_batches_open && ps.small_m_lut {
+                    sess.touch_routed_hits(&[gate_id, up_id, down_id], &hit_ids[..hit_count])?;
+                    None
+                } else if role_batches_open && hit_count > 0 {
                     Some(sess.push_roles_cpu(
                         be_,
                         &[
@@ -10529,39 +11332,67 @@ fn execute_paged_moe<'a>(
                 push.complete_without_recorder(be_)?;
             }
             if role_batches_open {
-                let gate_hit_w = stage_and_window(
-                    be_,
-                    rec,
-                    ps,
-                    gate_id,
-                    &[],
-                    &hit_ids[..hit_count],
-                    n_expert,
-                    false,
-                    true,
-                )?;
-                let up_hit_w = stage_and_window(
-                    be_,
-                    rec,
-                    ps,
-                    up_id,
-                    &[],
-                    &hit_ids[..hit_count],
-                    n_expert,
-                    false,
-                    true,
-                )?;
-                let down_hit_w = stage_and_window(
-                    be_,
-                    rec,
-                    ps,
-                    down_id,
-                    &[],
-                    &hit_ids[..hit_count],
-                    n_expert,
-                    false,
-                    true,
-                )?;
+                let sparse_hit_windows = if ps.small_m_lut {
+                    let mut guard = be_.moe_pager().lock().unwrap();
+                    let sess = guard.as_mut().expect("paged execution requires a session");
+                    let mut windows = [0u32; 3];
+                    for (role, buf) in [gate_id, up_id, down_id].into_iter().enumerate() {
+                        windows[role] = sess.routed_lut_window(
+                            &mut ps.tape_cursor,
+                            buf,
+                            n_expert,
+                            &hit_ids[..hit_count],
+                        )?;
+                    }
+                    Some(windows)
+                } else {
+                    None
+                };
+                let gate_hit_w = if let Some(windows) = sparse_hit_windows {
+                    windows[0]
+                } else {
+                    stage_and_window(
+                        be_,
+                        rec,
+                        ps,
+                        gate_id,
+                        &[],
+                        &hit_ids[..hit_count],
+                        n_expert,
+                        false,
+                        true,
+                    )?
+                };
+                let up_hit_w = if let Some(windows) = sparse_hit_windows {
+                    windows[1]
+                } else {
+                    stage_and_window(
+                        be_,
+                        rec,
+                        ps,
+                        up_id,
+                        &[],
+                        &hit_ids[..hit_count],
+                        n_expert,
+                        false,
+                        true,
+                    )?
+                };
+                let down_hit_w = if let Some(windows) = sparse_hit_windows {
+                    windows[2]
+                } else {
+                    stage_and_window(
+                        be_,
+                        rec,
+                        ps,
+                        down_id,
+                        &[],
+                        &hit_ids[..hit_count],
+                        n_expert,
+                        false,
+                        true,
+                    )?
+                };
                 let PagedMoeScratch::Small(scratch) = &moe_scratch else {
                     unreachable!("hit-first path always uses small-m scratch")
                 };
@@ -10574,9 +11405,15 @@ fn execute_paged_moe<'a>(
                     scratch.ybuf,
                 );
                 let rec2 = rec.as_ref().expect("segment always Some between ops");
-                rec2.zero(pool[&gbuf].as_ref(), physical_slots * gu_width);
-                rec2.zero(pool[&ubuf].as_ref(), physical_slots * nff);
-                rec2.zero(pool[&ybuf].as_ref(), physical_slots * ne);
+                narrow_hit_activation = rows == 1
+                    && miss_count == 1
+                    && nff.is_multiple_of(64)
+                    && matches!(act, Activation::Silu);
+                if !narrow_hit_activation {
+                    rec2.zero(pool[&gbuf].as_ref(), physical_slots * gu_width);
+                    rec2.zero(pool[&ubuf].as_ref(), physical_slots * nff);
+                }
+                // Hit Down and miss Down/result-copy cover every routed/shared output slot.
                 rec2.arena_stream_barrier();
                 let xb = r(*x)?;
                 let first_mask = if row_hit_masks {
@@ -10633,6 +11470,14 @@ fn execute_paged_moe<'a>(
                 }
                 let n_act = physical_slots * nff;
                 match act {
+                    Activation::Silu if narrow_hit_activation => rec2.silu_mul_masked(
+                        pool[&gbuf].as_ref(),
+                        pool[&ubuf].as_ref(),
+                        pool[&abuf].as_ref(),
+                        nff,
+                        first_mask,
+                        *swiglu_clamp,
+                    ),
                     Activation::Silu => rec2.silu_mul(
                         pool[&gbuf].as_ref(),
                         pool[&ubuf].as_ref(),
@@ -10685,7 +11530,7 @@ fn execute_paged_moe<'a>(
                         first_row_mask_bank,
                     );
                 }
-                promotion_probe = Some(submit_prefill_compute(rec, ps)?);
+                promotion_probe = Some(submit_prefill_compute(be_, rec, ps, pool)?);
                 let fresh = be_.recorder()?;
                 fresh.seed_barrier();
                 fresh.arena_stream_barrier();
@@ -10710,8 +11555,45 @@ fn execute_paged_moe<'a>(
     rec.as_ref()
         .expect("segment always Some between ops")
         .arena_stream_barrier();
+    let down_overlap = be_.use_decode_down_overlap(
+        rows,
+        graph
+            .sequence_spans
+            .iter()
+            .map(|span| span.start_pos)
+            .min()
+            .unwrap_or(0),
+    ) && !layer_stream
+        && cpu_miss_job.is_none()
+        && graph.independent_rows
+        && decode_token_rows(graph) == Some(rows)
+        && (2..=3).contains(&rows)
+        && matches!(&moe_scratch, PagedMoeScratch::Small(_))
+        && !*fused_gate_up
+        && !*weight_before
+        && swiglu_clamp.is_none()
+        && matches!(act, Activation::Silu)
+        && ne == 2560
+        && nff == 640
+        && !stage_ids.is_empty()
+        && stage_ids.len() < u32::BITS as usize
+        && {
+            let guard = be_.moe_pager().lock().unwrap();
+            let sess = guard.as_ref().expect("paged execution requires a session");
+            sess.down_overlap_supported(gate_id, up_id, down_id)
+                && sess.routed_roles_resident_mask(&[down_id], &stage_ids)?
+                    != (1u32 << stage_ids.len()) - 1
+        };
+    let mut pipelined_gate_up = None;
     let roles_batched = if role_batches_preopened {
         true
+    } else if down_overlap {
+        be_.moe_pager()
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("paged execution requires a session")
+            .begin_role_batches(&[gate_id, up_id, down_id])?
     } else if !layer_stream && !stage_ids.is_empty() && !*fused_gate_up {
         let mut guard = be_.moe_pager().lock().unwrap();
         let sess = guard.as_mut().expect("paged execution requires a session");
@@ -10721,7 +11603,7 @@ fn execute_paged_moe<'a>(
     };
     // Resolve every role under its size pool's epoch, then combine all full-RAM, bounded-RAM or
     // SSD-backed moves into one transfer batch.
-    if roles_batched {
+    if roles_batched && !cpu_promoted {
         let overlap = if let Some(probe) = promotion_probe {
             if infr_core::pager_profile::active() {
                 Some((
@@ -10735,21 +11617,24 @@ fn execute_paged_moe<'a>(
         } else {
             None
         };
+        let prepare_span = infr_core::timeline::span("expert_prepare");
         let push = {
             let mut guard = be_.moe_pager().lock().unwrap();
+            let roles = [
+                (gate_id, stage_ids.as_slice()),
+                (up_id, stage_ids.as_slice()),
+                (down_id, stage_ids.as_slice()),
+            ];
             guard
                 .as_mut()
                 .expect("paged execution requires a session")
                 .push_roles_cpu(
                     be_,
-                    &[
-                        (gate_id, stage_ids.as_slice()),
-                        (up_id, stage_ids.as_slice()),
-                        (down_id, stage_ids.as_slice()),
-                    ],
+                    if down_overlap { &roles[..2] } else { &roles },
                     touch_all,
                 )?
         };
+        drop(prepare_span);
         let bytes = push.bytes();
         let prepared_profile = if let Some((probe, compute_live_at_start, started)) = overlap {
             Some((
@@ -10762,7 +11647,9 @@ fn execute_paged_moe<'a>(
         } else {
             None
         };
+        let enqueue_span = infr_core::timeline::span("expert_enqueue");
         push.record(rec.as_ref().expect("segment always Some between ops"))?;
+        drop(enqueue_span);
         if let Some((
             probe,
             compute_live_at_start,
@@ -10780,12 +11667,85 @@ fn execute_paged_moe<'a>(
                 enqueue_started.elapsed(),
             );
         }
+        if down_overlap {
+            let gate_w = stage_and_window(
+                be_,
+                rec,
+                ps,
+                gate_id,
+                &[],
+                &stage_ids,
+                n_expert,
+                false,
+                true,
+            )?;
+            let up_w =
+                stage_and_window(be_, rec, ps, up_id, &[], &stage_ids, n_expert, false, true)?;
+            let PagedMoeScratch::Small(scratch) = &moe_scratch else {
+                unreachable!("Down overlap requires small-m scratch")
+            };
+            let ubuf = scratch.ubuf.expect("Down overlap excludes fused Gate/Up");
+            let rc = rec.as_ref().expect("segment always Some between ops");
+            rc.arena_stream_barrier();
+            {
+                let guard = be_.moe_pager().lock().unwrap();
+                let sess = guard.as_ref().expect("paged execution requires a session");
+                for (dt, id, window, shared_w, dst) in [
+                    (gdt, gate_id, gate_w, shared_wgate, scratch.gbuf),
+                    (udt, up_id, up_w, shared_wup, ubuf),
+                ] {
+                    linear_paged_maybe_shared(
+                        rc,
+                        dt,
+                        sess.arena_addr(id)?,
+                        sess.slot_bytes(id)? as u32,
+                        sess.tape(),
+                        pool[&ids_key].as_ref(),
+                        n_used,
+                        window as usize,
+                        shared_w,
+                        r(*x)?,
+                        false,
+                        pool[&dst].as_ref(),
+                        ne,
+                        nff,
+                        rows,
+                        active_mask,
+                        row_mask_bank,
+                    );
+                }
+            }
+            rc.silu_mul(
+                pool[&scratch.gbuf].as_ref(),
+                pool[&ubuf].as_ref(),
+                pool[&scratch.abuf].as_ref(),
+                physical_slots * nff,
+                None,
+            );
+            submit_prefill_compute(be_, rec, ps, pool)?;
+            let fresh = be_.recorder()?;
+            fresh.seed_barrier();
+            fresh.arena_stream_barrier();
+            *rec = Some(fresh);
+            let span = infr_core::timeline::span("expert_down_prepare");
+            let push = be_
+                .moe_pager()
+                .lock()
+                .unwrap()
+                .as_mut()
+                .expect("paged execution requires a session")
+                .push_roles_cpu(be_, &[(down_id, stage_ids.as_slice())], touch_all)?;
+            drop(span);
+            push.record(rec.as_ref().expect("fresh recorder"))?;
+            pipelined_gate_up = Some((gate_w, up_w));
+        }
     }
     let role_stage_ids = if roles_batched {
         &[][..]
     } else {
         stage_ids.as_slice()
     };
+    let cpu_offload = cpu_miss_job.is_some() && !be_.cfg().kernels.vulkan.cpu_miss_validate;
     // The all-resident fast path leaves router ids on the GPU and therefore has no exact CPU list.
     // Protect that layer's complete LUT; every other Decode path protects only routed ids.
     let all_resident_lut_ids =
@@ -10793,7 +11753,11 @@ fn execute_paged_moe<'a>(
     let role_lut_ids = all_resident_lut_ids
         .as_deref()
         .unwrap_or(stage_ids.as_slice());
-    let gate_w = if layer_stream {
+    let gate_w = if cpu_offload {
+        0 // CPU miss outputs do not read routed GPU weights or their LUT windows.
+    } else if let Some((gate, _)) = pipelined_gate_up {
+        gate
+    } else if layer_stream {
         stage_layer_and_window(be_, rec, ps, gate_id, n_expert)?
     } else {
         stage_and_window(
@@ -10808,7 +11772,11 @@ fn execute_paged_moe<'a>(
             roles_batched,
         )?
     };
-    let up_w = if *fused_gate_up {
+    let up_w = if cpu_offload {
+        0
+    } else if let Some((_, up)) = pipelined_gate_up {
+        up
+    } else if *fused_gate_up {
         gate_w // never dispatched (no Up GEMV on the fused shape) — placeholder
     } else if layer_stream {
         stage_layer_and_window(be_, rec, ps, up_id, n_expert)?
@@ -10825,7 +11793,9 @@ fn execute_paged_moe<'a>(
             roles_batched,
         )?
     };
-    let down_w = if layer_stream {
+    let down_w = if cpu_offload {
+        0
+    } else if layer_stream {
         stage_layer_and_window(be_, rec, ps, down_id, n_expert)?
     } else {
         stage_and_window(
@@ -11055,7 +12025,7 @@ fn execute_paged_moe<'a>(
             *weight_before,
         );
         if layer_stream {
-            prefetch_next_moe_layer(be_, rec, ps, gate_id)?;
+            prefetch_next_moe_layer(be_, rec, ps, pool, gate_id, graph.prefill_next_chunk)?;
         }
         return Ok(current_layer); // recorded inline; the ambient segment stays open
     }
@@ -11085,7 +12055,11 @@ fn execute_paged_moe<'a>(
         && udt == infr_core::DType::Iq2Xs
         && ne == 2560
         && nff == 640;
-    if fused_decode_swiglu {
+    if cpu_offload {
+        // Hit+Shared already ran. Their clears/activation must not run again over the miss slots.
+    } else if pipelined_gate_up.is_some() {
+        // Gate/Up and activation were submitted before the independent Down pool upload.
+    } else if fused_decode_swiglu {
         let guard = be_.moe_pager().lock().unwrap();
         let sess = guard.as_ref().expect("checked above");
         rec2.linear_native_id_swiglu_iq2xs_paged(
@@ -11155,6 +12129,14 @@ fn execute_paged_moe<'a>(
         }
         match &ubuf {
             Some(ubuf) => match act {
+                Activation::Silu if narrow_hit_activation => rec2.silu_mul_masked(
+                    pool[&gbuf].as_ref(),
+                    pool[ubuf].as_ref(),
+                    pool[&abuf].as_ref(),
+                    nff,
+                    active_mask,
+                    *swiglu_clamp,
+                ),
                 Activation::Silu => rec2.silu_mul(
                     pool[&gbuf].as_ref(),
                     pool[ubuf].as_ref(),
@@ -11211,7 +12193,7 @@ fn execute_paged_moe<'a>(
         }
     }
     let rec2 = rec.as_ref().expect("segment always Some between ops");
-    {
+    if !cpu_offload {
         let guard = be_.moe_pager().lock().unwrap();
         let sess = guard.as_ref().expect("checked above");
         linear_paged_maybe_shared(
@@ -11234,11 +12216,85 @@ fn execute_paged_moe<'a>(
             row_mask_bank,
         );
     }
+    let mut host_cpu_result = None;
+    if let Some((job, result_buf, miss_mask)) = cpu_miss_job {
+        if be_.cfg().kernels.vulkan.cpu_miss_validate {
+            let wait_span = infr_core::timeline::span("cpu_miss_wait");
+            let output = job.wait()?;
+            drop(wait_span);
+            sync_stream(be_, rec, ps, pool)?;
+            let mut gpu = vec![0.0f32; physical_slots * ne];
+            be_.download(pool[&ybuf].as_ref(), bytemuck::cast_slice_mut(&mut gpu))?;
+            for (index, &slot) in output.slots.iter().enumerate() {
+                for (&cpu, &gpu) in output.values[index * ne..(index + 1) * ne]
+                    .iter()
+                    .zip(&gpu[slot * ne..(slot + 1) * ne])
+                {
+                    if !cpu.is_finite()
+                        || !gpu.is_finite()
+                        || (cpu - gpu).abs() > 0.003 + gpu.abs() * 0.002
+                    {
+                        return Err(be(format!("CPU miss parity failure: layer={current_layer} slot={slot} cpu={cpu} gpu={gpu}")));
+                    }
+                }
+            }
+        } else {
+            let rc = rec.as_ref().expect("segment always Some between ops");
+            rc.arena_stream_barrier();
+            let direct = be_.cfg().kernels.vulkan.cpu_miss_direct_result
+                && crate::as_vk_buf(pool[&ybuf].as_ref())?
+                    .mapped_ptr()
+                    .is_some();
+            let target = if be_.cfg().kernels.vulkan.cpu_miss_host_result
+                && shared.is_some()
+                && miss_mask.count_ones() == 1
+            {
+                debug_assert_eq!(rows, 1);
+                host_cpu_result = Some((result_buf, miss_mask.trailing_zeros() as usize));
+                CpuMissResultTarget::Staging(result_buf)
+            } else if direct {
+                CpuMissResultTarget::Mapped {
+                    key: ybuf,
+                    row_elements: ne,
+                }
+            } else {
+                let mut index = 0;
+                for slot in 0..n_used {
+                    if miss_mask & (1 << slot) == 0 {
+                        continue;
+                    }
+                    rc.copy(
+                        pool[&result_buf].as_ref(),
+                        index * ne * 4,
+                        pool[&ybuf].as_ref(),
+                        slot * ne * 4,
+                        ne * 4,
+                    );
+                    index += 1;
+                }
+                CpuMissResultTarget::Staging(result_buf)
+            };
+            debug_assert!(ps.cpu_miss.is_none());
+            ps.cpu_miss = Some((job, target, current_layer as usize));
+        }
+    }
+    let rec2 = rec.as_ref().expect("segment always Some between ops");
     let dstb = match shared {
         Some(shared) => r(shared.dst)?,
         None => r(*dst)?,
     };
-    if let Some(shared) = shared {
+    if let (Some(shared), Some((result, slot))) = (shared, host_cpu_result) {
+        rec2.moe_accumulate_shared_cpu(
+            pool[&ybuf].as_ref(),
+            pool[&wts].as_ref(),
+            r(shared.gate)?,
+            dstb,
+            pool[&result].as_ref(),
+            ne,
+            n_used,
+            slot,
+        );
+    } else if let Some(shared) = shared {
         rec2.moe_accumulate_shared(
             pool[&ybuf].as_ref(),
             pool[&wts].as_ref(),
@@ -11275,13 +12331,429 @@ fn execute_paged_moe<'a>(
         }
     }
     if layer_stream {
-        prefetch_next_moe_layer(be_, rec, ps, gate_id)?;
+        prefetch_next_moe_layer(be_, rec, ps, pool, gate_id, graph.prefill_next_chunk)?;
+    } else if rows <= MOE_HIT_FIRST_MAX_ROWS
+        && ((cpu_offload && be_.cfg().kernels.vulkan.cpu_miss_early_submit)
+            || (!cpu_offload
+                && be_.use_decode_early_submit(
+                    rows,
+                    if be_.cfg().paging.expert_prefetch {
+                        None
+                    } else {
+                        measured_decode_rows
+                    },
+                    graph.mtp_verify,
+                )))
+    {
+        submit_prefill_compute(be_, rec, ps, pool)?;
+        let fresh = be_.recorder()?;
+        fresh.seed_barrier();
+        fresh.arena_stream_barrier();
+        *rec = Some(fresh);
     }
     Ok(current_layer) // recorded inline; the ambient segment stays open
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires a Vulkan GPU; run explicitly"]
+    fn sparse_routed_lut_validates_hits_and_preserves_expert_indexed_addresses() {
+        use super::*;
+        use crate::pager::{ExpertSource, MoeHostChunkSpec, MoePagerLayout, MoePoolSpec, Role};
+        use infr_core::blockio::{BlockDesc, BlockExtent, BlockIo};
+        struct FixtureIo;
+        impl BlockIo for FixtureIo {
+            fn read_block(&self, desc: &BlockDesc, dst: &mut [u8]) -> Result<()> {
+                dst[..desc.nbytes()].fill(desc.id as u8 + 1);
+                Ok(())
+            }
+        }
+        let be_ = VulkanBackend::new().unwrap();
+        const SLOT: usize = 65536;
+        be_.init_moe_pager(MoePagerLayout {
+            load_reserve_bytes: 0,
+            n_blocks: 2,
+            pools: vec![MoePoolSpec {
+                slot_bytes: SLOT,
+                n_slots: 16,
+                min_enabled_slots: 8,
+            }],
+            host_tier: None,
+            host_store_io: Some(Arc::new(FixtureIo)),
+            dynamic_state_reserve_bytes: 0,
+            dynamic_state_max_allocation_bytes: 0,
+            prefill_min_lane_bytes: 0,
+            runtime_reserve_bytes: 0,
+            host_chunks: vec![MoeHostChunkSpec {
+                base_offset: 0,
+                bytes: SLOT * 6,
+            }],
+            prefill_target_lanes: 1,
+            prefill_cache_bytes: (SLOT * 16) as u64,
+        })
+        .unwrap();
+        let roles = [101, 102, 103];
+        {
+            let mut pager = be_.moe_pager().lock().unwrap();
+            let session = pager.as_mut().unwrap();
+            for (i, role) in [Role::Gate, Role::Up, Role::Down].into_iter().enumerate() {
+                session
+                    .register(
+                        role,
+                        roles[i],
+                        ExpertSource {
+                            bank: Arc::new(vec![0u8; SLOT * 2]),
+                            stride_bytes: SLOT,
+                            layer_base: 0,
+                            host_offset: SLOT * 2 * i,
+                            file: Some(BlockDesc {
+                                id: i as u32,
+                                extents: vec![BlockExtent {
+                                    offset: 0,
+                                    len: SLOT * 2,
+                                }],
+                            }),
+                        },
+                        2,
+                    )
+                    .unwrap();
+            }
+        }
+        {
+            let mut pager = be_.moe_pager().lock().unwrap();
+            let session = pager.as_mut().unwrap();
+            session.begin_role_batches(&roles).unwrap();
+            session
+                .push_roles_cpu(&be_, &roles.map(|role| (role, &[1u32][..])), false)
+                .unwrap()
+                .complete_without_recorder(&be_)
+                .unwrap();
+            session.touch_routed_hits(&roles, &[1, 1]).unwrap();
+            session.touch_routed_hits(&roles, &[]).unwrap();
+            assert!(session.touch_routed_hits(&roles, &[0]).is_err());
+            assert!(session.touch_routed_hits(&roles, &[2]).is_err());
+            assert!(session.touch_routed_hits(&[usize::MAX], &[1]).is_err());
+            assert_eq!(
+                session.routed_roles_resident_mask(&roles, &[0, 1]).unwrap(),
+                0b10
+            );
+            let mut cursor = 0;
+            for role in roles {
+                let dense = session.lut_window(&mut cursor, role, 2).unwrap();
+                let sparse = session
+                    .routed_lut_window(&mut cursor, role, 2, &[1, 1])
+                    .unwrap();
+                let ptr = crate::as_vk_buf(session.tape())
+                    .unwrap()
+                    .mapped_ptr()
+                    .unwrap()
+                    .cast::<u64>();
+                unsafe {
+                    assert_eq!(
+                        ptr.add(dense as usize + 1).read_unaligned(),
+                        ptr.add(sparse as usize + 1).read_unaligned()
+                    );
+                }
+                let previous = cursor;
+                assert!(session
+                    .routed_lut_window(&mut cursor, role, 2, &[0])
+                    .is_err());
+                assert!(session
+                    .routed_lut_window(&mut cursor, role, 2, &[2])
+                    .is_err());
+                assert_eq!(cursor, previous);
+                session
+                    .routed_lut_window(&mut cursor, role, 2, &[])
+                    .unwrap();
+            }
+            session.clear_frozen_lut_slots();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU and AVX2+FMA; run explicitly"]
+    fn deferred_cpu_miss_abort_invalidates_only_promoted_experts_after_drain() {
+        use super::*;
+        use crate::pager::{ExpertSource, MoeHostChunkSpec, MoePagerLayout, MoePoolSpec, Role};
+        use infr_core::blockio::{BlockDesc, BlockExtent, BlockIo};
+        struct FixtureIo;
+        impl BlockIo for FixtureIo {
+            fn read_block(&self, desc: &BlockDesc, dst: &mut [u8]) -> Result<()> {
+                dst[..desc.nbytes()].fill(desc.id as u8 + 1);
+                Ok(())
+            }
+        }
+        let Some(worker) = crate::cpu_miss::Worker::new(4, true) else {
+            return;
+        };
+        let be_ = VulkanBackend::new().unwrap();
+        const SLOT: usize = 65536;
+        be_.init_moe_pager(MoePagerLayout {
+            load_reserve_bytes: 0,
+            n_blocks: 2,
+            pools: vec![MoePoolSpec {
+                slot_bytes: SLOT,
+                n_slots: 16,
+                min_enabled_slots: 8,
+            }],
+            host_tier: None,
+            host_store_io: Some(Arc::new(FixtureIo)),
+            dynamic_state_reserve_bytes: 0,
+            dynamic_state_max_allocation_bytes: 0,
+            prefill_min_lane_bytes: 0,
+            runtime_reserve_bytes: 0,
+            host_chunks: vec![MoeHostChunkSpec {
+                base_offset: 0,
+                bytes: SLOT * 6,
+            }],
+            prefill_target_lanes: 1,
+            prefill_cache_bytes: (SLOT * 16) as u64,
+        })
+        .unwrap();
+        let roles = [101, 102, 103];
+        {
+            let mut pager = be_.moe_pager().lock().unwrap();
+            let session = pager.as_mut().unwrap();
+            for (i, role) in [Role::Gate, Role::Up, Role::Down].into_iter().enumerate() {
+                session
+                    .register(
+                        role,
+                        roles[i],
+                        ExpertSource {
+                            bank: Arc::new(vec![0u8; SLOT * 2]),
+                            stride_bytes: SLOT,
+                            layer_base: 0,
+                            host_offset: SLOT * 2 * i,
+                            file: Some(BlockDesc {
+                                id: i as u32,
+                                extents: vec![BlockExtent {
+                                    offset: 0,
+                                    len: SLOT * 2,
+                                }],
+                            }),
+                        },
+                        2,
+                    )
+                    .unwrap();
+            }
+        }
+        {
+            let mut pager = be_.moe_pager().lock().unwrap();
+            let session = pager.as_mut().unwrap();
+            session.begin_role_batches(&roles).unwrap();
+            session
+                .push_roles_cpu(&be_, &roles.map(|role| (role, &[1u32][..])), false)
+                .unwrap()
+                .complete_without_recorder(&be_)
+                .unwrap();
+            session.touch_routed_hits(&roles, &[1, 1]).unwrap();
+            session.touch_routed_hits(&roles, &[]).unwrap();
+            assert!(session.touch_routed_hits(&roles, &[0]).is_err());
+            assert!(session.touch_routed_hits(&roles, &[2]).is_err());
+            assert!(session.touch_routed_hits(&[usize::MAX], &[1]).is_err());
+            assert_eq!(
+                session.routed_roles_resident_mask(&roles, &[0, 1]).unwrap(),
+                0b10
+            );
+            let mut cursor = 0;
+            assert!(session.cpu_miss_source_supported(roles, true));
+            assert!(!session.cpu_miss_source_supported([roles[0], roles[1], usize::MAX], true));
+            for role in roles {
+                let dense = session.lut_window(&mut cursor, role, 2).unwrap();
+                let sparse = session
+                    .routed_lut_window(&mut cursor, role, 2, &[1, 1])
+                    .unwrap();
+                let ptr = crate::as_vk_buf(session.tape())
+                    .unwrap()
+                    .mapped_ptr()
+                    .unwrap()
+                    .cast::<u64>();
+                unsafe {
+                    assert_eq!(
+                        ptr.add(dense as usize + 1).read_unaligned(),
+                        ptr.add(sparse as usize + 1).read_unaligned()
+                    );
+                }
+                let previous = cursor;
+                assert!(session
+                    .routed_lut_window(&mut cursor, role, 2, &[0])
+                    .is_err());
+                assert!(session
+                    .routed_lut_window(&mut cursor, role, 2, &[2])
+                    .is_err());
+                assert_eq!(cursor, previous);
+                session
+                    .routed_lut_window(&mut cursor, role, 2, &[])
+                    .unwrap();
+            }
+            session.clear_frozen_lut_slots();
+        }
+        for (complete, already_joined) in [(true, true), (false, false), (false, true)] {
+            let mut experts = {
+                let mut pager = be_.moe_pager().lock().unwrap();
+                let session = pager.as_mut().unwrap();
+                session.discard_cpu_miss(roles, &[0]);
+                session.begin_role_batches(&roles).unwrap();
+                let experts = session.cpu_miss_experts(roles, &[0], &[3], true).unwrap();
+                session
+                    .push_roles_cpu(&be_, &roles.map(|role| (role, &[1u32][..])), false)
+                    .unwrap()
+                    .complete_without_recorder(&be_)
+                    .unwrap();
+                experts
+            };
+            be_.moe_pager()
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .prepare_cpu_miss_push(roles, &[0], &mut experts)
+                .unwrap();
+            let mut ps = PagedStream {
+                cpu_promotion_abort: Some(CpuPromotionAbortGuard {
+                    pager: Arc::clone(&be_.moe_pager),
+                    experts: vec![(roles, 0)],
+                    complete,
+                }),
+                cpu_promotion: Some(CpuMissPromotion {
+                    roles,
+                    ids: vec![0],
+                    layer: 8,
+                    sources: Vec::new(),
+                    started: true,
+                    pending: Some(CpuPromotionPending::Push(Some(worker.promote(experts)))),
+                }),
+                ..Default::default()
+            };
+            if already_joined {
+                ps.wait_cpu_promotion(&be_).unwrap();
+            }
+            drop(ps);
+            let pager = be_.moe_pager().lock().unwrap();
+            let session = pager.as_ref().unwrap();
+            assert_eq!(
+                session.routed_roles_resident_mask(&roles, &[0, 1]).unwrap(),
+                if complete { 0b11 } else { 0b10 }
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU; run explicitly"]
+    fn deferred_cpu_miss_fills_staging_before_all_submit_boundaries() {
+        use super::*;
+        use infr_core::backend::{Backend, BufferUsage};
+        let be_ = VulkanBackend::new().unwrap();
+        for (boundary, direct) in ["sync", "hit_first", "rotate", "final"]
+            .into_iter()
+            .flat_map(|boundary| [false, true].map(|direct| (boundary, direct)))
+        {
+            let mut pool = ScratchPool::default();
+            let key = pooled_usage(
+                &mut pool,
+                &be_,
+                "moe_cpu_miss_result",
+                20480,
+                BufferUsage::Staging,
+            )
+            .unwrap();
+            let dst = be_.alloc(20480, BufferUsage::Activations).unwrap();
+            let expected: Vec<f32> = (0..5120).map(|i| i as f32 * 0.001 - 2.0).collect();
+            let values = expected.clone();
+            let mapped_key = if direct {
+                let key = pooled_usage(
+                    &mut pool,
+                    &be_,
+                    "direct_result_y",
+                    8 * 2560 * 4,
+                    BufferUsage::Staging,
+                )
+                .unwrap();
+                be_.upload(
+                    pool[&key].as_ref(),
+                    bytemuck::cast_slice(&vec![-17.0f32; 8 * 2560]),
+                )
+                .unwrap();
+                Some(key)
+            } else {
+                None
+            };
+            let target = mapped_key.map_or(CpuMissResultTarget::Staging(key), |key| {
+                CpuMissResultTarget::Mapped {
+                    key,
+                    row_elements: 2560,
+                }
+            });
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let producer = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                sender
+                    .send(Ok(crate::cpu_miss::Output {
+                        slots: vec![2, 7],
+                        values,
+                        tasks: Vec::new(),
+                        experts: Vec::new(),
+                    }))
+                    .unwrap();
+            });
+            let mut ps = PagedStream::default();
+            ps.ensure_slots(2);
+            ps.cpu_miss = Some((crate::cpu_miss::Job::test_receiver(receiver), target, 8));
+            let mut rec = Some(be_.recorder().unwrap());
+            if let Some(key) = mapped_key {
+                let rc = rec.as_ref().unwrap();
+                rc.arena_stream_barrier();
+                for (index, slot) in [2usize, 7].into_iter().enumerate() {
+                    rc.copy(
+                        pool[&key].as_ref(),
+                        slot * 2560 * 4,
+                        dst.as_ref(),
+                        index * 2560 * 4,
+                        2560 * 4,
+                    );
+                }
+            } else {
+                rec.as_ref()
+                    .unwrap()
+                    .copy(pool[&key].as_ref(), 0, dst.as_ref(), 0, 20480);
+            }
+            match boundary {
+                "sync" => sync_stream(&be_, &mut rec, &mut ps, &pool).unwrap(),
+                "hit_first" => {
+                    submit_prefill_compute(&be_, &mut rec, &mut ps, &pool).unwrap();
+                }
+                "rotate" => rotate_stream(&be_, &mut rec, &mut ps, &pool).unwrap(),
+                _ => {
+                    ps.finish_cpu_miss(&be_, &pool).unwrap();
+                    rec.take().unwrap().finish().unwrap();
+                }
+            }
+            if let Some(rec) = rec.take() {
+                rec.discard().unwrap();
+            }
+            ps.drain().unwrap();
+            producer.join().unwrap();
+            assert!(ps.cpu_miss.is_none());
+            let mut actual = vec![0.0f32; 5120];
+            be_.download(dst.as_ref(), bytemuck::cast_slice_mut(&mut actual))
+                .unwrap();
+            assert_eq!(
+                actual, expected,
+                "submit boundary {boundary}, direct={direct}"
+            );
+            if let Some(key) = mapped_key {
+                let mut whole = vec![0.0f32; 8 * 2560];
+                be_.download(pool[&key].as_ref(), bytemuck::cast_slice_mut(&mut whole))
+                    .unwrap();
+                for (slot, values) in whole.chunks_exact(2560).enumerate() {
+                    if ![2, 7].contains(&slot) {
+                        assert!(values.iter().all(|&v| v == -17.0));
+                    }
+                }
+            }
+        }
+    }
     use super::*;
     use infr_core::graph::Graph;
     use infr_core::tensor::TensorDesc;
@@ -11309,6 +12781,29 @@ mod tests {
 
         graph.sequence_spans[1].rows = 2;
         assert_eq!(decode_token_rows(&graph), None);
+    }
+
+    #[test]
+    fn cpu_miss_decode_excludes_one_row_verify_and_parallel_decode() {
+        let mut graph = Graph::new();
+        assert!(cpu_miss_decode_graph(&graph));
+        graph.mtp_verify = true;
+        assert!(!cpu_miss_decode_graph(&graph));
+        graph.mtp_verify = false;
+        graph.independent_rows = true;
+        graph.sequence_spans = vec![
+            SequenceSpan {
+                row_start: 0,
+                rows: 1,
+                start_pos: 30_000,
+            },
+            SequenceSpan {
+                row_start: 1,
+                rows: 1,
+                start_pos: 31_000,
+            },
+        ];
+        assert!(!cpu_miss_decode_graph(&graph));
     }
 
     #[test]
@@ -11387,9 +12882,95 @@ mod tests {
         assert_eq!(qsa_indexer_blocks(0, Some(&spans), 4), 16_384);
         assert_eq!(qsa_indexer_blocks(65_536, None, 4), 16_384);
         assert_eq!(
-            qsa_indexer_score_capacity_bytes(3_072, 16_384, 40_960 * 128, 128),
+            qsa_indexer_score_capacity_bytes(3_072, 16_384, 40_960 * 128, 128, None),
             3_072 * 40_960 * 4,
         );
+    }
+
+    #[test]
+    fn qsa_prefill_scores_price_transaction_depth_and_guard_current_blocks() {
+        for target in [30_000, 32_768, 32_769, 90_000, 150_000, 163_840] {
+            for rows in [256, 512, 1024, 3072, 4096, 5120] {
+                let blocks = target / 4;
+                assert_eq!(
+                    qsa_indexer_score_capacity_bytes(rows, 1024, 40_960 * 128, 128, Some(blocks)),
+                    rows as usize * blocks * 4
+                );
+            }
+        }
+        assert_eq!(
+            qsa_indexer_score_capacity_bytes(512, 8192, 40_960 * 128, 128, Some(1024)),
+            512 * 8192 * 4
+        );
+        assert_eq!(
+            qsa_indexer_score_capacity_bytes(512, 8192, 40_960 * 128, 128, Some(80_000)),
+            512 * 40_960 * 4
+        );
+    }
+
+    #[test]
+    fn qsa_transaction_scratch_stays_stable_across_chunks_and_mixed_lanes() {
+        let rows = 512;
+        let mut graph = Graph::new();
+        let q = graph.input(TensorDesc::new(vec![rows, 4, 128], DType::F16));
+        let k_cache = graph.input(TensorDesc::new(vec![163840, 128], DType::F16));
+        let block_cache = graph.input(TensorDesc::new(vec![40960, 128], DType::F32));
+        let k_norm = graph.input(TensorDesc::new(vec![128], DType::F32));
+        let dst = graph.output(TensorDesc::new(vec![rows, 512], DType::I32));
+        graph.push(Op::QsaIndexer {
+            q,
+            k_cache,
+            block_cache,
+            k_norm,
+            positions4: None,
+            dst,
+            rows: rows as u32,
+            kv_len: 8192,
+            compress_from: 0,
+            n_head: 4,
+            head_dim: 128,
+            top_blocks: 512,
+            ratio: 4,
+            rope_dim: 64,
+            theta: 10000.0,
+            eps: 1e-6,
+            scale: 1.0,
+            sections: [0; 4],
+        });
+        let scores = |graph: &Graph| {
+            paged_qsa_scratch_requests(graph)
+                .unwrap()
+                .into_iter()
+                .find(|(tag, _)| *tag == "qsa_indexer_scores")
+                .unwrap()
+                .1
+        };
+        for target in [30_000, 90_000, 150_000] {
+            graph.prefill_target_tokens = Some(target);
+            for depth in [8192, target] {
+                if let Op::QsaIndexer { kv_len, .. } = &mut graph.ops[0] {
+                    *kv_len = depth as u32;
+                }
+                assert_eq!(scores(&graph), rows * (target / 4) * 4);
+            }
+        }
+        graph.independent_rows = true;
+        graph.sequence_spans = vec![
+            SequenceSpan {
+                row_start: 0,
+                rows: 256,
+                start_pos: 30000,
+            },
+            SequenceSpan {
+                row_start: 256,
+                rows: 256,
+                start_pos: 90000,
+            },
+        ];
+        graph.prefill_target_tokens = Some(90_256);
+        assert_eq!(scores(&graph), rows * (90_256 / 4) * 4);
+        graph.prefill_target_tokens = None;
+        assert_eq!(scores(&graph), rows * 40960 * 4);
     }
 
     #[test]
@@ -11760,7 +13341,7 @@ mod tests {
     }
 
     #[test]
-    fn service_client_transition_releases_the_whole_inactive_phase() {
+    fn explicit_runtime_release_frees_the_whole_phase() {
         let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut arena = RuntimePhaseArena::default();
         let layout = vec![Some(4)];
@@ -11818,6 +13399,34 @@ mod tests {
         assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert!(arena.scratch[0].is_some());
         assert!(arena.pool.buffers.is_empty());
+    }
+
+    #[test]
+    fn runtime_phase_auxiliary_reuses_high_water_and_bounds_topology_growth() {
+        let mut arena = RuntimePhaseArena::default();
+        let layout = vec![Some(64), None];
+        arena.begin_execute(RuntimePhase::Auxiliary, &layout);
+        arena.install_scratch(&layout, vec![Some(Box::new(TestBuffer(64))), None]);
+        arena
+            .pool
+            .buffers
+            .insert(("aux_pool", 64), Box::new(TestBuffer(64)));
+        for layout in [vec![Some(64), None], vec![Some(32), None]] {
+            let start = arena.begin_execute(RuntimePhase::Auxiliary, &layout);
+            assert!(start.scratch_reused);
+            assert!(start.reset_retained_scratch);
+            assert_eq!(arena.pool.buffers.len(), 1);
+        }
+        let start = arena.begin_execute(RuntimePhase::Auxiliary, &vec![Some(128), None]);
+        assert!(!start.scratch_reused);
+        assert!(arena.pool.buffers.is_empty());
+        let changed = vec![None, Some(64)];
+        arena.begin_execute(RuntimePhase::Auxiliary, &changed);
+        assert!(arena.scratch.iter().all(Option::is_none));
+        assert!(
+            arena.parked_scratch.is_empty(),
+            "auxiliary clients retain just one graph family"
+        );
     }
 
     #[test]
@@ -12791,10 +14400,9 @@ mod tests {
         }
     }
 
-    /// A one-op `GatedRmsNorm` graph (fused per-head RMSNorm + SiLU gate, qwen35 DeltaNet z-gate)
-    /// through the seam must match `rmsnorm(x,w) * silu(z)` computed in two host passes — i.e.
-    /// the SAME thing the split `QkNorm`→`GatedAct` pair produces. Multi-head (n_head=2) shape so
-    /// the per-head reduction boundary is exercised, not just a single-row rmsnorm.
+    /// A one-op `GatedRmsNorm` graph through the seam must match the split
+    /// `QkNorm`→`GatedAct` pair for both supported gates. Multi-row and multi-head geometry
+    /// exercises the per-head reduction boundaries used by Decode and Prefill.
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn gated_rmsnorm_graph_matches_host() {
@@ -12806,58 +14414,64 @@ mod tests {
         let x: Vec<f32> = (0..rows * dim).map(|i| i as f32 * 0.1 - 0.4).collect();
         let w: Vec<f32> = (0..head_dim).map(|i| 1.0 + i as f32 * 0.05).collect();
         let z: Vec<f32> = (0..rows * dim).map(|i| (i as f32 * 0.37).sin()).collect();
-        let silu = |v: f32| v / (1.0 + (-v).exp());
-        // host reference: per-head rmsnorm, then elementwise silu(z) gate — the split-op semantics.
-        let mut want = vec![0f32; rows * dim];
-        for r in 0..rows {
-            for h in 0..n_head {
-                let b = (r * n_head + h) * head_dim;
-                let ss = (0..head_dim).map(|i| x[b + i] * x[b + i]).sum::<f32>() / head_dim as f32;
-                let s = 1.0 / (ss + eps).sqrt();
-                for i in 0..head_dim {
-                    want[b + i] = x[b + i] * s * w[i] * silu(z[b + i]);
+        for act in [Activation::Silu, Activation::Sigmoid] {
+            let mut want = vec![0f32; rows * dim];
+            for r in 0..rows {
+                for h in 0..n_head {
+                    let b = (r * n_head + h) * head_dim;
+                    let ss =
+                        (0..head_dim).map(|i| x[b + i] * x[b + i]).sum::<f32>() / head_dim as f32;
+                    let s = 1.0 / (ss + eps).sqrt();
+                    for i in 0..head_dim {
+                        let zv = z[b + i];
+                        let gate = match act {
+                            Activation::Silu => zv / (1.0 + (-zv).exp()),
+                            Activation::Sigmoid => 1.0 / (1.0 + (-zv).exp()),
+                            Activation::Gelu => unreachable!(),
+                        };
+                        want[b + i] = x[b + i] * s * w[i] * gate;
+                    }
                 }
             }
-        }
-        let mut g = Graph::new();
-        let xi = g.input(TensorDesc::new(vec![rows, dim], DType::F32));
-        let wi = g.weight(TensorDesc::new(vec![head_dim], DType::F32));
-        let zi = g.input(TensorDesc::new(vec![rows, dim], DType::F32));
-        let yi = g.output(TensorDesc::new(vec![rows, dim], DType::F32));
-        g.push(Op::GatedRmsNorm {
-            x: xi,
-            weight: wi,
-            gate: zi,
-            dst: yi,
-            rows: rows as u32,
-            n_head: n_head as u32,
-            head_dim: head_dim as u32,
-            eps,
-        });
-        let xb = be_.alloc(rows * dim * 4, BufferUsage::Activations).unwrap();
-        let wb = be_.alloc(head_dim * 4, BufferUsage::Weights).unwrap();
-        let zb = be_.alloc(rows * dim * 4, BufferUsage::Activations).unwrap();
-        let yb = be_.alloc(rows * dim * 4, BufferUsage::Activations).unwrap();
-        be_.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
-        be_.upload(wb.as_ref(), bytemuck::cast_slice(&w)).unwrap();
-        be_.upload(zb.as_ref(), bytemuck::cast_slice(&z)).unwrap();
-        let plan = be_.compile(&g).unwrap();
-        let mut bind = Bindings::new();
-        bind.bind(xi, xb.as_ref());
-        bind.bind(wi, wb.as_ref());
-        bind.bind(zi, zb.as_ref());
-        bind.bind(yi, yb.as_ref());
-        be_.execute(plan.as_ref(), &bind).unwrap();
-        let mut got = vec![0f32; rows * dim];
-        be_.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
-            .unwrap();
-        for i in 0..rows * dim {
-            assert!(
-                (got[i] - want[i]).abs() < 1e-3,
-                "gated_rmsnorm mismatch at {i}: got {} want {}",
-                got[i],
-                want[i]
-            );
+
+            let mut g = Graph::new();
+            let xi = g.input(TensorDesc::new(vec![rows, dim], DType::F32));
+            let wi = g.weight(TensorDesc::new(vec![head_dim], DType::F32));
+            let zi = g.input(TensorDesc::new(vec![rows, dim], DType::F32));
+            g.push(Op::GatedRmsNorm {
+                x: xi,
+                weight: wi,
+                gate: zi,
+                dst: xi,
+                rows: rows as u32,
+                n_head: n_head as u32,
+                head_dim: head_dim as u32,
+                eps,
+                act,
+            });
+            let xb = be_.alloc(rows * dim * 4, BufferUsage::Activations).unwrap();
+            let wb = be_.alloc(head_dim * 4, BufferUsage::Weights).unwrap();
+            let zb = be_.alloc(rows * dim * 4, BufferUsage::Activations).unwrap();
+            be_.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+            be_.upload(wb.as_ref(), bytemuck::cast_slice(&w)).unwrap();
+            be_.upload(zb.as_ref(), bytemuck::cast_slice(&z)).unwrap();
+            let plan = be_.compile(&g).unwrap();
+            let mut bind = Bindings::new();
+            bind.bind(xi, xb.as_ref());
+            bind.bind(wi, wb.as_ref());
+            bind.bind(zi, zb.as_ref());
+            be_.execute(plan.as_ref(), &bind).unwrap();
+            let mut got = vec![0f32; rows * dim];
+            be_.download(xb.as_ref(), bytemuck::cast_slice_mut(&mut got))
+                .unwrap();
+            for i in 0..rows * dim {
+                assert!(
+                    (got[i] - want[i]).abs() < 1e-3,
+                    "gated_rmsnorm {act:?} mismatch at {i}: got {} want {}",
+                    got[i],
+                    want[i]
+                );
+            }
         }
     }
 
@@ -12915,6 +14529,463 @@ mod tests {
                 want[o]
             );
         }
+    }
+
+    /// `LinearPair` preserves both independent F32 projections across the decode, short-row and
+    /// MROW8 paths. The non-divisible width also covers the scalar (non-vec4) shader family.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn linear_pair_f32_matches_host() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return;
+        };
+        for (rows, in_f) in [(1usize, 32usize), (4, 32), (9, 32), (3, 30)] {
+            let out_f = 7usize;
+            let x: Vec<f32> = (0..rows * in_f)
+                .map(|i| (i as f32 * 0.071).sin() * 0.5)
+                .collect();
+            let wa: Vec<f32> = (0..out_f * in_f)
+                .map(|i| (i as f32 * 0.037).cos() * 0.3)
+                .collect();
+            let wb: Vec<f32> = (0..out_f * in_f)
+                .map(|i| (i as f32 * 0.053).sin() * 0.2)
+                .collect();
+            let want_a = infr_testkit::ref_linear(&x, &wa, rows, in_f, out_f);
+            let want_b = infr_testkit::ref_linear(&x, &wb, rows, in_f, out_f);
+            let mut g = Graph::new();
+            let xi = g.input(TensorDesc::new(vec![rows, in_f], DType::F32));
+            let wai = g.weight(TensorDesc::new(vec![out_f, in_f], DType::F32));
+            let wbi = g.weight(TensorDesc::new(vec![out_f, in_f], DType::F32));
+            let ya = g.output(TensorDesc::new(vec![rows, out_f], DType::F32));
+            let yb = g.output(TensorDesc::new(vec![rows, out_f], DType::F32));
+            g.push(Op::LinearPair {
+                x: xi,
+                weight_a: wai,
+                weight_b: wbi,
+                dst_a: ya,
+                dst_b: yb,
+                m: rows as u32,
+                in_f: in_f as u32,
+                out_f: out_f as u32,
+            });
+            let xb = be_.alloc(x.len() * 4, BufferUsage::Activations).unwrap();
+            let wab = be_.alloc(wa.len() * 4, BufferUsage::Weights).unwrap();
+            let wbb = be_.alloc(wb.len() * 4, BufferUsage::Weights).unwrap();
+            let yab = be_.alloc(rows * out_f * 4, BufferUsage::Readback).unwrap();
+            let ybb = be_.alloc(rows * out_f * 4, BufferUsage::Readback).unwrap();
+            be_.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+            be_.upload(wab.as_ref(), bytemuck::cast_slice(&wa)).unwrap();
+            be_.upload(wbb.as_ref(), bytemuck::cast_slice(&wb)).unwrap();
+            let plan = be_.compile(&g).unwrap();
+            let mut bindings = Bindings::new();
+            bindings
+                .bind(xi, xb.as_ref())
+                .bind(wai, wab.as_ref())
+                .bind(wbi, wbb.as_ref())
+                .bind(ya, yab.as_ref())
+                .bind(yb, ybb.as_ref());
+            be_.execute(plan.as_ref(), &bindings).unwrap();
+            let mut got_a = vec![0f32; rows * out_f];
+            let mut got_b = vec![0f32; rows * out_f];
+            be_.download(yab.as_ref(), bytemuck::cast_slice_mut(&mut got_a))
+                .unwrap();
+            be_.download(ybb.as_ref(), bytemuck::cast_slice_mut(&mut got_b))
+                .unwrap();
+            for (projection, got, want) in [("A", &got_a, &want_a), ("B", &got_b, &want_b)] {
+                for (i, (&got, &want)) in got.iter().zip(want).enumerate() {
+                    assert!(
+                        (got - want).abs() < 2e-3,
+                        "rows={rows} in_f={in_f} projection={projection} index={i}: got {got} want {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Qwen3.8's production HC dimensions and dtypes: the fused one-row launch must match the
+    /// existing Q8_0 Linear -> scaled SiLU plus independent four-row F32 Linear graph.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn qwen_hc_down_inject_matches_split_graph() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return;
+        };
+        let (in_f, low_rank, hc) = (10_240usize, 320usize, 4usize);
+        let scale = 1.0 / hc as f32;
+        let x: Vec<f32> = (0..in_f).map(|i| (i as f32 * 0.017).sin() * 0.25).collect();
+        let down = infr_testkit::synth_weight(DType::Q8_0, in_f * low_rank, 0x4843_444e);
+        let inject: Vec<f32> = (0..in_f * hc)
+            .map(|i| (i as f32 * 0.023).cos() * 0.125)
+            .collect();
+
+        let mut g = Graph::new();
+        let xi = g.input(TensorDesc::new(vec![1, in_f], DType::F32));
+        let down_w = g.weight(TensorDesc::new(vec![low_rank, in_f], DType::Q8_0));
+        let inject_w = g.weight(TensorDesc::new(vec![hc, in_f], DType::F32));
+        let fused_low = g.output(TensorDesc::new(vec![1, low_rank], DType::F32));
+        let fused_inject = g.output(TensorDesc::new(vec![1, hc], DType::F32));
+        let split_raw = g.internal(TensorDesc::new(vec![1, low_rank], DType::F32));
+        let split_low = g.output(TensorDesc::new(vec![1, low_rank], DType::F32));
+        let split_inject = g.output(TensorDesc::new(vec![1, hc], DType::F32));
+        g.push(Op::QwenHcDownInject {
+            x: xi,
+            down_weight: down_w,
+            inject_weight: inject_w,
+            low_dst: fused_low,
+            inject_dst: fused_inject,
+            in_f: in_f as u32,
+            low_rank: low_rank as u32,
+            hc: hc as u32,
+            silu_scale: scale,
+        });
+        g.push(Op::Linear {
+            x: xi,
+            weight: down_w,
+            dst: split_raw,
+            m: 1,
+            in_f: in_f as u32,
+            out_f: low_rank as u32,
+            w_off: 0,
+        });
+        g.push(Op::Silu {
+            x: split_raw,
+            dst: split_low,
+            n: low_rank as u32,
+            scale,
+        });
+        g.push(Op::Linear {
+            x: xi,
+            weight: inject_w,
+            dst: split_inject,
+            m: 1,
+            in_f: in_f as u32,
+            out_f: hc as u32,
+            w_off: 0,
+        });
+
+        let xb = be_.alloc(x.len() * 4, BufferUsage::Activations).unwrap();
+        let down_b = be_.alloc(down.len(), BufferUsage::Weights).unwrap();
+        let inject_b = be_.alloc(inject.len() * 4, BufferUsage::Weights).unwrap();
+        let fused_low_b = be_.alloc(low_rank * 4, BufferUsage::Readback).unwrap();
+        let fused_inject_b = be_.alloc(hc * 4, BufferUsage::Readback).unwrap();
+        let split_low_b = be_.alloc(low_rank * 4, BufferUsage::Readback).unwrap();
+        let split_inject_b = be_.alloc(hc * 4, BufferUsage::Readback).unwrap();
+        be_.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+        be_.upload(down_b.as_ref(), &down).unwrap();
+        be_.upload(inject_b.as_ref(), bytemuck::cast_slice(&inject))
+            .unwrap();
+        let plan = be_.compile(&g).unwrap();
+        let mut bindings = Bindings::new();
+        bindings
+            .bind(xi, xb.as_ref())
+            .bind(down_w, down_b.as_ref())
+            .bind(inject_w, inject_b.as_ref())
+            .bind(fused_low, fused_low_b.as_ref())
+            .bind(fused_inject, fused_inject_b.as_ref())
+            .bind(split_low, split_low_b.as_ref())
+            .bind(split_inject, split_inject_b.as_ref());
+        be_.execute(plan.as_ref(), &bindings).unwrap();
+
+        let mut got_fused_low = vec![0.0f32; low_rank];
+        let mut got_split_low = vec![0.0f32; low_rank];
+        let mut got_fused_inject = vec![0.0f32; hc];
+        let mut got_split_inject = vec![0.0f32; hc];
+        be_.download(
+            fused_low_b.as_ref(),
+            bytemuck::cast_slice_mut(&mut got_fused_low),
+        )
+        .unwrap();
+        be_.download(
+            split_low_b.as_ref(),
+            bytemuck::cast_slice_mut(&mut got_split_low),
+        )
+        .unwrap();
+        be_.download(
+            fused_inject_b.as_ref(),
+            bytemuck::cast_slice_mut(&mut got_fused_inject),
+        )
+        .unwrap();
+        be_.download(
+            split_inject_b.as_ref(),
+            bytemuck::cast_slice_mut(&mut got_split_inject),
+        )
+        .unwrap();
+
+        for (i, (&fused, &split)) in got_fused_low.iter().zip(&got_split_low).enumerate() {
+            assert_eq!(fused.to_bits(), split.to_bits(), "HC down mismatch at {i}");
+        }
+        for (i, (&fused, &split)) in got_fused_inject.iter().zip(&got_split_inject).enumerate() {
+            assert_eq!(
+                fused.to_bits(),
+                split.to_bits(),
+                "HC inject mismatch at {i}"
+            );
+        }
+        let expected = if be_.cfg().kernels.vulkan.qwen_hc_down_prefetch
+            && be_.prefers_qwen_hc_down_prefetch4()
+        {
+            "qwen_hc_down_inject_pf4"
+        } else {
+            "qwen_hc_down_inject"
+        };
+        assert!(
+            be_.built_kernel_names().contains(&expected),
+            "Qwen HC down selected the wrong kernel; expected {expected}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU; HC quantization and cohort parity"]
+    fn qwen_hc_down_inject_quantizations_match_split() {
+        for prefetch in [false, true] {
+            let mut cfg = infr_core::config::Config::default();
+            cfg.kernels.vulkan.qwen_hc_down_prefetch = prefetch;
+            let be_ = VulkanBackend::new_with(std::sync::Arc::new(cfg)).unwrap();
+            for inject_dtype in [DType::F32, DType::Q8_0] {
+                for rows in [1usize] {
+                    if inject_dtype == DType::F32 && rows > 1 {
+                        continue;
+                    }
+                    let (in_f, rank, hc) = (10240usize, 320usize, 4usize);
+                    let x = (0..rows * in_f)
+                        .map(|i| (i as f32 * 0.017).sin() * 0.25)
+                        .collect::<Vec<_>>();
+                    let down = infr_testkit::synth_weight(DType::Q8_0, in_f * rank, 0x4843_444e);
+                    let inject = infr_testkit::synth_weight(inject_dtype, in_f * hc, 0x4843_494e);
+                    let mut g = Graph::new();
+                    let xi = g.input(TensorDesc::new(vec![rows, in_f], DType::F32));
+                    let dw = g.weight(TensorDesc::new(vec![rank, in_f], DType::Q8_0));
+                    let iw = g.weight(TensorDesc::new(vec![hc, in_f], inject_dtype));
+                    let sizes = [rows * rank, rows * hc, rows * rank, rows * hc];
+                    let outputs =
+                        sizes.map(|size| g.output(TensorDesc::new(vec![size], DType::F32)));
+                    let raw = g.internal(TensorDesc::new(vec![rows, rank], DType::F32));
+                    g.push(Op::QwenHcDownInject {
+                        x: xi,
+                        down_weight: dw,
+                        inject_weight: iw,
+                        low_dst: outputs[0],
+                        inject_dst: outputs[1],
+                        in_f: in_f as u32,
+                        low_rank: rank as u32,
+                        hc: hc as u32,
+                        silu_scale: 0.25,
+                    });
+                    g.push(Op::Linear {
+                        x: xi,
+                        weight: dw,
+                        dst: raw,
+                        m: rows as u32,
+                        in_f: in_f as u32,
+                        out_f: rank as u32,
+                        w_off: 0,
+                    });
+                    g.push(Op::Silu {
+                        x: raw,
+                        dst: outputs[2],
+                        n: sizes[2] as u32,
+                        scale: 0.25,
+                    });
+                    g.push(Op::Linear {
+                        x: xi,
+                        weight: iw,
+                        dst: outputs[3],
+                        m: rows as u32,
+                        in_f: in_f as u32,
+                        out_f: hc as u32,
+                        w_off: 0,
+                    });
+                    let xb = be_.alloc(x.len() * 4, BufferUsage::Activations).unwrap();
+                    let db = be_.alloc(down.len(), BufferUsage::Weights).unwrap();
+                    let ib = be_.alloc(inject.len(), BufferUsage::Weights).unwrap();
+                    be_.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+                    be_.upload(db.as_ref(), &down).unwrap();
+                    be_.upload(ib.as_ref(), &inject).unwrap();
+                    let buffers =
+                        sizes.map(|size| be_.alloc(size * 4, BufferUsage::Readback).unwrap());
+                    let mut bindings = Bindings::new();
+                    bindings
+                        .bind(xi, xb.as_ref())
+                        .bind(dw, db.as_ref())
+                        .bind(iw, ib.as_ref());
+                    for (id, buffer) in outputs.iter().zip(&buffers) {
+                        bindings.bind(*id, buffer.as_ref());
+                    }
+                    let plan = be_.compile(&g).unwrap();
+                    be_.execute(plan.as_ref(), &bindings).unwrap();
+                    let mut values = Vec::new();
+                    for (size, buffer) in sizes.iter().zip(&buffers) {
+                        let mut v = vec![0f32; *size];
+                        be_.download(buffer.as_ref(), bytemuck::cast_slice_mut(&mut v))
+                            .unwrap();
+                        values.push(v);
+                    }
+                    for (a, b) in [(0, 2), (1, 3)] {
+                        for (index, (fused, split)) in values[a].iter().zip(&values[b]).enumerate()
+                        {
+                            assert_eq!(fused.to_bits(), split.to_bits(),
+                                "HC parity prefetch={prefetch} inject={inject_dtype:?} rows={rows} output={a} index={index}: {fused} vs {split}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU (perf micro-bench)"]
+    fn qwen_hc_down_inject_prefetch_probe() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return;
+        };
+        let (in_f, low_rank, hc) = (10_240usize, 320usize, 4usize);
+        let scale = 1.0 / hc as f32;
+        let x: Vec<f32> = (0..in_f).map(|i| (i as f32 * 0.017).sin() * 0.25).collect();
+        let down = infr_testkit::synth_weight(DType::Q8_0, in_f * low_rank, 0x4843_444e);
+        let inject: Vec<f32> = (0..in_f * hc)
+            .map(|i| (i as f32 * 0.023).cos() * 0.125)
+            .collect();
+        let xb = be_.alloc(x.len() * 4, BufferUsage::Activations).unwrap();
+        let inject_b = be_.alloc(inject.len() * 4, BufferUsage::Weights).unwrap();
+        be_.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+        be_.upload(inject_b.as_ref(), bytemuck::cast_slice(&inject))
+            .unwrap();
+
+        let working_set = 128usize << 20;
+        let n_weights = working_set.div_ceil(down.len()).max(4);
+        let weights: Vec<Box<dyn infr_core::backend::Buffer>> = (0..n_weights)
+            .map(|_| {
+                let w = be_.alloc(down.len(), BufferUsage::Weights).unwrap();
+                be_.upload(w.as_ref(), &down).unwrap();
+                w
+            })
+            .collect();
+        let outputs: Vec<_> = (0..2)
+            .map(|_| {
+                (
+                    be_.alloc(low_rank * 4, BufferUsage::Readback).unwrap(),
+                    be_.alloc(hc * 4, BufferUsage::Readback).unwrap(),
+                )
+            })
+            .collect();
+
+        let run_one = |prefetch: bool, w: &dyn infr_core::backend::Buffer, out: usize| {
+            let rec = be_.recorder().unwrap();
+            if prefetch {
+                rec.qwen_hc_down_inject_prefetch(
+                    xb.as_ref(),
+                    w,
+                    inject_b.as_ref(),
+                    outputs[out].0.as_ref(),
+                    outputs[out].1.as_ref(),
+                    in_f as u32,
+                    low_rank as u32,
+                    hc as u32,
+                    scale,
+                );
+            } else {
+                rec.qwen_hc_down_inject_kernel(
+                    "qwen_hc_down_inject",
+                    crate::gemm::qwen_hc_down_inject_spv(),
+                    xb.as_ref(),
+                    w,
+                    inject_b.as_ref(),
+                    outputs[out].0.as_ref(),
+                    outputs[out].1.as_ref(),
+                    in_f as u32,
+                    low_rank as u32,
+                    hc as u32,
+                    scale,
+                );
+            }
+            rec.finish().unwrap();
+        };
+        for (out, prefetch) in [false, true].into_iter().enumerate() {
+            run_one(prefetch, weights[0].as_ref(), out);
+        }
+        let read = |out: usize| {
+            let mut low = vec![0.0f32; low_rank];
+            let mut inject = vec![0.0f32; hc];
+            be_.download(outputs[out].0.as_ref(), bytemuck::cast_slice_mut(&mut low))
+                .unwrap();
+            be_.download(
+                outputs[out].1.as_ref(),
+                bytemuck::cast_slice_mut(&mut inject),
+            )
+            .unwrap();
+            (low, inject)
+        };
+        let baseline = read(0);
+        for out in [1usize] {
+            let got = read(out);
+            for (i, (&a, &b)) in baseline.0.iter().zip(&got.0).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "HC down PF mismatch at {i}");
+            }
+            for (i, (&a, &b)) in baseline.1.iter().zip(&got.1).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "HC inject PF mismatch at {i}");
+            }
+        }
+
+        let reps = n_weights * 8;
+        let bench = |prefetch: bool, out: usize| {
+            let rec = be_.recorder().unwrap();
+            for i in 0..reps {
+                let w = weights[i % n_weights].as_ref();
+                if prefetch {
+                    rec.qwen_hc_down_inject_prefetch(
+                        xb.as_ref(),
+                        w,
+                        inject_b.as_ref(),
+                        outputs[out].0.as_ref(),
+                        outputs[out].1.as_ref(),
+                        in_f as u32,
+                        low_rank as u32,
+                        hc as u32,
+                        scale,
+                    );
+                } else {
+                    rec.qwen_hc_down_inject_kernel(
+                        "qwen_hc_down_inject",
+                        crate::gemm::qwen_hc_down_inject_spv(),
+                        xb.as_ref(),
+                        w,
+                        inject_b.as_ref(),
+                        outputs[out].0.as_ref(),
+                        outputs[out].1.as_ref(),
+                        in_f as u32,
+                        low_rank as u32,
+                        hc as u32,
+                        scale,
+                    );
+                }
+            }
+            let start = std::time::Instant::now();
+            rec.finish().unwrap();
+            start.elapsed().as_secs_f64() * 1e6 / reps as f64
+        };
+        for (out, prefetch) in [false, true].into_iter().enumerate() {
+            let _ = bench(prefetch, out);
+        }
+        let mut best = [f64::INFINITY; 2];
+        let variants = [false, true];
+        for round in 0..4 {
+            if round % 2 == 0 {
+                for i in 0..2 {
+                    best[i] = best[i].min(bench(variants[i], i));
+                }
+            } else {
+                for i in (0..2).rev() {
+                    best[i] = best[i].min(bench(variants[i], i));
+                }
+            }
+        }
+        println!(
+            "Qwen3.8 HC down+inject 10240x320, {} MiB rotating weights: base={:.2} us, pf4={:.2} us ({:+.1}%)",
+            n_weights * down.len() / (1 << 20),
+            best[0],
+            best[1],
+            (best[1] / best[0] - 1.0) * 100.0,
+        );
     }
 
     /// A fused F16 weight can expose a row-aligned projection through `Linear::w_off` without

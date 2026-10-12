@@ -2,11 +2,16 @@
 kind: index
 status: current
 scope: incidents
-last_verified: 2026-09-28
-verified_commit: ed62393068679573afe94a1472454efe7eae0f15
+last_verified: 2026-10-11
+verified_commit: 7b4a9411e9c7524f8dc6ae2603c62d5f338190dc
+baseline_tag: release-0.10.0
 ---
 
 # 事故
+
+- [INC-20261009：idle KV spill 阻塞 Decode](INC-20261009-idle-kv-spill-stall.md)
+- [INC-20261009：辅助 Vulkan command pool 生命周期](INC-20261009-vulkan-aux-command-pool.md)
+- [INC-20261010：mixed batch sampling suffix 行错位](INC-20261010-mixed-batch-sampling-suffix.md)
 
 这里保存已经定位的用户可见故障：复现、影响、根因、被破坏的不变量、修复和回归测试。
 

@@ -3,11 +3,21 @@
 // Slot order deliberately matches the original two-op path: routed slots accumulate first, then
 // the sigmoid-gated shared output is added last, preserving the trained graph's arithmetic order.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
-layout(push_constant) uniform PC { uint ne; uint routed_used; uint rows; } pc;
+layout(push_constant) uniform PC {
+    uint ne; uint routed_used; uint rows;
+#ifdef CPU_MISS_RESULT
+    uint cpu_slot;
+#endif
+} pc;
 layout(binding = 0) readonly buffer DB { float down[]; };
 layout(binding = 1) readonly buffer WB { float wts[]; };
 layout(binding = 2) readonly buffer GB { float gate[]; };
+#ifdef CPU_MISS_RESULT
+layout(binding = 3) readonly buffer CB { float cpu_result[]; };
+layout(binding = 4) buffer HB { float hidden[]; };
+#else
 layout(binding = 3) buffer HB { float hidden[]; };
+#endif
 
 void main() {
     uint i = gl_GlobalInvocationID.x;
@@ -18,7 +28,12 @@ void main() {
     uint down_base = row * physical_used;
     float acc = 0.0;
     for (uint slot = 0u; slot < pc.routed_used; slot++) {
+#ifdef CPU_MISS_RESULT
+        float value = slot == pc.cpu_slot ? cpu_result[i] : down[(down_base + slot) * pc.ne + i];
+        acc += wts[routed_base + slot] * value;
+#else
         acc += wts[routed_base + slot] * down[(down_base + slot) * pc.ne + i];
+#endif
     }
     float g = 1.0 / (1.0 + exp(-gate[row]));
     hidden[row * pc.ne + i] =

@@ -22,6 +22,7 @@
 
 mod config;
 mod engine;
+mod heif;
 mod preprocess;
 mod weights;
 

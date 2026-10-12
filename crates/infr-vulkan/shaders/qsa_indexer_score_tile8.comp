@@ -1,0 +1,116 @@
+#version 460
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Qwen3.8 QSA Prefill indexer scorer. Eight subgroups own eight query rows and share an F32
+// block-key tile in LDS. Each subgroup keeps its four query heads in registers while walking the
+// complete block tile, preserving the established F32 dot/reduction order without reloading Q for
+// every four blocks. BLOCK_TILE=32 uses 16 KiB LDS; BLOCK_TILE=64 uses the full 32 KiB.
+#ifndef BLOCK_TILE
+#define BLOCK_TILE 64
+#endif
+#if BLOCK_TILE != 32 && BLOCK_TILE != 64
+#error "BLOCK_TILE must be 32 or 64"
+#endif
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint kv_len;
+    uint n_head;
+    uint head_dim;
+    uint ratio;
+    float scale;
+    uint block_shift;
+} pc;
+layout(binding = 0) readonly buffer QB { uint q[]; };
+layout(binding = 1) readonly buffer KB { uvec2 block_segments[]; };
+layout(binding = 2) writeonly buffer SB { float scores[]; };
+
+#include "kv_addr.glsl"
+
+const uint QUERY_TILE = 8u;
+const uint HEADS = 4u;
+const uint HEAD_DIM = 128u;
+
+shared float ktile[BLOCK_TILE][HEAD_DIM];
+
+float qread(uint i) {
+    uint w = q[i >> 1u];
+    uint h = (i & 1u) == 0u ? w & 0xffffu : w >> 16u;
+    return unpackHalf2x16(h).x;
+}
+
+uint64_t block_segment_address(uint segment) {
+    uvec2 address = uvec2(0u);
+    if (subgroupElect()) {
+        address = block_segments[segment];
+    }
+    address.x = subgroupBroadcastFirst(address.x);
+    address.y = subgroupBroadcastFirst(address.y);
+    return kv_segment_base(address);
+}
+
+void main() {
+    uint sg = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint row_base = gl_WorkGroupID.y * QUERY_TILE;
+    uint block_base = gl_WorkGroupID.x * BLOCK_TILE;
+    uint max_blocks = pc.kv_len / pc.ratio;
+
+    for (uint bs = sg; bs < BLOCK_TILE; bs += 8u) {
+        uint block = block_base + bs;
+        if (block < max_blocks) {
+            uint elem = block * HEAD_DIM;
+            uint64_t base = block_segment_address(kv_segment(elem, pc.block_shift));
+            uint local_base = kv_segment_local(elem, pc.block_shift);
+            for (uint d = lane; d < HEAD_DIM; d += 32u) {
+                ktile[bs][d] = kv_f32(base, local_base + d);
+            }
+        } else {
+            for (uint d = lane; d < HEAD_DIM; d += 32u) {
+                ktile[bs][d] = 0.0;
+            }
+        }
+    }
+    barrier();
+
+    uint row = row_base + sg;
+    if (row >= pc.rows) { return; }
+
+    vec4 query[4];
+    uint qbase = row * HEADS * HEAD_DIM;
+    for (uint component = 0u; component < 4u; ++component) {
+        uint d = lane + component * 32u;
+        query[component] = vec4(
+            qread(qbase + d),
+            qread(qbase + HEAD_DIM + d),
+            qread(qbase + 2u * HEAD_DIM + d),
+            qread(qbase + 3u * HEAD_DIM + d)
+        );
+    }
+
+    uint visible = pc.kv_len - pc.rows + row + 1u;
+    uint visible_blocks = visible / pc.ratio;
+    uint count = min(BLOCK_TILE, min(max_blocks, visible_blocks) - min(block_base, visible_blocks));
+    for (uint bs = 0u; bs < count; ++bs) {
+        vec4 part = vec4(0.0);
+        for (uint component = 0u; component < 4u; ++component) {
+            uint d = lane + component * 32u;
+            part += query[component] * ktile[bs][d];
+        }
+        vec4 heads = subgroupAdd(part);
+        if (lane == 0u) {
+            uint block = block_base + bs;
+            scores[row * max_blocks + block] = (
+                max(heads.x, 0.0) + max(heads.y, 0.0)
+                    + max(heads.z, 0.0) + max(heads.w, 0.0)
+            ) * pc.scale;
+        }
+    }
+}

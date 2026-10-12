@@ -2,8 +2,9 @@
 kind: architecture
 status: current
 scope: model-runtime-families
-last_verified: 2026-09-28
-verified_commit: ed62393068679573afe94a1472454efe7eae0f15
+last_verified: 2026-10-11
+verified_commit: 7b4a9411e9c7524f8dc6ae2603c62d5f338190dc
+baseline_tag: release-0.10.0
 ---
 
 # 模型执行路径
@@ -33,7 +34,7 @@ GGUF 架构名与元数据
 | `deepseek2`、`deepseek32`、`deepseek4` | MLA、索引器或 V4 压缩注意力与 Hyper-Connection 按架构分别构图 | 缓存几何与量化布局不能互相套用 |
 | `gemma3`、`gemma4`、`diffusion-gemma` | 滑动注意力、异构层或块扩散 | DiffusionGemma 不使用普通逐 token Decode 语义 |
 
-`deepseek32` 和 `deepseek4` 在 `seam/runner.rs` 均有权重绑定及图发射路径。`arch.rs` 中关于这两者“只有 LOAD、建图拒绝”的注释是早期阶段遗留；判断 0.9.0 的实际路径应看构图实现及对应的[DeepSeek V4 历史结项](../../evidence/campaigns/deepseek-v4/2026-08-24-rx7900xtx-closeout.md)，不能单凭旧注释。
+`deepseek32` 和 `deepseek4` 在 `seam/runner.rs` 均有权重绑定及图发射路径。`arch.rs` 中关于这两者“只有 LOAD、建图拒绝”的注释是早期阶段遗留；判断 0.10.0 的实际路径应看构图实现及对应的[DeepSeek V4 历史结项](../../evidence/campaigns/deepseek-v4/2026-08-24-rx7900xtx-closeout.md)，不能单凭旧注释。
 
 ## 请求与后端边界
 

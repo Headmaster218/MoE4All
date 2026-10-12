@@ -2,19 +2,26 @@
 
 **Run models far larger than VRAM on gaming GPUs. AMD, NVIDIA, and Intel are all working.**
 
-The portable Windows package is 13 MiB. Download a GGUF, choose automatic
+The portable Windows download is about 14 MiB. Download a GGUF, choose automatic
 configuration, and start local chat or an OpenAI-compatible API. MoE expert
 weights are coordinated across VRAM, system RAM, and SSD.
 
-**0.8.0 release benchmark:** RX 7900 XTX 24 GiB + 64 GiB DDR4, using the
-automatic aggressive-performance profile. The table shows measured generation
-speed in tok/s; see [Measured results](#measured-results) for full conditions and
-per-segment results.
+**0.10.0 peak-speed reference:** RX 7900 XTX 24 GiB, Ryzen 5 5600X, 64 GiB
+DDR4, automatic aggressive profile. Flash-Next 4.27bpw peaks at about
+**1,446 tok/s Prefill** and **79.4 tok/s total Decode** with three active streams;
+35B Balanced peaks at **65.4 tok/s Decode** with one active stream at 30K.
+Three configured slots, MTP and CPU miss offload disabled.
+The table shows 2026-10-09 measured peaks in tok/s; see
+[Measured results](#measured-results) for measurement definitions.
 
-| Recommended model and quantization | MTP | 20K input | 150K input |
-| --- | --- | ---: | ---: |
-| **Qwen3.6-35B-A3B · APEX-I-Balanced** | Off | **65.6** | **39.9** |
-| **Qwen3.8-Flash-Next · AD-4.27bpw-Q4_K_M-M64** | On | **60.2** | **48.1** |
+| Model | Active streams | 30K Prefill peak | 30K Decode total peak | 150K Prefill peak | 150K Decode total peak |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash-Next 4.27bpw | 1 | 1,439.4 | **47.7** | 1,444.6 | **44.7** |
+| Flash-Next 4.27bpw | 2 | 1,445.2 | **71.3** | 1,446.3 | **63.6** |
+| Flash-Next 4.27bpw | 3 | 1,437.0 | **79.4** | 1,434.2 | **62.5** |
+| 35B Balanced | 1 | 3,824.8 | **65.4** | 3,981.7 | **36.7** |
+
+<sub>Peak means the highest speed within a 1.5-second rolling window. Prefill peaks interpolate completed-chunk progress.</sub>
 
 [Released Windows builds](https://github.com/Headmaster218/MoE4All/releases/latest) |
 [Quick start](#quick-start) |
@@ -28,9 +35,9 @@ per-segment results.
 ### 1. Download the program
 
 Open [MoE4All Releases](https://github.com/Headmaster218/MoE4All/releases) and
-download the matching `MoE4All-Windows-x86_64-v*.zip`. The speed table on this
-page is historical **0.8.0** evidence; current source and architecture facts in
-the documentation are pinned to the **0.9.0** tag.
+download the matching `MoE4All-Windows-x86_64-v*.zip`. This page covers
+**0.10.0**; the results below describe the test conditions and provenance of
+the performance tables.
 
 ### 2. Extract it
 
@@ -38,15 +45,15 @@ Fully extract the ZIP into a directory such as `D:\MoE4All`.
 
 ### 3. Download a GGUF model
 
-The historical 0.8.0 measurements above used the following two
-quantizations. Store the model files on a local SSD when reproducing them.
+The following models and components are recommended. Store the model files on
+a local SSD.
 
 | Model / component | Download | File and purpose |
 | --- | --- | --- |
 | **Qwen3.6 35B model** | [Download APEX-I-Balanced](https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/resolve/main/Qwen3.6-35B-A3B-APEX-I-Balanced.gguf?download=true) | `Qwen3.6-35B-A3B-APEX-I-Balanced.gguf`; this single file is sufficient for the 35B model |
 | **Flash-Next main model** | [Download all AD-4.27bpw-Q4_K_M-M64 shards](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/tree/main/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64) | Download all **33 GGUF shards** from this directory into one folder |
 | **Flash-Next vision** | [Download the F16 vision projector](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/mmproj-Qwen3.8-Flash-Next-F16.gguf?download=true) | `mmproj-Qwen3.8-Flash-Next-F16.gguf`; load it for image understanding |
-| **Flash-Next MTP** | [Download the shared Q4_K_M MTP head](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf?download=true) | `mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf`; the text-acceleration component used in these measurements |
+| **Flash-Next MTP** | [Download the shared Q4_K_M MTP head](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf?download=true) | `mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf`; an optional text-acceleration component |
 
 For Flash-Next, select the first shard when launching:
 `Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00033.gguf`.
@@ -58,121 +65,116 @@ for their respective modes in the wizard.
 1. Double-click **`Start-INFR-Wizard.cmd`** in the extracted directory.
 2. Choose terminal chat or the OpenAI-compatible API, drag the main-model GGUF
    into the prompt, and press Enter.
-3. Choose an automatic profile. **Aggressive performance** is the profile used
-   for the results on this page; **conservative** provides more headroom for a
-   first run or a system with other active workloads.
-4. Leave context blank for automatic sizing, then confirm launch. To reproduce
-   these measurements, use `32768` for 20K input and `163840` for 150K input.
+3. Select optional MTP, vision, and Embedding components, then the device and
+   profile. **Aggressive performance** is used for these results; **conservative**
+   provides more headroom for a first run or other active workloads.
+4. Set concurrency, context, and API options, then confirm launch. To reproduce
+   these measurements, configure three slots and `ctx=163840`, with MTP and
+   experimental CPU offload disabled.
 
 Automatic profiles use Q8 K/V by default and plan VRAM, system RAM, expert
 cache, and Ubatch. The 35B model is ready for chat with its main GGUF alone.
-For the **historical 0.8.0 measurements above**, Flash-Next used these paths:
+Flash-Next has these optional components:
 
-- **MTP text acceleration:** enable “Qwen3.8 MTP single-stream acceleration,”
-  select the MTP head above, and use verification width `4`. This path uses
-  greedy decoding (`temperature=0`) and one session.
-- **Image understanding:** choose API mode, leave MTP disabled, enable vision,
-  and select the F16 vision projector above.
+- **MTP text acceleration:** enable "Qwen3.8 MTP acceleration," select the head
+  above, and use greedy decoding (`temperature=0`). Two-slot opportunistic MTP
+  uses MTP with one active stream and ordinary batched Decode when both are active.
+- **Image understanding:** choose API mode, enable vision, and select the F16
+  projector above. Vision and MTP can be used together.
 
-Version 0.9.0 also supports Vision and MTP together; see the [capability matrix](documentation/reference/model-capabilities.md). The default API base URL is `http://127.0.0.1:8080/v1`. See the [API guide](documentation/guide/serving/api-quickstart.md) and the
+See the [capability matrix](documentation/reference/model-capabilities.md) for combination limits. The default API base URL is `http://127.0.0.1:8080/v1`. See the [API guide](documentation/guide/serving/api-quickstart.md) and the
 [configuration reference](documentation/reference/configuration.md) for all available settings.
+
+## Build from source (Linux)
+
+Experimental Linux x86_64 packages ship alongside the Windows release; feedback is welcome. Source builds remain recommended
+until the first CI validation. Once a `.tar.gz` asset is available, extract it and run
+`Start-INFR-Wizard-Linux.sh` inside the package; Rust and glslc are not needed.
+The source installation command below targets Ubuntu 26.04; other distributions need
+`glslc` from shaderc 2025 or newer first:
+
+```sh
+sudo apt-get update && sudo apt-get install -y glslc
+git clone https://github.com/Headmaster218/MoE4All.git && cd MoE4All
+cargo build --release --locked -p infr-cli
+./Start-INFR-Wizard-Linux.sh      # interactive launcher; --dry-run prints only
+```
+
+Requires Rust 1.97.1 (installed by `rustup` from `rust-toolchain.toml`) and
+`glslc` from shaderc 2025 or newer. The full guide is
+[Build and run on Linux](documentation/guide/linux-build-and-run.md); toolchain
+and platform details are in
+[Building from source](documentation/development/building-from-source.md).
 
 ## Measured results
 
-### 0.8.0: Qwen3.8-Flash-Next, 20K versus 150K input
+### 0.10.0: 30K / 150K measurements
 
-Both input sizes use the **automatic aggressive-performance profile**. Context,
-Q8 K/V, and sampling are specified; the engine plans the remaining resources
-and automatically selects `ubatch=4096`.
+Measured on **2026-10-09** using the generic x86-64 0.10.0 release build,
+source commit `53afa86f3`. Hardware: RX 7900 XTX 24 GiB, Ryzen 5 5600X,
+64 GiB DDR4, Windows 11. Models: `Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64`
+and `Qwen3.6-35B-A3B-APEX-I-Balanced`.
+The service used the automatic aggressive profile, Q8 K/V, `ctx=163840`, and
+three configured slots with 1 / 2 / 3 simultaneously active. **MTP and CPU miss
+offload were disabled.** Sampling and thinking used model defaults. Vision and
+Embedding APIs were enabled; the table uses text-only requests, each with a
+different long technical background and a normal question.
 
-- **Hardware and OS:** RX 7900 XTX 24 GiB, Ryzen 5 5600X, 64 GiB DDR4, Windows 11.
-- **Model:** `Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64`; MTP uses
-  `mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf`.
-- **Shared settings:** Q8 K/V, greedy, thinking disabled, single-stream
-  generation, automatic aggressive profile.
-- **Context capacity:** 32K for the 20K input and `ctx=163840` for the 150K input.
+Each cell starts a fresh server: one cold Prefill round followed by two KV-reuse
+rounds, generating 768 tokens per stream per round. All speeds are tok/s.
+Prefill measures group token progress from the first Prefill sample to the last
+prompt completion, excluding startup before that sample; it is not a sum of
+stream rates. Decode averages three rounds over the interval when all streams are
+decoding, excluding pauses for another request's Prefill. Approximate per-stream
+Decode divides the total mean by the number of streams. Peak is the maximum
+1.5-second rolling window. Prefill peaks and thirds interpolate chunk-completion
+progress, not precise instantaneous GPU speeds.
 
-Prefill is input-processing speed and Decode is end-to-end generation speed.
-Both are measured in tok/s.
-
-| Workload | Mode | 20K Prefill | 20K Decode | 150K Prefill | 150K Decode |
+| Model | Input per stream | Active streams | Cold Prefill mean / peak | Decode total mean / peak | Approx. Decode per stream |
 | --- | --- | ---: | ---: | ---: | ---: |
-| Complex prompt | MTP | 937 | **39.9** | 766 | **33.4** |
-| Complex prompt | No MTP | 1,034 | **35.0** | 889 | **30.8** |
-| Simple prompt (high acceptance) | MTP | 936 | **60.2** | 769 | **48.1** |
-| Simple prompt (high acceptance) | No MTP | 1,035 | **37.7** | 888 | **32.4** |
+| Flash-Next 4.27bpw | 30K | 1 | 1,280.4 / 1,439.4 | **42.8** / 47.7 | 42.8 |
+| Flash-Next 4.27bpw | 30K | 2 | 1,288.2 / 1,445.2 | **60.7** / 71.3 | 30.3 |
+| Flash-Next 4.27bpw | 30K | 3 | 1,283.9 / 1,437.0 | **64.0** / 79.4 | 21.3 |
+| Flash-Next 4.27bpw | 150K | 1 | 1,307.5 / 1,444.6 | **39.4** / 44.7 | 39.4 |
+| Flash-Next 4.27bpw | 150K | 2 | 1,301.9 / 1,446.3 | **52.8** / 63.6 | 26.4 |
+| Flash-Next 4.27bpw | 150K | 3 | 1,228.3 / 1,434.2 | **45.4** / 62.5 | 15.1 |
+| 35B Balanced | 30K | 1 | 2,579.9 / 3,824.8 | **63.2** / 65.4 | 63.2 |
+| 35B Balanced | 150K | 1 | 1,164.9 / 3,981.7 | **35.9** / 36.7 | 35.9 |
 
-- **Long-input generation remains fast:** from 20K to 150K, end-to-end Decode
-  retains approximately **80%–88%** across the four workloads.
-- **MTP gains vary with content:** complex prompts improve by approximately
-  **14.0% / 8.4%** at 20K / 150K; simple prompts improve by approximately
-  **59.7% / 48.5%**.
-- **Input and output are timed separately:** MTP adds Prefill work in this test.
-  Total request time combines input processing and output generation.
+Front / middle / late split each measured interval into equal wall-time thirds;
+Decode thirds also average three rounds.
 
-<details>
-<summary>Full per-segment results, MTP acceptance, and long-context changes</summary>
+| Model | Input per stream | Active streams | Prefill front / middle / late | Decode total front / middle / late |
+| --- | --- | ---: | ---: | ---: |
+| Flash-Next 4.27bpw | 30K | 1 | 1,225.1 / 1,414.3 / 1,201.9 | 40.8 / 42.2 / 45.3 |
+| Flash-Next 4.27bpw | 30K | 2 | 1,315.6 / 1,214.0 / 1,335.0 | 58.5 / 63.3 / 60.2 |
+| Flash-Next 4.27bpw | 30K | 3 | 1,302.4 / 1,285.8 / 1,263.3 | 65.5 / 62.6 / 63.8 |
+| Flash-Next 4.27bpw | 150K | 1 | 1,358.2 / 1,345.7 / 1,218.8 | 36.3 / 40.4 / 41.5 |
+| Flash-Next 4.27bpw | 150K | 2 | 1,353.4 / 1,281.4 / 1,270.8 | 50.3 / 55.7 / 52.4 |
+| Flash-Next 4.27bpw | 150K | 3 | 1,303.6 / 1,263.0 / 1,118.3 | 44.0 / 46.7 / 45.4 |
+| 35B Balanced | 30K | 1 | 3,254.9 / 2,797.3 / 1,687.6 | 63.6 / 62.6 / 63.4 |
+| 35B Balanced | 150K | 1 | 1,829.5 / 968.9 / 696.4 | 35.8 / 36.0 / 35.8 |
 
-Speeds are in tok/s. Middle covers 25%–62.5% of generated tokens and Late covers
-62.5%–100%. Alpha is the MTP draft acceptance rate.
-
-| Input size | Mode and workload | Prefill | Full Decode | Middle | Late | Alpha |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| 20K | MTP simple prompt | 936 | 60.2 | 61.4 | 61.3 | 0.994 |
-| 20K | MTP complex prompt | 937 | 39.9 | 42.0 | 39.7 | 0.594 |
-| 20K | No-MTP simple prompt | 1,035 | 37.7 | 38.6 | 37.8 | — |
-| 20K | No-MTP complex prompt | 1,034 | 35.0 | 35.1 | 36.8 | — |
-| 150K | MTP simple prompt | 769 | 48.1 | 49.2 | 46.8 | 0.979 |
-| 150K | MTP complex prompt | 766 | 33.4 | 35.5 | 34.3 | 0.642 |
-| 150K | No-MTP simple prompt | 888 | 32.4 | 32.0 | 32.9 | — |
-| 150K | No-MTP complex prompt | 889 | 30.8 | 31.4 | 31.2 | — |
-
-Actual input lengths for the 20K simple / complex prompts are **19,988 / 20,019**
-tokens; the 150K inputs contain **149,849 / 149,857** tokens.
-
-| Mode and workload | Prefill change, 150K vs 20K | Full Decode change |
-| --- | ---: | ---: |
-| MTP simple prompt | -17.8% | -20.1% |
-| MTP complex prompt | -18.2% | -16.3% |
-| No-MTP simple prompt | -14.2% | -14.1% |
-| No-MTP complex prompt | -14.0% | -12.0% |
-
-[20K test setup, results, and analysis](documentation/evidence/benchmarks/2026-09-24-qwen38-mtp-20k.md).
-
-</details>
-
-### 0.8.0: Qwen3.6 35B without MTP
-
-**The complex prompt generates at 59.1 tok/s with 20K input and 39.0 tok/s
-with 150K input.**
-
-- **Model:** `Qwen3.6-35B-A3B-APEX-I-Balanced`, without MTP.
-- **Hardware and OS:** the same RX 7900 XTX 24 GiB, Ryzen 5 5600X, 64 GiB DDR4,
-  and Windows 11 system.
-- **Test settings:** automatic aggressive-performance profile, Q8 K/V, greedy,
-  thinking disabled, and single-stream generation. Context capacity is 32K for
-  the 20K input and `ctx=163840` for the 150K input.
-
-Prompt is the actual input token count. Prefill and Decode are measured in
-tok/s. Middle and Late cover 25%–62.5% and 62.5%–100% of generated tokens.
-
-| Input / workload | Prompt | Prefill | Full Decode | Middle | Late |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 20K simple prompt | 20,041 | 2,484 | **65.6** | 66.7 | 66.8 |
-| 20K complex prompt | 20,049 | 2,421 | **59.1** | 59.5 | 62.6 |
-| 150K simple prompt | 149,849 | 1,135 | **39.9** | 40.3 | 39.9 |
-| 150K complex prompt | 149,857 | 1,140 | **39.0** | 39.6 | 39.8 |
+At 150K, Flash-Next's three-stream total is lower than its two-stream total;
+concurrency gains are not linear. The full matrix completed 36 rounds and 72
+stream responses without request failures; both warm rounds hit the expected
+KV cache. Flash-Next ran with tight Windows commit headroom, which
+can also affect reproducibility.
 
 ## Community results
 
 **AMD, NVIDIA RTX, and Intel Arc all have user-tested configurations and
 generation-speed reports.**
 
-| GPU and memory | Model and conditions | Generation speed | Version and source |
-| --- | --- | ---: | --- |
-| **AMD RX 7700 XT 12GB + 64GB RAM** | Ornith 1.5 35B-A3B, `serve`, 131K context capacity | **41.5–42.7 tok/s** | v0.5.2 community baseline, [PR #21](https://github.com/Headmaster218/MoE4All/pull/21) |
-| **Intel Arc A770 16GB + 64GB DDR4-3200** | Ornith 1.5 35B Q4_K_M, F16 KV, 96K context capacity, three REAL-workload runs | **30.15–30.28 tok/s** | v0.6.0-beta.1, [Issue #41](https://github.com/Headmaster218/MoE4All/issues/41) |
-| **NVIDIA RTX 3090 Ti + 64GB RAM** | Successful community run; model, quantization, and context were not included in the original comment | **about 29 tok/s** | Version not reported, [Bilibili user report](https://www.bilibili.com/video/BV1ALha63Eyd/) (rpid `318146261056`) |
+| GPU / CPU and memory | Model and conditions | Prefill | Decode | Version and source |
+| --- | --- | ---: | ---: | --- |
+| **AMD R9700 + Ryzen 9 9950X3D + 48GB RAM** | Flash-Next; quantization and context not reported | **800-1,100 tok/s** | **20-50 tok/s** | v0.10.0, user report |
+| **Intel Arc A770 16GB + 64GB DDR4-3200** | Flash-Next, three runs; quantization and context not reported | Not reported | **17.44 / 17.30 / 17.45 tok/s** | v0.10.0, user report |
+| **AMD RX 7700 XT 12GB + 64GB RAM** | Ornith 1.5 35B-A3B, `serve`, 131K context capacity | Not reported | **41.5–42.7 tok/s** | v0.5.2 community baseline, [PR #21](https://github.com/Headmaster218/MoE4All/pull/21) |
+| **Intel Arc A770 16GB + 64GB DDR4-3200** | Ornith 1.5 35B Q4_K_M, F16 KV, 96K context capacity, three REAL-workload runs | Not reported | **30.15–30.28 tok/s** | v0.6.0-beta.1, [Issue #41](https://github.com/Headmaster218/MoE4All/issues/41) |
+| **NVIDIA RTX 3090 Ti + 64GB RAM** | Successful community run; model, quantization, and context were not included in the original comment | Not reported | **about 29 tok/s** | Version not reported, [Bilibili user report](https://www.bilibili.com/video/BV1ALha63Eyd/) (rpid `318146261056`) |
+
+Community speeds retain the users' original definitions and were not independently retested. Average versus peak was not specified, so they are not directly comparable to the fixed-window peak table above.
 
 Share successful configurations in
 [Discussions](https://github.com/Headmaster218/MoE4All/discussions), or report
@@ -196,8 +198,11 @@ context, automatic profile or launch command, and Prefill/Decode speeds.
   it after a server restart.
 - **Long context:** supports quantized KV Cache, KV overflow, and long-context
   performance tests.
-- **Qwen3.8 MTP (0.8.0 preview):** optional single-stream speculative decoding;
+- **Qwen3.8 MTP:** optional single-stream and two-slot opportunistic speculative decoding;
   gains depend on draft acceptance. Setup is covered in [Quick start](#quick-start).
+- **Experimental CPU miss offload:** disabled by default, requiring AVX2 + FMA3.
+  On a Ryzen 5 5600X, four cores handling one miss delivered roughly the same
+  end-to-end speed as the GPU path. A stronger CPU may help; benchmark locally.
 - **Measurement and diagnostics:** built-in prefill/decode benchmarks, synthetic
   depth, and paging statistics.
 

@@ -362,6 +362,126 @@ fn qwen4_primitives_match_reference() {
     );
     assert!(maxerr(&inject_cpu, &inject_ref) < 1e-6);
 
+    let norm_in = gen(hc * ne, 37);
+    let eps = 1e-6f32;
+    let mut grouped_norm_ref = vec![0.0f32; wide_n];
+    for r in 0..rows {
+        for h in 0..hc {
+            let base = (r * hc + h) * ne;
+            let sum_sq = residual_in[base..base + ne]
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>();
+            let scale = (sum_sq / ne as f32 + eps).sqrt().recip();
+            for d in 0..ne {
+                grouped_norm_ref[base + d] = residual_in[base + d] * scale * norm_in[h * ne + d];
+            }
+        }
+    }
+    let mut grouped_norm_graph = Graph::new();
+    let grouped_x = grouped_norm_graph.input(f32d(wide_n));
+    let grouped_norm = grouped_norm_graph.weight(f32d(hc * ne));
+    let grouped_dst = grouped_norm_graph.output(f32d(wide_n));
+    grouped_norm_graph.push(Op::QwenHcNorm {
+        x: grouped_x,
+        norm: grouped_norm,
+        dst: grouped_dst,
+        rows: rows as u32,
+        hc: hc as u32,
+        n_embd: ne as u32,
+        eps,
+    });
+    let grouped_norm_cpu = run(
+        &cpu,
+        &grouped_norm_graph,
+        &[(grouped_x, &residual_in)],
+        &[(grouped_norm, &norm_in)],
+        grouped_dst,
+        wide_n,
+    );
+    assert!(maxerr(&grouped_norm_cpu, &grouped_norm_ref) < 2e-6);
+
+    let mut inject_norm_ref = vec![0.0f32; wide_n];
+    for r in 0..rows {
+        for h in 0..hc {
+            let base = (r * hc + h) * ne;
+            let sum_sq = inject_ref[base..base + ne]
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>();
+            let scale = (sum_sq / ne as f32 + eps).sqrt().recip();
+            for d in 0..ne {
+                inject_norm_ref[base + d] = inject_ref[base + d] * scale * norm_in[h * ne + d];
+            }
+        }
+    }
+
+    let mut fused_residual_graph = Graph::new();
+    let fused_residual = fused_residual_graph.input(f32d(wide_n));
+    let fused_block = fused_residual_graph.input(f32d(rows * ne));
+    let fused_gate = fused_residual_graph.input(f32d(rows * hc));
+    let fused_norm = fused_residual_graph.weight(f32d(hc * ne));
+    let fused_residual_dst = fused_residual_graph.output(f32d(wide_n));
+    let fused_normed_dst = fused_residual_graph.internal(f32d(wide_n));
+    fused_residual_graph.push(Op::QwenHcInjectNorm {
+        residual: fused_residual,
+        block: fused_block,
+        gate: fused_gate,
+        norm: fused_norm,
+        residual_dst: fused_residual_dst,
+        normed_dst: fused_normed_dst,
+        rows: rows as u32,
+        hc: hc as u32,
+        n_embd: ne as u32,
+        eps,
+    });
+    let fused_residual_cpu = run(
+        &cpu,
+        &fused_residual_graph,
+        &[
+            (fused_residual, &residual_in),
+            (fused_block, &block_in),
+            (fused_gate, &inject_gate_in),
+        ],
+        &[(fused_norm, &norm_in)],
+        fused_residual_dst,
+        wide_n,
+    );
+    assert!(maxerr(&fused_residual_cpu, &inject_ref) < 1e-6);
+
+    let mut fused_normed_graph = Graph::new();
+    let fused_residual = fused_normed_graph.input(f32d(wide_n));
+    let fused_block = fused_normed_graph.input(f32d(rows * ne));
+    let fused_gate = fused_normed_graph.input(f32d(rows * hc));
+    let fused_norm = fused_normed_graph.weight(f32d(hc * ne));
+    let fused_residual_dst = fused_normed_graph.internal(f32d(wide_n));
+    let fused_normed_dst = fused_normed_graph.output(f32d(wide_n));
+    fused_normed_graph.push(Op::QwenHcInjectNorm {
+        residual: fused_residual,
+        block: fused_block,
+        gate: fused_gate,
+        norm: fused_norm,
+        residual_dst: fused_residual_dst,
+        normed_dst: fused_normed_dst,
+        rows: rows as u32,
+        hc: hc as u32,
+        n_embd: ne as u32,
+        eps,
+    });
+    let fused_normed_cpu = run(
+        &cpu,
+        &fused_normed_graph,
+        &[
+            (fused_residual, &residual_in),
+            (fused_block, &block_in),
+            (fused_gate, &inject_gate_in),
+        ],
+        &[(fused_norm, &norm_in)],
+        fused_normed_dst,
+        wide_n,
+    );
+    assert!(maxerr(&fused_normed_cpu, &inject_norm_ref) < 2e-6);
+
     let mut ple_graph = Graph::new();
     let ple_key = ple_graph.input(f32d(wide_n));
     let ple_query = ple_graph.input(f32d(wide_n));

@@ -1,0 +1,228 @@
+#version 460
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Qwen3.8 Prefill QSA fast path. One workgroup owns one (row, KV head), stages an
+// sixteen-token Q8 K/V tile once, then consumes it for all twelve GQA query heads in
+// four-head micro-batches. Query and online-softmax output state live in LDS so the
+// hot K/V tile can be reused without the register pressure of a monolithic GQA12
+// kernel. This production-specialized path deliberately covers only hd256, Q8 K/V,
+// segmented caches and a 12:1 GQA ratio; the recorder retains the general fallback.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint kv_len;
+    uint n_head;
+    uint n_kv;
+    uint head_dim;
+    uint top_blocks;
+    uint ratio;
+    float scale;
+    uint kcap;
+    uint vcap;
+    uint segment_shift;
+} pc;
+
+layout(binding = 0) readonly buffer QB { uint q[]; };
+layout(binding = 1) readonly buffer KB { uvec2 k_segments[]; };
+layout(binding = 2) readonly buffer VB { uvec2 v_segments[]; };
+layout(binding = 3) readonly buffer IB { uint indices[]; };
+layout(binding = 4) writeonly buffer DB { float dst[]; };
+
+#define KV_SEGMENTED
+#include "kv_addr.glsl"
+
+const uint SUBGROUPS = 4u;
+const uint HEAD_DIM = 256u;
+const uint GQA_HEADS = 12u;
+const uint TILE_KEYS = 16u;
+const uint HALF_WORDS = HEAD_DIM / 2u;
+const uint QUADS = HEAD_DIM / 4u;
+
+shared uint key_half[TILE_KEYS * HALF_WORDS];
+shared uint value_half[TILE_KEYS * HALF_WORDS];
+shared float output_state[GQA_HEADS * HEAD_DIM];
+shared float softmax_max[GQA_HEADS];
+shared float softmax_sum[GQA_HEADS];
+shared uvec2 tile_k_address[TILE_KEYS];
+shared uvec2 tile_v_address[TILE_KEYS];
+shared uint tile_local_base[TILE_KEYS];
+
+float half_at(uint packed, uint component) {
+    vec2 pair = unpackHalf2x16(packed);
+    return (component & 1u) == 0u ? pair.x : pair.y;
+}
+
+void q8_quad(
+    uint64_t base,
+    uint local,
+    uint segment_elems,
+    out uint low_pair,
+    out uint high_pair
+) {
+    int codes = int(kv_word(base, local >> 2u));
+    uint block = local >> 5u;
+    uint scales = kv_word(base, (segment_elems >> 2u) + (block >> 1u));
+    float scale = unpackHalf2x16(scales)[block & 1u];
+    vec2 low = vec2(
+        float(bitfieldExtract(codes, 0, 8)),
+        float(bitfieldExtract(codes, 8, 8))
+    ) * scale;
+    vec2 high = vec2(
+        float(bitfieldExtract(codes, 16, 8)),
+        float(bitfieldExtract(codes, 24, 8))
+    ) * scale;
+    low_pair = packHalf2x16(low);
+    high_pair = packHalf2x16(high);
+}
+
+uint source_row(uint row, uint logical, uint selected, uint complete) {
+    uint selected_rows = selected * pc.ratio;
+    if (logical < selected_rows) {
+        uint slot = logical / pc.ratio;
+        uint block = indices[row * pc.top_blocks + slot];
+        return block * pc.ratio + logical % pc.ratio;
+    }
+    return complete * pc.ratio + logical - selected_rows;
+}
+
+void main() {
+    uint local_id = gl_LocalInvocationIndex;
+    uint subgroup = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint job = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint row = job / pc.n_kv;
+    uint kv_head = job - row * pc.n_kv;
+    uint group = pc.n_head / pc.n_kv;
+    if (row >= pc.rows || pc.head_dim != HEAD_DIM || group != GQA_HEADS) { return; }
+
+    uint head_base = kv_head * GQA_HEADS;
+    uint q_word_base = ((row * pc.n_head + head_base) * HEAD_DIM) >> 1u;
+    for (uint i = local_id; i < GQA_HEADS * HEAD_DIM; i += 128u) {
+        output_state[i] = 0.0;
+    }
+    if (local_id < GQA_HEADS) {
+        softmax_max[local_id] = -3.402823466e+38;
+        softmax_sum[local_id] = 0.0;
+    }
+    barrier();
+
+    uint visible = pc.kv_len - pc.rows + row + 1u;
+    uint complete = visible / pc.ratio;
+    uint tail = visible - complete * pc.ratio;
+    uint selected = min(pc.top_blocks, complete);
+    uint keys = selected * pc.ratio + tail;
+    uint segment_elems = 1u << pc.segment_shift;
+
+    for (uint tile_start = 0u; tile_start < keys; tile_start += TILE_KEYS) {
+        uint tile_count = min(TILE_KEYS, keys - tile_start);
+        if (local_id < tile_count) {
+            uint src_row = source_row(row, tile_start + local_id, selected, complete);
+            uint elem_base = (src_row * pc.n_kv + kv_head) * HEAD_DIM;
+            uint segment = kv_segment(elem_base, pc.segment_shift);
+            tile_k_address[local_id] = k_segments[segment];
+            tile_v_address[local_id] = v_segments[segment];
+            tile_local_base[local_id] = kv_segment_local(elem_base, pc.segment_shift);
+        }
+        barrier();
+
+        uint tile_quads = tile_count * QUADS;
+        for (uint packed = local_id; packed < tile_quads; packed += 128u) {
+            uint key = packed / QUADS;
+            uint quad = packed - key * QUADS;
+            uint local = tile_local_base[key] + quad * 4u;
+            uint pair_base = key * HALF_WORDS + quad * 2u;
+            uint low_pair;
+            uint high_pair;
+            q8_quad(
+                kv_segment_base(tile_k_address[key]),
+                local,
+                segment_elems,
+                low_pair,
+                high_pair
+            );
+            key_half[pair_base] = low_pair;
+            key_half[pair_base + 1u] = high_pair;
+            q8_quad(
+                kv_segment_base(tile_v_address[key]),
+                local,
+                segment_elems,
+                low_pair,
+                high_pair
+            );
+            value_half[pair_base] = low_pair;
+            value_half[pair_base + 1u] = high_pair;
+        }
+        barrier();
+
+        for (uint head_batch = 0u; head_batch < GQA_HEADS; head_batch += SUBGROUPS) {
+            uint query = head_batch + subgroup;
+            float qv[8];
+            float accum[8];
+            for (uint component = 0u; component < 8u; ++component) {
+                uint d = lane + component * 32u;
+                qv[component] = half_at(
+                    q[q_word_base + query * HALF_WORDS + (d >> 1u)],
+                    d
+                );
+                accum[component] = output_state[query * HEAD_DIM + d];
+            }
+            float local_max = softmax_max[query];
+            float local_sum = softmax_sum[query];
+
+            for (uint key = 0u; key < tile_count; ++key) {
+                float dot = 0.0;
+                for (uint component = 0u; component < 8u; ++component) {
+                    uint d = lane + component * 32u;
+                    float kval = half_at(
+                        key_half[key * HALF_WORDS + (d >> 1u)],
+                        d
+                    );
+                    dot += qv[component] * kval;
+                }
+                float score = subgroupAdd(dot) * pc.scale;
+                float next_max = max(local_max, score);
+                float previous_scale = 1.0;
+                float value_scale = 1.0;
+                if (score > local_max) {
+                    previous_scale = local_sum == 0.0 ? 0.0 : exp(local_max - score);
+                } else {
+                    value_scale = exp(score - local_max);
+                }
+                local_sum = local_sum * previous_scale + value_scale;
+                for (uint component = 0u; component < 8u; ++component) {
+                    uint d = lane + component * 32u;
+                    float value = half_at(
+                        value_half[key * HALF_WORDS + (d >> 1u)],
+                        d
+                    );
+                    accum[component] = accum[component] * previous_scale
+                        + value_scale * value;
+                }
+                local_max = next_max;
+            }
+
+            for (uint component = 0u; component < 8u; ++component) {
+                uint d = lane + component * 32u;
+                output_state[query * HEAD_DIM + d] = accum[component];
+            }
+            if (lane == 0u) {
+                softmax_max[query] = local_max;
+                softmax_sum[query] = local_sum;
+            }
+        }
+        barrier();
+    }
+
+    for (uint i = local_id; i < GQA_HEADS * HEAD_DIM; i += 128u) {
+        uint query = i / HEAD_DIM;
+        uint d = i - query * HEAD_DIM;
+        uint out_base = (row * pc.n_head + head_base + query) * HEAD_DIM;
+        dst[out_base + d] = output_state[i] / softmax_sum[query];
+    }
+}

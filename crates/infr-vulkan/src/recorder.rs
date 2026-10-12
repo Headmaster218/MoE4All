@@ -968,6 +968,8 @@ pub struct Recorder<'a> {
     submit_query_pool: std::cell::Cell<vk::QueryPool>,
     submit_timing_token: std::cell::Cell<Option<crate::SubmitTimingToken>>,
     submit_pager_profile: std::cell::Cell<bool>,
+    timeline_query: RefCell<Option<crate::timeline::Query>>,
+    timeline_lifetime: RefCell<Option<infr_core::timeline::Span>>,
     ts_labels: RefCell<Vec<&'static str>>,
     /// Dispatches past the query-pool capacity: counted (and reported) instead of stamped.
     ts_dropped: std::cell::Cell<usize>,
@@ -1042,6 +1044,7 @@ impl<'a> Recorder<'a> {
     }
 
     fn new_inner(backend: &'a VulkanBackend, persistent: bool) -> Result<Self> {
+        let _timeline_acquire = infr_core::timeline::span("recorder_acquire");
         let profile_acquire_t0 = pager_profile::start();
         let device = &backend.shared.device;
         let cmd_pool = backend.shared.cmd_pool.lock().unwrap();
@@ -1165,6 +1168,34 @@ impl<'a> Recorder<'a> {
         if let Some(elapsed) = pager_profile::elapsed(profile_acquire_t0) {
             pager_profile::record_command_recorder_acquire(elapsed);
         }
+        let timeline_query = if persistent {
+            None
+        } else {
+            match crate::timeline::Query::new(
+                &backend.shared,
+                cmd,
+                "main",
+                backend.shared.submit_timestamp_valid_bits,
+            ) {
+                Ok(query) => query,
+                Err(error) => {
+                    unsafe {
+                        if query_pool != vk::QueryPool::null() {
+                            device.destroy_query_pool(query_pool, None);
+                        }
+                    }
+                    backend.shared.return_submit_timing_query(submit_query_pool);
+                    backend.shared.recorder_cmds.lock().unwrap().push(cmd);
+                    backend
+                        .shared
+                        .recorder_desc_pools
+                        .lock()
+                        .unwrap()
+                        .push(pool);
+                    return Err(error);
+                }
+            }
+        };
         Ok(Self {
             be: backend,
             cmd,
@@ -1186,6 +1217,8 @@ impl<'a> Recorder<'a> {
             submit_query_pool: std::cell::Cell::new(submit_query_pool),
             submit_timing_token: std::cell::Cell::new(submit_timing_token),
             submit_pager_profile: std::cell::Cell::new(submit_pager_profile),
+            timeline_query: RefCell::new(timeline_query),
+            timeline_lifetime: RefCell::new(infr_core::timeline::span("recorder_lifetime")),
             ts_labels: RefCell::new(Vec::new()),
             ts_dropped: std::cell::Cell::new(0),
             next_label: std::cell::Cell::new(None),
@@ -1329,6 +1362,9 @@ impl<'a> Recorder<'a> {
     /// longer stamp by hand (use [`label_next`](Self::label_next) to override a too-generic
     /// kernel name).
     fn stamp(&self, label: &'static str) {
+        if let Some(query) = self.timeline_query.borrow_mut().as_mut() {
+            query.mark(crate::timeline::group(label));
+        }
         // Every dispatch funnels through here, so this is also where the recorder counts them —
         // the submit splitter (`Recorder::dispatches`) needs the count whether or not INFR_PROF_OPS
         // is on.
@@ -1556,6 +1592,7 @@ impl<'a> Recorder<'a> {
         args: vk::Buffer,
         args_off: u64,
     ) {
+        let _timeline_encode = infr_core::timeline::span("command_encode");
         // Auto-label (INFR_PROF_OPS): every dispatch stamps a timestamp tagged with its kernel name
         // — the chokepoint knows the kernel, so no op method needs a manual stamp call. Placed
         // before `sync` so a barrier's cost lands in the op it fences (same as the old
@@ -1610,6 +1647,7 @@ impl<'a> Recorder<'a> {
         gy: u32,
         gz: u32,
     ) {
+        let _timeline_encode = infr_core::timeline::span("command_encode");
         // Auto-label (INFR_PROF_OPS): see `dispatch_indirect` — kernel-name timestamp per dispatch.
         self.stamp(k.name);
         // The last `n_out` bound buffers are outputs; the rest are inputs. Inputs keep in-place
@@ -2082,6 +2120,79 @@ impl<'a> Recorder<'a> {
             k,
             &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
             1,
+            &push,
+            groups,
+        );
+    }
+
+    /// Two independent F32 projections over the same activation in one dispatch. The paired
+    /// shader doubles the logical output-column grid but retains the exact scalar/vec4/MROW
+    /// variant selected by two standalone [`Self::linear_f32`] calls.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_f32_pair(
+        &self,
+        w_a: &dyn Buffer,
+        w_b: &dyn Buffer,
+        x: &dyn Buffer,
+        y_a: &dyn Buffer,
+        y_b: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.label_gemv("lin_f32_pair", rows, in_f, out_f * 2);
+        let addr_a = w_a
+            .device_addr()
+            .expect("resident-BDA weight: linear_f32_pair weight_a needs a device address");
+        let addr_b = w_b
+            .device_addr()
+            .expect("resident-BDA weight: linear_f32_pair weight_b needs a device address");
+        let use_mrow = rows > 1 && self.vk().f32_mrow;
+        let use_v4 = in_f.is_multiple_of(4) && self.vk().f32_v4;
+        let (name, spv, groups) = if use_v4 && rows == 1 {
+            (
+                "linear_f32r_pair_v4",
+                crate::gemm::linear_f32r_pair_v4_spv(),
+                (out_f * 2) as u32,
+            )
+        } else if use_v4 && rows <= 4 {
+            (
+                "linear_f32r_pair_mrow4_v4",
+                crate::gemm::linear_f32r_pair_mrow4_v4_spv(),
+                (out_f * 2 * rows.div_ceil(4)) as u32,
+            )
+        } else if use_v4 {
+            (
+                "linear_f32r_pair_mrow8_v4",
+                crate::gemm::linear_f32r_pair_mrow8_v4_spv(),
+                (out_f * 2 * rows.div_ceil(8)) as u32,
+            )
+        } else if use_mrow {
+            (
+                "linear_f32r_pair_mrow8",
+                crate::gemm::linear_f32r_pair_mrow8_spv(),
+                (out_f * 2 * rows.div_ceil(8)) as u32,
+            )
+        } else {
+            (
+                "linear_f32r_pair",
+                crate::gemm::linear_f32r_pair_spv(),
+                (rows * out_f * 2) as u32,
+            )
+        };
+        let k = self.be.kernel(name, spv, 4, 28);
+        let mut push = [0u8; 28];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(addr_a as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&((addr_a >> 32) as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&(addr_b as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&((addr_b >> 32) as u32).to_ne_bytes());
+        self.dispatch_wide(
+            k,
+            &[Self::vkb(x), Self::vkb(x), Self::vkb(y_a), Self::vkb(y_b)],
+            2,
             &push,
             groups,
         );
@@ -4594,6 +4705,155 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Qwen3.8 decode HC fast path. The Q8_0 down projection, its scaled SiLU, and the four-row
+    /// F32 inject projection share the input and one dispatch. Both weights remain independently
+    /// addressable, so this adds no packed copy or persistent allocation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen_hc_down_inject(
+        &self,
+        x: &dyn Buffer,
+        down_weight: &dyn Buffer,
+        inject_weight: &dyn Buffer,
+        low_dst: &dyn Buffer,
+        inject_dst: &dyn Buffer,
+        in_f: u32,
+        low_rank: u32,
+        hc: u32,
+        silu_scale: f32,
+    ) {
+        self.qwen_hc_down_inject_quantized(
+            x,
+            down_weight,
+            inject_weight,
+            low_dst,
+            inject_dst,
+            in_f,
+            low_rank,
+            hc,
+            silu_scale,
+            infr_core::DType::F32,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen_hc_down_inject_quantized(
+        &self,
+        x: &dyn Buffer,
+        down_weight: &dyn Buffer,
+        inject_weight: &dyn Buffer,
+        low_dst: &dyn Buffer,
+        inject_dst: &dyn Buffer,
+        in_f: u32,
+        low_rank: u32,
+        hc: u32,
+        silu_scale: f32,
+        inject_dtype: infr_core::DType,
+    ) {
+        let pf4 = self.be.cfg().kernels.vulkan.qwen_hc_down_prefetch
+            && self.be.prefers_qwen_hc_down_prefetch4()
+            && in_f == 10_240
+            && low_rank == 320;
+        // The Q8-inject fusion measured best with the base layout; PF4 remains F32-only.
+        let (name, spv) = if inject_dtype == infr_core::DType::Q8_0 {
+            (
+                "qwen_hc_down_inject_q8",
+                crate::gemm::qwen_hc_down_inject_q8_spv(),
+            )
+        } else if pf4 {
+            (
+                "qwen_hc_down_inject_pf4",
+                crate::gemm::qwen_hc_down_inject_pf4_spv(),
+            )
+        } else {
+            (
+                "qwen_hc_down_inject",
+                crate::gemm::qwen_hc_down_inject_spv(),
+            )
+        };
+        self.qwen_hc_down_inject_kernel(
+            name,
+            spv,
+            x,
+            down_weight,
+            inject_weight,
+            low_dst,
+            inject_dst,
+            in_f,
+            low_rank,
+            hc,
+            silu_scale,
+        );
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn qwen_hc_down_inject_prefetch(
+        &self,
+        x: &dyn Buffer,
+        down_weight: &dyn Buffer,
+        inject_weight: &dyn Buffer,
+        low_dst: &dyn Buffer,
+        inject_dst: &dyn Buffer,
+        in_f: u32,
+        low_rank: u32,
+        hc: u32,
+        silu_scale: f32,
+    ) {
+        self.qwen_hc_down_inject_kernel(
+            "qwen_hc_down_inject_pf4",
+            crate::gemm::qwen_hc_down_inject_pf4_spv(),
+            x,
+            down_weight,
+            inject_weight,
+            low_dst,
+            inject_dst,
+            in_f,
+            low_rank,
+            hc,
+            silu_scale,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn qwen_hc_down_inject_kernel(
+        &self,
+        kernel_name: &'static str,
+        spv: &'static [u32],
+        x: &dyn Buffer,
+        down_weight: &dyn Buffer,
+        inject_weight: &dyn Buffer,
+        low_dst: &dyn Buffer,
+        inject_dst: &dyn Buffer,
+        in_f: u32,
+        low_rank: u32,
+        hc: u32,
+        silu_scale: f32,
+    ) {
+        let down_addr = down_weight
+            .device_addr()
+            .expect("Qwen HC down weight requires a device address");
+        let inject_addr = inject_weight
+            .device_addr()
+            .expect("Qwen HC inject weight requires a device address");
+        let kernel = self.be.kernel(kernel_name, spv, 3, 32);
+        let mut push = [0u8; 32];
+        push[0..4].copy_from_slice(&in_f.to_ne_bytes());
+        push[4..8].copy_from_slice(&low_rank.to_ne_bytes());
+        push[8..12].copy_from_slice(&hc.to_ne_bytes());
+        push[12..16].copy_from_slice(&silu_scale.to_ne_bytes());
+        push[16..20].copy_from_slice(&(down_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((down_addr >> 32) as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&(inject_addr as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&((inject_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch_wide(
+            kernel,
+            &[Self::vkb(x), Self::vkb(low_dst), Self::vkb(inject_dst)],
+            2,
+            &push,
+            low_rank + hc,
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn qwen_hc_inject(
         &self,
@@ -4624,6 +4884,74 @@ impl<'a> Recorder<'a> {
             1,
             &push,
             total.div_ceil(64),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen_hc_norm(
+        &self,
+        x: &dyn Buffer,
+        norm: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: u32,
+        hc: u32,
+        n_embd: u32,
+        eps: f32,
+    ) {
+        let kernel = self
+            .be
+            .kernel_sg("qwen_hc_norm", crate::gemm::qwen_hc_norm_spv(), 3, 12, 32);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&hc.to_ne_bytes());
+        push[4..8].copy_from_slice(&n_embd.to_ne_bytes());
+        push[8..12].copy_from_slice(&eps.to_ne_bytes());
+        self.dispatch(
+            kernel,
+            &[Self::vkb(x), Self::vkb(norm), Self::vkb(dst)],
+            1,
+            &push,
+            rows * hc,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen_hc_inject_norm(
+        &self,
+        residual: &dyn Buffer,
+        block: &dyn Buffer,
+        gate: &dyn Buffer,
+        norm: &dyn Buffer,
+        residual_dst: &dyn Buffer,
+        normed_dst: &dyn Buffer,
+        rows: u32,
+        hc: u32,
+        n_embd: u32,
+        eps: f32,
+    ) {
+        let kernel = self.be.kernel_sg(
+            "qwen_hc_inject_norm",
+            crate::gemm::qwen_hc_inject_norm_spv(),
+            6,
+            12,
+            32,
+        );
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&hc.to_ne_bytes());
+        push[4..8].copy_from_slice(&n_embd.to_ne_bytes());
+        push[8..12].copy_from_slice(&eps.to_ne_bytes());
+        self.dispatch(
+            kernel,
+            &[
+                Self::vkb(residual),
+                Self::vkb(block),
+                Self::vkb(gate),
+                Self::vkb(norm),
+                Self::vkb(residual_dst),
+                Self::vkb(normed_dst),
+            ],
+            1,
+            &push,
+            rows * hc,
         );
     }
 
@@ -4866,6 +5194,38 @@ impl<'a> Recorder<'a> {
             1,
             &push,
             rows as u32, // one workgroup per row (cooperative reduction)
+        );
+    }
+
+    /// Qwen3.8 variant of [`Self::rmsnorm_gate`], using a Sigmoid rather than SiLU gate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_gate_sigmoid(
+        &self,
+        x: &dyn Buffer,
+        w: &dyn Buffer,
+        z: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) {
+        let k = self.be.kernel_sg(
+            "rmsnorm_gate_sigmoid",
+            crate::gemm::rmsnorm_gate_sigmoid_spv(),
+            4,
+            12,
+            32,
+        );
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&eps.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(w), Self::vkb(z), Self::vkb(y)],
+            1,
+            &push,
+            rows as u32,
         );
     }
 
@@ -8833,6 +9193,43 @@ impl<'a> Recorder<'a> {
         n: usize,
         clamp: Option<f32>,
     ) {
+        self.silu_mul_at(gate, up, y, n, 0, clamp);
+    }
+
+    pub(crate) fn silu_mul_masked(
+        &self,
+        gate: &dyn Buffer,
+        up: &dyn Buffer,
+        y: &dyn Buffer,
+        width: usize,
+        mut mask: u32,
+        clamp: Option<f32>,
+    ) {
+        debug_assert!(width.is_multiple_of(64));
+        while mask != 0 {
+            let first = mask.trailing_zeros();
+            let count = (mask >> first).trailing_ones();
+            self.silu_mul_at(
+                gate,
+                up,
+                y,
+                width * count as usize,
+                width * first as usize,
+                clamp,
+            );
+            mask &= !((((u32::MAX >> (32 - count)) as u64) << first) as u32);
+        }
+    }
+
+    fn silu_mul_at(
+        &self,
+        gate: &dyn Buffer,
+        up: &dyn Buffer,
+        y: &dyn Buffer,
+        n: usize,
+        offset: usize,
+        clamp: Option<f32>,
+    ) {
         let k = self
             .be
             .kernel("silu_mul", crate::gemm::silu_mul_spv(), 3, 36);
@@ -8840,9 +9237,16 @@ impl<'a> Recorder<'a> {
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&(u32::from(clamp.is_some())).to_ne_bytes());
         push[32..36].copy_from_slice(&clamp.unwrap_or(0.0).to_ne_bytes());
+        let binding = |buffer| {
+            if offset == 0 {
+                Self::vkb(buffer)
+            } else {
+                Self::vkb_off(buffer, offset)
+            }
+        };
         self.dispatch(
             k,
-            &[Self::vkb(gate), Self::vkb(up), Self::vkb(y)],
+            &[binding(gate), binding(up), binding(y)],
             1,
             &push,
             (n as u32).div_ceil(64),
@@ -9167,6 +9571,68 @@ impl<'a> Recorder<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn qsa_prepare_off(
+        &self,
+        qk: &dyn Buffer,
+        norm: &dyn Buffer,
+        positions: &dyn Buffer,
+        raw_cache: &dyn Buffer,
+        query: &dyn Buffer,
+        rows: u32,
+        n_head: u32,
+        head_dim: u32,
+        rope_dim: u32,
+        theta: f32,
+        eps: f32,
+        pos: u32,
+        cap_rows: u32,
+        segment_shift: Option<u32>,
+        mrope_sections: Option<[u32; 4]>,
+        qk_byte_off: usize,
+        positions_byte_off: usize,
+        query_byte_off: usize,
+    ) {
+        let (name, spv) = match (segment_shift, mrope_sections) {
+            (Some(_), Some(_)) => (
+                "qsa_prepare_mrope_seg",
+                crate::gemm::qsa_prepare_mrope_seg_spv(),
+            ),
+            (None, Some(_)) => ("qsa_prepare_mrope", crate::gemm::qsa_prepare_mrope_spv()),
+            (Some(_), None) => ("qsa_prepare_seg", crate::gemm::qsa_prepare_seg_spv()),
+            (None, None) => ("qsa_prepare", crate::gemm::qsa_prepare_spv()),
+        };
+        let kernel = self.be.kernel(name, spv, 5, 52);
+        let mut push = [0u8; 52];
+        push[0..4].copy_from_slice(&rows.to_ne_bytes());
+        push[4..8].copy_from_slice(&n_head.to_ne_bytes());
+        push[8..12].copy_from_slice(&head_dim.to_ne_bytes());
+        push[12..16].copy_from_slice(&rope_dim.to_ne_bytes());
+        push[16..20].copy_from_slice(&theta.to_ne_bytes());
+        push[20..24].copy_from_slice(&eps.to_ne_bytes());
+        push[24..28].copy_from_slice(&pos.to_ne_bytes());
+        push[28..32].copy_from_slice(&cap_rows.to_ne_bytes());
+        push[32..36].copy_from_slice(&segment_shift.unwrap_or(0).to_ne_bytes());
+        if let Some(sections) = mrope_sections {
+            for (i, section) in sections.into_iter().enumerate() {
+                push[36 + i * 4..40 + i * 4].copy_from_slice(&section.to_ne_bytes());
+            }
+        }
+        self.dispatch_wide(
+            kernel,
+            &[
+                Self::vkb_byte_off(qk, qk_byte_off),
+                Self::vkb(norm),
+                Self::vkb_byte_off(positions, positions_byte_off),
+                Self::vkb(raw_cache),
+                Self::vkb_byte_off(query, query_byte_off),
+            ],
+            1,
+            &push,
+            rows * n_head,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn qsa_indexer(
         &self,
         q: &dyn Buffer,
@@ -9324,7 +9790,23 @@ impl<'a> Recorder<'a> {
         let segmented = segment_shifts.is_some();
         let h4 = rows > 1 && n_head == 4 && head_dim == 128;
         let decode8_h4 = decode8 && n_head == 4 && head_dim == 128;
-        let (score_name, score_spv, block_tile, query_tile) = if decode8_h4 && segmented {
+        let score_tile = self.vk().qsa_score_tile;
+        let (score_name, score_spv, block_tile, query_tile) = if h4 && segmented && score_tile == 64
+        {
+            (
+                "qsa_indexer_score_h4_t64_seg",
+                crate::gemm::qsa_indexer_score_h4_t64_seg_spv(),
+                64,
+                8,
+            )
+        } else if h4 && segmented && score_tile == 32 {
+            (
+                "qsa_indexer_score_h4_t32_seg",
+                crate::gemm::qsa_indexer_score_h4_t32_seg_spv(),
+                32,
+                8,
+            )
+        } else if decode8_h4 && segmented {
             (
                 "qsa_indexer_score_decode8_h4_seg",
                 crate::gemm::qsa_indexer_score_decode8_h4_seg_spv(),
@@ -9409,6 +9891,38 @@ impl<'a> Recorder<'a> {
             1,
         );
 
+        self.qsa_indexer_topk(
+            scores,
+            topk_work,
+            dst,
+            blocks,
+            top_blocks,
+            rows,
+            kv_len,
+            ratio,
+            dst_byte_off,
+            self.be.use_qsa_topk_scan(
+                rows as usize,
+                top_blocks as usize,
+                topk_work.is_some() && self.vk().qsa_topk_parallel,
+            ),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_indexer_topk(
+        &self,
+        scores: &dyn Buffer,
+        topk_work: Option<&dyn Buffer>,
+        dst: &dyn Buffer,
+        blocks: u32,
+        top_blocks: u32,
+        rows: u32,
+        kv_len: u32,
+        ratio: u32,
+        dst_byte_off: usize,
+        scan: bool,
+    ) {
         if let Some(work) = topk_work.filter(|_| rows == 1 && self.vk().qsa_topk_parallel) {
             let groups = blocks.div_ceil(1024).clamp(1, QSA_TOPK_PARALLEL_MAX_GROUPS);
             let state_base = groups * 256;
@@ -9418,12 +9932,22 @@ impl<'a> Recorder<'a> {
                 2,
                 20,
             );
-            let select_k = self.be.kernel(
-                "qsa_indexer_topk_select",
-                crate::gemm::qsa_indexer_topk_select_spv(),
-                1,
-                20,
-            );
+            let select_k = if scan {
+                self.be.kernel_sg(
+                    "qsa_indexer_topk_select_scan",
+                    crate::gemm::qsa_indexer_topk_select_scan_spv(),
+                    1,
+                    20,
+                    32,
+                )
+            } else {
+                self.be.kernel(
+                    "qsa_indexer_topk_select",
+                    crate::gemm::qsa_indexer_topk_select_spv(),
+                    1,
+                    20,
+                )
+            };
             let mut radix_push = [0u8; 20];
             radix_push[0..4].copy_from_slice(&blocks.to_ne_bytes());
             radix_push[4..8].copy_from_slice(&top_blocks.to_ne_bytes());
@@ -9441,12 +9965,22 @@ impl<'a> Recorder<'a> {
                 self.dispatch(select_k, &[Self::vkb(work)], 1, &radix_push, 1);
             }
 
-            let collect_k = self.be.kernel(
-                "qsa_indexer_topk_collect",
-                crate::gemm::qsa_indexer_topk_collect_spv(),
-                3,
-                12,
-            );
+            let collect_k = if scan {
+                self.be.kernel_sg(
+                    "qsa_indexer_topk_collect_scan",
+                    crate::gemm::qsa_indexer_topk_collect_scan_spv(),
+                    3,
+                    12,
+                    32,
+                )
+            } else {
+                self.be.kernel(
+                    "qsa_indexer_topk_collect",
+                    crate::gemm::qsa_indexer_topk_collect_spv(),
+                    3,
+                    12,
+                )
+            };
             let mut collect_push = [0u8; 12];
             collect_push[0..4].copy_from_slice(&blocks.to_ne_bytes());
             collect_push[4..8].copy_from_slice(&top_blocks.to_ne_bytes());
@@ -9463,12 +9997,22 @@ impl<'a> Recorder<'a> {
                 1,
             );
         } else {
-            let topk_k = self.be.kernel(
-                "qsa_indexer_topk",
-                crate::gemm::qsa_indexer_topk_spv(),
-                2,
-                20,
-            );
+            let topk_k = if scan {
+                self.be.kernel_sg(
+                    "qsa_indexer_topk_scan",
+                    crate::gemm::qsa_indexer_topk_scan_spv(),
+                    2,
+                    20,
+                    32,
+                )
+            } else {
+                self.be.kernel(
+                    "qsa_indexer_topk",
+                    crate::gemm::qsa_indexer_topk_spv(),
+                    2,
+                    20,
+                )
+            };
             let mut topk_push = [0u8; 20];
             topk_push[0..4].copy_from_slice(&blocks.to_ne_bytes());
             topk_push[4..8].copy_from_slice(&top_blocks.to_ne_bytes());
@@ -9559,36 +10103,81 @@ impl<'a> Recorder<'a> {
         dst_byte_off: usize,
     ) {
         let segmented = segment_shift.is_some();
-        let (name, spv) = match (k_q8, v_q8, segmented) {
-            (false, false, true) => (
+        let requested_gqa = self.vk().qsa_prefill_gqa;
+        let grouped = if k_q8 && v_q8 && segmented {
+            let group = n_head / n_kv.max(1);
+            match requested_gqa {
+                12 if group == 12 && head_dim == 256 => 12,
+                2 if group.is_multiple_of(2) => 2,
+                _ => 1,
+            }
+        } else {
+            1
+        };
+        let flash_gqa12 = grouped == 12 && self.vk().qsa_prefill_tile >= 32;
+        let coop_qk = flash_gqa12
+            && self.vk().qsa_prefill_coopmat
+            && self.be.caps().f16_coopmat()
+            && n_head >= 16;
+        let coop_pv = coop_qk && self.vk().qsa_prefill_coopmat_pv;
+        let (name, spv) = match (
+            k_q8,
+            v_q8,
+            segmented,
+            grouped,
+            flash_gqa12,
+            coop_qk,
+            coop_pv,
+        ) {
+            (true, true, true, 12, true, true, true) => (
+                "qsa_attention_batch_q8_seg_gqa12_flash_cm_qk_pv",
+                crate::gemm::qsa_attention_batch_q8_seg_gqa12_flash_cm_qk_pv_spv(),
+            ),
+            (true, true, true, 12, true, true, false) => (
+                "qsa_attention_batch_q8_seg_gqa12_flash_cm_qk",
+                crate::gemm::qsa_attention_batch_q8_seg_gqa12_flash_cm_qk_spv(),
+            ),
+            (true, true, true, 12, true, false, _) => (
+                "qsa_attention_batch_q8_seg_gqa12_flash",
+                crate::gemm::qsa_attention_batch_q8_seg_gqa12_flash_spv(),
+            ),
+            (true, true, true, 12, false, _, _) => (
+                "qsa_attention_batch_q8_seg_gqa12",
+                crate::gemm::qsa_attention_batch_q8_seg_gqa12_spv(),
+            ),
+            (true, true, true, 2, _, _, _) => (
+                "qsa_attention_batch_q8_seg_gqa2",
+                crate::gemm::qsa_attention_batch_q8_seg_gqa2_spv(),
+            ),
+            (false, false, true, _, _, _, _) => (
                 "qsa_attention_batch_seg",
                 crate::gemm::qsa_attention_batch_seg_spv(),
             ),
-            (true, false, true) => (
+            (true, false, true, _, _, _, _) => (
                 "qsa_attention_batch_kq8_seg",
                 crate::gemm::qsa_attention_batch_kq8_seg_spv(),
             ),
-            (false, true, true) => (
+            (false, true, true, _, _, _, _) => (
                 "qsa_attention_batch_vq8_seg",
                 crate::gemm::qsa_attention_batch_vq8_seg_spv(),
             ),
-            (true, true, true) => (
+            (true, true, true, _, _, _, _) => (
                 "qsa_attention_batch_q8_seg",
                 crate::gemm::qsa_attention_batch_q8_seg_spv(),
             ),
-            (false, false, false) => (
+            (false, false, false, _, _, _, _) => (
                 "qsa_attention_batch",
                 crate::gemm::qsa_attention_batch_spv(),
             ),
-            (true, false, false) => (
+            (true, false, false, _, _, _, _) => (
                 "qsa_attention_batch_kq8",
                 crate::gemm::qsa_attention_batch_kq8_spv(),
             ),
-            (false, true, false) => (
+            (false, true, false, _, _, _, _) => (
                 "qsa_attention_batch_vq8",
                 crate::gemm::qsa_attention_batch_vq8_spv(),
             ),
-            (true, true, false) => (
+            (true, true, false, _, _, _, _) => (
                 "qsa_attention_batch_q8",
                 crate::gemm::qsa_attention_batch_q8_spv(),
             ),
@@ -9627,7 +10216,7 @@ impl<'a> Recorder<'a> {
             ],
             1,
             &push[..push_bytes as usize],
-            rows.saturating_mul(n_head),
+            rows.saturating_mul(n_head / grouped),
         );
     }
 
@@ -10641,12 +11230,88 @@ impl<'a> Recorder<'a> {
         hash_ids: &dyn Buffer,
         hash: bool,
     ) {
-        let k = if self.vk().moe_topk_sg {
-            self.be
-                .kernel_sg("moe_topk_sg", crate::gemm::moe_topk_sg_spv(), 5, 36, 32)
+        self.moe_topk_with_tap(
+            logits,
+            ids,
+            wts,
+            bias,
+            n_tokens,
+            n_expert,
+            n_used,
+            scale,
+            gating,
+            norm_w,
+            has_bias,
+            n_expert_groups,
+            n_expert_groups_used,
+            hash_ids,
+            hash,
+            None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn moe_topk_with_tap(
+        &self,
+        logits: &dyn Buffer,
+        ids: &dyn Buffer,
+        wts: &dyn Buffer,
+        bias: &dyn Buffer,
+        n_tokens: usize,
+        n_expert: usize,
+        n_used: usize,
+        scale: f32,
+        gating: u32,
+        norm_w: bool,
+        has_bias: bool,
+        n_expert_groups: u32,
+        n_expert_groups_used: u32,
+        hash_ids: &dyn Buffer,
+        hash: bool,
+        input_tap: Option<(&dyn Buffer, &dyn Buffer)>,
+    ) {
+        if let Some((input, output)) = input_tap {
+            assert!(n_tokens == 1 && !has_bias && !hash);
+            assert!(input.len_bytes() >= 2560 * 4 && output.len_bytes() >= 2560 * 4);
+        }
+        let fast_sigmoid_wave32 = self.vk().moe_topk_sg
+            && n_tokens == 1
+            && gating == 1
+            && norm_w
+            && !has_bias
+            && (n_expert_groups <= 1 || n_expert_groups_used == 0)
+            && !hash
+            && n_expert > 0
+            && n_expert <= 512
+            && n_used > 0
+            && n_used <= 32;
+        let k = if fast_sigmoid_wave32 {
+            let (name, spv) = if input_tap.is_some() {
+                (
+                    "moe_topk_sigmoid_wave32_tap",
+                    crate::gemm::moe_topk_sigmoid_wave32_tap_spv(),
+                )
+            } else {
+                (
+                    "moe_topk_sigmoid_wave32",
+                    crate::gemm::moe_topk_sigmoid_wave32_spv(),
+                )
+            };
+            self.be.kernel_sg(name, spv, 5, 36, 32)
+        } else if self.vk().moe_topk_sg {
+            let (name, spv) = if input_tap.is_some() {
+                ("moe_topk_sg_tap", crate::gemm::moe_topk_sg_tap_spv())
+            } else {
+                ("moe_topk_sg", crate::gemm::moe_topk_sg_spv())
+            };
+            self.be.kernel_sg(name, spv, 5, 36, 32)
         } else {
-            self.be
-                .kernel("moe_topk", crate::gemm::moe_topk_spv(), 5, 36)
+            let (name, spv) = if input_tap.is_some() {
+                ("moe_topk_tap", crate::gemm::moe_topk_tap_spv())
+            } else {
+                ("moe_topk", crate::gemm::moe_topk_spv())
+            };
+            self.be.kernel(name, spv, 5, 36)
         };
         let mut push = [0u8; 36];
         push[0..4].copy_from_slice(&(n_expert as u32).to_ne_bytes());
@@ -10662,12 +11327,12 @@ impl<'a> Recorder<'a> {
             k,
             &[
                 Self::vkb(logits),
-                Self::vkb(bias),
-                Self::vkb(hash_ids),
+                Self::vkb(input_tap.map_or(bias, |(input, _)| input)),
+                Self::vkb(input_tap.map_or(hash_ids, |(_, output)| output)),
                 Self::vkb(ids),
                 Self::vkb(wts),
             ],
-            2,
+            if input_tap.is_some() { 3 } else { 2 },
             &push,
             n_tokens as u32,
         );
@@ -11760,6 +12425,32 @@ impl<'a> Recorder<'a> {
             Self::vkb(lut),
             Self::vkb(y),
         ];
+        if matches!(dtype, infr_core::DType::Iq2S | infr_core::DType::Iq3S)
+            && self.be.use_paged_grid_buffer(in_f, out_f, rows)
+        {
+            let nr = self.gemv().id_grid_buffer_nr;
+            let grid = if dtype == infr_core::DType::Iq2S {
+                &self.be.iq2s_grid
+            } else {
+                &self.be.iq3s_grid
+            };
+            if let Some(grid) = grid.as_ref() {
+                let build = crate::gemm::native_idm_grid_buffer_paged_spv(dtype, nr);
+                if let Some((name, spv)) = build {
+                    let k = self.be.kernel(name, spv, 5, 44);
+                    let mut grid_bufs = bufs;
+                    grid_bufs[0] = Self::vkb(grid.as_ref());
+                    self.dispatch_wide(
+                        k,
+                        &grid_bufs,
+                        1,
+                        &push,
+                        (rows * n_used * out_f.div_ceil(nr as usize)) as u32,
+                    );
+                    return;
+                }
+            }
+        }
         if rows > 1 {
             let nr = self.gemv().id_grid_nr;
             if let Some((name, spv)) = crate::gemm::native_idm_grid_nr_paged_build_spv(dtype, nr) {
@@ -11847,6 +12538,32 @@ impl<'a> Recorder<'a> {
                 let groups = (rows * n_used * out_f.div_ceil(nr as usize)) as u32;
                 self.dispatch_wide(k, &bufs, 1, &push, groups);
                 return;
+            }
+        }
+        if matches!(dtype, infr_core::DType::Iq2S | infr_core::DType::Iq3S)
+            && self.be.use_paged_grid_buffer(in_f, out_f, rows)
+        {
+            let nr = self.gemv().id_grid_buffer_nr;
+            let grid = if dtype == infr_core::DType::Iq2S {
+                &self.be.iq2s_grid
+            } else {
+                &self.be.iq3s_grid
+            };
+            if let Some(grid) = grid.as_ref() {
+                let build = crate::gemm::native_idm_grid_buffer_shared_spv(dtype, nr);
+                if let Some((name, spv)) = build {
+                    let k = self.be.kernel(name, spv, 5, 56);
+                    let mut grid_bufs = bufs;
+                    grid_bufs[0] = Self::vkb(grid.as_ref());
+                    self.dispatch_wide(
+                        k,
+                        &grid_bufs,
+                        1,
+                        &push,
+                        (rows * n_used * out_f.div_ceil(nr as usize)) as u32,
+                    );
+                    return;
+                }
             }
         }
         let (name, spv) = crate::gemm::native_idm_paged_shared_build_spv(dtype)
@@ -12101,6 +12818,47 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn moe_accumulate_shared_cpu(
+        &self,
+        down: &dyn Buffer,
+        wts: &dyn Buffer,
+        shared_gate: &dyn Buffer,
+        hidden: &dyn Buffer,
+        cpu_result: &dyn Buffer,
+        ne: usize,
+        routed_used: usize,
+        cpu_slot: usize,
+    ) {
+        assert!(cpu_slot < routed_used);
+        let kernel = self.be.kernel(
+            "moe_accumulate_shared_cpu",
+            crate::gemm::moe_accumulate_shared_cpu_spv(),
+            5,
+            16,
+        );
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(ne as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(routed_used as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&1u32.to_ne_bytes());
+        push[12..16].copy_from_slice(&(cpu_slot as u32).to_ne_bytes());
+        self.dispatch3(
+            kernel,
+            &[
+                Self::vkb(down),
+                Self::vkb(wts),
+                Self::vkb(shared_gate),
+                Self::vkb(cpu_result),
+                Self::vkb(hidden),
+            ],
+            1,
+            &push,
+            (ne as u32).div_ceil(64),
+            1,
+            1,
+        );
+    }
+
     /// `acc += wts[slot] * x` (indexed axpy) — the scale is read from a GPU buffer (the on-GPU router
     /// weights), so the weighted MoE expert accumulate needs no host scale.
     pub fn add_scaled_id(
@@ -12332,6 +13090,15 @@ impl<'a> Recorder<'a> {
     }
 
     fn close_submit_timing(&self) {
+        self.timeline_lifetime.borrow_mut().take();
+        if let Some(query) = self.timeline_query.borrow_mut().as_mut() {
+            query.close(
+                self.dispatches.get(),
+                self.dedicated_transfer_wait.get(),
+                0,
+                0,
+            );
+        }
         let pool = self.submit_query_pool.get();
         if pool != vk::QueryPool::null() {
             unsafe {
@@ -12386,6 +13153,14 @@ impl<'a> Recorder<'a> {
 
     /// End recording, submit once, wait, and release transient objects.
     pub fn finish(self) -> Result<()> {
+        self.finish_after_submit(|| Ok(()))
+    }
+
+    /// Start host-side work only after submission; always drain GPU readers even if it fails.
+    pub(crate) fn finish_after_submit(
+        self,
+        after_submit: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         let device = &self.be.shared.device;
         let dispatches = self.dispatches.get();
         let t_record = self.t0.elapsed();
@@ -12414,6 +13189,10 @@ impl<'a> Recorder<'a> {
             self.free_transient();
             return Err(be(format!("end cmd: {e}")));
         }
+        let submit_span = infr_core::timeline::span("queue_submit");
+        if let Some(query) = self.timeline_query.borrow_mut().as_mut() {
+            query.submitted();
+        }
         let submit = self.be.shared.queue_submit_commands_recovering(
             std::slice::from_ref(&self.cmd),
             vk::Fence::null(),
@@ -12421,12 +13200,17 @@ impl<'a> Recorder<'a> {
             "forward queue_submit",
             self.dedicated_transfer_wait.get(),
         );
+        drop(submit_span);
         if let Err(e) = submit {
             self.free_transient();
             return Err(be(format!("queue_submit: {e}")));
         }
+        let host_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(after_submit))
+            .unwrap_or_else(|_| Err(be("post-submit host work panicked")));
         let wait_t0 = prof.then(std::time::Instant::now);
+        let wait_span = infr_core::timeline::span("queue_idle_wait");
         let wait = self.be.shared.queue_wait_idle_serialized();
+        drop(wait_span);
         if let Some(t0) = wait_t0 {
             pager_profile::record_sync_wait(pager_profile::SyncKind::QueueIdle, t0.elapsed());
         }
@@ -12447,8 +13231,11 @@ impl<'a> Recorder<'a> {
             self.report_timestamps();
         }
         self.resolve_submit_timing(dispatches);
+        if let Some(query) = self.timeline_query.borrow_mut().take() {
+            query.resolve();
+        }
         self.free_transient();
-        Ok(())
+        host_result
     }
 
     /// Abandon a partially recorded command buffer WITHOUT submitting it, releasing exactly what
@@ -12497,6 +13284,7 @@ impl<'a> Recorder<'a> {
                 submit_timing_token: None,
                 submit_pager_profile: false,
                 dispatches,
+                timeline_query: None,
             });
         }
         if pager_profile::active() {
@@ -12528,6 +13316,10 @@ impl<'a> Recorder<'a> {
                 }
             },
         };
+        let submit_span = infr_core::timeline::span("queue_submit");
+        if let Some(query) = self.timeline_query.borrow_mut().as_mut() {
+            query.submitted();
+        }
         let submit = self.be.shared.queue_submit_commands_recovering(
             std::slice::from_ref(&self.cmd),
             fence,
@@ -12535,6 +13327,7 @@ impl<'a> Recorder<'a> {
             "pipelined queue_submit",
             self.dedicated_transfer_wait.get(),
         );
+        drop(submit_span);
         if let Err(e) = submit {
             self.be.shared.recorder_fences.lock().unwrap().push(fence);
             self.free_transient();
@@ -12557,6 +13350,7 @@ impl<'a> Recorder<'a> {
             submit_timing_token,
             submit_pager_profile,
             dispatches,
+            timeline_query: self.timeline_query.borrow_mut().take(),
         })
     }
 
@@ -12875,6 +13669,7 @@ pub struct PendingSegment {
     submit_pager_profile: bool,
     /// Dispatches this segment carried; consumed by the submit profiler and finite GPU tuner.
     dispatches: usize,
+    timeline_query: Option<crate::timeline::Query>,
 }
 
 impl PendingSegment {
@@ -12906,7 +13701,17 @@ impl PendingSegment {
         };
         let device = &self.shared.device;
         let wait_t0 = pager_profile::start();
+        let wait_span = infr_core::timeline::span_with_submit(
+            "fence_wait",
+            self.timeline_query.as_ref().map_or(0, |query| query.id),
+        );
         let waited = unsafe { device.wait_for_fences(&[fence], true, u64::MAX) };
+        drop(wait_span);
+        if waited.is_ok() {
+            if let Some(query) = self.timeline_query.take() {
+                query.resolve();
+            }
+        }
         if let Some(elapsed) = pager_profile::elapsed(wait_t0) {
             pager_profile::record_sync_wait(pager_profile::SyncKind::Fence, elapsed);
         }
@@ -13102,6 +13907,324 @@ mod chunk_math_tests {
 mod tests {
     use super::*;
     use infr_core::{backend::BufferUsage, Backend};
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn fused_host_miss_accumulation_matches_scatter_for_every_slot_and_tail() {
+        let backend = VulkanBackend::new().unwrap();
+        for ne in [63, 64, 2560] {
+            for used in [8, 10] {
+                let down: Vec<_> = (0..(used + 1) * ne)
+                    .map(|i| (i % 113) as f32 * 0.01 - 0.56)
+                    .collect();
+                let weights: Vec<_> = (0..used).map(|i| (i + 1) as f32 / 55.0).collect();
+                let cpu_values: Vec<_> = (0..ne).map(|i| (i % 29) as f32 * 0.03 - 0.4).collect();
+                let gpu_down = backend
+                    .alloc(down.len() * 4, BufferUsage::Activations)
+                    .unwrap();
+                let gpu_weights = backend.alloc(used * 4, BufferUsage::Staging).unwrap();
+                let gate = backend.alloc(4, BufferUsage::Staging).unwrap();
+                let host = backend.alloc(ne * 4, BufferUsage::Staging).unwrap();
+                let original = backend.alloc(ne * 4, BufferUsage::Readback).unwrap();
+                let fused = backend.alloc(ne * 4, BufferUsage::Readback).unwrap();
+                backend
+                    .upload(gpu_weights.as_ref(), bytemuck::cast_slice(&weights))
+                    .unwrap();
+                backend
+                    .upload(host.as_ref(), bytemuck::cast_slice(&cpu_values))
+                    .unwrap();
+                for slot in 0..used {
+                    backend
+                        .upload(gpu_down.as_ref(), bytemuck::cast_slice(&down))
+                        .unwrap();
+                    for shared_gate in [-10.0f32, 0.0, 10.0] {
+                        backend
+                            .upload(gate.as_ref(), bytemuck::bytes_of(&shared_gate))
+                            .unwrap();
+                        let rec = backend.recorder().unwrap();
+                        rec.moe_accumulate_shared_cpu(
+                            gpu_down.as_ref(),
+                            gpu_weights.as_ref(),
+                            gate.as_ref(),
+                            fused.as_ref(),
+                            host.as_ref(),
+                            ne,
+                            used,
+                            slot,
+                        );
+                        rec.finish().unwrap();
+                        let mut actual = vec![0.0f32; ne];
+                        backend
+                            .download(fused.as_ref(), bytemuck::cast_slice_mut(&mut actual))
+                            .unwrap();
+                        let rec = backend.recorder().unwrap();
+                        rec.copy(host.as_ref(), 0, gpu_down.as_ref(), slot * ne * 4, ne * 4);
+                        rec.moe_accumulate_shared(
+                            gpu_down.as_ref(),
+                            gpu_weights.as_ref(),
+                            gate.as_ref(),
+                            original.as_ref(),
+                            ne,
+                            used,
+                            1,
+                        );
+                        rec.finish().unwrap();
+                        let mut expected = vec![0.0f32; ne];
+                        backend
+                            .download(original.as_ref(), bytemuck::cast_slice_mut(&mut expected))
+                            .unwrap();
+                        assert_eq!(
+                            actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            "ne={ne} used={used} slot={slot} gate={shared_gate}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU; isolated host timeline readiness experiment"]
+    fn host_timeline_readiness_preserves_prefix_and_releases_on_host_error() {
+        struct Release<'a> {
+            device: &'a ash::Device,
+            semaphore: vk::Semaphore,
+            value: u64,
+            armed: bool,
+        }
+        impl Release<'_> {
+            fn signal(&mut self) -> std::time::Duration {
+                let start = std::time::Instant::now();
+                if unsafe {
+                    self.device.signal_semaphore(
+                        &vk::SemaphoreSignalInfo::default()
+                            .semaphore(self.semaphore)
+                            .value(self.value),
+                    )
+                }
+                .is_err()
+                {
+                    // A submitted wait cannot be cancelled. This isolated probe must not
+                    // hang its destructor; runtime adoption needs a separate fatal-error policy.
+                    std::process::abort();
+                }
+                self.armed = false;
+                start.elapsed()
+            }
+        }
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.signal();
+                }
+            }
+        }
+        let backend = VulkanBackend::new().unwrap();
+        assert!(backend.shared.dedicated_transfer.is_some());
+        let device = &backend.shared.device;
+        let make_timeline = || {
+            let mut kind =
+                vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+            unsafe {
+                device.create_semaphore(
+                    &vk::SemaphoreCreateInfo::default().push_next(&mut kind),
+                    None,
+                )
+            }
+            .unwrap()
+        };
+        let witness = make_timeline();
+        let ready = make_timeline();
+        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
+        let src = backend.alloc(4, BufferUsage::Staging).unwrap();
+        let hit = backend.alloc(4, BufferUsage::Readback).unwrap();
+        let cpu = backend.alloc(4, BufferUsage::Staging).unwrap();
+        let out = backend.alloc(4, BufferUsage::Readback).unwrap();
+        backend
+            .upload(src.as_ref(), bytemuck::bytes_of(&14.0f32))
+            .unwrap();
+        let prefix = backend.recorder_persistent().unwrap();
+        prefix.copy(src.as_ref(), 0, hit.as_ref(), 0, 4);
+        unsafe {
+            device.cmd_pipeline_barrier(
+                prefix.cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)],
+                &[],
+                &[],
+            );
+        }
+        let prefix = prefix.finish_record().unwrap();
+        let merge = backend.recorder_persistent().unwrap();
+        merge.seed_barrier();
+        merge.add(hit.as_ref(), cpu.as_ref(), out.as_ref(), 1);
+        let merge = merge.finish_record().unwrap();
+        let hit_ptr = as_vk_buf(hit.as_ref()).unwrap().mapped_ptr().unwrap() as *const f32;
+        let cpu_ptr = as_vk_buf(cpu.as_ref()).unwrap().mapped_ptr().unwrap();
+        let mut signals = Vec::new();
+        let mut submits = Vec::new();
+        for value in 1..=96u64 {
+            unsafe { device.reset_fences(&[fence]) }.unwrap();
+            let prefix_cmd = [prefix.segments[0].cmd];
+            let merge_cmd = [merge.segments[0].cmd];
+            let witness_sems = [witness];
+            let ready_sems = [ready];
+            let values = [value];
+            let stages = [vk::PipelineStageFlags::ALL_COMMANDS];
+            let mut prefix_timeline =
+                vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&values);
+            let mut merge_timeline =
+                vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&values);
+            let batch = [
+                vk::SubmitInfo::default()
+                    .command_buffers(&prefix_cmd)
+                    .signal_semaphores(&witness_sems)
+                    .push_next(&mut prefix_timeline),
+                vk::SubmitInfo::default()
+                    .command_buffers(&merge_cmd)
+                    .wait_semaphores(&ready_sems)
+                    .wait_dst_stage_mask(&stages)
+                    .push_next(&mut merge_timeline),
+            ];
+            let start = std::time::Instant::now();
+            backend
+                .shared
+                .queue_submit_recovering(&batch, fence, None, "host readiness probe")
+                .unwrap();
+            submits.push(start.elapsed().as_secs_f64() * 1e6);
+            let mut release = Release {
+                device,
+                semaphore: ready,
+                value,
+                armed: true,
+            };
+            unsafe {
+                device.wait_semaphores(
+                    &vk::SemaphoreWaitInfo::default()
+                        .semaphores(&witness_sems)
+                        .values(&values),
+                    5_000_000_000,
+                )
+            }
+            .unwrap();
+            assert_eq!(
+                unsafe { *hit_ptr },
+                14.0,
+                "prefix must execute before CPU readiness"
+            );
+            assert!(unsafe { device.get_semaphore_counter_value(ready) }.unwrap() < value);
+            // The explicit HOST_WRITE barrier is essential: these writes occur after submit.
+            crate::copy_to_mapped(bytemuck::bytes_of(&0.0f32), cpu_ptr);
+            let mode = value % 3;
+            let host = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                if mode == 1 {
+                    return Err(be("injected CPU failure"));
+                }
+                if mode == 2 {
+                    panic!("injected CPU panic");
+                }
+                crate::copy_to_mapped(bytemuck::bytes_of(&7.0f32), cpu_ptr);
+                Ok(())
+            }));
+            signals.push(release.signal().as_secs_f64() * 1e6);
+            drop(release);
+            unsafe { device.wait_for_fences(&[fence], true, 5_000_000_000) }.unwrap();
+            let mut actual = [0.0f32];
+            backend
+                .download(out.as_ref(), bytemuck::cast_slice_mut(&mut actual))
+                .unwrap();
+            assert_eq!(actual[0], if mode == 0 { 21.0 } else { 14.0 });
+            assert_eq!(matches!(host, Ok(Ok(()))), mode == 0);
+        }
+        submits.sort_by(f64::total_cmp);
+        signals.sort_by(f64::total_cmp);
+        println!("HOST_TIMELINE samples=96 submit_p50_us={:.2} submit_p90_us={:.2} signal_p50_us={:.2} signal_p90_us={:.2}",
+            submits[48], submits[86], signals[48], signals[86]);
+        drop(merge);
+        drop(prefix);
+        unsafe {
+            device.destroy_fence(fence, None);
+            device.destroy_semaphore(ready, None);
+            device.destroy_semaphore(witness, None);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn masked_silu_preserves_inactive_slots_and_matches_dense() {
+        let be_ = VulkanBackend::new().unwrap();
+        for width in [64, 640] {
+            let n = 32 * width;
+            let gate: Vec<_> = (0..n).map(|i| (i % 113) as f32 * 0.1 - 5.6).collect();
+            let up: Vec<_> = (0..n).map(|i| (i % 43) as f32 * 0.05 - 1.0).collect();
+            let g = be_.alloc(n * 4, BufferUsage::Staging).unwrap();
+            let u = be_.alloc(n * 4, BufferUsage::Staging).unwrap();
+            let y = be_.alloc(n * 4, BufferUsage::Readback).unwrap();
+            let dense = be_.alloc(n * 4, BufferUsage::Readback).unwrap();
+            be_.upload(g.as_ref(), bytemuck::cast_slice(&gate)).unwrap();
+            be_.upload(u.as_ref(), bytemuck::cast_slice(&up)).unwrap();
+            for clamp in [None, Some(0.5)] {
+                let rec = be_.recorder().unwrap();
+                rec.silu_mul(g.as_ref(), u.as_ref(), dense.as_ref(), n, clamp);
+                rec.finish().unwrap();
+                let mut expected = vec![0.0f32; n];
+                be_.download(dense.as_ref(), bytemuck::cast_slice_mut(&mut expected))
+                    .unwrap();
+                let masks = [0, 1, 1 << 31, u32::MAX, 0xaaaaaaaa, 0x7ff & !(1 << 5)];
+                for mask in masks {
+                    let mut actual = vec![-999.0f32; n];
+                    be_.upload(y.as_ref(), bytemuck::cast_slice(&actual))
+                        .unwrap();
+                    let rec = be_.recorder().unwrap();
+                    rec.silu_mul_masked(g.as_ref(), u.as_ref(), y.as_ref(), width, mask, clamp);
+                    rec.finish().unwrap();
+                    be_.download(y.as_ref(), bytemuck::cast_slice_mut(&mut actual))
+                        .unwrap();
+                    for i in 0..n {
+                        assert_eq!(
+                            actual[i].to_bits(),
+                            if mask & (1 << (i / width)) == 0 {
+                                (-999.0f32).to_bits()
+                            } else {
+                                expected[i].to_bits()
+                            },
+                            "width={width} mask={mask:x} i={i}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn deferred_cpu_miss_host_callback_error_still_drains_gpu_copy() {
+        let be_ = VulkanBackend::new().unwrap();
+        for panic in [false, true] {
+            let src = be_.alloc(4096, BufferUsage::Staging).unwrap();
+            let dst = be_.alloc(4096, BufferUsage::Activations).unwrap();
+            let expected = vec![0x39; 4096];
+            be_.upload(src.as_ref(), &expected).unwrap();
+            let rec = be_.recorder().unwrap();
+            rec.copy(src.as_ref(), 0, dst.as_ref(), 0, 4096);
+            assert!(rec
+                .finish_after_submit(|| {
+                    if panic {
+                        panic!("test post-submit panic");
+                    }
+                    Err(be("test post-submit failure"))
+                })
+                .is_err());
+            let mut actual = vec![0; 4096];
+            be_.download(dst.as_ref(), &mut actual).unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
 
     #[test]
     fn splitk_reduce_uses_logical_output_and_padded_partial_stride() {
@@ -13690,7 +14813,7 @@ mod tests {
         const HEADS: usize = 4;
         const TOP: usize = 512;
 
-        let be = VulkanBackend::new().unwrap();
+        let be = be_with(|vk| vk.qsa_prefill_gqa = 12);
         let _pool = be.init_unified_vram(224 * MIB).unwrap();
         let kv_len = SEGMENT_ROWS + 6;
         let blocks = kv_len / RATIO;
@@ -13972,7 +15095,7 @@ mod tests {
         const N_HEAD: usize = 24;
         const N_KV: usize = 2;
         const ROW_ELEMS: usize = N_KV * ATTN_HD;
-        const CROSS_ROWS: usize = 8;
+        const CROSS_ROWS: usize = 17;
         const SELECTED: usize = 2;
         let kv_segment_elements = SEGMENT_ROWS * ROW_ELEMS;
         let kv_segment_bytes = (kv_segment_elements / 32 * 34).next_multiple_of(4);
@@ -14099,7 +15222,9 @@ mod tests {
             0,
             Some(kv_shift),
         );
-        let qsa_kv_len = (SEGMENT_ROWS + RATIO) as u32;
+        // Include a nine-token causal tail so the GQA12 path crosses both the physical 32K
+        // boundary and its sixteen-key LDS tile boundary in the same dispatch.
+        let qsa_kv_len = (SEGMENT_ROWS + RATIO + 9) as u32;
         rec.qsa_attention_batch(
             attn_q.as_ref(),
             k_flat.as_ref(),
@@ -14167,10 +15292,184 @@ mod tests {
         }
         let flat_attention = download_f32(&be, attn_flat.as_ref(), N_HEAD * ATTN_HD);
         let segmented_attention = download_f32(&be, attn_segmented.as_ref(), N_HEAD * ATTN_HD);
-        assert_eq!(
-            segmented_attention, flat_attention,
-            "segmented Q8 QSA attention differs across 32K"
+        let attention_err = segmented_attention
+            .iter()
+            .zip(&flat_attention)
+            .map(|(segmented, flat)| (segmented - flat).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            attention_err <= 3e-4,
+            "segmented LDS-GQA12 QSA attention differs across 32K: {attention_err:e}"
         );
+    }
+
+    #[test]
+    #[ignore = "requires Vulkan GPU"]
+    fn qsa_scan_default_uses_the_actual_parallel_workspace() {
+        let be = VulkanBackend::new().expect("QSA automatic scan probe needs Vulkan");
+        assert!(be.cfg().kernels.vulkan.qsa_topk_scan.is_none());
+        assert!(!be.use_qsa_topk_scan(1, 512, false));
+        let zero = |bytes: usize| {
+            let buffer = be.alloc(bytes, BufferUsage::Activations).unwrap();
+            be.upload(buffer.as_ref(), &vec![0u8; bytes]).unwrap();
+            buffer
+        };
+        let q = zero(8 * 2);
+        let norm = be.alloc(8 * 4, BufferUsage::Weights).unwrap();
+        be.upload(norm.as_ref(), bytemuck::cast_slice(&[1.0f32; 8]))
+            .unwrap();
+        let work = zero(QSA_TOPK_PARALLEL_WORK_BYTES);
+        for blocks in [4095usize, 4096] {
+            let raw = zero(blocks * 8 * 8 * 2);
+            let compressed = zero(blocks * 8 * 4);
+            let scores = zero(blocks * 4);
+            let output = be.alloc(512 * 4, BufferUsage::Readback).unwrap();
+            let rec = be.recorder().unwrap();
+            rec.qsa_indexer(
+                q.as_ref(),
+                raw.as_ref(),
+                compressed.as_ref(),
+                norm.as_ref(),
+                scores.as_ref(),
+                (blocks == 4096).then_some(work.as_ref()),
+                output.as_ref(),
+                1,
+                (blocks * 8) as u32,
+                blocks as u32,
+                1,
+                8,
+                512,
+                8,
+                8,
+                10_000.0,
+                1e-6,
+                1.0,
+                None,
+                None,
+            );
+            rec.finish().unwrap();
+            let mut got = vec![0u32; 512];
+            be.download(output.as_ref(), bytemuck::cast_slice_mut(&mut got))
+                .unwrap();
+            assert_eq!(got, (0..512u32).collect::<Vec<_>>());
+        }
+        let names = be.built_kernel_names();
+        assert!(names.contains(&"qsa_indexer_topk"));
+        let select = if be.use_qsa_topk_scan(1, 512, true) {
+            "qsa_indexer_topk_select_scan"
+        } else {
+            "qsa_indexer_topk_select"
+        };
+        assert!(
+            names.contains(&select),
+            "missing automatic selection {select}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Vulkan GPU"]
+    fn qsa_topk_prefix_scan_matches_original_and_host_order() {
+        let Ok(be) = VulkanBackend::new() else {
+            panic!("QSA scan probe needs a Vulkan GPU");
+        };
+        let mut cases = 0;
+        for blocks in [512usize, 513, 4095, 4096, 18750, 65536] {
+            for rows in [1usize, 3] {
+                for top in [1usize, 511, 512] {
+                    for kind in 0..3usize {
+                        let kv_len = blocks * 8 + kind;
+                        let scores: Vec<f32> = (0..blocks * rows)
+                            .map(|i| match kind {
+                                0 => 0.25,
+                                1 => {
+                                    (((i as u32).wrapping_mul(1664525).wrapping_add(1013904223)
+                                        >> 8)
+                                        % 8192) as f32
+                                        / 512.0
+                                        - 8.0
+                                }
+                                _ => match i % 8 {
+                                    0 => -0.0,
+                                    1 => 0.0,
+                                    2 => f32::NEG_INFINITY,
+                                    3 => f32::INFINITY,
+                                    4 => -f32::NAN,
+                                    5 => f32::NAN,
+                                    _ => (i % 13) as f32 * 0.01,
+                                },
+                            })
+                            .collect();
+                        let sb = be
+                            .alloc(scores.len() * 4, BufferUsage::Activations)
+                            .unwrap();
+                        be.upload(sb.as_ref(), bytemuck::cast_slice(&scores))
+                            .unwrap();
+                        let work = be
+                            .alloc(QSA_TOPK_PARALLEL_WORK_BYTES, BufferUsage::Activations)
+                            .unwrap();
+                        for parallel in [false, true] {
+                            if parallel && (rows != 1 || blocks <= top) {
+                                continue;
+                            }
+                            let mut expected = vec![0xa5a5a5a5u32; rows * top + 8];
+                            for row in 0..rows {
+                                let visible = (kv_len - rows + row + 1) / 8;
+                                let mut indices: Vec<usize> = (0..visible).collect();
+                                indices.sort_unstable_by(|&a, &b| {
+                                    scores[row * blocks + b]
+                                        .total_cmp(&scores[row * blocks + a])
+                                        .then_with(|| a.cmp(&b))
+                                });
+                                indices.truncate(top);
+                                indices.sort_unstable();
+                                for (slot, value) in indices.iter().enumerate() {
+                                    expected[4 + row * top + slot] = *value as u32;
+                                }
+                            }
+                            for scan in [false, true] {
+                                let output =
+                                    be.alloc(expected.len() * 4, BufferUsage::Readback).unwrap();
+                                be.upload(
+                                    output.as_ref(),
+                                    bytemuck::cast_slice(&vec![0xa5a5a5a5u32; expected.len()]),
+                                )
+                                .unwrap();
+                                let rec = be.recorder().unwrap();
+                                rec.qsa_indexer_topk(
+                                    sb.as_ref(),
+                                    parallel.then_some(work.as_ref()),
+                                    output.as_ref(),
+                                    blocks as u32,
+                                    top as u32,
+                                    rows as u32,
+                                    kv_len as u32,
+                                    8,
+                                    16,
+                                    scan,
+                                );
+                                rec.finish().unwrap();
+                                let mut got = vec![0u32; expected.len()];
+                                be.download(output.as_ref(), bytemuck::cast_slice_mut(&mut got))
+                                    .unwrap();
+                                assert_eq!(got, expected, "blocks={blocks} rows={rows} top={top} kind={kind} parallel={parallel} scan={scan}");
+                            }
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        for name in [
+            "qsa_indexer_topk_scan",
+            "qsa_indexer_topk_select_scan",
+            "qsa_indexer_topk_collect_scan",
+        ] {
+            assert!(
+                be.built_kernel_names().contains(&name),
+                "missing actual scan kernel {name}"
+            );
+        }
+        eprintln!("QSA integer prefix exact cases={cases} (two GPU paths each, host ordered oracle, guarded offsets)");
     }
 
     /// A cached multi-token continuation must be causal: every row must match a scalar forward at
@@ -15727,6 +17026,163 @@ mod tests {
         assert!(e < 2e-2, "native_gemm_mmq_q6k mismatch: {e}"); // int8 activation quant tolerance
     }
 
+    #[test]
+    #[ignore = "requires a Vulkan GPU; IQ grid/bounds/grouping parity and probe"]
+    fn iq2s_shared_grid_grouping_probe() {
+        use infr_core::backend::{Backend, BufferUsage};
+        let mut references = std::collections::HashMap::new();
+        for dtype in [infr_core::DType::Iq2S, infr_core::DType::Iq3S] {
+            for (buffer_grid, nr) in [false, true]
+                .into_iter()
+                .flat_map(|buffer| [1u32, 2, 4, 8].map(move |nr| (buffer, nr)))
+            {
+                let mut cfg = infr_core::config::Config::default();
+                cfg.kernels.vulkan.gemv.id_grid_buffer_nr = nr;
+                cfg.kernels.vulkan.gemv.id_grid_nr = nr;
+                cfg.kernels.vulkan.gemv.id_grid_buffer = Some(buffer_grid);
+                let be = VulkanBackend::new_on_with(1, std::sync::Arc::new(cfg)).unwrap();
+                for (k, n) in [(2560usize, 641usize), (768, 2561)] {
+                    for rows in [1usize, 2, 3] {
+                        for (with_shared, per_slot) in
+                            [false, true].into_iter().flat_map(|shared| {
+                                [false, true].map(move |per_slot| (shared, per_slot))
+                            })
+                        {
+                            // The ragged output also exercises the last grouped workgroup.
+                            let (experts, used) = (10usize, 10usize);
+                            let width = used + usize::from(with_shared);
+                            let weight_bytes =
+                                infr_testkit::synth_weight(dtype, k * n * experts, 456);
+                            let stride = infr_testkit::synth_weight(dtype, k * n, 456).len();
+                            let weight = be.upload_weight_bytes(&weight_bytes).unwrap();
+                            let shared = be
+                                .upload_weight_bytes(&infr_testkit::synth_weight(
+                                    infr_core::DType::Q8_0,
+                                    k * n,
+                                    457,
+                                ))
+                                .unwrap();
+                            let lut_words = (0..experts)
+                                .flat_map(|e| {
+                                    let address =
+                                        weight.device_addr().unwrap() + (e * stride) as u64;
+                                    [address as u32, (address >> 32) as u32]
+                                })
+                                .collect::<Vec<_>>();
+                            let mut ids = (0..rows)
+                                .flat_map(|r| {
+                                    (0..used).map(move |s| ((s + r * 3) % experts) as u32)
+                                })
+                                .collect::<Vec<_>>();
+                            for r in 0..rows {
+                                ids.push(((1u32 << width) - 1) & !(1 << (r + 2)));
+                            }
+                            let x = (0..rows * (if per_slot { width } else { 1 }) * k)
+                                .map(|i| (i as f32 * 0.031).sin() * 0.2)
+                                .collect::<Vec<_>>();
+                            let input = be.alloc(x.len() * 4, BufferUsage::Activations).unwrap();
+                            let lut = be
+                                .alloc(lut_words.len() * 4, BufferUsage::Activations)
+                                .unwrap();
+                            let ids_b = be.alloc(ids.len() * 4, BufferUsage::Activations).unwrap();
+                            let output = be
+                                .alloc(rows * width * n * 4, BufferUsage::Readback)
+                                .unwrap();
+                            be.upload(input.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+                            be.upload(lut.as_ref(), bytemuck::cast_slice(&lut_words))
+                                .unwrap();
+                            be.upload(ids_b.as_ref(), bytemuck::cast_slice(&ids))
+                                .unwrap();
+                            be.upload(output.as_ref(), &vec![0; output.len_bytes()])
+                                .unwrap();
+                            let run = |reps| {
+                                let rec = be.recorder().unwrap();
+                                for _ in 0..reps {
+                                    if with_shared {
+                                        rec.linear_native_id_multi_paged_shared(
+                                            dtype,
+                                            weight.device_addr().unwrap(),
+                                            stride as u32,
+                                            lut.as_ref(),
+                                            ids_b.as_ref(),
+                                            used,
+                                            0,
+                                            shared.as_ref(),
+                                            input.as_ref(),
+                                            per_slot,
+                                            output.as_ref(),
+                                            k,
+                                            n,
+                                            rows,
+                                            0,
+                                            1,
+                                        );
+                                    } else {
+                                        rec.linear_native_id_multi_paged(
+                                            dtype,
+                                            weight.device_addr().unwrap(),
+                                            stride as u32,
+                                            lut.as_ref(),
+                                            ids_b.as_ref(),
+                                            used,
+                                            0,
+                                            input.as_ref(),
+                                            per_slot,
+                                            output.as_ref(),
+                                            k,
+                                            n,
+                                            rows,
+                                            0,
+                                            1,
+                                        );
+                                    }
+                                }
+                                let start = std::time::Instant::now();
+                                rec.finish().unwrap();
+                                start.elapsed().as_secs_f64() * 1e6 / reps as f64
+                            };
+                            run(1);
+                            if buffer_grid {
+                                let effective_nr = nr;
+                                let (expected, _) = if with_shared {
+                                    crate::gemm::native_idm_grid_buffer_shared_spv(
+                                        dtype,
+                                        effective_nr,
+                                    )
+                                    .unwrap()
+                                } else {
+                                    crate::gemm::native_idm_grid_buffer_paged_spv(
+                                        dtype,
+                                        effective_nr,
+                                    )
+                                    .unwrap()
+                                };
+                                assert!(
+                                    be.built_kernel_names().contains(&expected),
+                                    "grid probe took a fallback instead of {expected}"
+                                );
+                            }
+                            let mut values = vec![0u8; output.len_bytes()];
+                            be.download(output.as_ref(), &mut values).unwrap();
+                            if nr == 1 && !buffer_grid {
+                                references
+                                    .insert((dtype, k, n, rows, per_slot, with_shared), values);
+                            } else {
+                                assert_eq!(
+                            &values,
+                            &references[&(dtype, k, n, rows, per_slot, with_shared)],
+                                "{dtype:?} K={k}, N={n}, shared={with_shared}, buffer={buffer_grid}, nr={nr}, rows={rows}, per_slot={per_slot}"
+                        );
+                            }
+                            let measurements = (0..4).map(|_| run(64)).collect::<Vec<_>>();
+                            println!("{dtype:?} K={k}, N={n}, shared={with_shared}, buffer={buffer_grid}, nr={nr}, rows={rows}, per_slot={per_slot}, warm_us={measurements:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Q8_0 BN=64/BK=64 A_GLOBAL tile used by Qwen3.8's N=320 recurrent projections. The
     /// non-multiple-of-64 row count exercises padded rows without changing the logical N stride.
     #[test]
@@ -16234,53 +17690,123 @@ mod tests {
         );
     }
 
-    /// Exercise every wave in the 512-expert, top-10 sigmoid router shape used by Qwen3.5 MoE.
+    /// Exercise every wave in the 512-expert, top-10 sigmoid router shape used by Qwen3.8.
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn moe_topk_512_experts_selects_exact_top10() {
-        let be = be_with(|_| {});
         let (n_tokens, n_expert, n_used) = (1usize, 512usize, 10usize);
         let logits: Vec<f32> = (0..n_expert).map(|i| i as f32 / 512.0).collect();
         let dummy = vec![0.0f32; n_expert];
-        let blog = upf32(&be, &logits);
-        let bdummy = upf32(&be, &dummy);
-        let bids = be
-            .alloc(n_tokens * n_used * 4, BufferUsage::Readback)
-            .unwrap();
-        let bwts = be
-            .alloc(n_tokens * n_used * 4, BufferUsage::Readback)
-            .unwrap();
-        let rec = be.recorder().unwrap();
-        rec.moe_topk(
-            blog.as_ref(),
-            bids.as_ref(),
-            bwts.as_ref(),
-            bdummy.as_ref(),
-            n_tokens,
-            n_expert,
-            n_used,
-            1.0,
-            1,    // sigmoid
-            true, // normalize selected weights
-            false,
-            0,
-            0,
-            bdummy.as_ref(),
-            false,
-        );
-        rec.finish().unwrap();
-
-        let mut idb = vec![0u8; n_tokens * n_used * 4];
-        be.download(bids.as_ref(), &mut idb).unwrap();
-        let ids: &[u32] = bytemuck::cast_slice(&idb);
+        let run = |wave32: bool| {
+            let be = be_with(|cfg| cfg.moe_topk_sg = wave32);
+            let blog = upf32(&be, &logits);
+            let bdummy = upf32(&be, &dummy);
+            let bids = be
+                .alloc(n_tokens * n_used * 4, BufferUsage::Readback)
+                .unwrap();
+            let bwts = be
+                .alloc(n_tokens * n_used * 4, BufferUsage::Readback)
+                .unwrap();
+            let rec = be.recorder().unwrap();
+            rec.moe_topk(
+                blog.as_ref(),
+                bids.as_ref(),
+                bwts.as_ref(),
+                bdummy.as_ref(),
+                n_tokens,
+                n_expert,
+                n_used,
+                1.0,
+                1,    // sigmoid
+                true, // normalize selected weights
+                false,
+                0,
+                0,
+                bdummy.as_ref(),
+                false,
+            );
+            rec.finish().unwrap();
+            let mut idb = vec![0u8; n_tokens * n_used * 4];
+            be.download(bids.as_ref(), &mut idb).unwrap();
+            let mut wb = vec![0u8; n_tokens * n_used * 4];
+            be.download(bwts.as_ref(), &mut wb).unwrap();
+            (
+                bytemuck::cast_slice::<u8, u32>(&idb).to_vec(),
+                bytemuck::cast_slice::<u8, u32>(&wb).to_vec(),
+            )
+        };
+        let (ids, weight_bits) = run(true);
+        let (fallback_ids, fallback_weight_bits) = run(false);
         let expected: Vec<u32> = (502..512).rev().collect();
         assert_eq!(ids, expected, "512-expert top-10 selection changed");
-
-        let mut wb = vec![0u8; n_tokens * n_used * 4];
-        be.download(bwts.as_ref(), &mut wb).unwrap();
-        let wts: &[f32] = bytemuck::cast_slice(&wb);
+        assert_eq!(ids, fallback_ids, "wave32 ids differ from generic router");
+        assert_eq!(
+            weight_bits, fallback_weight_bits,
+            "wave32 weights differ bitwise from generic router"
+        );
+        let wts: &[f32] = bytemuck::cast_slice(&weight_bits);
         assert!(wts.iter().all(|w| w.is_finite() && *w > 0.0));
         assert!((wts.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn router_input_tap_preserves_routing_and_every_input_bit() {
+        let input_bits: Vec<u32> = (0..2560u32).map(|i| i.wrapping_mul(2654435761)).collect();
+        for wave32 in [false, true] {
+            let be = be_with(|cfg| cfg.moe_topk_sg = wave32);
+            let input = be.alloc(2560 * 4, BufferUsage::Activations).unwrap();
+            be.upload(input.as_ref(), bytemuck::cast_slice(&input_bits))
+                .unwrap();
+            let tap = be.alloc(2560 * 4, BufferUsage::Readback).unwrap();
+            let dummy = upf32(&be, &[0.0]);
+            for (n_expert, n_used) in [(512usize, 10usize), (512, 32), (129, 7), (1024, 10)] {
+                let logits: Vec<f32> = (0..n_expert)
+                    .map(|i| (i % 61) as f32 * 0.02 - 0.6)
+                    .collect();
+                let blog = upf32(&be, &logits);
+                for gating in 0..=2 {
+                    let mut routes = Vec::new();
+                    for enabled in [false, true] {
+                        let ids = be.alloc(n_used * 4, BufferUsage::Readback).unwrap();
+                        let weights = be.alloc(n_used * 4, BufferUsage::Readback).unwrap();
+                        let rec = be.recorder().unwrap();
+                        rec.moe_topk_with_tap(
+                            blog.as_ref(),
+                            ids.as_ref(),
+                            weights.as_ref(),
+                            dummy.as_ref(),
+                            1,
+                            n_expert,
+                            n_used,
+                            1.0,
+                            gating,
+                            true,
+                            false,
+                            0,
+                            0,
+                            dummy.as_ref(),
+                            false,
+                            enabled.then_some((input.as_ref(), tap.as_ref())),
+                        );
+                        rec.finish().unwrap();
+                        let mut id_bytes = vec![0u8; n_used * 4];
+                        let mut weight_bytes = vec![0u8; n_used * 4];
+                        be.download(ids.as_ref(), &mut id_bytes).unwrap();
+                        be.download(weights.as_ref(), &mut weight_bytes).unwrap();
+                        routes.push((id_bytes, weight_bytes));
+                    }
+                    assert_eq!(
+                        routes[0], routes[1],
+                        "tap changed routing wave32={wave32} gating={gating}"
+                    );
+                    let mut actual = vec![0u32; 2560];
+                    be.download(tap.as_ref(), bytemuck::cast_slice_mut(&mut actual))
+                        .unwrap();
+                    assert_eq!(actual, input_bits);
+                }
+            }
+        }
     }
 
     /// MLA (DeepSeek V2/V3 absorbed form) on the REAL Vulkan path, vs a CPU reference — the

@@ -241,6 +241,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     v.small_bm = presence_inv(get, "INFR_NO_SMALL_BM");
     v.bm16 = presence_inv(get, "INFR_NO_BM16");
     v.mmq = presence_inv(get, "INFR_NO_MMQ");
+    v.qwen_hc_down_prefetch = presence_inv(get, "INFR_NO_QWEN_HC_DOWN_PREFETCH");
     v.mmq_fallback = presence_inv(get, "INFR_NO_MMQ_FALLBACK");
     v.mmv = presence_inv(get, "INFR_NO_MMV");
     v.mmv_decode = presence(get, "INFR_MMV_DECODE");
@@ -365,6 +366,8 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     // ── kernels (graph shape, `infr-llama`) ──────────────────────────────────
     p.kernels.qkv_fuse = presence_inv(get, "INFR_NO_QKV_FUSE");
     p.kernels.gated_rmsnorm = presence_inv(get, "INFR_NO_GATED_RMSNORM");
+    p.kernels.delta_ab_fuse = presence_inv(get, "INFR_NO_DELTA_AB_FUSE");
+    p.kernels.qwen_hc_down_inject = presence_inv(get, "INFR_NO_QWEN_HC_DOWN_INJECT");
     p.kernels.ple_single_parallel = presence_inv(get, "INFR_NO_PLE_SINGLE_PAR");
 
     // ── spec ─────────────────────────────────────────────────────────────────

@@ -163,6 +163,41 @@ pub(crate) fn bilinear_resize_pos_table(
     Ok(out)
 }
 
+/// Explain *why* an image payload could not be decoded.
+///
+/// A bare `"decoding image"` is unactionable from a server log, because this one failure covers two
+/// very different causes: the bytes are a real image whose format this build has no decoder for,
+/// or they are not an image at all — a URL that fell through [`decode_image_input`]'s scheme guard
+/// and got base64-decoded as if it were a payload. Reporting the guessed format, the leading magic
+/// bytes, and whether the payload is merely printable text separates those cases at a glance.
+fn describe_undecodable(bytes: &[u8], guessed: Option<image::ImageFormat>) -> String {
+    let hint = if bytes.is_empty() {
+        " — payload is empty"
+    } else if bytes
+        .iter()
+        .take(64)
+        .all(|b| b.is_ascii_graphic() || *b == b' ')
+    {
+        " — payload is printable text, not image data: the input was probably a URL rather than a \
+         data: URI or base64 payload"
+    } else if guessed.is_none() {
+        " — unrecognised image magic; this build decodes png, jpeg, webp, gif, bmp, tiff and ico \
+         plus heic and avif when the bundled image codecs are installed"
+    } else {
+        ""
+    };
+    let magic = bytes
+        .iter()
+        .take(16)
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "decoding image (guessed format: {guessed:?}, {} bytes, magic: {magic}){hint}",
+        bytes.len()
+    )
+}
+
 /// Decode, resize, normalize, patchify, and reorder one image into ViT input.
 ///
 /// `pos_table_f32` is the dequantized `v.position_embd.weight`, `[embd, base²]` ne0-fastest.
@@ -171,11 +206,17 @@ pub fn prepare_image_bytes(
     cfg: &ClipConfig,
     pos_table_f32: &[f32],
 ) -> Result<PreparedImage> {
-    let img = ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .context("guessing image format")?
-        .decode()
-        .context("decoding image")?;
+    let img = if crate::heif::recognizes(bytes) {
+        crate::heif::decode(bytes)?
+    } else {
+        let reader = ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .context("guessing image format")?;
+        let guessed = reader.format();
+        reader
+            .decode()
+            .with_context(|| describe_undecodable(bytes, guessed))?
+    };
     let (w, h) = img.dimensions();
     let (rw, rh) = smart_resize(w, h, cfg.merge_factor() as u32, cfg.patch_size);
     tracing::debug!(from = ?(w, h), to = ?(rw, rh), "vision smart-resize");
@@ -260,6 +301,36 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore = "requires the pinned decoder bundle and upstream fixtures"]
+    fn bundled_codecs_prepare_matches_png() -> Result<()> {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("INFR_IMAGE_CODEC_FIXTURES").context("missing fixture root")?,
+        );
+        let cfg = test_cfg();
+        let positions = [0.0; 32];
+        for file in [
+            "examples/example.heic",
+            "examples/example.avif",
+            "fuzzing/data/corpus/colors-with-alpha.heic",
+        ] {
+            let bytes = std::fs::read(root.join(file))?;
+            let uri = format!(
+                "data:image/heif;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(&bytes)
+            );
+            let input = decode_image_input(&uri)?;
+            let got = prepare_image_bytes(&input, &cfg, &positions)?;
+            let rgb = crate::heif::decode(&bytes)?.to_rgb8();
+            let want = prepare_image_bytes(&png_of(&rgb), &cfg, &positions)?;
+            assert_eq!((got.grid_nx, got.grid_ny), (want.grid_nx, want.grid_ny));
+            assert_eq!(got.patches, want.patches);
+            assert_eq!(got.pos_embed, want.pos_embed);
+            assert!(got.patches.iter().all(|v| v.is_finite()));
+        }
+        Ok(())
+    }
+
     /// Encode a solid/procedural RGB image as PNG bytes in memory.
     fn png_of(img: &RgbImage) -> Vec<u8> {
         let mut buf = Cursor::new(Vec::new());
@@ -305,6 +376,78 @@ mod tests {
         assert!(decode_image_input("https://example.com/x.png").is_err());
         assert!(decode_image_input("data:image/png,raw").is_err());
         assert!(decode_image_input("not base64 !!!").is_err());
+    }
+
+    /// Every format a client may realistically upload must survive the FULL prepare path.
+    ///
+    /// Regression: `image` was compiled with only png/jpeg/webp, so a GIF/BMP/TIFF upload — all of
+    /// which a browser, Paint or a screenshot tool will happily produce — base64-decoded fine and
+    /// then died at `.decode()` with a bare "decoding image", indistinguishable in the log from a
+    /// payload that was never an image at all.
+    #[test]
+    fn prepare_accepts_every_supported_image_format() {
+        let cfg = test_cfg();
+        let pos_table: Vec<f32> = (0..cfg.base_grid * cfg.base_grid * cfg.embedding_length)
+            .map(|v| v as f32)
+            .collect();
+        // One flat colour, so the palette-quantising encoders (gif) round-trip exactly.
+        let img = RgbImage::from_pixel(64, 64, Rgb([37, 129, 201]));
+
+        let encode = |format: image::ImageFormat| {
+            let mut buf = Cursor::new(Vec::new());
+            if format == image::ImageFormat::Ico {
+                image::DynamicImage::ImageRgb8(img.clone())
+                    .to_rgba8()
+                    .write_to(&mut buf, format)
+                    .expect("encode RGBA icon fixture");
+            } else {
+                img.write_to(&mut buf, format).expect("encode fixture");
+            }
+            buf.into_inner()
+        };
+
+        // Lossless: the decoded pixels are identical, so the prepared patches must be too.
+        let want = prepare_image_bytes(&encode(image::ImageFormat::Png), &cfg, &pos_table)
+            .expect("png")
+            .patches;
+        for format in [
+            image::ImageFormat::Gif,
+            image::ImageFormat::Bmp,
+            image::ImageFormat::Tiff,
+            image::ImageFormat::Ico,
+        ] {
+            let got = prepare_image_bytes(&encode(format), &cfg, &pos_table)
+                .unwrap_or_else(|e| panic!("{format:?} must prepare: {e:#}"));
+            assert_eq!((got.grid_nx, got.grid_ny), (2, 2), "{format:?}");
+            assert_eq!(got.patches, want, "{format:?} must match png exactly");
+        }
+
+        // Lossy (and palette-vs-lossless-webp) formats only have to prepare cleanly.
+        for format in [image::ImageFormat::Jpeg, image::ImageFormat::WebP] {
+            let got = prepare_image_bytes(&encode(format), &cfg, &pos_table)
+                .unwrap_or_else(|e| panic!("{format:?} must prepare: {e:#}"));
+            assert_eq!((got.grid_nx, got.grid_ny), (2, 2), "{format:?}");
+            assert_eq!(got.n_patches(), 16, "{format:?}");
+        }
+    }
+
+    /// A payload that is not an image must say so, rather than reporting the same bare
+    /// "decoding image" as an unsupported-but-real image format.
+    #[test]
+    fn undecodable_payloads_explain_themselves() {
+        let err =
+            match prepare_image_bytes(b"https://example.com/shot.png", &test_cfg(), &[0.0; 32]) {
+                Ok(_) => panic!("text is not an image"),
+                Err(e) => e.to_string(),
+            };
+        assert!(err.contains("printable text"), "got: {err}");
+
+        // A real GIF magic with a truncated body: recognised magic, still undecodable.
+        let err = match prepare_image_bytes(b"GIF89a\x01\x00\x01\x00", &test_cfg(), &[0.0; 32]) {
+            Ok(_) => panic!("truncated gif is not an image"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("guessed format: Some(Gif)"), "got: {err}");
     }
 
     // ── bilinear (ALIGN_CORNERS) ────────────────────────────────────────────

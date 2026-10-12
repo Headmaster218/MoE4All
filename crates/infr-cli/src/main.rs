@@ -758,6 +758,7 @@ fn main() -> anyhow::Result<()> {
     publish_thread_count(&cfg);
     publish_profile_out(&cfg);
     let _pager_profile = infr_core::pager_profile::SummaryGuard::new(cfg.prof.pager_profile);
+    infr_core::timeline::configure(&cfg.prof).map_err(anyhow::Error::msg)?;
     // WHICH paths a layer actually specified — the one thing a resolved `Config` cannot answer,
     // and the input the model-recommended sampling defaults need (they may only fill a knob nobody
     // named). S1 answered it by re-publishing the values into the environment and probing it back;
@@ -770,6 +771,7 @@ fn main() -> anyhow::Result<()> {
     // produced (an aborted forward reports `aborted: shutdown requested`, which is noise once we
     // are already saying "interrupted" with the right status).
     let res = dispatch(cmd, &cfg, &specified);
+    infr_core::timeline::flush().context("writing Decode timeline")?;
     exit_if_signalled();
     res
 }

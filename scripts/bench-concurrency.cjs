@@ -10,7 +10,7 @@ const [label, mode = 'ordinary', profile = 'off', selection = 'short,medium,mixe
 if (!label || !['ordinary', 'mtp'].includes(mode) || !['off', 'pager', 'ops'].includes(profile)) {
   throw new Error('Usage: node scripts/bench-concurrency.cjs LABEL ordinary|mtp off|pager|ops [short,medium,mixed,reverse,long,split]');
 }
-const root = path.resolve('target/concurrency-20260923');
+const root = path.resolve(process.env.BENCH_ROOT || 'target/concurrency-20260923');
 fs.mkdirSync(root, { recursive: true });
 const exe = path.resolve(process.env.BENCH_EXE || 'target/release/infr.exe');
 const model = process.env.BENCH_MODEL || 'D:\\AILMStudioModels\\Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64\\Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00033.gguf';
@@ -24,6 +24,12 @@ const scenarios = {
   long: { depths: [28672, 28672], outputs: [1024, 1024], delay: 0 },
   split: { depths: [512, 28672], outputs: [1024, 1024], delay: 6000 },
   tiny: { depths: [128, 128], outputs: [256, 256], delay: 0 },
+  ctx30: { depths: [30720, 30720], outputs: [512, 512], delay: 0 },
+  ctx45: { depths: [46080, 46080], outputs: [512, 512], delay: 0 },
+  ctx60: { depths: [61440, 61440], outputs: [512, 512], delay: 0 },
+  ctx75: { depths: [76800, 76800], outputs: [512, 512], delay: 0 },
+  ctx90: { depths: [92160, 92160], outputs: [512, 512], delay: 0 },
+  ctx150: { depths: [153600, 153600], outputs: [512, 512], delay: 0 },
 };
 const names = selection.split(',');
 for (const name of names) if (!scenarios[name]) throw new Error(`Unknown scenario: ${name}`);
@@ -33,12 +39,16 @@ if (process.env.BENCH_TOKENS) {
   for (const cfg of Object.values(scenarios)) cfg.outputs = [tokens, tokens];
 }
 const env = { ...process.env };
+const single = process.env.BENCH_SINGLE === '1';
+const automaticBudgets = process.env.BENCH_AUTO_BUDGETS === '1';
 for (const key of Object.keys(env)) if (key.startsWith('INFR_')) delete env[key];
 Object.assign(env, {
   RUST_LOG: 'info,infr_llama::parallel=debug',
-  INFR_RAM_BUDGET: '48g', INFR_VRAM_BUDGET: '24g', INFR_UBATCH_PARALLEL: '256',
   INFR_MTP: mode === 'mtp' ? '1' : '0', INFR_SERVE_STATS_SECS: '1',
 });
+if (!automaticBudgets) {
+  Object.assign(env, { INFR_RAM_BUDGET: '48g', INFR_VRAM_BUDGET: '24g', INFR_UBATCH_PARALLEL: '256' });
+}
 if (mode === 'mtp') env.INFR_SPEC_DRAFT = head;
 if (process.env.BENCH_GRID_NR) env.INFR_GEMV_ID_GRID_NR = process.env.BENCH_GRID_NR;
 if (process.env.BENCH_NO_SHARED_SLOT) env.INFR_NO_MOE_SHARED_SLOT = '1';
@@ -147,7 +157,9 @@ async function main() {
   if (!device) throw new Error(devs.stderr || 'RX 7900 XTX not found');
   const port = await reservePort();
   const url = `http://127.0.0.1:${port}`;
-  const args = ['serve', model, '--addr', `127.0.0.1:${port}`, '--parallel', '2', '--ctx', process.env.BENCH_CTX || '32768', '--dev', device, '--ubatch', '3072', '--temp', '0', '--seed', '1', '--no-think'];
+  const args = ['serve', model, '--addr', `127.0.0.1:${port}`, '--parallel', '2', '--ctx', process.env.BENCH_CTX || '32768', '--dev', device, '--temp', '0', '--seed', '1', '--no-think'];
+  if (process.env.BENCH_UBATCH !== 'auto') args.push('--ubatch', process.env.BENCH_UBATCH || '3072');
+  if (process.env.BENCH_SET) args.push('--set', process.env.BENCH_SET);
   const out = fs.createWriteStream(prefix + '.out.log');
   const err = fs.createWriteStream(prefix + '.err.log');
   child = spawn(exe, args, { env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -179,6 +191,14 @@ async function main() {
       cases.push(c);
       const a = startRequest(url, modelId, prompts[name][0], name, 0, cfg.outputs[0]);
       c.requests.push(a);
+      if (single) {
+        await a.promise;
+        c.doneAt = Date.now();
+        persist();
+        if (childExit) break;
+        await sleep(2000);
+        continue;
+      }
       if (cfg.delay) {
         while (!a.firstAt && !a.doneAt) await sleep(50);
         if (a.firstAt) await sleep(cfg.delay);

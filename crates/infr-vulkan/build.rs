@@ -690,9 +690,14 @@ fn main() {
         // Decode twin of `rmsnorm`: 1024 threads + vec4 loads in the single rows==1 workgroup, to
         // buy back the memory-level parallelism the 256-thread build lacks (see rmsnorm.comp).
         ("rmsnorm", "rmsnorm_wide", &["-DWIDE"]),
-        // Fused per-head RMSNorm + SiLU gate multiply (qwen35 DeltaNet z-gate, Op::GatedRmsNorm) —
-        // same reduction as `rmsnorm`, one extra buffer + the gate multiply on store.
+        // Fused per-head RMSNorm + gate multiply (Op::GatedRmsNorm): Qwen3.5 uses SiLU and
+        // Qwen3.8 uses Sigmoid. Both preserve the base reduction and fold the gate into the store.
         ("rmsnorm", "rmsnorm_gate", &["-DGATE"]),
+        (
+            "rmsnorm",
+            "rmsnorm_gate_sigmoid",
+            &["-DGATE", "-DGATE_SIGMOID"],
+        ),
         ("rmsnorm", "rmsnorm_add", &["-DADD"]),
         // f16-in/f16-out RMSNorm (llama4's post-rope weightless Q/K L2-norm, `Op::QkNorm` on the
         // f16 rope scratch — `w` stays f32).
@@ -719,6 +724,14 @@ fn main() {
         ("dsv4_indexer_score", "dsv4_indexer_score", &[]),
         ("dsv4_indexer_topk", "dsv4_indexer_topk", &[]),
         ("dsv4_gather", "dsv4_gather", &[]),
+        ("qsa_prepare", "qsa_prepare", &[]),
+        ("qsa_prepare", "qsa_prepare_mrope", &["-DQSA_MROPE"]),
+        ("qsa_prepare", "qsa_prepare_seg", &["-DKV_SEGMENTED"]),
+        (
+            "qsa_prepare",
+            "qsa_prepare_mrope_seg",
+            &["-DQSA_MROPE", "-DKV_SEGMENTED"],
+        ),
         ("qsa_indexer_compress", "qsa_indexer_compress", &[]),
         (
             "qsa_indexer_compress",
@@ -752,6 +765,16 @@ fn main() {
             &["-DKV_SEGMENTED", "-DQSA_SCORE_H4"],
         ),
         (
+            "qsa_indexer_score_tile8",
+            "qsa_indexer_score_h4_t32_seg",
+            &["-DBLOCK_TILE=32", "-DKV_SEGMENTED"],
+        ),
+        (
+            "qsa_indexer_score_tile8",
+            "qsa_indexer_score_h4_t64_seg",
+            &["-DBLOCK_TILE=64", "-DKV_SEGMENTED"],
+        ),
+        (
             "qsa_indexer_score",
             "qsa_indexer_score_decode8",
             &["-DQSA_SCORE_DECODE8"],
@@ -772,9 +795,24 @@ fn main() {
             &["-DQSA_SCORE_DECODE8", "-DQSA_SCORE_H4", "-DKV_SEGMENTED"],
         ),
         ("qsa_indexer_topk", "qsa_indexer_topk", &[]),
+        (
+            "qsa_indexer_topk",
+            "qsa_indexer_topk_scan",
+            &["-DPARALLEL_SCAN"],
+        ),
         ("qsa_indexer_topk_hist", "qsa_indexer_topk_hist", &[]),
         ("qsa_indexer_topk_select", "qsa_indexer_topk_select", &[]),
+        (
+            "qsa_indexer_topk_select",
+            "qsa_indexer_topk_select_scan",
+            &["-DPARALLEL_SCAN"],
+        ),
         ("qsa_indexer_topk_collect", "qsa_indexer_topk_collect", &[]),
+        (
+            "qsa_indexer_topk_collect",
+            "qsa_indexer_topk_collect_scan",
+            &["-DPARALLEL_SCAN"],
+        ),
         ("qsa_gather", "qsa_gather", &[]),
         ("qsa_gather", "qsa_gather_kq8", &["-DKQ8"]),
         ("qsa_gather", "qsa_gather_vq8", &["-DVQ8"]),
@@ -823,6 +861,31 @@ fn main() {
             "qsa_attention_batch_q8_seg",
             &["-DKQ8", "-DVQ8", "-DKV_SEGMENTED"],
         ),
+        (
+            "qsa_attention_batch",
+            "qsa_attention_batch_q8_seg_gqa2",
+            &["-DKQ8", "-DVQ8", "-DKV_SEGMENTED", "-DGQA_HEADS=2"],
+        ),
+        (
+            "qsa_attention_batch_gqa12",
+            "qsa_attention_batch_q8_seg_gqa12",
+            &[],
+        ),
+        (
+            "qsa_attention_batch_gqa12_flash",
+            "qsa_attention_batch_q8_seg_gqa12_flash",
+            &[],
+        ),
+        (
+            "qsa_attention_batch_gqa12_flash",
+            "qsa_attention_batch_q8_seg_gqa12_flash_cm_qk",
+            &["-DCOOP_QK"],
+        ),
+        (
+            "qsa_attention_batch_gqa12_flash",
+            "qsa_attention_batch_q8_seg_gqa12_flash_cm_qk_pv",
+            &["-DCOOP_QK", "-DCOOP_PV"],
+        ),
         // DeepSeek V4 Sinkhorn hyper-connections (Op::HyperConnectMix / Pre / Post). `-DGATES`
         // adds the `post` + `comb` outputs; without it the mix kernel is `build_hc_head`'s
         // pre-only form, whose `mixes` is the pre chunk alone.
@@ -835,8 +898,21 @@ fn main() {
         ("gelu", "gelu", &[]),
         ("qk_norm_rope_mrope", "qk_norm_rope_mrope", &[]),
         ("qwen_hc_mix", "qwen_hc_mix", &[]),
+        ("qwen_hc_norm", "qwen_hc_norm", &[]),
         ("qwen_hc_inject", "qwen_hc_inject", &[]),
+        ("qwen_hc_inject_norm", "qwen_hc_inject_norm", &[]),
+        ("qwen_hc_down_inject", "qwen_hc_down_inject", &[]),
+        (
+            "qwen_hc_down_inject",
+            "qwen_hc_down_inject_pf4",
+            &["-DHC_PF=4"],
+        ),
         ("qwen_ple_gate", "qwen_ple_gate", &[]),
+        (
+            "qwen_hc_down_inject",
+            "qwen_hc_down_inject_q8",
+            &["-DHC_INJECT_Q8"],
+        ),
         ("softmax", "softmax", &[]),
         // DiffusionGemma denoise self-conditioning perf: scale read from a device buffer instead
         // of a push constant (see `Op::Softmax::scale_buf`'s doc + `Recorder::softmax_dyn`).
@@ -1012,6 +1088,23 @@ fn main() {
             "linear_f32r",
             "linear_f32r_mrow8_v4",
             &["-DMROW=8", "-DVEC4"],
+        ),
+        ("linear_f32r", "linear_f32r_pair", &["-DPAIR"]),
+        ("linear_f32r", "linear_f32r_pair_v4", &["-DPAIR", "-DVEC4"]),
+        (
+            "linear_f32r",
+            "linear_f32r_pair_mrow8",
+            &["-DPAIR", "-DMROW=8"],
+        ),
+        (
+            "linear_f32r",
+            "linear_f32r_pair_mrow4_v4",
+            &["-DPAIR", "-DMROW=4", "-DVEC4"],
+        ),
+        (
+            "linear_f32r",
+            "linear_f32r_pair_mrow8_v4",
+            &["-DPAIR", "-DMROW=8", "-DVEC4"],
         ),
         ("e2b_gate", "e2b_gate", &[]),
         // e2b_proj (fused E2B per-layer proj GEMV+RMSNorm+Add) landed but was NEVER wired into
@@ -1756,6 +1849,123 @@ fn main() {
             "native_idm_iq4xs_paged",
             &["-DFMT_IQ4XS", "-DPAGED"],
         ),
+        // Paged IQ codebooks shared by workgroups instead of repeated LDS initialization.
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_buffer_paged",
+            &["-DFMT_IQ2S", "-DIQ2_GRID_BUFFER", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_buffer_nr2_paged",
+            &["-DFMT_IQ2S", "-DIQ2_GRID_BUFFER", "-DPAGED", "-DNR=2"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_buffer_nr4_paged",
+            &["-DFMT_IQ2S", "-DIQ2_GRID_BUFFER", "-DPAGED", "-DNR=4"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_buffer_nr8_paged",
+            &["-DFMT_IQ2S", "-DIQ2_GRID_BUFFER", "-DPAGED", "-DNR=8"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_buffer_paged_shexp",
+            &["-DFMT_IQ2S", "-DIQ2_GRID_BUFFER", "-DPAGED", "-DSHARED_Q8"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_buffer_nr2_paged_shexp",
+            &[
+                "-DFMT_IQ2S",
+                "-DIQ2_GRID_BUFFER",
+                "-DPAGED",
+                "-DSHARED_Q8",
+                "-DNR=2",
+            ],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_buffer_nr4_paged_shexp",
+            &[
+                "-DFMT_IQ2S",
+                "-DIQ2_GRID_BUFFER",
+                "-DPAGED",
+                "-DSHARED_Q8",
+                "-DNR=4",
+            ],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_buffer_nr8_paged_shexp",
+            &[
+                "-DFMT_IQ2S",
+                "-DIQ2_GRID_BUFFER",
+                "-DPAGED",
+                "-DSHARED_Q8",
+                "-DNR=8",
+            ],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3s_buffer_paged",
+            &["-DFMT_IQ3S", "-DIQ3_GRID_BUFFER", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3s_buffer_nr2_paged",
+            &["-DFMT_IQ3S", "-DIQ3_GRID_BUFFER", "-DPAGED", "-DNR=2"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3s_buffer_nr4_paged",
+            &["-DFMT_IQ3S", "-DIQ3_GRID_BUFFER", "-DPAGED", "-DNR=4"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3s_buffer_nr8_paged",
+            &["-DFMT_IQ3S", "-DIQ3_GRID_BUFFER", "-DPAGED", "-DNR=8"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3s_buffer_paged_shexp",
+            &["-DFMT_IQ3S", "-DIQ3_GRID_BUFFER", "-DPAGED", "-DSHARED_Q8"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3s_buffer_nr2_paged_shexp",
+            &[
+                "-DFMT_IQ3S",
+                "-DIQ3_GRID_BUFFER",
+                "-DPAGED",
+                "-DSHARED_Q8",
+                "-DNR=2",
+            ],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3s_buffer_nr4_paged_shexp",
+            &[
+                "-DFMT_IQ3S",
+                "-DIQ3_GRID_BUFFER",
+                "-DPAGED",
+                "-DSHARED_Q8",
+                "-DNR=4",
+            ],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3s_buffer_nr8_paged_shexp",
+            &[
+                "-DFMT_IQ3S",
+                "-DIQ3_GRID_BUFFER",
+                "-DPAGED",
+                "-DSHARED_Q8",
+                "-DNR=8",
+            ],
+        ),
         // Qwen shared-expert decode: routed slots keep their native quant while the final slot
         // reads one fixed Q8_0 shared-expert matrix by BDA. Keep the format set aligned with
         // `paged_moe_shared_at`; Qwen3.8 uses IQ2_S/IQ4_NL/IQ3_S across its mixed-quant banks.
@@ -2074,6 +2284,11 @@ fn main() {
         ("moe_accumulate", "moe_accumulate", &[]),
         ("moe_accumulate_scaled", "moe_accumulate_scaled", &[]),
         ("moe_accumulate_shared", "moe_accumulate_shared", &[]),
+        (
+            "moe_accumulate_shared",
+            "moe_accumulate_shared_cpu",
+            &["-DCPU_MISS_RESULT"],
+        ),
         ("native_mmv_id_q4k", "native_mmv_id_q4k", &[]),
         // Int8 dp4a decode GEMV (m=1, NUM_ROWS=2): one .spv per (format, residual).
         ("native_mmv", "native_mmv_q4k", &["-DFMT_Q4K"]),
@@ -3234,6 +3449,18 @@ fn main() {
         ("moe_scatter_reduce", "moe_scatter_reduce", &[]),
         ("moe_topk", "moe_topk", &[]),
         ("moe_topk", "moe_topk_sg", &["-DSUBGROUP_REDUCE"]),
+        ("moe_topk", "moe_topk_tap", &["-DCPU_INPUT_TAP"]),
+        (
+            "moe_topk",
+            "moe_topk_sg_tap",
+            &["-DSUBGROUP_REDUCE", "-DCPU_INPUT_TAP"],
+        ),
+        ("moe_topk_sigmoid_wave32", "moe_topk_sigmoid_wave32", &[]),
+        (
+            "moe_topk_sigmoid_wave32",
+            "moe_topk_sigmoid_wave32_tap",
+            &["-DCPU_INPUT_TAP"],
+        ),
         // Embedding-row gather+dequant (Op::EmbedGather): one .spv per table format.
         ("embed_gather", "embed_gather_q8_0", &["-DFMT_Q8_0"]),
         ("embed_gather", "embed_gather_bf16", &["-DFMT_BF16"]),

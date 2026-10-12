@@ -2,8 +2,9 @@
 kind: architecture
 status: current
 scope: runtime-memory
-last_verified: 2026-09-28
-verified_commit: ed62393068679573afe94a1472454efe7eae0f15
+last_verified: 2026-10-11
+verified_commit: 7b4a9411e9c7524f8dc6ae2603c62d5f338190dc
+baseline_tag: release-0.10.0
 ---
 
 # 运行时资源生命周期
@@ -76,7 +77,21 @@ pool 永久 pin 住。
 
 自动 RAM 预算在启动时按当时系统状态冻结。显式预算类似手动配置，不应在运行中随系统 available 值漂移。
 保守档使用启动时可用 RAM 减 3 GiB，激进档使用总物理 RAM 减 14 GiB，均写入进程总 RAM 预算。
-保守 VRAM 在分配器 256 MiB guard 外再留 768 MiB；激进档将总进程显存限制为设备总量减 2 GiB，同时受实时可用量约束。两档都先真实分配固定资源，再测量剩余空间建立 arena；Windows 大型 ReBAR 模型还可能应用额外启动保留与失败重试。
-离散 GPU 的默认 Prefill ubatch 分别从 2048/4096 行开始，放置不足时按档位下调；iGPU 使用独立默认值。
+保守 VRAM 在分配器 256 MiB guard 外再留 768 MiB；激进档直接使用扣除 guard 后的设备当前可用量。两档都先真实分配固定资源，再测量剩余空间建立 arena；物理分配失败时缩小 arena 或下调 ubatch 后重新探测，Windows 大型 ReBAR 模型还可能应用额外启动保留。
+离散 GPU 两档的默认 Prefill ubatch 都从 4096 行开始，放置不足时按档位下调；iGPU 使用独立默认值。
+
+Windows Intel Xe1 自动模式额外将总后端预算限制为物理 VRAM 的 75%（保守）或 85%（激进）；显式 VRAM budget/reserve、其他架构和非 Windows 平台不应用该 cap。Ubatch 的完整降档为 `4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256`；最终值以 measured placement 日志为准。
+
+## Prefill 事务借用
+
+固定 KV corridor 预留坐标不等于已提交 KV。0.10.0 允许独占 Prefill 暂借未提交区间；真实 KV 已提交范围、其他 slot 的 live state 和被冻结的 Expert 引用仍受保护。QSA runtime reserve 按本次事务将到达的深度计算，完成后恢复 Decode 的约束。
+
+Live arena 优先保留至少 3 个上传/计算 lanes；若 2 lanes 能比 3+ lanes 多容纳至少 1024 rows，则选择该较大 ubatch，只有无法容纳多 lanes 才降到 1。固定资源已落地、当前 resident KV 和可用 shard 连续区间共同决定选择。放置日志中的 `actual_lanes` 比用户指定 ubatch 更直接地说明流送并行度。
+
+完整 host-store 已导入的范围可通过 dedicated transfer queue 上传；未导入的 mapped 尾部仍走 CPU push。跨 chunk 预取只上传下一 chunk 开头层的权重，不提前执行下一个 prompt，也不在长 Prefill 中插入 Decode。ring buffer 复用必须等待上一代 compute/transfer 依赖完成。
+
+## 辅助工作区与传输
+
+Embedding/Vision 的工作区以执行范围保留 lease，idle eviction 或 image batch 结束后才释放；one-shot state upload 和 staging-ring recording 进入共享的可重入执行门，避免与主 Recorder 并发录制同一个 command pool。固定初始化探测仍在初始化路径完成。
 
 更完整的历史设计见 [分层统一内存](../../evidence/changes/memory/unified-memory.md) 和 [Tiered weight paging](../../evidence/changes/memory/tiered-weight-paging.md)。

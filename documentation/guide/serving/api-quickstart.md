@@ -2,17 +2,20 @@
 kind: guide
 status: current
 scope: serving-api
-last_verified: 2026-09-28
-verified_commit: ed62393068679573afe94a1472454efe7eae0f15
+last_verified: 2026-10-11
+verified_commit: 7b4a9411e9c7524f8dc6ae2603c62d5f338190dc
+baseline_tag: release-0.10.0
 ---
 
 # 使用本地 API
 
-先在 Windows 向导中选择“OpenAI 兼容 API”，或用 `infr serve` 启动模型。下面以本机默认地址为例；若启动时指定了 `--addr`，请替换地址。客户端的 Base URL 为 `http://127.0.0.1:8080/v1`。
+先用启动向导选择“OpenAI 兼容 API”——Windows 是 `Start-INFR-Wizard.cmd`，Linux 是 [`Start-INFR-Wizard-Linux.sh`](../../../Start-INFR-Wizard-Linux.sh)——或直接用 `infr serve` 启动模型。下面以本机默认地址为例；若启动时指定了 `--addr`，请替换地址。客户端的 Base URL 为 `http://127.0.0.1:8080/v1`。
 
 ## 查找模型与鉴权
 
 `GET /health` 无需鉴权。设置了非空 `serve.api_key` 时，`/v1/models` 和生成、嵌入接口都要求 `Authorization: Bearer <key>`；空字符串等于未启用鉴权。
+
+**本机使用 `127.0.0.1`；局域网访问可用 `0.0.0.0`，但应启用 API key。** 不带鉴权地把服务绑定到非回环地址（例如 `--addr 0.0.0.0:8080`），等于把本机的模型能力开放给同网段的所有人。
 
 ```powershell
 $base = 'http://127.0.0.1:8080'
@@ -42,7 +45,7 @@ Invoke-RestMethod -Method Post -Uri "$base/v1/chat/completions" -Headers $header
 
 ## Responses API
 
-0.9.0 提供无状态 `POST /v1/responses`，接受字符串或消息数组形式的 `input`，支持 JSON 响应和 typed SSE：
+0.10.0 提供无状态 `POST /v1/responses`，接受字符串或消息数组形式的 `input`，支持 JSON 响应和 typed SSE：
 
 ```powershell
 $request = @{ model = $chatModel; input = '用一句话解释 Prefill。'; max_output_tokens = 128; stream = $false } | ConvertTo-Json
@@ -54,6 +57,12 @@ Invoke-RestMethod -Method Post -Uri "$base/v1/responses" -Headers $headers -Cont
 ## 图片与嵌入
 
 启用 Vision 并加载兼容的 mmproj 后，Chat Completions 的 `content` 可交错包含文本和 `image_url`。图片须为 data URI 或 base64；远程 HTTP URL 不受支持。以下示例读取本地 PNG：
+
+支持 PNG、JPEG、WebP、GIF、BMP、TIFF、ICO；带 `image-codecs/` 的 Windows/Linux
+发行包还支持 HEIC/HEIF（HEVC）和 AVIF。按文件内容识别，不依赖 MIME 或扩展名；
+HEIF/AVIF 使用主图并应用文件内裁剪、旋转、镜像，再走同一视觉预处理。
+不新增远程 URL 获取或动画播放。HEIF/AVIF 限制每边不超过 8192、面积不超过
+64 Mi 像素、压缩数据不超过 256 MiB；损坏或不支持的编码会明确报错。
 
 ```powershell
 $image = [Convert]::ToBase64String([IO.File]::ReadAllBytes('D:\Images\example.png'))
@@ -78,3 +87,9 @@ $result.data | Select-Object index, @{Name='dimensions';Expression={$_.embedding
 ```
 
 具体可运行组合取决于[模型能力](../../reference/model-capabilities.md)和启动时的内存预算。接口行为以 `crates/infr-server/src/lib.rs` 和 `crates/infr-server/src/responses.rs` 在上述 `verified_commit` 的实现为准。
+
+## 大请求与服务速度
+
+完整 JSON body 上限为 64 MiB，超过返回 413；base64 的体积约比原始图片多三分之一，context token 容量另行检查。图片格式、HEIC/AVIF 解码库及 Embedding 首次载入行为见[图片与 Embedding](images-and-embeddings.md)。
+
+live 表每 1.5 秒刷新，各 slot 与总 Decode 速度均为区间值；完整请求的速度看 `timings`。KV 复用必须对照 `cached_n` 与 `prompt_n`，几十 token 的 suffix Prefill 不能与 30K/150K 全冷吞吐直接比较。

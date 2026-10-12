@@ -2,8 +2,9 @@
 kind: architecture
 status: current
 scope: system
-last_verified: 2026-09-28
-verified_commit: ed62393068679573afe94a1472454efe7eae0f15
+last_verified: 2026-10-11
+verified_commit: 7b4a9411e9c7524f8dc6ae2603c62d5f338190dc
+baseline_tag: release-0.10.0
 ---
 
 # 系统总览
@@ -12,14 +13,12 @@ verified_commit: ed62393068679573afe94a1472454efe7eae0f15
 
 MoE4All 当前以独立 Rust 推理 worker 为核心，提供四类入口：
 
-- Windows Wizard 组合启动参数；
+- Windows / Linux Wizard 组合启动参数；
 - `infr run` 终端对话；
 - `infr serve` / `infr multi` OpenAI-compatible 服务；
 - `infr bench` / `infr compare` 性能与参考对照。
 
-`infr-gui` 是现有浏览器控制面，负责目录、估算、下载和 worker 生命周期。Agent/DSH harness 不属于
-`release-0.9.0` tag；后续开发分支加入了相关源码和开发环境，但不能据此描述为 0.9.0 已交付能力。版本边界见
-[提交审计](../evidence/audits/2026-09-28-release-0.9.0-baseline-and-new-commits.md)。未来产品边界另见[Agent 发行版提案](../roadmap/agent-distribution.md)。
+`infr-gui` 是浏览器控制面，负责目录、估算、下载和 worker 生命周期。`harness/` 已在 0.10.0 固定品牌化 DSH 和维护插件的源码，可建立隔离的 MoE4All Agent Web 环境。Agent 复用 DSH 的会话、工具、审批和插件机制，通过 Provider 连接独立引擎；其详细边界见[Agent 产品架构](product/agent-distribution.md)。0.10.0 引擎发布工作流不负责生成正式 Agent EXE。
 
 ## 请求路径
 
@@ -44,7 +43,7 @@ backend-neutral Graph
         +--> Metal
 ```
 
-HTTP DTO、鉴权、SSE 和错误映射属于 `infr-server`；0.9.0 同时提供 Chat Completions 与无状态 Responses API。模板、工具和 reasoning/content 分流属于 `infr-chat`。
+HTTP DTO、鉴权、SSE 和错误映射属于 `infr-server`；0.10.0 提供 Chat Completions 与无状态 Responses API。模板、工具和 reasoning/content 分流属于 `infr-chat`。
 模型、session、scheduler 与 MTP 主要仍在 `infr-llama`。CLI 负责把这些模块装配成实际命令。Vulkan `serve` 通常由
 `ParallelSeam` 统一调度；仅单 slot、纯文本且没有 Vision/Embedding 的 Qwen3.8 MTP serve 保留传统单请求路径。
 并发 token group 的 lane 顺序优先多模态 lane，再优先剩余 Prefill 较长的 lane，最后以 slot 稳定排序；这是共享图形状
@@ -54,7 +53,7 @@ HTTP DTO、鉴权、SSE 和错误映射属于 `infr-server`；0.9.0 同时提供
 
 模型级固定权重跨请求共享。每个并发 slot 有独立的 KV、recurrent state、采样和会话前缀。
 Qwen3.8 compatible rows 可按层批量执行，但位置、QSA selection、PLE/recurrent state 和输出仍分别维护。Qwen3.8 concurrent
-MTP 共享 target/head 权重、每 slot 独立 MTP state，当前最多两个 slot；请求不符合 greedy-compatible 条件时回退普通 Decode。
+MTP 共享 target/head 权重、每 slot 独立 MTP state，当前最多两个 slot；请求不符合 greedy-compatible 条件时回退普通 Decode。默认 `spec.mtp_concurrent=false`，多路同时活跃使用普通批量 Decode；调度器的机会式 MTP 还受 48K target context cutoff 限制。
 
 冷 KV session cache 是引擎状态优化，不是聊天记录数据库。恢复失败最多导致重新 Prefill，不应丢失 Agent 或用户会话事实。
 

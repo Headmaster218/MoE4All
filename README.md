@@ -2,16 +2,22 @@
 
 **让游戏显卡跑起远超显存容量的大模型。AMD、NVIDIA、Intel，均已跑通。**
 
-Windows 免安装，程序 13 MiB。下载 GGUF、选择自动配置，即可本地聊天，
+Windows 免安装，下载约 14 MiB。下载 GGUF、选择自动配置，即可本地聊天，
 或通过 OpenAI 兼容接口接入现有客户端。显存、内存与 SSD 协同加载 MoE 专家权重。
 
-**0.8.0 发布实测**：RX 7900 XTX 24 GiB + 64 GiB DDR4，自动配置：激进性能。
-下表为实测生成速度，单位 tok/s；完整配置与分段结果见[实测结果](#实测结果)。
+**0.10.0 峰值速度参考**：RX 7900 XTX 24 GiB + Ryzen 5 5600X + 64 GiB DDR4，自动激进配置。
+Flash-Next 4.27bpw 的 Prefill 峰值约 **1,446 tok/s**，三路 Decode 总峰值 **79.4 tok/s**；
+35B Balanced 在 30K 下单路 Decode 峰值 **65.4 tok/s**。
+MTP / CPU miss 关闭，配置三个槽位。以下为 2026-10-09 实测峰值，单位 tok/s；统计口径见[实测结果](#实测结果)。
 
-| 主推模型与量化 | MTP | 20K 输入 | 150K 输入 |
-| --- | --- | ---: | ---: |
-| **Qwen3.6-35B-A3B · APEX-I-Balanced** | 关闭 | **65.6** | **39.9** |
-| **Qwen3.8-Flash-Next · AD-4.27bpw-Q4_K_M-M64** | 开启 | **60.2** | **48.1** |
+| 模型 | 同时生成路数 | 30K Prefill 峰值 | 30K Decode 总峰值 | 150K Prefill 峰值 | 150K Decode 总峰值 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash-Next 4.27bpw | 1 | 1,439.4 | **47.7** | 1,444.6 | **44.7** |
+| Flash-Next 4.27bpw | 2 | 1,445.2 | **71.3** | 1,446.3 | **63.6** |
+| Flash-Next 4.27bpw | 3 | 1,437.0 | **79.4** | 1,434.2 | **62.5** |
+| 35B Balanced | 1 | 3,824.8 | **65.4** | 3,981.7 | **36.7** |
+
+<sub>峰值为 1.5 秒滚动窗口内的最高速度。Prefill 峰值由 chunk 完成进度插值估算。</sub>
 
 [下载已发布的 Windows 版本](https://github.com/Headmaster218/MoE4All/releases/latest) |
 [快速使用](#快速使用) |
@@ -25,7 +31,8 @@ Windows 免安装，程序 13 MiB。下载 GGUF、选择自动配置，即可本
 ### 1. 下载程序
 
 打开 [MoE4All Releases](https://github.com/Headmaster218/MoE4All/releases)，
-下载对应版本的 `MoE4All-Windows-x86_64-v*.zip`。本页速度表是 **0.8.0** 历史实测；当前文档与源码事实以 **0.9.0** tag 为准。
+下载对应版本的 `MoE4All-Windows-x86_64-v*.zip`。本页面向 **0.10.0**，
+性能表的测试条件与来源见下方实测结果。
 
 
 ### 2. 解压
@@ -34,14 +41,14 @@ Windows 免安装，程序 13 MiB。下载 GGUF、选择自动配置，即可本
 
 ### 3. 下载 GGUF 模型
 
-上方 0.8.0 历史实测使用以下两种量化；复现这些数字时请使用对应文件。模型单独下载到本地 SSD。
+推荐以下模型与组件，模型单独下载到本地 SSD。
 
 | 模型 / 组件 | 下载链接 | 文件与用途 |
 | --- | --- | --- |
 | **Qwen3.6 35B 本体** | [下载 APEX-I-Balanced](https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/resolve/main/Qwen3.6-35B-A3B-APEX-I-Balanced.gguf?download=true) | `Qwen3.6-35B-A3B-APEX-I-Balanced.gguf`；35B 下载这一个文件即可 |
 | **Flash-Next 主模型** | [下载 AD-4.27bpw-Q4_K_M-M64 全部分片](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/tree/main/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64) | 该目录下的 **33 个 GGUF 分片**，全部放在同一文件夹 |
 | **Flash-Next 视觉** | [下载 F16 视觉文件](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/mmproj-Qwen3.8-Flash-Next-F16.gguf?download=true) | `mmproj-Qwen3.8-Flash-Next-F16.gguf`；图片理解时加载 |
-| **Flash-Next MTP** | [下载 shared Q4_K_M MTP 头](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf?download=true) | `mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf`；本页实测使用的文本加速组件 |
+| **Flash-Next MTP** | [下载 shared Q4_K_M MTP 头](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf?download=true) | `mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf`；可选的文本加速组件 |
 
 Flash-Next 启动时选择第一片：`Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00033.gguf`。
 视觉与 MTP 文件可放在主模型目录，在向导中按用途选择。
@@ -50,106 +57,96 @@ Flash-Next 启动时选择第一片：`Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-
 
 1. 双击解压目录中的 **`Start-INFR-Wizard.cmd`**。
 2. 选择“终端聊天”或“OpenAI 兼容 API”，将主模型 GGUF 拖入窗口，按 Enter。
-3. 选择自动配置档位：**激进性能**是本页实测使用的档位；**保守**适合首次试运行或后台程序较多时使用。
-4. 上下文留空由引擎自动确定，确认启动。复现实测时，20K 输入设置 `32768`，150K 输入设置 `163840`。
+3. 按需选择 MTP、视觉和 Embedding，选择运行设备及自动配置档位：**激进性能**是本页实测使用的档位；**保守**适合首次试运行或后台程序较多时使用。
+4. 设置并发、上下文和 API，确认启动。复现实测时，配置三个槽位，上下文设置 `163840`，关闭 MTP 与实验性 CPU 计算。
+
+
 
 自动档默认使用 Q8 K/V，显存、内存、专家缓存与 Ubatch 由引擎规划。
-35B 加载本体即可聊天。以下 Flash-Next 选项用于复现上方 **0.8.0 历史实测**：
+35B 加载本体即可聊天。Flash-Next 的可选组件如下：
 
-- **文本 MTP 加速**：启用“Qwen3.8 MTP 单路加速”，选择上表的 MTP 头，验证宽度选 `4`。
-  使用 greedy（`temperature=0`）和单会话生成。
-- **图片理解**：选择 API 模式，MTP 选择关闭，启用“视觉图片理解”，选择上表的 F16 视觉文件。
+- **文本 MTP 加速**：启用“Qwen3.8 MTP 加速”，选择上表的 MTP 头，使用 greedy（`temperature=0`）。
+  双槽机会式 MTP 在仅一路活跃时使用 MTP，两路同时 Decode 时自动回退普通批量 Decode。
+- **图片理解**：选择 API 模式，启用“视觉图片理解”，选择上表的 F16 视觉文件；可与 MTP 组合。
 
-0.9.0 已支持服务端 Vision 与 MTP 组合，组合能力和限制见[模型能力矩阵](documentation/reference/model-capabilities.md)。API 默认地址为 `http://127.0.0.1:8080/v1`；请求示例见[API 使用](documentation/guide/serving/api-quickstart.md)，完整配置项见[配置参考](documentation/reference/configuration.md)。
+组合能力和限制见[模型能力矩阵](documentation/reference/model-capabilities.md)。API 默认地址为 `http://127.0.0.1:8080/v1`；请求示例见[API 使用](documentation/guide/serving/api-quickstart.md)，完整配置项见[配置参考](documentation/reference/configuration.md)。
+
+## 从源码构建（Linux）
+
+Linux x86_64 实验性发行包与 Windows 同版发包，欢迎试用反馈；首次 CI 验证完成前仍建议从源码构建。
+发布页提供 `.tar.gz` 后可直接解压，运行包内 `Start-INFR-Wizard-Linux.sh`，无需 Rust 或 glslc。
+以下源码安装命令适用于 Ubuntu 26.04；
+其他发行版请先准备 shaderc 2025 或更新的 `glslc`：
+
+```sh
+sudo apt-get update && sudo apt-get install -y glslc
+git clone https://github.com/Headmaster218/MoE4All.git && cd MoE4All
+cargo build --release --locked -p infr-cli
+./Start-INFR-Wizard-Linux.sh      # 交互式启动；加 --dry-run 只打印命令
+```
+
+需要 Rust 1.97.1（`rust-toolchain.toml` 会自动安装）与 shaderc 2025 及以上的
+`glslc`。完整指南见 [在 Linux 上构建并运行](documentation/guide/linux-build-and-run.md)，
+工具链与平台细节见 [从源码构建](documentation/development/building-from-source.md)。
 
 ## 实测结果
 
-### 0.8.0：Qwen3.8-Flash-Next，20K 与 150K 输入对照
+### 0.10.0：30K / 150K 实测
 
-两组都使用**自动配置：激进性能**。测试指定上下文、Q8 K/V 和采样方式，
-其余资源由引擎规划，最终自动选用 `ubatch=4096`。
+测试于 **2026-10-09**，使用 0.10.0 通用 x86-64 发布构建，代码提交 `53afa86f3`。
+硬件为 RX 7900 XTX 24 GiB、Ryzen 5 5600X、64 GiB DDR4、Windows 11；
+模型为 `Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64` 与 `Qwen3.6-35B-A3B-APEX-I-Balanced`。
+使用自动激进配置、Q8 K/V、`ctx=163840`，配置三个槽位，分别同时占用 1 / 2 / 3 槽；
+**MTP 与 CPU miss 均关闭**，采样与思考使用模型默认。视觉与 Embedding API 已启用，
+下表使用纯文本请求，各路为不同的长技术背景加普通问题。
 
-- **硬件与系统**：RX 7900 XTX 24 GiB、Ryzen 5 5600X、64 GiB DDR4、Windows 11。
-- **模型**：`Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64`；MTP 使用匹配的
-  `mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf`。
-- **共同设置**：Q8 K/V、greedy、关闭思考、单路生成、自动激进资源策略。
-- **上下文容量**：20K 输入使用 32K 容量；150K 输入使用 `ctx=163840`。
+每组重新启动服务，首轮全冷 Prefill，随后两轮复用 KV；每轮每路生成 768 token。
+速度单位均为 tok/s。Prefill 为首次进度采样至最后一路完成 Prefill 的组吞吐，
+不含首次采样前的启动时间，也不是各路速度相加。Decode 为所有路同时 Decode 区间的三轮均值，
+不把等待其他请求 Prefill 的时间算成解码降速；“每路约”为总均速除以路数。
+峰值为 1.5 秒滚动窗口最大值；Prefill 的峰值与分段速度由 chunk 完成进度插值估算，
+不代表精确的瞬时 GPU 速度。
 
-Prefill 为处理输入的速度，Decode 为全程生成速度，单位均为 tok/s。
-
-| 测试负载 | 模式 | 20K Prefill | 20K Decode | 150K Prefill | 150K Decode |
+| 模型 | 每路输入 | 同时生成路数 | 冷 Prefill 均速 / 峰值 | Decode 总均速 / 峰值 | Decode 每路约 |
 | --- | --- | ---: | ---: | ---: | ---: |
-| 复杂问题 | MTP | 937 | **39.9** | 766 | **33.4** |
-| 复杂问题 | 无 MTP | 1,034 | **35.0** | 889 | **30.8** |
-| 简单问题（高接受率） | MTP | 936 | **60.2** | 769 | **48.1** |
-| 简单问题（高接受率） | 无 MTP | 1,035 | **37.7** | 888 | **32.4** |
+| Flash-Next 4.27bpw | 30K | 1 | 1,280.4 / 1,439.4 | **42.8** / 47.7 | 42.8 |
+| Flash-Next 4.27bpw | 30K | 2 | 1,288.2 / 1,445.2 | **60.7** / 71.3 | 30.3 |
+| Flash-Next 4.27bpw | 30K | 3 | 1,283.9 / 1,437.0 | **64.0** / 79.4 | 21.3 |
+| Flash-Next 4.27bpw | 150K | 1 | 1,307.5 / 1,444.6 | **39.4** / 44.7 | 39.4 |
+| Flash-Next 4.27bpw | 150K | 2 | 1,301.9 / 1,446.3 | **52.8** / 63.6 | 26.4 |
+| Flash-Next 4.27bpw | 150K | 3 | 1,228.3 / 1,434.2 | **45.4** / 62.5 | 15.1 |
+| 35B Balanced | 30K | 1 | 2,579.9 / 3,824.8 | **63.2** / 65.4 | 63.2 |
+| 35B Balanced | 150K | 1 | 1,164.9 / 3,981.7 | **35.9** / 36.7 | 35.9 |
 
-- **长输入下仍保持生成速度**：从 20K 增至 150K，各组全程 Decode 保留约 **80%–88%**。
-- **MTP 收益随内容变化**：复杂问题在 20K / 150K 时分别提速约 **14.0% / 8.4%**；
-  简单问题分别约 **59.7% / 48.5%**。
-- **输入与输出分别计时**：本组 MTP 的 Prefill 开销有所增加；整次请求耗时由输入处理
-  与输出生成两部分共同决定。
+前 / 中 / 后段按各自统计区间的时间三等分；Decode 分段值同样是三轮均值。
 
-<details>
-<summary>展开完整分段结果、MTP 接受率与长上下文变化</summary>
+| 模型 | 每路输入 | 同时生成路数 | Prefill 前 / 中 / 后 | Decode 总速前 / 中 / 后 |
+| --- | --- | ---: | ---: | ---: |
+| Flash-Next 4.27bpw | 30K | 1 | 1,225.1 / 1,414.3 / 1,201.9 | 40.8 / 42.2 / 45.3 |
+| Flash-Next 4.27bpw | 30K | 2 | 1,315.6 / 1,214.0 / 1,335.0 | 58.5 / 63.3 / 60.2 |
+| Flash-Next 4.27bpw | 30K | 3 | 1,302.4 / 1,285.8 / 1,263.3 | 65.5 / 62.6 / 63.8 |
+| Flash-Next 4.27bpw | 150K | 1 | 1,358.2 / 1,345.7 / 1,218.8 | 36.3 / 40.4 / 41.5 |
+| Flash-Next 4.27bpw | 150K | 2 | 1,353.4 / 1,281.4 / 1,270.8 | 50.3 / 55.7 / 52.4 |
+| Flash-Next 4.27bpw | 150K | 3 | 1,303.6 / 1,263.0 / 1,118.3 | 44.0 / 46.7 / 45.4 |
+| 35B Balanced | 30K | 1 | 3,254.9 / 2,797.3 / 1,687.6 | 63.6 / 62.6 / 63.4 |
+| 35B Balanced | 150K | 1 | 1,829.5 / 968.9 / 696.4 | 35.8 / 36.0 / 35.8 |
 
-以下速度单位均为 tok/s。中段指生成 token 的 25%–62.5%，后段为 62.5%–100%；
-Alpha 为 MTP 草稿接受率。
-
-| 输入规模 | 模式与负载 | Prefill | Decode 全程 | 中段 | 后段 | Alpha |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| 20K | MTP 简单问题 | 936 | 60.2 | 61.4 | 61.3 | 0.994 |
-| 20K | MTP 复杂问题 | 937 | 39.9 | 42.0 | 39.7 | 0.594 |
-| 20K | 无 MTP 简单问题 | 1,035 | 37.7 | 38.6 | 37.8 | — |
-| 20K | 无 MTP 复杂问题 | 1,034 | 35.0 | 35.1 | 36.8 | — |
-| 150K | MTP 简单问题 | 769 | 48.1 | 49.2 | 46.8 | 0.979 |
-| 150K | MTP 复杂问题 | 766 | 33.4 | 35.5 | 34.3 | 0.642 |
-| 150K | 无 MTP 简单问题 | 888 | 32.4 | 32.0 | 32.9 | — |
-| 150K | 无 MTP 复杂问题 | 889 | 30.8 | 31.4 | 31.2 | — |
-
-实际输入长度：20K 简单问题 / 复杂问题为 **19,988 / 20,019** token；
-150K 简单问题 / 复杂问题为 **149,849 / 149,857** token。
-
-| 模式与负载 | 150K 相对 20K 的 Prefill 变化 | 全程 Decode 变化 |
-| --- | ---: | ---: |
-| MTP 简单问题 | -17.8% | -20.1% |
-| MTP 复杂问题 | -18.2% | -16.3% |
-| 无 MTP 简单问题 | -14.2% | -14.1% |
-| 无 MTP 复杂问题 | -14.0% | -12.0% |
-
-[20K 测试条件、结果与分析](documentation/evidence/benchmarks/2026-09-24-qwen38-mtp-20k.md)。
-
-</details>
-
-### 0.8.0：Qwen3.6 35B · 无 MTP
-
-**复杂问题在 20K 输入下生成 59.1 tok/s，150K 输入下生成 39.0 tok/s。**
-
-- **模型**：`Qwen3.6-35B-A3B-APEX-I-Balanced`，不启用 MTP。
-- **硬件与系统**：与上组相同，RX 7900 XTX 24 GiB、Ryzen 5 5600X、64 GiB DDR4、Windows 11。
-- **测试条件**：同样使用自动配置的激进性能策略、Q8 K/V、greedy、关闭思考、单路生成。
-  20K 输入使用 32K 上下文容量，150K 输入使用 `ctx=163840`。
-
-Prompt 为实际输入 token 数；Prefill 与 Decode 的单位均为 tok/s。
-中段、后段分别为生成 token 的 25%–62.5%、62.5%–100%。
-
-| 输入规模 / 任务 | Prompt | Prefill | Decode 全程 | 中段 | 后段 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 20K 简单问题 | 20,041 | 2,484 | **65.6** | 66.7 | 66.8 |
-| 20K 复杂问题 | 20,049 | 2,421 | **59.1** | 59.5 | 62.6 |
-| 150K 简单问题 | 149,849 | 1,135 | **39.9** | 40.3 | 39.9 |
-| 150K 复杂问题 | 149,857 | 1,140 | **39.0** | 39.6 | 39.8 |
-
+Flash-Next 在 150K 下三路总速低于双路，并发收益不是线性的。
+本轮完整矩阵共 36 轮、72 路生成，无请求失败，后两轮均命中预期 KVlash-Next 测试期间 Windows 提交额度余量较小，也可能影响复测速度。
 ## 社区实测
 
 **AMD、NVIDIA RTX 和 Intel Arc 均已有用户实测，具体配置与速度如下。**
 
 
-| GPU 与内存 | 模型与条件 | 生成速度 | 版本与来源 |
-| --- | --- | ---: | --- |
-| **AMD RX 7700 XT 12GB + 64GB RAM** | Ornith 1.5 35B-A3B，`serve`，131K 上下文容量 | **41.5–42.7 tok/s** | v0.5.2 社区基线，[PR #21](https://github.com/Headmaster218/MoE4All/pull/21) |
-| **Intel Arc A770 16GB + 64GB DDR4-3200** | Ornith 1.5 35B Q4_K_M，F16 KV，96K 上下文容量，REAL 负载三次测试 | **30.15–30.28 tok/s** | v0.6.0-beta.1，[Issue #41](https://github.com/Headmaster218/MoE4All/issues/41) |
-| **NVIDIA RTX 3090 Ti + 64GB RAM** | 社区成功运行反馈；原评论未注明模型、量化和上下文 | **约 29 tok/s** | 版本未注明，[B站用户反馈](https://www.bilibili.com/video/BV1ALha63Eyd/)（rpid `318146261056`） |
+| GPU / CPU 与内存 | 模型与条件 | Prefill | Decode | 版本与来源 |
+| --- | --- | ---: | ---: | --- |
+| **AMD R9700 + Ryzen 9 9950X3D + 48GB RAM** | Flash-Next，量化与上下文未注明 | **800–1,100 tok/s** | **20–50 tok/s** | v0.10.0，用户反馈 |
+| **Intel Arc A770 16GB + 64GB DDR4-3200** | Flash-Next，三次测试，量化与上下文未注明 | 未提供 | **17.44 / 17.30 / 17.45 tok/s** | v0.10.0，用户反馈 |
+| **AMD RX 7700 XT 12GB + 64GB RAM** | Ornith 1.5 35B-A3B，`serve`，131K 上下文容量 | 未提供 | **41.5–42.7 tok/s** | v0.5.2 社区基线，[PR #21](https://github.com/Headmaster218/MoE4All/pull/21) |
+| **Intel Arc A770 16GB + 64GB DDR4-3200** | Ornith 1.5 35B Q4_K_M，F16 KV，96K 上下文容量，REAL 负载三次测试 | 未提供 | **30.15–30.28 tok/s** | v0.6.0-beta.1，[Issue #41](https://github.com/Headmaster218/MoE4All/issues/41) |
+| **NVIDIA RTX 3090 Ti + 64GB RAM** | 社区成功运行反馈；原评论未注明模型、量化和上下文 | 未提供 | **约 29 tok/s** | 版本未注明，[B站用户反馈](https://www.bilibili.com/video/BV1ALha63Eyd/)（rpid `318146261056`） |
+
+社区速度保留用户原始口径，未独立复测；未说明是否为均值或峰值，不能直接与上方统一窗口的峰值表比较。
 
 
 欢迎在 [Discussions](https://github.com/Headmaster218/MoE4All/discussions) 分享成功配置，
@@ -168,8 +165,10 @@ Prompt 为实际输入 token 数；Prefill 与 Decode 的单位均为 tok/s。
 - **并发服务**：多个独立 K/V 槽可处理先后到达、上下文长度不同的请求。
 - **会话持久化**：可选的 SSD 缓存能转存空闲文本 K/V，并在服务重启后恢复。
 - **长上下文**：支持量化 KV Cache、KV 溢出和长上下文性能测试。
-- **Qwen3.8 MTP（0.8.0 预览）**：可选的单路投机解码，收益取决于草稿接受率，
+- **Qwen3.8 MTP**：可选的单路与双槽机会式投机解码，收益取决于草稿接受率，
   使用方式见[快速使用](#快速使用)。
+- **实验性 CPU miss 计算**：默认关闭，支持 AVX2 + FMA3 CPU；Ryzen 5 5600X 使用
+  4 核处理 1 miss 时，端到端速度与 GPU 路径基本相同，更强 CPU 可能提速，需本机实测。
 - **可测量、可调试**：内置 prefill/decode benchmark、synthetic depth 和分页
   统计工具。
 

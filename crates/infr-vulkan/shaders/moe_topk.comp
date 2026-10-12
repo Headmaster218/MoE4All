@@ -49,8 +49,13 @@ layout(push_constant) uniform PC {
 // Binding order is INPUTS FIRST: the recorder marks the last N bound buffers as the dispatch's
 // outputs for hazard tracking, so `hash_ids` (read-only) has to precede `ids`/`wts`.
 layout(binding = 0) readonly buffer LB { float logits[]; };
+#ifdef CPU_INPUT_TAP
+layout(binding = 1) readonly buffer BB { uint raw_input[]; };
+layout(binding = 2) writeonly buffer HB { uint cpu_input[]; };
+#else
 layout(binding = 1) readonly buffer BB { float bias[]; }; // exp_probs_b, always bound
 layout(binding = 2) readonly buffer HB { uint hash_ids[]; }; // tid2eid gather, always bound
+#endif
 layout(binding = 3) buffer IB { uint ids[]; };
 layout(binding = 4) writeonly buffer WB { float wts[]; };
 
@@ -120,6 +125,7 @@ void main() {
     // reads back its own writes and needs no cross-lane visibility. A lane-parallel copy would:
     // `barrier()` orders SHARED memory, not buffer memory, and would need an explicit
     // `memoryBarrierBuffer()` — not worth it for `n_used` (single digits) elements.
+#ifndef CPU_INPUT_TAP
     if (pc.hash != 0u) {
         if (t == 0u) {
             for (uint k = 0u; k < pc.n_used; k++) {
@@ -131,7 +137,17 @@ void main() {
     } else {
         select_topk(t, lbase, obase);
     }
+#else
+    select_topk(t, lbase, obase);
+#endif
     weights_of(t, lbase, obase);
+#ifdef CPU_INPUT_TAP
+    // The fixed-geometry scalar CPU path binds its normalized F32 input in the otherwise
+    // unused bias slot. This stores exact bits while the existing router fence is pending.
+    for (uint i = t; i < 2560u; i += 128u) {
+        cpu_input[i] = raw_input[i];
+    }
+#endif
 }
 
 // Top-`n_used` selection into `ids` — everything a hash-routed layer skips. `pc.hash` is a push
@@ -153,7 +169,11 @@ void select_topk(uint t, uint lbase, uint obase) {
         if (do_adj) {
             // Start with bias (or zero).
             for (uint e = 0u; e < pc.n_expert; e++) {
+#ifdef CPU_INPUT_TAP
+                ssel_adj[e] = 0.0;
+#else
                 ssel_adj[e] = (pc.has_bias != 0u) ? bias[e] : 0.0;
+#endif
             }
             // Group-limited routing.
             uint ng = pc.n_expert_groups;
