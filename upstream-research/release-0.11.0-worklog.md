@@ -19,7 +19,7 @@ concurrency, device, and measurement interval.
 | 5 | Decode front/back bubble overlap | Done | No production change. Runner-side setup is already overlapped/small; splitting the first frontend into an earlier submit regressed matched 30K and 150K throughput and was removed. Further gains require reusable command buffers/GPU-driven replay, which is architecture work. |
 | 6 | Expert-miss critical path | Done | No production change. Pool-streaming and mapped-copy worker variants were neutral/slower; the aggressive copy/encode overlap also produced nondeterministic output despite a host join before submit, so it was rejected. |
 | 7 | Version 0.11.0 and release benchmark | Done | Native benchmark binary and portable static-CRT package built. Both models completed the full matrix; FlashNext 150K x3 exposed one output-stability warning, while all other rows were stable. |
-| 8 | Recover MTP experiment and automatic splitter | Pending | Audit the MTP branch, reproduce the automatic splitter failure, and produce an implementation-ready repair plan or a validated fix. |
+| 8 | Recover MTP experiment and automatic splitter | Done | The WIP startup-reference splitter is not portable and was not copied. The current global tuner also mixes unrelated graph shapes; an implementation-ready class-isolated replacement and validation matrix are recorded below. |
 
 ## Accepted baseline
 
@@ -175,6 +175,66 @@ Cold Prefill (`cached_n=0`):
   `ecf8852fbaf8025890afd5d5436392ba835375913a64c8d0fa934116314c8428`. The extracted package passed
   install-manifest verification, update-transaction checks, command/wizard dry runs and dependency
   inspection. An earlier native package correctly failed the dependency check and was replaced.
+
+### MTP experiment and automatic splitter recovery
+
+- `research/flashnext-mtp-acceptance` does not contain a newer independent MTP implementation; it
+  currently points at `8d5a4875b`, which this branch already contains. The relevant unfinished work is
+  commit `56a821e17` on `perf/expert-mtp-optimization`.
+- Its replacement `splitter.rs` calibrates one synthetic 16-row, width-2560, dense-F16 two-block
+  graph at startup. It then scales that result with row-count multipliers measured locally at about
+  22 us/dispatch. The graph excludes quantized model kernels, paged experts, GDN/QSA/HC, MTP
+  target/head work and real ubatch shapes. The row multipliers are device-specific. Copying this
+  implementation would therefore replace newer runtime feedback with a less representative policy.
+- The current branch has the opposite failure mode: one process-global `SubmitAutoTuner` samples the
+  first eligible Prefill/batched forwards, then freezes after a bounded calibration window. Text,
+  MTP, vision and embedding graphs can therefore contaminate each other's cap according to request
+  order. Pager-mandated submits are also included in whole-forward timing even though the splitter
+  did not create them. Short services may never finish calibration and can later mix a different
+  workload into the partially armed tuner.
+- Release benchmark evidence matches this diagnosis. Aggressive automatic mode started at
+  `split/16` and usually reached `split/256` after ten forwards, but the measured submissions were
+  not homogeneous: FlashNext 150K x3 recorded 395 timed submits at about 711 us/submit with a
+  67.6 ms longest submission, while Qwen3.6-35B 150K x3 recorded 490 at about 857 us/submit with a
+  161 ms longest submission. These aggregates cannot be used as a clean dispatch-cap signal.
+
+Repair plan:
+
+1. Add a caller-selected `SubmitClass`; never infer it from tensor labels or maximum graph rows.
+   Classes are text Prefill (model family, row band, paged/dense), MTP prime/catch-up, MTP verify,
+   vision, and embedding. Single-token paged Decode keeps its pager/platform cap and does not train
+   the Prefill tuner.
+2. Replace the one global cap/tuner with independent state per class and row band. Each state owns
+   its cap, warmed sample count, splitter-created segment count, maximum segment time and frozen
+   status. Explicit `device.submit_dispatches` remains authoritative and bypasses every tuner.
+3. Tag submit cause at recorder close. Feed a tuner only command buffers closed by its splitter;
+   exclude pager rotations, router readback, DMA/acquire, resident hit/miss recovery, compilation
+   and first-touch work.
+4. Start from a platform-safe cap, collect two warmed samples, shrink immediately when the maximum
+   splitter segment exceeds the watchdog budget, and grow geometrically only when the splitter
+   actually created boundaries and timing has margin. Freeze a class after convergence or a no-split
+   sample; opening a new class/row band creates a fresh bounded state instead of thawing old ones.
+5. Report class, row band, starting/final cap, splitter-created segments, mean/maximum GPU segment
+   time and stop reason. This makes automatic decisions reproducible without sampling user content.
+6. Unit-test class isolation, explicit override, shrink/grow/freeze transitions and exclusion of
+   pager submissions. GPU validation covers text Prefill at ubatch 256/1024/2048/4096, MTP
+   prime/verify, small/large vision, embedding and an integrated-GPU watchdog run.
+
+Acceptance requires byte-identical outputs, request-order-independent convergence within each
+class, every measured splitter segment below its budget, and no more than 1% throughput regression
+against the best fixed safe cap. Only the explicit workload taxonomy and the intent to avoid mixed
+user-request sampling are retained from `56a821e17`; its synthetic graph and hardcoded multipliers
+are rejected.
+
+### Known release follow-up
+
+- FlashNext 150K x3 produced unstable measured output on lanes 0 and 2 while temperature, seeds and
+  prompts were fixed. The pattern converged over later rounds but is not enough to attribute the
+  cause to stale SSD KV alone. Do not invalidate the cache format on that evidence.
+- A focused follow-up must compare three isolated state origins with the same binary and payload:
+  fresh full Prefill, live-slot seed, and process-restarted SSD restore. Capture recurrent/PLE
+  checkpoint hashes before Decode and compare the first divergent token. This is a correctness
+  investigation, not part of splitter calibration.
 
 ## Measurement rules
 
