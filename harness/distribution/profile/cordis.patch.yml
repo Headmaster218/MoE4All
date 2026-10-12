@@ -10,6 +10,11 @@
 - id: dsh-mneme-moe4all
   config:
     autoSummarize: true
+    vectorDefaults:
+      enabled: true
+      baseUrl: http://127.0.0.1:8080/v1
+      apiKey: moe4all-local
+      model: Qwen3-Embedding-0.6B-Q8_0
     distillEngine: v2
     dreamMode: v2
     distillMaxTokens: 32768

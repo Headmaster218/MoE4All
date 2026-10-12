@@ -70,8 +70,27 @@ if (Test-Path -LiteralPath $profilePatch -PathType Leaf) {
     $legacyEndpoint = '    endpoint: http://127.0.0.1:1234/v1'
     if ($patch.Contains($legacyEndpoint)) {
         $patch = $patch.Replace($legacyEndpoint, '    endpoint: http://127.0.0.1:8080/v1')
-        [IO.File]::WriteAllText($profilePatch, $patch, (New-Object Text.UTF8Encoding($false)))
     }
+    $mnemePattern = '(?ms)^- id: dsh-mneme-moe4all\s*\r?\n(?:(?!^- id: ).)*?(?=^- id: |\z)'
+    $mnemeMatch = [regex]::Match($patch, $mnemePattern)
+    if ($mnemeMatch.Success -and $mnemeMatch.Value -notmatch '(?m)^\s{4}vectorDefaults:\s*$') {
+        $configLine = [regex]::Match($mnemeMatch.Value, '(?m)^  config:\s*\r?\n')
+        if ($configLine.Success) {
+            $lineEnding = "`n"
+            if ($patch.Contains("`r`n")) { $lineEnding = "`r`n" }
+            $defaults = @(
+                '    vectorDefaults:'
+                '      enabled: true'
+                '      baseUrl: http://127.0.0.1:8080/v1'
+                '      apiKey: moe4all-local'
+                '      model: Qwen3-Embedding-0.6B-Q8_0'
+                ''
+            ) -join $lineEnding
+            $insertAt = $mnemeMatch.Index + $configLine.Index + $configLine.Length
+            $patch = $patch.Insert($insertAt, $defaults)
+        }
+    }
+    [IO.File]::WriteAllText($profilePatch, $patch, (New-Object Text.UTF8Encoding($false)))
 }
 
 $engineManifestPath = Join-Path $harnessRoot 'runtime\engine\bundled-engine.json'
@@ -106,3 +125,4 @@ if (Test-Path -LiteralPath $engineManifestPath -PathType Leaf) {
 }
 
 Write-Host 'Bundled MoE4All runtime is ready.'
+exit 0
