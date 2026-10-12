@@ -11,8 +11,8 @@ try {
   await page.waitForTimeout(5_000)
   const start = page.getByRole('button', { name: '开始使用' })
   if (await start.count()) await start.click()
-  const close = page.getByRole('button', { name: '关闭' })
-  if (await close.count()) await close.click()
+  const close = page.getByRole('button', { name: /关闭/ })
+  if (await close.count()) await close.last().click()
   await page.waitForTimeout(1_000)
 
   const inspect = () => page.evaluate(() => {
