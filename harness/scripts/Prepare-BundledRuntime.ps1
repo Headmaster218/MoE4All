@@ -64,6 +64,16 @@ if (-not (Test-Path -LiteralPath $profileModules -PathType Container)) {
     }
 }
 
+$profilePatch = Join-Path $state 'home\profiles\web\cordis.patch.yml'
+if (Test-Path -LiteralPath $profilePatch -PathType Leaf) {
+    $patch = Get-Content -LiteralPath $profilePatch -Raw -Encoding UTF8
+    $legacyEndpoint = '    endpoint: http://127.0.0.1:1234/v1'
+    if ($patch.Contains($legacyEndpoint)) {
+        $patch = $patch.Replace($legacyEndpoint, '    endpoint: http://127.0.0.1:8080/v1')
+        [IO.File]::WriteAllText($profilePatch, $patch, (New-Object Text.UTF8Encoding($false)))
+    }
+}
+
 $engineManifestPath = Join-Path $harnessRoot 'runtime\engine\bundled-engine.json'
 if (Test-Path -LiteralPath $engineManifestPath -PathType Leaf) {
     $engine = Get-Content -LiteralPath $engineManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json

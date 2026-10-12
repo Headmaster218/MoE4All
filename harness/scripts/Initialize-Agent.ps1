@@ -47,7 +47,7 @@ if ($EngineEndpoint) {
         throw 'EngineEndpoint must be an http(s) URL without credentials, query, or fragment.'
     }
 }
-if ($null -eq $endpoint) { $endpoint = [Uri]'http://127.0.0.1:1234/v1' }
+if ($null -eq $endpoint) { $endpoint = [Uri]'http://127.0.0.1:8080/v1' }
 
 $manifestPath = Join-Path $profile 'package.json'
 if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
