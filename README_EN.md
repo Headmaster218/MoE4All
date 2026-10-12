@@ -6,6 +6,11 @@ The portable Windows download is about 14 MiB. Download a GGUF, choose automatic
 configuration, and start local chat or an OpenAI-compatible API. MoE expert
 weights are coordinated across VRAM, system RAM, and SSD.
 
+**The current source build supports true parallel Decode for Qwen3.5 / Qwen3.6
+MoE.** With three active 35B Balanced streams, total Decode is **112.0 tok/s**
+at 30K, with a **115.1 tok/s** median after warm-up; at 150K the corresponding
+results are **49.0 / 49.45 tok/s**. See the [current-source measurements](#current-source-35b-true-parallel-decode-2026-10-12) for conditions.
+
 **0.10.0 fastest-third speed reference:** RX 7900 XTX 24 GiB, Ryzen 5 5600X, 64 GiB
 DDR4, automatic aggressive profile. At 30K, Flash-Next 4.27bpw reaches
 **1,414.3 tok/s Prefill** with one active stream and
@@ -109,6 +114,35 @@ and platform details are in
 
 ## Measured results
 
+### Current source: 35B true parallel Decode (2026-10-12)
+
+Commit `25e6d1944` connects Qwen3.5 / Qwen3.6 MoE to layer-synchronous batched
+Decode while keeping each session's KV, Gated DeltaNet state, and sampler
+independent. Long Prefill remains serialized by slot; once all active prompts
+are ready, their token rows run in one Decode graph.
+
+Hardware was an RX 7900 XTX 24 GiB, Ryzen 5 5600X, 64 GiB DDR4, and Windows 11,
+using `Qwen3.6-35B-A3B-APEX-I-Balanced`. Configuration was automatic aggressive,
+Q8 K/V, `ctx=163840`, three slots, `temperature=0`, with thinking, MTP, and CPU
+miss offload disabled. One- and two-stream cases ran twice with 256 generated
+tokens per stream; the three-stream case ran once with 512 tokens per stream.
+
+| Input per stream | Active streams | Total Decode mean | Approx. per stream | Notes |
+| --- | ---: | ---: | ---: | --- |
+| 30K | 1 | **58.7–66.6** | 58.7–66.6 | Two-run range |
+| 30K | 2 | **90.1–97.4** | 45.0–48.7 | Two-run range |
+| 30K | 3 | **112.0** | 37.35 | Warm median 115.1; range 110.3–117.2 |
+| 150K | 1 | **33.3–36.8** | 33.3–36.8 | Two-run range |
+| 150K | 2 | **45.1–46.2** | 22.5–23.1 | Two-run range |
+| 150K | 3 | **49.0** | 16.33 | Warm median 49.45; range 46.4–51.8 |
+
+For the three-stream run, the three 512-token Decode completion times differed
+by about 2.4 ms at 30K and 9.7 ms at 150K; every request completed successfully.
+Warm statistics exclude the first two partial one-second intervals after Decode
+started. Because long Prefill is serialized by slot, the per-request Prefill time
+reported by the API includes time spent waiting for the other slots and is not
+single-stream Prefill throughput.
+
 ### 0.10.0: 30K / 150K measurements
 
 Measured on **2026-10-09** using the generic x86-64 0.10.0 release build,
@@ -194,7 +228,8 @@ context, automatic profile or launch command, and Prefill/Decode speeds.
 - **OpenAI-compatible serving:** provides chat and Embedding APIs for existing
   clients.
 - **Parallel serving:** independent K/V slots handle requests arriving at
-  different times and using different context lengths.
+  different times and using different context lengths; Qwen3.5 / Qwen3.6 MoE
+  batches simultaneously active text requests in layer-synchronous Decode.
 - **Persistent sessions:** an optional SSD cache stores idle text K/V and restores
   it after a server restart.
 - **Long context:** supports quantized KV Cache, KV overflow, and long-context
@@ -213,7 +248,7 @@ context, automatic profile or launch command, and Prefill/Decode speeds.
 | --- | --- | --- |
 | Llama and Llama 4 | `llama`, `llama4` | Dense and MoE Vulkan inference |
 | Qwen2 / Qwen2.5 / Qwen3 | `qwen2`, `qwen3`, `qwen3moe` | Dense and Qwen3 MoE |
-| Qwen3.5 / Qwen3.6 | `qwen35`, `qwen35moe` | Gated DeltaNet, attention, and paged MoE |
+| Qwen3.5 / Qwen3.6 | `qwen35`, `qwen35moe` | Gated DeltaNet, attention, paged MoE, and layer-synchronous parallel generation |
 | Qwen3.8 Flash Next | `qwen4exp` | Vulkan text and vision inference, parallel generation, hyper-connections, DeltaNet, PLE, QSA, and paged MoE |
 | Gemma 3 / Gemma 4 | `gemma3`, `gemma4` | Dense, MoE, and E2B variants |
 | Ling 3.0 Flash | `bailingmoe3` | KDA, gated MLA, 512 experts, and RAM/SSD paging |

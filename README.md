@@ -5,6 +5,10 @@
 Windows 免安装，下载约 14 MiB。下载 GGUF、选择自动配置，即可本地聊天，
 或通过 OpenAI 兼容接口接入现有客户端。显存、内存与 SSD 协同加载 MoE 专家权重。
 
+**当前源码已支持 Qwen3.5 / Qwen3.6 MoE 真并发 Decode。** 35B Balanced 在 30K
+三路同时生成时总均速为 **112.0 tok/s**，预热后每秒统计中位数为 **115.1 tok/s**；
+150K 下分别为 **49.0 / 49.45 tok/s**。完整条件见[当前源码实测](#当前源码35b-真并发-decode2026-10-12)。
+
 **0.10.0 最快分段速度参考**：RX 7900 XTX 24 GiB + Ryzen 5 5600X + 64 GiB DDR4，自动激进配置。
 Flash-Next 4.27bpw 在 30K 下单路 Prefill 为 **1,414.3 tok/s**，三路 Decode 为 **65.5 tok/s**；
 35B Balanced 在 30K 下单路 Decode 为 **63.6 tok/s**。
@@ -91,6 +95,31 @@ cargo build --release --locked -p infr-cli
 
 ## 实测结果
 
+### 当前源码：35B 真并发 Decode（2026-10-12）
+
+代码提交 `25e6d1944` 将 Qwen3.5 / Qwen3.6 MoE 接入层同步批量 Decode；不同会话的
+KV、Gated DeltaNet 状态与采样器保持独立。长 Prefill 仍按槽依次完成，全部就绪后
+才进入同一张多行 Decode 图。
+
+测试硬件为 RX 7900 XTX 24 GiB、Ryzen 5 5600X、64 GiB DDR4、Windows 11；
+模型为 `Qwen3.6-35B-A3B-APEX-I-Balanced`。使用自动激进配置、Q8 K/V、
+`ctx=163840`、三个槽位、`temperature=0`，关闭思考、MTP 与 CPU miss offload。
+单路和双路各运行两轮、每路生成 256 token；三路运行一轮、每路生成 512 token。
+
+| 每路输入 | 同时生成路数 | Decode 总均速 | Decode 每路 | 说明 |
+| --- | ---: | ---: | ---: | --- |
+| 30K | 1 | **58.7–66.6** | 58.7–66.6 | 两轮范围 |
+| 30K | 2 | **90.1–97.4** | 45.0–48.7 | 两轮范围 |
+| 30K | 3 | **112.0** | 37.35 | 预热后总速中位数 115.1，范围 110.3–117.2 |
+| 150K | 1 | **33.3–36.8** | 33.3–36.8 | 两轮范围 |
+| 150K | 2 | **45.1–46.2** | 22.5–23.1 | 两轮范围 |
+| 150K | 3 | **49.0** | 16.33 | 预热后总速中位数 49.45，范围 46.4–51.8 |
+
+三路测试中，各路 512-token Decode 的完成时间在 30K 下相差约 2.4 ms、在 150K
+下相差约 9.7 ms；全部请求成功。预热后数据剔除了 Decode 刚开始的两个不完整一秒
+统计区间。由于长 Prefill 按槽串行，API 为单个请求显示的 Prefill 时间包含等待其他
+槽位的时间，不能视为单槽 Prefill 吞吐。
+
 ### 0.10.0：30K / 150K 实测
 
 测试于 **2026-10-09**，使用 0.10.0 通用 x86-64 发布构建，代码提交 `53afa86f3`。
@@ -132,7 +161,8 @@ cargo build --release --locked -p infr-cli
 | 35B Balanced | 150K | 1 | 1,829.5 / 968.9 / 696.4 | 35.8 / 36.0 / 35.8 |
 
 Flash-Next 在 150K 下三路总速低于双路，并发收益不是线性的。
-本轮完整矩阵共 36 轮、72 路生成，无请求失败，后两轮均命中预期 KVlash-Next 测试期间 Windows 提交额度余量较小，也可能影响复测速度。
+本轮完整矩阵共 36 轮、72 路生成，无请求失败，后两轮均命中预期 KV。
+Flash-Next 测试期间 Windows 提交额度余量较小，也可能影响复测速度。
 ## 社区实测
 
 **AMD、NVIDIA RTX 和 Intel Arc 均已有用户实测，具体配置与速度如下。**
@@ -162,7 +192,8 @@ Flash-Next 在 150K 下三路总速低于双路，并发收益不是线性的。
 - **直接聊天**：终端中保持上下文进行多轮对话，可选择模型默认、开启或关闭
   思考模式。
 - **兼容现有客户端**：提供 OpenAI 兼容的聊天与 Embedding API。
-- **并发服务**：多个独立 K/V 槽可处理先后到达、上下文长度不同的请求。
+- **并发服务**：多个独立 K/V 槽可处理先后到达、上下文长度不同的请求；
+  Qwen3.5 / Qwen3.6 MoE 可将同时活跃的文本请求合入层同步批量 Decode。
 - **会话持久化**：可选的 SSD 缓存能转存空闲文本 K/V，并在服务重启后恢复。
 - **长上下文**：支持量化 KV Cache、KV 溢出和长上下文性能测试。
 - **Qwen3.8 MTP**：可选的单路与双槽机会式投机解码，收益取决于草稿接受率，
@@ -179,7 +210,7 @@ Flash-Next 在 150K 下三路总速低于双路，并发收益不是线性的。
 | ----------------------- | ---------------------------------- | --------------------------------------------------------------------- |
 | Llama、Llama 4          | `llama`、`llama4`              | Dense 与 MoE Vulkan 推理                                              |
 | Qwen2 / Qwen2.5 / Qwen3 | `qwen2`、`qwen3`、`qwen3moe` | Dense 与 Qwen3 MoE                                                    |
-| Qwen3.5 / Qwen3.6       | `qwen35`、`qwen35moe`          | Gated DeltaNet、Attention 与分页 MoE                                  |
+| Qwen3.5 / Qwen3.6       | `qwen35`、`qwen35moe`          | Gated DeltaNet、Attention、分页 MoE 与层同步并发生成                   |
 | Qwen3.8 Flash Next      | `qwen4exp`                       | Vulkan 文本与视觉推理、并发生成、Hyper-Connection、DeltaNet、PLE、QSA 与分页 MoE |
 | Gemma 3 / Gemma 4       | `gemma3`、`gemma4`             | Dense、MoE 与 E2B 变体                                                |
 | Ling 3.0 Flash          | `bailingmoe3`                    | KDA、gated MLA、512 experts 与 RAM/SSD 分页                           |
