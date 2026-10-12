@@ -17,7 +17,7 @@ concurrency, device, and measurement interval.
 | 3 | Qwen3.6-35B reasoning effort | Done | Model-scoped prompt mapping for Qwen3.5/3.6; CLI, wizard and API request controls validated while default and no-think prompts remain unchanged. |
 | 4 | Review `perf/expert-mtp-optimization` after `release-0.10.0` | Done | No mature runtime optimization can be cherry-picked safely. The only novel experiments are reassigned to Tasks 5/6 for a current-architecture reimplementation and matched A/B. |
 | 5 | Decode front/back bubble overlap | Done | No production change. Runner-side setup is already overlapped/small; splitting the first frontend into an earlier submit regressed matched 30K and 150K throughput and was removed. Further gains require reusable command buffers/GPU-driven replay, which is architecture work. |
-| 6 | Expert-miss critical path | Pending | Start DMA/CPU copy immediately after miss IDs, move deferrable work off the transfer path, and overlap independent S5/S6 copies where correctness permits. |
+| 6 | Expert-miss critical path | Done | No production change. Pool-streaming and mapped-copy worker variants were neutral/slower; the aggressive copy/encode overlap also produced nondeterministic output despite a host join before submit, so it was rejected. |
 | 7 | Version 0.11.0 and release benchmark | Pending | FlashNext 4.27 bpw and Qwen3.6-35B; 30K/150K; 1/2/3 active streams; warmed three-run Decode front/middle/back/mean/peak plus Prefill. |
 | 8 | Recover MTP experiment and automatic splitter | Pending | Audit the MTP branch, reproduce the automatic splitter failure, and produce an implementation-ready repair plan or a validated fix. |
 
@@ -93,6 +93,31 @@ concurrency, device, and measurement interval.
   reusable/indirect resident command buffers or a GPU-driven replay loop, not another host submit.
 - Evidence: `benchmark-data/artifacts/gpu-resident-decode-20261011/`
   (`release011-frontgap-samebin-ab-control-*` and `release011-frontgap-samebin-ab-frontsubmit-*`).
+
+### Expert-miss critical-path experiments, RX 7900 XTX
+
+- Model/config: FlashNext 4.27 bpw, `Vulkan1`, two configured slots with one active, Q8 KV,
+  30K context, 256 generated tokens, resident hit-first/notice/early-recovery path.
+- Pool-streaming experiment submitted each independent role-size transfer as soon as that pool was
+  prepared. Matched complete-request Decode was neutral (`49.01/48.99` versus control
+  `49.33/48.69 tok/s`). Combining it with parallel mapped copies regressed to `48.78/48.40`.
+- Disabling the mapped-copy serial threshold alone measured `49.29/49.23 tok/s`, about 0.5% over
+  the noisy control and below the acceptance threshold. All pool-streaming code was removed.
+- A second experiment moved full-RAM mapped-VRAM copies to a private host worker while the main
+  thread encoded miss recovery. The first version submitted before the host copy was joined and
+  produced a different output hash on every round. The second joined before queue submit but
+  consumed promotion metadata too early; warmup correctly rejected it. The final lifecycle fix
+  retained metadata and completed, but output hashes still differed on every candidate round.
+- Final same-binary steady comparison: control `49.47/49.52 tok/s`; one copy worker
+  `41.39/41.76 tok/s`, about 16% slower. The candidate was therefore rejected on both correctness
+  and performance grounds and fully removed.
+- Conclusion: mapped host writes cannot safely overlap this recovery window with only a host join.
+  A future attempt needs an explicit host-write publication and slot-version protocol, or must copy
+  through a transfer submission whose timeline dependency is consumed by the recovery queue. More
+  host threads alone do not remove the exposed miss tail.
+- Evidence: `benchmark-data/artifacts/gpu-resident-decode-20261011/`
+  (`release011-miss-pool-mapped-ab-*`, `release011-miss-copyworker-ab-v1-*`,
+  `release011-miss-copyworker-ab-v2-*`, and `release011-miss-copyworker-ab-v3-*`).
 
 ## Measurement rules
 
