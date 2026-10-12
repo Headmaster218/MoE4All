@@ -520,6 +520,40 @@ pub fn streaming_arena_plan_for_profile(
     )
 }
 
+/// The rule is **`arena + in-use + fill-churn <= 90% of MemTotal`**:
+///
+/// * `in-use` is the kernel's own estimate `MemTotal - MemAvailable`, so reclaimable page cache
+///   is not counted twice against us;
+/// * `fill-churn` is the page cache a FILL will rebuild. Filling the arena streams the source
+///   blocks back through the page cache, so the machine transiently needs room for both — and on
+///   a fast fill the kernel cannot reclaim one fast enough to make space for the other. That term
+///   is why a 47 GiB fall-through still OOM'd on a 58 GiB-available box, cap and cgroup and all.
+///
+/// This is deliberately DYNAMIC: free memory admits a larger arena, a busy machine clamps even a
+/// modest one, and a request well inside the ceiling passes through untouched. On a quiet 60 GiB
+/// box (`used` ~3 GiB) it settles near `(54 - 3) / 2` ~ 25 GiB.
+pub fn clamp_arena_to_spare(
+    bytes: u64,
+    available: Option<u64>,
+    total: Option<u64>,
+    fill_churn_bytes: u64,
+) -> u64 {
+    let Some(total) = total else {
+        // No physical-RAM probe (unusual outside Linux/Windows): nothing to bound against.
+        return bytes;
+    };
+    let used = available.map_or(0, |available| total.saturating_sub(available));
+    let budget = (total / 10 * 9).saturating_sub(used);
+    // Never more churn than we take, and never a ceiling that double-counts it: solving
+    // Solve `arena + min(churn, arena) <= budget` for the largest admissible arena: at most half
+    // the budget, tightened further to `budget - churn` once the churn is the smaller term.
+    let mut ceiling = bytes.min(budget / 2);
+    if fill_churn_bytes < ceiling {
+        ceiling = ceiling.min(budget.saturating_sub(fill_churn_bytes));
+    }
+    ceiling
+}
+
 /// Profile-aware arena planning with the complete host-memory snapshot.
 pub fn streaming_arena_plan_for_snapshot(
     profile: crate::config::AutoProfile,
@@ -537,6 +571,10 @@ pub fn streaming_arena_plan_for_snapshot(
         RamRequest::Bypass => return ArenaPlan::StreamOnly,
         RamRequest::TotalProcessBudget(0) => return ArenaPlan::Skip(Skip::Disabled),
         RamRequest::TotalProcessBudget(total) => {
+            // An explicit total-process budget keeps its documented meaning: the user is stating
+            // what the PROCESS may use, so `cache_bytes_for_total_budget` already nets out the
+            // resident set and its own future reserve. Do not second-guess it here —
+            // `an_oversized_explicit_budget_bypasses_automatic_headroom` pins that contract.
             let bytes = cache_bytes_for_total_budget(total, process_resident, pageable);
             return if bytes == 0 {
                 ArenaPlan::Skip(Skip::TooLittle)
@@ -545,7 +583,9 @@ pub fn streaming_arena_plan_for_snapshot(
             };
         }
         RamRequest::LegacyCacheBudget(0) => return ArenaPlan::Skip(Skip::Disabled),
-        RamRequest::LegacyCacheBudget(bytes) => return ArenaPlan::Take(bytes),
+        RamRequest::LegacyCacheBudget(bytes) => {
+            return ArenaPlan::Take(clamp_arena_to_spare(bytes, available, total, pageable));
+        }
         RamRequest::Auto => {}
     }
     if unified {
