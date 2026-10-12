@@ -134,6 +134,32 @@ pub(crate) fn native_streamed_build_spv(
     }
 }
 
+/// Bit-identical Wave32 Q8_0 Decode GEMV. The shader preserves the 64-thread kernel's reduction
+/// tree and is therefore suitable for exact A/B tests on large-K fixed projections.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_q8_wave32_spv(res: bool, nr: u32) -> Option<(&'static str, &'static [u32])> {
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            ($name, s)
+        }};
+    }
+    Some(match (res, nr) {
+        (false, 1) => v!("native_q8_0_wave32"),
+        (false, 2) => v!("native_q8_0_wave32_nr2"),
+        (false, 4) => v!("native_q8_0_wave32_nr4"),
+        (true, 1) => v!("native_q8_0_wave32_res"),
+        (true, 2) => v!("native_q8_0_wave32_nr2_res"),
+        (true, 4) => v!("native_q8_0_wave32_nr4_res"),
+        _ => return None,
+    })
+}
+
 /// SPIR-V (kernel-cache name + words) for [`native_mrow_kernel_name`]'s pick — the multi-row GEMV's
 /// weight read from a `bufferDeviceAddress` arena; the sole weight build. Production dispatches it
 /// via [`crate::recorder::Recorder::linear_native_mrow`]; parity tests call the streamed entry

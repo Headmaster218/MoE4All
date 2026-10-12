@@ -2920,6 +2920,30 @@ impl VulkanBackend {
         )
     }
 
+    pub(crate) fn paged_grid_buffer_nr(&self) -> u32 {
+        self.cfg()
+            .kernels
+            .vulkan
+            .gemv
+            .id_grid_buffer_nr
+            .unwrap_or_else(|| {
+                if self.measured_decode_kernel_device() {
+                    2
+                } else {
+                    4
+                }
+            })
+    }
+
+    pub(crate) fn use_q8_wave32(&self) -> bool {
+        self.cfg()
+            .kernels
+            .vulkan
+            .gemv
+            .q8_wave32
+            .unwrap_or_else(|| self.measured_decode_kernel_device())
+    }
+
     pub(crate) fn use_decode_down_overlap(&self, rows: usize, min_context: u32) -> bool {
         use_decode_down_overlap(
             self.cfg().kernels.vulkan.decode_down_overlap,

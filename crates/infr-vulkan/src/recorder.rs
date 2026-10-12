@@ -272,6 +272,16 @@ fn native_sg_choice(
     matches!(nr, 2 | 4 | 8).then_some(nr)
 }
 
+fn native_q8_wave32_choice(
+    dtype: infr_core::DType,
+    in_f: usize,
+    out_f: usize,
+    enabled: bool,
+) -> Option<u32> {
+    (dtype == infr_core::DType::Q8_0 && enabled && out_f >= 1024 && in_f.is_multiple_of(32))
+        .then_some(if in_f <= 2560 { 4 } else { 2 })
+}
+
 /// NUM_ROWS for the reassociation-tolerant subgroup id-indexed decode GEMV
 /// (`native_gemv_id_multi_sg.comp`), or `None` to keep the tree id kernel. Same projection-band
 /// discipline as [`native_sg_choice`], but covers BOTH Q6_K (Qwen3-30B expert down, out_f≈2048 — the
@@ -3552,6 +3562,10 @@ impl<'a> Recorder<'a> {
         // `_streamed` twin (the build tables are 1:1 mirrored — see this fn's doc). Every branch
         // reachable here has a streamed kernel to route to.
         if rows == 1 {
+            if let Some(nr) = native_q8_wave32_choice(dtype, in_f, out_f, self.be.use_q8_wave32()) {
+                self.linear_native_q8_wave32_at(arena_addr, w_base, x, None, y, in_f, out_f, nr);
+                return;
+            }
             if let Some(nr) = native_sg_choice(dtype, in_f, out_f, self.gemv()) {
                 if crate::gemm::native_sg_streamed_build_spv(dtype, false, nr, self.sg16())
                     .is_some()
@@ -3652,6 +3666,54 @@ impl<'a> Recorder<'a> {
             &push,
             (rows * out_f) as u32,
         );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_native_q8_wave32_at(
+        &self,
+        arena_addr: u64,
+        w_base: usize,
+        x: &dyn Buffer,
+        residual: Option<&dyn Buffer>,
+        y: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+        nr: u32,
+    ) {
+        self.label_gemv("gemv_q8_wave32_streamed", 1, in_f, out_f);
+        let (name, spv) = crate::gemm::native_q8_wave32_spv(residual.is_some(), nr)
+            .expect("unsupported Q8 Wave32 output-row tile");
+        let nbind = if residual.is_some() { 4 } else { 3 };
+        let k = self.be.kernel_sg(name, spv, nbind, 24, 32);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&1u32.to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        if let Some(residual) = residual {
+            self.dispatch_wide(
+                k,
+                &[
+                    Self::vkb(x),
+                    Self::vkb(x),
+                    Self::vkb(residual),
+                    Self::vkb(y),
+                ],
+                1,
+                &push,
+                (out_f.div_ceil(nr as usize)) as u32,
+            );
+        } else {
+            self.dispatch_wide(
+                k,
+                &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
+                1,
+                &push,
+                (out_f.div_ceil(nr as usize)) as u32,
+            );
+        }
     }
 
     /// Multi-row native GEMV (`2 <= rows <= 8`): the GEMV's out_f-wide cooperative-over-K grid,
@@ -4194,6 +4256,21 @@ impl<'a> Recorder<'a> {
             Self::vkb(residual),
             Self::vkb(y),
         ];
+        if rows == 1 {
+            if let Some(nr) = native_q8_wave32_choice(dtype, in_f, out_f, self.be.use_q8_wave32()) {
+                self.linear_native_q8_wave32_at(
+                    arena_addr,
+                    0,
+                    x,
+                    Some(residual),
+                    y,
+                    in_f,
+                    out_f,
+                    nr,
+                );
+                return;
+            }
+        }
         // Reassociation-tolerant subgroup route — precedence over RM, mirrors linear_add_native.
         if rows == 1 {
             if let Some(nr) = native_sg_choice(dtype, in_f, out_f, self.gemv()) {
@@ -11381,9 +11458,9 @@ impl<'a> Recorder<'a> {
             assert!(n_tokens == 1 && !has_bias && !hash);
             assert!(input.len_bytes() >= 2560 * 4 && output.len_bytes() >= 2560 * 4);
         }
-        let fast_sigmoid_wave32 = self.vk().moe_topk_sg
+        let fast_selected_norm_wave32 = self.vk().moe_topk_sg
             && n_tokens == 1
-            && gating == 1
+            && gating <= 1
             && norm_w
             && !has_bias
             && (n_expert_groups <= 1 || n_expert_groups_used == 0)
@@ -11392,7 +11469,7 @@ impl<'a> Recorder<'a> {
             && n_expert <= 512
             && n_used > 0
             && n_used <= 32;
-        let k = if fast_sigmoid_wave32 {
+        let k = if fast_selected_norm_wave32 {
             let (name, spv) = if input_tap.is_some() {
                 (
                     "moe_topk_sigmoid_wave32_tap",
@@ -12883,7 +12960,7 @@ impl<'a> Recorder<'a> {
         if matches!(dtype, infr_core::DType::Iq2S | infr_core::DType::Iq3S)
             && self.be.use_paged_grid_buffer(in_f, out_f, rows)
         {
-            let nr = self.gemv().id_grid_buffer_nr;
+            let nr = self.be.paged_grid_buffer_nr();
             let grid = if dtype == infr_core::DType::Iq2S {
                 &self.be.iq2s_grid
             } else {
@@ -12998,7 +13075,7 @@ impl<'a> Recorder<'a> {
         if matches!(dtype, infr_core::DType::Iq2S | infr_core::DType::Iq3S)
             && self.be.use_paged_grid_buffer(in_f, out_f, rows)
         {
-            let nr = self.gemv().id_grid_buffer_nr;
+            let nr = self.be.paged_grid_buffer_nr();
             let grid = if dtype == infr_core::DType::Iq2S {
                 &self.be.iq2s_grid
             } else {
@@ -18062,7 +18139,7 @@ mod tests {
                 .flat_map(|buffer| [1u32, 2, 4, 8].map(move |nr| (buffer, nr)))
             {
                 let mut cfg = infr_core::config::Config::default();
-                cfg.kernels.vulkan.gemv.id_grid_buffer_nr = nr;
+                cfg.kernels.vulkan.gemv.id_grid_buffer_nr = Some(nr);
                 cfg.kernels.vulkan.gemv.id_grid_nr = nr;
                 cfg.kernels.vulkan.gemv.id_grid_buffer = Some(buffer_grid);
                 let be = VulkanBackend::new_on_with(1, std::sync::Arc::new(cfg)).unwrap();
@@ -18205,6 +18282,102 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires Vulkan1; exact Q8_0 Wave32 parity and timing"]
+    fn q8_wave32_matches_tree_bitwise() {
+        use infr_core::backend::{Backend, BufferUsage};
+
+        let be = VulkanBackend::new_on_with(
+            1,
+            std::sync::Arc::new(infr_core::config::Config::default()),
+        )
+        .unwrap();
+        for (case, (k, n)) in [
+            (320usize, 10240usize),
+            (2560usize, 6144usize),
+            (2560, 10240),
+            (6144, 2560),
+            (10240, 320),
+            (10240, 2560),
+            (12288, 2560),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let weight = be
+                .upload_weight_bytes(&infr_testkit::synth_weight(
+                    infr_core::DType::Q8_0,
+                    k * n,
+                    900 + case as u32,
+                ))
+                .unwrap();
+            let input_values = (0..k)
+                .map(|i| (i as f32 * 0.013).sin() * 0.2)
+                .collect::<Vec<_>>();
+            let input = be.alloc(k * 4, BufferUsage::Activations).unwrap();
+            let tree = be.alloc(n * 4, BufferUsage::Readback).unwrap();
+            let waves = (0..3)
+                .map(|_| be.alloc(n * 4, BufferUsage::Readback).unwrap())
+                .collect::<Vec<_>>();
+            be.upload(input.as_ref(), bytemuck::cast_slice(&input_values))
+                .unwrap();
+
+            let run = |nr: u32, reps: usize| {
+                let rec = be.recorder().unwrap();
+                for _ in 0..reps {
+                    if nr != 0 {
+                        rec.linear_native_q8_wave32_at(
+                            weight.device_addr().unwrap(),
+                            0,
+                            input.as_ref(),
+                            None,
+                            waves[nr.trailing_zeros() as usize].as_ref(),
+                            k,
+                            n,
+                            nr,
+                        );
+                    } else {
+                        rec.linear_native_at(
+                            infr_core::DType::Q8_0,
+                            weight.device_addr().unwrap(),
+                            0,
+                            input.as_ref(),
+                            tree.as_ref(),
+                            1,
+                            k,
+                            n,
+                        );
+                    }
+                }
+                let start = std::time::Instant::now();
+                rec.finish().unwrap();
+                start.elapsed().as_secs_f64() * 1e6 / reps as f64
+            };
+
+            run(0, 1);
+            for nr in [1, 2, 4] {
+                run(nr, 1);
+            }
+            let mut tree_bytes = vec![0u8; n * 4];
+            be.download(tree.as_ref(), &mut tree_bytes).unwrap();
+            for (nr, wave) in [1u32, 2, 4].into_iter().zip(&waves) {
+                let mut wave_bytes = vec![0u8; n * 4];
+                be.download(wave.as_ref(), &mut wave_bytes).unwrap();
+                assert_eq!(
+                    wave_bytes, tree_bytes,
+                    "Q8 Wave32 NR={nr} differs at K={k}, N={n}"
+                );
+            }
+
+            let tree_us = (0..4).map(|_| run(0, 64)).collect::<Vec<_>>();
+            let waves_us = [1u32, 2, 4]
+                .into_iter()
+                .map(|nr| (nr, (0..4).map(|_| run(nr, 64)).collect::<Vec<_>>()))
+                .collect::<Vec<_>>();
+            println!("Q8 K={k}, N={n}, tree_us={tree_us:?}, waves_us={waves_us:?}");
         }
     }
 
@@ -18715,14 +18888,14 @@ mod tests {
         );
     }
 
-    /// Exercise every wave in the 512-expert, top-10 sigmoid router shape used by Qwen3.8.
+    /// Exercise every lane in the 512-expert, top-10 fast router for both supported gates.
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn moe_topk_512_experts_selects_exact_top10() {
         let (n_tokens, n_expert, n_used) = (1usize, 512usize, 10usize);
         let logits: Vec<f32> = (0..n_expert).map(|i| i as f32 / 512.0).collect();
         let dummy = vec![0.0f32; n_expert];
-        let run = |wave32: bool| {
+        let run = |wave32: bool, gating: u32, reps: usize| {
             let be = be_with(|cfg| cfg.moe_topk_sg = wave32);
             let blog = upf32(&be, &logits);
             let bdummy = upf32(&be, &dummy);
@@ -18733,24 +18906,28 @@ mod tests {
                 .alloc(n_tokens * n_used * 4, BufferUsage::Readback)
                 .unwrap();
             let rec = be.recorder().unwrap();
-            rec.moe_topk(
-                blog.as_ref(),
-                bids.as_ref(),
-                bwts.as_ref(),
-                bdummy.as_ref(),
-                n_tokens,
-                n_expert,
-                n_used,
-                1.0,
-                1,    // sigmoid
-                true, // normalize selected weights
-                false,
-                0,
-                0,
-                bdummy.as_ref(),
-                false,
-            );
+            for _ in 0..reps {
+                rec.moe_topk(
+                    blog.as_ref(),
+                    bids.as_ref(),
+                    bwts.as_ref(),
+                    bdummy.as_ref(),
+                    n_tokens,
+                    n_expert,
+                    n_used,
+                    1.0,
+                    gating,
+                    true, // normalize selected weights
+                    false,
+                    0,
+                    0,
+                    bdummy.as_ref(),
+                    false,
+                );
+            }
+            let start = std::time::Instant::now();
             rec.finish().unwrap();
+            let us = start.elapsed().as_secs_f64() * 1e6 / reps as f64;
             let mut idb = vec![0u8; n_tokens * n_used * 4];
             be.download(bids.as_ref(), &mut idb).unwrap();
             let mut wb = vec![0u8; n_tokens * n_used * 4];
@@ -18758,20 +18935,24 @@ mod tests {
             (
                 bytemuck::cast_slice::<u8, u32>(&idb).to_vec(),
                 bytemuck::cast_slice::<u8, u32>(&wb).to_vec(),
+                us,
             )
         };
-        let (ids, weight_bits) = run(true);
-        let (fallback_ids, fallback_weight_bits) = run(false);
-        let expected: Vec<u32> = (502..512).rev().collect();
-        assert_eq!(ids, expected, "512-expert top-10 selection changed");
-        assert_eq!(ids, fallback_ids, "wave32 ids differ from generic router");
-        assert_eq!(
-            weight_bits, fallback_weight_bits,
-            "wave32 weights differ bitwise from generic router"
-        );
-        let wts: &[f32] = bytemuck::cast_slice(&weight_bits);
-        assert!(wts.iter().all(|w| w.is_finite() && *w > 0.0));
-        assert!((wts.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        for gating in [0, 1] {
+            let (ids, weight_bits, fast_us) = run(true, gating, 256);
+            let (fallback_ids, fallback_weight_bits, generic_us) = run(false, gating, 256);
+            println!("moe top-k gating={gating}: wave32={fast_us:.3}us generic={generic_us:.3}us");
+            let expected: Vec<u32> = (502..512).rev().collect();
+            assert_eq!(ids, expected, "512-expert top-10 selection changed");
+            assert_eq!(ids, fallback_ids, "wave32 ids differ from generic router");
+            assert_eq!(
+                weight_bits, fallback_weight_bits,
+                "wave32 weights differ bitwise from generic router for gating={gating}"
+            );
+            let wts: &[f32] = bytemuck::cast_slice(&weight_bits);
+            assert!(wts.iter().all(|w| w.is_finite() && *w > 0.0));
+            assert!((wts.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        }
     }
 
     #[test]

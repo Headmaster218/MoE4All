@@ -34,7 +34,7 @@ fn paged_iq_grid_override_preserves_auto_and_explicit_modes() {
         let mut cfg = Config::default();
         layer.apply(&mut cfg);
         assert_eq!(cfg.kernels.vulkan.gemv.id_grid_buffer, expected);
-        assert_eq!(cfg.kernels.vulkan.gemv.id_grid_buffer_nr, 4);
+        assert_eq!(cfg.kernels.vulkan.gemv.id_grid_buffer_nr, Some(4));
     }
 }
 

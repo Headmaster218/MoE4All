@@ -3,15 +3,13 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_ballot : require
 
-// Fast Qwen MoE router: one wave32 per token, up to 512 experts and top-32.
+// Fast bias-free MoE router: one wave32 per token, up to 512 experts and top-32.
 //
-// This is the common bias-free, group-free sigmoid + selected-weight-renormalization path. Each
-// lane owns 16 experts and keeps their logits/live mask in registers. Sigmoid is monotonic, so
-// ranking raw logits is identical while avoiding 512 exp() calls and a second 16-float register
-// array per token. Only the ten winners need sigmoid for their final weights. All top-k passes use
-// wave shuffles only; unlike the generic 128-thread router there are no cross-wave shared
-// reductions or workgroup barriers. Selection ties and the rank-ordered weight sum match the
-// generic kernel.
+// Covers selected-weight-renormalized softmax and sigmoid. Each lane owns 16 experts and keeps
+// their logits/live mask in registers. Both gates are monotonic, so ranking raw logits is exact;
+// only the selected logits need exp/sigmoid. All top-k passes use wave shuffles only; unlike the
+// generic 128-thread router there are no cross-wave shared reductions or workgroup barriers.
+// Selection ties, max shifting, and the rank-ordered weight sum match the generic kernel.
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
@@ -93,7 +91,10 @@ void main() {
         if (lane == owner) { live &= ~(1u << owner_j); }
     }
 
-    float my_weight = lane < pc.n_used ? sigmoid(my_logit) : 0.0;
+    float selected_max = subgroupBroadcast(my_logit, 0u);
+    float my_weight = lane < pc.n_used
+        ? (pc.gating == 0u ? exp(my_logit - selected_max) : sigmoid(my_logit))
+        : 0.0;
     float sum = 0.0;
     for (uint rank = 0u; rank < pc.n_used; rank++) {
         sum += subgroupBroadcast(my_weight, rank);

@@ -2162,3 +2162,60 @@ Next bounded implementation candidates, respecting the narrowed scope:
    Previous owned-graph correctness exclusions still forbid broad promotion.
 
 Do not retune L0/L1, full-hit gaps, kernels, LRU or MTP in this focused round.
+
+### Rejected early-publication experiment, 2026-10-11
+
+The first candidate above was implemented in four bounded variants and is
+rejected. Publishing a miss result before the dedicated transfer submission
+completed changed generated output even when the transfer timeline semaphore
+was attached to the recovery submission. The affected tags were
+`phase1-overlap-screen-a`, `phase1-overlap-screen-c` and
+`phase1-overlap-screen-d`; the final timeline-semaphore variant produced
+SHA256 `78df...` versus control `6af78aa...`. An apparent host-DMA-disabled
+pass did not exercise the producer path and is not evidence of correctness.
+
+The experiment's deferred pager upload and `Preparing` result state were
+removed. Keep the correct ordering: prepare and submit the transfer, publish
+the notice result, then let recovery consume the returned timeline value.
+Real-model exact-output validation caught a dependency that the synthetic GPU
+fixture did not model. Future overlap work must preserve this ordering unless
+it supplies a stronger, explicitly proven ownership and queue-dependency
+protocol.
+
+### Phase 1/2 stable closeout, 2026-10-12 +08:00
+
+Tag `phase12-final-20261012-final-stable` uses release binary SHA256
+`de3dd904333d8e36f86cb9bc65606052af104827947f876cc3fb5bfd83b20ca7`,
+two configured slots, no MTP or profiler, three regenerated 512-token rounds,
+and the same 16-layer resident/hit-first settings used by the preceding A/B
+campaign. The first round is retained as cold runtime state; the table reports
+the two subsequent stable rounds. All requests complete normally, every lane's
+whole-output SHA256 is identical across all three rounds, and the final 30K
+single output also matches the prior exact control/A/B campaigns.
+
+| Context | Active lanes | Stable tok/s/lane | Stable aggregate tok/s |
+| --- | ---: | ---: | ---: |
+| 30K | 1 | 52.201 / 52.657 | 52.201 / 52.657 |
+| 30K | 2 | 34.713 / 34.911 | 69.426 / 69.823 |
+| 150K | 1 | 46.275 / 46.178 | 46.275 / 46.178 |
+| 150K | 2 | 26.023 / 25.998 | 52.046 / 51.995 |
+
+The 30K single-lane stable latency is 19.157/18.991 ms per token. This meets
+the Phase 1 requirement of stable >=50 tok/s and <20 ms per token. The Phase 2
+55 tok/s target remains unmet: the measured stable ceiling is 52.657 tok/s,
+4.3% below 55 and 12.2% below 60. Do not describe 55/60 as achieved.
+
+Promoted changes are limited to the measured positive paths:
+
+1. Context-gated ordinary-Decode full graph plus bounded mapped-copy policy.
+2. Bit-identical Q8_0 fixed-projection Wave32 GEMV on measured Windows/RDNA3
+   Decode shapes.
+3. Windows/RDNA3 immutable-codebook expert NR2 policy and exact softmax/sigmoid
+   Wave32 router selection.
+
+The cross-layer HC candidate, resident Gate/Up/SwiGLU variants, one-token GDN
+split, QSA indexed direct-read, IQ2/IQ3 dp4a, PLE successor prefetch, owned
+graph, scratch inline and mapped staging were all screened and removed. Some
+module kernels were faster, but no retained candidate may change output hashes
+or reduce matched end-to-end throughput. Further progress toward 55/60 needs a
+new exact critical-path change rather than combining these rejected switches.

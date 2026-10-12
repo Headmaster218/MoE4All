@@ -1260,6 +1260,32 @@ fn main() {
         ),
         // Native-block dequant GEMVs: one .spv per (quant format, residual) from one source.
         ("native_gemv", "native_q8_0", &["-DFMT_Q8_0"]),
+        ("native_gemv_wave32", "native_q8_0_wave32", &["-DFMT_Q8_0"]),
+        (
+            "native_gemv_wave32",
+            "native_q8_0_wave32_nr2",
+            &["-DFMT_Q8_0", "-DNR=2"],
+        ),
+        (
+            "native_gemv_wave32",
+            "native_q8_0_wave32_nr4",
+            &["-DFMT_Q8_0", "-DNR=4"],
+        ),
+        (
+            "native_gemv_wave32",
+            "native_q8_0_wave32_res",
+            &["-DFMT_Q8_0", "-DUSE_RES"],
+        ),
+        (
+            "native_gemv_wave32",
+            "native_q8_0_wave32_nr2_res",
+            &["-DFMT_Q8_0", "-DNR=2", "-DUSE_RES"],
+        ),
+        (
+            "native_gemv_wave32",
+            "native_q8_0_wave32_nr4_res",
+            &["-DFMT_Q8_0", "-DNR=4", "-DUSE_RES"],
+        ),
         ("native_gemv", "native_f16", &["-DFMT_F16"]),
         ("native_gemv", "native_f16_res", &["-DFMT_F16", "-DUSE_RES"]),
         ("native_gemv", "native_bf16", &["-DFMT_BF16"]),
