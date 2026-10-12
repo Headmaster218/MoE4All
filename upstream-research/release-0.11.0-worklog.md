@@ -15,7 +15,7 @@ concurrency, device, and measurement interval.
 | 1 | Q8 long-context attention optimization | Done | Commit `8d5a4875b`; XTX-only INT8 Q.K policy and depth-adaptive combine accepted. |
 | 2 | Qwen3.6-35B vision | Done | Qwen3.6 enabled on the existing Qwen-VL MRoPE path. Small/large image recognition and image -> text -> image passed; later long-text Prefill matched the text-only baseline. |
 | 3 | Qwen3.6-35B reasoning effort | Done | Model-scoped prompt mapping for Qwen3.5/3.6; CLI, wizard and API request controls validated while default and no-think prompts remain unchanged. |
-| 4 | Review `perf/expert-mtp-optimization` after `release-0.10.0` | Pending | Port only independently useful, architecture-compatible changes with focused tests/A-B. |
+| 4 | Review `perf/expert-mtp-optimization` after `release-0.10.0` | Done | No mature runtime optimization can be cherry-picked safely. The only novel experiments are reassigned to Tasks 5/6 for a current-architecture reimplementation and matched A/B. |
 | 5 | Decode front/back bubble overlap | Pending | Pipeline safe pre/post work around the GPU submission; measure 30K and 150K, reject changes without end-to-end gain. |
 | 6 | Expert-miss critical path | Pending | Start DMA/CPU copy immediately after miss IDs, move deferrable work off the transfer path, and overlap independent S5/S6 copies where correctness permits. |
 | 7 | Version 0.11.0 and release benchmark | Pending | FlashNext 4.27 bpw and Qwen3.6-35B; 30K/150K; 1/2/3 active streams; warmed three-run Decode front/middle/back/mean/peak plus Prefill. |
@@ -51,6 +51,28 @@ concurrency, device, and measurement interval.
 - 1024-key replay remains default-off: its isolated kernel is faster but paged-MoE end-to-end Decode regressed.
 - Direct Q8 K write remains default-off: byte-exact but end-to-end neutral.
 - Scoped buffer barriers were reverted after the correct hazard-preserving implementation showed no gain.
+
+### `perf/expert-mtp-optimization` audit
+
+- Range reviewed: `release-0.10.0..perf/expert-mtp-optimization`. Only `56a821e17` and
+  `c722b854b` change engine runtime or diagnostics; the remaining commits are documentation,
+  submodule, or packaging changes.
+- The splitter in `56a821e17` is a startup/static rewrite. The current branch instead uses
+  runtime pager feedback and adaptive calibration, so copying the old `splitter.rs` would replace
+  newer policy rather than add an optimization.
+- The `DecodeDmaWorker` experiment moved a frozen dedicated-transfer submit to one helper thread,
+  but it predates the current resident notice producer, hit-first execution, early recovery, and
+  promotion lifecycle. It had no accepted end-to-end A/B and cannot be transplanted without
+  duplicating ownership and cancellation paths. Its useful intent, immediate asynchronous submit,
+  is retained as a Task 6 design input.
+- `micro_prefill_row_counts` packs several remaining prompt rows beside Decode lanes. It targets
+  mixed short-Prefill/Decode batches, not the single-stream per-token front/back bubble, and was
+  environment-only with no accepted throughput result. If useful, it must be rebuilt against the
+  current scheduler and checkpoint/QSA boundaries; it is not a release-ready optimization.
+- `c722b854b` is feature-gated expert omission diagnostics. It adds synchronization, downloads,
+  and analysis scripts only when enabled; it has no production performance change to port.
+- Result: no code cherry-pick. This avoids reintroducing obsolete splitter and pager assumptions;
+  Tasks 5 and 6 will test the two still-relevant ideas on the current architecture.
 
 ## Measurement rules
 
