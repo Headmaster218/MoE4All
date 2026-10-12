@@ -16,7 +16,7 @@ concurrency, device, and measurement interval.
 | 2 | Qwen3.6-35B vision | Done | Qwen3.6 enabled on the existing Qwen-VL MRoPE path. Small/large image recognition and image -> text -> image passed; later long-text Prefill matched the text-only baseline. |
 | 3 | Qwen3.6-35B reasoning effort | Done | Model-scoped prompt mapping for Qwen3.5/3.6; CLI, wizard and API request controls validated while default and no-think prompts remain unchanged. |
 | 4 | Review `perf/expert-mtp-optimization` after `release-0.10.0` | Done | No mature runtime optimization can be cherry-picked safely. The only novel experiments are reassigned to Tasks 5/6 for a current-architecture reimplementation and matched A/B. |
-| 5 | Decode front/back bubble overlap | Pending | Pipeline safe pre/post work around the GPU submission; measure 30K and 150K, reject changes without end-to-end gain. |
+| 5 | Decode front/back bubble overlap | Done | No production change. Runner-side setup is already overlapped/small; splitting the first frontend into an earlier submit regressed matched 30K and 150K throughput and was removed. Further gains require reusable command buffers/GPU-driven replay, which is architecture work. |
 | 6 | Expert-miss critical path | Pending | Start DMA/CPU copy immediately after miss IDs, move deferrable work off the transfer path, and overlap independent S5/S6 copies where correctness permits. |
 | 7 | Version 0.11.0 and release benchmark | Pending | FlashNext 4.27 bpw and Qwen3.6-35B; 30K/150K; 1/2/3 active streams; warmed three-run Decode front/middle/back/mean/peak plus Prefill. |
 | 8 | Recover MTP experiment and automatic splitter | Pending | Audit the MTP branch, reproduce the automatic splitter failure, and produce an implementation-ready repair plan or a validated fix. |
@@ -73,6 +73,26 @@ concurrency, device, and measurement interval.
   and analysis scripts only when enabled; it has no production performance change to port.
 - Result: no code cherry-pick. This avoids reintroducing obsolete splitter and pager assumptions;
   Tasks 5 and 6 will test the two still-relevant ideas on the current architecture.
+
+### Decode front/back bubble experiment, RX 7900 XTX
+
+- Model/config: FlashNext 4.27 bpw, `Vulkan1`, two configured slots with one active, Q8 KV,
+  30K/150K contexts, 256 generated tokens, resident hit-first/notice/early-recovery path.
+- Existing code already builds the next scheduler plan beside the current execute where dependencies
+  permit. Pager profiles put runner front/setup work in the tens of microseconds per step; the larger
+  visible pre-GPU interval is primarily Vulkan command recording, queue submission, and device start.
+- Experiment: finish and submit the token frontend immediately before the first resident MoE layer,
+  then continue recording the layer stack in a fresh recorder. The control and candidate used the
+  same binary hash (`c67643d8...`) and differed only by the runtime switch.
+- 30K warmed complete-request Decode: control `49.59`, `47.99 tok/s`; early-submit `45.04`,
+  `44.60 tok/s` (about 8% slower).
+- 150K warmed complete-request Decode: control was noisy at `38.79`, `43.83 tok/s`; early-submit was
+  consistently slower at `39.47`, `39.37 tok/s`. Output hashes matched in every pair.
+- Conclusion: an extra small submission moves a visual boundary but adds queue/synchronization cost
+  and reduces complete-cycle throughput. The code was removed. A meaningful next step would be
+  reusable/indirect resident command buffers or a GPU-driven replay loop, not another host submit.
+- Evidence: `benchmark-data/artifacts/gpu-resident-decode-20261011/`
+  (`release011-frontgap-samebin-ab-control-*` and `release011-frontgap-samebin-ab-frontsubmit-*`).
 
 ## Measurement rules
 
