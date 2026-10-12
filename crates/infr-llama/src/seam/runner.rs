@@ -3449,9 +3449,9 @@ fn generate_dense_backend_inner(
     // linear text positions, so fill them once now instead of mutating another persistent cache on
     // every decode step. Text-only calls allocate nothing.
     let (mrope_history_buf, mrope_positions) = if let Some(plan) = mm {
-        if !c.qwen4exp {
+        if !(c.qwen4exp || c.qwen35) {
             return Err(anyhow!(
-                "multimodal RoPE is currently supported only by qwen4exp"
+                "multimodal RoPE is currently supported only by qwen4exp and qwen35"
             ));
         }
         let plan_prompt_len = plan.prompt_pos4.len() / 4;
@@ -3467,7 +3467,7 @@ fn generate_dense_backend_inner(
             ));
         }
         if c.rope_sections.iter().sum::<u32>() == 0 {
-            return Err(anyhow!("qwen4exp multimodal RoPE sections are empty"));
+            return Err(anyhow!("Qwen multimodal RoPE sections are empty"));
         }
         let mut previous_end = 0usize;
         for (index, span) in plan.spans.iter().enumerate() {

@@ -4622,7 +4622,7 @@ fn cmd_serve(
         anyhow::bail!("Qwen3.8 concurrent MTP currently supports at most two slots");
     }
     if mmproj.is_some() && !is_vulkan {
-        anyhow::bail!("--mmproj currently requires the Vulkan qwen4exp serve path");
+        anyhow::bail!("--mmproj currently requires the Vulkan seam serve path");
     }
     if let Some(path) = mmproj {
         if !path.is_file() {

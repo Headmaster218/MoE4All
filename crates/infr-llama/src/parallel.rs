@@ -3833,7 +3833,7 @@ impl ParallelSeam {
         )
     }
 
-    /// Generate one Qwen3.8 vision turn. Projector execution is completed by the caller before
+    /// Generate one Qwen hybrid vision turn. Projector execution is completed by the caller before
     /// entering here, so its request-scoped weights have already returned to the unified arena.
     pub fn generate_multimodal_turn(
         &self,
@@ -3844,9 +3844,9 @@ impl ParallelSeam {
         req: &RequestCtx,
         mut on_piece: impl FnMut(&str),
     ) -> Result<GenStats> {
-        if !self.model.config().qwen4exp {
+        if !(self.model.config().qwen4exp || self.model.config().qwen35) {
             return Err(anyhow!(
-                "vision text integration currently supports qwen4exp models only"
+                "vision text integration currently supports qwen4exp and qwen35 models only"
             ));
         }
         if images.is_empty() {

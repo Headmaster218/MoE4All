@@ -1,0 +1,52 @@
+# MoE4All 0.11.0 worklog
+
+Updated: 2026-10-13
+Branch: `perf/gpu-resident-decode`
+
+This file tracks implementation state, matched measurements, accepted changes, rejected experiments,
+and the commit that closes each task. Performance claims must name the model, context depth,
+concurrency, device, and measurement interval.
+
+## Status
+
+| ID | Task | State | Result / acceptance |
+| --- | --- | --- | --- |
+| 0 | Move the active branch to `D:\AIinfr\infr` | Done | Same branch and dirty state restored in the primary checkout; no merge or branch migration. |
+| 1 | Q8 long-context attention optimization | Done | Commit `8d5a4875b`; XTX-only INT8 Q.K policy and depth-adaptive combine accepted. |
+| 2 | Qwen3.6-35B vision | Done | Qwen3.6 enabled on the existing Qwen-VL MRoPE path. Small/large image recognition and image -> text -> image passed; later long-text Prefill matched the text-only baseline. |
+| 3 | Qwen3.6-35B reasoning effort | Pending | Expose supported reasoning-strength choices through CLI/wizard/API without changing unsupported models. |
+| 4 | Review `perf/expert-mtp-optimization` after `release-0.10.0` | Pending | Port only independently useful, architecture-compatible changes with focused tests/A-B. |
+| 5 | Decode front/back bubble overlap | Pending | Pipeline safe pre/post work around the GPU submission; measure 30K and 150K, reject changes without end-to-end gain. |
+| 6 | Expert-miss critical path | Pending | Start DMA/CPU copy immediately after miss IDs, move deferrable work off the transfer path, and overlap independent S5/S6 copies where correctness permits. |
+| 7 | Version 0.11.0 and release benchmark | Pending | FlashNext 4.27 bpw and Qwen3.6-35B; 30K/150K; 1/2/3 active streams; warmed three-run Decode front/middle/back/mean/peak plus Prefill. |
+| 8 | Recover MTP experiment and automatic splitter | Pending | Audit the MTP branch, reproduce the automatic splitter failure, and produce an implementation-ready repair plan or a validated fix. |
+
+## Accepted baseline
+
+### Qwen3.6-35B vision, RX 7900 XTX
+
+- Model: `Qwen3.6-35B-A3B-APEX-I-Balanced.gguf`; projector: `mmproj-Qwen3.6-35B-A3B-BF16.gguf`.
+- Device and shape: `Vulkan1`, one 32K slot, Q8 KV, aggressive profile, ubatch 4096.
+- Small 128x128 image: correct blue-square answer. End-to-end request Prefill was `53.5 tok/s`; after request-scoped projector work, the 43-token model Prefill was about `128 tok/s`.
+- Large 1024x1024 image after a text turn: correct purple/larger-canvas answer. End-to-end request Prefill was `627.6 tok/s`; after projector work, the 4,515-token model Prefill was about `2,157 tok/s`.
+- Matched long text: text-only `2,715 tok/s`; after the first image `2,721 tok/s`, with 36 prefix tokens reused. Vision did not leave a persistent text-Prefill slowdown.
+- Final no-image recall reused 4,508 of 4,572 prompt tokens and correctly returned `Blue, purple`.
+- Evidence: `benchmark-data/artifacts/qwen36-35b-vision-20261013/run-2026-10-12T17-18-33.030Z/summary.json` and `stderr.log`.
+
+### Q8 attention, RX 7900 XTX
+
+- INT8 Q.K continuous Decode: 30K `61.33 -> 62.79 tok/s`; 150K `36.49 -> 36.54 tok/s` in the matched five-run comparison.
+- Final default confirmation: 30K `63.66 tok/s`; 150K `36.91 tok/s`.
+- The INT8 path is automatic only on Windows RDNA3-class devices with packed integer-dot support.
+- Depth-adaptive combine is neutral at 30K and lowers isolated 150K Attention from `1699.34` to `1657.12 us/layer`.
+- 1024-key replay remains default-off: its isolated kernel is faster but paged-MoE end-to-end Decode regressed.
+- Direct Q8 K write remains default-off: byte-exact but end-to-end neutral.
+- Scoped buffer barriers were reverted after the correct hazard-preserving implementation showed no gain.
+
+## Measurement rules
+
+- Explicitly use `Vulkan1` (RX 7900 XTX); never rely on automatic selection while the 2 GiB adapters are present.
+- Put new Cargo build output under `B:\` and keep source, records, and release artifacts under `D:\AIinfr\infr`.
+- Separate isolated-kernel timing from complete-cycle throughput.
+- For Decode, discard warm-up, report three warmed runs, and define front/middle/back windows before collection.
+- Preserve unrelated `harness/plugins/dsh-llm-moe4all` and `test-kv-cache` state.
