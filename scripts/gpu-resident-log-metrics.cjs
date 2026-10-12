@@ -64,6 +64,7 @@ function parseLogMetrics(text, rounds, count) {
     return { perRequest, steadyConcurrent: {
       active: count, windows: windows.length, tokens, seconds,
       aggregateTokensPerSecond: seconds ? tokens / seconds : null,
+      peakAggregateTokensPerSecond: windows.length ? Math.max(...windows.map(window => window.rate)) : null,
       precision: 'Existing server decode_tps rounded to 0.1 tok/s; only fully contained Decode windows',
     } };
   });
