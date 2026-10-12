@@ -2,11 +2,15 @@
 kind: index
 status: current
 scope: optimization-campaigns
-last_verified: 2026-09-28
-verified_commit: ed62393068679573afe94a1472454efe7eae0f15
+last_verified: 2026-10-11
+verified_commit: 7b4a9411e9c7524f8dc6ae2603c62d5f338190dc
+baseline_tag: release-0.10.0
 ---
 
 # 优化专项
+
+- [2026-10-04..07 Prefill 与 MTP 策略](qwen38/2026-10-06-prefill-and-mtp.md)
+- [2026-10-08 Decode / CPU miss 专项](qwen38/2026-10-08-decode-and-cpu-miss.md)
 
 ## Qwen3.8
 

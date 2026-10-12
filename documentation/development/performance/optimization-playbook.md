@@ -2,10 +2,14 @@
 kind: development-guide
 status: mixed
 scope: performance-optimization-methods
-source_checkpoint: release-0.9.0
+source_checkpoint: release-0.10.0
+last_verified: 2026-10-11
+verified_commit: 7b4a9411e9c7524f8dc6ae2603c62d5f338190dc
 ---
 
-# perf.md — 性能优化方法
+# 性能优化方法
+
+方法与工具入口按 0.10.0 核对；正文中的 2026-07/08 测量和实验仅代表其历史条件。0.10.0 的新 timeline 与端到端结果另见[性能分析方法](decode-timeline.md)及[发布前矩阵](../../evidence/benchmarks/2026-10-09-release-0.10.0-matrix.md)。
 
 本页保留历史专项的方法和当时的经验数字；运行新的优化任务时应先按目标设备与当前版本重新建立基线。
 
@@ -42,7 +46,7 @@ source_checkpoint: release-0.9.0
 4. **修复一个杠杆**：以最小改动解决已测得的瓶颈。
 5. **首先验证正确性**：一致性测试套件 + 黄金值（见下文），之后才进行基准测试。
 6. **串行执行基准测试**：一次一个 GPU 作业，既测试修改的配置，也测试共享所触及代码路径的配置（一个模型的门控变更可能静默重路由所有其他模型）。
-7. **带着数据提交**：在提交信息中记录前后 t/s 和比值，并更新项目记忆/文档中的性能日志。
+7. **带着数据提交**：在提交信息中记录前后 t/s 和比值，并更新文档中的性能证据（项目记忆只在用户明确要求时修改）。
 
 ## 模型来源 — Hugging Face 缓存 + `infr pull`
 
@@ -86,11 +90,11 @@ infr compare --sweep <models...> --sweep-depth 4096
 - **固定数量语义。** `infr bench` 设置 `INFR_IGNORE_EOS`，使解码基准测试像 llama-bench 一样恰好生成 n 个 token。若某个数值好得不可能，请检查生成是否提前停止。
 - **重新构建的新鲜度。** 实际编辑后若构建工具报告“Finished in 0.06s”，输出可能来自缓存；基准测试前强制执行真实构建。
 - 预填充和解码是两台独立机器。预填充变更必须让 tg 保持逐位一致（验证前后 tg128）；解码变更必须让 pp 保持不变。
-- **DiffusionGemma 的扫描方式不同。** `arch=diffusion-gemma` 没有上游 `llama-bench` 支持，因此其扫描行改为来自参考分支的 `llama-diffusion-cli`（见 README 的 Compare 节及 `documentation/architecture/models/diffusion-gemma.md`），输出 `dg-step`/`dg-e2e`，而非 pp512/tg128/tg64@d/mtp128。只有 `dg-step`（步骤内并行吞吐量）进入按排名的“最大差距”摘要；`dg-e2e` 仅供参考，因为两个实现的熵约束采样器对相同 `-n` 运行不同的步骤数，原始端到端 tok/s 不是公平比值。
+- **DiffusionGemma 的扫描方式不同。** `arch=diffusion-gemma` 没有上游 `llama-bench` 支持，因此其扫描行改为来自参考分支的 `llama-diffusion-cli`（见 README 的 Compare 节及 [DiffusionGemma 变化记录](../../evidence/changes/models/diffusion-gemma.md)），输出 `dg-step`/`dg-e2e`，而非 pp512/tg128/tg64@d/mtp128。只有 `dg-step`（步骤内并行吞吐量）进入按排名的“最大差距”摘要；`dg-e2e` 仅供参考，因为两个实现的熵约束采样器对相同 `-n` 运行不同的步骤数，原始端到端 tok/s 不是公平比值。
 
 ## 归档扫描
 
-`scripts/perf-sweep.sh <models...>`（macOS 上使用 `INFR_METAL=1`）运行扫描，并将原始矩阵归档到本机忽略的 `benchmark-data/target/perf/<utc>-<sha>.txt`。请固定模型列表，使每次提交的比值可比；将提炼后的对照、条件和限制写入 `documentation/evidence/`。
+`scripts/perf-sweep.sh <models...>`（macOS 选择 `--dev metal`；旧 `INFR_METAL` 已移除）运行扫描，并将原始矩阵归档到本机忽略的 `benchmark-data/target/perf/<utc>-<sha>.txt`。请固定模型列表，使每次提交的比值可比；将提炼后的对照、条件和限制写入 `documentation/evidence/`。
 
 **扫描行不是回归证据。** 多模型扫描会加热芯片；在扫描中途测得的行会低几个百分点（观察到：一行单独为 0.93×，扫描中读为 0.83×，数分钟后单独重测回到 0.91×）。宣布回归前，请在空闲机器上单独复测被标记的行，并比较绝对数字而不仅是比值（llama.cpp 一侧也会受相同热量影响而漂移）。
 
@@ -103,7 +107,7 @@ INFR_PROF_OPS=1    infr bench "$M" -p 512 -n 0 -r 1  # per-op device time, any -
 INFR_PROF_STAGES=1 infr bench ...                    # host-side stage timing
 ```
 
-每个 `prof.*` 调节项都可通过三种方式设置：环境变量 `INFR_PROF_*`、任意命令上的 `--set prof.<name>=<value>`，或 `infr.toml` 中的 `[prof]` 节。共有八个，均以 `INFR_PROF_` 为前缀：
+`prof.*` 可通过 `--set prof.<name>=<value>` 或 `[prof]` 节设置；下表为具有历史环境别名的字段。0.10.0 新增 timeline 与 CPU miss 样本参数，不自动具有 `INFR_PROF_*` 别名，详见[配置](../../reference/configuration.md)。
 
 | 调节项                | 作用                                               |
 | ------------------- | ---------------------------------------------------------- |
@@ -148,39 +152,11 @@ op 类型。
 
 ### 后端特定说明
 
-- **Vulkan** labels by **kernel name**, not op kind — its walk is a recorder
-  that lowers one op into several dispatches, so the kernel is the finer, truer
-  unit there. Labels are automatic: the `be.kernel("name", …)` cache key travels
-  on `ComputeKernel`, so a new kernel appears in the report by existing. Buffer
-  copies and fills stamp as `copy_buffer` / `zero_fill`.
-  `Recorder::label_next("…")` overrides one dispatch whose name is ambiguous
-  (`expert_gateup` vs `expert_down` share one MMQ kernel; the
-  `lin_vocab_out`/`lin_vocab_in` lm_head-vs-projection split).
-  `INFR_PROF_OP_SHAPES=1` swaps GEMV/GEMM labels for shape-itemized ones
-  (`mmvr:m4:1536x24576`) — Vulkan's equivalent of the shared itemizer. **Trust
-  the percentages and per-op relative times; the absolute µs totals can
-  overflow.** Decode's record-once replay tape cannot carry per-replay
-  timestamps (queries are baked at record time), so the replayed decode path
-  reports nothing — set `INFR_SEAM_NO_REPLAY=1` to force the re-recorded path
-  when profiling decode.
-- **Metal** needs a second knob for DEVICE time, because batching means it is
-  never free there: `--set prof.metal_device_time=counters` samples
-  stage-boundary timestamps — **the only honest per-op device mode** — and
-  disables the replay tape for the run. `=flush` flushes after each op instead,
-  which costs the batching and, because the tape re-executes decode tokens
-  without walking ops, silently attributes a sample of one token. Left `off`
-  (the default), `INFR_PROF_OPS` still gives you host encode time. Sweep with
-  `--dev MTL0` (llama-bench rejects `Vulkan0` on a Metal box).
-- **CPU** measures host wall per op, which for a host backend _is_ execution
-  time, so its rows are `Unit::Device` and compare directly against a GPU's.
-
-- `infr bench` excludes its untimed warmup + depth-warm turns from the profile
-  on **every** backend (they run suppressed and the exit aggregate is reset
-  after warmup), so the report covers exactly the timed reps. A profile whose
-  `Linear` rows include an `m=1` or `m=8` shape you did not ask for is warmup
-  leaking in.
-- Sum GEMM-ish labels vs elementwise labels vs attention. Then look at **op
-  计数**：无论单个算子成本如何，每块 50k 次派发本身就是一个发现。
+- **Vulkan** 按 kernel 名称而非 op 类型计数：一个 op 经 Recorder 降成多个 dispatch，kernel 更细。标签由 `be.kernel("name", …)` 随 ComputeKernel 传递，copy/fill 标为 `copy_buffer`/`zero_fill`；`Recorder::label_next` 可区分共用 MMQ 的 expert_gateup/expert_down，以及 LM head/投影。op_shapes 增加 shape 桶。历史计数曾有绝对 µs overflow 风险，不仅看占比也检查计数类型和范围。record-once replay 的 query 固定，不能逐次测时；用 `--set kernels.vulkan.no_replay=true` 强制重新录制，结果包含不同路径开销。
+- **Metal** 的 `--set prof.metal_device_time=counters` 在阶段边界采样 device timestamp，并关闭本次 replay；`flush` 每 op 排空会破坏 batch，而且 replay 不遍历 op 时不能据单个 token 样本推算全程。默认 off 时取得 host encode 而非 GPU执行时间；设备选择用 `--dev MTL0`。
+- **CPU** 逐 op 的 host wall 就是 host backend 执行时间，表中作为 `Unit::Device`。
+- `infr bench` 各 backend 的 untimed warmup/depth-warm 不纳入正式 profile，warmup 后重置汇总。若出现未请求的 m=1/m=8 Linear，要检查 warmup 是否泄漏。
+- 分别看 GEMM、elementwise、attention 与 op count；每 chunk 50K dispatch 本身可能就是瓶颈，不仅比较单个 kernel 耗时。
 - 微型探针：`crates/infr-vulkan/tests/`（`gemm_bench`、`decode_gemv_bw`、`small_m_bench`、`bandwidth_probe`），`crates/infr-metal/tests/`（`gemv_bw`、`dispatch_overhead`、`moe_bw`）。其中的链式派发数据会在连续运行间受温度影响而不稳定；应以端到端基准测试作出接受/回退决定。
 - 对可疑的 GEMM 形状，将其加入按形状微基准测试（`crates/infr-vulkan/tests/gemm_bench.rs`）并输出 µs + TFLOPS。与内核的已知上限比较：远低于上限的形状属于形状问题（网格/占用率），上限本身过低才是内核微架构问题。
 
@@ -206,10 +182,7 @@ INFR_PROF_OUT=prof.json ./target/release/infr ... # + full table as JSON
 
 `self` 不包含花费在已插桩被调函数中的时间（`total` 为包含时间；递归仅在最外层帧计入一次包含时间）。累加是线程本地的（热点路径中没有共享状态）；各线程表在报告时合并，因此覆盖 rayon/自旋池线程。
 
-**How it works.** Each hot crate's `build.rs` turns `INFR_PROFILE=1` into
-`cfg(infr_profile)`; every top-level `fn` and `impl` block in infr-core,
-infr-cpu, infr-vulkan, infr-gguf and infr-llama carries
-`#[cfg_attr(infr_profile, infr_prof::instrument)]`。未设置环境变量时，该属性会被完全编译掉，默认二进制不包含性能剖析代码、运行时分支或任何额外内容。设置后，`infr-prof` 过程宏会重写项目中的每个函数，使其打开可跨越 `?`、`return` 和 panic 的 RAII 范围（`infr-prof-rt`）。
+**实现方式。** 热点crate的build.rs将 `INFR_PROFILE=1` 转为 `cfg(infr_profile)`；infr-core、infr-cpu、infr-vulkan、infr-gguf、infr-llama中的顶层fn/impl带 `#[cfg_attr(infr_profile, infr_prof::instrument)]`。未设置环境变量时，该属性会被完全编译掉，默认二进制不包含性能剖析代码、运行时分支或任何额外内容。设置后，`infr-prof` 过程宏会重写项目中的每个函数，使其打开可跨越 `?`、`return` 和 panic 的 RAII 范围（`infr-prof-rt`）。
 
 **覆盖规则——新函数需要什么：**
 
@@ -222,37 +195,15 @@ infr-cpu, infr-vulkan, infr-gguf and infr-llama carries
 
 **设计说明（被拒绝的替代方案）。** （B）拒绝通过 build.rs 将 crate 源码用 syn 重写到 OUT_DIR + `include!`：非内联 `mod foo;` 的解析会在 `include!` 下失效，每个嵌套模块都需要路径重写，且 rust-analyzer/增量构建会看到幽灵源码；唯一收益只是每个项目少写一行属性，不值得引入这些脆弱性。（C）rustc 级插桩（`-Z instrument-xray`、mcount 风格钩子）仅支持 nightly，并向外部工具输出，在 stable 上没有 self/child 或逐线程信息；samply 已覆盖“完全没有源代码标记”的场景。（非内联 `mod foo;` 上的过程宏属性也不稳定，因此注解按项目而非按文件。）
 
-**Deprecation rule:** do not add new one-off `Instant::now()` accumulators or
-config-gated eprintln timers (`prof.prof_dec` / `INFR_PROF_STAGES`-style) —
-build with `INFR_PROFILE=1` instead. The existing `prof.*` knobs stay until this
-system has proven itself in a few campaigns, then get removed. (`INFR_PROFILE`
-itself is a BUILD-time input read by `build.rs`, which is why it is one of the
-few `INFR_*` keys that is deliberately not a `Config` field.) Device-side timing
-is the same idea at each backend's dispatch chokepoint: `INFR_PROF_OPS` per-op
-timing is auto-labeled (no manual stamp calls — see the Profiling section
-above), but stays **runtime**-gated, not build-gated: the instrumentation costs
-nothing when off, and toggling profiling without a rebuild is worth keeping. The
-two compose: run an `INFR_PROFILE=1` build with `INFR_PROF_OPS=1` and the exit
-report prints the host function table AND the per-op device aggregate in one
-output (`INFR_PROF_OUT` JSON carries both as `"sites"` + `"gpu"`) — the host
-section tells you _that_ the GPU path waits in `replay_n`; the device section
-tells you which ops it spent that time on.
+**历史替代方向与当前边界。** 早期方案希望用构建期自动插桩替代零散的 `Instant::now()`/eprintln计时；0.10.0的prof.*仍在使用，不能把“以后移除”写成已退役事实。INFR_PROFILE是build.rs输入而非运行时Config。设备逐op计时仍是runtime门控，可不重建而切换；标签由dispatch入口自动传递。两者可组合输出host函数表与GPU aggregate，INFR_PROF_OUT的JSON含sites和gpu：host说明在replay_n等待，device说明所等op。0.10.0还增加独立有界timeline；需要明确同步区间的结构化测量不属于随意加计时器。
 
 **不要再新增另一套逐算子性能剖析器。** 新后端通过调用 `infr_core::prof::enabled` 并将耗时交给 `OpProf`，即可获得全部功能：调节项、标签语法、表格、退出汇总和预热抑制。它唯一需要自行编写的是如何从自身 API 获得耗时，因为该部分确实不同（时间戳查询/计数器样本/主机时钟）。若 `no_backend_feeds_the_aggregate_behind_the_shared_reporter` 越过此边界，构建会失败。
 
 ### CPU 性能剖析（samply）
 
-For CPU-side attribution, use a sampling profiler — **do not add ad-hoc
-`Instant::now()` timers to the code**. Hand-rolled timing gets added, skews what
-it measures (the eprintln/sync overhead is visible at this scale: a denoise
-`exec` read 6.0s with `INFR_PROF_OPS=1` vs 3.85s without), and then has to be
-reverted. A profile answers the same question per-function, per-line, with zero
-code changes, and keeps stack context the timers throw away.
+CPU归因优先采样profiler，不为一次调查塞入零散计时器。历史denoise exec在INFR_PROF_OPS打开时6.0s、关闭3.85s，说明eprintln/同步开销会干扰测量。采样能保留函数、行和调用栈，不需要改代码。
 
-Tooling: [`samply`](https://github.com/mstange/samply) (`cargo install samply`),
-no root needed. `[profile.release] debug = "line-tables-only"` in the workspace
-`Cargo.toml` gives it symbols + line numbers; debug info never affects codegen,
-so release numbers and the bit-exact goldens are unchanged.
+可用[samply](https://github.com/mstange/samply)（cargo install samply），通常不需要root；workspace release的line-tables-only提供符号/行号而不改变codegen。下面是原调查环境的命令，使用前确认本机工具和参数。
 
 ```bash
 # Interactive: records, then opens the Firefox Profiler UI (flame graph,
@@ -264,25 +215,9 @@ samply record --save-only -o prof.json.gz -- ./target/release/infr bench ...
 scripts/samply-top.py prof.json.gz 30
 ```
 
-Reading `samply-top.py` output: percentages are of **total thread-seconds**
-across all threads, not wall time — on 32 threads, a function at 3% of
-thread-time can still be the top wall-time lever if it's serial, and rayon
-plumbing frames (`accum.rs`, `crossbeam_epoch`, `Producer::fold_with`) showing
-up high is itself a finding (fork-join overhead / idle spinning, the
-"whole-graph threadpool" class). For per-line attribution inside one hot
-function, open the same `prof.json.gz` in the UI (`samply load prof.json.gz`).
+samply-top.py百分比是所有线程的total thread-seconds，不是wall time。32线程中3%的函数如果串行，仍可能主导端到端；accum.rs、crossbeam_epoch、Producer::fold_with较高可能表示fork-join/idle-spin成本。要逐行归因，使用samply load同一prof.json.gz。
 
-What samply does NOT give you: hardware counters (DRAM bandwidth, IPC, cache
-misses). When the taxonomy question is "bandwidth-bound or compute-bound?", use
-`perf stat` (`sudo pacman -S perf`) — reason about bytes-moved first though; a
-back-of-envelope traffic count (table size × times streamed) has called it
-correctly every time so far.
-
-The env-gated profiles (`INFR_PROF_OPS=1` per-op totals + the per-stage MoE
-breakdown, `INFR_PROF_STAGES=1` per-denoise-step phases) stay useful as cheap
-first reads — they're already in-tree, run everywhere, and cost nothing when
-off. The rule is only: don't add NEW timer instrumentation when a profile would
-answer the question.
+samply不提供DRAM带宽、IPC、cache miss等硬件计数器，带宽/计算分类需perf stat等工具；先估算表大小×流送次数的字节量，不以猜测代替计数。Linux发行工具安装命令依发行版而异。现有prof.ops、prof.stages和pager聚合仍可作为快速首轮读数，实际profile有开销，关闭时不等于每种instrumentation都构建期移除。
 
 ## 瓶颈分类 — 性能剖析的含义
 
@@ -333,86 +268,21 @@ answer the question.
 | warp-GEMM Q5_K/Q4_0/Q2_K          | 覆盖门控     | Q4_0 0.6B 0.43 → 0.85x，Q5_K 0.42 → 0.61x，Q2_K 14B 0.47 → 0.68x |
 | IQ4_XS dqblk + warp-GEMM          | 覆盖门控     | 0.6B pp 0.25 → 0.67x（2.7x），tg 0.39 → 0.68x                     |
 
-Known open items (re-sweep before trusting): the quant cliff — **largely
-closed** (Q5_K/Q4_0/Q2_K/IQ4_XS now on the warptile; for the K-quants the dqblk
-decoders already existed so it was pure wiring, and IQ4_XS just needed a
-`dqblk_iq4xs` written — a 32-elem sub-block is exactly one IQ4_XS sub-block, so
-the amortized decode also fixed its slow `native_gemv` decode). Remaining,
-biggest-gap-first: **gemma-4-E2B decode is now the worst Q4_K_M combo (tg 0.64x
-@d4096, 0.70x tg128)**; qwen35 engine (DeltaNet occupancy, narrow-n split-K);
-gemma3-1b's narrow-shape GEMM efficiency (pp 0.66x); the warptile's ~36 TF
-ceiling vs llama's ~45-50 on wide shapes (class-6, dense pp tails); and Metal
-parity for everything above (most fast paths are Vulkan-only; Metal states its
-own capabilities, so it degrades gracefully but slowly).
+**当时未闭环项，使用前重新测量：** 量化断崖大部分已关闭：Q5_K/Q4_0/Q2_K/IQ4_XS接入warptile，K-quant已有dqblk只需接线，IQ4_XS新增32-element dqblk也改善native_gemv。当时最大Q4_K_M差距是Gemma4 E2B Decode（tg@d4096约0.64x、tg128约0.70x），其次qwen35 DeltaNet occupancy/narrow-n split-K、Gemma3-1B窄GEMM（pp0.66x）、宽shape warptile约36TF对照llama约45..50TF，以及Metal parity。这是7/8月专项状态，不代表0.10.0最新排名。
 
 ## Coopmat 操作数层级（fp8 / int8 / bf16）— 相对 f16 经测量确认的死路
 
 Vulkan 后端枚举设备接受的 cooperative-matrix 组件类型，并在启动横幅中报告它们（`f16cm / bf16cm / f8cm / i8cm`）。在 RDNA4（RX 9060 XT / Navi 44、Mesa 26.1.4）上四种均存在；在 RDNA3（7900 XTX）上仅有 f16 + int8。很容易想将量化权重 GEMM 路由到“更快”的 8 位单元。**我们已在真实硬件上构建和测量了全部路径，均未胜过 f16 coopmat GEMM。没有原生低位模型时，不要重新开启此方向。**
 
-- **fp8 (E4M3) coopmat GEMM** — full path built + validated on RDNA4 (per-row
-  activation range-scaling into E4M3's ±448, warp-tiled to match
-  `native_gemm_warp`, per-row descale). Gated opt-in `INFR_F8_COOPMAT=1` (+
-  `INFR_F8_PREPACK=1` for the Q8_0→E4M3 prepack path), default-off. Result:
-  - fp8-with-in-shader-dequant = **0.73×** f16 (pays the SAME Q8_0 dequant f16
-    pays, then adds an activation-scale pass + a descale epilogue).
-  - fp8-with-prepacked-E4M3-weights (dequant removed) ties f16 **exactly**
-    per-op (1024×6144 @ m512: f16 **364.3µs** vs fp8 **364.5µs**), loses on
-    narrow shapes (no split-K/A_GLOBAL variant). So even fully WMMA-bound, RDNA4
-    fp8 gives **no speedup** — these GEMMs measure ~17.6 TF/s
-    (latency/occupancy- bound, well under peak), so a faster MAC can't help, and
-    the identical wide- shape time argues fp8 WMMA ≈ f16 rate here anyway.
-- **int8 coopmat GEMM** — also built (`INFR_I8_COOPMAT=1`, default-off):
-  4.8-5.6× slower raw, amortized to ~0.73× after a store-to-shared per-block
-  rescale epilogue, still loses. Coopmat v1 has no in-flight per-element scale,
-  so block-quant integer matmul pays a rescale tax f16-dequant doesn't. **The
-  principled integer path is dp4a `mmq`** (each thread owns its accumulator →
-  scale-after for free), which is what infr's Q4_K mmq + llama.cpp both use.
-- **coopmat2 (`VK_NV_cooperative_matrix2`) per-element — tested, doesn't rescue
-  int8.** Coopmat2's `coopMatPerElementNV` gives (row,col)-indexed in-fragment
-  element access → apply the per-block rank-1 descale with NO store-to-shared
-  round trip (the "rescale tax" above). Present on RDNA4 RADV behind the driconf
-  flag `radv_cooperative_matrix2_nv=true` (Mesa 26.1.4); glslc compiles it
-  (`GL_NV_cooperative_matrix2`;
-  `void coopMatPerElementNV(out coopmat r, coopmat m, T fn)`). The probe
-  `crates/infr-vulkan/examples/coopmat2_test.rs` (per-element vs the v1
-  store-to-shared epilogue) measures coopmat2 **SLOWER at both scales**:
-  single-tile 2.16 vs 2.24µs (1.04×, noise); **full-GEMM 512×2048×2048 (64
-  rescale blocks, 4096 wg) 1239.8 vs 1195.3µs = 0.964× (coopmat2 slower)**. So
-  removing the rescale tax doesn't help — it was never the bottleneck
-  (store-to-shared is cheap on RDNA4). Example KEPT as a re-test tool; **re-run
-  it if a future Mesa stabilizes/optimizes coopmat2** (it's currently
-  experimental/driconf-gated). Run:
-  `radv_cooperative_matrix2_nv=true cargo run --release -p infr-vulkan --example coopmat2_test`.
-- **bf16 coopmat GEMM** — `native_gemm_warp.comp` `-DBF16CM` variant
-  (`INFR_BF16_COOPMAT=1`, default-off): the PRODUCTION warptile with
-  `bfloat16_t` operands instead of `float16_t` (a `CMTYPE` macro; default build
-  byte-identical, verified via .spv md5), reading bf16 weights exactly (no f16
-  clamp). Its value is **precision faithfulness** — preserves bf16's exponent
-  range instead of clamping to f16 (max 65504). **But it is ~12-27% SLOWER than
-  the f16-clamp path, and that gap is the bf16 WMMA itself, not a missing
-  optimization.** Per-op profiling (RDNA4 Qwen3-0.6B-BF16, pp512, SAME shape +
-  SAME non-A_GLOBAL variant): `native_gemm_warp_bf16` (f16) 769.9µs vs
-  `native_gemm_warp_bf16cm` (bf16) 865.1µs @ 1024×6144 (+12%; +27% on narrow).
-  Identical kernel/staging/ tiling — only the coopmat operand type differs →
-  **RDNA4's `bfloat16_t` coopMatMulAdd runs slower than `float16_t`'s** (likely
-  RADV codegen immaturity for the newer bf16-coopmat path — re-check on a future
-  Mesa — or a real HW rate gap). So bf16-at-f16-speed is NOT achievable here;
-  kept opt-in faithful path, ~12-27% slower. (Retired the standalone
-  `native_gemm_bf16cm.comp`.) **Memory-access gotcha (measured on the
-  standalone):** reading bf16 weights as a native `bfloat16_t[]` SSBO (16-bit
-  loads, "no conversion") ran **~27% SLOWER** than the `dqblk` path that reads
-  32-bit words (`uint nw[]`, 2 bf16/word) + ALU bitcast — narrow 16-bit loads
-  don't coalesce on RADV. Read packed 16-bit weights as 32-bit words, never as a
-  native 16-bit array (same reason the f16 GEMM reads `uint nw[]`).
-- **Why no 8-bit operand swap wins:** on Vulkan/AMD, low-bit-float weights have
-  no native matmul — you always dequant/convert to the WMMA operand type first,
-  and RDNA4's fp8/int8 WMMA doesn't out-rate f16 on inference-shaped GEMMs.
-  **ggml- vulkan does the same thing**: it has no fp8/fp4 weight matmul —
-  MXFP4/NVFP4 dequant to f16 (`ue4m3_to_fp32` scale × `kvalues_mxfp4` codebook)
-  then run the normal f16 coopmat. The only genuine low-bit-float _compute_ win
-  is NVIDIA **Blackwell's block-scaled fp4 MMA**
-  (`mma…kind::mxf4nvf4.block_scale…e2m1.e2m1 …ue4m3` — fp4 operands, fp8 scale
-  applied in the tensor core), which RDNA4 does not expose (no `e2m1` coopmat
-  config). fp8/int8 coopmat stay as gated-off measurement paths; the win, if a
-  low-bit-float model ever needs it, is a native weight format, not an
-  operand-type swap on a dequant-bound GEMM.
+以下保留原RDNA4/Mesa26.1.4实验，不把旧INFR开关当作0.10.0运行时承诺；当前字段查Config参考。
+
+- **fp8 E4M3 coopmat：** 完整路径按行把activation缩放到±448，使用native_gemm_warp同类tile，再按行descale。当时INFR_F8_COOPMAT/INFR_F8_PREPACK默认off。shader内dequant只有f16的0.73x（同样Q8解码外加scale/epilogue）；预打包E4M3去掉dequant后，1024×6144/m512仍364.5µs对f16 364.3µs，窄shape因缺split-K/A_GLOBAL更差。这些GEMM约17.6TF/s，latency/occupancy限制下更快MAC没带来净收益。
+- **int8 coopmat：** 当时INFR_I8_COOPMAT默认off，原始约慢4.8..5.6倍，经shared逐block rescale后仍仅约f16的0.73x。v1没有in-flight逐元素scale；dp4a mmq让每线程拥有accumulator、可后置scale，是不同整数路线。
+- **coopmat2逐元素：** VK_NV_cooperative_matrix2/coopMatPerElementNV在RDNA4 RADV需radv_cooperative_matrix2_nv=true。GL_NV_cooperative_matrix2的`void coopMatPerElementNV(out coopmat r, coopmat m, T fn)`支持row/col fragment访问可去shared rescale往返，但probe仍无收益：single-tile2.16对2.24µs属噪声；512×2048×2048、64 rescale blocks/4096workgroups为1239.8对1195.3µs、0.964x。shared成本不是主要瓶颈。保留crates/infr-vulkan/examples/coopmat2_test.rs作为后续Mesa重测工具，不能据barrier更少翻案。
+
+```bash
+radv_cooperative_matrix2_nv=true cargo run --release -p infr-vulkan --example coopmat2_test
+```
+
+- **bf16 coopmat：** native_gemm_warp的BF16CM变体使用bfloat16_t/CMTYPE，默认SPV字节一致性当时用md5核对。保留bf16指数范围、不clamp到f16的65504，但同shape/non-A_GLOBAL的Qwen3-0.6B BF16/pp512为865.1µs，对f16-clamp769.9µs，宽shape约慢12%、窄约27%。可能是RADV codegen成熟度或硬件率差，未单独证实；因此不能承诺bf16保真且同速。standalone native_gemm_bf16cm已退役。native16-bit bfloat16_t[] SSBO在独立测量中还比uint32双bf16/word+dqblk慢约27%，packed32bit访问对RADV更好，不能把“少转换”当更快。
+- **为什么换8-bit操作数没赢：** 当时Vulkan/AMD low-bit float权重仍需先转WMMA类型；ggml-vulkan的MXFP4/NVFP4也先以UE4M3scale×码本解成f16。原调查对比NVIDIA Blackwell block-scaled fp4 MMA（e2m1操作数、UE4M3scale），RDNA4没有对应e2m1 coopmat配置。这个跨硬件判断保留为当时观察，不是已在本项目采用的新内核。若再研究，须用当前native权重格式、设备能力和matched模型验证，而不是重复dequant-bound GEMM的操作数替换。

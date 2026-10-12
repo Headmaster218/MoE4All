@@ -2,8 +2,9 @@
 kind: guide
 status: current
 scope: serving-api
-last_verified: 2026-09-28
-verified_commit: ed62393068679573afe94a1472454efe7eae0f15
+last_verified: 2026-10-11
+verified_commit: 7b4a9411e9c7524f8dc6ae2603c62d5f338190dc
+baseline_tag: release-0.10.0
 ---
 
 # 使用本地 API
@@ -44,7 +45,7 @@ Invoke-RestMethod -Method Post -Uri "$base/v1/chat/completions" -Headers $header
 
 ## Responses API
 
-0.9.0 提供无状态 `POST /v1/responses`，接受字符串或消息数组形式的 `input`，支持 JSON 响应和 typed SSE：
+0.10.0 提供无状态 `POST /v1/responses`，接受字符串或消息数组形式的 `input`，支持 JSON 响应和 typed SSE：
 
 ```powershell
 $request = @{ model = $chatModel; input = '用一句话解释 Prefill。'; max_output_tokens = 128; stream = $false } | ConvertTo-Json
@@ -86,3 +87,9 @@ $result.data | Select-Object index, @{Name='dimensions';Expression={$_.embedding
 ```
 
 具体可运行组合取决于[模型能力](../../reference/model-capabilities.md)和启动时的内存预算。接口行为以 `crates/infr-server/src/lib.rs` 和 `crates/infr-server/src/responses.rs` 在上述 `verified_commit` 的实现为准。
+
+## 大请求与服务速度
+
+完整 JSON body 上限为 64 MiB，超过返回 413；base64 的体积约比原始图片多三分之一，context token 容量另行检查。图片格式、HEIC/AVIF 解码库及 Embedding 首次载入行为见[图片与 Embedding](images-and-embeddings.md)。
+
+live 表每 1.5 秒刷新，各 slot 与总 Decode 速度均为区间值；完整请求的速度看 `timings`。KV 复用必须对照 `cached_n` 与 `prompt_n`，几十 token 的 suffix Prefill 不能与 30K/150K 全冷吞吐直接比较。

@@ -2,13 +2,15 @@
 kind: development-guide
 status: current
 scope: build-from-source
-last_verified: 2026-10-10
-verification: local-launcher-and-package-tests; Linux-release-CI-pending
+last_verified: 2026-10-11
+verification: source-audit; historical-local-tests; remote-CI-and-GPU-not-checked
+verified_commit: 7b4a9411e9c7524f8dc6ae2603c62d5f338190dc
+baseline_tag: release-0.10.0
 ---
 
 # 从源码构建
 
-Linux x86_64 的发包 CI 已加入；首次完整 CI 与 GPU 验收尚待执行。源码构建与运行见
+Linux x86_64 发包 workflow 已加入，已有本地构建和包夹具记录；本轮未查询线上 CI 结果或进行真实 Linux GPU 验收。源码构建与运行见
 [在 Linux 上构建并运行](../guide/linux-build-and-run.md)。
 
 ## 前置条件
@@ -67,7 +69,7 @@ RUSTFLAGS="-C target-cpu=x86-64" cargo build --release --locked -p infr-cli
 `.github/workflows/release-linux.yml` 在 Ubuntu 22.04 构建，目标为 Linux x86_64、
 glibc 2.35+，独立构建 shaderc 2026.3 并覆盖 `target-cpu=native`。不适用于 Alpine/musl、
 ARM64 或旧于该 glibc 的系统。AVX2 + FMA3 的 CPU-miss 内核仍由运行时检测后启用。
-首次 CI 实际执行前，以上是构建目标而非已通过的跨发行版验收。
+以上兼容范围来自 workflow 的构建目标；本轮不据此宣称已通过跨发行版验收。本地 WSL 包的 glibc 2.39 与 CI 目标 2.35 要区分，详见[解码库与整包验证记录](../evidence/audits/2026-10-10-image-codec-package-size.md)。
 
 构建后打包（版本必须与 `infr --version` 相同）：
 

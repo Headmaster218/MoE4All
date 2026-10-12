@@ -2,13 +2,17 @@
 kind: index
 status: current
 scope: change-history
-last_verified: 2026-09-28
-verified_commit: ed62393068679573afe94a1472454efe7eae0f15
+last_verified: 2026-10-11
+verified_commit: 7b4a9411e9c7524f8dc6ae2603c62d5f338190dc
+baseline_tag: release-0.10.0
 ---
 
 # 改进与变化记录
 
-这里记录某一阶段为何选择、修正或否决一种实现。日期、提交和设备只约束该阶段；**当前行为以[架构](../../architecture/README.md)为准**。`preserved_in_tag` 只表示该技术记录存在于 tag 时，不表示正文每一阶段都由 tag 实测验证；历史计划中的“当前”不能作为 0.9.0 能力断言。
+- [0.9.0 → 0.10.0 全提交变化](2026-10-release-0.10.0.md)
+- [DSH 来源与本地改造迁移](product/dsh-source-and-local-migration.md)
+
+这里记录某一阶段为何选择、修正或否决一种实现。日期、提交和设备只约束该阶段；**当前行为以[架构](../../architecture/README.md)为准**。`preserved_in_tag` 只表示该技术记录存在于 tag 时，不表示正文每一阶段都由 tag 实测验证；历史计划中的“当前”不能作为 0.10.0 能力断言。
 
 ## 演化与反例
 

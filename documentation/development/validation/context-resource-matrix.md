@@ -2,8 +2,9 @@
 kind: validation-method
 status: current
 scope: windows-context-resource-matrix
-last_verified: 2026-09-28
-verified_commit: ed62393068679573afe94a1472454efe7eae0f15
+last_verified: 2026-10-11
+verified_commit: 7b4a9411e9c7524f8dc6ae2603c62d5f338190dc
+baseline_tag: release-0.10.0
 ---
 
 # 长上下文资源矩阵
@@ -64,3 +65,9 @@ infr __test-plan-prompt MODEL --messages template.json --target 32768 --output p
 ```
 
 它仅打开 GGUF 元数据和模型分词器，从不构造 GPU 后端。该辅助工具渲染与 `serve` 相同的聊天模板，恰好替换一个 `{{INFR_FILLER}}` 标记，并寻找不超过目标值的最接近提示词深度。
+
+## 测试缓存管理
+
+所有新测试和 benchmark 的主 KV、MTP sidecar 与元数据放在仓库根 `test-kv-cache/`，各 run 的日志与结果仍放 `benchmark-data/`。缓存跨兼容运行复用，总滚动预算为 30 GiB，包含所有嵌套目录和并行测试，不是每服务各 30 GiB。
+
+开始测试前与写入后统计总量；超额时按完成条目的保存时间从旧到新成组清理主 KV、sidecar 和元数据，读写中的条目不得删除。活跃条目妨碍清理时停止新增缓存。清理前确认解析路径在 `test-kv-cache/` 内，拒绝 reparse point；生产 `kv-sessions/` 不参与测试缓存管理。旧 evidence 的测试缓存位置和额度只保留为当时条件，不用于新测试。

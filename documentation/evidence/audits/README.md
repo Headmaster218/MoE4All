@@ -2,11 +2,14 @@
 kind: index
 status: current
 scope: audits
-last_verified: 2026-09-28
-verified_commit: ed62393068679573afe94a1472454efe7eae0f15
+last_verified: 2026-10-11
+verified_commit: 7b4a9411e9c7524f8dc6ae2603c62d5f338190dc
+baseline_tag: release-0.10.0
 ---
 
 # 审计
+
+- [2026-10-11：0.10.0 文档与提交覆盖核对](2026-10-11-documentation-0.10.0.md)
 
 - [2026-07-21 代码库审计](2026-07-21-codebase-audit.md)
 - [2026-08-11 Vulkan 多厂商审查](2026-08-11-vulkan-multivendor-review.md)

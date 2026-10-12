@@ -2,8 +2,9 @@
 kind: guide
 status: current
 scope: windows-release
-last_verified: 2026-09-28
-verified_commit: ed62393068679573afe94a1472454efe7eae0f15
+last_verified: 2026-10-11
+verified_commit: 7b4a9411e9c7524f8dc6ae2603c62d5f338190dc
+baseline_tag: release-0.10.0
 ---
 
 # Windows 快速开始
@@ -32,7 +33,9 @@ Start-INFR-Wizard.cmd
 3. 自动配置：保守。
 4. 上下文和高级选项先保留默认。
 
-向导会显示最终命令。确认 GPU、上下文、RAM/VRAM 预算和模型路径后再启动。
+0.10.0 向导可直接复用上次设置；重新配置时先选择模型与可选 MTP、Vision、Embedding，再列出 Vulkan GPU。自动档也询问并发槽位和上下文，默认 KV 为 Q8；手动档才展开资源、splitter 与 profiler。向导默认每轮最大生成量为 65536，与直接 CLI 的模型采样默认值不同。
+
+向导会显示最终命令。确认 GPU、上下文、RAM/VRAM 预算和模型路径后再启动。Windows CMD 只为本次 PowerShell 子进程设置执行策略，不修改系统全局设置。正常更新检查后仍由用户决定是否更新，已有引擎运行时不能覆盖其文件。
 
 ## 三种入口
 
@@ -46,7 +49,7 @@ API 默认使用 loopback。对局域网开放时应设置 Bearer API key，不�
 
 CLI 的 `infr pull` 可预先下载模型；`run` 和 `serve` 遇到未缓存的 Hugging Face 引用也会自动拉取。模型参数可以是本地 GGUF 路径，或 `org/repo[:quant]`、`org/repo:filename.gguf`；`hf:` 和 `huggingface:` 前缀可省略。未指定量化时默认选择 `Q4_K_M`。分片 GGUF 仍须保持同组文件完整。
 
-下载使用标准 Hugging Face Hub 缓存，而非另建一份模型仓库：位置依次由 `HF_HUB_CACHE`、`HF_HOME/hub`、系统 cache 目录下的 `huggingface/hub` 决定。受限仓库可通过 `HF_TOKEN` 授权。路径和选择规则以 0.9.0 的 `infr-hub` 实现为准；不要把旧计划中的 Unix `~/.cache` 写法当作 Windows 的固定路径。
+下载使用标准 Hugging Face Hub 缓存，而非另建一份模型仓库：位置依次由 `HF_HUB_CACHE`、`HF_HOME/hub`、系统 cache 目录下的 `huggingface/hub` 决定。受限仓库可通过 `HF_TOKEN` 授权。路径和选择规则以 0.10.0 的 `infr-hub` 实现为准；不要把旧计划中的 Unix `~/.cache` 写法当作 Windows 的固定路径。
 
 ## 自动策略
 
@@ -55,6 +58,12 @@ CLI 的 `infr pull` 可预先下载模型；`run` 和 `serve` 遇到未缓存的
 - **手动**：用于固定实验条件；显式 RAM、VRAM、Ubatch 和 submit 设置优先于自动策略。
 
 RAM 自动预算启动时冻结；显式值优先。ubatch 可按实际放置能力下调；iGPU 有单独的较小默认值，并发 ubatch 未显式指定时继承该次选出的值。这些预算不是最终专家缓存大小，固定分配后的真实显存余量仍会决定 arena。
+
+Windows Intel Xe1 自动模式另有 75% / 85% VRAM cap；其他 GPU 不套用。MTP 在向导中默认使用 greedy，双槽位默认是机会式 MTP；详见[配置参考](../reference/configuration.md)。
+
+## 实验性 CPU miss
+
+默认关闭。开启后向导询问 1–3 个 miss 上限与物理计算核数，默认 `max(1, 总物理核数 - 2)`。它只覆盖特定 Qwen3.8 scalar Decode 的完整 RAM 专家，不是通用 CPU/GPU 混合推理；不符合条件仍由 GPU 计算。5600X 上没有验收出稳定净提速，使用方法与限制见[CPU miss 指南](cpu-miss.md)。
 
 ## 继续阅读
 

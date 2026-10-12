@@ -2,8 +2,9 @@
 kind: release-validation
 status: current
 scope: windows-long-context
-last_verified: 2026-09-28
-verified_commit: ed62393068679573afe94a1472454efe7eae0f15
+last_verified: 2026-10-11
+verified_commit: 7b4a9411e9c7524f8dc6ae2603c62d5f338190dc
+baseline_tag: release-0.10.0
 ---
 
 # 发版前长上下文验证手册
@@ -15,6 +16,8 @@ verified_commit: ed62393068679573afe94a1472454efe7eae0f15
 测试矩阵的实现与参数说明见 [context-resource-matrix.md](../validation/context-resource-matrix.md)。
 
 ## 验证目标
+
+这份 9-case 资源矩阵是门禁方法，不意味着本轮或 final tag 已重新通过。0.10.0 发布前另有[12-cell 性能矩阵](../../evidence/benchmarks/2026-10-09-release-0.10.0-matrix.md)，两者不能互相代替。新增回归还要覆盖 mixed batch sampling suffix、idle SSD spill overlap、Vision/Embedding shared pool、MTP gates 和 native 图片解码；Linux 门禁单独记录。
 
 在真实模型、真实 API 多轮对话和真实动态 KV 增长下，确认以下内容：
 
@@ -157,3 +160,9 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
 
 最终汇报应简短列出提交/版本、9 项通过情况、峰值资源摘要、总耗时，以及过程中是否
 修复过小问题。若没有全部通过，不得称为发版通过。
+
+## 测试缓存管理
+
+所有新测试和 benchmark 的主 KV、MTP sidecar 与元数据放在仓库根 `test-kv-cache/`，各 run 的日志与结果仍放 `benchmark-data/`。缓存跨兼容运行复用，总滚动预算为 30 GiB，包含所有嵌套目录和并行测试，不是每服务各 30 GiB。
+
+开始测试前与写入后统计总量；超额时按完成条目的保存时间从旧到新成组清理主 KV、sidecar 和元数据，读写中的条目不得删除。活跃条目妨碍清理时停止新增缓存。清理前确认解析路径在 `test-kv-cache/` 内，拒绝 reparse point；生产 `kv-sessions/` 不参与测试缓存管理。旧 evidence 的测试缓存位置和额度只保留为当时条件，不用于新测试。

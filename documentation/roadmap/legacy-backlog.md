@@ -1,3 +1,12 @@
+---
+kind: historical-backlog
+status: historical
+scope: legacy-engine-research
+preserved_in_tag: release-0.10.0
+---
+
+本页保存早期问题和调查现场，不代表 0.10.0 全部仍未解决。新增或关闭事项按[版本变化](../evidence/changes/2026-10-release-0.10.0.md)与当前架构判断，不改写历史测量。
+
 # 待办事项
 
 这里记录的是有意暂缓的已知事项，并保留了足够的背景，方便后续接手。

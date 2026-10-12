@@ -1,39 +1,10 @@
-# MoE4All Harness development environment
+# MoE4All Agent 源码入口
 
-This directory keeps the maintained DSH source and bundled plugins separate from the production DSH Desktop installation.
+完整说明统一在 documentation：
 
-- `dsh/` is the `dsh-v0.1.1-rc.2` source checkpoint maintained in `Headmaster218/dsh-moe4all`.
-- `plugins/` contains independent MoE4All plugin repositories.
-- `distribution/` contains the sanitized product profile and portable overrides.
-- `inventory.md` records the imported upstream versions and local changes that still need migration.
-- `dev-state/` is an ignored, isolated `DSH_HOME`. It never points at the production home.
-- `runtime/` is an ignored Node and pnpm toolchain used for repeatable local runs.
+- [当前产品架构](../documentation/architecture/product/agent-distribution.md)
+- [构建与隔离运行](../documentation/guide/agent-development.md)
+- [来源与本地改造迁移](../documentation/evidence/changes/product/dsh-source-and-local-migration.md)
+- [发行剩余工作](../documentation/roadmap/agent-distribution.md)
 
-Each maintained repository starts with an exact upstream source checkpoint. Upstream commit history is intentionally not imported; each repository's `UPSTREAM.md` records the original repository, release or commit, license, and attribution before MoE4All changes begin. The root repository pins the tested combination through Git submodules.
-
-There are two user-facing entry points. Double-click the first one after cloning or after changing DSH or plugin source:
-
-```text
-harness\1-Build-or-Initialize.cmd
-```
-
-It initializes the isolated profile when needed, builds DSH, packs every local plugin, and installs the resulting packages into that profile. It does not start DSH.
-
-Double-click the second one when you only want to start the already-built development harness:
-
-```text
-harness\2-Start.cmd
-```
-
-The equivalent PowerShell commands are:
-
-```powershell
-.\harness\scripts\Build-DevHarness.ps1
-.\harness\scripts\Run-DevHarness.ps1
-```
-
-The build command preserves the existing isolated configuration. Use `Build-DevHarness.ps1 -RefreshConfig` only when you intentionally want to copy the current production settings into it again.
-
-The initializer copies settings, credentials, the profile patch, and the workspace registry. It deliberately does not copy sessions, attachments, session projection caches, installed `node_modules`, or remote-device authorization state. Existing workspace records continue to point at their real directories; project files are not duplicated.
-
-Do not copy a live DSH profile into this source tree. Credentials, sessions, memory databases, logs, attachments, machine-specific URLs, and personal workspaces are user data rather than source.
+请使用干净 Agent 初始化入口；旧 DevHarness 会复制本机设置与凭据，不适合制作公共发行物。

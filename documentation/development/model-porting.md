@@ -2,13 +2,14 @@
 kind: development-guide
 status: current
 scope: gguf-model-porting
-last_verified: 2026-09-28
-verified_commit: ed62393068679573afe94a1472454efe7eae0f15
+last_verified: 2026-10-11
+verified_commit: 7b4a9411e9c7524f8dc6ae2603c62d5f338190dc
+baseline_tag: release-0.10.0
 ---
 
 # 接入新的 GGUF 模型家族
 
-0.9.0 的模型家族不是运行时插件：GGUF 元数据进入 `infr-llama` 的 `Config`，再由权重绑定与共享 runner 选择图分支。先建立可检验的 CPU 数值路径，再处理 Vulkan/Metal；否则构图错误与 shader 错误难以分辨。当前边界见[模型执行路径](../architecture/models/runtime-families.md)。
+0.10.0 的模型家族不是运行时插件：GGUF 元数据进入 `infr-llama` 的 `Config`，再由权重绑定与共享 runner 选择图分支。先建立可检验的 CPU 数值路径，再处理 Vulkan/Metal；否则构图错误与 shader 错误难以分辨。当前边界见[模型执行路径](../architecture/models/runtime-families.md)。
 
 1. **检查真实 GGUF。** 导出元数据和张量目录，记录 `general.architecture`、键名、dtype、shape、chat template 和特殊 token。与最接近的已支持家族比较，不根据模型名称猜架构字符串。
 2. **固定参照实现。** 阅读匹配版本的 llama.cpp 模型 builder 与转换器，将差异分为“仅元数据”“权重名称/形状”或“需要新算子”。参考实现、GGUF 文件与转换器版本都写入验收记录。

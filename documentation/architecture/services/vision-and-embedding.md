@@ -2,8 +2,9 @@
 kind: architecture
 status: current
 scope: auxiliary-engines
-last_verified: 2026-09-28
-verified_commit: ed62393068679573afe94a1472454efe7eae0f15
+last_verified: 2026-10-11
+verified_commit: 7b4a9411e9c7524f8dc6ae2603c62d5f338190dc
+baseline_tag: release-0.10.0
 ---
 
 # 视觉与嵌入
@@ -26,6 +27,10 @@ VRAM pool。它们不能绕过资源管理器再建立一份不可见的 GPU 模
 
 不支持的 projector/deepstack 或远程 HTTP image URL 应明确失败，避免静默降级和 SSRF 面。
 
+输入按文件内容识别 PNG、JPEG、WebP、GIF、BMP、TIFF、ICO；HEIC/AVIF 使用发行包随带的 `image-codecs/` 动态解码库。动态图像路径不是视频推理，只处理解码出的静态帧/主图像。HEIC/AVIF 原生解码限制为压缩输入不超过 256 MiB、每边不超过 8192、总像素不超过 64 × 1024²；HTTP 输入仍先受 64 MiB body 限制。解码后按 `MAX_PATCHES=4096` 进行 smart resize；不代表先无界解码再缩小。
+
+解码库从引擎可执行文件旁定位；源码测试可用绝对路径 `INFR_IMAGE_CODEC_DIR`。缺库、无 decoder 或非法 payload 明确报错，日志包含猜测格式和 magic 摘要；不抓取远程 URL。格式支持不意味着支持任意 mmproj，详见[图片与 Embedding 使用](../../guide/serving/images-and-embeddings.md)。
+
 ## 嵌入
 
 原生 Embedding engine 与 llama.cpp compatibility worker 共享一个上层 contract。原生 Vulkan 模式可以：
@@ -39,4 +44,7 @@ VRAM pool。它们不能绕过资源管理器再建立一份不可见的 GPU 模
 
 - Active LLM、Vision 和 Embedding request 都通过统一 owner/lease 保护资源。
 - 辅助模型不能回收正在执行的 LLM/MTP runtime range 或 frozen Expert slot。
-未来 Agent 插件如何接入 Embedding 由[Agent 发行版提案](../../roadmap/agent-distribution.md)定义；本页只描述 0.9.0 引擎的共享显存行为。
+- auxiliary workspace 在其执行期间保留 owner lease；权重 idle eviction 与临时 scratch 回收分别处理。
+- state transfers 和 staging-ring recording 与主 Recorder 共用执行门；避免只锁 command-buffer alloc/free、却让 recording lifetime 重叠。
+
+Agent 插件通过 Provider/API 接入，见[产品架构](../product/agent-distribution.md)。本页的共享显存边界对应 0.10.0 引擎；并发视觉的历史崩溃与修复见[事故记录](../../evidence/incidents/INC-20261009-vulkan-aux-command-pool.md)。

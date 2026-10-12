@@ -2,8 +2,10 @@
 kind: guide
 status: current
 scope: linux-build
-last_verified: 2026-10-10
+last_verified: 2026-10-11
 verification: launcher-and-package-fixtures; Linux-GPU-and-release-CI-pending
+verified_commit: 7b4a9411e9c7524f8dc6ae2603c62d5f338190dc
+baseline_tag: release-0.10.0
 ---
 
 # 在 Linux 上构建并运行
@@ -118,7 +120,7 @@ bash ./Start-INFR-Wizard-Linux.sh --update
 只替换发行包管理的文件，保留模型、`infr.toml`、保存设置和 `kv-sessions/`。
 检测到引擎仍运行时拒绝替换。替换/新引擎版本检查失败会回滚；成功后需重新运行向导。
 回滚覆盖更新进程内的失败，不承诺断电或进程被强杀后的事务恢复。
-首次 CI 发包、真实 Linux 更新和 GPU 推理尚未验收，当前本地验证为脚本与包夹具测试。
+已有本地脚本、整包与 codec 测试记录；本轮未核验线上 CI 发包、真实 Linux 更新或 GPU 推理，不能用源码存在代替这些验收。
 
 ## 直接用 CLI
 

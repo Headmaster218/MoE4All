@@ -2,13 +2,16 @@
 kind: reference
 status: current
 scope: configuration
-last_verified: 2026-09-28
-verified_commit: ed62393068679573afe94a1472454efe7eae0f15
+last_verified: 2026-10-11
+verified_commit: 7b4a9411e9c7524f8dc6ae2603c62d5f338190dc
+baseline_tag: release-0.10.0
 ---
 
 # 配置 infr
 
-infr 只有一个配置值：启动时从四个层级解析一次，然后显式传递给后端和会话。每个调节项都是 `infr_core::config::Config` 上的类型化字段；没有任何部分会在背后读取环境变量。
+完整字段、类型及构造默认值见[261 项 Config 默认值表](configuration-defaults.md)；本页说明解析、覆盖与使用语义。
+
+infr 使用一个配置对象：启动时从四个层级解析一次，然后显式传递给后端和会话。每个调节项都是 `infr_core::config::Config` 上的类型化字段；运行时调节项由它集中解析；构建、测试和动态解码库发现等例外见本页末尾。
 
 带注释的起始配置位于 [`infr.example.toml`](../../infr.example.toml)。
 
@@ -143,7 +146,7 @@ infr run "$M" "hi" --set kv.type_k=q8_0 --set kv.type_v=q8_0
 | `--no-think` / `--think` | `sampling.no_think` | `INFR_NO_THINK` |
 | `--reasoning-effort`      | `sampling.reasoning_effort` | — |
 
-`device.threads` 没有 `INFR_*` 对应项；它以 `RAYON_NUM_THREADS` 发布，因为 rayon 的全局线程池没有其他输入。
+`device.threads` 没有 `INFR_*` 对应项；它经 `RAYON_NUM_THREADS` 影响通用 CPU 工作池。CPU miss 的私有物理 worker 数另由 `kernels.vulkan.cpu_miss_threads` 设置，两者不能混用。
 
 ## 可调节项
 
@@ -165,17 +168,19 @@ infr run "$M" "hi" --set kv.type_k=q8_0 --set kv.type_v=q8_0
 
 **`[paging]`** — MoE 专家缓存和稠密层流式加载：`cache` 设置分页 VRAM 预算（即使权重本可容纳也会强制分页），`ring` 覆盖上传暂存环，`stats` 输出每个池的命中/未命中/驱逐次数。`paging.cache` / `INFR_CACHE` 为兼容性保留为专家/稠密内存区覆盖值，但超过统一总内存预算时会被限制。
 
-**`[kernels]`** — 两个与后端无关的图形状门控（`qkv_fuse`、`gated_rmsnorm`）以及每个后端的一个子节。其下的所有项都是内核**层级**覆盖：引擎会选择设备支持的最佳层级，而这些设置用于在二分定位正确性或性能问题时强制禁用某一层级。
+**`[kernels]`** — 图形状门控（`qkv_fuse`、`gated_rmsnorm`、`delta_ab_fuse`、`qwen_hc_down_inject`、`ple_single_parallel`）以及每个后端的一个子节。其下的所有项都是内核**层级**覆盖：引擎会选择设备支持的最佳层级，而这些设置用于在二分定位正确性或性能问题时强制禁用某一层级。
 
-- **`[kernels.vulkan]`**（最大节，62 个键）：能力掩码（`coopmat`、`f16`、`i8_dot`、`coopmat_8x8`、`i8_coopmat`）、GEMM/GEMV 层级（`gemm_warp`、`mmq`、`mmv`、`mrow`、`moe_small_m`、`[kernels.vulkan.gemv]` 子表）、注意力（`flash_warp`、`flash_splits`、`flash_min_rows`、`pv_splits`）、DeltaNet（`dn_chunk_scan`、`dn_chunk`、`dn_split`）以及管线开关（`push_desc`、`pipeline_cache_disk`、`no_replay`、`no_vram_guard`、BDA 块上限）。注意：无论 `coopmat` 为何值，`f16 = false` 都会禁用 coopmat，与当前 `INFR_NO_F16` 的效果一致。
+- **`[kernels.vulkan]`**（完整字段以 `Config::all_paths()` 为准）：能力掩码（`coopmat`、`f16`、`i8_dot`、`coopmat_8x8`、`i8_coopmat`）、GEMM/GEMV 层级（`gemm_warp`、`mmq`、`mmv`、`mrow`、`moe_small_m`、`[kernels.vulkan.gemv]` 子表）、注意力（`flash_warp`、`flash_splits`、`flash_min_rows`、`pv_splits`）、DeltaNet（`dn_chunk_scan`、`dn_chunk`、`dn_split`）以及管线开关（`push_desc`、`pipeline_cache_disk`、`no_replay`、`no_vram_guard`、BDA 块上限）。注意：无论 `coopmat` 为何值，`f16 = false` 都会禁用 coopmat，与当前 `INFR_NO_F16` 的效果一致。
 - **`[kernels.metal]`** — Apple 后端按 dtype 区分的原生/CMM/RT 内核家族，以及 `deltanet`、`moe` 和 `pipeline_cache`（将编译后的 `MTLComputePipelineState` 作为 `MTLBinaryArchive` 持久化到 `~/.cache/infr`，这样每次启动无需为每个内核重新运行驱动的 AIR → GPU-ISA 后端；MSL → AIR 前端不可缓存，仍会在每次启动时运行）。与 `kernels.cpu.reference` 一样，它没有 `INFR_*` 对应项。
 - **`[kernels.cpu]`** — `spin`（自旋池空闲上限）、`spinpool`、`repack_mb` 和 `reference`（位参考内核路径，没有也从未有过 `INFR_*` 对应项）。`repack_mb` 同样是兼容名称；其数值表示 MiB。
 
-**`[spec]`** — MTP / 推测式解码：`mtp`、`k`、`decode_chain`、`draft`（草稿模型路径）以及 GPU 侧采样步骤（`gpu_argmax`、`gpu_sample`、`gpu_embed` 等）。MTP 当前已搁置；参见 README。
+**`[spec]`** — MTP / 推测式解码：`mtp`、`k`、`decode_chain`、`draft`（草稿模型路径）以及 GPU 侧采样步骤（`gpu_argmax`、`gpu_sample`、`gpu_embed` 等）。Qwen3.8 MTP 可用；Qwen3.5/3.6 的旧 MTP 门控与此不同，不得据旧历史页断言全部 MTP 停用。Qwen3.8 的 `spec.k` 在传统单请求路径裁剪为 2–4 个 VERIFY rows；并发调度器固定 4 rows。VERIFY rows 含一个已确定的 leading token，默认 4 rows 实际核验 3 个 draft 候选。
+
+`spec.mtp_context=32768` 限制 detached head 的滑动注意力/KV horizon，不缩小 target context；`spec.mtp_max_context=49152` 是 `ParallelSeam` 的收益 cutoff，0 禁用 cutoff；传统单请求路径不读取该 cutoff。`spec.mtp_concurrent=false` 默认让多路 active work 走普通 batch，true 才启用双路接受率探测。详情见[MTP 架构](../architecture/runtime/qwen38-mtp.md)。
 
 **`[multi]`** — 多 GPU 切分：`pipeline`、`tensor_parallel`（两者均需要 ≥ 2 个设备）和 `expert_parallel`（≥ 1）；设备过少是硬错误。三个 `*_p2p` 标志选择 GPU 到 GPU 的传输（默认 `true`），而非经由主机 RAM 暂存。
 
-**`[prof]`** — 每个键均为 `INFR_PROF_*`，且都可通过三种方式设置（环境变量、`--set prof.<name>=…` 或文件中的 `[prof]` 节）：
+**`[prof]`** — 通过 `--set prof.<name>=…` 或文件中的 `[prof]` 节设置；部分历史字段有 `INFR_PROF_*` 环境别名，timeline/CPU miss 样本等新增字段应以 manifest 为准，不能由字段名自动推导环境变量：
 
 | 调节项                | 作用                                                                                                            |
 | ------------------- | ----------------------------------------------------------------------------------------------------------------------- |
@@ -192,7 +197,7 @@ infr run "$M" "hi" --set kv.type_k=q8_0 --set kv.type_v=q8_0
 
 **`[serve]`** — `api_key`（Bearer 令牌；**空**值表示不鉴权，它限制 `/v1/chat/completions`、`/v1/responses`、`/v1/embeddings` 和 `/v1/models`，但从不限制 `/health`）、`max_tokens_cap`、`request_timeout_secs`（单个请求以秒计的实际时钟期限；默认值 `0` 表示无期限。期限会截断本来合法但较慢的回复，因此为选择启用）以及 `stats_interval_secs`（`INFR_SERVE_STATS_SECS`，控制服务器记录汇总吞吐量和每请求进度的频率；默认 `5`，`0` 关闭周期性行）。`shutdown_file`（`INFR_SHUTDOWN_FILE`）是可选的监督器 IPC 路径：创建该文件会请求与 SIGTERM 相同的优雅排空，包括模型加载期间。`embedding_runner`（`INFR_EMBEDDING_RUNNER`）可选择受管理的 llama-server 可执行文件；否则 INFR 会从自身目录、`PATH` 或 LM Studio 中发现兼容运行器。每请求采样不在此处，仍保留在请求中。
 
-汇总 `serve stats` 行仅在**有活动时**输出：无事件的区间不输出任何内容，因此空闲服务器会留下干净日志，且不会出现可能被误认为负载的心跳。它的 `prefill_tps`/`decode_tps` 是整个服务器的模型 token 数除以该区间的实际时钟时间，而非累计值。每个活跃请求还会在完成预填充块时及解码期间输出受限频率的 `request progress` 行。它报告精确的模型 token `context_tokens/context_limit`、未缓存预填充进度、缓存前缀、已生成 token（包含推理）和请求本地速率。即使禁用周期性行，阶段变化和 `request done` 仍会记录。请求日志**仅包含计数，绝不包含提示词文本**。
+汇总 `serve stats` 行仅在**有活动时**输出：无事件的区间不输出任何内容，因此空闲服务器会留下干净日志，且不会出现可能被误认为负载的心跳。它的 `prefill_tps`/`decode_tps` 是整个服务器的模型 token 数除以该区间的实际时钟时间，而非累计值。每个活跃请求还会在完成预填充块时及解码期间输出受限频率的 `request progress` 行。终端 dashboard 每 1.5 秒独立刷新，各 slot 与 total Decode Speed 使用该区间的增量；Prefill 展示按 chunk 做平滑估算。完整请求均速应查最终 API timings。它报告精确的模型 token `context_tokens/context_limit`、未缓存预填充进度、缓存前缀、已生成 token（包含推理）和请求本地速率。即使禁用周期性行，阶段变化和 `request done` 仍会记录。请求日志**仅包含计数，绝不包含提示词文本**。
 
 成功的非流式响应和流式响应的终止完成帧，均包含权威的 `usage` 及 llama.cpp 兼容的 `timings` 对象。`timings.context_n` 是完整提示词加补全深度，`context_limit` 是 KV 槽位容量，`cached_n` 将复用的提示词 token 与实际评估的 `prompt_n` token 区分开来。流式指标无条件输出，因此未发送 `stream_options.include_usage` 的客户端不会静默记录零 token。
 
@@ -208,16 +213,45 @@ Responses API 只接受 plain text 与默认 `text.verbosity="medium"`；`low`/`
 
 **`[debug]`** — 填毒/屏障/转储开关：`coopmat`（输出枚举到和选定的 coopmat 形状，对 Intel Arc 很有用）、`bda_chunk`、`wide_dispatch`、`chat`、`moe_counts`、`moe_counts_dump`、`poison_uninit`、`no_barrier`、`full_barrier`。
 
+## 0.10.0 新增的运行时调节项
+
+这些配置路径可通过 TOML / `--set` 使用；不保证各自存在环境变量别名，以 manifest 为准。
+
+| 路径 | 默认值 | 用途与边界 |
+| --- | --- | --- |
+| `paging.prefill_cross_chunk` | `true` | 跨 Prefill chunk 上传下一开头层，不提前计算 |
+| `kernels.vulkan.qsa_prefill_gqa` / `qsa_prefill_tile` | `12` / `32` | Qwen3.8 GQA12 / Flash32；不符合形状回退 |
+| `kernels.vulkan.qsa_prefill_coopmat` / `qsa_prefill_coopmat_pv` | `true` / `true` | 能力满足时使用 f16 coopmat QK / PV |
+| `kernels.vulkan.qsa_score_tile` | `32` | 8-query indexer tile；支持 32/64，其他值回退 |
+| `kernels.vulkan.qsa_prepare_fused` | `false` | 实验性 prepare fusion，未设为默认 |
+| `kernels.vulkan.gemv.id_grid_buffer` / `id_grid_buffer_nr` | `none` / `4` | 测得的 Windows RDNA3 小行 IQ2_S/IQ3_S 码本路径 |
+| `kernels.vulkan.decode_down_overlap` | `none` | 测得的深上下文 2/3-row Down promotion overlap |
+| `kernels.vulkan.decode_sparse_lut` / `decode_early_submit` | `none` / `none` | 测得的 Qwen3.8 ordinary Decode 自动门控 |
+| `kernels.vulkan.qsa_topk_scan` | `none` | 测得的 RDNA3 parallel top-512 exact prefix scan |
+| `kernels.vulkan.cpu_miss_threads` / `cpu_miss_max` | `0` / `1` | opt-in 物理核数 / 1–3 miss 上限 |
+| `kernels.vulkan.cpu_miss_iq3` | `false` | IQ3_S CPU 路径的诊断开关 |
+| `kernels.vulkan.cpu_miss_spin` / `cpu_miss_poll` | `16384` / `0` | 私有 worker spin 次数 / coordinator polling |
+| `prof.timeline_path` | `none` | 有界异步 Decode timeline JSON |
+| `prof.timeline_skip_steps` / `timeline_steps` | `64` / `16` | 初始跳过步数 / 每窗口采集步数 |
+| `prof.timeline_stride` / `timeline_windows` / `timeline_lanes` | `128` / `12` / `0` | 窗口间隔 / 窗口上限 / cohort 过滤；0 为任意 lanes |
+| `prof.cpu_miss_fixture_dir` | `none` | 一次性本地 CPU miss 诊断样本目录 |
+
+CPU miss 的 `early_submit`、`input_tap`、`direct_result`、`host_result`、`idle_park`、`token_park`、`push`、`validate`、`split_acc`、`grouped_dot`、`flush_denormals` 均以 `kernels.vulkan.cpu_miss_` 为前缀，默认 false。向导选择开启时另注入 `push=true`、`host_result=true`、`token_park=true`、`spin=262144`；不能将向导组合误写成 Config 默认值。见[CPU miss 使用](../guide/cpu-miss.md)和[timeline 方法](../development/performance/decode-timeline.md)。
+
+Windows Intel Xe1 无显式 VRAM 约束时的额外 cap 是总显存 75% / 85%，且仍受当前物理余量约束；它不修改用户明确给出的预算。
+
 ## 有意不属于配置的 `INFR_*` 键
 
-有四个键继续直接读取环境变量，原因是运行时 `Config` 无法解决：
+以下键继续直接读取环境变量，原因是运行时 `Config` 无法解决：
 
 | 键                        | 原因                                                                                                                                         |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `INFR_IMAGE_CODEC_DIR` | 源码/测试覆盖解码库目录，必须为绝对路径；默认从可执行文件旁的 `image-codecs/` 加载，不属于推理 Config。 |
+| `INFR_IMAGE_CODEC_FIXTURES` | ignored 原生图片解码一致性测试的固件目录。 |
 | `INFR_PROFILE`             | **构建时**输入：由 core/cpu/gguf/llama/vulkan 中的 `build.rs` 读取以设置 `cfg(infr_profile)`。读取时不存在运行时值。 |
-| `INFR_TEST_GGUF`           | 测试固件：将 `infr-gguf` 的测试指向磁盘上的 `.gguf`。                                                                              |
-| `INFR_TEST_MODEL`          | 测试固件：覆盖由模型支持的测试的 HF 缓存查找。                                                                     |
-| `INFR_LLAMA_DIFFUSION_CLI` | 开发固件：将 `infr compare` 指向磁盘上的 `llama-diffusion-cli` 二进制文件。                                                               |
+| `INFR_TEST_GGUF`           | 测试样本：将 `infr-gguf` 的测试指向磁盘上的 `.gguf`。                                                                              |
+| `INFR_TEST_MODEL`          | 测试样本：覆盖由模型支持的测试的 HF 缓存查找。                                                                     |
+| `INFR_LLAMA_DIFFUSION_CLI` | 开发样本：将 `infr compare` 指向磁盘上的 `llama-diffusion-cli` 二进制文件。                                                               |
 
 有两点相关说明。`INFR_DIFFUSION_VISUAL` 也不是 `Config` 字段；由于它只控制 CLI 呈现，已变为普通标志 `infr run --diffusion-visual`，其 clap `env =` 回退保持旧拼写可用。`INFR_CPU` / `INFR_METAL` 已**废弃**：它们已作为后端选择器移除，且没有别名。请使用 `--dev cpu` / `--dev metal`，或 `INFR_DEV=cpu` / `INFR_DEV=metal`。
 

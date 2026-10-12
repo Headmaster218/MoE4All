@@ -2,10 +2,14 @@
 kind: development-guide
 status: mixed
 scope: benchmarking-methods
-source_checkpoint: release-0.9.0
+source_checkpoint: release-0.10.0
+last_verified: 2026-10-11
+verified_commit: 7b4a9411e9c7524f8dc6ae2603c62d5f338190dc
 ---
 
 # 基准测试与性能剖析
+
+方法与工具入口按 0.10.0 核对；正文中的 2026-07/08 测量和实验仅代表其历史条件。0.10.0 的新 timeline 与端到端结果另见[性能分析方法](decode-timeline.md)及[发布前矩阵](../../evidence/benchmarks/2026-10-09-release-0.10.0-matrix.md)。
 
 `infr bench` 与 `llama-bench` 的 `-p`/`-n`/`-d`/`-r` 标志对应，因此两者可直接比较。管线会在模型加载时编译并首次触及 GPU 状态（`Llama::warmup`），所以计时测量的是计算而非一次性设置。**请一次只运行一个基准测试**，并发 GPU 工作会扭曲结果。
 
@@ -61,3 +65,9 @@ infr compare "$M" --ctx 8000,16000 --gen 256 --turn 2048,256 --reps 2
 **大小语法**：`paging.cache` / `INFR_CACHE`、`device.vram_budget` / `INFR_VRAM_BUDGET`、`device.vram_reserve` / `INFR_VRAM_RESERVE` 和 `device.ctx` / `INFR_CTX` / `--ctx` 共用一套取值语法（`infr_core::parse_size`）：纯数字表示基准单位（内存预算为字节，`INFR_CTX` 为 token），`k`/`m`/`g`/`t` 后缀按 1024 缩放（`INFR_VRAM_BUDGET=23g`、`INFR_CTX=256k`）。`%` 的总量/保留预算相对设备总内存解析；`INFR_CACHE=%` 保持其历史可用 VRAM 基数；上下文百分比在 Vulkan 上使用空闲 VRAM KV 容量（在 CPU/Metal 聊天路径上使用训练上下文）。
 
 **常驻 BDA 权重内存区**：始终启用，也是唯一的权重路径。它将每次权重分配路由到单一 `bufferDeviceAddress` 内存区，让内核通过 64 位设备地址而非每张量 SSBO 描述符绑定读取权重。稠密投影权重和 MoE 专家权重库经由 `-DSTREAMED` 内核孪生体读取，子张量经子范围描述符绑定读取，分页专家缓存可在其上保持不变地组合。该寻址在整个模型集合中与已退役的 u32-SSBO 描述符路径逐位一致（稠密、MoE、qwen35/DeltaNet、DiffusionGemma 和分页 Scout 专家；由 `gpu_seam` 黄金值和流式一致性测试套件证明），并且在 RDNA3（7900 XTX）的稠密和 qwen3-MoE 路径上运行速度不低于该路径。
+
+## 测试缓存管理
+
+所有新测试和 benchmark 的主 KV、MTP sidecar 与元数据放在仓库根 `test-kv-cache/`，各 run 的日志与结果仍放 `benchmark-data/`。缓存跨兼容运行复用，总滚动预算为 30 GiB，包含所有嵌套目录和并行测试，不是每服务各 30 GiB。
+
+开始测试前与写入后统计总量；超额时按完成条目的保存时间从旧到新成组清理主 KV、sidecar 和元数据，读写中的条目不得删除。活跃条目妨碍清理时停止新增缓存。清理前确认解析路径在 `test-kv-cache/` 内，拒绝 reparse point；生产 `kv-sessions/` 不参与测试缓存管理。旧 evidence 的测试缓存位置和额度只保留为当时条件，不用于新测试。

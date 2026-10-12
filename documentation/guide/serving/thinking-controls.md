@@ -2,22 +2,23 @@
 kind: guide
 status: current
 scope: reasoning-controls
-last_verified: 2026-09-28
-verified_commit: ed62393068679573afe94a1472454efe7eae0f15
+last_verified: 2026-10-11
+verified_commit: 7b4a9411e9c7524f8dc6ae2603c62d5f338190dc
+baseline_tag: release-0.10.0
 ---
 
 # 原生思考控制
 
 MoE4All 将思考控制传递给 GGUF 内嵌的 `tokenizer.chat_template`。模型模板定义这些控制的含义。推理级别不是 token 预算、采样温度或 MoE 路由变化。
 
-## CLI 和 Windows 向导
+## CLI 和启动向导
 
 ```powershell
 .\infr.exe run --think --reasoning-effort medium 'D:\Models\model.gguf'
 .\infr.exe serve --think --reasoning-effort medium 'D:\Models\model.gguf'
 ```
 
-Windows 启动向导会在思考开关选择器之后提供推理强度选择器，并记住该选择。禁用思考时，它不会传递强度标志。此次更改未为 GUI 应用新增下拉框；请使用向导、CLI 或 API 控制这些选项。
+Windows / Linux 启动向导会在思考开关选择器之后提供推理强度选择器，并记住该选择。禁用思考时，它不会传递强度标志。此次更改未为 GUI 应用新增下拉框；请使用向导、CLI 或 API 控制这些选项。
 
 等效配置为：
 
@@ -77,7 +78,7 @@ reasoning_effort = "medium"
 
 ## 验证
 
-使用 Rust stable 以及仓库 CI 和 Windows 构建说明中的平台构建前置条件（包括适用于 Vulkan 的 `glslc`）。
+使用仓库固定的 Rust 1.97.1 以及仓库 CI 和 Windows 构建说明中的平台构建前置条件（包括适用于 Vulkan 的 `glslc`）。
 
 ```powershell
 cargo fmt --all
@@ -101,4 +102,4 @@ Qwen 固件矩阵覆盖 20 种情形：默认值、全部三个受支持级别�
 - [Gemma 4 31B template](https://huggingface.co/google/gemma-4-31B-it/blob/main/chat_template.jinja)
 - [DeepSeek-V4-Flash-0731 encoder](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731/blob/main/encoding/encoding_dsv4.py)
 
-`crates/infr-chat/tests/fixtures/qwen38_chat_template.jinja` 是 Qwen/Qwen3.8-27B 的 Apache-2.0 模板经空白规范化后的文本提取，修订版为 `412f8b6`，读取于 2026-09-09。版权属于 Qwen 作者。其 170 行提取的源代码与 Flash-Next 模板（修订版 `34567a4`）比较后完全相同。它仅是回归测试固件；生产环境始终使用实际 GGUF 元数据。仓库的 Apache-2.0 许可证适用于该固件。未包含模型权重。
+`crates/infr-chat/tests/fixtures/qwen38_chat_template.jinja` 是 Qwen/Qwen3.8-27B 的 Apache-2.0 模板经空白规范化后的文本提取，修订版为 `412f8b6`，读取于 2026-09-09。版权属于 Qwen 作者。其 170 行提取的源代码与 Flash-Next 模板（修订版 `34567a4`）比较后完全相同。它仅是回归测试样本；生产环境始终使用实际 GGUF 元数据。仓库的 Apache-2.0 许可证适用于该固件。未包含模型权重。

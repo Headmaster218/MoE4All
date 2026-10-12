@@ -1,16 +1,5 @@
-# Distribution profile snapshot
+# Agent profile 源码快照
 
-This directory is the sanitized, source-controlled baseline for the MoE4All Agent profile. It
-captures plugin composition and portable behavioral overrides without copying credentials,
-sessions, memory databases, logs, attachments, public addresses, or machine-specific networking
-state.
+本目录保存插件组合、portable patch 与 Embedding 依赖 stub，不保存用户会话或凭据。源码快照不等于已验收的正式 Agent EXE；模型特化配置仍需公开发行审查。
 
-- `profile/package.json` records the maintained MoE4All plugin set. The release builder resolves
-  these packages from tested submodule tarballs rather than updating them from the marketplace.
-- `profile/cordis.patch.yml` records the portable configuration overrides.
-- `profile/stubs/hf-transformers-stub` preserves the current Mneme installation strategy while
-  embeddings are supplied by the MoE4All OpenAI-compatible endpoint.
-
-The source for each bundled component is a Git submodule under `../plugins`; the root gitlinks and
-each repository's `UPSTREAM.md` provide the exact source and attribution record. This profile is a
-distribution baseline; machine-specific product settings remain outside source control.
+完整说明见[产品架构](../../documentation/architecture/product/agent-distribution.md)与[来源及迁移](../../documentation/evidence/changes/product/dsh-source-and-local-migration.md)。
