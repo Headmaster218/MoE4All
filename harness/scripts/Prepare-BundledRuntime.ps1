@@ -64,6 +64,80 @@ if (-not (Test-Path -LiteralPath $profileModules -PathType Container)) {
     }
 }
 
+$runtimePnpm = Join-Path $dshRoot 'node_modules\.pnpm'
+$runtimeScope = Join-Path $dshRoot 'node_modules\@deepseek-ai'
+$profileScope = Join-Path $profileModules '@deepseek-ai'
+if (-not (Test-Path -LiteralPath $runtimePnpm -PathType Container)) {
+    throw 'The bundled DSH package store is missing.'
+}
+New-Item -ItemType Directory -Path $runtimeScope -Force | Out-Null
+New-Item -ItemType Directory -Path $profileScope -Force | Out-Null
+$runtimePackages = @{}
+
+function Add-RuntimePackage([string]$path) {
+    if (($null -eq $path) -or -not (Test-Path -LiteralPath $path -PathType Container)) { return }
+    $packageManifest = Join-Path $path 'package.json'
+    if (-not (Test-Path -LiteralPath $packageManifest -PathType Leaf)) { return }
+    try {
+        $packageName = [string](Get-Content -LiteralPath $packageManifest -Raw -Encoding UTF8 | ConvertFrom-Json).name
+    } catch {
+        return
+    }
+    if ($packageName -notmatch '^@deepseek-ai/[0-9A-Za-z._-]+$' -or $runtimePackages.ContainsKey($packageName)) { return }
+    $runtimePackages[$packageName] = [IO.Path]::GetFullPath($path)
+}
+
+foreach ($entry in Get-ChildItem -LiteralPath $runtimePnpm -Directory) {
+    $scope = Join-Path $entry.FullName 'node_modules\@deepseek-ai'
+    if (-not (Test-Path -LiteralPath $scope -PathType Container)) { continue }
+    foreach ($package in Get-ChildItem -LiteralPath $scope -Directory -Force) {
+        if (($package.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+        Add-RuntimePackage $package.FullName
+    }
+}
+$materializedRoot = Join-Path $dshRoot '.moe4all-workspace'
+if (Test-Path -LiteralPath $materializedRoot -PathType Container) {
+    foreach ($package in Get-ChildItem -LiteralPath $materializedRoot -Directory -Force) {
+        Add-RuntimePackage $package.FullName
+    }
+}
+$requiredRuntimePackages = @(
+    '@deepseek-ai/cosmokit',
+    '@deepseek-ai/dsh-base',
+    '@deepseek-ai/dsh-scope',
+    '@deepseek-ai/dsh-timeout',
+    '@deepseek-ai/dsh-web-app',
+    '@deepseek-ai/schemastery'
+)
+foreach ($packageName in $requiredRuntimePackages) {
+    if (-not $runtimePackages.ContainsKey($packageName)) {
+        throw "The bundled DSH package store is incomplete: $packageName is missing."
+    }
+}
+
+function Ensure-PackageJunction([string]$link, [string]$target) {
+    $existing = Get-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue
+    if ($null -ne $existing) {
+        if (($existing.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) { return }
+        $existingTargetValue = [string]@($existing.Target)[0]
+        if ([IO.Path]::IsPathRooted($existingTargetValue)) {
+            $existingTarget = [IO.Path]::GetFullPath($existingTargetValue)
+        } else {
+            $existingTarget = [IO.Path]::GetFullPath((Join-Path $existing.Parent.FullName $existingTargetValue))
+        }
+        if ($existingTarget.Equals($target, [StringComparison]::OrdinalIgnoreCase)) { return }
+        [IO.Directory]::Delete($link, $false)
+    }
+    New-Item -ItemType Junction -Path $link -Target $target | Out-Null
+}
+
+foreach ($packageName in @($runtimePackages.Keys | Sort-Object)) {
+    $shortName = $packageName.Substring('@deepseek-ai/'.Length)
+    $target = [string]$runtimePackages[$packageName]
+    Ensure-PackageJunction (Join-Path $runtimeScope $shortName) $target
+    Ensure-PackageJunction (Join-Path $profileScope $shortName) $target
+}
+
 $profilePatch = Join-Path $state 'home\profiles\web\cordis.patch.yml'
 if (Test-Path -LiteralPath $profilePatch -PathType Leaf) {
     $patch = Get-Content -LiteralPath $profilePatch -Raw -Encoding UTF8

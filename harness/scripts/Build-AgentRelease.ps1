@@ -179,6 +179,76 @@ foreach ($target in @($externalTargets.Keys | Sort-Object)) {
     if ($LASTEXITCODE -ge 8) { throw "Materializing DSH workspace package $sourceRelative failed (robocopy $LASTEXITCODE)." }
     $materializedTargets[$target] = $materialized
 }
+
+# pnpm deploy does not materialize workspace packages that are only peer
+# dependencies. Build the production dependency closure explicitly so the
+# offline runtime never falls back to the source checkout's hoisted modules.
+$workspacePackages = @{}
+$workspaceManifests = Get-ChildItem -LiteralPath $buildDshRoot -Recurse -File -Filter package.json |
+    Where-Object { $_.FullName -notmatch '[\\/]node_modules[\\/]' }
+foreach ($manifestPath in $workspaceManifests) {
+    try {
+        $manifest = Get-Content -LiteralPath $manifestPath.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        continue
+    }
+    $packageName = [string]$manifest.name
+    if ($packageName -match '^@deepseek-ai/[0-9A-Za-z._-]+$' -and -not $workspacePackages.ContainsKey($packageName)) {
+        $workspacePackages[$packageName] = $manifestPath.Directory.FullName
+    }
+}
+
+$runtimePackages = @{}
+$runtimeQueue = New-Object 'Collections.Generic.Queue[string]'
+function Register-RuntimePackage([string]$packagePath) {
+    $manifestPath = Join-Path $packagePath 'package.json'
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { return }
+    try {
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        return
+    }
+    $packageName = [string]$manifest.name
+    if ($packageName -notmatch '^@deepseek-ai/[0-9A-Za-z._-]+$' -or $runtimePackages.ContainsKey($packageName)) { return }
+    $runtimePackages[$packageName] = $packagePath
+    foreach ($section in @('dependencies', 'optionalDependencies', 'peerDependencies')) {
+        $dependencies = $manifest.$section
+        if ($null -eq $dependencies) { continue }
+        foreach ($dependency in @($dependencies.PSObject.Properties.Name)) {
+            if ($dependency -match '^@deepseek-ai/[0-9A-Za-z._-]+$') { $runtimeQueue.Enqueue($dependency) }
+        }
+    }
+}
+
+$deployPnpm = Join-Path $deployRoot 'node_modules\.pnpm'
+foreach ($entry in Get-ChildItem -LiteralPath $deployPnpm -Directory) {
+    $scope = Join-Path $entry.FullName 'node_modules\@deepseek-ai'
+    if (-not (Test-Path -LiteralPath $scope -PathType Container)) { continue }
+    foreach ($package in Get-ChildItem -LiteralPath $scope -Directory -Force) {
+        if (($package.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+            Register-RuntimePackage $package.FullName
+        }
+    }
+}
+foreach ($materialized in @($materializedTargets.Values)) {
+    Register-RuntimePackage ([string]$materialized)
+}
+while ($runtimeQueue.Count -gt 0) {
+    $packageName = $runtimeQueue.Dequeue()
+    if ($runtimePackages.ContainsKey($packageName)) { continue }
+    if (-not $workspacePackages.ContainsKey($packageName)) {
+        throw "The production DSH dependency closure is missing workspace package $packageName."
+    }
+    $source = [string]$workspacePackages[$packageName]
+    $sourceRelative = Get-RelativePath $buildDshRoot $source
+    $safeName = $sourceRelative -replace '[^0-9A-Za-z._-]', '-'
+    $materialized = Join-Path $materializedRoot $safeName
+    New-Item -ItemType Directory -Path $materialized -Force | Out-Null
+    & robocopy $source $materialized /E /XJ /XD node_modules .git /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "Materializing DSH workspace dependency $sourceRelative failed (robocopy $LASTEXITCODE)." }
+    Register-RuntimePackage $materialized
+}
+
 $links = @()
 foreach ($entry in $deployLinks) {
     $targetValue = [string]@($entry.Target)[0]
