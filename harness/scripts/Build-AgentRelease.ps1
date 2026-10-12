@@ -158,7 +158,7 @@ $links = @()
 foreach ($entry in @(Get-ChildItem -LiteralPath $deployRoot -Recurse -Force -Attributes ReparsePoint)) {
     if (-not $entry.PSIsContainer) { throw "The DSH deployment contains a file symlink: $($entry.FullName)" }
     $targetValue = [string]@($entry.Target)[0]
-    $target = [IO.Path]::GetFullPath((Join-Path $entry.DirectoryName $targetValue))
+    $target = [IO.Path]::GetFullPath((Join-Path $entry.Parent.FullName $targetValue))
     if (-not $target.StartsWith($deployRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
         throw "The DSH deployment link escapes its root: $($entry.FullName)"
     }
