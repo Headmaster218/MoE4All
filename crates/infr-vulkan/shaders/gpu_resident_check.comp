@@ -13,6 +13,7 @@ layout(push_constant) uniform Params {
     uint ordinal;
     uint immutable_predicates;
 } p;
+const uint JOURNAL_WORDS = 40u;
 void main() {
     if (p.count == 0) {
         run = 1;
@@ -28,7 +29,7 @@ void main() {
     bool missing = false;
     for (uint i = 0; i < p.count; ++i) {
         uint id = ids[i];
-        journal[p.ordinal * 32 + i] = id;
+        journal[p.ordinal * JOURNAL_WORDS + i] = id;
         if (id >= p.experts) {
             invalid = 1;
             missing = true;

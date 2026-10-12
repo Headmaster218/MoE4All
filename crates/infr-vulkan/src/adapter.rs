@@ -3,7 +3,9 @@
 //! interpreter (`infr-llama::seam`) op-for-op, but executes on the GPU — so the SAME model
 //! `Graph` runs on either backend. Built incrementally; ops not yet mapped return an error.
 
-use crate::linear::native_dense_supported;
+use crate::linear::{
+    native_dense_supported, native_id_paged_kernel_name, native_idm_paged_kernel_name,
+};
 use crate::recorder::{Recorder, QSA_TOPK_PARALLEL_MIN_BLOCKS, QSA_TOPK_PARALLEL_WORK_BYTES};
 use crate::{be, VulkanBackend};
 use infr_core::backend::{Bindings, Buffer, BufferUsage, Plan};
@@ -9290,7 +9292,7 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
     let mut live_pos: usize = 0;
     loop {
         if let Some(chunk) = resident_chunk.as_mut() {
-            if let Some((op_idx, _)) = chunk.recovery_op {
+            if let Some(recovery) = chunk.recovery_op {
                 if resident_recovery_submit_due(
                     pstream.resume_ids.is_some(),
                     live_ops.get(live_pos).map(|(_, op)| *op),
@@ -9298,7 +9300,7 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
                 ) {
                     submitted_dispatches += chunk.submit_early_recovery(
                         be_,
-                        op_idx,
+                        recovery.op_idx,
                         &mut rec,
                         &mut pstream,
                         &mut segments,
@@ -9476,19 +9478,16 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
                 if let Some(chunk) = resident_chunk.as_mut() {
                     if pstream.resume_ids.is_none() {
                         let Op::MoeFfn {
-                            x,
-                            ne,
-                            n_used,
-                            up_exps,
-                            down_exps,
-                            ..
+                            up_exps, down_exps, ..
                         } = op
                         else {
                             unreachable!()
                         };
+                        let layout = ResidentMoeLayout::from_op(graph, op)
+                            .expect("resident graph contains only supported MoeFfn layouts");
                         chunk.entries.push(ResidentJournalEntry {
                             op_idx,
-                            count: graph.desc(*x).numel() / *ne as usize * *n_used as usize,
+                            layout,
                             roles: [
                                 crate::pager::buffer_identity(gbuf),
                                 crate::pager::buffer_identity(resolve(
@@ -9857,7 +9856,88 @@ struct GpuRoute {
 struct ResidentJournalEntry {
     op_idx: usize,
     roles: [usize; 3],
-    count: usize,
+    layout: ResidentMoeLayout,
+}
+
+/// Per-op facts needed by the resident control plane. Kernels remain shape/dtype specialized;
+/// this descriptor only decides whether the generic journal, hit-first and miss-recovery protocol
+/// can represent an `MoeFfn` without architecture-name or model-size assumptions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResidentMoeLayout {
+    rows: usize,
+    n_expert: usize,
+    n_used: usize,
+}
+
+impl ResidentMoeLayout {
+    fn count(self) -> usize {
+        self.rows * self.n_used
+    }
+
+    fn role_tape_words(self) -> usize {
+        3 * self.n_expert
+    }
+
+    fn from_op(graph: &Graph, op: &Op) -> Option<Self> {
+        let Op::MoeFfn {
+            x,
+            gate_exps,
+            up_exps,
+            down_exps,
+            down_scale,
+            fused_gate_up,
+            ne,
+            n_expert,
+            n_used,
+            n_ff_exp,
+            act,
+            weight_before,
+            ep_band,
+            swiglu_clamp,
+            expert_ids,
+            ..
+        } = op
+        else {
+            return None;
+        };
+        let (ne, n_ff_exp, n_expert, n_used) = (
+            *ne as usize,
+            *n_ff_exp as usize,
+            *n_expert as usize,
+            *n_used as usize,
+        );
+        if ne == 0 || n_ff_exp == 0 || graph.desc(*x).numel() % ne != 0 {
+            return None;
+        }
+        let layout = Self {
+            rows: graph.desc(*x).numel() / ne,
+            n_expert,
+            n_used,
+        };
+        (layout.rows > 0
+            && layout.rows <= crate::recorder::RESIDENT_JOURNAL_MASK_WORDS
+            && n_expert > 0
+            && n_expert <= 512
+            && n_used > 0
+            && n_used <= 16
+            && n_used <= n_expert
+            && layout.count() <= crate::recorder::RESIDENT_JOURNAL_ID_WORDS
+            && !*fused_gate_up
+            && !*weight_before
+            && matches!(act, Activation::Silu)
+            && swiglu_clamp.is_none()
+            && down_scale.is_none()
+            && ep_band.is_none()
+            && expert_ids.is_none()
+            && [*gate_exps, *up_exps, *down_exps]
+                .into_iter()
+                .all(|weight| {
+                    let dtype = graph.desc(weight).dtype;
+                    native_id_paged_kernel_name(dtype).is_some()
+                        && native_idm_paged_kernel_name(dtype).is_some()
+                }))
+        .then_some(layout)
+    }
 }
 
 struct ResidentChunk {
@@ -9865,8 +9945,7 @@ struct ResidentChunk {
     journal: std::sync::Arc<dyn Buffer>,
     entries: Vec<ResidentJournalEntry>,
     early_recovery: bool,
-    /// Op to resume and the first LUT word owned by its queued miss FFN.
-    recovery_op: Option<(usize, usize)>,
+    recovery_op: Option<ResidentRecovery>,
     limit: usize,
     recording: bool,
     submit_layers: usize,
@@ -9880,6 +9959,15 @@ struct ResidentChunk {
     mapped_serial_max_bytes: usize,
     waiter: Option<Arc<crate::recorder::FenceWaiter>>,
     indirect: Option<Arc<crate::recorder::ResidentIndirect>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResidentRecovery {
+    op_idx: usize,
+    /// First LUT word after the retained hit submission and queued miss FFN.
+    miss_tape_start: usize,
+    /// Three split expert banks, each with one address per expert.
+    minimum_tape_words: usize,
 }
 
 struct ResidentBuffers {
@@ -9943,7 +10031,7 @@ struct ProducedPromotion {
 }
 
 struct ProducedNotice {
-    words: [u32; 32],
+    words: [u32; crate::recorder::RESIDENT_JOURNAL_WORDS],
     promotion: Option<ProducedPromotion>,
 }
 
@@ -10096,13 +10184,17 @@ impl ResidentNoticeProducer {
                     .map_err(|_| be("trace notice pager poisoned"))?
                     .as_ref()
                     .ok_or_else(|| be("trace notice pager missing"))?
-                    .registered_layer(entry.roles[0], 512)? as i32;
+                    .registered_layer(entry.roles[0], entry.layout.n_expert)?
+                    as i32;
                 infr_core::timeline::record_resident_notice(infr_core::timeline::ResidentNotice {
                     context,
                     ordinal,
-                    status: words[31],
-                    hit_masks: [words[24], words[25]],
-                    count: entry.count,
+                    status: words[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD],
+                    hit_masks: [
+                        words[crate::recorder::RESIDENT_JOURNAL_MASK_WORD],
+                        words[crate::recorder::RESIDENT_JOURNAL_MASK_WORD + 1],
+                    ],
+                    count: entry.layout.count(),
                 });
             }
             Some(context)
@@ -10114,7 +10206,7 @@ impl ResidentNoticeProducer {
             words,
             promotion: None,
         };
-        match words[31] {
+        match words[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] {
             0 => (),
             1 => {
                 let _lru = ResidentProducerTrace::begin("resident_producer_lru", trace_context);
@@ -10125,14 +10217,14 @@ impl ResidentNoticeProducer {
                     .as_mut()
                     .ok_or_else(|| be("notice producer pager missing"))?;
                 session.begin_role_batches(&entry.roles)?;
-                session.touch_routed_hits(&entry.roles, &words[..entry.count])?;
+                session.touch_routed_hits(&entry.roles, &words[..entry.layout.count()])?;
             }
             2 => {
                 // Cancel CPU speculation as soon as the GPU notice arrives, not after its
                 // RAM copy/DMA preparation. The result channel still owns upload handoff.
                 announced_miss.store(ordinal, std::sync::atomic::Ordering::Release);
                 let admit = ResidentProducerTrace::begin("resident_producer_admit", trace_context);
-                let (_, hits, misses) = resident_notice_slots(&words, entry.count)?;
+                let (_, hits, misses) = resident_notice_slots(&words, entry.layout)?;
                 let abort = CpuPromotionAbortGuard {
                     pager: Arc::clone(pager),
                     experts: misses.iter().map(|&id| (entry.roles, id)).collect(),
@@ -10147,7 +10239,8 @@ impl ResidentNoticeProducer {
                 let session = guard
                     .as_mut()
                     .ok_or_else(|| be("notice producer pager missing"))?;
-                let layer = session.registered_layer(entry.roles[0], 512)? as usize;
+                let layer =
+                    session.registered_layer(entry.roles[0], entry.layout.n_expert)? as usize;
                 session.begin_role_batches(&entry.roles)?;
                 session.touch_routed_hits(&entry.roles, &hits)?;
                 let push = session.push_roles_cpu(
@@ -10295,38 +10388,61 @@ fn resident_chunk_status(words: [u32; 4], recorded: usize) -> Result<Option<usiz
     }
 }
 
-// The caller has observed this layer's Vulkan event after its HOST_READ publication.
-// The immutable 128-byte range can be copied together instead of 32 scalar ReBAR reads.
-fn resident_notice_words(journal: &dyn Buffer, ordinal: usize) -> Result<[u32; 32]> {
+// The caller has observed this layer's Vulkan event after its HOST_READ publication. The immutable
+// journal range can be copied together instead of issuing scalar ReBAR reads.
+fn resident_notice_words(
+    journal: &dyn Buffer,
+    ordinal: usize,
+) -> Result<[u32; crate::recorder::RESIDENT_JOURNAL_WORDS]> {
     let offset = ordinal
-        .checked_mul(128)
-        .filter(|&offset| journal.len_bytes().saturating_sub(offset) >= 128)
+        .checked_mul(crate::recorder::RESIDENT_JOURNAL_BYTES)
+        .filter(|&offset| {
+            journal.len_bytes().saturating_sub(offset) >= crate::recorder::RESIDENT_JOURNAL_BYTES
+        })
         .ok_or_else(|| be("resident notice journal range exceeds storage"))?;
     let ptr = crate::as_vk_buf(journal)?
         .mapped_ptr()
         .ok_or_else(|| be("resident notice journal must be coherent mapped memory"))?;
-    let mut words = [0u32; 32];
+    let mut words = [0u32; crate::recorder::RESIDENT_JOURNAL_WORDS];
     unsafe {
-        std::ptr::copy_nonoverlapping(ptr.add(offset), words.as_mut_ptr().cast::<u8>(), 128);
+        std::ptr::copy_nonoverlapping(
+            ptr.add(offset),
+            words.as_mut_ptr().cast::<u8>(),
+            crate::recorder::RESIDENT_JOURNAL_BYTES,
+        );
     }
     Ok(words)
 }
 
 fn resident_notice_slots(
-    words: &[u32; 32],
-    count: usize,
+    words: &[u32; crate::recorder::RESIDENT_JOURNAL_WORDS],
+    layout: ResidentMoeLayout,
 ) -> Result<(Vec<u32>, Vec<u32>, Vec<u32>)> {
-    if !matches!(count, 10 | 20) || words[31] != 2 {
+    let count = layout.count();
+    if layout.rows == 0
+        || layout.rows > crate::recorder::RESIDENT_JOURNAL_MASK_WORDS
+        || layout.n_used == 0
+        || layout.n_used > 16
+        || count > crate::recorder::RESIDENT_JOURNAL_ID_WORDS
+        || words[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] != 2
+    {
         return Err(be("invalid resident miss notice shape/status"));
     }
-    let masks = words[24..24 + count / 10].to_vec();
-    if masks.iter().any(|&mask| mask & !1023 != 0) || words[..count].iter().any(|&id| id >= 512) {
+    let masks = words[crate::recorder::RESIDENT_JOURNAL_MASK_WORD
+        ..crate::recorder::RESIDENT_JOURNAL_MASK_WORD + layout.rows]
+        .to_vec();
+    let valid_mask = (1u32 << layout.n_used) - 1;
+    if masks.iter().any(|&mask| mask & !valid_mask != 0)
+        || words[..count]
+            .iter()
+            .any(|&id| id >= layout.n_expert as u32)
+    {
         return Err(be("invalid resident miss notice mask/id"));
     }
     let mut hits = Vec::new();
     let mut misses = Vec::new();
     for (slot, &id) in words[..count].iter().enumerate() {
-        if masks[slot / 10] & (1 << (slot % 10)) != 0 {
+        if masks[slot / layout.n_used] & (1 << (slot % layout.n_used)) != 0 {
             hits.push(id);
         } else {
             misses.push(id);
@@ -10402,6 +10518,12 @@ impl ResidentChunk {
         retained: &mut Option<ResidentBuffers>,
     ) -> Result<Option<Self>> {
         let cfg = &be_.cfg().kernels.vulkan;
+        let resident_layouts = graph
+            .ops
+            .iter()
+            .filter(|op| matches!(op, Op::MoeFfn { .. }))
+            .map(|op| ResidentMoeLayout::from_op(graph, op))
+            .collect::<Option<Vec<_>>>();
         let eligible = cfg.decode_gpu_resident
             && be_.shared.conditional_rendering.is_some()
             && token_row_paged_moe
@@ -10413,37 +10535,9 @@ impl ResidentChunk {
             && !be_.cfg().paging.expert_prefetch
             && cfg.cpu_miss_threads == 0
             && decode_token_rows(graph).is_some_and(|rows| rows <= 2)
-            && graph
-                .ops
-                .iter()
-                .filter(|op| matches!(op, Op::MoeFfn { .. }))
-                .count()
-                > 1
-            && graph.ops.iter().all(|op| match op {
-                Op::MoeFfn {
-                    ne,
-                    n_ff_exp,
-                    n_expert,
-                    n_used,
-                    fused_gate_up,
-                    weight_before,
-                    act,
-                    swiglu_clamp,
-                    down_scale,
-                    ..
-                } => {
-                    *ne == 2560
-                        && *n_ff_exp == 640
-                        && *n_expert == 512
-                        && *n_used == 10
-                        && !*fused_gate_up
-                        && !*weight_before
-                        && matches!(act, Activation::Silu)
-                        && swiglu_clamp.is_none()
-                        && down_scale.is_none()
-                }
-                _ => true,
-            });
+            && resident_layouts
+                .as_ref()
+                .is_some_and(|layouts| layouts.len() > 1);
         if !eligible {
             return Ok(None);
         }
@@ -10476,7 +10570,7 @@ impl ResidentChunk {
                     std::sync::Arc::from(buffer)
                 }
             };
-            let journal_bytes = limit * 32 * 4;
+            let journal_bytes = limit * crate::recorder::RESIDENT_JOURNAL_BYTES;
             let journal = if cfg.decode_gpu_resident_mapped_journal {
                 match be_.alloc_mapped_arena_bda(journal_bytes) {
                     Ok((buffer, _)) => buffer,
@@ -10586,21 +10680,22 @@ impl ResidentChunk {
         let mut words = [0u32; 4];
         be_.download(self.control.as_ref(), bytemuck::cast_slice_mut(&mut words))?;
         let stopped = resident_chunk_status(words, self.entries.len())?;
-        let mut ids = vec![0u32; self.entries.len() * 32];
+        let mut ids = vec![0u32; self.entries.len() * crate::recorder::RESIDENT_JOURNAL_WORDS];
         be_.download(self.journal.as_ref(), bytemuck::cast_slice_mut(&mut ids))?;
         let hit_count = stopped.unwrap_or(self.entries.len());
         let mut guard = be_.moe_pager().lock().unwrap();
         let session = guard.as_mut().expect("GPU resident Decode owns a pager");
         for (ordinal, entry) in self.entries[..hit_count].iter().enumerate() {
+            let base = ordinal * crate::recorder::RESIDENT_JOURNAL_WORDS;
             session.begin_role_batches(&entry.roles)?;
-            session
-                .touch_routed_hits(&entry.roles, &ids[ordinal * 32..ordinal * 32 + entry.count])?;
+            session.touch_routed_hits(&entry.roles, &ids[base..base + entry.layout.count()])?;
         }
         let resume = stopped.map(|ordinal| {
             let entry = &self.entries[ordinal];
+            let base = ordinal * crate::recorder::RESIDENT_JOURNAL_WORDS;
             (
                 entry.op_idx,
-                ids[ordinal * 32..ordinal * 32 + entry.count].to_vec(),
+                ids[base..base + entry.layout.count()].to_vec(),
             )
         });
         self.entries.clear();
@@ -10663,19 +10758,20 @@ impl ResidentChunk {
             let words = resident_notice_words(self.journal.as_ref(), ordinal)?;
             drop(_span);
             self.notice_cursor = ordinal + 1;
-            match words[31] {
+            match words[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] {
                 1 => {
                     let mut guard = be_.moe_pager().lock().unwrap();
                     let session = guard.as_mut().unwrap();
                     session.begin_role_batches(&entry.roles)?;
-                    session.touch_routed_hits(&entry.roles, &words[..entry.count])?;
+                    session.touch_routed_hits(&entry.roles, &words[..entry.layout.count()])?;
                 }
                 2 => {
                     let _promotion = infr_core::timeline::span("gpu_resident_notice_promotion");
-                    let (masks, hits, misses) = resident_notice_slots(&words, entry.count)?;
+                    let (masks, hits, misses) = resident_notice_slots(&words, entry.layout)?;
                     let mut guard = be_.moe_pager().lock().unwrap();
                     let session = guard.as_mut().unwrap();
-                    let layer = session.registered_layer(entry.roles[0], 512)? as usize;
+                    let layer =
+                        session.registered_layer(entry.roles[0], entry.layout.n_expert)? as usize;
                     // The notice orders all earlier layer reads. This layer can still read
                     // its actual hit triplets: pin them before admitting any new payload.
                     session.begin_role_batches(&entry.roles)?;
@@ -10717,7 +10813,8 @@ impl ResidentChunk {
                         pending: transfer,
                     });
                     ps.resume_hit_masks = Some(masks);
-                    self.notice_resume = Some((entry.op_idx, words[..entry.count].to_vec()));
+                    self.notice_resume =
+                        Some((entry.op_idx, words[..entry.layout.count()].to_vec()));
                     break;
                 }
                 _ => {
@@ -10755,10 +10852,10 @@ impl ResidentChunk {
             }
             let mut notice = result?;
             let entry = &self.entries[ordinal];
-            match notice.words[31] {
+            match notice.words[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] {
                 1 => (), // The producer already replayed the actual hits in journal order.
                 2 => {
-                    let (masks, _, _) = resident_notice_slots(&notice.words, entry.count)?;
+                    let (masks, _, _) = resident_notice_slots(&notice.words, entry.layout)?;
                     let mut produced = notice
                         .promotion
                         .take()
@@ -10779,7 +10876,8 @@ impl ResidentChunk {
                     }
                     ps.cpu_promotion = Some(promotion);
                     ps.resume_hit_masks = Some(masks);
-                    self.notice_resume = Some((entry.op_idx, notice.words[..entry.count].to_vec()));
+                    self.notice_resume =
+                        Some((entry.op_idx, notice.words[..entry.layout.count()].to_vec()));
                     break;
                 }
                 _ => {
@@ -10845,13 +10943,25 @@ impl ResidentChunk {
         let resume = self.notice_resume.take();
         if self.early_recovery {
             if let Some((op_idx, _)) = &resume {
+                let entry = self
+                    .entries
+                    .iter()
+                    .find(|entry| entry.op_idx == *op_idx)
+                    .ok_or_else(|| {
+                        be("early recovery notice does not belong to the resident window")
+                    })?;
+                let minimum_tape_words = entry.layout.role_tape_words();
                 // The miss LUT is appended, never written over the hit-reader windows. The
                 // first next-layer window will fit below it; rolling cap 1 retires this miss
                 // segment before a second next-layer window can reuse these coordinates.
-                if ps.tape_cursor < 3 * 512 || segments.is_empty() {
+                if ps.tape_cursor < minimum_tape_words || segments.is_empty() {
                     return Err(be("early recovery has no retained hit/LUT submission"));
                 }
-                self.recovery_op = Some((*op_idx, ps.tape_cursor));
+                self.recovery_op = Some(ResidentRecovery {
+                    op_idx: *op_idx,
+                    miss_tape_start: ps.tape_cursor,
+                    minimum_tape_words,
+                });
                 let fresh = be_.recorder()?;
                 fresh.seed_barrier();
                 ps.acquire_cpu_promotion(&fresh);
@@ -10868,7 +10978,7 @@ impl ResidentChunk {
                 if ordinal != expected {
                     return Err(be("resident producer result order mismatch"));
                 }
-                if result?.words[31] != 0 {
+                if result?.words[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] != 0 {
                     return Err(be("resident producer tail was not skipped"));
                 }
             }
@@ -10928,8 +11038,11 @@ impl ResidentChunk {
         ps: &mut PagedStream,
         segments: &mut std::collections::VecDeque<crate::recorder::PendingSegment>,
     ) -> Result<usize> {
-        let (expected_op, miss_tape_start) = self.recovery_op.take().expect("pending recovery");
-        if op_idx != expected_op || miss_tape_start < 3 * 512 || ps.resume_ids.is_some() {
+        let recovery = self.recovery_op.take().expect("pending recovery");
+        if op_idx != recovery.op_idx
+            || recovery.miss_tape_start < recovery.minimum_tape_words
+            || ps.resume_ids.is_some()
+        {
             return Err(be("early recovery resumed the wrong FFN or LUT window"));
         }
         let retire = segments.len();
@@ -10949,7 +11062,9 @@ impl ResidentChunk {
         if let Some(producer) = &self.producer {
             while self.notice_cursor < self.notices_sent {
                 let (ordinal, result) = producer.receive(true)?.expect("producer tail result");
-                if ordinal != self.notice_cursor || result?.words[31] != 0 {
+                if ordinal != self.notice_cursor
+                    || result?.words[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] != 0
+                {
                     return Err(be("early recovery producer tail was not skipped in order"));
                 }
                 self.notice_cursor += 1;
@@ -10958,7 +11073,7 @@ impl ResidentChunk {
         let mut status = [0u32; 4];
         be_.download(self.control.as_ref(), bytemuck::cast_slice_mut(&mut status))?;
         let stopped = resident_chunk_status(status, self.entries.len())?;
-        if stopped.map(|ordinal| self.entries[ordinal].op_idx) != Some(expected_op) {
+        if stopped.map(|ordinal| self.entries[ordinal].op_idx) != Some(recovery.op_idx) {
             return Err(be("early recovery notice and final control disagree"));
         }
         // The queued miss owns only the appended LUT window. Low coordinates may now be
@@ -14250,37 +14365,169 @@ mod tests {
     }
     #[test]
     fn resident_notice_preserves_row_slot_order_and_rejects_stale_metadata() {
-        for count in [10, 20] {
+        for layout in [
+            super::ResidentMoeLayout {
+                rows: 1,
+                n_expert: 256,
+                n_used: 8,
+            },
+            super::ResidentMoeLayout {
+                rows: 2,
+                n_expert: 512,
+                n_used: 10,
+            },
+            super::ResidentMoeLayout {
+                rows: 2,
+                n_expert: 512,
+                n_used: 16,
+            },
+        ] {
+            let count = layout.count();
             for miss_slot in 0..count {
-                let mut words = [0u32; 32];
+                let mut words = [0u32; crate::recorder::RESIDENT_JOURNAL_WORDS];
                 for (slot, id) in words[..count].iter_mut().enumerate() {
-                    *id = slot as u32 + 400;
+                    *id = slot as u32 + 16;
                 }
-                words[31] = 2;
-                words[24..24 + count / 10].fill(1023);
-                words[24 + miss_slot / 10] &= !(1 << (miss_slot % 10));
-                let (masks, hits, misses) = super::resident_notice_slots(&words, count).unwrap();
-                assert_eq!(misses, vec![400 + miss_slot as u32]);
+                words[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] = 2;
+                let valid_mask = (1u32 << layout.n_used) - 1;
+                words[crate::recorder::RESIDENT_JOURNAL_MASK_WORD
+                    ..crate::recorder::RESIDENT_JOURNAL_MASK_WORD + layout.rows]
+                    .fill(valid_mask);
+                words[crate::recorder::RESIDENT_JOURNAL_MASK_WORD + miss_slot / layout.n_used] &=
+                    !(1 << (miss_slot % layout.n_used));
+                let (masks, hits, misses) = super::resident_notice_slots(&words, layout).unwrap();
+                assert_eq!(misses, vec![16 + miss_slot as u32]);
                 assert_eq!(hits.len(), count - 1);
-                assert_eq!(masks.len(), count / 10);
+                assert_eq!(masks.len(), layout.rows);
                 for status in [0, 1, 3, u32::MAX] {
                     let mut invalid = words;
-                    invalid[31] = status;
-                    assert!(super::resident_notice_slots(&invalid, count).is_err());
+                    invalid[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] = status;
+                    assert!(super::resident_notice_slots(&invalid, layout).is_err());
                 }
                 let mut invalid = words;
-                invalid[24] |= 1024;
-                assert!(super::resident_notice_slots(&invalid, count).is_err());
+                invalid[crate::recorder::RESIDENT_JOURNAL_MASK_WORD] |= 1 << layout.n_used;
+                assert!(super::resident_notice_slots(&invalid, layout).is_err());
                 let mut invalid = words;
-                invalid[0] = 512;
-                assert!(super::resident_notice_slots(&invalid, count).is_err());
+                invalid[0] = layout.n_expert as u32;
+                assert!(super::resident_notice_slots(&invalid, layout).is_err());
                 let mut invalid = words;
-                invalid[24..24 + count / 10].fill(1023);
-                assert!(super::resident_notice_slots(&invalid, count).is_err());
+                invalid[crate::recorder::RESIDENT_JOURNAL_MASK_WORD
+                    ..crate::recorder::RESIDENT_JOURNAL_MASK_WORD + layout.rows]
+                    .fill(valid_mask);
+                assert!(super::resident_notice_slots(&invalid, layout).is_err());
             }
         }
-        for count in [0, 1, 9, 11, 21, 32, usize::MAX] {
-            assert!(super::resident_notice_slots(&[0; 32], count).is_err());
+        for layout in [
+            super::ResidentMoeLayout {
+                rows: 0,
+                n_expert: 256,
+                n_used: 8,
+            },
+            super::ResidentMoeLayout {
+                rows: 3,
+                n_expert: 256,
+                n_used: 8,
+            },
+            super::ResidentMoeLayout {
+                rows: 2,
+                n_expert: 256,
+                n_used: 17,
+            },
+        ] {
+            assert!(super::resident_notice_slots(
+                &[0; crate::recorder::RESIDENT_JOURNAL_WORDS],
+                layout
+            )
+            .is_err());
+        }
+    }
+
+    fn resident_layout_graph(
+        rows: usize,
+        ne: usize,
+        nff: usize,
+        n_expert: usize,
+        n_used: usize,
+        dtype: infr_core::DType,
+        fused_gate_up: bool,
+        weight_before: bool,
+    ) -> super::Graph {
+        use super::*;
+        use infr_core::TensorDesc;
+        let mut graph = Graph::new();
+        let x = graph.input(TensorDesc::new(vec![rows, ne], DType::F32));
+        let router = graph.weight(TensorDesc::new(vec![n_expert, ne], DType::Q8_0));
+        let gate = graph.weight(TensorDesc::new(vec![n_expert, nff, ne], dtype));
+        let up = if fused_gate_up {
+            gate
+        } else {
+            graph.weight(TensorDesc::new(vec![n_expert, nff, ne], dtype))
+        };
+        let down = graph.weight(TensorDesc::new(vec![n_expert, ne, nff], dtype));
+        let dst = graph.output(TensorDesc::new(vec![rows, ne], DType::F32));
+        graph.push(Op::MoeFfn {
+            x,
+            router_x: x,
+            router,
+            gate_exps: gate,
+            up_exps: up,
+            down_exps: down,
+            down_scale: None,
+            fused_gate_up,
+            dst,
+            ne: ne as u32,
+            n_expert: n_expert as u32,
+            n_used: n_used as u32,
+            n_ff_exp: nff as u32,
+            scale: 1.0,
+            act: Activation::Silu,
+            gating: infr_core::graph::MoeGating::Softmax,
+            norm_w: true,
+            weight_before,
+            ep_band: None,
+            exp_probs_b: None,
+            n_expert_groups: 0,
+            n_expert_groups_used: 0,
+            swiglu_clamp: None,
+            expert_ids: None,
+        });
+        graph
+    }
+
+    #[test]
+    fn resident_layout_is_shape_generic_but_protocol_bounded() {
+        use super::*;
+        for (rows, ne, nff, experts, used, dtype) in [
+            (1, 2560, 640, 512, 10, DType::Iq2S),
+            (2, 2560, 640, 512, 10, DType::Iq3S),
+            (1, 2048, 512, 256, 8, DType::Q6K),
+            (2, 2048, 512, 256, 8, DType::Q6K),
+            (1, 2048, 512, 256, 8, DType::F16),
+            (1, 2048, 512, 256, 8, DType::F32),
+        ] {
+            let graph = resident_layout_graph(rows, ne, nff, experts, used, dtype, false, false);
+            assert_eq!(
+                ResidentMoeLayout::from_op(&graph, graph.ops.last().unwrap()),
+                Some(ResidentMoeLayout {
+                    rows,
+                    n_expert: experts,
+                    n_used: used,
+                })
+            );
+            assert_eq!(
+                ResidentMoeLayout::from_op(&graph, graph.ops.last().unwrap())
+                    .unwrap()
+                    .role_tape_words(),
+                3 * experts
+            );
+        }
+        for graph in [
+            resident_layout_graph(3, 2048, 512, 256, 8, DType::Q6K, false, false),
+            resident_layout_graph(2, 2048, 512, 256, 17, DType::Q6K, false, false),
+            resident_layout_graph(1, 2048, 512, 256, 8, DType::Q6K, true, false),
+            resident_layout_graph(1, 2048, 512, 256, 8, DType::Q6K, false, true),
+        ] {
+            assert!(ResidentMoeLayout::from_op(&graph, graph.ops.last().unwrap()).is_none());
         }
     }
 
@@ -14699,7 +14946,14 @@ mod tests {
 
     #[test]
     fn resident_notice_snapshot_rejects_short_or_overflowing_ranges() {
-        for (bytes, ordinal) in [(0, 0), (127, 0), (128, 1), (256, 2), (128, usize::MAX)] {
+        let stride = crate::recorder::RESIDENT_JOURNAL_BYTES;
+        for (bytes, ordinal) in [
+            (0, 0),
+            (stride - 1, 0),
+            (stride, 1),
+            (2 * stride, 2),
+            (stride, usize::MAX),
+        ] {
             let error = super::resident_notice_words(&TestBuffer(bytes), ordinal).unwrap_err();
             assert!(error.to_string().contains("range exceeds storage"));
         }

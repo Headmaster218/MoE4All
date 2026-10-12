@@ -803,6 +803,47 @@ pub(crate) fn prepare_dense_vulkan_parallel_prompt_session(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_dense_vulkan_prepared_prefill_session(
+    vk: &infr_vulkan::VulkanBackend,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    state: &mut Option<SeamKv>,
+    want_ctx: usize,
+    prepared: runner::PreparedParallelPrompt,
+) -> AResult<GenStats> {
+    let bind: Box<BindWeight<'_>> = Box::new(|name: &str, _tb, _dt, _n| {
+        Err(anyhow!("warm prepared Prefill must not re-bind {name}"))
+    });
+    let result = runner::generate_dense_backend_prepared_prefill(
+        vk,
+        bind.as_ref(),
+        g,
+        cfg,
+        ec,
+        token_embd,
+        ple,
+        prompt,
+        state,
+        want_ctx,
+        prepared,
+    );
+    if result.is_err() {
+        if let Some(slot) = state.as_mut() {
+            slot.reset();
+        }
+        vk.release_moe_load_reservation();
+    }
+    let (_, stats) = result?;
+    vk.print_moe_pager_stats();
+    vk.print_dense_pager_stats();
+    Ok(stats)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_dense_vulkan_parallel_sampled_session(
     vk: &infr_vulkan::VulkanBackend,
     g: &Gguf,

@@ -2,14 +2,14 @@
 //!
 //! # What this is (and what it is not)
 //!
-//! Every sequence owns one KV slot. Qwen3.8 text requests register with one persistent compute
+//! Every sequence owns one KV slot. Supported Qwen hybrid text requests register with one persistent compute
 //! worker before tokenization, then enqueue their prepared task and remain under that scheduler
 //! through completion; no request thread doubles as the cohort leader. Decode rows run
 //! layer-synchronously. Up to 96 uncached prompt tokens advance as teacher-forced rows in the same
 //! Decode-LRU graphs; longer prompts share the configured ubatch in one exclusive Prefill-ring
 //! phase before decode resumes. Stateless work and paged expert traffic are shared while every
-//! sequence retains independent positions, KV/recurrent state and sampling. Dense/sparse QSA rows
-//! form compatible subgroups but never fall back to independent request loops. Other architectures
+//! sequence retains independent positions, KV/recurrent state and sampling. Qwen3.8 dense/sparse
+//! QSA rows form compatible subgroups but never fall back to independent request loops. Other architectures
 //! and constrained generation retain the established interleaved path through
 //! [`crate::sampling::StepGate`].
 //!
@@ -306,6 +306,14 @@ fn phase_for_remaining_prefill(tokens: usize) -> BatchPhase {
         BatchPhase::ShortPrefill
     } else {
         BatchPhase::LongPrefill
+    }
+}
+
+fn long_prefill_cohort_limit(config: &Config) -> usize {
+    if config.qwen4exp {
+        MAX_DECODE_BATCH
+    } else {
+        1
     }
 }
 
@@ -1080,7 +1088,7 @@ impl ParallelSeam {
     }
 
     fn start_scheduler_worker(&mut self) -> Result<()> {
-        if self.gate.is_none() || !self.model.config().qwen4exp {
+        if self.gate.is_none() || !self.model.config().supports_parallel_token_rows() {
             return Ok(());
         }
         let stop = Arc::new(AtomicBool::new(false));
@@ -2251,7 +2259,7 @@ impl ParallelSeam {
             prompt_tokens = work.prompt_end,
             remaining = work.remaining_prefill(),
             phase = ?work.phase,
-            "prepared work for the unified Qwen3.8 scheduler"
+            "prepared work for the unified Qwen hybrid scheduler"
         );
         Ok(())
     }
@@ -2259,8 +2267,10 @@ impl ParallelSeam {
     fn run_long_prefill_phase(&self, active: &mut Vec<BatchWork>, req: &RequestCtx) -> Result<()> {
         let mut long = Vec::new();
         let mut token_work = Vec::with_capacity(active.len());
+        let long_prefill_limit = long_prefill_cohort_limit(self.model.config());
+        let batch_prefill_rows = long_prefill_limit > 1;
         for work in active.drain(..) {
-            if work.phase == BatchPhase::LongPrefill {
+            if work.phase == BatchPhase::LongPrefill && long.len() < long_prefill_limit {
                 long.push(work);
             } else {
                 token_work.push(work);
@@ -2306,21 +2316,39 @@ impl ParallelSeam {
             // avoids per-chunk baton release and prevents unrelated legacy work from rebuilding
             // Decode LRU between ring chunks.
             let _gate = req.gate_pass();
-            crate::seam::generate_dense_vulkan_parallel_prefill_session(
-                self.vk.as_ref(),
-                self.model.gguf(),
-                self.model.config(),
-                self.model.engine_cfg(),
-                self.model.embd(),
-                self.model.per_layer_embd(),
-                &prompts,
-                &mut primary,
-                &mut peers,
-                self.max_ctx,
-                &prepared,
-                Some(&report_progress),
-                None,
-            )
+            if batch_prefill_rows {
+                crate::seam::generate_dense_vulkan_parallel_prefill_session(
+                    self.vk.as_ref(),
+                    self.model.gguf(),
+                    self.model.config(),
+                    self.model.engine_cfg(),
+                    self.model.embd(),
+                    self.model.per_layer_embd(),
+                    &prompts,
+                    &mut primary,
+                    &mut peers,
+                    self.max_ctx,
+                    &prepared,
+                    Some(&report_progress),
+                    None,
+                )
+            } else {
+                debug_assert_eq!(prompts.len(), 1);
+                debug_assert!(peers.is_empty());
+                crate::seam::generate_dense_vulkan_prepared_prefill_session(
+                    self.vk.as_ref(),
+                    self.model.gguf(),
+                    self.model.config(),
+                    self.model.engine_cfg(),
+                    self.model.embd(),
+                    self.model.per_layer_embd(),
+                    &prompts[0],
+                    &mut primary,
+                    self.max_ctx,
+                    prepared[0].clone(),
+                )
+                .map(|stats| vec![stats])
+            }
         };
         long[0].kv = primary;
         for (work, kv) in long.iter_mut().skip(1).zip(peers) {
@@ -3699,7 +3727,7 @@ impl ParallelSeam {
                 && (effective.temp <= 0.0 || effective.top_k == 1)
                 && !req.sampling().penalties_active()
         });
-        let initially_eligible = self.model.config().qwen4exp
+        let initially_eligible = self.model.config().supports_parallel_token_rows()
             && constraint.is_none()
             && self.gate.is_some()
             && mtp_eligible
@@ -4057,8 +4085,8 @@ impl ParallelSeam {
 mod tests {
     use super::{
         concurrent_mtp_profitable, concurrent_mtp_ready, expand_multimodal_prompt,
-        mtp_accepted_rows, mtp_context_profitable, multimodal_key, multimodal_token_position,
-        phase_for_remaining_prefill, pick_continuation, scheduler_mode,
+        long_prefill_cohort_limit, mtp_accepted_rows, mtp_context_profitable, multimodal_key,
+        multimodal_token_position, phase_for_remaining_prefill, pick_continuation, scheduler_mode,
         should_handoff_multimodal_to_scheduler, token_lane_sort_key, BatchPhase,
         MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
     };
@@ -4076,6 +4104,28 @@ mod tests {
             phase_for_remaining_prefill(SHORT_PREFILL_TOKENS + 1),
             BatchPhase::LongPrefill
         );
+    }
+
+    #[test]
+    fn qwen35_batches_decode_but_serializes_long_prefill() {
+        let qwen35 = crate::Config {
+            qwen35: true,
+            ..Default::default()
+        };
+        assert!(qwen35.supports_parallel_token_rows());
+        assert_eq!(long_prefill_cohort_limit(&qwen35), 1);
+
+        let qwen4exp = crate::Config {
+            qwen4exp: true,
+            ..Default::default()
+        };
+        assert!(qwen4exp.supports_parallel_token_rows());
+        assert_eq!(
+            long_prefill_cohort_limit(&qwen4exp),
+            super::MAX_DECODE_BATCH
+        );
+
+        assert!(!crate::Config::default().supports_parallel_token_rows());
     }
 
     #[test]

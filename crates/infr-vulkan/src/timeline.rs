@@ -262,11 +262,55 @@ pub(crate) fn group(kernel: &'static str) -> &'static str {
         "HC_completion_interval"
     } else if kernel.contains("deltanet") || kernel.contains("conv1d") {
         "GDN_completion_interval"
-    } else if kernel.contains("mmv_id") || kernel.contains("moe") {
-        "MoE_completion_interval"
-    } else if kernel.contains("mmv") || kernel.contains("gemv") || kernel.contains("quant") {
-        "matrix_completion_interval"
+    } else if kernel.contains("expert_") || kernel.contains("mmv_id") || kernel.contains("moe") {
+        "Expert_completion_interval"
+    } else if kernel.contains("mmv")
+        || kernel.contains("gemv")
+        || kernel.contains("gemm")
+        || kernel.contains("linear")
+        || kernel.contains("lin_")
+    {
+        "Projection_completion_interval"
+    } else if kernel.contains("norm") || kernel.contains("rope") {
+        "NormRope_completion_interval"
+    } else if kernel.contains("silu")
+        || kernel.contains("sigmoid")
+        || kernel.contains("gated")
+        || kernel == "add"
+        || kernel == "mul"
+    {
+        "Elementwise_completion_interval"
+    } else if kernel.contains("store")
+        || kernel.contains("copy")
+        || kernel.contains("gather")
+        || kernel.contains("scatter")
+        || kernel.contains("quant")
+        || kernel.contains("zero")
+    {
+        "Data_completion_interval"
     } else {
         "other_completion_interval"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::group;
+
+    #[test]
+    fn prefill_timeline_groups_flashnext_kernels_by_work() {
+        assert_eq!(group("expert_gateup"), "Expert_completion_interval");
+        assert_eq!(group("expert_down"), "Expert_completion_interval");
+        assert_eq!(group("mmv_id_q4_k"), "Expert_completion_interval");
+        assert_eq!(
+            group("native_gemm_warp_q8_0_n128_ag"),
+            "Projection_completion_interval"
+        );
+        assert_eq!(group("qk_norm_rope_bda"), "NormRope_completion_interval");
+        assert_eq!(group("silu_mul"), "Elementwise_completion_interval");
+        assert_eq!(group("store_q8_seg"), "Data_completion_interval");
+        assert_eq!(group("qsa_indexer_topk"), "QSA_completion_interval");
+        assert_eq!(group("deltanet_seq"), "GDN_completion_interval");
+        assert_eq!(group("qwen_hc_mix"), "HC_completion_interval");
     }
 }

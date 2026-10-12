@@ -27,6 +27,14 @@ const QSA_TOPK_PARALLEL_MAX_GROUPS: u32 = 64;
 pub(crate) const RESIDENT_MAX_LAYERS: usize = 16;
 pub(crate) const RESIDENT_SEED_WORD: usize = 5 + 2 * RESIDENT_MAX_LAYERS;
 pub(crate) const RESIDENT_CONTROL_BYTES: usize = (RESIDENT_SEED_WORD + 1) * 4;
+// Resident journal ABI shared with gpu_resident_{check,hit_check}.comp. Keep routed ids and
+// per-row masks disjoint so every supported layout (up to two rows x top-16) is recoverable.
+pub(crate) const RESIDENT_JOURNAL_ID_WORDS: usize = 32;
+pub(crate) const RESIDENT_JOURNAL_MASK_WORD: usize = RESIDENT_JOURNAL_ID_WORDS;
+pub(crate) const RESIDENT_JOURNAL_MASK_WORDS: usize = 2;
+pub(crate) const RESIDENT_JOURNAL_STATUS_WORD: usize = 39;
+pub(crate) const RESIDENT_JOURNAL_WORDS: usize = 40;
+pub(crate) const RESIDENT_JOURNAL_BYTES: usize = RESIDENT_JOURNAL_WORDS * 4;
 
 const RESIDENT_DISPATCH_CAPACITY: usize = 8192;
 const RESIDENT_REGION_CAPACITY: usize = 4096;
@@ -1349,11 +1357,11 @@ impl<'a> Recorder<'a> {
         self.suppress.set(on);
     }
 
-    /// Override the label of the NEXT dispatch's timestamp (INFR_PROF_OPS). Consumed once — a
-    /// pre-set override wins over the automatic kernel-name label AND over the shape itemizers
-    /// below. No-op without prof_ops.
+    /// Override the label of the NEXT dispatch's timestamp. Consumed once — a pre-set override
+    /// wins over the automatic kernel-name label AND over the shape itemizers below. No-op unless
+    /// per-op profiling or the diagnostic device timeline is active.
     pub fn label_next(&self, label: &'static str) {
-        if self.prof_ops {
+        if self.prof_ops || self.timeline_query.borrow().is_some() {
             self.next_label.set(Some(label));
         }
     }
@@ -1439,8 +1447,9 @@ impl<'a> Recorder<'a> {
     /// longer stamp by hand (use [`label_next`](Self::label_next) to override a too-generic
     /// kernel name).
     fn stamp(&self, label: &'static str) {
+        let explicit_label = self.next_label.take();
         if let Some(query) = self.timeline_query.borrow_mut().as_mut() {
-            query.mark(crate::timeline::group(label));
+            query.mark(crate::timeline::group(explicit_label.unwrap_or(label)));
         }
         // Every dispatch funnels through here, so this is also where the recorder counts them —
         // the submit splitter (`Recorder::dispatches`) needs the count whether or not INFR_PROF_OPS
@@ -1449,7 +1458,7 @@ impl<'a> Recorder<'a> {
         if !self.prof_ops {
             return;
         }
-        let label = self.next_label.take().unwrap_or(label);
+        let label = explicit_label.unwrap_or(label);
         let idx = self.ts_labels.borrow().len() as u32;
         if idx >= Self::MAX_TS - 1 {
             self.ts_dropped.set(self.ts_dropped.get() + 1);
@@ -12210,8 +12219,8 @@ impl<'a> Recorder<'a> {
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .buffer(journal_buf.buffer)
-            .offset((journal_buf.sub_offset + params[5] as usize * 32 * 4) as u64)
-            .size(32 * 4);
+            .offset((journal_buf.sub_offset + params[5] as usize * RESIDENT_JOURNAL_BYTES) as u64)
+            .size(RESIDENT_JOURNAL_BYTES as u64);
         // Early recovery drains existing submissions rather than submitting an empty tail.
         // Publish its final run/stopped/reached/invalid words in the same notice dependency.
         let control_buf = Self::vk_of(control);
@@ -14795,7 +14804,9 @@ mod tests {
             "conditional rendering required"
         );
         let control = backend.alloc(16, BufferUsage::Readback).unwrap();
-        let journal = backend.alloc(4 * 32 * 4, BufferUsage::Readback).unwrap();
+        let journal = backend
+            .alloc(4 * RESIDENT_JOURNAL_BYTES, BufferUsage::Readback)
+            .unwrap();
         let tape = backend.alloc(3 * 16 * 8, BufferUsage::Staging).unwrap();
         let source = backend.alloc(4, BufferUsage::Staging).unwrap();
         backend
@@ -14972,7 +14983,9 @@ mod tests {
         }
         .unwrap();
         let control = backend.alloc(16, BufferUsage::Readback).unwrap();
-        let journal = backend.alloc(128, BufferUsage::Readback).unwrap();
+        let journal = backend
+            .alloc(RESIDENT_JOURNAL_BYTES, BufferUsage::Readback)
+            .unwrap();
         let tape = backend.alloc(512 * 3 * 8, BufferUsage::Staging).unwrap();
         // One routed triplet: IQ2_S gate/up plus IQ4_NL down, ne=2560, nff=640.
         let expert_bytes = 2 * (2560 * 640 / 256 * 82) + 2560 * 640 / 32 * 18;

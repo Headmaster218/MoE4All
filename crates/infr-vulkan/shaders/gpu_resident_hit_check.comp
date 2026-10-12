@@ -9,9 +9,12 @@ layout(push_constant) uniform Params {
     uint ordinal; uint used; uint shared_mask;
     uint immutable_predicates;
 } p;
+const uint JOURNAL_WORDS = 40u;
+const uint JOURNAL_MASK_WORD = 32u;
+const uint JOURNAL_STATUS_WORD = 39u;
 void main() {
     hit_run = 0;
-    journal[p.ordinal * 32 + 31] = 0;
+    journal[p.ordinal * JOURNAL_WORDS + JOURNAL_STATUS_WORD] = 0;
     if (p.immutable_predicates != 0) {
         predicates[p.ordinal * 2] = 0;
         predicates[p.ordinal * 2 + 1] = 0;
@@ -22,7 +25,7 @@ void main() {
     bool missing = false;
     for (uint i = 0; i < p.count; ++i) {
         uint id = ids[i];
-        journal[p.ordinal * 32 + i] = id;
+        journal[p.ordinal * JOURNAL_WORDS + i] = id;
         bool resident = false;
         if (id >= p.experts) invalid = 1;
         else resident = any(notEqual(addresses[p.gate_base + id], uvec2(0)))
@@ -37,11 +40,11 @@ void main() {
     for (uint row = 0; row < rows; ++row) {
         ids[p.count + row] = hit[row] | p.shared_mask;
         ids[p.count + rows + row] = miss[row];
-        journal[p.ordinal * 32 + 24 + row] = hit[row];
+        journal[p.ordinal * JOURNAL_WORDS + JOURNAL_MASK_WORD + row] = hit[row];
     }
     reached = p.ordinal + 1;
     hit_run = invalid == 0 ? 1 : 0;
-    journal[p.ordinal * 32 + 31] = invalid != 0 ? 3 : (missing ? 2 : 1);
+    journal[p.ordinal * JOURNAL_WORDS + JOURNAL_STATUS_WORD] = invalid != 0 ? 3 : (missing ? 2 : 1);
     if (missing) { run = 0; stopped = p.ordinal; }
     if (p.immutable_predicates != 0) {
         predicates[p.ordinal * 2] = run;
