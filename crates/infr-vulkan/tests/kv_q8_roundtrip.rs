@@ -377,7 +377,7 @@ fn planar_q8_dynac_matches_f16() {
     let of = be.alloc(nh * hd * 4, BufferUsage::Activations).unwrap();
     let (pm, pl, pacc, args) = mk();
     let rec = be.recorder().unwrap();
-    rec.attn_live_prologue(params.as_ref(), args.as_ref(), nh, chunk, 0);
+    rec.attn_live_prologue(params.as_ref(), args.as_ref(), nh, chunk, 1024, 0);
     rec.attention_kv_split_dynac(
         qb.as_ref(),
         kf.as_ref(),
@@ -396,6 +396,7 @@ fn planar_q8_dynac_matches_f16() {
         0.0,
         0,
         false,
+        false,
         0,
     );
     rec.finish().unwrap();
@@ -412,7 +413,7 @@ fn planar_q8_dynac_matches_f16() {
     let rec = be.recorder().unwrap();
     rec.store_q8(kf.as_ref(), kq.as_ref(), n, 0, cap, true, 0);
     rec.store_q8(vf.as_ref(), vq.as_ref(), n, 0, cap, true, 0);
-    rec.attn_live_prologue(params.as_ref(), args2.as_ref(), nh, chunk, 0);
+    rec.attn_live_prologue(params.as_ref(), args2.as_ref(), nh, chunk, 1024, 0);
     rec.attention_kv_split_dynac(
         qb.as_ref(),
         kq.as_ref(),
@@ -431,6 +432,7 @@ fn planar_q8_dynac_matches_f16() {
         0.0,
         0,
         true,
+        false,
         cap,
     );
     rec.finish().unwrap();

@@ -6966,6 +6966,51 @@ impl<'a> Recorder<'a> {
         }
     }
 
+    /// Decode-only QkNorm+RoPE fused directly into a flat planar-Q8 K cache. This removes the
+    /// intermediate f16 K row and the following store_q8 dispatch; the cache remains bound as the
+    /// inert write descriptor so ordinary recorder hazard tracking orders the attention read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qk_norm_rope_q8_dyn_at(
+        &self,
+        x: &dyn Buffer,
+        nw: &dyn Buffer,
+        params: &dyn Buffer,
+        y: &dyn Buffer,
+        y_addr: u64,
+        rows: usize,
+        nheads: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+        eps: f32,
+        kcap: usize,
+    ) {
+        let k = self.be.kernel(
+            "qk_norm_rope_dyn_q8_bda",
+            crate::gemm::qk_norm_rope_dyn_q8_bda_spv(),
+            4,
+            44,
+        );
+        let mut push = [0u8; 44];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(nheads as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(rope_dim as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&theta.to_ne_bytes());
+        push[24..28].copy_from_slice(&1u32.to_ne_bytes());
+        push[28..32].copy_from_slice(&eps.to_ne_bytes());
+        push[32..36].copy_from_slice(&(kcap as u32).to_ne_bytes());
+        push[36..40].copy_from_slice(&(y_addr as u32).to_ne_bytes());
+        push[40..44].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(nw), Self::vkb(params), Self::vkb(y)],
+            1,
+            &push,
+            (rows * nheads) as u32,
+        );
+    }
+
     /// `-DKV_BDA` twin of [`Self::qk_norm_rope_interleaved_dyn`]: writes the fused K cache at
     /// `y_addr` (pos from `params`). `y` stays bound at slot 3 (inert) for the store→read barrier.
     #[allow(clippy::too_many_arguments)]
@@ -8125,6 +8170,7 @@ impl<'a> Recorder<'a> {
                         self.vk().q8_decode_d8,
                         self.vk().q8_decode_ls128,
                         self.vk().q8_decode_ls256,
+                        false,
                         self.vk().q8_qk_f16,
                         self.vk().q8_pv_f16,
                         self.vk().q8_decode_chunk1024,
@@ -8793,34 +8839,36 @@ impl<'a> Recorder<'a> {
     }
 
     /// Record the split-K replay prologue ONCE per execute: derives the live chunk count from the
-    /// params SSBO's kv_len and writes `args = [nh·live, 1, 1, live]` — the indirect dispatch args
+    /// params SSBO's kv_len and writes `args = [work_heads·live, 1, 1, live]` — the indirect args
     /// and combine loop bound that every subsequent [`Self::attention_kv_split_dynac`] in the same
     /// execute shares (kv_len is the same for every layer of a token).
     pub fn attn_live_prologue(
         &self,
         params: &dyn Buffer,
         args: &dyn Buffer,
-        nh: usize,
+        work_heads: usize,
         chunk: usize,
+        max_chunk: usize,
         window: usize,
     ) {
         let kl = self
             .be
-            .kernel("attn_live", crate::gemm::attn_live_spv(), 2, 12);
-        let mut p0 = [0u8; 12];
-        p0[0..4].copy_from_slice(&(nh as u32).to_ne_bytes());
+            .kernel("attn_live", crate::gemm::attn_live_spv(), 2, 16);
+        let mut p0 = [0u8; 16];
+        p0[0..4].copy_from_slice(&(work_heads as u32).to_ne_bytes());
         p0[4..8].copy_from_slice(&(chunk as u32).to_ne_bytes());
-        p0[8..12].copy_from_slice(&(window as u32).to_ne_bytes());
+        p0[8..12].copy_from_slice(&(max_chunk as u32).to_ne_bytes());
+        p0[12..16].copy_from_slice(&(window as u32).to_ne_bytes());
         self.dispatch(kl, &[Self::vkb(params), Self::vkb(args)], 1, &p0, 1);
     }
 
     /// SELF-CHUNKING variant for record-once REPLAY over a growing kv_len. A one-thread prologue
     /// (`attn_live`) derives the adaptive chunk (~32 chunks/head, 64..512, floored by the baked
     /// minimum `chunk`) from the LIVE kv_len and writes the partial pass's INDIRECT dispatch args
-    /// (`args`, ≥16 bytes: [gx,gy,gz,live]) — so one recorded plan launches exactly nh·live
-    /// workgroups at every depth (no dead workgroups shallow, no re-record deep). The combine
-    /// loops the prologue's live count. `n_chunks` is only the pm/pl/pacc scratch STRIDE/capacity
-    /// (cap.div_ceil(chunk), ≤1024).
+    /// (`args`, ≥16 bytes: [gx,gy,gz,live]) — so one recorded plan launches exactly
+    /// work_heads·live workgroups at every depth (no dead workgroups shallow, no re-record deep).
+    /// `work_heads` is normally `nh`; fused GQA replay uses one work head per group. The combine
+    /// loops the prologue's live count. `n_chunks` is only the pm/pl/pacc scratch STRIDE/capacity.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_kv_split_dynac(
         &self,
@@ -8841,11 +8889,12 @@ impl<'a> Recorder<'a> {
         scale: f32,
         window: usize,
         q8: bool,
+        fuse_gqa4: bool,
         cap: usize,
     ) {
         self.attention_kv_split_dynac_impl(
             q, kc, vc, o, pm, pl, pacc, params, args, nh, nkv, hd, chunk, n_chunks, scale, window,
-            q8, cap, None,
+            q8, fuse_gqa4, cap, None,
         );
     }
 
@@ -8876,6 +8925,7 @@ impl<'a> Recorder<'a> {
         scale: f32,
         window: usize,
         q8: bool,
+        fuse_gqa4: bool,
         cap: usize,
     ) {
         self.attention_kv_split_dynac_impl(
@@ -8896,6 +8946,7 @@ impl<'a> Recorder<'a> {
             scale,
             window,
             q8,
+            fuse_gqa4,
             cap,
             Some((k_addr, v_addr)),
         );
@@ -8922,6 +8973,8 @@ impl<'a> Recorder<'a> {
         window: usize,
         // Q8_0 KV cache (K==V==q8): coalesced planar Q8 read variant. `false` = f16 cache.
         q8: bool,
+        // The caller's indirect grid uses nh/4 work heads and is compatible with GQA4 fusion.
+        fuse_gqa4: bool,
         // Planar Q8 scales region base = total cache elements (`cap`). Unused when `q8` is false.
         cap: usize,
         // #74 slice 2: Some((k_addr, v_addr)) selects the `-DKV_BDA` twins; None keeps bound SSBOs.
@@ -8960,9 +9013,9 @@ impl<'a> Recorder<'a> {
         // tape, so a specialization wired only into the static path above measures as zero gain.
         // Its SELF_CHUNK arm re-derives the identical adaptive chunk (`max(pc.chunk,
         // min(max(span/32,64),512))`) from the live kv_len, so the `attn_live` prologue's indirect
-        // grid — nh·live workgroups, one per (query head, chunk) — is unchanged and the prologue
-        // needs no edit. `chunk <= 512` keeps the derived chunk inside the kernel's `sc[512]` slab
-        // (the policy's own `min(.., 512)` only binds above the baked floor).
+        // grid — work_heads·live workgroups — uses the same live count. `chunk <= 512` keeps the
+        // derived chunk inside the kernel's score slab (the policy's own `min(.., 512)` only binds
+        // above the baked floor).
         //
         // Slice 3b widens this to `window > 0` (the `-DSWA -DRING` builds: the window mask floor
         // AND the ring row modulo an SWA layer's `window + ubatch`-row cache needs — this path
@@ -8971,17 +9024,35 @@ impl<'a> Recorder<'a> {
         // hd 256/512 (the `-DDHD4=64/128` builds). Anything else still falls back.
         let fast = if !crate::gemm::attn_decode_disabled(self.vk())
             && bda
-            && !q8
             && chunk <= 512
             // INFR_NO_ATTN_HD=1 A/Bs the hd 256/512 specialization; the family's hd256/hd512
             // builds ARE it, so leave those dims on `attn_partial_dynac_nohd_bda` when it is set.
             && (hd == 128 || !crate::gemm::attn_hd_spec_disabled(self.vk()))
         {
+            if q8 {
+                crate::gemm::attn_decode_q8_kernel(
+                    hd,
+                    window > 0,
+                    true,
+                    self.vk().q8_decode_d8,
+                    self.vk().q8_decode_ls128,
+                    self.vk().q8_decode_ls256,
+                    self.be.caps().i8_dot && self.vk().q8_qk_i8 && self.be.prefers_q8_qk_i8(),
+                    self.vk().q8_qk_f16,
+                    self.vk().q8_pv_f16,
+                    self.vk().q8_decode_replay_chunk1024,
+                    false,
+                    fuse_gqa4
+                        && self.vk().q8_decode_gqa4
+                        && self.be.prefers_q8_decode_gqa4_replay()
+                        && nh / nkv >= 4
+                        && (nh / nkv).is_multiple_of(4),
+                )
             // The replay graph cannot change pipelines as live kv_len grows. On Windows/RDNA3 the
             // general hd256 full-context build is already neutral at shallow depth and faster at
-            // 100k/200k, so bake that build for the whole replay. Q8 is excluded above; SWA and
-            // every unmeasured platform retain their existing specialization.
-            if hd == 256 && window == 0 && self.be.prefers_generic_hd256_decode() {
+            // 100k/200k, so bake that build for the whole replay. SWA and every unmeasured platform
+            // retain their existing specialization.
+            } else if hd == 256 && window == 0 && self.be.prefers_generic_hd256_decode() {
                 None
             } else {
                 crate::gemm::attn_decode_kernel(hd, window > 0, true)
@@ -9034,14 +9105,33 @@ impl<'a> Recorder<'a> {
             0,
         );
 
-        // pass 2: combine over the live chunks
-        let k2 = self.be.kernel(
-            "attn_combine_live",
-            crate::gemm::attn_combine_live_spv(),
-            5,
-            16,
-        );
-        let ntile = if hd.is_multiple_of(4) { 4u32 } else { 1u32 };
+        // pass 2: combine over the live chunks. The static path already uses subgroup reduction
+        // and 16 hd tiles for Q8/hd256; replay used to fall back to the serial four-tile combine,
+        // leaving the exact same optimization out of the production record-once path.
+        let combine_sg = hd == 256 && q8 && self.vk().q8_decode_combine_sg;
+        let k2 = if combine_sg {
+            self.be.kernel_sg(
+                "attn_combine_live_hybrid",
+                crate::gemm::attn_combine_live_hybrid_spv(),
+                5,
+                16,
+                32,
+            )
+        } else {
+            self.be.kernel(
+                "attn_combine_live",
+                crate::gemm::attn_combine_live_spv(),
+                5,
+                16,
+            )
+        };
+        let ntile = if combine_sg {
+            16u32
+        } else if hd.is_multiple_of(4) {
+            4u32
+        } else {
+            1u32
+        };
         // attn_combine.comp splits hd as `hdt = hd/ntile`; a non-divisor ntile drops the top
         // hd-ntile*hdt dims (left uninitialized). ntile is 4 only when hd%4==0, else 1, so hd%ntile==0
         // always holds — this pins that invariant at the call site (never fires for shipped hd).
@@ -15815,7 +15905,7 @@ mod tests {
         .unwrap();
         let args = be.alloc(16, BufferUsage::Activations).unwrap();
         let rec = be.recorder().unwrap();
-        rec.attn_live_prologue(params.as_ref(), args.as_ref(), nh, chunk, win);
+        rec.attn_live_prologue(params.as_ref(), args.as_ref(), nh, chunk, 512, win);
         rec.attention_kv_split_dynac(
             bq.as_ref(),
             bk.as_ref(),
@@ -15834,6 +15924,7 @@ mod tests {
             scale,
             win,
             false, // f16 KV cache
+            false, // fused GQA4 grid
             0,     // cap (unused for f16)
         );
         rec.finish().unwrap();

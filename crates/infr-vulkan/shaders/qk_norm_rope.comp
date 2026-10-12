@@ -3,6 +3,13 @@
 // Assumes rope_dim == hd (Qwen3). x [rows, nheads, hd] f32, nw [hd] f32, y f16 (q buffer / KV cache).
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#ifdef KV_Q8
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#endif
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
@@ -57,6 +64,9 @@ layout(binding = 2) readonly buffer YB { uvec2 segments[]; };
 layout(binding = 2) buffer YB { float16_t y[]; };
 #endif
 #ifdef KV_BDA
+#ifdef KV_Q8
+#define KV_STORE_BYTE
+#endif
 #include "kv_addr.glsl"
 #ifdef KV_SEGMENTED
 void kvw(uint idx, float val) {
@@ -66,7 +76,11 @@ void kvw(uint idx, float val) {
 }
 #define KVW(idx, val) kvw((idx), (val))
 #else
+#ifdef KV_Q8
+#define KVW(idx, val) xs[(idx) % pc.hd] = float(float16_t(val))
+#else
 #define KVW(idx, val) kv_store_half(k_addr, (idx), (val))
+#endif
 #endif
 #else
 #define KVW(idx, val) y[idx] = float16_t(val)
@@ -127,4 +141,44 @@ void main() {
     for (uint i = pc.rope_dim + t; i < pc.hd; i += 64u) {
         KVW(out_base_idx + i, xs[i] * scale * nw[i]);
     }
+#ifdef KV_Q8
+    // The K row is consumed from planar Q8 immediately after this dispatch. Keep the rotated row
+    // in LDS, then let the two wave32 subgroups quantize independent native 32-element blocks.
+    barrier();
+    uint lane = t & 31u;
+    uint slot = t >> 5u;
+    uint row = (pc.kcap > 0u) ? (p_pos % pc.kcap) : p_pos;
+    uint row_width = pc.nheads * pc.hd;
+    uint cap = pc.kcap * row_width;
+    uint nblk = pc.hd / 32u;
+    for (uint base = 0u; base < nblk; base += 2u) {
+        uint blk = base + slot;
+        uint i = blk * 32u + lane;
+        bool valid = blk < nblk;
+        float v = valid ? xs[i] : 0.0;
+        red[t] = abs(v);
+        barrier();
+        for (uint stride = 16u; stride > 0u; stride >>= 1u) {
+            if (valid && lane < stride) {
+                red[t] = max(red[t], red[t + stride]);
+            }
+            barrier();
+        }
+        if (valid) {
+            float amax = red[slot * 32u];
+            float d = amax / 127.0;
+            float inv = amax > 0.0 ? 1.0 / d : 0.0;
+            int q = clamp(int(round(v * inv)), -127, 127);
+            uint elem = row * row_width + h * pc.hd + i;
+            kv_store_byte(k_addr, elem, uint(q) & 0xffu);
+            if (lane == 0u) {
+                uint sb = cap + (elem / 32u) * 2u;
+                uint16_t bits = float16BitsToUint16(float16_t(d));
+                kv_store_byte(k_addr, sb, uint(bits & uint16_t(0xffu)));
+                kv_store_byte(k_addr, sb + 1u, uint(bits >> 8));
+            }
+        }
+        barrier();
+    }
+#endif
 }

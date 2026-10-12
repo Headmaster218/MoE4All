@@ -2906,6 +2906,19 @@ impl VulkanBackend {
         cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
     }
 
+    /// The hd256/Q8/GQA4 replay layout measured on Windows/Navi 31. Its register/LDS tradeoff is
+    /// device-sensitive, so unmeasured drivers and architectures
+    /// retain the established per-query-head replay kernel even when the feature knobs are enabled.
+    pub(crate) fn prefers_q8_decode_gqa4_replay(&self) -> bool {
+        cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+    }
+
+    /// The planar-Q8 hd256 query-int8 path measured on Windows/Navi 31. Packed integer-dot is
+    /// still checked separately; other devices retain fp16 Q.K until they have matched A/B data.
+    pub(crate) fn prefers_q8_qk_i8(&self) -> bool {
+        cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+    }
+
     fn measured_decode_kernel_device(&self) -> bool {
         cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
     }

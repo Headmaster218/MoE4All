@@ -1957,7 +1957,11 @@ fn sm_buf(
 /// same-key layers share one prologue dispatch and one scratch set.
 struct DynAttnCtx {
     nh: usize,
+    /// Partial-pass workgroups per live chunk. Equal to `nh` normally and `nh / 4` only for the
+    /// narrowly gated Q8 GQA4 replay specialization.
+    work_heads: usize,
     chunk: usize,
+    max_chunk: usize,
     n_chunks: usize,
     hd: usize,
     window: usize,
@@ -2211,6 +2215,54 @@ pub(crate) const MLA_MAX_KEY_LEN: u32 = 576;
 /// MIRRORS `#define MLA_MAX_KV_LORA_RANK` in `shaders/mla.comp`; see [`MLA_MAX_KEY_LEN`].
 pub(crate) const MLA_MAX_KV_LORA_RANK: u32 = 512;
 
+/// Record-once-only Q8 K-write fusion. The shared core peephole deliberately covers f16 caches;
+/// this Vulkan extension additionally recognizes QkNormRope -> WriteKv(Q8_0) when the destination
+/// is a flat BDA cache and the one-row decode kernel can quantize the rotated row in LDS.
+fn q8_kv_write_replay_fusions(
+    graph: &Graph,
+    scratch: &[Option<Box<dyn Buffer>>],
+    bindings: &Bindings,
+) -> Result<HashMap<usize, TensorId>> {
+    let mut out = HashMap::new();
+    for (i, op) in graph.ops.iter().enumerate() {
+        let Op::QkNormRope {
+            dst,
+            rows: 1,
+            x_stride: 0,
+            freq_factors: None,
+            ..
+        } = op
+        else {
+            continue;
+        };
+        if !matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal)
+            || !matches!(graph.desc(*dst).dtype, infr_core::DType::F16)
+        {
+            continue;
+        }
+        let Some(Op::WriteKv {
+            src,
+            cache,
+            rows: 1,
+            ..
+        }) = graph.ops.get(i + 1)
+        else {
+            continue;
+        };
+        if src != dst
+            || !matches!(graph.desc(*cache).dtype, infr_core::DType::Q8_0)
+            || !infr_core::fusion::dst_only_read_by_next(graph, i + 2, *dst)
+        {
+            continue;
+        }
+        let cache_buf = resolve(scratch, bindings, *cache)?;
+        if cache_buf.device_addr().is_some() && segmented_kv_view(cache_buf).is_none() {
+            out.insert(i, *cache);
+        }
+    }
+    Ok(out)
+}
+
 /// Lower ONE graph op into the recorder. Shared by the static (`execute_static`) and record-once
 /// (`record_decode_replay`) paths — only the three pos-dependent ops branch on `mode`.
 #[allow(clippy::too_many_arguments)]
@@ -2224,6 +2276,7 @@ fn lower_op(
     scratch: &[Option<Box<dyn Buffer>>],
     bindings: &Bindings,
     fused_kv_write: &HashMap<usize, (TensorId, usize)>,
+    fused_q8_kv_write: &HashMap<usize, TensorId>,
     fused_add: &HashMap<usize, (TensorId, TensorId)>,
     mode: &RopeMode,
     transient: &mut Vec<Box<dyn Buffer>>,
@@ -4708,6 +4761,32 @@ fn lower_op(
             x_stride,
             ..
         } => {
+            if let Some(&cache) = fused_q8_kv_write.get(&op_idx) {
+                let RopeMode::Dynamic(params) = mode else {
+                    return Err(be("Q8 K-write fusion requires record-once decode"));
+                };
+                let out = r(cache)?;
+                let addr = out
+                    .device_addr()
+                    .ok_or_else(|| be("Q8 K-write fusion requires a flat BDA cache"))?;
+                let row = (*n_head as usize) * (*head_dim as usize);
+                let kcap = graph.desc(cache).numel() / row.max(1);
+                rec.qk_norm_rope_q8_dyn_at(
+                    r(*x)?,
+                    r(*weight)?,
+                    *params,
+                    out,
+                    addr,
+                    *rows as usize,
+                    *n_head as usize,
+                    *head_dim as usize,
+                    *rope_dim as usize,
+                    *theta,
+                    *eps,
+                    kcap,
+                );
+                return Ok(());
+            }
             // `fused` carries the WRITE ROW (already `pos % cap_rows` for an SWA ring cache —
             // see `kv_write_peephole`); `kcap` is the fused cache's row capacity for the DYNAMIC
             // path, where the row must be derived from the live params pos in-kernel (the ring
@@ -5408,6 +5487,49 @@ fn lower_op(
                     infr_core::tier::baked_chunk(cap_rows, ATTN_MAX_CHUNKS, ATTN_SPLIT.min_chunk);
                 let n_chunks = infr_core::tier::n_chunks(cap_rows, chunk);
                 if hd % 4 == 0 && hd <= 512 && n_chunks > 1 {
+                    let kb = r(*k_cache)?;
+                    let vb = r(*v_cache)?;
+                    let group = nh / nkv.max(1);
+                    let fast_q8 = (kv_q8
+                        && !crate::gemm::attn_decode_disabled(&be_.cfg().kernels.vulkan)
+                        && !crate::gemm::attn_hd_spec_disabled(&be_.cfg().kernels.vulkan)
+                        && chunk <= 512
+                        && kb.device_addr().is_some()
+                        && vb.device_addr().is_some())
+                    .then(|| {
+                        crate::gemm::attn_decode_q8_kernel(
+                            hd,
+                            window > 0,
+                            true,
+                            be_.cfg().kernels.vulkan.q8_decode_d8,
+                            be_.cfg().kernels.vulkan.q8_decode_ls128,
+                            be_.cfg().kernels.vulkan.q8_decode_ls256,
+                            be_.caps().i8_dot
+                                && be_.cfg().kernels.vulkan.q8_qk_i8
+                                && be_.prefers_q8_qk_i8(),
+                            be_.cfg().kernels.vulkan.q8_qk_f16,
+                            be_.cfg().kernels.vulkan.q8_pv_f16,
+                            be_.cfg().kernels.vulkan.q8_decode_replay_chunk1024,
+                            false,
+                            kv_q8
+                                && be_.cfg().kernels.vulkan.q8_decode_gqa4
+                                && be_.prefers_q8_decode_gqa4_replay()
+                                && group >= 4
+                                && group.is_multiple_of(4),
+                        )
+                    })
+                    .flatten();
+                    let work_heads = match fast_q8.map(|(name, _)| name) {
+                        Some("attn_decode_hd256_q8_gqa4_dynac") => nh / 4,
+                        _ => nh,
+                    };
+                    let max_chunk = if fast_q8.is_some()
+                        && be_.cfg().kernels.vulkan.q8_decode_replay_chunk1024
+                    {
+                        Q8_HD256_DECODE_SPLIT.max_chunk
+                    } else {
+                        ATTN_SPLIT.max_chunk
+                    };
                     // ONE prologue + ONE scratch set per (nh, hd, chunk, n_chunks, window) key:
                     // the first Dynamic attention op of a shape records/allocates; every later
                     // same-shape layer reuses (kv_len is per-token, and the layers' attention ops
@@ -5416,17 +5538,28 @@ fn lower_op(
                     // handful of keys coexist per execute.
                     let key = |c: &DynAttnCtx| {
                         c.nh == nh
+                            && c.work_heads == work_heads
                             && c.chunk == chunk
+                            && c.max_chunk == max_chunk
                             && c.n_chunks == n_chunks
                             && c.hd == hd
                             && c.window == window
                     };
                     if !dyn_args.iter().any(key) {
                         let args = be_.alloc_uninit(16, BufferUsage::Activations)?;
-                        rec.attn_live_prologue(*params, args.as_ref(), nh, chunk, window);
+                        rec.attn_live_prologue(
+                            *params,
+                            args.as_ref(),
+                            work_heads,
+                            chunk,
+                            max_chunk,
+                            window,
+                        );
                         dyn_args.push(DynAttnCtx {
                             nh,
+                            work_heads,
                             chunk,
+                            max_chunk,
                             n_chunks,
                             hd,
                             window,
@@ -5443,8 +5576,6 @@ fn lower_op(
                     // resident decode path, KV is never the dequant scratch here). The caches persist
                     // across replay, so their addresses are stable in the baked push. Bit-identical to
                     // the bound dispatch (kept dual-arm: attn_partial's .comp also serves prefill).
-                    let kb = r(*k_cache)?;
-                    let vb = r(*v_cache)?;
                     match (kb.device_addr(), vb.device_addr()) {
                         (Some(ka), Some(va)) => rec.attention_kv_split_dynac_at(
                             r(*q)?,
@@ -5466,6 +5597,7 @@ fn lower_op(
                             pscale,
                             window,
                             kv_q8,
+                            work_heads == nh / 4,
                             cap,
                         ),
                         _ => rec.attention_kv_split_dynac(
@@ -5486,6 +5618,7 @@ fn lower_op(
                             pscale,
                             window,
                             kv_q8,
+                            work_heads == nh / 4,
                             cap,
                         ),
                     }
@@ -8176,9 +8309,15 @@ fn record_decode_replay(
         })
         .ok_or_else(|| be("vulkan adapter: eligible decode has no positions tensor"))?;
     let plan = infr_core::fusion::plan_fusions(graph, &fusion_cfg(be_));
+    let fused_q8_kv_write = if be_.cfg().kernels.vulkan.q8_kv_write_fusion {
+        q8_kv_write_replay_fusions(graph, &scratch, bindings)?
+    } else {
+        HashMap::new()
+    };
     let fused_kv_write = plan.kv_write;
     let fused_add = plan.linear_add;
     let mut skip_op = plan.skip;
+    skip_op.extend(fused_q8_kv_write.keys().map(|&i| i + 1));
 
     let mut transient: Vec<Box<dyn Buffer>> = Vec::new();
     let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
@@ -8292,6 +8431,7 @@ fn record_decode_replay(
             &scratch,
             bindings,
             &fused_kv_write,
+            &fused_q8_kv_write,
             &fused_add,
             &mode,
             &mut transient,
@@ -9169,6 +9309,7 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
         );
     }
     let fused_kv_write = plan.kv_write;
+    let fused_q8_kv_write = HashMap::new();
     let fused_add = plan.linear_add;
     let mut skip_op = plan.skip;
     // Strict decode-only Qwen peephole. Only suppress the six dense shared-expert ops when the
@@ -9562,6 +9703,7 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
                         scratch,
                         bindings,
                         &fused_kv_write,
+                        &fused_q8_kv_write,
                         &fused_add,
                         &mode,
                         &mut transient,
@@ -9591,6 +9733,7 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
             scratch,
             bindings,
             &fused_kv_write,
+            &fused_q8_kv_write,
             &fused_add,
             &mode,
             &mut transient,

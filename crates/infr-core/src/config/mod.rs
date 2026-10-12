@@ -523,9 +523,21 @@ cfg_struct! {
         /// kernel to use 1024-key chunks. All f16, prefill and other head-dim paths stay capped at
         /// 512; disabling this restores the previous Q8 split/combine geometry.
         q8_decode_chunk1024: bool = true,
+        /// `INFR_Q8_DECODE_REPLAY_CHUNK1024` — extend the record-once Q8 hd256 decode tape from
+        /// 512 to 1024 keys per split. The isolated kernel is faster, but the Qwen3.6-35B paged-MoE
+        /// end-to-end path regressed at both 30K and 150K, so production replay keeps 512 by default.
+        q8_decode_replay_chunk1024: bool = false,
         /// `INFR_NO_Q8_QK_F16` (inverted) — use packed fp16 products for the Q8 hd256 Q.K pass;
         /// softmax and P.V accumulation remain fp32. The fp32 Q.K build remains a fallback.
         q8_qk_f16: bool = true,
+        /// `INFR_NO_Q8_QK_I8` (inverted) — allow measured devices to quantize the one-token query
+        /// per native Q8 block and use packed signed-int8 dot products against cached K codes.
+        /// Device policy keeps unmeasured drivers on the fp16 Q.K path.
+        q8_qk_i8: bool = true,
+        /// `INFR_Q8_KV_WRITE_FUSION` — in record-once decode, quantize the rotated K
+        /// row directly from QkNormRope's LDS into the planar Q8 cache. Disabling it restores the
+        /// f16 scratch write followed by the standalone Q8 quantization dispatch.
+        q8_kv_write_fusion: bool = false,
         /// `INFR_NO_Q8_PV_F16` (inverted) — use packed fp16 only for Q8 V dequantization before
         /// converting back to fp32; softmax weighting and P.V accumulation remain fp32.
         q8_pv_f16: bool = true,

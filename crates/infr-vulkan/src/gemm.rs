@@ -4084,6 +4084,7 @@ dyn_spv!(rope_f16_bda_spv, "rope_f16_bda");
 dyn_spv!(rope_f16_dyn_bda_spv, "rope_f16_dyn_bda");
 dyn_spv!(qk_norm_rope_bda_spv, "qk_norm_rope_bda");
 dyn_spv!(qk_norm_rope_dyn_bda_spv, "qk_norm_rope_dyn_bda");
+dyn_spv!(qk_norm_rope_dyn_q8_bda_spv, "qk_norm_rope_dyn_q8_bda");
 dyn_spv!(qk_norm_rope_ff_bda_spv, "qk_norm_rope_ff_bda");
 dyn_spv!(qk_norm_rope_dyn_ff_bda_spv, "qk_norm_rope_dyn_ff_bda");
 dyn_spv!(
@@ -4232,8 +4233,21 @@ dyn_spv!(attn_decode_swa_spv, "attn_decode_swa");
 dyn_spv!(attn_decode_swa_dynac_spv, "attn_decode_swa_dynac");
 dyn_spv!(attn_decode_hd256_spv, "attn_decode_hd256");
 dyn_spv!(attn_decode_hd256_q8_spv, "attn_decode_hd256_q8");
+dyn_spv!(attn_decode_hd256_q8_dynac_spv, "attn_decode_hd256_q8_dynac");
+dyn_spv!(
+    attn_decode_hd256_q8_i8_dynac_spv,
+    "attn_decode_hd256_q8_i8_dynac"
+);
+dyn_spv!(
+    attn_decode_hd256_q8_i8_c512_dynac_spv,
+    "attn_decode_hd256_q8_i8_c512_dynac"
+);
 dyn_spv!(attn_decode_hd256_q8_gqa2_spv, "attn_decode_hd256_q8_gqa2");
 dyn_spv!(attn_decode_hd256_q8_gqa4_spv, "attn_decode_hd256_q8_gqa4");
+dyn_spv!(
+    attn_decode_hd256_q8_gqa4_dynac_spv,
+    "attn_decode_hd256_q8_gqa4_dynac"
+);
 dyn_spv!(attn_decode_hd256_q8_c512_spv, "attn_decode_hd256_q8_c512");
 dyn_spv!(attn_decode_hd256_q8_ls64_spv, "attn_decode_hd256_q8_ls64");
 dyn_spv!(attn_decode_hd256_q8_ls128_spv, "attn_decode_hd256_q8_ls128");
@@ -4310,6 +4324,7 @@ pub(crate) fn attn_decode_q8_kernel(
     d8: bool,
     ls128: bool,
     ls256: bool,
+    qk_i8: bool,
     qk_f16: bool,
     pv_f16: bool,
     chunk1024: bool,
@@ -4317,6 +4332,22 @@ pub(crate) fn attn_decode_q8_kernel(
     gqa4: bool,
 ) -> Option<(&'static str, &'static [u32])> {
     match (hd, swa, dynac) {
+        (256, false, true) if d8 && ls256 && qk_i8 && pv_f16 && chunk1024 => Some((
+            "attn_decode_hd256_q8_i8_dynac",
+            attn_decode_hd256_q8_i8_dynac_spv(),
+        )),
+        (256, false, true) if d8 && ls256 && qk_i8 && pv_f16 => Some((
+            "attn_decode_hd256_q8_i8_c512_dynac",
+            attn_decode_hd256_q8_i8_c512_dynac_spv(),
+        )),
+        (256, false, true) if d8 && ls256 && qk_f16 && pv_f16 && chunk1024 && gqa4 => Some((
+            "attn_decode_hd256_q8_gqa4_dynac",
+            attn_decode_hd256_q8_gqa4_dynac_spv(),
+        )),
+        (256, false, true) if d8 && ls256 && qk_f16 && pv_f16 && chunk1024 => Some((
+            "attn_decode_hd256_q8_dynac",
+            attn_decode_hd256_q8_dynac_spv(),
+        )),
         (256, false, false) if d8 && ls256 && qk_f16 && pv_f16 && chunk1024 && gqa4 => {
             Some(("attn_decode_hd256_q8_gqa4", attn_decode_hd256_q8_gqa4_spv()))
         }
@@ -4443,6 +4474,13 @@ pub(crate) fn attn_partial_dynac_spv() -> &'static [u32] {
 pub(crate) fn attn_combine_live_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(ATTN_COMBINE_LIVE_SPV_BYTES))
+}
+/// Depth-adaptive serial/Wave32 live-count combine used by record-once replay.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn attn_combine_live_hybrid_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_combine_live_hybrid.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
 }
 /// SPIR-V for the split-K replay prologue (indirect args + live count from kv_len).
 #[cfg_attr(infr_profile, infr_prof::instrument)]

@@ -40,14 +40,17 @@
 //   no planar-Q8 · no mainline-inline quant KV · chunk <= 512 (the `sc[]` score slab) ·
 //   hd exactly 4*DHD4.
 //
-// The grid (one workgroup per query head × chunk, g heads sharing a kv-head/chunk kept CONSECUTIVE),
-// the adaptive chunk policy, the pm/pl/pacc layout and pass 2 (`attn_combine` / `attn_combine_live`)
-// are all `attn_partial`'s unchanged — this is a drop-in for pass 1 only, and the `attn_live`
-// prologue that writes the indirect grid needs no change because the grid shape is the same.
+// The ordinary grid remains one workgroup per query head × chunk. GQA2/GQA4 builds instead own
+// two/four adjacent query heads per workgroup while preserving the same pm/pl/pacc layout and pass
+// 2 (`attn_combine` / `attn_combine_live`). Record-once replay therefore sends `nh/gqa` as the
+// prologue's work-head count for a fused build; every non-fused build still sends `nh`.
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #ifdef KVQ8_D8
 #extension GL_KHR_shader_subgroup_clustered : require
+#endif
+#ifdef QK_I8
+#extension GL_EXT_integer_dot_product : require
 #endif
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
@@ -187,8 +190,9 @@ void main() {
     // Record-once replay with a growing kv_len: chunk/n_chunks are baked at record, so derive the
     // SAME adaptive policy the `attn_live` prologue and `attn_partial`'s SELF_CHUNK arm use (~32
     // chunks/head, 64..512, floored by the baked minimum pc.chunk) from the LIVE kv_len. The
-    // prologue dispatches EXACTLY nh·live workgroups (indirect), so the workgroup → (head, chunk)
-    // decomposition must use the live count, NOT pc.n_chunks (only the pm/pl/pacc scratch stride).
+    // prologue dispatches EXACTLY work_heads·live workgroups (indirect), so the workgroup →
+    // (head group, chunk) decomposition must use the live count, NOT pc.n_chunks (only the
+    // pm/pl/pacc scratch stride).
     uint kv_len = p_kvlen;
     uint qpos1 = kv_len;
     // Sliding window: this row attends only keys j >= lo. The chunk grid is offset by `lo` and
@@ -199,10 +203,24 @@ void main() {
     uint lo = 0u;
 #endif
     uint span = kv_len - lo;
+#ifdef Q8_CHUNK1024
+    uint chunkv = max(pc.chunk, min(max(span / 32u, 64u), 1024u));
+#else
     uint chunkv = max(pc.chunk, min(max(span / 32u, 64u), 512u));
+#endif
     uint live = (span + chunkv - 1u) / chunkv;
+#ifdef GQA4
+    uint gp = g >> 2u;
+    uint hh = (gl_WorkGroupID.x % gp) * 4u;
+    uint rest = gl_WorkGroupID.x / gp;
+#elif defined(GQA2)
+    uint gp = g >> 1u;
+    uint hh = (gl_WorkGroupID.x % gp) * 2u;
+    uint rest = gl_WorkGroupID.x / gp;
+#else
     uint hh = gl_WorkGroupID.x % g;
     uint rest = gl_WorkGroupID.x / g;
+#endif
     uint c = rest % live;
     uint kvh = rest / live;
     uint h = kvh * g + hh;
@@ -605,14 +623,28 @@ void main() {
     // cache's scale granularity.
     uint dl = lane & 7u;
     uint kl = lane >> 3u;
-#ifdef QK_F16
+#ifdef QK_I8
+    int qreg[8];
+    float qscale[8];
+#elif defined(QK_F16)
     f16vec4 qreg[8];
 #else
     vec4 qreg[8];
 #endif
     uint qbase = h * 64u;
     for (uint i = 0u; i < 8u; i++) {
-#ifdef QK_F16
+#ifdef QK_I8
+        vec4 qv = vec4(q4[qbase + dl + 8u * i]);
+        float amax = subgroupClusteredMax(
+            max(max(abs(qv.x), abs(qv.y)), max(abs(qv.z), abs(qv.w))),
+            8u
+        );
+        float inv = amax > 0.0 ? 127.0 / amax : 0.0;
+        ivec4 qi = clamp(ivec4(round(qv * inv)), ivec4(-127), ivec4(127));
+        uvec4 qu = uvec4(qi) & uvec4(0xffu);
+        qreg[i] = int(qu.x | (qu.y << 8u) | (qu.z << 16u) | (qu.w << 24u));
+        qscale[i] = amax / 127.0;
+#elif defined(QK_F16)
         qreg[i] = q4[qbase + dl + 8u * i];
 #else
         qreg[i] = vec4(q4[qbase + dl + 8u * i]);
@@ -662,13 +694,17 @@ void main() {
         uint key = jb + kl;
         bool ok = key < j1;
         uint rb = RROW(ok ? key : j0) * kb + kh;
-#ifdef QK_F16
+#ifdef QK_I8
+        int a[8];
+#elif defined(QK_F16)
         f16vec4 a[8];
 #else
         vec4 a[8];
 #endif
         for (uint i = 0u; i < 8u; i++) {
-#ifdef QK_F16
+#ifdef QK_I8
+            a[i] = int(kv_word(k_addr, rb + 8u * i));
+#elif defined(QK_F16)
             a[i] = q8read4h(k_addr, rb + 8u * i);
 #else
             a[i] = kread4(rb + 8u * i);
@@ -676,7 +712,14 @@ void main() {
         }
         float part = 0.0;
         for (uint i = 0u; i < 8u; i++) {
-#ifdef QK_F16
+#ifdef QK_I8
+            uint bi = (rb + 8u * i) >> 3u;
+            float kd = unpackHalf2x16(
+                kv_word(k_addr, (pc.cap >> 2u) + (bi >> 1u))
+            )[bi & 1u];
+            int ip = dotPacked4x8AccSatEXT(qreg[i], a[i], 0);
+            part += float(ip) * qscale[i] * kd;
+#elif defined(QK_F16)
             part += float(dot(qreg[i], a[i]));
 #else
             part += dot(qreg[i], a[i]);
