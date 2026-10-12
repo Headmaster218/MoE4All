@@ -129,7 +129,8 @@ async function run(count, depth) {
     '--dev', 'Vulkan1', '--temp', '0', '--seed', '1', '--no-think', '--max-new', String(tokens),
     '--set', 'device.auto_profile=aggressive', '--set', 'kv.type_k=q8_0', '--set', 'kv.type_v=q8_0',
     '--set', 'kv.overflow=false', '--set', `kv.session_cache_dir=${sharedKv || ''}`, '--set', 'spec.mtp=false',
-    '--set', 'prof.ops=false', '--set', `prof.stages=${process.env.TRACE_PROFILE_STAGES === '1'}`,
+    '--set', `prof.ops=${process.env.TRACE_PROFILE_OPS === '1'}`,
+    '--set', `prof.stages=${process.env.TRACE_PROFILE_STAGES === '1'}`,
     '--set', `prof.pager_profile=${process.env.TRACE_PROFILE_PAGER === '1'}`,
     '--set', 'paging.expert_prefetch=false',
     '--set', 'sampling.ignore_eos=true', '--set', `serve.shutdown_file=${shutdown}`];

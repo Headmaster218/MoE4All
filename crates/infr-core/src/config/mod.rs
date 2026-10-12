@@ -426,8 +426,15 @@ cfg_struct! {
         decode_gpu_resident_immutable_predicates: bool = false,
         /// Receive GPU notices and prepare miss uploads on a separate host producer thread (A/B).
         decode_gpu_resident_notice_thread: bool = false,
+        /// Copy small mapped miss batches on the notice producer. None selects the context-aware
+        /// Decode policy; Some(0) disables it and Some(KiB) is an explicit A/B override.
+        /// Capped at 8192; imported DMA and ordinary/Prefill uploads are unchanged.
+        decode_gpu_resident_mapped_serial_max_kib: Option<usize> = None,
         /// Experimental queued miss recovery before retiring old resident chunks (rolling cap 1).
         decode_gpu_resident_early_recovery: bool = false,
+        /// Ordinary FlashNext Decode full-graph mode. None enables it for short contexts only;
+        /// Some(false/true) is an explicit diagnostic override.
+        decode_gpu_resident_full_graph: Option<bool> = None,
         /// A/B GPU-produced indirect dispatch sizes instead of conditional-rendering commands.
         decode_gpu_resident_indirect_predicates: bool = false,
         /// Submit a CPU-miss result/merge immediately instead of waiting for the next router (A/B).

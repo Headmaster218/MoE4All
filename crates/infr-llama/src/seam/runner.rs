@@ -19,7 +19,7 @@ use super::{
 use crate::seam::TokenEmbd;
 use crate::{Config, EngineConfig, GenStats, PerLayerEmbd};
 use anyhow::{anyhow, Context, Result as AResult};
-use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage};
+use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Plan};
 use infr_core::graph::{
     Activation, AttnMask, Dsv4CacheFormat, Graph, HyperGates, MoePrefetchHint, Op, SequenceSpan,
 };
@@ -302,6 +302,38 @@ fn lm_head_sampling_input(
         n: (logits_rows * dim) as u32,
     });
     suffix
+}
+
+fn resident_full_graph_decode(
+    c: &Config,
+    ec: &EngineConfig,
+    backend: &str,
+    lanes: usize,
+    sample_from: usize,
+    capture_hidden: bool,
+    multimodal: bool,
+    context_tokens: usize,
+) -> bool {
+    ec.kernels
+        .vulkan
+        .decode_gpu_resident_full_graph
+        .unwrap_or(context_tokens <= 96 * 1024)
+        && ec.kernels.vulkan.decode_gpu_resident
+        && backend == "vulkan"
+        && c.qwen4exp
+        && c.n_layer > 1
+        && c.n_embd == 2560
+        && c.hc_mult == 4
+        && c.moe
+            .as_ref()
+            .is_some_and(|moe| moe.n_expert == 512 && moe.n_used == 10 && moe.n_ff_exp == 640)
+        && (1..=2).contains(&lanes)
+        && sample_from == 0
+        && !capture_hidden
+        && !multimodal
+        && !ec.spec.mtp
+        && !ec.paging.expert_prefetch
+        && ec.kernels.vulkan.cpu_miss_threads == 0
 }
 
 fn sampling_suffix_start(positions: &[usize], prompt_ends: &[usize]) -> AResult<usize> {
@@ -9768,6 +9800,117 @@ fn generate_dense_backend_inner(
         let mut profile_steps = 0usize;
         let mut profile_decode_rows = 0usize;
         let mut profile_prefill_rows = 0usize;
+        let prompt_ends_for_plans = parallel.prompt_ends.to_vec();
+        struct PreparedParallelDecodePlans {
+            first: Option<(Box<dyn Plan>, DecodeHandles)>,
+            main: (Box<dyn Plan>, DecodeHandles),
+            logits_rows: usize,
+            batch_argmax: bool,
+            batch_gpu_sample: bool,
+            full_graph: bool,
+        }
+        let argmax_capable = parallel
+            .samplers
+            .iter()
+            .map(crate::sampling::ParallelSampler::can_gpu_argmax)
+            .collect::<Vec<_>>();
+        let gpu_sample_capable = parallel
+            .samplers
+            .iter()
+            .map(|lane| lane.can_gpu_sample_with(sampler))
+            .collect::<Vec<_>>();
+        let prepare_decode_plans = |plan_step: usize| -> AResult<PreparedParallelDecodePlans> {
+            let plan_positions = lane_starts
+                .iter()
+                .map(|&lane_start| lane_start + plan_step)
+                .collect::<Vec<_>>();
+            let plan_sample_from = sampling_suffix_start(&plan_positions, &prompt_ends_for_plans)?;
+            let plan_logits_rows = lanes - plan_sample_from;
+            let plan_batch_argmax = plan_logits_rows > 0
+                && caps.argmax_rows
+                && ec.spec.gpu_argmax
+                && argmax_capable[plan_sample_from..]
+                    .iter()
+                    .all(|&value| value);
+            let plan_batch_gpu_sample = plan_logits_rows > 0
+                && (plan_logits_rows == 1 || caps.sample_rows)
+                && caps.gpu_sample
+                && ec.spec.gpu_sample
+                && (2..=infr_vulkan::Recorder::SAMPLE_KMAX).contains(&sampler.top_k)
+                && gpu_sample_capable[plan_sample_from..]
+                    .iter()
+                    .all(|&value| value);
+            let plan_full_graph = resident_full_graph_decode(
+                c,
+                ec,
+                be.name(),
+                lanes,
+                plan_sample_from,
+                capture_hidden,
+                has_multimodal_lane,
+                plan_positions.iter().copied().max().unwrap_or(0) + 1,
+            );
+            let plan_spans = independent_rows.then(|| {
+                plan_positions
+                    .iter()
+                    .enumerate()
+                    .map(|(row, &position)| SequenceSpan {
+                        row_start: row as u32,
+                        rows: 1,
+                        start_pos: position as u32,
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let first = if plan_full_graph {
+                None
+            } else {
+                let (g0, h0) = build(
+                    lanes,
+                    plan_positions[0],
+                    0,
+                    false,
+                    None,
+                    false,
+                    false,
+                    false,
+                    false,
+                    true,
+                    false,
+                    independent_rows,
+                    plan_spans.as_deref(),
+                    Some(0..1),
+                );
+                let plan0 = be.compile(&g0).map_err(|e| anyhow!("{e}"))?;
+                Some((plan0, h0))
+            };
+            let (g1, h1) = build(
+                lanes,
+                plan_positions[0],
+                plan_logits_rows,
+                false,
+                None,
+                false,
+                capture_hidden,
+                plan_batch_argmax,
+                plan_batch_gpu_sample,
+                plan_full_graph,
+                false,
+                independent_rows,
+                plan_spans.as_deref(),
+                Some(usize::from(!plan_full_graph)..c.n_layer),
+            );
+            let plan1 = be.compile(&g1).map_err(|e| anyhow!("{e}"))?;
+            Ok(PreparedParallelDecodePlans {
+                first,
+                main: (plan1, h1),
+                logits_rows: plan_logits_rows,
+                batch_argmax: plan_batch_argmax,
+                batch_gpu_sample: plan_batch_gpu_sample,
+                full_graph: plan_full_graph,
+            })
+        };
+        let mut prepared_decode_plans = Some(prepare_decode_plans(0)?);
+        let mut retired_decode_plans: Option<(Option<Box<dyn Plan>>, Box<dyn Plan>)> = None;
         for step in 0..max_new {
             let step_t0 = std::time::Instant::now();
             let profile_front_t0 = profile_cohort.then(std::time::Instant::now);
@@ -9798,6 +9941,17 @@ fn generate_dense_backend_inner(
                 && parallel.samplers[sample_from..]
                     .iter()
                     .all(|lane| lane.can_gpu_sample_with(sampler));
+            let mut current_plans = prepared_decode_plans
+                .take()
+                .ok_or_else(|| anyhow!("missing prepared Decode plans"))?;
+            if current_plans.logits_rows != logits_rows
+                || current_plans.batch_argmax != batch_argmax
+                || current_plans.batch_gpu_sample != batch_gpu_sample
+            {
+                return Err(anyhow!(
+                    "prepared Decode sampling shape changed unexpectedly"
+                ));
+            }
             ensure_kv_depth!(positions[0] + 1);
             for (peer, &position) in parallel.peers.iter_mut().zip(&positions[1..]) {
                 peer.ensure_segmented_depth(be, c, position + 1)?;
@@ -9826,74 +9980,74 @@ fn generate_dense_backend_inner(
                     .map(|(tokens, &position)| (tokens.as_slice(), position)),
                 c.ple_ngram_size,
             )?;
-            let sequence_spans = independent_rows.then(|| {
-                positions
-                    .iter()
-                    .enumerate()
-                    .map(|(row, &position)| SequenceSpan {
-                        row_start: row as u32,
-                        rows: 1,
-                        start_pos: position as u32,
-                    })
-                    .collect::<Vec<_>>()
-            });
-
-            let (g0, h0) = build(
+            let full_graph = resident_full_graph_decode(
+                c,
+                ec,
+                be.name(),
                 lanes,
-                positions[0],
-                0,
-                false,
-                None,
-                false,
-                false,
-                false,
-                false,
-                true,
-                false,
-                independent_rows,
-                sequence_spans.as_deref(),
-                Some(0..1),
+                sample_from,
+                capture_hidden,
+                has_multimodal_lane,
+                positions.iter().copied().max().unwrap_or(0) + 1,
             );
-            let plan0 = be.compile(&g0).map_err(|e| anyhow!("{e}"))?;
-            let mut b0 = Bindings::new();
-            b0.bind(
-                h0.tok_ids.expect("GPU embedding needs ids"),
-                ids_buf.as_ref(),
-            );
-            b0.bind(h0.hidden, hidden_batch.as_ref());
-            b0.bind(h0.positions, pos_batch.as_ref());
-            bind_parallel_layer_io(
-                &mut b0,
-                &h0,
-                c.n_layer,
-                rf_buf,
-                yff_buf,
-                &kbufs[..],
-                &vbufs[..],
-                &qsa_kbufs[..],
-                &qsa_cbufs[..],
-                &mrope_history_buf,
-                peer_mrope_history_bufs.as_deref(),
-                &wbufs[..],
-                qwen_wide_buf,
-                ple_embd_buf,
-                ple_state_buf,
-                wide_batch.as_ref(),
-                None,
-                &*parallel.peers,
-                None,
-                independent_rows,
-            );
+            if current_plans.full_graph != full_graph {
+                return Err(anyhow!("prepared Decode graph mode changed unexpectedly"));
+            }
+            let mut first_layer = if full_graph {
+                if current_plans.first.is_some() {
+                    return Err(anyhow!(
+                        "prepared split Decode L0 plan for a full-graph step"
+                    ));
+                }
+                None
+            } else {
+                let (plan0, h0) = current_plans
+                    .first
+                    .take()
+                    .ok_or_else(|| anyhow!("missing prepared Decode L0 plan"))?;
+                let mut b0 = Bindings::new();
+                b0.bind(
+                    h0.tok_ids.expect("GPU embedding needs ids"),
+                    ids_buf.as_ref(),
+                );
+                b0.bind(h0.hidden, hidden_batch.as_ref());
+                b0.bind(h0.positions, pos_batch.as_ref());
+                bind_parallel_layer_io(
+                    &mut b0,
+                    &h0,
+                    c.n_layer,
+                    rf_buf,
+                    yff_buf,
+                    &kbufs[..],
+                    &vbufs[..],
+                    &qsa_kbufs[..],
+                    &qsa_cbufs[..],
+                    &mrope_history_buf,
+                    peer_mrope_history_bufs.as_deref(),
+                    &wbufs[..],
+                    qwen_wide_buf,
+                    ple_embd_buf,
+                    ple_state_buf,
+                    wide_batch.as_ref(),
+                    None,
+                    &*parallel.peers,
+                    None,
+                    independent_rows,
+                );
+                Some((plan0, b0))
+            };
             if let Some(t0) = profile_front_t0 {
                 profile_front += t0.elapsed();
             }
             drop(timeline_front);
-            let profile_layer0_t0 = profile_cohort.then(std::time::Instant::now);
-            be.execute(plan0.as_ref(), &b0)
-                .map_err(|e| anyhow!("{e}"))?;
-            if let Some(t0) = profile_layer0_t0 {
-                profile_layer0 += t0.elapsed();
+            let layer0_started = std::time::Instant::now();
+            if let Some((plan0, b0)) = first_layer.as_ref() {
+                be.execute(plan0.as_ref(), b0).map_err(|e| anyhow!("{e}"))?;
             }
+            if profile_cohort {
+                profile_layer0 += layer0_started.elapsed();
+            }
+            let (plan1, h1) = current_plans.main;
 
             let profile_ple_wait_t0 = profile_cohort.then(std::time::Instant::now);
             let timeline_ple_wait = infr_core::timeline::span("PLE_wait");
@@ -9920,24 +10074,13 @@ fn generate_dense_backend_inner(
             }
 
             let profile_main_setup_t0 = profile_cohort.then(std::time::Instant::now);
-            let (g1, h1) = build(
-                lanes,
-                positions[0],
-                logits_rows,
-                false,
-                None,
-                false,
-                capture_hidden,
-                batch_argmax,
-                batch_gpu_sample,
-                false,
-                false,
-                independent_rows,
-                sequence_spans.as_deref(),
-                Some(1..c.n_layer),
-            );
-            let plan1 = be.compile(&g1).map_err(|e| anyhow!("{e}"))?;
             let mut b1 = Bindings::new();
+            if full_graph {
+                b1.bind(
+                    h1.tok_ids.expect("full Decode graph embeds token ids"),
+                    ids_buf.as_ref(),
+                );
+            }
             b1.bind(h1.hidden, hidden_batch.as_ref());
             b1.bind(h1.positions, pos_batch.as_ref());
             bind_parallel_layer_io(
@@ -9998,8 +10141,25 @@ fn generate_dense_backend_inner(
                 profile_main_setup += t0.elapsed();
             }
             let profile_main_execute_t0 = profile_cohort.then(std::time::Instant::now);
-            be.execute(plan1.as_ref(), &b1)
-                .map_err(|e| anyhow!("{e}"))?;
+            let retired_first = first_layer.take().map(|(plan, bindings)| {
+                drop(bindings);
+                plan
+            });
+            let previously_retired = retired_decode_plans.take();
+            let (execute_result, next_plans_result) = rayon::join(
+                || be.execute(plan1.as_ref(), &b1).map_err(|e| anyhow!("{e}")),
+                || {
+                    drop(previously_retired);
+                    if step + 1 < max_new {
+                        prepare_decode_plans(step + 1).map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                },
+            );
+            execute_result?;
+            prepared_decode_plans = next_plans_result?;
+            retired_decode_plans = Some((retired_first, plan1));
             if let Some(t0) = profile_main_execute_t0 {
                 profile_main_execute += t0.elapsed();
             }
@@ -12118,6 +12278,98 @@ fn generate_dense_backend_inner(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resident_full_graph_is_only_plain_flashnext_decode() {
+        let c = crate::Config {
+            qwen4exp: true,
+            n_layer: 48,
+            n_embd: 2560,
+            hc_mult: 4,
+            moe: Some(crate::MoeConfig {
+                n_expert: 512,
+                n_used: 10,
+                n_ff_exp: 640,
+                scale: 1.,
+                gating: infr_core::graph::MoeGating::Softmax,
+                norm_w: true,
+                weight_before: false,
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
+            }),
+            ..Default::default()
+        };
+        let mut ec = crate::EngineConfig::default();
+        ec.kernels.vulkan.decode_gpu_resident = true;
+        ec.kernels.vulkan.decode_gpu_resident_full_graph = Some(true);
+        ec.paging.expert_prefetch = false;
+        let eligible = |c: &crate::Config, ec: &crate::EngineConfig| {
+            super::resident_full_graph_decode(c, ec, "vulkan", 1, 0, false, false, 150_000)
+        };
+        assert!(eligible(&c, &ec));
+        for lanes in 0..=8 {
+            for sample_from in 0..=lanes {
+                for capture in [false, true] {
+                    for multimodal in [false, true] {
+                        assert_eq!(
+                            super::resident_full_graph_decode(
+                                &c,
+                                &ec,
+                                "vulkan",
+                                lanes,
+                                sample_from,
+                                capture,
+                                multimodal,
+                                150_000
+                            ),
+                            (1..=2).contains(&lanes) && sample_from == 0 && !capture && !multimodal
+                        );
+                    }
+                }
+            }
+        }
+        for backend in ["cpu", "metal"] {
+            assert!(!super::resident_full_graph_decode(
+                &c, &ec, backend, 1, 0, false, false, 150_000
+            ));
+        }
+        for mode in 0..5 {
+            let mut excluded = ec.clone();
+            match mode {
+                0 => excluded.kernels.vulkan.decode_gpu_resident_full_graph = Some(false),
+                1 => excluded.kernels.vulkan.decode_gpu_resident = false,
+                2 => excluded.spec.mtp = true,
+                3 => excluded.paging.expert_prefetch = true,
+                _ => excluded.kernels.vulkan.cpu_miss_threads = 1,
+            }
+            assert!(!eligible(&c, &excluded));
+        }
+        for shape in 0..7 {
+            let mut excluded = c.clone();
+            match shape {
+                0 => excluded.qwen4exp = false,
+                1 => excluded.n_layer = 1,
+                2 => excluded.n_embd = 1280,
+                3 => excluded.hc_mult = 2,
+                4 => excluded.moe.as_mut().unwrap().n_expert = 256,
+                5 => excluded.moe.as_mut().unwrap().n_used = 8,
+                _ => excluded.moe.as_mut().unwrap().n_ff_exp = 512,
+            }
+            assert!(!eligible(&excluded, &ec));
+        }
+        let mut automatic = ec;
+        automatic.kernels.vulkan.decode_gpu_resident_full_graph = None;
+        assert!(super::resident_full_graph_decode(
+            &c, &automatic, "vulkan", 1, 0, false, false, 30_000
+        ));
+        assert!(!super::resident_full_graph_decode(
+            &c, &automatic, "vulkan", 1, 0, false, false, 150_000
+        ));
+
+        let mut dense = c;
+        dense.moe = None;
+        assert!(!eligible(&dense, &automatic));
+    }
+
     #[test]
     fn lm_head_projects_sampling_suffix_for_every_batch_shape() {
         use infr_core::backend::{Backend, Bindings, BufferUsage};

@@ -415,6 +415,33 @@ fn decode_token_rows(graph: &Graph) -> Option<usize> {
         .then_some(graph.sequence_spans.len())
 }
 
+const RESIDENT_AUTO_MAPPED_SERIAL_CONTEXT_MAX: usize = 96 * 1024;
+const RESIDENT_AUTO_MAPPED_SERIAL_MAX_BYTES: usize = 6 * 1024 * 1024;
+
+fn resident_decode_context_tokens(graph: &Graph) -> Option<usize> {
+    let op_depth = graph.ops.iter().filter_map(|op| match op {
+        Op::QsaIndexer { kv_len, .. }
+        | Op::QsaBatchAttention { kv_len, .. }
+        | Op::Attention { kv_len, .. } => Some(*kv_len as usize),
+        _ => None,
+    });
+    let span_depth = graph
+        .sequence_spans
+        .iter()
+        .filter_map(|span| span.start_pos.checked_add(span.rows))
+        .map(|depth| depth as usize);
+    op_depth.chain(span_depth).max()
+}
+
+fn resident_mapped_serial_max_bytes(setting_kib: Option<usize>, graph: &Graph) -> usize {
+    if let Some(kib) = setting_kib {
+        return kib.min(8192).saturating_mul(1024);
+    }
+    resident_decode_context_tokens(graph)
+        .filter(|&tokens| tokens <= RESIDENT_AUTO_MAPPED_SERIAL_CONTEXT_MAX)
+        .map_or(0, |_| RESIDENT_AUTO_MAPPED_SERIAL_MAX_BYTES)
+}
+
 fn cpu_miss_decode_graph(graph: &Graph) -> bool {
     !graph.mtp_verify && decode_token_rows(graph) == Some(1)
 }
@@ -3567,7 +3594,7 @@ fn lower_op(
                 Activation::Silu => rec.silu_mul_fused(gu_, y, rows, nff, *swiglu_clamp),
                 Activation::Gelu => rec.gelu_mul_fused(gu_, y, rows, nff, *swiglu_clamp),
                 Activation::Sigmoid => {
-                    return Err(be("vulkan adapter: GatedActFused Sigmoid unsupported"))
+                    return Err(be("vulkan adapter: GatedActFused Sigmoid unsupported"));
                 }
             }
         }
@@ -3803,7 +3830,7 @@ fn lower_op(
                     // The only f16 WriteKv (K) is always fused into the QkNormRope and skipped, so a
                     // standalone f16 WriteKv shouldn't reach the record-once path.
                     infr_core::DType::F16 => {
-                        return Err(be("vulkan adapter: dynamic decode f16 WriteKv unexpected"))
+                        return Err(be("vulkan adapter: dynamic decode f16 WriteKv unexpected"));
                     }
                     _ => match c_addr {
                         Some(a) => rec.store_f16_dyn_at(s, *params, c, a, n, cap_rows),
@@ -4197,8 +4224,8 @@ fn lower_op(
                 (None, None) => (raw_cache, block_cache, None),
                 _ => {
                     return Err(be(
-                            "vulkan Op::QsaIndexer raw and block caches must both be segmented or both be flat",
-                        ));
+                        "vulkan Op::QsaIndexer raw and block caches must both be segmented or both be flat",
+                    ));
                 }
             };
             rec.qsa_indexer(
@@ -4561,8 +4588,8 @@ fn lower_op(
                 (None, None) => (k_cache_buf, v_cache_buf, None),
                 _ => {
                     return Err(be(
-                            "vulkan Op::QsaBatchAttention K/V caches must both be segmented or both be flat",
-                        ));
+                        "vulkan Op::QsaBatchAttention K/V caches must both be segmented or both be flat",
+                    ));
                 }
             };
             rec.qsa_attention_batch(
@@ -6270,7 +6297,7 @@ fn lower_op(
                     rec.rmsnorm_gate_sigmoid(args.0, args.1, args.2, args.3, args.4, args.5, args.6)
                 }
                 Activation::Gelu => {
-                    return Err(be("vulkan adapter: GatedRmsNorm Gelu unsupported"))
+                    return Err(be("vulkan adapter: GatedRmsNorm Gelu unsupported"));
                 }
             }
         }
@@ -6579,6 +6606,11 @@ fn lower_op(
                         let (kn, qn, bet, dec) = seq_scratch
                             .as_ref()
                             .expect("multi-row seq split allocated scratch");
+                        let (seq_k_off, seq_v_off) = if strided {
+                            (q_off + nk_ * kd_, q_off + 2 * nk_ * kd_)
+                        } else {
+                            (k_off, v_off)
+                        };
                         rec.deltanet_seq_split_off(
                             r(*q)?,
                             r(*k)?,
@@ -6600,8 +6632,8 @@ fn lower_op(
                             vd_,
                             *eps,
                             q_off,
-                            k_off,
-                            v_off,
+                            seq_k_off,
+                            seq_v_off,
                             blog_off,
                             alpha_off,
                             out_off,
@@ -6744,27 +6776,59 @@ fn lower_op(
                 let qn = pooled(pool, be_, "dn_seq_qn", rows_ * nk_ * kd_ * 4)?;
                 let bet = pooled(pool, be_, "dn_seq_bet", rows_ * nv_ * 4)?;
                 let dec = pooled(pool, be_, "dn_seq_dec", rows_ * nv_ * 4)?;
-                rec.deltanet_seq_split(
-                    r(*q)?,
-                    r(*k)?,
-                    r(*v)?,
-                    r(*b)?,
-                    r(*a)?,
-                    r(*a_coef)?,
-                    r(*dt_bias)?,
-                    r(*state)?,
-                    r(*dst)?,
-                    pool[&kn].as_ref(),
-                    pool[&qn].as_ref(),
-                    pool[&bet].as_ref(),
-                    pool[&dec].as_ref(),
-                    rows_,
-                    nv_,
-                    nk_,
-                    kd_,
-                    vd_,
-                    *eps,
-                );
+                let strided = *q == *k && *k == *v && be_.cfg().kernels.vulkan.delta_strided;
+                if strided {
+                    rec.deltanet_seq_split_off(
+                        r(*q)?,
+                        r(*k)?,
+                        r(*v)?,
+                        r(*b)?,
+                        r(*a)?,
+                        r(*a_coef)?,
+                        r(*dt_bias)?,
+                        r(*state)?,
+                        r(*dst)?,
+                        pool[&kn].as_ref(),
+                        pool[&qn].as_ref(),
+                        pool[&bet].as_ref(),
+                        pool[&dec].as_ref(),
+                        rows_,
+                        nv_,
+                        nk_,
+                        kd_,
+                        vd_,
+                        *eps,
+                        0,
+                        nk_ * kd_,
+                        2 * nk_ * kd_,
+                        0,
+                        0,
+                        0,
+                        None,
+                    );
+                } else {
+                    rec.deltanet_seq_split(
+                        r(*q)?,
+                        r(*k)?,
+                        r(*v)?,
+                        r(*b)?,
+                        r(*a)?,
+                        r(*a_coef)?,
+                        r(*dt_bias)?,
+                        r(*state)?,
+                        r(*dst)?,
+                        pool[&kn].as_ref(),
+                        pool[&qn].as_ref(),
+                        pool[&bet].as_ref(),
+                        pool[&dec].as_ref(),
+                        rows_,
+                        nv_,
+                        nk_,
+                        kd_,
+                        vd_,
+                        *eps,
+                    );
+                }
                 return Ok(());
             }
             // deltanet_chunked_split's prep pass (deltanet_prep.comp) is the ONLY DeltaNet shader
@@ -7415,7 +7479,7 @@ fn lower_op(
                         Activation::Sigmoid => {
                             return Err(be(
                                 "vulkan adapter: fused_gate_up batched MoeFfn Sigmoid unsupported",
-                            ))
+                            ));
                         }
                     }
                 }
@@ -7627,7 +7691,7 @@ fn lower_op(
                     Activation::Sigmoid => {
                         return Err(be(
                             "vulkan adapter: fused_gate_up MoeFfn Sigmoid unsupported",
-                        ))
+                        ));
                     }
                 }
             } else {
@@ -9110,10 +9174,10 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
     // original op stream. `PagedMoeShared` is Copy and contains only graph handles.
     let setup_part_t0 = infr_core::pager_profile::start();
     let mut paged_moe_shared = HashMap::<usize, PagedMoeShared>::new();
-    for op_idx in 0..graph.ops.len() {
-        let Some(shared) = paged_moe_shared_at(graph, op_idx) else {
-            continue;
-        };
+    // This escape hatch is execute-scoped, not per-op. Most ops cannot be a shared-expert tail;
+    // checking the process environment for each of them dominated the scan on Windows.
+    let shared_slot_disabled = std::env::var_os("INFR_NO_MOE_SHARED_SLOT").is_some();
+    for (op_idx, shared) in paged_moe_shared_candidates(graph, shared_slot_disabled) {
         let Op::MoeFfn { gate_exps, .. } = &graph.ops[op_idx] else {
             unreachable!();
         };
@@ -9813,6 +9877,7 @@ struct ResidentChunk {
     notice_stop: bool,
     producer: Option<Arc<ResidentNoticeProducer>>,
     notices_sent: usize,
+    mapped_serial_max_bytes: usize,
     waiter: Option<Arc<crate::recorder::FenceWaiter>>,
     indirect: Option<Arc<crate::recorder::ResidentIndirect>>,
 }
@@ -9887,6 +9952,7 @@ struct ResidentNoticeJob {
     notices: Arc<ResidentNotices>,
     fence: Option<ash::vk::Fence>,
     entries: Vec<(usize, ResidentJournalEntry)>,
+    mapped_serial_max_bytes: usize,
     done: std::sync::mpsc::Sender<()>,
     trace_context: Option<infr_core::timeline::Context>,
 }
@@ -9950,10 +10016,13 @@ impl ResidentNoticeProducer {
             .spawn(move || {
                 while let Ok(job) = jobs.recv() {
                     let _ack = NoticeProducerAck(job.done);
+                    let job_executor = executor
+                        .clone()
+                        .with_mapped_serial_max_bytes(job.mapped_serial_max_bytes);
                     for (ordinal, entry) in &job.entries {
                         let notice = Self::produce(
                             &pager,
-                            &executor,
+                            &job_executor,
                             job.journal.as_ref(),
                             &job.notices,
                             job.fence,
@@ -10131,7 +10200,7 @@ impl ResidentNoticeProducer {
                 Ok(result) => Some(result),
                 Err(std::sync::mpsc::TryRecvError::Empty) => None,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    return Err(be("notice producer disconnected"))
+                    return Err(be("notice producer disconnected"));
                 }
             }
         };
@@ -10299,6 +10368,7 @@ impl ResidentChunk {
                     .take(count)
                     .skip(self.notices_sent)
                     .collect(),
+                mapped_serial_max_bytes: self.mapped_serial_max_bytes,
                 done,
                 trace_context: infr_core::timeline::context(),
             })
@@ -10472,6 +10542,10 @@ impl ResidentChunk {
             notice_stop: false,
             producer: buffers.producer.clone(),
             notices_sent: 0,
+            mapped_serial_max_bytes: resident_mapped_serial_max_bytes(
+                cfg.decode_gpu_resident_mapped_serial_max_kib,
+                graph,
+            ),
             waiter: buffers.waiter.clone(),
             indirect: buffers.indirect.clone(),
         }))
@@ -10649,7 +10723,7 @@ impl ResidentChunk {
                 _ => {
                     return Err(be(
                         "invalid or skipped resident notice before the first miss",
-                    ))
+                    ));
                 }
             }
         }
@@ -10711,7 +10785,7 @@ impl ResidentChunk {
                 _ => {
                     return Err(be(
                         "invalid or skipped producer notice before the first miss",
-                    ))
+                    ));
                 }
             }
         }
@@ -11722,7 +11796,7 @@ fn prefetch_next_moe_layer<'a>(
 /// arena+window hop with `out_f = 2*nff` and the activation splits gate|up per row exactly like
 /// the resident fused arms. `rows`/`n_used` are general (not hardcoded to llama4's rows=1/
 /// n_used=1).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PagedMoeShared {
     gate_inp: TensorId,
     gate: TensorId,
@@ -11732,15 +11806,22 @@ struct PagedMoeShared {
     dst: TensorId,
 }
 
+fn paged_moe_shared_candidates(
+    graph: &Graph,
+    disabled: bool,
+) -> impl Iterator<Item = (usize, PagedMoeShared)> + '_ {
+    graph.ops.iter().enumerate().filter_map(move |(idx, op)| {
+        if disabled || !matches!(op, Op::MoeFfn { .. }) {
+            return None;
+        }
+        paged_moe_shared_at(graph, idx).map(|shared| (idx, shared))
+    })
+}
+
 /// Recognize the exact Qwen sigmoid-gated shared-expert tail emitted by `seam::runner`. This is a
 /// backend peephole rather than a graph semantic change: other backends retain the ordinary dense
 /// chain, while Vulkan small-m decode/VERIFY can place the shared expert in routed slot 8.
 fn paged_moe_shared_at(graph: &Graph, op_idx: usize) -> Option<PagedMoeShared> {
-    // Validation/escape hatch: permits same-binary A/B and an immediate fallback if a future
-    // model reuses the exact graph shape but violates an unstated packing invariant.
-    if std::env::var_os("INFR_NO_MOE_SHARED_SLOT").is_some() {
-        return None;
-    }
     let Op::MoeFfn {
         x,
         gate_exps,
@@ -13734,7 +13815,7 @@ fn execute_paged_moe<'a>(
                 Activation::Sigmoid => {
                     return Err(be(
                         "vulkan adapter: fused_gate_up paged MoeFfn Sigmoid unsupported",
-                    ))
+                    ));
                 }
             },
         }
@@ -13781,7 +13862,9 @@ fn execute_paged_moe<'a>(
                         || !gpu.is_finite()
                         || (cpu - gpu).abs() > 0.003 + gpu.abs() * 0.002
                     {
-                        return Err(be(format!("CPU miss parity failure: layer={current_layer} slot={slot} cpu={cpu} gpu={gpu}")));
+                        return Err(be(format!(
+                            "CPU miss parity failure: layer={current_layer} slot={slot} cpu={cpu} gpu={gpu}"
+                        )));
                     }
                 }
             }
@@ -13903,6 +13986,197 @@ fn execute_paged_moe<'a>(
 
 #[cfg(test)]
 mod tests {
+    fn shared_scan_graph(rows: usize, routed_dtype: infr_core::DType) -> super::Graph {
+        use super::*;
+        use infr_core::TensorDesc;
+        let mut graph = Graph::new();
+        let desc = |n, dtype| TensorDesc::new(vec![n], dtype);
+        let x = graph.input(desc(rows * 2560, infr_core::DType::F32));
+        let routed = graph.weight(desc(2560 * 640 * 512, routed_dtype));
+        let gate_inp = graph.weight(desc(2560, infr_core::DType::F32));
+        let shared = graph.weight(desc(2560 * 640, infr_core::DType::Q8_0));
+        let gate = graph.internal(desc(rows, infr_core::DType::F32));
+        let gbuf = graph.internal(desc(rows * 640, infr_core::DType::F32));
+        let ubuf = graph.internal(desc(rows * 640, infr_core::DType::F32));
+        let act = graph.internal(desc(rows * 640, infr_core::DType::F32));
+        let moe = graph.internal(desc(rows * 2560, infr_core::DType::F32));
+        let out = graph.internal(desc(rows * 2560, infr_core::DType::F32));
+        for _ in 0..80 {
+            graph.push(Op::Add {
+                a: x,
+                b: x,
+                dst: x,
+                n: (rows * 2560) as u32,
+            });
+        }
+        graph.push(Op::MoeFfn {
+            x,
+            router_x: x,
+            router: gate_inp,
+            gate_exps: routed,
+            up_exps: routed,
+            down_exps: routed,
+            dst: moe,
+            ne: 2560,
+            n_expert: 512,
+            n_used: 10,
+            n_ff_exp: 640,
+            down_scale: None,
+            fused_gate_up: false,
+            scale: 1.,
+            act: Activation::Silu,
+            gating: infr_core::graph::MoeGating::Softmax,
+            norm_w: true,
+            weight_before: false,
+            ep_band: None,
+            exp_probs_b: None,
+            n_expert_groups: 0,
+            n_expert_groups_used: 0,
+            swiglu_clamp: None,
+            expert_ids: None,
+        });
+        graph.push(Op::Linear {
+            x,
+            weight: gate_inp,
+            dst: gate,
+            m: rows as u32,
+            in_f: 2560,
+            out_f: 1,
+            w_off: 0,
+        });
+        for dst in [gbuf, ubuf] {
+            graph.push(Op::Linear {
+                x,
+                weight: shared,
+                dst,
+                m: rows as u32,
+                in_f: 2560,
+                out_f: 640,
+                w_off: 0,
+            });
+        }
+        graph.push(Op::GatedAct {
+            gate: gbuf,
+            up: ubuf,
+            dst: act,
+            rows: rows as u32,
+            nff: 640,
+            act: Activation::Silu,
+            up_off: 0,
+            up_stride: 0,
+            gate_stride: 0,
+            gate_block_width: 0,
+            swiglu_clamp: None,
+        });
+        graph.push(Op::Linear {
+            x: act,
+            weight: shared,
+            dst: out,
+            m: rows as u32,
+            in_f: 640,
+            out_f: 2560,
+            w_off: 0,
+        });
+        graph.push(Op::MoeSharedExpertAdd {
+            moe,
+            shexp: out,
+            gate,
+            dst: x,
+            rows: rows as u32,
+            n: 2560,
+        });
+        graph
+    }
+
+    #[test]
+    fn shared_scan_prefilter_preserves_shapes_indices_and_escape_hatch() {
+        use super::*;
+        use infr_core::DType;
+        for rows in [1, 2, 4, 8, 9, 32] {
+            for dtype in [
+                DType::Q5K,
+                DType::Q6K,
+                DType::Iq2S,
+                DType::Iq3S,
+                DType::Iq4Nl,
+                DType::Iq4Xs,
+                DType::Q8_0,
+                DType::F32,
+            ] {
+                let mut graph = shared_scan_graph(rows, dtype);
+                let tail = graph.ops.clone();
+                graph.ops.extend(tail);
+                let original = (0..graph.ops.len())
+                    .filter_map(|idx| paged_moe_shared_at(&graph, idx).map(|shared| (idx, shared)))
+                    .collect::<Vec<_>>();
+                let filtered = paged_moe_shared_candidates(&graph, false).collect::<Vec<_>>();
+                assert_eq!(filtered, original, "rows={rows}, dtype={dtype:?}");
+                let supported = rows <= 8
+                    && matches!(dtype, DType::Q5K | DType::Q6K | DType::Iq4Xs)
+                    || rows == 1 && matches!(dtype, DType::Iq2S | DType::Iq3S | DType::Iq4Nl);
+                assert_eq!(filtered.len(), if supported { 2 } else { 0 });
+                if supported {
+                    assert_eq!(
+                        filtered.iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
+                        vec![80, 167]
+                    );
+                }
+                assert_eq!(paged_moe_shared_candidates(&graph, true).count(), 0);
+            }
+        }
+        let mut truncated = shared_scan_graph(1, DType::Q5K);
+        truncated.ops.pop();
+        assert_eq!(paged_moe_shared_candidates(&truncated, false).count(), 0);
+        assert_eq!(paged_moe_shared_candidates(&Graph::new(), false).count(), 0);
+    }
+
+    #[test]
+    #[ignore = "CPU-only timing comparison; run explicitly with --nocapture"]
+    fn shared_scan_cpu_benchmark() {
+        use super::*;
+        use std::{hint::black_box, time::Instant};
+        let mut graph = shared_scan_graph(1, infr_core::DType::Q5K);
+        let layer = graph.ops.clone();
+        for _ in 1..47 {
+            graph.ops.extend_from_slice(&layer);
+        }
+        let repeats = 1024;
+        for pass in 0..6 {
+            let mut samples = [0.; 2];
+            for mode in [pass % 2, 1 - pass % 2] {
+                let start = Instant::now();
+                let mut checksum = 0;
+                for _ in 0..repeats {
+                    let graph = black_box(&graph);
+                    if mode == 0 {
+                        // Exact old escape-hatch ordering, with the unchanged shape recognizer.
+                        checksum += (0..graph.ops.len())
+                            .filter_map(|idx| {
+                                if std::env::var_os("INFR_NO_MOE_SHARED_SLOT").is_some() {
+                                    None
+                                } else {
+                                    paged_moe_shared_at(graph, idx)
+                                }
+                            })
+                            .count();
+                    } else {
+                        let disabled = std::env::var_os("INFR_NO_MOE_SHARED_SLOT").is_some();
+                        checksum += paged_moe_shared_candidates(graph, disabled).count();
+                    }
+                }
+                assert_eq!(checksum, repeats * 47);
+                black_box(checksum);
+                samples[mode] = start.elapsed().as_secs_f64() * 1e6 / repeats as f64;
+            }
+            println!(
+                "shared_scan pass={pass} ops={} legacy_us={:.3} filtered_us={:.3}",
+                graph.ops.len(),
+                samples[0],
+                samples[1]
+            );
+        }
+    }
+
     #[test]
     fn recovery_submits_at_next_moe_end_or_cap_but_never_before_missing_ffn() {
         use super::*;
@@ -14390,10 +14664,16 @@ mod tests {
                             expected.insert((rows, missing), result);
                         } else {
                             let reference = &expected[&(rows, missing)];
-                            assert!(result.iter().zip(reference).all(|(&actual, &reference)|
-                            (actual - reference).abs() <= 1e-5f32.max(reference.abs() * 1e-5)),
-                            "rows={rows} missing={missing:?} submit={submit_layers} mapped={mapped} fence={fence_wait} hit_first={hit_first} indirect={indirect}: {:?} != {:?}",
-                            &result[..4], &reference[..4]);
+                            assert!(
+                                result
+                                    .iter()
+                                    .zip(reference)
+                                    .all(|(&actual, &reference)| (actual - reference).abs()
+                                        <= 1e-5f32.max(reference.abs() * 1e-5)),
+                                "rows={rows} missing={missing:?} submit={submit_layers} mapped={mapped} fence={fence_wait} hit_first={hit_first} indirect={indirect}: {:?} != {:?}",
+                                &result[..4],
+                                &reference[..4]
+                            );
                         }
                     }
                 }
@@ -14901,6 +15181,34 @@ mod tests {
 
         graph.sequence_spans[1].rows = 2;
         assert_eq!(decode_token_rows(&graph), None);
+    }
+
+    #[test]
+    fn resident_mapped_serial_policy_is_short_context_only_and_overridable() {
+        let mut graph = Graph::new();
+        assert_eq!(resident_mapped_serial_max_bytes(None, &graph), 0);
+
+        graph.sequence_spans = vec![SequenceSpan {
+            row_start: 0,
+            rows: 1,
+            start_pos: (RESIDENT_AUTO_MAPPED_SERIAL_CONTEXT_MAX - 1) as u32,
+        }];
+        assert_eq!(
+            resident_mapped_serial_max_bytes(None, &graph),
+            RESIDENT_AUTO_MAPPED_SERIAL_MAX_BYTES
+        );
+
+        graph.sequence_spans[0].start_pos = RESIDENT_AUTO_MAPPED_SERIAL_CONTEXT_MAX as u32;
+        assert_eq!(resident_mapped_serial_max_bytes(None, &graph), 0);
+        assert_eq!(resident_mapped_serial_max_bytes(Some(0), &graph), 0);
+        assert_eq!(
+            resident_mapped_serial_max_bytes(Some(6144), &graph),
+            6 * 1024 * 1024
+        );
+        assert_eq!(
+            resident_mapped_serial_max_bytes(Some(16384), &graph),
+            8 * 1024 * 1024
+        );
     }
 
     #[test]
@@ -16943,8 +17251,11 @@ mod tests {
                     for (a, b) in [(0, 2), (1, 3)] {
                         for (index, (fused, split)) in values[a].iter().zip(&values[b]).enumerate()
                         {
-                            assert_eq!(fused.to_bits(), split.to_bits(),
-                                "HC parity prefetch={prefetch} inject={inject_dtype:?} rows={rows} output={a} index={index}: {fused} vs {split}");
+                            assert_eq!(
+                                fused.to_bits(),
+                                split.to_bits(),
+                                "HC parity prefetch={prefetch} inject={inject_dtype:?} rows={rows} output={a} index={index}: {fused} vs {split}"
+                            );
                         }
                     }
                 }
