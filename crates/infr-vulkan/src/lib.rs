@@ -1849,6 +1849,23 @@ struct ImportedHostShard {
     buffer: Arc<dyn Buffer>,
 }
 
+/// A host-cache arena this backend OWNS: an ordinary host-visible (system-RAM) buffer whose
+/// persistent CPU mapping a host pager uses as its slot storage.
+///
+/// This exists to avoid `VK_EXT_external_memory_host` for the paged-MoE host tier. That import
+/// aliases a USERPTR BO, and on some kernels the driver makes the whole aliased range
+/// device-visible on EVERY command submission — measured on amdgpu at ~6.8 ms per GiB per submit
+/// (RADV Mesa 26.0.8 and AMDVLK v-2025.Q2.1 alike, so it is the kernel). A plain host-visible
+/// allocation is read over the same PCIe path and costs ~0.03 ms per submit; see
+/// `tests/linux_host_submit_probe.rs`.
+struct HostCacheArena {
+    /// The CPU mapping a host pager's slot pointers resolve against
+    /// ([`AlignedHostBuffer::as_ptr`]).
+    ptr: usize,
+    len: usize,
+    buffer: Arc<dyn Buffer>,
+}
+
 /// Vulkan aliases over one existing host allocation. A requested byte range may cross a 2-GiB
 /// import shard, so callers iterate the returned pieces rather than assuming one source buffer.
 pub(crate) struct ImportedHostAllocation {
@@ -2485,6 +2502,10 @@ pub struct VulkanBackend {
     /// `infr-llama`'s sessions own the `VulkanBackend`, and a new backend is a new device whose
     /// buffers couldn't read the old session anyway.
     moe_pager: Arc<crate::pager::MoePagerCell>,
+    /// Host-cache arenas THIS backend owns — see [`HostCacheArena`] and
+    /// [`Self::alloc_host_cache_arena`]. Declared before `shared` so these buffers free first
+    /// (each holds an `Arc<VulkanShared>`, the same reference-cycle lesson `moe_pager` documents).
+    host_cache_arenas: Arc<Mutex<Vec<HostCacheArena>>>,
     /// `ParallelSeam` eagerly creates every KV slot after its warmup forward. While that startup
     /// batch is in progress, the runner must not admit optional Host DMA aliases after slot 0 and
     /// consume driver capacity needed by the remaining persistent slots.
@@ -4425,6 +4446,7 @@ impl VulkanBackend {
             decode_prefetch: Mutex::new(None),
             cpu_miss: std::sync::OnceLock::new(),
             moe_pager: Arc::new(Mutex::new(None)),
+            host_cache_arenas: Arc::new(Mutex::new(Vec::new())),
             session_finalization_deferred: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             dense_pager: Mutex::new(None),
             runtime_phase,
@@ -4537,27 +4559,50 @@ impl VulkanBackend {
         &self,
         allocations: Vec<(Arc<AlignedHostBuffer>, usize)>,
     ) -> crate::transfer::SessionTransferPlan {
-        if !self.cfg().paging.host_dma {
-            return crate::transfer::SessionTransferPlan::default();
-        }
-        let Some(ext) = self.shared.external_memory_host.as_ref() else {
-            return crate::transfer::SessionTransferPlan::default();
-        };
-        let alignment = self.shared.host_import_alignment.max(1);
-        if alignment > AlignedHostBuffer::ALIGNMENT {
-            tracing::warn!(
-                "[infr] host DMA disabled: Vulkan import alignment {} exceeds arena alignment {}",
-                alignment,
-                AlignedHostBuffer::ALIGNMENT,
-            );
-            return crate::transfer::SessionTransferPlan::default();
+        let mut built: Vec<ImportedHostAllocation> = Vec::new();
+        let mut to_import: Vec<(Arc<AlignedHostBuffer>, usize)> = Vec::new();
+        {
+            let owned = self.host_cache_arenas.lock().unwrap();
+            for (owner, block_bytes) in allocations {
+                let base = owner.as_ptr() as usize;
+                match owned
+                    .iter()
+                    .find(|arena| arena.ptr == base && arena.len >= owner.len())
+                {
+                    // Engine-owned arena: no import, and no per-submit walk of an aliased range.
+                    // The plan's range lookup is unchanged — only the shard's provenance differs.
+                    Some(arena) => built.push(ImportedHostAllocation {
+                        base,
+                        logical_len: owner.len(),
+                        imported_len: owner.len(),
+                        shards: vec![ImportedHostShard {
+                            offset: 0,
+                            len: owner.len(),
+                            buffer: Arc::clone(&arena.buffer),
+                        }],
+                    }),
+                    None => to_import.push((owner, block_bytes)),
+                }
+            }
         }
 
-        crate::transfer::SessionTransferPlan::new(self.try_import_host_allocations(
-            ext,
-            allocations,
-            alignment,
-        ))
+        if !to_import.is_empty() && self.cfg().paging.host_dma {
+            if let Some(ext) = self.shared.external_memory_host.as_ref() {
+                let alignment = self.shared.host_import_alignment.max(1);
+                if alignment > AlignedHostBuffer::ALIGNMENT {
+                    tracing::warn!(
+                        "[infr] host DMA disabled: Vulkan import alignment {} exceeds arena \
+                         alignment {}",
+                        alignment,
+                        AlignedHostBuffer::ALIGNMENT,
+                    );
+                } else {
+                    built.extend(self.try_import_host_allocations(ext, to_import, alignment));
+                }
+            }
+        }
+
+        crate::transfer::SessionTransferPlan::new(built)
     }
 
     fn try_import_host_allocations(
@@ -5460,6 +5505,87 @@ impl VulkanBackend {
             .inspect_err(|_| unsafe { self.shared.device.destroy_buffer(buffer, None) })
     }
 
+    /// Allocate the paged-MoE HOST CACHE as an ordinary host-visible (system-RAM) buffer the GPU
+    /// addresses through `bufferDeviceAddress` — deliberately NOT an import of process memory.
+    ///
+    /// `VK_EXT_external_memory_host` aliases a userptr BO, and on some kernels the driver makes
+    /// that whole range device-visible on EVERY command submission. MEASURED on amdgpu (RX 7900
+    /// XTX, RADV Mesa 26.0.8 AND AMDVLK v-2025.Q2.1 alike, so it is the kernel): ~6.8 ms per GiB
+    /// per submit — ~145 ms/submit for a 22 GiB tier — which is what turns a paged MoE into 0.07
+    /// tok/s. The same bytes as a plain host-visible allocation cost ~0.03 ms per submit
+    /// (`tests/linux_host_submit_probe.rs`) and are read over the same PCIe path.
+    ///
+    /// Returns `(buffer, cpu_mapping, device_address)`. The allocation is persistently CPU-mapped
+    /// so a host pager can keep writing slots through `cpu_mapping`, and BDA-addressed so the
+    /// promotion copies read it with no shader change. The caller must keep the buffer alive for
+    /// at least as long as anything built over `cpu_mapping`.
+    ///
+    /// Refuses rather than silently landing in VRAM: callers reach this only where the host tier
+    /// must NOT be VRAM.
+    fn alloc_host_cache_arena_buffer(
+        &self,
+        bytes: usize,
+    ) -> Result<(Arc<dyn Buffer>, *mut u8, u64)> {
+        let ty = self.shared.host_overflow_type.ok_or_else(|| {
+            be(
+                "host cache arena requested, but this device exposes no host-visible \
+                non-device-local memory type for it"
+                    .to_string(),
+            )
+        })?;
+        let usage = vk::BufferUsageFlags::from_raw(
+            BUFFER_USAGE.as_raw() | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS.as_raw(),
+        );
+        let buf_ci = vk::BufferCreateInfo::default()
+            .size(fill_span(bytes))
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = unsafe { self.shared.device.create_buffer(&buf_ci, None) }
+            .map_err(|e| be(format!("create_buffer(host-cache-arena): {e}")))?;
+        let requirements = unsafe { self.shared.device.get_buffer_memory_requirements(buffer) };
+        if requirements.memory_type_bits & (1 << ty) == 0 {
+            unsafe { self.shared.device.destroy_buffer(buffer, None) };
+            return Err(be(
+                "the host-visible overflow memory type is not compatible with a host cache arena \
+                 on this device"
+                    .to_string(),
+            ));
+        }
+        // spilled=true (host RAM: never charged to `device_used`), device_address=true,
+        // budget_check=false (system RAM does not consume the device-local budget).
+        let buf = self
+            .alloc_vram_mapped(buffer, bytes, &requirements, ty, true, true, false)
+            .inspect_err(|_| unsafe { self.shared.device.destroy_buffer(buffer, None) })?;
+        let ptr = buf
+            .mapped_ptr()
+            .expect("host cache arena is a persistently mapped allocation");
+        let addr = buf
+            .own_addr
+            .expect("host cache arena built with device_address=true carries an own_addr");
+        tracing::info!(
+            "[infr] host cache arena: {} host-visible system RAM, CPU-mapped + BDA, no import",
+            fmt_bytes(requirements.size),
+        );
+        let buffer: Arc<dyn Buffer> = Arc::new(buf);
+        Ok((buffer, ptr, addr))
+    }
+
+    /// Allocate a HOST-CACHE ARENA and hand it to a host pager: returns the CPU mapping the pager
+    /// writes its slots through.
+    ///
+    /// The backend KEEPS the buffer — it must outlive every transfer plan built over the mapping,
+    /// and `build_session_transfer_plan` recognises the mapping — so the GPU reads these bytes from
+    /// an ordinary host-visible buffer instead of an imported process range.
+    pub fn alloc_host_cache_arena(&self, bytes: usize) -> Result<*mut u8> {
+        let (buffer, ptr, _addr) = self.alloc_host_cache_arena_buffer(bytes)?;
+        self.host_cache_arenas.lock().unwrap().push(HostCacheArena {
+            ptr: ptr as usize,
+            len: bytes,
+            buffer,
+        });
+        Ok(ptr)
+    }
+
     /// Allocate the paged-MoE expert arena as a `bufferDeviceAddress` buffer and return it with its
     /// 64-bit `VkDeviceAddress`. Unlike a plain SSBO arena (capped at `maxStorageBufferRange`), the
     /// paged expert kernels read this through a `GL_EXT_buffer_reference` pointer, so it may be as
@@ -5800,6 +5926,7 @@ impl VulkanBackend {
             decode_prefetch: Mutex::new(None),
             cpu_miss: std::sync::OnceLock::new(),
             moe_pager: Arc::clone(&self.moe_pager),
+            host_cache_arenas: Arc::clone(&self.host_cache_arenas),
             session_finalization_deferred: Arc::clone(&self.session_finalization_deferred),
             dense_pager: Mutex::new(None),
             runtime_phase,
