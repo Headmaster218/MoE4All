@@ -184,17 +184,22 @@ foreach ($target in @($externalTargets.Keys | Sort-Object)) {
 # dependencies. Build the production dependency closure explicitly so the
 # offline runtime never falls back to the source checkout's hoisted modules.
 $workspacePackages = @{}
-$workspaceManifests = Get-ChildItem -LiteralPath $buildDshRoot -Recurse -File -Filter package.json |
-    Where-Object { $_.FullName -notmatch '[\\/]node_modules[\\/]' }
-foreach ($manifestPath in $workspaceManifests) {
+$dshSourceRoot = Join-Path $root 'harness\dsh'
+$workspaceManifestPaths = @(& git -C $dshSourceRoot ls-files '--' ':(glob)**/package.json')
+if ($LASTEXITCODE -ne 0 -or $workspaceManifestPaths.Count -eq 0) {
+    throw 'Cannot enumerate DSH workspace package manifests.'
+}
+foreach ($relativeManifestPath in $workspaceManifestPaths) {
+    $manifestPath = Join-Path $buildDshRoot ($relativeManifestPath.Replace('/', '\'))
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { continue }
     try {
-        $manifest = Get-Content -LiteralPath $manifestPath.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
     } catch {
         continue
     }
     $packageName = [string]$manifest.name
     if ($packageName -match '^@deepseek-ai/[0-9A-Za-z._-]+$' -and -not $workspacePackages.ContainsKey($packageName)) {
-        $workspacePackages[$packageName] = $manifestPath.Directory.FullName
+        $workspacePackages[$packageName] = Split-Path -Parent $manifestPath
     }
 }
 
