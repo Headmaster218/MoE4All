@@ -109,8 +109,13 @@ if ($PrebuiltHarnessRoot) {
     if (-not (Test-Path -LiteralPath (Join-Path $buildHarness 'dsh\apps\cli\lib\bin.js') -PathType Leaf)) {
         throw "Prebuilt DSH runtime is incomplete: $buildHarness"
     }
-    $builtCommit = (& git -C (Join-Path $buildHarness 'dsh') rev-parse HEAD 2>$null).Trim()
-    if ($LASTEXITCODE -eq 0 -and $builtCommit -ne $dshCommit) {
+    $prebuiltManifestPath = Join-Path $buildHarness 'distribution\agent-release.json'
+    if (-not (Test-Path -LiteralPath $prebuiltManifestPath -PathType Leaf)) {
+        throw "Prebuilt release manifest is missing: $prebuiltManifestPath"
+    }
+    $prebuiltManifest = Get-Content -LiteralPath $prebuiltManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $builtCommit = [string]$prebuiltManifest.dshCommit
+    if ($builtCommit -ne $dshCommit) {
         throw "Prebuilt DSH commit does not match the release pin: $builtCommit"
     }
     & (Join-Path $stageHarness 'scripts\Initialize-Agent.ps1') -StateRoot (Join-Path $stageHarness 'agent-state')
