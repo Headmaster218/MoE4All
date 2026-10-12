@@ -221,6 +221,7 @@ Move-Item -LiteralPath (Join-Path $stageHarness 'agent-state') -Destination $see
 $removePaths = @(
     (Join-Path $stageHarness 'dsh'),
     (Join-Path $stageHarness 'plugins'),
+    (Join-Path $stageHarness ([IO.Path]::GetFileName($deploy))),
     (Join-Path $stageRuntime 'pnpm'),
     (Join-Path $stageRuntime 'pnpm-store'),
     (Join-Path $stageRuntime 'plugin-packs')
