@@ -143,7 +143,11 @@ async function run(count, depth) {
   if (sharedKv) nativeArgs.push('--set', 'kv.session_idle_secs=3600',
     '--set', `kv.session_cache_max=${process.env.TRACE_SHARED_KV_MAX || '48g'}`, '--set', 'kv.session_cache_ttl_hours=0');
   for (const entry of JSON.parse(process.env.TRACE_EXTRA_SETS || '[]')) nativeArgs.push('--set', entry);
-  if (traceEnabled) nativeArgs.push('--set', `prof.timeline_path=${trace}`, '--set', `prof.timeline_lanes=${count}`,
+  const timelineLanes = Number(process.env.TRACE_TIMELINE_LANES || count);
+  if (!Number.isInteger(timelineLanes) || timelineLanes < 1 || timelineLanes > count) {
+    throw new Error('TRACE_TIMELINE_LANES must be between one and the active lane count');
+  }
+  if (traceEnabled) nativeArgs.push('--set', `prof.timeline_path=${trace}`, '--set', `prof.timeline_lanes=${timelineLanes}`,
     '--set', `prof.timeline_skip_steps=${process.env.TRACE_SKIP || 64}`, '--set', `prof.timeline_steps=${process.env.TRACE_STEPS || 16}`,
     '--set', `prof.timeline_stride=${process.env.TRACE_STRIDE || 128}`, '--set', `prof.timeline_windows=${process.env.TRACE_WINDOWS || 12}`);
   const stdout = fs.createWriteStream(path.join(dir, 'stdout.log'));
