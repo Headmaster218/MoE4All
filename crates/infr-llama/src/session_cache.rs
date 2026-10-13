@@ -116,7 +116,7 @@ impl SessionCache {
             return Ok(None);
         }
         let max_bytes = match cfg.kv.session_cache_max {
-            SizeSpec::Bytes(bytes) => bytes,
+            SizeSpec::Bytes(bytes) | SizeSpec::FrozenAutomaticBytes(bytes) => bytes,
             SizeSpec::Percent(_) => {
                 return Err(anyhow!(
                     "kv.session_cache_max does not accept percentages; use an absolute GiB/MiB size"

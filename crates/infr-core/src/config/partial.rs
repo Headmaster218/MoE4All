@@ -95,7 +95,7 @@ impl ConfigValue for SizeSpec {
     }
     fn to_display(&self) -> String {
         match self {
-            SizeSpec::Bytes(b) => b.to_string(),
+            SizeSpec::Bytes(b) | SizeSpec::FrozenAutomaticBytes(b) => b.to_string(),
             SizeSpec::Percent(f) => format!("{}%", f * 100.0),
         }
     }

@@ -96,6 +96,10 @@ pub type GenerationProgressCallback =
 pub enum SizeSpec {
     /// Absolute amount in the knob's base unit (bytes for sizes, tokens for counts).
     Bytes(u64),
+    /// Startup-frozen automatic RAM budget. The text parser never creates this variant; retaining
+    /// its origin lets a unified-memory backend avoid treating automatic policy as a user-forced
+    /// second host cache over the same physical RAM.
+    FrozenAutomaticBytes(u64),
     /// Fraction in `(0.0, ..]` of the caller's base (e.g. `80%` → `0.8`).
     Percent(f64),
 }
@@ -105,7 +109,7 @@ impl SizeSpec {
     /// pass through untouched; percentages scale `base`.
     pub fn resolve(self, base: u64) -> u64 {
         match self {
-            SizeSpec::Bytes(b) => b,
+            SizeSpec::Bytes(b) | SizeSpec::FrozenAutomaticBytes(b) => b,
             SizeSpec::Percent(f) => (base as f64 * f) as u64,
         }
     }

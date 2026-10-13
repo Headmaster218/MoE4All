@@ -98,9 +98,10 @@ impl<'a> TokenEmbd<'a> {
 fn host_ram_request(ec: &EngineConfig) -> infr_core::hostmem::RamRequest {
     let total_host_ram = infr_core::hostmem::total_bytes();
     let total_process_budget = ec.device.ram_budget.and_then(|size| match size {
-        infr_core::SizeSpec::Bytes(bytes) => Some(bytes),
+        infr_core::SizeSpec::Bytes(bytes) => Some((bytes, false)),
+        infr_core::SizeSpec::FrozenAutomaticBytes(bytes) => Some((bytes, true)),
         infr_core::SizeSpec::Percent(_) => match total_host_ram {
-            Some(total) => Some(size.resolve(total)),
+            Some(total) => Some((size.resolve(total), false)),
             None => {
                 tracing::warn!(
                     "device.ram_budget is a percentage, but total physical RAM could not be \
@@ -116,11 +117,17 @@ fn host_ram_request(ec: &EngineConfig) -> infr_core::hostmem::RamRequest {
             "both device.ram_budget and legacy paging.dram are set; using device.ram_budget"
         );
     }
-    infr_core::hostmem::RamRequest::from_config(
-        total_process_budget,
+    let request = infr_core::hostmem::RamRequest::from_config(
+        total_process_budget.map(|(bytes, _)| bytes),
         legacy_cache_budget,
         ec.paging.dram_bypass,
-    )
+    );
+    if matches!(total_process_budget, Some((_, true))) {
+        if let infr_core::hostmem::RamRequest::TotalProcessBudget(bytes) = request {
+            return infr_core::hostmem::RamRequest::FrozenAutomaticBudget(bytes);
+        }
+    }
+    request
 }
 
 fn log_host_ram_request(
@@ -145,6 +152,20 @@ fn log_host_ram_request(
             host_cache_budget_bytes = cache_bytes,
             "{what} host tier: this platform could not measure process resident RAM; treating \
              device.ram_budget as a best-effort host-cache ceiling"
+        ),
+        (infr_core::hostmem::RamRequest::FrozenAutomaticBudget(total), Some(resident)) => {
+            tracing::info!(
+                total_process_ram_budget_bytes = total,
+                observed_process_resident_bytes = resident,
+                reclaimable_load_source_bytes = reclaimable_load_source,
+                host_cache_budget_bytes = cache_bytes,
+                "{what} host tier: using the startup-frozen automatic total-process RAM budget"
+            )
+        }
+        (infr_core::hostmem::RamRequest::FrozenAutomaticBudget(total), None) => tracing::warn!(
+            total_process_ram_budget_bytes = total,
+            host_cache_budget_bytes = cache_bytes,
+            "{what} host tier: process resident RAM is unavailable while applying the startup-frozen automatic budget"
         ),
         (infr_core::hostmem::RamRequest::LegacyCacheBudget(bytes), _) => tracing::warn!(
             legacy_host_cache_bytes = bytes,
@@ -216,7 +237,7 @@ fn cpu_paged_store(
             return Ok(None);
         }
         infr_core::hostmem::ArenaPlan::Take(n) => {
-            if ram_request == infr_core::hostmem::RamRequest::Auto {
+            if ram_request.is_automatic() {
                 tracing::info!(
                     "host paging: {:.2} GiB of weights exceed the {:.2} GiB of host memory \
                      available, so they stream from disk through a {:.2} GiB arena instead of the \
@@ -356,7 +377,7 @@ fn vulkan_host_tier(
             return Ok(out);
         }
         infr_core::hostmem::ArenaPlan::Take(n) => {
-            if ram_request == infr_core::hostmem::RamRequest::Auto {
+            if ram_request.is_automatic() {
                 tracing::info!(
                     "{what} host tier: sized automatically to {:.2} GiB of {:.2} GiB available host \
                      memory (set INFR_RAM_BUDGET to override)",
@@ -3325,20 +3346,31 @@ enum MoeHostBacking {
     Bounded { bytes: usize },
 }
 
-fn moe_host_backing(
+fn moe_host_backing_for_device(
     profile: infr_core::config::AutoProfile,
     ram_request: infr_core::hostmem::RamRequest,
+    unified: bool,
     available: Option<u64>,
     total: Option<u64>,
     process_resident: Option<u64>,
     commit_ceiling: Option<u64>,
     payload_bytes: usize,
 ) -> MoeHostBacking {
+    if unified && ram_request.is_automatic() {
+        return MoeHostBacking::Bounded { bytes: 0 };
+    }
     // Automatic Windows sizing may supply a post-Vulkan snapshot so WDDM's commit charge is
     // visible. Explicit total-process sizing retains the pre-upload resident snapshot because the
     // clean GGUF source pages touched by fixed uploads are reclaimable before this arena is filled.
     let requested_budget = match ram_request {
         infr_core::hostmem::RamRequest::TotalProcessBudget(total) => {
+            infr_core::hostmem::cache_bytes_for_total_budget(
+                total,
+                process_resident,
+                payload_bytes as u64,
+            )
+        }
+        infr_core::hostmem::RamRequest::FrozenAutomaticBudget(total) => {
             infr_core::hostmem::cache_bytes_for_total_budget(
                 total,
                 process_resident,
@@ -3364,7 +3396,8 @@ fn moe_host_backing(
     // sizing must account for that live pressure. Every explicit request remains authoritative:
     // advanced users may intentionally trade system headroom for a complete Host store.
     let budget = match ram_request {
-        infr_core::hostmem::RamRequest::Auto => {
+        infr_core::hostmem::RamRequest::Auto
+        | infr_core::hostmem::RamRequest::FrozenAutomaticBudget(_) => {
             requested_budget.min(commit_ceiling.unwrap_or(u64::MAX))
         }
         infr_core::hostmem::RamRequest::TotalProcessBudget(_)
@@ -3376,6 +3409,28 @@ fn moe_host_backing(
     } else {
         MoeHostBacking::Bounded { bytes: budget }
     }
+}
+
+#[cfg(test)]
+fn moe_host_backing(
+    profile: infr_core::config::AutoProfile,
+    ram_request: infr_core::hostmem::RamRequest,
+    available: Option<u64>,
+    total: Option<u64>,
+    process_resident: Option<u64>,
+    commit_ceiling: Option<u64>,
+    payload_bytes: usize,
+) -> MoeHostBacking {
+    moe_host_backing_for_device(
+        profile,
+        ram_request,
+        false,
+        available,
+        total,
+        process_resident,
+        commit_ceiling,
+        payload_bytes,
+    )
 }
 
 /// Publish the per-expert file ranges only after the bounded host arena exists. During weight
@@ -4265,8 +4320,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     );
                 };
 
-                let automatic_host_budget =
-                    matches!(ram_request, infr_core::hostmem::RamRequest::Auto);
+                let automatic_host_budget = ram_request.is_automatic();
                 let host_available = if cfg!(windows) && automatic_host_budget {
                     infr_core::hostmem::available_bytes()
                 } else {
@@ -4282,9 +4336,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 let automatic_commit_ceiling = automatic_host_budget
                     .then_some(live_commit_ceiling)
                     .flatten();
-                let host_backing = moe_host_backing(
+                let host_backing = moe_host_backing_for_device(
                     auto_profile,
                     ram_request,
+                    vk.capabilities().unified_memory,
                     host_available,
                     planned_host_total,
                     process_resident,
@@ -4322,7 +4377,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         );
                     }
                 }
-                if ram_request == infr_core::hostmem::RamRequest::Auto {
+                if ram_request.is_automatic() {
                     if let Some(available) = host_available {
                         tracing::info!(
                             auto_profile = ?auto_profile,
@@ -6214,6 +6269,48 @@ mod seam_helper_tests {
             super::host_ram_request(&config),
             RamRequest::TotalProcessBudget(0),
             "zero must retain its canonical source so diagnostics cannot mislabel it"
+        );
+
+        config.device.ram_budget = Some(SizeSpec::FrozenAutomaticBytes((45 * GIB) as u64));
+        assert_eq!(
+            super::host_ram_request(&config),
+            RamRequest::FrozenAutomaticBudget((45 * GIB) as u64),
+            "startup-frozen automatic RAM must not become a user-forced budget"
+        );
+    }
+
+    #[test]
+    fn automatic_moe_host_backing_does_not_duplicate_unified_memory() {
+        use infr_core::hostmem::RamRequest;
+
+        let payload = 47 * GIB;
+        assert_eq!(
+            super::moe_host_backing_for_device(
+                infr_core::config::AutoProfile::Aggressive,
+                RamRequest::FrozenAutomaticBudget((50 * GIB) as u64),
+                true,
+                Some((60 * GIB) as u64),
+                Some((64 * GIB) as u64),
+                Some((2 * GIB) as u64),
+                None,
+                payload,
+            ),
+            super::MoeHostBacking::Bounded { bytes: 0 },
+            "the mapped device arena is already the only useful expert cache on UMA"
+        );
+        assert_eq!(
+            super::moe_host_backing_for_device(
+                infr_core::config::AutoProfile::Aggressive,
+                RamRequest::TotalProcessBudget((50 * GIB) as u64),
+                true,
+                Some((60 * GIB) as u64),
+                Some((64 * GIB) as u64),
+                Some((2 * GIB) as u64),
+                None,
+                payload,
+            ),
+            super::MoeHostBacking::Full,
+            "a genuinely explicit RAM budget remains authoritative on UMA"
         );
     }
 

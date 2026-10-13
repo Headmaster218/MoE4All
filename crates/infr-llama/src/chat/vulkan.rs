@@ -103,9 +103,10 @@ impl DenseSeamChat {
         if self.session.is_none() {
             let user_ctx = super::cfg_ctx_spec(self.model.engine_cfg());
             self.session = Some(match user_ctx {
-                Some(infr_core::SizeSpec::Bytes(ctx)) => {
-                    self.model.vulkan_session_on(self.dev, ctx as usize)?
-                }
+                Some(
+                    infr_core::SizeSpec::Bytes(ctx)
+                    | infr_core::SizeSpec::FrozenAutomaticBytes(ctx),
+                ) => self.model.vulkan_session_on(self.dev, ctx as usize)?,
                 Some(infr_core::SizeSpec::Percent(f)) => {
                     self.model.vulkan_session_frac_on(self.dev, f)?
                 }

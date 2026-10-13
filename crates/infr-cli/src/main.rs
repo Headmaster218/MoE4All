@@ -967,7 +967,8 @@ fn profile_size_field(
         .as_str()
         .ok_or_else(|| anyhow!("test resource profile `{name}` must be a byte count or size"))?;
     match infr_core::parse_size(raw) {
-        Some(infr_core::SizeSpec::Bytes(bytes)) => Ok(bytes),
+        Some(infr_core::SizeSpec::Bytes(bytes))
+        | Some(infr_core::SizeSpec::FrozenAutomaticBytes(bytes)) => Ok(bytes),
         Some(infr_core::SizeSpec::Percent(_)) => {
             anyhow::bail!("test resource profile `{name}` cannot be a percentage")
         }

@@ -480,7 +480,7 @@ fn attached_embedding_bytes(profile: &ModelProfile) -> Result<Option<u64>, Strin
 
 fn parse_absolute(raw: &str) -> Option<u64> {
     match parse_size(raw.trim())? {
-        SizeSpec::Bytes(v) => Some(v),
+        SizeSpec::Bytes(v) | SizeSpec::FrozenAutomaticBytes(v) => Some(v),
         SizeSpec::Percent(_) => None,
     }
 }
@@ -490,7 +490,7 @@ fn parse_budget(raw: &str, base: Option<u64>) -> Option<u64> {
         return None;
     }
     match parse_size(raw.trim())? {
-        SizeSpec::Bytes(v) => Some(v),
+        SizeSpec::Bytes(v) | SizeSpec::FrozenAutomaticBytes(v) => Some(v),
         SizeSpec::Percent(p) => base.map(|b| (b as f64 * p) as u64),
     }
 }
