@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ash::vk;
 use infr_core::timeline::{self, Context, DeviceEvent};
@@ -256,19 +256,25 @@ impl Drop for Query {
 }
 
 pub(crate) fn group(kernel: &'static str) -> &'static str {
-    if kernel.contains("qsa") {
+    if kernel.contains("qsa") || kernel.contains("attention") || kernel.contains("attn") {
         "QSA_completion_interval"
     } else if kernel.contains("hc_") {
         "HC_completion_interval"
     } else if kernel.contains("deltanet") || kernel.contains("conv1d") {
         "GDN_completion_interval"
-    } else if kernel.contains("expert_") || kernel.contains("mmv_id") || kernel.contains("moe") {
+    } else if kernel.contains("expert_")
+        || kernel.contains("mmv_id")
+        || kernel.contains("native_idm")
+        || kernel.contains("ple_gate")
+        || kernel.contains("moe")
+    {
         "Expert_completion_interval"
     } else if kernel.contains("mmv")
         || kernel.contains("gemv")
         || kernel.contains("gemm")
         || kernel.contains("linear")
         || kernel.contains("lin_")
+        || kernel.contains("mrow")
     {
         "Projection_completion_interval"
     } else if kernel.contains("norm") || kernel.contains("rope") {
@@ -288,10 +294,16 @@ pub(crate) fn group(kernel: &'static str) -> &'static str {
         || kernel.contains("zero")
     {
         "Data_completion_interval"
+    } else if *RAW_UNKNOWN_KERNELS
+        .get_or_init(|| std::env::var_os("INFR_TIMELINE_RAW_UNKNOWN").is_some())
+    {
+        kernel
     } else {
         "other_completion_interval"
     }
 }
+
+static RAW_UNKNOWN_KERNELS: OnceLock<bool> = OnceLock::new();
 
 #[cfg(test)]
 mod tests {
@@ -303,13 +315,19 @@ mod tests {
         assert_eq!(group("expert_down"), "Expert_completion_interval");
         assert_eq!(group("mmv_id_q4_k"), "Expert_completion_interval");
         assert_eq!(
+            group("native_idm_iq2s_nr4_paged"),
+            "Expert_completion_interval"
+        );
+        assert_eq!(
             group("native_gemm_warp_q8_0_n128_ag"),
             "Projection_completion_interval"
         );
+        assert_eq!(group("native_mrow_q8_0"), "Projection_completion_interval");
         assert_eq!(group("qk_norm_rope_bda"), "NormRope_completion_interval");
         assert_eq!(group("silu_mul"), "Elementwise_completion_interval");
         assert_eq!(group("store_q8_seg"), "Data_completion_interval");
         assert_eq!(group("qsa_indexer_topk"), "QSA_completion_interval");
+        assert_eq!(group("attention_q8"), "QSA_completion_interval");
         assert_eq!(group("deltanet_seq"), "GDN_completion_interval");
         assert_eq!(group("qwen_hc_mix"), "HC_completion_interval");
     }

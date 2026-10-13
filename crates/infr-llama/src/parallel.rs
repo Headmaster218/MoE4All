@@ -3412,10 +3412,20 @@ impl ParallelSeam {
         let ec = self.model.engine_cfg();
         let h_width = cfg.hc_mult * cfg.n_embd;
         let rows = crate::mtp::DRAFT_TOKENS;
+        let timeline_positions = indices
+            .iter()
+            .map(|&index| active[index].kv().cached_len())
+            .collect::<Vec<_>>();
+        let _timeline_cycle = infr_core::timeline::begin_step(&timeline_positions);
+        let timeline_snapshot = infr_core::timeline::span("mtp_snapshot_refresh");
         self.refresh_mtp_snapshots(active, indices)?;
+        drop(timeline_snapshot);
         let t0 = Instant::now();
+        let timeline_draft = infr_core::timeline::span("mtp_draft");
         let (feeds, predictions) = {
+            let timeline_gate_wait = infr_core::timeline::span("mtp_draft_gate_wait");
             let _gate = req.gate_pass();
+            drop(timeline_gate_wait);
             let mut heads = self
                 .mtp_heads
                 .as_ref()
@@ -3454,9 +3464,13 @@ impl ParallelSeam {
             }
             (feeds, predictions)
         };
+        drop(timeline_draft);
 
+        let timeline_verify = infr_core::timeline::span("mtp_verify");
         let (mut verify_ids, mut verify_logits, verify_hidden) = {
+            let timeline_gate_wait = infr_core::timeline::span("mtp_verify_gate_wait");
             let _gate = req.gate_pass();
+            drop(timeline_gate_wait);
             let mut owned_mrope_plans = indices
                 .iter()
                 .map(|&index| active[index].mrope_plan.take())
@@ -3492,6 +3506,7 @@ impl ParallelSeam {
             }
             result?
         };
+        drop(timeline_verify);
         anyhow::ensure!(
             verify_ids.len() == indices.len()
                 && verify_logits.len() == indices.len()
@@ -3502,6 +3517,7 @@ impl ParallelSeam {
 
         let mut cycle = MtpBatchCycleStats::default();
         for (lane_index, &index) in indices.iter().enumerate() {
+            let timeline_accept = infr_core::timeline::span("mtp_accept_emit");
             let work = &mut active[index];
             let pending_emitted = self
                 .mtp_heads
@@ -3591,9 +3607,13 @@ impl ParallelSeam {
                     break;
                 }
             }
+            drop(timeline_accept);
             let restore_t0 = Instant::now();
+            let timeline_restore = infr_core::timeline::span("mtp_restore");
             {
+                let timeline_gate_wait = infr_core::timeline::span("mtp_restore_gate_wait");
                 let _gate = req.gate_pass();
+                drop(timeline_gate_wait);
                 let kv = work.kv.as_mut().expect("MTP lane has target KV");
                 if committed < rows {
                     kv.mtp_restore_delta_row(self.vk.as_ref(), committed)?;
@@ -3616,6 +3636,7 @@ impl ParallelSeam {
                         .copy_from_slice(&hidden[(committed - 1) * h_width..committed * h_width]);
                 }
             }
+            drop(timeline_restore);
             work.prompt.extend_from_slice(
                 &feeds[lane_index][old_len + already_emitted..old_len + committed],
             );
