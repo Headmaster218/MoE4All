@@ -18,6 +18,11 @@ const repeats = Number(process.env.TRACE_REPEATS || 3);
 const tokens = Number(process.env.TRACE_TOKENS || 512);
 const continuation = process.env.TRACE_CONTINUATION === '1';
 const systemPrefix = process.env.TRACE_SYSTEM_PREFIX === '1';
+const mtp = process.env.TRACE_MTP === '1';
+const mtpDraft = process.env.TRACE_MTP_DRAFT ? path.resolve(process.env.TRACE_MTP_DRAFT) : null;
+const mtpK = Number(process.env.TRACE_MTP_K || 4);
+if (mtp && !mtpDraft) throw new Error('TRACE_MTP_DRAFT must name the MTP sidecar when TRACE_MTP=1');
+if (!Number.isInteger(mtpK) || mtpK < 2) throw new Error('TRACE_MTP_K must be an integer >= 2');
 const sharedKv = process.env.TRACE_SHARED_KV ? path.resolve(process.env.TRACE_SHARED_KV) : null;
 const traceEnabled = process.env.TRACE_ENABLED !== '0';
 const tag = process.env.TRACE_TAG || 'measured';
@@ -27,7 +32,7 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const log = value => console.log(JSON.stringify({ at: new Date().toISOString(), ...value }));
 const hash = text => crypto.createHash('sha256').update(text).digest('hex');
 fs.mkdirSync(root, { recursive: true });
-const env = { ...process.env, RUST_LOG: 'info' };
+const env = { ...process.env, RUST_LOG: process.env.TRACE_RUST_LOG || 'info' };
 for (const key of Object.keys(env)) if (key.startsWith('INFR_')) delete env[key];
 const subjects = ['transactional database storage and crash recovery', 'operating system scheduling and virtual memory', 'distributed consensus and replicated state machines'];
 const fillers = [
@@ -128,7 +133,7 @@ async function run(count, depth) {
   const nativeArgs = ['serve', model, '--addr', url.slice(7), '--parallel', String(slots), '--ctx', '160k',
     '--dev', 'Vulkan1', '--temp', '0', '--seed', '1', '--no-think', '--max-new', String(tokens),
     '--set', 'device.auto_profile=aggressive', '--set', 'kv.type_k=q8_0', '--set', 'kv.type_v=q8_0',
-    '--set', 'kv.overflow=false', '--set', `kv.session_cache_dir=${sharedKv || ''}`, '--set', 'spec.mtp=false',
+    '--set', 'kv.overflow=false', '--set', `kv.session_cache_dir=${sharedKv || ''}`, '--set', `spec.mtp=${mtp}`,
     '--set', `prof.ops=${process.env.TRACE_PROFILE_OPS === '1'}`,
     '--set', `prof.stages=${process.env.TRACE_PROFILE_STAGES === '1'}`,
     '--set', `prof.pager_profile=${process.env.TRACE_PROFILE_PAGER === '1'}`,
@@ -138,6 +143,7 @@ async function run(count, depth) {
   nativeArgs[nativeArgs.indexOf('--parallel') + 1] = String(slots);
   if (process.env.TRACE_UBATCH) nativeArgs.push('--ubatch', process.env.TRACE_UBATCH);
   if (process.env.TRACE_THREADS) nativeArgs.push('--threads', process.env.TRACE_THREADS);
+  if (mtp) nativeArgs.push('--set', `spec.draft=${mtpDraft}`, '--set', `spec.k=${mtpK}`);
   if (process.env.TRACE_CPU_MISS_FIXTURE) nativeArgs.push('--set',
     `prof.cpu_miss_fixture_dir=${path.resolve(process.env.TRACE_CPU_MISS_FIXTURE)}`);
   if (sharedKv) nativeArgs.push('--set', `kv.session_idle_secs=${process.env.TRACE_SHARED_KV_IDLE_SECS || '3600'}`,
@@ -168,7 +174,7 @@ async function run(count, depth) {
   child.stderr.on('data', data => { stderr.write(data); last = data.toString().trim().split(/\r?\n/).at(-1); });
   const closed = new Promise(resolve => child.once('close', (code, signal) => { exitInfo = { code, signal }; stdout.end(); stderr.end(); resolve(); }));
   const heartbeat = setInterval(() => log({ count, depth, pid: child.pid, latest: last }), 30000);
-  const result = { count, depth, slots, repeats, tokens, continuation, systemPrefix, sharedKv,
+  const result = { count, depth, slots, repeats, tokens, continuation, systemPrefix, mtp, mtpDraft, mtpK, sharedKv,
     requestOrder, promptHashes: prompt.map(value => hash(JSON.stringify(value.messages))),
     cacheIdentityBefore: identityBefore ? 'cache-identity-before.json' : null,
     warmRoundSkip: systemPrefix ? 1 : 0, traceEnabled, exe, binaryHash: hash(fs.readFileSync(exe)), args: nativeArgs, rounds: [] };
@@ -192,7 +198,7 @@ async function run(count, depth) {
       if ((continuation || systemPrefix) && round > 0) {
         for (const req of requests) {
           const initial = result.rounds[0].requests.find(value => value.lane === req.lane).usage.prompt_tokens;
-          if (req.timings.cached_n < initial - 128) throw new Error(`continuation did not reuse the initial prefix: lane=${req.lane} cached=${req.timings.cached_n} initial=${initial}`);
+          if (!mtp && req.timings.cached_n < initial - 128) throw new Error(`continuation did not reuse the initial prefix: lane=${req.lane} cached=${req.timings.cached_n} initial=${initial}`);
         }
       }
       result.rounds.push({ round, startedUnixMs, finishedUnixMs: Date.now(), requests });
