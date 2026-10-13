@@ -5,7 +5,8 @@ param(
     [string]$Version,
     [string]$OutputDirectory,
     [string]$EngineExecutable,
-    [string]$PrebuiltHarnessRoot
+    [string]$PrebuiltHarnessRoot,
+    [string]$BaseArchive
 )
 
 $ErrorActionPreference = 'Stop'
@@ -58,6 +59,89 @@ foreach ($relative in $submodules) {
     if ($LASTEXITCODE -ne 0 -or $actual -ne $expected) { throw "Submodule does not match its pin: $relative" }
     $dirty = & git -C $source status --porcelain --untracked-files=no
     if ($LASTEXITCODE -ne 0 -or $dirty) { throw "Commit tracked submodule changes: $relative" }
+}
+
+# A launcher-only hotfix can reuse a verified integrated runtime when all runtime source pins match.
+if ($BaseArchive) {
+    if ($PrebuiltHarnessRoot) { throw 'BaseArchive and PrebuiltHarnessRoot cannot be combined.' }
+    $baseZip = [IO.Path]::GetFullPath($BaseArchive)
+    $baseSum = "$baseZip.sha256"
+    if (-not (Test-Path -LiteralPath $baseSum -PathType Leaf)) { throw 'The base archive checksum is missing.' }
+    $sumPattern = '(?im)^([a-f0-9]{64})\s+\*?' + [regex]::Escape([IO.Path]::GetFileName($baseZip)) + '\s*$'
+    if ((Get-Content -LiteralPath $baseSum -Raw -Encoding UTF8) -notmatch $sumPattern) {
+        throw 'The base checksum does not name the expected archive.'
+    }
+    $expectedHash = $Matches[1]
+    if ((Get-FileHash -LiteralPath $baseZip -Algorithm SHA256).Hash -ne $expectedHash) {
+        throw 'The base archive SHA256 does not match.'
+    }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $baseReader = [IO.Compression.ZipFile]::OpenRead($baseZip)
+    try {
+        $baseTop = [IO.Path]::GetFileNameWithoutExtension($baseZip)
+        foreach ($entry in $baseReader.Entries) {
+            $parts = $entry.FullName -split '[\\/]'
+            if ($parts[0] -ne $baseTop -or $parts -contains '..' -or $entry.FullName.Contains(':')) {
+                throw "Unexpected base archive path: $($entry.FullName)"
+            }
+        }
+        $baseManifestEntry = $baseReader.GetEntry("$baseTop/harness/distribution/agent-release.json")
+        if ($null -eq $baseManifestEntry) { throw 'The base release manifest is missing.' }
+        $manifestReader = New-Object IO.StreamReader($baseManifestEntry.Open())
+        try { $baseManifest = $manifestReader.ReadToEnd() | ConvertFrom-Json } finally { $manifestReader.Dispose() }
+        $baseCommit = [string]$baseManifest.sourceCommit
+        if ($baseManifest.schema -ne 2 -or $baseManifest.product -ne 'moe4all-agent' -or
+            $baseManifest.packageKind -ne 'integrated' -or $baseManifest.engineVersion -ne $engineTag -or
+            $baseCommit -notmatch '^[0-9a-f]{40}$' -or $baseTop -ne "MoE4All-Agent-Windows-x64-$($baseManifest.version)") {
+            throw 'The base archive is not a matching integrated Agent release.'
+        }
+    } finally { $baseReader.Dispose() }
+    . (Join-Path $PSScriptRoot 'AgentUpdateVersion.ps1')
+    if (-not (Test-AgentVersionNewer $Version ([string]$baseManifest.version))) {
+        throw 'The hotfix release must be newer than the base release.'
+    }
+    & git -C $root cat-file -e ($baseCommit + '^{commit}')
+    if ($LASTEXITCODE -ne 0) { throw 'The base source commit is not available for verification.' }
+    $runtimePaths = @($submodules) + @('harness/distribution/profile')
+    & git -C $root diff --quiet $baseCommit HEAD -- @runtimePaths
+    if ($LASTEXITCODE -ne 0) { throw 'Runtime submodules or profile changed; perform a full release build.' }
+
+    $baseExtract = Join-Path $output "$name-base"
+    if (Test-Path -LiteralPath $baseExtract) { throw "Base extraction already exists: $baseExtract" }
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+    [IO.Compression.ZipFile]::ExtractToDirectory($baseZip, $baseExtract)
+    Move-Item -LiteralPath (Join-Path $baseExtract $baseTop) -Destination $stage
+    [IO.Directory]::Delete($baseExtract, $false)
+    $stageHarness = Join-Path $stage 'harness'
+    if (Test-Path -LiteralPath (Join-Path $stageHarness 'agent-state')) {
+        throw 'The base archive contains user runtime state.'
+    }
+    $bundledEnginePath = Join-Path $stageHarness "runtime\engine\$engineTag\infr.exe"
+    if ((Get-FileHash -LiteralPath $bundledEnginePath -Algorithm SHA256).Hash -ne
+        (Get-FileHash -LiteralPath $engineExe -Algorithm SHA256).Hash) {
+        throw 'The reused Engine differs from the selected release executable.'
+    }
+    foreach ($scriptName in @('AgentUpdateVersion.ps1', 'Check-AgentUpdate.ps1', 'Prepare-BundledRuntime.ps1', 'Run-Agent.ps1')) {
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot $scriptName) -Destination (Join-Path $stageHarness "scripts\$scriptName") -Force
+    }
+    Copy-Item -LiteralPath (Join-Path $root 'harness\launcher\MoE4All.cs') -Destination (Join-Path $stageHarness 'launcher\MoE4All.cs') -Force
+    & (Join-Path $PSScriptRoot 'Build-AgentLauncher.ps1') -OutputPath (Join-Path $stage 'MoE4All.exe')
+    if ($LASTEXITCODE -ne 0) { throw 'Building the hotfix launcher failed.' }
+    $baseVersion = [string]$baseManifest.version
+    $baseManifest.version = $Version
+    $baseManifest.sourceCommit = $rootCommit
+    $runtimeSourceCommit = $baseCommit
+    if ($baseManifest.runtimeSourceCommit) { $runtimeSourceCommit = [string]$baseManifest.runtimeSourceCommit }
+    $baseManifest | Add-Member -NotePropertyName runtimeSourceCommit -NotePropertyValue $runtimeSourceCommit -Force
+    $baseManifest | Add-Member -NotePropertyName basePackageVersion -NotePropertyValue $baseVersion -Force
+    [IO.File]::WriteAllText((Join-Path $stageHarness 'distribution\agent-release.json'),
+        (($baseManifest | ConvertTo-Json) + "`n"), (New-Object Text.UTF8Encoding($false)))
+    [IO.Compression.ZipFile]::CreateFromDirectory($stage, $archive, [IO.Compression.CompressionLevel]::Optimal, $true)
+    $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+    [IO.File]::WriteAllText($checksum, "$hash  $([IO.Path]::GetFileName($archive))`n", (New-Object Text.UTF8Encoding($false)))
+    Write-Host "Agent release: $archive"
+    Write-Host "SHA256: $hash"
+    return
 }
 
 New-Item -ItemType Directory -Path $output, $stage -Force | Out-Null
