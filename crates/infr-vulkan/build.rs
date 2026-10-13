@@ -1608,6 +1608,11 @@ fn main() {
             "native_mrow_q8_0_m2",
             &["-DFMT_Q8_0", "-DMR=2"],
         ),
+        (
+            "native_gemv_mrow",
+            "native_mrow_q8_0_m4",
+            &["-DFMT_Q8_0", "-DMR=4"],
+        ),
         ("native_gemv_mrow", "native_mrow_bf16", &["-DFMT_BF16"]),
         ("native_gemv_mrow", "native_mrow_q4_0", &["-DFMT_Q4_0"]),
         ("native_gemv_mrow", "native_mrow_q4_1", &["-DFMT_Q4_1"]),

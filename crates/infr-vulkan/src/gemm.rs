@@ -184,6 +184,7 @@ pub(crate) fn native_mrow_spv(
     }
     match (dtype, rows) {
         (Q8_0, 2) => v!("native_mrow_q8_0_m2"),
+        (Q8_0, 4) => v!("native_mrow_q8_0_m4"),
         (Q8_0, _) => v!("native_mrow_q8_0"),
         (Bf16, _) => v!("native_mrow_bf16"),
         (Q4_0, _) => v!("native_mrow_q4_0"),
@@ -4703,6 +4704,22 @@ impl VulkanBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn q8_mrow_uses_fixed_row_specializations() {
+        assert_eq!(
+            native_mrow_spv(infr_core::DType::Q8_0, 2).unwrap().0,
+            "native_mrow_q8_0_m2"
+        );
+        assert_eq!(
+            native_mrow_spv(infr_core::DType::Q8_0, 4).unwrap().0,
+            "native_mrow_q8_0_m4"
+        );
+        assert_eq!(
+            native_mrow_spv(infr_core::DType::Q8_0, 3).unwrap().0,
+            "native_mrow_q8_0"
+        );
+    }
 
     /// B7 slice 3a — the decode specialization's reduction must be a PLAIN subgroup reduce, never
     /// a clustered one. `attn_partial_dsplit.comp` (the width probe) spells the same width-32
