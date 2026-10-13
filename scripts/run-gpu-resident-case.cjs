@@ -140,7 +140,7 @@ async function run(count, depth) {
   if (process.env.TRACE_THREADS) nativeArgs.push('--threads', process.env.TRACE_THREADS);
   if (process.env.TRACE_CPU_MISS_FIXTURE) nativeArgs.push('--set',
     `prof.cpu_miss_fixture_dir=${path.resolve(process.env.TRACE_CPU_MISS_FIXTURE)}`);
-  if (sharedKv) nativeArgs.push('--set', 'kv.session_idle_secs=3600',
+  if (sharedKv) nativeArgs.push('--set', `kv.session_idle_secs=${process.env.TRACE_SHARED_KV_IDLE_SECS || '3600'}`,
     '--set', `kv.session_cache_max=${process.env.TRACE_SHARED_KV_MAX || '48g'}`, '--set', 'kv.session_cache_ttl_hours=0');
   for (const entry of JSON.parse(process.env.TRACE_EXTRA_SETS || '[]')) nativeArgs.push('--set', entry);
   const timelineLanes = Number(process.env.TRACE_TIMELINE_LANES || count);
