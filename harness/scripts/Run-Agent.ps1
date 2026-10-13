@@ -10,6 +10,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
 $harnessRoot = Split-Path -Parent $PSScriptRoot
 if (-not $StateRoot) { $StateRoot = Join-Path $harnessRoot 'agent-state' }
 $state = [System.IO.Path]::GetFullPath($StateRoot)
@@ -60,9 +61,10 @@ if (-not (Test-Path -LiteralPath (Join-Path $profile 'node_modules') -PathType C
 if (-not (Test-Path -LiteralPath $workspace -PathType Container)) {
     throw "Workspace directory not found: $workspace"
 }
-$node = Get-ChildItem -LiteralPath (Join-Path $harnessRoot 'runtime') -Filter node.exe -Recurse -ErrorAction SilentlyContinue |
-    Where-Object { $_.FullName -match 'node-v[^\\]+-win-x64\\node\.exe$' } |
-    Select-Object -First 1 -ExpandProperty FullName
+$node = Get-ChildItem -LiteralPath (Join-Path $harnessRoot 'runtime') -Directory -Filter 'node-v*-win-x64' |
+    ForEach-Object { Join-Path $_.FullName 'node.exe' } |
+    Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+    Select-Object -First 1
 if (-not $node) { throw 'The bundled MoE4All Node runtime is missing.' }
 if (-not $CliPath) { $CliPath = Join-Path $harnessRoot 'runtime\dsh\lib\bin.js' }
 $entry = [System.IO.Path]::GetFullPath($CliPath)

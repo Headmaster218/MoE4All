@@ -5,6 +5,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
 $harnessRoot = Split-Path -Parent $PSScriptRoot
 if (-not $InstallRoot) { $InstallRoot = Split-Path -Parent $harnessRoot }
 if (-not $StateRoot) { $StateRoot = Join-Path $harnessRoot 'agent-state' }
