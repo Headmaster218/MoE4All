@@ -124,6 +124,8 @@ if ($BaseArchive) {
     foreach ($scriptName in @('AgentUpdateVersion.ps1', 'Check-AgentUpdate.ps1', 'Prepare-BundledRuntime.ps1', 'Run-Agent.ps1')) {
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot $scriptName) -Destination (Join-Path $stageHarness "scripts\$scriptName") -Force
     }
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Prepare-BundledRuntime.cjs') -Destination (Join-Path $stageHarness 'scripts\Prepare-BundledRuntime.cjs') -Force
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'vendor') -Destination (Join-Path $stageHarness 'scripts\vendor') -Recurse -Force
     Copy-Item -LiteralPath (Join-Path $root 'harness\launcher\MoE4All.cs') -Destination (Join-Path $stageHarness 'launcher\MoE4All.cs') -Force
     & (Join-Path $PSScriptRoot 'Build-AgentLauncher.ps1') -OutputPath (Join-Path $stage 'MoE4All.exe')
     if ($LASTEXITCODE -ne 0) { throw 'Building the hotfix launcher failed.' }
@@ -136,6 +138,7 @@ if ($BaseArchive) {
     $baseManifest | Add-Member -NotePropertyName basePackageVersion -NotePropertyValue $baseVersion -Force
     [IO.File]::WriteAllText((Join-Path $stageHarness 'distribution\agent-release.json'),
         (($baseManifest | ConvertTo-Json) + "`n"), (New-Object Text.UTF8Encoding($false)))
+    & (Join-Path $PSScriptRoot 'Pack-AgentRuntime.ps1') -HarnessRoot $stageHarness
     [IO.Compression.ZipFile]::CreateFromDirectory($stage, $archive, [IO.Compression.CompressionLevel]::Optimal, $true)
     $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
     [IO.File]::WriteAllText($checksum, "$hash  $([IO.Path]::GetFileName($archive))`n", (New-Object Text.UTF8Encoding($false)))
@@ -155,6 +158,8 @@ $agentPaths = @(
     'harness/scripts/Check-AgentUpdate.ps1',
     'harness/scripts/Initialize-Agent.ps1',
     'harness/scripts/Prepare-BundledRuntime.ps1',
+    'harness/scripts/Prepare-BundledRuntime.cjs',
+    'harness/scripts/vendor',
     'harness/scripts/Run-Agent.ps1'
 )
 & git -C $root archive '--format=zip' ("--output=$temp") HEAD @agentPaths
@@ -396,6 +401,7 @@ foreach ($scriptName in @('Build-Agent.ps1', 'Build-DevHarness.ps1', 'Initialize
 }
 Remove-Item -LiteralPath $deploy -Recurse -Force
 
+& (Join-Path $PSScriptRoot 'Pack-AgentRuntime.ps1') -HarnessRoot $stageHarness
 Compress-Archive -LiteralPath $stage -DestinationPath $archive -CompressionLevel Optimal
 $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
 [IO.File]::WriteAllText($checksum, "$hash  $([IO.Path]::GetFileName($archive))`n", (New-Object Text.UTF8Encoding($false)))
