@@ -311,6 +311,19 @@ fn freeze_automatic_ram_budget_for_snapshot(
     {
         return None;
     }
+    // On Linux the GPU-aliased host cache is a net LOSS. Making the host tier device-visible
+    // (`VK_EXT_external_memory_host`) is billed on EVERY command submission in proportion to its
+    // size — measured ~6.8 ms per GiB per submit on amdgpu (RADV Mesa 26.0.8 AND AMDVLK
+    // v-2025.Q2.1 alike, so it is the kernel, not the userspace driver). A 22 GiB tier then costs
+    // ~145 ms/submit and a paged MoE emits ~170 submits per decode token: 0.07 tok/s, against
+    // 29 tok/s for the same model with no host cache at all. So the AUTO policy here is "no host
+    // cache" — stream straight from disk into VRAM, the shape unified memory already takes.
+    // Explicit settings returned above and still win, which is the escape hatch for a platform
+    // whose aliasing is cheap.
+    if cfg!(target_os = "linux") {
+        config.paging.dram_bypass = true;
+        return None;
+    }
     let profile = config.device.auto_profile;
     let budget_bytes = match profile {
         crate::config::AutoProfile::Conservative => {
@@ -753,6 +766,21 @@ mod tests {
 
     #[test]
     fn automatic_ram_budget_is_frozen_like_an_explicit_startup_value() {
+        // Linux declines the automatic host cache outright — the GPU-aliased host tier is
+        // billed per command submission there — so nothing is frozen and the request stays
+        // `Bypass`. See `freeze_automatic_ram_budget_for_snapshot`.
+        if cfg!(target_os = "linux") {
+            let mut declined = crate::config::Config::default();
+            assert!(freeze_automatic_ram_budget_for_snapshot(
+                &mut declined,
+                Some(48 * GIB),
+                Some(64 * GIB)
+            )
+            .is_none());
+            assert!(declined.paging.dram_bypass);
+            assert_eq!(declined.device.ram_budget, None);
+            return;
+        }
         let mut conservative = crate::config::Config::default();
         let frozen = freeze_automatic_ram_budget_for_snapshot(
             &mut conservative,

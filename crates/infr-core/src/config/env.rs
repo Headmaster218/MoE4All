@@ -218,6 +218,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.paging.dram_bypass = presence(get, "INFR_DRAM_BYPASS");
     p.paging.host_dma = presence_inv(get, "INFR_NO_HOST_DMA");
     p.paging.stats = presence(get, "INFR_PAGER_STATS");
+    p.paging.warm_page_cache = presence(get, "INFR_WARM_PAGE_CACHE");
     p.paging.trace = opt_path(get, "INFR_PAGER_TRACE");
     // Tri-state syntax retained for compatibility: "0" keeps chunk-major, any other value forces
     // layer-major, and unset uses the chunk-major default (see `PagingCfg::layer_major`).
