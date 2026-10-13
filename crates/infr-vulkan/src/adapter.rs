@@ -10348,6 +10348,7 @@ impl ResidentNoticeProducer {
                         words[crate::recorder::RESIDENT_JOURNAL_MASK_WORD + row]
                     }),
                     count: entry.layout.count(),
+                    routed_ids: words[..entry.layout.count()].to_vec(),
                 });
             }
             Some(context)

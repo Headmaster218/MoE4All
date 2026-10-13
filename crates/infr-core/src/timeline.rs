@@ -78,6 +78,7 @@ pub struct ResidentNotice {
     pub status: u32,
     pub hit_masks: [u32; 4],
     pub count: usize,
+    pub routed_ids: Vec<u32>,
 }
 
 struct State {
