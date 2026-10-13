@@ -288,7 +288,11 @@ fn native_q8_wave32_choice(
     enabled: bool,
 ) -> Option<u32> {
     (dtype == infr_core::DType::Q8_0 && enabled && out_f >= 1024 && in_f.is_multiple_of(32))
-        .then_some(if in_f <= 2560 { 4 } else { 2 })
+        .then_some(if in_f <= 2560 && out_f < 131072 {
+            4
+        } else {
+            2
+        })
 }
 
 /// NUM_ROWS for the reassociation-tolerant subgroup id-indexed decode GEMV
@@ -14639,6 +14643,30 @@ mod tests {
     use infr_core::{backend::BufferUsage, Backend};
 
     #[test]
+    fn q8_wave32_uses_two_rows_only_for_very_wide_outputs() {
+        assert_eq!(
+            native_q8_wave32_choice(infr_core::DType::Q8_0, 2560, 248_320, true),
+            Some(2)
+        );
+        assert_eq!(
+            native_q8_wave32_choice(infr_core::DType::Q8_0, 2560, 10_240, true),
+            Some(4)
+        );
+        assert_eq!(
+            native_q8_wave32_choice(infr_core::DType::Q8_0, 6144, 2560, true),
+            Some(2)
+        );
+        assert_eq!(
+            native_q8_wave32_choice(infr_core::DType::Q8_0, 2560, 248_320, false),
+            None
+        );
+        assert_eq!(
+            native_q8_wave32_choice(infr_core::DType::F16, 2560, 248_320, true),
+            None
+        );
+    }
+
+    #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn fused_host_miss_accumulation_matches_scatter_for_every_slot_and_tail() {
         let backend = VulkanBackend::new().unwrap();
@@ -18408,6 +18436,7 @@ mod tests {
             (10240, 320),
             (10240, 2560),
             (12288, 2560),
+            (2560, 248320),
         ]
         .into_iter()
         .enumerate()
