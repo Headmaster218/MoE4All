@@ -4402,6 +4402,21 @@ impl VulkanBackend {
             has_push_descriptor.then(|| ash::khr::push_descriptor::Device::new(&instance, &device));
         let conditional_rendering = has_conditional
             .then(|| ash::ext::conditional_rendering::Device::new(&instance, &device));
+        if vkcfg.decode_gpu_resident {
+            if has_conditional {
+                tracing::info!(
+                    layers = vkcfg.decode_gpu_resident_layers,
+                    submit_layers = vkcfg.decode_gpu_resident_submit_layers,
+                    hit_first = vkcfg.decode_gpu_resident_hit_first,
+                    early_recovery = vkcfg.decode_gpu_resident_early_recovery,
+                    "[infr] GPU-resident paged Decode controller enabled"
+                );
+            } else {
+                tracing::warn!(
+                    "[infr] GPU-resident paged Decode unavailable: device lacks VK_EXT_conditional_rendering; using CPU-controlled paging"
+                );
+            }
+        }
 
         // External-memory fd loader (`vkGetMemoryFdKHR`/`vkGetMemoryFdPropertiesKHR`) — present only
         // when the device extension was enabled above. `Some` here is the sole gate the P2P path

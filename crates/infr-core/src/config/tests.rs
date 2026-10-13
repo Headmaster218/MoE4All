@@ -186,6 +186,17 @@ fn default_config_matches_documented_defaults() {
     assert_eq!(d.kernels.vulkan.flash_min_rows, 24);
     assert_eq!(d.kernels.vulkan.moe_small_m, 8);
     assert!(!d.kernels.vulkan.qsa_prepare_fused);
+    assert!(d.kernels.vulkan.decode_gpu_resident);
+    assert_eq!(d.kernels.vulkan.decode_gpu_resident_layers, 16);
+    assert_eq!(d.kernels.vulkan.decode_gpu_resident_submit_layers, 1);
+    assert_eq!(d.kernels.vulkan.decode_gpu_resident_inflight, 1);
+    assert!(d.kernels.vulkan.decode_gpu_resident_mapped_metadata);
+    assert!(d.kernels.vulkan.decode_gpu_resident_mapped_journal);
+    assert!(d.kernels.vulkan.decode_gpu_resident_fast_lut);
+    assert!(d.kernels.vulkan.decode_gpu_resident_hit_first);
+    assert!(d.kernels.vulkan.decode_gpu_resident_immutable_predicates);
+    assert!(d.kernels.vulkan.decode_gpu_resident_notice_thread);
+    assert!(d.kernels.vulkan.decode_gpu_resident_early_recovery);
     assert_eq!(d.kernels.vulkan.canvas_chunk_n, 3);
     assert!(
         d.kernels.vulkan.delta_strided,
@@ -230,6 +241,16 @@ fn default_config_matches_documented_defaults() {
     assert_eq!(d.spec.mtp_max_context, 48 * 1024);
     assert!(!d.spec.mtp_concurrent);
     assert_eq!(d.spec.decode_chain, 8);
+}
+
+#[test]
+fn gpu_resident_decode_is_shipped_by_default_and_can_be_disabled_explicitly() {
+    let defaults = Config::default();
+    assert!(defaults.kernels.vulkan.decode_gpu_resident);
+
+    let mut cfg = defaults;
+    cli_layer(&["kernels.vulkan.decode_gpu_resident=false"]).apply(&mut cfg);
+    assert!(!cfg.kernels.vulkan.decode_gpu_resident);
 }
 
 #[test]

@@ -10706,6 +10706,24 @@ impl ResidentChunk {
         let limit = cfg
             .decode_gpu_resident_layers
             .clamp(1, crate::recorder::RESIDENT_MAX_LAYERS);
+        static RESIDENT_GRAPH_LOGGED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !RESIDENT_GRAPH_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let layouts = resident_layouts
+                .as_ref()
+                .expect("eligible resident graph has layouts");
+            let first = layouts[0];
+            tracing::info!(
+                moe_layers = layouts.len(),
+                rows = first.rows,
+                experts = first.n_expert,
+                top_k = first.n_used,
+                chunk_layers = limit,
+                hit_first = cfg.decode_gpu_resident_hit_first,
+                early_recovery = cfg.decode_gpu_resident_early_recovery,
+                "[infr] GPU-resident paged Decode graph active"
+            );
+        }
         if retained
             .as_ref()
             .is_none_or(|buffers| buffers.capacity < limit)

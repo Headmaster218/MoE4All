@@ -406,36 +406,37 @@ cfg_struct! {
         decode_sparse_lut: Option<bool> = None,
         /// Earlier FFN submit. None selects measured Qwen3.8 Decode without expert prefetch.
         decode_early_submit: Option<bool> = None,
-        /// Experimental paged Decode: continue full-hit layers on GPU, pause at the first miss.
-        decode_gpu_resident: bool = false,
+        /// Paged Decode: continue full-hit MoE layers on GPU and pause only at the first miss.
+        /// Unsupported devices, expert formats and execution modes fall back automatically.
+        decode_gpu_resident: bool = true,
         /// Bound speculative work and missed-layer recovery; ordinary Decode only.
-        decode_gpu_resident_layers: usize = 4,
-        /// Submit every N checked layers while recording the rest of a chunk; zero keeps one submit.
-        decode_gpu_resident_submit_layers: usize = 0,
-        /// Maximum submitted resident segments kept in flight; clamped to one or two.
-        decode_gpu_resident_inflight: usize = 2,
+        decode_gpu_resident_layers: usize = 16,
+        /// Submit each completed checked layer while recording the rest of the resident chunk.
+        decode_gpu_resident_submit_layers: usize = 1,
+        /// Keep one submitted resident segment in flight so miss recovery has a single owner.
+        decode_gpu_resident_inflight: usize = 1,
         /// Keep resident predicates and LUT tape in coherent mapped VRAM when the device supports it.
-        decode_gpu_resident_mapped_metadata: bool = false,
-        /// A/B keep the published routing journal in coherent mapped VRAM instead of host readback.
-        decode_gpu_resident_mapped_journal: bool = false,
+        decode_gpu_resident_mapped_metadata: bool = true,
+        /// Keep the published routing journal in coherent mapped VRAM, with readback fallback.
+        decode_gpu_resident_mapped_journal: bool = true,
         /// Drain resident chunks to their own fence instead of waiting for the entire queue (A/B).
         decode_gpu_resident_fence_wait: bool = false,
-        /// Cache immutable physical addresses and use dense slot protection for resident LUTs (A/B).
-        decode_gpu_resident_fast_lut: bool = false,
-        /// Experimental GPU miss notice and hit-first overlap; ordinary resident Decode only.
-        decode_gpu_resident_hit_first: bool = false,
+        /// Cache immutable physical addresses and use dense slot protection for resident LUTs.
+        decode_gpu_resident_fast_lut: bool = true,
+        /// Continue resident hits while a miss notice starts host-side recovery.
+        decode_gpu_resident_hit_first: bool = true,
         /// Wait submitted resident fences on a dedicated host thread (driver scheduling A/B).
         decode_gpu_resident_waiter: bool = false,
         /// Give each checked layer immutable predicate words to avoid predicate read/write barriers.
-        decode_gpu_resident_immutable_predicates: bool = false,
-        /// Receive GPU notices and prepare miss uploads on a separate host producer thread (A/B).
-        decode_gpu_resident_notice_thread: bool = false,
+        decode_gpu_resident_immutable_predicates: bool = true,
+        /// Receive GPU notices and prepare miss uploads on a separate host producer thread.
+        decode_gpu_resident_notice_thread: bool = true,
         /// Copy small mapped miss batches on the notice producer. None selects the context-aware
         /// Decode policy; Some(0) disables it and Some(KiB) is an explicit A/B override.
         /// Capped at 8192; imported DMA and ordinary/Prefill uploads are unchanged.
         decode_gpu_resident_mapped_serial_max_kib: Option<usize> = None,
-        /// Experimental queued miss recovery before retiring old resident chunks (rolling cap 1).
-        decode_gpu_resident_early_recovery: bool = false,
+        /// Queue miss recovery before retiring old resident chunks (rolling cap one).
+        decode_gpu_resident_early_recovery: bool = true,
         /// Ordinary FlashNext Decode full-graph mode. None enables it for short contexts only;
         /// Some(false/true) is an explicit diagnostic override.
         decode_gpu_resident_full_graph: Option<bool> = None,
