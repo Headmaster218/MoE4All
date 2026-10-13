@@ -21,7 +21,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAGIC: [u8; 8] = *b"INFRKV01";
-const VERSION: u32 = 2;
+// Persistent state is only reusable across binaries that agree on every cache-producing numeric
+// path. Version 2 predated the Qwen3.8 DeltaNet/HC/QSA rewrites and accepted their old device state
+// because the model fingerprint covers only GGUF bytes. Treat the compatibility epoch as part of
+// the file version so stale state is rejected before it can change a deterministic continuation.
+const VERSION: u32 = 3;
 const HEADER_BYTES: u64 = 112;
 const RECORD_HEADER_BYTES: u64 = 16;
 const CHECKSUM_BYTES: u64 = 32;
@@ -1963,6 +1967,29 @@ mod tests {
             checked_file_bytes(&header).unwrap(),
             HEADER_BYTES + (42 + 17 + 29) * 4 + 12 * RECORD_HEADER_BYTES + 98_765 + CHECKSUM_BYTES
         );
+    }
+
+    #[test]
+    fn previous_numeric_state_epoch_is_rejected() {
+        let header = Header {
+            fingerprint: [7; 32],
+            saved_at: 123,
+            max_ctx: 131_072,
+            committed_tokens: 65_536,
+            cached_count: 42,
+            checkpoint_counts: [17, 29],
+            record_count: 12,
+            k_fmt: DType::Q8_0,
+            v_fmt: DType::F16,
+            data_bytes: 98_765,
+            has_checkpoints: [true, true],
+        };
+        let mut encoded = encode_header(&header);
+        encoded[8..12].copy_from_slice(&2u32.to_le_bytes());
+        assert!(decode_header(&encoded)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported cold KV format version 2"));
     }
 
     #[test]

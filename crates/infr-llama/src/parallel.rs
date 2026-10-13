@@ -784,7 +784,7 @@ fn cold_session_worker(
             Err(error) => {
                 tracing::warn!(
                     slot = index,
-                    "cold KV idle spill failed; keeping the resident state: {error}"
+                    "cold KV idle spill failed; keeping the resident state: {error:#}"
                 );
                 true
             }
