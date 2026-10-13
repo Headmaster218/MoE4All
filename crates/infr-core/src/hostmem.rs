@@ -274,7 +274,7 @@ const AUTO_AVAILABLE_RESERVE: u64 = 3 << 30;
 /// Aggressive automatic sizing treats this as a process-wide reserve below total physical RAM.
 /// Unlike the ordinary profile, already-used RAM does not permanently shrink the target: the
 /// current process working set is subtracted from `total - reserve` to obtain the new arena size.
-const AGGRESSIVE_TOTAL_RESERVE: u64 = 14 << 30;
+const AGGRESSIVE_TOTAL_RESERVE: u64 = 13 << 30;
 
 /// One startup-time automatic RAM decision after it has been frozen into
 /// `device.ram_budget`. From this point on it deliberately follows the explicit total-process
@@ -763,7 +763,7 @@ mod tests {
     }
 
     #[test]
-    fn aggressive_profile_targets_total_ram_minus_fourteen_gib() {
+    fn aggressive_profile_targets_total_ram_minus_thirteen_gib() {
         let available = 40 * GIB;
         let conservative = auto_cache_bytes(available, 0, u64::MAX);
         let aggressive = auto_cache_bytes_for_snapshot(
@@ -775,7 +775,7 @@ mod tests {
             u64::MAX,
         );
         assert!(aggressive > conservative);
-        assert_eq!(aggressive, 48 * GIB);
+        assert_eq!(aggressive, 49 * GIB);
     }
 
     #[test]
@@ -801,10 +801,10 @@ mod tests {
             Some(64 * GIB),
         )
         .expect("aggressive startup budget");
-        assert_eq!(frozen.budget_bytes, 50 * GIB);
+        assert_eq!(frozen.budget_bytes, 51 * GIB);
         assert_eq!(
             aggressive.device.ram_budget,
-            Some(crate::SizeSpec::FrozenAutomaticBytes(50 * GIB))
+            Some(crate::SizeSpec::FrozenAutomaticBytes(51 * GIB))
         );
     }
 

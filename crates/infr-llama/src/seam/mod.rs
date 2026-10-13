@@ -3346,6 +3346,27 @@ enum MoeHostBacking {
     Bounded { bytes: usize },
 }
 
+/// Startup-frozen automatic budgets are total-process limits. Account for persistent memory
+/// created while fixed Vulkan weights were loading, but never let a working-set trim make the
+/// process appear smaller than it was when placement began. Explicit user budgets retain their
+/// established pre-load snapshot semantics.
+fn host_budget_resident_after_fixed(
+    ram_request: infr_core::hostmem::RamRequest,
+    planned: Option<u64>,
+    after_fixed: Option<u64>,
+) -> Option<u64> {
+    if !matches!(
+        ram_request,
+        infr_core::hostmem::RamRequest::FrozenAutomaticBudget(_)
+    ) {
+        return planned;
+    }
+    match (planned, after_fixed) {
+        (Some(before), Some(after)) => Some(before.max(after)),
+        (before, after) => before.or(after),
+    }
+}
+
 fn moe_host_backing_for_device(
     profile: infr_core::config::AutoProfile,
     ram_request: infr_core::hostmem::RamRequest,
@@ -3392,15 +3413,15 @@ fn moe_host_backing_for_device(
             })
             .unwrap_or(0),
     };
-    // WDDM charges device-local Vulkan allocations against Windows' system commit limit. Automatic
-    // sizing must account for that live pressure. Every explicit request remains authoritative:
-    // advanced users may intentionally trade system headroom for a complete Host store.
+    // WDDM charges device-local Vulkan allocations against Windows' system commit limit. Only an
+    // unresolved live Auto request may be clipped by that late snapshot. A startup-frozen budget
+    // already has exact total-process semantics and must not silently change after model loading.
     let budget = match ram_request {
-        infr_core::hostmem::RamRequest::Auto
-        | infr_core::hostmem::RamRequest::FrozenAutomaticBudget(_) => {
+        infr_core::hostmem::RamRequest::Auto => {
             requested_budget.min(commit_ceiling.unwrap_or(u64::MAX))
         }
         infr_core::hostmem::RamRequest::TotalProcessBudget(_)
+        | infr_core::hostmem::RamRequest::FrozenAutomaticBudget(_)
         | infr_core::hostmem::RamRequest::LegacyCacheBudget(_)
         | infr_core::hostmem::RamRequest::Bypass => requested_budget,
     } as usize;
@@ -4320,20 +4341,25 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     );
                 };
 
-                let automatic_host_budget = ram_request.is_automatic();
-                let host_available = if cfg!(windows) && automatic_host_budget {
+                let live_automatic_budget =
+                    matches!(ram_request, infr_core::hostmem::RamRequest::Auto);
+                let host_available = if cfg!(windows) && live_automatic_budget {
                     infr_core::hostmem::available_bytes()
                 } else {
                     planned_host_available
                 };
-                let process_resident = planned_process_resident;
+                let process_resident = host_budget_resident_after_fixed(
+                    ram_request,
+                    planned_process_resident,
+                    infr_core::hostmem::process_resident_bytes(),
+                );
                 // Leave a small commit tail for the pager metadata, initial KV segment and server
-                // objects created after this point. This ceiling is automatic policy only;
-                // explicit RAM budgets remain exact even when they deliberately exceed it.
+                // objects created after this point. This ceiling is a fallback only for a live Auto
+                // request. Startup-frozen and explicit total-process budgets remain exact.
                 let commit_available = infr_core::hostmem::commit_available_bytes();
                 let live_commit_ceiling =
                     commit_available.map(|bytes| bytes.saturating_sub(512 << 20));
-                let automatic_commit_ceiling = automatic_host_budget
+                let automatic_commit_ceiling = live_automatic_budget
                     .then_some(live_commit_ceiling)
                     .flatten();
                 let host_backing = moe_host_backing_for_device(
@@ -4361,7 +4387,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     }
                 }
                 if let (Some(available), Some(ceiling)) = (commit_available, live_commit_ceiling) {
-                    if automatic_host_budget {
+                    if live_automatic_budget {
                         tracing::info!(
                             available_commit_bytes = available,
                             host_cache_commit_ceiling_bytes = ceiling,
@@ -4369,15 +4395,24 @@ pub(crate) fn vulkan_moe_binder<'a>(
                             "MoE Windows automatic commit guard after fixed Vulkan allocations"
                         );
                     } else if host_resident_bytes as u64 > ceiling {
+                        let policy = if matches!(
+                            ram_request,
+                            infr_core::hostmem::RamRequest::FrozenAutomaticBudget(_)
+                        ) {
+                            "startup-frozen automatic"
+                        } else {
+                            "explicit"
+                        };
                         tracing::warn!(
+                            policy,
                             available_commit_bytes = available,
                             host_cache_commit_ceiling_bytes = ceiling,
                             selected_host_cache_bytes = host_resident_bytes,
-                            "explicit MoE RAM budget exceeds the current Windows commit headroom; honoring the user setting without automatic reduction"
+                            "MoE RAM target exceeds the current Windows commit headroom; preserving the exact total-process target without silent reduction"
                         );
                     }
                 }
-                if ram_request.is_automatic() {
+                if live_automatic_budget {
                     if let Some(available) = host_available {
                         tracing::info!(
                             auto_profile = ?auto_profile,
@@ -6284,20 +6319,25 @@ mod seam_helper_tests {
         use infr_core::hostmem::RamRequest;
 
         let payload = 47 * GIB;
-        assert_eq!(
-            super::moe_host_backing_for_device(
-                infr_core::config::AutoProfile::Aggressive,
-                RamRequest::FrozenAutomaticBudget((50 * GIB) as u64),
-                true,
-                Some((60 * GIB) as u64),
-                Some((64 * GIB) as u64),
-                Some((2 * GIB) as u64),
-                None,
-                payload,
-            ),
-            super::MoeHostBacking::Bounded { bytes: 0 },
-            "the mapped device arena is already the only useful expert cache on UMA"
-        );
+        for profile in [
+            infr_core::config::AutoProfile::Conservative,
+            infr_core::config::AutoProfile::Aggressive,
+        ] {
+            assert_eq!(
+                super::moe_host_backing_for_device(
+                    profile,
+                    RamRequest::FrozenAutomaticBudget((50 * GIB) as u64),
+                    true,
+                    Some((60 * GIB) as u64),
+                    Some((64 * GIB) as u64),
+                    Some((2 * GIB) as u64),
+                    None,
+                    payload,
+                ),
+                super::MoeHostBacking::Bounded { bytes: 0 },
+                "the mapped device arena is already the only useful expert cache on UMA"
+            );
+        }
         assert_eq!(
             super::moe_host_backing_for_device(
                 infr_core::config::AutoProfile::Aggressive,
@@ -6416,7 +6456,7 @@ mod seam_helper_tests {
     }
 
     #[test]
-    fn aggressive_moe_auto_targets_total_minus_fourteen_gib() {
+    fn aggressive_moe_auto_targets_total_minus_thirteen_gib() {
         use infr_core::config::AutoProfile;
         use infr_core::hostmem::RamRequest;
 
@@ -6426,20 +6466,20 @@ mod seam_helper_tests {
                 AutoProfile::Aggressive,
                 RamRequest::Auto,
                 Some((26 * GIB) as u64),
-                Some((41 * GIB) as u64),
+                Some((40 * GIB) as u64),
                 Some((3 * GIB) as u64),
                 None,
                 payload,
             ),
             super::MoeHostBacking::Full,
-            "41 GiB total minus 14 GiB reserve and 3 GiB resident leaves the 24 GiB payload"
+            "40 GiB total minus 13 GiB reserve and 3 GiB resident leaves the 24 GiB payload"
         );
         assert!(matches!(
             super::moe_host_backing(
                 AutoProfile::Aggressive,
                 RamRequest::Auto,
                 Some((26 * GIB) as u64),
-                Some((41 * GIB) as u64),
+                Some((40 * GIB) as u64),
                 Some((3 * GIB + 1) as u64),
                 None,
                 payload,
@@ -6470,7 +6510,7 @@ mod seam_helper_tests {
                 None,
                 large_payload,
             ),
-            super::MoeHostBacking::Bounded { bytes: 48 * GIB },
+            super::MoeHostBacking::Bounded { bytes: 49 * GIB },
             "below full fit, MoE uses the same total-process target"
         );
     }
@@ -6560,6 +6600,34 @@ mod seam_helper_tests {
         assert_eq!(
             super::moe_host_backing(
                 infr_core::config::AutoProfile::Aggressive,
+                RamRequest::FrozenAutomaticBudget((50 * GIB) as u64),
+                Some((56 * GIB) as u64),
+                None,
+                Some(0),
+                Some(ceiling as u64),
+                payload,
+            ),
+            super::MoeHostBacking::Full,
+            "a startup-frozen automatic budget must not be silently reduced after Vulkan loading"
+        );
+        assert_eq!(
+            super::moe_host_backing(
+                infr_core::config::AutoProfile::Conservative,
+                RamRequest::FrozenAutomaticBudget((45 * GIB) as u64),
+                Some((56 * GIB) as u64),
+                None,
+                Some(0),
+                Some(ceiling as u64),
+                payload,
+            ),
+            super::MoeHostBacking::Bounded {
+                bytes: 45 * GIB - (512 << 20),
+            },
+            "a conservative startup snapshot must retain available-at-start minus its fixed reserve"
+        );
+        assert_eq!(
+            super::moe_host_backing(
+                infr_core::config::AutoProfile::Aggressive,
                 RamRequest::TotalProcessBudget((48 * GIB) as u64),
                 Some((56 * GIB) as u64),
                 None,
@@ -6569,6 +6637,40 @@ mod seam_helper_tests {
             ),
             super::MoeHostBacking::Full,
             "a 48 GiB manual process budget must be allowed to hold a 47 GiB expert payload"
+        );
+    }
+
+    #[test]
+    fn frozen_automatic_budget_counts_persistent_startup_memory() {
+        use infr_core::hostmem::RamRequest;
+
+        let frozen = RamRequest::FrozenAutomaticBudget((50 * GIB) as u64);
+        assert_eq!(
+            super::host_budget_resident_after_fixed(
+                frozen,
+                Some((2 * GIB) as u64),
+                Some((5 * GIB) as u64),
+            ),
+            Some((5 * GIB) as u64),
+            "persistent allocations created during startup must reduce the Host tier"
+        );
+        assert_eq!(
+            super::host_budget_resident_after_fixed(
+                frozen,
+                Some((5 * GIB) as u64),
+                Some((2 * GIB) as u64),
+            ),
+            Some((5 * GIB) as u64),
+            "working-set trimming must not enlarge the startup-frozen Host tier"
+        );
+        assert_eq!(
+            super::host_budget_resident_after_fixed(
+                RamRequest::TotalProcessBudget((50 * GIB) as u64),
+                Some((2 * GIB) as u64),
+                Some((5 * GIB) as u64),
+            ),
+            Some((2 * GIB) as u64),
+            "manual budget semantics remain unchanged"
         );
     }
 
