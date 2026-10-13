@@ -28,12 +28,13 @@ pub(crate) const RESIDENT_MAX_LAYERS: usize = 16;
 pub(crate) const RESIDENT_SEED_WORD: usize = 5 + 2 * RESIDENT_MAX_LAYERS;
 pub(crate) const RESIDENT_CONTROL_BYTES: usize = (RESIDENT_SEED_WORD + 1) * 4;
 // Resident journal ABI shared with gpu_resident_{check,hit_check}.comp. Keep routed ids and
-// per-row masks disjoint so every supported layout (up to two rows x top-16) is recoverable.
-pub(crate) const RESIDENT_JOURNAL_ID_WORDS: usize = 32;
+// per-row masks disjoint so every supported layout (up to four rows x top-16) is recoverable.
+// Four rows cover one Qwen3.8 MTP VERIFY batch without changing the ordinary Decode protocol.
+pub(crate) const RESIDENT_JOURNAL_ID_WORDS: usize = 64;
 pub(crate) const RESIDENT_JOURNAL_MASK_WORD: usize = RESIDENT_JOURNAL_ID_WORDS;
-pub(crate) const RESIDENT_JOURNAL_MASK_WORDS: usize = 2;
-pub(crate) const RESIDENT_JOURNAL_STATUS_WORD: usize = 39;
-pub(crate) const RESIDENT_JOURNAL_WORDS: usize = 40;
+pub(crate) const RESIDENT_JOURNAL_MASK_WORDS: usize = 4;
+pub(crate) const RESIDENT_JOURNAL_STATUS_WORD: usize = 71;
+pub(crate) const RESIDENT_JOURNAL_WORDS: usize = 72;
 pub(crate) const RESIDENT_JOURNAL_BYTES: usize = RESIDENT_JOURNAL_WORDS * 4;
 
 const RESIDENT_DISPATCH_CAPACITY: usize = 8192;

@@ -9359,7 +9359,18 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
     // input shape rather than replay eligibility: QSA and other stateful decode ops correctly force
     // this graph down the static path. Independent decode carries one token row per sequence.
     let mut saw_moe = false;
-    let token_rows = decode_token_rows(graph);
+    // A single-sequence MTP VERIFY graph is a short causal batch rather than independent
+    // sequences, so `decode_token_rows` intentionally reports one sequence. Its paged MoE ops
+    // still carry one routed row per draft token and can use the same resident continuation
+    // protocol once that exact row count is recognized here.
+    let token_rows = if graph.mtp_verify && !graph.independent_rows {
+        graph.ops.iter().find_map(|op| match op {
+            Op::MoeFfn { x, ne, .. } => Some(graph.desc(*x).numel() / *ne as usize),
+            _ => None,
+        })
+    } else {
+        decode_token_rows(graph)
+    };
     let token_row_paged_moe = be_.moe_paged()
         && token_rows.is_some()
         && graph.ops.iter().all(|op| {
@@ -10333,10 +10344,9 @@ impl ResidentNoticeProducer {
                     context,
                     ordinal,
                     status: words[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD],
-                    hit_masks: [
-                        words[crate::recorder::RESIDENT_JOURNAL_MASK_WORD],
-                        words[crate::recorder::RESIDENT_JOURNAL_MASK_WORD + 1],
-                    ],
+                    hit_masks: std::array::from_fn(|row| {
+                        words[crate::recorder::RESIDENT_JOURNAL_MASK_WORD + row]
+                    }),
                     count: entry.layout.count(),
                 });
             }
@@ -10667,17 +10677,25 @@ impl ResidentChunk {
             .filter(|op| matches!(op, Op::MoeFfn { .. }))
             .map(|op| ResidentMoeLayout::from_op(graph, op))
             .collect::<Option<Vec<_>>>();
+        let mtp_verify_rows = graph.mtp_verify
+            && !graph.independent_rows
+            && resident_layouts.as_ref().is_some_and(|layouts| {
+                layouts.iter().all(|layout| {
+                    (1..=crate::recorder::RESIDENT_JOURNAL_MASK_WORDS).contains(&layout.rows)
+                })
+            });
+        let ordinary_decode_rows =
+            !graph.mtp_verify && decode_token_rows(graph).is_some_and(|rows| rows <= 2);
         let eligible = cfg.decode_gpu_resident
             && be_.shared.conditional_rendering.is_some()
             && token_row_paged_moe
             && !graph.prefill_next_chunk
             && graph.prefill_target_tokens.is_none()
-            && !graph.mtp_verify
-            && !be_.cfg().spec.mtp
+            && (!be_.cfg().spec.mtp || graph.mtp_verify)
             && !be_.dense_paged()
             && !be_.cfg().paging.expert_prefetch
             && cfg.cpu_miss_threads == 0
-            && decode_token_rows(graph).is_some_and(|rows| rows <= 2)
+            && (ordinary_decode_rows || mtp_verify_rows)
             && resident_layouts
                 .as_ref()
                 .is_some_and(|layouts| layouts.len() > 1);
@@ -14524,6 +14542,11 @@ mod tests {
                 n_expert: 512,
                 n_used: 16,
             },
+            super::ResidentMoeLayout {
+                rows: 4,
+                n_expert: 512,
+                n_used: 10,
+            },
         ] {
             let count = layout.count();
             for miss_slot in 0..count {
@@ -14567,7 +14590,7 @@ mod tests {
                 n_used: 8,
             },
             super::ResidentMoeLayout {
-                rows: 3,
+                rows: 5,
                 n_expert: 256,
                 n_used: 8,
             },
@@ -14645,6 +14668,7 @@ mod tests {
             (2, 2560, 640, 512, 10, DType::Iq3S),
             (1, 2048, 512, 256, 8, DType::Q6K),
             (2, 2048, 512, 256, 8, DType::Q6K),
+            (4, 2560, 640, 512, 10, DType::Iq2S),
             (1, 2048, 512, 256, 8, DType::F16),
             (1, 2048, 512, 256, 8, DType::F32),
         ] {
@@ -14665,7 +14689,7 @@ mod tests {
             );
         }
         for graph in [
-            resident_layout_graph(3, 2048, 512, 256, 8, DType::Q6K, false, false),
+            resident_layout_graph(5, 2048, 512, 256, 8, DType::Q6K, false, false),
             resident_layout_graph(2, 2048, 512, 256, 17, DType::Q6K, false, false),
             resident_layout_graph(1, 2048, 512, 256, 8, DType::Q6K, true, false),
             resident_layout_graph(1, 2048, 512, 256, 8, DType::Q6K, false, true),

@@ -76,7 +76,7 @@ pub struct ResidentNotice {
     pub context: Context,
     pub ordinal: usize,
     pub status: u32,
-    pub hit_masks: [u32; 2],
+    pub hit_masks: [u32; 4],
     pub count: usize,
 }
 

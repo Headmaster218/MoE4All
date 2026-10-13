@@ -9,9 +9,9 @@ layout(push_constant) uniform Params {
     uint ordinal; uint used; uint shared_mask;
     uint immutable_predicates;
 } p;
-const uint JOURNAL_WORDS = 40u;
-const uint JOURNAL_MASK_WORD = 32u;
-const uint JOURNAL_STATUS_WORD = 39u;
+const uint JOURNAL_WORDS = 72u;
+const uint JOURNAL_MASK_WORD = 64u;
+const uint JOURNAL_STATUS_WORD = 71u;
 void main() {
     hit_run = 0;
     journal[p.ordinal * JOURNAL_WORDS + JOURNAL_STATUS_WORD] = 0;
@@ -20,8 +20,8 @@ void main() {
         predicates[p.ordinal * 2 + 1] = 0;
     }
     if (run == 0) return;
-    uint hit[2] = uint[2](0, 0);
-    uint miss[2] = uint[2](0, 0);
+    uint hit[4] = uint[4](0, 0, 0, 0);
+    uint miss[4] = uint[4](0, 0, 0, 0);
     bool missing = false;
     for (uint i = 0; i < p.count; ++i) {
         uint id = ids[i];
