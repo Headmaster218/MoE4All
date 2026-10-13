@@ -309,6 +309,24 @@ fn phase_for_remaining_prefill(tokens: usize) -> BatchPhase {
     }
 }
 
+fn long_prefill_phase_prompt_end(
+    start: usize,
+    prompt_end: usize,
+    checkpoint_boundaries: &[Option<usize>; crate::seam::TURN_CHECKPOINT_COUNT],
+) -> usize {
+    let frontier = prompt_end.saturating_sub(1);
+    checkpoint_boundaries
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|&boundary| {
+            boundary > start && boundary < frontier && frontier - boundary <= SHORT_PREFILL_TOKENS
+        })
+        .max()
+        .map(|boundary| boundary + 1)
+        .unwrap_or(prompt_end)
+}
+
 fn long_prefill_cohort_limit(config: &Config) -> usize {
     if config.qwen4exp {
         MAX_DECODE_BATCH
@@ -2281,9 +2299,20 @@ impl ParallelSeam {
             return Ok(());
         }
 
+        let phase_prompt_ends = long
+            .iter()
+            .map(|work| {
+                long_prefill_phase_prompt_end(
+                    work.kv().cached_len(),
+                    work.prompt_end,
+                    &work.checkpoint_boundaries,
+                )
+            })
+            .collect::<Vec<_>>();
         let prompts = long
             .iter()
-            .map(|work| work.prompt[..work.prompt_end].to_vec())
+            .zip(&phase_prompt_ends)
+            .map(|(work, &end)| work.prompt[..end].to_vec())
             .collect::<Vec<_>>();
         let prepared = long
             .iter()
@@ -2372,7 +2401,8 @@ impl ParallelSeam {
         };
         if long
             .iter()
-            .any(|work| work.kv().cached_len() + 1 != work.prompt_end)
+            .zip(&phase_prompt_ends)
+            .any(|(work, &end)| work.kv().cached_len() + 1 != end)
         {
             active.extend(long);
             return Err(anyhow!(
@@ -2381,15 +2411,20 @@ impl ParallelSeam {
         }
         for (work, stats) in long.iter_mut().zip(stats) {
             work.stats.prompt_secs += stats.prompt_secs;
-            work.phase = BatchPhase::Decode;
-            work.checkpoint_boundaries = [None; crate::seam::TURN_CHECKPOINT_COUNT];
+            let cached_len = work.kv().cached_len();
+            for boundary in &mut work.checkpoint_boundaries {
+                if boundary.is_some_and(|boundary| cached_len >= boundary) {
+                    *boundary = None;
+                }
+            }
+            work.phase = phase_for_remaining_prefill(work.remaining_prefill());
             let progress = infr_core::GenerationProgress {
                 phase: infr_core::GenerationPhase::Prefill,
                 prompt_tokens: work.prompt_end as u64,
                 cached_prompt_tokens: work.prefill_start as u64,
-                prefill_tokens: work.prompt_end.saturating_sub(work.prefill_start) as u64,
+                prefill_tokens: cached_len.saturating_sub(work.prefill_start) as u64,
                 completion_tokens: 0,
-                context_tokens: work.prompt_end.saturating_sub(1) as u64,
+                context_tokens: cached_len as u64,
                 context_limit: self.max_ctx as u64,
             };
             if let Some(channels) = work.channels.as_ref() {
@@ -4085,8 +4120,9 @@ impl ParallelSeam {
 mod tests {
     use super::{
         concurrent_mtp_profitable, concurrent_mtp_ready, expand_multimodal_prompt,
-        long_prefill_cohort_limit, mtp_accepted_rows, mtp_context_profitable, multimodal_key,
-        multimodal_token_position, phase_for_remaining_prefill, pick_continuation, scheduler_mode,
+        long_prefill_cohort_limit, long_prefill_phase_prompt_end, mtp_accepted_rows,
+        mtp_context_profitable, multimodal_key, multimodal_token_position,
+        phase_for_remaining_prefill, pick_continuation, scheduler_mode,
         should_handoff_multimodal_to_scheduler, token_lane_sort_key, BatchPhase,
         MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
     };
@@ -4103,6 +4139,22 @@ mod tests {
         assert_eq!(
             phase_for_remaining_prefill(SHORT_PREFILL_TOKENS + 1),
             BatchPhase::LongPrefill
+        );
+    }
+
+    #[test]
+    fn long_prefill_hands_a_short_checkpoint_tail_to_token_steps() {
+        assert_eq!(
+            long_prefill_phase_prompt_end(0, 30_000, &[Some(29_950), None]),
+            29_951
+        );
+        assert_eq!(
+            long_prefill_phase_prompt_end(0, 30_000, &[Some(29_900), None]),
+            30_000
+        );
+        assert_eq!(
+            long_prefill_phase_prompt_end(29_950, 30_000, &[Some(29_950), None]),
+            30_000
         );
     }
 
