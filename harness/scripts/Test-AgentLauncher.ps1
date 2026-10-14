@@ -77,6 +77,13 @@ if ($success.ExitCode -ne 0 -or $success.Output -notmatch 'prepare-ok' -or $succ
     throw "Downloaded-script/module-path launch failed: $($success.Output)"
 }
 
+$windowedLauncher = Join-Path $fixtureRoot 'MoE4All-windowed.exe'
+& (Join-Path $PSScriptRoot 'Build-AgentLauncher.ps1') -OutputPath $windowedLauncher
+$windowed = Start-Process -FilePath $windowedLauncher -ArgumentList '--no-pause' -WorkingDirectory $fixtureRoot -PassThru -Wait
+if ($windowed.ExitCode -ne 0) {
+    throw "Windowed launcher failed without a console handle: exit $($windowed.ExitCode)"
+}
+
 Write-FixtureScript 'Prepare-BundledRuntime.ps1' @'
 param([string]$InstallRoot, [string]$StateRoot)
 [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
@@ -90,5 +97,5 @@ if ($failed.ExitCode -eq 0 -or -not $failed.Output.Contains($expectedError) -or
     -not $logContent.Contains($expectedError) -or $failed.Output -notmatch 'Startup log:') {
     throw "Child-error logging/encoding failed: $($failed.Output)"
 }
-Write-Host 'Launcher tests passed: missing runtime, unified data root, no browser launch, downloaded scripts, isolated module path, child error logging, UTF-8 output.'
+Write-Host 'Launcher tests passed: missing runtime, unified data root, no browser launch, windowed startup without a console, downloaded scripts, isolated module path, child error logging, UTF-8 output.'
 Write-Host "Evidence: $testRoot"

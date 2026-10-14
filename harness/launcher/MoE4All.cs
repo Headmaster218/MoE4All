@@ -204,7 +204,14 @@ internal static class MoE4All
     [STAThread]
     private static int Main(string[] arguments)
     {
-        Console.OutputEncoding = new UTF8Encoding(false);
+        try
+        {
+            Console.OutputEncoding = new UTF8Encoding(false);
+        }
+        catch (IOException)
+        {
+            // The normal WinExe launcher intentionally has no console handle.
+        }
         bool headless = Array.IndexOf(arguments, "--headless") >= 0 || Array.IndexOf(arguments, "--no-pause") >= 0;
         string root = AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
         try
