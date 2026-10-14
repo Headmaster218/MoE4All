@@ -59,11 +59,10 @@ function createProgress(total) {
   };
 }
 
-function createNodeUnzipInflate(decoders, block, unblock) {
+function createNodeUnzipInflate(decoders) {
   class NodeUnzipInflate {
     constructor(name) {
       this.name = name;
-      this.inputBlocked = false;
       this.ended = false;
       this.stream = zlib.createInflateRaw();
       decoders.set(name, this);
@@ -75,7 +74,6 @@ function createNodeUnzipInflate(decoders, block, unblock) {
       });
       this.stream.once('error', (error) => {
         this.ended = true;
-        if (this.inputBlocked) { this.inputBlocked = false; unblock(); }
         decoders.delete(name);
         this.ondata(error, null, false);
       });
@@ -84,15 +82,7 @@ function createNodeUnzipInflate(decoders, block, unblock) {
     push(chunk, final) {
       if (this.ended) return;
       try {
-        if (chunk.length && !this.stream.write(chunk) && !this.inputBlocked) {
-          this.inputBlocked = true;
-          block();
-          this.stream.once('drain', () => {
-            if (!this.inputBlocked) return;
-            this.inputBlocked = false;
-            unblock();
-          });
-        }
+        if (chunk.length) this.stream.write(chunk);
         if (final) this.stream.end();
       } catch (error) {
         this.stream.destroy(error);
@@ -102,7 +92,6 @@ function createNodeUnzipInflate(decoders, block, unblock) {
     pause() { this.stream.pause(); }
     resume() { if (!this.ended) this.stream.resume(); }
     terminate() {
-      if (this.inputBlocked) { this.inputBlocked = false; unblock(); }
       this.ended = true;
       decoders.delete(this.name);
       this.stream.destroy();
@@ -227,7 +216,7 @@ async function unpack(harness, archive, progress) {
     queue.push({ file, target });
     pump();
   });
-  unzip.register(createNodeUnzipInflate(decoders, block, unblock));
+  unzip.register(createNodeUnzipInflate(decoders));
   try {
     for await (const chunk of fs.createReadStream(native(source))) {
       await waitForFlow();

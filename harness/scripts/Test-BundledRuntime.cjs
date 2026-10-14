@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const childProcess = require('node:child_process');
 const { createRequire } = require('node:module');
 const { zipSync, strToU8 } = require('./vendor/fflate.cjs');
 const { unpack, restoreLinks, remapManagedPath } = require('./Prepare-BundledRuntime.cjs');
@@ -48,6 +49,25 @@ test('runtime payload completes concurrent compressed file writes before marking
   await unpack(harness, archive, { extracted() { completed++; } });
   assert.equal(completed, 24);
   assert.equal(fs.readFileSync(native(path.join(harness, 'runtime/dsh/files/23.txt')), 'utf8').startsWith('23:payload-'), true);
+  assert.equal(fs.readFileSync(native(path.join(harness, 'runtime/dsh/.moe4all-payload-ready')), 'utf8').trim(), archive.sha256);
+});
+
+test('standalone runtime preparation stays alive until a large payload is complete', (t) => {
+  const harness = path.join(fixture(t), 'harness');
+  const entries = {};
+  for (let index = 0; index < 512; index++) {
+    entries[`files/${index}.txt`] = strToU8(`${index}:` + 'concurrent-payload-'.repeat(4096));
+  }
+  const archive = payload(harness, entries, 512);
+  const runner = path.join(harness, 'standalone-unpack.cjs');
+  write(runner, `const { unpack } = require(${JSON.stringify(path.join(__dirname, 'Prepare-BundledRuntime.cjs'))});\n`
+    + `unpack(${JSON.stringify(harness)}, ${JSON.stringify(archive)})\n`
+    + `.catch((error) => { console.error(error.stack); process.exitCode = 1; });\n`);
+  const child = childProcess.spawnSync(process.execPath, [runner], { encoding: 'utf8', timeout: 120000 });
+  assert.equal(child.error, undefined, child.error && child.error.message);
+  assert.equal(child.status, 0, child.stdout + child.stderr);
+  assert.equal(fs.readFileSync(native(path.join(harness, 'runtime/dsh/files/511.txt')), 'utf8')
+    .startsWith('511:concurrent-payload-'), true);
   assert.equal(fs.readFileSync(native(path.join(harness, 'runtime/dsh/.moe4all-payload-ready')), 'utf8').trim(), archive.sha256);
 });
 
