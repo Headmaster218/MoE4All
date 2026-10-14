@@ -11,6 +11,7 @@ Cargo.lock.bak
 
 # Models / weights (never commit)
 *.gguf
+models/
 *.safetensors
 
 # Editor / OS

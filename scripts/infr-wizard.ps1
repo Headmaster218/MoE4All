@@ -516,47 +516,250 @@ function ConvertTo-FullPath {
     return [System.IO.Path]::GetFullPath((Join-Path $repoRoot $value))
 }
 
-function Show-RecommendedModelDownloads {
-    param([ValidateSet('all', 'llm', 'mtp', 'vision', 'embedding')][string]$Kind = 'all')
-    $downloads = @(
+function Get-RecommendedModelCatalog {
+    $flashDirectory = 'Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64'
+    $flashFiles = @()
+    for ($i = 1; $i -le 33; $i++) {
+        $fileName = 'Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-{0:D5}-of-00033.gguf' -f $i
+        $flashFiles += [pscustomobject]@{
+            Url = "https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/$flashDirectory/$fileName`?download=true"
+            RelativePath = Join-Path $flashDirectory $fileName
+        }
+    }
+
+    return @(
         [pscustomobject]@{
+            Id = 'qwen35-balanced'
             Kind = 'llm'
             Name = 'Qwen3.6 35B APEX-I-Balanced'
-            Url = 'https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/resolve/main/Qwen3.6-35B-A3B-APEX-I-Balanced.gguf?download=true'
+            InfoUrl = 'https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/blob/main/Qwen3.6-35B-A3B-APEX-I-Balanced.gguf'
+            Primary = 'Qwen3.6-35B-A3B-APEX-I-Balanced\Qwen3.6-35B-A3B-APEX-I-Balanced.gguf'
+            Files = @([pscustomobject]@{
+                Url = 'https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/resolve/main/Qwen3.6-35B-A3B-APEX-I-Balanced.gguf?download=true'
+                RelativePath = 'Qwen3.6-35B-A3B-APEX-I-Balanced\Qwen3.6-35B-A3B-APEX-I-Balanced.gguf'
+            })
         }
         [pscustomobject]@{
+            Id = 'flashnext-427'
             Kind = 'llm'
-            Name = 'Qwen3.8 Flash-Next AD-4.27bpw-Q4_K_M-M64（33 个主模型分片 / 33 main-model shards）'
-            Url = 'https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/tree/main/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64'
+            Name = 'Qwen3.8 Flash-Next AD-4.27bpw-Q4_K_M-M64（33 个分片 / 33 shards）'
+            InfoUrl = "https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/tree/main/$flashDirectory"
+            Primary = "$flashDirectory\Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00033.gguf"
+            Files = $flashFiles
         }
         [pscustomobject]@{
+            Id = 'flashnext-vision'
             Kind = 'vision'
             Name = 'Qwen3.8 Flash-Next F16 视觉文件 / vision projector'
-            Url = 'https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/mmproj-Qwen3.8-Flash-Next-F16.gguf?download=true'
+            InfoUrl = 'https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/blob/main/mmproj-Qwen3.8-Flash-Next-F16.gguf'
+            Primary = "$flashDirectory\mmproj-Qwen3.8-Flash-Next-F16.gguf"
+            Files = @([pscustomobject]@{
+                Url = 'https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/mmproj-Qwen3.8-Flash-Next-F16.gguf?download=true'
+                RelativePath = "$flashDirectory\mmproj-Qwen3.8-Flash-Next-F16.gguf"
+            })
         }
         [pscustomobject]@{
-            Kind = 'mtp'
-            Name = 'Qwen3.8 Flash-Next shared Q4_K_M MTP 头 / MTP head'
-            Url = 'https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf?download=true'
-        }
-        [pscustomobject]@{
+            Id = 'qwen3-embedding-06b-q8'
             Kind = 'embedding'
-            Name = 'Qwen3-Embedding 0.6B GGUF'
-            Url = 'https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/tree/main'
+            Name = 'Qwen3-Embedding 0.6B Q8_0'
+            InfoUrl = 'https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/blob/main/Qwen3-Embedding-0.6B-Q8_0.gguf'
+            Primary = 'Qwen3-Embedding-0.6B-Q8_0\Qwen3-Embedding-0.6B-Q8_0.gguf'
+            Files = @([pscustomobject]@{
+                Url = 'https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf?download=true'
+                RelativePath = 'Qwen3-Embedding-0.6B-Q8_0\Qwen3-Embedding-0.6B-Q8_0.gguf'
+            })
         }
     )
+}
+
+function Show-RecommendedModelDownloads {
+    param([ValidateSet('all', 'llm', 'vision', 'embedding')][string]$Kind = 'all')
 
     Write-Host "`n官方推荐的模型 / Official recommended models" -ForegroundColor Cyan
-    foreach ($download in $downloads) {
+    foreach ($download in @(Get-RecommendedModelCatalog)) {
         if ($Kind -ne 'all' -and $download.Kind -ne $Kind) { continue }
         Write-Host " $($download.Name)"
-        Write-Host "   $($download.Url)" -ForegroundColor DarkGray
+        Write-Host "   $($download.InfoUrl)" -ForegroundColor DarkGray
     }
-    if ($Kind -eq 'all' -or $Kind -eq 'llm') {
-        Write-Host '下载后请输入主模型 GGUF 路径；视觉与 MTP 文件可在后续步骤选择。' -ForegroundColor DarkGray
-        Write-Host 'After downloading, enter the main-model GGUF path; vision and MTP files are selected later.' -ForegroundColor DarkGray
-    } else {
-        Write-Host '下载后请输入对应的 GGUF 文件路径。After downloading, enter the corresponding GGUF path.' -ForegroundColor DarkGray
+    Write-Host '在模型列表选择 D，可一次选择一个或多个项目下载到安装目录下的 models 文件夹。' -ForegroundColor DarkGray
+    Write-Host 'Choose D in the model list to download one or more items into the models folder beside the launcher.' -ForegroundColor DarkGray
+}
+
+function Format-DownloadBytes {
+    param([long]$Bytes)
+    if ($Bytes -ge 1GB) { return ('{0:N2} GiB' -f ($Bytes / 1GB)) }
+    if ($Bytes -ge 1MB) { return ('{0:N1} MiB' -f ($Bytes / 1MB)) }
+    if ($Bytes -ge 1KB) { return ('{0:N1} KiB' -f ($Bytes / 1KB)) }
+    return "$Bytes B"
+}
+
+function Invoke-ModelFileDownload {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][string]$Label,
+        [int]$MaximumAttempts = 3
+    )
+
+    if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+        $existingFile = Get-Item -LiteralPath $Destination
+        if ($existingFile.Length -gt 0) {
+            Write-Host "已存在，跳过 / Already present: $Destination" -ForegroundColor DarkGray
+            return
+        }
+        Remove-Item -LiteralPath $Destination -Force
+    }
+
+    $directory = Split-Path -Parent $Destination
+    New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    $partialPath = "$Destination.part"
+    [System.Net.ServicePointManager]::SecurityProtocol =
+        [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+
+    for ($attempt = 1; $attempt -le $MaximumAttempts; $attempt++) {
+        $response = $null
+        $sourceStream = $null
+        $targetStream = $null
+        try {
+            $resumeAt = 0L
+            if (Test-Path -LiteralPath $partialPath -PathType Leaf) {
+                $resumeAt = (Get-Item -LiteralPath $partialPath).Length
+            }
+
+            $request = [System.Net.HttpWebRequest]::Create($Url)
+            $request.AllowAutoRedirect = $true
+            $request.Timeout = 30000
+            $request.ReadWriteTimeout = 120000
+            $request.UserAgent = 'MoE4All-Wizard/1.0'
+            if ($resumeAt -gt 0) { $request.AddRange($resumeAt) }
+
+            $response = [System.Net.HttpWebResponse]$request.GetResponse()
+            $isPartial = $response.StatusCode -eq [System.Net.HttpStatusCode]::PartialContent
+            if ($resumeAt -gt 0 -and -not $isPartial) {
+                $resumeAt = 0
+            }
+            $mode = if ($resumeAt -gt 0) { [System.IO.FileMode]::Append } else { [System.IO.FileMode]::Create }
+            $targetStream = [System.IO.File]::Open($partialPath, $mode, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+            $sourceStream = $response.GetResponseStream()
+            $totalBytes = if ($response.ContentLength -ge 0) { $resumeAt + $response.ContentLength } else { -1L }
+            $downloaded = $resumeAt
+            $started = [System.Diagnostics.Stopwatch]::StartNew()
+            $buffer = [byte[]]::new(1048576)
+
+            while (($read = $sourceStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                $targetStream.Write($buffer, 0, $read)
+                $downloaded += $read
+                $speed = if ($started.Elapsed.TotalSeconds -gt 0) { [long](($downloaded - $resumeAt) / $started.Elapsed.TotalSeconds) } else { 0L }
+                $status = "$(Format-DownloadBytes $downloaded)"
+                if ($totalBytes -gt 0) { $status += " / $(Format-DownloadBytes $totalBytes)" }
+                if ($speed -gt 0) { $status += "  $(Format-DownloadBytes $speed)/s" }
+                $progress = if ($totalBytes -gt 0) { [Math]::Min(100, [int](100 * $downloaded / $totalBytes)) } else { -1 }
+                Write-Progress -Id 71 -ParentId 70 -Activity $Label -Status $status -PercentComplete $progress
+            }
+
+            $targetStream.Flush()
+            $targetStream.Dispose()
+            $targetStream = $null
+            $actualBytes = (Get-Item -LiteralPath $partialPath).Length
+            if ($totalBytes -gt 0 -and $actualBytes -ne $totalBytes) {
+                throw "下载大小不完整 / Incomplete download: $actualBytes of $totalBytes bytes"
+            }
+            Move-Item -LiteralPath $partialPath -Destination $Destination -Force
+            Write-Progress -Id 71 -ParentId 70 -Activity $Label -Completed
+            return
+        } catch {
+            Write-Progress -Id 71 -ParentId 70 -Activity $Label -Completed
+            if ($attempt -ge $MaximumAttempts) {
+                throw "下载失败，已重试 $MaximumAttempts 次 / Download failed after $MaximumAttempts attempts: $($_.Exception.Message)"
+            }
+            Write-Warning "下载中断，将从 .part 文件重试（$attempt/$MaximumAttempts）。Download interrupted; retrying from the .part file. $($_.Exception.Message)"
+            Start-Sleep -Seconds ([Math]::Pow(2, $attempt))
+        } finally {
+            if ($null -ne $targetStream) { $targetStream.Dispose() }
+            if ($null -ne $sourceStream) { $sourceStream.Dispose() }
+            if ($null -ne $response) { $response.Dispose() }
+        }
+    }
+}
+
+function Invoke-RecommendedModelDownload {
+    param([Parameter(Mandatory = $true)][string]$Id)
+
+    $bundle = @(Get-RecommendedModelCatalog | Where-Object { $_.Id -eq $Id }) | Select-Object -First 1
+    if ($null -eq $bundle) { throw "Unknown recommended download: $Id" }
+    $modelsRoot = Join-Path $repoRoot 'models'
+    $files = @($bundle.Files)
+    Write-Host "`n下载 / Download: $($bundle.Name)" -ForegroundColor Cyan
+    Write-Host "目录 / Folder: $modelsRoot" -ForegroundColor DarkGray
+    try {
+        for ($i = 0; $i -lt $files.Count; $i++) {
+            $file = $files[$i]
+            $destination = Join-Path $modelsRoot $file.RelativePath
+            $activity = "[$($i + 1)/$($files.Count)] $([System.IO.Path]::GetFileName($destination))"
+            Write-Progress -Id 70 -Activity $bundle.Name -Status $activity -PercentComplete ([int](100 * $i / $files.Count))
+            Invoke-ModelFileDownload -Url $file.Url -Destination $destination -Label $activity
+        }
+    } finally {
+        Write-Progress -Id 70 -Activity $bundle.Name -Completed
+    }
+
+    $primary = Join-Path $modelsRoot $bundle.Primary
+    if (-not (Test-Path -LiteralPath $primary -PathType Leaf)) {
+        throw "下载完成但找不到主文件 / Download completed but the primary file is missing: $primary"
+    }
+    Write-Host "下载完成 / Download complete: $primary" -ForegroundColor Green
+    return $primary
+}
+
+function Select-RecommendedDownloads {
+    $catalog = @(Get-RecommendedModelCatalog)
+    while ($true) {
+        Write-Host "`n下载模型与组件 / Download models and components" -ForegroundColor Cyan
+        for ($i = 0; $i -lt $catalog.Count; $i++) {
+            $bundle = $catalog[$i]
+            $primary = Join-Path (Join-Path $repoRoot 'models') $bundle.Primary
+            $status = if (Test-Path -LiteralPath $primary -PathType Leaf) { ' [已下载 / installed]' } else { '' }
+            Write-Host (" [{0}] {1}{2}" -f ($i + 1), $bundle.Name, $status)
+            Write-Host "     $($bundle.InfoUrl)" -ForegroundColor DarkGray
+        }
+        Write-Host ' [A] 全部 / All'
+        Write-Host ' [B] 返回 / Back'
+        $raw = (Read-Host '选择一个或多个编号，用逗号分隔 / Select one or more numbers, comma-separated').Trim()
+        if ($raw -match '^(b|back|返回)$') { return @() }
+
+        $indexes = [System.Collections.Generic.List[int]]::new()
+        $seenIndexes = [System.Collections.Generic.HashSet[int]]::new()
+        $valid = $true
+        if ($raw -match '^(a|all|全部)$') {
+            for ($i = 0; $i -lt $catalog.Count; $i++) { [void]$indexes.Add($i) }
+        } else {
+            foreach ($token in @($raw -split '[,;\s]+' | Where-Object { $_ })) {
+                $number = 0
+                if (-not [int]::TryParse($token, [ref]$number) -or $number -lt 1 -or $number -gt $catalog.Count) {
+                    $valid = $false
+                    break
+                }
+                $index = $number - 1
+                if ($seenIndexes.Add($index)) { [void]$indexes.Add($index) }
+            }
+        }
+        if (-not $valid -or $indexes.Count -eq 0) {
+            Write-Host '请输入列表中的编号，多个编号用逗号分隔。Enter listed numbers separated by commas.' -ForegroundColor Yellow
+            continue
+        }
+        if (-not (Read-YesNo -Label '立即开始或继续所选下载？/ Start or resume the selected downloads now?' -Default $true)) {
+            return @()
+        }
+
+        $downloaded = [System.Collections.Generic.List[string]]::new()
+        foreach ($index in $indexes) {
+            try {
+                [void]$downloaded.Add((Invoke-RecommendedModelDownload -Id $catalog[$index].Id))
+            } catch {
+                Write-Host $_.Exception.Message -ForegroundColor Yellow
+            }
+        }
+        return $downloaded.ToArray()
     }
 }
 
@@ -602,37 +805,47 @@ function Select-ModelPath {
         }
     }
 
-    if ($models.Count -gt 0) {
-        while ($true) {
-            Write-Host "`n模型 / Model" -ForegroundColor Cyan
-            for ($i = 0; $i -lt $models.Count; $i++) {
-                Write-Host (" [{0}] {1}" -f ($i + 1), $models[$i])
-            }
-            Write-Host ' [R] 官方推荐的模型 / Official recommended models'
-            Write-Host ' [N] 输入新路径，或直接粘贴路径 / Enter a new path, or paste it directly'
-            $choice = (Read-Host '选择模型 [1] / Select model [1]').Trim()
-            if ([string]::IsNullOrWhiteSpace($choice)) { return $models[0] }
-            $index = 0
-            if ([int]::TryParse($choice, [ref]$index) -and $index -ge 1 -and $index -le $models.Count) {
-                return $models[$index - 1]
-            }
-            if ($choice -match '^(r|recommended|推荐)$') {
-                Show-RecommendedModelDownloads
-                continue
-            }
-            if ($choice -match '^(n|new|新)$') { break }
-            try {
-                $modelPath = ConvertTo-FullPath $choice
-                if (Test-Path -LiteralPath $modelPath -PathType Leaf) {
-                    return $modelPath
-                }
-            } catch {
-                # Keep prompting with the common, actionable error below.
-            }
-            Write-Host '选择无效或找不到该模型文件。Invalid selection or model file not found.' -ForegroundColor Yellow
+    foreach ($bundle in @(Get-RecommendedModelCatalog | Where-Object { $_.Kind -eq 'llm' })) {
+        $candidate = Join-Path (Join-Path $repoRoot 'models') $bundle.Primary
+        if ((Test-Path -LiteralPath $candidate -PathType Leaf) -and $seen.Add($candidate)) {
+            [void]$models.Add($candidate)
         }
-    } else {
-        Show-RecommendedModelDownloads
+    }
+
+    while ($true) {
+        Write-Host "`n模型 / Model" -ForegroundColor Cyan
+        for ($i = 0; $i -lt $models.Count; $i++) {
+            Write-Host (" [{0}] {1}" -f ($i + 1), $models[$i])
+        }
+        Write-Host ' [D] 下载模型或组件 / Download models or components'
+        Write-Host ' [N] 输入新路径，或直接粘贴路径 / Enter a new path, or paste it directly'
+        $defaultChoice = if ($models.Count -gt 0) { '1' } else { 'D' }
+        $choice = (Read-Host "选择模型 [$defaultChoice] / Select model [$defaultChoice]").Trim()
+        if ([string]::IsNullOrWhiteSpace($choice)) { $choice = $defaultChoice }
+        $index = 0
+        if ([int]::TryParse($choice, [ref]$index) -and $index -ge 1 -and $index -le $models.Count) {
+            return $models[$index - 1]
+        }
+        if ($choice -match '^(d|download|下载)$') {
+            $null = @(Select-RecommendedDownloads)
+            foreach ($bundle in @(Get-RecommendedModelCatalog | Where-Object { $_.Kind -eq 'llm' })) {
+                $candidate = Join-Path (Join-Path $repoRoot 'models') $bundle.Primary
+                if ((Test-Path -LiteralPath $candidate -PathType Leaf) -and $seen.Add($candidate)) {
+                    [void]$models.Add($candidate)
+                }
+            }
+            continue
+        }
+        if ($choice -match '^(n|new|新)$') { break }
+        try {
+            $modelPath = ConvertTo-FullPath $choice
+            if (Test-Path -LiteralPath $modelPath -PathType Leaf) {
+                return $modelPath
+            }
+        } catch {
+            # Keep prompting with the common, actionable error below.
+        }
+        Write-Host '选择无效或找不到该模型文件。Invalid selection or model file not found.' -ForegroundColor Yellow
     }
 
     while ($true) {
@@ -654,7 +867,10 @@ function Select-EmbeddingModelPath {
 
     if (-not $Default) { Show-RecommendedModelDownloads -Kind 'embedding' }
     while ($true) {
-        $inputPath = Read-TextValue -Label 'Embedding GGUF 文件或目录，R 查看推荐 / GGUF file or directory, R for recommendations' -Default $Default -Required
+        $inputPath = Read-TextValue -Label 'Embedding GGUF 文件或目录，D 自动下载，R 查看推荐 / GGUF file or directory, D to download, R for recommendations' -Default $Default -Required
+        if ($inputPath -match '^(d|download|下载)$') {
+            try { return Invoke-RecommendedModelDownload -Id 'qwen3-embedding-06b-q8' } catch { Write-Host $_.Exception.Message -ForegroundColor Yellow; continue }
+        }
         if ($inputPath -match '^(r|recommended|推荐)$') { Show-RecommendedModelDownloads -Kind 'embedding'; continue }
         try {
             $path = ConvertTo-FullPath $inputPath
@@ -675,43 +891,6 @@ function Select-EmbeddingModelPath {
                     throw '目录中没有 GGUF 文件。The directory contains no GGUF file.'
                 }
                 throw "目录中有 $($models.Count) 个 GGUF 文件，请输入具体文件路径。The directory contains $($models.Count) GGUF files; enter the exact file path."
-            }
-            throw '路径不存在。The path does not exist.'
-        } catch {
-            Write-Host $_.Exception.Message -ForegroundColor Yellow
-            $Default = ''
-        }
-    }
-}
-
-function Select-MtpModelPath {
-    param([AllowEmptyString()][string]$Default = '')
-
-    if (-not $Default) { Show-RecommendedModelDownloads -Kind 'mtp' }
-    while ($true) {
-        $inputPath = Read-TextValue -Label 'MTP 头 GGUF 文件或目录，R 查看推荐 / MTP-head GGUF file or directory, R for recommendations' -Default $Default -Required
-        if ($inputPath -match '^(r|recommended|推荐)$') { Show-RecommendedModelDownloads -Kind 'mtp'; continue }
-        try {
-            $path = ConvertTo-FullPath $inputPath
-            if (Test-Path -LiteralPath $path -PathType Leaf) {
-                if ([System.IO.Path]::GetExtension($path) -ine '.gguf') {
-                    throw '文件扩展名不是 .gguf。The file extension is not .gguf.'
-                }
-                return $path
-            }
-            if (Test-Path -LiteralPath $path -PathType Container) {
-                $models = @(Get-ChildItem -LiteralPath $path -File | Where-Object {
-                    $_.Extension -ieq '.gguf' -and
-                    $_.Name -notlike 'mmproj*' -and
-                    ($_.Name -notmatch '-\d{5}-of-\d{5}\.gguf$' -or $_.Name -match '-00001-of-\d{5}\.gguf$')
-                } | Sort-Object Name)
-                if ($models.Count -eq 1) {
-                    return $models[0].FullName
-                }
-                if ($models.Count -eq 0) {
-                    throw '目录中没有 MTP GGUF 文件。The directory contains no MTP GGUF file.'
-                }
-                throw "目录中有 $($models.Count) 个候选 MTP GGUF，请输入具体文件路径。The directory contains $($models.Count) MTP GGUF candidates; enter the exact file path."
             }
             throw '路径不存在。The path does not exist.'
         } catch {
@@ -743,7 +922,10 @@ function Select-VisionProjectorPath {
 
     if (-not $Default) { Show-RecommendedModelDownloads -Kind 'vision' }
     while ($true) {
-        $inputPath = Read-TextValue -Label '视觉 mmproj GGUF 文件或目录，R 查看推荐 / Vision mmproj GGUF file or directory, R for recommendations' -Default $Default -Required
+        $inputPath = Read-TextValue -Label '视觉 mmproj GGUF 文件或目录，D 自动下载，R 查看推荐 / Vision mmproj GGUF file or directory, D to download, R for recommendations' -Default $Default -Required
+        if ($inputPath -match '^(d|download|下载)$') {
+            try { return Invoke-RecommendedModelDownload -Id 'flashnext-vision' } catch { Write-Host $_.Exception.Message -ForegroundColor Yellow; continue }
+        }
         if ($inputPath -match '^(r|recommended|推荐)$') { Show-RecommendedModelDownloads -Kind 'vision'; continue }
         try {
             $path = ConvertTo-FullPath $inputPath
@@ -1164,9 +1346,6 @@ $visionProjectorPath = [string](Get-SavedValue 'vision_projector' '')
 $serverEmbedding = [bool](Get-SavedValue 'server_embedding' $false)
 $embeddingModelPath = [string](Get-SavedValue 'embedding_model' '')
 $embeddingIdleTimeout = [string](Get-SavedValue 'embedding_idle_timeout' '300')
-$mtpEnabled = [bool](Get-SavedValue 'mtp_enabled' $false)
-$mtpModelPath = [string](Get-SavedValue 'mtp_model' '')
-$mtpVerifyTokens = [string](Get-SavedValue 'mtp_verify_tokens' '4')
 
 $configureThinking = [bool](Get-SavedValue 'configure_thinking' ($thinkMode -ne 'default' -or $reasoningEffort -ne 'default'))
 $cpuMissEnabled = [bool](Get-SavedValue 'cpu_miss_enabled' $false)
@@ -1184,18 +1363,6 @@ if (-not $reuseSavedSettings) {
     $modelPath = Select-ModelPath -InitialPath $InitialModelPath
     if ($launchMode -ne 'benchmark') {
         Start-ModelReasoningProbe -ModelPath $modelPath
-        $mtpEnabled = Read-YesNo -Label '启用 Qwen3.8 MTP 加速？/ Enable Qwen3.8 MTP acceleration?' -Default $mtpEnabled
-        if ($mtpEnabled) {
-            Write-Host 'MTP 当前仅支持 Qwen3.8 Vulkan 和 greedy 解码；非 greedy API 请求会回退普通 decode。' -ForegroundColor Yellow
-            Write-Host 'MTP currently supports Qwen3.8 Vulkan and greedy decoding. Non-greedy API requests fall back to ordinary decode.' -ForegroundColor DarkGray
-            $mtpModelPath = Select-MtpModelPath -Default $mtpModelPath
-            $mtpVerifyTokens = Read-Choice -Label 'MTP 批量验证宽度 / MTP batched verification width' -DefaultValue $mtpVerifyTokens -Options @(
-                [pscustomobject]@{ Key = '1'; Value = '4'; Label = '4 tokens（推荐）/ 4 tokens (recommended)' }
-                [pscustomobject]@{ Key = '2'; Value = '3'; Label = '3 tokens' }
-                [pscustomobject]@{ Key = '3'; Value = '2'; Label = '2 tokens' }
-            )
-        }
-
     }
     if ($launchMode -eq 'server') {
         if (-not $visionProjectorPath -or -not (Test-Path -LiteralPath $visionProjectorPath -PathType Leaf)) {
@@ -1363,39 +1530,18 @@ if (-not $reuseSavedSettings) {
         Write-Host '性能收益尚未保证；2/3 miss 未做整机性能验收。Performance gains are not guaranteed; 2/3-miss model throughput is unvalidated.' -ForegroundColor Yellow
     }
     if ($launchMode -eq 'server') {
-        if ($mtpEnabled) {
-            $mtpParallelDefault = if ($serverParallel -eq '2') { '2' } else { '1' }
-            $serverParallel = Read-Choice -Label 'API 并发会话数 / Concurrent API slots' -DefaultValue $mtpParallelDefault -Options @(
-                [pscustomobject]@{ Key = '1'; Value = '1'; Label = '单路 MTP / Single-stream MTP' }
-                [pscustomobject]@{ Key = '2'; Value = '2'; Label = '双槽机会式 MTP（推荐）/ Two slots, opportunistic MTP (recommended)' }
-            )
-            if ($serverParallel -eq '2' -and $mtpVerifyTokens -ne '4') {
-                $mtpVerifyTokens = '4'
-                Write-Host '双槽机会式 MTP 固定使用 4-token 验证。Two-slot opportunistic MTP uses fixed 4-token verification.' -ForegroundColor Yellow
-            }
-            if ($serverParallel -eq '2') {
-                Write-Host '只有一个活跃会话时使用 MTP；两个会话同时解码时自动切换普通批量 decode，恢复单会话后切回 MTP。' -ForegroundColor Cyan
-                Write-Host 'MTP is used with one active request. Two active decodes automatically use ordinary batched decode, then return to MTP when one remains.' -ForegroundColor DarkGray
-            }
-        } else {
-            $serverParallel = Read-IntegerValue -Label '并发会话数（每个会话有独立 KV）/ Concurrent slots (one KV cache each)' -Default $serverParallel -Minimum 1
-        }
+        $serverParallel = Read-IntegerValue -Label '并发会话数（每个会话有独立 KV）/ Concurrent slots (one KV cache each)' -Default $serverParallel -Minimum 1
     }
 
     $context = Read-TextValue -Label '上下文窗口，留空为自动 / Context window, blank for auto' -Default $context
     if ($launchMode -eq 'server') {
-        if ($mtpEnabled -and $serverParallel -eq '1' -and -not $serverVision -and -not $serverEmbedding) {
-            $serverSessionCache = $false
-            Write-Host '单路纯文本 MTP 使用串行服务，SSD 会话缓存关闭。Single-stream text-only MTP disables SSD session caching.' -ForegroundColor DarkGray
-        } else {
-            $serverSessionCache = Read-YesNo -Label '将闲置会话 KV 缓存到 SSD？/ Cache idle-session KV on SSD?' -Default $serverSessionCache
-            if ($serverSessionCache -and (Read-YesNo -Label '修改 SSD KV 缓存参数？/ Customize SSD KV cache settings?' -Default $false)) {
-                $sessionCacheDir = Read-TextValue -Label 'KV 缓存目录 / KV cache directory' -Default $sessionCacheDir -Required
-                $sessionCacheDir = ConvertTo-FullPath $sessionCacheDir
-                $sessionIdleSecs = Read-IntegerValue -Label '会话闲置多少秒后写入 SSD / Spill after idle seconds' -Default $sessionIdleSecs -Minimum 0
-                $sessionCacheMax = Read-TextValue -Label 'SSD KV 缓存总上限（绝对大小）/ Total SSD KV cache limit (absolute size)' -Default $sessionCacheMax -Required
-                $sessionCacheTtlHours = Read-IntegerValue -Label '缓存保留小时数，0 为不按时间清理 / Cache TTL hours, 0 disables age expiry' -Default $sessionCacheTtlHours -Minimum 0
-            }
+        $serverSessionCache = Read-YesNo -Label '将闲置会话 KV 缓存到 SSD？/ Cache idle-session KV on SSD?' -Default $serverSessionCache
+        if ($serverSessionCache -and (Read-YesNo -Label '修改 SSD KV 缓存参数？/ Customize SSD KV cache settings?' -Default $false)) {
+            $sessionCacheDir = Read-TextValue -Label 'KV 缓存目录 / KV cache directory' -Default $sessionCacheDir -Required
+            $sessionCacheDir = ConvertTo-FullPath $sessionCacheDir
+            $sessionIdleSecs = Read-IntegerValue -Label '会话闲置多少秒后写入 SSD / Spill after idle seconds' -Default $sessionIdleSecs -Minimum 0
+            $sessionCacheMax = Read-TextValue -Label 'SSD KV 缓存总上限（绝对大小）/ Total SSD KV cache limit (absolute size)' -Default $sessionCacheMax -Required
+            $sessionCacheTtlHours = Read-IntegerValue -Label '缓存保留小时数，0 为不按时间清理 / Cache TTL hours, 0 disables age expiry' -Default $sessionCacheTtlHours -Minimum 0
         }
 
         Write-Host "`nAPI 服务器 / API server" -ForegroundColor Cyan
@@ -1443,9 +1589,6 @@ if (-not $reuseSavedSettings) {
     }
 }
 
-if ($mtpEnabled -and $launchMode -ne 'benchmark' -and $device -and $device -notmatch '^Vulkan') {
-    throw 'Qwen3.8 MTP 需要 Vulkan 设备。Qwen3.8 MTP requires a Vulkan device.'
-}
 if ($launchMode -eq 'server') {
     if ($serverAuth) {
         $serverApiKey = Read-SecretValue -Label 'API key（隐藏输入且不会保存）/ API key (hidden and not saved)'
@@ -1531,11 +1674,9 @@ if ($setupMode -eq 'manual' -and -not [string]::IsNullOrWhiteSpace($customSets))
     }
 }
 if ($launchMode -ne 'benchmark') {
-    Add-SetArgument $nativeArgs 'spec.mtp' $mtpEnabled.ToString().ToLowerInvariant()
-    if ($mtpEnabled) {
-        Add-SetArgument $nativeArgs 'spec.draft' $mtpModelPath
-        Add-SetArgument $nativeArgs 'spec.k' $mtpVerifyTokens
-    }
+    # The engine still supports MTP through manual CLI/config use, but the release wizard keeps a
+    # deterministic non-MTP path and overrides stale saved or environment configuration.
+    Add-SetArgument $nativeArgs 'spec.mtp' 'false'
 }
 
 if ($launchMode -eq 'benchmark') {
@@ -1560,9 +1701,7 @@ if ($launchMode -eq 'benchmark') {
         [void]$nativeArgs.Add('--reasoning-effort'); [void]$nativeArgs.Add($reasoningEffort)
     }
     if ($maxNew) { [void]$nativeArgs.Add('--max-new'); [void]$nativeArgs.Add($maxNew) }
-    if ($mtpEnabled) {
-        [void]$nativeArgs.Add('--temp'); [void]$nativeArgs.Add('0')
-    } elseif ($configureSampling) {
+    if ($configureSampling) {
         if ($temperature) { [void]$nativeArgs.Add('--temp'); [void]$nativeArgs.Add($temperature) }
         if ($topK) { [void]$nativeArgs.Add('--top-k'); [void]$nativeArgs.Add($topK) }
         if ($topP) { [void]$nativeArgs.Add('--top-p'); [void]$nativeArgs.Add($topP) }
@@ -1627,7 +1766,6 @@ $state = [ordered]@{
     server_vision = $serverVision; vision_projector = $visionProjectorPath
     server_embedding = $serverEmbedding; embedding_model = $embeddingModelPath
     embedding_idle_timeout = $embeddingIdleTimeout
-    mtp_enabled = $mtpEnabled; mtp_model = $mtpModelPath; mtp_verify_tokens = $mtpVerifyTokens
     cpu_miss_enabled = $cpuMissEnabled; cpu_miss_max = $cpuMissMax; cpu_miss_cores = $cpuMissCores
     custom_sets = $customSets; last_command = $commandText
 }

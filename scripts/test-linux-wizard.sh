@@ -91,6 +91,79 @@ for name in flash-00001-of-00002.gguf flash-00002-of-00002.gguf mmproj-flash.ggu
 model_candidates "$ROOT/models" llm; [[ ${#CANDIDATES[@]} == 1 && ${CANDIDATES[0]} == *-00001-of-00002.gguf ]]; pass
 model_candidates "$ROOT/models" vision; [[ ${#CANDIDATES[@]} == 1 && ${CANDIDATES[0]} == *mmproj* ]]; pass
 reset; model_path llm model <<< 'models' > "$tmp/model-choice"; [[ ${S[model]} == *-00001-of-00002.gguf ]]; pass
+
+# The package-local catalog supports multi-select and returns to model choice
+# instead of selecting one downloaded model on the user's behalf.
+catalog_load flashnext-427; [[ $CATALOG_KIND == llm && $CATALOG_COUNT == 33 && $CATALOG_PRIMARY == *00001-of-00033.gguf ]]; pass
+catalog_file flashnext-427 33; [[ $DOWNLOAD_RELATIVE == *00033-of-00033.gguf && $DOWNLOAD_URL == https://huggingface.co/*/resolve/* ]]; pass
+catalog_load qwen3-embedding-06b-q8; [[ $CATALOG_KIND == embedding && $CATALOG_PRIMARY == *Qwen3-Embedding-0.6B-Q8_0.gguf ]]; pass
+(
+    download_bundle() {
+        printf '%s\n' "$1" >> "$tmp/download-ids"
+        catalog_load "$1"; mkdir -p -- "$ROOT/models/${CATALOG_PRIMARY%/*}"; printf fixture > "$ROOT/models/$CATALOG_PRIMARY"
+    }
+    download_menu <<< $'1,3,4\ny'
+) > "$tmp/download-menu"
+[[ $(tr '\n' ',' < "$tmp/download-ids") == 'qwen35-balanced,flashnext-vision,qwen3-embedding-06b-q8,' ]]; pass
+(
+    download_menu() {
+        catalog_load qwen35-balanced; mkdir -p -- "$ROOT/models/${CATALOG_PRIMARY%/*}"; printf fixture > "$ROOT/models/$CATALOG_PRIMARY"
+    }
+    reset; model_path llm model <<< $'D\nN\nmodels/flash-00001-of-00002.gguf'; printf '%s\n' "${S[model]}" > "$tmp/model-after-download"
+) > "$tmp/model-download-choice"
+[[ $(grep -c '^LLM model$' "$tmp/model-download-choice") == 2 && $(< "$tmp/model-after-download") == *flash-00001-of-00002.gguf ]]; pass
+
+# Exercise the real download path without network access and reject arbitrary URLs.
+mkdir "$tmp/fake-downloader"
+cat > "$tmp/fake-downloader/curl" <<'CURL'
+#!/usr/bin/env bash
+while (($#)); do
+    if [[ $1 == --output ]]; then output=$2; shift 2; else shift; fi
+done
+printf fixture >> "$output"
+CURL
+chmod +x "$tmp/fake-downloader/curl"
+(
+    PATH="$tmp/fake-downloader:$PATH"; unset MODEL_DOWNLOADER
+    model_download_file 'https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf?download=true' "$tmp/downloaded.gguf" fixture
+)
+[[ $(< "$tmp/downloaded.gguf") == fixture && ! -e $tmp/downloaded.gguf.part ]]; pass
+reject model_download_file 'https://example.invalid/model.gguf' "$tmp/rejected.gguf" rejected
+cat > "$tmp/fake-downloader/wget" <<'WGET'
+#!/usr/bin/env bash
+if [[ ${1-} == --help ]]; then printf 'minimal wget\n'; exit 0; fi
+while (($#)); do
+    if [[ $1 == -O ]]; then output=$2; shift 2; else shift; fi
+done
+printf wget-fixture >> "$output"
+WGET
+chmod +x "$tmp/fake-downloader/wget"
+(
+    command() {
+        if [[ ${1-} == -v && ${2-} == curl ]]; then return 1; fi
+        builtin command "$@"
+    }
+    PATH="$tmp/fake-downloader:$PATH"; unset MODEL_DOWNLOADER
+    model_download_file 'https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf?download=true' "$tmp/downloaded-wget.gguf" wget-fixture
+)
+[[ $(< "$tmp/downloaded-wget.gguf") == wget-fixture ]]; pass
+(
+    command() {
+        if [[ ${1-} == -v && (${2-} == curl || ${2-} == wget) ]]; then return 1; fi
+        builtin command "$@"
+    }
+    INTERACTIVE=false; HEADLESS=false; ! ensure_model_downloader
+); pass
+(
+    command() {
+        if [[ ${1-} == -v && (${2-} == curl || ${2-} == wget) ]]; then return 1; fi
+        builtin command "$@"
+    }
+    yes() { REPLY=true; }
+    install_curl() { return 1; }
+    INTERACTIVE=true; HEADLESS=false; ! ensure_model_downloader
+); pass
+
 reset; choose_device <<< '' > "$tmp/device-choice"; [[ ${S[device]} == Vulkan1 ]]; ! grep -q Software "$tmp/device-choice"; pass
 for address in 127.0.0.1:8080 localhost:8080 '[::1]:8080'; do valid_address "$address"; loopback "$address"; done; pass
 reject valid_address localhost.evil:8080
@@ -108,6 +181,10 @@ S[server_embedding]=true; S[embedding_model]=emb.gguf; S[ubatch]=2048; save_stat
 before=$(sha256sum "$STATE")
 output=$(INFR_API_KEY=fixture-secret bash "$ROOT/Start-INFR-Wizard-Linux.sh" --dry-run --model relative.gguf --ubatch 3072 --kv-k q8_0 --no-mtp --no-mmproj --no-embedding --no-api-key </dev/null)
 [[ $output == *3072* && $output == *kv.type_k=q8_0* && $output != *fixture-secret* && $output != *spec.draft* && $output != *--mmproj* && $(sha256sum "$STATE") == "$before" ]]; pass
+output=$(bash "$ROOT/Start-INFR-Wizard-Linux.sh" --dry-run --model relative.gguf --no-mmproj --no-embedding --no-api-key </dev/null)
+[[ $output == *spec.mtp=false* && $output != *spec.draft* ]]; pass
+output=$(bash "$ROOT/Start-INFR-Wizard-Linux.sh" --dry-run --model relative.gguf --mtp head.gguf --mtp-k 3 --no-mmproj --no-embedding --no-api-key </dev/null)
+[[ $output == *spec.mtp=true* && $output == *spec.draft=*head.gguf* && $output == *spec.k=3* ]]; pass
 reject bash "$ROOT/Start-INFR-Wizard-Linux.sh" --mode serve --model model.gguf --addr 0.0.0.0:8080 --no-api-key
 reject bash "$ROOT/Start-INFR-Wizard-Linux.sh" --mode serve --model model.gguf
 output=$(INFR_API_KEY=fixture-secret bash "$ROOT/Start-INFR-Wizard-Linux.sh" --mode serve --model model.gguf --yes --no-mtp --no-mmproj --no-embedding </dev/null)
@@ -124,6 +201,12 @@ gguf_string() { local n=${#1}; printf '\\%03o' "$n" > /dev/null; printf '%b' "\\
     gguf_string tokenizer.chat_template; printf '\10\0\0\0'; gguf_string reasoning_effort
 } > "$ROOT/tiny.gguf"
 [[ $(reasoning_efforts "$ROOT/tiny.gguf") == 'low medium xhigh' ]]; pass
+{
+    printf 'GGUF\3\0\0\0\0\0\0\0\0\0\0\0\2\0\0\0\0\0\0\0'
+    gguf_string general.architecture; printf '\10\0\0\0'; gguf_string qwen35moe
+    gguf_string tokenizer.chat_template; printf '\10\0\0\0'; gguf_string enable_thinking
+} > "$ROOT/tiny-qwen35.gguf"
+[[ $(reasoning_efforts "$ROOT/tiny-qwen35.gguf") == 'low medium high max' ]]; pass
 printf GGUF > "$ROOT/bad.gguf"; reject reasoning_efforts "$ROOT/bad.gguf"
 
 # The release fixture contains only runtime products, not developer Python files.
@@ -144,76 +227,76 @@ make_package() {
     } > "$base/install-manifest.json"
 }
 make_package "$tmp/installed" 0.10.0
-make_package "$tmp/stage" 0.11.0
-validate_package "$tmp/stage" 0.11.0; pass
+make_package "$tmp/stage" 1.0.0
+validate_package "$tmp/stage" 1.0.0; pass
 reject validate_package "$tmp/stage" 0.12.0
-touch "$tmp/stage/unlisted"; reject validate_package "$tmp/stage" 0.11.0; rm "$tmp/stage/unlisted"
-cp "$tmp/stage/infr" "$tmp/original-infr"; printf corrupt > "$tmp/stage/infr"; reject validate_package "$tmp/stage" 0.11.0; cp "$tmp/original-infr" "$tmp/stage/infr"
-prefix=MoE4All-Linux-x86_64-v0.11.0
+touch "$tmp/stage/unlisted"; reject validate_package "$tmp/stage" 1.0.0; rm "$tmp/stage/unlisted"
+cp "$tmp/stage/infr" "$tmp/original-infr"; printf corrupt > "$tmp/stage/infr"; reject validate_package "$tmp/stage" 1.0.0; cp "$tmp/original-infr" "$tmp/stage/infr"
+prefix=MoE4All-Linux-x86_64-v1.0.0
 cp -r "$tmp/stage" "$tmp/$prefix"; tar -czf "$tmp/valid.tar.gz" -C "$tmp" "$prefix"
-extract_package "$tmp/valid.tar.gz" "$tmp/extracted" 0.11.0; pass
+extract_package "$tmp/valid.tar.gz" "$tmp/extracted" 1.0.0; pass
 printf private > "$tmp/installed/infr.toml"; mkdir "$tmp/installed/kv-sessions"; printf cache > "$tmp/installed/kv-sessions/private.infrkv"
-apply_update "$tmp/installed" "$tmp/extracted" 0.11.0
-[[ $("$tmp/installed/infr" --version) == 'infr 0.11.0' && $(< "$tmp/installed/infr.toml") == private && $(< "$tmp/installed/kv-sessions/private.infrkv") == cache ]]; pass
-reject apply_update "$tmp/installed" "$tmp/stage" 0.11.0
-make_package "$tmp/rollback-old" 0.10.0; make_package "$tmp/rollback-new" 0.11.0
+apply_update "$tmp/installed" "$tmp/extracted" 1.0.0
+[[ $("$tmp/installed/infr" --version) == 'infr 1.0.0' && $(< "$tmp/installed/infr.toml") == private && $(< "$tmp/installed/kv-sessions/private.infrkv") == cache ]]; pass
+reject apply_update "$tmp/installed" "$tmp/stage" 1.0.0
+make_package "$tmp/rollback-old" 0.10.0; make_package "$tmp/rollback-new" 1.0.0
 # Version mismatch is internally consistent with the manifest, but fails the final executable probe.
 printf '#!/usr/bin/env bash\nprintf "infr 9.9.9\\n"\n' > "$tmp/rollback-new/infr"
 hash=$(sha256sum "$tmp/rollback-new/infr"); hash=${hash%% *}; size=$(wc -c < "$tmp/rollback-new/infr")
 json_load "$tmp/rollback-new/install-manifest.json"; original_hash=${J['["files",0,"sha256"]']}; original_size=${J['["files",0,"size"]']}
 sed -i "s/${original_hash:1:64}/$hash/;s/\"size\":$original_size,/\"size\":$size,/" "$tmp/rollback-new/install-manifest.json"
 before=$(sha256sum "$tmp/rollback-old/infr" "$tmp/rollback-old/install-manifest.json")
-reject apply_update "$tmp/rollback-old" "$tmp/rollback-new" 0.11.0
+reject apply_update "$tmp/rollback-old" "$tmp/rollback-new" 1.0.0
 [[ $(sha256sum "$tmp/rollback-old/infr" "$tmp/rollback-old/install-manifest.json") == "$before" ]]; pass
 reject fetch_url https://example.invalid/asset "$tmp/asset" 100
 
 # Shell updater guards (not just the separate developer Python fixtures).
 for name in 'documentation/../escape.md' 'documentation//escape.md' 'kv-sessions/private.infrkv' '/absolute' 'scripts/linux_wizard.py'; do reject managed "$name"; done
-make_package "$tmp/link-package" 0.11.0
+make_package "$tmp/link-package" 1.0.0
 rm "$tmp/link-package/documentation/README.md"; ln -s /outside "$tmp/link-package/documentation/README.md"
-reject validate_package "$tmp/link-package" 0.11.0
+reject validate_package "$tmp/link-package" 1.0.0
 mkdir "$tmp/link-installed"; cp -r "$tmp/rollback-old/." "$tmp/link-installed/"
 mv "$tmp/link-installed/documentation" "$tmp/outside-docs"; ln -s "$tmp/outside-docs" "$tmp/link-installed/documentation"
-make_package "$tmp/link-stage" 0.11.0; reject apply_update "$tmp/link-installed" "$tmp/link-stage" 0.11.0
-make_package "$tmp/running-old" 0.10.0; make_package "$tmp/running-new" 0.11.0
-( engine_running() { return 0; }; reject apply_update "$tmp/running-old" "$tmp/running-new" 0.11.0 ); pass
-mkdir "$tmp/running-old/.git"; reject apply_update "$tmp/running-old" "$tmp/running-new" 0.11.0
-make_package "$tmp/mid-old" 0.10.0; make_package "$tmp/mid-new" 0.11.0
+make_package "$tmp/link-stage" 1.0.0; reject apply_update "$tmp/link-installed" "$tmp/link-stage" 1.0.0
+make_package "$tmp/running-old" 0.10.0; make_package "$tmp/running-new" 1.0.0
+( engine_running() { return 0; }; reject apply_update "$tmp/running-old" "$tmp/running-new" 1.0.0 ); pass
+mkdir "$tmp/running-old/.git"; reject apply_update "$tmp/running-old" "$tmp/running-new" 1.0.0
+make_package "$tmp/mid-old" 0.10.0; make_package "$tmp/mid-new" 1.0.0
 before=$(sha256sum "$tmp/mid-old/infr" "$tmp/mid-old/install-manifest.json")
 (
     mv() { local arg; for arg in "$@"; do [[ $arg != *mid-new/Start-INFR-Wizard-Linux.sh ]] || return 1; done; command mv "$@"; }
-    reject apply_update "$tmp/mid-old" "$tmp/mid-new" 0.11.0
+    reject apply_update "$tmp/mid-old" "$tmp/mid-new" 1.0.0
 )
 [[ $(sha256sum "$tmp/mid-old/infr" "$tmp/mid-old/install-manifest.json") == "$before" ]]; pass
 
 if [[ $(uname -s) == Linux ]]; then
-    make_package "$tmp/fifo" 0.11.0; mkfifo "$tmp/fifo/unlisted-fifo"; reject validate_package "$tmp/fifo" 0.11.0
+    make_package "$tmp/fifo" 1.0.0; mkfifo "$tmp/fifo/unlisted-fifo"; reject validate_package "$tmp/fifo" 1.0.0
     mkdir -p "$tmp/archive-bad/$prefix"
     ln -s /outside "$tmp/archive-bad/$prefix/infr"
     tar -czf "$tmp/bad-link.tar.gz" -C "$tmp/archive-bad" "$prefix"
-    reject extract_package "$tmp/bad-link.tar.gz" "$tmp/link-extract" 0.11.0
+    reject extract_package "$tmp/bad-link.tar.gz" "$tmp/link-extract" 1.0.0
     rm "$tmp/archive-bad/$prefix/infr"; printf data > "$tmp/archive-bad/$prefix/infr"
     tar -czf "$tmp/bad-duplicate.tar.gz" -C "$tmp/archive-bad" "$prefix/infr" "$prefix/infr"
-    reject extract_package "$tmp/bad-duplicate.tar.gz" "$tmp/duplicate-extract" 0.11.0
+    reject extract_package "$tmp/bad-duplicate.tar.gz" "$tmp/duplicate-extract" 1.0.0
     tar -czf "$tmp/bad-traversal.tar.gz" --transform='s@infr$@../escape@' -C "$tmp/archive-bad" "$prefix/infr"
-    reject extract_package "$tmp/bad-traversal.tar.gz" "$tmp/traversal-extract" 0.11.0
+    reject extract_package "$tmp/bad-traversal.tar.gz" "$tmp/traversal-extract" 1.0.0
 
     # Full Shell download/checksum/extract/replace chain, all network replaced by local fixtures.
     make_package "$tmp/download-old" 0.10.0
     hash=$(sha256sum "$tmp/valid.tar.gz"); hash=${hash%% *}
     printf '%s  %s.tar.gz\n' "$hash" "$prefix" > "$tmp/download.sha256"
     (
-        RELEASE_VERSION=0.11.0
-        RELEASE_ARCHIVE="https://github.com/Headmaster218/MoE4All/releases/download/release-0.11.0/$prefix.tar.gz"
+        RELEASE_VERSION=1.0.0
+        RELEASE_ARCHIVE="https://github.com/Headmaster218/MoE4All/releases/download/release-1.0.0/$prefix.tar.gz"
         RELEASE_CHECKSUM="$RELEASE_ARCHIVE.sha256"
         fetch_url() { if [[ $1 == *.sha256 ]]; then cp "$tmp/download.sha256" "$2"; else cp "$tmp/valid.tar.gz" "$2"; fi; }
         download_update "$tmp/download-old"
     ) > "$tmp/download-output"
-    [[ $("$tmp/download-old/infr" --version) == 'infr 0.11.0' ]]; pass
+    [[ $("$tmp/download-old/infr" --version) == 'infr 1.0.0' ]]; pass
     make_package "$tmp/bad-download-old" 0.10.0
     before=$(sha256sum "$tmp/bad-download-old/infr")
     (
-        RELEASE_VERSION=0.11.0; RELEASE_ARCHIVE=archive; RELEASE_CHECKSUM=checksum
+        RELEASE_VERSION=1.0.0; RELEASE_ARCHIVE=archive; RELEASE_CHECKSUM=checksum
         fetch_url() { if [[ $1 == checksum ]]; then printf '%064d  %s.tar.gz\n' 0 "$prefix" > "$2"; else cp "$tmp/valid.tar.gz" "$2"; fi; }
         reject download_update "$tmp/bad-download-old"
     )
@@ -237,12 +320,9 @@ configure > "$tmp/interactive-default" <<'INPUT'
 INPUT
 [[ ${S[launch_mode]} == run && ${S[setup_mode]} == conservative && ${S[device]} == Vulkan1 && ${S[max_new]} == 65536 ]]; pass
 reset; S[launch_mode]=serve; S[model]="$ROOT/models/flash-00001-of-00002.gguf"
-S[setup_mode]=aggressive; S[mtp_model]="$ROOT/models/mtp-flash.gguf"; S[vision_projector]="$ROOT/models/mmproj-flash.gguf"
+S[setup_mode]=aggressive; S[vision_projector]="$ROOT/models/mmproj-flash.gguf"
 S[embedding_model]="$ROOT/models/mtp-flash.gguf"; S[server_parallel]=2
 configure > "$tmp/interactive-combined" <<'INPUT'
-
-
-y
 
 
 y
@@ -263,7 +343,7 @@ n
 
 n
 INPUT
-build_command; has_arg --mmproj; has_arg --embedding-model; has_arg spec.k=4; has_arg kv.session_idle_secs=120; has_arg 150k; pass
+build_command; has_arg --mmproj; has_arg --embedding-model; has_arg spec.mtp=false; has_arg kv.session_idle_secs=120; has_arg 150k; pass
 
 version_newer 0.10.0 0.9.9; ! version_newer 0.10.0 0.10.0; ! version_newer 0.9.9 0.10.0; pass
 
@@ -276,7 +356,7 @@ output=$(PATH="$tmp/no-language-runtime:$PATH" bash "$ROOT/Start-INFR-Wizard-Lin
 printf '[{"tag_name":"release-0.9.0","draft":false,"prerelease":false,"assets":[]},{"tag_name":"release-0.10.0","draft":false,"prerelease":false,"assets":[]},{"tag_name":"release-1.0.0","draft":false,"prerelease":true,"assets":[]},{"tag_name":"agent-9.0.0","draft":false,"prerelease":false,"assets":[]}]' > "$tmp/releases.json"
 json_load "$tmp/releases.json"; select_release; [[ $RELEASE_VERSION == 0.10.0 && -z $RELEASE_ARCHIVE ]]; pass
 
-printf '[{"tag_name":"release-0.11.0","draft":false,"prerelease":false,"assets":[{"name":"MoE4All-Linux-x86_64-v0.11.0.tar.gz","browser_download_url":"https://github.com/Headmaster218/MoE4All/releases/download/release-0.11.0/MoE4All-Linux-x86_64-v0.11.0.tar.gz"},{"name":"MoE4All-Linux-x86_64-v0.11.0.tar.gz.sha256","browser_download_url":"https://github.com/Headmaster218/MoE4All/releases/download/release-0.11.0/MoE4All-Linux-x86_64-v0.11.0.tar.gz.sha256"}]}]' > "$tmp/update-check.json"
+printf '[{"tag_name":"release-1.0.0","draft":false,"prerelease":false,"assets":[{"name":"MoE4All-Linux-x86_64-v1.0.0.tar.gz","browser_download_url":"https://github.com/Headmaster218/MoE4All/releases/download/release-1.0.0/MoE4All-Linux-x86_64-v1.0.0.tar.gz"},{"name":"MoE4All-Linux-x86_64-v1.0.0.tar.gz.sha256","browser_download_url":"https://github.com/Headmaster218/MoE4All/releases/download/release-1.0.0/MoE4All-Linux-x86_64-v1.0.0.tar.gz.sha256"}]}]' > "$tmp/update-check.json"
 (
     touch "$ROOT/install-manifest.json"; INTERACTIVE=true; HEADLESS=false
     fetch_url() { cp "$tmp/update-check.json" "$2"; }
