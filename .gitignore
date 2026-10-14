@@ -1,5 +1,7 @@
 # Rust
 /target
+/dist/
+/test-kv-cache/
 /scripts/__pycache__/
 **/*.rs.bk
 Cargo.lock.bak
