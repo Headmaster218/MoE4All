@@ -6,6 +6,49 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-10-15
+
+### Added
+
+- The Windows and Linux launch wizards provide a package-local download menu for selecting one or more Qwen3.6 35B, Qwen3.8 Flash-Next, Vision, and Embedding GGUF bundles. Downloads show progress, retry transient failures, resume from `.part` files, and return to local model selection without choosing a model automatically.
+- GPU-resident paged-MoE Decode scheduling, later generalized to resident MoE layouts and Qwen3.5/Qwen3.6 layer-synchronous batched Decode.
+- Native Qwen3.5/Qwen3.6 multimodal serving and model-aware reasoning-effort controls.
+- Release benchmark and profiling coverage for resident hit/miss handoff, queue overlap, MTP cycles, and 30K/150K concurrency.
+
+### Changed
+
+- Removed MTP selection from both release wizards. MTP remains available through direct engine CLI/configuration, and the Linux launcher still accepts an explicit `--mtp`; ordinary interactive wizard launches use the ordinary Decode path.
+- Synchronized the Linux release wizard with the post-0.10.0 Windows flow without adding Python or jq dependencies. Model downloads use curl or wget and can install curl through common Linux package managers after explicit confirmation when neither tool exists.
+- Separated model downloads from Quick Start and added a same-host, methodology-qualified Strata v0.1.44.1 comparison to both READMEs.
+- Resident paging is enabled by default on supported Decode paths; full-graph scheduling and queued miss retirement reduce host-side layer bubbles.
+- Q8 long-context attention, very-wide Q8 projections, exact Flash-Next Decode kernels, and four-token MTP verification received targeted Vulkan optimization.
+- The 1.0.0 release reference reports single-, dual-, and triple-stream 30K/150K throughput for Flash-Next and Qwen3.6 35B.
+
+### Fixed
+
+- Preserved frozen automatic RAM budgets, removed duplicate UMA host-cache allocation, and kept paged-MoE Prefill resident instead of rereading experts from disk.
+- Applied Qwen3.6 anti-repeat sampling defaults and aligned suffix checkpoints in mixed parallel execution.
+- Rejected stale numeric session-cache state, removed launch-time wizard probe stalls, and preserved pager cleanup after the main synchronization point.
+
+## [0.10.0] - 2026-10-09
+
+### Added
+
+- Experimental CPU expert-miss computation with bounded worker pools and wizard controls for miss count and compute cores.
+- Simplified Windows wizard setup with reusable saved settings, local SSD K/V defaults, and per-slot plus aggregate live throughput reporting.
+- Experimental Linux release packages and an aligned single-shell launch wizard; native Vision decoding gained bounded HEIC and AVIF support.
+
+### Changed
+
+- Qwen3.8 Prefill gained fused QSA, KV reuse across GQA heads, scratch reuse, dynamic live-lane planning, and overlapped expert uploads.
+- Decode and MTP paths gained faster sigmoid routing, fused DeltaNet/HC operations, cached quantization tables, and tighter router-to-hit handoff.
+- Automatic GPU profiles and current-transaction KV/Prefill budgeting were rebalanced for larger useful ubatch and lane counts when memory permits.
+
+### Fixed
+
+- Smoothed chunked-Prefill progress, raised the API request-body limit to 64 MiB, and allowed idle SSD K/V writes to yield the inference gate.
+- Preserved auxiliary Vulkan workspaces and serialized state transfers, corrected mixed-batch sampling suffix projection, and improved host-allocation failure diagnostics.
+
 ## [0.9.0] - 2026-09-28
 
 ### Added

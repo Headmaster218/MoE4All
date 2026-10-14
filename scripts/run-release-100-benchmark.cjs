@@ -148,12 +148,12 @@ function main() {
   if (!['all', 'decode', 'prefill'].includes(mode)) throw new Error(`Invalid benchmark mode: ${mode}`);
   for (const file of [exe, model, runner]) if (!fs.statSync(file).isFile()) throw new Error(`Missing file: ${file}`);
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  root = path.join(repo, 'benchmark-data', 'artifacts', 'release-0.11.0-benchmark', `${stamp}-${modelName}`);
+  root = path.join(repo, 'benchmark-data', 'artifacts', 'release-1.0.0-benchmark', `${stamp}-${modelName}`);
   cache = path.join(repo, 'test-kv-cache');
   fs.mkdirSync(root, { recursive: true });
   const version = spawnSync(exe, ['--version'], { encoding: 'utf8', windowsHide: true });
-  if (version.status !== 0 || !/\b0\.11\.0\b/.test(version.stdout)) {
-    throw new Error(`Expected a 0.11.0 binary, got: ${version.stdout || version.stderr}`);
+  if (version.status !== 0 || !/\b1\.0\.0\b/.test(version.stdout)) {
+    throw new Error(`Expected a 1.0.0 binary, got: ${version.stdout || version.stderr}`);
   }
   const manifest = { startedAt: new Date().toISOString(), root, modelName, model,
     modelBytes: fs.statSync(model).size, modelFirstShardPrefix: sha256Prefix(model),

@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { summarizeDecode, summarizePrefill } = require('./run-release-011-benchmark.cjs');
+const { summarizeDecode, summarizePrefill } = require('./run-release-100-benchmark.cjs');
 
 const request = (rate, hash = 'same') => ({ usage: { completion_tokens: 100 },
   timings: { predicted_ms: 2000, predicted_per_second: rate, cached_n: 90 }, outputHash: hash });

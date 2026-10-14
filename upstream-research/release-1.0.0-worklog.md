@@ -1,4 +1,4 @@
-# MoE4All 0.11.0 worklog
+# MoE4All 1.0.0 worklog
 
 Updated: 2026-10-13
 Branch: `perf/gpu-resident-decode`
@@ -18,7 +18,7 @@ concurrency, device, and measurement interval.
 | 4 | Review `perf/expert-mtp-optimization` after `release-0.10.0` | Done | No mature runtime optimization can be cherry-picked safely. The only novel experiments are reassigned to Tasks 5/6 for a current-architecture reimplementation and matched A/B. |
 | 5 | Decode front/back bubble overlap | Done | No production change. Runner-side setup is already overlapped/small; splitting the first frontend into an earlier submit regressed matched 30K and 150K throughput and was removed. Further gains require reusable command buffers/GPU-driven replay, which is architecture work. |
 | 6 | Expert-miss critical path | Done | No production change. Pool-streaming and mapped-copy worker variants were neutral/slower; the aggressive copy/encode overlap also produced nondeterministic output despite a host join before submit, so it was rejected. |
-| 7 | Version 0.11.0 and release benchmark | Done | Native benchmark binary and portable static-CRT package built. Both models completed the full matrix; FlashNext 150K x3 exposed one output-stability warning, while all other rows were stable. |
+| 7 | Version 1.0.0 and release benchmark | Done | Native benchmark binary and portable static-CRT package built. Both models completed the full matrix; FlashNext 150K x3 exposed one output-stability warning, while all other rows were stable. |
 | 8 | Recover MTP experiment and automatic splitter | Done | The WIP startup-reference splitter is not portable and was not copied. The current global tuner also mixes unrelated graph shapes; an implementation-ready class-isolated replacement and validation matrix are recorded below. |
 
 ## Accepted baseline
@@ -92,7 +92,7 @@ concurrency, device, and measurement interval.
   and reduces complete-cycle throughput. The code was removed. A meaningful next step would be
   reusable/indirect resident command buffers or a GPU-driven replay loop, not another host submit.
 - Evidence: `benchmark-data/artifacts/gpu-resident-decode-20261011/`
-  (`release011-frontgap-samebin-ab-control-*` and `release011-frontgap-samebin-ab-frontsubmit-*`).
+  (`release100-frontgap-samebin-ab-control-*` and `release100-frontgap-samebin-ab-frontsubmit-*`).
 
 ### Expert-miss critical-path experiments, RX 7900 XTX
 
@@ -116,12 +116,12 @@ concurrency, device, and measurement interval.
   through a transfer submission whose timeline dependency is consumed by the recovery queue. More
   host threads alone do not remove the exposed miss tail.
 - Evidence: `benchmark-data/artifacts/gpu-resident-decode-20261011/`
-  (`release011-miss-pool-mapped-ab-*`, `release011-miss-copyworker-ab-v1-*`,
-  `release011-miss-copyworker-ab-v2-*`, and `release011-miss-copyworker-ab-v3-*`).
+  (`release100-miss-pool-mapped-ab-*`, `release100-miss-copyworker-ab-v1-*`,
+  `release100-miss-copyworker-ab-v2-*`, and `release100-miss-copyworker-ab-v3-*`).
 
-### Release 0.11.0 benchmark, RX 7900 XTX
+### Release 1.0.0 benchmark, RX 7900 XTX
 
-- Native benchmark binary: `infr 0.11.0`, SHA-256
+- Native benchmark binary: `infr 1.0.0`, SHA-256
   `8a3c80cd8f8872778ae2425568f108562353d051a3aa002edff0d3819feeafff`.
 - Runtime source commit: `fabf3e614`; the later `5b949cd63` changes only benchmark reporting so an
   unstable row is retained instead of terminating the remaining matrix.
@@ -165,13 +165,13 @@ Cold Prefill (`cached_n=0`):
   fixed per-lane seeds, and lane 0/2 diverged from the beginning of the generated text. The raw rounds
   remain available for state/scheduler diagnosis; no correctness claim is made for that row.
 - Evidence roots:
-  `benchmark-data/artifacts/release-0.11.0-benchmark/2026-10-12T19-51-47-832Z-flashnext-4.27bpw`,
+  `benchmark-data/artifacts/release-1.0.0-benchmark/2026-10-12T19-51-47-832Z-flashnext-4.27bpw`,
   `2026-10-12T20-15-46-153Z-flashnext-4.27bpw-prefill`, and
   `2026-10-12T20-20-14-502Z-qwen36-35b-apex-i-balanced`.
 - The local CMD binary at `target/release/infr.exe` is the benchmarked native build. The Windows
   release archive uses `target-cpu=x86-64` and static CRT; its executable SHA-256 is
   `71f57f34c9043a98146f0c1dd896cbc6e03bacbb6069c556c60e51aa28998cc8`.
-- Release archive: `dist/MoE4All-Windows-x86_64-v0.11.0.zip`, SHA-256
+- Release archive: `dist/MoE4All-Windows-x86_64-v1.0.0.zip`, SHA-256
   `ecf8852fbaf8025890afd5d5436392ba835375913a64c8d0fa934116314c8428`. The extracted package passed
   install-manifest verification, update-transaction checks, command/wizard dry runs and dependency
   inspection. An earlier native package correctly failed the dependency check and was replaced.
