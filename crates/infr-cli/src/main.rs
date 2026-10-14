@@ -2140,6 +2140,7 @@ struct SeamGenerator {
     model: std::sync::Mutex<Box<dyn infr_llama::chat::ChatModel + Send>>,
     renderer: infr_llama::chat::OaiRenderer,
     watch: infr_llama::WeightWatch,
+    default_presence_penalty: f32,
 }
 
 impl SeamGenerator {
@@ -2152,6 +2153,7 @@ impl SeamGenerator {
             model: std::sync::Mutex::new(model),
             renderer: infr_llama::chat::OaiRenderer::open(gguf_path, cfg)?,
             watch: infr_llama::WeightWatch::open(gguf_path)?,
+            default_presence_penalty: model_default_presence_penalty(gguf_path),
         })
     }
 }
@@ -2163,6 +2165,7 @@ struct ParallelGenerator {
     vision: Option<Arc<infr_vision::NativeVisionEngine>>,
     renderer: infr_llama::chat::OaiRenderer,
     watch: infr_llama::WeightWatch,
+    default_presence_penalty: f32,
 }
 
 struct EmbeddingGeneratorAdapter {
@@ -2191,6 +2194,7 @@ impl ParallelGenerator {
             vision,
             renderer: infr_llama::chat::OaiRenderer::open(gguf_path, cfg)?,
             watch: infr_llama::WeightWatch::open(gguf_path)?,
+            default_presence_penalty: model_default_presence_penalty(gguf_path),
         })
     }
 }
@@ -2214,6 +2218,10 @@ trait GenBackend: Send + Sync {
     fn max_new_default(&self) -> usize {
         self.renderer().engine_cfg().sampling.max_new
     }
+
+    /// Model-family default for an omitted OpenAI `presence_penalty`. An explicit request value,
+    /// including zero, always wins.
+    fn default_presence_penalty(&self) -> f32;
 
     /// This sequence's own state: sampling config, abort latch, and (when the engine is
     /// multi-slot) its turn on the GPU baton.
@@ -2260,6 +2268,10 @@ impl GenBackend for SeamGenerator {
         &self.watch
     }
 
+    fn default_presence_penalty(&self) -> f32 {
+        self.default_presence_penalty
+    }
+
     fn request_ctx(
         &self,
         sampling: infr_llama::sampling::RequestSampling,
@@ -2304,6 +2316,10 @@ impl GenBackend for ParallelGenerator {
 
     fn weights(&self) -> &infr_llama::WeightWatch {
         &self.watch
+    }
+
+    fn default_presence_penalty(&self) -> f32 {
+        self.default_presence_penalty
     }
 
     fn request_ctx(
@@ -2370,16 +2386,20 @@ impl GenBackend for ParallelGenerator {
     }
 }
 
-/// Map the validated request params onto the seam's per-request sampling scope. An ABSENT request
-/// field stays `None`/neutral, so the decode loop keeps inheriting the CLI's `INFR_TEMP` /
-/// `INFR_TOP_K` / `INFR_TOP_P` defaults for it — only an EXPLICIT field overrides.
-fn request_sampling(p: &infr_server::GenParams) -> infr_llama::sampling::RequestSampling {
+/// Map the validated request params onto the seam's per-request sampling scope. Temperature/top-k/
+/// top-p stay `None` when absent and inherit the CLI defaults. Penalties use neutral defaults except
+/// for a model-family recommendation supplied by the backend; an EXPLICIT request value always
+/// overrides, including an explicit zero.
+fn request_sampling(
+    p: &infr_server::GenParams,
+    default_presence_penalty: f32,
+) -> infr_llama::sampling::RequestSampling {
     infr_llama::sampling::RequestSampling {
         temp: p.temperature,
         top_k: p.top_k,
         top_p: p.top_p,
         seed: p.seed,
-        presence_penalty: p.presence_penalty.unwrap_or(0.0),
+        presence_penalty: p.presence_penalty.unwrap_or(default_presence_penalty),
         frequency_penalty: p.frequency_penalty.unwrap_or(0.0),
         repeat_penalty: p.repeat_penalty.unwrap_or(1.0),
         ..Default::default()
@@ -2521,7 +2541,7 @@ fn run_chat(
         // turn. Owned by this call — not installed anywhere ambient — so it cannot be observed by,
         // or leak into, any other in-flight request.
         let req = be
-            .request_ctx(request_sampling(params))
+            .request_ctx(request_sampling(params, be.default_presence_penalty()))
             .with_external_abort(cancel.clone())
             .with_progress(progress);
         // Forced tool_choice ("required"/named): grammar-constrain the call body (the same
@@ -4446,8 +4466,9 @@ fn cmd_compare(
 }
 
 /// Architecture-family recommended sampling `(temp, top_k, top_p)` — the published per-family
-/// defaults (`top_k = 0` = keep-all, i.e. top_k disabled). Qwen3.8 publishes distinct thinking and
-/// non-thinking profiles; older Qwen families retain their established thinking recommendation.
+/// defaults (`top_k = 0` = keep-all, i.e. top_k disabled). Qwen3.6 and Qwen3.8 publish distinct
+/// thinking and non-thinking profiles; older Qwen families retain their established thinking
+/// recommendation.
 /// An unknown arch falls back to the neutral chat default the whole engine used before this table
 /// existed.
 fn arch_sampling(arch: &str, no_think: bool) -> (f32, usize, f32) {
@@ -4457,8 +4478,11 @@ fn arch_sampling(arch: &str, no_think: bool) -> (f32, usize, f32) {
         // values; the model card separately specifies the non-thinking values.
         QWEN4EXP if no_think => (0.7, 20, 0.8),
         QWEN4EXP => (1.0, 20, 0.95),
-        // Qwen3.x thinking rec (Qwen team): temp 0.6 / top_k 20 / top_p 0.95.
-        QWEN3 | QWEN3_MOE | QWEN35 | QWEN35_MOE => (0.6, 20, 0.95),
+        // Qwen3.6 publishes the same thinking/non-thinking temperature profiles as Qwen3.8.
+        QWEN35 | QWEN35_MOE if no_think => (0.7, 20, 0.8),
+        QWEN35 | QWEN35_MOE => (1.0, 20, 0.95),
+        // Older Qwen3 thinking rec: temp 0.6 / top_k 20 / top_p 0.95.
+        QWEN3 | QWEN3_MOE => (0.6, 20, 0.95),
         // Qwen2/2.5 rec: a touch hotter, tighter nucleus.
         QWEN2 => (0.7, 20, 0.8),
         // Gemma (Google): higher temp, wide top_k.
@@ -4475,6 +4499,30 @@ fn arch_sampling(arch: &str, no_think: bool) -> (f32, usize, f32) {
         BAILINGMOE3 => (1.0, 20, 0.95),
         _ => (0.6, 20, 0.95),
     }
+}
+
+/// Qwen3.6's published general-thinking and non-thinking profiles both use a 1.5 presence
+/// penalty. Keep this API default model-scoped: an omitted request field gets the recommendation,
+/// while an explicit zero remains a supported performance-first override.
+fn default_presence_penalty_for_arch(arch: Option<&str>) -> f32 {
+    use infr_llama::arch::{QWEN35, QWEN35_MOE};
+    match arch {
+        Some(QWEN35) | Some(QWEN35_MOE) => 1.5,
+        _ => 0.0,
+    }
+}
+
+fn model_default_presence_penalty(gguf: &std::path::Path) -> f32 {
+    let arch = infr_llama::arch::arch_of(gguf);
+    let penalty = default_presence_penalty_for_arch(arch.as_deref());
+    if penalty != 0.0 {
+        tracing::info!(
+            architecture = arch.as_deref().unwrap_or("unknown"),
+            presence_penalty = penalty,
+            "using model-recommended presence penalty when the API request omits it; an explicit value overrides"
+        );
+    }
+    penalty
 }
 
 /// Per-field sampling override from a `generation_config.json` sitting BESIDE the model (the HF
@@ -5651,11 +5699,12 @@ mod tests {
 
     #[test]
     fn arch_sampling_table_is_family_specific() {
-        // Qwen3.x thinking rec; also the fallback for any unknown arch.
+        // Older Qwen3 thinking rec; also the fallback for any unknown arch.
         assert_eq!(arch_sampling(QWEN3, false), (0.6, 20, 0.95));
-        assert_eq!(arch_sampling(QWEN35_MOE, false), (0.6, 20, 0.95));
         assert_eq!(arch_sampling("some-future-arch", false), (0.6, 20, 0.95));
-        // Qwen3.8 publishes separate defaults for thinking and direct-answer modes.
+        // Qwen3.6 and Qwen3.8 publish separate defaults for thinking and direct-answer modes.
+        assert_eq!(arch_sampling(QWEN35_MOE, false), (1.0, 20, 0.95));
+        assert_eq!(arch_sampling(QWEN35_MOE, true), (0.7, 20, 0.8));
         assert_eq!(arch_sampling(QWEN4EXP, false), (1.0, 20, 0.95));
         assert_eq!(arch_sampling(QWEN4EXP, true), (0.7, 20, 0.8));
         // Qwen2/2.5 runs hotter with a tighter nucleus.
@@ -5665,6 +5714,32 @@ mod tests {
         assert_eq!(arch_sampling(BAILINGMOE3, false), (1.0, 20, 0.95));
         // Llama: top_k off (0 = keep all), top_p 0.9.
         assert_eq!(arch_sampling(LLAMA, false), (0.6, 0, 0.9));
+    }
+
+    #[test]
+    fn qwen35_api_presence_default_is_model_scoped_and_explicitly_overridable() {
+        assert_eq!(default_presence_penalty_for_arch(Some(QWEN35)), 1.5);
+        assert_eq!(default_presence_penalty_for_arch(Some(QWEN35_MOE)), 1.5);
+        assert_eq!(default_presence_penalty_for_arch(Some(QWEN4EXP)), 0.0);
+        assert_eq!(default_presence_penalty_for_arch(None), 0.0);
+
+        let absent = infr_server::GenParams::default();
+        assert_eq!(request_sampling(&absent, 1.5).presence_penalty, 1.5);
+
+        let explicit_zero = infr_server::GenParams {
+            presence_penalty: Some(0.0),
+            ..Default::default()
+        };
+        assert_eq!(request_sampling(&explicit_zero, 1.5).presence_penalty, 0.0);
+
+        let explicit_custom = infr_server::GenParams {
+            presence_penalty: Some(0.75),
+            ..Default::default()
+        };
+        assert_eq!(
+            request_sampling(&explicit_custom, 1.5).presence_penalty,
+            0.75
+        );
     }
 
     /// `infr bench --json` must emit PARSEABLE JSON whose first key is `avg_ts`, in every
