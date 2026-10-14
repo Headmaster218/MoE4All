@@ -127,6 +127,9 @@ if ($BaseArchive) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Prepare-BundledRuntime.cjs') -Destination (Join-Path $stageHarness 'scripts\Prepare-BundledRuntime.cjs') -Force
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'vendor') -Destination (Join-Path $stageHarness 'scripts\vendor') -Recurse -Force
     Copy-Item -LiteralPath (Join-Path $root 'harness\launcher\MoE4All.cs') -Destination (Join-Path $stageHarness 'launcher\MoE4All.cs') -Force
+    $stageLauncherVendor = Join-Path $stageHarness 'launcher\vendor'
+    if (Test-Path -LiteralPath $stageLauncherVendor) { Remove-Item -LiteralPath $stageLauncherVendor -Recurse -Force }
+    Copy-Item -LiteralPath (Join-Path $root 'harness\launcher\vendor') -Destination $stageLauncherVendor -Recurse -Force
     & (Join-Path $PSScriptRoot 'Build-AgentLauncher.ps1') -OutputPath (Join-Path $stage 'MoE4All.exe')
     if ($LASTEXITCODE -ne 0) { throw 'Building the hotfix launcher failed.' }
     $baseVersion = [string]$baseManifest.version
@@ -151,7 +154,7 @@ New-Item -ItemType Directory -Path $output, $stage -Force | Out-Null
 $temp = Join-Path $output "$name-source.zip"
 $agentPaths = @(
     'harness/distribution/profile',
-    'harness/launcher/MoE4All.cs',
+    'harness/launcher',
     'harness/scripts/AgentUpdateVersion.ps1',
     'harness/scripts/Build-Agent.ps1',
     'harness/scripts/Build-DevHarness.ps1',

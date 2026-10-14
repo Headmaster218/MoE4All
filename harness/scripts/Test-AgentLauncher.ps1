@@ -9,7 +9,7 @@ $fixtureRoot = Join-Path $testRoot ('path with spaces ' + [char]0x4e2d + [char]0
 $scriptRoot = Join-Path $fixtureRoot 'harness\scripts'
 New-Item -ItemType Directory -Path $scriptRoot -Force | Out-Null
 $launcher = Join-Path $fixtureRoot 'MoE4All.exe'
-& (Join-Path $PSScriptRoot 'Build-AgentLauncher.ps1') -OutputPath $launcher
+& (Join-Path $PSScriptRoot 'Build-AgentLauncher.ps1') -OutputPath $launcher -Console
 
 function Write-FixtureScript([string]$name, [string]$content) {
     $path = Join-Path $scriptRoot $name
@@ -65,7 +65,8 @@ Write-FixtureScript 'Run-Agent.ps1' @'
 param([string]$StateRoot, [switch]$Open)
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
-if (-not $Open) { throw 'The EXE did not request browser opening.' }
+if ($Open) { throw 'The desktop EXE unexpectedly requested browser opening.' }
+if ((Split-Path -Leaf $StateRoot) -ne 'data') { throw 'The EXE did not use the unified data directory.' }
 $null = Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256
 Write-Host 'run-ok'
 exit 0
@@ -83,11 +84,11 @@ throw ('prepare-error-' + [char]0x4e2d + [char]0x6587)
 '@
 $failed = Invoke-FixtureLauncher
 $expectedError = 'prepare-error-' + [char]0x4e2d + [char]0x6587
-$logPath = Join-Path $fixtureRoot 'harness\agent-state\logs\launcher.log'
+$logPath = Join-Path $fixtureRoot 'data\logs\launcher.log'
 $logContent = Get-Content -LiteralPath $logPath -Raw -Encoding UTF8
 if ($failed.ExitCode -eq 0 -or -not $failed.Output.Contains($expectedError) -or
     -not $logContent.Contains($expectedError) -or $failed.Output -notmatch 'Startup log:') {
     throw "Child-error logging/encoding failed: $($failed.Output)"
 }
-Write-Host 'Launcher tests passed: missing runtime, downloaded scripts, isolated module path, child error logging, UTF-8 output.'
+Write-Host 'Launcher tests passed: missing runtime, unified data root, no browser launch, downloaded scripts, isolated module path, child error logging, UTF-8 output.'
 Write-Host "Evidence: $testRoot"

@@ -130,7 +130,20 @@ function runtimePackages(dsh) {
   return packages;
 }
 
-function prepareProfile(harness, state, dsh) {
+function remapManagedPath(value, mappings) {
+  if (typeof value !== 'string' || !path.isAbsolute(value)) return value;
+  const resolved = path.resolve(value);
+  const lowered = resolved.toLowerCase();
+  for (const [source, destination] of mappings) {
+    const prefix = path.resolve(source);
+    const loweredPrefix = prefix.toLowerCase();
+    if (lowered === loweredPrefix) return destination;
+    if (lowered.startsWith(loweredPrefix + path.sep)) return path.join(destination, resolved.slice(prefix.length + 1));
+  }
+  return value;
+}
+
+function prepareProfile(install, previousInstall, harness, state, dsh) {
   const modules = path.join(state, 'home', 'profiles', 'web', 'node_modules');
   if (!exists(modules)) {
     const seed = path.join(harness, 'distribution', 'prebuilt-state');
@@ -150,6 +163,21 @@ function prepareProfile(harness, state, dsh) {
   const yaml = requireDsh('js-yaml');
   const patch = yaml.load(fs.readFileSync(native(patchPath), 'utf8'));
   let changed = false;
+  const models = path.join(install, 'models');
+  const cache = path.join(install, 'cache', 'kv-sessions');
+  const mappings = [
+    [path.join(install, 'harness', 'agent-state', 'home', 'moe4all-models'), models],
+    [path.join(state, 'home', 'moe4all-models'), models],
+    [path.join(install, 'harness', 'agent-state'), state],
+  ];
+  if (previousInstall && path.resolve(previousInstall).toLowerCase() !== path.resolve(install).toLowerCase()) {
+    mappings.unshift(
+      [path.join(previousInstall, 'models'), models],
+      [path.join(previousInstall, 'cache'), path.join(install, 'cache')],
+      [path.join(previousInstall, 'data'), state],
+      [path.join(previousInstall, 'harness', 'agent-state'), state],
+    );
+  }
   for (const entry of patch) {
     if (entry.id === 'moe4all-engine' && entry.config?.endpoint === 'http://127.0.0.1:1234/v1') {
       entry.config.endpoint = 'http://127.0.0.1:8080/v1'; changed = true;
@@ -157,6 +185,30 @@ function prepareProfile(harness, state, dsh) {
     if (entry.id === 'dsh-mneme-moe4all' && entry.config && !Object.hasOwn(entry.config, 'vectorDefaults')) {
       entry.config.vectorDefaults = { enabled: true, baseUrl: 'http://127.0.0.1:8080/v1', apiKey: 'moe4all-local', model: 'Qwen3-Embedding-0.6B-Q8_0' };
       changed = true;
+    }
+    if (entry.id === 'moe4all-engine' && entry.config) {
+      const directory = remapManagedPath(entry.config.modelDirectory, mappings);
+      if (directory !== entry.config.modelDirectory) { entry.config.modelDirectory = directory; changed = true; }
+      if (Array.isArray(entry.config.modelDirectories)) {
+        const directories = entry.config.modelDirectories.map(value => remapManagedPath(value, mappings));
+        if (directories.some((value, index) => value !== entry.config.modelDirectories[index])) {
+          entry.config.modelDirectories = directories; changed = true;
+        }
+      }
+      if (Array.isArray(entry.config.arguments)) {
+        const arguments_ = entry.config.arguments.map((value) => {
+          if (value === 'kv.session_cache_dir=kv-sessions') return `kv.session_cache_dir=${cache}`;
+          if (typeof value === 'string' && value.startsWith('kv.session_cache_dir=')) {
+            const current = value.slice('kv.session_cache_dir='.length);
+            const relocated = remapManagedPath(current, mappings);
+            return `kv.session_cache_dir=${relocated}`;
+          }
+          return remapManagedPath(value, mappings);
+        });
+        if (arguments_.some((value, index) => value !== entry.config.arguments[index])) {
+          entry.config.arguments = arguments_; changed = true;
+        }
+      }
     }
   }
   if (changed) write(patchPath, yaml.dump(patch, { lineWidth: -1 }));
@@ -197,7 +249,17 @@ async function prepareEngine(harness, state) {
 }
 
 async function prepare(install, state) {
-  const harness = path.join(path.resolve(install), 'harness');
+  const resolvedInstall = path.resolve(install);
+  const resolvedState = path.resolve(state);
+  const harness = path.join(resolvedInstall, 'harness');
+  const rootMarker = path.join(resolvedState, 'product-root.json');
+  let previousInstall;
+  if (exists(rootMarker)) {
+    try {
+      const marker = readJson(rootMarker);
+      if (marker.schema === 1 && typeof marker.root === 'string' && path.isAbsolute(marker.root)) previousInstall = marker.root;
+    } catch { /* A malformed hint must not block startup; current paths remain authoritative. */ }
+  }
   const payload = path.join(harness, 'runtime', 'runtime-payload.json');
   if (exists(payload)) {
     const manifest = readJson(payload);
@@ -205,8 +267,9 @@ async function prepare(install, state) {
     for (const archive of manifest.archives) await unpack(harness, archive);
   }
   const dsh = restoreLinks(harness);
-  prepareProfile(harness, path.resolve(state), dsh);
-  await prepareEngine(harness, path.resolve(state));
+  prepareProfile(resolvedInstall, previousInstall, harness, resolvedState, dsh);
+  await prepareEngine(harness, resolvedState);
+  write(rootMarker, JSON.stringify({ schema: 1, root: resolvedInstall }, null, 2) + '\n');
   console.log('Bundled MoE4All runtime is ready.');
 }
 
@@ -215,4 +278,4 @@ if (require.main === module) {
   if (!install || !state) { console.error('InstallRoot and StateRoot are required.'); process.exitCode = 1; }
   else prepare(install, state).catch((error) => { console.error(error.stack); process.exitCode = 1; });
 }
-module.exports = { contained, unpack, ensureJunction, restoreLinks, prepare };
+module.exports = { contained, unpack, ensureJunction, restoreLinks, remapManagedPath, prepare };

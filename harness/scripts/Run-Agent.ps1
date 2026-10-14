@@ -5,6 +5,8 @@ param(
     [string]$HostAddress = '127.0.0.1',
     [int]$Port = 17373,
     [string]$CliPath,
+    [string]$DesktopBridge,
+    [string]$DesktopToken,
     [switch]$AllowSharedWorkspace,
     [switch]$Open
 )
@@ -12,7 +14,8 @@ param(
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
 $harnessRoot = Split-Path -Parent $PSScriptRoot
-if (-not $StateRoot) { $StateRoot = Join-Path $harnessRoot 'agent-state' }
+$installRoot = Split-Path -Parent $harnessRoot
+if (-not $StateRoot) { $StateRoot = Join-Path $installRoot 'data' }
 $state = [System.IO.Path]::GetFullPath($StateRoot)
 if (-not $WorkspaceRoot) { $WorkspaceRoot = Join-Path $state 'workspace' }
 $workspace = [System.IO.Path]::GetFullPath($WorkspaceRoot)
@@ -58,9 +61,7 @@ $profile = Join-Path $agentHome 'profiles\web'
 if (-not (Test-Path -LiteralPath (Join-Path $profile 'node_modules') -PathType Container)) {
     throw 'MoE4All profile is not built. Run Build-Agent.ps1 first.'
 }
-if (-not (Test-Path -LiteralPath $workspace -PathType Container)) {
-    throw "Workspace directory not found: $workspace"
-}
+New-Item -ItemType Directory -Path $workspace -Force | Out-Null
 $node = Get-ChildItem -LiteralPath (Join-Path $harnessRoot 'runtime') -Directory -Filter 'node-v*-win-x64' |
     ForEach-Object { Join-Path $_.FullName 'node.exe' } |
     Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
@@ -69,18 +70,54 @@ if (-not $node) { throw 'The bundled MoE4All Node runtime is missing.' }
 if (-not $CliPath) { $CliPath = Join-Path $harnessRoot 'runtime\dsh\lib\bin.js' }
 $entry = [System.IO.Path]::GetFullPath($CliPath)
 if (-not (Test-Path -LiteralPath $entry -PathType Leaf)) { throw "MoE4All CLI entry not found: $entry" }
-$oldHome = $env:DSH_HOME
-$oldAgentsHome = $env:DSH_AGENTS_HOME
-$oldPath = $env:PATH
-$oldProduct = $env:MOE4ALL_AGENT
+$cacheRoot = Join-Path $installRoot 'cache'
+$modelsRoot = Join-Path $installRoot 'models'
+$cacheDirectories = @(
+    $cacheRoot,
+    (Join-Path $cacheRoot 'temp'),
+    (Join-Path $cacheRoot 'node'),
+    (Join-Path $cacheRoot 'python'),
+    (Join-Path $cacheRoot 'huggingface'),
+    (Join-Path $cacheRoot 'torch'),
+    (Join-Path $cacheRoot 'kv-sessions'),
+    $modelsRoot
+)
+New-Item -ItemType Directory -Path $cacheDirectories -Force | Out-Null
+
+$managedEnvironment = [ordered]@{
+    DSH_HOME = $agentHome
+    DSH_AGENTS_HOME = (Join-Path $state 'agents')
+    MOE4ALL_AGENT = '1'
+    MOE4ALL_ROOT = $installRoot
+    MOE4ALL_DATA_DIR = $state
+    MOE4ALL_MODELS_DIR = $modelsRoot
+    MOE4ALL_CACHE_DIR = $cacheRoot
+    MOE4ALL_KV_CACHE_DIR = (Join-Path $cacheRoot 'kv-sessions')
+    XDG_CACHE_HOME = $cacheRoot
+    HF_HOME = (Join-Path $cacheRoot 'huggingface')
+    HUGGINGFACE_HUB_CACHE = (Join-Path $cacheRoot 'huggingface\hub')
+    TRANSFORMERS_CACHE = (Join-Path $cacheRoot 'huggingface\transformers')
+    TORCH_HOME = (Join-Path $cacheRoot 'torch')
+    NPM_CONFIG_CACHE = (Join-Path $cacheRoot 'node\npm')
+    UV_CACHE_DIR = (Join-Path $cacheRoot 'python\uv')
+    PIP_CACHE_DIR = (Join-Path $cacheRoot 'python\pip')
+    TEMP = (Join-Path $cacheRoot 'temp')
+    TMP = (Join-Path $cacheRoot 'temp')
+    MOE4ALL_DESKTOP_BRIDGE = $DesktopBridge
+    MOE4ALL_DESKTOP_TOKEN = $DesktopToken
+    PATH = "$(Split-Path -Parent $node);$env:PATH"
+}
+$oldEnvironment = @{}
 try {
-    $env:DSH_HOME = $agentHome
-    $env:DSH_AGENTS_HOME = Join-Path $state 'agents'
-    $env:MOE4ALL_AGENT = '1'
-    $env:PATH = "$(Split-Path -Parent $node);$oldPath"
+    foreach ($entry in $managedEnvironment.GetEnumerator()) {
+        $oldEnvironment[$entry.Key] = [Environment]::GetEnvironmentVariable($entry.Key, 'Process')
+        [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, 'Process')
+    }
     Write-Host "MoE4All Agent: http://${HostAddress}:$Port"
     Write-Host "DSH_HOME: $agentHome"
     Write-Host "Workspace: $workspace"
+    Write-Host "Models: $modelsRoot"
+    Write-Host "Cache: $cacheRoot"
     Push-Location $workspace
     try {
         $nodeArgs = @($entry, 'web', '--host', $HostAddress, '--port', [string]$Port)
@@ -91,8 +128,7 @@ try {
         Pop-Location
     }
 } finally {
-    $env:PATH = $oldPath
-    if ($null -eq $oldHome) { Remove-Item Env:DSH_HOME -ErrorAction SilentlyContinue } else { $env:DSH_HOME = $oldHome }
-    if ($null -eq $oldAgentsHome) { Remove-Item Env:DSH_AGENTS_HOME -ErrorAction SilentlyContinue } else { $env:DSH_AGENTS_HOME = $oldAgentsHome }
-    if ($null -eq $oldProduct) { Remove-Item Env:MOE4ALL_AGENT -ErrorAction SilentlyContinue } else { $env:MOE4ALL_AGENT = $oldProduct }
+    foreach ($entry in $managedEnvironment.GetEnumerator()) {
+        [Environment]::SetEnvironmentVariable($entry.Key, $oldEnvironment[$entry.Key], 'Process')
+    }
 }

@@ -6,7 +6,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { createRequire } = require('node:module');
 const { zipSync, strToU8 } = require('./vendor/fflate.cjs');
-const { unpack, restoreLinks } = require('./Prepare-BundledRuntime.cjs');
+const { unpack, restoreLinks, remapManagedPath } = require('./Prepare-BundledRuntime.cjs');
 const native = (filename) => path.toNamespacedPath(filename);
 
 function fixture(t) {
@@ -67,4 +67,16 @@ test('an initialized installation repairs commander junctions after its original
   restoreLinks(moved);
   assert.equal(createRequire(path.join(movedDsh, 'package.json'))('commander'), 42);
   assert.equal(fs.existsSync(native(original)), false);
+});
+
+test('managed state paths relocate without rewriting external or relative paths', (t) => {
+  const base = fixture(t);
+  const oldState = path.join(base, 'old-state');
+  const newState = path.join(base, 'new-state');
+  const external = path.join(base, 'external', 'model.gguf');
+  const mappings = [[oldState, newState]];
+  assert.equal(remapManagedPath(path.join(oldState, 'models', 'model.gguf'), mappings),
+    path.join(newState, 'models', 'model.gguf'));
+  assert.equal(remapManagedPath(external, mappings), external);
+  assert.equal(remapManagedPath('kv-sessions', mappings), 'kv-sessions');
 });
