@@ -7,7 +7,7 @@ const crypto = require('node:crypto');
 const childProcess = require('node:child_process');
 const { createRequire } = require('node:module');
 const { zipSync, strToU8 } = require('./vendor/fflate.cjs');
-const { unpack, restoreLinks, remapManagedPath } = require('./Prepare-BundledRuntime.cjs');
+const { copyTree, unpack, restoreLinks, remapManagedPath } = require('./Prepare-BundledRuntime.cjs');
 const native = (filename) => path.toNamespacedPath(filename);
 
 function fixture(t) {
@@ -50,6 +50,18 @@ test('runtime payload completes concurrent compressed file writes before marking
   assert.equal(completed, 24);
   assert.equal(fs.readFileSync(native(path.join(harness, 'runtime/dsh/files/23.txt')), 'utf8').startsWith('23:payload-'), true);
   assert.equal(fs.readFileSync(native(path.join(harness, 'runtime/dsh/.moe4all-payload-ready')), 'utf8').trim(), archive.sha256);
+});
+
+test('profile seed copy supports deep Windows paths and interrupted destinations', (t) => {
+  const base = fixture(t);
+  const source = path.join(base, 'source');
+  const destination = path.join(base, 'deep-path-'.repeat(16), 'destination');
+  const relative = 'profiles/web/node_modules/example/package.json';
+  assert.ok(path.join(destination, relative).length > 260);
+  write(path.join(source, relative), '{"name":"example","version":1}');
+  write(path.join(destination, relative), 'partial');
+  copyTree(source, destination);
+  assert.equal(fs.readFileSync(native(path.join(destination, relative)), 'utf8'), '{"name":"example","version":1}');
 });
 
 test('standalone runtime preparation stays alive until a large payload is complete', (t) => {

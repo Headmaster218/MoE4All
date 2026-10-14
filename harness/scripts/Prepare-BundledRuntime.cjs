@@ -16,6 +16,21 @@ const readJson = (value) => JSON.parse(fs.readFileSync(native(value), 'utf8'));
 const write = (value, text) => fs.writeFileSync(native(value), text, 'utf8');
 const mkdir = (value) => fs.mkdirSync(native(value), { recursive: true });
 
+function copyTree(source, destination) {
+  const pending = [[path.resolve(source), path.resolve(destination)]];
+  while (pending.length) {
+    const [currentSource, currentDestination] = pending.pop();
+    mkdir(currentDestination);
+    for (const entry of fs.readdirSync(native(currentSource), { withFileTypes: true })) {
+      const sourcePath = path.join(currentSource, entry.name);
+      const destinationPath = path.join(currentDestination, entry.name);
+      if (entry.isDirectory() && !entry.isSymbolicLink()) pending.push([sourcePath, destinationPath]);
+      else if (entry.isFile() && !entry.isSymbolicLink()) fs.copyFileSync(native(sourcePath), native(destinationPath));
+      else throw new Error(`Unsupported entry in bundled profile seed: ${sourcePath}`);
+    }
+  }
+}
+
 function contained(base, relative) {
   if (typeof relative !== 'string' || path.isAbsolute(relative) || /[:\0]/.test(relative)
     || relative.split(/[\\/]/).includes('..')) throw new Error(`Unsafe bundled relative path: ${relative}`);
@@ -313,18 +328,24 @@ function prepareProfile(install, previousInstall, harness, state, dsh) {
   if (!exists(modules)) {
     const seed = path.join(harness, 'distribution', 'prebuilt-state');
     if (!exists(seed)) throw new Error('The bundled Agent state seed is missing.');
+    console.log('Restoring the portable Agent profile seed.');
     mkdir(state);
-    fs.cpSync(native(seed), native(state), { recursive: true, force: false, errorOnExist: false });
+    copyTree(seed, state);
   }
-  for (const [name, target] of runtimePackages(dsh)) {
+  console.log('Indexing bundled DSH runtime packages.');
+  const packages = runtimePackages(dsh);
+  console.log(`Linking ${packages.size} bundled DSH runtime packages.`);
+  for (const [name, target] of packages) {
     const short = name.slice('@deepseek-ai/'.length);
     ensureJunction(path.join(dsh, 'node_modules', '@deepseek-ai', short), target, true);
     ensureJunction(path.join(modules, '@deepseek-ai', short), target, true);
   }
+  console.log('Validating bundled DSH dependencies.');
   const requireDsh = createRequire(path.join(dsh, 'package.json'));
   requireDsh.resolve('commander');
   const patchPath = path.join(state, 'home', 'profiles', 'web', 'cordis.patch.yml');
   if (!exists(patchPath)) return;
+  console.log('Applying portable Agent profile paths.');
   const yaml = requireDsh('js-yaml');
   const patch = yaml.load(fs.readFileSync(native(patchPath), 'utf8'));
   let changed = false;
@@ -444,8 +465,11 @@ async function prepare(install, state) {
       progress.finish();
     }
   }
+  console.log('Finalizing bundled runtime links.');
   const dsh = restoreLinks(harness);
+  console.log('Preparing the isolated Agent profile.');
   prepareProfile(resolvedInstall, previousInstall, harness, resolvedState, dsh);
+  console.log('Preparing the bundled MoE4All Engine.');
   await prepareEngine(harness, resolvedState);
   write(rootMarker, JSON.stringify({ schema: 1, root: resolvedInstall }, null, 2) + '\n');
   console.log('Bundled MoE4All runtime is ready.');
@@ -456,4 +480,4 @@ if (require.main === module) {
   if (!install || !state) { console.error('InstallRoot and StateRoot are required.'); process.exitCode = 1; }
   else prepare(install, state).catch((error) => { console.error(error.stack); process.exitCode = 1; });
 }
-module.exports = { contained, unpack, ensureJunction, restoreLinks, remapManagedPath, prepare };
+module.exports = { contained, copyTree, unpack, ensureJunction, restoreLinks, remapManagedPath, prepare };
