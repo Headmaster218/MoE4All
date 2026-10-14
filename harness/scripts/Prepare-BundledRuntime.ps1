@@ -6,12 +6,17 @@ $ErrorActionPreference = 'Stop'
 $harnessRoot = Split-Path -Parent $PSScriptRoot
 if (-not $InstallRoot) { $InstallRoot = Split-Path -Parent $harnessRoot }
 if (-not $StateRoot) { $StateRoot = Join-Path $InstallRoot 'data' }
-$node = Join-Path $harnessRoot 'bootstrap\node.exe'
+$node = Join-Path $InstallRoot 'node.exe'
 if (-not (Test-Path -LiteralPath $node -PathType Leaf)) {
-    $node = Get-ChildItem -LiteralPath (Join-Path $harnessRoot 'runtime') -Directory -Filter 'node-v*-win-x64' |
-        ForEach-Object { Join-Path $_.FullName 'node.exe' } |
-        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
-        Select-Object -First 1
+    $bootstrapNode = Join-Path $harnessRoot 'bootstrap\node.exe'
+    if (Test-Path -LiteralPath $bootstrapNode -PathType Leaf) {
+        Copy-Item -LiteralPath $bootstrapNode -Destination $node -Force
+    } else {
+        $node = Get-ChildItem -LiteralPath (Join-Path $harnessRoot 'runtime') -Directory -Filter 'node-v*-win-x64' |
+            ForEach-Object { Join-Path $_.FullName 'node.exe' } |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+            Select-Object -First 1
+    }
 }
 if (-not $node) { throw 'The bundled MoE4All Node runtime is missing.' }
 $workerCount = [Math]::Max(4, [Math]::Min(16, [Environment]::ProcessorCount))

@@ -29,6 +29,10 @@ if ((Join-Path $scriptRoot 'Prepare-BundledRuntime.ps1').Length -le 260 -or
 if (-not (Test-Path -LiteralPath ($launcher + '.config') -PathType Leaf)) {
     throw 'The launcher .NET configuration was not deployed.'
 }
+$bundledConfig = Join-Path $fixtureRoot 'harness\launcher\MoE4All.exe.config'
+[IO.Directory]::CreateDirectory((Split-Path -Parent $bundledConfig)) | Out-Null
+[IO.File]::Copy(($launcher + '.config'), $bundledConfig, $true)
+[IO.File]::Delete($launcher + '.config')
 
 function Write-FixtureScript([string]$name, [string]$content) {
     $path = Join-Path $scriptRoot $name
@@ -71,6 +75,9 @@ function Invoke-FixtureLauncher {
 $missing = Invoke-FixtureLauncher
 if ($missing.ExitCode -ne 3 -or $missing.Output -notmatch 'runtime is incomplete') {
     throw "Missing-runtime diagnostics failed: $($missing.Output)"
+}
+if (-not (Test-Path -LiteralPath ($launcher + '.config') -PathType Leaf)) {
+    throw 'The launcher did not restore its .NET configuration after an old-style update.'
 }
 
 Write-FixtureScript 'Prepare-BundledRuntime.ps1' @'

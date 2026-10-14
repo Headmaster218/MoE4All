@@ -89,6 +89,14 @@ internal static class MoE4All
         return Assembly.Load(File.ReadAllBytes(filename));
     }
 
+    private static void RepairLauncherConfiguration(string root)
+    {
+        string active = Path.Combine(root, "MoE4All.exe.config");
+        if (File.Exists(active)) return;
+        string bundled = Path.Combine(root, "harness", "launcher", "MoE4All.exe.config");
+        if (File.Exists(bundled)) File.Copy(bundled, active, false);
+    }
+
     private static void WriteMessage(string message, bool error)
     {
         lock (LogLock)
@@ -230,6 +238,8 @@ internal static class MoE4All
     [STAThread]
     private static int Main(string[] arguments)
     {
+        AppContext.SetSwitch("Switch.System.IO.UseLegacyPathHandling", false);
+        AppContext.SetSwitch("Switch.System.IO.BlockLongPaths", false);
         AppDomain.CurrentDomain.AssemblyResolve += ResolveBundledManagedAssembly;
         try
         {
@@ -243,6 +253,7 @@ internal static class MoE4All
         string root = AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
         try
         {
+            RepairLauncherConfiguration(root);
             PrepareProductDirectories(root);
             logPath = Path.Combine(root, "data", "logs", "launcher.log");
             log = new StreamWriter(new FileStream(logPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite), new UTF8Encoding(false));

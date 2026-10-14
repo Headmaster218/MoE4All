@@ -29,6 +29,8 @@ function Write-Manifest([string]$Root, [string]$Version) {
 function Write-App([string]$Root, [string]$Version) {
     Write-Text (Join-Path $Root 'MoE4All.exe') $Version
     Write-Text (Join-Path $Root 'MoE4All.exe.config') '<configuration />'
+    Write-Text (Join-Path $Root 'node.exe') 'node'
+    Write-Text (Join-Path $Root 'harness\bootstrap\node.exe') 'bootstrap-node'
     Write-Text (Join-Path $Root 'Microsoft.Web.WebView2.Core.dll') 'core'
     Write-Text (Join-Path $Root 'Microsoft.Web.WebView2.WinForms.dll') 'forms'
     Write-Text (Join-Path $Root 'WebView2Loader.dll') 'loader'

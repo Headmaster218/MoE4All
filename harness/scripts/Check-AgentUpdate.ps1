@@ -43,6 +43,7 @@ function Assert-UpdatePath([string]$Path) {
 $managedNames = @(
     'MoE4All.exe',
     'MoE4All.exe.config',
+    'node.exe',
     'Microsoft.Web.WebView2.Core.dll',
     'Microsoft.Web.WebView2.WinForms.dll',
     'WebView2Loader.dll',
@@ -159,7 +160,7 @@ try {
     } finally { $reader.Dispose() }
     Expand-Archive -LiteralPath $download -DestinationPath $expanded
     $nextManifest = Join-Path $newRoot 'harness\distribution\agent-release.json'
-    foreach ($required in @('MoE4All.exe', 'MoE4All.exe.config', 'harness', 'Microsoft.Web.WebView2.Core.dll', 'Microsoft.Web.WebView2.WinForms.dll', 'WebView2Loader.dll')) {
+    foreach ($required in @('MoE4All.exe', 'MoE4All.exe.config', 'harness', 'harness\bootstrap\node.exe', 'Microsoft.Web.WebView2.Core.dll', 'Microsoft.Web.WebView2.WinForms.dll', 'WebView2Loader.dll')) {
         if (-not (Test-Path -LiteralPath (Join-Path $newRoot $required))) { throw "The Agent archive is missing $required." }
     }
     if (-not (Test-Path -LiteralPath $nextManifest -PathType Leaf)) { throw 'The Agent archive manifest is missing.' }

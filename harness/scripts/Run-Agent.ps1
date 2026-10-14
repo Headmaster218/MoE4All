@@ -62,12 +62,15 @@ if (-not (Test-Path -LiteralPath (Join-Path $profile 'node_modules') -PathType C
     throw 'MoE4All profile is not built. Run Build-Agent.ps1 first.'
 }
 New-Item -ItemType Directory -Path $workspace -Force | Out-Null
-$node = Join-Path $harnessRoot 'bootstrap\node.exe'
+$node = Join-Path $installRoot 'node.exe'
 if (-not (Test-Path -LiteralPath $node -PathType Leaf)) {
-    $node = Get-ChildItem -LiteralPath (Join-Path $harnessRoot 'runtime') -Directory -Filter 'node-v*-win-x64' |
-        ForEach-Object { Join-Path $_.FullName 'node.exe' } |
-        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
-        Select-Object -First 1
+    $node = Join-Path $harnessRoot 'bootstrap\node.exe'
+    if (-not (Test-Path -LiteralPath $node -PathType Leaf)) {
+        $node = Get-ChildItem -LiteralPath (Join-Path $harnessRoot 'runtime') -Directory -Filter 'node-v*-win-x64' |
+            ForEach-Object { Join-Path $_.FullName 'node.exe' } |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+            Select-Object -First 1
+    }
 }
 if (-not $node) { throw 'The bundled MoE4All Node runtime is missing.' }
 if (-not $CliPath) { $CliPath = Join-Path $harnessRoot 'runtime\dsh\lib\bin.js' }
