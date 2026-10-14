@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Decode 墙钟时间线</title>
+<style>
+body { font: 14px system-ui; margin: 24px; color: #20252c; background: #fff; }
+h1 { font-size: 24px; margin-bottom: 8px; }
+table { border-collapse: collapse; width: 100%; margin: 20px 0; }
+th, td { text-align: right; padding: 8px 12px; border-bottom: 1px solid #ddd; }
+th:first-child, td:first-child { text-align: left; }
+.table-wrap { overflow-x: auto; max-width: 100%; }
+.table-wrap th, .table-wrap td { white-space: nowrap; }
+label { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; margin: 8px 12px 8px 0; }
+select { min-width: 0; max-width: 100%; padding: 7px; }
+button { width: 34px; height: 34px; font-size: 22px; color: #303840; background: #f4f6f7; border: 1px solid #c7cdd2; border-radius: 4px; vertical-align: middle; cursor: pointer; }
+button:focus-visible, canvas:focus-visible { outline: 2px solid #337eb6; outline-offset: 2px; }
+canvas { display: block; width: 100%; border-bottom: 1px solid #ddd; }
+#timeline { height: 450px; touch-action: none; }
+#timeline.dragging { cursor: grabbing; }
+#histogram { height: 190px; }
+#detail, #hover, small { overflow-wrap: anywhere; line-height: 1.7; }
+#hover { height: 96px; overflow-y: auto; }
+.legend { display: flex; gap: 10px 16px; flex-wrap: wrap; margin: 12px 0; }
+.legend span { display: inline-flex; gap: 5px; align-items: center; }
+.legend i { width: 12px; height: 12px; flex: 0 0 12px; }
+small { color: #59616b; }
+details { margin: 16px 0; }
+summary { cursor: pointer; }
+.definitions td { text-align: left; vertical-align: top; }
+.definitions td:first-child { white-space: nowrap; }
+@media(max-width: 480px) { body { margin: 16px; } .definitions td { padding: 8px 4px; } }
+</style>
+<h1>Decode 墙钟时间线</h1>
+<small>2026-10-11 · FlashNext 4.27bpw · RX 7900 XTX · aggressive · Q8 KV · MTP off · 2 slots / 1 active · db5040ed5 · SHA256 b6384b9f…d92a0</small>
+<p>本轮对照：普通 CPU 控制与 GPU 条件续跑。每工况仅 12 个连续 step，P50/P90 只描述这个短窗口，不能代表长期吞吐。正常速度来自独立的无 profiler 完整矩阵，不由采样 step 反推。</p>
+<div class="table-wrap"><table><thead><tr><th>路径 / 上下文</th><th>无 profiler tok/s</th><th>样本</th><th>Step P50 ms</th><th>P90 ms</th><th>范围 ms</th><th>编码 P50 ms</th><th>等待 P50 ms</th><th>主队列 P50 ms</th></tr></thead><tbody id="table"></tbody></table></div>
+<label>工况 <select id="case" aria-label="工况"></select></label>
+<label>样本 <select id="step" aria-label="样本"></select></label>
+<button id="reset" title="完整时间范围" aria-label="完整时间范围">↺</button>
+<div id="detail"></div><div id="hover">&nbsp;</div>
+<div id="breakdown"></div>
+<div class="legend" id="legend"></div>
+<small>GPU 层轨为估算：将 CPU 末尾 HC injection 对应的 recorder 与真实主队列提交匹配，再以同一步单独 HC 更新的中位耗时拆分合并 HC（缺少参考时按一半拆分）。不是整层均分；QSA 沿用实测区间。虚线为估算切点，悬停显示定位范围，不能当作精确 kernel 耗时或缓存命中率。</small>
+<canvas id="timeline" height="450" aria-label="选中 Decode step 的 CPU 层、GPU 层估算与四轨时间线"></canvas>
+<canvas id="histogram" height="190" aria-label="当前工况所有采样 step 的墙钟时间分布"></canvas>
+<small>时间线为一个真实 step，0 ms 是该 step 的 CPU 起点。四轨共用校准后的墙钟时间轴，不能纵向求和。下图统计当前工况的全部采样 step；竖线标记选中样本，不随时间线缩放改变统计样本。</small>
+<p><strong>优化路径的观测限制：</strong>CPU 轨只记录主控制线程；notice producer 的缓存管理、专家准备和上传没有继承 trace context，DMA 轨因此可能缺失，空轨不表示没有搬运。CPU wait 包含等待 producer，不能算作纯 CPU 忙碌。GPU 主队列有真实时间戳，但条件跳过仍会执行 query marker；不对优化路径强行推导整层边界。普通路径保留旧图的 CPU 层与 GPU 层估算。</p>
+<details><summary>分类含义与测量口径</summary>
+<table class="definitions"><thead><tr><th>分类</th><th>含义</th></tr></thead><tbody id="definitions"></tbody></table>
+<p>一个普通 Decode step 推进所有活跃路各一个 token，包含输入准备、模型执行、采样和 token 回调；不含前面的请求排队和大段 Prefill。主队列区间包含依赖、复制、屏障和停顿，不是 ALU 利用率。CPU wait 常与 GPU 工作重叠，不能直接当作可删除开销。P50/P90 标记选择最接近该分位数的真实样本，不拼接各阶段中位数。</p>
+<p>层轨使用 L0 起的编号。每层开始/结束由 CPU 算子顺序推导，包含该层 PLE（若有）、GDN/QSA、MoE 和末尾 HC injection 的 CPU 执行区间；不代表 GPU 的整层执行时间。条内深线是原始 expert_layer span，表示 CPU 专家处理阶段。绿色起点、红色终点延伸到 CPU 轨，不延伸到 GPU 轨。旧 trace 未记录整层 GPU 起止，不据此估算 GPU 层耗时。</p>
+<p>GPU 估算轨以末尾 HC injection 所在 recorder 的提交内第一个 HC completion interval 为边界锚点；每层必须对应独立提交。该版本 early submit 会将 MoE 和末尾 HC 分开，不能沿用旧图的同提交 MoE→HC 匹配规则。单独 HC 使用区间终点；HC injection 与下一层 norm 合并时，按该步单独 HC 区间的中位耗时估算切点，无参考则取中点。同类算子耗时只是近似稳定，会受设备、路数、融合、缓存和调度影响。边界定位范围是整个对应 HC 区间，不是严格误差界或统计置信区间；层区间包含队列停顿、等待与提交空隙，不是纯计算。缺少或歧义锚点的样本不强行插值。原 CPU 和提交统计不变。</p>
+</details>
+<script id="payload" type="application/octet-stream">__TIMELINE_PAYLOAD__</script>
+<script>
+window.timelineReady = (async () => {
+  const bytes = Uint8Array.from(atob(document.getElementById('payload').textContent.trim()), c => c.charCodeAt(0));
+  const data = JSON.parse(await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'))).text());
+  const labels = __TIMELINE_LABELS__;
+  const descriptions = {
+    command_encode: 'CPU 向 Vulkan command buffer 记录 dispatch、绑定、复制和屏障的时间，不是 GPU kernel 执行时间。',
+    wait: 'CPU 等待队列、fence、DMA 槽位、timeline semaphore 或 PLE 完成。通常同时有 GPU/DMA 工作，不等于 GPU 空转。',
+    submit: 'CPU 调用主队列或 DMA 队列提交 API 的时间；不包括整个 GPU 执行时长。',
+    expert_prepare: 'CPU pager 为缺失专家准备上传，包括缓存位置、映射、拷贝与传输计划等；图中单独分类的嵌套编码、提交、等待已扣除。',
+    expert_mapped_copy: 'CPU 将专家字节写入映射显存的 fallback 拷贝；新 trace 单列，早期 trace 可能包含在 expert_prepare 中。',
+    expert_enqueue: 'CPU 将已准备的专家上传操作和依赖接入当前 recorder；嵌套 command_encode 等在互斥图中另计。',
+    dma_host_prepare: 'CPU 准备专用 DMA 命令和可复用槽位；嵌套等待、编码、实际提交在互斥图中另计。不是 DMA 实际搬运时间。',
+    recorder_acquire: 'CPU 获取或初始化 Vulkan recorder、command buffer 和配套资源的时间，不是 recorder 的整个生命周期。',
+    recorder_recycle: 'fence 和 notice ACK 已完成之后，CPU 归还 command buffer、descriptor pool 和引用的临时资源。不是等待阶段。',
+    notice_poll: '主线程非阻塞检查 producer 结果队列，不代表阻塞等待；ACK 和阻塞接收另计 wait。',
+    router_readback: '路由结果已完成同步之后，CPU 读取专家 ID 等路由结果；前面的等待计入 wait。',
+    backend_setup: '每次 backend execute 的入口准备与检查；嵌套的其他已命名阶段另计。',
+    residency_snapshot: '主线程冻结专家驻留查找表的时间；不等于上传线程维护 LRU 的全部时间。',
+    scheduler_front_tail: 'Decode 循环头尾的输入/位置准备、采样、token 回调与状态更新；不是请求排队时长。',
+    measurement: '显式 trace 开销，例如校准时钟、取得 query、写 marker 和读取结果。不保证包含测量的全部扰动。',
+    lowering_other: 'CPU step 内未归入以上类别的其余墙钟时间，包括图 lowering、控制逻辑、驱动、调度或未细分记账；不能全部叫无用开销。',
+    main: 'GPU 主队列每个提交的 TOP 到 BOTTOM 校准时间戳区间并集；包含计算、复制、依赖等待和屏障，不等于纯计算。',
+    dma: '专用 transfer 队列上 DMA 提交的 GPU 时间区间；主队列上的复制和 CPU mapped 拷贝不属于这一轨。',
+    pending: '从 CPU 开始调用主队列提交 API 到 GPU 首个 TOP 时间戳的区间并集；包含提交调用、排队与依赖，不是纯 GPU 等待。'
+  };
+  const colors = { command_encode: '#337eb6', wait: '#d26458', submit: '#9669ab', expert_prepare: '#36a080',
+    expert_mapped_copy: '#a88736', expert_enqueue: '#247962', dma_host_prepare: '#d39332', recorder_acquire: '#ab7595',
+    recorder_recycle: '#6f7884', notice_poll: '#758b9a', router_readback: '#768f34', backend_setup: '#6799a4', scheduler_front_tail: '#909d55', measurement: '#858585',
+    lowering_other: '#cad1d7', residency_snapshot: '#bb7354', main: '#315f93', dma: '#23916d', pending: '#b38c41' };
+  const f = v => Number(v || 0).toFixed(2), fm = v => Number(v || 0).toFixed(4);
+  const cs = document.getElementById('case'), ss = document.getElementById('step');
+  const timeline = document.getElementById('timeline');
+  let viewport = { start: 0, span: null }, view, drag = null;
+  const rowY = i => 115 + i * 64 + (i >= 2 ? 60 : 0);
+  document.getElementById('table').innerHTML = data.map(c => {
+    const d = c.distributions;
+    return '<tr><td>' + c.mode + ' / ' + c.depth / 1000 + 'K</td><td>' + (c.unprofiledRate ? f(c.unprofiledRate) : '未测') + '</td><td>' + c.capturedSteps +
+      '</td><td>' + f(d.wallMs.median) + '</td><td>' + f(d.wallMs.p90) + '</td><td>' + f(d.wallMs.min) + '–' + f(d.wallMs.max) +
+      '</td><td>' + f(d.cpu.command_encode?.median) + '</td><td>' + f(d.cpu.wait?.median) + '</td><td>' + f(d.mainMs.median) + '</td></tr>';
+  }).join('');
+  cs.innerHTML = data.map((c, i) => '<option value="' + i + '">' + c.mode + ' · ' + c.depth / 1000 + 'K · ' + c.count + ' 路活跃 · ' + c.slots + ' slots</option>').join('');
+  document.getElementById('legend').innerHTML = labels.map(k => '<span title="' + descriptions[k] + '"><i style="background:' + colors[k] + '"></i>' + k + '</span>').join('');
+  document.getElementById('definitions').innerHTML = labels.map(k => '<tr><td><code>' + k + '</code></td><td>' + descriptions[k] + '</td></tr>').join('');
+  function canvas(id, h) {
+    const el = document.getElementById(id), w = el.clientWidth, r = devicePixelRatio || 1;
+    el.width = Math.round(w * r); el.height = Math.round(h * r);
+    const x = el.getContext('2d'); x.scale(r, r); x.font = '12px system-ui';
+    return [x, w, h];
+  }
+  function reset() {
+    viewport = { start: 0, span: null };
+    document.getElementById('hover').textContent = '\u00a0'; draw();
+  }
+  function choose() {
+    const c = data[+cs.value];
+    ss.innerHTML = c.points.map(p => '<option value="' + p.id + '">Step ' + p.id + ' · ' + f(p.wallMs) + ' ms' +
+      (p.id === c.representative.median ? ' · P50' : '') + (p.id === c.representative.p90 ? ' · P90' : '') + '</option>').join('');
+    ss.value = c.representative.median; reset();
+  }
+  function clampViewport(p) {
+    viewport.span = Math.max(Math.max(0.0001, p.wallMs / 5000), Math.min(p.wallMs, viewport.span ?? p.wallMs));
+    viewport.start = Math.max(0, Math.min(p.wallMs - viewport.span, viewport.start));
+  }
+  function draw() {
+    const c = data[+cs.value], p = c.points.find(p => p.id === +ss.value); if (!p) return;
+    clampViewport(p);
+    document.getElementById('detail').textContent = 'Step ' + p.id + ' · ' + c.count + ' 路各推进 1 token · 位置 ' + p.positions.join(' / ') +
+      ' · 墙钟 ' + f(p.wallMs) + ' ms · 编码/主队列重叠 ' + f(p.encodeOverlapMs) + ' ms · 编码在主队列外 ' + f(p.encodeOutsideMainMs) +
+      ' ms · DMA/主队列重叠 ' + f(p.dmaOverlapMs) + ' ms · 时钟校准偏差 ' + f(p.maxClockDeviationNs / 1000) + ' us';
+    const d = c.distributions;
+    document.getElementById('breakdown').textContent = '短窗口平均（不是所选单步）：编码 ' + f(d.cpu.command_encode?.mean) +
+      ' ms，其中主队列外 ' + f(d.encodeOutsideMainMs.mean) + ' ms；等待 ' + f(d.cpu.wait?.mean) +
+      ' ms，其中主队列外 ' + f(d.waitOutsideMainMs.mean) + ' ms；主队列提交 ' + f(d.mainSubmits.mean) +
+      ' 次/step；主线程提交 API ' + f(d.cpu.submit?.mean) + ' ms；pending ' + f(d.mainPendingMs.mean) +
+      ' ms，其中与主队列重叠 ' + f(d.pendingMainOverlapMs.mean) + ' ms。pending 不能全部当作空转；主队列外不等于全部可删除，未观测的上传线程可能仍在工作。';
+    const [x, w] = canvas('timeline', 450), left = 125, right = 20;
+    const { start, span } = viewport, scale = (w - left - right) / span;
+    const names = ['CPU exclusive', 'Submit to TOP', 'GPU main queue', 'GPU DMA'];
+    view = { p, left, right, width: w, start, span, scale };
+    x.clearRect(0, 0, w, 450); x.fillStyle = '#47515d';
+    const ticks = Math.max(2, Math.min(10, Math.floor((w - left - right) / 85)));
+    for (let i = 0; i <= ticks; i++) {
+      const at = start + span * i / ticks, px = left + (at - start) * scale;
+      x.textAlign = i === ticks ? 'right' : i === 0 ? 'left' : 'center';
+      x.fillText((span < 1 ? fm(at) : f(at)) + ' ms', px, 22);
+      x.strokeStyle = '#e7e9ec'; x.beginPath(); x.moveTo(px, 30); x.lineTo(px, 415); x.stroke();
+    }
+    x.textAlign = 'left';
+    x.fillStyle = '#303840'; x.fillText('层 CPU（推导）', 0, 70);
+    if (!(p.layers || []).length) x.fillText('推测录制含重放，不估算层界', left, 70);
+    x.save(); x.beginPath(); x.rect(left, 45, w - left - right, 100); x.clip();
+    for (const layer of p.layers || []) {
+      const lo = Math.max(layer.start, start), hi = Math.min(layer.end, start + span);
+      if (hi <= lo) continue;
+      const px = left + (lo - start) * scale, width = (hi - lo) * scale;
+      x.fillStyle = layer.kind === 'QSA' ? '#ded3e8' : '#cce7dc'; x.fillRect(px, 52, width, 30);
+      const ea = Math.max(layer.expertStart, start), eb = Math.min(layer.expertEnd, start + span);
+      if (eb > ea) { x.fillStyle = '#66717b'; x.fillRect(left + (ea - start) * scale, 78, (eb - ea) * scale, 4); }
+      for (const [at, color, label] of [[layer.start, '#247962', '始'], [layer.end, '#bd4640', '终']]) {
+        if (at < start || at > start + span) continue;
+        const edge = left + (at - start) * scale;
+        x.strokeStyle = color; x.beginPath(); x.moveTo(edge, 48); x.lineTo(edge, 110); x.stroke();
+        if (width > 130) { x.fillStyle = color; x.textAlign = label === '始' ? 'left' : 'right'; x.fillText(label, edge, 43); }
+      }
+      x.textAlign = 'left'; x.fillStyle = '#303840';
+      if (width > 32) x.fillText('L' + layer.layer + (width > 65 ? ' ' + layer.kind : ''), px + 3, 71);
+    }
+    x.restore(); x.textAlign = 'left';
+    p.rows.forEach((row, i) => {
+      const y = rowY(i); x.fillStyle = '#303840'; x.fillText(names[i], 0, y + 17);
+      x.save(); x.beginPath(); x.rect(left, y, w - left - right, 28); x.clip();
+      for (const [a, b, code] of row) {
+        const lo = Math.max(a, start), hi = Math.min(b, start + span); if (hi <= lo) continue;
+        x.fillStyle = colors[labels[code]] || '#999'; x.fillRect(left + (lo - start) * scale, y, Math.max(0.5, (hi - lo) * scale), 28);
+      }
+      x.restore();
+    });
+    x.fillStyle = '#303840'; x.fillText('层 GPU（估算）', 0, 263);
+    if (!(p.gpuLayers || []).length) x.fillText('条件跳过，旧估算算法不适用', left, 263);
+    x.save(); x.beginPath(); x.rect(left, 237, w - left - right, 94); x.clip();
+    for (const layer of p.gpuLayers || []) {
+      const lo = Math.max(layer.start, start), hi = Math.min(layer.end, start + span);
+      if (hi <= lo) continue;
+      const px = left + (lo - start) * scale, width = (hi - lo) * scale;
+      x.fillStyle = layer.kind === 'QSA' ? '#ded3e8' : '#cce7dc'; x.fillRect(px, 245, width, 28);
+      const a = Math.max(layer.endBounds[0], start), b = Math.min(layer.endBounds[1], start + span);
+      if (b > a) { x.fillStyle = '#c7ac76'; x.fillRect(left + (a - start) * scale, 269, Math.max(.5, (b - a) * scale), 4); }
+      x.fillStyle = '#303840';
+      if (width > 32) x.fillText('L' + layer.layer + (width > 65 ? ' ' + layer.kind : ''), px + 3, 264);
+    }
+    x.setLineDash([3, 3]); x.strokeStyle = '#5a6978';
+    for (const at of (p.gpuLayers || []).flatMap((l, i) => i ? [l.end] : [l.start, l.end])) {
+      if (at < start || at > start + span) continue;
+      const edge = left + (at - start) * scale;
+      x.beginPath(); x.moveTo(edge, 241); x.lineTo(edge, 331); x.stroke();
+    }
+    x.restore();
+    x.save(); x.beginPath(); x.rect(left, 115, w - left - right, 28); x.clip();
+    for (const layer of p.layers || []) {
+      for (const [at, color] of [[layer.start, '#247962'], [layer.end, '#bd4640']]) {
+        if (at < start || at > start + span) continue;
+        const edge = left + (at - start) * scale;
+        x.strokeStyle = color; x.beginPath(); x.moveTo(edge, 115); x.lineTo(edge, 143); x.stroke();
+      }
+    }
+    x.restore();
+    const [z, hw] = canvas('histogram', 190), a = c.distributions.wallMs.min, b = c.distributions.wallMs.max;
+    const bins = Array(30).fill(0), range = Math.max(0.001, b - a);
+    for (const point of c.points) bins[Math.min(29, Math.floor((point.wallMs - a) / range * 30))]++;
+    const max = Math.max(...bins), bw = (hw - left - right) / 30;
+    z.clearRect(0, 0, hw, 190); z.fillStyle = '#47515d'; z.fillText('Step 墙钟分布', 0, 32);
+    z.fillText('n=' + c.points.length, left, 20);
+    for (let i = 0; i <= 2; i++) {
+      const n = max * i / 2; z.fillText(n.toFixed(0), left - 30, 145 - n / max * 105);
+    }
+    bins.forEach((n, i) => { z.fillStyle = '#337eb6'; z.fillRect(left + i * bw, 145 - n / max * 105, Math.max(0, bw - 2), n / max * 105); });
+    const selectedX = left + (p.wallMs - a) / range * (hw - left - right);
+    z.strokeStyle = '#bd4640'; z.beginPath(); z.moveTo(selectedX, 38); z.lineTo(selectedX, 145); z.stroke();
+    z.fillStyle = '#47515d'; z.fillText(f(a) + ' ms', left, 175); z.textAlign = 'right'; z.fillText(f(b) + ' ms', hw - right, 175); z.textAlign = 'left';
+  }
+  function coordinates(event) {
+    const rect = timeline.getBoundingClientRect(); return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+  }
+  function inPlot(x, y) { return view && x >= view.left && x <= view.width - view.right && y >= 30 && y <= 415; }
+  function hover(event) {
+    if (!view) return;
+    const { x, y } = coordinates(event), row = [0, 1, 2, 3].find(i => y >= rowY(i) && y < rowY(i) + 28), at = view.start + (x - view.left) / view.scale;
+    if (!inPlot(x, y)) { document.getElementById('hover').textContent = '\u00a0'; return; }
+    const layer = y >= 45 && y <= 85 && (view.p.layers || []).find(l => l.start <= at && at <= l.end);
+    if (layer) {
+      document.getElementById('hover').textContent = 'L' + layer.layer + ' · ' + layer.kind + ' · CPU 层边界（算子顺序推导，非 GPU 层耗时） | 开始 ' +
+        fm(layer.start) + ' ms | 结束 ' + fm(layer.end) + ' ms | 区间 ' + fm(layer.end - layer.start) +
+        ' ms | 专家阶段 ' + fm(layer.expertStart) + ' - ' + fm(layer.expertEnd) + ' ms'; return;
+    }
+    const gpuLayer = y >= 237 && y <= 277 && (view.p.gpuLayers || []).find(l => l.start <= at && at <= l.end);
+    if (gpuLayer) {
+      const methods = { 'isolated-HC-end': '单独 HC 终点', 'isolated-HC-median': '单独 HC 中位耗时拆分', 'half-HC-fallback': '无参考，HC 中点回退' };
+      document.getElementById('hover').textContent = 'L' + gpuLayer.layer + ' · ' + gpuLayer.kind + ' · GPU 层估算（非精确测量） | ' +
+        fm(gpuLayer.start) + ' - ' + fm(gpuLayer.end) + ' ms | 区间 ' + fm(gpuLayer.end - gpuLayer.start) +
+        ' ms（含等待/空隙） | 起点定位范围 ' + gpuLayer.startBounds.map(fm).join(' - ') + ' ms | 终点定位范围 ' +
+        gpuLayer.endBounds.map(fm).join(' - ') + ' ms | ' + methods[gpuLayer.method] + ' | 锚点 submit ' + gpuLayer.boundarySubmit; return;
+    }
+    const interval = view.p.rows[row]?.find(([a, b]) => a <= at && at < b);
+    document.getElementById('hover').textContent = interval ? labels[interval[2]] + ' | ' + fm(interval[0]) + ' - ' + fm(interval[1]) +
+      ' ms | ' + fm(interval[1] - interval[0]) + ' ms · ' + descriptions[labels[interval[2]]] : '时间 ' + fm(at) + ' ms';
+  }
+  timeline.addEventListener('wheel', event => {
+    const { x, y } = coordinates(event); if (!inPlot(x, y)) return;
+    event.preventDefault();
+    const delta = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 450 : 1);
+    const fraction = (x - view.left) / (view.width - view.left - view.right), anchor = viewport.start + fraction * viewport.span;
+    viewport.span *= Math.exp(Math.max(-1200, Math.min(1200, delta)) * 0.0025);
+    clampViewport(view.p); viewport.start = anchor - fraction * viewport.span; draw(); hover(event);
+  }, { passive: false });
+  timeline.addEventListener('pointerdown', event => {
+    const { x, y } = coordinates(event); if (event.button !== 0 || !inPlot(x, y)) return;
+    event.preventDefault(); drag = { id: event.pointerId, x, start: viewport.start, scale: view.scale };
+    timeline.setPointerCapture(event.pointerId); timeline.classList.add('dragging');
+  });
+  timeline.addEventListener('pointermove', event => {
+    const { x, y } = coordinates(event);
+    if (drag && drag.id === event.pointerId) { viewport.start = drag.start - (x - drag.x) / drag.scale; draw(); }
+    timeline.style.cursor = drag ? 'grabbing' : inPlot(x, y) ? 'grab' : 'default'; hover(event);
+  });
+  function endDrag(event) {
+    if (!drag || drag.id !== event.pointerId) return;
+    if (timeline.hasPointerCapture(event.pointerId)) timeline.releasePointerCapture(event.pointerId);
+    drag = null; timeline.classList.remove('dragging'); timeline.style.cursor = 'default';
+  }
+  timeline.addEventListener('pointerup', endDrag);
+  timeline.addEventListener('pointercancel', endDrag);
+  timeline.addEventListener('lostpointercapture', endDrag);
+  cs.onchange = choose; ss.onchange = reset; document.getElementById('reset').onclick = reset;
+  window.onresize = draw; choose();
+  return { choose, draw, reset, getViewport: () => ({ ...viewport }),
+    getLayers: () => view.p.layers || [],
+    getGpuLayers: () => view.p.gpuLayers || [],
+    summaries: data.map(c => ({ representative: c.representative, depth: c.depth, count: c.count, capturedSteps: c.capturedSteps })) };
+})();
+</script>
+</html>

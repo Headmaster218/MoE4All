@@ -54,7 +54,7 @@ class PackageTests(unittest.TestCase):
     def test_rejects_corrupt_manifest_unlisted_file_and_wrong_version(self):
         _, stage = self.stage("0.10.0")
         with self.assertRaises(ValueError):
-            release.validate_package(stage, "0.11.0")
+            release.validate_package(stage, "1.0.0")
         (stage / "infr").write_bytes(b"corrupt")
         with self.assertRaises(ValueError):
             release.validate_package(stage, "0.10.0")
@@ -108,13 +108,13 @@ class PackageTests(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "symlink creation requires Windows privileges")
     def test_update_rejects_symlinked_install_directory(self):
         _, installed = self.stage("0.10.0")
-        _, stage = self.stage("0.11.0")
+        _, stage = self.stage("1.0.0")
         outside = self.root / "outside"
         os.rename(installed / "documentation", outside)
         (installed / "documentation").symlink_to(outside, target_is_directory=True)
         with mock.patch.object(release, "engine_running", return_value=False):
             with self.assertRaises(ValueError):
-                release.apply_update(installed, stage, "0.11.0")
+                release.apply_update(installed, stage, "1.0.0")
 
     def test_fetch_rejects_untrusted_asset_urls(self):
         with self.assertRaises(ValueError):
@@ -122,8 +122,8 @@ class PackageTests(unittest.TestCase):
 
     def test_download_checksum_failure_never_replaces_files(self):
         _, installed = self.stage("0.10.0")
-        name = release.package_name("0.11.0") + ".tar.gz"
-        chosen = {"version": "0.11.0", "name": name, "checksum": "checksum-url", "archive": "archive-url"}
+        name = release.package_name("1.0.0") + ".tar.gz"
+        chosen = {"version": "1.0.0", "name": name, "checksum": "checksum-url", "archive": "archive-url"}
 
         def fetch_fixture(url, output, maximum):
             output.write_bytes(("0" * 64 + "  " + name + "\n").encode() if url == "checksum-url" else b"corrupt archive")
@@ -137,29 +137,29 @@ class PackageTests(unittest.TestCase):
 
     def test_update_preserves_user_data_and_checks_version(self):
         _, installed = self.stage("0.10.0")
-        _, stage = self.stage("0.11.0")
+        _, stage = self.stage("1.0.0")
         (installed / "infr.toml").write_text("private-config")
         (installed / "kv-sessions").mkdir()
         (installed / "kv-sessions/a.infrkv").write_bytes(b"cache")
-        with mock.patch.object(release, "engine_running", return_value=False), mock.patch("subprocess.check_output", return_value="infr 0.11.0\n"):
-            release.apply_update(installed, stage, "0.11.0")
-        self.assertEqual(json.loads((installed / "install-manifest.json").read_text())["version"], "0.11.0")
+        with mock.patch.object(release, "engine_running", return_value=False), mock.patch("subprocess.check_output", return_value="infr 1.0.0\n"):
+            release.apply_update(installed, stage, "1.0.0")
+        self.assertEqual(json.loads((installed / "install-manifest.json").read_text())["version"], "1.0.0")
         self.assertEqual((installed / "infr.toml").read_text(), "private-config")
         self.assertEqual((installed / "kv-sessions/a.infrkv").read_bytes(), b"cache")
 
     def test_update_rolls_back_if_executable_validation_fails(self):
         _, installed = self.stage("0.10.0")
-        _, stage = self.stage("0.11.0")
+        _, stage = self.stage("1.0.0")
         before = {p.relative_to(installed): p.read_bytes() for p in installed.rglob("*") if p.is_file()}
         with mock.patch.object(release, "engine_running", return_value=False), mock.patch("subprocess.check_output", side_effect=OSError("loader failed")):
             with self.assertRaises(OSError):
-                release.apply_update(installed, stage, "0.11.0")
+                release.apply_update(installed, stage, "1.0.0")
         after = {p.relative_to(installed): p.read_bytes() for p in installed.rglob("*") if p.is_file()}
         self.assertEqual(before, after)
 
     def test_update_rolls_back_a_mid_replace_failure(self):
         _, installed = self.stage("0.10.0")
-        _, stage = self.stage("0.11.0")
+        _, stage = self.stage("1.0.0")
         before = {p.relative_to(installed): p.read_bytes() for p in installed.rglob("*") if p.is_file()}
         replace = os.replace
         calls = [0]
@@ -172,20 +172,20 @@ class PackageTests(unittest.TestCase):
 
         with mock.patch.object(release, "engine_running", return_value=False), mock.patch("os.replace", side_effect=fail_once):
             with self.assertRaises(OSError):
-                release.apply_update(installed, stage, "0.11.0")
+                release.apply_update(installed, stage, "1.0.0")
         self.assertEqual(before, {p.relative_to(installed): p.read_bytes() for p in installed.rglob("*") if p.is_file()})
 
     def test_running_engine_source_checkout_and_downgrade_are_rejected(self):
         _, installed = self.stage("0.10.0")
-        _, stage = self.stage("0.11.0")
+        _, stage = self.stage("1.0.0")
         with mock.patch.object(release, "engine_running", return_value=True):
             with self.assertRaises(ValueError):
-                release.apply_update(installed, stage, "0.11.0")
+                release.apply_update(installed, stage, "1.0.0")
         with self.assertRaises(ValueError):
             release.apply_update(installed, stage, "0.10.0")
         (installed / ".git").mkdir()
         with self.assertRaises(ValueError):
-            release.apply_update(installed, stage, "0.11.0")
+            release.apply_update(installed, stage, "1.0.0")
 
     def test_release_selection_checks_tags_prereleases_assets_and_numeric_order(self):
         releases = [{"tag_name": tag, "prerelease": pre, "assets": []} for tag, pre in [("release-0.9.0", False), ("release-0.10.0", False), ("agent-99.0.0", False), ("release-1.0.0", True)]]

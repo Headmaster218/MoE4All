@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ash::vk;
 use infr_core::timeline::{self, Context, DeviceEvent};
@@ -80,7 +80,7 @@ pub(crate) struct Query {
     pub(crate) id: u64,
     ctx: Context,
     queue: &'static str,
-    labels: Vec<&'static str>,
+    labels: Vec<(&'static str, Context)>,
     host_submit_ns: u64,
     period: f32,
     bits: u32,
@@ -97,6 +97,9 @@ impl Query {
         queue: &'static str,
         bits: u32,
     ) -> crate::Result<Option<Self>> {
+        if !timeline::device_enabled() {
+            return Ok(None);
+        }
         let Some(ctx) = timeline::context() else {
             return Ok(None);
         };
@@ -148,7 +151,13 @@ impl Query {
     }
 
     pub(crate) fn mark(&mut self, name: &'static str) {
-        if self.queue != "main" || self.labels.last() == Some(&name) {
+        let name = timeline::device_phase().unwrap_or(name);
+        let ctx = timeline::context().unwrap_or(self.ctx);
+        if self.queue != "main"
+            || self.labels.last().is_some_and(|&(label, previous)| {
+                label == name && previous.layer == ctx.layer && previous.step == ctx.step
+            })
+        {
             return;
         }
         let _span = timeline::span("trace_marker_encode");
@@ -163,7 +172,7 @@ impl Query {
                 self.labels.len() as u32 + 1,
             );
         }
-        self.labels.push(name);
+        self.labels.push((name, ctx));
     }
 
     pub(crate) fn close(&mut self, dispatches: usize, wait: u64, signal: u64, bytes: u64) {
@@ -205,9 +214,10 @@ impl Query {
                     },
                     ticks[0],
                     *ticks.last().unwrap(),
+                    self.ctx,
                 );
-                for (index, label) in self.labels.iter().enumerate() {
-                    self.event(label, ticks[index + 1], ticks[index + 2]);
+                for (index, &(label, ctx)) in self.labels.iter().enumerate() {
+                    self.event(label, ticks[index + 1], ticks[index + 2], ctx);
                 }
                 self.pools.lock().unwrap().push(self.pool);
                 self.pool = vk::QueryPool::null();
@@ -216,11 +226,11 @@ impl Query {
         }
     }
 
-    fn event(&self, name: &'static str, start: u64, end: u64) {
+    fn event(&self, name: &'static str, start: u64, end: u64, context: Context) {
         timeline::record_device(DeviceEvent {
             name,
             queue: self.queue,
-            context: self.ctx,
+            context,
             submit: self.id,
             host_submit_ns: self.host_submit_ns,
             start_tick: start,
@@ -246,17 +256,82 @@ impl Drop for Query {
 }
 
 pub(crate) fn group(kernel: &'static str) -> &'static str {
-    if kernel.contains("qsa") {
+    if *RAW_ALL_KERNELS.get_or_init(|| std::env::var_os("INFR_TIMELINE_RAW_KERNELS").is_some()) {
+        kernel
+    } else if kernel.contains("qsa") || kernel.contains("attention") || kernel.contains("attn") {
         "QSA_completion_interval"
     } else if kernel.contains("hc_") {
         "HC_completion_interval"
     } else if kernel.contains("deltanet") || kernel.contains("conv1d") {
         "GDN_completion_interval"
-    } else if kernel.contains("mmv_id") || kernel.contains("moe") {
-        "MoE_completion_interval"
-    } else if kernel.contains("mmv") || kernel.contains("gemv") || kernel.contains("quant") {
-        "matrix_completion_interval"
+    } else if kernel.contains("expert_")
+        || kernel.contains("mmv_id")
+        || kernel.contains("native_idm")
+        || kernel.contains("ple_gate")
+        || kernel.contains("moe")
+    {
+        "Expert_completion_interval"
+    } else if kernel.contains("mmv")
+        || kernel.contains("gemv")
+        || kernel.contains("gemm")
+        || kernel.contains("linear")
+        || kernel.contains("lin_")
+        || kernel.contains("mrow")
+    {
+        "Projection_completion_interval"
+    } else if kernel.contains("norm") || kernel.contains("rope") {
+        "NormRope_completion_interval"
+    } else if kernel.contains("silu")
+        || kernel.contains("sigmoid")
+        || kernel.contains("gated")
+        || kernel == "add"
+        || kernel == "mul"
+    {
+        "Elementwise_completion_interval"
+    } else if kernel.contains("store")
+        || kernel.contains("copy")
+        || kernel.contains("gather")
+        || kernel.contains("scatter")
+        || kernel.contains("quant")
+        || kernel.contains("zero")
+    {
+        "Data_completion_interval"
+    } else if *RAW_UNKNOWN_KERNELS
+        .get_or_init(|| std::env::var_os("INFR_TIMELINE_RAW_UNKNOWN").is_some())
+    {
+        kernel
     } else {
         "other_completion_interval"
+    }
+}
+
+static RAW_ALL_KERNELS: OnceLock<bool> = OnceLock::new();
+static RAW_UNKNOWN_KERNELS: OnceLock<bool> = OnceLock::new();
+
+#[cfg(test)]
+mod tests {
+    use super::group;
+
+    #[test]
+    fn prefill_timeline_groups_flashnext_kernels_by_work() {
+        assert_eq!(group("expert_gateup"), "Expert_completion_interval");
+        assert_eq!(group("expert_down"), "Expert_completion_interval");
+        assert_eq!(group("mmv_id_q4_k"), "Expert_completion_interval");
+        assert_eq!(
+            group("native_idm_iq2s_nr4_paged"),
+            "Expert_completion_interval"
+        );
+        assert_eq!(
+            group("native_gemm_warp_q8_0_n128_ag"),
+            "Projection_completion_interval"
+        );
+        assert_eq!(group("native_mrow_q8_0"), "Projection_completion_interval");
+        assert_eq!(group("qk_norm_rope_bda"), "NormRope_completion_interval");
+        assert_eq!(group("silu_mul"), "Elementwise_completion_interval");
+        assert_eq!(group("store_q8_seg"), "Data_completion_interval");
+        assert_eq!(group("qsa_indexer_topk"), "QSA_completion_interval");
+        assert_eq!(group("attention_q8"), "QSA_completion_interval");
+        assert_eq!(group("deltanet_seq"), "GDN_completion_interval");
+        assert_eq!(group("qwen_hc_mix"), "HC_completion_interval");
     }
 }

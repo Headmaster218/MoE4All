@@ -19,7 +19,7 @@ use super::{
 use crate::seam::TokenEmbd;
 use crate::{Config, EngineConfig, GenStats, PerLayerEmbd};
 use anyhow::{anyhow, Context, Result as AResult};
-use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage};
+use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Plan};
 use infr_core::graph::{
     Activation, AttnMask, Dsv4CacheFormat, Graph, HyperGates, MoePrefetchHint, Op, SequenceSpan,
 };
@@ -302,6 +302,84 @@ fn lm_head_sampling_input(
         n: (logits_rows * dim) as u32,
     });
     suffix
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResidentFullGraphModel {
+    /// The model has no host-produced data between L0 and L1, so Decode can enter the resident
+    /// backend as one uninterrupted graph at every context length.
+    NoHostInterlock,
+    /// FlashNext can also run as one graph, but its PLE overlap makes the automatic choice
+    /// context-sensitive. Keep its existing short-context policy unchanged.
+    FlashNextPle,
+}
+
+fn resident_full_graph_model(c: &Config) -> Option<ResidentFullGraphModel> {
+    let moe = c.moe.as_ref()?;
+    if c.n_layer <= 1 {
+        return None;
+    }
+    if !c.qwen4exp {
+        Some(ResidentFullGraphModel::NoHostInterlock)
+    } else if c.qwen4exp
+        && c.n_layer > 1
+        && c.n_embd == 2560
+        && c.hc_mult == 4
+        && moe.n_expert == 512
+        && moe.n_used == 10
+        && moe.n_ff_exp == 640
+    {
+        Some(ResidentFullGraphModel::FlashNextPle)
+    } else {
+        None
+    }
+}
+
+fn resident_auto_submit_layers(
+    c: &Config,
+    full_graph: bool,
+    context_tokens: usize,
+    lanes: usize,
+) -> usize {
+    match resident_full_graph_model(c) {
+        // Matched A/B favored two-layer lookahead for a single Qwen35 lane, while two active
+        // lanes were neutral-to-negative. Full-graph execution remains enabled for both.
+        Some(ResidentFullGraphModel::NoHostInterlock) if c.qwen35 && full_graph && lanes == 1 => 2,
+        Some(ResidentFullGraphModel::FlashNextPle) if context_tokens > 96 * 1024 => 2,
+        _ => 1,
+    }
+}
+
+fn resident_full_graph_decode(
+    c: &Config,
+    ec: &EngineConfig,
+    backend: &str,
+    lanes: usize,
+    sample_from: usize,
+    capture_hidden: bool,
+    multimodal: bool,
+    context_tokens: usize,
+) -> bool {
+    let Some(model) = resident_full_graph_model(c) else {
+        return false;
+    };
+    let automatic = match model {
+        ResidentFullGraphModel::NoHostInterlock => true,
+        ResidentFullGraphModel::FlashNextPle => context_tokens <= 96 * 1024,
+    };
+    ec.kernels
+        .vulkan
+        .decode_gpu_resident_full_graph
+        .unwrap_or(automatic)
+        && ec.kernels.vulkan.decode_gpu_resident
+        && backend == "vulkan"
+        && (1..=infr_vulkan::GPU_RESIDENT_MAX_ROWS).contains(&lanes)
+        && sample_from == 0
+        && !capture_hidden
+        && !multimodal
+        && !ec.spec.mtp
+        && !ec.paging.expert_prefetch
+        && ec.kernels.vulkan.cpu_miss_threads == 0
 }
 
 fn sampling_suffix_start(positions: &[usize], prompt_ends: &[usize]) -> AResult<usize> {
@@ -745,7 +823,7 @@ fn bind_parallel_layer_io<'a>(
     primary_wide: &'a Option<Box<dyn Buffer>>,
     primary_ple_embd: &'a Option<Box<dyn Buffer>>,
     primary_ple_state: &'a Option<Box<dyn Buffer>>,
-    wide: &'a dyn Buffer,
+    wide: Option<&'a dyn Buffer>,
     ple_embd: Option<&'a dyn Buffer>,
     peers: &'a [SeamKv],
     lane_indices: Option<&[usize]>,
@@ -767,8 +845,8 @@ fn bind_parallel_layer_io<'a>(
         primary_ple_embd,
         primary_ple_state,
     );
-    if let Some(id) = h.qwen_wide {
-        b.bind(id, wide);
+    if let (Some(id), Some(buf)) = (h.qwen_wide, wide) {
+        b.bind(id, buf);
     }
     if let (Some(id), Some(buf)) = (h.ple_embd, ple_embd) {
         b.bind(id, buf);
@@ -1581,6 +1659,54 @@ pub(crate) fn generate_dense_backend(
     )
 }
 
+/// Continue one scheduler-prepared prompt through the ordinary chunked Prefill path. The prepared
+/// start and checkpoint boundaries must be preserved: preparing twice would discard a restored
+/// recurrent checkpoint, while dropping them would lose the next reusable turn checkpoints.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_dense_backend_prepared_prefill(
+    be: &dyn Backend,
+    bind_weight: &BindWeight,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    state: &mut Option<SeamKv>,
+    want_ctx: usize,
+    prepared: PreparedParallelPrompt,
+) -> AResult<(Vec<u32>, GenStats)> {
+    generate_dense_backend_inner(
+        be,
+        bind_weight,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        ple,
+        prompt,
+        0,
+        |_| {},
+        state,
+        want_ctx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(prepared),
+        None,
+    )
+}
+
 /// Prime Qwen3.8 through the ordinary chunked-Prefill path while streaming each completed target
 /// hidden chunk directly to the detached MTP head. Only the frontier logits are returned; hidden
 /// rows stay on the device and are consumed synchronously by `sink`.
@@ -1632,8 +1758,8 @@ pub(crate) fn generate_dense_backend_mtp_prime(
     )
 }
 
-/// Decode Qwen3.8 slots in one layer-synchronous graph while retaining independent positions,
-/// KV, QSA, PLE and sampler state for every row.
+/// Decode supported Qwen hybrid slots in one layer-synchronous graph while retaining independent
+/// positions, recurrent/KV state and sampler state for every row. QSA and PLE remain Qwen3.8-only.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_dense_backend_parallel_sampled(
     be: &dyn Backend,
@@ -3369,9 +3495,9 @@ fn generate_dense_backend_inner(
     // linear text positions, so fill them once now instead of mutating another persistent cache on
     // every decode step. Text-only calls allocate nothing.
     let (mrope_history_buf, mrope_positions) = if let Some(plan) = mm {
-        if !c.qwen4exp {
+        if !(c.qwen4exp || c.qwen35) {
             return Err(anyhow!(
-                "multimodal RoPE is currently supported only by qwen4exp"
+                "multimodal RoPE is currently supported only by qwen4exp and qwen35"
             ));
         }
         let plan_prompt_len = plan.prompt_pos4.len() / 4;
@@ -3387,7 +3513,7 @@ fn generate_dense_backend_inner(
             ));
         }
         if c.rope_sections.iter().sum::<u32>() == 0 {
-            return Err(anyhow!("qwen4exp multimodal RoPE sections are empty"));
+            return Err(anyhow!("Qwen multimodal RoPE sections are empty"));
         }
         let mut previous_end = 0usize;
         for (index, span) in plan.spans.iter().enumerate() {
@@ -3805,6 +3931,21 @@ fn generate_dense_backend_inner(
         let mut g = Graph::new();
         g.mtp_verify = mtp_verify;
         g.independent_rows = independent_rows;
+        if !mtp_verify && !denoise && logits_rows > 0 && batch <= 2 {
+            let no_interlock_full_graph = use_ids
+                && l_first == 0
+                && l_end == c.n_layer
+                && matches!(
+                    resident_full_graph_model(c),
+                    Some(ResidentFullGraphModel::NoHostInterlock)
+                );
+            g.resident_submit_layers = Some(resident_auto_submit_layers(
+                c,
+                no_interlock_full_graph,
+                start_pos + batch,
+                batch,
+            ));
+        }
         if independent_rows {
             g.sequence_spans = independent_spans.map_or_else(
                 || {
@@ -7978,7 +8119,15 @@ fn generate_dense_backend_inner(
             if crate::sampling::abort_requested(req) {
                 break;
             }
+            let timeline_positions = prefill_lanes
+                .iter()
+                .map(|&lane| cursors[lane])
+                .collect::<Vec<_>>();
+            let _timeline_prefill_chunk = infr_core::timeline::begin_step(&timeline_positions);
+            let timeline_gate_wait = infr_core::timeline::span("prefill_gate_wait");
             let _gp = req.and_then(|request| request.gate_pass());
+            drop(timeline_gate_wait);
+            let timeline_plan = infr_core::timeline::span("prefill_plan");
             // Prefill may borrow every uncommitted future KV segment. Materialize the selected
             // slot's complete prompt depth before its first chunk so the ring is built around the
             // exact live footprint. Other slots remain at their current committed depth until the
@@ -8098,7 +8247,9 @@ fn generate_dense_backend_inner(
                     parallel.peers[lane - 1].ensure_segmented_depth(be, c, range.end)?;
                 }
             }
+            drop(timeline_plan);
 
+            let timeline_materialize = infr_core::timeline::span("prefill_materialize");
             let mut ids = Vec::with_capacity(batch);
             let mut positions = Vec::with_capacity(batch);
             let worker = ple_worker
@@ -8139,7 +8290,9 @@ fn generate_dense_backend_inner(
                 .map_err(|error| anyhow!("{error}"))?;
             be.upload(pos_batch.as_ref(), bytemuck::cast_slice(&positions))
                 .map_err(|error| anyhow!("{error}"))?;
+            drop(timeline_materialize);
 
+            let timeline_l0_build = infr_core::timeline::span("prefill_l0_build");
             let (mut g0, h0) = build(
                 batch,
                 ranges[0].start,
@@ -8158,7 +8311,11 @@ fn generate_dense_backend_inner(
             );
             g0.prefill_target_tokens = Some(prefill_target);
             g0.prefill_runtime_reserve_bytes = prefill_runtime_reserve;
+            drop(timeline_l0_build);
+            let timeline_l0_compile = infr_core::timeline::span("prefill_l0_compile");
             let plan0 = be.compile(&g0).map_err(|error| anyhow!("{error}"))?;
+            drop(timeline_l0_compile);
+            let timeline_l0_bind = infr_core::timeline::span("prefill_l0_bind");
             let mut bindings0 = Bindings::new();
             bindings0.bind(
                 h0.tok_ids.expect("GPU embedding needs token ids"),
@@ -8182,15 +8339,19 @@ fn generate_dense_backend_inner(
                 qwen_wide_buf,
                 ple_embd_buf,
                 ple_state_buf,
-                wide_batch.as_ref(),
+                Some(wide_batch.as_ref()),
                 None,
                 &*parallel.peers,
                 Some(&batch_lanes),
                 independent_rows,
             );
+            drop(timeline_l0_bind);
+            let timeline_l0_execute = infr_core::timeline::span("prefill_l0_execute");
             be.execute(plan0.as_ref(), &bindings0)
                 .map_err(|error| anyhow!("{error}"))?;
+            drop(timeline_l0_execute);
 
+            let timeline_ple_wait = infr_core::timeline::span("prefill_ple_wait");
             let mut ple_rows = Vec::with_capacity(batch * ple_row);
             for (ticket, range) in tickets.into_iter().zip(&ranges) {
                 let rows = ticket.wait()?;
@@ -8203,9 +8364,13 @@ fn generate_dense_backend_inner(
                 }
                 ple_rows.extend_from_slice(rows.as_slice());
             }
+            drop(timeline_ple_wait);
+            let timeline_ple_upload = infr_core::timeline::span("prefill_ple_upload");
             be.upload(ple_batch.as_ref(), bytemuck::cast_slice(&ple_rows))
                 .map_err(|error| anyhow!("{error}"))?;
+            drop(timeline_ple_upload);
 
+            let timeline_main_build = infr_core::timeline::span("prefill_main_build");
             let (mut g1, h1) = build(
                 batch,
                 ranges[0].start,
@@ -8225,7 +8390,11 @@ fn generate_dense_backend_inner(
             g1.prefill_next_chunk = prefill_next_chunk;
             g1.prefill_target_tokens = Some(prefill_target);
             g1.prefill_runtime_reserve_bytes = prefill_runtime_reserve;
+            drop(timeline_main_build);
+            let timeline_main_compile = infr_core::timeline::span("prefill_main_compile");
             let plan1 = be.compile(&g1).map_err(|error| anyhow!("{error}"))?;
+            drop(timeline_main_compile);
+            let timeline_main_bind = infr_core::timeline::span("prefill_main_bind");
             let mut bindings1 = Bindings::new();
             bindings1.bind(h1.hidden, hidden_batch.as_ref());
             bindings1.bind(h1.positions, pos_batch.as_ref());
@@ -8245,15 +8414,19 @@ fn generate_dense_backend_inner(
                 qwen_wide_buf,
                 ple_embd_buf,
                 ple_state_buf,
-                wide_batch.as_ref(),
+                Some(wide_batch.as_ref()),
                 Some(ple_batch.as_ref()),
                 &*parallel.peers,
                 Some(&batch_lanes),
                 independent_rows,
             );
+            drop(timeline_main_bind);
+            let timeline_main_execute = infr_core::timeline::span("prefill_main_execute");
             be.execute(plan1.as_ref(), &bindings1)
                 .map_err(|error| anyhow!("{error}"))?;
+            drop(timeline_main_execute);
 
+            let timeline_tail = infr_core::timeline::span("prefill_tail");
             for (&lane, range) in prefill_lanes.iter().zip(&prefill_ranges) {
                 cursors[lane] = range.end;
                 for (index, boundary) in prepared[lane].checkpoint_boundaries.iter().enumerate() {
@@ -8299,6 +8472,7 @@ fn generate_dense_backend_inner(
                     }
                 }
             }
+            drop(timeline_tail);
         }
 
         let elapsed = t0.elapsed().as_secs_f64();
@@ -8905,7 +9079,7 @@ fn generate_dense_backend_inner(
             qwen_wide_buf,
             ple_embd_buf,
             ple_state_buf,
-            fixed.wide.as_ref(),
+            Some(fixed.wide.as_ref()),
             None,
             &*parallel.peers,
             None,
@@ -8967,7 +9141,7 @@ fn generate_dense_backend_inner(
             qwen_wide_buf,
             ple_embd_buf,
             ple_state_buf,
-            fixed.wide.as_ref(),
+            Some(fixed.wide.as_ref()),
             Some(fixed.ple.as_ref()),
             &*parallel.peers,
             None,
@@ -9592,8 +9766,10 @@ fn generate_dense_backend_inner(
 
     // ── drive ───────────────────────────────────────────────────────────────────────
     if let Some(parallel) = parallel_decode {
-        if !c.qwen4exp {
-            return Err(anyhow!("parallel decode currently supports qwen4exp only"));
+        if !c.supports_parallel_token_rows() {
+            return Err(anyhow!(
+                "parallel decode does not support this model's persistent row state"
+            ));
         }
         if !gpu_embed {
             return Err(anyhow!("parallel decode requires Vulkan GPU embedding"));
@@ -9690,8 +9866,12 @@ fn generate_dense_backend_inner(
         let profile_layers_before =
             profile_cohort.then(infr_core::pager_profile::paged_moe_layer_snapshot);
         let profile_once_t0 = profile_cohort.then(std::time::Instant::now);
-        let ple_heads = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram;
-        let ple_row = ple_heads * c.ple_head_dim;
+        let ple_row = c.qwen4exp.then(|| {
+            c.ple_ngram_size
+                .saturating_sub(1)
+                .saturating_mul(c.ple_heads_per_ngram)
+                .saturating_mul(c.ple_head_dim)
+        });
         let peer_mrope_history_bufs = if has_multimodal_lane {
             let _gp = req.and_then(|request| request.gate_pass());
             let mut buffers = Vec::with_capacity(lanes.saturating_sub(1));
@@ -9733,9 +9913,13 @@ fn generate_dense_backend_inner(
                     .map_err(|e| anyhow!("{e}"))?,
                 be.alloc(lanes * 4, BufferUsage::Staging)
                     .map_err(|e| anyhow!("{e}"))?,
-                be.alloc_uninit(lanes * c.hc_mult * ne * 4, BufferUsage::Activations)
+                c.qwen4exp
+                    .then(|| be.alloc_uninit(lanes * c.hc_mult * ne * 4, BufferUsage::Activations))
+                    .transpose()
                     .map_err(|e| anyhow!("{e}"))?,
-                be.alloc(lanes * ple_row * 4, BufferUsage::Staging)
+                ple_row
+                    .map(|row| be.alloc(lanes * row * 4, BufferUsage::Staging))
+                    .transpose()
                     .map_err(|e| anyhow!("{e}"))?,
             )
         };
@@ -9768,6 +9952,117 @@ fn generate_dense_backend_inner(
         let mut profile_steps = 0usize;
         let mut profile_decode_rows = 0usize;
         let mut profile_prefill_rows = 0usize;
+        let prompt_ends_for_plans = parallel.prompt_ends.to_vec();
+        struct PreparedParallelDecodePlans {
+            first: Option<(Box<dyn Plan>, DecodeHandles)>,
+            main: (Box<dyn Plan>, DecodeHandles),
+            logits_rows: usize,
+            batch_argmax: bool,
+            batch_gpu_sample: bool,
+            full_graph: bool,
+        }
+        let argmax_capable = parallel
+            .samplers
+            .iter()
+            .map(crate::sampling::ParallelSampler::can_gpu_argmax)
+            .collect::<Vec<_>>();
+        let gpu_sample_capable = parallel
+            .samplers
+            .iter()
+            .map(|lane| lane.can_gpu_sample_with(sampler))
+            .collect::<Vec<_>>();
+        let prepare_decode_plans = |plan_step: usize| -> AResult<PreparedParallelDecodePlans> {
+            let plan_positions = lane_starts
+                .iter()
+                .map(|&lane_start| lane_start + plan_step)
+                .collect::<Vec<_>>();
+            let plan_sample_from = sampling_suffix_start(&plan_positions, &prompt_ends_for_plans)?;
+            let plan_logits_rows = lanes - plan_sample_from;
+            let plan_batch_argmax = plan_logits_rows > 0
+                && caps.argmax_rows
+                && ec.spec.gpu_argmax
+                && argmax_capable[plan_sample_from..]
+                    .iter()
+                    .all(|&value| value);
+            let plan_batch_gpu_sample = plan_logits_rows > 0
+                && (plan_logits_rows == 1 || caps.sample_rows)
+                && caps.gpu_sample
+                && ec.spec.gpu_sample
+                && (2..=infr_vulkan::Recorder::SAMPLE_KMAX).contains(&sampler.top_k)
+                && gpu_sample_capable[plan_sample_from..]
+                    .iter()
+                    .all(|&value| value);
+            let plan_full_graph = resident_full_graph_decode(
+                c,
+                ec,
+                be.name(),
+                lanes,
+                plan_sample_from,
+                capture_hidden,
+                has_multimodal_lane,
+                plan_positions.iter().copied().max().unwrap_or(0) + 1,
+            );
+            let plan_spans = independent_rows.then(|| {
+                plan_positions
+                    .iter()
+                    .enumerate()
+                    .map(|(row, &position)| SequenceSpan {
+                        row_start: row as u32,
+                        rows: 1,
+                        start_pos: position as u32,
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let first = if plan_full_graph {
+                None
+            } else {
+                let (g0, h0) = build(
+                    lanes,
+                    plan_positions[0],
+                    0,
+                    false,
+                    None,
+                    false,
+                    false,
+                    false,
+                    false,
+                    true,
+                    false,
+                    independent_rows,
+                    plan_spans.as_deref(),
+                    Some(0..1),
+                );
+                let plan0 = be.compile(&g0).map_err(|e| anyhow!("{e}"))?;
+                Some((plan0, h0))
+            };
+            let (g1, h1) = build(
+                lanes,
+                plan_positions[0],
+                plan_logits_rows,
+                false,
+                None,
+                false,
+                capture_hidden,
+                plan_batch_argmax,
+                plan_batch_gpu_sample,
+                plan_full_graph,
+                false,
+                independent_rows,
+                plan_spans.as_deref(),
+                Some(usize::from(!plan_full_graph)..c.n_layer),
+            );
+            let plan1 = be.compile(&g1).map_err(|e| anyhow!("{e}"))?;
+            Ok(PreparedParallelDecodePlans {
+                first,
+                main: (plan1, h1),
+                logits_rows: plan_logits_rows,
+                batch_argmax: plan_batch_argmax,
+                batch_gpu_sample: plan_batch_gpu_sample,
+                full_graph: plan_full_graph,
+            })
+        };
+        let mut prepared_decode_plans = Some(prepare_decode_plans(0)?);
+        let mut retired_decode_plans: Option<(Option<Box<dyn Plan>>, Box<dyn Plan>)> = None;
         for step in 0..max_new {
             let step_t0 = std::time::Instant::now();
             let profile_front_t0 = profile_cohort.then(std::time::Instant::now);
@@ -9798,6 +10093,17 @@ fn generate_dense_backend_inner(
                 && parallel.samplers[sample_from..]
                     .iter()
                     .all(|lane| lane.can_gpu_sample_with(sampler));
+            let mut current_plans = prepared_decode_plans
+                .take()
+                .ok_or_else(|| anyhow!("missing prepared Decode plans"))?;
+            if current_plans.logits_rows != logits_rows
+                || current_plans.batch_argmax != batch_argmax
+                || current_plans.batch_gpu_sample != batch_gpu_sample
+            {
+                return Err(anyhow!(
+                    "prepared Decode sampling shape changed unexpectedly"
+                ));
+            }
             ensure_kv_depth!(positions[0] + 1);
             for (peer, &position) in parallel.peers.iter_mut().zip(&positions[1..]) {
                 peer.ensure_segmented_depth(be, c, position + 1)?;
@@ -9817,127 +10123,126 @@ fn generate_dense_backend_inner(
             be.upload(pos_batch.as_ref(), bytemuck::cast_slice(&position_rows))
                 .map_err(|e| anyhow!("{e}"))?;
 
-            let worker = ple_worker
-                .as_ref()
-                .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?;
-            let ple_ticket = worker.submit_batch(
-                curs.iter()
-                    .zip(&positions)
-                    .map(|(tokens, &position)| (tokens.as_slice(), position)),
-                c.ple_ngram_size,
-            )?;
-            let sequence_spans = independent_rows.then(|| {
-                positions
-                    .iter()
-                    .enumerate()
-                    .map(|(row, &position)| SequenceSpan {
-                        row_start: row as u32,
-                        rows: 1,
-                        start_pos: position as u32,
-                    })
-                    .collect::<Vec<_>>()
-            });
-
-            let (g0, h0) = build(
+            let ple_ticket = if c.qwen4exp {
+                Some(
+                    ple_worker
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?
+                        .submit_batch(
+                            curs.iter()
+                                .zip(&positions)
+                                .map(|(tokens, &position)| (tokens.as_slice(), position)),
+                            c.ple_ngram_size,
+                        )?,
+                )
+            } else {
+                None
+            };
+            let full_graph = resident_full_graph_decode(
+                c,
+                ec,
+                be.name(),
                 lanes,
-                positions[0],
-                0,
-                false,
-                None,
-                false,
-                false,
-                false,
-                false,
-                true,
-                false,
-                independent_rows,
-                sequence_spans.as_deref(),
-                Some(0..1),
+                sample_from,
+                capture_hidden,
+                has_multimodal_lane,
+                positions.iter().copied().max().unwrap_or(0) + 1,
             );
-            let plan0 = be.compile(&g0).map_err(|e| anyhow!("{e}"))?;
-            let mut b0 = Bindings::new();
-            b0.bind(
-                h0.tok_ids.expect("GPU embedding needs ids"),
-                ids_buf.as_ref(),
-            );
-            b0.bind(h0.hidden, hidden_batch.as_ref());
-            b0.bind(h0.positions, pos_batch.as_ref());
-            bind_parallel_layer_io(
-                &mut b0,
-                &h0,
-                c.n_layer,
-                rf_buf,
-                yff_buf,
-                &kbufs[..],
-                &vbufs[..],
-                &qsa_kbufs[..],
-                &qsa_cbufs[..],
-                &mrope_history_buf,
-                peer_mrope_history_bufs.as_deref(),
-                &wbufs[..],
-                qwen_wide_buf,
-                ple_embd_buf,
-                ple_state_buf,
-                wide_batch.as_ref(),
-                None,
-                &*parallel.peers,
-                None,
-                independent_rows,
-            );
+            if current_plans.full_graph != full_graph {
+                return Err(anyhow!("prepared Decode graph mode changed unexpectedly"));
+            }
+            let mut first_layer = if full_graph {
+                if current_plans.first.is_some() {
+                    return Err(anyhow!(
+                        "prepared split Decode L0 plan for a full-graph step"
+                    ));
+                }
+                None
+            } else {
+                let (plan0, h0) = current_plans
+                    .first
+                    .take()
+                    .ok_or_else(|| anyhow!("missing prepared Decode L0 plan"))?;
+                let mut b0 = Bindings::new();
+                b0.bind(
+                    h0.tok_ids.expect("GPU embedding needs ids"),
+                    ids_buf.as_ref(),
+                );
+                b0.bind(h0.hidden, hidden_batch.as_ref());
+                b0.bind(h0.positions, pos_batch.as_ref());
+                bind_parallel_layer_io(
+                    &mut b0,
+                    &h0,
+                    c.n_layer,
+                    rf_buf,
+                    yff_buf,
+                    &kbufs[..],
+                    &vbufs[..],
+                    &qsa_kbufs[..],
+                    &qsa_cbufs[..],
+                    &mrope_history_buf,
+                    peer_mrope_history_bufs.as_deref(),
+                    &wbufs[..],
+                    qwen_wide_buf,
+                    ple_embd_buf,
+                    ple_state_buf,
+                    wide_batch.as_deref(),
+                    None,
+                    &*parallel.peers,
+                    None,
+                    independent_rows,
+                );
+                Some((plan0, b0))
+            };
             if let Some(t0) = profile_front_t0 {
                 profile_front += t0.elapsed();
             }
             drop(timeline_front);
-            let profile_layer0_t0 = profile_cohort.then(std::time::Instant::now);
-            be.execute(plan0.as_ref(), &b0)
-                .map_err(|e| anyhow!("{e}"))?;
-            if let Some(t0) = profile_layer0_t0 {
-                profile_layer0 += t0.elapsed();
+            let layer0_started = std::time::Instant::now();
+            if let Some((plan0, b0)) = first_layer.as_ref() {
+                be.execute(plan0.as_ref(), b0).map_err(|e| anyhow!("{e}"))?;
             }
+            if profile_cohort {
+                profile_layer0 += layer0_started.elapsed();
+            }
+            let (plan1, h1) = current_plans.main;
 
-            let profile_ple_wait_t0 = profile_cohort.then(std::time::Instant::now);
-            let timeline_ple_wait = infr_core::timeline::span("PLE_wait");
-            let ple_rows = ple_ticket.wait()?;
-            if let Some(t0) = profile_ple_wait_t0 {
-                profile_ple_wait += t0.elapsed();
-            }
-            drop(timeline_ple_wait);
-            let expected_ple_values = lanes * ple_row;
-            if ple_rows.len() != expected_ple_values {
-                return Err(anyhow!(
-                    "parallel PLE produced {} values, expected {expected_ple_values}",
-                    ple_rows.len()
-                ));
-            }
-            let profile_ple_upload_t0 = profile_cohort.then(std::time::Instant::now);
-            be.upload(
-                ple_batch.as_ref(),
-                bytemuck::cast_slice(ple_rows.as_slice()),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
-            if let Some(t0) = profile_ple_upload_t0 {
-                profile_ple_upload += t0.elapsed();
+            if let Some(ticket) = ple_ticket {
+                let profile_ple_wait_t0 = profile_cohort.then(std::time::Instant::now);
+                let timeline_ple_wait = infr_core::timeline::span("PLE_wait");
+                let ple_rows = ticket.wait()?;
+                if let Some(t0) = profile_ple_wait_t0 {
+                    profile_ple_wait += t0.elapsed();
+                }
+                drop(timeline_ple_wait);
+                let expected_ple_values = lanes * ple_row.expect("Qwen3.8 has a PLE row");
+                if ple_rows.len() != expected_ple_values {
+                    return Err(anyhow!(
+                        "parallel PLE produced {} values, expected {expected_ple_values}",
+                        ple_rows.len()
+                    ));
+                }
+                let profile_ple_upload_t0 = profile_cohort.then(std::time::Instant::now);
+                be.upload(
+                    ple_batch
+                        .as_deref()
+                        .expect("Qwen3.8 parallel Decode has a PLE buffer"),
+                    bytemuck::cast_slice(ple_rows.as_slice()),
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+                if let Some(t0) = profile_ple_upload_t0 {
+                    profile_ple_upload += t0.elapsed();
+                }
             }
 
             let profile_main_setup_t0 = profile_cohort.then(std::time::Instant::now);
-            let (g1, h1) = build(
-                lanes,
-                positions[0],
-                logits_rows,
-                false,
-                None,
-                false,
-                capture_hidden,
-                batch_argmax,
-                batch_gpu_sample,
-                false,
-                false,
-                independent_rows,
-                sequence_spans.as_deref(),
-                Some(1..c.n_layer),
-            );
-            let plan1 = be.compile(&g1).map_err(|e| anyhow!("{e}"))?;
             let mut b1 = Bindings::new();
+            if full_graph {
+                b1.bind(
+                    h1.tok_ids.expect("full Decode graph embeds token ids"),
+                    ids_buf.as_ref(),
+                );
+            }
             b1.bind(h1.hidden, hidden_batch.as_ref());
             b1.bind(h1.positions, pos_batch.as_ref());
             bind_parallel_layer_io(
@@ -9956,8 +10261,8 @@ fn generate_dense_backend_inner(
                 qwen_wide_buf,
                 ple_embd_buf,
                 ple_state_buf,
-                wide_batch.as_ref(),
-                Some(ple_batch.as_ref()),
+                wide_batch.as_deref(),
+                ple_batch.as_deref(),
                 &*parallel.peers,
                 None,
                 independent_rows,
@@ -9998,8 +10303,29 @@ fn generate_dense_backend_inner(
                 profile_main_setup += t0.elapsed();
             }
             let profile_main_execute_t0 = profile_cohort.then(std::time::Instant::now);
-            be.execute(plan1.as_ref(), &b1)
-                .map_err(|e| anyhow!("{e}"))?;
+            let retired_first = first_layer.take().map(|(plan, bindings)| {
+                drop(bindings);
+                plan
+            });
+            let previously_retired = retired_decode_plans.take();
+            let execute_trace_context = infr_core::timeline::context();
+            let (execute_result, next_plans_result) = rayon::join(
+                || {
+                    let _trace_context = infr_core::timeline::scoped_context(execute_trace_context);
+                    be.execute(plan1.as_ref(), &b1).map_err(|e| anyhow!("{e}"))
+                },
+                || {
+                    drop(previously_retired);
+                    if step + 1 < max_new {
+                        prepare_decode_plans(step + 1).map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                },
+            );
+            execute_result?;
+            prepared_decode_plans = next_plans_result?;
+            retired_decode_plans = Some((retired_first, plan1));
             if let Some(t0) = profile_main_execute_t0 {
                 profile_main_execute += t0.elapsed();
             }
@@ -10779,6 +11105,12 @@ fn generate_dense_backend_inner(
                         if crate::sampling::abort_requested(req) {
                             anyhow::bail!("aborted: shutdown requested");
                         }
+                        let _timeline_prefill_chunk = if materialize_only {
+                            None
+                        } else {
+                            infr_core::timeline::begin_step(&[cstart])
+                        };
+                        let timeline_ple_wait = infr_core::timeline::span("prefill_ple_wait");
                         let ple_rows = if c.qwen4exp && live[ci].is_none() {
                             let worker = ple_worker
                                 .as_ref()
@@ -10810,13 +11142,16 @@ fn generate_dense_backend_inner(
                         } else {
                             None
                         };
+                        drop(timeline_ple_wait);
                         // One dispatch = one turn on the GPU. Dropped at the end of the iteration, handing
                         // the baton to whichever sequence has been waiting longest.
+                        let timeline_gate_wait = infr_core::timeline::span("prefill_gate_wait");
                         let _gp = if materialize_only {
                             None
                         } else {
                             req.and_then(|r| r.gate_pass())
                         };
+                        drop(timeline_gate_wait);
                         ensure_kv_depth!(cend);
                         let pf_m = cend - cstart;
                         let chunk_has_image = mm.is_some_and(|plan| {
@@ -10825,6 +11160,7 @@ fn generate_dense_backend_inner(
                             })
                         });
                         let gpu_embed_chunk = gpu_embed && !chunk_has_image;
+                        let timeline_materialize = infr_core::timeline::span("prefill_materialize");
                         if live[ci].is_none() {
                             // GPU embed gather: upload the chunk's token IDS (4*pf_m bytes) — the graph's
                             // Op::EmbedGather dequantizes the rows on-device. Host-embed fallback keeps
@@ -10977,6 +11313,7 @@ fn generate_dense_backend_inner(
                                 ple_embd,
                             });
                         }
+                        drop(timeline_materialize);
                         // Claim every long-lived buffer in this group before the first execute lets
                         // the expert pager lay its asynchronous Prefill ring over the elastic arena.
                         // The buffers were already included in placement; this preserves a contiguous
@@ -10988,6 +11325,7 @@ fn generate_dense_backend_inner(
                             .as_ref()
                             .expect("the chunk's buffers were just materialized");
                         let pf_t0 = std::time::Instant::now();
+                        let timeline_build = infr_core::timeline::span("prefill_build");
                         // HEADLESS build (`logits_rows == 0`, task #27): nothing ever consumes a prefill
                         // chunk's logits — the decode loop below feeds the LAST prompt token itself and
                         // samples from its own fresh logits — so the LM-head tail (whole-chunk
@@ -11021,8 +11359,12 @@ fn generate_dense_backend_inner(
                         pf_g.prefill_target_tokens = Some(prompt.len());
                         pf_g.prefill_runtime_reserve_bytes = prefill_runtime_reserve;
                         let t_build = pf_t0.elapsed();
+                        drop(timeline_build);
+                        let timeline_compile = infr_core::timeline::span("prefill_compile");
                         let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
                         let t_compile = pf_t0.elapsed();
+                        drop(timeline_compile);
+                        let timeline_bind = infr_core::timeline::span("prefill_bind");
                         let mut pf_b = Bindings::new();
                         if let Some(ids) = pf_h.tok_ids {
                             pf_b.bind(ids, ch.input.as_ref());
@@ -11069,9 +11411,12 @@ fn generate_dense_backend_inner(
                             pf_h.logits.is_none(),
                             "headless prefill build has no logits"
                         );
+                        drop(timeline_bind);
+                        let timeline_execute = infr_core::timeline::span("prefill_execute");
                         be.execute(pf_plan.as_ref(), &pf_b)
                             .map_err(|e| anyhow!("{e}"))?;
                         let t_target_execute = pf_t0.elapsed();
+                        drop(timeline_execute);
                         // The MTP head needs the completed wide residual, but none of the target
                         // graph's scratch. Release the compiled Prefill plan before compiling the
                         // catch-up graph; otherwise both plans coexist in LlmRuntime and can exceed
@@ -12118,6 +12463,157 @@ fn generate_dense_backend_inner(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resident_full_graph_follows_host_interlocks_and_journal_capacity() {
+        let flashnext = crate::Config {
+            qwen4exp: true,
+            n_layer: 48,
+            n_embd: 2560,
+            hc_mult: 4,
+            moe: Some(crate::MoeConfig {
+                n_expert: 512,
+                n_used: 10,
+                n_ff_exp: 640,
+                scale: 1.,
+                gating: infr_core::graph::MoeGating::Softmax,
+                norm_w: true,
+                weight_before: false,
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
+            }),
+            ..Default::default()
+        };
+        let mut ec = crate::EngineConfig::default();
+        ec.kernels.vulkan.decode_gpu_resident = true;
+        ec.kernels.vulkan.decode_gpu_resident_full_graph = Some(true);
+        ec.paging.expert_prefetch = false;
+        let eligible = |c: &crate::Config, ec: &crate::EngineConfig| {
+            super::resident_full_graph_decode(c, ec, "vulkan", 1, 0, false, false, 150_000)
+        };
+        assert!(eligible(&flashnext, &ec));
+        for lanes in 0..=8 {
+            for sample_from in 0..=lanes {
+                for capture in [false, true] {
+                    for multimodal in [false, true] {
+                        assert_eq!(
+                            super::resident_full_graph_decode(
+                                &flashnext,
+                                &ec,
+                                "vulkan",
+                                lanes,
+                                sample_from,
+                                capture,
+                                multimodal,
+                                150_000
+                            ),
+                            (1..=infr_vulkan::GPU_RESIDENT_MAX_ROWS).contains(&lanes)
+                                && sample_from == 0
+                                && !capture
+                                && !multimodal
+                        );
+                    }
+                }
+            }
+        }
+        for backend in ["cpu", "metal"] {
+            assert!(!super::resident_full_graph_decode(
+                &flashnext, &ec, backend, 1, 0, false, false, 150_000
+            ));
+        }
+        for mode in 0..5 {
+            let mut excluded = ec.clone();
+            match mode {
+                0 => excluded.kernels.vulkan.decode_gpu_resident_full_graph = Some(false),
+                1 => excluded.kernels.vulkan.decode_gpu_resident = false,
+                2 => excluded.spec.mtp = true,
+                3 => excluded.paging.expert_prefetch = true,
+                _ => excluded.kernels.vulkan.cpu_miss_threads = 1,
+            }
+            assert!(!eligible(&flashnext, &excluded));
+        }
+        for shape in 0..6 {
+            let mut excluded = flashnext.clone();
+            match shape {
+                0 => excluded.n_layer = 1,
+                1 => excluded.n_embd = 1280,
+                2 => excluded.hc_mult = 2,
+                3 => excluded.moe.as_mut().unwrap().n_expert = 256,
+                4 => excluded.moe.as_mut().unwrap().n_used = 8,
+                _ => excluded.moe.as_mut().unwrap().n_ff_exp = 512,
+            }
+            assert!(!eligible(&excluded, &ec));
+        }
+        let mut automatic = ec;
+        automatic.kernels.vulkan.decode_gpu_resident_full_graph = None;
+        assert!(super::resident_full_graph_decode(
+            &flashnext, &automatic, "vulkan", 1, 0, false, false, 30_000
+        ));
+        assert!(!super::resident_full_graph_decode(
+            &flashnext, &automatic, "vulkan", 1, 0, false, false, 150_000
+        ));
+
+        let qwen35 = crate::Config {
+            qwen35: true,
+            n_layer: 40,
+            n_embd: 2048,
+            shexp_ff: 512,
+            moe: Some(crate::MoeConfig {
+                n_expert: 256,
+                n_used: 8,
+                n_ff_exp: 512,
+                scale: 1.,
+                gating: infr_core::graph::MoeGating::Softmax,
+                norm_w: true,
+                weight_before: false,
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
+            }),
+            ..Default::default()
+        };
+        for context in [30_000, 150_000] {
+            assert!(super::resident_full_graph_decode(
+                &qwen35, &automatic, "vulkan", 1, 0, false, false, context
+            ));
+        }
+        assert_eq!(
+            super::resident_auto_submit_layers(&flashnext, true, 30_000, 1),
+            1
+        );
+        assert_eq!(
+            super::resident_auto_submit_layers(&flashnext, false, 150_000, 1),
+            2
+        );
+        assert_eq!(
+            super::resident_auto_submit_layers(&qwen35, false, 30_000, 1),
+            1
+        );
+        assert_eq!(
+            super::resident_auto_submit_layers(&qwen35, true, 30_000, 1),
+            2
+        );
+        assert_eq!(
+            super::resident_auto_submit_layers(&qwen35, true, 30_000, 2),
+            1
+        );
+
+        let mut generic_moe = qwen35.clone();
+        generic_moe.qwen35 = false;
+        generic_moe.n_embd = 1536;
+        generic_moe.moe.as_mut().unwrap().n_expert = 128;
+        generic_moe.moe.as_mut().unwrap().n_used = 4;
+        generic_moe.moe.as_mut().unwrap().n_ff_exp = 256;
+        generic_moe.shexp_ff = 0;
+        assert!(eligible(&generic_moe, &automatic));
+
+        let mut one_layer = generic_moe;
+        one_layer.n_layer = 1;
+        assert!(!eligible(&one_layer, &automatic));
+
+        let mut dense = flashnext;
+        dense.moe = None;
+        assert!(!eligible(&dense, &automatic));
+    }
+
     #[test]
     fn lm_head_projects_sampling_suffix_for_every_batch_shape() {
         use infr_core::backend::{Backend, Bindings, BufferUsage};

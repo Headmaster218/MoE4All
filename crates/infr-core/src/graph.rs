@@ -1425,6 +1425,25 @@ pub enum Op {
     },
 }
 
+trait TensorIoList: Extend<TensorId> {
+    fn from_array<const N: usize>(ids: [TensorId; N]) -> Self;
+}
+
+impl TensorIoList for Vec<TensorId> {
+    #[inline]
+    fn from_array<const N: usize>(ids: [TensorId; N]) -> Self {
+        let ids: Box<[TensorId]> = Box::new(ids);
+        ids.into_vec()
+    }
+}
+
+impl<A: smallvec::Array<Item = TensorId>> TensorIoList for smallvec::SmallVec<A> {
+    #[inline]
+    fn from_array<const N: usize>(ids: [TensorId; N]) -> Self {
+        Self::from_slice(&ids)
+    }
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Op {
     /// The op's variant name — used by backends for per-op profiling / error messages so the
@@ -1499,6 +1518,30 @@ impl Op {
     /// (`dst == x`, a `+=`, or a stateful `state`/`cache` write) appears in BOTH lists: it is read
     /// and written. Kept exhaustive (no `_` arm) so a new [`Op`] variant forces a decision here.
     pub fn io(&self) -> (Vec<TensorId>, Vec<TensorId>) {
+        self.io_lists()
+    }
+
+    /// The same exhaustive I/O definition, kept inline for repeated graph scans. New ops with
+    /// more operands can spill safely instead of imposing a fixed arity limit.
+    pub fn io_inline(
+        &self,
+    ) -> (
+        smallvec::SmallVec<[TensorId; 8]>,
+        smallvec::SmallVec<[TensorId; 3]>,
+    ) {
+        self.io_lists()
+    }
+
+    fn io_lists<R, W>(&self) -> (R, W)
+    where
+        R: TensorIoList,
+        W: TensorIoList,
+    {
+        // Each caller constructs its own container directly; the Vec API does not pay for an
+        // intermediate SmallVec. Operand order and optional state handles have one definition.
+        macro_rules! vec {
+            ($($id:expr),* $(,)?) => { TensorIoList::from_array([$($id),*]) };
+        }
         match *self {
             Op::RmsNorm { x, weight, dst, .. } => (vec![x, weight], vec![dst]),
             Op::RmsNormAdd { x, weight, dst, .. } => (vec![x, weight, dst], vec![dst]),
@@ -1512,7 +1555,7 @@ impl Op {
             Op::Softmax {
                 x, dst, scale_buf, ..
             } => {
-                let mut r = vec![x];
+                let mut r: R = vec![x];
                 r.extend(scale_buf);
                 (r, vec![dst])
             }
@@ -1537,7 +1580,7 @@ impl Op {
                 vec![low_dst, inject_dst],
             ),
             Op::QkNorm { x, weight, dst, .. } => {
-                let mut r = vec![x];
+                let mut r: R = vec![x];
                 r.extend(weight);
                 (r, vec![dst])
             }
@@ -1555,7 +1598,7 @@ impl Op {
                 freq_factors,
                 ..
             } => {
-                let mut r = vec![x, positions];
+                let mut r: R = vec![x, positions];
                 r.extend(freq_factors);
                 (r, vec![dst])
             }
@@ -1575,7 +1618,7 @@ impl Op {
                 freq_factors,
                 ..
             } => {
-                let mut r = vec![x, weight, positions];
+                let mut r: R = vec![x, weight, positions];
                 r.extend(freq_factors);
                 (r, vec![dst])
             }
@@ -1596,7 +1639,7 @@ impl Op {
                 q_dst,
                 ..
             } => {
-                let mut reads = vec![qk, q_norm, positions, k_cache];
+                let mut reads: R = vec![qk, q_norm, positions, k_cache];
                 reads.extend(positions4);
                 (reads, vec![k_cache, q_dst])
             }
@@ -1610,7 +1653,7 @@ impl Op {
                 dst,
                 ..
             } => {
-                let mut r = vec![values, scores, ape, norm, state];
+                let mut r: R = vec![values, scores, ape, norm, state];
                 r.extend(freq_factors);
                 (r, vec![state, dst])
             }
@@ -1629,7 +1672,7 @@ impl Op {
                 dst,
                 ..
             } => {
-                let mut r = vec![raw_cache, comp_cache];
+                let mut r: R = vec![raw_cache, comp_cache];
                 r.extend(indices);
                 (r, vec![dst])
             }
@@ -1642,7 +1685,7 @@ impl Op {
                 dst,
                 ..
             } => {
-                let mut reads = vec![q, k_cache, block_cache, k_norm];
+                let mut reads: R = vec![q, k_cache, block_cache, k_norm];
                 reads.extend(positions4);
                 (reads, vec![block_cache, dst])
             }
@@ -1670,7 +1713,7 @@ impl Op {
                 sinks,
                 ..
             } => {
-                let mut r = vec![q, k_cache, v_cache];
+                let mut r: R = vec![q, k_cache, v_cache];
                 r.extend(sinks);
                 (r, vec![dst])
             }
@@ -1683,7 +1726,7 @@ impl Op {
                 key_bias,
                 ..
             } => {
-                let mut r = vec![q, k_cache, wk_b, wv_b];
+                let mut r: R = vec![q, k_cache, wk_b, wv_b];
                 r.extend(key_bias);
                 (r, vec![dst])
             }
@@ -1703,10 +1746,9 @@ impl Op {
                 gates,
                 ..
             } => {
-                let mut w = vec![pre];
+                let mut w: W = vec![pre];
                 if let Some(HyperGates { post, comb }) = gates {
-                    w.push(post);
-                    w.push(comb);
+                    w.extend([post, comb]);
                 }
                 (vec![mixes, scale, base], w)
             }
@@ -1787,7 +1829,7 @@ impl Op {
                 dst,
                 ..
             } => {
-                let mut r = vec![x, router_x, router, gate_exps, up_exps, down_exps];
+                let mut r: R = vec![x, router_x, router, gate_exps, up_exps, down_exps];
                 r.extend(down_scale);
                 r.extend(expert_ids);
                 (r, vec![dst])
@@ -1800,7 +1842,7 @@ impl Op {
                 dst,
                 ..
             } => {
-                let mut writes = vec![state, dst];
+                let mut writes: W = vec![state, dst];
                 writes.extend(state_trace);
                 (vec![x, weight, state], writes)
             }
@@ -1817,7 +1859,7 @@ impl Op {
                 dst,
                 ..
             } => {
-                let mut writes = vec![state, dst];
+                let mut writes: W = vec![state, dst];
                 writes.extend(state_trace);
                 (vec![q, k, v, b, a, a_coef, dt_bias, state], writes)
             }
@@ -1894,6 +1936,9 @@ pub struct Graph {
     pub sequence_spans: Vec<SequenceSpan>,
     /// Decode-only scheduling hints. Empty for models without a validated next-layer predictor.
     pub moe_prefetch_hints: Vec<MoePrefetchHint>,
+    /// Model-tuned resident rolling-submit depth. The Vulkan backend uses this only when the
+    /// engine setting is automatic (0); an explicit engine value remains authoritative.
+    pub resident_submit_layers: Option<usize>,
     /// Producer-set opt-out of the Vulkan record-once decode replay: `true` forces the
     /// per-execute STATIC path even for an otherwise replay-eligible single-token decode.
     ///
@@ -2087,6 +2132,107 @@ impl Graph {
 mod tests {
     use super::*;
     use crate::tensor::{DType, TensorDesc};
+
+    #[test]
+    fn inline_io_keeps_maximal_stateful_and_optional_operands_on_stack() {
+        let t = TensorId;
+        for rows in [1, 2, 4, 8, 32, 2048, 4096] {
+            for optional in [false, true] {
+                let trace = optional.then_some(t(9));
+                let cases = [
+                    (
+                        Op::DeltaNet {
+                            q: t(0),
+                            k: t(1),
+                            v: t(2),
+                            b: t(3),
+                            a: t(4),
+                            a_coef: t(5),
+                            dt_bias: t(6),
+                            state: t(7),
+                            state_trace: trace,
+                            dst: t(8),
+                            rows,
+                            n_vhead: 32,
+                            n_khead: 16,
+                            head_k: 128,
+                            head_v: 128,
+                            eps: 1e-6,
+                            src_stride: 0,
+                        },
+                        (0..8).map(t).collect::<Vec<_>>(),
+                        if optional {
+                            vec![t(7), t(8), t(9)]
+                        } else {
+                            vec![t(7), t(8)]
+                        },
+                    ),
+                    (
+                        Op::QsaPrepare {
+                            qk: t(0),
+                            q_norm: t(1),
+                            positions: t(2),
+                            k_cache: t(3),
+                            q_dst: t(4),
+                            positions4: trace,
+                            rows,
+                            n_head: 16,
+                            head_dim: 128,
+                            rope_dim: 64,
+                            theta: 1e4,
+                            eps: 1e-6,
+                            sections: [16; 4],
+                            pos: 150_000,
+                        },
+                        if optional {
+                            vec![t(0), t(1), t(2), t(3), t(9)]
+                        } else {
+                            (0..4).map(t).collect()
+                        },
+                        vec![t(3), t(4)],
+                    ),
+                    (
+                        Op::HyperConnectMix {
+                            mixes: t(0),
+                            scale: t(1),
+                            base: t(2),
+                            pre: t(3),
+                            gates: optional.then_some(HyperGates {
+                                post: t(4),
+                                comb: t(5),
+                            }),
+                            rows,
+                            hc: 4,
+                            eps: 1e-6,
+                            n_iter: 20,
+                        },
+                        vec![t(0), t(1), t(2)],
+                        if optional {
+                            vec![t(3), t(4), t(5)]
+                        } else {
+                            vec![t(3)]
+                        },
+                    ),
+                ];
+                for (op, expected_reads, expected_writes) in cases {
+                    let (reads, writes) = op.io_inline();
+                    assert!(!reads.spilled() && !writes.spilled());
+                    assert_eq!(reads.as_slice(), expected_reads);
+                    assert_eq!(writes.as_slice(), expected_writes);
+                    assert_eq!(op.io(), (expected_reads, expected_writes));
+                }
+            }
+        }
+        let duplicate = Op::Add {
+            a: t(0),
+            b: t(0),
+            dst: t(0),
+            n: 8,
+        };
+        let (reads, writes) = duplicate.io_inline();
+        assert_eq!(reads.as_slice(), [t(0), t(0)]);
+        assert_eq!(writes.as_slice(), [t(0)]);
+    }
 
     /// `Op::io` reports the exact read/write handles — the contract the multi-device pipeline
     /// executor infers each op's device and cut tensors from.

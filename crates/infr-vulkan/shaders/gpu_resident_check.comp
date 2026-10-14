@@ -1,0 +1,48 @@
+#version 450
+layout(local_size_x = 1) in;
+layout(binding = 0) readonly buffer Ids { uint ids[]; };
+layout(binding = 1) readonly buffer Tape { uvec2 addresses[]; };
+layout(binding = 2) buffer Control { uint run; uint stopped; uint reached; uint invalid; uint extra[]; };
+layout(binding = 3) buffer Journal { uint journal[]; };
+layout(push_constant) uniform Params {
+    uint count;
+    uint experts;
+    uint gate_base;
+    uint up_base;
+    uint down_base;
+    uint ordinal;
+    uint immutable_predicates;
+} p;
+const uint JOURNAL_WORDS = 72u;
+void main() {
+    if (p.count == 0) {
+        run = 1;
+        stopped = 0xffffffffu;
+        reached = 0;
+        invalid = 0;
+        // Word 37 is the initial predicate; words 5..36 belong to 16 checked layers.
+        if (p.immutable_predicates != 0) extra[33] = 1;
+        return;
+    }
+    if (p.immutable_predicates != 0) extra[1 + p.ordinal * 2] = 0;
+    if (run == 0) return;
+    bool missing = false;
+    for (uint i = 0; i < p.count; ++i) {
+        uint id = ids[i];
+        journal[p.ordinal * JOURNAL_WORDS + i] = id;
+        if (id >= p.experts) {
+            invalid = 1;
+            missing = true;
+        } else {
+            missing = missing || all(equal(addresses[p.gate_base + id], uvec2(0)))
+                              || all(equal(addresses[p.up_base + id], uvec2(0)))
+                              || all(equal(addresses[p.down_base + id], uvec2(0)));
+        }
+    }
+    reached = p.ordinal + 1;
+    if (missing) {
+        run = 0;
+        stopped = p.ordinal;
+    }
+    if (p.immutable_predicates != 0) extra[1 + p.ordinal * 2] = run;
+}

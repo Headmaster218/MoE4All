@@ -11,7 +11,11 @@ use std::collections::HashSet;
 
 use ash::vk;
 
-use infr_core::{backend::Buffer, error::Result, pager_profile};
+use infr_core::{
+    backend::{Backend, Buffer},
+    error::Result,
+    pager_profile,
+};
 
 use super::ops::ComputeKernel;
 use super::{as_vk_buf, be, Backing, VkBuffer, VulkanBackend};
@@ -19,6 +23,70 @@ use super::{as_vk_buf, be, Backing, VkBuffer, VulkanBackend};
 pub(crate) const QSA_TOPK_PARALLEL_MIN_BLOCKS: u32 = 4096;
 pub(crate) const QSA_TOPK_PARALLEL_WORK_BYTES: usize = (64 * 256 + 2) * 4;
 const QSA_TOPK_PARALLEL_MAX_GROUPS: u32 = 64;
+// Shader ABI: five status words, two predicates per checked layer, one immutable seed.
+pub(crate) const RESIDENT_MAX_LAYERS: usize = 16;
+pub(crate) const RESIDENT_SEED_WORD: usize = 5 + 2 * RESIDENT_MAX_LAYERS;
+pub(crate) const RESIDENT_CONTROL_BYTES: usize = (RESIDENT_SEED_WORD + 1) * 4;
+// Resident journal ABI shared with gpu_resident_{check,hit_check}.comp. Keep routed ids and
+// per-row masks disjoint so every supported layout (up to four rows x top-16) is recoverable.
+// Four rows cover one Qwen3.8 MTP VERIFY batch without changing the ordinary Decode protocol.
+pub(crate) const RESIDENT_JOURNAL_ID_WORDS: usize = 64;
+pub(crate) const RESIDENT_JOURNAL_MASK_WORD: usize = RESIDENT_JOURNAL_ID_WORDS;
+pub(crate) const RESIDENT_JOURNAL_MASK_WORDS: usize = 4;
+pub(crate) const RESIDENT_JOURNAL_STATUS_WORD: usize = 71;
+pub(crate) const RESIDENT_JOURNAL_WORDS: usize = 72;
+pub(crate) const RESIDENT_JOURNAL_BYTES: usize = RESIDENT_JOURNAL_WORDS * 4;
+
+const RESIDENT_DISPATCH_CAPACITY: usize = 8192;
+const RESIDENT_REGION_CAPACITY: usize = 4096;
+const RESIDENT_DIMENSIONS_BASE: usize = RESIDENT_REGION_CAPACITY * 4;
+
+pub(crate) struct ResidentIndirect {
+    metadata: std::sync::Arc<dyn Buffer>,
+    commands: std::sync::Arc<dyn Buffer>,
+    dispatch_cursor: std::sync::atomic::AtomicUsize,
+    region_cursor: std::sync::atomic::AtomicUsize,
+}
+
+impl ResidentIndirect {
+    pub(crate) fn new(be_: &VulkanBackend) -> Result<Self> {
+        Ok(Self {
+            metadata: std::sync::Arc::from(be_.alloc_uninit(
+                (RESIDENT_DIMENSIONS_BASE + RESIDENT_DISPATCH_CAPACITY * 3) * 4,
+                infr_core::backend::BufferUsage::Staging,
+            )?),
+            commands: std::sync::Arc::from(be_.alloc_uninit(
+                RESIDENT_DISPATCH_CAPACITY * 12,
+                infr_core::backend::BufferUsage::Activations,
+            )?),
+            dispatch_cursor: std::sync::atomic::AtomicUsize::new(0),
+            region_cursor: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    pub(crate) fn reset_after_drain(&self) {
+        self.dispatch_cursor
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.region_cursor
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn write_words(&self, start: usize, words: &[u32]) {
+        let ptr = as_vk_buf(self.metadata.as_ref())
+            .unwrap()
+            .mapped_ptr()
+            .unwrap();
+        assert!((start + words.len()) * 4 <= self.metadata.len_bytes());
+        // Each region is finalized before submission and retained until its GPU readers drain.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                words.as_ptr(),
+                ptr.add(start * 4).cast::<u32>(),
+                words.len(),
+            );
+        }
+    }
+}
 
 /// Coopmat prefill shmem-staging mode for `attention_prefill_flash` (Levers 2 & 5,
 /// kv-decode-perf-levers). `Off` = the default direct coopMatLoad from the bound descriptor.
@@ -211,6 +279,16 @@ fn native_sg_choice(
     }
     let nr = k.sg_nr;
     matches!(nr, 2 | 4 | 8).then_some(nr)
+}
+
+fn native_q8_wave32_choice(
+    dtype: infr_core::DType,
+    in_f: usize,
+    out_f: usize,
+    enabled: bool,
+) -> Option<u32> {
+    (dtype == infr_core::DType::Q8_0 && enabled && out_f >= 1024 && in_f.is_multiple_of(32))
+        .then_some(if in_f <= 2560 && out_f < 131072 { 4 } else { 2 })
 }
 
 /// NUM_ROWS for the reassociation-tolerant subgroup id-indexed decode GEMV
@@ -947,6 +1025,10 @@ pub struct Recorder<'a> {
     /// Set while recording an indirect dispatch so `sync` widens the barrier to cover the
     /// indirect-command read of GPU-written dispatch args.
     indirect_pending: std::cell::Cell<bool>,
+    conditional_active: std::cell::Cell<bool>,
+    conditional_mutable: std::cell::Cell<bool>,
+    resident_indirect: RefCell<Option<std::sync::Arc<ResidentIndirect>>>,
+    indirect_region: std::cell::Cell<Option<(usize, usize)>>,
     /// Debug knobs, resolved ONCE at construction from the backend's `Config` — `debug.no_barrier`,
     /// `debug.full_barrier`, `prof.stages` (S5b). Per-dispatch paths read these fields, never a
     /// config tree walk and never the environment.
@@ -1208,6 +1290,10 @@ impl<'a> Recorder<'a> {
             dirty_transfer: std::cell::Cell::new(false),
             barriers: RefCell::new(0),
             indirect_pending: std::cell::Cell::new(false),
+            conditional_active: std::cell::Cell::new(false),
+            conditional_mutable: std::cell::Cell::new(true),
+            resident_indirect: RefCell::new(None),
+            indirect_region: std::cell::Cell::new(None),
             no_barrier: dbgcfg.no_barrier,
             full_barrier: dbgcfg.full_barrier,
             stages: profcfg.stages,
@@ -1272,11 +1358,11 @@ impl<'a> Recorder<'a> {
         self.suppress.set(on);
     }
 
-    /// Override the label of the NEXT dispatch's timestamp (INFR_PROF_OPS). Consumed once — a
-    /// pre-set override wins over the automatic kernel-name label AND over the shape itemizers
-    /// below. No-op without prof_ops.
+    /// Override the label of the NEXT dispatch's timestamp. Consumed once — a pre-set override
+    /// wins over the automatic kernel-name label AND over the shape itemizers below. No-op unless
+    /// per-op profiling or the diagnostic device timeline is active.
     pub fn label_next(&self, label: &'static str) {
-        if self.prof_ops {
+        if self.prof_ops || self.timeline_query.borrow().is_some() {
             self.next_label.set(Some(label));
         }
     }
@@ -1362,8 +1448,9 @@ impl<'a> Recorder<'a> {
     /// longer stamp by hand (use [`label_next`](Self::label_next) to override a too-generic
     /// kernel name).
     fn stamp(&self, label: &'static str) {
+        let explicit_label = self.next_label.take();
         if let Some(query) = self.timeline_query.borrow_mut().as_mut() {
-            query.mark(crate::timeline::group(label));
+            query.mark(crate::timeline::group(explicit_label.unwrap_or(label)));
         }
         // Every dispatch funnels through here, so this is also where the recorder counts them —
         // the submit splitter (`Recorder::dispatches`) needs the count whether or not INFR_PROF_OPS
@@ -1372,7 +1459,7 @@ impl<'a> Recorder<'a> {
         if !self.prof_ops {
             return;
         }
-        let label = self.next_label.take().unwrap_or(label);
+        let label = explicit_label.unwrap_or(label);
         let idx = self.ts_labels.borrow().len() as u32;
         if idx >= Self::MAX_TS - 1 {
             self.ts_dropped.set(self.ts_dropped.get() + 1);
@@ -1592,6 +1679,10 @@ impl<'a> Recorder<'a> {
         args: vk::Buffer,
         args_off: u64,
     ) {
+        assert!(
+            !self.conditional_active.get() || self.resident_indirect.borrow().is_none(),
+            "resident indirect predicates do not nest pre-existing indirect dispatches"
+        );
         let _timeline_encode = infr_core::timeline::span("command_encode");
         // Auto-label (INFR_PROF_OPS): every dispatch stamps a timestamp tagged with its kernel name
         // — the chokepoint knows the kernel, so no op method needs a manual stamp call. Placed
@@ -1675,7 +1766,26 @@ impl<'a> Recorder<'a> {
                     push,
                 );
             }
-            device.cmd_dispatch(self.cmd, gx, gy, gz);
+            if self.conditional_active.get() && self.resident_indirect.borrow().is_some() {
+                let state = self.resident_indirect.borrow();
+                let state = state.as_ref().unwrap();
+                let ordinal = state
+                    .dispatch_cursor
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                assert!(
+                    ordinal < RESIDENT_DISPATCH_CAPACITY,
+                    "resident indirect dispatch tape overflow"
+                );
+                state.write_words(RESIDENT_DIMENSIONS_BASE + ordinal * 3, &[gx, gy, gz]);
+                let buffer = Self::vk_of(state.commands.as_ref());
+                device.cmd_dispatch_indirect(
+                    self.cmd,
+                    buffer.buffer,
+                    (buffer.sub_offset + ordinal * 12) as u64,
+                );
+            } else {
+                device.cmd_dispatch(self.cmd, gx, gy, gz);
+            }
         }
     }
 
@@ -3462,6 +3572,10 @@ impl<'a> Recorder<'a> {
         // `_streamed` twin (the build tables are 1:1 mirrored — see this fn's doc). Every branch
         // reachable here has a streamed kernel to route to.
         if rows == 1 {
+            if let Some(nr) = native_q8_wave32_choice(dtype, in_f, out_f, self.be.use_q8_wave32()) {
+                self.linear_native_q8_wave32_at(arena_addr, w_base, x, None, y, in_f, out_f, nr);
+                return;
+            }
             if let Some(nr) = native_sg_choice(dtype, in_f, out_f, self.gemv()) {
                 if crate::gemm::native_sg_streamed_build_spv(dtype, false, nr, self.sg16())
                     .is_some()
@@ -3562,6 +3676,54 @@ impl<'a> Recorder<'a> {
             &push,
             (rows * out_f) as u32,
         );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_native_q8_wave32_at(
+        &self,
+        arena_addr: u64,
+        w_base: usize,
+        x: &dyn Buffer,
+        residual: Option<&dyn Buffer>,
+        y: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+        nr: u32,
+    ) {
+        self.label_gemv("gemv_q8_wave32_streamed", 1, in_f, out_f);
+        let (name, spv) = crate::gemm::native_q8_wave32_spv(residual.is_some(), nr)
+            .expect("unsupported Q8 Wave32 output-row tile");
+        let nbind = if residual.is_some() { 4 } else { 3 };
+        let k = self.be.kernel_sg(name, spv, nbind, 24, 32);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&1u32.to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        if let Some(residual) = residual {
+            self.dispatch_wide(
+                k,
+                &[
+                    Self::vkb(x),
+                    Self::vkb(x),
+                    Self::vkb(residual),
+                    Self::vkb(y),
+                ],
+                1,
+                &push,
+                (out_f.div_ceil(nr as usize)) as u32,
+            );
+        } else {
+            self.dispatch_wide(
+                k,
+                &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
+                1,
+                &push,
+                (out_f.div_ceil(nr as usize)) as u32,
+            );
+        }
     }
 
     /// Multi-row native GEMV (`2 <= rows <= 8`): the GEMV's out_f-wide cooperative-over-K grid,
@@ -4104,6 +4266,21 @@ impl<'a> Recorder<'a> {
             Self::vkb(residual),
             Self::vkb(y),
         ];
+        if rows == 1 {
+            if let Some(nr) = native_q8_wave32_choice(dtype, in_f, out_f, self.be.use_q8_wave32()) {
+                self.linear_native_q8_wave32_at(
+                    arena_addr,
+                    0,
+                    x,
+                    Some(residual),
+                    y,
+                    in_f,
+                    out_f,
+                    nr,
+                );
+                return;
+            }
+        }
         // Reassociation-tolerant subgroup route — precedence over RM, mirrors linear_add_native.
         if rows == 1 {
             if let Some(nr) = native_sg_choice(dtype, in_f, out_f, self.gemv()) {
@@ -6790,6 +6967,51 @@ impl<'a> Recorder<'a> {
         }
     }
 
+    /// Decode-only QkNorm+RoPE fused directly into a flat planar-Q8 K cache. This removes the
+    /// intermediate f16 K row and the following store_q8 dispatch; the cache remains bound as the
+    /// inert write descriptor so ordinary recorder hazard tracking orders the attention read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qk_norm_rope_q8_dyn_at(
+        &self,
+        x: &dyn Buffer,
+        nw: &dyn Buffer,
+        params: &dyn Buffer,
+        y: &dyn Buffer,
+        y_addr: u64,
+        rows: usize,
+        nheads: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+        eps: f32,
+        kcap: usize,
+    ) {
+        let k = self.be.kernel(
+            "qk_norm_rope_dyn_q8_bda",
+            crate::gemm::qk_norm_rope_dyn_q8_bda_spv(),
+            4,
+            44,
+        );
+        let mut push = [0u8; 44];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(nheads as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(rope_dim as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&theta.to_ne_bytes());
+        push[24..28].copy_from_slice(&1u32.to_ne_bytes());
+        push[28..32].copy_from_slice(&eps.to_ne_bytes());
+        push[32..36].copy_from_slice(&(kcap as u32).to_ne_bytes());
+        push[36..40].copy_from_slice(&(y_addr as u32).to_ne_bytes());
+        push[40..44].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(nw), Self::vkb(params), Self::vkb(y)],
+            1,
+            &push,
+            (rows * nheads) as u32,
+        );
+    }
+
     /// `-DKV_BDA` twin of [`Self::qk_norm_rope_interleaved_dyn`]: writes the fused K cache at
     /// `y_addr` (pos from `params`). `y` stays bound at slot 3 (inert) for the store→read barrier.
     #[allow(clippy::too_many_arguments)]
@@ -7949,6 +8171,7 @@ impl<'a> Recorder<'a> {
                         self.vk().q8_decode_d8,
                         self.vk().q8_decode_ls128,
                         self.vk().q8_decode_ls256,
+                        false,
                         self.vk().q8_qk_f16,
                         self.vk().q8_pv_f16,
                         self.vk().q8_decode_chunk1024,
@@ -8617,34 +8840,36 @@ impl<'a> Recorder<'a> {
     }
 
     /// Record the split-K replay prologue ONCE per execute: derives the live chunk count from the
-    /// params SSBO's kv_len and writes `args = [nh·live, 1, 1, live]` — the indirect dispatch args
+    /// params SSBO's kv_len and writes `args = [work_heads·live, 1, 1, live]` — the indirect args
     /// and combine loop bound that every subsequent [`Self::attention_kv_split_dynac`] in the same
     /// execute shares (kv_len is the same for every layer of a token).
     pub fn attn_live_prologue(
         &self,
         params: &dyn Buffer,
         args: &dyn Buffer,
-        nh: usize,
+        work_heads: usize,
         chunk: usize,
+        max_chunk: usize,
         window: usize,
     ) {
         let kl = self
             .be
-            .kernel("attn_live", crate::gemm::attn_live_spv(), 2, 12);
-        let mut p0 = [0u8; 12];
-        p0[0..4].copy_from_slice(&(nh as u32).to_ne_bytes());
+            .kernel("attn_live", crate::gemm::attn_live_spv(), 2, 16);
+        let mut p0 = [0u8; 16];
+        p0[0..4].copy_from_slice(&(work_heads as u32).to_ne_bytes());
         p0[4..8].copy_from_slice(&(chunk as u32).to_ne_bytes());
-        p0[8..12].copy_from_slice(&(window as u32).to_ne_bytes());
+        p0[8..12].copy_from_slice(&(max_chunk as u32).to_ne_bytes());
+        p0[12..16].copy_from_slice(&(window as u32).to_ne_bytes());
         self.dispatch(kl, &[Self::vkb(params), Self::vkb(args)], 1, &p0, 1);
     }
 
     /// SELF-CHUNKING variant for record-once REPLAY over a growing kv_len. A one-thread prologue
     /// (`attn_live`) derives the adaptive chunk (~32 chunks/head, 64..512, floored by the baked
     /// minimum `chunk`) from the LIVE kv_len and writes the partial pass's INDIRECT dispatch args
-    /// (`args`, ≥16 bytes: [gx,gy,gz,live]) — so one recorded plan launches exactly nh·live
-    /// workgroups at every depth (no dead workgroups shallow, no re-record deep). The combine
-    /// loops the prologue's live count. `n_chunks` is only the pm/pl/pacc scratch STRIDE/capacity
-    /// (cap.div_ceil(chunk), ≤1024).
+    /// (`args`, ≥16 bytes: [gx,gy,gz,live]) — so one recorded plan launches exactly
+    /// work_heads·live workgroups at every depth (no dead workgroups shallow, no re-record deep).
+    /// `work_heads` is normally `nh`; fused GQA replay uses one work head per group. The combine
+    /// loops the prologue's live count. `n_chunks` is only the pm/pl/pacc scratch STRIDE/capacity.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_kv_split_dynac(
         &self,
@@ -8665,11 +8890,12 @@ impl<'a> Recorder<'a> {
         scale: f32,
         window: usize,
         q8: bool,
+        fuse_gqa4: bool,
         cap: usize,
     ) {
         self.attention_kv_split_dynac_impl(
             q, kc, vc, o, pm, pl, pacc, params, args, nh, nkv, hd, chunk, n_chunks, scale, window,
-            q8, cap, None,
+            q8, fuse_gqa4, cap, None,
         );
     }
 
@@ -8700,6 +8926,7 @@ impl<'a> Recorder<'a> {
         scale: f32,
         window: usize,
         q8: bool,
+        fuse_gqa4: bool,
         cap: usize,
     ) {
         self.attention_kv_split_dynac_impl(
@@ -8720,6 +8947,7 @@ impl<'a> Recorder<'a> {
             scale,
             window,
             q8,
+            fuse_gqa4,
             cap,
             Some((k_addr, v_addr)),
         );
@@ -8746,6 +8974,8 @@ impl<'a> Recorder<'a> {
         window: usize,
         // Q8_0 KV cache (K==V==q8): coalesced planar Q8 read variant. `false` = f16 cache.
         q8: bool,
+        // The caller's indirect grid uses nh/4 work heads and is compatible with GQA4 fusion.
+        fuse_gqa4: bool,
         // Planar Q8 scales region base = total cache elements (`cap`). Unused when `q8` is false.
         cap: usize,
         // #74 slice 2: Some((k_addr, v_addr)) selects the `-DKV_BDA` twins; None keeps bound SSBOs.
@@ -8784,9 +9014,9 @@ impl<'a> Recorder<'a> {
         // tape, so a specialization wired only into the static path above measures as zero gain.
         // Its SELF_CHUNK arm re-derives the identical adaptive chunk (`max(pc.chunk,
         // min(max(span/32,64),512))`) from the live kv_len, so the `attn_live` prologue's indirect
-        // grid — nh·live workgroups, one per (query head, chunk) — is unchanged and the prologue
-        // needs no edit. `chunk <= 512` keeps the derived chunk inside the kernel's `sc[512]` slab
-        // (the policy's own `min(.., 512)` only binds above the baked floor).
+        // grid — work_heads·live workgroups — uses the same live count. `chunk <= 512` keeps the
+        // derived chunk inside the kernel's score slab (the policy's own `min(.., 512)` only binds
+        // above the baked floor).
         //
         // Slice 3b widens this to `window > 0` (the `-DSWA -DRING` builds: the window mask floor
         // AND the ring row modulo an SWA layer's `window + ubatch`-row cache needs — this path
@@ -8795,17 +9025,35 @@ impl<'a> Recorder<'a> {
         // hd 256/512 (the `-DDHD4=64/128` builds). Anything else still falls back.
         let fast = if !crate::gemm::attn_decode_disabled(self.vk())
             && bda
-            && !q8
             && chunk <= 512
             // INFR_NO_ATTN_HD=1 A/Bs the hd 256/512 specialization; the family's hd256/hd512
             // builds ARE it, so leave those dims on `attn_partial_dynac_nohd_bda` when it is set.
             && (hd == 128 || !crate::gemm::attn_hd_spec_disabled(self.vk()))
         {
+            if q8 {
+                crate::gemm::attn_decode_q8_kernel(
+                    hd,
+                    window > 0,
+                    true,
+                    self.vk().q8_decode_d8,
+                    self.vk().q8_decode_ls128,
+                    self.vk().q8_decode_ls256,
+                    self.be.caps().i8_dot && self.vk().q8_qk_i8 && self.be.prefers_q8_qk_i8(),
+                    self.vk().q8_qk_f16,
+                    self.vk().q8_pv_f16,
+                    self.vk().q8_decode_replay_chunk1024,
+                    false,
+                    fuse_gqa4
+                        && self.vk().q8_decode_gqa4
+                        && self.be.prefers_q8_decode_gqa4_replay()
+                        && nh / nkv >= 4
+                        && (nh / nkv).is_multiple_of(4),
+                )
             // The replay graph cannot change pipelines as live kv_len grows. On Windows/RDNA3 the
             // general hd256 full-context build is already neutral at shallow depth and faster at
-            // 100k/200k, so bake that build for the whole replay. Q8 is excluded above; SWA and
-            // every unmeasured platform retain their existing specialization.
-            if hd == 256 && window == 0 && self.be.prefers_generic_hd256_decode() {
+            // 100k/200k, so bake that build for the whole replay. SWA and every unmeasured platform
+            // retain their existing specialization.
+            } else if hd == 256 && window == 0 && self.be.prefers_generic_hd256_decode() {
                 None
             } else {
                 crate::gemm::attn_decode_kernel(hd, window > 0, true)
@@ -8858,14 +9106,33 @@ impl<'a> Recorder<'a> {
             0,
         );
 
-        // pass 2: combine over the live chunks
-        let k2 = self.be.kernel(
-            "attn_combine_live",
-            crate::gemm::attn_combine_live_spv(),
-            5,
-            16,
-        );
-        let ntile = if hd.is_multiple_of(4) { 4u32 } else { 1u32 };
+        // pass 2: combine over the live chunks. The static path already uses subgroup reduction
+        // and 16 hd tiles for Q8/hd256; replay used to fall back to the serial four-tile combine,
+        // leaving the exact same optimization out of the production record-once path.
+        let combine_sg = hd == 256 && q8 && self.vk().q8_decode_combine_sg;
+        let k2 = if combine_sg {
+            self.be.kernel_sg(
+                "attn_combine_live_hybrid",
+                crate::gemm::attn_combine_live_hybrid_spv(),
+                5,
+                16,
+                32,
+            )
+        } else {
+            self.be.kernel(
+                "attn_combine_live",
+                crate::gemm::attn_combine_live_spv(),
+                5,
+                16,
+            )
+        };
+        let ntile = if combine_sg {
+            16u32
+        } else if hd.is_multiple_of(4) {
+            4u32
+        } else {
+            1u32
+        };
         // attn_combine.comp splits hd as `hdt = hd/ntile`; a non-divisor ntile drops the top
         // hd-ntile*hdt dims (left uninitialized). ntile is 4 only when hd%4==0, else 1, so hd%ntile==0
         // always holds — this pins that invariant at the call site (never fires for shipped hd).
@@ -9001,6 +9268,11 @@ impl<'a> Recorder<'a> {
         dst_offset: usize,
         bytes: usize,
     ) {
+        if self.conditional_active.get() {
+            assert_eq!((src_offset | dst_offset | bytes) & 3, 0);
+            self.copy_strided(src, dst, 1, bytes / 4, src_offset / 4, 0, dst_offset / 4, 0);
+            return;
+        }
         // Transfer chokepoint: previously un-stamped, so copy time silently landed in the
         // preceding label's bucket. Distinct from the `copy_strided` compute kernel.
         self.stamp("copy_buffer");
@@ -9040,6 +9312,18 @@ impl<'a> Recorder<'a> {
         regions: &[vk::BufferCopy],
     ) {
         if regions.is_empty() {
+            return;
+        }
+        if self.conditional_active.get() {
+            for region in regions {
+                self.copy(
+                    src,
+                    region.src_offset as usize,
+                    dst,
+                    region.dst_offset as usize,
+                    region.size as usize,
+                );
+            }
             return;
         }
         self.stamp("copy_buffer");
@@ -11274,9 +11558,9 @@ impl<'a> Recorder<'a> {
             assert!(n_tokens == 1 && !has_bias && !hash);
             assert!(input.len_bytes() >= 2560 * 4 && output.len_bytes() >= 2560 * 4);
         }
-        let fast_sigmoid_wave32 = self.vk().moe_topk_sg
+        let fast_selected_norm_wave32 = self.vk().moe_topk_sg
             && n_tokens == 1
-            && gating == 1
+            && gating <= 1
             && norm_w
             && !has_bias
             && (n_expert_groups <= 1 || n_expert_groups_used == 0)
@@ -11285,7 +11569,7 @@ impl<'a> Recorder<'a> {
             && n_expert <= 512
             && n_used > 0
             && n_used <= 32;
-        let k = if fast_sigmoid_wave32 {
+        let k = if fast_selected_norm_wave32 {
             let (name, spv) = if input_tap.is_some() {
                 (
                     "moe_topk_sigmoid_wave32_tap",
@@ -11755,8 +12039,356 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Zero a buffer's first `n` 4-byte elements (cmd_fill_buffer) — clears the bucket counters.
+    /// Predicate subsequent dispatches on the GPU-written run word.
+    pub(crate) fn begin_conditional(&self, control: &dyn Buffer) {
+        self.begin_conditional_at(control, 0);
+    }
+
+    pub(crate) fn use_resident_indirect(&self, state: std::sync::Arc<ResidentIndirect>) {
+        assert!(!self.conditional_active.get());
+        let mut current = self.resident_indirect.borrow_mut();
+        if current.is_none() {
+            self.retain_buffer(std::sync::Arc::clone(&state.metadata));
+            self.retain_buffer(std::sync::Arc::clone(&state.commands));
+            *current = Some(state);
+        }
+    }
+
+    pub(crate) fn begin_conditional_at(&self, control: &dyn Buffer, word: usize) {
+        self.begin_conditional_inner(control, word, true);
+    }
+
+    /// The caller must keep this predicate unchanged until every submitted reader drains.
+    pub(crate) fn begin_immutable_conditional_at(&self, control: &dyn Buffer, word: usize) {
+        self.begin_conditional_inner(control, word, false);
+    }
+
+    fn begin_conditional_inner(&self, control: &dyn Buffer, word: usize, mutable: bool) {
+        assert!((word + 1) * 4 <= control.len_bytes());
+        assert!(!self.conditional_active.get());
+        if let Some(state) = self.resident_indirect.borrow().as_ref() {
+            let region = state
+                .region_cursor
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                region < RESIDENT_REGION_CAPACITY,
+                "resident indirect region tape overflow"
+            );
+            let start = state
+                .dispatch_cursor
+                .load(std::sync::atomic::Ordering::Relaxed);
+            state.write_words(region * 4, &[start as u32, 0, word as u32, 0]);
+            // The shader descriptor covers the whole tape. Order earlier indirect readers
+            // before its next write, including readers from a preceding rolling segment.
+            let before = vk::MemoryBarrier::default()
+                .src_access_mask(
+                    vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_WRITE,
+                )
+                .dst_access_mask(vk::AccessFlags::SHADER_WRITE);
+            unsafe {
+                self.be.shared.device.cmd_pipeline_barrier(
+                    self.cmd,
+                    vk::PipelineStageFlags::DRAW_INDIRECT | vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[before],
+                    &[],
+                    &[],
+                );
+            }
+            let kernel = self.be.kernel(
+                "gpu_resident_dispatch",
+                crate::gemm::gpu_resident_dispatch_spv(),
+                3,
+                8,
+            );
+            self.dispatch(
+                kernel,
+                &[
+                    Self::vkb(control),
+                    Self::vkb(state.metadata.as_ref()),
+                    Self::vkb(state.commands.as_ref()),
+                ],
+                1,
+                bytemuck::cast_slice(&[region as u32, RESIDENT_DIMENSIONS_BASE as u32]),
+                1,
+            );
+            let buffer = Self::vk_of(state.commands.as_ref());
+            let barrier = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::INDIRECT_COMMAND_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(buffer.buffer)
+                .offset(buffer.sub_offset as u64)
+                .size(state.commands.len_bytes() as u64);
+            unsafe {
+                self.be.shared.device.cmd_pipeline_barrier(
+                    self.cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::DRAW_INDIRECT,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[barrier],
+                    &[],
+                );
+            }
+            self.indirect_region.set(Some((region, start)));
+            self.conditional_active.set(true);
+            return;
+        }
+        assert!(!self.conditional_active.replace(true));
+        self.conditional_mutable.set(mutable);
+        let loader = self
+            .be
+            .shared
+            .conditional_rendering
+            .as_ref()
+            .expect("conditional rendering was feature-checked");
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::CONDITIONAL_RENDERING_READ_EXT);
+        unsafe {
+            self.be.shared.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::CONDITIONAL_RENDERING_EXT,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+            (loader.fp().cmd_begin_conditional_rendering_ext)(
+                self.cmd,
+                &vk::ConditionalRenderingBeginInfoEXT::default()
+                    .buffer(Self::vk_handle(control))
+                    .offset((Self::vk_of(control).sub_offset + word * 4) as u64),
+            );
+        }
+    }
+
+    pub(crate) fn end_conditional(&self) {
+        if !self.conditional_active.replace(false) {
+            return;
+        }
+        if let Some((region, start)) = self.indirect_region.take() {
+            let state = self.resident_indirect.borrow();
+            let state = state.as_ref().unwrap();
+            let end = state
+                .dispatch_cursor
+                .load(std::sync::atomic::Ordering::Relaxed);
+            state.write_words(region * 4 + 1, &[(end - start) as u32]);
+            return;
+        }
+        unsafe {
+            (self
+                .be
+                .shared
+                .conditional_rendering
+                .as_ref()
+                .unwrap()
+                .fp()
+                .cmd_end_conditional_rendering_ext)(self.cmd);
+            if !self.conditional_mutable.get() {
+                return;
+            }
+            let barrier = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::CONDITIONAL_RENDERING_READ_EXT)
+                .dst_access_mask(vk::AccessFlags::SHADER_WRITE);
+            self.be.shared.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::CONDITIONAL_RENDERING_EXT,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+        }
+    }
+
+    pub(crate) fn gpu_resident_check(
+        &self,
+        ids: &dyn Buffer,
+        tape: &dyn Buffer,
+        control: &dyn Buffer,
+        journal: &dyn Buffer,
+        params: [u32; 6],
+    ) {
+        assert!(!self.conditional_active.get());
+        let kernel = self.be.kernel(
+            "gpu_resident_check",
+            crate::gemm::gpu_resident_check_spv(),
+            4,
+            28,
+        );
+        let params = [
+            params[0],
+            params[1],
+            params[2],
+            params[3],
+            params[4],
+            params[5],
+            u32::from(control.len_bytes() == RESIDENT_CONTROL_BYTES),
+        ];
+        self.dispatch(
+            kernel,
+            &[
+                Self::vkb(ids),
+                Self::vkb(tape),
+                Self::vkb(control),
+                Self::vkb(journal),
+            ],
+            2,
+            bytemuck::cast_slice(&params),
+            1,
+        );
+    }
+
+    pub(crate) fn publish_host_reads(&self) {
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ);
+        unsafe {
+            self.be.shared.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+        }
+    }
+
+    pub(crate) fn gpu_resident_hit_check(
+        &self,
+        ids: &dyn Buffer,
+        tape: &dyn Buffer,
+        control: &dyn Buffer,
+        journal: &dyn Buffer,
+        params: [u32; 8],
+        notice: vk::Event,
+    ) {
+        assert!(!self.conditional_active.get());
+        let kernel = self.be.kernel(
+            "gpu_resident_hit_check",
+            crate::gemm::gpu_resident_hit_check_spv(),
+            4,
+            36,
+        );
+        let params = [
+            params[0],
+            params[1],
+            params[2],
+            params[3],
+            params[4],
+            params[5],
+            params[6],
+            params[7],
+            u32::from(control.len_bytes() == RESIDENT_CONTROL_BYTES),
+        ];
+        self.dispatch(
+            kernel,
+            &[
+                Self::vkb(ids),
+                Self::vkb(tape),
+                Self::vkb(control),
+                Self::vkb(journal),
+            ],
+            // Ids is read/write and not trailing. Conservatively mark all bindings as writes
+            // so the following masked GEMVs observe its freshly written row masks.
+            4,
+            bytemuck::cast_slice(&params),
+            1,
+        );
+        let journal_buf = Self::vk_of(journal);
+        let barrier = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(journal_buf.buffer)
+            .offset((journal_buf.sub_offset + params[5] as usize * RESIDENT_JOURNAL_BYTES) as u64)
+            .size(RESIDENT_JOURNAL_BYTES as u64);
+        // Early recovery drains existing submissions rather than submitting an empty tail.
+        // Publish its final run/stopped/reached/invalid words in the same notice dependency.
+        let control_buf = Self::vk_of(control);
+        let control_barrier = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(control_buf.buffer)
+            .offset(control_buf.sub_offset as u64)
+            .size(16);
+        unsafe {
+            self.be.shared.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[barrier, control_barrier],
+                &[],
+            );
+        }
+        // Notices are unconditional. Each has its own immutable journal status; skipped
+        // layers publish SKIP rather than reusing an earlier layer's routed IDs.
+        unsafe {
+            self.be.shared.device.cmd_set_event(
+                self.cmd,
+                notice,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+            );
+        }
+    }
+
+    pub(crate) fn gpu_resident_silu(
+        &self,
+        gate: &dyn Buffer,
+        up: &dyn Buffer,
+        ids: &dyn Buffer,
+        out: &dyn Buffer,
+        params: [u32; 4],
+    ) {
+        let kernel = self.be.kernel(
+            "gpu_resident_silu",
+            crate::gemm::gpu_resident_silu_spv(),
+            4,
+            16,
+        );
+        let words = params[0] * params[2] * params[3];
+        self.dispatch(
+            kernel,
+            &[
+                Self::vkb(gate),
+                Self::vkb(up),
+                Self::vkb(ids),
+                Self::vkb(out),
+            ],
+            1,
+            bytemuck::cast_slice(&params),
+            words.div_ceil(128),
+        );
+    }
+
+    /// Zero the first `n` words, using a predicated compute fill inside conditional regions.
     pub fn zero(&self, buf: &dyn Buffer, n: usize) {
+        if self.conditional_active.get() {
+            let kernel = self
+                .be
+                .kernel("zero_words", crate::gemm::zero_words_spv(), 1, 4);
+            self.dispatch(
+                kernel,
+                &[Self::vkb(buf)],
+                1,
+                &(n as u32).to_ne_bytes(),
+                (n as u32).div_ceil(256),
+            );
+            return;
+        }
         // Transfer chokepoint (see `copy`): previously an un-stamped blind spot.
         self.stamp("zero_fill");
         // `cmd_fill_buffer` takes a raw handle + explicit byte offset, not a descriptor — go
@@ -12428,7 +13060,7 @@ impl<'a> Recorder<'a> {
         if matches!(dtype, infr_core::DType::Iq2S | infr_core::DType::Iq3S)
             && self.be.use_paged_grid_buffer(in_f, out_f, rows)
         {
-            let nr = self.gemv().id_grid_buffer_nr;
+            let nr = self.be.paged_grid_buffer_nr();
             let grid = if dtype == infr_core::DType::Iq2S {
                 &self.be.iq2s_grid
             } else {
@@ -12543,7 +13175,7 @@ impl<'a> Recorder<'a> {
         if matches!(dtype, infr_core::DType::Iq2S | infr_core::DType::Iq3S)
             && self.be.use_paged_grid_buffer(in_f, out_f, rows)
         {
-            let nr = self.gemv().id_grid_buffer_nr;
+            let nr = self.be.paged_grid_buffer_nr();
             let grid = if dtype == infr_core::DType::Iq2S {
                 &self.be.iq2s_grid
             } else {
@@ -13161,6 +13793,7 @@ impl<'a> Recorder<'a> {
         self,
         after_submit: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
+        self.end_conditional();
         let device = &self.be.shared.device;
         let dispatches = self.dispatches.get();
         let t_record = self.t0.elapsed();
@@ -13252,6 +13885,7 @@ impl<'a> Recorder<'a> {
     /// Only the NOT-yet-submitted buffer is abandoned. Anything already on the queue is still
     /// drained by the caller — a submitted command buffer cannot be cancelled, only waited on.
     pub fn discard(self) -> Result<()> {
+        self.end_conditional();
         let device = &self.be.shared.device;
         let end = unsafe { device.end_command_buffer(self.cmd) };
         self.free_transient();
@@ -13270,6 +13904,7 @@ impl<'a> Recorder<'a> {
     /// per-recorder, so cross-submission RAW/WAR ordering (scratch reuse, arena-slot rewrites vs
     /// a prior segment's reads) is otherwise invisible to it.
     pub fn finish_nowait(self) -> Result<PendingSegment> {
+        self.end_conditional();
         let dispatches = self.dispatches.get();
         if self.stages || self.prof_ops {
             let shared = std::sync::Arc::clone(&self.be.shared);
@@ -13285,6 +13920,8 @@ impl<'a> Recorder<'a> {
                 submit_pager_profile: false,
                 dispatches,
                 timeline_query: None,
+                waiter: None,
+                notice_producer: None,
             });
         }
         if pager_profile::active() {
@@ -13351,6 +13988,8 @@ impl<'a> Recorder<'a> {
             submit_pager_profile,
             dispatches,
             timeline_query: self.timeline_query.borrow_mut().take(),
+            waiter: None,
+            notice_producer: None,
         })
     }
 
@@ -13399,6 +14038,7 @@ impl<'a> Recorder<'a> {
     /// and its own segment is a SEPARATE submit at replay time, so no single submit can trip the
     /// per-submit GPU hang watchdog. A discrete GPU records the whole decode into one segment.
     pub(crate) fn end_segment(self) -> Result<RecordedSegment> {
+        self.end_conditional();
         if self.stages {
             eprintln!("[prof] barriers emitted = {}", self.barriers.borrow());
         }
@@ -13422,6 +14062,7 @@ impl<'a> Recorder<'a> {
     /// fast path taken by every discrete GPU; a device that watchdog-splits its decode builds a
     /// multi-segment [`RecordedCmd`] from [`Self::end_segment`] instead.
     pub fn finish_record(self) -> Result<RecordedCmd> {
+        self.end_conditional();
         let shared = std::sync::Arc::clone(&self.be.shared);
         let seg = self.end_segment()?;
         Ok(RecordedCmd::from_shared_segments(shared, vec![seg]))
@@ -13650,10 +14291,58 @@ impl Drop for RecordedCmd {
     }
 }
 
-/// A submitted-but-unwaited segment from [`Recorder::finish_nowait`]: holds the fence its submit
-/// signals plus the transient objects (command buffer, descriptor pools) that must outlive GPU
-/// execution. [`Self::wait`] blocks on the fence and releases everything; `Drop` does the same
-/// (best-effort) so an error path can never free a command buffer the GPU still owns.
+/// Optional host wait producer. Fence mode leaves the Vulkan queue mutex available to submits;
+/// the queue-idle comparator uses the ordinary serialized gate and can delay further submits.
+pub(crate) struct FenceWaiter {
+    sender: Option<std::sync::mpsc::Sender<FenceWaitJob>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+struct FenceWaitJob {
+    fence: vk::Fence,
+    done: std::sync::mpsc::Sender<std::result::Result<(), vk::Result>>,
+}
+
+impl FenceWaiter {
+    pub(crate) fn new(
+        shared: std::sync::Arc<crate::VulkanShared>,
+        queue_idle: bool,
+    ) -> Result<Self> {
+        let (sender, receiver) = std::sync::mpsc::channel::<FenceWaitJob>();
+        let thread = std::thread::Builder::new()
+            .name("resident-fence-wait".into())
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    let result = if queue_idle {
+                        shared.queue_wait_idle_serialized()
+                    } else {
+                        Ok(())
+                    }
+                    .and_then(|()| unsafe {
+                        shared.device.wait_for_fences(&[job.fence], true, u64::MAX)
+                    });
+                    let _ = job.done.send(result);
+                }
+            })
+            .map_err(|error| be(format!("resident fence waiter: {error}")))?;
+        Ok(Self {
+            sender: Some(sender),
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for FenceWaiter {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// A submitted segment owns its fence and transient objects until GPU completion. Both explicit
+/// waits and Drop drain the optional worker before recycling objects that the GPU can still read.
 pub struct PendingSegment {
     shared: std::sync::Arc<crate::VulkanShared>,
     /// `None` = already drained (the profiling degrade path in `finish_nowait`, or after `wait`).
@@ -13670,9 +14359,36 @@ pub struct PendingSegment {
     /// Dispatches this segment carried; consumed by the submit profiler and finite GPU tuner.
     dispatches: usize,
     timeline_query: Option<crate::timeline::Query>,
+    /// The fence is never reset/recycled until this worker's wait has returned.
+    waiter: Option<std::sync::mpsc::Receiver<std::result::Result<(), vk::Result>>>,
+    notice_producer: Option<std::sync::mpsc::Receiver<()>>,
 }
 
 impl PendingSegment {
+    pub(crate) fn notice_fence(&self) -> Option<vk::Fence> {
+        self.fence
+    }
+
+    pub(crate) fn retain_notice_producer(&mut self, done: std::sync::mpsc::Receiver<()>) {
+        assert!(self.notice_producer.replace(done).is_none());
+    }
+
+    pub(crate) fn start_waiter(&mut self, worker: &FenceWaiter) -> Result<()> {
+        let Some(fence) = self.fence else {
+            return Ok(());
+        };
+        debug_assert!(self.waiter.is_none());
+        let (done, receiver) = std::sync::mpsc::channel();
+        worker
+            .sender
+            .as_ref()
+            .expect("live fence waiter")
+            .send(FenceWaitJob { fence, done })
+            .map_err(|error| be(format!("submit resident fence wait: {error}")))?;
+        self.waiter = Some(receiver);
+        Ok(())
+    }
+
     /// Dispatches recorded into this segment's command buffer.
     pub fn dispatches(&self) -> usize {
         self.dispatches
@@ -13696,6 +14412,14 @@ impl PendingSegment {
     }
 
     fn drain(&mut self) -> Result<()> {
+        if let Some(done) = self.notice_producer.take() {
+            // No producer can query this fence after it is recycled, including Drop/error paths.
+            let _ack_wait = infr_core::timeline::span_with_submit(
+                "resident_notice_ack_wait",
+                self.timeline_query.as_ref().map_or(0, |query| query.id),
+            );
+            let _ = done.recv();
+        }
         let Some(fence) = self.fence.take() else {
             return Ok(()); // already drained
         };
@@ -13705,7 +14429,12 @@ impl PendingSegment {
             "fence_wait",
             self.timeline_query.as_ref().map_or(0, |query| query.id),
         );
-        let waited = unsafe { device.wait_for_fences(&[fence], true, u64::MAX) };
+        let waited = match self.waiter.take() {
+            Some(receiver) => receiver
+                .recv()
+                .unwrap_or_else(|_| unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }),
+            None => unsafe { device.wait_for_fences(&[fence], true, u64::MAX) },
+        };
         drop(wait_span);
         if waited.is_ok() {
             if let Some(query) = self.timeline_query.take() {
@@ -13730,6 +14459,7 @@ impl PendingSegment {
                 self.shared.return_submit_timing_query(submit_pool);
             }
         }
+        let _recycle = infr_core::timeline::span("resident_segment_recycle");
         self.shared.recorder_fences.lock().unwrap().push(fence);
         self.shared.recorder_cmds.lock().unwrap().push(self.cmd);
         self.shared
@@ -13907,6 +14637,30 @@ mod chunk_math_tests {
 mod tests {
     use super::*;
     use infr_core::{backend::BufferUsage, Backend};
+
+    #[test]
+    fn q8_wave32_uses_two_rows_only_for_very_wide_outputs() {
+        assert_eq!(
+            native_q8_wave32_choice(infr_core::DType::Q8_0, 2560, 248_320, true),
+            Some(2)
+        );
+        assert_eq!(
+            native_q8_wave32_choice(infr_core::DType::Q8_0, 2560, 10_240, true),
+            Some(4)
+        );
+        assert_eq!(
+            native_q8_wave32_choice(infr_core::DType::Q8_0, 6144, 2560, true),
+            Some(2)
+        );
+        assert_eq!(
+            native_q8_wave32_choice(infr_core::DType::Q8_0, 2560, 248_320, false),
+            None
+        );
+        assert_eq!(
+            native_q8_wave32_choice(infr_core::DType::F16, 2560, 248_320, true),
+            None
+        );
+    }
 
     #[test]
     #[ignore = "requires a Vulkan GPU"]
@@ -14151,6 +14905,482 @@ mod tests {
             device.destroy_fence(fence, None);
             device.destroy_semaphore(ready, None);
             device.destroy_semaphore(witness, None);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn gpu_resident_conditions_preserve_paused_state() {
+        let mut cfg = infr_core::config::Config::default();
+        cfg.kernels.vulkan.decode_gpu_resident = true;
+        let backend = VulkanBackend::new_with(std::sync::Arc::new(cfg)).unwrap();
+        assert!(
+            backend.shared.conditional_rendering.is_some(),
+            "conditional rendering required"
+        );
+        let control = backend.alloc(16, BufferUsage::Readback).unwrap();
+        let journal = backend
+            .alloc(4 * RESIDENT_JOURNAL_BYTES, BufferUsage::Readback)
+            .unwrap();
+        let tape = backend.alloc(3 * 16 * 8, BufferUsage::Staging).unwrap();
+        let source = backend.alloc(4, BufferUsage::Staging).unwrap();
+        backend
+            .upload(source.as_ref(), bytemuck::bytes_of(&17u32))
+            .unwrap();
+        let increment = backend.alloc(4, BufferUsage::Staging).unwrap();
+        backend
+            .upload(increment.as_ref(), bytemuck::bytes_of(&1f32))
+            .unwrap();
+        for rows in [1, 2] {
+            for missing_at in [None, Some(0), Some(1), Some(3)] {
+                for missing_role in 0..3 {
+                    let outputs: Vec<_> = (0..4)
+                        .map(|_| backend.alloc(4, BufferUsage::Readback).unwrap())
+                        .collect();
+                    let fronts: Vec<_> = (0..4)
+                        .map(|_| backend.alloc(4, BufferUsage::Readback).unwrap())
+                        .collect();
+                    let cleared: Vec<_> = (0..4)
+                        .map(|_| backend.alloc(4, BufferUsage::Readback).unwrap())
+                        .collect();
+                    let routed: Vec<_> = (0..4)
+                        .map(|_| backend.alloc(rows * 3 * 4, BufferUsage::Staging).unwrap())
+                        .collect();
+                    let mut addresses = vec![1u64; 48];
+                    if let Some(stage) = missing_at {
+                        addresses[missing_role * 16 + stage] = 0;
+                    }
+                    backend
+                        .upload(tape.as_ref(), bytemuck::cast_slice(&addresses))
+                        .unwrap();
+                    for stage in 0..4 {
+                        for buffer in [&outputs[stage], &cleared[stage]] {
+                            backend
+                                .upload(buffer.as_ref(), bytemuck::bytes_of(&99u32))
+                                .unwrap();
+                        }
+                        backend
+                            .upload(fronts[stage].as_ref(), bytemuck::bytes_of(&99f32))
+                            .unwrap();
+                        let ids = vec![stage as u32; rows * 3];
+                        backend
+                            .upload(routed[stage].as_ref(), bytemuck::cast_slice(&ids))
+                            .unwrap();
+                    }
+                    let rec = backend.recorder().unwrap();
+                    rec.gpu_resident_check(
+                        control.as_ref(),
+                        tape.as_ref(),
+                        control.as_ref(),
+                        journal.as_ref(),
+                        [0; 6],
+                    );
+                    rec.begin_conditional(control.as_ref());
+                    for stage in 0..4 {
+                        // Frontend runs up to and including the missed router, but no later state write.
+                        rec.add(
+                            fronts[stage].as_ref(),
+                            increment.as_ref(),
+                            fronts[stage].as_ref(),
+                            1,
+                        );
+                        rec.end_conditional();
+                        rec.gpu_resident_check(
+                            routed[stage].as_ref(),
+                            tape.as_ref(),
+                            control.as_ref(),
+                            journal.as_ref(),
+                            [(rows * 3) as u32, 16, 0, 16, 32, stage as u32],
+                        );
+                        rec.begin_conditional(control.as_ref());
+                        rec.copy(source.as_ref(), 0, outputs[stage].as_ref(), 0, 4);
+                        rec.zero(cleared[stage].as_ref(), 1);
+                    }
+                    rec.finish().unwrap();
+                    let mut status = [0u32; 4];
+                    backend
+                        .download(control.as_ref(), bytemuck::cast_slice_mut(&mut status))
+                        .unwrap();
+                    assert_eq!(
+                        status,
+                        missing_at.map_or([1, u32::MAX, 4, 0], |stage| [
+                            0,
+                            stage as u32,
+                            stage as u32 + 1,
+                            0
+                        ])
+                    );
+                    for stage in 0..4 {
+                        let hit = missing_at.is_none_or(|miss| stage < miss);
+                        let front = missing_at.is_none_or(|miss| stage <= miss);
+                        for (buffer, expected) in [
+                            (&outputs[stage], if hit { 17 } else { 99 }),
+                            (
+                                &fronts[stage],
+                                if front {
+                                    100f32.to_bits()
+                                } else {
+                                    99f32.to_bits()
+                                },
+                            ),
+                            (&cleared[stage], if hit { 0 } else { 99 }),
+                        ] {
+                            let mut actual = [0u32];
+                            backend
+                                .download(buffer.as_ref(), bytemuck::cast_slice_mut(&mut actual))
+                                .unwrap();
+                            assert_eq!(
+                                actual[0], expected,
+                                "rows={rows} miss={missing_at:?} role={missing_role} stage={stage}"
+                            );
+                        }
+                    }
+                    if let Some(missed) = missing_at {
+                        addresses.fill(1);
+                        backend
+                            .upload(tape.as_ref(), bytemuck::cast_slice(&addresses))
+                            .unwrap();
+                        let resumed = backend.recorder().unwrap();
+                        resumed.seed_barrier();
+                        resumed.gpu_resident_check(
+                            control.as_ref(),
+                            tape.as_ref(),
+                            control.as_ref(),
+                            journal.as_ref(),
+                            [0; 6],
+                        );
+                        resumed.begin_conditional(control.as_ref());
+                        for stage in missed..4 {
+                            // Resume at the missed FFN, not at its already-executed frontend.
+                            if stage > missed {
+                                resumed.add(
+                                    fronts[stage].as_ref(),
+                                    increment.as_ref(),
+                                    fronts[stage].as_ref(),
+                                    1,
+                                );
+                            }
+                            resumed.copy(source.as_ref(), 0, outputs[stage].as_ref(), 0, 4);
+                            resumed.zero(cleared[stage].as_ref(), 1);
+                        }
+                        resumed.finish().unwrap();
+                        for stage in 0..4 {
+                            let mut actual = [0f32];
+                            backend
+                                .download(
+                                    fronts[stage].as_ref(),
+                                    bytemuck::cast_slice_mut(&mut actual),
+                                )
+                                .unwrap();
+                            assert_eq!(actual[0], 100., "frontend must execute exactly once");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an idle Vulkan GPU; reports mechanism timings, not model throughput"]
+    fn gpu_resident_handoff_microbenchmark() {
+        let mut cfg = infr_core::config::Config::default();
+        cfg.kernels.vulkan.decode_gpu_resident = true;
+        let backend = VulkanBackend::new_with(std::sync::Arc::new(cfg)).unwrap();
+        assert!(backend.shared.conditional_rendering.is_some());
+        let device = &backend.shared.device;
+        let query = unsafe {
+            device.create_query_pool(
+                &vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(2),
+                None,
+            )
+        }
+        .unwrap();
+        let control = backend.alloc(16, BufferUsage::Readback).unwrap();
+        let journal = backend
+            .alloc(RESIDENT_JOURNAL_BYTES, BufferUsage::Readback)
+            .unwrap();
+        let tape = backend.alloc(512 * 3 * 8, BufferUsage::Staging).unwrap();
+        // One routed triplet: IQ2_S gate/up plus IQ4_NL down, ne=2560, nff=640.
+        let expert_bytes = 2 * (2560 * 640 / 256 * 82) + 2560 * 640 / 32 * 18;
+        let host_bytes = vec![0x3fu8; expert_bytes];
+        let host: std::sync::Arc<dyn Buffer> = std::sync::Arc::from(
+            backend
+                .alloc(expert_bytes, BufferUsage::HostWeights)
+                .unwrap(),
+        );
+        backend.upload(host.as_ref(), &host_bytes).unwrap();
+        let (expert, _) = backend.alloc_mapped_arena_bda(expert_bytes).unwrap();
+        let expert: std::sync::Arc<dyn Buffer> = std::sync::Arc::from(expert);
+        let dma_host: std::sync::Arc<dyn Buffer> = std::sync::Arc::from(
+            backend
+                .alloc(expert_bytes, BufferUsage::HostWeights)
+                .unwrap(),
+        );
+        backend.upload(dma_host.as_ref(), &host_bytes).unwrap();
+        for source in [&host, &dma_host] {
+            let crate::Backing::Pooled(allocation) = &as_vk_buf(source.as_ref()).unwrap().backing
+            else {
+                panic!("microbenchmark source must be allocator-owned host RAM")
+            };
+            let flags = allocation.memory_properties();
+            assert!(
+                !flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL),
+                "expert source must be RAM, not ReBAR VRAM: {flags:?}"
+            );
+            println!("HANDOFF_SOURCE memory={flags:?} bytes={expert_bytes}");
+        }
+        let dummy = backend.alloc(4, BufferUsage::Staging).unwrap();
+        let timestamp = |rec: &Recorder<'_>, index, stage| unsafe {
+            device.cmd_write_timestamp(rec.cmd, stage, query, index);
+        };
+        let ordering = |rec: &Recorder<'_>| unsafe {
+            device.cmd_pipeline_barrier(
+                rec.cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                    .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)],
+                &[],
+                &[],
+            );
+        };
+        for rows in [1, 2] {
+            let input = backend
+                .alloc(rows * 2560 * 4, BufferUsage::Activations)
+                .unwrap();
+            backend
+                .upload(
+                    input.as_ref(),
+                    bytemuck::cast_slice(&vec![1f32; rows * 2560]),
+                )
+                .unwrap();
+            let weight = backend.alloc(512 * 2560 * 4, BufferUsage::Weights).unwrap();
+            let mut weights = vec![0f32; 512 * 2560];
+            for e in 0..512 {
+                weights[e * 2560] = (512 - e) as f32;
+            }
+            backend
+                .upload(weight.as_ref(), bytemuck::cast_slice(&weights))
+                .unwrap();
+            let logits = backend
+                .alloc(rows * 512 * 4, BufferUsage::Activations)
+                .unwrap();
+            let ids = backend.alloc(rows * 10 * 4, BufferUsage::Readback).unwrap();
+            let wts = backend
+                .alloc(rows * 10 * 4, BufferUsage::Activations)
+                .unwrap();
+            let output = backend
+                .alloc(rows * 512 * 4, BufferUsage::Activations)
+                .unwrap();
+            let router = |rec: &Recorder<'_>| {
+                rec.linear_f32(
+                    weight.as_ref(),
+                    input.as_ref(),
+                    logits.as_ref(),
+                    rows,
+                    2560,
+                    512,
+                );
+                rec.moe_topk(
+                    logits.as_ref(),
+                    ids.as_ref(),
+                    wts.as_ref(),
+                    dummy.as_ref(),
+                    rows,
+                    512,
+                    10,
+                    1.,
+                    0,
+                    true,
+                    false,
+                    0,
+                    0,
+                    dummy.as_ref(),
+                    false,
+                );
+            };
+            let mut cases = vec![
+                "cpu_hit",
+                "gpu_hit",
+                "gpu_miss_push",
+                "gpu_miss_dma",
+                "gpu_miss_dedicated",
+            ];
+            if std::env::var_os("MOE4ALL_HANDOFF_REVERSE").is_some() {
+                cases.reverse();
+            }
+            for case in cases {
+                if case == "gpu_miss_dedicated" && backend.shared.dedicated_transfer.is_none() {
+                    continue;
+                }
+                let mut gaps = Vec::new();
+                let mut totals = Vec::new();
+                let mut host_prepare = Vec::new();
+                for sample in 0..112 {
+                    let missing = case.starts_with("gpu_miss");
+                    if missing {
+                        let ptr = as_vk_buf(expert.as_ref()).unwrap().mapped_ptr().unwrap();
+                        crate::copy_to_mapped(&[0u8; 4], unsafe { ptr.add(expert_bytes - 4) });
+                    }
+                    let mut addresses = vec![1u64; 1536];
+                    if missing {
+                        addresses[0] = 0;
+                    }
+                    backend
+                        .upload(tape.as_ref(), bytemuck::cast_slice(&addresses))
+                        .unwrap();
+                    let start = std::time::Instant::now();
+                    let rec = backend.recorder().unwrap();
+                    unsafe {
+                        device.cmd_reset_query_pool(rec.cmd, query, 0, 2);
+                    }
+                    rec.gpu_resident_check(
+                        control.as_ref(),
+                        tape.as_ref(),
+                        control.as_ref(),
+                        journal.as_ref(),
+                        [0; 6],
+                    );
+                    router(&rec);
+                    timestamp(&rec, 0, vk::PipelineStageFlags::BOTTOM_OF_PIPE);
+                    let rec = if case == "cpu_hit" {
+                        rec.publish_host_reads();
+                        rec.finish().unwrap();
+                        let mut routed = vec![0u32; rows * 10];
+                        backend
+                            .download(ids.as_ref(), bytemuck::cast_slice_mut(&mut routed))
+                            .unwrap();
+                        assert!(
+                            routed
+                                .iter()
+                                .all(|&id| (0..3)
+                                    .all(|role| addresses[role * 512 + id as usize] != 0))
+                        );
+                        let resumed = backend.recorder().unwrap();
+                        resumed.seed_barrier();
+                        resumed
+                    } else {
+                        rec.gpu_resident_check(
+                            ids.as_ref(),
+                            tape.as_ref(),
+                            control.as_ref(),
+                            journal.as_ref(),
+                            [(rows * 10) as u32, 512, 0, 512, 1024, 0],
+                        );
+                        if missing {
+                            rec.publish_host_reads();
+                            rec.finish().unwrap();
+                            let mut status = [0u32; 4];
+                            backend
+                                .download(control.as_ref(), bytemuck::cast_slice_mut(&mut status))
+                                .unwrap();
+                            assert_eq!(status, [0, 0, 1, 0]);
+                            let prepare = std::time::Instant::now();
+                            let resumed = backend.recorder().unwrap();
+                            resumed.seed_barrier();
+                            if case == "gpu_miss_push" {
+                                crate::copy_to_mapped(
+                                    &host_bytes,
+                                    as_vk_buf(expert.as_ref()).unwrap().mapped_ptr().unwrap(),
+                                );
+                                resumed.arena_stream_barrier();
+                            } else if case == "gpu_miss_dedicated" {
+                                assert!(resumed
+                                    .submit_dedicated_transfer(&[
+                                        crate::transfer::TransferCopyBatch {
+                                            src: std::sync::Arc::clone(&dma_host),
+                                            dst: std::sync::Arc::clone(&expert),
+                                            regions: vec![
+                                                vk::BufferCopy::default().size(expert_bytes as u64)
+                                            ],
+                                        }
+                                    ])
+                                    .unwrap());
+                            } else {
+                                resumed.copy(host.as_ref(), 0, expert.as_ref(), 0, expert_bytes);
+                            }
+                            addresses[0] = 1;
+                            backend
+                                .upload(tape.as_ref(), bytemuck::cast_slice(&addresses))
+                                .unwrap();
+                            if sample >= 16 {
+                                host_prepare.push(prepare.elapsed().as_secs_f64() * 1e6);
+                            }
+                            resumed.gpu_resident_check(
+                                control.as_ref(),
+                                tape.as_ref(),
+                                control.as_ref(),
+                                journal.as_ref(),
+                                [0; 6],
+                            );
+                            resumed.gpu_resident_check(
+                                ids.as_ref(),
+                                tape.as_ref(),
+                                control.as_ref(),
+                                journal.as_ref(),
+                                [(rows * 10) as u32, 512, 0, 512, 1024, 0],
+                            );
+                            resumed
+                        } else {
+                            rec
+                        }
+                    };
+                    if case != "cpu_hit" {
+                        rec.begin_conditional(control.as_ref());
+                    }
+                    ordering(&rec);
+                    timestamp(&rec, 1, vk::PipelineStageFlags::TOP_OF_PIPE);
+                    // Identical representative downstream compute, outside the handoff interval.
+                    rec.linear_f32(
+                        weight.as_ref(),
+                        input.as_ref(),
+                        output.as_ref(),
+                        rows,
+                        2560,
+                        512,
+                    );
+                    rec.finish().unwrap();
+                    let elapsed = start.elapsed().as_secs_f64() * 1e6;
+                    let mut stamps = [0u64; 2];
+                    unsafe {
+                        device.get_query_pool_results(
+                            query,
+                            0,
+                            &mut stamps,
+                            vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                        )
+                    }
+                    .unwrap();
+                    if sample >= 16 {
+                        gaps.push(
+                            stamps[1].wrapping_sub(stamps[0]) as f64
+                                * backend.shared.submit_timestamp_period_ns as f64
+                                / 1000.,
+                        );
+                        totals.push(elapsed);
+                    }
+                    if missing {
+                        let mut head = [0u8; 4];
+                        backend
+                            .download_range(expert.as_ref(), expert_bytes - 4, &mut head)
+                            .unwrap();
+                        assert_eq!(head, [0x3f; 4]);
+                    }
+                }
+                println!("HANDOFF_SAMPLES {{\"rows\":{rows},\"case\":\"{case}\",\"gap_us\":{gaps:?},\"wall_us\":{totals:?},\"host_prepare_us\":{host_prepare:?}}}");
+                for values in [&mut gaps, &mut totals, &mut host_prepare] {
+                    values.sort_by(f64::total_cmp);
+                }
+                println!("HANDOFF rows={rows} case={case} samples=96 gap_p50_us={:.3} gap_p90_us={:.3} wall_p50_us={:.3} host_prepare_p50_us={:.3} expert_bytes={expert_bytes}",
+                    gaps[48], gaps[86], totals[48], host_prepare.get(48).copied().unwrap_or(0.));
+            }
+        }
+        unsafe {
+            device.destroy_query_pool(query, None);
         }
     }
 
@@ -14700,7 +15930,7 @@ mod tests {
         .unwrap();
         let args = be.alloc(16, BufferUsage::Activations).unwrap();
         let rec = be.recorder().unwrap();
-        rec.attn_live_prologue(params.as_ref(), args.as_ref(), nh, chunk, win);
+        rec.attn_live_prologue(params.as_ref(), args.as_ref(), nh, chunk, 512, win);
         rec.attention_kv_split_dynac(
             bq.as_ref(),
             bk.as_ref(),
@@ -14719,6 +15949,7 @@ mod tests {
             scale,
             win,
             false, // f16 KV cache
+            false, // fused GQA4 grid
             0,     // cap (unused for f16)
         );
         rec.finish().unwrap();
@@ -17037,7 +18268,7 @@ mod tests {
                 .flat_map(|buffer| [1u32, 2, 4, 8].map(move |nr| (buffer, nr)))
             {
                 let mut cfg = infr_core::config::Config::default();
-                cfg.kernels.vulkan.gemv.id_grid_buffer_nr = nr;
+                cfg.kernels.vulkan.gemv.id_grid_buffer_nr = Some(nr);
                 cfg.kernels.vulkan.gemv.id_grid_nr = nr;
                 cfg.kernels.vulkan.gemv.id_grid_buffer = Some(buffer_grid);
                 let be = VulkanBackend::new_on_with(1, std::sync::Arc::new(cfg)).unwrap();
@@ -17180,6 +18411,103 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires Vulkan1; exact Q8_0 Wave32 parity and timing"]
+    fn q8_wave32_matches_tree_bitwise() {
+        use infr_core::backend::{Backend, BufferUsage};
+
+        let be = VulkanBackend::new_on_with(
+            1,
+            std::sync::Arc::new(infr_core::config::Config::default()),
+        )
+        .unwrap();
+        for (case, (k, n)) in [
+            (320usize, 10240usize),
+            (2560usize, 6144usize),
+            (2560, 10240),
+            (6144, 2560),
+            (10240, 320),
+            (10240, 2560),
+            (12288, 2560),
+            (2560, 248320),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let weight = be
+                .upload_weight_bytes(&infr_testkit::synth_weight(
+                    infr_core::DType::Q8_0,
+                    k * n,
+                    900 + case as u32,
+                ))
+                .unwrap();
+            let input_values = (0..k)
+                .map(|i| (i as f32 * 0.013).sin() * 0.2)
+                .collect::<Vec<_>>();
+            let input = be.alloc(k * 4, BufferUsage::Activations).unwrap();
+            let tree = be.alloc(n * 4, BufferUsage::Readback).unwrap();
+            let waves = (0..3)
+                .map(|_| be.alloc(n * 4, BufferUsage::Readback).unwrap())
+                .collect::<Vec<_>>();
+            be.upload(input.as_ref(), bytemuck::cast_slice(&input_values))
+                .unwrap();
+
+            let run = |nr: u32, reps: usize| {
+                let rec = be.recorder().unwrap();
+                for _ in 0..reps {
+                    if nr != 0 {
+                        rec.linear_native_q8_wave32_at(
+                            weight.device_addr().unwrap(),
+                            0,
+                            input.as_ref(),
+                            None,
+                            waves[nr.trailing_zeros() as usize].as_ref(),
+                            k,
+                            n,
+                            nr,
+                        );
+                    } else {
+                        rec.linear_native_at(
+                            infr_core::DType::Q8_0,
+                            weight.device_addr().unwrap(),
+                            0,
+                            input.as_ref(),
+                            tree.as_ref(),
+                            1,
+                            k,
+                            n,
+                        );
+                    }
+                }
+                let start = std::time::Instant::now();
+                rec.finish().unwrap();
+                start.elapsed().as_secs_f64() * 1e6 / reps as f64
+            };
+
+            run(0, 1);
+            for nr in [1, 2, 4] {
+                run(nr, 1);
+            }
+            let mut tree_bytes = vec![0u8; n * 4];
+            be.download(tree.as_ref(), &mut tree_bytes).unwrap();
+            for (nr, wave) in [1u32, 2, 4].into_iter().zip(&waves) {
+                let mut wave_bytes = vec![0u8; n * 4];
+                be.download(wave.as_ref(), &mut wave_bytes).unwrap();
+                assert_eq!(
+                    wave_bytes, tree_bytes,
+                    "Q8 Wave32 NR={nr} differs at K={k}, N={n}"
+                );
+            }
+
+            let tree_us = (0..4).map(|_| run(0, 64)).collect::<Vec<_>>();
+            let waves_us = [1u32, 2, 4]
+                .into_iter()
+                .map(|nr| (nr, (0..4).map(|_| run(nr, 64)).collect::<Vec<_>>()))
+                .collect::<Vec<_>>();
+            println!("Q8 K={k}, N={n}, tree_us={tree_us:?}, waves_us={waves_us:?}");
         }
     }
 
@@ -17690,14 +19018,14 @@ mod tests {
         );
     }
 
-    /// Exercise every wave in the 512-expert, top-10 sigmoid router shape used by Qwen3.8.
+    /// Exercise every lane in the 512-expert, top-10 fast router for both supported gates.
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn moe_topk_512_experts_selects_exact_top10() {
         let (n_tokens, n_expert, n_used) = (1usize, 512usize, 10usize);
         let logits: Vec<f32> = (0..n_expert).map(|i| i as f32 / 512.0).collect();
         let dummy = vec![0.0f32; n_expert];
-        let run = |wave32: bool| {
+        let run = |wave32: bool, gating: u32, reps: usize| {
             let be = be_with(|cfg| cfg.moe_topk_sg = wave32);
             let blog = upf32(&be, &logits);
             let bdummy = upf32(&be, &dummy);
@@ -17708,24 +19036,28 @@ mod tests {
                 .alloc(n_tokens * n_used * 4, BufferUsage::Readback)
                 .unwrap();
             let rec = be.recorder().unwrap();
-            rec.moe_topk(
-                blog.as_ref(),
-                bids.as_ref(),
-                bwts.as_ref(),
-                bdummy.as_ref(),
-                n_tokens,
-                n_expert,
-                n_used,
-                1.0,
-                1,    // sigmoid
-                true, // normalize selected weights
-                false,
-                0,
-                0,
-                bdummy.as_ref(),
-                false,
-            );
+            for _ in 0..reps {
+                rec.moe_topk(
+                    blog.as_ref(),
+                    bids.as_ref(),
+                    bwts.as_ref(),
+                    bdummy.as_ref(),
+                    n_tokens,
+                    n_expert,
+                    n_used,
+                    1.0,
+                    gating,
+                    true, // normalize selected weights
+                    false,
+                    0,
+                    0,
+                    bdummy.as_ref(),
+                    false,
+                );
+            }
+            let start = std::time::Instant::now();
             rec.finish().unwrap();
+            let us = start.elapsed().as_secs_f64() * 1e6 / reps as f64;
             let mut idb = vec![0u8; n_tokens * n_used * 4];
             be.download(bids.as_ref(), &mut idb).unwrap();
             let mut wb = vec![0u8; n_tokens * n_used * 4];
@@ -17733,20 +19065,24 @@ mod tests {
             (
                 bytemuck::cast_slice::<u8, u32>(&idb).to_vec(),
                 bytemuck::cast_slice::<u8, u32>(&wb).to_vec(),
+                us,
             )
         };
-        let (ids, weight_bits) = run(true);
-        let (fallback_ids, fallback_weight_bits) = run(false);
-        let expected: Vec<u32> = (502..512).rev().collect();
-        assert_eq!(ids, expected, "512-expert top-10 selection changed");
-        assert_eq!(ids, fallback_ids, "wave32 ids differ from generic router");
-        assert_eq!(
-            weight_bits, fallback_weight_bits,
-            "wave32 weights differ bitwise from generic router"
-        );
-        let wts: &[f32] = bytemuck::cast_slice(&weight_bits);
-        assert!(wts.iter().all(|w| w.is_finite() && *w > 0.0));
-        assert!((wts.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        for gating in [0, 1] {
+            let (ids, weight_bits, fast_us) = run(true, gating, 256);
+            let (fallback_ids, fallback_weight_bits, generic_us) = run(false, gating, 256);
+            println!("moe top-k gating={gating}: wave32={fast_us:.3}us generic={generic_us:.3}us");
+            let expected: Vec<u32> = (502..512).rev().collect();
+            assert_eq!(ids, expected, "512-expert top-10 selection changed");
+            assert_eq!(ids, fallback_ids, "wave32 ids differ from generic router");
+            assert_eq!(
+                weight_bits, fallback_weight_bits,
+                "wave32 weights differ bitwise from generic router for gating={gating}"
+            );
+            let wts: &[f32] = bytemuck::cast_slice(&weight_bits);
+            assert!(wts.iter().all(|w| w.is_finite() && *w > 0.0));
+            assert!((wts.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        }
     }
 
     #[test]

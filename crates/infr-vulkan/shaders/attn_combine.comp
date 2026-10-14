@@ -27,8 +27,6 @@ void main() {
     uint h = gl_WorkGroupID.x / pc.ntile;
     uint tile = gl_WorkGroupID.x % pc.ntile;
     uint hd = pc.hd;
-    uint hdt = hd / pc.ntile;
-    uint d0 = tile * hdt;
     uint t = gl_LocalInvocationID.x;
     uint base = h * pc.n_chunks;
 #ifdef USE_LIVE
@@ -36,24 +34,59 @@ void main() {
 #else
     uint nch = pc.n_chunks;
 #endif
-#ifdef SUBGROUP_REDUCE
+#ifdef HYBRID_REDUCE
+    // Record-once replay cannot swap pipelines as KV grows. Keep the established four-tile serial
+    // combine while the live split count is small, then use all 16 tiles and wave32 reductions at
+    // deep context. Extra short-context workgroups return uniformly before touching shared state.
+    bool use_sg = nch >= 128u;
+    uint logical_ntile = use_sg ? pc.ntile : 4u;
+    if (!use_sg && tile >= logical_ntile) { return; }
+#else
+    uint logical_ntile = pc.ntile;
+#endif
+    uint hdt = hd / logical_ntile;
+    uint d0 = tile * hdt;
+    float mm;
+    float l;
+#if defined(SUBGROUP_REDUCE) && defined(HYBRID_REDUCE)
+    if (use_sg) {
+        float lane_m = -3.0e38;
+        for (uint c = t; c < nch; c += 32u) { lane_m = max(lane_m, pm[base + c]); }
+        mm = subgroupMax(lane_m);
+        float lane_l = 0.0;
+        for (uint c = t; c < nch; c += 32u) {
+            float w = exp(pm[base + c] - mm);
+            wexp[c] = w;
+            lane_l += pl[base + c] * w;
+        }
+        l = subgroupAdd(lane_l);
+        barrier();
+    } else {
+        mm = -3.0e38;
+        for (uint c = 0u; c < nch; c++) { mm = max(mm, pm[base + c]); }
+        for (uint c = t; c < nch; c += 32u) { wexp[c] = exp(pm[base + c] - mm); }
+        barrier();
+        l = 0.0;
+        for (uint c = 0u; c < nch; c++) { l += pl[base + c] * wexp[c]; }
+    }
+#elif defined(SUBGROUP_REDUCE)
     float lane_m = -3.0e38;
     for (uint c = t; c < nch; c += 32u) { lane_m = max(lane_m, pm[base + c]); }
-    float mm = subgroupMax(lane_m);
+    mm = subgroupMax(lane_m);
     float lane_l = 0.0;
     for (uint c = t; c < nch; c += 32u) {
         float w = exp(pm[base + c] - mm);
         wexp[c] = w;
         lane_l += pl[base + c] * w;
     }
-    float l = subgroupAdd(lane_l);
+    l = subgroupAdd(lane_l);
     barrier();
 #else
-    float mm = -3.0e38;
+    mm = -3.0e38;
     for (uint c = 0u; c < nch; c++) { mm = max(mm, pm[base + c]); }
     for (uint c = t; c < nch; c += 32u) { wexp[c] = exp(pm[base + c] - mm); }
     barrier();
-    float l = 0.0;
+    l = 0.0;
     for (uint c = 0u; c < nch; c++) { l += pl[base + c] * wexp[c]; }
 #endif
     float inv = 1.0 / l;

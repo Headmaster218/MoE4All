@@ -580,6 +580,13 @@ impl Config {
             || (self.bailingmoe3 && !self.is_bailing_mla_layer(il))
     }
 
+    /// Whether this architecture has been validated with independent sequence rows in one
+    /// layer-synchronous token graph. This is deliberately narrower than "has recurrent layers":
+    /// each architecture must first define correct row-wise persistent-state bindings.
+    pub fn supports_parallel_token_rows(&self) -> bool {
+        self.qwen35 || self.qwen4exp
+    }
+
     pub fn recurrent_conv_channels(&self) -> usize {
         if self.bailingmoe3 {
             3 * self.n_head * self.kda_head_dim

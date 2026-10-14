@@ -2,14 +2,14 @@
 //!
 //! # What this is (and what it is not)
 //!
-//! Every sequence owns one KV slot. Qwen3.8 text requests register with one persistent compute
+//! Every sequence owns one KV slot. Supported Qwen hybrid text requests register with one persistent compute
 //! worker before tokenization, then enqueue their prepared task and remain under that scheduler
 //! through completion; no request thread doubles as the cohort leader. Decode rows run
 //! layer-synchronously. Up to 96 uncached prompt tokens advance as teacher-forced rows in the same
 //! Decode-LRU graphs; longer prompts share the configured ubatch in one exclusive Prefill-ring
 //! phase before decode resumes. Stateless work and paged expert traffic are shared while every
-//! sequence retains independent positions, KV/recurrent state and sampling. Dense/sparse QSA rows
-//! form compatible subgroups but never fall back to independent request loops. Other architectures
+//! sequence retains independent positions, KV/recurrent state and sampling. Qwen3.8 dense/sparse
+//! QSA rows form compatible subgroups but never fall back to independent request loops. Other architectures
 //! and constrained generation retain the established interleaved path through
 //! [`crate::sampling::StepGate`].
 //!
@@ -306,6 +306,32 @@ fn phase_for_remaining_prefill(tokens: usize) -> BatchPhase {
         BatchPhase::ShortPrefill
     } else {
         BatchPhase::LongPrefill
+    }
+}
+
+fn long_prefill_phase_prompt_end(
+    start: usize,
+    prompt_end: usize,
+    checkpoint_boundaries: &[Option<usize>; crate::seam::TURN_CHECKPOINT_COUNT],
+) -> usize {
+    let frontier = prompt_end.saturating_sub(1);
+    checkpoint_boundaries
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|&boundary| {
+            boundary > start && boundary < frontier && frontier - boundary <= SHORT_PREFILL_TOKENS
+        })
+        .max()
+        .map(|boundary| boundary + 1)
+        .unwrap_or(prompt_end)
+}
+
+fn long_prefill_cohort_limit(config: &Config) -> usize {
+    if config.qwen4exp {
+        MAX_DECODE_BATCH
+    } else {
+        1
     }
 }
 
@@ -776,7 +802,7 @@ fn cold_session_worker(
             Err(error) => {
                 tracing::warn!(
                     slot = index,
-                    "cold KV idle spill failed; keeping the resident state: {error}"
+                    "cold KV idle spill failed; keeping the resident state: {error:#}"
                 );
                 true
             }
@@ -1080,7 +1106,7 @@ impl ParallelSeam {
     }
 
     fn start_scheduler_worker(&mut self) -> Result<()> {
-        if self.gate.is_none() || !self.model.config().qwen4exp {
+        if self.gate.is_none() || !self.model.config().supports_parallel_token_rows() {
             return Ok(());
         }
         let stop = Arc::new(AtomicBool::new(false));
@@ -2251,7 +2277,7 @@ impl ParallelSeam {
             prompt_tokens = work.prompt_end,
             remaining = work.remaining_prefill(),
             phase = ?work.phase,
-            "prepared work for the unified Qwen3.8 scheduler"
+            "prepared work for the unified Qwen hybrid scheduler"
         );
         Ok(())
     }
@@ -2259,8 +2285,10 @@ impl ParallelSeam {
     fn run_long_prefill_phase(&self, active: &mut Vec<BatchWork>, req: &RequestCtx) -> Result<()> {
         let mut long = Vec::new();
         let mut token_work = Vec::with_capacity(active.len());
+        let long_prefill_limit = long_prefill_cohort_limit(self.model.config());
+        let batch_prefill_rows = long_prefill_limit > 1;
         for work in active.drain(..) {
-            if work.phase == BatchPhase::LongPrefill {
+            if work.phase == BatchPhase::LongPrefill && long.len() < long_prefill_limit {
                 long.push(work);
             } else {
                 token_work.push(work);
@@ -2271,9 +2299,20 @@ impl ParallelSeam {
             return Ok(());
         }
 
+        let phase_prompt_ends = long
+            .iter()
+            .map(|work| {
+                long_prefill_phase_prompt_end(
+                    work.kv().cached_len(),
+                    work.prompt_end,
+                    &work.checkpoint_boundaries,
+                )
+            })
+            .collect::<Vec<_>>();
         let prompts = long
             .iter()
-            .map(|work| work.prompt[..work.prompt_end].to_vec())
+            .zip(&phase_prompt_ends)
+            .map(|(work, &end)| work.prompt[..end].to_vec())
             .collect::<Vec<_>>();
         let prepared = long
             .iter()
@@ -2306,21 +2345,39 @@ impl ParallelSeam {
             // avoids per-chunk baton release and prevents unrelated legacy work from rebuilding
             // Decode LRU between ring chunks.
             let _gate = req.gate_pass();
-            crate::seam::generate_dense_vulkan_parallel_prefill_session(
-                self.vk.as_ref(),
-                self.model.gguf(),
-                self.model.config(),
-                self.model.engine_cfg(),
-                self.model.embd(),
-                self.model.per_layer_embd(),
-                &prompts,
-                &mut primary,
-                &mut peers,
-                self.max_ctx,
-                &prepared,
-                Some(&report_progress),
-                None,
-            )
+            if batch_prefill_rows {
+                crate::seam::generate_dense_vulkan_parallel_prefill_session(
+                    self.vk.as_ref(),
+                    self.model.gguf(),
+                    self.model.config(),
+                    self.model.engine_cfg(),
+                    self.model.embd(),
+                    self.model.per_layer_embd(),
+                    &prompts,
+                    &mut primary,
+                    &mut peers,
+                    self.max_ctx,
+                    &prepared,
+                    Some(&report_progress),
+                    None,
+                )
+            } else {
+                debug_assert_eq!(prompts.len(), 1);
+                debug_assert!(peers.is_empty());
+                crate::seam::generate_dense_vulkan_prepared_prefill_session(
+                    self.vk.as_ref(),
+                    self.model.gguf(),
+                    self.model.config(),
+                    self.model.engine_cfg(),
+                    self.model.embd(),
+                    self.model.per_layer_embd(),
+                    &prompts[0],
+                    &mut primary,
+                    self.max_ctx,
+                    prepared[0].clone(),
+                )
+                .map(|stats| vec![stats])
+            }
         };
         long[0].kv = primary;
         for (work, kv) in long.iter_mut().skip(1).zip(peers) {
@@ -2344,7 +2401,8 @@ impl ParallelSeam {
         };
         if long
             .iter()
-            .any(|work| work.kv().cached_len() + 1 != work.prompt_end)
+            .zip(&phase_prompt_ends)
+            .any(|(work, &end)| work.kv().cached_len() + 1 != end)
         {
             active.extend(long);
             return Err(anyhow!(
@@ -2353,15 +2411,20 @@ impl ParallelSeam {
         }
         for (work, stats) in long.iter_mut().zip(stats) {
             work.stats.prompt_secs += stats.prompt_secs;
-            work.phase = BatchPhase::Decode;
-            work.checkpoint_boundaries = [None; crate::seam::TURN_CHECKPOINT_COUNT];
+            let cached_len = work.kv().cached_len();
+            for boundary in &mut work.checkpoint_boundaries {
+                if boundary.is_some_and(|boundary| cached_len >= boundary) {
+                    *boundary = None;
+                }
+            }
+            work.phase = phase_for_remaining_prefill(work.remaining_prefill());
             let progress = infr_core::GenerationProgress {
                 phase: infr_core::GenerationPhase::Prefill,
                 prompt_tokens: work.prompt_end as u64,
                 cached_prompt_tokens: work.prefill_start as u64,
-                prefill_tokens: work.prompt_end.saturating_sub(work.prefill_start) as u64,
+                prefill_tokens: cached_len.saturating_sub(work.prefill_start) as u64,
                 completion_tokens: 0,
-                context_tokens: work.prompt_end.saturating_sub(1) as u64,
+                context_tokens: cached_len as u64,
                 context_limit: self.max_ctx as u64,
             };
             if let Some(channels) = work.channels.as_ref() {
@@ -3349,10 +3412,20 @@ impl ParallelSeam {
         let ec = self.model.engine_cfg();
         let h_width = cfg.hc_mult * cfg.n_embd;
         let rows = crate::mtp::DRAFT_TOKENS;
+        let timeline_positions = indices
+            .iter()
+            .map(|&index| active[index].kv().cached_len())
+            .collect::<Vec<_>>();
+        let _timeline_cycle = infr_core::timeline::begin_step(&timeline_positions);
+        let timeline_snapshot = infr_core::timeline::span("mtp_snapshot_refresh");
         self.refresh_mtp_snapshots(active, indices)?;
+        drop(timeline_snapshot);
         let t0 = Instant::now();
+        let timeline_draft = infr_core::timeline::span("mtp_draft");
         let (feeds, predictions) = {
+            let timeline_gate_wait = infr_core::timeline::span("mtp_draft_gate_wait");
             let _gate = req.gate_pass();
+            drop(timeline_gate_wait);
             let mut heads = self
                 .mtp_heads
                 .as_ref()
@@ -3391,9 +3464,13 @@ impl ParallelSeam {
             }
             (feeds, predictions)
         };
+        drop(timeline_draft);
 
+        let timeline_verify = infr_core::timeline::span("mtp_verify");
         let (mut verify_ids, mut verify_logits, verify_hidden) = {
+            let timeline_gate_wait = infr_core::timeline::span("mtp_verify_gate_wait");
             let _gate = req.gate_pass();
+            drop(timeline_gate_wait);
             let mut owned_mrope_plans = indices
                 .iter()
                 .map(|&index| active[index].mrope_plan.take())
@@ -3429,6 +3506,7 @@ impl ParallelSeam {
             }
             result?
         };
+        drop(timeline_verify);
         anyhow::ensure!(
             verify_ids.len() == indices.len()
                 && verify_logits.len() == indices.len()
@@ -3439,6 +3517,7 @@ impl ParallelSeam {
 
         let mut cycle = MtpBatchCycleStats::default();
         for (lane_index, &index) in indices.iter().enumerate() {
+            let timeline_accept = infr_core::timeline::span("mtp_accept_emit");
             let work = &mut active[index];
             let pending_emitted = self
                 .mtp_heads
@@ -3528,9 +3607,13 @@ impl ParallelSeam {
                     break;
                 }
             }
+            drop(timeline_accept);
             let restore_t0 = Instant::now();
+            let timeline_restore = infr_core::timeline::span("mtp_restore");
             {
+                let timeline_gate_wait = infr_core::timeline::span("mtp_restore_gate_wait");
                 let _gate = req.gate_pass();
+                drop(timeline_gate_wait);
                 let kv = work.kv.as_mut().expect("MTP lane has target KV");
                 if committed < rows {
                     kv.mtp_restore_delta_row(self.vk.as_ref(), committed)?;
@@ -3553,6 +3636,7 @@ impl ParallelSeam {
                         .copy_from_slice(&hidden[(committed - 1) * h_width..committed * h_width]);
                 }
             }
+            drop(timeline_restore);
             work.prompt.extend_from_slice(
                 &feeds[lane_index][old_len + already_emitted..old_len + committed],
             );
@@ -3699,7 +3783,7 @@ impl ParallelSeam {
                 && (effective.temp <= 0.0 || effective.top_k == 1)
                 && !req.sampling().penalties_active()
         });
-        let initially_eligible = self.model.config().qwen4exp
+        let initially_eligible = self.model.config().supports_parallel_token_rows()
             && constraint.is_none()
             && self.gate.is_some()
             && mtp_eligible
@@ -3805,7 +3889,7 @@ impl ParallelSeam {
         )
     }
 
-    /// Generate one Qwen3.8 vision turn. Projector execution is completed by the caller before
+    /// Generate one Qwen hybrid vision turn. Projector execution is completed by the caller before
     /// entering here, so its request-scoped weights have already returned to the unified arena.
     pub fn generate_multimodal_turn(
         &self,
@@ -3816,9 +3900,9 @@ impl ParallelSeam {
         req: &RequestCtx,
         mut on_piece: impl FnMut(&str),
     ) -> Result<GenStats> {
-        if !self.model.config().qwen4exp {
+        if !(self.model.config().qwen4exp || self.model.config().qwen35) {
             return Err(anyhow!(
-                "vision text integration currently supports qwen4exp models only"
+                "vision text integration currently supports qwen4exp and qwen35 models only"
             ));
         }
         if images.is_empty() {
@@ -4057,7 +4141,8 @@ impl ParallelSeam {
 mod tests {
     use super::{
         concurrent_mtp_profitable, concurrent_mtp_ready, expand_multimodal_prompt,
-        mtp_accepted_rows, mtp_context_profitable, multimodal_key, multimodal_token_position,
+        long_prefill_cohort_limit, long_prefill_phase_prompt_end, mtp_accepted_rows,
+        mtp_context_profitable, multimodal_key, multimodal_token_position,
         phase_for_remaining_prefill, pick_continuation, scheduler_mode,
         should_handoff_multimodal_to_scheduler, token_lane_sort_key, BatchPhase,
         MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
@@ -4076,6 +4161,44 @@ mod tests {
             phase_for_remaining_prefill(SHORT_PREFILL_TOKENS + 1),
             BatchPhase::LongPrefill
         );
+    }
+
+    #[test]
+    fn long_prefill_hands_a_short_checkpoint_tail_to_token_steps() {
+        assert_eq!(
+            long_prefill_phase_prompt_end(0, 30_000, &[Some(29_950), None]),
+            29_951
+        );
+        assert_eq!(
+            long_prefill_phase_prompt_end(0, 30_000, &[Some(29_900), None]),
+            30_000
+        );
+        assert_eq!(
+            long_prefill_phase_prompt_end(29_950, 30_000, &[Some(29_950), None]),
+            30_000
+        );
+    }
+
+    #[test]
+    fn qwen35_batches_decode_but_serializes_long_prefill() {
+        let qwen35 = crate::Config {
+            qwen35: true,
+            ..Default::default()
+        };
+        assert!(qwen35.supports_parallel_token_rows());
+        assert_eq!(long_prefill_cohort_limit(&qwen35), 1);
+
+        let qwen4exp = crate::Config {
+            qwen4exp: true,
+            ..Default::default()
+        };
+        assert!(qwen4exp.supports_parallel_token_rows());
+        assert_eq!(
+            long_prefill_cohort_limit(&qwen4exp),
+            super::MAX_DECODE_BATCH
+        );
+
+        assert!(!crate::Config::default().supports_parallel_token_rows());
     }
 
     #[test]

@@ -7,6 +7,8 @@ use std::sync::{Mutex, OnceLock};
 use serde::Serialize;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+static DEVICE_TIMESTAMPS: AtomicBool = AtomicBool::new(false);
+static HOST_SPANS: AtomicBool = AtomicBool::new(false);
 static NEXT_STEP: AtomicU64 = AtomicU64::new(0);
 static NEXT_SUBMIT: AtomicU64 = AtomicU64::new(1);
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
@@ -15,6 +17,8 @@ const MAX_EVENTS: usize = 2_000_000;
 thread_local! {
     static CONTEXT: Cell<Option<Context>> = const { Cell::new(None) };
     static EVENTS: RefCell<Vec<HostEvent>> = const { RefCell::new(Vec::new()) };
+    static DEVICE_PHASE: Cell<Option<&'static str>> = const { Cell::new(None) };
+    static LOCAL_HOST_SPANS: Cell<bool> = const { Cell::new(true) };
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -67,6 +71,16 @@ pub struct DeviceEvent {
     pub dispatches: usize,
 }
 
+#[derive(Serialize)]
+pub struct ResidentNotice {
+    pub context: Context,
+    pub ordinal: usize,
+    pub status: u32,
+    pub hit_masks: [u32; 4],
+    pub count: usize,
+    pub routed_ids: Vec<u32>,
+}
+
 struct State {
     path: PathBuf,
     origin_ns: u64,
@@ -79,6 +93,7 @@ struct State {
     steps: Vec<Step>,
     device: Vec<DeviceEvent>,
     clocks: Vec<ClockSample>,
+    resident_notices: Vec<ResidentNotice>,
     dropped: usize,
 }
 
@@ -124,6 +139,9 @@ pub fn configure(cfg: &crate::config::ProfCfg) -> Result<(), String> {
     if cfg.ops || cfg.stages {
         return Err("timeline requires prof.ops=false and prof.stages=false to preserve asynchronous submits".into());
     }
+    if cfg.timeline_cpu_only && cfg.timeline_gpu_only {
+        return Err("timeline_cpu_only and timeline_gpu_only are mutually exclusive".into());
+    }
     if cfg.timeline_steps == 0
         || cfg.timeline_stride < cfg.timeline_steps
         || cfg.timeline_windows == 0
@@ -143,9 +161,12 @@ pub fn configure(cfg: &crate::config::ProfCfg) -> Result<(), String> {
             steps: Vec::new(),
             device: Vec::with_capacity(20_000),
             clocks: Vec::new(),
+            resident_notices: Vec::new(),
             dropped: 0,
         }))
         .map_err(|_| "timeline already configured".to_string())?;
+    DEVICE_TIMESTAMPS.store(wants_device_timestamps(cfg), Ordering::Relaxed);
+    HOST_SPANS.store(!cfg.timeline_gpu_only, Ordering::Relaxed);
     ENABLED.store(true, Ordering::Release);
     Ok(())
 }
@@ -155,7 +176,48 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+fn wants_device_timestamps(cfg: &crate::config::ProfCfg) -> bool {
+    cfg.timeline_path.is_some() && !cfg.timeline_cpu_only
+}
+
 #[inline]
+pub fn device_enabled() -> bool {
+    ENABLED.load(Ordering::Acquire) && DEVICE_TIMESTAMPS.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn host_enabled() -> bool {
+    enabled() && HOST_SPANS.load(Ordering::Relaxed)
+}
+
+/// Propagate GPU context without misclassifying uploader spans as main-thread CPU work.
+pub struct ContextGuard(Option<Context>, bool);
+pub fn scoped_context(context: Option<Context>) -> ContextGuard {
+    ContextGuard(
+        CONTEXT.with(|current| current.replace(context)),
+        LOCAL_HOST_SPANS.with(|current| current.replace(false)),
+    )
+}
+impl Drop for ContextGuard {
+    fn drop(&mut self) {
+        CONTEXT.with(|current| current.set(self.0));
+        LOCAL_HOST_SPANS.with(|current| current.set(self.1));
+    }
+}
+
+pub struct DevicePhaseGuard(Option<&'static str>);
+pub fn device_phase_scope(phase: &'static str) -> DevicePhaseGuard {
+    DevicePhaseGuard(DEVICE_PHASE.with(|current| current.replace(Some(phase))))
+}
+pub fn device_phase() -> Option<&'static str> {
+    DEVICE_PHASE.with(Cell::get)
+}
+impl Drop for DevicePhaseGuard {
+    fn drop(&mut self) {
+        DEVICE_PHASE.with(|current| current.set(self.0));
+    }
+}
+
 pub fn context() -> Option<Context> {
     if !enabled() {
         return None;
@@ -254,12 +316,47 @@ pub fn span(name: &'static str) -> Option<Span> {
 }
 
 pub fn span_with_submit(name: &'static str, submit: u64) -> Option<Span> {
+    if !host_enabled() || !LOCAL_HOST_SPANS.with(Cell::get) {
+        return None;
+    }
     context().map(|ctx| Span {
         name,
         ctx,
         start: clock_ns(),
         submit,
     })
+}
+
+fn background_context() -> Option<Context> {
+    if LOCAL_HOST_SPANS.with(Cell::get) {
+        None
+    } else {
+        CONTEXT.with(Cell::get)
+    }
+}
+
+/// Explicit worker phases use the global recorder; normal uploader spans remain suppressed.
+pub struct BackgroundSpan {
+    name: &'static str,
+    context: Context,
+    start_ns: u64,
+}
+
+pub fn background_span(name: &'static str) -> Option<BackgroundSpan> {
+    if !host_enabled() {
+        return None;
+    }
+    background_context().map(|context| BackgroundSpan {
+        name,
+        context,
+        start_ns: clock_ns(),
+    })
+}
+
+impl Drop for BackgroundSpan {
+    fn drop(&mut self) {
+        record_cpu_miss(self.name, self.context, self.start_ns, clock_ns());
+    }
 }
 
 impl Drop for Span {
@@ -306,6 +403,9 @@ pub fn record_device(event: DeviceEvent) {
 /// A background CPU producer retains the submitting decode step's context rather than using its
 /// own (empty) thread-local graph context. The interval is wall time, including worker handoffs.
 pub fn record_cpu_miss(name: &'static str, context: Context, start_ns: u64, end_ns: u64) {
+    if !host_enabled() {
+        return;
+    }
     if let Some(state) = STATE.get() {
         let mut state = state.lock().unwrap();
         if state.events.len() < MAX_EVENTS {
@@ -318,6 +418,13 @@ pub fn record_cpu_miss(name: &'static str, context: Context, start_ns: u64, end_
             });
         } else {
             state.dropped += 1;
+        }
+    }
+}
+pub fn record_resident_notice(notice: ResidentNotice) {
+    if device_enabled() {
+        if let Some(state) = STATE.get() {
+            state.lock().unwrap().resident_notices.push(notice);
         }
     }
 }
@@ -343,7 +450,7 @@ pub fn flush() -> std::io::Result<()> {
         );
     }
     for event in &state.events {
-        trace.push(serde_json::json!({"name":event.name,"ph":"X","pid":1,"tid":if event.name == "recorder_lifetime" {2} else if matches!(event.name, "cpu_miss_ffn_one" | "cpu_miss_ffn_two" | "cpu_miss_ffn_three" | "cpu_miss_gu" | "cpu_miss_down") {3} else {1},
+        trace.push(serde_json::json!({"name":event.name,"ph":"X","pid":1,"tid":if event.name == "recorder_lifetime" {2} else if event.name.starts_with("resident_producer_") {4} else if matches!(event.name, "cpu_miss_ffn_one" | "cpu_miss_ffn_two" | "cpu_miss_ffn_three" | "cpu_miss_gu" | "cpu_miss_down") {3} else {1},
             "ts":event.start_ns.saturating_sub(origin) as f64 / 1000.0,
             "dur":event.end_ns.saturating_sub(event.start_ns) as f64 / 1000.0,
             "args":{"step":event.context.step,"layer":event.context.layer,"submit":event.submit}}));
@@ -372,12 +479,16 @@ pub fn flush() -> std::io::Result<()> {
     trace.push(serde_json::json!({"name":"thread_name","ph":"M","pid":1,"tid":1,"args":{"name":"CPU inference"}}));
     trace.push(serde_json::json!({"name":"thread_name","ph":"M","pid":1,"tid":2,"args":{"name":"Recorder lifetimes"}}));
     trace.push(serde_json::json!({"name":"thread_name","ph":"M","pid":1,"tid":3,"args":{"name":"CPU miss worker phase envelopes"}}));
+    trace.push(serde_json::json!({"name":"thread_name","ph":"M","pid":1,"tid":4,"args":{"name":"Resident notice producer phase envelopes (not GPU DMA)"}}));
     trace.push(serde_json::json!({"name":"thread_name","ph":"M","pid":2,"tid":1,"args":{"name":"GPU main queue envelopes"}}));
     trace.push(serde_json::json!({"name":"thread_name","ph":"M","pid":2,"tid":2,"args":{"name":"GPU dedicated DMA"}}));
     trace.push(serde_json::json!({"name":"thread_name","ph":"M","pid":2,"tid":3,"args":{"name":"GPU completion milestones (not isolated kernel times)"}}));
     let document = serde_json::json!({"traceEvents":trace,"displayTimeUnit":"ms",
         "origin_ns":origin,"steps":state.steps,"host_events":state.events,"device_events":state.device,
         "clock_samples":state.clocks,"dropped_events":state.dropped,
+        "device_timestamps":DEVICE_TIMESTAMPS.load(Ordering::Relaxed),
+        "host_spans":HOST_SPANS.load(Ordering::Relaxed),
+        "resident_notices":state.resident_notices,
         "gpu_interval_semantics":"TOP/BOTTOM queue envelope; includes dependencies and stalls, not ALU busy time"});
     if let Some(parent) = state.path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
@@ -413,6 +524,65 @@ fn map_tick(tick: u64, bits: u32, sample: ClockSample) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn background_context_restores_tls_without_cpu_spans() {
+        assert!(LOCAL_HOST_SPANS.with(Cell::get));
+        assert!(background_context().is_none());
+        {
+            let _scope = scoped_context(Some(Context {
+                step: 91,
+                lanes: 2,
+                layer: 7,
+            }));
+            assert_eq!(CONTEXT.with(Cell::get).unwrap().step, 91);
+            assert!(!LOCAL_HOST_SPANS.with(Cell::get));
+            assert_eq!(background_context().unwrap().layer, 7);
+            {
+                let _nested = scoped_context(None);
+                assert!(CONTEXT.with(Cell::get).is_none());
+                assert!(background_context().is_none());
+            }
+            assert_eq!(CONTEXT.with(Cell::get).unwrap().layer, 7);
+        }
+        assert!(CONTEXT.with(Cell::get).is_none());
+        assert!(LOCAL_HOST_SPANS.with(Cell::get));
+        assert!(background_context().is_none());
+    }
+    #[test]
+    fn device_phase_scopes_restore_nested_state() {
+        assert_eq!(device_phase(), None);
+        {
+            let _hit = device_phase_scope("hit");
+            assert_eq!(device_phase(), Some("hit"));
+            {
+                let _miss = device_phase_scope("miss");
+                assert_eq!(device_phase(), Some("miss"));
+            }
+            assert_eq!(device_phase(), Some("hit"));
+        }
+        assert_eq!(device_phase(), None);
+        let mut cfg = crate::config::ProfCfg {
+            timeline_path: Some("unused.json".into()),
+            timeline_gpu_only: true,
+            ..Default::default()
+        };
+        assert!(wants_device_timestamps(&cfg));
+        cfg.timeline_cpu_only = true;
+        assert!(configure(&cfg).unwrap_err().contains("mutually exclusive"));
+    }
+    #[test]
+    fn cpu_only_tracing_never_requests_device_queries() {
+        for path in [None, Some(PathBuf::from("unused.json"))] {
+            for cpu_only in [false, true] {
+                let cfg = crate::config::ProfCfg {
+                    timeline_path: path.clone(),
+                    timeline_cpu_only: cpu_only,
+                    ..Default::default()
+                };
+                assert_eq!(wants_device_timestamps(&cfg), path.is_some() && !cpu_only);
+            }
+        }
+    }
     #[test]
     fn windows_are_bounded_and_skip_warmup() {
         let ids = (0..100)

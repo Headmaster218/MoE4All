@@ -3,7 +3,9 @@
 //! interpreter (`infr-llama::seam`) op-for-op, but executes on the GPU — so the SAME model
 //! `Graph` runs on either backend. Built incrementally; ops not yet mapped return an error.
 
-use crate::linear::native_dense_supported;
+use crate::linear::{
+    native_dense_supported, native_id_paged_kernel_name, native_idm_paged_kernel_name,
+};
 use crate::recorder::{Recorder, QSA_TOPK_PARALLEL_MIN_BLOCKS, QSA_TOPK_PARALLEL_WORK_BYTES};
 use crate::{be, VulkanBackend};
 use infr_core::backend::{Bindings, Buffer, BufferUsage, Plan};
@@ -413,6 +415,33 @@ fn decode_token_rows(graph: &Graph) -> Option<usize> {
     }
     (!graph.sequence_spans.is_empty() && graph.sequence_spans.iter().all(|span| span.rows == 1))
         .then_some(graph.sequence_spans.len())
+}
+
+const RESIDENT_AUTO_MAPPED_SERIAL_CONTEXT_MAX: usize = 96 * 1024;
+const RESIDENT_AUTO_MAPPED_SERIAL_MAX_BYTES: usize = 6 * 1024 * 1024;
+
+fn resident_decode_context_tokens(graph: &Graph) -> Option<usize> {
+    let op_depth = graph.ops.iter().filter_map(|op| match op {
+        Op::QsaIndexer { kv_len, .. }
+        | Op::QsaBatchAttention { kv_len, .. }
+        | Op::Attention { kv_len, .. } => Some(*kv_len as usize),
+        _ => None,
+    });
+    let span_depth = graph
+        .sequence_spans
+        .iter()
+        .filter_map(|span| span.start_pos.checked_add(span.rows))
+        .map(|depth| depth as usize);
+    op_depth.chain(span_depth).max()
+}
+
+fn resident_mapped_serial_max_bytes(setting_kib: Option<usize>, graph: &Graph) -> usize {
+    if let Some(kib) = setting_kib {
+        return kib.min(8192).saturating_mul(1024);
+    }
+    resident_decode_context_tokens(graph)
+        .filter(|&tokens| tokens <= RESIDENT_AUTO_MAPPED_SERIAL_CONTEXT_MAX)
+        .map_or(0, |_| RESIDENT_AUTO_MAPPED_SERIAL_MAX_BYTES)
 }
 
 fn cpu_miss_decode_graph(graph: &Graph) -> bool {
@@ -827,6 +856,7 @@ pub(crate) struct RuntimePhaseArena {
     scratch: ScratchSet,
     parked_scratch: Vec<PhaseScratch>,
     pool: ScratchPool,
+    resident_buffers: Option<ResidentBuffers>,
 }
 
 struct PhaseScratch {
@@ -1029,6 +1059,7 @@ impl RuntimePhaseArena {
         self.scratch_layout.clear();
         self.parked_scratch.clear();
         self.pool.clear();
+        self.resident_buffers = None;
     }
 
     #[cfg(test)]
@@ -1926,7 +1957,11 @@ fn sm_buf(
 /// same-key layers share one prologue dispatch and one scratch set.
 struct DynAttnCtx {
     nh: usize,
+    /// Partial-pass workgroups per live chunk. Equal to `nh` normally and `nh / 4` only for the
+    /// narrowly gated Q8 GQA4 replay specialization.
+    work_heads: usize,
     chunk: usize,
+    max_chunk: usize,
     n_chunks: usize,
     hd: usize,
     window: usize,
@@ -2180,6 +2215,54 @@ pub(crate) const MLA_MAX_KEY_LEN: u32 = 576;
 /// MIRRORS `#define MLA_MAX_KV_LORA_RANK` in `shaders/mla.comp`; see [`MLA_MAX_KEY_LEN`].
 pub(crate) const MLA_MAX_KV_LORA_RANK: u32 = 512;
 
+/// Record-once-only Q8 K-write fusion. The shared core peephole deliberately covers f16 caches;
+/// this Vulkan extension additionally recognizes QkNormRope -> WriteKv(Q8_0) when the destination
+/// is a flat BDA cache and the one-row decode kernel can quantize the rotated row in LDS.
+fn q8_kv_write_replay_fusions(
+    graph: &Graph,
+    scratch: &[Option<Box<dyn Buffer>>],
+    bindings: &Bindings,
+) -> Result<HashMap<usize, TensorId>> {
+    let mut out = HashMap::new();
+    for (i, op) in graph.ops.iter().enumerate() {
+        let Op::QkNormRope {
+            dst,
+            rows: 1,
+            x_stride: 0,
+            freq_factors: None,
+            ..
+        } = op
+        else {
+            continue;
+        };
+        if !matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal)
+            || !matches!(graph.desc(*dst).dtype, infr_core::DType::F16)
+        {
+            continue;
+        }
+        let Some(Op::WriteKv {
+            src,
+            cache,
+            rows: 1,
+            ..
+        }) = graph.ops.get(i + 1)
+        else {
+            continue;
+        };
+        if src != dst
+            || !matches!(graph.desc(*cache).dtype, infr_core::DType::Q8_0)
+            || !infr_core::fusion::dst_only_read_by_next(graph, i + 2, *dst)
+        {
+            continue;
+        }
+        let cache_buf = resolve(scratch, bindings, *cache)?;
+        if cache_buf.device_addr().is_some() && segmented_kv_view(cache_buf).is_none() {
+            out.insert(i, *cache);
+        }
+    }
+    Ok(out)
+}
+
 /// Lower ONE graph op into the recorder. Shared by the static (`execute_static`) and record-once
 /// (`record_decode_replay`) paths — only the three pos-dependent ops branch on `mode`.
 #[allow(clippy::too_many_arguments)]
@@ -2193,6 +2276,7 @@ fn lower_op(
     scratch: &[Option<Box<dyn Buffer>>],
     bindings: &Bindings,
     fused_kv_write: &HashMap<usize, (TensorId, usize)>,
+    fused_q8_kv_write: &HashMap<usize, TensorId>,
     fused_add: &HashMap<usize, (TensorId, TensorId)>,
     mode: &RopeMode,
     transient: &mut Vec<Box<dyn Buffer>>,
@@ -3565,7 +3649,7 @@ fn lower_op(
                 Activation::Silu => rec.silu_mul_fused(gu_, y, rows, nff, *swiglu_clamp),
                 Activation::Gelu => rec.gelu_mul_fused(gu_, y, rows, nff, *swiglu_clamp),
                 Activation::Sigmoid => {
-                    return Err(be("vulkan adapter: GatedActFused Sigmoid unsupported"))
+                    return Err(be("vulkan adapter: GatedActFused Sigmoid unsupported"));
                 }
             }
         }
@@ -3801,7 +3885,7 @@ fn lower_op(
                     // The only f16 WriteKv (K) is always fused into the QkNormRope and skipped, so a
                     // standalone f16 WriteKv shouldn't reach the record-once path.
                     infr_core::DType::F16 => {
-                        return Err(be("vulkan adapter: dynamic decode f16 WriteKv unexpected"))
+                        return Err(be("vulkan adapter: dynamic decode f16 WriteKv unexpected"));
                     }
                     _ => match c_addr {
                         Some(a) => rec.store_f16_dyn_at(s, *params, c, a, n, cap_rows),
@@ -4195,8 +4279,8 @@ fn lower_op(
                 (None, None) => (raw_cache, block_cache, None),
                 _ => {
                     return Err(be(
-                            "vulkan Op::QsaIndexer raw and block caches must both be segmented or both be flat",
-                        ));
+                        "vulkan Op::QsaIndexer raw and block caches must both be segmented or both be flat",
+                    ));
                 }
             };
             rec.qsa_indexer(
@@ -4559,8 +4643,8 @@ fn lower_op(
                 (None, None) => (k_cache_buf, v_cache_buf, None),
                 _ => {
                     return Err(be(
-                            "vulkan Op::QsaBatchAttention K/V caches must both be segmented or both be flat",
-                        ));
+                        "vulkan Op::QsaBatchAttention K/V caches must both be segmented or both be flat",
+                    ));
                 }
             };
             rec.qsa_attention_batch(
@@ -4677,6 +4761,32 @@ fn lower_op(
             x_stride,
             ..
         } => {
+            if let Some(&cache) = fused_q8_kv_write.get(&op_idx) {
+                let RopeMode::Dynamic(params) = mode else {
+                    return Err(be("Q8 K-write fusion requires record-once decode"));
+                };
+                let out = r(cache)?;
+                let addr = out
+                    .device_addr()
+                    .ok_or_else(|| be("Q8 K-write fusion requires a flat BDA cache"))?;
+                let row = (*n_head as usize) * (*head_dim as usize);
+                let kcap = graph.desc(cache).numel() / row.max(1);
+                rec.qk_norm_rope_q8_dyn_at(
+                    r(*x)?,
+                    r(*weight)?,
+                    *params,
+                    out,
+                    addr,
+                    *rows as usize,
+                    *n_head as usize,
+                    *head_dim as usize,
+                    *rope_dim as usize,
+                    *theta,
+                    *eps,
+                    kcap,
+                );
+                return Ok(());
+            }
             // `fused` carries the WRITE ROW (already `pos % cap_rows` for an SWA ring cache —
             // see `kv_write_peephole`); `kcap` is the fused cache's row capacity for the DYNAMIC
             // path, where the row must be derived from the live params pos in-kernel (the ring
@@ -5377,6 +5487,49 @@ fn lower_op(
                     infr_core::tier::baked_chunk(cap_rows, ATTN_MAX_CHUNKS, ATTN_SPLIT.min_chunk);
                 let n_chunks = infr_core::tier::n_chunks(cap_rows, chunk);
                 if hd % 4 == 0 && hd <= 512 && n_chunks > 1 {
+                    let kb = r(*k_cache)?;
+                    let vb = r(*v_cache)?;
+                    let group = nh / nkv.max(1);
+                    let fast_q8 = (kv_q8
+                        && !crate::gemm::attn_decode_disabled(&be_.cfg().kernels.vulkan)
+                        && !crate::gemm::attn_hd_spec_disabled(&be_.cfg().kernels.vulkan)
+                        && chunk <= 512
+                        && kb.device_addr().is_some()
+                        && vb.device_addr().is_some())
+                    .then(|| {
+                        crate::gemm::attn_decode_q8_kernel(
+                            hd,
+                            window > 0,
+                            true,
+                            be_.cfg().kernels.vulkan.q8_decode_d8,
+                            be_.cfg().kernels.vulkan.q8_decode_ls128,
+                            be_.cfg().kernels.vulkan.q8_decode_ls256,
+                            be_.caps().i8_dot
+                                && be_.cfg().kernels.vulkan.q8_qk_i8
+                                && be_.prefers_q8_qk_i8(),
+                            be_.cfg().kernels.vulkan.q8_qk_f16,
+                            be_.cfg().kernels.vulkan.q8_pv_f16,
+                            be_.cfg().kernels.vulkan.q8_decode_replay_chunk1024,
+                            false,
+                            kv_q8
+                                && be_.cfg().kernels.vulkan.q8_decode_gqa4
+                                && be_.prefers_q8_decode_gqa4_replay()
+                                && group >= 4
+                                && group.is_multiple_of(4),
+                        )
+                    })
+                    .flatten();
+                    let work_heads = match fast_q8.map(|(name, _)| name) {
+                        Some("attn_decode_hd256_q8_gqa4_dynac") => nh / 4,
+                        _ => nh,
+                    };
+                    let max_chunk = if fast_q8.is_some()
+                        && be_.cfg().kernels.vulkan.q8_decode_replay_chunk1024
+                    {
+                        Q8_HD256_DECODE_SPLIT.max_chunk
+                    } else {
+                        ATTN_SPLIT.max_chunk
+                    };
                     // ONE prologue + ONE scratch set per (nh, hd, chunk, n_chunks, window) key:
                     // the first Dynamic attention op of a shape records/allocates; every later
                     // same-shape layer reuses (kv_len is per-token, and the layers' attention ops
@@ -5385,17 +5538,28 @@ fn lower_op(
                     // handful of keys coexist per execute.
                     let key = |c: &DynAttnCtx| {
                         c.nh == nh
+                            && c.work_heads == work_heads
                             && c.chunk == chunk
+                            && c.max_chunk == max_chunk
                             && c.n_chunks == n_chunks
                             && c.hd == hd
                             && c.window == window
                     };
                     if !dyn_args.iter().any(key) {
                         let args = be_.alloc_uninit(16, BufferUsage::Activations)?;
-                        rec.attn_live_prologue(*params, args.as_ref(), nh, chunk, window);
+                        rec.attn_live_prologue(
+                            *params,
+                            args.as_ref(),
+                            work_heads,
+                            chunk,
+                            max_chunk,
+                            window,
+                        );
                         dyn_args.push(DynAttnCtx {
                             nh,
+                            work_heads,
                             chunk,
+                            max_chunk,
                             n_chunks,
                             hd,
                             window,
@@ -5412,8 +5576,6 @@ fn lower_op(
                     // resident decode path, KV is never the dequant scratch here). The caches persist
                     // across replay, so their addresses are stable in the baked push. Bit-identical to
                     // the bound dispatch (kept dual-arm: attn_partial's .comp also serves prefill).
-                    let kb = r(*k_cache)?;
-                    let vb = r(*v_cache)?;
                     match (kb.device_addr(), vb.device_addr()) {
                         (Some(ka), Some(va)) => rec.attention_kv_split_dynac_at(
                             r(*q)?,
@@ -5435,6 +5597,7 @@ fn lower_op(
                             pscale,
                             window,
                             kv_q8,
+                            work_heads == nh / 4,
                             cap,
                         ),
                         _ => rec.attention_kv_split_dynac(
@@ -5455,6 +5618,7 @@ fn lower_op(
                             pscale,
                             window,
                             kv_q8,
+                            work_heads == nh / 4,
                             cap,
                         ),
                     }
@@ -6268,7 +6432,7 @@ fn lower_op(
                     rec.rmsnorm_gate_sigmoid(args.0, args.1, args.2, args.3, args.4, args.5, args.6)
                 }
                 Activation::Gelu => {
-                    return Err(be("vulkan adapter: GatedRmsNorm Gelu unsupported"))
+                    return Err(be("vulkan adapter: GatedRmsNorm Gelu unsupported"));
                 }
             }
         }
@@ -6577,6 +6741,11 @@ fn lower_op(
                         let (kn, qn, bet, dec) = seq_scratch
                             .as_ref()
                             .expect("multi-row seq split allocated scratch");
+                        let (seq_k_off, seq_v_off) = if strided {
+                            (q_off + nk_ * kd_, q_off + 2 * nk_ * kd_)
+                        } else {
+                            (k_off, v_off)
+                        };
                         rec.deltanet_seq_split_off(
                             r(*q)?,
                             r(*k)?,
@@ -6598,8 +6767,8 @@ fn lower_op(
                             vd_,
                             *eps,
                             q_off,
-                            k_off,
-                            v_off,
+                            seq_k_off,
+                            seq_v_off,
                             blog_off,
                             alpha_off,
                             out_off,
@@ -6742,27 +6911,59 @@ fn lower_op(
                 let qn = pooled(pool, be_, "dn_seq_qn", rows_ * nk_ * kd_ * 4)?;
                 let bet = pooled(pool, be_, "dn_seq_bet", rows_ * nv_ * 4)?;
                 let dec = pooled(pool, be_, "dn_seq_dec", rows_ * nv_ * 4)?;
-                rec.deltanet_seq_split(
-                    r(*q)?,
-                    r(*k)?,
-                    r(*v)?,
-                    r(*b)?,
-                    r(*a)?,
-                    r(*a_coef)?,
-                    r(*dt_bias)?,
-                    r(*state)?,
-                    r(*dst)?,
-                    pool[&kn].as_ref(),
-                    pool[&qn].as_ref(),
-                    pool[&bet].as_ref(),
-                    pool[&dec].as_ref(),
-                    rows_,
-                    nv_,
-                    nk_,
-                    kd_,
-                    vd_,
-                    *eps,
-                );
+                let strided = *q == *k && *k == *v && be_.cfg().kernels.vulkan.delta_strided;
+                if strided {
+                    rec.deltanet_seq_split_off(
+                        r(*q)?,
+                        r(*k)?,
+                        r(*v)?,
+                        r(*b)?,
+                        r(*a)?,
+                        r(*a_coef)?,
+                        r(*dt_bias)?,
+                        r(*state)?,
+                        r(*dst)?,
+                        pool[&kn].as_ref(),
+                        pool[&qn].as_ref(),
+                        pool[&bet].as_ref(),
+                        pool[&dec].as_ref(),
+                        rows_,
+                        nv_,
+                        nk_,
+                        kd_,
+                        vd_,
+                        *eps,
+                        0,
+                        nk_ * kd_,
+                        2 * nk_ * kd_,
+                        0,
+                        0,
+                        0,
+                        None,
+                    );
+                } else {
+                    rec.deltanet_seq_split(
+                        r(*q)?,
+                        r(*k)?,
+                        r(*v)?,
+                        r(*b)?,
+                        r(*a)?,
+                        r(*a_coef)?,
+                        r(*dt_bias)?,
+                        r(*state)?,
+                        r(*dst)?,
+                        pool[&kn].as_ref(),
+                        pool[&qn].as_ref(),
+                        pool[&bet].as_ref(),
+                        pool[&dec].as_ref(),
+                        rows_,
+                        nv_,
+                        nk_,
+                        kd_,
+                        vd_,
+                        *eps,
+                    );
+                }
                 return Ok(());
             }
             // deltanet_chunked_split's prep pass (deltanet_prep.comp) is the ONLY DeltaNet shader
@@ -7413,7 +7614,7 @@ fn lower_op(
                         Activation::Sigmoid => {
                             return Err(be(
                                 "vulkan adapter: fused_gate_up batched MoeFfn Sigmoid unsupported",
-                            ))
+                            ));
                         }
                     }
                 }
@@ -7625,7 +7826,7 @@ fn lower_op(
                     Activation::Sigmoid => {
                         return Err(be(
                             "vulkan adapter: fused_gate_up MoeFfn Sigmoid unsupported",
-                        ))
+                        ));
                     }
                 }
             } else {
@@ -8108,9 +8309,15 @@ fn record_decode_replay(
         })
         .ok_or_else(|| be("vulkan adapter: eligible decode has no positions tensor"))?;
     let plan = infr_core::fusion::plan_fusions(graph, &fusion_cfg(be_));
+    let fused_q8_kv_write = if be_.cfg().kernels.vulkan.q8_kv_write_fusion {
+        q8_kv_write_replay_fusions(graph, &scratch, bindings)?
+    } else {
+        HashMap::new()
+    };
     let fused_kv_write = plan.kv_write;
     let fused_add = plan.linear_add;
     let mut skip_op = plan.skip;
+    skip_op.extend(fused_q8_kv_write.keys().map(|&i| i + 1));
 
     let mut transient: Vec<Box<dyn Buffer>> = Vec::new();
     let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
@@ -8224,6 +8431,7 @@ fn record_decode_replay(
             &scratch,
             bindings,
             &fused_kv_write,
+            &fused_q8_kv_write,
             &fused_add,
             &mode,
             &mut transient,
@@ -9021,16 +9229,18 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
     }
     let using_phase_arena = phase_arena.is_some();
     let mut local_pool = ScratchPool::default();
-    let (scratch, pool): (&ScratchSet, &mut ScratchPool) = match phase_arena.as_mut() {
+    let mut local_resident_buffers = None;
+    let (scratch, pool, resident_buffers) = match phase_arena.as_mut() {
         Some(arena) => {
             let arena = &mut **arena;
-            (&arena.scratch, &mut arena.pool)
+            (&arena.scratch, &mut arena.pool, &mut arena.resident_buffers)
         }
         None => (
             local_scratch
                 .as_ref()
                 .expect("non-paged static execution owns local scratch"),
             &mut local_pool,
+            &mut local_resident_buffers,
         ),
     };
     if let Some(elapsed) = infr_core::pager_profile::elapsed(setup_part_t0) {
@@ -9105,6 +9315,7 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
         );
     }
     let fused_kv_write = plan.kv_write;
+    let fused_q8_kv_write = HashMap::new();
     let fused_add = plan.linear_add;
     let mut skip_op = plan.skip;
     // Strict decode-only Qwen peephole. Only suppress the six dense shared-expert ops when the
@@ -9112,10 +9323,10 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
     // original op stream. `PagedMoeShared` is Copy and contains only graph handles.
     let setup_part_t0 = infr_core::pager_profile::start();
     let mut paged_moe_shared = HashMap::<usize, PagedMoeShared>::new();
-    for op_idx in 0..graph.ops.len() {
-        let Some(shared) = paged_moe_shared_at(graph, op_idx) else {
-            continue;
-        };
+    // This escape hatch is execute-scoped, not per-op. Most ops cannot be a shared-expert tail;
+    // checking the process environment for each of them dominated the scan on Windows.
+    let shared_slot_disabled = std::env::var_os("INFR_NO_MOE_SHARED_SLOT").is_some();
+    for (op_idx, shared) in paged_moe_shared_candidates(graph, shared_slot_disabled) {
         let Op::MoeFfn { gate_exps, .. } = &graph.ops[op_idx] else {
             unreachable!();
         };
@@ -9154,7 +9365,18 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
     // input shape rather than replay eligibility: QSA and other stateful decode ops correctly force
     // this graph down the static path. Independent decode carries one token row per sequence.
     let mut saw_moe = false;
-    let token_rows = decode_token_rows(graph);
+    // A single-sequence MTP VERIFY graph is a short causal batch rather than independent
+    // sequences, so `decode_token_rows` intentionally reports one sequence. Its paged MoE ops
+    // still carry one routed row per draft token and can use the same resident continuation
+    // protocol once that exact row count is recognized here.
+    let token_rows = if graph.mtp_verify && !graph.independent_rows {
+        graph.ops.iter().find_map(|op| match op {
+            Op::MoeFfn { x, ne, .. } => Some(graph.desc(*x).numel() / *ne as usize),
+            _ => None,
+        })
+    } else {
+        decode_token_rows(graph)
+    };
     let token_row_paged_moe = be_.moe_paged()
         && token_rows.is_some()
         && graph.ops.iter().all(|op| {
@@ -9191,6 +9413,7 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
     let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
     let mut mmv_memo: Option<(TensorId, usize, usize)> = None;
     let mut pstream = PagedStream::default();
+    let mut resident_chunk = ResidentChunk::new(be_, graph, token_row_paged_moe, resident_buffers)?;
 
     // ── submit splitter ───────────────────────────────────────────────────────────────────────
     // The GPU hang watchdog is armed per SUBMIT, so recording the whole forward into ONE command
@@ -9223,7 +9446,123 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
     // device-specific and stays here, so this path keeps its own loop body rather than an
     // `OpDispatch`. `record_decode_replay` can't even use this much — its skip set is MUTATED
     // mid-walk by the E2B `Linear`+`GatedAct` peephole.
-    for (op_idx, op) in infr_core::exec::live_ops(&graph.ops, &skip_op) {
+    let live_ops: Vec<_> = infr_core::exec::live_ops(&graph.ops, &skip_op).collect();
+    let mut live_pos: usize = 0;
+    loop {
+        if let Some(chunk) = resident_chunk.as_mut() {
+            if let Some(recovery) = chunk.recovery_op {
+                if resident_recovery_submit_due(
+                    pstream.resume_ids.is_some(),
+                    live_ops.get(live_pos).map(|(_, op)| *op),
+                    cap > 0 && rec.as_ref().is_some_and(|r| r.dispatches() >= cap),
+                ) {
+                    submitted_dispatches += chunk.submit_early_recovery(
+                        be_,
+                        recovery.op_idx,
+                        &mut rec,
+                        &mut pstream,
+                        &mut segments,
+                    )?;
+                }
+            }
+        }
+        if let Some(chunk) = resident_chunk
+            .as_mut()
+            .filter(|chunk| chunk.recovery_op.is_none())
+        {
+            if (chunk.producer.is_some() || live_pos.is_multiple_of(8)) && chunk.notices.is_some() {
+                chunk.poll_notices(be_, &mut pstream, None)?;
+            }
+            if chunk.notice_resume.is_some() || chunk.notice_stop {
+                // All commands currently being recorded follow a notified miss and would be
+                // predicated off. Do not submit or keep encoding them; retain submitted hits.
+                rec.take().unwrap().discard()?;
+            }
+            if !chunk.entries.is_empty()
+                && (chunk.entries.len() == chunk.limit
+                    || live_pos == live_ops.len()
+                    || chunk.notice_resume.is_some()
+                    || chunk.notice_stop)
+            {
+                if let Some((op_idx, ids)) =
+                    chunk.finish(be_, &mut rec, &mut pstream, pool, &mut segments)?
+                {
+                    live_pos = live_ops
+                        .iter()
+                        .position(|&(idx, _)| idx == op_idx)
+                        .expect("journal op belongs to this walk");
+                    pstream.resume_ids = Some(ids);
+                    mmv_memo = None;
+                }
+                if chunk.recovery_op.is_none() {
+                    while let Some(segment) = segments.pop_front() {
+                        segment.wait()?;
+                    }
+                }
+            } else if chunk.submit_due()
+                || (chunk.recording
+                    && cap > 0
+                    && rec.as_ref().is_some_and(|r| r.dispatches() >= cap))
+            {
+                if !chunk.submit_due() {
+                    splitter_splits += 1;
+                }
+                let _span = infr_core::timeline::span("gpu_resident_rolling_submit");
+                let mut segment = rec
+                    .take()
+                    .expect("resident recorder exists")
+                    .finish_nowait()?;
+                if let Some(waiter) = &chunk.waiter {
+                    segment.start_waiter(waiter)?;
+                }
+                chunk.send_producer_jobs(&mut segment, chunk.entries.len())?;
+                submitted_dispatches += segment.dispatches();
+                segments.push_back(segment);
+                while segments.len()
+                    > be_
+                        .cfg()
+                        .kernels
+                        .vulkan
+                        .decode_gpu_resident_inflight
+                        .clamp(1, 2)
+                {
+                    segments
+                        .pop_front()
+                        .expect("in-flight resident segment")
+                        .wait()?;
+                }
+                let fresh = be_.recorder()?;
+                fresh.seed_barrier();
+                fresh.arena_stream_barrier();
+                chunk.begin_conditional(&fresh);
+                rec = Some(fresh);
+                chunk.submitted_entries = chunk.entries.len();
+            }
+            if live_pos < live_ops.len() && !chunk.recording && pstream.resume_ids.is_none() {
+                if let Some(notices) = &chunk.notices {
+                    notices.reset()?;
+                }
+                // Initialization is a GPU command after the resumed FFN, never a host write
+                // into an in-flight predicate. Fresh tape ranges remain pinned until the drain.
+                let rc = rec.as_ref().unwrap();
+                // All fresh host LUT windows are published before this recorder is submitted.
+                rc.arena_stream_barrier();
+                rc.gpu_resident_check(
+                    chunk.control.as_ref(),
+                    chunk.control.as_ref(),
+                    chunk.control.as_ref(),
+                    chunk.journal.as_ref(),
+                    [0; 6],
+                );
+                chunk.begin_conditional(rc);
+                chunk.recording = true;
+            }
+        }
+        if live_pos == live_ops.len() {
+            break;
+        }
+        let (op_idx, op) = live_ops[live_pos];
+        live_pos += 1;
         // ── shutdown (SIGINT/SIGTERM) ─────────────────────────────────────────────────────────
         // Polled HERE — at the op/submit boundary INSIDE the forward — and not merely between
         // tokens, because on the devices that split (§ the splitter above) a single forward is
@@ -9255,7 +9594,10 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
         // Split BETWEEN ops, never inside one: a single op can lower to several dispatches that
         // share transient scratch, and the hazard tracking that orders them is per-recorder.
         // Crossing the cap therefore closes the segment at the next op boundary.
-        if cap > 0 && rec.as_ref().is_some_and(|r| r.dispatches() >= cap) {
+        if resident_chunk.is_none()
+            && cap > 0
+            && rec.as_ref().is_some_and(|r| r.dispatches() >= cap)
+        {
             splitter_splits += 1;
             pstream.finish_cpu_miss(be_, pool)?;
             let seg = rec
@@ -9291,6 +9633,40 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
                 )
             });
             if paged {
+                if let Some(chunk) = resident_chunk.as_mut() {
+                    if pstream.resume_ids.is_none() {
+                        let Op::MoeFfn {
+                            up_exps, down_exps, ..
+                        } = op
+                        else {
+                            unreachable!()
+                        };
+                        let layout = ResidentMoeLayout::from_op(graph, op)
+                            .expect("resident graph contains only supported MoeFfn layouts");
+                        chunk.entries.push(ResidentJournalEntry {
+                            op_idx,
+                            layout,
+                            roles: [
+                                crate::pager::buffer_identity(gbuf),
+                                crate::pager::buffer_identity(resolve(
+                                    scratch, bindings, *up_exps,
+                                )?),
+                                crate::pager::buffer_identity(resolve(
+                                    scratch, bindings, *down_exps,
+                                )?),
+                            ],
+                        });
+                        pstream.gpu_route = Some(GpuRoute {
+                            control: std::sync::Arc::clone(&chunk.control),
+                            journal: std::sync::Arc::clone(&chunk.journal),
+                            ordinal: (chunk.entries.len() - 1) as u32,
+                            notice: chunk
+                                .notices
+                                .as_ref()
+                                .map(|notices| notices.events[chunk.entries.len() - 1]),
+                        });
+                    }
+                }
                 let layer_profile_t0 = infr_core::pager_profile::start();
                 let layer_profile_before =
                     layer_profile_t0.map(|_| infr_core::pager_profile::paged_moe_hot_snapshot());
@@ -9344,6 +9720,7 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
                         scratch,
                         bindings,
                         &fused_kv_write,
+                        &fused_q8_kv_write,
                         &fused_add,
                         &mode,
                         &mut transient,
@@ -9373,6 +9750,7 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
             scratch,
             bindings,
             &fused_kv_write,
+            &fused_q8_kv_write,
             &fused_add,
             &mode,
             &mut transient,
@@ -9402,8 +9780,12 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
     }
     let last = rec.take().expect("segment always Some at loop end");
     submitted_dispatches += last.dispatches();
-    last.finish_after_submit(|| pstream.start_cpu_promotion(be_))
-        .map_err(|e| be(e.to_string()))?;
+    if resident_chunk.is_some() && last.dispatches() == 0 {
+        last.discard()?;
+    } else {
+        last.finish_after_submit(|| pstream.start_cpu_promotion(be_))
+            .map_err(|e| be(e.to_string()))?;
+    }
     // The blocking finish above already waited the queue idle — draining just releases the
     // pipelined segments' command buffers/fences (every buffer they referenced outlives this
     // call: pooled scratch in `transient`, ring/tape/arenas on the session).
@@ -9622,8 +10004,1306 @@ impl Drop for CpuMissPromotion {
     }
 }
 
+#[derive(Clone)]
+struct GpuRoute {
+    control: std::sync::Arc<dyn Buffer>,
+    journal: std::sync::Arc<dyn Buffer>,
+    ordinal: u32,
+    notice: Option<ash::vk::Event>,
+}
+
+#[derive(Clone)]
+struct ResidentJournalEntry {
+    op_idx: usize,
+    roles: [usize; 3],
+    layout: ResidentMoeLayout,
+}
+
+/// Per-op facts needed by the resident control plane. Kernels remain shape/dtype specialized;
+/// this descriptor only decides whether the generic journal, hit-first and miss-recovery protocol
+/// can represent an `MoeFfn` without architecture-name or model-size assumptions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResidentMoeLayout {
+    rows: usize,
+    n_expert: usize,
+    n_used: usize,
+}
+
+impl ResidentMoeLayout {
+    fn count(self) -> usize {
+        self.rows * self.n_used
+    }
+
+    fn role_tape_words(self) -> usize {
+        3 * self.n_expert
+    }
+
+    fn from_op(graph: &Graph, op: &Op) -> Option<Self> {
+        let Op::MoeFfn {
+            x,
+            gate_exps,
+            up_exps,
+            down_exps,
+            down_scale,
+            fused_gate_up,
+            ne,
+            n_expert,
+            n_used,
+            n_ff_exp,
+            act,
+            weight_before,
+            ep_band,
+            swiglu_clamp,
+            expert_ids,
+            ..
+        } = op
+        else {
+            return None;
+        };
+        let (ne, n_ff_exp, n_expert, n_used) = (
+            *ne as usize,
+            *n_ff_exp as usize,
+            *n_expert as usize,
+            *n_used as usize,
+        );
+        if ne == 0 || n_ff_exp == 0 || graph.desc(*x).numel() % ne != 0 {
+            return None;
+        }
+        let layout = Self {
+            rows: graph.desc(*x).numel() / ne,
+            n_expert,
+            n_used,
+        };
+        (layout.rows > 0
+            && layout.rows <= crate::recorder::RESIDENT_JOURNAL_MASK_WORDS
+            && n_expert > 0
+            && n_expert <= 512
+            && n_used > 0
+            && n_used <= 16
+            && n_used <= n_expert
+            && layout.count() <= crate::recorder::RESIDENT_JOURNAL_ID_WORDS
+            && !*fused_gate_up
+            && !*weight_before
+            && matches!(act, Activation::Silu)
+            && swiglu_clamp.is_none()
+            && down_scale.is_none()
+            && ep_band.is_none()
+            && expert_ids.is_none()
+            && [*gate_exps, *up_exps, *down_exps]
+                .into_iter()
+                .all(|weight| {
+                    let dtype = graph.desc(weight).dtype;
+                    native_id_paged_kernel_name(dtype).is_some()
+                        && native_idm_paged_kernel_name(dtype).is_some()
+                }))
+        .then_some(layout)
+    }
+}
+
+struct ResidentChunk {
+    control: std::sync::Arc<dyn Buffer>,
+    journal: std::sync::Arc<dyn Buffer>,
+    entries: Vec<ResidentJournalEntry>,
+    early_recovery: bool,
+    recovery_op: Option<ResidentRecovery>,
+    limit: usize,
+    recording: bool,
+    submit_layers: usize,
+    submitted_entries: usize,
+    notices: Option<std::sync::Arc<ResidentNotices>>,
+    notice_cursor: usize,
+    notice_resume: Option<(usize, Vec<u32>)>,
+    notice_stop: bool,
+    producer: Option<Arc<ResidentNoticeProducer>>,
+    notices_sent: usize,
+    mapped_serial_max_bytes: usize,
+    waiter: Option<Arc<crate::recorder::FenceWaiter>>,
+    indirect: Option<Arc<crate::recorder::ResidentIndirect>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResidentRecovery {
+    op_idx: usize,
+    /// First LUT word after the retained hit submission and queued miss FFN.
+    miss_tape_start: usize,
+    /// Three split expert banks, each with one address per expert.
+    minimum_tape_words: usize,
+}
+
+struct ResidentBuffers {
+    control: std::sync::Arc<dyn Buffer>,
+    journal: std::sync::Arc<dyn Buffer>,
+    capacity: usize,
+    notices: Option<std::sync::Arc<ResidentNotices>>,
+    producer: Option<Arc<ResidentNoticeProducer>>,
+    waiter: Option<Arc<crate::recorder::FenceWaiter>>,
+    indirect: Option<Arc<crate::recorder::ResidentIndirect>>,
+}
+
+struct ResidentNotices {
+    shared: std::sync::Arc<crate::VulkanShared>,
+    events: Vec<ash::vk::Event>,
+}
+
+impl ResidentNotices {
+    fn new(be_: &VulkanBackend, count: usize) -> Result<Self> {
+        let mut notices = Self {
+            shared: std::sync::Arc::clone(&be_.shared),
+            events: Vec::new(),
+        };
+        for _ in 0..count {
+            notices.events.push(
+                unsafe {
+                    notices
+                        .shared
+                        .device
+                        .create_event(&ash::vk::EventCreateInfo::default(), None)
+                }
+                .map_err(|error| be(format!("resident notice allocation: {error}")))?,
+            );
+        }
+        Ok(notices)
+    }
+
+    fn reset(&self) -> Result<()> {
+        for &event in &self.events {
+            unsafe { self.shared.device.reset_event(event) }
+                .map_err(|error| be(format!("reset resident notice: {error}")))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ResidentNotices {
+    fn drop(&mut self) {
+        for &event in &self.events {
+            unsafe {
+                self.shared.device.destroy_event(event, None);
+            }
+        }
+    }
+}
+
+struct ProducedPromotion {
+    // Drain the upload before its admission guard can invalidate/reuse destinations.
+    promotion: Option<CpuMissPromotion>,
+    abort: Option<CpuPromotionAbortGuard>,
+}
+
+struct ProducedNotice {
+    words: [u32; crate::recorder::RESIDENT_JOURNAL_WORDS],
+    promotion: Option<ProducedPromotion>,
+}
+
+struct ResidentNoticeJob {
+    journal: Arc<dyn Buffer>,
+    notices: Arc<ResidentNotices>,
+    fence: Option<ash::vk::Fence>,
+    entries: Vec<(usize, ResidentJournalEntry)>,
+    mapped_serial_max_bytes: usize,
+    done: std::sync::mpsc::Sender<()>,
+    trace_context: Option<infr_core::timeline::Context>,
+}
+
+struct ResidentProducerTrace {
+    name: &'static str,
+    context: infr_core::timeline::Context,
+    start_ns: u64,
+}
+
+impl ResidentProducerTrace {
+    fn begin(name: &'static str, context: Option<infr_core::timeline::Context>) -> Option<Self> {
+        if !infr_core::timeline::host_enabled() {
+            return None;
+        }
+        context.map(|context| Self {
+            name,
+            context,
+            start_ns: infr_core::timeline::clock_ns(),
+        })
+    }
+}
+
+impl Drop for ResidentProducerTrace {
+    fn drop(&mut self) {
+        infr_core::timeline::record_cpu_miss(
+            self.name,
+            self.context,
+            self.start_ns,
+            infr_core::timeline::clock_ns(),
+        );
+    }
+}
+
+struct NoticeProducerAck(std::sync::mpsc::Sender<()>);
+impl Drop for NoticeProducerAck {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+struct ResidentNoticeProducer {
+    sender: Option<std::sync::mpsc::Sender<ResidentNoticeJob>>,
+    results: std::sync::Mutex<std::sync::mpsc::Receiver<(usize, Result<ProducedNotice>)>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    announced_miss: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ResidentNoticeProducer {
+    fn new(be_: &VulkanBackend) -> Result<Option<Self>> {
+        let Some(executor) = be_.background_expert_transfer_executor() else {
+            return Ok(None);
+        };
+        let pager = Arc::clone(&be_.moe_pager);
+        let (sender, jobs) = std::sync::mpsc::channel::<ResidentNoticeJob>();
+        let (output, results) = std::sync::mpsc::channel();
+        let announced_miss = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let worker_miss = Arc::clone(&announced_miss);
+        let thread = std::thread::Builder::new()
+            .name("resident-notice-producer".into())
+            .spawn(move || {
+                while let Ok(job) = jobs.recv() {
+                    let _ack = NoticeProducerAck(job.done);
+                    let job_executor = executor
+                        .clone()
+                        .with_mapped_serial_max_bytes(job.mapped_serial_max_bytes);
+                    for (ordinal, entry) in &job.entries {
+                        let notice = Self::produce(
+                            &pager,
+                            &job_executor,
+                            job.journal.as_ref(),
+                            &job.notices,
+                            job.fence,
+                            *ordinal,
+                            entry,
+                            &worker_miss,
+                            job.trace_context,
+                        );
+                        if output.send((*ordinal, notice)).is_err() {
+                            return;
+                        }
+                    }
+                }
+            })
+            .map_err(|error| be(format!("create resident notice producer: {error}")))?;
+        Ok(Some(Self {
+            sender: Some(sender),
+            results: std::sync::Mutex::new(results),
+            thread: Some(thread),
+            announced_miss,
+        }))
+    }
+
+    fn produce(
+        pager: &Arc<crate::pager::MoePagerCell>,
+        executor: &crate::transfer::BackgroundTransferExecutor,
+        journal: &dyn Buffer,
+        notices: &ResidentNotices,
+        fence: Option<ash::vk::Fence>,
+        ordinal: usize,
+        entry: &ResidentJournalEntry,
+        announced_miss: &std::sync::atomic::AtomicUsize,
+        trace_context: Option<infr_core::timeline::Context>,
+    ) -> Result<ProducedNotice> {
+        let _produce = ResidentProducerTrace::begin("resident_producer_total", trace_context);
+        let device = &notices.shared.device;
+        let event = notices.events[ordinal];
+        let mut spins = 0;
+        let event_wait =
+            ResidentProducerTrace::begin("resident_producer_event_wait", trace_context);
+        while !unsafe { device.get_event_status(event) }
+            .map_err(|error| be(format!("producer notice query: {error}")))?
+        {
+            let complete = fence
+                .map_or(Ok(true), |fence| unsafe { device.get_fence_status(fence) })
+                .map_err(|error| be(format!("producer fence query: {error}")))?;
+            if complete {
+                if unsafe { device.get_event_status(event) }
+                    .map_err(|error| be(format!("producer notice recheck: {error}")))?
+                {
+                    break;
+                }
+                return Err(be("completed producer segment did not publish its notice"));
+            }
+            spins += 1;
+            if spins < 64 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        drop(event_wait);
+        let journal_read =
+            ResidentProducerTrace::begin("resident_producer_journal_read", trace_context);
+        let words = resident_notice_words(journal, ordinal)?;
+        drop(journal_read);
+        let trace_context = if let Some(mut context) = trace_context {
+            if infr_core::timeline::device_enabled() {
+                context.layer = pager
+                    .lock()
+                    .map_err(|_| be("trace notice pager poisoned"))?
+                    .as_ref()
+                    .ok_or_else(|| be("trace notice pager missing"))?
+                    .registered_layer(entry.roles[0], entry.layout.n_expert)?
+                    as i32;
+                infr_core::timeline::record_resident_notice(infr_core::timeline::ResidentNotice {
+                    context,
+                    ordinal,
+                    status: words[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD],
+                    hit_masks: std::array::from_fn(|row| {
+                        words[crate::recorder::RESIDENT_JOURNAL_MASK_WORD + row]
+                    }),
+                    count: entry.layout.count(),
+                    routed_ids: words[..entry.layout.count()].to_vec(),
+                });
+            }
+            Some(context)
+        } else {
+            None
+        };
+        let _trace_context = infr_core::timeline::scoped_context(trace_context);
+        let mut notice = ProducedNotice {
+            words,
+            promotion: None,
+        };
+        match words[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] {
+            0 => (),
+            1 => {
+                let _lru = ResidentProducerTrace::begin("resident_producer_lru", trace_context);
+                let mut guard = pager
+                    .lock()
+                    .map_err(|_| be("notice producer pager poisoned"))?;
+                let session = guard
+                    .as_mut()
+                    .ok_or_else(|| be("notice producer pager missing"))?;
+                session.begin_role_batches(&entry.roles)?;
+                session.touch_routed_hits(&entry.roles, &words[..entry.layout.count()])?;
+            }
+            2 => {
+                // Cancel CPU speculation as soon as the GPU notice arrives, not after its
+                // RAM copy/DMA preparation. The result channel still owns upload handoff.
+                announced_miss.store(ordinal, std::sync::atomic::Ordering::Release);
+                let admit = ResidentProducerTrace::begin("resident_producer_admit", trace_context);
+                let (_, hits, misses) = resident_notice_slots(&words, entry.layout)?;
+                let abort = CpuPromotionAbortGuard {
+                    pager: Arc::clone(pager),
+                    experts: misses.iter().map(|&id| (entry.roles, id)).collect(),
+                    complete: false,
+                };
+                let lock_wait =
+                    ResidentProducerTrace::begin("resident_producer_lock_wait", trace_context);
+                let mut guard = pager
+                    .lock()
+                    .map_err(|_| be("notice producer pager poisoned"))?;
+                drop(lock_wait);
+                let session = guard
+                    .as_mut()
+                    .ok_or_else(|| be("notice producer pager missing"))?;
+                let layer =
+                    session.registered_layer(entry.roles[0], entry.layout.n_expert)? as usize;
+                session.begin_role_batches(&entry.roles)?;
+                session.touch_routed_hits(&entry.roles, &hits)?;
+                let push = session.push_roles_cpu(
+                    executor,
+                    &entry.roles.map(|role| (role, misses.as_slice())),
+                    false,
+                )?;
+                // The main thread may still allocate speculative scratch. Ordinary LRU pins
+                // alone do not protect an in-flight upload from unified arena claims.
+                for &role in &entry.roles {
+                    session.protect_lut_ids(role, &misses)?;
+                }
+                drop(guard);
+                drop(admit);
+                let _submit =
+                    ResidentProducerTrace::begin("resident_producer_dma_submit", trace_context);
+                let pending = push
+                    .submit_background(executor)?
+                    .map(|value| CpuPromotionPending::Dma(executor.clone(), Some(value)));
+                notice.promotion = Some(ProducedPromotion {
+                    promotion: Some(CpuMissPromotion {
+                        roles: entry.roles,
+                        ids: misses,
+                        layer,
+                        sources: Vec::new(),
+                        started: true,
+                        pending,
+                    }),
+                    abort: Some(abort),
+                });
+            }
+            _ => return Err(be("invalid resident producer notice")),
+        }
+        Ok(notice)
+    }
+
+    fn receive(&self, blocking: bool) -> Result<Option<(usize, Result<ProducedNotice>)>> {
+        let receiver = self
+            .results
+            .lock()
+            .map_err(|_| be("notice producer result queue poisoned"))?;
+        let result = if blocking {
+            Some(
+                receiver
+                    .recv()
+                    .map_err(|_| be("notice producer disconnected"))?,
+            )
+        } else {
+            match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(be("notice producer disconnected"));
+                }
+            }
+        };
+        Ok(result)
+    }
+
+    fn stop_recording(&self, submitted: usize) -> Result<bool> {
+        resident_notice_stop(
+            self.announced_miss
+                .load(std::sync::atomic::Ordering::Acquire),
+            submitted,
+        )
+    }
+
+    fn reset_after_drain(&self) {
+        self.announced_miss
+            .store(usize::MAX, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Drop for ResidentNoticeProducer {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for ResidentChunk {
+    fn drop(&mut self) {
+        // Submitted-segment drops acknowledge every producer job first. Discarded results
+        // must then drain DMA and invalidate abandoned admissions before slot protection clears.
+        if let Some(producer) = &self.producer {
+            while self.notice_cursor < self.notices_sent {
+                match producer.receive(true) {
+                    Ok(Some(_)) => self.notice_cursor += 1,
+                    _ => break,
+                }
+            }
+            producer.reset_after_drain();
+        }
+    }
+}
+
+fn resident_notice_stop(announced: usize, submitted: usize) -> Result<bool> {
+    if announced == usize::MAX {
+        Ok(false)
+    } else if announced < submitted {
+        Ok(true)
+    } else {
+        Err(be("resident producer announced an unsubmitted miss"))
+    }
+}
+
+fn resident_submit_due(entries: usize, submitted: usize, interval: usize, limit: usize) -> bool {
+    interval != 0 && entries < limit && entries.saturating_sub(submitted) >= interval.min(limit)
+}
+
+fn resident_early_recovery_eligible(
+    requested: bool,
+    producer: bool,
+    submit_layers: usize,
+    inflight: usize,
+    indirect: bool,
+) -> bool {
+    requested && producer && (1..=2).contains(&submit_layers) && inflight == 1 && !indirect
+}
+
+fn resident_recovery_submit_due(
+    resume_pending: bool,
+    next: Option<&Op>,
+    at_dispatch_cap: bool,
+) -> bool {
+    // Encode the missing FFN and the unconditional next frontend before retirement. Stop
+    // before the next router/LUT/journal can reuse old metadata, or at the splitter boundary.
+    !resume_pending
+        && (at_dispatch_cap || next.is_none() || matches!(next, Some(Op::MoeFfn { .. })))
+}
+
+fn resident_chunk_status(words: [u32; 4], recorded: usize) -> Result<Option<usize>> {
+    let [run, stopped, reached, invalid] = words;
+    if invalid != 0 || reached as usize > recorded || run > 1 {
+        return Err(be("invalid GPU residency journal"));
+    }
+    if run == 1 && stopped == u32::MAX && reached as usize == recorded {
+        Ok(None)
+    } else if run == 0 && (stopped as usize) < recorded && reached == stopped + 1 {
+        Ok(Some(stopped as usize))
+    } else {
+        Err(be("incomplete GPU residency journal"))
+    }
+}
+
+// The caller has observed this layer's Vulkan event after its HOST_READ publication. The immutable
+// journal range can be copied together instead of issuing scalar ReBAR reads.
+fn resident_notice_words(
+    journal: &dyn Buffer,
+    ordinal: usize,
+) -> Result<[u32; crate::recorder::RESIDENT_JOURNAL_WORDS]> {
+    let offset = ordinal
+        .checked_mul(crate::recorder::RESIDENT_JOURNAL_BYTES)
+        .filter(|&offset| {
+            journal.len_bytes().saturating_sub(offset) >= crate::recorder::RESIDENT_JOURNAL_BYTES
+        })
+        .ok_or_else(|| be("resident notice journal range exceeds storage"))?;
+    let ptr = crate::as_vk_buf(journal)?
+        .mapped_ptr()
+        .ok_or_else(|| be("resident notice journal must be coherent mapped memory"))?;
+    let mut words = [0u32; crate::recorder::RESIDENT_JOURNAL_WORDS];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            ptr.add(offset),
+            words.as_mut_ptr().cast::<u8>(),
+            crate::recorder::RESIDENT_JOURNAL_BYTES,
+        );
+    }
+    Ok(words)
+}
+
+fn resident_notice_slots(
+    words: &[u32; crate::recorder::RESIDENT_JOURNAL_WORDS],
+    layout: ResidentMoeLayout,
+) -> Result<(Vec<u32>, Vec<u32>, Vec<u32>)> {
+    let count = layout.count();
+    if layout.rows == 0
+        || layout.rows > crate::recorder::RESIDENT_JOURNAL_MASK_WORDS
+        || layout.n_used == 0
+        || layout.n_used > 16
+        || count > crate::recorder::RESIDENT_JOURNAL_ID_WORDS
+        || words[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] != 2
+    {
+        return Err(be("invalid resident miss notice shape/status"));
+    }
+    let masks = words[crate::recorder::RESIDENT_JOURNAL_MASK_WORD
+        ..crate::recorder::RESIDENT_JOURNAL_MASK_WORD + layout.rows]
+        .to_vec();
+    let valid_mask = (1u32 << layout.n_used) - 1;
+    if masks.iter().any(|&mask| mask & !valid_mask != 0)
+        || words[..count]
+            .iter()
+            .any(|&id| id >= layout.n_expert as u32)
+    {
+        return Err(be("invalid resident miss notice mask/id"));
+    }
+    let mut hits = Vec::new();
+    let mut misses = Vec::new();
+    for (slot, &id) in words[..count].iter().enumerate() {
+        if masks[slot / layout.n_used] & (1 << (slot % layout.n_used)) != 0 {
+            hits.push(id);
+        } else {
+            misses.push(id);
+        }
+    }
+    if misses.is_empty() {
+        return Err(be("resident miss notice contains only hits"));
+    }
+    Ok((masks, hits, misses))
+}
+
+impl ResidentChunk {
+    fn send_producer_jobs(
+        &mut self,
+        segment: &mut crate::recorder::PendingSegment,
+        count: usize,
+    ) -> Result<()> {
+        let Some(producer) = &self.producer else {
+            return Ok(());
+        };
+        if self.notices_sent == count {
+            return Ok(());
+        }
+        let (done, receiver) = std::sync::mpsc::channel();
+        segment.retain_notice_producer(receiver);
+        producer
+            .sender
+            .as_ref()
+            .expect("live notice producer")
+            .send(ResidentNoticeJob {
+                journal: Arc::clone(&self.journal),
+                notices: Arc::clone(self.notices.as_ref().unwrap()),
+                fence: segment.notice_fence(),
+                entries: self
+                    .entries
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .take(count)
+                    .skip(self.notices_sent)
+                    .collect(),
+                mapped_serial_max_bytes: self.mapped_serial_max_bytes,
+                done,
+                trace_context: infr_core::timeline::context(),
+            })
+            .map_err(|error| be(format!("submit resident notices: {error}")))?;
+        self.notices_sent = count;
+        Ok(())
+    }
+
+    fn begin_conditional(&self, recorder: &Recorder<'_>) {
+        if let Some(indirect) = &self.indirect {
+            recorder.use_resident_indirect(Arc::clone(indirect));
+        }
+        if self.control.len_bytes() == crate::recorder::RESIDENT_CONTROL_BYTES {
+            let word = self
+                .entries
+                .len()
+                .checked_sub(1)
+                .map_or(crate::recorder::RESIDENT_SEED_WORD, |ordinal| {
+                    5 + ordinal * 2
+                });
+            recorder.begin_immutable_conditional_at(self.control.as_ref(), word);
+        } else {
+            recorder.begin_conditional(self.control.as_ref());
+        }
+    }
+
+    fn new(
+        be_: &VulkanBackend,
+        graph: &Graph,
+        token_row_paged_moe: bool,
+        retained: &mut Option<ResidentBuffers>,
+    ) -> Result<Option<Self>> {
+        let cfg = &be_.cfg().kernels.vulkan;
+        let resident_layouts = graph
+            .ops
+            .iter()
+            .filter(|op| matches!(op, Op::MoeFfn { .. }))
+            .map(|op| ResidentMoeLayout::from_op(graph, op))
+            .collect::<Option<Vec<_>>>();
+        let mtp_verify_rows = graph.mtp_verify
+            && !graph.independent_rows
+            && resident_layouts.as_ref().is_some_and(|layouts| {
+                layouts.iter().all(|layout| {
+                    (1..=crate::recorder::RESIDENT_JOURNAL_MASK_WORDS).contains(&layout.rows)
+                })
+            });
+        let ordinary_decode_rows = !graph.mtp_verify
+            && decode_token_rows(graph)
+                .is_some_and(|rows| (1..=crate::GPU_RESIDENT_MAX_ROWS).contains(&rows));
+        let eligible = cfg.decode_gpu_resident
+            && be_.shared.conditional_rendering.is_some()
+            && token_row_paged_moe
+            && !graph.prefill_next_chunk
+            && graph.prefill_target_tokens.is_none()
+            && (!be_.cfg().spec.mtp || graph.mtp_verify)
+            && !be_.dense_paged()
+            && !be_.cfg().paging.expert_prefetch
+            && cfg.cpu_miss_threads == 0
+            && (ordinary_decode_rows || mtp_verify_rows)
+            && resident_layouts
+                .as_ref()
+                .is_some_and(|layouts| layouts.len() > 1);
+        if !eligible {
+            return Ok(None);
+        }
+        let submit_layers = match cfg.decode_gpu_resident_submit_layers {
+            0 => graph.resident_submit_layers.unwrap_or(1),
+            explicit => explicit,
+        };
+        let limit = cfg
+            .decode_gpu_resident_layers
+            .clamp(1, crate::recorder::RESIDENT_MAX_LAYERS);
+        static RESIDENT_GRAPH_LOGGED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !RESIDENT_GRAPH_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let layouts = resident_layouts
+                .as_ref()
+                .expect("eligible resident graph has layouts");
+            let first = layouts[0];
+            tracing::info!(
+                moe_layers = layouts.len(),
+                rows = first.rows,
+                experts = first.n_expert,
+                top_k = first.n_used,
+                chunk_layers = limit,
+                submit_layers,
+                hit_first = cfg.decode_gpu_resident_hit_first,
+                early_recovery = cfg.decode_gpu_resident_early_recovery,
+                "[infr] GPU-resident paged Decode graph active"
+            );
+        }
+        if retained
+            .as_ref()
+            .is_none_or(|buffers| buffers.capacity < limit)
+        {
+            let control = match retained.as_ref() {
+                Some(buffers) => std::sync::Arc::clone(&buffers.control),
+                None => {
+                    let bytes = if cfg.decode_gpu_resident_immutable_predicates {
+                        crate::recorder::RESIDENT_CONTROL_BYTES
+                    } else {
+                        20
+                    };
+                    let buffer = if cfg.decode_gpu_resident_mapped_metadata {
+                        match be_.alloc_mapped_predicate(bytes) {
+                            Ok(buffer) => buffer,
+                            Err(error) => {
+                                tracing::warn!(%error, "resident predicate mapped VRAM unavailable; retaining host readback");
+                                be_.alloc_uninit(bytes, BufferUsage::Readback)?
+                            }
+                        }
+                    } else {
+                        be_.alloc_uninit(bytes, BufferUsage::Readback)?
+                    };
+                    std::sync::Arc::from(buffer)
+                }
+            };
+            let journal_bytes = limit * crate::recorder::RESIDENT_JOURNAL_BYTES;
+            let journal = if cfg.decode_gpu_resident_mapped_journal {
+                match be_.alloc_mapped_arena_bda(journal_bytes) {
+                    Ok((buffer, _)) => buffer,
+                    Err(error) => {
+                        tracing::warn!(%error, "resident journal mapped VRAM unavailable; retaining host readback");
+                        be_.alloc_uninit(journal_bytes, BufferUsage::Readback)?
+                    }
+                }
+            } else {
+                be_.alloc_uninit(journal_bytes, BufferUsage::Readback)?
+            };
+            *retained = Some(ResidentBuffers {
+                control,
+                journal: std::sync::Arc::from(journal),
+                capacity: limit,
+                notices: if cfg.decode_gpu_resident_hit_first {
+                    Some(std::sync::Arc::new(ResidentNotices::new(be_, limit)?))
+                } else {
+                    None
+                },
+                producer: if cfg.decode_gpu_resident_notice_thread
+                    && cfg.decode_gpu_resident_hit_first
+                {
+                    ResidentNoticeProducer::new(be_)?.map(Arc::new)
+                } else {
+                    None
+                },
+                waiter: if cfg.decode_gpu_resident_waiter {
+                    Some(Arc::new(crate::recorder::FenceWaiter::new(
+                        Arc::clone(&be_.shared),
+                        !cfg.decode_gpu_resident_fence_wait,
+                    )?))
+                } else {
+                    None
+                },
+                indirect: if cfg.decode_gpu_resident_indirect_predicates {
+                    Some(Arc::new(crate::recorder::ResidentIndirect::new(be_)?))
+                } else {
+                    None
+                },
+            });
+        }
+        let buffers = retained.as_ref().expect("resident buffers were allocated");
+        Ok(Some(Self {
+            control: std::sync::Arc::clone(&buffers.control),
+            journal: std::sync::Arc::clone(&buffers.journal),
+            entries: Vec::with_capacity(limit),
+            early_recovery: resident_early_recovery_eligible(
+                cfg.decode_gpu_resident_early_recovery,
+                buffers.producer.is_some(),
+                submit_layers,
+                cfg.decode_gpu_resident_inflight,
+                buffers.indirect.is_some(),
+            ),
+            recovery_op: None,
+            limit,
+            recording: false,
+            submit_layers,
+            submitted_entries: 0,
+            notices: buffers.notices.clone(),
+            notice_cursor: 0,
+            notice_resume: None,
+            notice_stop: false,
+            producer: buffers.producer.clone(),
+            notices_sent: 0,
+            mapped_serial_max_bytes: resident_mapped_serial_max_bytes(
+                cfg.decode_gpu_resident_mapped_serial_max_kib,
+                graph,
+            ),
+            waiter: buffers.waiter.clone(),
+            indirect: buffers.indirect.clone(),
+        }))
+    }
+
+    fn submit_due(&self) -> bool {
+        self.recording
+            && resident_submit_due(
+                self.entries.len(),
+                self.submitted_entries,
+                self.submit_layers,
+                self.limit,
+            )
+    }
+
+    fn finish<'a>(
+        &mut self,
+        be_: &'a VulkanBackend,
+        rec: &mut Option<Recorder<'a>>,
+        ps: &mut PagedStream,
+        pool: &mut ScratchPool,
+        segments: &mut std::collections::VecDeque<crate::recorder::PendingSegment>,
+    ) -> Result<Option<(usize, Vec<u32>)>> {
+        if self.notices.is_some() {
+            return self.finish_with_notice(be_, rec, ps, pool, segments);
+        }
+        rec.as_ref().unwrap().end_conditional();
+        rec.as_ref().unwrap().publish_host_reads();
+        ps.gpu_route = None;
+        sync_stream_inner(
+            be_,
+            rec,
+            ps,
+            pool,
+            be_.cfg().kernels.vulkan.decode_gpu_resident_fence_wait,
+        )?;
+        let _span = infr_core::timeline::span("gpu_resident_journal");
+        let mut words = [0u32; 4];
+        be_.download(self.control.as_ref(), bytemuck::cast_slice_mut(&mut words))?;
+        let stopped = resident_chunk_status(words, self.entries.len())?;
+        let mut ids = vec![0u32; self.entries.len() * crate::recorder::RESIDENT_JOURNAL_WORDS];
+        be_.download(self.journal.as_ref(), bytemuck::cast_slice_mut(&mut ids))?;
+        let hit_count = stopped.unwrap_or(self.entries.len());
+        let mut guard = be_.moe_pager().lock().unwrap();
+        let session = guard.as_mut().expect("GPU resident Decode owns a pager");
+        for (ordinal, entry) in self.entries[..hit_count].iter().enumerate() {
+            let base = ordinal * crate::recorder::RESIDENT_JOURNAL_WORDS;
+            session.begin_role_batches(&entry.roles)?;
+            session.touch_routed_hits(&entry.roles, &ids[base..base + entry.layout.count()])?;
+        }
+        let resume = stopped.map(|ordinal| {
+            let entry = &self.entries[ordinal];
+            let base = ordinal * crate::recorder::RESIDENT_JOURNAL_WORDS;
+            (
+                entry.op_idx,
+                ids[base..base + entry.layout.count()].to_vec(),
+            )
+        });
+        self.entries.clear();
+        self.recording = false;
+        self.submitted_entries = 0;
+        if let Some(indirect) = &self.indirect {
+            indirect.reset_after_drain();
+        }
+        Ok(resume)
+    }
+
+    fn poll_notices(
+        &mut self,
+        be_: &VulkanBackend,
+        ps: &mut PagedStream,
+        pending: Option<&crate::recorder::PendingSegment>,
+    ) -> Result<()> {
+        if self.notice_resume.is_some() || self.notices.is_none() {
+            return Ok(());
+        }
+        if self.producer.is_some() {
+            return self.poll_produced_notices(be_, ps, pending.is_some());
+        }
+        let notices = self.notices.as_ref().unwrap();
+        let limit = if pending.is_some() {
+            self.entries.len()
+        } else {
+            self.submitted_entries
+        };
+        for (ordinal, entry) in self
+            .entries
+            .iter()
+            .enumerate()
+            .take(limit)
+            .skip(self.notice_cursor)
+        {
+            let _span = infr_core::timeline::span("gpu_resident_notice_wait");
+            let mut spins = 0;
+            while !unsafe { be_.shared.device.get_event_status(notices.events[ordinal]) }
+                .map_err(|error| be(format!("resident notice query: {error}")))?
+            {
+                let Some(pending) = pending else {
+                    return Ok(());
+                };
+                if pending.is_complete()? {
+                    if unsafe { be_.shared.device.get_event_status(notices.events[ordinal]) }
+                        .map_err(|error| be(format!("resident notice recheck: {error}")))?
+                    {
+                        break;
+                    }
+                    return Err(be("completed resident segment did not publish its notice"));
+                }
+                spins += 1;
+                if spins < 64 {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+            let words = resident_notice_words(self.journal.as_ref(), ordinal)?;
+            drop(_span);
+            self.notice_cursor = ordinal + 1;
+            match words[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] {
+                1 => {
+                    let mut guard = be_.moe_pager().lock().unwrap();
+                    let session = guard.as_mut().unwrap();
+                    session.begin_role_batches(&entry.roles)?;
+                    session.touch_routed_hits(&entry.roles, &words[..entry.layout.count()])?;
+                }
+                2 => {
+                    let _promotion = infr_core::timeline::span("gpu_resident_notice_promotion");
+                    let (masks, hits, misses) = resident_notice_slots(&words, entry.layout)?;
+                    let mut guard = be_.moe_pager().lock().unwrap();
+                    let session = guard.as_mut().unwrap();
+                    let layer =
+                        session.registered_layer(entry.roles[0], entry.layout.n_expert)? as usize;
+                    // The notice orders all earlier layer reads. This layer can still read
+                    // its actual hit triplets: pin them before admitting any new payload.
+                    session.begin_role_batches(&entry.roles)?;
+                    session.touch_routed_hits(&entry.roles, &hits)?;
+                    let abort =
+                        ps.cpu_promotion_abort
+                            .get_or_insert_with(|| CpuPromotionAbortGuard {
+                                pager: Arc::clone(&be_.moe_pager),
+                                experts: Vec::new(),
+                                complete: false,
+                            });
+                    abort
+                        .experts
+                        .extend(misses.iter().map(|&id| (entry.roles, id)));
+                    let push = session.push_roles_cpu(
+                        be_,
+                        &entry.roles.map(|role| (role, misses.as_slice())),
+                        false,
+                    )?;
+                    drop(guard);
+                    let transfer = if let Some(executor) = be_
+                        .background_expert_transfer_executor()
+                        .filter(|_| push.background_compatible())
+                    {
+                        push.submit_background(&executor)?.map(|value| {
+                            ps.cpu_transfer_wait = ps.cpu_transfer_wait.max(value);
+                            CpuPromotionPending::Dma(executor, Some(value))
+                        })
+                    } else {
+                        push.complete_without_recorder(be_)?;
+                        None
+                    };
+                    ps.cpu_promotion = Some(CpuMissPromotion {
+                        roles: entry.roles,
+                        ids: misses,
+                        layer,
+                        sources: Vec::new(),
+                        started: true,
+                        pending: transfer,
+                    });
+                    ps.resume_hit_masks = Some(masks);
+                    self.notice_resume =
+                        Some((entry.op_idx, words[..entry.layout.count()].to_vec()));
+                    break;
+                }
+                _ => {
+                    return Err(be(
+                        "invalid or skipped resident notice before the first miss",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn poll_produced_notices(
+        &mut self,
+        be_: &VulkanBackend,
+        ps: &mut PagedStream,
+        blocking: bool,
+    ) -> Result<()> {
+        let producer = self.producer.as_ref().unwrap();
+        self.notice_stop |= producer.stop_recording(self.notices_sent)?;
+        while self.notice_cursor < self.notices_sent {
+            let _span = infr_core::timeline::span(if blocking {
+                "gpu_resident_notice_producer_wait"
+            } else {
+                "resident_notice_poll"
+            });
+            let Some((ordinal, result)) = producer.receive(blocking)? else {
+                return Ok(());
+            };
+            drop(_span);
+            let expected = self.notice_cursor;
+            self.notice_cursor += 1;
+            if ordinal != expected {
+                return Err(be("resident producer result order mismatch"));
+            }
+            let mut notice = result?;
+            let entry = &self.entries[ordinal];
+            match notice.words[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] {
+                1 => (), // The producer already replayed the actual hits in journal order.
+                2 => {
+                    let (masks, _, _) = resident_notice_slots(&notice.words, entry.layout)?;
+                    let mut produced = notice
+                        .promotion
+                        .take()
+                        .ok_or_else(|| be("producer miss has no upload"))?;
+                    let mut abort = produced.abort.take().expect("producer admission guard");
+                    let main_abort =
+                        ps.cpu_promotion_abort
+                            .get_or_insert_with(|| CpuPromotionAbortGuard {
+                                pager: Arc::clone(&be_.moe_pager),
+                                experts: Vec::new(),
+                                complete: false,
+                            });
+                    main_abort.experts.append(&mut abort.experts);
+                    abort.complete = true;
+                    let promotion = produced.promotion.take().expect("producer promotion");
+                    if let Some(CpuPromotionPending::Dma(_, Some(value))) = &promotion.pending {
+                        ps.cpu_transfer_wait = ps.cpu_transfer_wait.max(*value);
+                    }
+                    ps.cpu_promotion = Some(promotion);
+                    ps.resume_hit_masks = Some(masks);
+                    self.notice_resume =
+                        Some((entry.op_idx, notice.words[..entry.layout.count()].to_vec()));
+                    break;
+                }
+                _ => {
+                    return Err(be(
+                        "invalid or skipped producer notice before the first miss",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_with_notice<'a>(
+        &mut self,
+        be_: &'a VulkanBackend,
+        rec: &mut Option<Recorder<'a>>,
+        ps: &mut PagedStream,
+        pool: &ScratchPool,
+        segments: &mut std::collections::VecDeque<crate::recorder::PendingSegment>,
+    ) -> Result<Option<(usize, Vec<u32>)>> {
+        ps.gpu_route = None;
+        ps.finish_cpu_miss(be_, pool)?;
+        if let Some(recorder) = rec.take() {
+            recorder.end_conditional();
+            recorder.publish_host_reads();
+            let mut pending = recorder.finish_nowait()?;
+            if let Some(waiter) = &self.waiter {
+                pending.start_waiter(waiter)?;
+            }
+            self.send_producer_jobs(&mut pending, self.entries.len())?;
+            self.poll_notices(be_, ps, Some(&pending))?;
+            // Error paths drain through PendingSegment::drop before phase storage disappears.
+            if self.early_recovery && self.notice_resume.is_some() {
+                segments.push_back(pending);
+            } else {
+                pending.wait()?;
+            }
+        } else {
+            assert!(
+                self.notice_resume.is_some() || self.notice_stop,
+                "only a notified miss discards its recorder"
+            );
+            assert!(
+                !segments.is_empty(),
+                "an early notice must belong to submitted work"
+            );
+            // An early cancellation does not own the prepared upload yet. Collect that
+            // result before resuming, while the worker remains free to prepare the copy.
+            self.poll_notices(be_, ps, segments.back())?;
+            if self.notice_resume.is_none() {
+                return Err(be(
+                    "announced resident miss has no prepared recovery result",
+                ));
+            }
+            // The published miss belongs to an existing submission. Waiting those fences
+            // drains its hit readers without submitting a new empty command buffer.
+            if !self.early_recovery {
+                while let Some(segment) = segments.pop_front() {
+                    segment.wait()?;
+                }
+            }
+        }
+        let resume = self.notice_resume.take();
+        if self.early_recovery {
+            if let Some((op_idx, _)) = &resume {
+                let entry = self
+                    .entries
+                    .iter()
+                    .find(|entry| entry.op_idx == *op_idx)
+                    .ok_or_else(|| {
+                        be("early recovery notice does not belong to the resident window")
+                    })?;
+                let minimum_tape_words = entry.layout.role_tape_words();
+                // The miss LUT is appended, never written over the hit-reader windows. The first
+                // replayed next-layer window will fit below it. At most one submitted segment is
+                // retained; a two-layer lookahead may contain one skipped successor, but that
+                // segment is retired before replay can reuse these coordinates.
+                if ps.tape_cursor < minimum_tape_words || segments.is_empty() {
+                    return Err(be("early recovery has no retained hit/LUT submission"));
+                }
+                self.recovery_op = Some(ResidentRecovery {
+                    op_idx: *op_idx,
+                    miss_tape_start: ps.tape_cursor,
+                    minimum_tape_words,
+                });
+                let fresh = be_.recorder()?;
+                fresh.seed_barrier();
+                ps.acquire_cpu_promotion(&fresh);
+                *rec = Some(fresh);
+                return Ok(resume);
+            }
+        }
+        ps.drain()?;
+        if let Some(producer) = &self.producer {
+            while self.notice_cursor < self.notices_sent {
+                let (ordinal, result) = producer.receive(true)?.expect("blocking producer result");
+                let expected = self.notice_cursor;
+                self.notice_cursor += 1;
+                if ordinal != expected {
+                    return Err(be("resident producer result order mismatch"));
+                }
+                if result?.words[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] != 0 {
+                    return Err(be("resident producer tail was not skipped"));
+                }
+            }
+        }
+        // Admission already pinned the miss destinations. Encode their consumers while the
+        // dedicated transfer runs; the fresh submission carries its timeline dependency.
+        // The next residency mutation (or final drain) waits before releasing those pins.
+        if resume.is_none() {
+            ps.wait_cpu_promotion(be_)?;
+        }
+        let mut status = [0u32; 4];
+        be_.download(self.control.as_ref(), bytemuck::cast_slice_mut(&mut status))?;
+        let stopped = resident_chunk_status(status, self.entries.len())?;
+        if stopped.map(|ordinal| self.entries[ordinal].op_idx)
+            != resume.as_ref().map(|(op_idx, _)| *op_idx)
+        {
+            return Err(be("resident notice and final control disagree"));
+        }
+        ps.cursor = 0;
+        ps.tape_cursor = 0;
+        clear_frozen_moe_lut_slots(be_.moe_pager())?;
+        if resume.is_some() {
+            if let Some(promotion) = ps.cpu_promotion.as_ref() {
+                // GPU hit readers drained, but the miss upload still owns its destinations.
+                // Protect them from unified scratch claims as well as ordinary LRU eviction.
+                let mut guard = be_.moe_pager().lock().unwrap();
+                let session = guard.as_mut().unwrap();
+                for &role in &promotion.roles {
+                    session.protect_lut_ids(role, &promotion.ids)?;
+                }
+            }
+        }
+        let fresh = be_.recorder()?;
+        fresh.seed_barrier();
+        ps.acquire_cpu_promotion(&fresh);
+        *rec = Some(fresh);
+        self.entries.clear();
+        self.recording = false;
+        self.submitted_entries = 0;
+        self.notice_cursor = 0;
+        self.notices_sent = 0;
+        self.notice_stop = false;
+        if let Some(producer) = &self.producer {
+            producer.reset_after_drain();
+        }
+        if let Some(indirect) = &self.indirect {
+            indirect.reset_after_drain();
+        }
+        Ok(resume)
+    }
+
+    fn submit_early_recovery<'a>(
+        &mut self,
+        be_: &'a VulkanBackend,
+        op_idx: usize,
+        rec: &mut Option<Recorder<'a>>,
+        ps: &mut PagedStream,
+        segments: &mut std::collections::VecDeque<crate::recorder::PendingSegment>,
+    ) -> Result<usize> {
+        let recovery = self.recovery_op.take().expect("pending recovery");
+        if op_idx != recovery.op_idx
+            || recovery.miss_tape_start < recovery.minimum_tape_words
+            || ps.resume_ids.is_some()
+        {
+            return Err(be("early recovery resumed the wrong FFN or LUT window"));
+        }
+        let retire = segments.len();
+        let pending = rec
+            .take()
+            .expect("miss recovery recorder")
+            .finish_nowait()?;
+        let dispatches = pending.dispatches();
+        segments.push_back(pending);
+        // Queue the next frontend before CPU retirement. Decode early-submit may already have
+        // queued the miss FFN separately; this larger useful interval still covers cleanup.
+        // Queue order and the transfer semaphore protect both the residual and missing weights.
+        for _ in 0..retire {
+            segments.pop_front().expect("retained hit segment").wait()?;
+        }
+        ps.drain()?;
+        if let Some(producer) = &self.producer {
+            while self.notice_cursor < self.notices_sent {
+                let (ordinal, result) = producer.receive(true)?.expect("producer tail result");
+                if ordinal != self.notice_cursor
+                    || result?.words[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] != 0
+                {
+                    return Err(be("early recovery producer tail was not skipped in order"));
+                }
+                self.notice_cursor += 1;
+            }
+        }
+        let mut status = [0u32; 4];
+        be_.download(self.control.as_ref(), bytemuck::cast_slice_mut(&mut status))?;
+        let stopped = resident_chunk_status(status, self.entries.len())?;
+        if stopped.map(|ordinal| self.entries[ordinal].op_idx) != Some(recovery.op_idx) {
+            return Err(be("early recovery notice and final control disagree"));
+        }
+        // The queued miss owns only the appended LUT window. Low coordinates may now be
+        // recycled for one next layer, but its expert destinations remain protected.
+        ps.cursor = 0;
+        ps.tape_cursor = 0;
+        let promotion = ps
+            .cpu_promotion
+            .as_ref()
+            .ok_or_else(|| be("queued early recovery lost its protected promotion"))?;
+        be_.moe_pager()
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .clear_frozen_except_routed(&promotion.roles, &promotion.ids)?;
+        let fresh = be_.recorder()?;
+        fresh.seed_barrier();
+        *rec = Some(fresh);
+        self.entries.clear();
+        self.recording = false;
+        self.submitted_entries = 0;
+        self.notice_cursor = 0;
+        self.notices_sent = 0;
+        self.notice_stop = false;
+        if let Some(producer) = &self.producer {
+            producer.reset_after_drain();
+        }
+        Ok(dispatches)
+    }
+}
+
 #[derive(Default)]
 struct PagedStream {
+    gpu_route: Option<GpuRoute>,
+    resume_ids: Option<Vec<u32>>,
+    resume_hit_masks: Option<Vec<u32>>,
     /// Sparse tape entries are only legal for the small-m shaders, never bucketed MMQ.
     small_m_lut: bool,
     /// Result copies can be encoded immediately; host writes must complete before submission or
@@ -10058,13 +11738,33 @@ fn sync_stream<'a>(
     ps: &mut PagedStream,
     pool: &ScratchPool,
 ) -> Result<()> {
+    sync_stream_inner(be_, rec, ps, pool, false)
+}
+
+fn sync_stream_inner<'a>(
+    be_: &'a VulkanBackend,
+    rec: &mut Option<Recorder<'a>>,
+    ps: &mut PagedStream,
+    pool: &ScratchPool,
+    fence_wait: bool,
+) -> Result<()> {
     let _timeline_sync = infr_core::timeline::span("router_sync_stream");
     let sync_t0 = infr_core::pager_profile::start();
     ps.finish_cpu_miss(be_, pool)?;
-    rec.take()
-        .expect("segment always Some between ops")
-        .finish_after_submit(|| ps.start_cpu_promotion(be_))
-        .map_err(|e| be(e.to_string()))?;
+    let recorder = rec.take().expect("segment always Some between ops");
+    if fence_wait {
+        let pending = recorder.finish_nowait()?;
+        let host_result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ps.start_cpu_promotion(be_)))
+                .unwrap_or_else(|_| Err(be("post-submit promotion panicked")));
+        // Drain even when promotion failed or panicked; recorded readers still own these slots.
+        pending.wait()?;
+        host_result?;
+    } else {
+        recorder
+            .finish_after_submit(|| ps.start_cpu_promotion(be_))
+            .map_err(|e| be(e.to_string()))?;
+    }
     ps.drain()?; // fences already signaled (queue idle) — releases their transient objects
     ps.wait_cpu_promotion(be_)?;
     ps.cursor = 0;
@@ -10404,7 +12104,7 @@ fn prefetch_next_moe_layer<'a>(
 /// arena+window hop with `out_f = 2*nff` and the activation splits gate|up per row exactly like
 /// the resident fused arms. `rows`/`n_used` are general (not hardcoded to llama4's rows=1/
 /// n_used=1).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PagedMoeShared {
     gate_inp: TensorId,
     gate: TensorId,
@@ -10414,15 +12114,22 @@ struct PagedMoeShared {
     dst: TensorId,
 }
 
+fn paged_moe_shared_candidates(
+    graph: &Graph,
+    disabled: bool,
+) -> impl Iterator<Item = (usize, PagedMoeShared)> + '_ {
+    graph.ops.iter().enumerate().filter_map(move |(idx, op)| {
+        if disabled || !matches!(op, Op::MoeFfn { .. }) {
+            return None;
+        }
+        paged_moe_shared_at(graph, idx).map(|shared| (idx, shared))
+    })
+}
+
 /// Recognize the exact Qwen sigmoid-gated shared-expert tail emitted by `seam::runner`. This is a
 /// backend peephole rather than a graph semantic change: other backends retain the ordinary dense
 /// chain, while Vulkan small-m decode/VERIFY can place the shared expert in routed slot 8.
 fn paged_moe_shared_at(graph: &Graph, op_idx: usize) -> Option<PagedMoeShared> {
-    // Validation/escape hatch: permits same-binary A/B and an immediate fallback if a future
-    // model reuses the exact graph shape but violates an unstated packing invariant.
-    if std::env::var_os("INFR_NO_MOE_SHARED_SLOT").is_some() {
-        return None;
-    }
     let Op::MoeFfn {
         x,
         gate_exps,
@@ -10728,8 +12435,14 @@ fn execute_paged_moe<'a>(
     // MoE has no cross-row recurrence. The same per-row hit/miss masks used by parallel decode are
     // therefore valid for a short causal VERIFY batch too; attention and DeltaNet remain on their
     // original causal graph paths outside this local op.
-    let row_hit_masks =
-        rows > 1 && rows <= MOE_HIT_FIRST_MAX_ROWS && n_slots <= MOE_HIT_FIRST_MAX_SLOTS;
+    let gpu_hit_first = ps
+        .gpu_route
+        .as_ref()
+        .is_some_and(|route| route.notice.is_some())
+        || ps.resume_hit_masks.is_some();
+    let row_hit_masks = (rows > 1 || gpu_hit_first)
+        && rows <= MOE_HIT_FIRST_MAX_ROWS
+        && n_slots <= MOE_HIT_FIRST_MAX_SLOTS;
     let physical_used = n_used + usize::from(shared.is_some());
     let physical_slots = rows * physical_used;
     let routed_mask = if n_used == u32::BITS as usize {
@@ -10911,7 +12624,9 @@ fn execute_paged_moe<'a>(
             BufferUsage::Readback,
         )?);
     }
-    {
+    let resume_ids = ps.resume_ids.take();
+    let precomputed_hit_masks = ps.resume_hit_masks.take();
+    if resume_ids.is_none() {
         let rc = rec.as_ref().expect("segment always Some between ops");
         let rxb = r(*router_x)?;
         let rw = r(*router)?;
@@ -10999,7 +12714,9 @@ fn execute_paged_moe<'a>(
     // A submitted promotion can still own mapped slots; drain before any residency changes.
     // Unsubmitted result copies retain their sources until sync_stream submits them.
     ps.finish_cpu_miss(be_, pool)?;
-    ps.wait_cpu_promotion(be_)?;
+    if precomputed_hit_masks.is_none() {
+        ps.wait_cpu_promotion(be_)?;
+    }
     ps.acquire_cpu_promotion(rec.as_ref().expect("ambient segment exists"));
     if !layer_stream && !touch_all {
         let changed = be_
@@ -11034,7 +12751,207 @@ fn execute_paged_moe<'a>(
     } else {
         None
     };
-    if layer_stream {
+    if let Some(route) = ps.gpu_route.as_ref() {
+        let workspace = small_workspace
+            .as_ref()
+            .expect("GPU resident Decode uses small-m");
+        let (windows, tape, banks) = {
+            let mut guard = be_.moe_pager().lock().unwrap();
+            let sess = guard
+                .as_mut()
+                .expect("GPU resident Decode requires a pager");
+            let windows = [
+                sess.resident_lut_window(&mut ps.tape_cursor, gate_id, n_expert)?,
+                sess.resident_lut_window(&mut ps.tape_cursor, up_id, n_expert)?,
+                sess.resident_lut_window(&mut ps.tape_cursor, down_id, n_expert)?,
+            ];
+            let bank = |role| -> Result<(u64, u32)> {
+                Ok((sess.arena_addr(role)?, sess.slot_bytes(role)? as u32))
+            };
+            let banks = [bank(gate_id)?, bank(up_id)?, bank(down_id)?];
+            (windows, sess.retained_tape(), banks)
+        };
+        // Frozen addresses remain protected until the chunk drains. Encoding does not
+        // need the pager lock; the notice producer can now prepare uploads concurrently.
+        let rc = rec.as_ref().unwrap();
+        rc.end_conditional();
+        {
+            let _notice_phase = infr_core::timeline::device_enabled()
+                .then(|| infr_core::timeline::device_phase_scope("resident_router_notice"));
+            let params = [
+                n_slots as u32,
+                n_expert as u32,
+                windows[0],
+                windows[1],
+                windows[2],
+                route.ordinal,
+            ];
+            if let Some(notice) = route.notice {
+                rc.gpu_resident_hit_check(
+                    pool[&ids_key].as_ref(),
+                    tape.as_ref(),
+                    route.control.as_ref(),
+                    route.journal.as_ref(),
+                    [
+                        params[0],
+                        params[1],
+                        params[2],
+                        params[3],
+                        params[4],
+                        params[5],
+                        n_used as u32,
+                        shared_mask,
+                    ],
+                    notice,
+                );
+            } else {
+                rc.gpu_resident_check(
+                    pool[&ids_key].as_ref(),
+                    tape.as_ref(),
+                    route.control.as_ref(),
+                    route.journal.as_ref(),
+                    params,
+                );
+            }
+        }
+        if route.control.len_bytes() == crate::recorder::RESIDENT_CONTROL_BYTES {
+            rc.begin_immutable_conditional_at(
+                route.control.as_ref(),
+                5 + route.ordinal as usize * 2 + usize::from(route.notice.is_some()),
+            );
+        } else {
+            rc.begin_conditional_at(
+                route.control.as_ref(),
+                if route.notice.is_some() { 4 } else { 0 },
+            );
+        }
+        let route_mask = if route.notice.is_some() {
+            0
+        } else {
+            all_active_mask
+        };
+        let route_bank = if route.notice.is_some() {
+            MOE_ROW_MASK_HITS
+        } else {
+            MOE_ROW_MASK_NONE
+        };
+        let xb = r(*x)?;
+        let hit_phase = infr_core::timeline::device_enabled().then(|| {
+            infr_core::timeline::device_phase_scope(if route.notice.is_some() {
+                "resident_hit_FFN"
+            } else {
+                "resident_full_hit_FFN"
+            })
+        });
+        for (dtype, bank, window, shared_weight, output) in [
+            (gdt, banks[0], windows[0], shared_wgate, workspace.gbuf),
+            (
+                udt,
+                banks[1],
+                windows[1],
+                shared_wup,
+                workspace.ubuf.unwrap(),
+            ),
+        ] {
+            linear_paged_maybe_shared(
+                rc,
+                dtype,
+                bank.0,
+                bank.1,
+                tape.as_ref(),
+                pool[&ids_key].as_ref(),
+                n_used,
+                window as usize,
+                shared_weight,
+                xb,
+                false,
+                pool[&output].as_ref(),
+                ne,
+                nff,
+                rows,
+                route_mask,
+                route_bank,
+            );
+        }
+        if route.notice.is_some() {
+            rc.gpu_resident_silu(
+                pool[&workspace.gbuf].as_ref(),
+                pool[&workspace.ubuf.unwrap()].as_ref(),
+                pool[&ids_key].as_ref(),
+                pool[&workspace.abuf].as_ref(),
+                [rows as u32, n_used as u32, physical_used as u32, nff as u32],
+            );
+        } else {
+            rc.silu_mul(
+                pool[&workspace.gbuf].as_ref(),
+                pool[&workspace.ubuf.unwrap()].as_ref(),
+                pool[&workspace.abuf].as_ref(),
+                physical_slots * nff,
+                None,
+            );
+        }
+        linear_paged_maybe_shared(
+            rc,
+            ddt,
+            banks[2].0,
+            banks[2].1,
+            tape.as_ref(),
+            pool[&ids_key].as_ref(),
+            n_used,
+            windows[2] as usize,
+            shared_wdown,
+            pool[&workspace.abuf].as_ref(),
+            true,
+            pool[&workspace.ybuf].as_ref(),
+            nff,
+            ne,
+            rows,
+            route_mask,
+            route_bank,
+        );
+        drop(hit_phase);
+        if route.notice.is_some() {
+            rc.end_conditional();
+            if route.control.len_bytes() == crate::recorder::RESIDENT_CONTROL_BYTES {
+                rc.begin_immutable_conditional_at(
+                    route.control.as_ref(),
+                    5 + route.ordinal as usize * 2,
+                );
+            } else {
+                rc.begin_conditional(route.control.as_ref());
+            }
+        }
+        if let Some(shared) = shared {
+            rc.moe_accumulate_shared(
+                pool[&workspace.ybuf].as_ref(),
+                pool[&wts].as_ref(),
+                r(shared.gate)?,
+                r(shared.dst)?,
+                ne,
+                n_used,
+                rows,
+            );
+        } else {
+            rc.zero(r(*dst)?, rows * ne);
+            rc.moe_accumulate(
+                pool[&workspace.ybuf].as_ref(),
+                pool[&wts].as_ref(),
+                r(*dst)?,
+                ne,
+                n_used,
+                rows,
+                false,
+            );
+        }
+        return Ok(current_layer);
+    }
+    let _miss_phase = (precomputed_hit_masks.is_some() && infr_core::timeline::device_enabled())
+        .then(|| infr_core::timeline::device_phase_scope("resident_miss_resume_FFN"));
+    if let Some(ids) = resume_ids {
+        stage_ids = ids;
+        // Router, top-k and shared gate belong to the paused layer. Its frontend must not rerun.
+        stream_synced_for_cpu_push = true;
+    } else if layer_stream {
         // Whole-layer staging below bypasses expert-level LRU bookkeeping entirely.
     } else if touch_all {
         stage_ids = (0..n_expert as u32).collect();
@@ -11186,6 +13103,18 @@ fn execute_paged_moe<'a>(
     let mut active_mask = all_active_mask;
     let mut row_mask_bank = MOE_ROW_MASK_NONE;
     let mut role_batches_preopened = false;
+    if let Some(masks) = precomputed_hit_masks.as_ref() {
+        stage_ids = stage_ids
+            .into_iter()
+            .enumerate()
+            .filter_map(|(slot, id)| {
+                (masks[slot / n_used] & (1 << (slot % n_used)) == 0).then_some(id)
+            })
+            .collect();
+        active_mask = 0;
+        row_mask_bank = MOE_ROW_MASK_MISSES;
+        role_batches_preopened = true;
+    }
     let mut promotion_probe = None;
     let mut cpu_miss_job = None;
     let mut cpu_promoted = false;
@@ -11197,6 +13126,7 @@ fn execute_paged_moe<'a>(
     // in their ordinary layout. Keep the pager epoch open across both halves: miss insertion may
     // then use any cold slot except the hit weights still being read by the GPU.
     if !layer_stream
+        && precomputed_hit_masks.is_none()
         && (rows == 1 || row_hit_masks)
         && matches!(&moe_scratch, PagedMoeScratch::Small(_))
         && !*fused_gate_up
@@ -12193,7 +14123,7 @@ fn execute_paged_moe<'a>(
                 Activation::Sigmoid => {
                     return Err(be(
                         "vulkan adapter: fused_gate_up paged MoeFfn Sigmoid unsupported",
-                    ))
+                    ));
                 }
             },
         }
@@ -12240,7 +14170,9 @@ fn execute_paged_moe<'a>(
                         || !gpu.is_finite()
                         || (cpu - gpu).abs() > 0.003 + gpu.abs() * 0.002
                     {
-                        return Err(be(format!("CPU miss parity failure: layer={current_layer} slot={slot} cpu={cpu} gpu={gpu}")));
+                        return Err(be(format!(
+                            "CPU miss parity failure: layer={current_layer} slot={slot} cpu={cpu} gpu={gpu}"
+                        )));
                     }
                 }
             }
@@ -12362,6 +14294,923 @@ fn execute_paged_moe<'a>(
 
 #[cfg(test)]
 mod tests {
+    fn shared_scan_graph(rows: usize, routed_dtype: infr_core::DType) -> super::Graph {
+        use super::*;
+        use infr_core::TensorDesc;
+        let mut graph = Graph::new();
+        let desc = |n, dtype| TensorDesc::new(vec![n], dtype);
+        let x = graph.input(desc(rows * 2560, infr_core::DType::F32));
+        let routed = graph.weight(desc(2560 * 640 * 512, routed_dtype));
+        let gate_inp = graph.weight(desc(2560, infr_core::DType::F32));
+        let shared = graph.weight(desc(2560 * 640, infr_core::DType::Q8_0));
+        let gate = graph.internal(desc(rows, infr_core::DType::F32));
+        let gbuf = graph.internal(desc(rows * 640, infr_core::DType::F32));
+        let ubuf = graph.internal(desc(rows * 640, infr_core::DType::F32));
+        let act = graph.internal(desc(rows * 640, infr_core::DType::F32));
+        let moe = graph.internal(desc(rows * 2560, infr_core::DType::F32));
+        let out = graph.internal(desc(rows * 2560, infr_core::DType::F32));
+        for _ in 0..80 {
+            graph.push(Op::Add {
+                a: x,
+                b: x,
+                dst: x,
+                n: (rows * 2560) as u32,
+            });
+        }
+        graph.push(Op::MoeFfn {
+            x,
+            router_x: x,
+            router: gate_inp,
+            gate_exps: routed,
+            up_exps: routed,
+            down_exps: routed,
+            dst: moe,
+            ne: 2560,
+            n_expert: 512,
+            n_used: 10,
+            n_ff_exp: 640,
+            down_scale: None,
+            fused_gate_up: false,
+            scale: 1.,
+            act: Activation::Silu,
+            gating: infr_core::graph::MoeGating::Softmax,
+            norm_w: true,
+            weight_before: false,
+            ep_band: None,
+            exp_probs_b: None,
+            n_expert_groups: 0,
+            n_expert_groups_used: 0,
+            swiglu_clamp: None,
+            expert_ids: None,
+        });
+        graph.push(Op::Linear {
+            x,
+            weight: gate_inp,
+            dst: gate,
+            m: rows as u32,
+            in_f: 2560,
+            out_f: 1,
+            w_off: 0,
+        });
+        for dst in [gbuf, ubuf] {
+            graph.push(Op::Linear {
+                x,
+                weight: shared,
+                dst,
+                m: rows as u32,
+                in_f: 2560,
+                out_f: 640,
+                w_off: 0,
+            });
+        }
+        graph.push(Op::GatedAct {
+            gate: gbuf,
+            up: ubuf,
+            dst: act,
+            rows: rows as u32,
+            nff: 640,
+            act: Activation::Silu,
+            up_off: 0,
+            up_stride: 0,
+            gate_stride: 0,
+            gate_block_width: 0,
+            swiglu_clamp: None,
+        });
+        graph.push(Op::Linear {
+            x: act,
+            weight: shared,
+            dst: out,
+            m: rows as u32,
+            in_f: 640,
+            out_f: 2560,
+            w_off: 0,
+        });
+        graph.push(Op::MoeSharedExpertAdd {
+            moe,
+            shexp: out,
+            gate,
+            dst: x,
+            rows: rows as u32,
+            n: 2560,
+        });
+        graph
+    }
+
+    #[test]
+    fn shared_scan_prefilter_preserves_shapes_indices_and_escape_hatch() {
+        use super::*;
+        use infr_core::DType;
+        for rows in [1, 2, 4, 8, 9, 32] {
+            for dtype in [
+                DType::Q5K,
+                DType::Q6K,
+                DType::Iq2S,
+                DType::Iq3S,
+                DType::Iq4Nl,
+                DType::Iq4Xs,
+                DType::Q8_0,
+                DType::F32,
+            ] {
+                let mut graph = shared_scan_graph(rows, dtype);
+                let tail = graph.ops.clone();
+                graph.ops.extend(tail);
+                let original = (0..graph.ops.len())
+                    .filter_map(|idx| paged_moe_shared_at(&graph, idx).map(|shared| (idx, shared)))
+                    .collect::<Vec<_>>();
+                let filtered = paged_moe_shared_candidates(&graph, false).collect::<Vec<_>>();
+                assert_eq!(filtered, original, "rows={rows}, dtype={dtype:?}");
+                let supported = rows <= 8
+                    && matches!(dtype, DType::Q5K | DType::Q6K | DType::Iq4Xs)
+                    || rows == 1 && matches!(dtype, DType::Iq2S | DType::Iq3S | DType::Iq4Nl);
+                assert_eq!(filtered.len(), if supported { 2 } else { 0 });
+                if supported {
+                    assert_eq!(
+                        filtered.iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
+                        vec![80, 167]
+                    );
+                }
+                assert_eq!(paged_moe_shared_candidates(&graph, true).count(), 0);
+            }
+        }
+        let mut truncated = shared_scan_graph(1, DType::Q5K);
+        truncated.ops.pop();
+        assert_eq!(paged_moe_shared_candidates(&truncated, false).count(), 0);
+        assert_eq!(paged_moe_shared_candidates(&Graph::new(), false).count(), 0);
+    }
+
+    #[test]
+    #[ignore = "CPU-only timing comparison; run explicitly with --nocapture"]
+    fn shared_scan_cpu_benchmark() {
+        use super::*;
+        use std::{hint::black_box, time::Instant};
+        let mut graph = shared_scan_graph(1, infr_core::DType::Q5K);
+        let layer = graph.ops.clone();
+        for _ in 1..47 {
+            graph.ops.extend_from_slice(&layer);
+        }
+        let repeats = 1024;
+        for pass in 0..6 {
+            let mut samples = [0.; 2];
+            for mode in [pass % 2, 1 - pass % 2] {
+                let start = Instant::now();
+                let mut checksum = 0;
+                for _ in 0..repeats {
+                    let graph = black_box(&graph);
+                    if mode == 0 {
+                        // Exact old escape-hatch ordering, with the unchanged shape recognizer.
+                        checksum += (0..graph.ops.len())
+                            .filter_map(|idx| {
+                                if std::env::var_os("INFR_NO_MOE_SHARED_SLOT").is_some() {
+                                    None
+                                } else {
+                                    paged_moe_shared_at(graph, idx)
+                                }
+                            })
+                            .count();
+                    } else {
+                        let disabled = std::env::var_os("INFR_NO_MOE_SHARED_SLOT").is_some();
+                        checksum += paged_moe_shared_candidates(graph, disabled).count();
+                    }
+                }
+                assert_eq!(checksum, repeats * 47);
+                black_box(checksum);
+                samples[mode] = start.elapsed().as_secs_f64() * 1e6 / repeats as f64;
+            }
+            println!(
+                "shared_scan pass={pass} ops={} legacy_us={:.3} filtered_us={:.3}",
+                graph.ops.len(),
+                samples[0],
+                samples[1]
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_submits_at_next_moe_end_or_cap_but_never_before_missing_ffn() {
+        use super::*;
+        let id = TensorId(0);
+        let frontend = Op::Add {
+            a: id,
+            b: id,
+            dst: id,
+            n: 1,
+        };
+        let moe = Op::MoeFfn {
+            x: id,
+            router_x: id,
+            router: id,
+            gate_exps: id,
+            up_exps: id,
+            down_exps: id,
+            dst: id,
+            ne: 2560,
+            n_expert: 512,
+            n_used: 10,
+            n_ff_exp: 640,
+            down_scale: None,
+            fused_gate_up: false,
+            scale: 1.,
+            act: Activation::Silu,
+            gating: infr_core::graph::MoeGating::Softmax,
+            norm_w: true,
+            weight_before: false,
+            ep_band: None,
+            exp_probs_b: None,
+            n_expert_groups: 0,
+            n_expert_groups_used: 0,
+            swiglu_clamp: None,
+            expert_ids: None,
+        };
+        for pending in [false, true] {
+            for cap in [false, true] {
+                for next in [None, Some(&frontend), Some(&moe)] {
+                    assert_eq!(
+                        resident_recovery_submit_due(pending, next, cap),
+                        !pending
+                            && (cap || next.is_none() || matches!(next, Some(Op::MoeFfn { .. })))
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn early_recovery_allows_one_layer_of_lookahead_with_one_inflight_segment() {
+        for requested in [false, true] {
+            for producer in [false, true] {
+                for interval in [0, 1, 2, 16] {
+                    for inflight in [1, 2] {
+                        for indirect in [false, true] {
+                            assert_eq!(
+                                super::resident_early_recovery_eligible(
+                                    requested, producer, interval, inflight, indirect
+                                ),
+                                requested
+                                    && producer
+                                    && (1..=2).contains(&interval)
+                                    && inflight == 1
+                                    && !indirect,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn resident_notice_preserves_row_slot_order_and_rejects_stale_metadata() {
+        for layout in [
+            super::ResidentMoeLayout {
+                rows: 1,
+                n_expert: 256,
+                n_used: 8,
+            },
+            super::ResidentMoeLayout {
+                rows: 2,
+                n_expert: 512,
+                n_used: 10,
+            },
+            super::ResidentMoeLayout {
+                rows: 2,
+                n_expert: 512,
+                n_used: 16,
+            },
+            super::ResidentMoeLayout {
+                rows: 4,
+                n_expert: 512,
+                n_used: 10,
+            },
+        ] {
+            let count = layout.count();
+            for miss_slot in 0..count {
+                let mut words = [0u32; crate::recorder::RESIDENT_JOURNAL_WORDS];
+                for (slot, id) in words[..count].iter_mut().enumerate() {
+                    *id = slot as u32 + 16;
+                }
+                words[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] = 2;
+                let valid_mask = (1u32 << layout.n_used) - 1;
+                words[crate::recorder::RESIDENT_JOURNAL_MASK_WORD
+                    ..crate::recorder::RESIDENT_JOURNAL_MASK_WORD + layout.rows]
+                    .fill(valid_mask);
+                words[crate::recorder::RESIDENT_JOURNAL_MASK_WORD + miss_slot / layout.n_used] &=
+                    !(1 << (miss_slot % layout.n_used));
+                let (masks, hits, misses) = super::resident_notice_slots(&words, layout).unwrap();
+                assert_eq!(misses, vec![16 + miss_slot as u32]);
+                assert_eq!(hits.len(), count - 1);
+                assert_eq!(masks.len(), layout.rows);
+                for status in [0, 1, 3, u32::MAX] {
+                    let mut invalid = words;
+                    invalid[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] = status;
+                    assert!(super::resident_notice_slots(&invalid, layout).is_err());
+                }
+                let mut invalid = words;
+                invalid[crate::recorder::RESIDENT_JOURNAL_MASK_WORD] |= 1 << layout.n_used;
+                assert!(super::resident_notice_slots(&invalid, layout).is_err());
+                let mut invalid = words;
+                invalid[0] = layout.n_expert as u32;
+                assert!(super::resident_notice_slots(&invalid, layout).is_err());
+                let mut invalid = words;
+                invalid[crate::recorder::RESIDENT_JOURNAL_MASK_WORD
+                    ..crate::recorder::RESIDENT_JOURNAL_MASK_WORD + layout.rows]
+                    .fill(valid_mask);
+                assert!(super::resident_notice_slots(&invalid, layout).is_err());
+            }
+        }
+        for layout in [
+            super::ResidentMoeLayout {
+                rows: 0,
+                n_expert: 256,
+                n_used: 8,
+            },
+            super::ResidentMoeLayout {
+                rows: 5,
+                n_expert: 256,
+                n_used: 8,
+            },
+            super::ResidentMoeLayout {
+                rows: 2,
+                n_expert: 256,
+                n_used: 17,
+            },
+        ] {
+            assert!(super::resident_notice_slots(
+                &[0; crate::recorder::RESIDENT_JOURNAL_WORDS],
+                layout
+            )
+            .is_err());
+        }
+    }
+
+    fn resident_layout_graph(
+        rows: usize,
+        ne: usize,
+        nff: usize,
+        n_expert: usize,
+        n_used: usize,
+        dtype: infr_core::DType,
+        fused_gate_up: bool,
+        weight_before: bool,
+    ) -> super::Graph {
+        use super::*;
+        use infr_core::TensorDesc;
+        let mut graph = Graph::new();
+        let x = graph.input(TensorDesc::new(vec![rows, ne], DType::F32));
+        let router = graph.weight(TensorDesc::new(vec![n_expert, ne], DType::Q8_0));
+        let gate = graph.weight(TensorDesc::new(vec![n_expert, nff, ne], dtype));
+        let up = if fused_gate_up {
+            gate
+        } else {
+            graph.weight(TensorDesc::new(vec![n_expert, nff, ne], dtype))
+        };
+        let down = graph.weight(TensorDesc::new(vec![n_expert, ne, nff], dtype));
+        let dst = graph.output(TensorDesc::new(vec![rows, ne], DType::F32));
+        graph.push(Op::MoeFfn {
+            x,
+            router_x: x,
+            router,
+            gate_exps: gate,
+            up_exps: up,
+            down_exps: down,
+            down_scale: None,
+            fused_gate_up,
+            dst,
+            ne: ne as u32,
+            n_expert: n_expert as u32,
+            n_used: n_used as u32,
+            n_ff_exp: nff as u32,
+            scale: 1.0,
+            act: Activation::Silu,
+            gating: infr_core::graph::MoeGating::Softmax,
+            norm_w: true,
+            weight_before,
+            ep_band: None,
+            exp_probs_b: None,
+            n_expert_groups: 0,
+            n_expert_groups_used: 0,
+            swiglu_clamp: None,
+            expert_ids: None,
+        });
+        graph
+    }
+
+    #[test]
+    fn resident_layout_is_shape_generic_but_protocol_bounded() {
+        use super::*;
+        for (rows, ne, nff, experts, used, dtype) in [
+            (1, 2560, 640, 512, 10, DType::Iq2S),
+            (2, 2560, 640, 512, 10, DType::Iq3S),
+            (1, 2048, 512, 256, 8, DType::Q6K),
+            (2, 2048, 512, 256, 8, DType::Q6K),
+            (4, 2560, 640, 512, 10, DType::Iq2S),
+            (1, 2048, 512, 256, 8, DType::F16),
+            (1, 2048, 512, 256, 8, DType::F32),
+        ] {
+            let graph = resident_layout_graph(rows, ne, nff, experts, used, dtype, false, false);
+            assert_eq!(
+                ResidentMoeLayout::from_op(&graph, graph.ops.last().unwrap()),
+                Some(ResidentMoeLayout {
+                    rows,
+                    n_expert: experts,
+                    n_used: used,
+                })
+            );
+            assert_eq!(
+                ResidentMoeLayout::from_op(&graph, graph.ops.last().unwrap())
+                    .unwrap()
+                    .role_tape_words(),
+                3 * experts
+            );
+        }
+        for graph in [
+            resident_layout_graph(5, 2048, 512, 256, 8, DType::Q6K, false, false),
+            resident_layout_graph(2, 2048, 512, 256, 17, DType::Q6K, false, false),
+            resident_layout_graph(1, 2048, 512, 256, 8, DType::Q6K, true, false),
+            resident_layout_graph(1, 2048, 512, 256, 8, DType::Q6K, false, true),
+        ] {
+            assert!(ResidentMoeLayout::from_op(&graph, graph.ops.last().unwrap()).is_none());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an idle Vulkan GPU and about 3 GiB temporary RAM"]
+    fn gpu_resident_graph_resumes_ffn_without_repeating_frontend() {
+        gpu_resident_recovery_fixture(false);
+    }
+
+    #[test]
+    #[ignore = "requires an idle Vulkan GPU and about 3 GiB temporary RAM"]
+    fn gpu_resident_recovery_frontend_matches_ordinary_rows_and_misses() {
+        gpu_resident_recovery_fixture(true);
+    }
+
+    fn gpu_resident_recovery_fixture(recovery_only: bool) {
+        use super::*;
+        use crate::pager::{ExpertSource, MoeHostChunkSpec, MoePagerLayout, MoePoolSpec, Role};
+        use infr_core::blockio::{BlockDesc, BlockExtent, BlockIo};
+        use infr_core::graph::SequenceSpan;
+        use infr_core::{DType, TensorDesc};
+        struct ScaledIo;
+        impl BlockIo for ScaledIo {
+            fn read_block(&self, desc: &BlockDesc, dst: &mut [u8]) -> Result<()> {
+                dst[..desc.nbytes()].fill(0);
+                let stride = if desc.id % 3 == 2 { 18 } else { 82 };
+                let scale = if desc.id % 3 == 2 {
+                    0x0004u16
+                } else {
+                    0x0400u16
+                };
+                for block in dst[..desc.nbytes()].chunks_exact_mut(stride) {
+                    block[..2].copy_from_slice(&scale.to_le_bytes());
+                }
+                Ok(())
+            }
+        }
+        const NE: usize = 2560;
+        const FF: usize = 640;
+        const EXP: usize = 512;
+        const GU: usize = NE * FF / 256 * 82;
+        const DOWN: usize = NE * FF / 32 * 18;
+        let gu = Arc::new(vec![0u8; GU * EXP]);
+        let down = Arc::new(vec![0u8; DOWN * EXP]);
+        let mut expected = HashMap::new();
+        for (indirect, mapped_journal) in [(false, false), (true, false), (false, true)] {
+            if recovery_only && indirect {
+                continue;
+            }
+            for (
+                enabled,
+                limit,
+                submit_layers,
+                mapped,
+                fence_wait,
+                hit_first,
+                dma,
+                immutable,
+                producer,
+            ) in [
+                (false, 2, 0, false, false, false, false, false, false),
+                (true, 2, 0, false, false, false, false, false, false),
+                (true, 2, 1, false, false, false, false, false, false),
+                (true, 2, 2, false, false, false, false, false, false),
+                (true, 2, 1, true, false, false, false, false, false),
+                (true, 2, 1, false, true, false, false, false, false),
+                (true, 2, 1, true, true, false, false, false, false),
+                (true, 2, 0, false, false, true, false, false, false),
+                (true, 2, 1, true, true, true, false, false, false),
+                (true, 1, 0, false, true, true, false, false, false),
+                (true, 1, 0, true, true, true, false, false, false),
+                (true, 2, 1, true, true, true, true, false, false),
+                (true, 1, 0, true, true, true, true, false, false),
+                (true, 2, 1, false, false, false, false, true, false),
+                (true, 2, 1, true, true, false, false, true, false),
+                (true, 2, 1, false, false, true, false, true, false),
+                (true, 2, 1, true, true, true, true, true, false),
+                (true, 1, 0, true, true, true, true, true, false),
+                (true, 3, 1, true, false, true, true, true, true),
+                (true, 1, 1, true, false, true, true, true, true),
+                (true, 3, 2, true, false, true, true, true, true),
+                (true, 2, 0, false, true, true, true, false, true),
+                (true, 1, 0, true, true, true, true, true, true),
+            ] {
+                if recovery_only && enabled && !(producer && (1..=2).contains(&submit_layers)) {
+                    continue;
+                }
+                for (rows, mtp_verify) in
+                    [(1, false), (2, false), (3, false), (4, false), (4, true)]
+                {
+                    let mut cfg = infr_core::config::Config::default();
+                    cfg.kernels.vulkan.decode_gpu_resident = enabled;
+                    cfg.kernels.vulkan.decode_gpu_resident_layers = limit;
+                    cfg.kernels.vulkan.decode_gpu_resident_submit_layers = submit_layers;
+                    cfg.kernels.vulkan.decode_gpu_resident_mapped_metadata = mapped;
+                    cfg.kernels.vulkan.decode_gpu_resident_mapped_journal = mapped_journal;
+                    cfg.kernels.vulkan.decode_gpu_resident_fence_wait = fence_wait;
+                    cfg.kernels.vulkan.decode_gpu_resident_fast_lut = true;
+                    cfg.kernels.vulkan.decode_gpu_resident_hit_first = hit_first;
+                    cfg.kernels.vulkan.decode_gpu_resident_waiter = hit_first;
+                    cfg.kernels.vulkan.decode_gpu_resident_immutable_predicates = immutable;
+                    cfg.kernels.vulkan.decode_gpu_resident_notice_thread = producer;
+                    cfg.kernels.vulkan.decode_gpu_resident_early_recovery = producer;
+                    cfg.kernels.vulkan.decode_gpu_resident_inflight = 1;
+                    cfg.kernels.vulkan.decode_gpu_resident_indirect_predicates =
+                        enabled && indirect;
+                    if producer && limit == 1 {
+                        cfg.device.submit_dispatches = Some(1);
+                    }
+                    cfg.paging.expert_prefetch = false;
+                    cfg.paging.host_dma = dma;
+                    let backend = VulkanBackend::new_with(Arc::new(cfg)).unwrap();
+                    let sizes = [GU, GU, DOWN, GU, GU, DOWN];
+                    let mut offset = 0;
+                    let chunks = sizes.map(|bytes| {
+                        let chunk = MoeHostChunkSpec {
+                            base_offset: offset,
+                            bytes: bytes * EXP,
+                        };
+                        offset += bytes * EXP;
+                        chunk
+                    });
+                    backend
+                        .init_moe_pager(MoePagerLayout {
+                            load_reserve_bytes: 0,
+                            n_blocks: 2 * EXP,
+                            pools: vec![
+                                MoePoolSpec {
+                                    slot_bytes: GU,
+                                    n_slots: 96,
+                                    min_enabled_slots: 48,
+                                },
+                                MoePoolSpec {
+                                    slot_bytes: DOWN,
+                                    n_slots: 48,
+                                    min_enabled_slots: 24,
+                                },
+                            ],
+                            host_tier: None,
+                            host_store_io: Some(Arc::new(ScaledIo)),
+                            dynamic_state_reserve_bytes: 0,
+                            dynamic_state_max_allocation_bytes: 0,
+                            prefill_min_lane_bytes: 0,
+                            runtime_reserve_bytes: 16 * 1024 * 1024,
+                            host_chunks: chunks
+                                .iter()
+                                .map(|chunk| MoeHostChunkSpec {
+                                    base_offset: chunk.base_offset,
+                                    bytes: chunk.bytes,
+                                })
+                                .collect(),
+                            prefill_target_lanes: 1,
+                            prefill_cache_bytes: (GU * 96 + DOWN * 48) as u64,
+                        })
+                        .unwrap();
+                    let mut graph = Graph::new();
+                    graph.independent_rows = rows > 1 && !mtp_verify;
+                    graph.mtp_verify = mtp_verify;
+                    if graph.independent_rows {
+                        graph.sequence_spans = (0..rows)
+                            .map(|row_start| SequenceSpan {
+                                row_start: row_start as u32,
+                                rows: 1,
+                                start_pos: 30000 + row_start as u32 * 30000,
+                            })
+                            .collect();
+                    }
+                    let state = graph.input(TensorDesc::new(vec![rows, NE], DType::F32));
+                    let one = graph.input(TensorDesc::new(vec![rows, NE], DType::F32));
+                    let routing = graph.input(TensorDesc::new(vec![rows, NE], DType::F32));
+                    let checkpoint = graph.output(TensorDesc::new(vec![rows, NE], DType::F32));
+                    let router = graph.weight(TensorDesc::new(vec![EXP, NE], DType::F32));
+                    let mut role_handles = Vec::new();
+                    for layer in 0..2 {
+                        graph.push(Op::Add {
+                            a: state,
+                            b: one,
+                            dst: state,
+                            n: (rows * NE) as u32,
+                        });
+                        let gate_exps =
+                            graph.weight(TensorDesc::new(vec![EXP, FF, NE], DType::Iq2S));
+                        let up_exps = graph.weight(TensorDesc::new(vec![EXP, FF, NE], DType::Iq2S));
+                        let down_exps =
+                            graph.weight(TensorDesc::new(vec![EXP, NE, FF], DType::Iq4Nl));
+                        role_handles.extend([gate_exps, up_exps, down_exps]);
+                        let out = graph.output(TensorDesc::new(vec![rows, NE], DType::F32));
+                        graph.push(Op::MoeFfn {
+                            x: state,
+                            router_x: routing,
+                            router,
+                            gate_exps,
+                            up_exps,
+                            down_exps,
+                            down_scale: None,
+                            fused_gate_up: false,
+                            dst: out,
+                            ne: NE as u32,
+                            n_expert: EXP as u32,
+                            n_used: 10,
+                            n_ff_exp: FF as u32,
+                            scale: 1.,
+                            act: Activation::Silu,
+                            gating: infr_core::graph::MoeGating::Softmax,
+                            norm_w: true,
+                            weight_before: false,
+                            ep_band: None,
+                            exp_probs_b: None,
+                            n_expert_groups: 0,
+                            n_expert_groups_used: 0,
+                            swiglu_clamp: None,
+                            expert_ids: None,
+                        });
+                        graph.push(Op::Add {
+                            a: state,
+                            b: out,
+                            dst: state,
+                            n: (rows * NE) as u32,
+                        });
+                        if layer == 1 {
+                            graph.push(Op::Copy {
+                                src: state,
+                                src_off: 0,
+                                dst: checkpoint,
+                                dst_off: 0,
+                                n: (rows * NE) as u32,
+                            });
+                        }
+                    }
+                    let state_buf = backend
+                        .alloc(rows * NE * 4, BufferUsage::Activations)
+                        .unwrap();
+                    let one_buf = backend
+                        .alloc(rows * NE * 4, BufferUsage::Activations)
+                        .unwrap();
+                    backend
+                        .upload(
+                            one_buf.as_ref(),
+                            bytemuck::cast_slice(&vec![1f32; rows * NE]),
+                        )
+                        .unwrap();
+                    let router_buf = backend.alloc(EXP * NE * 4, BufferUsage::Weights).unwrap();
+                    let mut router_values = vec![0f32; EXP * NE];
+                    for slot in 0..10 {
+                        router_values[slot * NE] = (10 - slot) as f32;
+                        router_values[(10 + slot) * NE + 1] = (10 - slot) as f32;
+                    }
+                    let routing_buf = backend
+                        .alloc(rows * NE * 4, BufferUsage::Activations)
+                        .unwrap();
+                    let mut routing_values = vec![0f32; rows * NE];
+                    for row in 0..rows {
+                        // Alternate disjoint routes so expert zero is absent from odd rows.
+                        routing_values[row * NE + row % 2] = 1.;
+                    }
+                    backend
+                        .upload(routing_buf.as_ref(), bytemuck::cast_slice(&routing_values))
+                        .unwrap();
+                    backend
+                        .upload(router_buf.as_ref(), bytemuck::cast_slice(&router_values))
+                        .unwrap();
+                    let placeholders: Vec<_> = (0..6)
+                        .map(|_| backend.alloc(4, BufferUsage::Staging).unwrap())
+                        .collect();
+                    let roles: Vec<_> = placeholders
+                        .iter()
+                        .map(|buffer| crate::pager::buffer_identity(buffer.as_ref()))
+                        .collect();
+                    for i in 0..6 {
+                        backend
+                            .register_paged_expert(
+                                [Role::Gate, Role::Up, Role::Down][i % 3],
+                                roles[i],
+                                ExpertSource {
+                                    bank: if i % 3 == 2 { down.clone() } else { gu.clone() },
+                                    stride_bytes: sizes[i],
+                                    layer_base: ((i / 3) * EXP) as u32,
+                                    host_offset: chunks[i].base_offset,
+                                    file: Some(BlockDesc {
+                                        id: i as u32,
+                                        extents: vec![BlockExtent {
+                                            offset: 0,
+                                            len: sizes[i] * EXP,
+                                        }],
+                                    }),
+                                },
+                                EXP,
+                            )
+                            .unwrap();
+                    }
+                    backend.finish_session_allocations().unwrap();
+                    let checkpoint_buf =
+                        backend.alloc(rows * NE * 4, BufferUsage::Readback).unwrap();
+                    let outputs: Vec<_> = (0..2)
+                        .map(|_| {
+                            backend
+                                .alloc(rows * NE * 4, BufferUsage::Activations)
+                                .unwrap()
+                        })
+                        .collect();
+                    if enabled {
+                        let resident = ResidentChunk::new(&backend, &graph, true, &mut None)
+                            .unwrap()
+                            .expect("GPU recovery fixture must exercise resident execution, not fallback");
+                        assert_eq!(
+                            resident.early_recovery,
+                            producer && (1..=2).contains(&submit_layers) && !indirect
+                        );
+                        drop(resident);
+                        for (next_chunk, target_tokens) in [(true, None), (false, Some(1))] {
+                            let mut prefill = graph.clone();
+                            prefill.prefill_next_chunk = next_chunk;
+                            prefill.prefill_target_tokens = target_tokens;
+                            assert!(ResidentChunk::new(&backend, &prefill, true, &mut None)
+                                .unwrap()
+                                .is_none());
+                        }
+                    }
+                    let plan = backend.compile(&graph).unwrap();
+                    let mut bindings = Bindings::new();
+                    bindings.bind(state, state_buf.as_ref());
+                    bindings.bind(one, one_buf.as_ref());
+                    bindings.bind(routing, routing_buf.as_ref());
+                    bindings.bind(router, router_buf.as_ref());
+                    bindings.bind(checkpoint, checkpoint_buf.as_ref());
+                    for (handle, buffer) in role_handles.iter().zip(&placeholders) {
+                        bindings.bind(*handle, buffer.as_ref());
+                    }
+                    for (handle, buffer) in graph.outputs.iter().skip(1).zip(&outputs) {
+                        bindings.bind(*handle, buffer.as_ref());
+                    }
+                    for missing in [None, Some(0), Some(1), None] {
+                        let ids: Vec<u32> = (0..(rows * 10) as u32).collect();
+                        let mut guard = backend.moe_pager().lock().unwrap();
+                        let session = guard.as_mut().unwrap();
+                        for layer in 0..2 {
+                            let roles = &roles[layer * 3..layer * 3 + 3];
+                            session.begin_role_batches(roles).unwrap();
+                            session
+                                .push_roles_cpu(
+                                    &backend,
+                                    &roles
+                                        .iter()
+                                        .map(|&role| (role, ids.as_slice()))
+                                        .collect::<Vec<_>>(),
+                                    false,
+                                )
+                                .unwrap()
+                                .complete_without_recorder(&backend)
+                                .unwrap();
+                        }
+                        if let Some(layer) = missing {
+                            session.discard_cpu_miss(
+                                roles[layer * 3..layer * 3 + 3].try_into().unwrap(),
+                                &[0],
+                            );
+                        }
+                        drop(guard);
+                        backend
+                            .upload(
+                                state_buf.as_ref(),
+                                bytemuck::cast_slice(&vec![1f32; rows * NE]),
+                            )
+                            .unwrap();
+                        backend.execute(plan.as_ref(), &bindings).unwrap();
+                        let mut result = vec![0f32; rows * NE];
+                        backend
+                            .download(
+                                checkpoint_buf.as_ref(),
+                                bytemuck::cast_slice_mut(&mut result),
+                            )
+                            .unwrap();
+                        assert!(result.iter().all(|value| value.is_finite()));
+                        if !enabled {
+                            assert!(
+                                result.iter().all(|&value| value > 0.),
+                                "keep routing in the preloaded top-ten bank"
+                            );
+                            assert!(
+                                result.iter().any(|&value| value != 3.),
+                                "fixture must exercise nonzero expert outputs"
+                            );
+                            expected.insert((rows, missing), result);
+                        } else {
+                            let reference = &expected[&(rows, missing)];
+                            assert!(
+                                result
+                                    .iter()
+                                    .zip(reference)
+                                    .all(|(&actual, &reference)| (actual - reference).abs()
+                                        <= 1e-5f32.max(reference.abs() * 1e-5)),
+                                "rows={rows} missing={missing:?} submit={submit_layers} mapped={mapped} fence={fence_wait} hit_first={hit_first} indirect={indirect}: {:?} != {:?}",
+                                &result[..4],
+                                &reference[..4]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resident_notice_announcements_only_stop_submitted_work() {
+        for submitted in 0..=16 {
+            assert!(!super::resident_notice_stop(usize::MAX, submitted).unwrap());
+            for ordinal in 0..=16 {
+                let stop = super::resident_notice_stop(ordinal, submitted);
+                if ordinal < submitted {
+                    assert!(stop.unwrap());
+                } else {
+                    assert!(stop.is_err());
+                }
+            }
+            assert!(super::resident_notice_stop(usize::MAX - 1, submitted).is_err());
+        }
+    }
+
+    #[test]
+    fn resident_notice_snapshot_rejects_short_or_overflowing_ranges() {
+        let stride = crate::recorder::RESIDENT_JOURNAL_BYTES;
+        for (bytes, ordinal) in [
+            (0, 0),
+            (stride - 1, 0),
+            (stride, 1),
+            (2 * stride, 2),
+            (stride, usize::MAX),
+        ] {
+            let error = super::resident_notice_words(&TestBuffer(bytes), ordinal).unwrap_err();
+            assert!(error.to_string().contains("range exceeds storage"));
+        }
+    }
+
+    #[test]
+    fn resident_rolling_submit_has_bounded_nonrepeating_boundaries() {
+        for limit in [1, 2, 4, 8, 16] {
+            for interval in [0, 1, 2, 4, 8, 16, 32] {
+                let mut submitted = 0;
+                let mut boundaries = Vec::new();
+                for entries in 0..=limit {
+                    if super::resident_submit_due(entries, submitted, interval, limit) {
+                        boundaries.push(entries);
+                        submitted = entries;
+                        assert!(!super::resident_submit_due(
+                            entries, submitted, interval, limit
+                        ));
+                    }
+                }
+                let expected: Vec<_> = if interval == 0 {
+                    Vec::new()
+                } else {
+                    (1..limit)
+                        .filter(|entries| entries % interval.min(limit) == 0)
+                        .collect()
+                };
+                assert_eq!(boundaries, expected, "limit={limit} interval={interval}");
+            }
+        }
+    }
+
+    #[test]
+    fn resident_journal_accepts_only_complete_prefixes() {
+        assert_eq!(
+            super::resident_chunk_status([1, u32::MAX, 4, 0], 4).unwrap(),
+            None
+        );
+        for stopped in 0..4 {
+            assert_eq!(
+                super::resident_chunk_status([0, stopped, stopped + 1, 0], 4).unwrap(),
+                Some(stopped as usize)
+            );
+        }
+        for words in [
+            [1, 0, 4, 0],
+            [1, u32::MAX, 3, 0],
+            [0, 4, 5, 0],
+            [0, 1, 1, 0],
+            [0, 1, 2, 1],
+            [2, u32::MAX, 4, 0],
+        ] {
+            assert!(super::resident_chunk_status(words, 4).is_err(), "{words:?}");
+        }
+    }
+
     #[test]
     fn frozen_lut_cleanup_preserves_pager_poison_without_panicking() {
         use super::*;
@@ -12803,6 +15652,34 @@ mod tests {
 
         graph.sequence_spans[1].rows = 2;
         assert_eq!(decode_token_rows(&graph), None);
+    }
+
+    #[test]
+    fn resident_mapped_serial_policy_is_short_context_only_and_overridable() {
+        let mut graph = Graph::new();
+        assert_eq!(resident_mapped_serial_max_bytes(None, &graph), 0);
+
+        graph.sequence_spans = vec![SequenceSpan {
+            row_start: 0,
+            rows: 1,
+            start_pos: (RESIDENT_AUTO_MAPPED_SERIAL_CONTEXT_MAX - 1) as u32,
+        }];
+        assert_eq!(
+            resident_mapped_serial_max_bytes(None, &graph),
+            RESIDENT_AUTO_MAPPED_SERIAL_MAX_BYTES
+        );
+
+        graph.sequence_spans[0].start_pos = RESIDENT_AUTO_MAPPED_SERIAL_CONTEXT_MAX as u32;
+        assert_eq!(resident_mapped_serial_max_bytes(None, &graph), 0);
+        assert_eq!(resident_mapped_serial_max_bytes(Some(0), &graph), 0);
+        assert_eq!(
+            resident_mapped_serial_max_bytes(Some(6144), &graph),
+            6 * 1024 * 1024
+        );
+        assert_eq!(
+            resident_mapped_serial_max_bytes(Some(16384), &graph),
+            8 * 1024 * 1024
+        );
     }
 
     #[test]
@@ -14845,8 +17722,11 @@ mod tests {
                     for (a, b) in [(0, 2), (1, 3)] {
                         for (index, (fused, split)) in values[a].iter().zip(&values[b]).enumerate()
                         {
-                            assert_eq!(fused.to_bits(), split.to_bits(),
-                                "HC parity prefetch={prefetch} inject={inject_dtype:?} rows={rows} output={a} index={index}: {fused} vs {split}");
+                            assert_eq!(
+                                fused.to_bits(),
+                                split.to_bits(),
+                                "HC parity prefetch={prefetch} inject={inject_dtype:?} rows={rows} output={a} index={index}: {fused} vs {split}"
+                            );
                         }
                     }
                 }

@@ -1,0 +1,18 @@
+#version 450
+layout(local_size_x = 128) in;
+layout(binding = 0) readonly buffer Gate { float g[]; };
+layout(binding = 1) readonly buffer Up { float u[]; };
+layout(binding = 2) readonly buffer Ids { uint ids[]; };
+layout(binding = 3) writeonly buffer Out { float a[]; };
+layout(push_constant) uniform Params { uint rows; uint used; uint physical_used; uint width; } p;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.rows * p.physical_used * p.width) return;
+    uint slot = i / p.width;
+    uint row = slot / p.physical_used;
+    uint expert = slot % p.physical_used;
+    uint mask = ids[p.rows * p.used + row];
+    if ((mask & (1u << expert)) == 0) return;
+    float v = g[i];
+    a[i] = (v / (1.0 + exp(-v))) * u[i];
+}

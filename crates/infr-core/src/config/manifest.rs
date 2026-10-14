@@ -226,7 +226,10 @@ knobs! {
     "INFR_NO_Q8_DECODE_LS128" => "kernels.vulkan.q8_decode_ls128", PresenceInv,    Ignored, "1",  migrated;
     "INFR_NO_Q8_DECODE_LS256" => "kernels.vulkan.q8_decode_ls256", PresenceInv,    Ignored, "1",  migrated;
     "INFR_NO_Q8_DECODE_CHUNK1024" => "kernels.vulkan.q8_decode_chunk1024", PresenceInv, Ignored, "1", migrated;
+    "INFR_Q8_DECODE_REPLAY_CHUNK1024" => "kernels.vulkan.q8_decode_replay_chunk1024", Presence, Ignored, "1", migrated;
     "INFR_NO_Q8_QK_F16" => "kernels.vulkan.q8_qk_f16",            PresenceInv,    Ignored, "1",  migrated;
+    "INFR_NO_Q8_QK_I8" => "kernels.vulkan.q8_qk_i8",               PresenceInv,    Ignored, "1",  migrated;
+    "INFR_Q8_KV_WRITE_FUSION" => "kernels.vulkan.q8_kv_write_fusion", Presence, Ignored, "1", migrated;
     "INFR_NO_Q8_PV_F16" => "kernels.vulkan.q8_pv_f16",            PresenceInv,    Ignored, "1",  migrated;
     "INFR_NO_MROWS_ATTN"  => "kernels.vulkan.mrows_attn",       PresenceOptFalse, Ignored, "1",  migrated;
     "INFR_MROWS_ATTN"     => "kernels.vulkan.mrows_attn",       PresenceOptTrue,  Ignored, "1",  migrated;

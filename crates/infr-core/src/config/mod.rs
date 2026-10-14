@@ -300,10 +300,14 @@ cfg_struct! {
         sg_nr: u32 = 2,
         /// `INFR_GEMV_ID_GRID_NR`: output rows handled per 64-thread paged IQ id-GEMV workgroup.
         id_grid_nr: u32 = 8,
-        /// Output rows per immutable-codebook paged IQ2_S/IQ3_S workgroup.
-        id_grid_buffer_nr: u32 = 4,
+        /// Output rows per immutable-codebook paged IQ2_S/IQ3_S workgroup. None selects the
+        /// measured device policy; Some(1/2/4/8) is an explicit A/B override.
+        id_grid_buffer_nr: Option<u32> = None,
         /// Immutable IQ codebooks. None selects measured Windows/RDNA3 Decode shapes only.
         id_grid_buffer: Option<bool> = None,
+        /// Bit-identical Wave32 large-K Q8_0 Decode GEMV. None selects measured Windows/RDNA3
+        /// Decode shapes only; Some(false/true) is an explicit A/B override.
+        q8_wave32: Option<bool> = None,
         /// The selected GEMV variant, COMPUTED from two keys exactly as `GemvKnobs::resolve`
         /// does it: `INFR_NO_GEMV_REG` present ⇒ `None` (and it silently wins over
         /// `INFR_GEMV_VARIANT`); otherwise `INFR_GEMV_VARIANT`, else `Some("reg")`.
@@ -402,6 +406,42 @@ cfg_struct! {
         decode_sparse_lut: Option<bool> = None,
         /// Earlier FFN submit. None selects measured Qwen3.8 Decode without expert prefetch.
         decode_early_submit: Option<bool> = None,
+        /// Paged Decode: continue full-hit MoE layers on GPU and pause only at the first miss.
+        /// Unsupported devices, expert formats and execution modes fall back automatically.
+        decode_gpu_resident: bool = true,
+        /// Bound speculative work and missed-layer recovery; ordinary Decode only.
+        decode_gpu_resident_layers: usize = 16,
+        /// Resident rolling-submit depth. 0 selects the graph's model-tuned value.
+        decode_gpu_resident_submit_layers: usize = 0,
+        /// Keep one submitted resident segment in flight so miss recovery has a single owner.
+        decode_gpu_resident_inflight: usize = 1,
+        /// Keep resident predicates and LUT tape in coherent mapped VRAM when the device supports it.
+        decode_gpu_resident_mapped_metadata: bool = true,
+        /// Keep the published routing journal in coherent mapped VRAM, with readback fallback.
+        decode_gpu_resident_mapped_journal: bool = true,
+        /// Drain resident chunks to their own fence instead of waiting for the entire queue (A/B).
+        decode_gpu_resident_fence_wait: bool = false,
+        /// Cache immutable physical addresses and use dense slot protection for resident LUTs.
+        decode_gpu_resident_fast_lut: bool = true,
+        /// Continue resident hits while a miss notice starts host-side recovery.
+        decode_gpu_resident_hit_first: bool = true,
+        /// Wait submitted resident fences on a dedicated host thread (driver scheduling A/B).
+        decode_gpu_resident_waiter: bool = false,
+        /// Give each checked layer immutable predicate words to avoid predicate read/write barriers.
+        decode_gpu_resident_immutable_predicates: bool = true,
+        /// Receive GPU notices and prepare miss uploads on a separate host producer thread.
+        decode_gpu_resident_notice_thread: bool = true,
+        /// Copy small mapped miss batches on the notice producer. None selects the context-aware
+        /// Decode policy; Some(0) disables it and Some(KiB) is an explicit A/B override.
+        /// Capped at 8192; imported DMA and ordinary/Prefill uploads are unchanged.
+        decode_gpu_resident_mapped_serial_max_kib: Option<usize> = None,
+        /// Queue miss recovery before retiring old resident chunks (rolling cap one).
+        decode_gpu_resident_early_recovery: bool = true,
+        /// Plain MoE Decode full-graph mode. None enables models without a host interlock and uses
+        /// the measured context policy for FlashNext PLE; Some(false/true) is a diagnostic override.
+        decode_gpu_resident_full_graph: Option<bool> = None,
+        /// A/B GPU-produced indirect dispatch sizes instead of conditional-rendering commands.
+        decode_gpu_resident_indirect_predicates: bool = false,
         /// Submit a CPU-miss result/merge immediately instead of waiting for the next router (A/B).
         cpu_miss_early_submit: bool = false,
         /// Fuse the one-row F32 CPU input readback into routing, avoiding a separate copy.
@@ -484,9 +524,21 @@ cfg_struct! {
         /// kernel to use 1024-key chunks. All f16, prefill and other head-dim paths stay capped at
         /// 512; disabling this restores the previous Q8 split/combine geometry.
         q8_decode_chunk1024: bool = true,
+        /// `INFR_Q8_DECODE_REPLAY_CHUNK1024` — extend the record-once Q8 hd256 decode tape from
+        /// 512 to 1024 keys per split. The isolated kernel is faster, but the Qwen3.6-35B paged-MoE
+        /// end-to-end path regressed at both 30K and 150K, so production replay keeps 512 by default.
+        q8_decode_replay_chunk1024: bool = false,
         /// `INFR_NO_Q8_QK_F16` (inverted) — use packed fp16 products for the Q8 hd256 Q.K pass;
         /// softmax and P.V accumulation remain fp32. The fp32 Q.K build remains a fallback.
         q8_qk_f16: bool = true,
+        /// `INFR_NO_Q8_QK_I8` (inverted) — allow measured devices to quantize the one-token query
+        /// per native Q8 block and use packed signed-int8 dot products against cached K codes.
+        /// Device policy keeps unmeasured drivers on the fp16 Q.K path.
+        q8_qk_i8: bool = true,
+        /// `INFR_Q8_KV_WRITE_FUSION` — in record-once decode, quantize the rotated K
+        /// row directly from QkNormRope's LDS into the planar Q8 cache. Disabling it restores the
+        /// f16 scratch write followed by the standalone Q8 quantization dispatch.
+        q8_kv_write_fusion: bool = false,
         /// `INFR_NO_Q8_PV_F16` (inverted) — use packed fp16 only for Q8 V dequantization before
         /// converting back to fp32; softmax weighting and P.V accumulation remain fp32.
         q8_pv_f16: bool = true,
@@ -816,6 +868,10 @@ cfg_struct! {
         pager_profile: bool = false,
         /// Bounded asynchronous Decode trace; independent of the blocking per-op profiler.
         timeline_path: Option<PathBuf> = None,
+        /// Capture host spans without Vulkan timestamp queries or clock calibration.
+        timeline_cpu_only: bool = false,
+        /// Capture GPU timestamps and routing metadata without CPU phase spans.
+        timeline_gpu_only: bool = false,
         /// Optional one-shot CPU-miss weight/input fixture for local kernel diagnostics.
         cpu_miss_fixture_dir: Option<PathBuf> = None,
         timeline_skip_steps: usize = 64,

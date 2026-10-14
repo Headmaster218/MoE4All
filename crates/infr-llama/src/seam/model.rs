@@ -1019,7 +1019,9 @@ impl SeamModel {
     ) -> Result<usize> {
         let n_slots = n_slots.max(1);
         // An explicit token count is the user's demand — honour it verbatim, at any N.
-        if let Some(infr_core::SizeSpec::Bytes(c)) = want {
+        if let Some(infr_core::SizeSpec::Bytes(c) | infr_core::SizeSpec::FrozenAutomaticBytes(c)) =
+            want
+        {
             return Ok((c as usize).max(1));
         }
         if n_slots == 1 && want.is_none() {

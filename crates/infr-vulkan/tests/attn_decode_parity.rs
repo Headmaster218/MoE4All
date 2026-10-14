@@ -509,7 +509,7 @@ fn run_shape(be: &VulkanBackend, s: &Shape) -> Legs {
     let args = be.alloc(16, BufferUsage::Activations).unwrap();
     let o_rep = be.alloc(o_bytes, BufferUsage::Activations).unwrap();
     let rec = be.recorder().unwrap();
-    rec.attn_live_prologue(params.as_ref(), args.as_ref(), nh, chunk, s.window);
+    rec.attn_live_prologue(params.as_ref(), args.as_ref(), nh, chunk, 512, s.window);
     rec.attention_kv_split_dynac_at(
         qb.as_ref(),
         kb.as_ref(),
@@ -530,6 +530,7 @@ fn run_shape(be: &VulkanBackend, s: &Shape) -> Legs {
         s.scale,
         s.window,
         false, // q8
+        false, // fused GQA4 grid
         cap,
     );
     rec.finish().unwrap();

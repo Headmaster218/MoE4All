@@ -274,7 +274,7 @@ const AUTO_AVAILABLE_RESERVE: u64 = 3 << 30;
 /// Aggressive automatic sizing treats this as a process-wide reserve below total physical RAM.
 /// Unlike the ordinary profile, already-used RAM does not permanently shrink the target: the
 /// current process working set is subtracted from `total - reserve` to obtain the new arena size.
-const AGGRESSIVE_TOTAL_RESERVE: u64 = 14 << 30;
+const AGGRESSIVE_TOTAL_RESERVE: u64 = 13 << 30;
 
 /// One startup-time automatic RAM decision after it has been frozen into
 /// `device.ram_budget`. From this point on it deliberately follows the explicit total-process
@@ -318,7 +318,7 @@ fn freeze_automatic_ram_budget_for_snapshot(
         }
         crate::config::AutoProfile::Aggressive => total?.saturating_sub(AGGRESSIVE_TOTAL_RESERVE),
     };
-    config.device.ram_budget = Some(crate::SizeSpec::Bytes(budget_bytes));
+    config.device.ram_budget = Some(crate::SizeSpec::FrozenAutomaticBytes(budget_bytes));
     Some(FrozenAutomaticRamBudget {
         profile,
         budget_bytes,
@@ -446,6 +446,10 @@ pub enum RamRequest {
     Auto,
     /// Canonical `device.ram_budget`: a total-process resident-RAM target.
     TotalProcessBudget(u64),
+    /// Automatic startup snapshot carried with total-process semantics on discrete devices. On
+    /// unified memory it remains automatic policy and therefore must not allocate a second cache
+    /// from the same physical RAM used by the device arena.
+    FrozenAutomaticBudget(u64),
     /// Compatibility-only `paging.dram`: the old exact host-cache allocation.
     LegacyCacheBudget(u64),
     /// `paging.dram_bypass` — no host cache at all: blocks are read from disk straight into the
@@ -454,6 +458,12 @@ pub enum RamRequest {
 }
 
 impl RamRequest {
+    /// Whether this request came from automatic policy, including the startup-frozen form used by
+    /// the CLI to keep a stable total-process target during model loading.
+    pub fn is_automatic(self) -> bool {
+        matches!(self, Self::Auto | Self::FrozenAutomaticBudget(_))
+    }
+
     /// Resolve the canonical total-process budget and the legacy raw-cache override. Bypass wins,
     /// then `device.ram_budget`, then compatibility-only `paging.dram`; zero remains the explicit
     /// off switch in either spelling while retaining which spelling supplied it.
@@ -544,6 +554,15 @@ pub fn streaming_arena_plan_for_snapshot(
                 ArenaPlan::Take(bytes)
             };
         }
+        RamRequest::FrozenAutomaticBudget(_) if unified => return ArenaPlan::StreamOnly,
+        RamRequest::FrozenAutomaticBudget(total) => {
+            let bytes = cache_bytes_for_total_budget(total, process_resident, pageable);
+            return if bytes == 0 {
+                ArenaPlan::Skip(Skip::TooLittle)
+            } else {
+                ArenaPlan::Take(bytes)
+            };
+        }
         RamRequest::LegacyCacheBudget(0) => return ArenaPlan::Skip(Skip::Disabled),
         RamRequest::LegacyCacheBudget(bytes) => return ArenaPlan::Take(bytes),
         RamRequest::Auto => {}
@@ -612,6 +631,14 @@ pub fn cpu_arena_plan_for_snapshot(
     match request {
         RamRequest::TotalProcessBudget(0) => return ArenaPlan::Skip(Skip::Disabled),
         RamRequest::TotalProcessBudget(total) => {
+            let bytes = cache_bytes_for_total_budget(total, process_resident, pageable);
+            return if bytes == 0 {
+                ArenaPlan::Skip(Skip::TooLittle)
+            } else {
+                ArenaPlan::Take(bytes)
+            };
+        }
+        RamRequest::FrozenAutomaticBudget(total) => {
             let bytes = cache_bytes_for_total_budget(total, process_resident, pageable);
             return if bytes == 0 {
                 ArenaPlan::Skip(Skip::TooLittle)
@@ -736,7 +763,7 @@ mod tests {
     }
 
     #[test]
-    fn aggressive_profile_targets_total_ram_minus_fourteen_gib() {
+    fn aggressive_profile_targets_total_ram_minus_thirteen_gib() {
         let available = 40 * GIB;
         let conservative = auto_cache_bytes(available, 0, u64::MAX);
         let aggressive = auto_cache_bytes_for_snapshot(
@@ -748,7 +775,7 @@ mod tests {
             u64::MAX,
         );
         assert!(aggressive > conservative);
-        assert_eq!(aggressive, 48 * GIB);
+        assert_eq!(aggressive, 49 * GIB);
     }
 
     #[test]
@@ -763,7 +790,7 @@ mod tests {
         assert_eq!(frozen.budget_bytes, 45 * GIB);
         assert_eq!(
             conservative.device.ram_budget,
-            Some(crate::SizeSpec::Bytes(45 * GIB))
+            Some(crate::SizeSpec::FrozenAutomaticBytes(45 * GIB))
         );
 
         let mut aggressive = crate::config::Config::default();
@@ -774,11 +801,24 @@ mod tests {
             Some(64 * GIB),
         )
         .expect("aggressive startup budget");
-        assert_eq!(frozen.budget_bytes, 50 * GIB);
+        assert_eq!(frozen.budget_bytes, 51 * GIB);
         assert_eq!(
             aggressive.device.ram_budget,
-            Some(crate::SizeSpec::Bytes(50 * GIB))
+            Some(crate::SizeSpec::FrozenAutomaticBytes(51 * GIB))
         );
+    }
+
+    #[test]
+    fn frozen_automatic_budget_does_not_duplicate_unified_memory() {
+        let frozen = RamRequest::FrozenAutomaticBudget(50 * GIB);
+        assert_eq!(
+            streaming_arena_plan(frozen, Some(48 * GIB), Some(2 * GIB), true, 40 * GIB),
+            ArenaPlan::StreamOnly
+        );
+        assert!(matches!(
+            streaming_arena_plan(frozen, Some(48 * GIB), Some(2 * GIB), false, 40 * GIB),
+            ArenaPlan::Take(_)
+        ));
     }
 
     #[test]

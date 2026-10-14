@@ -214,6 +214,7 @@ impl DedicatedTransferQueue {
         batches: &[TransferCopyBatch],
     ) -> Result<u64> {
         let _timeline_transfer = infr_core::timeline::span("dma_prepare_submit");
+        let _worker_prepare = infr_core::timeline::background_span("resident_producer_dma_prepare");
         debug_assert!(!batches.is_empty());
         let slot_index = self.cursor;
         let slot = &mut self.slots[slot_index];
@@ -343,10 +344,13 @@ impl DedicatedTransferQueue {
             .signal_semaphores(&signals)
             .push_next(&mut timeline);
         let submit_span = infr_core::timeline::span("dma_queue_submit");
+        let worker_submit =
+            infr_core::timeline::background_span("resident_producer_dma_queue_submit");
         if let Some(query) = timeline_query.as_mut() {
             query.submitted();
         }
         shared.submit_dedicated_transfer(self.queue, &submit)?;
+        drop(worker_submit);
         drop(submit_span);
         slot.timeline_query = timeline_query;
 
@@ -417,6 +421,10 @@ fn timestamp_delta_ns(start: u64, end: u64, valid_bits: u32, period_ns: f32) -> 
 /// types or queue choices; a different executor can satisfy the same requests without changing
 /// pager policy.
 pub(crate) trait TransferExecutor: Sync {
+    fn mapped_serial_max_bytes(&self) -> usize {
+        0
+    }
+
     fn materialize_staging(&self, src: &[u8]) -> Result<(Arc<dyn Buffer>, usize, bool)>;
 
     fn complete_copies_now(
@@ -480,6 +488,8 @@ impl SessionTransferPlan {
         }
         if let Some(dst) = target.mapped_ptr() {
             let _timeline_copy = infr_core::timeline::span("expert_mapped_copy");
+            let _worker_copy =
+                infr_core::timeline::background_span("resident_producer_mapped_copy");
             let started = pager_profile::active().then(std::time::Instant::now);
             parallel_copy_to_mapped(src, dst);
             if let Some(t0) = started {
@@ -546,8 +556,10 @@ impl SessionTransferPlan {
 
         if !mapped.is_empty() {
             let _timeline_copy = infr_core::timeline::span("expert_mapped_copy");
+            let _worker_copy =
+                infr_core::timeline::background_span("resident_producer_mapped_copy");
             let started = pager_profile::active().then(std::time::Instant::now);
-            parallel_copy_to_mapped_batch(&mapped);
+            copy_to_mapped_batch(&mapped, executor.mapped_serial_max_bytes());
             if let Some(t0) = started {
                 let bytes = mapped
                     .iter()
@@ -586,6 +598,7 @@ impl SessionTransferPlan {
     }
 
     fn imported_ranges(&self, src: &[u8]) -> Option<Vec<crate::ImportedHostRange>> {
+        let _lookup = infr_core::timeline::background_span("resident_producer_import_lookup");
         self.imports
             .read()
             .unwrap()
@@ -703,6 +716,7 @@ struct PreparedCopy {
 #[derive(Clone)]
 pub(crate) struct BackgroundTransferExecutor {
     shared: Arc<VulkanShared>,
+    mapped_serial_max_bytes: usize,
 }
 
 impl BackgroundTransferExecutor {
@@ -710,13 +724,34 @@ impl BackgroundTransferExecutor {
         (be_.shared.dedicated_transfer.is_some() && be_.shared.host_overflow_type.is_some()).then(
             || Self {
                 shared: Arc::clone(&be_.shared),
+                mapped_serial_max_bytes: 0,
             },
         )
     }
 
+    pub(crate) fn with_mapped_serial_max_bytes(mut self, bytes: usize) -> Self {
+        self.mapped_serial_max_bytes = bytes;
+        self
+    }
+
     fn stage_host_bytes(&self, src: &[u8]) -> Result<(Arc<dyn Buffer>, usize, bool)> {
-        let staging = make_dedicated_host_transfer_buffer(&self.shared, src.len())?;
+        let staging: Arc<dyn Buffer> = Arc::new(make_dedicated_host_transfer_buffer(
+            &self.shared,
+            src.len(),
+        )?);
+        self.fill_staging(src, staging)
+    }
+
+    fn fill_staging(
+        &self,
+        src: &[u8],
+        staging: Arc<dyn Buffer>,
+    ) -> Result<(Arc<dyn Buffer>, usize, bool)> {
+        let _worker_stage = infr_core::timeline::background_span("resident_producer_staging_copy");
         let ptr = staging
+            .as_any()
+            .downcast_ref::<VkBuffer>()
+            .ok_or_else(|| be("background staging pool returned a non-Vulkan buffer"))?
             .mapped_ptr()
             .ok_or_else(|| be("background transfer staging allocation is not mapped"))?;
         let started = pager_profile::active().then(std::time::Instant::now);
@@ -724,7 +759,7 @@ impl BackgroundTransferExecutor {
         if let Some(t0) = started {
             pager_profile::record_memcpy(src.len(), t0.elapsed());
         }
-        Ok((Arc::new(staging), ptr as usize, true))
+        Ok((staging, ptr as usize, true))
     }
 
     fn submit_batches(&self, batches: &[TransferCopyBatch]) -> Result<u64> {
@@ -739,6 +774,10 @@ impl BackgroundTransferExecutor {
 }
 
 impl TransferExecutor for BackgroundTransferExecutor {
+    fn mapped_serial_max_bytes(&self) -> usize {
+        self.mapped_serial_max_bytes
+    }
+
     fn materialize_staging(&self, src: &[u8]) -> Result<(Arc<dyn Buffer>, usize, bool)> {
         self.stage_host_bytes(src)
     }
@@ -944,13 +983,24 @@ struct MappedHostCopy {
     len: usize,
 }
 
-fn parallel_copy_to_mapped_batch(copies: &[MappedHostCopy]) {
+fn mapped_batch_is_serial(copies: &[MappedHostCopy], max_bytes: usize) -> bool {
+    copies.len() <= 1
+        || (max_bytes != 0
+            && copies
+                .iter()
+                .try_fold(0usize, |sum, copy| sum.checked_add(copy.len))
+                .is_some_and(|bytes| bytes <= max_bytes))
+}
+
+fn copy_to_mapped_batch(copies: &[MappedHostCopy], serial_max_bytes: usize) {
     use rayon::prelude::*;
 
-    if let [copy] = copies {
-        unsafe {
-            std::ptr::copy_nonoverlapping(copy.src as *const u8, copy.dst as *mut u8, copy.len)
-        };
+    if mapped_batch_is_serial(copies, serial_max_bytes) {
+        for copy in copies {
+            unsafe {
+                std::ptr::copy_nonoverlapping(copy.src as *const u8, copy.dst as *mut u8, copy.len);
+            }
+        }
         return;
     }
     copies.par_iter().for_each(|copy| unsafe {
@@ -1407,7 +1457,8 @@ mod tests {
     use infr_core::backend::Buffer;
 
     use super::{
-        parallel_copy_to_mapped_batch, timestamp_delta_ns, MappedHostCopy, SessionTransferPlan,
+        copy_to_mapped_batch, mapped_batch_is_serial, timestamp_delta_ns, MappedHostCopy,
+        SessionTransferPlan,
     };
     use crate::{ImportedHostAllocation, ImportedHostShard};
 
@@ -1431,6 +1482,131 @@ mod tests {
     }
 
     #[test]
+    fn mapped_copy_threshold_preserves_default_and_rejects_overflow() {
+        let copy = |len| MappedHostCopy {
+            src: 0,
+            dst: 0,
+            len,
+        };
+        assert!(mapped_batch_is_serial(&[], 0));
+        assert!(mapped_batch_is_serial(&[copy(4096)], 0));
+        assert!(!mapped_batch_is_serial(&[copy(1024), copy(2048)], 0));
+        assert!(mapped_batch_is_serial(&[copy(1024), copy(2048)], 3072));
+        assert!(!mapped_batch_is_serial(&[copy(1024), copy(2048)], 3071));
+        assert!(!mapped_batch_is_serial(
+            &[copy(usize::MAX), copy(1)],
+            usize::MAX
+        ));
+    }
+
+    #[test]
+    fn serial_and_parallel_mapped_batches_preserve_payloads_and_guards() {
+        for count in [0, 1, 2, 3, 6, 12, 24] {
+            let sources = (0..count)
+                .map(|i| {
+                    (0..257 + i * 17)
+                        .map(|j| (i * 29 + j) as u8)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let mut expected = vec![0xa5; count * 1024 + 64];
+            for (i, source) in sources.iter().enumerate() {
+                expected[i * 1024 + 32..i * 1024 + 32 + source.len()].copy_from_slice(source);
+            }
+            for threshold in [0, 1, usize::MAX] {
+                let mut dst = vec![0xa5; expected.len()];
+                let copies = sources
+                    .iter()
+                    .enumerate()
+                    .map(|(i, source)| MappedHostCopy {
+                        src: source.as_ptr() as usize,
+                        dst: unsafe { dst.as_mut_ptr().add(i * 1024 + 32) } as usize,
+                        len: source.len(),
+                    })
+                    .collect::<Vec<_>>();
+                copy_to_mapped_batch(&copies, threshold);
+                assert_eq!(dst, expected);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "opt-in mapped device-local transport benchmark; no inference gain claim"]
+    fn benchmark_mapped_miss_copy_policy() {
+        use ash::vk;
+        use gpu_allocator::MemoryLocation;
+        let be = crate::VulkanBackend::new().expect("benchmark Vulkan device");
+        // Each expert has three differently-sized banks, as on FlashNext Q4_K_M.
+        let strides = [524_288usize, 720_896, 950_272];
+        let buffer_bytes = strides.iter().sum::<usize>() * 8;
+        let (buffer, _) = be
+            .alloc_mapped_arena_bda(buffer_bytes)
+            .expect("coherent mapped VRAM");
+        let ptr = crate::as_vk_buf(buffer.as_ref())
+            .unwrap()
+            .mapped_ptr()
+            .unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(10)
+            .build()
+            .unwrap();
+        for experts in [1, 2, 3, 4, 8] {
+            let sources = (0..experts * 3)
+                .map(|i| vec![(i * 19 + 7) as u8; strides[i % 3]])
+                .collect::<Vec<_>>();
+            let mut offset = 0;
+            let copies = sources
+                .iter()
+                .map(|src| {
+                    let copy = MappedHostCopy {
+                        src: src.as_ptr() as usize,
+                        dst: unsafe { ptr.add(offset) } as usize,
+                        len: src.len(),
+                    };
+                    offset += src.len();
+                    copy
+                })
+                .collect::<Vec<_>>();
+            let readback = be
+                .make_buf(offset, MemoryLocation::GpuToCpu, "mapped-copy-benchmark")
+                .expect("readback buffer");
+            pool.install(|| {
+                for pass in 0..6 {
+                    let order = if pass % 2 == 0 { [false, true] } else { [true, false] };
+                    for serial in order {
+                        let threshold = if serial { usize::MAX } else { 0 };
+                        for _ in 0..8 { copy_to_mapped_batch(&copies, threshold); }
+                        let started = std::time::Instant::now();
+                        for _ in 0..96 { copy_to_mapped_batch(&copies, threshold); }
+                        let elapsed_us = started.elapsed().as_secs_f64() * 1e6 / 96.0;
+                        // A real GPU readback after the timing flushes/validates CPU writes.
+                        let mut downloaded = vec![0; offset];
+                        let src = crate::as_vk_buf(buffer.as_ref()).unwrap().buffer;
+                        be.one_shot(|cmd| unsafe {
+                            let barrier = vk::MemoryBarrier::default()
+                                .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+                            be.shared.device.cmd_pipeline_barrier(cmd,
+                                vk::PipelineStageFlags::HOST, vk::PipelineStageFlags::TRANSFER,
+                                vk::DependencyFlags::empty(), &[barrier], &[], &[]);
+                            be.shared.device.cmd_copy_buffer(cmd, src, readback.buffer,
+                                &[vk::BufferCopy::default().size(offset as u64)]);
+                        }).unwrap();
+                        unsafe { std::ptr::copy_nonoverlapping(readback.mapped_ptr().unwrap(),
+                            downloaded.as_mut_ptr(), offset); }
+                        let mut cursor = 0;
+                        for src in &sources {
+                            assert_eq!(&downloaded[cursor..cursor + src.len()], src);
+                            cursor += src.len();
+                        }
+                        println!("mapped_copy experts={experts} bytes={offset} pass={pass} serial={serial} us={elapsed_us:.3}");
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
     fn mapped_host_batch_copies_disjoint_ranges_exactly() {
         let sources = [vec![0x17u8; 257], vec![0x5cu8; 513], vec![0xe1u8; 129]];
         let offsets = [0usize, 320, 896];
@@ -1445,7 +1621,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        parallel_copy_to_mapped_batch(&copies);
+        copy_to_mapped_batch(&copies, 0);
 
         for (src, offset) in sources.iter().zip(offsets) {
             assert_eq!(&dst[offset..offset + src.len()], src);

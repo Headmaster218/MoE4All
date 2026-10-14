@@ -134,6 +134,32 @@ pub(crate) fn native_streamed_build_spv(
     }
 }
 
+/// Bit-identical Wave32 Q8_0 Decode GEMV. The shader preserves the 64-thread kernel's reduction
+/// tree and is therefore suitable for exact A/B tests on large-K fixed projections.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_q8_wave32_spv(res: bool, nr: u32) -> Option<(&'static str, &'static [u32])> {
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            ($name, s)
+        }};
+    }
+    Some(match (res, nr) {
+        (false, 1) => v!("native_q8_0_wave32"),
+        (false, 2) => v!("native_q8_0_wave32_nr2"),
+        (false, 4) => v!("native_q8_0_wave32_nr4"),
+        (true, 1) => v!("native_q8_0_wave32_res"),
+        (true, 2) => v!("native_q8_0_wave32_nr2_res"),
+        (true, 4) => v!("native_q8_0_wave32_nr4_res"),
+        _ => return None,
+    })
+}
+
 /// SPIR-V (kernel-cache name + words) for [`native_mrow_kernel_name`]'s pick — the multi-row GEMV's
 /// weight read from a `bufferDeviceAddress` arena; the sole weight build. Production dispatches it
 /// via [`crate::recorder::Recorder::linear_native_mrow`]; parity tests call the streamed entry
@@ -158,6 +184,7 @@ pub(crate) fn native_mrow_spv(
     }
     match (dtype, rows) {
         (Q8_0, 2) => v!("native_mrow_q8_0_m2"),
+        (Q8_0, 4) => v!("native_mrow_q8_0_m4"),
         (Q8_0, _) => v!("native_mrow_q8_0"),
         (Bf16, _) => v!("native_mrow_bf16"),
         (Q4_0, _) => v!("native_mrow_q4_0"),
@@ -3762,6 +3789,31 @@ pub(crate) fn copy_strided_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(COPY_STRIDED_SPV_BYTES))
 }
+pub(crate) fn gpu_resident_check_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_resident_check.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+pub(crate) fn gpu_resident_dispatch_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_resident_dispatch.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+pub(crate) fn zero_words_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/zero_words.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+pub(crate) fn gpu_resident_hit_check_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_resident_hit_check.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+pub(crate) fn gpu_resident_silu_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_resident_silu.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the elementwise sigmoid gate `y = a * sigmoid(b)`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn mul_sigmoid_spv() -> &'static [u32] {
@@ -4033,6 +4085,7 @@ dyn_spv!(rope_f16_bda_spv, "rope_f16_bda");
 dyn_spv!(rope_f16_dyn_bda_spv, "rope_f16_dyn_bda");
 dyn_spv!(qk_norm_rope_bda_spv, "qk_norm_rope_bda");
 dyn_spv!(qk_norm_rope_dyn_bda_spv, "qk_norm_rope_dyn_bda");
+dyn_spv!(qk_norm_rope_dyn_q8_bda_spv, "qk_norm_rope_dyn_q8_bda");
 dyn_spv!(qk_norm_rope_ff_bda_spv, "qk_norm_rope_ff_bda");
 dyn_spv!(qk_norm_rope_dyn_ff_bda_spv, "qk_norm_rope_dyn_ff_bda");
 dyn_spv!(
@@ -4181,8 +4234,21 @@ dyn_spv!(attn_decode_swa_spv, "attn_decode_swa");
 dyn_spv!(attn_decode_swa_dynac_spv, "attn_decode_swa_dynac");
 dyn_spv!(attn_decode_hd256_spv, "attn_decode_hd256");
 dyn_spv!(attn_decode_hd256_q8_spv, "attn_decode_hd256_q8");
+dyn_spv!(attn_decode_hd256_q8_dynac_spv, "attn_decode_hd256_q8_dynac");
+dyn_spv!(
+    attn_decode_hd256_q8_i8_dynac_spv,
+    "attn_decode_hd256_q8_i8_dynac"
+);
+dyn_spv!(
+    attn_decode_hd256_q8_i8_c512_dynac_spv,
+    "attn_decode_hd256_q8_i8_c512_dynac"
+);
 dyn_spv!(attn_decode_hd256_q8_gqa2_spv, "attn_decode_hd256_q8_gqa2");
 dyn_spv!(attn_decode_hd256_q8_gqa4_spv, "attn_decode_hd256_q8_gqa4");
+dyn_spv!(
+    attn_decode_hd256_q8_gqa4_dynac_spv,
+    "attn_decode_hd256_q8_gqa4_dynac"
+);
 dyn_spv!(attn_decode_hd256_q8_c512_spv, "attn_decode_hd256_q8_c512");
 dyn_spv!(attn_decode_hd256_q8_ls64_spv, "attn_decode_hd256_q8_ls64");
 dyn_spv!(attn_decode_hd256_q8_ls128_spv, "attn_decode_hd256_q8_ls128");
@@ -4259,6 +4325,7 @@ pub(crate) fn attn_decode_q8_kernel(
     d8: bool,
     ls128: bool,
     ls256: bool,
+    qk_i8: bool,
     qk_f16: bool,
     pv_f16: bool,
     chunk1024: bool,
@@ -4266,6 +4333,22 @@ pub(crate) fn attn_decode_q8_kernel(
     gqa4: bool,
 ) -> Option<(&'static str, &'static [u32])> {
     match (hd, swa, dynac) {
+        (256, false, true) if d8 && ls256 && qk_i8 && pv_f16 && chunk1024 => Some((
+            "attn_decode_hd256_q8_i8_dynac",
+            attn_decode_hd256_q8_i8_dynac_spv(),
+        )),
+        (256, false, true) if d8 && ls256 && qk_i8 && pv_f16 => Some((
+            "attn_decode_hd256_q8_i8_c512_dynac",
+            attn_decode_hd256_q8_i8_c512_dynac_spv(),
+        )),
+        (256, false, true) if d8 && ls256 && qk_f16 && pv_f16 && chunk1024 && gqa4 => Some((
+            "attn_decode_hd256_q8_gqa4_dynac",
+            attn_decode_hd256_q8_gqa4_dynac_spv(),
+        )),
+        (256, false, true) if d8 && ls256 && qk_f16 && pv_f16 && chunk1024 => Some((
+            "attn_decode_hd256_q8_dynac",
+            attn_decode_hd256_q8_dynac_spv(),
+        )),
         (256, false, false) if d8 && ls256 && qk_f16 && pv_f16 && chunk1024 && gqa4 => {
             Some(("attn_decode_hd256_q8_gqa4", attn_decode_hd256_q8_gqa4_spv()))
         }
@@ -4392,6 +4475,13 @@ pub(crate) fn attn_partial_dynac_spv() -> &'static [u32] {
 pub(crate) fn attn_combine_live_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(ATTN_COMBINE_LIVE_SPV_BYTES))
+}
+/// Depth-adaptive serial/Wave32 live-count combine used by record-once replay.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn attn_combine_live_hybrid_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_combine_live_hybrid.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
 }
 /// SPIR-V for the split-K replay prologue (indirect args + live count from kv_len).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -4614,6 +4704,22 @@ impl VulkanBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn q8_mrow_uses_fixed_row_specializations() {
+        assert_eq!(
+            native_mrow_spv(infr_core::DType::Q8_0, 2).unwrap().0,
+            "native_mrow_q8_0_m2"
+        );
+        assert_eq!(
+            native_mrow_spv(infr_core::DType::Q8_0, 4).unwrap().0,
+            "native_mrow_q8_0_m4"
+        );
+        assert_eq!(
+            native_mrow_spv(infr_core::DType::Q8_0, 3).unwrap().0,
+            "native_mrow_q8_0"
+        );
+    }
 
     /// B7 slice 3a — the decode specialization's reduction must be a PLAIN subgroup reduce, never
     /// a clustered one. `attn_partial_dsplit.comp` (the width probe) spells the same width-32

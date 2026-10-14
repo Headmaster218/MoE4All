@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Runtime: Bash 4+, awk and standard Linux utilities; no Python or jq.
+# Model downloads use curl or wget. If both are absent, the interactive wizard
+# can install curl through a supported system package manager after confirmation.
 set -euo pipefail
 
 fail() { printf '%s\n' "$*" >&2; return 1; }
@@ -537,7 +539,7 @@ defaults() {
         [submit_mode]=auto [submit_cap]=64 [configure_diagnostics]=false [pager_stats]=false [pager_profile]=false [stage_profile]=false [vram_profile]=false
         [think_mode]=default [configure_thinking]=false [reasoning_effort]=default [max_new]=65536
         [configure_sampling]=false [temperature]='' [top_k]='' [top_p]='' [seed]=''
-        [server_addr]=127.0.0.1:8080 [server_parallel]=1 [server_auth]=false [server_session_cache]=false
+        [server_addr]=127.0.0.1:8080 [server_parallel]=1 [server_auth]=false [server_session_cache]=true
         [session_cache_dir]="$ROOT/kv-sessions" [session_idle_secs]=120 [session_cache_max]=5GiB [session_cache_ttl_hours]=24
         [server_vision]=false [vision_projector]='' [server_embedding]=false [embedding_model]='' [embedding_idle_timeout]=300
         [mtp_enabled]=false [mtp_model]='' [mtp_verify_tokens]=4 [cpu_miss_enabled]=false [cpu_miss_max]=1 [cpu_miss_cores]=''
@@ -646,13 +648,163 @@ absolute() {
     [[ $value == /* ]] || value="$ROOT/$value"
     REPLY=$(realpath -m -- "$value")
 }
-recommendations() {
+CATALOG_IDS=(qwen35-balanced flashnext-427 flashnext-vision qwen3-embedding-06b-q8)
+catalog_load() {
+    CATALOG_ID=$1 CATALOG_KIND='' CATALOG_NAME='' CATALOG_INFO='' CATALOG_PRIMARY='' CATALOG_COUNT=0
     case $1 in
-        llm) printf '%s\n' 'Qwen3.6 35B APEX-I-Balanced' 'https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/resolve/main/Qwen3.6-35B-A3B-APEX-I-Balanced.gguf?download=true' 'Qwen3.8 Flash-Next AD-4.27bpw (33 shards)' 'https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/tree/main/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64' ;;
-        mtp) printf '%s\n' 'Flash-Next shared Q4_K_M MTP' 'https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf?download=true' ;;
-        vision) printf '%s\n' 'Flash-Next F16 mmproj' 'https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/mmproj-Qwen3.8-Flash-Next-F16.gguf?download=true' ;;
-        embedding) printf '%s\n' 'Qwen3-Embedding 0.6B' 'https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/tree/main' ;;
+        flashnext-427)
+            CATALOG_KIND=llm; CATALOG_NAME='Qwen3.8 Flash-Next AD-4.27bpw-Q4_K_M-M64 (33 shards)'
+            CATALOG_INFO='https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/tree/main/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64'
+            CATALOG_PRIMARY='Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00033.gguf'; CATALOG_COUNT=33 ;;
+        qwen35-balanced)
+            CATALOG_KIND=llm; CATALOG_NAME='Qwen3.6 35B APEX-I-Balanced'
+            CATALOG_INFO='https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/blob/main/Qwen3.6-35B-A3B-APEX-I-Balanced.gguf'
+            CATALOG_PRIMARY='Qwen3.6-35B-A3B-APEX-I-Balanced/Qwen3.6-35B-A3B-APEX-I-Balanced.gguf'; CATALOG_COUNT=1 ;;
+        flashnext-vision)
+            CATALOG_KIND=vision; CATALOG_NAME='Qwen3.8 Flash-Next F16 vision projector'
+            CATALOG_INFO='https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/blob/main/mmproj-Qwen3.8-Flash-Next-F16.gguf'
+            CATALOG_PRIMARY='Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64/mmproj-Qwen3.8-Flash-Next-F16.gguf'; CATALOG_COUNT=1 ;;
+        qwen3-embedding-06b-q8)
+            CATALOG_KIND=embedding; CATALOG_NAME='Qwen3-Embedding 0.6B Q8_0'
+            CATALOG_INFO='https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/blob/main/Qwen3-Embedding-0.6B-Q8_0.gguf'
+            CATALOG_PRIMARY='Qwen3-Embedding-0.6B-Q8_0/Qwen3-Embedding-0.6B-Q8_0.gguf'; CATALOG_COUNT=1 ;;
+        *) fail "Unknown recommended download: $1"; return 1 ;;
     esac
+}
+catalog_file() {
+    local index=$2 file directory='Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64'
+    catalog_load "$1" || return 1
+    valid_uint "$index" 1 "$CATALOG_COUNT" || { fail "Invalid catalog file index: $index"; return 1; }
+    case $1 in
+        flashnext-427)
+            printf -v file 'Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-%05d-of-00033.gguf' "$index"
+            DOWNLOAD_RELATIVE="$directory/$file"
+            DOWNLOAD_URL="https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/$directory/$file?download=true" ;;
+        qwen35-balanced)
+            DOWNLOAD_RELATIVE=$CATALOG_PRIMARY
+            DOWNLOAD_URL='https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/resolve/main/Qwen3.6-35B-A3B-APEX-I-Balanced.gguf?download=true' ;;
+        flashnext-vision)
+            DOWNLOAD_RELATIVE=$CATALOG_PRIMARY
+            DOWNLOAD_URL='https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/mmproj-Qwen3.8-Flash-Next-F16.gguf?download=true' ;;
+        qwen3-embedding-06b-q8)
+            DOWNLOAD_RELATIVE=$CATALOG_PRIMARY
+            DOWNLOAD_URL='https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf?download=true' ;;
+    esac
+}
+recommendations() {
+    local kind=${1-all} id
+    printf '\nOfficial recommended models and components:\n'
+    for id in "${CATALOG_IDS[@]}"; do
+        catalog_load "$id"
+        [[ $kind == all || $CATALOG_KIND == "$kind" ]] || continue
+        printf ' %s\n   %s\n' "$CATALOG_NAME" "$CATALOG_INFO"
+    done
+    printf 'Choose D in a model prompt to download one or more items into %s/models.\n' "$ROOT"
+}
+catalog_candidates() {
+    local kind=$1 id path found existing
+    for id in "${CATALOG_IDS[@]}"; do
+        catalog_load "$id"; [[ $CATALOG_KIND == "$kind" ]] || continue
+        path="$ROOT/models/$CATALOG_PRIMARY"; [[ -f $path ]] || continue
+        found=false; for existing in "${CANDIDATES[@]}"; do [[ $existing != "$path" ]] || found=true; done
+        [[ $found == true ]] || CANDIDATES+=("$path")
+    done
+}
+run_privileged() {
+    if ((EUID==0)); then "$@"
+    elif command -v sudo >/dev/null 2>&1; then sudo "$@"
+    else fail 'Installing curl requires root or sudo.'; return 1
+    fi
+}
+install_curl() {
+    if command -v apt-get >/dev/null 2>&1; then run_privileged apt-get update && run_privileged apt-get install -y curl
+    elif command -v dnf >/dev/null 2>&1; then run_privileged dnf install -y curl
+    elif command -v yum >/dev/null 2>&1; then run_privileged yum install -y curl
+    elif command -v zypper >/dev/null 2>&1; then run_privileged zypper --non-interactive install curl
+    elif command -v pacman >/dev/null 2>&1; then run_privileged pacman -Sy --noconfirm curl
+    elif command -v apk >/dev/null 2>&1; then run_privileged apk add curl
+    else fail 'Neither curl/wget nor a supported package manager was found. Install curl or wget and retry.'; return 1
+    fi
+    command -v curl >/dev/null 2>&1 || { fail 'curl installation completed but curl is still unavailable.'; return 1; }
+}
+ensure_model_downloader() {
+    if command -v curl >/dev/null 2>&1; then MODEL_DOWNLOADER=curl; return 0; fi
+    if command -v wget >/dev/null 2>&1; then MODEL_DOWNLOADER=wget; return 0; fi
+    [[ ${INTERACTIVE-false} == true && ${HEADLESS-false} == false ]] || {
+        fail 'Model download requires curl or wget. Install either tool, or run the wizard interactively to install curl.'; return 1;
+    }
+    yes 'curl and wget are missing. Install curl with the system package manager now?' false
+    [[ $REPLY == true ]] || return 1
+    install_curl || return 1
+    MODEL_DOWNLOADER=curl
+}
+model_download_file() {
+    local url=$1 destination=$2 label=$3 partial attempt
+    [[ $url =~ ^https://huggingface\.co/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/resolve/[A-Za-z0-9._/?=-]+$ ]] || {
+        fail "Refusing non-catalog download URL: $url"; return 1;
+    }
+    if [[ -s $destination ]]; then printf 'Already present: %s\n' "$destination"; return 0; fi
+    [[ ! -e $destination ]] || rm -f -- "$destination"
+    mkdir -p -- "${destination%/*}"; partial="$destination.part"
+    ensure_model_downloader || return 1
+    printf '\n%s\n' "$label"
+    for attempt in 1 2 3; do
+        if [[ $MODEL_DOWNLOADER == curl ]]; then
+            if curl --fail --location --proto '=https' --proto-redir '=https' --connect-timeout 30 \
+                --continue-at - --output "$partial" --progress-bar --user-agent 'MoE4All-Linux-Wizard/1.0' "$url"; then
+                [[ -s $partial ]] || { fail 'Downloaded file is empty.'; return 1; }
+                mv -f -- "$partial" "$destination"; return 0
+            fi
+        else
+            local -a wget_args=(-c -O "$partial")
+            if wget --help 2>&1 | grep -q -- '--https-only'; then wget_args+=(--https-only); fi
+            if wget "${wget_args[@]}" "$url"; then
+                [[ -s $partial ]] || { fail 'Downloaded file is empty.'; return 1; }
+                mv -f -- "$partial" "$destination"; return 0
+            fi
+        fi
+        printf 'Download interrupted; retrying from .part (%d/3).\n' "$attempt" >&2
+        ((attempt==3)) || sleep $((attempt*2))
+    done
+    fail 'Download failed after 3 attempts.'
+}
+download_bundle() {
+    local id=$1 i destination
+    catalog_load "$id" || return 1
+    printf '\nDownload: %s\nFolder: %s/models\n' "$CATALOG_NAME" "$ROOT"
+    for ((i=1;i<=CATALOG_COUNT;i++)); do
+        catalog_file "$id" "$i"
+        destination="$ROOT/models/$DOWNLOAD_RELATIVE"
+        model_download_file "$DOWNLOAD_URL" "$destination" "[$i/$CATALOG_COUNT] ${destination##*/}" || return 1
+    done
+    catalog_load "$id"
+    [[ -s $ROOT/models/$CATALOG_PRIMARY ]] || { fail "Downloaded primary file is missing: $ROOT/models/$CATALOG_PRIMARY"; return 1; }
+    printf 'Download complete: %s/models/%s\n' "$ROOT" "$CATALOG_PRIMARY"
+}
+download_menu() {
+    local raw token number index id primary i valid; local -a selected=(); local -A seen=()
+    while true; do
+        printf '\nDownload models and components\n'
+        for ((i=0;i<${#CATALOG_IDS[@]};i++)); do
+            catalog_load "${CATALOG_IDS[i]}"; primary="$ROOT/models/$CATALOG_PRIMARY"
+            if [[ -s $primary ]]; then printf ' [%d] %s [installed]\n' "$((i+1))" "$CATALOG_NAME"; else printf ' [%d] %s\n' "$((i+1))" "$CATALOG_NAME"; fi
+            printf '     %s\n' "$CATALOG_INFO"
+        done
+        printf ' [A] All\n [B] Back\nSelect one or more numbers, comma-separated: '
+        IFS= read -r raw || { fail 'Download selection cancelled: input ended.'; return 1; }; trim "$raw"; raw=$REPLY
+        case ${raw,,} in b|back) return 0 ;; a|all) selected=(0 1 2 3) ;; *)
+            raw=${raw//,/ }; raw=${raw//;/ }; selected=(); seen=(); valid=true
+            for token in $raw; do
+                if ! valid_uint "$token" 1 "${#CATALOG_IDS[@]}"; then valid=false; break; fi
+                number=$((10#$token)); index=$((number-1))
+                [[ -v 'seen[$index]' ]] || { selected+=("$index"); seen[$index]=1; }
+            done
+            if [[ $valid != true || ${#selected[@]} == 0 ]]; then printf 'Choose listed numbers separated by commas.\n'; continue; fi ;;
+        esac
+        yes 'Start or resume the selected downloads now?' true; [[ $REPLY == true ]] || return 0
+        for index in "${selected[@]}"; do id=${CATALOG_IDS[index]}; download_bundle "$id" || return 1; done
+        return 0
+    done
 }
 model_candidates() {
     local file lower
@@ -673,6 +825,7 @@ hub_reference() { [[ $1 != /* && ${1,,} != *.gguf && $1 == */* ]]; }
 model_path() {
     local kind=$1 key=$2 value i found saved=${S[$2]} path
     model_candidates "$ROOT" "$kind"
+    catalog_candidates "$kind"
     local -a nearby=("${CANDIDATES[@]}") remembered=("$saved")
     if [[ $kind == llm && -f $ROOT/gui-data/state.json ]]; then
         if json_load "$ROOT/gui-data/state.json"; then
@@ -690,12 +843,23 @@ model_path() {
         [[ $found == true ]] || nearby=("$value" "${nearby[@]}")
     done
     while true; do
-        printf '\n%s model; R = official recommended models\n' "${kind^^}"
+        printf '\n%s model\n' "${kind^^}"
         for ((i=0;i<${#nearby[@]};i++)); do printf ' [%d] %s\n' "$((i+1))" "${nearby[i]}"; done
-        [[ -n $saved ]] || recommendations "$kind"
-        value=$saved; [[ -n $value || $kind != llm || ${#nearby[@]} == 0 ]] || value=${nearby[0]}
-        prompt 'GGUF file/directory, number, or R' "$value" true; value=$REPLY
+        printf ' [D] Download models or components\n [R] Show official download links\n [N] Enter a new path\n'
+        value=$saved; [[ -n $value || ${#nearby[@]} == 0 ]] || value=1
+        [[ -n $value || ${#nearby[@]} != 0 ]] || value=D
+        prompt 'Select a model, command, or GGUF path' "$value" true; value=$REPLY
+        if [[ ${value,,} == d || ${value,,} == download ]]; then
+            case $kind in
+                vision) download_bundle flashnext-vision || continue ;;
+                embedding) download_bundle qwen3-embedding-06b-q8 || continue ;;
+                *) download_menu || continue ;;
+            esac
+            CANDIDATES=("${nearby[@]}"); catalog_candidates "$kind"; nearby=("${CANDIDATES[@]}")
+            saved=''; continue
+        fi
         if [[ ${value,,} == r || ${value,,} == recommended ]]; then recommendations "$kind"; continue; fi
+        if [[ ${value,,} == n || ${value,,} == new ]]; then prompt 'GGUF file or directory' '' true; value=$REPLY; fi
         if valid_uint "$value" 1 "${#nearby[@]}"; then value=${nearby[10#$value-1]}; fi
         if [[ $value == \"*\" ]]; then value=${value:1:${#value}-2}; fi
         absolute "$value"; path=$REPLY
@@ -737,7 +901,8 @@ reasoning_efforts() (
             else value(t,0)
             if(have_arch&&have_template)break
         }
-        if(template~/(^|[^a-zA-Z0-9_])reasoning_effort([^a-zA-Z0-9_]|$)/){if(arch=="qwen4exp")print "low medium xhigh";else print "low medium high max"}
+        if((arch=="qwen35"||arch=="qwen35moe")&&template~/(^|[^a-zA-Z0-9_])enable_thinking([^a-zA-Z0-9_]|$)/)print "low medium high max"
+        else if(template~/(^|[^a-zA-Z0-9_])reasoning_effort([^a-zA-Z0-9_]|$)/){if(arch=="qwen4exp")print "low medium xhigh";else print "low medium high max"}
         exit 0
     }'
 )
@@ -808,13 +973,6 @@ configure() {
     local key value effort count previous
     choice launch_mode '1. Purpose' 'run|Terminal chat (recommended)' 'serve|OpenAI-compatible API' 'bench|Benchmark'
     model_path llm model
-    if [[ ${S[launch_mode]} != bench ]]; then
-        ask_yes mtp_enabled '2.2 Enable Qwen3.8 MTP?'
-        if [[ ${S[mtp_enabled]} == true ]]; then
-            model_path mtp mtp_model; choice mtp_verify_tokens 'MTP verification width' '4|4 (recommended)' '3|3' '2|2'
-            printf 'Qwen3.8 Vulkan, greedy only. Non-greedy API requests use ordinary decode.\n'
-        fi
-    fi
     if [[ ${S[launch_mode]} == serve ]]; then
         if [[ -z ${S[vision_projector]} ]]; then model_candidates "${S[model]%/*}" vision; ((${#CANDIDATES[@]}!=1)) || S[vision_projector]=${CANDIDATES[0]}; fi
         ask_yes server_vision '2.3 Enable vision?'; [[ ${S[server_vision]} != true ]] || model_path vision vision_projector
@@ -870,11 +1028,7 @@ configure() {
         integer cpu_miss_cores 'CPU compute cores' 1 "$count"
     fi
     if [[ ${S[launch_mode]} == serve ]]; then
-        if [[ ${S[mtp_enabled]} == true ]]; then
-            [[ ${S[server_parallel]} == 1 || ${S[server_parallel]} == 2 ]] || S[server_parallel]=1
-            choice server_parallel '6. Concurrent slots' '1|Single-stream MTP' '2|Two slots, opportunistic MTP'
-            if [[ ${S[server_parallel]} == 2 ]]; then S[mtp_verify_tokens]=4; printf 'One active decode uses MTP; two active decodes use ordinary batched decode.\n'; fi
-        else integer server_parallel '6. Concurrent slots' 1; fi
+        integer server_parallel '6. Concurrent slots' 1
     fi
     ask context '7. Context (blank = auto)'
     if [[ ${S[launch_mode]} == serve ]]; then
@@ -1228,6 +1382,9 @@ main() {
         esac
     done
     for key in ubatch ram_budget vram_budget; do [[ ! -v 'OVERRIDES[$key]' ]] || S[auto_overrides]+=",$key,"; done
+    # The release wizard no longer exposes MTP. Ignore stale saved MTP state,
+    # while preserving the explicit --mtp CLI for advanced/manual use.
+    if [[ ! -v 'OVERRIDES[mtp_model]' ]]; then S[mtp_enabled]=false; S[mtp_model]=''; S[mtp_verify_tokens]=4; fi
     for key in mtp_model vision_projector embedding_model; do
         case $key in mtp_model) value=mtp_enabled ;; vision_projector) value=server_vision ;; embedding_model) value=server_embedding ;; esac
         if [[ -v 'OVERRIDES[$key]' ]]; then S[$value]=false; [[ -z ${S[$key]} ]] || S[$value]=true; fi
