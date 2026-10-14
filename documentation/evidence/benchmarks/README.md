@@ -8,7 +8,7 @@ verified_commit: ed62393068679573afe94a1472454efe7eae0f15
 
 # 基准测试记录
 
-- [2026-10-11 FlashNext 专家缓存容量与 Miss 率](2026-10-11-flashnext-expert-cache-capacity.md)：真实自然问答访问序列的 0.5～48 GiB 离线回放、连续分段指数函数与误差；不是 MTP 或各档容量的实机速度测试。
+- [2026-10-11 FlashNext 专家缓存容量、Miss 率与多卡配比](2026-10-11-flashnext-expert-cache-capacity.md)：真实自然问答访问序列的 0.5～48 GiB 离线回放、连续分段指数函数与误差，以及按可用专家显存和实测 PCIe 带宽求层数比例的规划公式；曲线不是 MTP 或各档容量的实机速度测试，配比示例也不是多卡实测。
 - [2026-09-27 Qwen3.8 整体性能与稳定性](2026-09-27-system-performance-stability.md)：20K/100K/150K，普通、MTP、视觉及双槽单活跃对照。注意测试提交不属于 `release-0.9.0` tag 血统。
 - [2026-09-24 Qwen3.8 MTP 20K 对照](2026-09-24-qwen38-mtp-20k.md)
 - [2026-09-24 Qwen3.8 MTP 150K 对照](2026-09-24-qwen38-mtp-150k.md)
