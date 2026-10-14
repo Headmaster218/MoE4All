@@ -2,6 +2,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$InstallRoot,
     [Parameter(Mandatory = $true)][int]$ParentPid,
+    [ValidateSet('Legacy', 'Check', 'Install')][string]$Action = 'Legacy',
     [string]$FeedUri = 'https://api.github.com/repos/Headmaster218/MoE4All/releases?per_page=30',
     [string]$TestArchive,
     [string]$TestRoot,
@@ -15,6 +16,45 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { return }
 $installed = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($installed.product -ne 'moe4all-agent') { return }
 . (Join-Path $PSScriptRoot 'AgentUpdateVersion.ps1')
+
+function Write-UpdateStatus([string]$Kind, [long]$Completed, [long]$Total, [string]$Message) {
+    $safeMessage = ([string]$Message).Replace("`r", ' ').Replace("`n", ' ').Replace("`t", ' ')
+    Write-Output "@@MOE4ALL_UPDATE`t$Kind`t$Completed`t$Total`t$safeMessage"
+    [Console]::Out.Flush()
+}
+
+function Receive-UpdateFile([Uri]$Uri, [string]$Destination, [long]$ExpectedBytes) {
+    $request = [Net.HttpWebRequest]::Create($Uri)
+    $request.UserAgent = 'MoE4All-Agent-Updater'
+    $request.Timeout = 900000
+    $request.ReadWriteTimeout = 900000
+    $response = $request.GetResponse()
+    $inputStream = $null
+    $outputStream = $null
+    try {
+        $total = if ($response.ContentLength -gt 0) { [long]$response.ContentLength } else { $ExpectedBytes }
+        $inputStream = $response.GetResponseStream()
+        $outputStream = New-Object IO.FileStream($Destination, ([IO.FileMode]::Create), ([IO.FileAccess]::Write), ([IO.FileShare]::None), 1048576, ([IO.FileOptions]::SequentialScan))
+        $buffer = New-Object byte[] 1048576
+        $completed = [long]0
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        Write-UpdateStatus 'download' 0 $total 'Downloading update'
+        while (($read = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $outputStream.Write($buffer, 0, $read)
+            $completed += $read
+            if ($clock.ElapsedMilliseconds -ge 200 -or ($total -gt 0 -and $completed -ge $total)) {
+                Write-UpdateStatus 'download' $completed $total 'Downloading update'
+                $clock.Restart()
+            }
+        }
+        $outputStream.Flush()
+        Write-UpdateStatus 'download' $completed $total 'Download complete'
+    } finally {
+        if ($outputStream) { $outputStream.Dispose() }
+        if ($inputStream) { $inputStream.Dispose() }
+        $response.Dispose()
+    }
+}
 
 $testMode = [bool]$TestArchive
 if ($testMode) {
@@ -61,7 +101,7 @@ function Move-ManagedItems([string]$Source, [string]$Destination) {
     }
 }
 
-if (-not $TestInstallOnly) {
+if (-not $TestInstallOnly -and -not $testMode) {
     # The checker is detached from the launcher and waits until first-run setup finishes.
     for ($attempt = 0; $attempt -lt 600; $attempt++) {
         if (-not (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)) { return }
@@ -77,6 +117,7 @@ if (-not $TestInstallOnly) {
 $best = $null
 $zipAsset = $null
 $sumAsset = $null
+if ($Action -ne 'Legacy') { Write-UpdateStatus 'checking' 0 0 'Checking for updates' }
 if ($testMode) {
     $zipName = [IO.Path]::GetFileName($testZip)
     if ($zipName -notmatch '^MoE4All-Agent-Windows-x64-(agent-v[0-9]+\.[0-9]+\.[0-9]+(?:-preview\.[0-9]+)?)\.zip$') {
@@ -89,7 +130,12 @@ if ($testMode) {
 } else {
     try {
         $releases = Invoke-RestMethod -Uri $FeedUri -Headers @{ 'User-Agent' = 'MoE4All-Agent-Updater' } -TimeoutSec 15
-    } catch { return }
+    } catch {
+        if ($Action -ne 'Legacy') {
+            Write-UpdateStatus 'error' 0 0 ("Could not check for updates: " + $_.Exception.Message)
+        }
+        return
+    }
     foreach ($release in @($releases)) {
         $tag = [string]$release.tag_name
         if ($release.draft -eq $true -or -not (Test-AgentVersionNewer $tag ([string]$installed.version))) { continue }
@@ -110,9 +156,18 @@ if ($testMode) {
         $best, $zipAsset, $sumAsset = $release, $zip, $sum
     }
 }
-if ($null -eq $best) { return }
+if ($null -eq $best) {
+    if ($Action -ne 'Legacy') { Write-UpdateStatus 'none' 0 0 ([string]$installed.version) }
+    return
+}
 
-if (-not $testMode) {
+if ($Action -eq 'Check') {
+    $availableBytes = if ($zipAsset.size) { [long]$zipAsset.size } elseif ($testMode) { (Get-Item -LiteralPath $testZip).Length } else { 0 }
+    Write-UpdateStatus 'available' 0 $availableBytes ([string]$best.tag_name)
+    return
+}
+
+if (-not $testMode -and $Action -eq 'Legacy') {
     Add-Type -AssemblyName System.Windows.Forms
     $message = "MoE4All Agent $($best.tag_name) is available.`n`nThe update replaces the application only. Models, conversations and caches stay in this directory. One previous application version is kept for rollback.`n`nUpdate now?"
     $choice = [Windows.Forms.MessageBox]::Show($message, 'MoE4All Agent update', 'YesNo', 'Question')
@@ -135,10 +190,14 @@ try {
     if ($testMode) {
         Copy-Item -LiteralPath $testZip -Destination $download
         Copy-Item -LiteralPath "$testZip.sha256" -Destination $checksum
+        $testBytes = (Get-Item -LiteralPath $download).Length
+        Write-UpdateStatus 'download' $testBytes $testBytes 'Download complete'
     } else {
-        Invoke-WebRequest -UseBasicParsing -Uri $zipAsset.browser_download_url -Headers @{ 'User-Agent' = 'MoE4All-Agent-Updater' } -OutFile $download -TimeoutSec 900
+        $expectedBytes = if ($zipAsset.size) { [long]$zipAsset.size } else { 0 }
+        Receive-UpdateFile ([Uri]$zipAsset.browser_download_url) $download $expectedBytes
         Invoke-WebRequest -UseBasicParsing -Uri $sumAsset.browser_download_url -Headers @{ 'User-Agent' = 'MoE4All-Agent-Updater' } -OutFile $checksum -TimeoutSec 30
     }
+    Write-UpdateStatus 'verify' 0 0 'Verifying downloaded package'
     $sumText = Get-Content -LiteralPath $checksum -Raw -Encoding UTF8
     $pattern = '(?im)^([a-f0-9]{64})\s+\*?' + [regex]::Escape($zipAsset.name) + '\s*$'
     if ($sumText -notmatch $pattern) { throw 'Release checksum file does not name the expected Agent archive.' }
@@ -146,6 +205,7 @@ try {
     if ($actualHash -ne $Matches[1]) { throw 'Agent archive SHA256 mismatch.' }
 
     $phase = 'extract'
+    Write-UpdateStatus 'extract' 0 0 'Preparing the new application'
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $reader = [IO.Compression.ZipFile]::OpenRead($download)
     try {
@@ -170,6 +230,7 @@ try {
 
     if (-not $TestInstallOnly) {
         $phase = 'stop old Agent'
+        Write-UpdateStatus 'install' 0 0 'Installing update and restarting'
         $process = Get-Process -Id $ParentPid -ErrorAction Stop
         $expectedExe = Join-Path $root 'MoE4All.exe'
         if (-not $process.Path.Equals($expectedExe, [StringComparison]::OrdinalIgnoreCase)) {
@@ -221,7 +282,11 @@ try {
         } catch { $detail += "`nAutomatic rollback also failed: $($_.Exception.Message)" }
     }
     if ($testMode) { throw "Agent update test failed: $detail" }
-    [Windows.Forms.MessageBox]::Show("Agent update failed: $detail", 'MoE4All Agent', 'OK', 'Error') | Out-Null
+    if ($Action -eq 'Legacy') {
+        [Windows.Forms.MessageBox]::Show("Agent update failed: $detail", 'MoE4All Agent', 'OK', 'Error') | Out-Null
+    } else {
+        Write-UpdateStatus 'error' 0 0 ("Update failed: " + $detail)
+    }
 } finally {
     if (Test-Path -LiteralPath $work) {
         Assert-UpdatePath $work | Out-Null

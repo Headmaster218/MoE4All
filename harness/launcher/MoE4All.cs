@@ -9,6 +9,7 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Web.WebView2.Core;
@@ -20,6 +21,7 @@ internal static class MoE4All
     private const int ExtendedLimitInformation = 9;
     private const int WebPort = 17373;
     private const string ProgressPrefix = "@@MOE4ALL_PROGRESS\t";
+    private const string UpdatePrefix = "@@MOE4ALL_UPDATE\t";
     private static readonly object LogLock = new object();
     private static StreamWriter log;
     private static string logPath;
@@ -209,26 +211,6 @@ internal static class MoE4All
         }
     }
 
-    private static void StartUpdateChecker(string root)
-    {
-        string manifest = Path.Combine(root, "harness", "distribution", "agent-release.json");
-        string script = Path.Combine(root, "harness", "scripts", "Check-AgentUpdate.ps1");
-        if (!File.Exists(manifest) || !File.Exists(script)) return;
-        ProcessStartInfo start = PowerShellStart(root);
-        start.Arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File " + Quote(script)
-            + " -InstallRoot " + Quote(root) + " -ParentPid " + Process.GetCurrentProcess().Id;
-        start.WorkingDirectory = root;
-        start.WindowStyle = ProcessWindowStyle.Hidden;
-        try
-        {
-            using (Process checker = Process.Start(start)) { }
-        }
-        catch (Exception error)
-        {
-            WriteMessage("Agent update check could not start: " + error.Message, true);
-        }
-    }
-
     private static void OpenLog(string root)
     {
         string path = Path.Combine(root, "data", "logs", "launcher.log");
@@ -343,17 +325,27 @@ internal static class MoE4All
         private readonly TextBox output;
         private readonly Panel startup;
         private readonly Button browserButton;
+        private readonly Button updateButton;
         private readonly Button runtimeButton;
         private readonly WebView2 webView;
+        private readonly string installedVersion;
         private IntPtr job = IntPtr.Zero;
         private DesktopBridge bridge;
+        private UpdateDialog updateDialog;
         private volatile bool closing;
         private volatile bool ready;
         private bool preparingProgress;
+        private bool updateBusy;
+        private bool updateInstalling;
+        private bool updateStatusFailed;
+        private bool revealUpdateResult;
+        private string availableUpdate;
+        private long availableUpdateBytes;
 
         public AgentWindow(string installRoot)
         {
             root = installRoot;
+            installedVersion = ReadInstalledVersion(root);
             Text = "MoE4All Agent";
             StartPosition = FormStartPosition.CenterScreen;
             MinimumSize = new Size(900, 620);
@@ -387,6 +379,13 @@ internal static class MoE4All
             browserButton.Width = 118;
             browserButton.Click += delegate { OpenUrl("http://127.0.0.1:" + WebPort + "/"); };
             toolbar.Controls.Add(browserButton);
+
+            updateButton = CreateButton("Check updates");
+            updateButton.Dock = DockStyle.Right;
+            updateButton.Width = 112;
+            updateButton.Enabled = false;
+            updateButton.Click += delegate { ShowUpdates(); };
+            toolbar.Controls.Add(updateButton);
 
             webView = new WebView2();
             webView.Dock = DockStyle.Fill;
@@ -462,6 +461,21 @@ internal static class MoE4All
             FormClosing += OnClosing;
         }
 
+        private static string ReadInstalledVersion(string installRoot)
+        {
+            string manifest = Path.Combine(installRoot, "harness", "distribution", "agent-release.json");
+            if (!File.Exists(manifest)) return "development build";
+            try
+            {
+                Match match = Regex.Match(File.ReadAllText(manifest), "\\\"version\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"");
+                return match.Success ? match.Groups[1].Value : "development build";
+            }
+            catch
+            {
+                return "development build";
+            }
+        }
+
         private static Button CreateButton(string text)
         {
             Button button = new Button();
@@ -473,6 +487,229 @@ internal static class MoE4All
             button.ForeColor = Color.FromArgb(232, 234, 237);
             button.UseVisualStyleBackColor = false;
             return button;
+        }
+
+        private void ShowUpdates()
+        {
+            EnsureUpdateDialog();
+            ShowUpdateDialog();
+            if (updateBusy) return;
+            if (!string.IsNullOrEmpty(availableUpdate))
+            {
+                updateDialog.ShowAvailable(availableUpdate, availableUpdateBytes);
+                return;
+            }
+            StartUpdateAction("Check", true);
+        }
+
+        private void EnsureUpdateDialog()
+        {
+            if (updateDialog != null && !updateDialog.IsDisposed) return;
+            updateDialog = new UpdateDialog(installedVersion,
+                delegate { StartUpdateAction("Check", true); },
+                delegate { StartUpdateAction("Install", true); },
+                delegate
+                {
+                    if (!string.IsNullOrEmpty(availableUpdate))
+                    {
+                        OpenUrl("https://github.com/Headmaster218/MoE4All/releases/tag/" + Uri.EscapeDataString(availableUpdate));
+                    }
+                });
+        }
+
+        private void ShowUpdateDialog()
+        {
+            if (!updateDialog.Visible) updateDialog.Show(this);
+            else
+            {
+                updateDialog.BringToFront();
+                updateDialog.Activate();
+            }
+        }
+
+        private void StartUpdateAction(string action, bool revealResult)
+        {
+            if (closing || updateBusy || !ready) return;
+            string manifest = Path.Combine(root, "harness", "distribution", "agent-release.json");
+            string script = Path.Combine(root, "harness", "scripts", "Check-AgentUpdate.ps1");
+            if (!File.Exists(manifest) || !File.Exists(script))
+            {
+                EnsureUpdateDialog();
+                ShowUpdateDialog();
+                updateDialog.ShowError("The bundled updater is unavailable. Reinstall the complete MoE4All Agent package.");
+                return;
+            }
+
+            updateBusy = true;
+            updateInstalling = action == "Install";
+            updateStatusFailed = false;
+            revealUpdateResult = revealResult;
+            updateButton.Enabled = false;
+            updateButton.Text = updateInstalling ? "Updating..." : "Checking...";
+            if (revealResult || updateInstalling)
+            {
+                EnsureUpdateDialog();
+                ShowUpdateDialog();
+                if (updateInstalling) updateDialog.ShowStage("download", "Starting update");
+                else updateDialog.ShowChecking();
+            }
+
+            Thread worker = new Thread(new ThreadStart(delegate { RunUpdateAction(action); }));
+            worker.IsBackground = true;
+            worker.Name = "MoE4All Agent updater";
+            worker.Start();
+        }
+
+        private void RunUpdateAction(string action)
+        {
+            StringBuilder errors = new StringBuilder();
+            int exitCode = -1;
+            try
+            {
+                string script = Path.Combine(root, "harness", "scripts", "Check-AgentUpdate.ps1");
+                ProcessStartInfo start = PowerShellStart(root);
+                start.Arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File " + Quote(script)
+                    + " -InstallRoot " + Quote(root)
+                    + " -ParentPid " + Process.GetCurrentProcess().Id
+                    + " -Action " + action;
+                start.RedirectStandardOutput = true;
+                start.RedirectStandardError = true;
+                start.StandardOutputEncoding = new UTF8Encoding(false);
+                start.StandardErrorEncoding = new UTF8Encoding(false);
+                using (Process updater = new Process())
+                {
+                    updater.StartInfo = start;
+                    updater.OutputDataReceived += delegate(object sender, DataReceivedEventArgs e)
+                    {
+                        if (e.Data != null && !TryHandleUpdateStatus(e.Data)) WriteMessage(e.Data);
+                    };
+                    updater.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs e)
+                    {
+                        if (e.Data == null) return;
+                        lock (errors) errors.AppendLine(e.Data);
+                        WriteMessage(e.Data, true);
+                    };
+                    if (!updater.Start()) throw new InvalidOperationException("The updater process could not start.");
+                    updater.BeginOutputReadLine();
+                    updater.BeginErrorReadLine();
+                    updater.WaitForExit();
+                    updater.WaitForExit();
+                    exitCode = updater.ExitCode;
+                }
+            }
+            catch (Exception error)
+            {
+                lock (errors) errors.AppendLine(error.Message);
+            }
+
+            string detail;
+            lock (errors) detail = errors.ToString().Trim();
+            if (!closing)
+            {
+                try { BeginInvoke(new Action<string, int, string>(FinishUpdateAction), action, exitCode, detail); }
+                catch (InvalidOperationException) { }
+            }
+        }
+
+        private bool TryHandleUpdateStatus(string message)
+        {
+            if (!message.StartsWith(UpdatePrefix, StringComparison.Ordinal)) return false;
+            string[] parts = message.Split(new char[] { '\t' }, 5);
+            long completed;
+            long total;
+            if (parts.Length != 5 || !long.TryParse(parts[2], out completed) || !long.TryParse(parts[3], out total)) return true;
+            if (!closing)
+            {
+                try
+                {
+                    BeginInvoke(new Action<string, long, long, string>(ApplyUpdateStatus),
+                        parts[1], completed, total, parts[4]);
+                }
+                catch (InvalidOperationException) { }
+            }
+            return true;
+        }
+
+        private void ApplyUpdateStatus(string kind, long completed, long total, string message)
+        {
+            if (IsDisposed) return;
+            if (kind == "checking")
+            {
+                if (updateInstalling && updateDialog != null) updateDialog.ShowStage("download", "Checking release information");
+                else if (revealUpdateResult && updateDialog != null) updateDialog.ShowChecking();
+                return;
+            }
+            if (kind == "none")
+            {
+                availableUpdate = null;
+                availableUpdateBytes = 0;
+                updateButton.Text = "Check updates";
+                updateButton.BackColor = Color.FromArgb(50, 52, 56);
+                updateButton.FlatAppearance.BorderColor = Color.FromArgb(82, 85, 91);
+                if (revealUpdateResult)
+                {
+                    EnsureUpdateDialog();
+                    ShowUpdateDialog();
+                    updateDialog.ShowCurrent();
+                }
+                return;
+            }
+            if (kind == "available")
+            {
+                availableUpdate = message;
+                availableUpdateBytes = total;
+                updateButton.Text = "Update available";
+                updateButton.BackColor = Color.FromArgb(62, 91, 76);
+                updateButton.FlatAppearance.BorderColor = Color.FromArgb(93, 132, 111);
+                EnsureUpdateDialog();
+                ShowUpdateDialog();
+                updateDialog.ShowAvailable(availableUpdate, availableUpdateBytes);
+                return;
+            }
+            if (kind == "error")
+            {
+                updateStatusFailed = true;
+                if (revealUpdateResult || updateInstalling)
+                {
+                    EnsureUpdateDialog();
+                    ShowUpdateDialog();
+                    updateDialog.ShowError(message);
+                }
+                return;
+            }
+
+            EnsureUpdateDialog();
+            ShowUpdateDialog();
+            if (kind == "download") updateDialog.ShowDownload(completed, total, message);
+            else updateDialog.ShowStage(kind, message);
+        }
+
+        private void FinishUpdateAction(string action, int exitCode, string error)
+        {
+            updateBusy = false;
+            updateButton.Enabled = ready;
+            if (updateInstalling) updateInstalling = false;
+
+            if (updateStatusFailed)
+            {
+                updateButton.Text = string.IsNullOrEmpty(availableUpdate) ? "Check updates" : "Update available";
+                return;
+            }
+            if (exitCode != 0)
+            {
+                updateButton.Text = string.IsNullOrEmpty(availableUpdate) ? "Check updates" : "Update available";
+                if (revealUpdateResult || action == "Install")
+                {
+                    EnsureUpdateDialog();
+                    ShowUpdateDialog();
+                    updateDialog.ShowError(string.IsNullOrEmpty(error) ? "The updater exited before completing." : error);
+                }
+                return;
+            }
+            if (action == "Check" && !string.IsNullOrEmpty(availableUpdate) && updateDialog != null)
+            {
+                updateDialog.ShowAvailable(availableUpdate, availableUpdateBytes);
+            }
         }
 
         public void AppendLog(string message, bool isError)
@@ -594,8 +831,7 @@ internal static class MoE4All
                     {
                         if ((int)response.StatusCode >= 200 && (int)response.StatusCode < 400)
                         {
-                            BeginInvoke(new Action(ActivateWebView));
-                            StartUpdateChecker(root);
+                            BeginInvoke(new Action(OnAgentReady));
                             return;
                         }
                     }
@@ -604,6 +840,16 @@ internal static class MoE4All
                 Thread.Sleep(500);
             }
             if (!closing) Fail("The Agent web service did not become ready. See the startup log for details.");
+        }
+
+        private void OnAgentReady()
+        {
+            ready = true;
+            status.Text = "Ready";
+            status.ForeColor = Color.FromArgb(131, 201, 157);
+            updateButton.Enabled = true;
+            ActivateWebView();
+            StartUpdateAction("Check", false);
         }
 
         private async void ActivateWebView()
@@ -631,9 +877,6 @@ internal static class MoE4All
                     }
                 };
                 webView.Source = new Uri("http://127.0.0.1:" + WebPort + "/");
-                ready = true;
-                status.Text = "Ready";
-                status.ForeColor = Color.FromArgb(131, 201, 157);
                 startup.Visible = false;
                 webView.Visible = true;
                 webView.BringToFront();
@@ -722,6 +965,278 @@ internal static class MoE4All
                 dialog.InitialDirectory = Directory.Exists(downloads) ? downloads : root;
                 return dialog.ShowDialog(this) == DialogResult.OK ? dialog.FileName : null;
             }
+        }
+    }
+
+    private sealed class UpdateDialog : Form
+    {
+        private readonly string installedVersion;
+        private readonly Action checkRequested;
+        private readonly Action installRequested;
+        private readonly Action releaseRequested;
+        private readonly Label statusText;
+        private readonly Label detailText;
+        private readonly Label progressText;
+        private readonly ProgressBar progressBar;
+        private readonly LinkLabel releaseLink;
+        private readonly Button primaryButton;
+        private readonly Button secondaryButton;
+        private bool hasUpdate;
+        private bool installing;
+
+        public UpdateDialog(string currentVersion, Action checkAction, Action installAction, Action releaseAction)
+        {
+            installedVersion = currentVersion;
+            checkRequested = checkAction;
+            installRequested = installAction;
+            releaseRequested = releaseAction;
+
+            Text = "MoE4All Agent updates";
+            StartPosition = FormStartPosition.CenterParent;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+            ClientSize = new Size(560, 330);
+            BackColor = Color.FromArgb(31, 32, 35);
+            ForeColor = Color.FromArgb(232, 234, 237);
+            Font = new Font("Segoe UI", 9F);
+            AutoScaleMode = AutoScaleMode.Dpi;
+
+            Label heading = new Label();
+            heading.Text = "Agent updates";
+            heading.Font = new Font("Segoe UI Semibold", 17F);
+            heading.AutoSize = true;
+            heading.Location = new Point(28, 24);
+            Controls.Add(heading);
+
+            Label version = new Label();
+            version.Text = "Installed  " + installedVersion;
+            version.ForeColor = Color.FromArgb(166, 170, 176);
+            version.AutoSize = true;
+            version.Location = new Point(30, 62);
+            Controls.Add(version);
+
+            Panel separator = new Panel();
+            separator.BackColor = Color.FromArgb(61, 63, 68);
+            separator.Location = new Point(28, 91);
+            separator.Size = new Size(504, 1);
+            Controls.Add(separator);
+
+            statusText = new Label();
+            statusText.Text = "Ready to check";
+            statusText.Font = new Font("Segoe UI Semibold", 12F);
+            statusText.AutoEllipsis = true;
+            statusText.Location = new Point(28, 112);
+            statusText.Size = new Size(504, 28);
+            Controls.Add(statusText);
+
+            detailText = new Label();
+            detailText.Text = "Check GitHub for a newer MoE4All Agent package.";
+            detailText.ForeColor = Color.FromArgb(180, 184, 190);
+            detailText.Location = new Point(28, 145);
+            detailText.Size = new Size(504, 44);
+            Controls.Add(detailText);
+
+            progressBar = new ProgressBar();
+            progressBar.Location = new Point(28, 204);
+            progressBar.Size = new Size(504, 14);
+            progressBar.Minimum = 0;
+            progressBar.Maximum = 1000;
+            progressBar.Style = ProgressBarStyle.Continuous;
+            Controls.Add(progressBar);
+
+            progressText = new Label();
+            progressText.ForeColor = Color.FromArgb(153, 158, 165);
+            progressText.AutoEllipsis = true;
+            progressText.Location = new Point(28, 225);
+            progressText.Size = new Size(330, 20);
+            Controls.Add(progressText);
+
+            releaseLink = new LinkLabel();
+            releaseLink.Text = "View release page";
+            releaseLink.LinkColor = Color.FromArgb(145, 190, 164);
+            releaseLink.ActiveLinkColor = Color.FromArgb(177, 216, 194);
+            releaseLink.VisitedLinkColor = releaseLink.LinkColor;
+            releaseLink.AutoSize = true;
+            releaseLink.Location = new Point(30, 247);
+            releaseLink.Visible = false;
+            releaseLink.LinkClicked += delegate { releaseRequested(); };
+            Controls.Add(releaseLink);
+
+            primaryButton = MakeButton("Check for updates", true);
+            primaryButton.Location = new Point(346, 279);
+            primaryButton.Size = new Size(186, 31);
+            primaryButton.Click += delegate
+            {
+                if (hasUpdate) installRequested();
+                else checkRequested();
+            };
+            Controls.Add(primaryButton);
+
+            secondaryButton = MakeButton("Close", false);
+            secondaryButton.Location = new Point(242, 279);
+            secondaryButton.Size = new Size(94, 31);
+            secondaryButton.Click += delegate { Hide(); };
+            Controls.Add(secondaryButton);
+
+            FormClosing += delegate(object sender, FormClosingEventArgs e)
+            {
+                if (installing)
+                {
+                    e.Cancel = true;
+                    return;
+                }
+                if (e.CloseReason == CloseReason.UserClosing)
+                {
+                    e.Cancel = true;
+                    Hide();
+                }
+            };
+        }
+
+        private static Button MakeButton(string text, bool primary)
+        {
+            Button button = new Button();
+            button.Text = text;
+            button.Height = 31;
+            button.FlatStyle = FlatStyle.Flat;
+            button.UseVisualStyleBackColor = false;
+            button.ForeColor = Color.FromArgb(239, 241, 243);
+            button.BackColor = primary ? Color.FromArgb(62, 91, 76) : Color.FromArgb(48, 50, 54);
+            button.FlatAppearance.BorderColor = primary ? Color.FromArgb(93, 132, 111) : Color.FromArgb(79, 82, 88);
+            return button;
+        }
+
+        private void SetProgress(long completed, long total)
+        {
+            progressBar.MarqueeAnimationSpeed = 0;
+            progressBar.Style = ProgressBarStyle.Continuous;
+            int value = total <= 0 ? 0 : (int)Math.Max(0, Math.Min(1000, completed * 1000 / total));
+            progressBar.Value = value;
+            progressText.Text = total > 0
+                ? FormatBytes(completed) + " / " + FormatBytes(total) + "  " + (value / 10) + "%"
+                : FormatBytes(completed);
+        }
+
+        private void SetIndeterminate(string caption)
+        {
+            progressBar.Value = 0;
+            progressBar.Style = ProgressBarStyle.Marquee;
+            progressBar.MarqueeAnimationSpeed = 24;
+            progressText.Text = caption;
+        }
+
+        private static string FormatBytes(long value)
+        {
+            if (value >= 1024L * 1024L * 1024L) return (value / (1024d * 1024d * 1024d)).ToString("0.0") + " GB";
+            if (value >= 1024L * 1024L) return (value / (1024d * 1024d)).ToString("0.0") + " MB";
+            if (value >= 1024L) return (value / 1024d).ToString("0.0") + " KB";
+            return value + " B";
+        }
+
+        private void SetButtons(bool canAct, string primaryText, string secondaryText)
+        {
+            primaryButton.Text = primaryText;
+            primaryButton.Enabled = canAct;
+            secondaryButton.Text = secondaryText;
+            secondaryButton.Enabled = !installing;
+        }
+
+        public void ShowChecking()
+        {
+            hasUpdate = false;
+            installing = false;
+            statusText.Text = "Checking for updates";
+            detailText.Text = "Contacting the official MoE4All release feed.";
+            detailText.ForeColor = Color.FromArgb(180, 184, 190);
+            releaseLink.Visible = false;
+            SetIndeterminate("Checking release information");
+            SetButtons(false, "Checking...", "Close");
+        }
+
+        public void ShowCurrent()
+        {
+            hasUpdate = false;
+            installing = false;
+            statusText.Text = "You're up to date";
+            detailText.Text = installedVersion + " is the newest available Agent version.";
+            detailText.ForeColor = Color.FromArgb(180, 184, 190);
+            releaseLink.Visible = false;
+            SetProgress(1, 1);
+            progressText.Text = "No update is required";
+            SetButtons(true, "Check again", "Close");
+        }
+
+        public void ShowAvailable(string version, long bytes)
+        {
+            hasUpdate = true;
+            installing = false;
+            statusText.Text = version + " is available";
+            detailText.Text = "Download and replace application files only. Models, conversations and caches stay in place; one previous version is kept for rollback.";
+            detailText.ForeColor = Color.FromArgb(180, 184, 190);
+            releaseLink.Visible = true;
+            SetProgress(0, bytes);
+            progressText.Text = bytes > 0 ? "Package size  " + FormatBytes(bytes) : "Ready to download";
+            SetButtons(true, "Download and install", "Not now");
+        }
+
+        public void ShowDownload(long completed, long total, string message)
+        {
+            hasUpdate = false;
+            installing = true;
+            statusText.Text = "Downloading update";
+            detailText.Text = "MoE4All Agent remains usable while the package downloads.";
+            detailText.ForeColor = Color.FromArgb(180, 184, 190);
+            releaseLink.Visible = false;
+            SetProgress(completed, total);
+            if (total <= 0) progressText.Text = message;
+            SetButtons(false, "Updating...", "Please wait");
+        }
+
+        public void ShowStage(string stage, string message)
+        {
+            hasUpdate = false;
+            installing = stage != "checking";
+            if (stage == "verify")
+            {
+                statusText.Text = "Verifying download";
+                detailText.Text = "Checking the package SHA-256 before any application files are changed.";
+            }
+            else if (stage == "extract")
+            {
+                statusText.Text = "Preparing update";
+                detailText.Text = "Unpacking and validating the new application beside the current version.";
+            }
+            else if (stage == "install")
+            {
+                statusText.Text = "Installing and restarting";
+                detailText.Text = "The Agent window will close briefly, switch versions, and reopen automatically.";
+            }
+            else
+            {
+                statusText.Text = "Starting update";
+                detailText.Text = "Preparing a secure application-only update.";
+            }
+            detailText.ForeColor = Color.FromArgb(180, 184, 190);
+            releaseLink.Visible = false;
+            SetIndeterminate(message);
+            SetButtons(false, "Updating...", "Please wait");
+        }
+
+        public void ShowError(string message)
+        {
+            hasUpdate = false;
+            installing = false;
+            statusText.Text = "Update needs attention";
+            detailText.Text = message;
+            detailText.ForeColor = Color.FromArgb(235, 137, 137);
+            releaseLink.Visible = false;
+            progressBar.MarqueeAnimationSpeed = 0;
+            progressBar.Style = ProgressBarStyle.Continuous;
+            progressBar.Value = 0;
+            progressText.Text = "No application files were replaced";
+            SetButtons(true, "Try again", "Close");
         }
     }
 

@@ -64,7 +64,21 @@ $preview3 = Write-Archive 'agent-v0.10.0-preview.3'
 $oldGuard = $env:MOE4ALL_AGENT_UPDATE_TEST
 try {
     $env:MOE4ALL_AGENT_UPDATE_TEST = '1'
-    & (Join-Path $install 'harness\scripts\Check-AgentUpdate.ps1') -InstallRoot $install -ParentPid $PID -TestArchive $preview2 -TestRoot $testRoot -TestInstallOnly
+    $updater = Join-Path $install 'harness\scripts\Check-AgentUpdate.ps1'
+    $checkOutput = @(& $updater -InstallRoot $install -ParentPid $PID -Action Check -TestArchive $preview2 -TestRoot $testRoot)
+    if (($checkOutput -join "`n") -notmatch '@@MOE4ALL_UPDATE\s+available\s+0\s+[1-9][0-9]*\s+agent-v0\.10\.0-preview\.2') {
+        throw "Manual update check did not report the available package: $($checkOutput -join ' | ')"
+    }
+    $stillInstalled = Get-Content -LiteralPath (Join-Path $install 'harness\distribution\agent-release.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($stillInstalled.version -ne 'agent-v0.10.0-preview.1') { throw 'Check-only mode changed the installed application.' }
+
+    $preview2Output = @(& $updater -InstallRoot $install -ParentPid $PID -TestArchive $preview2 -TestRoot $testRoot -TestInstallOnly)
+    $preview2Text = $preview2Output -join "`n"
+    foreach ($expectedStage in @('download', 'verify', 'extract')) {
+        if ($preview2Text -notmatch ("@@MOE4ALL_UPDATE\s+" + $expectedStage)) {
+            throw "Updater did not report the $expectedStage stage: $preview2Text"
+        }
+    }
     & (Join-Path $install 'harness\scripts\Check-AgentUpdate.ps1') -InstallRoot $install -ParentPid $PID -TestArchive $preview3 -TestRoot $testRoot -TestInstallOnly
 } finally {
     $env:MOE4ALL_AGENT_UPDATE_TEST = $oldGuard
@@ -83,5 +97,5 @@ foreach ($directory in @('data', 'models', 'cache')) {
 $unexpected = @(Get-ChildItem -LiteralPath (Join-Path $install 'updates') -Force | Where-Object Name -ne 'previous')
 if ($unexpected.Count -ne 0) { throw "Updater staging was not cleaned: $($unexpected.Name -join ', ')" }
 
-Write-Host 'Agent updater tests passed: application-only swap, persistent data, one rolling previous version, staging cleanup.'
+Write-Host 'Agent updater tests passed: manual check protocol, visible stages, application-only swap, persistent data, one rolling previous version, staging cleanup.'
 Write-Host "Evidence: $testRoot"
