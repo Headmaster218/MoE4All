@@ -11192,7 +11192,7 @@ impl ResidentChunk {
         }
         ps.cursor = 0;
         ps.tape_cursor = 0;
-        clear_frozen_moe_lut_slots(be_);
+        clear_frozen_moe_lut_slots(be_.moe_pager())?;
         if resume.is_some() {
             if let Some(promotion) = ps.cpu_promotion.as_ref() {
                 // GPU hit readers drained, but the miss upload still owns its destinations.
