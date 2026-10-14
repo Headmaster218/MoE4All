@@ -18,6 +18,7 @@ internal static class MoE4All
     private const int KillOnJobClose = 0x2000;
     private const int ExtendedLimitInformation = 9;
     private const int WebPort = 17373;
+    private const string ProgressPrefix = "@@MOE4ALL_PROGRESS\t";
     private static readonly object LogLock = new object();
     private static StreamWriter log;
     private static string logPath;
@@ -95,6 +96,18 @@ internal static class MoE4All
         WriteMessage(message, false);
     }
 
+    private static bool TryHandleProgress(string message)
+    {
+        if (!message.StartsWith(ProgressPrefix, StringComparison.Ordinal)) return false;
+        string[] parts = message.Split(new char[] { '\t' }, 4);
+        long completed;
+        long total;
+        if (parts.Length != 4 || !long.TryParse(parts[1], out completed) || !long.TryParse(parts[2], out total)) return true;
+        AgentWindow active = window;
+        if (active != null) active.UpdatePreparationProgress(completed, total, parts[3]);
+        return true;
+    }
+
     private static int RunScript(IntPtr job, string root, string script, string arguments)
     {
         ProcessStartInfo start = PowerShellStart(root);
@@ -106,7 +119,10 @@ internal static class MoE4All
         using (Process child = new Process())
         {
             child.StartInfo = start;
-            child.OutputDataReceived += delegate(object sender, DataReceivedEventArgs e) { if (e.Data != null) WriteMessage(e.Data); };
+            child.OutputDataReceived += delegate(object sender, DataReceivedEventArgs e)
+            {
+                if (e.Data != null && !TryHandleProgress(e.Data)) WriteMessage(e.Data);
+            };
             child.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs e) { if (e.Data != null) WriteMessage(e.Data, true); };
             if (!child.Start()) return 4;
             if (!AssignProcessToJobObject(job, child.Handle))
@@ -300,6 +316,8 @@ internal static class MoE4All
     {
         private readonly string root;
         private readonly Label status;
+        private readonly Label progressText;
+        private readonly ProgressBar progressBar;
         private readonly TextBox output;
         private readonly Panel startup;
         private readonly Button browserButton;
@@ -309,6 +327,7 @@ internal static class MoE4All
         private DesktopBridge bridge;
         private volatile bool closing;
         private volatile bool ready;
+        private bool preparingProgress;
 
         public AgentWindow(string installRoot)
         {
@@ -371,6 +390,21 @@ internal static class MoE4All
             explanation.Location = new Point(54, 106);
             startup.Controls.Add(explanation);
 
+            progressText = new Label();
+            progressText.Text = "Checking bundled runtime";
+            progressText.ForeColor = Color.FromArgb(196, 199, 204);
+            progressText.AutoSize = true;
+            progressText.Location = new Point(54, 137);
+            startup.Controls.Add(progressText);
+
+            progressBar = new ProgressBar();
+            progressBar.Style = ProgressBarStyle.Marquee;
+            progressBar.MarqueeAnimationSpeed = 24;
+            progressBar.Location = new Point(54, 160);
+            progressBar.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            progressBar.Size = new Size(Width - 128, 18);
+            startup.Controls.Add(progressBar);
+
             output = new TextBox();
             output.Multiline = true;
             output.ReadOnly = true;
@@ -379,9 +413,9 @@ internal static class MoE4All
             output.BackColor = Color.FromArgb(37, 38, 41);
             output.ForeColor = Color.FromArgb(196, 199, 204);
             output.Font = new Font("Consolas", 9F);
-            output.Location = new Point(54, 152);
+            output.Location = new Point(54, 204);
             output.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
-            output.Size = new Size(Width - 128, Height - 300);
+            output.Size = new Size(Width - 128, Height - 352);
             startup.Controls.Add(output);
 
             runtimeButton = CreateButton("Install WebView2 Runtime");
@@ -428,9 +462,49 @@ internal static class MoE4All
                 catch (InvalidOperationException) { }
                 return;
             }
-            status.Text = isError ? "Needs attention" : (ready ? "Ready" : "Starting");
+            if (isError) status.Text = "Needs attention";
+            else if (ready) status.Text = "Ready";
+            else if (!preparingProgress) status.Text = "Starting";
             if (isError) status.ForeColor = Color.FromArgb(235, 112, 112);
             output.AppendText(message + Environment.NewLine);
+        }
+
+        public void UpdatePreparationProgress(long completed, long total, string message)
+        {
+            if (IsDisposed) return;
+            if (InvokeRequired)
+            {
+                try { BeginInvoke(new Action<long, long, string>(UpdatePreparationProgress), completed, total, message); }
+                catch (InvalidOperationException) { }
+                return;
+            }
+            preparingProgress = true;
+            int value = total <= 0 ? 0 : (int)Math.Max(0, Math.Min(1000, completed * 1000 / total));
+            int percent = value / 10;
+            progressBar.MarqueeAnimationSpeed = 0;
+            progressBar.Style = ProgressBarStyle.Continuous;
+            progressBar.Minimum = 0;
+            progressBar.Maximum = 1000;
+            progressBar.Value = value;
+            progressText.Text = message + "  " + percent + "%";
+            status.Text = "Preparing " + percent + "%";
+            status.ForeColor = Color.FromArgb(176, 179, 184);
+        }
+
+        private void CompletePreparation()
+        {
+            if (IsDisposed) return;
+            if (InvokeRequired)
+            {
+                try { BeginInvoke(new Action(CompletePreparation)); }
+                catch (InvalidOperationException) { }
+                return;
+            }
+            preparingProgress = false;
+            progressText.Text = "Starting MoE4All Agent";
+            progressBar.Style = ProgressBarStyle.Marquee;
+            progressBar.MarqueeAnimationSpeed = 24;
+            status.Text = "Starting";
         }
 
         private void StartAgent()
@@ -467,6 +541,7 @@ internal static class MoE4All
                     return;
                 }
 
+                CompletePreparation();
                 WriteMessage("MoE4All Agent is starting.");
                 Thread readiness = new Thread(WaitForReady);
                 readiness.IsBackground = true;
@@ -567,8 +642,12 @@ internal static class MoE4All
         private void FailUi(string message)
         {
             ready = false;
+            preparingProgress = false;
             status.Text = "Needs attention";
             status.ForeColor = Color.FromArgb(235, 112, 112);
+            progressBar.MarqueeAnimationSpeed = 0;
+            progressBar.Style = ProgressBarStyle.Continuous;
+            progressText.Text = "Startup needs attention";
             startup.Visible = true;
             startup.BringToFront();
             browserButton.Enabled = true;
@@ -604,6 +683,21 @@ internal static class MoE4All
                 dialog.Multiselect = false;
                 dialog.CheckFileExists = true;
                 dialog.InitialDirectory = Directory.Exists(initialDirectory) ? initialDirectory : root;
+                return dialog.ShowDialog(this) == DialogResult.OK ? dialog.FileName : null;
+            }
+        }
+
+        public string PickEngine()
+        {
+            if (InvokeRequired) return (string)Invoke(new Func<string>(PickEngine));
+            using (OpenFileDialog dialog = new OpenFileDialog())
+            {
+                dialog.Title = "Select a MoE4All engine package or infr.exe";
+                dialog.Filter = "MoE4All engine (*.zip;infr.exe)|*.zip;infr.exe|ZIP archive (*.zip)|*.zip|Engine executable (infr.exe)|infr.exe|All files (*.*)|*.*";
+                dialog.Multiselect = false;
+                dialog.CheckFileExists = true;
+                string downloads = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+                dialog.InitialDirectory = Directory.Exists(downloads) ? downloads : root;
                 return dialog.ShowDialog(this) == DialogResult.OK ? dialog.FileName : null;
             }
         }
@@ -693,6 +787,7 @@ internal static class MoE4All
                 string selected;
                 if (path == "/pick-directory") selected = owner.PickDirectory();
                 else if (path == "/pick-model") selected = owner.PickModel(modelDirectory);
+                else if (path == "/pick-engine") selected = owner.PickEngine();
                 else
                 {
                     Respond(stream, 404, "{\"error\":\"not-found\"}");

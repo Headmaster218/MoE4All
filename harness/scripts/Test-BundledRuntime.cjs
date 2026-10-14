@@ -37,6 +37,20 @@ test('streamed runtime payload restores paths over 260 characters and empty dire
   await unpack(harness, archive);
 });
 
+test('runtime payload completes concurrent compressed file writes before marking ready', async (t) => {
+  const harness = path.join(fixture(t), 'harness');
+  const entries = {};
+  for (let index = 0; index < 24; index++) {
+    entries[`files/${index}.txt`] = strToU8(`${index}:` + 'payload-'.repeat(16384));
+  }
+  const archive = payload(harness, entries, 24);
+  let completed = 0;
+  await unpack(harness, archive, { extracted() { completed++; } });
+  assert.equal(completed, 24);
+  assert.equal(fs.readFileSync(native(path.join(harness, 'runtime/dsh/files/23.txt')), 'utf8').startsWith('23:payload-'), true);
+  assert.equal(fs.readFileSync(native(path.join(harness, 'runtime/dsh/.moe4all-payload-ready')), 'utf8').trim(), archive.sha256);
+});
+
 test('runtime payload rejects checksum mismatch, path traversal and duplicate Windows paths', async (t) => {
   const harness = path.join(fixture(t), 'harness');
   let archive = payload(harness, { 'file.txt': strToU8('data') }, 1);

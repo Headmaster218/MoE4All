@@ -1,8 +1,14 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const os = require('node:os');
+const zlib = require('node:zlib');
 const { createRequire } = require('node:module');
-const { Unzip, UnzipInflate } = require('./vendor/fflate.cjs');
+const { Unzip } = require('./vendor/fflate.cjs');
+
+const PROGRESS_PREFIX = '@@MOE4ALL_PROGRESS';
+const extractionConcurrency = Math.max(2, Math.min(8,
+  typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length));
 
 const native = (value) => path.toNamespacedPath(path.resolve(value));
 const exists = (value) => fs.existsSync(native(value));
@@ -26,18 +32,187 @@ async function hashFile(filename) {
   return hash.digest('hex');
 }
 
-async function unpack(harness, archive) {
+function payloadReady(destination, sha256) {
+  const marker = path.join(destination, '.moe4all-payload-ready');
+  return exists(marker) && fs.readFileSync(native(marker), 'utf8').trim() === sha256;
+}
+
+function createProgress(total) {
+  let completed = 0;
+  let lastEmit = 0;
+  let nextLog = 10;
+  const emit = (message, force = false) => {
+    const now = Date.now();
+    if (!force && now - lastEmit < 100) return;
+    lastEmit = now;
+    console.log(`${PROGRESS_PREFIX}\t${completed}\t${total}\t${message}`);
+    const percent = total > 0 ? Math.floor(completed * 100 / total) : 100;
+    if (completed > 0 && (percent >= nextLog || completed === total)) {
+      console.log(`Bundled runtime extraction: ${percent}% (${completed}/${total} files)`);
+      while (nextLog <= percent) nextLog += 10;
+    }
+  };
+  return {
+    begin() { emit('Verifying bundled runtime', true); },
+    extracted() { completed++; emit('Unpacking bundled runtime'); },
+    finish() { completed = total; emit('Bundled runtime ready', true); },
+  };
+}
+
+function createNodeUnzipInflate(decoders, block, unblock) {
+  class NodeUnzipInflate {
+    constructor(name) {
+      this.name = name;
+      this.inputBlocked = false;
+      this.ended = false;
+      this.stream = zlib.createInflateRaw();
+      decoders.set(name, this);
+      this.stream.on('data', (data) => this.ondata(null, data, false));
+      this.stream.once('end', () => {
+        this.ended = true;
+        this.ondata(null, new Uint8Array(), true);
+        decoders.delete(name);
+      });
+      this.stream.once('error', (error) => {
+        this.ended = true;
+        if (this.inputBlocked) { this.inputBlocked = false; unblock(); }
+        decoders.delete(name);
+        this.ondata(error, null, false);
+      });
+    }
+
+    push(chunk, final) {
+      if (this.ended) return;
+      try {
+        if (chunk.length && !this.stream.write(chunk) && !this.inputBlocked) {
+          this.inputBlocked = true;
+          block();
+          this.stream.once('drain', () => {
+            if (!this.inputBlocked) return;
+            this.inputBlocked = false;
+            unblock();
+          });
+        }
+        if (final) this.stream.end();
+      } catch (error) {
+        this.stream.destroy(error);
+      }
+    }
+
+    pause() { this.stream.pause(); }
+    resume() { if (!this.ended) this.stream.resume(); }
+    terminate() {
+      if (this.inputBlocked) { this.inputBlocked = false; unblock(); }
+      this.ended = true;
+      decoders.delete(this.name);
+      this.stream.destroy();
+    }
+  }
+  NodeUnzipInflate.compression = 8;
+  return NodeUnzipInflate;
+}
+
+async function unpack(harness, archive, progress) {
   if (!/^[a-f0-9]{64}$/.test(archive.sha256)) throw new Error('Invalid runtime payload SHA256.');
+  if (!Number.isSafeInteger(archive.files) || archive.files < 0) throw new Error('Invalid runtime payload file count.');
   const source = contained(harness, archive.file);
   const destination = contained(harness, archive.root);
   const marker = path.join(destination, '.moe4all-payload-ready');
-  if (exists(marker) && fs.readFileSync(native(marker), 'utf8').trim() === archive.sha256) return;
+  if (payloadReady(destination, archive.sha256)) return;
   if (await hashFile(source) !== archive.sha256) throw new Error(`Runtime payload SHA256 mismatch: ${archive.file}`);
   mkdir(destination);
   console.log(`Unpacking bundled runtime: ${archive.file}`);
-  const descriptors = new Set();
+  const outputs = new Set();
+  const decoders = new Map();
   const names = new Set();
+  const queue = [];
+  const waiters = [];
   let files = 0;
+  let active = 0;
+  let blocked = 0;
+  let inputFinished = false;
+  let failure;
+  let resolveCompletion;
+  let rejectCompletion;
+  const completion = new Promise((resolve, reject) => {
+    resolveCompletion = resolve;
+    rejectCompletion = reject;
+  });
+  completion.catch(() => {});
+
+  const wake = () => {
+    for (const resolve of waiters.splice(0)) resolve();
+  };
+  const block = () => { blocked++; };
+  const unblock = () => { blocked = Math.max(0, blocked - 1); wake(); };
+  const fail = (error) => {
+    if (failure) return;
+    failure = error instanceof Error ? error : new Error(String(error));
+    rejectCompletion(failure);
+    wake();
+  };
+  const maybeComplete = () => {
+    if (failure || !inputFinished || active || queue.length) return;
+    if (files !== archive.files) fail(new Error(`Runtime payload is incomplete: ${archive.file}`));
+    else resolveCompletion();
+  };
+  const waitForFlow = async () => {
+    while (!failure && (queue.length || blocked)) {
+      await new Promise((resolve) => waiters.push(resolve));
+    }
+    if (failure) throw failure;
+  };
+
+  let pump;
+  const startFile = (file, target) => {
+    active++;
+    mkdir(path.dirname(target));
+    const output = fs.createWriteStream(native(target), { flags: 'w' });
+    outputs.add(output);
+    let outputBlocked = false;
+    const releaseOutputBlock = () => {
+      if (!outputBlocked) return;
+      outputBlocked = false;
+      unblock();
+    };
+    output.once('error', (error) => { releaseOutputBlock(); fail(error); });
+    output.once('close', () => outputs.delete(output));
+    output.once('finish', () => {
+      releaseOutputBlock();
+      active--;
+      files++;
+      if (progress) progress.extracted();
+      pump();
+      wake();
+      maybeComplete();
+    });
+    file.ondata = (error, data, final) => {
+      if (error) { fail(error); return; }
+      if (failure) return;
+      try {
+        if (data.length && !output.write(data) && !outputBlocked) {
+          outputBlocked = true;
+          block();
+          const decoder = decoders.get(file.name);
+          if (decoder) decoder.pause();
+          output.once('drain', () => {
+            releaseOutputBlock();
+            if (decoder) decoder.resume();
+          });
+        }
+        if (final) output.end();
+      } catch (writeError) { fail(writeError); }
+    };
+    try { file.start(); } catch (error) { fail(error); }
+  };
+  pump = () => {
+    while (!failure && active < extractionConcurrency && queue.length) {
+      const { file, target } = queue.shift();
+      startFile(file, target);
+    }
+    wake();
+  };
+
   const unzip = new Unzip((file) => {
     const target = contained(destination, file.name);
     const key = target.toLowerCase();
@@ -45,28 +220,29 @@ async function unpack(harness, archive) {
     names.add(key);
     if (file.name.endsWith('/')) {
       mkdir(target);
-      file.ondata = (error) => { if (error) throw error; };
+      file.ondata = (error) => { if (error) fail(error); };
       file.start();
       return;
     }
-    mkdir(path.dirname(target));
-    const fd = fs.openSync(native(target), 'w');
-    descriptors.add(fd);
-    file.ondata = (error, data, final) => {
-      if (error) throw error;
-      let offset = 0;
-      while (offset < data.length) offset += fs.writeSync(fd, data, offset, data.length - offset);
-      if (final) { fs.closeSync(fd); descriptors.delete(fd); files++; }
-    };
-    file.start();
+    queue.push({ file, target });
+    pump();
   });
-  unzip.register(UnzipInflate);
+  unzip.register(createNodeUnzipInflate(decoders, block, unblock));
   try {
-    for await (const chunk of fs.createReadStream(native(source))) unzip.push(chunk, false);
+    for await (const chunk of fs.createReadStream(native(source))) {
+      await waitForFlow();
+      unzip.push(chunk, false);
+    }
+    await waitForFlow();
     unzip.push(new Uint8Array(), true);
-    if (descriptors.size || files !== archive.files) throw new Error(`Runtime payload is incomplete: ${archive.file}`);
+    inputFinished = true;
+    maybeComplete();
+    await completion;
     write(marker, archive.sha256 + '\n');
-  } finally { for (const fd of descriptors) fs.closeSync(fd); }
+  } finally {
+    for (const decoder of decoders.values()) decoder.terminate();
+    for (const output of outputs) output.destroy();
+  }
 }
 
 function ensureJunction(link, target, allowDirectory = false) {
@@ -264,7 +440,20 @@ async function prepare(install, state) {
   if (exists(payload)) {
     const manifest = readJson(payload);
     if (manifest.schema !== 1 || !Array.isArray(manifest.archives)) throw new Error('Invalid runtime payload manifest.');
-    for (const archive of manifest.archives) await unpack(harness, archive);
+    const pending = manifest.archives.filter((archive) => {
+      if (!/^[a-f0-9]{64}$/.test(archive.sha256)) throw new Error('Invalid runtime payload SHA256.');
+      return !payloadReady(contained(harness, archive.root), archive.sha256);
+    });
+    if (pending.length) {
+      const total = pending.reduce((sum, archive) => {
+        if (!Number.isSafeInteger(archive.files) || archive.files < 0) throw new Error('Invalid runtime payload file count.');
+        return sum + archive.files;
+      }, 0);
+      const progress = createProgress(total);
+      progress.begin();
+      await Promise.all(pending.map((archive) => unpack(harness, archive, progress)));
+      progress.finish();
+    }
   }
   const dsh = restoreLinks(harness);
   prepareProfile(resolvedInstall, previousInstall, harness, resolvedState, dsh);

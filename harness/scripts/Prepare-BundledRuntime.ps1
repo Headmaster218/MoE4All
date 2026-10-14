@@ -11,5 +11,7 @@ $node = Get-ChildItem -LiteralPath (Join-Path $harnessRoot 'runtime') -Directory
     Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
     Select-Object -First 1
 if (-not $node) { throw 'The bundled MoE4All Node runtime is missing.' }
+$workerCount = [Math]::Max(4, [Math]::Min(16, [Environment]::ProcessorCount))
+$env:UV_THREADPOOL_SIZE = [string]$workerCount
 & $node (Join-Path $PSScriptRoot 'Prepare-BundledRuntime.cjs') ([IO.Path]::GetFullPath($InstallRoot)) ([IO.Path]::GetFullPath($StateRoot))
 exit $LASTEXITCODE
