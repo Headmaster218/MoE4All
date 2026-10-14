@@ -288,11 +288,7 @@ fn native_q8_wave32_choice(
     enabled: bool,
 ) -> Option<u32> {
     (dtype == infr_core::DType::Q8_0 && enabled && out_f >= 1024 && in_f.is_multiple_of(32))
-        .then_some(if in_f <= 2560 && out_f < 131072 {
-            4
-        } else {
-            2
-        })
+        .then_some(if in_f <= 2560 && out_f < 131072 { 4 } else { 2 })
 }
 
 /// NUM_ROWS for the reassociation-tolerant subgroup id-indexed decode GEMV

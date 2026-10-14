@@ -256,9 +256,7 @@ impl Drop for Query {
 }
 
 pub(crate) fn group(kernel: &'static str) -> &'static str {
-    if *RAW_ALL_KERNELS
-        .get_or_init(|| std::env::var_os("INFR_TIMELINE_RAW_KERNELS").is_some())
-    {
+    if *RAW_ALL_KERNELS.get_or_init(|| std::env::var_os("INFR_TIMELINE_RAW_KERNELS").is_some()) {
         kernel
     } else if kernel.contains("qsa") || kernel.contains("attention") || kernel.contains("attn") {
         "QSA_completion_interval"
