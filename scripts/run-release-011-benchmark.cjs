@@ -12,6 +12,7 @@ let mode;
 let root;
 let cache;
 
+const submitLayers = process.env.RELEASE_BENCH_SUBMIT_LAYERS || '1';
 const residentSets = [
   'device.vram_budget=24g',
   'device.vram_reserve=0',
@@ -25,7 +26,7 @@ const residentSets = [
   'kernels.vulkan.decode_gpu_resident_immutable_predicates=true',
   'kernels.vulkan.decode_gpu_resident_notice_thread=true',
   'kernels.vulkan.decode_gpu_resident_mapped_journal=true',
-  'kernels.vulkan.decode_gpu_resident_submit_layers=1',
+  `kernels.vulkan.decode_gpu_resident_submit_layers=${submitLayers}`,
   'kernels.vulkan.decode_gpu_resident_inflight=1',
   'kernels.vulkan.decode_gpu_resident_early_recovery=true',
 ];
