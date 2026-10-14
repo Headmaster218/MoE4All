@@ -11,6 +11,9 @@ $fixtureRoot = Join-Path $testRoot ('path with spaces ' + [char]0x4e2d + [char]0
 while ((Join-Path $fixtureRoot 'harness\scripts\Prepare-BundledRuntime.ps1').Length -le 260) {
     $fixtureRoot = Join-Path $fixtureRoot 'segment-segment-segment'
 }
+while ((Join-Path $fixtureRoot 'Microsoft.Web.WebView2.WinForms.dll').Length -le 260) {
+    $fixtureRoot = Join-Path $fixtureRoot 'long'
+}
 $scriptRoot = Join-Path $fixtureRoot 'harness\scripts'
 New-Item -ItemType Directory -Path $scriptRoot, $buildRoot -Force | Out-Null
 $launcher = Join-Path $fixtureRoot 'MoE4All.exe'
@@ -19,8 +22,9 @@ $builtLauncher = Join-Path $buildRoot 'MoE4All.exe'
 foreach ($file in [IO.Directory]::EnumerateFiles($buildRoot)) {
     [IO.File]::Copy($file, (Join-Path $fixtureRoot ([IO.Path]::GetFileName($file))), $true)
 }
-if ((Join-Path $scriptRoot 'Prepare-BundledRuntime.ps1').Length -le 260 -or $launcher.Length -ge 250) {
-    throw 'The launcher fixture does not exercise a script path longer than MAX_PATH.'
+if ((Join-Path $scriptRoot 'Prepare-BundledRuntime.ps1').Length -le 260 -or
+    (Join-Path $fixtureRoot 'Microsoft.Web.WebView2.WinForms.dll').Length -le 260 -or $launcher.Length -ge 250) {
+    throw 'The launcher fixture does not exercise script and managed dependency paths longer than MAX_PATH.'
 }
 if (-not (Test-Path -LiteralPath ($launcher + '.config') -PathType Leaf)) {
     throw 'The launcher .NET configuration was not deployed.'

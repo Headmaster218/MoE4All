@@ -5,6 +5,7 @@ using System.Drawing;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -77,6 +78,15 @@ internal static class MoE4All
         start.CreateNoWindow = true;
         start.EnvironmentVariables.Remove("PSModulePath");
         return start;
+    }
+
+    private static Assembly ResolveBundledManagedAssembly(object sender, ResolveEventArgs arguments)
+    {
+        string name = new AssemblyName(arguments.Name).Name;
+        if (name != "Microsoft.Web.WebView2.Core" && name != "Microsoft.Web.WebView2.WinForms") return null;
+        string filename = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, name + ".dll");
+        if (!File.Exists(filename)) return null;
+        return Assembly.Load(File.ReadAllBytes(filename));
     }
 
     private static void WriteMessage(string message, bool error)
@@ -220,6 +230,7 @@ internal static class MoE4All
     [STAThread]
     private static int Main(string[] arguments)
     {
+        AppDomain.CurrentDomain.AssemblyResolve += ResolveBundledManagedAssembly;
         try
         {
             Console.OutputEncoding = new UTF8Encoding(false);
