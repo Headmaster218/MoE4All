@@ -2,167 +2,105 @@
 
 **让游戏显卡跑起远超显存容量的大模型。AMD、NVIDIA、Intel，均已跑通。**
 
-Windows 免安装，下载约 14 MiB。下载 GGUF、选择自动配置，即可本地聊天，
-或通过 OpenAI 兼容接口接入现有客户端。显存、内存与 SSD 协同加载 MoE 专家权重。
+Windows、Linux 免安装，约 17 MiB 即下即用！选择推荐的模型或自备模型，自动配置参数，即可立即开始聊天，
+或通过 OpenAI 兼容API接入现有客户端。显存、内存与 SSD 三级流动，协同加载权重运行。
 
-**当前源码已支持 Qwen3.5 / Qwen3.6 MoE 真并发 Decode。** 35B Balanced 在 30K
-三路同时生成时总均速为 **112.0 tok/s**，预热后每秒统计中位数为 **115.1 tok/s**；
-150K 下分别为 **49.0 / 49.45 tok/s**。完整条件见[当前源码实测](#当前源码35b-真并发-decode2026-10-12)。
+**1.0.0 性能参考**：Win 11 + RX 7900 XTX 24 GiB + Ryzen 5 5600X + 64 GiB DDR4，
+自动激进配置，Q8 K/V，关闭 MTP 与 CPU miss。速度单位均为 tok/s。
 
-**0.10.0 最快分段速度参考**：RX 7900 XTX 24 GiB + Ryzen 5 5600X + 64 GiB DDR4，自动激进配置。
-Flash-Next 4.27bpw 在 30K 下单路 Prefill 为 **1,414.3 tok/s**，三路 Decode 为 **65.5 tok/s**；
-35B Balanced 在 30K 下单路 Decode 为 **63.6 tok/s**。
-MTP / CPU miss 关闭，配置三个槽位。以下取 2026-10-09 实测前 / 中 / 后三段中最快一段的平均速度，单位 tok/s；统计口径见[实测结果](#实测结果)。
+| 模型 | 30K 单路 Prefill | 30K Decode 总均速 x1 / x2 / x3 | 150K 单路 Prefill | 150K Decode 总均速 x1 / x2 / x3 |
+| --- | ---: | ---: | ---: | ---: |
+| Flash-Next 4.27bpw | **1,414.75** | **50.44 / 66.19 / 71.20** | **1,445.50** | **44.16 / 49.50 / 45.47** |
+| Qwen3.6 35B Balanced | **2,749.06** | **80.49 / 118.34 / 110.78** | **1,169.40** | **41.91 / 50.87 / 49.27** |
 
-| 模型 | 同时生成路数 | 30K Prefill  | 30K Decode  | 150K Prefill  | 150K Decode  |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Flash-Next 4.27bpw | 1 | 1,414.3 | **45.3** | 1,358.2 | **41.5** |
-| Flash-Next 4.27bpw | 2 | 1,335.0 | **63.3** | 1,353.4 | **55.7** |
-| Flash-Next 4.27bpw | 3 | 1,302.4 | **65.5** | 1,303.6 | **46.7** |
-| 35B Balanced | 1 | 3,254.9 | **63.6** | 1,829.5 | **36.0** |
+<sub>Decode 为 1 / 2 / 3 路同时生成时的总平均吞吐；Prefill 为单路完整区间平均速度。完整条件见 [1.0.0 实测](#10030k--150k-平均性能2026-10-14)。</sub>
 
-<sub>各统计区间按时间三等分，取三段中最高的平均速度。Decode 分段值为三轮均值；Prefill 分段速度由 chunk 完成进度插值估算。</sub>
+**同机 Strata v0.1.44.1 参考**：使用其自动配置、不启用 MTP；`x2` 为两路总吞吐。
+
+| 模型 | 30K 单路 Prefill | 30K Decode x1 / x2 | 150K 单路 Prefill | 150K Decode x1 |
+| --- | ---: | ---: | ---: | ---: |
+| Flash-Next 4.27bpw | 576.15 | 30.17 / 48.14 | 650.01 | 36.52 |
+| Qwen3.6 35B Balanced | 1,325.32 | 19.37 / 未支持 | 436.51 | 11.00 |
+
+<sub>这是同一台机器上的方向性对照，兼容转换和测试差异见 [Strata 对照说明](#strata-v01441-同机对照2026-10-15)。</sub>
 
 [下载已发布的 Windows 版本](https://github.com/Headmaster218/MoE4All/releases/latest) |
 [快速使用](#快速使用) |
 [实测结果](#实测结果) |
 [社区实测](#社区实测) |
 [English](README_EN.md) |
-[技术文档](documentation/README.md)
+[技术文档](documentation/README.md) |
+[低权重专家跳过实验](documentation/evidence/campaigns/qwen38/2026-10-11-low-weight-expert-omission.md) |
+[专家缓存与多卡配比](documentation/evidence/benchmarks/2026-10-11-flashnext-expert-cache-capacity.md)
 
 ## 快速使用
 
 ### 1. 下载程序
 
 打开 [MoE4All Releases](https://github.com/Headmaster218/MoE4All/releases)，
-下载对应版本的 `MoE4All-Windows-x86_64-v*.zip`。本页面向 **0.10.0**，
-性能表的测试条件与来源见下方实测结果。
+Windows 下载 `MoE4All-Windows-x86_64-v*.zip`，Linux x86_64 下载对应的
+`.tar.gz` 发行包。
 
 
 ### 2. 解压
 
-将 ZIP **完整解压**到一个目录，例如 `D:\MoE4All`。
+将发行包**完整解压**到一个目录，例如 Windows 的 `D:\MoE4All`。
 
-### 3. 下载 GGUF 模型
+### 3. 运行
 
-推荐以下模型与组件，模型单独下载到本地 SSD。
+1. Windows 双击 **`Start-INFR-Wizard.cmd`**；Linux 运行 `bash Start-INFR-Wizard-Linux.sh`。
+2. 选择“终端聊天”或“OpenAI 兼容 API”。模型列表先显示本地已保存模型，下面的 `D` 是下载入口；进入后可自行选择一个或多个主模型、视觉或 Embedding 组件。下载完成后会回到本地模型列表，不会替用户默认选定某个模型。Windows 也可将已有 GGUF 拖入窗口后按 Enter。
+3. 选择运行设备与自动配置档位。**激进性能**是本页实测使用的档位；**保守**适合首次试运行或后台程序较多时使用。
+4. API 模式可按需启用视觉和 Embedding；对应路径提示也可进入下载。设置并发、上下文和 API 后确认启动。
+
+Windows 与 Linux 自动下载都会显示进度，失败重试并从 `.part` 文件续传，文件统一保存在安装目录的 `models`。Linux 向导不依赖 Python 或 jq，下载优先使用系统现有的 curl/wget；两者都缺失时，只在交互确认后通过 apt、dnf、yum、zypper、pacman 或 apk 安装 curl。自动档默认使用 Q8 K/V，显存、内存、专家缓存与 Ubatch 由引擎规划。终端聊天当前为纯文本；图片请通过启用视觉的 OpenAI 兼容 API 发送。
+
+组合能力和限制见[模型能力矩阵](documentation/reference/model-capabilities.md)。API 默认地址为 `http://127.0.0.1:8080/v1`；请求示例见[API 使用](documentation/guide/serving/api-quickstart.md)，完整配置项见[配置参考](documentation/reference/configuration.md)。
+
+## 推荐模型与下载
+
+Windows 与 Linux 启动向导都可从统一下载菜单选择一个或多个下列主模型和组件，也可使用链接自行下载到本地 SSD。自动下载统一保存到解压目录的 `models` 文件夹。
 
 | 模型 / 组件 | 下载链接 | 文件与用途 |
 | --- | --- | --- |
 | **Qwen3.6 35B 本体** | [下载 APEX-I-Balanced](https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/resolve/main/Qwen3.6-35B-A3B-APEX-I-Balanced.gguf?download=true) | `Qwen3.6-35B-A3B-APEX-I-Balanced.gguf`；35B 下载这一个文件即可 |
-| **Flash-Next 主模型** | [下载 AD-4.27bpw-Q4_K_M-M64 全部分片](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/tree/main/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64) | 该目录下的 **33 个 GGUF 分片**，全部放在同一文件夹 |
-| **Flash-Next 视觉** | [下载 F16 视觉文件](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/mmproj-Qwen3.8-Flash-Next-F16.gguf?download=true) | `mmproj-Qwen3.8-Flash-Next-F16.gguf`；图片理解时加载 |
-| **Flash-Next MTP** | [下载 shared Q4_K_M MTP 头](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf?download=true) | `mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf`；可选的文本加速组件 |
+| **Flash-Next 主模型** | [下载 AD-4.27bpw-Q4_K_M-M64 全部分片](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/tree/main/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64) | 该目录下的 **33 个 GGUF 分片**，全部放在同一文件夹；启动时选择第一片 |
+| **Flash-Next 视觉** | [下载 F16 视觉文件](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/mmproj-Qwen3.8-Flash-Next-F16.gguf?download=true) | `mmproj-Qwen3.8-Flash-Next-F16.gguf`；API 图片理解时加载 |
+| **Qwen3 Embedding 0.6B** | [下载 Q8_0 GGUF](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf?download=true) | `Qwen3-Embedding-0.6B-Q8_0.gguf`；提供 `/v1/embeddings` |
 
-Flash-Next 启动时选择第一片：`Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00033.gguf`。
-视觉与 MTP 文件可放在主模型目录，在向导中按用途选择。
+Flash-Next 第一片为 `Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00033.gguf`。视觉文件会自动放到同一模型目录，便于向导发现。
 
-### 4. 运行
-
-1. 双击解压目录中的 **`Start-INFR-Wizard.cmd`**。
-2. 选择“终端聊天”或“OpenAI 兼容 API”，将主模型 GGUF 拖入窗口，按 Enter。
-3. 按需选择 MTP、视觉和 Embedding，选择运行设备及自动配置档位：**激进性能**是本页实测使用的档位；**保守**适合首次试运行或后台程序较多时使用。
-4. 设置并发、上下文和 API，确认启动。复现实测时，配置三个槽位，上下文设置 `163840`，关闭 MTP 与实验性 CPU 计算。
-
-
-
-自动档默认使用 Q8 K/V，显存、内存、专家缓存与 Ubatch 由引擎规划。
-35B 加载本体即可聊天。Flash-Next 的可选组件如下：
-
-- **文本 MTP 加速**：启用“Qwen3.8 MTP 加速”，选择上表的 MTP 头，使用 greedy（`temperature=0`）。
-  双槽机会式 MTP 在仅一路活跃时使用 MTP，两路同时 Decode 时自动回退普通批量 Decode。
-- **图片理解**：选择 API 模式，启用“视觉图片理解”，选择上表的 F16 视觉文件；可与 MTP 组合。
-
-组合能力和限制见[模型能力矩阵](documentation/reference/model-capabilities.md)。API 默认地址为 `http://127.0.0.1:8080/v1`；请求示例见[API 使用](documentation/guide/serving/api-quickstart.md)，完整配置项见[配置参考](documentation/reference/configuration.md)。
-
-## 从源码构建（Linux）
-
-Linux x86_64 实验性发行包与 Windows 同版发包，欢迎试用反馈；首次 CI 验证完成前仍建议从源码构建。
-发布页提供 `.tar.gz` 后可直接解压，运行包内 `Start-INFR-Wizard-Linux.sh`，无需 Rust 或 glslc。
-以下源码安装命令适用于 Ubuntu 26.04；
-其他发行版请先准备 shaderc 2025 或更新的 `glslc`：
-
-```sh
-sudo apt-get update && sudo apt-get install -y glslc
-git clone https://github.com/Headmaster218/MoE4All.git && cd MoE4All
-cargo build --release --locked -p infr-cli
-./Start-INFR-Wizard-Linux.sh      # 交互式启动；加 --dry-run 只打印命令
-```
-
-需要 Rust 1.97.1（`rust-toolchain.toml` 会自动安装）与 shaderc 2025 及以上的
-`glslc`。完整指南见 [在 Linux 上构建并运行](documentation/guide/linux-build-and-run.md)，
-工具链与平台细节见 [从源码构建](documentation/development/building-from-source.md)。
 
 ## 实测结果
 
-### 当前源码：35B 真并发 Decode（2026-10-12）
+### 1.0.0：30K / 150K 平均性能（2026-10-14）
 
-代码提交 `25e6d1944` 将 Qwen3.5 / Qwen3.6 MoE 接入层同步批量 Decode；不同会话的
-KV、Gated DeltaNet 状态与采样器保持独立。长 Prefill 仍按槽依次完成，全部就绪后
-才进入同一张多行 Decode 图。
+测试硬件为 RX 7900 XTX 24 GiB、Ryzen 5 5600X、64 GiB DDR4、Windows 11。
+使用自动激进配置、Q8 K/V、`ctx=163840`，关闭 MTP 与 CPU miss。Decode 分别同时
+占用 1 / 2 / 3 个槽位，数值为所有活跃路合计的完整区间平均吞吐；Prefill 为单路平均速度。
 
-测试硬件为 RX 7900 XTX 24 GiB、Ryzen 5 5600X、64 GiB DDR4、Windows 11；
-模型为 `Qwen3.6-35B-A3B-APEX-I-Balanced`。使用自动激进配置、Q8 K/V、
-`ctx=163840`、三个槽位、`temperature=0`，关闭思考、MTP 与 CPU miss offload。
-单路和双路各运行两轮、每路生成 256 token；三路运行一轮、每路生成 512 token。
+| 模型 | 输入长度 | 单路 Prefill | Decode x1 总均速 | Decode x2 总均速 | Decode x3 总均速 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash-Next 4.27bpw | 30K | **1,414.75** | **50.44** | **66.19** | **71.20** |
+| Flash-Next 4.27bpw | 150K | **1,445.50** | **44.16** | **49.50** | **45.47** |
+| Qwen3.6 35B Balanced | 30K | **2,749.06** | **80.49** | **118.34** | **110.78** |
+| Qwen3.6 35B Balanced | 150K | **1,169.40** | **41.91** | **50.87** | **49.27** |
 
-| 每路输入 | 同时生成路数 | Decode 总均速 | Decode 每路 | 说明 |
-| --- | ---: | ---: | ---: | --- |
-| 30K | 1 | **58.7–66.6** | 58.7–66.6 | 两轮范围 |
-| 30K | 2 | **90.1–97.4** | 45.0–48.7 | 两轮范围 |
-| 30K | 3 | **112.0** | 37.35 | 预热后总速中位数 115.1，范围 110.3–117.2 |
-| 150K | 1 | **33.3–36.8** | 33.3–36.8 | 两轮范围 |
-| 150K | 2 | **45.1–46.2** | 22.5–23.1 | 两轮范围 |
-| 150K | 3 | **49.0** | 16.33 | 预热后总速中位数 49.45，范围 46.4–51.8 |
+### Strata v0.1.44.1 同机对照（2026-10-15）
 
-三路测试中，各路 512-token Decode 的完成时间在 30K 下相差约 2.4 ms、在 150K
-下相差约 9.7 ms；全部请求成功。预热后数据剔除了 Decode 刚开始的两个不完整一秒
-统计区间。由于长 Prefill 按槽串行，API 为单个请求显示的 Prefill 时间包含等待其他
-槽位的时间，不能视为单槽 Prefill 吞吐。
+本次额外在同一台 RX 7900 XTX / Ryzen 5 5600X / 64 GiB Windows 主机上运行 Strata 官方 v0.1.44.1 HIP 发行版。使用 `ctx=163840`、INT8 K/V，以及 Strata 的自动 expert-cache 和 Prefill 策略；关闭 prompt cache，不使用 MTP。每项先预热，再记录完整 Prefill 和较长 Decode 区间。
 
-### 0.10.0：30K / 150K 实测
+| 模型 | 输入长度 | 单路 Prefill | Decode x1 均速 | Decode x2 总均速 | 备注 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Flash-Next 4.27bpw | 30K | 576.15 | 30.17 | 48.14 | 双路为同步重叠区间总吞吐 |
+| Flash-Next 4.27bpw | 150K | 650.01 | 36.52 | 未测试 | Decode 前 / 中 / 后为 21.28 / 40.88 / 45.71 |
+| Qwen3.6 35B Balanced | 30K | 1,325.32 | 19.37 | 当前构建不支持 | Prefill 为预热后三轮中位数；Decode 范围 18.51–21.61 |
+| Qwen3.6 35B Balanced | 150K | 436.51 | 11.00 | 当前构建不支持 | 一次完整 Prefill，随后生成 512 token |
 
-测试于 **2026-10-09**，使用 0.10.0 通用 x86-64 发布构建，代码提交 `53afa86f3`。
-硬件为 RX 7900 XTX 24 GiB、Ryzen 5 5600X、64 GiB DDR4、Windows 11；
-模型为 `Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64` 与 `Qwen3.6-35B-A3B-APEX-I-Balanced`。
-使用自动激进配置、Q8 K/V、`ctx=163840`，配置三个槽位，分别同时占用 1 / 2 / 3 槽；
-**MTP 与 CPU miss 均关闭**，采样与思考使用模型默认。视觉与 Embedding API 已启用，
-下表使用纯文本请求，各路为不同的长技术背景加普通问题。
+为让模型被该版本 Strata 接受，Flash-Next 的 363 个固定投影张量转换为 BF16；35B 补充了兼容 metadata，并将 60 个很小的 GDN alpha/beta 状态张量从 Q6_K 转为 F32。两者的 routed expert 量化均未改变，原模型文件也未修改，但固定权重已不再逐位一致，因此这些数字只能作为方向性对照。
 
-每组重新启动服务，首轮全冷 Prefill，随后两轮复用 KV；每轮每路生成 768 token。
-速度单位均为 tok/s。Prefill 为首次进度采样至最后一路完成 Prefill 的组吞吐，
-不含首次采样前的启动时间，也不是各路速度相加。Decode 为所有路同时 Decode 区间的三轮均值，
-不把等待其他请求 Prefill 的时间算成解码降速；“每路约”为总均速除以路数。
-峰值为 1.5 秒滚动窗口最大值；Prefill 的峰值与分段速度由 chunk 完成进度插值估算，
-不代表精确的瞬时 GPU 速度。
+Strata 自动模式为完整专家分配约 47.17 GiB Host arena；Flash-Next 单路另使用约 13 GiB GPU expert cache，miss 可在 CPU 计算或经 PCIe 搬运。测试时 Windows 总提交量接近 95 GiB，且 Strata 没有套用 MoE4All 的 48 GiB 进程总 RAM 预算。其混合 CPU/GPU 路径在更强 CPU 上可能表现不同。两边测试 prompt、固定权重格式、内存策略和统计脚本并不完全一致，不能把差值归因于某一个 kernel 或单项设计。
 
-| 模型 | 每路输入 | 同时生成路数 | 冷 Prefill 均速 / 峰值 | Decode 总均速 / 峰值 | Decode 每路约 |
-| --- | --- | ---: | ---: | ---: | ---: |
-| Flash-Next 4.27bpw | 30K | 1 | 1,280.4 / 1,439.4 | **42.8** / 47.7 | 42.8 |
-| Flash-Next 4.27bpw | 30K | 2 | 1,288.2 / 1,445.2 | **60.7** / 71.3 | 30.3 |
-| Flash-Next 4.27bpw | 30K | 3 | 1,283.9 / 1,437.0 | **64.0** / 79.4 | 21.3 |
-| Flash-Next 4.27bpw | 150K | 1 | 1,307.5 / 1,444.6 | **39.4** / 44.7 | 39.4 |
-| Flash-Next 4.27bpw | 150K | 2 | 1,301.9 / 1,446.3 | **52.8** / 63.6 | 26.4 |
-| Flash-Next 4.27bpw | 150K | 3 | 1,228.3 / 1,434.2 | **45.4** / 62.5 | 15.1 |
-| 35B Balanced | 30K | 1 | 2,579.9 / 3,824.8 | **63.2** / 65.4 | 63.2 |
-| 35B Balanced | 150K | 1 | 1,164.9 / 3,981.7 | **35.9** / 36.7 | 35.9 |
-
-前 / 中 / 后段按各自统计区间的时间三等分；Decode 分段值同样是三轮均值。
-
-| 模型 | 每路输入 | 同时生成路数 | Prefill 前 / 中 / 后 | Decode 总速前 / 中 / 后 |
-| --- | --- | ---: | ---: | ---: |
-| Flash-Next 4.27bpw | 30K | 1 | 1,225.1 / 1,414.3 / 1,201.9 | 40.8 / 42.2 / 45.3 |
-| Flash-Next 4.27bpw | 30K | 2 | 1,315.6 / 1,214.0 / 1,335.0 | 58.5 / 63.3 / 60.2 |
-| Flash-Next 4.27bpw | 30K | 3 | 1,302.4 / 1,285.8 / 1,263.3 | 65.5 / 62.6 / 63.8 |
-| Flash-Next 4.27bpw | 150K | 1 | 1,358.2 / 1,345.7 / 1,218.8 | 36.3 / 40.4 / 41.5 |
-| Flash-Next 4.27bpw | 150K | 2 | 1,353.4 / 1,281.4 / 1,270.8 | 50.3 / 55.7 / 52.4 |
-| Flash-Next 4.27bpw | 150K | 3 | 1,303.6 / 1,263.0 / 1,118.3 | 44.0 / 46.7 / 45.4 |
-| 35B Balanced | 30K | 1 | 3,254.9 / 2,797.3 / 1,687.6 | 63.6 / 62.6 / 63.4 |
-| 35B Balanced | 150K | 1 | 1,829.5 / 968.9 / 696.4 | 35.8 / 36.0 / 35.8 |
-
-Flash-Next 在 150K 下三路总速低于双路，并发收益不是线性的。
-本轮完整矩阵共 36 轮、72 路生成，无请求失败，后两轮均命中预期 KV。
-Flash-Next 测试期间 Windows 提交额度余量较小，也可能影响复测速度。
 ## 社区实测
 
 **AMD、NVIDIA RTX 和 Intel Arc 均已有用户实测，具体配置与速度如下。**
@@ -197,7 +135,7 @@ Flash-Next 测试期间 Windows 提交额度余量较小，也可能影响复测
 - **会话持久化**：可选的 SSD 缓存能转存空闲文本 K/V，并在服务重启后恢复。
 - **长上下文**：支持量化 KV Cache、KV 溢出和长上下文性能测试。
 - **Qwen3.8 MTP**：可选的单路与双槽机会式投机解码，收益取决于草稿接受率，
-  使用方式见[快速使用](#快速使用)。
+  当前保留为手动 CLI / 配置功能，不在 Windows 发行版启动向导中提供。
 - **实验性 CPU miss 计算**：默认关闭，支持 AVX2 + FMA3 CPU；Ryzen 5 5600X 使用
   4 核处理 1 miss 时，端到端速度与 GPU 路径基本相同，更强 CPU 可能提速，需本机实测。
 - **可测量、可调试**：内置 prefill/decode benchmark、synthetic depth 和分页
@@ -241,6 +179,8 @@ Vulkan GPU 计算
 prefill 与 decode 切换时可以重新分配弹性空间。
 
 更深入的实现说明见[技术文档索引](documentation/README.md)；历史优化和取舍见[变化记录](documentation/evidence/changes/README.md)。
+
+专家缓存留多少显存才够、多张不同 PCIe 带宽的显卡该怎样分层？参见 [FlashNext 专家缓存与多卡配比](documentation/evidence/benchmarks/2026-10-11-flashnext-expert-cache-capacity.md)：包含真实访问序列的 0.5～48 GiB 离线回放曲线、连续分段指数函数，以及基于曲线的多卡层数分配公式和适用限制。
 
 
 ## 项目与署名

@@ -2,94 +2,97 @@
 
 **Run models far larger than VRAM on gaming GPUs. AMD, NVIDIA, and Intel are all working.**
 
-The portable Windows download is about 14 MiB. Download a GGUF, choose automatic
-configuration, and start local chat or an OpenAI-compatible API. MoE expert
-weights are coordinated across VRAM, system RAM, and SSD.
+The portable Windows and Linux packages are about 17 MiB and require no installation.
+Choose a recommended model or bring your own GGUF, select an automatic profile, and
+start terminal chat or an OpenAI-compatible API. Weights move across VRAM, system
+RAM, and SSD under one memory plan.
 
-**The current source build supports true parallel Decode for Qwen3.5 / Qwen3.6
-MoE.** With three active 35B Balanced streams, total Decode is **112.0 tok/s**
-at 30K, with a **115.1 tok/s** median after warm-up; at 150K the corresponding
-results are **49.0 / 49.45 tok/s**. See the [current-source measurements](#current-source-35b-true-parallel-decode-2026-10-12) for conditions.
+**1.0.0 performance reference:** RX 7900 XTX 24 GiB, Ryzen 5 5600X, 64 GiB
+DDR4, automatic aggressive profile, Q8 K/V, with MTP and CPU miss offload disabled.
+All speeds are tok/s.
 
-**0.10.0 fastest-third speed reference:** RX 7900 XTX 24 GiB, Ryzen 5 5600X, 64 GiB
-DDR4, automatic aggressive profile. At 30K, Flash-Next 4.27bpw reaches
-**1,414.3 tok/s Prefill** with one active stream and
-**65.5 tok/s total Decode** with three active streams;
-35B Balanced reaches **63.6 tok/s Decode** with one active stream at 30K.
-Three configured slots, MTP and CPU miss offload disabled.
-The table takes the highest average speed among the front, middle, and late thirds measured on 2026-10-09, in tok/s; see
-[Measured results](#measured-results) for measurement definitions.
+| Model | 30K single-stream Prefill | 30K total Decode mean x1 / x2 / x3 | 150K single-stream Prefill | 150K total Decode mean x1 / x2 / x3 |
+| --- | ---: | ---: | ---: | ---: |
+| Flash-Next 4.27bpw | **1,414.75** | **50.44 / 66.19 / 71.20** | **1,445.50** | **44.16 / 49.50 / 45.47** |
+| Qwen3.6 35B Balanced | **2,749.06** | **80.49 / 118.34 / 110.78** | **1,169.40** | **41.91 / 50.87 / 49.27** |
 
-| Model | Active streams | 30K Prefill | 30K Decode | 150K Prefill | 150K Decode |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Flash-Next 4.27bpw | 1 | 1,414.3 | **45.3** | 1,358.2 | **41.5** |
-| Flash-Next 4.27bpw | 2 | 1,335.0 | **63.3** | 1,353.4 | **55.7** |
-| Flash-Next 4.27bpw | 3 | 1,302.4 | **65.5** | 1,303.6 | **46.7** |
-| 35B Balanced | 1 | 3,254.9 | **63.6** | 1,829.5 | **36.0** |
+<sub>Decode is aggregate mean throughput with 1 / 2 / 3 simultaneously active streams, not per-stream speed. Prefill is the full-interval single-stream mean. See the [1.0.0 measurements](#100-30k--150k-mean-performance-2026-10-14) for conditions.</sub>
 
-<sub>Each measured interval is split into equal wall-time thirds; values are the highest third's average. Decode thirds average three rounds; Prefill thirds interpolate completed-chunk progress.</sub>
+**Same-host Strata v0.1.44.1 reference:** automatic configuration, without MTP;
+`x2` is aggregate throughput for two streams.
+
+| Model | 30K single-stream Prefill | 30K Decode x1 / x2 | 150K single-stream Prefill | 150K Decode x1 |
+| --- | ---: | ---: | ---: | ---: |
+| Flash-Next 4.27bpw | 576.15 | 30.17 / 48.14 | 650.01 | 36.52 |
+| Qwen3.6 35B Balanced | 1,325.32 | 19.37 / unsupported | 436.51 | 11.00 |
+
+<sub>This is a directional same-host reference, not a strict same-weights, same-memory, same-harness engine A/B. See the [Strata comparison notes](#same-host-strata-v01441-comparison-2026-10-15) for compatibility conversions and methodological differences.</sub>
 
 [Released Windows builds](https://github.com/Headmaster218/MoE4All/releases/latest) |
 [Quick start](#quick-start) |
 [Measured results](#measured-results) |
 [Community results](#community-results) |
 [简体中文](README.md) |
-[Technical documentation](documentation/README.md)
+[Technical documentation](documentation/README.md) |
+[Low-weight expert omission experiment (Chinese)](documentation/evidence/campaigns/qwen38/2026-10-11-low-weight-expert-omission.md) |
+[Expert cache and multi-GPU split (Chinese)](documentation/evidence/benchmarks/2026-10-11-flashnext-expert-cache-capacity.md)
 
 ## Quick start
 
 ### 1. Download the program
 
 Open [MoE4All Releases](https://github.com/Headmaster218/MoE4All/releases) and
-download the matching `MoE4All-Windows-x86_64-v*.zip`. This page covers
-**0.10.0**; the results below describe the test conditions and provenance of
-the performance tables.
+download `MoE4All-Windows-x86_64-v*.zip` on Windows or the matching `.tar.gz`
+package on Linux x86_64. This page covers **1.0.0**; the results below describe
+the test conditions and provenance of the performance tables.
 
 ### 2. Extract it
 
-Fully extract the ZIP into a directory such as `D:\MoE4All`.
+Fully extract the package into a directory such as `D:\MoE4All` on Windows.
 
-### 3. Download a GGUF model
+### 3. Run
 
-The following models and components are recommended. Store the model files on
-a local SSD.
+1. On Windows, double-click **`Start-INFR-Wizard.cmd`**. On Linux, run
+   `bash Start-INFR-Wizard-Linux.sh`.
+2. Choose terminal chat or the OpenAI-compatible API. The model list shows local
+   models first and a `D` download entry below them. Open it to select one or more
+   main models, Vision projectors, or Embedding models yourself. The wizard returns
+   to local model selection after downloading and never chooses one model for you.
+   On Windows, you can also drag an existing GGUF into the window and press Enter.
+3. Select a device and automatic profile. **Aggressive performance** is used for
+   the published results; **conservative** leaves more headroom for a first run or
+   other active workloads.
+4. API mode can optionally enable Vision and Embedding. Their path prompts also
+   provide download access. Set concurrency, context, and API options and confirm launch.
+
+Windows and Linux downloads show progress, retry failures, resume from `.part`
+files, and store content in the package-local `models` directory. The Linux wizard
+does not require Python or jq and uses an existing curl or wget. If both are absent,
+it offers to install curl through apt, dnf, yum, zypper, pacman, or apk only after
+interactive confirmation. Automatic profiles use Q8 K/V by default and plan VRAM,
+system RAM, expert cache, and Ubatch. Terminal chat is currently text-only; send
+images through an OpenAI-compatible API server started with Vision enabled.
+
+See the [capability matrix](documentation/reference/model-capabilities.md) for combination limits. The default API base URL is `http://127.0.0.1:8080/v1`. See the [API guide](documentation/guide/serving/api-quickstart.md) and the
+[configuration reference](documentation/reference/configuration.md) for all available settings.
+
+## Recommended models and downloads
+
+The Windows and Linux launch wizards expose one download menu where you can select
+one or more of these models and components. You can also use the links below and
+store them on a local SSD. Automatic downloads are placed in the `models` directory
+beside the launcher.
 
 | Model / component | Download | File and purpose |
 | --- | --- | --- |
 | **Qwen3.6 35B model** | [Download APEX-I-Balanced](https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/resolve/main/Qwen3.6-35B-A3B-APEX-I-Balanced.gguf?download=true) | `Qwen3.6-35B-A3B-APEX-I-Balanced.gguf`; this single file is sufficient for the 35B model |
-| **Flash-Next main model** | [Download all AD-4.27bpw-Q4_K_M-M64 shards](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/tree/main/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64) | Download all **33 GGUF shards** from this directory into one folder |
-| **Flash-Next vision** | [Download the F16 vision projector](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/mmproj-Qwen3.8-Flash-Next-F16.gguf?download=true) | `mmproj-Qwen3.8-Flash-Next-F16.gguf`; load it for image understanding |
-| **Flash-Next MTP** | [Download the shared Q4_K_M MTP head](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf?download=true) | `mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf`; an optional text-acceleration component |
+| **Flash-Next main model** | [Download all AD-4.27bpw-Q4_K_M-M64 shards](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/tree/main/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64) | Download all **33 GGUF shards** into one folder and select the first shard at launch |
+| **Flash-Next vision** | [Download the F16 vision projector](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/mmproj-Qwen3.8-Flash-Next-F16.gguf?download=true) | `mmproj-Qwen3.8-Flash-Next-F16.gguf`; loaded for API image understanding |
+| **Qwen3 Embedding 0.6B** | [Download the Q8_0 GGUF](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf?download=true) | `Qwen3-Embedding-0.6B-Q8_0.gguf`; serves `/v1/embeddings` |
 
-For Flash-Next, select the first shard when launching:
-`Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00033.gguf`.
-The vision and MTP files can be placed beside the main-model shards and selected
-for their respective modes in the wizard.
-
-### 4. Run
-
-1. Double-click **`Start-INFR-Wizard.cmd`** in the extracted directory.
-2. Choose terminal chat or the OpenAI-compatible API, drag the main-model GGUF
-   into the prompt, and press Enter.
-3. Select optional MTP, vision, and Embedding components, then the device and
-   profile. **Aggressive performance** is used for these results; **conservative**
-   provides more headroom for a first run or other active workloads.
-4. Set concurrency, context, and API options, then confirm launch. To reproduce
-   these measurements, configure three slots and `ctx=163840`, with MTP and
-   experimental CPU offload disabled.
-
-Automatic profiles use Q8 K/V by default and plan VRAM, system RAM, expert
-cache, and Ubatch. The 35B model is ready for chat with its main GGUF alone.
-Flash-Next has these optional components:
-
-- **MTP text acceleration:** enable "Qwen3.8 MTP acceleration," select the head
-  above, and use greedy decoding (`temperature=0`). Two-slot opportunistic MTP
-  uses MTP with one active stream and ordinary batched Decode when both are active.
-- **Image understanding:** choose API mode, enable vision, and select the F16
-  projector above. Vision and MTP can be used together.
-
-See the [capability matrix](documentation/reference/model-capabilities.md) for combination limits. The default API base URL is `http://127.0.0.1:8080/v1`. See the [API guide](documentation/guide/serving/api-quickstart.md) and the
-[configuration reference](documentation/reference/configuration.md) for all available settings.
+The first Flash-Next shard is
+`Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00033.gguf`. The automatic
+Vision download is placed in the same model directory for discovery by the wizard.
 
 ## Build from source (Linux)
 
@@ -113,6 +116,54 @@ and platform details are in
 [Building from source](documentation/development/building-from-source.md).
 
 ## Measured results
+
+### 1.0.0: 30K / 150K mean performance (2026-10-14)
+
+Hardware: RX 7900 XTX 24 GiB, Ryzen 5 5600X, 64 GiB DDR4, and Windows 11.
+Configuration: automatic aggressive, Q8 K/V, `ctx=163840`, with MTP and CPU miss
+offload disabled. Decode uses 1 / 2 / 3 simultaneously active slots and reports
+aggregate full-interval mean throughput. Prefill reports the single-stream mean.
+
+| Model | Input length | Single-stream Prefill | Decode x1 total mean | Decode x2 total mean | Decode x3 total mean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash-Next 4.27bpw | 30K | **1,414.75** | **50.44** | **66.19** | **71.20** |
+| Flash-Next 4.27bpw | 150K | **1,445.50** | **44.16** | **49.50** | **45.47** |
+| Qwen3.6 35B Balanced | 30K | **2,749.06** | **80.49** | **118.34** | **110.78** |
+| Qwen3.6 35B Balanced | 150K | **1,169.40** | **41.91** | **50.87** | **49.27** |
+
+### Same-host Strata v0.1.44.1 comparison (2026-10-15)
+
+Strata's official v0.1.44.1 Windows HIP build was run on the same RX 7900 XTX,
+Ryzen 5 5600X, 64 GiB Windows host. It used `ctx=163840`, INT8 K/V, automatic
+expert-cache and Prefill settings, prompt cache off, and no MTP. Each case was
+warmed before recording full Prefill and a sustained Decode interval.
+
+| Model | Input length | Single-stream Prefill | Decode x1 mean | Decode x2 total mean | Notes |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Flash-Next 4.27bpw | 30K | 576.15 | 30.17 | 48.14 | x2 is aggregate throughput during the synchronized overlap |
+| Flash-Next 4.27bpw | 150K | 650.01 | 36.52 | Not tested | Decode front / middle / late: 21.28 / 40.88 / 45.71 |
+| Qwen3.6 35B Balanced | 30K | 1,325.32 | 19.37 | Unsupported by this build | Prefill is the median of three post-warmup runs; Decode range 18.51-21.61 |
+| Qwen3.6 35B Balanced | 150K | 436.51 | 11.00 | Unsupported by this build | One complete Prefill followed by a 512-token Decode |
+
+Compatibility changes were required for this Strata build. The Flash-Next copy
+converted 363 fixed projection tensors to BF16. The 35B copy added compatibility
+metadata and converted 60 small GDN alpha/beta state tensors from Q6_K to F32.
+Routed-expert quantization was unchanged and the original model files were left
+untouched, but the fixed weights are not bit-identical, so this is directional
+rather than a strict engine A/B.
+
+Strata automatic mode allocated about 47.17 GiB for its full host expert arena;
+the single-stream Flash-Next run also used about 13 GiB of GPU expert cache, with
+misses computed on CPU or transferred over PCIe. Windows commit approached 95 GiB,
+and Strata did not apply MoE4All's 48 GiB total-process RAM budget. Its hybrid
+CPU/GPU path may behave differently on a faster CPU. Prompts, fixed-weight format,
+memory policy, and measurement harness were not identical, so the observed gap
+cannot be attributed to one kernel or one design choice.
+
+Concurrency gains are not linear: at 150K, both models have slightly lower
+three-stream total throughput than two-stream throughput. Choose the slot count
+according to aggregate-throughput and per-request-latency needs. The detailed
+1.0.0-development and 0.10.0 measurements below remain as historical baselines.
 
 ### Current source: 35B true parallel Decode (2026-10-12)
 
@@ -235,7 +286,8 @@ context, automatic profile or launch command, and Prefill/Decode speeds.
 - **Long context:** supports quantized KV Cache, KV overflow, and long-context
   performance tests.
 - **Qwen3.8 MTP:** optional single-stream and two-slot opportunistic speculative decoding;
-  gains depend on draft acceptance. Setup is covered in [Quick start](#quick-start).
+  gains depend on draft acceptance. It remains available through manual CLI/configuration,
+  but is not exposed by the Windows release launch wizard.
 - **Experimental CPU miss offload:** disabled by default, requiring AVX2 + FMA3.
   On a Ryzen 5 5600X, four cores handling one miss delivered roughly the same
   end-to-end speed as the GPU path. A stronger CPU may help; benchmark locally.
@@ -282,6 +334,9 @@ reassigned when execution switches between prefill and decode.
 
 Implementation details are in the [documentation index](documentation/README.md);
 historical optimization decisions are in the [change records](documentation/evidence/changes/README.md).
+
+How much VRAM should the expert cache retain, and how should layers be split across GPUs with different PCIe bandwidths? See [FlashNext expert cache and multi-GPU split](documentation/evidence/benchmarks/2026-10-11-flashnext-expert-cache-capacity.md)
+for a 0.5-48 GiB offline replay of real accesses, a continuous piecewise exponential approximation, a curve-based layer-allocation formula, and its limitations (Chinese documentation).
 
 ## Project and attribution
 
