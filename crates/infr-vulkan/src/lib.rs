@@ -39,6 +39,10 @@ pub use tp::{TensorParallelBackend, TpBuffer, TpRole};
 pub use tp_allreduce::{AllReduce, AllReduceMode};
 pub use tp_sem::{TpExportSemaphore, TpImportSemaphore};
 
+/// Maximum routed-token rows represented by one GPU-resident MoE journal entry.
+/// Ordinary parallel Decode and packed MTP verification share this protocol limit.
+pub const GPU_RESIDENT_MAX_ROWS: usize = recorder::RESIDENT_JOURNAL_MASK_WORDS;
+
 /// Shared-memory bytes consumed per query row of a flash-attention prefill tile
 /// (`Ss` + `Ps` + `Os` + softmax state, at `BN=64` / `HD=128`). The tile height is chosen so
 /// `rows * FLASH_SHARED_PER_ROW <= maxComputeSharedMemorySize`; `use_flash` needs the smallest
@@ -4406,7 +4410,11 @@ impl VulkanBackend {
             if has_conditional {
                 tracing::info!(
                     layers = vkcfg.decode_gpu_resident_layers,
-                    submit_layers = vkcfg.decode_gpu_resident_submit_layers,
+                    submit_layers = if vkcfg.decode_gpu_resident_submit_layers == 0 {
+                        "auto".to_owned()
+                    } else {
+                        vkcfg.decode_gpu_resident_submit_layers.to_string()
+                    },
                     hit_first = vkcfg.decode_gpu_resident_hit_first,
                     early_recovery = vkcfg.decode_gpu_resident_early_recovery,
                     "[infr] GPU-resident paged Decode controller enabled"

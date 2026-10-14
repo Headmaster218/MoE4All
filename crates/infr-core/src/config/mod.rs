@@ -411,8 +411,8 @@ cfg_struct! {
         decode_gpu_resident: bool = true,
         /// Bound speculative work and missed-layer recovery; ordinary Decode only.
         decode_gpu_resident_layers: usize = 16,
-        /// Submit each completed checked layer while recording the rest of the resident chunk.
-        decode_gpu_resident_submit_layers: usize = 1,
+        /// Resident rolling-submit depth. 0 selects the graph's model-tuned value.
+        decode_gpu_resident_submit_layers: usize = 0,
         /// Keep one submitted resident segment in flight so miss recovery has a single owner.
         decode_gpu_resident_inflight: usize = 1,
         /// Keep resident predicates and LUT tape in coherent mapped VRAM when the device supports it.
@@ -437,8 +437,8 @@ cfg_struct! {
         decode_gpu_resident_mapped_serial_max_kib: Option<usize> = None,
         /// Queue miss recovery before retiring old resident chunks (rolling cap one).
         decode_gpu_resident_early_recovery: bool = true,
-        /// Ordinary FlashNext Decode full-graph mode. None enables it for short contexts only;
-        /// Some(false/true) is an explicit diagnostic override.
+        /// Plain MoE Decode full-graph mode. None enables models without a host interlock and uses
+        /// the measured context policy for FlashNext PLE; Some(false/true) is a diagnostic override.
         decode_gpu_resident_full_graph: Option<bool> = None,
         /// A/B GPU-produced indirect dispatch sizes instead of conditional-rendering commands.
         decode_gpu_resident_indirect_predicates: bool = false,

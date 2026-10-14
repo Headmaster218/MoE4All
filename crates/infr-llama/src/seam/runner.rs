@@ -304,6 +304,52 @@ fn lm_head_sampling_input(
     suffix
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResidentFullGraphModel {
+    /// The model has no host-produced data between L0 and L1, so Decode can enter the resident
+    /// backend as one uninterrupted graph at every context length.
+    NoHostInterlock,
+    /// FlashNext can also run as one graph, but its PLE overlap makes the automatic choice
+    /// context-sensitive. Keep its existing short-context policy unchanged.
+    FlashNextPle,
+}
+
+fn resident_full_graph_model(c: &Config) -> Option<ResidentFullGraphModel> {
+    let moe = c.moe.as_ref()?;
+    if c.n_layer <= 1 {
+        return None;
+    }
+    if !c.qwen4exp {
+        Some(ResidentFullGraphModel::NoHostInterlock)
+    } else if c.qwen4exp
+        && c.n_layer > 1
+        && c.n_embd == 2560
+        && c.hc_mult == 4
+        && moe.n_expert == 512
+        && moe.n_used == 10
+        && moe.n_ff_exp == 640
+    {
+        Some(ResidentFullGraphModel::FlashNextPle)
+    } else {
+        None
+    }
+}
+
+fn resident_auto_submit_layers(
+    c: &Config,
+    full_graph: bool,
+    context_tokens: usize,
+    lanes: usize,
+) -> usize {
+    match resident_full_graph_model(c) {
+        // Matched A/B favored two-layer lookahead for a single Qwen35 lane, while two active
+        // lanes were neutral-to-negative. Full-graph execution remains enabled for both.
+        Some(ResidentFullGraphModel::NoHostInterlock) if c.qwen35 && full_graph && lanes == 1 => 2,
+        Some(ResidentFullGraphModel::FlashNextPle) if context_tokens > 96 * 1024 => 2,
+        _ => 1,
+    }
+}
+
 fn resident_full_graph_decode(
     c: &Config,
     ec: &EngineConfig,
@@ -314,20 +360,20 @@ fn resident_full_graph_decode(
     multimodal: bool,
     context_tokens: usize,
 ) -> bool {
+    let Some(model) = resident_full_graph_model(c) else {
+        return false;
+    };
+    let automatic = match model {
+        ResidentFullGraphModel::NoHostInterlock => true,
+        ResidentFullGraphModel::FlashNextPle => context_tokens <= 96 * 1024,
+    };
     ec.kernels
         .vulkan
         .decode_gpu_resident_full_graph
-        .unwrap_or(context_tokens <= 96 * 1024)
+        .unwrap_or(automatic)
         && ec.kernels.vulkan.decode_gpu_resident
         && backend == "vulkan"
-        && c.qwen4exp
-        && c.n_layer > 1
-        && c.n_embd == 2560
-        && c.hc_mult == 4
-        && c.moe
-            .as_ref()
-            .is_some_and(|moe| moe.n_expert == 512 && moe.n_used == 10 && moe.n_ff_exp == 640)
-        && (1..=2).contains(&lanes)
+        && (1..=infr_vulkan::GPU_RESIDENT_MAX_ROWS).contains(&lanes)
         && sample_from == 0
         && !capture_hidden
         && !multimodal
@@ -3885,6 +3931,21 @@ fn generate_dense_backend_inner(
         let mut g = Graph::new();
         g.mtp_verify = mtp_verify;
         g.independent_rows = independent_rows;
+        if !mtp_verify && !denoise && logits_rows > 0 && batch <= 2 {
+            let no_interlock_full_graph = use_ids
+                && l_first == 0
+                && l_end == c.n_layer
+                && matches!(
+                    resident_full_graph_model(c),
+                    Some(ResidentFullGraphModel::NoHostInterlock)
+                );
+            g.resident_submit_layers = Some(resident_auto_submit_layers(
+                c,
+                no_interlock_full_graph,
+                start_pos + batch,
+                batch,
+            ));
+        }
         if independent_rows {
             g.sequence_spans = independent_spans.map_or_else(
                 || {
@@ -12403,8 +12464,8 @@ fn generate_dense_backend_inner(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn resident_full_graph_is_only_plain_flashnext_decode() {
-        let c = crate::Config {
+    fn resident_full_graph_follows_host_interlocks_and_journal_capacity() {
+        let flashnext = crate::Config {
             qwen4exp: true,
             n_layer: 48,
             n_embd: 2560,
@@ -12429,14 +12490,14 @@ mod tests {
         let eligible = |c: &crate::Config, ec: &crate::EngineConfig| {
             super::resident_full_graph_decode(c, ec, "vulkan", 1, 0, false, false, 150_000)
         };
-        assert!(eligible(&c, &ec));
+        assert!(eligible(&flashnext, &ec));
         for lanes in 0..=8 {
             for sample_from in 0..=lanes {
                 for capture in [false, true] {
                     for multimodal in [false, true] {
                         assert_eq!(
                             super::resident_full_graph_decode(
-                                &c,
+                                &flashnext,
                                 &ec,
                                 "vulkan",
                                 lanes,
@@ -12445,7 +12506,10 @@ mod tests {
                                 multimodal,
                                 150_000
                             ),
-                            (1..=2).contains(&lanes) && sample_from == 0 && !capture && !multimodal
+                            (1..=infr_vulkan::GPU_RESIDENT_MAX_ROWS).contains(&lanes)
+                                && sample_from == 0
+                                && !capture
+                                && !multimodal
                         );
                     }
                 }
@@ -12453,7 +12517,7 @@ mod tests {
         }
         for backend in ["cpu", "metal"] {
             assert!(!super::resident_full_graph_decode(
-                &c, &ec, backend, 1, 0, false, false, 150_000
+                &flashnext, &ec, backend, 1, 0, false, false, 150_000
             ));
         }
         for mode in 0..5 {
@@ -12465,17 +12529,16 @@ mod tests {
                 3 => excluded.paging.expert_prefetch = true,
                 _ => excluded.kernels.vulkan.cpu_miss_threads = 1,
             }
-            assert!(!eligible(&c, &excluded));
+            assert!(!eligible(&flashnext, &excluded));
         }
-        for shape in 0..7 {
-            let mut excluded = c.clone();
+        for shape in 0..6 {
+            let mut excluded = flashnext.clone();
             match shape {
-                0 => excluded.qwen4exp = false,
-                1 => excluded.n_layer = 1,
-                2 => excluded.n_embd = 1280,
-                3 => excluded.hc_mult = 2,
-                4 => excluded.moe.as_mut().unwrap().n_expert = 256,
-                5 => excluded.moe.as_mut().unwrap().n_used = 8,
+                0 => excluded.n_layer = 1,
+                1 => excluded.n_embd = 1280,
+                2 => excluded.hc_mult = 2,
+                3 => excluded.moe.as_mut().unwrap().n_expert = 256,
+                4 => excluded.moe.as_mut().unwrap().n_used = 8,
                 _ => excluded.moe.as_mut().unwrap().n_ff_exp = 512,
             }
             assert!(!eligible(&excluded, &ec));
@@ -12483,13 +12546,70 @@ mod tests {
         let mut automatic = ec;
         automatic.kernels.vulkan.decode_gpu_resident_full_graph = None;
         assert!(super::resident_full_graph_decode(
-            &c, &automatic, "vulkan", 1, 0, false, false, 30_000
+            &flashnext, &automatic, "vulkan", 1, 0, false, false, 30_000
         ));
         assert!(!super::resident_full_graph_decode(
-            &c, &automatic, "vulkan", 1, 0, false, false, 150_000
+            &flashnext, &automatic, "vulkan", 1, 0, false, false, 150_000
         ));
 
-        let mut dense = c;
+        let qwen35 = crate::Config {
+            qwen35: true,
+            n_layer: 40,
+            n_embd: 2048,
+            shexp_ff: 512,
+            moe: Some(crate::MoeConfig {
+                n_expert: 256,
+                n_used: 8,
+                n_ff_exp: 512,
+                scale: 1.,
+                gating: infr_core::graph::MoeGating::Softmax,
+                norm_w: true,
+                weight_before: false,
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
+            }),
+            ..Default::default()
+        };
+        for context in [30_000, 150_000] {
+            assert!(super::resident_full_graph_decode(
+                &qwen35, &automatic, "vulkan", 1, 0, false, false, context
+            ));
+        }
+        assert_eq!(
+            super::resident_auto_submit_layers(&flashnext, true, 30_000, 1),
+            1
+        );
+        assert_eq!(
+            super::resident_auto_submit_layers(&flashnext, false, 150_000, 1),
+            2
+        );
+        assert_eq!(
+            super::resident_auto_submit_layers(&qwen35, false, 30_000, 1),
+            1
+        );
+        assert_eq!(
+            super::resident_auto_submit_layers(&qwen35, true, 30_000, 1),
+            2
+        );
+        assert_eq!(
+            super::resident_auto_submit_layers(&qwen35, true, 30_000, 2),
+            1
+        );
+
+        let mut generic_moe = qwen35.clone();
+        generic_moe.qwen35 = false;
+        generic_moe.n_embd = 1536;
+        generic_moe.moe.as_mut().unwrap().n_expert = 128;
+        generic_moe.moe.as_mut().unwrap().n_used = 4;
+        generic_moe.moe.as_mut().unwrap().n_ff_exp = 256;
+        generic_moe.shexp_ff = 0;
+        assert!(eligible(&generic_moe, &automatic));
+
+        let mut one_layer = generic_moe;
+        one_layer.n_layer = 1;
+        assert!(!eligible(&one_layer, &automatic));
+
+        let mut dense = flashnext;
         dense.moe = None;
         assert!(!eligible(&dense, &automatic));
     }

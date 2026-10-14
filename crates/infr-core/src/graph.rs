@@ -1936,6 +1936,9 @@ pub struct Graph {
     pub sequence_spans: Vec<SequenceSpan>,
     /// Decode-only scheduling hints. Empty for models without a validated next-layer predictor.
     pub moe_prefetch_hints: Vec<MoePrefetchHint>,
+    /// Model-tuned resident rolling-submit depth. The Vulkan backend uses this only when the
+    /// engine setting is automatic (0); an explicit engine value remains authoritative.
+    pub resident_submit_layers: Option<usize>,
     /// Producer-set opt-out of the Vulkan record-once decode replay: `true` forces the
     /// per-execute STATIC path even for an otherwise replay-eligible single-token decode.
     ///

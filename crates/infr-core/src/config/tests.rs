@@ -188,7 +188,7 @@ fn default_config_matches_documented_defaults() {
     assert!(!d.kernels.vulkan.qsa_prepare_fused);
     assert!(d.kernels.vulkan.decode_gpu_resident);
     assert_eq!(d.kernels.vulkan.decode_gpu_resident_layers, 16);
-    assert_eq!(d.kernels.vulkan.decode_gpu_resident_submit_layers, 1);
+    assert_eq!(d.kernels.vulkan.decode_gpu_resident_submit_layers, 0);
     assert_eq!(d.kernels.vulkan.decode_gpu_resident_inflight, 1);
     assert!(d.kernels.vulkan.decode_gpu_resident_mapped_metadata);
     assert!(d.kernels.vulkan.decode_gpu_resident_mapped_journal);

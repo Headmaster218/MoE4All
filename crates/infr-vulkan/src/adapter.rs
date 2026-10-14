@@ -10514,7 +10514,7 @@ fn resident_early_recovery_eligible(
     inflight: usize,
     indirect: bool,
 ) -> bool {
-    requested && producer && submit_layers == 1 && inflight == 1 && !indirect
+    requested && producer && (1..=2).contains(&submit_layers) && inflight == 1 && !indirect
 }
 
 fn resident_recovery_submit_due(
@@ -10685,8 +10685,9 @@ impl ResidentChunk {
                     (1..=crate::recorder::RESIDENT_JOURNAL_MASK_WORDS).contains(&layout.rows)
                 })
             });
-        let ordinary_decode_rows =
-            !graph.mtp_verify && decode_token_rows(graph).is_some_and(|rows| rows <= 2);
+        let ordinary_decode_rows = !graph.mtp_verify
+            && decode_token_rows(graph)
+                .is_some_and(|rows| (1..=crate::GPU_RESIDENT_MAX_ROWS).contains(&rows));
         let eligible = cfg.decode_gpu_resident
             && be_.shared.conditional_rendering.is_some()
             && token_row_paged_moe
@@ -10703,6 +10704,10 @@ impl ResidentChunk {
         if !eligible {
             return Ok(None);
         }
+        let submit_layers = match cfg.decode_gpu_resident_submit_layers {
+            0 => graph.resident_submit_layers.unwrap_or(1),
+            explicit => explicit,
+        };
         let limit = cfg
             .decode_gpu_resident_layers
             .clamp(1, crate::recorder::RESIDENT_MAX_LAYERS);
@@ -10719,6 +10724,7 @@ impl ResidentChunk {
                 experts = first.n_expert,
                 top_k = first.n_used,
                 chunk_layers = limit,
+                submit_layers,
                 hit_first = cfg.decode_gpu_resident_hit_first,
                 early_recovery = cfg.decode_gpu_resident_early_recovery,
                 "[infr] GPU-resident paged Decode graph active"
@@ -10801,14 +10807,14 @@ impl ResidentChunk {
             early_recovery: resident_early_recovery_eligible(
                 cfg.decode_gpu_resident_early_recovery,
                 buffers.producer.is_some(),
-                cfg.decode_gpu_resident_submit_layers,
+                submit_layers,
                 cfg.decode_gpu_resident_inflight,
                 buffers.indirect.is_some(),
             ),
             recovery_op: None,
             limit,
             recording: false,
-            submit_layers: cfg.decode_gpu_resident_submit_layers,
+            submit_layers,
             submitted_entries: 0,
             notices: buffers.notices.clone(),
             notice_cursor: 0,
@@ -11131,9 +11137,10 @@ impl ResidentChunk {
                         be("early recovery notice does not belong to the resident window")
                     })?;
                 let minimum_tape_words = entry.layout.role_tape_words();
-                // The miss LUT is appended, never written over the hit-reader windows. The
-                // first next-layer window will fit below it; rolling cap 1 retires this miss
-                // segment before a second next-layer window can reuse these coordinates.
+                // The miss LUT is appended, never written over the hit-reader windows. The first
+                // replayed next-layer window will fit below it. At most one submitted segment is
+                // retained; a two-layer lookahead may contain one skipped successor, but that
+                // segment is retired before replay can reuse these coordinates.
                 if ps.tape_cursor < minimum_tape_words || segments.is_empty() {
                     return Err(be("early recovery has no retained hit/LUT submission"));
                 }
@@ -14521,7 +14528,7 @@ mod tests {
         }
     }
     #[test]
-    fn early_recovery_requires_a_single_layer_rolling_retirement_boundary() {
+    fn early_recovery_allows_one_layer_of_lookahead_with_one_inflight_segment() {
         for requested in [false, true] {
             for producer in [false, true] {
                 for interval in [0, 1, 2, 16] {
@@ -14533,7 +14540,7 @@ mod tests {
                                 ),
                                 requested
                                     && producer
-                                    && interval == 1
+                                    && (1..=2).contains(&interval)
                                     && inflight == 1
                                     && !indirect,
                             );
@@ -14798,10 +14805,12 @@ mod tests {
                 (true, 2, 0, false, true, true, true, false, true),
                 (true, 1, 0, true, true, true, true, true, true),
             ] {
-                if recovery_only && enabled && !(producer && submit_layers == 1) {
+                if recovery_only && enabled && !(producer && (1..=2).contains(&submit_layers)) {
                     continue;
                 }
-                for rows in [1, 2] {
+                for (rows, mtp_verify) in
+                    [(1, false), (2, false), (3, false), (4, false), (4, true)]
+                {
                     let mut cfg = infr_core::config::Config::default();
                     cfg.kernels.vulkan.decode_gpu_resident = enabled;
                     cfg.kernels.vulkan.decode_gpu_resident_layers = limit;
@@ -14868,13 +14877,14 @@ mod tests {
                         })
                         .unwrap();
                     let mut graph = Graph::new();
-                    graph.independent_rows = rows == 2;
-                    if rows == 2 {
-                        graph.sequence_spans = (0..2)
+                    graph.independent_rows = rows > 1 && !mtp_verify;
+                    graph.mtp_verify = mtp_verify;
+                    if graph.independent_rows {
+                        graph.sequence_spans = (0..rows)
                             .map(|row_start| SequenceSpan {
-                                row_start,
+                                row_start: row_start as u32,
                                 rows: 1,
-                                start_pos: 30000 + row_start * 120000,
+                                start_pos: 30000 + row_start as u32 * 30000,
                             })
                             .collect();
                     }
@@ -14962,10 +14972,9 @@ mod tests {
                         .alloc(rows * NE * 4, BufferUsage::Activations)
                         .unwrap();
                     let mut routing_values = vec![0f32; rows * NE];
-                    routing_values[0] = 1.;
-                    if rows == 2 {
-                        // Disjoint routes make expert zero a miss in only the first lane.
-                        routing_values[NE + 1] = 1.;
+                    for row in 0..rows {
+                        // Alternate disjoint routes so expert zero is absent from odd rows.
+                        routing_values[row * NE + row % 2] = 1.;
                     }
                     backend
                         .upload(routing_buf.as_ref(), bytemuck::cast_slice(&routing_values))
@@ -15018,7 +15027,7 @@ mod tests {
                             .expect("GPU recovery fixture must exercise resident execution, not fallback");
                         assert_eq!(
                             resident.early_recovery,
-                            producer && submit_layers == 1 && !indirect
+                            producer && (1..=2).contains(&submit_layers) && !indirect
                         );
                         drop(resident);
                         for (next_chunk, target_tokens) in [(true, None), (false, Some(1))] {
