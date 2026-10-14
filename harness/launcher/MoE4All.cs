@@ -647,10 +647,23 @@ internal static class MoE4All
                 try
                 {
                     TcpClient client = listener.AcceptTcpClient();
-                    ThreadPool.QueueUserWorkItem(delegate { Handle(client); });
+                    ThreadPool.QueueUserWorkItem(delegate { HandleSafely(client); });
                 }
                 catch (SocketException) { if (!stopping) WriteMessage("Desktop bridge stopped unexpectedly.", true); }
                 catch (ObjectDisposedException) { }
+            }
+        }
+
+        private void HandleSafely(TcpClient client)
+        {
+            try
+            {
+                Handle(client);
+            }
+            catch (Exception error)
+            {
+                if (!(error is IOException) && !(error is SocketException) && !(error is ObjectDisposedException) && !stopping)
+                    WriteMessage("Desktop bridge request failed: " + error.Message, true);
             }
         }
 
