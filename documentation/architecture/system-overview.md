@@ -17,7 +17,8 @@ MoE4All 当前以独立 Rust 推理 worker 为核心，提供四类入口：
 - `infr serve` / `infr multi` OpenAI-compatible 服务；
 - `infr bench` / `infr compare` 性能与参考对照。
 
-`infr-gui` 是现有浏览器控制面，负责目录、估算、下载和 worker 生命周期。Agent/DSH harness 不属于
+旧浏览器控制面 `infr-gui` 及其启动器已从当前源码移除，不再开发或随发行包提供；Windows CMD Wizard
+继续保留。旧 GUI 的设计仅作为[历史记录](../evidence/changes/product/browser-control-plane.md)保存。Agent/DSH harness 不属于
 `release-0.9.0` tag；后续开发分支加入了相关源码和开发环境，但不能据此描述为 0.9.0 已交付能力。版本边界见
 [提交审计](../evidence/audits/2026-09-28-release-0.9.0-baseline-and-new-commits.md)。未来产品边界另见[Agent 发行版提案](../roadmap/agent-distribution.md)。
 

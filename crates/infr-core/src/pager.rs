@@ -340,6 +340,11 @@ impl Pager {
         let idx = self.slot_idx(slot);
         let node = self.lru[idx];
         let id = node.id?;
+        // MRU promotion or an external eviction can remove the next cold victim. Advance
+        // before unlinking so a mixed touch/touch_cold batch cannot skip the remaining list.
+        if self.cold_victim_cursor == Some(slot) {
+            self.cold_victim_cursor = node.next;
+        }
         if let Some(prev) = node.prev {
             let prev_idx = self.slot_idx(prev);
             self.lru[prev_idx].next = node.next;
@@ -906,6 +911,25 @@ pub fn ring_bytes(pager_budget: u64, ring: Option<crate::SizeSpec>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_mru_then_cold_touch_preserves_remaining_victims() {
+        let mut pager = Pager::new(4);
+        for id in 0..4 {
+            pager.touch(id);
+        }
+        pager.begin_batch();
+        pager.touch(0);
+        assert!(matches!(
+            pager.touch_cold(4),
+            Resolution::Miss {
+                evicted: Some(1),
+                ..
+            }
+        ));
+        assert!(pager.slot_of(0).is_some());
+        assert!(pager.slot_of(4).is_some());
+    }
 
     /// The ring clamp's boundaries, pinning the pre-hoist inline expression
     /// `(budget / 8).clamp(256 MiB, 2048 MiB)` — the seam subtracts this from the pager budget
