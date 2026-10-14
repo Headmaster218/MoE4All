@@ -10,6 +10,7 @@ if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
 foreach ($definition in $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
     . ([scriptblock]::Create($definition.Extent.Text))
 }
+$realStartModelReasoningProbe = ${function:Start-ModelReasoningProbe}
 $source = Get-Content -LiteralPath $wizardPath -Raw -Encoding UTF8
 $start = $source.IndexOf('$reuseSavedSettings = $false')
 $save = $ast.EndBlock.Statements | Where-Object { $_.Extent.Text.StartsWith('$state = [ordered]') } | Select-Object -First 1
@@ -37,6 +38,8 @@ function Write-Host {
     if ($ChildFixture) { Microsoft.PowerShell.Utility\Write-Host $Object }
 }
 function Get-VulkanDeviceOptions { return $script:Devices }
+function Start-VulkanDeviceProbe {}
+function Start-ModelReasoningProbe { param([string]$ModelPath) }
 function Get-CimInstance { return [pscustomobject]@{ Name = 'Fixture CPU' } }
 function Get-CpuMissTopology { return $script:CpuTopology }
 
@@ -178,6 +181,10 @@ try {
         Assert ("kv.session_cache_dir=$testRoot\kv-sessions" -in $nativeArgs) 'Cache must default to the install directory'
         Assert ('serve.api_key=' -in $nativeArgs) 'Explicit no-auth override lost'
     }
+    Test-Flow 'fresh API enables local cache by default' -Inputs @('2', $model, '', '', '', '', '', '', '', '', '', '', '', '', '', '', '') -Check {
+        Assert ($state.server_session_cache) 'Fresh API installs should enable SSD KV caching'
+        Assert ("kv.session_cache_dir=$testRoot\kv-sessions" -in $nativeArgs) 'Default SSD KV cache path was not emitted'
+    }
     Test-Flow 'manual hardware and sampling' -Inputs @('', $model, '', '', '3', '3072', '4', '', '', 'n', '3', '256', 'n', 'paging.expert_prefetch=false', 'n', '2048', 'y', '0.7', '20', '0.95', '9', 'n', '20k') -Check {
         foreach ($value in @('--ubatch', '3072', '--threads', '4', 'device.submit_dispatches=256', 'paging.expert_prefetch=false', '--temp', '0.7', '--seed', '9')) {
             Assert ($value -in $nativeArgs) "Missing manual setting $value"
@@ -243,6 +250,33 @@ try {
     Test-Flow 'single MTP slot with vision may keep SSD cache' -Inputs @('2', $model, 'y', $aux, '', 'y', $aux, 'n', '', '', '', '', '', '', '1', '100k', 'y', '', '', '') -Check {
         Assert ($state.server_parallel -eq '1' -and $state.server_session_cache) 'Auxiliary-enabled MTP uses the concurrent scheduler and may cache KV'
     }
+    $script:Saved = $null
+    $script:ReasoningProbeModel = ''
+    $script:ReasoningProbeLength = -1
+    $script:ReasoningProbeMtimeTicks = -1
+    $script:ReasoningProbeEfforts = @()
+    $script:ModelReasoningProbe = $null
+    & $realStartModelReasoningProbe -ModelPath $model
+    $asyncEfforts = @(Get-ModelReasoningEfforts -ModelPath $model)
+    Assert (($asyncEfforts -join ',') -eq 'low,medium,xhigh') 'Background reasoning probe returned the wrong capabilities'
+    $script:Passed++
+    Microsoft.PowerShell.Utility\Write-Host 'PASS background reasoning capability probe'
+
+    $cachedIdentity = Get-ModelProbeIdentity -ModelPath $model35
+    $script:Saved = [pscustomobject]@{
+        reasoning_probe_model = $cachedIdentity.Path
+        reasoning_probe_length = $cachedIdentity.Length
+        reasoning_probe_mtime_ticks = $cachedIdentity.LastWriteTicks
+        reasoning_probe_efforts = @('low', 'medium', 'high', 'max')
+    }
+    $script:ReasoningProbeModel = ''
+    $script:ReasoningProbeLength = -1
+    $script:ReasoningProbeMtimeTicks = -1
+    $script:ReasoningProbeEfforts = @()
+    $cachedEfforts = @(Get-ModelReasoningEfforts -ModelPath $model35)
+    Assert (($cachedEfforts -join ',') -eq 'low,medium,high,max') 'Persisted reasoning capability cache was not reused'
+    $script:Passed++
+    Microsoft.PowerShell.Utility\Write-Host 'PASS persisted reasoning capability cache'
     $script:Devices = @(
         [pscustomobject]@{ Key = '1'; Value = 'Vulkan0'; Label = 'Vulkan0: small GPU'; IsDefault = $false },
         [pscustomobject]@{ Key = '2'; Value = 'Vulkan1'; Label = 'Vulkan1: large GPU'; IsDefault = $true },

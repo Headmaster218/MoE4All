@@ -220,7 +220,8 @@ function Read-Choice {
     }
 }
 
-function Get-VulkanDeviceOptions {
+function Start-VulkanDeviceProbe {
+    if ($null -ne $script:VulkanDeviceProbe -or $script:VulkanDeviceProbeError) { return }
     $process = $null
     try {
         $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
@@ -237,6 +238,25 @@ function Get-VulkanDeviceOptions {
         if (-not $process.Start()) {
             throw 'process did not start'
         }
+        $script:VulkanDeviceProbe = $process
+    } catch {
+        if ($null -ne $process) { $process.Dispose() }
+        $script:VulkanDeviceProbeError = $_.Exception.Message
+    }
+}
+
+function Get-VulkanDeviceOptions {
+    if ($null -eq $script:VulkanDeviceProbe -and -not $script:VulkanDeviceProbeError) {
+        Start-VulkanDeviceProbe
+    }
+    if ($script:VulkanDeviceProbeError) {
+        Write-Warning "无法枚举 Vulkan 设备，请检查显卡驱动：$($script:VulkanDeviceProbeError) / Could not enumerate Vulkan devices; check the GPU driver."
+        return @()
+    }
+
+    $process = $script:VulkanDeviceProbe
+    $script:VulkanDeviceProbe = $null
+    try {
         $stdout = $process.StandardOutput.ReadToEnd()
         $stderr = $process.StandardError.ReadToEnd()
         $process.WaitForExit()
@@ -292,7 +312,7 @@ function Read-ComputeDevice {
     return Read-Choice -Label '运行设备 / Compute device' -DefaultValue ([string]$selected.Value) -Options $options
 }
 
-function Get-ModelReasoningEfforts {
+function Read-ModelReasoningEfforts {
     param([Parameter(Mandatory = $true)][string]$ModelPath)
 
     try {
@@ -371,6 +391,97 @@ namespace Moe4All {
         Write-Warning '无法读取模型的思考强度能力，保留模板默认。Could not read reasoning-effort support; keeping the template default.'
         return @()
     }
+}
+
+function Get-ModelProbeIdentity {
+    param([Parameter(Mandatory = $true)][string]$ModelPath)
+    $item = Get-Item -LiteralPath $ModelPath -ErrorAction Stop
+    return [pscustomobject]@{
+        Path = $item.FullName
+        Length = [int64]$item.Length
+        LastWriteTicks = [int64]$item.LastWriteTimeUtc.Ticks
+    }
+}
+
+function Set-ModelReasoningProbeResult {
+    param($Identity, [string[]]$Efforts)
+    $script:ReasoningProbeModel = [string]$Identity.Path
+    $script:ReasoningProbeLength = [int64]$Identity.Length
+    $script:ReasoningProbeMtimeTicks = [int64]$Identity.LastWriteTicks
+    $script:ReasoningProbeEfforts = @($Efforts)
+}
+
+function Get-CachedModelReasoningEfforts {
+    param($Identity)
+    $cachedPath = [string](Get-SavedValue 'reasoning_probe_model' '')
+    $cachedLength = [int64](Get-SavedValue 'reasoning_probe_length' -1)
+    $cachedTicks = [int64](Get-SavedValue 'reasoning_probe_mtime_ticks' -1)
+    if ([string]::Equals($cachedPath, [string]$Identity.Path, [System.StringComparison]::OrdinalIgnoreCase) -and
+        $cachedLength -eq [int64]$Identity.Length -and $cachedTicks -eq [int64]$Identity.LastWriteTicks) {
+        return [pscustomobject]@{ Found = $true; Efforts = @((Get-SavedValue 'reasoning_probe_efforts' @())) }
+    }
+    return [pscustomobject]@{ Found = $false; Efforts = @() }
+}
+
+function Start-ModelReasoningProbe {
+    param([Parameter(Mandatory = $true)][string]$ModelPath)
+    $worker = $null
+    try {
+        $identity = Get-ModelProbeIdentity -ModelPath $ModelPath
+        $cached = Get-CachedModelReasoningEfforts -Identity $identity
+        if ($cached.Found) {
+            Set-ModelReasoningProbeResult -Identity $identity -Efforts @($cached.Efforts)
+            return
+        }
+        if ($null -ne $script:ModelReasoningProbe) { return }
+
+        $worker = [PowerShell]::Create()
+        [void]$worker.AddScript(${function:Read-ModelReasoningEfforts}.ToString()).AddArgument($identity.Path)
+        $script:ModelReasoningProbe = [pscustomobject]@{
+            Identity = $identity
+            Worker = $worker
+            Async = $worker.BeginInvoke()
+        }
+    } catch {
+        if ($null -ne $worker) { $worker.Dispose() }
+        $script:ModelReasoningProbe = $null
+    }
+}
+
+function Get-ModelReasoningEfforts {
+    param([Parameter(Mandatory = $true)][string]$ModelPath)
+
+    $identity = Get-ModelProbeIdentity -ModelPath $ModelPath
+    if ([string]::Equals($script:ReasoningProbeModel, $identity.Path, [System.StringComparison]::OrdinalIgnoreCase) -and
+        $script:ReasoningProbeLength -eq $identity.Length -and $script:ReasoningProbeMtimeTicks -eq $identity.LastWriteTicks) {
+        return @($script:ReasoningProbeEfforts)
+    }
+
+    $cached = Get-CachedModelReasoningEfforts -Identity $identity
+    if ($cached.Found) {
+        Set-ModelReasoningProbeResult -Identity $identity -Efforts @($cached.Efforts)
+        return @($cached.Efforts)
+    }
+
+    $efforts = @()
+    $pending = $script:ModelReasoningProbe
+    if ($null -ne $pending -and
+        [string]::Equals($pending.Identity.Path, $identity.Path, [System.StringComparison]::OrdinalIgnoreCase) -and
+        $pending.Identity.Length -eq $identity.Length -and $pending.Identity.LastWriteTicks -eq $identity.LastWriteTicks) {
+        try {
+            $efforts = @($pending.Worker.EndInvoke($pending.Async) | ForEach-Object { [string]$_ })
+            foreach ($warning in $pending.Worker.Streams.Warning) {
+                Write-Warning ([string]$warning.Message)
+            }
+        } finally {
+            $pending.Worker.Dispose()
+            $script:ModelReasoningProbe = $null
+        }
+    } else {
+        $efforts = @(Read-ModelReasoningEfforts -ModelPath $identity.Path)
+    }
+    Set-ModelReasoningProbeResult -Identity $identity -Efforts $efforts
+    return $efforts
 }
 
 function ConvertTo-FullPath {
@@ -1021,6 +1132,13 @@ $reps = [string](Get-SavedValue 'reps' '1')
 $jsonOutput = [bool](Get-SavedValue 'json_output' $false)
 $thinkMode = [string](Get-SavedValue 'think_mode' 'default')
 $reasoningEffort = [string](Get-SavedValue 'reasoning_effort' 'default')
+$script:ReasoningProbeModel = [string](Get-SavedValue 'reasoning_probe_model' '')
+$script:ReasoningProbeLength = [int64](Get-SavedValue 'reasoning_probe_length' -1)
+$script:ReasoningProbeMtimeTicks = [int64](Get-SavedValue 'reasoning_probe_mtime_ticks' -1)
+$script:ReasoningProbeEfforts = @((Get-SavedValue 'reasoning_probe_efforts' @()))
+$script:ModelReasoningProbe = $null
+$script:VulkanDeviceProbe = $null
+$script:VulkanDeviceProbeError = ''
 $maxNew = [string](Get-SavedValue 'max_new' '65536')
 $configureSampling = [bool](Get-SavedValue 'configure_sampling' $false)
 $temperature = [string](Get-SavedValue 'temperature' '')
@@ -1031,7 +1149,7 @@ $serverAddr = [string](Get-SavedValue 'server_addr' '127.0.0.1:8080')
 $serverParallel = [string](Get-SavedValue 'server_parallel' '1')
 $defaultSessionCacheDir = Join-Path $repoRoot 'kv-sessions'
 $legacySessionCacheDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'MoE4All\kv-sessions'
-$serverSessionCache = [bool](Get-SavedValue 'server_session_cache' $false)
+$serverSessionCache = [bool](Get-SavedValue 'server_session_cache' $true)
 $sessionCacheDir = [string](Get-SavedValue 'session_cache_dir' $defaultSessionCacheDir)
 if ([string]::Equals($sessionCacheDir, $legacySessionCacheDir, [System.StringComparison]::OrdinalIgnoreCase)) {
     $sessionCacheDir = $defaultSessionCacheDir
@@ -1057,6 +1175,7 @@ $cpuMissCores = [string](Get-SavedValue 'cpu_miss_cores' '')
 $customSets = [string](Get-SavedValue 'custom_sets' '')
 
 if (-not $reuseSavedSettings) {
+    Start-VulkanDeviceProbe
     $launchMode = Read-Choice -Label '你想做什么？/ What would you like to do?' -DefaultValue ([string](Get-SavedValue 'launch_mode' 'chat')) -Options @(
         [pscustomobject]@{ Key = '1'; Value = 'chat'; Label = '实时终端对话（推荐）/ Interactive terminal chat (recommended)' }
         [pscustomobject]@{ Key = '2'; Value = 'server'; Label = '启动 OpenAI 兼容 API / Start OpenAI-compatible API server' }
@@ -1064,6 +1183,7 @@ if (-not $reuseSavedSettings) {
     )
     $modelPath = Select-ModelPath -InitialPath $InitialModelPath
     if ($launchMode -ne 'benchmark') {
+        Start-ModelReasoningProbe -ModelPath $modelPath
         $mtpEnabled = Read-YesNo -Label '启用 Qwen3.8 MTP 加速？/ Enable Qwen3.8 MTP acceleration?' -Default $mtpEnabled
         if ($mtpEnabled) {
             Write-Host 'MTP 当前仅支持 Qwen3.8 Vulkan 和 greedy 解码；非 greedy API 请求会回退普通 decode。' -ForegroundColor Yellow
@@ -1476,6 +1596,9 @@ if ($launchMode -eq 'server') {
 [void]$nativeArgs.Add($modelPath)
 
 $commandText = '& ' + (Format-PowerShellArgument $infrPath) + ' ' + (($nativeArgs | ForEach-Object { Format-PowerShellArgument $_ }) -join ' ')
+if ($null -ne $script:ModelReasoningProbe -and $script:ModelReasoningProbe.Async.IsCompleted) {
+    [void](Get-ModelReasoningEfforts -ModelPath $modelPath)
+}
 $state = [ordered]@{
     launch_mode = $launchMode; setup_mode = $setupMode; model = $modelPath; device = $device; context = $context
     ubatch = $ubatch; threads = $threads; config_path = $configPath
@@ -1492,6 +1615,10 @@ $state = [ordered]@{
     think_mode = $thinkMode; configure_thinking = $configureThinking
     max_new = $maxNew; configure_sampling = $configureSampling
     reasoning_effort = $reasoningEffort
+    reasoning_probe_model = $script:ReasoningProbeModel
+    reasoning_probe_length = $script:ReasoningProbeLength
+    reasoning_probe_mtime_ticks = $script:ReasoningProbeMtimeTicks
+    reasoning_probe_efforts = @($script:ReasoningProbeEfforts)
     temperature = $temperature; top_k = $topK; top_p = $topP; seed = $seed
     server_addr = $serverAddr; server_parallel = $serverParallel; server_auth = $serverAuth
     server_session_cache = $serverSessionCache; session_cache_dir = $sessionCacheDir
