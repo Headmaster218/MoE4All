@@ -2,6 +2,7 @@ using System;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -232,7 +233,9 @@ internal static class MoE4All
             // The normal WinExe launcher intentionally has no console handle.
         }
         bool headless = Array.IndexOf(arguments, "--headless") >= 0 || Array.IndexOf(arguments, "--no-pause") >= 0;
+        bool startupUiTest = Array.IndexOf(arguments, "--startup-ui-test") >= 0;
         string root = AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
+        if (startupUiTest) return RunStartupUiTest(root);
         try
         {
             RepairLauncherConfiguration(root);
@@ -316,14 +319,160 @@ internal static class MoE4All
         }
     }
 
+    private static int RunStartupUiTest(string root)
+    {
+        Application.EnableVisualStyles();
+        Application.SetCompatibleTextRenderingDefault(false);
+        using (AgentWindow testWindow = new AgentWindow(root, false))
+        {
+            testWindow.ShowInTaskbar = false;
+            testWindow.Opacity = 0;
+            testWindow.Show();
+            Application.DoEvents();
+            Size[] sizes = { new Size(760, 520), new Size(1024, 640), new Size(1280, 760) };
+            foreach (Size size in sizes)
+            {
+                string error;
+                if (!testWindow.ValidateStartupLayoutForTest(size, out error))
+                {
+                    Console.Error.WriteLine("Startup UI layout failed at " + size.Width + "x" + size.Height + ": " + error);
+                    return 5;
+                }
+            }
+        }
+        Console.WriteLine("Startup UI layout tests passed at 760x520, 1024x640 and 1280x760.");
+        return 0;
+    }
+
+    private sealed class StartupProgressIndicator : Control
+    {
+        private readonly System.Windows.Forms.Timer animation;
+        private int progress;
+        private int animationOffset;
+        private bool indeterminate = true;
+        private bool failed;
+
+        public StartupProgressIndicator()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
+                | ControlStyles.ResizeRedraw | ControlStyles.UserPaint, true);
+            Height = 12;
+            TabStop = false;
+            animation = new System.Windows.Forms.Timer();
+            animation.Interval = 28;
+            animation.Tick += delegate
+            {
+                if (!indeterminate || Width <= 0) return;
+                animationOffset = (animationOffset + Math.Max(4, Width / 100)) % Math.Max(1, Width + Math.Max(48, Width / 4));
+                Invalidate();
+            };
+            animation.Start();
+        }
+
+        public void SetProgress(int value)
+        {
+            progress = Math.Max(0, Math.Min(1000, value));
+            indeterminate = false;
+            failed = false;
+            Invalidate();
+        }
+
+        public void SetIndeterminate()
+        {
+            indeterminate = true;
+            failed = false;
+            animationOffset = 0;
+            Invalidate();
+        }
+
+        public void SetFailed()
+        {
+            indeterminate = false;
+            failed = true;
+            Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            if (ClientSize.Width < 2 || ClientSize.Height < 2) return;
+
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            int barHeight = Math.Min(8, Math.Max(4, ClientSize.Height - 2));
+            Rectangle track = new Rectangle(0, (ClientSize.Height - barHeight) / 2, ClientSize.Width - 1, barHeight);
+            using (GraphicsPath trackPath = RoundedRectangle(track, barHeight / 2))
+            using (SolidBrush trackBrush = new SolidBrush(Color.FromArgb(57, 60, 65)))
+            {
+                e.Graphics.FillPath(trackBrush, trackPath);
+                e.Graphics.SetClip(trackPath);
+                Color fillColor = failed ? Color.FromArgb(199, 93, 93) : Color.FromArgb(126, 181, 151);
+                using (SolidBrush fillBrush = new SolidBrush(fillColor))
+                {
+                    if (indeterminate)
+                    {
+                        int segmentWidth = Math.Max(48, track.Width / 4);
+                        Rectangle segment = new Rectangle(animationOffset - segmentWidth, track.Y, segmentWidth, track.Height);
+                        using (GraphicsPath segmentPath = RoundedRectangle(segment, barHeight / 2))
+                            e.Graphics.FillPath(fillBrush, segmentPath);
+                    }
+                    else if (progress > 0 || failed)
+                    {
+                        int fillWidth = failed ? track.Width : Math.Max(1, track.Width * progress / 1000);
+                        Rectangle fill = new Rectangle(track.X, track.Y, fillWidth, track.Height);
+                        using (GraphicsPath fillPath = RoundedRectangle(fill, barHeight / 2))
+                            e.Graphics.FillPath(fillBrush, fillPath);
+                    }
+                }
+                e.Graphics.ResetClip();
+            }
+        }
+
+        private static GraphicsPath RoundedRectangle(Rectangle bounds, int radius)
+        {
+            GraphicsPath path = new GraphicsPath();
+            int diameter = Math.Max(1, Math.Min(radius * 2, Math.Min(bounds.Width, bounds.Height)));
+            if (diameter <= 1)
+            {
+                path.AddRectangle(bounds);
+                return path;
+            }
+            Rectangle arc = new Rectangle(bounds.X, bounds.Y, diameter, diameter);
+            path.AddArc(arc, 180, 90);
+            arc.X = bounds.Right - diameter;
+            path.AddArc(arc, 270, 90);
+            arc.Y = bounds.Bottom - diameter;
+            path.AddArc(arc, 0, 90);
+            arc.X = bounds.X;
+            path.AddArc(arc, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) animation.Dispose();
+            base.Dispose(disposing);
+        }
+    }
+
     private sealed class AgentWindow : Form
     {
         private readonly string root;
+        private readonly bool firstLaunch;
         private readonly Label status;
+        private readonly Label startupHeading;
+        private readonly Label startupExplanation;
         private readonly Label progressText;
-        private readonly ProgressBar progressBar;
+        private readonly Label progressDetail;
+        private readonly Label progressPercent;
+        private readonly StartupProgressIndicator progressBar;
         private readonly TextBox output;
         private readonly Panel startup;
+        private readonly TableLayoutPanel startupLayout;
+        private readonly Panel detailsPanel;
+        private readonly FlowLayoutPanel startupActions;
+        private readonly Button detailsButton;
+        private readonly Button logButton;
         private readonly Button browserButton;
         private readonly Button updateButton;
         private readonly Button runtimeButton;
@@ -342,14 +491,19 @@ internal static class MoE4All
         private string availableUpdate;
         private long availableUpdateBytes;
 
-        public AgentWindow(string installRoot)
+        public AgentWindow(string installRoot, bool startAgentOnShown = true)
         {
             root = installRoot;
+            firstLaunch = !Directory.Exists(Path.Combine(root, "data", "home", "profiles", "web", "node_modules"));
             installedVersion = ReadInstalledVersion(root);
             Text = "MoE4All Agent";
             StartPosition = FormStartPosition.CenterScreen;
-            MinimumSize = new Size(900, 620);
-            Size = new Size(1280, 820);
+            AutoScaleMode = AutoScaleMode.Dpi;
+            Rectangle workingArea = Screen.FromPoint(Cursor.Position).WorkingArea;
+            int initialWidth = Math.Max(680, Math.Min(1180, workingArea.Width - 48));
+            int initialHeight = Math.Max(500, Math.Min(760, workingArea.Height - 48));
+            MinimumSize = new Size(Math.Min(760, initialWidth), Math.Min(520, initialHeight));
+            Size = new Size(initialWidth, initialHeight);
             BackColor = Color.FromArgb(31, 32, 35);
             ForeColor = Color.FromArgb(232, 234, 237);
             Font = new Font("Segoe UI", 9F);
@@ -394,37 +548,116 @@ internal static class MoE4All
 
             startup = new Panel();
             startup.Dock = DockStyle.Fill;
-            startup.Padding = new Padding(54);
             startup.BackColor = BackColor;
+            startup.AutoScroll = true;
 
-            Label heading = new Label();
-            heading.Text = "Preparing MoE4All Agent";
-            heading.Font = new Font("Segoe UI Semibold", 22F);
-            heading.AutoSize = true;
-            heading.Location = new Point(50, 58);
-            startup.Controls.Add(heading);
+            startupLayout = new TableLayoutPanel();
+            startupLayout.Dock = DockStyle.Fill;
+            startupLayout.Padding = new Padding(52, 38, 52, 28);
+            startupLayout.BackColor = BackColor;
+            startupLayout.ColumnCount = 1;
+            startupLayout.RowCount = 10;
+            startupLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            startupLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 25F));
+            startupLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 56F));
+            startupLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 66F));
+            startupLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 12F));
+            startupLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 32F));
+            startupLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 16F));
+            startupLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38F));
+            startupLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            startupLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 22F));
+            startupLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42F));
+            startup.Controls.Add(startupLayout);
 
-            Label explanation = new Label();
-            explanation.Text = "Runtime, plugins and your private workspace stay inside this MoE4All directory.";
-            explanation.ForeColor = Color.FromArgb(176, 179, 184);
-            explanation.AutoSize = true;
-            explanation.Location = new Point(54, 106);
-            startup.Controls.Add(explanation);
+            Label eyebrow = new Label();
+            eyebrow.Text = firstLaunch ? "MOE4ALL AGENT  /  FIRST LAUNCH" : "MOE4ALL AGENT";
+            eyebrow.Dock = DockStyle.Fill;
+            eyebrow.Font = new Font("Segoe UI Semibold", 9F);
+            eyebrow.ForeColor = Color.FromArgb(132, 184, 155);
+            eyebrow.TextAlign = ContentAlignment.MiddleLeft;
+            startupLayout.Controls.Add(eyebrow, 0, 0);
+
+            startupHeading = new Label();
+            startupHeading.Text = firstLaunch ? "专家正在登机" : "正在唤醒你的 Agent";
+            startupHeading.Dock = DockStyle.Fill;
+            startupHeading.Font = new Font("Microsoft YaHei UI", 24F, FontStyle.Bold);
+            startupHeading.ForeColor = Color.FromArgb(239, 240, 242);
+            startupHeading.TextAlign = ContentAlignment.MiddleLeft;
+            startupLayout.Controls.Add(startupHeading, 0, 1);
+
+            startupExplanation = new Label();
+            startupExplanation.Text = firstLaunch
+                ? "这是第一次启动。MoE4All 正在准备 Agent 运行时、内置插件和独立工作区。只需一次，完成后会自动进入。"
+                : "正在连接本地运行时、内置插件和工作区，很快就好。";
+            startupExplanation.Dock = DockStyle.Fill;
+            startupExplanation.Font = new Font("Microsoft YaHei UI", 10F);
+            startupExplanation.ForeColor = Color.FromArgb(174, 178, 184);
+            startupExplanation.TextAlign = ContentAlignment.TopLeft;
+            startupLayout.Controls.Add(startupExplanation, 0, 2);
+
+            TableLayoutPanel progressHeader = new TableLayoutPanel();
+            progressHeader.Dock = DockStyle.Fill;
+            progressHeader.ColumnCount = 2;
+            progressHeader.RowCount = 1;
+            progressHeader.Margin = Padding.Empty;
+            progressHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            progressHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 64F));
+            progressHeader.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            startupLayout.Controls.Add(progressHeader, 0, 4);
 
             progressText = new Label();
-            progressText.Text = "Checking bundled runtime";
-            progressText.ForeColor = Color.FromArgb(196, 199, 204);
-            progressText.AutoSize = true;
-            progressText.Location = new Point(54, 137);
-            startup.Controls.Add(progressText);
+            progressText.Text = firstLaunch ? "正在核验登机清单" : "正在检查本地运行时";
+            progressText.Dock = DockStyle.Fill;
+            progressText.Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold);
+            progressText.ForeColor = Color.FromArgb(214, 216, 219);
+            progressText.TextAlign = ContentAlignment.MiddleLeft;
+            progressHeader.Controls.Add(progressText, 0, 0);
 
-            progressBar = new ProgressBar();
-            progressBar.Style = ProgressBarStyle.Marquee;
-            progressBar.MarqueeAnimationSpeed = 24;
-            progressBar.Location = new Point(54, 160);
-            progressBar.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
-            progressBar.Size = new Size(Width - 128, 18);
-            startup.Controls.Add(progressBar);
+            progressPercent = new Label();
+            progressPercent.Text = "准备中";
+            progressPercent.Dock = DockStyle.Fill;
+            progressPercent.ForeColor = Color.FromArgb(142, 147, 154);
+            progressPercent.TextAlign = ContentAlignment.MiddleRight;
+            progressHeader.Controls.Add(progressPercent, 1, 0);
+
+            progressBar = new StartupProgressIndicator();
+            progressBar.Dock = DockStyle.Fill;
+            progressBar.Margin = new Padding(0, 2, 0, 2);
+            startupLayout.Controls.Add(progressBar, 0, 5);
+
+            progressDetail = new Label();
+            progressDetail.Text = firstLaunch
+                ? "运行时、插件与工作区将在本机完成准备。"
+                : "正在复用已经准备好的本地资源。";
+            progressDetail.Dock = DockStyle.Fill;
+            progressDetail.Font = new Font("Microsoft YaHei UI", 9F);
+            progressDetail.ForeColor = Color.FromArgb(139, 144, 151);
+            progressDetail.TextAlign = ContentAlignment.TopLeft;
+            progressDetail.AutoEllipsis = true;
+            startupLayout.Controls.Add(progressDetail, 0, 6);
+
+            detailsPanel = new Panel();
+            detailsPanel.Dock = DockStyle.Fill;
+            detailsPanel.Margin = new Padding(0, 8, 0, 4);
+            detailsPanel.Visible = false;
+            startupLayout.Controls.Add(detailsPanel, 0, 7);
+
+            TableLayoutPanel detailsLayout = new TableLayoutPanel();
+            detailsLayout.Dock = DockStyle.Fill;
+            detailsLayout.ColumnCount = 1;
+            detailsLayout.RowCount = 2;
+            detailsLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            detailsLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 24F));
+            detailsLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            detailsPanel.Controls.Add(detailsLayout);
+
+            Label detailsHeading = new Label();
+            detailsHeading.Text = "启动详情";
+            detailsHeading.Dock = DockStyle.Fill;
+            detailsHeading.ForeColor = Color.FromArgb(154, 158, 164);
+            detailsHeading.TextAlign = ContentAlignment.MiddleLeft;
+            detailsLayout.Controls.Add(detailsHeading, 0, 0);
 
             output = new TextBox();
             output.Multiline = true;
@@ -434,30 +667,52 @@ internal static class MoE4All
             output.BackColor = Color.FromArgb(37, 38, 41);
             output.ForeColor = Color.FromArgb(196, 199, 204);
             output.Font = new Font("Consolas", 9F);
-            output.Location = new Point(54, 204);
-            output.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
-            output.Size = new Size(Width - 128, Height - 352);
-            startup.Controls.Add(output);
+            output.Dock = DockStyle.Fill;
+            output.Margin = Padding.Empty;
+            detailsLayout.Controls.Add(output, 0, 1);
+
+            Label firstLaunchNote = new Label();
+            firstLaunchNote.Text = firstLaunch
+                ? "专家抵达后，后续启动会直接复用这套本地环境。"
+                : "本地环境已就位，正在等待 Agent 响应。";
+            firstLaunchNote.Dock = DockStyle.Fill;
+            firstLaunchNote.Font = new Font("Microsoft YaHei UI", 8.5F);
+            firstLaunchNote.ForeColor = Color.FromArgb(122, 127, 134);
+            firstLaunchNote.TextAlign = ContentAlignment.MiddleLeft;
+            startupLayout.Controls.Add(firstLaunchNote, 0, 8);
+
+            startupActions = new FlowLayoutPanel();
+            startupActions.Dock = DockStyle.Fill;
+            startupActions.Margin = Padding.Empty;
+            startupActions.Padding = new Padding(0, 6, 0, 0);
+            startupActions.FlowDirection = FlowDirection.LeftToRight;
+            startupActions.WrapContents = false;
+            startupLayout.Controls.Add(startupActions, 0, 9);
+
+            detailsButton = CreateButton("查看启动详情");
+            detailsButton.Width = 122;
+            detailsButton.Margin = new Padding(0, 0, 10, 0);
+            detailsButton.Click += delegate { SetDetailsVisible(!detailsPanel.Visible); };
+            startupActions.Controls.Add(detailsButton);
 
             runtimeButton = CreateButton("Install WebView2 Runtime");
             runtimeButton.Visible = false;
-            runtimeButton.Location = new Point(54, Height - 130);
-            runtimeButton.Anchor = AnchorStyles.Left | AnchorStyles.Bottom;
             runtimeButton.Width = 180;
+            runtimeButton.Margin = new Padding(0, 0, 10, 0);
             runtimeButton.Click += delegate { OpenUrl("https://developer.microsoft.com/microsoft-edge/webview2/"); };
-            startup.Controls.Add(runtimeButton);
+            startupActions.Controls.Add(runtimeButton);
 
-            Button logButton = CreateButton("Open startup log");
-            logButton.Location = new Point(246, Height - 130);
-            logButton.Anchor = AnchorStyles.Left | AnchorStyles.Bottom;
+            logButton = CreateButton("打开启动日志");
             logButton.Width = 138;
+            logButton.Margin = Padding.Empty;
             logButton.Click += delegate { OpenLog(root); };
-            startup.Controls.Add(logButton);
+            startupActions.Controls.Add(logButton);
 
             Controls.Add(webView);
             Controls.Add(startup);
             Controls.Add(toolbar);
-            Shown += delegate { StartAgent(); };
+            Load += delegate { FitToWorkingArea(); };
+            if (startAgentOnShown) Shown += delegate { StartAgent(); };
             FormClosing += OnClosing;
         }
 
@@ -487,6 +742,105 @@ internal static class MoE4All
             button.ForeColor = Color.FromArgb(232, 234, 237);
             button.UseVisualStyleBackColor = false;
             return button;
+        }
+
+        private void SetDetailsVisible(bool visible)
+        {
+            detailsPanel.Visible = visible;
+            detailsButton.Text = visible ? "收起启动详情" : "查看启动详情";
+            startupLayout.PerformLayout();
+        }
+
+        private void FitToWorkingArea()
+        {
+            Rectangle workingArea = Screen.FromControl(this).WorkingArea;
+            int maxWidth = Math.Max(640, workingArea.Width - 32);
+            int maxHeight = Math.Max(460, workingArea.Height - 32);
+            MinimumSize = new Size(Math.Min(MinimumSize.Width, maxWidth), Math.Min(MinimumSize.Height, maxHeight));
+            int width = Math.Min(Width, maxWidth);
+            int height = Math.Min(Height, maxHeight);
+            SetBounds(workingArea.Left + (workingArea.Width - width) / 2,
+                workingArea.Top + (workingArea.Height - height) / 2, width, height);
+        }
+
+        private string PreparationStage(int percent)
+        {
+            if (!firstLaunch)
+            {
+                if (percent < 35) return "正在检查本地运行时";
+                if (percent < 85) return "正在连接插件与工作区";
+                return "Agent 即将醒来";
+            }
+            if (percent < 10) return "正在核验登机清单";
+            if (percent < 38) return "运行时正在装舱";
+            if (percent < 78) return "专家正在飞往本地工作区";
+            if (percent < 96) return "即将抵达，正在整理最后一排座位";
+            return "专家即将落地";
+        }
+
+        private static string PreparationDetail(string message)
+        {
+            if (string.IsNullOrWhiteSpace(message)) return "正在准备本地运行时。";
+            if (message.IndexOf("verifying bundled runtime", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "正在核验整合包中的运行时文件。";
+            if (message.IndexOf("unpacking bundled runtime", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "正在解压运行时、内置插件与工作区模板。";
+            if (message.IndexOf("bundled runtime ready", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "本地运行时已经准备完成。";
+            return message;
+        }
+
+        public bool ValidateStartupLayoutForTest(Size clientSize, out string error)
+        {
+            ClientSize = clientSize;
+            CreateControl();
+            PerformLayout();
+            startup.PerformLayout();
+            startupLayout.PerformLayout();
+
+            Control[] primaryControls = { startupHeading, startupExplanation, progressText, progressBar, startupActions };
+            foreach (Control control in primaryControls)
+            {
+                if (!ControlFitsInside(control, startup, out error)) return false;
+            }
+
+            SetDetailsVisible(true);
+            PerformLayout();
+            startup.PerformLayout();
+            startupLayout.PerformLayout();
+            if (!ControlFitsInside(output, startup, out error)) return false;
+            SetDetailsVisible(false);
+            error = null;
+            return true;
+        }
+
+        private static bool ControlFitsInside(Control control, Control ancestor, out string error)
+        {
+            int x = 0;
+            int y = 0;
+            Control current = control;
+            while (current != null && current != ancestor)
+            {
+                x += current.Left;
+                y += current.Top;
+                current = current.Parent;
+            }
+            if (current != ancestor)
+            {
+                error = control.Name + " is not inside the startup surface.";
+                return false;
+            }
+
+            Rectangle bounds = new Rectangle(x, y, control.Width, control.Height);
+            Rectangle client = ancestor.ClientRectangle;
+            if (bounds.Width <= 0 || bounds.Height <= 0 || bounds.Left < 0 || bounds.Top < 0
+                || bounds.Right > client.Right || bounds.Bottom > client.Bottom)
+            {
+                error = control.GetType().Name + " bounds " + bounds + " exceed startup client " + client + ".";
+                return false;
+            }
+            error = null;
+            return true;
         }
 
         private void ShowUpdates()
@@ -740,12 +1094,10 @@ internal static class MoE4All
             preparingProgress = true;
             int value = total <= 0 ? 0 : (int)Math.Max(0, Math.Min(1000, completed * 1000 / total));
             int percent = value / 10;
-            progressBar.MarqueeAnimationSpeed = 0;
-            progressBar.Style = ProgressBarStyle.Continuous;
-            progressBar.Minimum = 0;
-            progressBar.Maximum = 1000;
-            progressBar.Value = value;
-            progressText.Text = message + "  " + percent + "%";
+            progressBar.SetProgress(value);
+            progressText.Text = PreparationStage(percent);
+            progressDetail.Text = PreparationDetail(message);
+            progressPercent.Text = percent + "%";
             status.Text = "Preparing " + percent + "%";
             status.ForeColor = Color.FromArgb(176, 179, 184);
         }
@@ -760,9 +1112,10 @@ internal static class MoE4All
                 return;
             }
             preparingProgress = false;
-            progressText.Text = "Starting MoE4All Agent";
-            progressBar.Style = ProgressBarStyle.Marquee;
-            progressBar.MarqueeAnimationSpeed = 24;
+            progressText.Text = firstLaunch ? "专家已落地，正在唤醒 Agent" : "本地环境就绪，正在唤醒 Agent";
+            progressDetail.Text = "正在启动桌面界面与本地服务。";
+            progressPercent.Text = "启动中";
+            progressBar.SetIndeterminate();
             status.Text = "Starting";
         }
 
@@ -910,9 +1263,13 @@ internal static class MoE4All
             preparingProgress = false;
             status.Text = "Needs attention";
             status.ForeColor = Color.FromArgb(235, 112, 112);
-            progressBar.MarqueeAnimationSpeed = 0;
-            progressBar.Style = ProgressBarStyle.Continuous;
-            progressText.Text = "Startup needs attention";
+            startupHeading.Text = "启动遇到问题";
+            startupExplanation.Text = "MoE4All 没有继续运行。具体原因已展开在下方，修正后重新启动即可。";
+            progressBar.SetFailed();
+            progressText.Text = "需要处理后再继续";
+            progressDetail.Text = message;
+            progressPercent.Text = "已停止";
+            SetDetailsVisible(true);
             startup.Visible = true;
             startup.BringToFront();
             browserButton.Enabled = true;
