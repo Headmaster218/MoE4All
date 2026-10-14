@@ -126,7 +126,9 @@ if ($BaseArchive) {
     }
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Prepare-BundledRuntime.cjs') -Destination (Join-Path $stageHarness 'scripts\Prepare-BundledRuntime.cjs') -Force
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'vendor') -Destination (Join-Path $stageHarness 'scripts\vendor') -Recurse -Force
-    Copy-Item -LiteralPath (Join-Path $root 'harness\launcher\MoE4All.cs') -Destination (Join-Path $stageHarness 'launcher\MoE4All.cs') -Force
+    foreach ($launcherSource in @('MoE4All.cs', 'MoE4All.exe.manifest')) {
+        Copy-Item -LiteralPath (Join-Path $root "harness\launcher\$launcherSource") -Destination (Join-Path $stageHarness "launcher\$launcherSource") -Force
+    }
     $stageLauncherVendor = Join-Path $stageHarness 'launcher\vendor'
     if (Test-Path -LiteralPath $stageLauncherVendor) { Remove-Item -LiteralPath $stageLauncherVendor -Recurse -Force }
     Copy-Item -LiteralPath (Join-Path $root 'harness\launcher\vendor') -Destination $stageLauncherVendor -Recurse -Force
