@@ -68,8 +68,8 @@ $node = Get-ChildItem -LiteralPath (Join-Path $harnessRoot 'runtime') -Directory
     Select-Object -First 1
 if (-not $node) { throw 'The bundled MoE4All Node runtime is missing.' }
 if (-not $CliPath) { $CliPath = Join-Path $harnessRoot 'runtime\dsh\lib\bin.js' }
-$entry = [System.IO.Path]::GetFullPath($CliPath)
-if (-not (Test-Path -LiteralPath $entry -PathType Leaf)) { throw "MoE4All CLI entry not found: $entry" }
+$cliEntry = [System.IO.Path]::GetFullPath($CliPath)
+if (-not (Test-Path -LiteralPath $cliEntry -PathType Leaf)) { throw "MoE4All CLI entry not found: $cliEntry" }
 $cacheRoot = Join-Path $installRoot 'cache'
 $modelsRoot = Join-Path $installRoot 'models'
 $cacheDirectories = @(
@@ -109,9 +109,9 @@ $managedEnvironment = [ordered]@{
 }
 $oldEnvironment = @{}
 try {
-    foreach ($entry in $managedEnvironment.GetEnumerator()) {
-        $oldEnvironment[$entry.Key] = [Environment]::GetEnvironmentVariable($entry.Key, 'Process')
-        [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, 'Process')
+    foreach ($environmentEntry in $managedEnvironment.GetEnumerator()) {
+        $oldEnvironment[$environmentEntry.Key] = [Environment]::GetEnvironmentVariable($environmentEntry.Key, 'Process')
+        [Environment]::SetEnvironmentVariable($environmentEntry.Key, $environmentEntry.Value, 'Process')
     }
     Write-Host "MoE4All Agent: http://${HostAddress}:$Port"
     Write-Host "DSH_HOME: $agentHome"
@@ -120,7 +120,7 @@ try {
     Write-Host "Cache: $cacheRoot"
     Push-Location $workspace
     try {
-        $nodeArgs = @($entry, 'web', '--host', $HostAddress, '--port', [string]$Port)
+        $nodeArgs = @($cliEntry, 'web', '--host', $HostAddress, '--port', [string]$Port)
         if (-not $Open) { $nodeArgs += '--no-open' }
         & $node @nodeArgs
         if ($LASTEXITCODE -ne 0) { throw "MoE4All Agent exited with code $LASTEXITCODE" }
@@ -128,7 +128,7 @@ try {
         Pop-Location
     }
 } finally {
-    foreach ($entry in $managedEnvironment.GetEnumerator()) {
-        [Environment]::SetEnvironmentVariable($entry.Key, $oldEnvironment[$entry.Key], 'Process')
+    foreach ($environmentEntry in $managedEnvironment.GetEnumerator()) {
+        [Environment]::SetEnvironmentVariable($environmentEntry.Key, $oldEnvironment[$environmentEntry.Key], 'Process')
     }
 }
