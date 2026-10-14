@@ -8,6 +8,17 @@ if ((Get-Content -LiteralPath (Join-Path $harness 'distribution\agent-release.js
 }
 if (Test-Path -LiteralPath (Join-Path $harness 'agent-state')) { throw 'Do not pack an initialized Agent installation.' }
 $manifestPath = Join-Path $harness 'runtime\runtime-payload.json'
+$bootstrapRoot = Join-Path $harness 'bootstrap'
+$bootstrapNode = Join-Path $bootstrapRoot 'node.exe'
+if (-not (Test-Path -LiteralPath $bootstrapNode -PathType Leaf)) {
+    $runtimeNode = Get-ChildItem -LiteralPath (Join-Path $harness 'runtime') -Directory -Filter 'node-v*-win-x64' |
+        ForEach-Object { Join-Path $_.FullName 'node.exe' } |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+        Select-Object -First 1
+    if (-not $runtimeNode) { throw 'The bundled Node executable is missing.' }
+    New-Item -ItemType Directory -Path $bootstrapRoot -Force | Out-Null
+    Move-Item -LiteralPath $runtimeNode -Destination $bootstrapNode
+}
 if (Test-Path -LiteralPath $manifestPath) {
     $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
     foreach ($entry in $manifest.archives) {
@@ -25,7 +36,7 @@ if (-not $nodeDirectory) { throw 'The bundled Node runtime is missing.' }
 $groups = @(
     @{ root='runtime\dsh'; file='runtime\dsh-data.zip'; keep=$null },
     @{ root='distribution\prebuilt-state'; file='distribution\profile-data.zip'; keep=$null },
-    @{ root=('runtime\' + $nodeDirectory.Name); file='runtime\node-data.zip'; keep='node.exe' }
+    @{ root=('runtime\' + $nodeDirectory.Name); file='runtime\node-data.zip'; keep=$null }
 )
 $archives = @()
 foreach ($group in $groups) {
