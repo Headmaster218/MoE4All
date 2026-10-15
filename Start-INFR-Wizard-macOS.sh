@@ -468,6 +468,17 @@ MOE4ALL_JSON_AWK
 
 typeset -A S=() DEFAULTS=() J=() OVERRIDES=()
 typeset -a COMMAND=() FILES=() CANDIDATES=()
+typeset -r RE_HUGGINGFACE_URL='^https://huggingface\.co/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/resolve/[A-Za-z0-9._/?=-]+$'
+typeset -r RE_GGUF_SHARD='-[0-9]{5}-of-[0-9]{5}\.gguf$'
+typeset -r RE_GGUF_FIRST_SHARD='-00001-of-[0-9]{5}\.gguf$'
+typeset -r RE_RECENT_MODEL_PATH='^\["(recent|favorites)",[0-9]+\]$'
+typeset -r RE_PROFILE_MODEL_PATH='^\["profiles",[0-9]+,"model_path"\]$'
+typeset -r RE_IPV6_ENDPOINT='^\[([0-9a-fA-F:]+)\]:([0-9]+)$'
+typeset -r RE_HOST_PORT='^([^:]+):([0-9]+)$'
+typeset -r RE_IPV4='^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+typeset -r RE_LOOPBACK_ENDPOINT='^(127\.[0-9]+\.[0-9]+\.[0-9]+|localhost|\[::1\]):[0-9]+$'
+typeset -r RE_VERSION='^(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})$'
+typeset -r RE_RELEASE_ASSET_URL='^https://github\.com/Headmaster218/MoE4All/releases/download/release-[0-9]+\.[0-9]+\.[0-9]+/MoE4All-macOS-arm64-v[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz(\.sha256)?$'
 
 json_load() {
     local flat json_path value
@@ -716,7 +727,7 @@ ensure_model_downloader() {
 }
 model_download_file() {
     local url=$1 destination=$2 label=$3 partial attempt
-    [[ $url =~ ^https://huggingface\.co/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/resolve/[A-Za-z0-9._/?=-]+$ ]] || {
+    [[ $url =~ $RE_HUGGINGFACE_URL ]] || {
         fail "Refusing non-catalog download URL: $url"; return 1;
     }
     if [[ -s $destination ]]; then printf 'Already present: %s\n' "$destination"; return 0; fi
@@ -782,7 +793,7 @@ model_candidates() {
             vision) [[ $lower == mmproj* ]] || continue ;;
             llm|mtp)
                 [[ $lower != mmproj* ]] || continue
-                if [[ $lower =~ -[0-9]{5}-of-[0-9]{5}\.gguf$ && ! $lower =~ -00001-of-[0-9]{5}\.gguf$ ]]; then continue; fi
+                if [[ $lower =~ $RE_GGUF_SHARD && ! $lower =~ $RE_GGUF_FIRST_SHARD ]]; then continue; fi
                 [[ $2 != llm || $lower != mtp* ]] || continue ;;
         esac
         CANDIDATES+=("$file")
@@ -797,7 +808,7 @@ model_path() {
     if [[ $kind == llm && -f $ROOT/gui-data/state.json ]]; then
         if json_load "$ROOT/gui-data/state.json"; then
             for candidate_path in "${(@k)J[@]}"; do
-                if [[ $candidate_path =~ ^\[\"(recent|favorites)\",[0-9]+\]$ || $candidate_path =~ ^\[\"profiles\",[0-9]+,\"model_path\"\]$ ]]; then
+                if [[ $candidate_path =~ $RE_RECENT_MODEL_PATH || $candidate_path =~ $RE_PROFILE_MODEL_PATH ]]; then
                     json_get "$candidate_path" && remembered+=("$REPLY")
                 fi
             done
@@ -883,7 +894,7 @@ choose_device() {
 }
 valid_address() {
     local host port part compressed=false; local -a parts
-    if [[ $1 =~ ^\[([0-9a-fA-F:]+)\]:([0-9]+)$ ]]; then
+    if [[ $1 =~ $RE_IPV6_ENDPOINT ]]; then
         host=${BASH_REMATCH[1]}; port=${BASH_REMATCH[2]}; [[ $host == *:* && $host != *:::* ]] || return 1
         if [[ $host == *::* ]]; then
             part=${host#*::}; [[ $part != *::* ]] || return 1
@@ -892,16 +903,16 @@ valid_address() {
         IFS=: read -rA parts <<< "$host"
         for part in "${parts[@]}"; do [[ $part =~ ^[0-9a-fA-F]{1,4}$ ]] || return 1; done
         if [[ $compressed == true ]]; then ((${#parts[@]}<8)) || return 1; else ((${#parts[@]}==8)) || return 1; fi
-    elif [[ $1 =~ ^([^:]+):([0-9]+)$ ]]; then
+    elif [[ $1 =~ $RE_HOST_PORT ]]; then
         host=${BASH_REMATCH[1]}; port=${BASH_REMATCH[2]}
         if [[ $host != localhost ]]; then
-            [[ $host =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+            [[ $host =~ $RE_IPV4 ]] || return 1
             IFS=. read -rA parts <<< "$host"; for part in "${parts[@]}"; do valid_uint "$part" 0 255 || return 1; done
         fi
     else return 1; fi
     valid_uint "$port" 1 65535
 }
-loopback() { [[ $1 =~ ^(127\.[0-9]+\.[0-9]+\.[0-9]+|localhost|\[::1\]):[0-9]+$ ]]; }
+loopback() { [[ $1 =~ $RE_LOOPBACK_ENDPOINT ]]; }
 serial_mtp() { [[ ${S[mtp_enabled]} == true && ${S[server_parallel]} == 1 && ${S[server_vision]} == false && ${S[server_embedding]} == false ]]; }
 
 configure() {
@@ -1034,7 +1045,7 @@ build_command() {
     COMMAND+=("${S[model]}")
 }
 
-version_valid() { [[ $1 =~ ^(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})$ ]]; }
+version_valid() { [[ $1 =~ $RE_VERSION ]]; }
 version_newer() {
     version_valid "$1" && version_valid "$2" || return 1
     local -a a b; local i
@@ -1043,10 +1054,11 @@ version_newer() {
     return 1
 }
 managed() {
-    [[ -n $1 && $1 != /* && $1 != *\\* && ! $1 =~ (^|/)(\.|\.\.|)(/|$) && ! $1 =~ [[:cntrl:]] ]] || return 1
+    [[ -n $1 && $1 != /* && $1 != */ && $1 != *//* && $1 != *\\* && ! $1 =~ [[:cntrl:]] ]] || return 1
+    case "/$1/" in */./*|*/../*) return 1 ;; esac
     case $1 in
         infr|Start-INFR-Wizard-macOS.sh|README.md|README_EN.md|CHANGELOG.md|infr.example.toml|LICENSE|LICENSE-MIT|NOTICE|install-manifest.json) return 0 ;;
-        documentation/*) [[ ${1:l} =~ \.(md|png|jpg|svg|webp)$ ]] ;;
+        documentation/*) case ${1:l} in *.md|*.png|*.jpg|*.svg|*.webp) return 0 ;; *) return 1 ;; esac ;;
         *) return 1 ;;
     esac
 }
@@ -1101,7 +1113,8 @@ extract_package() {
     # manifest independently cap compressed and extracted file sizes.
     printf '%s\n' "$verbose" | awk 'substr($0,1,1)!="-"&&substr($0,1,1)!="d"{exit 1}{n++}END{if(n>6000)exit 1}' || return 1
     while IFS= read -r name; do
-        [[ $name != *\\* && ! $name =~ (^|/)(\.|\.\.)(/|$) && ! $name =~ [[:cntrl:]] && ! -v 'seen[$name]' ]] || return 1
+        [[ $name != *\\* && ! $name =~ [[:cntrl:]] && ! -v 'seen[$name]' ]] || return 1
+        case "/$name/" in */./*|*/../*) return 1 ;; esac
         seen[$name]=1; ((count+=1)); ((count<=6000)) || return 1
         [[ $name == "$prefix" || $name == "$prefix/" ]] && continue
         [[ $name == "$prefix/"* ]] || return 1
@@ -1166,7 +1179,7 @@ apply_update() (
 fetch_url() {
     local url=$1 output=$2 maximum=$3 seconds=${4-600} progress=${5-false}
     local -a curl_args=(-fL --proto '=https' --proto-redir '=https' --connect-timeout 5 --max-time "$seconds" --max-filesize "$maximum" -H 'Accept: application/vnd.github+json' -H 'User-Agent: MoE4All-macOS-Wizard' -o "$output")
-    [[ $url == https://api.github.com/repos/Headmaster218/MoE4All/releases\?per_page=100 || $url =~ ^https://github\.com/Headmaster218/MoE4All/releases/download/release-[0-9]+\.[0-9]+\.[0-9]+/MoE4All-macOS-arm64-v[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz(\.sha256)?$ ]] || return 1
+    [[ $url == https://api.github.com/repos/Headmaster218/MoE4All/releases\?per_page=100 || $url =~ $RE_RELEASE_ASSET_URL ]] || return 1
     if [[ $progress == true && -t 2 ]]; then curl_args+=(--show-error --progress-bar)
     else curl_args+=(-sS); fi
     curl "${curl_args[@]}" "$url" || return 1
