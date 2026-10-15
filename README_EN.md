@@ -2,7 +2,8 @@
 
 **Run models far larger than VRAM on gaming GPUs. AMD, NVIDIA, and Intel are all working.**
 
-The portable Windows and Linux packages are about 17 MiB and require no installation.
+The portable Windows and Linux packages are about 17 MiB and require no installation;
+an experimental Metal package is also available for Apple Silicon.
 Choose a recommended model or bring your own GGUF, select an automatic profile, and
 start terminal chat or an OpenAI-compatible API. Weights move across VRAM, system
 RAM, and SSD under one memory plan.
@@ -28,7 +29,7 @@ All speeds are tok/s.
 
 <sub>This is a directional same-host reference, not a strict same-weights, same-memory, same-harness engine A/B. See the [Strata comparison notes](#same-host-strata-v01441-comparison-2026-10-15) for compatibility conversions and methodological differences.</sub>
 
-[Released Windows builds](https://github.com/Headmaster218/MoE4All/releases/latest) |
+[Released builds](https://github.com/Headmaster218/MoE4All/releases/latest) |
 [Quick start](#quick-start) |
 [Measured results](#measured-results) |
 [Community results](#community-results) |
@@ -42,8 +43,9 @@ All speeds are tok/s.
 ### 1. Download the program
 
 Open [MoE4All Releases](https://github.com/Headmaster218/MoE4All/releases) and
-download `MoE4All-Windows-x86_64-v*.zip` on Windows or the matching `.tar.gz`
-package on Linux x86_64. This page covers **1.0.0**; the results below describe
+download `MoE4All-Windows-x86_64-v*.zip` on Windows, the matching `.tar.gz`
+package on Linux x86_64, or the experimental `MoE4All-macOS-arm64-v*.tar.gz`
+package on Apple Silicon. This page covers **1.0.0**; the results below describe
 the test conditions and provenance of the performance tables.
 
 ### 2. Extract it
@@ -53,33 +55,39 @@ Fully extract the package into a directory such as `D:\MoE4All` on Windows.
 ### 3. Run
 
 1. On Windows, double-click **`Start-INFR-Wizard.cmd`**. On Linux, run
-   `bash Start-INFR-Wizard-Linux.sh`.
+   `bash Start-INFR-Wizard-Linux.sh`. On Apple Silicon, run
+   `./Start-INFR-Wizard-macOS.sh`.
 2. Choose terminal chat or the OpenAI-compatible API. The model list shows local
    models first and a `D` download entry below them. Open it to select one or more
-   main models, Vision projectors, or Embedding models yourself. The wizard returns
+   main models yourself; Windows and Linux also expose Vision and Embedding components. The wizard returns
    to local model selection after downloading and never chooses one model for you.
    On Windows, you can also drag an existing GGUF into the window and press Enter.
 3. Select a device and automatic profile. **Aggressive performance** is used for
    the published results; **conservative** leaves more headroom for a first run or
    other active workloads.
-4. API mode can optionally enable Vision and Embedding. Their path prompts also
-   provide download access. Set concurrency, context, and API options and confirm launch.
+4. Windows/Linux API mode can optionally enable Vision and Embedding. The experimental
+   Metal package currently provides serialized, single-slot text serving only. Set context
+   and API options and confirm launch.
 
-Windows and Linux downloads show progress, retry failures, resume from `.part`
+All three release launchers show download progress, retry failures, resume from `.part`
 files, and store content in the package-local `models` directory. The Linux wizard
-does not require Python or jq and uses an existing curl or wget. If both are absent,
-it offers to install curl through apt, dnf, yum, zypper, pacman, or apk only after
-interactive confirmation. Automatic profiles use Q8 K/V by default and plan VRAM,
-system RAM, expert cache, and Ubatch. Terminal chat is currently text-only; send
-images through an OpenAI-compatible API server started with Vision enabled.
+does not require Python or jq. The macOS wizard uses the system `zsh`, `curl`, and
+standard Apple utilities, with no Homebrew, Python, jq, or Rust runtime dependency.
+Automatic profiles use Q8 K/V by default and let the engine plan available resources.
+Terminal chat is text-only; Vision API serving is currently limited to Windows/Linux.
+
+The experimental macOS binary is ad-hoc signed but not Apple-notarized. If Gatekeeper
+blocks the first launch, run `xattr -dr com.apple.quarantine /path/to/MoE4All-macOS-arm64-v*`
+on the extracted package, then start the wizard again.
 
 See the [capability matrix](documentation/reference/model-capabilities.md) for combination limits. The default API base URL is `http://127.0.0.1:8080/v1`. See the [API guide](documentation/guide/serving/api-quickstart.md) and the
 [configuration reference](documentation/reference/configuration.md) for all available settings.
 
 ## Recommended models and downloads
 
-The Windows and Linux launch wizards expose one download menu where you can select
-one or more of these models and components. You can also use the links below and
+The Windows and Linux launch wizards expose one download menu for these models and
+components; the experimental Metal launcher currently lists the two main models only.
+You can also use the links below and
 store them on a local SSD. Automatic downloads are placed in the `models` directory
 beside the launcher.
 
