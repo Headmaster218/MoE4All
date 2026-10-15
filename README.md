@@ -2,7 +2,7 @@
 
 **让游戏显卡跑起远超显存容量的大模型。AMD、NVIDIA、Intel，均已跑通。**
 
-Windows、Linux 免安装，约 17 MiB 即下即用！选择推荐的模型或自备模型，自动配置参数，即可立即开始聊天，
+Windows、Linux 免安装，约 17 MiB 即下即用；Apple Silicon 同步提供实验性 Metal 发行包。选择推荐的模型或自备模型，自动配置参数，即可立即开始聊天，
 或通过 OpenAI 兼容API接入现有客户端。显存、内存与 SSD 三级流动，协同加载权重运行。
 
 **1.0.0 性能参考**：Win 11 + RX 7900 XTX 24 GiB + Ryzen 5 5600X + 64 GiB DDR4，
@@ -24,7 +24,7 @@ Windows、Linux 免安装，约 17 MiB 即下即用！选择推荐的模型或�
 
 <sub>这是同一台机器上的方向性对照，兼容转换和测试差异见 [Strata 对照说明](#strata-v01441-同机对照2026-10-15)。</sub>
 
-[下载已发布的 Windows 版本](https://github.com/Headmaster218/MoE4All/releases/latest) |
+[下载已发布版本](https://github.com/Headmaster218/MoE4All/releases/latest) |
 [快速使用](#快速使用) |
 [实测结果](#实测结果) |
 [社区实测](#社区实测) |
@@ -39,7 +39,7 @@ Windows、Linux 免安装，约 17 MiB 即下即用！选择推荐的模型或�
 
 打开 [MoE4All Releases](https://github.com/Headmaster218/MoE4All/releases)，
 Windows 下载 `MoE4All-Windows-x86_64-v*.zip`，Linux x86_64 下载对应的
-`.tar.gz` 发行包。
+`.tar.gz` 包；Apple Silicon 可试用 `MoE4All-macOS-arm64-v*.tar.gz` 实验包。
 
 
 ### 2. 解压
@@ -48,18 +48,20 @@ Windows 下载 `MoE4All-Windows-x86_64-v*.zip`，Linux x86_64 下载对应的
 
 ### 3. 运行
 
-1. Windows 双击 **`Start-INFR-Wizard.cmd`**；Linux 运行 `bash Start-INFR-Wizard-Linux.sh`。
-2. 选择“终端聊天”或“OpenAI 兼容 API”。模型列表先显示本地已保存模型，下面的 `D` 是下载入口；进入后可自行选择一个或多个主模型、视觉或 Embedding 组件。下载完成后会回到本地模型列表，不会替用户默认选定某个模型。Windows 也可将已有 GGUF 拖入窗口后按 Enter。
+1. Windows 双击 **`Start-INFR-Wizard.cmd`**；Linux 运行 `bash Start-INFR-Wizard-Linux.sh`；Apple Silicon 运行 `./Start-INFR-Wizard-macOS.sh`。
+2. 选择“终端聊天”或“OpenAI 兼容 API”。模型列表先显示本地已保存模型，下面的 `D` 是下载入口；进入后可自行选择一个或多个主模型，Windows/Linux 还可选择视觉或 Embedding 组件。下载完成后会回到本地模型列表，不会替用户默认选定某个模型。Windows 也可将已有 GGUF 拖入窗口后按 Enter。
 3. 选择运行设备与自动配置档位。**激进性能**是本页实测使用的档位；**保守**适合首次试运行或后台程序较多时使用。
-4. API 模式可按需启用视觉和 Embedding；对应路径提示也可进入下载。设置并发、上下文和 API 后确认启动。
+4. Windows/Linux API 模式可按需启用视觉和 Embedding。macOS Metal 实验版目前为单槽文本服务，不提供视觉与 Embedding。设置上下文和 API 后确认启动。
 
-Windows 与 Linux 自动下载都会显示进度，失败重试并从 `.part` 文件续传，文件统一保存在安装目录的 `models`。Linux 向导不依赖 Python 或 jq，下载优先使用系统现有的 curl/wget；两者都缺失时，只在交互确认后通过 apt、dnf、yum、zypper、pacman 或 apk 安装 curl。自动档默认使用 Q8 K/V，显存、内存、专家缓存与 Ubatch 由引擎规划。终端聊天当前为纯文本；图片请通过启用视觉的 OpenAI 兼容 API 发送。
+三个发行版的自动下载都会显示进度，失败重试并从 `.part` 文件续传，文件统一保存在安装目录的 `models`。Linux 向导不依赖 Python 或 jq；macOS 向导只依赖系统 `zsh`、`curl` 和标准 Apple 工具，无需 Homebrew、Python、jq 或 Rust。自动档默认使用 Q8 K/V，由引擎规划可用资源。终端聊天当前为纯文本；图片请通过 Windows/Linux 上启用视觉的 OpenAI 兼容 API 发送。
+
+macOS 实验包使用临时签名，尚未 Apple 公证。若 Gatekeeper 拦截首次运行，请在终端对解压目录执行 `xattr -dr com.apple.quarantine /path/to/MoE4All-macOS-arm64-v*`，再启动向导。
 
 组合能力和限制见[模型能力矩阵](documentation/reference/model-capabilities.md)。API 默认地址为 `http://127.0.0.1:8080/v1`；请求示例见[API 使用](documentation/guide/serving/api-quickstart.md)，完整配置项见[配置参考](documentation/reference/configuration.md)。
 
 ## 推荐模型与下载
 
-Windows 与 Linux 启动向导都可从统一下载菜单选择一个或多个下列主模型和组件，也可使用链接自行下载到本地 SSD。自动下载统一保存到解压目录的 `models` 文件夹。
+Windows 与 Linux 启动向导可从统一下载菜单选择下列主模型和组件；macOS Metal 实验版当前只列出两个主模型。也可使用链接自行下载到本地 SSD，自动下载统一保存到解压目录的 `models` 文件夹。
 
 | 模型 / 组件 | 下载链接 | 文件与用途 |
 | --- | --- | --- |
