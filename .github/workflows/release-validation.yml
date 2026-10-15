@@ -4,13 +4,20 @@ on:
   push:
     branches:
       - perf/expert-mtp-optimization
+      - release/1.0.0-maintenance
+      - 'hotfix/**'
     paths:
       - '.github/workflows/release-*.yml'
       - 'scripts/build-image-codecs.py'
       - 'scripts/install-shaderc-linux.sh'
       - 'scripts/package-windows.ps1'
       - 'scripts/linux_release.py'
+      - 'scripts/macos_release.py'
       - 'scripts/smoke-*'
+      - 'scripts/infr-wizard.ps1'
+      - 'Start-INFR-Wizard.cmd'
+      - 'Start-INFR-Wizard-Linux.sh'
+      - 'Start-INFR-Wizard-macOS.sh'
       - 'crates/infr-vision/**'
   workflow_dispatch: {}
 
@@ -32,3 +39,7 @@ jobs:
     permissions:
       contents: write
     uses: ./.github/workflows/release-linux.yml
+  macos:
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-macos.yml
