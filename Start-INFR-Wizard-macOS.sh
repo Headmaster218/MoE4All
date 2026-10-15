@@ -488,7 +488,7 @@ json_load() {
     while IFS=$'\t' read -r json_path value; do
         if [[ $json_path == __MOE4ALL_ROOT__ ]]; then JSON_KIND=$value; continue; fi
         [[ -n $json_path && ! -v "J[$json_path]" ]] || return 1
-        J["$json_path"]=$value
+        J[$json_path]=$value
     done <<< "$flat"
     [[ $JSON_KIND == object || $JSON_KIND == array ]]
 }
@@ -508,17 +508,17 @@ json_decode() {
     [[ $text == \"*\" ]] || { REPLY=$text; return; }
     text=${text:1:${#text}-2}
     for ((i=0;i<${#text};i++)); do
-        c=${text:i:1}
+        c=${text:$i:1}
         if [[ $c != '\' ]]; then out+=$c; continue; fi
-        ((i+=1)); c=${text:i:1}
+        ((i+=1)); c=${text:$i:1}
         case $c in
             '"'|'\'|/) out+=$c ;; b) out+=$'\b' ;; f) out+=$'\f' ;; n) out+=$'\n' ;; r) out+=$'\r' ;; t) out+=$'\t' ;;
             u)
-                hex=${text:i+1:4}; [[ $hex =~ ^[0-9a-fA-F]{4}$ ]] || return 1
+                hex=${text:$((i+1)):4}; [[ $hex =~ ^[0-9a-fA-F]{4}$ ]] || return 1
                 n=$((16#$hex)); ((i+=4))
                 if ((n>=55296 && n<=56319)); then
-                    [[ ${text:i+1:2} == '\u' ]] || return 1
-                    hex=${text:i+3:4}; [[ $hex =~ ^[0-9a-fA-F]{4}$ ]] || return 1
+                    [[ ${text:$((i+1)):2} == '\u' ]] || return 1
+                    hex=${text:$((i+3)):4}; [[ $hex =~ ^[0-9a-fA-F]{4}$ ]] || return 1
                     low=$((16#$hex)); ((low>=56320 && low<=57343)) || return 1
                     n=$((65536+(n-55296)*1024+low-56320)); ((i+=6))
                 fi
@@ -529,10 +529,11 @@ json_decode() {
     REPLY=$out
 }
 json_get() { local json_path=$1; [[ -v "J[$json_path]" ]] || return 1; json_decode "${J[$json_path]}"; }
+json_equals() { local json_path=$1 expected=$2; json_get "$json_path" && [[ $REPLY == "$expected" ]]; }
 json_quote() {
     local text=$1 out='"' c escaped i byte LC_ALL=C
     for ((i=0;i<${#text};i++)); do
-        c=${text:i:1}
+        c=${text:$i:1}
         case $c in
             '"') out+='\"' ;; '\') out+='\\' ;; $'\n') out+='\n' ;; $'\r') out+='\r' ;; $'\t') out+='\t' ;;
             *) printf -v byte '%d' "'$c"; if ((byte<32)); then printf -v escaped '\\u%04x' "$byte"; out+=$escaped; else out+=$c; fi ;;
@@ -1078,7 +1079,11 @@ validate_package() {
     local -A seen=()
     FILES=()
     json_load "$base/install-manifest.json" || return 1
-    [[ ${J['["schema_version"]']-} == 1 && ${J['["updater_protocol"]']-} == 1 && ${J['["product"]']-} == '"moe4all-engine"' && ${J['["platform"]']-} == '"macOS-arm64"' && ${J['["version"]']-} == "\"$version\"" ]] || return 1
+    json_equals '["schema_version"]' 1 &&
+        json_equals '["updater_protocol"]' 1 &&
+        json_equals '["product"]' 'moe4all-engine' &&
+        json_equals '["platform"]' 'macOS-arm64' &&
+        json_equals '["version"]' "$version" || return 1
     while true; do
         manifest_path="[\"files\",$index,\"path\"]"; [[ -v "J[$manifest_path]" ]] || break
         json_get "$manifest_path" || return 1; name=$REPLY
@@ -1136,7 +1141,9 @@ apply_update() (
     local -a installed=() files
     [[ ! -e $root/.git && -f $root/install-manifest.json && ! -L $root/install-manifest.json ]] || { fail 'Only an extracted managed package can be updated.'; exit 1; }
     json_load "$root/install-manifest.json" || exit 1
-    [[ ${J['["product"]']-} == '"moe4all-engine"' && ${J['["platform"]']-} == '"macOS-arm64"' && ${J['["updater_protocol"]']-} == 1 ]] || exit 1
+    json_equals '["product"]' 'moe4all-engine' &&
+        json_equals '["platform"]' 'macOS-arm64' &&
+        json_equals '["updater_protocol"]' 1 || exit 1
     json_get '["version"]' || exit 1; old_version=$REPLY
     version_newer "$version" "$old_version" || { fail 'Refusing a downgrade or same-version replacement.'; exit 1; }
     validate_package "$stage" "$version" || { fail 'Invalid staged package; no files changed.'; exit 1; }
@@ -1186,12 +1193,13 @@ fetch_url() {
     [[ $(wc -c < "$output") -le $maximum ]]
 }
 select_release() {
-    local i=0 j tag version name url release_path archive checksum
+    local i=0 j tag version name url release_path draft_path prerelease_path archive checksum
     RELEASE_VERSION=''; RELEASE_ARCHIVE=''; RELEASE_CHECKSUM=''
     while true; do
         release_path="[$i,\"tag_name\"]"; [[ -v "J[$release_path]" ]] || break
         json_get "$release_path" || return 1; tag=$REPLY
-        if [[ ${J["[$i,\"draft\"]"]-} == false && ${J["[$i,\"prerelease\"]"]-} == false && $tag == release-* ]]; then
+        draft_path="[$i,\"draft\"]"; prerelease_path="[$i,\"prerelease\"]"
+        if json_equals "$draft_path" false && json_equals "$prerelease_path" false && [[ $tag == release-* ]]; then
             version=${tag#release-}
             if version_valid "$version" && { [[ -z $RELEASE_VERSION ]] || version_newer "$version" "$RELEASE_VERSION"; }; then
                 RELEASE_VERSION=$version; archive=''; checksum=''; j=0; name="MoE4All-macOS-arm64-v$version.tar.gz"
