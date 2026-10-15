@@ -1,5 +1,13 @@
 //! SGLang-style radix-tree prefix cache holding idle conversation KV in host RAM.
 //!
+//! # What is (and is not) shared
+//!
+//! The radix tree shares the *prefix index* — it decides which cached conversation can serve a
+//! prompt. Each conversation's KV *snapshot* stays a full, self-contained copy: two conversations
+//! sharing a 2000-token prefix store those bytes twice in RAM. This is NOT RadixAttention-style
+//! shared KV blocks; a true block-sharing paged tier (frames owned by the tree, zero-copy prefix
+//! reuse) is a separate experimental tier and out of scope here.
+//!
 //! The VRAM slot pool keeps `kv.slots` conversations resident; this module is the tier below
 //! it: when a different-prefix request needs its slot (checkout replacement), the outgoing
 //! device state is captured — every buffer listed by
@@ -180,7 +188,10 @@ impl RadixCache {
     pub(crate) fn stats_line(&self) -> String {
         format!(
             "entries={} held={:.2}GiB/limit={:.2}GiB hits={} misses={} demotions={} evictions={}",
-            self.nodes.iter().filter(|node| node.entry.is_some()).count(),
+            self.nodes
+                .iter()
+                .filter(|node| node.entry.is_some())
+                .count(),
             self.held_bytes() as f64 / (1u64 << 30) as f64,
             self.geometry.max_bytes as f64 / (1u64 << 30) as f64,
             self.hits,
@@ -273,7 +284,9 @@ impl RadixCache {
             .then(|| subtree.and_then(|root| self.subtree_entry_node(root)))
             .flatten();
         match (spine, below) {
-            (Some((prefix, node)), Some(below)) => (prefix >= prompt.len()).then_some(node).or(Some(below)),
+            (Some((prefix, node)), Some(below)) => {
+                (prefix >= prompt.len()).then_some(node).or(Some(below))
+            }
             (Some((_, node)), None) => Some(node),
             (None, Some(below)) => Some(below),
             (None, None) => None,
@@ -744,12 +757,8 @@ mod tests {
     fn edge_split_keeps_both_branches_matchable() {
         let mut cache = RadixCache::new(&meta(&[1]), 1 << 20);
         cache.publish(snapshot(&cache, &[1, 2, 3], 400)).unwrap();
-        cache
-            .publish(snapshot(&cache, &[1, 2, 9], 400))
-            .unwrap();
-        cache
-            .publish(snapshot(&cache, &[1, 2, 3, 4], 400))
-            .unwrap();
+        cache.publish(snapshot(&cache, &[1, 2, 9], 400)).unwrap();
+        cache.publish(snapshot(&cache, &[1, 2, 3, 4], 400)).unwrap();
         assert_eq!(cache.best_continuation_len(&[1, 2, 3, 4, 5]), 4);
         assert_eq!(cache.best_continuation_len(&[1, 2, 9, 0]), 3);
         // Shorter prompt: a descendant snapshot truncated-continues it (engine continuation rule).

@@ -199,6 +199,12 @@ cfg_struct! {
         /// pool, never written to disk). Percentages resolve against total physical RAM, like
         /// `device.ram_budget`. `None`/zero keeps the established behavior; when set it takes
         /// precedence over `session_cache_dir` (the disk tier stays closed).
+        ///
+        /// EXPERIMENTAL, two documented deviations from the budget system: the ceiling is NOT
+        /// folded into the process-wide RAM budget and competes with the expert host store for
+        /// the same physical memory (risky under the automatic aggressive policy or on iGPUs);
+        /// and demotion is synchronous at checkout replacement — `session_idle_secs` does NOT
+        /// drive this tier (no idle worker: a resident continuation always beats a restore).
         ram_cache_max: Option<SizeSpec> = None,
         /// `INFR_NO_KV_RING` (inverted): the SWA ring cache.
         ring: bool = true,

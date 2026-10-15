@@ -1548,6 +1548,8 @@ if (-not $reuseSavedSettings) {
         if ($kvRamCacheEnabled) {
             if (-not $kvRamCacheMax) { $kvRamCacheMax = '16GiB' }
             $kvRamCacheMax = Read-TextValue -Label 'RAM KV 缓存上限（绝对大小或内存百分比，如 16GiB / 25%）/ RAM KV cache limit (absolute size or percent, e.g. 16GiB / 25%)' -Default $kvRamCacheMax -Required
+            Write-Host '试验性特性：此缓存独立分配，不并入进程总 RAM 预算，会从专家 Host Store 的可用内存中挤占；自动策略或核显设备可能触发换页或内存分配失败，建议使用物理内存充裕的设备。' -ForegroundColor Yellow
+            Write-Host 'Experimental: this cache allocates OUTSIDE the process-wide RAM budget and competes with the expert host store; the auto strategy or iGPU devices may page or fail to allocate. Recommended on RAM-rich machines only.' -ForegroundColor DarkGray
             if ($serverSessionCache) {
                 Write-Host 'RAM 缓存开启，磁盘会话缓存已关闭。The disk session cache was turned off because the RAM cache is on.' -ForegroundColor Yellow
                 $serverSessionCache = $false
