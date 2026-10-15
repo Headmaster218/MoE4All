@@ -3349,6 +3349,30 @@ impl Backend for CpuBackend {
                     }
                     vals[dst.0 as usize] = out;
                 }
+                Op::SamplingPenalty {
+                    x,
+                    counts,
+                    control,
+                    n,
+                    rows,
+                } => {
+                    let n = n as usize;
+                    for row in 0..rows as usize {
+                        let p = &vals[control.0 as usize][row * 4..row * 4 + 4];
+                        let (presence, frequency, previous, base) =
+                            (p[0], p[1], p[2].to_bits(), p[3].to_bits() as usize * n);
+                        for token in 0..n {
+                            let count = &mut vals[counts.0 as usize][base + token];
+                            if token == previous as usize {
+                                *count += 1.0;
+                            }
+                            let count = *count;
+                            if count > 0.0 {
+                                vals[x.0 as usize][row * n + token] -= presence + frequency * count;
+                            }
+                        }
+                    }
+                }
                 Op::Sample {
                     x,
                     u,

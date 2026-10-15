@@ -1213,6 +1213,7 @@ pub(super) struct DecodeHandles {
     // the `[vocab]` logits. `None` when the build didn't append the op (sampling temp > 0, a
     // grammar constraint, or a multi-row logits build).
     tok_id: Option<TensorId>,
+    penalty_io: Option<(TensorId, TensorId)>,
     // Qwen3.8's caller-owned four-stream residual and PLE inputs. The wide residual is shared by
     // the layer-0 and layer-1..end plans; PLE inputs exist only on a span containing the PLE layer.
     qwen_wide: Option<TensorId>,
@@ -1226,6 +1227,66 @@ pub(super) struct DecodeHandles {
     qsa_k_cache: Vec<Option<TensorId>>,
     qsa_block_cache: Vec<Option<TensorId>>,
     weights: Vec<TensorId>, // flat, in declaration == upload order
+}
+
+/// Counts are initialized from request-local CPU mirrors once per cohort. Thereafter only the
+/// actual committed ids cross to the GPU; rebuilding/reordering a cohort starts from its mirrors.
+struct GpuPenaltyBuffers {
+    counts: Box<dyn Buffer>,
+    control: Box<dyn Buffer>,
+}
+
+impl GpuPenaltyBuffers {
+    fn new(
+        be: &dyn Backend,
+        vocab: usize,
+        penalties: &[Option<&crate::sampling::Penalties>],
+    ) -> AResult<Self> {
+        let mut counts = vec![0f32; penalties.len() * vocab];
+        for (row, penalty) in penalties.iter().enumerate() {
+            if let Some(penalty) = penalty {
+                penalty.write_counts(&mut counts[row * vocab..(row + 1) * vocab]);
+            }
+        }
+        let buffers = Self {
+            counts: be.alloc_uninit(counts.len() * 4, BufferUsage::Activations)?,
+            control: be.alloc_uninit(penalties.len() * 16, BufferUsage::Staging)?,
+        };
+        be.upload(buffers.counts.as_ref(), bytemuck::cast_slice(&counts))?;
+        buffers.upload(
+            be,
+            penalties
+                .iter()
+                .enumerate()
+                .map(|(row, penalty)| Self::control_row(*penalty, None, row)),
+        )?;
+        Ok(buffers)
+    }
+
+    fn control_row(
+        penalty: Option<&crate::sampling::Penalties>,
+        previous: Option<u32>,
+        row: usize,
+    ) -> [u32; 4] {
+        penalty.map_or([0, 0, previous.unwrap_or(u32::MAX), row as u32], |p| {
+            p.gpu_control(previous, row)
+        })
+    }
+
+    fn upload(&self, be: &dyn Backend, rows: impl Iterator<Item = [u32; 4]>) -> AResult<()> {
+        let control = rows.collect::<Vec<_>>();
+        if !control.is_empty() {
+            be.upload(self.control.as_ref(), bytemuck::cast_slice(&control))?;
+        }
+        Ok(())
+    }
+
+    fn bind<'a>(&'a self, bindings: &mut Bindings<'a>, handles: &DecodeHandles) {
+        if let Some((counts, control)) = handles.penalty_io {
+            bindings.bind(counts, self.counts.as_ref());
+            bindings.bind(control, self.control.as_ref());
+        }
+    }
 }
 
 /// One serve slot with every pool-external, session-lifetime allocation already materialized.
@@ -3760,17 +3821,42 @@ fn generate_dense_backend_inner(
     let mut rng = crate::sampling::resolve_seed(req, &ec.sampling);
     // Repetition penalties (`infr serve`'s presence/frequency/repeat request fields). `None` for
     // every non-serve caller AND for any request that leaves them at their neutral defaults — see
-    // `Penalties::resolve`. When active they must MUTATE the logits row, so they force the host
-    // sampling path below (exactly like a grammar constraint does).
+    // `Penalties::resolve`. Additive penalties can mutate the row on Vulkan; repeat-window
+    // penalties and constrained/speculative paths retain host sampling.
     let mut penalties = crate::sampling::Penalties::resolve(req);
     let penalize = penalties.is_some();
+    // Speculative verification keeps the existing host semantics: rejected drafts must not
+    // enter generated-token counts. Repeat-window penalties likewise stay on the host.
+    let gpu_penalty_backend = be.name() == "vulkan"
+        && !ec.spec.mtp
+        && verify.is_none()
+        && parallel_mtp_verify.is_none()
+        && mtp_prefill_sink.is_none()
+        && denoise_req.is_none()
+        && logits_out.is_none()
+        && h_out.is_none();
+    let gpu_penalty_graph = gpu_penalty_backend
+        && (penalties
+            .as_ref()
+            .is_some_and(crate::sampling::Penalties::gpu_supported)
+            || parallel_decode.as_ref().is_some_and(|p| {
+                p.samplers.iter().any(|s| {
+                    s.penalties()
+                        .is_some_and(crate::sampling::Penalties::gpu_supported)
+                })
+            }));
+    let host_penalty = penalize
+        && !(gpu_penalty_backend
+            && penalties
+                .as_ref()
+                .is_none_or(crate::sampling::Penalties::gpu_supported));
     // GPU-resident greedy sampling (`Op::Argmax` appended to the decode graph): only the 4-byte
     // token id is read back per step — the [vocab] logits stay in VRAM (downloaded only for the
     // one-time `logits_out` hook). Grammar-constrained decodes need host logits every step
     // (llguidance masking). INFR_NO_GPU_ARGMAX forces the host path (A/B).
     let gpu_argmax = (sampler.temp <= 0.0 || sampler.top_k == 1)
         && constraint.is_none()
-        && !penalize
+        && !host_penalty
         && ec.spec.gpu_argmax;
     // GPU-resident stochastic sampling (`Op::Sample`): temperature + top-k + top-p ON the device,
     // inverse-CDF'd with a host-drawn uniform uploaded as 4 bytes/token — the host consumes the
@@ -3781,7 +3867,7 @@ fn generate_dense_backend_inner(
         && sampler.temp > 0.0
         && (2..=infr_vulkan::Recorder::SAMPLE_KMAX).contains(&sampler.top_k)
         && constraint.is_none()
-        && !penalize
+        && !host_penalty
         && caps.gpu_sample
         && ec.spec.gpu_sample;
 
@@ -7951,6 +8037,7 @@ fn generate_dense_backend_inner(
         }
         // LM-head tail — skipped entirely for headless builds (`logits_rows == 0`, the batched
         // prefill chunks: see `logits`' declaration above).
+        let mut penalty_io = None;
         let (h_out, tok_id, u_in) = if let Some(logits) = logits {
             if !c.qwen4exp {
                 g.push(Op::RmsNorm {
@@ -8012,6 +8099,18 @@ fn generate_dense_backend_inner(
             // host-drawn uniform read from the 1-float `u_in` Input. `logits_rows > 1` with
             // `gpu_argmax` is the MTP speculative-verify accept (issue #31): one per-row argmax,
             // m ids read back instead of m×vocab logits.
+            if gpu_penalty_graph && !mtp_verify && !denoise && (gpu_argmax || gpu_sample) {
+                let counts = g.input(f32d(batch * c.vocab));
+                let control = g.input(f32d(logits_rows * 4));
+                g.push(Op::SamplingPenalty {
+                    x: logits,
+                    counts,
+                    control,
+                    n: c.vocab as u32,
+                    rows: logits_rows as u32,
+                });
+                penalty_io = Some((counts, control));
+            }
             let (tok_id, u_in) = if gpu_argmax {
                 let tid = g.output(f32d(logits_rows));
                 g.push(Op::Argmax {
@@ -8060,6 +8159,7 @@ fn generate_dense_backend_inner(
                 tok_ids,
                 u_in,
                 tok_id,
+                penalty_io,
                 qwen_wide,
                 ple_embd,
                 ple_state,
@@ -9924,6 +10024,20 @@ fn generate_dense_backend_inner(
             )
         };
         let capture_hidden = parallel.hidden.is_some();
+        let gpu_penalty_buffers = if gpu_penalty_graph {
+            Some(GpuPenaltyBuffers::new(
+                be,
+                c.vocab,
+                &parallel
+                    .samplers
+                    .iter()
+                    .map(|s| s.penalties())
+                    .collect::<Vec<_>>(),
+            )?)
+        } else {
+            None
+        };
+        let mut penalty_previous = vec![None; lanes];
         let hidden_width = c.hc_mult * ne;
         let hidden_out = if capture_hidden {
             Some(
@@ -9964,12 +10078,17 @@ fn generate_dense_backend_inner(
         let argmax_capable = parallel
             .samplers
             .iter()
-            .map(crate::sampling::ParallelSampler::can_gpu_argmax)
+            .map(|lane| {
+                lane.can_gpu_argmax() && (gpu_penalty_backend || lane.penalties().is_none())
+            })
             .collect::<Vec<_>>();
         let gpu_sample_capable = parallel
             .samplers
             .iter()
-            .map(|lane| lane.can_gpu_sample_with(sampler))
+            .map(|lane| {
+                lane.can_gpu_sample_with(sampler)
+                    && (gpu_penalty_backend || lane.penalties().is_none())
+            })
             .collect::<Vec<_>>();
         let prepare_decode_plans = |plan_step: usize| -> AResult<PreparedParallelDecodePlans> {
             let plan_positions = lane_starts
@@ -10082,17 +10201,18 @@ fn generate_dense_backend_inner(
             let batch_argmax = logits_rows > 0
                 && caps.argmax_rows
                 && ec.spec.gpu_argmax
-                && parallel.samplers[sample_from..]
-                    .iter()
-                    .all(crate::sampling::ParallelSampler::can_gpu_argmax);
+                && parallel.samplers[sample_from..].iter().all(|lane| {
+                    lane.can_gpu_argmax() && (gpu_penalty_backend || lane.penalties().is_none())
+                });
             let batch_gpu_sample = logits_rows > 0
                 && (logits_rows == 1 || caps.sample_rows)
                 && caps.gpu_sample
                 && ec.spec.gpu_sample
                 && (2..=infr_vulkan::Recorder::SAMPLE_KMAX).contains(&sampler.top_k)
-                && parallel.samplers[sample_from..]
-                    .iter()
-                    .all(|lane| lane.can_gpu_sample_with(sampler));
+                && parallel.samplers[sample_from..].iter().all(|lane| {
+                    lane.can_gpu_sample_with(sampler)
+                        && (gpu_penalty_backend || lane.penalties().is_none())
+                });
             let mut current_plans = prepared_decode_plans
                 .take()
                 .ok_or_else(|| anyhow!("missing prepared Decode plans"))?;
@@ -10273,6 +10393,22 @@ fn generate_dense_backend_inner(
                     logits_batch.as_ref(),
                 );
             }
+            if let Some(buffers) = gpu_penalty_buffers
+                .as_ref()
+                .filter(|_| h1.penalty_io.is_some())
+            {
+                buffers.upload(
+                    be,
+                    (sample_from..lanes).map(|lane| {
+                        GpuPenaltyBuffers::control_row(
+                            parallel.samplers[lane].penalties(),
+                            penalty_previous[lane],
+                            lane,
+                        )
+                    }),
+                )?;
+                buffers.bind(&mut b1, &h1);
+            }
             if batch_argmax {
                 b1.bind(
                     h1.tok_id.expect("parallel greedy token step has ids"),
@@ -10369,7 +10505,7 @@ fn generate_dense_backend_inner(
                         let blocked = next[row];
                         let logits = &mut logits[row * c.vocab..(row + 1) * c.vocab];
                         parallel.reasoning_guards[lane].mask_eos(c, logits);
-                        next[row] = parallel.samplers[lane].sample(logits);
+                        next[row] = parallel.samplers[lane].sample_penalized(logits);
                         tracing::warn!(
                             lane,
                             blocked_token = blocked,
@@ -10377,6 +10513,11 @@ fn generate_dense_backend_inner(
                             "Qwen3.8 suppressed premature EOS inside an open reasoning block"
                         );
                     }
+                }
+                for (row, &token) in next.iter().enumerate() {
+                    let lane = sample_from + row;
+                    parallel.samplers[lane].observe(token);
+                    penalty_previous[lane] = Some(token);
                 }
             } else if logits_rows > 0 {
                 let mut logits = vec![0f32; logits_rows * c.vocab];
@@ -10836,6 +10977,13 @@ fn generate_dense_backend_inner(
     // Positions monotonically increase and are consumed before their slot wraps (mod 64), so no
     // read ever observes a stale draw from 64 tokens ago within the active window.
     let mut u_ring_host = [0f32; 64];
+    let gpu_penalty_buffers = if gpu_penalty_graph && (gpu_argmax || gpu_sample) {
+        let _gp = req.and_then(|r| r.gate_pass());
+        Some(GpuPenaltyBuffers::new(be, c.vocab, &[penalties.as_ref()])?)
+    } else {
+        None
+    };
+    let mut penalty_previous = None;
     // Chained decode: when the graph both GATHERS from an id input and SAMPLES an id output,
     // bind them to the SAME buffer — within one iteration the gather reads before the sampler
     // writes, and across chained iterations the sampler's id feeds the next gather directly
@@ -11645,6 +11793,9 @@ fn generate_dense_backend_inner(
         if let Some(uin) = h.u_in {
             b.bind(uin, u_buf.as_ref());
         }
+        if let Some(buffers) = gpu_penalty_buffers.as_ref() {
+            buffers.bind(&mut b, &h);
+        }
         Some((plan, b))
     } else {
         None
@@ -11669,7 +11820,9 @@ fn generate_dense_backend_inner(
     // exclusion matters only here (not for `gpu_argmax`): a decline mid-flight would have already
     // drawn+uploaded this chunk's uniforms from the host RNG stream, desyncing it from the
     // per-token fallback's draws for the SAME tokens (argmax draws nothing, so it's harmless there).
+    // Counts advance from host-confirmed commits, so a penalty graph replays one token at a time.
     let can_chain = gpu_embed
+        && gpu_penalty_buffers.is_none()
         && (gpu_argmax || gpu_sample)
         && ro.is_some()
         && chain_n >= 2
@@ -11898,6 +12051,18 @@ fn generate_dense_backend_inner(
         // step can emit several deterministically-forced tokens at once — they're queued onto
         // `cur` and the following iterations just feed them (no sampling) until the frontier.
         let at_frontier = pos + 1 == cur.len();
+        if is_decode && at_frontier {
+            if let Some(buffers) = gpu_penalty_buffers.as_ref() {
+                buffers.upload(
+                    be,
+                    std::iter::once(GpuPenaltyBuffers::control_row(
+                        penalties.as_ref(),
+                        penalty_previous,
+                        0,
+                    )),
+                )?;
+            }
+        }
         // MTP Phase 1 h-tap (issue #33): only the frontier row is ever sampled/downloaded as
         // logits — same row `h_out` (when requested) captures. `dyn_replay` already excludes
         // `h_out.is_some()` (see its doc), so this is always the rebuild (`else`) branch below.
@@ -12051,6 +12216,9 @@ fn generate_dense_backend_inner(
             if let Some(uin) = h1.u_in {
                 b1.bind(uin, u_buf.as_ref());
             }
+            if let Some(buffers) = gpu_penalty_buffers.as_ref() {
+                buffers.bind(&mut b1, &h1);
+            }
             if let (Some(ho), Some(hb)) = (h1.h_out, &h_tap_buf) {
                 b1.bind(ho, hb.as_ref());
             }
@@ -12106,6 +12274,9 @@ fn generate_dense_backend_inner(
             }
             if let Some(uin) = h.u_in {
                 b.bind(uin, u_buf.as_ref());
+            }
+            if let Some(buffers) = gpu_penalty_buffers.as_ref() {
+                buffers.bind(&mut b, &h);
             }
             if let (Some(ho), Some(hb)) = (h.h_out, &h_tap_buf) {
                 b.bind(ho, hb.as_ref());
@@ -12260,6 +12431,7 @@ fn generate_dense_backend_inner(
                 if let Some(p) = penalties.as_mut() {
                     p.observe(next);
                 }
+                penalty_previous = Some(next);
                 reasoning_eos_guard.observe(c, next);
                 let is_eos = !ignore_eos && (c.eos_ids.contains(&next) || next == c.eos);
                 out.push(next);

@@ -7123,6 +7123,21 @@ fn lower_op(
             }
             rec.gather_i32(r(*table)?, r(*ids)?, r(*dst)?, *rows as usize, *ne as usize);
         }
+        Op::SamplingPenalty {
+            x,
+            counts,
+            control,
+            n,
+            rows,
+        } => {
+            rec.sampling_penalty(
+                r(*x)?,
+                r(*counts)?,
+                r(*control)?,
+                *n as usize,
+                *rows as usize,
+            );
+        }
         Op::Sample {
             x,
             u,
@@ -8243,6 +8258,11 @@ pub(crate) fn execute_chain(
         return Ok(None);
     };
     if !plan.eligible
+        || plan
+            .graph
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::SamplingPenalty { .. }))
         || n == 0
         || n > 64
         || be_.unified_client.is_some()

@@ -3792,6 +3792,11 @@ impl MetalBackend {
                 }
                 r.loc[dst.0 as usize] = Loc::Device;
             }
+            Op::SamplingPenalty { .. } => {
+                return Err(Error::Unsupported(
+                    "Metal GPU additive penalties are not implemented; use host sampling".into(),
+                ));
+            }
             Op::ArgmaxProb { .. } => {
                 // No fused argmax+prob kernel on Metal yet (issue #33 follow-up, Vulkan-only so
                 // far — `Capabilities::argmax_prob` is false, so the MTP driver never builds this

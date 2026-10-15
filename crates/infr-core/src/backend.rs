@@ -16,6 +16,9 @@ use crate::error::{Error, Result};
 use crate::graph::Graph;
 use crate::tensor::TensorId;
 
+/// Maximum active rows in one layer-synchronous Decode cohort (not the KV slot pool size).
+pub const MAX_DECODE_ROWS: usize = 8;
+
 /// Bounds-check a [`Backend::copy_buffer`] prefix request: the copied prefix (`bytes`) must fit
 /// inside the source buffer (`src_len`). Returns a `Backend` error rather than letting a downstream
 /// slice/download panic on an oversize `bytes`. Extracted as a pure helper so the check is unit-

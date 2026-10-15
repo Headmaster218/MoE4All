@@ -1684,8 +1684,15 @@ pub(crate) fn params_advance_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
-/// SPIR-V for the vocab sampler's slice pass (256 workgroups → 256*k (val, idx) candidates).
+/// Separate additive-penalty pass before argmax/top-k; counts persist between steps.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn sampling_penalty_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sampling_penalty.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+
+/// SPIR-V for the vocab sampler's slice pass (256 workgroups -> 256*k candidates).
 pub(crate) fn sample_topk_part_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sample_topk_part.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();

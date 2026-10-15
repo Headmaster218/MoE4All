@@ -11865,6 +11865,33 @@ impl<'a> Recorder<'a> {
     /// Largest `top_k` the GPU stochastic sampler handles; above this the caller samples on the host.
     pub const SAMPLE_KMAX: usize = crate::gemm::SAMPLE_KMAX;
 
+    /// Additive request penalties over persistent per-row generated-token counts.
+    pub fn sampling_penalty(
+        &self,
+        logits: &dyn Buffer,
+        counts: &dyn Buffer,
+        control: &dyn Buffer,
+        n: usize,
+        rows: usize,
+    ) {
+        let mut push = [0u8; 8];
+        push[..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..].copy_from_slice(&(rows as u32).to_ne_bytes());
+        let kernel = self.be.kernel(
+            "sampling_penalty",
+            crate::gemm::sampling_penalty_spv(),
+            3,
+            8,
+        );
+        self.dispatch(
+            kernel,
+            &[Self::vkb(logits), Self::vkb(counts), Self::vkb(control)],
+            3,
+            &push,
+            (n * rows).div_ceil(256) as u32,
+        );
+    }
+
     /// Vocab-scale GPU stochastic sampling (`Op::Sample`): temperature + top-k + top-p over `n`
     /// logits → one token id per row, with one uniform draw per row read from `u`. Two-stage (see
     /// sample_topk.comp); `cand` = rows*2*256*top_k f32 scratch. Requires
