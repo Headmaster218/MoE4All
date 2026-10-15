@@ -82,6 +82,7 @@ function Select-Moe4AllEngineRelease {
             ArchiveSize = [long]$archive.size
             ChecksumName = "$archiveName.sha256"
             ChecksumUrl = [string]$checksum.browser_download_url
+            ChecksumSize = [long]$checksum.size
         }
         if ($null -eq $selected -or (Compare-Moe4AllSemVer $candidate.SemVer $selected.SemVer) -gt 0) {
             $selected = $candidate

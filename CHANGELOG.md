@@ -6,6 +6,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-10-15
+
+### Added
+
+- Added an experimental Apple Silicon release package with a system-zsh Metal launcher for text run, single-slot serve, benchmark, and explicit MTP workflows; it has no Homebrew, Python, jq, or Rust runtime dependency.
+
+### Fixed
+
+- Made Windows managed-package updates stream progress, relaunch the replaced wizard, verify the reported engine version, and restore the previous installation if the new launcher fails.
+- Made Linux managed-package updates validate the replacement launcher and restart directly into the updated version after releasing updater resources.
+
 ## [1.0.1] - 2026-10-15
 
 ### Changed

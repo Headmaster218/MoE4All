@@ -4,9 +4,12 @@ param(
     [Parameter(Mandatory = $true)][string]$StagedPackageRoot,
     [Parameter(Mandatory = $true)][string]$ExpectedVersion,
     [int]$ParentProcessId = 0,
+    [int]$LauncherProcessId = 0,
     [string]$CleanupRoot = '',
     [switch]$DeleteSelf,
-    [switch]$NoRelaunch
+    [switch]$NoRelaunch,
+    [switch]$RelaunchProbeOnly,
+    [switch]$NoFailureRelaunch
 )
 
 $ErrorActionPreference = 'Stop'
@@ -20,14 +23,78 @@ if (-not (Test-Path -LiteralPath $commonPath -PathType Leaf)) {
 }
 . $commonPath
 
-function Start-UpdatedWizard {
-    param([Parameter(Mandatory = $true)][string]$Root)
+function Stop-StartedWizardTree {
+    param([Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process)
 
-    if ($NoRelaunch) { return }
-    $launcher = Join-Path $Root 'Start-INFR-Wizard.cmd'
-    if (Test-Path -LiteralPath $launcher -PathType Leaf) {
-        Start-Process -FilePath $launcher -ArgumentList '-SkipUpdateCheck' -WorkingDirectory $Root | Out-Null
+    try {
+        if ($Process.HasExited) { return }
+        & taskkill.exe /PID $Process.Id /T /F *> $null
+    } catch {
+        try { Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue } catch {}
     }
+}
+
+function Start-UpdatedWizard {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [string]$ExpectedVersion = '',
+        [switch]$SkipUpdateCheck,
+        [switch]$RequireReadinessProbe
+    )
+
+    if ($NoRelaunch) { return $false }
+    $launcher = Join-Path $Root 'Start-INFR-Wizard.cmd'
+    if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) {
+        throw "The updated launcher is missing: $launcher"
+    }
+
+    $launcherArguments = [System.Collections.Generic.List[string]]::new()
+    if ($SkipUpdateCheck) { $launcherArguments.Add('-SkipUpdateCheck') }
+    $probePath = ''
+    if ($RequireReadinessProbe) {
+        $probePath = Join-Path $Root ('.update\relaunch-' + [guid]::NewGuid().ToString('N') + '.json')
+        $launcherArguments.Add('-PostUpdateProbePath')
+        $launcherArguments.Add('"' + $probePath.Replace('"', '""') + '"')
+        if ($ExpectedVersion) {
+            $launcherArguments.Add('-ExpectedPostUpdateVersion')
+            $launcherArguments.Add('"' + $ExpectedVersion.Replace('"', '""') + '"')
+        }
+        if ($RelaunchProbeOnly) { $launcherArguments.Add('-ExitAfterPostUpdateProbe') }
+    }
+
+    $quotedLauncher = '"' + $launcher.Replace('"', '""') + '"'
+    $commandLine = '/d /s /c "' + $quotedLauncher + ' ' + ($launcherArguments -join ' ') + '"'
+    $process = Start-Process -FilePath $env:ComSpec -ArgumentList $commandLine -WorkingDirectory $Root -WindowStyle Normal -PassThru
+    if (-not $RequireReadinessProbe) { return $true }
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(20)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (Test-Path -LiteralPath $probePath -PathType Leaf) { break }
+        if ($process.HasExited) {
+            throw "The updated launcher exited before reporting readiness (exit code $($process.ExitCode))."
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    if (-not (Test-Path -LiteralPath $probePath -PathType Leaf)) {
+        Stop-StartedWizardTree -Process $process
+        throw 'The updated launcher did not report readiness within 20 seconds.'
+    }
+
+    try {
+        $probe = Get-Content -LiteralPath $probePath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($ExpectedVersion -and [string]$probe.version -ne $ExpectedVersion) {
+            throw "The updated launcher reported v$($probe.version); expected v$ExpectedVersion."
+        }
+        if ($RelaunchProbeOnly -and -not $process.WaitForExit(10000)) {
+            throw 'The probe-only updated launcher did not exit after reporting readiness.'
+        }
+    } catch {
+        Stop-StartedWizardTree -Process $process
+        throw
+    } finally {
+        Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
+    }
+    return $true
 }
 
 function Write-UpdateResult {
@@ -48,12 +115,39 @@ function Write-UpdateResult {
     [System.IO.File]::WriteAllText((Join-Path $updateRoot 'last-update-result.json'), $json, [System.Text.UTF8Encoding]::new($false))
 }
 
+if ($LauncherProcessId -le 0 -and $ParentProcessId -gt 0) {
+    try {
+        $wizardProcess = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $ParentProcessId" -ErrorAction Stop
+        $launcherProcess = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $([int]$wizardProcess.ParentProcessId)" -ErrorAction Stop
+        $launcherCommandLine = [string]$launcherProcess.CommandLine
+        if ([string]$launcherProcess.Name -ieq 'cmd.exe' -and $launcherCommandLine -match '(?i)(?:^|\s)/c(?:\s|$)' -and $launcherCommandLine -match '(?i)Start-INFR-Wizard\.cmd') {
+            $LauncherProcessId = [int]$launcherProcess.ProcessId
+        }
+    } catch {
+        $LauncherProcessId = 0
+    }
+}
+
 if ($ParentProcessId -gt 0) {
     try {
         $parent = Get-Process -Id $ParentProcessId -ErrorAction Stop
-        [void]$parent.WaitForExit(30000)
+        if (-not $parent.WaitForExit(30000)) {
+            throw 'The previous wizard did not exit within 30 seconds.'
+        }
     } catch {
+        if (Get-Process -Id $ParentProcessId -ErrorAction SilentlyContinue) { throw }
         # The parent may already have exited before the helper starts.
+    }
+}
+if ($LauncherProcessId -gt 0) {
+    try {
+        $launcherProcess = Get-Process -Id $LauncherProcessId -ErrorAction Stop
+        if (-not $launcherProcess.WaitForExit(30000)) {
+            throw 'The previous CMD launcher did not exit within 30 seconds.'
+        }
+    } catch {
+        if (Get-Process -Id $LauncherProcessId -ErrorAction SilentlyContinue) { throw }
+        # The transient cmd.exe launcher may already have exited.
     }
 }
 Start-Sleep -Milliseconds 1200
@@ -133,6 +227,7 @@ try {
     }
 
     Write-UpdateResult -Status success -Message "MoE4All Engine was updated to v$ExpectedVersion."
+    $relaunched = Start-UpdatedWizard -Root $InstallRoot -ExpectedVersion $ExpectedVersion -SkipUpdateCheck -RequireReadinessProbe
     if (-not [string]::IsNullOrWhiteSpace($CleanupRoot)) {
         $cleanup = [System.IO.Path]::GetFullPath($CleanupRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
         $updateRoot = [System.IO.Path]::GetFullPath((Join-Path $InstallRoot '.update')).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
@@ -141,8 +236,10 @@ try {
             Remove-Item -LiteralPath $cleanup -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+    if ($relaunched -and (Test-Path -LiteralPath $backupRoot)) {
+        Remove-Item -LiteralPath $backupRoot -Recurse -Force
+    }
     Write-Host "MoE4All Engine updated to v$ExpectedVersion." -ForegroundColor Green
-    Start-UpdatedWizard -Root $InstallRoot
 } catch {
     $failure = $_
     Write-Warning "Update failed; restoring the previous installation. $($failure.Exception.Message)"
@@ -163,8 +260,14 @@ try {
         Remove-Item -LiteralPath $oldManifestPath -Force -ErrorAction SilentlyContinue
     }
     Write-UpdateResult -Status error -Message "Engine update failed and was rolled back: $($failure.Exception.Message)"
-    Start-UpdatedWizard -Root $InstallRoot
-    throw
+    if (-not $NoFailureRelaunch) {
+        try {
+            [void](Start-UpdatedWizard -Root $InstallRoot)
+        } catch {
+            Write-Warning "The previous installation was restored, but its launcher could not be reopened. $($_.Exception.Message)"
+        }
+    }
+    throw $failure
 } finally {
     if ($DeleteSelf -and -not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
         Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue

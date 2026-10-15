@@ -134,7 +134,7 @@ try {
         $PackageRoot
         '-ExpectedVersion'
         $targetVersion
-        '-NoRelaunch'
+        '-RelaunchProbeOnly'
     )
     $updateOutput = & powershell.exe @nativeArgs 2>&1 | Out-String
     $updateExitCode = $LASTEXITCODE
@@ -155,8 +155,14 @@ try {
         throw 'Engine update did not remove a product-owned file absent from the new manifest.'
     }
     [void](Read-Moe4AllInstallManifest -ManifestPath (Join-Path $updateTestRoot 'install-manifest.json') -PackageRoot $updateTestRoot -VerifyFiles)
-    $backupLegacy = Get-ChildItem -LiteralPath (Join-Path $updateTestRoot '.update\backups') -Filter 'legacy-managed.txt' -File -Recurse | Select-Object -First 1
-    if ($null -eq $backupLegacy) { throw 'Engine update did not retain a rollback copy of the old managed file.' }
+    $updateResult = Get-Content -LiteralPath (Join-Path $updateTestRoot '.update\last-update-result.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ([string]$updateResult.status -ne 'success' -or [string]$updateResult.version -ne $targetVersion) {
+        throw 'Engine update did not record a successful replacement and relaunch.'
+    }
+    $probeFiles = @(Get-ChildItem -LiteralPath (Join-Path $updateTestRoot '.update') -Filter 'relaunch-*.json' -File -ErrorAction SilentlyContinue)
+    if ($probeFiles.Count -ne 0) { throw 'Engine update left a relaunch probe behind.' }
+    $backupFiles = @(Get-ChildItem -LiteralPath (Join-Path $updateTestRoot '.update\backups') -File -Recurse -ErrorAction SilentlyContinue)
+    if ($backupFiles.Count -ne 0) { throw 'Engine update retained old-version files after the replacement and relaunch were verified.' }
 } finally {
     if (Test-Path -LiteralPath $updateTestRoot) {
         Remove-Item -LiteralPath $updateTestRoot -Recurse -Force

@@ -2374,7 +2374,7 @@ impl ParallelSeam {
                     &prompts[0],
                     &mut primary,
                     self.max_ctx,
-                    prepared[0].clone(),
+                    prepared[0],
                 )
                 .map(|stats| vec![stats])
             }

@@ -2,7 +2,10 @@
 param(
     [Parameter(Position = 0)][string]$InitialModelPath = '',
     [switch]$DryRun,
-    [switch]$SkipUpdateCheck
+    [switch]$SkipUpdateCheck,
+    [string]$PostUpdateProbePath = '',
+    [string]$ExpectedPostUpdateVersion = '',
+    [switch]$ExitAfterPostUpdateProbe
 )
 
 $ErrorActionPreference = 'Stop'
@@ -593,17 +596,22 @@ function Format-DownloadBytes {
     return "$Bytes B"
 }
 
-function Invoke-ModelFileDownload {
+function Invoke-FileDownloadWithProgress {
     param(
         [Parameter(Mandatory = $true)][string]$Url,
         [Parameter(Mandatory = $true)][string]$Destination,
         [Parameter(Mandatory = $true)][string]$Label,
-        [int]$MaximumAttempts = 3
+        [int]$MaximumAttempts = 3,
+        [long]$ExpectedBytes = 0,
+        [int]$ProgressId = 71,
+        [int]$ParentProgressId = -1,
+        [string]$UserAgent = 'MoE4All-Wizard/1.0',
+        [switch]$ReplaceExisting
     )
 
     if (Test-Path -LiteralPath $Destination -PathType Leaf) {
         $existingFile = Get-Item -LiteralPath $Destination
-        if ($existingFile.Length -gt 0) {
+        if (-not $ReplaceExisting -and $existingFile.Length -gt 0) {
             Write-Host "已存在，跳过 / Already present: $Destination" -ForegroundColor DarkGray
             return
         }
@@ -630,7 +638,7 @@ function Invoke-ModelFileDownload {
             $request.AllowAutoRedirect = $true
             $request.Timeout = 30000
             $request.ReadWriteTimeout = 120000
-            $request.UserAgent = 'MoE4All-Wizard/1.0'
+            $request.UserAgent = $UserAgent
             if ($resumeAt -gt 0) { $request.AddRange($resumeAt) }
 
             $response = [System.Net.HttpWebResponse]$request.GetResponse()
@@ -641,7 +649,13 @@ function Invoke-ModelFileDownload {
             $mode = if ($resumeAt -gt 0) { [System.IO.FileMode]::Append } else { [System.IO.FileMode]::Create }
             $targetStream = [System.IO.File]::Open($partialPath, $mode, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
             $sourceStream = $response.GetResponseStream()
-            $totalBytes = if ($response.ContentLength -ge 0) { $resumeAt + $response.ContentLength } else { -1L }
+            $totalBytes = if ($response.ContentLength -ge 0) {
+                $resumeAt + $response.ContentLength
+            } elseif ($ExpectedBytes -gt 0) {
+                $ExpectedBytes
+            } else {
+                -1L
+            }
             $downloaded = $resumeAt
             $started = [System.Diagnostics.Stopwatch]::StartNew()
             $buffer = [byte[]]::new(1048576)
@@ -654,21 +668,33 @@ function Invoke-ModelFileDownload {
                 if ($totalBytes -gt 0) { $status += " / $(Format-DownloadBytes $totalBytes)" }
                 if ($speed -gt 0) { $status += "  $(Format-DownloadBytes $speed)/s" }
                 $progress = if ($totalBytes -gt 0) { [Math]::Min(100, [int](100 * $downloaded / $totalBytes)) } else { -1 }
-                Write-Progress -Id 71 -ParentId 70 -Activity $Label -Status $status -PercentComplete $progress
+                $progressArguments = @{
+                    Id = $ProgressId
+                    Activity = $Label
+                    Status = $status
+                    PercentComplete = $progress
+                }
+                if ($ParentProgressId -ge 0) { $progressArguments.ParentId = $ParentProgressId }
+                Write-Progress @progressArguments
             }
 
             $targetStream.Flush()
             $targetStream.Dispose()
             $targetStream = $null
             $actualBytes = (Get-Item -LiteralPath $partialPath).Length
-            if ($totalBytes -gt 0 -and $actualBytes -ne $totalBytes) {
-                throw "下载大小不完整 / Incomplete download: $actualBytes of $totalBytes bytes"
+            $requiredBytes = if ($ExpectedBytes -gt 0) { $ExpectedBytes } else { $totalBytes }
+            if ($requiredBytes -gt 0 -and $actualBytes -ne $requiredBytes) {
+                throw "下载大小不完整 / Incomplete download: $actualBytes of $requiredBytes bytes"
             }
             Move-Item -LiteralPath $partialPath -Destination $Destination -Force
-            Write-Progress -Id 71 -ParentId 70 -Activity $Label -Completed
+            $completeArguments = @{ Id = $ProgressId; Activity = $Label; Completed = $true }
+            if ($ParentProgressId -ge 0) { $completeArguments.ParentId = $ParentProgressId }
+            Write-Progress @completeArguments
             return
         } catch {
-            Write-Progress -Id 71 -ParentId 70 -Activity $Label -Completed
+            $completeArguments = @{ Id = $ProgressId; Activity = $Label; Completed = $true }
+            if ($ParentProgressId -ge 0) { $completeArguments.ParentId = $ParentProgressId }
+            Write-Progress @completeArguments
             if ($attempt -ge $MaximumAttempts) {
                 throw "下载失败，已重试 $MaximumAttempts 次 / Download failed after $MaximumAttempts attempts: $($_.Exception.Message)"
             }
@@ -680,6 +706,23 @@ function Invoke-ModelFileDownload {
             if ($null -ne $response) { $response.Dispose() }
         }
     }
+}
+
+function Invoke-ModelFileDownload {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][string]$Label,
+        [int]$MaximumAttempts = 3
+    )
+
+    Invoke-FileDownloadWithProgress `
+        -Url $Url `
+        -Destination $Destination `
+        -Label $Label `
+        -MaximumAttempts $MaximumAttempts `
+        -ProgressId 71 `
+        -ParentProgressId 70
 }
 
 function Invoke-RecommendedModelDownload {
@@ -1117,8 +1160,22 @@ function Invoke-EngineSelfUpdate {
     try {
         $headers = @{ 'User-Agent' = "MoE4All-Wizard/$productVersion" }
         Write-Host "`n正在下载 $($Release.ArchiveName) / Downloading $($Release.ArchiveName)..." -ForegroundColor Cyan
-        Invoke-WebRequest -Uri $Release.ArchiveUrl -Headers $headers -OutFile $archivePath -UseBasicParsing -TimeoutSec 900
-        Invoke-WebRequest -Uri $Release.ChecksumUrl -Headers $headers -OutFile $checksumPath -UseBasicParsing -TimeoutSec 60
+        Invoke-FileDownloadWithProgress `
+            -Url $Release.ArchiveUrl `
+            -Destination $archivePath `
+            -Label $Release.ArchiveName `
+            -ExpectedBytes $Release.ArchiveSize `
+            -ProgressId 81 `
+            -UserAgent $headers['User-Agent'] `
+            -ReplaceExisting
+        Invoke-FileDownloadWithProgress `
+            -Url $Release.ChecksumUrl `
+            -Destination $checksumPath `
+            -Label $Release.ChecksumName `
+            -ExpectedBytes $Release.ChecksumSize `
+            -ProgressId 82 `
+            -UserAgent $headers['User-Agent'] `
+            -ReplaceExisting
 
         if ($Release.ArchiveSize -gt 0 -and (Get-Item -LiteralPath $archivePath).Length -ne $Release.ArchiveSize) {
             throw 'Downloaded archive size does not match the GitHub release asset.'
@@ -1152,6 +1209,17 @@ function Invoke-EngineSelfUpdate {
         $stagedHelper = Join-Path $packageRoot 'scripts\apply-engine-update.ps1'
         $temporaryHelper = Join-Path ([System.IO.Path]::GetTempPath()) ("MoE4All-Engine-Updater-" + [guid]::NewGuid().ToString('N') + '.ps1')
         Copy-Item -LiteralPath $stagedHelper -Destination $temporaryHelper -Force
+        $launcherProcessId = 0
+        try {
+            $currentProcess = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $PID" -ErrorAction Stop
+            $parent = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $([int]$currentProcess.ParentProcessId)" -ErrorAction Stop
+            $parentCommandLine = [string]$parent.CommandLine
+            if ([string]$parent.Name -ieq 'cmd.exe' -and $parentCommandLine -match '(?i)(?:^|\s)/c(?:\s|$)' -and $parentCommandLine -match '(?i)Start-INFR-Wizard\.cmd') {
+                $launcherProcessId = [int]$parent.ProcessId
+            }
+        } catch {
+            $launcherProcessId = 0
+        }
         $argumentText = @(
             '-NoLogo'
             '-NoProfile'
@@ -1165,6 +1233,8 @@ function Invoke-EngineSelfUpdate {
             ('"' + $Release.Version + '"')
             '-ParentProcessId'
             ([string]$PID)
+            '-LauncherProcessId'
+            ([string]$launcherProcessId)
             '-CleanupRoot'
             ('"' + $runRoot + '"')
             '-DeleteSelf'
@@ -1217,11 +1287,42 @@ function Show-UpdateStatus {
     }
 }
 
+function Write-PostUpdateProbe {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Version
+    )
+
+    $updateRoot = [System.IO.Path]::GetFullPath((Join-Path $repoRoot '.update')).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+    $probePath = [System.IO.Path]::GetFullPath($Path)
+    $updatePrefix = $updateRoot + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $probePath.StartsWith($updatePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The post-update probe path must remain inside the installation update directory.'
+    }
+    if ($ExpectedPostUpdateVersion -and $Version -ne $ExpectedPostUpdateVersion) {
+        throw "The relaunched wizard reported v$Version; expected v$ExpectedPostUpdateVersion."
+    }
+
+    New-Item -ItemType Directory -Path $updateRoot -Force | Out-Null
+    $probe = [ordered]@{
+        version = $Version
+        process_id = $PID
+        at = [DateTimeOffset]::Now.ToString('o')
+    }
+    $temporary = "$probePath.moe4all-new-$([guid]::NewGuid().ToString('N'))"
+    [System.IO.File]::WriteAllText($temporary, ($probe | ConvertTo-Json), [System.Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $temporary -Destination $probePath -Force
+}
+
 if (-not (Test-Path -LiteralPath $infrPath -PathType Leaf)) {
     throw "找不到 infr.exe。发布包请把 infr.exe 与 Start-INFR-Wizard.cmd 放在同一目录；源码构建请先运行 cargo build --release --locked -p infr-cli。`nExecutable not found beside the launcher or under target\release."
 }
 
 $productVersion = Get-EngineVersion
+if ($PostUpdateProbePath) {
+    Write-PostUpdateProbe -Path $PostUpdateProbePath -Version $productVersion
+    if ($ExitAfterPostUpdateProbe) { exit 43 }
+}
 Clear-Host
 Write-Host '============================================================' -ForegroundColor Green
 $banner = @'

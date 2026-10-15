@@ -18,7 +18,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-  # Override .cargo/config.toml's developer-only target-cpu=native setting.
+  # Keep the release baseline explicit and aligned with .cargo/config.toml.
   RUSTFLAGS: '-C target-cpu=x86-64 -C target-feature=+crt-static'
   VULKAN_SDK_VERSION: '1.4.357.0'
 
