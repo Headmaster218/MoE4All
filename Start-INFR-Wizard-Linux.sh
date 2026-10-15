@@ -1265,9 +1265,12 @@ apply_update() (
     success=true
 )
 fetch_url() {
-    local url=$1 output=$2 maximum=$3 seconds=${4-600}
+    local url=$1 output=$2 maximum=$3 seconds=${4-600} progress=${5-false}
+    local -a curl_args=(-fL --proto '=https' --proto-redir '=https' --connect-timeout 5 --max-time "$seconds" --max-filesize "$maximum" -H 'Accept: application/vnd.github+json' -H 'User-Agent: MoE4All-Linux-Wizard' -o "$output")
     [[ $url == https://api.github.com/repos/Headmaster218/MoE4All/releases\?per_page=100 || $url =~ ^https://github\.com/Headmaster218/MoE4All/releases/download/release-[0-9]+\.[0-9]+\.[0-9]+/MoE4All-Linux-x86_64-v[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz(\.sha256)?$ ]] || return 1
-    curl -fLsS --proto '=https' --proto-redir '=https' --connect-timeout 5 --max-time "$seconds" --max-filesize "$maximum" -H 'Accept: application/vnd.github+json' -H 'User-Agent: MoE4All-Linux-Wizard' -o "$output" "$url" || return 1
+    if [[ $progress == true && -t 2 ]]; then curl_args+=(--show-error --progress-bar)
+    else curl_args+=(-sS); fi
+    curl "${curl_args[@]}" "$url" || return 1
     [[ $(wc -c < "$output") -le $maximum ]]
 }
 select_release() {
@@ -1306,7 +1309,7 @@ download_update() (
     fetch_url "$RELEASE_CHECKSUM" "$temp/checksum" 4096 || exit 1
     read -r hash filename extra < "$temp/checksum" || exit 1
     [[ $hash =~ ^[0-9a-fA-F]{64}$ && ${filename#\*} == "$name" && -z $extra ]] || { fail 'Malformed release checksum.'; exit 1; }
-    fetch_url "$RELEASE_ARCHIVE" "$temp/$name" 1073741824 || exit 1
+    fetch_url "$RELEASE_ARCHIVE" "$temp/$name" 1073741824 600 true || exit 1
     actual=$(sha256sum -- "$temp/$name"); actual=${actual%% *}
     [[ $actual == "${hash,,}" ]] || { fail 'Release checksum mismatch; no files changed.'; exit 1; }
     extract_package "$temp/$name" "$temp/files" "$version" || { fail 'Invalid release archive; no files changed.'; exit 1; }
