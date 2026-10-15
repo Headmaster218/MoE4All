@@ -11,10 +11,10 @@ RAM, and SSD under one memory plan.
 DDR4, automatic aggressive profile, Q8 K/V, with MTP and CPU miss offload disabled.
 All speeds are tok/s.
 
-| Model | 30K single-stream Prefill | 30K total Decode mean x1 / x2 / x3 | 150K single-stream Prefill | 150K total Decode mean x1 / x2 / x3 |
-| --- | ---: | ---: | ---: | ---: |
-| Flash-Next 4.27bpw | **1,414.75** | **50.44 / 66.19 / 71.20** | **1,445.50** | **44.16 / 49.50 / 45.47** |
-| Qwen3.6 35B Balanced | **2,749.06** | **80.49 / 118.34 / 110.78** | **1,169.40** | **41.91 / 50.87 / 49.27** |
+| Model | 2K total Decode mean x1 / x2 / x3 | 30K single-stream Prefill | 30K total Decode mean x1 / x2 / x3 | 150K single-stream Prefill | 150K total Decode mean x1 / x2 / x3 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash-Next 4.27bpw | — | **1,414.75** | **50.44 / 66.19 / 71.20** | **1,445.50** | **44.16 / 49.50 / 45.47** |
+| Qwen3.6 35B Balanced | **130.26 / 168.09 / 206.63** | **2,749.06** | **80.49 / 118.34 / 110.78** | **1,169.40** | **41.91 / 50.87 / 49.27** |
 
 <sub>Decode is aggregate mean throughput with 1 / 2 / 3 simultaneously active streams, not per-stream speed. Prefill is the full-interval single-stream mean. See the [1.0.0 measurements](#100-30k--150k-mean-performance-2026-10-14) for conditions.</sub>
 
@@ -128,6 +128,7 @@ aggregate full-interval mean throughput. Prefill reports the single-stream mean.
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Flash-Next 4.27bpw | 30K | **1,414.75** | **50.44** | **66.19** | **71.20** |
 | Flash-Next 4.27bpw | 150K | **1,445.50** | **44.16** | **49.50** | **45.47** |
+| Qwen3.6 35B Balanced | 2K | — | **130.26** | **168.09** | **206.63** |
 | Qwen3.6 35B Balanced | 30K | **2,749.06** | **80.49** | **118.34** | **110.78** |
 | Qwen3.6 35B Balanced | 150K | **1,169.40** | **41.91** | **50.87** | **49.27** |
 
