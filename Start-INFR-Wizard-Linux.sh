@@ -1228,6 +1228,7 @@ apply_update() (
     json_get '["version"]' || exit 1; old_version=$REPLY
     version_newer "$version" "$old_version" || { fail 'Refusing a downgrade or same-version replacement.'; exit 1; }
     validate_package "$stage" "$version" || { fail 'Invalid staged package; no files changed.'; exit 1; }
+    bash -n "$stage/Start-INFR-Wizard-Linux.sh" || { fail 'Invalid staged launcher; no files changed.'; exit 1; }
     files=("${FILES[@]}" install-manifest.json)
     for name in "${files[@]}"; do safe_target "$root" "$name" || { fail 'Unsafe install destination; no files changed.'; exit 1; }; done
     if engine_running "$root/infr"; then fail 'Stop the running engine before updating; no files changed.'; exit 1; fi
@@ -1260,6 +1261,7 @@ apply_update() (
     done
     actual=$("$root/infr" --version) || exit 1
     [[ $actual == "infr $version" ]] || exit 1
+    bash -n "$root/Start-INFR-Wizard-Linux.sh" || exit 1
     success=true
 )
 fetch_url() {
@@ -1293,7 +1295,8 @@ select_release() {
     [[ -n $RELEASE_VERSION ]]
 }
 download_update() (
-    local root=$1 version=$RELEASE_VERSION temp name="MoE4All-Linux-x86_64-v$RELEASE_VERSION.tar.gz" hash filename extra actual
+    local root=$1 relaunch=${2-true} version=$RELEASE_VERSION temp name="MoE4All-Linux-x86_64-v$RELEASE_VERSION.tar.gz" hash filename extra actual
+    [[ $relaunch == true || $relaunch == false ]] || { fail 'Invalid updater relaunch mode.'; exit 1; }
     [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || { fail 'Updating supports Linux x86_64 only.'; exit 1; }
     need flock || exit 1; need tar || exit 1; need sha256sum || exit 1
     [[ ! -L $root/.moe4all-update.lock ]] || { fail 'Refusing a symlinked update lock.'; exit 1; }
@@ -1308,7 +1311,15 @@ download_update() (
     [[ $actual == "${hash,,}" ]] || { fail 'Release checksum mismatch; no files changed.'; exit 1; }
     extract_package "$temp/$name" "$temp/files" "$version" || { fail 'Invalid release archive; no files changed.'; exit 1; }
     apply_update "$root" "$temp/files" "$version" || exit 1
-    printf 'Update complete. Run the launcher again.\n'
+    if [[ $relaunch == true ]]; then
+        printf 'Update complete. Restarting the updated launcher...\n'
+        trap - EXIT
+        rm -rf -- "$temp"
+        flock -u 9
+        exec 9>&-
+        exec bash "$root/Start-INFR-Wizard-Linux.sh" --skip-update-check
+    fi
+    printf 'Update complete.\n'
 )
 check_updates() (
     local mode=$1 current temp
@@ -1405,7 +1416,8 @@ main() {
     if [[ -n $UPDATE_MODE ]]; then check_updates "$UPDATE_MODE"; return; fi
     if [[ $INTERACTIVE == true && $SKIP_UPDATE == false && ! ${MOE4ALL_NO_UPDATE_CHECK-} =~ ^(1|true|yes|on)$ ]]; then check_updates --check-update; fi
     if [[ $INTERACTIVE == true && $HEADLESS == false ]]; then
-        printf 'MoE4All Linux Launch Wizard\nEnter = previous/default; - = clear\n'
+        value=$("$BINARY" --version 2>/dev/null || true); value=${value##* }
+        printf 'MoE4All v%s Linux Launch Wizard\nEnter = previous/default; - = clear\n' "$value"
         if [[ -n ${S[model]} && ${#OVERRIDES[@]} == 0 && ${#disables[@]} == 0 ]]; then
             absolute "${S[model]}"; if [[ -f $REPLY ]]; then yes 'Start with previous settings?' true; reused=$REPLY; fi
         fi

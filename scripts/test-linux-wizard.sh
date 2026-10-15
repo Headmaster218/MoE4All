@@ -211,10 +211,11 @@ printf GGUF > "$ROOT/bad.gguf"; reject reasoning_efforts "$ROOT/bad.gguf"
 
 # The release fixture contains only runtime products, not developer Python files.
 make_package() {
-    local base=$1 version=$2 name hash size sep=''
+    local base=$1 version=$2 launcher=${3-} name hash size sep=''
     mkdir -p "$base/documentation"
     printf '#!/usr/bin/env bash\nprintf "infr %s\\n"\n' "$version" > "$base/infr"
-    cp "$repo/Start-INFR-Wizard-Linux.sh" "$base/"
+    if [[ -n $launcher ]]; then cp "$launcher" "$base/Start-INFR-Wizard-Linux.sh"
+    else cp "$repo/Start-INFR-Wizard-Linux.sh" "$base/"; fi
     printf 'test guide\n' > "$base/documentation/README.md"
     chmod +x "$base/infr" "$base/Start-INFR-Wizard-Linux.sh"
     {
@@ -248,6 +249,12 @@ sed -i "s/${original_hash:1:64}/$hash/;s/\"size\":$original_size,/\"size\":$size
 before=$(sha256sum "$tmp/rollback-old/infr" "$tmp/rollback-old/install-manifest.json")
 reject apply_update "$tmp/rollback-old" "$tmp/rollback-new" 1.0.0
 [[ $(sha256sum "$tmp/rollback-old/infr" "$tmp/rollback-old/install-manifest.json") == "$before" ]]; pass
+make_package "$tmp/bad-launcher-old" 0.10.0
+printf '#!/usr/bin/env bash\nif\n' > "$tmp/bad-launcher"
+make_package "$tmp/bad-launcher-new" 1.0.0 "$tmp/bad-launcher"
+before=$(sha256sum "$tmp/bad-launcher-old/infr" "$tmp/bad-launcher-old/install-manifest.json")
+reject apply_update "$tmp/bad-launcher-old" "$tmp/bad-launcher-new" 1.0.0
+[[ $(sha256sum "$tmp/bad-launcher-old/infr" "$tmp/bad-launcher-old/install-manifest.json") == "$before" ]]; pass
 reject fetch_url https://example.invalid/asset "$tmp/asset" 100
 
 # Shell updater guards (not just the separate developer Python fixtures).
@@ -290,7 +297,7 @@ if [[ $(uname -s) == Linux ]]; then
         RELEASE_ARCHIVE="https://github.com/Headmaster218/MoE4All/releases/download/release-1.0.0/$prefix.tar.gz"
         RELEASE_CHECKSUM="$RELEASE_ARCHIVE.sha256"
         fetch_url() { if [[ $1 == *.sha256 ]]; then cp "$tmp/download.sha256" "$2"; else cp "$tmp/valid.tar.gz" "$2"; fi; }
-        download_update "$tmp/download-old"
+        download_update "$tmp/download-old" false
     ) > "$tmp/download-output"
     [[ $("$tmp/download-old/infr" --version) == 'infr 1.0.0' ]]; pass
     make_package "$tmp/bad-download-old" 0.10.0
@@ -301,6 +308,23 @@ if [[ $(uname -s) == Linux ]]; then
         reject download_update "$tmp/bad-download-old"
     )
     [[ $(sha256sum "$tmp/bad-download-old/infr") == "$before" ]]; pass
+
+    printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$@" > "$MOE4ALL_RELAUNCH_MARKER"\n' > "$tmp/relaunch-launcher"
+    make_package "$tmp/relaunch-old" 0.10.0
+    make_package "$tmp/relaunch-new" 1.0.0 "$tmp/relaunch-launcher"
+    rm -rf "$tmp/$prefix"; cp -r "$tmp/relaunch-new" "$tmp/$prefix"
+    tar -czf "$tmp/relaunch.tar.gz" -C "$tmp" "$prefix"
+    hash=$(sha256sum "$tmp/relaunch.tar.gz"); hash=${hash%% *}
+    printf '%s  %s.tar.gz\n' "$hash" "$prefix" > "$tmp/relaunch.sha256"
+    (
+        export MOE4ALL_RELAUNCH_MARKER="$tmp/relaunch-marker"
+        RELEASE_VERSION=1.0.0
+        RELEASE_ARCHIVE="https://github.com/Headmaster218/MoE4All/releases/download/release-1.0.0/$prefix.tar.gz"
+        RELEASE_CHECKSUM="$RELEASE_ARCHIVE.sha256"
+        fetch_url() { if [[ $1 == *.sha256 ]]; then cp "$tmp/relaunch.sha256" "$2"; else cp "$tmp/relaunch.tar.gz" "$2"; fi; }
+        download_update "$tmp/relaunch-old"
+    ) > "$tmp/relaunch-output"
+    [[ $(< "$tmp/relaunch-marker") == --skip-update-check && $("$tmp/relaunch-old/infr" --version) == 'infr 1.0.0' ]]; pass
 fi
 
 # Exercise full interactive configuration with stub devices, no TTY or GPU needed.
