@@ -10217,8 +10217,9 @@ fn generate_dense_backend_inner(
                 full_graph: plan_full_graph,
             })
         };
+        type RetiredDecodePlans = (Option<Box<dyn Plan>>, Box<dyn Plan>);
         let mut prepared_decode_plans = Some(prepare_decode_plans(0)?);
-        let mut retired_decode_plans: Option<(Option<Box<dyn Plan>>, Box<dyn Plan>)> = None;
+        let mut retired_decode_plans: Option<RetiredDecodePlans> = None;
         for step in 0..max_new {
             let step_t0 = std::time::Instant::now();
             let profile_front_t0 = profile_cohort.then(std::time::Instant::now);

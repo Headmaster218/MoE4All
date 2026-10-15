@@ -10086,7 +10086,7 @@ impl ResidentMoeLayout {
             *n_expert as usize,
             *n_used as usize,
         );
-        if ne == 0 || n_ff_exp == 0 || graph.desc(*x).numel() % ne != 0 {
+        if ne == 0 || n_ff_exp == 0 || !graph.desc(*x).numel().is_multiple_of(ne) {
             return None;
         }
         let layout = Self {
