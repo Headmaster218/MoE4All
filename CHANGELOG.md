@@ -6,6 +6,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-10-15
+
+### Changed
+
+- Moved additive repeat, frequency, and presence penalties onto Vulkan where supported, avoiding the CPU logit round trip while retaining the existing fallback path.
+- Removed the Agent distribution and bundled plugin sources from the Engine repository; they are now maintained independently from the backend release.
+
+### Fixed
+
+- Unified resident Decode handling through eight simultaneous rows and reserved head-projection scratch before the Vulkan arena is frozen, preventing multi-slot Qwen3.6 35B allocation and execution regressions.
+- Routed raw Vulkan timeline-label controls through the resolved profiler configuration so per-backend settings no longer depend on process-global cached environment state.
+- Applied a single startup RAM budget to unified-memory GPUs, preventing the device arena and a duplicate host expert cache from consuming the same physical memory twice.
+
 ## [1.0.0] - 2026-10-15
 
 ### Added
