@@ -26,7 +26,7 @@ permissions:
 
 concurrency:
   group: release-validation-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
   windows:
