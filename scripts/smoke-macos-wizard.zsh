@@ -9,9 +9,9 @@ trap 'rm -rf -- "$work"' EXIT INT TERM
 fail() { print -u2 -- "$*"; return 1; }
 assert_contains() { [[ $1 == *$2* ]] || fail "missing '$2' in: $1"; }
 make_engine() {
-    local path=$1 version=$2
-    mkdir -p -- "${path:h}"
-    cat > "$path" <<EOF
+    local target=$1 version=$2
+    mkdir -p -- "${target:h}"
+    cat > "$target" <<EOF
 #!/bin/zsh
 case \${1-} in
   --version) print 'infr $version' ;;
@@ -19,7 +19,7 @@ case \${1-} in
   *) print 'mock infr $version' ;;
 esac
 EOF
-    chmod 755 "$path"
+    chmod 755 "$target"
 }
 
 /bin/zsh -n "$repo/Start-INFR-Wizard-macOS.sh"

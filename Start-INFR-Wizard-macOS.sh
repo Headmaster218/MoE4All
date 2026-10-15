@@ -470,14 +470,14 @@ typeset -A S=() DEFAULTS=() J=() OVERRIDES=()
 typeset -a COMMAND=() FILES=() CANDIDATES=()
 
 json_load() {
-    local flat path value
+    local flat json_path value
     J=(); JSON_KIND=''
     [[ -s $1 && $(wc -c < "$1") -le 8388608 ]] || return 1
     flat=$(LC_ALL=C awk "$JSON_PARSER" "$1" 2>/dev/null) || return 1
-    while IFS=$'\t' read -r path value; do
-        if [[ $path == __MOE4ALL_ROOT__ ]]; then JSON_KIND=$value; continue; fi
-        [[ -n $path && ! -v "J[$path]" ]] || return 1
-        J["$path"]=$value
+    while IFS=$'\t' read -r json_path value; do
+        if [[ $json_path == __MOE4ALL_ROOT__ ]]; then JSON_KIND=$value; continue; fi
+        [[ -n $json_path && ! -v "J[$json_path]" ]] || return 1
+        J["$json_path"]=$value
     done <<< "$flat"
     [[ $JSON_KIND == object || $JSON_KIND == array ]]
 }
@@ -517,7 +517,7 @@ json_decode() {
     done
     REPLY=$out
 }
-json_get() { local path=$1; [[ -v "J[$path]" ]] || return 1; json_decode "${J[$path]}"; }
+json_get() { local json_path=$1; [[ -v "J[$json_path]" ]] || return 1; json_decode "${J[$json_path]}"; }
 json_quote() {
     local text=$1 out='"' c escaped i byte LC_ALL=C
     for ((i=0;i<${#text};i++)); do
@@ -549,20 +549,20 @@ defaults() {
     DEFAULTS=(); for key in "${(@k)S}"; do DEFAULTS[$key]=${S[$key]}; done
 }
 load_state() {
-    local key raw value path
+    local key raw value state_path
     if [[ -f $STATE ]]; then
         json_load "$STATE" || { fail "Invalid saved settings: $STATE"; return 1; }
         [[ $JSON_KIND == object ]] || { fail 'Saved settings must be a JSON object.'; return 1; }
         for key in "${(@k)S}"; do
-            path="[\"$key\"]"; [[ -v "J[$path]" ]] || continue; raw=${J[$path]}
+            state_path="[\"$key\"]"; [[ -v "J[$state_path]" ]] || continue; raw=${J[$state_path]}
             case ${DEFAULTS[$key]} in
                 true|false) [[ $raw == true || $raw == false ]] || { fail "Invalid saved boolean: $key"; return 1; } ;;
                 *) [[ $raw == \"*\" ]] || { fail "Invalid saved string: $key"; return 1; } ;;
             esac
             json_decode "$raw" || return 1; S[$key]=$REPLY
         done
-        path='["configure_thinking"]'
-        if [[ ! -v "J[$path]" && (${S[think_mode]} != default || ${S[reasoning_effort]} != default) ]]; then S[configure_thinking]=true; fi
+        state_path='["configure_thinking"]'
+        if [[ ! -v "J[$state_path]" && (${S[think_mode]} != default || ${S[reasoning_effort]} != default) ]]; then S[configure_thinking]=true; fi
     elif [[ -f $CONFIG_DIR/wizard.conf ]]; then
         local -A names=([MODE]=launch_mode [MODEL]=model [PROFILE]=setup_mode [CTX]=context [UBATCH]=ubatch [KV_K]=kv_type_k [KV_V]=kv_type_v
             [RAM]=ram_budget [VRAM]=vram_budget [MTP]=mtp_model [MTP_K]=mtp_verify_tokens [ADDR]=server_addr [PARALLEL]=server_parallel [MMPROJ]=vision_projector [EMBEDDING]=embedding_model)
@@ -702,12 +702,12 @@ recommendations() {
     printf 'Choose D in a model prompt to download one or more items into %s/models.\n' "$ROOT"
 }
 catalog_candidates() {
-    local kind=$1 id path found existing
+    local kind=$1 id candidate_path found existing
     for id in "${CATALOG_IDS[@]}"; do
         catalog_load "$id"; [[ $CATALOG_KIND == "$kind" ]] || continue
-        path="$ROOT/models/$CATALOG_PRIMARY"; [[ -f $path ]] || continue
-        found=false; for existing in "${CANDIDATES[@]}"; do [[ $existing != "$path" ]] || found=true; done
-        [[ $found == true ]] || CANDIDATES+=("$path")
+        candidate_path="$ROOT/models/$CATALOG_PRIMARY"; [[ -f $candidate_path ]] || continue
+        found=false; for existing in "${CANDIDATES[@]}"; do [[ $existing != "$candidate_path" ]] || found=true; done
+        [[ $found == true ]] || CANDIDATES+=("$candidate_path")
     done
 }
 ensure_model_downloader() {
@@ -790,15 +790,15 @@ model_candidates() {
 }
 hub_reference() { [[ $1 != /* && ${1:l} != *.gguf && $1 == */* ]]; }
 model_path() {
-    local kind=$1 key=$2 value i found saved=${S[$2]} path
+    local kind=$1 key=$2 value i found saved=${S[$2]} candidate_path
     model_candidates "$ROOT" "$kind"
     catalog_candidates "$kind"
     local -a nearby=("${CANDIDATES[@]}") remembered=("$saved")
     if [[ $kind == llm && -f $ROOT/gui-data/state.json ]]; then
         if json_load "$ROOT/gui-data/state.json"; then
-            for path in "${(@k)J}"; do
-                if [[ $path =~ ^\[\"(recent|favorites)\",[0-9]+\]$ || $path =~ ^\[\"profiles\",[0-9]+,\"model_path\"\]$ ]]; then
-                    json_get "$path" && remembered+=("$REPLY")
+            for candidate_path in "${(@k)J}"; do
+                if [[ $candidate_path =~ ^\[\"(recent|favorites)\",[0-9]+\]$ || $candidate_path =~ ^\[\"profiles\",[0-9]+,\"model_path\"\]$ ]]; then
+                    json_get "$candidate_path" && remembered+=("$REPLY")
                 fi
             done
         fi
@@ -806,7 +806,7 @@ model_path() {
     for value in "${remembered[@]}"; do
         [[ -n $value ]] || continue; absolute "$value"; value=$REPLY
         [[ -f $value && ${value:l} == *.gguf ]] || continue
-        found=false; for path in "${nearby[@]}"; do [[ $path != "$value" ]] || found=true; done
+        found=false; for candidate_path in "${nearby[@]}"; do [[ $candidate_path != "$value" ]] || found=true; done
         [[ $found == true ]] || nearby=("$value" "${nearby[@]}")
     done
     while true; do
@@ -829,10 +829,10 @@ model_path() {
         if [[ ${value:l} == n || ${value:l} == new ]]; then prompt 'GGUF file or directory' '' true; value=$REPLY; fi
         if valid_uint "$value" 1 "${#nearby[@]}"; then value=${nearby[10#$value-1]}; fi
         if [[ $value == \"*\" ]]; then value=${value:1:${#value}-2}; fi
-        absolute "$value"; path=$REPLY
-        if [[ -f $path && ${path:l} == *.gguf ]]; then S[$key]=$path; return; fi
-        if [[ -d $path ]]; then
-            model_candidates "$path" "$kind"
+        absolute "$value"; candidate_path=$REPLY
+        if [[ -f $candidate_path && ${candidate_path:l} == *.gguf ]]; then S[$key]=$candidate_path; return; fi
+        if [[ -d $candidate_path ]]; then
+            model_candidates "$candidate_path" "$kind"
             if ((${#CANDIDATES[@]}==1)); then S[$key]=${CANDIDATES[0]}; return; fi
             printf 'Directory has %d candidates; enter the exact file path.\n' "${#CANDIDATES[@]}"; continue
         fi
@@ -935,10 +935,10 @@ configure() {
             if [[ $REPLY == true ]]; then
                 S[think_mode]=think; value=$(reasoning_efforts "${S[model]}") || value=''
                 if [[ -n $value ]]; then
-                    local -a options=('default|Template default'); local found=false
-                    for key in $value; do options+=("$key|$key"); [[ $key != "$effort" ]] || found=true; done
+                    local -a effort_options=('default|Template default'); local found=false
+                    for key in $value; do effort_options+=("$key|$key"); [[ $key != "$effort" ]] || found=true; done
                     [[ $found == false ]] || S[reasoning_effort]=$effort
-                    choice reasoning_effort 'Reasoning effort' "${options[@]}"
+                    choice reasoning_effort 'Reasoning effort' "${effort_options[@]}"
                 else printf 'Reasoning-effort support not detected; keeping template default.\n'; fi
             else S[think_mode]=no-think; fi
         fi
@@ -1062,18 +1062,18 @@ safe_target() {
     REPLY=$current
 }
 validate_package() {
-    local base=$1 version=$2 index=0 name size hash file expected path actual
+    local base=$1 version=$2 index=0 name size hash file expected manifest_path actual
     local -A seen=()
     FILES=()
     json_load "$base/install-manifest.json" || return 1
     [[ ${J['["schema_version"]']-} == 1 && ${J['["updater_protocol"]']-} == 1 && ${J['["product"]']-} == '"moe4all-engine"' && ${J['["platform"]']-} == '"macOS-arm64"' && ${J['["version"]']-} == "\"$version\"" ]] || return 1
     while true; do
-        path="[\"files\",$index,\"path\"]"; [[ -v "J[$path]" ]] || break
-        json_get "$path" || return 1; name=$REPLY
+        manifest_path="[\"files\",$index,\"path\"]"; [[ -v "J[$manifest_path]" ]] || break
+        json_get "$manifest_path" || return 1; name=$REPLY
         [[ $name != install-manifest.json && ! -v "seen[$name]" ]] || return 1
         safe_target "$base" "$name" || return 1; file=$REPLY
         [[ -f $file ]] || return 1
-        path="[\"files\",$index,\"size\"]"; size=${J[$path]-}
+        manifest_path="[\"files\",$index,\"size\"]"; size=${J[$manifest_path]-}
         [[ $size =~ ^[0-9]{1,10}$ ]] && ((size<=1073741824)) || return 1
         json_get "[\"files\",$index,\"sha256\"]" || return 1; hash=$REPLY
         actual=$(wc -c < "$file"); trim "$actual"; actual=$REPLY
@@ -1133,7 +1133,7 @@ apply_update() (
     if engine_running "$root/infr"; then fail 'Stop the running engine before updating; no files changed.'; exit 1; fi
     backup=$(mktemp -d "$root/.update-backup.XXXXXX") || exit 1
     rollback() {
-        local status=$? name target errors=false
+        local saved_status=$? name target errors=false
         trap - EXIT
         if [[ $success == false ]]; then
             for name in "${installed[@]}"; do
@@ -1145,7 +1145,7 @@ apply_update() (
             else rm -rf -- "$backup"; printf 'Update failed; previous installation restored.\n' >&2; fi
             exit 1
         fi
-        rm -rf -- "$backup"; exit "$status"
+        rm -rf -- "$backup"; exit "$saved_status"
     }
     trap rollback EXIT
     for name in "${files[@]}"; do
@@ -1173,20 +1173,20 @@ fetch_url() {
     [[ $(wc -c < "$output") -le $maximum ]]
 }
 select_release() {
-    local i=0 j tag version name url path archive checksum
+    local i=0 j tag version name url release_path archive checksum
     RELEASE_VERSION=''; RELEASE_ARCHIVE=''; RELEASE_CHECKSUM=''
     while true; do
-        path="[$i,\"tag_name\"]"; [[ -v "J[$path]" ]] || break
-        json_get "$path" || return 1; tag=$REPLY
+        release_path="[$i,\"tag_name\"]"; [[ -v "J[$release_path]" ]] || break
+        json_get "$release_path" || return 1; tag=$REPLY
         if [[ ${J["[$i,\"draft\"]"]-} == false && ${J["[$i,\"prerelease\"]"]-} == false && $tag == release-* ]]; then
             version=${tag#release-}
             if version_valid "$version" && { [[ -z $RELEASE_VERSION ]] || version_newer "$version" "$RELEASE_VERSION"; }; then
                 RELEASE_VERSION=$version; archive=''; checksum=''; j=0; name="MoE4All-macOS-arm64-v$version.tar.gz"
                 while true; do
-                    path="[$i,\"assets\",$j,\"name\"]"; [[ -v "J[$path]" ]] || break
-                    json_get "$path" || return 1; path=$REPLY
+                    release_path="[$i,\"assets\",$j,\"name\"]"; [[ -v "J[$release_path]" ]] || break
+                    json_get "$release_path" || return 1; release_path=$REPLY
                     json_get "[$i,\"assets\",$j,\"browser_download_url\"]" || return 1; url=$REPLY
-                    [[ $path != "$name" ]] || archive=$url; [[ $path != "$name.sha256" ]] || checksum=$url
+                    [[ $release_path != "$name" ]] || archive=$url; [[ $release_path != "$name.sha256" ]] || checksum=$url
                     ((j+=1))
                 done
                 RELEASE_ARCHIVE=$archive; RELEASE_CHECKSUM=$checksum
@@ -1262,15 +1262,15 @@ usage() {
 }
 main() {
     local key flag value inherited=${INFR_API_KEY-} api_key='' reused=false
-    local -a argv=("$@")
+    local -a original_args=("$@")
     ROOT=$(cd -P -- "$(dirname -- "$0")" && pwd -P)
     DRY_RUN=false; HEADLESS=false; SKIP_UPDATE=false; UPDATE_MODE=''; INTERACTIVE=false; NO_API_KEY=false
     typeset -A disables=()
-    for ((key=0;key<${#argv[@]};key++)); do
-        case ${argv[key]} in --help|-h) usage; return ;; esac
-        if [[ ${argv[key]} == --root ]]; then
-            ((key+1<${#argv[@]})) || { fail '--root requires a directory'; return 1; }
-            ROOT=$(cd -P -- "${argv[key+1]}" 2>/dev/null && pwd -P) || { fail 'Installation root does not exist.'; return 1; }
+    for ((key=0;key<${#original_args[@]};key++)); do
+        case ${original_args[key]} in --help|-h) usage; return ;; esac
+        if [[ ${original_args[key]} == --root ]]; then
+            ((key+1<${#original_args[@]})) || { fail '--root requires a directory'; return 1; }
+            ROOT=$(cd -P -- "${original_args[key+1]}" 2>/dev/null && pwd -P) || { fail 'Installation root does not exist.'; return 1; }
         fi
     done
     [[ -d $ROOT ]] || { fail 'Installation root does not exist.'; return 1; }
