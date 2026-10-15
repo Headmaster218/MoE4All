@@ -15188,13 +15188,10 @@ mod tests {
                             resumed.zero(cleared[stage].as_ref(), 1);
                         }
                         resumed.finish().unwrap();
-                        for stage in 0..4 {
+                        for front in fronts.iter().take(4) {
                             let mut actual = [0f32];
                             backend
-                                .download(
-                                    fronts[stage].as_ref(),
-                                    bytemuck::cast_slice_mut(&mut actual),
-                                )
+                                .download(front.as_ref(), bytemuck::cast_slice_mut(&mut actual))
                                 .unwrap();
                             assert_eq!(actual[0], 100., "frontend must execute exactly once");
                         }

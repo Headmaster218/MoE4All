@@ -1260,7 +1260,7 @@ fn physical_masks() -> Vec<usize> {
     unsafe {
         GetLogicalProcessorInformation(std::ptr::null_mut(), &mut bytes);
     }
-    if bytes == 0 || bytes as usize % std::mem::size_of::<Info>() != 0 {
+    if bytes == 0 || !(bytes as usize).is_multiple_of(std::mem::size_of::<Info>()) {
         return Vec::new();
     }
     let mut info = vec![Info::default(); bytes as usize / std::mem::size_of::<Info>()];
