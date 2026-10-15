@@ -56,16 +56,24 @@ cargo build --release --locked -p infr-cli
 
 ## 二进制可移植性
 
-`.cargo/config.toml` 设置了 `-C target-cpu=native`。CPU 后端的标量 dequant/matvec
-循环依赖它自动向量化（AVX2 / AVX-512），所以**构建产物与本机 ISA 绑定**，拷到指令集
-不同的机器上可能直接非法指令退出。需要跨机分发时，请覆盖该设置，例如：
+`.cargo/config.toml` 对 x86_64 默认设置 `-C target-cpu=x86-64`，本地构建与发行版采用
+相同的通用 CPU 基线，不再默认使用 `target-cpu=native`。Windows x86_64 MSVC 还默认
+设置 `-C target-feature=+crt-static`，与 Windows 发版的 CRT 链接方式一致；其它架构保留
+目标平台默认 CPU 设置，不会误用 x86_64 参数。
+
+这不禁用运行时检测后启用的 AVX2 / AVX-512 内核。没有函数级 SIMD 分发、依赖自动
+向量化的 CPU 推理路径仍可能受编译基线影响，不能视为与 native 性能完全相同。
+仅在明确进行 CPU 专项实验时覆盖参数，并单独标明实验配置；日常 GPU 推理测试使用
+通用构建，避免本地测试与用户发行版采用不同 CPU 基线。
+
+发版 CI 仍显式设置参数，例如 Linux x86_64：
 
 ```sh
 RUSTFLAGS="-C target-cpu=x86-64" cargo build --release --locked -p infr-cli
 ```
 
 `.github/workflows/release-linux.yml` 在 Ubuntu 22.04 构建，目标为 Linux x86_64、
-glibc 2.35+，独立构建 shaderc 2026.3 并覆盖 `target-cpu=native`。不适用于 Alpine/musl、
+glibc 2.35+，独立构建 shaderc 2026.3 并显式使用通用 CPU 基线。不适用于 Alpine/musl、
 ARM64 或旧于该 glibc 的系统。AVX2 + FMA3 的 CPU-miss 内核仍由运行时检测后启用。
 首次 CI 实际执行前，以上是构建目标而非已通过的跨发行版验收。
 
