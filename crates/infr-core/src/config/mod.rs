@@ -872,6 +872,10 @@ cfg_struct! {
         timeline_cpu_only: bool = false,
         /// Capture GPU timestamps and routing metadata without CPU phase spans.
         timeline_gpu_only: bool = false,
+        /// `INFR_TIMELINE_RAW_KERNELS`: retain every kernel name instead of category labels.
+        timeline_raw_kernels: bool = false,
+        /// `INFR_TIMELINE_RAW_UNKNOWN`: retain names for kernels outside known categories.
+        timeline_raw_unknown: bool = false,
         /// Optional one-shot CPU-miss weight/input fixture for local kernel diagnostics.
         cpu_miss_fixture_dir: Option<PathBuf> = None,
         timeline_skip_steps: usize = 64,

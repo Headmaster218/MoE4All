@@ -373,6 +373,27 @@ pub(crate) struct Penalties {
 }
 
 impl Penalties {
+    pub(crate) fn gpu_supported(&self) -> bool {
+        self.repeat == 1.0 || self.last_n == 0
+    }
+
+    pub(crate) fn write_counts(&self, row: &mut [f32]) {
+        for (&id, &count) in &self.counts {
+            if let Some(value) = row.get_mut(id as usize) {
+                *value = count as f32;
+            }
+        }
+    }
+
+    pub(crate) fn gpu_control(&self, previous: Option<u32>, row: usize) -> [u32; 4] {
+        [
+            self.presence.to_bits(),
+            self.frequency.to_bits(),
+            previous.unwrap_or(u32::MAX),
+            row as u32,
+        ]
+    }
+
     pub(crate) fn resolve(req: Option<&RequestCtx>) -> Option<Self> {
         let r = req.map(RequestCtx::sampling)?;
         if !r.penalties_active() {
@@ -523,7 +544,8 @@ impl ParallelSampler {
     }
 
     pub(crate) fn can_gpu_argmax(&self) -> bool {
-        (self.sampler.temp <= 0.0 || self.sampler.top_k == 1) && self.penalties.is_none()
+        (self.sampler.temp <= 0.0 || self.sampler.top_k == 1)
+            && self.penalties.as_ref().is_none_or(Penalties::gpu_supported)
     }
 
     /// Whether a one-row parallel graph may bake `graph_sampler` into `Op::Sample`. The graph is
@@ -531,7 +553,7 @@ impl ParallelSampler {
     /// overrides must fall back to host sampling unless its effective parameters are identical.
     pub(crate) fn can_gpu_sample_with(&self, graph_sampler: Sampler) -> bool {
         self.sampler.temp > 0.0
-            && self.penalties.is_none()
+            && self.penalties.as_ref().is_none_or(Penalties::gpu_supported)
             && self.sampler.temp.to_bits() == graph_sampler.temp.to_bits()
             && self.sampler.top_k == graph_sampler.top_k
             && self.sampler.top_p.to_bits() == graph_sampler.top_p.to_bits()
@@ -546,11 +568,24 @@ impl ParallelSampler {
         if let Some(penalties) = self.penalties.as_ref() {
             penalties.apply(logits);
         }
-        let token = sample_logits(logits, self.sampler, &mut self.rng);
+        let token = self.sample_penalized(logits);
+        self.observe(token);
+        token
+    }
+
+    pub(crate) fn penalties(&self) -> Option<&Penalties> {
+        self.penalties.as_ref()
+    }
+
+    pub(crate) fn observe(&mut self, token: u32) {
         if let Some(penalties) = self.penalties.as_mut() {
             penalties.observe(token);
         }
-        token
+    }
+
+    /// The GPU already applied penalties; EOS repair must not apply them twice.
+    pub(crate) fn sample_penalized(&mut self, logits: &[f32]) -> u32 {
+        sample_logits(logits, self.sampler, &mut self.rng)
     }
 }
 
@@ -1090,7 +1125,7 @@ mod tests {
             ..Default::default()
         });
         let penalized_baked = Sampler::resolve(Some(&penalized), &scfg());
-        assert!(!ParallelSampler::new(&penalized, &scfg()).can_gpu_sample_with(penalized_baked));
+        assert!(ParallelSampler::new(&penalized, &scfg()).can_gpu_sample_with(penalized_baked));
     }
 
     /// Penalties are per-sequence state (their token history is), and a sequence that sets none must
@@ -1105,6 +1140,54 @@ mod tests {
         assert!(Penalties::resolve(Some(&plain)).is_none());
         assert!(Penalties::resolve(Some(&penalized)).is_some());
         assert!(Penalties::resolve(None).is_none());
+    }
+
+    #[test]
+    fn gpu_penalties_preserve_history_and_repeat_fallback() {
+        let req = RequestCtx::new(RequestSampling {
+            temp: Some(0.0),
+            presence_penalty: 1.5,
+            frequency_penalty: -0.25,
+            ..Default::default()
+        });
+        let mut lane = ParallelSampler::new(&req, &scfg());
+        assert!(lane.can_gpu_argmax());
+        lane.observe(3);
+        lane.observe(3);
+        lane.observe(u32::MAX);
+        let p = lane.penalties().unwrap();
+        let mut counts = [0f32; 8];
+        p.write_counts(&mut counts);
+        assert_eq!(counts[3], 2.0);
+        assert_eq!(counts.iter().sum::<f32>(), 2.0);
+        assert_eq!(
+            p.gpu_control(None, 7),
+            [1.5f32.to_bits(), (-0.25f32).to_bits(), u32::MAX, 7]
+        );
+        let mut logits = [0f32; 8];
+        p.apply(&mut logits);
+        assert_eq!(logits[3], -1.0);
+        let mut repaired = [0f32; 8];
+        repaired[4] = 9.0;
+        assert_eq!(lane.sample_penalized(&repaired), 4);
+        let mut counts = [0f32; 8];
+        lane.penalties().unwrap().write_counts(&mut counts);
+        assert_eq!(counts[4], 0.0, "repair is not committed until observe");
+        lane.observe(4);
+        lane.penalties().unwrap().write_counts(&mut counts);
+        assert_eq!(counts[4], 1.0);
+        for last_n in [0, 64] {
+            let req = RequestCtx::new(RequestSampling {
+                temp: Some(0.0),
+                repeat_penalty: 1.2,
+                repeat_last_n: last_n,
+                ..Default::default()
+            });
+            assert_eq!(
+                ParallelSampler::new(&req, &scfg()).can_gpu_argmax(),
+                last_n == 0
+            );
+        }
     }
 
     /// **Finding 1 — repeat penalty is per-DISTINCT-token, not per-occurrence.** llama.cpp's

@@ -255,7 +255,8 @@ pub(crate) fn max_storage_buffer_range() -> u32 {
 
 /// Device memory snapshot from [`VulkanBackend::vram`]. `available` is live free bytes when
 /// `live` is true (VK_EXT_memory_budget present, or a test resource profile is accounting for
-/// this backend's allocations), otherwise it equals `total` (best-effort).
+/// this backend's allocations), otherwise it equals `total` (best-effort). UMA backend snapshots
+/// additionally cap availability by the shared host-RAM target and live host availability.
 ///
 /// WHICH HEAPS THIS COUNTS depends on the device class (see [`vram_info`]): device-local only on a
 /// discrete card, ALL heaps on a unified-memory part where they are the same physical DDR.
@@ -293,6 +294,39 @@ fn backend_physical_alloc_room(vram: VramInfo, tracked_used: u64) -> u64 {
         // Without VK_EXT_memory_budget the snapshot is the whole heap, not live free memory.
         // Keep the fallback honest with the backend's own balanced allocation tally.
         vram.alloc_room().saturating_sub(tracked_used)
+    }
+}
+
+/// One host-RAM ceiling for all owned UMA allocations, regardless of Vulkan heap or location.
+/// The device-local tally remains separate because the spill selector needs that heap alone.
+struct UnifiedRamBudget {
+    limit: Option<u64>,
+    used: AtomicU64,
+}
+
+impl UnifiedRamBudget {
+    fn charge(&self, bytes: u64) {
+        self.used.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn release(&self, bytes: u64) {
+        self.used.fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self, mut vram: VramInfo, host_available: Option<u64>) -> VramInfo {
+        let used = self.used.load(Ordering::Relaxed);
+        if !vram.live {
+            vram.available = vram.available.saturating_sub(used);
+        }
+        if let Some(limit) = self.limit {
+            vram.available = vram.available.min(limit.saturating_sub(used));
+        }
+        if let Some(available) = host_available {
+            vram.available = vram.available.min(available);
+        }
+        // Both fallback heaps and the shared target have now had owned bytes subtracted once.
+        vram.live = true;
+        vram
     }
 }
 
@@ -769,6 +803,8 @@ struct VulkanShared {
     /// VK_EXT_memory_budget is absent — the live per-heap budget is preferred when present
     /// (it also sees other processes' VRAM).
     device_used: AtomicU64,
+    /// Includes UMA overflow and staging/readback, but excludes imported aliases and subranges.
+    unified_ram: Option<UnifiedRamBudget>,
     /// Concurrently-live [`BufferUsage::Activations`] bytes, and the high-water mark that figure
     /// has reached since this backend was built ([`VulkanBackend::activation_peak`]).
     ///
@@ -989,6 +1025,25 @@ impl Drop for VramKeepalive {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl VulkanShared {
+    fn budget_used(&self) -> u64 {
+        self.unified_ram.as_ref().map_or_else(
+            || self.device_used.load(Ordering::Relaxed),
+            |ram| ram.used.load(Ordering::Relaxed),
+        )
+    }
+
+    fn charge_owned_ram(&self, bytes: u64) {
+        if let Some(ram) = &self.unified_ram {
+            ram.charge(bytes);
+        }
+    }
+
+    fn release_owned_ram(&self, bytes: u64) {
+        if let Some(ram) = &self.unified_ram {
+            ram.release(bytes);
+        }
+    }
+
     fn dedicated_transfer_families(&self) -> Option<[u32; 2]> {
         self.dedicated_transfer.as_ref().map(|queue| {
             let family = queue.lock().unwrap().family_index();
@@ -1790,6 +1845,7 @@ impl Drop for VkBuffer {
             match &mut self.backing {
                 Backing::Pooled(alloc) => {
                     let alloc = ManuallyDrop::take(alloc);
+                    self.shared.release_owned_ram(alloc.size());
                     // Keep the budget guard's fallback accounting balanced.
                     if self.location == MemoryLocation::GpuOnly {
                         self.shared
@@ -1805,6 +1861,7 @@ impl Drop for VkBuffer {
                 Backing::Vram {
                     memory, spilled, ..
                 } => {
+                    self.shared.release_owned_ram(self.mem_size);
                     if !*spilled {
                         self.shared
                             .device_used
@@ -1814,6 +1871,7 @@ impl Drop for VkBuffer {
                     self.shared.device.free_memory(*memory, None);
                 }
                 Backing::Device { memory } => {
+                    self.shared.release_owned_ram(self.mem_size);
                     self.shared
                         .device_used
                         .fetch_sub(self.mem_size, Ordering::Relaxed);
@@ -2811,15 +2869,22 @@ fn physical_vram_info(
     }
 }
 
-fn vram_info(s: &VulkanShared) -> VramInfo {
+fn raw_vram_info(s: &VulkanShared) -> VramInfo {
     physical_vram_info(
         &s.instance,
         s.physical_device,
         s.caps.unified_memory,
         s.largest_device_local_heap_only,
         s.has_mem_budget,
-        s.device_used.load(Ordering::Relaxed),
+        s.budget_used(),
     )
+}
+
+fn vram_info(s: &VulkanShared) -> VramInfo {
+    let vram = raw_vram_info(s);
+    s.unified_ram.as_ref().map_or(vram, |ram| {
+        ram.snapshot(vram, infr_core::hostmem::available_bytes())
+    })
 }
 
 /// RAII scope for a weight-load progress bar (see [`VulkanBackend::weight_progress`]). While alive,
@@ -4499,6 +4564,24 @@ impl VulkanBackend {
 
         let runtime_phase = Arc::new(Mutex::new(adapter::RuntimePhaseArena::default()));
         let unified_phases = UnifiedPhaseRegistry::new(&runtime_phase);
+        let unified_ram = caps.unified_memory.then(|| {
+            let resident = infr_core::hostmem::process_resident_bytes();
+            let limit = infr_core::hostmem::unified_device_budget_for_snapshot(
+                &cfg,
+                infr_core::hostmem::available_bytes(),
+                infr_core::hostmem::total_bytes(),
+                resident,
+            );
+            tracing::info!(
+                shared_device_budget_bytes = limit,
+                host_baseline_resident_bytes = resident,
+                "[infr] UMA RAM and Vulkan heaps share one process budget; device allocations are charged once, not added to an independent RAM cache"
+            );
+            UnifiedRamBudget {
+                limit,
+                used: AtomicU64::new(0),
+            }
+        });
         let mut backend = Self {
             decode_prefetch: Mutex::new(None),
             cpu_miss: std::sync::OnceLock::new(),
@@ -4561,6 +4644,7 @@ impl VulkanBackend {
                 pcache,
                 weight_pb: Mutex::new(None),
                 device_used: AtomicU64::new(0),
+                unified_ram,
                 act_live: AtomicU64::new(0),
                 act_peak: AtomicU64::new(0),
                 submit_dispatch_cap: AtomicUsize::new(submit_dispatch_cap),
@@ -5272,7 +5356,7 @@ impl VulkanBackend {
     /// the room only before this backend has allocated — which is when placement runs.
     pub fn alloc_room(&self) -> u64 {
         let vram = self.vram();
-        let tracked_used = self.shared.device_used.load(Ordering::Relaxed);
+        let tracked_used = self.shared.budget_used();
         let room = infr_core::budget::unified_vram_room_for_profile(
             vram.total,
             backend_physical_alloc_room(vram, tracked_used),
@@ -5315,6 +5399,7 @@ impl VulkanBackend {
         const CHECK_MIN: u64 = 1 << 20; // 1 MiB
         let unified_limit = self.cfg.device.vram_budget.is_some()
             || self.cfg.device.vram_reserve.is_some()
+            || self.shared.unified_ram.is_some()
             || infr_core::test_resource::active().is_some();
         if (want < CHECK_MIN && !unified_limit) || self.cfg.kernels.vulkan.no_vram_guard {
             return Ok(());
@@ -5325,13 +5410,13 @@ impl VulkanBackend {
         if self.vram_budget_fits(want) {
             return Ok(());
         }
-        let v = self.vram();
+        let v = raw_vram_info(&self.shared);
         let global_used = if v.live {
             v.total.saturating_sub(v.available)
         } else {
-            self.shared.device_used.load(Ordering::Relaxed)
+            self.shared.budget_used()
         };
-        let process_used = self.shared.device_used.load(Ordering::Relaxed);
+        let process_used = self.shared.budget_used();
         let physical_budget = v.total.saturating_sub(GUARD_HEADROOM).saturating_sub(
             self.cfg
                 .device
@@ -5345,7 +5430,7 @@ impl VulkanBackend {
             .map(|spec| spec.resolve(v.total).min(v.total));
         Err(be(format!(
             "{} budget exceeded: {} requested with {} physical / {} backend bytes already in use; \
-                 {} remains under the unified limit (physical cap {}, configured cap {}). \
+                 {} remains under the unified limit (physical cap {}, configured cap {}, shared RAM cap {}). \
                  Refusing to over-commit: exceeding it doesn't fail \
                  cleanly — the driver evicts (weights get read back over the bus) or the device is \
                  lost (TDR) mid-inference. Use a smaller context (INFR_CTX), a smaller/more- \
@@ -5358,6 +5443,11 @@ impl VulkanBackend {
             fmt_bytes(self.alloc_room()),
             fmt_bytes(physical_budget),
             configured_budget.map_or_else(|| "unlimited".to_owned(), fmt_bytes),
+            self.shared
+                .unified_ram
+                .as_ref()
+                .and_then(|ram| ram.limit)
+                .map_or_else(|| "not applicable".to_owned(), fmt_bytes),
         )))
     }
 
@@ -5458,6 +5548,7 @@ impl VulkanBackend {
                 .device_used
                 .fetch_add(requirements.size, Ordering::Relaxed);
         }
+        self.shared.charge_owned_ram(requirements.size);
 
         // Mirror `make_buf_ex`'s own-address computation: `device_address` here means the caller
         // already added `SHADER_DEVICE_ADDRESS` to the buffer's usage AND (just above) chained the
@@ -5532,11 +5623,18 @@ impl VulkanBackend {
                     .to_string(),
             ));
         }
-        // spilled=true (NOT charged to device_used), device_address=true,
-        // budget_check=false (this is system RAM). On Err, `alloc_vram_mapped` leaves the buffer
-        // to us.
-        self.alloc_vram_mapped(buffer, size, &requirements, ty, true, true, false)
-            .inspect_err(|_| unsafe { self.shared.device.destroy_buffer(buffer, None) })
+        // Spills stay outside the device-local tally; UMA still charges and guards their shared
+        // host RAM. On Err, `alloc_vram_mapped` leaves the buffer to us.
+        self.alloc_vram_mapped(
+            buffer,
+            size,
+            &requirements,
+            ty,
+            true,
+            true,
+            self.shared.caps.unified_memory,
+        )
+        .inspect_err(|_| unsafe { self.shared.device.destroy_buffer(buffer, None) })
     }
 
     /// Allocate the paged-MoE expert arena as a `bufferDeviceAddress` buffer and return it with its
@@ -5629,6 +5727,7 @@ impl VulkanBackend {
         self.shared
             .device_used
             .fetch_add(requirements.size, Ordering::Relaxed);
+        self.shared.charge_owned_ram(requirements.size);
         let address = unsafe {
             self.shared
                 .device
@@ -6629,10 +6728,9 @@ impl VulkanBackend {
         } else {
             AllocationScheme::GpuAllocatorManaged
         };
-        // Budget guard: fail fast, with a clear error, BEFORE committing device-local memory the
-        // budget can't cover (host-visible staging/readback/host-weights are exempt — the guard
-        // protects VRAM only).
-        if location == MemoryLocation::GpuOnly {
+        // UMA staging/readback consumes the same physical pool as GPU weights and runtime.
+        // Discrete devices retain the device-local-only guard.
+        if location == MemoryLocation::GpuOnly || self.shared.unified_ram.is_some() {
             if let Err(e) = self.check_vram_budget(requirements.size) {
                 unsafe { self.shared.device.destroy_buffer(buffer, None) };
                 return Err(e);
@@ -6727,6 +6825,7 @@ impl VulkanBackend {
                 .device_used
                 .fetch_add(allocation.size(), Ordering::Relaxed);
         }
+        self.shared.charge_owned_ram(allocation.size());
 
         // `device_address` callers added `SHADER_DEVICE_ADDRESS` to the buffer's usage above; the
         // allocator itself was built with `buffer_device_address: true` (see `VulkanShared::new`),
@@ -8898,6 +8997,144 @@ mod tests {
             backend_physical_alloc_room(live, 5 * GIB),
             live.alloc_room(),
             "a live heap budget already nets out tracked allocations"
+        );
+    }
+
+    #[test]
+    fn unified_ram_budget_caps_heap_sums_and_counts_overflow_once() {
+        const GIB: u64 = 1 << 30;
+        let ram = UnifiedRamBudget {
+            limit: Some(19 * GIB),
+            used: AtomicU64::new(0),
+        };
+        // Device-local weights plus overflow/staging all spend the same physical RAM.
+        ram.charge(8 * GIB);
+        ram.charge(3 * GIB);
+        for live in [false, true] {
+            let raw = VramInfo {
+                total: 48 * GIB,
+                available: 32 * GIB,
+                live,
+                uma: true,
+            };
+            let snapshot = ram.snapshot(raw, Some(28 * GIB));
+            assert!(snapshot.live);
+            assert_eq!(snapshot.available, 8 * GIB);
+            assert_eq!(
+                backend_physical_alloc_room(snapshot, 11 * GIB),
+                8 * GIB - GUARD_HEADROOM,
+                "the planner and allocator must not subtract the same UMA bytes twice"
+            );
+        }
+        ram.release(3 * GIB);
+        let raw = VramInfo {
+            total: 48 * GIB,
+            available: 32 * GIB,
+            live: true,
+            uma: true,
+        };
+        assert_eq!(ram.snapshot(raw, Some(28 * GIB)).available, 11 * GIB);
+        ram.release(8 * GIB);
+        assert_eq!(ram.used.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn unified_ram_budget_respects_live_pressure_and_driver_fallback() {
+        const GIB: u64 = 1 << 30;
+        let ram = UnifiedRamBudget {
+            limit: Some(19 * GIB),
+            used: AtomicU64::new(11 * GIB),
+        };
+        let raw = VramInfo {
+            total: 48 * GIB,
+            available: 32 * GIB,
+            live: true,
+            uma: true,
+        };
+        assert_eq!(ram.snapshot(raw, Some(2 * GIB)).available, 2 * GIB);
+        assert_eq!(
+            ram.snapshot(
+                VramInfo {
+                    available: GIB,
+                    ..raw
+                },
+                None
+            )
+            .available,
+            GIB
+        );
+        ram.charge(20 * GIB);
+        assert_eq!(ram.snapshot(raw, None).available, 0);
+
+        let unknown = UnifiedRamBudget {
+            limit: None,
+            used: AtomicU64::new(11 * GIB),
+        };
+        assert_eq!(
+            unknown
+                .snapshot(VramInfo { live: false, ..raw }, None)
+                .available,
+            21 * GIB
+        );
+        assert_eq!(unknown.snapshot(raw, None).available, 32 * GIB);
+    }
+
+    #[test]
+    #[ignore = "uses small Vulkan buffers with emulated UMA accounting; requires an idle GPU"]
+    fn unified_ram_budget_real_buffers_release_and_alias_once() {
+        const MIB: usize = 1 << 20;
+        let mut config = Config::default();
+        config.device.vram_reserve = Some(infr_core::SizeSpec::Bytes(0));
+        config.kernels.vulkan.gemv.id_grid_buffer = Some(false);
+        let mut backend = VulkanBackend::new_with(Arc::new(config)).unwrap();
+        // No live buffers may predate the synthetic counter. Each owned VkBuffer retains Shared,
+        // so unique ownership here also verifies that there is nothing to charge retroactively.
+        let shared = Arc::get_mut(&mut backend.shared).expect("no live startup buffers");
+        shared.caps.unified_memory = true;
+        shared.unified_ram = Some(UnifiedRamBudget {
+            limit: Some((512 * MIB) as u64),
+            used: AtomicU64::new(0),
+        });
+        let tracking = Arc::clone(&backend.shared);
+        let weights = backend.alloc_uninit(4 * MIB, BufferUsage::Weights).unwrap();
+        let after_weights = tracking.budget_used();
+        assert!(after_weights >= (4 * MIB) as u64);
+        let staging = backend.alloc_uninit(4 * MIB, BufferUsage::Staging).unwrap();
+        assert!(tracking.budget_used() >= after_weights + (4 * MIB) as u64);
+        if backend.shared.host_overflow_type.is_some() {
+            let device_local = tracking.device_used.load(Ordering::Relaxed);
+            let before = tracking.budget_used();
+            let overflow = backend.alloc_kv_host(4 * MIB).unwrap();
+            assert!(tracking.budget_used() >= before + (4 * MIB) as u64);
+            assert_eq!(tracking.device_used.load(Ordering::Relaxed), device_local);
+            drop(overflow);
+            assert_eq!(tracking.budget_used(), before);
+        }
+        assert!(backend.check_vram_budget((512 * MIB) as u64).is_err());
+        let pool = backend.init_unified_vram(8 * MIB).unwrap();
+        let before_views = tracking.budget_used();
+        let a = backend
+            .alloc_unified(MIB, crate::unified::UnifiedVramClass::Expert)
+            .unwrap();
+        let b = backend
+            .alloc_unified(MIB, crate::unified::UnifiedVramClass::LlmRuntime)
+            .unwrap();
+        assert_eq!(
+            tracking.budget_used(),
+            before_views,
+            "views must not charge their parent again"
+        );
+        drop(a);
+        drop(b);
+        assert_eq!(tracking.budget_used(), before_views);
+        drop(pool);
+        drop(weights);
+        drop(staging);
+        drop(backend);
+        assert_eq!(
+            tracking.budget_used(),
+            0,
+            "all owned allocations must be released exactly once"
         );
     }
 
