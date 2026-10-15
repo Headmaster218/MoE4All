@@ -4393,6 +4393,12 @@ fn main() {
         for d in defines {
             args.push(d.clone());
         }
+        if src_stem == "gpu_resident_check" || src_stem == "gpu_resident_hit_check" {
+            args.push(format!(
+                "-DINFR_MAX_DECODE_ROWS={}",
+                infr_core::backend::MAX_DECODE_ROWS
+            ));
+        }
         args.push(src.clone());
         args.push("-o".into());
         args.push(dst);

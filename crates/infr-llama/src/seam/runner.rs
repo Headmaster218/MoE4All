@@ -304,6 +304,23 @@ fn lm_head_sampling_input(
     suffix
 }
 
+fn parallel_lm_head_target(
+    graph: &mut Graph,
+    output: TensorId,
+    rows: usize,
+    vocab: usize,
+    independent: bool,
+) -> TensorId {
+    if independent && rows > 4 {
+        // Wide LM heads may use a 64-row tiled GEMM from five lanes onwards. Declare its
+        // row geometry so the backend reserves padding before expert LUTs become frozen,
+        // rather than allocating a large transient at the end of an already-pinned graph.
+        graph.internal(TensorDesc::new(vec![rows, vocab], DType::F32))
+    } else {
+        output
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResidentFullGraphModel {
     /// The model has no host-produced data between L0 and L1, so Decode can enter the resident
@@ -4017,7 +4034,11 @@ fn generate_dense_backend_inner(
         let mut g = Graph::new();
         g.mtp_verify = mtp_verify;
         g.independent_rows = independent_rows;
-        if !mtp_verify && !denoise && logits_rows > 0 && batch <= 2 {
+        if !mtp_verify
+            && !denoise
+            && logits_rows > 0
+            && batch <= infr_core::backend::MAX_DECODE_ROWS
+        {
             let no_interlock_full_graph = use_ids
                 && l_first == 0
                 && l_end == c.n_layer
@@ -8076,15 +8097,31 @@ fn generate_dense_backend_inner(
             } else {
                 None
             };
+            let lm_logits = parallel_lm_head_target(
+                &mut g,
+                logits,
+                logits_rows,
+                c.vocab,
+                independent_rows && !mtp_verify,
+            );
             g.push(Op::Linear {
                 x: lm_in,
                 weight: w_lm,
-                dst: logits,
+                dst: lm_logits,
                 m: logits_rows as u32,
                 in_f: ne as u32,
                 out_f: c.vocab as u32,
                 w_off: 0,
             });
+            if lm_logits != logits {
+                g.push(Op::Copy {
+                    src: lm_logits,
+                    src_off: 0,
+                    dst: logits,
+                    dst_off: 0,
+                    n: (logits_rows * c.vocab) as u32,
+                });
+            }
             if c.final_softcap > 0.0 {
                 g.push(Op::Softcap {
                     x: logits,
@@ -12663,7 +12700,7 @@ mod tests {
             super::resident_full_graph_decode(c, ec, "vulkan", 1, 0, false, false, 150_000)
         };
         assert!(eligible(&flashnext, &ec));
-        for lanes in 0..=8 {
+        for lanes in 0..=infr_core::backend::MAX_DECODE_ROWS + 1 {
             for sample_from in 0..=lanes {
                 for capture in [false, true] {
                     for multimodal in [false, true] {
@@ -12784,6 +12821,32 @@ mod tests {
         let mut dense = flashnext;
         dense.moe = None;
         assert!(!eligible(&dense, &automatic));
+    }
+
+    #[test]
+    fn parallel_lm_head_reserves_tiled_padding_before_expert_freeze() {
+        use infr_core::{
+            graph::{Graph, TensorKind},
+            DType, TensorDesc,
+        };
+        let vocab = 248_320;
+        for rows in 1..=infr_core::backend::MAX_DECODE_ROWS {
+            for independent in [false, true] {
+                let mut graph = Graph::new();
+                let output = graph.output(TensorDesc::new(vec![rows * vocab], DType::F32));
+                let target =
+                    super::parallel_lm_head_target(&mut graph, output, rows, vocab, independent);
+                if independent && rows > 4 {
+                    assert_ne!(target, output);
+                    assert_eq!(graph.tensors[target.0 as usize].kind, TensorKind::Internal);
+                    assert_eq!(graph.desc(target).shape, vec![rows, vocab]);
+                    let padded_bytes = rows.div_ceil(64) * 64 * vocab * 4;
+                    assert_eq!(padded_bytes, 63_569_920);
+                } else {
+                    assert_eq!(target, output);
+                }
+            }
+        }
     }
 
     #[test]

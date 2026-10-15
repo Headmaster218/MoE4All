@@ -28,13 +28,13 @@ pub(crate) const RESIDENT_MAX_LAYERS: usize = 16;
 pub(crate) const RESIDENT_SEED_WORD: usize = 5 + 2 * RESIDENT_MAX_LAYERS;
 pub(crate) const RESIDENT_CONTROL_BYTES: usize = (RESIDENT_SEED_WORD + 1) * 4;
 // Resident journal ABI shared with gpu_resident_{check,hit_check}.comp. Keep routed ids and
-// per-row masks disjoint so every supported layout (up to four rows x top-16) is recoverable.
-// Four rows cover one Qwen3.8 MTP VERIFY batch without changing the ordinary Decode protocol.
-pub(crate) const RESIDENT_JOURNAL_ID_WORDS: usize = 64;
+// per-row masks disjoint for every supported cohort, including eight rows x top-16.
+pub(crate) const RESIDENT_JOURNAL_ID_WORDS: usize = infr_core::backend::MAX_DECODE_ROWS * 16;
 pub(crate) const RESIDENT_JOURNAL_MASK_WORD: usize = RESIDENT_JOURNAL_ID_WORDS;
-pub(crate) const RESIDENT_JOURNAL_MASK_WORDS: usize = 4;
-pub(crate) const RESIDENT_JOURNAL_STATUS_WORD: usize = 71;
-pub(crate) const RESIDENT_JOURNAL_WORDS: usize = 72;
+pub(crate) const RESIDENT_JOURNAL_MASK_WORDS: usize = infr_core::backend::MAX_DECODE_ROWS;
+pub(crate) const RESIDENT_JOURNAL_STATUS_WORD: usize =
+    RESIDENT_JOURNAL_MASK_WORD + RESIDENT_JOURNAL_MASK_WORDS + 3;
+pub(crate) const RESIDENT_JOURNAL_WORDS: usize = RESIDENT_JOURNAL_STATUS_WORD + 1;
 pub(crate) const RESIDENT_JOURNAL_BYTES: usize = RESIDENT_JOURNAL_WORDS * 4;
 
 const RESIDENT_DISPATCH_CAPACITY: usize = 8192;
@@ -14937,6 +14937,100 @@ mod tests {
 
     #[test]
     #[ignore = "requires a Vulkan GPU"]
+    fn gpu_resident_hit_journal_supports_all_decode_rows() {
+        let backend = VulkanBackend::new().unwrap();
+        let event = unsafe {
+            backend
+                .shared
+                .device
+                .create_event(&vk::EventCreateInfo::default(), None)
+        }
+        .unwrap();
+        let experts = 256;
+        let tape = backend
+            .alloc(experts * 3 * 8, BufferUsage::Staging)
+            .unwrap();
+        let control = backend
+            .alloc(RESIDENT_CONTROL_BYTES, BufferUsage::Readback)
+            .unwrap();
+        let journal = backend
+            .alloc(RESIDENT_JOURNAL_BYTES, BufferUsage::Readback)
+            .unwrap();
+        for rows in [1, 2, 4, infr_core::backend::MAX_DECODE_ROWS] {
+            let used = 16;
+            let count = rows * used;
+            let ids = backend
+                .alloc((count + rows * 2) * 4, BufferUsage::Readback)
+                .unwrap();
+            for missing in [false, true] {
+                let routed: Vec<u32> = (0..count as u32).collect();
+                backend
+                    .upload(ids.as_ref(), bytemuck::cast_slice(&routed))
+                    .unwrap();
+                let mut addresses = vec![1u64; experts * 3];
+                if missing {
+                    addresses[count - 1] = 0;
+                }
+                backend
+                    .upload(tape.as_ref(), bytemuck::cast_slice(&addresses))
+                    .unwrap();
+                let rec = backend.recorder().unwrap();
+                rec.gpu_resident_check(
+                    control.as_ref(),
+                    tape.as_ref(),
+                    control.as_ref(),
+                    journal.as_ref(),
+                    [0; 6],
+                );
+                rec.gpu_resident_hit_check(
+                    ids.as_ref(),
+                    tape.as_ref(),
+                    control.as_ref(),
+                    journal.as_ref(),
+                    [
+                        count as u32,
+                        experts as u32,
+                        0,
+                        experts as u32,
+                        (experts * 2) as u32,
+                        0,
+                        used as u32,
+                        0,
+                    ],
+                    event,
+                );
+                rec.finish().unwrap();
+                let mut words = vec![0u32; RESIDENT_JOURNAL_WORDS];
+                backend
+                    .download(journal.as_ref(), bytemuck::cast_slice_mut(&mut words))
+                    .unwrap();
+                assert_eq!(&words[..count], routed.as_slice());
+                for row in 0..rows {
+                    let expected = if missing && row == rows - 1 {
+                        0x7fff
+                    } else {
+                        0xffff
+                    };
+                    assert_eq!(
+                        words[RESIDENT_JOURNAL_MASK_WORD + row],
+                        expected,
+                        "rows={rows} row={row}"
+                    );
+                }
+                assert_eq!(
+                    words[RESIDENT_JOURNAL_STATUS_WORD],
+                    if missing { 2 } else { 1 }
+                );
+                unsafe { backend.shared.device.reset_event(event) }.unwrap();
+            }
+        }
+        unsafe {
+            backend.shared.device.destroy_event(event, None);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
     fn gpu_resident_conditions_preserve_paused_state() {
         let mut cfg = infr_core::config::Config::default();
         cfg.kernels.vulkan.decode_gpu_resident = true;
@@ -14958,7 +15052,7 @@ mod tests {
         backend
             .upload(increment.as_ref(), bytemuck::bytes_of(&1f32))
             .unwrap();
-        for rows in [1, 2] {
+        for rows in [1, 2, 4, infr_core::backend::MAX_DECODE_ROWS] {
             for missing_at in [None, Some(0), Some(1), Some(3)] {
                 for missing_role in 0..3 {
                     let outputs: Vec<_> = (0..4)
