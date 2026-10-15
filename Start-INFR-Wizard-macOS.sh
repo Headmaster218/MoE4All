@@ -546,14 +546,14 @@ defaults() {
         [bench_kind]=decode [prompt_tokens]=1024 [gen_tokens]=128 [depth_mode]=none [depth_tokens]=0 [reps]=1 [json_output]=false
         [custom_sets]='' [auto_overrides]=''
     )
-    DEFAULTS=(); for key in "${(@k)S}"; do DEFAULTS[$key]=${S[$key]}; done
+    DEFAULTS=(); for key in "${(@k)S[@]}"; do DEFAULTS[$key]=${S[$key]}; done
 }
 load_state() {
     local key raw value state_path
     if [[ -f $STATE ]]; then
         json_load "$STATE" || { fail "Invalid saved settings: $STATE"; return 1; }
         [[ $JSON_KIND == object ]] || { fail 'Saved settings must be a JSON object.'; return 1; }
-        for key in "${(@k)S}"; do
+        for key in "${(@k)S[@]}"; do
             state_path="[\"$key\"]"; [[ -v "J[$state_path]" ]] || continue; raw=${J[$state_path]}
             case ${DEFAULTS[$key]} in
                 true|false) [[ $raw == true || $raw == false ]] || { fail "Invalid saved boolean: $key"; return 1; } ;;
@@ -582,7 +582,7 @@ save_state() {
     mkdir -p -- "$CONFIG_DIR"; temporary=$(mktemp "$CONFIG_DIR/.wizard-state.XXXXXX")
     {
         printf '{\n'
-        for key in "${(@k)S}"; do
+        for key in "${(@k)S[@]}"; do
             printf '%s  "%s": ' "$sep" "$key"
             case ${DEFAULTS[$key]} in true|false) printf '%s' "${S[$key]}" ;; *) json_quote "${S[$key]}"; printf '%s' "$REPLY" ;; esac
             sep=$',\n'
@@ -796,7 +796,7 @@ model_path() {
     local -a nearby=("${CANDIDATES[@]}") remembered=("$saved")
     if [[ $kind == llm && -f $ROOT/gui-data/state.json ]]; then
         if json_load "$ROOT/gui-data/state.json"; then
-            for candidate_path in "${(@k)J}"; do
+            for candidate_path in "${(@k)J[@]}"; do
                 if [[ $candidate_path =~ ^\[\"(recent|favorites)\",[0-9]+\]$ || $candidate_path =~ ^\[\"profiles\",[0-9]+,\"model_path\"\]$ ]]; then
                     json_get "$candidate_path" && remembered+=("$REPLY")
                 fi
@@ -1318,7 +1318,7 @@ main() {
         case $key in mtp_model) value=mtp_enabled ;; vision_projector) value=server_vision ;; embedding_model) value=server_embedding ;; esac
         if [[ -v "OVERRIDES[$key]" ]]; then S[$value]=false; [[ -z ${S[$key]} ]] || S[$value]=true; fi
     done
-    for key in "${(@k)disables}"; do S[$key]=''; S[${disables[$key]}]=false; done
+    for key in "${(@k)disables[@]}"; do S[$key]=''; S[${disables[$key]}]=false; done
     [[ ! -v 'OVERRIDES[ram_budget]' ]] || S[configure_memory]=true
     [[ ! -v 'OVERRIDES[kv_type_k]' && ! -v 'OVERRIDES[kv_type_v]' ]] || S[kv_preset]=custom
     if [[ -v 'OVERRIDES[cpu_miss_cores]' ]]; then S[cpu_miss_enabled]=false; [[ ${S[cpu_miss_cores]} == '' || ${S[cpu_miss_cores]} == 0 ]] || S[cpu_miss_enabled]=true; fi
