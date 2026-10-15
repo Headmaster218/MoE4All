@@ -184,6 +184,59 @@ pub fn trim_reclaimable_working_set() -> bool {
     }
 }
 
+/// Release clean file-backed source pages after their contents have been copied elsewhere.
+/// The mapping stays valid and subsequent reads fault the original file bytes back in.
+/// Unlike a process-wide working-set trim, this does not evict Vulkan allocations or host caches.
+///
+/// # Safety
+/// `bytes` must belong to a live, read-only file mapping, including the page-aligned range that
+/// encloses it. It must not refer to anonymous allocations or privately modified pages.
+pub unsafe fn release_read_only_file_pages(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::ERROR_NOT_LOCKED;
+        use windows::Win32::System::Memory::VirtualUnlock;
+
+        // For unlocked pages Windows removes the range from the working set, then reports
+        // ERROR_NOT_LOCKED. That is the expected result for our read-only GGUF mappings.
+        match unsafe { VirtualUnlock(bytes.as_ptr().cast(), bytes.len()) } {
+            Ok(()) => true,
+            Err(error) => error.code() == windows::core::HRESULT::from_win32(ERROR_NOT_LOCKED.0),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page_size <= 0 {
+            return false;
+        }
+        let page_size = page_size as usize;
+        let start = bytes.as_ptr() as usize;
+        let page_start = start / page_size * page_size;
+        let Some(end) = start.checked_add(bytes.len()) else {
+            return false;
+        };
+        let Some(page_end) = end.checked_add(page_size - 1) else {
+            return false;
+        };
+        let page_end = page_end / page_size * page_size;
+        unsafe {
+            libc::madvise(
+                page_start as *mut libc::c_void,
+                page_end - page_start,
+                libc::MADV_DONTNEED,
+            ) == 0
+        }
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        false
+    }
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn parse_process_resident(text: &str) -> Option<u64> {
     let line = text.lines().find(|line| line.starts_with("VmRSS:"))?;
@@ -408,6 +461,37 @@ pub fn cache_bytes_for_total_budget(total: u64, resident: Option<u64>, pageable:
         .min(pageable)
 }
 
+/// A UMA device arena spends the host process target, not an independent pool of "VRAM".
+/// Resolve this before Vulkan allocations exist so their mapped pages cannot be counted both
+/// in the process working set and in the device allocation tally. Zero disables a host cache,
+/// not GPU execution; the legacy exact-cache override is reserved separately when selected.
+pub fn unified_device_budget_for_snapshot(
+    config: &crate::config::Config,
+    available: Option<u64>,
+    total: Option<u64>,
+    resident: Option<u64>,
+) -> Option<u64> {
+    let explicit = config.device.ram_budget.and_then(|size| match size {
+        crate::SizeSpec::Bytes(bytes) => (bytes > 0).then_some(bytes),
+        crate::SizeSpec::FrozenAutomaticBytes(bytes) => Some(bytes),
+        crate::SizeSpec::Percent(_) => total.map(|total| size.resolve(total)).filter(|n| *n > 0),
+    });
+    let target = explicit.or_else(|| match config.device.auto_profile {
+        crate::config::AutoProfile::Conservative => {
+            available.map(|bytes| bytes.saturating_sub(AUTO_AVAILABLE_RESERVE))
+        }
+        crate::config::AutoProfile::Aggressive => {
+            total.map(|bytes| bytes.saturating_sub(AGGRESSIVE_TOTAL_RESERVE))
+        }
+    })?;
+    let legacy_cache = if config.device.ram_budget.is_none() && !config.paging.dram_bypass {
+        config.paging.dram.map_or(0, |size| size.resolve(0))
+    } else {
+        0
+    };
+    Some(cache_bytes_for_total_budget(target, resident, u64::MAX).saturating_sub(legacy_cache))
+}
+
 /// What a caller should do about a host weight arena.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArenaPlan {
@@ -488,8 +572,9 @@ impl RamRequest {
 /// The arena plan for a run that has ALREADY been decided to stream — the Vulkan dense and MoE
 /// tiers, whose callers only reach them once residency was rejected.
 ///
-/// A user request always wins, including on unified memory. `TotalProcessBudget` subtracts
-/// `process_resident`; `LegacyCacheBudget` preserves the old exact-cache benchmark control. The
+/// A total-process RAM target also covers the device arena on unified memory, so it must not
+/// create an additional host cache there. `LegacyCacheBudget` preserves the old exact-cache
+/// benchmark control. On other devices `TotalProcessBudget` subtracts `process_resident`. The
 /// canonical total budget deliberately bypasses automatic headroom, so it may make the OS page out
 /// unrelated cold memory.
 pub fn streaming_arena_plan(
@@ -546,6 +631,7 @@ pub fn streaming_arena_plan_for_snapshot(
         // discrete GPU, which is the only hardware this is developed on.
         RamRequest::Bypass => return ArenaPlan::StreamOnly,
         RamRequest::TotalProcessBudget(0) => return ArenaPlan::Skip(Skip::Disabled),
+        RamRequest::TotalProcessBudget(_) if unified => return ArenaPlan::StreamOnly,
         RamRequest::TotalProcessBudget(total) => {
             let bytes = cache_bytes_for_total_budget(total, process_resident, pageable);
             return if bytes == 0 {
@@ -819,6 +905,103 @@ mod tests {
             streaming_arena_plan(frozen, Some(48 * GIB), Some(2 * GIB), false, 40 * GIB),
             ArenaPlan::Take(_)
         ));
+    }
+
+    #[test]
+    fn canonical_ram_budget_never_duplicates_a_uma_cache() {
+        for request in [
+            RamRequest::Auto,
+            RamRequest::FrozenAutomaticBudget(50 * GIB),
+            RamRequest::TotalProcessBudget(50 * GIB),
+        ] {
+            assert_eq!(
+                streaming_arena_plan(request, Some(60 * GIB), Some(2 * GIB), true, 40 * GIB),
+                ArenaPlan::StreamOnly,
+                "{request:?} already limits the UMA device arena"
+            );
+        }
+        assert_eq!(
+            streaming_arena_plan(
+                RamRequest::TotalProcessBudget(0),
+                Some(60 * GIB),
+                Some(2 * GIB),
+                true,
+                40 * GIB,
+            ),
+            ArenaPlan::Skip(Skip::Disabled)
+        );
+    }
+
+    #[test]
+    fn unified_device_budget_uses_one_startup_host_target() {
+        use crate::config::{AutoProfile, Config};
+        let mut config = Config::default();
+        let budget = |config: &Config| {
+            unified_device_budget_for_snapshot(config, Some(20 * GIB), Some(64 * GIB), Some(GIB))
+        };
+        assert_eq!(
+            budget(&config),
+            Some(16 * GIB - TOTAL_BUDGET_FUTURE_RESERVE)
+        );
+        config.device.auto_profile = AutoProfile::Aggressive;
+        assert_eq!(
+            budget(&config),
+            Some(50 * GIB - TOTAL_BUDGET_FUTURE_RESERVE)
+        );
+        config.device.ram_budget = Some(crate::SizeSpec::Bytes(40 * GIB));
+        assert_eq!(
+            budget(&config),
+            Some(39 * GIB - TOTAL_BUDGET_FUTURE_RESERVE)
+        );
+        config.device.ram_budget = Some(crate::SizeSpec::Percent(0.5));
+        assert_eq!(
+            budget(&config),
+            Some(31 * GIB - TOTAL_BUDGET_FUTURE_RESERVE)
+        );
+        config.device.ram_budget = Some(crate::SizeSpec::FrozenAutomaticBytes(40 * GIB));
+        assert_eq!(
+            budget(&config),
+            Some(39 * GIB - TOTAL_BUDGET_FUTURE_RESERVE)
+        );
+        config.device.ram_budget = Some(crate::SizeSpec::FrozenAutomaticBytes(0));
+        assert_eq!(
+            budget(&config),
+            Some(0),
+            "a frozen zero is not a fresh automatic request"
+        );
+    }
+
+    #[test]
+    fn unified_device_budget_preserves_host_disable_and_legacy_controls() {
+        use crate::config::Config;
+        let mut config = Config::default();
+        let budget = |config: &Config| {
+            unified_device_budget_for_snapshot(config, Some(20 * GIB), Some(64 * GIB), Some(GIB))
+        };
+        config.device.ram_budget = Some(crate::SizeSpec::Bytes(0));
+        assert_eq!(
+            budget(&config),
+            Some(16 * GIB - TOTAL_BUDGET_FUTURE_RESERVE)
+        );
+        config.device.ram_budget = None;
+        config.paging.dram = Some(crate::SizeSpec::Bytes(8 * GIB));
+        assert_eq!(budget(&config), Some(8 * GIB - TOTAL_BUDGET_FUTURE_RESERVE));
+        config.paging.dram_bypass = true;
+        assert_eq!(
+            budget(&config),
+            Some(16 * GIB - TOTAL_BUDGET_FUTURE_RESERVE)
+        );
+        config.paging.dram_bypass = false;
+        config.device.ram_budget = Some(crate::SizeSpec::Bytes(40 * GIB));
+        assert_eq!(
+            budget(&config),
+            Some(39 * GIB - TOTAL_BUDGET_FUTURE_RESERVE)
+        );
+        assert_eq!(
+            unified_device_budget_for_snapshot(&Config::default(), None, None, None),
+            None,
+            "a missing RAM probe is not a zero-byte GPU budget"
+        );
     }
 
     #[test]
