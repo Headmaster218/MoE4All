@@ -1450,7 +1450,10 @@ impl<'a> Recorder<'a> {
     fn stamp(&self, label: &'static str) {
         let explicit_label = self.next_label.take();
         if let Some(query) = self.timeline_query.borrow_mut().as_mut() {
-            query.mark(crate::timeline::group(explicit_label.unwrap_or(label)));
+            query.mark(crate::timeline::group(
+                explicit_label.unwrap_or(label),
+                &self.be.cfg().prof,
+            ));
         }
         // Every dispatch funnels through here, so this is also where the recorder counts them —
         // the submit splitter (`Recorder::dispatches`) needs the count whether or not INFR_PROF_OPS

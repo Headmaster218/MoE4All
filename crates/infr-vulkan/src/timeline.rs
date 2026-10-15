@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use ash::vk;
 use infr_core::timeline::{self, Context, DeviceEvent};
@@ -255,8 +255,8 @@ impl Drop for Query {
     }
 }
 
-pub(crate) fn group(kernel: &'static str) -> &'static str {
-    if *RAW_ALL_KERNELS.get_or_init(|| std::env::var_os("INFR_TIMELINE_RAW_KERNELS").is_some()) {
+pub(crate) fn group(kernel: &'static str, config: &infr_core::config::ProfCfg) -> &'static str {
+    if config.timeline_raw_kernels {
         kernel
     } else if kernel.contains("qsa") || kernel.contains("attention") || kernel.contains("attn") {
         "QSA_completion_interval"
@@ -296,21 +296,44 @@ pub(crate) fn group(kernel: &'static str) -> &'static str {
         || kernel.contains("zero")
     {
         "Data_completion_interval"
-    } else if *RAW_UNKNOWN_KERNELS
-        .get_or_init(|| std::env::var_os("INFR_TIMELINE_RAW_UNKNOWN").is_some())
-    {
+    } else if config.timeline_raw_unknown {
         kernel
     } else {
         "other_completion_interval"
     }
 }
 
-static RAW_ALL_KERNELS: OnceLock<bool> = OnceLock::new();
-static RAW_UNKNOWN_KERNELS: OnceLock<bool> = OnceLock::new();
-
 #[cfg(test)]
 mod tests {
-    use super::group;
+    fn group(kernel: &'static str) -> &'static str {
+        super::group(kernel, &Default::default())
+    }
+
+    #[test]
+    fn raw_kernel_labels_follow_each_backend_config() {
+        let mut config = infr_core::config::ProfCfg::default();
+        assert_eq!(
+            super::group("unknown_test_kernel", &config),
+            "other_completion_interval"
+        );
+        config.timeline_raw_unknown = true;
+        assert_eq!(
+            super::group("unknown_test_kernel", &config),
+            "unknown_test_kernel"
+        );
+        assert_eq!(
+            super::group("expert_gateup", &config),
+            "Expert_completion_interval"
+        );
+        config.timeline_raw_kernels = true;
+        assert_eq!(super::group("expert_gateup", &config), "expert_gateup");
+        config.timeline_raw_kernels = false;
+        config.timeline_raw_unknown = false;
+        assert_eq!(
+            super::group("expert_gateup", &config),
+            "Expert_completion_interval"
+        );
+    }
 
     #[test]
     fn prefill_timeline_groups_flashnext_kernels_by_work() {
