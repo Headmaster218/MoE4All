@@ -99,8 +99,11 @@ impl Drop for SnapshotInner {
 }
 
 /// A snapshot checked out for restore. Holds the tree node pinned (refs) so eviction skips it.
+/// The `generation` guards the hand-back: a node freed and REUSED while a restore was in flight
+/// must not take the stale release's `refs` decrement (it would un-pin the new owner).
 pub(crate) struct TakenSnapshot {
     node: usize,
+    generation: u64,
     inner: Arc<SnapshotInner>,
 }
 
@@ -123,6 +126,9 @@ struct Node {
     last_access: u64,
     /// Restores in flight; eviction and spine pruning skip pinned nodes.
     refs: usize,
+    /// Bumped on every slot reuse off the free list; stale [`TakenSnapshot`] hand-backs compare
+    /// it before touching `refs`.
+    generation: u64,
 }
 
 impl Node {
@@ -135,6 +141,7 @@ impl Node {
             entry: None,
             last_access: 0,
             refs: 0,
+            generation: 0,
         }
     }
 }
@@ -142,6 +149,10 @@ impl Node {
 /// The radix tree plus the byte ledger. Wrapped in a `Mutex` by the scheduler.
 pub(crate) struct RadixCache {
     nodes: Vec<Node>,
+    /// Recycled indices of detached nodes (see `free_node`): long-lived churn reuses slots
+    /// instead of growing the arena forever, which is what the PR review's metadata-growth
+    /// concern asked for.
+    free: Vec<usize>,
     geometry: SnapshotGeometry,
     /// Shared with every `SnapshotInner`; its value IS the held bytes.
     ledger: Arc<AtomicU64>,
@@ -156,6 +167,7 @@ impl RadixCache {
     pub(crate) fn new(slot: &SessionStateMeta, max_bytes: u64) -> Self {
         Self {
             nodes: vec![Node::new(None, Vec::new(), 0)],
+            free: Vec::new(),
             geometry: SnapshotGeometry {
                 max_ctx: slot.max_ctx,
                 k_fmt: slot.k_fmt,
@@ -323,22 +335,41 @@ impl RadixCache {
         self.nodes[node].refs += 1;
         self.clock += 1;
         self.nodes[node].last_access = self.clock;
-        Some(TakenSnapshot { node, inner })
+        let generation = self.nodes[node].generation;
+        Some(TakenSnapshot {
+            node,
+            generation,
+            inner,
+        })
     }
 
-    /// Un-pin a taken snapshot and stamp it as used (a restore keeps the entry for reuse).
+    /// Un-pin a taken snapshot and stamp it as used (a restore keeps the entry for reuse). A
+    /// hand-back whose `generation` no longer matches targets a recycled slot: touching it would
+    /// un-pin the node's NEW owner, so it is dropped. A node whose entry was cleared while it
+    /// was pinned (superseded or discarded mid-restore) is swept once the last hold leaves.
     pub(crate) fn release(&mut self, taken: TakenSnapshot) {
-        let TakenSnapshot { node, inner } = taken;
-        if let Some(node) = self.nodes.get_mut(node) {
-            node.refs = node.refs.saturating_sub(1);
-            if node
-                .entry
-                .as_ref()
-                .is_some_and(|entry| Arc::ptr_eq(entry, &inner))
-            {
-                self.clock += 1;
-                node.last_access = self.clock;
-            }
+        let TakenSnapshot {
+            node,
+            generation,
+            inner,
+        } = taken;
+        if self
+            .nodes
+            .get(node)
+            .is_none_or(|n| n.generation != generation)
+        {
+            return;
+        }
+        self.nodes[node].refs = self.nodes[node].refs.saturating_sub(1);
+        let stamp = self.nodes[node]
+            .entry
+            .as_ref()
+            .is_some_and(|entry| Arc::ptr_eq(entry, &inner));
+        if stamp {
+            self.clock += 1;
+            self.nodes[node].last_access = self.clock;
+        } else if self.nodes[node].entry.is_none() && self.nodes[node].refs == 0 {
+            self.prune_upward(node);
         }
     }
 
@@ -368,8 +399,7 @@ impl RadixCache {
                     let shared = edge[..offset].to_vec();
                     let remainder = edge[offset..].to_vec();
                     let path_len = self.nodes[node].path_len + offset;
-                    let mid = self.nodes.len();
-                    self.nodes.push(Node::new(Some(node), shared, path_len));
+                    let mid = self.alloc_node(node, shared, path_len);
                     let remainder_len = remainder.len();
                     self.nodes[child].edge = remainder;
                     self.nodes[child].parent = Some(mid);
@@ -382,9 +412,7 @@ impl RadixCache {
                 }
                 None => {
                     let path_len = self.nodes[node].path_len + (tokens.len() - index);
-                    let leaf = self.nodes.len();
-                    self.nodes
-                        .push(Node::new(Some(node), tokens[index..].to_vec(), path_len));
+                    let leaf = self.alloc_node(node, tokens[index..].to_vec(), path_len);
                     self.nodes[node].children.insert(first, leaf);
                     node = leaf;
                     break;
@@ -395,13 +423,20 @@ impl RadixCache {
     }
 
     /// Evict strict-ancestor entries superseded by a snapshot keyed at `node` (see module doc).
+    /// Cleared ancestors are swept after the walk: pruning mid-walk could free a node whose
+    /// index the walk still has to visit (recycled slots are alive for the new conversation).
     fn drop_superseded_ancestors(&mut self, node: usize) {
+        let mut cleared = Vec::new();
         let mut parent = self.nodes[node].parent;
         while let Some(index) = parent {
             if self.nodes[index].entry.is_some() {
                 self.nodes[index].entry = None;
+                cleared.push(index);
             }
             parent = self.nodes[index].parent;
+        }
+        for index in cleared {
+            self.prune_upward(index);
         }
     }
 
@@ -476,25 +511,92 @@ impl RadixCache {
             .any(|child| self.nodes[child].entry.is_some() || self.has_entry_below(child))
     }
 
-    /// Detach entry-less, child-less, unpinned nodes upward so token spines of evicted
-    /// conversations do not accumulate. The freed node keeps its slot in the arena (indices in
-    /// flight stay valid); its edge storage is released.
-    fn prune_upward(&mut self, mut node: usize) {
-        while let Some(parent) = self.nodes[node].parent {
-            let detached = {
-                let node_ref = &self.nodes[node];
-                node_ref.entry.is_none() && node_ref.children.is_empty() && node_ref.refs == 0
-            };
-            if !detached {
-                break;
-            }
-            if let Some(entry_first) = self.nodes[node].edge.first().copied() {
-                self.nodes[parent].children.remove(&entry_first);
-            }
-            self.nodes[node].parent = None;
-            self.nodes[node].edge = Vec::new();
-            node = parent;
+    /// Claim a node slot: a recycled index when the free list has one, else a fresh push. Reuse
+    /// bumps `generation` so any [`TakenSnapshot`] still naming the old occupant fails its
+    /// hand-back check instead of un-pinning this node.
+    fn alloc_node(&mut self, parent: usize, edge: Vec<u32>, path_len: usize) -> usize {
+        if let Some(index) = self.free.pop() {
+            let node = &mut self.nodes[index];
+            node.parent = Some(parent);
+            node.edge = edge;
+            node.children.clear();
+            node.path_len = path_len;
+            node.entry = None;
+            node.last_access = 0;
+            node.refs = 0;
+            node.generation += 1;
+            index
+        } else {
+            self.nodes.push(Node::new(Some(parent), edge, path_len));
+            self.nodes.len() - 1
         }
+    }
+
+    /// Return a detached node's index to the free list. Callers must have already unlinked it
+    /// from its parent's children and proved `entry` gone, children empty (or re-homed) and
+    /// `refs == 0`.
+    fn free_node(&mut self, node: usize) {
+        self.free.push(node);
+        let node = &mut self.nodes[node];
+        node.parent = None;
+        node.edge = Vec::new();
+        node.children.clear();
+        node.entry = None;
+        node.generation += 1;
+    }
+
+    /// Detach entry-less, child-less, unpinned nodes upward and merge pass-through nodes into
+    /// their only child, so token spines of evicted conversations neither accumulate bytes nor
+    /// indices (the PR review's metadata-growth point). Detached slots go back on the free list
+    /// for `alloc_node` to recycle; merging keeps every path's token string (and therefore every
+    /// match) exactly as it was.
+    fn prune_upward(&mut self, mut node: usize) {
+        loop {
+            let Some(parent) = self.nodes[node].parent else {
+                return; // root, or already detached on an earlier pass
+            };
+            let detach = {
+                let node = &self.nodes[node];
+                node.entry.is_none() && node.children.is_empty() && node.refs == 0
+            };
+            if detach {
+                if let Some(first) = self.nodes[node].edge.first().copied() {
+                    self.nodes[parent].children.remove(&first);
+                }
+                self.free_node(node);
+                node = parent; // the parent may have just degenerated
+                continue;
+            }
+            match self.merge_single_child(node) {
+                Some(grandparent) => node = grandparent,
+                None => return,
+            }
+        }
+    }
+
+    /// Merge `node` into its only child when it is a pure pass-through (no entry, unpinned,
+    /// exactly one child, not the root): the child's edge grows by `node`'s and the child takes
+    /// `node`'s place under the grandparent — whose children key is unchanged, because the
+    /// merged edge still starts with `node`'s first token. Returns the grandparent (the merge
+    /// point to continue pruning from) or `None` when `node` must stay.
+    fn merge_single_child(&mut self, node: usize) -> Option<usize> {
+        let (parent, child) = {
+            let node = &self.nodes[node];
+            if node.entry.is_some() || node.refs > 0 || node.children.len() != 1 {
+                return None;
+            }
+            let parent = node.parent?;
+            let child = *node.children.values().next()?;
+            (parent, child)
+        };
+        let key = self.nodes[node].edge.first().copied()?;
+        let edge = std::mem::take(&mut self.nodes[node].edge);
+        self.nodes[child].edge.splice(0..0, edge);
+        self.nodes[child].parent = Some(parent);
+        // Same key: the merged edge begins with the token that selected `node`.
+        self.nodes[parent].children.insert(key, child);
+        self.free_node(node);
+        Some(parent)
     }
 
     /// Descend only along fully matching edges (the publish path created the exact spine, so a
@@ -809,5 +911,99 @@ mod tests {
         assert!(cache.held_bytes() <= cache.geometry.max_bytes);
         assert!(cache.best_continuation_len(&[2, 3]) > 0);
         let _ = second_bytes;
+    }
+
+    #[test]
+    fn churn_recycles_freed_nodes_so_the_arena_stays_bounded() {
+        // The cap holds ~two conversations; from the third publish on, every new conversation
+        // evicts the LRU one and its spine must be recycled instead of left in the arena.
+        let mut cache = RadixCache::new(&meta(&[1]), 4096);
+        let publish = |cache: &mut RadixCache, seed: u32| {
+            let tokens = [seed * 100 + 1, seed * 100 + 2, seed * 100 + 3];
+            cache
+                .publish(snapshot(cache, &tokens, 1500))
+                .expect("publish fits once the LRU left");
+        };
+        for seed in 0..20 {
+            publish(&mut cache, seed);
+        }
+        let steady = cache.nodes.len();
+        for seed in 20..40 {
+            publish(&mut cache, seed);
+        }
+        // Root + the survivors' spine: the arena stopped growing once recycling kicked in.
+        // Without recycling, 40 fresh conversations would have pushed the arena past 40 nodes.
+        assert_eq!(cache.nodes.len(), steady, "churn grew the arena: {steady}");
+        assert!(steady <= 4, "steady arena should stay small, got {steady}");
+        // Every survivor and every evictee's prompt still resolves correctly.
+        assert_eq!(cache.best_continuation_len(&[3901, 3902, 3903]), 3);
+        assert_eq!(cache.best_continuation_len(&[1]), 0);
+    }
+
+    #[test]
+    fn superseded_pass_through_spine_merges_into_the_deeper_entry() {
+        let mut cache = RadixCache::new(&meta(&[1]), 1 << 20);
+        cache.publish(snapshot(&cache, &[1, 2, 3, 4], 100)).unwrap();
+        assert_eq!(cache.nodes.len(), 2); // root + the 4-token spine
+        cache
+            .publish(snapshot(&cache, &[1, 2, 3, 4, 5, 6], 100))
+            .unwrap();
+        // The 4-token node lost its entry to the supersede and became a pass-through with one
+        // child: it must merge into that child, not linger.
+        assert!(cache.free.contains(&1), "pass-through spine was not freed");
+        assert!(cache.nodes[1].parent.is_none());
+        assert_eq!(cache.best_continuation_len(&[1, 2, 3, 4]), 4);
+        assert_eq!(cache.best_continuation_len(&[1, 2, 3, 4, 5, 6]), 6);
+        assert!(!cache.free.is_empty());
+    }
+
+    #[test]
+    fn entry_cleared_while_pinned_is_swept_when_the_restore_hands_back() {
+        let mut cache = RadixCache::new(&meta(&[1]), 1 << 20);
+        let a = snapshot(&cache, &[9, 9], 100);
+        let node = cache.publish(a).unwrap();
+        let taken = cache.take_best(&[9, 9]).expect("pin the fresh entry");
+        assert_eq!(taken.node, node);
+        // A longer snapshot supersedes the pinned entry MID-RESTORE: the node must survive
+        // pinned, then be swept once the hand-back lands.
+        let b = snapshot(&cache, &[9, 9, 9], 100);
+        cache.publish(b).unwrap();
+        assert!(cache.nodes[node].entry.is_none());
+        assert_eq!(
+            cache.nodes[node].refs, 1,
+            "pinned node must survive the supersede"
+        );
+        cache.release(taken);
+        assert!(
+            cache.free.contains(&node),
+            "sweep only happens at hand-back"
+        );
+        assert_eq!(cache.best_continuation_len(&[9, 9, 9]), 3);
+    }
+
+    #[test]
+    fn stale_handback_cannot_disturb_a_recycled_slot() {
+        let mut cache = RadixCache::new(&meta(&[1]), 1 << 20);
+        let a = snapshot(&cache, &[4, 4], 100);
+        let a_handle = Arc::clone(&a);
+        let node = cache.publish(a).unwrap();
+        let taken = cache.take_best(&[4, 4]).expect("pin");
+        let stale = TakenSnapshot {
+            node,
+            generation: taken.generation,
+            inner: a_handle,
+        };
+        cache.discard(&[4, 4], &stale.inner); // entry gone, still pinned
+        cache.release(taken); // last hold: the spine is swept to the free list
+        assert!(cache.free.contains(&node));
+        let c = snapshot(&cache, &[7, 7], 100);
+        let reused = cache.publish(c).unwrap();
+        assert_eq!(reused, node, "LIFO free list hands the same slot back");
+        cache.release(stale); // stale generation: must be a complete no-op
+        assert!(cache.nodes[reused]
+            .entry
+            .as_ref()
+            .is_some_and(|entry| entry.meta.cached == vec![7, 7]));
+        assert_eq!(cache.best_continuation_len(&[7, 7]), 2);
     }
 }
