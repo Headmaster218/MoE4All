@@ -1,9 +1,6 @@
 name: Windows Release
 
 on:
-  push:
-    tags:
-      - 'release-*'
   workflow_dispatch: {}
   workflow_call: {}
 
@@ -28,7 +25,7 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 90
     permissions:
-      contents: write
+      contents: read
       id-token: write
       attestations: write
     steps:
@@ -37,7 +34,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-build-cache
         with:
           shared-key: windows-release-x86-64
           cache-on-failure: true
@@ -79,8 +76,25 @@ jobs:
           python -m pip install meson==1.9.1 ninja==1.13.0
           choco install nasm --version=2.16.03 --yes --no-progress
           "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Cache bundled image codecs
+        id: codec-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/image-codecs
+            target/image-codec-sources.tar.gz
+          key: image-codecs-v1-windows-2025-x64-${{ hashFiles('scripts/build-image-codecs.py') }}
       - name: Build bundled HEIC and AVIF decoders
+        if: steps.codec-cache.outputs.cache-hit != 'true'
         run: python scripts/build-image-codecs.py --work "${{ runner.temp }}/image-codec-build"
+      - name: Restore codec source fixtures
+        if: steps.codec-cache.outputs.cache-hit == 'true'
+        shell: pwsh
+        run: |
+          $sourceRoot = Join-Path $env:RUNNER_TEMP 'image-codec-build\sources'
+          New-Item -ItemType Directory -Path $sourceRoot -Force | Out-Null
+          tar -xzf .\target\image-codec-sources.tar.gz -C $sourceRoot
+          if ($LASTEXITCODE -ne 0) { throw "Codec source extraction failed with exit code $LASTEXITCODE" }
       - name: Verify image decoding without a GPU
         shell: pwsh
         env:
@@ -109,6 +123,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build portable MoE4All engine (infr.exe)
         run: cargo build --release --locked -p infr-cli
+      - name: Show sccache statistics
+        if: always()
+        run: sccache --show-stats
 
       - name: Create release archive
         shell: pwsh
@@ -121,6 +138,30 @@ jobs:
           $packageRoot = Join-Path $extractPath '${{ steps.release.outputs.package_name }}'
           .\scripts\smoke-windows-package.ps1 -PackageRoot $packageRoot -ExpectedVersion '${{ steps.release.outputs.version }}' -SkipInteractiveDeviceChecks
 
+      - name: Write immutable release manifest
+        shell: pwsh
+        run: |
+          $rustc = (& rustc --version).Trim()
+          $cargo = (& cargo --version).Trim()
+          $runner = "$env:ImageOS-$env:ImageVersion"
+          $manifestArgs = @(
+            'scripts/release_ci.py'
+            'write'
+            '--platform', 'windows-x86_64'
+            '--version', '${{ steps.release.outputs.version }}'
+            '--commit', '${{ github.sha }}'
+            '--repository', '${{ github.repository }}'
+            '--output', 'dist/release-manifest-windows-x86_64.json'
+            '--metadata', "rustc=$rustc"
+            '--metadata', "cargo=$cargo"
+            '--metadata', "runner=$runner"
+            "dist/${{ steps.release.outputs.archive_name }}"
+            "dist/${{ steps.release.outputs.archive_name }}.sha256"
+            'dist/image-codec-sources.tar.gz'
+          )
+          & python @manifestArgs
+          if ($LASTEXITCODE -ne 0) { throw "Release manifest failed with exit code $LASTEXITCODE" }
+
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v6
         with:
@@ -129,45 +170,12 @@ jobs:
             dist/${{ steps.release.outputs.archive_name }}
             dist/${{ steps.release.outputs.archive_name }}.sha256
             dist/image-codec-sources.tar.gz
+            dist/release-manifest-windows-x86_64.json
           if-no-files-found: error
           retention-days: 14
 
       - name: Attest release archive
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/release-')
+        if: github.repository_visibility == 'public'
         uses: actions/attest-build-provenance@v3
         with:
           subject-path: dist/${{ steps.release.outputs.archive_name }}
-
-      - name: Publish GitHub Release
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/release-')
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $tag = '${{ github.ref_name }}'
-          $assets = @(
-            '.\dist\${{ steps.release.outputs.archive_name }}'
-            '.\dist\${{ steps.release.outputs.archive_name }}.sha256'
-            '.\dist\image-codec-sources.tar.gz'
-          )
-          $releaseFlags = @()
-          if ('${{ steps.release.outputs.prerelease }}' -eq 'true') {
-            $releaseFlags += '--prerelease'
-          }
-          & gh release view $tag *> $null
-          if ($LASTEXITCODE -eq 0) {
-            & gh release upload $tag @assets --clobber
-            if ($LASTEXITCODE -ne 0) { throw "GitHub Release upload failed with exit code $LASTEXITCODE" }
-            & gh release edit $tag --title "MoE4All v${{ steps.release.outputs.version }}" @releaseFlags
-          } else {
-            & gh release create $tag @assets --verify-tag --title "MoE4All v${{ steps.release.outputs.version }}" --generate-notes @releaseFlags
-            if ($LASTEXITCODE -ne 0) {
-              # Linux may have created the shared release after our initial view.
-              & gh release view $tag *> $null
-              if ($LASTEXITCODE -ne 0) { throw 'GitHub Release creation failed.' }
-              & gh release upload $tag @assets --clobber
-              if ($LASTEXITCODE -ne 0) { throw 'GitHub Release upload failed.' }
-              & gh release edit $tag --title "MoE4All v${{ steps.release.outputs.version }}" @releaseFlags
-            }
-          }
-          if ($LASTEXITCODE -ne 0) { throw "GitHub Release publish failed with exit code $LASTEXITCODE" }

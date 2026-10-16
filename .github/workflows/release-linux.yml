@@ -1,9 +1,6 @@
 name: Linux Release (Experimental)
 
 on:
-  push:
-    tags:
-      - 'release-*'
   workflow_dispatch: {}
   workflow_call: {}
 
@@ -26,15 +23,18 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     permissions:
-      contents: write
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-build-cache
         with:
           shared-key: linux-release-x86-64-glibc235
+          cache-on-failure: true
       - name: Install shader compiler build tools
         run: sudo apt-get update && sudo apt-get install -y cmake ninja-build build-essential python3 meson nasm pkg-config
       - name: Cache shaderc
@@ -58,8 +58,22 @@ jobs:
           echo "archive=MoE4All-Linux-x86_64-v$version.tar.gz" >> "$GITHUB_OUTPUT"
       - name: Test launcher and updater without a GPU
         run: bash scripts/smoke-linux-wizard.sh
+      - name: Cache bundled image codecs
+        id: codec-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/image-codecs
+            target/image-codec-sources.tar.gz
+          key: image-codecs-v1-ubuntu-22.04-x64-${{ hashFiles('scripts/build-image-codecs.py') }}
       - name: Build bundled HEIC and AVIF decoders
+        if: steps.codec-cache.outputs.cache-hit != 'true'
         run: python3 scripts/build-image-codecs.py --work "$RUNNER_TEMP/image-codec-build"
+      - name: Restore codec source fixtures
+        if: steps.codec-cache.outputs.cache-hit == 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/image-codec-build/sources"
+          tar -xzf target/image-codec-sources.tar.gz -C "$RUNNER_TEMP/image-codec-build/sources"
       - name: Verify image decoding without a GPU
         env:
           INFR_IMAGE_CODEC_DIR: ${{ github.workspace }}/target/image-codecs
@@ -69,6 +83,9 @@ jobs:
           cargo test --locked -p infr-vision bundled_codecs -- --ignored
       - name: Build portable engine
         run: cargo build --release --locked -p infr-cli
+      - name: Show sccache statistics
+        if: always()
+        run: sccache --show-stats
       - name: Package and smoke-test extracted release
         env:
           VERSION: ${{ steps.release.outputs.version }}
@@ -89,6 +106,21 @@ jobs:
           cd "$RUNNER_TEMP"
           XDG_CONFIG_HOME="$smoke/config" bash "$package/Start-INFR-Wizard-Linux.sh" \
             --dry-run --mode serve --model '/tmp/model with spaces.gguf' --profile aggressive
+      - name: Write immutable release manifest
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          ARCHIVE: ${{ steps.release.outputs.archive }}
+        run: |
+          python3 scripts/release_ci.py write \
+            --platform linux-x86_64 \
+            --version "$VERSION" \
+            --commit "$GITHUB_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --output dist/release-manifest-linux-x86_64.json \
+            --metadata "rustc=$(rustc --version)" \
+            --metadata "cargo=$(cargo --version)" \
+            --metadata "runner=${ImageOS:-unknown}-${ImageVersion:-unknown}" \
+            "dist/$ARCHIVE" "dist/$ARCHIVE.sha256" dist/image-codec-sources.tar.gz
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v6
         with:
@@ -97,26 +129,11 @@ jobs:
             dist/${{ steps.release.outputs.archive }}
             dist/${{ steps.release.outputs.archive }}.sha256
             dist/image-codec-sources.tar.gz
+            dist/release-manifest-linux-x86_64.json
           if-no-files-found: error
           retention-days: 14
-      - name: Publish Linux assets
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/release-')
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.release.outputs.version }}
-          ARCHIVE: ${{ steps.release.outputs.archive }}
-        run: |
-          tag="release-$VERSION"
-          if ! gh release view "$tag" >/dev/null 2>&1; then
-            # Windows may create the same release concurrently; tolerate that race.
-            gh release create "$tag" --verify-tag --title "MoE4All v$VERSION" --generate-notes || gh release view "$tag"
-          fi
-          gh release upload "$tag" "dist/$ARCHIVE" "dist/$ARCHIVE.sha256" dist/image-codec-sources.tar.gz --clobber
-          notes=$(gh release view "$tag" --json body --jq .body)
-          if [[ "$notes" != *'<!-- moe4all-linux-experimental -->'* ]]; then
-            printf '%s\n\n%s\n%s\n' "$notes" \
-              '<!-- moe4all-linux-experimental -->' \
-              'Linux x86_64 is experimental: requires glibc 2.35+, Bash 4.3+, standard Linux utilities and a Vulkan GPU driver; no Python or jq is needed to launch. GPU inference and upgrading across real systems need community validation. / Linux 包为实验性版本，请反馈驱动、推理及更新兼容性问题。' \
-              > "$RUNNER_TEMP/linux-release-notes.md"
-            gh release edit "$tag" --notes-file "$RUNNER_TEMP/linux-release-notes.md"
-          fi
+      - name: Attest release archive
+        if: github.repository_visibility == 'public'
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/${{ steps.release.outputs.archive }}

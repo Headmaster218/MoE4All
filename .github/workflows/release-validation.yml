@@ -7,12 +7,15 @@ on:
       - release/1.0.0-maintenance
       - 'hotfix/**'
     paths:
+      - '.github/actions/setup-build-cache/**'
       - '.github/workflows/release-*.yml'
       - 'scripts/build-image-codecs.py'
       - 'scripts/install-shaderc-linux.sh'
       - 'scripts/package-windows.ps1'
       - 'scripts/linux_release.py'
       - 'scripts/macos_release.py'
+      - 'scripts/release_ci.py'
+      - 'scripts/test_release_ci.py'
       - 'scripts/smoke-*'
       - 'scripts/infr-wizard.ps1'
       - 'Start-INFR-Wizard.cmd'
@@ -29,17 +32,31 @@ concurrency:
   cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
+  metadata-tests:
+    name: Validate release promotion metadata
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: python3 -m unittest discover -s scripts -p 'test_release_ci.py' -v
+
   windows:
+    needs: metadata-tests
     permissions:
-      contents: write
+      contents: read
       id-token: write
       attestations: write
     uses: ./.github/workflows/release-windows.yml
   linux:
+    needs: metadata-tests
     permissions:
-      contents: write
+      contents: read
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/release-linux.yml
   macos:
+    needs: metadata-tests
     permissions:
-      contents: write
+      contents: read
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/release-macos.yml
