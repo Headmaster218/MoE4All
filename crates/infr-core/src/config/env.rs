@@ -198,6 +198,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.kv.session_cache_max =
         get("INFR_KV_SESSION_CACHE_MAX").and_then(|value| crate::parse_size(&value));
     p.kv.session_cache_ttl_hours = num(get, "INFR_KV_SESSION_CACHE_TTL_HOURS");
+    p.kv.ram_cache_max = opt_size(get, "INFR_KV_RAM_CACHE_MAX");
     p.kv.ring = presence_inv(get, "INFR_NO_KV_RING");
     p.kv.dynamic = presence_inv(get, "INFR_NO_DYNAMIC_KV");
     p.kv.inline_decode = presence(get, "INFR_KV_INLINE");

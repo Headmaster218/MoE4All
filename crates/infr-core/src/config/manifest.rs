@@ -152,6 +152,7 @@ knobs! {
     "INFR_KV_SESSION_IDLE_SECS"  => "kv.session_idle_secs",   Int,         Ignored, "120",  migrated;
     "INFR_KV_SESSION_CACHE_MAX"  => "kv.session_cache_max",   Size,        Ignored, "5GiB",  migrated;
     "INFR_KV_SESSION_CACHE_TTL_HOURS" => "kv.session_cache_ttl_hours", Int,  Ignored, "24",   migrated;
+    "INFR_KV_RAM_CACHE_MAX"      => "kv.ram_cache_max",        Size,        Ignored, "16GiB",  migrated;
     "INFR_NO_KV_RING"           => "kv.ring",                PresenceInv, Ignored, "1",    migrated;
     "INFR_NO_DYNAMIC_KV"        => "kv.dynamic",             PresenceInv, Ignored, "1",    migrated;
     "INFR_KV_INLINE"            => "kv.inline_decode",       Presence,    Ignored, "1",    migrated;
