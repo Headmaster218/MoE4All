@@ -259,7 +259,10 @@ pub(crate) fn max_storage_buffer_range() -> u32 {
 /// additionally cap availability by the shared host-RAM target and live host availability.
 ///
 /// WHICH HEAPS THIS COUNTS depends on the device class (see [`vram_info`]): device-local only on a
-/// discrete card, ALL heaps on a unified-memory part where they are the same physical DDR.
+/// discrete card, ALL heaps on a unified-memory part where they are the same physical DDR. A UMA
+/// backend with no resolved startup RAM target additionally uses live host availability as a
+/// fallback ceiling; a resolved target is already a frozen total-process budget and must not be
+/// clipped again by transient load-time host pressure.
 #[derive(Clone, Copy, Debug)]
 pub struct VramInfo {
     pub total: u64,
@@ -320,8 +323,14 @@ impl UnifiedRamBudget {
         }
         if let Some(limit) = self.limit {
             vram.available = vram.available.min(limit.saturating_sub(used));
-        }
-        if let Some(available) = host_available {
+        } else if let Some(available) = host_available {
+            // Without a resolved startup target, live host availability is the only host-side
+            // pressure signal. With a target it would double-charge this process's Vulkan
+            // allocations and clean GGUF source pages: both reduce `available`, while the former
+            // are already in `used` and the latter are released as fixed uploads complete. That
+            // transient collapse used to reject an aggressive 35B UMA load with 90 MiB reported
+            // free even though both the Vulkan heap and the frozen process budget had many GiB
+            // left.
             vram.available = vram.available.min(available);
         }
         // Both fallback heaps and the shared target have now had owned bytes subtracted once.
@@ -9039,7 +9048,7 @@ mod tests {
     }
 
     #[test]
-    fn unified_ram_budget_respects_live_pressure_and_driver_fallback() {
+    fn unified_ram_budget_preserves_frozen_target_and_driver_pressure() {
         const GIB: u64 = 1 << 30;
         let ram = UnifiedRamBudget {
             limit: Some(19 * GIB),
@@ -9051,7 +9060,11 @@ mod tests {
             live: true,
             uma: true,
         };
-        assert_eq!(ram.snapshot(raw, Some(2 * GIB)).available, 2 * GIB);
+        assert_eq!(
+            ram.snapshot(raw, Some(2 * GIB)).available,
+            8 * GIB,
+            "live host availability must not rewrite a frozen total-process target"
+        );
         assert_eq!(
             ram.snapshot(
                 VramInfo {
@@ -9071,12 +9084,38 @@ mod tests {
             used: AtomicU64::new(11 * GIB),
         };
         assert_eq!(
+            unknown.snapshot(raw, Some(2 * GIB)).available,
+            2 * GIB,
+            "live host availability remains the fallback when no startup target resolved"
+        );
+        assert_eq!(
             unknown
                 .snapshot(VramInfo { live: false, ..raw }, None)
                 .available,
             21 * GIB
         );
         assert_eq!(unknown.snapshot(raw, None).available, 32 * GIB);
+    }
+
+    #[test]
+    fn unified_ram_budget_ignores_transient_load_time_host_collapse() {
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+        let ram = UnifiedRamBudget {
+            limit: Some(50 * GIB + 154 * MIB),
+            used: AtomicU64::new(27 * GIB + 20 * MIB),
+        };
+        let raw = VramInfo {
+            total: 31 * GIB + 912 * MIB,
+            available: 19 * GIB + 760 * MIB,
+            live: true,
+            uma: true,
+        };
+        assert_eq!(
+            ram.snapshot(raw, Some(91 * MIB)).available,
+            raw.available,
+            "the driver heap, not transient Windows available RAM, is limiting here"
+        );
     }
 
     #[test]
