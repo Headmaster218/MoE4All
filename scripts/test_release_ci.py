@@ -55,6 +55,13 @@ class ReleaseCiTests(unittest.TestCase):
         self.assertEqual(COMMIT, combined["commit"])
         self.assertEqual(3, len(combined["platforms"]))
         self.assertNotIn(b"\r\n", (output / "SHA256SUMS").read_bytes())
+        published_names = [entry["name"] for entry in combined["published_files"]]
+        self.assertEqual(sorted(published_names), published_names)
+        checksum_names = [
+            line.split("  ", 1)[1]
+            for line in (output / "SHA256SUMS").read_text(encoding="ascii").splitlines()
+        ]
+        self.assertEqual(sorted(checksum_names), checksum_names)
 
     def test_prepare_rejects_wrong_commit(self):
         self.make_platform("windows-x86_64", with_sources=True)

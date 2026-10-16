@@ -237,7 +237,7 @@ def prepare_promotion(root, output, commit, version, repository):
         stream.write(
             "".join(
                 "{}  {}\n".format(sha256(path), path.name)
-                for path in sorted(promoted)
+                for path in sorted(promoted, key=lambda path: path.name)
             )
         )
     combined = {
@@ -250,7 +250,7 @@ def prepare_promotion(root, output, commit, version, repository):
         "platforms": platform_manifests,
         "published_files": [
             {"name": path.name, "size": path.stat().st_size, "sha256": sha256(path)}
-            for path in sorted(promoted + [sums])
+            for path in sorted(promoted + [sums], key=lambda path: path.name)
         ],
     }
     combined_path = output / "release-build-manifest.json"
