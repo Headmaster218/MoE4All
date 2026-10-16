@@ -54,6 +54,7 @@ class ReleaseCiTests(unittest.TestCase):
         combined = json.loads((output / "release-build-manifest.json").read_text())
         self.assertEqual(COMMIT, combined["commit"])
         self.assertEqual(3, len(combined["platforms"]))
+        self.assertNotIn(b"\r\n", (output / "SHA256SUMS").read_bytes())
 
     def test_prepare_rejects_wrong_commit(self):
         self.make_platform("windows-x86_64", with_sources=True)

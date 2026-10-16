@@ -233,10 +233,13 @@ def prepare_promotion(root, output, commit, version, repository):
         raise ValueError("Windows artifact is missing corresponding codec sources")
     promoted.append(copy_unique(windows_root / source_name, output))
     sums = output / "SHA256SUMS"
-    sums.write_text(
-        "".join("{}  {}\n".format(sha256(path), path.name) for path in sorted(promoted)),
-        encoding="ascii",
-    )
+    with sums.open("w", encoding="ascii", newline="\n") as stream:
+        stream.write(
+            "".join(
+                "{}  {}\n".format(sha256(path), path.name)
+                for path in sorted(promoted)
+            )
+        )
     combined = {
         "schema_version": SCHEMA_VERSION,
         "product": "moe4all-engine",
