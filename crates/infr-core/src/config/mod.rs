@@ -199,18 +199,25 @@ cfg_struct! {
         /// pool, never written to disk). Percentages resolve against total physical RAM, like
         /// `device.ram_budget`. `None`/zero keeps the established behavior; when set it takes
         /// precedence over `session_cache_dir` (the disk tier stays closed).
-        ///
-        /// EXPERIMENTAL, two documented deviations from the budget system: the ceiling is NOT
-        /// folded into the process-wide RAM budget and competes with the expert host store for
-        /// the same physical memory (risky under the automatic aggressive policy or on iGPUs);
-        /// and demotion is synchronous at checkout replacement — `session_idle_secs` does NOT
-        /// drive this tier (no idle worker: a resident continuation always beats a restore).
         ram_cache_max: Option<SizeSpec> = None,
         /// `INFR_NO_KV_RING` (inverted): the SWA ring cache.
         ring: bool = true,
         /// Lazily commit supported Qwen KV caches in 32K-token increments. Backends/models without
         /// segmented addressing retain their existing flat allocation.
         dynamic: bool = true,
+        /// `INFR_KV_PAGED_PAGE_TOKENS`: tokens per physical KV segment (page). The segmented
+        /// machinery addresses planes through a runtime device table, so the page size is pure
+        /// geometry — 32768 (default) reproduces the legacy 32K growth step byte-for-byte, while
+        /// small power-of-two pages (e.g. 64) are the prerequisite for SGLang-style frame sharing
+        /// and DMA tiering. Must be a power of two and a multiple of every layer's QSA
+        /// compression ratio.
+        paged_page_tokens: usize = 32 * 1024,
+        /// `INFR_KV_PAGED_CACHE_MAX`: byte ceiling of the host-RAM frame pool backing the paged
+        /// KV cache (VRAM frames + RAM frames form one logical address space; evicted prefixes
+        /// stay resident in RAM instead of being dropped). Percentages resolve against total
+        /// physical RAM, like `device.ram_budget`. `None`/zero disables the RAM tier; only
+        /// meaningful together with small [`KvCfg::paged_page_tokens`].
+        paged_cache_max: Option<SizeSpec> = None,
         /// `INFR_KV_INLINE`.
         inline_decode: bool = false,
         /// `INFR_KV_COOPMAT_BDA`.

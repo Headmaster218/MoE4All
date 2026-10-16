@@ -155,6 +155,8 @@ knobs! {
     "INFR_KV_RAM_CACHE_MAX"      => "kv.ram_cache_max",        Size,        Ignored, "16GiB",  migrated;
     "INFR_NO_KV_RING"           => "kv.ring",                PresenceInv, Ignored, "1",    migrated;
     "INFR_NO_DYNAMIC_KV"        => "kv.dynamic",             PresenceInv, Ignored, "1",    migrated;
+    "INFR_KV_PAGED_PAGE_TOKENS" => "kv.paged_page_tokens",    Int,         Ignored, "64",   migrated;
+    "INFR_KV_PAGED_CACHE_MAX"   => "kv.paged_cache_max",      Size,        Ignored, "16GiB", migrated;
     "INFR_KV_INLINE"            => "kv.inline_decode",       Presence,    Ignored, "1",    migrated;
     "INFR_KV_COOPMAT_BDA"       => "kv.coopmat_bda",         Presence,    Ignored, "1",    migrated;
     "INFR_KV_OVERFLOW"          => "kv.overflow",            Flag,        Ignored, "1",    migrated;
@@ -403,6 +405,16 @@ pub const NOT_MIGRATED: &[(&str, &str)] = &[
         "Vulkan validation escape hatch for same-binary A/B of the shared-expert slot peephole. \
          It is backend-private and deliberately remains a direct presence check rather than user \
          configuration.",
+    ),
+    (
+        "INFR_TIMELINE_RAW_KERNELS",
+        "trace-dump filter read directly by infr-vulkan/src/timeline.rs; it shapes chrome-trace \
+         output only and is not a runtime Config knob.",
+    ),
+    (
+        "INFR_TIMELINE_RAW_UNKNOWN",
+        "trace-dump filter read directly by infr-vulkan/src/timeline.rs; it shapes chrome-trace \
+         output only and is not a runtime Config knob.",
     ),
 ];
 

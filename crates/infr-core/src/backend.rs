@@ -649,6 +649,32 @@ pub trait Backend: Send + Sync {
             "segmented KV release is not supported by this backend",
         ))
     }
+    /// Reserve one contiguous corridor of `count` fixed-size KV frames (the paged hierarchical
+    /// cache, Phase B of `.trae/documents/paged-hierarchical-kv-cache.md`) and return its device
+    /// base address. Frame `slot` then starts at `base + slot * frame_bytes`; a session plane's
+    /// page entry is `base + slot * frame_bytes + plane_offset`, written through
+    /// [`Backend::set_kv_table_entry`]. Fixed-size frames cannot form external fragments, and the
+    /// corridor outlives every individual conversation: pages move between sessions and the radix
+    /// tree by refcount, never by `vkFreeMemory`. `Ok(None)` = unsupported backend.
+    fn alloc_kv_frames(&self, _frame_bytes: u64, _count: usize) -> Result<Option<u64>> {
+        Ok(None)
+    }
+    /// Write one page entry of a segmented KV buffer's device address table. `addr = 0` unmaps the
+    /// page (RAM-tier frames are never device-addressable — BDA stale-read + bandwidth-wall
+    /// convictions). The caller must hold the GPU baton whenever live sessions could read the
+    /// table; entries are host-visible writes the next dispatch observes.
+    fn set_kv_table_entry(&self, _buffer: &dyn Buffer, _page: usize, _addr: u64) -> Result<()> {
+        Err(crate::error::Error::backend(
+            "segmented KV table writes are not supported by this backend",
+        ))
+    }
+    /// Release a corridor previously returned by [`Self::alloc_kv_frames`]. Engine shutdown only;
+    /// every frame must already be free (refcount 0) or the drop order is a use-after-free.
+    fn free_kv_frames(&self, _base: u64) -> Result<()> {
+        Err(crate::error::Error::backend(
+            "segmented KV frame corridors are not supported by this backend",
+        ))
+    }
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()>;
     fn download(&self, src: &dyn Buffer, dst: &mut [u8]) -> Result<()>;
     /// Emit the one-shot KV-cache placement summary for a VRAM-first spill backend (the Vulkan
