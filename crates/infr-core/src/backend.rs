@@ -538,6 +538,20 @@ impl<'a> Bindings<'a> {
     }
 }
 
+/// One contiguous run of fixed-size KV frames inside a backend's device memory (the paged
+/// hierarchical cache, Phase B of `.trae/documents/paged-hierarchical-kv-cache.md`). A pool may
+/// hand back several: the unified VRAM arena is built from ~2 GiB ReBAR shard pieces, so a KV
+/// space larger than one shard's largest free gap (ctx 262144 wants 4.31 GiB) can only be
+/// satisfied by tiling. Frame indices stay global across segments — the caller accumulates the
+/// per-segment `first_frame` itself, so the radix tree and eviction logic never see the split.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvFrameCorridor {
+    /// Device address of this segment's frame 0.
+    pub base: u64,
+    /// Number of whole frames in this segment.
+    pub frames: usize,
+}
+
 /// A compute device. Implementations: `infr-vulkan`, `infr-cpu`, `infr-metal`.
 pub trait Backend: Send + Sync {
     fn name(&self) -> &str;
@@ -649,14 +663,21 @@ pub trait Backend: Send + Sync {
             "segmented KV release is not supported by this backend",
         ))
     }
-    /// Reserve one contiguous corridor of `count` fixed-size KV frames (the paged hierarchical
-    /// cache, Phase B of `.trae/documents/paged-hierarchical-kv-cache.md`) and return its device
-    /// base address. Frame `slot` then starts at `base + slot * frame_bytes`; a session plane's
-    /// page entry is `base + slot * frame_bytes + plane_offset`, written through
+    /// Reserve `count` fixed-size KV frames (the paged hierarchical cache, Phase B of
+    /// `.trae/documents/paged-hierarchical-kv-cache.md`) and return the device corridors backing
+    /// them. Global frame `slot` starts at `corridors[i].base + (slot - first_i) * frame_bytes`;
+    /// a session plane's page entry is that address `+ plane_offset`, written through
     /// [`Backend::set_kv_table_entry`]. Fixed-size frames cannot form external fragments, and the
-    /// corridor outlives every individual conversation: pages move between sessions and the radix
-    /// tree by refcount, never by `vkFreeMemory`. `Ok(None)` = unsupported backend.
-    fn alloc_kv_frames(&self, _frame_bytes: u64, _count: usize) -> Result<Option<u64>> {
+    /// corridors outlive every individual conversation: pages move between sessions and the radix
+    /// tree by refcount, never by `vkFreeMemory`. One corridor is the common small-ctx case; a
+    /// backend whose pool is sharded (the unified VRAM arena is ~2 GiB ReBAR pieces) returns
+    /// several when the request exceeds a single shard's largest free gap. `Ok(None)` = unsupported
+    /// backend.
+    fn alloc_kv_frames(
+        &self,
+        _frame_bytes: u64,
+        _count: usize,
+    ) -> Result<Option<Vec<KvFrameCorridor>>> {
         Ok(None)
     }
     /// Write one page entry of a segmented KV buffer's device address table. `addr = 0` unmaps the
@@ -668,9 +689,9 @@ pub trait Backend: Send + Sync {
             "segmented KV table writes are not supported by this backend",
         ))
     }
-    /// Release a corridor previously returned by [`Self::alloc_kv_frames`]. Engine shutdown only;
+    /// Release corridors previously returned by [`Self::alloc_kv_frames`]. Engine shutdown only;
     /// every frame must already be free (refcount 0) or the drop order is a use-after-free.
-    fn free_kv_frames(&self, _base: u64) -> Result<()> {
+    fn free_kv_frames(&self, _corridors: &[KvFrameCorridor]) -> Result<()> {
         Err(crate::error::Error::backend(
             "segmented KV frame corridors are not supported by this backend",
         ))

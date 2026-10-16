@@ -19,6 +19,7 @@
 //! tale this API refuses to encode: every mutation here is synchronous and
 //! complete by return.
 
+use infr_core::backend::KvFrameCorridor;
 use std::collections::VecDeque;
 
 /// Bit 63 of a packed [`FrameId`]: clear = VRAM tier, set = imported host-RAM
@@ -110,18 +111,31 @@ impl TierState {
     }
 }
 
+/// One contiguous run of frames inside a tier's device corridor, plus the global slot index of
+/// its first frame. `frame_addr` is arithmetic within a segment; the segment table is what makes
+/// that arithmetic work when a tier is split across several device corridors.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FrameSegment {
+    base: u64,
+    first_frame: usize,
+    frames: usize,
+}
+
 /// The two-tier fixed-frame allocator shared by the paged KV cache.
 #[derive(Clone, Debug)]
 pub(crate) struct FramePool {
     frame_bytes: u64,
     clock: u64,
     tiers: [TierState; 2],
-    /// Device base address of each tier's contiguous corridor (VRAM: the unified-arena
-    /// `alloc_kv_frames` corridor; RAM: 0 until Phase C imports a host arena — RAM frames are
-    /// never device-addressable anyway). `frame_addr` is pure arithmetic on this base, which is
-    /// what lets a page-table entry be `base + slot * frame_bytes + plane_offset` without the
-    /// pool ever owning a buffer.
-    base: [u64; 2],
+    /// Device corridors of each tier in ascending slot order (VRAM: the unified-arena
+    /// `alloc_kv_frames` corridors; RAM: empty until Phase C imports a host arena — RAM frames
+    /// are never device-addressable anyway). A tier may hold several segments: the unified arena
+    /// is built from ~2 GiB ReBAR shard pieces, so a KV space larger than one piece's largest gap
+    /// (ctx 262144 wants 4.31 GiB) is satisfied by tiling. Slot indices stay global 0..capacity —
+    /// segments are pure addressing detail, so the radix tree, the LRU and the eviction logic
+    /// never see them. A page-table entry is then `base + slot * frame_bytes + plane_offset`
+    /// without the pool ever owning a buffer.
+    segments: [Vec<FrameSegment>; 2],
 }
 
 impl FramePool {
@@ -131,24 +145,59 @@ impl FramePool {
             frame_bytes,
             clock: 0,
             tiers: [TierState::new(vram_frames), TierState::new(ram_frames)],
-            base: [0; 2],
+            segments: [Vec::new(), Vec::new()],
         }
     }
 
-    /// Attach a tier's corridor base once the backend has reserved it (Phase B: VRAM only).
-    pub(crate) fn set_base(&mut self, tier: Tier, base: u64) {
-        self.base[Self::idx(tier)] = base;
+    /// Install a tier's device corridors once the backend has reserved them (Phase B: VRAM only).
+    /// The corridors must tile frames `0..capacity` exactly — a gap in the slot space would make
+    /// `frame_addr` panic on a live handle.
+    pub(crate) fn set_segments(&mut self, tier: Tier, corridors: &[KvFrameCorridor]) {
+        let mut segments = Vec::with_capacity(corridors.len());
+        let mut first_frame = 0usize;
+        for corridor in corridors {
+            assert!(corridor.frames > 0, "a KV frame corridor must hold frames");
+            segments.push(FrameSegment {
+                base: corridor.base,
+                first_frame,
+                frames: corridor.frames,
+            });
+            first_frame += corridor.frames;
+        }
+        assert_eq!(
+            first_frame,
+            self.capacity_frames(tier),
+            "KV frame corridors must cover every {tier:?} slot"
+        );
+        self.segments[Self::idx(tier)] = segments;
     }
 
     /// Device address of a frame's first byte. Debug-asserts the tier has a corridor: a RAM-tier
     /// frame must never reach a page table (the caller writes 0 for RAM-tier entries instead).
     pub(crate) fn frame_addr(&self, id: FrameId) -> u64 {
-        let base = self.base[Self::idx(id.tier())];
+        let tier = id.tier();
+        let segments = &self.segments[Self::idx(tier)];
+        let slot = id.slot();
+        if segments.is_empty() {
+            debug_assert!(
+                matches!(tier, Tier::Ram),
+                "frame {id:?} used before its corridor was installed"
+            );
+            return slot as u64 * self.frame_bytes;
+        }
+        // Segments are sorted by `first_frame`, so the owning segment is the last one whose first
+        // frame is not above this slot.
+        let index = match segments.binary_search_by(|seg| seg.first_frame.cmp(&slot)) {
+            Ok(index) => index,
+            Err(0) => 0,
+            Err(index) => index - 1,
+        };
+        let segment = &segments[index];
         debug_assert!(
-            base != 0 || matches!(id.tier(), Tier::Ram),
-            "frame {id:?} used before its corridor was installed"
+            slot < segment.first_frame + segment.frames,
+            "frame {id:?} falls outside its corridor segments"
         );
-        base + id.slot() as u64 * self.frame_bytes
+        segment.base + (slot - segment.first_frame) as u64 * self.frame_bytes
     }
 
     fn idx(tier: Tier) -> usize {
@@ -410,7 +459,13 @@ mod tests {
     #[test]
     fn frame_addr_is_slot_arithmetic_on_the_corridor_base() {
         let mut p = FramePool::new(FB, 4, 1);
-        p.set_base(Tier::Vram, 0x1000_0000);
+        p.set_segments(
+            Tier::Vram,
+            &[KvFrameCorridor {
+                base: 0x1000_0000,
+                frames: 4,
+            }],
+        );
         let a = p.alloc(Tier::Vram).unwrap();
         let b = p.alloc(Tier::Vram).unwrap();
         assert_eq!(p.frame_addr(a), 0x1000_0000 + a.slot() as u64 * FB);
@@ -418,6 +473,37 @@ mod tests {
             p.frame_addr(b) - p.frame_addr(a),
             FB,
             "frames tile the corridor"
+        );
+    }
+
+    #[test]
+    fn frame_addr_walks_several_corridors_by_global_slot() {
+        // The unified arena is sharded, so a 5-frame tier arrives as 2 + 3 frames in two
+        // corridors; global slot indices cross the segment boundary untouched.
+        let mut p = FramePool::new(FB, 5, 0);
+        p.set_segments(
+            Tier::Vram,
+            &[
+                KvFrameCorridor {
+                    base: 0x2000_0000,
+                    frames: 2,
+                },
+                KvFrameCorridor {
+                    base: 0x9000_0000,
+                    frames: 3,
+                },
+            ],
+        );
+        assert_eq!(p.frame_addr(FrameId::new(Tier::Vram, 0)), 0x2000_0000);
+        assert_eq!(p.frame_addr(FrameId::new(Tier::Vram, 1)), 0x2000_0000 + FB);
+        assert_eq!(
+            p.frame_addr(FrameId::new(Tier::Vram, 2)),
+            0x9000_0000,
+            "slot 2 opens the second corridor"
+        );
+        assert_eq!(
+            p.frame_addr(FrameId::new(Tier::Vram, 4)),
+            0x9000_0000 + 2 * FB
         );
     }
 

@@ -39,6 +39,7 @@
 
 use crate::seam::kv_frame_pool::{FrameId, FramePool, Tier};
 use anyhow::{anyhow, Result};
+use infr_core::backend::KvFrameCorridor;
 use std::collections::HashMap;
 
 /// One cached conversation: the frames covering every COMPLETE page of its token prefix
@@ -120,8 +121,10 @@ impl PagedKv {
         }
     }
 
-    pub(crate) fn set_vram_base(&mut self, base: u64) {
-        self.pool.set_base(Tier::Vram, base);
+    /// Install the VRAM corridors backing frames `0..vram_frames`. Usually one segment; the
+    /// unified arena hands back several when the request exceeds a single shard's largest gap.
+    pub(crate) fn set_vram_segments(&mut self, corridors: &[KvFrameCorridor]) {
+        self.pool.set_segments(Tier::Vram, corridors);
     }
 
     /// Device address to write into plane `plane`'s table for one VRAM frame. RAM-tier frames must
@@ -508,7 +511,10 @@ mod tests {
     fn cache(vram_frames: usize) -> PagedKv {
         // Two planes so plane_addr exercises the offset prefix sums.
         let mut kv = PagedKv::new(FB, PAGE, vec![0, FB / 2], vram_frames, 0);
-        kv.set_vram_base(0x1_0000_0000);
+        kv.set_vram_segments(&[KvFrameCorridor {
+            base: 0x1_0000_0000,
+            frames: vram_frames,
+        }]);
         kv
     }
 
