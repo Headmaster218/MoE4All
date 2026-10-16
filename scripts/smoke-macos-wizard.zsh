@@ -24,6 +24,7 @@ EOF
 
 /bin/zsh -n "$repo/Start-INFR-Wizard-macOS.sh"
 python3 -c 'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))' "$repo/scripts/macos_release.py"
+grep -Fq "trap 'launcher_exit \$?' EXIT" "$repo/Start-INFR-Wizard-macOS.sh"
 
 root="$work/root"
 home="$work/home"

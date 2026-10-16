@@ -24,6 +24,20 @@ exit 42
     if ($exitCode -ne 0 -or ($output | Out-String) -notmatch 'ENTRY_POLICY_OK') {
         throw ('Entry policy test failed: ' + ($output | Out-String))
     }
+
+    [IO.File]::WriteAllText($script, @'
+Write-Output 'START_FAILURE_FIXTURE'
+exit 7
+'@, [Text.UTF8Encoding]::new($false))
+    Push-Location $fixture
+    try {
+        $output = ' ' | & $env:ComSpec /d /c Start-INFR-Wizard.cmd 2>&1
+        $exitCode = $LASTEXITCODE
+    } finally { Pop-Location }
+    $failureText = $output | Out-String
+    if ($exitCode -ne 7 -or $failureText -notmatch 'START_FAILURE_FIXTURE' -or $failureText -notmatch 'Review the messages above') {
+        throw ('Entry failure retention test failed: ' + $failureText)
+    }
     Write-Output 'Test-WizardEntryPolicy: downloaded script runs under process-local Bypass; no elevation.'
 } finally {
     $env:PSExecutionPolicyPreference = $previous
