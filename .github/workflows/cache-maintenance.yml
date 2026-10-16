@@ -39,5 +39,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CACHE_REF: ${{ steps.cache-ref.outputs.ref }}
+          REPOSITORY: ${{ github.repository }}
         run: |
-          gh cache delete --all --ref "$CACHE_REF" --succeed-on-no-caches
+          gh cache delete --repo "$REPOSITORY" --all --ref "$CACHE_REF" --succeed-on-no-caches
