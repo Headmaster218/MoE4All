@@ -38,6 +38,12 @@ All speeds are tok/s.
 [Low-weight expert omission experiment (Chinese)](documentation/evidence/campaigns/qwen38/2026-10-11-low-weight-expert-omission.md) |
 [Expert cache and multi-GPU split (Chinese)](documentation/evidence/benchmarks/2026-10-11-flashnext-expert-cache-capacity.md)
 
+<p align="center">
+  <a href="https://buymeacoffee.com/headmaster218">
+    <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee" height="45">
+  </a>
+</p>
+
 ## Quick start
 
 ### 1. Download the program
@@ -346,6 +352,16 @@ historical optimization decisions are in the [change records](documentation/evid
 
 How much VRAM should the expert cache retain, and how should layers be split across GPUs with different PCIe bandwidths? See [FlashNext expert cache and multi-GPU split](documentation/evidence/benchmarks/2026-10-11-flashnext-expert-cache-capacity.md)
 for a 0.5-48 GiB offline replay of real accesses, a continuous piecewise exponential approximation, a curve-based layer-allocation formula, and its limitations (Chinese documentation).
+
+## Star History
+
+<a href="https://www.star-history.com/#Headmaster218/MoE4All&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Headmaster218/MoE4All&type=Date&theme=dark">
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Headmaster218/MoE4All&type=Date">
+    <img alt="MoE4All Star History" src="https://api.star-history.com/svg?repos=Headmaster218/MoE4All&type=Date">
+  </picture>
+</a>
 
 ## Project and attribution
 
