@@ -7,6 +7,15 @@ set -euo pipefail
 fail() { printf '%s\n' "$*" >&2; return 1; }
 need() { command -v "$1" >/dev/null || fail "Required system tool not found: $1"; }
 trim() { REPLY=$1; REPLY="${REPLY#"${REPLY%%[![:space:]]*}"}"; REPLY="${REPLY%"${REPLY##*[![:space:]]}"}"; }
+launcher_exit() {
+    local status=$1 ignored
+    trap - EXIT
+    if ((status != 0)) && [[ $status != 130 && $status != 143 && ${INTERACTIVE-false} == true && -t 0 ]]; then
+        printf '\nMoE4All launch failed (exit %d). Review the messages above.\nPress Enter to close: ' "$status" >&2
+        IFS= read -r ignored || true
+    fi
+    exit "$status"
+}
 
 # JSON.awk 1.4.2 (MIT), embedded so the launcher needs no separate parser.
 read -r -d '' JSON_PARSER <<'MOE4ALL_JSON_AWK' || true
@@ -932,7 +941,10 @@ physical_cores() {
 }
 choose_device() {
     local output line device name kind mark default='' entry found=false; local -a options=()
-    output=$("$BINARY" devices) || { fail 'Vulkan device enumeration failed; check the GPU driver.'; return 1; }
+    output=$("$BINARY" devices) || {
+        fail $'Vulkan device enumeration failed. Check the messages above, then run `./infr devices`.\nOn Intel/AMD Linux GPUs, install or update the matching Mesa Vulkan driver; mixed old/new Mesa libraries can also cause this failure.'
+        return 1
+    }
     while IFS= read -r line; do
         if [[ $line =~ ^[[:space:]]*(Vulkan[0-9]+):[[:space:]]+(.+)[[:space:]]+\[([^]]+)\](.*)$ ]]; then
             device=${BASH_REMATCH[1]}; name=${BASH_REMATCH[2]}; kind=${BASH_REMATCH[3]}; mark=${BASH_REMATCH[4]}
@@ -940,7 +952,10 @@ choose_device() {
             options+=("$device|$device: $name [$kind]"); [[ $mark != *default* ]] || default=$device
         fi
     done <<< "$output"
-    ((${#options[@]}>0)) || { fail 'No Vulkan GPU found; check the GPU driver.'; return 1; }
+    ((${#options[@]}>0)) || {
+        fail $'No usable Vulkan GPU was found. Run `./infr devices` and `vulkaninfo --summary` to inspect the system driver.\nA "Driver does not support the ... PCI ID" warning is a Mesa/Intel driver mismatch, not a model-path error.'
+        return 1
+    }
     [[ -n $default ]] || default=${options[0]%%|*}
     for entry in "${options[@]}"; do [[ ${S[device]} != "${entry%%|*}" ]] || found=true; done
     [[ $found == true ]] || S[device]=$default
@@ -1455,7 +1470,16 @@ main() {
     fi
     save_state; printf 'Settings saved: %s\n' "$STATE"
     if [[ -n $api_key ]]; then export INFR_API_KEY=$api_key; else unset INFR_API_KEY; fi
-    cd -- "$ROOT"; exec "${COMMAND[@]}"
+    cd -- "$ROOT"
+    if [[ $INTERACTIVE == true && $HEADLESS == false ]]; then
+        "${COMMAND[@]}"
+    else
+        exec "${COMMAND[@]}"
+    fi
 }
 
-if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    trap 'launcher_exit $?' EXIT
+    main "$@"
+    trap - EXIT
+fi

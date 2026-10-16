@@ -7,6 +7,15 @@ fail() { printf '%s\n' "$*" >&2; return 1; }
 need() { command -v "$1" >/dev/null || fail "Required system tool not found: $1"; }
 trim() { REPLY=$1; REPLY="${REPLY#"${REPLY%%[![:space:]]*}"}"; REPLY="${REPLY%"${REPLY##*[![:space:]]}"}"; }
 file_sha256() { REPLY=$(shasum -a 256 -- "$1") || return 1; REPLY=${REPLY%% *}; }
+launcher_exit() {
+    local status=$1 ignored
+    trap - EXIT
+    if ((status != 0)) && [[ $status != 130 && $status != 143 && ${INTERACTIVE-false} == true && -t 0 ]]; then
+        printf '\nMoE4All launch failed (exit %d). Review the messages above.\nPress Enter to close: ' "$status" >&2
+        IFS= read -r ignored || true
+    fi
+    exit "$status"
+}
 
 # JSON.awk 1.4.2 (MIT), embedded so the launcher needs no separate parser.
 read -r -d '' JSON_PARSER <<'MOE4ALL_JSON_AWK' || true
@@ -1391,7 +1400,16 @@ main() {
     fi
     save_state; printf 'Settings saved: %s\n' "$STATE"
     if [[ -n $api_key ]]; then export INFR_API_KEY=$api_key; else unset INFR_API_KEY; fi
-    cd -- "$ROOT"; exec "${COMMAND[@]}"
+    cd -- "$ROOT"
+    if [[ $INTERACTIVE == true && $HEADLESS == false ]]; then
+        "${COMMAND[@]}"
+    else
+        exec "${COMMAND[@]}"
+    fi
 }
 
-if [[ ${MOE4ALL_WIZARD_LIBRARY-} != 1 ]]; then main "$@"; fi
+if [[ ${MOE4ALL_WIZARD_LIBRARY-} != 1 ]]; then
+    trap 'launcher_exit $?' EXIT
+    main "$@"
+    trap - EXIT
+fi

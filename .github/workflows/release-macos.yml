@@ -1,9 +1,6 @@
 name: macOS Release (Experimental)
 
 on:
-  push:
-    tags:
-      - 'release-*'
   workflow_dispatch: {}
   workflow_call: {}
 
@@ -26,7 +23,9 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 90
     permissions:
-      contents: write
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v7
       - name: Confirm Apple Silicon runner
@@ -36,9 +35,10 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-build-cache
         with:
           shared-key: macos-release-arm64
+          cache-on-failure: true
       - name: Resolve release version
         id: release
         run: |
@@ -53,6 +53,9 @@ jobs:
         run: /bin/zsh scripts/smoke-macos-wizard.zsh
       - name: Build portable Apple Silicon engine
         run: cargo build --release --locked -p infr-cli --config 'build.rustflags=[]'
+      - name: Show sccache statistics
+        if: always()
+        run: sccache --show-stats
       - name: Ad-hoc sign and audit runtime dependencies
         run: |
           codesign --force --sign - --timestamp=none target/release/infr
@@ -83,6 +86,21 @@ jobs:
             --profile aggressive --dev metal --parallel 1 --no-api-key | tee "$RUNNER_TEMP/macos-wizard-dry-run.txt"
           grep -F -- '--dev metal' "$RUNNER_TEMP/macos-wizard-dry-run.txt"
           grep -F -- 'device.auto_profile=aggressive' "$RUNNER_TEMP/macos-wizard-dry-run.txt"
+      - name: Write immutable release manifest
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          ARCHIVE: ${{ steps.release.outputs.archive }}
+        run: |
+          python3 scripts/release_ci.py write \
+            --platform macos-arm64 \
+            --version "$VERSION" \
+            --commit "$GITHUB_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --output dist/release-manifest-macos-arm64.json \
+            --metadata "rustc=$(rustc --version)" \
+            --metadata "cargo=$(cargo --version)" \
+            --metadata "runner=${ImageOS:-unknown}-${ImageVersion:-unknown}" \
+            "dist/$ARCHIVE" "dist/$ARCHIVE.sha256"
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v6
         with:
@@ -90,25 +108,11 @@ jobs:
           path: |
             dist/${{ steps.release.outputs.archive }}
             dist/${{ steps.release.outputs.archive }}.sha256
+            dist/release-manifest-macos-arm64.json
           if-no-files-found: error
           retention-days: 14
-      - name: Publish macOS assets
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/release-')
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.release.outputs.version }}
-          ARCHIVE: ${{ steps.release.outputs.archive }}
-        run: |
-          tag="release-$VERSION"
-          if ! gh release view "$tag" >/dev/null 2>&1; then
-            gh release create "$tag" --verify-tag --title "MoE4All v$VERSION" --generate-notes || gh release view "$tag"
-          fi
-          gh release upload "$tag" "dist/$ARCHIVE" "dist/$ARCHIVE.sha256" --clobber
-          notes=$(gh release view "$tag" --json body --jq .body)
-          if [[ "$notes" != *'<!-- moe4all-macos-experimental -->'* ]]; then
-            printf '%s\n\n%s\n%s\n' "$notes" \
-              '<!-- moe4all-macos-experimental -->' \
-              'macOS arm64 / Metal is experimental. The package runs on Apple Silicon with the system zsh and standard Apple utilities; Homebrew, Python, jq and a Rust toolchain are not runtime dependencies. Text run/serve/bench and explicit MTP are included. Metal serving is currently single-slot; Vision and Embedding are not yet available. The binary is ad-hoc signed but not Apple-notarized; if Gatekeeper blocks it, remove quarantine from the extracted package with the system xattr command documented in the README. / macOS Apple Silicon 包为实验版，请反馈模型兼容性与性能问题。' \
-              > "$RUNNER_TEMP/macos-release-notes.md"
-            gh release edit "$tag" --notes-file "$RUNNER_TEMP/macos-release-notes.md"
-          fi
+      - name: Attest release archive
+        if: github.repository_visibility == 'public'
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/${{ steps.release.outputs.archive }}

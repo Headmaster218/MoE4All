@@ -1,0 +1,44 @@
+name: Cache Maintenance
+
+on:
+  pull_request_target:
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Exact cache ref to remove, for example refs/tags/release-1.0.2
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  prune-ref:
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Resolve cache ref
+        id: cache-ref
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          MANUAL_REF: ${{ inputs.ref }}
+        run: |
+          if [[ "$EVENT_NAME" == pull_request_target ]]; then
+            ref="refs/pull/$PR_NUMBER/merge"
+          else
+            ref="$MANUAL_REF"
+          fi
+          if [[ ! "$ref" =~ ^refs/(pull/[0-9]+/merge|tags/release-[0-9A-Za-z.+-]+)$ ]]; then
+            echo "Ref is outside the allowed PR/tag cache namespaces: $ref" >&2
+            exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+      - name: Delete caches scoped to the retired ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CACHE_REF: ${{ steps.cache-ref.outputs.ref }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          gh cache delete --repo "$REPOSITORY" --all --ref "$CACHE_REF" --succeed-on-no-caches

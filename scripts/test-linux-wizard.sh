@@ -343,6 +343,23 @@ configure > "$tmp/interactive-default" <<'INPUT'
 
 INPUT
 [[ ${S[launch_mode]} == run && ${S[setup_mode]} == conservative && ${S[device]} == Vulkan1 && ${S[max_new]} == 65536 ]]; pass
+
+# Device-driver failures after model selection stay explicit instead of looking
+# like a model-path failure. The top-level launcher keeps an interactive terminal
+# open; this sourced test verifies the actionable diagnostic without a GPU.
+cat > "$tmp/no-vulkan-infr" <<'ENGINE'
+#!/usr/bin/env bash
+if [[ ${1-} == devices ]]; then
+    printf '%s\n' 'MESA: warning: Driver does not support the 0x7d67 PCI ID.' >&2
+    printf '%s\n' 'no Vulkan physical devices found'
+fi
+ENGINE
+chmod +x "$tmp/no-vulkan-infr"
+BINARY=$tmp/no-vulkan-infr
+reject choose_device
+grep -q 'Mesa/Intel driver mismatch' "$tmp/reject.log"; pass
+BINARY=$ROOT/infr
+
 reset; S[launch_mode]=serve; S[model]="$ROOT/models/flash-00001-of-00002.gguf"
 S[setup_mode]=aggressive; S[vision_projector]="$ROOT/models/mmproj-flash.gguf"
 S[embedding_model]="$ROOT/models/mtp-flash.gguf"; S[server_parallel]=2

@@ -45,8 +45,12 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-build-cache
+        with:
+          cache-write: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - if: always()
+        run: sccache --show-stats
 
   test:
     name: cargo test
@@ -55,17 +59,23 @@ jobs:
       - uses: actions/checkout@v7
       - name: Linux wizard smoke
         run: bash scripts/smoke-linux-wizard.sh
+      - name: Release promotion metadata tests
+        run: python3 -m unittest discover -s scripts -p 'test_release_ci.py' -v
       - name: Install glslc (shaderc)
         run: sudo apt-get update && sudo apt-get install -y glslc
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-build-cache
+        with:
+          cache-write: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
       - run: cargo nextest run --workspace --locked
       - run: cargo test --doc --workspace --locked
+      - if: always()
+        run: sccache --show-stats
 
   # CPU generation goldens against REAL models. The `cpu_golden_*` /
   # `cpu_kv_*` tests in `infr-llama/tests/cpu_backend.rs` self-skip when the
@@ -99,7 +109,9 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-build-cache
+        with:
+          cache-write: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       # Cache the downloaded GGUFs across runs. The key encodes the exact model
       # set + quant, so it only re-downloads when that list changes (bump the
       # `-v1` suffix if you change the models below).
@@ -117,6 +129,8 @@ jobs:
       # which is far too slow to time out in debug. Single-threaded because the
       # goldens mutate process-global generation env under a shared lock.
       - run: cargo test --release -p infr-llama --test cpu_backend --locked -- --test-threads=1
+      - if: always()
+        run: sccache --show-stats
 
   build:
     name: cargo build --release
@@ -128,8 +142,12 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-build-cache
+        with:
+          cache-write: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - run: cargo build --release --workspace --locked
+      - if: always()
+        run: sccache --show-stats
 
   # Cheap Linux guard for the macOS-only `infr-metal` crate: `cargo check`
   # cross-compiled to aarch64-apple-darwin doesn't link, so no macOS SDK is
@@ -148,8 +166,12 @@ jobs:
           target: aarch64-apple-darwin
           cache: false
       - run: rustup target add aarch64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-build-cache
+        with:
+          cache-write: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - run: cargo check -p infr-metal --all-targets --locked --target aarch64-apple-darwin
+      - if: always()
+        run: sccache --show-stats
 
   # macOS / Metal: the Linux jobs above never build `infr-metal` (it is
   # `#![cfg(target_os = "macos")]`). This job builds the workspace on an
@@ -171,6 +193,10 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-build-cache
+        with:
+          cache-write: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - run: cargo build --workspace --locked
       - run: cargo test -p infr-metal --locked -- --include-ignored --nocapture
+      - if: always()
+        run: sccache --show-stats
