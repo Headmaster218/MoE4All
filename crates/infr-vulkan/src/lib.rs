@@ -2531,6 +2531,10 @@ pub struct VulkanBackend {
     /// Auxiliary-engine allocation routing. `None` keeps every established LLM allocation path;
     /// an Embedding fork sends only weights and graph activations into the shared elastic arena.
     unified_client: Option<UnifiedClient>,
+    /// Paged-KV frame corridors (see [`Backend::alloc_kv_frames`]): (device base, corridor buffer).
+    /// The buffer holds the arena lease that keeps every frame address valid; dropping it while a
+    /// session table still points inside is a use-after-free, so release happens only at shutdown.
+    kv_corridors: Mutex<Vec<(u64, VkBuffer)>>,
     /// The engine configuration this backend reads its knobs from — one value, held for the
     /// backend's whole life, borrowed (never cloned) at every read site (`docs/config-plan.md`
     /// R4/R6).
@@ -4515,6 +4519,7 @@ impl VulkanBackend {
             unified_phase_id: UnifiedPhaseRegistry::PRIMARY_ID,
             auxiliary_runtime_reaper: None,
             unified_client: None,
+            kv_corridors: Mutex::new(Vec::new()),
             cfg,
             shared: Arc::new(VulkanShared {
                 _entry: entry,
@@ -5910,6 +5915,7 @@ impl VulkanBackend {
             unified_phase_id,
             auxiliary_runtime_reaper: Some(auxiliary_runtime_reaper),
             unified_client: Some(client),
+            kv_corridors: Mutex::new(Vec::new()),
             cfg: Arc::clone(&self.cfg),
             shared: Arc::clone(&self.shared),
         })
@@ -7600,6 +7606,119 @@ impl Backend for VulkanBackend {
             *segmented.reservation.lock().unwrap() = None;
             Ok(())
         })
+    }
+
+    fn alloc_kv_frames(&self, frame_bytes: u64, count: usize) -> Result<Option<u64>> {
+        // One contiguous corridor claim, sliced into fixed-size frames by the caller's
+        // FramePool bookkeeping. A single lease is deliberate: per-frame arena claims would
+        // reintroduce exactly the external fragmentation the fixed-frame design removes, and
+        // the whole corridor is claimed at cache init (never lazily), so expert/KV reclaim
+        // pressure is paid once, not per page.
+        let total = (frame_bytes as usize)
+            .checked_mul(count)
+            .ok_or_else(|| be("KV frame corridor size overflow"))?;
+        if total == 0 || count == 0 {
+            return Err(be(
+                "KV frame corridor needs a non-zero frame count and size",
+            ));
+        }
+        let addr = self.with_unified_exclusive(|| {
+            let pool = self
+                .unified_vram()
+                .ok_or_else(|| be("KV frame corridor lost its unified VRAM arena"))?;
+            let handle = if pool.expert_layout().is_some() {
+                let protected = self.protected_unified_experts();
+                let owner = self
+                    .unified_phases
+                    .claim_with_reclaim(self.unified_phase_id, || {
+                        pool.reserve_kv_layout(&[total], &protected)
+                    })?;
+                let range = *owner
+                    .ranges()
+                    .first()
+                    .ok_or_else(|| be("KV frame corridor reservation returned no range"))?;
+                if range.requested_len != total {
+                    return Err(be(
+                        "KV frame corridor reservation size differs from the request",
+                    ));
+                }
+                let mut plan =
+                    self.unified_phases
+                        .claim_with_reclaim(self.unified_phase_id, || {
+                            pool.plan_exact_owner_claim(
+                                &[range],
+                                crate::unified::UnifiedVramClass::KvCache,
+                                &protected,
+                            )
+                        })?;
+                if !plan.victims().is_empty() && self.quiesce_decode_prefetch_for_vram_claim()? {
+                    let protected = self.protected_unified_experts();
+                    plan = self
+                        .unified_phases
+                        .claim_with_reclaim(self.unified_phase_id, || {
+                            pool.plan_exact_owner_claim(
+                                &[range],
+                                crate::unified::UnifiedVramClass::KvCache,
+                                &protected,
+                            )
+                        })?;
+                }
+                self.commit_unified_claim_locked(&pool, plan)?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| be("KV frame corridor claim returned no handle"))?
+            } else {
+                self.unified_phases
+                    .claim_with_reclaim(self.unified_phase_id, || {
+                        pool.allocate(total, crate::unified::UnifiedVramClass::KvCache)
+                            .ok_or_else(|| {
+                                be("generic unified VRAM cannot fit the KV frame corridor")
+                            })
+                    })?
+            };
+            let corridor = self.unified_sub_buffer(handle, total)?;
+            let addr = corridor
+                .device_addr()
+                .ok_or_else(|| be("KV frame corridor has no device address"))?;
+            self.kv_corridors.lock().unwrap().push((addr, corridor));
+            Ok(addr)
+        })?;
+        Ok(Some(addr))
+    }
+
+    fn set_kv_table_entry(&self, buffer: &dyn Buffer, page: usize, addr: u64) -> Result<()> {
+        let segmented = as_segmented_kv(buffer)
+            .ok_or_else(|| be("set_kv_table_entry received a flat or foreign buffer"))?;
+        if page >= segmented.spec.max_segments {
+            return Err(be(format!(
+                "paged KV table write at page {page}, but the plane holds only {}",
+                segmented.spec.max_segments
+            )));
+        }
+        let table_ptr = segmented
+            .table
+            .mapped_ptr()
+            .ok_or_else(|| be("segmented KV address table is not host-visible"))?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                addr.to_ne_bytes().as_ptr(),
+                table_ptr.add(page * std::mem::size_of::<u64>()),
+                std::mem::size_of::<u64>(),
+            );
+        }
+        Ok(())
+    }
+
+    fn free_kv_frames(&self, base: u64) -> Result<()> {
+        let mut corridors = self.kv_corridors.lock().unwrap();
+        let index = corridors
+            .iter()
+            .position(|(addr, _)| *addr == base)
+            .ok_or_else(|| be("unknown KV frame corridor"))?;
+        // Dropping the corridor buffer releases the arena lease. Safe only when every frame's
+        // refcount reached zero — the engine tears the paged cache down before its slots.
+        corridors.remove(index);
+        Ok(())
     }
 
     /// Copy `src` (host slice) into `dst` (device buffer).
