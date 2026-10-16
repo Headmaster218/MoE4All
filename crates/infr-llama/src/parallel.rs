@@ -1144,20 +1144,23 @@ impl ParallelSeam {
                 plane_offsets.push(frame_bytes);
                 frame_bytes += plane.segment_bytes() as u64;
             }
-            // Phase B sizes the corridor to the FULL VRAM KV space (every slot x every page), per the
-            // plan: sessions and the tree share one frame pool, the tree is what's left after the
-            // resident chains. `spec` (the RAM tier budget) lands with Phase C's DMA pool.
+            // Phase B sizes the frame space to the FULL VRAM KV space (every slot x every page),
+            // per the plan: sessions and the tree share one frame pool, the tree is what's left
+            // after the resident chains. `spec` (the RAM tier budget) lands with Phase C's DMA
+            // pool. The arena is sharded (~2 GiB ReBAR pieces), so this request arrives as one
+            // corridor at small ctx and as several when it exceeds a shard's largest free gap.
             let vram_frames = n_slots * meta.max_ctx.div_ceil(page_tokens);
-            let base = Backend::alloc_kv_frames(self.vk.as_ref(), frame_bytes, vram_frames)?
+            let corridors = Backend::alloc_kv_frames(self.vk.as_ref(), frame_bytes, vram_frames)?
                 .ok_or_else(|| {
-                    anyhow!("the unified VRAM arena cannot fit the KV frame corridor")
-                })?;
+                anyhow!("the unified VRAM arena cannot fit the KV frame corridor")
+            })?;
             let mut tree = PagedKv::new(frame_bytes, page_tokens, plane_offsets, vram_frames, 0);
-            tree.set_vram_base(base);
+            tree.set_vram_segments(&corridors);
             tracing::info!(
                 page_tokens,
                 vram_frames,
                 frame_bytes,
+                corridors = corridors.len(),
                 corridor_bytes = frame_bytes * vram_frames as u64,
                 ram_budget = ?spec,
                 tree = %tree.stats_line(),
