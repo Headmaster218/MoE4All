@@ -33,6 +33,12 @@ Windows、Linux 免安装，约 17 MiB 即下即用；Apple Silicon 同步提供
 [低权重专家跳过实验](documentation/evidence/campaigns/qwen38/2026-10-11-low-weight-expert-omission.md) |
 [专家缓存与多卡配比](documentation/evidence/benchmarks/2026-10-11-flashnext-expert-cache-capacity.md)
 
+<p align="center">
+  <a href="https://buymeacoffee.com/headmaster218">
+    <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee" height="45">
+  </a>
+</p>
+
 ## 快速使用
 
 ### 1. 下载程序
@@ -185,6 +191,15 @@ prefill 与 decode 切换时可以重新分配弹性空间。
 
 专家缓存留多少显存才够、多张不同 PCIe 带宽的显卡该怎样分层？参见 [FlashNext 专家缓存与多卡配比](documentation/evidence/benchmarks/2026-10-11-flashnext-expert-cache-capacity.md)：包含真实访问序列的 0.5～48 GiB 离线回放曲线、连续分段指数函数，以及基于曲线的多卡层数分配公式和适用限制。
 
+## Star History
+
+<a href="https://www.star-history.com/#Headmaster218/MoE4All&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Headmaster218/MoE4All&type=Date&theme=dark">
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Headmaster218/MoE4All&type=Date">
+    <img alt="MoE4All Star History" src="https://api.star-history.com/svg?repos=Headmaster218/MoE4All&type=Date">
+  </picture>
+</a>
 
 ## 项目与署名
 
