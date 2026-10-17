@@ -3593,7 +3593,7 @@ impl Backend for CpuBackend {
                     // — long enough that spinning pool workers SMT-throttled it, which is where
                     // qwen3moe's phase-3 prefill regression hid (per-op MoeFfn time had IMPROVED).
                     let logits_all: Vec<f32> = {
-                        let r_kind = expert_acts_kind(rdt, ne, int8_ok);
+                        let r_kind = expert_acts_kind(rdt, ne, int8_ok, !reference);
                         let rq8: Vec<Q8> = if r_kind == ActsKind::Super {
                             pool.collect(rows, &|r| quantize_q8(&rxs[r * ne..r * ne + ne]))
                         } else {
@@ -3917,11 +3917,11 @@ impl Backend for CpuBackend {
                     // per-expert gather re-quantized a row for every expert it routed to), then
                     // cloned per pair so each bucket owns a contiguous slice.
                     let t_a = std::time::Instant::now();
-                    let g_kind = expert_acts_kind(gdt, ne, int8_ok);
+                    let g_kind = expert_acts_kind(gdt, ne, int8_ok, !reference);
                     let u_kind = if fused_gate_up {
                         g_kind
                     } else {
-                        expert_acts_kind(udt, ne, int8_ok)
+                        expert_acts_kind(udt, ne, int8_ok, !reference)
                     };
                     let need = |k: ActsKind| g_kind == k || u_kind == k;
                     let q8_pairs: Vec<Q8> = if need(ActsKind::Super) {
@@ -4056,7 +4056,7 @@ impl Backend for CpuBackend {
                     // values the old un-transpose+split produced), quantized straight into the
                     // representation the DOWN bank's dtype wants.
                     let t_c = std::time::Instant::now();
-                    let d_kind = expert_acts_kind(ddt, nffx, int8_ok);
+                    let d_kind = expert_acts_kind(ddt, nffx, int8_ok, !reference);
                     let act_row_of = |p: usize| -> Vec<f32> {
                         let b = pair_bucket[p] as usize;
                         let i = pair_local[p] as usize;
@@ -4371,6 +4371,22 @@ impl Backend for CpuBackend {
                     let mut out = vec![0.0f32; rr * inner];
                     let qscale = 1.0 / (hd as f32).sqrt();
 
+                    // The recurrence's O(hd²) per (token, head) state walk is inherent; what made
+                    // this arm slow was pure redundancy ON TOP of it. (1) The decay gate depends on
+                    // (head, k) ONLY, yet both of its exp()s sat inside the `v` loop — hd² pairs per
+                    // head per token (32K exps at hd=128) where hd suffices. (2) The scaled key and
+                    // query projections were re-multiplied per v as well. (3) The v-outer/k-inner
+                    // nest strode `hd` floats per k through the [k][v]-major state; walking k-major
+                    // instead makes every row contiguous. Every output element still accumulates
+                    // over k ASCENDING and every state element is still decayed exactly once before
+                    // it is read, so the arithmetic is unchanged element-for-element.
+                    let mut decay = vec![0.0f32; hd];
+                    let mut ksc = vec![0.0f32; hd];
+                    let mut qsc = vec![0.0f32; hd];
+                    let mut pred_v = vec![0.0f32; hd];
+                    let mut delta_v = vec![0.0f32; hd];
+                    let mut obuf = vec![0.0f32; hd];
+
                     for t in 0..rr {
                         let row = t * 3 * inner;
                         for h in 0..nh {
@@ -4388,27 +4404,40 @@ impl Backend for CpuBackend {
                             let kinv = 1.0 / (kn + eps).sqrt();
                             let b = 1.0 / (1.0 + (-beta[t * nh + h]).exp());
                             let sbase = h * hd * hd;
+                            let ah = a[h];
+                            let fbase = t * inner + hv;
 
-                            for v in 0..hd {
-                                let mut pred = 0.0f32;
-                                for k in 0..hd {
-                                    let gate =
-                                        a[h] * (forget[t * inner + hv + k] + dt_bias[hv + k]);
-                                    let log_decay = lower_bound / (1.0 + (-gate).exp());
-                                    let si = sbase + k * hd + v;
-                                    st[si] *= log_decay.exp();
-                                    pred += st[si] * (qkv[kbase + k] * kinv);
-                                }
-                                let delta = (qkv[vbase + v] - pred) * b;
-                                let mut o = 0.0f32;
-                                for k in 0..hd {
-                                    let kval = qkv[kbase + k] * kinv;
-                                    let si = sbase + k * hd + v;
-                                    st[si] += kval * delta;
-                                    o += st[si] * (qkv[qbase + k] * qinv);
-                                }
-                                out[t * inner + hv + v] = o;
+                            for k in 0..hd {
+                                let gate = ah * (forget[fbase + k] + dt_bias[hv + k]);
+                                let log_decay = lower_bound / (1.0 + (-gate).exp());
+                                decay[k] = log_decay.exp();
+                                ksc[k] = qkv[kbase + k] * kinv;
+                                qsc[k] = qkv[qbase + k] * qinv;
                             }
+                            pred_v.fill(0.0);
+                            obuf.fill(0.0);
+                            for k in 0..hd {
+                                let d = decay[k];
+                                let kv = ksc[k];
+                                let srow = &mut st[sbase + k * hd..sbase + k * hd + hd];
+                                for v in 0..hd {
+                                    srow[v] *= d;
+                                    pred_v[v] += srow[v] * kv;
+                                }
+                            }
+                            for v in 0..hd {
+                                delta_v[v] = (qkv[vbase + v] - pred_v[v]) * b;
+                            }
+                            for k in 0..hd {
+                                let kv = ksc[k];
+                                let qv = qsc[k];
+                                let srow = &mut st[sbase + k * hd..sbase + k * hd + hd];
+                                for v in 0..hd {
+                                    srow[v] += kv * delta_v[v];
+                                    obuf[v] += srow[v] * qv;
+                                }
+                            }
+                            out[t * inner + hv..t * inner + hv + hd].copy_from_slice(&obuf);
                         }
                     }
                     vals[dst.0 as usize] = out;
@@ -4534,26 +4563,35 @@ impl Backend for CpuBackend {
                             for &s in &sc {
                                 l += (s - mx).exp();
                             }
-                            // Accumulate: V is first kv_lora columns of K.
+                            // Accumulate: V is first kv_lora columns of K. The value projection
+                            // factors through the softmax sum — `Σ_jj p_jj · (wv_b[h] @ V_jj) ==
+                            // wv_b[h] @ (Σ_jj p_jj V_jj)` — so the context vector is accumulated
+                            // in kv_lora space FIRST (kv_lora MACs per key) and `wv_b[h]` is
+                            // applied ONCE per (token, head). The old fused form re-projected
+                            // every key through the full [kv_lora, v_head] matrix, which made
+                            // prefill MLA quadratic-in-keys with a 512×512 constant — the single
+                            // hottest thing in glm5next CPU prefill (26% of a 34-minute run).
+                            // Same math, llama.cpp's association order, f32-reshuffled results.
+                            let mut ctx = vec![0f32; kv_lora];
                             for (jj, &s) in sc.iter().enumerate() {
                                 let j = lo + jj;
                                 let jr = if cap_rows > 0 { j % cap_rows } else { j };
                                 let p = (s - mx).exp() / l;
                                 let krow = jr * key_len;
-                                // attn_out[jj] += p * V[jj] where V[jj] = ks[krow..krow+kv_lora]
-                                // Apply wv_b[h] to the accumulated output directly:
-                                // ob_slice += p * wv_b[h] @ V[jj]
-                                let wv_off = h * kv_lora * vhd;
-                                for o_idx in 0..vhd {
-                                    let mut vs = 0f32;
-                                    for a_idx in 0..kv_lora {
-                                        // wv_b[h][a_idx][o_idx]: element [a][o] with a the FAST
-                                        // (row) dim — flat = a + o*kv_lora (GGUF layout).
-                                        vs +=
-                                            wv[wv_off + a_idx + o_idx * kv_lora] * ks[krow + a_idx];
-                                    }
-                                    ob_slice[o_idx] = p.mul_add(vs, ob_slice[o_idx]);
+                                // ctx += p * V[jj] where V[jj] = ks[krow..krow+kv_lora]
+                                for (c, &v) in ctx.iter_mut().zip(&ks[krow..krow + kv_lora]) {
+                                    *c = p.mul_add(v, *c);
                                 }
+                            }
+                            // ob = wv_b[h] @ ctx, once. wv_b[h][a][o] with a the FAST (row) dim —
+                            // flat = a + o*kv_lora (GGUF layout), so each output row is a
+                            // contiguous dot against the context.
+                            let wv_off = h * kv_lora * vhd;
+                            for o_idx in 0..vhd {
+                                ob_slice[o_idx] = crate::kernels::dot(
+                                    &wv[wv_off + o_idx * kv_lora..][..kv_lora],
+                                    &ctx,
+                                );
                             }
                         });
                     vals[dst.0 as usize] = out;
@@ -4655,6 +4693,142 @@ impl Backend for CpuBackend {
                                 *slot = f32::from_bits(bi as u32);
                             }
                         });
+                    vals[dst.0 as usize] = out;
+                }
+                Op::GlmKpoolIndexer {
+                    q,
+                    k_cache,
+                    ape,
+                    weights,
+                    dst,
+                    rows,
+                    kv_len,
+                    n_head,
+                    head_dim,
+                    kpool,
+                    top_k,
+                    scale,
+                    pos,
+                } => {
+                    let (rows, kv_len, nh, hd, kp, tk, pos) = (
+                        rows as usize,
+                        kv_len as usize,
+                        n_head as usize,
+                        head_dim as usize,
+                        kpool as usize,
+                        top_k as usize,
+                        pos as usize,
+                    );
+                    assert!(
+                        (2..=8).contains(&kp) && tk % kp == 0,
+                        "cpu Op::GlmKpoolIndexer: kpool {kp} / top_k {tk} — the graph builder must \
+                         pass the GGUF's `attention.indexer.kpool` and a token-count top_k"
+                    );
+                    let qs = &vals[q.0 as usize];
+                    let ws = &vals[weights.0 as usize];
+                    // The APE is a WEIGHT (the graph binds it), not interpreter state.
+                    let apw = weight(ape);
+                    let ap = &apw[..];
+                    let kbuf = bindings
+                        .get(k_cache)
+                        .expect("cpu backend: unbound indexer k_cache");
+                    let kguard = cpu_buf(kbuf).read();
+                    let row_w = 2 * hd;
+                    let cap_rows = g.desc(k_cache).numel() / row_w.max(1);
+                    assert!(
+                        cap_rows >= kv_len,
+                        "cpu Op::GlmKpoolIndexer: indexer cache holds {cap_rows} rows but kv_len \
+                         is {kv_len}"
+                    );
+                    // `[key | gate]` rows dequantised to f32, like `Op::LightningIndexer`'s cache.
+                    let ks = dequant_cache_prefix(&kguard, g.desc(k_cache).dtype, kv_len * row_w);
+                    // Pool the complete pools plus a possible incomplete tail: missing members
+                    // contribute key = 0, gate = 0 (the reference's zeroed dump row), so their
+                    // `ape` logits still join the per-channel softmax.
+                    let n_pool = kv_len.div_ceil(kp);
+                    let mut pooled = vec![0f32; n_pool * hd];
+                    for p in 0..n_pool {
+                        let real = kp.min(kv_len - p * kp);
+                        for d in 0..hd {
+                            let mut lg = [0f32; 8];
+                            let mut mx = f32::NEG_INFINITY;
+                            for s in 0..kp {
+                                let gate = if s < real {
+                                    ks[(p * kp + s) * row_w + hd + d]
+                                } else {
+                                    0.0
+                                };
+                                lg[s] = gate + ap[s * hd + d];
+                                if lg[s] > mx {
+                                    mx = lg[s];
+                                }
+                            }
+                            let mut acc = 0f32;
+                            let mut den = 0f32;
+                            for s in 0..real {
+                                let wgt = (lg[s] - mx).exp();
+                                den += wgt;
+                                acc += wgt * ks[(p * kp + s) * row_w + d];
+                            }
+                            for s in real..kp {
+                                den += (lg[s] - mx).exp();
+                            }
+                            pooled[p * hd + d] = acc / den;
+                        }
+                    }
+                    let n_keep = tk / kp;
+                    let mut out = vec![0f32; rows * tk];
+                    for (ti, slotrow) in out.chunks_exact_mut(tk).enumerate() {
+                        // Pool p is visible when its FIRST member is at or before the query.
+                        let qpos = pos + ti;
+                        let n_vis = (qpos / kp + 1).min(n_pool);
+                        let n_sel = n_vis.min(n_keep);
+                        // score[p] over the visible prefix: the LightningIndexer head sum over
+                        // pooled keys, ASCENDING h (ggml_sum_rows order).
+                        let mut sc = vec![0f32; n_vis];
+                        for (p, s) in sc.iter_mut().enumerate() {
+                            let pb = p * hd;
+                            let mut acc = 0f32;
+                            for h in 0..nh {
+                                let qo = (ti * nh + h) * hd;
+                                let d = crate::kernels::dot(&qs[qo..qo + hd], &pooled[pb..pb + hd]);
+                                acc += (ws[ti * nh + h] * scale) * d.max(0.0);
+                            }
+                            *s = acc;
+                        }
+                        // Select n_sel pools by (score DESC, pool ASC) — the strict-better scan
+                        // `Op::LightningIndexer` uses, so ties keep the lower pool index.
+                        let mut taken = vec![false; n_vis];
+                        let mut w = 0usize;
+                        for _ in 0..n_sel {
+                            let mut bi = usize::MAX;
+                            for p in 0..n_vis {
+                                if taken[p] {
+                                    continue;
+                                }
+                                if bi == usize::MAX || sc[p] > sc[bi] {
+                                    bi = p;
+                                }
+                            }
+                            taken[bi] = true;
+                            // Emit the pool's members ascending; the incomplete tail pool clamps
+                            // its members to the real token count (duplicates keep every slot a
+                            // valid index — TopkMask's write is idempotent).
+                            let real = kp.min(kv_len - bi * kp);
+                            for m in 0..kp {
+                                if w >= tk {
+                                    break;
+                                }
+                                let tok = (bi * kp + m.min(real - 1)) as u32;
+                                slotrow[w] = f32::from_bits(tok);
+                                w += 1;
+                            }
+                        }
+                        // Remaining slots (fewer pools than the budget) repeat token 0.
+                        for x in slotrow[w..].iter_mut() {
+                            *x = 0f32;
+                        }
+                    }
                     vals[dst.0 as usize] = out;
                 }
                 Op::TopkMask {
@@ -6063,5 +6237,216 @@ mod tests {
                 .reference
         );
         assert!(CpuBackend::reference().cfg.kernels.cpu.reference);
+    }
+
+    // The glm5next k-pool indexer: synthetic cache, gate = ape = 0, so every pool's pooled key
+    // is the plain mean of its members and the score is `relu(dot(q, pooled))` — everything the
+    // op promises (visibility bound, top-pool selection with pool-ASC ties, member expansion,
+    // tail-pool clamping, and token-0 padding) is then exactly checkable.
+    #[test]
+    fn glm_kpool_indexer_selects_pools_and_pads() {
+        let (kv_len, kp, tk) = (10usize, 4usize, 8usize);
+        let (nh, hd) = (2usize, 4usize);
+        let rows = 9usize; // queries at pos 0..=8
+                           // Pool keys: pool 0 -> 1.0, pool 1 -> 2.0, pool 2 (tokens 8,9 + two missing) -> 0.5.
+        let mut cache = vec![0f32; kv_len * 2 * hd];
+        for t in 0..kv_len {
+            let v = match t / kp {
+                0 => 1.0,
+                1 => 2.0,
+                _ => 0.5,
+            };
+            for d in 0..hd {
+                cache[t * 2 * hd + d] = v; // key
+                                           // gate stays 0
+            }
+        }
+        // q[t][h][d] = 1.0 in channel 0, 0 elsewhere; weights 1; scale 1 -> score = pooled[0].
+        let mut q = vec![0f32; rows * nh * hd];
+        for t in 0..rows {
+            for h in 0..nh {
+                q[t * nh * hd + h * hd] = 1.0;
+            }
+        }
+        let w = vec![1f32; rows * nh];
+        let ape = vec![0f32; kp * hd];
+
+        let backend = CpuBackend::new();
+        let mut g = Graph::new();
+        let qi = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+        let wi = g.input(TensorDesc::new(vec![rows, nh], DType::F32));
+        let aw = g.weight(TensorDesc::new(vec![kp * hd], DType::F32));
+        let kc = g.input(TensorDesc::new(vec![kv_len * 2 * hd], DType::F32));
+        let di = g.output(TensorDesc::new(vec![rows * tk], DType::I32));
+        g.push(Op::GlmKpoolIndexer {
+            q: qi,
+            k_cache: kc,
+            ape: aw,
+            weights: wi,
+            dst: di,
+            rows: rows as u32,
+            kv_len: kv_len as u32,
+            n_head: nh as u32,
+            head_dim: hd as u32,
+            kpool: kp as u32,
+            top_k: tk as u32,
+            scale: 1.0,
+            pos: 0,
+        });
+        let plan = backend.compile(&g).expect("compile");
+        let qb = backend
+            .alloc(q.len() * 4, BufferUsage::Activations)
+            .unwrap();
+        let wb = backend
+            .alloc(w.len() * 4, BufferUsage::Activations)
+            .unwrap();
+        let ab = backend.alloc(ape.len() * 4, BufferUsage::Weights).unwrap();
+        let kb = backend
+            .alloc(cache.len() * 4, BufferUsage::KvCache)
+            .unwrap();
+        let db = backend.alloc(rows * tk * 4, BufferUsage::Readback).unwrap();
+        backend
+            .upload(qb.as_ref(), bytemuck::cast_slice(&q))
+            .unwrap();
+        backend
+            .upload(wb.as_ref(), bytemuck::cast_slice(&w))
+            .unwrap();
+        backend
+            .upload(ab.as_ref(), bytemuck::cast_slice(&ape))
+            .unwrap();
+        backend
+            .upload(kb.as_ref(), bytemuck::cast_slice(&cache))
+            .unwrap();
+        let mut bindings = Bindings::new();
+        bindings
+            .bind(qi, qb.as_ref())
+            .bind(wi, wb.as_ref())
+            .bind(aw, ab.as_ref())
+            .bind(kc, kb.as_ref())
+            .bind(di, db.as_ref());
+        backend.execute(plan.as_ref(), &bindings).expect("execute");
+        let mut out = vec![0u8; rows * tk * 4];
+        backend.download(db.as_ref(), &mut out).unwrap();
+        let got: Vec<u32> = bytemuck::cast_slice::<u8, i32>(&out)
+            .iter()
+            .map(|v| *v as u32)
+            .collect();
+
+        // pos 0..3 see ONLY pool 0 -> its 4 members, then token-0 padding (idempotent under
+        // TopkMask, and every slot must be a valid index — no -1 sentinel).
+        for t in 0..4 {
+            assert_eq!(
+                &got[t * tk..t * tk + tk],
+                &[0, 1, 2, 3, 0, 0, 0, 0],
+                "row {t}"
+            );
+        }
+        // pos 4..7 see pools 0-1; pool 1 scores higher -> members first, pool 0 second.
+        for t in 4..8 {
+            assert_eq!(
+                &got[t * tk..t * tk + tk],
+                &[4, 5, 6, 7, 0, 1, 2, 3],
+                "row {t}"
+            );
+        }
+        // pos 8 adds the incomplete tail pool (score 0.5, between the other two) -> pool 1 then
+        // pool 0; the tail pool is visible but never wins here.
+        assert_eq!(
+            &got[8 * tk..8 * tk + tk],
+            &[4, 5, 6, 7, 0, 1, 2, 3],
+            "row 8"
+        );
+    }
+
+    // The tail pool's MISSING members clamp to the last real token (every emitted index stays
+    // < kv_len, which TopkMask asserts) and the pooled mean divides by the FULL kpool (the
+    // reference's zeroed dump row joins the softmax with key = 0).
+    #[test]
+    fn glm_kpool_indexer_tail_pool_clamps_members() {
+        let (kv_len, kp, tk) = (10usize, 4usize, 4usize); // budget = ONE pool
+        let (nh, hd) = (1usize, 2usize);
+        let rows = 1usize; // query at pos 9 -> all three pools visible
+                           // NB: `pos` is the ROW-0 position (the LightningIndexer convention), so the query at
+                           // row 0 sits at `pos` itself — pos 8, not 9.
+        let mut cache = vec![0f32; kv_len * 2 * hd];
+        for t in 0..kv_len {
+            let v = match t / kp {
+                0 => 1.0,
+                1 => 2.0,
+                _ => 3.0, // tail pool scores HIGHEST
+            };
+            for d in 0..hd {
+                cache[t * 2 * hd + d] = v;
+            }
+        }
+        let q = vec![1f32; rows * nh * hd];
+        let w = vec![1f32; rows * nh];
+        let ape = vec![0f32; kp * hd];
+        let backend = CpuBackend::new();
+        let mut g = Graph::new();
+        let qi = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+        let wi = g.input(TensorDesc::new(vec![rows, nh], DType::F32));
+        let aw = g.weight(TensorDesc::new(vec![kp * hd], DType::F32));
+        let kc = g.input(TensorDesc::new(vec![kv_len * 2 * hd], DType::F32));
+        let di = g.output(TensorDesc::new(vec![rows * tk], DType::I32));
+        g.push(Op::GlmKpoolIndexer {
+            q: qi,
+            k_cache: kc,
+            ape: aw,
+            weights: wi,
+            dst: di,
+            rows: rows as u32,
+            kv_len: kv_len as u32,
+            n_head: nh as u32,
+            head_dim: hd as u32,
+            kpool: kp as u32,
+            top_k: tk as u32,
+            scale: 1.0,
+            pos: 8,
+        });
+        let plan = backend.compile(&g).expect("compile");
+        let qb = backend
+            .alloc(q.len() * 4, BufferUsage::Activations)
+            .unwrap();
+        let wb = backend
+            .alloc(w.len() * 4, BufferUsage::Activations)
+            .unwrap();
+        let ab = backend.alloc(ape.len() * 4, BufferUsage::Weights).unwrap();
+        let kb = backend
+            .alloc(cache.len() * 4, BufferUsage::KvCache)
+            .unwrap();
+        let db = backend.alloc(rows * tk * 4, BufferUsage::Readback).unwrap();
+        backend
+            .upload(qb.as_ref(), bytemuck::cast_slice(&q))
+            .unwrap();
+        backend
+            .upload(wb.as_ref(), bytemuck::cast_slice(&w))
+            .unwrap();
+        backend
+            .upload(ab.as_ref(), bytemuck::cast_slice(&ape))
+            .unwrap();
+        backend
+            .upload(kb.as_ref(), bytemuck::cast_slice(&cache))
+            .unwrap();
+        let mut bindings = Bindings::new();
+        bindings
+            .bind(qi, qb.as_ref())
+            .bind(wi, wb.as_ref())
+            .bind(aw, ab.as_ref())
+            .bind(kc, kb.as_ref())
+            .bind(di, db.as_ref());
+        backend.execute(plan.as_ref(), &bindings).expect("execute");
+        let mut out = vec![0u8; rows * tk * 4];
+        backend.download(db.as_ref(), &mut out).unwrap();
+        let got: Vec<u32> = bytemuck::cast_slice::<u8, i32>(&out)
+            .iter()
+            .map(|v| *v as u32)
+            .collect();
+        // The winning tail pool emits 8, 9, then 9, 9 — the missing members clamp to the last
+        // real token instead of running past kv_len.
+        // The reference's zeroed dump row joins the softmax with key = 0, so the pooled mean
+        // divides by the FULL kpool: tail = (8+9)/4 = 4.25 < pool 1's 2.0 — the tail pool is
+        // visible but loses, and pool 1 wins the single slot.
+        assert_eq!(&got[..], &[4, 5, 6, 7]);
     }
 }
