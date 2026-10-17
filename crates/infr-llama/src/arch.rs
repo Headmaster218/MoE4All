@@ -55,6 +55,18 @@ pub const QWEN4EXP: &str = "qwen4exp";
 /// one or more dense lead layers. Covers the 24-layer Tiny and 42-layer Flash variants. KDA is a
 /// distinct recurrent operator; MLA and MoE reuse DeepSeek machinery where their layouts match.
 pub const BAILINGMOE3: &str = "bailingmoe3";
+/// GLM-5.3-Flash (`glm5next`, zai-org): a 46-block hybrid — 3 dense-lead blocks, then KDA
+/// linear-attention blocks and, every 4th block, an MLA block (NoPE: `rope.dimension_count = 0`,
+/// NO rotary anywhere) — with DeepSeek-V3.2-style lightning-indexer tensors PLUS a two-tensor
+/// key-pooling compressor (`indexer_compressor_{ape,gate}`, `kpool = 4`) on the MLA blocks,
+/// deepseek4-style hyper-connections (`hc_mult = 4`, Sinkhorn mixing, per-layer
+/// `hc_{attn,ffn}_{fn,base,scale}` triples, no model-level `output_hc_*`), a 288-expert sigmoid
+/// MoE (top-8, scale 2.5, renormalized, `exp_probs_b` bias, one shared expert, per-layer
+/// `swiglu_clamp`), and one NextN/MTP block (`nextn_predict_layers = 1`, tensors under
+/// `blk.45.nextn.*`). KDA carries TWO low-rank projections per gate (`ssm_f_a`+`ssm_f_b`,
+/// `ssm_g_a`+`ssm_g_b`) where Ling carries one. llama.cpp keeps it in its own model class
+/// (`src/models/glm5next.cpp`, merged #27773).
+pub const GLM5NEXT: &str = "glm5next";
 /// DiffusionGemma: block text-diffusion MoE on a Gemma-4 backbone (shares gemma4's heterogeneous
 /// per-layer dims, V-norm, freq_factors, softcap, sandwich norms), plus a per-layer DUAL FFN
 /// (dense GeGLU ∥ 128-expert MoE, summed) and encoder/decoder per-layer output scalars. See
@@ -169,4 +181,5 @@ pub const ALL: &[&str] = &[
     QWEN35_MOE,
     QWEN4EXP,
     BAILINGMOE3,
+    GLM5NEXT,
 ];
