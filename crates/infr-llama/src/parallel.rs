@@ -1149,11 +1149,24 @@ impl ParallelSeam {
             // after the resident chains. `spec` (the RAM tier budget) lands with Phase C's DMA
             // pool. The arena is sharded (~2 GiB ReBAR pieces), so this request arrives as one
             // corridor at small ctx and as several when it exceeds a shard's largest free gap.
-            let vram_frames = n_slots * meta.max_ctx.div_ceil(page_tokens);
-            let corridors = Backend::alloc_kv_frames(self.vk.as_ref(), frame_bytes, vram_frames)?
+            let budget_frames = n_slots * meta.max_ctx.div_ceil(page_tokens);
+            let corridors = Backend::alloc_kv_frames(self.vk.as_ref(), frame_bytes, budget_frames)?
                 .ok_or_else(|| {
-                anyhow!("the unified VRAM arena cannot fit the KV frame corridor")
-            })?;
+                    anyhow!("the unified VRAM arena cannot fit the KV frame corridor")
+                })?;
+            // The corridor tiling rounds every physical shard piece down to whole frames, so under
+            // fragmentation the backend can place fewer frames than the budget. Trust what was
+            // actually installed (FramePool::set_segments asserts capacity == corridor frames);
+            // fewer frames only means cold tree entries evict earlier.
+            let vram_frames: usize = corridors.iter().map(|corridor| corridor.frames).sum();
+            if vram_frames < budget_frames {
+                tracing::warn!(
+                    budget_frames,
+                    placed_frames = vram_frames,
+                    corridors = corridors.len(),
+                    "paged KV frame pool is smaller than the full ctx budget; cold tree entries evict earlier"
+                );
+            }
             let mut tree = PagedKv::new(frame_bytes, page_tokens, plane_offsets, vram_frames, 0);
             tree.set_vram_segments(&corridors);
             tracing::info!(

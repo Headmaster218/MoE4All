@@ -944,14 +944,12 @@ fn free_gaps(pieces: &[ArenaPiece], blockers: &[PlannedRange]) -> Vec<ArenaPiece
 
 /// Tile `total` bytes of `frame_bytes`-sized frames across `gaps`, largest gap first: pack the
 /// biggest chunks where there is room, then the leftovers into smaller tails. Returns the per-gap
-/// chunks (each a whole number of frames, starting at its gap's aligned offset), or `None` when the
-/// gaps cannot hold the whole request. The stored reservation is re-sorted by coordinate on read, so
-/// the largest-first order here is only for keeping the tiling dense.
-fn plan_kv_tiling(
-    gaps: &[ArenaPiece],
-    total: usize,
-    frame_bytes: usize,
-) -> Option<Vec<PlannedRange>> {
+/// chunks (each a whole number of frames, starting at its gap's aligned offset). The plan is
+/// best-effort: when the gaps cannot hold the whole request it still returns every whole frame that
+/// fits, so the caller can degrade the frame count instead of refusing to start. The stored
+/// reservation is re-sorted by coordinate on read, so the largest-first order here is only for
+/// keeping the tiling dense.
+fn plan_kv_tiling(gaps: &[ArenaPiece], total: usize, frame_bytes: usize) -> Vec<PlannedRange> {
     let mut ordered = gaps.to_vec();
     ordered.sort_unstable_by_key(|gap| std::cmp::Reverse(gap.end - gap.start));
     let mut ranges = Vec::new();
@@ -973,7 +971,7 @@ fn plan_kv_tiling(
         });
         remaining -= len;
     }
-    (remaining == 0).then_some(ranges)
+    ranges
 }
 
 fn ranges_overlap(a_offset: usize, a_len: usize, b_offset: usize, b_len: usize) -> bool {
@@ -1645,6 +1643,10 @@ impl UnifiedVramPool {
     /// must itself be `UNIFIED_ALIGN`-aligned), one per gap, largest gap first. The returned ranges
     /// are consumed exactly like [`Self::reserve_kv_layout`]'s single range: the caller installs each
     /// as a corridor and keeps frame indices global across the split.
+    ///
+    /// Alignment can leave the request a frame or two short even when raw bytes suffice — each gap
+    /// floors independently to a whole number of frames. In that case this returns the best-effort
+    /// layout (every frame that fits); only a corridor that cannot hold a single frame is an error.
     pub(crate) fn reserve_kv_layout_split(
         &self,
         total: usize,
@@ -1672,14 +1674,17 @@ impl UnifiedVramPool {
             layout.corridor_blockers(&live, &live_experts, protected_experts, &existing)?;
         let pieces = layout.physical_pieces(layout.kv_corridor());
         let gaps = free_gaps(&pieces, &blockers);
-        let Some(ranges) = plan_kv_tiling(&gaps, total, frame_bytes) else {
+        // Best-effort tiling: never more than requested, but possibly fewer whole frames when the
+        // gaps cannot hold the whole request. The caller degrades the frame count accordingly.
+        let ranges = plan_kv_tiling(&gaps, total, frame_bytes);
+        if ranges.is_empty() {
             let (free_bytes, largest_gap, gap_count) = gap_stats(&pieces, &blockers);
             return Err(be(format!(
-                "KV split reservation cannot tile {total} bytes of {frame_bytes}-byte frames in its \
-                 frozen arena corridor: available={free_bytes} bytes in {gap_count} gap(s), \
+                "KV split reservation cannot place a single {frame_bytes}-byte frame in its frozen \
+                 arena corridor: available={free_bytes} bytes in {gap_count} gap(s), \
                  largest_gap={largest_gap} bytes"
             )));
-        };
+        }
         let id = state.next_id;
         state.next_id = state
             .next_id
@@ -2474,7 +2479,7 @@ mod tests {
                 end: 1024,
             },
         ];
-        let ranges = plan_kv_tiling(&gaps, 1536, 256).expect("two gaps can tile the request");
+        let ranges = plan_kv_tiling(&gaps, 1536, 256);
         assert_eq!(
             ranges
                 .iter()
@@ -2482,11 +2487,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0, 0, 1024), (1, 0, 512)]
         );
-        // No single gap's whole-frame capacity can absorb one frame larger than every gap, and a
-        // request bigger than the total free space must fail rather than pretend it fits.
-        assert!(plan_kv_tiling(&gaps, 2048, 2048).is_none());
-        assert!(plan_kv_tiling(&gaps, 4096, 256).is_none());
-        assert!(plan_kv_tiling(&[], 256, 256).is_none());
+        // Best-effort: a frame larger than every gap yields nothing, while an over-sized request
+        // returns every whole frame that fits (2048 of the 4096 asked) instead of failing outright.
+        assert!(plan_kv_tiling(&gaps, 2048, 2048).is_empty());
+        assert_eq!(
+            plan_kv_tiling(&gaps, 4096, 256)
+                .iter()
+                .map(|r| r.len)
+                .sum::<usize>(),
+            2048
+        );
+        assert!(plan_kv_tiling(&[], 256, 256).is_empty());
     }
 
     #[test]
