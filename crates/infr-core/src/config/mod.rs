@@ -194,11 +194,30 @@ cfg_struct! {
         session_cache_max: SizeSpec = SizeSpec::Bytes(5u64 << 30),
         /// Remove cold sessions older than this many hours while opening/maintaining the cache.
         session_cache_ttl_hours: u64 = 24,
+        /// `INFR_KV_RAM_CACHE_MAX`: byte ceiling of the host-RAM radix-tree prefix cache that
+        /// holds idle conversation KV (SGLang-style two-tier: VRAM slots over a RAM snapshot
+        /// pool, never written to disk). Percentages resolve against total physical RAM, like
+        /// `device.ram_budget`. `None`/zero keeps the established behavior; when set it takes
+        /// precedence over `session_cache_dir` (the disk tier stays closed).
+        ram_cache_max: Option<SizeSpec> = None,
         /// `INFR_NO_KV_RING` (inverted): the SWA ring cache.
         ring: bool = true,
         /// Lazily commit supported Qwen KV caches in 32K-token increments. Backends/models without
         /// segmented addressing retain their existing flat allocation.
         dynamic: bool = true,
+        /// `INFR_KV_PAGED_PAGE_TOKENS`: tokens per physical KV segment (page). The segmented
+        /// machinery addresses planes through a runtime device table, so the page size is pure
+        /// geometry — 32768 (default) reproduces the legacy 32K growth step byte-for-byte, while
+        /// small power-of-two pages (e.g. 64) are the prerequisite for SGLang-style frame sharing
+        /// and DMA tiering. Must be a power of two and a multiple of every layer's QSA
+        /// compression ratio.
+        paged_page_tokens: usize = 32 * 1024,
+        /// `INFR_KV_PAGED_CACHE_MAX`: byte ceiling of the host-RAM frame pool backing the paged
+        /// KV cache (VRAM frames + RAM frames form one logical address space; evicted prefixes
+        /// stay resident in RAM instead of being dropped). Percentages resolve against total
+        /// physical RAM, like `device.ram_budget`. `None`/zero disables the RAM tier; only
+        /// meaningful together with small [`KvCfg::paged_page_tokens`].
+        paged_cache_max: Option<SizeSpec> = None,
         /// `INFR_KV_INLINE`.
         inline_decode: bool = false,
         /// `INFR_KV_COOPMAT_BDA`.

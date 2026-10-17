@@ -1063,6 +1063,10 @@ fn no_infr_env_reads_outside_the_config_layer() {
         "INFR_NO_MOE_SHARED_SLOT",
         "INFR_IMAGE_CODEC_DIR",
         "INFR_IMAGE_CODEC_FIXTURES",
+        // Chrome-trace dump filters read directly by infr-vulkan/src/timeline.rs: they shape
+        // trace output only, carry no runtime semantics, and are accounted in NOT_MIGRATED.
+        "INFR_TIMELINE_RAW_KERNELS",
+        "INFR_TIMELINE_RAW_UNKNOWN",
     ];
 
     let Some(crates) = repo_crates_dir() else {
@@ -1663,6 +1667,9 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_KV_SESSION_IDLE_SECS",
         "INFR_KV_SESSION_CACHE_MAX",
         "INFR_KV_SESSION_CACHE_TTL_HOURS",
+        "INFR_KV_RAM_CACHE_MAX",
+        "INFR_KV_PAGED_PAGE_TOKENS",
+        "INFR_KV_PAGED_CACHE_MAX",
     ];
 
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();

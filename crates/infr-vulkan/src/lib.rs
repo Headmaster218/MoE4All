@@ -73,7 +73,9 @@ use gpu_allocator::vulkan::{
 use gpu_allocator::MemoryLocation;
 
 use infr_core::{
-    backend::{Bindings, Buffer, BufferUsage, Capabilities, Plan, SegmentedKvSpec},
+    backend::{
+        Bindings, Buffer, BufferUsage, Capabilities, KvFrameCorridor, Plan, SegmentedKvSpec,
+    },
     budget::{spill_report_line, SpillNouns, SpillTally},
     config::Config,
     error::Result,
@@ -2598,6 +2600,10 @@ pub struct VulkanBackend {
     /// Auxiliary-engine allocation routing. `None` keeps every established LLM allocation path;
     /// an Embedding fork sends only weights and graph activations into the shared elastic arena.
     unified_client: Option<UnifiedClient>,
+    /// Paged-KV frame corridors (see [`Backend::alloc_kv_frames`]): (device base, corridor buffer).
+    /// The buffer holds the arena lease that keeps every frame address valid; dropping it while a
+    /// session table still points inside is a use-after-free, so release happens only at shutdown.
+    kv_corridors: Mutex<Vec<(u64, VkBuffer)>>,
     /// The engine configuration this backend reads its knobs from — one value, held for the
     /// backend's whole life, borrowed (never cloned) at every read site (`docs/config-plan.md`
     /// R4/R6).
@@ -4607,6 +4613,7 @@ impl VulkanBackend {
             unified_phase_id: UnifiedPhaseRegistry::PRIMARY_ID,
             auxiliary_runtime_reaper: None,
             unified_client: None,
+            kv_corridors: Mutex::new(Vec::new()),
             cfg,
             shared: Arc::new(VulkanShared {
                 _entry: entry,
@@ -6018,6 +6025,7 @@ impl VulkanBackend {
             unified_phase_id,
             auxiliary_runtime_reaper: Some(auxiliary_runtime_reaper),
             unified_client: Some(client),
+            kv_corridors: Mutex::new(Vec::new()),
             cfg: Arc::clone(&self.cfg),
             shared: Arc::clone(&self.shared),
         })
@@ -6086,6 +6094,27 @@ impl VulkanBackend {
             sub_offset: range.offset,
             own_addr: None,
             act_bytes: 0,
+        })
+    }
+
+    /// Install one claimed unified-arena run as a KV frame corridor: sub-buffer it (which owns the
+    /// arena lease), record its device base and hold the buffer so the lease outlives the paged
+    /// cache, and report the whole-frame extent for the caller's global slot accounting.
+    fn install_kv_corridor(
+        &self,
+        handle: Arc<crate::unified::UnifiedAllocationHandle>,
+        bytes: usize,
+        frame_bytes: usize,
+    ) -> Result<KvFrameCorridor> {
+        debug_assert!(frame_bytes > 0 && bytes.is_multiple_of(frame_bytes));
+        let buffer = self.unified_sub_buffer(handle, bytes)?;
+        let base = buffer
+            .device_addr()
+            .ok_or_else(|| be("KV frame corridor has no device address"))?;
+        self.kv_corridors.lock().unwrap().push((base, buffer));
+        Ok(KvFrameCorridor {
+            base,
+            frames: bytes / frame_bytes,
         })
     }
 
@@ -7708,6 +7737,156 @@ impl Backend for VulkanBackend {
             *segmented.reservation.lock().unwrap() = None;
             Ok(())
         })
+    }
+
+    fn alloc_kv_frames(
+        &self,
+        frame_bytes: u64,
+        count: usize,
+    ) -> Result<Option<Vec<KvFrameCorridor>>> {
+        // One arena transaction per corridor, sliced into fixed-size frames by the caller's
+        // FramePool bookkeeping. A single lease per segment is deliberate: per-frame arena claims
+        // would reintroduce exactly the external fragmentation the fixed-frame design removes, and
+        // the whole space is claimed at cache init (never lazily), so expert/KV reclaim pressure is
+        // paid once, not per page. The unified arena is built from ~2 GiB ReBAR shard pieces, so a
+        // space larger than one shard's largest free gap (ctx 262144 wants 4.31 GiB) is claimed as
+        // several corridors in one transaction, never as one impossible contiguous run.
+        let total = (frame_bytes as usize)
+            .checked_mul(count)
+            .ok_or_else(|| be("KV frame corridor size overflow"))?;
+        if total == 0 || count == 0 {
+            return Err(be(
+                "KV frame corridor needs a non-zero frame count and size",
+            ));
+        }
+        let frame_bytes = frame_bytes as usize;
+        let corridors = self.with_unified_exclusive(|| -> Result<Vec<KvFrameCorridor>> {
+            let pool = self
+                .unified_vram()
+                .ok_or_else(|| be("KV frame corridor lost its unified VRAM arena"))?;
+            let mut corridors = Vec::new();
+            if pool.expert_layout().is_some() {
+                let protected = self.protected_unified_experts();
+                let owner =
+                    self.unified_phases
+                        .claim_with_reclaim(self.unified_phase_id, || {
+                            // Fast path: one contiguous corridor, the common small-ctx case. A request
+                            // that exceeds a shard gap can never be one claim, so it falls back to
+                            // tiling the free gaps of the KV corridor.
+                            match pool.reserve_kv_layout(&[total], &protected) {
+                                Ok(owner) => Ok(owner),
+                                Err(_) => {
+                                    pool.reserve_kv_layout_split(total, frame_bytes, &protected)
+                                }
+                            }
+                        })?;
+                let ranges = owner.ranges().to_vec();
+                if ranges.is_empty() {
+                    return Err(be("KV frame corridor reservation returned no range"));
+                }
+                for range in &ranges {
+                    if range.len == 0 || !range.len.is_multiple_of(frame_bytes) {
+                        return Err(be(
+                            "KV frame corridor segment is not a whole number of frames",
+                        ));
+                    }
+                }
+                // Split tiling rounds each physical shard piece down to whole frames independently,
+                // so the request can land a frame or two short even when the corridor holds enough
+                // raw bytes. Degrading the frame count is safe: the pool is simply smaller, and
+                // PagedKv evicts cold entries earlier (its Phase B exhaustion path).
+                let placed: usize = ranges.iter().map(|range| range.len).sum();
+                if placed < total {
+                    tracing::warn!(
+                        requested_frames = count,
+                        placed_frames = placed / frame_bytes,
+                        corridors = ranges.len(),
+                        "paged KV frame pool degraded by arena fragmentation"
+                    );
+                }
+                let mut plan =
+                    self.unified_phases
+                        .claim_with_reclaim(self.unified_phase_id, || {
+                            pool.plan_exact_owner_claim(
+                                &ranges,
+                                crate::unified::UnifiedVramClass::KvCache,
+                                &protected,
+                            )
+                        })?;
+                if !plan.victims().is_empty() && self.quiesce_decode_prefetch_for_vram_claim()? {
+                    let protected = self.protected_unified_experts();
+                    plan = self
+                        .unified_phases
+                        .claim_with_reclaim(self.unified_phase_id, || {
+                            pool.plan_exact_owner_claim(
+                                &ranges,
+                                crate::unified::UnifiedVramClass::KvCache,
+                                &protected,
+                            )
+                        })?;
+                }
+                let handles = self.commit_unified_claim_locked(&pool, plan)?;
+                if handles.len() != ranges.len() {
+                    return Err(be(
+                        "KV frame corridor claim returned the wrong segment count",
+                    ));
+                }
+                for (handle, range) in handles.into_iter().zip(ranges.iter()) {
+                    let corridor = self.install_kv_corridor(handle, range.len, frame_bytes)?;
+                    corridors.push(corridor);
+                }
+            } else {
+                let handle =
+                    self.unified_phases
+                        .claim_with_reclaim(self.unified_phase_id, || {
+                            pool.allocate(total, crate::unified::UnifiedVramClass::KvCache)
+                                .ok_or_else(|| {
+                                    be("generic unified VRAM cannot fit the KV frame corridor")
+                                })
+                        })?;
+                let corridor = self.install_kv_corridor(handle, total, frame_bytes)?;
+                corridors.push(corridor);
+            }
+            Ok(corridors)
+        })?;
+        Ok(Some(corridors))
+    }
+
+    fn set_kv_table_entry(&self, buffer: &dyn Buffer, page: usize, addr: u64) -> Result<()> {
+        let segmented = as_segmented_kv(buffer)
+            .ok_or_else(|| be("set_kv_table_entry received a flat or foreign buffer"))?;
+        if page >= segmented.spec.max_segments {
+            return Err(be(format!(
+                "paged KV table write at page {page}, but the plane holds only {}",
+                segmented.spec.max_segments
+            )));
+        }
+        let table_ptr = segmented
+            .table
+            .mapped_ptr()
+            .ok_or_else(|| be("segmented KV address table is not host-visible"))?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                addr.to_ne_bytes().as_ptr(),
+                table_ptr.add(page * std::mem::size_of::<u64>()),
+                std::mem::size_of::<u64>(),
+            );
+        }
+        Ok(())
+    }
+
+    fn free_kv_frames(&self, corridors: &[KvFrameCorridor]) -> Result<()> {
+        let mut installed = self.kv_corridors.lock().unwrap();
+        for corridor in corridors {
+            let index = installed
+                .iter()
+                .position(|(addr, _)| *addr == corridor.base)
+                .ok_or_else(|| be("unknown KV frame corridor"))?;
+            // Dropping the corridor buffer releases its arena lease. Safe only when every frame's
+            // refcount reached zero — the engine tears the paged cache down before its slots.
+            installed.remove(index);
+        }
+        Ok(())
     }
 
     /// Copy `src` (host slice) into `dst` (device buffer).

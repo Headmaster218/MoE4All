@@ -1,7 +1,7 @@
 //! Per-layer weight handles + the persistent seam session state ([`SeamKv`]/[`SeamWeights`]).
 //! Pure-move split of `seam.rs` — see `super` for the module overview.
 use super::sc::{DenoiseCache, SelfCondWeights};
-use super::segmented_kv::{PlaneKind, SegmentedKvLayout, KV_GROW_ROWS};
+use super::segmented_kv::{PlaneKind, SegmentedKvLayout};
 use super::{common_prefix_len, kv_fmt_bytes};
 use crate::Config;
 use anyhow::{anyhow, Result as AResult};
@@ -535,19 +535,32 @@ impl QwenMtpVerifyBuffers {
 #[derive(Default)]
 pub(super) struct SegmentedKvState {
     pub(super) enabled: bool,
+    /// Tokens per physical segment (page). Carried on the slot so depth commits and session
+    /// release rebuild the exact same geometry without threading `EngineConfig` everywhere.
+    pub(super) page_tokens: usize,
     pub(super) committed_tokens: usize,
+    /// Paged radix tier (`kv.paged_cache_max`): the engine-wide frame pool + tree. `None` keeps
+    /// the blob path (arena-committed segments per slot) byte-for-byte.
+    pub(super) paged: Option<std::sync::Arc<std::sync::Mutex<crate::paged_cache::PagedKv>>>,
+    /// The frames this slot's page table points at, one per committed page, POSITIONAL from
+    /// token 0 — the same chain form the radix tree publishes, so a demote/attach swap is a
+    /// Vec move plus table writes, never a byte copy.
+    pub(super) chain: Vec<super::kv_frame_pool::FrameId>,
 }
 
 impl SegmentedKvState {
-    pub(super) fn enabled() -> Self {
+    pub(super) fn enabled(page_tokens: usize) -> Self {
         Self {
             enabled: true,
+            page_tokens,
             committed_tokens: 0,
+            paged: None,
+            chain: Vec::new(),
         }
     }
 
     /// Commit every per-token plane through `tokens`. The fast path is one comparison; allocation
-    /// and address-table updates happen only when a call crosses a 32K-token boundary.
+    /// and address-table updates happen only when a call crosses a page boundary.
     pub(super) fn ensure_depth(
         &mut self,
         be: &dyn Backend,
@@ -569,7 +582,7 @@ impl SegmentedKvState {
                 "KV depth {tokens} exceeds the session capacity {max_ctx}"
             ));
         }
-        let layout = SegmentedKvLayout::for_qwen(cfg, max_ctx, k_fmt, v_fmt)
+        let layout = SegmentedKvLayout::for_qwen(cfg, max_ctx, k_fmt, v_fmt, self.page_tokens)
             .ok_or_else(|| anyhow!("segmented KV enabled for a non-Qwen session"))?;
         let segments = layout.segments_for_tokens(tokens);
         let buffers: Vec<&dyn Buffer> = layout
@@ -588,9 +601,32 @@ impl SegmentedKvState {
                 })
             })
             .collect::<AResult<_>>()?;
+        if let Some(paged) = &self.paged {
+            // Paged tier: growth is a corridor frame claim + one table write per plane. No arena
+            // segment is ever committed for this slot — the frames are shared by refcount with
+            // the radix tree, so the blob reservation/loan machinery must not see them.
+            let mut kv = paged
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            while self.chain.len() < segments {
+                let page = self.chain.len();
+                let frame = kv.alloc_frame().ok_or_else(|| {
+                    anyhow!("paged KV corridor exhausted at page {page} (every frame is owned by a live session)")
+                })?;
+                for (plane, &buffer) in buffers.iter().enumerate() {
+                    be.set_kv_table_entry(buffer, page, kv.plane_addr(frame, plane))
+                        .map_err(|e| {
+                            anyhow!("paged KV table write at page {page} plane {plane}: {e}")
+                        })?;
+                }
+                self.chain.push(frame);
+            }
+            self.committed_tokens = (segments * self.page_tokens).min(max_ctx);
+            return Ok(());
+        }
         be.ensure_segmented_kv_batch(&buffers, segments)
             .map_err(|e| anyhow!("commit segmented KV growth transaction: {e}"))?;
-        self.committed_tokens = (segments * KV_GROW_ROWS).min(max_ctx);
+        self.committed_tokens = (segments * self.page_tokens).min(max_ctx);
         tracing::info!(
             requested_tokens = tokens,
             committed_tokens = self.committed_tokens,
@@ -610,6 +646,12 @@ impl SegmentedKvState {
         qsa_cbufs: &[Option<Box<dyn Buffer>>],
     ) -> AResult<()> {
         if !self.enabled {
+            return Ok(());
+        }
+        if self.paged.is_some() {
+            // Paged frames can be shared with the radix tree (or a second session); zeroing the
+            // committed byte range would clobber another owner's conversation. The paged path
+            // never clears in place — a fresh session overwrites rows through its own chain.
             return Ok(());
         }
         for layer in 0..cfg.n_layer {
@@ -1177,6 +1219,12 @@ impl SeamKv {
         &self.cached
     }
 
+    /// Paged tier: does this slot still own corridor frames (a published chain, or warm-reuse
+    /// frames past a `reset()`)? A paged attach needs an empty chain; see `checkout_with_paged_cache`.
+    pub(crate) fn paged_holds_frames(&self) -> bool {
+        !self.segmented_kv.chain.is_empty()
+    }
+
     /// Forget the materialized tokens (the KV rows become dead; the next prompt prefills from
     /// row 0). Used to discard a warmup generation without dropping the slot's buffers.
     pub(crate) fn reset(&mut self) {
@@ -1535,8 +1583,14 @@ impl SeamKv {
         let mut qsa_kbufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
         let mut qsa_cbufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
         let segmented_layout = self.segmented_kv.enabled.then(|| {
-            SegmentedKvLayout::for_qwen(cfg, self.max_ctx, self.k_fmt, self.v_fmt)
-                .expect("a segmented Qwen slot keeps its Qwen geometry when forked")
+            SegmentedKvLayout::for_qwen(
+                cfg,
+                self.max_ctx,
+                self.k_fmt,
+                self.v_fmt,
+                self.segmented_kv.page_tokens,
+            )
+            .expect("a segmented Qwen slot keeps its Qwen geometry when forked")
         });
         for l in 0..cfg.n_layer {
             let (k_bytes, v_bytes) = crate::seam::layer_state_bytes(
@@ -1684,7 +1738,7 @@ impl SeamKv {
             qsa_kbufs,
             qsa_cbufs,
             segmented_kv: if self.segmented_kv.enabled {
-                SegmentedKvState::enabled()
+                SegmentedKvState::enabled(self.segmented_kv.page_tokens)
             } else {
                 SegmentedKvState::default()
             },

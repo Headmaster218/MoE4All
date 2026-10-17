@@ -19,8 +19,10 @@ pub(crate) use util::*;
 mod kv;
 pub use kv::MoeConfig;
 pub mod grammar;
+mod paged_cache;
 /// N-slot concurrent generation (`infr serve --parallel N`) — see [`parallel::ParallelSeam`].
 pub mod parallel;
+mod ram_cache;
 pub mod sampling;
 mod session_cache;
 pub use config::Config;

@@ -105,6 +105,13 @@ session_idle_secs = 120
 session_cache_max = "5GiB" # absolute size only; 0 disables the store
 session_cache_ttl_hours = 24 # 0 disables age expiry
 
+# Host-RAM prefix cache for idle conversations (SGLang-style radix tree over the VRAM slots):
+# a free slot's KV is demoted to RAM snapshots after `session_idle_secs` idle (or immediately
+# when a different-prefix request needs the slot) and restored on the next prefix hit. Never
+# written to disk; when set, it takes precedence over session_cache_dir. Percentages resolve
+# against total physical RAM. Requires the same dynamic Q8_0/Q8_0 Qwen KV as the disk store.
+# ram_cache_max = "16GiB" # e.g. "16GiB" or "25%"; unset/0 disables
+
 # The sliding-window ring cache (INFR_NO_KV_RING inverted).
 ring = true
 

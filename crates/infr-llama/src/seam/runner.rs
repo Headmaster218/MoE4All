@@ -1557,10 +1557,9 @@ fn finish_pending_seam_slot(
         vbufs,
         qsa_kbufs: pending.qsa_kbufs,
         qsa_cbufs: pending.qsa_cbufs,
-        segmented_kv: if segmented_layout.is_some() {
-            SegmentedKvState::enabled()
-        } else {
-            SegmentedKvState::default()
+        segmented_kv: match segmented_layout {
+            Some(layout) => SegmentedKvState::enabled(layout.page_tokens),
+            None => SegmentedKvState::default(),
         },
         k_fmt,
         v_fmt,
@@ -3031,7 +3030,7 @@ fn generate_dense_backend_inner(
             crate::seam::reclamp_ctx_to_live_room(be, c, ec, want_ctx, k_fmt, v_fmt)
         };
         let segmented_layout = segmented_kv.then(|| {
-            SegmentedKvLayout::for_qwen(c, want_ctx, k_fmt, v_fmt)
+            SegmentedKvLayout::for_qwen(c, want_ctx, k_fmt, v_fmt, ec.kv.paged_page_tokens)
                 .expect("Qwen hybrid models have segmented KV geometry")
         });
 
@@ -3351,10 +3350,9 @@ fn generate_dense_backend_inner(
             vbufs,
             qsa_kbufs,
             qsa_cbufs,
-            segmented_kv: if segmented_kv {
-                SegmentedKvState::enabled()
-            } else {
-                SegmentedKvState::default()
+            segmented_kv: match segmented_layout.as_ref() {
+                Some(layout) => SegmentedKvState::enabled(layout.page_tokens),
+                None => SegmentedKvState::default(),
             },
             k_fmt,
             v_fmt,
