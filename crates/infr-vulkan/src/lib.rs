@@ -7677,16 +7677,24 @@ impl Backend for VulkanBackend {
                     return Err(be("KV frame corridor reservation returned no range"));
                 }
                 for range in &ranges {
-                    if range.len != range.requested_len {
-                        return Err(be(
-                            "KV frame corridor reservation size differs from the request",
-                        ));
-                    }
                     if range.len == 0 || !range.len.is_multiple_of(frame_bytes) {
                         return Err(be(
                             "KV frame corridor segment is not a whole number of frames",
                         ));
                     }
+                }
+                // Split tiling rounds each physical shard piece down to whole frames independently,
+                // so the request can land a frame or two short even when the corridor holds enough
+                // raw bytes. Degrading the frame count is safe: the pool is simply smaller, and
+                // PagedKv evicts cold entries earlier (its Phase B exhaustion path).
+                let placed: usize = ranges.iter().map(|range| range.len).sum();
+                if placed < total {
+                    tracing::warn!(
+                        requested_frames = count,
+                        placed_frames = placed / frame_bytes,
+                        corridors = ranges.len(),
+                        "paged KV frame pool degraded by arena fragmentation"
+                    );
                 }
                 let mut plan =
                     self.unified_phases
