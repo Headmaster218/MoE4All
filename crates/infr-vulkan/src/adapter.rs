@@ -187,7 +187,7 @@ const MOE_SMALL_M: infr_core::tier::EnvRows = infr_core::tier::EnvRows {
 const MOE_ROW_MASK_NONE: u32 = 0;
 const MOE_ROW_MASK_HITS: u32 = 1;
 const MOE_ROW_MASK_MISSES: u32 = 2;
-const MOE_HIT_FIRST_MAX_ROWS: usize = 8;
+const MOE_HIT_FIRST_MAX_ROWS: usize = infr_core::backend::MAX_DECODE_ROWS;
 const MOE_HIT_FIRST_MAX_SLOTS: usize = MOE_HIT_FIRST_MAX_ROWS * u32::BITS as usize;
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -7123,6 +7123,21 @@ fn lower_op(
             }
             rec.gather_i32(r(*table)?, r(*ids)?, r(*dst)?, *rows as usize, *ne as usize);
         }
+        Op::SamplingPenalty {
+            x,
+            counts,
+            control,
+            n,
+            rows,
+        } => {
+            rec.sampling_penalty(
+                r(*x)?,
+                r(*counts)?,
+                r(*control)?,
+                *n as usize,
+                *rows as usize,
+            );
+        }
         Op::Sample {
             x,
             u,
@@ -8243,6 +8258,11 @@ pub(crate) fn execute_chain(
         return Ok(None);
     };
     if !plan.eligible
+        || plan
+            .graph
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::SamplingPenalty { .. }))
         || n == 0
         || n > 64
         || be_.unified_client.is_some()
@@ -10066,7 +10086,7 @@ impl ResidentMoeLayout {
             *n_expert as usize,
             *n_used as usize,
         );
-        if ne == 0 || n_ff_exp == 0 || graph.desc(*x).numel() % ne != 0 {
+        if ne == 0 || n_ff_exp == 0 || !graph.desc(*x).numel().is_multiple_of(ne) {
             return None;
         }
         let layout = Self {
@@ -14579,6 +14599,11 @@ mod tests {
                 n_expert: 512,
                 n_used: 10,
             },
+            super::ResidentMoeLayout {
+                rows: infr_core::backend::MAX_DECODE_ROWS,
+                n_expert: 512,
+                n_used: 16,
+            },
         ] {
             let count = layout.count();
             for miss_slot in 0..count {
@@ -14622,7 +14647,7 @@ mod tests {
                 n_used: 8,
             },
             super::ResidentMoeLayout {
-                rows: 5,
+                rows: infr_core::backend::MAX_DECODE_ROWS + 1,
                 n_expert: 256,
                 n_used: 8,
             },
@@ -14701,6 +14726,8 @@ mod tests {
             (1, 2048, 512, 256, 8, DType::Q6K),
             (2, 2048, 512, 256, 8, DType::Q6K),
             (4, 2560, 640, 512, 10, DType::Iq2S),
+            (8, 2560, 640, 512, 16, DType::Iq2S),
+            (8, 2048, 512, 256, 8, DType::Q6K),
             (1, 2048, 512, 256, 8, DType::F16),
             (1, 2048, 512, 256, 8, DType::F32),
         ] {
@@ -14721,7 +14748,16 @@ mod tests {
             );
         }
         for graph in [
-            resident_layout_graph(5, 2048, 512, 256, 8, DType::Q6K, false, false),
+            resident_layout_graph(
+                infr_core::backend::MAX_DECODE_ROWS + 1,
+                2048,
+                512,
+                256,
+                8,
+                DType::Q6K,
+                false,
+                false,
+            ),
             resident_layout_graph(2, 2048, 512, 256, 17, DType::Q6K, false, false),
             resident_layout_graph(1, 2048, 512, 256, 8, DType::Q6K, true, false),
             resident_layout_graph(1, 2048, 512, 256, 8, DType::Q6K, false, true),
@@ -14814,9 +14850,14 @@ mod tests {
                 if recovery_only && enabled && !(producer && (1..=2).contains(&submit_layers)) {
                     continue;
                 }
-                for (rows, mtp_verify) in
-                    [(1, false), (2, false), (3, false), (4, false), (4, true)]
-                {
+                for (rows, mtp_verify) in [
+                    (1, false),
+                    (2, false),
+                    (3, false),
+                    (4, false),
+                    (8, false),
+                    (4, true),
+                ] {
                     let mut cfg = infr_core::config::Config::default();
                     cfg.kernels.vulkan.decode_gpu_resident = enabled;
                     cfg.kernels.vulkan.decode_gpu_resident_layers = limit;
@@ -14840,6 +14881,11 @@ mod tests {
                     cfg.paging.host_dma = dma;
                     let backend = VulkanBackend::new_with(Arc::new(cfg)).unwrap();
                     let sizes = [GU, GU, DOWN, GU, GU, DOWN];
+                    // Each row can route ten distinct experts. The cache must hold both
+                    // Gate/Up roles for one complete eight-row dispatch before it may evict.
+                    // Retain an exchange spare and enough loanable arena for runtime scratch.
+                    let gu_slots = if rows > 4 { rows * 10 * 2 + 33 } else { 96 };
+                    let down_slots = if rows > 4 { rows * 10 + 17 } else { 48 };
                     let mut offset = 0;
                     let chunks = sizes.map(|bytes| {
                         let chunk = MoeHostChunkSpec {
@@ -14856,13 +14902,13 @@ mod tests {
                             pools: vec![
                                 MoePoolSpec {
                                     slot_bytes: GU,
-                                    n_slots: 96,
-                                    min_enabled_slots: 48,
+                                    n_slots: gu_slots,
+                                    min_enabled_slots: if rows > 4 { rows * 10 * 2 } else { 48 },
                                 },
                                 MoePoolSpec {
                                     slot_bytes: DOWN,
-                                    n_slots: 48,
-                                    min_enabled_slots: 24,
+                                    n_slots: down_slots,
+                                    min_enabled_slots: if rows > 4 { rows * 10 } else { 24 },
                                 },
                             ],
                             host_tier: None,
@@ -14879,7 +14925,7 @@ mod tests {
                                 })
                                 .collect(),
                             prefill_target_lanes: 1,
-                            prefill_cache_bytes: (GU * 96 + DOWN * 48) as u64,
+                            prefill_cache_bytes: (GU * gu_slots + DOWN * down_slots) as u64,
                         })
                         .unwrap();
                     let mut graph = Graph::new();

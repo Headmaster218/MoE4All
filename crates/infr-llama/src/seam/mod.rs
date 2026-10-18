@@ -327,8 +327,8 @@ fn cpu_paged_store(
 /// the same RAM that the GPU CANNOT read directly: every hit would still be copied through the
 /// staging ring, while the identical bytes spent on the arena above are read in place. It is not
 /// merely double-counted, it is strictly worse than making that arena bigger. So auto-sizing
-/// declines on unified memory and says why; an explicit `device.ram_budget` is still honoured,
-/// because a user asking for it by name may be working around something this does not model.
+/// declines on unified memory and says why. Canonical `device.ram_budget` limits the shared
+/// device arena instead; only the legacy exact-cache override may force a separate host cache.
 fn vulkan_host_tier(
     ec: &EngineConfig,
     g: &Gguf,
@@ -370,7 +370,7 @@ fn vulkan_host_tier(
                 "{what} host tier: streaming DISK -> GPU-accessible RAM with no host cache — \
                      this device's memory IS host memory, so the {} pool(s) above are already the \
                      only useful cache and a second one would hold bytes the GPU cannot read in \
-                     place. Raise INFR_CACHE to cache more; INFR_RAM_BUDGET forces a host arena",
+                     place. Raise paging.cache to cache more; legacy paging.dram forces a host arena",
                 classes.len(),
             );
             let mut out = Vec::with_capacity(classes.len());
@@ -3556,11 +3556,18 @@ fn moe_host_backing_for_device(
             })
             .unwrap_or(0),
     };
-    if unified && ram_request.is_automatic() {
+    if unified
+        && matches!(
+            ram_request,
+            infr_core::hostmem::RamRequest::Auto
+                | infr_core::hostmem::RamRequest::FrozenAutomaticBudget(_)
+                | infr_core::hostmem::RamRequest::TotalProcessBudget(_)
+        )
+    {
         return if requested_budget >= payload_bytes as u64 {
             MoeHostBacking::Mapped
         } else {
-            // The mapping cannot be kept resident inside the automatic process budget. Preserve
+            // The mapping cannot be kept resident inside the shared process budget. Preserve
             // the old direct file-streaming fallback instead of prefaulting the host into paging.
             MoeHostBacking::Bounded { bytes: 0 }
         };
@@ -4594,7 +4601,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         "MoE host plan: retained GGUF mapping below the unified-memory device arena; runtime misses copy from the OS page cache without a duplicate anonymous Host Store",
                     ),
                 }
-                if reclaimable_fixed_host_source_bytes > 0
+                // UMA uploads release only their source mappings; a process-wide trim could
+                // also evict GPU-resident shared RAM and undo the placement just completed.
+                if !vk.capabilities().unified_memory
+                    && reclaimable_fixed_host_source_bytes > 0
                     && should_trim_reclaimable_sources(host_backing)
                 {
                     let resident_before_trim = infr_core::hostmem::process_resident_bytes();
@@ -5304,6 +5314,11 @@ pub(crate) fn vulkan_moe_binder<'a>(
             .map_err(|e| anyhow!("{e}"))?;
         vk.upload(buf.as_ref(), &padded)
             .map_err(|e| anyhow!("{e}"))?;
+        if vk.capabilities().unified_memory {
+            // upload has copied the CPU source into its destination or an owned staging buffer.
+            // UMA must not retain another resident file-backed copy of every GPU weight.
+            tb.release_source_pages();
+        }
         Ok((buf, dt))
     });
     Ok((bind, finish_fixed_allocations))
@@ -6226,6 +6241,20 @@ pub(crate) enum WBytes {
 }
 
 impl WBytes {
+    fn release_source_pages(&self) {
+        match self {
+            WBytes::Mmap(tb) => {
+                tb.release_source_pages();
+            }
+            WBytes::Concat(parts) => {
+                for part in parts {
+                    part.release_source_pages();
+                }
+            }
+            WBytes::Owned(_) => {}
+        }
+    }
+
     /// Byte length, without materializing anything.
     pub(crate) fn len(&self) -> usize {
         match self {
@@ -6555,8 +6584,8 @@ mod seam_helper_tests {
                 None,
                 payload,
             ),
-            super::MoeHostBacking::Full,
-            "a genuinely explicit RAM budget remains authoritative on UMA"
+            super::MoeHostBacking::Mapped,
+            "an explicit total-process RAM budget must not create a second UMA expert store"
         );
     }
 

@@ -7,6 +7,15 @@ set -euo pipefail
 fail() { printf '%s\n' "$*" >&2; return 1; }
 need() { command -v "$1" >/dev/null || fail "Required system tool not found: $1"; }
 trim() { REPLY=$1; REPLY="${REPLY#"${REPLY%%[![:space:]]*}"}"; REPLY="${REPLY%"${REPLY##*[![:space:]]}"}"; }
+launcher_exit() {
+    local status=$1 ignored
+    trap - EXIT
+    if ((status != 0)) && [[ $status != 130 && $status != 143 && ${INTERACTIVE-false} == true && -t 0 ]]; then
+        printf '\nMoE4All launch failed (exit %d). Review the messages above.\nPress Enter to close: ' "$status" >&2
+        IFS= read -r ignored || true
+    fi
+    exit "$status"
+}
 
 # JSON.awk 1.4.2 (MIT), embedded so the launcher needs no separate parser.
 read -r -d '' JSON_PARSER <<'MOE4ALL_JSON_AWK' || true
@@ -932,7 +941,10 @@ physical_cores() {
 }
 choose_device() {
     local output line device name kind mark default='' entry found=false; local -a options=()
-    output=$("$BINARY" devices) || { fail 'Vulkan device enumeration failed; check the GPU driver.'; return 1; }
+    output=$("$BINARY" devices) || {
+        fail $'Vulkan device enumeration failed. Check the messages above, then run `./infr devices`.\nOn Intel/AMD Linux GPUs, install or update the matching Mesa Vulkan driver; mixed old/new Mesa libraries can also cause this failure.'
+        return 1
+    }
     while IFS= read -r line; do
         if [[ $line =~ ^[[:space:]]*(Vulkan[0-9]+):[[:space:]]+(.+)[[:space:]]+\[([^]]+)\](.*)$ ]]; then
             device=${BASH_REMATCH[1]}; name=${BASH_REMATCH[2]}; kind=${BASH_REMATCH[3]}; mark=${BASH_REMATCH[4]}
@@ -940,7 +952,10 @@ choose_device() {
             options+=("$device|$device: $name [$kind]"); [[ $mark != *default* ]] || default=$device
         fi
     done <<< "$output"
-    ((${#options[@]}>0)) || { fail 'No Vulkan GPU found; check the GPU driver.'; return 1; }
+    ((${#options[@]}>0)) || {
+        fail $'No usable Vulkan GPU was found. Run `./infr devices` and `vulkaninfo --summary` to inspect the system driver.\nA "Driver does not support the ... PCI ID" warning is a Mesa/Intel driver mismatch, not a model-path error.'
+        return 1
+    }
     [[ -n $default ]] || default=${options[0]%%|*}
     for entry in "${options[@]}"; do [[ ${S[device]} != "${entry%%|*}" ]] || found=true; done
     [[ $found == true ]] || S[device]=$default
@@ -1228,6 +1243,7 @@ apply_update() (
     json_get '["version"]' || exit 1; old_version=$REPLY
     version_newer "$version" "$old_version" || { fail 'Refusing a downgrade or same-version replacement.'; exit 1; }
     validate_package "$stage" "$version" || { fail 'Invalid staged package; no files changed.'; exit 1; }
+    bash -n "$stage/Start-INFR-Wizard-Linux.sh" || { fail 'Invalid staged launcher; no files changed.'; exit 1; }
     files=("${FILES[@]}" install-manifest.json)
     for name in "${files[@]}"; do safe_target "$root" "$name" || { fail 'Unsafe install destination; no files changed.'; exit 1; }; done
     if engine_running "$root/infr"; then fail 'Stop the running engine before updating; no files changed.'; exit 1; fi
@@ -1260,12 +1276,16 @@ apply_update() (
     done
     actual=$("$root/infr" --version) || exit 1
     [[ $actual == "infr $version" ]] || exit 1
+    bash -n "$root/Start-INFR-Wizard-Linux.sh" || exit 1
     success=true
 )
 fetch_url() {
-    local url=$1 output=$2 maximum=$3 seconds=${4-600}
+    local url=$1 output=$2 maximum=$3 seconds=${4-600} progress=${5-false}
+    local -a curl_args=(-fL --proto '=https' --proto-redir '=https' --connect-timeout 5 --max-time "$seconds" --max-filesize "$maximum" -H 'Accept: application/vnd.github+json' -H 'User-Agent: MoE4All-Linux-Wizard' -o "$output")
     [[ $url == https://api.github.com/repos/Headmaster218/MoE4All/releases\?per_page=100 || $url =~ ^https://github\.com/Headmaster218/MoE4All/releases/download/release-[0-9]+\.[0-9]+\.[0-9]+/MoE4All-Linux-x86_64-v[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz(\.sha256)?$ ]] || return 1
-    curl -fLsS --proto '=https' --proto-redir '=https' --connect-timeout 5 --max-time "$seconds" --max-filesize "$maximum" -H 'Accept: application/vnd.github+json' -H 'User-Agent: MoE4All-Linux-Wizard' -o "$output" "$url" || return 1
+    if [[ $progress == true && -t 2 ]]; then curl_args+=(--show-error --progress-bar)
+    else curl_args+=(-sS); fi
+    curl "${curl_args[@]}" "$url" || return 1
     [[ $(wc -c < "$output") -le $maximum ]]
 }
 select_release() {
@@ -1293,7 +1313,8 @@ select_release() {
     [[ -n $RELEASE_VERSION ]]
 }
 download_update() (
-    local root=$1 version=$RELEASE_VERSION temp name="MoE4All-Linux-x86_64-v$RELEASE_VERSION.tar.gz" hash filename extra actual
+    local root=$1 relaunch=${2-true} version=$RELEASE_VERSION temp name="MoE4All-Linux-x86_64-v$RELEASE_VERSION.tar.gz" hash filename extra actual
+    [[ $relaunch == true || $relaunch == false ]] || { fail 'Invalid updater relaunch mode.'; exit 1; }
     [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || { fail 'Updating supports Linux x86_64 only.'; exit 1; }
     need flock || exit 1; need tar || exit 1; need sha256sum || exit 1
     [[ ! -L $root/.moe4all-update.lock ]] || { fail 'Refusing a symlinked update lock.'; exit 1; }
@@ -1303,12 +1324,20 @@ download_update() (
     fetch_url "$RELEASE_CHECKSUM" "$temp/checksum" 4096 || exit 1
     read -r hash filename extra < "$temp/checksum" || exit 1
     [[ $hash =~ ^[0-9a-fA-F]{64}$ && ${filename#\*} == "$name" && -z $extra ]] || { fail 'Malformed release checksum.'; exit 1; }
-    fetch_url "$RELEASE_ARCHIVE" "$temp/$name" 1073741824 || exit 1
+    fetch_url "$RELEASE_ARCHIVE" "$temp/$name" 1073741824 600 true || exit 1
     actual=$(sha256sum -- "$temp/$name"); actual=${actual%% *}
     [[ $actual == "${hash,,}" ]] || { fail 'Release checksum mismatch; no files changed.'; exit 1; }
     extract_package "$temp/$name" "$temp/files" "$version" || { fail 'Invalid release archive; no files changed.'; exit 1; }
     apply_update "$root" "$temp/files" "$version" || exit 1
-    printf 'Update complete. Run the launcher again.\n'
+    if [[ $relaunch == true ]]; then
+        printf 'Update complete. Restarting the updated launcher...\n'
+        trap - EXIT
+        rm -rf -- "$temp"
+        flock -u 9
+        exec 9>&-
+        exec bash "$root/Start-INFR-Wizard-Linux.sh" --skip-update-check
+    fi
+    printf 'Update complete.\n'
 )
 check_updates() (
     local mode=$1 current temp
@@ -1405,7 +1434,8 @@ main() {
     if [[ -n $UPDATE_MODE ]]; then check_updates "$UPDATE_MODE"; return; fi
     if [[ $INTERACTIVE == true && $SKIP_UPDATE == false && ! ${MOE4ALL_NO_UPDATE_CHECK-} =~ ^(1|true|yes|on)$ ]]; then check_updates --check-update; fi
     if [[ $INTERACTIVE == true && $HEADLESS == false ]]; then
-        printf 'MoE4All Linux Launch Wizard\nEnter = previous/default; - = clear\n'
+        value=$("$BINARY" --version 2>/dev/null || true); value=${value##* }
+        printf 'MoE4All v%s Linux Launch Wizard\nEnter = previous/default; - = clear\n' "$value"
         if [[ -n ${S[model]} && ${#OVERRIDES[@]} == 0 && ${#disables[@]} == 0 ]]; then
             absolute "${S[model]}"; if [[ -f $REPLY ]]; then yes 'Start with previous settings?' true; reused=$REPLY; fi
         fi
@@ -1440,7 +1470,16 @@ main() {
     fi
     save_state; printf 'Settings saved: %s\n' "$STATE"
     if [[ -n $api_key ]]; then export INFR_API_KEY=$api_key; else unset INFR_API_KEY; fi
-    cd -- "$ROOT"; exec "${COMMAND[@]}"
+    cd -- "$ROOT"
+    if [[ $INTERACTIVE == true && $HEADLESS == false ]]; then
+        "${COMMAND[@]}"
+    else
+        exec "${COMMAND[@]}"
+    fi
 }
 
-if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    trap 'launcher_exit $?' EXIT
+    main "$@"
+    trap - EXIT
+fi

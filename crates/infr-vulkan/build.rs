@@ -3594,6 +3594,7 @@ fn main() {
         ("params_advance", "params_advance", &[]),
         // Two-stage vocab-scale stochastic sampler (Op::Sample): per-slice top-k candidates,
         // then select+softmax+nucleus+CDF over the union.
+        ("sampling_penalty", "sampling_penalty", &[]),
         ("sample_topk", "sample_topk_part", &[]),
         ("sample_topk", "sample_topk", &["-DPASS2"]),
         // Chained-decode variant: stage 2 reads `u` from a 64-slot ring keyed by the self-advancing
@@ -4391,6 +4392,12 @@ fn main() {
         ];
         for d in defines {
             args.push(d.clone());
+        }
+        if src_stem == "gpu_resident_check" || src_stem == "gpu_resident_hit_check" {
+            args.push(format!(
+                "-DINFR_MAX_DECODE_ROWS={}",
+                infr_core::backend::MAX_DECODE_ROWS
+            ));
         }
         args.push(src.clone());
         args.push("-o".into());

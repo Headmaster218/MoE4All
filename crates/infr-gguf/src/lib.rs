@@ -145,6 +145,14 @@ impl TensorBytes {
     pub fn file_range(&self) -> (u64, usize) {
         (self.file_base + self.off as u64, self.len)
     }
+
+    /// Release this tensor's clean source pages after an upload. The view and its clones remain
+    /// readable; this is only a best-effort residency hint, not an unmap or a content change.
+    pub fn release_source_pages(&self) -> bool {
+        // SAFETY: this view is backed by a live, read-only, whole-file Mmap. OS page rounding
+        // may include adjacent file bytes but never an unrelated anonymous allocation.
+        unsafe { infr_core::hostmem::release_read_only_file_pages(self) }
+    }
 }
 
 // ─── byte-cursor ──────────────────────────────────────────────────────────────
@@ -1144,6 +1152,63 @@ mod tests {
             data, expected,
             "mmap read must be byte-for-byte with the source"
         );
+    }
+
+    #[test]
+    fn released_source_pages_preserve_owned_views_and_file_bytes() {
+        let mut bytes = build_fixture();
+        let offset = bytes.len() - 16;
+        bytes[offset..].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        let tmp = write_temp_gguf(&bytes);
+        let gguf = Gguf::open(tmp.path()).expect("open fixture");
+        let view = gguf.tensor_bytes_arc("tensor0").expect("view");
+        let clone = view.clone();
+        assert_eq!(&view[..], &bytes[offset..]);
+        let released = view.release_source_pages();
+        #[cfg(any(windows, target_os = "linux"))]
+        assert!(
+            released,
+            "read-only mapped source pages should be releasable"
+        );
+        #[cfg(not(any(windows, target_os = "linux")))]
+        let _ = released;
+        drop(gguf);
+        assert_eq!(&clone[..], &bytes[offset..]);
+        assert_eq!(&view[..], &bytes[offset..]);
+        assert!(clone.release_source_pages() || !cfg!(any(windows, target_os = "linux")));
+        assert_eq!(std::fs::read(tmp.path()).expect("read fixture"), bytes);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "measures Windows working-set residency; run in isolation"]
+    fn released_source_pages_reduce_large_mapped_working_set() {
+        const BYTES: usize = 32 << 20;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        for _ in 0..BYTES / 4096 {
+            file.write_all(&[0x5a; 4096]).unwrap();
+        }
+        file.flush().unwrap();
+        let view = TensorBytes {
+            mmap: Arc::new(unsafe { Mmap::map(file.as_file()).unwrap() }),
+            off: 0,
+            len: BYTES,
+            file_base: 0,
+        };
+        for offset in (0..BYTES).step_by(4096) {
+            std::hint::black_box(view[offset]);
+        }
+        let before = infr_core::hostmem::process_resident_bytes().unwrap();
+        assert!(view.release_source_pages());
+        let after = infr_core::hostmem::process_resident_bytes().unwrap();
+        println!("mapped_source_bytes={BYTES} resident_before={before} resident_after={after}");
+        assert!(before.saturating_sub(after) >= (BYTES / 2) as u64);
+        for offset in (0..BYTES).step_by(4096) {
+            assert_eq!(
+                view[offset], 0x5a,
+                "released file pages must remain readable"
+            );
+        }
     }
 
     /// The mapping starts at file byte 0, which is what lets a mapped view's offset double as a

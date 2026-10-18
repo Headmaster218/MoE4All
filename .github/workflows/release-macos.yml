@@ -1,0 +1,118 @@
+name: macOS Release (Experimental)
+
+on:
+  workflow_dispatch: {}
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  MACOSX_DEPLOYMENT_TARGET: '13.0'
+
+jobs:
+  package:
+    name: Build experimental macOS arm64 package
+    runs-on: macos-15
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Confirm Apple Silicon runner
+        run: test "$(uname -s)" = Darwin && test "$(uname -m)" = arm64
+      - name: Install glslc (build-time only)
+        run: brew install shaderc
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: ./.github/actions/setup-build-cache
+        with:
+          shared-key: macos-release-arm64
+          cache-on-failure: true
+      - name: Resolve release version
+        id: release
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 --config 'build.rustflags=[]' | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "infr-cli"))')
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "release-$version" ]]; then
+            echo 'Release tag does not match Cargo version' >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "archive=MoE4All-macOS-arm64-v$version.tar.gz" >> "$GITHUB_OUTPUT"
+      - name: Test zsh launcher, package validation, update and rollback
+        run: /bin/zsh scripts/smoke-macos-wizard.zsh
+      - name: Build portable Apple Silicon engine
+        run: cargo build --release --locked -p infr-cli --config 'build.rustflags=[]'
+      - name: Show sccache statistics
+        if: always()
+        run: sccache --show-stats
+      - name: Ad-hoc sign and audit runtime dependencies
+        run: |
+          codesign --force --sign - --timestamp=none target/release/infr
+          codesign --verify --verbose=2 target/release/infr
+          target/release/infr --version
+          target/release/infr --help
+          test "$(lipo -archs target/release/infr)" = arm64
+          otool -L target/release/infr | tee "$RUNNER_TEMP/infr-otool.txt"
+          tail -n +2 "$RUNNER_TEMP/infr-otool.txt" > "$RUNNER_TEMP/infr-dependencies.txt"
+          vtool -show-build target/release/infr | tee "$RUNNER_TEMP/infr-build-version.txt"
+          grep -F 'minos 13.0' "$RUNNER_TEMP/infr-build-version.txt"
+          ! grep -E '/opt/homebrew|/usr/local|${{ github.workspace }}|${{ runner.temp }}' "$RUNNER_TEMP/infr-dependencies.txt"
+      - name: Package and smoke-test extracted release
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          mkdir -p dist
+          python3 scripts/macos_release.py --version "$VERSION" --output dist
+          smoke=$(mktemp -d "$RUNNER_TEMP/moe4all-macos-package.XXXXXX")
+          tar -xzf "dist/MoE4All-macOS-arm64-v$VERSION.tar.gz" -C "$smoke"
+          package="$smoke/MoE4All-macOS-arm64-v$VERSION"
+          "$package/infr" --version | grep -F "$VERSION"
+          "$package/infr" --help
+          codesign --verify --verbose=2 "$package/infr"
+          touch "$smoke/model.gguf"
+          HOME="$smoke/home" /bin/zsh "$package/Start-INFR-Wizard-macOS.sh" \
+            --root "$package" --dry-run --mode serve --model "$smoke/model.gguf" \
+            --profile aggressive --dev metal --parallel 1 --no-api-key | tee "$RUNNER_TEMP/macos-wizard-dry-run.txt"
+          grep -F -- '--dev metal' "$RUNNER_TEMP/macos-wizard-dry-run.txt"
+          grep -F -- 'device.auto_profile=aggressive' "$RUNNER_TEMP/macos-wizard-dry-run.txt"
+      - name: Write immutable release manifest
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          ARCHIVE: ${{ steps.release.outputs.archive }}
+        run: |
+          python3 scripts/release_ci.py write \
+            --platform macos-arm64 \
+            --version "$VERSION" \
+            --commit "$GITHUB_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --output dist/release-manifest-macos-arm64.json \
+            --metadata "rustc=$(rustc --version)" \
+            --metadata "cargo=$(cargo --version)" \
+            --metadata "runner=${ImageOS:-unknown}-${ImageVersion:-unknown}" \
+            "dist/$ARCHIVE" "dist/$ARCHIVE.sha256"
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: MoE4All-macOS-arm64-v${{ steps.release.outputs.version }}
+          path: |
+            dist/${{ steps.release.outputs.archive }}
+            dist/${{ steps.release.outputs.archive }}.sha256
+            dist/release-manifest-macos-arm64.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Attest release archive
+        if: github.repository_visibility == 'public'
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/${{ steps.release.outputs.archive }}

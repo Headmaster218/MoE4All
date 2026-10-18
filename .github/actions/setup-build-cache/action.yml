@@ -1,0 +1,45 @@
+name: Set up MoE4All build cache
+description: Configure content-addressed Rust compilation and dependency-only Cargo caches.
+
+inputs:
+  shared-key:
+    description: Stable cache namespace for compatible jobs.
+    required: false
+    default: workspace-v1
+  cache-write:
+    description: Whether this trusted run may update caches.
+    required: false
+    default: "true"
+  cache-on-failure:
+    description: Whether Cargo dependency state may be saved after a failed job.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Configure compiler cache policy
+      shell: bash
+      run: |
+        echo 'RUSTC_WRAPPER=sccache' >> "$GITHUB_ENV"
+        echo 'SCCACHE_GHA_ENABLED=true' >> "$GITHUB_ENV"
+        echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
+        if [[ '${{ inputs.cache-write }}' == 'true' ]]; then
+          echo 'SCCACHE_GHA_RW_MODE=READ_WRITE' >> "$GITHUB_ENV"
+        else
+          echo 'SCCACHE_GHA_RW_MODE=READ_ONLY' >> "$GITHUB_ENV"
+        fi
+
+    - name: Set up sccache
+      uses: mozilla-actions/sccache-action@fd02668681acd5f960e1372061bee5e3e987195c # v0.0.11
+
+    # Keep Cargo's immutable downloads and installed CI tools, but do not save
+    # one large target tree per job. sccache handles rustc outputs by content.
+    - name: Restore Cargo dependency cache
+      uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      with:
+        shared-key: cargo-home-${{ inputs.shared-key }}
+        cache-targets: false
+        cache-bin: true
+        cache-on-failure: ${{ inputs.cache-on-failure }}
+        save-if: ${{ inputs.cache-write }}

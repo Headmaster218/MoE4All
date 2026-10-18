@@ -337,6 +337,8 @@ knobs! {
     "INFR_PROF_VRAM"               => "prof.vram",              Presence, Ignored, "1",           migrated;
     "INFR_PROF_DIFFUSION_TRACE"    => "prof.diffusion_trace",   Presence, Ignored, "1",           migrated;
     "INFR_PAGER_PROFILE"           => "prof.pager_profile",     Presence, Ignored, "1",           migrated;
+    "INFR_TIMELINE_RAW_KERNELS"    => "prof.timeline_raw_kernels", Presence, Ignored, "1",         migrated;
+    "INFR_TIMELINE_RAW_UNKNOWN"    => "prof.timeline_raw_unknown", Presence, Ignored, "1",         migrated;
     "INFR_PROF_OUT"                => "prof.out",               Path,     Ignored, "/tmp/p.json", migrated;
     "INFR_PROF_METAL_DEVICE_TIME"  => "prof.metal_device_time", Text,     Ignored, "counters",    migrated;
     "INFR_PROF_METAL_DEBUG"        => "prof.metal_debug",       Presence, Ignored, "1",           migrated;

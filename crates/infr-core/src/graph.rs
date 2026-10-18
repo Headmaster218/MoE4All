@@ -1156,12 +1156,20 @@ pub enum Op {
         dst_prob: TensorId,
         n: u32,
     },
-    /// Device-side stochastic sampling: `dst[0] = sample(x[0..n])` (u32 id bit-pattern in the f32
-    /// slot) via temperature + top-k + top-p, inverse-CDF'd with the uniform draw read from the
-    /// 1-float `u` Input — the host draws u (4 bytes/token) and reads back only the id, the
-    /// `[vocab]` logits never leave the device. Same order of operations as the host sampler
-    /// (top-k select desc → softmax(temp) → nucleus cutoff → CDF walk), so the same `u` picks the
-    /// same token. `top_k` must be `2..=64` (backend kernel bound); the runner gates.
+    /// Apply request-local additive penalties before sampling, in place on `[rows, n]` logits.
+    /// `counts` is persistent F32 `[cohort_rows, n]` generated-token counts. Each four-word
+    /// control row contains presence, frequency, previous committed id (u32 bits, MAX = none),
+    /// and the count-row index (u32 bits). Only that committed id is added before applying
+    /// `logit -= presence + frequency * count` to seen ids. Prompt/draft ids are never counted.
+    SamplingPenalty {
+        x: TensorId,
+        counts: TensorId,
+        control: TensorId,
+        n: u32,
+        rows: u32,
+    },
+    /// Device-side temperature + top-k + top-p sampling using a host-drawn uniform per row.
+    /// Same arithmetic order as the host sampler; `top_k` must be `2..=64`.
     Sample {
         x: TensorId,
         u: TensorId,
@@ -1497,6 +1505,7 @@ impl Op {
             Op::Argmax { .. } => "Argmax",
             Op::ArgmaxProb { .. } => "ArgmaxProb",
             Op::Sample { .. } => "Sample",
+            Op::SamplingPenalty { .. } => "SamplingPenalty",
             Op::EmbedGather { .. } => "EmbedGather",
             Op::GatherI32 { .. } => "GatherI32",
             Op::Copy { .. } => "Copy",
@@ -1809,6 +1818,9 @@ impl Op {
                 ..
             } => (vec![x], vec![dst_id, dst_prob]),
             Op::Sample { x, u, dst, .. } => (vec![x, u], vec![dst]),
+            Op::SamplingPenalty {
+                x, counts, control, ..
+            } => (vec![x, counts, control], vec![x, counts]),
             Op::EmbedGather {
                 ids, table, dst, ..
             } => (vec![ids, table], vec![dst]),

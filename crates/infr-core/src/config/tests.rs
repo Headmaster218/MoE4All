@@ -847,6 +847,26 @@ fn kv_dtype_presence_survives_an_unparseable_name() {
     assert!(!Config::default().kv.type_k_specified);
 }
 
+#[test]
+fn timeline_raw_label_controls_use_config_and_preserve_presence_env() {
+    let default = Config::default();
+    assert!(!default.prof.timeline_raw_kernels);
+    assert!(!default.prof.timeline_raw_unknown);
+    let cfg = Config::load_from_layers(&[env_layer(&[
+        ("INFR_TIMELINE_RAW_KERNELS", "0"),
+        ("INFR_TIMELINE_RAW_UNKNOWN", ""),
+    ])]);
+    assert!(cfg.prof.timeline_raw_kernels);
+    assert!(cfg.prof.timeline_raw_unknown);
+    let layer = cli_layer(&[
+        "prof.timeline_raw_kernels=false",
+        "prof.timeline_raw_unknown=false",
+    ]);
+    let cfg = Config::load_from_layers(&[env_layer(&[("INFR_TIMELINE_RAW_KERNELS", "1")]), layer]);
+    assert!(!cfg.prof.timeline_raw_kernels);
+    assert!(!cfg.prof.timeline_raw_unknown);
+}
+
 // ── §8.8 — every key is read ─────────────────────────────────────────────────
 
 /// Setting ANY manifest key through the injected reader must change what the layer specifies.
@@ -1538,6 +1558,8 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_NO_SMALL_BM",
         "INFR_PROF_OPS",
         "INFR_PROF_OP_SHAPES",
+        "INFR_TIMELINE_RAW_KERNELS",
+        "INFR_TIMELINE_RAW_UNKNOWN",
         "INFR_PV_SPLITS",
         "INFR_SEAM_NO_REPLAY",
     ];

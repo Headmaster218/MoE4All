@@ -1,4 +1,8 @@
-# Build for the host CPU so the scalar dequant/matvec loops autovectorize to AVX2/AVX-512
-# (the CPU backend leans on this; the binary is then specific to this machine's ISA).
-[build]
-rustflags = ["-C", "target-cpu=native"]
+# Use the portable release baseline, including for local builds. CPU kernels with
+# runtime feature detection retain their function-specific SIMD implementations.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64"]
+
+# Match the Windows release CRT linkage. Other architectures keep target defaults.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 
 const DECODE_BATCH_WAIT: Duration = Duration::from_secs(1);
 const PREFILL_COHORT_WAIT: Duration = Duration::from_millis(50);
-const MAX_DECODE_BATCH: usize = 8;
+const MAX_DECODE_BATCH: usize = infr_core::backend::MAX_DECODE_ROWS;
 const SHORT_PREFILL_TOKENS: usize = 96;
 const MTP_PLAIN_SYNC_QUANTUM: usize = 1024;
 const MTP_CONCURRENT_PROBE_CYCLES: usize = 8;
@@ -3130,7 +3130,7 @@ impl ParallelSeam {
                     &prompts[0],
                     &mut primary,
                     self.max_ctx,
-                    prepared[0].clone(),
+                    prepared[0],
                 )
                 .map(|stats| vec![stats])
             }
