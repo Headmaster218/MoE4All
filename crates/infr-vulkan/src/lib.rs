@@ -4184,9 +4184,11 @@ impl VulkanBackend {
 
         // infr's Vulkan compute kernels are written for a PINNED subgroup size of 32 (RDNA3 wave32):
         // rmsnorm / softmax / quant_q8 / the coopmat GEMM / attention QK+PV / flash / DeltaNet all
-        // dispatch via `kernel_sg(..., 32)`, which sets `requiredSubgroupSize=32` and FAILS pipeline
-        // creation on any device that can't provide a size-32 subgroup (no `subgroup_size_control`,
-        // or 32 outside `[minSubgroupSize, maxSubgroupSize]`). rmsnorm/softmax run on EVERY forward
+        // run at wave32. Explicit specializations dispatch via `kernel_sg(..., 32)`; the ordinary
+        // `kernel()` builder also inspects SPIR-V and safely pins subgroup-using modules to 32. Both
+        // set `requiredSubgroupSize=32` and FAIL pipeline creation on any device that can't provide
+        // it (no `subgroup_size_control`, or 32 outside `[minSubgroupSize, maxSubgroupSize]`).
+        // rmsnorm/softmax run on EVERY forward
         // and are NOT coopmat-gated, so gating only the coopmat caps wouldn't prevent the crash —
         // the whole backend needs 32. Refuse the Vulkan backend here (a clean Err, not a mid-forward
         // panic) so `gpu_available()`/the seam falls back to CPU. Every real target — RADV (32-64),
@@ -5090,7 +5092,7 @@ impl VulkanBackend {
             0,
             // The kernel this probes is dispatched at a pinned subgroup 32, and its lane->element
             // arithmetic only holds there; pin the probe identically.
-            Some(32),
+            crate::ops::SubgroupContract::Fixed(32),
             self.shared.push_descriptor.is_some(),
             self.shared.max_push_constants,
         )?;

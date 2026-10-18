@@ -11,6 +11,98 @@ use infr_core::{backend::BufferUsage, error::Result, Backend};
 
 use super::{as_vk_buf, be, VulkanBackend};
 
+/// The subgroup-width promise attached to a compute pipeline.
+///
+/// The maintenance backend guarantees that every accepted device can pin wave32. Most callers use
+/// [`VulkanBackend::kernel`], whose safe default is therefore to pin subgroup-using SPIR-V to 32.
+/// Width-independent portable shaders must opt into [`VulkanBackend::kernel_native`] explicitly;
+/// tuned wave16/wave32 shaders keep using [`VulkanBackend::kernel_sg`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SubgroupContract {
+    None,
+    Native,
+    Fixed(u32),
+}
+
+impl SubgroupContract {
+    fn required_size(self) -> Option<u32> {
+        match self {
+            Self::None | Self::Native => None,
+            Self::Fixed(size) => Some(size),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubgroupRequest {
+    Automatic,
+    Native,
+    Fixed(u32),
+}
+
+const SPIRV_MAGIC: u32 = 0x0723_0203;
+const OP_CAPABILITY: u16 = 17;
+const OP_GROUP_NON_UNIFORM_FIRST: u16 = 333;
+const OP_GROUP_NON_UNIFORM_LAST: u16 = 366;
+
+/// Return whether a SPIR-V module uses subgroup collective instructions.
+///
+/// Checking the instruction stream rather than shader names keeps the contract attached to the
+/// compiled artifact. The core GroupNonUniform instruction family is contiguous in SPIR-V 1.x;
+/// capabilities are also checked so future instructions from an enabled subgroup family still
+/// take the safe path even before this opcode range is extended.
+fn spv_uses_subgroups(spv: &[u32]) -> bool {
+    assert!(
+        spv.len() >= 5 && spv[0] == SPIRV_MAGIC,
+        "invalid SPIR-V module passed to Vulkan kernel builder"
+    );
+    let mut i = 5usize;
+    while i < spv.len() {
+        let word = spv[i];
+        let words = (word >> 16) as usize;
+        let opcode = (word & 0xffff) as u16;
+        assert!(
+            words > 0 && i + words <= spv.len(),
+            "malformed SPIR-V instruction at word {i}"
+        );
+        if (OP_GROUP_NON_UNIFORM_FIRST..=OP_GROUP_NON_UNIFORM_LAST).contains(&opcode) {
+            return true;
+        }
+        if opcode == OP_CAPABILITY && words >= 2 {
+            // GroupNonUniform plus Vote, Arithmetic, Ballot, Shuffle, ShuffleRelative,
+            // Clustered and Quad capabilities.
+            if (61..=68).contains(&spv[i + 1]) {
+                return true;
+            }
+        }
+        i += words;
+    }
+    false
+}
+
+fn resolve_subgroup_contract(request: SubgroupRequest, spv: &[u32]) -> SubgroupContract {
+    match request {
+        SubgroupRequest::Automatic => {
+            if spv_uses_subgroups(spv) {
+                SubgroupContract::Fixed(32)
+            } else {
+                SubgroupContract::None
+            }
+        }
+        SubgroupRequest::Native => {
+            assert!(
+                spv_uses_subgroups(spv),
+                "kernel_native requires SPIR-V that actually uses subgroup operations"
+            );
+            SubgroupContract::Native
+        }
+        SubgroupRequest::Fixed(size) => {
+            assert!(size > 0, "a fixed subgroup size must be non-zero");
+            SubgroupContract::Fixed(size)
+        }
+    }
+}
+
 /// Cached, reusable compute objects for one kernel. All fields are Vulkan handles (Copy).
 #[derive(Clone, Copy)]
 pub(crate) struct ComputeKernel {
@@ -24,10 +116,11 @@ pub(crate) struct ComputeKernel {
     pub desc_pool: vk::DescriptorPool,
     pub n_buf: usize,
     pub push_size: u32,
+    pub subgroup_contract: SubgroupContract,
     /// Hash of the SPIR-V this kernel was built from. The cache is keyed on `name` alone, so this
-    /// lets [`VulkanBackend::kernel`]/[`VulkanBackend::kernel_sg`] debug-assert on a cache hit that
-    /// the request's shader/layout matches the built one — a name reused with a different
-    /// `spv`/`n_buf`/`push_size` would otherwise silently return a mismatched pipeline.
+    /// lets the kernel builders debug-assert on a cache hit that the request's shader/layout
+    /// matches the built one — a name reused with a different `spv`/`n_buf`/`push_size` would
+    /// otherwise silently return a mismatched pipeline.
     pub spv_hash: u64,
 }
 
@@ -51,7 +144,7 @@ pub(crate) fn make_compute_kernel(
     spv: &[u32],
     n_buf: usize,
     push_size: u32,
-    required_sg: Option<u32>,
+    subgroup_contract: SubgroupContract,
     push_descriptor: bool,
     max_push_constants: u32,
 ) -> ComputeKernel {
@@ -62,7 +155,7 @@ pub(crate) fn make_compute_kernel(
         spv,
         n_buf,
         push_size,
-        required_sg,
+        subgroup_contract,
         push_descriptor,
         max_push_constants,
     )
@@ -89,7 +182,7 @@ pub(crate) fn try_make_compute_kernel(
     spv: &[u32],
     n_buf: usize,
     push_size: u32,
-    required_sg: Option<u32>,
+    subgroup_contract: SubgroupContract,
     push_descriptor: bool,
     max_push_constants: u32,
 ) -> Result<ComputeKernel> {
@@ -164,7 +257,7 @@ pub(crate) fn try_make_compute_kernel(
         .stage(vk::ShaderStageFlags::COMPUTE)
         .module(shader)
         .name(entry);
-    if let Some(sz) = required_sg {
+    if let Some(sz) = subgroup_contract.required_size() {
         req_sz = req_sz.required_subgroup_size(sz);
         stage = stage
             .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
@@ -241,6 +334,7 @@ pub(crate) fn try_make_compute_kernel(
         desc_pool,
         n_buf,
         push_size,
+        subgroup_contract,
         spv_hash: hash_spv(spv),
     })
 }
@@ -332,12 +426,26 @@ impl VulkanBackend {
         n_buf: usize,
         push_size: u32,
     ) -> ComputeKernel {
-        self.kernel_inner(name, spv, n_buf, push_size, None)
+        self.kernel_inner(name, spv, n_buf, push_size, SubgroupRequest::Automatic)
     }
 
-    /// Like `kernel`, but pins the pipeline's subgroup size (coopmat needs wave32 on RDNA3).
-    /// A size of `0` means "no subgroup requirement" (treated like [`Self::kernel`]) — a caller
-    /// that passes 0 by mistake would otherwise build an invalid `RequiredSubgroupSizeCreateInfo`.
+    /// Build a width-independent subgroup shader using the device-selected subgroup size.
+    ///
+    /// This explicit spelling prevents a wave32-only shader from silently reaching an Intel
+    /// wave16 pipeline. The current maintenance paths do not need it; portable subgroup variants
+    /// may opt in as they are introduced.
+    #[allow(dead_code)]
+    pub(crate) fn kernel_native(
+        &self,
+        name: &'static str,
+        spv: &[u32],
+        n_buf: usize,
+        push_size: u32,
+    ) -> ComputeKernel {
+        self.kernel_inner(name, spv, n_buf, push_size, SubgroupRequest::Native)
+    }
+
+    /// Like `kernel`, but explicitly pins the pipeline's subgroup size.
     pub(crate) fn kernel_sg(
         &self,
         name: &'static str,
@@ -346,13 +454,7 @@ impl VulkanBackend {
         push_size: u32,
         sg_size: u32,
     ) -> ComputeKernel {
-        self.kernel_inner(
-            name,
-            spv,
-            n_buf,
-            push_size,
-            (sg_size > 0).then_some(sg_size),
-        )
+        self.kernel_inner(name, spv, n_buf, push_size, SubgroupRequest::Fixed(sg_size))
     }
 
     /// Shared fetch-or-build for [`Self::kernel`]/[`Self::kernel_sg`]. The build runs UNDER the
@@ -366,12 +468,13 @@ impl VulkanBackend {
         spv: &[u32],
         n_buf: usize,
         push_size: u32,
-        required_sg: Option<u32>,
+        subgroup_request: SubgroupRequest,
     ) -> ComputeKernel {
         let mut map = self.shared.kernels.lock().unwrap();
         let mut built = false;
         let k = *map.entry(name).or_insert_with(|| {
             built = true;
+            let subgroup_contract = resolve_subgroup_contract(subgroup_request, spv);
             make_compute_kernel(
                 &self.shared.device,
                 self.shared.pipeline_cache,
@@ -379,7 +482,7 @@ impl VulkanBackend {
                 spv,
                 n_buf,
                 push_size,
-                required_sg,
+                subgroup_contract,
                 self.shared.push_descriptor.is_some(),
                 self.shared.max_push_constants,
             )
@@ -388,6 +491,23 @@ impl VulkanBackend {
         if built {
             self.shared.persist_pipeline_cache(); // new pipeline -> debounced disk save
         } else {
+            let contract_matches = match subgroup_request {
+                SubgroupRequest::Automatic => {
+                    matches!(
+                        k.subgroup_contract,
+                        SubgroupContract::None | SubgroupContract::Fixed(32)
+                    )
+                }
+                SubgroupRequest::Native => k.subgroup_contract == SubgroupContract::Native,
+                SubgroupRequest::Fixed(size) => {
+                    k.subgroup_contract == SubgroupContract::Fixed(size)
+                }
+            };
+            assert!(
+                contract_matches,
+                "kernel {name:?} cached with subgroup contract {:?} but re-requested as {:?}",
+                k.subgroup_contract, subgroup_request
+            );
             // Cache HIT: the cache is keyed on `name` alone, so a name reused with a different
             // shader/layout would silently hand back a mismatched pipeline (VUID/UB). Fail loudly
             // in debug instead. The spv hash is only computed on this hit path in debug builds.
@@ -597,6 +717,44 @@ impl VulkanBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subgroup_contract_is_derived_from_compiled_spirv() {
+        assert!(!spv_uses_subgroups(crate::gemm::rope_spv()));
+        for (name, spv) in [
+            ("store_q8", crate::gemm::store_q8_spv()),
+            ("store_q8_f16", crate::gemm::store_q8_f16_spv()),
+            ("store_q8_seg", crate::gemm::store_q8_seg_spv()),
+            ("store_q8_f16_seg", crate::gemm::store_q8_f16_seg_spv()),
+            ("store_q8_dyn", crate::gemm::store_q8_dyn_spv()),
+            ("store_q8_f16_dyn", crate::gemm::store_q8_f16_dyn_spv()),
+        ] {
+            assert!(spv_uses_subgroups(spv), "{name} lost its subgroup contract");
+            assert_eq!(
+                resolve_subgroup_contract(SubgroupRequest::Automatic, spv),
+                SubgroupContract::Fixed(32),
+                "{name} did not inherit the safe wave32 default"
+            );
+        }
+        assert_eq!(
+            resolve_subgroup_contract(SubgroupRequest::Automatic, crate::gemm::rope_spv()),
+            SubgroupContract::None
+        );
+        assert_eq!(
+            resolve_subgroup_contract(SubgroupRequest::Native, crate::gemm::store_q8_spv()),
+            SubgroupContract::Native
+        );
+        assert_eq!(
+            resolve_subgroup_contract(SubgroupRequest::Fixed(16), crate::gemm::store_q8_spv()),
+            SubgroupContract::Fixed(16)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "fixed subgroup size must be non-zero")]
+    fn zero_subgroup_contract_is_rejected() {
+        let _ = resolve_subgroup_contract(SubgroupRequest::Fixed(0), crate::gemm::rope_spv());
+    }
 
     #[test]
     #[ignore = "requires a Vulkan GPU"]
