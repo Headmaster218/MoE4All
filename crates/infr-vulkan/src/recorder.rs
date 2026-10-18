@@ -6205,6 +6205,7 @@ impl<'a> Recorder<'a> {
         nkv: usize,
         pos_offset: usize,
         prefer_deep_splits: bool,
+        register_o_tail_safe: bool,
         kv_addr: Option<(u64, u64)>,
     ) {
         const HD: u32 = 256;
@@ -6212,7 +6213,7 @@ impl<'a> Recorder<'a> {
         // Register-O is profitable at deep context but requires its 128-row padded contract. Full
         // 128-row tiles use it; arbitrary tail chunks stay on the established BM16 kernel. The
         // existing flash_warp knob is the same-binary A/B/fallback escape hatch.
-        if self.vk().flash_warp && n.is_multiple_of(128) {
+        if self.vk().flash_warp && n.is_multiple_of(128) && register_o_tail_safe {
             self.attention_prefill_flash_reg(
                 q,
                 kc,
@@ -12437,6 +12438,43 @@ impl<'a> Recorder<'a> {
         }
     }
 
+    /// Zero one byte range with `vkCmdFillBuffer`. This is used for small tile-padding tails after
+    /// a compute writer filled the valid prefix; unlike [`Self::zero`], it is deliberately not
+    /// available inside a conditional region because transfer commands are not conditional.
+    pub fn zero_bytes(&self, buf: &dyn Buffer, byte_offset: usize, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        assert!(
+            !self.conditional_active.get(),
+            "zero_bytes cannot be recorded inside a conditional region"
+        );
+        assert!(
+            byte_offset.is_multiple_of(4) && bytes.is_multiple_of(4),
+            "zero_bytes requires four-byte aligned offset and length"
+        );
+        let vkbuf = Self::vk_of(buf);
+        let end = byte_offset
+            .checked_add(bytes)
+            .expect("zero_bytes range overflow");
+        assert!(
+            end <= vkbuf.size,
+            "zero_bytes range {byte_offset}..{end} exceeds {}-byte buffer",
+            vkbuf.size
+        );
+        self.stamp("zero_fill_range");
+        self.sync(&[], &[vkbuf.buffer], true);
+        unsafe {
+            self.be.shared.device.cmd_fill_buffer(
+                self.cmd,
+                vkbuf.buffer,
+                (vkbuf.sub_offset + byte_offset) as u64,
+                bytes as u64,
+                0,
+            );
+        }
+    }
+
     /// MoE bucketing pass 1 (count): tally assignments per expert into `counts` (pre-zeroed).
     pub fn moe_bucket_count(&self, tok_ids: &dyn Buffer, counts: &dyn Buffer, n_pairs: usize) {
         let k = self.be.kernel(
@@ -14667,6 +14705,23 @@ mod chunk_math_tests {
 mod tests {
     use super::*;
     use infr_core::{backend::BufferUsage, Backend};
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn zero_bytes_clears_only_the_requested_tail() {
+        let backend = VulkanBackend::new().unwrap();
+        let buffer = backend.alloc(64, BufferUsage::Activations).unwrap();
+        backend.upload(buffer.as_ref(), &[0xff; 64]).unwrap();
+        let recorder = backend.recorder().unwrap();
+        recorder.zero_bytes(buffer.as_ref(), 16, 32);
+        recorder.finish().unwrap();
+
+        let mut bytes = [0u8; 64];
+        backend.download(buffer.as_ref(), &mut bytes).unwrap();
+        assert!(bytes[..16].iter().all(|&byte| byte == 0xff));
+        assert!(bytes[16..48].iter().all(|&byte| byte == 0));
+        assert!(bytes[48..].iter().all(|&byte| byte == 0xff));
+    }
 
     #[test]
     fn q8_wave32_uses_two_rows_only_for_very_wide_outputs() {
@@ -17436,6 +17491,7 @@ mod tests {
                 nkv,
                 pos_offset,
                 false,
+                true,
                 None,
             );
         } else {
