@@ -2051,6 +2051,7 @@ impl ParallelSeam {
             let mut target_kv = pool.slots[target].kv.take();
             drop(pool);
 
+            let mut tree_attached = 0usize;
             {
                 // One pass owns both the inference baton and the tree: no dispatch can observe a
                 // half-written page table, and no other checkout can match a chain mid-swap.
@@ -2159,6 +2160,7 @@ impl ParallelSeam {
                                     &prompt[..reusable],
                                 ) {
                                     Ok(()) => {
+                                        tree_attached = reusable;
                                         tracing::info!(
                                             slot = target,
                                             cached_prefix_tokens = reusable,
@@ -2193,6 +2195,19 @@ impl ParallelSeam {
                         }
                     }
                 }
+                // Console-visible per-request ledger: what THIS prompt reuses (tree attach or the
+                // resident continuation left in the slot) and what the corridor currently holds —
+                // allocated frames cover both tree chains and live sessions, so `free` is what a
+                // growing request can still claim before cold eviction starts.
+                let reused = tree_attached.max(continuation_prefix);
+                tracing::info!(
+                    slot = target,
+                    prompt_tokens = prompt.len(),
+                    reused_tokens = reused,
+                    prefill_tokens = prompt.len().saturating_sub(reused),
+                    cache = %tree.stats_line(),
+                    "paged KV prefix cache status"
+                );
             }
 
             return Ok(SlotGuard {

@@ -137,16 +137,28 @@ impl PagedKv {
         self.pool.frame_addr(frame) + self.plane_offsets[plane]
     }
 
+    /// One-line console report. Besides the tree counters it spells the corridor in the units an
+    /// operator reads on the serve console: frames (allocated/total/free), the token capacity they
+    /// buy, and the GiB claimed — `held` counts every allocated frame (tree chains AND live
+    /// sessions), so `free` is exactly what a growing request can still claim before eviction.
     pub(crate) fn stats_line(&self) -> String {
+        let gib =
+            |frames: usize| frames as f64 * self.pool.frame_bytes() as f64 / (1u64 << 30) as f64;
+        let held = self.pool.held_frames(Tier::Vram);
+        let total = self.pool.capacity_frames(Tier::Vram);
         format!(
-            "entries={} frames_held={}/{} free={} hits={} misses={} demotions={} evictions={}",
+            "entries={} frames_held={}/{} free={} tokens_held={}/{} bytes={:.2}GiB/{:.2}GiB hits={} misses={} demotions={} evictions={}",
             self.nodes
                 .iter()
                 .filter(|node| node.entry.is_some())
                 .count(),
-            self.pool.held_frames(Tier::Vram),
-            self.pool.capacity_frames(Tier::Vram),
+            held,
+            total,
             self.pool.free_frames(Tier::Vram),
+            held * self.page_tokens,
+            total * self.page_tokens,
+            gib(held),
+            gib(total),
             self.hits,
             self.misses,
             self.demotions,
