@@ -1,0 +1,241 @@
+{
+    "schema_version":  1,
+    "id":  "20261018T181424.669Z-f78a5c41bfd8b97359ec936852449048-000",
+    "created_at_utc":  "2026-10-18T18:14:24.668842300+00:00",
+    "engine_version":  "1.0.3",
+    "engine_commit":  null,
+    "profile":  "quick",
+    "model":  {
+                  "name":  "Qwen3.6-35B-A3B-APEX-I-Balanced.gguf",
+                  "architecture":  "qwen35moe",
+                  "storage_bytes":  25624957632,
+                  "resident_weight_bytes":  25569541376,
+                  "dense_weight_bytes":  1997552896,
+                  "expert_weight_bytes":  23571988480
+              },
+    "hardware":  {
+                     "os":  "windows",
+                     "architecture":  "x86_64",
+                     "cpu":  {
+                                 "name":  "AMD64 Family 25 Model 33 Stepping 0, AuthenticAMD",
+                                 "logical_threads":  12
+                             },
+                     "ram":  {
+                                 "total_bytes":  68626702336,
+                                 "available_before_bytes":  41587568640,
+                                 "available_after_bytes":  24160653312,
+                                 "process_resident_after_bytes":  23617802240,
+                                 "memory_generation":  "DDR4",
+                                 "module_count":  3,
+                                 "modules":  [
+                                                 {
+                                                     "capacity_bytes":  17179869184,
+                                                     "generation":  "DDR4",
+                                                     "speed_mt_s":  3000,
+                                                     "configured_speed_mt_s":  3000,
+                                                     "manufacturer":  "Colorful",
+                                                     "part_number":  "CD16G3200D4NZ22"
+                                                 },
+                                                 {
+                                                     "capacity_bytes":  17179869184,
+                                                     "generation":  "DDR4",
+                                                     "speed_mt_s":  3000,
+                                                     "configured_speed_mt_s":  3000,
+                                                     "manufacturer":  "Colorful",
+                                                     "part_number":  "CD16G3200D4NZ22"
+                                                 },
+                                                 {
+                                                     "capacity_bytes":  34359738368,
+                                                     "generation":  "DDR4",
+                                                     "speed_mt_s":  3000,
+                                                     "configured_speed_mt_s":  3000,
+                                                     "manufacturer":  "Corsair",
+                                                     "part_number":  "CMK64GX4M2D3000C16"
+                                                 }
+                                             ]
+                             },
+                     "gpu":  {
+                                 "name":  "AMD Radeon RX 7900 XTX",
+                                 "type":  "discrete",
+                                 "integrated":  false,
+                                 "vram_total_bytes":  25753026560,
+                                 "vram_available_before_bytes":  24902934528,
+                                 "vram_available_after_bytes":  1077870592,
+                                 "vram_used_delta_bytes":  23825063936,
+                                 "vram_available_is_live_before":  true,
+                                 "vram_available_is_live_after":  true,
+                                 "unified_memory":  false,
+                                 "pcie_generation":  4,
+                                 "pcie_width":  16,
+                                 "pcie_max_generation":  4,
+                                 "pcie_max_width":  16,
+                                 "pcie_theoretical_one_way_gb_per_second":  31.504,
+                                 "pcie_max_theoretical_one_way_gb_per_second":  31.504,
+                                 "pcie_source":  "windows_pnp"
+                             },
+                     "model_storage":  {
+                                           "model":  "Acer SSD FA100 512GB",
+                                           "media_type":  "SSD",
+                                           "bus_type":  "NVMe",
+                                           "size_bytes":  512105932800,
+                                           "filesystem":  "NTFS",
+                                           "read_probe":  {
+                                                              "mode":  "buffered_read_only_before_benchmark",
+                                                              "sampled_file_bytes":  25624957632,
+                                                              "sequential":  {
+                                                                                 "seconds":  0.500968,
+                                                                                 "bytes":  1082130432,
+                                                                                 "mib_per_second":  2060.011
+                                                                             },
+                                                              "random_64k":  {
+                                                                                 "seconds":  0.500017,
+                                                                                 "operations":  16406,
+                                                                                 "bytes":  1075183616,
+                                                                                 "mib_per_second":  2050.681,
+                                                                                 "iops":  32810.891
+                                                                             },
+                                                              "physical_disk_read_bytes":  888401920,
+                                                              "physical_read_fraction":  0.4118,
+                                                              "cache_disposition":  "mixed"
+                                                          }
+                                       }
+                 },
+    "configuration":  {
+                          "max_parallel":  1,
+                          "per_slot_context_limit":  7936,
+                          "requested_context_tokens":  [
+                                                           6144
+                                                       ],
+                          "prefill_warmup_tokens":  6144,
+                          "decode_tokens_per_rep":  1024,
+                          "decode_warmup_tokens_per_rep":  512,
+                          "decode_repetitions":  1,
+                          "decode_sections":  [
+                                                  341,
+                                                  341,
+                                                  342
+                                              ],
+                          "real_context":  true,
+                          "synthetic_depth":  false,
+                          "kv_type_k":  "Some(Q8_0)",
+                          "kv_type_v":  "Some(Q8_0)",
+                          "auto_profile":  "Aggressive",
+                          "configured_device":  "Vulkan0",
+                          "configured_ubatch":  null,
+                          "configured_threads":  null,
+                          "configured_vram_budget":  "None",
+                          "configured_vram_reserve":  "None",
+                          "configured_ram_budget":  "Some(FrozenAutomaticBytes(54668058624))",
+                          "host_dma":  true,
+                          "submit_dispatches":  null,
+                          "sampling":  {
+                                           "temperature":  0.0,
+                                           "top_k":  20,
+                                           "top_p":  0.949999988079071,
+                                           "seed":  93751,
+                                           "ignore_eos":  true
+                                       },
+                          "mtp":  false
+                      },
+    "estimate":  {
+                     "lower_seconds":  33.45536742492993,
+                     "central_seconds":  44.607156566573245,
+                     "upper_seconds":  64.6803770215312,
+                     "display_minutes":  1,
+                     "assumed_h2d_gib_per_second":  12.0,
+                     "startup_seconds":  26.664150946382165,
+                     "prefill_seconds":  4.769499062544936,
+                     "decode_seconds":  13.17350655764614,
+                     "estimated_ram_budget_bytes":  54668058624,
+                     "estimated_vram_budget_bytes":  24634499072,
+                     "architecture_class":  "full-attention"
+                 },
+    "startup":  {
+                    "seconds":  22.5589838,
+                    "model_startup_effective_gib_per_second":  1.0578978968124795,
+                    "prefill_warmup":  {
+                                           "tokens":  6144,
+                                           "seconds":  1.8101768,
+                                           "wall_seconds":  1.8657639000000001,
+                                           "tokens_per_second":  3394.1435996749046,
+                                           "scored":  false
+                                       }
+                },
+    "contexts":  [
+                     {
+                         "requested_context_tokens":  6144,
+                         "actual_prompt_tokens":  [
+                                                      6144
+                                                  ],
+                         "decode_measurement_start_tokens":  [
+                                                                 6656
+                                                             ],
+                         "decode_measurement_end_tokens":  [
+                                                               7680
+                                                           ],
+                         "prefill":  {
+                                         "requested_context_tokens":  6144,
+                                         "actual_prompt_tokens":  6144,
+                                         "evaluated_tokens":  6144,
+                                         "seconds":  1.8546265,
+                                         "tokens_per_second":  3312.796404019893,
+                                         "setup_slots":  1,
+                                         "setup_seconds":  1.9131394
+                                     },
+                         "decode":  [
+                                        {
+                                            "parallel":  1,
+                                            "repetitions":  [
+                                                                {
+                                                                    "sections":  [
+                                                                                     {
+                                                                                         "tokens":  341,
+                                                                                         "seconds":  3.0118995999999996,
+                                                                                         "tokens_per_second":  113.2175853404941
+                                                                                     },
+                                                                                     {
+                                                                                         "tokens":  341,
+                                                                                         "seconds":  3.0412607000000005,
+                                                                                         "tokens_per_second":  112.12455413638165
+                                                                                     },
+                                                                                     {
+                                                                                         "tokens":  342,
+                                                                                         "seconds":  3.1620124,
+                                                                                         "tokens_per_second":  108.15896863655563
+                                                                                     }
+                                                                                 ],
+                                                                    "overall":  {
+                                                                                    "tokens":  1024,
+                                                                                    "seconds":  9.2151727,
+                                                                                    "tokens_per_second":  111.12108620601326
+                                                                                },
+                                                                    "lane_tokens_per_second":  [
+                                                                                                   [
+                                                                                                       113.2175853404941
+                                                                                                   ],
+                                                                                                   [
+                                                                                                       112.12455413638165
+                                                                                                   ],
+                                                                                                   [
+                                                                                                       108.15896863655563
+                                                                                                   ]
+                                                                                               ]
+                                                                }
+                                                            ],
+                                            "section_mean_tokens_per_second":  [
+                                                                                   113.2175853404941,
+                                                                                   112.12455413638165,
+                                                                                   108.15896863655563
+                                                                               ],
+                                            "overall_tokens_per_second":  111.12108620601326
+                                        }
+                                    ],
+                         "failures":  [
+
+                                      ]
+                     }
+                 ],
+    "failures":  [
+
+                 ]
+}
