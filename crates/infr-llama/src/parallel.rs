@@ -1237,25 +1237,59 @@ impl ParallelSeam {
         // it at construction; warmup submits would pollute a later bench's per-op aggregate) via the
         // shared `with_profiling_suppressed` helper.
         let mut slot0: Option<SeamKv> = None;
-        crate::with_profiling_suppressed(|| {
-            crate::seam::generate_dense_session_for(
-                self.be.as_ref(),
-                self.model.gguf(),
-                self.model.config(),
-                self.model.engine_cfg(),
-                self.model.embd(),
-                self.model.per_layer_embd(),
-                &[1u32],
-                2,
-                |_| {},
-                &mut slot0,
-                self.max_ctx,
-                Some(crate::seam::TurnCheckpoint::ENABLED),
-                None, // constraint
-                None, // req: startup, not a request — env sampling, no gate
-                None, // multimodal plan
-            )
-        })?;
+        // SAFETY NET, not a policy: the prefill chunk was priced BEFORE this session's KV segments
+        // became resident, so the first forward can find the activation scratch a couple of MiB short
+        // (`adapter.rs`'s `alloc_uninit_batch(Activations)`; `INFR_ALLOC_BT=1` prints the backtrace).
+        // A bare error there kills the whole engine at boot — so on a VRAM-refusal retry at HALF the
+        // chunk, twice at most. The success path never enters this loop body twice, the pin is
+        // session-scoped (`PlacementPins`), and it only ever lowers the height — a slot that has the
+        // room keeps the chunk the ladder chose.
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            let warm = crate::with_profiling_suppressed(|| {
+                crate::seam::generate_dense_session_for(
+                    self.be.as_ref(),
+                    self.model.gguf(),
+                    self.model.config(),
+                    self.model.engine_cfg(),
+                    self.model.embd(),
+                    self.model.per_layer_embd(),
+                    &[1u32],
+                    2,
+                    |_| {},
+                    &mut slot0,
+                    self.max_ctx,
+                    Some(crate::seam::TurnCheckpoint::ENABLED),
+                    None, // constraint
+                    None, // req: startup, not a request — env sampling, no gate
+                    None, // multimodal plan
+                )
+            });
+            match warm {
+                Ok(_) => break,
+                Err(error) => {
+                    let vram_short = error.to_string().contains("budget exceeded");
+                    let lowered = if vram_short && attempt < 3 {
+                        crate::seam::halve_pinned_prefill_chunk(self.model.engine_cfg())
+                    } else {
+                        None
+                    };
+                    match lowered {
+                        Some(rows) => {
+                            tracing::warn!(
+                                attempt,
+                                rows,
+                                %error,
+                                "warmup could not fit its activation scratch; retrying with a \
+                                 smaller pinned prefill chunk (this session only)"
+                            );
+                        }
+                        None => return Err(error),
+                    }
+                }
+            }
+        }
         let mut slot0 = slot0.ok_or_else(|| anyhow!("warmup did not initialize a KV slot"))?;
         // The warmup is what loads the weights, so it is also where the cold init re-clamps the
         // context against the memory the device reports free once they are resident. Take the
@@ -2382,12 +2416,22 @@ impl ParallelSeam {
             .skip(1)
             .map(|work| work.kv.take().expect("long prefill work owns a KV slot"))
             .collect::<Vec<_>>();
-        let result = {
-            // Long prefill owns the pager phase as one transaction. Passing no RequestCtx below
-            // avoids per-chunk baton release and prevents unrelated legacy work from rebuilding
-            // Decode LRU between ring chunks.
-            let _gate = req.gate_pass();
-            crate::seam::generate_dense_vulkan_parallel_prefill_session(
+        // The chunk ladder priced this session BEFORE its KV segments and activation scratch took
+        // their current shape, so a real forward can be a few MiB short exactly like the warmup was
+        // (measured: a 24.0 MiB scratch refused with 14.1 MiB left, two concurrent requests at 256K —
+        // an unwrapped failure reaches the client as a 500). On a VRAM refusal, halve the
+        // SESSION-pinned chunk and run the whole take→forward→put-back block again, at most twice.
+        // The failure happens while the graph is being built, before any compute, so the slot state
+        // the retry re-uses is the state the first attempt started from.
+        let mut forward_attempt = 0usize;
+        let result = loop {
+            forward_attempt += 1;
+            let attempt = {
+                // Long prefill owns the pager phase as one transaction. Passing no RequestCtx below
+                // avoids per-chunk baton release and prevents unrelated legacy work from rebuilding
+                // Decode LRU between ring chunks.
+                let _gate = req.gate_pass();
+                crate::seam::generate_dense_vulkan_parallel_prefill_session(
                 self.be.as_ref(),
                 self.model.gguf(),
                 self.model.config(),
@@ -2401,7 +2445,29 @@ impl ParallelSeam {
                 &prepared,
                 Some(&report_progress),
                 None,
-            )
+                )
+            };
+            match attempt {
+                Ok(stats) => break Ok(stats),
+                Err(error) => {
+                    let lowered =
+                        if error.to_string().contains("budget exceeded") && forward_attempt < 3 {
+                            crate::seam::halve_pinned_prefill_chunk(self.model.engine_cfg())
+                        } else {
+                            None
+                        };
+                    match lowered {
+                        Some(rows) => tracing::warn!(
+                            attempt = forward_attempt,
+                            rows,
+                            %error,
+                            "parallel prefill could not fit its activation scratch; retrying with \
+                             a smaller pinned prefill chunk (this session only)"
+                        ),
+                        None => break Err(error),
+                    }
+                }
+            }
         };
         long[0].kv = primary;
         for (work, kv) in long.iter_mut().skip(1).zip(peers) {
@@ -2783,28 +2849,55 @@ impl ParallelSeam {
             }
             None => RequestCtx::new(active[indices[0]].sampling.clone()),
         };
-        let result = crate::seam::generate_dense_vulkan_parallel_sampled_session(
-            self.be.as_ref(),
-            self.model.gguf(),
-            self.model.config(),
-            self.model.engine_cfg(),
-            self.model.embd(),
-            self.model.per_layer_embd(),
-            &prompts,
-            &prompt_ends,
-            &checkpoints,
-            &mrope_plans,
-            max_steps,
-            &mut primary,
-            &mut peers,
-            self.max_ctx,
-            &mut samplers,
-            &mut reasoning_guards,
-            &mut stream,
-            Some(&self.batch_interrupt),
-            Some(&group_req),
-            sync_mtp,
-        );
+        // Same safety net as long prefill: a decode forward whose activation scratch does not fit is
+        // retried at half the session-pinned chunk rather than failing the request.
+        let mut forward_attempt = 0usize;
+        let result = loop {
+            forward_attempt += 1;
+            let attempt = crate::seam::generate_dense_vulkan_parallel_sampled_session(
+                self.be.as_ref(),
+                self.model.gguf(),
+                self.model.config(),
+                self.model.engine_cfg(),
+                self.model.embd(),
+                self.model.per_layer_embd(),
+                &prompts,
+                &prompt_ends,
+                &checkpoints,
+                &mrope_plans,
+                max_steps,
+                &mut primary,
+                &mut peers,
+                self.max_ctx,
+                &mut samplers,
+                &mut reasoning_guards,
+                &mut stream,
+                Some(&self.batch_interrupt),
+                Some(&group_req),
+                sync_mtp,
+            );
+            match attempt {
+                Ok(stats) => break Ok(stats),
+                Err(error) => {
+                    let lowered =
+                        if error.to_string().contains("budget exceeded") && forward_attempt < 3 {
+                            crate::seam::halve_pinned_prefill_chunk(self.model.engine_cfg())
+                        } else {
+                            None
+                        };
+                    match lowered {
+                        Some(rows) => tracing::warn!(
+                            attempt = forward_attempt,
+                            rows,
+                            %error,
+                            "parallel decode could not fit its activation scratch; retrying with a \
+                             smaller pinned prefill chunk (this session only)"
+                        ),
+                        None => break Err(error),
+                    }
+                }
+            }
+        };
 
         active[indices[0]].kv = primary;
         for (&index, kv) in indices[1..].iter().zip(peers) {

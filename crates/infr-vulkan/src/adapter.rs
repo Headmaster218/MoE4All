@@ -1439,10 +1439,12 @@ fn pooled_batch(
     be_: &VulkanBackend,
     requests: &[(&'static str, usize)],
 ) -> Result<Vec<ScratchKey>> {
-    pool.acquire_batch(requests, |capacities| {
-        be_.alloc_uninit_batch(capacities, BufferUsage::Activations)
-    })
-    .map_err(|error| {
+    let acquire = |pool: &mut ScratchPool| {
+        pool.acquire_batch(requests, |capacities| {
+            be_.alloc_uninit_batch(capacities, BufferUsage::Activations)
+        })
+    };
+    let wrap = |error: infr_core::error::Error| {
         let total = requests
             .iter()
             .fold(0usize, |sum, (_, bytes)| sum.saturating_add(*bytes));
@@ -1451,7 +1453,22 @@ fn pooled_batch(
             requests.len(),
             total
         ))
-    })
+    };
+    match acquire(pool) {
+        Ok(keys) => Ok(keys),
+        Err(error) if error.to_string().contains("budget exceeded") => {
+            // The activation pool is the LAST claim on VRAM, and by the time a graph is built the
+            // pager may still be holding a streamed-expert ring or a transient cohort claim it can
+            // hand back (both are re-derived on the next execute). A session that cannot fit its own
+            // scratch is dead — measured on 2 slots at 256K: a 2,100,224-byte member of this batch
+            // was refused with 0 B left and took the whole engine down at boot. `INFR_ALLOC_BT=1`
+            // is what pointed here. Give the transient claims back and try once more.
+            be_.release_transient_runtime();
+            be_.release_primary_runtime_after_cohort_shrink();
+            acquire(pool).map_err(wrap)
+        }
+        Err(error) => Err(wrap(error)),
+    }
 }
 
 /// Describe the largest QSA indexer workspace used by this graph. QSA first appears late in a

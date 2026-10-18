@@ -1400,6 +1400,15 @@ pub(crate) fn ubatch_rows(ec: &EngineConfig) -> usize {
     let selected = configured
         .or(placed)
         .unwrap_or_else(|| default_ubatch_rows(ec.device.auto_profile));
+    // Emergency retry bound: set only after a forward failed to allocate its activation scratch, and
+    // it overrides EVERYTHING below — including an explicit `--ubatch`/`INFR_UBATCH`. The alternative
+    // is a dead session (see `halve_pinned_prefill_chunk`).
+    let emergency = with_placement_pins(|p| p.ubatch_emergency.load(std::sync::atomic::Ordering::Relaxed));
+    let selected = if emergency == 0 {
+        selected
+    } else {
+        selected.min(emergency)
+    };
     // The MoE residency cap corrects the DEFAULT height only; an explicit `--ubatch`/`INFR_UBATCH`
     // stays authoritative, so the A/B harness can still force the taller chunk that reproduces the
     // streaming regime.
@@ -1555,6 +1564,11 @@ pub(crate) struct PlacementPins {
     /// Prefill lane. Kept separate so ordinary placement/re-clamp pins cannot override an explicit
     /// `INFR_UBATCH`.
     moe_ubatch_cap: std::sync::atomic::AtomicUsize,
+    /// Emergency upper bound set ONLY by a failed-forward retry (see
+    /// [`halve_pinned_prefill_chunk`]): unlike `moe_ubatch_cap` it deliberately overrides even an
+    /// explicit `INFR_UBATCH`, because "the user asked for 512 rows and the activation scratch does
+    /// not fit" must degrade rather than kill the session. 0 = no emergency. Monotonically lowered.
+    ubatch_emergency: std::sync::atomic::AtomicUsize,
     kv_q8: std::sync::OnceLock<()>,
     /// Has this session already reported an activation peak above what it reserved (the runner's
     /// `activation reserve too low` warning)? The condition persists for the session's whole life —
@@ -1648,13 +1662,41 @@ fn pin_ubatch(rows: usize) {
 /// so it buys context; the sweeps chose their height against an ESTIMATE of the weight bytes,
 /// and by here the real ones are known. Refuses to RAISE a height (that could outgrow buffers a
 /// pre-load decision already sized, and on an integrated GPU it is the watchdog bound).
-fn repin_ubatch_lower(rows: usize) {
+pub(crate) fn repin_ubatch_lower(rows: usize) {
     with_placement_pins(|p| {
         let cur = p.ubatch.load(std::sync::atomic::Ordering::Relaxed);
         if cur == 0 || rows < cur {
             p.ubatch.store(rows, std::sync::atomic::Ordering::Relaxed);
         }
     });
+}
+
+/// Halve this session's pinned prefill chunk (never below a small floor) and return the height that
+/// actually stuck, or `None` when it is already at the floor.
+///
+/// The ONE caller is the batched seam's warmup retry: the chunk ladder priced the session against an
+/// ESTIMATE of the weight/KV bytes, and by the time the first forward runs its KV segments may have
+/// grown, leaving the activation scratch a couple of MiB short (`adapter.rs`'s
+/// `alloc_uninit_batch(Activations)` is where that shows up — `INFR_ALLOC_BT=1` prints the backtrace).
+/// Retrying at half height costs nothing on the success path, and the pin is SESSION-scoped: a slot
+/// that has the room keeps its full chunk.
+pub(crate) fn halve_pinned_prefill_chunk(ec: &EngineConfig) -> Option<usize> {
+    let current = ubatch_rows(ec);
+    let next = (current / 2).max(32);
+    if next >= current {
+        return None;
+    }
+    // The emergency pin, not the ordinary lower-only pin: an explicit `INFR_UBATCH` outranks the
+    // latter (by design — A/B harnesses force heights with it), and this path exists precisely for
+    // the case where that requested height does not fit.
+    with_placement_pins(|p| {
+        let cur = p.ubatch_emergency.load(std::sync::atomic::Ordering::Relaxed);
+        if cur == 0 || next < cur {
+            p.ubatch_emergency
+                .store(next, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    Some(ubatch_rows(ec))
 }
 
 pub(crate) fn cap_moe_ubatch(rows: usize) {

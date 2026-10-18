@@ -2150,6 +2150,17 @@ fn kv_overflow_vram_cap(cfg: &infr_core::config::Config) -> Option<u64> {
 /// driver-internal allocations (descriptor pools, pipeline/shader memory, command buffers).
 const GUARD_HEADROOM: u64 = 256 * 1024 * 1024;
 
+/// Auto-mode (no explicit `INFR_KV_OVERFLOW_VRAM_MB`) reserve that the VRAM-first KV placement keeps
+/// free for the NEXT forward's activation scratch.
+///
+/// The KV cache is the last big claim on VRAM and it is claimed *before* the graph that will use it,
+/// so without this the cache fills the card to 0 B and that graph's activation batch is refused —
+/// measured on 2 slots at 256K: a 2,100,224-byte member of `pooled_batch` was refused with 0 B left
+/// and took the whole engine down at boot, even though the KV it displaced is worth far less than the
+/// forward that could not run. `activation_peak` is the measured high-water mark once a forward has
+/// run; the floor stands in for the FIRST segment, which is claimed before any forward exists.
+const KV_AUTO_ACT_RESERVE_FLOOR: u64 = 64 * 1024 * 1024;
+
 /// Free bytes on the DEVICE-LOCAL heaps alone — what the UMA spill decision keys off (unlike
 /// [`vram_info`]'s UMA figure, which spans every heap). Live VK_EXT_memory_budget when present, so
 /// a device-local heap another process has filled reads as full here too; otherwise the heap size
@@ -5417,6 +5428,19 @@ impl VulkanBackend {
             .device
             .vram_budget
             .map(|spec| spec.resolve(v.total).min(v.total));
+        // `INFR_ALLOC_BT=1`: name the caller of a refused allocation. The guard is the ONE place every
+        // device-local allocation funnels through, so a forced backtrace here answers "who ate the last
+        // 2 MiB?" without guessing which growth/fast-path site to instrument — the release profile
+        // carries debug info, so the frames resolve to real functions.
+        if std::env::var_os("INFR_ALLOC_BT").is_some() {
+            tracing::warn!(
+                want,
+                used = process_used,
+                room = self.alloc_room(),
+                "VRAM guard refused {want} bytes; allocation backtrace:\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
         Err(be(format!(
             "{} budget exceeded: {} requested with {} physical / {} backend bytes already in use; \
                  {} remains under the unified limit (physical cap {}, configured cap {}). \
@@ -6354,48 +6378,25 @@ impl VulkanBackend {
                 return Ok(());
             }
 
-            // No unified arena ⇒ this is one device of a layer split (`PipelineBackend`), which
-            // keeps its own weights rather than a shared elastic pool. Claiming from a pool is
-            // impossible here — and a pool could not place a segment outside VRAM anyway, which is
-            // precisely what a windowed KV needs: the low-index (hot) segments resident, the cold
-            // tail in system RAM. Allocate each segment on its own through the ordinary `KvCache`
-            // arm, which is already "VRAM-first, spill the rest to host RAM" (`INFR_KV_OVERFLOW`).
-            // Sibling devices place the same logical segment index by the same rule, and
-            // `KvSegmentedKvBuffer`'s per-device table makes the difference invisible to readers.
-            if self.unified_vram().is_none() {
-                let mut pending = Vec::with_capacity(requests.len());
-                for &(buffer_idx, index, bytes) in &requests {
-                    let segment = self.make_alloc(bytes, BufferUsage::KvCache)?;
-                    let addr = segment.device_addr().ok_or_else(|| {
-                        be("segmented KV standalone segment has no device address")
-                    })?;
-                    let table_ptr = buffers[buffer_idx]
-                        .table
-                        .mapped_ptr()
-                        .ok_or_else(|| be("segmented KV address table is not host-visible"))?;
-                    pending.push((buffer_idx, index, table_ptr, addr, segment));
-                }
-                // Publication is deliberately last (same contract as the arena path below): every
-                // allocation is in hand before any address becomes visible to a kernel.
-                for &(_, index, table_ptr, addr, _) in &pending {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            addr.to_ne_bytes().as_ptr(),
-                            table_ptr.add(index * std::mem::size_of::<u64>()),
-                            std::mem::size_of::<u64>(),
-                        );
-                    }
-                }
-                for (buffer_idx, index, _, _, segment) in pending {
-                    debug_assert_eq!(locked[buffer_idx].len(), index);
-                    locked[buffer_idx].push(segment);
-                }
-                return Ok(());
-            }
-
-            let pool = self
-                .unified_vram()
-                .ok_or_else(|| be("segmented KV lost its unified VRAM arena"))?;
+            // Try the unified arena first (hot segments resident in the shared elastic pool); if it
+            // cannot fit this growth, fall through to the STANDALONE placement below, which is the
+            // ordinary `KvCache` arm: VRAM-first, spilling to host RAM when the guard refuses.
+            //
+            // The fallback matters as much as the fast path. A windowed KV is expected to overflow —
+            // the low-index (hot) segments resident, the cold tail in system RAM — and a pool cannot
+            // place a segment outside VRAM. Without this, growing a second slot's 32K segment by 2 MiB
+            // past the pool's room took the WHOLE session down with a VRAM-guard error instead of
+            // spilling one segment (measured on 2 slots at 256K: "expanded dynamic KV cache ...
+            // committed_tokens=32768" → "VRAM budget exceeded: 2.0 MiB"). Sibling devices place the
+            // same logical segment index by the same rule, and `KvSegmentedKvBuffer`'s per-device
+            // table makes the difference invisible to readers.
+            let pooled: Result<()> = if self.unified_vram().is_none() {
+                Err(be("no unified arena on this device"))
+            } else {
+                (|| -> Result<()> {
+                    let pool = self
+                        .unified_vram()
+                        .ok_or_else(|| be("segmented KV lost its unified VRAM arena"))?;
             if pool.expert_layout().is_some() {
                 // Prefill may temporarily borrow uncommitted coordinates from the frozen KV
                 // corridor. Growing a slot is a serial phase boundary: retire that transient ring
@@ -6522,7 +6523,7 @@ impl VulkanBackend {
             }
 
             let mut pending = Vec::with_capacity(requests.len());
-            for ((buffer_idx, index, bytes), handle) in requests.into_iter().zip(handles) {
+            for (&(buffer_idx, index, bytes), handle) in requests.iter().zip(handles) {
                 let segment = self.unified_sub_buffer(handle, bytes)?;
                 let addr = segment
                     .device_addr()
@@ -6549,6 +6550,46 @@ impl VulkanBackend {
             for (buffer_idx, index, _, _, segment) in pending {
                 debug_assert_eq!(locked[buffer_idx].len(), index);
                 locked[buffer_idx].push(segment);
+            }
+                    Ok(())
+                })()
+            };
+            if let Err(error) = pooled {
+                if self.unified_vram().is_some() {
+                    tracing::warn!(
+                        %error,
+                        segments = requests.len(),
+                        "segmented KV growth could not claim unified VRAM; placing the new segments \
+                         standalone (VRAM-first, spilling to host RAM when the guard refuses)"
+                    );
+                }
+                let mut pending = Vec::with_capacity(requests.len());
+                for &(buffer_idx, index, bytes) in &requests {
+                    let segment = self.make_alloc(bytes, BufferUsage::KvCache)?;
+                    let addr = segment.device_addr().ok_or_else(|| {
+                        be("segmented KV standalone segment has no device address")
+                    })?;
+                    let table_ptr = buffers[buffer_idx]
+                        .table
+                        .mapped_ptr()
+                        .ok_or_else(|| be("segmented KV address table is not host-visible"))?;
+                    pending.push((buffer_idx, index, table_ptr, addr, segment));
+                }
+                // Same publication contract as the pooled path: every allocation and table mapping
+                // is validated before any address becomes visible to a kernel.
+                for &(_, index, table_ptr, addr, _) in &pending {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            addr.to_ne_bytes().as_ptr(),
+                            table_ptr.add(index * std::mem::size_of::<u64>()),
+                            std::mem::size_of::<u64>(),
+                        );
+                    }
+                }
+                for (buffer_idx, index, _, _, segment) in pending {
+                    debug_assert_eq!(locked[buffer_idx].len(), index);
+                    locked[buffer_idx].push(segment);
+                }
             }
             Ok(())
         })
@@ -7212,11 +7253,21 @@ impl VulkanBackend {
                 // whole-host case is reproducible apples-to-apples for benchmarking. It gates ONLY
                 // this KV placement — never the real guard (`vram_budget_fits`/`check_vram_budget`),
                 // which keeps protecting weights + activations against true VRAM.
-                let cap_ok = self
-                    .shared
-                    .kv_spill
-                    .admits(kv_overflow_vram_cap(&self.cfg), bytes as u64);
-                if cap_ok && self.vram_budget_fits(bytes as u64) {
+                let explicit_cap = kv_overflow_vram_cap(&self.cfg);
+                let cap_ok = self.shared.kv_spill.admits(explicit_cap, bytes as u64);
+                // AUTO: never let the KV take the bytes the next forward's activation scratch needs
+                // (see `KV_AUTO_ACT_RESERVE_FLOOR`). An explicit cap is the user's A/B knob, so it
+                // stands alone.
+                let act_ok = if explicit_cap.is_some() {
+                    true
+                } else {
+                    let reserve = self
+                        .activation_peak()
+                        .unwrap_or(0)
+                        .max(KV_AUTO_ACT_RESERVE_FLOOR);
+                    bytes as u64 <= self.alloc_room().saturating_sub(reserve)
+                };
+                if cap_ok && act_ok && self.vram_budget_fits(bytes as u64) {
                     if let Ok(buf) =
                         self.make_buf_ex(bytes, MemoryLocation::GpuOnly, "kv-cache", false, true)
                     {
