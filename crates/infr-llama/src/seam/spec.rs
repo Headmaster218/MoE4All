@@ -37,6 +37,35 @@ use crate::{Config, EngineConfig, GenStats};
 /// configured `spec.k` can spill the KV cache even though those rows are never used.
 pub(crate) const SPEC_MAX_K: usize = crate::mtp::DRAFT_TOKENS;
 
+/// Measured VERIFY-width preference for the Qwen3.8 family.
+///
+/// WHY a measured default: like the layer-split boundary, the per-cycle cost of a VERIFY is not
+/// linear in its row count. Measured on 2x RX 7900 XTX (Qwen3.8-Flash-Next IQ3_XXS, 16K, MTP + Q8_0
+/// sidecar, same prompt and 256 output tokens):
+///
+/// | `spec.k` | alpha | tokens/cycle | wall | decode |
+/// |---|---|---|---|---|
+/// | 3 | 0.724 | 2.45 | 17.2 s | **14.87 tok/s** |
+/// | 4 | 0.636 | 2.91 | | |
+/// | 6 (the config default) | 0.512 | 3.56 | 56.4 s | 4.54 tok/s |
+///
+/// The wider draft commits more rows per cycle, but the cycle itself grows faster than the row
+/// count (the same "kernel/layout terrain" effect the layer split has), so the narrow one wins by
+/// 3.27x.
+///
+/// Applied ONLY while `spec.k` is still the config default (6): an explicit `INFR_SPEC_K` is the
+/// user's A/B knob and always wins — exactly like `INFR_PIPELINE_SPLIT` does for the layer map.
+const VERIFY_WIDTH_PREFERENCE_QWEN38: usize = 3;
+
+/// [`verify_width`] with the measured Qwen3.8 preference applied (see the constant above).
+pub(crate) fn preferred_verify_width(cfg: &Config, ec: &EngineConfig) -> usize {
+    let configured = verify_width(ec);
+    if !cfg.qwen4exp || ec.spec.k != 6 {
+        return configured;
+    }
+    configured.min(VERIFY_WIDTH_PREFERENCE_QWEN38)
+}
+
 /// The VERIFY width this engine instance actually runs. `spec.k` is an upper bound; the loops
 /// clamp it to the architecture's supported `[2, SPEC_MAX_K]` range.
 pub(crate) fn verify_width(ec: &EngineConfig) -> usize {

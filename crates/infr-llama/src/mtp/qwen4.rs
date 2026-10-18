@@ -2559,7 +2559,10 @@ impl Qwen4MtpRuntime {
         let ec = model.engine_cfg();
         // The fixed MTP runtime supports two through eight VERIFY rows. Keep the configured width
         // effective so kernel improvements can change the best batch size without a hidden cap.
-        let verify_tokens = ec.spec.k.clamp(2, DRAFT_TOKENS);
+        // Measured preference (see `spec::VERIFY_WIDTH_PREFERENCE_QWEN38`): the config default of 6
+        // rows costs 3.27x more per token than 3 rows on this family, because the per-cycle cost
+        // grows faster than the row count. An explicit `INFR_SPEC_K` still wins.
+        let verify_tokens = crate::seam::spec::preferred_verify_width(cfg, ec);
         let h_width = cfg.hc_mult * cfg.n_embd;
         let prompt_tokens = model.encode(prompt)?;
         if prompt_tokens.is_empty() {
