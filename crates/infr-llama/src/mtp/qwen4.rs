@@ -2361,7 +2361,7 @@ impl Qwen4MtpRuntime {
             );
             reasoning_eos_guard.mask_eos(cfg, &mut pending_logits);
             let blocked = pending_token;
-            pending_token = super::argmax_row(&pending_logits);
+            pending_token = super::argmax_row(&pending_logits)?;
             tracing::warn!(
                 blocked_token = blocked,
                 replacement_token = pending_token,
@@ -2473,7 +2473,7 @@ impl Qwen4MtpRuntime {
                 let logits = &mut verify_logits[row * cfg.vocab..(row + 1) * cfg.vocab];
                 verify_guard.mask_eos(cfg, logits);
                 let blocked = verify_ids[row];
-                verify_ids[row] = super::argmax_row(logits);
+                verify_ids[row] = super::argmax_row(logits)?;
                 tracing::warn!(
                     row,
                     blocked_token = blocked,

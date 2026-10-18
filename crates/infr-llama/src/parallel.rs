@@ -2878,6 +2878,16 @@ impl ParallelSeam {
 
     fn fail_unified_scheduler(&self, active: &mut Vec<BatchWork>, error: anyhow::Error) {
         let message = error.to_string();
+        if crate::sampling::is_numerical_corruption(&error) {
+            for work in active.iter_mut() {
+                work.kv.as_mut().expect("batch work owns a KV slot").reset();
+            }
+            tracing::error!(
+                active_slots = active.len(),
+                %error,
+                "discarded KV state after non-finite model output"
+            );
+        }
         if let Some(heads) = &self.mtp_heads {
             let mut heads = heads.lock().expect("MTP heads poisoned");
             for work in active.iter() {
@@ -3080,7 +3090,7 @@ impl ParallelSeam {
             );
             work.reasoning_guard.mask_eos(cfg, &mut pending_logits);
             let blocked = pending;
-            pending = crate::mtp::argmax_row(&pending_logits);
+            pending = crate::mtp::argmax_row(&pending_logits)?;
             tracing::warn!(
                 slot = work.slot,
                 blocked_token = blocked,
@@ -3549,7 +3559,7 @@ impl ParallelSeam {
                 let row_logits = &mut logits[row * cfg.vocab..(row + 1) * cfg.vocab];
                 verify_guard.mask_eos(cfg, row_logits);
                 let blocked = ids[row];
-                ids[row] = crate::mtp::argmax_row(row_logits);
+                ids[row] = crate::mtp::argmax_row(row_logits)?;
                 tracing::warn!(
                     slot = work.slot,
                     row,
@@ -3808,7 +3818,7 @@ impl ParallelSeam {
                 let mut heads = heads.lock().expect("MTP heads poisoned");
                 heads[guard.idx].invalidate_live();
             }
-            let (_, stats) = crate::seam::generate_dense_vulkan_session(
+            let result = crate::seam::generate_dense_vulkan_session(
                 self.vk.as_ref(),
                 self.model.gguf(),
                 self.model.config(),
@@ -3832,7 +3842,17 @@ impl ParallelSeam {
                 constraint,
                 Some(req),
                 None,
-            )?;
+            );
+            if result
+                .as_ref()
+                .err()
+                .is_some_and(crate::sampling::is_numerical_corruption)
+            {
+                if let Some(kv) = guard.kv.as_mut() {
+                    kv.reset();
+                }
+            }
+            let (_, stats) = result?;
             return Ok(stats);
         }
 
