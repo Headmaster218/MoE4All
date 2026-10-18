@@ -7093,7 +7093,8 @@ impl<'a> Recorder<'a> {
         } else {
             ("store_q8", crate::gemm::store_q8_spv())
         };
-        let k = self.be.kernel(name, spv, 2, 24);
+        // One 32-lane subgroup owns one Q8_0 block; subgroupMax must cover all 32 values.
+        let k = self.be.kernel_sg(name, spv, 2, 24, 32);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
@@ -7129,7 +7130,8 @@ impl<'a> Recorder<'a> {
         } else {
             ("store_q8_seg", crate::gemm::store_q8_seg_spv())
         };
-        let k = self.be.kernel(name, spv, 2, 24);
+        // Keep the segmented store on the same one-wave-per-Q8-block contract.
+        let k = self.be.kernel_sg(name, spv, 2, 24, 32);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
@@ -7165,7 +7167,8 @@ impl<'a> Recorder<'a> {
         } else {
             ("store_q8_dyn", crate::gemm::store_q8_dyn_spv())
         };
-        let k = self.be.kernel(name, spv, 3, 24);
+        // Replay does not change the quantizer's fixed 32-lane reduction contract.
+        let k = self.be.kernel_sg(name, spv, 3, 24, 32);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         // [4..8] off: unused (from params). [12..16] src_off: always 0 here (a single decode row
@@ -16708,6 +16711,72 @@ mod tests {
             attention_err <= 3e-4,
             "segmented LDS-GQA12 QSA attention differs across 32K: {attention_err:e}"
         );
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn q8_dynamic_store_matches_static_offset_for_f32_and_f16() {
+        let Ok(be) = VulkanBackend::new() else {
+            return;
+        };
+        const ROW_ELEMS: usize = 512;
+        const ROWS: usize = 8;
+        const POS: usize = 5;
+        let cap = ROWS * ROW_ELEMS;
+        let cache_bytes = (cap / 32 * 34).next_multiple_of(4);
+        let values: Vec<f32> = (0..ROW_ELEMS)
+            .map(|i| ((i * 37 + 11) % 251) as f32 / 73.0 - 1.7)
+            .collect();
+        let params = be.alloc(8, BufferUsage::Staging).unwrap();
+        be.upload(
+            params.as_ref(),
+            bytemuck::cast_slice(&[POS as u32, (POS + 1) as u32]),
+        )
+        .unwrap();
+
+        for src_f16 in [false, true] {
+            let src = if src_f16 {
+                upf16(&be, &values)
+            } else {
+                upf32(&be, &values)
+            };
+            let static_cache = be.alloc(cache_bytes, BufferUsage::KvCache).unwrap();
+            let dynamic_cache = be.alloc(cache_bytes, BufferUsage::KvCache).unwrap();
+            let zeroes = vec![0u8; cache_bytes];
+            be.upload(static_cache.as_ref(), &zeroes).unwrap();
+            be.upload(dynamic_cache.as_ref(), &zeroes).unwrap();
+
+            let rec = be.recorder().unwrap();
+            rec.store_q8(
+                src.as_ref(),
+                static_cache.as_ref(),
+                ROW_ELEMS,
+                POS * ROW_ELEMS,
+                cap,
+                src_f16,
+                0,
+            );
+            rec.store_q8_dyn(
+                src.as_ref(),
+                params.as_ref(),
+                dynamic_cache.as_ref(),
+                ROW_ELEMS,
+                cap,
+                src_f16,
+            );
+            rec.finish().unwrap();
+
+            let mut static_bytes = vec![0u8; cache_bytes];
+            let mut dynamic_bytes = vec![0u8; cache_bytes];
+            be.download(static_cache.as_ref(), &mut static_bytes)
+                .unwrap();
+            be.download(dynamic_cache.as_ref(), &mut dynamic_bytes)
+                .unwrap();
+            assert_eq!(
+                dynamic_bytes, static_bytes,
+                "dynamic Q8 store diverged from static offset (src_f16={src_f16})"
+            );
+        }
     }
 
     #[test]
