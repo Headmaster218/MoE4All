@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::{BindWeightFn, MtpTensor};
 
-pub const DRAFT_TOKENS: usize = 4;
+pub const DRAFT_TOKENS: usize = 8;
 
 fn generation_budget(prompt_rows: usize, requested: usize, max_ctx: usize) -> Result<usize> {
     let reserved = prompt_rows
@@ -27,10 +27,107 @@ fn generation_budget(prompt_rows: usize, requested: usize, max_ctx: usize) -> Re
 pub(crate) type SharedWeight<'a> = (&'a dyn Buffer, DType, usize);
 pub(crate) type SharedWeights<'a> = (SharedWeight<'a>, SharedWeight<'a>);
 
+/// The MTP stage-0 / reduced-draft-head switch. Supplying a draft vocabulary is the explicit opt-in:
+/// it both shrinks the draft output head and places the whole draft graph on the first pipeline
+/// card.
+fn mtp_stage0_enabled() -> bool {
+    std::env::var_os("INFR_MTP_STAGE0").is_some()
+}
+
+fn head_alloc_scope(be: &dyn Backend) -> Option<infr_vulkan::HeadAllocScope> {
+    be.backend_any()
+        .and_then(|any| any.downcast_ref::<infr_vulkan::PipelineBackend>())
+        .map(infr_vulkan::PipelineBackend::enter_head_alloc_scope)
+}
+
+fn load_draft_vocab(path: &Path, vocab: usize) -> Result<Vec<u32>> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("read MTP draft vocabulary {}", path.display()))?;
+    if !bytes.len().is_multiple_of(4) {
+        bail!("MTP draft vocabulary {} is not a u32/int32 array", path.display());
+    }
+    let mut ids = Vec::with_capacity(bytes.len() / 4);
+    for chunk in bytes.chunks_exact(4) {
+        let id = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        if id < 0 || id as usize >= vocab {
+            bail!(
+                "MTP draft vocabulary id {id} is outside the model vocabulary {vocab}"
+            );
+        }
+        ids.push(id as u32);
+    }
+    if ids.is_empty() {
+        bail!("MTP draft vocabulary {} is empty", path.display());
+    }
+    Ok(ids)
+}
+
+fn gather_quantized_rows(
+    bytes: &[u8],
+    dtype: DType,
+    in_f: usize,
+    vocab: usize,
+    ids: &[u32],
+) -> Result<Vec<u8>> {
+    if vocab == 0 || bytes.len() % vocab != 0 {
+        bail!(
+            "MTP reduced head: {}-byte tensor is not divisible into {vocab} vocabulary rows",
+            bytes.len()
+        );
+    }
+    let row_bytes = bytes.len() / vocab;
+    let (block_elems, _) = infr_gguf::block_layout(dtype);
+    if !in_f.is_multiple_of(block_elems) || row_bytes % (in_f / block_elems) != 0 {
+        bail!("MTP reduced head: row geometry for {dtype:?} in_f={in_f} is not block aligned");
+    }
+    let mut out = Vec::with_capacity(ids.len() * row_bytes);
+    for &id in ids {
+        let start = id as usize * row_bytes;
+        out.extend_from_slice(&bytes[start..start + row_bytes]);
+    }
+    Ok(out)
+}
+
+fn upload_small_weight(be: &dyn Backend, bytes: &[u8], name: &str) -> Result<Box<dyn Buffer>> {
+    if let Some(pb) = be
+        .backend_any()
+        .and_then(|a| a.downcast_ref::<infr_vulkan::PipelineBackend>())
+    {
+        let device = pb.head_device().unwrap_or_else(|| {
+            if mtp_stage0_enabled() {
+                pb.first_device()
+            } else {
+                pb.last_device()
+            }
+        });
+        let buf = pb
+            .backend(device)
+            .alloc_uninit(bytes.len(), BufferUsage::Weights)
+            .map_err(|e| anyhow!("{name}: {e}"))?;
+        pb.backend(device)
+            .upload(buf.as_ref(), bytes)
+            .map_err(|e| anyhow!("{name}: {e}"))?;
+        return Ok(infr_vulkan::PipelineBuffer::single(device, buf));
+    }
+    let buf = be
+        .alloc_uninit(bytes.len(), BufferUsage::Weights)
+        .map_err(|e| anyhow!("{name}: {e}"))?;
+    be.upload(buf.as_ref(), bytes).map_err(|e| anyhow!("{name}: {e}"))?;
+    Ok(buf)
+}
+
+fn upload_i32_on_first(be: &dyn Backend, values: &[u32], name: &str) -> Result<Box<dyn Buffer>> {
+    let bytes = bytemuck::cast_slice(values);
+    let padded = infr_vulkan::linear::pad_to_u32_align(bytes);
+    upload_small_weight(be, &padded, name)
+}
+
 struct PhaseProfile {
     name: &'static str,
     start: std::time::Instant,
     before: Option<infr_core::pager_profile::Snapshot>,
+    /// Bills the phase's submits to `name` in the flight recorder (no-op without one).
+    _flight_phase: infr_core::timeline::PhaseGuard,
 }
 
 impl PhaseProfile {
@@ -39,6 +136,7 @@ impl PhaseProfile {
             name,
             start: std::time::Instant::now(),
             before: infr_core::pager_profile::active().then(infr_core::pager_profile::snapshot),
+            _flight_phase: infr_core::timeline::phase(name),
         }
     }
 }
@@ -127,7 +225,10 @@ impl Qwen4MtpWeights {
             bail!("Qwen3.8 MTP sidecar requires an arch=qwen4exp target");
         }
         let arch = g.metadata().str("general.architecture").unwrap_or("");
-        if arch != "qwen4exp" {
+        // LOCAL TRIAL: also accept the head's own arch tag. Heads packed from the BF16 checkpoint
+        // (and, per the README's download link, the official unsloth ones) declare `qwen4exp-mtp`;
+        // only the trunk declares plain `qwen4exp`, so this check rejected every external head.
+        if arch != "qwen4exp" && arch != "qwen4exp-mtp" {
             bail!("MTP sidecar architecture is `{arch}`, expected `qwen4exp`");
         }
         let nextn = g
@@ -378,10 +479,10 @@ fn emit_hc_mix(
     }
     let inject = weights.inject;
     let fused_down_inject = fuse_down_inject
-        && rows == 1
+        && rows <= 8
         && inject.is_some_and(|inject| {
             g.desc(weights.down).dtype == DType::Q8_0
-                && g.desc(inject).dtype == DType::F32
+                && matches!(g.desc(inject).dtype, DType::F32 | DType::Q8_0)
                 && hcw.is_multiple_of(32)
         });
     if let Some(inject) = inject.filter(|_| fused_down_inject) {
@@ -1146,13 +1247,16 @@ struct DraftHandles {
     embd: TensorId,
     lm_head: TensorId,
     ids: Vec<TensorId>,
+    vocab_table: Option<TensorId>,
 }
 
 #[allow(clippy::too_many_arguments)]
 fn build_draft_graph(
     cfg: &crate::Config,
     specs: &[(DType, usize)],
-    shared: [(DType, usize); 2],
+    embd: (DType, usize),
+    lm_head: (DType, usize),
+    subset: Option<usize>,
     kv_capacity: usize,
     attention_window: usize,
     start_pos: usize,
@@ -1170,7 +1274,8 @@ fn build_draft_graph(
         .collect::<Vec<_>>();
     let k_cache = g.input(TensorDesc::new(vec![kv_capacity * kvrow], DType::F16));
     let v_cache = g.input(TensorDesc::new(vec![kv_capacity * kvrow], DType::F16));
-    let (weights, handles) = declare_weights(&mut g, specs, shared[0], shared[1]);
+    let (weights, handles) = declare_weights(&mut g, specs, embd, lm_head);
+    let vocab_table = subset.map(|n| g.input(TensorDesc::new(vec![n], DType::I32)));
     let scratch = step_scratch(&mut g, cfg, 1);
     let mut prev_id = id;
     let mut prev_h = h;
@@ -1214,25 +1319,37 @@ fn build_draft_graph(
             fuse_down_inject,
             None,
         );
-        let logits = g.internal(f32d(cfg.vocab));
+        let logits = g.internal(f32d(subset.unwrap_or(cfg.vocab)));
         g.push(Op::Linear {
             x: head_hidden,
             weight: weights.lm_head,
             dst: logits,
             m: 1,
             in_f: cfg.n_embd as u32,
-            out_f: cfg.vocab as u32,
+            out_f: subset.unwrap_or(cfg.vocab) as u32,
             w_off: 0,
         });
         let next_id = g.output(f32d(1));
         g.push(Op::Argmax {
             x: logits,
             dst: next_id,
-            n: cfg.vocab as u32,
+            n: subset.unwrap_or(cfg.vocab) as u32,
             rows: 1,
         });
         out_ids.push(next_id);
-        prev_id = next_id;
+        prev_id = if let Some(table) = vocab_table {
+            let mapped = g.internal(TensorDesc::new(vec![1], DType::I32));
+            g.push(Op::GatherI32 {
+                ids: next_id,
+                table,
+                dst: mapped,
+                rows: 1,
+                ne: 1,
+            });
+            mapped
+        } else {
+            next_id
+        };
         prev_h = h_next;
     }
     (
@@ -1247,6 +1364,7 @@ fn build_draft_graph(
             embd: weights.embd,
             lm_head: weights.lm_head,
             ids: out_ids,
+            vocab_table,
         },
     )
 }
@@ -1255,6 +1373,12 @@ pub(crate) struct Qwen4MtpFixed {
     cfg: crate::Config,
     weights: Vec<Box<dyn Buffer>>,
     specs: Vec<(DType, usize)>,
+    /// Reduced draft output head and its logical spec. `None` keeps the full shared trunk lm_head.
+    reduced_lm_head: Option<Box<dyn Buffer>>,
+    reduced_lm_spec: Option<(DType, usize)>,
+    /// Local draft id -> global model token id. Indexed by the reduced head's argmax.
+    draft_vocab: Option<Vec<u32>>,
+    draft_vocab_table: Option<Box<dyn Buffer>>,
     fuse_down_inject: bool,
     device_catch_plans: Mutex<VecDeque<Arc<DeviceCatchPlan>>>,
 }
@@ -1328,8 +1452,8 @@ pub(crate) struct Qwen4MtpSession {
     prime_last_h: Box<dyn Buffer>,
     draft_id: Box<dyn Buffer>,
     draft_h: Box<dyn Buffer>,
-    draft_positions: [Box<dyn Buffer>; DRAFT_TOKENS],
-    draft_ids: [Box<dyn Buffer>; DRAFT_TOKENS],
+    draft_positions: Vec<Box<dyn Buffer>>,
+    draft_ids: Vec<Box<dyn Buffer>>,
 }
 
 pub(crate) struct Qwen4MtpPrimeCapture {
@@ -1460,38 +1584,35 @@ impl Qwen4MtpSession {
         self.cfg.hc_mult * self.cfg.n_embd
     }
 
-    pub(crate) fn load_fixed_vulkan(
-        vk: &infr_vulkan::VulkanBackend,
+    pub(crate) fn load_fixed_backend(
+        be: &dyn Backend,
+        trunk_g: &Gguf,
         sidecar_path: &Path,
         cfg: &crate::Config,
-    ) -> Result<Arc<Qwen4MtpFixed>> {
-        let bind: &BindWeightFn = &|_name, bytes, dtype, _numel| {
-            let materialized = bytes.materialize();
-            let padded = infr_vulkan::linear::pad_to_u32_align(&materialized);
-            let buffer = vk
-                .alloc(padded.len(), BufferUsage::Weights)
-                .map_err(|e| anyhow!("{e}"))?;
-            vk.upload(buffer.as_ref(), &padded)
-                .map_err(|e| anyhow!("{e}"))?;
-            Ok((buffer, dtype))
-        };
-        Self::load_fixed(
-            bind,
-            sidecar_path,
-            cfg,
-            vk.capabilities().qwen_hc_down_inject && vk.cfg().kernels.qwen_hc_down_inject,
-        )
-    }
-
-    pub(crate) fn load_fixed(
-        bind: &BindWeightFn,
-        sidecar_path: &Path,
-        cfg: &crate::Config,
+        ec: &crate::EngineConfig,
+        want_ctx: usize,
         fuse_down_inject: bool,
     ) -> Result<Arc<Qwen4MtpFixed>> {
         let sidecar = Gguf::open(sidecar_path)
             .with_context(|| format!("open Qwen3.8 MTP sidecar {}", sidecar_path.display()))?;
-        let found = Qwen4MtpWeights::load(&sidecar, cfg)?;
+        let (bind, finish) =
+            crate::seam::bind_head_with_cache(be, &sidecar, cfg, ec, want_ctx)?;
+        let fixed = Self::load_fixed(&*bind, be, trunk_g, &sidecar, cfg, fuse_down_inject)?;
+        if let Some(finish) = finish {
+            finish()?;
+        }
+        Ok(fixed)
+    }
+
+    pub(crate) fn load_fixed(
+        bind: &BindWeightFn,
+        be: &dyn Backend,
+        trunk_g: &Gguf,
+        sidecar: &Gguf,
+        cfg: &crate::Config,
+        fuse_down_inject: bool,
+    ) -> Result<Arc<Qwen4MtpFixed>> {
+        let found = Qwen4MtpWeights::load(sidecar, cfg)?;
         let mut weights = Vec::with_capacity(28);
         let mut specs = Vec::with_capacity(28);
         for tensor in found.ordered() {
@@ -1508,10 +1629,53 @@ impl Qwen4MtpSession {
             weights.push(buffer);
             specs.push((dtype, numel));
         }
+        let (reduced_lm_head, reduced_lm_spec, draft_vocab, draft_vocab_table) =
+            if let Some(path) = std::env::var_os("INFR_MTP_DRAFT_VOCAB") {
+                let ids = load_draft_vocab(Path::new(&path), cfg.vocab)?;
+                let (name, tensor) = if let Some(t) = trunk_g
+                    .tensors()
+                    .iter()
+                    .find(|t| t.name == "output.weight")
+                {
+                    ("output.weight", t)
+                } else {
+                    (
+                        "token_embd.weight",
+                        trunk_g
+                            .tensors()
+                            .iter()
+                            .find(|t| t.name == "token_embd.weight")
+                            .ok_or_else(|| anyhow!("trunk has neither output.weight nor token_embd.weight"))?,
+                    )
+                };
+                let bytes = trunk_g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
+                let gathered = gather_quantized_rows(
+                    bytes,
+                    tensor.dtype,
+                    cfg.n_embd,
+                    cfg.vocab,
+                    &ids,
+                )?;
+                let padded = infr_vulkan::linear::pad_to_u32_align(&gathered);
+                let head = upload_small_weight(be, &padded, "MTP reduced draft head")?;
+                let table = upload_i32_on_first(be, &ids, "MTP draft vocab table")?;
+                (
+                    Some(head),
+                    Some((tensor.dtype, ids.len() * cfg.n_embd)),
+                    Some(ids),
+                    Some(table),
+                )
+            } else {
+                (None, None, None, None)
+            };
         Ok(Arc::new(Qwen4MtpFixed {
             cfg: cfg.clone(),
             weights,
             specs,
+            reduced_lm_head,
+            reduced_lm_spec,
+            draft_vocab,
+            draft_vocab_table,
             fuse_down_inject,
             device_catch_plans: Mutex::new(VecDeque::new()),
         }))
@@ -1534,6 +1698,7 @@ impl Qwen4MtpSession {
         max_ctx: usize,
         max_batch: usize,
     ) -> Result<Arc<Qwen4MtpCatchWorkspace>> {
+        let _head_scope = head_alloc_scope(be);
         let cfg = &fixed.cfg;
         let hcw = cfg.hc_mult * cfg.n_embd;
         let max_batch = max_batch.max(DRAFT_TOKENS).min(max_ctx.max(1));
@@ -1559,6 +1724,7 @@ impl Qwen4MtpSession {
         catch: Arc<Qwen4MtpCatchWorkspace>,
         attention_window: usize,
     ) -> Result<Self> {
+        let _head_scope = head_alloc_scope(be);
         let cfg = &fixed.cfg;
         let hcw = cfg.hc_mult * cfg.n_embd;
         anyhow::ensure!(
@@ -1573,40 +1739,64 @@ impl Qwen4MtpSession {
         let kv_capacity = attention_window;
         let alloc = |bytes, usage| be.alloc(bytes, usage).map_err(|e| anyhow!("{e}"));
         let kv_spec = qwen4_mtp_kv_spec(cfg, kv_capacity)?;
-        let (k_cache, v_cache, segmented_kv) = match be
-            .alloc_segmented_kv(kv_spec)
-            .map_err(|e| anyhow!("{e}"))?
+        let (k_cache, v_cache, segmented_kv) = if let Some(pb) = be
+            .backend_any()
+            .and_then(|any| any.downcast_ref::<infr_vulkan::PipelineBackend>())
         {
-            Some(k_cache) => {
-                let v_cache = be
-                    .alloc_segmented_kv(kv_spec)
-                    .map_err(|e| anyhow!("{e}"))?
-                    .ok_or_else(|| {
-                        anyhow!("Qwen3.8 MTP segmented KV support disappeared during allocation")
-                    })?;
-                (k_cache, v_cache, true)
-            }
-            None => (
-                alloc(kv_spec.logical_bytes, BufferUsage::KvCache)?,
-                alloc(kv_spec.logical_bytes, BufferUsage::KvCache)?,
+            // The head graph and its resident lm_head both run on the last device (see
+            // `seam::bind_head`), so its KV must live there too. `alloc_kv_on` deliberately
+            // does not consume a layer-pair index: the trunk's own layer-ordered KV allocation
+            // still starts at pair 0.
+            let device = pb.head_device().unwrap_or_else(|| {
+                if mtp_stage0_enabled() {
+                    pb.first_device()
+                } else {
+                    pb.last_device()
+                }
+            });
+            (
+                pb.alloc_dedicated_on(device, kv_spec.logical_bytes, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+                pb.alloc_dedicated_on(device, kv_spec.logical_bytes, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
                 false,
-            ),
+            )
+        } else {
+            match be.alloc_segmented_kv(kv_spec).map_err(|e| anyhow!("{e}"))? {
+                Some(k_cache) => {
+                    let v_cache = be
+                        .alloc_segmented_kv(kv_spec)
+                        .map_err(|e| anyhow!("{e}"))?
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "Qwen3.8 MTP segmented KV support disappeared during allocation"
+                            )
+                        })?;
+                    (k_cache, v_cache, true)
+                }
+                None => (
+                    alloc(kv_spec.logical_bytes, BufferUsage::KvCache)?,
+                    alloc(kv_spec.logical_bytes, BufferUsage::KvCache)?,
+                    false,
+                ),
+            }
         };
         let draft_id = alloc(4, BufferUsage::Staging)?;
         let draft_h = alloc(hcw * 4, BufferUsage::Staging)?;
         let prime_last_h = alloc(hcw * 4, BufferUsage::Activations)?;
-        let draft_positions = [
-            alloc(4, BufferUsage::Staging)?,
-            alloc(4, BufferUsage::Staging)?,
-            alloc(4, BufferUsage::Staging)?,
-            alloc(4, BufferUsage::Staging)?,
-        ];
-        let draft_ids = [
-            alloc(4, BufferUsage::Readback)?,
-            alloc(4, BufferUsage::Readback)?,
-            alloc(4, BufferUsage::Readback)?,
-            alloc(4, BufferUsage::Readback)?,
-        ];
+        let mut draft_positions = Vec::with_capacity(DRAFT_TOKENS);
+        let mut draft_ids = Vec::with_capacity(DRAFT_TOKENS);
+        let draft_id_usage = if mtp_stage0_enabled() {
+            // A reduced draft head runs on the first pipeline card; Readback would pin the
+            // Argmax/GatherI32 chain to the last card and break device monotonicity.
+            BufferUsage::Staging
+        } else {
+            BufferUsage::Readback
+        };
+        for _ in 0..DRAFT_TOKENS {
+            draft_positions.push(alloc(4, BufferUsage::Staging)?);
+            draft_ids.push(alloc(4, draft_id_usage)?);
+        }
         let catch_batch = catch
             .buffers
             .lock()
@@ -1652,6 +1842,7 @@ impl Qwen4MtpSession {
         be: &dyn Backend,
         tokens: usize,
     ) -> Result<MutexGuard<'a, Qwen4MtpKvCache>> {
+        let _head_scope = head_alloc_scope(be);
         anyhow::ensure!(
             tokens <= self.max_ctx,
             "Qwen3.8 MTP KV depth {tokens} exceeds the session capacity {}",
@@ -1901,7 +2092,11 @@ impl Qwen4MtpSession {
                 )
                 .map_err(|e| anyhow!("{e}"))?;
             }
-            let specs = [(shared.0 .1, shared.0 .2), (shared.1 .1, shared.1 .2)];
+            let lm_spec = self
+                .fixed
+                .reduced_lm_spec
+                .unwrap_or((shared.1 .1, shared.1 .2));
+            let specs = [(shared.0 .1, shared.0 .2), lm_spec];
             let (graph, handles) = build_catch_graph(
                 &self.cfg,
                 &self.fixed.specs,
@@ -1926,13 +2121,19 @@ impl Qwen4MtpSession {
             }
             bindings.bind(handles.k_cache, kv.k.as_ref());
             bindings.bind(handles.v_cache, kv.v.as_ref());
+            let lm_head = self
+                .fixed
+                .reduced_lm_head
+                .as_ref()
+                .map(|b| b.as_ref())
+                .unwrap_or(shared.1 .0);
             self.bind_common(
                 &mut bindings,
                 &handles.weights,
                 handles.embd,
                 handles.lm_head,
                 shared.0 .0,
-                shared.1 .0,
+                lm_head,
             );
             be.execute(plan.as_ref(), &bindings)
                 .map_err(|e| anyhow!("{e}"))?;
@@ -2136,7 +2337,11 @@ impl Qwen4MtpSession {
         }
 
         let kv = self.kv_for_depth(be, start_pos + rows)?;
-        let specs = [(shared.0 .1, shared.0 .2), (shared.1 .1, shared.1 .2)];
+        let lm_spec = self
+            .fixed
+            .reduced_lm_spec
+            .unwrap_or((shared.1 .1, shared.1 .2));
+        let specs = [(shared.0 .1, shared.0 .2), lm_spec];
         let plan = self.device_catch_plan(
             be,
             rows,
@@ -2160,13 +2365,19 @@ impl Qwen4MtpSession {
         }
         bindings.bind(handles.k_cache, kv.k.as_ref());
         bindings.bind(handles.v_cache, kv.v.as_ref());
+        let lm_head = self
+            .fixed
+            .reduced_lm_head
+            .as_ref()
+            .map(|b| b.as_ref())
+            .unwrap_or(shared.1 .0);
         self.bind_common(
             &mut bindings,
             &handles.weights,
             handles.embd,
             handles.lm_head,
             shared.0 .0,
-            shared.1 .0,
+            lm_head,
         );
         be.execute(plan.plan.as_ref(), &bindings)
             .map_err(|e| anyhow!("{e}"))
@@ -2211,11 +2422,18 @@ impl Qwen4MtpSession {
             be.upload(buffer.as_ref(), bytemuck::bytes_of(&position))
                 .map_err(|e| anyhow!("{e}"))?;
         }
-        let specs = [(shared.0 .1, shared.0 .2), (shared.1 .1, shared.1 .2)];
+        let embd_spec = (shared.0 .1, shared.0 .2);
+        let lm_spec = self
+            .fixed
+            .reduced_lm_spec
+            .unwrap_or((shared.1 .1, shared.1 .2));
+        let subset = self.fixed.draft_vocab.as_ref().map(|ids| ids.len());
         let (graph, handles) = build_draft_graph(
             &self.cfg,
             &self.fixed.specs,
-            specs,
+            embd_spec,
+            lm_spec,
+            subset,
             self.kv_capacity,
             self.attention_window,
             start_pos,
@@ -2234,13 +2452,24 @@ impl Qwen4MtpSession {
         for (id, buffer) in handles.ids.into_iter().zip(&self.draft_ids) {
             bindings.bind(id, buffer.as_ref());
         }
+        if let (Some(id), Some(table)) =
+            (handles.vocab_table, self.fixed.draft_vocab_table.as_ref())
+        {
+            bindings.bind(id, table.as_ref());
+        }
+        let lm_head = self
+            .fixed
+            .reduced_lm_head
+            .as_ref()
+            .map(|b| b.as_ref())
+            .unwrap_or(shared.1 .0);
         self.bind_common(
             &mut bindings,
             &handles.weights,
             handles.embd,
             handles.lm_head,
             shared.0 .0,
-            shared.1 .0,
+            lm_head,
         );
         be.execute(plan.as_ref(), &bindings)
             .map_err(|e| anyhow!("{e}"))?;
@@ -2248,6 +2477,12 @@ impl Qwen4MtpSession {
         for (dst, buffer) in result.iter_mut().zip(&self.draft_ids) {
             be.download(buffer.as_ref(), bytemuck::bytes_of_mut(dst))
                 .map_err(|e| anyhow!("{e}"))?;
+            if let Some(vocab) = self.fixed.draft_vocab.as_ref() {
+                let local = *dst as usize;
+                *dst = *vocab
+                    .get(local)
+                    .ok_or_else(|| anyhow!("MTP draft head returned local id {local} outside its vocabulary"))?;
+            }
         }
         Ok(result)
     }
@@ -2260,20 +2495,34 @@ impl Qwen4MtpSession {
 pub(crate) struct Qwen4MtpRuntime {
     head: Qwen4MtpSession,
     trunk: Option<crate::seam::SeamKv>,
+    /// Native window-pipeline second verifier state (`INFR_MTP_WINDOW_PIPE`). It shares the
+    /// uploaded weights with `trunk` and owns independent KV/recurrent buffers so the next guessed
+    /// window can be advanced while the current one is verified.
+    guess_trunk: Option<crate::seam::SeamKv>,
     max_ctx: usize,
 }
 
 impl Qwen4MtpRuntime {
-    pub(crate) fn new_vulkan(
-        vk: &infr_vulkan::VulkanBackend,
+    pub(crate) fn new_backend(
+        be: &dyn Backend,
         model: &crate::SeamModel,
         sidecar_path: &Path,
         max_ctx: usize,
     ) -> Result<Self> {
         let catch_batch = crate::seam::ubatch_rows(model.engine_cfg());
-        let fixed = Qwen4MtpSession::load_fixed_vulkan(vk, sidecar_path, model.config())?;
+        let fuse_down_inject =
+            be.capabilities().qwen_hc_down_inject && model.engine_cfg().kernels.qwen_hc_down_inject;
+        let fixed = Qwen4MtpSession::load_fixed_backend(
+            be,
+            model.gguf(),
+            sidecar_path,
+            model.config(),
+            model.engine_cfg(),
+            max_ctx,
+            fuse_down_inject,
+        )?;
         let head = Qwen4MtpSession::with_fixed(
-            vk,
+            be,
             fixed,
             max_ctx,
             catch_batch,
@@ -2282,6 +2531,7 @@ impl Qwen4MtpRuntime {
         Ok(Self {
             head,
             trunk: None,
+            guess_trunk: None,
             max_ctx,
         })
     }
@@ -2290,12 +2540,15 @@ impl Qwen4MtpRuntime {
         if let Some(trunk) = self.trunk.as_mut() {
             trunk.reset();
         }
+        if let Some(guess) = self.guess_trunk.as_mut() {
+            guess.reset();
+        }
     }
 
     #[cfg_attr(infr_profile, infr_prof::instrument)]
-    pub(crate) fn generate_vulkan(
+    pub(crate) fn generate_backend(
         &mut self,
-        vk: &infr_vulkan::VulkanBackend,
+        be: &dyn Backend,
         model: &crate::SeamModel,
         prompt: &str,
         max_new: usize,
@@ -2304,7 +2557,7 @@ impl Qwen4MtpRuntime {
     ) -> Result<(crate::GenStats, super::MtpTiming)> {
         let cfg = model.config();
         let ec = model.engine_cfg();
-        // The fixed MTP runtime supports two through four VERIFY rows. Keep the configured width
+        // The fixed MTP runtime supports two through eight VERIFY rows. Keep the configured width
         // effective so kernel improvements can change the best batch size without a hidden cap.
         let verify_tokens = ec.spec.k.clamp(2, DRAFT_TOKENS);
         let h_width = cfg.hc_mult * cfg.n_embd;
@@ -2313,13 +2566,13 @@ impl Qwen4MtpRuntime {
             bail!("Qwen3.8 MTP received an empty prompt");
         }
         // `max_new` is a ceiling, not a capacity demand. Match ordinary decode by clipping it to
-        // the remaining window while retaining the four rows a full VERIFY cycle may touch.
+        // the remaining window while retaining the rows a full VERIFY cycle may touch.
         let max_new = generation_budget(prompt_tokens.len(), max_new, self.max_ctx)?;
         self.reset();
 
         let t_prime = std::time::Instant::now();
-        let (target_bind, finish_fixed_allocations) = crate::seam::vulkan_moe_binder(
-            vk,
+        let (target_bind, finish_fixed_allocations) = crate::seam::bind_trunk(
+            be,
             model.gguf(),
             cfg,
             ec,
@@ -2337,7 +2590,7 @@ impl Qwen4MtpRuntime {
             None,
         )?;
         let (mut pending_token, mut pending_logits) = super::run_qwen4_prime_frontier_with_finish(
-            vk,
+            be,
             &*target_bind,
             model.gguf(),
             cfg,
@@ -2351,7 +2604,7 @@ impl Qwen4MtpRuntime {
             &mut prime_sink,
             None,
         )?;
-        let prime_capture = prime_sink.finish(vk)?;
+        let prime_capture = prime_sink.finish(be)?;
         if reasoning_eos_guard.blocks(cfg, pending_token, ec.sampling.ignore_eos) {
             anyhow::ensure!(
                 pending_logits.len() == cfg.vocab,
@@ -2371,10 +2624,25 @@ impl Qwen4MtpRuntime {
         self.trunk
             .as_mut()
             .expect("target prime initialized a trunk")
-            .mtp_snapshot_delta(vk, cfg)?;
+            .mtp_snapshot_delta(be, cfg)?;
         let prompt_secs = t_prime.elapsed().as_secs_f64();
 
         let mut committed = prompt_tokens;
+        let mut lookup_history = committed.clone();
+        if std::env::var_os("INFR_MTP_WINDOW_PIPE").is_some() && self.guess_trunk.is_none() {
+            let src = self
+                .trunk
+                .as_ref()
+                .expect("target prime initialized a trunk");
+            let mut guess = crate::seam::fork_seam_slot_flat(src, be, cfg, ec)?;
+            let seeded = guess.seed_from(be, cfg, ec, src, committed.len())?;
+            tracing::info!(
+                seeded_prefix_rows = seeded,
+                prompt_rows = committed.len(),
+                "native MTP window pipe: second verifier state ready"
+            );
+            self.guess_trunk = Some(guess);
+        }
         // Keep the target's already-known next token one row ahead of the committed trunk state.
         // The next VERIFY consumes it as row zero, so every batch commits at least one token and
         // rejection never needs a separate correction forward or MTP-head catch-up.
@@ -2393,9 +2661,42 @@ impl Qwen4MtpRuntime {
         {
             cycle += 1;
             let n_past = committed.len();
+            // One timeline step per speculative cycle: draft, VERIFY, and catch-up share it, so the
+            // device submits can be attributed to the phase that issued them without inventing a
+            // second trace format. Positions are the rows VERIFY will process.
+            // The flight recorder needs the same step attribution as the timestamp timeline, but
+            // runs WITHOUT the timestamp queries (see `infr_core::timeline::begin_step`).
+            let _timeline_step = if infr_core::timeline::enabled()
+                || infr_core::timeline::flight_enabled()
+            {
+                let positions = (n_past..n_past + verify_tokens).collect::<Vec<_>>();
+                infr_core::timeline::begin_step(&positions)
+            } else {
+                None
+            };
 
             let t_draft = std::time::Instant::now();
-            let candidates = {
+            let _timeline_draft = infr_core::timeline::span("mtp_cycle_draft");
+            let lookup_enabled = std::env::var_os("INFR_MTP_LOOKUP").is_some();
+            let lookup_min_match = std::env::var("INFR_MTP_LOOKUP_MIN_MATCH")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(8);
+            let (lookup_candidates, lookup_match) = if lookup_enabled {
+                crate::seam::spec::draft_lookup_with_match(
+                    &lookup_history,
+                    verify_tokens.saturating_sub(1),
+                )
+            } else {
+                (Vec::new(), 0)
+            };
+            let use_lookup = lookup_enabled
+                && verify_tokens > 1
+                && lookup_match >= lookup_min_match
+                && lookup_candidates.len() == verify_tokens - 1;
+            let candidates = if use_lookup {
+                lookup_candidates
+            } else {
                 let _profile = PhaseProfile::new("draft");
                 let shared = self
                     .trunk
@@ -2403,7 +2704,7 @@ impl Qwen4MtpRuntime {
                     .expect("target trunk remains initialized")
                     .mtp_shared_weights();
                 self.head.draft(
-                    vk,
+                    be,
                     pending_token,
                     &pending_h,
                     n_past,
@@ -2414,6 +2715,7 @@ impl Qwen4MtpRuntime {
                 )?
             };
             let draft_secs = t_draft.elapsed().as_secs_f64();
+            drop(_timeline_draft);
             timing.draft_secs += draft_secs;
             timing.total_drafted += verify_tokens - 1;
 
@@ -2426,9 +2728,10 @@ impl Qwen4MtpRuntime {
                 .expect("target trunk remains initialized")
                 .mtp_arm_delta_trace(verify_tokens)?;
             let t_verify = std::time::Instant::now();
+            let _timeline_verify = infr_core::timeline::span("mtp_cycle_verify");
             let verify_profile = PhaseProfile::new("verify");
-            let (target_bind, finish_fixed_allocations) = crate::seam::vulkan_moe_binder(
-                vk,
+            let (target_bind, finish_fixed_allocations) = crate::seam::bind_trunk(
+                be,
                 model.gguf(),
                 cfg,
                 ec,
@@ -2436,7 +2739,7 @@ impl Qwen4MtpRuntime {
                 self.max_ctx,
             )?;
             let (mut verify_ids, mut verify_logits, verify_h) = super::run_verify_with_finish(
-                vk,
+                be,
                 &*target_bind,
                 model.gguf(),
                 cfg,
@@ -2449,6 +2752,7 @@ impl Qwen4MtpRuntime {
             )?;
             let verify_secs = t_verify.elapsed().as_secs_f64();
             drop(verify_profile);
+            drop(_timeline_verify);
             timing.verify_secs += verify_secs;
             anyhow::ensure!(
                 verify_ids.len() == verify_tokens
@@ -2487,55 +2791,95 @@ impl Qwen4MtpRuntime {
                 .count();
             let accepted = accepted_spec + 1;
             timing.total_accepted += accepted_spec;
+            if std::env::var_os("INFR_MTP_TRACE_IDS").is_some() && cycle <= 8 {
+                tracing::info!(
+                    "[qwen4 mtp ids {cycle}] pending={pending_token} candidate={:?} verify={:?} accepted_spec={accepted_spec}",
+                    &candidates[..verify_tokens - 1],
+                    &verify_ids[..verify_tokens.min(verify_ids.len())],
+                );
+            }
 
             let t_catchup = std::time::Instant::now();
+            let _timeline_catchup = infr_core::timeline::span("mtp_cycle_catchup");
             if accepted < verify_tokens {
                 let trunk = self
                     .trunk
                     .as_mut()
                     .expect("target trunk remains initialized");
                 let restore_profile = PhaseProfile::new("restore");
-                trunk.mtp_restore_delta_row(vk, accepted)?;
+                trunk.mtp_restore_delta_row(be, accepted)?;
                 drop(restore_profile);
             }
             let new_tokens = &feed[n_past..n_past + accepted];
             committed.extend_from_slice(new_tokens);
+            lookup_history.extend_from_slice(new_tokens);
             pending_token = verify_ids[accepted - 1];
             pending_h = verify_h[(accepted - 1) * h_width..accepted * h_width].to_vec();
             let snapshot_profile = PhaseProfile::new("snapshot");
             self.trunk
                 .as_mut()
                 .expect("target trunk remains initialized")
-                .mtp_snapshot_delta(vk, cfg)?;
+                .mtp_snapshot_delta(be, cfg)?;
             drop(snapshot_profile);
             let emitted = new_tokens.to_vec();
             let catchup_secs = t_catchup.elapsed().as_secs_f64();
+            drop(_timeline_catchup);
             timing.catchup_secs += catchup_secs;
 
             if ec.prof.stages || infr_core::pager_profile::active() {
                 tracing::info!(
-                    "[qwen4 mtp cycle {cycle}] drafted={} accepted={accepted_spec} committed={accepted} draft={:.1}ms verify={:.1}ms catchup={:.1}ms",
+                    "[qwen4 mtp cycle {cycle}] drafted={} accepted={accepted_spec} committed={accepted} lookup={} match={lookup_match} draft={:.1}ms verify={:.1}ms catchup={:.1}ms",
                     verify_tokens - 1,
+                    use_lookup,
                     draft_secs * 1e3,
                     verify_secs * 1e3,
                     catchup_secs * 1e3,
                 );
             }
-            for token in emitted {
-                let eos = hit_eos(token);
-                generated += 1;
-                reasoning_eos_guard.observe(cfg, token);
-                if !eos {
-                    crate::stream_token(
+            if std::env::var_os("INFR_NO_MTP_BATCH_DETOK").is_none() {
+                let mut visible = Vec::with_capacity(emitted.len());
+                let mut stop = false;
+                for &token in &emitted {
+                    let eos = hit_eos(token);
+                    generated += 1;
+                    reasoning_eos_guard.observe(cfg, token);
+                    if !eos {
+                        visible.push(token);
+                    }
+                    if eos || generated >= max_new {
+                        stop = true;
+                        break;
+                    }
+                }
+                if !visible.is_empty() {
+                    crate::stream_tokens(
                         model.tokenizer(),
                         &mut acc,
                         &mut printed,
-                        token,
+                        &visible,
                         &mut on_piece,
                     );
                 }
-                if eos || generated >= max_new {
+                if stop {
                     break 'decode;
+                }
+            } else {
+                for token in emitted {
+                    let eos = hit_eos(token);
+                    generated += 1;
+                    reasoning_eos_guard.observe(cfg, token);
+                    if !eos {
+                        crate::stream_token(
+                            model.tokenizer(),
+                            &mut acc,
+                            &mut printed,
+                            token,
+                            &mut on_piece,
+                        );
+                    }
+                    if eos || generated >= max_new {
+                        break 'decode;
+                    }
                 }
             }
         }
@@ -2571,14 +2915,19 @@ mod tests {
     use super::{
         generation_budget, hidden_shift_copy_lengths, mtp_kv_spec, push_bounded, DeviceCatchPlanKey,
     };
+    use anyhow::anyhow;
+    use infr_core::backend::Backend;
+    use infr_core::backend::BufferUsage;
     use infr_core::tensor::DType;
+    use infr_core::WeightSource;
+    use infr_gguf::Gguf;
     use std::collections::VecDeque;
 
     #[test]
     fn generation_budget_clips_a_large_reply_to_the_remaining_context() {
         assert_eq!(
             generation_budget(200_000, 102_400, 262_144).unwrap(),
-            62_140
+            62_136
         );
     }
 
@@ -2639,5 +2988,161 @@ mod tests {
         assert_eq!(cache, VecDeque::from([2, 3, 4]));
         push_bounded(&mut cache, 5, 0);
         assert_eq!(cache, VecDeque::from([2, 3, 4]));
+    }
+
+    /// Opt-in probe for the off-device draft architecture. It loads the Qwen3.8 MTP sidecar on
+    /// `CpuBackend` and times only `Qwen4MtpSession::draft`; the target trunk is never executed.
+    ///
+    /// Required environment:
+    /// - `INFR_CPU_MTP_TRUNK`: first shard of the Qwen3.8 trunk GGUF
+    /// - `INFR_CPU_MTP_SIDECAR`: Qwen3.8 MTP sidecar GGUF
+    ///
+    /// Optional:
+    /// - `INFR_CPU_MTP_CTX` (default 64)
+    /// - `INFR_CPU_MTP_ITERS` (default 8)
+    /// - `INFR_CPU_MTP_VERIFY_TOKENS` (default 4)
+    /// - `INFR_MTP_DRAFT_VOCAB`: reduced draft vocabulary path
+    #[test]
+    #[ignore = "requires the Qwen3.8 trunk and MTP sidecar on disk"]
+    fn qwen4_cpu_mtp_draft_probe() {
+        let Some(trunk_path) = std::env::var_os("INFR_CPU_MTP_TRUNK") else {
+            eprintln!("skip: INFR_CPU_MTP_TRUNK is not set");
+            return;
+        };
+        let Some(sidecar_path) = std::env::var_os("INFR_CPU_MTP_SIDECAR") else {
+            eprintln!("skip: INFR_CPU_MTP_SIDECAR is not set");
+            return;
+        };
+        let max_ctx = std::env::var("INFR_CPU_MTP_CTX")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(64);
+        let iterations = std::env::var("INFR_CPU_MTP_ITERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(8);
+        let verify_tokens = std::env::var("INFR_CPU_MTP_VERIFY_TOKENS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(4)
+            .clamp(2, super::DRAFT_TOKENS);
+
+        let trunk_g = Gguf::open(std::path::Path::new(&trunk_path))
+            .expect("open Qwen3.8 trunk GGUF");
+        let sidecar = Gguf::open(std::path::Path::new(&sidecar_path))
+            .expect("open Qwen3.8 MTP sidecar");
+        let cfg = crate::Config::from_gguf(&trunk_g).expect("parse Qwen3.8 config");
+        let mut ec = crate::EngineConfig::default();
+        ec.kernels.qwen_hc_down_inject = false;
+        ec.spec.mtp_context = max_ctx;
+        let ec = std::sync::Arc::new(ec);
+        let cpu = infr_cpu::CpuBackend::new_with(ec.clone());
+
+        let bind = |_name: &str, tb: crate::seam::WBytes, dt: DType, _numel: usize| {
+            match tb {
+                crate::seam::WBytes::Mmap(tb) => Ok((cpu.map_weight(tb), dt)),
+                other => {
+                    let bytes = other.materialize();
+                    let buf = cpu
+                        .alloc(bytes.len().max(1), BufferUsage::Weights)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    cpu.upload(buf.as_ref(), &bytes).map_err(|e| anyhow!("{e}"))?;
+                    Ok((buf, dt))
+                }
+            }
+        };
+
+        let t_load = std::time::Instant::now();
+        let fixed = super::Qwen4MtpSession::load_fixed(
+            &bind,
+            &cpu,
+            &trunk_g,
+            &sidecar,
+            &cfg,
+            false,
+        )
+        .expect("load Qwen4 MTP head on CPU");
+        let session = super::Qwen4MtpSession::with_fixed(
+            &cpu,
+            fixed,
+            max_ctx,
+            super::DRAFT_TOKENS,
+            max_ctx,
+        )
+        .expect("build Qwen4 MTP CPU session");
+        let load_secs = t_load.elapsed().as_secs_f64();
+
+        let tensor = |name: &str| {
+            trunk_g
+                .tensors()
+                .iter()
+                .find(|tensor| tensor.name == name)
+                .unwrap_or_else(|| panic!("missing trunk tensor {name}"))
+        };
+        let emb_tensor = tensor("token_embd.weight");
+        let lm_tensor = trunk_g
+            .tensors()
+            .iter()
+            .find(|tensor| tensor.name == "output.weight")
+            .unwrap_or(emb_tensor);
+        let emb = cpu.map_weight(
+            trunk_g
+                .tensor_bytes_arc(&emb_tensor.name)
+                .expect("map trunk token embedding"),
+        );
+        let lm = cpu.map_weight(
+            trunk_g
+                .tensor_bytes_arc(&lm_tensor.name)
+                .expect("map trunk output head"),
+        );
+        let emb_numel = emb_tensor.shape.iter().product::<usize>();
+        let lm_numel = lm_tensor.shape.iter().product::<usize>();
+        let shared = (
+            (emb.as_ref(), emb_tensor.dtype, emb_numel),
+            (lm.as_ref(), lm_tensor.dtype, lm_numel),
+        );
+
+        let h_width = cfg.hc_mult * cfg.n_embd;
+        let mut h = vec![0.0f32; h_width];
+        let mut rng = 0x1234_5678u64;
+        for value in &mut h {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *value = (((rng >> 40) as u32 as f32 / (1u32 << 24) as f32) - 0.5) * 0.1;
+        }
+
+        let run = |start_pos: usize| {
+            session
+                .draft(
+                    &cpu,
+                    0,
+                    &h,
+                    start_pos,
+                    start_pos as i32,
+                    verify_tokens,
+                    shared,
+                )
+                .expect("CPU MTP draft")
+        };
+        let first = run(0);
+        let mut samples = Vec::with_capacity(iterations);
+        for iteration in 0..iterations {
+            let start_pos = (iteration * verify_tokens) % (max_ctx - verify_tokens);
+            let t = std::time::Instant::now();
+            let ids = run(start_pos);
+            samples.push(t.elapsed().as_secs_f64() * 1e3);
+            if iteration == 0 {
+                eprintln!(
+                    "cpu mtp probe first ids={ids:?} warmup_ids={first:?} load={load_secs:.3}s"
+                );
+            }
+        }
+        samples.sort_by(|a, b| a.total_cmp(b));
+        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        let median = samples[samples.len() / 2];
+        eprintln!(
+            "cpu mtp probe ctx={max_ctx} verify_tokens={verify_tokens} reduced_vocab={} samples_ms={samples:?} min={:.2} median={median:.2} mean={mean:.2}",
+            std::env::var_os("INFR_MTP_DRAFT_VOCAB").is_some(),
+            samples[0],
+        );
     }
 }

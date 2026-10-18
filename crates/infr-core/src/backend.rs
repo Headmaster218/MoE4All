@@ -758,6 +758,35 @@ pub trait Backend: Send + Sync {
     // ---- execution (compile once per shape, execute per token/step) ----
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>>;
     fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()>;
+    /// Software-pipelined multi-plan execute (1F1B): the caller passes the plan it wants run NOW
+    /// (`stages`, whose device-0 halves run here while their device-1 halves are deferred to the
+    /// next call) plus the plan whose device-1 half the PREVIOUS call deferred (`deferred`). A
+    /// backend that can drive several devices at once may then overlap a later stage's device-0 work
+    /// against an earlier stage's device-1 work, instead of the devices taking turns.
+    ///
+    /// `after_dev0(i)` runs between stage `i`'s device-0 half and its device-1 half: the host-side
+    /// staging hook (an upload a later stage consumes) must have completed before device 1 is
+    /// released.
+    ///
+    /// Every plan must be passed EXACTLY ONCE across the whole sequence of calls: `deferred` plus
+    /// this call's `stages`, and the final plan again as a last `deferred` with empty `stages` to
+    /// drain it. The default implementation is the serial walk — correct for every single-device
+    /// backend, where the halves are meaningless and a deferred plan is simply run here, in order.
+    fn execute_pipelined(
+        &self,
+        deferred: Option<(&dyn Plan, &Bindings)>,
+        stages: &[(&dyn Plan, &Bindings)],
+        after_dev0: &mut dyn FnMut(usize) -> Result<()>,
+    ) -> Result<()> {
+        if let Some((plan, bindings)) = deferred {
+            self.execute(plan, bindings)?;
+        }
+        for (i, (plan, bindings)) in stages.iter().enumerate() {
+            self.execute(*plan, *bindings)?;
+            after_dev0(i)?;
+        }
+        Ok(())
+    }
     /// Chained decode: run the record-once decode plan `n` times in ONE submission, the sampled
     /// token id flowing device-side from each iteration's `Op::Argmax`/`Op::Sample` into the next
     /// iteration's `Op::EmbedGather` — the caller MUST have bound the sampler output and the
@@ -791,7 +820,44 @@ pub trait Backend: Send + Sync {
         usize::MAX
     }
 
+    /// Downcast hook for the handful of paths that must specialise on the CONCRETE backend — the
+    /// multi-GPU dispatch: MTP's trunk and head binders are the layer-split pipeline's on a
+    /// multi-device session and the single device's otherwise (see `seam::bind_trunk` /
+    /// `seam::bind_head`). Deliberately `Option` rather than `Plan`'s required `as_any`: a backend
+    /// that offers no specialisation (CPU, Metal) is a valid answer, not a panic.
+    fn backend_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
     fn sync(&self) -> Result<()>;
+
+    /// Hold session-lifetime allocations open (the unified-arena policy a single-device Vulkan
+    /// backend owns) until [`Self::finish_deferred_session_allocations`]. Exists on the trait so a
+    /// multi-device engine (the batched `ParallelSeam`, which may drive either one `VulkanBackend`
+    /// or a layer-split `PipelineBackend`) can drive its backend uniformly: backends without an
+    /// elastic arena — and a pipeline, which forwards to each lane — keep the no-op default.
+    fn defer_session_finalization(&self, _deferred: bool) {}
+
+    /// Complete a previously deferred session-finalization boundary. No-op unless the backend
+    /// overrides [`Self::defer_session_finalization`].
+    fn finish_deferred_session_allocations(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Release the runtime scratch a decode cohort claimed once the cohort shrinks (a single-device
+    /// Vulkan backend hands the freed unified-arena slots back to the pager). Exists on the trait so
+    /// the batched seam drives a layer split the same way: a pipeline broadcasts to every lane,
+    /// every other backend is a no-op.
+    fn release_primary_runtime_after_cohort_shrink(&self) {}
+
+    /// Release a cold-load reservation this session took (the unified arena's "weights are still
+    /// landing" window). No-op on a backend that takes none; a layer split forwards to every lane.
+    fn release_moe_load_reservation(&self) {}
+
+    /// Diagnostics only: print the MoE / dense pager tallies (`INFR_PAGER_STATS=1`). No-op where the
+    /// backend owns no pager; a layer split forwards to every lane.
+    fn print_moe_pager_stats(&self) {}
+    fn print_dense_pager_stats(&self) {}
 
     /// Whether the currently loaded model is running any MoE expert layer through a paged VRAM
     /// cache (an expert bank too big to keep fully resident — see `infr_vulkan::pager::GpuPager`).

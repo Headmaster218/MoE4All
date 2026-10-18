@@ -68,15 +68,45 @@ use crate::{be, VulkanBackend};
 /// logits); an expert-bank shard holds each rank's own expert band (different bytes, same per-expert
 /// layout). The executor always unwraps to the per-rank inner `VkBuffer` before it reaches a
 /// sub-backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EpKind {
+    /// Identical bytes on every rank.
+    Replica,
+    /// Each rank owns a contiguous band of experts from a stacked bank.
+    Expert,
+    /// Each rank owns a contiguous input-column band for a row-parallel Linear.
+    Row,
+}
+
 pub struct EpBuffer {
     bufs: Vec<Box<dyn Buffer>>,
+    kind: EpKind,
 }
 
 impl EpBuffer {
     /// Wrap one buffer per rank (a replica set, or an expert-bank shard set — the wrapper is the
     /// same; only the bytes the binder uploaded differ).
     pub fn wrap(bufs: Vec<Box<dyn Buffer>>) -> Box<dyn Buffer> {
-        Box::new(EpBuffer { bufs })
+        Box::new(EpBuffer {
+            bufs,
+            kind: EpKind::Replica,
+        })
+    }
+
+    /// Wrap an expert-bank band set: each rank's buffer holds only its expert band.
+    pub fn wrap_experts(bufs: Vec<Box<dyn Buffer>>) -> Box<dyn Buffer> {
+        Box::new(EpBuffer {
+            bufs,
+            kind: EpKind::Expert,
+        })
+    }
+
+    /// Wrap a row-parallel weight shard set: each rank owns an input-column band.
+    pub fn wrap_rows(bufs: Vec<Box<dyn Buffer>>) -> Box<dyn Buffer> {
+        Box::new(EpBuffer {
+            bufs,
+            kind: EpKind::Row,
+        })
     }
 
     fn on(&self, r: usize) -> Result<&dyn Buffer> {
@@ -84,6 +114,10 @@ impl EpBuffer {
             .get(r)
             .map(|b| b.as_ref())
             .ok_or_else(|| be(format!("ep: no buffer for rank {r}")))
+    }
+
+    fn kind(&self) -> EpKind {
+        self.kind
     }
 }
 
@@ -107,6 +141,12 @@ fn as_ep(buf: &dyn Buffer) -> Result<&EpBuffer> {
         .ok_or_else(|| be("ep: a buffer bound to an ExpertParallelBackend was not an EpBuffer"))
 }
 
+fn ep_kind(buf: &dyn Buffer) -> Option<EpKind> {
+    buf.as_any()
+        .downcast_ref::<EpBuffer>()
+        .map(EpBuffer::kind)
+}
+
 /// One contiguous run of ops that runs on every rank, plus (except for the last) the MoE `dst`
 /// boundary to all-reduce after it.
 struct Segment {
@@ -127,15 +167,15 @@ struct Prepared {
     /// runner allocated. Kept for `desc()` lookups.
     lowered: Graph,
     segments: Vec<Segment>,
-    /// The MoE `dst` boundary tensors, promoted from Internal to bound Input: `tid -> per-rank
-    /// persistent buffer`. The MoE `dst` (`sub`) is written by a segment's final `Op::MoeFfn` and
-    /// read by the NEXT segment's residual `Add`, so it must be a persistent bound buffer that
-    /// survives across the cut (and is the buffer the all-reduce sums in place) — exactly like TP's
-    /// row-parallel boundary. Every layer's MoE `dst` is the same reused scratch tid, so one per-rank
-    /// buffer set serves them all.
+    /// Reduce boundaries promoted from Internal to bound Input: `tid -> per-rank persistent buffer`.
+    /// A boundary is written by a segment's final sharded op and read by the next segment, so it
+    /// must survive across the cut and is the buffer the all-reduce sums in place.
     boundary: HashMap<TensorId, Vec<Box<dyn Buffer>>>,
-    /// The cross-device all-reduce transport, over the (single, reused) MoE `dst` size.
+    /// The cross-device all-reduce transport. Boundaries are padded to the largest boundary width;
+    /// every `reduce` call uses this same element count, so one compiled transport serves every cut.
     allreduce: AllReduce,
+    /// Elements in the padded all-reduce transport.
+    reduce_elems: usize,
 }
 
 /// An [`ExpertParallelBackend`] plan: the full graph + its lazily-built lowering.
@@ -216,45 +256,80 @@ impl ExpertParallelBackend {
     }
 
     /// Lower `full` (the runner's global-dim graph) into per-rank segments + the all-reduce transport.
-    /// Called once per plan (the first execute). Only [`Op::MoeFfn`] ops are sharded (their `dst`
-    /// becomes a per-rank partial reduced right after); everything else runs replicated + identical.
-    fn prepare(&self, full: &Graph) -> Result<Prepared> {
+    /// Called once per plan (the first execute). Expert banks are sharded by expert; weights bound
+    /// as `EpKind::Row` are sharded by input columns and their full-width partial output is reduced
+    /// right after the op. Everything else runs replicated.
+    fn prepare(&self, full: &Graph, bindings: &Bindings) -> Result<Prepared> {
         let w = self.world();
         let n_ops = full.ops.len();
 
-        // ── shrink the expert-bank tensor decls to the per-rank band ──────────────────────────────
-        // The bound expert-bank buffer on each rank holds only E/W experts (the binder uploaded just
-        // the band), so the Weight decl must match or the sub-backend's size math disagrees. Router
-        // and every other weight stay full (replicated). `up_exps == gate_exps` when fused, so a set
-        // dedupes the shrink.
         let mut lowered = full.clone();
         let mut bank_tids: HashSet<TensorId> = HashSet::new();
+        let mut row_tids: HashSet<TensorId> = HashSet::new();
+        let mut cuts: Vec<usize> = Vec::new();
+        let mut cut_dsts: Vec<TensorId> = Vec::new();
+        let mut boundary: HashSet<TensorId> = HashSet::new();
         let mut n_moe = 0usize;
-        for op in &full.ops {
-            if let Op::MoeFfn {
-                gate_exps,
-                up_exps,
-                down_exps,
-                n_expert,
-                ..
-            } = op
-            {
-                n_moe += 1;
-                if (*n_expert as usize) != self.n_expert {
-                    return Err(be(format!(
-                        "ep: Op::MoeFfn n_expert={n_expert} disagrees with the backend's \
-                         n_expert={} (all MoE layers must share the same expert count)",
-                        self.n_expert
-                    )));
+        for (i, op) in full.ops.iter().enumerate() {
+            match op {
+                Op::MoeFfn {
+                    gate_exps,
+                    up_exps,
+                    down_exps,
+                    n_expert,
+                    dst,
+                    ..
+                } => {
+                    n_moe += 1;
+                    if (*n_expert as usize) != self.n_expert {
+                        return Err(be(format!(
+                            "ep: Op::MoeFfn n_expert={n_expert} disagrees with the backend's \
+                             n_expert={} (all MoE layers must share the same expert count)",
+                            self.n_expert
+                        )));
+                    }
+                    if !(*n_expert as usize).is_multiple_of(w) {
+                        return Err(be(format!(
+                            "ep: Op::MoeFfn n_expert={n_expert} not divisible by world {w}"
+                        )));
+                    }
+                    bank_tids.insert(*gate_exps);
+                    bank_tids.insert(*up_exps);
+                    bank_tids.insert(*down_exps);
+                    cuts.push(i);
+                    cut_dsts.push(*dst);
+                    boundary.insert(*dst);
                 }
-                if !(*n_expert as usize).is_multiple_of(w) {
-                    return Err(be(format!(
-                        "ep: Op::MoeFfn n_expert={n_expert} not divisible by world {w}"
-                    )));
+                Op::Linear {
+                    weight,
+                    dst,
+                    w_off,
+                    in_f,
+                    ..
+                } if bindings
+                    .get(*weight)
+                    .is_some_and(|buf| ep_kind(buf) == Some(EpKind::Row)) =>
+                {
+                    if *w_off != 0 {
+                        return Err(be(format!(
+                            "ep: row-parallel Linear {i} has w_off={w_off}; fused weight groups \
+                             must be disabled for row-parallel dense execution"
+                        )));
+                    }
+                    if !(*in_f as usize).is_multiple_of(w) {
+                        return Err(be(format!(
+                            "ep: row-parallel Linear {i} in_f={in_f} not divisible by world {w}"
+                        )));
+                    }
+                    row_tids.insert(*weight);
+                    if let Op::Linear { in_f, .. } = &mut lowered.ops[i] {
+                        *in_f = (*in_f) / w as u32;
+                    }
+                    cuts.push(i);
+                    cut_dsts.push(*dst);
+                    boundary.insert(*dst);
                 }
-                bank_tids.insert(*gate_exps);
-                bank_tids.insert(*up_exps);
-                bank_tids.insert(*down_exps);
+                _ => {}
             }
         }
         if n_moe == 0 {
@@ -263,6 +338,13 @@ impl ExpertParallelBackend {
                  model",
             ));
         }
+        if cuts.is_empty() {
+            return Err(be("ep: the graph has no sharded op"));
+        }
+
+        // ── shrink the sharded Weight decls to the per-rank buffer size ───────────────────────────
+        // Expert banks hold E/W experts; row-parallel weights hold in_f/W input columns. Router,
+        // norms, embeddings and the LM head stay full (replicated).
         for &tid in &bank_tids {
             let decl = &mut lowered.tensors[tid.0 as usize];
             let n = decl.desc.numel();
@@ -274,27 +356,27 @@ impl ExpertParallelBackend {
             }
             decl.desc = TensorDesc::new(vec![n / w], decl.desc.dtype);
         }
+        for &tid in &row_tids {
+            let decl = &mut lowered.tensors[tid.0 as usize];
+            let n = decl.desc.numel();
+            if !n.is_multiple_of(w) {
+                return Err(be(format!(
+                    "ep: row-parallel weight {} numel={n} not divisible by world {w}",
+                    tid.0
+                )));
+            }
+            decl.desc = TensorDesc::new(vec![n / w], decl.desc.dtype);
+        }
 
-        // ── segment cuts: after each Op::MoeFfn (its dst partial is all-reduced) ───────────────────
-        let cuts: Vec<usize> = (0..n_ops)
-            .filter(|&i| matches!(full.ops[i], Op::MoeFfn { .. }))
-            .collect();
+        // ── segment cuts: after every sharded op (its dst partial is all-reduced) ────────────────
         let mut bounds: Vec<usize> = cuts.iter().map(|&c| c + 1).collect();
         if bounds.last() != Some(&n_ops) {
             bounds.push(n_ops);
         }
 
-        // ── promote the MoE `dst` boundaries (Internal → Input) so they persist across the cut ─────
-        // Each MoeFfn `dst` is written at a segment's end and read by the next segment's residual
-        // Add, and is the buffer the all-reduce sums, so it must be a bound persistent buffer (the
-        // runner leaves it Internal — a per-segment scratch would neither carry the value nor be
-        // addressable by the reduce). Same reused scratch tid across all layers → one buffer set.
-        let mut boundary: HashSet<TensorId> = HashSet::new();
-        for &c in &cuts {
-            if let Op::MoeFfn { dst, .. } = &lowered.ops[c] {
-                boundary.insert(*dst);
-            }
-        }
+        // ── promote the reduce boundaries (Internal → Input) so they persist across the cut ───────
+        // A boundary is written by a segment's final sharded op and read by the next segment, and is
+        // the buffer the all-reduce sums in place, so it must be a bound persistent buffer.
         for &tid in &boundary {
             lowered.tensors[tid.0 as usize].kind = TensorKind::Input;
         }
@@ -303,21 +385,18 @@ impl ExpertParallelBackend {
         let nl = self.n_expert / w; // experts per band
         let mut segments = Vec::with_capacity(bounds.len());
         let mut sizes: Vec<usize> = Vec::new();
-        let mut reduce_dtype = infr_core::tensor::DType::F32;
+        let reduce_dtype = infr_core::tensor::DType::F32;
         let mut lo = 0usize;
         for (si, &hi) in bounds.iter().enumerate() {
-            // The reduce boundary for this segment is the cut op's (MoeFfn) dst — None for the last.
-            let reduce = if si + 1 < bounds.len() {
-                match &lowered.ops[hi - 1] {
-                    Op::MoeFfn { dst, .. } => Some(*dst),
-                    _ => None,
-                }
-            } else {
-                None
-            };
+            let reduce = (si + 1 < bounds.len()).then(|| cut_dsts[si]);
             if let Some(tid) = reduce {
                 let desc = lowered.desc(tid);
-                reduce_dtype = desc.dtype;
+                if desc.dtype != reduce_dtype {
+                    return Err(be(format!(
+                        "ep: reduce boundary {tid:?} has dtype {:?}, expected F32",
+                        desc.dtype
+                    )));
+                }
                 sizes.push(desc.numel() * crate::tp_allreduce::dtype_bytes(desc.dtype));
             }
             // Ops this segment needs bound.
@@ -355,27 +434,33 @@ impl ExpertParallelBackend {
             lo = hi;
         }
 
-        // ── per-rank persistent boundary buffers (one set per distinct MoE `dst` tid) ──────────────
-        // All MoE `dst` boundaries share the reused scratch tid + size; the single reduce transport
-        // requires them equal (asserted), not silently `max`-ed.
+        // ── per-rank persistent boundary buffers (one set per distinct reduce tid) ────────────────
+        // The transport has one fixed padded width. Boundary buffers are allocated at that width;
+        // the logical tensor occupies a prefix and the zeroed padding participates harmlessly.
+        let reduce_bytes = sizes.iter().copied().max().unwrap_or(0);
+        let reduce_bytes = reduce_bytes
+            .checked_add(3)
+            .map(|bytes| bytes / 4 * 4)
+            .ok_or_else(|| be("ep: reduce boundary size overflow"))?;
         let mut boundary_bufs: HashMap<TensorId, Vec<Box<dyn Buffer>>> = HashMap::new();
         for &tid in &boundary {
-            let bytes = lowered.desc(tid).numel()
-                * crate::tp_allreduce::dtype_bytes(lowered.desc(tid).dtype);
             let mut bufs = Vec::with_capacity(w);
             for r in 0..w {
-                bufs.push(self.ranks[r].alloc(bytes, BufferUsage::Activations)?);
+                bufs.push(
+                    self.ranks[r].alloc(reduce_bytes, BufferUsage::Activations)?,
+                );
             }
             boundary_bufs.insert(tid, bufs);
         }
 
-        let reduce_bytes = crate::tp_allreduce::uniform_boundary_bytes(&sizes)?;
         let allreduce = AllReduce::new(&self.ranks, reduce_bytes, reduce_dtype, self.use_p2p)?;
+        let reduce_elems = reduce_bytes / crate::tp_allreduce::dtype_bytes(reduce_dtype);
         Ok(Prepared {
             lowered,
             segments,
             boundary: boundary_bufs,
             allreduce,
+            reduce_elems,
         })
     }
 }
@@ -385,18 +470,24 @@ impl Backend for ExpertParallelBackend {
         "vulkan-expert-parallel"
     }
 
+    fn backend_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     fn capabilities(&self) -> Capabilities {
-        // Rank 0's caps with the GPU-resident fast paths the EP segment executor does not model
-        // turned OFF: the runner then takes the classic host-embed + host-sample static per-token
-        // `execute` path (keeps the residual `hidden` a bound Input the executor hands through). The
-        // attention qkv/dense fuses are LEFT ON — attention is replicated (not sharded) under EP, so
-        // fused projections run identically on every rank.
+        // Rank 0's caps with decode replay/sample off (the EP segment executor does not model those
+        // one-submit forms). Embedding gather and row argmax ARE modeled: every segment runs the op
+        // on each rank, and both outputs are replicated, so Qwen3.8 MTP VERIFY can use the same
+        // runner path as the single-device backend. Combined gate/up (and qkv) fusions are disabled
+        // because the row-parallel binder needs the separate projection tensors to slice their
+        // input-column bands.
         let mut c = self.ranks[0].capabilities();
         c.decode_replay = false;
-        c.embed_gather = false;
+        c.embed_gather = true;
         c.gpu_sample = false;
-        c.argmax_rows = false;
+        c.argmax_rows = true;
         c.argmax_prob = false;
+        c.combined_gu = false;
         // The segment executor hands `hidden` between ranks through its own buffers; the caller's
         // is only read at the start of a step.
         c.graph_input_inplace = false;
@@ -457,26 +548,55 @@ impl Backend for ExpertParallelBackend {
             .ok_or_else(|| be("ep: execute got a non-ep plan"))?;
         let mut guard = ep.prepared.lock().expect("ep plan poisoned");
         if guard.is_none() {
-            *guard = Some(self.prepare(&ep.graph)?);
+            *guard = Some(self.prepare(&ep.graph, bindings)?);
         }
         let prep = guard.as_ref().expect("prepared just set");
         let w = self.world();
 
         for seg in &prep.segments {
-            // Run this segment on every rank (independent devices).
-            for r in 0..w {
-                let mut sub = Bindings::new();
-                for &t in &seg.needed {
-                    if let Some(bufs) = prep.boundary.get(&t) {
-                        // A promoted MoE `dst` boundary: this backend owns its per-rank buffer.
-                        sub.bind(t, bufs[r].as_ref());
-                    } else if let Some(buf) = bindings.get(t) {
-                        sub.bind(t, as_ep(buf)?.on(r)?);
-                    }
-                    // (unbound = an Internal scratch the rank allocates itself)
+            // Run this segment on every rank CONCURRENTLY. The old serial loop made the two GPUs
+            // take turns for every segment; all-reduce then paid the full round trip on top.
+            // Each rank owns its own device, queue and backend, so the submissions are independent;
+            // the all-reduce after the join provides the cross-rank ordering.
+            std::thread::scope(|scope| -> Result<()> {
+                let mut workers = Vec::with_capacity(w);
+                for r in 0..w {
+                    let rank = &self.ranks[r];
+                    let plan = &seg.plans[r];
+                    let needed = &seg.needed;
+                    let boundary = &prep.boundary;
+                    workers.push(scope.spawn(move || -> Result<()> {
+                        let mut sub = Bindings::new();
+                        for &t in needed {
+                            if let Some(bufs) = boundary.get(&t) {
+                                // A promoted MoE `dst` boundary: this backend owns its per-rank
+                                // buffer.
+                                sub.bind(t, bufs[r].as_ref());
+                            } else if let Some(buf) = bindings.get(t) {
+                                sub.bind(t, as_ep(buf)?.on(r)?);
+                            }
+                            // (unbound = an Internal scratch the rank allocates itself)
+                        }
+                        rank.execute(plan.as_ref(), &sub)
+                    }));
                 }
-                self.ranks[r].execute(seg.plans[r].as_ref(), &sub)?;
-            }
+                let mut first_err = None;
+                for worker in workers {
+                    match worker.join() {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            first_err.get_or_insert(error);
+                        }
+                        Err(_) => {
+                            return Err(be("ep: rank worker panicked"));
+                        }
+                    }
+                }
+                match first_err {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                }
+            })?;
             // All-reduce the MoE `dst` partial across ranks (sum) → the full weighted top-k output,
             // identical on every rank, so the following residual Add reads the same value everywhere.
             if let Some(tid) = seg.reduce {
@@ -484,8 +604,8 @@ impl Backend for ExpertParallelBackend {
                     .boundary
                     .get(&tid)
                     .ok_or_else(|| be("ep: reduce tensor has no boundary buffer"))?;
-                let elems = prep.lowered.desc(tid).numel();
-                prep.allreduce.reduce(&self.ranks, bufs, elems)?;
+                prep.allreduce
+                    .reduce(&self.ranks, bufs, prep.reduce_elems)?;
             }
         }
         Ok(())

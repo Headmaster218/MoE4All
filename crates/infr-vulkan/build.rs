@@ -886,6 +886,16 @@ fn main() {
             "qsa_attention_batch_q8_seg_gqa12_flash_cm_qk_pv",
             &["-DCOOP_QK", "-DCOOP_PV"],
         ),
+        (
+            "qsa_attention_batch_gqa12_flash",
+            "qsa_attention_batch_q8_seg_gqa12_flash_cm_qk_pv_union",
+            &["-DCOOP_QK", "-DCOOP_PV", "-DQSA_UNION"],
+        ),
+        // QSA prefill union planner: bitmap -> rank -> in-place index rewrite -> compact K/V copy.
+        ("qsa_union_bits", "qsa_union_bits", &[]),
+        ("qsa_union_rank", "qsa_union_rank", &[]),
+        ("qsa_union_apply", "qsa_union_apply", &[]),
+        ("qsa_union_gather", "qsa_union_gather", &[]),
         // DeepSeek V4 Sinkhorn hyper-connections (Op::HyperConnectMix / Pre / Post). `-DGATES`
         // adds the `post` + `comb` outputs; without it the mix kernel is `build_hc_head`'s
         // pre-only form, whose `mixes` is the pre chunk alone.
@@ -1519,6 +1529,11 @@ fn main() {
         ("native_gemv_mrow", "native_mrow_q6k", &["-DFMT_Q6K"]),
         ("native_gemv_mrow", "native_mrow_iq4nl", &["-DFMT_IQ4NL"]),
         ("native_gemv_mrow", "native_mrow_iq4xs", &["-DFMT_IQ4XS"]),
+        (
+            "native_gemv_mrow",
+            "native_mrow_iq3s",
+            &["-DFMT_IQ3S", "-DUSE_GRID"],
+        ),
         ("native_gemv_mrow", "native_mrow_q2_0", &["-DFMT_Q2_0"]),
         (
             "native_gemv",
@@ -1774,6 +1789,38 @@ fn main() {
             "native_gemv_id_multi",
             "native_idm_iq3s",
             &["-DFMT_IQ3S", "-DUSE_GRID"],
+        ),
+        // Resident-BDA IQ3_S with the immutable codebook in binding 0 instead of staging it into
+        // LDS once per workgroup. The streamed-twin pass appends -DSTREAMED; PAGED is deliberately
+        // absent so this stays the LUT-less resident form used by linear_native_id_multi_at.
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3s_buffer",
+            &["-DFMT_IQ3S", "-DIQ3_GRID_BUFFER"],
+        ),
+        // Resident-BDA IQ2_S twin: Qwen3.8's 2560x640 gate/up uses IQ2_S in a large share of
+        // layers, and the tree kernel stages its codebook into LDS for every output workgroup.
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_buffer",
+            &["-DFMT_IQ2S", "-DIQ2_GRID_BUFFER"],
+        ),
+        // Same immutable-codebook route for IQ2_XS. It uses a distinct 512x64 table, so the
+        // shader needs its own binding declaration (`IQ2XS_GRID_BUFFER`).
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2xs_buffer",
+            &["-DFMT_IQ2XS", "-DIQ2XS_GRID_BUFFER"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2xxs_buffer",
+            &["-DFMT_IQ2XXS", "-DIQ2XXS_GRID_BUFFER"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3xxs_buffer",
+            &["-DFMT_IQ3XXS", "-DIQ3XXS_GRID_BUFFER"],
         ),
         (
             "native_gemv_id_multi",
@@ -2208,6 +2255,39 @@ fn main() {
             "native_gemv_id_multi_sg",
             "native_idm_iq3s_sg8",
             &["-DFMT_IQ3S", "-DUSE_GRID", "-DNR=8"],
+        ),
+        // Decode down projections for the mixed-quant Qwen3.8 expert banks. Their shape is
+        // in_f=640/out_f=2560 — the projection band the SG route was cut for — and the tree
+        // kernel still costs ~240us / ~130us per dispatch for IQ4_NL / Q2_0 respectively.
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_iq4nl_sg2",
+            &["-DFMT_IQ4NL", "-DNR=2"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_iq4nl_sg4",
+            &["-DFMT_IQ4NL", "-DNR=4"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_iq4nl_sg8",
+            &["-DFMT_IQ4NL", "-DNR=8"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q2_0_sg2",
+            &["-DFMT_Q2_0", "-DNR=2"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q2_0_sg4",
+            &["-DFMT_Q2_0", "-DNR=4"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q2_0_sg8",
+            &["-DFMT_Q2_0", "-DNR=8"],
         ),
         (
             "native_gemv_id_multi_sg",
@@ -3178,6 +3258,31 @@ fn main() {
             "native_gemm_mmq_iq3_xxs_xpg32",
             &["-DFMT_IQ3XXS", "-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
         ),
+        // IQ2_XXS: the mixed-imatrix IQ3_XXS file's gate/up banks are Iq2Xxs on 9 of its 48 MoE
+        // layers, which kept the whole model off the batched-prefill path (moe_batched_ok is an
+        // ALL-layers derivation) and left its prefill at the per-token rate — 26 t/s on the dual
+        // 7900 XTX pipeline. Same 8-byte grid entries as IQ2_XS (only the index/scale bytes
+        // differ), so these are the same four variants.
+        (
+            "native_gemm_mmq_iq_xs",
+            "native_gemm_mmq_iq2_xxs_xp",
+            &["-DFMT_IQ2XXS", "-DEXPERT_GRID"],
+        ),
+        (
+            "native_gemm_mmq_iq_xs",
+            "native_gemm_mmq_iq2_xxs_xp32",
+            &["-DFMT_IQ2XXS", "-DEXPERT_GRID", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_iq_xs",
+            "native_gemm_mmq_iq2_xxs_xpg",
+            &["-DFMT_IQ2XXS", "-DEXPERT_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemm_mmq_iq_xs",
+            "native_gemm_mmq_iq2_xxs_xpg32",
+            &["-DFMT_IQ2XXS", "-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
+        ),
         // BM=32 row-tile variants of the expert-grid GEMM (see matmul_mmq_experts' `n_used` doc):
         // at small rows-per-expert (Qwen3.6-MoE's 256-expert pool averages ~16/expert at pp512)
         // the default BM=64 tile is ~75% masked waste — a BM=32 tile halves that. Selected
@@ -3476,6 +3581,11 @@ fn main() {
         ("embed_gather", "embed_gather_q6k", &["-DFMT_Q6K"]),
         ("embed_gather", "embed_gather_iq4nl", &["-DFMT_IQ4NL"]),
         ("embed_gather", "embed_gather_iq4xs", &["-DFMT_IQ4XS"]),
+        // LOCAL TRIAL: IQ3_S trunk embeddings (the Qwen3.8 IQ3_XXS GGUF ships token_embd as
+        // IQ3_S). dqblk's FMT_IQ3S decode already exists in native_decode.glsl; the gather family
+        // simply never enrolled the i-quant set, which left `embed_gather_supported(IQ3_S)=false`
+        // and in turn `gpu_embed=false` — and MTP VERIFY hard-requires gpu_embed.
+        ("embed_gather", "embed_gather_iq3s", &["-DFMT_IQ3S", "-DUSE_GRID"]),
         // Q2_0 (Bonsai ternary): the shipped Bonsai GGUFs quantize token_embd.weight itself as
         // Q2_0, so the gather kernel needs the format or prefill falls back to host embedding.
         ("embed_gather", "embed_gather_q2_0", &["-DFMT_Q2_0"]),
@@ -3506,6 +3616,9 @@ fn main() {
         ("dg_eb_sample", "dg_eb_sample", &[]),
         ("moe_bucket_count", "moe_bucket_count", &[]),
         ("moe_bucket_scan", "moe_bucket_scan", &[]),
+        // Batched-MoE expert-GEMM dispatch prologue: derive the indirect dispatch's grid width
+        // from the on-GPU bucket counts (see shaders/moe_grid_args.comp).
+        ("moe_grid_args", "moe_grid_args", &[]),
         ("moe_bucket_scatter", "moe_bucket_scatter", &[]),
         (
             "moe_bucket_scatter",
@@ -4430,4 +4543,23 @@ fn gen_grids(out: &str) {
     }
     s += "    barrier();\n}\n";
     std::fs::write(format!("{out}/native_grids.glsl"), s).expect("write native_grids.glsl");
+
+    // IQ2_XS's buffer-codebook build keeps the 4 KiB grid in binding 0, but its dequant still
+    // needs the 128-entry sign table. Keep that table in LDS (512 bytes): dynamically indexing a
+    // large const array makes glslang/ACO materialize it into per-invocation scratch, which cost
+    // ~7x on the first buffer attempt.
+    let mut signs = String::from(
+        "// Generated by build.rs. Do not edit.\n\
+         const uint C_KSIGNS[] = uint[](",
+    );
+    for value in g::KSIGNS_IQ2XS {
+        signs += &format!("{}u,", value as u32);
+    }
+    signs.pop();
+    signs += ");\nshared uint KSIGNS[128];\n";
+    signs += "void ksigns_init() {\n";
+    signs += "    uint gstep = gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z;\n";
+    signs += "    for (uint gi = gl_LocalInvocationIndex; gi < 128u; gi += gstep) { KSIGNS[gi] = C_KSIGNS[gi]; }\n";
+    signs += "    barrier();\n}\n";
+    std::fs::write(format!("{out}/native_ksigns.glsl"), signs).expect("write native_ksigns.glsl");
 }

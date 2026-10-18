@@ -1,0 +1,53 @@
+#version 460
+// MoE batched-GEMM dispatch prologue — derive the expert GEMM's REAL grid width on the GPU from
+// the bucket `counts`, so `vkCmdDispatchIndirect` launches only the row tiles that hold live rows
+// instead of the worst-case `ceil(rows/BM)` bound the host can only guess at.
+//
+// The batched expert GEMM (`native_gemm_mmq_*` expert-grid arm) puts the expert on
+// `gl_WorkGroupID.y` and derives its row tile from `gl_WorkGroupID.x / tilesN`; a tile past its
+// expert's segment exits immediately. That makes the host's `gx = ceil(rows/BM)·tilesN` a valid
+// but wildly loose upper bound — at pp512 a top-k router spreads `rows·n_used` assignments over
+// `n_expert` buckets, so the average bucket holds far fewer than BM rows while the launch still
+// pays for one row tile per BM of the WHOLE chunk. The empty launches are not free (measured:
+// expert_gateup at rows=693 runs ~3.5x slower at gx=220 than at gx=110 for the same useful work,
+// tracking workgroup count rather than FLOPs), so shrink the grid to the bound the counts imply.
+//
+// One workgroup, one thread per expert (strided past `gl_WorkGroupSize.x`): `max_e
+// ceil(counts[e]/BM)` row tiles, scaled by the per-expert column-tile count. Writes the
+// `[gx, gy, gz]` triple `vkCmdDispatchIndirect` reads; `gy` stays `n_expert`, the shader's own
+// expert-per-workgroup-row mapping. Correct for any `counts` (a superset of each segment's tiles
+// is all the kernel needs), so this can only ever over-launch, never under.
+layout(local_size_x = 64) in;
+layout(push_constant) uniform PC {
+    uint n_expert;
+    uint bm;
+    uint tiles_n;
+}
+pc;
+layout(binding = 0) readonly buffer CB {
+    uint counts[];
+};
+layout(binding = 1) writeonly buffer AB {
+    uint args[];
+};
+shared uint g_max;
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    if (t == 0u) {
+        g_max = 0u;
+    }
+    barrier();
+    uint m = 0u;
+    for (uint e = t; e < pc.n_expert; e += gl_WorkGroupSize.x) {
+        m = max(m, (counts[e] + pc.bm - 1u) / pc.bm);
+    }
+    atomicMax(g_max, m);
+    barrier();
+    if (t == 0u) {
+        // Clamp to one row tile so the dispatch is never zero-width (a chunk whose whole router
+        // output is empty still runs a grid that exits immediately).
+        args[0] = max(g_max, 1u) * pc.tiles_n;
+        args[1] = pc.n_expert;
+        args[2] = 1u;
+    }
+}

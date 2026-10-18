@@ -47,11 +47,24 @@ shared float part[MAX_ROWS * MAX_SG]; // one partial per (row, subgroup)
 #include "native_decode.glsl"
 
 void main() {
+    GRID_INIT;
     // Flat-index recovery for a possibly-2-D dispatch grid — see native_mmv.comp's main() for why
     // an explicit early return is needed (the final `y_buf[...+o]` write below is unconditional on
     // o, unlike native_gemv_rm/sg's per-output-guarded writes).
-    uint o = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x; // grid = out_f: one wg/output
-    if (o >= pc.out_f) { return; }
+    //
+    // Grid = one workgroup per (MR-row block, output): `rows <= 8` (the decode/verify shape this
+    // was written for) gives exactly one block, i.e. the original `grid = out_f` behaviour. A
+    // prefill-height call splits into `ceil(rows/MR)` blocks, so each weight sub-block is decoded
+    // once per 8 rows instead of once per row — the m=1 GEMV's `rows`-times weight traffic at
+    // prefill heights, where the 64-wide fma GEMM tile cannot run (out_f % 64 != 0: MoE router
+    // gates, small projections). The output column rides the LOW term so consecutive workgroups
+    // share a row block's activation sub-blocks in L2 (same reason the old grid kept 2-D recovery).
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint blocks = (pc.rows + MAX_ROWS - 1u) / MAX_ROWS;
+    if (unit >= blocks * pc.out_f) { return; }
+    uint o = unit % pc.out_f;
+    uint row0 = (unit / pc.out_f) * MAX_ROWS;
+    uint nrows = pc.rows - row0 < MAX_ROWS ? pc.rows - row0 : MAX_ROWS;
     uint t = gl_LocalInvocationID.x;
     w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
     uint wbase = pc.w_base + o * pc.in_f;
@@ -69,8 +82,8 @@ void main() {
         }
         uint xo4 = s * 8u;
         for (uint r = 0u; r < MAX_ROWS; r++) {
-            if (r < pc.rows) {
-                uint b = r * in_f4 + xo4;
+            if (r < nrows) {
+                uint b = (row0 + r) * in_f4 + xo4;
                 vec4 a = v4[0] * x4[b] + v4[1] * x4[b + 1u];
                 a += v4[2] * x4[b + 2u] + v4[3] * x4[b + 3u];
                 a += v4[4] * x4[b + 4u] + v4[5] * x4[b + 5u];
@@ -80,15 +93,15 @@ void main() {
         }
     }
     for (uint r = 0u; r < MAX_ROWS; r++) {
-        if (r < pc.rows) {
+        if (r < nrows) {
             float sg = subgroupAdd(acc[r]);
             if (subgroupElect()) { part[r * MAX_SG + gl_SubgroupID] = sg; }
         }
     }
     barrier();
-    if (t < pc.rows) {
+    if (t < nrows) {
         float tot = 0.0;
         for (uint s = 0u; s < gl_NumSubgroups; s++) { tot += part[t * MAX_SG + s]; }
-        y_buf[t * pc.out_f + o] = tot;
+        y_buf[(row0 + t) * pc.out_f + o] = tot;
     }
 }

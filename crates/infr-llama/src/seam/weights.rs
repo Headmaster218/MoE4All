@@ -525,7 +525,12 @@ impl QwenMtpVerifyBuffers {
                 .alloc_uninit(rows * h_width * 4, BufferUsage::Activations)
                 .map_err(|e| anyhow!("{e}"))?,
             ple: alloc(rows * ple_row * 4, BufferUsage::Staging)?,
-            logits: alloc(rows * cfg.vocab * 4, BufferUsage::Staging)?,
+            // `Readback` (GpuToCpu, cached), NOT `Staging` (CpuToGpu, write-combined): this buffer
+            // exists to be READ BACK to the host. Reading a write-combined mapping is uncached and
+            // costs ~30 MB/s on this hardware — measured as a flat 122 ms for the VERIFY's
+            // `rows * vocab * 4` bytes on EVERY cycle, against 0.00-0.04 ms for the `Readback`
+            // h_out/out_ids downloads in the very same call. `Staging` is for uploads.
+            logits: alloc(rows * cfg.vocab * 4, BufferUsage::Readback)?,
             h_out: alloc(rows * h_width * 4, BufferUsage::Readback)?,
             out_ids: alloc(rows * 4, BufferUsage::Readback)?,
         })
@@ -1468,6 +1473,15 @@ impl SeamKv {
         Ok(())
     }
 
+    /// Whether this slot can roll a rejected draft back: a recurrent-trace runtime exists and is
+    /// wide enough for `rows` VERIFY rows (see [`Self::mtp_restore_delta_row`]). The speculative
+    /// loop gates on this — without the trace a rejected draft would stay in the slot's state.
+    pub(crate) fn mtp_can_trace(&self, rows: usize) -> bool {
+        self.mtp_delta_ckpt
+            .as_ref()
+            .is_some_and(|ck| rows.saturating_sub(1) <= ck.trace_rows)
+    }
+
     /// Restore the recurrent state immediately after `accepted` VERIFY rows. Row zero is the
     /// existing clean checkpoint; positive rows come from the snapshots emitted inside the
     /// recurrent kernels during that VERIFY. This avoids replaying accepted target tokens.
@@ -1519,6 +1533,120 @@ impl SeamKv {
         be.copy_buffer_ranges(&copies)
             .map_err(|e| anyhow!("restore MTP recurrent row {row}: {e}"))?;
         self.cached.truncate(ck.cached_len + accepted);
+        Ok(())
+    }
+
+    /// [`Self::mtp_restore_delta`], restricted to the recurrent layers in `layers`.
+    ///
+    /// The native window pipeline (`INFR_MTP_WINDOW_PIPE`) runs one window ahead by LAYER: the
+    /// guessed window's FRONT span has already advanced the front half of every recurrent state
+    /// before the batch being verified is accepted, while its BACK span holds exactly the state
+    /// that batch produced. A rejected pipeline guess therefore rewinds the front half to the clean
+    /// boundary (this method) and keeps the back half's live state (or rewinds it a row with
+    /// [`Self::mtp_restore_delta_row_span`] when the batch itself was only partially accepted).
+    ///
+    /// Leaves `cached` untouched — the caller owns the pipeline's commit bookkeeping.
+    pub(crate) fn mtp_restore_delta_span(
+        &mut self,
+        be: &dyn Backend,
+        cfg: &Config,
+        layers: std::ops::Range<usize>,
+    ) -> AResult<()> {
+        let Some(ck) = self.mtp_delta_ckpt.as_ref() else {
+            return Ok(());
+        };
+        let mut copies =
+            Vec::with_capacity(ck.layers.len() * 2 + usize::from(ck.ple_state.is_some()));
+        for (i, &layer) in ck.layers.iter().enumerate() {
+            if !layers.contains(&layer) {
+                continue;
+            }
+            copies.push((
+                ck.kbufs[i].as_ref(),
+                self.kbufs[layer].as_ref(),
+                ck.kbufs[i].len_bytes(),
+            ));
+            copies.push((
+                ck.vbufs[i].as_ref(),
+                self.vbufs[layer].as_ref(),
+                ck.vbufs[i].len_bytes(),
+            ));
+        }
+        // The PLE convolution history is a single shared buffer fed by every PLE layer, so it
+        // belongs to whichever span actually contains one.
+        let ple_in_span = layers.clone().any(|layer| cfg.is_ple_layer(layer));
+        if ple_in_span {
+            if let (Some(src), Some(dst)) =
+                (ck.ple_state.as_deref(), self.ple_state_buf.as_deref())
+            {
+                copies.push((src, dst, src.len_bytes()));
+            }
+        }
+        be.copy_buffers(&copies).map_err(|e| anyhow!("{e}"))?;
+        Ok(())
+    }
+
+    /// [`Self::mtp_restore_delta_row`], restricted to the recurrent layers in `layers`.
+    ///
+    /// This is the window pipeline's back-span rewind: the back span's trace rows are still intact
+    /// when a partially accepted batch is rolled back (the next window's front span only writes the
+    /// front half), while the front half is restored from the clean snapshot and replayed instead.
+    ///
+    /// Leaves `cached` untouched — the caller owns the pipeline's commit bookkeeping.
+    pub(crate) fn mtp_restore_delta_row_span(
+        &mut self,
+        be: &dyn Backend,
+        cfg: &Config,
+        accepted: usize,
+        layers: std::ops::Range<usize>,
+    ) -> AResult<()> {
+        anyhow::ensure!(
+            accepted > 0,
+            "MTP span row restore needs a non-empty accepted prefix"
+        );
+        let ck = self
+            .mtp_delta_ckpt
+            .as_ref()
+            .ok_or_else(|| anyhow!("MTP recurrent row restore has no checkpoint runtime"))?;
+        anyhow::ensure!(
+            accepted <= ck.trace_rows,
+            "MTP recurrent row restore requested {accepted} rows, capacity is {}",
+            ck.trace_rows
+        );
+        let row = accepted - 1;
+        let mut copies =
+            Vec::with_capacity(ck.layers.len() * 2 + usize::from(ck.trace_ple_state.is_some()));
+        for (i, &layer) in ck.layers.iter().enumerate() {
+            if !layers.contains(&layer) {
+                continue;
+            }
+            let kb = self.kbufs[layer].len_bytes();
+            let vb = self.vbufs[layer].len_bytes();
+            copies.push((
+                ck.trace_kbufs[i].as_ref(),
+                row * kb,
+                self.kbufs[layer].as_ref(),
+                0,
+                kb,
+            ));
+            copies.push((
+                ck.trace_vbufs[i].as_ref(),
+                row * vb,
+                self.vbufs[layer].as_ref(),
+                0,
+                vb,
+            ));
+        }
+        if layers.clone().any(|layer| cfg.is_ple_layer(layer)) {
+            if let (Some(src), Some(dst)) =
+                (ck.trace_ple_state.as_deref(), self.ple_state_buf.as_deref())
+            {
+                let bytes = dst.len_bytes();
+                copies.push((src, row * bytes, dst, 0, bytes));
+            }
+        }
+        be.copy_buffer_ranges(&copies)
+            .map_err(|e| anyhow!("restore MTP recurrent row {row}: {e}"))?;
         Ok(())
     }
 
@@ -1663,7 +1791,9 @@ impl SeamKv {
                 &kbufs,
                 &vbufs,
                 ple_state_buf.as_deref(),
-                crate::mtp::DRAFT_TOKENS.saturating_sub(1),
+                self.mtp_delta_ckpt
+                    .as_ref()
+                    .map_or(0, |checkpoint| checkpoint.trace_rows),
             )?
         } else {
             None

@@ -192,10 +192,23 @@ fn global() -> &'static Global {
     })
 }
 
-/// Process-wide per-op device aggregate: label → (total µs, dispatch count). Fed by every
-/// backend's profiler through the shared reporter; printed as the device section of [`report`].
-/// A Mutex is fine — this is touched once per submit/forward (not per dispatch), profiling only.
-static GPU: Mutex<Vec<(String, f64, u64)>> = Mutex::new(Vec::new());
+/// One row of the process-wide per-op device aggregate.
+///
+/// `bytes` is the op's estimated DRAM traffic (weights + activations + KV for the kernels whose
+/// recorder knows its shape). It is 0 for backends/ops that do not report it — the report then
+/// simply omits the bandwidth columns, so this never fabricates a number.
+#[derive(Clone, Debug, Default)]
+pub struct GpuRow {
+    pub label: String,
+    pub us: f64,
+    pub count: u64,
+    pub bytes: u64,
+}
+
+/// Process-wide per-op device aggregate. Fed by every backend's profiler through the shared
+/// reporter; printed as the device section of [`report`]. A Mutex is fine — this is touched once
+/// per submit/forward (not per dispatch), profiling only.
+static GPU: Mutex<Vec<GpuRow>> = Mutex::new(Vec::new());
 
 /// Accumulate `us` device-microseconds / `count` dispatches under `label`. Registers the exit
 /// report (idempotent) so a default build with only the runtime knob set still prints the
@@ -204,14 +217,26 @@ static GPU: Mutex<Vec<(String, f64, u64)>> = Mutex::new(Vec::new());
 /// Call this through [`infr_core::prof::OpProf::flush`], not directly — that is what keeps every
 /// backend's label grammar, sort order and units consistent.
 pub fn gpu_add(label: &str, us: f64, count: u64) {
+    gpu_add_bytes(label, us, count, 0);
+}
+
+/// [`gpu_add`] with the op's estimated DRAM traffic. `bytes == 0` means "unknown", and the report
+/// treats it as such rather than folding a zero into an average bandwidth.
+pub fn gpu_add_bytes(label: &str, us: f64, count: u64, bytes: u64) {
     let _ = global(); // ensure the atexit report hook exists
     let mut g = GPU.lock().unwrap();
-    match g.iter_mut().find(|(l, _, _)| l == label) {
+    match g.iter_mut().find(|r| r.label == label) {
         Some(row) => {
-            row.1 += us;
-            row.2 += count;
+            row.us += us;
+            row.count += count;
+            row.bytes += bytes;
         }
-        None => g.push((label.to_string(), us, count)),
+        None => g.push(GpuRow {
+            label: label.to_string(),
+            us,
+            count,
+            bytes,
+        }),
     }
 }
 
@@ -407,11 +432,11 @@ pub fn report() {
         return;
     }
     let (rows, n_threads, wall_ns) = collect();
-    let mut gpu: Vec<(String, f64, u64)> = GPU.lock().unwrap().clone();
+    let mut gpu: Vec<GpuRow> = GPU.lock().unwrap().clone();
     // total_cmp, not partial_cmp().unwrap(): a bad timestamp delta can yield a NaN `us`, and
     // panicking here would abort the whole process from inside the atexit reporter. total_cmp
     // is a total order (NaN sorts deterministically) so the report always prints.
-    gpu.sort_by(|a, b| b.1.total_cmp(&a.1));
+    gpu.sort_by(|a, b| b.us.total_cmp(&a.us));
     if rows.is_empty() && gpu.is_empty() {
         return;
     }
@@ -458,8 +483,10 @@ pub fn report() {
         }
     }
     if !gpu.is_empty() {
-        let total_us: f64 = gpu.iter().map(|(_, us, _)| us).sum();
-        let total_n: u64 = gpu.iter().map(|(_, _, n)| n).sum();
+        let total_us: f64 = gpu.iter().map(|r| r.us).sum();
+        let total_n: u64 = gpu.iter().map(|r| r.count).sum();
+        let total_bytes: u64 = gpu.iter().map(|r| r.bytes).sum();
+        let have_bytes = total_bytes > 0;
         // print-ok: report line, see above.
         eprintln!();
         // print-ok: report line, see above.
@@ -468,20 +495,55 @@ pub fn report() {
             gpu.len(),
             fmt_ns((total_us * 1e3) as u64),
         );
-        // print-ok: report line, see above.
-        eprintln!(
-            "{:>12} {:>7} {:>12} {:>10}  gpu op",
-            "total", "gpu%", "dispatches", "avg"
-        );
-        for (label, us, count) in &gpu {
+        if have_bytes {
             // print-ok: report line, see above.
             eprintln!(
-                "{:>12} {:>6.2}% {:>12} {:>10}  {label}",
-                fmt_ns((us * 1e3) as u64),
-                100.0 * us / total_us.max(f64::MIN_POSITIVE),
-                count,
-                fmt_ns((us * 1e3) as u64 / count.max(&1)),
+                "{:>12} {:>7} {:>12} {:>10} {:>10} {:>9} {:>9}  gpu op",
+                "total", "gpu%", "dispatches", "avg", "GB", "GB/s", "us/ea"
             );
+        } else {
+            // print-ok: report line, see above.
+            eprintln!(
+                "{:>12} {:>7} {:>12} {:>10}  gpu op",
+                "total", "gpu%", "dispatches", "avg"
+            );
+        }
+        for r in &gpu {
+            let avg = fmt_ns((r.us * 1e3) as u64 / r.count.max(1));
+            if have_bytes {
+                // Effective bandwidth over the kernel's own device time — the number that says
+                // whether this op is moving bytes or waiting on dispatch/dispatch-overlap gaps.
+                let gb = r.bytes as f64 / 1e9;
+                let gbps = if r.us > 0.0 {
+                    // bytes/µs × 1e6 B/s per (bytes/µs) / 1e9 B per GB = /1e3.
+                    r.bytes as f64 / r.us / 1e3
+                } else {
+                    0.0
+                };
+                let us_ea = r.us / r.count.max(1) as f64;
+                // print-ok: report line, see above.
+                eprintln!(
+                    "{:>12} {:>6.2}% {:>12} {:>10} {:>10.2} {:>9.1} {:>9.1}  {label}",
+                    fmt_ns((r.us * 1e3) as u64),
+                    100.0 * r.us / total_us.max(f64::MIN_POSITIVE),
+                    r.count,
+                    avg,
+                    gb,
+                    gbps,
+                    us_ea,
+                    label = r.label,
+                );
+            } else {
+                // print-ok: report line, see above.
+                eprintln!(
+                    "{:>12} {:>6.2}% {:>12} {:>10}  {label}",
+                    fmt_ns((r.us * 1e3) as u64),
+                    100.0 * r.us / total_us.max(f64::MIN_POSITIVE),
+                    r.count,
+                    avg,
+                    label = r.label,
+                );
+            }
         }
     }
     if let Some(path) = profile_out() {
@@ -499,7 +561,7 @@ pub fn report() {
 fn write_json(
     path: &str,
     rows: &[Row],
-    gpu: &[(String, f64, u64)],
+    gpu: &[GpuRow],
     n_threads: usize,
     wall_ns: u64,
 ) -> std::io::Result<()> {
@@ -521,12 +583,20 @@ fn write_json(
     }
     writeln!(f, "  ],")?;
     writeln!(f, "  \"gpu\": [")?;
-    for (i, (label, us, count)) in gpu.iter().enumerate() {
-        let label = esc(label);
+    for (i, r) in gpu.iter().enumerate() {
+        let label = esc(&r.label);
         let comma = if i + 1 < gpu.len() { "," } else { "" };
+        // `gbps` is 0 when the op reported no byte count, so a consumer can tell "no traffic
+        // reported" (bytes == 0) from a genuinely zero-bandwidth op.
+        let gbps = if r.us > 0.0 {
+            r.bytes as f64 / r.us / 1e3
+        } else {
+            0.0
+        };
         writeln!(
             f,
-            "    {{\"label\": \"{label}\", \"dispatches\": {count}, \"total_us\": {us:.1}}}{comma}",
+            "    {{\"label\": \"{label}\", \"dispatches\": {}, \"total_us\": {:.1}, \"bytes\": {}, \"gbps\": {gbps:.3}}}{comma}",
+            r.count, r.us, r.bytes,
         )?;
     }
     writeln!(f, "  ]")?;

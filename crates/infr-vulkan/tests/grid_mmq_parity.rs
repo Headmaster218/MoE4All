@@ -35,6 +35,7 @@ impl Rng {
 fn block_geom(dt: DType) -> (usize, usize) {
     match dt {
         DType::Iq2S => (256, 82),
+        DType::Iq2Xxs => (256, 66),
         DType::Iq2Xs => (256, 74),
         DType::Iq3S => (256, 110),
         DType::Iq3Xxs => (256, 98),
@@ -503,7 +504,7 @@ fn qwen38_xs_grid_mmq_all_variants_match_host() {
     let (k, n, n_expert) = (256usize, 64usize, 5usize);
     let stride = k * n;
 
-    for dt in [DType::Iq2Xs, DType::Iq3Xxs] {
+    for dt in [DType::Iq2Xxs, DType::Iq2Xs, DType::Iq3Xxs] {
         let banks: Vec<Vec<u8>> = (0..n_expert)
             .map(|e| synth_bank(dt, stride, 0x38f1a5 ^ (dt as u64) ^ ((e as u64) << 32)))
             .collect();

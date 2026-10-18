@@ -666,7 +666,7 @@ fn cold_session_worker(
     pool: Arc<Mutex<Pool>>,
     wake: Arc<Condvar>,
     cache: Arc<Mutex<SessionCache>>,
-    backend: Arc<infr_vulkan::VulkanBackend>,
+    backend: Arc<dyn infr_core::backend::Backend>,
     gate: Option<Arc<StepGate>>,
     mtp_heads: Option<Arc<Mutex<Vec<MtpSlotState>>>>,
     model_cfg: Config,
@@ -814,7 +814,15 @@ pub struct ParallelSeam {
     scheduler_worker: Option<SchedulerWorker>,
     cold_worker: Option<ColdWorker>,
     model: Arc<SeamModel>,
-    vk: Arc<infr_vulkan::VulkanBackend>,
+    /// The backend every shared path drives, as a trait object: a plain `VulkanBackend` for the
+    /// ordinary single-device engine, or a layer-split `PipelineBackend` when `INFR_PIPELINE` is
+    /// set. Held as a trait object so ONE batched engine can serve either shape.
+    be: Arc<dyn infr_core::backend::Backend>,
+    /// The SAME backend when it is a single-device Vulkan one. The unified-arena client forks
+    /// (embedding/vision), the arena statistics and the session-allocation policy are Vulkan-only,
+    /// and a layer split has no single arena to fork an auxiliary client from — `None` there, so
+    /// those paths report the limitation instead of silently using one lane.
+    vk: Option<Arc<infr_vulkan::VulkanBackend>>,
     pool: Arc<Mutex<Pool>>,
     /// Signalled when a slot is returned — a queued request waits here.
     freed: Arc<Condvar>,
@@ -886,6 +894,19 @@ impl ParallelSeam {
     ) -> Result<Self> {
         let n_slots = n_slots.max(1);
         let ecfg = model.cfg().clone();
+        // A layer split (`INFR_PIPELINE=VulkanN,VulkanM`) is ONE engine across N devices: build the
+        // pipeline — it owns the per-device backends, the weight placement and the KV/arena layout —
+        // and drive it as a trait object. The `dev` pin is a single-device concept; a split takes its
+        // device list from the config.
+        if let Some(devices) = crate::seam::pipeline_devices(&ecfg) {
+            let pb = crate::seam::open_pipeline_backend(
+                devices,
+                model.gguf(),
+                model.config(),
+                model.engine_cfg(),
+            )?;
+            return Self::new_with_dyn_backend(model, n_slots, want_ctx, Arc::new(pb), None);
+        }
         let vk = match dev {
             Some(idx) => infr_vulkan::VulkanBackend::new_on_with(idx, ecfg)
                 .map_err(|e| anyhow!("vulkan init (Vulkan{idx}): {e}"))?,
@@ -904,6 +925,24 @@ impl ParallelSeam {
         want_ctx: Option<infr_core::SizeSpec>,
         vk: infr_vulkan::VulkanBackend,
     ) -> Result<Self> {
+        let vk = Arc::new(vk);
+        let be: Arc<dyn infr_core::backend::Backend> =
+            Arc::clone(&vk) as Arc<dyn infr_core::backend::Backend>;
+        Self::new_with_dyn_backend(model, n_slots, want_ctx, be, Some(vk))
+    }
+
+    /// Build on a backend TRAIT OBJECT — the shared body of the single-device and layer-split
+    /// constructors. `vk` is `Some` only when `be` really is a plain [`VulkanBackend`] (arcs of the
+    /// same allocation): the auxiliary-model forks, the arena statistics and the session-allocation
+    /// policy are Vulkan-only, and a layer split has no single arena to fork an auxiliary client
+    /// from, so those paths report the limitation instead of quietly using one lane.
+    pub fn new_with_dyn_backend(
+        model: SeamModel,
+        n_slots: usize,
+        want_ctx: Option<infr_core::SizeSpec>,
+        be: Arc<dyn infr_core::backend::Backend>,
+        vk: Option<Arc<infr_vulkan::VulkanBackend>>,
+    ) -> Result<Self> {
         let n_slots = n_slots.max(1);
         if model.engine_cfg().spec.mtp && model.config().qwen4exp && n_slots > 2 {
             return Err(anyhow!("Qwen3.8 concurrent MTP supports at most two slots"));
@@ -913,8 +952,23 @@ impl ParallelSeam {
         // where the binder pins the prefill chunk / auto-q8 KV). See `PlacementPins`.
         let pins = Arc::new(crate::seam::PlacementPins::for_slots(n_slots));
         let scope = crate::seam::PlacementScope::enter(pins.clone());
-        let max_ctx = model.vulkan_slot_ctx(&vk, n_slots, want_ctx)?;
+        // Per-slot context. The single-device ladder prices it against one card's room; a layer split
+        // is priced against its FIRST lane, because every lane carries a replica of each slot's KV —
+        // and an explicit token count is honoured verbatim on either shape.
+        let sizing = match vk.as_deref() {
+            Some(vk) => vk,
+            None => be
+                .backend_any()
+                .and_then(|a| a.downcast_ref::<infr_vulkan::PipelineBackend>())
+                .ok_or_else(|| {
+                    anyhow!("a batched seam backend must be a Vulkan device or a layer split")
+                })?
+                .backend(0),
+        };
+        let max_ctx = model.vulkan_slot_ctx(sizing, n_slots, want_ctx)?;
         let mtp_heads = if model.engine_cfg().spec.mtp && model.config().qwen4exp {
+            use infr_core::backend::Backend as _;
+
             let sampler = crate::sampling::Sampler::from_cfg(&model.engine_cfg().sampling);
             if sampler.temp > 0.0 && sampler.top_k != 1 {
                 tracing::warn!(
@@ -927,10 +981,19 @@ impl ParallelSeam {
                 .draft
                 .as_deref()
                 .ok_or_else(|| anyhow!("Qwen3.8 MTP needs a draft sidecar"))?;
-            let fixed =
-                crate::mtp::Qwen4MtpSession::load_fixed_vulkan(&vk, sidecar, model.config())?;
+            let fuse_down_inject = be.capabilities().qwen_hc_down_inject
+                && model.engine_cfg().kernels.qwen_hc_down_inject;
+            let fixed = crate::mtp::Qwen4MtpSession::load_fixed_backend(
+                be.as_ref(),
+                model.gguf(),
+                sidecar,
+                model.config(),
+                model.engine_cfg(),
+                max_ctx,
+                fuse_down_inject,
+            )?;
             let catch = crate::mtp::Qwen4MtpSession::shared_catch_workspace(
-                &vk,
+                be.as_ref(),
                 &fixed,
                 max_ctx,
                 crate::seam::ubatch_rows(model.engine_cfg()),
@@ -939,7 +1002,7 @@ impl ParallelSeam {
             for _ in 0..n_slots {
                 heads.push(MtpSlotState {
                     head: Arc::new(crate::mtp::Qwen4MtpSession::with_fixed_and_catch(
-                        &vk,
+                        be.as_ref(),
                         Arc::clone(&fixed),
                         max_ctx,
                         Arc::clone(&catch),
@@ -965,7 +1028,8 @@ impl ParallelSeam {
             scheduler_worker: None,
             cold_worker: None,
             model: Arc::new(model),
-            vk: Arc::new(vk),
+            be,
+            vk,
             pool: Arc::new(Mutex::new(Pool {
                 slots: Vec::new(),
                 tick: 0,
@@ -1028,7 +1092,7 @@ impl ParallelSeam {
         let worker_stop = Arc::clone(&stop);
         let pool = Arc::clone(&self.pool);
         let wake = Arc::clone(&self.freed);
-        let backend = Arc::clone(&self.vk);
+        let backend = Arc::clone(&self.be);
         let gate = self.gate.as_ref().map(Arc::clone);
         let model_cfg = self.model.config().clone();
         let mtp_heads = self.mtp_heads.as_ref().map(Arc::clone);
@@ -1064,7 +1128,8 @@ impl ParallelSeam {
             scheduler_worker: None,
             cold_worker: None,
             model: Arc::clone(&self.model),
-            vk: Arc::clone(&self.vk),
+            be: Arc::clone(&self.be),
+            vk: self.vk.as_ref().map(Arc::clone),
             pool: Arc::clone(&self.pool),
             freed: Arc::clone(&self.freed),
             decode_batch: Arc::clone(&self.decode_batch),
@@ -1119,30 +1184,46 @@ impl ParallelSeam {
 
     pub fn fork_embedding_backend(&self) -> Result<infr_vulkan::VulkanBackend> {
         self.vk
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow!(
+                    "an auxiliary Embedding engine needs a single-device backend; a layer split has \
+                     no unified arena to fork a client from"
+                )
+            })?
             .fork_embedding_client()
             .map_err(|error| anyhow!("derive unified Embedding backend: {error}"))
     }
 
     pub fn fork_vision_backend(&self) -> Result<infr_vulkan::VulkanBackend> {
         self.vk
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow!(
+                    "an auxiliary Vision engine needs a single-device backend; a layer split has no \
+                     unified arena to fork a client from"
+                )
+            })?
             .fork_vision_client()
             .map_err(|error| anyhow!("derive unified Vision backend: {error}"))
     }
 
     pub fn unified_vram_stats(&self) -> Option<infr_vulkan::unified::UnifiedVramStats> {
-        self.vk.unified_vram().map(|pool| pool.stats())
+        self.vk
+            .as_ref()
+            .and_then(|vk| vk.unified_vram().map(|pool| pool.stats()))
     }
 
     /// Materialize slot 0 (weights + KV + pipelines) with a throwaway generation, then fork the
     /// rest off it. `&mut self` — this runs at startup, before the engine is shared.
     fn init_slots(&mut self, n_slots: usize) -> Result<()> {
-        self.vk.defer_session_finalization(true);
+        self.be.defer_session_finalization(true);
         let initialized = self.init_slots_before_host_import(n_slots);
         if let Err(error) = initialized {
-            self.vk.defer_session_finalization(false);
+            self.be.defer_session_finalization(false);
             return Err(error);
         }
-        self.vk
+        self.be
             .finish_deferred_session_allocations()
             .map_err(|error| anyhow!("finalize Vulkan session allocations: {error}"))
     }
@@ -1157,8 +1238,8 @@ impl ParallelSeam {
         // shared `with_profiling_suppressed` helper.
         let mut slot0: Option<SeamKv> = None;
         crate::with_profiling_suppressed(|| {
-            crate::seam::generate_dense_vulkan_session(
-                &self.vk,
+            crate::seam::generate_dense_session_for(
+                self.be.as_ref(),
                 self.model.gguf(),
                 self.model.config(),
                 self.model.engine_cfg(),
@@ -1202,7 +1283,7 @@ impl ParallelSeam {
                 Some(kv) => kv,
                 None => slot0
                     .fork(
-                        self.vk.as_ref(),
+                        self.be.as_ref(),
                         self.model.config(),
                         self.model.engine_cfg(),
                     )
@@ -1255,7 +1336,7 @@ impl ParallelSeam {
     /// indices report different names.
     pub fn device_name(&self) -> String {
         use infr_core::backend::Backend;
-        self.vk.capabilities().name
+        self.be.capabilities().name
     }
 
     pub fn model(&self) -> &SeamModel {
@@ -1364,7 +1445,7 @@ impl ParallelSeam {
                         let r: Result<usize> = {
                             let _gp = req.gate_pass();
                             let seeded = match dst.as_mut() {
-                                Some(dst) => dst.seed_from(self.vk.as_ref(), cfg, ec, &src, best_s),
+                                Some(dst) => dst.seed_from(self.be.as_ref(), cfg, ec, &src, best_s),
                                 None => Ok(0),
                             };
                             seeded.inspect(|&seeded| {
@@ -1375,7 +1456,7 @@ impl ParallelSeam {
                                         let (target_lane, source_lane) =
                                             mtp_slot_pair_mut(&mut heads, target, best);
                                         if let Err(error) = target_lane.seed_from(
-                                            self.vk.as_ref(),
+                                            self.be.as_ref(),
                                             source_lane,
                                             tokens,
                                         ) {
@@ -1569,7 +1650,7 @@ impl ParallelSeam {
                                     head: &heads[target].head,
                                     state,
                                 });
-                        match cache.spill(kv, self.vk.as_ref(), cfg, mtp_source) {
+                        match cache.spill(kv, self.be.as_ref(), cfg, mtp_source) {
                             Ok(true) => {
                                 released = true;
                                 if let Some(heads) = heads.as_mut() {
@@ -1590,12 +1671,12 @@ impl ParallelSeam {
                         }
                     }
                     if !released {
-                        released = kv.release_session_state(self.vk.as_ref(), cfg).is_ok()
-                            || kv.release_session_state(self.vk.as_ref(), cfg).is_ok();
+                        released = kv.release_session_state(self.be.as_ref(), cfg).is_ok()
+                            || kv.release_session_state(self.be.as_ref(), cfg).is_ok();
                     }
                     if released {
                         if let Some(heads) = heads.as_mut() {
-                            if let Err(error) = heads[target].head.release_kv(self.vk.as_ref()) {
+                            if let Err(error) = heads[target].head.release_kv(self.be.as_ref()) {
                                 tracing::warn!(
                                     slot = target,
                                     "cold KV replacement could not release stale MTP head KV: {error}"
@@ -1604,7 +1685,7 @@ impl ParallelSeam {
                             heads[target].invalidate_all();
                         }
                         let mtp_head = heads.as_ref().map(|heads| heads[target].head.as_ref());
-                        match cache.restore(entry, kv, self.vk.as_ref(), cfg, mtp_head) {
+                        match cache.restore(entry, kv, self.be.as_ref(), cfg, mtp_head) {
                             Ok(Some(state)) => {
                                 if let Some(heads) = heads.as_mut() {
                                     heads[target].install_cache_state(state);
@@ -1649,7 +1730,7 @@ impl ParallelSeam {
                                     head: &heads[target].head,
                                     state,
                                 });
-                        if let Err(error) = cache.spill(kv, self.vk.as_ref(), cfg, mtp_source) {
+                        if let Err(error) = cache.spill(kv, self.be.as_ref(), cfg, mtp_source) {
                             tracing::warn!(
                                 slot = target,
                                 "cold KV replacement spill failed; forgetting the old conversation: {error}"
@@ -1659,7 +1740,7 @@ impl ParallelSeam {
                                 heads[target].invalidate_all();
                             }
                         } else if let Some(heads) = heads.as_mut() {
-                            if let Err(error) = heads[target].head.release_kv(self.vk.as_ref()) {
+                            if let Err(error) = heads[target].head.release_kv(self.be.as_ref()) {
                                 tracing::warn!(
                                     slot = target,
                                     "cold KV seed target could not release stale MTP head KV: {error}"
@@ -1672,7 +1753,7 @@ impl ParallelSeam {
                         (target_kv.as_mut(), seed_kv.as_ref())
                     {
                         match kv.seed_from(
-                            self.vk.as_ref(),
+                            self.be.as_ref(),
                             cfg,
                             self.model.engine_cfg(),
                             source_kv,
@@ -1684,7 +1765,7 @@ impl ParallelSeam {
                                     let (target_lane, source_lane) =
                                         mtp_slot_pair_mut(heads, target, *source);
                                     if let Err(error) =
-                                        target_lane.seed_from(self.vk.as_ref(), source_lane, tokens)
+                                        target_lane.seed_from(self.be.as_ref(), source_lane, tokens)
                                     {
                                         target_lane.invalidate_all();
                                         tracing::warn!(
@@ -1879,7 +1960,7 @@ impl ParallelSeam {
                                         state,
                                     });
                             if let Err(error) =
-                                cache.spill(kv, self.vk.as_ref(), self.model.config(), mtp_source)
+                                cache.spill(kv, self.be.as_ref(), self.model.config(), mtp_source)
                             {
                                 tracing::warn!(
                                     slot = target,
@@ -1888,7 +1969,7 @@ impl ParallelSeam {
                                 kv.reset();
                             }
                             if let Some(heads) = heads.as_mut() {
-                                if let Err(error) = heads[target].head.release_kv(self.vk.as_ref())
+                                if let Err(error) = heads[target].head.release_kv(self.be.as_ref())
                                 {
                                     tracing::warn!(
                                         slot = target,
@@ -2229,7 +2310,7 @@ impl ParallelSeam {
         let prepared = {
             let _gate = req.gate_pass();
             crate::seam::prepare_dense_vulkan_parallel_prompt_session(
-                self.vk.as_ref(),
+                self.be.as_ref(),
                 self.model.config(),
                 self.model.engine_cfg(),
                 work.kv.as_mut().expect("unprepared work owns a KV slot"),
@@ -2307,7 +2388,7 @@ impl ParallelSeam {
             // Decode LRU between ring chunks.
             let _gate = req.gate_pass();
             crate::seam::generate_dense_vulkan_parallel_prefill_session(
-                self.vk.as_ref(),
+                self.be.as_ref(),
                 self.model.gguf(),
                 self.model.config(),
                 self.model.engine_cfg(),
@@ -2545,7 +2626,7 @@ impl ParallelSeam {
             }
             let catch_up_t0 = Instant::now();
             lane.head.catch_up(
-                self.vk.as_ref(),
+                self.be.as_ref(),
                 &target[start..],
                 &shifted,
                 start,
@@ -2586,7 +2667,7 @@ impl ParallelSeam {
             work.kv
                 .as_mut()
                 .expect("MTP work has target KV")
-                .mtp_snapshot_delta(self.vk.as_ref(), cfg)?;
+                .mtp_snapshot_delta(self.be.as_ref(), cfg)?;
             lane.target_snapshot_dirty = false;
         }
         Ok(())
@@ -2703,7 +2784,7 @@ impl ParallelSeam {
             None => RequestCtx::new(active[indices[0]].sampling.clone()),
         };
         let result = crate::seam::generate_dense_vulkan_parallel_sampled_session(
-            self.vk.as_ref(),
+            self.be.as_ref(),
             self.model.gguf(),
             self.model.config(),
             self.model.engine_cfg(),
@@ -2825,7 +2906,7 @@ impl ParallelSeam {
             self.fail_batch_work(work, &message);
         }
         self.close_decode_batch(Some(&message));
-        self.vk.release_primary_runtime_after_cohort_shrink();
+        self.be.release_primary_runtime_after_cohort_shrink();
         tracing::warn!(%error, "parallel scheduler batch failed");
     }
 
@@ -2838,7 +2919,7 @@ impl ParallelSeam {
         let prompt = &work.prompt[..work.prompt_end];
         let _gate = req.gate_pass();
         let prepared = crate::seam::prepare_dense_vulkan_parallel_prompt_session(
-            self.vk.as_ref(),
+            self.be.as_ref(),
             cfg,
             ec,
             work.kv.as_mut().expect("MTP work has target KV"),
@@ -2959,8 +3040,8 @@ impl ParallelSeam {
             });
         }
         let t0 = Instant::now();
-        let (bind, finish) = crate::seam::vulkan_moe_binder(
-            self.vk.as_ref(),
+        let (bind, finish) = crate::seam::moe_binder_for(
+            self.be.as_ref(),
             self.model.gguf(),
             cfg,
             ec,
@@ -2991,7 +3072,7 @@ impl ParallelSeam {
             Some(&report_prime_progress),
         )?;
         let (mut pending, mut pending_logits) = crate::mtp::run_qwen4_prime_frontier_with_finish(
-            self.vk.as_ref(),
+            self.be.as_ref(),
             &*bind,
             self.model.gguf(),
             cfg,
@@ -3025,7 +3106,7 @@ impl ParallelSeam {
                 "Qwen3.8 MTP suppressed premature EOS inside an open reasoning block"
             );
         }
-        let prime_capture = prime_sink.finish(self.vk.as_ref())?;
+        let prime_capture = prime_sink.finish(self.be.as_ref())?;
         lane.last_h = prime_capture.last_h;
         for (index, checkpoint_h) in prime_capture.checkpoint_h.into_iter().enumerate() {
             if let (Some(boundary), Some(last_h)) = (checkpoint_boundaries[index], checkpoint_h) {
@@ -3043,7 +3124,7 @@ impl ParallelSeam {
         work.kv
             .as_mut()
             .expect("MTP work has target KV")
-            .mtp_snapshot_delta(self.vk.as_ref(), cfg)?;
+            .mtp_snapshot_delta(self.be.as_ref(), cfg)?;
         if ec.debug.state_trace {
             let recurrent = work
                 .kv()
@@ -3202,7 +3283,7 @@ impl ParallelSeam {
                 let before = active.len();
                 self.retire_finished_work(&mut active);
                 if active.len() < before {
-                    self.vk.release_primary_runtime_after_cohort_shrink();
+                    self.be.release_primary_runtime_after_cohort_shrink();
                 }
                 if active.len() < 2 {
                     continue;
@@ -3219,7 +3300,7 @@ impl ParallelSeam {
                 let before = active.len();
                 self.retire_finished_work(&mut active);
                 if active.len() < before {
-                    self.vk.release_primary_runtime_after_cohort_shrink();
+                    self.be.release_primary_runtime_after_cohort_shrink();
                 }
                 continue;
             }
@@ -3334,7 +3415,7 @@ impl ParallelSeam {
             let before = active.len();
             self.retire_finished_work(&mut active);
             if active.len() < before {
-                self.vk.release_primary_runtime_after_cohort_shrink();
+                self.be.release_primary_runtime_after_cohort_shrink();
             }
         }
     }
@@ -3371,7 +3452,7 @@ impl ParallelSeam {
                 let rope_position =
                     multimodal_token_position(work.mrope_plan.as_ref(), physical_position)?;
                 let candidates = lane.head.draft(
-                    self.vk.as_ref(),
+                    self.be.as_ref(),
                     pending,
                     &lane.last_h,
                     physical_position,
@@ -3408,7 +3489,7 @@ impl ParallelSeam {
                 .map(|&index| active[index].kv.take().expect("MTP peer has target KV"))
                 .collect::<Vec<_>>();
             let result = crate::seam::generate_dense_vulkan_parallel_mtp_verify_session(
-                self.vk.as_ref(),
+                self.be.as_ref(),
                 self.model.gguf(),
                 cfg,
                 ec,
@@ -3533,9 +3614,9 @@ impl ParallelSeam {
                 let _gate = req.gate_pass();
                 let kv = work.kv.as_mut().expect("MTP lane has target KV");
                 if committed < rows {
-                    kv.mtp_restore_delta_row(self.vk.as_ref(), committed)?;
+                    kv.mtp_restore_delta_row(self.be.as_ref(), committed)?;
                 }
-                kv.mtp_snapshot_delta(self.vk.as_ref(), cfg)?;
+                kv.mtp_snapshot_delta(self.be.as_ref(), cfg)?;
                 let mut heads = self
                     .mtp_heads
                     .as_ref()
@@ -3613,7 +3694,7 @@ impl ParallelSeam {
                 let cohort_len = active.len();
                 self.retire_finished_work(&mut active);
                 if active.len() < cohort_len {
-                    self.vk.release_primary_runtime_after_cohort_shrink();
+                    self.be.release_primary_runtime_after_cohort_shrink();
                 }
                 long_prefill_coalesced = false;
                 continue;
@@ -3638,7 +3719,7 @@ impl ParallelSeam {
                 // raises that high-water mark; without this request-boundary reset, its retired
                 // expert slots remain unavailable after lanes leave and the surviving request
                 // stays permanently in the wider batch's slow cache state.
-                self.vk.release_primary_runtime_after_cohort_shrink();
+                self.be.release_primary_runtime_after_cohort_shrink();
             }
         }
     }
@@ -3724,8 +3805,8 @@ impl ParallelSeam {
                 let mut heads = heads.lock().expect("MTP heads poisoned");
                 heads[guard.idx].invalidate_live();
             }
-            let (_, stats) = crate::seam::generate_dense_vulkan_session(
-                self.vk.as_ref(),
+            let (_, stats) = crate::seam::generate_dense_session_for(
+                self.be.as_ref(),
                 self.model.gguf(),
                 self.model.config(),
                 self.model.engine_cfg(),
@@ -3958,8 +4039,8 @@ impl ParallelSeam {
             max_new,
         );
         let legacy_max_new = if handoff { 0 } else { max_new };
-        let result = crate::seam::generate_dense_vulkan_session(
-            &self.vk,
+        let result = crate::seam::generate_dense_session_for(
+            self.be.as_ref(),
             self.model.gguf(),
             self.model.config(),
             self.model.engine_cfg(),

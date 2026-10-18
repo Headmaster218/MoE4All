@@ -772,6 +772,9 @@ fn main() -> anyhow::Result<()> {
     // are already saying "interrupted" with the right status).
     let res = dispatch(cmd, &cfg, &specified);
     infr_core::timeline::flush().context("writing Decode timeline")?;
+    // `exit_if_signalled` below terminates the process without unwinding, which would otherwise
+    // skip `SummaryGuard::drop`. Flush the profile while the device is still represented.
+    infr_core::pager_profile::print_summary_if_enabled();
     exit_if_signalled();
     res
 }
@@ -4618,6 +4621,14 @@ fn cmd_serve(
     let vulkan_mtp = is_vulkan && cfg.spec.mtp && cfg.spec.draft.is_some();
     let serialized_vulkan_mtp =
         vulkan_mtp && parallel == 1 && mmproj.is_none() && embedding_model.is_none();
+    // LAYER-SPLIT (`INFR_PIPELINE=Vulkan0,Vulkan2`): one request at a time uses the session engine's
+    // pipeline session (that is the path that spans cards with a single sequence). Asking for N>1
+    // slots routes to the concurrent `ParallelSeam` instead, which now owns its backend as a trait
+    // object and can drive the split too — that is what lets one forward serve SEVERAL rows, which is
+    // where a paged-expert decode amortizes its per-layer expert fetches instead of paying them per
+    // token.
+    let serialized_layer_split =
+        is_vulkan && infr_llama::seam::pipeline_devices(cfg).is_some() && parallel == 1;
     if vulkan_mtp && parallel > 2 {
         anyhow::bail!("Qwen3.8 concurrent MTP currently supports at most two slots");
     }
@@ -4646,7 +4657,7 @@ fn cmd_serve(
     // ── the CONCURRENT path: dense/MoE/qwen35 on the Vulkan seam ────────────────────────────────
     // N KV slots off ONE weight upload, round-robin on the GPU at token granularity. This is the
     // default `infr serve` engine.
-    if is_vulkan && !serialized_vulkan_mtp {
+    if is_vulkan && !serialized_vulkan_mtp && !serialized_layer_split {
         let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
         // `--ctx` (or INFR_CTX) is the PER-SLOT window: an explicit token count is used verbatim,
         // a `%` is a fraction of the fitted per-slot context after all slot state is priced, and
@@ -4740,8 +4751,8 @@ fn cmd_serve(
     // CPU/Metal/diffusion serve would otherwise print a spurious "ignored" note.
     if matches!(parallel_explicit, Some(n) if n > 1) {
         tracing::warn!(
-            "note: --parallel {} ignored on this serialized backend (CPU/Metal/diffusion or \
-             Qwen3.8 MTP v1); serving 1 request at a time.",
+            "note: --parallel {} ignored on this serialized backend (CPU/Metal/diffusion, \
+             Qwen3.8 MTP v1, or an INFR_PIPELINE layer split); serving 1 request at a time.",
             parallel_explicit.unwrap()
         );
     }

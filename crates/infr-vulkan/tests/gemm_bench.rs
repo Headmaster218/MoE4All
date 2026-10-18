@@ -1185,6 +1185,132 @@ fn moe_expert_row_tile_bench() {
     }
 }
 
+/// The production shape this engine actually runs: Qwen3.8-Flash-Next's batched-MoE gate/up GEMM
+/// at `ne=2560, n=640 (2·nff), n_expert=512, n_used=10`, captured from a live `expert_gateup` op
+/// trace at pp693. Isolates WHY that op costs ~119 ms on d1 while the same dtype at pp52 costs
+/// ~1.2 ms: the x grid is `ceil(rows/BM)·(n/BN)`, and every row tile past `ceil(count_e/BM)`
+/// returns at the shader's early-exit guard — so raising `rows` mostly raises the number of
+/// workgroups that do nothing. Sweeping tokens at a FIXED balanced counts distribution separates
+/// per-workgroup overhead from weight traffic (which is constant: one row tile per expert already
+/// covers a ~13-row bucket).
+#[test]
+#[ignore = "requires a Vulkan GPU (perf micro-bench)"]
+fn moe_flash_gateup_grid_shape_bench() {
+    let be = VulkanBackend::new().unwrap();
+    let reps = 20usize;
+    // (tag, dtype, block bytes per 256-elem super-block) — the two dtypes the live trace showed
+    // dominating the prefill (d1 IQ3_S 119.6 ms/op, d0 IQ2_XS 22.7 ms/op at the same grid).
+    let dtypes: &[(&str, infr_core::DType, usize)] = &[
+        ("IQ3_S", infr_core::DType::Iq3S, 110),
+        ("IQ2_XS", infr_core::DType::Iq2Xs, 74),
+    ];
+    // The live shape: k = hidden = 2560, n = gate_up width = 640, 512 experts, top-10.
+    let (ne, ncol, n_expert, n_used) = (2560usize, 640usize, 512usize, 10usize);
+    let bn = 64usize;
+
+    for &(tag, dtype, block_bytes) in dtypes {
+        for &tokens in &[52usize, 128, 256, 384, 512, 693, 1024, 2048] {
+            let n_pairs = tokens * n_used;
+            let npad = n_pairs.div_ceil(64) * 64 + 64;
+
+            let qa = be.alloc(npad * ne, BufferUsage::Activations).unwrap();
+            let dact = be
+                .alloc(npad * (ne / 32) * 2, BufferUsage::Activations)
+                .unwrap();
+            let c = be.alloc(npad * ncol * 4, BufferUsage::Activations).unwrap();
+            let w = be
+                .alloc(
+                    n_expert * ncol * (ne / 256) * block_bytes,
+                    BufferUsage::Weights,
+                )
+                .unwrap();
+
+            // Balanced routing (a trained router with a load-balance aux loss stays close to
+            // uniform): the counts distribution is INDEPENDENT of `tokens` only through its mean,
+            // so both the mean bucket and the grid grow with tokens exactly as in production.
+            let base = (n_pairs / n_expert) as u32;
+            let rem = n_pairs - base as usize * n_expert;
+            let mut counts_v = vec![base; n_expert];
+            for c in counts_v.iter_mut().take(rem) {
+                *c += 1;
+            }
+            let mut offsets_v = vec![0u32; n_expert];
+            let mut acc = 0u32;
+            for e in 0..n_expert {
+                offsets_v[e] = acc;
+                acc += counts_v[e];
+            }
+            let counts = be.alloc(n_expert * 4, BufferUsage::Activations).unwrap();
+            let offsets = be.alloc(n_expert * 4, BufferUsage::Activations).unwrap();
+            be.upload(counts.as_ref(), bytemuck::cast_slice(&counts_v))
+                .unwrap();
+            be.upload(offsets.as_ref(), bytemuck::cast_slice(&offsets_v))
+                .unwrap();
+
+            let tiles_n = ncol / bn;
+            // `n_used_probe` only steers the Rust-side tile pick (the shader never reads it), so
+            // BM64 can be measured against the SAME counts/offsets/rows.
+            for (tile_label, n_used_probe, bm) in
+                [("BM32", n_used, 32usize), ("BM64", n_expert * 100, 64usize)]
+            {
+                let row_tiles = tokens.div_ceil(bm);
+                // Workgroups that get past the `tile·BM >= count_e` early-exit guard.
+                let working: usize = counts_v
+                    .iter()
+                    .map(|&n| (n as usize).div_ceil(bm).min(row_tiles))
+                    .sum::<usize>()
+                    * tiles_n;
+                let dispatched = row_tiles * tiles_n * n_expert;
+
+                let record = |rec: &infr_vulkan::Recorder| {
+                    rec.matmul_mmq_experts(
+                        dtype,
+                        "bench_gateup",
+                        qa.as_ref(),
+                        dact.as_ref(),
+                        None,
+                        w.as_ref(),
+                        0,
+                        ne,
+                        counts.as_ref(),
+                        offsets.as_ref(),
+                        c.as_ref(),
+                        tokens,
+                        ne,
+                        ncol,
+                        n_expert,
+                        n_used_probe,
+                    );
+                };
+                let rec = be.recorder().unwrap();
+                record(&rec);
+                rec.finish().unwrap(); // warmup (pipeline compile)
+                let t0 = std::time::Instant::now();
+                let rec = be.recorder().unwrap();
+                for _ in 0..reps {
+                    record(&rec);
+                }
+                rec.finish().unwrap();
+                let us = t0.elapsed().as_micros() as f64 / reps as f64;
+
+                // Weight traffic is bounded by the WORKING workgroups: each stages a BM×BN tile
+                // over the full K, so the unique bank is read once per (expert, col tile) that
+                // has any rows at all.
+                let wg_bytes = (bm * bn) as f64 * (ne as f64 / 256.0) * block_bytes as f64;
+                let gbs = working as f64 * wg_bytes / (us * 1e-6) / 1e9;
+                println!(
+                    "[{tag} {tile_label} pp{tokens:4}] {us:8.1} us  dispatched={dispatched:6} working={working:5} \
+                     ({:5.1}% live)  bank={:6.1}MB  {:5.1} GB/s  per-wg={:6.3}us",
+                    100.0 * working as f64 / dispatched as f64,
+                    working as f64 * wg_bytes / 1e6,
+                    gbs,
+                    us / dispatched as f64 * 1000.0
+                );
+            }
+        }
+    }
+}
+
 /// Same crossover question as `moe_expert_row_tile_bench`, but for the DOWN projection (Q5_K,
 /// qwen3.6-MoE's down bank format): k=nff=512 (16 BLK=32 iterations vs gate_up's 64) — fewer K
 /// iterations means the per-workgroup fixed cost (barrier/staging) amortizes over LESS loop depth,

@@ -1345,7 +1345,11 @@ pub struct UnifiedVramPool {
 
 impl UnifiedVramPool {
     pub(crate) fn cpu_miss_push_mapped(&self) -> bool {
-        self.arena.backing() == crate::arena::DeviceArenaBacking::MappedDeviceLocal
+        matches!(
+            self.arena.backing(),
+            crate::arena::DeviceArenaBacking::MappedDeviceLocal
+                | crate::arena::DeviceArenaBacking::MappedHost
+        )
     }
 
     pub(crate) fn new(vk: &VulkanBackend, capacity: usize) -> Result<Arc<Self>> {

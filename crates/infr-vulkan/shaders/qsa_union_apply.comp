@@ -1,0 +1,41 @@
+#version 460
+// QSA prefill union planner, pass 3: rewrite each row's selected block ids in place into the KEY
+// index of that block inside the compact plane (`rank[block] * ratio`).
+//
+// In place is deliberate: the prefill graph produces `indices` right before it is consumed, and only
+// `Op::QsaBatchAttention` reads it on this path, so swapping block ids for compact positions costs
+// no extra buffer and keeps attention's own loop bound, key order and softmax order byte-identical.
+// When the overflow flag is set this pass writes nothing and attention keeps reading block ids from
+// the original segmented cache.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint kv_len;
+    uint top_blocks;
+    uint ratio;
+    uint blocks;
+} pc;
+
+layout(binding = 0) readonly buffer BB { uint bits[]; };
+layout(binding = 1) readonly buffer RB { uint rank[]; };
+layout(binding = 2) buffer IB { uint indices[]; };
+
+void main() {
+    if (bits[0] != 0u) {
+        return;
+    }
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.rows) {
+        return;
+    }
+    uint visible = pc.kv_len - pc.rows + row + 1u;
+    uint selected = min(pc.top_blocks, visible / pc.ratio);
+    uint base = row * pc.top_blocks;
+    for (uint i = gl_LocalInvocationID.x; i < selected; i += 256u) {
+        uint block = indices[base + i];
+        if (block < pc.blocks) {
+            indices[base + i] = rank[block] * pc.ratio;
+        }
+    }
+}

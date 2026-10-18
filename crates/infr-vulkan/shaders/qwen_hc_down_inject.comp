@@ -1,8 +1,8 @@
 #version 460
 #extension GL_EXT_control_flow_attributes : require
-// Qwen3.8 single-row HC bottleneck: one Q8_0 down projection followed by scaled SiLU, plus the
-// tiny independent F32/Q8_0 inject projection. One workgroup owns one output row from either weight.
-// The Q8 arm mirrors native_gemv.comp; the F32 arm mirrors linear_f32r.comp -DVEC4.
+// Qwen3.8 HC bottleneck: one Q8_0 down projection followed by scaled SiLU, plus the tiny
+// independent F32/Q8_0 inject projection. One workgroup owns one (row, output column) pair from
+// either weight. The Q8 arm mirrors native_gemv.comp; the F32 arm mirrors linear_f32r.comp -DVEC4.
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -90,7 +90,8 @@ float q8_dot(Q8Raw q, uint xoff) {
 
 void main() {
     GRID_INIT;
-    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint row = gl_WorkGroupID.y;
+    uint unit = gl_WorkGroupID.x;
     if (unit >= pc.low_rank + pc.hc) { return; }
     uint t = gl_LocalInvocationID.x;
     float acc = 0.0;
@@ -119,12 +120,12 @@ void main() {
             }
             [[unroll]] for (uint p = 0u; p < uint(HC_PF); ++p) {
                 uint s = s0 + p * 64u;
-                if (valid[p]) { acc += q8_dot(prefetched[p], s * 32u); }
+                if (valid[p]) { acc += q8_dot(prefetched[p], row * pc.in_f + s * 32u); }
             }
         }
 #else
         for (uint s = t; s < nsub; s += 64u) {
-            acc += q8_sub(wbase + s * 32u, s * 32u);
+            acc += q8_sub(wbase + s * 32u, row * pc.in_f + s * 32u);
         }
 #endif
     } else {
@@ -137,7 +138,8 @@ void main() {
         for (uint i = t; i < nv; i += 64u) {
             uint xbase = i * 4u;
             vec4 xv = vec4(
-                x_buf[xbase], x_buf[xbase + 1u], x_buf[xbase + 2u], x_buf[xbase + 3u]
+                x_buf[row * pc.in_f + xbase], x_buf[row * pc.in_f + xbase + 1u],
+                x_buf[row * pc.in_f + xbase + 2u], x_buf[row * pc.in_f + xbase + 3u]
             );
             vacc += weights.v[wbase + i] * xv;
         }
@@ -153,9 +155,9 @@ void main() {
     if (t == 0u) {
         if (unit < pc.low_rank) {
             float v = red[0] * pc.silu_scale;
-            low_buf[unit] = v / (1.0 + exp(-v));
+            low_buf[row * pc.low_rank + unit] = v / (1.0 + exp(-v));
         } else {
-            inject_buf[unit - pc.low_rank] = red[0];
+            inject_buf[row * pc.hc + unit - pc.low_rank] = red[0];
         }
     }
 }

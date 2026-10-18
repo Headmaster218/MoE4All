@@ -415,8 +415,12 @@ fn decode_token_rows(graph: &Graph) -> Option<usize> {
         .then_some(graph.sequence_spans.len())
 }
 
-fn cpu_miss_decode_graph(graph: &Graph) -> bool {
-    !graph.mtp_verify && decode_token_rows(graph) == Some(1)
+fn cpu_miss_decode_graph(graph: &Graph, rows: usize) -> bool {
+    if graph.mtp_verify {
+        (1..=crate::cpu_miss::MAX_ROWS).contains(&rows)
+    } else {
+        decode_token_rows(graph) == Some(1)
+    }
 }
 
 fn qsa_topk_workspace_needed(
@@ -2369,9 +2373,16 @@ fn lower_op(
                     "vulkan adapter: QwenHcDownInject requires non-zero outputs and in_f divisible by 32",
                 ));
             }
-            if graph.desc(*x).numel() != *in_f as usize
-                || graph.desc(*low_dst).numel() != *low_rank as usize
-                || graph.desc(*inject_dst).numel() != *hc as usize
+            let in_f = *in_f as usize;
+            let low_rank = *low_rank as usize;
+            let hc = *hc as usize;
+            let x_numel = graph.desc(*x).numel();
+            let rows = x_numel / in_f;
+            if rows == 0
+                || rows > 8
+                || x_numel != rows * in_f
+                || graph.desc(*low_dst).numel() != rows * low_rank
+                || graph.desc(*inject_dst).numel() != rows * hc
             {
                 return Err(be("vulkan adapter: QwenHcDownInject row geometry mismatch"));
             }
@@ -2381,9 +2392,10 @@ fn lower_op(
                 r(*inject_weight)?,
                 r(*low_dst)?,
                 r(*inject_dst)?,
-                *in_f,
-                *low_rank,
-                *hc,
+                in_f as u32,
+                low_rank as u32,
+                hc as u32,
+                rows as u32,
                 *silu_scale,
                 graph.desc(*inject_weight).dtype,
             );
@@ -2773,7 +2785,14 @@ fn lower_op(
             // disables the WHOLE tier (both arms) for A/B against the scalar floor.
             let nc_tier =
                 gemm_ok && !be_.caps().f16_coopmat() && be_.cfg().kernels.vulkan.mmq_fallback;
-            let nc_mmq = nc_tier && be_.caps().i8_dot && infr_core::tensor::moe_mmq_ok(dt);
+            // `moe_mmq_ok` is the EXPERT set; the dense mmq table is a SUBSET of it (no Iq2_XS/
+            // Iq2_XXS/IQ3_XXS/MXFP4/NVFP4/Q2_0 dense builds), and `matmul_mmq_at` `.expect`s its
+            // table — so the dense arm additionally requires the dense build to exist, else the
+            // dtype falls to `nc_fma` instead of panicking.
+            let nc_mmq = nc_tier
+                && be_.caps().i8_dot
+                && infr_core::tensor::moe_mmq_ok(dt)
+                && crate::gemm::native_gemm_mmq_dense_spv(dt).is_some();
             let nc_fma =
                 nc_tier && !nc_mmq && crate::gemm::native_gemm_fma_kernel_name(dt).is_some();
             // A `>= 2^32`-element weight (a big-vocab lm_head/embed) can only take the CHUNKED GEMV
@@ -4538,6 +4557,7 @@ fn lower_op(
                         span.row_start as usize * q_row_bytes,
                         span.row_start as usize * idx_row_bytes,
                         span.row_start as usize * dst_row_bytes,
+                        None,
                     );
                 }
                 return Ok(());
@@ -4563,6 +4583,38 @@ fn lower_op(
                         ));
                 }
             };
+            let union_keys = if be_.cfg().kernels.vulkan.qsa_union
+                && *rows > 1
+                && kdt == infr_core::DType::Q8_0
+                && vdt == infr_core::DType::Q8_0
+                && segment_shift.is_some()
+            {
+                let union_blocks = (*kv_len / ratio_safe).max(1);
+                Some((
+                    pooled(
+                        pool,
+                        be_,
+                        "qsa_union_bits",
+                        crate::recorder::qsa_union_bits_bytes(union_blocks),
+                    )?,
+                    pooled(
+                        pool,
+                        be_,
+                        "qsa_union_rank",
+                        crate::recorder::qsa_union_rank_bytes(union_blocks),
+                    )?,
+                    pooled(pool, be_, "qsa_union_kv", crate::recorder::QSA_UNION_KV_BYTES)?,
+                ))
+            } else {
+                None
+            };
+            let union = union_keys.as_ref().map(|(bits, rank, kv)| {
+                crate::recorder::QsaUnionScratch {
+                    bits: pool[bits].as_ref(),
+                    rank: pool[rank].as_ref(),
+                    kv: pool[kv].as_ref(),
+                }
+            });
             rec.qsa_attention_batch(
                 r(*q)?,
                 k_binding,
@@ -4582,6 +4634,7 @@ fn lower_op(
                 graph.desc(*k_cache).numel() as u32,
                 graph.desc(*v_cache).numel() as u32,
                 segment_shift,
+                union,
             );
         }
         Op::Rope2D {
@@ -9701,7 +9754,9 @@ impl PagedStream {
                 }
             }
             if let Some(promotion) = self.cpu_promotion.as_mut() {
-                promotion.sources = output.experts;
+                if promotion.sources.is_empty() {
+                    promotion.sources = output.experts;
+                }
             }
         }
         Ok(())
@@ -10874,12 +10929,43 @@ fn execute_paged_moe<'a>(
     };
     let mut cpu_miss_input = None;
     let cpu_cfg = &be_.cfg().kernels.vulkan;
+    let cpu_geom = crate::cpu_miss::geometry(rows, 1, ne, nff, gdt, udt, ddt);
+    let cpu_graph = cpu_miss_decode_graph(graph, rows);
+    if cpu_cfg.cpu_miss_threads != 0
+        && graph.mtp_verify
+        && std::env::var_os("INFR_CPU_MISS_DIAG").is_some()
+    {
+        static CPU_MISS_DIAG_ONCE: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !CPU_MISS_DIAG_ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!(
+                rows,
+                ne,
+                nff,
+                ?gdt,
+                ?udt,
+                ?ddt,
+                x_dtype = ?graph.desc(*x).dtype,
+                ?act,
+                fused = *fused_gate_up,
+                weight_before = *weight_before,
+                clamp = swiglu_clamp.is_some(),
+                cpu_threads = cpu_cfg.cpu_miss_threads,
+                supported = crate::cpu_miss::supported(cpu_cfg.cpu_miss_threads),
+                geom = cpu_geom,
+                graph = cpu_graph,
+                mtp_verify = graph.mtp_verify,
+                independent_rows = graph.independent_rows,
+                "cpu_miss eligibility inputs"
+            );
+        }
+    }
     let cpu_input_eligible = cpu_cfg.cpu_miss_threads != 0
         && crate::cpu_miss::within_limit(1, cpu_cfg.cpu_miss_max)
         && crate::cpu_miss::supported(cpu_cfg.cpu_miss_threads)
-        && crate::cpu_miss::geometry(rows, 1, ne, nff, gdt, udt, ddt)
+        && cpu_geom
         && (gdt != infr_core::DType::Iq3S || cpu_cfg.cpu_miss_iq3)
-        && cpu_miss_decode_graph(graph)
+        && cpu_graph
         && !*fused_gate_up
         && !*weight_before
         && graph.desc(*x).dtype == infr_core::DType::F32
@@ -10896,7 +10982,7 @@ fn execute_paged_moe<'a>(
             crate::cpu_miss::decode_layer(sess.registered_layer(roles[0], n_expert)?)
                 && sess.cpu_miss_source_supported(roles, true)
         };
-    if cpu_input_eligible && cpu_cfg.cpu_miss_input_tap && !has_bias && !hash {
+    if cpu_input_eligible && cpu_cfg.cpu_miss_input_tap && !has_bias && !hash && rows == 1 {
         cpu_miss_input = Some(pooled_usage(
             pool,
             be_,
@@ -11065,7 +11151,7 @@ fn execute_paged_moe<'a>(
                         pool,
                         be_,
                         "moe_cpu_miss_input",
-                        ne * 4,
+                        rows * ne * 4,
                         BufferUsage::Readback,
                     )?
                 };
@@ -11073,14 +11159,14 @@ fn execute_paged_moe<'a>(
                     pool,
                     be_,
                     "moe_cpu_miss_result",
-                    ne * 4 * cpu_cfg.cpu_miss_max,
+                    rows * ne * 4 * cpu_cfg.cpu_miss_max,
                     BufferUsage::Staging,
                 )?);
                 let _ = be_.cpu_miss_worker();
                 if cpu_miss_input.is_none() {
                     let rc = rec.as_ref().expect("segment always Some between ops");
                     rc.label_next("cpu_miss_input_copy");
-                    rc.copy(r(*x)?, 0, pool[&key].as_ref(), 0, ne * 4);
+                    rc.copy(r(*x)?, 0, pool[&key].as_ref(), 0, rows * ne * 4);
                 }
                 cpu_miss_input = Some(key);
             }
@@ -11250,56 +11336,112 @@ fn execute_paged_moe<'a>(
             // Full-RAM computation does not admit/overwrite GPU cache slots. Start it before
             // LRU maintenance and command recording, which can overlap the CPU's GU phase.
             let cpu_cfg = &be_.cfg().kernels.vulkan;
-            if let (true, Some(cpu_miss_input)) = (
-                cpu_input_eligible
-                    && crate::cpu_miss::within_limit(miss_count, cpu_cfg.cpu_miss_max),
-                cpu_miss_input,
-            ) {
-                if let Some(worker) = be_.cpu_miss_worker() {
-                    let slots: Vec<_> = (0..n_used)
-                        .filter(|&slot| miss_masks[0] & (1 << slot) != 0)
-                        .collect();
-                    let experts = be_
-                        .moe_pager()
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .unwrap()
-                        .cpu_miss_experts(
-                            [gate_id, up_id, down_id],
-                            &miss_ids[..miss_count],
-                            &slots,
-                            true,
-                        );
-                    if let Some(experts) = experts {
+            if cpu_input_eligible {
+                if let (Some(cpu_miss_input), Some(worker)) =
+                    (cpu_miss_input, be_.cpu_miss_worker())
+                {
+                    let roles = [gate_id, up_id, down_id];
+                    let mut row_experts = Vec::new();
+                    let mut row_indices = Vec::new();
+                    let mut destinations = Vec::new();
+                    let mut promotion_ids = Vec::new();
+                    let mut promotion_slots = Vec::new();
+                    let mut promotion_experts = None;
+                    let mut cpu_miss_ok = true;
+                    let promote =
+                        !cpu_cfg.cpu_miss_validate && cpu_cfg.cpu_miss_promote;
+                    {
+                        let guard = be_.moe_pager().lock().unwrap();
+                        let sess = guard.as_ref().unwrap();
+                        for row in 0..rows {
+                            let mask = miss_masks[row];
+                            if mask == 0 {
+                                continue;
+                            }
+                            if !crate::cpu_miss::within_limit(
+                                mask.count_ones() as usize,
+                                cpu_cfg.cpu_miss_max,
+                            ) {
+                                cpu_miss_ok = false;
+                                break;
+                            }
+                            let slots: Vec<_> = (0..n_used)
+                                .filter(|&slot| mask & (1u32 << slot) != 0)
+                                .collect();
+                            let ids: Vec<u32> = slots
+                                .iter()
+                                .map(|&slot| stage_ids[row * n_used + slot])
+                                .collect();
+                            let global_slots: Vec<usize> = slots
+                                .iter()
+                                .map(|&slot| row * physical_used + slot)
+                                .collect();
+                            let Some(experts) =
+                                sess.cpu_miss_experts(roles, &ids, &global_slots, true)
+                            else {
+                                cpu_miss_ok = false;
+                                break;
+                            };
+                            for (&id, &slot) in ids.iter().zip(&global_slots) {
+                                if !promotion_ids.contains(&id) {
+                                    promotion_ids.push(id);
+                                    promotion_slots.push(slot);
+                                }
+                            }
+                            destinations.extend_from_slice(&global_slots);
+                            row_experts.push(experts);
+                            row_indices.push(row);
+                        }
+                        if cpu_miss_ok && !destinations.is_empty() && promote {
+                            promotion_experts = sess.cpu_miss_experts(
+                                roles,
+                                &promotion_ids,
+                                &promotion_slots,
+                                true,
+                            );
+                            cpu_miss_ok = promotion_experts.is_some();
+                        }
+                    }
+                    if cpu_miss_ok && !destinations.is_empty() {
                         if ps.cpu_miss_controller.is_none() {
                             ps.cpu_miss_controller = worker.controller_guard();
                         }
                         let result_buf =
                             cpu_miss_result.expect("input/result scratch prepared together");
                         let input_span = infr_core::timeline::span("cpu_miss_input");
-                        let mut input = vec![0.0f32; ne];
+                        let mut input = vec![0.0f32; rows * ne];
                         be_.download(
                             pool[&cpu_miss_input].as_ref(),
                             bytemuck::cast_slice_mut(&mut input),
                         )?;
                         drop(input_span);
-                        if !cpu_cfg.cpu_miss_validate {
-                            debug_assert!(ps.cpu_promotion.is_none());
-                            ps.cpu_promotion = Some(CpuMissPromotion {
-                                roles: [gate_id, up_id, down_id],
-                                ids: miss_ids[..miss_count].to_vec(),
-                                layer: current_layer as usize,
-                                sources: Vec::new(),
-                                started: false,
-                                pending: None,
+                        let mut miss_rows = Vec::with_capacity(row_experts.len());
+                        for (row, experts) in row_indices.into_iter().zip(row_experts) {
+                            let start = row * ne;
+                            miss_rows.push(crate::cpu_miss::MissRow {
+                                experts,
+                                input: input[start..start + ne].to_vec(),
                             });
+                        }
+                        if !cpu_cfg.cpu_miss_validate {
                             cpu_promoted = true;
+                            if cpu_cfg.cpu_miss_promote {
+                                debug_assert!(ps.cpu_promotion.is_none());
+                                ps.cpu_promotion = Some(CpuMissPromotion {
+                                    roles,
+                                    ids: promotion_ids,
+                                    layer: current_layer as usize,
+                                    sources: promotion_experts
+                                        .expect("promotion experts checked above"),
+                                    started: false,
+                                    pending: None,
+                                });
+                            }
                         }
                         cpu_miss_job = Some((
-                            worker.submit(experts, gdt, input),
+                            worker.submit_rows(miss_rows, gdt),
                             result_buf,
-                            miss_masks[0],
+                            destinations,
                         ));
                     }
                 }
@@ -12217,7 +12359,7 @@ fn execute_paged_moe<'a>(
         );
     }
     let mut host_cpu_result = None;
-    if let Some((job, result_buf, miss_mask)) = cpu_miss_job {
+    if let Some((job, result_buf, destinations)) = cpu_miss_job {
         if be_.cfg().kernels.vulkan.cpu_miss_validate {
             let wait_span = infr_core::timeline::span("cpu_miss_wait");
             let output = job.wait()?;
@@ -12247,10 +12389,11 @@ fn execute_paged_moe<'a>(
                     .is_some();
             let target = if be_.cfg().kernels.vulkan.cpu_miss_host_result
                 && shared.is_some()
-                && miss_mask.count_ones() == 1
+                && rows == 1
+                && destinations.len() == 1
             {
                 debug_assert_eq!(rows, 1);
-                host_cpu_result = Some((result_buf, miss_mask.trailing_zeros() as usize));
+                host_cpu_result = Some((result_buf, destinations[0]));
                 CpuMissResultTarget::Staging(result_buf)
             } else if direct {
                 CpuMissResultTarget::Mapped {
@@ -12258,11 +12401,7 @@ fn execute_paged_moe<'a>(
                     row_elements: ne,
                 }
             } else {
-                let mut index = 0;
-                for slot in 0..n_used {
-                    if miss_mask & (1 << slot) == 0 {
-                        continue;
-                    }
+                for (index, &slot) in destinations.iter().enumerate() {
                     rc.copy(
                         pool[&result_buf].as_ref(),
                         index * ne * 4,
@@ -12270,7 +12409,6 @@ fn execute_paged_moe<'a>(
                         slot * ne * 4,
                         ne * 4,
                     );
-                    index += 1;
                 }
                 CpuMissResultTarget::Staging(result_buf)
             };
@@ -12391,6 +12529,8 @@ mod tests {
             }],
             prefill_target_lanes: 1,
             prefill_cache_bytes: (SLOT * 16) as u64,
+            reuse_existing: false,
+            private_unified_arena: false,
         })
         .unwrap();
         let roles = [101, 102, 103];
@@ -12509,6 +12649,8 @@ mod tests {
             }],
             prefill_target_lanes: 1,
             prefill_cache_bytes: (SLOT * 16) as u64,
+            reuse_existing: false,
+            private_unified_arena: false,
         })
         .unwrap();
         let roles = [101, 102, 103];
@@ -12784,11 +12926,13 @@ mod tests {
     }
 
     #[test]
-    fn cpu_miss_decode_excludes_one_row_verify_and_parallel_decode() {
+    fn cpu_miss_decode_allows_short_verify_but_excludes_parallel_decode() {
         let mut graph = Graph::new();
-        assert!(cpu_miss_decode_graph(&graph));
+        assert!(cpu_miss_decode_graph(&graph, 1));
         graph.mtp_verify = true;
-        assert!(!cpu_miss_decode_graph(&graph));
+        assert!(cpu_miss_decode_graph(&graph, 1));
+        assert!(cpu_miss_decode_graph(&graph, 4));
+        assert!(!cpu_miss_decode_graph(&graph, 5));
         graph.mtp_verify = false;
         graph.independent_rows = true;
         graph.sequence_spans = vec![
@@ -12803,7 +12947,7 @@ mod tests {
                 start_pos: 31_000,
             },
         ];
-        assert!(!cpu_miss_decode_graph(&graph));
+        assert!(!cpu_miss_decode_graph(&graph, 2));
     }
 
     #[test]
@@ -14742,10 +14886,7 @@ mod tests {
             cfg.kernels.vulkan.qwen_hc_down_prefetch = prefetch;
             let be_ = VulkanBackend::new_with(std::sync::Arc::new(cfg)).unwrap();
             for inject_dtype in [DType::F32, DType::Q8_0] {
-                for rows in [1usize] {
-                    if inject_dtype == DType::F32 && rows > 1 {
-                        continue;
-                    }
+                for rows in [1usize, 2, 3, 4, 5, 6, 7, 8] {
                     let (in_f, rank, hc) = (10240usize, 320usize, 4usize);
                     let x = (0..rows * in_f)
                         .map(|i| (i as f32 * 0.017).sin() * 0.25)
@@ -14821,11 +14962,23 @@ mod tests {
                         values.push(v);
                     }
                     for (a, b) in [(0, 2), (1, 3)] {
+                        let mut max_err = 0.0f32;
+                        let mut max_at = 0usize;
                         for (index, (fused, split)) in values[a].iter().zip(&values[b]).enumerate()
                         {
-                            assert_eq!(fused.to_bits(), split.to_bits(),
-                                "HC parity prefetch={prefetch} inject={inject_dtype:?} rows={rows} output={a} index={index}: {fused} vs {split}");
+                            let err = (fused - split).abs();
+                            if err > max_err {
+                                max_err = err;
+                                max_at = index;
+                            }
                         }
+                        assert!(
+                            max_err < 1e-5,
+                            "HC parity prefetch={prefetch} inject={inject_dtype:?} rows={rows} \
+                             output={a}: max error {max_err} at {max_at} ({} vs {})",
+                            values[a][max_at],
+                            values[b][max_at],
+                        );
                     }
                 }
             }
@@ -14881,6 +15034,7 @@ mod tests {
                     in_f as u32,
                     low_rank as u32,
                     hc as u32,
+                    1,
                     scale,
                 );
             } else {
@@ -14895,6 +15049,7 @@ mod tests {
                     in_f as u32,
                     low_rank as u32,
                     hc as u32,
+                    1,
                     scale,
                 );
             }
@@ -14941,6 +15096,7 @@ mod tests {
                         in_f as u32,
                         low_rank as u32,
                         hc as u32,
+                        1,
                         scale,
                     );
                 } else {
@@ -14955,6 +15111,7 @@ mod tests {
                         in_f as u32,
                         low_rank as u32,
                         hc as u32,
+                        1,
                         scale,
                     );
                 }

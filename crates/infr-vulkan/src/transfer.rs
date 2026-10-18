@@ -594,6 +594,22 @@ impl SessionTransferPlan {
             .and_then(|import| import.ranges(src.as_ptr(), src.len()))
     }
 
+    /// The 64-bit device address of `src`'s first byte, when the whole range lies inside ONE
+    /// imported host shard that was built WITH a device address (`paging.moe_prefill_inplace`; see
+    /// `VulkanBackend::try_import_host_shard`). `None` when the import carries no address, or the
+    /// range spans two shards — a spanning range has no single linear address, so the caller must
+    /// keep using the copy path. Callers append their own intra-bank offset to this address.
+    pub(crate) fn imported_addr(&self, src: &[u8]) -> Option<u64> {
+        let ranges = self.imported_ranges(src)?;
+        match ranges.as_slice() {
+            [one] => one
+                .buffer
+                .device_addr()
+                .map(|addr| addr + one.offset as u64),
+            _ => None,
+        }
+    }
+
     /// Release up to `target_bytes` of imported-host aliases without touching any source buffer
     /// retained by a prepared or in-flight command. Imports cover contiguous prefixes, so only a
     /// physical tail shard can be retired while keeping all earlier source addresses valid.
@@ -1128,6 +1144,15 @@ fn make_dedicated_host_transfer_buffer(
         size,
         mem_size: requirements.size,
         location: MemoryLocation::GpuOnly,
+        mem_type: memory_type as i32,
+        mem_flags: unsafe {
+            shared
+                .instance
+                .get_physical_device_memory_properties(shared.physical_device)
+        }
+        .memory_types[memory_type as usize]
+            .property_flags
+            .as_raw(),
         sub_offset: 0,
         own_addr: None,
         act_bytes: 0,

@@ -46,6 +46,7 @@ pub(crate) fn native_mrow_kernel_name(dtype: infr_core::DType) -> Option<&'stati
         Q6K => "native_mrow_q6k",
         Iq4Nl => "native_mrow_iq4nl",
         Iq4Xs => "native_mrow_iq4xs",
+        Iq3S => "native_mrow_iq3s",
         Q2_0 => "native_mrow_q2_0",
         _ => return None,
     })
@@ -171,6 +172,7 @@ pub(crate) fn native_mrow_spv(
         (Q6K, _) => v!("native_mrow_q6k"),
         (Iq4Nl, _) => v!("native_mrow_iq4nl"),
         (Iq4Xs, _) => v!("native_mrow_iq4xs"),
+        (Iq3S, _) => v!("native_mrow_iq3s"),
         (Q2_0, _) => v!("native_mrow_q2_0"),
         _ => None,
     }
@@ -511,6 +513,33 @@ pub(crate) fn native_idm_grid_buffer_shared_spv(
     }
 }
 
+/// Resident-BDA twin of the immutable-codebook IQ3_S id GEMV. The codebook is read from
+/// binding 0, so no `grid_init()` LDS staging runs per workgroup; the weight itself stays
+/// arena-addressed, exactly like `native_idm_build_spv`'s STREAMED build.
+pub(crate) fn native_idm_grid_buffer_streamed_spv(
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
+        }};
+    }
+    match dtype {
+        infr_core::DType::Iq2S => v!("native_idm_iq2s_buffer"),
+        infr_core::DType::Iq2Xxs => v!("native_idm_iq2xxs_buffer"),
+        infr_core::DType::Iq2Xs => v!("native_idm_iq2xs_buffer"),
+        infr_core::DType::Iq3S => v!("native_idm_iq3s_buffer"),
+        infr_core::DType::Iq3Xxs => v!("native_idm_iq3xxs_buffer"),
+        _ => None,
+    }
+}
+
 /// The single-slot id-indexed native GEMV (kernel-cache name + SPIR-V) — the stacked expert
 /// tensor read from a `bufferDeviceAddress` arena; `stride` becomes the per-expert BYTE stride
 /// applied on the 64-bit pointer (no LUT); the sole weight build. Dispatched via
@@ -653,6 +682,18 @@ pub(crate) fn native_idm_sg_build_spv(
         (Iq3S, 2, true) => v!("native_idm_iq3s_sg2_sg16"),
         (Iq3S, 4, true) => v!("native_idm_iq3s_sg4_sg16"),
         (Iq3S, 8, true) => v!("native_idm_iq3s_sg8_sg16"),
+        (Iq4Nl, 2, false) => v!("native_idm_iq4nl_sg2"),
+        (Iq4Nl, 4, false) => v!("native_idm_iq4nl_sg4"),
+        (Iq4Nl, 8, false) => v!("native_idm_iq4nl_sg8"),
+        (Iq4Nl, 2, true) => v!("native_idm_iq4nl_sg2_sg16"),
+        (Iq4Nl, 4, true) => v!("native_idm_iq4nl_sg4_sg16"),
+        (Iq4Nl, 8, true) => v!("native_idm_iq4nl_sg8_sg16"),
+        (Q2_0, 2, false) => v!("native_idm_q2_0_sg2"),
+        (Q2_0, 4, false) => v!("native_idm_q2_0_sg4"),
+        (Q2_0, 8, false) => v!("native_idm_q2_0_sg8"),
+        (Q2_0, 2, true) => v!("native_idm_q2_0_sg2_sg16"),
+        (Q2_0, 4, true) => v!("native_idm_q2_0_sg4_sg16"),
+        (Q2_0, 8, true) => v!("native_idm_q2_0_sg8_sg16"),
         _ => None,
     }
 }
@@ -1209,6 +1250,19 @@ iq_xs_mmq_spv!(
     native_gemm_mmq_iq3_xxs_xpg32_spv,
     "native_gemm_mmq_iq3_xxs_xpg32"
 );
+iq_xs_mmq_spv!(native_gemm_mmq_iq2_xxs_xp_spv, "native_gemm_mmq_iq2_xxs_xp");
+iq_xs_mmq_spv!(
+    native_gemm_mmq_iq2_xxs_xp32_spv,
+    "native_gemm_mmq_iq2_xxs_xp32"
+);
+iq_xs_mmq_spv!(
+    native_gemm_mmq_iq2_xxs_xpg_spv,
+    "native_gemm_mmq_iq2_xxs_xpg"
+);
+iq_xs_mmq_spv!(
+    native_gemm_mmq_iq2_xxs_xpg32_spv,
+    "native_gemm_mmq_iq2_xxs_xpg32"
+);
 /// The f16-weight decode GEMV (`linear_f16.comp`; weight read through a typed 64-bit
 /// buffer_reference — see the shader's STREAMED doc) — the ONLY weight build (the bound-SSBO
 /// resident build died with the eager `VulkanBackend::linear_f16` caller, its sole consumer).
@@ -1631,6 +1685,8 @@ pub(crate) fn embed_gather_spv(dtype: infr_core::DType) -> Option<(&'static str,
         Q6K => v!("embed_gather_q6k"),
         Iq4Nl => v!("embed_gather_iq4nl"),
         Iq4Xs => v!("embed_gather_iq4xs"),
+        // LOCAL TRIAL: see build.rs — enrolled for IQ3_S token_embd trunks.
+        Iq3S => v!("embed_gather_iq3s"),
         Q2_0 => v!("embed_gather_q2_0"),
         _ => None,
     }
@@ -1735,6 +1791,12 @@ pub(crate) fn moe_bucket_count_spv() -> &'static [u32] {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn moe_bucket_scan_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_bucket_scan.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn moe_grid_args_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_grid_args.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
@@ -3575,6 +3637,14 @@ qsa_spv!(qsa_prepare_mrope_seg_spv, "qsa_prepare_mrope_seg");
 qsa_spv!(qsa_indexer_topk_hist_spv, "qsa_indexer_topk_hist");
 qsa_spv!(qsa_indexer_topk_select_spv, "qsa_indexer_topk_select");
 qsa_spv!(qsa_indexer_topk_collect_spv, "qsa_indexer_topk_collect");
+qsa_spv!(
+    qsa_attention_batch_q8_seg_gqa12_flash_cm_qk_pv_union_spv,
+    "qsa_attention_batch_q8_seg_gqa12_flash_cm_qk_pv_union"
+);
+qsa_spv!(qsa_union_bits_spv, "qsa_union_bits");
+qsa_spv!(qsa_union_rank_spv, "qsa_union_rank");
+qsa_spv!(qsa_union_apply_spv, "qsa_union_apply");
+qsa_spv!(qsa_union_gather_spv, "qsa_union_gather");
 qsa_spv!(qsa_indexer_topk_scan_spv, "qsa_indexer_topk_scan");
 qsa_spv!(
     qsa_indexer_topk_select_scan_spv,

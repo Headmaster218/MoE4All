@@ -1,0 +1,50 @@
+#version 460
+// QSA prefill sparse-attention UNION planner, pass 0 (clear) + pass 1 (mark).
+//
+// The GQA12 prefill kernel gives every (query row, KV head) its own workgroup, so all `rows`
+// query rows of a chunk walk the whole scattered segmented cache to reach the ~512 blocks they
+// selected — the same ~1 MiB of hot K/V fetched `rows` times. This pass builds the chunk-wide
+// bitmap of selected block ids; `qsa_union_rank` turns it into positions inside one contiguous
+// copy (`qsa_union_gather`) that attention then reads once.
+//
+// PASS 0 clears words [0]=flag, [1]=count and the bitmap. PASS 1 ORs the selected ids of the row
+// owned by each workgroup. `selected` must mirror the attention's own bound exactly
+// (`min(top_blocks, (kv_len - rows + row + 1) / ratio)`) — anything wider would pull block ids the
+// topk never wrote into the union.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint kv_len;
+    uint top_blocks;
+    uint ratio;
+    uint words; // bitmap words = ceil(blocks / 32)
+    uint pass;  // 0 = clear, 1 = mark
+} pc;
+
+layout(binding = 0) buffer BB { uint bits[]; };
+layout(binding = 1) readonly buffer IB { uint indices[]; };
+
+void main() {
+    if (pc.pass == 0u) {
+        uint total = pc.words + 2u;
+        for (uint w = gl_GlobalInvocationID.x; w < total; w += gl_NumWorkGroups.x * 256u) {
+            bits[w] = 0u;
+        }
+        return;
+    }
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.rows) {
+        return;
+    }
+    uint visible = pc.kv_len - pc.rows + row + 1u;
+    uint selected = min(pc.top_blocks, visible / pc.ratio);
+    uint base = row * pc.top_blocks;
+    uint limit = pc.words * 32u;
+    for (uint i = gl_LocalInvocationID.x; i < selected; i += 256u) {
+        uint block = indices[base + i];
+        if (block < limit) {
+            atomicOr(bits[2u + (block >> 5u)], 1u << (block & 31u));
+        }
+    }
+}

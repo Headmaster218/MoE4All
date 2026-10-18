@@ -7,6 +7,7 @@ use std::sync::{Mutex, OnceLock};
 use serde::Serialize;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+static FLIGHT_ENABLED: OnceLock<bool> = OnceLock::new();
 static NEXT_STEP: AtomicU64 = AtomicU64::new(0);
 static NEXT_SUBMIT: AtomicU64 = AtomicU64::new(1);
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
@@ -22,6 +23,13 @@ pub struct Context {
     pub step: u64,
     pub lanes: usize,
     pub layer: i32,
+    /// Pipeline device the traced work executes on, or -1 when the backend does not
+    /// expose a per-segment device identity.
+    pub device: i32,
+    /// Decode phase the traced work belongs to ("draft"/"verify"/…), or "" outside one. The
+    /// flight recorder uses it to bill a submit to the phase that issued it; the timestamp
+    /// timeline ignores it.
+    pub phase: &'static str,
 }
 
 #[derive(Serialize)]
@@ -172,37 +180,55 @@ fn selected(index: usize, skip: usize, count: usize, stride: usize, windows: usi
 pub struct StepGuard {
     previous: Option<Context>,
     step: Step,
+    record_timeline: bool,
 }
 
 pub fn begin_step(positions: &[usize]) -> Option<StepGuard> {
-    if !enabled() || crate::prof::suppressed() {
+    let trace = enabled();
+    let flight = flight_enabled();
+    if (!trace && !flight) || crate::prof::suppressed() {
         return None;
     }
-    let state = STATE.get()?.lock().unwrap();
-    if state.lanes != 0 && state.lanes != positions.len() {
-        return None;
-    }
-    let id = NEXT_STEP.fetch_add(1, Ordering::Relaxed);
-    if !selected(
-        id as usize,
-        state.skip,
-        state.count,
-        state.stride,
-        state.windows,
-    ) {
-        return None;
-    }
-    drop(state);
-    EVENTS.with(|events| {
-        let mut events = events.borrow_mut();
-        if events.capacity() < 16_384 {
-            events.reserve(16_384);
+    let mut id = None;
+    let mut record_timeline = false;
+    if trace {
+        if let Some(state) = STATE.get() {
+            let state = state.lock().unwrap();
+            if state.lanes == 0 || state.lanes == positions.len() {
+                let candidate = NEXT_STEP.fetch_add(1, Ordering::Relaxed);
+                record_timeline = selected(
+                    candidate as usize,
+                    state.skip,
+                    state.count,
+                    state.stride,
+                    state.windows,
+                );
+                id = Some(candidate);
+            }
         }
-    });
+    }
+    let id = match id {
+        Some(id) => id,
+        None if flight => NEXT_STEP.fetch_add(1, Ordering::Relaxed),
+        None => return None,
+    };
+    if !record_timeline && !flight {
+        return None;
+    }
+    if record_timeline {
+        EVENTS.with(|events| {
+            let mut events = events.borrow_mut();
+            if events.capacity() < 16_384 {
+                events.reserve(16_384);
+            }
+        });
+    }
     let ctx = Context {
         step: id,
         lanes: positions.len(),
         layer: -1,
+        device: -1,
+        phase: "",
     };
     let previous = CONTEXT.with(|current| current.replace(Some(ctx)));
     Some(StepGuard {
@@ -214,13 +240,17 @@ pub fn begin_step(positions: &[usize]) -> Option<StepGuard> {
             start_ns: clock_ns(),
             end_ns: 0,
         },
+        record_timeline,
     })
 }
 
 impl Drop for StepGuard {
     fn drop(&mut self) {
-        self.step.end_ns = clock_ns();
         CONTEXT.with(|current| current.set(self.previous));
+        if !self.record_timeline {
+            return;
+        }
+        self.step.end_ns = clock_ns();
         let mut state = STATE.get().unwrap().lock().unwrap();
         EVENTS.with(|events| {
             let mut events = events.borrow_mut();
@@ -279,7 +309,7 @@ impl Drop for Span {
 
 pub struct LayerGuard(Option<Context>);
 pub fn layer(layer: usize) -> LayerGuard {
-    let previous = context();
+    let previous = attribution_context();
     if let Some(mut ctx) = previous {
         ctx.layer = layer as i32;
         CONTEXT.with(|current| current.set(Some(ctx)));
@@ -288,9 +318,109 @@ pub fn layer(layer: usize) -> LayerGuard {
 }
 impl Drop for LayerGuard {
     fn drop(&mut self) {
-        if enabled() {
+        if enabled() || flight_enabled() {
             CONTEXT.with(|current| current.set(self.0));
         }
+    }
+}
+
+/// Attribute spans and device submissions to pipeline segment `device` until the guard drops.
+/// A no-op outside an active [`begin_step`] context (e.g. background threads).
+pub struct DeviceGuard(Option<Context>);
+/// Attribute submissions to a named decode phase until the guard drops. A no-op when neither the
+/// timestamp timeline nor the flight recorder is active, so production pays one relaxed load.
+pub struct PhaseGuard(Option<Context>);
+pub fn phase(name: &'static str) -> PhaseGuard {
+    let previous = attribution_context();
+    if let Some(mut ctx) = previous {
+        ctx.phase = name;
+        CONTEXT.with(|current| current.set(Some(ctx)));
+    }
+    PhaseGuard(previous)
+}
+impl Drop for PhaseGuard {
+    fn drop(&mut self) {
+        if enabled() || flight_enabled() {
+            CONTEXT.with(|current| current.set(self.0));
+        }
+    }
+}
+
+pub fn device(device: usize) -> DeviceGuard {
+    let previous = attribution_context();
+    if let Some(mut ctx) = previous {
+        ctx.device = device as i32;
+        CONTEXT.with(|current| current.set(Some(ctx)));
+    }
+    DeviceGuard(previous)
+}
+impl Drop for DeviceGuard {
+    fn drop(&mut self) {
+        if enabled() || flight_enabled() {
+            CONTEXT.with(|current| current.set(self.0));
+        }
+    }
+}
+
+/// The calling thread's current attribution context, if a step is active — the counterpart of
+/// [`adopt`], for work about to be handed to a worker thread.
+#[inline]
+pub fn current_context() -> Option<Context> {
+    CONTEXT.with(Cell::get)
+}
+
+/// Adopt `ctx` as this thread's attribution context until the guard drops. The context is
+/// thread-local, so a spawned worker sees none of the step/phase bookkeeping its parent set up;
+/// the pipeline's device-1 half uses this to bill its submits to the same decode step and phase as
+/// the device-0 half that spawned it.
+pub struct AdoptGuard(Option<Context>);
+pub fn adopt(ctx: Option<Context>) -> AdoptGuard {
+    let previous = CONTEXT.with(Cell::get);
+    if enabled() || flight_enabled() {
+        CONTEXT.with(|current| current.set(ctx));
+    }
+    AdoptGuard(previous)
+}
+impl Drop for AdoptGuard {
+    fn drop(&mut self) {
+        if enabled() || flight_enabled() {
+            CONTEXT.with(|current| current.set(self.0));
+        }
+    }
+}
+
+/// Whether a lightweight trace requested decode-step attribution. The submit flight recorder and
+/// the per-dispatch op trace both need the same thread-local context, even when the heavyweight
+/// device timeline is off.
+#[inline]
+pub fn flight_enabled() -> bool {
+    *FLIGHT_ENABLED.get_or_init(|| {
+        [
+            std::env::var_os("INFR_SUBMIT_TRACE"),
+            std::env::var_os("INFR_PROF_OP_TRACE"),
+        ]
+        .iter()
+        .flatten()
+        .any(|value| !value.is_empty())
+    })
+}
+
+/// Current decode context for the submit flight recorder. Unlike [`context`], this does not
+/// require the device-timestamp timeline to be active.
+#[inline]
+pub fn flight_context() -> Option<Context> {
+    if !flight_enabled() {
+        return None;
+    }
+    CONTEXT.with(Cell::get)
+}
+
+#[inline]
+fn attribution_context() -> Option<Context> {
+    if enabled() {
+        context()
+    } else {
+        flight_context()
     }
 }
 
@@ -346,7 +476,7 @@ pub fn flush() -> std::io::Result<()> {
         trace.push(serde_json::json!({"name":event.name,"ph":"X","pid":1,"tid":if event.name == "recorder_lifetime" {2} else if matches!(event.name, "cpu_miss_ffn_one" | "cpu_miss_ffn_two" | "cpu_miss_ffn_three" | "cpu_miss_gu" | "cpu_miss_down") {3} else {1},
             "ts":event.start_ns.saturating_sub(origin) as f64 / 1000.0,
             "dur":event.end_ns.saturating_sub(event.start_ns) as f64 / 1000.0,
-            "args":{"step":event.context.step,"layer":event.context.layer,"submit":event.submit}}));
+            "args":{"step":event.context.step,"layer":event.context.layer,"device":event.context.device,"submit":event.submit}}));
     }
     for event in &state.device {
         if let Some(sample) = state
@@ -364,7 +494,7 @@ pub fn flush() -> std::io::Result<()> {
             trace.push(serde_json::json!({"name":event.name,"ph":"X","pid":2,
                 "tid":if event.queue != "main" {2} else if event.name == "queue_envelope" {1} else {3},
                 "ts":start.saturating_sub(origin) as f64 / 1000.0,"dur":duration as f64 / 1000.0,
-                "args":{"step":event.context.step,"layer":event.context.layer,"submit":event.submit,
+                "args":{"step":event.context.step,"layer":event.context.layer,"device":event.context.device,"submit":event.submit,
                     "wait":event.transfer_wait,"signal":event.transfer_signal,"bytes":event.bytes,
                     "dispatches":event.dispatches,"calibration_deviation_ns":sample.deviation_ns}}));
         }

@@ -27,6 +27,7 @@ layout(binding = 2) writeonly buffer YB { float y_buf[]; };
 #include "native_decode.glsl"
 
 void main() {
+    GRID_INIT; // barrier inside — must precede the (workgroup-uniform) early return below
     uint row = gl_WorkGroupID.x;
     if (row >= pc.rows) { return; }
     uint t = gl_LocalInvocationID.x;

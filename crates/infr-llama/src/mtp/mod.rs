@@ -94,7 +94,11 @@ pub struct MtpHeadWeights {
 /// The real fix is an accuracy mitigation (e.g. re-verify in f32 when the top-2 logit margin is
 /// below a threshold), NOT faster kernels — see `infr_vulkan`'s `mmv_int8_decode_dtypes` doc.
 pub fn mtp_enabled() -> bool {
-    false
+    // LOCAL TRIAL (revert before proposing upstream). Un-parked to measure Qwen3.8 MTP on this
+    // 2x7900XTX box, where the same hardware sustains 100+ tok/s with speculation via Strata, so
+    // the 0.59-0.78x row this was parked on is not necessarily our ceiling. The parity caveat in
+    // the doc comment above still stands until `mtp_spec_matches_target_only_greedy` passes.
+    true
 }
 
 /// The SINGLE MTP opt-in decision the chat backends share (`chat::vulkan`/`chat::metal`/`chat::cpu`
@@ -118,6 +122,11 @@ pub fn should_use_mtp(cfg: &crate::Config, ec: &crate::EngineConfig) -> bool {
         );
         return false;
     }
+    // LOCAL TRIAL: the `spec.draft` sidecar does NOT feed this path — `load_mtp_head` reads the
+    // TRUNK's own GGUF, so a sidecar-only head has nothing to load here. Qwen3.8's MTP routes
+    // through `Qwen4MtpRuntime` (which DOES read the sidecar) and is gated separately in
+    // `chat::vulkan::wants_qwen4_mtp`; letting this return `true` for a headless trunk sent that
+    // model into the qwen35 loader and aborted startup. Keep this about the trunk's `nextn` block.
     cfg.n_layer_nextn > 0
 }
 

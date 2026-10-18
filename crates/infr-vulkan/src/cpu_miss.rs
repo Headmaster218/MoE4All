@@ -13,12 +13,16 @@ mod topology;
 #[path = "cpu_miss/kernels.rs"]
 mod kernels;
 
+pub(crate) const MAX_ROWS: usize = 4;
+
 pub(crate) fn eligible(threads: usize, avx2: bool, fma: bool) -> bool {
     threads != 0 && avx2 && fma
 }
 
 pub(crate) fn within_limit(misses: usize, maximum: usize) -> bool {
-    (1..=3).contains(&maximum) && (1..=maximum).contains(&misses)
+    // ponytail: 16 rather than the hard 3 -- qwen4exp routes top-10, so a decode token can miss
+    // more than 3 experts. Upper bound stays a bound: it sizes the miss scratch.
+    (1..=16).contains(&maximum) && (1..=maximum).contains(&misses)
 }
 
 pub(crate) fn supported(threads: usize) -> bool {
@@ -47,7 +51,7 @@ pub(crate) fn geometry(
     up: DType,
     down: DType,
 ) -> bool {
-    rows == 1
+    (1..=MAX_ROWS).contains(&rows)
         && (1..=3).contains(&misses)
         && k == 2560
         && n == 640
@@ -111,6 +115,11 @@ impl Weight {
 pub(crate) struct Expert {
     pub(crate) slot: usize,
     pub(crate) weights: [Weight; 3],
+}
+
+pub(crate) struct MissRow {
+    pub(crate) experts: Vec<Expert>,
+    pub(crate) input: Vec<f32>,
 }
 
 pub(crate) struct Output {
@@ -197,9 +206,8 @@ struct FixtureCapture {
     captured: std::sync::atomic::AtomicBool,
 }
 struct Command {
-    experts: Vec<Expert>,
+    rows: Vec<MissRow>,
     kind: DType,
-    x: Vec<f32>,
     queued: Instant,
     context: Option<infr_core::timeline::Context>,
     sender: mpsc::SyncSender<Result<Output>>,
@@ -384,11 +392,17 @@ impl Worker {
         })
     }
     pub(crate) fn submit(&self, experts: Vec<Expert>, kind: DType, x: Vec<f32>) -> Job {
+        self.submit_rows(vec![MissRow {
+            experts,
+            input: x,
+        }], kind)
+    }
+
+    pub(crate) fn submit_rows(&self, rows: Vec<MissRow>, kind: DType) -> Job {
         let (sender, receiver) = mpsc::sync_channel(1);
         let command = Command {
-            experts,
+            rows,
             kind,
-            x,
             queued: Instant::now(),
             context: infr_core::timeline::context(),
             sender,
@@ -488,9 +502,8 @@ impl Drop for AffinityGuard {
 
 fn run_command(pool: &CpuTaskPool, stats: &Mutex<Stats>, command: Command) {
     let Command {
-        experts,
+        rows,
         kind,
-        x,
         queued,
         context,
         sender,
@@ -499,50 +512,73 @@ fn run_command(pool: &CpuTaskPool, stats: &Mutex<Stats>, command: Command) {
         grouped_dot,
         fixture,
     } = command;
-    capture_fixture(fixture.as_deref(), &experts, kind, &x, context);
+    if rows.len() == 1 {
+        capture_fixture(
+            fixture.as_deref(),
+            &rows[0].experts,
+            kind,
+            &rows[0].input,
+            context,
+        );
+    }
     let started = Instant::now();
     let clock_start = context.map(|_| infr_core::timeline::clock_ns());
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        compute_options(
-            pool,
-            &experts,
-            kind,
-            &x,
-            context,
-            split_acc,
-            flush_denormals,
-            grouped_dot,
-        )
-    }));
-    let clock_end = context.map(|_| infr_core::timeline::clock_ns());
-    let mut tasks = Vec::new();
-    let result = match result {
-        Ok(mut output) => {
-            tasks = std::mem::take(&mut output.tasks);
-            Ok(output)
+    let mut output = Output {
+        slots: Vec::new(),
+        values: Vec::new(),
+        tasks: Vec::new(),
+        experts: Vec::new(),
+    };
+    let mut failed = false;
+    for row in &rows {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            compute_options(
+                pool,
+                &row.experts,
+                kind,
+                &row.input,
+                context,
+                split_acc,
+                flush_denormals,
+                grouped_dot,
+            )
+        }));
+        match result {
+            Ok(mut row_output) => {
+                output.slots.append(&mut row_output.slots);
+                output.values.append(&mut row_output.values);
+                output.tasks.append(&mut row_output.tasks);
+            }
+            Err(_) => {
+                failed = true;
+                break;
+            }
         }
-        Err(_) => {
-            // A failed compute must not leave a half-written expert marked resident.
-            for expert in &experts {
-                for w in &expert.weights {
-                    if let Some(target) = &w.target {
-                        crate::copy_to_mapped(w.bytes(), target.mapped_ptr().unwrap());
+    }
+    let clock_end = context.map(|_| infr_core::timeline::clock_ns());
+    let tasks = std::mem::take(&mut output.tasks);
+    let count: usize = rows.iter().map(|row| row.experts.len()).sum();
+    let result = if failed {
+        // A failed compute must not leave a half-written expert marked resident.
+        for row in &rows {
+            for expert in &row.experts {
+                for weight in &expert.weights {
+                    if let Some(target) = &weight.target {
+                        crate::copy_to_mapped(weight.bytes(), target.mapped_ptr().unwrap());
                     }
                 }
             }
-            Err(be("CPU miss computation panicked"))
         }
+        Err(be("CPU miss computation panicked"))
+    } else {
+        output.experts = rows.into_iter().flat_map(|row| row.experts).collect();
+        Ok(output)
     };
-    let count = experts.len();
     let sample = (
         count as f64,
         started.duration_since(queued).as_secs_f64() * 1e6,
         started.elapsed().as_secs_f64() * 1e6,
     );
-    let result = result.map(|mut output| {
-        output.experts = experts;
-        output
-    });
     let _ = sender.send(result);
     if let (Some(ctx), Some(start), Some(end)) = (context, clock_start, clock_end) {
         let label = match count {
@@ -2089,7 +2125,7 @@ mod tests {
                 }
             }
         }
-        for rows in 1..=3 {
+        for rows in 1..=5 {
             for misses in 0..=10 {
                 assert_eq!(
                     geometry(
@@ -2101,7 +2137,7 @@ mod tests {
                         DType::Iq2S,
                         DType::Iq4Nl
                     ),
-                    rows == 1 && (1..=3).contains(&misses)
+                    (1..=MAX_ROWS).contains(&rows) && (1..=3).contains(&misses)
                 );
             }
         }
@@ -2110,7 +2146,7 @@ mod tests {
             for misses in 0..=10 {
                 assert_eq!(
                     within_limit(misses, maximum),
-                    (1..=3).contains(&maximum) && (1..=maximum).contains(&misses)
+                    (1..=16).contains(&maximum) && (1..=maximum).contains(&misses)
                 );
             }
         }
@@ -2133,6 +2169,24 @@ mod tests {
             DType::Iq2S,
             DType::Iq2S,
             DType::Q4K
+        ));
+        assert!(!geometry(
+            1,
+            1,
+            2560,
+            640,
+            DType::Iq2S,
+            DType::Iq2S,
+            DType::Q2_0
+        ));
+        assert!(!geometry(
+            1,
+            1,
+            2560,
+            640,
+            DType::Iq2Xs,
+            DType::Iq2Xs,
+            DType::Iq4Nl
         ));
         assert!(!geometry(
             1,
@@ -2275,6 +2329,57 @@ mod tests {
                         .unwrap()
                         .values,
                     vec![0.0; 2560]
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn batched_rows_preserve_row_order_and_global_slots() {
+        if !supported(4) {
+            return;
+        }
+        for kind in [DType::Iq2S, DType::Iq3S] {
+            let worker = Worker::new(4, false).unwrap();
+            for rows in 2..=MAX_ROWS {
+                let inputs: Vec<Vec<f32>> = (0..rows)
+                    .map(|row| {
+                        (0..2560)
+                            .map(|i| ((i % 31) as f32 - 15.0) * (0.001 + row as f32 * 0.002))
+                            .collect()
+                    })
+                    .collect();
+                let mut batch = Vec::with_capacity(rows);
+                let mut expected_slots = Vec::new();
+                let mut expected_values = Vec::new();
+                for (row, input) in inputs.iter().enumerate() {
+                    let mut experts = vec![fixture(kind, 2), fixture(kind, 7)];
+                    experts[0].slot = row * 8 + 2;
+                    experts[1].slot = row * 8 + 7;
+                    expected_slots.extend([row * 8 + 2, row * 8 + 7]);
+                    let single = worker
+                        .submit(vec![fixture(kind, 2), fixture(kind, 7)], kind, input.clone())
+                        .wait()
+                        .unwrap();
+                    expected_values.extend(single.values);
+                    batch.push(MissRow {
+                        experts,
+                        input: input.clone(),
+                    });
+                }
+                let output = worker.submit_rows(batch, kind).wait().unwrap();
+                assert_eq!(output.slots, expected_slots);
+                assert_eq!(
+                    output
+                        .values
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    expected_values
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>()
                 );
             }
         }

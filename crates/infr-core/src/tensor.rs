@@ -184,6 +184,12 @@ pub const MOE_MMQ_DTYPES: &[DType] = &[
     DType::Iq4Xs,
     DType::Iq2S,
     DType::Iq2Xs,
+    // IQ2_XXS: same grid-codebook recipe as Iq2S/Iq2Xs via the shared-LUT staging, now with its
+    // own `native_gemm_mmq_iq2_xxs_*` builds. It was excluded only because no shipped MoE caller
+    // used it — but Qwen3.8-Flash-Next's mixed-imatrix IQ3_XXS file carries it in 9 of 48 layers'
+    // gate/up banks, and ONE uncovered bank held the whole model's prefill at the per-token rate
+    // (26 t/s) because `moe_batched_ok` is an all-layers derivation.
+    DType::Iq2Xxs,
     DType::Iq3S,
     DType::Iq3Xxs,
     DType::Mxfp4,
@@ -238,6 +244,12 @@ pub const MOE_MMQ_PAGED_DTYPES: &[DType] = &[
     DType::Iq4Xs,
     DType::Iq2S,
     DType::Iq2Xs,
+    // IQ2_XXS: same grid-codebook recipe as Iq2S/Iq2Xs via the shared-LUT staging, now with its
+    // own `native_gemm_mmq_iq2_xxs_*` builds. It was excluded only because no shipped MoE caller
+    // used it — but Qwen3.8-Flash-Next's mixed-imatrix IQ3_XXS file carries it in 9 of 48 layers'
+    // gate/up banks, and ONE uncovered bank held the whole model's prefill at the per-token rate
+    // (26 t/s) because `moe_batched_ok` is an all-layers derivation.
+    DType::Iq2Xxs,
     DType::Iq3S,
     DType::Iq3Xxs,
     DType::Mxfp4,
@@ -358,9 +370,11 @@ mod moe_mmq_drift_tests {
         for &d in MOE_MMQ_PAGED_DTYPES {
             assert!(moe_paged_mmq_ok(d));
         }
-        // A format NOT in MOE_MMQ_DTYPES must read as uncovered everywhere.
-        assert!(!moe_mmq_ok(DType::Iq2Xxs));
-        assert!(!moe_mmq_needs_sact(DType::Iq2Xxs));
-        assert!(!moe_paged_mmq_ok(DType::Iq2Xxs));
+        // A format NOT in MOE_MMQ_DTYPES must read as uncovered everywhere. (`Iq1S`: the ±0.125
+        // delta needs a per-sub-block activation sum, so it stays on id-GEMV — see the list's doc.
+        // Was `Iq2Xxs` until its `native_gemm_mmq_iq2_xxs_*` builds landed.)
+        assert!(!moe_mmq_ok(DType::Iq1S));
+        assert!(!moe_mmq_needs_sact(DType::Iq1S));
+        assert!(!moe_paged_mmq_ok(DType::Iq1S));
     }
 }

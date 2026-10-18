@@ -62,6 +62,9 @@ void main() {
         bucket[t] = 0u;
         barrier();
 
+        // Wave-coalesced stride-256 walk, left as-is: this pass was never the cost (measured
+        // 32.3 ms/dispatch before and after a 4-wide along-stride batch), and the batch along
+        // the lane-contiguous tie/collect passes below is what actually matters.
         for (uint j = t; j < blocks; j += 256u) {
             uint score_key = ordered_float(scores[score_base + j]);
             uint done = level * 8u;
@@ -111,7 +114,30 @@ void main() {
     uint begin = blocks * t / 256u;
     uint end = blocks * (t + 1u) / 256u;
     uint local_ties = 0u;
-    for (uint j = begin; j < end; ++j) {
+    // 8-wide: each lane walks its contiguous range 8 elements at a time so the 8 loads share
+    // one cache line and stay in flight together. The contiguous walk alone leaves one DRAM row
+    // open per lane per load (256 rows at once), which is what made this pass ~2000 cycles per
+    // element at 90K context; batching amortizes the row-buffer and TLB pressure.
+    uint j = begin;
+    for (; j + 8u <= end; j += 8u) {
+        float v0 = scores[score_base + j];
+        float v1 = scores[score_base + j + 1u];
+        float v2 = scores[score_base + j + 2u];
+        float v3 = scores[score_base + j + 3u];
+        float v4 = scores[score_base + j + 4u];
+        float v5 = scores[score_base + j + 5u];
+        float v6 = scores[score_base + j + 6u];
+        float v7 = scores[score_base + j + 7u];
+        local_ties += uint(ordered_float(v0) == prefix_score)
+                    + uint(ordered_float(v1) == prefix_score)
+                    + uint(ordered_float(v2) == prefix_score)
+                    + uint(ordered_float(v3) == prefix_score)
+                    + uint(ordered_float(v4) == prefix_score)
+                    + uint(ordered_float(v5) == prefix_score)
+                    + uint(ordered_float(v6) == prefix_score)
+                    + uint(ordered_float(v7) == prefix_score);
+    }
+    for (; j < end; ++j) {
         local_ties += uint(ordered_float(scores[score_base + j]) == prefix_score);
     }
 #ifdef PARALLEL_SCAN
@@ -135,12 +161,42 @@ void main() {
 #ifndef PARALLEL_SCAN
     uint tie_ordinal = tie_prefix[t];
 #endif
-    for (uint j = begin; j < end; ++j) {
-        uint score_key = ordered_float(scores[score_base + j]);
+    // Same 8-wide batching as the tie count above. Elements are still consumed strictly in
+    // ascending index order (tie_ordinal is a sequential chain), the loads are just batched.
+#define COLLECT_ONE(key, idx) { \
+        bool _equal = (key) == prefix_score; \
+        if ((key) > prefix_score || (_equal && tie_ordinal < rank)) { \
+            uint _slot = atomicAdd(selected_count, 1u); \
+            if (_slot < pc.top_k) { chosen[_slot] = (idx); } \
+        } \
+        tie_ordinal += uint(_equal); \
+    }
+    uint jc = begin;
+    for (; jc + 8u <= end; jc += 8u) {
+        uint k0 = ordered_float(scores[score_base + jc]);
+        uint k1 = ordered_float(scores[score_base + jc + 1u]);
+        uint k2 = ordered_float(scores[score_base + jc + 2u]);
+        uint k3 = ordered_float(scores[score_base + jc + 3u]);
+        uint k4 = ordered_float(scores[score_base + jc + 4u]);
+        uint k5 = ordered_float(scores[score_base + jc + 5u]);
+        uint k6 = ordered_float(scores[score_base + jc + 6u]);
+        uint k7 = ordered_float(scores[score_base + jc + 7u]);
+        COLLECT_ONE(k0, jc)
+        COLLECT_ONE(k1, jc + 1u)
+        COLLECT_ONE(k2, jc + 2u)
+        COLLECT_ONE(k3, jc + 3u)
+        COLLECT_ONE(k4, jc + 4u)
+        COLLECT_ONE(k5, jc + 5u)
+        COLLECT_ONE(k6, jc + 6u)
+        COLLECT_ONE(k7, jc + 7u)
+    }
+#undef COLLECT_ONE
+    for (; jc < end; ++jc) {
+        uint score_key = ordered_float(scores[score_base + jc]);
         bool equal = score_key == prefix_score;
         if (score_key > prefix_score || (equal && tie_ordinal < rank)) {
             uint slot = atomicAdd(selected_count, 1u);
-            if (slot < pc.top_k) { chosen[slot] = j; }
+            if (slot < pc.top_k) { chosen[slot] = jc; }
         }
         tie_ordinal += uint(equal);
     }

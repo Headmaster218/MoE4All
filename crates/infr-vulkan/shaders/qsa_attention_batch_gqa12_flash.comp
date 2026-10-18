@@ -40,7 +40,20 @@ layout(binding = 0) readonly buffer QB { uint q[]; };
 layout(binding = 1) readonly buffer KB { uvec2 k_segments[]; };
 layout(binding = 2) readonly buffer VB { uvec2 v_segments[]; };
 layout(binding = 3) readonly buffer IB { uint indices[]; };
+#ifdef QSA_UNION
+// Compact union planes from `qsa_union_gather` (`uh[0]` = overflow flag, `uh[1]` = union blocks).
+// The plane layout mirrors the planar-Q8 segment the raw path reads, so one staging shape serves
+// both sources; the compact copy is what turns `rows` scattered cache walks into one hot region.
+layout(binding = 4) readonly buffer UKB { uint uk[]; };
+layout(binding = 5) readonly buffer UHB { uint uh[]; };
+// `dst` stays the LAST bound buffer so the recorder's trailing-output convention (n_out = 1) holds.
+layout(binding = 6) writeonly buffer DB { float dst[]; };
+#define UK_KEYS 32768u
+#define UK_PLANE_WORDS (UK_KEYS * 68u)
+#define UK_CODE_WORDS (UK_KEYS * 64u)
+#else
 layout(binding = 4) writeonly buffer DB { float dst[]; };
+#endif
 
 #define KV_SEGMENTED
 #include "kv_addr.glsl"
@@ -61,7 +74,70 @@ shared float score_tile[SCORE_ROWS * TILE_KEYS];
 #ifdef COOP_PV
 shared float16_t prob_tile[SCORE_ROWS * TILE_KEYS];
 #endif
+#ifndef COOP_PV
 shared float output_state[GQA_HEADS * HEAD_DIM];
+#endif
+#ifdef COOP_PV
+// PV accumulators live in VGPRs instead of a 12 KiB shared `output_state`. Every index below is a
+// macro-expanded literal, so `pv_acc` never needs a dynamic index (which would spill to scratch).
+// The workgroup LDS footprint drops from ~32.6 KiB to ~20 KiB: on gfx11 (64 KiB LDS per WGP) that
+// is the difference between one and three resident workgroups per WGP.
+#define PV_ACC(C, K) \
+    { \
+        uint packed_##C##_##K = local_id + (K) * 128u; \
+        if (packed_##C##_##K < GQA_HEADS * 32u) { \
+            uint qa_##C##_##K = packed_##C##_##K / 32u; \
+            uint da_##C##_##K = packed_##C##_##K - qa_##C##_##K * 32u; \
+            float tv_##C##_##K = score_tile[(qa_##C##_##K + query_row_offset) * 32u + da_##C##_##K]; \
+            pv_acc[(C) * 3u + (K)] = pv_acc[(C) * 3u + (K)] * tile_max[qa_##C##_##K] \
+                + tv_##C##_##K * tile_sum[qa_##C##_##K]; \
+        } \
+    }
+#define PV_ITER(C) \
+    { \
+        if (subgroup < 2u) { \
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> values_##C = \
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0); \
+            for (uint key_base = 0u; key_base < TILE_KEYS; key_base += 16u) { \
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> probabilities_##C; \
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> value_tile_##C; \
+                coopMatLoad(probabilities_##C, prob_tile, key_base, TILE_KEYS, gl_CooperativeMatrixLayoutRowMajor); \
+                coopMatLoad(value_tile_##C, kv_tile, key_base * HEAD_DIM + (C) * 32u + subgroup * 16u, HEAD_DIM, gl_CooperativeMatrixLayoutRowMajor); \
+                values_##C = coopMatMulAdd(probabilities_##C, value_tile_##C, values_##C); \
+            } \
+            coopMatStore(values_##C, score_tile, subgroup * 16u, 32u, gl_CooperativeMatrixLayoutRowMajor); \
+        } \
+        barrier(); \
+        PV_ACC(C, 0u) \
+        PV_ACC(C, 1u) \
+        PV_ACC(C, 2u) \
+        barrier(); \
+    }
+#define PV_STORE(C) \
+    { \
+        uint ps_##C##_0 = local_id; \
+        if (ps_##C##_0 < GQA_HEADS * 32u) { \
+            uint qs_##C##_0 = ps_##C##_0 / 32u; \
+            uint ds_##C##_0 = ps_##C##_0 - qs_##C##_0 * 32u; \
+            dst[(row * pc.n_head + head_base + qs_##C##_0) * HEAD_DIM + (C) * 32u + ds_##C##_0] = \
+                pv_acc[(C) * 3u + 0u] / softmax_sum[qs_##C##_0]; \
+        } \
+        uint ps_##C##_1 = local_id + 128u; \
+        if (ps_##C##_1 < GQA_HEADS * 32u) { \
+            uint qs_##C##_1 = ps_##C##_1 / 32u; \
+            uint ds_##C##_1 = ps_##C##_1 - qs_##C##_1 * 32u; \
+            dst[(row * pc.n_head + head_base + qs_##C##_1) * HEAD_DIM + (C) * 32u + ds_##C##_1] = \
+                pv_acc[(C) * 3u + 1u] / softmax_sum[qs_##C##_1]; \
+        } \
+        uint ps_##C##_2 = local_id + 256u; \
+        if (ps_##C##_2 < GQA_HEADS * 32u) { \
+            uint qs_##C##_2 = ps_##C##_2 / 32u; \
+            uint ds_##C##_2 = ps_##C##_2 - qs_##C##_2 * 32u; \
+            dst[(row * pc.n_head + head_base + qs_##C##_2) * HEAD_DIM + (C) * 32u + ds_##C##_2] = \
+                pv_acc[(C) * 3u + 2u] / softmax_sum[qs_##C##_2]; \
+        } \
+    }
+#endif
 shared float softmax_max[GQA_HEADS];
 shared float softmax_sum[GQA_HEADS];
 shared float tile_max[GQA_HEADS];
@@ -69,6 +145,10 @@ shared float tile_sum[GQA_HEADS];
 shared uvec2 tile_k_address[TILE_KEYS];
 shared uvec2 tile_v_address[TILE_KEYS];
 shared uint tile_local_base[TILE_KEYS];
+#ifdef QSA_UNION
+// 1 = this key comes from the compact union plane, 0 = the raw segmented cache.
+shared uint tile_src[TILE_KEYS];
+#endif
 
 #ifndef COOP_QK
 float qread(uint word_base, uint component) {
@@ -98,7 +178,37 @@ uint source_row(uint row, uint logical, uint selected, uint complete) {
     return complete * pc.ratio + logical - selected_rows;
 }
 
+#ifdef QSA_UNION
+// One q8 quad (4 codes + their f16 scale) off a compact union plane: the same arithmetic as
+// `stage_q8_quad`, only the base differs (a bound SSBO plane instead of a cache segment).
+void stage_q8_plane(uint plane_word, uint local, uint dst_base) {
+    int codes = int(uk[plane_word + (local >> 2u)]);
+    uint block = local >> 5u;
+    float scale = unpackHalf2x16(uk[plane_word + UK_CODE_WORDS + (block >> 1u)])[block & 1u];
+    kv_tile[dst_base] = float16_t(float(bitfieldExtract(codes, 0, 8)) * scale);
+    kv_tile[dst_base + 1u] = float16_t(float(bitfieldExtract(codes, 8, 8)) * scale);
+    kv_tile[dst_base + 2u] = float16_t(float(bitfieldExtract(codes, 16, 8)) * scale);
+    kv_tile[dst_base + 3u] = float16_t(float(bitfieldExtract(codes, 24, 8)) * scale);
+}
+#endif
+
+// Route one key's q8 quad to whichever source owns it: the compact union plane for a selected key
+// of a planned chunk, the raw segmented cache otherwise (and for everything when the plan
+// overflowed, which is why the flag lives in device memory rather than a push constant).
+void stage_kv(uint key, uint quad, uint dst_base, uint plane_word, uvec2 raw_address, uint elems) {
+#ifdef QSA_UNION
+    if (tile_src[key] == 1u) {
+        stage_q8_plane(plane_word, tile_local_base[key] + quad * 4u, dst_base);
+        return;
+    }
+#endif
+    stage_q8_quad(kv_segment_base(raw_address), tile_local_base[key] + quad * 4u, elems, dst_base);
+}
+
 void main() {
+#ifdef COOP_PV
+    float pv_acc[24];
+#endif
     uint local_id = gl_LocalInvocationIndex;
     uint subgroup = gl_SubgroupID;
     uint lane = gl_SubgroupInvocationID;
@@ -107,12 +217,24 @@ void main() {
     uint kv_head = job - row * pc.n_kv;
     uint group = pc.n_head / pc.n_kv;
     if (row >= pc.rows || pc.head_dim != HEAD_DIM || group != GQA_HEADS) { return; }
+    uint uk_k_word = 0u;
+    uint uk_v_word = 0u;
+#ifdef QSA_UNION
+    // uh[1] == 0 means no plan ran for this dispatch (raw path / decode-shaped rows).
+    uint union_on = (uh[0] == 0u && uh[1] != 0u) ? 1u : 0u;
+    uk_k_word = kv_head * UK_PLANE_WORDS;
+    uk_v_word = (2u + kv_head) * UK_PLANE_WORDS;
+#endif
 
     uint head_base = kv_head * GQA_HEADS;
     uint q_word_base = ((row * pc.n_head + head_base) * HEAD_DIM) >> 1u;
+#ifdef COOP_PV
+    pv_acc[0u] = 0.0; pv_acc[1u] = 0.0; pv_acc[2u] = 0.0; pv_acc[3u] = 0.0; pv_acc[4u] = 0.0; pv_acc[5u] = 0.0; pv_acc[6u] = 0.0; pv_acc[7u] = 0.0; pv_acc[8u] = 0.0; pv_acc[9u] = 0.0; pv_acc[10u] = 0.0; pv_acc[11u] = 0.0; pv_acc[12u] = 0.0; pv_acc[13u] = 0.0; pv_acc[14u] = 0.0; pv_acc[15u] = 0.0; pv_acc[16u] = 0.0; pv_acc[17u] = 0.0; pv_acc[18u] = 0.0; pv_acc[19u] = 0.0; pv_acc[20u] = 0.0; pv_acc[21u] = 0.0; pv_acc[22u] = 0.0; pv_acc[23u] = 0.0;
+#else
     for (uint i = local_id; i < GQA_HEADS * HEAD_DIM; i += 128u) {
         output_state[i] = 0.0;
     }
+#endif
     if (local_id < GQA_HEADS) {
         softmax_max[local_id] = -3.402823466e+38;
         softmax_sum[local_id] = 0.0;
@@ -129,12 +251,32 @@ void main() {
     for (uint tile_start = 0u; tile_start < keys; tile_start += TILE_KEYS) {
         uint tile_count = min(TILE_KEYS, keys - tile_start);
         if (local_id < tile_count) {
-            uint src_row = source_row(row, tile_start + local_id, selected, complete);
+            uint logical = tile_start + local_id;
+#ifdef QSA_UNION
+            if (union_on == 1u && logical < selected * pc.ratio) {
+                // `indices` holds this block's first key index inside the compact plane.
+                tile_src[local_id] = 1u;
+                tile_local_base[local_id] =
+                    (indices[row * pc.top_blocks + logical / pc.ratio] + logical % pc.ratio) * HEAD_DIM;
+                tile_k_address[local_id] = uvec2(0u);
+                tile_v_address[local_id] = uvec2(0u);
+            } else {
+                tile_src[local_id] = 0u;
+                uint src_row = source_row(row, logical, selected, complete);
+                uint elem_base = (src_row * pc.n_kv + kv_head) * HEAD_DIM;
+                uint segment = kv_segment(elem_base, pc.segment_shift);
+                tile_k_address[local_id] = k_segments[segment];
+                tile_v_address[local_id] = v_segments[segment];
+                tile_local_base[local_id] = kv_segment_local(elem_base, pc.segment_shift);
+            }
+#else
+            uint src_row = source_row(row, logical, selected, complete);
             uint elem_base = (src_row * pc.n_kv + kv_head) * HEAD_DIM;
             uint segment = kv_segment(elem_base, pc.segment_shift);
             tile_k_address[local_id] = k_segments[segment];
             tile_v_address[local_id] = v_segments[segment];
             tile_local_base[local_id] = kv_segment_local(elem_base, pc.segment_shift);
+#endif
         }
         barrier();
 
@@ -145,12 +287,7 @@ void main() {
             uint quad = packed - key * QUADS;
             uint dst_base = key * HEAD_DIM + quad * 4u;
             if (key < tile_count) {
-                stage_q8_quad(
-                    kv_segment_base(tile_k_address[key]),
-                    tile_local_base[key] + quad * 4u,
-                    segment_elems,
-                    dst_base
-                );
+                stage_kv(key, quad, dst_base, uk_k_word, tile_k_address[key], segment_elems);
             } else {
                 kv_tile[dst_base] = float16_t(0.0);
                 kv_tile[dst_base + 1u] = float16_t(0.0);
@@ -162,12 +299,7 @@ void main() {
         for (uint packed = local_id; packed < tile_quads; packed += 128u) {
             uint key = packed / QUADS;
             uint quad = packed - key * QUADS;
-            stage_q8_quad(
-                kv_segment_base(tile_k_address[key]),
-                tile_local_base[key] + quad * 4u,
-                segment_elems,
-                key * HEAD_DIM + quad * 4u
-            );
+            stage_kv(key, quad, key * HEAD_DIM + quad * 4u, uk_k_word, tile_k_address[key], segment_elems);
         }
 #endif
         barrier();
@@ -272,12 +404,7 @@ void main() {
         for (uint packed = local_id; packed < tile_quads; packed += 128u) {
             uint key = packed / QUADS;
             uint quad = packed - key * QUADS;
-            stage_q8_quad(
-                kv_segment_base(tile_v_address[key]),
-                tile_local_base[key] + quad * 4u,
-                segment_elems,
-                key * HEAD_DIM + quad * 4u
-            );
+            stage_kv(key, quad, key * HEAD_DIM + quad * 4u, uk_v_word, tile_v_address[key], segment_elems);
         }
         barrier();
 
@@ -297,49 +424,8 @@ void main() {
 
         uint matrix_head = min(head_base, pc.n_head - 16u);
         uint query_row_offset = head_base - matrix_head;
-        for (uint output_base = 0u; output_base < HEAD_DIM; output_base += 32u) {
-            if (subgroup < 2u) {
-                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> values =
-                    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
-                for (uint key_base = 0u; key_base < TILE_KEYS; key_base += 16u) {
-                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> probabilities;
-                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> value_tile;
-                    coopMatLoad(
-                        probabilities,
-                        prob_tile,
-                        key_base,
-                        TILE_KEYS,
-                        gl_CooperativeMatrixLayoutRowMajor
-                    );
-                    coopMatLoad(
-                        value_tile,
-                        kv_tile,
-                        key_base * HEAD_DIM + output_base + subgroup * 16u,
-                        HEAD_DIM,
-                        gl_CooperativeMatrixLayoutRowMajor
-                    );
-                    values = coopMatMulAdd(probabilities, value_tile, values);
-                }
-                coopMatStore(
-                    values,
-                    score_tile,
-                    subgroup * 16u,
-                    32u,
-                    gl_CooperativeMatrixLayoutRowMajor
-                );
-            }
-            barrier();
-
-            for (uint packed = local_id; packed < GQA_HEADS * 32u; packed += 128u) {
-                uint query = packed / 32u;
-                uint d = packed - query * 32u;
-                uint output_index = query * HEAD_DIM + output_base + d;
-                float tile_output = score_tile[(query + query_row_offset) * 32u + d];
-                output_state[output_index] = output_state[output_index] * tile_max[query]
-                    + tile_output * tile_sum[query];
-            }
-            barrier();
-        }
+        PV_ITER(0u) PV_ITER(1u) PV_ITER(2u) PV_ITER(3u)
+        PV_ITER(4u) PV_ITER(5u) PV_ITER(6u) PV_ITER(7u)
 #else
         for (uint head_batch = 0u; head_batch < GQA_HEADS; head_batch += SUBGROUPS) {
             uint query = head_batch + subgroup;
@@ -382,10 +468,15 @@ void main() {
 #endif
     }
 
+#ifdef COOP_PV
+    PV_STORE(0u) PV_STORE(1u) PV_STORE(2u) PV_STORE(3u)
+    PV_STORE(4u) PV_STORE(5u) PV_STORE(6u) PV_STORE(7u)
+#else
     for (uint i = local_id; i < GQA_HEADS * HEAD_DIM; i += 128u) {
         uint query = i / HEAD_DIM;
         uint d = i - query * HEAD_DIM;
         uint out_base = (row * pc.n_head + head_base + query) * HEAD_DIM;
         dst[out_base + d] = output_state[i] / softmax_sum[query];
     }
+#endif
 }

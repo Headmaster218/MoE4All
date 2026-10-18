@@ -111,6 +111,20 @@ impl P2pExport {
         self.size
     }
 
+    /// The exported fd (dma-buf / opaque-fd), NOT `dup`ed: a caller handing it to another process
+    /// must `dup(2)` it AND clear `FD_CLOEXEC` — the driver sets that flag on export, so an
+    /// `exec`ed child would otherwise see a closed fd (and the import would fail with a
+    /// misleading error, e.g. `hipErrorOutOfMemory`).
+    pub fn fd(&self) -> RawFd {
+        self.fd
+    }
+
+    /// Size of the underlying `VkDeviceMemory` allocation (`>= len_bytes()`); an importer must
+    /// bind an allocation of exactly this many bytes.
+    pub fn mem_size(&self) -> u64 {
+        self.mem_size
+    }
+
     /// The handle type this memory was exported as.
     pub fn handle_type(&self) -> P2pHandleType {
         self.handle_type
@@ -166,6 +180,22 @@ impl VulkanBackend {
     /// the VRAM budget guard — this is a probe/transport capability, explicit and self-bounded, not
     /// a model allocation.
     pub fn p2p_export(&self, size: usize, handle_type: P2pHandleType) -> Result<P2pExport> {
+        self.p2p_export_with(size, handle_type, false)
+    }
+
+    /// As [`p2p_export`](Self::p2p_export), but the exported buffer ALSO carries a 64-bit device
+    /// address (`SHADER_DEVICE_ADDRESS` usage + a `DEVICE_ADDRESS` allocation), so a kernel of the
+    /// EXPORTING backend can read it through a buffer-reference streamed weight exactly like a
+    /// resident-BDA weight. `false` for every caller that only needs the fd.
+    ///
+    /// Added for the ROCm-GEMM cross-check (`tests/rocm_gemm_xcheck.rs`): one allocation that the
+    /// Vulkan backend runs its own `matmul_native` on AND `rocBLAS` reads through the exported fd.
+    pub fn p2p_export_with(
+        &self,
+        size: usize,
+        handle_type: P2pHandleType,
+        want_bda: bool,
+    ) -> Result<P2pExport> {
         if !self.p2p_supported(handle_type) {
             return Err(be(format!(
                 "p2p_export: this device does not support the {handle_type:?} external-memory \
@@ -182,9 +212,13 @@ impl VulkanBackend {
 
         // ── exportable buffer ────────────────────────────────────────────────────────────────
         let mut ext_ci = vk::ExternalMemoryBufferCreateInfo::default().handle_types(ht);
+        let mut usage = BUFFER_USAGE;
+        if want_bda {
+            usage |= vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
+        }
         let buf_ci = vk::BufferCreateInfo::default()
             .size(size as u64)
-            .usage(BUFFER_USAGE)
+            .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .push_next(&mut ext_ci);
         let buffer = unsafe { device.create_buffer(&buf_ci, None) }
@@ -206,11 +240,18 @@ impl VulkanBackend {
         // ── dedicated, exportable allocation ─────────────────────────────────────────────────
         let mut export_info = vk::ExportMemoryAllocateInfo::default().handle_types(ht);
         let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(buffer);
-        let alloc_ci = vk::MemoryAllocateInfo::default()
+        // A buffer created with `SHADER_DEVICE_ADDRESS` MUST have its memory allocated with
+        // `DEVICE_ADDRESS` (VUID-VkMemoryAllocateInfo-flags-03331), or the address query is bogus.
+        let mut addr_flags =
+            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let mut alloc_ci = vk::MemoryAllocateInfo::default()
             .allocation_size(req.size)
             .memory_type_index(ty)
             .push_next(&mut export_info)
             .push_next(&mut dedicated);
+        if want_bda {
+            alloc_ci = alloc_ci.push_next(&mut addr_flags);
+        }
         let memory = match unsafe { device.allocate_memory(&alloc_ci, None) } {
             Ok(m) => m,
             Err(e) => {
@@ -253,8 +294,14 @@ impl VulkanBackend {
                 size,
                 mem_size: req.size,
                 location: MemoryLocation::GpuOnly,
+                mem_type: ty as i32,
+                mem_flags: self.mem_type_flags(ty),
                 sub_offset: 0,
-                own_addr: None,
+                own_addr: want_bda.then(|| unsafe {
+                    device.get_buffer_device_address(
+                        &vk::BufferDeviceAddressInfo::default().buffer(buffer),
+                    )
+                }),
                 act_bytes: 0,
             },
             fd,
@@ -398,6 +445,8 @@ impl VulkanBackend {
             size: export.size,
             mem_size: export.mem_size,
             location: MemoryLocation::GpuOnly,
+            mem_type: ty as i32,
+            mem_flags: self.mem_type_flags(ty),
             sub_offset: 0,
             own_addr: None,
             act_bytes: 0,

@@ -266,6 +266,29 @@ cfg_struct! {
         /// Alias eligible DRAM pager arenas through `VK_EXT_external_memory_host` so Vulkan can
         /// DMA promotions into VRAM. Unsupported devices transparently keep CPU ReBAR copies.
         host_dma: bool = true,
+        /// `INFR_MOE_ARENA_HOST`: place the paged-MoE expert arena in host-visible SYSTEM RAM
+        /// instead of ReBAR VRAM. Pager, LUT and LRU are unchanged — only the memory the CPU pushes
+        /// into and the GPU reads from moves, so the push becomes a RAM→RAM memcpy and the read a
+        /// PCIe fetch, instead of a CPU write into a BAR window (measured ~3 GB/s on gfx1100).
+        /// `spilled`: not charged against the device-local budget. Opt-in for A/B.
+        moe_arena_host: bool = false,
+        /// `INFR_MOE_PREFILL_INPLACE`: give every imported host-DMA shard a 64-bit device address
+        /// (`SHADER_DEVICE_ADDRESS` + the matching allocate flag — RADV supports this on
+        /// `VK_EXT_external_memory_host` memory) and let whole-layer Prefill read the permanent
+        /// expert store **in place** through that address instead of DMA-ing every layer into its
+        /// VRAM ring corridor first. The ring, LUT and LRU bookkeeping are unchanged; only the
+        /// address the per-layer LUT window carries and the (now skipped) push copy differ.
+        /// Off ⇒ byte-identical to the previous path.
+        ///
+        /// ★KNOWN BROKEN on RADV/gfx1100 — do not enable: with the address live, the expert kernels
+        /// fault on a WILD address (~55 GiB past the card's 25.8 GiB VRAM window) inside the
+        /// `infr-moe-prefil` thread, the ring times out, the device is lost, and one run wedged the
+        /// whole machine. Both variants fault (with and without the push copy), so it is the read of
+        /// the imported store that faults, not the skipped copy. The Vulkan mechanism itself is
+        /// proven good in isolation — see `/home/qiankun/build/bdahost_probe{,2}.c` (1 MiB / 64 MiB /
+        /// 1472 MiB imports all read back the right bytes). Suspect the 40 GiB userptr/HMM residency,
+        /// not the address arithmetic; the address trace knob below decides which.
+        moe_prefill_inplace: bool = false,
         /// `INFR_LAYER_MAJOR`, TRI-state syntax: `None` and `Some(false)` use the chunk-major
         /// default; `Some(true)` forces layer-major where the backend and architecture support it.
         ///
@@ -304,6 +327,9 @@ cfg_struct! {
         id_grid_buffer_nr: u32 = 4,
         /// Immutable IQ codebooks. None selects measured Windows/RDNA3 Decode shapes only.
         id_grid_buffer: Option<bool> = None,
+        /// Resident-BDA IQ3_S gate/up: read the immutable codebook from binding 0 instead of
+        /// staging it into LDS once per workgroup. Off keeps the established tree kernel.
+        id_stream_grid_buffer: bool = true,
         /// The selected GEMV variant, COMPUTED from two keys exactly as `GemvKnobs::resolve`
         /// does it: `INFR_NO_GEMV_REG` present ⇒ `None` (and it silently wins over
         /// `INFR_GEMV_VARIANT`); otherwise `INFR_GEMV_VARIANT`, else `Some("reg")`.
@@ -428,6 +454,9 @@ cfg_struct! {
         cpu_miss_token_park: bool = false,
         /// Promote miss weights with the private CPU pool after submitting the result, not DMA.
         cpu_miss_push: bool = false,
+        /// Promote CPU-computed misses into the GPU expert cache after the job. Disable to
+        /// keep them host-only and preserve VRAM slots for stage-0 / pipeline windows.
+        cpu_miss_promote: bool = true,
         /// Diagnostic only: retain GPU miss computation and compare its raw output to the CPU.
         cpu_miss_validate: bool = false,
         /// Experimental independent FMA chains; changes reduction order, never activation dtype.
@@ -506,6 +535,11 @@ cfg_struct! {
         /// Also use cooperative-matrix PV in that path. Kept separate so QK-only remains an
         /// exact runtime A/B fallback on drivers where F16 probability staging is not profitable.
         qsa_prefill_coopmat_pv: bool = true,
+        /// `INFR_QSA_UNION` — plan one compact K/V union per prefill chunk so the GQA12 attention
+        /// workgroups read a ~1 MiB hot plane instead of each re-walking the scattered segmented
+        /// cache `rows` times. A chunk whose selections are too scattered to fit the compact plane
+        /// sets an overflow flag and falls back to the raw per-row path.
+        qsa_union: bool = false,
         /// Block width of the Qwen3.8 Prefill indexer scorer's 8-query F32 tile. Supported values
         /// are 32 and 64; other values keep the established 2-query x 4-block path.
         qsa_score_tile: usize = 32,

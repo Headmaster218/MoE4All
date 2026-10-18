@@ -692,6 +692,7 @@ fn qsa_batched_rows_match_causal_reference() {
         0,
         0,
         None,
+        None,
     );
     rec.finish().unwrap();
 
@@ -739,6 +740,7 @@ fn qsa_batched_rows_match_causal_reference() {
         true,
         cap as u32,
         cap as u32,
+        None,
         None,
     );
     rec.finish().unwrap();

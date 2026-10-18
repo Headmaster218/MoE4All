@@ -30,6 +30,7 @@ tracing.workspace = true
 indicatif.workspace = true
 rayon.workspace = true
 libc.workspace = true
+serde_json.workspace = true
 # GGUF block layout (`block_layout`) — recorder.rs's resident-BDA streamed dispatch converts
 # element-space expert strides to the per-expert BYTE stride the STREAMED shaders' pointer
 # arithmetic needs; single source of truth with the GGUF loader instead of a second hand-kept table.

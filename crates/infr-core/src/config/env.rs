@@ -216,6 +216,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.paging.moe_size_cache_bias = opt_num(get, "INFR_MOE_SIZE_CACHE_BIAS");
     p.paging.dram = opt_size(get, "INFR_DRAM_CACHE");
     p.paging.dram_bypass = presence(get, "INFR_DRAM_BYPASS");
+    p.paging.moe_prefill_inplace = presence(get, "INFR_MOE_PREFILL_INPLACE");
     p.paging.host_dma = presence_inv(get, "INFR_NO_HOST_DMA");
     p.paging.stats = presence(get, "INFR_PAGER_STATS");
     p.paging.trace = opt_path(get, "INFR_PAGER_TRACE");

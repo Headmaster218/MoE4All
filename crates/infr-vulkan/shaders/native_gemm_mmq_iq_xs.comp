@@ -1,14 +1,17 @@
 #version 460
-// Batched expert-grid dp4a GEMM for the two compact grid i-quants used by
-// Qwen3.8-Flash-Next's Q2_K_XL expert banks:
+// Batched expert-grid dp4a GEMM for the three compact grid i-quants used by
+// Qwen3.8-Flash-Next's Q2_K_XL / IQ3_XXS expert banks:
 //
+//   IQ2_XXS [f16 d][u8 aux[64]]               = 66 bytes / 256 values
 //   IQ2_XS  [f16 d][u16 qs[32]][u8 scales[8]] = 74 bytes / 256 values
 //   IQ3_XXS [f16 d][u8 qs[64]][u32 aux[8]]    = 98 bytes / 256 values
 //
-// Both formats decode one 32-value activation block into eight packed int8
+// All three decode one 32-value activation block into eight packed int8
 // words and reuse it across the expert bucket's row tile. IQ2_XS has two
-// 16-value scales per pass; IQ3_XXS has one scale per pass. The resident,
-// paged and small-row-tile variants are produced from this one source.
+// 16-value scales per pass; IQ2_XXS and IQ3_XXS have one scale per pass
+// (IQ2_XXS's in its aux sign word's top nibble at unit 0.25, IQ3_XXS's at
+// 0.5). The resident, paged and small-row-tile variants are produced from
+// this one source.
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -16,8 +19,8 @@
 #extension GL_EXT_integer_dot_product : require
 #extension GL_EXT_control_flow_attributes : require
 
-#if !defined(FMT_IQ2XS) && !defined(FMT_IQ3XXS)
-#error "native_gemm_mmq_iq_xs requires FMT_IQ2XS or FMT_IQ3XXS"
+#if !defined(FMT_IQ2XXS) && !defined(FMT_IQ2XS) && !defined(FMT_IQ3XXS)
+#error "native_gemm_mmq_iq_xs requires FMT_IQ2XXS, FMT_IQ2XS or FMT_IQ3XXS"
 #endif
 
 #ifndef BM_TILE
@@ -143,6 +146,16 @@ void main() {
             uint sc = rb(bd + 66u + ib32);
             Bdl[cc] = d * (0.5 + float(sc & 0xFu)) * 0.25;
             Bdh[cc] = d * (0.5 + float(sc >> 4u)) * 0.25;
+#elif defined(FMT_IQ2XXS)
+            // IQ2_XXS: [f16 d][aux[8 x u32]] = 66 bytes / 256 values. Each 32-value group's aux is
+            // EIGHT bytes at 2 + ib32*8: the first u32 holds its four 8-bit grid indices, the
+            // second holds four 7-bit sign indices with the (single, whole-group) scale nibble in
+            // its top 4 bits — and that scale's unit is 0.25, not IQ3_XXS's 0.5 (see
+            // native_decode.glsl's FMT_IQ2XXS dqblk, the reference decode this mirrors).
+            uint bd = (gelem / 256u) * 66u;
+            float d = f16tof32(ru16(bd));
+            uint aux1 = ru32(bd + 2u + ib32 * 8u + 4u);
+            Bdl[cc] = d * (0.5 + float(aux1 >> 28u)) * 0.25;
 #else
             uint bd = (gelem / 256u) * 98u;
             float d = f16tof32(ru16(bd));
@@ -165,6 +178,21 @@ void main() {
             uint grididx = qs16 & 511u;
             uint signs = KSIGNS[qs16 >> 9u] >> (word_half * 4u);
             int gw = int(G_IQ2XS[2u * grididx + word_half]);
+#elif defined(FMT_IQ2XXS)
+            // Same 8-byte grid entries as IQ2_XS (G_IQ2XXS is emitted as u32 lo/hi pairs, so
+            // `word_half` still picks 4 of the 8 int8 values), but the indices live in the aux
+            // bytes instead of a fused 16-bit word: four 8-bit grid indices in aux[0], four 7-bit
+            // sign indices in aux[1]. One grid entry per 4 output words (p>>1) — identical packing
+            // to IQ2_XS, which is why the dot-product loop below reuses its shape.
+            uint bd = (gelem / 256u) * 66u;
+            uint l = p >> 1u;
+            uint word_half = p & 1u;
+            uint off = bd + 2u + ib32 * 8u;
+            uint aux0 = ru32(off);
+            uint aux1 = ru32(off + 4u);
+            uint grididx = (aux0 >> (8u * l)) & 0xFFu;
+            uint signs = KSIGNS[(aux1 >> (7u * l)) & 127u] >> (word_half * 4u);
+            int gw = int(G_IQ2XXS[2u * grididx + word_half]);
 #else
             uint bd = (gelem / 256u) * 98u;
             uint l = p >> 1u;

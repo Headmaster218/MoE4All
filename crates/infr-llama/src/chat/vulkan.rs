@@ -19,15 +19,12 @@ use anyhow::Result;
 /// same `session` path it always has — zero risk to non-MTP models/GGUFs.
 pub struct DenseSeamChat {
     model: SeamModel,
-    session: Option<crate::seam::model::DenseVulkanSession>,
+    session: Option<crate::seam::model::SeamSession>,
     mtp_head: Option<crate::mtp::MtpHeadWeights>,
     mtp_checked: bool,
-    /// The ONE Vulkan backend MTP mode's trunk+head share across every `generate()` call
-    /// (`ensure_mtp_backend`). MTP's driver rebuilds a fresh trunk+head SESSION every call by
-    /// design (`crate::mtp`'s "no cross-turn KV reuse" doc) — but that's an ordinary allocation,
-    /// not a device re-init, so this field is what keeps `warmup()`'s call and every real chat
-    /// turn on the SAME VkDevice/allocator/pipeline-cache instead of constructing a new one each
-    /// time (previously: two full Vulkan backends for a single-turn `INFR_MTP=1` run).
+    /// The Vulkan backend qwen35 MTP mode uses for its one-shot head path (`ensure_mtp_backend`).
+    /// Qwen3.8's detached MTP runtime shares the persistent seam session's backend instead, so a
+    /// layer-split `INFR_PIPELINE` keeps the trunk and MTP head on the same two devices.
     mtp_vk: Option<infr_vulkan::VulkanBackend>,
     /// Qwen3.8's detached MTP head and target slot. Created before the target's first forward so
     /// the fixed head weights/runtime precede unified expert-pool finalization.
@@ -102,7 +99,51 @@ impl DenseSeamChat {
     fn ensure_session(&mut self) -> Result<()> {
         if self.session.is_none() {
             let user_ctx = super::cfg_ctx_spec(self.model.engine_cfg());
-            self.session = Some(match user_ctx {
+            let tp_devices =
+                crate::seam::tensor_parallel_devices(self.model.engine_cfg()).map(<[usize]>::to_vec);
+            if let Some(devices) = tp_devices {
+                let ctx = match user_ctx {
+                    Some(infr_core::SizeSpec::Bytes(ctx)) => Some(ctx as usize),
+                    _ => None,
+                };
+                self.session = Some(crate::seam::model::SeamSession::TensorParallel(
+                    self.model.vulkan_tensor_parallel_session_on(&devices, ctx)?,
+                ));
+                return Ok(());
+            }
+            // Row-parallel dense + expert-parallel MoE session: every sharded projection runs on
+            // both cards concurrently, so this is the session shape that removes the layer-split
+            // serialization rather than merely moving weights across devices.
+            let ep_devices =
+                crate::seam::expert_parallel_devices(self.model.engine_cfg()).map(<[usize]>::to_vec);
+            if let Some(devices) = ep_devices {
+                let ctx = match user_ctx {
+                    Some(infr_core::SizeSpec::Bytes(ctx)) => Some(ctx as usize),
+                    _ => None,
+                };
+                self.session = Some(crate::seam::model::SeamSession::ExpertParallel(
+                    self.model.vulkan_expert_parallel_session_on(&devices, ctx)?,
+                ));
+                return Ok(());
+            }
+            // LAYER-SPLIT session: `INFR_PIPELINE=Vulkan0,Vulkan2` opens ONE session spanning
+            // cards, each keeping its own layers' weights + KV. The multi-device shape `serve`
+            // never had — the SAME placement `infr run` uses, held open across turns.
+            let devices =
+                crate::seam::pipeline_devices(self.model.engine_cfg()).map(<[usize]>::to_vec);
+            if let Some(devices) = devices {
+                // ponytail: an explicit `INFR_CTX` is honoured verbatim; a percentage falls back
+                // to the single-device default clamp (add a per-device fraction when asked for).
+                let ctx = match user_ctx {
+                    Some(infr_core::SizeSpec::Bytes(ctx)) => Some(ctx as usize),
+                    _ => None,
+                };
+                self.session = Some(crate::seam::model::SeamSession::Pipeline(
+                    self.model.vulkan_pipeline_session_on(&devices, ctx)?,
+                ));
+                return Ok(());
+            }
+            self.session = Some(crate::seam::model::SeamSession::Single(match user_ctx {
                 Some(infr_core::SizeSpec::Bytes(ctx)) => {
                     self.model.vulkan_session_on(self.dev, ctx as usize)?
                 }
@@ -110,7 +151,7 @@ impl DenseSeamChat {
                     self.model.vulkan_session_frac_on(self.dev, f)?
                 }
                 None => self.model.vulkan_session_default_on(self.dev)?,
-            });
+            }));
         }
         Ok(())
     }
@@ -150,7 +191,7 @@ impl DenseSeamChat {
     }
 
     fn ensure_qwen4_mtp(&mut self) -> Result<()> {
-        self.ensure_mtp_backend()?;
+        self.ensure_session()?;
         if self.qwen4_mtp.is_none() {
             let sidecar = self
                 .model
@@ -161,9 +202,13 @@ impl DenseSeamChat {
                 .expect("wants_qwen4_mtp checked the sidecar");
             let train_ctx = self.model.config().n_ctx_train;
             let max_ctx = super::cfg_ctx(self.model.engine_cfg(), train_ctx).unwrap_or(train_ctx);
-            let vk = self.mtp_vk.as_ref().expect("ensure_mtp_backend set it");
-            self.qwen4_mtp = Some(crate::mtp::Qwen4MtpRuntime::new_vulkan(
-                vk,
+            let be = self
+                .session
+                .as_ref()
+                .expect("ensure_session set it")
+                .backend();
+            self.qwen4_mtp = Some(crate::mtp::Qwen4MtpRuntime::new_backend(
+                be,
                 &self.model,
                 sidecar,
                 max_ctx,
@@ -182,10 +227,14 @@ impl DenseSeamChat {
     ) -> Result<GenStats> {
         if self.wants_qwen4_mtp(req)? {
             self.ensure_qwen4_mtp()?;
-            let vk = self.mtp_vk.as_ref().expect("ensure_qwen4_mtp set it");
+            let be = self
+                .session
+                .as_ref()
+                .expect("ensure_qwen4_mtp set it")
+                .backend();
             let runtime = self.qwen4_mtp.as_mut().expect("ensure_qwen4_mtp set it");
             return runtime
-                .generate_vulkan(vk, &self.model, prompt, max_new, req, |p| on_piece(p))
+                .generate_backend(be, &self.model, prompt, max_new, req, |p| on_piece(p))
                 .map(|(stats, _)| stats);
         }
         if self.wants_mtp()? {
@@ -204,7 +253,7 @@ impl DenseSeamChat {
         }
         self.ensure_session()?;
         self.model
-            .generate_vulkan_session_turn_with_checkpoints_constrained(
+            .generate_seam_session_turn_with_checkpoints_constrained(
                 self.session.as_mut().unwrap(),
                 prompt,
                 max_new,
@@ -228,7 +277,7 @@ impl DenseSeamChat {
             self.ensure_session()?;
             return self
                 .model
-                .generate_vulkan_session_turn_with_checkpoints_constrained(
+                .generate_seam_session_turn_with_checkpoints_constrained(
                     self.session.as_mut().unwrap(),
                     prompt,
                     max_new,
@@ -253,7 +302,9 @@ impl ChatModel for DenseSeamChat {
     }
 
     fn reset_kv(&mut self) {
-        super::reset_session(&mut self.session);
+        if let Some(s) = self.session.as_mut() {
+            s.reset_cache();
+        }
         if let Some(runtime) = self.qwen4_mtp.as_mut() {
             runtime.reset();
         }
@@ -320,7 +371,7 @@ impl ChatModel for DenseSeamChat {
     ) -> Result<GenStats> {
         self.ensure_session()?;
         self.model
-            .generate_vulkan_session_turn_with_checkpoints_constrained(
+            .generate_seam_session_turn_with_checkpoints_constrained(
                 self.session.as_mut().unwrap(),
                 prompt,
                 max_new,

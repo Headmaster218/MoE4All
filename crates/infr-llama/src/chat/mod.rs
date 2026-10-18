@@ -208,17 +208,6 @@ pub trait ChatModel {
     }
 }
 
-/// Drop a lazily-opened seam session's materialized tokens, if it has been opened yet — the body
-/// every session-backed [`ChatModel::reset_kv`] (and warmup discard) copy-pasted. Generic over the
-/// backend/extension pairing so ONE implementation serves Vulkan and Metal; a chat whose
-/// session is still `None` has nothing to reset (its first `generate` opens a clean one).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn reset_session<B, X>(session: &mut Option<crate::seam::model::DenseSession<B, X>>) {
-    if let Some(s) = session {
-        s.reset_cache();
-    }
-}
-
 /// The user's `device.ctx` (`INFR_CTX`) override in the shared size grammar (`8192`, `256k`,
 /// `50%`), unresolved. Vulkan wants the raw [`infr_core::SizeSpec`] (it routes `Bytes`/`Percent`
 /// to different VRAM-fit constructors); Metal resolves it through [`cfg_ctx`]. `None` = no

@@ -1,0 +1,62 @@
+#version 460
+// QSA prefill union planner, pass 2: bitmap -> rank table + union list (+ overflow flag).
+//
+// `rank[block]` is the position of that block inside the compact union; `list[rank]` is the block id
+// itself, in strictly ascending order, which is what makes `qsa_union_gather` a *streaming* walk of
+// the segmented cache instead of a gather. Everything is decided by ONE workgroup: the bitmap is at
+// most 2048 words, so the serial prefix scan of its 32-bit population counts is a few thousand
+// shared-memory reads and costs nothing next to the attention op it feeds.
+//
+// `bits[0]` becomes the overflow flag: when the chunk's selections are too scattered to fit the
+// compact plane, the flag is set and every later pass (rewrite, gather, attention) falls back to
+// the untouched per-row path, so a degenerate chunk is slow rather than wrong.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint words;  // bitmap words
+    uint blocks; // rank-table span: block ids are < blocks
+    uint cap;    // compact-plane capacity, in blocks
+} pc;
+
+layout(binding = 0) buffer BB { uint bits[]; };
+layout(binding = 1) buffer RB { uint rank[]; }; // [0, blocks) = rank, [blocks, 2*blocks) = list
+
+#define MAX_WORDS 2048u // blocks <= 65536
+shared uint wbase[MAX_WORDS];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    if (pc.words > MAX_WORDS) {
+        return;
+    }
+    for (uint w = t; w < pc.words; w += 256u) {
+        wbase[w] = bitCount(bits[2u + w]);
+    }
+    barrier();
+    if (t == 0u) {
+        uint run = 0u;
+        for (uint w = 0u; w < pc.words; ++w) {
+            uint count = wbase[w];
+            wbase[w] = run;
+            run += count;
+        }
+        bits[1] = run;
+        bits[0] = run > pc.cap ? 1u : 0u;
+    }
+    barrier();
+    if (bits[0] != 0u) {
+        return;
+    }
+    for (uint w = t; w < pc.words; w += 256u) {
+        uint word = bits[2u + w];
+        uint at = wbase[w];
+        for (uint b = 0u; b < 32u; ++b) {
+            if ((word & (1u << b)) != 0u) {
+                uint id = w * 32u + b;
+                rank[id] = at;
+                rank[pc.blocks + at] = id;
+                ++at;
+            }
+        }
+    }
+}

@@ -74,6 +74,11 @@ pub fn suppressed() -> bool {
 /// Scope is the backend's choice — vulkan folds one per submit and metal one per forward, cpu
 /// one per `execute`. Whatever the scope, [`flush`](Self::flush) pushes the rows into the
 /// process-wide aggregate, so the exit report is over the whole run regardless.
+///
+/// `bytes` is optional per-row DRAM traffic (see [`OpProf::add_n_bytes`]). Rows without it carry
+/// 0 and the report omits the bandwidth columns entirely; a backend that reports bytes for only
+/// some rows still gets an honest per-row `GB/s` (`bytes == 0` rows print `-`), because a
+/// half-populated average would be worse than no number.
 pub struct OpProf {
     /// Which backend produced these rows — printed in the header so a multi-backend run (paged MoE
     /// with a cpu fallback, a multi-GPU split) stays readable.
@@ -82,7 +87,14 @@ pub struct OpProf {
     /// backend and a table that doesn't say so invites comparing metal's encode µs against vulkan's
     /// device µs.
     unit: Unit,
-    rows: BTreeMap<String, (u64, f64)>,
+    rows: BTreeMap<String, Row>,
+}
+
+#[derive(Clone, Copy)]
+struct Row {
+    count: u64,
+    us: f64,
+    bytes: u64,
 }
 
 /// What a profiled duration actually measures.
@@ -124,9 +136,20 @@ impl OpProf {
     /// Accumulate `count` dispatches of `label` costing `us` microseconds IN TOTAL — for backends
     /// that have already aggregated (vulkan folds its query pool by label before reporting).
     pub fn add_n(&mut self, label: impl Into<String>, us: f64, count: u64) {
-        let e = self.rows.entry(label.into()).or_insert((0, 0.0));
-        e.0 += count;
-        e.1 += us;
+        self.add_n_bytes(label, us, count, 0);
+    }
+
+    /// [`Self::add_n`] plus the op's estimated DRAM traffic in bytes. `bytes` accumulates, so a
+    /// caller that folds N dispatches into one row passes the SUM of their traffic.
+    pub fn add_n_bytes(&mut self, label: impl Into<String>, us: f64, count: u64, bytes: u64) {
+        let e = self.rows.entry(label.into()).or_insert(Row {
+            count: 0,
+            us: 0.0,
+            bytes: 0,
+        });
+        e.count += count;
+        e.us += us;
+        e.bytes += bytes;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -135,16 +158,21 @@ impl OpProf {
 
     /// Total µs across every row.
     pub fn total_us(&self) -> f64 {
-        self.rows.values().map(|(_, us)| us).sum()
+        self.rows.values().map(|r| r.us).sum()
+    }
+
+    /// Total reported DRAM traffic across every row (0 when no caller reported bytes).
+    pub fn total_bytes(&self) -> u64 {
+        self.rows.values().map(|r| r.bytes).sum()
     }
 
     /// Rows sorted by descending total time — the order every report prints, and the order a test
     /// asserts against.
-    pub fn ranked(&self) -> Vec<(&str, u64, f64)> {
-        let mut rows: Vec<(&str, u64, f64)> = self
+    pub fn ranked(&self) -> Vec<(&str, u64, f64, u64)> {
+        let mut rows: Vec<(&str, u64, f64, u64)> = self
             .rows
             .iter()
-            .map(|(l, (n, us))| (l.as_str(), *n, *us))
+            .map(|(l, r)| (l.as_str(), r.count, r.us, r.bytes))
             .collect();
         // Descending by total, then by label so equal-time rows have a stable order across runs
         // (BTreeMap iteration is already label-ordered, so this only matters for the ties).
@@ -163,6 +191,8 @@ impl OpProf {
             return;
         }
         let total = self.total_us();
+        let total_bytes = self.total_bytes();
+        let have_bytes = total_bytes > 0;
         // print-ok: a column-aligned profiling REPORT the user asked for with `INFR_PROF_OPS`, not
         // a diagnostic — a per-line `tracing` prefix would destroy the columns it is made of.
         eprintln!(
@@ -170,25 +200,48 @@ impl OpProf {
             self.backend,
             self.unit.label(),
             total / 1000.0,
-            self.rows.values().map(|(n, _)| n).sum::<u64>(),
+            self.rows.values().map(|r| r.count).sum::<u64>(),
         );
-        // print-ok: report table header, see above.
-        eprintln!(
-            "[prof:{}] {:>10} {:>7} {:>8} {:>9}  op",
-            self.backend, "ms", "share", "count", "us/ea"
-        );
-        for (label, n, us) in self.ranked() {
+        if have_bytes {
+            // print-ok: report table header, see above.
+            eprintln!(
+                "[prof:{}] {:>10} {:>7} {:>8} {:>9} {:>8} {:>8}  op",
+                self.backend, "ms", "share", "count", "us/ea", "GB", "GB/s"
+            );
+        } else {
+            // print-ok: report table header, see above.
+            eprintln!(
+                "[prof:{}] {:>10} {:>7} {:>8} {:>9}  op",
+                self.backend, "ms", "share", "count", "us/ea"
+            );
+        }
+        for (label, n, us, bytes) in self.ranked() {
             if self.unit == Unit::Device {
-                infr_prof_rt::gpu_add(label, us, n);
+                infr_prof_rt::gpu_add_bytes(label, us, n, bytes);
             }
             let share = if total > 0.0 { us / total * 100.0 } else { 0.0 };
             let each = if n > 0 { us / n as f64 } else { 0.0 };
-            // print-ok: report table row, see above.
-            eprintln!(
-                "[prof:{}] {:>10.2} {share:>6.1}% {n:>8} {each:>9.1}  {label}",
-                self.backend,
-                us / 1000.0,
-            );
+            if have_bytes {
+                let gb = bytes as f64 / 1e9;
+                let gbps = if bytes > 0 && us > 0.0 {
+                    bytes as f64 / us / 1e3
+                } else {
+                    0.0
+                };
+                // print-ok: report table row, see above.
+                eprintln!(
+                    "[prof:{}] {:>10.2} {share:>6.1}% {n:>8} {each:>9.1} {gb:>8.2} {gbps:>8.1}  {label}",
+                    self.backend,
+                    us / 1000.0,
+                );
+            } else {
+                // print-ok: report table row, see above.
+                eprintln!(
+                    "[prof:{}] {:>10.2} {share:>6.1}% {n:>8} {each:>9.1}  {label}",
+                    self.backend,
+                    us / 1000.0,
+                );
+            }
         }
     }
 }
@@ -294,7 +347,7 @@ mod tests {
         let rows = p.ranked();
         assert_eq!(rows[0].0, "dear", "sorted by time, not by dispatch count");
         assert_eq!(rows[0].1, 1);
-        assert_eq!(rows[1], ("cheap", 3, 30.0));
+        assert_eq!(rows[1], ("cheap", 3, 30.0, 0));
     }
 
     #[test]
@@ -302,7 +355,19 @@ mod tests {
         let mut p = OpProf::new("test", Unit::Device);
         p.add_n("k", 90.0, 3);
         p.add("k", 10.0);
-        assert_eq!(p.ranked(), vec![("k", 4, 100.0)]);
+        assert_eq!(p.ranked(), vec![("k", 4, 100.0, 0)]);
+    }
+
+    /// Byte accounting folds per row and the session total, so a backend that reports traffic gets
+    /// `GB/s` without changing how non-reporting backends are rendered.
+    #[test]
+    fn add_n_bytes_accumulates_traffic() {
+        let mut p = OpProf::new("test", Unit::Device);
+        p.add_n_bytes("k", 100.0, 2, 1_000);
+        p.add_n_bytes("k", 100.0, 2, 3_000);
+        p.add("k", 100.0);
+        assert_eq!(p.total_bytes(), 4_000);
+        assert_eq!(p.ranked(), vec![("k", 5, 300.0, 4_000)]);
     }
 
     /// A tiny graph with the three itemized ops plus one that falls back to its kind.

@@ -320,7 +320,12 @@ impl GpuPager {
         let mut first_slot = 0usize;
         while first_slot < n_slots {
             let shard_slots = (n_slots - first_slot).min(max_slots);
-            let (arena, addr) = vk.alloc_mapped_arena_bda(shard_slots * slot_bytes)?;
+            // paging.moe_arena_host: same arena, in host-visible system RAM instead of ReBAR VRAM.
+            let (arena, addr) = if vk.cfg().paging.moe_arena_host {
+                vk.alloc_mapped_arena_host_bda(shard_slots * slot_bytes)?
+            } else {
+                vk.alloc_mapped_arena_bda(shard_slots * slot_bytes)?
+            };
             arenas.push(ArenaShard {
                 buffer: Arc::from(arena),
                 addr,
@@ -1893,6 +1898,7 @@ pub struct MoePagerSession {
     load_reservation: Vec<Box<dyn Buffer>>,
     pools: Vec<Pool>,
     unified_pool: Arc<UnifiedVramPool>,
+    private_arena: bool,
     /// Last topology observed by the cheap Decode restoration check. A matching generation is
     /// one atomic load and no scan; module allocation/drop changes it.
     unified_generation: u64,
@@ -2023,6 +2029,14 @@ pub struct MoePagerLayout {
     /// Maximum bytes the Prefill ring may retain below the fixed runtime corridor. Live KV claims
     /// remain blockers, while uncommitted future segmented-KV coordinates are phase-loanable.
     pub prefill_cache_bytes: u64,
+    /// Reuse an already-materialized unified arena when its capacity matches, even if runtime
+    /// corridors differ. Set only by the detached MTP head cache, whose tiny arena may be
+    /// initialized after an equivalent probe on the same dedicated backend.
+    pub reuse_existing: bool,
+    /// Create a private unified arena for this pager session without installing it in the
+    /// backend's shared `unified_pool` cell. The detached MTP head uses this so its hot-expert
+    /// cache can coexist with the resident trunk's own unified arena on the same backend.
+    pub private_unified_arena: bool,
 }
 
 /// Upload-ring sizing policy — pure budget arithmetic, so it lives in the shared seam
@@ -2169,13 +2183,28 @@ impl MoePagerSession {
                 Ok((spec.slot_bytes, spec.n_slots, physical_floor))
             })
             .collect::<Result<Vec<_>>>()?;
-        let unified_pool = vk.init_unified_vram_for_expert_slots(
-            &unified_specs,
-            layout.dynamic_state_reserve_bytes,
-            layout.dynamic_state_max_allocation_bytes,
-            layout.prefill_min_lane_bytes,
-            layout.runtime_reserve_bytes,
-        )?;
+        let unified_pool = if layout.private_unified_arena {
+            // The head pager's real cache is allocated by `GpuPager::new_mapped` below. This
+            // one-slot pool exists only to satisfy the session's unified bookkeeping fields and
+            // is deliberately NOT installed in the backend's shared cell.
+            let dummy = [(4096usize, 1usize, 1usize)];
+            vk.make_private_unified_vram_for_expert_slots(
+                &dummy,
+                0,
+                0,
+                0,
+                0,
+            )?
+        } else {
+            vk.init_unified_vram_for_expert_slots(
+                &unified_specs,
+                layout.dynamic_state_reserve_bytes,
+                layout.dynamic_state_max_allocation_bytes,
+                layout.prefill_min_lane_bytes,
+                layout.runtime_reserve_bytes,
+                layout.reuse_existing,
+            )?
+        };
         let mut pools = Vec::with_capacity(layout.pools.len());
         for (pool_index, spec) in layout.pools.iter().enumerate() {
             if spec.min_enabled_slots == 0 || spec.min_enabled_slots > spec.n_slots {
@@ -2184,14 +2213,23 @@ impl MoePagerSession {
                     spec.min_enabled_slots, spec.n_slots,
                 )));
             }
-            let mut pager = GpuPager::new_unified(
-                vk,
-                Arc::clone(&unified_pool),
-                pool_index,
-                layout.n_blocks.saturating_mul(3),
-                spec.n_slots,
-                spec.slot_bytes,
-            )?;
+            let mut pager = if layout.private_unified_arena {
+                GpuPager::new_mapped(
+                    vk,
+                    layout.n_blocks.saturating_mul(3),
+                    spec.n_slots,
+                    spec.slot_bytes,
+                )?
+            } else {
+                GpuPager::new_unified(
+                    vk,
+                    Arc::clone(&unified_pool),
+                    pool_index,
+                    layout.n_blocks.saturating_mul(3),
+                    spec.n_slots,
+                    spec.slot_bytes,
+                )?
+            };
             let host = layout
                 .host_tier
                 .as_ref()
@@ -2233,6 +2271,7 @@ impl MoePagerSession {
             pools,
             unified_generation: unified_pool.generation(),
             unified_pool,
+            private_arena: layout.private_unified_arena,
             role_stride: layout.n_blocks,
             host_store,
             _host_tier: layout.host_tier,
@@ -2482,6 +2521,10 @@ impl MoePagerSession {
         self.sources.get(&buf_id).is_some_and(|(r, ..)| *r == role)
     }
 
+    pub(crate) fn is_private_arena(&self) -> bool {
+        self.private_arena
+    }
+
     pub fn bank_bytes(&self, buf_id: usize) -> Result<usize> {
         let (_, _, src) = self
             .sources
@@ -2494,6 +2537,9 @@ impl MoePagerSession {
     /// Decode floor, plus every slot named by a frozen LUT window in the current command stream.
     /// The phase-exclusive Prefill ring uses separate allocations and contributes no LUT slots.
     pub(crate) fn protected_expert_slots(&self) -> Vec<ExpertSlotId> {
+        if self.private_arena {
+            return Vec::new();
+        }
         let Some(layout) = self.unified_pool.expert_layout() else {
             return Vec::new();
         };
@@ -2529,6 +2575,11 @@ impl MoePagerSession {
         executor: &E,
         plan: UnifiedClaimPlan,
     ) -> Result<Vec<Arc<UnifiedAllocationHandle>>> {
+        if self.private_arena {
+            return Err(be(
+                "private MTP pager arena does not participate in unified VRAM claims",
+            ));
+        }
         let floor_suspended =
             plan.class() == UnifiedVramClass::Prefill || self.mode == MoeArenaMode::PrefillLayer;
         let floor_slots: Vec<Vec<usize>> = (0..self.pools.len())
@@ -2647,6 +2698,9 @@ impl MoePagerSession {
     }
 
     fn restore_unified_slots_if_changed(&mut self) -> usize {
+        if self.private_arena {
+            return 0;
+        }
         if self.unified_pool.generation() == self.unified_generation {
             return 0;
         }
@@ -2730,6 +2784,9 @@ impl MoePagerSession {
     /// those ranges remains valid and hot. The borrowed slots are already on each pager's free
     /// list; Decode naturally repopulates only those misses.
     pub fn enter_decode(&mut self) -> bool {
+        if self.private_arena {
+            return false;
+        }
         self.unified_pool.reset_prefill_runtime_reserve();
         if self.mode == MoeArenaMode::DecodeLru {
             let restored = self.restore_unified_slots_if_changed();
@@ -2745,6 +2802,27 @@ impl MoePagerSession {
         self.restore_unified_slots_if_changed();
         self.restore_exchange_spares();
         true
+    }
+
+    /// Byte address of `source`'s bank **in the permanent host store**, when the store is imported
+    /// WITH a device address (`paging.moe_prefill_inplace`) and the whole bank lies inside one
+    /// import shard. `None` ⇒ the layer is only reachable through its VRAM corridor and must be
+    /// pushed there first, which is the historical behaviour.
+    ///
+    /// This is the whole in-place prefill switch: the per-layer LUT window hands the kernels an
+    /// absolute byte address, so pointing that address at the store instead of at the corridor
+    /// turns a per-layer DMA push (one whole 1.11 GiB layer, 48 of them per chunk) into a PCIe read
+    /// of the same bytes in place. LUT, LRU, ring and lane bookkeeping are untouched — the corridor
+    /// claim stays as the inert descriptor binding the paged kernels already ignore.
+    fn store_bank_bda(&self, source: &RegisteredExpertSource) -> Option<u64> {
+        // BISECT: temporarily disabled to isolate "import carries an address" from "prefill reads
+        // through it".
+        if std::env::var_os("INFR_INPLACE_BISECT_IMPORT_ONLY").is_some() {
+            return None;
+        }
+        let chunk = self.host_store.get(source.host_chunk?)?;
+        let slice = chunk.range(source.host_offset, source.bank_bytes)?;
+        self.transfer_plan.imported_addr(slice)
     }
 
     fn packed_prefill_layers(&self) -> Result<Vec<PrefillLayer>> {
@@ -2813,6 +2891,9 @@ impl MoePagerSession {
         self.park_exchange_spares_in_floor()?;
         let layers = self.packed_prefill_layers()?;
         let mut feasible = Vec::new();
+        // Candidates that only fit the live arena by evicting resident expert slots (the regime the
+        // `plan_owner_claim` call below rejects). Kept only as a last resort.
+        let mut feasible_evicting = Vec::new();
         for &(rows, reserve) in candidates {
             let Ok(reserve_bytes) = usize::try_from(reserve) else {
                 continue;
@@ -2829,13 +2910,30 @@ impl MoePagerSession {
                     .into_iter()
                     .flatten()
                     .collect();
-                if self
-                    .unified_pool
-                    .plan_owner_claim(&requested, UnifiedVramClass::Prefill, &[])
-                    .is_ok()
-                {
-                    feasible.push((rows, lanes, reserve));
-                    break;
+                // The prefill ring lives in the SAME elastic arena as the resident expert slots, so
+                // a claim that has to evict an expert to succeed is not "feasible" — it is a
+                // thrash: every later chunk then drags that layer's weights past the pager again
+                // (chunk-major = one whole-model span per chunk, see the runner's comment).
+                // Measured on a dual 7900 XTX, IQ3_XXS Qwen3.8-Flash-Next, 1911-token prompt:
+                // 644 t/s at 1024 rows, 215 at 2048, 197 at 4096, and the 2048/4096 runs carry
+                // exactly one 160-200 ms refetch per layer (48 of them) that accounts for the
+                // whole slowdown. Protect the resident experts and require a VICTIM-FREE claim.
+                let protected = self.protected_expert_slots();
+                match self.unified_pool.plan_owner_claim(
+                    &requested,
+                    UnifiedVramClass::Prefill,
+                    &protected,
+                ) {
+                    Ok(plan) if plan.victims().is_empty() => {
+                        feasible.push((rows, lanes, reserve));
+                        break;
+                    }
+                    Ok(_) => {
+                        // Fits only by evicting resident experts: keep it as a last resort so a
+                        // user-pinned height still runs, but prefer anything that fits clean.
+                        feasible_evicting.push((rows, lanes, reserve));
+                    }
+                    Err(_) => {}
                 }
             }
             // The first >=3-lane candidate is the tallest such chunk. All remaining candidates
@@ -2844,7 +2942,13 @@ impl MoePagerSession {
                 break;
             }
         }
-        let Some((rows, lanes, reserve)) = select_prefill_candidate(&feasible) else {
+        // Prefer a chunk whose ring fits WITHOUT evicting resident experts: the ring then coexists
+        // with the expert cache instead of displacing it, and a chunk-major sweep stays free.
+        // Only when nothing fits clean — a user-pinned height, or an arena too small for any clean
+        // fit — take the tallest evicting candidate and say so out loud.
+        let clean = select_prefill_candidate(&feasible);
+        let chosen = clean.or_else(|| select_prefill_candidate(&feasible_evicting));
+        let Some((rows, lanes, reserve)) = chosen else {
             let original = self
                 .unified_pool
                 .expert_layout()
@@ -2854,12 +2958,22 @@ impl MoePagerSession {
             self.unified_pool.set_prefill_runtime_reserve(original)?;
             return Err(be("no Prefill ubatch/lane combination fits the live arena"));
         };
+        if clean.is_none() {
+            tracing::warn!(
+                rows,
+                lanes,
+                "[moe-prefill] no chunk fits the live arena without evicting resident experts; \
+                 taking the tallest that fits anyway — expect one expert refetch per layer per \
+                 chunk (measured 3x slower than a clean fit on a dual 7900 XTX)"
+            );
+        }
         self.unified_pool
             .set_prefill_runtime_reserve(reserve as usize)?;
         tracing::info!(
             ubatch = rows,
             planned_lanes = lanes,
             runtime_reserve_bytes = reserve,
+            resident_experts_protected = clean.is_some(),
             "[moe-prefill] selected live-arena combination"
         );
         Ok(rows)
@@ -3109,11 +3223,23 @@ impl MoePagerSession {
                 let src = self.host_store[host_chunk]
                     .range(source.host_offset, source.bank_bytes)
                     .ok_or_else(|| be("moe pager: async Prefill source range out of bounds"))?;
-                copies.push(PrefillCopy::Memory {
-                    src: src.as_ptr() as usize,
-                    len: src.len(),
-                    target,
-                });
+                // `paging.moe_prefill_inplace`: the store already carries a device address, so the
+                // layer is where the kernels will read it — pushing it into the corridor would be
+                // 1.11 GiB of DMA per layer that nothing consumes (`layer_lut_window` points past
+                // it). Keep the corridor claim (it is the inert descriptor binding) and skip the
+                // copy. Without an address the copy stays exactly as before.
+                //
+                // Bring-up knob: `INFR_INPLACE_KEEP_PUSH=1` still pushes the layer into its corridor
+                // while the LUT window already points at the store — it prices the copy against the
+                // in-place read without changing which bytes the kernels see.
+                let keep_push = std::env::var_os("INFR_INPLACE_KEEP_PUSH").is_some();
+                if keep_push || self.store_bank_bda(source).is_none() {
+                    copies.push(PrefillCopy::Memory {
+                        src: src.as_ptr() as usize,
+                        len: src.len(),
+                        target,
+                    });
+                }
             } else {
                 // Prefill may pack this bank into a different GPU arena pool, but its block
                 // descriptors remain registered in the original size-class host pool.
@@ -3133,6 +3259,13 @@ impl MoePagerSession {
         }
 
         let lane = placement.lane;
+        if copies.is_empty() {
+            tracing::info!(
+                "[moe-prefill] in-place store bank: buf={buf_id} layer={} — kernels read the \
+                 permanent host store over PCIe (paging.moe_prefill_inplace), no push",
+                placement.layer_base,
+            );
+        }
         self.prefill_loaded.retain(|loaded| {
             self.prefill_placement
                 .get(loaded)
@@ -3968,7 +4101,40 @@ impl MoePagerSession {
         if source.bank_bytes > range.len {
             return Err(be("moe pager: Prefill LUT bank exceeds its corridor lease"));
         }
-        let bank_addr = allocation.base_addr() + range.offset as u64;
+        // `paging.moe_prefill_inplace`: read the store in place over PCIe instead of the VRAM
+        // corridor this layer was DMA-ed into. Everything else about the window is unchanged —
+        // same expert stride, same `local id == slot` identity the kernels assume.
+        let bank_addr = self
+            .store_bank_bda(source)
+            .unwrap_or_else(|| allocation.base_addr() + range.offset as u64);
+        // `INFR_INPLACE_TRACE_ADDR=<path>`: append the address this window hands the kernels, then
+        // fsync — a wild-address fault can take the whole box down, and a buffered log line does not
+        // survive that. Also echoed through `tracing` for the normal log.
+        if let Ok(path) = std::env::var("INFR_INPLACE_TRACE_ADDR") {
+            use std::io::Write as _;
+            let line = format!(
+                "buf={buf_id} layer_base={} bank_addr=0x{bank_addr:x} corridor=0x{:x} \
+                 n_expert={n_expert} stride={} bank_bytes={} host_chunk={:?} host_offset={}\n",
+                self.prefill_placement
+                    .get(&buf_id)
+                    .map(|p| p.layer_base)
+                    .unwrap_or(u32::MAX),
+                allocation.base_addr() + range.offset as u64,
+                source.stride_bytes,
+                source.bank_bytes,
+                source.host_chunk,
+                source.host_offset,
+            );
+            tracing::info!("[moe-prefill] addr trace: {line}");
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = f.write_all(line.as_bytes());
+                let _ = f.sync_all();
+            }
+        }
         let mut addresses = Vec::with_capacity(n_expert);
         for expert in 0..n_expert {
             let offset = expert

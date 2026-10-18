@@ -27,11 +27,13 @@ mod sc;
 mod segmented_kv;
 pub(crate) use segmented_kv::KV_GROW_ROWS;
 mod session_state;
+pub(crate) mod spec;
 mod weights;
 
 pub(crate) use runner::{
-    generate_dense_backend, generate_dense_backend_mtp_prime, MtpPrefillHiddenSink,
-    PreparedParallelPrompt,
+    fork_seam_slot_flat, generate_dense_backend, generate_dense_backend_mtp_prime,
+    generate_dense_backend_window_pipe, pipeline_layer_split, MtpPrefillHiddenSink,
+    PreparedParallelPrompt, WindowFront, WindowPipeRequest,
 };
 pub(crate) use sc::DenoiseReq;
 pub use sc::{DenoiseOutcome, EbReduced};
@@ -792,19 +794,19 @@ pub(crate) fn generate_dense_vulkan_session(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_dense_vulkan_parallel_prompt_session(
-    vk: &infr_vulkan::VulkanBackend,
+    be: &dyn infr_core::backend::Backend,
     cfg: &Config,
     ec: &EngineConfig,
     state: &mut SeamKv,
     prompt: &[u32],
     turn_checkpoint: Option<TurnCheckpoint>,
 ) -> AResult<runner::PreparedParallelPrompt> {
-    runner::prepare_parallel_prompt(vk, cfg, ec, state, prompt, turn_checkpoint)
+    runner::prepare_parallel_prompt(be, cfg, ec, state, prompt, turn_checkpoint)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_dense_vulkan_parallel_sampled_session(
-    vk: &infr_vulkan::VulkanBackend,
+    be: &dyn infr_core::backend::Backend,
     g: &Gguf,
     cfg: &Config,
     ec: &EngineConfig,
@@ -834,7 +836,7 @@ pub(crate) fn generate_dense_vulkan_parallel_sampled_session(
         Err(anyhow!("warm parallel session must not re-bind {name}"))
     });
     let out = runner::generate_dense_backend_parallel_sampled(
-        vk,
+        be,
         &*bind,
         g,
         cfg,
@@ -856,14 +858,14 @@ pub(crate) fn generate_dense_vulkan_parallel_sampled_session(
         req,
         capture_hidden,
     )?;
-    vk.print_moe_pager_stats();
-    vk.print_dense_pager_stats();
+    be.print_moe_pager_stats();
+    be.print_dense_pager_stats();
     Ok(out)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_dense_vulkan_parallel_prefill_session(
-    vk: &infr_vulkan::VulkanBackend,
+    be: &dyn infr_core::backend::Backend,
     g: &Gguf,
     cfg: &Config,
     ec: &EngineConfig,
@@ -886,7 +888,7 @@ pub(crate) fn generate_dense_vulkan_parallel_prefill_session(
         Err(anyhow!("warm parallel session must not re-bind {name}"))
     });
     let out = runner::generate_dense_backend_parallel_prefill(
-        vk,
+        be,
         &*bind,
         g,
         cfg,
@@ -908,18 +910,18 @@ pub(crate) fn generate_dense_vulkan_parallel_prefill_session(
         for slot in peers {
             slot.reset();
         }
-        vk.release_moe_load_reservation();
+        be.release_moe_load_reservation();
     }
     let out = out?;
-    vk.print_moe_pager_stats();
-    vk.print_dense_pager_stats();
+    be.print_moe_pager_stats();
+    be.print_dense_pager_stats();
     Ok(out)
 }
 
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 pub(crate) fn generate_dense_vulkan_parallel_mtp_verify_session(
-    vk: &infr_vulkan::VulkanBackend,
+    be: &dyn infr_core::backend::Backend,
     g: &Gguf,
     cfg: &Config,
     ec: &EngineConfig,
@@ -937,7 +939,7 @@ pub(crate) fn generate_dense_vulkan_parallel_mtp_verify_session(
     let mut logits = Vec::new();
     let mut hidden = Vec::new();
     let result = runner::generate_dense_backend_parallel_mtp_verify(
-        vk,
+        be,
         &*bind,
         g,
         cfg,
@@ -959,7 +961,7 @@ pub(crate) fn generate_dense_vulkan_parallel_mtp_verify_session(
         for slot in peers {
             slot.reset();
         }
-        vk.release_moe_load_reservation();
+        be.release_moe_load_reservation();
     }
     result?;
     Ok((ids, logits, hidden))
@@ -1398,9 +1400,12 @@ pub(crate) fn ubatch_rows(ec: &EngineConfig) -> usize {
     let selected = configured
         .or(placed)
         .unwrap_or_else(|| default_ubatch_rows(ec.device.auto_profile));
-    match moe_cap {
-        Some(cap) => selected.min(cap),
-        None => selected,
+    // The MoE residency cap corrects the DEFAULT height only; an explicit `--ubatch`/`INFR_UBATCH`
+    // stays authoritative, so the A/B harness can still force the taller chunk that reproduces the
+    // streaming regime.
+    match (configured.is_some(), moe_cap) {
+        (false, Some(cap)) => selected.min(cap),
+        _ => selected,
     }
 }
 
@@ -1652,7 +1657,7 @@ fn repin_ubatch_lower(rows: usize) {
     });
 }
 
-fn cap_moe_ubatch(rows: usize) {
+pub(crate) fn cap_moe_ubatch(rows: usize) {
     with_placement_pins(|p| {
         let cur = p.moe_ubatch_cap.load(std::sync::atomic::Ordering::Relaxed);
         if cur == 0 || rows < cur {
@@ -1661,6 +1666,34 @@ fn cap_moe_ubatch(rows: usize) {
         }
     });
 }
+
+/// The tallest prefill chunk a FULLY-RESIDENT MoE expert payload survives, in rows.
+///
+/// When the pager owns the experts (`moe_paged()`), `cap_moe_ubatch` is driven by a priced plan.
+/// When it does NOT — every expert is an ordinary resident buffer — nothing prices the chunk, and
+/// `default_ubatch_rows` hands a discrete GPU 4096 rows. That chunk's runtime workspace then shares
+/// VRAM with the expert payload and can displace it; because a chunk-major prefill sweep is one
+/// whole-model span per chunk, every later chunk re-reads a displaced layer's experts from host
+/// memory. Measured on a dual RX 7900 XTX (IQ3_XXS Qwen3.8-Flash-Next, 47 GB weights + 29 GB PLE,
+/// RADV, `INFR_PIPELINE=Vulkan0,Vulkan2`, 62 GB RAM):
+///
+/// | prompt | 1024 rows | 2048 rows | 4096 rows |
+/// |---|---|---|---|
+/// | 1911 tok | 650 t/s | 230 t/s | 197 t/s |
+/// | 3980 tok | 750 t/s | — | 70 t/s |
+///
+/// and the 2048/4096 runs carry exactly one 160-200 ms stall per layer (48 of them) whose sum is
+/// the entire slowdown. 4096 rows is also what `--ubatch`-less `infr run` picks by default, so the
+/// engine's own default was the slow configuration.
+///
+/// 2026-10-12 re-sweep (same box, after the `linear_native` batched-prefill fix): the height is a
+/// hard VRAM wall, not a slider — 995 t/s @1280 vs 583 @1536 vs 293 @2048, and at 1536 the
+/// blow-up is `moe_scatter_reduce` 0.03 s → 1.30 s and `expert_down` 0.48 s → 1.54 s, i.e. whole
+/// kernels falling off the resident expert payload onto host memory. 1280 is the tallest chunk
+/// that still fits, so it is the cap. Shrinking the KV cache does NOT move it (8192/4096 ctx give
+/// the same 566/220 t/s at 1536/2560), which pins the displacement on the per-chunk runtime
+/// workspace, not the cache.
+pub(crate) const MOE_RESIDENT_PREFILL_CAP_ROWS: usize = 1280;
 
 /// Claim the one-shot "activation reserve too low" report for the current session scope: `true`
 /// exactly once, for the first caller that finds the peak above the reserve.
@@ -2285,7 +2318,11 @@ pub(crate) fn segmented_kv_wanted(
     ec.kv.dynamic
         && (cfg.qwen35 || cfg.qwen4exp)
         && !ring
-        && !ec.kv.overflow
+        // `INFR_KV_OVERFLOW` no longer disqualifies the segmented layout (the multi-device
+        // backends now forward it: see `PipelineBackend`'s segmented-KV arm). Segments are
+        // committed LAZILY in 32K-token steps, so a short prompt on a 256K context claims ONE
+        // segment per plane and reads it from VRAM, while the flat layout it replaced committed
+        // the whole per-layer extent to host RAM and paid ~2.1x reading it back over PCIe.
         && k_fmt == DType::Q8_0
         && v_fmt == DType::Q8_0
 }
@@ -2366,6 +2403,43 @@ pub(crate) fn dense_placement_fits(
     };
     dense_resident_need(cfg, caps, weights, want_ctx, ring, ubatch, k_fmt, v_fmt).saturating_add(lm)
         <= planned_vram_room(vram, ec)
+}
+
+/// PROBE (temporary, Linux VRAM-margin investigation 2026-10-12): prints the exact composition of
+/// the resident-fit decision so the gap between the estimate and the allocator can be read off a
+/// single run instead of inferred.
+pub(crate) fn dense_fit_probe(
+    cfg: &Config,
+    caps: &Capabilities,
+    ec: &EngineConfig,
+    weights: u64,
+    vram: &infr_vulkan::VramInfo,
+    want_ctx: usize,
+    ubatch: usize,
+    k_fmt: DType,
+    v_fmt: DType,
+) {
+    let ring = placement_ring(cfg, ec, k_fmt, v_fmt);
+    let lm = if ec.paging.layer_major == Some(true) {
+        layer_major_act_bytes(cfg, want_ctx, ubatch)
+    } else {
+        0
+    };
+    let need = dense_resident_need(cfg, caps, weights, want_ctx, ring, ubatch, k_fmt, v_fmt)
+        .saturating_add(lm);
+    let room = planned_vram_room(vram, ec);
+    tracing::info!(
+        "[dense-fit] ub={ubatch} weights={:.2} GiB non-weight-need={:.2} GiB (lm={:.2}) total-need={:.2} GiB \
+         room={:.2} GiB alloc_room={:.2} GiB physical={:.2} GiB => {}",
+        weights as f64 / GIB_F64,
+        need.saturating_sub(weights) as f64 / GIB_F64,
+        lm as f64 / GIB_F64,
+        need as f64 / GIB_F64,
+        room as f64 / GIB_F64,
+        vram.alloc_room() as f64 / GIB_F64,
+        vram.total as f64 / GIB_F64,
+        if need <= room { "RESIDENT" } else { "STREAM" },
+    );
 }
 
 /// The TALLEST [`ubatch_candidates`] rung at which this dense session fits resident, or `None` when
@@ -2705,14 +2779,61 @@ fn moe_role_index(name: &str) -> Option<usize> {
 /// The pager's physical size classes, derived from the same expert banks its binder diverts.
 /// Keeping this outside the binder lets the default-context preflight reserve the exact one-layer
 /// floor before any Vulkan allocation exists.
-fn moe_logical_pools(g: &Gguf, cfg: &Config, n_paged: usize) -> Vec<(usize, usize, [usize; 3])> {
+#[derive(Clone, Copy, Debug)]
+struct MoeLayerScope {
+    start: usize,
+    end: usize,
+    vram_reserve_bytes: u64,
+    cache_override_bytes: Option<u64>,
+    min_slots_per_pool: Option<usize>,
+    runtime_reserve_override_bytes: Option<u64>,
+    dynamic_state_reserve_override_bytes: Option<u64>,
+    prefill_min_lane_override_bytes: Option<u64>,
+    reuse_existing_arena: bool,
+    private_unified_arena: bool,
+}
+
+impl MoeLayerScope {
+    fn all(n_layer: usize) -> Self {
+        Self {
+            start: 0,
+            end: n_layer,
+            vram_reserve_bytes: 0,
+            cache_override_bytes: None,
+            min_slots_per_pool: None,
+            runtime_reserve_override_bytes: None,
+            dynamic_state_reserve_override_bytes: None,
+            prefill_min_lane_override_bytes: None,
+            reuse_existing_arena: false,
+            private_unified_arena: false,
+        }
+    }
+
+    fn len(self) -> usize {
+        self.end.saturating_sub(self.start)
+    }
+
+    fn contains(self, layer: usize) -> bool {
+        (self.start..self.end).contains(&layer)
+    }
+
+    fn local(self, layer: usize) -> usize {
+        layer.saturating_sub(self.start)
+    }
+}
+
+fn moe_logical_pools(
+    g: &Gguf,
+    cfg: &Config,
+    scope: MoeLayerScope,
+) -> Vec<(usize, usize, [usize; 3])> {
     let Some(moe) = cfg.moe.as_ref() else {
         return Vec::new();
     };
     let n_expert = moe.n_expert.max(1);
     let mut by_size = std::collections::BTreeMap::<usize, (usize, [usize; 3])>::new();
     for t in g.tensors() {
-        let Some(_layer) = moe_expert_layer(&t.name).filter(|&l| l < n_paged) else {
+        let Some(_layer) = moe_expert_layer(&t.name).filter(|&l| scope.contains(l)) else {
             continue;
         };
         let Some(role) = moe_role_index(&t.name) else {
@@ -2761,33 +2882,25 @@ fn moe_pool_floor_bytes(pools: &[(usize, usize, [usize; 3])], n_expert: usize) -
         })
 }
 
-fn moe_pool_physical_floor_bytes(
-    pools: &[(usize, usize, [usize; 3])],
-    n_expert: usize,
-) -> Option<u64> {
-    pools
-        .iter()
-        .zip(moe_pool_slot_floors(pools, n_expert))
-        .try_fold(0u64, |sum, (&(slot_bytes, ..), slots)| {
-            sum.checked_add((slot_bytes as u64).checked_mul(slots as u64)?)
-        })
-}
-
-pub(crate) fn moe_prefill_floor_bytes(g: &Gguf, cfg: &Config) -> u64 {
+fn moe_prefill_floor_bytes_scoped(g: &Gguf, cfg: &Config, scope: MoeLayerScope) -> u64 {
     let Some(moe) = cfg.moe.as_ref() else {
         return 0;
     };
-    let pools = moe_logical_pools(g, cfg, cfg.n_layer);
+    let pools = moe_logical_pools(g, cfg, scope);
     moe_pool_floor_bytes(&pools, moe.n_expert.max(1)).unwrap_or(u64::MAX)
+}
+
+pub(crate) fn moe_prefill_floor_bytes(g: &Gguf, cfg: &Config) -> u64 {
+    moe_prefill_floor_bytes_scoped(g, cfg, MoeLayerScope::all(cfg.n_layer))
 }
 
 /// Exact minimum whole-layer Prefill lane: one maximum bank for each role position used by any
 /// paged layer. This mirrors the pager's one-lane layout without multiplying mutually exclusive
 /// size classes into the Decode dispatch floor.
-fn moe_prefill_min_lane_bytes(g: &Gguf, cfg: &Config) -> u64 {
+fn moe_prefill_min_lane_bytes(g: &Gguf, _cfg: &Config, scope: MoeLayerScope) -> u64 {
     let mut role_max = [0u64; 3];
     for tensor in g.tensors() {
-        let Some(_layer) = moe_expert_layer(&tensor.name).filter(|&layer| layer < cfg.n_layer)
+        let Some(_layer) = moe_expert_layer(&tensor.name).filter(|&layer| scope.contains(layer))
         else {
             continue;
         };
@@ -2809,10 +2922,10 @@ fn moe_prefill_min_lane_bytes(g: &Gguf, cfg: &Config) -> u64 {
 /// the uploader that many fast layers in which to prepare the next slow Attention/MLA layer; the
 /// extra lane is the layer currently being consumed. Models without recurrent mixers keep the
 /// established all-layer target and let physical cache capacity cap it.
-fn moe_prefill_target_lanes(cfg: &Config, n_paged: usize) -> usize {
+fn moe_prefill_target_lanes(cfg: &Config, scope: MoeLayerScope) -> usize {
     let mut current_run = 0usize;
     let mut longest_run = 0usize;
-    for layer in 0..cfg.n_layer {
+    for layer in scope.start..scope.end {
         if cfg.is_recurrent_layer(layer) {
             current_run = current_run.saturating_add(1);
             longest_run = longest_run.max(current_run);
@@ -2821,9 +2934,9 @@ fn moe_prefill_target_lanes(cfg: &Config, n_paged: usize) -> usize {
         }
     }
     if longest_run == 0 {
-        n_paged.max(1)
+        scope.len().max(1)
     } else {
-        longest_run.saturating_add(1).min(n_paged.max(1))
+        longest_run.saturating_add(1).min(scope.len().max(1))
     }
 }
 
@@ -2836,9 +2949,17 @@ fn moe_pool_slot_counts(
     budget: u64,
     n_expert: usize,
     size_bias: f64,
+    floors: Option<&[usize]>,
 ) -> Option<Vec<usize>> {
-    let floors = moe_pool_slot_floors(pools, n_expert);
-    let minimum = moe_pool_physical_floor_bytes(pools, n_expert)?;
+    let floors = floors
+        .map(<[usize]>::to_vec)
+        .unwrap_or_else(|| moe_pool_slot_floors(pools, n_expert));
+    let minimum = pools
+        .iter()
+        .zip(&floors)
+        .try_fold(0u64, |sum, (&(slot_bytes, ..), &slots)| {
+            sum.checked_add((slot_bytes as u64).checked_mul(slots as u64)?)
+        })?;
     if minimum > budget {
         return None;
     }
@@ -3403,6 +3524,88 @@ fn register_bounded_moe_host_blocks(
     Ok(())
 }
 
+/// Streamable per-layer dense weight GROUPS for the dense streaming tier (VRAM→DRAM→disk).
+///
+/// Shared by the dense path and the MoE+EP path so their enumerations can't drift. One group =
+/// one weight GROUP exactly as `wload` uploads it (fused qkv / gate_up concats are one block —
+/// the shared `fuse_*_decision` helpers keep this enumeration and the runner's upload order from
+/// drifting). `names[0]` is the key `bind_weight` receives for the group.
+///
+/// Hybrid (qwen4exp / Qwen3.8-…) layers need the extra entries below: their per-layer dense bytes
+/// are dominated by `attn_qkv` / `attn_gate` / `ssm_out` / `hc_*`, NONE of which the plain
+/// attn_q/k/v + ffn_gate/up/down enum covers. Tensors that are absent (or whose dtype lacks
+/// offset-capable kernels) simply stay resident — `filter_map`'s "absent ⇒ skip" semantics.
+fn dense_stream_groups(
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    combined_gu: bool,
+) -> Vec<(Vec<String>, infr_core::DType, usize, usize)> {
+    let fuse_gu = runner::fuse_gu_decision(combined_gu, g, cfg);
+    let fuse_qkv = runner::fuse_qkv_decision(combined_gu, g, cfg, ec);
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    for l in 0..cfg.n_layer {
+        let p = |s: &str| format!("blk.{l}.{s}");
+        if !cfg.permute_qk_neox {
+            if fuse_qkv {
+                groups.push(vec![
+                    p("attn_q.weight"),
+                    p("attn_k.weight"),
+                    p("attn_v.weight"),
+                ]);
+            } else {
+                groups.push(vec![p("attn_q.weight")]);
+                groups.push(vec![p("attn_k.weight")]);
+                groups.push(vec![p("attn_v.weight")]);
+            }
+        } else if !fuse_qkv {
+            // Permuted q/k stay resident (their upload bytes are load-time rewrites of the
+            // mmap); v uploads raw and can still stream.
+            groups.push(vec![p("attn_v.weight")]);
+        }
+        groups.push(vec![p("attn_output.weight")]);
+        // Hybrid per-layer projections (absent on plain dense models ⇒ skipped).
+        groups.push(vec![p("attn_qkv.weight")]);
+        groups.push(vec![p("attn_gate.weight")]);
+        groups.push(vec![p("ssm_out.weight")]);
+        groups.push(vec![p("hc_attn_up.weight")]);
+        groups.push(vec![p("hc_attn_down.weight")]);
+        groups.push(vec![p("hc_ffn_up.weight")]);
+        groups.push(vec![p("hc_ffn_down.weight")]);
+        groups.push(vec![p("indexer.q_proj.weight")]);
+        groups.push(vec![p("indexer.k_proj.weight")]);
+        if fuse_gu {
+            groups.push(vec![p("ffn_gate.weight"), p("ffn_up.weight")]);
+        } else {
+            groups.push(vec![p("ffn_gate.weight")]);
+            groups.push(vec![p("ffn_up.weight")]);
+        }
+        groups.push(vec![p("ffn_down.weight")]);
+        groups.push(vec![p("ffn_gate_shexp.weight")]);
+        groups.push(vec![p("ffn_up_shexp.weight")]);
+        groups.push(vec![p("ffn_down_shexp.weight")]);
+    }
+    let tinfo = |n: &str| g.tensors().iter().find(|t| t.name == n);
+    groups
+        .into_iter()
+        .filter_map(|comps| {
+            let infos: Vec<_> = comps.iter().map(|n| tinfo(n)).collect::<Option<_>>()?;
+            let dt = infos[0].dtype;
+            if !infos.iter().all(|t| t.dtype == dt)
+                || !infr_vulkan::linear::native_dense_supported(dt)
+            {
+                return None;
+            }
+            let raw: usize = infos.iter().map(|t| t.nbytes).sum();
+            let numel: usize = infos
+                .iter()
+                .map(|t| t.shape.iter().product::<usize>())
+                .sum();
+            Some((comps, dt, raw, numel))
+        })
+        .collect()
+}
+
 /// Decide this model's MoE expert placement and return its Vulkan weight binder plus an optional
 /// one-shot pager finalizer (FIRST load only). The binder queues paged expert registrations; the
 /// finalizer installs the measured-size arena after fixed allocations. Shared by every
@@ -3422,6 +3625,50 @@ pub(crate) fn vulkan_moe_binder<'a>(
     first_load: bool,
     want_ctx: usize,
 ) -> AResult<(Box<BindWeight<'a>>, Option<Box<FinishFixedAllocations<'a>>>)> {
+    vulkan_moe_binder_scoped(
+        vk,
+        g,
+        cfg,
+        ec,
+        first_load,
+        want_ctx,
+        MoeLayerScope::all(cfg.n_layer),
+    )
+}
+
+/// The trunk's weight binder for a backend held as a trait object: a layer split gets the per-lane
+/// paged pipeline binder, a single device the ordinary Vulkan MoE binder. Mirrors
+/// [`generate_dense_session_for`], so the batched seam can drive either shape with one call site.
+pub(crate) fn moe_binder_for<'a>(
+    be: &'a dyn infr_core::backend::Backend,
+    g: &'a Gguf,
+    cfg: &'a Config,
+    ec: &EngineConfig,
+    first_load: bool,
+    want_ctx: usize,
+) -> AResult<(Box<BindWeight<'a>>, Option<Box<FinishFixedAllocations<'a>>>)> {
+    if let Some(pb) = be
+        .backend_any()
+        .and_then(|any| any.downcast_ref::<infr_vulkan::PipelineBackend>())
+    {
+        return pipeline_moe_binder(pb, g, cfg, ec, first_load, want_ctx);
+    }
+    let vk = be
+        .backend_any()
+        .and_then(|any| any.downcast_ref::<infr_vulkan::VulkanBackend>())
+        .ok_or_else(|| anyhow!("a seam weight binder needs a Vulkan device or a layer split"))?;
+    vulkan_moe_binder(vk, g, cfg, ec, first_load, want_ctx)
+}
+
+fn vulkan_moe_binder_scoped<'a>(
+    vk: &'a infr_vulkan::VulkanBackend,
+    g: &'a Gguf,
+    cfg: &'a Config,
+    ec: &EngineConfig,
+    first_load: bool,
+    want_ctx: usize,
+    scope: MoeLayerScope,
+) -> AResult<(Box<BindWeight<'a>>, Option<Box<FinishFixedAllocations<'a>>>)> {
     // ── MoE expert placement ─────────────────────────────────────────────────────────────────
     // The pager (`infr_vulkan::pager`) is the ONLY MoE offload mechanism — the legacy
     // host-visible (HostWeights/GTT) split and its INFR_NCMOE knob are gone. Tiers, in
@@ -3439,8 +3686,33 @@ pub(crate) fn vulkan_moe_binder<'a>(
     // paged branch). FUSED gate_up banks (gemma-4 MoE / DiffusionGemma) page under `Role::Gate`
     // with a double-width slot. Physical cache pools are keyed only by expert slot size, so roles
     // share capacity while mixed-dtype layouts still receive the distinct geometries they need.
-    let cache_override = ec.paging.cache;
+    let cache_override = scope
+        .cache_override_bytes
+        .map(infr_core::SizeSpec::Bytes)
+        .or(ec.paging.cache);
     let caps = vk.capabilities();
+    // MoE + expert-parallel: the per-rank dense copy is what overflows a 24 GiB card, and the
+    // dense streaming tier below is the only thing that can move it out of VRAM. Decided here
+    // because BOTH the MoE placement block (below) and the dense streaming block (further down)
+    // branch on it; `resident_dense` is filled in by the former and consumed by the latter.
+    // NOTE: deliberately off. The EP path (`expert_parallel_binder` + `run_dense_oneshot`) never
+    // calls this binder, so enabling dense streaming here only ever fires on a SINGLE-card serve
+    // session that happens to have INFR_EXPERT_PARALLEL set — where it streams dense away from
+    // VRAM with no second rank to use it, and makes prefill *slower* (measured: 37 → 32 t/s).
+    // Genuinely enabling it needs the EP path to grow a session/pager budget story first.
+    // NOTE: ENABLED (2026-10-13) for the two-rank MoE serve session. With EP wired into serve the
+    // per-rank dense copy is what leaves `room = 0` and refuses the model (see the plan error
+    // below); streaming it to the host tier is the only way experts stay resident per rank.
+    // The earlier "deliberately off" note measured a SINGLE-card session (rank 1 absent), where
+    // streaming dense away from VRAM bought nothing — that case does not apply here.
+    // ponytail: hardcoded on; make it a PagingCfg flag if a single-card regression shows up.
+    let ep_dense_stream = true;
+    // Set ONLY when the plan actually falls back to streaming dense (see the plan selection
+    // below). Everything that registers or handles the host tier keys off THIS, not the
+    // allow-flag: registering it on a resident session costs a host read per chunk for nothing
+    // (measured: 1014 -> 461 t/s @8K on the two-card pipeline session).
+    let mut dense_streaming = false;
+    let mut resident_dense = 0u64;
 
     let mut n_paged = 0usize; // paged layer-count (0 = fully resident, or all = cfg.n_layer)
     let mut expert_cache_target_bytes = 0u64;
@@ -3474,16 +3746,33 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // `infr_vulkan::linear::moe_expert_dtype_ok` is true for all of them; the invariant is
         // pinned by `moe_expert_floor_covers_dense_set` in infr-vulkan's linear.rs tests.
         let fp = crate::weights::weight_footprint(g);
-        // These are clean GGUF mapping pages used only as the source of fixed GPU uploads. The
-        // bounded Expert arena is populated after those uploads finish, so they are load-time
-        // working set, not a persistent owner of the process RAM budget.
-        reclaimable_fixed_host_source_bytes = fp.dense;
+        // ── MoE + expert-parallel only: route the per-rank dense copy through the dense streaming
+        // tier instead of requiring it resident. EP puts a FULL copy of the non-expert weights on
+        // EVERY rank (each rank owns only half the expert band), and that copy is exactly what
+        // overflows a 24 GiB card — `room = 0` in the plan error below. The streaming tier is
+        // several hundred lines down and is normally gated to `cfg.moe.is_none()`; enabling it
+        // here means the plan below may only charge the dense bytes that CANNOT stream.
+        //
+        // Gated to EP so the single-card MoE path (experts paged, dense resident) is untouched.
+        let streamable_dense: u64 = if ep_dense_stream {
+            dense_stream_groups(g, cfg, ec, vk.capabilities().combined_gu)
+                .iter()
+                .map(|(_, dt, raw, numel)| crate::weights::tensor_resident_bytes(*dt, *numel, *raw))
+                .sum()
+        } else {
+            0
+        };
+        // RESIDENT-FIRST (2026-10-13): keep the FULL per-rank dense copy in VRAM whenever the plan
+        // accepts it. Streaming dense costs a host read per chunk and measured 1014 -> 553 t/s on
+        // the two-card pipeline session, so it is only a FALLBACK for the case the plan used to
+        // refuse outright (EP per-rank copy: `room = 0`). See the plan selection below.
+        resident_dense = fp.dense;
         let vram = vk.vram();
         // Usually this binder is the backend's first owner, making `planned_vram_room`'s
         // tracked_used=0 assumption exact. A detached MTP head is intentionally resident before
         // the target, however, so use the backend's live accounting here. This keeps the
         // provisional placement consistent with the final post-fixed `vk.alloc_room()` query.
-        let room = vk.alloc_room();
+        let room = vk.alloc_room().saturating_sub(scope.vram_reserve_bytes);
         // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows`), so a mostly-SWA
         // model's KV prices far below n_layer * ctx. Price the actual per-side Vulkan formats:
         // explicit Q8 and F16 choices must change the expert remainder just like the allocation.
@@ -3508,9 +3797,13 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     .saturating_mul(2)
             })
             .unwrap_or(0);
-        let dynamic_kv_reserve = total_slot_state_bytes(
-            dynamic_kv_reserve_per_slot.saturating_add(mtp_dynamic_reserve_per_slot),
-        );
+        let dynamic_kv_reserve = scope
+            .dynamic_state_reserve_override_bytes
+            .unwrap_or_else(|| {
+                total_slot_state_bytes(
+                    dynamic_kv_reserve_per_slot.saturating_add(mtp_dynamic_reserve_per_slot),
+                )
+            });
         dynamic_state_max_allocation_bytes = dynamic_layout
             .as_ref()
             .and_then(|layout| {
@@ -3537,30 +3830,69 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // 4096 rows still gets the full 4K reserve; a lower selected rung no longer strands the
         // difference behind a permanent 2 GiB/4K assumption. Prefill's layer ring already borrows
         // only cold Decode arena ranges and returns them on `enter_decode`.
-        let runtime_reserve =
-            runtime_reserve_at(cfg, &caps, want_ctx, ring, selected_ubatch, k_fmt, v_fmt);
-        let packing_margin = resident_weight_packing_margin(fp.dense);
+        let runtime_reserve = scope.runtime_reserve_override_bytes.unwrap_or_else(|| {
+            runtime_reserve_at(cfg, &caps, want_ctx, ring, selected_ubatch, k_fmt, v_fmt)
+        });
         let load_driver_reserve = session_load_driver_reserve(cfg, ec);
-        let Some(mut plan) = ModelMemoryPlan::new_with_dynamic_reserve(
-            room,
-            fp.dense,
-            persistent_state,
-            runtime_reserve,
-            dynamic_kv_reserve,
-            packing_margin,
-            load_driver_reserve,
-            POST_KV_DEVICE_RESERVE,
-        ) else {
-            return Err(anyhow!(
-                "this MoE model's dense weights ({:.2} GiB) + KV cache ({:.2} GiB) exceed the unified \
-                 VRAM room ({:.2} GiB after guard/reserve/configured cap) — dense layer streaming \
-                 does not cover MoE models' dense parts; reduce ctx or run on the CPU backend \
-                 (INFR_DEV=cpu)",
-                fp.dense as f64 / GIB_F64,
-                kv_bytes as f64 / GIB_F64,
-                room as f64 / GIB_F64,
-            ));
+        let build_plan = |resident_dense: u64| {
+            ModelMemoryPlan::new_with_dynamic_reserve(
+                room,
+                resident_dense,
+                persistent_state,
+                runtime_reserve,
+                dynamic_kv_reserve,
+                resident_weight_packing_margin(resident_dense),
+                load_driver_reserve,
+                POST_KV_DEVICE_RESERVE,
+            )
         };
+        let mut plan = match build_plan(resident_dense) {
+            Some(plan) => plan,
+            // FALLBACK: the per-rank dense copy cannot stay resident (the EP case, where the plan
+            // used to refuse the model with `room = 0`). Route the streamable groups to the host
+            // tier — the dense streaming block below is gated on `ep_dense_stream`, which is why
+            // this arm only exists when it is set. `INFR_EP_DENSE_STREAM=1` forces the streamed
+            // placement outright (A/B only).
+            None if streamable_dense > 0 => {
+                let streamed = fp.dense.saturating_sub(streamable_dense);
+                tracing::warn!(
+                    "MoE dense does not fit resident ({:.2} GiB in a {:.2} GiB room) — routing \
+                     {:.2} GiB to the dense streaming tier; {:.2} GiB stays resident per rank",
+                    resident_dense as f64 / GIB_F64,
+                    room as f64 / GIB_F64,
+                    streamable_dense as f64 / GIB_F64,
+                    streamed as f64 / GIB_F64,
+                );
+                resident_dense = streamed;
+                dense_streaming = true;
+                build_plan(resident_dense).ok_or_else(|| {
+                    anyhow!(
+                        "this MoE model's dense weights ({:.2} GiB resident after streaming) + KV \
+                         cache ({:.2} GiB) exceed the unified VRAM room ({:.2} GiB after \
+                         guard/reserve/configured cap); reduce ctx or run on the CPU backend \
+                         (INFR_DEV=cpu)",
+                        resident_dense as f64 / GIB_F64,
+                        kv_bytes as f64 / GIB_F64,
+                        room as f64 / GIB_F64,
+                    )
+                })?
+            }
+            None => {
+                return Err(anyhow!(
+                    "this MoE model's dense weights ({:.2} GiB) + KV cache ({:.2} GiB) exceed the \
+                     unified VRAM room ({:.2} GiB after guard/reserve/configured cap) — dense layer \
+                     streaming does not cover MoE models' dense parts; reduce ctx or run on the CPU \
+                     backend (INFR_DEV=cpu)",
+                    resident_dense as f64 / GIB_F64,
+                    kv_bytes as f64 / GIB_F64,
+                    room as f64 / GIB_F64,
+                ))
+            }
+        };
+        // These are clean GGUF mapping pages used only as the source of fixed GPU uploads. The
+        // bounded Expert arena is populated after those uploads finish, so they are load-time
+        // working set, not a persistent owner of the process RAM budget.
+        reclaimable_fixed_host_source_bytes = resident_dense;
         let requested_cache = cache_override.map(|spec| spec.resolve(vram.available));
         requested_cache_bytes = requested_cache;
         let paged_target_at = |candidate: ModelMemoryPlan| match requested_cache {
@@ -3568,7 +3900,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
             None if candidate.expert_cache_bytes < fp.expert => Some(candidate.expert_cache_bytes),
             None => None,
         };
-        let prefill_floor = moe_prefill_floor_bytes(g, cfg);
+        let prefill_floor = moe_prefill_floor_bytes_scoped(g, cfg, scope);
         let paged_target = paged_target_at(plan);
         if paged_target.is_some_and(|bytes| bytes < prefill_floor) {
             for candidate in moe_ubatch_fallback_candidates(ec).into_iter().skip(1) {
@@ -3579,11 +3911,11 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     runtime_reserve_at(cfg, &caps, want_ctx, ring, candidate, k_fmt, v_fmt);
                 let Some(candidate_plan) = ModelMemoryPlan::new_with_dynamic_reserve(
                     room,
-                    fp.dense,
+                    resident_dense,
                     candidate_persistent,
                     candidate_runtime,
                     dynamic_kv_reserve,
-                    packing_margin,
+                    resident_weight_packing_margin(resident_dense),
                     load_driver_reserve,
                     POST_KV_DEVICE_RESERVE,
                 ) else {
@@ -3608,7 +3940,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
             .map(|rows| {
                 (
                     rows,
-                    runtime_reserve_at(cfg, &caps, want_ctx, ring, rows, k_fmt, v_fmt),
+                    scope.runtime_reserve_override_bytes.unwrap_or_else(|| {
+                        runtime_reserve_at(cfg, &caps, want_ctx, ring, rows, k_fmt, v_fmt)
+                    }),
                 )
             })
             .collect();
@@ -3616,7 +3950,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let auto_budget = plan.expert_cache_bytes;
         match cache_override {
             Some(spec) => {
-                n_paged = cfg.n_layer;
+                n_paged = scope.len();
                 // Legacy expert-only override remains supported, but cannot punch through the new
                 // total-process budget or the physical allocator ceiling. Percent keeps its old
                 // AVAILABLE-VRAM base for compatibility.
@@ -3635,7 +3969,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 // Page EVERY expert layer with the WHOLE remainder. A shared LRU arena keeps hot
                 // experts from every layer and is strictly more flexible than pinning a prefix of
                 // complete layers.
-                n_paged = cfg.n_layer;
+                n_paged = scope.len();
                 expert_cache_target_bytes = auto_budget;
             }
             None => {}
@@ -3650,6 +3984,35 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 "MoE resident placement: lowered the Prefill chunk from {initial_ubatch} to \
                  {selected_ubatch} rows so the complete expert payload remains resident"
             );
+        }
+        // Fully-resident MoE placement (`n_paged == 0`): the expert payload and the chunk's runtime
+        // workspace share VRAM, and a wide chunk's workspace is large enough to displace the payload
+        // — every later chunk then re-reads the displaced experts from host memory one layer at a
+        // time. The branch above only covers the case where the viability fallback ALREADY lowered
+        // the height; when the priced height and the initial one agree (the common fully-resident
+        // case) nothing corrects it and the engine ships the wide chunk. Measured on a dual RX 7900
+        // XTX (IQ3_XXS Qwen3.8-Flash-Next, 47 GB + 29 GB PLE, RADV, `INFR_PIPELINE`):
+        //   1911-token prompt: 651 t/s @1024 rows, 230 @2048, 197 @4096
+        //   3980-token prompt: 750 t/s @1024 rows,  70 @4096
+        // and the 2048/4096 runs carry exactly 48 stalls of 160-200 ms — one per layer — which are
+        // the whole slowdown. An explicit `--ubatch`/`INFR_UBATCH` still wins over this cap (see
+        // `ubatch_rows`), so the taller heights remain reachable for A/B.
+        if n_paged == 0 && fp.expert > 0 {
+            const RESIDENT_MOE_PREFILL_CAP: usize = 1024;
+            let capped = selected_ubatch.min(RESIDENT_MOE_PREFILL_CAP);
+            if capped != selected_ubatch {
+                cap_moe_ubatch(capped);
+                tracing::warn!(
+                    "MoE resident placement: capped the Prefill chunk from {selected_ubatch} to \
+                     {capped} rows so the resident expert payload is not displaced by the chunk's \
+                     own runtime workspace (measured 3-10x slower above this height)"
+                );
+            } else {
+                tracing::info!(
+                    "MoE resident placement: Prefill chunk {selected_ubatch} rows is within the \
+                     resident-expert cap ({RESIDENT_MOE_PREFILL_CAP})"
+                );
+            }
         }
         if n_paged > 0 {
             // Runtime scratch and Experts now share one physical elastic arena. The planner still
@@ -3736,7 +4099,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let mut pool_blocks: Vec<(Role, usize, usize)> = Vec::new();
         let mut host_banks: Vec<(usize, Role, usize)> = Vec::new();
         for t in g.tensors() {
-            let Some(layer) = exps_layer(&t.name).filter(|&l| l < n_paged) else {
+            let Some(layer) = exps_layer(&t.name).filter(|&l| scope.contains(l)) else {
                 continue; // not a paged layer's `_exps` tensor
             };
             let Some(role) = moe_role_of(&t.name) else {
@@ -3866,10 +4229,25 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // below then sizes the elastic arena from the driver's measured remainder.
             let provisional_plan =
                 pager_memory_plan.expect("n_paged > 0 carries its provisional memory plan");
-            let physical_pool_floors = moe_pool_slot_floors(&logical_pools, n_expert);
-            let physical_pool_floor = moe_pool_physical_floor_bytes(&logical_pools, n_expert)
+            let physical_pool_floors: Vec<usize> = scope.min_slots_per_pool.map_or_else(
+                || moe_pool_slot_floors(&logical_pools, n_expert),
+                |minimum| {
+                    logical_pools
+                        .iter()
+                        .map(|&(_, n_blocks, _)| minimum.min(n_blocks).max(1))
+                        .collect()
+                },
+            );
+            let physical_pool_floor = logical_pools
+                .iter()
+                .zip(&physical_pool_floors)
+                .try_fold(0u64, |sum, (&(slot_bytes, ..), &slots)| {
+                    sum.checked_add((slot_bytes as u64).checked_mul(slots as u64)?)
+                })
                 .ok_or_else(|| anyhow!("MoE physical pool floor size overflow"))?;
-            let prefill_min_lane_bytes = moe_prefill_min_lane_bytes(g, cfg);
+            let prefill_min_lane_bytes = scope
+                .prefill_min_lane_override_bytes
+                .unwrap_or_else(|| moe_prefill_min_lane_bytes(g, cfg, scope));
             let planned_pager_budget = pager_budget_bytes;
             let adaptive_arena = cache_override.is_none();
             // Resolve the Host tier only after the physical device arena exists. In particular,
@@ -3910,7 +4288,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // may lower that target to fit the Expert-cache share, but never spends the runtime
             // reserve priced for the selected Prefill chunk. Pure Attention models retain their
             // established all-layer target.
-            let prefill_target_lanes = moe_prefill_target_lanes(cfg, n_paged);
+            let prefill_target_lanes = moe_prefill_target_lanes(cfg, scope);
             let pending = pending_moe_registrations.clone();
             finish_fixed_allocations = Some(Box::new(move || {
                 // Staging is part of the load, not the steady-state layout. Free it before the
@@ -3940,7 +4318,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         // mapped allocation can change WDDM's reported commit even after the empty
                         // probe is dropped, so reusing the first snapshot would only repeat the same
                         // over-sized request with a smaller runtime corridor.
-                        let live_alloc_room = vk.alloc_room();
+                        let live_alloc_room =
+                            vk.alloc_room().saturating_sub(scope.vram_reserve_bytes);
                         let measured_room = live_alloc_room.saturating_sub(POST_KV_DEVICE_RESERVE);
                         last_measured_room = measured_room;
                         let elastic_reserve = dynamic_state_reserve.saturating_add(runtime_reserve);
@@ -3960,6 +4339,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                             candidate_budget,
                             n_expert,
                             size_cache_bias,
+                            Some(&physical_pool_floors),
                         ) else {
                             return Ok(None);
                         };
@@ -3993,6 +4373,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                                                 probe_budget,
                                                 n_expert,
                                                 size_cache_bias,
+                                                Some(&physical_pool_floors),
                                             ) else {
                                                 return false;
                                             };
@@ -4042,6 +4423,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                                 candidate_budget,
                                 n_expert,
                                 size_cache_bias,
+                                Some(&physical_pool_floors),
                             ) else {
                                 last_layout_error = Some(format!(
                                     "ubatch {rows}: MoE arena budget ({:.2} MiB) cannot hold one \
@@ -4073,34 +4455,52 @@ pub(crate) fn vulkan_moe_binder<'a>(
                                 })
                                 .collect();
 
-                            let failure = match vk.prepare_moe_unified_vram(
-                                &specs,
-                                dynamic_state_reserve,
-                                dynamic_state_max_allocation_bytes,
-                                prefill_min_lane_bytes,
-                                runtime_reserve,
-                            ) {
-                                Ok(committed) => {
-                                    debug_assert_eq!(committed as u64, physical_bytes);
-                                    let live_room = vk.alloc_room();
-                                    if live_room >= POST_KV_DEVICE_RESERVE {
+                            let failure = if scope.private_unified_arena {
+                                match vk.validate_moe_unified_vram(
+                                    &specs,
+                                    dynamic_state_reserve,
+                                    dynamic_state_max_allocation_bytes,
+                                    prefill_min_lane_bytes,
+                                    runtime_reserve,
+                                ) {
+                                    Ok(committed) => {
+                                        debug_assert_eq!(committed as u64, physical_bytes);
                                         break Some((candidate_slots, physical_bytes));
                                     }
-                                    let shortfall = POST_KV_DEVICE_RESERVE - live_room;
-                                    vk.discard_empty_moe_unified_vram().map_err(|e| {
-                                        anyhow!("discarding MoE allocation probe: {e}")
-                                    })?;
-                                    (
-                                        shortfall,
-                                        format!(
-                                        "the arena left {:.2} MiB live, {:.2} MiB short of the \
-                                         post-load reserve",
-                                        live_room as f64 / MIB_F64,
-                                        shortfall as f64 / MIB_F64,
-                                    ),
-                                    )
+                                    Err(error) => (0, error.to_string()),
                                 }
-                                Err(error) => (0, error.to_string()),
+                            } else {
+                                match vk.prepare_moe_unified_vram(
+                                    &specs,
+                                    dynamic_state_reserve,
+                                    dynamic_state_max_allocation_bytes,
+                                    prefill_min_lane_bytes,
+                                    runtime_reserve,
+                                ) {
+                                    Ok(committed) => {
+                                        debug_assert_eq!(committed as u64, physical_bytes);
+                                        let live_room = vk
+                                            .alloc_room()
+                                            .saturating_sub(scope.vram_reserve_bytes);
+                                        if live_room >= POST_KV_DEVICE_RESERVE {
+                                            break Some((candidate_slots, physical_bytes));
+                                        }
+                                        let shortfall = POST_KV_DEVICE_RESERVE - live_room;
+                                        vk.discard_empty_moe_unified_vram().map_err(|e| {
+                                            anyhow!("discarding MoE allocation probe: {e}")
+                                        })?;
+                                        (
+                                            shortfall,
+                                            format!(
+                                                "the arena left {:.2} MiB live, {:.2} MiB short of \
+                                                 the post-load reserve",
+                                                live_room as f64 / MIB_F64,
+                                                shortfall as f64 / MIB_F64,
+                                            ),
+                                        )
+                                    }
+                                    Err(error) => (0, error.to_string()),
+                                }
                             };
 
                             if !adaptive_arena {
@@ -4314,7 +4714,11 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     ),
                 }
 
-                let pool_floors = moe_pool_batch_slot_floors(&logical_pools, n_expert);
+                let pool_floors = if scope.min_slots_per_pool.is_some() {
+                    physical_pool_floors.clone()
+                } else {
+                    moe_pool_batch_slot_floors(&logical_pools, n_expert)
+                };
                 let pools: Vec<infr_vulkan::pager::MoePoolSpec> = logical_pools
                     .iter()
                     .zip(slot_counts)
@@ -4406,6 +4810,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     // Runtime remains fixed at the high end; live KV allocations are enforced by
                     // the unified allocator when the ring is built.
                     prefill_cache_bytes: physical_bytes.saturating_sub(runtime_reserve),
+                    reuse_existing: scope.reuse_existing_arena,
+                    private_unified_arena: scope.private_unified_arena,
                 })
                 .map_err(|e| anyhow!("{e}"))?;
 
@@ -4449,62 +4855,13 @@ pub(crate) fn vulkan_moe_binder<'a>(
         std::collections::HashMap::new();
     // The tier BELOW VRAM, one entry per dense pool (empty = none: every miss reads the mmap).
     let mut dense_host: Vec<Option<std::sync::Arc<infr_core::hostpager::HostPager>>> = Vec::new();
-    if first_load && cfg.moe.is_none() {
-        let fuse_gu = runner::fuse_gu_decision(vk.capabilities().combined_gu, g, cfg);
-        let fuse_qkv = runner::fuse_qkv_decision(vk.capabilities().combined_gu, g, cfg, ec);
+    if first_load && (cfg.moe.is_none() || dense_streaming) {
         // Candidate groups in LAYER ORDER — the cyclic-sweep schedule key. Key = names[0] (what
-        // `bind_weight` receives for the group).
-        let mut groups: Vec<Vec<String>> = Vec::new();
-        for l in 0..cfg.n_layer {
-            let p = |s: &str| format!("blk.{l}.{s}");
-            if !cfg.permute_qk_neox {
-                if fuse_qkv {
-                    groups.push(vec![
-                        p("attn_q.weight"),
-                        p("attn_k.weight"),
-                        p("attn_v.weight"),
-                    ]);
-                } else {
-                    groups.push(vec![p("attn_q.weight")]);
-                    groups.push(vec![p("attn_k.weight")]);
-                    groups.push(vec![p("attn_v.weight")]);
-                }
-            } else if !fuse_qkv {
-                // Permuted q/k stay resident (their upload bytes are load-time rewrites of the
-                // mmap); v uploads raw and can still stream.
-                groups.push(vec![p("attn_v.weight")]);
-            }
-            groups.push(vec![p("attn_output.weight")]);
-            if fuse_gu {
-                groups.push(vec![p("ffn_gate.weight"), p("ffn_up.weight")]);
-            } else {
-                groups.push(vec![p("ffn_gate.weight")]);
-                groups.push(vec![p("ffn_up.weight")]);
-            }
-            groups.push(vec![p("ffn_down.weight")]);
-        }
-        let tinfo = |n: &str| g.tensors().iter().find(|t| t.name == n);
-        // Eligible groups with their (dtype, raw bytes, numel) — a group whose tensors are
-        // missing (DeltaNet layers, gemma4 V-less layers) or whose dtype lacks offset-capable
-        // kernels simply stays resident.
-        let eligible: Vec<(Vec<String>, infr_core::DType, usize, usize)> = groups
-            .into_iter()
-            .filter_map(|comps| {
-                let infos: Vec<_> = comps.iter().map(|n| tinfo(n)).collect::<Option<_>>()?;
-                let dt = infos[0].dtype;
-                if !infos.iter().all(|t| t.dtype == dt)
-                    || !infr_vulkan::linear::native_dense_supported(dt)
-                {
-                    return None;
-                }
-                let raw: usize = infos.iter().map(|t| t.nbytes).sum();
-                let numel: usize = infos
-                    .iter()
-                    .map(|t| t.shape.iter().product::<usize>())
-                    .sum();
-                Some((comps, dt, raw, numel))
-            })
-            .collect();
+        // `bind_weight` receives for the group). Shared with the MoE+EP path
+        // (`dense_stream_groups`) so the two enumerations cannot drift; that helper also carries
+        // the hybrid-model entries (attn_qkv / attn_gate / ssm_out / hc_*) the plain set never
+        // covered — which is why flipping this gate alone would have freed almost nothing.
+        let eligible = dense_stream_groups(g, cfg, ec, vk.capabilities().combined_gu);
         let streamable_resident: u64 = eligible
             .iter()
             .map(|(_, dt, raw, numel)| crate::weights::tensor_resident_bytes(*dt, *numel, *raw))
@@ -4556,8 +4913,12 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // explicit INFR_UBATCH disables the sweep (the user's height is authoritative). Runs
         // BEFORE the auto-q8 rung below: a shorter prefill chunk costs only some prefill
         // throughput, while q8 KV costs ~10-16% GQA decode — prefer the cheaper concession.
+        {
+            let (pk, pv) = kv_fmts(kv_auto_q8());
+            dense_fit_probe(cfg, &caps, ec, fp.total(), &vram, want_ctx, ubatch_rows(ec), pk, pv);
+        }
         let mut resident = fits(ubatch_rows(ec), kv_auto_q8());
-        if !resident && !user_pinned_ubatch(ec) && cache_override.is_none() {
+        if !resident && !user_pinned_ubatch(ec) && cache_override.is_none() && !dense_streaming {
             // `dense_resident_rung` walks the shared ladder — the SAME walk `kv_fit_ctx_for` makes
             // to decide a context fits, so the rung it lands on here is the rung that math priced.
             // Its first entry is the height `resident` above already priced and rejected.
@@ -4637,7 +4998,14 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let stride_of = |dt: infr_core::DType, raw: usize| {
             raw.next_multiple_of(lcm(infr_gguf::block_layout(dt).1, 4))
         };
-        let streamed_fixed = fp.total().saturating_sub(streamable_resident);
+        // MoE+EP: the expert band is budgeted separately (its own arena), so the figure to stream
+        // against is the RESIDENT DENSE bytes — `fp.total()` here would count all ~40 GiB of
+        // experts and collapse the arena to nothing.
+        let streamed_fixed = if dense_streaming {
+            resident_dense
+        } else {
+            fp.total().saturating_sub(streamable_resident)
+        };
         let budget = match cache_override {
             Some(spec) => {
                 let requested = spec.resolve(vram.available);
@@ -4884,7 +5252,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
             .map_err(|e| anyhow!("{e}"))?;
             return Ok((placeholder, dt));
         }
-        if let Some(l) = exps_layer(name).filter(|&l| l < n_paged) {
+        if let Some(l) = exps_layer(name).filter(|&l| scope.contains(l)) {
             if let (WBytes::Mmap(bytes), Some(role)) = (&tb, moe_role_of(name)) {
                 let n_expert = cfg
                     .moe
@@ -4901,7 +5269,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     .alloc_uninit(4, BufferUsage::Weights)
                     .map_err(|e| anyhow!("{e}"))?;
                 let buf_id = infr_vulkan::pager::buffer_identity(placeholder.as_ref());
-                let layer_base = (l * n_expert) as u32;
+                let layer_base = (scope.local(l) * n_expert) as u32;
                 let bank = std::sync::Arc::new(bytes.clone())
                     as std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>;
                 let host_offset = *moe_host_offsets.get(&(l, role)).ok_or_else(|| {
@@ -4919,7 +5287,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     infr_vulkan::pager::Role::Up => 1,
                     infr_vulkan::pager::Role::Down => 2,
                 };
-                let block_base = (role_idx * n_paged * n_expert + l * n_expert) as u32;
+                let block_base =
+                    (role_idx * n_paged * n_expert + scope.local(l) * n_expert) as u32;
                 let file = Some(infr_core::blockio::BlockDesc {
                     id: block_base,
                     extents: vec![infr_core::blockio::BlockExtent { offset: base, len }],
@@ -5011,9 +5380,17 @@ fn open_vulkan_devices(
 /// diffusion-gemma with a clear per-flag message (`label` = the env var). Expert parallelism has
 /// its own guard (it REQUIRES MoE).
 fn dense_multi_gpu_guard(cfg: &Config, label: &str) -> AResult<()> {
-    if cfg.moe.is_some() {
+    // MoE is allowed on the LAYER-SPLIT path only. `pipeline_binder` places every `blk.{l}.*`
+    // weight — INCLUDING the `ffn_{gate,up,down}_exps` banks — on layer `l`'s device by name, and
+    // the graph the runner builds is the plain RESIDENT MoE graph (no pager: `n_paged` is decided
+    // inside `vulkan_moe_binder`, which this path never calls). So each device holds half the
+    // layers' experts + half the layers' dense weights instead of EP's "half the experts, ALL the
+    // dense replicated" — the shape that actually fits 2x24 GiB. TP still rejects MoE: its binder
+    // has no `ffn_*_exps` role, so the banks would be replicated and blow VRAM.
+    if cfg.moe.is_some() && label != "INFR_PIPELINE" {
         return Err(anyhow!(
-            "{label} supports dense models only; this is an MoE model — use INFR_EXPERT_PARALLEL"
+            "{label} supports dense models only; this is an MoE model — use INFR_EXPERT_PARALLEL \
+             or INFR_PIPELINE"
         ));
     }
     if cfg.qwen35 {
@@ -5101,6 +5478,16 @@ fn pipeline_binder<'a>(pb: &'a infr_vulkan::PipelineBackend) -> Box<BindWeight<'
         let d = pb.device_for_weight(name);
         let bytes = tb.materialize();
         let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
+        if name == "token_embd.weight" {
+            // The trunk gathers this table on device 0, while the detached MTP head runs on the
+            // tail device so it can share the resident lm_head there. Keep one native-dtype copy
+            // per lane; a single-device binding would force every unrolled draft step back across
+            // the pipeline boundary.
+            let buf = pb
+                .upload_replicated(&padded, BufferUsage::Weights)
+                .map_err(|e| anyhow!("{e}"))?;
+            return Ok((buf, dt));
+        }
         let buf = pb
             .backend(d)
             .alloc_uninit(padded.len(), BufferUsage::Weights)
@@ -5112,30 +5499,478 @@ fn pipeline_binder<'a>(pb: &'a infr_vulkan::PipelineBackend) -> Box<BindWeight<'
     })
 }
 
-/// Multi-GPU PIPELINE (layer-split) dense generation — the layers of ONE model are split across
-/// the `devices` (a physical index list, e.g. `[0, 1]`), each layer's weights + KV resident on its
-/// device, the residual hidden state handed across at the split (P2P dma-buf when available, else
-/// host-bounce). The forward is BIT-IDENTICAL to the same model run single-device (identical ops +
-/// per-device kernels; only the boundary residual crosses via a value-preserving copy).
+/// Pipeline trunk binder with an optional per-lane MoE pager on the first device.
 ///
-/// Dense attention models only (Qwen3/Llama/Gemma-dense); MoE / qwen35 DeltaNet / gemma E2B / the
-/// paged + streamed weight tiers are rejected with a clear message (they need per-layer placement
-/// work beyond this slice). Runs one-shot (a single conversation, no slot pool).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn generate_dense_vulkan_pipeline(
+/// The default remains [`pipeline_binder`]'s fully-resident placement. When
+/// `INFR_PIPELINE_MOE_PAGER=1`, the first lane's expert banks are diverted through a scoped
+/// [`vulkan_moe_binder_scoped`] pager; `INFR_PIPELINE_MOE_RESERVE_MB` bytes of that lane's VRAM
+/// budget are left unallocated so the stage-0 MTP head can live beside the target trunk. The
+/// remaining lanes continue to use the ordinary resident pipeline upload.
+fn pipeline_moe_binder<'a>(
+    pb: &'a infr_vulkan::PipelineBackend,
+    g: &'a Gguf,
+    cfg: &'a Config,
+    ec: &EngineConfig,
+    first_load: bool,
+    want_ctx: usize,
+) -> AResult<(Box<BindWeight<'a>>, Option<Box<FinishFixedAllocations<'a>>>)> {
+    if std::env::var_os("INFR_PIPELINE_MOE_PAGER").is_none() || !first_load {
+        return Ok((pipeline_binder(pb), None));
+    }
+    let reserve_mb = std::env::var("INFR_PIPELINE_MOE_RESERVE_MB")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let ranges = pb.layer_ranges();
+    let mut lane_binders: Vec<Option<Box<BindWeight<'a>>>> =
+        (0..ranges.len()).map(|_| None).collect();
+    let mut hooks = Vec::new();
+    for (device, range) in ranges.iter().enumerate() {
+        // EVERY device gets its own scoped MoE lane, not just device 0. A pinned-resident tail
+        // device spends its VRAM on expert banks it reads sparsely; turning them into paged slots
+        // hands that VRAM to the device's own page cache instead, which is where a decode actually
+        // benefits (measured: one pinned band left the paged head device with an 18.85 GiB arena
+        // for a 40 GiB expert store, and every decode token paid ~0.22 GB of PCIe fetches).
+        if range.is_empty() {
+            continue;
+        }
+        let scope = MoeLayerScope {
+            start: range.start,
+            end: range.end,
+            vram_reserve_bytes: reserve_mb.saturating_mul(1024 * 1024),
+            cache_override_bytes: None,
+            min_slots_per_pool: None,
+            runtime_reserve_override_bytes: None,
+            dynamic_state_reserve_override_bytes: None,
+            prefill_min_lane_override_bytes: None,
+            reuse_existing_arena: false,
+            private_unified_arena: false,
+        };
+        let (bind, hook) = vulkan_moe_binder_scoped(
+            pb.backend(device),
+            g,
+            cfg,
+            ec,
+            true,
+            want_ctx,
+            scope,
+        )?;
+        lane_binders[device] = Some(bind);
+        if let Some(hook) = hook {
+            hooks.push(hook);
+        }
+    }
+    let fallback = pipeline_binder(pb);
+    let bind: Box<BindWeight<'a>> = Box::new(move |name, tb, dt, numel| {
+        let device = pb.device_for_weight(name);
+        if let Some(lane) = lane_binders[device].as_ref() {
+            if moe_role_index(name).is_some() {
+                let (buf, dt) = lane(name, tb, dt, numel)?;
+                return Ok((infr_vulkan::PipelineBuffer::single(device, buf), dt));
+            }
+        }
+        fallback(name, tb, dt, numel)
+    });
+    let finish: Option<Box<FinishFixedAllocations<'a>>> = if hooks.is_empty() {
+        None
+    } else {
+        Some(Box::new(move || {
+            for hook in &hooks {
+                hook()?;
+            }
+            Ok(())
+        }))
+    };
+    Ok((bind, finish))
+}
+
+/// The MTP head's OWN weights (`blk.48.*` of the sidecar) for the LAYER-SPLIT pipeline.
+///
+/// Every tensor the head owns goes on the LAST device, where the trunk's resident lm_head already
+/// lives. The head's unrolled draft graph performs an embed-gather, a head layer, an lm_head, and
+/// an argmax per step; co-locating all of those keeps its device assignment monotonic and uses the
+/// trunk's own resident lm_head, so no 1.3 GiB mirror is needed. `token_embd` is replicated by
+/// [`pipeline_binder`], which supplies the tail-device gather without moving the trunk's first op
+/// off device 0.
+///
+/// The head's MoE EXPERT BANKS (2.49 GiB of a 2.58 GiB head — the entire reason MTP cannot fit
+/// beside a 256K-resident trunk, which leaves ~1.5 GiB across both cards) go to
+/// [`BufferUsage::HostWeights`]: system RAM the expert kernels still read through a device address.
+/// A draft touches only its ~10/512 routed experts per row, so the bus read is ~50 MiB per draft
+/// cycle — free next to the forward it is drafting for.
+fn pipeline_head_binder<'a>(pb: &'a infr_vulkan::PipelineBackend) -> Box<BindWeight<'a>> {
+    Box::new(move |name: &str, tb: WBytes, dt: DType, numel: usize| {
+        if !chunk_covered_dense_tensor(name) {
+            check_bda_element_cap(name, "tensor", numel)?;
+        }
+        // `INFR_MTP_EXPS_VRAM=1`: keep the head's expert banks in device-local VRAM instead of the
+        // default GTT system RAM. The bank is ~2.5 GiB; the draft only reads ~10 of 512 experts per
+        // row, so the system-RAM path pays far more in bus latency than in bytes.
+        let usage = if name.contains("_exps.weight")
+            && std::env::var_os("INFR_MTP_EXPS_VRAM").is_none()
+        {
+            BufferUsage::HostWeights
+        } else {
+            BufferUsage::Weights
+        };
+        let device = pb.head_device().unwrap_or_else(|| {
+            if std::env::var_os("INFR_MTP_STAGE0").is_some() {
+                pb.first_device()
+            } else {
+                pb.last_device()
+            }
+        });
+        let bytes = tb.materialize();
+        let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
+        let buf = pb
+            .backend(device)
+            .alloc_uninit(padded.len(), usage)
+            .map_err(|e| anyhow!("{e}"))?;
+        pb.backend(device)
+            .upload(buf.as_ref(), &padded)
+            .map_err(|e| anyhow!("{e}"))?;
+        Ok((infr_vulkan::PipelineBuffer::single(device, buf), dt))
+    })
+}
+
+fn mtp_exps_cache_bytes(vk: &infr_vulkan::VulkanBackend) -> Option<u64> {
+    if let Some(mb) = std::env::var("INFR_MTP_EXPS_CACHE_MB")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Some(mb.saturating_mul(1024 * 1024));
+    }
+    let raw = std::env::var("INFR_MTP_EXPS_CACHE").ok()?;
+    let spec = infr_core::parse_size(&raw)?;
+    Some(spec.resolve(vk.vram().available))
+}
+
+/// Bind the detached MTP head with an optional small VRAM expert cache.
+///
+/// The default remains [`pipeline_head_binder`] / the single-device upload. With
+/// `INFR_MTP_EXPS_CACHE[_MB]`, the head's three expert banks are registered with a one-layer
+/// pager on the head device and only the configured hot-expert window stays in VRAM; the rest is
+/// sourced from the sidecar's full host store. This is deliberately separate from the trunk
+/// pager: the head cache must not overwrite a trunk pager session on the same backend.
+pub(crate) fn bind_head_with_cache<'a>(
+    be: &'a dyn Backend,
+    sidecar: &'a Gguf,
+    cfg: &'a Config,
+    ec: &'a EngineConfig,
+    want_ctx: usize,
+) -> AResult<(Box<BindWeight<'a>>, Option<Box<FinishFixedAllocations<'a>>>)> {
+    if let Some(tp) = be
+        .backend_any()
+        .and_then(|a| a.downcast_ref::<infr_vulkan::TensorParallelBackend>())
+    {
+        return Ok((tensor_parallel_binder(tp, cfg), None));
+    }
+    if let Some(ep) = be
+        .backend_any()
+        .and_then(|a| a.downcast_ref::<infr_vulkan::ExpertParallelBackend>())
+    {
+        return Ok((expert_parallel_binder(ep, cfg), None));
+    }
+    if std::env::var_os("INFR_MTP_EXPS_CACHE").is_none()
+        && std::env::var_os("INFR_MTP_EXPS_CACHE_MB").is_none()
+    {
+        return Ok((bind_head(be)?, None));
+    }
+    if std::env::var_os("INFR_PIPELINE_MOE_PAGER").is_some() {
+        return Err(anyhow!(
+            "INFR_MTP_EXPS_CACHE and INFR_PIPELINE_MOE_PAGER cannot share one Vulkan backend"
+        ));
+    }
+    let head_min_slots = std::env::var("INFR_MTP_CACHE_MIN_SLOTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .or(Some(160));
+    let scope = |cache_bytes| MoeLayerScope {
+        start: cfg.n_layer,
+        end: cfg.n_layer.saturating_add(1),
+        vram_reserve_bytes: 0,
+        cache_override_bytes: Some(cache_bytes),
+        // A whole MTP layer is 512 experts per role, far more than one draft batch touches. Keep
+        // the one-batch working set resident so a small hot-expert cache can actually open.
+        min_slots_per_pool: head_min_slots,
+        runtime_reserve_override_bytes: Some(64 * 1024 * 1024),
+        dynamic_state_reserve_override_bytes: Some(64 * 1024 * 1024),
+        prefill_min_lane_override_bytes: Some(0),
+        reuse_existing_arena: true,
+        private_unified_arena: true,
+    };
+    if let Some(pb) = be
+        .backend_any()
+        .and_then(|a| a.downcast_ref::<infr_vulkan::PipelineBackend>())
+    {
+        let device = pb.head_device().unwrap_or_else(|| {
+            if std::env::var_os("INFR_MTP_STAGE0").is_some() {
+                pb.first_device()
+            } else {
+                pb.last_device()
+            }
+        });
+        let cache_bytes = mtp_exps_cache_bytes(pb.backend(device)).ok_or_else(|| {
+            anyhow!("INFR_MTP_EXPS_CACHE must be a byte size or percentage")
+        })?;
+        let (lane, hook) = vulkan_moe_binder_scoped(
+            pb.backend(device),
+            sidecar,
+            cfg,
+            ec,
+            true,
+            want_ctx,
+            scope(cache_bytes),
+        )?;
+        let bind: Box<BindWeight<'a>> = Box::new(move |name, tb, dt, numel| {
+            let (buf, dt) = lane(name, tb, dt, numel)?;
+            Ok((infr_vulkan::PipelineBuffer::single(device, buf), dt))
+        });
+        return Ok((bind, hook));
+    }
+    if let Some(vk) = be
+        .backend_any()
+        .and_then(|a| a.downcast_ref::<infr_vulkan::VulkanBackend>())
+    {
+        let cache_bytes = mtp_exps_cache_bytes(vk)
+            .ok_or_else(|| anyhow!("INFR_MTP_EXPS_CACHE must be a byte size or percentage"))?;
+        let (bind, hook) = vulkan_moe_binder_scoped(
+            vk,
+            sidecar,
+            cfg,
+            ec,
+            true,
+            want_ctx,
+            scope(cache_bytes),
+        )?;
+        return Ok((bind, hook));
+    }
+    Err(anyhow!(
+        "MTP head cache binder: unsupported backend `{}`",
+        be.name()
+    ))
+}
+
+/// The TRUNK binder for any seam backend — the one dispatcher MTP needs to run on a layer split.
+/// The pipeline binders its own resident weights ([`pipeline_binder`]) and needs no deferred
+/// fixed-allocation hook (there is no pager on that path); every single-device backend keeps
+/// [`vulkan_moe_binder`] (expert placement / pager / the deferred hook).
+pub(crate) fn bind_trunk<'a>(
+    be: &'a dyn Backend,
+    g: &'a Gguf,
+    cfg: &'a Config,
+    ec: &'a EngineConfig,
+    first_load: bool,
+    want_ctx: usize,
+) -> AResult<(Box<BindWeight<'a>>, Option<Box<FinishFixedAllocations<'a>>>)> {
+    if let Some(tp) = be
+        .backend_any()
+        .and_then(|a| a.downcast_ref::<infr_vulkan::TensorParallelBackend>())
+    {
+        if !first_load {
+            return Ok((
+                Box::new(|name: &str, _tb, _dt, _n| {
+                    Err(anyhow!("warm TP trunk must not re-bind {name}"))
+                }),
+                None,
+            ));
+        }
+        return Ok((tensor_parallel_binder(tp, cfg), None));
+    }
+    if let Some(ep) = be
+        .backend_any()
+        .and_then(|a| a.downcast_ref::<infr_vulkan::ExpertParallelBackend>())
+    {
+        if !first_load {
+            return Ok((
+                Box::new(|name: &str, _tb, _dt, _n| {
+                    Err(anyhow!("warm EP trunk must not re-bind {name}"))
+                }),
+                None,
+            ));
+        }
+        return Ok((expert_parallel_binder(ep, cfg), None));
+    }
+    if let Some(pb) = be
+        .backend_any()
+        .and_then(|a| a.downcast_ref::<infr_vulkan::PipelineBackend>())
+    {
+        if first_load && cfg.moe.is_some() {
+            return pipeline_moe_binder(pb, g, cfg, ec, first_load, want_ctx);
+        }
+        // Warm trunk: its weights are already resident, so never re-bind — mirrors
+        // `generate_dense_vulkan_pipeline_session`'s warm binder (a re-bind would re-allocate every
+        // weight of the model).
+        let bind: Box<BindWeight<'a>> = if first_load {
+            pipeline_binder(pb)
+        } else {
+            Box::new(|name: &str, _tb, _dt, _n| {
+                Err(anyhow!("warm pipeline trunk must not re-bind {name}"))
+            })
+        };
+        return Ok((bind, None));
+    }
+    let vk = be
+        .backend_any()
+        .and_then(|a| a.downcast_ref::<infr_vulkan::VulkanBackend>())
+        .ok_or_else(|| anyhow!("MTP trunk binder: unsupported backend `{}`", be.name()))?;
+    vulkan_moe_binder(vk, g, cfg, ec, first_load, want_ctx)
+}
+
+/// The MTP head's own weights for ANY seam backend (see [`pipeline_head_binder`] for the layer
+/// split): the pipeline wraps every tensor as a device-0 [`PipelineBuffer`], a single-device
+/// backend allocates straight on it.
+pub(crate) fn bind_head(be: &dyn Backend) -> AResult<Box<BindWeight<'_>>> {
+    if let Some(pb) = be
+        .backend_any()
+        .and_then(|a| a.downcast_ref::<infr_vulkan::PipelineBackend>())
+    {
+        return Ok(pipeline_head_binder(pb));
+    }
+    if let Some(vk) = be
+        .backend_any()
+        .and_then(|a| a.downcast_ref::<infr_vulkan::VulkanBackend>())
+    {
+        return Ok(Box::new(move |_name: &str, tb: WBytes, dt: DType, _numel: usize| {
+            let bytes = tb.materialize();
+            let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
+            let buf = vk
+                .alloc(padded.len(), BufferUsage::Weights)
+                .map_err(|e| anyhow!("{e}"))?;
+            vk.upload(buf.as_ref(), &padded).map_err(|e| anyhow!("{e}"))?;
+            Ok((buf, dt))
+        }));
+    }
+    Err(anyhow!(
+        "MTP head binder: unsupported backend `{}`",
+        be.name()
+    ))
+}
+
+/// The layer-split [`PipelineBackend`] for `devices`: opens ONE real Vulkan backend per device,
+/// balances the layers by weight BYTES (see `PipelineBackend::byte_balanced_layer_map`) and logs
+/// the split. The ONE construction shared by the one-shot `INFR_PIPELINE` path and the pipeline
+/// SESSION (`infr serve` / the `infr run` chat REPL) — a placement fix lands in both at once.
+pub(crate) fn open_pipeline_backend(
     devices: &[usize],
     g: &Gguf,
     cfg: &Config,
     ec: &EngineConfig,
-    token_embd: TokenEmbd<'_>,
-    ple: Option<&PerLayerEmbd>,
-    prompt: &[u32],
-    max_new: usize,
-    on_token: impl FnMut(u32),
-) -> AResult<(Vec<u32>, GenStats)> {
+) -> AResult<infr_vulkan::PipelineBackend> {
     dense_multi_gpu_guard(cfg, "INFR_PIPELINE")?;
     let backends = open_vulkan_devices(devices, ec)?;
-    let layer_map = infr_vulkan::PipelineBackend::balanced_layer_map(cfg.n_layer, backends.len());
+    // Layer-split placement: balanced by weight BYTES, not layer count — see
+    // `PipelineBackend::byte_balanced_layer_map` for the why (mixed-imatrix layers differ by up to
+    // ~1.7x, and the last device alone carries the final norm + LM head + `token_embd`). A count
+    // split OOM'd `INFR_PIPELINE` on Qwen3.8 IQ3_XXS by over-committing the tail device.
+    let layer_map = {
+        let mut per_layer = vec![0u64; cfg.n_layer];
+        // Non-layer weights, by `PipelineBackend::device_for_weight`: `output*` goes to the LAST
+        // device, `token_embd` (and anything else) to device 0.
+        let (mut head, mut tail) = (0u64, 0u64);
+        for t in g.tensors() {
+            // qwen4exp's PLE table is an SSD/mmap host tier, never a resident weight — see
+            // `weights::weight_footprint`, which skips it the same way. Pricing its 26 GiB here
+            // would swamp the split with bytes that never enter VRAM.
+            if t.name == "per_layer_token_embd.weight" {
+                continue;
+            }
+            let numel: usize = t.shape.iter().product();
+            let bytes = crate::weights::tensor_resident_bytes(t.dtype, numel, t.nbytes);
+            match t
+                .name
+                .strip_prefix("blk.")
+                .and_then(|r| r.split('.').next())
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&l| l < cfg.n_layer)
+            {
+                Some(l) => per_layer[l] += bytes,
+                None if t.name.starts_with("output") => tail += bytes,
+                None => head += bytes,
+            }
+        }
+        // Capacity-aware by default: the cards are not equally available (one may drive a display,
+        // and each loses the guard's headroom plus driver overhead), so a uniform byte band can be
+        // one the tighter card cannot actually hold. `INFR_PIPELINE_LAYER_RESERVE_MB` is what each
+        // device keeps back for its runtime scratch / arena — weights get the rest of its
+        // *allocatable* room, which is the same ceiling the VRAM guard enforces.
+        let layer_reserve = std::env::var("INFR_PIPELINE_LAYER_RESERVE_MB")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1024)
+            .saturating_mul(1024 * 1024);
+        let caps = backends
+            .iter()
+            .map(|be| {
+                // `planned_vram_room`, NOT `alloc_room`: the automatic profile (and any explicit
+                // budget/reserve) holds bytes back on top of the guard's own headroom, and the
+                // ALLOCATOR refuses past that same ceiling. Planning against the raw free figure is
+                // what made a "fits" band die on its last weight with ~160 MiB of room left.
+                planned_vram_room(&be.vram(), ec).saturating_sub(layer_reserve)
+            })
+            .collect::<Vec<u64>>();
+        let default = infr_vulkan::PipelineBackend::byte_balanced_layer_map_caps(
+            cfg.n_layer,
+            &per_layer,
+            head,
+            tail,
+            &caps,
+        );
+        if std::env::var_os("INFR_PIPE_TIME").is_some() {
+            let bands = infr_vulkan::PipelineBackend::layer_map_band_bytes(
+                &default,
+                backends.len(),
+                &per_layer,
+                head,
+                tail,
+            );
+            for (device, (cap, band)) in caps.iter().zip(&bands).enumerate() {
+                tracing::info!(
+                    "[pipeline placement] device {device}: {:.2} GiB weight band vs {:.2} GiB \
+                     allocatable ({})",
+                    *band as f64 / (1u64 << 30) as f64,
+                    *cap as f64 / (1u64 << 30) as f64,
+                    if band <= cap { "fits" } else { "OVER" },
+                );
+            }
+        }
+        match std::env::var_os("INFR_PIPELINE_SPLIT") {
+            None => default,
+            Some(spec) => {
+                // Advanced A/B override: `INFR_PIPELINE_SPLIT=26,22` pins the number of layers on
+                // each pipeline device, overriding the byte-balanced default. Useful when decode
+                // speed, not weight footprint, decides the best boundary.
+                let spec = spec.to_string_lossy();
+                let counts = spec
+                    .split(',')
+                    .map(|part| {
+                        part.trim().parse::<usize>().map_err(|_| {
+                            anyhow!(
+                                "INFR_PIPELINE_SPLIT: expected comma-separated layer counts, got \
+                                 `{spec}`"
+                            )
+                        })
+                    })
+                    .collect::<AResult<Vec<_>>>()?;
+                if counts.len() != backends.len()
+                    || counts.iter().any(|&n| n == 0)
+                    || counts.iter().sum::<usize>() != cfg.n_layer
+                {
+                    anyhow::bail!(
+                        "INFR_PIPELINE_SPLIT: expected {} positive counts summing to {}, got \
+                         `{spec}`",
+                        backends.len(),
+                        cfg.n_layer
+                    );
+                }
+                let mut map = Vec::with_capacity(cfg.n_layer);
+                for (device, &count) in counts.iter().enumerate() {
+                    map.extend(std::iter::repeat(device).take(count));
+                }
+                map
+            }
+        }
+    };
     // Placement report: how many layers landed on each physical device.
     let names = backends
         .iter()
@@ -5146,8 +5981,32 @@ pub(crate) fn generate_dense_vulkan_pipeline(
         .collect::<Vec<_>>();
     // `multi.pipeline_p2p` (`INFR_PIPELINE_HOST` inverted): its ABSENCE selects P2P.
     let use_p2p = ec.multi.pipeline_p2p;
-    let pb = infr_vulkan::PipelineBackend::new(backends, layer_map.clone(), use_p2p)
-        .map_err(|e| anyhow!("{e}"))?;
+    // Hybrid SSM/DeltaNet + hyper-connection models put recurrent conv/state and the HC history
+    // buffer under `KvCache` usage, which breaks the per-layer `(k,v)` pair placement — see
+    // `PipelineBackend::replicate_kv`. Qwen3.8 (`qwen4exp`, hc_mult>0 + recurrent layers) is one.
+    let replicate_kv = cfg.hc_mult > 0
+        || cfg.recurrent_state_elems() > 0
+        || cfg.qwen35
+        || cfg.qwen4exp;
+    let mut pb =
+        infr_vulkan::PipelineBackend::new(backends, layer_map.clone(), use_p2p, replicate_kv)
+            .map_err(|e| anyhow!("{e}"))?;
+    if std::env::var_os("INFR_MTP_HEAD_BACKEND").is_some() {
+        let head_physical = if std::env::var_os("INFR_MTP_STAGE0").is_some() {
+            devices[0]
+        } else {
+            *devices
+                .last()
+                .expect("pipeline device list is non-empty")
+        };
+        let mut head = open_vulkan_devices(&[head_physical], ec)?;
+        let head_backend = head.pop().expect("one dedicated head backend");
+        let head_device = pb.attach_head_backend(head_backend);
+        tracing::info!(
+            "pipeline: dedicated MTP head backend on Vulkan{head_physical} (pipeline device \
+             {head_device})"
+        );
+    }
     tracing::info!(
         "pipeline: {}-way layer split of {} layers:",
         devices.len(),
@@ -5170,10 +6029,404 @@ pub(crate) fn generate_dense_vulkan_pipeline(
             _ => tracing::info!("  Vulkan{idx} ({}): (no layers)", names[di]),
         }
     }
+    Ok(pb)
+}
+
+/// Open the 2-way expert-parallel backend used by the persistent session path.
+pub(crate) fn open_expert_parallel_backend(
+    devices: &[usize],
+    cfg: &Config,
+    ec: &EngineConfig,
+) -> AResult<infr_vulkan::ExpertParallelBackend> {
+    let moe = cfg
+        .moe
+        .as_ref()
+        .ok_or_else(|| anyhow!("INFR_EXPERT_PARALLEL requires a routed-expert (MoE) model"))?;
+    let backends = open_vulkan_devices(devices, ec)?;
+    let use_p2p = ec.multi.ep_p2p;
+    infr_vulkan::ExpertParallelBackend::new(backends, moe.n_expert, use_p2p)
+        .map_err(|e| anyhow!("{e}"))
+}
+
+/// Open the Qwen3.8 tensor-parallel backend used by the persistent session path: dense FFN
+/// matrices are tensor-sharded, routed experts are expert-sharded, and attention/recurrent state
+/// stays replicated full-width.
+pub(crate) fn open_qwen4_tensor_parallel_backend(
+    devices: &[usize],
+    cfg: &Config,
+    ec: &EngineConfig,
+) -> AResult<infr_vulkan::TensorParallelBackend> {
+    let n_expert = cfg.moe.as_ref().map(|moe| moe.n_expert).unwrap_or(0);
+    let backends = open_vulkan_devices(devices, ec)?;
+    infr_vulkan::TensorParallelBackend::new_ext(
+        backends,
+        cfg.n_head,
+        cfg.n_kv,
+        cfg.n_ff,
+        n_expert,
+        cfg.qwen4exp,
+        ec.multi.tp_p2p,
+    )
+    .map_err(|e| anyhow!("{e}"))
+}
+
+
+
+/// Multi-GPU PIPELINE (layer-split) dense generation — the layers of ONE model are split across
+/// the `devices` (a physical index list, e.g. `[0, 1]`), each layer's weights + KV resident on its
+/// device, the residual hidden state handed across at the split (P2P dma-buf when available, else
+/// host-bounce). The forward is BIT-IDENTICAL to the same model run single-device (identical ops +
+/// per-device kernels; only the boundary residual crosses via a value-preserving copy).
+///
+/// Dense attention models, and MoE via this path's per-layer placement (see `dense_multi_gpu_guard`:
+/// `pipeline_binder` puts every `blk.{l}.*` weight — expert banks included — on layer `l`'s device,
+/// and the graph is the plain RESIDENT MoE graph, so each device ends up with half the layers'
+/// experts AND half the layers' dense weights — the shape that fits 2x24 GiB). qwen35 DeltaNet /
+/// gemma E2B / diffusion-gemma / the paged + streamed weight tiers are rejected with a clear message
+/// (they need per-layer placement work beyond this slice). Runs one-shot (a single conversation, no
+/// slot pool).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn generate_dense_vulkan_pipeline(
+    devices: &[usize],
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    max_new: usize,
+    on_token: impl FnMut(u32),
+) -> AResult<(Vec<u32>, GenStats)> {
+    let pb = open_pipeline_backend(devices, g, cfg, ec)?;
     let bind = pipeline_binder(&pb);
     run_dense_oneshot(
         &pb, &*bind, g, cfg, ec, token_embd, ple, prompt, max_new, on_token,
     )
+}
+
+/// Persistent-session twin of [`generate_dense_vulkan_pipeline`]: the SAME layer-split
+/// [`PipelineBackend`] driven through the ordinary seam session runner instead of
+/// `run_dense_oneshot` — weights upload once on the cold call (`state.is_none()`), every later turn
+/// reuses them and prefills only the changed suffix, and each device's KV lives on that device.
+/// This is what gives `infr serve` the multi-device shape it never had.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+/// [`generate_dense_vulkan_session`] or [`generate_dense_vulkan_pipeline_session`], chosen from the
+/// backend the caller holds as a trait object.
+///
+/// The batched seam (`ParallelSeam`) owns its backend as `Arc<dyn Backend>` so ONE engine can serve
+/// either a plain single-device `VulkanBackend` or a layer-split `PipelineBackend`. The two session
+/// generators have identical parameter lists — they differ only in the backend they drive and in
+/// which binder they build — so this one dispatch serves both shapes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_dense_session_for(
+    be: &dyn infr_core::backend::Backend,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    max_new: usize,
+    on_token: impl FnMut(u32),
+    state: &mut Option<SeamKv>,
+    want_ctx: usize,
+    turn_checkpoint: Option<TurnCheckpoint>,
+    constraint: Option<&mut crate::grammar::Constraint>,
+    req: Option<&crate::sampling::RequestCtx>,
+    mm: Option<&MropePlan>,
+) -> AResult<(Vec<u32>, GenStats)> {
+    if let Some(pb) = be
+        .backend_any()
+        .and_then(|any| any.downcast_ref::<infr_vulkan::PipelineBackend>())
+    {
+        return generate_dense_vulkan_pipeline_session(
+            pb,
+            g,
+            cfg,
+            ec,
+            token_embd,
+            ple,
+            prompt,
+            max_new,
+            on_token,
+            state,
+            want_ctx,
+            turn_checkpoint,
+            constraint,
+            req,
+            mm,
+        );
+    }
+    let vk = be
+        .backend_any()
+        .and_then(|any| any.downcast_ref::<infr_vulkan::VulkanBackend>())
+        .ok_or_else(|| anyhow!("a seam session needs a Vulkan device or a layer split"))?;
+    generate_dense_vulkan_session(
+        vk,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        ple,
+        prompt,
+        max_new,
+        on_token,
+        state,
+        want_ctx,
+        turn_checkpoint,
+        constraint,
+        req,
+        mm,
+    )
+}
+
+pub(crate) fn generate_dense_vulkan_pipeline_session(
+    pb: &infr_vulkan::PipelineBackend,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    max_new: usize,
+    on_token: impl FnMut(u32),
+    state: &mut Option<SeamKv>,
+    want_ctx: usize,
+    turn_checkpoint: Option<TurnCheckpoint>,
+    constraint: Option<&mut crate::grammar::Constraint>,
+    req: Option<&crate::sampling::RequestCtx>,
+    mm: Option<&MropePlan>,
+) -> AResult<(Vec<u32>, GenStats)> {
+    // Same warm/cold rule as `generate_dense_vulkan_session`: a warm slot never re-binds, so the
+    // pipeline binder (which re-derives the placement and allocs every weight) is cold-only. No
+    // pager exists on this path, so there is no load reservation to release either.
+    let warm_binder: Box<BindWeight<'_>> =
+        Box::new(|name: &str, _tb, _dt, _n| Err(anyhow!("warm session must not re-bind {name}")));
+    let bind: Box<BindWeight<'_>> = if state.is_some() {
+        warm_binder
+    } else {
+        let _gp = req.and_then(|r| r.gate_pass());
+        pipeline_binder(pb)
+    };
+    let spec_k = spec::spec_width(ec, cfg, req, constraint.is_some());
+    let out = if spec_k >= 2 {
+        spec::generate_spec_backend(
+            pb,
+            &*bind,
+            g,
+            cfg,
+            ec,
+            token_embd,
+            ple,
+            prompt,
+            max_new,
+            on_token,
+            state,
+            want_ctx,
+            turn_checkpoint,
+            req,
+            mm,
+            spec_k,
+        )
+    } else {
+        generate_dense_backend(
+            pb,
+            &*bind,
+            g,
+            cfg,
+            ec,
+            token_embd,
+            ple,
+            prompt,
+            max_new,
+            on_token,
+            state,
+            want_ctx,
+            constraint,
+            None,
+            None,
+            None,
+            None,
+            None,
+            turn_checkpoint,
+            req,
+            None, // deferred fixed-allocation hook
+            mm,
+        )
+    };
+    if out.is_err() {
+        // Mirror the single-device session: a failed forward may already have committed partial
+        // KV, so never hand the half-advanced slot back to the pool as reusable.
+        if let Some(kv) = state.as_mut() {
+            kv.reset();
+        }
+    }
+    out
+}
+
+/// Persistent-session driver for row-parallel dense + expert-parallel MoE execution. The backend
+/// runs every rank concurrently with a full-width reduce after each sharded projection, so a single
+/// `serve` session can use both cards without the layer-split serialization.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_dense_vulkan_ep_session(
+    ep: &infr_vulkan::ExpertParallelBackend,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    max_new: usize,
+    on_token: impl FnMut(u32),
+    state: &mut Option<SeamKv>,
+    want_ctx: usize,
+    turn_checkpoint: Option<TurnCheckpoint>,
+    constraint: Option<&mut crate::grammar::Constraint>,
+    req: Option<&crate::sampling::RequestCtx>,
+    mm: Option<&MropePlan>,
+) -> AResult<(Vec<u32>, GenStats)> {
+    let warm_binder: Box<BindWeight<'_>> =
+        Box::new(|name: &str, _tb, _dt, _n| Err(anyhow!("warm session must not re-bind {name}")));
+    let bind: Box<BindWeight<'_>> = if state.is_some() {
+        warm_binder
+    } else {
+        let _gp = req.and_then(|r| r.gate_pass());
+        expert_parallel_binder(ep, cfg)
+    };
+    let spec_k = spec::spec_width(ec, cfg, req, constraint.is_some());
+    let out = if spec_k >= 2 {
+        spec::generate_spec_backend(
+            ep,
+            &*bind,
+            g,
+            cfg,
+            ec,
+            token_embd,
+            ple,
+            prompt,
+            max_new,
+            on_token,
+            state,
+            want_ctx,
+            turn_checkpoint,
+            req,
+            mm,
+            spec_k,
+        )
+    } else {
+        generate_dense_backend(
+            ep,
+            &*bind,
+            g,
+            cfg,
+            ec,
+            token_embd,
+            ple,
+            prompt,
+            max_new,
+            on_token,
+            state,
+            want_ctx,
+            constraint,
+            None,
+            None,
+            None,
+            None,
+            None,
+            turn_checkpoint,
+            req,
+            None,
+            mm,
+        )
+    };
+    if out.is_err() {
+        if let Some(kv) = state.as_mut() {
+            kv.reset();
+        }
+    }
+    out
+}
+
+/// Persistent-session driver for Qwen3.8 hybrid tensor/expert parallelism.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_dense_vulkan_tp_session(
+    tp: &infr_vulkan::TensorParallelBackend,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    max_new: usize,
+    on_token: impl FnMut(u32),
+    state: &mut Option<SeamKv>,
+    want_ctx: usize,
+    turn_checkpoint: Option<TurnCheckpoint>,
+    constraint: Option<&mut crate::grammar::Constraint>,
+    req: Option<&crate::sampling::RequestCtx>,
+    mm: Option<&MropePlan>,
+) -> AResult<(Vec<u32>, GenStats)> {
+    let warm_binder: Box<BindWeight<'_>> =
+        Box::new(|name: &str, _tb, _dt, _n| Err(anyhow!("warm session must not re-bind {name}")));
+    let bind: Box<BindWeight<'_>> = if state.is_some() {
+        warm_binder
+    } else {
+        let _gp = req.and_then(|r| r.gate_pass());
+        tensor_parallel_binder(tp, cfg)
+    };
+    let spec_k = spec::spec_width(ec, cfg, req, constraint.is_some());
+    let out = if spec_k >= 2 {
+        spec::generate_spec_backend(
+            tp,
+            &*bind,
+            g,
+            cfg,
+            ec,
+            token_embd,
+            ple,
+            prompt,
+            max_new,
+            on_token,
+            state,
+            want_ctx,
+            turn_checkpoint,
+            req,
+            mm,
+            spec_k,
+        )
+    } else {
+        generate_dense_backend(
+            tp,
+            &*bind,
+            g,
+            cfg,
+            ec,
+            token_embd,
+            ple,
+            prompt,
+            max_new,
+            on_token,
+            state,
+            want_ctx,
+            constraint,
+            None,
+            None,
+            None,
+            None,
+            None,
+            turn_checkpoint,
+            req,
+            None,
+            mm,
+        )
+    };
+    if out.is_err() {
+        if let Some(kv) = state.as_mut() {
+            kv.reset();
+        }
+    }
+    out
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -5201,6 +6454,18 @@ fn tp_weight_role(name: &str, cfg: &Config) -> Option<(infr_vulkan::TpRole, usiz
     let ne = cfg.n_embd;
     let qrow = cfg.n_head * cfg.layer_head_dim(l);
     let nff = cfg.layer_n_ff(l);
+    if cfg.qwen4exp {
+        return match after {
+            "ffn_gate" | "ffn_up" | "ffn_gate_shexp" | "ffn_up_shexp" => {
+                Some((infr_vulkan::TpRole::Column, ne))
+            }
+            "ffn_down" => Some((infr_vulkan::TpRole::Row, nff)),
+            "ffn_down_shexp" => Some((infr_vulkan::TpRole::Row, cfg.shexp_ff)),
+            // Qwen3.8 QSA/DeltaNet consume full-width attention activations, so keep the
+            // attention projections replicated and shard only the FFN/MoE path.
+            _ => None,
+        };
+    }
     match after {
         "attn_q" | "attn_k" | "attn_v" => Some((infr_vulkan::TpRole::Column, ne)),
         "ffn_gate" | "ffn_up" => Some((infr_vulkan::TpRole::Column, ne)),
@@ -5291,6 +6556,37 @@ fn tensor_parallel_binder<'a>(
         if !chunk_covered_dense_tensor(name) {
             check_bda_element_cap(name, "tensor", numel)?;
         }
+        if is_expert_bank(name) && tp.n_expert() > 0 {
+            let n_expert = tp.n_expert();
+            let total = tb.len();
+            if !total.is_multiple_of(n_expert) {
+                return Err(anyhow!(
+                    "tp expert bank '{name}' {total} bytes not divisible by n_expert={n_expert}"
+                ));
+            }
+            check_bda_element_cap(name, "per-expert slice", numel / n_expert)?;
+            let stride_bytes = total / n_expert;
+            let per_rank = n_expert / world;
+            let bytes = tb.materialize();
+            let mut bufs = Vec::with_capacity(world);
+            for r in 0..world {
+                let start = r * per_rank * stride_bytes;
+                let slice = &bytes[start..start + per_rank * stride_bytes];
+                let padded = infr_vulkan::linear::pad_to_u32_align(slice);
+                let buf = tp
+                    .rank(r)
+                    .alloc_uninit(padded.len(), BufferUsage::Weights)
+                    .map_err(|e| anyhow!("{e}"))?;
+                tp.rank(r)
+                    .upload(buf.as_ref(), &padded)
+                    .map_err(|e| anyhow!("{e}"))?;
+                bufs.push(buf);
+            }
+            return Ok((
+                infr_vulkan::TpBuffer::weight(infr_vulkan::TpRole::Expert, bufs),
+                dt,
+            ));
+        }
         match tp_weight_role(name, cfg) {
             Some((role, in_f)) => {
                 // Every rank's slice is cut from the whole tensor, so this binder needs the bytes
@@ -5301,6 +6597,9 @@ fn tensor_parallel_binder<'a>(
                     let slice = match role {
                         infr_vulkan::TpRole::Column => tp_slice_column(&tb, dt, in_f, r, world)?,
                         infr_vulkan::TpRole::Row => tp_slice_row(&tb, dt, in_f, r, world)?,
+                        infr_vulkan::TpRole::Expert => {
+                            return Err(anyhow!("tp: Expert role reached the dense binder path"))
+                        }
                         infr_vulkan::TpRole::Replicated => tb.to_vec(),
                     };
                     let padded = infr_vulkan::linear::pad_to_u32_align(&slice);
@@ -5352,7 +6651,9 @@ pub(crate) fn generate_dense_vulkan_tp(
     max_new: usize,
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
-    dense_multi_gpu_guard(cfg, "INFR_TENSOR_PARALLEL")?;
+    if !(cfg.qwen4exp && cfg.moe.is_some()) {
+        dense_multi_gpu_guard(cfg, "INFR_TENSOR_PARALLEL")?;
+    }
     let backends = open_vulkan_devices(devices, ec)?;
     let names = backends
         .iter()
@@ -5363,9 +6664,17 @@ pub(crate) fn generate_dense_vulkan_tp(
         .collect::<Vec<_>>();
     // `multi.tp_p2p` (`INFR_TP_HOST` inverted): its ABSENCE selects P2P.
     let use_p2p = ec.multi.tp_p2p;
-    let tp =
-        infr_vulkan::TensorParallelBackend::new(backends, cfg.n_head, cfg.n_kv, cfg.n_ff, use_p2p)
-            .map_err(|e| anyhow!("{e}"))?;
+    let n_expert = cfg.moe.as_ref().map(|moe| moe.n_expert).unwrap_or(0);
+    let tp = infr_vulkan::TensorParallelBackend::new_ext(
+        backends,
+        cfg.n_head,
+        cfg.n_kv,
+        cfg.n_ff,
+        n_expert,
+        cfg.qwen4exp,
+        use_p2p,
+    )
+    .map_err(|e| anyhow!("{e}"))?;
     tracing::info!(
         "tensor-parallel: {}-way weight split (n_head={}, n_kv={}, n_ff={}):",
         devices.len(),
@@ -5410,6 +6719,24 @@ fn is_expert_bank(name: &str) -> bool {
         || name.ends_with("ffn_up_exps.weight")
         || name.ends_with("ffn_down_exps.weight")
         || name.ends_with("ffn_gate_up_exps.weight")
+}
+
+/// Input-column width for a dense matrix that can be row-parallel: every rank owns a contiguous
+/// band of the input columns and the full output vector is all-reduced. This deliberately reuses the
+/// standard TP role map for q/k/v/o and gate/up/down, then adds the Qwen3.8 shared-expert and
+/// hyper-connection projections. Unknown tensors (norms, routers, embeddings, indexed weights) stay
+/// replicated.
+fn ep_row_parallel_in_f(name: &str, cfg: &Config) -> Option<usize> {
+    if let Some((_role, in_f)) = tp_weight_role(name, cfg) {
+        return Some(in_f);
+    }
+    let after = name.rsplit('.').nth(1)?;
+    match after {
+        "ffn_gate_shexp" | "ffn_up_shexp" => Some(cfg.n_embd),
+        "ffn_down_shexp" => Some(cfg.shexp_ff),
+        "eh_proj" => Some(2 * cfg.n_embd),
+        _ => None,
+    }
 }
 
 /// A device-aware [`BindWeight`] for Expert Parallelism: the stacked expert banks
@@ -5460,8 +6787,25 @@ fn expert_parallel_binder<'a>(
                     .map_err(|e| anyhow!("{e}"))?;
                 bufs.push(buf);
             }
-            Ok((infr_vulkan::EpBuffer::wrap(bufs), dt))
+            Ok((infr_vulkan::EpBuffer::wrap_experts(bufs), dt))
         } else {
+            if let Some(in_f) = ep_row_parallel_in_f(name, cfg) {
+                let bytes = tb.materialize();
+                let mut bufs = Vec::with_capacity(world);
+                for r in 0..world {
+                    let slice = tp_slice_row(&bytes, dt, in_f, r, world)?;
+                    let padded = infr_vulkan::linear::pad_to_u32_align(&slice);
+                    let buf = ep
+                        .rank(r)
+                        .alloc_uninit(padded.len(), BufferUsage::Weights)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    ep.rank(r)
+                        .upload(buf.as_ref(), &padded)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    bufs.push(buf);
+                }
+                return Ok((infr_vulkan::EpBuffer::wrap_rows(bufs), dt));
+            }
             // Replicated: the full padded tensor on every rank. Mirror the resident binder's
             // per-expert-slice / chunk-covered / whole-tensor element-cap policy for non-bank
             // weights (a replicated router is a whole tensor; lm_head/token_embd are chunk-covered).
@@ -5518,13 +6862,14 @@ pub(crate) fn generate_moe_vulkan_ep(
              is a separate slice)"
         ));
     }
-    if cfg.shexp_ff > 0 {
-        return Err(anyhow!(
-            "INFR_EXPERT_PARALLEL v1 does not yet place a SHARED expert (qwen35moe / llama4 \
-             MoeSharedExpertAdd) — only routed-only MoE (qwen3moe). Shared-expert placement is a \
-             separate slice"
-        ));
-    }
+    // Shared expert (qwen35moe / qwen4exp / llama4 MoeSharedExpertAdd) is ALLOWED: its weights
+    // (`ffn_*_shexp`) are not expert banks, so `expert_parallel_binder` already replicates them to
+    // every rank — the only correct placement for a shared expert. And the graph is safe against
+    // the all-reduce: with `shexp` present the routed branch writes `moe_out` (NOT `sub`), and
+    // `Op::MoeSharedExpertAdd` reads `moe_out` and writes `sub` — so the segment cut lands between
+    // them, the one all-reduce fires on `moe_out` before anything reads it, and `sub` (never
+    // reduced) carries the combined result. No W-fold double-count. Verified against the EP
+    // runtime: INFRA_EXPERT_PARALLEL=Vulkan0,Vulkan1 now runs qwen4exp.
     if cfg.n_embd_per_layer > 0 {
         return Err(anyhow!(
             "INFR_EXPERT_PARALLEL does not support gemma E2B per-layer embeddings"
@@ -6900,7 +8245,10 @@ mod seam_helper_tests {
     #[test]
     fn moe_prefill_lanes_use_current_plus_longest_recurrent_run() {
         let qwen35 = qwen35_hybrid_state();
-        assert_eq!(super::moe_prefill_target_lanes(&qwen35, 40), 4);
+        assert_eq!(
+            super::moe_prefill_target_lanes(&qwen35, super::MoeLayerScope::all(40)),
+            4
+        );
 
         let qwen38 = Config {
             qwen4exp: true,
@@ -6910,7 +8258,10 @@ mod seam_helper_tests {
                 .collect(),
             ..Default::default()
         };
-        assert_eq!(super::moe_prefill_target_lanes(&qwen38, 48), 4);
+        assert_eq!(
+            super::moe_prefill_target_lanes(&qwen38, super::MoeLayerScope::all(48)),
+            4
+        );
 
         let mut mla_layers = vec![false; 42];
         for layer in [5, 11, 17, 23, 29, 35, 41] {
@@ -6922,13 +8273,22 @@ mod seam_helper_tests {
             bailing_mla_layers: mla_layers,
             ..Default::default()
         };
-        assert_eq!(super::moe_prefill_target_lanes(&ling, 42), 6);
+        assert_eq!(
+            super::moe_prefill_target_lanes(&ling, super::MoeLayerScope::all(42)),
+            6
+        );
 
         let attention_only = Config {
             n_layer: 24,
             ..Default::default()
         };
-        assert_eq!(super::moe_prefill_target_lanes(&attention_only, 24), 24);
+        assert_eq!(
+            super::moe_prefill_target_lanes(
+                &attention_only,
+                super::MoeLayerScope::all(24)
+            ),
+            24
+        );
     }
 
     #[test]
@@ -8150,16 +9510,22 @@ mod seam_helper_tests {
             Some(batch_floor_bytes as u64)
         );
         assert!(
-            super::moe_pool_slot_counts(&pools, (physical_floor_bytes - 1) as u64, 8, 2.0)
+            super::moe_pool_slot_counts(
+                &pools,
+                (physical_floor_bytes - 1) as u64,
+                8,
+                2.0,
+                None,
+            )
                 .is_none()
         );
         assert_eq!(
-            super::moe_pool_slot_counts(&pools, physical_floor_bytes as u64, 8, 2.0),
+            super::moe_pool_slot_counts(&pools, physical_floor_bytes as u64, 8, 2.0, None),
             Some(vec![25, 25]),
         );
 
         let budget = 512 * MIB as u64;
-        let slots = super::moe_pool_slot_counts(&pools, budget, 8, 2.0).unwrap();
+        let slots = super::moe_pool_slot_counts(&pools, budget, 8, 2.0, None).unwrap();
         assert!(slots.iter().all(|&n| n >= 25));
         let allocated = pools
             .iter()

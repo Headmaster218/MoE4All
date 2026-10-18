@@ -23,6 +23,7 @@ pub mod pager;
 mod pcache;
 pub mod pipeline;
 mod recorder;
+mod submit_trace;
 mod timeline;
 pub mod tp;
 pub mod tp_allreduce;
@@ -33,7 +34,7 @@ mod vkext;
 
 pub use ep::{EpBuffer, ExpertParallelBackend};
 pub use p2p::{P2pExport, P2pHandleType};
-pub use pipeline::{PipelineBackend, PipelineBuffer};
+pub use pipeline::{HeadAllocScope, PipelineBackend, PipelineBuffer};
 pub use recorder::{FlashStage, RecordedCmd, Recorder};
 pub use tp::{TensorParallelBackend, TpBuffer, TpRole};
 pub use tp_allreduce::{AllReduce, AllReduceMode};
@@ -352,13 +353,18 @@ fn use_qsa_topk_scan(
     top: usize,
     parallel: bool,
 ) -> bool {
-    requested.unwrap_or(measured_device && parallel && rows == 1 && top == 512)
+    let _ = rows;
+    requested.unwrap_or(measured_device && parallel && top == 512)
 }
 
 const AUTO_SUBMIT_SAMPLES_PER_CAP: usize = 2;
 const AUTO_SUBMIT_MAX_ROUNDS: usize = 12;
 const AGGRESSIVE_SUBMIT_BUDGET_NS: u64 = 500_000_000;
-const AGGRESSIVE_SUBMIT_EXPLORE_CAP: usize = 256;
+// Keep the automatic ceiling below the measured no-reset range on the dual-7900-XTX host.
+// At split/120 the largest observed prefill submit was ~833 ms; split/512 produced 1.7 s
+// submits and a gfx ring timeout. An explicit INFR_SUBMIT_DISPATCHES override may still
+// explore higher values for a deliberate experiment.
+const AGGRESSIVE_SUBMIT_EXPLORE_CAP: usize = 128;
 
 #[derive(Clone, Copy, Debug)]
 struct SubmitAutoSettings {
@@ -368,6 +374,7 @@ struct SubmitAutoSettings {
     max_rounds: usize,
     budget_ns: u64,
     explore_through_cap: usize,
+    growth_ceiling: usize,
 }
 
 impl SubmitAutoSettings {
@@ -380,6 +387,7 @@ impl SubmitAutoSettings {
                 max_rounds: AUTO_SUBMIT_MAX_ROUNDS,
                 budget_ns: infr_core::SUBMIT_BUDGET_NS,
                 explore_through_cap: AUTO_SUBMIT_INITIAL_CAP,
+                growth_ceiling: usize::MAX,
             },
             infr_core::config::AutoProfile::Aggressive => Self {
                 profile,
@@ -388,6 +396,7 @@ impl SubmitAutoSettings {
                 max_rounds: AUTO_SUBMIT_MAX_ROUNDS,
                 budget_ns: AGGRESSIVE_SUBMIT_BUDGET_NS,
                 explore_through_cap: AGGRESSIVE_SUBMIT_EXPLORE_CAP,
+                growth_ceiling: AGGRESSIVE_SUBMIT_EXPLORE_CAP,
             },
         }
     }
@@ -529,7 +538,10 @@ impl SubmitAutoPolicy {
             };
         }
 
-        let doubled = self.cap.saturating_mul(2);
+        let doubled = self
+            .cap
+            .saturating_mul(2)
+            .min(self.settings.growth_ceiling);
         self.cap = if measured == 0 {
             doubled
         } else {
@@ -815,6 +827,10 @@ struct VulkanShared {
     /// via its device address — the KV read seam is 100% `bufferDeviceAddress`, so the bytes may
     /// live off-device with no shader change). See [`Self::alloc_kv_host`].
     host_overflow_type: Option<u32>,
+    /// The CACHED flavour of `host_overflow_type` — RADV exposes the system heap twice, write-
+    /// combined (no `HOST_CACHED`) and cached. The KV spill prefers it; see
+    /// [`Self::alloc_kv_host`] for why the read side decides.
+    host_overflow_cached_type: Option<u32>,
     /// VRAM-first KV-overflow placement tally (`INFR_KV_OVERFLOW`): how many `BufferUsage::KvCache`
     /// buffers landed in device-local VRAM vs spilled to system RAM, and their byte totals. Purely
     /// for the one-shot placement banner (`kv_overflow_report`) so the user sees the resident/spilled
@@ -1194,11 +1210,15 @@ impl VulkanShared {
         submits: &[vk::SubmitInfo<'_>],
         fence: vk::Fence,
         profile_dispatches: Option<usize>,
+        context: &str,
     ) -> std::result::Result<(), vk::Result> {
         let started = profile_dispatches
             .filter(|_| infr_core::pager_profile::active())
             .map(|_| std::time::Instant::now());
+        let submit_trace =
+            submit_trace::begin_submit(self.queue, submits, fence, profile_dispatches, context);
         let result = unsafe { self.device.queue_submit(self.queue, submits, fence) };
+        submit_trace::end_submit(submit_trace, &result);
         if let (Some(dispatches), Some(t0)) = (profile_dispatches, started) {
             infr_core::pager_profile::record_queue_submit(dispatches, t0.elapsed());
         }
@@ -1243,7 +1263,7 @@ impl VulkanShared {
             return Err(error);
         }
         let mut attempts = 1usize;
-        let mut last = match self.queue_submit_once(submits, fence, profile_dispatches) {
+        let mut last = match self.queue_submit_once(submits, fence, profile_dispatches, context) {
             Ok(()) => return Ok(()),
             Err(error) if retryable_queue_submit_error(error) => error,
             Err(error) => return Err(self.make_queue_unusable(error, context)),
@@ -1258,7 +1278,7 @@ impl VulkanShared {
             }
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
             attempts += 1;
-            match self.queue_submit_once(submits, fence, profile_dispatches) {
+            match self.queue_submit_once(submits, fence, profile_dispatches, context) {
                 Ok(()) => {
                     tracing::warn!(
                         "[infr] {context} recovered after {attempts} queue-submit attempts"
@@ -1287,7 +1307,7 @@ impl VulkanShared {
             );
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
             attempts += 1;
-            match self.queue_submit_once(submits, fence, profile_dispatches) {
+            match self.queue_submit_once(submits, fence, profile_dispatches, context) {
                 Ok(()) => {
                     tracing::warn!(
                         "[infr] {context} recovered after {attempts} queue-submit attempts"
@@ -1316,7 +1336,7 @@ impl VulkanShared {
             return Err(error);
         }
         let mut attempts = 1usize;
-        let mut last = match self.queue_submit_once(submits, vk::Fence::null(), None) {
+        let mut last = match self.queue_submit_once(submits, vk::Fence::null(), None, context) {
             Ok(()) => return Ok(()),
             Err(error) if retryable_queue_submit_error(error) => error,
             Err(error) => return Err(error),
@@ -1326,7 +1346,7 @@ impl VulkanShared {
             self.drain_queue_for_submit_retry()?;
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
             attempts += 1;
-            match self.queue_submit_once(submits, vk::Fence::null(), None) {
+            match self.queue_submit_once(submits, vk::Fence::null(), None, context) {
                 Ok(()) => {
                     tracing::warn!(
                         "[infr] {context} recovered after {attempts} residency-probe attempts"
@@ -1351,7 +1371,7 @@ impl VulkanShared {
                 );
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 attempts += 1;
-                match self.queue_submit_once(submits, vk::Fence::null(), None) {
+                match self.queue_submit_once(submits, vk::Fence::null(), None, context) {
                     Ok(()) => {
                         tracing::warn!(
                             "[infr] {context} recovered after {attempts} residency-probe attempts"
@@ -1368,7 +1388,10 @@ impl VulkanShared {
 
     pub(crate) fn queue_wait_idle_serialized(&self) -> std::result::Result<(), vk::Result> {
         let _queue = self.queue_access.lock().unwrap();
-        unsafe { self.device.queue_wait_idle(self.queue) }
+        let trace = submit_trace::begin_wait("queue_wait_idle", vk::Fence::null(), self.queue);
+        let result = unsafe { self.device.queue_wait_idle(self.queue) };
+        submit_trace::end_wait(trace, &result);
+        result
     }
 
     fn device_wait_idle_serialized(&self) -> std::result::Result<(), vk::Result> {
@@ -1720,6 +1743,19 @@ struct VkBuffer {
     /// by [`Backing::Vram`], which owns its `VkDeviceMemory` outright.
     mem_size: u64,
     location: MemoryLocation,
+    /// Physical-device memory type index this buffer's bytes live in, when we picked it ourselves
+    /// (`Backing::Vram`/`Device`/`External`/`ImportedHost`, and the arena shards copied through
+    /// [`Backing::UnifiedSub`]). `-1` when the choice belongs to gpu-allocator (a pooled
+    /// sub-allocation) or to the block a `BdaSub` aliases — there the flags in `mem_flags` are
+    /// still authoritative. Diagnostic only (the `INFR_PROF_OP_TRACE` residency column); no
+    /// allocation decision reads it.
+    mem_type: i32,
+    /// `vk::MemoryPropertyFlags` of the memory backing this buffer — the raw bits of
+    /// `Allocation::memory_properties()` for a pooled allocation, and the property flags of
+    /// `mem_type` (or, for a `BdaSub`/`UnifiedSub`, the block/shard it aliases) otherwise. This is
+    /// what tells a trace reader whether a bound tensor sits in DEVICE_LOCAL memory, is reachable
+    /// over ReBAR (HOST_VISIBLE | DEVICE_LOCAL), or is a host-side staging buffer.
+    mem_flags: u32,
     /// Byte offset of this tensor's logical range within `buffer` — `0` for every buffer except a
     /// resident-BDA weight sub-tensor (`Backing::BdaSub`, see [`BdaWeightArena`]), where several
     /// `VkBuffer` handles share ONE big `vk::Buffer` (the arena block) and this field is what tells
@@ -1767,6 +1803,16 @@ impl VkBuffer {
             // copy path (device A owns the pages; device B aliases them over PCIe).
             Backing::External { .. } => None,
             Backing::ImportedHost { host_ptr, .. } => Some(*host_ptr),
+        }
+    }
+
+    /// (memory type index, `vk::MemoryPropertyFlags` bits) of the memory physically backing this
+    /// buffer — resolved through the block/shard a `BdaSub`/`UnifiedSub` aliases. `-1` for the type
+    /// index when it was not ours to choose (see the field doc). Diagnostic only.
+    fn mem_info(&self) -> (i32, u32) {
+        match &self.backing {
+            Backing::BdaSub(block) => block.buf.mem_info(),
+            _ => (self.mem_type, self.mem_flags),
         }
     }
 }
@@ -2034,12 +2080,14 @@ const ARENA_OVERFLOW_BLOCK: u64 = 64 * 1024 * 1024;
 /// host placement or transfer staging, never as an automatic GpuOnly overflow.
 fn probe_host_visible_non_device_local_type(
     mp: &vk::PhysicalDeviceMemoryProperties,
+    want_cached: bool,
 ) -> Option<u32> {
     let want = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
     (0..mp.memory_type_count).find(|&i| {
         let t = mp.memory_types[i as usize];
         let heap = mp.memory_heaps[t.heap_index as usize];
         t.property_flags.contains(want)
+            && (!want_cached || t.property_flags.contains(vk::MemoryPropertyFlags::HOST_CACHED))
             && !t
                 .property_flags
                 .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
@@ -2510,6 +2558,9 @@ pub struct VulkanBackend {
     /// `backend_drop_frees_device_after_moe_pager`.
     bda_weight_arena: Mutex<Option<BdaWeightArena>>,
     iq2s_grid: Option<Arc<dyn Buffer>>,
+    iq2xxs_grid: Option<Arc<dyn Buffer>>,
+    iq2xs_grid: Option<Arc<dyn Buffer>>,
+    iq3xxs_grid: Option<Arc<dyn Buffer>>,
     iq3s_grid: Option<Arc<dyn Buffer>>,
     /// Service-level elastic VRAM arena. Kept on backend handles rather than `VulkanShared`
     /// because its physical shard buffers retain `Arc<VulkanShared>` and would otherwise form a
@@ -3379,14 +3430,24 @@ impl VulkanBackend {
             .position(|p| p.queue_flags.contains(vk::QueueFlags::COMPUTE))
             .map(|i| i as u32)
             .ok_or_else(|| be("no compute queue family found"))?;
+        // Transfer-only family, if one exists. The strict "pure TRANSFER (no
+        // GRAPHICS/COMPUTE)" form only exists on the Windows AMD driver (SDMA);
+        // Linux RADV exposes none — every family carries GRAPHICS or COMPUTE —
+        // so the strict pick returned None and the whole async path (dedicated
+        // DMA queue + next-layer expert prefetch) silently fell back to the
+        // blocking `one_shot` copy path. Relax to "any family that is not the
+        // main graphics ring", which on RADV selects the ACE compute+transfer
+        // family: a queue genuinely parallel to gfx, used here only for
+        // vkCmdCopyBuffer (bounded, no dispatch) so it can't hit the comp-ring
+        // hang the compute path warns about.
+        // ponytail: picks the first non-graphics TRANSFER family; if a device
+        // exposes several and ordering matters, rank by timestamp_valid_bits.
         let dedicated_transfer_family_index = qf_props
             .iter()
             .position(|p| {
                 p.queue_count > 0
                     && p.queue_flags.contains(vk::QueueFlags::TRANSFER)
-                    && !p
-                        .queue_flags
-                        .intersects(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
+                    && !p.queue_flags.contains(vk::QueueFlags::GRAPHICS)
             })
             .map(|i| i as u32);
         let submit_timestamp_valid_bits =
@@ -4366,12 +4427,24 @@ impl VulkanBackend {
         // across PCIe and must never receive a GpuOnly buffer.
         let uma_overflow_type = caps
             .unified_memory
-            .then(|| probe_host_visible_non_device_local_type(&mem_props))
+            .then(|| probe_host_visible_non_device_local_type(&mem_props, false))
             .flatten();
         // Same probe, but WITHOUT the UMA gate — on a discrete card this resolves to the GTT
         // host-visible type (system RAM over PCIe). KV overflow and portable transfer staging use
         // it explicitly; ordinary GpuOnly allocations never do.
-        let host_overflow_type = probe_host_visible_non_device_local_type(&mem_props);
+        let host_overflow_type = probe_host_visible_non_device_local_type(&mem_props, false);
+        // The same heap's CACHED flavour. Spilled KV is WRITTEN once per token but READ by
+        // attention across the whole prefix on every chunk, so the read side decides: on an
+        // uncached (write-combined) heap each of those reads is its own PCIe transaction that
+        // never hits L2, which is what "PCIe-bound on the spilled layers" costs. The SSD->VRAM
+        // staging paths above/below keep the write-combined type — they are CPU-write-heavy.
+        let host_overflow_cached_type = probe_host_visible_non_device_local_type(&mem_props, true);
+        // Name the pick once at startup: "PCIe-bound on the spilled layers" is decided HERE, and
+        // the type index is the only way to tell a cached heap from a write-combined one.
+        tracing::info!(
+            "host-visible overflow heap: type {host_overflow_type:?} (write-combined), cached type \
+             {host_overflow_cached_type:?} — KV spill uses the cached one when present"
+        );
         let dedicated_transfer = dedicated_transfer_family_index.and_then(|family| {
             match crate::transfer::DedicatedTransferQueue::new(
                 &device,
@@ -4430,6 +4503,9 @@ impl VulkanBackend {
             runtime_phase,
             bda_weight_arena: Mutex::new(None),
             iq2s_grid: None,
+            iq2xxs_grid: None,
+            iq2xs_grid: None,
+            iq3xxs_grid: None,
             iq3s_grid: None,
             unified_pool: Arc::new(Mutex::new(None)),
             unified_exec: Arc::new(RwLock::new(())),
@@ -4494,6 +4570,7 @@ impl VulkanBackend {
                 timeline_query_pools: Arc::new(Mutex::new(Vec::new())),
                 uma_overflow_type,
                 host_overflow_type,
+                host_overflow_cached_type,
                 kv_spill: SpillTally::default(),
                 staging_ring: Mutex::new(None),
             }),
@@ -4510,6 +4587,12 @@ impl VulkanBackend {
             .gemv
             .id_grid_buffer
             .unwrap_or(backend.measured_decode_kernel_device())
+            || backend
+                .cfg()
+                .kernels
+                .vulkan
+                .gemv
+                .id_stream_grid_buffer
         {
             let words: Vec<u32> = infr_core::iquant_grids::IQ2S_GRID
                 .iter()
@@ -4518,6 +4601,27 @@ impl VulkanBackend {
             let grid = backend.make_buf(words.len() * 4, MemoryLocation::GpuOnly, "iq2s-grid")?;
             backend.upload(&grid, bytemuck::cast_slice(&words))?;
             backend.iq2s_grid = Some(Arc::new(grid));
+            let words: Vec<u32> = infr_core::iquant_grids::IQ2XXS_GRID
+                .iter()
+                .flat_map(|&word| [word as u32, (word >> 32) as u32])
+                .collect();
+            let grid =
+                backend.make_buf(words.len() * 4, MemoryLocation::GpuOnly, "iq2xxs-grid")?;
+            backend.upload(&grid, bytemuck::cast_slice(&words))?;
+            backend.iq2xxs_grid = Some(Arc::new(grid));
+            let words: Vec<u32> = infr_core::iquant_grids::IQ2XS_GRID
+                .iter()
+                .flat_map(|&word| [word as u32, (word >> 32) as u32])
+                .collect();
+            let grid = backend.make_buf(words.len() * 4, MemoryLocation::GpuOnly, "iq2xs-grid")?;
+            backend.upload(&grid, bytemuck::cast_slice(&words))?;
+            backend.iq2xs_grid = Some(Arc::new(grid));
+            let grid = backend.make_buf(1024, MemoryLocation::GpuOnly, "iq3xxs-grid")?;
+            backend.upload(
+                &grid,
+                bytemuck::cast_slice(&infr_core::iquant_grids::IQ3XXS_GRID),
+            )?;
+            backend.iq3xxs_grid = Some(Arc::new(grid));
             let grid = backend.make_buf(2048, MemoryLocation::GpuOnly, "iq3s-grid")?;
             backend.upload(
                 &grid,
@@ -4566,9 +4670,24 @@ impl VulkanBackend {
         allocations: Vec<(Arc<AlignedHostBuffer>, usize)>,
         alignment: usize,
     ) -> Vec<ImportedHostAllocation> {
-        const IMPORT_SHARD_MAX: usize = 2 * 1024 * 1024 * 1024;
-        let max_shard =
-            IMPORT_SHARD_MAX.min(self.shared.max_mem_alloc_size as usize) / alignment * alignment;
+        // 2 GiB shards make every `vkQueueSubmit` that touches one pay the kernel's
+        // per-submit cost for the WHOLE shard (measured on RADV/amdgpu: ~2.2 ms per GiB
+        // of imported-host BO referenced by the submit, independent of how few bytes the
+        // submit actually copies). With 2 GiB shards a decode DMA submit referencing a
+        // handful of shards costs 25-420 ms, which is the entire decode wall time.
+        // Smaller shards shrink that per-submit charge proportionally.
+        // Measured sweep on RADV/amdgpu (7900 XTX), decode tg32:
+        //   2 GiB 0.3 t/s · 64 MiB 2.8 · 16 MiB 7.6 · 8 MiB 8.5 · 4 MiB 9.9 · 2 MiB 15.1 · 1 MiB 16.7
+        // The per-submit charge stops dominating below ~2 MiB; 1 MiB buys 11% more for 2x the BOs.
+        // ponytail: env-overridable so the driver's per-submit charge can be swept without a
+        // rebuild (this is a driver-behaviour calibration, not a policy value).
+        const IMPORT_SHARD_MAX: usize = 2 * 1024 * 1024;
+        let want_shard = std::env::var("INFR_IMPORT_SHARD_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|mb| mb * 1024 * 1024)
+            .unwrap_or(IMPORT_SHARD_MAX);
+        let max_shard = want_shard.min(self.shared.max_mem_alloc_size as usize) / alignment * alignment;
         if max_shard == 0 {
             tracing::warn!(
                 "[infr] host DMA disabled: Vulkan host-import shard limit is smaller than its alignment"
@@ -4749,12 +4868,23 @@ impl VulkanBackend {
     ) -> Result<ImportedHostShard> {
         let device = &self.shared.device;
         let handle_type = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
+        // `paging.moe_prefill_inplace`: hand this shard a 64-bit device address so whole-layer
+        // Prefill can read it in place instead of DMA-ing it into VRAM. RADV accepts
+        // `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT` on `VK_EXT_external_memory_host` memory (probed on
+        // gfx1100: allocate returns SUCCESS, `vkGetBufferDeviceAddress` is non-null, and a compute
+        // shader reading through `GL_EXT_buffer_reference` returns the host bytes unchanged).
+        // Off by default ⇒ the shard stays a plain transfer source with no address.
+        let want_addr = self.cfg().paging.moe_prefill_inplace;
         let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle_type);
         let queue_families = self.shared.dedicated_transfer_families();
+        let mut usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+        if want_addr {
+            usage |= vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
+        }
         let mut info = vk::BufferCreateInfo::default()
             .push_next(&mut external)
             .size(len as u64)
-            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST);
+            .usage(usage);
         if let Some(families) = queue_families.as_ref() {
             info = info
                 .sharing_mode(vk::SharingMode::CONCURRENT)
@@ -4813,10 +4943,18 @@ impl VulkanBackend {
         let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
             .handle_type(handle_type)
             .host_pointer(host_ptr.cast());
-        let allocation = vk::MemoryAllocateInfo::default()
+        // The matching allocate flag is REQUIRED (VUID-VkMemoryAllocateInfo-flags-03331): a buffer
+        // created with `SHADER_DEVICE_ADDRESS` must have memory allocated with `DEVICE_ADDRESS`, or
+        // the address query returns a bogus value.
+        let mut flags_info =
+            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let mut allocation = vk::MemoryAllocateInfo::default()
             .push_next(&mut import)
             .allocation_size(requirements.size)
             .memory_type_index(memory_type_index);
+        if want_addr {
+            allocation = allocation.push_next(&mut flags_info);
+        }
         let memory = unsafe { device.allocate_memory(&allocation, None) }.map_err(|e| {
             unsafe { device.destroy_buffer(buffer, None) };
             be(format!("import host shard {offset}..{}: {e}", offset + len,))
@@ -4828,6 +4966,9 @@ impl VulkanBackend {
             }
             return Err(be(format!("bind imported-host shard at {offset}: {e}")));
         }
+        let own_addr = want_addr.then(|| unsafe {
+            device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
+        });
         let imported: Arc<dyn Buffer> = Arc::new(VkBuffer {
             shared: Arc::clone(&self.shared),
             buffer,
@@ -4839,8 +4980,14 @@ impl VulkanBackend {
             size: len,
             mem_size: requirements.size,
             location: MemoryLocation::CpuToGpu,
+            mem_type: memory_type_index as i32,
+            mem_flags: memory_properties.memory_types[memory_type_index as usize]
+                .property_flags
+                .as_raw(),
             sub_offset: 0,
-            own_addr: None,
+            // `device_addr()` stays `None` for the default import; the in-place prefill path is the
+            // only consumer of a non-null address here (`layer_lut_window`).
+            own_addr,
             act_bytes: 0,
         });
         Ok(ImportedHostShard {
@@ -5237,7 +5384,13 @@ impl VulkanBackend {
         let unified_limit = self.cfg.device.vram_budget.is_some()
             || self.cfg.device.vram_reserve.is_some()
             || infr_core::test_resource::active().is_some();
-        if (want < CHECK_MIN && !unified_limit) || self.cfg.kernels.vulkan.no_vram_guard {
+        // `INFR_NO_VRAM_GUARD` keeps the physical headroom check off (that is its job), but an
+        // EXPLICIT `device.vram_reserve` / `device.vram_budget` must still bite: the whole point of
+        // the pairing is to deliberately spill a slice of weights to host RAM so prefill
+        // activations have somewhere to land.
+        if (want < CHECK_MIN && !unified_limit)
+            || (self.cfg.kernels.vulkan.no_vram_guard && !unified_limit)
+        {
             return Ok(());
         }
         // The probe is the single source of truth for "does `want` fit?" so the hard guard here and
@@ -5305,6 +5458,22 @@ impl VulkanBackend {
             (type_bits & (1 << i)) != 0
                 && mp.memory_types[i as usize].property_flags.contains(props)
         })
+    }
+
+    /// `vk::MemoryPropertyFlags` bits of physical-device memory type `ty` (`0` if out of range).
+    /// Used only to stamp a [`VkBuffer`]'s residency for the `INFR_PROF_OP_TRACE` diagnostic — the
+    /// per-type flags are otherwise re-queried inline at every allocation site.
+    fn mem_type_flags(&self, ty: u32) -> u32 {
+        let mp = unsafe {
+            self.shared
+                .instance
+                .get_physical_device_memory_properties(self.shared.physical_device)
+        };
+        if ty < mp.memory_type_count {
+            mp.memory_types[ty as usize].property_flags.as_raw()
+        } else {
+            0
+        }
     }
 
     /// Bind `buffer` to a fresh, PERSISTENTLY MAPPED dedicated allocation of memory type `ty`. The
@@ -5402,6 +5571,8 @@ impl VulkanBackend {
             size,
             mem_size: requirements.size,
             location: MemoryLocation::GpuOnly,
+            mem_type: ty as i32,
+            mem_flags: self.mem_type_flags(ty),
             sub_offset: 0,
             own_addr,
             act_bytes: 0,
@@ -5426,8 +5597,20 @@ impl VulkanBackend {
     /// `host_overflow_type` (present on RDNA3 = the GTT host-visible type); the caller has already
     /// checked the flag, so a missing type here is a hard error rather than a silent VRAM fallback.
     fn alloc_kv_host(&self, size: usize) -> Result<VkBuffer> {
-        let ty =
-            self.shared.host_overflow_type.ok_or_else(|| {
+        // CACHED first: attention reads the spilled KV over the whole prefix once per chunk while
+        // the KV store writes it once per token, so the read side decides. `None` on a device with
+        // no cached host heap falls back to the plain host-visible type. `INFR_KV_HOST_UNCACHED`
+        // forces the write-combined type — the A/B for that choice, same shape as the other
+        // diagnostics (`INFR_KV_OVERFLOW_VRAM_MB`).
+        let preferred = if std::env::var_os("INFR_KV_HOST_UNCACHED").is_some() {
+            self.shared.host_overflow_type
+        } else {
+            self.shared
+                .host_overflow_cached_type
+                .or(self.shared.host_overflow_type)
+        };
+        let mut ty = preferred
+            .ok_or_else(|| {
                 be("INFR_KV_OVERFLOW set but this device exposes no host-visible non-device-local \
                 memory type to place the KV cache in — unset it to run in VRAM".to_string())
             })?;
@@ -5445,6 +5628,17 @@ impl VulkanBackend {
         let buffer = unsafe { self.shared.device.create_buffer(&buf_ci, None) }
             .map_err(|e| be(format!("create_buffer(kv-host): {e}")))?;
         let requirements = unsafe { self.shared.device.get_buffer_memory_requirements(buffer) };
+        if requirements.memory_type_bits & (1 << ty) == 0 {
+            // A cached heap can be host-visible yet still not back THIS buffer; degrade to the
+            // write-combined type before giving up on the spill entirely.
+            if let Some(alt) = self
+                .shared
+                .host_overflow_type
+                .filter(|&alt| alt != ty && requirements.memory_type_bits & (1 << alt) != 0)
+            {
+                ty = alt;
+            }
+        }
         if requirements.memory_type_bits & (1 << ty) == 0 {
             unsafe { self.shared.device.destroy_buffer(buffer, None) };
             return Err(be(
@@ -5562,6 +5756,10 @@ impl VulkanBackend {
             size: bytes,
             mem_size: requirements.size,
             location: MemoryLocation::GpuOnly,
+            mem_type: memory_type as i32,
+            mem_flags: properties.memory_types[memory_type as usize]
+                .property_flags
+                .as_raw(),
             sub_offset: 0,
             own_addr: Some(address),
             act_bytes: 0,
@@ -5613,6 +5811,52 @@ impl VulkanBackend {
             .expect("mapped MoE arena built with device_address=true carries an own_addr");
         tracing::info!(
             "[infr] paged-MoE arena: {} ReBAR VRAM (DEVICE_LOCAL|HOST_VISIBLE), one CPU mapping, no mirror",
+            fmt_bytes(requirements.size),
+        );
+        Ok((Box::new(buf) as Box<dyn Buffer>, addr))
+    }
+
+    /// Host-RAM twin of [`Self::alloc_mapped_arena_bda`]: the same BDA expert arena, but in
+    /// host-visible system memory. `spilled = true` keeps it out of the device-local budget and
+    /// `budget_check = false` matches `alloc_kv_host`'s system-RAM shape. The CPU push then lands in
+    /// ordinary RAM (fast memcpy) and the GPU fetches the arena across PCIe, instead of the CPU
+    /// writing into a ReBAR window one cache line at a time. Enabled by `paging.moe_arena_host`.
+    pub fn alloc_mapped_arena_host_bda(&self, bytes: usize) -> Result<(Box<dyn Buffer>, u64)> {
+        let usage = vk::BufferUsageFlags::from_raw(
+            BUFFER_USAGE.as_raw() | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS.as_raw(),
+        );
+        let queue_families = self.shared.dedicated_transfer_families();
+        let info = if let Some(families) = queue_families.as_ref() {
+            vk::BufferCreateInfo::default()
+                .size(fill_span(bytes))
+                .usage(usage)
+                .sharing_mode(vk::SharingMode::CONCURRENT)
+                .queue_family_indices(families)
+        } else {
+            vk::BufferCreateInfo::default()
+                .size(fill_span(bytes))
+                .usage(usage)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        };
+        let buffer = unsafe { self.shared.device.create_buffer(&info, None) }
+            .map_err(|e| be(format!("create_buffer(moe-arena-host): {e}")))?;
+        let requirements = unsafe { self.shared.device.get_buffer_memory_requirements(buffer) };
+        let want = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let Some(ty) = self.find_memory_type(requirements.memory_type_bits, want) else {
+            unsafe { self.shared.device.destroy_buffer(buffer, None) };
+            return Err(be(
+                "paged MoE host arena needs HOST_VISIBLE|HOST_COHERENT system memory; this device \
+                 exposes no compatible memory type",
+            ));
+        };
+        let buf = self
+            .alloc_vram_mapped(buffer, bytes, &requirements, ty, true, true, false)
+            .inspect_err(|_| unsafe { self.shared.device.destroy_buffer(buffer, None) })?;
+        let addr = buf
+            .own_addr
+            .expect("host MoE arena built with device_address=true carries an own_addr");
+        tracing::info!(
+            "[infr] paged-MoE arena: {} SYSTEM RAM (HOST_VISIBLE|HOST_COHERENT), GPU fetches over PCIe",
             fmt_bytes(requirements.size),
         );
         Ok((Box::new(buf) as Box<dyn Buffer>, addr))
@@ -5698,6 +5942,7 @@ impl VulkanBackend {
         dynamic_state_max_allocation_bytes: u64,
         prefill_min_lane_bytes: u64,
         runtime_reserve_bytes: u64,
+        reuse_existing: bool,
     ) -> Result<Arc<crate::unified::UnifiedVramPool>> {
         let layout = self.plan_unified_vram_for_expert_slots(
             specs,
@@ -5709,6 +5954,9 @@ impl VulkanBackend {
         let expected = layout.total_bytes();
         let mut cell = self.unified_pool.lock().unwrap();
         if let Some(pool) = cell.as_ref() {
+            if reuse_existing && pool.stats().capacity_bytes == expected {
+                return Ok(Arc::clone(pool));
+            }
             let same_layout = pool.stats().capacity_bytes == expected
                 && pool
                     .expert_layout()
@@ -5724,6 +5972,27 @@ impl VulkanBackend {
         let pool = crate::unified::UnifiedVramPool::new_for_experts(self, layout)?;
         *cell = Some(Arc::clone(&pool));
         Ok(pool)
+    }
+
+    /// Materialize a unified expert arena that is NOT installed in the backend's shared cell.
+    /// The MTP head pager owns this pool privately so a resident trunk can still create its own
+    /// unified arena on the same backend later.
+    pub(crate) fn make_private_unified_vram_for_expert_slots(
+        &self,
+        specs: &[(usize, usize, usize)],
+        dynamic_state_reserve_bytes: u64,
+        dynamic_state_max_allocation_bytes: u64,
+        prefill_min_lane_bytes: u64,
+        runtime_reserve_bytes: u64,
+    ) -> Result<Arc<crate::unified::UnifiedVramPool>> {
+        let layout = self.plan_unified_vram_for_expert_slots(
+            specs,
+            dynamic_state_reserve_bytes,
+            dynamic_state_max_allocation_bytes,
+            prefill_min_lane_bytes,
+            runtime_reserve_bytes,
+        )?;
+        crate::unified::UnifiedVramPool::new_for_experts(self, layout)
     }
 
     /// Materialize an otherwise-empty MoE unified arena before the pager session is installed.
@@ -5744,6 +6013,7 @@ impl VulkanBackend {
             dynamic_state_max_allocation_bytes,
             prefill_min_lane_bytes,
             runtime_reserve_bytes,
+            false,
         )?;
         Ok(pool.stats().capacity_bytes)
     }
@@ -5805,6 +6075,9 @@ impl VulkanBackend {
             runtime_phase,
             bda_weight_arena: Mutex::new(None),
             iq2s_grid: self.iq2s_grid.clone(),
+            iq2xxs_grid: self.iq2xxs_grid.clone(),
+            iq2xs_grid: self.iq2xs_grid.clone(),
+            iq3xxs_grid: self.iq3xxs_grid.clone(),
             iq3s_grid: self.iq3s_grid.clone(),
             unified_pool: Arc::clone(&self.unified_pool),
             unified_exec: Arc::clone(&self.unified_exec),
@@ -5870,6 +6143,7 @@ impl VulkanBackend {
             return Err(be("unified VRAM allocation is outside its physical shard"));
         }
         let physical = as_vk_buf(handle.buffer())?;
+        let (mem_type, mem_flags) = physical.mem_info();
         Ok(VkBuffer {
             shared: Arc::clone(&self.shared),
             buffer: physical.buffer,
@@ -5877,6 +6151,8 @@ impl VulkanBackend {
             size,
             mem_size: 0,
             location: MemoryLocation::GpuOnly,
+            mem_type,
+            mem_flags,
             sub_offset: range.offset,
             own_addr: None,
             act_bytes: 0,
@@ -5950,7 +6226,9 @@ impl VulkanBackend {
     ) -> Result<Vec<Arc<crate::unified::UnifiedAllocationHandle>>> {
         let mut pager = self.moe_pager.lock().unwrap();
         if let Some(session) = pager.as_mut() {
-            return session.commit_unified_claim(self, plan);
+            if !session.is_private_arena() {
+                return session.commit_unified_claim(self, plan);
+            }
         }
         if !plan.victims().is_empty() {
             return Err(be(
@@ -6073,6 +6351,45 @@ impl VulkanBackend {
                 }
             }
             if requests.is_empty() {
+                return Ok(());
+            }
+
+            // No unified arena ⇒ this is one device of a layer split (`PipelineBackend`), which
+            // keeps its own weights rather than a shared elastic pool. Claiming from a pool is
+            // impossible here — and a pool could not place a segment outside VRAM anyway, which is
+            // precisely what a windowed KV needs: the low-index (hot) segments resident, the cold
+            // tail in system RAM. Allocate each segment on its own through the ordinary `KvCache`
+            // arm, which is already "VRAM-first, spill the rest to host RAM" (`INFR_KV_OVERFLOW`).
+            // Sibling devices place the same logical segment index by the same rule, and
+            // `KvSegmentedKvBuffer`'s per-device table makes the difference invisible to readers.
+            if self.unified_vram().is_none() {
+                let mut pending = Vec::with_capacity(requests.len());
+                for &(buffer_idx, index, bytes) in &requests {
+                    let segment = self.make_alloc(bytes, BufferUsage::KvCache)?;
+                    let addr = segment.device_addr().ok_or_else(|| {
+                        be("segmented KV standalone segment has no device address")
+                    })?;
+                    let table_ptr = buffers[buffer_idx]
+                        .table
+                        .mapped_ptr()
+                        .ok_or_else(|| be("segmented KV address table is not host-visible"))?;
+                    pending.push((buffer_idx, index, table_ptr, addr, segment));
+                }
+                // Publication is deliberately last (same contract as the arena path below): every
+                // allocation is in hand before any address becomes visible to a kernel.
+                for &(_, index, table_ptr, addr, _) in &pending {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            addr.to_ne_bytes().as_ptr(),
+                            table_ptr.add(index * std::mem::size_of::<u64>()),
+                            std::mem::size_of::<u64>(),
+                        );
+                    }
+                }
+                for (buffer_idx, index, _, _, segment) in pending {
+                    debug_assert_eq!(locked[buffer_idx].len(), index);
+                    locked[buffer_idx].push(segment);
+                }
                 return Ok(());
             }
 
@@ -6280,6 +6597,9 @@ impl VulkanBackend {
                     size,
                     mem_size: 0,
                     location: MemoryLocation::GpuOnly,
+                    // Resolved through the block on `mem_info()` — the block is the real owner.
+                    mem_type: -1,
+                    mem_flags: 0,
                     sub_offset: off as usize,
                     // `device_addr()` derives a `BdaSub`'s address from the block's `base_addr` +
                     // `sub_offset` — no own address needed here.
@@ -6334,6 +6654,9 @@ impl VulkanBackend {
             size,
             mem_size: 0,
             location: MemoryLocation::GpuOnly,
+            // Resolved through the block on `mem_info()` — the block is the real owner.
+            mem_type: -1,
+            mem_flags: 0,
             sub_offset: 0,
             own_addr: None,
             act_bytes: 0,
@@ -6637,6 +6960,10 @@ impl VulkanBackend {
                 .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
         });
 
+        // Read the allocator's own memory-property report BEFORE `allocation` moves into the
+        // backing — it is the only place a pooled sub-allocation's flags are knowable (gpu-allocator
+        // does not expose the type index).
+        let mem_flags = allocation.memory_properties().as_raw();
         Ok(VkBuffer {
             shared: Arc::clone(&self.shared),
             buffer,
@@ -6644,6 +6971,8 @@ impl VulkanBackend {
             size,
             mem_size: requirements.size,
             location,
+            mem_type: -1,
+            mem_flags,
             sub_offset: 0,
             own_addr,
             act_bytes: 0,
@@ -6907,11 +7236,20 @@ impl VulkanBackend {
             BufferUsage::Activations => (MemoryLocation::GpuOnly, "activations"),
             BufferUsage::Staging => (MemoryLocation::CpuToGpu, "staging"),
             BufferUsage::Readback => (MemoryLocation::GpuToCpu, "readback"),
-            // GpuToCpu = HOST_VISIBLE|HOST_CACHED system RAM — the point of the class is NOT
-            // living in VRAM.
-            BufferUsage::HostWeights => (MemoryLocation::GpuToCpu, "host-weights"),
-        };
-        let mut buf = self.make_buf(bytes, location, label)?;
+        // GpuToCpu = HOST_VISIBLE|HOST_CACHED system RAM — the point of the class is NOT
+        // living in VRAM.
+        BufferUsage::HostWeights => (MemoryLocation::GpuToCpu, "host-weights"),
+    };
+    // HostWeights is read by the MoE expert kernels through a 64-bit DEVICE ADDRESS (the
+    // `-DSTREAMED` bank path / `Buffer::device_addr`), exactly like the paged-MoE arena blocks and
+    // the `INFR_KV_OVERFLOW` spill — so it must carry SHADER_DEVICE_ADDRESS (`make_buf`'s plain
+    // form does not). Off-device memory, so it is deliberately NOT charged against the
+    // device-local budget (same shape as `alloc_kv_host`).
+    let mut buf = if usage == BufferUsage::HostWeights {
+        self.make_buf_ex(bytes, location, label, false, true)?
+    } else {
+        self.make_buf(bytes, location, label)?
+    };
         // Advance the weight-load progress bar for host-weights too (the single funnel every
         // weight upload passes through, so no loader can forget to account for a tensor).
         if matches!(usage, BufferUsage::HostWeights) {
@@ -7179,11 +7517,26 @@ impl VulkanBackend {
     /// The closure receives the command buffer handle to record into.
     /// The execution gate also excludes graph recording on this pool. The pool mutex alone
     /// cannot protect against a Recorder that released it after allocating its command buffer.
+    // `#[track_caller]` is what makes the flight recorder's per-submit label actionable: these
+    // submits are the engine's most numerous by far (one per small upload/download/fill), and the
+    // only thing that distinguishes them is WHERE they were issued from. The site string is only
+    // formatted when the flight recorder is active.
+    #[track_caller]
     fn one_shot(&self, f: impl FnOnce(vk::CommandBuffer)) -> Result<()> {
-        self.with_unified_exclusive(|| self.one_shot_locked(f))
+        let site = std::panic::Location::caller();
+        self.with_unified_exclusive(|| self.one_shot_locked_at(f, site))
     }
 
+    #[track_caller]
     fn one_shot_locked(&self, f: impl FnOnce(vk::CommandBuffer)) -> Result<()> {
+        self.one_shot_locked_at(f, std::panic::Location::caller())
+    }
+
+    fn one_shot_locked_at(
+        &self,
+        f: impl FnOnce(vk::CommandBuffer),
+        site: &std::panic::Location<'_>,
+    ) -> Result<()> {
         let device = &self.shared.device;
         // Vulkan command-pool access is externally synchronized. Keep this guard until
         // `OneShotCommand` frees the command buffer on every success/error path.
@@ -7217,8 +7570,9 @@ impl VulkanBackend {
 
         let cmds = [cmd];
         let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+        let label = format!("one-shot queue_submit @ {}:{}", site.file(), site.line());
         self.shared
-            .queue_submit_recovering(&[submit], vk::Fence::null(), None, "one-shot queue_submit")
+            .queue_submit_recovering(&[submit], vk::Fence::null(), None, &label)
             .map_err(|e| be(format!("queue_submit: {e}")))?;
 
         self.shared
@@ -7235,6 +7589,10 @@ impl VulkanBackend {
 impl Backend for VulkanBackend {
     fn name(&self) -> &str {
         "vulkan"
+    }
+
+    fn backend_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -7287,7 +7645,12 @@ impl Backend for VulkanBackend {
     }
 
     fn segmented_kv_available(&self) -> bool {
-        self.unified_vram().is_some()
+        // The elastic pool is the preferred backing but no longer the only one: without a pool (a
+        // layer-split device — `PipelineBackend`) segments are allocated on their own through the
+        // `KvCache` arm, which is already VRAM-first with a host-RAM spill. That spill is exactly
+        // what a windowed KV needs: a pool could only ever place a segment INSIDE VRAM, so it can
+        // never express "hot window resident, cold tail in system RAM".
+        self.unified_vram().is_some() || kv_overflow_enabled(&self.cfg)
     }
 
     fn ensure_segmented_kv(&self, buffer: &dyn Buffer, segments: usize) -> Result<()> {
@@ -7831,6 +8194,33 @@ impl Backend for VulkanBackend {
             .map_err(|e| be(format!("device_wait_idle: {e}")))
     }
 
+    /// Through the trait, `defer_session_finalization` must reach the SAME policy the inherent
+    /// method drives: an engine holding the backend as `dyn Backend` (the batched seam) would
+    /// otherwise silently skip the deferral and let the unified arena finalize mid-load.
+    fn defer_session_finalization(&self, deferred: bool) {
+        VulkanBackend::defer_session_finalization(self, deferred);
+    }
+
+    fn finish_deferred_session_allocations(&self) -> Result<()> {
+        VulkanBackend::finish_deferred_session_allocations(self)
+    }
+
+    fn release_primary_runtime_after_cohort_shrink(&self) {
+        VulkanBackend::release_primary_runtime_after_cohort_shrink(self);
+    }
+
+    fn release_moe_load_reservation(&self) {
+        VulkanBackend::release_moe_load_reservation(self);
+    }
+
+    fn print_moe_pager_stats(&self) {
+        VulkanBackend::print_moe_pager_stats(self);
+    }
+
+    fn print_dense_pager_stats(&self) {
+        VulkanBackend::print_dense_pager_stats(self);
+    }
+
     fn moe_paged(&self) -> bool {
         self.moe_pager.lock().unwrap().is_some()
     }
@@ -8350,7 +8740,7 @@ mod tests {
                     for parallel in [false, true] {
                         assert_eq!(
                             use_qsa_topk_scan(None, measured, rows, top, parallel),
-                            measured && parallel && rows == 1 && top == 512
+                            measured && parallel && top == 512
                         );
                         assert!(!use_qsa_topk_scan(
                             Some(false),
@@ -8746,6 +9136,22 @@ mod tests {
         }
         assert_eq!(update.cap, AGGRESSIVE_SUBMIT_EXPLORE_CAP);
         assert_eq!(update.stop, Some(SubmitTuneStop::NoSplit));
+    }
+
+    #[test]
+    fn submit_auto_policy_never_grows_past_its_explore_ceiling() {
+        let mut policy = submit_policy(infr_core::config::AutoProfile::Aggressive);
+        policy.cap = AGGRESSIVE_SUBMIT_EXPLORE_CAP;
+
+        let sample = submit_sample(1_600_000, AGGRESSIVE_SUBMIT_EXPLORE_CAP);
+        assert_eq!(
+            policy.observe_round(sample, 1).cap,
+            AGGRESSIVE_SUBMIT_EXPLORE_CAP
+        );
+        let update = policy.observe_round(sample, 1);
+
+        assert_eq!(update.cap, AGGRESSIVE_SUBMIT_EXPLORE_CAP);
+        assert_eq!(update.stop, None);
     }
 
     #[test]
@@ -9697,6 +10103,8 @@ mod tests {
             }],
             prefill_target_lanes: 1,
             prefill_cache_bytes: (SLOT * SLOTS) as u64,
+            reuse_existing: false,
+            private_unified_arena: false,
         })
         .expect("init pager");
         let pool = be.unified_vram().expect("unified pool");
@@ -9864,6 +10272,8 @@ mod tests {
             }],
             prefill_target_lanes: 2,
             prefill_cache_bytes: 8192,
+            reuse_existing: false,
+            private_unified_arena: false,
         })
         .expect("init_moe_pager");
         let weak = Arc::downgrade(&be.shared);

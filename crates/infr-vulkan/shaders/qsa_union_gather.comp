@@ -1,0 +1,89 @@
+#version 460
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+// QSA prefill union planner, pass 4: copy the union's K/V into one contiguous planar-Q8 plane set.
+//
+// One workgroup owns one (union block, KV head) and copies its `ratio` keys of both planes, so the
+// walk of the source cache is in ascending block order — a streaming read of the segmented cache
+// instead of the per-row scatter it replaces. The destination keeps infr's planar Q8 layout exactly
+// (`[codes][f16 scales per 32 codes]`), which is what lets the attention kernel dequantize the
+// compact plane with the very same `stage_q8_quad` shape, only off a different base.
+//
+// Layout (HEAD_DIM = 256): per (plane, KV head) UK_KEYS keys of 68 words — 64 code words then 4
+// scale words — with the scale region of the *plane* starting at word UK_KEYS * 64. Planes are
+// ordered K(head 0), K(head 1), V(head 0), V(head 1).
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint kv_len;
+    uint top_blocks;
+    uint ratio;
+    uint n_kv;
+    uint blocks;
+    uint segment_shift;
+} pc;
+
+layout(binding = 0) readonly buffer BB { uint bits[]; };
+layout(binding = 1) readonly buffer LB { uint list[]; }; // union list: list[rank] = block id
+layout(binding = 2) readonly buffer KB { uvec2 k_segments[]; };
+layout(binding = 3) readonly buffer VB { uvec2 v_segments[]; };
+layout(binding = 4) buffer UKV { uint uk[]; };
+
+#define KV_SEGMENTED
+#include "kv_addr.glsl"
+
+#define UK_KEYS 32768u
+#define UK_PLANE_WORDS (UK_KEYS * 68u)
+#define UK_CODE_WORDS (UK_KEYS * 64u)
+
+// Per-key source descriptors for this workgroup's block (GLSL wants `shared` at global scope).
+shared uvec2 k_seg[4];
+shared uvec2 v_seg[4];
+shared uint k_local[4];
+shared uint v_local[4];
+
+void main() {
+    if (bits[0] != 0u) {
+        return;
+    }
+    uint block = gl_WorkGroupID.x;
+    uint head = gl_WorkGroupID.y;
+    if (block >= bits[1] || head >= pc.n_kv) {
+        return;
+    }
+    uint src_block = list[block];
+    uint key_index = block * pc.ratio;
+    uint t = gl_LocalInvocationID.x;
+    uint segment_elems = 1u << pc.segment_shift;
+    uint k_plane = head * UK_PLANE_WORDS;
+    uint v_plane = (2u + head) * UK_PLANE_WORDS;
+
+    if (t < pc.ratio) {
+        uint elem = (src_block * pc.ratio + t) * pc.n_kv * 256u + head * 256u;
+        k_seg[t] = k_segments[kv_segment(elem, pc.segment_shift)];
+        k_local[t] = kv_segment_local(elem, pc.segment_shift);
+        v_seg[t] = v_segments[kv_segment(elem, pc.segment_shift)];
+        v_local[t] = kv_segment_local(elem, pc.segment_shift);
+    }
+    barrier();
+
+    for (uint i = t; i < pc.ratio * 64u; i += 128u) {
+        uint key = i >> 6u;
+        uint word = i & 63u;
+        uint dst = (key_index + key) * 64u + word;
+        uk[k_plane + dst] = kv_word(kv_segment_base(k_seg[key]), (k_local[key] >> 2u) + word);
+        uk[v_plane + dst] = kv_word(kv_segment_base(v_seg[key]), (v_local[key] >> 2u) + word);
+    }
+    for (uint i = t; i < pc.ratio * 4u; i += 128u) {
+        uint key = i >> 2u;
+        uint scale = i & 3u;
+        uint dst = (key_index + key) * 4u + scale;
+        uk[k_plane + UK_CODE_WORDS + dst] =
+            kv_word(kv_segment_base(k_seg[key]), (segment_elems >> 2u) + (k_local[key] >> 6u) + scale);
+        uk[v_plane + UK_CODE_WORDS + dst] =
+            kv_word(kv_segment_base(v_seg[key]), (segment_elems >> 2u) + (v_local[key] >> 6u) + scale);
+    }
+}

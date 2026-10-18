@@ -74,6 +74,9 @@ pub enum TpRole {
     /// a sharded input and producing a PARTIAL full-width sum. attn_output / ffn_down. Followed by
     /// an all-reduce.
     Row,
+    /// Expert-parallel: each rank owns a contiguous band of a stacked expert bank. The op keeps
+    /// its full routing geometry and writes a partial full-width output that is all-reduced.
+    Expert,
     /// Replicated: the full tensor lives on every rank, identical (norms, biases, embeddings, the
     /// LM head). A projection reading it is replicated (Rep in → Rep out).
     Replicated,
@@ -212,6 +215,15 @@ impl Plan for TpPlan {
 /// P2P all-reduce per attention + per FFN.
 pub struct TensorParallelBackend {
     ranks: Vec<VulkanBackend>,
+    /// Global attention/FFN geometry accepted from the constructor and used by the binder/lowering.
+    n_head: usize,
+    n_kv: usize,
+    n_ff: usize,
+    /// Global routed-expert count. Zero disables the MoE/expert-parallel lowering.
+    n_expert: usize,
+    /// Qwen3.8 attention/recurrent state is replicated (not head-sharded), so its KV buffers must
+    /// be full-width replicas rather than the usual 1/W head slices.
+    replicate_kv: bool,
     /// Try the host-less external-memory (dma-buf) all-reduce transport; falls back per pair.
     use_p2p: bool,
 }
@@ -227,6 +239,20 @@ impl TensorParallelBackend {
         n_ff: usize,
         use_p2p: bool,
     ) -> Result<Self> {
+        Self::new_ext(ranks, n_head, n_kv, n_ff, 0, false, use_p2p)
+    }
+
+    /// Full constructor used by the Qwen3.8 session path. `n_expert > 0` enables expert-parallel
+    /// lowering of `Op::MoeFfn`; `replicate_kv` keeps replicated attention/recurrent caches full.
+    pub fn new_ext(
+        ranks: Vec<VulkanBackend>,
+        n_head: usize,
+        n_kv: usize,
+        n_ff: usize,
+        n_expert: usize,
+        replicate_kv: bool,
+        use_p2p: bool,
+    ) -> Result<Self> {
         if ranks.is_empty() {
             return Err(be("tp: needs at least one device"));
         }
@@ -239,11 +265,28 @@ impl TensorParallelBackend {
                 )));
             }
         }
-        Ok(Self { ranks, use_p2p })
+        if n_expert != 0 && !n_expert.is_multiple_of(w) {
+            return Err(be(format!(
+                "tp: n_expert={n_expert} is not divisible by the {w}-way world"
+            )));
+        }
+        Ok(Self {
+            ranks,
+            n_head,
+            n_kv,
+            n_ff,
+            n_expert,
+            replicate_kv,
+            use_p2p,
+        })
     }
 
     pub fn world(&self) -> usize {
         self.ranks.len()
+    }
+
+    pub fn n_expert(&self) -> usize {
+        self.n_expert
     }
 
     /// The real backend for rank `r` — the binder allocs/uploads each per-rank weight slice through it.
@@ -337,6 +380,9 @@ impl TensorParallelBackend {
         let mut boundary: HashSet<TensorId> = HashSet::new();
         // op indices AFTER which a segment cut + all-reduce happens (the row-parallel Linears).
         let mut cuts: Vec<usize> = Vec::new();
+        // Expert-bank tensors whose per-rank buffers hold only E/W experts.
+        let mut expert_bank_tids: HashSet<TensorId> = HashSet::new();
+        let mut n_moe = 0usize;
 
         let wu = w as u32;
         for i in 0..n_ops {
@@ -388,7 +434,47 @@ impl TensorParallelBackend {
                             )?;
                             state.insert(dst, Shard::Rep);
                         }
+                        TpRole::Expert => {
+                            return Err(be(format!(
+                                "tp: expert-bank role bound to an Op::Linear at op {i}"
+                            )));
+                        }
                     }
+                }
+                Op::MoeFfn {
+                    x,
+                    router_x,
+                    gate_exps,
+                    up_exps,
+                    down_exps,
+                    n_expert,
+                    dst,
+                    ..
+                } => {
+                    require(
+                        shard_of(&state, x) == Shard::Rep
+                            && shard_of(&state, router_x) == Shard::Rep,
+                        i,
+                        "expert-parallel MoE needs replicated activations",
+                    )?;
+                    if self.n_expert == 0 || (n_expert as usize) != self.n_expert {
+                        return Err(be(format!(
+                            "tp: Op::MoeFfn n_expert={n_expert} disagrees with backend n_expert={}",
+                            self.n_expert
+                        )));
+                    }
+                    if !(n_expert as usize).is_multiple_of(w) {
+                        return Err(be(format!(
+                            "tp: Op::MoeFfn n_expert={n_expert} not divisible by world {w}"
+                        )));
+                    }
+                    expert_bank_tids.insert(gate_exps);
+                    expert_bank_tids.insert(up_exps);
+                    expert_bank_tids.insert(down_exps);
+                    n_moe += 1;
+                    state.insert(dst, Shard::Rep);
+                    boundary.insert(dst);
+                    cuts.push(i);
                 }
                 Op::RmsNorm { x, dst, .. } | Op::RmsNormAdd { x, dst, .. } => {
                     require(
@@ -498,11 +584,26 @@ impl TensorParallelBackend {
                     state.insert(dst, Shard::Rep);
                 }
                 other => {
-                    return Err(be(format!(
-                        "tp: op {i} ({}) is not supported by tensor parallelism (dense attention \
-                         models only — MoE / DeltaNet / conv are rejected)",
-                        other.kind()
-                    )));
+                    if self.n_expert == 0 {
+                        return Err(be(format!(
+                            "tp: op {i} ({}) is not supported by dense tensor parallelism",
+                            other.kind()
+                        )));
+                    }
+                    // Qwen3.8's recurrent/QSA/hyper-connection ops are kept replicated: their
+                    // attention and state stay full-width on every rank, while the dense FFN and
+                    // routed experts around them are the sharded compute.
+                    let (read, written) = other.io();
+                    for t in read {
+                        require(
+                            shard_of(&state, t) == Shard::Rep,
+                            i,
+                            "replicated Qwen3.8 op reads a sharded tensor",
+                        )?;
+                    }
+                    for t in written {
+                        state.insert(t, Shard::Rep);
+                    }
                 }
             }
         }
@@ -526,7 +627,7 @@ impl TensorParallelBackend {
             let sharded_weight = decl.kind == TensorKind::Weight
                 && matches!(
                     bindings.get(tid).map(Self::weight_role),
-                    Some(TpRole::Column | TpRole::Row)
+                    Some(TpRole::Column | TpRole::Row | TpRole::Expert)
                 );
             let sharded_scratch =
                 decl.kind == TensorKind::Internal && state.get(&tid) == Some(&Shard::Sharded);
@@ -562,8 +663,17 @@ impl TensorParallelBackend {
                 .collect();
             sub.no_decode_replay = true;
             let mut plans = Vec::with_capacity(w);
+            let experts_per_rank = self.n_expert / w;
             for r in 0..w {
-                plans.push(self.ranks[r].compile(&sub)?);
+                let mut rank_sub = sub.clone();
+                if n_moe > 0 {
+                    for op in &mut rank_sub.ops {
+                        if let Op::MoeFfn { ep_band, .. } = op {
+                            *ep_band = Some(((r * experts_per_rank) as u32, experts_per_rank as u32));
+                        }
+                    }
+                }
+                plans.push(self.ranks[r].compile(&rank_sub)?);
             }
             // Tensors this segment must have bound.
             let mut needed: HashSet<TensorId> = HashSet::new();
@@ -676,6 +786,10 @@ impl Backend for TensorParallelBackend {
         "vulkan-tensor-parallel"
     }
 
+    fn backend_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     fn capabilities(&self) -> Capabilities {
         // Rank 0's caps with every fast path the TP lowering does not model turned OFF: the runner
         // then takes the classic host-embed + host-sample static path over SEPARATE q/k/v/gate/up
@@ -683,9 +797,9 @@ impl Backend for TensorParallelBackend {
         // cleanly sliceable weight + op), which is the only shape TP shards.
         let mut c = self.ranks[0].capabilities();
         c.decode_replay = false;
-        c.embed_gather = false;
+        c.embed_gather = true;
         c.gpu_sample = false;
-        c.argmax_rows = false;
+        c.argmax_rows = true;
         c.argmax_prob = false;
         c.combined_gu = false;
         c.qsa_prepare = false;
@@ -701,6 +815,9 @@ impl Backend for TensorParallelBackend {
     fn alloc(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>> {
         match usage {
             BufferUsage::KvCache => {
+                if self.replicate_kv {
+                    return self.replicate(|b| b.alloc(bytes, usage));
+                }
                 // `bytes` is the LOGICAL (full-width) cache size; shard_bytes takes it to this
                 // rank's heads' slice. The resulting TpBuffer reports the logical size again from
                 // len_bytes(), so a caller that re-allocs from it does NOT shard a second time.
@@ -724,6 +841,9 @@ impl Backend for TensorParallelBackend {
     fn alloc_uninit(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>> {
         match usage {
             BufferUsage::KvCache => {
+                if self.replicate_kv {
+                    return self.replicate(|b| b.alloc_uninit(bytes, usage));
+                }
                 let w = self.world();
                 let per = self.shard_bytes(bytes)?;
                 let mut bufs = Vec::with_capacity(w);
@@ -826,19 +946,39 @@ impl Backend for TensorParallelBackend {
         let w = self.world();
 
         for seg in &prep.segments {
-            // Run this segment on every rank (independent devices).
-            for r in 0..w {
-                let mut sub = Bindings::new();
-                for &t in &seg.needed {
-                    if let Some(bufs) = prep.boundary.get(&t) {
-                        sub.bind(t, bufs[r].as_ref());
-                    } else if let Some(buf) = bindings.get(t) {
-                        sub.bind(t, as_tp(buf)?.on(r)?);
-                    }
-                    // (unbound = a resized Internal scratch the rank allocates itself)
+            // Run every rank concurrently. Each rank owns its own queue/backend; the all-reduce
+            // after the join is the cross-rank ordering point.
+            std::thread::scope(|scope| -> Result<()> {
+                let mut workers = Vec::with_capacity(w);
+                for r in 0..w {
+                    let rank = &self.ranks[r];
+                    let plan = &seg.plans[r];
+                    let needed = &seg.needed;
+                    let boundary = &prep.boundary;
+                    workers.push(scope.spawn(move || -> Result<()> {
+                        let mut sub = Bindings::new();
+                        for &t in needed {
+                            if let Some(bufs) = boundary.get(&t) {
+                                sub.bind(t, bufs[r].as_ref());
+                            } else if let Some(buf) = bindings.get(t) {
+                                sub.bind(t, as_tp(buf)?.on(r)?);
+                            }
+                        }
+                        rank.execute(plan.as_ref(), &sub)
+                    }));
                 }
-                self.ranks[r].execute(seg.plans[r].as_ref(), &sub)?;
-            }
+                let mut first_err = None;
+                for worker in workers {
+                    match worker.join() {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            first_err.get_or_insert(error);
+                        }
+                        Err(_) => return Err(be("tp: rank worker panicked")),
+                    }
+                }
+                first_err.map_or(Ok(()), Err)
+            })?;
             // All-reduce the boundary partial across ranks (sum), so the next segment's residual Add
             // reads the full sum identically on every rank.
             if let Some(tid) = seg.reduce {

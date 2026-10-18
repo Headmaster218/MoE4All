@@ -16,6 +16,9 @@ use crate::{as_vk_buf, be, VulkanBackend};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeviceArenaBacking {
     MappedDeviceLocal,
+    /// Host-visible SYSTEM RAM (`paging.moe_arena_host`): the CPU push is a RAM→RAM memcpy and the
+    /// GPU fetches the arena across PCIe, instead of the CPU writing into a ReBAR BAR window.
+    MappedHost,
     DeviceLocal,
 }
 
@@ -102,6 +105,11 @@ impl DeviceArena {
                 .ok_or_else(|| be("device arena byte size overflow"))
         })?;
         let mapped_capacity = mapped_device_local_heap_capacity(vk);
+        // paging.moe_arena_host: take the host-RAM arena when asked, ahead of the ReBAR preference.
+        if vk.cfg().paging.moe_arena_host {
+            return Self::allocate(vk, shard_sizes, DeviceArenaBacking::MappedHost)
+                .map_err(|error| be(format!("host-RAM MoE arena allocation failed: {error}")));
+        }
         let preferred = choose_backing(required, mapped_capacity);
 
         if preferred == DeviceArenaBacking::MappedDeviceLocal {
@@ -137,14 +145,19 @@ impl DeviceArena {
         for &bytes in shard_sizes {
             let (buffer, base_addr) = match backing {
                 DeviceArenaBacking::MappedDeviceLocal => vk.alloc_mapped_arena_bda(bytes)?,
+                DeviceArenaBacking::MappedHost => vk.alloc_mapped_arena_host_bda(bytes)?,
                 DeviceArenaBacking::DeviceLocal => vk.alloc_device_local_arena_bda(bytes)?,
             };
             let buffer: Arc<dyn Buffer> = Arc::from(buffer);
             let mapped_ptr = as_vk_buf(buffer.as_ref())?
                 .mapped_ptr()
                 .map(|ptr| ptr as usize);
-            if backing == DeviceArenaBacking::MappedDeviceLocal && mapped_ptr.is_none() {
-                return Err(be("mapped device-local arena shard has no CPU mapping"));
+            if matches!(
+                backing,
+                DeviceArenaBacking::MappedDeviceLocal | DeviceArenaBacking::MappedHost
+            ) && mapped_ptr.is_none()
+            {
+                return Err(be("mapped arena shard has no CPU mapping"));
             }
             shards.push(Arc::new(DeviceArenaShard {
                 buffer,

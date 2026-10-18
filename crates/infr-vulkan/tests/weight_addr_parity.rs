@@ -37,8 +37,10 @@
 //!
 //! Run: `cargo test -p infr-vulkan --test weight_addr_parity -- --ignored --nocapture`
 use infr_core::backend::{Backend, BufferUsage};
+use infr_core::config::Config;
 use infr_core::DType;
 use infr_vulkan::VulkanBackend;
+use std::sync::Arc;
 
 /// Pseudo-random weight bytes in `0x00..=0x3F` — see the module header for why the range matters.
 fn synth_weight_bytes(n: usize, seed: usize) -> Vec<u8> {
@@ -960,25 +962,46 @@ fn id_matches_resident() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn idm_matches_resident() {
-    let Ok(be) = VulkanBackend::new() else {
+    let mut cfg = Config::default();
+    // Force the immutable-codebook resident route on so the IQ3_S leg exercises the new streamed
+    // buffer build instead of the default LDS-staged tree kernel.
+    cfg.kernels.vulkan.gemv.id_stream_grid_buffer = true;
+    let Ok(be) = VulkanBackend::new_with(Arc::new(cfg)) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
-    let (in_f, out_f, n_expert, n_used) = (256usize, 8usize, 4usize, 4usize);
-    let x = synth_x(in_f);
-    let x_buf = be.alloc(in_f * 4, BufferUsage::Activations).unwrap();
+    let (in_f, out_f, n_expert, n_used, rows) = (2560usize, 640usize, 4usize, 4usize, 2usize);
+    let x = synth_x(in_f * rows);
+    let x_buf = be
+        .alloc(in_f * rows * 4, BufferUsage::Activations)
+        .unwrap();
     be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
     // Permuted, all-distinct ids: a stride bug scrambles WHICH expert each slot reads, so outputs
     // land wrong even when every expert is resident.
-    let ids_buf = be.alloc(n_used * 4, BufferUsage::Activations).unwrap();
-    be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&[2u32, 0, 3, 1]))
+    let ids_buf = be
+        .alloc(n_used * rows * 4, BufferUsage::Activations)
         .unwrap();
+    be.upload(
+        ids_buf.as_ref(),
+        bytemuck::cast_slice(&[2u32, 0, 3, 1, 1, 3, 0, 2]),
+    )
+    .unwrap();
 
     // Q6K takes the SG route on both sides (native_id_sg_choice); Q4K/Q8_0/F16 the tree kernel.
-    for dtype in [DType::Q4K, DType::Q6K, DType::Q8_0, DType::F16] {
+    for dtype in [
+        DType::Q4K,
+        DType::Q6K,
+        DType::Q8_0,
+        DType::F16,
+        DType::Iq2S,
+        DType::Iq2Xxs,
+        DType::Iq2Xs,
+        DType::Iq3Xxs,
+        DType::Iq3S,
+    ] {
         let bank = synth_bank(dtype, in_f, out_f, n_expert);
         let y_buf = be
-            .alloc(n_used * out_f * 4, BufferUsage::Activations)
+            .alloc(n_used * rows * out_f * 4, BufferUsage::Activations)
             .unwrap();
 
         let w_buf = be.alloc(bank.bytes.len(), BufferUsage::Weights).unwrap();
@@ -995,10 +1018,10 @@ fn idm_matches_resident() {
             y_buf.as_ref(),
             in_f,
             out_f,
-            1,
+            rows,
         );
         rec.finish().unwrap();
-        let mut out = vec![0u8; n_used * out_f * 4];
+        let mut out = vec![0u8; n_used * rows * out_f * 4];
         be.download(y_buf.as_ref(), &mut out).unwrap();
         let resident = bits(&out);
         assert!(
@@ -1023,10 +1046,10 @@ fn idm_matches_resident() {
             y_buf.as_ref(),
             in_f,
             out_f,
-            1,
+            rows,
         );
         rec.finish().unwrap();
-        let mut out = vec![0u8; n_used * out_f * 4];
+        let mut out = vec![0u8; n_used * rows * out_f * 4];
         be.download(y_buf.as_ref(), &mut out).unwrap();
         let streamed = bits(&out);
         for (i, (&r, &s)) in resident.iter().zip(streamed.iter()).enumerate() {

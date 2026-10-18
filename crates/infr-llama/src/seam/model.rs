@@ -235,6 +235,72 @@ impl DenseVulkanSession {
     }
 }
 
+/// The layer-split twin of [`DenseVulkanSession`]: the SAME persistent session machinery (slot
+/// pool, suffix-only prefill) over an [`infr_vulkan::PipelineBackend`], so a model whose weights
+/// only fit across two cards runs as ONE session instead of the one-shot `infr run` path. Built by
+/// [`SeamModel::vulkan_pipeline_session_on`]; see `crate::seam::open_pipeline_backend`.
+pub type DensePipelineSession = DenseSession<infr_vulkan::PipelineBackend, VulkanSessionPins>;
+
+impl DensePipelineSession {
+    /// This session's placement pins (see [`VulkanSessionPins`]).
+    pub(crate) fn pins(&self) -> &std::sync::Arc<crate::seam::PlacementPins> {
+        &self.ext.0
+    }
+}
+
+/// The row-parallel dense + expert-parallel MoE twin of [`DenseVulkanSession`]. It uses both cards
+/// concurrently for every layer instead of placing whole layers on one card.
+pub type DenseEpSession = DenseSession<infr_vulkan::ExpertParallelBackend, VulkanSessionPins>;
+
+impl DenseEpSession {
+    pub(crate) fn pins(&self) -> &std::sync::Arc<crate::seam::PlacementPins> {
+        &self.ext.0
+    }
+}
+
+/// Qwen3.8 hybrid tensor/expert-parallel session.
+pub type DenseTpSession = DenseSession<infr_vulkan::TensorParallelBackend, VulkanSessionPins>;
+
+impl DenseTpSession {
+    pub(crate) fn pins(&self) -> &std::sync::Arc<crate::seam::PlacementPins> {
+        &self.ext.0
+    }
+}
+
+/// The session a [`DenseSeamChat`](crate::chat::DenseSeamChat) holds: single-device by default, or
+/// the layer-split pipeline session when `INFR_PIPELINE` names >= 2 devices. Both arms are the same
+/// [`DenseSession`] machinery with a different backend, so every turn goes through ONE dispatcher —
+/// [`SeamModel::generate_seam_session_turn_with_checkpoints_constrained`].
+pub enum SeamSession {
+    Single(DenseVulkanSession),
+    Pipeline(DensePipelineSession),
+    ExpertParallel(DenseEpSession),
+    TensorParallel(DenseTpSession),
+}
+
+impl SeamSession {
+    /// Drop every slot's materialized tokens ([`DenseSession::reset_cache`]).
+    pub fn reset_cache(&mut self) {
+        match self {
+            Self::Single(s) => s.reset_cache(),
+            Self::Pipeline(s) => s.reset_cache(),
+            Self::ExpertParallel(s) => s.reset_cache(),
+            Self::TensorParallel(s) => s.reset_cache(),
+        }
+    }
+
+    /// The backend this session owns, exposed to detached MTP runtimes that share its placement
+    /// and weight upload instead of opening a second device backend.
+    pub(crate) fn backend(&self) -> &dyn Backend {
+        match self {
+            Self::Single(s) => &s.be,
+            Self::Pipeline(s) => &s.be,
+            Self::ExpertParallel(s) => &s.be,
+            Self::TensorParallel(s) => &s.be,
+        }
+    }
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl SlotPool {
     fn new() -> Self {
@@ -500,6 +566,80 @@ impl SeamModel {
             max_ctx,
             cfg: self.ecfg.clone(),
             ext: VulkanSessionPins(std::sync::Arc::new(crate::seam::PlacementPins::default())),
+        })
+    }
+
+    /// [`vulkan_session`](Self::vulkan_session) on a LAYER-SPLIT backend
+    /// (`INFR_PIPELINE=Vulkan0,Vulkan2`): each device keeps its own layers' weights + KV, so ONE
+    /// session spans cards that no single card fits — the multi-device shape `serve` had no path
+    /// to. `max_ctx = None` applies the single-device default's VRAM-budget clamp, measured on the
+    /// placement's first device.
+    pub fn vulkan_pipeline_session_on(
+        &self,
+        devices: &[usize],
+        max_ctx: Option<usize>,
+    ) -> Result<DensePipelineSession> {
+        let pb = crate::seam::open_pipeline_backend(devices, &self.gguf, &self.cfg, &self.ecfg)?;
+        let pins = std::sync::Arc::new(crate::seam::PlacementPins::default());
+        let scope = crate::seam::PlacementScope::enter(pins.clone());
+        let max_ctx = match max_ctx {
+            Some(ctx) => ctx,
+            None => self.clamp_default_ctx(pb.backend(0), self.cfg.n_ctx_train)?,
+        };
+        drop(scope);
+        Ok(DensePipelineSession {
+            be: pb,
+            pool: SlotPool::new(),
+            max_ctx,
+            cfg: self.ecfg.clone(),
+            ext: VulkanSessionPins(pins),
+        })
+    }
+
+    /// Persistent session over the row-parallel dense + expert-parallel MoE backend. Every layer's
+    /// sharded projections run on both cards concurrently and reduce per boundary.
+    pub fn vulkan_expert_parallel_session_on(
+        &self,
+        devices: &[usize],
+        max_ctx: Option<usize>,
+    ) -> Result<DenseEpSession> {
+        let ep = crate::seam::open_expert_parallel_backend(devices, &self.cfg, &self.ecfg)?;
+        let pins = std::sync::Arc::new(crate::seam::PlacementPins::default());
+        let scope = crate::seam::PlacementScope::enter(pins.clone());
+        let max_ctx = match max_ctx {
+            Some(ctx) => ctx,
+            None => self.clamp_default_ctx(ep.rank(0), self.cfg.n_ctx_train)?,
+        };
+        drop(scope);
+        Ok(DenseEpSession {
+            be: ep,
+            pool: SlotPool::new(),
+            max_ctx,
+            cfg: self.ecfg.clone(),
+            ext: VulkanSessionPins(pins),
+        })
+    }
+
+    /// Qwen3.8 hybrid TP+EP session: FFN/experts sharded, attention/recurrent state replicated.
+    pub fn vulkan_tensor_parallel_session_on(
+        &self,
+        devices: &[usize],
+        max_ctx: Option<usize>,
+    ) -> Result<DenseTpSession> {
+        let tp = crate::seam::open_qwen4_tensor_parallel_backend(devices, &self.cfg, &self.ecfg)?;
+        let pins = std::sync::Arc::new(crate::seam::PlacementPins::default());
+        let scope = crate::seam::PlacementScope::enter(pins.clone());
+        let max_ctx = match max_ctx {
+            Some(ctx) => ctx,
+            None => self.clamp_default_ctx(tp.rank(0), self.cfg.n_ctx_train)?,
+        };
+        drop(scope);
+        Ok(DenseTpSession {
+            be: tp,
+            pool: SlotPool::new(),
+            max_ctx,
+            cfg: self.ecfg.clone(),
+            ext: VulkanSessionPins(pins),
         })
     }
 
@@ -913,6 +1053,198 @@ impl SeamModel {
             session.max_ctx = kv.max_ctx();
         }
         Ok(stats)
+    }
+
+    /// Pipeline twin of
+    /// [`generate_vulkan_session_turn_with_checkpoints_constrained`](Self::generate_vulkan_session_turn_with_checkpoints_constrained):
+    /// the SAME session turn over a [`DensePipelineSession`] (layer-split placement, pipeline
+    /// binder, no pager).
+    pub fn generate_vulkan_pipeline_session_turn_with_checkpoints_constrained(
+        &self,
+        session: &mut DensePipelineSession,
+        prompt: &str,
+        max_new: usize,
+        checkpoint_prefixes: crate::seam::TurnCheckpointPrefixes<'_>,
+        constraint: Option<&mut crate::grammar::Constraint>,
+        req: Option<&crate::sampling::RequestCtx>,
+        mut on_piece: impl FnMut(&str),
+    ) -> Result<crate::GenStats> {
+        let prompt_tokens: Vec<u32> = self.encode(prompt)?;
+        let turn_checkpoint = self.turn_checkpoints(&prompt_tokens, checkpoint_prefixes)?;
+        let mut acc: Vec<u32> = Vec::new();
+        let mut printed = 0usize;
+        let slot = session
+            .pool
+            .pick(&session.be, &self.cfg, &session.cfg, &prompt_tokens)?;
+        let max_ctx = session.max_ctx;
+        let max_new = max_new.min(max_ctx.saturating_sub(prompt_tokens.len() + 1));
+        let _scope = crate::seam::PlacementScope::enter(session.pins().clone());
+        let (_generated, stats) = crate::seam::generate_dense_vulkan_pipeline_session(
+            &session.be,
+            &self.gguf,
+            &self.cfg,
+            &session.cfg,
+            self.embd(),
+            self.per_layer_embd.as_ref(),
+            &prompt_tokens,
+            max_new,
+            |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
+            &mut session.pool.slots[slot],
+            max_ctx,
+            turn_checkpoint,
+            constraint,
+            req,
+            None, // multimodal plan
+        )?;
+        // The cold init may have re-clamped the window to the memory actually free (see the
+        // single-device twin) — the slot's KV cache is the authority, not the opening value.
+        if let Some(kv) = session.pool.slots[slot].as_ref() {
+            session.max_ctx = kv.max_ctx();
+        }
+        Ok(stats)
+    }
+
+    /// EP twin of the pipeline session turn: both cards cooperate on every sharded projection.
+    pub fn generate_vulkan_ep_session_turn_with_checkpoints_constrained(
+        &self,
+        session: &mut DenseEpSession,
+        prompt: &str,
+        max_new: usize,
+        checkpoint_prefixes: crate::seam::TurnCheckpointPrefixes<'_>,
+        constraint: Option<&mut crate::grammar::Constraint>,
+        req: Option<&crate::sampling::RequestCtx>,
+        mut on_piece: impl FnMut(&str),
+    ) -> Result<crate::GenStats> {
+        let prompt_tokens: Vec<u32> = self.encode(prompt)?;
+        let turn_checkpoint = self.turn_checkpoints(&prompt_tokens, checkpoint_prefixes)?;
+        let mut acc: Vec<u32> = Vec::new();
+        let mut printed = 0usize;
+        let slot = session
+            .pool
+            .pick(&session.be, &self.cfg, &session.cfg, &prompt_tokens)?;
+        let max_ctx = session.max_ctx;
+        let max_new = max_new.min(max_ctx.saturating_sub(prompt_tokens.len() + 1));
+        let _scope = crate::seam::PlacementScope::enter(session.pins().clone());
+        let (_generated, stats) = crate::seam::generate_dense_vulkan_ep_session(
+            &session.be,
+            &self.gguf,
+            &self.cfg,
+            &session.cfg,
+            self.embd(),
+            self.per_layer_embd.as_ref(),
+            &prompt_tokens,
+            max_new,
+            |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
+            &mut session.pool.slots[slot],
+            max_ctx,
+            turn_checkpoint,
+            constraint,
+            req,
+            None,
+        )?;
+        if let Some(kv) = session.pool.slots[slot].as_ref() {
+            session.max_ctx = kv.max_ctx();
+        }
+        Ok(stats)
+    }
+
+    /// Hybrid TP+EP twin of the pipeline session turn.
+    pub fn generate_vulkan_tp_session_turn_with_checkpoints_constrained(
+        &self,
+        session: &mut DenseTpSession,
+        prompt: &str,
+        max_new: usize,
+        checkpoint_prefixes: crate::seam::TurnCheckpointPrefixes<'_>,
+        constraint: Option<&mut crate::grammar::Constraint>,
+        req: Option<&crate::sampling::RequestCtx>,
+        mut on_piece: impl FnMut(&str),
+    ) -> Result<crate::GenStats> {
+        let prompt_tokens: Vec<u32> = self.encode(prompt)?;
+        let turn_checkpoint = self.turn_checkpoints(&prompt_tokens, checkpoint_prefixes)?;
+        let mut acc: Vec<u32> = Vec::new();
+        let mut printed = 0usize;
+        let slot = session
+            .pool
+            .pick(&session.be, &self.cfg, &session.cfg, &prompt_tokens)?;
+        let max_ctx = session.max_ctx;
+        let max_new = max_new.min(max_ctx.saturating_sub(prompt_tokens.len() + 1));
+        let _scope = crate::seam::PlacementScope::enter(session.pins().clone());
+        let (_generated, stats) = crate::seam::generate_dense_vulkan_tp_session(
+            &session.be,
+            &self.gguf,
+            &self.cfg,
+            &session.cfg,
+            self.embd(),
+            self.per_layer_embd.as_ref(),
+            &prompt_tokens,
+            max_new,
+            |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
+            &mut session.pool.slots[slot],
+            max_ctx,
+            turn_checkpoint,
+            constraint,
+            req,
+            None,
+        )?;
+        if let Some(kv) = session.pool.slots[slot].as_ref() {
+            session.max_ctx = kv.max_ctx();
+        }
+        Ok(stats)
+    }
+
+    /// The ONE session-turn entry a chat uses, so no chat code names a backend: single-device
+    /// session, or layer-split pipeline session.
+    pub fn generate_seam_session_turn_with_checkpoints_constrained(
+        &self,
+        session: &mut SeamSession,
+        prompt: &str,
+        max_new: usize,
+        checkpoint_prefixes: crate::seam::TurnCheckpointPrefixes<'_>,
+        constraint: Option<&mut crate::grammar::Constraint>,
+        req: Option<&crate::sampling::RequestCtx>,
+        on_piece: impl FnMut(&str),
+    ) -> Result<crate::GenStats> {
+        match session {
+            SeamSession::Single(s) => self.generate_vulkan_session_turn_with_checkpoints_constrained(
+                s,
+                prompt,
+                max_new,
+                checkpoint_prefixes,
+                constraint,
+                req,
+                on_piece,
+            ),
+            SeamSession::Pipeline(s) => self
+                .generate_vulkan_pipeline_session_turn_with_checkpoints_constrained(
+                    s,
+                    prompt,
+                    max_new,
+                    checkpoint_prefixes,
+                    constraint,
+                    req,
+                    on_piece,
+                ),
+            SeamSession::ExpertParallel(s) => self
+                .generate_vulkan_ep_session_turn_with_checkpoints_constrained(
+                    s,
+                    prompt,
+                    max_new,
+                    checkpoint_prefixes,
+                    constraint,
+                    req,
+                    on_piece,
+                ),
+            SeamSession::TensorParallel(s) => self
+                .generate_vulkan_tp_session_turn_with_checkpoints_constrained(
+                    s,
+                    prompt,
+                    max_new,
+                    checkpoint_prefixes,
+                    constraint,
+                    req,
+                    on_piece,
+                ),
+        }
     }
 
     pub(crate) fn turn_checkpoints(

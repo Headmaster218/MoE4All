@@ -69,19 +69,32 @@ void main() {
             uint elem = block * HEAD_DIM;
             uint64_t base = block_segment_address(kv_segment(elem, pc.block_shift));
             uint local_base = kv_segment_local(elem, pc.block_shift);
-            for (uint d = lane; d < HEAD_DIM; d += 32u) {
-                ktile[bs][d] = kv_f32(base, local_base + d);
-            }
+            // Batch the four d-components into registers before the LDS stores: the previous
+            // load->store->load chain stalled one DRAM miss at a time.
+            float k0 = kv_f32(base, local_base + lane);
+            float k1 = kv_f32(base, local_base + lane + 32u);
+            float k2 = kv_f32(base, local_base + lane + 64u);
+            float k3 = kv_f32(base, local_base + lane + 96u);
+            ktile[bs][lane] = k0;
+            ktile[bs][lane + 32u] = k1;
+            ktile[bs][lane + 64u] = k2;
+            ktile[bs][lane + 96u] = k3;
         } else {
-            for (uint d = lane; d < HEAD_DIM; d += 32u) {
-                ktile[bs][d] = 0.0;
-            }
+            ktile[bs][lane] = 0.0;
+            ktile[bs][lane + 32u] = 0.0;
+            ktile[bs][lane + 64u] = 0.0;
+            ktile[bs][lane + 96u] = 0.0;
         }
     }
     barrier();
 
+    // Same formula, but the K tile loaded above now serves several row tiles: grid.y is capped
+    // by the caller and each workgroup walks the remaining row tiles with a NumWorkGroups stride.
+    // Previously every row tile re-loaded the identical 16 KiB of block keys.
+    for (uint row_base = gl_WorkGroupID.y * QUERY_TILE; row_base < pc.rows;
+         row_base += gl_NumWorkGroups.y * QUERY_TILE) {
     uint row = row_base + sg;
-    if (row >= pc.rows) { return; }
+    if (row >= pc.rows) { continue; }
 
     vec4 query[4];
     uint qbase = row * HEADS * HEAD_DIM;
@@ -112,5 +125,6 @@ void main() {
                     + max(heads.z, 0.0) + max(heads.w, 0.0)
             ) * pc.scale;
         }
+    }
     }
 }

@@ -12,7 +12,10 @@ use std::sync::{Arc, Mutex};
 
 const TABLE_NAME: &str = "per_layer_token_embd.weight";
 const SOURCE_PAGE_BYTES: usize = 4096;
-const MAX_GATHER_THREADS: usize = 4;
+// A verify row selects (ngram-1)*heads_per_ngram random 90-byte IQ4_NL rows from a ~27 GiB
+// NVMe-backed table. On a 16-core host, capping the gather at four concurrent page walks leaves
+// random-read latency exposed; 16 keeps enough misses in flight without saturating the CPU.
+const MAX_GATHER_THREADS: usize = 16;
 const PARALLEL_MIN_UNIQUE_ROWS: usize = 256;
 const OUTPUT_POOL_DEPTH: usize = 2;
 
@@ -31,21 +34,32 @@ struct Job {
 /// each job owns its reply channel, so several conversation slots can share the immutable table.
 pub(super) struct PleWorker {
     tx: SyncSender<Job>,
+    /// Shared worker state for the small-row synchronous path. Large prefill chunks keep using the
+    /// background worker so their gather can overlap GPU work; rows<=4 (decode/MTP verify) gather
+    /// inline instead of paying channel wake/queue latency on a 0.03 ms job.
+    state: Arc<Mutex<WorkerState>>,
 }
 
-pub(super) struct PleTicket(Receiver<Result<PleRows>>);
+pub(super) enum PleTicket {
+    Wait(Receiver<Result<PleRows>>),
+    Ready(Result<PleRows>),
+}
 
 impl PleTicket {
     pub(super) fn wait(self) -> Result<PleRows> {
-        let t0 = pager_profile::start();
-        let rows = self
-            .0
-            .recv()
-            .map_err(|_| anyhow!("qwen4exp PLE worker stopped before returning a row batch"))?;
-        if let Some(elapsed) = pager_profile::elapsed(t0) {
-            pager_profile::record_ple_wait(elapsed);
+        match self {
+            Self::Wait(rx) => {
+                let t0 = pager_profile::start();
+                let rows = rx.recv().map_err(|_| {
+                    anyhow!("qwen4exp PLE worker stopped before returning a row batch")
+                })?;
+                if let Some(elapsed) = pager_profile::elapsed(t0) {
+                    pager_profile::record_ple_wait(elapsed);
+                }
+                rows
+            }
+            Self::Ready(rows) => rows,
         }
-        rows
     }
 }
 
@@ -238,16 +252,21 @@ impl PleWorker {
             groups: Vec::new(),
         };
         let (tx, rx) = mpsc::sync_channel::<Job>(1);
+        let state = Arc::new(Mutex::new(state));
+        let worker_state = Arc::clone(&state);
         std::thread::Builder::new()
             .name("infr-qwen4-ple".into())
             .spawn(move || {
-                let mut state = state;
                 while let Ok(job) = rx.recv() {
-                    let _ = job.reply.send(state.gather_spans(&job.spans));
+                    let result = match worker_state.lock() {
+                        Ok(mut state) => state.gather_spans(&job.spans),
+                        Err(_) => Err(anyhow!("qwen4exp PLE worker state poisoned")),
+                    };
+                    let _ = job.reply.send(result);
                 }
             })
             .context("spawn qwen4exp PLE worker")?;
-        Ok(Some(Self { tx }))
+        Ok(Some(Self { tx, state }))
     }
 
     /// Start the SSD/mmap gather before layer 0 is submitted. Only the current token and at most
@@ -265,7 +284,15 @@ impl PleWorker {
         rows: usize,
         ngram: usize,
     ) -> Result<PleTicket> {
-        self.submit_spans(vec![ple_job_span(tokens, start, rows, ngram)?])
+        let span = ple_job_span(tokens, start, rows, ngram)?;
+        if rows <= 4 {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("qwen4exp PLE worker state poisoned"))?;
+            return Ok(PleTicket::Ready(state.gather_spans(&[span])));
+        }
+        self.submit_spans(vec![span])
     }
 
     /// Gather independent conversation rows in one source-sorted job. This lets concurrent decode
@@ -291,7 +318,7 @@ impl PleWorker {
         self.tx
             .send(Job { spans, reply })
             .map_err(|_| anyhow!("qwen4exp PLE worker is not running"))?;
-        Ok(PleTicket(rx))
+        Ok(PleTicket::Wait(rx))
     }
 }
 

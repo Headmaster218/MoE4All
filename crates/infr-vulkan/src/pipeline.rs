@@ -48,6 +48,27 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+thread_local! {
+    static HEAD_ALLOC_SCOPE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+fn in_head_alloc_scope() -> bool {
+    HEAD_ALLOC_SCOPE.with(std::cell::Cell::get)
+}
+
+/// RAII scope that marks buffers allocated by the detached MTP head. Trunk runtime/scratch
+/// allocations outside this scope stay on the trunk devices; head allocations replicate to (or
+/// pin on) the dedicated head backend.
+pub struct HeadAllocScope {
+    previous: bool,
+}
+
+impl Drop for HeadAllocScope {
+    fn drop(&mut self) {
+        HEAD_ALLOC_SCOPE.with(|scope| scope.set(self.previous));
+    }
+}
+
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, Plan};
 use infr_core::error::Result;
 use infr_core::graph::Graph;
@@ -65,7 +86,16 @@ pub struct PipelineBuffer {
     /// replica on device `i` (len == number of devices).
     device: Option<usize>,
     bufs: Vec<Box<dyn Buffer>>,
+    /// For a REPLICATED buffer: the device that last wrote it (see [`PipelineBuffer::read_device`]).
+    /// `NO_WRITER` means every replica holds the caller's value (fresh `alloc`/`upload`), so device
+    /// 0 is as good as any. A layer split writes a replicated tensor on ONE lane only — the
+    /// residual/hidden is written by whichever segment owns the last op touching it, logits by the
+    /// tail head — so a `download` that guessed device 0 would read a never-written replica.
+    last_writer: AtomicUsize,
 }
+
+/// Sentinel for [`PipelineBuffer::last_writer`]: no segment has written this buffer yet.
+const NO_WRITER: usize = usize::MAX;
 
 impl PipelineBuffer {
     /// A single-device buffer (weights/KV/logits).
@@ -73,6 +103,7 @@ impl PipelineBuffer {
         Box::new(PipelineBuffer {
             device: Some(device),
             bufs: vec![buf],
+            last_writer: AtomicUsize::new(NO_WRITER),
         })
     }
 
@@ -104,6 +135,25 @@ impl PipelineBuffer {
 
     fn is_replicated(&self) -> bool {
         self.device.is_none()
+    }
+
+    /// Record that device `dev` just wrote this buffer, so a later [`Self::read_device`] reads the
+    /// replica that actually holds the result. Only called for caller-bound tensors; a segment's
+    /// internal scratch is per-plan storage and never crosses a segment.
+    fn mark_written(&self, dev: usize) {
+        self.last_writer.store(dev, Ordering::Release);
+    }
+
+    /// The device a [`PipelineBackend::download`] must read this buffer from: the single resident
+    /// device for a weight/KV/logits handle, else the replica a segment actually wrote.
+    fn read_device(&self) -> usize {
+        match self.device {
+            Some(d) => d,
+            None => match self.last_writer.load(Ordering::Acquire) {
+                NO_WRITER => 0,
+                d => d,
+            },
+        }
     }
 }
 
@@ -159,6 +209,89 @@ enum Handoff {
     Host { scratch: Mutex<Vec<u8>> },
 }
 
+/// Which half of a cut tensor's handoff a per-device pass performs. The producer's device thread
+/// PUBLISHes (producer replica → export / host scratch); the consumer's device thread GATHERs
+/// (export / host scratch → consumer replica). Splitting the two halves by device is what lets one
+/// thread own each device's queue: no thread ever submits to a device it does not own.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cuts {
+    /// This device's segments are being run by this thread: move the cuts into them.
+    Move,
+    /// The cuts were already moved (or belong to a segment this device does not run): skip.
+    Skip,
+}
+
+/// One-shot host-side handshake between the device-0 and device-1 threads of
+/// [`PipelineBackend::execute_pipelined`]. `signal` releases every `wait`; `abort` releases them
+/// with `false` so a failing device-0 pass can never leave the worker blocked on `join`.
+struct Gate {
+    state: Mutex<(bool, bool)>,
+    cv: std::sync::Condvar,
+}
+
+impl Gate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new((false, false)),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    fn signal(&self) {
+        let mut s = self.state.lock().expect("pipeline gate poisoned");
+        s.0 = true;
+        self.cv.notify_all();
+    }
+
+    fn abort(&self) {
+        let mut s = self.state.lock().expect("pipeline gate poisoned");
+        s.1 = true;
+        self.cv.notify_all();
+    }
+
+    /// Blocks until released. `false` = the device-0 pass failed; do no work.
+    fn wait(&self) -> bool {
+        let mut s = self.state.lock().expect("pipeline gate poisoned");
+        while !s.0 && !s.1 {
+            s = self.cv.wait(s).expect("pipeline gate poisoned");
+        }
+        s.0
+    }
+}
+
+struct OverlapTiming {
+    base: std::time::Instant,
+    marks: Mutex<Vec<(String, f64)>>,
+}
+
+impl OverlapTiming {
+    fn new() -> Self {
+        Self {
+            base: std::time::Instant::now(),
+            marks: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn mark(&self, name: impl Into<String>) {
+        self.marks.lock().expect("overlap timing poisoned").push((
+            name.into(),
+            self.base.elapsed().as_secs_f64() * 1e3,
+        ));
+    }
+
+    fn log(&self, deferred: bool, stages: usize) {
+        let marks = self.marks.lock().expect("overlap timing poisoned");
+        let body = marks
+            .iter()
+            .map(|(name, ms)| format!("{name}={ms:.1}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        tracing::info!(
+            "[pipe overlap] deferred={deferred} stages={stages} {body}"
+        );
+    }
+}
+
 /// One contiguous run of ops assigned to a single device, plus the boundary handoff INTO it.
 struct Segment {
     device: usize,
@@ -193,6 +326,10 @@ impl Plan for PipelinePlan {
 /// assignment; presents one [`Backend`] to the runner.
 pub struct PipelineBackend {
     backends: Vec<VulkanBackend>,
+    /// Optional extra backend used only by the detached MTP head. It lives on the same physical
+    /// GPU as the stage-0 lane, but owns a separate Vulkan device so its hot-expert cache gets an
+    /// independent unified VRAM arena.
+    head_device: Option<usize>,
     /// `layer_device[l]` = the device index that runs layer `l`. Non-decreasing (a forward
     /// pipeline crosses each device boundary once).
     layer_device: Vec<usize>,
@@ -200,6 +337,16 @@ pub struct PipelineBackend {
     kv_alloc_pairs: AtomicUsize,
     /// Handoff transport preference: try P2P (dma-buf) first, else host-bounce.
     use_p2p: bool,
+    /// Replicate EVERY `BufferUsage::KvCache` allocation on all devices instead of placing it on
+    /// its layer's device. Needed whenever the model's tensors with that usage are NOT one `(k,v)`
+    /// pair per layer: hybrid SSM/DeltaNet models add recurrent conv/state buffers and hyper-
+    /// connection models add a per-layer history buffer, all under `KvCache` — which breaks the
+    /// `kv_alloc_pairs` layer-order heuristic and leaves a buffer shared ACROSS layers pinned to a
+    /// single device ("op 6 (Conv1dSilu) reads operands on two devices"). Replicating is safe: each
+    /// layer's op touches only its own replica, KV fork/seed copies every shared device, and the
+    /// segment cut logic hands a replica across a boundary when a later stage needs it.
+    /// Ceiling: doubles KV VRAM — fine at modest ctx, not for a max-ctx dense pipeline.
+    replicate_kv: bool,
 }
 
 impl PipelineBackend {
@@ -210,6 +357,7 @@ impl PipelineBackend {
         backends: Vec<VulkanBackend>,
         layer_device: Vec<usize>,
         use_p2p: bool,
+        replicate_kv: bool,
     ) -> Result<Self> {
         if backends.is_empty() {
             return Err(be("pipeline: needs at least one device"));
@@ -224,10 +372,38 @@ impl PipelineBackend {
         }
         Ok(Self {
             backends,
+            head_device: None,
             layer_device,
             kv_alloc_pairs: AtomicUsize::new(0),
             use_p2p,
+            replicate_kv,
         })
+    }
+
+    /// Attach the dedicated MTP-head backend at the end of the backend list and return its
+    /// pipeline device index.
+    pub fn attach_head_backend(&mut self, backend: VulkanBackend) -> usize {
+        let device = self.backends.len();
+        self.backends.push(backend);
+        self.head_device = Some(device);
+        device
+    }
+
+    pub fn head_device(&self) -> Option<usize> {
+        self.head_device
+    }
+
+    pub fn head_backend(&self) -> Option<&VulkanBackend> {
+        self.head_device.map(|device| &self.backends[device])
+    }
+
+    pub fn enter_head_alloc_scope(&self) -> HeadAllocScope {
+        let previous = HEAD_ALLOC_SCOPE.with(|scope| scope.replace(true));
+        HeadAllocScope { previous }
+    }
+
+    fn trunk_device_count(&self) -> usize {
+        self.head_device.unwrap_or(self.backends.len())
     }
 
     /// A balanced N-way split of `n_layer` layers across `backends.len()` devices (device `i` gets
@@ -239,31 +415,273 @@ impl PipelineBackend {
             .collect()
     }
 
+    /// Like [`Self::balanced_layer_map`], but balanced by WEIGHT BYTES instead of layer count.
+    ///
+    /// A count split assumes layers are the same size. They are not: in one mixed-imatrix quant the
+    /// per-layer weight bytes differ by up to ~1.7x (they are sized by each layer's `ffn_*_exps`
+    /// dtypes, which the quantizer picks per layer), and the LAST device alone also carries the
+    /// final norm + tied LM head + `token_embd`. Measured on Qwen3.8-Flash-Next IQ3_XXS (48 layers,
+    /// 2x24 GiB): the even 24/24 split put 24.7 GiB on the tail device against 19.4 GiB on the head
+    /// — over the 23.73 GiB heap before any KV — which is why `INFR_PIPELINE` OOM'd while binding
+    /// `blk.47.ffn_down_exps.weight`. Closing each band at its byte share gives 27/21 = 22.14/21.94.
+    ///
+    /// The split is EXACT — it minimises the heaviest device (binary-searched "split array largest
+    /// sum"), not a nearest-to-share approximation; measured max 22.14 GiB against 24.7 for 24/24.
+    /// The map stays contiguous + monotonic (each device owns one contiguous band), and every
+    /// device keeps at least one layer. `layer_bytes[l]` is layer `l`'s resident weight bytes;
+    /// `head_bytes` / `tail_bytes` are the non-layer weights the binder pins to device 0 / the last
+    /// device (see [`Self::device_for_weight`]); the tail is charged to the last device's share.
+    pub fn byte_balanced_layer_map(
+        n_layer: usize,
+        n_dev: usize,
+        layer_bytes: &[u64],
+        head_bytes: u64,
+        tail_bytes: u64,
+    ) -> Vec<usize> {
+        let n_dev = n_dev.max(1);
+        if n_dev < 2 || layer_bytes.len() < n_layer || n_layer < n_dev {
+            return Self::balanced_layer_map(n_layer, n_dev);
+        }
+        // `head_bytes` rides in device 0's first band; `tail_bytes` rides on the LAST device.
+        let mut lb = layer_bytes[..n_layer].to_vec();
+        lb[0] = lb[0].saturating_add(head_bytes);
+        let total: u128 = lb.iter().map(|&b| b as u128).sum::<u128>() + tail_bytes as u128;
+        // EXACT min-max: binary-search the lightest feasible heaviest-device weight, packing each
+        // trial greedily (fill a band as far as it goes, so the last — and tightest, since it also
+        // carries the tail — band gets the least). "Split array largest sum", solved properly: a
+        // nearest-to-share boundary guess is NOT optimal once the tail is in play.
+        let feasible = |m: u128| -> bool {
+            let mut used = 1usize;
+            let mut acc = 0u128;
+            for &b in &lb {
+                // The last device's band also carries `tail_bytes`.
+                let cap = if used == n_dev { m.saturating_sub(tail_bytes as u128) } else { m };
+                if b as u128 > cap {
+                    return false;
+                }
+                if acc + b as u128 > cap {
+                    used += 1;
+                    if used > n_dev {
+                        return false;
+                    }
+                    acc = 0;
+                }
+                acc += b as u128;
+            }
+            true
+        };
+        let (mut lo, mut hi) = (
+            lb.iter().copied().max().unwrap_or(0) as u128,
+            total,
+        );
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if feasible(mid) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        let m = lo;
+        // Replay the same greedy at the optimum to materialise the map.
+        let mut map = Vec::with_capacity(n_layer);
+        let mut d = 0usize;
+        let mut acc = 0u128;
+        for &b in &lb {
+            let cap = if d + 1 == n_dev { m.saturating_sub(tail_bytes as u128) } else { m };
+            if acc > 0 && acc + b as u128 > cap {
+                d += 1;
+                acc = 0;
+            }
+            map.push(d);
+            acc += b as u128;
+        }
+        debug_assert_eq!(map.len(), n_layer);
+        map
+    }
+
+    /// [`Self::byte_balanced_layer_map`] against **per-device capacity** instead of one uniform
+    /// share.
+    ///
+    /// The two (or N) cards a layer split runs on are not equally available: one may be driving a
+    /// display, and every card loses the VRAM guard's headroom plus driver overhead. A uniform byte
+    /// split then plans a band the display card cannot hold, and the load dies on the LAST weight of
+    /// that band with a couple hundred MiB of headroom left (`blk.26.ffn_down_exps.weight` on a
+    /// 27/21 split of Qwen3.8-Flash-Next IQ3_XXS with a 7900 XTX driving a Wayland session:
+    /// 22.14 GiB of weights against ~22.0 GiB of allocatable room).
+    ///
+    /// The objective is the same min-max, over each band's RATIO to its own device's capacity:
+    /// binary-search the smallest ratio `r` (fixed point, `SCALE`) at which a greedy
+    /// device-by-device packing keeps every band within `r * caps[device]`. `caps[i]` is what the
+    /// caller decided device `i` may spend on weights (its `VramInfo::alloc_room` minus whatever
+    /// runtime/arena reserve that caller keeps back), so this function never has to guess what the
+    /// allocator will do.
+    ///
+    /// Returns the uniform-capacity split when the capacities are degenerate (a single device, an
+    /// empty capacity, a short `layer_bytes`) — and when even a full-capacity packing cannot hold
+    /// the model, which the caller is expected to treat as "this model does not fit resident".
+    pub fn byte_balanced_layer_map_caps(
+        n_layer: usize,
+        layer_bytes: &[u64],
+        head_bytes: u64,
+        tail_bytes: u64,
+        caps: &[u64],
+    ) -> Vec<usize> {
+        let n_dev = caps.len();
+        if n_dev < 2
+            || layer_bytes.len() < n_layer
+            || n_layer < n_dev
+            || caps.iter().any(|&cap| cap == 0)
+        {
+            return Self::balanced_layer_map(n_layer, n_dev.max(1));
+        }
+        // `head_bytes` rides in device 0's first band; `tail_bytes` rides on the LAST device.
+        let mut lb = layer_bytes[..n_layer].to_vec();
+        lb[0] = lb[0].saturating_add(head_bytes);
+        const SCALE: u128 = 1 << 20;
+        let cap_at = |dev: usize, r: u128| -> u128 { (r * caps[dev] as u128) / SCALE };
+        // Greedy packing is optimal for feasibility here: filling an earlier device as far as it
+        // goes can only leave less on the later ones.
+        let feasible = |r: u128| -> bool {
+            if tail_bytes as u128 > cap_at(n_dev - 1, r) {
+                return false;
+            }
+            let mut used = 1usize;
+            let mut acc = 0u128;
+            for &b in &lb {
+                let dev = used - 1;
+                let cap = cap_at(dev, r)
+                    .saturating_sub(if used == n_dev { tail_bytes as u128 } else { 0 });
+                if b as u128 > cap {
+                    return false;
+                }
+                if acc + b as u128 > cap {
+                    used += 1;
+                    if used > n_dev {
+                        return false;
+                    }
+                    acc = 0;
+                }
+                acc += b as u128;
+            }
+            true
+        };
+        if !feasible(SCALE) {
+            // Even at 100% of every device's capacity the bands do not fit: report the uniform
+            // split so the caller's own fit/banner path keeps its existing meaning.
+            return Self::byte_balanced_layer_map(n_layer, n_dev, layer_bytes, head_bytes, tail_bytes);
+        }
+        let (mut lo, mut hi) = (0u128, SCALE);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if feasible(mid) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        let r = lo;
+        let mut map = Vec::with_capacity(n_layer);
+        let mut dev = 0usize;
+        let mut acc = 0u128;
+        for &b in &lb {
+            let cap = cap_at(dev, r)
+                .saturating_sub(if dev + 1 == n_dev { tail_bytes as u128 } else { 0 });
+            if acc > 0 && acc + b as u128 > cap {
+                dev += 1;
+                acc = 0;
+            }
+            map.push(dev);
+            acc += b as u128;
+        }
+        debug_assert_eq!(map.len(), n_layer);
+        map
+    }
+
+    /// Bytes each device's band may occupy for the given map, `head`/`tail` included — the number a
+    /// placement decision has to compare against that device's capacity.
+    pub fn layer_map_band_bytes(
+        layer_device: &[usize],
+        n_dev: usize,
+        layer_bytes: &[u64],
+        head_bytes: u64,
+        tail_bytes: u64,
+    ) -> Vec<u64> {
+        let mut bands = vec![0u64; n_dev];
+        for (layer, &bytes) in layer_bytes.iter().enumerate() {
+            if let Some(&dev) = layer_device.get(layer) {
+                if dev < n_dev {
+                    bands[dev] = bands[dev].saturating_add(bytes + if layer == 0 { head_bytes } else { 0 });
+                }
+            }
+        }
+        if let Some(last) = bands.last_mut() {
+            *last = last.saturating_add(tail_bytes);
+        }
+        bands
+    }
+
     /// The device that runs layer `l`.
     pub fn layer_device(&self, l: usize) -> usize {
         self.layer_device[l.min(self.layer_device.len().saturating_sub(1))]
     }
 
+    /// Contiguous model-layer range owned by each device. The layer map is non-decreasing, so a
+    /// device's range is half-open and may be empty when a caller supplied a sparse map.
+    pub fn layer_ranges(&self) -> Vec<std::ops::Range<usize>> {
+        let mut starts = vec![None; self.backends.len()];
+        let mut ends = vec![0usize; self.backends.len()];
+        for (layer, &device) in self.layer_device.iter().enumerate() {
+            if starts[device].is_none() {
+                starts[device] = Some(layer);
+            }
+            ends[device] = layer + 1;
+        }
+        starts
+            .into_iter()
+            .zip(ends)
+            .map(|(start, end)| start.unwrap_or(end)..end)
+            .collect()
+    }
+
     /// The last device (holds the final norm + LM head + logits).
     pub fn last_device(&self) -> usize {
-        self.backends.len() - 1
+        self.trunk_device_count() - 1
+    }
+
+    /// The first device (holds the trunk's leading layers and, in MTP stage-0 mode, the draft
+    /// head). Kept symmetric with [`Self::last_device`] for the head binder.
+    pub fn first_device(&self) -> usize {
+        0
     }
 
     pub fn n_devices(&self) -> usize {
-        self.backends.len()
+        self.trunk_device_count()
     }
 
     /// The device a weight named `name` is placed on: `blk.{l}.*` → layer `l`'s device;
-    /// `output*` / `token_embd` (the tied LM head) → the last device; anything else → device 0.
+    /// `output*` (the tied LM head) → the last device; `token_embd` and anything else → device 0
+    /// (the graph's first op, `EmbedGather`, reads `token_embd`, so it must live on the head
+    /// device or the device assignment runs backwards and the monotonic check rejects the split).
     pub fn device_for_weight(&self, name: &str) -> usize {
         if let Some(l) = name
             .strip_prefix("blk.")
             .and_then(|r| r.split('.').next())
             .and_then(|s| s.parse::<usize>().ok())
         {
+            if l >= self.layer_device.len() {
+                if let Some(head) = self.head_device {
+                    return head;
+                }
+            }
             return self.layer_device(l);
         }
-        if name.starts_with("output") || name.starts_with("token_embd") {
+        if name.starts_with("nextn.") {
+            if let Some(head) = self.head_device {
+                return head;
+            }
+        }
+        if name.starts_with("output") {
             return self.last_device();
         }
         0
@@ -272,6 +690,61 @@ impl PipelineBackend {
     /// The real backend for device `d` — the binder allocs/uploads a per-layer weight through it.
     pub fn backend(&self, d: usize) -> &VulkanBackend {
         &self.backends[d]
+    }
+
+    /// Upload the same host bytes to every device and return one replicated weight handle.
+    ///
+    /// This is for read-only tables whose consumers do not carry a layer identity of their own:
+    /// `token_embd` is read by the trunk's first `Op::EmbedGather` on the head device and by the
+    /// detached MTP head on the tail device. A single-device binding would pin the MTP gather back
+    /// to the head and make an unrolled draft graph jump `tail -> head -> tail`, which the pipeline
+    /// deliberately rejects. A replicated handle keeps the table available on both lanes while the
+    /// surrounding weight operands still decide where each op runs.
+    pub fn upload_replicated(&self, bytes: &[u8], usage: BufferUsage) -> Result<Box<dyn Buffer>> {
+        let mut bufs = Vec::with_capacity(self.backends.len());
+        for backend in &self.backends {
+            let buf = backend.alloc_uninit(bytes.len(), usage)?;
+            backend.upload(buf.as_ref(), bytes)?;
+            bufs.push(buf);
+        }
+        Ok(Box::new(PipelineBuffer {
+            device: None,
+            bufs,
+            last_writer: AtomicUsize::new(NO_WRITER),
+        }))
+    }
+
+    /// Allocate a KV buffer pinned to one device without advancing the layer-pair cursor.
+    ///
+    /// MTP's detached head owns a KV cache before the trunk's layer-ordered KV allocation starts.
+    /// That cache is read/written by head-layer ops pinned to device 0. Sending it through
+    /// [`Backend::alloc`]'s `KvCache` arm would consume pair 0 and shift every trunk layer's KV to
+    /// the NEXT layer's device; pinning it here keeps the trunk's `l -> device` mapping exact.
+    pub fn alloc_kv_on(&self, device: usize, bytes: usize) -> Result<Box<dyn Buffer>> {
+        let backend = self
+            .backends
+            .get(device)
+            .ok_or_else(|| be(format!("pipeline: no backend for device {device}")))?;
+        Ok(PipelineBuffer::single(
+            device,
+            backend.alloc(bytes, BufferUsage::KvCache)?,
+        ))
+    }
+
+    /// Allocate a regular device-local buffer on one backend, bypassing the unified expert arena.
+    /// The detached MTP head's KV cache uses this so it cannot consume the hot-expert cache's
+    /// frozen corridors.
+    pub fn alloc_dedicated_on(
+        &self,
+        device: usize,
+        bytes: usize,
+        usage: BufferUsage,
+    ) -> Result<Box<dyn Buffer>> {
+        let backend = self
+            .backends
+            .get(device)
+            .ok_or_else(|| be(format!("pipeline: no backend for device {device}")))?;
+        Ok(PipelineBuffer::single(device, backend.alloc(bytes, usage)?))
     }
 
     /// Per-device VRAM/name introspection: `(device_name, index)` for each device, so a caller can
@@ -292,7 +765,30 @@ impl PipelineBackend {
         for b in &self.backends {
             bufs.push(f(b)?);
         }
-        Ok(Box::new(PipelineBuffer { device: None, bufs }))
+        Ok(Box::new(PipelineBuffer {
+            device: None,
+            bufs,
+            last_writer: AtomicUsize::new(NO_WRITER),
+        }))
+    }
+
+    /// Replicate across the TRUNK backends only. The extra MTP-head backend never runs a trunk
+    /// layer, so replicating the hybrid model's large shared KV/state buffers onto it wastes its
+    /// dedicated hot-expert arena and can make the head cache unplaceable.
+    fn replicate_trunk<F>(&self, f: F) -> Result<Box<dyn Buffer>>
+    where
+        F: Fn(&VulkanBackend) -> Result<Box<dyn Buffer>>,
+    {
+        let trunk = self.trunk_device_count();
+        let mut bufs = Vec::with_capacity(trunk);
+        for b in &self.backends[..trunk] {
+            bufs.push(f(b)?);
+        }
+        Ok(Box::new(PipelineBuffer {
+            device: None,
+            bufs,
+            last_writer: AtomicUsize::new(NO_WRITER),
+        }))
     }
 
     /// Build the per-device partition of `graph` under `bindings` (called once per plan).
@@ -302,19 +798,70 @@ impl PipelineBackend {
         // An op runs on the device its single-device (weight/KV) operand lives on; a pure
         // activation op with no such operand inherits the previous op's device.
         let mut op_dev = vec![0usize; n_ops];
+        // `Some(d)` ⇒ this op itself reads a single-device (weight/KV) operand on `d`. A `None` op
+        // has no natural lane: the walk below hands it `cur`, which is arbitrary AT THE FRONT of a
+        // graph (nothing pinned `cur` yet, so it still holds the initial 0).
+        let mut op_pin: Vec<Option<usize>> = vec![None; n_ops];
         let mut cur = 0usize;
+        let debug_pipe = std::env::var_os("INFR_DEBUG_PIPE_GRAPH").is_some();
+        // Per-tensor device ledger for the diagnostic below: the FIRST single-device placement seen
+        // for each tensor, so a conflict can name both sides instead of just the op.
+        let mut tensor_dev: std::collections::HashMap<TensorId, (usize, String)> =
+            std::collections::HashMap::new();
         for (i, op) in graph.ops.iter().enumerate() {
             let (reads, writes) = op.io();
             let mut pinned: Option<usize> = None;
             for t in reads.iter().chain(writes.iter()) {
-                if let Some(buf) = bindings.get(*t) {
-                    if let Some(d) = as_pipe(buf)?.single_device() {
+                // Independent-row (`Graph::independent_rows`) state is bound as one buffer PER LANE,
+                // so `get` returns `None` for it. Every lane's copy of a given layer's state lives
+                // on that layer's device — that is what makes a batched decode a single segment per
+                // device instead of a per-lane scatter — so the op's device is that shared device,
+                // and a disagreement means the lanes were placed across the split (reject loudly
+                // rather than run with a wrong pin).
+                if let Some(rows) = bindings.get_rows(*t) {
+                    let mut lanes: Option<usize> = None;
+                    for buf in rows {
+                        if let Some(d) = as_pipe(*buf)?.single_device() {
+                            match lanes {
+                                None => lanes = Some(d),
+                                Some(p) if p != d => {
+                                    return Err(be(format!(
+                                        "pipeline: op {} ({}) has independent-row state on two \
+                                         devices ({p} and {d}): a batched decode needs every lane's \
+                                         copy of a layer's state on that layer's device",
+                                        i,
+                                        op.kind()
+                                    )));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    if let Some(d) = lanes {
+                        tensor_dev.entry(*t).or_insert((d, op.kind().to_string()));
                         match pinned {
                             None => pinned = Some(d),
                             Some(p) if p != d => {
                                 return Err(be(format!(
+                                    "pipeline: op {i} ({}) pins {p} and {d} across its operands",
+                                    op.kind()
+                                )));
+                            }
+                            _ => {}
+                        }
+                    }
+                } else if let Some(buf) = bindings.get(*t) {
+                    if let Some(d) = as_pipe(buf)?.single_device() {
+                        tensor_dev.entry(*t).or_insert((d, op.kind().to_string()));
+                        match pinned {
+                            None => pinned = Some(d),
+                            Some(p) if p != d => {
+                                let a = tensor_dev.get(t).map(|(ad, _)| *ad).unwrap_or(d);
+                                return Err(be(format!(
                                     "pipeline: op {} ({}) reads operands on two devices ({p} and \
-                                     {d}) — a weight/KV tensor is misplaced for a layer split",
+                                     {d}) — a weight/KV tensor is misplaced for a layer split \
+                                     [tensor {t:?} is on {d}, the op's pin was {p}, other side \
+                                     {a}]",
                                     i,
                                     op.kind()
                                 )));
@@ -327,7 +874,34 @@ impl PipelineBackend {
             if let Some(d) = pinned {
                 cur = d;
             }
+            op_pin[i] = pinned;
             op_dev[i] = cur;
+            if debug_pipe {
+                eprintln!(
+                    "[pipe-graph] op {i:4} dev={cur} {}{}",
+                    op.kind(),
+                    if reads.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" reads={:?}", reads)
+                    }
+                );
+            }
+        }
+        // A LEADING run of purely activation ops has no anchor of its own, so the forward walk pins
+        // it to device 0 by default. That is wrong for a detached-head graph (MTP's draft/catch
+        // graphs start at an `EmbedGather` whose table is replicated, so the gather has no pin while
+        // every op after it is pinned to the tail): the head's first segment then runs on device 0
+        // while its consumer segment runs on the tail, and the tensor in between is INTERNAL
+        // scratch — per-segment storage that is never bound, so `prepare`'s cut list skips it and
+        // the consumer reads a never-written buffer (silently wrong logits, zeros on the logits
+        // download). Anchor the leading run to the device of the first op that IS pinned, which is
+        // where the rest of the graph — and therefore the whole detached head — actually runs.
+        if let Some(first_pin) = op_pin.iter().position(|p| p.is_some()) {
+            let d = op_pin[first_pin].expect("position() found a pinned op");
+            if first_pin > 0 && d != 0 {
+                op_dev[..first_pin].fill(d);
+            }
         }
         if op_dev.windows(2).any(|w| w[1] < w[0]) {
             return Err(be(
@@ -357,7 +931,10 @@ impl PipelineBackend {
                 .copied()
                 .filter(|t| written.contains(t))
                 .collect();
-            // The static per-execute path (no record-once replay) — pipeline forces it via caps.
+            // The static per-execute path (no record-once replay) — pipeline forces it here. A
+            // measured attempt to inherit the producer's flag instead changed nothing (an MoE decode
+            // graph is ineligible for the tape by design — see `decode_eligible`), so the pipeline's
+            // per-token cost is NOT a replay-eligibility problem; see the doc's cost section.
             sub.no_decode_replay = true;
             let plan = self.backends[d].compile(&sub)?;
 
@@ -387,6 +964,17 @@ impl PipelineBackend {
                     let Some(&producer) = last_writer.get(&t) else {
                         continue; // not written before this segment (a fresh input / read-only)
                     };
+                    // Independent-row state bound per lane: this pipeline has no per-lane handoff, so
+                    // a layer-split graph must place every lane's copy of a layer's state on that
+                    // layer's device. Silently skipping the handoff here would let the consumer read
+                    // a replica nobody wrote.
+                    if bindings.get(t).is_none() && bindings.get_rows(t).is_some() {
+                        return Err(be(format!(
+                            "pipeline: independent-row state {t:?} produced on device {producer} is \
+                             read across the device split — a batched decode must keep every lane's \
+                             copy of a layer's state on that layer's device"
+                        )));
+                    }
                     let Some(buf) = bindings.get(t) else {
                         continue;
                     };
@@ -454,28 +1042,177 @@ impl PipelineBackend {
         ho: &Handoff,
         bindings: &Bindings,
     ) -> Result<()> {
+        self.publish_cut(t, producer, ho, bindings)?;
+        self.gather_cut(t, consumer, ho, bindings)
+    }
+
+    /// Producer half of [`Self::transfer`]: make the producer replica readable by the consumer.
+    /// Runs on the PRODUCER's device thread (see [`Self::execute_pipelined`]).
+    fn publish_cut(
+        &self,
+        t: TensorId,
+        producer: usize,
+        ho: &Handoff,
+        bindings: &Bindings,
+    ) -> Result<()> {
         let pb = as_pipe(
             bindings
                 .get(t)
-                .ok_or_else(|| be("pipeline: cut tensor not bound at transfer"))?,
+                .ok_or_else(|| be("pipeline: cut tensor not bound at publish"))?,
         )?;
         let src = pb.on(producer)?;
-        let dst = pb.on(consumer)?;
         let bytes = pb.len_bytes();
         match ho {
-            Handoff::P2p { export, imported } => {
-                // producer replica → shared export (producer-local), RELEASING the export to
-                // QUEUE_FAMILY_EXTERNAL; then ACQUIRE the imported alias from EXTERNAL and read it →
-                // consumer replica (the PCIe read). The QF ownership transfer satisfies the EXCLUSIVE
-                // external buffer's cross-family requirement (the queue_wait_idle fence alone does
-                // not); each helper submits + drains + frees its own command buffer.
-                self.backends[producer].p2p_publish_copy(src, export.buffer(), bytes)?;
-                self.backends[consumer].p2p_gather_copy(imported.as_ref(), dst, bytes)?;
+            // producer replica → shared export (producer-local), RELEASING the export to
+            // QUEUE_FAMILY_EXTERNAL; the consumer's `gather_cut` then ACQUIREs the imported alias
+            // from EXTERNAL and reads it. The QF ownership transfer satisfies the EXCLUSIVE external
+            // buffer's cross-family requirement (the queue_wait_idle fence alone does not); each
+            // helper submits + drains + frees its own command buffer.
+            Handoff::P2p { export, .. } => {
+                self.backends[producer].p2p_publish_copy(src, export.buffer(), bytes)
             }
             Handoff::Host { scratch } => {
                 let mut host = scratch.lock().expect("handoff scratch poisoned");
-                self.backends[producer].download(src, &mut host)?;
-                self.backends[consumer].upload(dst, &host)?;
+                self.backends[producer].download(src, &mut host)
+            }
+        }
+    }
+
+    /// Consumer half of [`Self::transfer`]: pull the published bytes into the consumer's replica.
+    /// Runs on the CONSUMER's device thread.
+    fn gather_cut(
+        &self,
+        t: TensorId,
+        consumer: usize,
+        ho: &Handoff,
+        bindings: &Bindings,
+    ) -> Result<()> {
+        let pb = as_pipe(
+            bindings
+                .get(t)
+                .ok_or_else(|| be("pipeline: cut tensor not bound at gather"))?,
+        )?;
+        let dst = pb.on(consumer)?;
+        let bytes = pb.len_bytes();
+        match ho {
+            Handoff::P2p { imported, .. } => {
+                self.backends[consumer].p2p_gather_copy(imported.as_ref(), dst, bytes)
+            }
+            Handoff::Host { scratch } => {
+                let host = scratch.lock().expect("handoff scratch poisoned");
+                self.backends[consumer].upload(dst, &host)
+            }
+        }
+    }
+
+    /// Lock `plan`'s cached per-device split (building it on first use) and hand it to `f`.
+    fn with_prep<R>(
+        &self,
+        plan: &dyn Plan,
+        bindings: &Bindings,
+        f: impl FnOnce(&PipelinePlan, &Prepared) -> Result<R>,
+    ) -> Result<R> {
+        let pp = plan
+            .as_any()
+            .downcast_ref::<PipelinePlan>()
+            .ok_or_else(|| be("pipeline: execute got a non-pipeline plan"))?;
+        let mut guard = pp.prepared.lock().expect("pipeline plan poisoned");
+        if guard.is_none() {
+            *guard = Some(self.prepare(&pp.graph, bindings)?);
+        }
+        f(pp, guard.as_ref().expect("prepared just set"))
+    }
+
+    /// Execute one segment on its own device with that device's sub-bindings.
+    fn run_segment(&self, pp: &PipelinePlan, seg: &Segment, bindings: &Bindings) -> Result<()> {
+        let time_it = std::env::var_os("INFR_PIPE_TIME").is_some();
+        let t_bind = std::time::Instant::now();
+        // Per-device bindings: resolve every bound tensor to this device's buffer/replica.
+        let d = seg.device;
+        // Device identity for the timeline: `Query::new` snapshots the thread-local context when
+        // the recorder opens, and the per-segment spans below inherit the same guard.
+        let _timeline_device = infr_core::timeline::device(d);
+        let mut sub = Bindings::new();
+        let (lo, hi) = seg.op_range;
+        let mut needed: std::collections::HashSet<TensorId> = std::collections::HashSet::new();
+        // Caller-bound tensors THIS segment writes: a replicated one is written on this device
+        // only, so a later `download` must read this replica (see `PipelineBuffer::read_device`).
+        let mut written_here: Vec<TensorId> = Vec::new();
+        for op in &pp.graph.ops[lo..hi] {
+            let (r, w) = op.io();
+            needed.extend(r);
+            written_here.extend(w.iter().copied());
+            needed.extend(w);
+        }
+        for t in &needed {
+            if let Some(buf) = bindings.get(*t) {
+                sub.bind(*t, as_pipe(buf)?.on(d)?);
+            } else if let Some(rows) = bindings.get_rows(*t) {
+                // Independent-row state: forward every LANE's copy of this tensor for THIS device.
+                // Dropping these (the single-buffer arm above is all this loop used to do) leaves the
+                // sub-backend with no row bindings, and a batched decode dies mid-graph with
+                // "tensor N has no independent-row bindings" — while plain single-row decode, which
+                // binds no rows at all, never notices. `prepare` already rejected the case where the
+                // lanes disagree about the device, so each `on(d)` here is a straight unwrap.
+                let mut lanes: Vec<&dyn Buffer> = Vec::with_capacity(rows.len());
+                for buf in rows {
+                    lanes.push(as_pipe(*buf)?.on(d)?);
+                }
+                sub.bind_rows(*t, lanes);
+            }
+        }
+        let bind_ms = t_bind.elapsed().as_secs_f64() * 1e3;
+        let t_exec = std::time::Instant::now();
+        self.backends[d].execute(seg.plan.as_ref(), &sub)?;
+        let exec_ms = t_exec.elapsed().as_secs_f64() * 1e3;
+        let t_sync = std::time::Instant::now();
+        // Kept even though the producer's `execute` already drained (the static path's
+        // `queue_wait_idle`): the pipeline's own segment order is what makes the cut handoff legal,
+        // and an experiment that skipped BOTH the drain and this wait device-lost the GPU
+        // (see the doc's cost section — freeing/reusing the transients needs the GPU finished).
+        self.backends[d].sync()?;
+        for t in &written_here {
+            if let Some(buf) = bindings.get(*t) {
+                as_pipe(buf)?.mark_written(d);
+            }
+        }
+        if time_it {
+            tracing::info!(
+                "[pipe seg] dev={d} ops={} bind={bind_ms:.1}ms exec={exec_ms:.1}ms sync={:.1}ms",
+                hi - lo,
+                t_sync.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        Ok(())
+    }
+
+    /// Run `device`'s segments of `prep`, in order. `Cuts::Move` first gathers their cut tensors
+    /// (this is the CONSUMER's thread; the producer's thread published them already).
+    fn run_device_segments(
+        &self,
+        pp: &PipelinePlan,
+        prep: &Prepared,
+        bindings: &Bindings,
+        device: usize,
+        cuts: Cuts,
+    ) -> Result<()> {
+        for seg in prep.segments.iter().filter(|s| s.device == device) {
+            if cuts == Cuts::Move {
+                for (t, _, ho) in &seg.cut {
+                    self.gather_cut(*t, device, ho, bindings)?;
+                }
+            }
+            self.run_segment(pp, seg, bindings)?;
+        }
+        Ok(())
+    }
+
+    /// Producer half of every cut tensor belonging to a segment on a device OTHER than `from`:
+    /// the publish a deferred device-1 pass will gather on its next call. One copy per cut tensor.
+    fn publish_remote_cuts(&self, prep: &Prepared, bindings: &Bindings, from: usize) -> Result<()> {
+        for seg in prep.segments.iter().filter(|s| s.device != from) {
+            for (t, producer, ho) in &seg.cut {
+                self.publish_cut(*t, *producer, ho, bindings)?;
             }
         }
         Ok(())
@@ -487,6 +1224,56 @@ impl Backend for PipelineBackend {
         "vulkan-pipeline"
     }
 
+    /// Broadcast the single-device session-allocation policy to every lane: the batched seam drives
+    /// its backend as `dyn Backend`, and each lane's unified arena has to hold its own
+    /// session-lifetime allocations open for the same window.
+    fn defer_session_finalization(&self, deferred: bool) {
+        for backend in &self.backends {
+            backend.defer_session_finalization(deferred);
+        }
+    }
+
+    fn finish_deferred_session_allocations(&self) -> Result<()> {
+        for backend in &self.backends {
+            backend.finish_deferred_session_allocations()?;
+        }
+        Ok(())
+    }
+
+    fn release_primary_runtime_after_cohort_shrink(&self) {
+        for backend in &self.backends {
+            backend.release_primary_runtime_after_cohort_shrink();
+        }
+    }
+
+    fn release_moe_load_reservation(&self) {
+        for backend in &self.backends {
+            backend.release_moe_load_reservation();
+        }
+    }
+
+    fn print_moe_pager_stats(&self) {
+        for backend in &self.backends {
+            backend.print_moe_pager_stats();
+        }
+    }
+
+    fn print_dense_pager_stats(&self) {
+        for backend in &self.backends {
+            backend.print_dense_pager_stats();
+        }
+    }
+
+    fn moe_paged(&self) -> bool {
+        self.backends[..self.trunk_device_count()]
+            .iter()
+            .any(VulkanBackend::moe_paged)
+    }
+
+    fn backend_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     fn capabilities(&self) -> Capabilities {
         // Device 0's caps, with the GPU-resident fast paths turned OFF so the runner takes the
         // classic host-embed + host-sample + static per-token execute path — the one the pipeline
@@ -494,9 +1281,17 @@ impl Backend for PipelineBackend {
         // lever that keeps `generate_dense_backend` unmodified.
         let mut c = self.backends[0].capabilities();
         c.decode_replay = false;
-        c.embed_gather = false;
+        // LOCAL TRIAL (revert before proposing upstream): MTP VERIFY hard-requires the GPU embed
+        // gather (`seam/runner.rs` ~9421 bails otherwise for qwen4exp) and the pipeline DOES
+        // support it — `execute` forwards every op in a segment unfiltered, so an EmbedGather node
+        // runs on whichever lane owns the table exactly like any other op. Only this one cap is
+        // re-enabled: `gpu_sample`/`argmax_*`/`decode_replay` stay off, so each step remains a
+        // plain `execute` and `generate_dense_backend` is still untouched.
+        c.embed_gather = true;
         c.gpu_sample = false;
-        c.argmax_rows = false;
+        // A/B: MTP VERIFY's rows>1 argmax reads back m u32s instead of m*vocab f32 logits.
+        // Leave the default path untouched unless the caller explicitly opts in.
+        c.argmax_rows = std::env::var_os("INFR_PIPE_ARGMAX_ROWS").is_some();
         c.argmax_prob = false;
         // The residual stream crosses devices between stages, so the caller's buffer is not what
         // the later layers wrote.
@@ -506,6 +1301,12 @@ impl Backend for PipelineBackend {
 
     fn alloc(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>> {
         match usage {
+            BufferUsage::KvCache
+                if self.replicate_kv && bytes >= 4 * 1024 * 1024 && !in_head_alloc_scope() =>
+            {
+                self.replicate_trunk(|b| b.alloc(bytes, usage))
+            }
+            BufferUsage::KvCache if self.replicate_kv => self.replicate(|b| b.alloc(bytes, usage)),
             BufferUsage::KvCache => {
                 // Placement by layer order: the runner allocs kbufs[l] then vbufs[l] for
                 // l = 0..n_layer, so the pair index IS the layer.
@@ -517,7 +1318,11 @@ impl Backend for PipelineBackend {
                 ))
             }
             BufferUsage::Readback => {
-                let d = self.last_device();
+                let d = if in_head_alloc_scope() {
+                    self.head_device.unwrap_or_else(|| self.last_device())
+                } else {
+                    self.last_device()
+                };
                 Ok(PipelineBuffer::single(
                     d,
                     self.backends[d].alloc(bytes, usage)?,
@@ -525,12 +1330,23 @@ impl Backend for PipelineBackend {
             }
             // Weights (ones-vectors / rope come through here — per-layer weights bypass alloc via
             // the binder), Staging (hidden/positions), Activations, HostWeights: replicate.
-            _ => self.replicate(|b| b.alloc(bytes, usage)),
+            _ if in_head_alloc_scope() || bytes <= 8 * 1024 * 1024 => {
+                self.replicate(|b| b.alloc(bytes, usage))
+            }
+            _ => self.replicate_trunk(|b| b.alloc(bytes, usage)),
         }
     }
 
     fn alloc_uninit(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>> {
         match usage {
+            BufferUsage::KvCache
+                if self.replicate_kv && bytes >= 4 * 1024 * 1024 && !in_head_alloc_scope() =>
+            {
+                self.replicate_trunk(|b| b.alloc_uninit(bytes, usage))
+            }
+            BufferUsage::KvCache if self.replicate_kv => {
+                self.replicate(|b| b.alloc_uninit(bytes, usage))
+            }
             BufferUsage::KvCache => {
                 let pair = self.kv_alloc_pairs.fetch_add(1, Ordering::SeqCst) / 2;
                 let d = self.layer_device(pair);
@@ -540,13 +1356,20 @@ impl Backend for PipelineBackend {
                 ))
             }
             BufferUsage::Readback => {
-                let d = self.last_device();
+                let d = if in_head_alloc_scope() {
+                    self.head_device.unwrap_or_else(|| self.last_device())
+                } else {
+                    self.last_device()
+                };
                 Ok(PipelineBuffer::single(
                     d,
                     self.backends[d].alloc_uninit(bytes, usage)?,
                 ))
             }
-            _ => self.replicate(|b| b.alloc_uninit(bytes, usage)),
+            _ if in_head_alloc_scope() || bytes <= 8 * 1024 * 1024 => {
+                self.replicate(|b| b.alloc_uninit(bytes, usage))
+            }
+            _ => self.replicate_trunk(|b| b.alloc_uninit(bytes, usage)),
         }
     }
 
@@ -565,10 +1388,10 @@ impl Backend for PipelineBackend {
 
     fn download(&self, src: &dyn Buffer, dst: &mut [u8]) -> Result<()> {
         let pb = as_pipe(src)?;
-        // Single-device: read its device. Replicated: read device 0 (the residual/positions are
-        // identical across replicas after a step, and no caller downloads a replicated buffer on a
-        // hot path).
-        let d = pb.single_device().unwrap_or(0);
+        // Single-device: read its device. Replicated: read the replica a segment actually wrote —
+        // NOT blindly device 0, which is only correct for buffers whose replicas happen to agree
+        // (positions/rope) or that no segment has written yet.
+        let d = pb.read_device();
         self.backends[d].download(pb.on(d)?, dst)
     }
 
@@ -581,13 +1404,118 @@ impl Backend for PipelineBackend {
                 self.backends[sd].copy_buffer(s.bufs[0].as_ref(), d.bufs[0].as_ref(), bytes)
             }
             (None, None) => {
-                for (i, b) in self.backends.iter().enumerate() {
+                let shared = s.bufs.len().min(d.bufs.len());
+                for (i, b) in self.backends.iter().take(shared).enumerate() {
                     b.copy_buffer(s.on(i)?, d.on(i)?, bytes)?;
                 }
                 Ok(())
             }
             _ => Err(be(
                 "pipeline: copy_buffer across devices is not supported (cross-device KV copy)",
+            )),
+        }
+    }
+
+    /// Batch of independent same-shape copies (the MTP checkpoint's per-layer KV snapshot). The
+    /// trait default issues each copy as its own `copy_buffer`, and a `VulkanBackend::copy_buffer`
+    /// is a one-shot submit + full queue drain — so a per-layer snapshot of a 30-layer model costs
+    /// ~60 submits and ~60 queue round trips PER DECODE CYCLE. Grouping by device hands each
+    /// sub-backend the whole batch, which records it into ONE command buffer and submits once.
+    fn copy_buffers(&self, copies: &[(&dyn Buffer, &dyn Buffer, usize)]) -> Result<()> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        let mut per_device: Vec<Vec<(&dyn Buffer, &dyn Buffer, usize)>> = (0..self.backends.len())
+            .map(|_| Vec::with_capacity(copies.len() / self.backends.len() + 1))
+            .collect();
+        for &(src, dst, bytes) in copies {
+            let (s, d) = (as_pipe(src)?, as_pipe(dst)?);
+            match (s.single_device(), d.single_device()) {
+                (Some(sd), Some(dd)) if sd == dd => {
+                    per_device[sd].push((s.bufs[0].as_ref(), d.bufs[0].as_ref(), bytes));
+                }
+                // A replicated pair (recurrent/HC state) is copied on every lane.
+                (None, None) => {
+                    let shared = s.bufs.len().min(d.bufs.len());
+                    for (dev, lane) in per_device.iter_mut().take(shared).enumerate() {
+                        lane.push((s.on(dev)?, d.on(dev)?, bytes));
+                    }
+                }
+                _ => {
+                    return Err(be(
+                        "pipeline: copy_buffers across devices is not supported (cross-device KV copy)",
+                    ))
+                }
+            }
+        }
+        for (backend, batch) in self.backends.iter().zip(&per_device) {
+            if !batch.is_empty() {
+                backend.copy_buffers(batch)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn copy_buffer_ranges(
+        &self,
+        copies: &[(&dyn Buffer, usize, &dyn Buffer, usize, usize)],
+    ) -> Result<()> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        let (first_src, _, first_dst, _, _) = copies[0];
+        let first_src = as_pipe(first_src)?;
+        let first_dst = as_pipe(first_dst)?;
+        match (first_src.single_device(), first_dst.single_device()) {
+            (Some(sd), Some(dd)) if sd == dd => {
+                let mut prepared = Vec::with_capacity(copies.len());
+                for &(src, src_offset, dst, dst_offset, bytes) in copies {
+                    let (s, d) = (as_pipe(src)?, as_pipe(dst)?);
+                    if s.single_device() != Some(sd) || d.single_device() != Some(dd) {
+                        return Err(be(
+                            "pipeline: copy_buffer_ranges spans devices for a single-device batch",
+                        ));
+                    }
+                    prepared.push((
+                        s.bufs[0].as_ref(),
+                        src_offset,
+                        d.bufs[0].as_ref(),
+                        dst_offset,
+                        bytes,
+                    ));
+                }
+                self.backends[sd].copy_buffer_ranges(&prepared)
+            }
+            (None, None) => {
+                // Recurrent/HC state is replicated on every lane. Batch all ranges per lane so
+                // each device pays one submit + wait instead of one host round trip per range.
+                let mut prepared: Vec<Vec<(&dyn Buffer, usize, &dyn Buffer, usize, usize)>> =
+                    (0..self.backends.len()).map(|_| Vec::with_capacity(copies.len())).collect();
+                for &(src, src_offset, dst, dst_offset, bytes) in copies {
+                    let (s, d) = (as_pipe(src)?, as_pipe(dst)?);
+                    if !s.is_replicated() || !d.is_replicated() {
+                        return Err(be(
+                            "pipeline: copy_buffer_ranges mixes replicated and single-device buffers",
+                        ));
+                    }
+                    let shared = s.bufs.len().min(d.bufs.len());
+                    for (dev, lane) in prepared.iter_mut().take(shared).enumerate() {
+                        lane.push((
+                            s.on(dev)?,
+                            src_offset,
+                            d.on(dev)?,
+                            dst_offset,
+                            bytes,
+                        ));
+                    }
+                }
+                for (backend, lane) in self.backends.iter().zip(&prepared) {
+                    backend.copy_buffer_ranges(lane)?;
+                }
+                Ok(())
+            }
+            _ => Err(be(
+                "pipeline: copy_buffer_ranges across devices is not supported",
             )),
         }
     }
@@ -600,41 +1528,164 @@ impl Backend for PipelineBackend {
     }
 
     fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
-        let pp = plan
-            .as_any()
-            .downcast_ref::<PipelinePlan>()
-            .ok_or_else(|| be("pipeline: execute got a non-pipeline plan"))?;
-        let mut guard = pp.prepared.lock().expect("pipeline plan poisoned");
-        if guard.is_none() {
-            *guard = Some(self.prepare(&pp.graph, bindings)?);
+        // `INFR_PIPE_TIME`: where a forward's wall time actually goes (per-segment execute+sync vs
+        // the host-staged cut transfers). The pipeline has no other timing hook, and a single
+        // forward's 145 ms vs ~5 ms/row of GPU work needs one.
+        let time_it = std::env::var_os("INFR_PIPE_TIME").is_some();
+        let t_all = std::time::Instant::now();
+        if time_it {
+            tracing::info!("[pipe path] plain-execute");
         }
-        let prep = guard.as_ref().expect("prepared just set");
-
-        for seg in &prep.segments {
-            // Hand each cut tensor off from the device that LAST wrote it (already run + synced —
-            // op_dev is monotonic, so every producer's segment precedes this one) into this segment.
-            for (t, producer, ho) in &seg.cut {
-                self.transfer(*t, *producer, seg.device, ho, bindings)?;
-            }
-            // Per-device bindings: resolve every bound tensor to this device's buffer/replica.
-            let d = seg.device;
-            let mut sub = Bindings::new();
-            let (lo, hi) = seg.op_range;
-            let mut needed: std::collections::HashSet<TensorId> = std::collections::HashSet::new();
-            for op in &pp.graph.ops[lo..hi] {
-                let (r, w) = op.io();
-                needed.extend(r);
-                needed.extend(w);
-            }
-            for t in &needed {
-                if let Some(buf) = bindings.get(*t) {
-                    sub.bind(*t, as_pipe(buf)?.on(d)?);
+        let mut seg_ms: Vec<f64> = Vec::new();
+        let mut cut_ms: Vec<f64> = Vec::new();
+        self.with_prep(plan, bindings, |pp, prep| {
+            for seg in &prep.segments {
+                // Hand each cut tensor off from the device that LAST wrote it (already run + synced —
+                // op_dev is monotonic, so every producer's segment precedes this one) into this segment.
+                let t_cut = std::time::Instant::now();
+                for (t, producer, ho) in &seg.cut {
+                    self.transfer(*t, *producer, seg.device, ho, bindings)?;
+                }
+                let cut = t_cut.elapsed().as_secs_f64() * 1e3;
+                let t_seg = std::time::Instant::now();
+                self.run_segment(pp, seg, bindings)?;
+                if time_it {
+                    cut_ms.push(cut);
+                    seg_ms.push(t_seg.elapsed().as_secs_f64() * 1e3);
                 }
             }
-            self.backends[d].execute(seg.plan.as_ref(), &sub)?;
-            self.backends[d].sync()?;
+            Ok(())
+        })?;
+        if time_it {
+            let fmt = |v: &[f64]| {
+                v.iter()
+                    .map(|x| format!("{x:.1}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            tracing::info!(
+                "[pipe time] total={:.1}ms segs=[{}] cuts=[{}]",
+                t_all.elapsed().as_secs_f64() * 1e3,
+                fmt(&seg_ms),
+                fmt(&cut_ms)
+            );
         }
         Ok(())
+    }
+
+    /// See [`Backend::execute_pipelined`]: two devices, one thread each, so the device-0 halves of
+    /// this call's stages run while the deferred plan's device-1 half runs on the other card —
+    /// instead of the two cards taking turns (each is idle ~half of every chunk, because layer L+1
+    /// depends on layer L and a layer split puts the halves on different cards).
+    ///
+    /// Caller invariants: a plan's device-0 half is independent of every EARLIER plan's device-1
+    /// half (true for consecutive prefill chunks of one sequence: only the residual handoff and the
+    /// KV cache cross chunks, the handoff in the plan's own cached buffers and the KV at disjoint
+    /// token positions), and each in-flight chunk binds its OWN buffer set (the deferred half reads
+    /// its chunk's buffers, which the next chunk must not reuse).
+    fn execute_pipelined(
+        &self,
+        deferred: Option<(&dyn Plan, &Bindings)>,
+        stages: &[(&dyn Plan, &Bindings)],
+        after_dev0: &mut dyn FnMut(usize) -> Result<()>,
+    ) -> Result<()> {
+        if self.backends.len() != 2 {
+            // Not the 2-way layer split this overlap is written for: the generic serial walk.
+            return Backend::execute_pipelined(self, deferred, stages, after_dev0);
+        }
+        if std::env::var_os("INFR_PIPE_TIME").is_some() {
+            tracing::info!(
+                "[pipe path] pipelined deferred={} stages={}",
+                deferred.is_some(),
+                stages.len()
+            );
+        }
+        let timing = std::env::var_os("INFR_PIPE_TIME").is_some().then(OverlapTiming::new);
+        if let Some(timing) = &timing {
+            timing.mark("call");
+        }
+        let gate = Gate::new();
+        // The attribution context (decode step / phase) is thread-local, so the device-1 worker
+        // would otherwise submit everything unattributed. Snapshot it here and adopt it there.
+        let inherited = infr_core::timeline::current_context();
+        std::thread::scope(|scope| -> Result<()> {
+            // Device 1: gather + run the deferred plan's segments, released by the gate. The
+            // publishes it consumes were done by the PREVIOUS call (deferred.dev0 ran there) and by
+            // this call's publish pass below (see `publish_remote_cuts`).
+            let worker = scope.spawn(|| -> Result<()> {
+                let _context = infr_core::timeline::adopt(inherited);
+                let Some((plan, bindings)) = deferred else {
+                    return Ok(());
+                };
+                if let Some(timing) = &timing {
+                    timing.mark("dev1_wait");
+                }
+                if !gate.wait() {
+                    return Ok(()); // device-0 pass failed: run nothing
+                }
+                if let Some(timing) = &timing {
+                    timing.mark("dev1_go");
+                }
+                self.with_prep(plan, bindings, |pp, prep| {
+                    self.run_device_segments(pp, prep, bindings, 1, Cuts::Move)
+                })
+                .map(|()| {
+                    if let Some(timing) = &timing {
+                        timing.mark("dev1_done");
+                    }
+                })
+            });
+            // Device 0 (this thread): publish the deferred plan's cuts, release device 1, then run
+            // every stage's device-0 half — publishing the cuts its own deferred device-1 half will
+            // gather on the NEXT call.
+            let main = (|| -> Result<()> {
+                if let Some((plan, bindings)) = deferred {
+                    self.with_prep(plan, bindings, |_pp, prep| {
+                        self.publish_remote_cuts(prep, bindings, 0)
+                    })?;
+                }
+                if let Some(timing) = &timing {
+                    timing.mark("dev1_published");
+                }
+                gate.signal();
+                if let Some(timing) = &timing {
+                    timing.mark("dev1_released");
+                }
+                for (i, (plan, bindings)) in stages.iter().enumerate() {
+                    self.with_prep(*plan, *bindings, |pp, prep| {
+                        self.run_device_segments(pp, prep, bindings, 0, Cuts::Skip)?;
+                        self.publish_remote_cuts(prep, bindings, 0)
+                    })?;
+                    after_dev0(i)?;
+                    if let Some(timing) = &timing {
+                        timing.mark(format!("stage{i}_done"));
+                    }
+                }
+                Ok(())
+            })();
+            let result = match main {
+                Ok(()) => worker
+                    .join()
+                    .map_err(|_| be("pipeline: device-1 worker panicked"))?,
+                Err(error) => {
+                    // Release the worker with a failure so `join` cannot hang on a gate that will
+                    // never be signaled.
+                    gate.abort();
+                    let _ = worker.join();
+                    Err(error)
+                }
+            };
+            if let Some(timing) = &timing {
+                timing.mark("joined");
+            }
+            result
+        })
+        .map(|result| {
+            if let Some(timing) = &timing {
+                timing.log(deferred.is_some(), stages.len());
+            }
+            result
+        })
     }
 
     fn sync(&self) -> Result<()> {
@@ -647,11 +1698,141 @@ impl Backend for PipelineBackend {
     fn kv_overflow_report(&self) {
         infr_core::backend::kv_overflow_report_each(&self.backends);
     }
+
+    // ── segmented (lazily committed) KV ─────────────────────────────────────────
+    // Replicated exactly like the flat KV path above (`replicate_kv`: Qwen4's recurrent/HC state
+    // under `KvCache` usage needs every device to hold its own copy), and for the same reason the
+    // segmented layout has no layer index to route by. Sessions that do not replicate keep the
+    // flat path unchanged, which is what `Ok(None)` says.
+    //
+    // Each device keeps its OWN arena reservation, so a 32K-token segment is claimed per device
+    // and the whole set stays addressable from the plan (`prepare` binds the `dev`-th replica).
+
+    fn segmented_kv_available(&self) -> bool {
+        self.backends.iter().all(|b| b.segmented_kv_available())
+    }
+
+    fn alloc_segmented_kv(
+        &self,
+        spec: infr_core::backend::SegmentedKvSpec,
+    ) -> Result<Option<Box<dyn Buffer>>> {
+        if !self.replicate_kv {
+            return Ok(None);
+        }
+        let mut bufs = Vec::with_capacity(self.backends.len());
+        for b in &self.backends {
+            match b.alloc_segmented_kv(spec)? {
+                Some(buf) => bufs.push(buf),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(Box::new(PipelineBuffer {
+            device: None,
+            bufs,
+            last_writer: AtomicUsize::new(NO_WRITER),
+        })))
+    }
+
+    fn ensure_segmented_kv(&self, buffer: &dyn Buffer, segments: usize) -> Result<()> {
+        let pipe = as_pipe(buffer)?;
+        for (dev, b) in self.backends[..self.trunk_device_count()]
+            .iter()
+            .enumerate()
+        {
+            b.ensure_segmented_kv(pipe.on(dev)?, segments)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_segmented_kv_batch(&self, buffers: &[&dyn Buffer], segments: usize) -> Result<()> {
+        // One transaction PER DEVICE over the whole plane set, so a context boundary can never
+        // leave device 0 grown and device 1 not.
+        let trunk = self.trunk_device_count();
+        let mut groups: Vec<Vec<&dyn Buffer>> = (0..trunk)
+            .map(|_| Vec::with_capacity(buffers.len()))
+            .collect();
+        for &buffer in buffers {
+            let pipe = as_pipe(buffer)?;
+            for (dev, group) in groups.iter_mut().enumerate() {
+                group.push(pipe.on(dev)?);
+            }
+        }
+        for (b, group) in self.backends[..trunk].iter().zip(&groups) {
+            b.ensure_segmented_kv_batch(group, segments)?;
+        }
+        Ok(())
+    }
+
+    fn clear_segmented_kv(&self, buffer: &dyn Buffer) -> Result<()> {
+        let pipe = as_pipe(buffer)?;
+        for (dev, b) in self.backends[..self.trunk_device_count()]
+            .iter()
+            .enumerate()
+        {
+            b.clear_segmented_kv(pipe.on(dev)?)?;
+        }
+        Ok(())
+    }
+
+    fn buffer_committed_bytes(&self, buffer: &dyn Buffer) -> Result<usize> {
+        let pipe = as_pipe(buffer)?;
+        // Replicas grow together, so any one answers; the smallest is the safe one — a divergence
+        // must never let the session read a row that is not physically backed on some device.
+        let mut committed = usize::MAX;
+        for (dev, b) in self.backends[..self.trunk_device_count()]
+            .iter()
+            .enumerate()
+        {
+            committed = committed.min(b.buffer_committed_bytes(pipe.on(dev)?)?);
+        }
+        Ok(committed)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The byte-weighted split must beat (or match) every other 2-device cut on the heavier device,
+    /// and stay contiguous. Pattern = the real Qwen3.8 IQ3_XXS shape: ~0.75 GiB layers early,
+    /// ~1.10 GiB late, plus a 0.67 GiB head/norm/embd burden only the last device carries.
+    #[test]
+    fn byte_balanced_split_minimises_the_heavier_device() {
+        let bytes: Vec<u64> = (0..48)
+            .map(|l| if l < 28 { 805_306_368 } else { 1_181_116_006 })
+            .collect();
+        let tail = 719_323_136u64;
+        let map = PipelineBackend::byte_balanced_layer_map(48, 2, &bytes, 0, tail);
+        let cut = map.iter().position(|&d| d == 1).expect("two bands");
+        assert!(map[..cut].iter().all(|&d| d == 0), "contiguous + monotonic: {map:?}");
+        let (a, b) = (
+            bytes[..cut].iter().sum::<u64>(),
+            bytes[cut..].iter().sum::<u64>() + tail,
+        );
+        let best = (1..48)
+            .map(|c| {
+                bytes[..c].iter().sum::<u64>().max(bytes[c..].iter().sum::<u64>() + tail)
+            })
+            .min()
+            .unwrap();
+        assert_eq!(a.max(b), best, "split {a}/{b} is not the byte optimum {best}");
+
+        // Same property on the general N-device path (brute-force every pair of cuts).
+        let map3 = PipelineBackend::byte_balanced_layer_map(48, 3, &bytes, 0, tail);
+        let (c1, c2) = (
+            map3.iter().position(|&d| d == 1).expect("band 1"),
+            map3.iter().position(|&d| d == 2).expect("band 2"),
+        );
+        assert!(map3[..c1].iter().all(|&d| d == 0) && map3[c1..c2].iter().all(|&d| d == 1));
+        let band = |s: usize, e: usize| bytes[s..e].iter().sum::<u64>();
+        let mine = band(0, c1).max(band(c1, c2)).max(band(c2, 48) + tail);
+        let best3 = (1..47)
+            .flat_map(|i| (i + 1..48).map(move |j| (i, j)))
+            .map(|(i, j)| band(0, i).max(band(i, j)).max(band(j, 48) + tail))
+            .min()
+            .unwrap();
+        assert_eq!(mine, best3, "3-way split {mine} is not the byte optimum {best3}");
+    }
 
     #[test]
     fn last_writer_is_the_most_recent_producer_device() {

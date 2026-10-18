@@ -19,7 +19,7 @@ use super::{
 use crate::seam::TokenEmbd;
 use crate::{Config, EngineConfig, GenStats, PerLayerEmbd};
 use anyhow::{anyhow, Context, Result as AResult};
-use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage};
+use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Plan};
 use infr_core::graph::{
     Activation, AttnMask, Dsv4CacheFormat, Graph, HyperGates, MoePrefetchHint, Op, SequenceSpan,
 };
@@ -728,6 +728,113 @@ fn bind_mtp_recurrent_traces<'a>(
     }
 }
 
+/// The per-chunk GPU buffers a batched-prefill chunk binds (token ids, positions, hidden residual,
+/// hyper-connection wide residual, PLE rows). Allocated fresh per iteration by default; hoisted to
+/// TWO persistent alternating sets when the 1F1B cross-chunk overlap is on
+/// (`INFR_PIPELINE_OVERLAP`), because a chunk whose device-1 half is deferred must keep ITS set
+/// alive until that half has run — and must not share it with the chunk that is already in flight.
+struct ChunkBufs {
+    ids: Box<dyn Buffer>,
+    pos: Box<dyn Buffer>,
+    hidden: Box<dyn Buffer>,
+    wide: Box<dyn Buffer>,
+    ple: Box<dyn Buffer>,
+}
+
+impl ChunkBufs {
+    fn alloc(
+        be: &dyn Backend,
+        rows: usize,
+        ne: usize,
+        hc_mult: usize,
+        ple_row: usize,
+    ) -> anyhow::Result<Self> {
+        let alloc = |bytes: usize, usage: BufferUsage| -> anyhow::Result<Box<dyn Buffer>> {
+            be.alloc(bytes, usage).map_err(|error| anyhow!("{error}"))
+        };
+        let alloc_uninit = |bytes: usize, usage: BufferUsage| -> anyhow::Result<Box<dyn Buffer>> {
+            be.alloc_uninit(bytes, usage)
+                .map_err(|error| anyhow!("{error}"))
+        };
+        Ok(Self {
+            ids: alloc(rows * 4, BufferUsage::Staging)?,
+            pos: alloc(rows * 4, BufferUsage::Staging)?,
+            hidden: alloc_uninit(rows * ne * 4, BufferUsage::Activations)?,
+            wide: alloc_uninit(rows * hc_mult * ne * 4, BufferUsage::Activations)?,
+            ple: alloc(rows * ple_row * 4, BufferUsage::Staging)?,
+        })
+    }
+}
+
+/// A prefill chunk whose DEVICE-1 half has not run yet (the 1F1B overlap defers it by one
+/// iteration): the plans and graph handles needed to re-bind and finish it, plus the buffer set it
+/// owns (`parity`) and the metadata the caller still needs.
+struct PendingChunk {
+    plan1: Box<dyn Plan>,
+    h1: DecodeHandles,
+    parity: usize,
+    prefill_lanes: Vec<usize>,
+}
+
+/// Bind one batched-prefill chunk's IO: its own per-chunk buffers (`first` = the embedding/layer-0
+/// graph, the only one that binds the token ids) plus the session-level wiring. Factored out of the
+/// chunk loop so a chunk deferred by the 1F1B overlap can be re-bound, and finished, later.
+#[allow(clippy::too_many_arguments)]
+fn bind_prefill_chunk<'a>(
+    h: &DecodeHandles,
+    first: bool,
+    ids: &'a dyn Buffer,
+    positions: &'a dyn Buffer,
+    hidden: &'a dyn Buffer,
+    wide: &'a dyn Buffer,
+    ple: Option<&'a dyn Buffer>,
+    n_layer: usize,
+    rf_buf: &'a Option<(Box<dyn Buffer>, usize)>,
+    yff_buf: &'a Option<(Box<dyn Buffer>, usize)>,
+    kbufs: &'a [Box<dyn Buffer>],
+    vbufs: &'a [Box<dyn Buffer>],
+    qsa_kbufs: &'a [Option<Box<dyn Buffer>>],
+    qsa_cbufs: &'a [Option<Box<dyn Buffer>>],
+    mrope_history_buf: &'a Option<Box<dyn Buffer>>,
+    wbufs: &'a [Box<dyn Buffer>],
+    primary_wide: &'a Option<Box<dyn Buffer>>,
+    primary_ple_embd: &'a Option<Box<dyn Buffer>>,
+    primary_ple_state: &'a Option<Box<dyn Buffer>>,
+    peers: &'a [SeamKv],
+    lane_indices: Option<&[usize]>,
+    independent_rows: bool,
+) -> Bindings<'a> {
+    let mut b = Bindings::new();
+    if first {
+        b.bind(h.tok_ids.expect("GPU embedding needs token ids"), ids);
+    }
+    b.bind(h.hidden, hidden);
+    b.bind(h.positions, positions);
+    bind_parallel_layer_io(
+        &mut b,
+        h,
+        n_layer,
+        rf_buf,
+        yff_buf,
+        kbufs,
+        vbufs,
+        qsa_kbufs,
+        qsa_cbufs,
+        mrope_history_buf,
+        None,
+        wbufs,
+        primary_wide,
+        primary_ple_embd,
+        primary_ple_state,
+        wide,
+        ple,
+        peers,
+        lane_indices,
+        independent_rows,
+    );
+    b
+}
+
 #[allow(clippy::too_many_arguments)]
 fn bind_parallel_layer_io<'a>(
     b: &mut Bindings<'a>,
@@ -1051,6 +1158,20 @@ fn session_stable(
     // made every DeepSeek prefill run one token per submit (see the CHANGELOG entry for the
     // before/after prefill throughput that fixing it bought).
     let moe_mmq_ok = |d: Option<DType>| d.is_some_and(infr_core::tensor::moe_mmq_ok);
+    if std::env::var_os("INFR_DEBUG_PREFILL_GATE").is_some() {
+        let dt = |n: String| g.tensors().iter().find(|t| t.name == n).map(|t| t.dtype);
+        for l in (0..c.n_layer).filter(|&l| c.is_moe_layer(l)) {
+            let g_ = dt(format!("blk.{l}.ffn_gate_exps.weight"));
+            let u_ = dt(format!("blk.{l}.ffn_up_exps.weight"));
+            let d_ = dt(format!("blk.{l}.ffn_down_exps.weight"));
+            eprintln!(
+                "[pf-mmq] l={l} gate={g_:?}({}) up={u_:?}({}) down={d_:?}({})",
+                g_.is_some_and(infr_core::tensor::moe_mmq_ok),
+                u_.is_some_and(infr_core::tensor::moe_mmq_ok),
+                d_.is_some_and(infr_core::tensor::moe_mmq_ok)
+            );
+        }
+    }
     let moe_batched_ok = c.moe.is_some() && {
         let dt = |n: String| g.tensors().iter().find(|t| t.name == n).map(|t| t.dtype);
         let moe_layers = || (0..c.n_layer).filter(|&l| c.is_moe_layer(l));
@@ -1275,14 +1396,14 @@ fn allocate_pending_seam_slot(
             )?;
         }
     }
-    let mtp_delta_ckpt = if ec.spec.mtp && cfg.qwen4exp {
+    let mtp_delta_ckpt = if crate::seam::spec::needs_recurrent_trace(ec, cfg) {
         MtpDeltaCkpt::allocate_before_dynamic_kv(
             be,
             cfg,
             &kbufs,
             &vbufs,
             ple_state_buf.as_deref(),
-            crate::mtp::DRAFT_TOKENS.saturating_sub(1),
+            crate::seam::spec::recurrent_trace_rows(ec),
         )?
     } else {
         None
@@ -1438,6 +1559,44 @@ fn finish_pending_seam_slot(
     })
 }
 
+/// Materialize a second, independent state slot for the native window pipeline. The new slot
+/// shares the uploaded weights/session derivaions with `src` but owns fresh flat KV/recurrent
+/// buffers, so stage 0 can advance a guessed window while stage 1 verifies the real one.
+///
+/// This is the native MoE4All equivalent of a second verifier state; it does not depend on Strata.
+pub(crate) fn fork_seam_slot_flat(
+    src: &SeamKv,
+    be: &dyn Backend,
+    cfg: &Config,
+    ec: &EngineConfig,
+) -> AResult<SeamKv> {
+    let pending = allocate_pending_seam_slot(
+        be,
+        cfg,
+        ec,
+        src.max_ctx,
+        src.kv_ring,
+        src.k_fmt,
+        src.v_fmt,
+        None,
+        false,
+        false,
+        true,
+    )?;
+    finish_pending_seam_slot(
+        pending,
+        be,
+        cfg,
+        std::sync::Arc::clone(&src.weights),
+        std::sync::Arc::clone(&src.stable),
+        None,
+        src.k_fmt,
+        src.v_fmt,
+        src.max_ctx,
+        src.kv_ring,
+    )
+}
+
 struct ParallelDecodeRequest<'a> {
     prompts: &'a [Vec<u32>],
     prompt_ends: &'a [usize],
@@ -1578,6 +1737,96 @@ pub(crate) fn generate_dense_backend(
         None,
         None,
         None,
+        None,
+    )
+}
+
+/// The front span of a window the native window pipeline has already executed on device 0, waiting
+/// for its back span one call later (`INFR_MTP_WINDOW_PIPE`).
+///
+/// Only the RESIDUAL handoff and the window's own bookkeeping survive between the two steps: the
+/// front span's KV rows and its share of every recurrent state live in the slot's own buffers, and
+/// the back span builds everything else (positions, logits, ids) itself. The two spans are separate
+/// plans in separate calls, so the pipeline backend's cut detection — which only sees a
+/// producer→consumer edge INSIDE one plan — cannot hand the residual over; the caller must have
+/// already refreshed every replica of `hidden`/`wide` (see the `window_pipe` branch in
+/// `generate_dense_backend_inner`).
+pub(crate) struct WindowFront {
+    /// Residual entering the window's back span, per-row `[rows, hc_mult * n_embd]`.
+    wide: Box<dyn Buffer>,
+    /// The `n_embd`-wide companion the back span's first layers read alongside `wide`.
+    hidden: Box<dyn Buffer>,
+    /// The tokens this window covers, i.e. `cached[..start]` extended by them is the sequence.
+    tokens: Vec<u32>,
+    /// Absolute position of this window's first row.
+    start: usize,
+    /// Rows in this window (`tokens.len() - start`).
+    rows: usize,
+}
+
+/// One step of the native window pipeline. The MTP loop drives it one window ahead:
+///
+/// * `carry` is `None` on the FILL step: only `front_feed`'s front span runs, and the step returns
+///   the residual to carry in `*carry`.
+/// * `carry` is `Some` on the PAIR step: the carried window's BACK span runs on device 1 while
+///   `front_feed`'s FRONT span runs on device 0, and the step replaces `*carry` with the new
+///   window's front. `ids`/`logits`/`hidden` then hold the CARRIED window's VERIFY results, which
+///   is what the caller accepts against the drafts it fed that window with.
+pub(crate) struct WindowPipeRequest<'a> {
+    pub(crate) carry: &'a mut Option<WindowFront>,
+    pub(crate) front_feed: &'a [u32],
+    pub(crate) ids: &'a mut Vec<u32>,
+    pub(crate) logits: &'a mut Vec<f32>,
+    pub(crate) hidden: &'a mut Vec<f32>,
+}
+
+/// [`generate_dense_backend`]'s native window pipeline entry (`INFR_MTP_WINDOW_PIPE`). Split out
+/// rather than folded into the main signature so the two dozen callers that never pipeline a VERIFY
+/// keep their exact call shape.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_dense_backend_window_pipe(
+    be: &dyn Backend,
+    bind_weight: &BindWeight,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    state: &mut Option<SeamKv>,
+    want_ctx: usize,
+    finish_fixed_allocations: Option<&dyn Fn() -> AResult<()>>,
+    window_pipe: &mut WindowPipeRequest<'_>,
+) -> AResult<(Vec<u32>, GenStats)> {
+    generate_dense_backend_inner(
+        be,
+        bind_weight,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        ple,
+        prompt,
+        0,
+        |_| {},
+        state,
+        want_ctx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        finish_fixed_allocations,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(window_pipe),
     )
 }
 
@@ -1629,6 +1878,7 @@ pub(crate) fn generate_dense_backend_mtp_prime(
         None,
         prepared,
         Some(sink),
+        None,
     )
 }
 
@@ -1722,6 +1972,7 @@ pub(crate) fn generate_dense_backend_parallel_sampled(
         None,
         None,
         None,
+        None,
     )?;
     let mut outputs = Vec::with_capacity(prompts.len());
     outputs.push(first);
@@ -1794,6 +2045,7 @@ pub(crate) fn generate_dense_backend_parallel_prefill(
         None,
         None,
         Some(&mut parallel),
+        None,
         None,
         None,
         None,
@@ -1872,8 +2124,22 @@ pub(crate) fn generate_dense_backend_parallel_mtp_verify(
         Some(&mut request),
         None,
         None,
+        None,
     )?;
     Ok(())
+}
+
+/// The layer index a two-device pipeline backend splits at, or `None` for every other backend.
+///
+/// The native window pipeline splits each VERIFY into a front span and a back span at exactly the
+/// boundary the backend already uses for weights, KV and recurrent state — so each span's ops all
+/// land on one card and neither span has to move anything but the residual.
+pub(crate) fn pipeline_layer_split(be: &dyn Backend) -> Option<usize> {
+    let ranges = be
+        .backend_any()?
+        .downcast_ref::<infr_vulkan::PipelineBackend>()?
+        .layer_ranges();
+    (ranges.len() == 2 && ranges[0].end == ranges[1].start).then_some(ranges[0].end)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1943,6 +2209,9 @@ fn generate_dense_backend_inner(
     parallel_mtp_verify: Option<&mut ParallelMtpVerifyRequest<'_>>,
     prepared_single: Option<PreparedParallelPrompt>,
     mut mtp_prefill_sink: Option<&mut dyn MtpPrefillHiddenSink>,
+    // Native window pipeline (`INFR_MTP_WINDOW_PIPE`, see [`WindowPipeRequest`]). `None` everywhere
+    // but the MTP loop's two `generate_dense_backend_window_pipe` calls.
+    window_pipe: Option<&mut WindowPipeRequest<'_>>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
     let state_trace = ec.debug.state_trace;
@@ -2060,17 +2329,28 @@ fn generate_dense_backend_inner(
     // AND `!deepseek2`, so a pinned q8 can never be gated back to f16 here against an estimate that
     // priced it at q8; the MLA exclusion it adds is a kernel-dtype fact, applied below per backend
     // (`crate::seam::mla_kv_fmt`) rather than here, because the CPU's MLA arm reads every KV dtype.
+    // `PipelineBackend` (the two-GPU layer split) IS Vulkan on every device, but it names itself
+    // "vulkan-pipeline" — so every literal `== "vulkan"` capability check below silently excluded
+    // exactly the multi-GPU setup: q8, turbo and block-quant (q4/q5) KV were all gated back to f16
+    // there, where those knobs matter most, and the Q8_0-only segmented layout became unreachable
+    // (which in turn left the whole 256K KV window dead). Normalize the name once here. The
+    // decode-path shortcuts further down that also test the name are left alone deliberately —
+    // they are unverified for the split, and none of them is what costs the KV its speed.
+    let backend = match be.name() {
+        "vulkan-pipeline" => "vulkan",
+        other => other,
+    };
     let kv_align_ok = crate::seam::kv_row_align_ok(c);
-    let kv_q8_backend = matches!(be.name(), "metal" | "cpu" | "vulkan");
+    let kv_q8_backend = matches!(backend, "metal" | "cpu" | "vulkan");
     // TurboQuant (turbo2/3/4): CPU + Vulkan + Metal (both GPUs use a dequant→f16 prepass); needs
     // head_dim % 128 (a WHT group is a 128-elem head_dim slice).
-    let kv_turbo_ok = matches!(be.name(), "cpu" | "vulkan" | "metal")
+    let kv_turbo_ok = matches!(backend, "cpu" | "vulkan" | "metal")
         && (0..c.n_layer).all(|l| c.layer_head_dim(l).is_multiple_of(128));
     // Mainline low-bit block quants (q4_0/…/iq4_nl): CPU + Vulkan + Metal; need 32-block alignment.
-    let blk_ok = matches!(be.name(), "cpu" | "vulkan" | "metal") && kv_align_ok;
+    let blk_ok = matches!(backend, "cpu" | "vulkan" | "metal") && kv_align_ok;
     // Dense f32/bf16 KV: CPU + Vulkan + Metal. Vulkan/Metal store dense; f32 reads natively (its
     // own f32 attention), bf16 reads via a cast→f16 prepass.
-    let dense_ok = matches!(be.name(), "cpu" | "vulkan" | "metal");
+    let dense_ok = matches!(backend, "cpu" | "vulkan" | "metal");
     // The requested format's NAME is parsed by the shared grammar (`infr_core::budget`, the same
     // table the placement estimator prices with); only the per-format CAPABILITY gates below are
     // the runner's, since they turn on this backend and this model's layout. A request that fails
@@ -2081,7 +2361,7 @@ fn generate_dense_backend_inner(
     // true, which is exactly today's split (§11 decision 8): it falls through to the ladder below
     // while still having suppressed auto-q8 up in the placement.
     let automatic_q8 =
-        be.name() == "vulkan" && (crate::seam::kv_auto_q8() || crate::seam::kv_default_q8(c, ec));
+        backend == "vulkan" && (crate::seam::kv_auto_q8() || crate::seam::kv_default_q8(c, ec));
     let parse_kv_fmt =
         |want: Option<DType>| -> DType {
             match want {
@@ -2808,6 +3088,20 @@ fn generate_dense_backend_inner(
         let segmented_available = be.segmented_kv_available() || pager_deferred;
         let segmented_kv =
             crate::seam::segmented_kv_wanted(c, ec, kv_ring, k_fmt, v_fmt) && segmented_available;
+        // Which gate decided the KV layout. `segmented_kv_wanted` is a conjunction of six
+        // conditions and the only visible symptom of a `false` is the flat path's PCIe reads, so
+        // name every input once instead of re-deriving it from the heap banner.
+        tracing::info!(
+            segmented_available,
+            pager_deferred,
+            kv_ring,
+            dynamic = ec.kv.dynamic,
+            overflow = ec.kv.overflow,
+            k_dtype = ?k_fmt,
+            v_dtype = ?v_fmt,
+            segmented_kv,
+            "KV layout decision: segmented=lazily-committed 32K segments, flat=whole-context buffers"
+        );
         if ec.kv.dynamic
             && (c.qwen35 || c.qwen4exp)
             && !kv_ring
@@ -2953,14 +3247,14 @@ fn generate_dense_backend_inner(
                 )?;
             }
         }
-        let mtp_delta_ckpt = if ec.spec.mtp && c.qwen4exp {
+        let mtp_delta_ckpt = if crate::seam::spec::needs_recurrent_trace(ec, c) {
             MtpDeltaCkpt::allocate_before_dynamic_kv(
                 be,
                 c,
                 &kbufs,
                 &vbufs,
                 ple_state_buf.as_deref(),
-                crate::mtp::DRAFT_TOKENS.saturating_sub(1),
+                crate::seam::spec::recurrent_trace_rows(ec),
             )?
         } else {
             None
@@ -3854,6 +4148,9 @@ fn generate_dense_backend_inner(
         // graph is ever replay-eligible anyway (batched prefill/denoise are rows>1), and DG has
         // no autoregressive decode loop — its per-prefill decode is exactly one token — so this
         // costs nothing while making both modes bit-identical.
+        // qwen4exp is back in the opt-out: dropping it changed nothing measurable (an MoE decode
+        // graph is ineligible for the tape by design — `decode_eligible` lists "MoE decode" as
+        // ineligible, the frozen-LUT machinery has no tape twin), so this is not on the cost path.
         g.no_decode_replay = c.diffusion_gemma || c.qwen4exp || segmented_kv_enabled;
         let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
         // KV cache dtype: f16 by default (halves memory vs f32, tightens CPU↔GPU parity); Q8_0
@@ -3918,7 +4215,13 @@ fn generate_dense_backend_inner(
         });
         let trace_recurrent = mtp_verify
             && mtp_trace.is_some_and(|(rows, _)| {
-                rows == batch || (parallel_mtp_trace && rows == crate::mtp::DRAFT_TOKENS)
+                // `rows == batch + 1` is the native window pipeline's shape: it arms one row more
+                // than the batch so the recurrent trace also holds a snapshot of the state AFTER
+                // the whole batch (the guessed window's front half has already moved the live
+                // state past it — see `SeamKv::mtp_restore_delta_row` and `spec::window_pipe`).
+                rows == batch
+                    || (parallel_mtp_trace && rows == crate::mtp::DRAFT_TOKENS)
+                    || (crate::seam::spec::window_pipe_enabled() && rows == batch + 1)
             });
         let mtp_trace_rows = mtp_trace.map_or(0, |(_, trace_rows)| trace_rows);
         let mtp_ple_trace = (trace_recurrent && span_has_ple).then(|| {
@@ -4919,7 +5222,7 @@ fn generate_dense_backend_inner(
                 }
                 let inject = t.inject;
                 let fused_down_inject = fuse_qwen_hc_down_inject
-                    && batch == 1
+                    && batch <= 8
                     && inject.is_some_and(|inject| {
                         g.desc(t.down).dtype == DType::Q8_0
                             && matches!(g.desc(inject).dtype, DType::F32 | DType::Q8_0)
@@ -7947,7 +8250,16 @@ fn generate_dense_backend_inner(
             .map(|tokens| tokens.len().saturating_sub(1))
             .collect::<Vec<_>>();
         let mut cursors = starts.clone();
-        let max_ubatch = crate::seam::ubatch_rows(ec).max(lanes);
+        // Per-lane chunk budget, NOT a total shared by the lanes. Prefill's whole cost model is
+        // "stream a layer's weights once and use them for `ubatch` rows", so a shared budget divides
+        // that amortization by the number of lanes: with two slots the aggregate read rate collapsed
+        // to one request's (measured 220 tok/s against 533 for a single request), which is exactly
+        // the "concurrency makes prefill slower" report. `ubatch_rows_parallel` is this path's
+        // per-lane knob (defaults to the sequential height); the paged-MoE arena still gets the last
+        // word, because `prepare_prefill` below negotiates the tallest chunk it can actually hold —
+        // this only stops the engine from handing itself a smaller ceiling than the hardware allows.
+        let per_lane_ubatch = crate::seam::ubatch_rows_parallel(ec);
+        let max_ubatch = per_lane_ubatch.saturating_mul(lanes).max(lanes);
         let mut planned_group = Vec::new();
         let mut ubatch = max_ubatch;
         let mut prefill_runtime_reserve = None;
@@ -7971,6 +8283,64 @@ fn generate_dense_backend_inner(
             }
         }
         let t0 = std::time::Instant::now();
+
+        // ── 1F1B 跨块流水（INFR_PIPELINE_OVERLAP=1，默认关）────────────────────────────
+        // 层切分下，同一块内"卡0 跑层 0-26 → 卡1 跑层 27-47"是依赖串行（层 27 要等层 26），
+        // 所以每张卡都有一半时间在闲着：实测两卡合起来忙 94%，但各自只有约 47% —— 第二张卡
+        // 只贡献容量、不贡献速度。把相邻两块错开半步：上一块的后半段在卡1 上跑的同时，本块的
+        // 前半段在卡0 上跑，两卡才真正并行。
+        //
+        // 只在"双卡 pipeline 后端 + 单 lane + 该 lane 无 checkpoint 边界"时启用：checkpoint
+        // 快照要读被就地更新的循环状态，必须赶在下一块开跑之前，与"错开半步"互斥。
+        // 每块缓冲因此改成两套常驻、按奇偶轮换（被推迟的块要留住属于它自己那一套）。
+        let overlap = std::env::var_os("INFR_PIPELINE_OVERLAP").is_some()
+            && be.name() == "vulkan-pipeline"
+            // NOT gated to one lane, and NOT gated to "no slot has a checkpoint boundary" any more.
+            // The stagger is a property of the CHUNKS, not of the lanes: a chunk holds rows of one
+            // or more slots, and the boundary rule below fences only the chunk that actually ENDS on
+            // a slot's rolling checkpoint. The old global `all(boundary.is_none())` test is what
+            // killed concurrent prefill — every serve request carries an edit-prefix boundary, so
+            // with two or more slots the stagger was off for the WHOLE prompt, the two cards went
+            // back to taking turns, and neither was ever more than half busy (measured: 2 concurrent
+            // requests read at 220 tok/s aggregate against 533 for one). This is the engine-side
+            // shape of Strata's `--batch-groups` (slots in groups pipelined through the GPUs).
+            ;
+        if std::env::var_os("INFR_PIPE_TIME").is_some() {
+            tracing::info!(
+                "[ov gate] path=parallel env={} name={} lanes={} ckpt_all_none={} => overlap={}",
+                std::env::var_os("INFR_PIPELINE_OVERLAP").is_some(),
+                be.name(),
+                lanes,
+                prepared[0]
+                    .checkpoint_boundaries
+                    .iter()
+                    .all(|b| b.is_none()),
+                overlap
+            );
+        }
+        let chunk_sets: Option<[ChunkBufs; 2]> = if overlap {
+            let alloc_sets = || -> anyhow::Result<[ChunkBufs; 2]> {
+                Ok([
+                    ChunkBufs::alloc(be, max_ubatch, ne, c.hc_mult, ple_row)?,
+                    ChunkBufs::alloc(be, max_ubatch, ne, c.hc_mult, ple_row)?,
+                ])
+            };
+            match alloc_sets() {
+                Ok(sets) => Some(sets),
+                Err(error) => {
+                    tracing::warn!(
+                        "pipeline overlap off: could not allocate the two chunk buffer sets \
+                         ({error})"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        // 上一块：它的前半段已经跑完，后半段还在等下一次调用。
+        let mut pending: Option<PendingChunk> = None;
+        let mut chunk_index = 0usize;
 
         while let Some((sparse, prefill_lanes)) =
             parallel_prefill_group(&cursors, &targets, qsa_threshold)
@@ -8045,6 +8415,16 @@ fn generate_dense_backend_inner(
                     begin..end
                 })
                 .collect::<Vec<_>>();
+            // A chunk whose END lands exactly on one of its slots' rolling checkpoints must run
+            // WHOLE (the checkpoint snapshots in-place recurrent state): fence only that chunk and
+            // let every other one stagger. Computed here because `final_ranges` is consumed below.
+            let boundary_chunk = prefill_lanes.iter().zip(&final_ranges).any(|(&lane, range)| {
+                prepared[lane]
+                    .checkpoint_boundaries
+                    .iter()
+                    .flatten()
+                    .any(|&boundary| boundary == range.end)
+            });
             let row_counts = allocate_parallel_prefill_rows(
                 &final_ranges
                     .iter()
@@ -8120,24 +8500,51 @@ fn generate_dense_backend_inner(
                 )?);
             }
 
-            let ids_buf = be
-                .alloc(batch * 4, BufferUsage::Staging)
+            // 每块缓冲：默认每轮新分配（原行为不变）；开流水时改用两套常驻缓冲按奇偶轮换。
+            // 绑一个比当前 batch 大的缓冲是安全的 —— 行数由图的形状决定，内核只读前 batch 行。
+            let fresh;
+            let (ids_buf, pos_batch, hidden_batch, wide_batch, ple_batch): (
+                &dyn Buffer,
+                &dyn Buffer,
+                &dyn Buffer,
+                &dyn Buffer,
+                &dyn Buffer,
+            ) = match chunk_sets.as_ref() {
+                Some(sets) => {
+                    let set = &sets[chunk_index % 2];
+                    (
+                        set.ids.as_ref(),
+                        set.pos.as_ref(),
+                        set.hidden.as_ref(),
+                        set.wide.as_ref(),
+                        set.ple.as_ref(),
+                    )
+                }
+                None => {
+                    fresh = (
+                        be.alloc(batch * 4, BufferUsage::Staging)
+                            .map_err(|error| anyhow!("{error}"))?,
+                        be.alloc(batch * 4, BufferUsage::Staging)
+                            .map_err(|error| anyhow!("{error}"))?,
+                        be.alloc_uninit(batch * ne * 4, BufferUsage::Activations)
+                            .map_err(|error| anyhow!("{error}"))?,
+                        be.alloc_uninit(batch * c.hc_mult * ne * 4, BufferUsage::Activations)
+                            .map_err(|error| anyhow!("{error}"))?,
+                        be.alloc(batch * ple_row * 4, BufferUsage::Staging)
+                            .map_err(|error| anyhow!("{error}"))?,
+                    );
+                    (
+                        fresh.0.as_ref(),
+                        fresh.1.as_ref(),
+                        fresh.2.as_ref(),
+                        fresh.3.as_ref(),
+                        fresh.4.as_ref(),
+                    )
+                }
+            };
+            be.upload(ids_buf, bytemuck::cast_slice(&ids))
                 .map_err(|error| anyhow!("{error}"))?;
-            let pos_batch = be
-                .alloc(batch * 4, BufferUsage::Staging)
-                .map_err(|error| anyhow!("{error}"))?;
-            let hidden_batch = be
-                .alloc_uninit(batch * ne * 4, BufferUsage::Activations)
-                .map_err(|error| anyhow!("{error}"))?;
-            let wide_batch = be
-                .alloc_uninit(batch * c.hc_mult * ne * 4, BufferUsage::Activations)
-                .map_err(|error| anyhow!("{error}"))?;
-            let ple_batch = be
-                .alloc(batch * ple_row * 4, BufferUsage::Staging)
-                .map_err(|error| anyhow!("{error}"))?;
-            be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids))
-                .map_err(|error| anyhow!("{error}"))?;
-            be.upload(pos_batch.as_ref(), bytemuck::cast_slice(&positions))
+            be.upload(pos_batch, bytemuck::cast_slice(&positions))
                 .map_err(|error| anyhow!("{error}"))?;
 
             let (mut g0, h0) = build(
@@ -8159,53 +8566,6 @@ fn generate_dense_backend_inner(
             g0.prefill_target_tokens = Some(prefill_target);
             g0.prefill_runtime_reserve_bytes = prefill_runtime_reserve;
             let plan0 = be.compile(&g0).map_err(|error| anyhow!("{error}"))?;
-            let mut bindings0 = Bindings::new();
-            bindings0.bind(
-                h0.tok_ids.expect("GPU embedding needs token ids"),
-                ids_buf.as_ref(),
-            );
-            bindings0.bind(h0.hidden, hidden_batch.as_ref());
-            bindings0.bind(h0.positions, pos_batch.as_ref());
-            bind_parallel_layer_io(
-                &mut bindings0,
-                &h0,
-                c.n_layer,
-                rf_buf,
-                yff_buf,
-                &kbufs[..],
-                &vbufs[..],
-                &qsa_kbufs[..],
-                &qsa_cbufs[..],
-                &mrope_history_buf,
-                None,
-                &wbufs[..],
-                qwen_wide_buf,
-                ple_embd_buf,
-                ple_state_buf,
-                wide_batch.as_ref(),
-                None,
-                &*parallel.peers,
-                Some(&batch_lanes),
-                independent_rows,
-            );
-            be.execute(plan0.as_ref(), &bindings0)
-                .map_err(|error| anyhow!("{error}"))?;
-
-            let mut ple_rows = Vec::with_capacity(batch * ple_row);
-            for (ticket, range) in tickets.into_iter().zip(&ranges) {
-                let rows = ticket.wait()?;
-                let expected = range.len() * ple_row;
-                if rows.len() != expected {
-                    return Err(anyhow!(
-                        "parallel PLE produced {} values, expected {expected}",
-                        rows.len()
-                    ));
-                }
-                ple_rows.extend_from_slice(rows.as_slice());
-            }
-            be.upload(ple_batch.as_ref(), bytemuck::cast_slice(&ple_rows))
-                .map_err(|error| anyhow!("{error}"))?;
-
             let (mut g1, h1) = build(
                 batch,
                 ranges[0].start,
@@ -8226,33 +8586,240 @@ fn generate_dense_backend_inner(
             g1.prefill_target_tokens = Some(prefill_target);
             g1.prefill_runtime_reserve_bytes = prefill_runtime_reserve;
             let plan1 = be.compile(&g1).map_err(|error| anyhow!("{error}"))?;
-            let mut bindings1 = Bindings::new();
-            bindings1.bind(h1.hidden, hidden_batch.as_ref());
-            bindings1.bind(h1.positions, pos_batch.as_ref());
-            bind_parallel_layer_io(
-                &mut bindings1,
-                &h1,
-                c.n_layer,
-                rf_buf,
-                yff_buf,
-                &kbufs[..],
-                &vbufs[..],
-                &qsa_kbufs[..],
-                &qsa_cbufs[..],
-                &mrope_history_buf,
-                None,
-                &wbufs[..],
-                qwen_wide_buf,
-                ple_embd_buf,
-                ple_state_buf,
-                wide_batch.as_ref(),
-                Some(ple_batch.as_ref()),
-                &*parallel.peers,
-                Some(&batch_lanes),
-                independent_rows,
-            );
-            be.execute(plan1.as_ref(), &bindings1)
+
+            // ── per-chunk checkpoint fence (the sequential loop's `boundary_chunk`) ─────────────
+            // `boundary_chunk` was computed above, before `final_ranges` was consumed. A fenced
+            // chunk drains the deferred one first so it starts from a complete state, then runs
+            // whole; every other chunk keeps staggering, which is what lets a concurrent prefill
+            // keep both cards busy.
+            if boundary_chunk {
+                if let Some(prev) = pending.take() {
+                    let sets = chunk_sets
+                        .as_ref()
+                        .expect("a pending chunk implies the two buffer sets");
+                    let set = &sets[prev.parity];
+                    let prev_b1 = bind_prefill_chunk(
+                        &prev.h1,
+                        false,
+                        set.ids.as_ref(),
+                        set.pos.as_ref(),
+                        set.hidden.as_ref(),
+                        set.wide.as_ref(),
+                        Some(set.ple.as_ref()),
+                        c.n_layer,
+                        rf_buf,
+                        yff_buf,
+                        &kbufs[..],
+                        &vbufs[..],
+                        &qsa_kbufs[..],
+                        &qsa_cbufs[..],
+                        &mrope_history_buf,
+                        &wbufs[..],
+                        qwen_wide_buf,
+                        ple_embd_buf,
+                        ple_state_buf,
+                        &*parallel.peers,
+                        Some(&prev.prefill_lanes),
+                        prev.prefill_lanes.len() > 1,
+                    );
+                    let mut no_hook = |_stage: usize| -> infr_core::Result<()> { Ok(()) };
+                    be.execute_pipelined(Some((prev.plan1.as_ref(), &prev_b1)), &[], &mut no_hook)
+                        .map_err(|error| anyhow!("{error}"))?;
+                }
+            }
+            if chunk_sets.is_some() && !boundary_chunk {
+                // ── 流水：上一块的后半段（卡1）与本块的前半段（卡0）同时跑 ────────────────
+                let b0 = bind_prefill_chunk(
+                    &h0,
+                    true,
+                    ids_buf,
+                    pos_batch,
+                    hidden_batch,
+                    wide_batch,
+                    None,
+                    c.n_layer,
+                    rf_buf,
+                    yff_buf,
+                    &kbufs[..],
+                    &vbufs[..],
+                    &qsa_kbufs[..],
+                    &qsa_cbufs[..],
+                    &mrope_history_buf,
+                    &wbufs[..],
+                    qwen_wide_buf,
+                    ple_embd_buf,
+                    ple_state_buf,
+                    &*parallel.peers,
+                    Some(&batch_lanes),
+                    independent_rows,
+                );
+                let b1 = bind_prefill_chunk(
+                    &h1,
+                    false,
+                    ids_buf,
+                    pos_batch,
+                    hidden_batch,
+                    wide_batch,
+                    Some(ple_batch),
+                    c.n_layer,
+                    rf_buf,
+                    yff_buf,
+                    &kbufs[..],
+                    &vbufs[..],
+                    &qsa_kbufs[..],
+                    &qsa_cbufs[..],
+                    &mrope_history_buf,
+                    &wbufs[..],
+                    qwen_wide_buf,
+                    ple_embd_buf,
+                    ple_state_buf,
+                    &*parallel.peers,
+                    Some(&batch_lanes),
+                    independent_rows,
+                );
+                // plan0 之后、plan1 之前：取回 PLE 行并上传（这几步和卡1 上的上一块并行）。
+                let mut ple_rows = Vec::with_capacity(batch * ple_row);
+                let mut tickets_pending = tickets;
+                let mut hook = |stage: usize| -> infr_core::Result<()> {
+                    if stage != 0 {
+                        return Ok(());
+                    }
+                    let staged = (|| -> anyhow::Result<()> {
+                        for (ticket, range) in std::mem::take(&mut tickets_pending)
+                            .into_iter()
+                            .zip(&ranges)
+                        {
+                            let rows = ticket.wait()?;
+                            let expected = range.len() * ple_row;
+                            if rows.len() != expected {
+                                return Err(anyhow!(
+                                    "parallel PLE produced {} values, expected {expected}",
+                                    rows.len()
+                                ));
+                            }
+                            ple_rows.extend_from_slice(rows.as_slice());
+                        }
+                        be.upload(ple_batch, bytemuck::cast_slice(&ple_rows))
+                            .map_err(|error| anyhow!("{error}"))
+                    })();
+                    staged.map_err(|error| infr_core::error::Error::Other(error.to_string()))
+                };
+                // 上一块：用它自己那一套缓冲重新绑定，只补跑它的后半段（前半段上一轮已跑）。
+                let deferred = pending.take().map(|prev| {
+                    let set = &chunk_sets.as_ref().expect("pending implies sets")[prev.parity];
+                    let prev_b1 = bind_prefill_chunk(
+                        &prev.h1,
+                        false,
+                        set.ids.as_ref(),
+                        set.pos.as_ref(),
+                        set.hidden.as_ref(),
+                        set.wide.as_ref(),
+                        Some(set.ple.as_ref()),
+                        c.n_layer,
+                        rf_buf,
+                        yff_buf,
+                        &kbufs[..],
+                        &vbufs[..],
+                        &qsa_kbufs[..],
+                        &qsa_cbufs[..],
+                        &mrope_history_buf,
+                        &wbufs[..],
+                        qwen_wide_buf,
+                        ple_embd_buf,
+                        ple_state_buf,
+                        &*parallel.peers,
+                        Some(&prev.prefill_lanes),
+                        prev.prefill_lanes.len() > 1,
+                    );
+                    (prev, prev_b1)
+                });
+                let deferred_stage = deferred
+                    .as_ref()
+                    .map(|(prev, prev_b1)| (prev.plan1.as_ref(), prev_b1));
+                be.execute_pipelined(
+                    deferred_stage,
+                    &[(plan0.as_ref(), &b0), (plan1.as_ref(), &b1)],
+                    &mut hook,
+                )
                 .map_err(|error| anyhow!("{error}"))?;
+                drop(deferred);
+                pending = Some(PendingChunk {
+                    plan1,
+                    h1,
+                    parity: chunk_index % 2,
+                    prefill_lanes: prefill_lanes.clone(),
+                });
+            } else {
+                // ── 串行（默认）：plan0 → PLE → plan1 ──────────────────────────────────
+                let bindings0 = bind_prefill_chunk(
+                    &h0,
+                    true,
+                    ids_buf,
+                    pos_batch,
+                    hidden_batch,
+                    wide_batch,
+                    None,
+                    c.n_layer,
+                    rf_buf,
+                    yff_buf,
+                    &kbufs[..],
+                    &vbufs[..],
+                    &qsa_kbufs[..],
+                    &qsa_cbufs[..],
+                    &mrope_history_buf,
+                    &wbufs[..],
+                    qwen_wide_buf,
+                    ple_embd_buf,
+                    ple_state_buf,
+                    &*parallel.peers,
+                    Some(&batch_lanes),
+                    independent_rows,
+                );
+                be.execute(plan0.as_ref(), &bindings0)
+                    .map_err(|error| anyhow!("{error}"))?;
+
+                let mut ple_rows = Vec::with_capacity(batch * ple_row);
+                for (ticket, range) in tickets.into_iter().zip(&ranges) {
+                    let rows = ticket.wait()?;
+                    let expected = range.len() * ple_row;
+                    if rows.len() != expected {
+                        return Err(anyhow!(
+                            "parallel PLE produced {} values, expected {expected}",
+                            rows.len()
+                        ));
+                    }
+                    ple_rows.extend_from_slice(rows.as_slice());
+                }
+                be.upload(ple_batch, bytemuck::cast_slice(&ple_rows))
+                    .map_err(|error| anyhow!("{error}"))?;
+
+                let bindings1 = bind_prefill_chunk(
+                    &h1,
+                    false,
+                    ids_buf,
+                    pos_batch,
+                    hidden_batch,
+                    wide_batch,
+                    Some(ple_batch),
+                    c.n_layer,
+                    rf_buf,
+                    yff_buf,
+                    &kbufs[..],
+                    &vbufs[..],
+                    &qsa_kbufs[..],
+                    &qsa_cbufs[..],
+                    &mrope_history_buf,
+                    &wbufs[..],
+                    qwen_wide_buf,
+                    ple_embd_buf,
+                    ple_state_buf,
+                    &*parallel.peers,
+                    Some(&batch_lanes),
+                    independent_rows,
+                );
+                be.execute(plan1.as_ref(), &bindings1)
+                    .map_err(|error| anyhow!("{error}"))?;
+            }
 
             for (&lane, range) in prefill_lanes.iter().zip(&prefill_ranges) {
                 cursors[lane] = range.end;
@@ -8299,6 +8866,44 @@ fn generate_dense_backend_inner(
                     }
                 }
             }
+            chunk_index += 1;
+        }
+
+        // 流水收尾：最后一块的后半段被推迟到了"下一次调用"，而这里已经没有下一次 —— 必须补跑，
+        // 否则那一块的层 27-47 永远不跑，最后一个 token 的 logits 和 KV 都是错的。只跑 device-1
+        // 段：它的前半段上一轮已经跑过，重跑会把这些层写的循环状态推进两次。
+        if let Some(prev) = pending.take() {
+            let sets = chunk_sets
+                .as_ref()
+                .expect("a pending chunk implies the two buffer sets");
+            let set = &sets[prev.parity];
+            let prev_b1 = bind_prefill_chunk(
+                &prev.h1,
+                false,
+                set.ids.as_ref(),
+                set.pos.as_ref(),
+                set.hidden.as_ref(),
+                set.wide.as_ref(),
+                Some(set.ple.as_ref()),
+                c.n_layer,
+                rf_buf,
+                yff_buf,
+                &kbufs[..],
+                &vbufs[..],
+                &qsa_kbufs[..],
+                &qsa_cbufs[..],
+                &mrope_history_buf,
+                &wbufs[..],
+                qwen_wide_buf,
+                ple_embd_buf,
+                ple_state_buf,
+                &*parallel.peers,
+                Some(&prev.prefill_lanes),
+                prev.prefill_lanes.len() > 1,
+            );
+            let mut no_hook = |_stage: usize| -> infr_core::Result<()> { Ok(()) };
+            be.execute_pipelined(Some((prev.plan1.as_ref(), &prev_b1)), &[], &mut no_hook)
+                .map_err(|error| anyhow!("{error}"))?;
         }
 
         let elapsed = t0.elapsed().as_secs_f64();
@@ -9043,6 +9648,323 @@ fn generate_dense_backend_inner(
         return Ok((Vec::new(), GenStats::default()));
     }
 
+    // ── native window pipeline (`INFR_MTP_WINDOW_PIPE`) ────────────────────────────────────────
+    //
+    // A layer split is serial WITHIN one window (layer L+1 depends on layer L), so each card idles
+    // about half of every VERIFY. The window pipeline breaks that by splitting each window into a
+    // FRONT span (layers `0..split`, device 0) and a BACK span (`split..n_layer`, device 1) and
+    // running them one window apart: window N's back span on device 1 while window N+1's front span
+    // fills device 0. Both halves are separate plans in separate CALLS, so the pipeline backend's
+    // cut machinery — which only resolves a producer→consumer edge inside ONE plan — cannot hand
+    // the residual over. That handoff is explicit here: the front span writes the caller-owned
+    // `hidden`/`wide` replicas on device 0, and this code refreshes every replica
+    // (`download` the replica that was written, `upload` it to all) before the back span reads them
+    // one call later.
+    //
+    // The caller (the MTP loop) owns the schedule and the rollback; this branch owns the two spans.
+    if let Some(request) = window_pipe {
+        anyhow::ensure!(c.qwen4exp, "INFR_MTP_WINDOW_PIPE is qwen4exp-only");
+        anyhow::ensure!(
+            mm.is_none(),
+            "INFR_MTP_WINDOW_PIPE does not support multimodal RoPE yet"
+        );
+        anyhow::ensure!(
+            gpu_embed,
+            "INFR_MTP_WINDOW_PIPE needs the backend's GPU embedding gather"
+        );
+        let split = pipeline_layer_split(be).ok_or_else(|| {
+            anyhow!(
+                "INFR_MTP_WINDOW_PIPE needs a two-device layer split \
+                 (INFR_PIPELINE=VulkanN,VulkanM INFR_MTP_WINDOW_PIPE=1)"
+            )
+        })?;
+        anyhow::ensure!(
+            split > 0 && split < c.n_layer,
+            "window-pipe layer split {split} must be interior to {} layers",
+            c.n_layer
+        );
+        let h_width = c.hc_mult * ne;
+        let ple_row = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram * c.ple_head_dim;
+        let worker = ple_worker
+            .as_ref()
+            .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?;
+        // The window this call ADVANCES runs one window past the carried one (which its back span
+        // is verifying): `front_start` is that window's first row.
+        let front_start = request
+            .carry
+            .as_ref()
+            .map_or(start, |front| front.start + front.rows);
+        let front_rows = request
+            .front_feed
+            .len()
+            .checked_sub(front_start)
+            .ok_or_else(|| {
+                anyhow!(
+                    "window-pipe front feed has {} tokens, shorter than its window start \
+                     {front_start}",
+                    request.front_feed.len()
+                )
+            })?;
+        anyhow::ensure!(front_rows > 0, "window-pipe front feed carries no rows");
+        if let Some(front) = request.carry.as_ref() {
+            anyhow::ensure!(
+                front.start == start,
+                "window-pipe carry starts at {} but the committed prefix ends at {start}",
+                front.start
+            );
+            anyhow::ensure!(
+                front.start + front.rows == front_start,
+                "window-pipe carry {}..{} does not abut the front window at {front_start}",
+                front.start,
+                front.start + front.rows
+            );
+        }
+        ensure_kv_depth!(front_start + front_rows);
+
+        let alloc = |bytes: usize, usage: BufferUsage| -> AResult<Box<dyn Buffer>> {
+            be.alloc(bytes, usage).map_err(|e| anyhow!("{e}"))
+        };
+        let alloc_uninit = |bytes: usize, usage: BufferUsage| -> AResult<Box<dyn Buffer>> {
+            be.alloc_uninit(bytes, usage).map_err(|e| anyhow!("{e}"))
+        };
+
+        // ── FRONT span (device 0) ──────────────────────────────────────────────────────────────
+        // Every input is transient: the KV rows and this span's share of each recurrent state live
+        // in the slot, and the residual — the one thing the back span needs one call later — is
+        // handed back to the caller in `WindowFront`.
+        let front_hidden = alloc_uninit(front_rows * ne * 4, BufferUsage::Activations)?;
+        let front_wide = alloc_uninit(front_rows * h_width * 4, BufferUsage::Activations)?;
+        let front_ids = alloc(front_rows * 4, BufferUsage::Staging)?;
+        let front_pos = alloc(front_rows * 4, BufferUsage::Staging)?;
+        let front_ple = alloc(front_rows * ple_row * 4, BufferUsage::Staging)?;
+        let front_tokens = &request.front_feed[front_start..front_start + front_rows];
+        let front_ids_host = front_tokens.iter().map(|&token| token as i32).collect::<Vec<_>>();
+        be.upload(front_ids.as_ref(), bytemuck::cast_slice(&front_ids_host))
+            .map_err(|e| anyhow!("{e}"))?;
+        let front_pos_host = (front_start..front_start + front_rows)
+            .map(|position| position as i32)
+            .collect::<Vec<_>>();
+        be.upload(front_pos.as_ref(), bytemuck::cast_slice(&front_pos_host))
+            .map_err(|e| anyhow!("{e}"))?;
+        let ple_rows = worker
+            .submit_range(request.front_feed, front_start, front_rows, c.ple_ngram_size)?
+            .wait()?;
+        anyhow::ensure!(
+            ple_rows.as_slice().len() == front_rows * ple_row,
+            "window-pipe front span PLE produced {} values, expected {}",
+            ple_rows.as_slice().len(),
+            front_rows * ple_row
+        );
+        be.upload(front_ple.as_ref(), bytemuck::cast_slice(ple_rows.as_slice()))
+            .map_err(|e| anyhow!("{e}"))?;
+
+        let (front_graph, front_handles) = build(
+            front_rows,
+            front_start,
+            0,     // headless: the LM head belongs to the back span
+            false, // denoise
+            None,
+            false,
+            false, // h_tap
+            false, // gpu argmax
+            false, // gpu sample
+            true,  // use_ids: embed on the front span's own device
+            true,  // mtp_verify: this span writes its share of the recurrent trace
+            false, // independent_rows
+            None,
+            Some(0..split),
+        );
+        let front_plan = be
+            .compile(&front_graph)
+            .map_err(|e| anyhow!("{e}"))?;
+        let mut front_bindings = Bindings::new();
+        front_bindings.bind(
+            front_handles.tok_ids.expect("window-pipe front span embeds on device"),
+            front_ids.as_ref(),
+        );
+        front_bindings.bind(front_handles.hidden, front_hidden.as_ref());
+        front_bindings.bind(front_handles.positions, front_pos.as_ref());
+        bind_layer_io(
+            &mut front_bindings,
+            &front_handles,
+            c.n_layer,
+            rf_buf,
+            yff_buf,
+            &kbufs[..],
+            &vbufs[..],
+            &qsa_kbufs[..],
+            &qsa_cbufs[..],
+            &mrope_history_buf,
+            &wbufs[..],
+            qwen_wide_buf,
+            ple_embd_buf,
+            ple_state_buf,
+        );
+        front_bindings.bind(
+            front_handles.qwen_wide.expect("window-pipe front span keeps the wide residual"),
+            front_wide.as_ref(),
+        );
+        if let Some(id) = front_handles.ple_embd {
+            front_bindings.bind(id, front_ple.as_ref());
+        }
+        bind_mtp_recurrent_traces(&mut front_bindings, &front_handles, mtp_delta_ckpt);
+
+        // ── BACK span (device 1) ──────────────────────────────────────────────────────────────
+        // Only when a front span was carried in: it carries the window being verified, and its
+        // residual replicas were refreshed at the end of the call that produced it.
+        #[allow(unused_assignments)]
+        let mut back_pos: Option<Box<dyn Buffer>> = None;
+        let mut back_logits: Option<Box<dyn Buffer>> = None;
+        let mut back_ids: Option<Box<dyn Buffer>> = None;
+        let mut back_h: Option<Box<dyn Buffer>> = None;
+        let mut back_plan: Option<Box<dyn Plan>> = None;
+        let mut back_bindings = Bindings::new();
+        let gpu_verify_ids =
+            caps.argmax_rows && ec.spec.gpu_argmax && ec.spec.gpu_mtp_accept;
+        if let Some(front) = request.carry.as_ref() {
+            let rows = front.rows;
+            let pos = alloc(rows * 4, BufferUsage::Staging)?;
+            let pos_host = (front.start..front.start + rows)
+                .map(|position| position as i32)
+                .collect::<Vec<_>>();
+            be.upload(pos.as_ref(), bytemuck::cast_slice(&pos_host))
+                .map_err(|e| anyhow!("{e}"))?;
+            // Allocated into the OUTER slots, never into block locals: the bindings below borrow
+            // them and must outlive this block (they are alive when the plans execute).
+            back_pos = Some(pos);
+            back_logits = Some(alloc(rows * c.vocab * 4, BufferUsage::Readback)?);
+            back_ids = gpu_verify_ids
+                .then(|| alloc(rows * 4, BufferUsage::Readback))
+                .transpose()?;
+            back_h = Some(alloc(rows * h_width * 4, BufferUsage::Readback)?);
+            let (graph, handles) = build(
+                rows,
+                front.start,
+                rows,  // logits over every verified row: acceptance compares each draft
+                false, // denoise
+                None,
+                false,
+                true, // h_tap: the MTP head needs the accepted row's hidden
+                gpu_verify_ids,
+                false, // gpu sample
+                false, // use_ids: the residual comes from the carried front span
+                true,  // mtp_verify: this span writes its share of the recurrent trace
+                false, // independent_rows
+                None,
+                Some(split..c.n_layer),
+            );
+            let plan = be.compile(&graph).map_err(|e| anyhow!("{e}"))?;
+            back_bindings.bind(handles.hidden, front.hidden.as_ref());
+            back_bindings.bind(handles.positions, back_pos.as_deref().expect("back span positions"));
+            bind_layer_io(
+                &mut back_bindings,
+                &handles,
+                c.n_layer,
+                rf_buf,
+                yff_buf,
+                &kbufs[..],
+                &vbufs[..],
+                &qsa_kbufs[..],
+                &qsa_cbufs[..],
+                &mrope_history_buf,
+                &wbufs[..],
+                qwen_wide_buf,
+                ple_embd_buf,
+                ple_state_buf,
+            );
+            back_bindings.bind(
+                handles.qwen_wide.expect("window-pipe back span reads the wide residual"),
+                front.wide.as_ref(),
+            );
+            bind_mtp_recurrent_traces(&mut back_bindings, &handles, mtp_delta_ckpt);
+            back_bindings.bind(
+                handles.logits.expect("window-pipe back span carries the LM head"),
+                back_logits.as_deref().expect("window-pipe back span logits"),
+            );
+            if let (Some(id), Some(buffer)) = (handles.tok_id, back_ids.as_deref()) {
+                back_bindings.bind(id, buffer);
+            }
+            back_bindings.bind(
+                handles.h_out.expect("window-pipe back span was built with h_tap"),
+                back_h.as_deref().expect("window-pipe back span h_tap"),
+            );
+            back_plan = Some(plan);
+        }
+
+        // ── RUN: the carried window's back span on device 1, the next window's front span on
+        // device 0, concurrently. With no carry this is the pipeline's FILL step: device 0 alone. ─
+        let mut after_dev0 = |_stage: usize| -> infr_core::error::Result<()> { Ok(()) };
+        be.execute_pipelined(
+            back_plan
+                .as_deref()
+                .map(|plan| (plan, &back_bindings)),
+            &[(front_plan.as_ref(), &front_bindings)],
+            &mut after_dev0,
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+
+        // The front span just wrote device 0's replica of the residual; the back span that consumes
+        // it runs in the NEXT call on device 1, so refresh every replica now.
+        for buffer in [front_hidden.as_ref(), front_wide.as_ref()] {
+            let mut host = vec![0u8; buffer.len_bytes()];
+            be.download(buffer, &mut host).map_err(|e| anyhow!("{e}"))?;
+            be.upload(buffer, &host).map_err(|e| anyhow!("{e}"))?;
+        }
+
+        let carried = request.carry.take();
+        if let Some(front) = carried.as_ref() {
+            let rows = front.rows;
+            // Mirror the ordinary VERIFY's `cached` bookkeeping: the verified window's rows are now
+            // in the slot and the caller truncates back to its accepted prefix.
+            cached.extend_from_slice(&front.tokens);
+            if let Some(buffer) = back_ids.as_deref() {
+                request.ids.resize(rows, 0);
+                be.download(buffer, bytemuck::cast_slice_mut(&mut request.ids))
+                    .map_err(|e| anyhow!("{e}"))?;
+                // A suppressed-EOS repair needs the full distribution for that row (mirrors the
+                // ordinary VERIFY's readback rule), so pull the logits only when one is possible.
+                let blocked = c.qwen4_think_start.is_some()
+                    && request
+                        .ids
+                        .iter()
+                        .any(|id| *id == c.eos || c.eos_ids.contains(id));
+                if blocked {
+                    if let Some(buffer) = back_logits.as_deref() {
+                        request.logits.resize(rows * c.vocab, 0.0);
+                        be.download(buffer, bytemuck::cast_slice_mut(&mut request.logits))
+                            .map_err(|e| anyhow!("{e}"))?;
+                    }
+                }
+            } else if let Some(buffer) = back_logits.as_deref() {
+                request.logits.resize(rows * c.vocab, 0.0);
+                be.download(buffer, bytemuck::cast_slice_mut(&mut request.logits))
+                    .map_err(|e| anyhow!("{e}"))?;
+            }
+            if let Some(buffer) = back_h.as_deref() {
+                request.hidden.resize(rows * h_width, 0.0);
+                be.download(buffer, bytemuck::cast_slice_mut(&mut request.hidden))
+                    .map_err(|e| anyhow!("{e}"))?;
+            }
+        }
+        *request.carry = Some(WindowFront {
+            wide: front_wide,
+            hidden: front_hidden,
+            tokens: front_tokens.to_vec(),
+            start: front_start,
+            rows: front_rows,
+        });
+        if ec.prof.stages || infr_core::pager_profile::active() {
+            tracing::info!(
+                "[qwen4 mtp window pipe] front={front_start}..{} back={}..{} pairs={}",
+                front_start + front_rows,
+                request.carry.as_ref().map_or(start, |front| front.start),
+                carried.as_ref().map_or(start, |front| front.start + front.rows),
+                carried.is_some(),
+            );
+        }
+        return Ok((Vec::new(), GenStats::default()));
+    }
+
     if let Some(out_logits) = verify {
         if c.qwen4exp {
             if !gpu_embed {
@@ -9126,7 +10048,7 @@ fn generate_dense_backend_inner(
                 .map_err(|e| anyhow!("{e}"))?;
             let logits_owned = fixed
                 .is_none()
-                .then(|| be.alloc(logits_rows * c.vocab * 4, BufferUsage::Staging))
+                .then(|| be.alloc(logits_rows * c.vocab * 4, BufferUsage::Readback))
                 .transpose()
                 .map_err(|e| anyhow!("{e}"))?;
             let h_owned = (want_h && fixed.is_none())
@@ -9232,6 +10154,7 @@ fn generate_dense_backend_inner(
             let mut vf_exec = std::time::Duration::ZERO;
 
             if overlap_ple {
+                let _timeline_plan0 = infr_core::timeline::span("mtp_verify_plan0");
                 let vf_t0 = std::time::Instant::now();
                 let (vg0, vh0) = build(
                     m,
@@ -9295,6 +10218,7 @@ fn generate_dense_backend_inner(
                 vf_exec += vf_t0.elapsed();
             }
 
+            let _timeline_ple = infr_core::timeline::span("mtp_verify_ple");
             let vf_t0 = std::time::Instant::now();
             let ple_rows = ticket.wait()?;
             if ple_rows.len() != m * ple_row {
@@ -9308,6 +10232,8 @@ fn generate_dense_backend_inner(
                 .map_err(|e| anyhow!("{e}"))?;
 
             let vf_ple = vf_t0.elapsed();
+            drop(_timeline_ple);
+            let _timeline_tail = infr_core::timeline::span("mtp_verify_tail");
             let vf_t0 = std::time::Instant::now();
             // With overlap enabled, layer 0 has already initialized hidden/wide state while the
             // PLE worker gathered these rows. The tail starts at the first PLE-bearing layer.
@@ -9375,38 +10301,55 @@ fn generate_dense_backend_inner(
             be.execute(vplan.as_ref(), &vb)
                 .map_err(|e| anyhow!("{e}"))?;
             vf_exec += vf_t0.elapsed();
+            drop(_timeline_tail);
+            let _timeline_readback = infr_core::timeline::span("mtp_verify_readback");
             let vf_t0 = std::time::Instant::now();
+            // Split the readback into its three transfers: the whole point of this timing is that a
+            // host-visible download is a mapped memcpy, so a slow readback can only be a WAIT inside
+            // one of these calls — and knowing WHICH one names the queue that was still busy.
+            let mut rb_ids = std::time::Duration::ZERO;
+            let mut rb_logits = std::time::Duration::ZERO;
+            let mut rb_h = std::time::Duration::ZERO;
 
             if let (Some(out_ids), Some(buf)) = (verify_ids, out_ids_buf) {
+                let t = std::time::Instant::now();
                 out_ids.resize(logits_rows, 0);
                 be.download(buf, bytemuck::cast_slice_mut(out_ids))
                     .map_err(|e| anyhow!("{e}"))?;
+                rb_ids = t.elapsed();
                 if c.qwen4_think_start.is_some()
                     && out_ids
                         .iter()
                         .any(|id| *id == c.eos || c.eos_ids.contains(id))
                 {
+                    let t = std::time::Instant::now();
                     out_logits.resize(logits_rows * c.vocab, 0.0);
                     be.download(logits_buf, bytemuck::cast_slice_mut(out_logits))
                         .map_err(|e| anyhow!("{e}"))?;
+                    rb_logits = t.elapsed();
                 }
             } else {
+                let t = std::time::Instant::now();
                 out_logits.resize(logits_rows * c.vocab, 0.0);
                 be.download(logits_buf, bytemuck::cast_slice_mut(out_logits))
                     .map_err(|e| anyhow!("{e}"))?;
+                rb_logits = t.elapsed();
             }
             if let (Some(out), Some(buf)) = (h_out.take(), h_buf) {
+                let t = std::time::Instant::now();
                 out.resize(m * h_width, 0.0);
                 be.download(buf, bytemuck::cast_slice_mut(out))
                     .map_err(|e| anyhow!("{e}"))?;
+                rb_h = t.elapsed();
             }
             cached.extend_from_slice(&prompt[start..]);
             if ec.prof.stages || infr_core::pager_profile::active() {
                 let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
                 tracing::info!(
-                    "[qwen4 mtp verify] m={m} logits_rows={logits_rows} start={start} io={:.2}ms ple={:.2}ms build={:.2}ms exec={:.2}ms readback={:.2}ms total={:.2}ms",
+                    "[qwen4 mtp verify] m={m} logits_rows={logits_rows} start={start} io={:.2}ms ple={:.2}ms build={:.2}ms exec={:.2}ms readback={:.2}ms (ids={:.2} logits={:.2} h={:.2}) total={:.2}ms",
                     ms(vf_alloc), ms(vf_ple), ms(vf_build), ms(vf_exec),
-                    ms(vf_t0.elapsed()), ms(verify_t0.elapsed()),
+                    ms(vf_t0.elapsed()), ms(rb_ids), ms(rb_logits), ms(rb_h),
+                    ms(verify_t0.elapsed()),
                 );
             }
             return Ok((
@@ -10638,6 +11581,16 @@ fn generate_dense_backend_inner(
     } else {
         (c.moe.is_none() || moe_batched_ok) && !c.deepseek4
     };
+    if std::env::var_os("INFR_DEBUG_PREFILL_GATE").is_some() {
+        eprintln!(
+            "[pf-gate] qwen4exp={} k={k_fmt:?} v={v_fmt:?} moe_paged={} moe_batched_ok={} \
+             prompt={} start={start} raw_ok={batched_prefill_ok}",
+            c.qwen4exp,
+            be.moe_paged(),
+            moe_batched_ok,
+            prompt.len(),
+        );
+    }
     let decode_start = if prompt.len() - start > 2 && batched_prefill_ok {
         // Batch-prefill the un-cached suffix, all but the last prompt token (positions
         // start..plen-1; rows 0..start are reused from the session cache) — in UBATCH CHUNKS.
@@ -10658,6 +11611,33 @@ fn generate_dense_backend_inner(
         } else {
             crate::seam::ubatch_rows(ec)
         };
+        // ── Fully-resident MoE vs a tall chunk's runtime workspace ───────────────────────────
+        // `be.moe_paged() == false` means every expert is an ordinary resident buffer, so nothing
+        // ever priced this chunk against the expert payload — `default_ubatch_rows` hands a
+        // discrete GPU 4096 rows and the `cap_moe_ubatch` call on the placement path never runs
+        // (it lives in the pager-owned branch). A 4096-row chunk's runtime workspace is big enough
+        // to displace residents, and a chunk-major sweep is ONE whole-model span per chunk: every
+        // later chunk then re-reads a displaced layer's experts from host memory, one layer at a
+        // time. Measured here (dual RX 7900 XTX, IQ3_XXS Qwen3.8-Flash-Next, RADV, INFR_PIPELINE):
+        //   1911 tok: 650 t/s @1024 rows vs 232 @4096 — 48 stalls of ~190 ms, one per layer
+        //   3980 tok: 750 t/s @1024 rows vs  70 @4096
+        // Skipped when the pager owns the experts (its own plan prices the height), for dense
+        // models (`moe_batched_ok` false), and when the user PINNED a height (`--ubatch`/
+        // `INFR_UBATCH`) — an explicit request stays authoritative, which is also how the tall
+        // heights stay reachable for A/B.
+        if !be.moe_paged()
+            && moe_batched_ok
+            && !crate::seam::user_pinned_ubatch(ec)
+            && ubatch > crate::seam::MOE_RESIDENT_PREFILL_CAP_ROWS
+        {
+            tracing::warn!(
+                from_rows = ubatch,
+                to_rows = crate::seam::MOE_RESIDENT_PREFILL_CAP_ROWS,
+                "prefill: lowering the chunk — the resident MoE expert payload does not survive a \
+                 taller chunk's runtime workspace (measured 3-10x slower prefill above this height)"
+            );
+            ubatch = crate::seam::MOE_RESIDENT_PREFILL_CAP_ROWS;
+        }
         let pf_end = prompt.len() - 1;
         let mut prefill_runtime_reserve = None;
         if be.moe_paged() && prefill_uses_layer_ring(c, pf_end.saturating_sub(start), ubatch) {
@@ -10676,6 +11656,13 @@ fn generate_dense_backend_inner(
             );
             let selected = be.prepare_prefill(&candidates)?;
             ubatch = selected.unwrap_or(ubatch);
+            // Keep the residency-aware height for the rest of the session. `ubatch_rows` is what the
+            // chunk loop below reads, so without this pin the next chunk falls back to the 4096
+            // default and walks straight back into the streaming regime this call just rejected —
+            // every chunk then re-fetches a layer's expert bytes (see the `[moe-prefill]` log).
+            if let Some(rows) = selected {
+                crate::seam::cap_moe_ubatch(rows);
+            }
             prefill_runtime_reserve = selected.and_then(|rows| {
                 candidates
                     .iter()
@@ -10743,6 +11730,66 @@ fn generate_dense_backend_inner(
             chunks.len().max(1)
         };
         let mut live: Vec<Option<PfChunk>> = (0..chunks.len()).map(|_| None).collect();
+
+        /// Bind one batched-prefill chunk's IO — the same wiring the chunk loop below does inline,
+        /// factored out so a chunk whose device-1 half was deferred by the 1F1B overlap can be
+        /// re-bound (and finished) on a later iteration.
+        #[allow(clippy::too_many_arguments)]
+        fn bind_pf_chunk<'a>(
+            h: &DecodeHandles,
+            ch: &'a PfChunk,
+            n_layer: usize,
+            rf_buf: &'a Option<(Box<dyn Buffer>, usize)>,
+            yff_buf: &'a Option<(Box<dyn Buffer>, usize)>,
+            kbufs: &'a [Box<dyn Buffer>],
+            vbufs: &'a [Box<dyn Buffer>],
+            qsa_kbufs: &'a [Option<Box<dyn Buffer>>],
+            qsa_cbufs: &'a [Option<Box<dyn Buffer>>],
+            mrope_history_buf: &'a Option<Box<dyn Buffer>>,
+            wbufs: &'a [Box<dyn Buffer>],
+            qwen4exp: bool,
+            qwen_wide_buf: &'a Option<Box<dyn Buffer>>,
+            ple_embd_buf: &'a Option<Box<dyn Buffer>>,
+            ple_state_buf: &'a Option<Box<dyn Buffer>>,
+        ) -> Bindings<'a> {
+            let mut b = Bindings::new();
+            if let Some(ids) = h.tok_ids {
+                b.bind(ids, ch.input.as_ref());
+            }
+            b.bind(h.hidden, ch.resid.as_deref().unwrap_or(ch.input.as_ref()));
+            b.bind(h.positions, ch.pos.as_ref());
+            if let (Some(id), Some(buf)) = (h.positions4, &ch.pos4) {
+                b.bind(id, buf.as_ref());
+            }
+            if let (Some(pid), Some(ib)) = (h.pl_tok_in, &ch.ipl) {
+                b.bind(pid, ib.as_ref());
+            }
+            bind_layer_io(
+                &mut b,
+                h,
+                n_layer,
+                rf_buf,
+                yff_buf,
+                kbufs,
+                vbufs,
+                qsa_kbufs,
+                qsa_cbufs,
+                mrope_history_buf,
+                wbufs,
+                if qwen4exp {
+                    &ch.qwen_wide
+                } else {
+                    qwen_wide_buf
+                },
+                if qwen4exp {
+                    &ch.ple_embd
+                } else {
+                    ple_embd_buf
+                },
+                ple_state_buf,
+            );
+            b
+        }
         // Keep Qwen3.8 PLE one chunk ahead. Chunk N+1's mmap/SSD gather runs while chunk N
         // traverses the GPU, instead of making the GPU wait for random host I/O at every chunk
         // boundary. Tickets are consumed before taking the shared GPU gate, so a slow PLE read
@@ -10757,6 +11804,79 @@ fn generate_dense_backend_inner(
                     Some(worker.submit_range(prompt, cstart, cend - cstart, c.ple_ngram_size)?);
             }
         }
+        // ── 1F1B 跨块流水（INFR_PIPELINE_OVERLAP=1，默认关）────────────────────────────
+        // 层切分把"层 0-26 / 27-47"放在两张卡上，同一块内后半段依赖前半段 ⇒ 两卡只能轮流干
+        // （实测各自只忙约 47%，第二张卡只贡献容量、不贡献速度）。把相邻两块错开半步：上一块的
+        // 后半段在卡1 上跑的同时，本块的前半段在卡0 上跑。
+        //
+        // 只在"双卡 pipeline + 整模型单 span"时启用。MTP 头要读整块的 wide 残差，所以它的
+        // consume 不能跟着 target 的 device-0 half 走；而是等该块的两半都跑完后，在下一次
+        // target 提交返回时补做。checkpoint 边界不再整体禁用重叠：边界落在哪一块就只把那一块
+        // 围栏成全跑（见循环里的 `boundary_chunk`），其余块照常错开 —— serve 的每个请求都带
+        // edit 前缀，整体禁用等于重叠永远不生效。
+        // `pending` 留住被推迟那一块的 plan/句柄，它的缓冲由 `live[ci]` 一直留到后半段跑完，
+        // `free_slot` 负责回收。
+        let overlap = std::env::var_os("INFR_PIPELINE_OVERLAP").is_some()
+            && be.name() == "vulkan-pipeline"
+            && !layer_major
+            && spans.len() == 1;
+        if std::env::var_os("INFR_PIPE_TIME").is_some() {
+            tracing::info!(
+                "[ov gate] path=chunk-major env={} name={} layer_major={} spans={} mtp_sink={} \
+                 ckpt={:?} ckpt_all_none={} => overlap={}",
+                std::env::var_os("INFR_PIPELINE_OVERLAP").is_some(),
+                be.name(),
+                layer_major,
+                spans.len(),
+                mtp_prefill_sink.is_some(),
+                turn_checkpoint_boundaries,
+                turn_checkpoint_boundaries.iter().all(|b| b.is_none()),
+                overlap
+            );
+        }
+        let mut pending: Option<(usize, DecodeHandles, Box<dyn Plan>)> = None;
+        let mut free_slot: Option<usize> = None;
+        // A completed target chunk can only feed the MTP tap after BOTH its device halves have run.
+        // Under overlap that is true when the next target call returns: its deferred worker ran the
+        // previous chunk's device-1 half while this thread ran the current chunk's device-0 half.
+        // Keep the buffer alive until then and release the target graph scratch first, matching the
+        // serial path's arena handoff.
+        let consume_completed_mtp = |be: &dyn Backend,
+                                     sink: &mut dyn MtpPrefillHiddenSink,
+                                     live: &mut [Option<PfChunk>],
+                                     ci: usize|
+         -> AResult<()> {
+            be.release_transient_runtime();
+            let (cstart, cend) = chunks[ci];
+            let mut completed = live[ci]
+                .take()
+                .ok_or_else(|| anyhow!("MTP Prefill chunk {ci} is no longer live"))?;
+            let target_hidden = completed.qwen_wide.take().ok_or_else(|| {
+                anyhow!("MTP Prefill tap requires Qwen3.8 wide residual")
+            })?;
+            drop(completed);
+            sink.consume(
+                be,
+                &prompt[cstart..cend],
+                target_hidden.as_ref(),
+                cstart,
+                mm,
+                (
+                    (
+                        wbufs[mtp_token_embd_index].as_ref(),
+                        wspecs[mtp_token_embd_index].0,
+                        wspecs[mtp_token_embd_index].1,
+                    ),
+                    (
+                        wbufs[mtp_lm_head_index].as_ref(),
+                        wspecs[mtp_lm_head_index].0,
+                        wspecs[mtp_lm_head_index].1,
+                    ),
+                ),
+            )?;
+            Ok(())
+        };
+
         for group_start in (0..chunks.len()).step_by(group_chunks) {
             let group_end = (group_start + group_chunks).min(chunks.len());
             let preallocate_group = layer_major && c.qwen4exp;
@@ -10779,6 +11899,20 @@ fn generate_dense_backend_inner(
                         if crate::sampling::abort_requested(req) {
                             anyhow::bail!("aborted: shutdown requested");
                         }
+                        // Prefill is a forward like any other: without a step context its
+                        // dispatches reach `INFR_PROF_OP_TRACE` with no device/phase/step, which
+                        // hides which GPU ran a chunk and how the chunk splits across the
+                        // pipeline. `begin_step` only allocates the position row for the
+                        // timestamp timeline, so the flight-recorder-only path stays cheap.
+                        let _timeline_chunk = if infr_core::timeline::enabled()
+                            || infr_core::timeline::flight_enabled()
+                        {
+                            let chunk_positions: Vec<usize> = (cstart..cend).collect();
+                            infr_core::timeline::begin_step(&chunk_positions)
+                        } else {
+                            None
+                        };
+                        let _timeline_prefill_phase = infr_core::timeline::phase("prefill");
                         let ple_rows = if c.qwen4exp && live[ci].is_none() {
                             let worker = ple_worker
                                 .as_ref()
@@ -10984,6 +12118,59 @@ fn generate_dense_backend_inner(
                         if materialize_only {
                             continue;
                         }
+                        // 流水：上一块的后半段已经在上一轮这次调用里跑完，它的缓冲现在可以回收。
+                        if let Some(old) = free_slot.take() {
+                            live[old] = None;
+                        }
+                        // A chunk that ENDS on a checkpoint boundary must run to completion before
+                        // its snapshot is taken: the snapshot copies the state every recurrent layer
+                        // has left behind, and under the 1F1B overlap the current chunk's device-1
+                        // half has not run yet (the two devices sit exactly one chunk apart). So fence
+                        // that chunk: drain the deferred predecessor, then run it whole. Every other
+                        // chunk keeps the staggered cadence.
+                        let boundary_chunk = turn_checkpoint_boundaries
+                            .iter()
+                            .any(|boundary| *boundary == Some(cend));
+                        let deferred = overlap && !boundary_chunk;
+                        if overlap && boundary_chunk {
+                            if let Some((prev_ci, prev_h, prev_plan)) = pending.take() {
+                                let prev_b = {
+                                    let prev_ch = live[prev_ci]
+                                        .as_ref()
+                                        .expect("the deferred chunk's buffers are live");
+                                    bind_pf_chunk(
+                                        &prev_h,
+                                        prev_ch,
+                                        c.n_layer,
+                                        rf_buf,
+                                        yff_buf,
+                                        &kbufs[..],
+                                        &vbufs[..],
+                                        &qsa_kbufs[..],
+                                        &qsa_cbufs[..],
+                                        &mrope_history_buf,
+                                        &wbufs[..],
+                                        c.qwen4exp,
+                                        qwen_wide_buf,
+                                        ple_embd_buf,
+                                        ple_state_buf,
+                                    )
+                                };
+                                let mut no_hook = |_stage: usize| -> infr_core::Result<()> { Ok(()) };
+                                be.execute_pipelined(
+                                    Some((prev_plan.as_ref(), &prev_b)),
+                                    &[],
+                                    &mut no_hook,
+                                )
+                                .map_err(|e| anyhow!("{e}"))?;
+                                drop(prev_b);
+                                drop(prev_plan);
+                                if let Some(sink) = mtp_prefill_sink.as_deref_mut() {
+                                    consume_completed_mtp(be, sink, &mut live, prev_ci)?;
+                                }
+                                free_slot = Some(prev_ci);
+                            }
+                        }
                         let ch = live[ci]
                             .as_ref()
                             .expect("the chunk's buffers were just materialized");
@@ -11069,58 +12256,83 @@ fn generate_dense_backend_inner(
                             pf_h.logits.is_none(),
                             "headless prefill build has no logits"
                         );
-                        be.execute(pf_plan.as_ref(), &pf_b)
+                        let t_target_execute;
+                        if deferred {
+                            // 上一块：用它自己那一套缓冲重新绑定，只补跑它的后半段（前半段上一轮
+                            // 已经跑过 —— 重跑会把那些层写的循环状态推进两次）。
+                            let prev_b = pending.as_ref().map(|(prev_ci, prev_h, _)| {
+                                let prev_ch = live[*prev_ci]
+                                    .as_ref()
+                                    .expect("the deferred chunk's buffers are live");
+                                bind_pf_chunk(
+                                    prev_h,
+                                    prev_ch,
+                                    c.n_layer,
+                                    rf_buf,
+                                    yff_buf,
+                                    &kbufs[..],
+                                    &vbufs[..],
+                                    &qsa_kbufs[..],
+                                    &qsa_cbufs[..],
+                                    &mrope_history_buf,
+                                    &wbufs[..],
+                                    c.qwen4exp,
+                                    qwen_wide_buf,
+                                    ple_embd_buf,
+                                    ple_state_buf,
+                                )
+                            });
+                            let deferred_stage = match (&prev_b, &pending) {
+                                (Some(b), Some((_, _, plan))) => Some((plan.as_ref(), b)),
+                                _ => None,
+                            };
+                            let mut no_hook = |_stage: usize| -> infr_core::Result<()> { Ok(()) };
+                            be.execute_pipelined(
+                                deferred_stage,
+                                &[(pf_plan.as_ref(), &pf_b)],
+                                &mut no_hook,
+                            )
                             .map_err(|e| anyhow!("{e}"))?;
-                        let t_target_execute = pf_t0.elapsed();
-                        // The MTP head needs the completed wide residual, but none of the target
-                        // graph's scratch. Release the compiled Prefill plan before compiling the
-                        // catch-up graph; otherwise both plans coexist in LlmRuntime and can exceed
-                        // the frozen arena corridor even though they execute serially.
-                        drop(pf_b);
-                        drop(pf_plan);
-                        drop(pf_g);
-                        if si + 1 == spans.len() {
+                            t_target_execute = pf_t0.elapsed();
+                            // 上一块的后半段在这次调用里跑完了。它的 target plan 已经
+                            // 不再需要，先释放再让 MTP 头复用 workspace；wide 残差留在
+                            // live[prev_ci] 里供 consume 读取，随后再进入延迟回收槽。
+                            let prev_ci = pending.as_ref().map(|(prev_ci, _, _)| *prev_ci);
+                            if let Some((_, _, prev_plan)) = pending.take() {
+                                drop(prev_plan);
+                            }
+                            if let (Some(prev_ci), Some(sink)) =
+                                (prev_ci, mtp_prefill_sink.as_deref_mut())
+                            {
+                                consume_completed_mtp(be, sink, &mut live, prev_ci)?;
+                            }
+                            free_slot = prev_ci;
+                            pending = Some((ci, pf_h, pf_plan));
+                            drop(pf_g);
+                        } else {
+                            be.execute(pf_plan.as_ref(), &pf_b)
+                                .map_err(|e| anyhow!("{e}"))?;
+                            t_target_execute = pf_t0.elapsed();
+                            // The MTP head needs the completed wide residual, but none of the target
+                            // graph's scratch. Release the compiled Prefill plan before compiling the
+                            // catch-up graph; otherwise both plans coexist in LlmRuntime and can exceed
+                            // the frozen arena corridor even though they execute serially.
+                            drop(pf_b);
+                            drop(pf_plan);
+                            drop(pf_g);
+                        }
+                        // Consume only a chunk whose device-1 half has run. Under overlap a
+                        // deferred chunk is completed by the NEXT target iteration, so its tap
+                        // is consumed there instead.
+                        if si + 1 == spans.len() && !deferred {
                             if let Some(sink) = mtp_prefill_sink.as_deref_mut() {
-                                // Paged Vulkan retains a same-phase Prefill high-water arena after
-                                // execute. The detached MTP head is a different graph family and
-                                // runs strictly after the target, so let it reuse that workspace
-                                // instead of growing beside several GiB of dead target scratch.
-                                be.release_transient_runtime();
-                                // Keep only the tapped residual alive across the handoff. The
-                                // chunk's ids, positions, PLE rows and narrow residual are dead
-                                // after the final target span and would needlessly compete with
-                                // the MTP catch-up workspace.
-                                let mut completed = live[ci]
-                                    .take()
-                                    .expect("the completed Prefill chunk is live");
-                                let target_hidden =
-                                    completed.qwen_wide.take().ok_or_else(|| {
-                                        anyhow!("MTP Prefill tap requires Qwen3.8 wide residual")
-                                    })?;
-                                drop(completed);
-                                sink.consume(
-                                    be,
-                                    &prompt[cstart..cend],
-                                    target_hidden.as_ref(),
-                                    cstart,
-                                    mm,
-                                    (
-                                        (
-                                            wbufs[mtp_token_embd_index].as_ref(),
-                                            wspecs[mtp_token_embd_index].0,
-                                            wspecs[mtp_token_embd_index].1,
-                                        ),
-                                        (
-                                            wbufs[mtp_lm_head_index].as_ref(),
-                                            wspecs[mtp_lm_head_index].0,
-                                            wspecs[mtp_lm_head_index].1,
-                                        ),
-                                    ),
-                                )?;
+                                consume_completed_mtp(be, sink, &mut live, ci)?;
                             }
                         }
+                        // Only a chunk that actually finished may be snapshotted: a deferred chunk
+                        // still owes its device-1 half, so its state is one chunk short.
                         for (index, boundary) in turn_checkpoint_boundaries.iter().enumerate() {
-                            if Some(cend) == *boundary {
+                            if Some(cend) == *boundary && !deferred {
                                 let Some(ck) = turn_recurrent_ckpts[index].as_mut() else {
                                     continue;
                                 };
@@ -11162,11 +12374,54 @@ fn generate_dense_backend_inner(
                             decode_n,
                         );
                         // Last span for this chunk: its uploads and its residual stream are dead.
-                        if si + 1 == spans.len() {
+                        // (Under the 1F1B overlap the slot is freed one iteration late, once its
+                        // deferred device-1 half has actually run — see `free_slot`.)
+                        if si + 1 == spans.len() && !deferred {
                             live[ci] = None;
                         }
                     }
                 }
+            }
+        }
+
+        // 流水收尾：最后一块的后半段被推迟到了"下一次调用"，而这里已经没有下一次 —— 必须补跑，
+        // 否则那一块的层 27-47 永远不跑，KV 和 logits 都是错的。只跑 device-1 段：它的前半段上
+        // 一轮已经跑过，重跑会把这些层写的循环状态推进两次。它也是唯一一段没有被任何一轮计时
+        // 覆盖到的工作，所以这里必须把它计进 `prompt_t`，否则报出来的预填 tok/s 会虚高。
+        if let Some((last_ci, last_h, last_plan)) = pending.take() {
+            let last_b = {
+                let last_ch = live[last_ci]
+                    .as_ref()
+                    .expect("the deferred chunk's buffers are live");
+                bind_pf_chunk(
+                    &last_h,
+                    last_ch,
+                    c.n_layer,
+                    rf_buf,
+                    yff_buf,
+                    &kbufs[..],
+                    &vbufs[..],
+                    &qsa_kbufs[..],
+                    &qsa_cbufs[..],
+                    &mrope_history_buf,
+                    &wbufs[..],
+                    c.qwen4exp,
+                    qwen_wide_buf,
+                    ple_embd_buf,
+                    ple_state_buf,
+                )
+            };
+            let t_drain = std::time::Instant::now();
+            let mut no_hook = |_stage: usize| -> infr_core::Result<()> { Ok(()) };
+            be.execute_pipelined(Some((last_plan.as_ref(), &last_b)), &[], &mut no_hook)
+                .map_err(|e| anyhow!("{e}"))?;
+            prompt_t += t_drain.elapsed();
+            drop(last_b);
+            drop(last_plan);
+            if let Some(sink) = mtp_prefill_sink.as_deref_mut() {
+                consume_completed_mtp(be, sink, &mut live, last_ci)?;
+            } else {
+                live[last_ci] = None;
             }
         }
 

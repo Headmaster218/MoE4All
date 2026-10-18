@@ -91,7 +91,19 @@ uint rw1(uint bo) {
 // indexing is a per-invocation-scratch catastrophe on RADV/ACO). Every includer runs `GRID_INIT;`
 // at the TOP of main(): it contains a barrier(), so it must precede any early return / divergent
 // flow. Non-grid builds expand it to an empty statement — byte-identical SPIR-V.
-#if defined(IQ2_GRID_BUFFER)
+#if defined(IQ2XS_GRID_BUFFER)
+layout(binding = 0) readonly buffer IQ2XSGridB { uint G_IQ2XS[]; };
+#include "native_ksigns.glsl"
+#define GRID_INIT ksigns_init()
+#elif defined(IQ2XXS_GRID_BUFFER)
+layout(binding = 0) readonly buffer IQ2XXSGridB { uint G_IQ2XXS[]; };
+#include "native_ksigns.glsl"
+#define GRID_INIT ksigns_init()
+#elif defined(IQ3XXS_GRID_BUFFER)
+layout(binding = 0) readonly buffer IQ3XXSGridB { uint G_IQ3XXS[]; };
+#include "native_ksigns.glsl"
+#define GRID_INIT ksigns_init()
+#elif defined(IQ2_GRID_BUFFER)
 layout(binding = 0) readonly buffer IQ2GridB { uint G_IQ2S[]; };
 #define GRID_INIT
 #elif defined(IQ3_GRID_BUFFER)

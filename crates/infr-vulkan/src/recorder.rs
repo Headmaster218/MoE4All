@@ -8,17 +8,67 @@
 
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Write};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use ash::vk;
+use ash::vk::Handle;
 
-use infr_core::{backend::Buffer, error::Result, pager_profile};
+use infr_core::{
+    backend::{Buffer, BufferUsage},
+    error::Result,
+    pager_profile, Backend,
+};
 
 use super::ops::ComputeKernel;
 use super::{as_vk_buf, be, Backing, VkBuffer, VulkanBackend};
 
 pub(crate) const QSA_TOPK_PARALLEL_MIN_BLOCKS: u32 = 4096;
 pub(crate) const QSA_TOPK_PARALLEL_WORK_BYTES: usize = (64 * 256 + 2) * 4;
+
+/// QSA prefill union scratch (`kernels.vulkan.qsa_union`, `INFR_QSA_UNION`): the bitmap/rank planner
+/// buffers plus the compact K/V plane set the Qwen3.8 prefill GQA12 kernel reads instead of
+/// re-walking the scattered segmented cache once per query row. See `qsa_union_plan`.
+pub struct QsaUnionScratch<'a> {
+    /// [0] overflow flag, [1] union block count, then the selected-block bitmap.
+    pub(crate) bits: &'a dyn Buffer,
+    /// [0, blocks) = block -> union rank, [blocks, 2*blocks) = rank -> block id.
+    pub(crate) rank: &'a dyn Buffer,
+    /// Compact planar-Q8 K/V planes, one per (plane, KV head); see the gather shader.
+    pub(crate) kv: &'a dyn Buffer,
+}
+
+/// Union blocks one chunk may hold before the plan gives up; on overflow the device-side flag sends
+/// every consumer back to the raw per-row path, so this is a speed ceiling, never a wrong answer.
+pub(crate) const QSA_UNION_CAP_BLOCKS: u32 = 8192;
+/// Keys the compact plane set holds (`ratio` = 4 keys per union block, the shader's `UK_KEYS`).
+pub(crate) const QSA_UNION_KEYS: u32 = QSA_UNION_CAP_BLOCKS * 4;
+/// Words per (plane, KV head): 64 Q8 code words per key then 4 f16-scale words, scale region last.
+pub(crate) const QSA_UNION_PLANE_WORDS: u32 = QSA_UNION_KEYS * 68;
+/// Bytes of the whole plane set: K and V planes for each of the 2 KV heads the shape requires.
+pub(crate) const QSA_UNION_KV_BYTES: usize = QSA_UNION_PLANE_WORDS as usize * 4 * 4;
+
+pub(crate) fn qsa_union_bits_bytes(blocks: u32) -> usize {
+    (blocks.div_ceil(32) as usize + 2) * 4
+}
+
+pub(crate) fn qsa_union_rank_bytes(blocks: u32) -> usize {
+    blocks as usize * 2 * 4
+}
 const QSA_TOPK_PARALLEL_MAX_GROUPS: u32 = 64;
+
+/// `INFR_TIMELINE_LABELS=1` keeps exact kernel labels in the decode timeline. The default keeps
+/// the compact family buckets so existing trace consumers stay unchanged.
+fn timeline_label(label: &'static str) -> &'static str {
+    static EXACT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *EXACT.get_or_init(|| std::env::var_os("INFR_TIMELINE_LABELS").is_some()) {
+        label
+    } else {
+        crate::timeline::group(label)
+    }
+}
 
 /// Coopmat prefill shmem-staging mode for `attention_prefill_flash` (Levers 2 & 5,
 /// kv-decode-perf-levers). `Off` = the default direct coopMatLoad from the bound descriptor.
@@ -209,7 +259,10 @@ fn native_sg_choice(
     if out_f < min_out || out_f > max_out {
         return None;
     }
-    let nr = k.sg_nr;
+    // Q2_0's decode has the lowest per-lane arithmetic cost of the enrolled formats; giving each
+    // workgroup 8 output rows keeps more weight loads in flight and measured ~5% faster than NR=2
+    // on the 640x2560 down shape. The heavier IQ4_NL/IQ3_S decodes stay on the configured NR.
+    let nr = if dtype == Q2_0 { 8 } else { k.sg_nr };
     matches!(nr, 2 | 4 | 8).then_some(nr)
 }
 
@@ -255,7 +308,7 @@ fn native_id_sg_choice(
     if dtype == Iq2Xs {
         return (in_f == 2560 && out_f == 640).then_some(8);
     }
-    if !matches!(dtype, Q6K | Q5K | Iq3S) {
+    if !matches!(dtype, Q6K | Q5K | Iq3S | Iq4Nl | Q2_0) {
         return None;
     }
     // wave32 lanes stride 32-elem sub-blocks; in_f must be a multiple of 32 (all projections are).
@@ -269,6 +322,371 @@ fn native_id_sg_choice(
     }
     let nr = k.sg_nr;
     matches!(nr, 2 | 4 | 8).then_some(nr)
+}
+
+thread_local! {
+    /// Profiling-only byte account for the next dispatch: the sum of the logical sizes of every
+    /// buffer bound through [`Recorder::vkb`] since the last `stamp`. It is the FALLBACK for a
+    /// kernel whose call site sets no explicit [`Recorder::label_bytes`] hint — an upper-ish bound
+    /// (whole buffers, not the touched elements) that is still the right order of magnitude, and
+    /// exactly what is needed to tell "bandwidth-bound" from "dispatch-bound". Recording is
+    /// single-threaded per recorder; thread-local keeps this race-free for free.
+    static BOUND_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Residency snapshot of each buffer bound through [`Recorder::vkb`]/[`Recorder::vkb_byte_off`]
+    /// since the last `stamp`, parallel to the descriptor order a dispatch receives. Drained by
+    /// `stamp` into the op-trace row. Only touched while [`OP_TRACE_ACTIVE`] is set, so the hot
+    /// non-profiling path pays a single relaxed atomic load per bind.
+    static BOUND_DETAILS: RefCell<Vec<BindingTrace>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Set once any recorder is built with `INFR_PROF_OP_TRACE` active; gates the per-bind residency
+/// capture above so a plain run never pays for it.
+static OP_TRACE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// One bound buffer's residency, captured at bind time. Stored inline (fixed capacity
+/// [`MAX_TRACE_BINDINGS`]) in the op-trace row so the JSONL self-describes which memory every
+/// dispatch read — the column that separates a residency-fed slowdown from a geometry one.
+const MAX_TRACE_BINDINGS: usize = MAX_DISPATCH_BINDINGS;
+
+#[derive(Clone, Copy)]
+struct BindingTrace {
+    /// The `vk::Buffer` handle the shader sees (shared with sibling `BdaSub` tensors).
+    buffer: u64,
+    /// Descriptor byte offset / range (`range == u64::MAX` is `VK_WHOLE_SIZE`).
+    offset: u64,
+    range: u64,
+    /// Logical tensor size and the bytes actually committed for it.
+    size: u64,
+    mem_size: u64,
+    /// This tensor's offset within `buffer` (non-zero only for a resident-BDA sub-tensor).
+    sub_offset: u64,
+    /// 64-bit device address the tensor is reachable at, or 0 when it has none.
+    device_addr: u64,
+    /// Activation-accounted bytes (0 for weights/KV/staging).
+    act_bytes: u64,
+    /// Physical-device memory type index, or -1 when the allocator chose it.
+    mem_type: i32,
+    /// `vk::MemoryPropertyFlags` bits of the backing memory (DEVICE_LOCAL / HOST_VISIBLE / ...).
+    mem_flags: u32,
+    /// `Backing` variant tag — see [`backing_tag`].
+    backing: u8,
+}
+
+impl BindingTrace {
+    const EMPTY: Self = Self {
+        buffer: 0,
+        offset: 0,
+        range: 0,
+        size: 0,
+        mem_size: 0,
+        sub_offset: 0,
+        device_addr: 0,
+        act_bytes: 0,
+        mem_type: -1,
+        mem_flags: 0,
+        backing: 0,
+    };
+}
+
+/// Stable numeric tag for a [`Backing`] variant, written into the op trace as `backing`.
+fn backing_tag(b: &Backing) -> u8 {
+    match b {
+        Backing::Pooled(_) => 0,
+        Backing::Vram { .. } => 1,
+        Backing::Device { .. } => 2,
+        Backing::BdaSub(_) => 3,
+        Backing::UnifiedSub(_) => 4,
+        Backing::External { .. } => 5,
+        Backing::ImportedHost { .. } => 6,
+    }
+}
+
+/// Human-readable name for a [`BindingTrace::backing`] tag (matches [`backing_tag`]).
+fn backing_name(tag: u8) -> &'static str {
+    match tag {
+        0 => "pooled",
+        1 => "vram",
+        2 => "device",
+        3 => "bda_sub",
+        4 => "unified_sub",
+        5 => "external",
+        6 => "imported_host",
+        _ => "unknown",
+    }
+}
+
+/// Geometry attached to one recorded dispatch. Direct dispatches carry their workgroup grid;
+/// indirect dispatches carry the argument buffer so the JSONL row still identifies the dispatch
+/// even though the final grid is produced on the GPU.
+#[derive(Clone, Copy)]
+enum DispatchGeometry {
+    Direct { gx: u32, gy: u32, gz: u32 },
+    Indirect { args: u64, args_off: u64 },
+    Copy { bytes: u64, regions: u32 },
+    Fill { bytes: u64 },
+}
+
+/// One row of the opt-in per-dispatch trace (`INFR_PROF_OP_TRACE`). Context is captured at record
+/// time, not at submit time: a command buffer can span several device/phase/layer guards, and the
+/// whole point of this trace is to preserve that attribution per dispatch.
+#[derive(Clone, Copy)]
+struct MoeTraceShape {
+    /// Weight dtype the expert bank was read in, as a short static tag (see [`moe_dtype_tag`]).
+    dtype: &'static str,
+    /// Selected kernel name (the `native_gemm_mmq_*` variant actually dispatched).
+    kernel: &'static str,
+    /// Caller-space problem shape, before tiling.
+    rows: u32,
+    k: u32,
+    n: u32,
+    n_expert: u32,
+    n_used: u32,
+    /// Tile sizes chosen by the heuristic plus the resulting grid width (`gx`).
+    bm: u32,
+    bn: u32,
+    wide_bn: bool,
+    gx: u32,
+    /// Physical source of the expert weight bank. The resident path uses a 64-bit BDA into a
+    /// shared `BdaWeightArena` block; the paged path uses an arena base plus a per-expert LUT slot
+    /// stride. Recorded so a slow kernel can be separated from the memory placement it actually
+    /// read, instead of inferred from the Rust-side allocation call.
+    weight: MoeWeightTrace,
+}
+
+#[derive(Clone, Copy)]
+struct MoeWeightTrace {
+    kind: &'static str,
+    addr: u64,
+    sub_offset: u64,
+    logical_size: u64,
+    block_size: u64,
+    mem_type: i32,
+    mem_flags: u32,
+    slot_bytes: u32,
+}
+
+/// Profiling-only view of a resident weight buffer's physical addressing. Returns an
+/// `ordinary_bda` row for standalone weight buffers (the microbench path) and a
+/// `resident_bda_sub` row when the tensor is a slice of the shared resident-weight arena.
+fn resident_weight_trace(w: &dyn Buffer) -> Option<MoeWeightTrace> {
+    let addr = w.device_addr()?;
+    let vk = crate::as_vk_buf(w).ok()?;
+    if let crate::Backing::BdaSub(block) = &vk.backing {
+        let (mem_type, mem_flags) = block.buf.mem_info();
+        Some(MoeWeightTrace {
+            kind: "resident_bda_sub",
+            addr,
+            sub_offset: vk.sub_offset as u64,
+            logical_size: vk.size as u64,
+            block_size: block.buf.size as u64,
+            mem_type,
+            mem_flags,
+            slot_bytes: 0,
+        })
+    } else {
+        let (mem_type, mem_flags) = vk.mem_info();
+        Some(MoeWeightTrace {
+            kind: "ordinary_bda",
+            addr,
+            sub_offset: 0,
+            logical_size: vk.size as u64,
+            block_size: vk.size as u64,
+            mem_type,
+            mem_flags,
+            slot_bytes: 0,
+        })
+    }
+}
+
+/// Short static tag for a MoE weight dtype, used only to stamp the op trace. Falls back to the
+/// variant name for anything outside the MoE set so a new dtype still shows up unambiguously.
+fn moe_dtype_tag(dtype: infr_core::DType) -> &'static str {
+    use infr_core::DType as D;
+    match dtype {
+        D::Q4_0 => "q4_0",
+        D::Q4_1 => "q4_1",
+        D::Q5_0 => "q5_0",
+        D::Q5_1 => "q5_1",
+        D::Q8_0 => "q8_0",
+        D::Q2K => "q2_k",
+        D::Q3K => "q3_k",
+        D::Q4K => "q4_k",
+        D::Q5K => "q5_k",
+        D::Q6K => "q6_k",
+        D::Q2_0 => "q2_0",
+        D::Iq4Nl => "iq4_nl",
+        D::Iq4Xs => "iq4_xs",
+        D::Iq2S => "iq2_s",
+        D::Iq2Xs => "iq2_xs",
+        D::Iq2Xxs => "iq2_xxs",
+        D::Iq3S => "iq3_s",
+        D::Iq3Xxs => "iq3_xxs",
+        D::Mxfp4 => "mxfp4",
+        D::Nvfp4 => "nvfp4",
+        _ => "other",
+    }
+}
+
+#[derive(Clone, Copy)]
+struct OpTraceEntry {
+    seq: u64,
+    label: &'static str,
+    bytes: u64,
+    context: Option<infr_core::timeline::Context>,
+    geometry: DispatchGeometry,
+    bindings: u32,
+    n_out: u32,
+    /// `vk::Pipeline` / `vk::PipelineLayout` handles and the SPIR-V hash of the kernel this
+    /// dispatch ran. Zero for the transfer ops (`copy`/`fill`), which bind no pipeline.
+    pipeline: u64,
+    pipeline_layout: u64,
+    spv_hash: u64,
+    /// Push-constant size the kernel was built with, and its declared binding count.
+    push_size: u32,
+    n_buf: u32,
+    /// MoE expert-GEMM shape/tile decision, when this dispatch came from
+    /// `matmul_mmq_experts{,_paged}`. `None` for every other op.
+    moe: Option<MoeTraceShape>,
+    /// Residency snapshot of each bound buffer, in binding order. Only `n_detail` entries are
+    /// meaningful; the rest are [`BindingTrace::EMPTY`].
+    detail: [BindingTrace; MAX_TRACE_BINDINGS],
+    n_detail: u32,
+}
+
+static OP_TRACE_STATE: OnceLock<Option<Mutex<BufWriter<File>>>> = OnceLock::new();
+static NEXT_OP_TRACE_SEQ: AtomicU64 = AtomicU64::new(1);
+static NEXT_OP_TRACE_SEGMENT: AtomicU64 = AtomicU64::new(1);
+
+fn op_trace_writer() -> Option<&'static Mutex<BufWriter<File>>> {
+    OP_TRACE_STATE
+        .get_or_init(|| {
+            let path = std::env::var_os("INFR_PROF_OP_TRACE")?;
+            if path.is_empty() {
+                return None;
+            }
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&path)
+                .map_err(|error| {
+                    eprintln!("[prof_ops] cannot open INFR_PROF_OP_TRACE: {error}");
+                    error
+                })
+                .ok()?;
+            eprintln!(
+                "[prof_ops] per-dispatch trace -> {}",
+                path.to_string_lossy()
+            );
+            Some(Mutex::new(BufWriter::new(file)))
+        })
+        .as_ref()
+}
+
+fn op_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| op_trace_writer().is_some())
+}
+
+/// Opt-in boolean env switch, spelled exactly `1` like the other debug/profile knobs. Kept
+/// local so a profiling flag never grows a config-tree walk on the dispatch path.
+fn env_flag_one(name: &str) -> bool {
+    std::env::var_os(name)
+        .and_then(|value| value.into_string().ok())
+        .is_some_and(|value| value == "1")
+}
+
+/// Diagnostic-only override for the batched-MoE expert-GEMM row tile (`INFR_MOE_FORCE_BM`).
+/// The heuristic picks BM=32 whenever the average bucket is small (`≤
+/// MOE_EXPERT_SMALL_TILE_AVG_ROWS`), which inflates `gx` — and with `gx = ceil(rows/bm)·(n/bn)`
+/// the vast majority of those workgroups exit immediately on an near-empty bucket. Forcing 64
+/// halves the grid so an A/B measures how much of the runtime is grid-launch overhead rather
+/// than weight traffic. Read once; `None` in any normal run.
+fn moe_force_bm() -> Option<usize> {
+    static FORCED: OnceLock<Option<usize>> = OnceLock::new();
+    *FORCED.get_or_init(|| {
+        std::env::var("INFR_MOE_FORCE_BM")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|bm| *bm == 32 || *bm == 64)
+    })
+}
+
+/// Opt-in switch for the batched-MoE expert GEMM's GPU-derived indirect dispatch grid
+/// (`INFR_MOE_INDIRECT=1`). OFF by default: the one-workgroup prologue removes the host's
+/// worst-case `ceil(rows/BM)` over-launch, but a same-binary A/B at pp1024 measured the whole
+/// device path at 9.59 s versus 9.10 s for direct dispatch, and the MoE expert kernels at
+/// ~2.51 s versus ~2.07 s. The saved empty workgroups cost less than the prologue, indirect
+/// dispatch, and narrower per-expert grids. `1` keeps the experimental path available for
+/// further tuning. Read once.
+fn moe_indirect_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("INFR_MOE_INDIRECT")
+            .map(|value| value == "1")
+            .unwrap_or(false)
+    })
+}
+
+fn dispatch_geometry_json(geometry: DispatchGeometry) -> serde_json::Value {
+    match geometry {
+        DispatchGeometry::Direct { gx, gy, gz } => serde_json::json!({
+            "kind": "direct",
+            "gx": gx,
+            "gy": gy,
+            "gz": gz,
+        }),
+        DispatchGeometry::Indirect { args, args_off } => serde_json::json!({
+            "kind": "indirect",
+            "args": args,
+            "args_off": args_off,
+        }),
+        DispatchGeometry::Copy { bytes, regions } => serde_json::json!({
+            "kind": "copy",
+            "bytes": bytes,
+            "regions": regions,
+        }),
+        DispatchGeometry::Fill { bytes } => serde_json::json!({
+            "kind": "fill",
+            "bytes": bytes,
+        }),
+    }
+}
+
+/// Exact on-disk byte count of an `elems`-element tensor in `dtype` — the same GGUF block layout
+/// the kernels decode, so a kernel's reported traffic is the bytes it really reads from VRAM.
+fn dtype_bytes(dtype: infr_core::DType, elems: usize) -> u64 {
+    let (block_elems, block_bytes) = infr_gguf::block_layout(dtype);
+    if block_elems == 0 {
+        return 0;
+    }
+    (elems.div_ceil(block_elems) * block_bytes) as u64
+}
+
+/// Profiled traffic of a dense `[m, k] · [k, n]` projection whose weight is a resident-BDA
+/// `dtype` tensor: the weight bank is read once per dispatch (every row tile shares it), plus the
+/// f32 activation and f32 output this engine allocates for activations.
+fn dense_gemm_bytes(dtype: infr_core::DType, m: usize, k: usize, n: usize) -> u64 {
+    let io = m.saturating_mul(k).saturating_add(m.saturating_mul(n)) as u64 * 4;
+    dtype_bytes(dtype, k.saturating_mul(n)) + io
+}
+
+/// Profiled traffic of one batched-MoE stage. Only experts with a non-empty bucket read their
+/// weight slice, so the weight term is `min(n_expert, rows·n_used)` slices of `k·n` elements; the
+/// activation and output are per `(row, slot)` pair. This is the number that turns a many-µs
+/// `expert_gateup` row from "slow" into "moving X GB at Y GB/s".
+fn moe_stage_bytes(
+    dtype: infr_core::DType,
+    rows: usize,
+    k: usize,
+    n: usize,
+    n_expert: usize,
+    n_used: usize,
+) -> u64 {
+    let pairs = rows.saturating_mul(n_used);
+    let active = pairs.min(n_expert) as u64;
+    let io = pairs.saturating_mul(k).saturating_add(pairs.saturating_mul(n)) as u64 * 4;
+    active.saturating_mul(dtype_bytes(dtype, k.saturating_mul(n))) + io
 }
 
 /// Converts an element-space per-expert stride to the per-expert BYTE stride the STREAMED
@@ -639,6 +1057,26 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
                 g::native_gemm_mmq_iq2_xs_xpg32_spv(),
             ),
         },
+        D::Iq2Xxs => MoeMmqDesc {
+            resident_nb: 6,
+            xp: (
+                "native_gemm_mmq_iq2_xxs_xp",
+                g::native_gemm_mmq_iq2_xxs_xp_spv(),
+            ),
+            xp32: (
+                "native_gemm_mmq_iq2_xxs_xp32",
+                g::native_gemm_mmq_iq2_xxs_xp32_spv(),
+            ),
+            xp_wide: None,
+            xpg: (
+                "native_gemm_mmq_iq2_xxs_xpg",
+                g::native_gemm_mmq_iq2_xxs_xpg_spv(),
+            ),
+            xpg32: (
+                "native_gemm_mmq_iq2_xxs_xpg32",
+                g::native_gemm_mmq_iq2_xxs_xpg32_spv(),
+            ),
+        },
         D::Iq3S => MoeMmqDesc {
             resident_nb: 6,
             xp: (
@@ -944,6 +1382,12 @@ pub struct Recorder<'a> {
     /// Whether any un-barriered write was produced by a transfer (copy) rather than a shader.
     dirty_transfer: std::cell::Cell<bool>,
     barriers: RefCell<usize>,
+    /// GPU-written indirect dispatch args (`[gx, gy, gz]`, 16 bytes) for the batched MoE expert
+    /// GEMMs — allocated once on first use and reused by every MoE stage this recorder records
+    /// (each stage re-runs its prologue, so the ordinary hazard barriers keep the writes ordered).
+    /// Owned here so the common case pays one allocation per forward, not one per layer; the
+    /// held `Arc` outlives a `finish()` that moves `buffer_keepalive` into a `PendingSegment`.
+    moe_args: RefCell<Option<std::sync::Arc<dyn Buffer>>>,
     /// Set while recording an indirect dispatch so `sync` widens the barrier to cover the
     /// indirect-command read of GPU-written dispatch args.
     indirect_pending: std::cell::Cell<bool>,
@@ -961,6 +1405,17 @@ pub struct Recorder<'a> {
     /// INFR_PROF_OP_SHAPES (on top of INFR_PROF_OPS): GEMV/GEMM dispatches get shape-itemized labels
     /// (`kind:mM:KxN`) instead of the bare kernel name. Read once at construction.
     op_shapes: bool,
+    /// INFR_PROF_OP_TRACE=/path/to/ops.jsonl: write one row per dispatch after its timestamp query
+    /// is resolved. Requires `INFR_PROF_OPS`, so the GPU interval and attribution stay on the same
+    /// already-supported profiling path.
+    op_trace: bool,
+    /// INFR_PROF_OP_TRACE_SPLIT=1 (requires `op_trace`): bracket every op with a
+    /// BOTTOM_OF_PIPE timestamp pair instead of one stamp per op. The pair measures the
+    /// command's own GPU execution (`kernel_ns`) and leaves the wait in front of it as a
+    /// separate `stall_ns`, instead of billing both to whichever op's interval happens to
+    /// contain them. The extra drain is a profiling cost, so this mode is for diagnosis, not
+    /// for throughput numbers.
+    op_trace_split: bool,
     query_pool: vk::QueryPool,
     /// Whole-command-buffer timestamps used only while the automatic submit cap is calibrating.
     /// Unlike `query_pool`, this has exactly two queries and remains compatible with nowait
@@ -971,6 +1426,19 @@ pub struct Recorder<'a> {
     timeline_query: RefCell<Option<crate::timeline::Query>>,
     timeline_lifetime: RefCell<Option<infr_core::timeline::Span>>,
     ts_labels: RefCell<Vec<&'static str>>,
+    /// Byte account parallel to [`Self::ts_labels`] (0 = not reported). Profile-only.
+    ts_bytes: RefCell<Vec<u64>>,
+    /// Per-dispatch rows parallel to [`Self::ts_labels`] when `INFR_PROF_OP_TRACE` is active.
+    op_trace_entries: RefCell<Vec<OpTraceEntry>>,
+    /// Next free timestamp-query slot. Non-split mode advances it once per op; split mode
+    /// reserves two slots per op (`before`, `after`) so indices stay aligned when copies and
+    /// fills are interleaved with dispatches.
+    ts_slots: std::cell::Cell<u32>,
+    /// Set while a split-mode entry has reserved its pair and still needs the before/after
+    /// stamps written at the command site. Cleared by [`Self::stamp_split_end`].
+    split_pending: std::cell::Cell<bool>,
+    /// Monotonic segment id shared by every row written after one submit is drained.
+    op_trace_segment: u64,
     /// Dispatches past the query-pool capacity: counted (and reported) instead of stamped.
     ts_dropped: std::cell::Cell<usize>,
     /// One-shot prof_ops label override: the NEXT dispatch's timestamp uses this instead of the
@@ -978,6 +1446,17 @@ pub struct Recorder<'a> {
     /// GEMM vs a projection, expert gate_up vs down) to a distinct bucket without per-op API
     /// plumbing.
     next_label: std::cell::Cell<Option<&'static str>>,
+    /// One-shot prof_ops byte account for the NEXT dispatch (see [`Self::label_bytes`]). 0 means
+    /// "no hint": `stamp` then falls back to the [`BOUND_BYTES`] accumulator. This split matters
+    /// because the biggest readers (resident-BDA expert/projection weights) are addressed by
+    /// 64-bit device pointer and are NOT bound as descriptors, so the fallback cannot see them.
+    next_bytes: std::cell::Cell<u64>,
+    /// One-shot MoE expert-GEMM shape record for the NEXT dispatch, set by
+    /// [`Self::label_moe_shape`] and drained by `stamp` into the op trace row. The MoE tile
+    /// heuristic's inputs (`rows`/`n_used`/`n_expert`) and its output (dtype + tile + grid) are
+    /// otherwise unrecoverable from the trace, which made the `gx=220` slow-gateup question
+    /// guesswork.
+    next_moe: std::cell::Cell<Option<MoeTraceShape>>,
     /// Record-once: when set, the command buffer is begun resubmittable (no ONE_TIME_SUBMIT) and
     /// `finish_record` hands back its cmd buffer + pool (a [`RecordedCmd`]) instead of submitting and
     /// freeing — so the caller can replay it across tokens.
@@ -1028,6 +1507,253 @@ fn intern_label(s: String) -> &'static str {
     let leaked: &'static str = Box::leak(s.into_boxed_str());
     set.insert(leaked);
     leaked
+}
+
+/// Per-op timestamp state captured while recording one command buffer. A blocking `finish` can
+/// report it immediately; an asynchronous `finish_nowait` moves it into the returned
+/// [`PendingSegment`] so the query pool is read only after that segment's fence signals.
+struct OpTimestampLedger {
+    query_pool: vk::QueryPool,
+    labels: Vec<&'static str>,
+    bytes: Vec<u64>,
+    entries: Vec<OpTraceEntry>,
+    segment: u64,
+    dropped: usize,
+    /// Whether the rows were recorded with a before/after timestamp pair per op
+    /// (`INFR_PROF_OP_TRACE_SPLIT`). The query-slot layout differs between the two modes.
+    split: bool,
+    /// `current_context()` at submit time. Captured here because an async segment may be waited
+    /// after the next device/phase has already begun recording.
+    context_prefix: Option<String>,
+}
+
+fn profile_context_prefix() -> Option<String> {
+    infr_core::timeline::current_context().map(|ctx| {
+        let device = if ctx.device >= 0 {
+            format!("d{}", ctx.device)
+        } else {
+            "d?".to_string()
+        };
+        let phase = if !ctx.phase.is_empty() {
+            ctx.phase
+        } else if ctx.lanes > 1 {
+            "prefill"
+        } else {
+            "decode"
+        };
+        format!("{device}/{phase}/")
+    })
+}
+
+fn report_op_timestamps(
+    shared: &crate::VulkanShared,
+    query_pool: vk::QueryPool,
+    labels: &[&'static str],
+    bytes: &[u64],
+    entries: &[OpTraceEntry],
+    segment: u64,
+    dropped: usize,
+    split: bool,
+    context_prefix: Option<&str>,
+) {
+    let n = labels.len();
+    debug_assert_eq!(n, bytes.len(), "label/byte ledgers must stay in lockstep");
+    debug_assert!(
+        entries.is_empty() || n == entries.len(),
+        "label/dispatch-trace ledgers must stay in lockstep"
+    );
+    debug_assert!(
+        !split || entries.is_empty() || n == entries.len(),
+        "split timing needs one trace entry per label"
+    );
+    if n == 0 {
+        if dropped > 0 {
+            eprintln!(
+                "[prof_ops] WARNING: {dropped} dispatches past the {}-timestamp query pool went unstamped",
+                Recorder::<'_>::MAX_TS,
+            );
+        }
+        return;
+    }
+    if dropped > 0 {
+        eprintln!(
+            "[prof_ops] WARNING: {dropped} dispatches past the {}-timestamp query pool went unstamped",
+            Recorder::<'_>::MAX_TS,
+        );
+    }
+    // Non-split: one stamp per op plus a closing stamp; row i's interval is
+    // ticks[i+1]-ticks[i]. Split: a before/after pair per op (`2*i`, `2*i+1`) plus a
+    // closing stamp, so row i's kernel time is ticks[2i+1]-ticks[2i] and the gap in
+    // front of it is ticks[2i]-ticks[2i-1].
+    let slot_count = if split { 2 * n + 1 } else { n + 1 };
+    let mut ticks = vec![0u64; slot_count];
+    unsafe {
+        shared
+            .device
+            .get_query_pool_results(
+                query_pool,
+                0,
+                &mut ticks,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+            )
+            .expect("get_query_pool_results");
+    }
+    let period = unsafe {
+        shared
+            .instance
+            .get_physical_device_properties(shared.physical_device)
+    }
+    .limits
+    .timestamp_period; // ns per tick
+    // Vulkan guarantees only `timestampValidBits` are meaningful. Mask the modular delta
+    // down to that width so a 36-/40-bit device counter cannot leak garbage upper bits, and
+    // wrap correctly at the counter's real period.
+    let valid_bits = shared.submit_timestamp_valid_bits;
+    let valid_mask = if valid_bits >= 64 {
+        u64::MAX
+    } else if valid_bits == 0 {
+        0
+    } else {
+        (1u64 << valid_bits) - 1
+    };
+    let tick_delta = |end: u64, start: u64| -> u64 { end.wrapping_sub(start) & valid_mask };
+
+    if valid_bits == 0 {
+        eprintln!("[prof_ops] WARNING: queue reports timestampValidBits=0; op timings are invalid");
+    }
+
+    let ns = |delta_ticks: u64| -> f64 { delta_ticks as f64 * period as f64 };
+
+    if !entries.is_empty() {
+        if let Some(state) = op_trace_writer() {
+            let mut out = state.lock().unwrap();
+            for (i, entry) in entries.iter().enumerate() {
+                let (duration_ns, kernel_ns, stall_ns) = if split {
+                    let kernel = ns(tick_delta(ticks[2 * i + 1], ticks[2 * i]));
+                    let stall = if i == 0 {
+                        0.0
+                    } else {
+                        ns(tick_delta(ticks[2 * i], ticks[2 * i - 1]))
+                    };
+                    (kernel, Some(kernel), Some(stall))
+                } else {
+                    let slot = ns(tick_delta(ticks[i + 1], ticks[i]));
+                    (slot, None, None)
+                };
+                let (step, lanes, layer, device, phase) = match entry.context {
+                    Some(ctx) => (
+                        serde_json::json!(ctx.step),
+                        serde_json::json!(ctx.lanes),
+                        serde_json::json!(ctx.layer),
+                        serde_json::json!(ctx.device),
+                        serde_json::json!(ctx.phase),
+                    ),
+                    None => (
+                        serde_json::Value::Null,
+                        serde_json::Value::Null,
+                        serde_json::Value::Null,
+                        serde_json::Value::Null,
+                        serde_json::Value::Null,
+                    ),
+                };
+                let event = serde_json::json!({
+                    "event": "op",
+                    "segment": segment,
+                    "seq": entry.seq,
+                    "label": entry.label,
+                    "device": device,
+                    "phase": phase,
+                    "step": step,
+                    "lanes": lanes,
+                    "layer": layer,
+                    "geometry": dispatch_geometry_json(entry.geometry),
+                    "bindings": entry.bindings,
+                    "n_out": entry.n_out,
+                    "pipeline": entry.pipeline,
+                    "pipeline_layout": entry.pipeline_layout,
+                    "spv": entry.spv_hash,
+                    "push_size": entry.push_size,
+                    "n_buf": entry.n_buf,
+                    "moe": entry.moe.map(|m| serde_json::json!({
+                        "dtype": m.dtype,
+                        "kernel": m.kernel,
+                        "rows": m.rows,
+                        "k": m.k,
+                        "n": m.n,
+                        "n_expert": m.n_expert,
+                        "n_used": m.n_used,
+                        "bm": m.bm,
+                        "bn": m.bn,
+                        "wide_bn": m.wide_bn,
+                        "gx": m.gx,
+                        "weight": {
+                            "kind": m.weight.kind,
+                            "addr": m.weight.addr,
+                            "sub_offset": m.weight.sub_offset,
+                            "logical_size": m.weight.logical_size,
+                            "block_size": m.weight.block_size,
+                            "mem_type": m.weight.mem_type,
+                            "mem_flags": m.weight.mem_flags,
+                            "slot_bytes": m.weight.slot_bytes,
+                        },
+                    })).unwrap_or(serde_json::Value::Null),
+                    "bufs": (0..entry.n_detail as usize).map(|b| {
+                        let d = &entry.detail[b];
+                        serde_json::json!({
+                            "i": b,
+                            "handle": d.buffer,
+                            "off": d.offset,
+                            "range": d.range,
+                            "size": d.size,
+                            "mem": d.mem_size,
+                            "sub": d.sub_offset,
+                            "addr": d.device_addr,
+                            "act": d.act_bytes,
+                            "mtype": d.mem_type,
+                            "mflags": d.mem_flags,
+                            "backing": backing_name(d.backing),
+                        })
+                    }).collect::<Vec<_>>(),
+                    "bytes": entry.bytes,
+                    "duration_ns": duration_ns,
+                    "timing": if split { "split" } else { "interval" },
+                    "kernel_ns": kernel_ns,
+                    "stall_ns": stall_ns,
+                    "begin_tick": if split { serde_json::json!(ticks[2 * i]) } else { serde_json::Value::Null },
+                    "end_tick": if split { serde_json::json!(ticks[2 * i + 1]) } else { serde_json::Value::Null },
+                });
+                if serde_json::to_writer(&mut *out, &event).is_err()
+                    || out.write_all(b"\n").is_err()
+                {
+                    eprintln!("[prof_ops] writing INFR_PROF_OP_TRACE failed");
+                    break;
+                }
+            }
+            let _ = out.flush();
+        }
+    }
+
+                       // Accounted, aggregated and printed by the shared reporter (`infr_core::prof::OpProf`),
+                       // which is where the `gpu_add` fold into the process-wide exit table now happens too — the
+                       // same code path metal and the cpu backend report through, so the three tables are
+                       // column-for-column comparable.
+    let mut p = infr_core::prof::OpProf::new("vulkan", infr_core::prof::Unit::Device);
+    // Attribute each row to the pipeline device and decode phase that produced it, so one exit
+    // table separates `d0/verify/...` from `d1/draft/...` instead of folding a prefill's m=768
+    // GEMM into the same row as the decode's m=4 one. The context is only present when the
+    // timeline or the flight recorder is active, so a bare `INFR_PROF_OPS=1` run keeps the
+    // exact labels it always had.
+    for i in 0..n {
+        let ticks_i = if split { 2 * i + 1 } else { i + 1 };
+        let ticks_prev = if split { 2 * i } else { i };
+        let us = ns(tick_delta(ticks[ticks_i], ticks[ticks_prev])) / 1000.0;
+        let bt = bytes.get(i).copied().unwrap_or(0);
+        match context_prefix {
+            Some(prefix) => p.add_n_bytes(format!("{prefix}{}", labels[i]), us, 1, bt),
+            None => p.add_n_bytes(labels[i], us, 1, bt),
+        }
+    }
+    p.flush();
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -1118,12 +1844,36 @@ impl<'a> Recorder<'a> {
             bda_chunk_caps(&backend.cfg().kernels.vulkan);
         let prof_ops = infr_core::prof::enabled(profcfg) && !persistent;
         let op_shapes = prof_ops && profcfg.op_shapes;
+        let op_trace = prof_ops && op_trace_enabled();
+        let op_trace_split = op_trace && env_flag_one("INFR_PROF_OP_TRACE_SPLIT");
+        if op_trace {
+            // Arm the per-bind residency capture (`record_binding`) for every thread that records
+            // into an op-traced recorder. Never disarmed: the flag only ever gates extra detail on
+            // an already-profiling run.
+            OP_TRACE_ACTIVE.store(true, Ordering::Relaxed);
+        }
+        if op_trace_split {
+            eprintln!(
+                "[prof_ops] split op timing: one before/after timestamp pair per op \
+                 (serializes the stream for attribution)"
+            );
+        }
+        let op_trace_segment = if op_trace {
+            NEXT_OP_TRACE_SEGMENT.fetch_add(1, Ordering::Relaxed)
+        } else {
+            0
+        };
+        let query_slots = if op_trace_split {
+            2 * MAX_TS
+        } else {
+            MAX_TS
+        };
         let query_pool = if prof_ops {
             let qp = match unsafe {
                 device.create_query_pool(
                     &vk::QueryPoolCreateInfo::default()
                         .query_type(vk::QueryType::TIMESTAMP)
-                        .query_count(MAX_TS),
+                        .query_count(query_slots),
                     None,
                 )
             } {
@@ -1139,7 +1889,7 @@ impl<'a> Recorder<'a> {
                     return Err(be(format!("create query pool: {e}")));
                 }
             };
-            unsafe { device.cmd_reset_query_pool(cmd, qp, 0, MAX_TS) };
+            unsafe { device.cmd_reset_query_pool(cmd, qp, 0, query_slots) };
             qp
         } else {
             vk::QueryPool::null()
@@ -1207,12 +1957,15 @@ impl<'a> Recorder<'a> {
             dirty_reads: RefCell::new(HashSet::new()),
             dirty_transfer: std::cell::Cell::new(false),
             barriers: RefCell::new(0),
+            moe_args: RefCell::new(None),
             indirect_pending: std::cell::Cell::new(false),
             no_barrier: dbgcfg.no_barrier,
             full_barrier: dbgcfg.full_barrier,
             stages: profcfg.stages,
             prof_ops,
             op_shapes,
+            op_trace,
+            op_trace_split,
             query_pool,
             submit_query_pool: std::cell::Cell::new(submit_query_pool),
             submit_timing_token: std::cell::Cell::new(submit_timing_token),
@@ -1220,8 +1973,15 @@ impl<'a> Recorder<'a> {
             timeline_query: RefCell::new(timeline_query),
             timeline_lifetime: RefCell::new(infr_core::timeline::span("recorder_lifetime")),
             ts_labels: RefCell::new(Vec::new()),
+            ts_bytes: RefCell::new(Vec::new()),
+            op_trace_entries: RefCell::new(Vec::new()),
+            ts_slots: std::cell::Cell::new(0),
+            split_pending: std::cell::Cell::new(false),
+            op_trace_segment,
             ts_dropped: std::cell::Cell::new(0),
             next_label: std::cell::Cell::new(None),
+            next_bytes: std::cell::Cell::new(0),
+            next_moe: std::cell::Cell::new(None),
             persistent,
             t0: std::time::Instant::now(),
             suppress: std::cell::Cell::new(false),
@@ -1278,6 +2038,36 @@ impl<'a> Recorder<'a> {
     pub fn label_next(&self, label: &'static str) {
         if self.prof_ops {
             self.next_label.set(Some(label));
+        }
+    }
+
+    /// Profiling-only: declare how many bytes the NEXT dispatch moves (weights + activations +
+    /// KV), overriding the [`BOUND_BYTES`] fallback. Needed for every resident-BDA weight, which
+    /// the kernel reads by 64-bit device address and therefore never binds as a descriptor; the
+    /// fallback sees the FILLER that occupies the vacated binding slot instead.
+    ///
+    /// No-op unless `INFR_PROF_OPS` is on, so a production run pays one branch.
+    pub fn label_bytes(&self, bytes: u64) {
+        if self.prof_ops {
+            self.next_bytes.set(bytes);
+        }
+    }
+
+    /// [`Self::label_next`] + [`Self::label_bytes`] for the call sites that already know both.
+    pub fn label_next_bytes(&self, label: &'static str, bytes: u64) {
+        if self.prof_ops {
+            self.next_label.set(Some(label));
+            self.next_bytes.set(bytes);
+        }
+    }
+
+    /// Diagnostic-only: attach the NEXT dispatch's MoE expert-GEMM shape/tile decision to its
+    /// op-trace row. Set by the two `matmul_mmq_experts` variants right before their dispatch;
+    /// drained by `stamp`. No-op without `INFR_PROF_OPS`, so the production path only pays a
+    /// branch.
+    fn label_moe_shape(&self, shape: MoeTraceShape) {
+        if self.prof_ops {
+            self.next_moe.set(Some(shape));
         }
     }
 
@@ -1353,40 +2143,165 @@ impl<'a> Recorder<'a> {
         }
     }
 
-    /// Query-pool capacity (timestamps per recorder). Stamps past `MAX_TS - 1` (one slot is
-    /// reserved for the closing timestamp in `finish`) are dropped and counted.
+    /// Query-pool capacity per timing mode. One timestamp slot per op in interval mode, two in
+    /// split mode. Stamps past the capacity (one slot is reserved for the closing timestamp in
+    /// `finish`) are dropped and counted.
     const MAX_TS: u32 = 65536;
 
-    /// Record a profiling timestamp (BOTTOM_OF_PIPE) tagged with an op label, if INFR_PROF_OPS.
-    /// Called automatically at the dispatch chokepoints with the kernel name — op methods no
-    /// longer stamp by hand (use [`label_next`](Self::label_next) to override a too-generic
-    /// kernel name).
-    fn stamp(&self, label: &'static str) {
-        if let Some(query) = self.timeline_query.borrow_mut().as_mut() {
-            query.mark(crate::timeline::group(label));
+    /// Timestamp slots this recorder's query pool owns. Split mode allocates a pair per op.
+    fn query_slots(&self) -> u32 {
+        if self.op_trace_split {
+            2 * Self::MAX_TS
+        } else {
+            Self::MAX_TS
         }
-        // Every dispatch funnels through here, so this is also where the recorder counts them —
-        // the submit splitter (`Recorder::dispatches`) needs the count whether or not INFR_PROF_OPS
-        // is on.
-        self.dispatches.set(self.dispatches.get() + 1);
-        if !self.prof_ops {
-            return;
-        }
-        let label = self.next_label.take().unwrap_or(label);
-        let idx = self.ts_labels.borrow().len() as u32;
-        if idx >= Self::MAX_TS - 1 {
-            self.ts_dropped.set(self.ts_dropped.get() + 1);
-            return;
-        }
+    }
+
+    /// Write one BOTTOM_OF_PIPE timestamp into the per-op query pool.
+    fn write_ts(&self, index: u32) {
         unsafe {
             self.be.shared.device.cmd_write_timestamp(
                 self.cmd,
                 vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                 self.query_pool,
-                idx,
+                index,
             );
         }
+    }
+
+    /// Split mode: timestamp immediately before the command, after its barrier and bindings.
+    /// In interval mode this is a no-op.
+    fn stamp_split_begin(&self) {
+        if !self.split_pending.get() {
+            return;
+        }
+        self.write_ts(self.ts_slots.get() - 2);
+    }
+
+    /// Split mode: timestamp immediately after the command. In interval mode this is a no-op.
+    fn stamp_split_end(&self) {
+        if !self.split_pending.replace(false) {
+            return;
+        }
+        self.write_ts(self.ts_slots.get() - 1);
+    }
+
+    /// Record a profiling timestamp (BOTTOM_OF_PIPE) tagged with an op label, if INFR_PROF_OPS.
+    /// Called automatically at the dispatch chokepoints with the kernel name — op methods no
+    /// longer stamp by hand (use [`label_next`](Self::label_next) to override a too-generic
+    /// kernel name).
+    fn stamp(
+        &self,
+        label: &'static str,
+        geometry: DispatchGeometry,
+        bindings: u32,
+        n_out: u32,
+    ) {
+        self.stamp_impl(label, geometry, bindings, n_out, None);
+    }
+
+    /// [`Self::stamp`] for a compute dispatch: additionally records the pipeline/layout/SPIR-V
+    /// identity and the per-binding residency snapshot.
+    fn stamp_kernel(
+        &self,
+        k: ComputeKernel,
+        geometry: DispatchGeometry,
+        bindings: u32,
+        n_out: u32,
+    ) {
+        self.stamp_impl(k.name, geometry, bindings, n_out, Some(k));
+    }
+
+    fn stamp_impl(
+        &self,
+        label: &'static str,
+        geometry: DispatchGeometry,
+        bindings: u32,
+        n_out: u32,
+        k: Option<ComputeKernel>,
+    ) {
+        if let Some(query) = self.timeline_query.borrow_mut().as_mut() {
+            query.mark(timeline_label(label));
+        }
+        // Every dispatch funnels through here, so this is also where the recorder counts them —
+        // the submit splitter (`Recorder::dispatches`) needs the count whether or not INFR_PROF_OPS
+        // is on.
+        self.dispatches.set(self.dispatches.get() + 1);
+        // Drain the per-bind residency snapshot BEFORE the prof_ops bail below so it can never
+        // accumulate across ops in a non-profiling run.
+        let mut detail = [BindingTrace::EMPTY; MAX_TRACE_BINDINGS];
+        let n_detail = if OP_TRACE_ACTIVE.load(Ordering::Relaxed) {
+            BOUND_DETAILS.with(|v| {
+                let captured = v.borrow();
+                let n = captured.len().min(MAX_TRACE_BINDINGS);
+                detail[..n].copy_from_slice(&captured[..n]);
+                n
+            })
+        } else {
+            0
+        };
+        if OP_TRACE_ACTIVE.load(Ordering::Relaxed) {
+            BOUND_DETAILS.with(|v| v.borrow_mut().clear());
+        }
+        if !self.prof_ops {
+            // Keep the fallback accumulator from growing unbounded: it is fed by every `vkb` bind
+            // above, including the ones this branch is about to ignore.
+            BOUND_BYTES.with(|c| c.set(0));
+            self.next_bytes.set(0);
+            self.next_moe.set(None);
+            return;
+        }
+        let label = self.next_label.take().unwrap_or(label);
+        let moe = self.next_moe.take();
+        // Explicit hint wins; otherwise take whatever the bound-buffer fallback saw. Either way the
+        // accumulator is cleared so it can never bleed into the NEXT dispatch.
+        let bytes = match self.next_bytes.take() {
+            0 => BOUND_BYTES.with(|c| c.replace(0)),
+            explicit => {
+                BOUND_BYTES.with(|c| c.set(0));
+                explicit
+            }
+        };
+        let trace = self.op_trace.then(|| OpTraceEntry {
+            seq: NEXT_OP_TRACE_SEQ.fetch_add(1, Ordering::Relaxed),
+            label,
+            bytes,
+            context: infr_core::timeline::current_context(),
+            geometry,
+            bindings,
+            n_out,
+            pipeline: k.as_ref().map_or(0, |k| k.pipeline.as_raw()),
+            pipeline_layout: k.as_ref().map_or(0, |k| k.pipeline_layout.as_raw()),
+            spv_hash: k.as_ref().map_or(0, |k| k.spv_hash),
+            push_size: k.as_ref().map_or(0, |k| k.push_size),
+            n_buf: k.as_ref().map_or(0, |k| k.n_buf as u32),
+            moe,
+            detail,
+            n_detail: n_detail as u32,
+        });
+        let idx = self.ts_slots.get();
+        if self.op_trace_split {
+            // Reserve (before, after) plus the closing slot. The actual stamps are written by
+            // `stamp_split_begin`/`stamp_split_end` at the command site, after this op's barrier.
+            if idx + 3 > self.query_slots() {
+                self.ts_dropped.set(self.ts_dropped.get() + 1);
+                return;
+            }
+            self.ts_slots.set(idx + 2);
+            self.split_pending.set(true);
+        } else {
+            if idx >= Self::MAX_TS - 1 {
+                self.ts_dropped.set(self.ts_dropped.get() + 1);
+                return;
+            }
+            self.write_ts(idx);
+            self.ts_slots.set(idx + 1);
+        }
         self.ts_labels.borrow_mut().push(label);
+        self.ts_bytes.borrow_mut().push(bytes);
+        if let Some(trace) = trace {
+            self.op_trace_entries.borrow_mut().push(trace);
+        }
     }
 
     /// Emit a global compute/transfer barrier only if `reads`/`writes` collide with work recorded
@@ -1597,7 +2512,15 @@ impl<'a> Recorder<'a> {
         // — the chokepoint knows the kernel, so no op method needs a manual stamp call. Placed
         // before `sync` so a barrier's cost lands in the op it fences (same as the old
         // stamp-at-op-start convention). One `prof_ops` branch when profiling is off.
-        self.stamp(k.name);
+        self.stamp_kernel(
+            k,
+            DispatchGeometry::Indirect {
+                args: args.as_raw(),
+                args_off,
+            },
+            buffers.len() as u32,
+            n_out as u32,
+        );
         let n = buffers.len();
         debug_assert!(
             n <= MAX_DISPATCH_BINDINGS,
@@ -1632,8 +2555,12 @@ impl<'a> Recorder<'a> {
                     push,
                 );
             }
+        }
+        self.stamp_split_begin();
+        unsafe {
             device.cmd_dispatch_indirect(self.cmd, args, args_off);
         }
+        self.stamp_split_end();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1649,7 +2576,12 @@ impl<'a> Recorder<'a> {
     ) {
         let _timeline_encode = infr_core::timeline::span("command_encode");
         // Auto-label (INFR_PROF_OPS): see `dispatch_indirect` — kernel-name timestamp per dispatch.
-        self.stamp(k.name);
+        self.stamp_kernel(
+            k,
+            DispatchGeometry::Direct { gx, gy, gz },
+            buffers.len() as u32,
+            n_out as u32,
+        );
         // The last `n_out` bound buffers are outputs; the rest are inputs. Inputs keep in-place
         // buffers (e.g. rope x==y) so a RAW from a prior op is still seen. Handles are copied into
         // one stack array (no per-dispatch `Vec`); reads/writes are then just subslices of it.
@@ -1675,8 +2607,12 @@ impl<'a> Recorder<'a> {
                     push,
                 );
             }
+        }
+        self.stamp_split_begin();
+        unsafe {
             device.cmd_dispatch(self.cmd, gx, gy, gz);
         }
+        self.stamp_split_end();
     }
 
     /// `&dyn Buffer` → `vk::DescriptorBufferInfo` — the SOLE choke point every dispatch call site in
@@ -1716,16 +2652,58 @@ impl<'a> Recorder<'a> {
     }
 
     fn vkb(b: &dyn Buffer) -> vk::DescriptorBufferInfo {
+        let (vb, info, bytes) = Self::vkb_raw(b);
+        Self::record_binding(vb, info, bytes);
+        info
+    }
+
+    /// Account one bind: fold its bytes into the [`BOUND_BYTES`] fallback and, when the op trace is
+    /// live, push its residency snapshot into [`BOUND_DETAILS`] (drained by `stamp`). The single
+    /// place a descriptor's buffer meets its `VkBuffer`, so the only one that can see both.
+    fn record_binding(vb: &VkBuffer, info: vk::DescriptorBufferInfo, bytes: u64) {
+        BOUND_BYTES.with(|c| c.set(c.get().saturating_add(bytes)));
+        if !OP_TRACE_ACTIVE.load(Ordering::Relaxed) {
+            return;
+        }
+        let (mem_type, mem_flags) = vb.mem_info();
+        BOUND_DETAILS.with(|v| {
+            let mut v = v.borrow_mut();
+            if v.len() < MAX_TRACE_BINDINGS {
+                v.push(BindingTrace {
+                    buffer: info.buffer.as_raw(),
+                    offset: info.offset,
+                    range: info.range,
+                    size: vb.size as u64,
+                    mem_size: vb.mem_size,
+                    sub_offset: vb.sub_offset as u64,
+                    device_addr: Buffer::device_addr(vb).unwrap_or(0),
+                    act_bytes: vb.act_bytes,
+                    mem_type,
+                    mem_flags,
+                    backing: backing_tag(&vb.backing),
+                });
+            }
+        });
+    }
+
+    /// Body of [`Self::vkb`], also returning the buffer's logical byte size so the caller can
+    /// account it as profiled traffic (see [`BOUND_BYTES`]).
+    fn vkb_raw(b: &dyn Buffer) -> (&VkBuffer, vk::DescriptorBufferInfo, u64) {
         let vb = Self::vk_of(b);
+        let bytes = vb.size as u64;
         let backing_len = match &vb.backing {
             Backing::BdaSub(block) => block.buf.size,
             Backing::UnifiedSub(handle) => handle.shard_bytes(),
             _ => {
-                return vk::DescriptorBufferInfo {
-                    buffer: vb.buffer,
-                    offset: 0,
-                    range: vk::WHOLE_SIZE,
-                };
+                return (
+                    vb,
+                    vk::DescriptorBufferInfo {
+                        buffer: vb.buffer,
+                        offset: 0,
+                        range: vk::WHOLE_SIZE,
+                    },
+                    bytes,
+                );
             }
         };
         let block_len = backing_len as u64;
@@ -1744,11 +2722,15 @@ impl<'a> Recorder<'a> {
              maxStorageBufferRange ({range_cap}) — this tensor must be read through its 64-bit \
              device_addr() via a -DSTREAMED twin, never bound as a descriptor"
         );
-        vk::DescriptorBufferInfo {
-            buffer: vb.buffer,
-            offset: vb.sub_offset as u64,
-            range,
-        }
+        (
+            vb,
+            vk::DescriptorBufferInfo {
+                buffer: vb.buffer,
+                offset: vb.sub_offset as u64,
+                range,
+            },
+            bytes,
+        )
     }
 
     /// [`Self::vkb`] with a leading f32-element offset, for binding one OUTPUT-row sub-range of an
@@ -1781,11 +2763,14 @@ impl<'a> Recorder<'a> {
             "descriptor row offset ({byte_off}) exceeds logical buffer size ({})",
             vb.size
         );
-        let mut info = Self::vkb(b);
+        let (vb, mut info, bytes) = Self::vkb_raw(b);
         info.offset += byte_off as u64;
         if info.range != vk::WHOLE_SIZE {
             info.range -= byte_off as u64;
         }
+        // `vkb_raw` reports the whole logical buffer; this bind starts `byte_off` in, so account
+        // only the tail the kernel can actually reach through it.
+        Self::record_binding(vb, info, bytes.saturating_sub(byte_off as u64));
         info
     }
 
@@ -3347,6 +4332,7 @@ impl<'a> Recorder<'a> {
             .expect("matmul_mmq_at: dtype gated by native_gemm_mmq_dense_spv");
         let needs_sact = infr_core::tensor::moe_mmq_needs_sact(dtype);
         self.label_gemm(name, m, k, n);
+        self.label_bytes(dense_gemm_bytes(dtype, m, k, n));
         let nb = if needs_sact { 5 } else { 4 };
         let kern = self.be.kernel(name, spv, nb, 24);
         let mut push = [0u8; 24];
@@ -3384,6 +4370,7 @@ impl<'a> Recorder<'a> {
         let (name, spv) = crate::gemm::native_gemm_fma_spv(dtype)
             .expect("matmul_fma_at: dtype gated by native_gemm_fma_spv");
         self.label_gemm(name, m, k, n);
+        self.label_bytes(dense_gemm_bytes(dtype, m, k, n));
         let kern = self.be.kernel(name, spv, 3, 24);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
@@ -3482,6 +4469,35 @@ impl<'a> Recorder<'a> {
                     return;
                 }
             }
+        }
+        // A prefill chunk on a plain (non-add) streamed Linear: batch it. The rows loop below
+        // re-reads the weight once per input row — fine for a decode GEMV, ruinous for a chunk.
+        // Measured on gfx1100/RADV: the MoE router logits GEMM (rows=1024, 2560x512 bf16) took
+        // 33% of prefill GPU time, 12.63 ms per dispatch, because the 2.6 MB weight was
+        // re-streamed 1024x per layer. `rows % 64 == 0` makes the fma warptile's `ceil(m/64)*64`
+        // output exactly `rows`, so the padded-dst dance isn't needed here (a partial tail chunk
+        // keeps the GEMV). Everything else — no fma build, odd shape, breaching weight — keeps
+        // the per-row GEMV exactly as before.
+        if rows > 16
+            && rows % 64 == 0
+            && in_f % 32 == 0
+            && out_f.is_multiple_of(64)
+            && std::env::var_os("INFR_NO_FMA").is_none()
+            && crate::gemm::native_gemm_fma_spv(dtype).is_some()
+            && !bda_weight_breaches(dtype, in_f, out_f, &self.be.cfg().kernels.vulkan)
+        {
+            self.matmul_fma_at(dtype, x, arena_addr, w_base, y, rows, in_f, out_f);
+            return;
+        }
+        // Prefill widths the 64-wide fma tile cannot take (out_f % 64 != 0: MoE router gates,
+        // small projections) plus every prefill tail chunk (rows % 64 != 0, so the padded-dst
+        // rule above excludes it). The multi-row GEMV decodes each weight sub-block once per
+        // 8-row block instead of once per row — 8x less weight traffic at prefill heights, on the
+        // same kernel the spec-decode verify path already ships. `None` = this format has no
+        // dequant mrow build, and rows <= 16 keeps the plain GEMV.
+        if rows > 16 && crate::gemm::native_mrow_spv(dtype, rows).is_some() {
+            self.linear_native_mrow_at(dtype, arena_addr, w_base, x, y, rows, in_f, out_f);
+            return;
         }
         self.linear_native_at(dtype, arena_addr, w_base, x, y, rows, in_f, out_f);
     }
@@ -3606,7 +4622,11 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        debug_assert!((2..=8).contains(&rows));
+        // `rows > 8` is the prefill-height case: the shader splits the grid into one workgroup per
+        // (8-row block, output), so each weight sub-block is decoded once per 8 rows instead of
+        // once per row. `rows <= 8` yields a single block — byte-identical grid to before, which
+        // is what the decode/verify callers rely on.
+        debug_assert!(rows >= 2);
         assert_native_k("linear_native_mrow_at", in_f);
         self.label_gemv("mrow_streamed", rows, in_f, out_f);
         let (name, spv) =
@@ -3624,7 +4644,7 @@ impl<'a> Recorder<'a> {
             &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
             1,
             &push,
-            out_f as u32,
+            (out_f * rows.div_ceil(8)) as u32,
         );
     }
 
@@ -4705,9 +5725,10 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Qwen3.8 decode HC fast path. The Q8_0 down projection, its scaled SiLU, and the four-row
-    /// F32 inject projection share the input and one dispatch. Both weights remain independently
-    /// addressable, so this adds no packed copy or persistent allocation.
+    /// Qwen3.8 decode HC fast path. The Q8_0 down projection, its scaled SiLU, and the independent
+    /// F32/Q8_0 inject projection share the input and one dispatch for one or more rows. Both
+    /// weights remain independently addressable, so this adds no packed copy or persistent
+    /// allocation.
     #[allow(clippy::too_many_arguments)]
     pub fn qwen_hc_down_inject(
         &self,
@@ -4719,6 +5740,7 @@ impl<'a> Recorder<'a> {
         in_f: u32,
         low_rank: u32,
         hc: u32,
+        rows: u32,
         silu_scale: f32,
     ) {
         self.qwen_hc_down_inject_quantized(
@@ -4730,6 +5752,7 @@ impl<'a> Recorder<'a> {
             in_f,
             low_rank,
             hc,
+            rows,
             silu_scale,
             infr_core::DType::F32,
         );
@@ -4746,6 +5769,7 @@ impl<'a> Recorder<'a> {
         in_f: u32,
         low_rank: u32,
         hc: u32,
+        rows: u32,
         silu_scale: f32,
         inject_dtype: infr_core::DType,
     ) {
@@ -4781,6 +5805,7 @@ impl<'a> Recorder<'a> {
             in_f,
             low_rank,
             hc,
+            rows,
             silu_scale,
         );
     }
@@ -4797,6 +5822,7 @@ impl<'a> Recorder<'a> {
         in_f: u32,
         low_rank: u32,
         hc: u32,
+        rows: u32,
         silu_scale: f32,
     ) {
         self.qwen_hc_down_inject_kernel(
@@ -4810,6 +5836,7 @@ impl<'a> Recorder<'a> {
             in_f,
             low_rank,
             hc,
+            rows,
             silu_scale,
         );
     }
@@ -4827,6 +5854,7 @@ impl<'a> Recorder<'a> {
         in_f: u32,
         low_rank: u32,
         hc: u32,
+        rows: u32,
         silu_scale: f32,
     ) {
         let down_addr = down_weight
@@ -4845,12 +5873,14 @@ impl<'a> Recorder<'a> {
         push[20..24].copy_from_slice(&((down_addr >> 32) as u32).to_ne_bytes());
         push[24..28].copy_from_slice(&(inject_addr as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&((inject_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch_wide(
+        self.dispatch3(
             kernel,
             &[Self::vkb(x), Self::vkb(low_dst), Self::vkb(inject_dst)],
             2,
             &push,
             low_rank + hc,
+            rows,
+            1,
         );
     }
 
@@ -9003,7 +10033,15 @@ impl<'a> Recorder<'a> {
     ) {
         // Transfer chokepoint: previously un-stamped, so copy time silently landed in the
         // preceding label's bucket. Distinct from the `copy_strided` compute kernel.
-        self.stamp("copy_buffer");
+        self.stamp(
+            "copy_buffer",
+            DispatchGeometry::Copy {
+                bytes: bytes as u64,
+                regions: 1,
+            },
+            0,
+            0,
+        );
         let device = &self.be.shared.device;
         // `cmd_copy_buffer` takes raw handles + explicit byte offsets, not a descriptor — go
         // through `vk_handle`, not `vkb` (whose sub-range `DescriptorBufferInfo` doesn't apply
@@ -9016,6 +10054,7 @@ impl<'a> Recorder<'a> {
         let dst_sub = Self::vk_of(dst).sub_offset;
         self.sync(&[src_h], &[dst_h], true);
         self.dirty_transfer.set(true);
+        self.stamp_split_begin();
         unsafe {
             device.cmd_copy_buffer(
                 self.cmd,
@@ -9028,6 +10067,7 @@ impl<'a> Recorder<'a> {
                 }],
             );
         }
+        self.stamp_split_end();
     }
 
     /// Record several disjoint ranges between one pair of buffers as one Vulkan copy command.
@@ -9042,7 +10082,16 @@ impl<'a> Recorder<'a> {
         if regions.is_empty() {
             return;
         }
-        self.stamp("copy_buffer");
+        let copy_bytes = regions.iter().map(|region| region.size).sum();
+        self.stamp(
+            "copy_buffer",
+            DispatchGeometry::Copy {
+                bytes: copy_bytes,
+                regions: regions.len() as u32,
+            },
+            0,
+            0,
+        );
         let src_h = Self::vk_handle(src);
         let dst_h = Self::vk_handle(dst);
         let src_sub = Self::vk_of(src).sub_offset as u64;
@@ -9063,12 +10112,14 @@ impl<'a> Recorder<'a> {
         };
         self.sync(&[src_h], &[dst_h], true);
         self.dirty_transfer.set(true);
+        self.stamp_split_begin();
         unsafe {
             self.be
                 .shared
                 .device
                 .cmd_copy_buffer(self.cmd, src_h, dst_h, regions);
         }
+        self.stamp_split_end();
     }
 
     /// Retain a temporary buffer used by recorded commands until their GPU execution completes.
@@ -9656,6 +10707,18 @@ impl<'a> Recorder<'a> {
         segment_shifts: Option<(u32, u32)>,
         mrope: Option<(&dyn Buffer, [u32; 4])>,
     ) {
+        {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static GEOM: AtomicU32 = AtomicU32::new(0);
+            if GEOM.fetch_add(1, Ordering::Relaxed) < 6 {
+                eprintln!(
+                    "[qsa-geom] indexer rows={rows} kv_len={kv_len} top_blocks={top_blocks} \
+                     ratio={ratio} candidates={} topk_work={}",
+                    kv_len / ratio.max(1),
+                    topk_work.is_some()
+                );
+            }
+        }
         self.qsa_indexer_off(
             q,
             k_cache,
@@ -9877,6 +10940,14 @@ impl<'a> Recorder<'a> {
         if let Some((_, block_shift)) = segment_shifts {
             push[24..28].copy_from_slice(&block_shift.to_ne_bytes());
         }
+        // The tile8 variants (block_tile >= 32) load the block-key tile once and then walk
+        // several row tiles internally, so cap the y grid to keep that reuse without
+        // starving the device of workgroups.
+        let score_y_tiles = if block_tile >= 32 {
+            rows.div_ceil(query_tile).min(16)
+        } else {
+            rows.div_ceil(query_tile)
+        };
         self.dispatch3(
             score_k,
             &[
@@ -9887,7 +10958,7 @@ impl<'a> Recorder<'a> {
             1,
             &push[..score_push_bytes as usize],
             blocks.div_ceil(block_tile),
-            rows.div_ceil(query_tile),
+            score_y_tiles,
             1,
         );
 
@@ -9904,7 +10975,7 @@ impl<'a> Recorder<'a> {
             self.be.use_qsa_topk_scan(
                 rows as usize,
                 top_blocks as usize,
-                topk_work.is_some() && self.vk().qsa_topk_parallel,
+                self.vk().qsa_topk_parallel,
             ),
         );
     }
@@ -10050,6 +11121,7 @@ impl<'a> Recorder<'a> {
         kcap: u32,
         vcap: u32,
         segment_shift: Option<u32>,
+        union: Option<QsaUnionScratch<'_>>,
     ) {
         self.qsa_attention_batch_off(
             q,
@@ -10073,6 +11145,7 @@ impl<'a> Recorder<'a> {
             0,
             0,
             0,
+            union,
         );
     }
 
@@ -10101,7 +11174,20 @@ impl<'a> Recorder<'a> {
         q_byte_off: usize,
         indices_byte_off: usize,
         dst_byte_off: usize,
+        union: Option<QsaUnionScratch<'_>>,
     ) {
+        {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static GEOM: AtomicU32 = AtomicU32::new(0);
+            if GEOM.fetch_add(1, Ordering::Relaxed) < 6 {
+                let group = n_head / n_kv.max(1);
+                eprintln!(
+                    "[qsa-geom] attn rows={rows} kv_len={kv_len} n_head={n_head} n_kv={n_kv} \
+                     hd={head_dim} top_blocks={top_blocks} ratio={ratio} group={group} grid={}",
+                    rows.saturating_mul(group.max(1))
+                );
+            }
+        }
         let segmented = segment_shift.is_some();
         let requested_gqa = self.vk().qsa_prefill_gqa;
         let grouped = if k_q8 && v_q8 && segmented {
@@ -10120,6 +11206,38 @@ impl<'a> Recorder<'a> {
             && self.be.caps().f16_coopmat()
             && n_head >= 16;
         let coop_pv = coop_qk && self.vk().qsa_prefill_coopmat_pv;
+        // One compact union per chunk: every query row of the chunk then reads the same ~1 MiB hot
+        // plane instead of each re-walking the whole scattered segmented cache. The plan's overflow
+        // flag is read from device memory by the kernel, so an over-scattered chunk degrades to the
+        // raw path instead of failing.
+        let union_ok = union.filter(|_| {
+            self.vk().qsa_union
+                && rows > 1
+                && segmented
+                && k_q8
+                && v_q8
+                && grouped == 12
+                && flash_gqa12
+                && coop_qk
+                && coop_pv
+                && head_dim == 256
+                && n_kv == 2
+                && ratio <= 4
+        });
+        if let Some(u) = union_ok.as_ref() {
+            self.qsa_union_plan(
+                u,
+                k,
+                v,
+                indices,
+                rows,
+                kv_len,
+                top_blocks,
+                ratio,
+                n_kv,
+                segment_shift.unwrap_or(0),
+            );
+        }
         let (name, spv) = match (
             k_q8,
             v_q8,
@@ -10182,8 +11300,17 @@ impl<'a> Recorder<'a> {
                 crate::gemm::qsa_attention_batch_q8_spv(),
             ),
         };
+        let (name, spv, n_buf) = if union_ok.is_some() {
+            (
+                "qsa_attention_batch_q8_seg_gqa12_flash_cm_qk_pv_union",
+                crate::gemm::qsa_attention_batch_q8_seg_gqa12_flash_cm_qk_pv_union_spv(),
+                7,
+            )
+        } else {
+            (name, spv, 5)
+        };
         let push_bytes = if segmented { 44 } else { 40 };
-        let kernel = self.be.kernel_sg(name, spv, 5, push_bytes, 32);
+        let kernel = self.be.kernel_sg(name, spv, n_buf, push_bytes, 32);
         let mut push = [0u8; 44];
         for (i, value) in [
             rows,
@@ -10205,18 +11332,131 @@ impl<'a> Recorder<'a> {
         if let Some(shift) = segment_shift {
             push[40..44].copy_from_slice(&shift.to_ne_bytes());
         }
+        // Binding order = binding numbers, and `dst` must stay LAST (n_out = 1).
+        let mut buffers = vec![
+            Self::vkb_byte_off(q, q_byte_off),
+            Self::vkb(k),
+            Self::vkb(v),
+            Self::vkb_byte_off(indices, indices_byte_off),
+        ];
+        if let Some(u) = union_ok.as_ref() {
+            buffers.push(Self::vkb(u.kv));
+            buffers.push(Self::vkb(u.bits));
+        }
+        buffers.push(Self::vkb_byte_off(dst, dst_byte_off));
         self.dispatch_wide(
             kernel,
-            &[
-                Self::vkb_byte_off(q, q_byte_off),
-                Self::vkb(k),
-                Self::vkb(v),
-                Self::vkb_byte_off(indices, indices_byte_off),
-                Self::vkb_byte_off(dst, dst_byte_off),
-            ],
+            &buffers,
             1,
             &push[..push_bytes as usize],
             rows.saturating_mul(n_head / grouped),
+        );
+    }
+
+    /// QSA prefill union plan: bitmap -> rank table -> in-place index rewrite -> compact K/V copy.
+    ///
+    /// Five small dispatches per (layer, chunk) buy the attention op below a contiguous hot K/V
+    /// plane. The bitmap holds one bit per candidate block, the rank pass turns it into ascending
+    /// positions (so the copy walks the segmented cache in block order, i.e. streaming), and the
+    /// rewrite swaps each row's block ids for that block's first KEY index inside the plane — in
+    /// place, which keeps attention's own loop bounds, key order and softmax order untouched.
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_union_plan(
+        &self,
+        u: &QsaUnionScratch<'_>,
+        k: &dyn Buffer,
+        v: &dyn Buffer,
+        indices: &dyn Buffer,
+        rows: u32,
+        kv_len: u32,
+        top_blocks: u32,
+        ratio: u32,
+        n_kv: u32,
+        segment_shift: u32,
+    ) {
+        let ratio = ratio.max(1);
+        let blocks = (kv_len / ratio).max(1);
+        let words = blocks.div_ceil(32);
+        let mut plan = [0u8; 24];
+        for (i, value) in [rows, kv_len, top_blocks, ratio, words, 0u32]
+            .into_iter()
+            .enumerate()
+        {
+            plan[i * 4..i * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        let bits_k = self
+            .be
+            .kernel("qsa_union_bits", crate::gemm::qsa_union_bits_spv(), 2, 24);
+        self.dispatch(
+            bits_k,
+            &[Self::vkb(indices), Self::vkb(u.bits)],
+            1,
+            &plan,
+            (words + 2).div_ceil(256),
+        );
+        plan[20..24].copy_from_slice(&1u32.to_ne_bytes());
+        self.dispatch(
+            bits_k,
+            &[Self::vkb(indices), Self::vkb(u.bits)],
+            1,
+            &plan,
+            rows,
+        );
+
+        let rank_k = self
+            .be
+            .kernel("qsa_union_rank", crate::gemm::qsa_union_rank_spv(), 2, 12);
+        let mut rank_push = [0u8; 12];
+        for (i, value) in [words, blocks, QSA_UNION_CAP_BLOCKS].into_iter().enumerate() {
+            rank_push[i * 4..i * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        // Writes both the rank table and the header words it just read: two outputs.
+        self.dispatch(rank_k, &[Self::vkb(u.bits), Self::vkb(u.rank)], 2, &rank_push, 1);
+
+        let apply_k = self
+            .be
+            .kernel("qsa_union_apply", crate::gemm::qsa_union_apply_spv(), 3, 20);
+        let mut apply_push = [0u8; 20];
+        for (i, value) in [rows, kv_len, top_blocks, ratio, blocks]
+            .into_iter()
+            .enumerate()
+        {
+            apply_push[i * 4..i * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        self.dispatch(
+            apply_k,
+            &[Self::vkb(u.bits), Self::vkb(u.rank), Self::vkb(indices)],
+            1,
+            &apply_push,
+            rows,
+        );
+
+        let gather_k = self
+            .be
+            .kernel("qsa_union_gather", crate::gemm::qsa_union_gather_spv(), 5, 28);
+        let mut gather_push = [0u8; 28];
+        for (i, value) in [rows, kv_len, top_blocks, ratio, n_kv, blocks, segment_shift]
+            .into_iter()
+            .enumerate()
+        {
+            gather_push[i * 4..i * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        // The list lives after the rank table in the same buffer; the grid is the capacity and the
+        // shader early-outs past the planned count.
+        self.dispatch3(
+            gather_k,
+            &[
+                Self::vkb(u.bits),
+                Self::vkb_byte_off(u.rank, blocks as usize * 4),
+                Self::vkb(k),
+                Self::vkb(v),
+                Self::vkb(u.kv),
+            ],
+            1,
+            &gather_push,
+            QSA_UNION_CAP_BLOCKS,
+            n_kv.max(1),
+            1,
         );
     }
 
@@ -11758,7 +12998,14 @@ impl<'a> Recorder<'a> {
     /// Zero a buffer's first `n` 4-byte elements (cmd_fill_buffer) — clears the bucket counters.
     pub fn zero(&self, buf: &dyn Buffer, n: usize) {
         // Transfer chokepoint (see `copy`): previously an un-stamped blind spot.
-        self.stamp("zero_fill");
+        self.stamp(
+            "zero_fill",
+            DispatchGeometry::Fill {
+                bytes: (n * 4) as u64,
+            },
+            0,
+            0,
+        );
         // `cmd_fill_buffer` takes a raw handle + explicit byte offset, not a descriptor — go
         // through `vk_handle`, not `vkb`. The fill starts at the buffer's `sub_offset` (0 for every
         // ordinary buffer): a resident-BDA sub-tensor shares its arena block's handle, and a fill
@@ -11767,12 +13014,14 @@ impl<'a> Recorder<'a> {
         let buf_h = Self::vk_handle(buf);
         let sub = Self::vk_of(buf).sub_offset;
         self.sync(&[], &[buf_h], true);
+        self.stamp_split_begin();
         unsafe {
             self.be
                 .shared
                 .device
                 .cmd_fill_buffer(self.cmd, buf_h, sub as u64, (n * 4) as u64, 0);
         }
+        self.stamp_split_end();
     }
 
     /// MoE bucketing pass 1 (count): tally assignments per expert into `counts` (pre-zeroed).
@@ -11894,6 +13143,54 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Lazily allocate (once per recorder) the 16-byte indirect dispatch-args buffer the batched
+    /// MoE expert GEMMs read: `[gx, gy, gz, pad]`, written on-GPU by [`Self::moe_grid_args`].
+    /// Reused across every MoE stage recorded here — the recorder's hazard tracking serializes
+    /// each prologue's write against the previous GEMM's indirect-command read. `retain_buffer`
+    /// keeps it alive for a `PendingSegment` submit, and the field's own `Arc` keeps it valid if
+    /// this recorder is reused for a later segment.
+    fn moe_args_slot(&self) -> std::sync::Arc<dyn Buffer> {
+        let mut slot = self.moe_args.borrow_mut();
+        let arc = slot
+            .get_or_insert_with(|| {
+                let buf = self
+                    .be
+                    .alloc_uninit(16, BufferUsage::Activations)
+                    .expect("MoE indirect dispatch args: 16-byte scratch alloc");
+                std::sync::Arc::from(buf)
+            })
+            .clone();
+        self.retain_buffer(arc.clone());
+        arc
+    }
+
+    /// Batched-MoE expert-GEMM dispatch prologue: write the indirect dispatch args (`args[0..3]`)
+    /// from the on-GPU bucket `counts`, so the GEMM launches only the row tiles its segments can
+    /// actually occupy. One workgroup reduces `max_e ceil(counts[e]/BM)` and scales it by the
+    /// per-expert column-tile count (`tiles_n`); `gy` stays `n_expert` (see
+    /// `shaders/moe_grid_args.comp`). Correct for any counts — the grid is always a superset of
+    /// every expert's live tiles, so this can only over-launch, never miss a row.
+    fn moe_grid_args(
+        &self,
+        counts: &dyn Buffer,
+        args: &dyn Buffer,
+        n_expert: usize,
+        bm: usize,
+        tiles_n: usize,
+    ) {
+        let k = self.be.kernel(
+            "moe_grid_args",
+            crate::gemm::moe_grid_args_spv(),
+            2,
+            12,
+        );
+        let mut p = [0u8; 12];
+        p[0..4].copy_from_slice(&(n_expert as u32).to_ne_bytes());
+        p[4..8].copy_from_slice(&(bm as u32).to_ne_bytes());
+        p[8..12].copy_from_slice(&(tiles_n as u32).to_ne_bytes());
+        self.dispatch(k, &[Self::vkb(counts), Self::vkb(args)], 1, &p, 1);
+    }
+
     /// ALL experts' mmq GEMMs in ONE dispatch (`gl_WorkGroupID.y` = expert): activation rows are
     /// packed by expert (bucket layout, segment e = offsets[e]..+counts[e]); the weight bank is
     /// indexed `w_base + e·stride`. Grid x covers the worst-case row tiles (`ceil(rows/BM)` — the
@@ -11961,11 +13258,15 @@ impl<'a> Recorder<'a> {
             .device_addr()
             .expect("resident-BDA weight: matmul_mmq_experts requires a u64 BDA device address");
         self.label_next(stage);
+        self.label_bytes(moe_stage_bytes(dtype, rows, k, n, n_expert, n_used));
         let avg_rows = rows.saturating_mul(n_used) / n_expert.max(1);
         let small_tile = avg_rows <= MOE_EXPERT_SMALL_TILE_AVG_ROWS;
         let wide_bn = n.is_multiple_of(128)
             && (small_tile || k <= MOE_EXPERT_WIDE_BN_MAX_K)
             && matches!(dtype, infr_core::DType::Q4K | infr_core::DType::Q6K);
+        // `moe_force_bm` is a diagnostic-only override of the tile probe; it must move the KERNEL
+        // selection with it, since `_xp`/`_xp32` are separate compiled tiles.
+        let small_tile = moe_force_bm().map_or(small_tile, |bm| bm == 32);
         let bm: usize = if small_tile { 32 } else { 64 };
         let bn: usize = if wide_bn { 128 } else { 64 };
         // Kernel selection from the SINGLE dtype→kernel table shared with the paged twin (see
@@ -12003,6 +13304,42 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
         let gx = (rows.div_ceil(bm) * (n / bn)) as u32;
+        self.label_moe_shape(MoeTraceShape {
+            dtype: moe_dtype_tag(dtype),
+            kernel: name,
+            rows: rows as u32,
+            k: k as u32,
+            n: n as u32,
+            n_expert: n_expert as u32,
+            n_used: n_used as u32,
+            bm: bm as u32,
+            bn: bn as u32,
+            wide_bn,
+            gx,
+            weight: if self.prof_ops {
+                resident_weight_trace(w).unwrap_or(MoeWeightTrace {
+                    kind: "unknown",
+                    addr: arena_addr,
+                    sub_offset: 0,
+                    logical_size: w.len_bytes() as u64,
+                    block_size: 0,
+                    mem_type: -1,
+                    mem_flags: 0,
+                    slot_bytes: 0,
+                })
+            } else {
+                MoeWeightTrace {
+                    kind: "not_profiled",
+                    addr: 0,
+                    sub_offset: 0,
+                    logical_size: 0,
+                    block_size: 0,
+                    mem_type: -1,
+                    mem_flags: 0,
+                    slot_bytes: 0,
+                }
+            },
+        });
         let mut bufs = vec![Self::vkb(qa), Self::vkb(dact)];
         if let Some(sa) = sact {
             bufs.push(Self::vkb(sa));
@@ -12015,7 +13352,44 @@ impl<'a> Recorder<'a> {
             Self::vkb(offsets),
             Self::vkb(c),
         ]);
-        self.dispatch3(kern, &bufs, 1, &push, gx, n_expert as u32, 1);
+        self.moe_dispatch_experts(kern, &bufs, &push, gx, n_expert, counts, bm, n / bn);
+    }
+
+    /// Tail shared by [`Self::matmul_mmq_experts`] and its paged twin: dispatch the expert GEMM
+    /// either directly at the host's worst-case `gx`, or — when [`moe_indirect_enabled`] — after a
+    /// one-workgroup prologue writes the GPU-derived grid into this recorder's args slot. The
+    /// prologue runs OUTSIDE any caller barrier-suppression: the indirect dispatch's own hazard
+    /// barrier has to cover the args write, and leaving it suppressed would let the GEMM read
+    /// unwritten args. Needs only `counts` — the paged twin derives its grid the same way.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_dispatch_experts(
+        &self,
+        kern: ComputeKernel,
+        bufs: &[vk::DescriptorBufferInfo],
+        push: &[u8],
+        gx: u32,
+        n_expert: usize,
+        counts: &dyn Buffer,
+        bm: usize,
+        tiles_n: usize,
+    ) {
+        if !moe_indirect_enabled() {
+            self.dispatch3(kern, bufs, 1, push, gx, n_expert as u32, 1);
+            return;
+        }
+        let args = self.moe_args_slot();
+        let saved = self.suppress.get();
+        self.suppress.set(false);
+        self.moe_grid_args(counts, args.as_ref(), n_expert, bm, tiles_n);
+        self.dispatch_indirect(
+            kern,
+            bufs,
+            1,
+            push,
+            Self::vk_handle(args.as_ref()),
+            0,
+        );
+        self.suppress.set(saved);
     }
 
     /// [`Self::matmul_mmq_experts`]'s paged twin: `arena` is a `GpuPager` arena (uniform slots)
@@ -12058,8 +13432,10 @@ impl<'a> Recorder<'a> {
         n_used: usize,
     ) {
         self.label_next(stage);
+        self.label_bytes(moe_stage_bytes(dtype, rows, k, n, n_expert, n_used));
         let avg_rows = rows.saturating_mul(n_used) / n_expert.max(1);
-        let small_tile = avg_rows <= MOE_EXPERT_SMALL_TILE_AVG_ROWS;
+        let small_tile =
+            moe_force_bm().map_or(avg_rows <= MOE_EXPERT_SMALL_TILE_AVG_ROWS, |bm| bm == 32);
         let bm: usize = if small_tile { 32 } else { 64 };
         // Kernel selection from the SAME dtype→kernel table as the resident twin (see
         // [`moe_mmq_desc`]): paged uses the `_xpg`/`_xpg32` variants and one MORE binding than
@@ -12087,6 +13463,29 @@ impl<'a> Recorder<'a> {
         push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
         push[24..28].copy_from_slice(&slot_bytes.to_ne_bytes());
         let gx = (rows.div_ceil(bm) * (n / 64)) as u32;
+        self.label_moe_shape(MoeTraceShape {
+            dtype: moe_dtype_tag(dtype),
+            kernel: name,
+            rows: rows as u32,
+            k: k as u32,
+            n: n as u32,
+            n_expert: n_expert as u32,
+            n_used: n_used as u32,
+            bm: bm as u32,
+            bn: 64,
+            wide_bn: false,
+            gx,
+            weight: MoeWeightTrace {
+                kind: "paged_arena",
+                addr: arena_addr,
+                sub_offset: 0,
+                logical_size: 0,
+                block_size: 0,
+                mem_type: -1,
+                mem_flags: 0,
+                slot_bytes,
+            },
+        });
         let mut bufs = vec![Self::vkb(qa), Self::vkb(dact)];
         if let Some(sa) = sact {
             bufs.push(Self::vkb(sa));
@@ -12101,7 +13500,9 @@ impl<'a> Recorder<'a> {
             Self::vkb(offsets),
             Self::vkb(c),
         ]);
-        self.dispatch3(kern, &bufs, 1, &push, gx, n_expert as u32, 1);
+        // `tiles_n` is `n / 64` in the paged build: `_xpg`/`_xpg32` are the BN=64 tiles only
+        // (the wide-BN variants have no paged twin), which is exactly what `gx` above assumed.
+        self.moe_dispatch_experts(kern, &bufs, &push, gx, n_expert, counts, bm, n / 64);
     }
 
     /// Batched-MoE epilogue: `dst[t] = Σ_s bucket_wts[p]·y_all[p]` over the token's `n_used`
@@ -12247,6 +13648,12 @@ impl<'a> Recorder<'a> {
     ) {
         assert_native_k("linear_native_id_at", in_f);
         self.label_gemv("gemv_id_streamed", rows, in_f, out_f);
+        // The stacked expert bank is read by 64-bit device address (the `_x` slot is a FILLER), so
+        // the bound-buffer fallback cannot see the weight. One `ids[slot]` slice per dispatch.
+        self.label_bytes(
+            stride_bytes as u64
+                + (rows.saturating_mul(in_f).saturating_add(rows.saturating_mul(out_f))) as u64 * 4,
+        );
         let (name, spv) = crate::gemm::native_id_build_spv(dtype).expect("native id streamed spv");
         let k = self.be.kernel(name, spv, 4, 28);
         let mut push = [0u8; 28];
@@ -12288,6 +13695,14 @@ impl<'a> Recorder<'a> {
         rows: usize,
     ) {
         assert_native_k("linear_native_id_multi_at", in_f);
+        // Weight: at most `n_used` distinct expert slices (repeats hit L2/L1 and cost no extra
+        // DRAM). Activation/output: one row per routed slot.
+        self.label_bytes(
+            (n_used as u64).saturating_mul(stride_bytes as u64)
+                + (rows.saturating_mul(n_used).saturating_mul(in_f)
+                    + rows.saturating_mul(n_used).saturating_mul(out_f)) as u64
+                    * 4,
+        );
         let mut push = [0u8; 32];
         push[0..4].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(out_f as u32).to_ne_bytes());
@@ -12298,16 +13713,53 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
         let bufs = [Self::vkb(x), Self::vkb(x), Self::vkb(ids), Self::vkb(y)];
-        if rows == 1 {
-            if let Some(nr) = native_id_sg_choice(dtype, in_f, out_f, self.gemv()) {
+        if matches!(
+            dtype,
+            infr_core::DType::Iq2S
+                | infr_core::DType::Iq2Xxs
+                | infr_core::DType::Iq2Xs
+                | infr_core::DType::Iq3Xxs
+                | infr_core::DType::Iq3S
+        )
+            && in_f == 2560
+            && out_f == 640
+            && self.gemv().id_stream_grid_buffer
+        {
+            let grid = match dtype {
+                infr_core::DType::Iq2S => self.be.iq2s_grid.as_ref(),
+                infr_core::DType::Iq2Xxs => self.be.iq2xxs_grid.as_ref(),
+                infr_core::DType::Iq2Xs => self.be.iq2xs_grid.as_ref(),
+                infr_core::DType::Iq3Xxs => self.be.iq3xxs_grid.as_ref(),
+                infr_core::DType::Iq3S => self.be.iq3s_grid.as_ref(),
+                _ => None,
+            };
+            if let Some(grid) = grid {
                 if let Some((name, spv)) =
-                    crate::gemm::native_idm_sg_build_spv(dtype, nr, self.sg16())
+                    crate::gemm::native_idm_grid_buffer_streamed_spv(dtype)
                 {
-                    let k = self.be.kernel_sg(name, spv, 4, 32, self.sgp());
-                    let groups = (n_used * out_f.div_ceil(nr as usize)) as u32;
-                    self.dispatch_wide(k, &bufs, 1, &push, groups);
+                    let k = self.be.kernel(name, spv, 4, 32);
+                    let mut grid_bufs = bufs;
+                    grid_bufs[0] = Self::vkb(grid.as_ref());
+                    self.dispatch_wide(
+                        k,
+                        &grid_bufs,
+                        1,
+                        &push,
+                        (rows * n_used * out_f) as u32,
+                    );
                     return;
                 }
+            }
+        }
+        if let Some(nr) = native_id_sg_choice(dtype, in_f, out_f, self.gemv()) {
+            if let Some((name, spv)) =
+                crate::gemm::native_idm_sg_build_spv(dtype, nr, self.sg16())
+            {
+                let k = self.be.kernel_sg(name, spv, 4, 32, self.sgp());
+                let groups =
+                    (rows * n_used * out_f.div_ceil(nr as usize)) as u32;
+                self.dispatch_wide(k, &bufs, 1, &push, groups);
+                return;
             }
         }
         let (name, spv) =
@@ -12342,6 +13794,10 @@ impl<'a> Recorder<'a> {
     ) {
         assert_native_k("linear_native_id_paged", in_f);
         self.label_gemv("gemv_id_paged", rows, in_f, out_f);
+        self.label_bytes(
+            slot_bytes as u64
+                + (rows.saturating_mul(in_f).saturating_add(rows.saturating_mul(out_f))) as u64 * 4,
+        );
         let name =
             crate::linear::native_id_paged_kernel_name(dtype).expect("native id paged kernel");
         let spv = crate::gemm::native_id_paged_build_spv(dtype).expect("native id paged spv");
@@ -12403,6 +13859,12 @@ impl<'a> Recorder<'a> {
         row_mask_bank: u32,
     ) {
         assert_native_k("linear_native_id_multi_paged", in_f);
+        self.label_bytes(
+            (n_used as u64).saturating_mul(slot_bytes as u64)
+                + (rows.saturating_mul(n_used).saturating_mul(in_f)
+                    + rows.saturating_mul(n_used).saturating_mul(out_f)) as u64
+                    * 4,
+        );
         let mut push = [0u8; 44];
         push[0..4].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(out_f as u32).to_ne_bytes());
@@ -12504,6 +13966,16 @@ impl<'a> Recorder<'a> {
         row_mask_bank: u32,
     ) {
         assert_native_k("linear_native_id_multi_paged_shared", in_f);
+        self.label_bytes(
+            (routed_used as u64).saturating_mul(slot_bytes as u64)
+                + dtype_bytes(
+                    infr_core::DType::Q8_0,
+                    in_f.saturating_mul(out_f),
+                )
+                + (rows.saturating_mul(routed_used + 1).saturating_mul(in_f)
+                    + rows.saturating_mul(routed_used + 1).saturating_mul(out_f)) as u64
+                    * 4,
+        );
         let shared_addr = shared
             .device_addr()
             .expect("shared-expert weight must expose a resident BDA device address");
@@ -13112,6 +14584,13 @@ impl<'a> Recorder<'a> {
         }
     }
 
+    fn write_final_op_timestamp(&self) {
+        if !self.prof_ops {
+            return;
+        }
+        self.write_ts(self.ts_slots.get());
+    }
+
     fn resolve_submit_timing(&self, dispatches: usize) {
         let pool = self.submit_query_pool.replace(vk::QueryPool::null());
         let token = self.submit_timing_token.take();
@@ -13172,17 +14651,7 @@ impl<'a> Recorder<'a> {
             eprintln!("[prof] barriers emitted = {}", self.barriers.borrow());
         }
         // Final timestamp so the last op has an interval to close.
-        if self.prof_ops {
-            let idx = self.ts_labels.borrow().len() as u32;
-            unsafe {
-                device.cmd_write_timestamp(
-                    self.cmd,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    self.query_pool,
-                    idx,
-                );
-            }
-        }
+        self.write_final_op_timestamp();
         self.close_submit_timing();
         // Each fallible step frees the transient objects before propagating — see `free_transient`.
         if let Err(e) = unsafe { device.end_command_buffer(self.cmd) } {
@@ -13262,16 +14731,16 @@ impl<'a> Recorder<'a> {
     /// [`PendingSegment`] whose [`PendingSegment::wait`] blocks on a fence and releases the
     /// command buffer / descriptor pools. The paged-MoE executor uses this to keep staging the
     /// next segment's expert uploads on the CPU while the GPU chews the one just submitted
-    /// (`adapter::execute_paged_moe`'s ring rotation). Profiling recorders (INFR_PROF /
-    /// INFR_PROF_OPS) degrade to the blocking [`Self::finish`] — their reports need completed
-    /// timestamps — and hand back an already-drained segment, so callers need no special case.
+    /// (`adapter::execute_paged_moe`'s ring rotation). INFR_PROF_OPS moves its timestamp query
+    /// into the returned segment, so profiling stays asynchronous; INFR_PROF_STAGES still degrades
+    /// to the blocking [`Self::finish`] because its stage diagnostics are deliberately synchronous.
     ///
     /// The NEXT recorder on this queue must open with [`Self::seed_barrier`]: hazard tracking is
     /// per-recorder, so cross-submission RAW/WAR ordering (scratch reuse, arena-slot rewrites vs
     /// a prior segment's reads) is otherwise invisible to it.
     pub fn finish_nowait(self) -> Result<PendingSegment> {
         let dispatches = self.dispatches.get();
-        if self.stages || self.prof_ops {
+        if self.stages {
             let shared = std::sync::Arc::clone(&self.be.shared);
             self.finish()?;
             return Ok(PendingSegment {
@@ -13285,12 +14754,15 @@ impl<'a> Recorder<'a> {
                 submit_pager_profile: false,
                 dispatches,
                 timeline_query: None,
+                op_timestamps: None,
             });
         }
         if pager_profile::active() {
             pager_profile::record_command_recording(dispatches, self.t0.elapsed());
         }
         let device = &self.be.shared.device;
+        // Final timestamp so the last op has an interval to close, exactly as in blocking finish.
+        self.write_final_op_timestamp();
         // On SUCCESS the cmd buffer + pools are handed to the returned `PendingSegment` (freed in
         // its `wait`); on every ERROR exit we still own them and free them immediately. `Drop`
         // remains the backstop for any future early-return path.
@@ -13339,6 +14811,16 @@ impl<'a> Recorder<'a> {
         let submit_query_pool = self.submit_query_pool.replace(vk::QueryPool::null());
         let submit_timing_token = self.submit_timing_token.take();
         let submit_pager_profile = self.submit_pager_profile.replace(false);
+        let op_timestamps = self.prof_ops.then(|| OpTimestampLedger {
+            query_pool: self.query_pool,
+            labels: std::mem::take(&mut *self.ts_labels.borrow_mut()),
+            bytes: std::mem::take(&mut *self.ts_bytes.borrow_mut()),
+            entries: std::mem::take(&mut *self.op_trace_entries.borrow_mut()),
+            segment: self.op_trace_segment,
+            dropped: self.ts_dropped.replace(0),
+            split: self.op_trace_split,
+            context_prefix: profile_context_prefix(),
+        });
         self.owns_transient.set(false);
         Ok(PendingSegment {
             shared,
@@ -13351,6 +14833,7 @@ impl<'a> Recorder<'a> {
             submit_pager_profile,
             dispatches,
             timeline_query: self.timeline_query.borrow_mut().take(),
+            op_timestamps,
         })
     }
 
@@ -13433,49 +14916,21 @@ impl<'a> Recorder<'a> {
     /// printed once at exit — and merged with the host-side function table when the binary was
     /// ALSO built with `INFR_PROFILE=1`.
     fn report_timestamps(&self) {
+        let prefix = profile_context_prefix();
         let labels = self.ts_labels.borrow();
-        let n = labels.len();
-        if n == 0 {
-            return;
-        }
-        if self.ts_dropped.get() > 0 {
-            eprintln!(
-                "[prof_ops] WARNING: {} dispatches past the {}-timestamp query pool went unstamped",
-                self.ts_dropped.get(),
-                Self::MAX_TS,
-            );
-        }
-        let mut ticks = vec![0u64; n + 1];
-        unsafe {
-            self.be
-                .shared
-                .device
-                .get_query_pool_results(
-                    self.query_pool,
-                    0,
-                    &mut ticks,
-                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
-                )
-                .expect("get_query_pool_results");
-        }
-        let period = unsafe {
-            self.be
-                .shared
-                .instance
-                .get_physical_device_properties(self.be.shared.physical_device)
-        }
-        .limits
-        .timestamp_period; // ns per tick
-                           // Accounted, aggregated and printed by the shared reporter (`infr_core::prof::OpProf`),
-                           // which is where the `gpu_add` fold into the process-wide exit table now happens too — the
-                           // same code path metal and the cpu backend report through, so the three tables are
-                           // column-for-column comparable.
-        let mut p = infr_core::prof::OpProf::new("vulkan", infr_core::prof::Unit::Device);
-        for i in 0..n {
-            let us = (ticks[i + 1].wrapping_sub(ticks[i]) as f64) * period as f64 / 1000.0;
-            p.add(labels[i], us);
-        }
-        p.flush();
+        let bytes = self.ts_bytes.borrow();
+        let entries = self.op_trace_entries.borrow();
+        report_op_timestamps(
+            &self.be.shared,
+            self.query_pool,
+            &labels,
+            &bytes,
+            &entries,
+            self.op_trace_segment,
+            self.ts_dropped.get(),
+            self.op_trace_split,
+            prefix.as_deref(),
+        );
     }
 }
 
@@ -13656,7 +15111,7 @@ impl Drop for RecordedCmd {
 /// (best-effort) so an error path can never free a command buffer the GPU still owns.
 pub struct PendingSegment {
     shared: std::sync::Arc<crate::VulkanShared>,
-    /// `None` = already drained (the profiling degrade path in `finish_nowait`, or after `wait`).
+    /// `None` = already drained (the synchronous stage-profile path, or after `wait`).
     fence: Option<vk::Fence>,
     cmd: vk::CommandBuffer,
     pools: Vec<vk::DescriptorPool>,
@@ -13670,6 +15125,9 @@ pub struct PendingSegment {
     /// Dispatches this segment carried; consumed by the submit profiler and finite GPU tuner.
     dispatches: usize,
     timeline_query: Option<crate::timeline::Query>,
+    /// Per-op profiling query state for this segment, if INFR_PROF_OPS was active. Read and
+    /// destroyed only after the fence has signaled, so profiling never forces a synchronous submit.
+    op_timestamps: Option<OpTimestampLedger>,
 }
 
 impl PendingSegment {
@@ -13695,8 +15153,21 @@ impl PendingSegment {
         self.drain()
     }
 
+    fn destroy_op_timestamps(&mut self) {
+        if let Some(profile) = self.op_timestamps.take() {
+            if profile.query_pool != vk::QueryPool::null() {
+                unsafe {
+                    self.shared
+                        .device
+                        .destroy_query_pool(profile.query_pool, None);
+                }
+            }
+        }
+    }
+
     fn drain(&mut self) -> Result<()> {
         let Some(fence) = self.fence.take() else {
+            self.destroy_op_timestamps();
             return Ok(()); // already drained
         };
         let device = &self.shared.device;
@@ -13705,7 +15176,10 @@ impl PendingSegment {
             "fence_wait",
             self.timeline_query.as_ref().map_or(0, |query| query.id),
         );
+        let submit_trace =
+            crate::submit_trace::begin_wait("fence_wait", fence, self.shared.queue);
         let waited = unsafe { device.wait_for_fences(&[fence], true, u64::MAX) };
+        crate::submit_trace::end_wait(submit_trace, &waited);
         drop(wait_span);
         if waited.is_ok() {
             if let Some(query) = self.timeline_query.take() {
@@ -13730,6 +15204,22 @@ impl PendingSegment {
                 self.shared.return_submit_timing_query(submit_pool);
             }
         }
+        if waited.is_ok() {
+            if let Some(profile) = self.op_timestamps.as_ref() {
+                report_op_timestamps(
+                    &self.shared,
+                    profile.query_pool,
+                    &profile.labels,
+                    &profile.bytes,
+                    &profile.entries,
+                    profile.segment,
+                    profile.dropped,
+                    profile.split,
+                    profile.context_prefix.as_deref(),
+                );
+            }
+        }
+        self.destroy_op_timestamps();
         self.shared.recorder_fences.lock().unwrap().push(fence);
         self.shared.recorder_cmds.lock().unwrap().push(self.cmd);
         self.shared
@@ -14388,6 +15878,7 @@ mod tests {
             (D::Iq4Xs, "iq4_xs", 6),
             (D::Iq2S, "iq2_s", 6),
             (D::Iq2Xs, "iq2_xs", 6),
+            (D::Iq2Xxs, "iq2_xxs", 6),
             (D::Iq3S, "iq3_s", 6),
             (D::Iq3Xxs, "iq3_xxs", 6),
             (D::Mxfp4, "mxfp4", 6),
@@ -15244,6 +16735,7 @@ mod tests {
             kv_cap as u32,
             kv_cap as u32,
             None,
+            None,
         );
         rec.qsa_attention_batch(
             attn_q.as_ref(),
@@ -15264,6 +16756,7 @@ mod tests {
             0,
             0,
             Some(kv_shift),
+            None,
         );
         rec.finish().unwrap();
 
@@ -15561,6 +17054,7 @@ mod tests {
             0,
             0,
             None,
+            None,
         );
         rec.finish().unwrap();
 
@@ -15623,6 +17117,7 @@ mod tests {
                 false,
                 0,
                 0,
+                None,
                 None,
             );
             rec.finish().unwrap();
