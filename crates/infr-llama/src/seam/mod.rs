@@ -5889,6 +5889,38 @@ pub(crate) fn bind_head(be: &dyn Backend) -> AResult<Box<BindWeight<'_>>> {
     ))
 }
 
+/// Measured layer-boundary preference for the Qwen3.8 family, keyed by layer count.
+///
+/// WHY a table and not a formula: the cost of a layer split is NOT a smooth function of the
+/// boundary. Measured on 2x RX 7900 XTX with Qwen3.8-Flash-Next IQ3_XXS (48 layers, QSA every 4th
+/// layer), 16K MTP VERIFY segment times (head device / tail device, ms):
+///
+/// | head/tail | 26/22 | 27/21 | 25/23 | 24/24 | 28/20 | 22/26 | 23/25 |
+/// |---|---|---|---|---|---|---|---|
+/// | segments  | 32/280 | 673/42 | 36/1591 | 35/1832 | 860/33 | 28/1901 | 30/1831 |
+///
+/// 26/22 is 2.3x the previous default (27/21) on that verify and +27% on a 256K single-row decode
+/// (9.5 vs 7.5 tok/s). `cuts` stayed <= 2.5 ms in every arm, so this is kernel/layout time on the
+/// device that owns the band — not cross-device traffic — and an offline sweep is the only way to
+/// find it. The table is consulted ONLY when the preference lands within one layer of the
+/// byte-balanced split, so the VRAM fit the balance was computed for is unchanged; any other model
+/// (or layer count, or VRAM budget) keeps the capacity-derived boundary.
+const SPLIT_PREFERENCE_QWEN38: &[(usize, usize)] = &[(48, 26)];
+
+/// The measured preferred head-band size for this model, or `None` when the family/layer count is not
+/// in [`SPLIT_PREFERENCE_QWEN38`].
+fn preferred_head_layers(cfg: &Config, n_layer: usize) -> Option<usize> {
+    // Qwen3.8 only: the effect comes from the QSA block layout (`compress_ratios`), which is what
+    // makes the terrain model-specific in the first place.
+    if !cfg.qwen4exp {
+        return None;
+    }
+    SPLIT_PREFERENCE_QWEN38
+        .iter()
+        .find(|&&(layers, _)| layers == n_layer)
+        .map(|&(_, head)| head)
+}
+
 /// The layer-split [`PipelineBackend`] for `devices`: opens ONE real Vulkan backend per device,
 /// balances the layers by weight BYTES (see `PipelineBackend::byte_balanced_layer_map`) and logs
 /// the split. The ONE construction shared by the one-shot `INFR_PIPELINE` path and the pipeline
@@ -5951,13 +5983,34 @@ pub(crate) fn open_pipeline_backend(
                 planned_vram_room(&be.vram(), ec).saturating_sub(layer_reserve)
             })
             .collect::<Vec<u64>>();
-        let default = infr_vulkan::PipelineBackend::byte_balanced_layer_map_caps(
+        let mut default = infr_vulkan::PipelineBackend::byte_balanced_layer_map_caps(
             cfg.n_layer,
             &per_layer,
             head,
             tail,
             &caps,
         );
+        // The byte balance is the SAFE seed; the measured preference (see
+        // `SPLIT_PREFERENCE_QWEN38`) is adopted only when it sits within one layer of that seed, so
+        // the band sizes — and therefore the VRAM fit the balance was computed for — stay put. A
+        // user-pinned `INFR_PIPELINE_SPLIT` still wins below.
+        if let Some(preferred) = preferred_head_layers(cfg, cfg.n_layer) {
+            let balanced = default.iter().filter(|&&device| device == 0).count();
+            if preferred > 0
+                && preferred < cfg.n_layer
+                && preferred.abs_diff(balanced) <= 1
+            {
+                default = (0..cfg.n_layer)
+                    .map(|layer| if layer < preferred { 0 } else { 1 })
+                    .collect();
+                tracing::info!(
+                    balanced_head = balanced,
+                    preferred_head = preferred,
+                    "pipeline: adopting the measured layer boundary (within one layer of the byte \
+                     balance)"
+                );
+            }
+        }
         if std::env::var_os("INFR_PIPE_TIME").is_some() {
             let bands = infr_vulkan::PipelineBackend::layer_map_band_bytes(
                 &default,
