@@ -1676,6 +1676,11 @@ impl SeamKv {
                 self.k_fmt,
                 self.v_fmt,
             );
+            let state_usage = if cfg.is_recurrent_layer(l) {
+                BufferUsage::RecurrentState
+            } else {
+                BufferUsage::KvCache
+            };
             kbufs.push(
                 if let Some(layout) = segmented_layout
                     .as_ref()
@@ -1683,7 +1688,7 @@ impl SeamKv {
                 {
                     alloc_segmented_plane(be, layout, l, PlaneKind::K)?
                 } else {
-                    be.alloc(k_bytes, BufferUsage::KvCache)
+                    be.alloc(k_bytes, state_usage)
                         .map_err(|e| anyhow!("{e}"))?
                 },
             );
@@ -1694,7 +1699,7 @@ impl SeamKv {
                 {
                     alloc_segmented_plane(be, layout, l, PlaneKind::V)?
                 } else {
-                    be.alloc(v_bytes, BufferUsage::KvCache)
+                    be.alloc(v_bytes, state_usage)
                         .map_err(|e| anyhow!("{e}"))?
                 },
             );
@@ -1764,7 +1769,10 @@ impl SeamKv {
         let ple_state_buf = if cfg.qwen4exp {
             let hist = (cfg.ple_conv_kernel - 1) * cfg.ple_ngram_size;
             Some(
-                be.alloc(hist * cfg.hc_mult * cfg.n_embd * 4, BufferUsage::KvCache)
+                be.alloc(
+                    hist * cfg.hc_mult * cfg.n_embd * 4,
+                    BufferUsage::RecurrentState,
+                )
                     .map_err(|e| anyhow!("{e}"))?,
             )
         } else {

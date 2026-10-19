@@ -7284,6 +7284,7 @@ impl VulkanBackend {
         let (location, label) = match usage {
             BufferUsage::Weights => unreachable!("Weights routed to bda_weight_alloc above"),
             BufferUsage::KvCache => unreachable!("KvCache routed to make_buf_ex above"),
+            BufferUsage::RecurrentState => (MemoryLocation::GpuOnly, "recurrent-state"),
             BufferUsage::Activations => (MemoryLocation::GpuOnly, "activations"),
             BufferUsage::Staging => (MemoryLocation::CpuToGpu, "staging"),
             BufferUsage::Readback => (MemoryLocation::GpuToCpu, "readback"),

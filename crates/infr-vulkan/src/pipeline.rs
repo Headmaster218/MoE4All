@@ -1386,6 +1386,17 @@ impl Backend for PipelineBackend {
                     self.backends[d].alloc(bytes, usage)?,
                 ))
             }
+            BufferUsage::RecurrentState if self.replicate_kv => {
+                self.replicate(|b| b.alloc(bytes, usage))
+            }
+            BufferUsage::RecurrentState => {
+                let pair = self.kv_alloc_pairs.fetch_add(1, Ordering::SeqCst) / 2;
+                let d = self.layer_device(pair);
+                Ok(PipelineBuffer::single(
+                    d,
+                    self.backends[d].alloc(bytes, usage)?,
+                ))
+            }
             BufferUsage::Readback => {
                 let d = if in_head_alloc_scope() {
                     self.head_device.unwrap_or_else(|| self.last_device())
@@ -1417,6 +1428,17 @@ impl Backend for PipelineBackend {
                 self.replicate(|b| b.alloc_uninit(bytes, usage))
             }
             BufferUsage::KvCache => {
+                let pair = self.kv_alloc_pairs.fetch_add(1, Ordering::SeqCst) / 2;
+                let d = self.layer_device(pair);
+                Ok(PipelineBuffer::single(
+                    d,
+                    self.backends[d].alloc_uninit(bytes, usage)?,
+                ))
+            }
+            BufferUsage::RecurrentState if self.replicate_kv => {
+                self.replicate(|b| b.alloc_uninit(bytes, usage))
+            }
+            BufferUsage::RecurrentState => {
                 let pair = self.kv_alloc_pairs.fetch_add(1, Ordering::SeqCst) / 2;
                 let d = self.layer_device(pair);
                 Ok(PipelineBuffer::single(

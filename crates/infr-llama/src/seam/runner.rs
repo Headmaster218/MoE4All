@@ -1318,6 +1318,11 @@ fn allocate_pending_seam_slot(
             k_fmt,
             v_fmt,
         );
+        let state_usage = if cfg.is_recurrent_layer(layer) {
+            BufferUsage::RecurrentState
+        } else {
+            BufferUsage::KvCache
+        };
         let k_segmented =
             segmented_layout.is_some_and(|layout| layout.plane(layer, PlaneKind::K).is_some());
         kbufs.push(if k_segmented {
@@ -1329,7 +1334,7 @@ fn allocate_pending_seam_slot(
             )?)
         } else {
             Some(
-                be.alloc(k_bytes, BufferUsage::KvCache)
+                be.alloc(k_bytes, state_usage)
                     .map_err(|e| anyhow!("{e}"))?,
             )
         });
@@ -1344,7 +1349,7 @@ fn allocate_pending_seam_slot(
             )?)
         } else {
             Some(
-                be.alloc(v_bytes, BufferUsage::KvCache)
+                be.alloc(v_bytes, state_usage)
                     .map_err(|e| anyhow!("{e}"))?,
             )
         });
@@ -1376,7 +1381,10 @@ fn allocate_pending_seam_slot(
     let ple_state_buf = if cfg.qwen4exp {
         let hist = (cfg.ple_conv_kernel - 1) * cfg.ple_ngram_size;
         Some(
-            be.alloc(hist * cfg.hc_mult * cfg.n_embd * 4, BufferUsage::KvCache)
+                be.alloc(
+                    hist * cfg.hc_mult * cfg.n_embd * 4,
+                    BufferUsage::RecurrentState,
+                )
                 .map_err(|e| anyhow!("{e}"))?,
         )
     } else {
@@ -3287,6 +3295,11 @@ fn generate_dense_backend_inner(
                 k_fmt,
                 v_fmt,
             );
+            let state_usage = if c.is_recurrent_layer(l) {
+                BufferUsage::RecurrentState
+            } else {
+                BufferUsage::KvCache
+            };
             let k_segmented = segmented_layout
                 .as_ref()
                 .is_some_and(|layout| layout.plane(l, PlaneKind::K).is_some());
@@ -3299,7 +3312,7 @@ fn generate_dense_backend_inner(
                 )?)
             } else {
                 Some(
-                    be.alloc(k_bytes, BufferUsage::KvCache)
+                    be.alloc(k_bytes, state_usage)
                         .map_err(|e| anyhow!("{e}"))?,
                 )
             });
@@ -3315,7 +3328,7 @@ fn generate_dense_backend_inner(
                 )?)
             } else {
                 Some(
-                    be.alloc(v_bytes, BufferUsage::KvCache)
+                    be.alloc(v_bytes, state_usage)
                         .map_err(|e| anyhow!("{e}"))?,
                 )
             });
@@ -3348,7 +3361,10 @@ fn generate_dense_backend_inner(
         let ple_state_buf = if c.qwen4exp {
             let hist = (c.ple_conv_kernel - 1) * c.ple_ngram_size;
             let b = be
-                .alloc(hist * c.hc_mult * ne * 4, BufferUsage::KvCache)
+                .alloc(
+                    hist * c.hc_mult * ne * 4,
+                    BufferUsage::RecurrentState,
+                )
                 .map_err(|e| anyhow!("{e}"))?;
             let zeros = vec![0u8; b.len_bytes()];
             be.upload(b.as_ref(), &zeros).map_err(|e| anyhow!("{e}"))?;

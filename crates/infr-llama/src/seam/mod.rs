@@ -2830,10 +2830,15 @@ struct MoeLayerScope {
     min_slots_per_pool: Option<usize>,
     runtime_reserve_override_bytes: Option<u64>,
     dynamic_state_reserve_override_bytes: Option<u64>,
+    /// Extra device-local headroom for fixed recurrent state. Unlike the KV override this is
+    /// additive, so it reserves a corridor for SSM/PLE without replacing dynamic-KV accounting.
+    state_reserve_bytes: u64,
     prefill_min_lane_override_bytes: Option<u64>,
     reuse_existing_arena: bool,
     private_unified_arena: bool,
 }
+
+const QWEN4_RECURRENT_STATE_VRAM_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
 
 impl MoeLayerScope {
     fn all(n_layer: usize) -> Self {
@@ -2845,6 +2850,7 @@ impl MoeLayerScope {
             min_slots_per_pool: None,
             runtime_reserve_override_bytes: None,
             dynamic_state_reserve_override_bytes: None,
+            state_reserve_bytes: 0,
             prefill_min_lane_override_bytes: None,
             reuse_existing_arena: false,
             private_unified_arena: false,
@@ -3846,6 +3852,7 @@ fn vulkan_moe_binder_scoped<'a>(
                     dynamic_kv_reserve_per_slot.saturating_add(mtp_dynamic_reserve_per_slot),
                 )
             });
+        let reserved_dynamic_state = dynamic_kv_reserve.saturating_add(scope.state_reserve_bytes);
         dynamic_state_max_allocation_bytes = dynamic_layout
             .as_ref()
             .and_then(|layout| {
@@ -3882,7 +3889,7 @@ fn vulkan_moe_binder_scoped<'a>(
                 resident_dense,
                 persistent_state,
                 runtime_reserve,
-                dynamic_kv_reserve,
+                reserved_dynamic_state,
                 resident_weight_packing_margin(resident_dense),
                 load_driver_reserve,
                 POST_KV_DEVICE_RESERVE,
@@ -3956,7 +3963,7 @@ fn vulkan_moe_binder_scoped<'a>(
                     resident_dense,
                     candidate_persistent,
                     candidate_runtime,
-                    dynamic_kv_reserve,
+                    reserved_dynamic_state,
                     resident_weight_packing_margin(resident_dense),
                     load_driver_reserve,
                     POST_KV_DEVICE_RESERVE,
@@ -5584,6 +5591,11 @@ fn pipeline_moe_binder<'a>(
             min_slots_per_pool: None,
             runtime_reserve_override_bytes: None,
             dynamic_state_reserve_override_bytes: None,
+            state_reserve_bytes: if cfg.qwen4exp && cfg.recurrent_state_elems() > 0 {
+                QWEN4_RECURRENT_STATE_VRAM_RESERVE_BYTES
+            } else {
+                0
+            },
             prefill_min_lane_override_bytes: None,
             reuse_existing_arena: false,
             private_unified_arena: false,
@@ -5737,6 +5749,7 @@ pub(crate) fn bind_head_with_cache<'a>(
         min_slots_per_pool: head_min_slots,
         runtime_reserve_override_bytes: Some(64 * 1024 * 1024),
         dynamic_state_reserve_override_bytes: Some(64 * 1024 * 1024),
+        state_reserve_bytes: 0,
         prefill_min_lane_override_bytes: Some(0),
         reuse_existing_arena: true,
         private_unified_arena: true,
@@ -5973,6 +5986,11 @@ pub(crate) fn open_pipeline_backend(
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(1024)
             .saturating_mul(1024 * 1024);
+        let recurrent_state_reserve = if cfg.qwen4exp && cfg.recurrent_state_elems() > 0 {
+            QWEN4_RECURRENT_STATE_VRAM_RESERVE_BYTES
+        } else {
+            0
+        };
         let caps = backends
             .iter()
             .map(|be| {
@@ -5980,7 +5998,9 @@ pub(crate) fn open_pipeline_backend(
                 // budget/reserve) holds bytes back on top of the guard's own headroom, and the
                 // ALLOCATOR refuses past that same ceiling. Planning against the raw free figure is
                 // what made a "fits" band die on its last weight with ~160 MiB of room left.
-                planned_vram_room(&be.vram(), ec).saturating_sub(layer_reserve)
+                planned_vram_room(&be.vram(), ec)
+                    .saturating_sub(layer_reserve)
+                    .saturating_sub(recurrent_state_reserve)
             })
             .collect::<Vec<u64>>();
         let mut default = infr_vulkan::PipelineBackend::byte_balanced_layer_map_caps(
@@ -5996,13 +6016,26 @@ pub(crate) fn open_pipeline_backend(
         // user-pinned `INFR_PIPELINE_SPLIT` still wins below.
         if let Some(preferred) = preferred_head_layers(cfg, cfg.n_layer) {
             let balanced = default.iter().filter(|&&device| device == 0).count();
+            let preferred_map = (0..cfg.n_layer)
+                .map(|layer| if layer < preferred { 0 } else { 1 })
+                .collect::<Vec<_>>();
+            let preferred_bands = infr_vulkan::PipelineBackend::layer_map_band_bytes(
+                &preferred_map,
+                backends.len(),
+                &per_layer,
+                head,
+                tail,
+            );
+            let preferred_fits = preferred_bands
+                .iter()
+                .zip(&caps)
+                .all(|(band, cap)| band <= cap);
             if preferred > 0
                 && preferred < cfg.n_layer
                 && preferred.abs_diff(balanced) <= 1
+                && preferred_fits
             {
-                default = (0..cfg.n_layer)
-                    .map(|layer| if layer < preferred { 0 } else { 1 })
-                    .collect();
+                default = preferred_map;
                 tracing::info!(
                     balanced_head = balanced,
                     preferred_head = preferred,

@@ -384,6 +384,12 @@ pub enum BufferUsage {
     /// backend that doesn't distinguish it (CPU, Metal today) may simply treat it like
     /// `Activations`.
     KvCache,
+    /// Fixed-size recurrent state that reuses a layer's K/V slots on gated-DeltaNet models:
+    /// the convolution history and the recurrent `S` state. It has the same lifetime and
+    /// placement as `KvCache`, but every decode step reads and writes it, so placing it in the
+    /// KV-overflow host tier costs a measured 3.3x in the recurrence kernel. Vulkan keeps it
+    /// device-local; backends that do not distinguish it may treat it like `KvCache`.
+    RecurrentState,
     /// Host→device staging (host-visible, mapped): `upload` is a direct memcpy.
     Staging,
     /// Device→host readback (host-visible, mapped): `download` is a direct memcpy.

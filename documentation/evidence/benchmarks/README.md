@@ -8,6 +8,9 @@ verified_commit: ed62393068679573afe94a1472454efe7eae0f15
 
 # 基准测试记录
 
+- [2026-10-19 Strata 对齐 Phase 1](2026-10-19-strata-align-phase1.md)：IQ3_XXS
+  双卡 256K 下将 SSM/PLE state 固定到 VRAM；32K decode 10.86 → 22.40 tok/s，
+  并记录 64K/200K Phase 0 基线。
 - [2026-10-19 v5-final-stable 稳定性验证](2026-10-19-v5-final-stable.md)：回退到
   `v4-pair-pipeline` 运行时；默认 26/22 层切分、`k=3` 串行 MTP，以及
   32K/256K 双 lane 1.748 cohort ratio。
