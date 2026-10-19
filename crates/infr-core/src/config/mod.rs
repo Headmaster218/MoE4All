@@ -419,6 +419,10 @@ cfg_struct! {
         moe_topk_sg: bool = true,
         /// Fill all eight wave32 subgroups when QSA scores a single decode row.
         qsa_score_decode8: bool = true,
+        /// Decode QSA block tile. The default 32 uses a 1024-thread workgroup so one dispatch
+        /// covers four times the key window and the grid shrinks 4x; 16/8 retain the narrower
+        /// workgroups as A/B fallbacks.
+        qsa_decode_tile: usize = 32,
         /// Experimental Qwen3.8 QSA prepare fusion. Concatenates the indexer Q/K projections and
         /// fuses raw-K cache write with query norm/RoPE. Kept off until model-level A/B validation.
         qsa_prepare_fused: bool = false,

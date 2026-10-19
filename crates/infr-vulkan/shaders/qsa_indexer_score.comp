@@ -11,7 +11,21 @@
 // kernel only stages reusable Q/K data and computes the positive-head dot sum. A fixed wave32
 // pipeline gives eight subgroups, one per query/block pair. Decode uses 1 query x 8 blocks so no
 // subgroup is idle; batched prefill keeps the established 2 queries x 4 blocks tile.
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+#ifdef QSA_SCORE_DECODE32
+#define QUERY_TILE 1u
+#define BLOCK_TILE 32u
+#elif defined(QSA_SCORE_DECODE16)
+#define QUERY_TILE 1u
+#define BLOCK_TILE 16u
+#elif defined(QSA_SCORE_DECODE8)
+#define QUERY_TILE 1u
+#define BLOCK_TILE 8u
+#else
+#define QUERY_TILE 2u
+#define BLOCK_TILE 4u
+#endif
+
+layout(local_size_x = QUERY_TILE * BLOCK_TILE * 32u, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
     uint rows;
@@ -30,14 +44,6 @@ layout(binding = 1) readonly buffer KB { uvec2 block_segments[]; };
 layout(binding = 1) readonly buffer KB { float block_k[]; };
 #endif
 layout(binding = 2) writeonly buffer SB { float scores[]; };
-
-#ifdef QSA_SCORE_DECODE8
-#define QUERY_TILE 1u
-#define BLOCK_TILE 8u
-#else
-#define QUERY_TILE 2u
-#define BLOCK_TILE 4u
-#endif
 
 shared float qtile[QUERY_TILE][4][128];
 shared float ktile[BLOCK_TILE][128];
@@ -86,7 +92,7 @@ void main() {
             : 0.0;
     }
 #ifdef KV_SEGMENTED
-#ifdef QSA_SCORE_DECODE8
+#if defined(QSA_SCORE_DECODE8) || defined(QSA_SCORE_DECODE16) || defined(QSA_SCORE_DECODE32)
     uint load_bs = sg;
     uint d_base = 0u;
     const uint LOAD_COMPONENTS = 4u;

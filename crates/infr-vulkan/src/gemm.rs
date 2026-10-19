@@ -3683,6 +3683,14 @@ qsa_spv!(
     qsa_indexer_score_decode8_h4_seg_spv,
     "qsa_indexer_score_decode8_h4_seg"
 );
+qsa_spv!(
+    qsa_indexer_score_decode16_h4_seg_spv,
+    "qsa_indexer_score_decode16_h4_seg"
+);
+qsa_spv!(
+    qsa_indexer_score_decode32_h4_seg_spv,
+    "qsa_indexer_score_decode32_h4_seg"
+);
 qsa_spv!(qsa_gather_spv, "qsa_gather");
 qsa_spv!(qsa_gather_kq8_spv, "qsa_gather_kq8");
 qsa_spv!(qsa_gather_vq8_spv, "qsa_gather_vq8");
@@ -3691,6 +3699,8 @@ qsa_spv!(qsa_gather_seg_spv, "qsa_gather_seg");
 qsa_spv!(qsa_gather_kq8_seg_spv, "qsa_gather_kq8_seg");
 qsa_spv!(qsa_gather_vq8_seg_spv, "qsa_gather_vq8_seg");
 qsa_spv!(qsa_gather_q8_seg_spv, "qsa_gather_q8_seg");
+qsa_spv!(qsa_gather_q8_x4_spv, "qsa_gather_q8_x4");
+qsa_spv!(qsa_gather_q8_seg_x4_spv, "qsa_gather_q8_seg_x4");
 qsa_spv!(qsa_attention_batch_spv, "qsa_attention_batch");
 qsa_spv!(qsa_attention_batch_kq8_spv, "qsa_attention_batch_kq8");
 qsa_spv!(qsa_attention_batch_vq8_spv, "qsa_attention_batch_vq8");

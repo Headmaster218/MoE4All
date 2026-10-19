@@ -794,6 +794,16 @@ fn main() {
             "qsa_indexer_score_decode8_h4_seg",
             &["-DQSA_SCORE_DECODE8", "-DQSA_SCORE_H4", "-DKV_SEGMENTED"],
         ),
+        (
+            "qsa_indexer_score",
+            "qsa_indexer_score_decode16_h4_seg",
+            &["-DQSA_SCORE_DECODE16", "-DQSA_SCORE_H4", "-DKV_SEGMENTED"],
+        ),
+        (
+            "qsa_indexer_score",
+            "qsa_indexer_score_decode32_h4_seg",
+            &["-DQSA_SCORE_DECODE32", "-DQSA_SCORE_H4", "-DKV_SEGMENTED"],
+        ),
         ("qsa_indexer_topk", "qsa_indexer_topk", &[]),
         (
             "qsa_indexer_topk",
@@ -832,6 +842,21 @@ fn main() {
             "qsa_gather",
             "qsa_gather_q8_seg",
             &["-DKQ8", "-DVQ8", "-DKV_SEGMENTED"],
+        ),
+        (
+            "qsa_gather",
+            "qsa_gather_q8_x4",
+            &["-DKQ8", "-DVQ8", "-DQSA_GATHER_X4"],
+        ),
+        (
+            "qsa_gather",
+            "qsa_gather_q8_seg_x4",
+            &[
+                "-DKQ8",
+                "-DVQ8",
+                "-DKV_SEGMENTED",
+                "-DQSA_GATHER_X4",
+            ],
         ),
         ("qsa_attention_batch", "qsa_attention_batch", &[]),
         ("qsa_attention_batch", "qsa_attention_batch_kq8", &["-DKQ8"]),

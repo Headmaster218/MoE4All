@@ -28,8 +28,13 @@ layout(binding = 0) readonly buffer KB { uint k[]; };
 layout(binding = 1) readonly buffer VB { uint v[]; };
 #endif
 layout(binding = 2) readonly buffer IB { uint indices[]; };
+#ifdef QSA_GATHER_X4
+layout(binding = 3) writeonly buffer KDB { uvec2 kd[]; };
+layout(binding = 4) writeonly buffer VDB { uvec2 vd[]; };
+#else
 layout(binding = 3) writeonly buffer KDB { uint kd[]; };
 layout(binding = 4) writeonly buffer VDB { uint vd[]; };
+#endif
 
 #if defined(KQ8) || defined(KV_SEGMENTED)
 float kread(uint i) {
@@ -85,6 +90,75 @@ float vread(uint i) {
 }
 #endif
 
+#ifdef QSA_GATHER_X4
+uvec2 q8x4(int codes, float scale) {
+    return uvec2(
+        packHalf2x16(vec2(
+            scale * float(bitfieldExtract(codes, 0, 8)),
+            scale * float(bitfieldExtract(codes, 8, 8))
+        )),
+        packHalf2x16(vec2(
+            scale * float(bitfieldExtract(codes, 16, 8)),
+            scale * float(bitfieldExtract(codes, 24, 8))
+        ))
+    );
+}
+
+void main() {
+    uint group = gl_GlobalInvocationID.x;
+    uint pair = group * 2u;
+    if (pair >= pc.total_pairs) { return; }
+    uint out_row = pair / pc.row_pairs;
+    uint in_row = pair % pc.row_pairs;
+    if (in_row + 1u >= pc.row_pairs) { return; }
+    uint selected_rows = pc.selected * pc.ratio;
+    uint src_row;
+    if (out_row < selected_rows) {
+        uint slot = out_row / pc.ratio;
+        src_row = indices[slot] * pc.ratio + out_row % pc.ratio;
+    } else {
+        src_row = pc.complete * pc.ratio + out_row - selected_rows;
+    }
+    uint src_elem = (src_row * pc.row_pairs + in_row) * 2u;
+
+#ifdef KV_SEGMENTED
+    uint k_local = kv_segment_local(src_elem, pc.segment_shift);
+    uint64_t k_base = kv_segment_base(k_segments[kv_segment(src_elem, pc.segment_shift)]);
+    uint k_codes = kv_word(k_base, k_local >> 2u);
+    uint k_block = k_local >> 5u;
+    uint k_scale_word = kv_word(
+        k_base,
+        ((1u << pc.segment_shift) >> 2u) + (k_block >> 1u)
+    );
+    float k_scale = unpackHalf2x16(k_scale_word)[k_block & 1u];
+
+    uint v_local = kv_segment_local(src_elem, pc.segment_shift);
+    uint64_t v_base = kv_segment_base(v_segments[kv_segment(src_elem, pc.segment_shift)]);
+    uint v_codes = kv_word(v_base, v_local >> 2u);
+    uint v_block = v_local >> 5u;
+    uint v_scale_word = kv_word(
+        v_base,
+        ((1u << pc.segment_shift) >> 2u) + (v_block >> 1u)
+    );
+    float v_scale = unpackHalf2x16(v_scale_word)[v_block & 1u];
+#else
+    uint k_codes = k[src_elem >> 2u];
+    uint k_block = src_elem >> 5u;
+    float k_scale = unpackHalf2x16(
+        k[(pc.kcap >> 2u) + (k_block >> 1u)]
+    )[k_block & 1u];
+
+    uint v_codes = v[src_elem >> 2u];
+    uint v_block = src_elem >> 5u;
+    float v_scale = unpackHalf2x16(
+        v[(pc.vcap >> 2u) + (v_block >> 1u)]
+    )[v_block & 1u];
+#endif
+
+    kd[group] = q8x4(int(k_codes), k_scale);
+    vd[group] = q8x4(int(v_codes), v_scale);
+}
+#else
 void main() {
     uint pair = gl_GlobalInvocationID.x;
     if (pair >= pc.total_pairs) { return; }
@@ -112,3 +186,4 @@ void main() {
     vd[pair] = v[src_pair];
 #endif
 }
+#endif

@@ -10854,8 +10854,28 @@ impl<'a> Recorder<'a> {
         let h4 = rows > 1 && n_head == 4 && head_dim == 128;
         let decode8_h4 = decode8 && n_head == 4 && head_dim == 128;
         let score_tile = self.vk().qsa_score_tile;
-        let (score_name, score_spv, block_tile, query_tile) = if h4 && segmented && score_tile == 64
-        {
+        let (score_name, score_spv, block_tile, query_tile) = if decode8_h4 && segmented {
+            match self.vk().qsa_decode_tile {
+                32 => (
+                    "qsa_indexer_score_decode32_h4_seg",
+                    crate::gemm::qsa_indexer_score_decode32_h4_seg_spv(),
+                    32,
+                    1,
+                ),
+                16 => (
+                    "qsa_indexer_score_decode16_h4_seg",
+                    crate::gemm::qsa_indexer_score_decode16_h4_seg_spv(),
+                    16,
+                    1,
+                ),
+                _ => (
+                    "qsa_indexer_score_decode8_h4_seg",
+                    crate::gemm::qsa_indexer_score_decode8_h4_seg_spv(),
+                    8,
+                    1,
+                ),
+            }
+        } else if h4 && segmented && score_tile == 64 {
             (
                 "qsa_indexer_score_h4_t64_seg",
                 crate::gemm::qsa_indexer_score_h4_t64_seg_spv(),
@@ -10869,12 +10889,12 @@ impl<'a> Recorder<'a> {
                 32,
                 8,
             )
-        } else if decode8_h4 && segmented {
+        } else if h4 && segmented {
             (
-                "qsa_indexer_score_decode8_h4_seg",
-                crate::gemm::qsa_indexer_score_decode8_h4_seg_spv(),
-                8,
-                1,
+                "qsa_indexer_score_h4_seg",
+                crate::gemm::qsa_indexer_score_h4_seg_spv(),
+                4,
+                2,
             )
         } else if decode8_h4 {
             (
@@ -10882,13 +10902,6 @@ impl<'a> Recorder<'a> {
                 crate::gemm::qsa_indexer_score_decode8_h4_spv(),
                 8,
                 1,
-            )
-        } else if h4 && segmented {
-            (
-                "qsa_indexer_score_h4_seg",
-                crate::gemm::qsa_indexer_score_h4_seg_spv(),
-                4,
-                2,
             )
         } else if h4 {
             (
@@ -11528,11 +11541,17 @@ impl<'a> Recorder<'a> {
             (false, false, true) => ("qsa_gather_seg", crate::gemm::qsa_gather_seg_spv()),
             (true, false, true) => ("qsa_gather_kq8_seg", crate::gemm::qsa_gather_kq8_seg_spv()),
             (false, true, true) => ("qsa_gather_vq8_seg", crate::gemm::qsa_gather_vq8_seg_spv()),
-            (true, true, true) => ("qsa_gather_q8_seg", crate::gemm::qsa_gather_q8_seg_spv()),
+            (true, true, true) => (
+                "qsa_gather_q8_seg_x4",
+                crate::gemm::qsa_gather_q8_seg_x4_spv(),
+            ),
             (false, false, false) => ("qsa_gather", crate::gemm::qsa_gather_spv()),
             (true, false, false) => ("qsa_gather_kq8", crate::gemm::qsa_gather_kq8_spv()),
             (false, true, false) => ("qsa_gather_vq8", crate::gemm::qsa_gather_vq8_spv()),
-            (true, true, false) => ("qsa_gather_q8", crate::gemm::qsa_gather_q8_spv()),
+            (true, true, false) => (
+                "qsa_gather_q8_x4",
+                crate::gemm::qsa_gather_q8_x4_spv(),
+            ),
         };
         let push_bytes = if segmented { 36 } else { 32 };
         let kernel = self.be.kernel(name, spv, 5, push_bytes);
@@ -11559,7 +11578,7 @@ impl<'a> Recorder<'a> {
             ],
             2,
             &push[..push_bytes as usize],
-            total_pairs.div_ceil(256),
+            total_pairs.div_ceil(512),
         );
     }
 
