@@ -8,6 +8,8 @@ verified_commit: ed62393068679573afe94a1472454efe7eae0f15
 
 # 基准测试记录
 
+- [2026-10-19 双 lane 跨步流水](2026-10-19-pair-pipeline.md)：32K/256K、`-u256`、双 lane 并发解码的
+  cohort ratio 1.26 → 1.78–1.80（每步 145.7 → 103–106 ms）。含 plan0/plan1 双缓冲与 2 次调用调度的底层推导。
 - [2026-09-27 Qwen3.8 整体性能与稳定性](2026-09-27-system-performance-stability.md)：20K/100K/150K，普通、MTP、视觉及双槽单活跃对照。注意测试提交不属于 `release-0.9.0` tag 血统。
 - [2026-09-24 Qwen3.8 MTP 20K 对照](2026-09-24-qwen38-mtp-20k.md)
 - [2026-09-24 Qwen3.8 MTP 150K 对照](2026-09-24-qwen38-mtp-150k.md)
