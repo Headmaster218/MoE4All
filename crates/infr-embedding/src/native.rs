@@ -1662,9 +1662,8 @@ mod tests {
         drop(exclusive);
         request.join().unwrap();
         pressure.join().unwrap();
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "pressure callback must skip a busy request"
         );
         assert_eq!(weights.load(Ordering::SeqCst), 0);

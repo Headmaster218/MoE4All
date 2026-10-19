@@ -112,10 +112,10 @@ if [[ ${1-} == submission && ${2-} == pack-benchmark ]]; then
             *) shift ;;
         esac
     done
-    path="$result_dir/v1/2026-10/manual-fixture.m4b"
-    mkdir -p -- "${path:h}"
-    printf 'MOE4ALL-SUBMISSION/1\nkind: benchmark\nid: manual-fixture\n' > "$path"
-    printf 'MOE4ALL_SUBMISSION_PATH=%s\n' "$path"
+    report_path="$result_dir/v1/2026-10/manual-fixture.m4b"
+    mkdir -p -- "${report_path:h}"
+    printf 'MOE4ALL-SUBMISSION/1\nkind: benchmark\nid: manual-fixture\n' > "$report_path"
+    printf 'MOE4ALL_SUBMISSION_PATH=%s\n' "$report_path"
     exit 0
 fi
 exit 1
