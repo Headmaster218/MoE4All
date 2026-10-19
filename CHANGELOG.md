@@ -6,6 +6,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Rolled the runtime back to the `v4-pair-pipeline` engine state for the `v5-final-stable`
+  baseline. The abandoned MTP two-window experiment and the uncommitted VRAM-only recurrent-state
+  placement are not part of this release.
+- Kept the measured Qwen3.8 defaults: the automatic layer boundary resolves to 26/22 when the
+  byte-balanced seed is 26, and the default VERIFY width is 3 rows.
+
+### Validation
+
+- The original 32K/256K, `-u256`, two-lane streaming workload completed with a 1.748 cohort ratio
+  on the validation host, in the same range as the recorded `v4-pair-pipeline` result.
+- Serial Qwen3.8 MTP was exercised through two sequential streaming requests. Both produced
+  byte-identical text, no request failed, and the MTP logs showed two candidates plus a three-row
+  VERIFY (`k=3`).
+- The rejected VRAM-only recurrent-state change was removed after it caused the 32K/256K
+  two-lane workload to exceed the VRAM guard at activation-pool allocation.
+
 ## [0.9.0] - 2026-09-28
 
 ### Added
