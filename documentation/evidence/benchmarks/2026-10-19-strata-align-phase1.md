@@ -48,6 +48,31 @@ Phase 1 的 32K 输入为 30,980 token，prefill 41.469 s；fresh 输出 128 tok
 启动日志仍选择 `26/22`，说明 64 MiB per-card reserve 在加入固定状态预留后
 仍能保持原层边界，没有 OOM 或强制降级。
 
+### 64K 深度
+
+| 64K 指标 | Phase 0 | Phase 1 | 变化 |
+| --- | ---: | ---: | ---: |
+| Fresh decode | 9.90 tok/s | **18.06 tok/s** | +82.4% |
+| 稳态复测 decode | 9.41 tok/s | **15.27 tok/s** | +62.3% |
+| Prefill | 525.9 tok/s | **563.8 tok/s** | +7.2% |
+
+实际输入 62,655 token。fresh prefill 111.135 s，输出 128 token 用 7.086 s；
+稳态复测 prefill 110.761 s，输出 128 token 用 8.385 s。
+
+### 32K 双 lane
+
+`--parallel 2`、262144 context、32K prompt、每 lane 128 token：
+
+- lane A：7.219 s，17.73 tok/s
+- lane B：7.267 s，17.73 tok/s
+- 按两 lane 的较长输出时间计算，聚合吞吐 **35.23 tok/s**，未达到 40 tok/s
+- cohort ratio：1.619
+- 并发结束后单 lane：5.883 s，21.76 tok/s
+
+两条 lane 都正常完成，没有失败请求或状态污染。该结果比 Phase 0 的 1.748
+cohort ratio 略低，但单 lane 稳态已明显提高；双 lane 尚未冲破 40 t/s，
+State 驻留解决了 PCIe 主损失，但没有消除 dispatch 和双 deck 调度上限。
+
 ## 放置证据
 
 Phase 0 启动日志：
@@ -71,3 +96,6 @@ Phase 1 达到并超过 15-20 tok/s 的第一阶段目标。状态原本每次 d
 PCIe 读取，现在固定在 device-local；这解释了 fresh decode 的 2.06x 和稳态
 复测的 1.71x 提升。下一步仍应单独优化 prefill 路径和 dispatch 数，不应把本结果
 误读成已经达到 Strata 的 47-50 tok/s。
+
+`v6-state-resident` 标记在 Phase 1 代码提交 `89eab002` 上。双 lane 32K 聚合为
+35.23 tok/s，因此该 tag 表示状态驻留里程碑，不表示双 lane 已经达到 40 tok/s。
