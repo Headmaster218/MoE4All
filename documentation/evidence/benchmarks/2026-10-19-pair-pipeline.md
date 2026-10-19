@@ -111,3 +111,72 @@ prologue: execute_pipelined(None, [A.front(0), A.tail(0)], hook: 上传 A 的 PL
 - 完整推导笔记：`ab-32k-pair-dbuf/NOTES-double-buffer-diagnosis.md`
 
 以上位于 `/media/qiankun/新加卷1/MoE4All_work/`（仓库外的本机数据目录），不随 tag 发布。
+
+---
+
+# 后续压榨尝试（2026-10-19 10:0x，同一二进制、无代码改动）
+
+dev1 成了唯一上界后，逐项试了三个候选杠杆。**三个都被实测封死**，结论是：在这台机器的这个
+配置下，调度层已经没有剩余油水，墙是 **VRAM 容量**。
+
+## 1. layer split 重排 → 被 VRAM 守门挡下
+
+`INFR_PIPELINE_SPLIT=28,20` 与 `30,18` 都在权重绑定期失败：
+
+```
+bind fixed weight `blk.27.ffn_up_exps.weight`
+  VRAM budget exceeded: 256.0 MiB requested with 23.63 GiB physical /
+  22.24 GiB backend bytes already in use; 109.5 MiB remains
+```
+
+放置日志给出了原因：
+
+```
+[pipeline placement] device 0: 21.03 GiB weight band vs 22.29 GiB allocatable (fits)
+[pipeline placement] device 1: 22.38 GiB weight band vs 23.12 GiB allocatable (fits)
+```
+
+dev1 的 band 比 dev0 **更大**（多背 `final norm + lm_head`），而 dev0 侧只剩 109.5 MiB。
+26/22 就是卡0 的容量上限；dev1 比 dev0 多的那 ~13–16 ms 正是它多背的 head，**挪不动**。
+
+## 2. 把 B 的 PLE ticket 提前一个迭代 → 0 收益（不需要做）
+
+α 的 `front+hook = 11.8 ms` 里绝大部分是在等 B 的 PLE gather，但整段都落在 dev1 的 50.8 ms
+之内（dev0 尾部 48.3 ms < dev1 50.8 ms）。提前提交只增加余量，**不减少 dev1 的工作量、也不改
+joined**。这一项按测量结论放弃，不留复杂度的半成品。
+
+## 3. KV 驻留 VRAM（直攻日志里标出的 PCIe 读）→ 同样的 VRAM 墙
+
+服务器日志自己写着 `attention reads those K/V over PCIe by device address (PCIe-bound on the
+spilled layers)`，而 A/B 脚本固定 `INFR_KV_OVERFLOW_VRAM_MB=0` —— 那是**整机宿主**（slice-1）
+最坏情况的复现开关，不是默认策略。放开后：
+
+| 放置 | 结果 |
+|---|---|
+| `auto`（VRAM 优先） | 337.7 MiB **全部进 VRAM**，第一次前向激活池即被拒（`moe_ue` 12.7 MiB，0 B 剩余） |
+| 上限 128 MiB | 106/219 驻留 → `moe_ye` 50.6 MiB 被拒 |
+| 上限 64 MiB | 54/219 驻留 → `moe_dqa` 3.2 MiB 被拒 |
+
+即：32K/256K/`-u256` 下，权重 + 激活池已经把 24 GiB 卡吃到只剩 **< 64 MiB**，MiB 级 KV 驻留
+都放不下。host KV 不是保守选择，是这台机器唯一的可行放置。
+
+### 附带发现（健壮性，不是本提交引入）
+
+VRAM 优先的**自动**策略在这个模型/边界下会过提交：KV 在任何前向之前就占位，而
+`KV_AUTO_ACT_RESERVE_FLOOR = 64 MiB` 对 Qwen4 MoE 的激活峰值（`moe_ya/ye/ue/qa/dqa` 合计
+远大于 64 MiB）不够，于是第一次前向直接 `Error: VRAM budget exceeded`。因此 A/B 脚本里的
+`INFR_KV_OVERFLOW_VRAM_MB=0` 是**承重**配置，不是纯测量脚手架 —— 这一点值得单独跟进。
+
+## 附带确认：`-u128` 对照
+
+ratio 1.7814、并发 103.5 ms/步、单请求 decode 10.85 tok/s（与 `-u256` 相同），但 prefill
+**828 → 594 tok/s**。再次确认解码由深度/带宽决定而非 ubatch，预填 chunk 256 仍是最优。
+
+## 结论：下一步只能跳出「权重全驻 + KV 全走宿主」这个组合
+
+1. **词表并行切分 head**：`lm_head` GEMV + argmax 现在整块压在 dev1，是它比 dev0 多出的时间
+   的主要部分；按 vocab 切到两张卡 + 设备内 reduce/argmax 才能真正把 dev1 压下去。
+2. **KV 溢出让走 BAR 可见堆**：如果板卡/驱动提供了大 BAR（SAM），把 `alloc_kv_host` 的
+   cached-system-RAM 选择改成 BAR 窗口，PCIe 读 KV 的吞吐会有量级差异。
+3. **容量本身**：更多 VRAM，或更低比特的权重/KV —— 这条路线里 43.4 GiB 权重 + 激活已经吃掉
+   全部 45 GiB 可用显存。
