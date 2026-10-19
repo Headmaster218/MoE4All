@@ -306,6 +306,10 @@ fn is_speed_line(line: &str) -> bool {
 }
 
 fn redact_unrecognized_paths_and_secrets(line: &str) -> String {
+    static CREDENTIAL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{8,}|\bsk-[A-Za-z0-9_-]{12,}|\b(?:api[_-]?key|password|secret)\s*[=:]\s*["']?[A-Za-z0-9._~+/-]{8,}"#).unwrap()
+    });
+    let line = CREDENTIAL.replace_all(line, "<redacted-setting>");
     line.split_whitespace()
         .map(|token| {
             let lower = token.to_ascii_lowercase();
@@ -341,11 +345,8 @@ fn redact_unrecognized_paths_and_secrets(line: &str) -> String {
         .join(" ")
 }
 
-fn sanitize_line(line: &str, redactions: &[String]) -> Option<String> {
+fn sanitize_diagnostic_text(line: &str, redactions: &[String]) -> String {
     let mut line = strip_ansi(line).trim().to_string();
-    if line.is_empty() || is_speed_line(&line) {
-        return None;
-    }
     for redaction in redactions {
         if redaction.len() >= 3 {
             line = line.replace(redaction, "<local-path>");
@@ -353,10 +354,32 @@ fn sanitize_line(line: &str, redactions: &[String]) -> Option<String> {
     }
     line = redact_unrecognized_paths_and_secrets(&line);
     if line.len() > 2_048 {
-        line.truncate(2_048);
+        line.truncate(line.floor_char_boundary(2_048));
         line.push_str("...");
     }
-    Some(line)
+    line
+}
+
+fn sanitize_line(line: &str, redactions: &[String]) -> Option<String> {
+    let line = sanitize_diagnostic_text(line, redactions);
+    (!line.is_empty() && !is_speed_line(&line)).then_some(line)
+}
+
+fn sanitize_report_value(value: &mut Value, redactions: &[String]) {
+    match value {
+        Value::String(text) => *text = sanitize_diagnostic_text(text, redactions),
+        Value::Array(values) => {
+            for value in values {
+                sanitize_report_value(value, redactions);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                sanitize_report_value(value, redactions);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn read_text(path: &Path) -> String {
@@ -443,7 +466,14 @@ pub fn create_report(
     let (startup, tail, dropped_events) = report_logs(files);
     let id = report_id()?;
     let created_at = chrono::Utc::now();
+    let error_chain = error_chain
+        .iter()
+        .take(32)
+        .map(|line| sanitize_diagnostic_text(line, &files.redactions))
+        .collect::<Vec<_>>();
     let error = error_chain.first().cloned().unwrap_or_default();
+    let mut launch = metadata.get("launch").cloned().unwrap_or(Value::Null);
+    sanitize_report_value(&mut launch, &files.redactions);
     let payload = serde_json::json!({
         "schema_version": 1,
         "id": id,
@@ -455,7 +485,7 @@ pub fn create_report(
         "engine": metadata.get("engine").cloned().unwrap_or(Value::Null),
         "hardware": hardware,
         "model": metadata.get("model").cloned().unwrap_or(Value::Null),
-        "launch": metadata.get("launch").cloned().unwrap_or(Value::Null),
+        "launch": launch,
         "error": {"message": error, "chain": error_chain},
         "logs": {
             "startup": startup,
@@ -586,5 +616,42 @@ mod tests {
     #[test]
     fn ansi_is_removed_from_uploaded_logs() {
         assert_eq!(strip_ansi("\u{1b}[31merror\u{1b}[0m"), "error");
+    }
+
+    #[test]
+    fn diagnostic_truncation_preserves_utf8_boundaries() {
+        for text in ["\u{4e2d}".repeat(800), "\u{1f600}".repeat(600)] {
+            let sanitized = sanitize_diagnostic_text(&text, &[]);
+            assert!(sanitized.len() <= 2_051);
+            assert!(sanitized.ends_with("..."));
+            assert!(std::str::from_utf8(sanitized.as_bytes()).is_ok());
+        }
+    }
+
+    #[test]
+    fn diagnostic_error_chain_redacts_paths_and_credentials() {
+        let text =
+            "loading D:\\private\\model.gguf failed: Bearer abcdefghijklmnop api_key=abcdefghijk";
+        let sanitized = sanitize_diagnostic_text(text, &[]);
+        assert!(!sanitized.contains("D:\\"));
+        assert!(!sanitized.contains("abcdefghijklmnop"));
+        assert!(!sanitized.contains("abcdefghijk"));
+        assert!(sanitized.contains("failed:"));
+        assert!(
+            sanitize_diagnostic_text("0 tok/s due to a device failure", &[])
+                .contains("device failure")
+        );
+    }
+
+    #[test]
+    fn diagnostic_launch_redacts_paths_inside_settings_and_preserves_numbers() {
+        let mut launch = serde_json::json!({
+            "arguments": ["--set", "kv.session_cache_dir=C:\\private\\kv", "--ctx", "32k"],
+            "process_id": 42
+        });
+        sanitize_report_value(&mut launch, &[]);
+        assert_eq!(launch["arguments"][1], "kv.session_cache_dir=<local-path>");
+        assert_eq!(launch["arguments"][3], "32k");
+        assert_eq!(launch["process_id"], 42);
     }
 }
