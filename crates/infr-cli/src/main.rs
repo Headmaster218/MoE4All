@@ -917,7 +917,8 @@ fn sanitize_launch_arguments(
                 || ((argument.contains('\\') || argument.contains('/'))
                     && Path::new(&argument).exists())
             {
-                return Path::new(&argument)
+                let normalized = argument.replace('\\', "/");
+                return Path::new(&normalized)
                     .file_name()
                     .and_then(|name| name.to_str())
                     .unwrap_or("<local-path>")
@@ -6965,6 +6966,21 @@ mod tests {
                 "--n-prompt=6000",
             ]
         );
+    }
+
+    #[test]
+    fn diagnostic_model_paths_are_redacted_independently_of_host_platform() {
+        for model in [
+            "D:\\models\\model.gguf",
+            "/home/private/models/model.gguf",
+            "D:\\models/mixed\\model.gguf",
+            "\\\\private-server\\models\\model.gguf",
+        ] {
+            assert_eq!(
+                sanitize_launch_arguments([model.to_string()], Some(model), None),
+                ["model.gguf"],
+            );
+        }
     }
 
     /// A synthetic `INFR_*` environment, driven through the config env layer's INJECTED reader.
