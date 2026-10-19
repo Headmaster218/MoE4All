@@ -25,8 +25,81 @@ env:
 # reference Metal backend's parity suite against a real Metal device.
 
 jobs:
+  classify:
+    name: classify PR
+    runs-on: ubuntu-26.04
+    outputs:
+      submission_only: ${{ steps.diff.outputs.submission_only }}
+      submission_kind: ${{ steps.diff.outputs.submission_kind }}
+      submission_path: ${{ steps.diff.outputs.submission_path }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          submission_only=false
+          submission_kind=
+          submission_path=
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            mapfile -t changes < <(git diff --name-status "$BASE_SHA" "$HEAD_SHA")
+            submission_data_touched=false
+            for change in "${changes[@]}"; do
+              if [[ "$change" == *$'\t'benchmark-database/v1/* || "$change" == *$'\t'error-database/v1/* ]]; then
+                submission_data_touched=true
+              fi
+            done
+            if [[ ${#changes[@]} -eq 1 ]]; then
+              status=${changes[0]%%$'\t'*}
+              path=${changes[0]#*$'\t'}
+              if [[ "$status" == A && "$path" =~ ^benchmark-database/v1/[0-9]{4}-[0-9]{2}/[^/]+\.m4b$ ]]; then
+                submission_only=true
+                submission_kind=benchmark
+                submission_path=$path
+              elif [[ "$status" == A && "$path" =~ ^error-database/v1/[0-9]{4}-[0-9]{2}/[^/]+\.m4e$ ]]; then
+                submission_only=true
+                submission_kind=error
+                submission_path=$path
+              fi
+            fi
+            if [[ "$submission_data_touched" == true && "$submission_only" != true ]]; then
+              echo "submission databases are immutable: submit exactly one newly added .m4b or .m4e file" >&2
+              exit 1
+            fi
+          fi
+          echo "submission_only=$submission_only" >> "$GITHUB_OUTPUT"
+          echo "submission_kind=$submission_kind" >> "$GITHUB_OUTPUT"
+          echo "submission_path=$submission_path" >> "$GITHUB_OUTPUT"
+
+  submission-data:
+    name: community submission
+    needs: classify
+    if: needs.classify.outputs.submission_only == 'true'
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate the one immutable submission
+        env:
+          SUBMISSION_KIND: ${{ needs.classify.outputs.submission_kind }}
+          SUBMISSION_PATH: ${{ needs.classify.outputs.submission_path }}
+        run: |
+          if [[ "$SUBMISSION_KIND" == benchmark ]]; then
+            python3 scripts/validate-benchmark-submission.py "$SUBMISSION_PATH"
+          elif [[ "$SUBMISSION_KIND" == error ]]; then
+            python3 scripts/validate-error-submission.py "$SUBMISSION_PATH"
+          else
+            echo "unknown submission kind: $SUBMISSION_KIND" >&2
+            exit 1
+          fi
+
   fmt:
     name: cargo fmt --check
+    needs: classify
+    if: needs.classify.outputs.submission_only != 'true'
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
@@ -37,6 +110,8 @@ jobs:
 
   clippy:
     name: cargo clippy
+    needs: classify
+    if: needs.classify.outputs.submission_only != 'true'
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
@@ -54,6 +129,8 @@ jobs:
 
   test:
     name: cargo test
+    needs: classify
+    if: needs.classify.outputs.submission_only != 'true'
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
@@ -101,6 +178,8 @@ jobs:
   # bit-for-bit; with the model absent, cpu_golden_qwen35 self-skips (need_model!).
   cpu-goldens:
     name: cargo test (CPU goldens, real models)
+    needs: classify
+    if: needs.classify.outputs.submission_only != 'true'
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
@@ -134,6 +213,8 @@ jobs:
 
   build:
     name: cargo build --release
+    needs: classify
+    if: needs.classify.outputs.submission_only != 'true'
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
@@ -156,6 +237,8 @@ jobs:
   # the expensive `test-macos` runner. Drop this job if it ever proves flaky.
   metal-check:
     name: cargo check (infr-metal, Apple target)
+    needs: classify
+    if: needs.classify.outputs.submission_only != 'true'
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
@@ -185,6 +268,8 @@ jobs:
   # measurement exists — no one on this project has a Metal device.
   test-macos:
     name: cargo test (macOS / Metal)
+    needs: classify
+    if: needs.classify.outputs.submission_only != 'true'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
@@ -198,5 +283,35 @@ jobs:
           cache-write: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - run: cargo build --workspace --locked
       - run: cargo test -p infr-metal --locked -- --include-ignored --nocapture
+      - name: macOS launch wizard and package smoke tests
+        run: /bin/zsh scripts/smoke-macos-wizard.zsh
       - if: always()
         run: sccache --show-stats
+
+  gate:
+    name: PR gate
+    if: always()
+    needs: [classify, submission-data, fmt, clippy, test, cpu-goldens, build, metal-check, test-macos]
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Require the applicable checks
+        env:
+          CLASSIFY: ${{ needs.classify.result }}
+          SUBMISSION_ONLY: ${{ needs.classify.outputs.submission_only }}
+          SUBMISSION_DATA: ${{ needs.submission-data.result }}
+          FMT: ${{ needs.fmt.result }}
+          CLIPPY: ${{ needs.clippy.result }}
+          TEST: ${{ needs.test.result }}
+          CPU_GOLDENS: ${{ needs.cpu-goldens.result }}
+          BUILD: ${{ needs.build.result }}
+          METAL_CHECK: ${{ needs.metal-check.result }}
+          TEST_MACOS: ${{ needs.test-macos.result }}
+        run: |
+          [[ "$CLASSIFY" == success ]]
+          if [[ "$SUBMISSION_ONLY" == true ]]; then
+            [[ "$SUBMISSION_DATA" == success ]]
+          else
+            for result in "$FMT" "$CLIPPY" "$TEST" "$CPU_GOLDENS" "$BUILD" "$METAL_CHECK" "$TEST_MACOS"; do
+              [[ "$result" == success ]]
+            done
+          fi
