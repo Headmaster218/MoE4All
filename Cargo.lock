@@ -1252,6 +1252,7 @@ dependencies = [
  "infr-vision",
  "infr-vulkan",
  "libc",
+ "regex",
  "serde",
  "serde_json",
  "sha2",

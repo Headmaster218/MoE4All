@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "one_line": [
+    {"name":"control", "text":"a\u0000\tb", "limit":240, "expected":"a b"},
+    {"name":"whitespace", "text":"  a\u00a0\u2003 b  ", "limit":240, "expected":"a b"},
+    {"name":"bom-is-not-white-space", "text":"\ufeffa\ufeff", "limit":240, "expected":"\ufeffa\ufeff"},
+    {"name":"ascii-before", "unit":"x", "count":239, "limit":240, "expected_count":239, "suffix":""},
+    {"name":"ascii-exact", "unit":"x", "count":240, "limit":240, "expected_count":240, "suffix":"..."},
+    {"name":"ascii-after", "unit":"x", "count":241, "limit":240, "expected_count":240, "suffix":"..."},
+    {"name":"chinese-exact", "unit":"\u4e2d", "count":240, "limit":240, "expected_count":240, "suffix":"..."},
+    {"name":"non-bmp-exact", "unit":"\ud83d\ude00", "count":240, "limit":240, "expected_count":240, "suffix":"..."},
+    {"name":"engine-boundary", "unit":"v", "count":80, "limit":80, "expected_count":80, "suffix":"..."},
+    {"name":"header-boundary", "unit":"s", "count":500, "limit":500, "expected_count":500, "suffix":"..."}
+  ],
+  "benchmark": {
+    "schema_version":1,"id":"interop-benchmark","created_at_utc":"2026-10-19T00:00:00Z","engine_version":"1.0.3","profile":"quick",
+    "model":{"name":"Fixture.gguf","architecture":"fixture","storage_bytes":1024},
+    "hardware":{"os":"windows","gpu":{"name":"Fixture GPU","vram_total_bytes":25769803776},"ram":{"total_bytes":68719476736}},
+    "configuration":{"auto_profile":"Aggressive","mtp":false},
+    "contexts":[{"requested_context_tokens":2048,"prefill":{"tokens_per_second":1000},"failures":[],"decode":[{"parallel":1,"overall_tokens_per_second":50,"section_mean_tokens_per_second":[50,50,50],"repetitions":[{"overall":{"tokens":3,"seconds":0.06,"tokens_per_second":50},"sections":[{"tokens":1,"seconds":0.02,"tokens_per_second":50},{"tokens":1,"seconds":0.02,"tokens_per_second":50},{"tokens":1,"seconds":0.02,"tokens_per_second":50}],"lane_tokens_per_second":[[50],[50],[50]]}]}]}]
+  },
+  "error": {
+    "schema_version":1,"id":"interop-error","created_at_utc":"2026-10-19T00:00:00Z","engine_version":"1.0.3","failure_kind":"runtime",
+    "description":"Synthetic diagnostic for local interoperability tests.","engine":{},"hardware":{"gpu":{"name":"Fixture GPU"}},"model":{"name":"Fixture.gguf"},"launch":{},
+    "error":{"message":"Synthetic failure","chain":[]},"logs":{"startup":[],"tail":[],"speed_statistics_included":false},"privacy":{"prompt_or_response_included":false,"api_keys_included":false,"local_paths_redacted":true}
+  },
+  "invalid": [
+    {"kind":"benchmark","path":"/hardware/gpu/vram_total_bytes","value":-1},
+    {"kind":"benchmark","path":"/configuration/mtp","value":"false"},
+    {"kind":"benchmark","path":"/contexts/0/decode/0/parallel","value":0},
+    {"kind":"benchmark","path":"/contexts/0/decode/0/repetitions/0/lane_tokens_per_second","value":[[1,2],[1],[1]]},
+    {"kind":"benchmark","path":"/contexts/0/decode/0/overall_tokens_per_second","value":-1},
+    {"kind":"error","path":"/description","value":""},
+    {"kind":"error","path":"/logs/speed_statistics_included","value":true},
+    {"kind":"error","path":"/privacy/api_keys_included","value":true},
+    {"kind":"error","path":"/error/message","value":"Bearer this-is-a-fake-token"},
+    {"kind":"error","path":"/error/message","value":"C:\\Users\\fixture\\secret.txt"}
+  ]
+}

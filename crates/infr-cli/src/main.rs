@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 mod diagnostics;
 mod submission;
+mod submission_validation;
 
 #[derive(Parser)]
 #[command(
@@ -1184,64 +1185,12 @@ fn run_engine_command(
     exit_if_signalled();
     res
 }
-
 fn validate_benchmark_payload(value: &serde_json::Value) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        value
-            .get("schema_version")
-            .and_then(serde_json::Value::as_u64)
-            == Some(1),
-        "benchmark schema_version must be 1"
-    );
-    let profile = value
-        .get("profile")
-        .and_then(serde_json::Value::as_str)
-        .context("benchmark profile is missing")?;
-    anyhow::ensure!(
-        matches!(profile, "quick" | "standard" | "full" | "manual"),
-        "benchmark profile `{profile}` is not supported"
-    );
-    anyhow::ensure!(
-        value
-            .get("contexts")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|contexts| !contexts.is_empty()),
-        "benchmark contexts must be a non-empty array"
-    );
-    Ok(())
+    submission_validation::validate("benchmark", value)
 }
 
 fn validate_error_payload(value: &serde_json::Value) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        value
-            .get("schema_version")
-            .and_then(serde_json::Value::as_u64)
-            == Some(1),
-        "error report schema_version must be 1"
-    );
-    anyhow::ensure!(
-        value
-            .get("failure_kind")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|kind| !kind.is_empty()),
-        "error report failure_kind must be a non-empty string"
-    );
-    anyhow::ensure!(
-        value
-            .get("description")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|description| !description.trim().is_empty()),
-        "error report description must be a non-empty string"
-    );
-    for field in [
-        "engine", "hardware", "model", "launch", "error", "logs", "privacy",
-    ] {
-        anyhow::ensure!(
-            value.get(field).is_some_and(serde_json::Value::is_object),
-            "error report `{field}` must be an object"
-        );
-    }
-    Ok(())
+    submission_validation::validate("error", value)
 }
 
 fn print_submission_summary(decoded: &submission::Decoded) {
@@ -1260,8 +1209,8 @@ fn cmd_submission(action: SubmissionCommand) -> anyhow::Result<()> {
         SubmissionCommand::PackBenchmark { input, result_dir } => {
             let bytes = std::fs::read(&input)
                 .with_context(|| format!("read benchmark JSON {}", input.display()))?;
-            let value: serde_json::Value =
-                serde_json::from_slice(&bytes).context("parse benchmark JSON")?;
+            let value =
+                submission_validation::parse_json(&bytes).context("parse benchmark JSON")?;
             validate_benchmark_payload(&value)?;
             let created = value
                 .get("created_at_utc")
@@ -1286,8 +1235,8 @@ fn cmd_submission(action: SubmissionCommand) -> anyhow::Result<()> {
             );
             let bytes = std::fs::read(&input)
                 .with_context(|| format!("read benchmark JSON {}", input.display()))?;
-            let value: serde_json::Value =
-                serde_json::from_slice(&bytes).context("parse benchmark JSON")?;
+            let value =
+                submission_validation::parse_json(&bytes).context("parse benchmark JSON")?;
             validate_benchmark_payload(&value)?;
             anyhow::ensure!(
                 value.get("id").and_then(serde_json::Value::as_str) == Some(original.id.as_str()),

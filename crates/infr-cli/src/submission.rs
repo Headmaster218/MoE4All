@@ -96,7 +96,10 @@ fn value_u64(value: &Value, path: &[&str]) -> Option<u64> {
     for key in path {
         current = current.get(*key)?;
     }
-    current.as_u64()
+    current
+        .as_f64()
+        .filter(|v| (0.0..=9_007_199_254_740_991.0).contains(v) && v.fract() == 0.0)
+        .map(|v| v as u64)
 }
 
 fn value_f64(value: &Value, path: &[&str]) -> Option<f64> {
@@ -391,8 +394,8 @@ pub fn decode(text: &str) -> anyhow::Result<Decoded> {
     if actual_sha != *expected_sha {
         bail!("submission SHA-256 mismatch");
     }
-    let payload: Value =
-        serde_json::from_slice(&decoded).context("parse submission JSON payload")?;
+    let payload = crate::submission_validation::parse_json(&decoded)
+        .context("parse submission JSON payload")?;
     let id = required_string(&payload, "id")?.to_string();
     let created_at = required_string(&payload, "created_at_utc")?.to_string();
     if headers.get("id") != Some(&id) {
@@ -436,6 +439,9 @@ pub fn decode(text: &str) -> anyhow::Result<Decoded> {
 }
 
 pub fn read(path: &Path) -> anyhow::Result<Decoded> {
+    if std::fs::metadata(path)?.len() > MAX_ARMOR_BYTES as u64 {
+        bail!("submission file exceeds the {} byte limit", MAX_ARMOR_BYTES);
+    }
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("read MoE4All submission {}", path.display()))?;
     decode(&text).with_context(|| format!("decode MoE4All submission {}", path.display()))
@@ -460,6 +466,41 @@ pub fn write_new(directory: &Path, kind: Kind, payload: &Value) -> anyhow::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_summary_vectors_and_envelopes() {
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../../../scripts/fixtures/submission-vectors.json"
+        ))
+        .unwrap();
+        for case in vectors["one_line"].as_array().unwrap() {
+            let input = case["text"].as_str().map(str::to_owned).unwrap_or_else(|| {
+                case["unit"]
+                    .as_str()
+                    .unwrap()
+                    .repeat(case["count"].as_u64().unwrap() as usize)
+            });
+            let expected = case["expected"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    case["unit"]
+                        .as_str()
+                        .unwrap()
+                        .repeat(case["expected_count"].as_u64().unwrap() as usize)
+                        + case["suffix"].as_str().unwrap()
+                });
+            assert_eq!(
+                one_line(input, case["limit"].as_u64().unwrap() as usize),
+                expected,
+                "{}",
+                case["name"]
+            );
+        }
+        for kind in [Kind::Benchmark, Kind::Error] {
+            let text = encode(kind, &vectors[kind.as_str()]).unwrap();
+            assert_eq!(decode(&text).unwrap().payload, vectors[kind.as_str()]);
+        }
+    }
 
     fn sample() -> Value {
         serde_json::json!({

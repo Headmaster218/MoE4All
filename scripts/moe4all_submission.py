@@ -7,6 +7,7 @@ import argparse
 import base64
 import hashlib
 import json
+import math
 import re
 import sys
 import zlib
@@ -34,8 +35,54 @@ class Submission:
 
 
 def _one_line(value: object, limit: int) -> str:
-    text = " ".join(str(value).split())
-    return text if len(text) <= limit else text[:limit] + "..."
+    output: list[str] = []
+    previous_space = False
+    for char in str(value):
+        code = ord(char)
+        if code <= 31 or 127 <= code <= 159:
+            char = " "
+        # Rust char::is_whitespace uses Unicode White_Space, not Python's extra C0 separators.
+        whitespace = char in "\t\n\v\f\r \u0085\u00a0\u1680\u2028\u2029\u202f\u205f\u3000" or "\u2000" <= char <= "\u200a"
+        if whitespace:
+            if previous_space:
+                continue
+            previous_space = True
+            output.append(" ")
+        else:
+            previous_space = False
+            output.append(char)
+        if len(output) >= limit:
+            output.append("...")
+            break
+    return "".join(output).strip()
+
+
+def strict_json(text: str) -> Any:
+    def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in items:
+            if key in result or key in {"__proto__", "constructor", "prototype"} or any(0xD800 <= ord(c) <= 0xDFFF for c in key):
+                raise ValueError("duplicate or reserved JSON field")
+            result[key] = value
+        return result
+
+    def visit(value: Any, depth: int = 0) -> None:
+        if depth > 48:
+            raise ValueError("JSON nesting exceeds 48 levels")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if (isinstance(value, int) and abs(value) > 9007199254740991) or (isinstance(value, float) and (not math.isfinite(value) or value == int(value) and abs(value) > 9007199254740991)):
+                raise ValueError("JSON number exceeds the interoperable range")
+        if isinstance(value, str) and any(0xD800 <= ord(c) <= 0xDFFF for c in value):
+            raise ValueError("JSON text contains an unpaired surrogate")
+        for child in value.values() if isinstance(value, dict) else value if isinstance(value, list) else []:
+            visit(child, depth + 1)
+
+    try:
+        value = json.loads(text, object_pairs_hook=pairs, parse_constant=lambda _: (_ for _ in ()).throw(ValueError("invalid JSON number")))
+    except (RecursionError, OverflowError):
+        raise ValueError("JSON nesting or numeric limits exceeded") from None
+    visit(value)
+    return value
 
 
 def _nested(value: object, *path: str) -> object | None:
@@ -48,17 +95,20 @@ def _nested(value: object, *path: str) -> object | None:
 
 
 def _gib(value: object, unknown: str) -> str:
-    if not isinstance(value, int) or isinstance(value, bool):
+    if type(value) not in (int, float) or not math.isfinite(value) or value != int(value) or not 0 <= value <= 9007199254740991:
         return unknown
     return f"{value / (1 << 30):.2f} GiB"
 
 
 def generated_summary(kind: str, payload: dict[str, Any]) -> list[str]:
     if kind == "benchmark":
-        model = _nested(payload, "model", "name") or "unknown model"
-        architecture = _nested(payload, "model", "architecture") or "unknown"
+        model = _nested(payload, "model", "name")
+        model = "unknown model" if model is None else model
+        architecture = _nested(payload, "model", "architecture")
+        architecture = "unknown" if architecture is None else architecture
         model_size = _gib(_nested(payload, "model", "storage_bytes"), "unknown size")
-        gpu = _nested(payload, "hardware", "gpu", "name") or "unknown device"
+        gpu = _nested(payload, "hardware", "gpu", "name")
+        gpu = "unknown device" if gpu is None else gpu
         vram = _gib(_nested(payload, "hardware", "gpu", "vram_total_bytes"), "unknown VRAM")
         lines = [f"model: {model} | {architecture} | {model_size}", f"device: {gpu} | {vram}"]
         profile = payload.get("profile")
@@ -70,6 +120,8 @@ def generated_summary(kind: str, payload: dict[str, Any]) -> list[str]:
                 if not isinstance(context, dict):
                     continue
                 tokens = context.get("requested_context_tokens", 0)
+                if type(tokens) in (int, float) and math.isfinite(tokens) and tokens == int(tokens):
+                    tokens = int(tokens)
                 label = (
                     f"{tokens // 1024}K"
                     if isinstance(tokens, int) and not isinstance(tokens, bool) and tokens and tokens % 1024 == 0
@@ -85,6 +137,8 @@ def generated_summary(kind: str, payload: dict[str, Any]) -> list[str]:
                         if not isinstance(case, dict):
                             continue
                         parallel = case.get("parallel", 0)
+                        if type(parallel) in (int, float) and math.isfinite(parallel) and parallel == int(parallel):
+                            parallel = int(parallel)
                         rate = case.get("overall_tokens_per_second")
                         if isinstance(rate, (int, float)) and not isinstance(rate, bool):
                             result.append(f"x{parallel}={rate:.2f}")
@@ -114,7 +168,7 @@ def generated_summary(kind: str, payload: dict[str, Any]) -> list[str]:
 def decode_text(text: str) -> Submission:
     if len(text.encode("utf-8")) > MAX_ARMOR_BYTES:
         raise ValueError(f"submission exceeds {MAX_ARMOR_BYTES} bytes")
-    lines = text.replace("\r\n", "\n").replace("\r", "\n").splitlines()
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     if not lines or lines[0] != ARMOR_VERSION:
         raise ValueError(f"not a {ARMOR_VERSION} document")
     try:
@@ -145,7 +199,10 @@ def decode_text(text: str) -> Submission:
         raise ValueError("submission schema does not match kind")
     if headers.get("encoding") != "gzip+base64":
         raise ValueError("submission encoding must be gzip+base64")
-    compressed = base64.b64decode("".join(line.strip() for line in lines[begin + 1 : end]), validate=True)
+    encoded = "".join(line.strip() for line in lines[begin + 1 : end])
+    compressed = base64.b64decode(encoded, validate=True)
+    if base64.b64encode(compressed).decode("ascii") != encoded:
+        raise ValueError("noncanonical Base64 padding")
     if len(compressed) != int(headers["compressed-bytes"]):
         raise ValueError("compressed payload length mismatch")
     inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
@@ -163,7 +220,7 @@ def decode_text(text: str) -> Submission:
         raise ValueError("decoded payload length mismatch")
     if hashlib.sha256(decoded).hexdigest() != headers.get("sha256"):
         raise ValueError("submission SHA-256 mismatch")
-    payload = json.loads(decoded.decode("utf-8"), parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+    payload = strict_json(decoded.decode("utf-8"))
     if not isinstance(payload, dict):
         raise ValueError("decoded payload must be a JSON object")
     submission_id = payload.get("id")
@@ -188,7 +245,9 @@ def decode_text(text: str) -> Submission:
 
 
 def decode_file(path: Path) -> Submission:
-    return decode_text(path.read_text(encoding="utf-8"))
+    if path.stat().st_size > MAX_ARMOR_BYTES:
+        raise ValueError(f"submission exceeds {MAX_ARMOR_BYTES} bytes")
+    return decode_text(path.read_bytes().decode("utf-8"))
 
 
 def main(argv: list[str]) -> int:
@@ -203,6 +262,8 @@ def main(argv: list[str]) -> int:
     try:
         submission = decode_file(args.path)
         if args.command == "verify":
+            from submission_validation import validate_payload
+            validate_payload(submission.kind, submission.payload)
             print(f"valid {submission.kind} submission {submission.submission_id}")
         else:
             text = json.dumps(submission.payload, ensure_ascii=False, indent=2) + "\n"
