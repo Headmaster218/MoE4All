@@ -671,11 +671,27 @@ pub(crate) const TURN_CHECKPOINT_COUNT: usize = 2;
 pub struct TurnCheckpointPrefixes<'a> {
     pub agent: Option<&'a str>,
     pub edit: Option<&'a str>,
+    /// Benchmark-only checkpoint immediately before the un-fed prompt frontier. A Prefill-only
+    /// call deliberately leaves the final prompt token for the first Decode step, so this is the
+    /// latest recurrent state that can be captured without adding a tiny Prefill chunk.
+    pub benchmark_frontier: bool,
 }
 
 impl<'a> TurnCheckpointPrefixes<'a> {
     pub const fn edit(edit: Option<&'a str>) -> Self {
-        Self { agent: None, edit }
+        Self {
+            agent: None,
+            edit,
+            benchmark_frontier: false,
+        }
+    }
+
+    pub const fn benchmark_frontier() -> Self {
+        Self {
+            agent: None,
+            edit: None,
+            benchmark_frontier: true,
+        }
     }
 }
 

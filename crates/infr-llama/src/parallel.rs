@@ -1284,6 +1284,11 @@ impl ParallelSeam {
         self.vk.capabilities().name
     }
 
+    /// Live device-memory snapshot for diagnostics and benchmark result attribution.
+    pub fn vram_info(&self) -> infr_vulkan::VramInfo {
+        self.vk.vram()
+    }
+
     pub fn model(&self) -> &SeamModel {
         &self.model
     }
@@ -1294,6 +1299,109 @@ impl ParallelSeam {
             Some(g) => RequestCtx::with_gate(sampling, g.clone()),
             None => RequestCtx::new(sampling),
         }
+    }
+
+    /// Fill one real prompt into each slot without counting setup prompts as concurrent Prefill.
+    ///
+    /// The automatic benchmark measures slot 0 as its single Prefill result, then needs equivalent
+    /// real contexts in the remaining slots before it can measure x2..xN Decode. Driving those
+    /// prompts through ordinary checkout would repeatedly select the best-prefix slot instead of
+    /// deterministically filling every slot. This setup-only entry point pins prompt `i` to slot
+    /// `i`, while using the same runner, KV layout and turn checkpoint machinery as serving.
+    pub fn prepare_benchmark_slots(
+        &self,
+        prompts: &[String],
+        progress: Option<&[infr_core::GenerationProgressCallback]>,
+    ) -> Result<Vec<GenStats>> {
+        anyhow::ensure!(
+            !prompts.is_empty() && prompts.len() <= self.n_slots(),
+            "benchmark needs 1..={} prompts, got {}",
+            self.n_slots(),
+            prompts.len(),
+        );
+        anyhow::ensure!(
+            self.mtp_heads.is_none(),
+            "automatic benchmark slot preparation does not support MTP yet"
+        );
+        anyhow::ensure!(
+            progress.is_none_or(|callbacks| callbacks.len() == prompts.len()),
+            "benchmark Prefill progress callback count must match the prompt count"
+        );
+
+        let mut results = Vec::with_capacity(prompts.len());
+        let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
+        for (index, prompt) in prompts.iter().enumerate() {
+            let prompt_tokens = self.model.encode(prompt)?;
+            let checkpoint = self.model.turn_checkpoints(
+                &prompt_tokens,
+                crate::seam::TurnCheckpointPrefixes::benchmark_frontier(),
+            )?;
+            let req = self
+                .request_ctx(crate::sampling::RequestSampling::default())
+                .with_progress(progress.and_then(|callbacks| callbacks.get(index).cloned()));
+            let mut kv = {
+                let mut pool = self.pool.lock().expect("pool poisoned");
+                let slot = &mut pool.slots[index];
+                anyhow::ensure!(!slot.busy, "benchmark slot {index} is busy");
+                slot.busy = true;
+                slot.multimodal_key = None;
+                slot.kv.take()
+            };
+            let run = crate::seam::generate_dense_vulkan_session(
+                self.vk.as_ref(),
+                self.model.gguf(),
+                self.model.config(),
+                self.model.engine_cfg(),
+                self.model.embd(),
+                self.model.per_layer_embd(),
+                &prompt_tokens,
+                0,
+                |_| {},
+                &mut kv,
+                self.max_ctx,
+                checkpoint,
+                None,
+                Some(&req),
+                None,
+            );
+            {
+                let mut pool = self.pool.lock().expect("pool poisoned");
+                pool.tick += 1;
+                let tick = pool.tick;
+                let slot = &mut pool.slots[index];
+                slot.kv = kv;
+                slot.busy = false;
+                slot.tick = tick;
+                slot.idle_since = self.session_cache.is_some().then(Instant::now);
+            }
+            self.freed.notify_all();
+            results.push((run?).1);
+        }
+        Ok(results)
+    }
+
+    /// Reset every resident benchmark slot so the next context-size case measures a full real
+    /// Prefill instead of extending or seeding from the preceding case. Keep the preallocated KV
+    /// buffers alive: the Vulkan arena is frozen after startup and cannot recreate those claims.
+    pub fn clear_benchmark_slots(&self) -> Result<()> {
+        let mut pool = self.pool.lock().expect("pool poisoned");
+        anyhow::ensure!(
+            pool.slots.iter().all(|slot| !slot.busy),
+            "cannot clear benchmark slots while a request is active"
+        );
+        for slot in &mut pool.slots {
+            if let Some(kv) = slot.kv.as_mut() {
+                kv.reset();
+            }
+            slot.multimodal_key = None;
+            slot.idle_since = None;
+        }
+        if let Some(heads) = &self.mtp_heads {
+            for head in heads.lock().expect("MTP heads poisoned").iter_mut() {
+                head.invalidate_all();
+            }
+        }
+        Ok(())
     }
 
     /// Take a slot for `prompt`, blocking until one is free.
