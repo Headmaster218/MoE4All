@@ -239,3 +239,64 @@ kernel 来说，这是**延迟**（launch + 依赖 + 小 workgroup），不是�
   indexer/gather/topk 家族（≈22%），第三才是 MoE 的 GEMV 家族（≈15%）。head 在列表末尾。
 - 另一条与 kernel 正交的杠杆是**摊薄**：延迟型瓶颈下并发 lane 越多越划算（2 lane 已经把
   cohort ratio 做到 1.8），这正是 `infr serve --parallel N` 的方向。
+
+---
+
+# `deltanet` / `rmsnorm_gate_sigmoid` 单行 kernel 剖析（2026-10-19 11:0x）
+
+把两个最大头的 kernel 从生产环境里**孤立出来**测（串行化 repeat，WAW 依赖强制排队，wall/REPS
+即单次派发成本）：
+
+```
+cargo test -p infr-vulkan --test recurrent_kernel_probe -- --ignored --nocapture
+```
+
+## 结果（RX 7900 XTX / RADV，稳定可复现）
+
+| kernel | state 在 VRAM | state 在宿主 RAM(PCIe) |
+|---|---:|---:|
+| `deltanet` rows=1（nv16 nk16 kd128 vd128，state 1 MiB） | **114.8 µs** | **374.0 µs** |
+| `deltanet` rows=8 | 254.7 µs | 506.4 µs |
+| `deltanet` rows=64 | 1102.1 µs（**17.2 µs/token**） | 1370.0 µs |
+| `rmsnorm_gate_sigmoid` rows=1 dim=2048 | 22.9 µs | — |
+| `rmsnorm_gate_sigmoid` rows=64 dim=2048 | 23.4 µs | — |
+
+## 解读：350 µs 里各占多少
+
+1. **launch/依赖 floor ≈ 115 µs**：`deltanet` 在 state 已在 VRAM 时，单行一次仍要 115 µs
+   （grid = nv×(vd/32) = 64 个 32 线程 workgroup，state 块走 LDS，每线程串行跑完整列）。
+   这部分是纯延迟，不是算力：整个 kernel 的真实 FLOP 只有 ~0.8 MFLOP（≈0.03 µs 的算力）。
+2. **访存(PCIe) ≈ +259 µs（3.3x）**：把 state 换成宿主 RAM（就是 `INFR_KV_OVERFLOW` 溢出的那一层）
+   就多出 259 µs。这与上下文深度**无关**（production 里 depth≈20 与 depth=32768 都是 500–700 µs）
+   —— 因为 state 是每 token 读+写 1 MiB 的固定量，跟 KV 长度无关。
+3. **`rmsnorm_gate_sigmoid` 的 kernel 只要 23 µs，而且对 rows 完全不敏感**（rows=64 也是 23 µs）
+   = 纯派发 floor。它在 production 里被记到 ~500 µs，**几乎全是 stall** —— GPU 在等前一个
+   DeltaNet 算子的输出，而那份输出住在 PCIe 那侧。per-op 表把这段等待记在了「先到的那个算子」头上。
+4. **摊薄杠杆被证实**：rows=64 时 `deltanet` 是 17.2 µs/token，比 rows=1 的 115 µs 好 **6.7x**。
+   单序列的 token 是串行依赖没法批，但这正是 prefill / MTP verify / 多 lane 的价值所在。
+
+结论：**这俩 kernel 的「350 µs」里，真正 kernel 结构只占 ~115 µs（deltanet）/ 23 µs（gate-norm），
+其余是把 36 MB 的 recurrent state 放在宿主 RAM 上反复走 PCIe 的代价。**
+
+## 容量核算：state 其实放得下
+
+`INFR_KV_OVERFLOW_VRAM_MB` 扫描（每个模块的 per-device 累计 KV 驻留上限，32K/256K/-u256）：
+
+| 上限 | 实测驻留 | 结果 |
+|---:|---:|---|
+| 0（A/B 脚本默认） | 0 MiB | ratio 1.776–1.784，103.1 ms/step |
+| 8 | 8.0 MiB | 完成，ratio 1.7843 |
+| 16 | 15.9 MiB | 完成，ratio 1.7869 |
+| 32 | 32.0 MiB | 完成，ratio 1.7821 |
+| 48 | 47.9 MiB | 完成，ratio 1.7915 |
+| 64 | 54 buffers | **失败**：`moe_dqa` 3.2 MiB 被拒（激活池没了） |
+
+即每张卡还能匀出 **~48–64 MiB**，而整份 DeltaNet state 只有 1 MiB × 36 层 ≈ **36 MB**（每卡 ~18 MB）。
+上限扫描没有提速，是因为 cap 是**按分配顺序**累计的：先到的是 7 MiB 一块的 attention KV 平面，
+48 MiB 只覆盖了 6–7 层，真正的 state 小块混在后面。**state 本身完全放得下。**
+
+## 下一步（建议）
+
+把 **DeltaNet/SSM 的 state（SSM 层的 `kbufs`/`vbufs` + conv state）改成 VRAM 优先放置**，让 ~36 MB
+进 VRAM、337 MB 的 attention KV 继续溢出宿主。预期收益：占解码设备时间 55.6% 的 SSM 部分
+丢掉 3.3x 的 state 惩罚（以及它导致的、被记在 `rmsnorm_gate_sigmoid` 头上的 stall）。
