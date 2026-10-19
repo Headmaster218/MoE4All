@@ -7,6 +7,8 @@ trap 'rm -rf -- "$tmp"' EXIT
 ROOT=$tmp/package
 CONFIG_DIR=$tmp/config/infr
 STATE=$CONFIG_DIR/wizard-state.json
+LEGACY_CONFIG_DIR=$tmp/legacy-config/infr
+LEGACY_STATE=$LEGACY_CONFIG_DIR/wizard-state.json
 BINARY=$ROOT/infr
 mkdir -p "$ROOT" "$CONFIG_DIR"
 cp "$repo/Start-INFR-Wizard-Linux.sh" "$ROOT/"
@@ -62,8 +64,8 @@ reset; S[launch_mode]=bench; S[bench_kind]=standard; S[bench_parallel]=3
 build_command; has_arg --suite; has_arg standard; has_arg --parallel; has_arg 3; has_arg --result-dir; ! has_arg --synthetic-depth; pass
 reset; S[launch_mode]=bench; S[setup_mode]=aggressive; S[device]=Vulkan1
 start_benchmark_estimate_probe
-benchmark_estimate_detail quick 1; [[ $REPLY == 'Estimated about 1 min.' ]]; pass
-benchmark_estimate_detail standard 3; [[ $REPLY == 'Estimated about 4 min.' ]]; pass
+benchmark_estimate_detail quick 1; [[ $REPLY == '预计约 1 分钟。Estimated about 1 min.' ]]; pass
+benchmark_estimate_detail standard 3; [[ $REPLY == '预计约 4 分钟。Estimated about 4 min.' ]]; pass
 reset; S[error_upload]=false
 output=$(complete_error_report <<< $'first line\nsecond line\n.\n1\nn\n')
 [[ $output == *MOE4ALL_SUBMISSION_PATH=*fixture.m4e* && ${S[error_upload]} == false ]]; pass
@@ -143,6 +145,17 @@ printf 'MODE=server\nMODEL=model.gguf\nPROFILE=aggressive\nUBATCH=3072\nMMPROJ=i
 defaults; load_state; [[ ${S[launch_mode]} == serve && ${S[server_vision]} == true && ${S[auto_overrides]} == *ubatch* ]]; pass
 rm "$CONFIG_DIR/wizard.conf"
 
+# Package-local state wins. Old XDG state is a read-only fallback and migrates
+# naturally when the next normal save writes the package-local state.
+mkdir -p "$LEGACY_CONFIG_DIR"
+printf '{"model":"legacy-model.gguf","setup_mode":"aggressive"}\n' > "$LEGACY_STATE"
+defaults; load_state; [[ ${S[model]} == legacy-model.gguf && ${S[setup_mode]} == aggressive ]]; pass
+printf '{"model":"package-model.gguf","setup_mode":"conservative"}\n' > "$STATE"
+defaults; load_state; [[ ${S[model]} == package-model.gguf && ${S[setup_mode]} == conservative ]]; pass
+rm "$STATE"
+defaults; load_state; save_state
+[[ -f $STATE && -f $LEGACY_STATE && ${S[model]} == legacy-model.gguf ]]; pass
+
 mkdir "$ROOT/models"
 for name in flash-00001-of-00002.gguf flash-00002-of-00002.gguf mmproj-flash.gguf mtp-flash.gguf; do touch "$ROOT/models/$name"; done
 model_candidates "$ROOT/models" llm; [[ ${#CANDIDATES[@]} == 1 && ${CANDIDATES[0]} == *-00001-of-00002.gguf ]]; pass
@@ -168,7 +181,7 @@ catalog_load qwen3-embedding-06b-q8; [[ $CATALOG_KIND == embedding && $CATALOG_P
     }
     reset; model_path llm model <<< $'D\nN\nmodels/flash-00001-of-00002.gguf'; printf '%s\n' "${S[model]}" > "$tmp/model-after-download"
 ) > "$tmp/model-download-choice"
-[[ $(grep -c '^LLM model$' "$tmp/model-download-choice") == 2 && $(< "$tmp/model-after-download") == *flash-00001-of-00002.gguf ]]; pass
+[[ $(grep -c '^LLM 模型 / model$' "$tmp/model-download-choice") == 2 && $(< "$tmp/model-after-download") == *flash-00001-of-00002.gguf ]]; pass
 
 # Exercise the real download path without network access and reject arbitrary URLs.
 mkdir "$tmp/fake-downloader"

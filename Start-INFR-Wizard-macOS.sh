@@ -616,10 +616,10 @@ prompt() {
     local value
     while true; do
         printf '%s' "$1"; [[ -z ${2-} ]] || printf ' [%s]' "$2"; printf ': '
-        IFS= read -r value || { fail 'Launch cancelled: input ended.'; return 1; }; trim "$value"; value=$REPLY
+        IFS= read -r value || { fail '启动已取消：输入已结束。Launch cancelled: input ended.'; return 1; }; trim "$value"; value=$REPLY
         if [[ $value == - ]]; then value=''; elif [[ -z $value ]]; then value=${2-}; fi
         if [[ -n $value || ${3-false} == false ]]; then REPLY=$value; return; fi
-        printf 'A value is required.\n'
+        printf '此项不能为空。A value is required.\n'
     done
 }
 ask() { prompt "$2" "${S[$1]}" "${3-false}"; S[$1]=$REPLY; }
@@ -627,9 +627,9 @@ yes() {
     local value
     while true; do
         if [[ ${2-false} == true ]]; then printf '%s [Y/n]: ' "$1"; else printf '%s [y/N]: ' "$1"; fi
-        IFS= read -r value || { fail 'Launch cancelled: input ended.'; return 1; }; trim "$value"; value=${REPLY:l}
+        IFS= read -r value || { fail '启动已取消：输入已结束。Launch cancelled: input ended.'; return 1; }; trim "$value"; value=${REPLY:l}
         case $value in '') REPLY=${2-false}; return ;; y|yes) REPLY=true; return ;; n|no) REPLY=false; return ;; esac
-        printf 'Enter y or n.\n'
+        printf '请输入 y 或 n。Enter y or n.\n'
     done
 }
 ask_yes() { yes "$2" "${S[$1]}"; S[$1]=$REPLY; }
@@ -638,7 +638,7 @@ integer() {
     while true; do
         prompt "$2" "${S[$1]}"
         if [[ -z $REPLY && ${5-false} == true ]] || valid_uint "$REPLY" "${3-0}" "${4-999999999}"; then S[$1]=$REPLY; return; fi
-        printf 'Integer outside the allowed range.\n'
+        printf '整数超出允许范围。Integer outside the allowed range.\n'
     done
 }
 choice() {
@@ -659,8 +659,8 @@ choice() {
         fi
     done
     while true; do
-        printf 'Select (Enter = previous/default): '
-        IFS= read -r selected || { fail 'Launch cancelled: input ended.'; return 1; }; trim "$selected"; selected=$REPLY
+        printf '选择（回车复用上次值/默认值）/ Select (Enter = previous/default): '
+        IFS= read -r selected || { fail '启动已取消：输入已结束。Launch cancelled: input ended.'; return 1; }; trim "$selected"; selected=$REPLY
         if [[ -z $selected ]]; then
             for entry in "${values[@]}"; do [[ ${S[$key]} != "$entry" ]] || return 0; done
         elif valid_uint "$selected" 1 "${#values[@]}"; then
@@ -669,7 +669,7 @@ choice() {
         for ((i=0;i<${#values[@]};i++)); do
             if [[ $selected == "${values[i]}" ]]; then S[$key]=${values[i]}; return; fi
         done
-        printf 'Choose a listed option.\n'
+        printf '请选择列表中的选项。Choose a listed option.\n'
     done
 }
 
@@ -725,13 +725,13 @@ catalog_file() {
 }
 recommendations() {
     local kind=${1-all} id
-    printf '\nOfficial recommended models and components:\n'
+    printf '\n官方推荐的模型与组件 / Official recommended models and components:\n'
     for id in "${CATALOG_IDS[@]}"; do
         catalog_load "$id"
         [[ $kind == all || $CATALOG_KIND == "$kind" ]] || continue
         printf ' %s\n   %s\n' "$CATALOG_NAME" "$CATALOG_INFO"
     done
-    printf 'Choose D in a model prompt to download one or more items into %s/models.\n' "$ROOT"
+    printf '在模型选择中按 D，可将一个或多个项目下载到 %s/models。\nChoose D in a model prompt to download one or more items into %s/models.\n' "$ROOT" "$ROOT"
 }
 catalog_candidates() {
     local kind=$1 id candidate_path found existing
@@ -743,7 +743,7 @@ catalog_candidates() {
     done
 }
 ensure_model_downloader() {
-    command -v curl >/dev/null 2>&1 || { fail 'The system curl command is required for model downloads.'; return 1; }
+    command -v curl >/dev/null 2>&1 || { fail '下载模型需要系统自带的 curl。The system curl command is required for model downloads.'; return 1; }
     MODEL_DOWNLOADER=curl
 }
 model_download_file() {
@@ -751,7 +751,7 @@ model_download_file() {
     [[ $url =~ $RE_HUGGINGFACE_URL ]] || {
         fail "Refusing non-catalog download URL: $url"; return 1;
     }
-    if [[ -s $destination ]]; then printf 'Already present: %s\n' "$destination"; return 0; fi
+    if [[ -s $destination ]]; then printf '已存在 / Already present: %s\n' "$destination"; return 0; fi
     [[ ! -e $destination ]] || rm -f -- "$destination"
     mkdir -p -- "${destination%/*}"; partial="$destination.part"
     ensure_model_downloader || return 1
@@ -762,15 +762,15 @@ model_download_file() {
             [[ -s $partial ]] || { fail 'Downloaded file is empty.'; return 1; }
             mv -f -- "$partial" "$destination"; return 0
         fi
-        printf 'Download interrupted; retrying from .part (%d/3).\n' "$attempt" >&2
+        printf '下载中断，正在从 .part 续传（%d/3）。Download interrupted; retrying from .part.\n' "$attempt" >&2
         ((attempt==3)) || sleep $((attempt*2))
     done
-    fail 'Download failed after 3 attempts.'
+    fail '下载重试 3 次后仍失败。Download failed after 3 attempts.'
 }
 download_bundle() {
     local id=$1 i destination
     catalog_load "$id" || return 1
-    printf '\nDownload: %s\nFolder: %s/models\n' "$CATALOG_NAME" "$ROOT"
+    printf '\n下载 / Download: %s\n目录 / Folder: %s/models\n' "$CATALOG_NAME" "$ROOT"
     for ((i=1;i<=CATALOG_COUNT;i++)); do
         catalog_file "$id" "$i"
         destination="$ROOT/models/$DOWNLOAD_RELATIVE"
@@ -778,19 +778,19 @@ download_bundle() {
     done
     catalog_load "$id"
     [[ -s $ROOT/models/$CATALOG_PRIMARY ]] || { fail "Downloaded primary file is missing: $ROOT/models/$CATALOG_PRIMARY"; return 1; }
-    printf 'Download complete: %s/models/%s\n' "$ROOT" "$CATALOG_PRIMARY"
+    printf '下载完成 / Download complete: %s/models/%s\n' "$ROOT" "$CATALOG_PRIMARY"
 }
 download_menu() {
     local raw token number index id primary i valid; local -a selected=(); local -A seen=()
     while true; do
-        printf '\nDownload models and components\n'
+        printf '\n下载模型与组件 / Download models and components\n'
         for ((i=0;i<${#CATALOG_IDS[@]};i++)); do
             catalog_load "${CATALOG_IDS[i]}"; primary="$ROOT/models/$CATALOG_PRIMARY"
-            if [[ -s $primary ]]; then printf ' [%d] %s [installed]\n' "$((i+1))" "$CATALOG_NAME"; else printf ' [%d] %s\n' "$((i+1))" "$CATALOG_NAME"; fi
+            if [[ -s $primary ]]; then printf ' [%d] %s [已安装 / installed]\n' "$((i+1))" "$CATALOG_NAME"; else printf ' [%d] %s\n' "$((i+1))" "$CATALOG_NAME"; fi
             printf '     %s\n' "$CATALOG_INFO"
         done
-        printf ' [A] All\n [B] Back\nSelect one or more numbers, comma-separated: '
-        IFS= read -r raw || { fail 'Download selection cancelled: input ended.'; return 1; }; trim "$raw"; raw=$REPLY
+        printf ' [A] 全部 / All\n [B] 返回 / Back\n选择一个或多个编号，用逗号分隔 / Select one or more numbers, comma-separated: '
+        IFS= read -r raw || { fail '下载选择已取消：输入已结束。Download selection cancelled: input ended.'; return 1; }; trim "$raw"; raw=$REPLY
         case ${raw:l} in b|back) return 0 ;; a|all) selected=(0 1 2 3) ;; *)
             raw=${raw//,/ }; raw=${raw//;/ }; selected=(); seen=(); valid=true
             for token in $raw; do
@@ -798,9 +798,9 @@ download_menu() {
                 number=$((10#$token)); index=$((number-1))
                 [[ -v "seen[$index]" ]] || { selected+=("$index"); seen[$index]=1; }
             done
-            if [[ $valid != true || ${#selected[@]} == 0 ]]; then printf 'Choose listed numbers separated by commas.\n'; continue; fi ;;
+            if [[ $valid != true || ${#selected[@]} == 0 ]]; then printf '请选择列表中的编号，并用逗号分隔。Choose listed numbers separated by commas.\n'; continue; fi ;;
         esac
-        yes 'Start or resume the selected downloads now?' true; [[ $REPLY == true ]] || return 0
+        yes '现在开始或继续所选下载？/ Start or resume the selected downloads now?' true; [[ $REPLY == true ]] || return 0
         for index in "${selected[@]}"; do id=${CATALOG_IDS[index]}; download_bundle "$id" || return 1; done
         return 0
     done
@@ -845,12 +845,12 @@ model_path() {
         [[ $found == true ]] || nearby=("$value" "${nearby[@]}")
     done
     while true; do
-        printf '\n%s model\n' "${kind:u}"
+        printf '\n%s 模型 / model\n' "${kind:u}"
         for ((i=0;i<${#nearby[@]};i++)); do printf ' [%d] %s\n' "$((i+1))" "${nearby[i]}"; done
-        printf ' [D] Download models or components\n [R] Show official download links\n [N] Enter a new path\n'
+        printf ' [D] 下载模型或组件 / Download models or components\n [R] 显示官方下载链接 / Show official download links\n [N] 输入新路径 / Enter a new path\n'
         value=$saved; [[ -n $value || ${#nearby[@]} == 0 ]] || value=1
         [[ -n $value || ${#nearby[@]} != 0 ]] || value=D
-        prompt 'Select a model, command, or GGUF path' "$value" true; value=$REPLY
+        prompt '选择模型、命令或 GGUF 路径 / Select a model, command, or GGUF path' "$value" true; value=$REPLY
         if [[ ${value:l} == d || ${value:l} == download ]]; then
             case $kind in
                 vision) download_bundle flashnext-vision || continue ;;
@@ -861,7 +861,7 @@ model_path() {
             saved=''; continue
         fi
         if [[ ${value:l} == r || ${value:l} == recommended ]]; then recommendations "$kind"; continue; fi
-        if [[ ${value:l} == n || ${value:l} == new ]]; then prompt 'GGUF file or directory' '' true; value=$REPLY; fi
+        if [[ ${value:l} == n || ${value:l} == new ]]; then prompt 'GGUF 文件或目录 / GGUF file or directory' '' true; value=$REPLY; fi
         if valid_uint "$value" 1 "${#nearby[@]}"; then value=${nearby[10#$value-1]}; fi
         if [[ $value == \"*\" ]]; then value=${value:1:${#value}-2}; fi
         absolute "$value"; candidate_path=$REPLY
@@ -869,10 +869,10 @@ model_path() {
         if [[ -d $candidate_path ]]; then
             model_candidates "$candidate_path" "$kind"
             if ((${#CANDIDATES[@]}==1)); then S[$key]=${CANDIDATES[0]}; return; fi
-            printf 'Directory has %d candidates; enter the exact file path.\n' "${#CANDIDATES[@]}"; continue
+            printf '目录中有 %d 个候选文件，请输入准确文件路径。Directory has %d candidates; enter the exact file path.\n' "${#CANDIDATES[@]}" "${#CANDIDATES[@]}"; continue
         fi
         if [[ $kind == llm ]] && hub_reference "$value"; then S[$key]=$value; return; fi
-        printf 'GGUF file not found.\n'
+        printf '未找到 GGUF 文件。GGUF file not found.\n'
     done
 }
 
@@ -932,7 +932,7 @@ physical_cores() {
 }
 choose_device() {
     S[device]=metal
-    printf '\n3. Runtime device\n * Metal: Apple GPU (experimental)\n'
+    printf '\n设备 / Runtime device\n * Metal: Apple GPU（实验性 / experimental）\n'
 }
 valid_address() {
     local host port part compressed=false; local -a parts
@@ -1079,7 +1079,7 @@ website_submission_upload() {
     json_quote "$report_id"; local q_id=$REPLY
     json_quote "$file_hash"; local q_hash=$REPLY
     printf '{"kind":%s,"report_id":%s,"file_sha256":%s,"size_bytes":%s}\n' "$q_kind" "$q_id" "$q_hash" "$size" > "$request"
-    printf '\nCreating a secure upload session / 正在创建安全上传会话...\n'
+    printf '\n正在创建安全上传会话 / Creating a secure upload session...\n'
     if ! submission_api_request POST "$SUBMISSION_API_BASE/upload-sessions" "$response" '' "$request"; then rm -f -- "$request" "$response"; return 1; fi
     if ! json_load "$response"; then rm -f -- "$request" "$response"; fail 'Submission service returned invalid JSON.'; return 1; fi
     json_get '["api_version"]'; [[ $REPLY == 1 ]] || { rm -f -- "$request" "$response"; return 1; }
@@ -1126,7 +1126,7 @@ website_submission_upload() {
     local public_path='["public_url"]'
     if [[ -v "J[$public_path]" && ${J[$public_path]} == \"*\" ]]; then json_get "$public_path"; public_url=$REPLY; fi
     save_submission_receipt "$receipt_id" "$receipt_token" "$kind" "$report_id" "$file_hash" "$payload_hash" "$status" "$received_at" "$public_url"
-    printf 'Received, status: %s / 已收到，状态：%s\nReceipt ID: %s\nPrivate receipt: %s\n' "$status" "$status" "$receipt_id" "$REPLY"
+    printf '已收到，状态 / Received, status: %s\n回执 ID / Receipt ID: %s\n私有回执 / Private receipt: %s\n' "$status" "$receipt_id" "$REPLY"
     [[ -z $public_url ]] || printf 'Public URL: %s\n' "$public_url"
     rm -f -- "$request" "$response"
 }
@@ -1142,8 +1142,8 @@ gh_benchmark_upload() {
     [[ $month =~ ^[0-9]{4}-[0-9]{2}$ ]] || return 1
     fork=$login/MoE4All
     relative=benchmark-database/v1/$month/${path:t}
-    printf '\nGitHub: %s\nTarget / 目标: %s/%s\n' "$login" "$upstream" "$relative"
-    yes 'Create the branch and benchmark PR now? / 现在创建分支和 benchmark PR？' true
+    printf '\nGitHub: %s\n目标 / Target: %s/%s\n' "$login" "$upstream" "$relative"
+    yes '现在创建分支和 benchmark PR？/ Create the branch and benchmark PR now?' true
     [[ $REPLY == true ]] || return 0
     if ! gh api "repos/$fork" >/dev/null 2>&1; then
         gh repo fork "$upstream" --clone=false --remote=false >/dev/null || return 1
@@ -1164,31 +1164,31 @@ gh_benchmark_upload() {
     if ! gh api --method PUT "repos/$fork/contents/$relative" --input "$request" >/dev/null; then rm -f -- "$request"; return 1; fi
     rm -f -- "$request"
     pr_url=$(gh pr create --repo "$upstream" --base main --head "$login:$branch" --title "bench: add $report_id" --body 'Automated benchmark result generated by the MoE4All launch wizard.' 2>/dev/null) || return 1
-    printf 'PR created / PR 已创建: %s\n' "$pr_url"
+    printf 'PR 已创建 / PR created: %s\n' "$pr_url"
 }
 
 offer_benchmark_upload() {
     local path=$1 has_github gh_authenticated=false authorize=false
-    yes 'Upload this anonymous benchmark result? / 愿意上传这份匿名 benchmark 结果吗？' "${S[benchmark_upload]}"
+    yes '愿意上传这份匿名 benchmark 结果吗？/ Upload this anonymous benchmark result?' "${S[benchmark_upload]}"
     S[benchmark_upload]=$REPLY; save_state
     [[ $REPLY == true ]] || return 0
-    yes 'Do you have a GitHub account? / 你有 GitHub 账号吗？' "${S[benchmark_upload_has_github]}"
+    yes '你有 GitHub 账号吗？/ Do you have a GitHub account?' "${S[benchmark_upload_has_github]}"
     has_github=$REPLY; S[benchmark_upload_has_github]=$has_github; save_state
     if [[ $has_github == true ]] && command -v gh >/dev/null 2>&1; then
         if gh auth status --hostname github.com >/dev/null 2>&1; then
             gh_authenticated=true
         else
-            yes 'gh is not signed in. Authorize in the browser now? / gh 尚未登录，现在通过浏览器授权吗？' false
+            yes 'gh 尚未登录。现在通过浏览器授权？/ gh is not signed in. Authorize in the browser now?' false
             authorize=$REPLY
             if [[ $authorize == true ]] && gh auth login --hostname github.com --git-protocol https --web; then gh_authenticated=true; fi
         fi
     fi
     if [[ $gh_authenticated == true ]]; then
         if gh_benchmark_upload "$path"; then return 0; fi
-        printf 'Direct GitHub upload failed; using the website relay. / GitHub 直传失败，改用网站中转。\n' >&2
+        printf 'GitHub 直传失败，改用网站中转。/ Direct GitHub upload failed; using the website relay.\n' >&2
     elif [[ $has_github == true ]]; then
-        printf 'No authenticated gh CLI is available; using the website relay without installing another tool.\n'
         printf '没有可用的已登录 gh；不安装额外工具，改用网站中转。\n'
+        printf 'No authenticated gh CLI is available; using the website relay without installing another tool.\n'
     fi
     website_submission_upload "$path" benchmark
 }
@@ -1220,7 +1220,7 @@ EOF
     rm -f -- "$payload"
     result_path=$(printf '%s\n' "$output" | sed -n 's/^MOE4ALL_SUBMISSION_PATH=//p' | tail -n 1)
     [[ -n $result_path ]] || { fail 'The engine did not return a benchmark submission path.'; return 1; }
-    printf '\nResults / 结果\n+------------------+------------+----------+\n'
+    printf '\n结果 / Results\n+------------------+------------+----------+\n'
     printf '| Workload         | Repetitions| Overall  |\n+------------------+------------+----------+\n'
     printf '| %-16s | %10s | %8.1f |\n' "${S[manual_bench_kind]}" "${S[reps]}" "$avg"
     printf '+------------------+------------+----------+\nBenchmark submission: %s\n' "$result_path"
@@ -1231,7 +1231,7 @@ read_problem_description() {
     local description='' mode=rewrite line added decision
     while true; do
         [[ $mode != rewrite ]] || description=''
-        printf '\nDescribe the problem / 请输入问题描述。\nMultiple lines are allowed; enter a single period . to finish / 可输入多行，单独输入 . 才结束。\n'
+        printf '\n请输入问题描述 / Describe the problem。\n可输入多行，单独输入 . 才结束 / Multiple lines are allowed; enter a single period . to finish.\n'
         added=''
         while true; do
             IFS= read -r line || return 1
@@ -1241,16 +1241,16 @@ read_problem_description() {
         added=${added%$'\n'}
         if [[ $mode == append && -n $description && -n $added ]]; then description+=$'\n'$added
         elif [[ -n $added || $mode == rewrite ]]; then description=$added; fi
-        printf '\nDescription preview / 问题描述预览:\n%s\n' "${description:-(empty / 空)}"
-        printf '1. Confirm  2. Rewrite  3. Append  4. Cancel [1]: '
+        printf '\n问题描述预览 / Description preview:\n%s\n' "${description:-(空 / empty)}"
+        printf '1. 确认 / Confirm  2. 重写 / Rewrite  3. 追加 / Append  4. 取消 / Cancel [1]: '
         IFS= read -r decision || return 1; [[ -n $decision ]] || decision=1
-        case $decision in 1) REPLY=$description; return ;; 2) mode=rewrite ;; 3) mode=append ;; 4) return 2 ;; *) printf 'Choose 1-4.\n' ;; esac
+        case $decision in 1) REPLY=$description; return ;; 2) mode=rewrite ;; 3) mode=append ;; 4) return 2 ;; *) printf '请选择 1-4。Choose 1-4.\n' ;; esac
     done
 }
 
 complete_error_report() {
     local source=${1-} description_file output path; local -a report_args
-    read_problem_description || { printf 'Cancelled; existing diagnostics were not deleted.\n'; return 0; }
+    read_problem_description || { printf '已取消；现有诊断文件未删除。Cancelled; existing diagnostics were not deleted.\n'; return 0; }
     mkdir -p -- "$CONFIG_DIR"
     description_file=$(mktemp "$CONFIG_DIR/.error-description.XXXXXX")
     printf '%s' "$REPLY" > "$description_file"
@@ -1263,93 +1263,93 @@ complete_error_report() {
     printf '%s\n' "$output"
     path=$(printf '%s\n' "$output" | sed -n 's/^MOE4ALL_SUBMISSION_PATH=//p' | tail -n 1)
     [[ -n $path ]] || { fail 'The engine did not return an error-report path.'; return 1; }
-    yes 'Upload this anonymous error report? / 愿意上传这份匿名错误报告吗？' "${S[error_upload]}"; S[error_upload]=$REPLY
+    yes '愿意上传这份匿名错误报告吗？/ Upload this anonymous error report?' "${S[error_upload]}"; S[error_upload]=$REPLY
     save_state
     if [[ $REPLY == true ]]; then
-        website_submission_upload "$path" error || printf 'Upload did not complete; the local report remains at %s\n' "$path" >&2
+        website_submission_upload "$path" error || printf '上传未完成；本地报告仍保存在 %s。Upload did not complete; the local report remains there.\n' "$path" >&2
     fi
 }
 
 configure() {
     local key value effort count previous
     REPORT_RETURN_MODE=${S[launch_mode]}
-    choice launch_mode '1. Purpose' 'run|Terminal chat (recommended)' 'serve|OpenAI-compatible API' 'bench|Benchmark' 'report|Report a current runtime problem'
+    choice launch_mode '你想做什么？/ What would you like to do?' 'run|实时终端对话（推荐）/ Terminal chat (recommended)' 'serve|启动 OpenAI 兼容 API / Start OpenAI-compatible API server' 'bench|性能测试 / Benchmark' 'report|报告当前运行问题 / Report a current runtime problem'
     [[ ${S[launch_mode]} != report ]] || return 0
     model_path llm model
     if [[ ${S[launch_mode]} == serve ]]; then
         S[server_vision]=false; S[vision_projector]=''
         S[server_embedding]=false; S[embedding_model]=''
-        printf 'The experimental Metal package currently serves text generation only; Vision and Embedding require Vulkan.\n'
+        printf '实验性 Metal 包目前只支持文本生成；视觉与 Embedding 仍需 Vulkan。\nThe experimental Metal package currently serves text generation only; Vision and Embedding require Vulkan.\n'
     fi
     choose_device
-    choice setup_mode '4. Configuration' 'conservative|Automatic: conservative (recommended)' 'aggressive|Automatic: aggressive' 'manual|Manual'
+    choice setup_mode '配置方式 / Configuration' 'conservative|自动配置：保守（推荐）/ Automatic: conservative (recommended)' 'aggressive|自动配置：激进性能 / Automatic: aggressive performance' 'manual|全手动配置 / Fully manual configuration'
     if [[ ${S[setup_mode]} == manual ]]; then
-        integer ubatch 'Ubatch (blank = auto)' 1 999999999 true; integer threads 'CPU threads (blank = all)' 1 999999999 true
-        while true; do ask config_path 'Config TOML (blank = default lookup)'; [[ -n ${S[config_path]} ]] || break; absolute "${S[config_path]}"; [[ ! -f $REPLY ]] || break; printf 'Config TOML not found.\n'; done
-        choice kv_preset 'KV cache' 'auto|Engine default' 'q8|Q8_0 K + V' 'f16|F16 K + V' 'custom|Custom K / V'
-        case ${S[kv_preset]} in custom) ask kv_type_k 'K dtype' true; ask kv_type_v 'V dtype' true ;; q8) S[kv_type_k]=q8_0; S[kv_type_v]=q8_0 ;; f16) S[kv_type_k]=f16; S[kv_type_v]=f16 ;; esac
-        ask_yes configure_memory 'Configure total process RAM budget?'
-        if [[ ${S[configure_memory]} == true ]]; then ask ram_budget 'ram_budget (blank = auto)'; fi
+        integer ubatch 'Ubatch，留空为自动 / Ubatch, blank for auto' 1 999999999 true; integer threads 'CPU 线程，留空为全部 / CPU threads, blank for all' 1 999999999 true
+        while true; do ask config_path '配置 TOML，留空使用默认查找 / Config TOML, blank for default lookup'; [[ -n ${S[config_path]} ]] || break; absolute "${S[config_path]}"; [[ ! -f $REPLY ]] || break; printf '未找到配置 TOML。Config TOML not found.\n'; done
+        choice kv_preset 'KV Cache 类型 / KV cache type' 'auto|引擎自动（推荐）/ Engine default (recommended)' 'q8|Q8_0 K + Q8_0 V' 'f16|F16 K + F16 V' 'custom|分别指定 / Custom K and V'
+        case ${S[kv_preset]} in custom) ask kv_type_k 'K 类型 / K dtype' true; ask kv_type_v 'V 类型 / V dtype' true ;; q8) S[kv_type_k]=q8_0; S[kv_type_v]=q8_0 ;; f16) S[kv_type_k]=f16; S[kv_type_v]=f16 ;; esac
+        ask_yes configure_memory '设置进程总 RAM 预算？/ Configure total process RAM budget?'
+        if [[ ${S[configure_memory]} == true ]]; then ask ram_budget '进程总 RAM 预算，留空为自动 / Total process RAM budget, blank for auto'; fi
         S[vram_budget]=''; S[vram_reserve]=''; S[expert_cache]=''; S[pager_ring]=''; S[pager_ring_slots]=''
         S[host_dma]=false; S[kv_overflow]=false; S[submit_mode]=auto; S[configure_diagnostics]=false
-        ask custom_sets 'Extra --set (semicolon separated)'
+        ask custom_sets '额外 --set，以分号分隔 / Extra --set entries separated by semicolons'
     else S[kv_preset]=q8; S[kv_type_k]=q8_0; S[kv_type_v]=q8_0; fi
     S[auto_overrides]=''
     if [[ ${S[launch_mode]} != bench ]]; then
-        ask_yes configure_thinking 'Configure default reasoning? (API may override)'
+        ask_yes configure_thinking '是否配置默认思考？API 可覆盖 / Configure default reasoning? API may override'
         previous=${S[think_mode]}; effort=${S[reasoning_effort]}; S[think_mode]=default; S[reasoning_effort]=default
         if [[ ${S[configure_thinking]} == true ]]; then
-            value=true; [[ $previous != no-think ]] || value=false; yes 'Enable reasoning by default?' "$value"
+            value=true; [[ $previous != no-think ]] || value=false; yes '默认开启思考？/ Enable reasoning by default?' "$value"
             if [[ $REPLY == true ]]; then
                 S[think_mode]=think; value=$(reasoning_efforts "${S[model]}") || value=''
                 if [[ -n $value ]]; then
-                    local -a effort_options=('default|Template default'); local found=false
+                    local -a effort_options=('default|模板默认 / Template default'); local found=false
                     for key in $value; do effort_options+=("$key|$key"); [[ $key != "$effort" ]] || found=true; done
                     [[ $found == false ]] || S[reasoning_effort]=$effort
-                    choice reasoning_effort 'Reasoning effort' "${effort_options[@]}"
-                else printf 'Reasoning-effort support not detected; keeping template default.\n'; fi
+                    choice reasoning_effort '默认思考强度 / Default reasoning effort' "${effort_options[@]}"
+                else printf '未检测到思考强度支持，将保留模板默认值。Reasoning-effort support not detected; keeping template default.\n'; fi
             else S[think_mode]=no-think; fi
         fi
-        integer max_new 'Max generated tokens (reasoning + answer)' 1
-        ask_yes configure_sampling 'Configure default sampling?'
-        if [[ ${S[configure_sampling]} == true ]]; then ask temperature 'Temperature (blank = model default)'; integer top_k 'Top K (blank = model default)' 0 999999999 true; ask top_p 'Top P (blank = model default)'; integer seed 'Seed (blank = model default)' 0 999999999 true; fi
+        integer max_new '每轮最大生成 token（思考与正文合计）/ Max generated tokens per reply (reasoning + answer)' 1
+        ask_yes configure_sampling '设置默认采样参数？/ Configure default sampling?'
+        if [[ ${S[configure_sampling]} == true ]]; then ask temperature '温度，留空为模型默认 / Temperature, blank for model default'; integer top_k 'Top K，留空为模型默认 / Top K, blank for model default' 0 999999999 true; ask top_p 'Top P，留空为模型默认 / Top P, blank for model default'; integer seed '随机种子，留空为模型默认 / Seed, blank for model default' 0 999999999 true; fi
     fi
     S[cpu_miss_enabled]=false; S[cpu_miss_cores]=''; S[cpu_miss_max]=1
     if [[ ${S[launch_mode]} == serve ]]; then
         S[server_parallel]=1; S[server_session_cache]=false
-        printf '6. Concurrent slots: 1 (the Metal backend is currently serialized)\n'
+        printf '并发会话数 / Concurrent slots: 1（Metal 后端当前串行 / currently serialized）\n'
     fi
-    if [[ ${S[launch_mode]} != bench ]]; then ask context '7. Context (blank = auto)'; fi
+    if [[ ${S[launch_mode]} != bench ]]; then ask context '上下文窗口，留空为自动 / Context window, blank for auto'; fi
     if [[ ${S[launch_mode]} == serve ]]; then
         S[server_session_cache]=false
-        printf '8. SSD session KV cache: unavailable on the serialized Metal backend\n'
-        while true; do ask server_addr '9. Listen address' true; valid_address "${S[server_addr]}" && break; printf 'Enter an IP:port, such as 127.0.0.1:8080 or [::1]:8080.\n'; done
-        ask_yes server_auth 'Enable Bearer API-key authentication?'
+        printf 'SSD 会话 KV 缓存 / SSD session KV cache：串行 Metal 后端暂不可用 / unavailable on the serialized Metal backend\n'
+        while true; do ask server_addr '监听地址（IP:端口）/ Listen address (IP:port)' true; valid_address "${S[server_addr]}" && break; printf '请输入 IP:端口，例如 127.0.0.1:8080 或 [::1]:8080。Enter an IP:port, such as 127.0.0.1:8080 or [::1]:8080.\n'; done
+        ask_yes server_auth '启用 Bearer API key 鉴权？/ Enable Bearer API-key authentication?'
     fi
     if [[ ${S[launch_mode]} == bench ]]; then
         S[bench_kind]=manual
-        if [[ -t 1 ]]; then printf '\033[90mAutomatic database suites currently require the Vulkan multi-slot engine; Metal keeps the manual benchmark.\033[0m\n'
-        else printf 'Automatic database suites currently require the Vulkan multi-slot engine; Metal keeps the manual benchmark.\n'; fi
+        if [[ -t 1 ]]; then printf '\033[90m自动数据库套件目前需要 Vulkan 多槽引擎；Metal 暂保留手动测试。Automatic database suites currently require the Vulkan multi-slot engine; Metal keeps the manual benchmark.\033[0m\n'
+        else printf '自动数据库套件目前需要 Vulkan 多槽引擎；Metal 暂保留手动测试。Automatic database suites currently require the Vulkan multi-slot engine; Metal keeps the manual benchmark.\n'; fi
         [[ ${S[manual_bench_kind]} =~ ^(prefill|decode|mixed)$ ]] || S[manual_bench_kind]=decode
-        choice manual_bench_kind 'Step 1: choose work / 第一步：选择工作' \
-            $'prefill|Prefill only / 只测 Prefill|Process a prompt without generating tokens.\n处理一段提示词，不生成 token。' \
-            $'decode|Decode only / 只测 Decode|Generate tokens; existing context can be added next.\n生成 token；下一步可添加已有上下文。' \
-            $'mixed|Prefill + Decode|Process a prompt and then generate in the same turn.\n同一轮先处理提示词，再生成 token。'
+        choice manual_bench_kind '第一步：选择要添加的工作 / Step 1: choose work' \
+            $'prefill|只测 Prefill / Prefill only|处理一段提示词，不生成 token。\nProcess a prompt without generating tokens.' \
+            $'decode|只测 Decode / Decode only|生成 token；下一步可添加已有上下文。\nGenerate tokens; existing context can be added next.' \
+            $'mixed|Prefill + Decode|同一轮先处理提示词，再生成 token。\nProcess a prompt and then generate in the same turn.'
         case ${S[manual_bench_kind]} in
-            prefill) integer prompt_tokens 'Prefill tokens' 1; S[gen_tokens]=0; S[depth_mode]=none; S[depth_tokens]=0 ;;
-            decode) S[prompt_tokens]=0; integer gen_tokens 'Decode tokens' 1 ;;
-            mixed) integer prompt_tokens 'Prefill tokens' 1; printf 'Added / 已添加: Prefill %s tokens\n' "${S[prompt_tokens]}"; integer gen_tokens 'Decode tokens' 1 ;;
+            prefill) integer prompt_tokens 'Prefill token 数 / Prefill tokens' 1; S[gen_tokens]=0; S[depth_mode]=none; S[depth_tokens]=0 ;;
+            decode) S[prompt_tokens]=0; integer gen_tokens 'Decode token 数 / Decode tokens' 1 ;;
+            mixed) integer prompt_tokens 'Prefill token 数 / Prefill tokens' 1; printf '已添加 / Added: Prefill %s tokens\n' "${S[prompt_tokens]}"; integer gen_tokens 'Decode token 数 / Decode tokens' 1 ;;
         esac
-        printf 'Added / 已添加: Prefill %s, Decode %s tokens\n' "${S[prompt_tokens]}" "${S[gen_tokens]}"
+        printf '已添加 / Added: Prefill %s, Decode %s tokens\n' "${S[prompt_tokens]}" "${S[gen_tokens]}"
         if [[ ${S[manual_bench_kind]} != prefill ]]; then
-            choice depth_mode 'Add context before measurement / 添加测量前上下文' \
-                $'none|None / 不添加|Measure from an empty KV cache.\n从空 KV 开始测量。' \
-                $'real|Real context / 真实上下文|Really prefill the selected depth before timing.\n先真实 Prefill 指定长度，再开始计时。'
-            if [[ ${S[depth_mode]} == none ]]; then S[depth_tokens]=0; else integer depth_tokens 'Existing context tokens' 1; fi
-            printf 'Added / 已添加: context=%s, depth=%s\n' "${S[depth_mode]}" "${S[depth_tokens]}"
+            choice depth_mode '添加测量前上下文 / Add context before measurement' \
+                $'none|不添加 / None|从空 KV 开始测量。\nMeasure from an empty KV cache.' \
+                $'real|真实上下文 / Real context|先真实 Prefill 指定长度，再开始计时。\nReally prefill the selected depth before timing.'
+            if [[ ${S[depth_mode]} == none ]]; then S[depth_tokens]=0; else integer depth_tokens '已有上下文 token 数 / Existing context tokens' 1; fi
+            printf '已添加 / Added: context=%s, depth=%s\n' "${S[depth_mode]}" "${S[depth_tokens]}"
         fi
-        integer reps 'Repetitions / 重复次数' 1; S[json_output]=true
-        printf 'Final plan / 最终计划: Prefill %s, Decode %s, context %s/%s, repetitions %s. JSON is emitted automatically.\n' \
+        integer reps '重复次数 / Repetitions' 1; S[json_output]=true
+        printf '最终计划 / Final plan: Prefill %s, Decode %s, context %s/%s, repetitions %s。JSON 自动输出。/ JSON is emitted automatically.\n' \
             "${S[prompt_tokens]}" "${S[gen_tokens]}" "${S[depth_mode]}" "${S[depth_tokens]}" "${S[reps]}"
     fi
 }
@@ -1610,31 +1610,31 @@ download_update() (
     extract_package "$temp/$name" "$temp/files" "$version" || { fail 'Invalid release archive; no files changed.'; exit 1; }
     apply_update "$root" "$temp/files" "$version" || exit 1
     if [[ $relaunch == true ]]; then
-        printf 'Update complete. Restarting the updated launcher...\n'
+        printf '更新完成，正在重新启动新版向导…… / Update complete. Restarting the updated launcher...\n'
         trap - EXIT INT TERM
         rm -rf -- "$temp"
         rmdir -- "$lock" || exit 1
         exec /bin/zsh "$root/Start-INFR-Wizard-macOS.sh" --skip-update-check
     fi
-    printf 'Update complete.\n'
+    printf '更新完成。Update complete.\n'
 )
 check_updates() (
     local mode=$1 current temp
-    if ! need curl; then printf 'Update check unavailable; continuing offline.\n'; return; fi
+    if ! need curl; then printf '更新检查不可用，继续离线启动。Update check unavailable; continuing offline.\n'; return; fi
     current=$("$BINARY" --version) || return 0; current=${current##* }
     version_valid "$current" || return 0
     mkdir -p -- "$CONFIG_DIR"
     temp=$(mktemp -d "$CONFIG_DIR/.update-check.XXXXXX"); trap 'rm -rf -- "$temp"' EXIT
     if ! fetch_url 'https://api.github.com/repos/Headmaster218/MoE4All/releases?per_page=100' "$temp/releases.json" 8388608 10 || ! json_load "$temp/releases.json" || ! select_release; then
-        printf 'Update check unavailable; continuing offline.\n'; return 0
+        printf '更新检查不可用，继续离线启动。Update check unavailable; continuing offline.\n'; return 0
     fi
-    if ! version_newer "$RELEASE_VERSION" "$current"; then printf 'Update check: v%s is current\n' "$current"; return 0; fi
-    printf 'New engine release: v%s\nhttps://github.com/Headmaster218/MoE4All/releases/tag/release-%s\n' "$RELEASE_VERSION" "$RELEASE_VERSION"
+    if ! version_newer "$RELEASE_VERSION" "$current"; then printf '更新检查 / Update check: v%s is current\n' "$current"; return 0; fi
+    printf '发现新引擎版本 / New engine release: v%s\nhttps://github.com/Headmaster218/MoE4All/releases/tag/release-%s\n' "$RELEASE_VERSION" "$RELEASE_VERSION"
     if [[ -z $RELEASE_ARCHIVE || -z $RELEASE_CHECKSUM || ! -f $ROOT/install-manifest.json || $BINARY != "$ROOT/infr" || -e $ROOT/.git ]]; then
-        printf 'Source install or no compatible macOS package: check only; no files changed.\n'
-    elif [[ $mode != --update ]]; then printf 'To update explicitly: ./Start-INFR-Wizard-macOS.sh --update\n'
-    elif [[ $INTERACTIVE != true || $HEADLESS == true ]]; then printf 'Updating requires interactive confirmation; no files changed.\n'
-    else yes 'Update this macOS package now?' false; [[ $REPLY != true ]] || download_update "$ROOT"; fi
+        printf '源码安装或没有兼容的 macOS 包：仅检查，未修改文件。Source install or no compatible macOS package: check only; no files changed.\n'
+    elif [[ $mode != --update ]]; then printf '显式更新命令 / To update explicitly: ./Start-INFR-Wizard-macOS.sh --update\n'
+    elif [[ $INTERACTIVE != true || $HEADLESS == true ]]; then printf '更新需要交互确认，未修改文件。Updating requires interactive confirmation; no files changed.\n'
+    else yes '现在更新此 macOS 安装包？/ Update this macOS package now?' false; [[ $REPLY != true ]] || download_update "$ROOT"; fi
 )
 
 usage() {
@@ -1729,9 +1729,9 @@ main() {
     if [[ $INTERACTIVE == true && $SKIP_UPDATE == false && ! ${MOE4ALL_NO_UPDATE_CHECK-} =~ ^(1|true|yes|on)$ ]]; then check_updates --check-update; fi
     if [[ $INTERACTIVE == true && $HEADLESS == false ]]; then
         value=$("$BINARY" --version 2>/dev/null || true); value=${value##* }
-        printf 'MoE4All v%s macOS arm64 Launch Wizard (experimental)\nEnter = previous/default; - = clear\n' "$value"
+        printf 'MoE4All v%s macOS arm64 启动向导（实验性）/ Launch Wizard (experimental)\n上次设置会作为默认值；直接回车即可复用，输入 - 可清空。\nPress Enter to reuse the previous/default value; enter - to clear it.\n' "$value"
         if [[ -n ${S[model]} && ${#OVERRIDES[@]} == 0 && ${#disables[@]} == 0 ]]; then
-            absolute "${S[model]}"; if [[ -f $REPLY ]]; then yes 'Start with previous settings?' true; reused=$REPLY; fi
+            absolute "${S[model]}"; if [[ -f $REPLY ]]; then yes '是否按上次设置直接启动？/ Start with the previous settings?' true; reused=$REPLY; fi
         fi
         [[ $reused == true ]] || configure
         [[ $NO_API_KEY == false ]] || S[server_auth]=false
@@ -1745,7 +1745,7 @@ main() {
     if [[ ${S[launch_mode]} == serve && ${S[server_auth]} == true ]]; then
         api_key=$inherited
         if [[ $INTERACTIVE == true && $HEADLESS == false ]]; then
-            printf 'API key (hidden, Enter reuses inherited key): '; IFS= read -rs value || return 1; printf '\n'; [[ -z $value ]] || api_key=$value
+            printf 'API key（隐藏输入；回车复用环境变量）/ API key (hidden; Enter reuses inherited key): '; IFS= read -rs value || return 1; printf '\n'; [[ -z $value ]] || api_key=$value
         fi
         [[ -n $api_key ]] || { fail 'API-key authentication requires INFR_API_KEY or hidden input.'; return 1; }
     fi
@@ -1755,20 +1755,22 @@ main() {
         absolute "${S[$key]}"; S[$key]=$REPLY
     done
     build_command
-    printf '\nCommand:\n  '; printf '%q ' "${COMMAND[@]}"; printf '\n'
+    printf '\n最终命令 / Final command\n  '; printf '%q ' "${COMMAND[@]}"; printf '\n'
     if [[ ${S[launch_mode]} == serve && -z $api_key ]] && ! loopback "${S[server_addr]}"; then
-        printf 'Warning: network listen address without API-key authentication.\n' >&2
+        printf '警告：当前网络监听地址未启用 API key 鉴权。Warning: network listen address without API-key authentication.\n' >&2
         if [[ $DRY_RUN == false && $HEADLESS == false ]]; then
             [[ $INTERACTIVE == true ]] || { fail 'Unauthenticated network serving requires explicit --yes.'; return 1; }
-            yes 'Continue without authentication?' false; [[ $REPLY == true ]] || return 0
+            yes '仍然继续？/ Continue without authentication?' false; [[ $REPLY == true ]] || return 0
         fi
     fi
     [[ $DRY_RUN == false ]] || return 0
     if [[ $HEADLESS == false && $reused == false ]]; then
         [[ $INTERACTIVE == true ]] || { fail 'Launch confirmation requires input or --yes.'; return 1; }
-        yes '10. Start now?' true; [[ $REPLY == true ]] || return 0
+        if [[ ${S[launch_mode]} == serve ]]; then yes '现在启动服务器？/ Start the server now?' true
+        else yes '现在启动？/ Start now?' true; fi
+        [[ $REPLY == true ]] || return 0
     fi
-    remember_model; save_state; printf 'Settings saved: %s\n' "$STATE"
+    remember_model; save_state; printf '设置已保存 / Settings saved: %s\n' "$STATE"
     if [[ -n $api_key ]]; then export INFR_API_KEY=$api_key; else unset INFR_API_KEY; fi
     export INFR_DIAGNOSTIC_DIR="$ROOT/diagnostics"
     cd -- "$ROOT"

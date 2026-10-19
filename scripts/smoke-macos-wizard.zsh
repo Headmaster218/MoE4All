@@ -182,7 +182,7 @@ S[device]=metal
 S[setup_mode]=aggressive
 pack_manual_benchmark "$work/manual-benchmark.json" > "$work/manual-pack-output"
 [[ -f $REPLY ]] || fail 'Manual benchmark submission was not packed'
-assert_contains "$(< "$work/manual-pack-output")" 'Results / 结果'
+assert_contains "$(< "$work/manual-pack-output")" '结果 / Results'
 
 install="$work/install"
 extract_package "$old_out/MoE4All-macOS-arm64-v1.0.1.tar.gz" "$install" 1.0.1
