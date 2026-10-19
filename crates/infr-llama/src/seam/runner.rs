@@ -13221,6 +13221,27 @@ mod tests {
     }
 
     #[test]
+    fn token_step_prefill_fallback_does_not_sample_before_rejoining() {
+        for start in [1, 30_000, 150_000] {
+            for remaining in [1, 37, 96] {
+                let prompt_end = start + remaining + 1;
+                for step in 0..remaining {
+                    assert_eq!(
+                        sampling_suffix_start(&[start + step], &[prompt_end]).unwrap(),
+                        1
+                    );
+                }
+                // The visual lane stayed untouched; both lanes now sample their Decode frontier.
+                assert_eq!(
+                    sampling_suffix_start(&[start, start + remaining], &[start + 1, prompt_end])
+                        .unwrap(),
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
     fn recurrent_empty_cache_never_reuses_device_state() {
         assert_eq!(recurrent_extension_start(&[], &[10, 20, 30]), None);
     }

@@ -542,6 +542,26 @@ fn sort_token_lane_indices(active: &[BatchWork], indices: &mut [usize]) {
     });
 }
 
+// Return a cohort-relative lane index and a Prefill-only step cap, not a physical KV slot id.
+fn token_lane_prefill_fallback(
+    lanes: impl IntoIterator<Item = (bool, usize)>,
+) -> Option<(usize, usize)> {
+    let mut previous = usize::MAX;
+    let mut out_of_order = false;
+    let mut text_prefill = None;
+    for (lane, (has_mrope, remaining)) in lanes.into_iter().enumerate() {
+        out_of_order |= previous < remaining;
+        previous = remaining;
+        if !has_mrope
+            && remaining > 0
+            && text_prefill.is_none_or(|(_, longest)| remaining > longest)
+        {
+            text_prefill = Some((lane, remaining));
+        }
+    }
+    out_of_order.then_some(text_prefill).flatten()
+}
+
 struct BatchChannels {
     events: SyncSender<BatchEvent>,
     acknowledgements: Receiver<bool>,
@@ -2774,6 +2794,18 @@ impl ParallelSeam {
         if indices.is_empty() {
             return Ok(());
         }
+        // MRoPE needs a visual primary, but sampling needs all Prefill rows before Decode rows.
+        // If these orders conflict, drain one text suffix without sampling, then rejoin the cohort.
+        let prefill_fallback = token_lane_prefill_fallback(indices.iter().map(|&index| {
+            let work = &active[index];
+            (work.mrope_plan.is_some(), work.remaining_prefill())
+        }));
+        let prefill_index = prefill_fallback.map(|(lane, _)| indices[lane]);
+        let indices = prefill_index
+            .as_ref()
+            .map(std::slice::from_ref)
+            .unwrap_or(indices);
+        let quantum = prefill_fallback.map_or(quantum, |(_, remaining)| quantum.min(remaining));
         let max_steps = indices
             .iter()
             .map(|&index| {
@@ -4272,8 +4304,8 @@ mod tests {
         long_prefill_cohort_limit, long_prefill_phase_prompt_end, mtp_accepted_rows,
         mtp_context_profitable, multimodal_key, multimodal_token_position,
         phase_for_remaining_prefill, pick_continuation, scheduler_mode,
-        should_handoff_multimodal_to_scheduler, token_lane_sort_key, BatchPhase,
-        MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
+        should_handoff_multimodal_to_scheduler, token_lane_prefill_fallback, token_lane_sort_key,
+        BatchPhase, MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
     };
     use std::sync::Arc;
 
@@ -4355,6 +4387,99 @@ mod tests {
             token_lane_sort_key(has_mrope, remaining, slot)
         });
         assert_eq!(lanes.map(|lane| lane.0), [1, 0]);
+    }
+
+    #[test]
+    fn token_lanes_drain_text_prefill_before_visual_decode() {
+        for remaining in [1, 37, SHORT_PREFILL_TOKENS] {
+            let lanes = [(true, 0), (false, remaining)];
+            assert_eq!(token_lane_prefill_fallback(lanes), Some((1, remaining)));
+            // At the fallback boundary no token was sampled; both lanes can now Decode together.
+            assert_eq!(token_lane_prefill_fallback([(true, 0), (false, 0)]), None);
+        }
+    }
+
+    #[test]
+    fn token_lanes_preserve_compatible_batches() {
+        for lanes in [
+            vec![],
+            vec![(false, 37)],
+            vec![(true, 0)],
+            vec![(false, 37), (false, 0)],
+            vec![(true, 37), (false, 0)],
+            vec![(true, 37), (true, 5), (false, 0)],
+            vec![(true, 0), (false, 0), (false, 0), (false, 0)],
+        ] {
+            assert_eq!(token_lane_prefill_fallback(lanes), None);
+        }
+    }
+
+    #[test]
+    fn token_lanes_drain_conflicting_suffixes_and_rejoin() {
+        let mut lanes = [(0, true, 5), (1, true, 0), (2, false, 96), (3, false, 37)];
+        for expected_slot in [2, 3] {
+            lanes.sort_by_key(|&(slot, has_mrope, remaining)| {
+                token_lane_sort_key(has_mrope, remaining, slot)
+            });
+            let (lane, steps) = token_lane_prefill_fallback(
+                lanes
+                    .iter()
+                    .map(|&(_, has_mrope, remaining)| (has_mrope, remaining)),
+            )
+            .expect("text suffix must run before this mixed cohort");
+            assert_eq!(lanes[lane].0, expected_slot);
+            assert!(!lanes[lane].1);
+            assert_eq!(steps, lanes[lane].2);
+            lanes[lane].2 -= steps;
+        }
+        assert_eq!(
+            token_lane_prefill_fallback(
+                lanes.map(|(_, has_mrope, remaining)| (has_mrope, remaining))
+            ),
+            None
+        );
+        assert!(lanes.windows(2).all(|pair| pair[0].2 >= pair[1].2));
+    }
+
+    #[test]
+    fn token_lanes_exhaustive_mixed_cohorts_remain_executable() {
+        const REMAINING: [usize; 3] = [0, 1, SHORT_PREFILL_TOKENS];
+        for count in 1..=4u32 {
+            for mut encoded in 0..6usize.pow(count) {
+                let mut lanes = (0..count as usize)
+                    .map(|slot| {
+                        let state = encoded % 6;
+                        encoded /= 6;
+                        (slot, state >= 3, REMAINING[state % 3])
+                    })
+                    .collect::<Vec<_>>();
+                let mut fallbacks = 0;
+                loop {
+                    lanes.sort_by_key(|&(slot, has_mrope, remaining)| {
+                        token_lane_sort_key(has_mrope, remaining, slot)
+                    });
+                    let fallback = token_lane_prefill_fallback(
+                        lanes
+                            .iter()
+                            .map(|&(_, has_mrope, remaining)| (has_mrope, remaining)),
+                    );
+                    let descending = lanes.windows(2).all(|pair| pair[0].2 >= pair[1].2);
+                    if let Some((lane, steps)) = fallback {
+                        assert!(!descending);
+                        assert!(!lanes[lane].1);
+                        assert!(steps > 0);
+                        assert_eq!(steps, lanes[lane].2);
+                        lanes[lane].2 -= steps;
+                        fallbacks += 1;
+                        assert!(fallbacks < lanes.len());
+                    } else {
+                        assert!(descending);
+                        assert!(!lanes.iter().any(|lane| lane.1) || lanes[0].1);
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     #[test]
