@@ -8,6 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Finalized `v7-qsa-tuned` on engine commit `8e7206ee`: QSA Q8 gather packs four codes per
+  thread, and single-row QSA score uses the 32-block / 1024-thread workgroup.
 - Rolled the runtime back to the `v4-pair-pipeline` engine state for the `v5-final-stable`
   baseline. The abandoned MTP two-window experiment and the uncommitted VRAM-only recurrent-state
   placement are not part of this release.
@@ -16,6 +18,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Validation
 
+- `v7-qsa-tuned` measured 23.12 tok/s single-request decode and 41.17 tok/s across two
+  concurrent lanes at 262144-token context. Both lanes completed without state contamination.
 - The original 32K/256K, `-u256`, two-lane streaming workload completed with a 1.748 cohort ratio
   on the validation host, in the same range as the recorded `v4-pair-pipeline` result.
 - Serial Qwen3.8 MTP was exercised through two sequential streaming requests. Both produced
@@ -23,6 +27,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   VERIFY (`k=3`).
 - The rejected VRAM-only recurrent-state change was removed after it caused the 32K/256K
   two-lane workload to exceed the VRAM guard at activation-pool allocation.
+- MTP two-window Phase 3 is closed. The remaining host-tier QSA F32 block-key cost is deferred
+  as a future system-level optimization rather than another engine-local workgroup sweep.
 
 ## [0.9.0] - 2026-09-28
 
