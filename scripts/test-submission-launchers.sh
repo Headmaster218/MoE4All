@@ -35,6 +35,8 @@ sleep() { printf '%s\n' "$1" >> "$work/sleeps"; }
 save_state() { :; }
 yes() { REPLY=true; }
 open_submission_url() { printf '%s' "$1" > "$work/opened-url"; }
+# BSD wc pads its count; protocol comparisons must not depend on that padding.
+wc() { local count; count=$(command wc "$@") || return 1; printf '        %s\n' "$count"; }
 original_request=$(typeset -f submission_api_request)
 eval "${original_request/submission_api_request/original_submission_api_request}"
 
@@ -76,7 +78,8 @@ for current_kind in benchmark error; do
     current_file=$work/fixture-$current_kind.$extension
     printf 'MOE4ALL-SUBMISSION/1\nkind: %s\nid: fixture-%s\ncreated-at: 2026-10-19T00:00:00Z\nsummary-001: fixture summary\n' "$current_kind" "$current_kind" > "$current_file"
     file_sha256 "$current_file"; current_hash=$REPLY
-    current_size=$(wc -c < "$current_file"); original_hash_fixture=$(printf '%064d' 0)
+    current_size=$(wc -c < "$current_file"); trim "$current_size"; current_size=$REPLY
+    original_hash_fixture=$(printf '%064d' 0)
     repeat_git=false; gh_submission_upload "$current_file" "$current_kind" > "$work/git-output"
     check grep -q "$current_kind-database/v1/2026-10/fixture-$current_kind.$extension" "$work/gh-calls"
     check grep -q "community/$current_kind/$current_hash" "$work/gh-calls"

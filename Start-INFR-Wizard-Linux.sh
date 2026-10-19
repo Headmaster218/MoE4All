@@ -1404,6 +1404,7 @@ website_submission_upload() {
     [[ -f $path && $path == *$extension ]] || { fail "Submission file is missing or does not match $kind."; return 1; }
     "$BINARY" submission verify "$path" >/dev/null || { fail 'Local submission verification failed; nothing was uploaded.'; return 1; }
     size=$(wc -c < "$path")
+    trim "$size"; size=$REPLY
     ((size > 0 && size <= 131072)) || { fail 'Submission must be between 1 and 131072 bytes.'; return 1; }
     submission_header "$path" kind; [[ $REPLY == "$kind" ]] || { fail 'Submission kind does not match the selected upload type.'; return 1; }
     submission_header "$path" id; report_id=$REPLY
