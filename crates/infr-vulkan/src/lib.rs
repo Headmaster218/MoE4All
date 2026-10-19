@@ -73,7 +73,9 @@ use gpu_allocator::vulkan::{
 use gpu_allocator::MemoryLocation;
 
 use infr_core::{
-    backend::{Bindings, Buffer, BufferUsage, Capabilities, Plan, SegmentedKvSpec},
+    backend::{
+        Bindings, Buffer, BufferUsage, Capabilities, IdleResourceReclaimer, Plan, SegmentedKvSpec,
+    },
     budget::{spill_report_line, SpillNouns, SpillTally},
     config::Config,
     error::Result,
@@ -2621,6 +2623,7 @@ struct UnifiedPhaseState {
     active: Option<u64>,
     next_id: u64,
     arenas: Vec<(u64, std::sync::Weak<Mutex<adapter::RuntimePhaseArena>>)>,
+    idle_reclaimers: Vec<(u64, Weak<dyn IdleResourceReclaimer>)>,
 }
 
 struct UnifiedPhaseRegistry {
@@ -2636,6 +2639,7 @@ impl UnifiedPhaseRegistry {
                 active: None,
                 next_id: Self::PRIMARY_ID + 1,
                 arenas: vec![(Self::PRIMARY_ID, Arc::downgrade(primary))],
+                idle_reclaimers: Vec::new(),
             }),
         })
     }
@@ -2646,6 +2650,27 @@ impl UnifiedPhaseRegistry {
         state.next_id = state.next_id.wrapping_add(1).max(Self::PRIMARY_ID + 1);
         state.arenas.push((id, Arc::downgrade(arena)));
         id
+    }
+
+    fn register_idle_reclaimer(&self, owner: u64, reclaimer: Weak<dyn IdleResourceReclaimer>) {
+        let mut state = self.state.lock().unwrap();
+        state
+            .idle_reclaimers
+            .retain(|(_, entry)| entry.strong_count() != 0);
+        state.idle_reclaimers.push((owner, reclaimer));
+    }
+
+    fn idle_reclaim_candidates(&self, current: u64) -> Vec<Arc<dyn IdleResourceReclaimer>> {
+        let mut state = self.state.lock().unwrap();
+        state
+            .idle_reclaimers
+            .retain(|(_, entry)| entry.strong_count() != 0);
+        state
+            .idle_reclaimers
+            .iter()
+            .filter(|(owner, _)| *owner != current)
+            .filter_map(|(_, entry)| entry.upgrade())
+            .collect()
     }
 
     /// Track transitions without destroying another client's reusable workspace.
@@ -2691,6 +2716,16 @@ impl UnifiedPhaseRegistry {
             match claim() {
                 Ok(value) => return Ok(value),
                 Err(next) => error = next,
+            }
+        }
+        // Callbacks run without the registry lock and must never wait on a request-owned lock.
+        // Preserve the successful fast path and exhaust the existing scratch recovery first.
+        for reclaimer in self.idle_reclaim_candidates(current) {
+            if reclaimer.try_reclaim_idle() {
+                match claim() {
+                    Ok(value) => return Ok(value),
+                    Err(next) => error = next,
+                }
             }
         }
         Err(error)
@@ -7981,6 +8016,13 @@ impl Backend for VulkanBackend {
         });
     }
 
+    fn register_idle_reclaimer(&self, reclaimer: Weak<dyn IdleResourceReclaimer>) {
+        if matches!(self.unified_client, Some(UnifiedClient::Embedding)) {
+            self.unified_phases
+                .register_idle_reclaimer(self.unified_phase_id, reclaimer);
+        }
+    }
+
     fn prepare_prefill(&self, candidates: &[(usize, u64)]) -> Result<Option<usize>> {
         if !self.cfg().paging.moe_layer_stream {
             return Ok(None);
@@ -8839,6 +8881,203 @@ mod tests {
             0,
             "current workspace must never be reclaimed"
         );
+    }
+
+    struct TestIdleReclaimer<F>(F);
+
+    impl<F: Fn() -> bool + Send + Sync> IdleResourceReclaimer for TestIdleReclaimer<F> {
+        fn try_reclaim_idle(&self) -> bool {
+            (self.0)()
+        }
+    }
+
+    fn test_idle_reclaimer(
+        f: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Arc<dyn IdleResourceReclaimer> {
+        Arc::new(TestIdleReclaimer(f))
+    }
+
+    #[test]
+    fn unified_embedding_pressure_keeps_successful_claims_unchanged() {
+        let (primary, _) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let reclaimer =
+            test_idle_reclaimer(|| panic!("successful allocation must not evict weights"));
+        registry.register_idle_reclaimer(2, Arc::downgrade(&reclaimer));
+        assert_eq!(registry.claim_with_reclaim(1, || Ok(7)).unwrap(), 7);
+    }
+
+    #[test]
+    fn unified_embedding_pressure_frees_real_allocator_ranges_without_dropping_kv() {
+        use crate::unified::{UnifiedRangePool, UnifiedVramClass as Class};
+        let pool = UnifiedRangePool::new([4096]).unwrap();
+        let weights = Arc::new(Mutex::new(Some(
+            pool.allocate(3072, 256, Class::EmbeddingWeights).unwrap(),
+        )));
+        let kv = pool.allocate(512, 256, Class::KvCache).unwrap();
+        assert!(pool.allocate(1024, 256, Class::LlmRuntime).is_none());
+        let (primary, _) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let callback_weights = Arc::clone(&weights);
+        let reclaimer = test_idle_reclaimer(move || {
+            let Ok(mut weights) = callback_weights.try_lock() else {
+                return false;
+            };
+            weights.take().is_some()
+        });
+        registry.register_idle_reclaimer(2, Arc::downgrade(&reclaimer));
+        let runtime = registry
+            .claim_with_reclaim(1, || {
+                pool.allocate(1024, 256, Class::LlmRuntime)
+                    .ok_or_else(|| be("no room"))
+            })
+            .unwrap();
+        let stats = pool.stats();
+        assert_eq!(stats.class_bytes(Class::EmbeddingWeights), 0);
+        assert_eq!(stats.class_bytes(Class::KvCache), 512);
+        assert_eq!(stats.class_bytes(Class::LlmRuntime), 1024);
+        drop(runtime);
+        drop(kv);
+        assert_eq!(pool.stats().free_bytes, 4096);
+    }
+
+    #[test]
+    fn unified_embedding_pressure_runs_only_after_runtime_recovery_fails() {
+        let (primary, _) = counted_runtime();
+        let (runtime, drops) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let owner = registry.register(&runtime);
+        let released = Arc::new(AtomicBool::new(false));
+        let callback_released = Arc::clone(&released);
+        let callback_drops = Arc::clone(&drops);
+        let reclaimer = test_idle_reclaimer(move || {
+            assert_eq!(callback_drops.load(Ordering::SeqCst), 1);
+            callback_released.store(true, Ordering::SeqCst);
+            true
+        });
+        registry.register_idle_reclaimer(owner, Arc::downgrade(&reclaimer));
+        let attempts = AtomicUsize::new(0);
+        let result = registry.claim_with_reclaim(1, || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            if released.load(Ordering::SeqCst) {
+                Ok(9)
+            } else {
+                Err(be("no room"))
+            }
+        });
+        assert_eq!(result.unwrap(), 9);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn unified_embedding_pressure_keeps_weights_if_runtime_recovery_succeeds() {
+        let (primary, _) = counted_runtime();
+        let (runtime, drops) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let owner = registry.register(&runtime);
+        let reclaimer = test_idle_reclaimer(|| panic!("runtime alone satisfied the allocation"));
+        registry.register_idle_reclaimer(owner, Arc::downgrade(&reclaimer));
+        assert_eq!(
+            registry
+                .claim_with_reclaim(1, || {
+                    if drops.load(Ordering::SeqCst) == 1 {
+                        Ok(9)
+                    } else {
+                        Err(be("no room"))
+                    }
+                })
+                .unwrap(),
+            9
+        );
+    }
+
+    #[test]
+    fn unified_embedding_pressure_excludes_the_allocating_client() {
+        let (primary, _) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let reclaimer = test_idle_reclaimer(|| panic!("current client's weights must stay pinned"));
+        registry.register_idle_reclaimer(1, Arc::downgrade(&reclaimer));
+        assert!(registry
+            .claim_with_reclaim::<()>(1, || Err(be("no room")))
+            .is_err());
+    }
+
+    #[test]
+    fn unified_embedding_pressure_skips_busy_and_expired_callbacks() {
+        let (primary, _) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let reclaimer = test_idle_reclaimer(move || {
+            callback_calls.fetch_add(1, Ordering::SeqCst);
+            false
+        });
+        registry.register_idle_reclaimer(2, Arc::downgrade(&reclaimer));
+        let expired = test_idle_reclaimer(|| panic!("expired callback"));
+        registry.register_idle_reclaimer(3, Arc::downgrade(&expired));
+        drop(expired);
+        let attempts = AtomicUsize::new(0);
+        assert!(registry
+            .claim_with_reclaim::<()>(1, || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(be("no room"))
+            })
+            .is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.state.lock().unwrap().idle_reclaimers.len(), 1);
+    }
+
+    #[test]
+    fn unified_embedding_pressure_retries_once_per_release_and_stops_after_success() {
+        let (primary, _) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let released = Arc::new(AtomicUsize::new(0));
+        let callback_released = Arc::clone(&released);
+        let first = test_idle_reclaimer(move || {
+            callback_released.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+        let second = test_idle_reclaimer(|| panic!("stop after the first successful retry"));
+        registry.register_idle_reclaimer(2, Arc::downgrade(&first));
+        registry.register_idle_reclaimer(3, Arc::downgrade(&second));
+        let attempts = AtomicUsize::new(0);
+        assert_eq!(
+            registry
+                .claim_with_reclaim(1, || {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    if released.load(Ordering::SeqCst) != 0 {
+                        Ok(9)
+                    } else {
+                        Err(be("no room"))
+                    }
+                })
+                .unwrap(),
+            9
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn unified_embedding_pressure_calls_back_without_holding_the_registry_lock() {
+        let (primary, _) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let callback_registry = Arc::clone(&registry);
+        let reclaimer = test_idle_reclaimer(move || {
+            callback_registry.activate(1);
+            true
+        });
+        registry.register_idle_reclaimer(2, Arc::downgrade(&reclaimer));
+        let attempts = AtomicUsize::new(0);
+        assert!(registry
+            .claim_with_reclaim::<()>(1, || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(be("still no room"))
+            })
+            .is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        drop(reclaimer);
+        assert!(registry.idle_reclaim_candidates(1).is_empty());
     }
 
     #[test]

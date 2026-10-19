@@ -6,7 +6,7 @@ use crate::{
 };
 use anyhow::{anyhow, bail, Context, Result};
 use infr_core::{
-    backend::{Backend, Bindings, Buffer, BufferUsage, Plan},
+    backend::{Backend, Bindings, Buffer, BufferUsage, IdleResourceReclaimer, Plan},
     graph::{Activation, AttnMask, Graph, Op},
     loader::{MetaValue, TensorInfo},
     tensor::{DType, TensorDesc, TensorId},
@@ -328,6 +328,44 @@ struct WeightCache {
     stop: AtomicBool,
 }
 
+struct EmbeddingWeightReclaimer {
+    cache: Arc<WeightCache>,
+    plans: Arc<Mutex<HashMap<usize, NativePlan>>>,
+    resource: Arc<ResourceTracker>,
+}
+
+impl IdleResourceReclaimer for EmbeddingWeightReclaimer {
+    fn try_reclaim_idle(&self) -> bool {
+        // An Embedding request holds residency while entering the device gate. Waiting here,
+        // with that gate already held by the allocator, would invert the request's lock order.
+        let Ok(mut residency) = self.cache.residency.try_lock() else {
+            return false;
+        };
+        if residency.buffers.is_none()
+            || residency.idle_deadline.is_none()
+            || self.resource.snapshot().active_requests != 0
+        {
+            return false;
+        }
+        let Ok(mut plans) = self.plans.try_lock() else {
+            return false;
+        };
+        let old_plans = std::mem::take(&mut *plans);
+        let old_weights = residency.buffers.take();
+        residency.idle_deadline = None;
+        drop(old_plans);
+        drop(old_weights);
+        let released_bytes = self.resource.snapshot().resident_bytes;
+        self.resource.set_residency(MemoryTier::Ssd, 0);
+        self.cache.changed.notify_one();
+        tracing::info!(
+            weight_bytes = released_bytes,
+            "idle embedding weights returned to SSD backing under unified VRAM pressure"
+        );
+        true
+    }
+}
+
 struct IdleWeightReaper {
     cache: Arc<WeightCache>,
     worker: Option<thread::JoinHandle<()>>,
@@ -446,6 +484,7 @@ pub struct NativeEmbeddingEngine {
     plans: Arc<Mutex<HashMap<usize, NativePlan>>>,
     resource: Arc<ResourceTracker>,
     _idle_reaper: Option<IdleWeightReaper>,
+    _pressure_reclaimer: Option<Arc<dyn IdleResourceReclaimer>>,
 }
 
 impl NativeEmbeddingEngine {
@@ -561,6 +600,19 @@ impl NativeEmbeddingEngine {
         } else {
             None
         };
+        let pressure_reclaimer: Option<Arc<dyn IdleResourceReclaimer>> = if dynamic_weights
+            && !idle_timeout.is_zero()
+        {
+            let reclaimer: Arc<dyn IdleResourceReclaimer> = Arc::new(EmbeddingWeightReclaimer {
+                cache: Arc::clone(&weights),
+                plans: Arc::clone(&plans),
+                resource: Arc::clone(&resource),
+            });
+            backend.register_idle_reclaimer(Arc::downgrade(&reclaimer));
+            Some(reclaimer)
+        } else {
+            None
+        };
         Ok(Self {
             model_path: path.to_owned(),
             cfg,
@@ -575,6 +627,7 @@ impl NativeEmbeddingEngine {
             plans,
             resource,
             _idle_reaper: idle_reaper,
+            _pressure_reclaimer: pressure_reclaimer,
         })
     }
 
@@ -1474,6 +1527,198 @@ mod tests {
         assert_eq!(resource.snapshot().resident_bytes, 0);
         assert!(cache.residency.lock().unwrap().buffers.is_none());
         reaper.stop_and_join();
+    }
+
+    struct CountedBuffer(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Buffer for CountedBuffer {
+        fn len_bytes(&self) -> usize {
+            16
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    impl Drop for CountedBuffer {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn pressure_plan(drops: &Arc<std::sync::atomic::AtomicUsize>) -> NativePlan {
+        NativePlan {
+            plan: infr_core::backend::GraphPlan::boxed(&Graph::new()),
+            ids: TensorId(0),
+            positions: TensorId(1),
+            output: TensorId(2),
+            weight_ids: vec![],
+            ids_buffer: Box::new(CountedBuffer(Arc::clone(drops))),
+            positions_buffer: Box::new(CountedBuffer(Arc::clone(drops))),
+            output_buffer: Box::new(CountedBuffer(Arc::clone(drops))),
+        }
+    }
+
+    fn pressure_fixture() -> (
+        Arc<EmbeddingWeightReclaimer>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let weights_dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let plans_dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reclaimer = Arc::new(EmbeddingWeightReclaimer {
+            cache: Arc::new(WeightCache {
+                residency: Mutex::new(WeightResidency {
+                    buffers: Some(vec![Box::new(CountedBuffer(Arc::clone(&weights_dropped)))]),
+                    idle_deadline: Some(Instant::now() + Duration::from_secs(60)),
+                }),
+                changed: Condvar::new(),
+                stop: AtomicBool::new(false),
+            }),
+            plans: Arc::new(Mutex::new(HashMap::from([(
+                4,
+                pressure_plan(&plans_dropped),
+            )]))),
+            resource: Arc::new(ResourceTracker::new(
+                "embedding:pressure-test",
+                ResourceKind::EmbeddingWeights,
+                16,
+                16,
+                MemoryTier::Vram,
+                16,
+            )),
+        });
+        (reclaimer, weights_dropped, plans_dropped)
+    }
+
+    #[test]
+    fn pressure_reclaims_idle_weights_before_deadline_and_clears_plans() {
+        let (reclaimer, weights, plans) = pressure_fixture();
+        assert!(!reclaimer
+            .cache
+            .residency
+            .lock()
+            .unwrap()
+            .idle_deadline_reached(Instant::now()));
+        assert!(reclaimer.try_reclaim_idle());
+        assert_eq!(weights.load(Ordering::SeqCst), 1);
+        assert_eq!(plans.load(Ordering::SeqCst), 3);
+        assert!(reclaimer.plans.lock().unwrap().is_empty());
+        let residency = reclaimer.cache.residency.lock().unwrap();
+        assert!(residency.buffers.is_none());
+        assert!(residency.idle_deadline.is_none());
+        drop(residency);
+        let snapshot = reclaimer.resource.snapshot();
+        assert_eq!(snapshot.tier, MemoryTier::Ssd);
+        assert_eq!(snapshot.resident_bytes, 0);
+        assert!(!reclaimer.try_reclaim_idle());
+    }
+
+    #[test]
+    fn pressure_preserves_active_requests_and_explicit_residency() {
+        let (reclaimer, weights, plans) = pressure_fixture();
+        let lease = reclaimer.resource.acquire();
+        assert!(!reclaimer.try_reclaim_idle());
+        drop(lease);
+        reclaimer.cache.residency.lock().unwrap().idle_deadline = None;
+        assert!(!reclaimer.try_reclaim_idle());
+        assert_eq!(weights.load(Ordering::SeqCst), 0);
+        assert_eq!(plans.load(Ordering::SeqCst), 0);
+        assert_eq!(reclaimer.resource.snapshot().tier, MemoryTier::Vram);
+    }
+
+    #[test]
+    fn pressure_skips_locked_plans_without_partially_dropping_weights() {
+        let (reclaimer, weights, _) = pressure_fixture();
+        let plans = reclaimer.plans.lock().unwrap();
+        assert!(!reclaimer.try_reclaim_idle());
+        assert!(reclaimer.cache.residency.lock().unwrap().buffers.is_some());
+        assert_eq!(weights.load(Ordering::SeqCst), 0);
+        drop(plans);
+        assert!(reclaimer.try_reclaim_idle());
+    }
+
+    #[test]
+    fn pressure_does_not_wait_for_a_request_blocked_on_the_device_gate() {
+        use std::sync::mpsc;
+        let (reclaimer, weights, _) = pressure_fixture();
+        let gate = Arc::new(Mutex::new(()));
+        let exclusive = gate.lock().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let request_cache = Arc::clone(&reclaimer.cache);
+        let request_gate = Arc::clone(&gate);
+        let request = thread::spawn(move || {
+            let _weights = request_cache.residency.lock().unwrap();
+            ready_tx.send(()).unwrap();
+            let _gate = request_gate.lock().unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_reclaimer = Arc::clone(&reclaimer);
+        let pressure = thread::spawn(move || {
+            done_tx.send(worker_reclaimer.try_reclaim_idle()).unwrap();
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(2));
+        drop(exclusive);
+        request.join().unwrap();
+        pressure.join().unwrap();
+        assert_eq!(
+            result.unwrap(),
+            false,
+            "pressure callback must skip a busy request"
+        );
+        assert_eq!(weights.load(Ordering::SeqCst), 0);
+        assert!(reclaimer.try_reclaim_idle());
+    }
+
+    #[test]
+    fn pressure_supports_reloaded_weights_and_repeated_idle_eviction() {
+        let (reclaimer, weights, _) = pressure_fixture();
+        assert!(reclaimer.try_reclaim_idle());
+        {
+            let mut residency = reclaimer.cache.residency.lock().unwrap();
+            residency.buffers = Some(vec![Box::new(CountedBuffer(Arc::clone(&weights)))]);
+            residency.arm_idle_deadline(Duration::from_secs(60), Instant::now());
+            reclaimer.resource.set_residency(MemoryTier::Vram, 16);
+        }
+        assert!(reclaimer.try_reclaim_idle());
+        assert_eq!(weights.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn pressure_and_idle_reaper_share_a_safe_reload_lifecycle() {
+        let (reclaimer, weights, _) = pressure_fixture();
+        let mut reaper = IdleWeightReaper::spawn(
+            Arc::clone(&reclaimer.cache),
+            Arc::clone(&reclaimer.plans),
+            Arc::clone(&reclaimer.resource),
+            None,
+            16,
+        )
+        .unwrap();
+        let pressure_deadline = Instant::now() + Duration::from_secs(2);
+        while !reclaimer.try_reclaim_idle() {
+            assert!(
+                Instant::now() < pressure_deadline,
+                "idle reaper never yielded residency"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        {
+            let mut residency = reclaimer.cache.residency.lock().unwrap();
+            residency.buffers = Some(vec![Box::new(CountedBuffer(Arc::clone(&weights)))]);
+            residency.arm_idle_deadline(Duration::from_millis(10), Instant::now());
+            reclaimer.resource.set_residency(MemoryTier::Vram, 16);
+            reclaimer.cache.changed.notify_one();
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while reclaimer.resource.snapshot().resident_bytes != 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        reaper.stop_and_join();
+        assert_eq!(weights.load(Ordering::SeqCst), 2);
+        assert_eq!(reclaimer.resource.snapshot().tier, MemoryTier::Ssd);
+        assert!(!reclaimer.try_reclaim_idle());
     }
 
     #[derive(Deserialize)]
