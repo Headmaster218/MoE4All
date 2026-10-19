@@ -1090,6 +1090,22 @@ fn no_infr_env_reads_outside_the_config_layer() {
     );
 }
 
+#[test]
+fn diagnostic_bootstrap_directory_uses_an_injected_os_reader() {
+    assert_eq!(env::diagnostic_directory(&|_| None), None);
+    assert_eq!(
+        env::diagnostic_directory(&|_| Some(std::ffi::OsString::new())),
+        None,
+    );
+    assert_eq!(
+        env::diagnostic_directory(&|key| {
+            assert_eq!(key, "INFR_DIAGNOSTIC_DIR");
+            Some(std::ffi::OsString::from("reports with spaces"))
+        }),
+        Some(std::path::PathBuf::from("reports with spaces")),
+    );
+}
+
 fn scan_for_env_reads(dir: &Path, out: &mut Vec<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;

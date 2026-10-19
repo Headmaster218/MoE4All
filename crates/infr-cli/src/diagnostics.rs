@@ -132,8 +132,8 @@ fn unique_id() -> anyhow::Result<String> {
 }
 
 pub fn default_root() -> PathBuf {
-    if let Some(path) = std::env::var_os("INFR_DIAGNOSTIC_DIR").filter(|path| !path.is_empty()) {
-        return PathBuf::from(path);
+    if let Some(path) = infr_core::config::env::diagnostic_directory(&|key| std::env::var_os(key)) {
+        return path;
     }
     std::env::current_exe()
         .ok()
