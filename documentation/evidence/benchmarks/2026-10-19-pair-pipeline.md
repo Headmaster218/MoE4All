@@ -172,11 +172,70 @@ VRAM 优先的**自动**策略在这个模型/边界下会过提交：KV 在任�
 ratio 1.7814、并发 103.5 ms/步、单请求 decode 10.85 tok/s（与 `-u256` 相同），但 prefill
 **828 → 594 tok/s**。再次确认解码由深度/带宽决定而非 ubatch，预填 chunk 256 仍是最优。
 
-## 结论：下一步只能跳出「权重全驻 + KV 全走宿主」这个组合
+## 由这一轮得出的候选方向（后续两项已被下一节的数据修正，见下）
 
-1. **词表并行切分 head**：`lm_head` GEMV + argmax 现在整块压在 dev1，是它比 dev0 多出的时间
-   的主要部分；按 vocab 切到两张卡 + 设备内 reduce/argmax 才能真正把 dev1 压下去。
+1. ~~词表并行切分 head~~ —— **下一节的 per-op 实测把它否决了**：head 只占 dev1 权重带的 1.9%、
+   占解码设备时间的 0.6%。
 2. **KV 溢出让走 BAR 可见堆**：如果板卡/驱动提供了大 BAR（SAM），把 `alloc_kv_host` 的
    cached-system-RAM 选择改成 BAR 窗口，PCIe 读 KV 的吞吐会有量级差异。
 3. **容量本身**：更多 VRAM，或更低比特的权重/KV —— 这条路线里 43.4 GiB 权重 + 激活已经吃掉
    全部 45 GiB 可用显存。
+
+---
+
+# 词表切 head 的量化评估：被自己的数据否决（2026-10-19 10:4x）
+
+「`lm_head` 整块压在 dev1 导致它慢」这个假设**不成立**，实测结论如下。
+
+## 元数据：head 只有 416.8 MiB
+
+用最小 GGUF 头解析器读模型（`qwen4exp` 架构，48 层，`embedding_length=2560`，
+`expert_count=512`/`expert_used_count=10`，`full_attention_interval=4`，
+`compress_ratios=[0,0,0,4]×12`，词表 248320；工具：仓库外
+`work/gguf_head.py`）：
+
+| 张量 | 形状 | 量化 | 大小 |
+|---|---|---:|---:|
+| `output.weight`（LM head） | [2560, 248320] | Q5_K | **416.8 MiB** |
+| `token_embd.weight`（在 dev0） | [2560, 248320] | IQ3_S | 260.5 MiB |
+| `output_hc_{down,up,norm}` | — | Q8_0/F32 | 6.6 MiB |
+
+dev1 的权重带是 22.38 GiB，head 只占其中 **1.9%**。把它 50/50 切到两张卡，最多省下的一半
+GEMV 时间——而 VRAM 余量（dev0 只剩 109.5 MiB）根本放不下那 208 MiB，还要额外付一次跨卡
+reduce。**收益上限 <0.3%，代价是撞 VRAM 墙**，因此不做。
+
+## per-op 实测：head 占解码设备时间的 0.6%
+
+32K 深度、单行解码（`INFR_PROF_OPS=1 INFR_PROF_OP_SHAPES=1`，末 30 张 per-op 表 ≈ 2 个
+解码步，合计 174.4 ms 设备时间 / 3591 次 dispatch）：
+
+| 算子 | ms | 占比 | 次数 |
+|---|---:|---:|---:|
+| `deltanet`（SSM/线性注意力） | 48.93 | 28.1% | 69 |
+| `rmsnorm_gate_sigmoid` | 47.95 | 27.5% | 69 |
+| `qsa_indexer_score_decode8_h4_seg` | 21.63 | 12.4% | 23 |
+| `qsa_gather_q8_seg` | 12.07 | 6.9% | 23 |
+| 其余 GEMV/MMQ（含 `m1:6144x2560`、`m1:320x10240`、`m1:2560x10240`） | ~35 | ~20% | — |
+| **`lin_vocab_out`（就是 head）** | **1.06** | **0.6%** | 2 |
+
+交叉验证：末 30 张表的设备时间 ÷ 2 步 ≈ 87 ms/步，与单 lane 的 `dev0 37 + dev1 51 = 88 ms`
+吻合到 1%。也就是说 head 每 token 约 **0.53 ms**，`416.8 MiB ÷ 800 GB/s ≈ 0.5 ms` 也吻合 ——
+它是个纯 memory-bound 的 GEMV，量级完全正常，没有实现缺陷。
+
+## 真正的发现：解码是 dispatch-latency bound，不是带宽也不是算力 bound
+
+同一个表还给出了每 token 的 dispatch 数：**≈1800 次/步/卡**，设备时间 87 ms ⇒ **每 dispatch
+≈48 µs**。其中 `deltanet` 与 `rmsnorm_gate_sigmoid` 各 ≈350 µs/次 —— 对单行、几千元素的
+kernel 来说，这是**延迟**（launch + 依赖 + 小 workgroup），不是吞吐。MoE 的
+`gemv_streamed:m1:2560x512` 只要 5 µs/次，说明不是所有小算子都慢。
+
+这解释了 1 lane 10.9 t/s 的物理来源：1800 次 dispatch × ~48 µs 的**串行**延迟。
+
+## 因此 100 t/s 的路线判断
+
+- 折 10 倍延迟需要把每 token 的 dispatch 数从 ~1800 降到 ~200（融合），或把每次 dispatch 的
+  延迟从 48 µs 压到 5 µs —— 两条路都是 kernel/图融合工程，**不是 QSA 单点问题**。
+- 按贡献排序，第一优先级是 `deltanet` + `rmsnorm_gate_sigmoid`（合计 55.6%），第二是 QSA 的
+  indexer/gather/topk 家族（≈22%），第三才是 MoE 的 GEMV 家族（≈15%）。head 在列表末尾。
+- 另一条与 kernel 正交的杠杆是**摊薄**：延迟型瓶颈下并发 lane 越多越划算（2 lane 已经把
+  cohort ratio 做到 1.8），这正是 `infr serve --parallel N` 的方向。
