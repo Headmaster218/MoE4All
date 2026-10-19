@@ -475,7 +475,10 @@ function cb_fail1(a) { return 0 }
 # vim:fdm=marker:
 MOE4ALL_JSON_AWK
 
-declare -A S=() DEFAULTS=() J=() OVERRIDES=()
+declare -A S=() DEFAULTS=() J=() OVERRIDES=() BENCHMARK_ESTIMATE_MINUTES=()
+BENCHMARK_ESTIMATE_PID=''
+BENCHMARK_ESTIMATE_FD=''
+BENCHMARK_ESTIMATE_ERROR=''
 declare -a COMMAND=() FILES=() CANDIDATES=()
 
 json_load() {
@@ -541,7 +544,7 @@ json_quote() {
 defaults() {
     local key
     S=(
-        [launch_mode]=run [setup_mode]=conservative [model]='' [device]='' [context]=''
+        [launch_mode]=run [setup_mode]=conservative [model]='' [model_history]='' [device]='' [context]=''
         [ubatch]='' [threads]='' [config_path]='' [kv_preset]=q8 [kv_type_k]=q8_0 [kv_type_v]=q8_0
         [configure_memory]=false [vram_budget]='' [vram_reserve]='' [expert_cache]='' [ram_budget]=''
         [host_dma]=true [pager_ring]='' [pager_ring_slots]='' [kv_overflow]=false [kv_overflow_vram_mb]='' [kv_overflow_reserve_mb]=''
@@ -552,8 +555,8 @@ defaults() {
         [session_cache_dir]="$ROOT/kv-sessions" [session_idle_secs]=120 [session_cache_max]=5GiB [session_cache_ttl_hours]=24
         [server_vision]=false [vision_projector]='' [server_embedding]=false [embedding_model]='' [embedding_idle_timeout]=300
         [mtp_enabled]=false [mtp_model]='' [mtp_verify_tokens]=4 [cpu_miss_enabled]=false [cpu_miss_max]=1 [cpu_miss_cores]=''
-        [bench_kind]=decode [prompt_tokens]=1024 [gen_tokens]=128 [depth_mode]=none [depth_tokens]=0 [reps]=1 [json_output]=false
-        [custom_sets]='' [auto_overrides]=''
+        [bench_kind]=quick [bench_parallel]=1 [manual_bench_kind]=decode [prompt_tokens]=6144 [gen_tokens]=512 [depth_mode]=none [depth_tokens]=0 [reps]=1 [json_output]=false
+        [custom_sets]='' [auto_overrides]='' [benchmark_upload]=false [benchmark_upload_has_github]=true [error_upload]=false
     )
     DEFAULTS=(); for key in "${!S[@]}"; do DEFAULTS[$key]=${S[$key]}; done
 }
@@ -631,10 +634,21 @@ integer() {
 }
 choice() {
     local key=$1 label=$2 selected i entry; shift 2
-    local -a values=() labels=()
-    for entry in "$@"; do values+=("${entry%%|*}"); labels+=("${entry#*|}"); done
+    local rest detail; local -a values=() labels=() details=()
+    for entry in "$@"; do
+        values+=("${entry%%|*}"); rest=${entry#*|}
+        if [[ $rest == *'|'* ]]; then labels+=("${rest%%|*}"); details+=("${rest#*|}")
+        else labels+=("$rest"); details+=(''); fi
+    done
     printf '\n%s\n' "$label"
-    for ((i=0;i<${#values[@]};i++)); do selected=' '; [[ ${S[$key]} != "${values[i]}" ]] || selected='*'; printf ' %s[%d] %s\n' "$selected" "$((i+1))" "${labels[i]}"; done
+    for ((i=0;i<${#values[@]};i++)); do
+        selected=' '; [[ ${S[$key]} != "${values[i]}" ]] || selected='*'; printf ' %s[%d] %s\n' "$selected" "$((i+1))" "${labels[i]}"
+        if [[ -n ${details[i]} ]]; then
+            while IFS= read -r detail; do
+                if [[ -t 1 ]]; then printf '\033[90m       %s\033[0m\n' "$detail"; else printf '       %s\n' "$detail"; fi
+            done <<< "${details[i]}"
+        fi
+    done
     while true; do
         printf 'Select (Enter = previous/default): '
         IFS= read -r selected || { fail 'Launch cancelled: input ended.'; return 1; }; trim "$selected"; selected=$REPLY
@@ -648,6 +662,72 @@ choice() {
         done
         printf 'Choose a listed option.\n'
     done
+}
+
+benchmark_estimate_args() {
+    ESTIMATE_ARGS=("$BINARY" bench --estimate-only)
+    if [[ -n ${S[device]} ]]; then ESTIMATE_ARGS+=(--dev "${S[device]}"); fi
+    if [[ ${S[setup_mode]} == manual ]]; then
+        [[ -z ${S[config_path]} ]] || ESTIMATE_ARGS+=(--config "${S[config_path]}")
+        [[ -z ${S[ubatch]} ]] || ESTIMATE_ARGS+=(--ubatch "${S[ubatch]}")
+        [[ -z ${S[threads]} ]] || ESTIMATE_ARGS+=(--threads "${S[threads]}")
+        if [[ ${S[configure_memory]-false} == true ]]; then
+            [[ -z ${S[vram_budget]} ]] || ESTIMATE_ARGS+=(--set "device.vram_budget=${S[vram_budget]}")
+            [[ -z ${S[vram_reserve]} ]] || ESTIMATE_ARGS+=(--set "device.vram_reserve=${S[vram_reserve]}")
+            [[ -z ${S[ram_budget]} ]] || ESTIMATE_ARGS+=(--set "device.ram_budget=${S[ram_budget]}")
+        fi
+    else
+        ESTIMATE_ARGS+=(--set "device.auto_profile=${S[setup_mode]}")
+    fi
+    ESTIMATE_ARGS+=("${S[model]}")
+}
+
+start_benchmark_estimate_probe() {
+    [[ ${S[launch_mode]} == bench && -z $BENCHMARK_ESTIMATE_PID && -z $BENCHMARK_ESTIMATE_ERROR && ${#BENCHMARK_ESTIMATE_MINUTES[@]} -eq 0 ]] || return 0
+    benchmark_estimate_args
+    coproc MOE4ALL_BENCH_ESTIMATE { "${ESTIMATE_ARGS[@]}" 2>/dev/null; }
+    BENCHMARK_ESTIMATE_PID=$MOE4ALL_BENCH_ESTIMATE_PID
+    BENCHMARK_ESTIMATE_FD=${MOE4ALL_BENCH_ESTIMATE[0]}
+}
+
+complete_benchmark_estimate_probe() {
+    local output line status suite parallel index value
+    local -a fields=()
+    ((${#BENCHMARK_ESTIMATE_MINUTES[@]} == 0)) || return 0
+    [[ -z $BENCHMARK_ESTIMATE_ERROR ]] || return 0
+    [[ -n $BENCHMARK_ESTIMATE_PID ]] || start_benchmark_estimate_probe
+    [[ -n $BENCHMARK_ESTIMATE_PID ]] || return 0
+    output=$(cat <&"$BENCHMARK_ESTIMATE_FD")
+    if wait "$BENCHMARK_ESTIMATE_PID"; then status=0; else status=$?; fi
+    BENCHMARK_ESTIMATE_PID=''; BENCHMARK_ESTIMATE_FD=''
+    if ((status != 0)); then BENCHMARK_ESTIMATE_ERROR="estimate process exited with code $status"; return 0; fi
+    line=$(printf '%s\n' "$output" | awk '/^BENCH_ESTIMATE_MENU_V1\|/{last=$0} END{print last}')
+    IFS='|' read -r -a fields <<< "$line"
+    if ((${#fields[@]} != 13)) || [[ ${fields[0]-} != BENCH_ESTIMATE_MENU_V1 ]]; then
+        BENCHMARK_ESTIMATE_ERROR='estimate matrix protocol response is missing'; return 0
+    fi
+    index=1
+    for suite in quick standard full; do
+        for parallel in 1 2 3 4; do
+            value=${fields[index]}
+            if [[ ! $value =~ ^[1-9][0-9]*$ ]]; then
+                BENCHMARK_ESTIMATE_MINUTES=(); BENCHMARK_ESTIMATE_ERROR='estimate matrix contains invalid minutes'; return 0
+            fi
+            BENCHMARK_ESTIMATE_MINUTES["$suite:$parallel"]=$value
+            ((index+=1))
+        done
+    done
+}
+
+benchmark_estimate_detail() {
+    local suite=$1 parallel=$2 key
+    complete_benchmark_estimate_probe
+    key="$suite:$parallel"
+    if [[ -n ${BENCHMARK_ESTIMATE_MINUTES[$key]-} ]]; then
+        REPLY="Estimated about ${BENCHMARK_ESTIMATE_MINUTES[$key]} min."
+    else
+        REPLY='Estimate currently unavailable.'
+    fi
 }
 
 absolute() {
@@ -836,6 +916,9 @@ model_path() {
     model_candidates "$ROOT" "$kind"
     catalog_candidates "$kind"
     local -a nearby=("${CANDIDATES[@]}") remembered=("$saved")
+    if [[ $kind == llm && -n ${S[model_history]} ]]; then
+        while IFS= read -r value; do [[ -z $value ]] || remembered+=("$value"); done <<< "${S[model_history]}"
+    fi
     if [[ $kind == llm && -f $ROOT/gui-data/state.json ]]; then
         if json_load "$ROOT/gui-data/state.json"; then
             for path in "${!J[@]}"; do
@@ -881,6 +964,24 @@ model_path() {
         if [[ $kind == llm ]] && hub_reference "$value"; then S[$key]=$value; return; fi
         printf 'GGUF file not found.\n'
     done
+}
+
+remember_model() {
+    local current=${S[model]} value path count=0 history='' found
+    [[ -n $current ]] || return 0
+    if hub_reference "$current"; then return 0; fi
+    absolute "$current"; current=$REPLY
+    [[ -f $current && ${current,,} == *.gguf ]] || return 0
+    while IFS= read -r value; do
+        [[ -n $value ]] || continue; absolute "$value"; path=$REPLY
+        [[ -f $path && ${path,,} == *.gguf ]] || continue
+        found=false
+        while IFS= read -r existing; do [[ $existing != "$path" ]] || found=true; done <<< "$history"
+        [[ $found == false ]] || continue
+        if [[ -n $history ]]; then history+=$'\n'; fi; history+="$path"; ((count+=1))
+        ((count<20)) || break
+    done <<< "$current"$'\n'"${S[model_history]}"
+    S[model_history]=$history
 }
 
 # Stream bounded GGUF metadata; do not scan tensor weights or create a GPU context.
@@ -984,9 +1085,343 @@ valid_address() {
 loopback() { [[ $1 =~ ^(127\.[0-9]+\.[0-9]+\.[0-9]+|localhost|\[::1\]):[0-9]+$ ]]; }
 serial_mtp() { [[ ${S[mtp_enabled]} == true && ${S[server_parallel]} == 1 && ${S[server_vision]} == false && ${S[server_embedding]} == false ]]; }
 
+newest_error_report() {
+    local root=$ROOT/diagnostics/reports
+    [[ -d $root ]] || { REPLY=''; return; }
+    REPLY=$(find "$root" -type f -name '*.m4e' -print 2>/dev/null | LC_ALL=C sort | tail -n 1)
+}
+
+newest_benchmark_report() {
+    local root=$ROOT/benchmark-database
+    [[ -d $root ]] || { REPLY=''; return; }
+    REPLY=$(find "$root" -type f -name '*.m4b' -print 2>/dev/null | LC_ALL=C sort | tail -n 1)
+}
+
+file_sha256() {
+    REPLY=$(sha256sum -- "$1") || return 1
+    REPLY=${REPLY%% *}
+}
+
+submission_header() {
+    local path=$1 name=$2 count
+    count=$(grep -c "^${name}: " "$path" 2>/dev/null) || true
+    [[ $count == 1 ]] || return 1
+    REPLY=$(sed -n "s/^${name}: //p" "$path")
+}
+
+ensure_submission_curl() {
+    command -v curl >/dev/null 2>&1 && return 0
+    if [[ ${INTERACTIVE-false} != true || ${HEADLESS-false} == true ]]; then
+        fail 'Uploading requires curl. The local report was preserved.'
+        return 1
+    fi
+    yes 'Uploading requires curl. Install it with the system package manager now? / 上传需要 curl，现在安装吗？' false
+    if [[ $REPLY != true ]]; then
+        printf 'Upload skipped; the local report was preserved.\n'
+        return 1
+    fi
+    install_curl
+}
+
+submission_api_config() {
+    local origin_rest
+    SUBMISSION_API_BASE=${MOE4ALL_SUBMISSION_API_BASE:-https://api.moe4all.com/v1}
+    case $SUBMISSION_API_BASE in
+        https://[A-Za-z0-9.-]*/v1|https://[A-Za-z0-9.-]*:[0-9]*/v1) ;;
+        http://127.0.0.1:[0-9]*/v1|http://localhost:[0-9]*/v1)
+            [[ -n ${MOE4ALL_SUBMISSION_API_BASE-} ]] || return 1
+            ;;
+        *) fail 'Invalid submission API base. HTTPS is required except for an explicit loopback development URL.'; return 1 ;;
+    esac
+    if [[ $SUBMISSION_API_BASE == *'?'* || $SUBMISSION_API_BASE == *'#'* || $SUBMISSION_API_BASE == *'@'* ]]; then
+        fail 'Submission API base must not contain credentials, query or fragment.'
+        return 1
+    fi
+    if [[ -n ${MOE4ALL_SUBMISSION_SITE_ORIGIN-} ]]; then
+        SUBMISSION_SITE_ORIGIN=$MOE4ALL_SUBMISSION_SITE_ORIGIN
+    elif [[ $SUBMISSION_API_BASE == https://api.moe4all.com/v1 ]]; then
+        SUBMISSION_SITE_ORIGIN=https://moe4all.com
+    else
+        SUBMISSION_SITE_ORIGIN=${SUBMISSION_API_BASE%/v1}
+    fi
+    case $SUBMISSION_SITE_ORIGIN in
+        https://[A-Za-z0-9.-]*|https://[A-Za-z0-9.-]*:[0-9]*|http://127.0.0.1:[0-9]*|http://localhost:[0-9]*) ;;
+        *) fail 'Invalid submission website origin.'; return 1 ;;
+    esac
+    origin_rest=${SUBMISSION_SITE_ORIGIN#*://}
+    if [[ $origin_rest == */* || $origin_rest == *'@'* || $SUBMISSION_SITE_ORIGIN == *'?'* || $SUBMISSION_SITE_ORIGIN == *'#'* ]]; then
+        fail 'Submission website origin must not contain a path, credentials, query or fragment.'
+        return 1
+    fi
+}
+
+submission_api_request() {
+    local method=$1 url=$2 output=$3 token=${4-} body=${5-} content_type=${6-application/json}
+    local attempt code delay
+    local -a args=(--silent --show-error --connect-timeout 10 --max-time 30 --request "$method" --header 'Accept: application/json')
+    [[ -z $token ]] || args+=(--header "Authorization: Bearer $token")
+    [[ -z $body ]] || args+=(--header "Content-Type: $content_type" --data-binary "@$body")
+    for attempt in 0 1 2 3; do
+        code=$(curl "${args[@]}" --output "$output" --write-out '%{http_code}' "$url") || code=000
+        if [[ $code =~ ^2[0-9][0-9]$ ]]; then SUBMISSION_HTTP_STATUS=$code; return 0; fi
+        if [[ $code != 000 && $code != 429 && ! $code =~ ^5[0-9][0-9]$ ]]; then break; fi
+        ((attempt < 3)) || break
+        delay=$((1 << (attempt + 1)))
+        sleep "$delay"
+    done
+    SUBMISSION_HTTP_STATUS=$code
+    fail "Submission service request failed (HTTP $code). The local report was preserved."
+    return 1
+}
+
+open_submission_url() {
+    if command -v xdg-open >/dev/null 2>&1; then xdg-open "$1" >/dev/null 2>&1 & return 0; fi
+    if command -v gio >/dev/null 2>&1; then gio open "$1" >/dev/null 2>&1 & return 0; fi
+    return 1
+}
+
+save_submission_receipt() {
+    local receipt_id=$1 receipt_token=$2 kind=$3 report_id=$4 file_hash=$5 payload_hash=$6 status=$7 received_at=$8 public_url=${9-}
+    local directory=$CONFIG_DIR/private/submission-receipts path temporary
+    path=$directory/$receipt_id.private-receipt.json
+    mkdir -p -- "$directory"
+    chmod 700 "$CONFIG_DIR/private" "$directory" 2>/dev/null || true
+    temporary=$(mktemp "$directory/.receipt.XXXXXX")
+    {
+        printf '{\n'
+        json_quote "$SUBMISSION_API_BASE"; printf '  "api_version": 1,\n  "api_base": %s,\n' "$REPLY"
+        json_quote "$receipt_id"; printf '  "receipt_id": %s,\n' "$REPLY"
+        json_quote "$receipt_token"; printf '  "receipt_token": %s,\n' "$REPLY"
+        json_quote "$kind"; printf '  "kind": %s,\n' "$REPLY"
+        json_quote "$report_id"; printf '  "report_id": %s,\n' "$REPLY"
+        json_quote "$file_hash"; printf '  "file_sha256": %s,\n' "$REPLY"
+        json_quote "$payload_hash"; printf '  "payload_sha256": %s,\n' "$REPLY"
+        json_quote "$status"; printf '  "status": %s,\n' "$REPLY"
+        json_quote "$received_at"; printf '  "received_at": %s,\n' "$REPLY"
+        json_quote "$public_url"; printf '  "public_url": %s\n}\n' "$REPLY"
+    } > "$temporary"
+    chmod 600 "$temporary"
+    mv -f -- "$temporary" "$path"
+    REPLY=$path
+}
+
+website_submission_upload() {
+    local path=$1 kind=$2 extension=.m4b size file_hash report_id response request
+    local session_id session_token verification_url state='' receipt_id receipt_token payload_hash status received_at public_url response_hash response_size count
+    [[ $kind != error ]] || extension=.m4e
+    [[ -f $path && $path == *$extension ]] || { fail "Submission file is missing or does not match $kind."; return 1; }
+    "$BINARY" submission verify "$path" >/dev/null || { fail 'Local submission verification failed; nothing was uploaded.'; return 1; }
+    size=$(wc -c < "$path")
+    ((size > 0 && size <= 131072)) || { fail 'Submission must be between 1 and 131072 bytes.'; return 1; }
+    submission_header "$path" kind; [[ $REPLY == "$kind" ]] || { fail 'Submission kind does not match the selected upload type.'; return 1; }
+    submission_header "$path" id; report_id=$REPLY
+    [[ ${path##*/} == "${report_id}${extension}" ]] || { fail 'Submission filename does not match its report ID.'; return 1; }
+    file_sha256 "$path"; file_hash=$REPLY
+    ensure_submission_curl || return 1
+    submission_api_config || return 1
+    mkdir -p -- "$CONFIG_DIR"
+    request=$(mktemp "$CONFIG_DIR/.submission-request.XXXXXX")
+    response=$(mktemp "$CONFIG_DIR/.submission-response.XXXXXX")
+    json_quote "$kind"; local q_kind=$REPLY
+    json_quote "$report_id"; local q_id=$REPLY
+    json_quote "$file_hash"; local q_hash=$REPLY
+    printf '{"kind":%s,"report_id":%s,"file_sha256":%s,"size_bytes":%s}\n' "$q_kind" "$q_id" "$q_hash" "$size" > "$request"
+    printf '\nCreating a secure upload session / 正在创建安全上传会话...\n'
+    if ! submission_api_request POST "$SUBMISSION_API_BASE/upload-sessions" "$response" '' "$request"; then rm -f -- "$request" "$response"; return 1; fi
+    if ! json_load "$response"; then rm -f -- "$request" "$response"; fail 'Submission service returned invalid JSON.'; return 1; fi
+    json_get '["api_version"]'; [[ $REPLY == 1 ]] || { rm -f -- "$request" "$response"; return 1; }
+    json_get '["state"]'; [[ $REPLY == awaiting_verification ]] || { rm -f -- "$request" "$response"; return 1; }
+    json_get '["session_id"]'; session_id=$REPLY; [[ $session_id =~ ^[A-Za-z0-9_-]+$ ]] || { rm -f -- "$request" "$response"; return 1; }
+    json_get '["session_token"]'; session_token=$REPLY; [[ -n $session_token ]] || { rm -f -- "$request" "$response"; return 1; }
+    json_get '["max_upload_bytes"]'; response_size=$REPLY; [[ $response_size =~ ^[0-9]+$ ]] && ((response_size >= size)) || { rm -f -- "$request" "$response"; return 1; }
+    json_get '["verification_url"]'; verification_url=$REPLY
+    if [[ $verification_url != "$SUBMISSION_SITE_ORIGIN/community/upload.html#"* ]]; then rm -f -- "$request" "$response"; fail 'Submission verification URL is outside the configured website origin.'; return 1; fi
+    if ! open_submission_url "$verification_url"; then
+        printf 'Open this one-time confirmation URL on this machine:\n%s\n' "$verification_url"
+    fi
+    printf 'Confirm the public submission in the browser. The backend will create a public GitHub PR.\n'
+    printf '请在浏览器确认公开提交；上传后后端会创建公开 GitHub PR。\n'
+    for count in {1..300}; do
+        sleep 3
+        if ! submission_api_request GET "$SUBMISSION_API_BASE/upload-sessions/$session_id" "$response" "$session_token"; then rm -f -- "$request" "$response"; return 1; fi
+        json_load "$response" || { rm -f -- "$request" "$response"; return 1; }
+        json_get '["kind"]'; [[ $REPLY == "$kind" ]] || { rm -f -- "$request" "$response"; return 1; }
+        json_get '["report_id"]'; [[ $REPLY == "$report_id" ]] || { rm -f -- "$request" "$response"; return 1; }
+        json_get '["file_sha256"]'; [[ $REPLY == "$file_hash" ]] || { rm -f -- "$request" "$response"; return 1; }
+        json_get '["size_bytes"]'; [[ $REPLY == "$size" ]] || { rm -f -- "$request" "$response"; return 1; }
+        json_get '["state"]'; state=$REPLY
+        case $state in
+            ready|uploaded) break ;;
+            cancelled) rm -f -- "$request" "$response"; printf 'Upload cancelled; the local report was preserved.\n'; return 1 ;;
+            awaiting_verification) ;;
+            *) rm -f -- "$request" "$response"; fail "Unknown upload session state: $state"; return 1 ;;
+        esac
+    done
+    if [[ $state != ready && $state != uploaded ]]; then rm -f -- "$request" "$response"; fail 'Upload confirmation timed out; the local report was preserved.'; return 1; fi
+    if ! submission_api_request POST "$SUBMISSION_API_BASE/upload-sessions/$session_id/report" "$response" "$session_token" "$path" 'text/plain; charset=utf-8'; then rm -f -- "$request" "$response"; return 1; fi
+    json_load "$response" || { rm -f -- "$request" "$response"; return 1; }
+    json_get '["receipt_id"]'; receipt_id=$REPLY; [[ $receipt_id =~ ^[A-Za-z0-9_-]+$ ]] || { rm -f -- "$request" "$response"; return 1; }
+    json_get '["receipt_token"]'; receipt_token=$REPLY; [[ -n $receipt_token ]] || { rm -f -- "$request" "$response"; return 1; }
+    json_get '["kind"]'; [[ $REPLY == "$kind" ]] || { rm -f -- "$request" "$response"; return 1; }
+    json_get '["report_id"]'; [[ $REPLY == "$report_id" ]] || { rm -f -- "$request" "$response"; return 1; }
+    json_get '["file_sha256"]'; response_hash=$REPLY; [[ $response_hash == "$file_hash" ]] || { rm -f -- "$request" "$response"; return 1; }
+    json_get '["payload_sha256"]'; payload_hash=$REPLY; [[ $payload_hash =~ ^[0-9a-f]{64}$ ]] || { rm -f -- "$request" "$response"; return 1; }
+    json_get '["status"]'; status=$REPLY
+    case $status in forwarding|pending_review|published|rejected|delivery_failed) ;; *) rm -f -- "$request" "$response"; fail "Unknown receipt status: $status"; return 1 ;; esac
+    json_get '["received_at"]'; received_at=$REPLY
+    public_url=''
+    local public_path='["public_url"]'
+    if [[ -v 'J[$public_path]' && ${J[$public_path]} == \"*\" ]]; then json_get "$public_path"; public_url=$REPLY; fi
+    save_submission_receipt "$receipt_id" "$receipt_token" "$kind" "$report_id" "$file_hash" "$payload_hash" "$status" "$received_at" "$public_url"
+    printf 'Received, status: %s / 已收到，状态：%s\nReceipt ID: %s\nPrivate receipt: %s\n' "$status" "$status" "$receipt_id" "$REPLY"
+    [[ -z $public_url ]] || printf 'Public URL: %s\n' "$public_url"
+    rm -f -- "$request" "$response"
+}
+
+gh_benchmark_upload() {
+    local path=$1 login upstream=Headmaster218/MoE4All fork month report_id branch base_sha relative request content pr_url
+    command -v gh >/dev/null 2>&1 || return 1
+    gh auth status --hostname github.com >/dev/null 2>&1 || return 1
+    login=$(gh api user --jq .login 2>/dev/null) || return 1
+    [[ $login =~ ^[A-Za-z0-9-]+$ ]] || return 1
+    submission_header "$path" id; report_id=$REPLY
+    submission_header "$path" created-at; month=${REPLY:0:7}
+    [[ $month =~ ^[0-9]{4}-[0-9]{2}$ ]] || return 1
+    fork=$login/MoE4All
+    relative=benchmark-database/v1/$month/${path##*/}
+    printf '\nGitHub: %s\nTarget / 目标: %s/%s\n' "$login" "$upstream" "$relative"
+    yes 'Create the branch and benchmark PR now? / 现在创建分支和 benchmark PR？' true
+    [[ $REPLY == true ]] || return 0
+    if ! gh api "repos/$fork" >/dev/null 2>&1; then
+        gh repo fork "$upstream" --clone=false --remote=false >/dev/null || return 1
+        local ready=false attempt
+        for attempt in {1..15}; do sleep 2; if gh api "repos/$fork" >/dev/null 2>&1; then ready=true; break; fi; done
+        [[ $ready == true ]] || return 1
+    fi
+    base_sha=$(gh api "repos/$fork/git/ref/heads/main" --jq .object.sha 2>/dev/null) || return 1
+    branch=benchmark/$login-$report_id
+    gh api --method POST "repos/$fork/git/refs" -f "ref=refs/heads/$branch" -f "sha=$base_sha" >/dev/null || return 1
+    mkdir -p -- "$CONFIG_DIR"
+    request=$(mktemp "$CONFIG_DIR/.github-benchmark.XXXXXX")
+    content=$(base64 < "$path" | tr -d '\r\n') || { rm -f -- "$request"; return 1; }
+    json_quote "bench: add $report_id"; local q_message=$REPLY
+    json_quote "$content"; local q_content=$REPLY
+    json_quote "$branch"; local q_branch=$REPLY
+    printf '{"message":%s,"content":%s,"branch":%s}\n' "$q_message" "$q_content" "$q_branch" > "$request"
+    if ! gh api --method PUT "repos/$fork/contents/$relative" --input "$request" >/dev/null; then rm -f -- "$request"; return 1; fi
+    rm -f -- "$request"
+    pr_url=$(gh pr create --repo "$upstream" --base main --head "$login:$branch" --title "bench: add $report_id" --body 'Automated benchmark result generated by the MoE4All launch wizard.' 2>/dev/null) || return 1
+    printf 'PR created / PR 已创建: %s\n' "$pr_url"
+}
+
+offer_benchmark_upload() {
+    local path=$1 has_github gh_authenticated=false authorize=false
+    yes 'Upload this anonymous benchmark result? / 愿意上传这份匿名 benchmark 结果吗？' "${S[benchmark_upload]}"
+    S[benchmark_upload]=$REPLY; save_state
+    [[ $REPLY == true ]] || return 0
+    yes 'Do you have a GitHub account? / 你有 GitHub 账号吗？' "${S[benchmark_upload_has_github]}"
+    has_github=$REPLY; S[benchmark_upload_has_github]=$has_github; save_state
+    if [[ $has_github == true ]] && command -v gh >/dev/null 2>&1; then
+        if gh auth status --hostname github.com >/dev/null 2>&1; then
+            gh_authenticated=true
+        else
+            yes 'gh is not signed in. Authorize in the browser now? / gh 尚未登录，现在通过浏览器授权吗？' false
+            authorize=$REPLY
+            if [[ $authorize == true ]] && gh auth login --hostname github.com --git-protocol https --web; then gh_authenticated=true; fi
+        fi
+    fi
+    if [[ $gh_authenticated == true ]]; then
+        if gh_benchmark_upload "$path"; then return 0; fi
+        printf 'Direct GitHub upload failed; using the website relay. / GitHub 直传失败，改用网站中转。\n' >&2
+    elif [[ $has_github == true ]]; then
+        printf 'No authenticated gh CLI is available; using the website relay without installing another tool.\n'
+        printf '没有可用的已登录 gh；不安装额外工具，改用网站中转。\n'
+    fi
+    website_submission_upload "$path" benchmark
+}
+
+pack_manual_benchmark() {
+    local raw_json=$1 payload output id created engine_version model_name model_size context_tokens avg result_path avg_path='[0,"avg_ts"]'
+    json_load "$raw_json" || { fail 'Manual benchmark did not return recognizable JSON.'; return 1; }
+    [[ $JSON_KIND == array && -v 'J[$avg_path]' ]] || { fail 'Manual benchmark JSON has no avg_ts result.'; return 1; }
+    avg=${J[$avg_path]}
+    [[ $avg =~ ^[0-9]+([.][0-9]+)?$ ]] || { fail 'Manual benchmark avg_ts is invalid.'; return 1; }
+    created=$(date -u '+%Y-%m-%dT%H:%M:%S.000Z')
+    id=$(date -u '+manual-%Y%m%dT%H%M%S.000Z-')$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+    engine_version=$($BINARY --version 2>/dev/null || true); engine_version=${engine_version##* }
+    model_name=${S[model]##*/}; model_size=0; [[ ! -f ${S[model]} ]] || model_size=$(wc -c < "${S[model]}")
+    context_tokens=${S[depth_tokens]}; [[ ${S[manual_bench_kind]} != prefill ]] || context_tokens=${S[prompt_tokens]}
+    payload=$(mktemp "$CONFIG_DIR/.benchmark-payload.XXXXXX")
+    json_quote "$id"; local q_id=$REPLY
+    json_quote "$created"; local q_created=$REPLY
+    json_quote "$engine_version"; local q_engine=$REPLY
+    json_quote "$model_name"; local q_model=$REPLY
+    json_quote "${S[device]}"; local q_device=$REPLY
+    json_quote "${S[manual_bench_kind]}"; local q_kind=$REPLY
+    json_quote "${S[depth_mode]}"; local q_depth=$REPLY
+    json_quote "${S[setup_mode]}"; local q_profile=$REPLY
+    cat > "$payload" <<EOF
+{"schema_version":1,"id":$q_id,"created_at_utc":$q_created,"engine_version":$q_engine,"engine_commit":null,"profile":"manual","model":{"name":$q_model,"storage_bytes":$model_size},"hardware":{"os":"linux","architecture":"$(uname -m)","cpu":{},"ram":{},"gpu":{"configured_device":$q_device}},"configuration":{"benchmark_kind":$q_kind,"prompt_tokens":${S[prompt_tokens]},"decode_tokens":${S[gen_tokens]},"depth_mode":$q_depth,"depth_tokens":${S[depth_tokens]},"repetitions":${S[reps]},"auto_profile":$q_profile},"contexts":[{"requested_context_tokens":$context_tokens,"prefill":null,"decode":[],"manual_result":{"kind":$q_kind,"average_tokens_per_second":$avg},"failures":[]}],"failures":[]}
+EOF
+    if ! output=$($BINARY submission pack-benchmark --input "$payload" --result-dir "$ROOT/benchmark-database" 2>&1); then rm -f -- "$payload"; fail "$output"; return 1; fi
+    rm -f -- "$payload"
+    result_path=$(printf '%s\n' "$output" | sed -n 's/^MOE4ALL_SUBMISSION_PATH=//p' | tail -n 1)
+    [[ -n $result_path ]] || { fail 'The engine did not return a benchmark submission path.'; return 1; }
+    printf '\nResults / 结果\n+------------------+------------+----------+\n'
+    printf '| Workload         | Repetitions| Overall  |\n+------------------+------------+----------+\n'
+    printf '| %-16s | %10s | %8.1f |\n' "${S[manual_bench_kind]}" "${S[reps]}" "$avg"
+    printf '+------------------+------------+----------+\nBenchmark submission: %s\n' "$result_path"
+    REPLY=$result_path
+}
+
+read_problem_description() {
+    local description='' mode=rewrite line added decision
+    while true; do
+        [[ $mode != rewrite ]] || description=''
+        printf '\nDescribe the problem / 请输入问题描述。\nMultiple lines are allowed; enter a single period . to finish / 可输入多行，单独输入 . 才结束。\n'
+        added=''
+        while true; do
+            IFS= read -r line || return 1
+            [[ $line != . ]] || break
+            added+="$line"$'\n'
+        done
+        added=${added%$'\n'}
+        if [[ $mode == append && -n $description && -n $added ]]; then description+=$'\n'$added
+        elif [[ -n $added || $mode == rewrite ]]; then description=$added; fi
+        printf '\nDescription preview / 问题描述预览:\n%s\n' "${description:-(empty / 空)}"
+        printf '1. Confirm  2. Rewrite  3. Append  4. Cancel [1]: '
+        IFS= read -r decision || return 1; [[ -n $decision ]] || decision=1
+        case $decision in 1) REPLY=$description; return ;; 2) mode=rewrite ;; 3) mode=append ;; 4) return 2 ;; *) printf 'Choose 1-4.\n' ;; esac
+    done
+}
+
+complete_error_report() {
+    local source=${1-} description_file output path; local -a report_args
+    read_problem_description || { printf 'Cancelled; existing diagnostics were not deleted.\n'; return 0; }
+    mkdir -p -- "$CONFIG_DIR"
+    description_file=$(mktemp "$CONFIG_DIR/.error-description.XXXXXX")
+    printf '%s' "$REPLY" > "$description_file"
+    report_args=(report)
+    if [[ -n $source ]]; then report_args+=(--source "$source")
+    else report_args+=(--diagnostics-dir "$ROOT/diagnostics"); fi
+    report_args+=(--description-file "$description_file")
+    if ! output=$("$BINARY" "${report_args[@]}" 2>&1); then rm -f -- "$description_file"; fail "$output"; return 1; fi
+    rm -f -- "$description_file"
+    printf '%s\n' "$output"
+    path=$(printf '%s\n' "$output" | sed -n 's/^MOE4ALL_SUBMISSION_PATH=//p' | tail -n 1)
+    [[ -n $path ]] || { fail 'The engine did not return an error-report path.'; return 1; }
+    yes 'Upload this anonymous error report? / 愿意上传这份匿名错误报告吗？' "${S[error_upload]}"; S[error_upload]=$REPLY
+    save_state
+    if [[ $REPLY == true ]]; then
+        website_submission_upload "$path" error || printf 'Upload did not complete; the local report remains at %s\n' "$path" >&2
+    fi
+}
+
 configure() {
     local key value effort count previous
-    choice launch_mode '1. Purpose' 'run|Terminal chat (recommended)' 'serve|OpenAI-compatible API' 'bench|Benchmark'
+    REPORT_RETURN_MODE=${S[launch_mode]}
+    choice launch_mode '1. Purpose' 'run|Terminal chat (recommended)' 'serve|OpenAI-compatible API' 'bench|Benchmark' 'report|Report a current runtime problem'
+    [[ ${S[launch_mode]} != report ]] || return 0
     model_path llm model
     if [[ ${S[launch_mode]} == serve ]]; then
         if [[ -z ${S[vision_projector]} ]]; then model_candidates "${S[model]%/*}" vision; ((${#CANDIDATES[@]}!=1)) || S[vision_projector]=${CANDIDATES[0]}; fi
@@ -1045,7 +1480,7 @@ configure() {
     if [[ ${S[launch_mode]} == serve ]]; then
         integer server_parallel '6. Concurrent slots' 1
     fi
-    ask context '7. Context (blank = auto)'
+    if [[ ${S[launch_mode]} != bench ]]; then ask context '7. Context (blank = auto)'; fi
     if [[ ${S[launch_mode]} == serve ]]; then
         if serial_mtp; then S[server_session_cache]=false; printf 'Single-stream text-only MTP disables SSD session caching.\n'
         else ask_yes server_session_cache '8. Cache idle KV sessions on SSD?'; fi
@@ -1057,13 +1492,39 @@ configure() {
         ask_yes server_auth 'Enable Bearer API-key authentication?'
     fi
     if [[ ${S[launch_mode]} == bench ]]; then
-        choice bench_kind 'Benchmark type' 'decode|Decode' 'prefill|Prefill' 'mixed|Combined turn' 'custom|Custom -p / -n'
-        value=1; [[ ${S[bench_kind]} != custom ]] || value=0
-        if [[ ${S[bench_kind]} == decode ]]; then S[prompt_tokens]=0; else integer prompt_tokens 'Prompt tokens' "$value"; fi
-        if [[ ${S[bench_kind]} == prefill ]]; then S[gen_tokens]=0; else integer gen_tokens 'Generated tokens' "$value"; fi
-        choice depth_mode 'Context depth' 'none|None' 'real|Real warmup' 'synthetic|Synthetic'
-        if [[ ${S[depth_mode]} == none ]]; then S[depth_tokens]=0; else integer depth_tokens 'Depth tokens' 1; fi
-        integer reps 'Repetitions' 1; ask_yes json_output 'Emit JSON?'
+        if [[ ! ${S[bench_kind]} =~ ^(quick|standard|full|manual)$ ]]; then S[manual_bench_kind]=${S[bench_kind]}; S[bench_kind]=manual; fi
+        choice bench_kind 'Benchmark plan' \
+            $'quick|Automatic quick|6K Prefill + 1024 Decode. x1, one run.\n6K Prefill + 1024 Decode。单发，一次。' \
+            $'standard|Automatic standard|6K Prefill + 1024 Decode; 30K Prefill + 1024 Decode; x1-x2, one run each, 4 runs total.\n6K Prefill + 1024 Decode；30K Prefill + 1024 Decode；1-2 并发，各一次，共 4 次。' \
+            $'full|Automatic full|6K, 30K and 150K Prefill + 1024 Decode; x1-x4, three runs each, 36 runs total.\n6K、30K、150K Prefill + 1024 Decode；1-4 并发，各三次，共 36 次。' \
+            $'manual|Manual benchmark|Build one test step by step: Prefill, Decode and context depth.\n按顺序添加 Prefill、Decode 和上下文深度。'
+        if [[ ${S[bench_kind]} != manual ]]; then
+            case ${S[bench_kind]} in quick) S[bench_parallel]=1 ;; standard) S[bench_parallel]=2 ;; full) S[bench_parallel]=4 ;; esac
+            integer bench_parallel 'Maximum concurrency (tests x1 through xN)' 1 4
+        else
+            [[ ${S[manual_bench_kind]} =~ ^(prefill|decode|mixed)$ ]] || S[manual_bench_kind]=decode
+            choice manual_bench_kind 'Step 1: choose work / 第一步：选择工作' \
+                $'prefill|Prefill only / 只测 Prefill|Process a prompt without generating tokens.\n处理一段提示词，不生成 token。' \
+                $'decode|Decode only / 只测 Decode|Generate tokens; existing context can be added next.\n生成 token；下一步可添加已有上下文。' \
+                $'mixed|Prefill + Decode|Process a prompt and then generate in the same turn.\n同一轮先处理提示词，再生成 token。'
+            case ${S[manual_bench_kind]} in
+                prefill) integer prompt_tokens 'Prefill tokens' 1; S[gen_tokens]=0; S[depth_mode]=none; S[depth_tokens]=0 ;;
+                decode) S[prompt_tokens]=0; integer gen_tokens 'Decode tokens' 1 ;;
+                mixed) integer prompt_tokens 'Prefill tokens' 1; printf 'Added / 已添加: Prefill %s tokens\n' "${S[prompt_tokens]}"; integer gen_tokens 'Decode tokens' 1 ;;
+            esac
+            printf 'Added / 已添加: Prefill %s, Decode %s tokens\n' "${S[prompt_tokens]}" "${S[gen_tokens]}"
+            if [[ ${S[manual_bench_kind]} != prefill ]]; then
+                choice depth_mode 'Add context before measurement / 添加测量前上下文' \
+                    $'none|None / 不添加|Measure from an empty KV cache.\n从空 KV 开始测量。' \
+                    $'real|Real context / 真实上下文|Really prefill the selected depth before timing.\n先真实 Prefill 指定长度，再开始计时。' \
+                    $'synthetic|Synthetic KV depth|Create KV depth and attention shape without a real Prefill.\n只构造 KV 深度与注意力形状，不计作真实 Prefill。'
+                if [[ ${S[depth_mode]} == none ]]; then S[depth_tokens]=0; else integer depth_tokens 'Existing context tokens' 1; fi
+                printf 'Added / 已添加: context=%s, depth=%s\n' "${S[depth_mode]}" "${S[depth_tokens]}"
+            fi
+            integer reps 'Repetitions / 重复次数' 1; S[json_output]=true
+            printf 'Final plan / 最终计划: Prefill %s, Decode %s, context %s/%s, repetitions %s. JSON is saved automatically.\n' \
+                "${S[prompt_tokens]}" "${S[gen_tokens]}" "${S[depth_mode]}" "${S[depth_tokens]}" "${S[reps]}"
+        fi
     fi
 }
 
@@ -1087,7 +1548,7 @@ build_command() {
         [[ ,${S[auto_overrides]}, != *,ubatch,* ]] || add_arg --ubatch ubatch
         for key in ram_budget vram_budget; do if [[ ,${S[auto_overrides]}, == *,$key,* && -n ${S[$key]} ]]; then setting "device.$key" "${S[$key]}"; fi; done
     fi
-    add_arg --ctx context
+    [[ ${S[launch_mode]} == bench ]] || add_arg --ctx context
     if [[ ${S[kv_preset]} != auto ]]; then setting kv.type_k "${S[kv_type_k]}"; setting kv.type_v "${S[kv_type_v]}"; fi
     if [[ ${S[setup_mode]} == manual ]]; then
         if [[ ${S[configure_memory]} == true ]]; then
@@ -1124,9 +1585,13 @@ build_command() {
         done
     fi
     if [[ ${S[launch_mode]} == bench ]]; then
-        if [[ ${S[bench_kind]} == mixed ]]; then COMMAND+=(--pg "${S[prompt_tokens]},${S[gen_tokens]}"); else COMMAND+=(-p "${S[prompt_tokens]}" -n "${S[gen_tokens]}"); fi
-        case ${S[depth_mode]} in real) COMMAND+=(-d "${S[depth_tokens]}") ;; synthetic) COMMAND+=(--synthetic-depth "${S[depth_tokens]}") ;; esac
-        COMMAND+=(-r "${S[reps]}"); [[ ${S[json_output]} != true ]] || COMMAND+=(--json)
+        if [[ ${S[bench_kind]} =~ ^(quick|standard|full)$ ]]; then
+            COMMAND+=(--suite "${S[bench_kind]}" --parallel "${S[bench_parallel]}" --result-dir "$ROOT/benchmark-database")
+        else
+            if [[ ${S[manual_bench_kind]} == mixed ]]; then COMMAND+=(--pg "${S[prompt_tokens]},${S[gen_tokens]}"); else COMMAND+=(-p "${S[prompt_tokens]}" -n "${S[gen_tokens]}"); fi
+            case ${S[depth_mode]} in real) COMMAND+=(-d "${S[depth_tokens]}") ;; synthetic) COMMAND+=(--synthetic-depth "${S[depth_tokens]}") ;; esac
+            COMMAND+=(-r "${S[reps]}" --json)
+        fi
     else
         setting spec.mtp "${S[mtp_enabled]}"
         if [[ ${S[mtp_enabled]} == true ]]; then setting spec.draft "${S[mtp_model]}"; setting spec.k "${S[mtp_verify_tokens]}"; fi
@@ -1376,7 +1841,7 @@ usage() {
         '  --root DIRECTORY          Resolve all relative paths against this root'
 }
 main() {
-    local key flag value inherited=${INFR_API_KEY-} api_key='' reused=false
+    local key flag value inherited=${INFR_API_KEY-} api_key='' reused=false before_benchmark='' result_path='' raw_benchmark=''
     local -a argv=("$@")
     ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
     DRY_RUN=false; HEADLESS=false; SKIP_UPDATE=false; UPDATE_MODE=''; INTERACTIVE=false; NO_API_KEY=false
@@ -1423,7 +1888,7 @@ main() {
     [[ ! -v 'OVERRIDES[kv_type_k]' && ! -v 'OVERRIDES[kv_type_v]' ]] || S[kv_preset]=custom
     if [[ -v 'OVERRIDES[cpu_miss_cores]' ]]; then S[cpu_miss_enabled]=false; [[ ${S[cpu_miss_cores]} == '' || ${S[cpu_miss_cores]} == 0 ]] || S[cpu_miss_enabled]=true; fi
     [[ ! -v 'OVERRIDES[depth_tokens]' ]] || S[depth_mode]=real
-    [[ ! -v 'OVERRIDES[prompt_tokens]' && ! -v 'OVERRIDES[gen_tokens]' ]] || S[bench_kind]=custom
+    if [[ -v 'OVERRIDES[prompt_tokens]' || -v 'OVERRIDES[gen_tokens]' ]]; then S[bench_kind]=manual; S[manual_bench_kind]=custom; fi
     if [[ $NO_API_KEY == true ]]; then S[server_auth]=false; elif [[ -n $inherited ]]; then S[server_auth]=true; fi
     BINARY=''
     for value in "$ROOT/infr" "$ROOT/target/release/infr" "$(command -v infr || true)"; do
@@ -1441,6 +1906,12 @@ main() {
         fi
         [[ $reused == true ]] || configure
         [[ $NO_API_KEY == false ]] || S[server_auth]=false
+    fi
+    if [[ ${S[launch_mode]} == report ]]; then
+        complete_error_report
+        S[launch_mode]=${REPORT_RETURN_MODE:-run}
+        save_state
+        return 0
     fi
     if [[ ${S[launch_mode]} == serve && ${S[server_auth]} == true ]]; then
         api_key=$inherited
@@ -1468,11 +1939,35 @@ main() {
         [[ $INTERACTIVE == true ]] || { fail 'Launch confirmation requires input or --yes.'; return 1; }
         yes '10. Start now?' true; [[ $REPLY == true ]] || return 0
     fi
-    save_state; printf 'Settings saved: %s\n' "$STATE"
+    remember_model; save_state; printf 'Settings saved: %s\n' "$STATE"
     if [[ -n $api_key ]]; then export INFR_API_KEY=$api_key; else unset INFR_API_KEY; fi
+    export INFR_DIAGNOSTIC_DIR="$ROOT/diagnostics"
     cd -- "$ROOT"
     if [[ $INTERACTIVE == true && $HEADLESS == false ]]; then
-        "${COMMAND[@]}"
+        local before_report after_report exit_code
+        newest_error_report; before_report=$REPLY
+        if [[ ${S[launch_mode]} == bench ]]; then newest_benchmark_report; before_benchmark=$REPLY; fi
+        if [[ ${S[launch_mode]} == bench && ${S[bench_kind]} == manual ]]; then
+            mkdir -p -- "$CONFIG_DIR"
+            raw_benchmark=$(mktemp "$CONFIG_DIR/.manual-benchmark.XXXXXX")
+            if "${COMMAND[@]}" | tee "$raw_benchmark"; then
+                exit_code=0
+                if pack_manual_benchmark "$raw_benchmark"; then result_path=$REPLY; fi
+            else
+                exit_code=$?
+            fi
+            rm -f -- "$raw_benchmark"
+        else
+            if "${COMMAND[@]}"; then exit_code=0; else exit_code=$?; fi
+            if [[ $exit_code == 0 && ${S[launch_mode]} == bench ]]; then
+                newest_benchmark_report
+                [[ -z $REPLY || $REPLY == "$before_benchmark" ]] || result_path=$REPLY
+            fi
+        fi
+        if [[ -n $result_path ]]; then offer_benchmark_upload "$result_path" || true; fi
+        newest_error_report; after_report=$REPLY
+        if ((exit_code != 0)) && [[ -n $after_report && $after_report != "$before_report" ]]; then complete_error_report "$after_report"; save_state; fi
+        return "$exit_code"
     else
         exec "${COMMAND[@]}"
     fi

@@ -15,6 +15,8 @@ cat > "$BINARY" <<'ENGINE'
 case ${1-} in
     --version) printf 'infr 0.10.0\n' ;;
     devices) printf '%s\n' '  Vulkan0: Software [cpu, 0 MiB]' '  Vulkan1: Test GPU [discrete, 24 GiB] <- default' '  Vulkan2: Other GPU [integrated, 4 GiB]' ;;
+    bench) printf 'BENCH_ESTIMATE_MENU_V1|1|2|3|4|2|3|4|5|10|11|12|13\n' ;;
+    report) printf 'MOE4ALL_SUBMISSION_PATH=%s\n' "$ROOT/diagnostics/reports/fixture.m4e" ;;
     *) printf 'STUB_LAUNCHED\n'; printf '<%s>\n' "$@"; printf 'KEY=%s\n' "${INFR_API_KEY-}" ;;
 esac
 ENGINE
@@ -54,8 +56,63 @@ S[custom_sets]='malformed'; reject build_command
 reset; S[cpu_miss_enabled]=true; S[cpu_miss_cores]=4; S[cpu_miss_max]=3
 build_command; has_arg kernels.vulkan.cpu_miss_threads=4; has_arg kernels.vulkan.cpu_miss_max=3; pass
 S[cpu_miss_max]=4; reject build_command
-reset; S[launch_mode]=bench; S[bench_kind]=mixed; S[depth_mode]=synthetic; S[depth_tokens]=30000; S[json_output]=true
+reset; S[launch_mode]=bench; S[bench_kind]=manual; S[manual_bench_kind]=mixed; S[depth_mode]=synthetic; S[depth_tokens]=30000; S[json_output]=true
 build_command; has_arg --pg; has_arg --synthetic-depth; has_arg --json; ! has_arg spec.mtp=false; pass
+reset; S[launch_mode]=bench; S[bench_kind]=standard; S[bench_parallel]=3
+build_command; has_arg --suite; has_arg standard; has_arg --parallel; has_arg 3; has_arg --result-dir; ! has_arg --synthetic-depth; pass
+reset; S[launch_mode]=bench; S[setup_mode]=aggressive; S[device]=Vulkan1
+start_benchmark_estimate_probe
+benchmark_estimate_detail quick 1; [[ $REPLY == 'Estimated about 1 min.' ]]; pass
+benchmark_estimate_detail standard 3; [[ $REPLY == 'Estimated about 4 min.' ]]; pass
+reset; S[error_upload]=false
+output=$(complete_error_report <<< $'first line\nsecond line\n.\n1\nn\n')
+[[ $output == *MOE4ALL_SUBMISSION_PATH=*fixture.m4e* && ${S[error_upload]} == false ]]; pass
+
+# The submission client is dependency-light: it uses the embedded JSON parser,
+# system curl, the engine verifier and a private receipt file.
+unset MOE4ALL_SUBMISSION_API_BASE MOE4ALL_SUBMISSION_SITE_ORIGIN
+submission_api_config; [[ $SUBMISSION_API_BASE == https://api.moe4all.com/v1 && $SUBMISSION_SITE_ORIGIN == https://moe4all.com ]]; pass
+MOE4ALL_SUBMISSION_API_BASE=http://127.0.0.1:18765/v1 submission_api_config
+[[ $SUBMISSION_SITE_ORIGIN == http://127.0.0.1:18765 ]]; pass
+if MOE4ALL_SUBMISSION_API_BASE=http://example.invalid/v1 submission_api_config > "$tmp/invalid-api" 2>&1; then exit 1; fi; pass
+mkdir -p "$tmp/submission-bin" "$ROOT/diagnostics/reports/v1/2026-10"
+report_id=20261019T010203.004Z-00112233445566778899aabbccddeeff
+report_path=$ROOT/diagnostics/reports/v1/2026-10/$report_id.m4e
+printf 'MOE4ALL-SUBMISSION/1\nkind: error\nid: %s\n' "$report_id" > "$report_path"
+fixture_hash=$(sha256sum "$report_path"); fixture_hash=${fixture_hash%% *}
+cat > "$tmp/submission-bin/curl" <<'CURL'
+#!/usr/bin/env bash
+output='' url='' method=GET
+while (($#)); do
+    case $1 in
+        --output) output=$2; shift 2 ;;
+        --request) method=$2; shift 2 ;;
+        --write-out|--header|--data-binary|--connect-timeout|--max-time) shift 2 ;;
+        --silent|--show-error) shift ;;
+        *) url=$1; shift ;;
+    esac
+done
+if [[ $url == */upload-sessions && $method == POST ]]; then
+    printf '{"api_version":1,"state":"awaiting_verification","session_id":"us_fixture","session_token":"st_fixture","verification_url":"http://127.0.0.1:18765/community/upload.html#session=fixture","max_upload_bytes":131072}' > "$output"
+    printf 201
+elif [[ $url == */upload-sessions/us_fixture && $method == GET ]]; then
+    printf '{"api_version":1,"state":"ready","kind":"error","report_id":"%s","file_sha256":"%s","size_bytes":%s}' "$FIXTURE_REPORT_ID" "$FIXTURE_HASH" "$FIXTURE_SIZE" > "$output"
+    printf 200
+else
+    printf '{"api_version":1,"receipt_id":"rc_fixture","receipt_token":"rt_fixture","kind":"error","report_id":"%s","file_sha256":"%s","payload_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","status":"forwarding","duplicate":false,"received_at":"2026-10-19T01:02:03Z","public_url":null}' "$FIXTURE_REPORT_ID" "$FIXTURE_HASH" > "$output"
+    printf 202
+fi
+CURL
+cat > "$tmp/submission-bin/xdg-open" <<'OPEN'
+#!/usr/bin/env bash
+exit 0
+OPEN
+chmod +x "$tmp/submission-bin/curl" "$tmp/submission-bin/xdg-open"
+old_path=$PATH; PATH=$tmp/submission-bin:$PATH
+export FIXTURE_REPORT_ID=$report_id FIXTURE_HASH=$fixture_hash FIXTURE_SIZE=$(wc -c < "$report_path") MOE4ALL_SUBMISSION_API_BASE=http://127.0.0.1:18765/v1
+website_submission_upload "$report_path" error > "$tmp/submission-output"
+PATH=$old_path; unset FIXTURE_REPORT_ID FIXTURE_HASH FIXTURE_SIZE MOE4ALL_SUBMISSION_API_BASE
+[[ -f $CONFIG_DIR/private/submission-receipts/rc_fixture.private-receipt.json && $(< "$tmp/submission-output") == *'status: forwarding'* ]]; pass
 
 # Round-trip adversarial values as data, never as shell commands.
 reset; S[model]=$'model "quote" \\ space\nline\t.g g u f'; S[mtp_model]='$(touch SENTINEL)'; S[think_mode]=think; S[reasoning_effort]=medium
@@ -277,7 +334,12 @@ before=$(sha256sum "$tmp/mid-old/infr" "$tmp/mid-old/install-manifest.json")
 [[ $(sha256sum "$tmp/mid-old/infr" "$tmp/mid-old/install-manifest.json") == "$before" ]]; pass
 
 if [[ $(uname -s) == Linux ]]; then
-    make_package "$tmp/fifo" 1.0.0; mkfifo "$tmp/fifo/unlisted-fifo"; reject validate_package "$tmp/fifo" 1.0.0
+    make_package "$tmp/fifo" 1.0.0
+    if mkfifo "$tmp/fifo/unlisted-fifo" 2>/dev/null; then
+        reject validate_package "$tmp/fifo" 1.0.0
+    else
+        rm -rf -- "$tmp/fifo"
+    fi
     mkdir -p "$tmp/archive-bad/$prefix"
     ln -s /outside "$tmp/archive-bad/$prefix/infr"
     tar -czf "$tmp/bad-link.tar.gz" -C "$tmp/archive-bad" "$prefix"
