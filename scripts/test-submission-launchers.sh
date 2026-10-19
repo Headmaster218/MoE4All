@@ -85,6 +85,36 @@ check grep -q error "$work/chosen-git-kind"
 offer_mode=cloudflare; offer_submission_upload "$current_file" error true
 check grep -q error "$work/chosen-web-kind"
 
+website_submission_upload() { return 1; }
+yes() { REPLY=false; }
+if offer_submission_upload "$current_file" error true; then exit 1; fi
+pending_file="$CONFIG_DIR/private/pending-submissions/${current_file##*/}"
+check test -f "$pending_file"
+website_submission_upload() { printf '%s' "$2" > "$work/retried-web-kind"; }
+yes() {
+    case $1 in
+        *Retry\ now*) REPLY=true ;;
+        *GitHub\ account*) REPLY=false ;;
+        *) REPLY=true ;;
+    esac
+}
+SUBMISSION_CONNECTIVITY_FILE=$CONFIG_DIR/private/submission-connectivity.status
+SUBMISSION_CONNECTIVITY_GENERATION=fixture
+printf 'generation=fixture\ngithub=true\ncloudflare=true\nproxy=not-configured\n' > "$SUBMISSION_CONNECTIVITY_FILE"
+PENDING_SUBMISSION_PROMPTED=false
+retry_pending_submissions
+check test ! -f "$pending_file"
+check grep -q error "$work/retried-web-kind"
+
+unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy
+curl() { [[ $* == *api.github.com/rate_limit* ]]; }
+start_submission_connectivity_probe
+wait "$SUBMISSION_CONNECTIVITY_PID"
+submission_connectivity_snapshot
+check test "$SUBMISSION_GITHUB_CONNECTIVITY" = true
+check test "$SUBMISSION_CLOUDFLARE_CONNECTIVITY" = false
+check test "$SUBMISSION_PROXY_CONNECTIVITY" = not-configured
+
 curl() {
     output='' headers=''
     while (($#)); do

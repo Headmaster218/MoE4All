@@ -36,6 +36,7 @@ $infrPath = if ($script:IsPackagedInstall) {
 $dataDir = Join-Path $repoRoot 'gui-data'
 $statePath = Join-Path $dataDir 'wizard-state.json'
 $guiStatePath = Join-Path $dataDir 'state.json'
+$pendingSubmissionDir = Join-Path $dataDir 'private\pending-submissions'
 $script:Saved = $null
 
 if (Test-Path -LiteralPath $statePath -PathType Leaf) {
@@ -1083,7 +1084,10 @@ function Test-SubmissionForUpload {
     $databaseRoot = [System.IO.Path]::GetFullPath((Join-Path $repoRoot 'benchmark-database'))
     $fullPath = [System.IO.Path]::GetFullPath($Path)
     $prefix = $databaseRoot.TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
-    if ($Kind -eq 'benchmark' -and -not $fullPath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+    $pendingDirectory = Get-PendingSubmissionDirectory
+    $pendingRoot = [System.IO.Path]::GetFullPath($pendingDirectory).TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+    $isPendingCopy = $fullPath.StartsWith($pendingRoot, [System.StringComparison]::OrdinalIgnoreCase)
+    if ($Kind -eq 'benchmark' -and -not $fullPath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase) -and -not $isPendingCopy) {
         throw '只允许上传 benchmark-database 中的结果。Only results under benchmark-database can be uploaded.'
     }
     $extension = if ($Kind -eq 'benchmark') { '.m4b' } else { '.m4e' }
@@ -1105,6 +1109,12 @@ function Test-SubmissionForUpload {
         throw '结果包含本机路径、主机名或序列号，已拒绝上传。The result contains a local path, hostname or serial number.'
     }
     return $value
+}
+
+function Get-PendingSubmissionDirectory {
+    if (-not [string]::IsNullOrWhiteSpace([string]$pendingSubmissionDir)) { return $pendingSubmissionDir }
+    if (-not [string]::IsNullOrWhiteSpace([string]$dataDir)) { return (Join-Path $dataDir 'private\pending-submissions') }
+    return ''
 }
 
 function Test-BenchmarkResultForUpload {
@@ -1402,6 +1412,145 @@ function Get-Moe4AllSubmissionApiConfig {
         ApiBase = [Uri]::new($api.AbsoluteUri.TrimEnd('/'))
         SiteOrigin = $site.GetLeftPart([UriPartial]::Authority).TrimEnd('/')
         IsLocalDevelopment = $loopback -and $api.Scheme -eq 'http'
+    }
+}
+
+function Get-SubmissionProxy {
+    param([Parameter(Mandatory = $true)][Uri]$ProbeUri)
+
+    foreach ($name in @('HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy')) {
+        $raw = [Environment]::GetEnvironmentVariable($name, 'Process')
+        $uri = $null
+        if (-not [string]::IsNullOrWhiteSpace($raw) -and [Uri]::TryCreate($raw.Trim(), [UriKind]::Absolute, [ref]$uri) -and $uri.Scheme -in @('http', 'https')) {
+            return [System.Net.WebProxy]::new($uri)
+        }
+    }
+    try {
+        $proxy = [System.Net.WebRequest]::DefaultWebProxy
+        if ($null -ne $proxy -and -not $proxy.IsBypassed($ProbeUri)) {
+            $mapped = $proxy.GetProxy($ProbeUri)
+            if ($null -ne $mapped -and $mapped.AbsoluteUri -ne $ProbeUri.AbsoluteUri) { return $proxy }
+        }
+    } catch { }
+    return $null
+}
+
+function New-SubmissionConnectivityTask {
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('github', 'cloudflare')][string]$Target,
+        [Parameter(Mandatory = $true)][Uri]$Uri,
+        [System.Net.IWebProxy]$Proxy = $null
+    )
+
+    Add-Type -AssemblyName System.Net.Http
+    $handler = [System.Net.Http.HttpClientHandler]::new()
+    $handler.AllowAutoRedirect = $false
+    if ($null -eq $Proxy) {
+        $handler.UseProxy = $false
+    } else {
+        $handler.UseProxy = $true
+        $handler.Proxy = $Proxy
+    }
+    $client = [System.Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds(5)
+    $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $Uri)
+    [void]$request.Headers.UserAgent.ParseAdd("MoE4All-Wizard/$productVersion")
+    return [pscustomobject]@{
+        Target = $Target
+        ViaProxy = $null -ne $Proxy
+        Handler = $handler
+        Client = $client
+        Request = $request
+        Task = $client.SendAsync($request)
+        Finished = $false
+        Reachable = $false
+    }
+}
+
+function Start-SubmissionConnectivityProbe {
+    $script:SubmissionConnectivityTasks = @()
+    try {
+        $githubUri = [Uri]::new('https://api.github.com/rate_limit')
+        $api = Get-Moe4AllSubmissionApiConfig
+        $cloudflareUri = [Uri]::new($api.ApiBase.AbsoluteUri.TrimEnd('/') + '/health')
+        $proxy = Get-SubmissionProxy -ProbeUri $githubUri
+        $script:SubmissionProxyConfigured = $null -ne $proxy
+        $script:SubmissionConnectivityTasks += New-SubmissionConnectivityTask -Target github -Uri $githubUri
+        $script:SubmissionConnectivityTasks += New-SubmissionConnectivityTask -Target cloudflare -Uri $cloudflareUri
+        if ($null -ne $proxy) {
+            $script:SubmissionConnectivityTasks += New-SubmissionConnectivityTask -Target github -Uri $githubUri -Proxy $proxy
+            $script:SubmissionConnectivityTasks += New-SubmissionConnectivityTask -Target cloudflare -Uri $cloudflareUri -Proxy $proxy
+        }
+    } catch {
+        $script:SubmissionConnectivityTasks = @()
+        $script:SubmissionProxyConfigured = $false
+    }
+}
+
+function Get-SubmissionConnectivitySnapshot {
+    $tasks = @($script:SubmissionConnectivityTasks)
+    foreach ($probe in $tasks) {
+        if ($probe.Finished -or -not $probe.Task.IsCompleted) { continue }
+        try {
+            $response = $probe.Task.GetAwaiter().GetResult()
+            try {
+                $status = [int]$response.StatusCode
+                $probe.Reachable = $status -ge 200 -and $status -lt 500
+            } finally {
+                $response.Dispose()
+            }
+        } catch {
+            $probe.Reachable = $false
+        } finally {
+            $probe.Finished = $true
+            $probe.Request.Dispose()
+            $probe.Client.Dispose()
+            $probe.Handler.Dispose()
+        }
+    }
+    $github = @($tasks | Where-Object Target -eq 'github')
+    $cloudflare = @($tasks | Where-Object Target -eq 'cloudflare')
+    $proxyTasks = @($tasks | Where-Object ViaProxy)
+    $githubReachable = @($github | Where-Object Reachable).Count -gt 0
+    $cloudflareReachable = @($cloudflare | Where-Object Reachable).Count -gt 0
+    return [pscustomobject]@{
+        Github = if ($githubReachable) { 'reachable' } elseif ($github.Count -gt 0 -and @($github | Where-Object { -not $_.Finished }).Count -eq 0) { 'unreachable' } else { 'pending' }
+        Cloudflare = if ($cloudflareReachable) { 'reachable' } elseif ($cloudflare.Count -gt 0 -and @($cloudflare | Where-Object { -not $_.Finished }).Count -eq 0) { 'unreachable' } else { 'pending' }
+        ProxyConfigured = [bool]$script:SubmissionProxyConfigured
+        Proxy = if (-not $script:SubmissionProxyConfigured) { 'not-configured' } elseif (@($proxyTasks | Where-Object Reachable).Count -gt 0) { 'reachable' } elseif ($proxyTasks.Count -gt 0 -and @($proxyTasks | Where-Object { -not $_.Finished }).Count -eq 0) { 'unreachable' } else { 'pending' }
+    }
+}
+
+function Save-PendingSubmission {
+    param([Parameter(Mandatory = $true)][string]$Path, [ValidateSet('benchmark', 'error')][string]$Kind)
+
+    [void](Test-SubmissionForUpload -Path $Path -Kind $Kind)
+    $directory = Get-PendingSubmissionDirectory
+    New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    $destination = Join-Path $directory ([System.IO.Path]::GetFileName($Path))
+    if ([System.IO.Path]::GetFullPath($Path) -ne [System.IO.Path]::GetFullPath($destination)) {
+        $temporary = "$destination.moe4all-new-$([Guid]::NewGuid().ToString('N'))"
+        Copy-Item -LiteralPath $Path -Destination $temporary -Force
+        Move-Item -LiteralPath $temporary -Destination $destination -Force
+    }
+    Write-Host "提交暂存，待下次启动重试 / Submission saved for a later retry: $destination" -ForegroundColor Yellow
+    return $destination
+}
+
+function Get-PendingSubmissions {
+    $directory = Get-PendingSubmissionDirectory
+    if ([string]::IsNullOrWhiteSpace($directory)) { return @() }
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) { return @() }
+    return @(Get-ChildItem -LiteralPath $directory -File -ErrorAction SilentlyContinue | Where-Object Extension -in @('.m4b', '.m4e') | Sort-Object LastWriteTimeUtc)
+}
+
+function Remove-PendingSubmission {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $root = [System.IO.Path]::GetFullPath((Get-PendingSubmissionDirectory)).TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    if ($fullPath.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Remove-Item -LiteralPath $fullPath -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -1760,6 +1909,7 @@ function Save-ErrorUploadPreference {
 function Complete-ErrorReport {
     param([AllowEmptyString()][string]$Source = '')
 
+    Start-SubmissionConnectivityProbe
     $description = Read-ProblemDescription
     if ($null -eq $description) {
         Write-Host '已取消；已有诊断文件不会删除。Cancelled; existing diagnostics were not deleted.' -ForegroundColor Yellow
@@ -1789,7 +1939,7 @@ function Complete-ErrorReport {
         $upload = Read-YesNo -Label '愿意公开提交这份错误报告吗？/ Submit this error report publicly?' -Default $script:ErrorUploadDefault
         $script:ErrorUploadDefault = $upload
         Save-ErrorUploadPreference
-        if ($upload) { Offer-SubmissionUpload -Path $path -Kind 'error' -ConsentAlreadyGranted }
+        if ($upload) { [void](Offer-SubmissionUpload -Path $path -Kind 'error' -ConsentAlreadyGranted) }
         return $path
     } finally {
         Remove-Item -LiteralPath $descriptionPath -Force -ErrorAction SilentlyContinue
@@ -1803,12 +1953,15 @@ function Offer-SubmissionUpload {
         [switch]$ConsentAlreadyGranted
     )
 
-    try { [void](Test-SubmissionForUpload -Path $Path -Kind $Kind) } catch { Write-Warning $_.Exception.Message; return }
-    if (-not $ConsentAlreadyGranted -and -not (Read-BenchmarkUploadConsent)) { return }
+    try { [void](Test-SubmissionForUpload -Path $Path -Kind $Kind) } catch { Write-Warning $_.Exception.Message; return $false }
+    if (-not $ConsentAlreadyGranted -and -not (Read-BenchmarkUploadConsent)) { return $true }
     $hasGithub = Read-YesNo -Label '你有 GitHub 账号吗？/ Do you have a GitHub account?' -Default $script:BenchmarkUploadHasGithubDefault
     $script:BenchmarkUploadHasGithubDefault = $hasGithub
     Save-BenchmarkUploadPreferences
-    if ($hasGithub) {
+    $connectivity = Get-SubmissionConnectivitySnapshot
+    $proxyText = if ($connectivity.ProxyConfigured) { "; proxy=$($connectivity.Proxy)" } else { '' }
+    Write-Host "提交连通性 / Submission connectivity: GitHub=$($connectivity.Github), Cloudflare=$($connectivity.Cloudflare)$proxyText" -ForegroundColor DarkGray
+    if ($hasGithub -and $connectivity.Github -ne 'unreachable') {
         $gh = Get-Command gh -ErrorAction SilentlyContinue
         $ghAuthenticated = $null -ne $gh -and (Test-GhAuthenticated -GhCommand $gh)
         if ($null -ne $gh -and -not $ghAuthenticated) {
@@ -1824,11 +1977,23 @@ function Offer-SubmissionUpload {
             }
         }
         if ($ghAuthenticated) {
-            if (Invoke-GhSubmissionUpload -Path $Path -Kind $Kind) { return }
+            if (Invoke-GhSubmissionUpload -Path $Path -Kind $Kind) { return $true }
         }
         Write-Host 'GitHub 直传不可用，改用浏览器确认的 Cloudflare 中转。Direct GitHub upload is unavailable; using the browser-confirmed Cloudflare relay.'
+    } elseif ($hasGithub) {
+        Write-Host 'GitHub 当前不可达，改用 Cloudflare 中转。GitHub is currently unreachable; using the Cloudflare relay.' -ForegroundColor Yellow
     }
-    [void](Invoke-WebsiteSubmissionUpload -Path $Path -Kind $Kind)
+    if ($connectivity.Cloudflare -ne 'unreachable') {
+        try {
+            if (Invoke-WebsiteSubmissionUpload -Path $Path -Kind $Kind) { return $true }
+        } catch {
+            Write-Warning "Cloudflare 中转失败：$($_.Exception.Message) / Cloudflare relay failed."
+        }
+    } else {
+        Write-Host 'Cloudflare 当前也不可达。Cloudflare is currently unreachable.' -ForegroundColor Yellow
+    }
+    try { [void](Save-PendingSubmission -Path $Path -Kind $Kind) } catch { Write-Warning "无法暂存待发报告：$($_.Exception.Message) / Could not save the pending report." }
+    return $false
 }
 
 function Offer-BenchmarkUpload {
@@ -1843,9 +2008,30 @@ function Invoke-BenchmarkUploadSafely {
     )
 
     try {
-        Offer-BenchmarkUpload -Path $Path -ConsentAlreadyGranted:$ConsentAlreadyGranted
+        [void](Offer-BenchmarkUpload -Path $Path -ConsentAlreadyGranted:$ConsentAlreadyGranted)
     } catch {
         Write-Warning "Benchmark 已完成，但上传辅助流程失败：$($_.Exception.Message) / Benchmark completed, but the upload helper failed."
+    }
+}
+
+function Offer-PendingSubmissions {
+    if ($script:PendingSubmissionPrompted) { return }
+    $pending = @(Get-PendingSubmissions)
+    if ($pending.Count -eq 0) { $script:PendingSubmissionPrompted = $true; return }
+    $connectivity = Get-SubmissionConnectivitySnapshot
+    if ($connectivity.Github -eq 'unreachable' -and $connectivity.Cloudflare -eq 'unreachable') {
+        Write-Host "发现 $($pending.Count) 份待发报告；当前提交渠道均不可达，将继续保留。" -ForegroundColor DarkGray
+        Write-Host "Found $($pending.Count) pending report(s); submission routes are offline, so they remain queued." -ForegroundColor DarkGray
+        return
+    }
+    if ($connectivity.Github -ne 'reachable' -and $connectivity.Cloudflare -ne 'reachable') { return }
+    $script:PendingSubmissionPrompted = $true
+    if (-not (Read-YesNo -Label "发现 $($pending.Count) 份待发报告，当前重试？/ Found $($pending.Count) pending report(s). Retry now?" -Default $true)) { return }
+    foreach ($item in $pending) {
+        $kind = if ($item.Extension -ieq '.m4e') { 'error' } else { 'benchmark' }
+        if (Offer-SubmissionUpload -Path $item.FullName -Kind $kind -ConsentAlreadyGranted) {
+            Remove-PendingSubmission -Path $item.FullName
+        }
     }
 }
 
@@ -2676,6 +2862,7 @@ if (-not (Test-Path -LiteralPath $infrPath -PathType Leaf)) {
 }
 
 $productVersion = Get-EngineVersion
+if (-not $DryRun) { Start-SubmissionConnectivityProbe }
 if ($PostUpdateProbePath) {
     Write-PostUpdateProbe -Path $PostUpdateProbePath -Version $productVersion
     if ($ExitAfterPostUpdateProbe) { exit 43 }
@@ -2790,6 +2977,8 @@ $script:BenchmarkUploadGhAuthDefault = [bool](Get-SavedValue 'benchmark_upload_g
 $script:BenchmarkUploadFallbackDefault = [string](Get-SavedValue 'benchmark_upload_fallback' 'folder')
 $script:ErrorUploadDefault = [bool](Get-SavedValue 'error_upload' $false)
 if ($script:BenchmarkUploadFallbackDefault -notin @('folder', 'clipboard', 'skip')) { $script:BenchmarkUploadFallbackDefault = 'folder' }
+$script:PendingSubmissionPrompted = $false
+if (-not $DryRun) { Offer-PendingSubmissions }
 $maxNew = [string](Get-SavedValue 'max_new' '65536')
 $configureSampling = [bool](Get-SavedValue 'configure_sampling' $false)
 $temperature = [string](Get-SavedValue 'temperature' '')
@@ -3281,6 +3470,7 @@ $state = [ordered]@{
     cpu_miss_enabled = $cpuMissEnabled; cpu_miss_max = $cpuMissMax; cpu_miss_cores = $cpuMissCores
     custom_sets = $customSets; last_command = $commandText
 }
+if (-not $DryRun -and -not $script:PendingSubmissionPrompted) { Offer-PendingSubmissions }
 Write-Host "`n最终命令 / Final command" -ForegroundColor Green
 Write-Host $commandText -ForegroundColor White
 if ($launchMode -eq 'server' -and $serverAuth) {
@@ -3373,7 +3563,10 @@ if ($launchMode -eq 'benchmark' -and $benchKind -ne 'manual') {
     if ($benchmarkResultPath.Count -gt 0) { $benchmarkResultPath = [string]$benchmarkResultPath[0] } else { $benchmarkResultPath = $null }
 }
 $benchmarkUploadRequested = $false
-if ($benchmarkResultPath) { $benchmarkUploadRequested = Read-BenchmarkUploadConsent }
+if ($benchmarkResultPath) {
+    Start-SubmissionConnectivityProbe
+    $benchmarkUploadRequested = Read-BenchmarkUploadConsent
+}
 if ($benchmarkResultPath) {
     try {
         $resultGpuName = ''

@@ -307,7 +307,7 @@ try {
     Assert ($source -match "Start-Process -FilePath 'https://github.com/login/device'") 'GitHub device login page is not opened explicitly'
     Assert ($source.Contains('$branch = "community/$Kind/$fileHash"')) 'Report branches must be deterministic and separated by kind'
     Assert ($source.Contains("Create the branch and report PR now?' -Default `$true")) 'Final automated PR confirmation should accept Enter'
-    Assert ($source.IndexOf('if ($benchmarkResultPath) { $benchmarkUploadRequested = Read-BenchmarkUploadConsent }') -lt $source.IndexOf('$benchmarkHardwareDetails = Get-WindowsBenchmarkHardwareDetails')) 'Upload consent must be requested before post-benchmark hardware enrichment'
+    Assert ($source.IndexOf('$benchmarkUploadRequested = Read-BenchmarkUploadConsent') -lt $source.IndexOf('$benchmarkHardwareDetails = Get-WindowsBenchmarkHardwareDetails')) 'Upload consent must be requested before post-benchmark hardware enrichment'
     $savedApiBase = [Environment]::GetEnvironmentVariable('MOE4ALL_SUBMISSION_API_BASE', 'Process')
     $savedSiteOrigin = [Environment]::GetEnvironmentVariable('MOE4ALL_SUBMISSION_SITE_ORIGIN', 'Process')
     try {
@@ -406,6 +406,43 @@ try {
     Assert $privacyRejected 'Benchmark upload must reject local paths'
     $script:Passed++
     Microsoft.PowerShell.Utility\Write-Host 'PASS benchmark upload privacy gate'
+    $resultValue.model.Remove('local_path')
+    [System.IO.File]::WriteAllText($fixtureSubmissionPath, ($resultValue | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
+    $pendingSubmissionDir = Join-Path $dataDir 'private\pending-submissions'
+    $queuedPath = Save-PendingSubmission -Path $fixtureSubmissionPath -Kind benchmark
+    Assert ((Test-Path -LiteralPath $queuedPath -PathType Leaf) -and (Get-FileHash $queuedPath).Hash -eq (Get-FileHash $fixtureSubmissionPath).Hash) 'Pending submission was not preserved byte-for-byte'
+    Remove-PendingSubmission -Path $queuedPath
+    Assert (-not (Test-Path -LiteralPath $queuedPath)) 'Successful pending submission cleanup failed'
+
+    $realConnectivitySnapshot = ${function:Get-SubmissionConnectivitySnapshot}
+    $realGhSubmissionUpload = ${function:Invoke-GhSubmissionUpload}
+    $realWebsiteSubmissionUpload = ${function:Invoke-WebsiteSubmissionUpload}
+    $realTestGhAuthenticated = ${function:Test-GhAuthenticated}
+    function gh { }
+    function Test-GhAuthenticated { return $true }
+    function Get-SubmissionConnectivitySnapshot { return [pscustomobject]@{ Github = 'reachable'; Cloudflare = 'reachable'; ProxyConfigured = $false; Proxy = 'not-configured' } }
+    function Invoke-GhSubmissionUpload { $script:GitRouteUsed = $true; return $true }
+    function Invoke-WebsiteSubmissionUpload { $script:CloudflareRouteUsed = $true; return $true }
+    $script:BenchmarkUploadHasGithubDefault = $true
+    $script:Answers = [System.Collections.Generic.Queue[string]]::new(); $script:Answers.Enqueue('y')
+    $script:GitRouteUsed = $false; $script:CloudflareRouteUsed = $false
+    Assert (Offer-SubmissionUpload -Path $fixtureSubmissionPath -Kind benchmark -ConsentAlreadyGranted) 'Reachable GitHub route failed'
+    Assert ($script:GitRouteUsed -and -not $script:CloudflareRouteUsed) 'GitHub was not preferred over Cloudflare'
+    $script:Answers.Enqueue('n'); $script:GitRouteUsed = $false; $script:CloudflareRouteUsed = $false
+    Assert (Offer-SubmissionUpload -Path $fixtureSubmissionPath -Kind benchmark -ConsentAlreadyGranted) 'Cloudflare-only route failed'
+    Assert (-not $script:GitRouteUsed -and $script:CloudflareRouteUsed) 'No-account flow did not go directly to Cloudflare'
+    function Get-SubmissionConnectivitySnapshot { return [pscustomobject]@{ Github = 'unreachable'; Cloudflare = 'unreachable'; ProxyConfigured = $true; Proxy = 'unreachable' } }
+    $script:Answers.Enqueue('n'); $script:GitRouteUsed = $false; $script:CloudflareRouteUsed = $false
+    Assert (-not (Offer-SubmissionUpload -Path $fixtureSubmissionPath -Kind benchmark -ConsentAlreadyGranted)) 'Offline submission should be queued rather than reported as sent'
+    Assert ((Test-Path -LiteralPath (Join-Path $pendingSubmissionDir (Split-Path -Leaf $fixtureSubmissionPath))) -and -not $script:GitRouteUsed -and -not $script:CloudflareRouteUsed) 'Offline fallback did not preserve the report without touching either route'
+    Remove-PendingSubmission -Path (Join-Path $pendingSubmissionDir (Split-Path -Leaf $fixtureSubmissionPath))
+    Set-Item Function:Get-SubmissionConnectivitySnapshot $realConnectivitySnapshot
+    Set-Item Function:Invoke-GhSubmissionUpload $realGhSubmissionUpload
+    Set-Item Function:Invoke-WebsiteSubmissionUpload $realWebsiteSubmissionUpload
+    Set-Item Function:Test-GhAuthenticated $realTestGhAuthenticated
+    Remove-Item Function:gh
+    $script:Passed++
+    Microsoft.PowerShell.Utility\Write-Host 'PASS asynchronous route priority and pending submission lifecycle'
     $nativeFailure = Invoke-NativeCommandResult -Executable (Join-Path $PSHOME 'powershell.exe') -Arguments @(
         '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
         '[Console]::Error.WriteLine(''not logged in''); exit 1'

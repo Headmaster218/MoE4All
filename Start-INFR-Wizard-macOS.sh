@@ -1100,6 +1100,124 @@ open_submission_receipt() {
     fi
 }
 
+submission_proxy_url() {
+    local name value settings host port enabled
+    for name in HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy; do
+        eval "value=\${$name-}"
+        if [[ -n $value ]]; then REPLY=$value; return 0; fi
+    done
+    if command -v scutil >/dev/null 2>&1; then
+        settings=$(scutil --proxy 2>/dev/null || true)
+        enabled=$(printf '%s\n' "$settings" | awk '/HTTPSEnable : 1/{print $3; exit}')
+        if [[ $enabled == 1 ]]; then
+            host=$(printf '%s\n' "$settings" | awk -F' : ' '/HTTPSProxy :/{print $2; exit}')
+            port=$(printf '%s\n' "$settings" | awk -F' : ' '/HTTPSPort :/{print $2; exit}')
+            if [[ -n $host && $port == <-> ]]; then REPLY="http://$host:$port"; return 0; fi
+        fi
+    fi
+    REPLY=''; return 1
+}
+
+start_submission_connectivity_probe() {
+    local api_base generation proxy=''
+    mkdir -p -- "$CONFIG_DIR/private"
+    SUBMISSION_CONNECTIVITY_FILE="$CONFIG_DIR/private/submission-connectivity.status"
+    generation="$$-$RANDOM-$(date +%s)"
+    SUBMISSION_CONNECTIVITY_GENERATION=$generation
+    rm -f -- "$SUBMISSION_CONNECTIVITY_FILE"
+    submission_proxy_url && proxy=$REPLY
+    api_base=${MOE4ALL_SUBMISSION_API_BASE:-https://api.moe4all.com/v1}
+    api_base=${api_base%/}
+    (
+        local temp="$CONFIG_DIR/private/.submission-connectivity.$generation" output
+        mkdir -p -- "$temp"
+        probe_one() {
+            local probe_mode=$1 probe_url=$2 probe_output=$3
+            if [[ $probe_mode == direct ]]; then
+                curl --silent --show-error --location --output /dev/null --connect-timeout 2 --max-time 5 --noproxy '*' --user-agent 'MoE4All-Wizard/connectivity' "$probe_url" >/dev/null 2>&1
+            else
+                curl --silent --show-error --location --output /dev/null --connect-timeout 2 --max-time 5 --noproxy '' --proxy "$proxy" --user-agent 'MoE4All-Wizard/connectivity' "$probe_url" >/dev/null 2>&1
+            fi && printf true > "$probe_output" || printf false > "$probe_output"
+        }
+        if command -v curl >/dev/null 2>&1; then
+            probe_one direct 'https://api.github.com/rate_limit' "$temp/github-direct" &
+            probe_one direct "$api_base/health" "$temp/cloudflare-direct" &
+            if [[ -n $proxy ]]; then
+                probe_one proxy 'https://api.github.com/rate_limit' "$temp/github-proxy" &
+                probe_one proxy "$api_base/health" "$temp/cloudflare-proxy" &
+            fi
+            wait
+        fi
+        local github=false cloudflare=false proxy_state=not-configured
+        [[ $(cat "$temp/github-direct" 2>/dev/null || true) == true ]] && github=true
+        [[ $(cat "$temp/cloudflare-direct" 2>/dev/null || true) == true ]] && cloudflare=true
+        if [[ -n $proxy ]]; then
+            proxy_state=unreachable
+            if [[ $(cat "$temp/github-proxy" 2>/dev/null || true) == true || $(cat "$temp/cloudflare-proxy" 2>/dev/null || true) == true ]]; then proxy_state=reachable; fi
+            [[ $(cat "$temp/github-proxy" 2>/dev/null || true) == true ]] && github=true
+            [[ $(cat "$temp/cloudflare-proxy" 2>/dev/null || true) == true ]] && cloudflare=true
+        fi
+        output="$SUBMISSION_CONNECTIVITY_FILE.new-$generation"
+        printf 'generation=%s\ngithub=%s\ncloudflare=%s\nproxy=%s\n' "$generation" "$github" "$cloudflare" "$proxy_state" > "$output"
+        mv -f -- "$output" "$SUBMISSION_CONNECTIVITY_FILE"
+        rm -rf -- "$temp"
+    ) >/dev/null 2>&1 &
+    SUBMISSION_CONNECTIVITY_PID=$!
+}
+
+submission_connectivity_snapshot() {
+    local key value github=pending cloudflare=pending proxy=pending generation=''
+    if [[ -f ${SUBMISSION_CONNECTIVITY_FILE-} ]]; then
+        while IFS='=' read -r key value; do
+            case $key in generation) generation=$value ;; github) github=$value ;; cloudflare) cloudflare=$value ;; proxy) proxy=$value ;; esac
+        done < "$SUBMISSION_CONNECTIVITY_FILE"
+        if [[ $generation != ${SUBMISSION_CONNECTIVITY_GENERATION-} ]]; then github=pending; cloudflare=pending; proxy=pending; fi
+    fi
+    SUBMISSION_GITHUB_CONNECTIVITY=$github
+    SUBMISSION_CLOUDFLARE_CONNECTIVITY=$cloudflare
+    SUBMISSION_PROXY_CONNECTIVITY=$proxy
+}
+
+pending_submission_dir() { REPLY="$CONFIG_DIR/private/pending-submissions"; }
+
+queue_pending_submission() {
+    local path=$1 kind=$2 directory destination temporary
+    "$BINARY" submission verify "$path" >/dev/null 2>&1 || return 1
+    pending_submission_dir; directory=$REPLY
+    mkdir -p -- "$directory"; chmod 700 "$CONFIG_DIR/private" "$directory" 2>/dev/null || true
+    destination="$directory/${path##*/}"
+    if [[ $path != "$destination" ]]; then
+        temporary="$destination.moe4all-new-$$-$RANDOM"
+        cp -- "$path" "$temporary" || return 1
+        chmod 600 "$temporary" 2>/dev/null || true
+        mv -f -- "$temporary" "$destination"
+    fi
+    printf '提交暂存，待下次启动重试 / Submission saved for a later retry: %s\n' "$destination" >&2
+}
+
+retry_pending_submissions() {
+    [[ ${PENDING_SUBMISSION_PROMPTED-false} != true ]] || return 0
+    pending_submission_dir; local directory=$REPLY path kind
+    local -a pending=()
+    [[ -d $directory ]] || { PENDING_SUBMISSION_PROMPTED=true; return 0; }
+    while IFS= read -r path; do pending+=("$path"); done < <(find "$directory" -type f \( -name '*.m4b' -o -name '*.m4e' \) -print 2>/dev/null | sort)
+    ((${#pending[@]})) || { PENDING_SUBMISSION_PROMPTED=true; return 0; }
+    submission_connectivity_snapshot
+    if [[ $SUBMISSION_GITHUB_CONNECTIVITY == false && $SUBMISSION_CLOUDFLARE_CONNECTIVITY == false ]]; then
+        printf '发现 %s 份待发报告；当前提交渠道均不可达，将继续保留。\nFound %s pending report(s); submission routes are offline, so they remain queued.\n' "${#pending[@]}" "${#pending[@]}"
+        return 0
+    fi
+    if [[ $SUBMISSION_GITHUB_CONNECTIVITY != true && $SUBMISSION_CLOUDFLARE_CONNECTIVITY != true ]]; then return 0; fi
+    PENDING_SUBMISSION_PROMPTED=true
+    yes "发现 ${#pending[@]} 份待发报告，当前重试？/ Found ${#pending[@]} pending report(s). Retry now?" true
+    [[ $REPLY == true ]] || return 0
+    for path in "${pending[@]}"; do
+        kind=benchmark; [[ $path != *.m4e ]] || kind=error
+        if offer_submission_upload "$path" "$kind" true; then rm -f -- "$path"; fi
+    done
+}
+
+
 website_submission_upload() {
     local -h path=$1 kind=$2 extension=.m4b size file_hash report_id response request
     local -h session_id session_token verification_url state='' receipt_id receipt_token payload_hash status received_at public_url response_hash response_size count original_hash summary_json
@@ -1241,7 +1359,9 @@ offer_submission_upload() {
     fi
     yes '你有 GitHub 账号吗？/ Do you have a GitHub account?' "${S[benchmark_upload_has_github]}"
     has_github=$REPLY; S[benchmark_upload_has_github]=$has_github; save_state
-    if [[ $has_github == true ]] && command -v gh >/dev/null 2>&1; then
+    submission_connectivity_snapshot
+    printf '提交连通性 / Submission connectivity: GitHub=%s, Cloudflare=%s, proxy=%s\n' "$SUBMISSION_GITHUB_CONNECTIVITY" "$SUBMISSION_CLOUDFLARE_CONNECTIVITY" "$SUBMISSION_PROXY_CONNECTIVITY"
+    if [[ $has_github == true && $SUBMISSION_GITHUB_CONNECTIVITY != false ]] && command -v gh >/dev/null 2>&1; then
         if gh auth status --hostname github.com >/dev/null 2>&1; then
             gh_authenticated=true
         else
@@ -1253,11 +1373,16 @@ offer_submission_upload() {
     if [[ $gh_authenticated == true ]]; then
         if gh_submission_upload "$path" "$kind"; then return 0; fi
         printf 'GitHub 直传失败，改用网站中转。/ Direct GitHub upload failed; using the website relay.\n' >&2
+    elif [[ $has_github == true && $SUBMISSION_GITHUB_CONNECTIVITY == false ]]; then
+        printf 'GitHub 当前不可达，改用网站中转。GitHub is currently unreachable; using the website relay.\n' >&2
     elif [[ $has_github == true ]]; then
         printf '没有可用的已登录 gh；不安装额外工具，改用网站中转。\n'
         printf 'No authenticated gh CLI is available; using the website relay without installing another tool.\n'
     fi
-    website_submission_upload "$path" "$kind"
+    if [[ $SUBMISSION_CLOUDFLARE_CONNECTIVITY != false ]] && website_submission_upload "$path" "$kind"; then return 0; fi
+    [[ $SUBMISSION_CLOUDFLARE_CONNECTIVITY != false ]] || printf 'Cloudflare 当前不可达。Cloudflare is currently unreachable.\n' >&2
+    queue_pending_submission "$path" "$kind" || printf '无法暂存待发报告。Could not save the pending report.\n' >&2
+    return 1
 }
 
 offer_benchmark_upload() { offer_submission_upload "$1" benchmark; }
@@ -1319,6 +1444,7 @@ read_problem_description() {
 
 complete_error_report() {
     local -h source=${1-} description_file output path; local -a report_args
+    start_submission_connectivity_probe
     read_problem_description || { printf '已取消；现有诊断文件未删除。Cancelled; existing diagnostics were not deleted.\n'; return 0; }
     mkdir -p -- "$CONFIG_DIR"
     description_file=$(mktemp "$CONFIG_DIR/.error-description.XXXXXX")
@@ -1794,9 +1920,12 @@ main() {
     done
     [[ -n $BINARY ]] || { fail 'infr not found beside the launcher or under target/release; build infr-cli first.'; return 1; }
     [[ ! -t 0 || $DRY_RUN == true ]] || INTERACTIVE=true
+    PENDING_SUBMISSION_PROMPTED=false
+    if [[ $INTERACTIVE == true && $DRY_RUN == false && $HEADLESS == false ]]; then start_submission_connectivity_probe; fi
     if [[ -n $UPDATE_MODE ]]; then check_updates "$UPDATE_MODE"; return; fi
     if [[ $INTERACTIVE == true && $SKIP_UPDATE == false && ! ${MOE4ALL_NO_UPDATE_CHECK-} =~ ^(1|true|yes|on)$ ]]; then check_updates --check-update; fi
     if [[ $INTERACTIVE == true && $HEADLESS == false ]]; then
+        retry_pending_submissions
         value=$("$BINARY" --version 2>/dev/null || true); value=${value##* }
         printf 'MoE4All v%s macOS arm64 启动向导（实验性）/ Launch Wizard (experimental)\n上次设置会作为默认值；直接回车即可复用，输入 - 可清空。\nPress Enter to reuse the previous/default value; enter - to clear it.\n' "$value"
         if [[ -n ${S[model]} && ${#OVERRIDES[@]} == 0 && ${#disables[@]} == 0 ]]; then
@@ -1824,6 +1953,7 @@ main() {
         absolute "${S[$key]}"; S[$key]=$REPLY
     done
     build_command
+    retry_pending_submissions
     printf '\n最终命令 / Final command\n  '; printf '%q ' "${COMMAND[@]}"; printf '\n'
     if [[ ${S[launch_mode]} == serve && -z $api_key ]] && ! loopback "${S[server_addr]}"; then
         printf '警告：当前网络监听地址未启用 API key 鉴权。Warning: network listen address without API-key authentication.\n' >&2
@@ -1859,7 +1989,7 @@ main() {
         else
             if "${COMMAND[@]}"; then exit_code=0; else exit_code=$?; fi
         fi
-        if [[ -n $result_path ]]; then offer_benchmark_upload "$result_path" || true; fi
+        if [[ -n $result_path ]]; then start_submission_connectivity_probe; offer_benchmark_upload "$result_path" || true; fi
         newest_error_report; after_report=$REPLY
         if ((exit_code != 0)) && [[ -n $after_report && $after_report != "$before_report" ]]; then complete_error_report "$after_report"; save_state; fi
         return "$exit_code"
