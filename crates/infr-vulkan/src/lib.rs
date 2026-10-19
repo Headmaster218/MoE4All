@@ -8219,6 +8219,23 @@ impl Backend for VulkanBackend {
         })
     }
 
+    fn execute_nowait<'a>(
+        &'a self,
+        plan: &dyn Plan,
+        bindings: &Bindings,
+    ) -> Result<Option<Box<dyn infr_core::backend::InFlight + 'a>>> {
+        // Queue the replay tape on the one compute queue without waiting. Every other plan
+        // (paged/static/partial-span) takes the synchronous fallback below, so callers can treat
+        // `None` as already done.
+        let inflight = self
+            .with_unified_exclusive(|| adapter::execute_nowait(self, plan, bindings))?;
+        if inflight.is_some() {
+            return Ok(inflight);
+        }
+        self.execute(plan, bindings)?;
+        Ok(None)
+    }
+
     /// See `Backend::max_decode_chain`. Persistent decode keeps the established platform cap
     /// because its command buffers are recorded once and cannot be rebuilt while static submits
     /// run through their finite startup calibration.

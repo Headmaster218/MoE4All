@@ -69,7 +69,7 @@ impl Drop for HeadAllocScope {
     }
 }
 
-use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, Plan};
+use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, InFlight, Plan};
 use infr_core::error::Result;
 use infr_core::graph::Graph;
 use infr_core::tensor::TensorId;
@@ -1123,20 +1123,18 @@ impl PipelineBackend {
         f(pp, guard.as_ref().expect("prepared just set"))
     }
 
-    /// Execute one segment on its own device with that device's sub-bindings.
-    fn run_segment(&self, pp: &PipelinePlan, seg: &Segment, bindings: &Bindings) -> Result<()> {
-        let time_it = std::env::var_os("INFR_PIPE_TIME").is_some();
-        let t_bind = std::time::Instant::now();
-        // Per-device bindings: resolve every bound tensor to this device's buffer/replica.
+    /// Resolve one segment's tensors to the replicas on its own device. The returned bindings
+    /// borrow the caller's buffers and therefore must outlive the segment submission.
+    fn bind_segment<'a>(
+        &self,
+        pp: &PipelinePlan,
+        seg: &Segment,
+        bindings: &'a Bindings<'a>,
+    ) -> Result<(Bindings<'a>, Vec<TensorId>)> {
         let d = seg.device;
-        // Device identity for the timeline: `Query::new` snapshots the thread-local context when
-        // the recorder opens, and the per-segment spans below inherit the same guard.
-        let _timeline_device = infr_core::timeline::device(d);
         let mut sub = Bindings::new();
         let (lo, hi) = seg.op_range;
         let mut needed: std::collections::HashSet<TensorId> = std::collections::HashSet::new();
-        // Caller-bound tensors THIS segment writes: a replicated one is written on this device
-        // only, so a later `download` must read this replica (see `PipelineBuffer::read_device`).
         let mut written_here: Vec<TensorId> = Vec::new();
         for op in &pp.graph.ops[lo..hi] {
             let (r, w) = op.io();
@@ -1148,12 +1146,6 @@ impl PipelineBackend {
             if let Some(buf) = bindings.get(*t) {
                 sub.bind(*t, as_pipe(buf)?.on(d)?);
             } else if let Some(rows) = bindings.get_rows(*t) {
-                // Independent-row state: forward every LANE's copy of this tensor for THIS device.
-                // Dropping these (the single-buffer arm above is all this loop used to do) leaves the
-                // sub-backend with no row bindings, and a batched decode dies mid-graph with
-                // "tensor N has no independent-row bindings" — while plain single-row decode, which
-                // binds no rows at all, never notices. `prepare` already rejected the case where the
-                // lanes disagree about the device, so each `on(d)` here is a straight unwrap.
                 let mut lanes: Vec<&dyn Buffer> = Vec::with_capacity(rows.len());
                 for buf in rows {
                     lanes.push(as_pipe(*buf)?.on(d)?);
@@ -1161,6 +1153,19 @@ impl PipelineBackend {
                 sub.bind_rows(*t, lanes);
             }
         }
+        Ok((sub, written_here))
+    }
+
+    /// Execute one segment on its own device with that device's sub-bindings.
+    fn run_segment(&self, pp: &PipelinePlan, seg: &Segment, bindings: &Bindings) -> Result<()> {
+        let time_it = std::env::var_os("INFR_PIPE_TIME").is_some();
+        let t_bind = std::time::Instant::now();
+        let d = seg.device;
+        // Device identity for the timeline: `Query::new` snapshots the thread-local context when
+        // the recorder opens, and the per-segment spans below inherit the same guard.
+        let _timeline_device = infr_core::timeline::device(d);
+        let (lo, hi) = seg.op_range;
+        let (sub, written_here) = self.bind_segment(pp, seg, bindings)?;
         let bind_ms = t_bind.elapsed().as_secs_f64() * 1e3;
         let t_exec = std::time::Instant::now();
         self.backends[d].execute(seg.plan.as_ref(), &sub)?;
@@ -1184,6 +1189,27 @@ impl PipelineBackend {
             );
         }
         Ok(())
+    }
+
+    fn run_segment_nowait<'a>(
+        &'a self,
+        pp: &PipelinePlan,
+        seg: &Segment,
+        bindings: &Bindings,
+    ) -> Result<PipelineSegmentFlight<'a>> {
+        let d = seg.device;
+        let _timeline_device = infr_core::timeline::device(d);
+        let (sub, written_here) = self.bind_segment(pp, seg, bindings)?;
+        let inflight = self.backends[d].execute_nowait(seg.plan.as_ref(), &sub)?;
+        // Submission is queued; the command buffer references session-owned buffers, so the
+        // per-device `sub` can drop now. Mark the replica before any caller can download it (the
+        // caller must wait the returned handle first).
+        for t in &written_here {
+            if let Some(buf) = bindings.get(*t) {
+                as_pipe(buf)?.mark_written(d);
+            }
+        }
+        Ok(PipelineSegmentFlight { inflight })
     }
 
     /// Run `device`'s segments of `prep`, in order. `Cuts::Move` first gathers their cut tensors
@@ -1216,6 +1242,49 @@ impl PipelineBackend {
             }
         }
         Ok(())
+    }
+}
+
+struct PipelineSegmentFlight<'a> {
+    inflight: Option<Box<dyn infr_core::backend::InFlight + 'a>>,
+}
+
+impl infr_core::backend::InFlight for PipelineSegmentFlight<'_> {
+    fn wait(self: Box<Self>) -> Result<()> {
+        let this = *self;
+        if let Some(inflight) = this.inflight {
+            inflight.wait()?;
+        }
+        Ok(())
+    }
+
+    fn is_complete(&self) -> Result<bool> {
+        self.inflight
+            .as_ref()
+            .map_or(Ok(true), |inflight| inflight.is_complete())
+    }
+}
+
+struct PipelineInFlight<'a> {
+    flights: Vec<PipelineSegmentFlight<'a>>,
+}
+
+impl infr_core::backend::InFlight for PipelineInFlight<'_> {
+    fn wait(self: Box<Self>) -> Result<()> {
+        let this = *self;
+        for flight in this.flights {
+            Box::new(flight).wait()?;
+        }
+        Ok(())
+    }
+
+    fn is_complete(&self) -> Result<bool> {
+        for flight in &self.flights {
+            if !flight.is_complete()? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -1571,6 +1640,56 @@ impl Backend for PipelineBackend {
             );
         }
         Ok(())
+    }
+
+    fn execute_nowait<'a>(
+        &'a self,
+        plan: &dyn Plan,
+        bindings: &Bindings,
+    ) -> Result<Option<Box<dyn infr_core::backend::InFlight + 'a>>> {
+        if self.backends.len() != 2 {
+            self.execute(plan, bindings)?;
+            return Ok(None);
+        }
+        let flights = self.with_prep(plan, bindings, |pp, prep| {
+            let mut current: Vec<PipelineSegmentFlight<'a>> = Vec::new();
+            let mut previous_device: Option<usize> = None;
+            for device in 0..2usize {
+                let segments: Vec<&Segment> = prep
+                    .segments
+                    .iter()
+                    .filter(|segment| segment.device == device)
+                    .collect();
+                if segments.is_empty() {
+                    continue;
+                }
+                // A later device's cut reads the producer's replica. Wait the producer's handles
+                // first; this is the only dependency point between the two halves.
+                if previous_device.is_some() {
+                    for flight in current.drain(..) {
+                        Box::new(flight).wait()?;
+                    }
+                }
+                for segment in segments {
+                    for (tensor, producer, handoff) in &segment.cut {
+                        self.transfer(*tensor, *producer, segment.device, handoff, bindings)?;
+                    }
+                    current.push(self.run_segment_nowait(pp, segment, bindings)?);
+                }
+                previous_device = Some(device);
+            }
+            Ok(current)
+        })?;
+        if flights.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(Box::new(PipelineInFlight { flights })))
+        }
+    }
+
+    fn prepare_plan(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
+        // Compile the per-device subgraphs (and build cut handoffs) without submitting work.
+        self.with_prep(plan, bindings, |_pp, _prep| Ok(()))
     }
 
     /// See [`Backend::execute_pipelined`]: two devices, one thread each, so the device-0 halves of

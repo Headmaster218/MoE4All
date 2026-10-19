@@ -1621,6 +1621,129 @@ struct ParallelPrefillRequest<'a> {
     on_progress: Option<&'a dyn Fn(usize, infr_core::GenerationProgress)>,
 }
 
+/// One decode step's host-side sampling state. `samplers` / `reasoning_guards` / `curs` /
+/// `generated` are exactly the rows being sampled; the caller passes a suffix for the aggregate
+/// cohort and a one-row slice per group in the two-lane pipeline path. `lane_indices` maps those
+/// local rows back to the cohort's lane numbers for token delivery; `None` means identity.
+struct ParallelStepState<'a> {
+    config: &'a Config,
+    engine: &'a EngineConfig,
+    logits_rows: usize,
+    batch_argmax: bool,
+    batch_gpu_sample: bool,
+    ids_out: &'a dyn Buffer,
+    logits_batch: &'a dyn Buffer,
+    samplers: &'a mut [crate::sampling::ParallelSampler],
+    reasoning_guards: &'a mut [crate::sampling::Qwen4ReasoningEosGuard],
+    curs: &'a mut [Vec<u32>],
+    generated: &'a mut [Vec<u32>],
+    max_new: &'a [usize],
+    lane_indices: Option<&'a [usize]>,
+    /// `(readback, output rows, row width, first output row in the readback)`. The aggregate path
+    /// downloads every batch row and only appends the sampling suffix; a group owns one row.
+    hidden: Option<(&'a dyn Buffer, &'a mut [Vec<f32>], usize, usize)>,
+}
+
+/// Download and resolve one step's sampled suffix, then commit it to the cursors. Shared by the
+/// aggregate cohort path and the two-lane pipeline path so both sample from exactly the rows whose
+/// prefill has completed.
+fn parallel_finish_step(
+    be: &dyn Backend,
+    state: ParallelStepState<'_>,
+    on_token: &mut dyn FnMut(usize, u32) -> bool,
+) -> AResult<bool> {
+    let ParallelStepState {
+        config: c,
+        engine: ec,
+        logits_rows,
+        batch_argmax,
+        batch_gpu_sample,
+        ids_out,
+        logits_batch,
+        samplers,
+        reasoning_guards,
+        curs,
+        generated,
+        max_new,
+        lane_indices,
+        hidden,
+    } = state;
+    if let Some((buffer, hidden, hidden_width, hidden_offset)) = hidden {
+        let mut rows = vec![0f32; (hidden_offset + hidden.len()) * hidden_width];
+        be.download(buffer, bytemuck::cast_slice_mut(&mut rows))
+            .map_err(|e| anyhow!("{e}"))?;
+        for (lane, lane_hidden) in hidden.iter_mut().enumerate() {
+            let start = (hidden_offset + lane) * hidden_width;
+            lane_hidden.extend_from_slice(&rows[start..start + hidden_width]);
+        }
+    }
+    let mut next = vec![0u32; logits_rows];
+    if batch_argmax || batch_gpu_sample {
+        be.download(ids_out, bytemuck::cast_slice_mut(&mut next))
+            .map_err(|e| anyhow!("{e}"))?;
+        let needs_reasoning_repair = next
+            .iter()
+            .zip(&*reasoning_guards)
+            .any(|(&token, guard)| guard.blocks(c, token, ec.sampling.ignore_eos));
+        if needs_reasoning_repair {
+            let mut logits = vec![0f32; logits_rows * c.vocab];
+            be.download(logits_batch, bytemuck::cast_slice_mut(&mut logits))
+                .map_err(|e| anyhow!("{e}"))?;
+            for (row, ((token, guard), lane_sampler)) in next
+                .iter_mut()
+                .zip(reasoning_guards.iter_mut())
+                .zip(samplers.iter_mut())
+                .enumerate()
+            {
+                if !guard.blocks(c, *token, ec.sampling.ignore_eos) {
+                    continue;
+                }
+                let blocked = *token;
+                let logits = &mut logits[row * c.vocab..(row + 1) * c.vocab];
+                guard.mask_eos(c, logits);
+                *token = lane_sampler.sample(logits);
+                tracing::warn!(
+                    lane = lane_indices.map_or(row, |lanes| lanes[row]),
+                    blocked_token = blocked,
+                    replacement_token = *token,
+                    "Qwen3.8 suppressed premature EOS inside an open reasoning block"
+                );
+            }
+        }
+    } else if logits_rows > 0 {
+        let mut logits = vec![0f32; logits_rows * c.vocab];
+        be.download(logits_batch, bytemuck::cast_slice_mut(&mut logits))
+            .map_err(|e| anyhow!("{e}"))?;
+        for (row, ((token, lane_sampler), guard)) in next
+            .iter_mut()
+            .zip(samplers.iter_mut())
+            .zip(reasoning_guards.iter_mut())
+            .enumerate()
+        {
+            let logits = &mut logits[row * c.vocab..(row + 1) * c.vocab];
+            if !ec.sampling.ignore_eos {
+                guard.mask_eos(c, logits);
+            }
+            *token = lane_sampler.sample(logits);
+        }
+    }
+    let mut stop_batch = false;
+    for (row, &token) in next.iter().enumerate() {
+        let lane = lane_indices.map_or(row, |lanes| lanes[row]);
+        generated[row].push(token);
+        reasoning_guards[row].observe(c, token);
+        let is_eos = !ec.sampling.ignore_eos && (c.eos_ids.contains(&token) || token == c.eos);
+        let _ = (max_new, row);
+        let keep_going = !is_eos && on_token(lane, token);
+        if keep_going {
+            curs[row].push(token);
+        } else {
+            stop_batch = true;
+        }
+    }
+    Ok(stop_batch)
+}
+
 fn bind_parallel_mtp_traces<'a>(
     bindings: &mut Bindings<'a>,
     handles: &DecodeHandles,
@@ -10635,6 +10758,686 @@ fn generate_dense_backend_inner(
         let profile_once_t0 = profile_cohort.then(std::time::Instant::now);
         let ple_heads = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram;
         let ple_row = ple_heads * c.ple_head_dim;
+
+        // ── two-lane interleaved groups ───────────────────────────────────────────────
+        // Two concurrent requests are the main serving case. `Bindings` has no offsets, so each
+        // lane gets its OWN zero-offset IO set and the four graphs are built with batch=1. The
+        // residual handoff inside a group is that group's caller-owned hidden/wide buffer pair.
+        //
+        // Schedule (the 1F1B primitive's argument IS the overlap):
+        //   A front -> A PLE -> A tail built
+        //   B front -> B PLE -> B tail built
+        //   execute_pipelined(deferred=A tail, stages=[B tail], hook: wait B's PLE ticket)
+        //       device0: B[1..split]   ∥   device1: A[split..n]
+        //   execute_pipelined(deferred=B tail, stages=[], ...)
+        //       device1: B[split..n]
+        //
+        // Lanes reach their decode frontier one step apart when their prompts differ in length.
+        // A lane's IO position is therefore derived from its own cursor (`len - 1`), and a lane
+        // whose cursor did not move REPLAYS its previous front plan instead of rewriting the same
+        // KV row and re-submitting the same PLE range.
+        if lanes == 2 {
+            if parallel.mrope_plans.iter().any(Option::is_some) {
+                return Err(anyhow!(
+                    "two-lane pipelined decode currently requires text-only lanes"
+                ));
+            }
+            if c.ple_layers.iter().enumerate().filter(|(_, &on)| on).count() != 1
+                || !c.ple_layers.get(1).copied().unwrap_or(false)
+            {
+                return Err(anyhow!(
+                    "two-lane pipelined decode expects the single PLE layer at index 1, got {:?}",
+                    c.ple_layers
+                ));
+            }
+            let capture_hidden = parallel.hidden.is_some();
+            let hidden_width = c.hc_mult * ne;
+            let allocate_io = || -> AResult<(
+                Vec<Box<dyn Buffer>>,
+                Vec<Box<dyn Buffer>>,
+                Vec<Box<dyn Buffer>>,
+                Vec<Box<dyn Buffer>>,
+                Vec<Box<dyn Buffer>>,
+                Vec<Box<dyn Buffer>>,
+                Vec<Box<dyn Buffer>>,
+                Vec<Box<dyn Buffer>>,
+            )> {
+                // One buffer per lane in every group, all offset zero.
+                let mut ids = Vec::with_capacity(lanes);
+                let mut positions = Vec::with_capacity(lanes);
+                let mut hidden = Vec::with_capacity(lanes);
+                let mut wide = Vec::with_capacity(lanes);
+                let mut ple = Vec::with_capacity(lanes);
+                let mut logits = Vec::with_capacity(lanes);
+                let mut ids_out = Vec::with_capacity(lanes);
+                let mut sample_u = Vec::with_capacity(lanes);
+                for _ in 0..lanes {
+                    ids.push(
+                        be.alloc(4, BufferUsage::Staging)
+                            .map_err(|e| anyhow!("{e}"))?,
+                    );
+                    positions.push(
+                        be.alloc(4, BufferUsage::Staging)
+                            .map_err(|e| anyhow!("{e}"))?,
+                    );
+                    hidden.push(
+                        be.alloc_uninit(ne * 4, BufferUsage::Activations)
+                            .map_err(|e| anyhow!("{e}"))?,
+                    );
+                    wide.push(
+                        be.alloc_uninit(c.hc_mult * ne * 4, BufferUsage::Activations)
+                            .map_err(|e| anyhow!("{e}"))?,
+                    );
+                    ple.push(
+                        be.alloc(ple_row * 4, BufferUsage::Staging)
+                            .map_err(|e| anyhow!("{e}"))?,
+                    );
+                    logits.push(
+                        be.alloc_uninit(c.vocab * 4, BufferUsage::Activations)
+                            .map_err(|e| anyhow!("{e}"))?,
+                    );
+                    ids_out.push(
+                        be.alloc(4, BufferUsage::Readback)
+                            .map_err(|e| anyhow!("{e}"))?,
+                    );
+                    sample_u.push(
+                        be.alloc(4, BufferUsage::Staging)
+                            .map_err(|e| anyhow!("{e}"))?,
+                    );
+                }
+                Ok((
+                    ids, positions, hidden, wide, ple, logits, ids_out, sample_u,
+                ))
+            };
+            let (
+                ids_group,
+                pos_group,
+                hidden_group,
+                wide_group,
+                ple_group,
+                logits_group,
+                ids_out_group,
+                sample_u_group,
+            ) = allocate_io()?;
+            let hidden_out = if capture_hidden {
+                let mut buffers = Vec::with_capacity(lanes);
+                for _ in 0..lanes {
+                    buffers.push(
+                        be.alloc(hidden_width * 4, BufferUsage::Readback)
+                            .map_err(|e| anyhow!("{e}"))?,
+                    );
+                }
+                Some(buffers)
+            } else {
+                None
+            };
+            let worker = ple_worker
+                .as_ref()
+                .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?;
+            let mut curs = parallel.prompts.to_vec();
+            let mut generated = vec![Vec::<u32>::with_capacity(max_new); lanes];
+            let mut last_written = vec![None; lanes];
+            let mut prompt_secs = vec![0.0f64; lanes];
+            let mut decode_secs = vec![0.0f64; lanes];
+            // Plan bindings borrow peer KV state for the whole loop; keep the slice local so the
+            // mutable depth/snapshot paths do not alias it.
+            let mut peers = std::mem::take(&mut parallel.peers);
+            peers[0].ensure_segmented_depth(be, c, lane_starts[1] + max_new)?;
+            // The graph binds the peer's cache buffers, not its checkpoint slots; taking the
+            // checkpoints out of the borrowed session keeps the in-step snapshots legal.
+            let mut peer_ckpts = std::mem::take(&mut peers[0].turn_recurrent_ckpts);
+
+            fn wait_upload_ple(
+                be: &dyn Backend,
+                buffer: &dyn Buffer,
+                ticket: crate::seam::ple::PleTicket,
+                ple_row: usize,
+            ) -> AResult<()> {
+                let rows = ticket.wait()?;
+                if rows.len() != ple_row {
+                    return Err(anyhow!(
+                        "two-lane PLE produced {} values, expected {ple_row}",
+                        rows.len()
+                    ));
+                }
+                be.upload(buffer, bytemuck::cast_slice(rows.as_slice()))
+                    .map_err(|e| anyhow!("{e}"))?;
+                Ok(())
+            }
+
+            {
+                let mut hidden_rows = parallel.hidden.take();
+                // Input positions are per lane and advance one per cohort step, exactly like the
+                // aggregate path's `lane_start + step`; lanes differ only by their start.
+                let mut next_pos = [lane_starts[0], lane_starts[1]];
+                // `max_new` is the cohort's prefill+decode step budget. Subtract the deepest
+                // lane's remaining prefill to recover the shared decode budget each lane may spend.
+                let deepest_prefill = lane_starts
+                    .iter()
+                    .zip(parallel.prompt_ends)
+                    .map(|(&start, &end)| end.saturating_sub(1).saturating_sub(start))
+                    .max()
+                    .unwrap_or(0);
+                let decode_budget = max_new.saturating_sub(deepest_prefill);
+                // Cohort-lane indices, consumed by the `finish_lane!` expansion below. Declared
+                // here because a `macro_rules!` body resolves free LOCAL names at the macro's
+                // definition site, so every local the macros below mention must already exist.
+                let lane_ids = [0usize, 1usize];
+
+                // ── lane-step builder ───────────────────────────────────────────────────────
+                // ONE lane's whole two-plan forward for `position`, built and bound but NOT
+                // executed: the layer-0 `front` (which seeds the four-stream residual) and the
+                // layers-1..end `tail` (which consumes that lane's PLE rows at layer 1). Uploads
+                // the lane's token id + position and submits its PLE gather, returning the plan
+                // pair, the step's sampling flags and the pending ticket.
+                //
+                // A macro rather than a closure: it has to expand at three points of the pipeline
+                // (the prologue's lane A, every step's lane B, every step's one-step-ahead lane A)
+                // while `parallel`, `curs` and the binding arrays are borrowed mutably by the
+                // surrounding loop, which a capturing closure would forbid.
+                macro_rules! build_lane_step {
+                    ($group:expr, $position:expr, $ready:expr) => {{
+                        let group = $group;
+                        let position = $position;
+                        let ready = $ready;
+                        let id = curs[group][position] as i32;
+                        be.upload(ids_group[group].as_ref(), bytemuck::cast_slice(&[id]))
+                            .map_err(|e| anyhow!("{e}"))?;
+                        be.upload(
+                            pos_group[group].as_ref(),
+                            bytemuck::cast_slice(&[position as i32]),
+                        )
+                        .map_err(|e| anyhow!("{e}"))?;
+                        let ticket = worker.submit_batch(
+                            std::iter::once((curs[group].as_slice(), position)),
+                            c.ple_ngram_size,
+                        )?;
+                        let spans = [SequenceSpan {
+                            row_start: 0,
+                            rows: 1,
+                            start_pos: position as u32,
+                        }];
+                        let (g0, h0) = build(
+                            1,
+                            position,
+                            0,
+                            false,
+                            None,
+                            false,
+                            false,
+                            false,
+                            false,
+                            true,
+                            false,
+                            true,
+                            Some(&spans),
+                            Some(0..1),
+                        );
+                        let front = be.compile(&g0).map_err(|e| anyhow!("{e}"))?;
+                        let mut front_bindings = Bindings::new();
+                        front_bindings.bind(
+                            h0.tok_ids.expect("GPU embedding needs ids"),
+                            ids_group[group].as_ref(),
+                        );
+                        front_bindings.bind(h0.hidden, hidden_group[group].as_ref());
+                        front_bindings.bind(h0.positions, pos_group[group].as_ref());
+                        bind_parallel_layer_io(
+                            &mut front_bindings,
+                            &h0,
+                            c.n_layer,
+                            rf_buf,
+                            yff_buf,
+                            &kbufs[..],
+                            &vbufs[..],
+                            &qsa_kbufs[..],
+                            &qsa_cbufs[..],
+                            &mrope_history_buf,
+                            None,
+                            &wbufs[..],
+                            qwen_wide_buf,
+                            ple_embd_buf,
+                            ple_state_buf,
+                            wide_group[group].as_ref(),
+                            None,
+                            &*peers,
+                            Some(std::slice::from_ref(&group)),
+                            true,
+                        );
+                        let mut argmax = false;
+                        let mut gpu_sample = false;
+                        if ready {
+                            argmax = caps.argmax_rows
+                                && ec.spec.gpu_argmax
+                                && parallel.samplers[group].can_gpu_argmax();
+                            gpu_sample = caps.gpu_sample
+                                && ec.spec.gpu_sample
+                                && (2..=infr_vulkan::Recorder::SAMPLE_KMAX)
+                                    .contains(&sampler.top_k)
+                                && parallel.samplers[group].can_gpu_sample_with(sampler);
+                            argmax = argmax && !gpu_sample;
+                        }
+                        let (g1, h1) = build(
+                            1,
+                            position,
+                            usize::from(ready),
+                            false,
+                            None,
+                            false,
+                            capture_hidden,
+                            argmax,
+                            gpu_sample,
+                            false,
+                            false,
+                            true,
+                            Some(&spans),
+                            Some(1..c.n_layer),
+                        );
+                        let tail = be.compile(&g1).map_err(|e| anyhow!("{e}"))?;
+                        let mut tail_bindings = Bindings::new();
+                        tail_bindings.bind(h1.hidden, hidden_group[group].as_ref());
+                        tail_bindings.bind(h1.positions, pos_group[group].as_ref());
+                        bind_parallel_layer_io(
+                            &mut tail_bindings,
+                            &h1,
+                            c.n_layer,
+                            rf_buf,
+                            yff_buf,
+                            &kbufs[..],
+                            &vbufs[..],
+                            &qsa_kbufs[..],
+                            &qsa_cbufs[..],
+                            &mrope_history_buf,
+                            None,
+                            &wbufs[..],
+                            qwen_wide_buf,
+                            ple_embd_buf,
+                            ple_state_buf,
+                            wide_group[group].as_ref(),
+                            Some(ple_group[group].as_ref()),
+                            &*peers,
+                            Some(std::slice::from_ref(&group)),
+                            true,
+                        );
+                        if ready {
+                            tail_bindings.bind(
+                                h1.logits.expect("parallel token build has logits"),
+                                logits_group[group].as_ref(),
+                            );
+                            if argmax || gpu_sample {
+                                tail_bindings.bind(
+                                    h1.tok_id.expect("parallel token step has an id"),
+                                    ids_out_group[group].as_ref(),
+                                );
+                            }
+                            if gpu_sample {
+                                let uniform = parallel.samplers[group].next_uniform();
+                                be.upload(
+                                    sample_u_group[group].as_ref(),
+                                    bytemuck::cast_slice(&[uniform]),
+                                )
+                                .map_err(|e| anyhow!("{e}"))?;
+                                tail_bindings.bind(
+                                    h1.u_in
+                                        .expect("parallel stochastic token step has a uniform"),
+                                    sample_u_group[group].as_ref(),
+                                );
+                            }
+                        }
+                        if let (Some(id), Some(buffers)) = (h1.h_out, hidden_out.as_ref()) {
+                            tail_bindings.bind(id, buffers[group].as_ref());
+                        }
+                        (
+                            front,
+                            front_bindings,
+                            tail,
+                            tail_bindings,
+                            argmax,
+                            gpu_sample,
+                            ticket,
+                        )
+                    }};
+                }
+
+                // Resolve one COMPLETED lane step: read back its sampled id (or logits), sample,
+                // emit, and advance that lane's cursor.
+                macro_rules! finish_lane {
+                    ($group:expr, $ready:expr, $argmax:expr, $gpu_sample:expr, $stop:ident) => {{
+                        let group = $group;
+                        if $ready && generated[group].len() < decode_budget {
+                            $stop |= parallel_finish_step(
+                                be,
+                                ParallelStepState {
+                                    config: c,
+                                    engine: ec,
+                                    logits_rows: 1,
+                                    batch_argmax: $argmax,
+                                    batch_gpu_sample: $gpu_sample,
+                                    ids_out: ids_out_group[group].as_ref(),
+                                    logits_batch: logits_group[group].as_ref(),
+                                    samplers: &mut parallel.samplers[group..group + 1],
+                                    reasoning_guards: &mut parallel.reasoning_guards[group..group + 1],
+                                    curs: &mut curs[group..group + 1],
+                                    generated: &mut generated[group..group + 1],
+                                    max_new: &[decode_budget],
+                                    lane_indices: Some(std::slice::from_ref(&lane_ids[group])),
+                                    hidden: match (
+                                        hidden_out.as_ref().map(|buffers| buffers[group].as_ref()),
+                                        hidden_rows.as_mut(),
+                                    ) {
+                                        (Some(buffer), Some(hidden)) => Some((
+                                            buffer,
+                                            &mut hidden[group..group + 1],
+                                            hidden_width,
+                                            0,
+                                        )),
+                                        _ => None,
+                                    },
+                                },
+                                parallel.on_token,
+                            )?;
+                        }
+                    }};
+                }
+
+                // Book-keeping for one COMPLETED lane step: the highest KV row that lane actually
+                // wrote, plus its turn-checkpoint snapshot when the step lands on a boundary. The
+                // snapshot is taken at the point the step completes (and nowhere later) because the
+                // state is exactly at `position` only there: the one-step-ahead lane keeps running
+                // its NEXT device-0 half, which advances its PLE state and its lower-layer KV rows.
+                macro_rules! commit_lane {
+                    ($group:expr, $position:expr) => {{
+                        let group = $group;
+                        let position = $position;
+                        last_written[group] = Some(position);
+                        for (index, boundary) in
+                            parallel.checkpoint_boundaries[group].iter().enumerate()
+                        {
+                            if Some(position + 1) != *boundary {
+                                continue;
+                            }
+                            if group == 0 {
+                                if let Some(checkpoint) = turn_recurrent_ckpts[index].as_mut() {
+                                    checkpoint.snapshot_all(
+                                        be,
+                                        &kbufs[..],
+                                        &vbufs[..],
+                                        ple_state_buf.as_deref(),
+                                    )?;
+                                }
+                            } else if let Some(checkpoint) = peer_ckpts[index].as_mut() {
+                                checkpoint.snapshot_all(
+                                    be,
+                                    &peers[0].kbufs,
+                                    &peers[0].vbufs,
+                                    peers[0].ple_state_buf.as_deref(),
+                                )?;
+                            }
+                        }
+                    }};
+                }
+
+                // ── prologue: lane A's first device-0 half ──────────────────────────────────
+                // Lane A runs one step ahead of lane B, so iteration 0's deferred plan is A's
+                // step-0 tail with its device-0 half already submitted; its device-1 half runs
+                // inside the first α, overlapped with B's device-0 half.
+                let ready0 = [
+                    next_pos[0] + 1 >= parallel.prompt_ends[0],
+                    next_pos[1] + 1 >= parallel.prompt_ends[1],
+                ];
+                ensure_kv_depth!(next_pos[0] + 1);
+                let (
+                    a_front,
+                    a_front_bindings,
+                    a_tail,
+                    a_tail_bindings,
+                    a_argmax,
+                    a_gpu_sample,
+                    a_ticket,
+                ) = build_lane_step!(0, next_pos[0], ready0[0]);
+                let mut a_flags = (a_argmax, a_gpu_sample);
+                {
+                    let stages = [
+                        (a_front.as_ref(), &a_front_bindings),
+                        (a_tail.as_ref(), &a_tail_bindings),
+                    ];
+                    let mut ticket = Some(a_ticket);
+                    let mut hook = |stage: usize| -> infr_core::Result<()> {
+                        if stage != 0 {
+                            return Ok(());
+                        }
+                        let staged = (|| -> anyhow::Result<()> {
+                            wait_upload_ple(
+                                be,
+                                ple_group[0].as_ref(),
+                                ticket.take().expect("lane A PLE ticket"),
+                                ple_row,
+                            )
+                        })();
+                        staged.map_err(|error| infr_core::error::Error::Other(error.to_string()))
+                    };
+                    be.execute_pipelined(None, &stages, &mut hook)
+                        .map_err(|e| anyhow!("{e}"))?;
+                }
+                // Only the tail is carried forward: the front's device-0 half has run and nothing
+                // else reads its plan or its bindings.
+                drop(a_front);
+                drop(a_front_bindings);
+                let mut carry: Option<(Box<dyn Plan>, Bindings<'_>)> =
+                    Some((a_tail, a_tail_bindings));
+
+                // ── steady state: two `execute_pipelined` calls per cohort step ─────────────
+                //   α: device 1 = A's tail for step t (deferred — its device-0 half already ran)
+                //      ∥ device 0 = B's front + B's tail for step t
+                //   β: device 1 = B's tail for step t
+                //      ∥ device 0 = A's front + A's tail for step t+1
+                // Both device-1 halves now overlap the OTHER lane's device-0 half instead of
+                // running alone, so a cohort step costs max(dev1, dev0) per call rather than a
+                // serial walk with ~51 ms of device-0 idle in the tail. Each lane's PLE rows are
+                // uploaded in the `after_dev0` hook of the stage that precedes layer 1 — the same
+                // shape the chunked prefill pipeline already uses.
+                for step in 0..max_new {
+                    let step_t0 = std::time::Instant::now();
+                    let _gp = req.and_then(|request| request.gate_pass());
+                    let positions = [next_pos[0], next_pos[1]];
+                    // A lane samples once its input position reaches the last prompt token
+                    // (the aggregate path's rule); the sampled token is appended at the next
+                    // cursor index, so the cursor and `next_pos` stay in step.
+                    let ready = [
+                        positions[0] + 1 >= parallel.prompt_ends[0],
+                        positions[1] + 1 >= parallel.prompt_ends[1],
+                    ];
+                    let mut stop_batch = false;
+                    if positions[0] >= curs[0].len() || positions[1] >= curs[1].len() {
+                        // A lane has no token left to feed (its decode budget is spent). Finish the
+                        // one-step-ahead lane's in-flight step — its layer-1 PLE state is already
+                        // advanced, so abandoning it would leave that lane's recurrent state ahead
+                        // of its committed KV rows — then stop the cohort.
+                        if let Some((plan, bindings)) = carry.take() {
+                            let no_stages: [(&dyn Plan, &Bindings<'_>); 0] = [];
+                            be.execute_pipelined(
+                                Some((plan.as_ref(), &bindings)),
+                                &no_stages,
+                                &mut |_| Ok(()),
+                            )
+                            .map_err(|e| anyhow!("{e}"))?;
+                            finish_lane!(0, ready[0], a_flags.0, a_flags.1, stop_batch);
+                            commit_lane!(0, positions[0]);
+                        }
+                        break;
+                    }
+                    let _timeline_step = if ready == [true, true] {
+                        infr_core::timeline::begin_step(&positions)
+                    } else {
+                        None
+                    };
+                    // Lane B's tail reads/writes KV row `positions[1]`; lane A's one-step-ahead
+                    // build below asks for one row more than its position.
+                    ensure_kv_depth!(positions[1] + 1);
+
+                    // ── lane B's step t: build it, then overlap A's device-1 half with it ──────
+                    let (
+                        b_front,
+                        b_front_bindings,
+                        b_tail,
+                        b_tail_bindings,
+                        b_argmax,
+                        b_gpu_sample,
+                        b_ticket,
+                    ) = build_lane_step!(1, positions[1], ready[1]);
+                    {
+                        let deferred =
+                            carry.as_ref().map(|(plan, bindings)| (plan.as_ref(), bindings));
+                        let stages = [
+                            (b_front.as_ref(), &b_front_bindings),
+                            (b_tail.as_ref(), &b_tail_bindings),
+                        ];
+                        let mut ticket = Some(b_ticket);
+                        let mut hook = |stage: usize| -> infr_core::Result<()> {
+                            if stage != 0 {
+                                return Ok(());
+                            }
+                            let staged = (|| -> anyhow::Result<()> {
+                                wait_upload_ple(
+                                    be,
+                                    ple_group[1].as_ref(),
+                                    ticket.take().expect("lane B PLE ticket"),
+                                    ple_row,
+                                )
+                            })();
+                            staged
+                                .map_err(|error| infr_core::error::Error::Other(error.to_string()))
+                        };
+                        be.execute_pipelined(deferred, &stages, &mut hook)
+                            .map_err(|e| anyhow!("{e}"))?;
+                    }
+                    // A's step t is complete: resolve it now, because its sampled token is the
+                    // input of the one-step-ahead front that β is about to run.
+                    finish_lane!(0, ready[0], a_flags.0, a_flags.1, stop_batch);
+                    commit_lane!(0, positions[0]);
+
+                    // ── lane A's step t+1 (one step ahead): build it, then let its device-0
+                    // half fill device 0 while B's step-t device-1 half finishes ────────────────
+                    let a_next_pos = positions[0] + 1;
+                    let a_next_ready = a_next_pos + 1 >= parallel.prompt_ends[0];
+                    // A may only start a step the loop would actually run next: there has to be a
+                    // next iteration, the token it feeds must exist, and a frontier lane must not
+                    // be over its decode budget. (A lane still feeding prompt rows always has its
+                    // next row — those are part of the prompt.)
+                    let a_continues = !stop_batch
+                        && step + 1 < max_new
+                        && a_next_pos < curs[0].len()
+                        && (!a_next_ready || generated[0].len() < decode_budget);
+                    if a_continues {
+                        ensure_kv_depth!(a_next_pos + 1);
+                        let (
+                            a_front,
+                            a_front_bindings,
+                            a_tail,
+                            a_tail_bindings,
+                            a_argmax,
+                            a_gpu_sample,
+                            a_ticket,
+                        ) = build_lane_step!(0, a_next_pos, a_next_ready);
+                        let stages = [
+                            (a_front.as_ref(), &a_front_bindings),
+                            (a_tail.as_ref(), &a_tail_bindings),
+                        ];
+                        let mut ticket = Some(a_ticket);
+                        let mut hook = |stage: usize| -> infr_core::Result<()> {
+                            if stage != 0 {
+                                return Ok(());
+                            }
+                            let staged = (|| -> anyhow::Result<()> {
+                                wait_upload_ple(
+                                    be,
+                                    ple_group[0].as_ref(),
+                                    ticket.take().expect("lane A PLE ticket"),
+                                    ple_row,
+                                )
+                            })();
+                            staged
+                                .map_err(|error| infr_core::error::Error::Other(error.to_string()))
+                        };
+                        be.execute_pipelined(
+                            Some((b_tail.as_ref(), &b_tail_bindings)),
+                            &stages,
+                            &mut hook,
+                        )
+                        .map_err(|e| anyhow!("{e}"))?;
+                        a_flags = (a_argmax, a_gpu_sample);
+                        carry = Some((a_tail, a_tail_bindings));
+                    } else {
+                        // Nothing can hide B's device-1 half this step: run it alone. This is the
+                        // last iteration, or lane A has stopped / run out of budget.
+                        let no_stages: [(&dyn Plan, &Bindings<'_>); 0] = [];
+                        be.execute_pipelined(
+                            Some((b_tail.as_ref(), &b_tail_bindings)),
+                            &no_stages,
+                            &mut |_| Ok(()),
+                        )
+                        .map_err(|e| anyhow!("{e}"))?;
+                        carry = None;
+                    }
+                    // B's step t is complete.
+                    finish_lane!(1, ready[1], b_argmax, b_gpu_sample, stop_batch);
+                    commit_lane!(1, positions[1]);
+
+                    let step_secs = step_t0.elapsed().as_secs_f64();
+                    for lane in 0..lanes {
+                        if ready[lane] {
+                            decode_secs[lane] += step_secs;
+                        } else {
+                            prompt_secs[lane] += step_secs;
+                        }
+                    }
+                    let stop_now = stop_batch
+                        || parallel.yield_requested.is_some_and(|requested| {
+                            requested.load(std::sync::atomic::Ordering::Acquire)
+                        });
+                    if stop_now || !a_continues {
+                        // Lane A's one-step-ahead device-0 half is already on the queue. Finish
+                        // that step rather than abandoning it: its KV rows (and its PLE state,
+                        // which layer 1 already advanced) stay self-consistent and the token it
+                        // produces is emitted. Two lanes are independent requests, so a partner
+                        // that stops first must not truncate this one mid-flight.
+                        if let Some((plan, bindings)) = carry.take() {
+                            let no_stages: [(&dyn Plan, &Bindings<'_>); 0] = [];
+                            be.execute_pipelined(
+                                Some((plan.as_ref(), &bindings)),
+                                &no_stages,
+                                &mut |_| Ok(()),
+                            )
+                            .map_err(|e| anyhow!("{e}"))?;
+                            finish_lane!(0, a_next_ready, a_flags.0, a_flags.1, stop_batch);
+                            commit_lane!(0, a_next_pos);
+                        }
+                        break;
+                    }
+                    next_pos[0] += 1;
+                    next_pos[1] += 1;
+                }
+            }
+            peers[0].turn_recurrent_ckpts = peer_ckpts;
+            *cached = resident_after_gen(&curs[0], last_written[0]);
+            peers[0].cached = resident_after_gen(&curs[1], last_written[1]);
+            let total_generated = generated.iter().map(Vec::len).sum();
+            generated.remove(0);
+            parallel.peer_outputs.extend(generated);
+            parallel.prompt_secs.extend(prompt_secs);
+            parallel.decode_secs.extend(decode_secs);
+            parallel.peers = peers;
+            return Ok((
+                curs.remove(0),
+                GenStats {
+                    n_prompt: 0,
+                    n_cached: lane_starts[0],
+                    prompt_secs: 0.0,
+                    n_gen: total_generated,
+                    decode_secs: 0.0,
+                },
+            ));
+        }
+
         let peer_mrope_history_bufs = if has_multimodal_lane {
             let _gp = req.and_then(|request| request.gate_pass());
             let mut buffers = Vec::with_capacity(lanes.saturating_sub(1));
@@ -10692,8 +11495,6 @@ fn generate_dense_backend_inner(
         } else {
             None
         };
-        let mut hidden_step = vec![0.0f32; usize::from(capture_hidden) * lanes * hidden_width];
-
         let mut curs = parallel.prompts.to_vec();
         let mut generated = vec![Vec::<u32>::with_capacity(max_new); lanes];
         let mut last_written = vec![None; lanes];
@@ -10949,65 +11750,38 @@ fn generate_dense_backend_inner(
 
             let profile_tail_t0 = profile_cohort.then(std::time::Instant::now);
             let _timeline_tail = infr_core::timeline::span("step_tail");
-            if let (Some(buffer), Some(hidden)) =
-                (hidden_out.as_deref(), parallel.hidden.as_deref_mut())
-            {
-                be.download(buffer, bytemuck::cast_slice_mut(&mut hidden_step))
-                    .map_err(|e| anyhow!("{e}"))?;
-                for (lane, rows) in hidden.iter_mut().enumerate() {
-                    let start = lane * hidden_width;
-                    rows.extend_from_slice(&hidden_step[start..start + hidden_width]);
-                }
-            }
-            let mut next = vec![0u32; logits_rows];
-            if batch_argmax || batch_gpu_sample {
-                be.download(ids_out.as_ref(), bytemuck::cast_slice_mut(&mut next))
-                    .map_err(|e| anyhow!("{e}"))?;
-                let needs_reasoning_repair = next.iter().enumerate().any(|(row, &token)| {
-                    parallel.reasoning_guards[sample_from + row].blocks(
-                        c,
-                        token,
-                        ec.sampling.ignore_eos,
-                    )
-                });
-                if needs_reasoning_repair {
-                    let mut logits = vec![0f32; logits_rows * c.vocab];
-                    be.download(logits_batch.as_ref(), bytemuck::cast_slice_mut(&mut logits))
-                        .map_err(|e| anyhow!("{e}"))?;
-                    for row in 0..logits_rows {
-                        let lane = sample_from + row;
-                        if !parallel.reasoning_guards[lane].blocks(
-                            c,
-                            next[row],
-                            ec.sampling.ignore_eos,
-                        ) {
-                            continue;
+            let lane_budgets = [max_new; 8];
+            let aggregate_lanes = (sample_from..lanes).collect::<Vec<_>>();
+            let stop_batch = parallel_finish_step(
+                be,
+                ParallelStepState {
+                    config: c,
+                    engine: ec,
+                    logits_rows,
+                    batch_argmax,
+                    batch_gpu_sample,
+                    ids_out: ids_out.as_ref(),
+                    logits_batch: logits_batch.as_ref(),
+                    samplers: &mut parallel.samplers[sample_from..],
+                    reasoning_guards: &mut parallel.reasoning_guards[sample_from..],
+                    curs: &mut curs[sample_from..],
+                    generated: &mut generated[sample_from..],
+                    max_new: &lane_budgets[..logits_rows],
+                    lane_indices: Some(&aggregate_lanes),
+                    hidden: match (hidden_out.as_deref(), parallel.hidden.as_mut()) {
+                        (Some(buffer), Some(hidden)) => {
+                            Some((
+                                buffer,
+                                &mut hidden[sample_from..],
+                                hidden_width,
+                                sample_from,
+                            ))
                         }
-                        let blocked = next[row];
-                        let logits = &mut logits[row * c.vocab..(row + 1) * c.vocab];
-                        parallel.reasoning_guards[lane].mask_eos(c, logits);
-                        next[row] = parallel.samplers[lane].sample(logits);
-                        tracing::warn!(
-                            lane,
-                            blocked_token = blocked,
-                            replacement_token = next[row],
-                            "Qwen3.8 suppressed premature EOS inside an open reasoning block"
-                        );
-                    }
-                }
-            } else if logits_rows > 0 {
-                let mut logits = vec![0f32; logits_rows * c.vocab];
-                be.download(logits_batch.as_ref(), bytemuck::cast_slice_mut(&mut logits))
-                    .map_err(|e| anyhow!("{e}"))?;
-                for row in 0..logits_rows {
-                    let lane = sample_from + row;
-                    let logits = &mut logits[row * c.vocab..(row + 1) * c.vocab];
-                    if !ec.sampling.ignore_eos {
-                        parallel.reasoning_guards[lane].mask_eos(c, logits);
-                    }
-                    next[row] = parallel.samplers[lane].sample(logits);
-                }
-            }
+                        _ => None,
+                    },
+                },
+                parallel.on_token,
+            )?;
             for (written, &position) in last_written.iter_mut().zip(&positions) {
                 *written = Some(position);
             }
@@ -11043,20 +11817,6 @@ fn generate_dense_backend_inner(
             }
             for lane in sample_from..lanes {
                 decode_secs[lane] += step_secs;
-            }
-            let mut stop_batch = false;
-            for (row, &token) in next.iter().enumerate() {
-                let lane = sample_from + row;
-                generated[lane].push(token);
-                parallel.reasoning_guards[lane].observe(c, token);
-                let is_eos =
-                    !ec.sampling.ignore_eos && (c.eos_ids.contains(&token) || token == c.eos);
-                let keep_going = !is_eos && (parallel.on_token)(lane, token);
-                if keep_going {
-                    curs[lane].push(token);
-                } else {
-                    stop_batch = true;
-                }
             }
             let should_stop = stop_batch
                 || parallel
@@ -12587,6 +13347,20 @@ fn generate_dense_backend_inner(
         && ec.kernels.vulkan.gpu_pos;
     let end = prompt.len() + max_new;
     let mut pos = decode_start;
+    // Double-buffered static Qwen4 path. The resident PLE forward is two plans — plan0 (layer 0)
+    // and plan1 (layer 1..end) — and both bake their RoPE position, so they are built per token.
+    // While token `pos`'s plan1 runs its device-1 half, the host compiles + binds the WHOLE
+    // `pos+1` forward into this slot, so the next iteration's critical path is two submits. The
+    // slot is keyed to exactly `pos + 1` and is left empty on any step whose successor's shape is
+    // not known to match (multimodal, host ipl, grammar-constrained, or the one-time h-tap row);
+    // those steps rebuild inline.
+    struct PrebuiltStep<'a> {
+        plan0: Box<dyn Plan>,
+        b0: Bindings<'a>,
+        plan1: Box<dyn Plan>,
+        b1: Bindings<'a>,
+    }
+    let mut next_step: Option<PrebuiltStep<'_>> = None;
     // Highest absolute position whose KV row was actually WRITTEN by a kept token this call — the
     // single source of truth for the teardown's `cached` (see `resident_after_gen`). Seeded to the
     // last already-resident position: rows `0..decode_start` are live from the session-cache reuse
@@ -12825,6 +13599,10 @@ fn generate_dense_backend_inner(
         let (setup_el, exec_el);
         let mut layer0_el = std::time::Duration::ZERO;
         let mut ple_el = std::time::Duration::ZERO;
+        // The resident Qwen4 PLE path is a two-plan forward. Submit plan0 without waiting, let
+        // the host PLE gather finish against it, then wait only when plan1 needs the layer-0
+        // residual. plan1 itself is allowed to run while the host reaches the next readback point.
+        let mut step_flight: Option<Box<dyn infr_core::backend::InFlight + '_>> = None;
         if let Some((plan, b)) = &ro {
             // Record-once path: reuse the single compiled plan + bindings (no per-token rebuild).
             setup_el = t_setup.elapsed();
@@ -12840,52 +13618,67 @@ fn generate_dense_backend_inner(
                 .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?
                 .submit(&cur, pos, c.ple_ngram_size)?;
 
-            let (g0, h0) = build(
-                1,
-                pos,
-                0,
-                false,
-                None,
-                false,
-                false,
-                false,
-                false,
-                gpu_embed_tok,
-                false,
-                false,
-                None,
-                Some(0..1),
-            );
-            let plan0 = be.compile(&g0).map_err(|e| anyhow!("{e}"))?;
-            let mut b0 = Bindings::new();
-            if let Some(ids) = h0.tok_ids {
-                b0.bind(ids, dec_ids_buf.as_ref());
-            }
-            // A partial span exposes hidden as an Input even when EmbedGather writes it.
-            b0.bind(h0.hidden, hidden_buf.as_ref());
-            b0.bind(h0.positions, pos_buf.as_ref());
-            if let (Some(id), Some(buf)) = (h0.positions4, &pos4_buf) {
-                b0.bind(id, buf.as_ref());
-            }
-            bind_layer_io(
-                &mut b0,
-                &h0,
-                c.n_layer,
-                rf_buf,
-                yff_buf,
-                &kbufs[..],
-                &vbufs[..],
-                &qsa_kbufs[..],
-                &qsa_cbufs[..],
-                &mrope_history_buf,
-                &wbufs[..],
-                qwen_wide_buf,
-                ple_embd_buf,
-                ple_state_buf,
-            );
+            // Take the prebuilt pair only when THIS step's shape matches what the previous
+            // iteration's overlap window built: no h-tap row (that plan1 carries an extra output
+            // plus a Copy) and no grammar constraint (which can queue several forced tokens at
+            // once, moving `cur`'s frontier). Otherwise drop it and rebuild inline.
+            let prebuilt = if !want_h && constraint.is_none() {
+                next_step.take()
+            } else {
+                None
+            };
+            let (plan0, b0, prebuilt_tail) = if let Some(step) = prebuilt {
+                (step.plan0, step.b0, Some((step.plan1, step.b1)))
+            } else {
+                let (g0, h0) = build(
+                    1,
+                    pos,
+                    0,
+                    false,
+                    None,
+                    false,
+                    false,
+                    false,
+                    false,
+                    gpu_embed_tok,
+                    false,
+                    false,
+                    None,
+                    Some(0..1),
+                );
+                let plan0 = be.compile(&g0).map_err(|e| anyhow!("{e}"))?;
+                let mut b0 = Bindings::new();
+                if let Some(ids) = h0.tok_ids {
+                    b0.bind(ids, dec_ids_buf.as_ref());
+                }
+                // A partial span exposes hidden as an Input even when EmbedGather writes it.
+                b0.bind(h0.hidden, hidden_buf.as_ref());
+                b0.bind(h0.positions, pos_buf.as_ref());
+                if let (Some(id), Some(buf)) = (h0.positions4, &pos4_buf) {
+                    b0.bind(id, buf.as_ref());
+                }
+                bind_layer_io(
+                    &mut b0,
+                    &h0,
+                    c.n_layer,
+                    rf_buf,
+                    yff_buf,
+                    &kbufs[..],
+                    &vbufs[..],
+                    &qsa_kbufs[..],
+                    &qsa_cbufs[..],
+                    &mrope_history_buf,
+                    &wbufs[..],
+                    qwen_wide_buf,
+                    ple_embd_buf,
+                    ple_state_buf,
+                );
+                (plan0, b0, None)
+            };
             let mut setup_total = t_setup.elapsed();
             let t_exec0 = std::time::Instant::now();
-            be.execute(plan0.as_ref(), &b0)
+            let plan0_flight = be
+                .execute_nowait(plan0.as_ref(), &b0)
                 .map_err(|e| anyhow!("{e}"))?;
             let exec0 = t_exec0.elapsed();
             layer0_el = exec0;
@@ -12911,65 +13704,192 @@ fn generate_dense_backend_inner(
             if profile_single {
                 ple_el = t_setup1.elapsed();
             }
+            if let Some(flight) = plan0_flight {
+                flight.wait().map_err(|e| anyhow!("{e}"))?;
+            }
 
-            let (g1, h1) = build(
-                1,
-                pos,
-                1,
-                false,
-                None,
-                false,
-                want_h,
-                gpu_argmax,
-                gpu_sample,
-                false,
-                false,
-                false,
-                None,
-                Some(1..c.n_layer),
-            );
-            let plan1 = be.compile(&g1).map_err(|e| anyhow!("{e}"))?;
-            let mut b1 = Bindings::new();
-            b1.bind(h1.hidden, hidden_buf.as_ref());
-            b1.bind(h1.positions, pos_buf.as_ref());
-            if let (Some(id), Some(buf)) = (h1.positions4, &pos4_buf) {
-                b1.bind(id, buf.as_ref());
-            }
-            bind_layer_io(
-                &mut b1,
-                &h1,
-                c.n_layer,
-                rf_buf,
-                yff_buf,
-                &kbufs[..],
-                &vbufs[..],
-                &qsa_kbufs[..],
-                &qsa_cbufs[..],
-                &mrope_history_buf,
-                &wbufs[..],
-                qwen_wide_buf,
-                ple_embd_buf,
-                ple_state_buf,
-            );
-            b1.bind(
-                h1.logits.expect("qwen4exp tail build has logits"),
-                logits_buf.as_ref(),
-            );
-            if let Some(tid) = h1.tok_id {
-                b1.bind(tid, id_out);
-            }
-            if let Some(uin) = h1.u_in {
-                b1.bind(uin, u_buf.as_ref());
-            }
-            if let (Some(ho), Some(hb)) = (h1.h_out, &h_tap_buf) {
-                b1.bind(ho, hb.as_ref());
-            }
+            // The tail comes from the prebuilt pair when there is one; the gate above already
+            // proved this step needs no `h_out` binding, matching what the overlap window built.
+            let (plan1, b1) = if let Some((plan1, b1)) = prebuilt_tail {
+                (plan1, b1)
+            } else {
+                let (g1, h1) = build(
+                    1,
+                    pos,
+                    1,
+                    false,
+                    None,
+                    false,
+                    want_h,
+                    gpu_argmax,
+                    gpu_sample,
+                    false,
+                    false,
+                    false,
+                    None,
+                    Some(1..c.n_layer),
+                );
+                let plan1 = be.compile(&g1).map_err(|e| anyhow!("{e}"))?;
+                let mut b1 = Bindings::new();
+                b1.bind(h1.hidden, hidden_buf.as_ref());
+                b1.bind(h1.positions, pos_buf.as_ref());
+                if let (Some(id), Some(buf)) = (h1.positions4, &pos4_buf) {
+                    b1.bind(id, buf.as_ref());
+                }
+                bind_layer_io(
+                    &mut b1,
+                    &h1,
+                    c.n_layer,
+                    rf_buf,
+                    yff_buf,
+                    &kbufs[..],
+                    &vbufs[..],
+                    &qsa_kbufs[..],
+                    &qsa_cbufs[..],
+                    &mrope_history_buf,
+                    &wbufs[..],
+                    qwen_wide_buf,
+                    ple_embd_buf,
+                    ple_state_buf,
+                );
+                b1.bind(
+                    h1.logits.expect("qwen4exp tail build has logits"),
+                    logits_buf.as_ref(),
+                );
+                if let Some(tid) = h1.tok_id {
+                    b1.bind(tid, id_out);
+                }
+                if let Some(uin) = h1.u_in {
+                    b1.bind(uin, u_buf.as_ref());
+                }
+                if let (Some(ho), Some(hb)) = (h1.h_out, &h_tap_buf) {
+                    b1.bind(ho, hb.as_ref());
+                }
+                (plan1, b1)
+            };
             setup_total += t_setup1.elapsed();
             let t_exec1 = std::time::Instant::now();
-            be.execute(plan1.as_ref(), &b1)
+            step_flight = be
+                .execute_nowait(plan1.as_ref(), &b1)
                 .map_err(|e| anyhow!("{e}"))?;
             setup_el = setup_total;
             exec_el = exec0 + t_exec1.elapsed();
+
+            // ── double buffering ─────────────────────────────────────────────────────────────
+            // plan1's device-1 half is running on the far card right now, so the host is otherwise
+            // idle: compile + bind the NEXT token's plan0 AND plan1 here. Nothing is submitted —
+            // the next iteration uploads its id/position and submits the same pair. `at_frontier`
+            // plus a drained constraint means this step queues exactly one token, so the successor
+            // is a plain frontier decode step with `h_out` already consumed (its `want_h` is
+            // false), which is precisely the shape built below.
+            if mm.is_none()
+                && ipl_buf.is_none()
+                && gpu_embed
+                && !want_h
+                && constraint.is_none()
+                && is_decode
+                && at_frontier
+                && pos + 1 < end
+            {
+                let next_pos = pos + 1;
+                let (g0_next, h0_next) = build(
+                    1,
+                    next_pos,
+                    0,
+                    false,
+                    None,
+                    false,
+                    false,
+                    false,
+                    false,
+                    true,
+                    false,
+                    false,
+                    None,
+                    Some(0..1),
+                );
+                let plan0_next = be.compile(&g0_next).map_err(|e| anyhow!("{e}"))?;
+                let mut b0_next = Bindings::new();
+                if let Some(ids) = h0_next.tok_ids {
+                    b0_next.bind(ids, dec_ids_buf.as_ref());
+                }
+                // A partial span exposes hidden as an Input even when EmbedGather writes it.
+                b0_next.bind(h0_next.hidden, hidden_buf.as_ref());
+                b0_next.bind(h0_next.positions, pos_buf.as_ref());
+                bind_layer_io(
+                    &mut b0_next,
+                    &h0_next,
+                    c.n_layer,
+                    rf_buf,
+                    yff_buf,
+                    &kbufs[..],
+                    &vbufs[..],
+                    &qsa_kbufs[..],
+                    &qsa_cbufs[..],
+                    &mrope_history_buf,
+                    &wbufs[..],
+                    qwen_wide_buf,
+                    ple_embd_buf,
+                    ple_state_buf,
+                );
+                be.prepare_plan(plan0_next.as_ref(), &b0_next)
+                    .map_err(|e| anyhow!("{e}"))?;
+
+                let (g1_next, h1_next) = build(
+                    1,
+                    next_pos,
+                    1,
+                    false,
+                    None,
+                    false,
+                    false, // want_h: this step's frontier consumed the h-tap row
+                    gpu_argmax,
+                    gpu_sample,
+                    false,
+                    false,
+                    false,
+                    None,
+                    Some(1..c.n_layer),
+                );
+                let plan1_next = be.compile(&g1_next).map_err(|e| anyhow!("{e}"))?;
+                let mut b1_next = Bindings::new();
+                b1_next.bind(h1_next.hidden, hidden_buf.as_ref());
+                b1_next.bind(h1_next.positions, pos_buf.as_ref());
+                bind_layer_io(
+                    &mut b1_next,
+                    &h1_next,
+                    c.n_layer,
+                    rf_buf,
+                    yff_buf,
+                    &kbufs[..],
+                    &vbufs[..],
+                    &qsa_kbufs[..],
+                    &qsa_cbufs[..],
+                    &mrope_history_buf,
+                    &wbufs[..],
+                    qwen_wide_buf,
+                    ple_embd_buf,
+                    ple_state_buf,
+                );
+                b1_next.bind(
+                    h1_next.logits.expect("qwen4exp tail build has logits"),
+                    logits_buf.as_ref(),
+                );
+                if let Some(tid) = h1_next.tok_id {
+                    b1_next.bind(tid, id_out);
+                }
+                if let Some(uin) = h1_next.u_in {
+                    b1_next.bind(uin, u_buf.as_ref());
+                }
+                be.prepare_plan(plan1_next.as_ref(), &b1_next)
+                    .map_err(|e| anyhow!("{e}"))?;
+                next_step = Some(PrebuiltStep {
+                    plan0: plan0_next,
+                    b0: b0_next,
+                    plan1: plan1_next,
+                    b1: b1_next,
+                });
+            }
         } else {
             let (g, h) = build(
                 1, pos, 1, false, None, false, want_h, gpu_argmax, gpu_sample, gpu_embed,
@@ -13024,6 +13944,9 @@ fn generate_dense_backend_inner(
             let t_exec = std::time::Instant::now();
             be.execute(plan.as_ref(), &b).map_err(|e| anyhow!("{e}"))?;
             exec_el = t_exec.elapsed();
+        }
+        if let Some(flight) = step_flight.take() {
+            flight.wait().map_err(|e| anyhow!("{e}"))?;
         }
         if pos < prompt.len() {
             if let Some(sink) = mtp_prefill_sink.as_deref_mut() {

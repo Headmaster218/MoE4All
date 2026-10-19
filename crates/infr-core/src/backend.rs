@@ -487,6 +487,18 @@ enum BoundBuffer<'a> {
     Rows(Vec<&'a dyn Buffer>),
 }
 
+/// A submitted-but-unwaited piece of GPU work. `wait` is the only synchronization point; a caller
+/// may keep preparing host-side work (positions/PLE/ids for the next step) between the submit and
+/// the wait. Implementations must keep every resource the submission references alive until the
+/// wait completes and must remain on the ONE queue the backend already uses — this is an async
+/// SUBMIT primitive, not a second compute queue.
+pub trait InFlight {
+    fn wait(self: Box<Self>) -> Result<()>;
+    fn is_complete(&self) -> Result<bool> {
+        Ok(false)
+    }
+}
+
 #[derive(Default)]
 pub struct Bindings<'a> {
     /// `slots[id.0] = Some(buf)` for a bound handle, `None` for unbound. Grows on demand to the
@@ -758,6 +770,23 @@ pub trait Backend: Send + Sync {
     // ---- execution (compile once per shape, execute per token/step) ----
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>>;
     fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()>;
+    /// Async-submit twin of [`Self::execute`]: submit on the SAME queue and return a handle whose
+    /// [`InFlight::wait`] is the only synchronization point. The default falls back to the
+    /// synchronous execute and returns `None`, which every caller must treat as "already done".
+    fn execute_nowait<'a>(
+        &'a self,
+        plan: &dyn Plan,
+        bindings: &Bindings,
+    ) -> Result<Option<Box<dyn InFlight + 'a>>> {
+        self.execute(plan, bindings)?;
+        Ok(None)
+    }
+    /// Pre-build a plan's backend-specific split/bindings without executing it. Used by the
+    /// double-buffered static path to compile the next plan while the current plan runs. Backends
+    /// without a deferred preparation step keep the no-op default.
+    fn prepare_plan(&self, _plan: &dyn Plan, _bindings: &Bindings) -> Result<()> {
+        Ok(())
+    }
     /// Software-pipelined multi-plan execute (1F1B): the caller passes the plan it wants run NOW
     /// (`stages`, whose device-0 halves run here while their device-1 halves are deferred to the
     /// next call) plus the plan whose device-1 half the PREVIOUS call deferred (`deferred`). A

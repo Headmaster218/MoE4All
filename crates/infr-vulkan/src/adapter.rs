@@ -8095,6 +8095,54 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
     Ok(())
 }
 
+struct VulkanInFlight {
+    pending: crate::recorder::PendingReplay,
+}
+
+impl infr_core::backend::InFlight for VulkanInFlight {
+    fn wait(self: Box<Self>) -> Result<()> {
+        self.pending.wait()
+    }
+
+    fn is_complete(&self) -> Result<bool> {
+        self.pending.is_complete()
+    }
+}
+
+/// Async twin of [`execute`] for the record-once replay tape. `None` means the plan cannot use the
+/// replay path (ineligible, paged, dense-streamed, or not a Vulkan decode plan); the caller must
+/// fall back to the synchronous execute. `Some` returns immediately after the tape is queued on
+/// the SAME compute queue — waiting is the caller's job.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn execute_nowait<'a>(
+    be_: &'a VulkanBackend,
+    plan: &dyn Plan,
+    bindings: &Bindings,
+) -> Result<Option<Box<dyn infr_core::backend::InFlight + 'a>>> {
+    let Some(plan) = plan.as_any().downcast_ref::<VkDecodePlan>() else {
+        return Ok(None);
+    };
+    if plan.eligible && be_.unified_client.is_none() && !be_.moe_paged() && !be_.dense_paged() {
+        let mut guard = plan.replay.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(record_decode_replay(be_, &plan.graph, bindings)?);
+        }
+        let replay = guard.as_ref().unwrap();
+        if !replay.self_advancing {
+            let pos = read_pos0(be_, resolve(&replay.scratch, bindings, replay.positions)?)?;
+            let kv_len = pos + 1;
+            let mut pbytes = [0u8; 8];
+            pbytes[0..4].copy_from_slice(&pos.to_le_bytes());
+            pbytes[4..8].copy_from_slice(&kv_len.to_le_bytes());
+            be_.upload(replay.params.as_ref(), &pbytes)?;
+        }
+        let pending = replay.recorded.replay_nowait()?;
+        return Ok(Some(Box::new(VulkanInFlight { pending })));
+    }
+    // QSA/partial-span plans are static, but their resident path can still submit asynchronously.
+    execute_static_nowait(be_, &plan.graph, bindings)
+}
+
 /// Chained decode (`Backend::execute_chain`): replay the record-once recording `n` times in ONE
 /// submission — the sampled id flows device-side (the runner bound the sampler output and the
 /// embed-gather ids input to one buffer), params self-advance, and the trailing `id_log` writes
@@ -8986,6 +9034,76 @@ impl Drop for FrozenMoeLutGuard<'_> {
     }
 }
 
+/// A static forward submitted without waiting. It owns every transient buffer, pooled scratch
+/// entry and pager-stream segment the command buffers reference, plus the frozen-LUT guard that
+/// must stay alive until the GPU has consumed those bindings. `wait` is the only synchronization
+/// point; the runner may prepare the next plan's host side in between.
+struct StaticInFlight<'a> {
+    be: &'a VulkanBackend,
+    last: crate::recorder::PendingSegment,
+    segments: std::collections::VecDeque<crate::recorder::PendingSegment>,
+    pstream: PagedStream,
+    transient: Vec<Box<dyn Buffer>>,
+    local_scratch: Option<ScratchSet>,
+    local_pool: ScratchPool,
+    phase_arena: Option<std::sync::MutexGuard<'a, RuntimePhaseArena>>,
+    _frozen_lut: FrozenMoeLutGuard<'a>,
+    tune: crate::SubmitTuneRound,
+    submit_before: Option<u64>,
+    submitted_dispatches: usize,
+    splitter_splits: usize,
+    cap: usize,
+}
+
+impl infr_core::backend::InFlight for StaticInFlight<'_> {
+    fn wait(self: Box<Self>) -> Result<()> {
+        let mut this = *self;
+        this.last.wait().map_err(|e| be(e.to_string()))?;
+        while let Some(segment) = this.segments.pop_front() {
+            segment.wait().map_err(|e| be(e.to_string()))?;
+        }
+        this.pstream.drain()?;
+        this.pstream.wait_cpu_promotion(this.be)?;
+        if this.pstream.cpu_transfer_wait != 0 {
+            let acquire = this.be.recorder()?;
+            this.pstream.acquire_cpu_promotion(&acquire);
+            acquire.finish()?;
+        }
+        this.pstream.finish_prefill_uploads(this.be)?;
+        if let Some(mut arena) = this.phase_arena.take() {
+            arena.finish_execute();
+        }
+        this.tune.finish(this.splitter_splits);
+        if let Some(before) = this.submit_before {
+            let submits =
+                infr_core::pager_profile::queue_submit_count().saturating_sub(before);
+            infr_core::pager_profile::record_splitter_forward(
+                this.cap,
+                this.be.submit_dispatch_cap(),
+                this.submitted_dispatches,
+                submits,
+            );
+        }
+        complete_decode_prefetch_handoffs(this.be);
+        if this.be.cfg().kernels.vulkan.cpu_miss_token_park
+            && this.pstream.cpu_miss_controller.is_some()
+        {
+            if let Some(worker) = this.be.cpu_miss_worker() {
+                worker.finish_burst()?;
+            }
+        }
+        // Keep the owned scratch/transient fields alive until this point; they drop with `this`.
+        let _ = &this.transient;
+        let _ = &this.local_scratch;
+        let _ = &this.local_pool;
+        Ok(())
+    }
+
+    fn is_complete(&self) -> Result<bool> {
+        self.last.is_complete()
+    }
+}
+
 /// Per-execute static recording: prepare zeroed `Internal` scratch, record every op via `lower_op`
 /// (Static mode — pos as a push constant read from `positions[0]`), submit + wait. Paged plans
 /// retain scratch within one decode/prefill phase; auxiliary clients retain it until idle expiry.
@@ -8993,8 +9111,8 @@ impl Drop for FrozenMoeLutGuard<'_> {
 fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Result<()> {
     let _timeline_execute = infr_core::timeline::span("backend_execute");
     let profile_t0 = infr_core::pager_profile::start();
-    let result = match execute_static_inner(be_, graph, bindings) {
-        Ok(()) => Ok(()),
+    let result = match execute_static_inner(be_, graph, bindings, false) {
+        Ok(_) => Ok(()),
         Err(error) => match cancel_decode_prefetch(be_) {
             Ok(()) => Err(error),
             Err(cleanup) => Err(be(format!(
@@ -9008,7 +9126,40 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     result
 }
 
-fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Result<()> {
+/// Async-submit variant of [`execute_static`] for the resident (non-paged, non-dense-stream,
+/// non-auxiliary) path. The returned handle owns the local scratch, pooled/transient buffers,
+/// in-flight segments and the frozen-LUT guard until `wait`. Paged/auxiliary plans return `None`
+/// so the caller can use the established synchronous path without a lifetime hazard.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn execute_static_nowait<'a>(
+    be_: &'a VulkanBackend,
+    graph: &Graph,
+    bindings: &Bindings,
+) -> Result<Option<Box<dyn infr_core::backend::InFlight + 'a>>> {
+    let profile_t0 = infr_core::pager_profile::start();
+    let result = match execute_static_inner(be_, graph, bindings, true) {
+        Ok(handle) => Ok(handle),
+        Err(error) => match cancel_decode_prefetch(be_) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(be(format!(
+                "{error} (decode expert prefetch teardown also failed: {cleanup})"
+            ))),
+        },
+    };
+    if let Some(elapsed) = infr_core::pager_profile::elapsed(profile_t0) {
+        infr_core::pager_profile::record_backend_execute(elapsed);
+    }
+    Ok(result?.map(|handle| {
+        Box::new(handle) as Box<dyn infr_core::backend::InFlight + 'a>
+    }))
+}
+
+fn execute_static_inner<'a>(
+    be_: &'a VulkanBackend,
+    graph: &Graph,
+    bindings: &Bindings,
+    nowait: bool,
+) -> Result<Option<StaticInFlight<'a>>> {
     let timeline_setup = infr_core::timeline::span("backend_setup");
     // A previous errored execute may have left protection until its recorder/segments dropped.
     // We are now inside the same unified execution gate, so no old command can still reference it.
@@ -9466,6 +9617,27 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
     }
     let last = rec.take().expect("segment always Some at loop end");
     submitted_dispatches += last.dispatches();
+    if nowait {
+        let last = last.finish_nowait().map_err(|e| be(e.to_string()))?;
+        // Submission is now on the queue; start the host-side promotion while the GPU runs.
+        pstream.start_cpu_promotion(be_)?;
+        return Ok(Some(StaticInFlight {
+            be: be_,
+            last,
+            segments,
+            pstream,
+            transient,
+            local_scratch,
+            local_pool,
+            phase_arena,
+            _frozen_lut: _frozen_lut_guard,
+            tune: submit_tune_round,
+            submit_before,
+            submitted_dispatches,
+            splitter_splits,
+            cap,
+        }));
+    }
     last.finish_after_submit(|| pstream.start_cpu_promotion(be_))
         .map_err(|e| be(e.to_string()))?;
     // The blocking finish above already waited the queue idle — draining just releases the
@@ -9514,7 +9686,7 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
             worker.finish_burst()?;
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Get-or-alloc a pooled buffer with an explicit `usage` (unlike [`pooled`], which is always

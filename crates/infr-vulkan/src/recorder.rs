@@ -15060,6 +15060,48 @@ impl RecordedCmd {
         Ok(())
     }
 
+    /// Async-submit twin of [`Self::replay`]: queue every segment back-to-back on the SAME compute
+    /// queue, signal one fence on the final submit, and return without waiting. The caller keeps
+    /// the [`PendingReplay`] and waits only where it actually needs the tape's output (or before
+    /// reusing a buffer the tape writes). The recording's command buffers are
+    /// `SIMULTANEOUS_USE`, so a second replay may be queued while the first is still in flight;
+    /// the caller is responsible for not overwriting its bound buffers out of order.
+    pub fn replay_nowait(&self) -> Result<PendingReplay> {
+        let device = &self.shared.device;
+        let fence = match self.shared.recorder_fences.lock().unwrap().pop() {
+            Some(fence) => {
+                unsafe { device.reset_fences(&[fence]) }
+                    .map_err(|error| be(format!("reset replay fence: {error}")))?;
+                fence
+            }
+            None => unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
+                .map_err(|error| be(format!("create replay fence: {error}")))?,
+        };
+        let last = self.segments.len().saturating_sub(1);
+        for (index, seg) in self.segments.iter().enumerate() {
+            let submits =
+                [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&seg.cmd))];
+            let signal = if index == last {
+                fence
+            } else {
+                vk::Fence::null()
+            };
+            if let Err(error) = self.shared.queue_submit_recovering(
+                &submits,
+                signal,
+                Some(seg.dispatches),
+                "decode replay_nowait queue_submit",
+            ) {
+                self.shared.recorder_fences.lock().unwrap().push(fence);
+                return Err(be(format!("replay_nowait submit: {error}")));
+            }
+        }
+        Ok(PendingReplay {
+            shared: std::sync::Arc::clone(&self.shared),
+            fence: Some(fence),
+        })
+    }
+
     /// Resubmit the recording and wait for completion. Each segment is a SEPARATE `vkQueueSubmit`,
     /// so the GPU hang watchdog — armed per submit — sees a split decode as several short jobs
     /// running back-to-back on the queue rather than one long one. The segments still execute in
@@ -15102,6 +15144,42 @@ impl Drop for RecordedCmd {
                 .unwrap()
                 .extend(seg.pools.iter().copied());
         }
+    }
+}
+
+/// An in-flight [`RecordedCmd::replay_nowait`]. Dropping it drains the fence best-effort, so an
+/// error path can never leave a fence/command buffer permanently checked out.
+pub struct PendingReplay {
+    shared: std::sync::Arc<crate::VulkanShared>,
+    fence: Option<vk::Fence>,
+}
+
+impl PendingReplay {
+    pub fn wait(mut self) -> Result<()> {
+        self.drain()
+    }
+
+    pub fn is_complete(&self) -> Result<bool> {
+        let Some(fence) = self.fence else {
+            return Ok(true);
+        };
+        unsafe { self.shared.device.get_fence_status(fence) }
+            .map_err(|error| be(format!("probe replay fence: {error}")))
+    }
+
+    fn drain(&mut self) -> Result<()> {
+        let Some(fence) = self.fence.take() else {
+            return Ok(());
+        };
+        let waited = unsafe { self.shared.device.wait_for_fences(&[fence], true, u64::MAX) };
+        self.shared.recorder_fences.lock().unwrap().push(fence);
+        waited.map_err(|error| be(format!("wait replay_nowait fence: {error}")))
+    }
+}
+
+impl Drop for PendingReplay {
+    fn drop(&mut self) {
+        let _ = self.drain();
     }
 }
 

@@ -552,3 +552,127 @@ fn planar_q8_store_replay_tape_matches_static() {
     assert_eq!(p[0] as usize, rows - 1, "params[0] after {rows} replays");
     eprintln!("replayed Q8 store tape bit-matches static ({rows} rows)");
 }
+
+/// `replay_nowait` must queue the same tape and expose a correct fence handoff: two async
+/// submissions (with a fresh upload between them) must produce the same planar Q8 bytes as two
+/// static per-token stores. This is the API-level gate for the async-submit wall work; it does not
+/// introduce a second compute queue.
+#[test]
+fn planar_q8_store_replay_nowait_matches_static() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let rs: usize = 64;
+    let cap_rows: usize = 32;
+    let cap = cap_rows * rs;
+    let cbytes = (cap / 32 * 34).next_multiple_of(4);
+    let row_at = |t: usize| -> Vec<f32> {
+        (0..rs)
+            .map(|i| ((i as f32) - 24.0) * 0.04 + t as f32 * 0.13)
+            .collect()
+    };
+
+    let kf = be.alloc(rs * 2, BufferUsage::Activations).unwrap();
+    let vf = be.alloc(rs * 4, BufferUsage::Activations).unwrap();
+    let params = be.alloc(8, BufferUsage::Staging).unwrap();
+    be.upload(params.as_ref(), bytemuck::cast_slice(&[u32::MAX, 0u32]))
+        .unwrap();
+    let kq = be.alloc(cbytes, BufferUsage::KvCache).unwrap();
+    let vq = be.alloc(cbytes, BufferUsage::KvCache).unwrap();
+    let rec = be.recorder_persistent().unwrap();
+    rec.global_barrier();
+    rec.params_advance(params.as_ref());
+    rec.store_q8_dyn(kf.as_ref(), params.as_ref(), kq.as_ref(), rs, cap, true);
+    rec.store_q8_dyn(vf.as_ref(), params.as_ref(), vq.as_ref(), rs, cap, false);
+    let tape = rec.finish_record().unwrap();
+
+    for t in 0..2usize {
+        let row = row_at(t);
+        be.upload(kf.as_ref(), &to_f16_bytes(&row)).unwrap();
+        be.upload(vf.as_ref(), bytemuck::cast_slice(&row)).unwrap();
+        let pending = tape.replay_nowait().unwrap();
+        let _ = pending.is_complete().unwrap();
+        pending.wait().unwrap();
+    }
+
+    let kst = be.alloc(cbytes, BufferUsage::KvCache).unwrap();
+    let vst = be.alloc(cbytes, BufferUsage::KvCache).unwrap();
+    for t in 0..2usize {
+        let row = row_at(t);
+        be.upload(kf.as_ref(), &to_f16_bytes(&row)).unwrap();
+        be.upload(vf.as_ref(), bytemuck::cast_slice(&row)).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.store_q8(kf.as_ref(), kst.as_ref(), rs, t * rs, cap, true, 0);
+        rec.store_q8(vf.as_ref(), vst.as_ref(), rs, t * rs, cap, false, 0);
+        rec.finish().unwrap();
+    }
+
+    let mut bufs = vec![vec![0u8; cbytes]; 4];
+    for (buf, out) in [&kq, &vq, &kst, &vst].iter().zip(bufs.iter_mut()) {
+        be.download(buf.as_ref(), out).unwrap();
+    }
+    let (kd, vd, ks, vs) = (&bufs[0], &bufs[1], &bufs[2], &bufs[3]);
+    assert_eq!(&kd[..2 * rs], &ks[..2 * rs], "async K codes differ");
+    assert_eq!(&vd[..2 * rs], &vs[..2 * rs], "async V codes differ");
+    let scales_end = cap + 2 * rs / 32 * 2;
+    assert_eq!(
+        &kd[cap..scales_end],
+        &ks[cap..scales_end],
+        "async K scales differ"
+    );
+    assert_eq!(
+        &vd[cap..scales_end],
+        &vs[cap..scales_end],
+        "async V scales differ"
+    );
+    let mut p = [0u8; 8];
+    be.download(params.as_ref(), &mut p).unwrap();
+    let p: &[u32] = bytemuck::cast_slice(&p);
+    assert_eq!(p[0], 1, "params[0] after two async replays");
+}
+
+/// A plain static forward must submit through `execute_nowait`, keep its scratch alive, and
+/// produce the same bytes as the synchronous `execute`. This is the lifetime gate for the
+/// QSA/static async-submit path (no replay tape involved).
+#[test]
+fn static_execute_nowait_matches_sync() {
+    use infr_core::backend::Bindings;
+    use infr_core::graph::{Graph, Op};
+    use infr_core::tensor::TensorDesc;
+    use infr_core::DType;
+
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let values = [1.0f32, -2.0, 3.5, 4.25];
+    let mut graph = Graph::new();
+    let src = graph.input(TensorDesc::new(vec![4], DType::F32));
+    let dst = graph.output(TensorDesc::new(vec![4], DType::F32));
+    graph.push(Op::Copy {
+        src,
+        src_off: 0,
+        dst,
+        dst_off: 0,
+        n: 4,
+    });
+    let plan = be.compile(&graph).unwrap();
+    let src_buf = be.alloc(16, BufferUsage::Staging).unwrap();
+    let dst_buf = be.alloc(16, BufferUsage::Readback).unwrap();
+    be.upload(src_buf.as_ref(), bytemuck::cast_slice(&values))
+        .unwrap();
+    let mut bindings = Bindings::new();
+    bindings.bind(src, src_buf.as_ref());
+    bindings.bind(dst, dst_buf.as_ref());
+
+    let pending = be
+        .execute_nowait(plan.as_ref(), &bindings)
+        .unwrap()
+        .expect("resident static plan must return an InFlight handle");
+    pending.wait().unwrap();
+    let mut out = vec![0u8; 16];
+    be.download(dst_buf.as_ref(), &mut out).unwrap();
+    let got: &[f32] = bytemuck::cast_slice(&out);
+    assert_eq!(got, values, "async static copy differs from source");
+}
