@@ -2,153 +2,103 @@
 kind: reference
 status: current
 scope: submission-protocol
-last_verified: 2026-10-19
+last_verified: 2026-10-20
 verified_commit: working-tree
 ---
 
-# MoE4All Text Submission Protocol
+# 社区报告封装与提交协议
 
-## Scope
+## 类型与路线
 
-`MOE4ALL-SUBMISSION/1` is the transport and storage envelope for public benchmark submissions
-(`.m4b`) and diagnostic error submissions (`.m4e`). Both are UTF-8 text, remain readable in a pull
-request or text editor, survive copy/paste, and carry one lossless compact JSON payload.
+| 类型 | 扩展名 | payload schema | Git 归档路径 |
+| --- | --- | --- | --- |
+| Benchmark | `.m4b` | `benchmark/1` | `benchmark-database/v1/YYYY-MM/<id>.m4b` |
+| 错误报告 | `.m4e` | `error/1` | `error-database/v1/YYYY-MM/<id>.m4e` |
 
-The envelope version, payload schema and delivery protocol are independent:
+两类文件共用 `MOE4ALL-SUBMISSION/1` UTF-8 文本封装。三平台向导都支持 GitHub PR 或 Cloudflare 中转：可使用已登录 gh 时直接提交；工具缺失、未授权或直传失败时使用浏览器确认的中转，不自动安装工具。PR 创建后即公开，不等合并才公开；不创建 Issue、不自动合并。
 
-- Envelope: `MOE4ALL-SUBMISSION/1`.
-- Benchmark payload: `benchmark/1`, extension `.m4b`.
-- Error payload: `error/1`, extension `.m4e`.
-- Delivery: GitHub PR or the MoE4All submission API v1. Delivery does not change the file bytes.
-
-The website integration defines the HTTP flow. The wizard creates a file-bound upload session,
-opens a same-origin browser confirmation page, polls with a private session credential, uploads the
-exact original bytes, and stores the returned private receipt separately. The default API base is
-`https://api.moe4all.com/v1`; this address is reserved until the cloud service is deployed. An
-explicit loopback `MOE4ALL_SUBMISSION_API_BASE=http://127.0.0.1:<port>/v1` is accepted for local
-development, while other clear-text origins are rejected.
-
-## Wire Format
-
-Every file uses LF line endings when produced. Decoders must also accept CRLF and bare CR copied
-from text applications. No UTF-8 BOM is written.
+## 封装
 
 ```text
 MOE4ALL-SUBMISSION/1
 kind: benchmark
 schema: benchmark/1
-id: 20261019T010203.004Z-00112233445566778899aabbccddeeff-000
+id: <unique-id>
 created-at: 2026-10-19T01:02:03.004Z
 engine: 1.0.3
 encoding: gzip+base64
-decoded-bytes: 6977
-compressed-bytes: 2495
-sha256: <64 lowercase hexadecimal characters>
-summary-count: 4
-summary-001: model: example.gguf | qwen35moe | 23.87 GiB
-summary-002: device: Example GPU | 23.98 GiB
-summary-003: profile: standard
-summary-004: result 6K: prefill=3333.40 | x1=115.97 tok/s
+decoded-bytes: <原始 JSON 字节数>
+compressed-bytes: <gzip 字节数>
+sha256: <原始 JSON 字节的 SHA-256，小写十六进制>
+summary-count: <摘要行数>
+summary-001: <从 payload 重新生成的单行摘要>
 
 -----BEGIN MOE4ALL PAYLOAD-----
-<RFC 4648 standard Base64, wrapped at 76 ASCII characters>
+<每行 76 个 ASCII 字符的标准 Base64，最后一行可更短>
 -----END MOE4ALL PAYLOAD-----
 ```
 
-Header names are lowercase ASCII letters, digits and hyphens. Duplicate headers, unknown kinds,
-schema/kind mismatches, text after the end marker and malformed Base64 are errors. Header order is
-canonical as shown; decoders need not require the order.
+将 payload 序列化为紧凑 UTF-8 JSON，对确切字节计算 SHA-256，然后压缩为一个 gzip member、标准 Base64 编码并按 76 字符换行。摘要可读，payload 无损，但不是加密。
 
-The only payload encoding in envelope version 1 is:
+生产者生成 LF、不带 UTF-8 BOM；解码器也接受 CRLF 和裸 CR。完整文件与解压 JSON **分别不超过 128 KiB**。gzip 必须完整、CRC 正确，不接受多个 member 或尾随压缩数据。长度、hash、kind、schema、身份和摘要都需一致。
 
-1. Serialize the payload as compact UTF-8 JSON with no insignificant whitespace.
-2. Calculate SHA-256 over those exact decoded JSON bytes.
-3. Compress those bytes as one gzip member using the highest ordinary compression level.
-4. Encode the gzip bytes with RFC 4648 standard Base64 including normal `=` padding.
-5. Wrap Base64 at 76 characters. The final payload line and end marker end with LF.
+header 名称使用 ASCII 字母、数字和连字符，顺序不作为接收条件；重复 header、标记后有内容、非规范 Base64 都拒绝。JSON 拒绝重复／保留字段、NaN、Infinity、不安全整数、未配对代理字符和超过 48 层的嵌套。UTC 接受 Z 和 +00:00；目录月份取原始报告 UTC 时间，不取上传时间。
 
-`decoded-bytes`, `compressed-bytes` and `sha256` are mandatory and must match. Encoders and decoders
-limit both the complete text envelope and the decompressed JSON to 128 KiB, preventing decompression
-bombs. JSON `NaN`, positive infinity and negative infinity are forbidden.
+## 摘要与校验
 
-## Readable Summary
+摘要是 payload 的确定性投影，不是第二份事实来源。Benchmark 包含模型、架构、体积、设备、VRAM、profile 和各上下文结果；错误报告包含失败类型、模型／设备、描述与最终错误。吞吐量、GiB 保留两位小数，使用 binary64 ties-to-even 格式化。
 
-The header summary is a deterministic projection of the decoded payload, never a second source of
-truth. Validators regenerate every `summary-NNN` line and reject a mismatch. Values are single-line,
-control characters and repeated whitespace are normalized, and long description/error fields are
-truncated only in the summary. The compressed payload remains lossless.
+控制字符转为空格、连续 Unicode White_Space 合并；U+FEFF 不属于 Rust 的空白字符。截断按 code point 计数，**达到上限即追加 ...**：描述／错误摘要上限 240，engine header 上限 80，最终摘要行上限 500。截断不改变 payload。
 
-Benchmark summaries include model, architecture, model size, device, VRAM, profile and one compact
-result line per measured context. Error summaries include failure kind, model/device when known,
-the user description and final error. Rates use two digits after the decimal point; byte capacities
-use GiB with two digits.
-
-## Benchmark Payload
-
-The decoded object retains benchmark JSON schema version 1. Its `id` equals the filename stem and
-its `created_at_utc` selects `benchmark-database/v1/YYYY-MM/`. GitHub submissions add exactly one
-new immutable `.m4b` file. A corrected measurement receives a new ID and file.
-
-The launch wizard uses GitHub PR submission when the user has GitHub access. Without GitHub it uses
-the website submission API. A failed or unavailable upload always preserves the local `.m4b` and
-does not change a successful benchmark exit code.
-
-Automatic benchmark suites emit this envelope on every supported platform. The Windows launch
-wizard also converts its manual single-test result to the same envelope before offering upload.
-Linux and macOS manual single-test upload is not exposed until their equivalent conversion and
-review flow is implemented; they must not submit the older raw JSON as protocol data.
-
-## Error Payload
-
-Error reports never enter GitHub Issues or the benchmark database. Both fatal-process reports and
-user-triggered runtime reports use `.m4e` and the website submission API, which forwards each
-accepted report to a public PR under `error-database/v1/YYYY-MM/`.
-
-The compact upload payload contains basic engine/model/hardware/launch information, the user-edited
-description, startup log lines, the final error chain for fatal failures and the last 12 non-speed
-diagnostic lines. It excludes live speed tables, prompts, generated responses, images, API keys,
-hostnames, serial numbers and absolute local paths. Local rolling evidence remains separate and may be
-larger; it is never embedded wholesale in `.m4e`.
-
-## CI And Independent Decoding
-
-The engine provides:
+共享向量位于 `scripts/fixtures/submission-vectors.json`，Rust、独立 Python 和网站校验对应边界。decode 允许检查尚未补充描述的 fatal 报告；verify 和提交校验要求完整、可公开的报告。
 
 ```text
 infr submission verify <file.m4b-or-m4e>
 infr submission decode <file> [--output decoded.json]
-```
-
-CI intentionally uses the independent, standard-library-only decoder instead of trusting the Rust
-producer:
-
-```text
 python3 scripts/moe4all_submission.py verify <file>
 python3 scripts/moe4all_submission.py decode <file> --output decoded.json
 python3 scripts/validate-benchmark-submission.py <file.m4b>
+python3 scripts/validate-error-submission.py <file.m4e>
 ```
 
-Benchmark-only pull requests bypass compilation only when the diff adds exactly one path matching
-`benchmark-database/v1/YYYY-MM/<id>.m4b`. CI verifies the armor, length fields, gzip, SHA-256,
-payload JSON, generated summary, filename identity and benchmark schema.
+浏览器和 Worker 都重新校验完整封装、gzip、JSON、schema、身份、摘要及隐私；浏览器通过不代表服务端可以跳过校验。浏览器使用可检查输入消耗的严格 gzip 解码器，不仅依赖无法暴露 member 消耗量的 DecompressionStream。
 
-## Website Decoder
+## Payload
 
-The website must follow the same byte order and limits. In a browser it may:
+Benchmark 保留模型、硬件、配置、上下文与原始测量。自动 suite 与三平台手动结果都使用 .m4b；手动结果须明确 prefill 或 decode，不上传旧裸 JSON。每份最多 64 个不同上下文，每上下文最多 64 种不同并发，每并发最多 100 轮；需包含 overall、三个计分段和与并发一致的 lane 矩阵。128 KiB 总限额同时生效，不保证最大矩阵都能容纳。
 
-1. Parse headers and concatenate the Base64 lines.
-2. Decode with `atob` into bytes.
-3. Decompress with `new DecompressionStream("gzip")`.
-4. reject more than 128 KiB of decoded data;
-5. verify `decoded-bytes` and SHA-256 with `crypto.subtle.digest("SHA-256", bytes)`;
-6. decode UTF-8 with a fatal `TextDecoder`, parse strict JSON, and regenerate the summary.
+Windows 向导生成后补全内存、所选 GPU 当前／最大 PCIe 链路和模型盘信息，并重新封装。直接运行引擎不能保证这些 Windows 补全字段；其他平台不可靠或不适用的字段保留未知，不推测。PCIe 理论带宽不同于实测速度，文件缓存命中也不能当作物理 SSD 吞吐量。
 
-The envelope permits exactly one gzip member and no trailing compressed bytes. Because the browser
-`DecompressionStream` API does not expose how many input bytes it consumed, a browser using only
-that API may label the result decoded but verification pending; exact member consumption is then
-confirmed by Cloudflare's strict decoder. A browser decoder/library that exposes consumed input may
-perform the same check locally.
+错误报告描述非空、最多 4096 code point，可在向导返回修改。诊断最多 220 行启动日志、12 行最近日志，两部分合计最多 32 KiB，附必要环境、最终错误及错误链。禁止速度表、prompt、response、图片、密钥、主机名、用户名、序列号及未脱敏绝对路径；隐私声明不能代替内容检查。原始滚动证据不整体嵌入报告。
 
-The website may display the readable header immediately, but must not mark the submission verified
-or store it until all payload and schema checks pass. Cloudflare must repeat server-side validation;
-browser validation alone is not a trust boundary.
+## Git 与 CI
+
+每个 PR 只能新增一份不可变报告，不改旧数据或混入代码。文件名等于 ID，全库唯一；更正结果使用新 ID。CI 按 merge-base 判定变更，读取 NUL 分隔路径，严格检查目录、月份、类型、身份与 payload。
+
+纯报告 PR 只运行独立 Python 校验，不触发模型下载、推理或重型构建。维护者手动审核；Git 直提不进入 D1，也不受 Cloudflare 来源额度约束。
+
+## 中转与浏览器回执
+
+默认 API 为 https://api.moe4all.com/v1，确认页为 https://moe4all.com/community/upload.html。正式入口使用 HTTPS；显式配置 loopback 开发地址可用 HTTP，不接受其他明文来源。
+
+向导绑定类型、ID、大小与整个文件 SHA-256，创建 15 分钟会话，并发送最多 8 行、每行 500 字符的摘要。浏览器将它标为客户端提供、尚未校验。用户主动同意公开并完成 Turnstile 后，向导发送确切原文件字节。
+
+Cloudflare 先返回回执，再异步创建 PR；复核 PR head 原件后立即删除云端正文，不等合并。128 MiB 缓冲区满时返回可重试 503，不淘汰未过期报告。最多重试 72 小时；每来源滚动 24 小时最多成功接收 50 份新报告、创建 100 个会话，重复提交不重复消耗成功报告额度。
+
+| 回执状态 | 含义 |
+| --- | --- |
+| forwarding | 已接收，后台创建或重试 PR |
+| pending_review | PR 原件复核完成，等待维护者审核 |
+| published | main 原件已复核、归档；错误归档不等于修复 |
+| rejected | PR 关闭且未合并 |
+| delivery_failed | 转发过期、正文清理；重新导出新 ID 再尝试 |
+
+向导只保存私密回执并打开网站，不实现查询界面。使用 URL fragment 交接独立回执凭证，网页读取后清除地址栏敏感参数并复核返回身份。无法自动打开时，在网页导入 .private-receipt.json。凭证不进入报告、Git 或普通日志。
+
+重复提交的 file_sha256 指向最初原件，submitted_file_sha256 绑定本次文件，不能因换行差异误判损坏。HTTP 200 不代表 PR 已建立，应展示真实状态。429／503 有限重试且遵守 Retry-After；过长等待保留原件、稍后重试，不提前重发。上传失败不改变已成功 Benchmark 的退出结果。
+
+## 榜单与验收边界
+
+网站按定时 CI 或手动操作，从 Git main 的 .m4b 生成全量精简静态数据库；浏览器获取最新已部署版本并本地筛选。**不要求引擎逐次通知，也不是网页每次实时扫描 Git。** .m4e 不上榜。
+
+本轮验证本地协议、三平台上传逻辑、真实 Windows CLI 与 loopback HTTP、浏览器回执交接和合成 Git 数据的索引生成。GitHub 写操作使用 fixture，没有创建真实 PR、部署云端或占用 GPU。非 macOS 主机的 Zsh 检查不替代原生 macOS 安装验收。

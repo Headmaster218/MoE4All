@@ -305,8 +305,8 @@ try {
     Assert ((ConvertFrom-StorageBusType -Type 17) -eq 'NVMe' -and (ConvertFrom-StorageMediaType -Type 4) -eq 'SSD') 'Storage enum mapping changed'
     Assert ((Get-PcieTheoreticalBandwidthGbps -Generation 4 -Width 16) -eq 31.504) 'PCIe 4.0 x16 bandwidth calculation changed'
     Assert ($source -match "Start-Process -FilePath 'https://github.com/login/device'") 'GitHub device login page is not opened explicitly'
-    Assert ($source -match '\$branch = "benchmark/\$login-\$\(\$value\.id\)"') 'Automated benchmark branch naming changed'
-    Assert ($source.Contains("Create the branch and benchmark PR now?' -Default `$true")) 'Final automated PR confirmation should accept Enter'
+    Assert ($source.Contains('$branch = "community/$Kind/$fileHash"')) 'Report branches must be deterministic and separated by kind'
+    Assert ($source.Contains("Create the branch and report PR now?' -Default `$true")) 'Final automated PR confirmation should accept Enter'
     Assert ($source.IndexOf('if ($benchmarkResultPath) { $benchmarkUploadRequested = Read-BenchmarkUploadConsent }') -lt $source.IndexOf('$benchmarkHardwareDetails = Get-WindowsBenchmarkHardwareDetails')) 'Upload consent must be requested before post-benchmark hardware enrichment'
     $savedApiBase = [Environment]::GetEnvironmentVariable('MOE4ALL_SUBMISSION_API_BASE', 'Process')
     $savedSiteOrigin = [Environment]::GetEnvironmentVariable('MOE4ALL_SUBMISSION_SITE_ORIGIN', 'Process')

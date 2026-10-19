@@ -1,6 +1,6 @@
 # Benchmark Database
 
-Automatic `infr bench --suite ...` runs and Windows launch-wizard manual benchmarks write one immutable,
+Automatic `infr bench --suite ...` runs and Windows/Linux/macOS launch-wizard manual benchmarks write one immutable,
 Base64-armored UTF-8 text submission under:
 
 ```text

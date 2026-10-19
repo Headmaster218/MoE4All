@@ -1077,30 +1077,39 @@ function Write-ManualBenchmarkResult {
     return $resultPath
 }
 
-function Test-BenchmarkResultForUpload {
-    param([Parameter(Mandatory = $true)][string]$Path)
+function Test-SubmissionForUpload {
+    param([Parameter(Mandatory = $true)][string]$Path, [ValidateSet('benchmark', 'error')][string]$Kind = 'benchmark')
 
     $databaseRoot = [System.IO.Path]::GetFullPath((Join-Path $repoRoot 'benchmark-database'))
     $fullPath = [System.IO.Path]::GetFullPath($Path)
     $prefix = $databaseRoot.TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
-    if (-not $fullPath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+    if ($Kind -eq 'benchmark' -and -not $fullPath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw '只允许上传 benchmark-database 中的结果。Only results under benchmark-database can be uploaded.'
     }
-    if ([System.IO.Path]::GetExtension($fullPath) -ine '.m4b') {
-        throw 'Benchmark 提交文件必须使用 .m4b。Benchmark submissions must use .m4b.'
+    $extension = if ($Kind -eq 'benchmark') { '.m4b' } else { '.m4e' }
+    if ([System.IO.Path]::GetExtension($fullPath) -ine $extension) {
+        throw '提交文件扩展名与类型不一致。Submission extension does not match its kind.'
     }
     $value = Read-MoE4AllSubmissionPayload -Path $fullPath
     $raw = $value | ConvertTo-Json -Depth 20 -Compress
     if ([int]$value.schema_version -ne 1 -or [string]$value.id -ne [System.IO.Path]::GetFileNameWithoutExtension($fullPath)) {
         throw 'Benchmark 提交的 schema 或文件名无效。The benchmark submission schema or filename is invalid.'
     }
-    if ([string]$value.profile -notin @('quick', 'standard', 'full', 'manual')) {
+    if ($Kind -eq 'benchmark' -and [string]$value.profile -notin @('quick', 'standard', 'full', 'manual')) {
         throw 'Benchmark 提交的 profile 无效。The benchmark submission profile is invalid.'
+    }
+    if ($Kind -eq 'error' -and ([string]::IsNullOrWhiteSpace([string]$value.description) -or (Get-UnicodeCodePointCount -Value ([string]$value.description)) -gt 4096)) {
+        throw '错误报告需要 1 至 4096 字的问题描述。Error reports require a description of 1..4096 code points.'
     }
     if ($raw -match '(?i)[a-z]:\\\\|/home/|/users/|\\\\users\\\\|"hostname"|"serial') {
         throw '结果包含本机路径、主机名或序列号，已拒绝上传。The result contains a local path, hostname or serial number.'
     }
     return $value
+}
+
+function Test-BenchmarkResultForUpload {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    return Test-SubmissionForUpload -Path $Path -Kind 'benchmark'
 }
 
 function Copy-BenchmarkSubmissionToClipboard {
@@ -1227,10 +1236,12 @@ function Invoke-GhBrowserLogin {
     }
 }
 
-function Invoke-GhBenchmarkUpload {
-    param([Parameter(Mandatory = $true)][string]$Path)
+function Invoke-GhSubmissionUpload {
+    param([Parameter(Mandatory = $true)][string]$Path, [ValidateSet('benchmark', 'error')][string]$Kind = 'benchmark')
 
-    $value = Test-BenchmarkResultForUpload -Path $Path
+    $value = Test-SubmissionForUpload -Path $Path -Kind $Kind
+    $verified = Invoke-NativeCommandResult -Executable $infrPath -Arguments @('submission', 'verify', $Path)
+    if ($verified.ExitCode -ne 0) { throw '提交文件未通过本地校验，未上传。Local submission validation failed; nothing was uploaded.' }
     $gh = Get-Command gh -ErrorAction SilentlyContinue
     if ($null -eq $gh) { return $false }
     if (-not (Test-GhAuthenticated -GhCommand $gh)) { return $false }
@@ -1238,14 +1249,16 @@ function Invoke-GhBenchmarkUpload {
     $login = [string]($identity.Output | Where-Object { $_ } | Select-Object -First 1)
     if ($identity.ExitCode -ne 0 -or -not $login) { return $false }
     $login = $login.Trim()
+    if ($login -notmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,38}$') { return $false }
 
     $upstream = 'Headmaster218/MoE4All'
     $fork = "$login/MoE4All"
     $month = ([DateTimeOffset]::Parse([string]$value.created_at_utc)).UtcDateTime.ToString('yyyy-MM')
-    $relative = "benchmark-database/v1/$month/$([System.IO.Path]::GetFileName($Path))"
+    $relative = "${Kind}-database/v1/$month/$([System.IO.Path]::GetFileName($Path))"
     Write-Host "`nGitHub: $login" -ForegroundColor Cyan
     Write-Host "目标 / Target: $upstream/$relative"
-    if (-not (Read-YesNo -Label '确认创建分支并提交 benchmark PR？/ Create the branch and benchmark PR now?' -Default $true)) {
+    Write-Host 'PR 创建后报告即公开；不创建 Issue，不自动合并。The report becomes public when the PR is created; no Issue or automatic merge.' -ForegroundColor Yellow
+    if (-not (Read-YesNo -Label '确认创建分支并提交报告 PR？/ Create the branch and report PR now?' -Default $true)) {
         return $true
     }
 
@@ -1262,36 +1275,56 @@ function Invoke-GhBenchmarkUpload {
             }
             if (-not $ready) { throw 'GitHub fork was not ready in time' }
         }
-        $baseResult = Invoke-NativeCommandResult -Executable $gh.Source -Arguments @('api', "repos/$fork/git/ref/heads/main", '--jq', '.object.sha')
+        $baseResult = Invoke-NativeCommandResult -Executable $gh.Source -Arguments @('api', "repos/$upstream/git/ref/heads/main", '--jq', '.object.sha')
         $baseSha = [string]($baseResult.Output | Where-Object { $_ } | Select-Object -First 1)
-        if ($baseResult.ExitCode -ne 0 -or -not $baseSha) { throw 'could not read fork main SHA' }
+        if ($baseResult.ExitCode -ne 0 -or -not $baseSha) { throw 'could not read upstream main SHA' }
         $baseSha = $baseSha.Trim()
-        $branch = "benchmark/$login-$($value.id)"
+        $fileHash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+        $branch = "community/$Kind/$fileHash"
         $refCreate = Invoke-NativeCommandResult -Executable $gh.Source -Arguments @('api', '--method', 'POST', "repos/$fork/git/refs", '-f', "ref=refs/heads/$branch", '-f', "sha=$baseSha")
-        if ($refCreate.ExitCode -ne 0) { throw "could not create benchmark branch: $($refCreate.Output -join ' ')" }
+        if ($refCreate.ExitCode -ne 0) {
+            $probe = Invoke-NativeCommandResult -Executable $gh.Source -Arguments @('api', "repos/$fork/git/ref/heads/$branch")
+            if ($probe.ExitCode -ne 0) { throw 'could not create or reuse the report branch' }
+        }
 
         $uploadRequest = Join-Path $dataDir ("benchmark-upload-{0}.json" -f [Guid]::NewGuid().ToString('N'))
         try {
             $body = [ordered]@{
-                message = "bench: add $($value.id)"
+                message = "${Kind}: add $($value.id)"
                 content = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($Path))
                 branch = $branch
             } | ConvertTo-Json -Compress
             [System.IO.File]::WriteAllText($uploadRequest, $body, [System.Text.UTF8Encoding]::new($false))
             $upload = Invoke-NativeCommandResult -Executable $gh.Source -Arguments @('api', '--method', 'PUT', "repos/$fork/contents/$relative", '--input', $uploadRequest)
-            if ($upload.ExitCode -ne 0) { throw "could not upload benchmark submission: $($upload.Output -join ' ')" }
+            if ($upload.ExitCode -ne 0) {
+                $existing = Invoke-NativeCommandResult -Executable $gh.Source -Arguments @('api', "repos/$fork/contents/${relative}?ref=$([Uri]::EscapeDataString($branch))", '--jq', '.content')
+                if ($existing.ExitCode -ne 0) { throw 'could not upload or verify the existing report' }
+                $content = [Convert]::FromBase64String(($existing.Output -join '').Replace("`n", '').Replace("`r", ''))
+                $sha = [System.Security.Cryptography.SHA256]::Create()
+                try { $actualHash = ([BitConverter]::ToString($sha.ComputeHash($content))).Replace('-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+                if ($actualHash -ne $fileHash) { throw 'existing report differs; nothing was overwritten' }
+            }
         } finally {
             Remove-Item -LiteralPath $uploadRequest -Force -ErrorAction SilentlyContinue
         }
-        $prCreate = Invoke-NativeCommandResult -Executable $gh.Source -Arguments @('pr', 'create', '--repo', $upstream, '--base', 'main', '--head', "${login}:$branch", '--title', "bench: add $($value.id)", '--body', 'Automated benchmark result generated by the MoE4All launch wizard.')
+        $prCreate = Invoke-NativeCommandResult -Executable $gh.Source -Arguments @('pr', 'create', '--repo', $upstream, '--base', 'main', '--head', "${login}:$branch", '--title', "${Kind}: add $($value.id)", '--body', 'User-consented public MoE4All report. Awaiting maintainer review; no automatic merge. Format validation is not an independent reproduction.')
         $prUrl = [string]($prCreate.Output | Where-Object { $_ } | Select-Object -Last 1)
-        if ($prCreate.ExitCode -ne 0) { throw "could not create pull request: $($prCreate.Output -join ' ')" }
+        if ($prCreate.ExitCode -ne 0) {
+            $listed = Invoke-NativeCommandResult -Executable $gh.Source -Arguments @('pr', 'list', '--repo', $upstream, '--head', "${login}:$branch", '--state', 'all', '--json', 'url', '--jq', '.[0].url // empty')
+            $prUrl = [string]($listed.Output | Where-Object { $_ } | Select-Object -First 1)
+            if ($listed.ExitCode -ne 0 -or $prUrl -notmatch '^https://github\.com/Headmaster218/MoE4All/pull/[0-9]+$') { throw 'could not create or reuse pull request' }
+        }
         Write-Host "PR 已创建 / PR created: $prUrl" -ForegroundColor Green
         return $true
     } catch {
         Write-Warning "gh 上传失败：$($_.Exception.Message) / gh upload failed."
         return $false
     }
+}
+
+function Invoke-GhBenchmarkUpload {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    return Invoke-GhSubmissionUpload -Path $Path -Kind 'benchmark'
 }
 
 function Save-BenchmarkUploadPreferences {
@@ -1312,7 +1345,7 @@ function Save-BenchmarkUploadPreferences {
 }
 
 function Read-BenchmarkUploadConsent {
-    $answer = Read-YesNo -Label '愿意上传这份匿名 benchmark 结果吗？/ Upload this anonymous benchmark result?' -Default $script:BenchmarkUploadDefault
+    $answer = Read-YesNo -Label '愿意公开提交这份 benchmark 结果吗？/ Submit this benchmark result publicly?' -Default $script:BenchmarkUploadDefault
     $script:BenchmarkUploadDefault = $answer
     Save-BenchmarkUploadPreferences
     return $answer
@@ -1451,7 +1484,8 @@ function Invoke-Moe4AllSubmissionApi {
                     $delaySeconds = [Math]::Max(0, ($response.Headers.RetryAfter.Date.UtcDateTime - [DateTime]::UtcNow).TotalSeconds)
                 }
             }
-            Start-Sleep -Milliseconds ([int]([Math]::Min(30000, $delaySeconds * 1000 + (Get-Random -Minimum 0 -Maximum 501))))
+            if ($delaySeconds -gt 120) { throw (New-Moe4AllSubmissionApiException -StatusCode $status -Code $code -Message '服务要求稍后重试；请保留报告。The service requested a longer wait; keep the report and retry later.') }
+            Start-Sleep -Milliseconds ([int]($delaySeconds * 1000 + (Get-Random -Minimum 0 -Maximum 501)))
         } catch {
             $statusData = $_.Exception.Data['StatusCode']
             if ($null -ne $statusData -or $attempt -eq $maximumRetries) { throw }
@@ -1521,6 +1555,8 @@ function Invoke-WebsiteSubmissionUpload {
     if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) { throw "找不到提交文件。Submission file not found: $fullPath" }
     $expectedExtension = if ($Kind -eq 'benchmark') { '.m4b' } else { '.m4e' }
     if ([System.IO.Path]::GetExtension($fullPath) -ine $expectedExtension) { throw "提交文件类型与 $Kind 不匹配。Submission extension does not match $Kind." }
+    $verified = Invoke-NativeCommandResult -Executable $infrPath -Arguments @('submission', 'verify', $fullPath)
+    if ($verified.ExitCode -ne 0) { throw '提交文件未通过本地校验，未上传。Local submission validation failed; nothing was uploaded.' }
     $payload = Read-MoE4AllSubmissionPayload -Path $fullPath
     $reportId = [string]$payload.id
     if ($reportId -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$' -or [System.IO.Path]::GetFileNameWithoutExtension($fullPath) -ne $reportId) {
@@ -1551,6 +1587,7 @@ function Invoke-WebsiteSubmissionUpload {
         report_id = $reportId
         file_sha256 = $fileHash
         size_bytes = $bytes.Length
+        summary = @(Get-SubmissionReadableSummary -Text $armorText)
     })
     $session = $opened.Value
     if ([int]$session.api_version -ne 1 -or [string]$session.state -ne 'awaiting_verification' -or [string]::IsNullOrWhiteSpace([string]$session.session_id) -or [string]::IsNullOrWhiteSpace([string]$session.session_token)) {
@@ -1609,16 +1646,42 @@ function Invoke-WebsiteSubmissionUpload {
         throw '提交回执与本地文件不匹配。Submission receipt does not match the local file.'
     }
     $receiptPath = Save-Moe4AllSubmissionReceipt -Receipt $receipt -ApiBase $config.ApiBase
-    Write-Host ("已收到，状态：{0} / Received, status: {0}" -f [string]$receipt.status) -ForegroundColor Green
+    if ([string]$receipt.status -eq 'delivery_failed') {
+        Write-Warning '该报告此前转发失败，正文已清理；请重新导出新报告。This report previously failed delivery; export a new report to try again.'
+    } elseif ([string]$receipt.status -eq 'rejected') {
+        Write-Warning '该报告的 PR 已退回。The report PR was closed without merging.'
+    } else { Write-Host ("已收到，状态：{0} / Received, status: {0}" -f [string]$receipt.status) -ForegroundColor Green }
     if (-not [string]::IsNullOrWhiteSpace([string]$receipt.public_url)) {
         Write-Host ("公开地址 / Public URL: {0}" -f [string]$receipt.public_url) -ForegroundColor Cyan
     } else {
-        Write-Host '报告已进入公开 PR 转发队列；PR 建立后可凭私有回执查询。' -ForegroundColor DarkGray
-        Write-Host 'The report is queued for a public PR; use the private receipt to query its final URL.' -ForegroundColor DarkGray
+        Write-Host '可在浏览器回执页查看转发与审核进度。' -ForegroundColor DarkGray
+        Write-Host 'View delivery and review progress on the browser receipt page.' -ForegroundColor DarkGray
     }
     Write-Host ("Receipt ID: {0}" -f [string]$receipt.receipt_id) -ForegroundColor Cyan
     Write-Host "Private receipt: $receiptPath" -ForegroundColor DarkGray
+    Open-Moe4AllSubmissionReceipt -Receipt $receipt -SiteOrigin $config.SiteOrigin
     return $true
+}
+
+function Get-SubmissionReadableSummary {
+    param([Parameter(Mandatory = $true)][string]$Text)
+    foreach ($line in @([regex]::Matches($Text, '(?m)^summary-[0-9]{3}: (.*)\r?$') | Select-Object -First 8)) {
+        $value = $line.Groups[1].Value.TrimEnd("`r")
+        $end = 0; $count = 0
+        while ($end -lt $value.Length -and $count -lt 500) {
+            if ([char]::IsHighSurrogate($value[$end]) -and $end + 1 -lt $value.Length -and [char]::IsLowSurrogate($value[$end + 1])) { $end++ }
+            $end++; $count++
+        }
+        $value.Substring(0, $end)
+    }
+}
+
+function Open-Moe4AllSubmissionReceipt {
+    param([Parameter(Mandatory = $true)]$Receipt, [Parameter(Mandatory = $true)][string]$SiteOrigin)
+    $url = $SiteOrigin.TrimEnd('/') + '/community/index.html#receipt=' + [Uri]::EscapeDataString([string]$Receipt.receipt_id) + '&token=' + [Uri]::EscapeDataString([string]$Receipt.receipt_token)
+    try { Start-Process -FilePath $url } catch {
+        Write-Host '未能打开回执页；可在网站“我的回执”导入本机保存的私密回执文件。Could not open the receipt page; import the saved private receipt on the website.' -ForegroundColor Yellow
+    }
 }
 
 function Get-ErrorSubmissionSnapshot {
@@ -1723,23 +1786,24 @@ function Complete-ErrorReport {
         if ($marker.Count -ne 1) { throw 'error report creation did not return a result path' }
         $path = [string]$marker[0].Substring('MOE4ALL_SUBMISSION_PATH='.Length)
         Write-Host "`n错误报告已生成 / Error report created: $path" -ForegroundColor Green
-        $upload = Read-YesNo -Label '愿意上传这份匿名错误报告吗？/ Upload this anonymous error report?' -Default $script:ErrorUploadDefault
+        $upload = Read-YesNo -Label '愿意公开提交这份错误报告吗？/ Submit this error report publicly?' -Default $script:ErrorUploadDefault
         $script:ErrorUploadDefault = $upload
         Save-ErrorUploadPreference
-        if ($upload) { [void](Invoke-WebsiteSubmissionUpload -Path $path -Kind 'error') }
+        if ($upload) { Offer-SubmissionUpload -Path $path -Kind 'error' -ConsentAlreadyGranted }
         return $path
     } finally {
         Remove-Item -LiteralPath $descriptionPath -Force -ErrorAction SilentlyContinue
     }
 }
 
-function Offer-BenchmarkUpload {
+function Offer-SubmissionUpload {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
+        [ValidateSet('benchmark', 'error')][string]$Kind = 'benchmark',
         [switch]$ConsentAlreadyGranted
     )
 
-    try { [void](Test-BenchmarkResultForUpload -Path $Path) } catch { Write-Warning $_.Exception.Message; return }
+    try { [void](Test-SubmissionForUpload -Path $Path -Kind $Kind) } catch { Write-Warning $_.Exception.Message; return }
     if (-not $ConsentAlreadyGranted -and -not (Read-BenchmarkUploadConsent)) { return }
     $hasGithub = Read-YesNo -Label '你有 GitHub 账号吗？/ Do you have a GitHub account?' -Default $script:BenchmarkUploadHasGithubDefault
     $script:BenchmarkUploadHasGithubDefault = $hasGithub
@@ -1756,17 +1820,20 @@ function Offer-BenchmarkUpload {
                     $ghAuthenticated = Test-GhAuthenticated -GhCommand $gh
                 }
             } else {
-                Open-BenchmarkBrowserUpload -Path $Path
-                return
+                Write-Host '不进行 gh 授权，改用浏览器确认的 Cloudflare 中转。Using the browser-confirmed Cloudflare relay without gh authorization.'
             }
         }
         if ($ghAuthenticated) {
-            if (Invoke-GhBenchmarkUpload -Path $Path) { return }
+            if (Invoke-GhSubmissionUpload -Path $Path -Kind $Kind) { return }
         }
-        Open-BenchmarkBrowserUpload -Path $Path
-        return
+        Write-Host 'GitHub 直传不可用，改用浏览器确认的 Cloudflare 中转。Direct GitHub upload is unavailable; using the browser-confirmed Cloudflare relay.'
     }
-    [void](Invoke-WebsiteSubmissionUpload -Path $Path -Kind 'benchmark')
+    [void](Invoke-WebsiteSubmissionUpload -Path $Path -Kind $Kind)
+}
+
+function Offer-BenchmarkUpload {
+    param([Parameter(Mandatory = $true)][string]$Path, [switch]$ConsentAlreadyGranted)
+    Offer-SubmissionUpload -Path $Path -Kind 'benchmark' -ConsentAlreadyGranted:$ConsentAlreadyGranted
 }
 
 function Invoke-BenchmarkUploadSafely {
@@ -2023,8 +2090,8 @@ function Get-WindowsBenchmarkHardwareDetails {
             $gpuLinks = @(Get-CimInstance Win32_VideoController -ErrorAction Stop | Where-Object {
                 [string]$_.PNPDeviceID -like 'PCI\*' -and [string]$_.Name -eq $SelectedGpuName
             } | Select-Object -First 1 | ForEach-Object {
-                $properties = @(Get-PnpDeviceProperty -InstanceId $_.PNPDeviceID -KeyName $linkKeys -ErrorAction Stop)
-                $get = { param($key) $entry = $properties | Where-Object KeyName -eq $key | Select-Object -First 1; if ($null -ne $entry) { [int]$entry.Data } else { 0 } }
+                $properties = @(Get-PnpDeviceProperty -InstanceId $_.PNPDeviceID -KeyName $linkKeys -ErrorAction SilentlyContinue)
+                $get = { param($key) $entry = $properties | Where-Object KeyName -eq $key | Select-Object -First 1; if ($null -ne $entry -and $null -ne $entry.Data -and [int]$entry.Data -gt 0) { [int]$entry.Data } else { $null } }
                 $currentGeneration = & $get 'DEVPKEY_PciDevice_CurrentLinkSpeed'
                 $currentWidth = & $get 'DEVPKEY_PciDevice_CurrentLinkWidth'
                 $maxGeneration = & $get 'DEVPKEY_PciDevice_MaxLinkSpeed'

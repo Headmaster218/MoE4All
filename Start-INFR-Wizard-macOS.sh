@@ -8,7 +8,7 @@ need() { command -v "$1" >/dev/null || fail "Required system tool not found: $1"
 trim() { REPLY=$1; REPLY="${REPLY#"${REPLY%%[![:space:]]*}"}"; REPLY="${REPLY%"${REPLY##*[![:space:]]}"}"; }
 file_sha256() { REPLY=$(shasum -a 256 -- "$1") || return 1; REPLY=${REPLY%% *}; }
 launcher_exit() {
-    local status=$1 ignored
+    local -h status=$1 ignored
     trap - EXIT
     if ((status != 0)) && [[ $status != 130 && $status != 143 && ${INTERACTIVE-false} == true && -t 0 ]]; then
         printf '\nMoE4All launch failed (exit %d). Review the messages above.\nPress Enter to close: ' "$status" >&2
@@ -964,7 +964,7 @@ newest_error_report() {
 }
 
 submission_header() {
-    local path=$1 name=$2 count
+    local -h path=$1 name=$2 count
     count=$(grep -c "^${name}: " "$path" 2>/dev/null) || true
     [[ $count == 1 ]] || return 1
     REPLY=$(sed -n "s/^${name}: //p" "$path")
@@ -1010,18 +1010,33 @@ submission_api_config() {
 
 submission_api_request() {
     local method=$1 url=$2 output=$3 token=${4-} body=${5-} content_type=${6-application/json}
-    local attempt code delay
-    local -a args=(--silent --show-error --connect-timeout 10 --max-time 30 --request "$method" --header 'Accept: application/json')
+    local attempt code delay retry_after headers retry_epoch now_epoch
+    mkdir -p -- "$CONFIG_DIR"
+    headers=$(mktemp "$CONFIG_DIR/.submission-headers.XXXXXX") || return 1
+    local -a args=(--silent --show-error --connect-timeout 10 --max-time 30 --request "$method" --header 'Accept: application/json' --dump-header "$headers")
     [[ -z $token ]] || args+=(--header "Authorization: Bearer $token")
     [[ -z $body ]] || args+=(--header "Content-Type: $content_type" --data-binary "@$body")
     for attempt in 0 1 2 3; do
+        : > "$headers"
         code=$(curl "${args[@]}" --output "$output" --write-out '%{http_code}' "$url") || code=000
-        if [[ $code =~ ^2[0-9][0-9]$ ]]; then SUBMISSION_HTTP_STATUS=$code; return 0; fi
+        if [[ $code =~ ^2[0-9][0-9]$ ]]; then rm -f -- "$headers"; SUBMISSION_HTTP_STATUS=$code; return 0; fi
         if [[ $code != 000 && $code != 429 && ! $code =~ ^5[0-9][0-9]$ ]]; then break; fi
         ((attempt < 3)) || break
         delay=$((1 << (attempt + 1)))
+        retry_after=$(awk 'tolower($0) ~ /^retry-after:/ { sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); value=$0 } END { print value }' "$headers")
+        if [[ $retry_after =~ ^[0-9]+$ ]]; then
+            if (("${#retry_after}" > 3)); then break; fi
+            delay=$((10#$retry_after))
+        elif [[ -n $retry_after ]]; then
+            retry_epoch=$(date -u -d "$retry_after" +%s 2>/dev/null) || retry_epoch=$(date -j -u -f '%a, %d %b %Y %T %Z' "$retry_after" +%s 2>/dev/null) || retry_epoch=''
+            if [[ $retry_epoch =~ ^[0-9]+$ ]]; then
+                now_epoch=$(date -u +%s); delay=$((retry_epoch - now_epoch)); ((delay >= 0)) || delay=0
+            fi
+        fi
+        ((delay <= 120)) || break
         sleep "$delay"
     done
+    rm -f -- "$headers"
     SUBMISSION_HTTP_STATUS=$code
     fail "Submission service request failed (HTTP $code). The local report was preserved."
     return 1
@@ -1033,8 +1048,8 @@ open_submission_url() {
 }
 
 save_submission_receipt() {
-    local receipt_id=$1 receipt_token=$2 kind=$3 report_id=$4 file_hash=$5 payload_hash=$6 status=$7 received_at=$8 public_url=${9-}
-    local directory path temporary
+    local -h receipt_id=$1 receipt_token=$2 kind=$3 report_id=$4 file_hash=$5 payload_hash=$6 status=$7 received_at=$8 public_url=${9-}
+    local -h directory path temporary
     directory=$CONFIG_DIR/private/submission-receipts
     path=$directory/$receipt_id.private-receipt.json
     mkdir -p -- "$directory"
@@ -1048,6 +1063,7 @@ save_submission_receipt() {
         json_quote "$kind"; printf '  "kind": %s,\n' "$REPLY"
         json_quote "$report_id"; printf '  "report_id": %s,\n' "$REPLY"
         json_quote "$file_hash"; printf '  "file_sha256": %s,\n' "$REPLY"
+        json_quote "${10-$file_hash}"; printf '  "submitted_file_sha256": %s,\n' "$REPLY"
         json_quote "$payload_hash"; printf '  "payload_sha256": %s,\n' "$REPLY"
         json_quote "$status"; printf '  "status": %s,\n' "$REPLY"
         json_quote "$received_at"; printf '  "received_at": %s,\n' "$REPLY"
@@ -1058,9 +1074,35 @@ save_submission_receipt() {
     REPLY=$path
 }
 
+submission_summary_json() {
+    local -h path=$1 line value count=0
+    printf '['
+    while IFS= read -r line || [[ -n $line ]]; do
+        case $line in
+            '-----BEGIN MOE4ALL PAYLOAD-----') break ;;
+            summary-[0-9][0-9][0-9]:\ *)
+                value=${line#*: }; value=${value%$'\r'}
+                (("${#value}" <= 500)) || continue
+                ((count == 0)) || printf ','
+                json_quote "$value"; printf '%s' "$REPLY"
+                count=$((count + 1)); ((count < 8)) || break
+                ;;
+        esac
+    done < "$path"
+    printf ']'
+}
+
+open_submission_receipt() {
+    local receipt_id=$1 receipt_token=$2
+    [[ $receipt_id =~ ^rc_[A-Za-z0-9_-]+$ && $receipt_token =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    if ! open_submission_url "$SUBMISSION_SITE_ORIGIN/community/index.html#receipt=$receipt_id&token=$receipt_token"; then
+        printf '未能打开回执页；可在网站“我的回执”导入本机私密回执文件。\nCould not open the receipt page; import the saved private receipt on the website.\n' >&2
+    fi
+}
+
 website_submission_upload() {
-    local path=$1 kind=$2 extension=.m4b size file_hash report_id response request
-    local session_id session_token verification_url state='' receipt_id receipt_token payload_hash status received_at public_url response_hash response_size count
+    local -h path=$1 kind=$2 extension=.m4b size file_hash report_id response request
+    local -h session_id session_token verification_url state='' receipt_id receipt_token payload_hash status received_at public_url response_hash response_size count original_hash summary_json
     [[ $kind != error ]] || extension=.m4e
     [[ -f $path && $path == *$extension ]] || { fail "Submission file is missing or does not match $kind."; return 1; }
     "$BINARY" submission verify "$path" >/dev/null || { fail 'Local submission verification failed; nothing was uploaded.'; return 1; }
@@ -1078,7 +1120,8 @@ website_submission_upload() {
     json_quote "$kind"; local q_kind=$REPLY
     json_quote "$report_id"; local q_id=$REPLY
     json_quote "$file_hash"; local q_hash=$REPLY
-    printf '{"kind":%s,"report_id":%s,"file_sha256":%s,"size_bytes":%s}\n' "$q_kind" "$q_id" "$q_hash" "$size" > "$request"
+    summary_json=$(submission_summary_json "$path")
+    printf '{"kind":%s,"report_id":%s,"file_sha256":%s,"size_bytes":%s,"summary":%s}\n' "$q_kind" "$q_id" "$q_hash" "$size" "$summary_json" > "$request"
     printf '\n正在创建安全上传会话 / Creating a secure upload session...\n'
     if ! submission_api_request POST "$SUBMISSION_API_BASE/upload-sessions" "$response" '' "$request"; then rm -f -- "$request" "$response"; return 1; fi
     if ! json_load "$response"; then rm -f -- "$request" "$response"; fail 'Submission service returned invalid JSON.'; return 1; fi
@@ -1117,7 +1160,10 @@ website_submission_upload() {
     json_get '["receipt_token"]'; receipt_token=$REPLY; [[ -n $receipt_token ]] || { rm -f -- "$request" "$response"; return 1; }
     json_get '["kind"]'; [[ $REPLY == "$kind" ]] || { rm -f -- "$request" "$response"; return 1; }
     json_get '["report_id"]'; [[ $REPLY == "$report_id" ]] || { rm -f -- "$request" "$response"; return 1; }
-    json_get '["file_sha256"]'; response_hash=$REPLY; [[ $response_hash == "$file_hash" ]] || { rm -f -- "$request" "$response"; return 1; }
+    json_get '["file_sha256"]'; original_hash=$REPLY; response_hash=$REPLY;
+    local submitted_path='["submitted_file_sha256"]'
+    if [[ -v "J[$submitted_path]" ]]; then json_get '["submitted_file_sha256"]'; response_hash=$REPLY; fi
+    [[ $response_hash == "$file_hash" ]] || { rm -f -- "$request" "$response"; return 1; }
     json_get '["payload_sha256"]'; payload_hash=$REPLY; [[ $payload_hash =~ ^[0-9a-f]{64}$ ]] || { rm -f -- "$request" "$response"; return 1; }
     json_get '["status"]'; status=$REPLY
     case $status in forwarding|pending_review|published|rejected|delivery_failed) ;; *) rm -f -- "$request" "$response"; fail "Unknown receipt status: $status"; return 1 ;; esac
@@ -1125,25 +1171,33 @@ website_submission_upload() {
     public_url=''
     local public_path='["public_url"]'
     if [[ -v "J[$public_path]" && ${J[$public_path]} == \"*\" ]]; then json_get "$public_path"; public_url=$REPLY; fi
-    save_submission_receipt "$receipt_id" "$receipt_token" "$kind" "$report_id" "$file_hash" "$payload_hash" "$status" "$received_at" "$public_url"
+    save_submission_receipt "$receipt_id" "$receipt_token" "$kind" "$report_id" "$original_hash" "$payload_hash" "$status" "$received_at" "$public_url" "$file_hash"
     printf '已收到，状态 / Received, status: %s\n回执 ID / Receipt ID: %s\n私有回执 / Private receipt: %s\n' "$status" "$receipt_id" "$REPLY"
     [[ -z $public_url ]] || printf 'Public URL: %s\n' "$public_url"
+    case $status in
+        delivery_failed) printf '转发已失败，云端正文已清理；请重新导出新报告。Delivery failed; export a new report to try again.\n' >&2 ;;
+        rejected) printf '该报告 PR 已退回。The report PR was closed without merging.\n' >&2 ;;
+    esac
+    open_submission_receipt "$receipt_id" "$receipt_token"
     rm -f -- "$request" "$response"
 }
 
-gh_benchmark_upload() {
-    local path=$1 login upstream=Headmaster218/MoE4All fork month report_id branch base_sha relative request content pr_url
+gh_submission_upload() {
+    local -h path=$1 kind=$2 login upstream=Headmaster218/MoE4All fork month report_id branch base_sha relative request content pr_url file_hash existing
     command -v gh >/dev/null 2>&1 || return 1
     gh auth status --hostname github.com >/dev/null 2>&1 || return 1
+    "$BINARY" submission verify "$path" >/dev/null || return 1
     login=$(gh api user --jq .login 2>/dev/null) || return 1
     [[ $login =~ ^[A-Za-z0-9-]+$ ]] || return 1
+    submission_header "$path" kind; [[ $REPLY == "$kind" ]] || return 1
     submission_header "$path" id; report_id=$REPLY
     submission_header "$path" created-at; month=${REPLY:0:7}
     [[ $month =~ ^[0-9]{4}-[0-9]{2}$ ]] || return 1
     fork=$login/MoE4All
-    relative=benchmark-database/v1/$month/${path:t}
+    relative=$kind-database/v1/$month/${path##*/}
     printf '\nGitHub: %s\n目标 / Target: %s/%s\n' "$login" "$upstream" "$relative"
-    yes '现在创建分支和 benchmark PR？/ Create the branch and benchmark PR now?' true
+    printf 'PR 创建后报告即公开；不创建 Issue，不自动合并。\nThe report becomes public when the PR is created; no Issue or automatic merge.\n'
+    yes '现在创建分支和报告 PR？/ Create the branch and report PR now?' true
     [[ $REPLY == true ]] || return 0
     if ! gh api "repos/$fork" >/dev/null 2>&1; then
         gh repo fork "$upstream" --clone=false --remote=false >/dev/null || return 1
@@ -1151,27 +1205,40 @@ gh_benchmark_upload() {
         for attempt in {1..15}; do sleep 2; if gh api "repos/$fork" >/dev/null 2>&1; then ready=true; break; fi; done
         [[ $ready == true ]] || return 1
     fi
-    base_sha=$(gh api "repos/$fork/git/ref/heads/main" --jq .object.sha 2>/dev/null) || return 1
-    branch=benchmark/$login-$report_id
-    gh api --method POST "repos/$fork/git/refs" -f "ref=refs/heads/$branch" -f "sha=$base_sha" >/dev/null || return 1
+    base_sha=$(gh api "repos/$upstream/git/ref/heads/main" --jq .object.sha 2>/dev/null) || return 1
+    [[ $base_sha =~ ^[a-f0-9]{40}$ ]] || return 1
+    file_sha256 "$path"; file_hash=$REPLY
+    branch=community/$kind/$file_hash
+    if ! gh api --method POST "repos/$fork/git/refs" -f "ref=refs/heads/$branch" -f "sha=$base_sha" >/dev/null 2>&1; then
+        gh api "repos/$fork/git/ref/heads/$branch" >/dev/null 2>&1 || return 1
+    fi
     mkdir -p -- "$CONFIG_DIR"
-    request=$(mktemp "$CONFIG_DIR/.github-benchmark.XXXXXX")
+    request=$(mktemp "$CONFIG_DIR/.github-submission.XXXXXX")
     content=$(base64 < "$path" | tr -d '\r\n') || { rm -f -- "$request"; return 1; }
-    json_quote "bench: add $report_id"; local q_message=$REPLY
+    json_quote "$kind: add $report_id"; local q_message=$REPLY
     json_quote "$content"; local q_content=$REPLY
     json_quote "$branch"; local q_branch=$REPLY
     printf '{"message":%s,"content":%s,"branch":%s}\n' "$q_message" "$q_content" "$q_branch" > "$request"
-    if ! gh api --method PUT "repos/$fork/contents/$relative" --input "$request" >/dev/null; then rm -f -- "$request"; return 1; fi
+    if ! gh api --method PUT "repos/$fork/contents/$relative" --input "$request" >/dev/null 2>&1; then
+        existing=$(gh api "repos/$fork/contents/$relative?ref=$branch" --jq .content 2>/dev/null | tr -d '\r\n') || { rm -f -- "$request"; return 1; }
+        if [[ $existing != "$content" ]]; then rm -f -- "$request"; fail 'Existing report differs; nothing was overwritten.'; return 1; fi
+    fi
     rm -f -- "$request"
-    pr_url=$(gh pr create --repo "$upstream" --base main --head "$login:$branch" --title "bench: add $report_id" --body 'Automated benchmark result generated by the MoE4All launch wizard.' 2>/dev/null) || return 1
-    printf 'PR 已创建 / PR created: %s\n' "$pr_url"
+    pr_url=$(gh pr create --repo "$upstream" --base main --head "$login:$branch" --title "$kind: add $report_id" --body 'User-consented public MoE4All report. Awaiting maintainer review; no automatic merge. Format validation is not an independent reproduction.' 2>/dev/null) ||
+        pr_url=$(gh pr list --repo "$upstream" --head "$login:$branch" --state all --json url --jq '.[0].url // empty' 2>/dev/null) || return 1
+    [[ $pr_url =~ ^https://github.com/Headmaster218/MoE4All/pull/[0-9]+$ ]] || return 1
+    printf 'PR 已创建或已存在 / PR created or already exists: %s\n' "$pr_url"
 }
 
-offer_benchmark_upload() {
-    local path=$1 has_github gh_authenticated=false authorize=false
-    yes '愿意上传这份匿名 benchmark 结果吗？/ Upload this anonymous benchmark result?' "${S[benchmark_upload]}"
-    S[benchmark_upload]=$REPLY; save_state
-    [[ $REPLY == true ]] || return 0
+gh_benchmark_upload() { gh_submission_upload "$1" benchmark; }
+
+offer_submission_upload() {
+    local -h path=$1 kind=$2 consented=${3-false} has_github gh_authenticated=false authorize=false
+    if [[ $consented != true ]]; then
+        yes '愿意公开提交这份报告吗？/ Submit this report publicly?' "${S[benchmark_upload]}"
+        S[benchmark_upload]=$REPLY; save_state
+        [[ $REPLY == true ]] || return 0
+    fi
     yes '你有 GitHub 账号吗？/ Do you have a GitHub account?' "${S[benchmark_upload_has_github]}"
     has_github=$REPLY; S[benchmark_upload_has_github]=$has_github; save_state
     if [[ $has_github == true ]] && command -v gh >/dev/null 2>&1; then
@@ -1184,14 +1251,16 @@ offer_benchmark_upload() {
         fi
     fi
     if [[ $gh_authenticated == true ]]; then
-        if gh_benchmark_upload "$path"; then return 0; fi
+        if gh_submission_upload "$path" "$kind"; then return 0; fi
         printf 'GitHub 直传失败，改用网站中转。/ Direct GitHub upload failed; using the website relay.\n' >&2
     elif [[ $has_github == true ]]; then
         printf '没有可用的已登录 gh；不安装额外工具，改用网站中转。\n'
         printf 'No authenticated gh CLI is available; using the website relay without installing another tool.\n'
     fi
-    website_submission_upload "$path" benchmark
+    website_submission_upload "$path" "$kind"
 }
+
+offer_benchmark_upload() { offer_submission_upload "$1" benchmark; }
 
 pack_manual_benchmark() {
     local raw_json=$1 payload output id created engine_version model_name model_size context_tokens avg result_path avg_path='[0,"avg_ts"]'
@@ -1249,7 +1318,7 @@ read_problem_description() {
 }
 
 complete_error_report() {
-    local source=${1-} description_file output path; local -a report_args
+    local -h source=${1-} description_file output path; local -a report_args
     read_problem_description || { printf '已取消；现有诊断文件未删除。Cancelled; existing diagnostics were not deleted.\n'; return 0; }
     mkdir -p -- "$CONFIG_DIR"
     description_file=$(mktemp "$CONFIG_DIR/.error-description.XXXXXX")
@@ -1263,10 +1332,10 @@ complete_error_report() {
     printf '%s\n' "$output"
     path=$(printf '%s\n' "$output" | sed -n 's/^MOE4ALL_SUBMISSION_PATH=//p' | tail -n 1)
     [[ -n $path ]] || { fail 'The engine did not return an error-report path.'; return 1; }
-    yes '愿意上传这份匿名错误报告吗？/ Upload this anonymous error report?' "${S[error_upload]}"; S[error_upload]=$REPLY
+    yes '愿意公开提交这份错误报告吗？/ Submit this error report publicly?' "${S[error_upload]}"; S[error_upload]=$REPLY
     save_state
     if [[ $REPLY == true ]]; then
-        website_submission_upload "$path" error || printf '上传未完成；本地报告仍保存在 %s。Upload did not complete; the local report remains there.\n' "$path" >&2
+        offer_submission_upload "$path" error true || printf '上传未完成；本地报告仍保存在 %s。Upload did not complete; the local report remains there.\n' "$path" >&2
     fi
 }
 
