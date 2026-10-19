@@ -565,7 +565,7 @@ defaults() {
         [server_vision]=false [vision_projector]='' [server_embedding]=false [embedding_model]='' [embedding_idle_timeout]=300
         [mtp_enabled]=false [mtp_model]='' [mtp_verify_tokens]=4 [cpu_miss_enabled]=false [cpu_miss_max]=1 [cpu_miss_cores]=''
         [bench_kind]=manual [bench_parallel]=1 [manual_bench_kind]=decode [prompt_tokens]=6144 [gen_tokens]=512 [depth_mode]=none [depth_tokens]=0 [reps]=1 [json_output]=false
-        [custom_sets]='' [auto_overrides]='' [benchmark_upload]=false [benchmark_upload_has_github]=true [error_upload]=false
+        [custom_sets]='' [auto_overrides]='' [benchmark_upload]=false [benchmark_upload_has_github]=true [benchmark_upload_gh_auth]=true [error_upload]=false
     )
     DEFAULTS=(); for key in "${(@k)S[@]}"; do DEFAULTS[$key]=${S[$key]}; done
 }
@@ -1018,7 +1018,7 @@ submission_api_request() {
     [[ -z $body ]] || args+=(--header "Content-Type: $content_type" --data-binary "@$body")
     for attempt in 0 1 2 3; do
         : > "$headers"
-        code=$(curl "${args[@]}" --output "$output" --write-out '%{http_code}' "$url") || code=000
+        code=$(submission_curl "${args[@]}" --output "$output" --write-out '%{http_code}' "$url") || code=000
         if [[ $code =~ ^2[0-9][0-9]$ ]]; then rm -f -- "$headers"; SUBMISSION_HTTP_STATUS=$code; return 0; fi
         if [[ $code != 000 && $code != 429 && ! $code =~ ^5[0-9][0-9]$ ]]; then break; fi
         ((attempt < 3)) || break
@@ -1120,24 +1120,27 @@ submission_proxy_url() {
 
 start_submission_connectivity_probe() {
     local api_base generation proxy=''
+    if [[ -n ${SUBMISSION_CONNECTIVITY_PID-} ]] && kill -0 "$SUBMISSION_CONNECTIVITY_PID" 2>/dev/null; then return 0; fi
     mkdir -p -- "$CONFIG_DIR/private"
     SUBMISSION_CONNECTIVITY_FILE="$CONFIG_DIR/private/submission-connectivity.status"
     generation="$$-$RANDOM-$(date +%s)"
     SUBMISSION_CONNECTIVITY_GENERATION=$generation
     rm -f -- "$SUBMISSION_CONNECTIVITY_FILE"
     submission_proxy_url && proxy=$REPLY
+    SUBMISSION_DETECTED_PROXY=$proxy
     api_base=${MOE4ALL_SUBMISSION_API_BASE:-https://api.moe4all.com/v1}
     api_base=${api_base%/}
     (
         local temp="$CONFIG_DIR/private/.submission-connectivity.$generation" output
         mkdir -p -- "$temp"
         probe_one() {
-            local probe_mode=$1 probe_url=$2 probe_output=$3
+            local probe_mode=$1 probe_url=$2 probe_output=$3 probe_code=000
             if [[ $probe_mode == direct ]]; then
-                curl --silent --show-error --location --output /dev/null --connect-timeout 2 --max-time 5 --noproxy '*' --user-agent 'MoE4All-Wizard/connectivity' "$probe_url" >/dev/null 2>&1
+                probe_code=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --connect-timeout 2 --max-time 5 --noproxy '*' --user-agent 'MoE4All-Wizard/connectivity' "$probe_url" 2>/dev/null) || probe_code=000
             else
-                curl --silent --show-error --location --output /dev/null --connect-timeout 2 --max-time 5 --noproxy '' --proxy "$proxy" --user-agent 'MoE4All-Wizard/connectivity' "$probe_url" >/dev/null 2>&1
-            fi && printf true > "$probe_output" || printf false > "$probe_output"
+                probe_code=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --connect-timeout 2 --max-time 5 --noproxy '' --proxy "$proxy" --user-agent 'MoE4All-Wizard/connectivity' "$probe_url" 2>/dev/null) || probe_code=000
+            fi
+            case $probe_code in 407) printf false ;; [234][0-9][0-9]) printf true ;; *) printf false ;; esac > "$probe_output"
         }
         if command -v curl >/dev/null 2>&1; then
             probe_one direct 'https://api.github.com/rate_limit' "$temp/github-direct" &
@@ -1148,7 +1151,7 @@ start_submission_connectivity_probe() {
             fi
             wait
         fi
-        local github=false cloudflare=false proxy_state=not-configured
+        local github=false cloudflare=false proxy_state=not-configured github_route=default cloudflare_route=default
         [[ $(cat "$temp/github-direct" 2>/dev/null || true) == true ]] && github=true
         [[ $(cat "$temp/cloudflare-direct" 2>/dev/null || true) == true ]] && cloudflare=true
         if [[ -n $proxy ]]; then
@@ -1157,8 +1160,12 @@ start_submission_connectivity_probe() {
             [[ $(cat "$temp/github-proxy" 2>/dev/null || true) == true ]] && github=true
             [[ $(cat "$temp/cloudflare-proxy" 2>/dev/null || true) == true ]] && cloudflare=true
         fi
+        if [[ $(cat "$temp/github-direct" 2>/dev/null || true) == true ]]; then github_route=direct
+        elif [[ $(cat "$temp/github-proxy" 2>/dev/null || true) == true ]]; then github_route=proxy; fi
+        if [[ $(cat "$temp/cloudflare-direct" 2>/dev/null || true) == true ]]; then cloudflare_route=direct
+        elif [[ $(cat "$temp/cloudflare-proxy" 2>/dev/null || true) == true ]]; then cloudflare_route=proxy; fi
         output="$SUBMISSION_CONNECTIVITY_FILE.new-$generation"
-        printf 'generation=%s\ngithub=%s\ncloudflare=%s\nproxy=%s\n' "$generation" "$github" "$cloudflare" "$proxy_state" > "$output"
+        printf 'generation=%s\ngithub=%s\ncloudflare=%s\nproxy=%s\ngithub-route=%s\ncloudflare-route=%s\n' "$generation" "$github" "$cloudflare" "$proxy_state" "$github_route" "$cloudflare_route" > "$output"
         mv -f -- "$output" "$SUBMISSION_CONNECTIVITY_FILE"
         rm -rf -- "$temp"
     ) >/dev/null 2>&1 &
@@ -1167,11 +1174,12 @@ start_submission_connectivity_probe() {
 
 submission_connectivity_snapshot() {
     local key value github=pending cloudflare=pending proxy=pending generation=''
+    SUBMISSION_GITHUB_ROUTE=default; SUBMISSION_CLOUDFLARE_ROUTE=default
     if [[ -f ${SUBMISSION_CONNECTIVITY_FILE-} ]]; then
         while IFS='=' read -r key value; do
-            case $key in generation) generation=$value ;; github) github=$value ;; cloudflare) cloudflare=$value ;; proxy) proxy=$value ;; esac
+            case $key in generation) generation=$value ;; github) github=$value ;; cloudflare) cloudflare=$value ;; proxy) proxy=$value ;; github-route) SUBMISSION_GITHUB_ROUTE=$value ;; cloudflare-route) SUBMISSION_CLOUDFLARE_ROUTE=$value ;; esac
         done < "$SUBMISSION_CONNECTIVITY_FILE"
-        if [[ $generation != ${SUBMISSION_CONNECTIVITY_GENERATION-} ]]; then github=pending; cloudflare=pending; proxy=pending; fi
+        if [[ $generation != ${SUBMISSION_CONNECTIVITY_GENERATION-} ]]; then github=pending; cloudflare=pending; proxy=pending; SUBMISSION_GITHUB_ROUTE=default; SUBMISSION_CLOUDFLARE_ROUTE=default; fi
     fi
     SUBMISSION_GITHUB_CONNECTIVITY=$github
     SUBMISSION_CLOUDFLARE_CONNECTIVITY=$cloudflare
@@ -1180,24 +1188,44 @@ submission_connectivity_snapshot() {
 
 pending_submission_dir() { REPLY="$CONFIG_DIR/private/pending-submissions"; }
 
+submission_gh() (
+    case ${SUBMISSION_GITHUB_ROUTE-default} in
+        direct) unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy; export NO_PROXY='*' no_proxy='*' ;;
+        proxy) export HTTPS_PROXY="$SUBMISSION_DETECTED_PROXY" https_proxy="$SUBMISSION_DETECTED_PROXY" NO_PROXY='' no_proxy='' ;;
+    esac
+    gh "$@"
+)
+
+submission_curl() {
+    case ${SUBMISSION_CLOUDFLARE_ROUTE-default} in
+        direct) curl --noproxy '*' "$@" ;;
+        proxy) curl --noproxy '' --proxy "$SUBMISSION_DETECTED_PROXY" "$@" ;;
+        *) curl "$@" ;;
+    esac
+}
+
 queue_pending_submission() {
-    local path=$1 kind=$2 directory destination temporary
+    local -h path=$1 kind=$2 directory destination temporary
     "$BINARY" submission verify "$path" >/dev/null 2>&1 || return 1
     pending_submission_dir; directory=$REPLY
     mkdir -p -- "$directory"; chmod 700 "$CONFIG_DIR/private" "$directory" 2>/dev/null || true
     destination="$directory/${path##*/}"
     if [[ $path != "$destination" ]]; then
+        if [[ -f $destination ]] && ! cmp -s "$path" "$destination"; then
+            fail '待发目录已有同 ID 的不同报告，已保留原件。A different report with this ID is already queued.'
+            return 1
+        fi
         temporary="$destination.moe4all-new-$$-$RANDOM"
         cp -- "$path" "$temporary" || return 1
         chmod 600 "$temporary" 2>/dev/null || true
         mv -f -- "$temporary" "$destination"
     fi
-    printf '提交暂存，待下次启动重试 / Submission saved for a later retry: %s\n' "$destination" >&2
+    [[ ${3-false} == true ]] || printf '提交暂存，待下次启动重试 / Submission saved for a later retry: %s\n' "$destination" >&2
 }
 
 retry_pending_submissions() {
     [[ ${PENDING_SUBMISSION_PROMPTED-false} != true ]] || return 0
-    pending_submission_dir; local directory=$REPLY path kind
+    pending_submission_dir; local -h directory=$REPLY path kind
     local -a pending=()
     [[ -d $directory ]] || { PENDING_SUBMISSION_PROMPTED=true; return 0; }
     while IFS= read -r path; do pending+=("$path"); done < <(find "$directory" -type f \( -name '*.m4b' -o -name '*.m4e' \) -print 2>/dev/null | sort)
@@ -1208,6 +1236,7 @@ retry_pending_submissions() {
         return 0
     fi
     if [[ $SUBMISSION_GITHUB_CONNECTIVITY != true && $SUBMISSION_CLOUDFLARE_CONNECTIVITY != true ]]; then return 0; fi
+    if [[ ${S[benchmark_upload_has_github]} != true && $SUBMISSION_CLOUDFLARE_CONNECTIVITY != true ]]; then return 0; fi
     PENDING_SUBMISSION_PROMPTED=true
     yes "发现 ${#pending[@]} 份待发报告，当前重试？/ Found ${#pending[@]} pending report(s). Retry now?" true
     [[ $REPLY == true ]] || return 0
@@ -1266,7 +1295,7 @@ website_submission_upload() {
         json_get '["state"]'; state=$REPLY
         case $state in
             ready|uploaded) break ;;
-            cancelled) rm -f -- "$request" "$response"; printf 'Upload cancelled; the local report was preserved.\n'; return 1 ;;
+            cancelled) rm -f -- "$request" "$response"; printf 'Upload cancelled; the local report was preserved.\n'; return 2 ;;
             awaiting_verification) ;;
             *) rm -f -- "$request" "$response"; fail "Unknown upload session state: $state"; return 1 ;;
         esac
@@ -1303,9 +1332,9 @@ website_submission_upload() {
 gh_submission_upload() {
     local -h path=$1 kind=$2 login upstream=Headmaster218/MoE4All fork month report_id branch base_sha relative request content pr_url file_hash existing
     command -v gh >/dev/null 2>&1 || return 1
-    gh auth status --hostname github.com >/dev/null 2>&1 || return 1
+    submission_gh auth status --hostname github.com >/dev/null 2>&1 || return 1
     "$BINARY" submission verify "$path" >/dev/null || return 1
-    login=$(gh api user --jq .login 2>/dev/null) || return 1
+    login=$(submission_gh api user --jq .login 2>/dev/null) || return 1
     [[ $login =~ ^[A-Za-z0-9-]+$ ]] || return 1
     submission_header "$path" kind; [[ $REPLY == "$kind" ]] || return 1
     submission_header "$path" id; report_id=$REPLY
@@ -1316,19 +1345,19 @@ gh_submission_upload() {
     printf '\nGitHub: %s\n目标 / Target: %s/%s\n' "$login" "$upstream" "$relative"
     printf 'PR 创建后报告即公开；不创建 Issue，不自动合并。\nThe report becomes public when the PR is created; no Issue or automatic merge.\n'
     yes '现在创建分支和报告 PR？/ Create the branch and report PR now?' true
-    [[ $REPLY == true ]] || return 0
-    if ! gh api "repos/$fork" >/dev/null 2>&1; then
-        gh repo fork "$upstream" --clone=false --remote=false >/dev/null || return 1
+    [[ $REPLY == true ]] || return 2
+    if ! submission_gh api "repos/$fork" >/dev/null 2>&1; then
+        submission_gh repo fork "$upstream" --clone=false --remote=false >/dev/null || return 1
         local ready=false attempt
-        for attempt in {1..15}; do sleep 2; if gh api "repos/$fork" >/dev/null 2>&1; then ready=true; break; fi; done
+        for attempt in {1..15}; do sleep 2; if submission_gh api "repos/$fork" >/dev/null 2>&1; then ready=true; break; fi; done
         [[ $ready == true ]] || return 1
     fi
-    base_sha=$(gh api "repos/$upstream/git/ref/heads/main" --jq .object.sha 2>/dev/null) || return 1
+    base_sha=$(submission_gh api "repos/$upstream/git/ref/heads/main" --jq .object.sha 2>/dev/null) || return 1
     [[ $base_sha =~ ^[a-f0-9]{40}$ ]] || return 1
     file_sha256 "$path"; file_hash=$REPLY
     branch=community/$kind/$file_hash
-    if ! gh api --method POST "repos/$fork/git/refs" -f "ref=refs/heads/$branch" -f "sha=$base_sha" >/dev/null 2>&1; then
-        gh api "repos/$fork/git/ref/heads/$branch" >/dev/null 2>&1 || return 1
+    if ! submission_gh api --method POST "repos/$fork/git/refs" -f "ref=refs/heads/$branch" -f "sha=$base_sha" >/dev/null 2>&1; then
+        submission_gh api "repos/$fork/git/ref/heads/$branch" >/dev/null 2>&1 || return 1
     fi
     mkdir -p -- "$CONFIG_DIR"
     request=$(mktemp "$CONFIG_DIR/.github-submission.XXXXXX")
@@ -1337,13 +1366,13 @@ gh_submission_upload() {
     json_quote "$content"; local q_content=$REPLY
     json_quote "$branch"; local q_branch=$REPLY
     printf '{"message":%s,"content":%s,"branch":%s}\n' "$q_message" "$q_content" "$q_branch" > "$request"
-    if ! gh api --method PUT "repos/$fork/contents/$relative" --input "$request" >/dev/null 2>&1; then
-        existing=$(gh api "repos/$fork/contents/$relative?ref=$branch" --jq .content 2>/dev/null | tr -d '\r\n') || { rm -f -- "$request"; return 1; }
+    if ! submission_gh api --method PUT "repos/$fork/contents/$relative" --input "$request" >/dev/null 2>&1; then
+        existing=$(submission_gh api "repos/$fork/contents/$relative?ref=$branch" --jq .content 2>/dev/null | tr -d '\r\n') || { rm -f -- "$request"; return 1; }
         if [[ $existing != "$content" ]]; then rm -f -- "$request"; fail 'Existing report differs; nothing was overwritten.'; return 1; fi
     fi
     rm -f -- "$request"
-    pr_url=$(gh pr create --repo "$upstream" --base main --head "$login:$branch" --title "$kind: add $report_id" --body 'User-consented public MoE4All report. Awaiting maintainer review; no automatic merge. Format validation is not an independent reproduction.' 2>/dev/null) ||
-        pr_url=$(gh pr list --repo "$upstream" --head "$login:$branch" --state all --json url --jq '.[0].url // empty' 2>/dev/null) || return 1
+    pr_url=$(submission_gh pr create --repo "$upstream" --base main --head "$login:$branch" --title "$kind: add $report_id" --body 'User-consented public MoE4All report. Awaiting maintainer review; no automatic merge. Format validation is not an independent reproduction.' 2>/dev/null) ||
+        pr_url=$(submission_gh pr list --repo "$upstream" --head "$login:$branch" --state all --json url --jq '.[0].url // empty' 2>/dev/null) || return 1
     [[ $pr_url =~ ^https://github.com/Headmaster218/MoE4All/pull/[0-9]+$ ]] || return 1
     printf 'PR 已创建或已存在 / PR created or already exists: %s\n' "$pr_url"
 }
@@ -1357,21 +1386,24 @@ offer_submission_upload() {
         S[benchmark_upload]=$REPLY; save_state
         [[ $REPLY == true ]] || return 0
     fi
+    queue_pending_submission "$path" "$kind" true || return 1
+    local pending_path="$CONFIG_DIR/private/pending-submissions/${path##*/}" upload_status=1
     yes '你有 GitHub 账号吗？/ Do you have a GitHub account?' "${S[benchmark_upload_has_github]}"
     has_github=$REPLY; S[benchmark_upload_has_github]=$has_github; save_state
     submission_connectivity_snapshot
     printf '提交连通性 / Submission connectivity: GitHub=%s, Cloudflare=%s, proxy=%s\n' "$SUBMISSION_GITHUB_CONNECTIVITY" "$SUBMISSION_CLOUDFLARE_CONNECTIVITY" "$SUBMISSION_PROXY_CONNECTIVITY"
     if [[ $has_github == true && $SUBMISSION_GITHUB_CONNECTIVITY != false ]] && command -v gh >/dev/null 2>&1; then
-        if gh auth status --hostname github.com >/dev/null 2>&1; then
+        if submission_gh auth status --hostname github.com >/dev/null 2>&1; then
             gh_authenticated=true
         else
-            yes 'gh 尚未登录。现在通过浏览器授权？/ gh is not signed in. Authorize in the browser now?' false
-            authorize=$REPLY
-            if [[ $authorize == true ]] && gh auth login --hostname github.com --git-protocol https --web; then gh_authenticated=true; fi
+            yes 'gh 尚未登录。现在通过浏览器授权？/ gh is not signed in. Authorize in the browser now?' "${S[benchmark_upload_gh_auth]}"
+            authorize=$REPLY; S[benchmark_upload_gh_auth]=$authorize; save_state
+            if [[ $authorize == true ]] && submission_gh auth login --hostname github.com --git-protocol https --web; then gh_authenticated=true; fi
         fi
     fi
     if [[ $gh_authenticated == true ]]; then
-        if gh_submission_upload "$path" "$kind"; then return 0; fi
+        if gh_submission_upload "$path" "$kind"; then rm -f -- "$pending_path"; return 0; else upload_status=$?; fi
+        [[ $upload_status != 2 ]] || return 1
         printf 'GitHub 直传失败，改用网站中转。/ Direct GitHub upload failed; using the website relay.\n' >&2
     elif [[ $has_github == true && $SUBMISSION_GITHUB_CONNECTIVITY == false ]]; then
         printf 'GitHub 当前不可达，改用网站中转。GitHub is currently unreachable; using the website relay.\n' >&2
@@ -1379,7 +1411,9 @@ offer_submission_upload() {
         printf '没有可用的已登录 gh；不安装额外工具，改用网站中转。\n'
         printf 'No authenticated gh CLI is available; using the website relay without installing another tool.\n'
     fi
-    if [[ $SUBMISSION_CLOUDFLARE_CONNECTIVITY != false ]] && website_submission_upload "$path" "$kind"; then return 0; fi
+    if [[ $SUBMISSION_CLOUDFLARE_CONNECTIVITY != false ]]; then
+        if website_submission_upload "$path" "$kind"; then rm -f -- "$pending_path"; return 0; fi
+    fi
     [[ $SUBMISSION_CLOUDFLARE_CONNECTIVITY != false ]] || printf 'Cloudflare 当前不可达。Cloudflare is currently unreachable.\n' >&2
     queue_pending_submission "$path" "$kind" || printf '无法暂存待发报告。Could not save the pending report.\n' >&2
     return 1
@@ -1395,7 +1429,7 @@ pack_manual_benchmark() {
     [[ $avg =~ ^[0-9]+([.][0-9]+)?$ ]] || { fail 'Manual benchmark avg_ts is invalid.'; return 1; }
     created=$(date -u '+%Y-%m-%dT%H:%M:%S.000Z')
     id=$(date -u '+manual-%Y%m%dT%H%M%S.000Z-')$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
-    engine_version=$($BINARY --version 2>/dev/null || true); engine_version=${engine_version##* }
+    engine_version=$("$BINARY" --version 2>/dev/null || true); engine_version=${engine_version##* }
     model_name=${S[model]:t}; model_size=0; [[ ! -f ${S[model]} ]] || model_size=$(wc -c < "${S[model]}")
     context_tokens=${S[depth_tokens]}; [[ ${S[manual_bench_kind]} != prefill ]] || context_tokens=${S[prompt_tokens]}
     payload=$(mktemp "$CONFIG_DIR/.benchmark-payload.XXXXXX")
@@ -1410,7 +1444,7 @@ pack_manual_benchmark() {
     cat > "$payload" <<EOF
 {"schema_version":1,"id":$q_id,"created_at_utc":$q_created,"engine_version":$q_engine,"engine_commit":null,"profile":"manual","model":{"name":$q_model,"storage_bytes":$model_size},"hardware":{"os":"macos","architecture":"$(uname -m)","cpu":{},"ram":{},"gpu":{"configured_device":$q_device}},"configuration":{"benchmark_kind":$q_kind,"prompt_tokens":${S[prompt_tokens]},"decode_tokens":${S[gen_tokens]},"depth_mode":$q_depth,"depth_tokens":${S[depth_tokens]},"repetitions":${S[reps]},"auto_profile":$q_profile},"contexts":[{"requested_context_tokens":$context_tokens,"prefill":null,"decode":[],"manual_result":{"kind":$q_kind,"average_tokens_per_second":$avg},"failures":[]}],"failures":[]}
 EOF
-    if ! output=$($BINARY submission pack-benchmark --input "$payload" --result-dir "$ROOT/benchmark-database" 2>&1); then rm -f -- "$payload"; fail "$output"; return 1; fi
+    if ! output=$("$BINARY" submission pack-benchmark --input "$payload" --result-dir "$ROOT/benchmark-database" 2>&1); then rm -f -- "$payload"; fail "$output"; return 1; fi
     rm -f -- "$payload"
     result_path=$(printf '%s\n' "$output" | sed -n 's/^MOE4ALL_SUBMISSION_PATH=//p' | tail -n 1)
     [[ -n $result_path ]] || { fail 'The engine did not return a benchmark submission path.'; return 1; }
@@ -1921,7 +1955,10 @@ main() {
     [[ -n $BINARY ]] || { fail 'infr not found beside the launcher or under target/release; build infr-cli first.'; return 1; }
     [[ ! -t 0 || $DRY_RUN == true ]] || INTERACTIVE=true
     PENDING_SUBMISSION_PROMPTED=false
-    if [[ $INTERACTIVE == true && $DRY_RUN == false && $HEADLESS == false ]]; then start_submission_connectivity_probe; fi
+    if [[ $INTERACTIVE == true && $DRY_RUN == false && $HEADLESS == false ]]; then
+        pending_submission_dir
+        if [[ -d $REPLY ]] && [[ -n $(find "$REPLY" -type f \( -name '*.m4b' -o -name '*.m4e' \) -print -quit) ]]; then start_submission_connectivity_probe; fi
+    fi
     if [[ -n $UPDATE_MODE ]]; then check_updates "$UPDATE_MODE"; return; fi
     if [[ $INTERACTIVE == true && $SKIP_UPDATE == false && ! ${MOE4ALL_NO_UPDATE_CHECK-} =~ ^(1|true|yes|on)$ ]]; then check_updates --check-update; fi
     if [[ $INTERACTIVE == true && $HEADLESS == false ]]; then
@@ -1953,7 +1990,7 @@ main() {
         absolute "${S[$key]}"; S[$key]=$REPLY
     done
     build_command
-    retry_pending_submissions
+    if [[ $INTERACTIVE == true && $DRY_RUN == false && $HEADLESS == false ]]; then retry_pending_submissions; fi
     printf '\n最终命令 / Final command\n  '; printf '%q ' "${COMMAND[@]}"; printf '\n'
     if [[ ${S[launch_mode]} == serve && -z $api_key ]] && ! loopback "${S[server_addr]}"; then
         printf '警告：当前网络监听地址未启用 API key 鉴权。Warning: network listen address without API-key authentication.\n' >&2

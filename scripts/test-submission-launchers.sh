@@ -11,10 +11,24 @@ fi
 if [[ -n ${ZSH_VERSION-} && -n ${MOE4ALL_ZSH_MODULES-} ]]; then module_path=("$MOE4ALL_ZSH_MODULES"); fi
 work=$(mktemp -d "${TMPDIR:?}/submission-launchers.XXXXXX")
 trap 'rm -rf -- "$work"' EXIT
-ROOT=$work/package; CONFIG_DIR=$work/config; BINARY=$work/engine
+ROOT=$work/package; CONFIG_DIR=$work/config; BINARY="$work/engine with spaces"
 defaults
 mkdir -p "$ROOT" "$CONFIG_DIR"
-printf '#!/bin/sh\nexit 0\n' > "$BINARY"; chmod +x "$BINARY"
+cat > "$BINARY" <<'ENGINE'
+#!/bin/sh
+if [ "$1" = --version ]; then printf 'infr 1.0.3\n'; exit 0; fi
+if [ "$1" = submission ] && [ "$2" = pack-benchmark ]; then
+    shift 2
+    while [ "$#" -gt 0 ]; do
+        case "$1" in --result-dir) result_dir=$2; shift 2 ;; *) shift ;; esac
+    done
+    mkdir -p "$result_dir/v1/2026-10"
+    printf fixture > "$result_dir/v1/2026-10/manual-fixture.m4b"
+    printf 'MOE4ALL_SUBMISSION_PATH=%s/v1/2026-10/manual-fixture.m4b\n' "$result_dir"
+fi
+exit 0
+ENGINE
+chmod +x "$BINARY"
 checks=0
 check() { if ! "$@"; then printf 'Failed: %s\n' "$*" >&2; exit 1; fi; checks=$((checks + 1)); }
 sleep() { printf '%s\n' "$1" >> "$work/sleeps"; }
@@ -76,6 +90,10 @@ for current_kind in benchmark error; do
     check grep -q 'status: forwarding' "$work/upload-output"
 done
 
+yes() { REPLY=false; }
+if gh_submission_upload "$current_file" "$current_kind" > "$work/git-cancel-output"; then exit 1; else cancel_status=$?; fi
+check test "$cancel_status" = 2
+
 offer_mode=github
 gh_submission_upload() { printf '%s' "$2" > "$work/chosen-git-kind"; }
 website_submission_upload() { printf '%s' "$2" > "$work/chosen-web-kind"; }
@@ -106,14 +124,35 @@ retry_pending_submissions
 check test ! -f "$pending_file"
 check grep -q error "$work/retried-web-kind"
 
+gh_submission_upload() { return 2; }
+yes() { REPLY=true; }
+if offer_submission_upload "$current_file" error true > "$work/offer-cancel-output"; then exit 1; fi
+check test -f "$pending_file"
+rm -f -- "$pending_file"
+SUBMISSION_GITHUB_ROUTE=direct
+HTTPS_PROXY=http://127.0.0.1:9
+gh() { [[ -z ${HTTPS_PROXY-} && ${NO_PROXY-} == '*' ]]; }
+check submission_gh auth status
+check test "$HTTPS_PROXY" = http://127.0.0.1:9
+SUBMISSION_GITHUB_ROUTE=proxy; SUBMISSION_DETECTED_PROXY=http://127.0.0.1:12345
+gh() { [[ $HTTPS_PROXY == http://127.0.0.1:12345 && -z $NO_PROXY ]]; }
+check submission_gh auth status
+check test "$HTTPS_PROXY" = http://127.0.0.1:9
+
 unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy
-curl() { [[ $* == *api.github.com/rate_limit* ]]; }
+curl() { [[ $* == *api.github.com/rate_limit* ]] && printf 200; }
 start_submission_connectivity_probe
 wait "$SUBMISSION_CONNECTIVITY_PID"
 submission_connectivity_snapshot
 check test "$SUBMISSION_GITHUB_CONNECTIVITY" = true
 check test "$SUBMISSION_CLOUDFLARE_CONNECTIVITY" = false
 check test "$SUBMISSION_PROXY_CONNECTIVITY" = not-configured
+
+printf '[{"avg_ts":123.4}]' > "$work/manual.json"
+S[model]="$work/model with spaces.gguf"
+pack_manual_benchmark "$work/manual.json" > "$work/manual-output"
+check test -f "$REPLY"
+check grep -q '123.4' "$work/manual-output"
 
 curl() {
     output='' headers=''

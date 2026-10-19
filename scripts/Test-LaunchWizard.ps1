@@ -435,7 +435,27 @@ try {
     $script:Answers.Enqueue('n'); $script:GitRouteUsed = $false; $script:CloudflareRouteUsed = $false
     Assert (-not (Offer-SubmissionUpload -Path $fixtureSubmissionPath -Kind benchmark -ConsentAlreadyGranted)) 'Offline submission should be queued rather than reported as sent'
     Assert ((Test-Path -LiteralPath (Join-Path $pendingSubmissionDir (Split-Path -Leaf $fixtureSubmissionPath))) -and -not $script:GitRouteUsed -and -not $script:CloudflareRouteUsed) 'Offline fallback did not preserve the report without touching either route'
-    Remove-PendingSubmission -Path (Join-Path $pendingSubmissionDir (Split-Path -Leaf $fixtureSubmissionPath))
+    function Get-SubmissionConnectivitySnapshot { return [pscustomobject]@{ Github = 'reachable'; Cloudflare = 'reachable'; ProxyConfigured = $false; Proxy = 'not-configured' } }
+    function Invoke-GhSubmissionUpload { $script:SubmissionUploadCancelled = $true; return $false }
+    $script:CloudflareRouteUsed = $false; $script:Answers.Enqueue('y')
+    Assert (-not (Offer-SubmissionUpload -Path $fixtureSubmissionPath -Kind benchmark -ConsentAlreadyGranted)) 'A cancelled GitHub confirmation must keep the pending submission'
+    Assert (-not $script:CloudflareRouteUsed -and @(Get-PendingSubmissions).Count -eq 1) 'Cancelling the GitHub confirmation fell through to Cloudflare or discarded the report'
+    function Invoke-GhSubmissionUpload { return $true }
+    $script:PendingSubmissionPrompted = $false
+    $script:Answers.Enqueue('y'); $script:Answers.Enqueue('y')
+    Offer-PendingSubmissions
+    Assert (@(Get-PendingSubmissions).Count -eq 0 -and (Test-Path -LiteralPath $fixtureSubmissionPath)) 'Successful retry must remove only the queued copy'
+    $savedProxyValue = [Environment]::GetEnvironmentVariable('HTTPS_PROXY', 'Process')
+    try {
+        [Environment]::SetEnvironmentVariable('HTTPS_PROXY', 'http://127.0.0.1:9', 'Process')
+        $script:SubmissionRouteModes = @{ github = 'direct' }
+        $sawDirect = Invoke-WithSubmissionGithubRoute -Action { return ([string]::IsNullOrEmpty($env:HTTPS_PROXY) -and $env:NO_PROXY -eq '*') }
+        Assert $sawDirect 'GitHub did not use the direct route selected by the probe'
+        Assert ($env:HTTPS_PROXY -eq 'http://127.0.0.1:9') 'GitHub route selection leaked proxy changes into the parent process'
+    } finally {
+        [Environment]::SetEnvironmentVariable('HTTPS_PROXY', $savedProxyValue, 'Process')
+        $script:SubmissionRouteModes = @{}
+    }
     Set-Item Function:Get-SubmissionConnectivitySnapshot $realConnectivitySnapshot
     Set-Item Function:Invoke-GhSubmissionUpload $realGhSubmissionUpload
     Set-Item Function:Invoke-WebsiteSubmissionUpload $realWebsiteSubmissionUpload
@@ -683,9 +703,9 @@ try {
         Assert (Test-Path -LiteralPath $statePath -PathType Leaf) 'Accepted launch or DryRun must save settings'
     }
     $resolvedRoot = [System.IO.Path]::GetFullPath($testRoot)
-    $tempPrefix = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+    $tempPrefix = [System.IO.Path]::GetFullPath((Join-Path (Join-Path $workRoot 'tmp') 'moe4all')).TrimEnd('\') + '\'
     if ($resolvedRoot.StartsWith($tempPrefix, [System.StringComparison]::OrdinalIgnoreCase) -and
-        (Split-Path -Leaf $resolvedRoot) -like 'moe4all-wizard-test-*' -and (Test-Path -LiteralPath $resolvedRoot)) {
+        (Split-Path -Leaf $resolvedRoot) -like 'wizard-test-*' -and (Test-Path -LiteralPath $resolvedRoot)) {
         Remove-Item -LiteralPath $resolvedRoot -Recurse -Force
     }
 }
