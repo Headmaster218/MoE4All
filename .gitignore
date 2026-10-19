@@ -23,6 +23,7 @@ target-prof/
 /kv-sessions/
 /.update/
 /benchmark-data/
+/diagnostics/
 /upstream-research/
 # Preserve local data from the retired resource-matrix harness.
 /artifacts/context-resource-matrix/

@@ -376,6 +376,15 @@ knobs! {
 /// "someone added a knob and forgot the manifest".
 pub const NOT_MIGRATED: &[(&str, &str)] = &[
     (
+        "INFR_DIAGNOSTIC_DIR",
+        "diagnostic bootstrap output path: resolved through config/env.rs before runtime Config \
+         loading, so configuration failures can be recorded; not an inference setting.",
+    ),
+    (
+        "INFR_GIT_COMMIT",
+        "compile-time provenance: option_env! embeds the build commit in reports, not runtime configuration.",
+    ),
+    (
         "INFR_IMAGE_CODEC_DIR",
         "source-build/test override for bundled native decoder discovery; release builds use \
          the executable-relative image-codecs directory, independent of runtime Config.",

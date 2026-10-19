@@ -21,6 +21,7 @@ if ($actual.Physical -lt 1 -or $actual.Preferred -lt 1 -or $actual.Preferred -gt
 Write-Host ("Live CPU topology: physical={0}, preferred={1}, detected={2}" -f $actual.Physical, $actual.Preferred, $actual.Detected)
 
 function Get-CpuMissTopology { return $script:Topology }
+function Get-UpdatedModelHistory { param([string]$SelectedModel) return @() }
 function Read-Host {
     param([string]$Prompt)
     if ($script:Answers.Count -eq 0) { throw "Unexpected prompt: $Prompt" }

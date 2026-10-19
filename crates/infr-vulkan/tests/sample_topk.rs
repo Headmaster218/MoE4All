@@ -150,3 +150,89 @@ fn sample_topk_rows_match_host() {
         assert_eq!(ids[row], expected, "row={row}");
     }
 }
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn non_finite_logits_emit_the_corruption_sentinel() {
+    let be = VulkanBackend::new().unwrap();
+    let (rows, n) = (2usize, 4096usize);
+    let mut logits = vec![-5.0f32; rows * n];
+    logits[17] = 9.0;
+    logits[n + 23] = 10.0;
+    logits[n + 701] = f32::NAN;
+
+    let lb = be
+        .alloc(logits.len() * 4, BufferUsage::Activations)
+        .unwrap();
+    be.upload(lb.as_ref(), bytemuck::cast_slice(&logits))
+        .unwrap();
+
+    let argmax_part = be.alloc(512 * 4, BufferUsage::Activations).unwrap();
+    let argmax_out = be.alloc(rows * 4, BufferUsage::Readback).unwrap();
+    let rec = be.recorder().unwrap();
+    rec.argmax(
+        lb.as_ref(),
+        argmax_part.as_ref(),
+        argmax_out.as_ref(),
+        n,
+        rows,
+    );
+    rec.finish().unwrap();
+    let mut argmax_ids = [0u32; 2];
+    be.download(
+        argmax_out.as_ref(),
+        bytemuck::cast_slice_mut(&mut argmax_ids),
+    )
+    .unwrap();
+    assert_eq!(argmax_ids, [17, u32::MAX]);
+
+    let top_k = 20usize;
+    let cand = be
+        .alloc(rows * 2 * 256 * top_k * 4, BufferUsage::Activations)
+        .unwrap();
+    let uniforms = [0.25f32, 0.75f32];
+    let ub = be.alloc(rows * 4, BufferUsage::Staging).unwrap();
+    let sample_out = be.alloc(rows * 4, BufferUsage::Readback).unwrap();
+    be.upload(ub.as_ref(), bytemuck::cast_slice(&uniforms))
+        .unwrap();
+    let rec = be.recorder().unwrap();
+    rec.sample_topk(
+        lb.as_ref(),
+        cand.as_ref(),
+        ub.as_ref(),
+        sample_out.as_ref(),
+        n,
+        rows,
+        top_k,
+        0.8,
+        0.95,
+    );
+    rec.finish().unwrap();
+    let mut sample_ids = [0u32; 2];
+    be.download(
+        sample_out.as_ref(),
+        bytemuck::cast_slice_mut(&mut sample_ids),
+    )
+    .unwrap();
+    assert_ne!(sample_ids[0], u32::MAX);
+    assert_eq!(sample_ids[1], u32::MAX);
+
+    let bad_row = be.alloc(n * 4, BufferUsage::Activations).unwrap();
+    be.upload(bad_row.as_ref(), bytemuck::cast_slice(&logits[n..2 * n]))
+        .unwrap();
+    let prob_part = be.alloc(768 * 4, BufferUsage::Activations).unwrap();
+    let prob_id = be.alloc(4, BufferUsage::Readback).unwrap();
+    let prob = be.alloc(4, BufferUsage::Readback).unwrap();
+    let rec = be.recorder().unwrap();
+    rec.argmax_prob(
+        bad_row.as_ref(),
+        prob_part.as_ref(),
+        prob_id.as_ref(),
+        prob.as_ref(),
+        n,
+    );
+    rec.finish().unwrap();
+    let mut id = [0u8; 4];
+    be.download(prob_id.as_ref(), &mut id).unwrap();
+    assert_eq!(u32::from_le_bytes(id), u32::MAX);
+}

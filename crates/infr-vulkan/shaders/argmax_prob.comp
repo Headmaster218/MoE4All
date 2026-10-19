@@ -32,16 +32,19 @@ layout(binding = 1) writeonly buffer PB { float part[]; };
 shared float sval[256];
 shared uint sidx[256];
 shared float ssum[256];
+shared uint sbad[256];
 void main() {
     uint t = gl_LocalInvocationID.x;
     float best = -1e30;
     uint bi = 0u;
     float sum = 0.0;
+    uint bad = 0u;
 #ifdef PASS2
     if (t < pc.n) {
         best = part[t];
         bi = floatBitsToUint(part[pc.n + t]);
         sum = part[2u * pc.n + t];
+        bad = uint(bi == 0xFFFFFFFFu);
     }
 #else
     uint chunk = (pc.n + 255u) / 256u;
@@ -49,6 +52,10 @@ void main() {
     uint hi = min(lo + chunk, pc.n);
     for (uint i = lo + t; i < hi; i += 256u) {
         float v = logits[i];
+        if (isnan(v) || isinf(v)) {
+            bad = 1u;
+            continue;
+        }
         // Online update: rescale the running sum onto the new max when `v` strictly exceeds it
         // (ascending scan + strict `>` keeps the lowest index within this thread's stride, exactly
         // like argmax.comp), accumulate onto the current max otherwise.
@@ -66,9 +73,11 @@ void main() {
     sval[t] = best;
     sidx[t] = bi;
     ssum[t] = sum;
+    sbad[t] = bad;
     barrier();
     for (uint s = 128u; s > 0u; s /= 2u) {
         if (t < s) {
+            sbad[t] |= sbad[t + s];
             float bv = sval[t], ov = sval[t + s];
             uint bidx = sidx[t], oidx = sidx[t + s];
             float bs = ssum[t], os = ssum[t + s];
@@ -86,11 +95,12 @@ void main() {
     }
     if (t == 0u) {
 #ifdef PASS2
-        out_id[0] = sidx[0];
-        out_prob[0] = 1.0 / ssum[0];
+        out_id[0] = (sbad[0] != 0u) ? 0xFFFFFFFFu : sidx[0];
+        out_prob[0] = (sbad[0] != 0u) ? 0.0 : 1.0 / ssum[0];
 #else
         part[gl_WorkGroupID.x] = sval[0];
-        part[256u + gl_WorkGroupID.x] = uintBitsToFloat(sidx[0]);
+        part[256u + gl_WorkGroupID.x] =
+            uintBitsToFloat((sbad[0] != 0u) ? 0xFFFFFFFFu : sidx[0]);
         part[512u + gl_WorkGroupID.x] = ssum[0];
 #endif
     }

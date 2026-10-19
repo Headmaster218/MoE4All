@@ -9320,8 +9320,21 @@ fn generate_dense_backend_inner(
             )
             .map_err(|e| anyhow!("{e}"))?;
             for (row, id) in all_ids.iter_mut().enumerate() {
-                *id = crate::mtp::argmax_row(&all_logits[row * c.vocab..(row + 1) * c.vocab]);
+                *id = crate::mtp::argmax_row(&all_logits[row * c.vocab..(row + 1) * c.vocab])?;
             }
+        }
+        for (row, id) in all_ids.iter_mut().enumerate() {
+            *id = crate::sampling::ensure_sampled_token(
+                *id,
+                c.vocab,
+                &format!("parallel MTP verify row {row}"),
+            )?;
+        }
+        for row in 0..(all_logits.len() / c.vocab) {
+            crate::sampling::ensure_finite_logits(
+                &all_logits[row * c.vocab..(row + 1) * c.vocab],
+                &format!("parallel MTP verify logits row {row}"),
+            )?;
         }
         let mut all_hidden = vec![0.0f32; batch * h_width];
         be.download(
@@ -10520,6 +10533,13 @@ fn generate_dense_backend_inner(
             if batch_argmax || batch_gpu_sample {
                 be.download(ids_out.as_ref(), bytemuck::cast_slice_mut(&mut next))
                     .map_err(|e| anyhow!("{e}"))?;
+                for (row, token) in next.iter_mut().enumerate() {
+                    *token = crate::sampling::ensure_sampled_token(
+                        *token,
+                        c.vocab,
+                        &format!("parallel GPU sample row {row}"),
+                    )?;
+                }
                 let needs_reasoning_repair = next.iter().enumerate().any(|(row, &token)| {
                     parallel.reasoning_guards[sample_from + row].blocks(
                         c,
@@ -10533,6 +10553,11 @@ fn generate_dense_backend_inner(
                         .map_err(|e| anyhow!("{e}"))?;
                     for row in 0..logits_rows {
                         let lane = sample_from + row;
+                        let row_logits = &mut logits[row * c.vocab..(row + 1) * c.vocab];
+                        crate::sampling::ensure_finite_logits(
+                            row_logits,
+                            &format!("parallel EOS repair row {row}"),
+                        )?;
                         if !parallel.reasoning_guards[lane].blocks(
                             c,
                             next[row],
@@ -10541,9 +10566,8 @@ fn generate_dense_backend_inner(
                             continue;
                         }
                         let blocked = next[row];
-                        let logits = &mut logits[row * c.vocab..(row + 1) * c.vocab];
-                        parallel.reasoning_guards[lane].mask_eos(c, logits);
-                        next[row] = parallel.samplers[lane].sample_penalized(logits);
+                        parallel.reasoning_guards[lane].mask_eos(c, row_logits);
+                        next[row] = parallel.samplers[lane].sample_penalized(row_logits);
                         tracing::warn!(
                             lane,
                             blocked_token = blocked,
@@ -10564,6 +10588,10 @@ fn generate_dense_backend_inner(
                 for row in 0..logits_rows {
                     let lane = sample_from + row;
                     let logits = &mut logits[row * c.vocab..(row + 1) * c.vocab];
+                    crate::sampling::ensure_finite_logits(
+                        logits,
+                        &format!("parallel host sample row {row}"),
+                    )?;
                     if !ec.sampling.ignore_eos {
                         parallel.reasoning_guards[lane].mask_eos(c, logits);
                     }
@@ -12388,6 +12416,7 @@ fn generate_dense_backend_inner(
                 be.download(logits_buf.as_ref(), bytemuck::cast_slice_mut(&mut logits))
                     .map_err(|e| anyhow!("{e}"))?;
                 have_frontier_logits = true;
+                crate::sampling::ensure_finite_logits(&logits, "single-stream logits")?;
             }
             // Phase-1 DiffusionGemma validation hook (see the param doc): this is the FIRST
             // is_decode row — the causal prefill's last-token logits — captured before sampling
@@ -12440,7 +12469,11 @@ fn generate_dense_backend_inner(
                     if let Some(t0) = readback_t0 {
                         dec_id_readback += t0.elapsed();
                     }
-                    u32::from_le_bytes(idb)
+                    crate::sampling::ensure_sampled_token(
+                        u32::from_le_bytes(idb),
+                        c.vocab,
+                        "single-stream GPU sample",
+                    )?
                 } else {
                     // Serve-only: repetition penalties patch the row in place (no-op allocation-wise
                     // — `penalties` is `None` on every other path, so this is one branch per token).
@@ -12456,6 +12489,7 @@ fn generate_dense_backend_inner(
                     if !have_frontier_logits {
                         be.download(logits_buf.as_ref(), bytemuck::cast_slice_mut(&mut logits))
                             .map_err(|e| anyhow!("{e}"))?;
+                        crate::sampling::ensure_finite_logits(&logits, "single-stream EOS repair")?;
                     }
                     reasoning_eos_guard.mask_eos(c, &mut logits);
                     let blocked = next;
@@ -13138,6 +13172,13 @@ mod tests {
     }
 
     #[test]
+    fn frontier_checkpoint_does_not_create_a_tiny_prefill_tail() {
+        let checkpoints = [None, Some(4063)];
+        assert_eq!(prefill_chunk_end(0, 4063, 2048, &checkpoints), 2048);
+        assert_eq!(prefill_chunk_end(2048, 4063, 2048, &checkpoints), 4063);
+    }
+
+    #[test]
     fn parallel_prefill_redistributes_unused_rows() {
         assert_eq!(
             allocate_parallel_prefill_rows(&[10, 2_000], 1_024),
@@ -13177,6 +13218,27 @@ mod tests {
         assert_eq!(sampling_suffix_start(&[10, 20], &[15, 25]).unwrap(), 2);
         assert!(sampling_suffix_start(&[20, 10], &[21, 15]).is_err());
         assert!(sampling_suffix_start(&[10], &[11, 12]).is_err());
+    }
+
+    #[test]
+    fn token_step_prefill_fallback_does_not_sample_before_rejoining() {
+        for start in [1, 30_000, 150_000] {
+            for remaining in [1, 37, 96] {
+                let prompt_end = start + remaining + 1;
+                for step in 0..remaining {
+                    assert_eq!(
+                        sampling_suffix_start(&[start + step], &[prompt_end]).unwrap(),
+                        1
+                    );
+                }
+                // The visual lane stayed untouched; both lanes now sample their Decode frontier.
+                assert_eq!(
+                    sampling_suffix_start(&[start, start + remaining], &[start + 1, prompt_end])
+                        .unwrap(),
+                    0
+                );
+            }
+        }
     }
 
     #[test]

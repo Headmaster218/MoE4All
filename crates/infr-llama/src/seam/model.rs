@@ -141,6 +141,10 @@ fn checkpoint_boundary(prompt: &[u32], hint: &[u32]) -> Option<usize> {
         .then_some(common)
 }
 
+fn benchmark_frontier_boundary(prompt_len: usize) -> Option<usize> {
+    prompt_len.checked_sub(1).filter(|&boundary| boundary > 0)
+}
+
 /// Open a Vulkan backend on physical device `dev`: `Some(idx)` pins `VulkanN`
 /// ([`infr_vulkan::VulkanBackend::new_on_with`], bypassing `device.dev`/the discrete-default rule
 /// for the multi-device path), `None` is the historical default
@@ -920,7 +924,7 @@ impl SeamModel {
         prompt_tokens: &[u32],
         prefixes: crate::seam::TurnCheckpointPrefixes<'_>,
     ) -> Result<Option<crate::seam::TurnCheckpoint>> {
-        if prefixes.agent.is_none() && prefixes.edit.is_none() {
+        if prefixes.agent.is_none() && prefixes.edit.is_none() && !prefixes.benchmark_frontier {
             return Ok(None);
         }
         let boundary = |prefix: Option<&str>| -> Result<Option<usize>> {
@@ -930,9 +934,14 @@ impl SeamModel {
             let tokens = self.encode(prefix)?;
             Ok(checkpoint_boundary(prompt_tokens, &tokens))
         };
+        let edit = if prefixes.benchmark_frontier {
+            benchmark_frontier_boundary(prompt_tokens.len())
+        } else {
+            boundary(prefixes.edit)?
+        };
         Ok(Some(crate::seam::TurnCheckpoint::new(
             boundary(prefixes.agent)?,
-            boundary(prefixes.edit)?,
+            edit,
         )))
     }
 
@@ -2737,7 +2746,7 @@ mod pick_continuation_tests {
 
 #[cfg(test)]
 mod checkpoint_boundary_tests {
-    use super::checkpoint_boundary;
+    use super::{benchmark_frontier_boundary, checkpoint_boundary};
 
     #[test]
     fn accepts_an_exact_strict_prefix() {
@@ -2768,5 +2777,13 @@ mod checkpoint_boundary_tests {
         assert_eq!(checkpoint_boundary(&[10, 20], &[]), None);
         assert_eq!(checkpoint_boundary(&[10, 20], &[10, 20]), None);
         assert_eq!(checkpoint_boundary(&[10, 20], &[99]), None);
+    }
+
+    #[test]
+    fn benchmark_frontier_stops_before_the_unfed_prompt_token() {
+        assert_eq!(benchmark_frontier_boundary(0), None);
+        assert_eq!(benchmark_frontier_boundary(1), None);
+        assert_eq!(benchmark_frontier_boundary(2), Some(1));
+        assert_eq!(benchmark_frontier_boundary(6_144), Some(6_143));
     }
 }

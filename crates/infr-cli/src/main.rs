@@ -3,7 +3,13 @@
 
 use clap::{Parser, Subcommand};
 use infr_core::config::{Config, ConfigOverrides, PartialConfig};
+use infr_core::WeightSource;
+use std::io::Write as _;
 use std::sync::Arc;
+
+mod diagnostics;
+mod submission;
+mod submission_validation;
 
 #[derive(Parser)]
 #[command(
@@ -58,6 +64,91 @@ enum CompletionShell {
     Powershell,
     Elvish,
     Nushell,
+}
+
+#[derive(Subcommand)]
+enum SubmissionCommand {
+    /// Pack one benchmark JSON object into the public text submission format.
+    PackBenchmark {
+        #[arg(long, value_name = "PATH")]
+        input: PathBuf,
+        #[arg(long, value_name = "DIR", default_value = "benchmark-database")]
+        result_dir: PathBuf,
+    },
+    /// Replace a benchmark submission with an updated JSON payload while preserving its identity.
+    RepackBenchmark {
+        #[arg(long, value_name = "PATH")]
+        source: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        input: PathBuf,
+    },
+    /// Verify the envelope, checksum, generated summary and decoded schema.
+    Verify { path: PathBuf },
+    /// Decode the compressed payload as readable JSON.
+    Decode {
+        path: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        output: Option<PathBuf>,
+    },
+}
+
+/// End-user benchmark suites. The low-level llama-bench-compatible flags remain available when
+/// this is absent; launch wizards use these profiles for repeatable, uploadable measurements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum BenchSuite {
+    Quick,
+    Standard,
+    Full,
+}
+
+impl BenchSuite {
+    fn context_tokens(self) -> &'static [usize] {
+        match self {
+            Self::Quick => &[6 * 1024],
+            Self::Standard => &[6 * 1024, 30 * 1024],
+            Self::Full => &[6 * 1024, 30 * 1024, 150 * 1024],
+        }
+    }
+
+    fn max_context_tokens(self) -> usize {
+        self.context_tokens().last().copied().unwrap_or(0)
+    }
+
+    fn decode_tokens(self) -> usize {
+        1024
+    }
+
+    fn decode_warmup_tokens(self) -> usize {
+        512
+    }
+
+    fn prefill_warmup_tokens(self) -> usize {
+        self.context_tokens().first().copied().unwrap_or(0)
+    }
+
+    fn decode_reps(self) -> usize {
+        match self {
+            Self::Quick => 1,
+            Self::Standard => 1,
+            Self::Full => 3,
+        }
+    }
+
+    fn default_parallel(self) -> usize {
+        match self {
+            Self::Quick => 1,
+            Self::Standard => 2,
+            Self::Full => 4,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Quick => "quick",
+            Self::Standard => "standard",
+            Self::Full => "full",
+        }
+    }
 }
 
 impl CompletionShell {
@@ -357,6 +448,22 @@ enum Cmd {
         #[command(flatten)]
         device: DeviceOpts,
     },
+    /// Capture or finish a compact diagnostic report. Run this in another terminal while a service
+    /// remains active, or pass --source to add the user's description to an automatic fatal report.
+    Report {
+        #[arg(long, value_name = "PATH")]
+        source: Option<PathBuf>,
+        #[arg(long, value_name = "PATH")]
+        description_file: Option<PathBuf>,
+        #[arg(long, value_name = "DIR")]
+        diagnostics_dir: Option<PathBuf>,
+    },
+    /// Encode, verify or decode MoE4All text submissions.
+    #[command(hide = true)]
+    Submission {
+        #[command(subcommand)]
+        action: SubmissionCommand,
+    },
     /// Render a chat history with the model tokenizer and fill it to a precise token depth.
     #[command(name = "__test-plan-prompt", hide = true)]
     TestPlanPrompt {
@@ -500,6 +607,21 @@ enum Cmd {
     /// so the two are directly comparable. Prefill (pp) when -n 0; decode (tg) when -p 0.
     Bench {
         model: String,
+        /// Run an automatic benchmark suite with one real Prefill and x1..xN Decode cases.
+        #[arg(long, value_enum)]
+        suite: Option<BenchSuite>,
+        /// Highest Decode concurrency for an automatic suite (1-4). Every lower level is included.
+        #[arg(long, value_name = "N", requires = "suite")]
+        parallel: Option<usize>,
+        /// Directory for the unique, upload-ready benchmark text submission. Defaults to
+        /// ./benchmark-database.
+        #[arg(long, value_name = "DIR", requires = "suite")]
+        result_dir: Option<PathBuf>,
+        /// Resolve the selected model, hardware and automatic-memory policy, then exit without
+        /// loading weights or running the GPU. With --suite, prints one estimate; without
+        /// --suite, prints the launcher's 3-suite x 4-concurrency minute matrix.
+        #[arg(long)]
+        estimate_only: bool,
         /// Prompt tokens to process (prefill). pp throughput = n_prompt / time.
         #[arg(short = 'p', long = "n-prompt", default_value_t = 512)]
         n_prompt: usize,
@@ -688,7 +810,242 @@ fn exit_if_signalled() {
     std::process::exit(128 + signo);
 }
 
-fn main() -> anyhow::Result<()> {
+struct CombinedLogWriter {
+    terminal: infr_server::TerminalLogWriter,
+    diagnostic: diagnostics::LogWriter,
+}
+
+impl std::io::Write for CombinedLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.terminal.write_all(buf)?;
+        self.diagnostic.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.terminal.flush()?;
+        self.diagnostic.flush()
+    }
+}
+
+fn combined_log_writer() -> CombinedLogWriter {
+    CombinedLogWriter {
+        terminal: infr_server::terminal_log_writer(),
+        diagnostic: diagnostics::log_writer(),
+    }
+}
+
+fn command_model(cmd: &Cmd) -> Option<&str> {
+    match cmd {
+        Cmd::Run { model, .. }
+        | Cmd::Serve { model, .. }
+        | Cmd::ServeEmbedding { model, .. }
+        | Cmd::Bench { model, .. } => Some(model),
+        _ => None,
+    }
+}
+
+fn command_name(cmd: &Cmd) -> &'static str {
+    match cmd {
+        Cmd::Pull { .. } => "pull",
+        Cmd::Devices => "devices",
+        Cmd::Resources { .. } => "resources",
+        Cmd::Report { .. } => "report",
+        Cmd::Submission { .. } => "submission",
+        Cmd::TestPlanPrompt { .. } => "test-plan-prompt",
+        Cmd::Run { .. } => "run",
+        Cmd::Serve { .. } => "serve",
+        Cmd::ServeEmbedding { .. } => "serve-embedding",
+        Cmd::Multi { .. } => "multi",
+        Cmd::Bench { .. } => "bench",
+        Cmd::Compare { .. } => "compare",
+    }
+}
+
+fn command_message(cmd: &Cmd) -> Option<&str> {
+    match cmd {
+        Cmd::Run { message, .. } => message.as_deref(),
+        _ => None,
+    }
+}
+
+fn sanitize_launch_arguments(
+    arguments: impl IntoIterator<Item = String>,
+    model: Option<&str>,
+    message: Option<&str>,
+) -> Vec<String> {
+    let model = model.map(str::to_string);
+    let message = message.map(str::to_string);
+    let mut redact_next = false;
+    arguments
+        .into_iter()
+        .map(|argument| {
+            if redact_next {
+                redact_next = false;
+                return "<redacted>".into();
+            }
+            let lower = argument.to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "--api-key"
+                    | "--token"
+                    | "--password"
+                    | "--secret"
+                    | "--prompt"
+                    | "--message"
+                    | "--system-prompt"
+            ) {
+                redact_next = true;
+                return argument;
+            }
+            if lower.contains("api_key=")
+                || lower.contains("api-key=")
+                || lower.contains("token=")
+                || lower.contains("password=")
+                || lower.contains("secret=")
+                || lower.starts_with("--prompt=")
+                || lower.starts_with("--message=")
+                || lower.contains("system_prompt=")
+                || lower.contains("system-prompt=")
+            {
+                return "<redacted-setting>".into();
+            }
+            if message.as_deref() == Some(argument.as_str()) {
+                return "<redacted-message>".into();
+            }
+            if model.as_deref() == Some(argument.as_str())
+                || ((argument.contains('\\') || argument.contains('/'))
+                    && Path::new(&argument).exists())
+            {
+                let normalized = argument.replace('\\', "/");
+                return Path::new(&normalized)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("<local-path>")
+                    .to_string();
+            }
+            argument
+        })
+        .collect()
+}
+
+fn sanitized_launch_args(model: Option<&str>, message: Option<&str>) -> Vec<String> {
+    sanitize_launch_arguments(std::env::args().skip(1), model, message)
+}
+
+fn diagnostic_metadata(cmd: &Cmd) -> (serde_json::Value, Vec<String>) {
+    let model = command_model(cmd);
+    let model_path = model.map(Path::new);
+    let mut redactions = Vec::new();
+    for variable in ["USERPROFILE", "HOME"] {
+        if let Some(value) = std::env::var_os(variable).and_then(|value| value.into_string().ok()) {
+            if !value.is_empty() {
+                redactions.push(value);
+            }
+        }
+    }
+    if let Ok(path) = std::env::current_dir() {
+        redactions.push(path.display().to_string());
+    }
+    if let Some(parent) = model_path.and_then(Path::parent) {
+        redactions.push(parent.display().to_string());
+    }
+    let model_name = model_path
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .or(model)
+        .unwrap_or("unknown");
+    let model_bytes = model_path
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map(|metadata| metadata.len());
+    let metadata = serde_json::json!({
+        "engine": {
+            "version": env!("CARGO_PKG_VERSION"),
+            "commit": option_env!("INFR_GIT_COMMIT"),
+        },
+        "hardware": {
+            "os": std::env::consts::OS,
+            "architecture": std::env::consts::ARCH,
+            "cpu": {
+                "name": benchmark_cpu_name(),
+                "logical_threads": std::thread::available_parallelism().ok().map(|value| value.get()),
+            },
+            "ram": {"total_bytes": infr_core::hostmem::total_bytes()},
+            "gpu": serde_json::Value::Null,
+        },
+        "model": {"name": model_name, "storage_bytes": model_bytes},
+        "launch": {
+            "command": command_name(cmd),
+            "arguments": sanitized_launch_args(model, command_message(cmd)),
+            "process_id": std::process::id(),
+        },
+        "private_redactions": redactions.clone(),
+    });
+    (metadata, redactions)
+}
+
+fn should_record_diagnostics(cmd: &Cmd) -> bool {
+    matches!(
+        cmd,
+        Cmd::Run { .. }
+            | Cmd::Serve { .. }
+            | Cmd::ServeEmbedding { .. }
+            | Cmd::Multi { .. }
+            | Cmd::Bench {
+                estimate_only: false,
+                ..
+            }
+    )
+}
+
+fn install_panic_report_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(files) = diagnostics::current_files() {
+            diagnostics::flush();
+            let payload = info
+                .payload()
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("Rust panic");
+            let message = if let Some(location) = info.location() {
+                format!(
+                    "{payload} at {}:{}:{}",
+                    location.file(),
+                    location.line(),
+                    location.column()
+                )
+            } else {
+                payload.to_string()
+            };
+            if let Ok(path) = diagnostics::create_report(files, "panic", "", &[message]) {
+                // print-ok: CLI panic report location, independent of logger availability.
+                eprintln!("Diagnostic report: {}", path.display());
+                // print-ok: machine-readable panic report path for launchers.
+                eprintln!("MOE4ALL_ERROR_REPORT={}", path.display());
+            }
+        }
+        previous(info);
+    }));
+}
+
+fn main() {
+    let cli = Cli::parse();
+    let diagnostics = cli.cmd.as_ref().and_then(|cmd| {
+        if !should_record_diagnostics(cmd) {
+            return None;
+        }
+        let (metadata, redactions) = diagnostic_metadata(cmd);
+        match diagnostics::initialize(&diagnostics::default_root(), metadata, redactions) {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                // print-ok: bootstrap failure before the tracing subscriber exists.
+                eprintln!("warning: diagnostic recorder is unavailable: {error:#}");
+                None
+            }
+        }
+    });
     // DIAGNOSTICS GO TO STDERR, never stdout. `tracing_subscriber::fmt()` defaults to stdout, and
     // once `refactor: route library diagnostics through tracing` (a6e9131) moved the device-probe
     // and placement lines off `eprintln!` onto `tracing`, that default interleaved them with
@@ -701,38 +1058,98 @@ fn main() -> anyhow::Result<()> {
     let stderr_is_terminal = std::io::stderr().is_terminal();
     infr_server::configure_terminal_output(stderr_is_terminal);
     tracing_subscriber::fmt()
-        .with_writer(infr_server::terminal_log_writer)
+        .with_writer(combined_log_writer)
         .with_ansi(stderr_is_terminal)
         .with_timer(tracing_subscriber::fmt::time::ChronoLocal::rfc_3339())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    install_panic_report_hook();
     install_signal_handlers();
 
-    let cli = Cli::parse();
+    let result = run(cli);
+    if let Err(error) = &result {
+        if !infr_core::shutdown::shutdown_requested() {
+            if let Some(guard) = diagnostics.as_ref() {
+                guard.flush();
+                let chain = error.chain().map(ToString::to_string).collect::<Vec<_>>();
+                match diagnostics::create_report(guard.files(), "fatal", "", &chain) {
+                    Ok(path) => {
+                        // print-ok: CLI fatal report location, visible even with filtered logs.
+                        eprintln!("Diagnostic report: {}", path.display());
+                        // print-ok: machine-readable fatal report path for launchers.
+                        eprintln!("MOE4ALL_ERROR_REPORT={}", path.display());
+                    }
+                    Err(report_error) => {
+                        // print-ok: CLI report-writing failure, visible even with filtered logs.
+                        eprintln!("warning: could not write diagnostic report: {report_error:#}");
+                    }
+                }
+            }
+        }
+    }
+    if let Some(guard) = diagnostics {
+        guard.finish();
+    }
+    if let Err(error) = result {
+        // print-ok: CLI final error after the diagnostic writer has stopped.
+        eprintln!("Error: {error:#}");
+        std::process::exit(1);
+    }
+}
 
+fn run(cli: Cli) -> anyhow::Result<()> {
+    let Cli {
+        cmd,
+        config,
+        set,
+        test_resource_profile,
+        completions,
+        man,
+    } = cli;
     // Packaging helpers (hidden): emit completions / man page and exit. The man page includes
     // every subcommand and flag straight from the clap definitions, so it can't drift.
-    if let Some(shell) = cli.completions {
+    if let Some(shell) = completions {
         use clap::CommandFactory;
         shell.generate(&mut Cli::command());
         return Ok(());
     }
-    if cli.man {
+    if man {
         use clap::CommandFactory;
         clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
         return Ok(());
     }
 
-    let Some(cmd) = cli.cmd else {
+    let Some(cmd) = cmd else {
         // arg_required_else_help covers the bare invocation; a flag-only call lands here.
         use clap::CommandFactory;
         Cli::command().print_help()?;
         return Ok(());
     };
 
-    if let Some(path) = cli.test_resource_profile.as_deref() {
+    match cmd {
+        Cmd::Submission { action } => cmd_submission(action),
+        Cmd::Report {
+            source,
+            description_file,
+            diagnostics_dir,
+        } => cmd_report(
+            source.as_deref(),
+            description_file.as_deref(),
+            diagnostics_dir.as_deref(),
+        ),
+        cmd => run_engine_command(cmd, config, set, test_resource_profile),
+    }
+}
+
+fn run_engine_command(
+    cmd: Cmd,
+    config_path: Option<PathBuf>,
+    sets: Vec<String>,
+    test_resource_profile: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    if let Some(path) = test_resource_profile.as_deref() {
         install_test_resource_profile(path)?;
     }
 
@@ -740,8 +1157,8 @@ fn main() -> anyhow::Result<()> {
     // (docs/config-plan.md §2). It is a VALUE, threaded into the commands as an `Arc` — there is
     // deliberately no global (R4).
     let overrides = ConfigOverrides {
-        config_path: cli.config.clone(),
-        sets: cli.set.clone(),
+        config_path,
+        sets,
         flags: cli_flag_layer(&cmd)?,
     };
     let mut cfg = Config::load(&overrides)?;
@@ -775,6 +1192,149 @@ fn main() -> anyhow::Result<()> {
     infr_core::timeline::flush().context("writing Decode timeline")?;
     exit_if_signalled();
     res
+}
+fn validate_benchmark_payload(value: &serde_json::Value) -> anyhow::Result<()> {
+    submission_validation::validate("benchmark", value)
+}
+
+fn validate_error_payload(value: &serde_json::Value) -> anyhow::Result<()> {
+    submission_validation::validate("error", value)
+}
+
+fn print_submission_summary(decoded: &submission::Decoded) {
+    // print-ok: submission verification output consumed by users and launchers.
+    println!("{}", submission::ARMOR_VERSION);
+    // print-ok: submission verification kind.
+    println!("kind: {}", decoded.kind.as_str());
+    // print-ok: submission verification schema.
+    println!("schema: {}", decoded.schema);
+    // print-ok: submission verification identity.
+    println!("id: {}", decoded.id);
+    // print-ok: submission verification timestamp.
+    println!("created-at: {}", decoded.created_at);
+    for line in submission::summary(decoded.kind, &decoded.payload) {
+        // print-ok: user-visible verification summary, not diagnostic logging.
+        println!("{line}");
+    }
+}
+
+fn cmd_submission(action: SubmissionCommand) -> anyhow::Result<()> {
+    match action {
+        SubmissionCommand::PackBenchmark { input, result_dir } => {
+            let bytes = std::fs::read(&input)
+                .with_context(|| format!("read benchmark JSON {}", input.display()))?;
+            let value =
+                submission_validation::parse_json(&bytes).context("parse benchmark JSON")?;
+            validate_benchmark_payload(&value)?;
+            let created = value
+                .get("created_at_utc")
+                .and_then(serde_json::Value::as_str)
+                .context("benchmark created_at_utc is missing")?;
+            let created = chrono::DateTime::parse_from_rfc3339(created)
+                .context("benchmark created_at_utc is invalid")?;
+            let directory = result_dir
+                .join("v1")
+                .join(created.format("%Y-%m").to_string());
+            let path = submission::write_new(&directory, submission::Kind::Benchmark, &value)?;
+            // print-ok: CLI benchmark export location.
+            println!("Benchmark submission: {}", path.display());
+            // print-ok: machine-readable export path for launchers.
+            println!("MOE4ALL_SUBMISSION_PATH={}", path.display());
+            Ok(())
+        }
+        SubmissionCommand::RepackBenchmark { source, input } => {
+            let original = submission::read(&source)?;
+            anyhow::ensure!(
+                original.kind == submission::Kind::Benchmark,
+                "{} is not a benchmark submission",
+                source.display()
+            );
+            let bytes = std::fs::read(&input)
+                .with_context(|| format!("read benchmark JSON {}", input.display()))?;
+            let value =
+                submission_validation::parse_json(&bytes).context("parse benchmark JSON")?;
+            validate_benchmark_payload(&value)?;
+            anyhow::ensure!(
+                value.get("id").and_then(serde_json::Value::as_str) == Some(original.id.as_str()),
+                "updated benchmark id does not match the source submission"
+            );
+            anyhow::ensure!(
+                value
+                    .get("created_at_utc")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(original.created_at.as_str()),
+                "updated benchmark timestamp does not match the source submission"
+            );
+            let text = submission::encode(submission::Kind::Benchmark, &value)?;
+            std::fs::write(&source, text)
+                .with_context(|| format!("replace benchmark submission {}", source.display()))?;
+            // print-ok: CLI benchmark re-export location.
+            println!("Benchmark submission: {}", source.display());
+            // print-ok: machine-readable re-export path for launchers.
+            println!("MOE4ALL_SUBMISSION_PATH={}", source.display());
+            Ok(())
+        }
+        SubmissionCommand::Verify { path } => {
+            let decoded = submission::read(&path)?;
+            match decoded.kind {
+                submission::Kind::Benchmark => validate_benchmark_payload(&decoded.payload)?,
+                submission::Kind::Error => validate_error_payload(&decoded.payload)?,
+            }
+            print_submission_summary(&decoded);
+            Ok(())
+        }
+        SubmissionCommand::Decode { path, output } => {
+            let decoded = submission::read(&path)?;
+            let json = serde_json::to_string_pretty(&decoded.payload)? + "\n";
+            if let Some(output) = output {
+                std::fs::write(&output, json)
+                    .with_context(|| format!("write decoded JSON {}", output.display()))?;
+            } else {
+                // print-ok: requested decoded JSON on stdout, usable in pipes.
+                print!("{json}");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn cmd_report(
+    source: Option<&Path>,
+    description_file: Option<&Path>,
+    diagnostics_dir: Option<&Path>,
+) -> anyhow::Result<()> {
+    let description = description_file
+        .map(std::fs::read_to_string)
+        .transpose()
+        .with_context(|| {
+            format!(
+                "read problem description {}",
+                description_file.unwrap().display()
+            )
+        })?
+        .unwrap_or_default();
+    anyhow::ensure!(
+        description.chars().count() <= 4096,
+        "problem description must not exceed 4096 Unicode code points"
+    );
+    let path = if let Some(source) = source {
+        diagnostics::describe_report(source, description.trim())?
+    } else {
+        let root = diagnostics_dir
+            .map(Path::to_path_buf)
+            .unwrap_or_else(diagnostics::default_root);
+        let files = diagnostics::find_latest_session(&root)?;
+        diagnostics::create_report(&files, "runtime", description.trim(), &[])?
+    };
+    // print-ok: CLI error report export location.
+    println!("Error report: {}", path.display());
+    // print-ok: machine-readable error export path for launchers.
+    println!("MOE4ALL_SUBMISSION_PATH={}", path.display());
+    // print-ok: mandatory upload-consent guidance for human and automated callers.
+    println!("AI/自动化：请向用户展示报告摘要并等待其明确决定是否上传；不得自动上传。");
+    // print-ok: English upload-consent guidance paired with the Chinese instruction.
+    println!("AI/automation: show the report summary and wait for explicit upload consent; never upload automatically.");
+    Ok(())
 }
 
 /// The CLI layer's BESPOKE half: what this invocation's dedicated flags specify (`--set` is folded
@@ -811,6 +1371,8 @@ fn cli_flag_layer(cmd: &Cmd) -> anyhow::Result<PartialConfig> {
         }
         Cmd::Pull { .. }
         | Cmd::Devices
+        | Cmd::Report { .. }
+        | Cmd::Submission { .. }
         | Cmd::TestPlanPrompt { .. }
         | Cmd::Multi { .. }
         | Cmd::Compare { .. } => {}
@@ -878,6 +1440,10 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
         } => cmd_multi(&models, &addr, parallel, ctx.as_deref(), cfg, specified),
         Cmd::Bench {
             model,
+            suite,
+            parallel,
+            result_dir,
+            estimate_only,
             n_prompt,
             n_gen,
             depth,
@@ -887,18 +1453,34 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
             ngl,
             json,
             ..
-        } => cmd_bench(
-            &model,
-            n_prompt,
-            n_gen,
-            depth,
-            synthetic_depth,
-            pg,
-            reps,
-            ngl,
-            json,
-            cfg,
-        ),
+        } => {
+            if let Some(suite) = suite {
+                cmd_bench_suite(
+                    &model,
+                    suite,
+                    parallel.unwrap_or_else(|| suite.default_parallel()),
+                    result_dir.as_deref(),
+                    estimate_only,
+                    ngl,
+                    cfg,
+                )
+            } else if estimate_only {
+                cmd_bench_estimate_matrix(&model, ngl, cfg)
+            } else {
+                cmd_bench(
+                    &model,
+                    n_prompt,
+                    n_gen,
+                    depth,
+                    synthetic_depth,
+                    pg,
+                    reps,
+                    ngl,
+                    json,
+                    cfg,
+                )
+            }
+        }
         Cmd::Compare {
             models,
             sweep,
@@ -946,6 +1528,9 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
                     cfg,
                 )
             }
+        }
+        Cmd::Report { .. } | Cmd::Submission { .. } => {
+            unreachable!("report and submission commands are handled before config resolution")
         }
     }
 }
@@ -1598,6 +2183,7 @@ fn cmd_run(
         let cfg = apply_model_sampling_defaults(cfg, specified, &gguf);
         let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg)?;
         let rendered = loaded.render_chat(msg)?;
+        diagnostics::mark_runtime();
         let out = loaded.generate_dense_vulkan_pipeline(&devices, &rendered, max_new)?;
         // print-ok: program OUTPUT — the one-shot generated text, the point of the command.
         println!("{out}");
@@ -1622,6 +2208,7 @@ fn cmd_run(
         let cfg = apply_model_sampling_defaults(cfg, specified, &gguf);
         let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg)?;
         let rendered = loaded.render_chat(msg)?;
+        diagnostics::mark_runtime();
         let out = loaded.generate_dense_vulkan_tp(&devices, &rendered, max_new)?;
         // print-ok: program OUTPUT — the one-shot generated text, the point of the command.
         println!("{out}");
@@ -1647,6 +2234,7 @@ fn cmd_run(
         let cfg = apply_model_sampling_defaults(cfg, specified, &gguf);
         let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg)?;
         let rendered = loaded.render_chat(msg)?;
+        diagnostics::mark_runtime();
         let out = loaded.generate_moe_vulkan_ep(&devices, &rendered, max_new)?;
         // print-ok: program OUTPUT — the one-shot generated text, the point of the command.
         println!("{out}");
@@ -1665,6 +2253,7 @@ fn cmd_run(
     // first turn's reported prefill rate measures prefill, not one-time pipeline builds — a cold
     // diffusion-gemma prefill measured 26 t/s vs 1424 t/s warm, all compile.
     model.warmup()?;
+    diagnostics::mark_runtime();
     let mut chat = infr_llama::chat::Chat::new(model);
     // Live denoise canvas view (diffusion-gemma only — see `DiffusionVisual`'s doc); `None` when
     // unset/not-DG/not-a-tty leaves `run_chat_turn` on the exact pre-existing `chat.turn` path.
@@ -1855,7 +2444,7 @@ const DG_VISUAL_ROWS: usize = 16;
 /// other instead of overwriting cleanly).
 const DG_VISUAL_COLS: usize = 120;
 
-use std::io::{IsTerminal, Write as _};
+use std::io::IsTerminal;
 
 /// `INFR_DIFFUSION_VISUAL` live denoise canvas view for `infr run` (diffusion-gemma only — see
 /// `docs/diffusion-gemma.md`, ports the UX idea of the oracle's `--diffusion-visual` without
@@ -2524,6 +3113,7 @@ fn run_chat(
         let checkpoint_prefixes = infr_llama::seam::TurnCheckpointPrefixes {
             agent: reusable_prefix.as_deref(),
             edit: edit_prefix.as_deref().or(Some(stable_prefix.as_str())),
+            ..Default::default()
         };
         if let Some(prefix) = reusable_prefix.as_deref() {
             tracing::debug!(
@@ -2692,6 +3282,1292 @@ fn run_chat(
 /// `llama-bench`, so `infr bench` and `llama-bench` are directly comparable. Vulkan uses four
 /// stable math-prompt streams so exact-shape warmup does not preheat the identical MoE route;
 /// `prefill_chunk` policy remains the engine's real path.
+#[derive(Debug, serde::Serialize)]
+struct SuiteRate {
+    tokens: usize,
+    seconds: f64,
+    tokens_per_second: f64,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SuiteDecodeRep {
+    sections: [SuiteRate; 3],
+    overall: SuiteRate,
+    lane_tokens_per_second: [Vec<f64>; 3],
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SuiteDecodeCase {
+    parallel: usize,
+    repetitions: Vec<SuiteDecodeRep>,
+    section_mean_tokens_per_second: [f64; 3],
+    overall_tokens_per_second: f64,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SuiteFailure {
+    stage: &'static str,
+    parallel: Option<usize>,
+    repetition: Option<usize>,
+    error: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SuitePrefill {
+    requested_context_tokens: usize,
+    actual_prompt_tokens: usize,
+    evaluated_tokens: usize,
+    seconds: f64,
+    tokens_per_second: f64,
+    setup_slots: usize,
+    setup_seconds: f64,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SuiteContextResult {
+    requested_context_tokens: usize,
+    actual_prompt_tokens: Vec<usize>,
+    decode_measurement_start_tokens: Vec<usize>,
+    decode_measurement_end_tokens: Vec<usize>,
+    prefill: Option<SuitePrefill>,
+    decode: Vec<SuiteDecodeCase>,
+    failures: Vec<SuiteFailure>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SuiteEstimate {
+    lower_seconds: f64,
+    central_seconds: f64,
+    upper_seconds: f64,
+    display_minutes: u64,
+    assumed_h2d_gib_per_second: f64,
+    startup_seconds: f64,
+    prefill_seconds: f64,
+    decode_seconds: f64,
+    estimated_ram_budget_bytes: u64,
+    estimated_vram_budget_bytes: u64,
+    architecture_class: &'static str,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SuiteResult {
+    schema_version: u32,
+    id: String,
+    created_at_utc: String,
+    engine_version: &'static str,
+    engine_commit: Option<&'static str>,
+    profile: &'static str,
+    model: serde_json::Value,
+    hardware: serde_json::Value,
+    configuration: serde_json::Value,
+    estimate: SuiteEstimate,
+    startup: serde_json::Value,
+    contexts: Vec<SuiteContextResult>,
+    failures: Vec<SuiteFailure>,
+}
+
+fn selected_benchmark_device(cfg: &Config) -> anyhow::Result<infr_vulkan::DeviceInfo> {
+    let devices = infr_vulkan::VulkanBackend::enumerate_devices(cfg)?;
+    let selected_index = match selected_backend(cfg)? {
+        Backend::Vulkan(Some(spec)) => {
+            let lower = spec.trim().to_ascii_lowercase();
+            let suffix = lower.strip_prefix("vulkan").unwrap_or_default();
+            if suffix.is_empty() {
+                None
+            } else {
+                Some(
+                    suffix
+                        .parse::<usize>()
+                        .with_context(|| format!("invalid Vulkan device `{spec}`"))?,
+                )
+            }
+        }
+        Backend::Vulkan(None) => None,
+        Backend::Metal | Backend::Cpu => None,
+    };
+    let selected = if let Some(index) = selected_index {
+        devices
+            .iter()
+            .find(|device| device.index == index)
+            .cloned()
+            .with_context(|| {
+                format!("Vulkan{index} is not available for the automatic benchmark")
+            })?
+    } else {
+        devices
+            .iter()
+            .find(|device| device.is_default_pick)
+            .or_else(|| devices.first())
+            .cloned()
+            .context("no Vulkan device is available for the automatic benchmark")?
+    };
+    Ok(selected)
+}
+
+fn model_storage_bytes(path: &Path) -> u64 {
+    let own = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return own;
+    };
+    let Some((prefix, tail)) = name.split_once("-00001-of-") else {
+        return own;
+    };
+    let Some(total) = tail.strip_suffix(".gguf") else {
+        return own;
+    };
+    let Some(parent) = path.parent() else {
+        return own;
+    };
+    let ending = format!("-of-{total}.gguf");
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return own;
+    };
+    let total = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let file_name = entry.file_name();
+            let file_name = file_name.to_str()?;
+            (file_name.starts_with(&format!("{prefix}-")) && file_name.ends_with(&ending))
+                .then(|| entry.metadata().ok().map(|meta| meta.len()))
+                .flatten()
+        })
+        .sum::<u64>();
+    if total == 0 {
+        own
+    } else {
+        total
+    }
+}
+
+fn benchmark_cpu_name() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var("PROCESSOR_IDENTIFIER")
+            .ok()
+            .filter(|name| !name.trim().is_empty())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/cpuinfo")
+            .ok()
+            .and_then(|text| {
+                text.lines().find_map(|line| {
+                    line.strip_prefix("model name")
+                        .and_then(|line| line.split_once(':'))
+                        .map(|(_, name)| name.trim().to_string())
+                })
+            })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "machdep.cpu.brand_string"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn suite_estimate(
+    suite: BenchSuite,
+    parallel: usize,
+    model_bytes: u64,
+    architecture: Option<&str>,
+    ram_total_bytes: u64,
+    ram_available_bytes: Option<u64>,
+    device: &infr_vulkan::DeviceInfo,
+    cfg: &Config,
+) -> SuiteEstimate {
+    const GIB_U64: u64 = 1 << 30;
+    const VULKAN_GUARD_BYTES: u64 = 256 << 20;
+    let gib = GIB_U64 as f64;
+    let model_gib = (model_bytes as f64 / gib).max(1.0);
+    let ram_budget_bytes = cfg
+        .device
+        .ram_budget
+        .map(|spec| spec.resolve(ram_total_bytes))
+        .unwrap_or_else(|| match cfg.device.auto_profile {
+            infr_core::config::AutoProfile::Conservative => ram_available_bytes
+                .unwrap_or(ram_total_bytes)
+                .saturating_sub(3 * GIB_U64),
+            infr_core::config::AutoProfile::Aggressive => {
+                ram_total_bytes.saturating_sub(13 * GIB_U64)
+            }
+        });
+    let guarded_available = device
+        .vram_available_bytes
+        .saturating_sub(VULKAN_GUARD_BYTES);
+    let mut vram_budget_bytes = infr_core::budget::unified_vram_room_for_profile(
+        device.vram_total_bytes,
+        guarded_available,
+        0,
+        cfg.device.vram_budget,
+        cfg.device.vram_reserve,
+        cfg.device.auto_profile,
+    );
+    if device.integrated {
+        // UMA device allocations and the host cache consume the same physical process budget.
+        vram_budget_bytes = vram_budget_bytes.min(ram_budget_bytes);
+    }
+    let ram_budget_gib = ram_budget_bytes as f64 / gib;
+    let vram_budget_gib = vram_budget_bytes as f64 / gib;
+
+    // This is intentionally a topology-class assumption: portable Vulkan does not expose a
+    // reliable negotiated PCIe link rate. The measured result records effective model-startup
+    // bandwidth, so uploaded submissions can refine these classes without changing the suite.
+    let h2d_gib_per_second: f64 = if device.integrated {
+        24.0
+    } else if device.vram_total_bytes >= 20 * GIB_U64 {
+        12.0
+    } else if device.vram_total_bytes >= 10 * GIB_U64 {
+        8.0
+    } else {
+        5.0
+    };
+    let host_factor = (0.55 + 0.45 * (ram_budget_gib / model_gib).clamp(0.0, 1.0)).clamp(0.45, 1.0);
+    let device_factor = (vram_budget_gib / 23.0).sqrt().clamp(0.25, 1.8);
+    let resource_factor = host_factor * device_factor;
+    let sparse_qsa = matches!(architecture, Some("qwen4exp"));
+    let architecture_class = if sparse_qsa {
+        "sparse-qsa"
+    } else {
+        "full-attention"
+    };
+
+    // Calibrated against the repository's 35B and FlashNext 30K/150K release measurements and
+    // the current 35B 6K suite. The architecture factor is necessary: model bytes alone cannot
+    // describe FlashNext's heavier HC path or its much flatter sparse-attention context curve.
+    let prefill_base = 3800.0
+        * (23.9 / model_gib).powf(0.55)
+        * resource_factor
+        * if sparse_qsa { 0.60 } else { 1.0 };
+    let decode_base = 129.0
+        * (23.9 / model_gib).powf(0.45)
+        * resource_factor
+        * if sparse_qsa { 0.60 } else { 1.0 };
+    let context_factor = |context_tokens: usize, prefill: bool| {
+        let relative = context_tokens as f64 / (30.0 * 1024.0);
+        if sparse_qsa {
+            let coefficient = if prefill { 0.03 } else { 0.08 };
+            (1.0 + coefficient * relative.powf(if prefill { 0.35 } else { 0.50 })).recip()
+        } else {
+            (1.0 + 0.45 * relative.powf(0.90)).recip()
+        }
+    };
+    let concurrency_gain = |lanes: usize, context_tokens: usize| {
+        if lanes <= 1 {
+            return 1.0;
+        }
+        let depth = context_tokens as f64 / 1024.0;
+        let (gain, scale_k) = match lanes {
+            2 => (0.32, if sparse_qsa { 70.0 } else { 150.0 }),
+            3 => (0.47, if sparse_qsa { 70.0 } else { 100.0 }),
+            _ => (0.58, if sparse_qsa { 60.0 } else { 80.0 }),
+        };
+        1.0 + gain / (1.0 + depth / scale_k)
+    };
+
+    // Startup has two visible costs: host materialisation/import and the resident H2D portion.
+    // A warm OS file cache can make the first term faster, hence it remains inside the final range.
+    let host_materialise_gib_per_second = (0.85 + 0.025 * h2d_gib_per_second).clamp(0.8, 1.3);
+    let resident_gib = model_gib.min(vram_budget_gib);
+    let startup = 4.0
+        + model_gib / host_materialise_gib_per_second
+        + if device.integrated {
+            0.0
+        } else {
+            resident_gib / h2d_gib_per_second
+        };
+
+    let warmup_prefill_tps =
+        (prefill_base * context_factor(suite.prefill_warmup_tokens(), true) * 0.60)
+            .clamp(20.0, 10_000.0);
+    let prefill_warmup = suite.prefill_warmup_tokens() as f64 / warmup_prefill_tps;
+    let (prefill, decode) = suite.context_tokens().iter().fold(
+        (0.0, 0.0),
+        |(prefill_total, decode_total), &context_tokens| {
+            let prefill_tps =
+                (prefill_base * context_factor(context_tokens, true)).clamp(20.0, 10_000.0);
+            let one_decode_tps =
+                (decode_base * context_factor(context_tokens, false)).clamp(1.0, 500.0);
+            let context_decode = (1..=parallel)
+                .map(|lanes| {
+                    let aggregate = one_decode_tps * concurrency_gain(lanes, context_tokens);
+                    suite.decode_reps() as f64
+                        * lanes as f64
+                        * (suite.decode_warmup_tokens() + suite.decode_tokens()) as f64
+                        / aggregate
+                })
+                .sum::<f64>();
+            (
+                // Every configured slot is populated with a real, independent context. Slot one
+                // supplies the score; it is not an extra Prefill on top of this work.
+                prefill_total + parallel as f64 * context_tokens as f64 / prefill_tps,
+                decode_total + context_decode,
+            )
+        },
+    );
+    let prefill_total = prefill_warmup + prefill;
+    let central = startup + prefill_total + decode;
+    let display_minutes = ((central * 1.30) / 60.0).ceil().max(1.0) as u64;
+    let uncertainty = if device.integrated {
+        (0.60, 1.75)
+    } else {
+        (0.75, 1.45)
+    };
+    SuiteEstimate {
+        lower_seconds: central * uncertainty.0,
+        central_seconds: central,
+        upper_seconds: central * uncertainty.1,
+        display_minutes,
+        assumed_h2d_gib_per_second: h2d_gib_per_second,
+        startup_seconds: startup,
+        prefill_seconds: prefill_total,
+        decode_seconds: decode,
+        estimated_ram_budget_bytes: ram_budget_bytes,
+        estimated_vram_budget_bytes: vram_budget_bytes,
+        architecture_class,
+    }
+}
+
+fn make_suite_prompts_from_corpus(
+    model: &infr_llama::SeamModel,
+    target: usize,
+    lanes: usize,
+    corpus: &str,
+    request_label: &str,
+) -> anyhow::Result<(Vec<String>, Vec<usize>)> {
+    let reserve = 48usize.min(target.saturating_sub(1));
+    let common_target = target.saturating_sub(reserve).max(1);
+    let mut source = corpus.repeat(common_target.div_ceil(32).max(2));
+    let mut ids = model.encode(&source)?;
+    while ids.len() < common_target {
+        source.push_str(corpus);
+        ids = model.encode(&source)?;
+    }
+    ids.truncate(common_target);
+    let stable_prefix = model.decode(&ids)?;
+    let mut prompts = Vec::with_capacity(lanes);
+    let mut lengths = Vec::with_capacity(lanes);
+    for lane in 0..lanes {
+        let mut prompt = format!(
+            "{stable_prefix}\n{request_label} lane {} has an independent final request. Analyze the code and continue with a deterministic technical answer.",
+            lane + 1
+        );
+        let mut len = model.encode(&prompt)?.len();
+        while len < target {
+            prompt.push_str(" evidence");
+            len = model.encode(&prompt)?.len();
+        }
+        prompts.push(prompt);
+        lengths.push(len);
+    }
+    Ok((prompts, lengths))
+}
+
+fn make_suite_prompts(
+    model: &infr_llama::SeamModel,
+    target: usize,
+    lanes: usize,
+) -> anyhow::Result<(Vec<String>, Vec<usize>)> {
+    const CORPUS: &str = "A benchmark should preserve exact evidence, compare the same workload, and explain every performance result with enough context to reproduce it. The following code review checks memory ownership, scheduling, cache reuse, numerical correctness, and stable error handling. ";
+    make_suite_prompts_from_corpus(model, target, lanes, CORPUS, "Benchmark")
+}
+
+fn make_suite_warmup_prompt(
+    model: &infr_llama::SeamModel,
+    target: usize,
+) -> anyhow::Result<(Vec<String>, Vec<usize>)> {
+    const WARMUP_CORPUS: &str = "A separate warmup workload surveys storage engines, network protocols, parser invariants, transactional recovery, and numerical algorithms. It intentionally differs from the scored benchmark while exercising the same runtime shape and memory paths. ";
+    make_suite_prompts_from_corpus(model, target, 1, WARMUP_CORPUS, "Warmup")
+}
+
+fn run_suite_decode_rep(
+    engine: &infr_llama::parallel::ParallelSeam,
+    prompts: &[String],
+    warmup_tokens: usize,
+    tokens: usize,
+    case_parallel: usize,
+) -> anyhow::Result<SuiteDecodeRep> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{mpsc, Barrier, OnceLock};
+    use std::time::{Duration, Instant};
+
+    let section_tokens = {
+        let first = tokens / 3;
+        let middle = tokens / 3;
+        [first, middle, tokens - first - middle]
+    };
+    let measured_start = warmup_tokens as u64;
+    let boundaries_at = [
+        measured_start,
+        measured_start + section_tokens[0] as u64,
+        measured_start + (section_tokens[0] + section_tokens[1]) as u64,
+        measured_start + tokens as u64,
+    ];
+    let progress = Arc::new(
+        (0..case_parallel)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>(),
+    );
+    let boundaries = Arc::new(
+        (0..case_parallel)
+            .map(|_| std::array::from_fn::<_, 4, _>(|_| AtomicU64::new(0)))
+            .collect::<Vec<_>>(),
+    );
+    let started = Arc::new(OnceLock::<Instant>::new());
+    let ready = Arc::new(Barrier::new(case_parallel + 1));
+    let go = Arc::new(Barrier::new(case_parallel + 1));
+    let (tx, rx) = mpsc::channel();
+    let mut received = Vec::with_capacity(case_parallel);
+    let wall_start = std::thread::scope(|scope| -> anyhow::Result<Instant> {
+        for lane in 0..case_parallel {
+            let tx = tx.clone();
+            let ready = Arc::clone(&ready);
+            let go = Arc::clone(&go);
+            let progress = Arc::clone(&progress);
+            let boundaries = Arc::clone(&boundaries);
+            let started = Arc::clone(&started);
+            let prompt = prompts[lane].clone();
+            scope.spawn(move || {
+                let callback: infr_core::GenerationProgressCallback = Arc::new(move |snapshot| {
+                    if snapshot.phase == infr_core::GenerationPhase::Decode {
+                        progress[lane].store(snapshot.completion_tokens, Ordering::Relaxed);
+                        if let (Some(started), Some(boundary)) = (
+                            started.get(),
+                            boundaries_at
+                                .iter()
+                                .position(|&tokens| tokens == snapshot.completion_tokens),
+                        ) {
+                            let elapsed = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                            boundaries[lane][boundary].store(elapsed.max(1), Ordering::Relaxed);
+                        }
+                    }
+                });
+                let req = engine
+                    .request_ctx(infr_llama::sampling::RequestSampling::default())
+                    .with_progress(Some(callback));
+                ready.wait();
+                go.wait();
+                let result = engine
+                    .generate_turn_with_checkpoints(
+                        &prompt,
+                        infr_llama::seam::TurnCheckpointPrefixes::benchmark_frontier(),
+                        warmup_tokens + tokens,
+                        None,
+                        &req,
+                        |_| {},
+                    )
+                    .map_err(|error| error.to_string());
+                let _ = tx.send((lane, result));
+            });
+        }
+        drop(tx);
+        ready.wait();
+        started
+            .set(Instant::now())
+            .map_err(|_| anyhow::anyhow!("Decode benchmark start clock was already initialized"))?;
+        go.wait();
+        let start = started
+            .get()
+            .copied()
+            .context("Decode benchmark start clock was not initialized")?;
+        while received.len() < case_parallel {
+            match rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(result) => received.push(result),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let total_done = progress
+                        .iter()
+                        .map(|tokens| tokens.load(Ordering::Relaxed))
+                        .sum::<u64>();
+                    let warmup_target = warmup_tokens.saturating_mul(case_parallel) as u64;
+                    let warmup_complete = boundaries
+                        .iter()
+                        .all(|lane| lane[0].load(Ordering::Relaxed) > 0);
+                    if !warmup_complete {
+                        // print-ok: interactive benchmark warmup progress, throttled to once per second.
+                        eprint!(
+                            "\rDecode x{case_parallel} warmup: {}/{warmup_target} tokens",
+                            total_done.min(warmup_target)
+                        );
+                    } else {
+                        let done = progress
+                            .iter()
+                            .map(|counter| {
+                                counter
+                                    .load(Ordering::Relaxed)
+                                    .saturating_sub(warmup_tokens as u64)
+                                    .min(tokens as u64)
+                            })
+                            .sum::<u64>();
+                        let target = tokens.saturating_mul(case_parallel);
+                        let measured_elapsed = boundaries
+                            .iter()
+                            .map(|lane| lane[0].load(Ordering::Relaxed))
+                            .filter(|&nanos| nanos > 0)
+                            .max()
+                            .map(|nanos| {
+                                start.elapsed().as_secs_f64() - nanos as f64 / 1_000_000_000.0
+                            })
+                            .unwrap_or_default()
+                            .max(1e-9);
+                        let minimum_live_tokens = case_parallel.saturating_mul(64) as u64;
+                        if done < minimum_live_tokens || measured_elapsed < 0.5 {
+                            // print-ok: avoid a meaningless startup spike while lanes cross the
+                            // warmup boundary a few milliseconds apart.
+                            eprint!(
+                                "\rDecode x{case_parallel}: {done}/{target} measured tokens, measuring..."
+                            );
+                        } else {
+                            let live = done as f64 / measured_elapsed;
+                            // print-ok: interactive measured Decode progress, throttled to once per second.
+                            eprint!(
+                                "\rDecode x{case_parallel}: {done}/{target} measured tokens, {live:.1} tok/s"
+                            );
+                        }
+                    }
+                    let _ = std::io::stderr().flush();
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        Ok(start)
+    })?;
+    let _wall_elapsed = wall_start.elapsed().as_secs_f64();
+    // print-ok: terminate the live progress line before printing the stable result.
+    eprintln!();
+    received.sort_by_key(|(lane, _)| *lane);
+    anyhow::ensure!(
+        received.len() == case_parallel,
+        "Decode x{case_parallel} ended before every lane returned"
+    );
+    for (_, result) in received {
+        let stats = result.map_err(anyhow::Error::msg)?;
+        let expected = warmup_tokens + tokens;
+        anyhow::ensure!(
+            stats.n_gen == expected,
+            "Decode benchmark generated {} of {expected} requested warmup + measured tokens",
+            stats.n_gen
+        );
+    }
+
+    let recorded_boundaries = (0..case_parallel)
+        .map(|lane| {
+            std::array::from_fn(|section| boundaries[lane][section].load(Ordering::Relaxed))
+        })
+        .collect::<Vec<_>>();
+    summarize_suite_decode(section_tokens, &recorded_boundaries)
+}
+
+fn summarize_suite_decode(
+    section_tokens: [usize; 3],
+    boundary_nanos: &[[u64; 4]],
+) -> anyhow::Result<SuiteDecodeRep> {
+    anyhow::ensure!(!boundary_nanos.is_empty(), "Decode benchmark has no lanes");
+    let mut lane_tokens_per_second: [Vec<f64>; 3] =
+        std::array::from_fn(|_| Vec::with_capacity(boundary_nanos.len()));
+    let mut global_start = 0.0f64;
+    let mut global_ends = [0.0f64; 3];
+    for (lane, boundaries) in boundary_nanos.iter().enumerate() {
+        anyhow::ensure!(
+            boundaries[0] > 0,
+            "Decode x{} did not record the warmup boundary for lane {}",
+            boundary_nanos.len(),
+            lane + 1
+        );
+        let mut previous = boundaries[0] as f64 / 1_000_000_000.0;
+        global_start = global_start.max(previous);
+        for (section, &nanos) in boundaries[1..].iter().enumerate() {
+            anyhow::ensure!(
+                nanos > 0,
+                "Decode x{} did not record section {} for lane {}",
+                boundary_nanos.len(),
+                section + 1,
+                lane + 1
+            );
+            let end = nanos as f64 / 1_000_000_000.0;
+            anyhow::ensure!(
+                end > previous,
+                "Decode lane {} section boundaries are not strictly increasing",
+                lane + 1
+            );
+            let seconds = end - previous;
+            lane_tokens_per_second[section].push(section_tokens[section] as f64 / seconds);
+            global_ends[section] = global_ends[section].max(end);
+            previous = end;
+        }
+    }
+    let mut previous = global_start;
+    let sections = std::array::from_fn(|section| {
+        let seconds = (global_ends[section] - previous).max(1e-9);
+        previous = global_ends[section];
+        let total_tokens = section_tokens[section] * boundary_nanos.len();
+        SuiteRate {
+            tokens: total_tokens,
+            seconds,
+            tokens_per_second: total_tokens as f64 / seconds,
+        }
+    });
+    let overall_tokens = section_tokens.iter().sum::<usize>() * boundary_nanos.len();
+    let overall_seconds = (global_ends[2] - global_start).max(1e-9);
+    Ok(SuiteDecodeRep {
+        sections,
+        overall: SuiteRate {
+            tokens: overall_tokens,
+            seconds: overall_seconds,
+            tokens_per_second: overall_tokens as f64 / overall_seconds,
+        },
+        lane_tokens_per_second,
+    })
+}
+
+fn run_suite_context(
+    engine: &infr_llama::parallel::ParallelSeam,
+    suite: BenchSuite,
+    context_tokens: usize,
+    parallel: usize,
+) -> SuiteContextResult {
+    let mut result = SuiteContextResult {
+        requested_context_tokens: context_tokens,
+        actual_prompt_tokens: Vec::new(),
+        decode_measurement_start_tokens: Vec::new(),
+        decode_measurement_end_tokens: Vec::new(),
+        prefill: None,
+        decode: Vec::new(),
+        failures: Vec::new(),
+    };
+    if let Err(error) = engine.clear_benchmark_slots() {
+        result.failures.push(SuiteFailure {
+            stage: "slot_reset",
+            parallel: None,
+            repetition: None,
+            error: format!("{error:#}"),
+        });
+        return result;
+    }
+    let (base_prompts, prompt_lengths) =
+        match make_suite_prompts(engine.model(), context_tokens, parallel) {
+            Ok(prompts) => prompts,
+            Err(error) => {
+                result.failures.push(SuiteFailure {
+                    stage: "prompt_build",
+                    parallel: None,
+                    repetition: None,
+                    error: format!("{error:#}"),
+                });
+                return result;
+            }
+        };
+    result.actual_prompt_tokens = prompt_lengths.clone();
+    result.decode_measurement_start_tokens = prompt_lengths
+        .iter()
+        .map(|&tokens| tokens.saturating_add(suite.decode_warmup_tokens()))
+        .collect();
+    result.decode_measurement_end_tokens = prompt_lengths
+        .iter()
+        .map(|&tokens| {
+            tokens
+                .saturating_add(suite.decode_warmup_tokens())
+                .saturating_add(suite.decode_tokens())
+        })
+        .collect();
+
+    // Extra slots are required for real concurrent Decode but are not reported as additional
+    // Prefill benchmark samples.
+    // print-ok: benchmark preparation progress requested by the user.
+    println!(
+        "Preparing {parallel} real context slot(s) at {context_tokens} tokens; only slot 1 is the Prefill score..."
+    );
+    let setup_started = std::time::Instant::now();
+    let prefill_counts = Arc::new(
+        (0..parallel)
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect::<Vec<_>>(),
+    );
+    let prefill_last_print = Arc::new(std::sync::Mutex::new(setup_started));
+    let prefill_target = prompt_lengths.iter().sum::<usize>();
+    let prefill_progress = (0..parallel)
+        .map(|lane| {
+            let counts = Arc::clone(&prefill_counts);
+            let last_print = Arc::clone(&prefill_last_print);
+            Arc::new(move |snapshot: infr_core::GenerationProgress| {
+                use std::sync::atomic::Ordering;
+                if snapshot.phase != infr_core::GenerationPhase::Prefill {
+                    return;
+                }
+                counts[lane].store(snapshot.prefill_tokens, Ordering::Relaxed);
+                let mut last = last_print.lock().expect("benchmark progress poisoned");
+                if last.elapsed() >= std::time::Duration::from_secs(1) {
+                    let done = counts
+                        .iter()
+                        .map(|tokens| tokens.load(Ordering::Relaxed))
+                        .sum::<u64>();
+                    let live = done as f64 / setup_started.elapsed().as_secs_f64().max(1e-9);
+                    // print-ok: automatic benchmark Prefill progress, throttled to once per second.
+                    eprint!(
+                        "\rPreparing {context_tokens}-token contexts: {done}/{prefill_target} tokens, {live:.1} tok/s"
+                    );
+                    let _ = std::io::stderr().flush();
+                    *last = std::time::Instant::now();
+                }
+            }) as infr_core::GenerationProgressCallback
+        })
+        .collect::<Vec<_>>();
+    let prefill_stats = match engine.prepare_benchmark_slots(&base_prompts, Some(&prefill_progress))
+    {
+        Ok(stats) => stats,
+        Err(error) => {
+            // print-ok: end the CLI progress line before reporting the case failure.
+            eprintln!();
+            let error = format!("{error:#}");
+            // print-ok: immediate benchmark failure feedback, also retained in the final result.
+            eprintln!("Prefill {context_tokens} failed; continuing: {error}");
+            result.failures.push(SuiteFailure {
+                stage: "prefill",
+                parallel: None,
+                repetition: None,
+                error,
+            });
+            return result;
+        }
+    };
+    // print-ok: terminate the CLI Prefill progress line.
+    eprintln!();
+    let setup_seconds = setup_started.elapsed().as_secs_f64();
+    let Some(scored) = prefill_stats.first().copied() else {
+        result.failures.push(SuiteFailure {
+            stage: "prefill",
+            parallel: None,
+            repetition: None,
+            error: "automatic benchmark produced no Prefill result".to_string(),
+        });
+        return result;
+    };
+    let prefill_tps = scored.n_prompt as f64 / scored.prompt_secs.max(1e-9);
+    // print-ok: completed Prefill benchmark score.
+    println!(
+        "Prefill {context_tokens}: {} evaluated tokens in {:.3}s = {:.1} tok/s. Context slots ready in {:.1}s.",
+        scored.n_prompt, scored.prompt_secs, prefill_tps, setup_seconds
+    );
+    result.prefill = Some(SuitePrefill {
+        requested_context_tokens: context_tokens,
+        actual_prompt_tokens: prompt_lengths[0],
+        evaluated_tokens: scored.n_prompt,
+        seconds: scored.prompt_secs,
+        tokens_per_second: prefill_tps,
+        setup_slots: parallel,
+        setup_seconds,
+    });
+
+    for active in 1..=parallel {
+        let mut repetitions = Vec::with_capacity(suite.decode_reps());
+        for rep in 0..suite.decode_reps() {
+            // print-ok: user-requested Decode benchmark repetition progress.
+            println!(
+                "Decode {context_tokens} x{active} rep {}/{}...",
+                rep + 1,
+                suite.decode_reps()
+            );
+            match run_suite_decode_rep(
+                engine,
+                &base_prompts[..active],
+                suite.decode_warmup_tokens(),
+                suite.decode_tokens(),
+                active,
+            ) {
+                Ok(measurement) => {
+                    // print-ok: completed Decode benchmark repetition score.
+                    println!(
+                        "Decode {context_tokens} x{active} rep {}/{}: first {:.1}, middle {:.1}, last {:.1}, overall {:.1} tok/s",
+                        rep + 1,
+                        suite.decode_reps(),
+                        measurement.sections[0].tokens_per_second,
+                        measurement.sections[1].tokens_per_second,
+                        measurement.sections[2].tokens_per_second,
+                        measurement.overall.tokens_per_second,
+                    );
+                    repetitions.push(measurement);
+                }
+                Err(error) => {
+                    let error = format!("{error:#}");
+                    // print-ok: immediate case failure, also retained in the final result.
+                    eprintln!(
+                        "Decode {context_tokens} x{active} rep {}/{} failed; continuing: {error}",
+                        rep + 1,
+                        suite.decode_reps()
+                    );
+                    result.failures.push(SuiteFailure {
+                        stage: "decode",
+                        parallel: Some(active),
+                        repetition: Some(rep + 1),
+                        error,
+                    });
+                }
+            }
+        }
+        if repetitions.is_empty() {
+            continue;
+        }
+        let mean = |section: usize| {
+            repetitions
+                .iter()
+                .map(|rep| rep.sections[section].tokens_per_second)
+                .sum::<f64>()
+                / repetitions.len() as f64
+        };
+        let overall = repetitions
+            .iter()
+            .map(|rep| rep.overall.tokens_per_second)
+            .sum::<f64>()
+            / repetitions.len() as f64;
+        result.decode.push(SuiteDecodeCase {
+            parallel: active,
+            section_mean_tokens_per_second: [mean(0), mean(1), mean(2)],
+            overall_tokens_per_second: overall,
+            repetitions,
+        });
+    }
+    result
+}
+
+fn write_suite_result(root: &Path, mut result: SuiteResult) -> anyhow::Result<PathBuf> {
+    use std::fs::OpenOptions;
+    let now = chrono::Utc::now();
+    let directory = root.join("v1").join(now.format("%Y-%m").to_string());
+    std::fs::create_dir_all(&directory)
+        .with_context(|| format!("create benchmark result directory {}", directory.display()))?;
+    let mut entropy = [0u8; 16];
+    getrandom::fill(&mut entropy).context("obtain OS entropy for benchmark result ID")?;
+    let random_id = entropy
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    for attempt in 0..1024u32 {
+        let id = format!(
+            "{}-{}-{:03x}",
+            now.format("%Y%m%dT%H%M%S%.3fZ"),
+            random_id,
+            attempt
+        );
+        let path = directory.join(format!("{id}.m4b"));
+        let file = OpenOptions::new().write(true).create_new(true).open(&path);
+        let Ok(mut file) = file else {
+            continue;
+        };
+        result.id = id;
+        let payload = serde_json::to_value(&result)?;
+        validate_benchmark_payload(&payload)?;
+        let armor = submission::encode(submission::Kind::Benchmark, &payload)?;
+        file.write_all(armor.as_bytes())?;
+        file.flush()?;
+        return Ok(path);
+    }
+    anyhow::bail!("could not allocate a unique benchmark submission filename")
+}
+
+fn cmd_bench_suite(
+    model: &str,
+    suite: BenchSuite,
+    parallel: usize,
+    result_dir: Option<&Path>,
+    estimate_only: bool,
+    ngl: usize,
+    cfg: &Arc<Config>,
+) -> anyhow::Result<()> {
+    if cfg.spec.mtp {
+        // print-ok: the suite contract is ordinary Decode, independent of saved chat settings.
+        println!("Automatic benchmark suites disable MTP for this run.");
+    }
+    let cfg = if cfg.spec.mtp {
+        let mut ordinary = (**cfg).clone();
+        ordinary.spec.mtp = false;
+        ordinary.spec.draft = None;
+        Arc::new(ordinary)
+    } else {
+        Arc::clone(cfg)
+    };
+    anyhow::ensure!(
+        ngl != 0,
+        "automatic benchmark suites currently require a Vulkan GPU"
+    );
+    anyhow::ensure!(
+        matches!(selected_backend(&cfg)?, Backend::Vulkan(_)),
+        "automatic benchmark suites currently require a Vulkan GPU"
+    );
+    anyhow::ensure!(
+        (1..=4).contains(&parallel),
+        "automatic benchmark --parallel must be in 1..=4"
+    );
+    let (gguf, tok) = resolve(model, &cfg)?;
+    let model_bytes = model_storage_bytes(&gguf);
+    let device = selected_benchmark_device(&cfg)?;
+    let ram_total = infr_core::hostmem::total_bytes().unwrap_or(0);
+    let ram_available_before = infr_core::hostmem::available_bytes();
+    let vram_available_before = device.vram_available_bytes;
+    let architecture = infr_llama::arch::arch_of(&gguf);
+    let estimate = suite_estimate(
+        suite,
+        parallel,
+        model_bytes,
+        architecture.as_deref(),
+        ram_total,
+        ram_available_before,
+        &device,
+        &cfg,
+    );
+    if estimate_only {
+        // Stable, dependency-free launcher protocol. Human diagnostics stay on stderr.
+        // print-ok: machine-readable benchmark estimate for the launch wizard.
+        println!(
+            "BENCH_ESTIMATE_V1|{:.0}|{:.0}|{:.0}|{:.2}|{}|{}|{}",
+            estimate.lower_seconds,
+            estimate.central_seconds,
+            estimate.upper_seconds,
+            estimate.assumed_h2d_gib_per_second,
+            estimate.estimated_ram_budget_bytes,
+            estimate.estimated_vram_budget_bytes,
+            estimate.display_minutes,
+        );
+        return Ok(());
+    }
+    let watch = infr_llama::WeightWatch::open(&gguf)?;
+    let context_plan = suite
+        .context_tokens()
+        .iter()
+        .map(|tokens| tokens.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    // print-ok: user-facing automatic benchmark plan.
+    println!(
+        "Automatic {} benchmark: untimed {}-token Prefill warmup, then real Prefill + {}-token measured Decode after a {}-token Decode warmup at context [{}], {} rep(s) each, x1..x{}.",
+        suite.as_str(),
+        suite.prefill_warmup_tokens(),
+        suite.decode_tokens(),
+        suite.decode_warmup_tokens(),
+        context_plan,
+        suite.decode_reps(),
+        parallel,
+    );
+
+    let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
+    let architecture = loaded
+        .gguf()
+        .metadata()
+        .str("general.architecture")
+        .unwrap_or("unknown")
+        .to_string();
+    let footprint = infr_llama::weight_footprint(loaded.gguf());
+    let required_ctx = suite
+        .max_context_tokens()
+        .saturating_add(suite.decode_warmup_tokens())
+        .saturating_add(suite.decode_tokens())
+        .saturating_add(256);
+    let want_ctx = cfg
+        .device
+        .ctx
+        .or(Some(infr_core::SizeSpec::Bytes(required_ctx as u64)));
+    if let Some(
+        infr_core::SizeSpec::Bytes(tokens) | infr_core::SizeSpec::FrozenAutomaticBytes(tokens),
+    ) = want_ctx
+    {
+        anyhow::ensure!(
+            tokens as usize >= required_ctx,
+            "automatic {} benchmark needs at least {required_ctx} context tokens; configured --ctx is {tokens}",
+            suite.as_str()
+        );
+    }
+    let load_started = std::time::Instant::now();
+    let engine = infr_llama::parallel::ParallelSeam::new(loaded, parallel, want_ctx)?;
+    let startup_seconds = load_started.elapsed().as_secs_f64();
+    anyhow::ensure!(
+        engine.max_ctx() >= required_ctx,
+        "automatic benchmark needs {required_ctx} tokens per slot, but placement provided {}",
+        engine.max_ctx()
+    );
+    diagnostics::mark_runtime();
+    let mut failures = Vec::new();
+    let prefill_warmup =
+        match make_suite_warmup_prompt(engine.model(), suite.prefill_warmup_tokens()).and_then(
+            |(prompts, _)| {
+                let wall_started = std::time::Instant::now();
+                let stats = engine.prepare_benchmark_slots(&prompts, None)?;
+                let scored = stats
+                    .first()
+                    .copied()
+                    .context("Prefill warmup produced no result")?;
+                Ok((scored, wall_started.elapsed().as_secs_f64()))
+            },
+        ) {
+            Ok((stats, wall_seconds)) => {
+                let tokens_per_second = stats.n_prompt as f64 / stats.prompt_secs.max(1e-9);
+                // print-ok: untimed benchmark warmup result requested by the user.
+                println!(
+                    "Prefill warmup: {} tokens in {:.3}s = {:.1} tok/s (not scored).",
+                    stats.n_prompt, stats.prompt_secs, tokens_per_second
+                );
+                Some(serde_json::json!({
+                    "tokens": stats.n_prompt,
+                    "seconds": stats.prompt_secs,
+                    "wall_seconds": wall_seconds,
+                    "tokens_per_second": tokens_per_second,
+                    "scored": false,
+                }))
+            }
+            Err(error) => {
+                let error = format!("{error:#}");
+                // print-ok: immediate warmup failure feedback before continuing the suite.
+                eprintln!("Prefill warmup failed; continuing with scored cases: {error}");
+                failures.push(SuiteFailure {
+                    stage: "prefill_warmup",
+                    parallel: None,
+                    repetition: None,
+                    error,
+                });
+                None
+            }
+        };
+    if let Err(error) = engine.clear_benchmark_slots() {
+        let error = format!("{error:#}");
+        // print-ok: immediate benchmark reset failure, also retained in the final result.
+        eprintln!("Clearing the Prefill warmup slot failed; continuing: {error}");
+        failures.push(SuiteFailure {
+            stage: "prefill_warmup_reset",
+            parallel: None,
+            repetition: None,
+            error,
+        });
+    }
+    let mut contexts = Vec::with_capacity(suite.context_tokens().len());
+    for &context_tokens in suite.context_tokens() {
+        contexts.push(run_suite_context(&engine, suite, context_tokens, parallel));
+    }
+    if let Err(error) = watch.check() {
+        let error = format!("{error:#}");
+        // print-ok: benchmark integrity failure, also retained in the final result.
+        eprintln!("Weight integrity check failed after the benchmark: {error}");
+        failures.push(SuiteFailure {
+            stage: "weight_integrity",
+            parallel: None,
+            repetition: None,
+            error,
+        });
+    }
+
+    let vram_after = engine.vram_info();
+    let process_resident = infr_core::hostmem::process_resident_bytes();
+    let ram_available_after = infr_core::hostmem::available_bytes();
+    // print-ok: final table remains visible after the process exits.
+    println!("\n结果 / Results");
+    // print-ok: benchmark result table border.
+    println!("+----------+------------+----------+----------+----------+----------+");
+    // print-ok: benchmark result table heading.
+    println!("| Context  | Workload   | First    | Middle   | Last     | Overall  |");
+    // print-ok: benchmark result table border.
+    println!("+----------+------------+----------+----------+----------+----------+");
+    for context in &contexts {
+        let context_label = if context.requested_context_tokens % 1024 == 0 {
+            format!("{}K", context.requested_context_tokens / 1024)
+        } else {
+            context.requested_context_tokens.to_string()
+        };
+        if let Some(prefill) = &context.prefill {
+            // print-ok: final Prefill benchmark table row.
+            println!(
+                "| {context_label:<8} | {:<10} | {:>8} | {:>8} | {:>8} | {:>8.1} |",
+                "Prefill", "-", "-", "-", prefill.tokens_per_second,
+            );
+        }
+        for case in &context.decode {
+            // print-ok: final Decode benchmark table row.
+            println!(
+                "| {context_label:<8} | {:<10} | {:>8.1} | {:>8.1} | {:>8.1} | {:>8.1} |",
+                format!("Decode x{}", case.parallel),
+                case.section_mean_tokens_per_second[0],
+                case.section_mean_tokens_per_second[1],
+                case.section_mean_tokens_per_second[2],
+                case.overall_tokens_per_second,
+            );
+        }
+    }
+    // print-ok: benchmark result table border.
+    println!("+----------+------------+----------+----------+----------+----------+");
+    // print-ok: benchmark result units.
+    println!("All speeds are aggregate tok/s. / 速度均为聚合 tok/s。");
+    for context in &contexts {
+        for failure in &context.failures {
+            // print-ok: final benchmark failure summary requested by the user.
+            println!(
+                "失败 / FAILED context={} {}{}{}: {}",
+                context.requested_context_tokens,
+                failure.stage,
+                failure
+                    .parallel
+                    .map(|parallel| format!(" x{parallel}"))
+                    .unwrap_or_default(),
+                failure
+                    .repetition
+                    .map(|repetition| format!(" rep {repetition}"))
+                    .unwrap_or_default(),
+                failure.error
+            );
+        }
+    }
+    for failure in &failures {
+        // print-ok: final benchmark-wide failure summary.
+        println!("失败 / FAILED {}: {}", failure.stage, failure.error);
+    }
+    let result = SuiteResult {
+        schema_version: 1,
+        id: String::new(),
+        created_at_utc: chrono::Utc::now().to_rfc3339(),
+        engine_version: env!("CARGO_PKG_VERSION"),
+        engine_commit: option_env!("INFR_GIT_COMMIT"),
+        profile: suite.as_str(),
+        model: serde_json::json!({
+            "name": gguf.file_name().and_then(|name| name.to_str()).unwrap_or("model"),
+            "architecture": architecture,
+            "storage_bytes": model_bytes,
+            "resident_weight_bytes": footprint.total(),
+            "dense_weight_bytes": footprint.dense,
+            "expert_weight_bytes": footprint.expert,
+        }),
+        hardware: serde_json::json!({
+            "os": std::env::consts::OS,
+            "architecture": std::env::consts::ARCH,
+            "cpu": {
+                "name": benchmark_cpu_name(),
+                "logical_threads": std::thread::available_parallelism().ok().map(|value| value.get()),
+            },
+            "ram": {
+                "total_bytes": ram_total,
+                "available_before_bytes": ram_available_before,
+                "available_after_bytes": ram_available_after,
+                "process_resident_after_bytes": process_resident,
+                "memory_generation": serde_json::Value::Null,
+            },
+            "gpu": {
+                "name": device.name,
+                "type": device.device_type,
+                "integrated": device.integrated,
+                "vram_total_bytes": device.vram_total_bytes,
+                "vram_available_before_bytes": vram_available_before,
+                "vram_available_after_bytes": vram_after.available,
+                "vram_used_delta_bytes": vram_available_before.saturating_sub(vram_after.available),
+                "vram_available_is_live_before": device.vram_live,
+                "vram_available_is_live_after": vram_after.live,
+                "unified_memory": vram_after.uma,
+                "pcie_generation": serde_json::Value::Null,
+                "pcie_width": serde_json::Value::Null,
+            },
+        }),
+        configuration: serde_json::json!({
+            "max_parallel": parallel,
+            "per_slot_context_limit": engine.max_ctx(),
+            "requested_context_tokens": suite.context_tokens(),
+            "prefill_warmup_tokens": suite.prefill_warmup_tokens(),
+            "decode_tokens_per_rep": suite.decode_tokens(),
+            "decode_warmup_tokens_per_rep": suite.decode_warmup_tokens(),
+            "decode_repetitions": suite.decode_reps(),
+            "decode_sections": [
+                suite.decode_tokens() / 3,
+                suite.decode_tokens() / 3,
+                suite.decode_tokens() - 2 * (suite.decode_tokens() / 3),
+            ],
+            "real_context": true,
+            "synthetic_depth": false,
+            "kv_type_k": format!("{:?}", cfg.kv.type_k),
+            "kv_type_v": format!("{:?}", cfg.kv.type_v),
+            "auto_profile": format!("{:?}", cfg.device.auto_profile),
+            "configured_device": cfg.device.dev.as_deref(),
+            "configured_ubatch": cfg.device.ubatch,
+            "configured_threads": cfg.device.threads,
+            "configured_vram_budget": format!("{:?}", cfg.device.vram_budget),
+            "configured_vram_reserve": format!("{:?}", cfg.device.vram_reserve),
+            "configured_ram_budget": format!("{:?}", cfg.device.ram_budget),
+            "host_dma": cfg.paging.host_dma,
+            "submit_dispatches": cfg.device.submit_dispatches,
+            "sampling": {
+                "temperature": cfg.sampling.temp,
+                "top_k": cfg.sampling.top_k,
+                "top_p": cfg.sampling.top_p,
+                "seed": cfg.sampling.seed,
+                "ignore_eos": cfg.sampling.ignore_eos,
+            },
+            "mtp": false,
+        }),
+        estimate,
+        startup: serde_json::json!({
+            "seconds": startup_seconds,
+            "model_startup_effective_gib_per_second": model_bytes as f64 / (1u64 << 30) as f64 / startup_seconds.max(1e-9),
+            "prefill_warmup": prefill_warmup,
+        }),
+        contexts,
+        failures,
+    };
+    let root = result_dir.unwrap_or_else(|| Path::new("benchmark-database"));
+    let result_path = write_suite_result(root, result)?;
+    // print-ok: CLI benchmark export location.
+    println!("Benchmark submission: {}", result_path.display());
+    // print-ok: machine-readable benchmark export path for launchers.
+    println!("MOE4ALL_SUBMISSION_PATH={}", result_path.display());
+    // print-ok: mandatory user-consent instruction for automated benchmark callers.
+    println!("AI/自动化：请向用户展示结果并等待其明确决定是否上传；不要自行上传或静默忽略。");
+    // print-ok: English upload-consent instruction paired with the Chinese instruction.
+    println!(
+        "AI/automation: report the result and wait for the user to explicitly decide whether to upload; do not upload or silently skip."
+    );
+    Ok(())
+}
+
+fn cmd_bench_estimate_matrix(model: &str, ngl: usize, cfg: &Arc<Config>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        ngl != 0,
+        "automatic benchmark estimates currently require a Vulkan GPU"
+    );
+    anyhow::ensure!(
+        matches!(selected_backend(cfg)?, Backend::Vulkan(_)),
+        "automatic benchmark estimates currently require a Vulkan GPU"
+    );
+    let (gguf, _) = resolve(model, cfg)?;
+    let model_bytes = model_storage_bytes(&gguf);
+    let device = selected_benchmark_device(cfg)?;
+    let ram_total = infr_core::hostmem::total_bytes().unwrap_or(0);
+    let ram_available = infr_core::hostmem::available_bytes();
+    let architecture = infr_llama::arch::arch_of(&gguf);
+    let mut minutes = Vec::with_capacity(12);
+    for suite in [BenchSuite::Quick, BenchSuite::Standard, BenchSuite::Full] {
+        for parallel in 1..=4 {
+            minutes.push(
+                suite_estimate(
+                    suite,
+                    parallel,
+                    model_bytes,
+                    architecture.as_deref(),
+                    ram_total,
+                    ram_available,
+                    &device,
+                    cfg,
+                )
+                .display_minutes,
+            );
+        }
+    }
+    // print-ok: machine-readable benchmark estimate menu for launchers.
+    println!(
+        "BENCH_ESTIMATE_MENU_V1|{}",
+        minutes
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join("|")
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_bench(
     model: &str,
@@ -4756,6 +6632,7 @@ fn cmd_serve(
         let generator: std::sync::Arc<dyn infr_server::ChatGenerator> =
             std::sync::Arc::new(ParallelGenerator::new(&gguf, engine, vision, cfg.clone())?);
         let rt = tokio::runtime::Runtime::new()?;
+        diagnostics::mark_runtime();
         // print-ok: program OUTPUT — the serve/multi startup banner and routing listing.
         println!(
             "infr serve: {model_id} on http://{sockaddr}  (OpenAI /v1, {n_slots} slot{} x {max_ctx} ctx{})",
@@ -4815,6 +6692,7 @@ fn cmd_serve(
         let generator: std::sync::Arc<dyn infr_server::ChatGenerator> =
             std::sync::Arc::new(SeamGenerator::new(&gguf, m, cfg.clone())?);
         let rt = tokio::runtime::Runtime::new()?;
+        diagnostics::mark_runtime();
         // print-ok: program OUTPUT — the serve/multi startup banner and routing listing.
         println!("infr serve: {model_id} on http://{sockaddr}  (OpenAI /v1, agnostic seam)");
         match embedding {
@@ -5085,6 +6963,8 @@ fn cmd_multi(
         entries.push((model_id, generator, n_slots));
     }
 
+    diagnostics::mark_runtime();
+
     // Print the model → device routing so the demo shows exactly which model landed on which GPU.
     // print-ok: program OUTPUT — the serve/multi startup banner and routing listing.
     println!(
@@ -5108,6 +6988,49 @@ fn cmd_multi(
 mod tests {
     use super::*;
     use infr_llama::arch::*;
+
+    #[test]
+    fn diagnostic_arguments_redact_prompts_and_secrets_but_keep_benchmark_shape() {
+        let arguments = [
+            "run",
+            "D:\\models\\model.gguf",
+            "private one-shot message",
+            "--set",
+            "serve.api_key=secret",
+            "--n-prompt=6000",
+        ]
+        .map(str::to_string);
+        assert_eq!(
+            sanitize_launch_arguments(
+                arguments,
+                Some("D:\\models\\model.gguf"),
+                Some("private one-shot message")
+            ),
+            [
+                "run",
+                "model.gguf",
+                "<redacted-message>",
+                "--set",
+                "<redacted-setting>",
+                "--n-prompt=6000",
+            ]
+        );
+    }
+
+    #[test]
+    fn diagnostic_model_paths_are_redacted_independently_of_host_platform() {
+        for model in [
+            "D:\\models\\model.gguf",
+            "/home/private/models/model.gguf",
+            "D:\\models/mixed\\model.gguf",
+            "\\\\private-server\\models\\model.gguf",
+        ] {
+            assert_eq!(
+                sanitize_launch_arguments([model.to_string()], Some(model), None),
+                ["model.gguf"],
+            );
+        }
+    }
 
     /// A synthetic `INFR_*` environment, driven through the config env layer's INJECTED reader.
     ///
@@ -5513,6 +7436,10 @@ mod tests {
     fn bench_cmd() -> Cmd {
         Cmd::Bench {
             model: "m".to_string(),
+            suite: None,
+            parallel: None,
+            result_dir: None,
+            estimate_only: false,
             n_prompt: 512,
             n_gen: 0,
             depth: 0,
@@ -5553,6 +7480,197 @@ mod tests {
         assert_eq!(synthetic_depth, Some(100000));
         assert_eq!(n_prompt, 0);
         assert_eq!(n_gen, 128);
+    }
+
+    #[test]
+    fn bench_parses_automatic_suite_and_concurrency() {
+        let cli = Cli::try_parse_from([
+            "infr",
+            "bench",
+            "--suite",
+            "standard",
+            "--parallel",
+            "3",
+            "--result-dir",
+            "benchmark-database",
+            "model.gguf",
+        ])
+        .unwrap();
+        let Some(Cmd::Bench {
+            suite,
+            parallel,
+            result_dir,
+            ..
+        }) = cli.cmd
+        else {
+            panic!("expected bench command");
+        };
+        assert_eq!(suite, Some(BenchSuite::Standard));
+        assert_eq!(parallel, Some(3));
+        assert_eq!(result_dir.as_deref(), Some(Path::new("benchmark-database")));
+    }
+
+    #[test]
+    fn bench_parses_estimate_only() {
+        let cli = Cli::try_parse_from([
+            "infr",
+            "bench",
+            "--suite",
+            "quick",
+            "--estimate-only",
+            "model.gguf",
+        ])
+        .unwrap();
+        let Some(Cmd::Bench { estimate_only, .. }) = cli.cmd else {
+            panic!("expected bench command");
+        };
+        assert!(estimate_only);
+    }
+
+    #[test]
+    fn bench_parses_launcher_estimate_matrix_without_suite() {
+        let cli = Cli::try_parse_from(["infr", "bench", "--estimate-only", "model.gguf"]).unwrap();
+        let Some(Cmd::Bench {
+            suite,
+            estimate_only,
+            ..
+        }) = cli.cmd
+        else {
+            panic!("expected bench command");
+        };
+        assert_eq!(suite, None);
+        assert!(estimate_only);
+    }
+
+    #[test]
+    fn bench_suite_profiles_match_the_published_contract() {
+        assert_eq!(BenchSuite::Quick.context_tokens(), &[6 * 1024]);
+        assert_eq!(
+            BenchSuite::Standard.context_tokens(),
+            &[6 * 1024, 30 * 1024]
+        );
+        assert_eq!(
+            BenchSuite::Full.context_tokens(),
+            &[6 * 1024, 30 * 1024, 150 * 1024]
+        );
+        assert_eq!(BenchSuite::Quick.decode_tokens(), 1024);
+        assert_eq!(BenchSuite::Quick.prefill_warmup_tokens(), 6 * 1024);
+        assert_eq!(BenchSuite::Quick.decode_warmup_tokens(), 512);
+        assert_eq!(BenchSuite::Quick.decode_reps(), 1);
+        assert_eq!(BenchSuite::Standard.decode_reps(), 1);
+        assert_eq!(BenchSuite::Full.decode_reps(), 3);
+        assert_eq!(BenchSuite::Quick.default_parallel(), 1);
+        assert_eq!(BenchSuite::Standard.default_parallel(), 2);
+        assert_eq!(BenchSuite::Full.default_parallel(), 4);
+    }
+
+    #[test]
+    fn suite_estimate_tracks_the_current_35b_quick_baseline() {
+        let mut cfg = Config::default();
+        cfg.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
+        cfg.device.ram_budget = Some(infr_core::SizeSpec::FrozenAutomaticBytes(54_668_058_624));
+        let device = infr_vulkan::DeviceInfo {
+            index: 1,
+            name: "AMD Radeon RX 7900 XTX".to_string(),
+            device_type: "discrete",
+            integrated: false,
+            vram_bytes: 25_753_026_560,
+            vram_total_bytes: 25_753_026_560,
+            vram_available_bytes: 24_902_938_624,
+            vram_live: true,
+            is_default_pick: true,
+            external_memory: true,
+            external_memory_fd: false,
+            external_memory_dma_buf: false,
+            flash_attention_hd256: true,
+        };
+        let estimate = suite_estimate(
+            BenchSuite::Quick,
+            3,
+            25_624_957_632,
+            Some("qwen35moe"),
+            68_626_702_336,
+            Some(42_913_292_288),
+            &device,
+            &cfg,
+        );
+        // The measured shape-warmup run was about 94 seconds including Decode warmups. Keep the
+        // formula honest without pretending one host is a universal exact-performance oracle.
+        assert!(
+            (85.0..=105.0).contains(&estimate.central_seconds),
+            "{}",
+            estimate.central_seconds
+        );
+        assert!(estimate.startup_seconds > 20.0);
+        assert!(estimate.decode_seconds > estimate.prefill_seconds);
+        assert_eq!(estimate.architecture_class, "full-attention");
+        assert_eq!(estimate.display_minutes, 3);
+
+        let standard = suite_estimate(
+            BenchSuite::Standard,
+            2,
+            25_624_957_632,
+            Some("qwen35moe"),
+            68_626_702_336,
+            Some(42_913_292_288),
+            &device,
+            &cfg,
+        );
+        // Reconstructing the same plan from the published 6K/30K stage rates gives about 129s.
+        assert!((120.0..=145.0).contains(&standard.central_seconds));
+        assert_eq!(standard.display_minutes, 3);
+
+        let full_x3 = suite_estimate(
+            BenchSuite::Full,
+            3,
+            25_624_957_632,
+            Some("qwen35moe"),
+            68_626_702_336,
+            Some(42_913_292_288),
+            &device,
+            &cfg,
+        );
+        // The 6K/30K/150K x1-x3 release table reconstructs to about 1475s.
+        assert!((1_300.0..=1_550.0).contains(&full_x3.central_seconds));
+        assert_eq!(full_x3.display_minutes, 31);
+    }
+
+    #[test]
+    fn continuous_decode_boundaries_produce_three_sections_without_restarts() {
+        let result = summarize_suite_decode(
+            [341, 341, 342],
+            &[
+                [1_000_000_000, 2_000_000_000, 3_000_000_000, 4_000_000_000],
+                [1_200_000_000, 2_200_000_000, 3_200_000_000, 4_200_000_000],
+            ],
+        )
+        .unwrap();
+        assert_eq!(result.sections[0].tokens, 682);
+        assert!((result.sections[0].seconds - 1.0).abs() < 1e-9);
+        assert!((result.sections[1].seconds - 1.0).abs() < 1e-9);
+        assert!((result.sections[2].seconds - 1.0).abs() < 1e-9);
+        assert_eq!(result.overall.tokens, 2048);
+        assert!((result.overall.seconds - 3.0).abs() < 1e-9);
+        assert!((result.overall.tokens_per_second - (2048.0 / 3.0)).abs() < 1e-9);
+        assert_eq!(result.lane_tokens_per_second[0].len(), 2);
+    }
+
+    #[test]
+    fn continuous_decode_rejects_missing_or_reordered_boundaries() {
+        assert!(summarize_suite_decode([1, 1, 1], &[[1, 2, 0, 4]]).is_err());
+        assert!(summarize_suite_decode([1, 1, 1], &[[2, 1, 3, 4]]).is_err());
+    }
+
+    #[test]
+    fn bench_rejects_automatic_only_flags_without_a_suite() {
+        let error = match Cli::try_parse_from(["infr", "bench", "--parallel", "2", "model.gguf"]) {
+            Ok(_) => panic!("--parallel without --suite must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[test]

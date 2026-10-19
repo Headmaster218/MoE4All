@@ -541,6 +541,13 @@ impl<'a> Bindings<'a> {
     }
 }
 
+/// Optional idle residency that can be dropped before retrying a failed logical allocation.
+/// Called under the shared device execution gate: implementations must not submit GPU work,
+/// wait for another execution gate, or block on request-owned locks. Return false if busy.
+pub trait IdleResourceReclaimer: Send + Sync {
+    fn try_reclaim_idle(&self) -> bool;
+}
+
 /// A compute device. Implementations: `infr-vulkan`, `infr-cpu`, `infr-metal`.
 pub trait Backend: Send + Sync {
     fn name(&self) -> &str;
@@ -695,6 +702,9 @@ pub trait Backend: Send + Sync {
     /// elastic backend should leave expert slots borrowed instead of eagerly refilling them into
     /// space the next graph will need.
     fn release_transient_runtime(&self) {}
+    /// Register caller-owned, independently evictable residency. The backend retains only a weak
+    /// reference and must exclude the allocating client. Backends without pressure recovery ignore it.
+    fn register_idle_reclaimer(&self, _reclaimer: std::sync::Weak<dyn IdleResourceReclaimer>) {}
     /// Select a Prefill chunk from tallest-first `(rows, runtime reserve bytes)` candidates after the prompt's
     /// persistent KV is resident. Called only at a serial phase boundary, before chunk buffers
     /// exist. Backends without a shared expert arena leave the caller's chunk unchanged.
