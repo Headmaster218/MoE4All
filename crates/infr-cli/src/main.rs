@@ -1020,7 +1020,9 @@ fn install_panic_report_hook() {
                 payload.to_string()
             };
             if let Ok(path) = diagnostics::create_report(files, "panic", "", &[message]) {
+                // print-ok: CLI panic report location, independent of logger availability.
                 eprintln!("Diagnostic report: {}", path.display());
+                // print-ok: machine-readable panic report path for launchers.
                 eprintln!("MOE4ALL_ERROR_REPORT={}", path.display());
             }
         }
@@ -1038,6 +1040,7 @@ fn main() {
         match diagnostics::initialize(&diagnostics::default_root(), metadata, redactions) {
             Ok(guard) => Some(guard),
             Err(error) => {
+                // print-ok: bootstrap failure before the tracing subscriber exists.
                 eprintln!("warning: diagnostic recorder is unavailable: {error:#}");
                 None
             }
@@ -1073,10 +1076,13 @@ fn main() {
                 let chain = error.chain().map(ToString::to_string).collect::<Vec<_>>();
                 match diagnostics::create_report(guard.files(), "fatal", "", &chain) {
                     Ok(path) => {
+                        // print-ok: CLI fatal report location, visible even with filtered logs.
                         eprintln!("Diagnostic report: {}", path.display());
+                        // print-ok: machine-readable fatal report path for launchers.
                         eprintln!("MOE4ALL_ERROR_REPORT={}", path.display());
                     }
                     Err(report_error) => {
+                        // print-ok: CLI report-writing failure, visible even with filtered logs.
                         eprintln!("warning: could not write diagnostic report: {report_error:#}");
                     }
                 }
@@ -1087,6 +1093,7 @@ fn main() {
         guard.finish();
     }
     if let Err(error) = result {
+        // print-ok: CLI final error after the diagnostic writer has stopped.
         eprintln!("Error: {error:#}");
         std::process::exit(1);
     }
@@ -1195,12 +1202,18 @@ fn validate_error_payload(value: &serde_json::Value) -> anyhow::Result<()> {
 }
 
 fn print_submission_summary(decoded: &submission::Decoded) {
+    // print-ok: submission verification output consumed by users and launchers.
     println!("{}", submission::ARMOR_VERSION);
+    // print-ok: submission verification kind.
     println!("kind: {}", decoded.kind.as_str());
+    // print-ok: submission verification schema.
     println!("schema: {}", decoded.schema);
+    // print-ok: submission verification identity.
     println!("id: {}", decoded.id);
+    // print-ok: submission verification timestamp.
     println!("created-at: {}", decoded.created_at);
     for line in submission::summary(decoded.kind, &decoded.payload) {
+        // print-ok: user-visible verification summary, not diagnostic logging.
         println!("{line}");
     }
 }
@@ -1223,7 +1236,9 @@ fn cmd_submission(action: SubmissionCommand) -> anyhow::Result<()> {
                 .join("v1")
                 .join(created.format("%Y-%m").to_string());
             let path = submission::write_new(&directory, submission::Kind::Benchmark, &value)?;
+            // print-ok: CLI benchmark export location.
             println!("Benchmark submission: {}", path.display());
+            // print-ok: machine-readable export path for launchers.
             println!("MOE4ALL_SUBMISSION_PATH={}", path.display());
             Ok(())
         }
@@ -1253,7 +1268,9 @@ fn cmd_submission(action: SubmissionCommand) -> anyhow::Result<()> {
             let text = submission::encode(submission::Kind::Benchmark, &value)?;
             std::fs::write(&source, text)
                 .with_context(|| format!("replace benchmark submission {}", source.display()))?;
+            // print-ok: CLI benchmark re-export location.
             println!("Benchmark submission: {}", source.display());
+            // print-ok: machine-readable re-export path for launchers.
             println!("MOE4ALL_SUBMISSION_PATH={}", source.display());
             Ok(())
         }
@@ -1273,6 +1290,7 @@ fn cmd_submission(action: SubmissionCommand) -> anyhow::Result<()> {
                 std::fs::write(&output, json)
                     .with_context(|| format!("write decoded JSON {}", output.display()))?;
             } else {
+                // print-ok: requested decoded JSON on stdout, usable in pipes.
                 print!("{json}");
             }
             Ok(())
@@ -1308,9 +1326,13 @@ fn cmd_report(
         let files = diagnostics::find_latest_session(&root)?;
         diagnostics::create_report(&files, "runtime", description.trim(), &[])?
     };
+    // print-ok: CLI error report export location.
     println!("Error report: {}", path.display());
+    // print-ok: machine-readable error export path for launchers.
     println!("MOE4ALL_SUBMISSION_PATH={}", path.display());
+    // print-ok: mandatory upload-consent guidance for human and automated callers.
     println!("AI/自动化：请向用户展示报告摘要并等待其明确决定是否上传；不得自动上传。");
+    // print-ok: English upload-consent guidance paired with the Chinese instruction.
     println!("AI/automation: show the report summary and wait for explicit upload consent; never upload automatically.");
     Ok(())
 }
@@ -3956,6 +3978,7 @@ fn run_suite_context(
 
     // Extra slots are required for real concurrent Decode but are not reported as additional
     // Prefill benchmark samples.
+    // print-ok: benchmark preparation progress requested by the user.
     println!(
         "Preparing {parallel} real context slot(s) at {context_tokens} tokens; only slot 1 is the Prefill score..."
     );
@@ -3998,8 +4021,10 @@ fn run_suite_context(
     {
         Ok(stats) => stats,
         Err(error) => {
+            // print-ok: end the CLI progress line before reporting the case failure.
             eprintln!();
             let error = format!("{error:#}");
+            // print-ok: immediate benchmark failure feedback, also retained in the final result.
             eprintln!("Prefill {context_tokens} failed; continuing: {error}");
             result.failures.push(SuiteFailure {
                 stage: "prefill",
@@ -4010,6 +4035,7 @@ fn run_suite_context(
             return result;
         }
     };
+    // print-ok: terminate the CLI Prefill progress line.
     eprintln!();
     let setup_seconds = setup_started.elapsed().as_secs_f64();
     let Some(scored) = prefill_stats.first().copied() else {
@@ -4022,6 +4048,7 @@ fn run_suite_context(
         return result;
     };
     let prefill_tps = scored.n_prompt as f64 / scored.prompt_secs.max(1e-9);
+    // print-ok: completed Prefill benchmark score.
     println!(
         "Prefill {context_tokens}: {} evaluated tokens in {:.3}s = {:.1} tok/s. Context slots ready in {:.1}s.",
         scored.n_prompt, scored.prompt_secs, prefill_tps, setup_seconds
@@ -4039,6 +4066,7 @@ fn run_suite_context(
     for active in 1..=parallel {
         let mut repetitions = Vec::with_capacity(suite.decode_reps());
         for rep in 0..suite.decode_reps() {
+            // print-ok: user-requested Decode benchmark repetition progress.
             println!(
                 "Decode {context_tokens} x{active} rep {}/{}...",
                 rep + 1,
@@ -4052,6 +4080,7 @@ fn run_suite_context(
                 active,
             ) {
                 Ok(measurement) => {
+                    // print-ok: completed Decode benchmark repetition score.
                     println!(
                         "Decode {context_tokens} x{active} rep {}/{}: first {:.1}, middle {:.1}, last {:.1}, overall {:.1} tok/s",
                         rep + 1,
@@ -4065,6 +4094,7 @@ fn run_suite_context(
                 }
                 Err(error) => {
                     let error = format!("{error:#}");
+                    // print-ok: immediate case failure, also retained in the final result.
                     eprintln!(
                         "Decode {context_tokens} x{active} rep {}/{} failed; continuing: {error}",
                         rep + 1,
@@ -4191,6 +4221,7 @@ fn cmd_bench_suite(
     );
     if estimate_only {
         // Stable, dependency-free launcher protocol. Human diagnostics stay on stderr.
+        // print-ok: machine-readable benchmark estimate for the launch wizard.
         println!(
             "BENCH_ESTIMATE_V1|{:.0}|{:.0}|{:.0}|{:.2}|{}|{}|{}",
             estimate.lower_seconds,
@@ -4273,6 +4304,7 @@ fn cmd_bench_suite(
         ) {
             Ok((stats, wall_seconds)) => {
                 let tokens_per_second = stats.n_prompt as f64 / stats.prompt_secs.max(1e-9);
+                // print-ok: untimed benchmark warmup result requested by the user.
                 println!(
                     "Prefill warmup: {} tokens in {:.3}s = {:.1} tok/s (not scored).",
                     stats.n_prompt, stats.prompt_secs, tokens_per_second
@@ -4287,6 +4319,7 @@ fn cmd_bench_suite(
             }
             Err(error) => {
                 let error = format!("{error:#}");
+                // print-ok: immediate warmup failure feedback before continuing the suite.
                 eprintln!("Prefill warmup failed; continuing with scored cases: {error}");
                 failures.push(SuiteFailure {
                     stage: "prefill_warmup",
@@ -4299,6 +4332,7 @@ fn cmd_bench_suite(
         };
     if let Err(error) = engine.clear_benchmark_slots() {
         let error = format!("{error:#}");
+        // print-ok: immediate benchmark reset failure, also retained in the final result.
         eprintln!("Clearing the Prefill warmup slot failed; continuing: {error}");
         failures.push(SuiteFailure {
             stage: "prefill_warmup_reset",
@@ -4313,6 +4347,7 @@ fn cmd_bench_suite(
     }
     if let Err(error) = watch.check() {
         let error = format!("{error:#}");
+        // print-ok: benchmark integrity failure, also retained in the final result.
         eprintln!("Weight integrity check failed after the benchmark: {error}");
         failures.push(SuiteFailure {
             stage: "weight_integrity",
@@ -4327,8 +4362,11 @@ fn cmd_bench_suite(
     let ram_available_after = infr_core::hostmem::available_bytes();
     // print-ok: final table remains visible after the process exits.
     println!("\n结果 / Results");
+    // print-ok: benchmark result table border.
     println!("+----------+------------+----------+----------+----------+----------+");
+    // print-ok: benchmark result table heading.
     println!("| Context  | Workload   | First    | Middle   | Last     | Overall  |");
+    // print-ok: benchmark result table border.
     println!("+----------+------------+----------+----------+----------+----------+");
     for context in &contexts {
         let context_label = if context.requested_context_tokens % 1024 == 0 {
@@ -4337,12 +4375,14 @@ fn cmd_bench_suite(
             context.requested_context_tokens.to_string()
         };
         if let Some(prefill) = &context.prefill {
+            // print-ok: final Prefill benchmark table row.
             println!(
                 "| {context_label:<8} | {:<10} | {:>8} | {:>8} | {:>8} | {:>8.1} |",
                 "Prefill", "-", "-", "-", prefill.tokens_per_second,
             );
         }
         for case in &context.decode {
+            // print-ok: final Decode benchmark table row.
             println!(
                 "| {context_label:<8} | {:<10} | {:>8.1} | {:>8.1} | {:>8.1} | {:>8.1} |",
                 format!("Decode x{}", case.parallel),
@@ -4353,10 +4393,13 @@ fn cmd_bench_suite(
             );
         }
     }
+    // print-ok: benchmark result table border.
     println!("+----------+------------+----------+----------+----------+----------+");
+    // print-ok: benchmark result units.
     println!("All speeds are aggregate tok/s. / 速度均为聚合 tok/s。");
     for context in &contexts {
         for failure in &context.failures {
+            // print-ok: final benchmark failure summary requested by the user.
             println!(
                 "失败 / FAILED context={} {}{}{}: {}",
                 context.requested_context_tokens,
@@ -4374,6 +4417,7 @@ fn cmd_bench_suite(
         }
     }
     for failure in &failures {
+        // print-ok: final benchmark-wide failure summary.
         println!("失败 / FAILED {}: {}", failure.stage, failure.error);
     }
     let result = SuiteResult {
@@ -4466,9 +4510,13 @@ fn cmd_bench_suite(
     };
     let root = result_dir.unwrap_or_else(|| Path::new("benchmark-database"));
     let result_path = write_suite_result(root, result)?;
+    // print-ok: CLI benchmark export location.
     println!("Benchmark submission: {}", result_path.display());
+    // print-ok: machine-readable benchmark export path for launchers.
     println!("MOE4ALL_SUBMISSION_PATH={}", result_path.display());
+    // print-ok: mandatory user-consent instruction for automated benchmark callers.
     println!("AI/自动化：请向用户展示结果并等待其明确决定是否上传；不要自行上传或静默忽略。");
+    // print-ok: English upload-consent instruction paired with the Chinese instruction.
     println!(
         "AI/automation: report the result and wait for the user to explicitly decide whether to upload; do not upload or silently skip."
     );
@@ -4508,6 +4556,7 @@ fn cmd_bench_estimate_matrix(model: &str, ngl: usize, cfg: &Arc<Config>) -> anyh
             );
         }
     }
+    // print-ok: machine-readable benchmark estimate menu for launchers.
     println!(
         "BENCH_ESTIMATE_MENU_V1|{}",
         minutes
