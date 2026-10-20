@@ -3982,8 +3982,8 @@ fn run_token_decode_rep(
                     let first_start = state.boundaries.iter().filter_map(|row| row[0]).min();
                     (warmup_done, measured, first_start)
                 };
-                // print-ok: progress polling is not a deadline; generation always runs to its token target.
                 if warmup_done < warmup_tokens * case_parallel {
+                    // print-ok: user-requested benchmark warmup progress, outside the sampler lock.
                     eprint!(
                         "\rDecode x{case_parallel} warmup: {warmup_done}/{} tokens",
                         warmup_tokens * case_parallel
@@ -3992,13 +3992,14 @@ fn run_token_decode_rep(
                     let seconds = first_start
                         .map(|start| clock.elapsed().saturating_sub(start).as_secs_f64())
                         .unwrap_or(0.0);
-                    // print-ok: console IO happens outside the sampler lock, once per second.
                     if seconds < 0.5 || measured < 64 * case_parallel {
+                        // print-ok: user-requested benchmark progress before a stable speed is available.
                         eprint!(
                             "\rDecode x{case_parallel}: {measured}/{} tokens, measuring...",
                             tokens * case_parallel
                         );
                     } else {
+                        // print-ok: user-requested benchmark speed, outside the sampler lock, once per second.
                         eprint!(
                             "\rDecode x{case_parallel}: {measured}/{} tokens, {:.1} tok/s",
                             tokens * case_parallel,
@@ -4176,9 +4177,9 @@ fn run_suite_context(
                 active,
             ) {
                 Ok(measurement) => {
-                    for lane in 0..active {
-                        let start = prompt_lengths[lane] + measurement.start_tokens[lane];
-                        let end = prompt_lengths[lane] + measurement.end_tokens[lane];
+                    for (lane, &prompt_length) in prompt_lengths.iter().enumerate().take(active) {
+                        let start = prompt_length + measurement.start_tokens[lane];
+                        let end = prompt_length + measurement.end_tokens[lane];
                         if result.decode_measurement_start_tokens[lane] == 0 {
                             result.decode_measurement_start_tokens[lane] = start;
                         } else {
@@ -7678,9 +7679,9 @@ mod tests {
             } else {
                 engine.prepare_benchmark_slots(&prompts, None).unwrap();
             }
-            for lane in 0..4 {
+            for (lane, prompt) in prompts.iter().enumerate().take(4) {
                 let req = engine.request_ctx(infr_llama::sampling::RequestSampling::default());
-                let result = engine.generate_benchmark_turn(&prompts[lane], 16, &req);
+                let result = engine.generate_benchmark_turn(prompt, 16, &req);
                 eprintln!("frontier shared={shared} serial lane={lane}: {result:?}");
                 if let Err(error) = result {
                     failures.push(format!("shared={shared} serial lane={lane}: {error:#}"));
