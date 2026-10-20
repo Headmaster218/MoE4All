@@ -47,14 +47,26 @@ jobs:
           set -euo pipefail
           for attempt in 1 2 3; do
             git fetch origin main
+            source="$RUNNER_TEMP/benchmark-source-$attempt"
             tree="$RUNNER_TEMP/benchmark-index-$attempt"
-            git worktree add --detach "$tree" origin/main
-            node "$tree/scripts/publish-benchmark-index.mjs" --source "$tree" --repository "$GITHUB_REPOSITORY" --python python3
-            if git -C "$tree" push origin HEAD:main; then
+            git worktree add --detach "$source" origin/main
+            remote_index=$(git ls-remote --heads origin refs/heads/benchmark-index)
+            if [[ -n "$remote_index" ]]; then
+              git fetch origin benchmark-index
+              git worktree add --detach "$tree" FETCH_HEAD
+            else
+              empty_tree=$(git hash-object -w -t tree --stdin </dev/null)
+              initial=$(git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit-tree "$empty_tree" -m 'data(benchmark): initialize index branch')
+              git worktree add --detach "$tree" "$initial"
+            fi
+            node "$source/scripts/publish-benchmark-index.mjs" --source "$source" --data-dir "$tree" --repository "$GITHUB_REPOSITORY" --python python3
+            if git -C "$tree" push origin HEAD:refs/heads/benchmark-index; then
               git worktree remove "$tree"
+              git worktree remove "$source"
               exit 0
             fi
             git worktree remove "$tree"
+            git worktree remove "$source"
             sleep "$((attempt * 2))"
           done
           echo 'Index publication failed; the last published manifest remains available.' >&2

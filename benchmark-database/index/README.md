@@ -1,6 +1,7 @@
 # Compact Benchmark Index
 
-Trusted main CI rebuilds `v1/` after benchmark originals change. Report PRs must
+Trusted main CI rebuilds `v1/` on the same repository's `benchmark-index` data
+branch after benchmark originals change. Report PRs must
 contain only one original `.m4b`; contributors must not submit generated files.
 
 `v1/manifest.json` is the fixed browser entry. Its `package_commit` pins both
@@ -13,5 +14,6 @@ Data source commits and package publication commits are distinct. Originals,
 compressed payloads, columns, source links, sizes and SHA-256 are validated before
 publication. No Cloudflare request or website deployment is involved.
 
-Use the workflow's manual entry for initial publication or retry. Repository rules
-must permit its bot to update these generated files; protection is never bypassed.
+Use the workflow's manual entry for initial publication or retry. The data branch
+contains only these artifacts and their attributes. Main keeps its PR protection;
+CI never pushes generated commits to main or changes protection rules.
