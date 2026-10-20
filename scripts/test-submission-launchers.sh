@@ -31,6 +31,8 @@ ENGINE
 chmod +x "$BINARY"
 checks=0
 check() { if ! "$@"; then printf 'Failed: %s\n' "$*" >&2; exit 1; fi; checks=$((checks + 1)); }
+native_save_definition=$(typeset -f save_state)
+eval "${native_save_definition/save_state/native_save_state}"
 sleep() { printf '%s\n' "$1" >> "$work/sleeps"; }
 save_state() { :; }
 yes() { REPLY=true; }
@@ -38,7 +40,6 @@ open_submission_url() { printf '%s' "$1" > "$work/opened-url"; }
 # BSD wc pads its count; protocol comparisons must not depend on that padding.
 wc() { local count; count=$(command wc "$@") || return 1; printf '        %s\n' "$count"; }
 original_request=$(typeset -f submission_api_request)
-original_snapshot=$(typeset -f submission_connectivity_snapshot)
 eval "${original_request/submission_api_request/original_submission_api_request}"
 
 gh() {
@@ -90,7 +91,8 @@ for current_kind in benchmark error; do
     check test -f "$CONFIG_DIR/private/submission-receipts/rc_$current_kind.private-receipt.json"
     check grep -q 'submitted_file_sha256' "$CONFIG_DIR/private/submission-receipts/rc_$current_kind.private-receipt.json"
     check grep -q "$current_hash" "$CONFIG_DIR/private/submission-receipts/rc_$current_kind.private-receipt.json"
-    check grep -q "#receipt=rc_$current_kind&token=" "$work/opened-url"
+    check grep -q '/community/upload.html#session=' "$work/opened-url"
+    check test "$(grep -c '#receipt=' "$work/opened-url" || true)" = 0
     check grep -q 'status: forwarding' "$work/upload-output"
 done
 
@@ -98,71 +100,119 @@ yes() { REPLY=false; }
 if gh_submission_upload "$current_file" "$current_kind" > "$work/git-cancel-output"; then exit 1; else cancel_status=$?; fi
 check test "$cancel_status" = 2
 
-offer_mode=github
-gh_submission_upload() { printf '%s' "$2" > "$work/chosen-git-kind"; }
-website_submission_upload() { printf '%s' "$2" > "$work/chosen-web-kind"; }
-yes() { REPLY=true; [[ $offer_mode != cloudflare ]] || REPLY=false; }
-offer_submission_upload "$current_file" error true
-check grep -q error "$work/chosen-git-kind"
-offer_mode=cloudflare; offer_submission_upload "$current_file" error true
-check grep -q error "$work/chosen-web-kind"
+real_gh_submission_upload=$(typeset -f gh_submission_upload)
+real_open_github_submission=$(typeset -f open_github_submission)
+real_save_state=$(typeset -f save_state)
+reset_routes() {
+    git_attempts=0; web_attempts=0; browser_attempts=0
+    git_failures=0; web_failures=0; signed_in=true; fixture_github=true; cancel_git=false; invalid_git=false
+    S[submission_browser_action]=later; S[submission_failure_action]=later
+}
+gh() { [[ $signed_in == true ]]; }
+gh_submission_upload() {
+    git_attempts=$((git_attempts + 1))
+    [[ $cancel_git != true ]] || return 2
+    [[ $invalid_git != true ]] || return 3
+    ((git_attempts > git_failures))
+}
+website_submission_upload() { web_attempts=$((web_attempts + 1)); ((web_attempts > web_failures)); }
+open_github_submission() { browser_attempts=$((browser_attempts + 1)); }
+yes() { REPLY=$fixture_github; }
 
-submission_connectivity_snapshot() { SUBMISSION_GITHUB_CONNECTIVITY=false; SUBMISSION_CLOUDFLARE_CONNECTIVITY=false; SUBMISSION_PROXY_CONNECTIVITY=false; }
-offer_mode=github; rm -f -- "$work/chosen-git-kind" "$work/chosen-web-kind"
+reset_routes
 offer_submission_upload "$current_file" error true
-check test -f "$work/chosen-git-kind"
-check test ! -f "$work/chosen-web-kind"
-gh_submission_upload() { return 1; }
+check test "$git_attempts" = 1
+check test "$browser_attempts" = 0
+check test "$web_attempts" = 0
+reset_routes; git_failures=1
 offer_submission_upload "$current_file" error true
-check test -f "$work/chosen-web-kind"
-eval "$original_snapshot"
-gh_submission_upload() { printf '%s' "$2" > "$work/chosen-git-kind"; }
-
-website_submission_upload() { return 1; }
-yes() { REPLY=false; }
-if offer_submission_upload "$current_file" error true; then exit 1; fi
+check test "$git_attempts" = 2
+check test "$browser_attempts" = 0
+reset_routes; git_failures=2
+if offer_submission_upload "$current_file" error true <<< '4'; then exit 1; fi
+check test "$git_attempts" = 2
+check test "$browser_attempts" = 1
+check test "$web_attempts" = 0
 pending_file="$CONFIG_DIR/private/pending-submissions/${current_file##*/}"
 check test -f "$pending_file"
-website_submission_upload() { printf '%s' "$2" > "$work/retried-web-kind"; }
-yes() {
-    case $1 in
-        *Retry\ now*) REPLY=true ;;
-        *GitHub\ account*) REPLY=false ;;
-        *) REPLY=true ;;
-    esac
-}
-SUBMISSION_CONNECTIVITY_FILE=$CONFIG_DIR/private/submission-connectivity.status
-SUBMISSION_CONNECTIVITY_GENERATION=fixture
-printf 'generation=fixture\ngithub=false\ncloudflare=false\nproxy=not-configured\n' > "$SUBMISSION_CONNECTIVITY_FILE"
+reset_routes; git_failures=2
+offer_submission_upload "$current_file" error true <<< '3'
+check test "$web_attempts" = 1
+check test ! -f "$pending_file"
+reset_routes; signed_in=false
+offer_submission_upload "$current_file" error true <<< $'2\n1'
+check test "$git_attempts" = 0
+check test "$browser_attempts" = 2
+check test "$web_attempts" = 0
+reset_routes; fixture_github=false
+offer_submission_upload "$current_file" error true
+check test "$web_attempts" = 1
+check test "$git_attempts" = 0
+check test "$browser_attempts" = 0
+reset_routes; fixture_github=false; web_failures=1
+offer_submission_upload "$current_file" error true <<< '1'
+check test "$web_attempts" = 2
+reset_routes; fixture_github=false; signed_in=false; web_failures=1
+fixture_account_reads=0
+yes() { fixture_account_reads=$((fixture_account_reads + 1)); REPLY=false; ((fixture_account_reads < 2)) || REPLY=true; }
+offer_submission_upload "$current_file" error true <<< $'2\n1'
+check test "$web_attempts" = 1
+check test "$browser_attempts" = 1
+yes() { REPLY=$fixture_github; }
+reset_routes; fixture_github=false; web_failures=1
+if offer_submission_upload "$current_file" error true <<< '3'; then exit 1; fi
+check test -f "$pending_file"
+reset_routes; cancel_git=true
+if offer_submission_upload "$current_file" error true; then exit 1; fi
+check test "$git_attempts" = 1
+check test "$web_attempts" = 0
+check test "$browser_attempts" = 0
+check test -f "$pending_file"
+reset_routes; invalid_git=true
+if offer_submission_upload "$current_file" error true; then exit 1; fi
+check test "$git_attempts" = 1
+check test "$browser_attempts" = 0
+check test "$web_attempts" = 0
+reset_routes
+PENDING_SUBMISSION_PROMPTED=false
+yes() { REPLY=true; }
+retry_pending_submissions
+check test ! -f "$pending_file"
+check test -f "$current_file"
+
+# Saving settings can modify REPLY; the selected action must survive it.
+save_state() { REPLY=clobbered; }
+reset_routes
+yes() { REPLY=true; }
+offer_submission_upload "$current_file" error
+check test "${S[error_upload]}" = true
+check test "$git_attempts" = 1
+queue_pending_submission "$current_file" error true
 PENDING_SUBMISSION_PROMPTED=false
 retry_pending_submissions
 check test ! -f "$pending_file"
-check grep -q error "$work/retried-web-kind"
+submission_next_action browser <<< '3'
+check test "$REPLY" = cloudflare
+submission_next_action <<< '2'
+check test "$REPLY" = channel
+STATE="$CONFIG_DIR/wizard-state.json"
+native_save_state
+json_load "$STATE"
+json_get '["submission_browser_action"]'; check test "$REPLY" = cloudflare
+json_get '["submission_failure_action"]'; check test "$REPLY" = channel
+eval "$real_save_state"
 
-gh_submission_upload() { return 2; }
-yes() { REPLY=true; }
-if offer_submission_upload "$current_file" error true > "$work/offer-cancel-output"; then exit 1; fi
-check test -f "$pending_file"
-rm -f -- "$pending_file"
-SUBMISSION_GITHUB_ROUTE=direct
-HTTPS_PROXY=http://127.0.0.1:9
-NO_PROXY=localhost
-gh() { [[ $HTTPS_PROXY == http://127.0.0.1:9 && $NO_PROXY == localhost ]]; }
-check submission_gh auth status
-check test "$HTTPS_PROXY" = http://127.0.0.1:9
-SUBMISSION_GITHUB_ROUTE=proxy; SUBMISSION_DETECTED_PROXY=http://127.0.0.1:12345
-gh() { [[ $HTTPS_PROXY == http://127.0.0.1:9 && $NO_PROXY == localhost ]]; }
-check submission_gh auth status
-check test "$HTTPS_PROXY" = http://127.0.0.1:9
-
-unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy
-curl() { [[ $* == *api.github.com/rate_limit* ]] && printf 200; }
-start_submission_connectivity_probe
-wait "$SUBMISSION_CONNECTIVITY_PID"
-submission_connectivity_snapshot
-check test "$SUBMISSION_GITHUB_CONNECTIVITY" = true
-check test "$SUBMISSION_CLOUDFLARE_CONNECTIVITY" = false
-check test "$SUBMISSION_PROXY_CONNECTIVITY" = not-configured
+# Real web form construction is local and never places the report body in the URL.
+eval "${real_gh_submission_upload/gh_submission_upload/original_gh_submission_upload}"
+eval "$real_open_github_submission"
+copy_submission_text() { return 1; }
+open_github_submission "$current_file" error > "$work/github-form-output"
+check grep -q '/new/main/error-database/v1/2026-10?filename=' "$work/opened-url"
+check grep -q '&message=' "$work/opened-url"
+check grep -q '&value=' "$work/opened-url"
+check grep -q '%43%74%72%6c%2b%41' "$work/opened-url"
+check test "$(grep -c 'summary-001' "$work/opened-url" || true)" = 0
+check test -f "$current_file"
 
 printf '[{"avg_ts":123.4}]' > "$work/manual.json"
 S[model]="$work/model with spaces.gguf"

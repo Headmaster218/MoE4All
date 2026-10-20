@@ -295,6 +295,12 @@ try {
     Assert ($browserPlan.GuidancePrefilled -and $browserPlan.Url -match 'filename=manual-fixture.m4b' -and $browserPlan.Url -match '&value=' -and $browserPlan.Url -match '&message=') 'Browser upload did not prefill its guidance'
     Assert ($decodedBrowserUrl -match 'Ctrl\+A' -and $decodedBrowserUrl -match 'Ctrl\+V' -and $decodedBrowserUrl -match 'Create pull request') 'Browser upload guidance is incomplete'
     Assert ($decodedBrowserUrl -notmatch 'Fixture CPU') 'Browser upload must not put benchmark JSON in the URL'
+    $errorBrowserPath = Join-Path $testRoot 'error-fixture.m4e'
+    [System.IO.File]::WriteAllText($errorBrowserPath, (@{ schema_version = 1; id = 'error-fixture'; created_at_utc = '2026-10-18T00:00:00Z'; description = 'Synthetic error description' } | ConvertTo-Json), [System.Text.UTF8Encoding]::new($false))
+    $errorPlan = Get-SubmissionBrowserUploadPlan -Path $errorBrowserPath -Kind error -ClipboardReady $false
+    $errorUrl = [Uri]::UnescapeDataString($errorPlan.Url)
+    Assert ($errorUrl -match '/new/main/error-database/v1/2026-10\?' -and $errorUrl -match 'error: add error-fixture') 'Error reports must use their own GitHub database and commit title'
+    Assert ($errorUrl -match 'Clipboard copy failed' -and $errorUrl -notmatch 'Synthetic error description') 'Missing clipboard must be explained without embedding report content'
     $resultValue['padding'] = 'x' * 7000
     [System.IO.File]::WriteAllText($fixtureSubmissionPath, ($resultValue | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
     $largeBrowserPlan = Get-BenchmarkBrowserUploadPlan -Path $fixtureSubmissionPath
@@ -304,7 +310,7 @@ try {
     Assert ((ConvertFrom-SmbiosMemoryType -Type 26) -eq 'DDR4' -and (ConvertFrom-SmbiosMemoryType -Type 34) -eq 'DDR5') 'SMBIOS memory generation mapping changed'
     Assert ((ConvertFrom-StorageBusType -Type 17) -eq 'NVMe' -and (ConvertFrom-StorageMediaType -Type 4) -eq 'SSD') 'Storage enum mapping changed'
     Assert ((Get-PcieTheoreticalBandwidthGbps -Generation 4 -Width 16) -eq 31.504) 'PCIe 4.0 x16 bandwidth calculation changed'
-    Assert ($source -match "Start-Process -FilePath 'https://github.com/login/device'") 'GitHub device login page is not opened explicitly'
+    Assert ($source -notmatch 'gh auth login|Invoke-GhBrowserLogin') 'Upload must not require CLI authorization before using the GitHub browser form'
     Assert ($source.Contains('$branch = "community/$Kind/$fileHash"')) 'Report branches must be deterministic and separated by kind'
     Assert ($source.Contains("Create the branch and report PR now?' -Default `$true")) 'Final automated PR confirmation should accept Enter'
     Assert ($source.IndexOf('$benchmarkUploadRequested = Read-BenchmarkUploadConsent') -lt $source.IndexOf('$benchmarkHardwareDetails = Get-WindowsBenchmarkHardwareDetails')) 'Upload consent must be requested before post-benchmark hardware enrichment'
@@ -357,6 +363,9 @@ try {
     $savedHasGithubDefault = $script:BenchmarkUploadHasGithubDefault
     $savedGhAuthDefault = $script:BenchmarkUploadGhAuthDefault
     $savedFallbackDefault = $script:BenchmarkUploadFallbackDefault
+    $savedBrowserAction = $script:SubmissionBrowserActionDefault
+    $savedFailureAction = $script:SubmissionFailureActionDefault
+    $savedPendingRetry = $script:SubmissionPendingRetryDefault
     try {
         $statePath = Join-Path $testRoot 'upload-preferences.json'
         $script:state = [ordered]@{ unrelated = 'preserved' }
@@ -364,9 +373,16 @@ try {
         $script:BenchmarkUploadHasGithubDefault = $false
         $script:BenchmarkUploadGhAuthDefault = $false
         $script:BenchmarkUploadFallbackDefault = 'clipboard'
+        $script:SubmissionBrowserActionDefault = 'cloudflare'
+        $script:SubmissionFailureActionDefault = 'later'
+        $script:SubmissionPendingRetryDefault = $false
         Save-BenchmarkUploadPreferences
         $savedUploadPreferences = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
         Assert ($savedUploadPreferences.unrelated -eq 'preserved' -and $savedUploadPreferences.benchmark_upload -and -not $savedUploadPreferences.benchmark_upload_has_github -and -not $savedUploadPreferences.benchmark_upload_gh_auth -and $savedUploadPreferences.benchmark_upload_fallback -eq 'clipboard') 'Benchmark upload preferences were not persisted safely'
+        Assert ($savedUploadPreferences.submission_browser_action -eq 'cloudflare' -and $savedUploadPreferences.submission_failure_action -eq 'later') 'Submission menu preferences were not saved'
+        Assert ($savedUploadPreferences.submission_pending_retry -eq $false) 'Pending retry preference was not saved'
+        $script:Answers.Enqueue('')
+        Assert ((Read-SubmissionNextAction -Browser) -eq 'cloudflare') 'Enter must reuse the saved browser action'
     } finally {
         $statePath = $savedStatePath
         $script:state = $savedStateObject
@@ -374,6 +390,9 @@ try {
         $script:BenchmarkUploadHasGithubDefault = $savedHasGithubDefault
         $script:BenchmarkUploadGhAuthDefault = $savedGhAuthDefault
         $script:BenchmarkUploadFallbackDefault = $savedFallbackDefault
+        $script:SubmissionBrowserActionDefault = $savedBrowserAction
+        $script:SubmissionFailureActionDefault = $savedFailureAction
+        $script:SubmissionPendingRetryDefault = $savedPendingRetry
     }
     $details = [pscustomobject]@{
         MemoryGeneration = 'DDR5'
@@ -414,52 +433,81 @@ try {
     Remove-PendingSubmission -Path $queuedPath
     Assert (-not (Test-Path -LiteralPath $queuedPath)) 'Successful pending submission cleanup failed'
 
-    $realConnectivitySnapshot = ${function:Get-SubmissionConnectivitySnapshot}
     $realGhSubmissionUpload = ${function:Invoke-GhSubmissionUpload}
     $realWebsiteSubmissionUpload = ${function:Invoke-WebsiteSubmissionUpload}
     $realTestGhAuthenticated = ${function:Test-GhAuthenticated}
+    $realOpenSubmissionBrowserUpload = ${function:Open-SubmissionBrowserUpload}
     function gh { }
-    function Test-GhAuthenticated { return $true }
-    function Get-SubmissionConnectivitySnapshot { return [pscustomobject]@{ Github = 'reachable'; Cloudflare = 'reachable'; ProxyConfigured = $false; Proxy = 'not-configured' } }
-    function Invoke-GhSubmissionUpload { $script:GitRouteUsed = $true; return $true }
-    function Invoke-WebsiteSubmissionUpload { $script:CloudflareRouteUsed = $true; return $true }
-    $script:BenchmarkUploadHasGithubDefault = $true
-    $script:Answers = [System.Collections.Generic.Queue[string]]::new(); $script:Answers.Enqueue('y')
-    $script:GitRouteUsed = $false; $script:CloudflareRouteUsed = $false
-    Assert (Offer-SubmissionUpload -Path $fixtureSubmissionPath -Kind benchmark -ConsentAlreadyGranted) 'Reachable GitHub route failed'
-    Assert ($script:GitRouteUsed -and -not $script:CloudflareRouteUsed) 'GitHub was not preferred over Cloudflare'
-    $script:Answers.Enqueue('n'); $script:GitRouteUsed = $false; $script:CloudflareRouteUsed = $false
-    Assert (Offer-SubmissionUpload -Path $fixtureSubmissionPath -Kind benchmark -ConsentAlreadyGranted) 'Cloudflare-only route failed'
-    Assert (-not $script:GitRouteUsed -and $script:CloudflareRouteUsed) 'No-account flow did not go directly to Cloudflare'
-    function Get-SubmissionConnectivitySnapshot { return [pscustomobject]@{ Github = 'unreachable'; Cloudflare = 'unreachable'; ProxyConfigured = $true; Proxy = 'unreachable' } }
-    $script:Answers.Enqueue('y'); $script:GitRouteUsed = $false; $script:CloudflareRouteUsed = $false
-    Assert (Offer-SubmissionUpload -Path $fixtureSubmissionPath -Kind benchmark -ConsentAlreadyGranted) 'Failed preflight blocked a successful GitHub submission'
-    Assert ($script:GitRouteUsed -and -not $script:CloudflareRouteUsed) 'Failed preflight bypassed GitHub'
-    function Invoke-GhSubmissionUpload { $script:GitRouteUsed = $true; return $false }
-    $script:Answers.Enqueue('y'); $script:GitRouteUsed = $false; $script:CloudflareRouteUsed = $false
-    Assert (Offer-SubmissionUpload -Path $fixtureSubmissionPath -Kind benchmark -ConsentAlreadyGranted) 'Actual GitHub failure did not fall back to Cloudflare'
-    Assert ($script:GitRouteUsed -and $script:CloudflareRouteUsed) 'Fallback skipped an actual route'
-    function Invoke-WebsiteSubmissionUpload { $script:CloudflareRouteUsed = $true; return $false }
-    $script:Answers.Enqueue('n'); $script:GitRouteUsed = $false; $script:CloudflareRouteUsed = $false
-    Assert (-not (Offer-SubmissionUpload -Path $fixtureSubmissionPath -Kind benchmark -ConsentAlreadyGranted)) 'Offline submission should be queued rather than reported as sent'
-    Assert ((Test-Path -LiteralPath (Join-Path $pendingSubmissionDir (Split-Path -Leaf $fixtureSubmissionPath))) -and -not $script:GitRouteUsed -and $script:CloudflareRouteUsed) 'Offline fallback did not attempt Cloudflare and preserve the report'
-    function Invoke-WebsiteSubmissionUpload { $script:CloudflareRouteUsed = $true; return $true }
-    function Invoke-GhSubmissionUpload { $script:SubmissionUploadCancelled = $true; return $false }
-    $script:CloudflareRouteUsed = $false; $script:Answers.Enqueue('y')
-    Assert (-not (Offer-SubmissionUpload -Path $fixtureSubmissionPath -Kind benchmark -ConsentAlreadyGranted)) 'A cancelled GitHub confirmation must keep the pending submission'
-    Assert (-not $script:CloudflareRouteUsed -and @(Get-PendingSubmissions).Count -eq 1) 'Cancelling the GitHub confirmation fell through to Cloudflare or discarded the report'
-    function Invoke-GhSubmissionUpload { return $true }
+    function Test-GhAuthenticated { return $script:GhSignedIn }
+    function Invoke-GhSubmissionUpload {
+        param($Path, $Kind, [switch]$Retry)
+        $script:GitAttempts++
+        if ($script:CancelGit) { $script:SubmissionUploadCancelled = $true; return $false }
+        return $script:GitResults.Dequeue()
+    }
+    function Invoke-WebsiteSubmissionUpload {
+        $script:CloudflareAttempts++
+        return $script:WebResults.Dequeue()
+    }
+    function Open-SubmissionBrowserUpload { $script:BrowserAttempts++ }
+    function Reset-UploadFixture {
+        param([bool[]]$GitResults = @(), [bool[]]$WebResults = @(), [string[]]$Answers = @(), [bool]$SignedIn = $true)
+        $script:GitAttempts = 0; $script:CloudflareAttempts = 0; $script:BrowserAttempts = 0
+        $script:CancelGit = $false; $script:GhSignedIn = $SignedIn
+        $script:GitResults = [System.Collections.Generic.Queue[bool]]::new()
+        foreach ($value in $GitResults) { $script:GitResults.Enqueue($value) }
+        $script:WebResults = [System.Collections.Generic.Queue[bool]]::new()
+        foreach ($value in $WebResults) { $script:WebResults.Enqueue($value) }
+        $script:Answers = [System.Collections.Generic.Queue[string]]::new()
+        foreach ($value in $Answers) { $script:Answers.Enqueue($value) }
+    }
+    Reset-UploadFixture -GitResults @($true) -Answers @('y')
+    Assert (Offer-SubmissionUpload -Path $fixtureSubmissionPath -Kind benchmark -ConsentAlreadyGranted) 'CLI first-attempt success failed'
+    Assert ($script:GitAttempts -eq 1 -and $script:BrowserAttempts -eq 0 -and $script:CloudflareAttempts -eq 0) 'CLI success must finish immediately'
+    Reset-UploadFixture -GitResults @($false, $true) -Answers @('y')
+    Assert (Offer-SubmissionUpload -Path $fixtureSubmissionPath -Kind benchmark -ConsentAlreadyGranted) 'CLI second-attempt success failed'
+    Assert ($script:GitAttempts -eq 2 -and $script:BrowserAttempts -eq 0) 'CLI must retry once before opening the browser'
+    Reset-UploadFixture -GitResults @($false, $false) -Answers @('y', '4')
+    Assert (-not (Offer-SubmissionUpload -Path $fixtureSubmissionPath -Kind benchmark -ConsentAlreadyGranted)) 'Send-later choice must retain the report'
+    Assert ($script:GitAttempts -eq 2 -and $script:BrowserAttempts -eq 1 -and $script:CloudflareAttempts -eq 0) 'CLI failures must open GitHub, not auto-switch to Cloudflare'
+    Reset-UploadFixture -GitResults @($false, $false) -WebResults @($true) -Answers @('y', '3')
+    Assert (Offer-SubmissionUpload -Path $fixtureSubmissionPath -Kind benchmark -ConsentAlreadyGranted) 'Explicit Cloudflare fallback failed'
+    Assert ($script:GitAttempts -eq 2 -and $script:BrowserAttempts -eq 1 -and $script:CloudflareAttempts -eq 1) 'Explicit fallback order changed'
+    Reset-UploadFixture -SignedIn $false -Answers @('y', '2', '1')
+    Assert (Offer-SubmissionUpload -Path $fixtureSubmissionPath -Kind benchmark -ConsentAlreadyGranted) 'Browser reopen then user confirmation failed'
+    Assert ($script:GitAttempts -eq 0 -and $script:BrowserAttempts -eq 2 -and $script:CloudflareAttempts -eq 0) 'Unsigned CLI must not upload, authorize or choose a relay'
+    Reset-UploadFixture -WebResults @($true) -Answers @('n')
+    Assert (Offer-SubmissionUpload -Path $fixtureSubmissionPath -Kind benchmark -ConsentAlreadyGranted) 'No-account Cloudflare route failed'
+    Assert ($script:GitAttempts -eq 0 -and $script:BrowserAttempts -eq 0 -and $script:CloudflareAttempts -eq 1) 'No-account route must directly use Cloudflare'
+    Reset-UploadFixture -WebResults @($false, $true) -Answers @('n', '1')
+    Assert (Offer-SubmissionUpload -Path $fixtureSubmissionPath -Kind benchmark -ConsentAlreadyGranted) 'Manual Cloudflare retry failed'
+    Assert ($script:CloudflareAttempts -eq 2) 'Cloudflare retry must be user-selected'
+    Reset-UploadFixture -SignedIn $false -WebResults @($false) -Answers @('n', '2', 'y', '1')
+    Assert (Offer-SubmissionUpload -Path $fixtureSubmissionPath -Kind benchmark -ConsentAlreadyGranted) 'Return to channel selection failed'
+    Assert ($script:CloudflareAttempts -eq 1 -and $script:BrowserAttempts -eq 1) 'Channel selection did not follow the user'
+    Reset-UploadFixture -WebResults @($false) -Answers @('n', '3')
+    Assert (-not (Offer-SubmissionUpload -Path $fixtureSubmissionPath -Kind benchmark -ConsentAlreadyGranted)) 'Failed relay must not claim success'
+    Assert (@(Get-PendingSubmissions).Count -eq 1 -and (Test-Path -LiteralPath $fixtureSubmissionPath)) 'Send-later lost the original or queue'
+    Reset-UploadFixture -Answers @('y')
+    $script:CancelGit = $true
+    Assert (-not (Offer-SubmissionUpload -Path $fixtureSubmissionPath -Kind benchmark -ConsentAlreadyGranted)) 'Cancelled CLI submission must remain pending'
+    Assert ($script:GitAttempts -eq 1 -and $script:BrowserAttempts -eq 0 -and $script:CloudflareAttempts -eq 0) 'User cancellation must stop retries and fallbacks'
+    Reset-UploadFixture -Answers @('')
+    $script:SubmissionPendingRetryDefault = $false
     $script:PendingSubmissionPrompted = $false
-    $script:Answers.Enqueue('y'); $script:Answers.Enqueue('y')
     Offer-PendingSubmissions
-    Assert (@(Get-PendingSubmissions).Count -eq 0 -and (Test-Path -LiteralPath $fixtureSubmissionPath)) 'Successful retry must remove only the queued copy'
+    Assert (@(Get-PendingSubmissions).Count -eq 1 -and $script:GitAttempts -eq 0) 'Enter must preserve the previous decision to retry later'
+    Reset-UploadFixture -GitResults @($true) -Answers @('y', 'y')
+    $script:PendingSubmissionPrompted = $false
+    Offer-PendingSubmissions
+    Assert (@(Get-PendingSubmissions).Count -eq 0 -and (Test-Path -LiteralPath $fixtureSubmissionPath)) 'Pending retry must remove only the queue copy'
+    Assert ($source -notmatch 'SubmissionConnectivity|SubmissionConnectivityProbe|Get-SubmissionConnectivitySnapshot') 'Submission connectivity preflight must be removed'
     $savedProxyValue = [Environment]::GetEnvironmentVariable('HTTPS_PROXY', 'Process')
     try {
         [Environment]::SetEnvironmentVariable('HTTPS_PROXY', 'http://127.0.0.1:9', 'Process')
-        $script:SubmissionRouteModes = @{ github = 'direct' }
         $originalNoProxy = $env:NO_PROXY
         $sawDirect = Invoke-WithSubmissionGithubRoute -Action { return ($env:HTTPS_PROXY -eq 'http://127.0.0.1:9' -and $env:NO_PROXY -eq $originalNoProxy) }
-        Assert $sawDirect 'Preflight changed the actual GitHub proxy settings'
+        Assert $sawDirect 'GitHub transport changed explicit proxy settings'
         Assert ($env:HTTPS_PROXY -eq 'http://127.0.0.1:9') 'GitHub route selection leaked proxy changes into the parent process'
         $savedNoProxy = $env:NO_PROXY
         try {
@@ -471,12 +519,11 @@ try {
         } finally { $env:NO_PROXY = $savedNoProxy }
     } finally {
         [Environment]::SetEnvironmentVariable('HTTPS_PROXY', $savedProxyValue, 'Process')
-        $script:SubmissionRouteModes = @{}
     }
-    Set-Item Function:Get-SubmissionConnectivitySnapshot $realConnectivitySnapshot
     Set-Item Function:Invoke-GhSubmissionUpload $realGhSubmissionUpload
     Set-Item Function:Invoke-WebsiteSubmissionUpload $realWebsiteSubmissionUpload
     Set-Item Function:Test-GhAuthenticated $realTestGhAuthenticated
+    Set-Item Function:Open-SubmissionBrowserUpload $realOpenSubmissionBrowserUpload
     Remove-Item Function:gh
     $script:Passed++
     Microsoft.PowerShell.Utility\Write-Host 'PASS asynchronous route priority and pending submission lifecycle'

@@ -565,7 +565,7 @@ defaults() {
         [server_vision]=false [vision_projector]='' [server_embedding]=false [embedding_model]='' [embedding_idle_timeout]=300
         [mtp_enabled]=false [mtp_model]='' [mtp_verify_tokens]=4 [cpu_miss_enabled]=false [cpu_miss_max]=1 [cpu_miss_cores]=''
         [bench_kind]=manual [bench_parallel]=1 [manual_bench_kind]=decode [prompt_tokens]=6144 [gen_tokens]=512 [depth_mode]=none [depth_tokens]=0 [reps]=1 [json_output]=false
-        [custom_sets]='' [auto_overrides]='' [benchmark_upload]=false [benchmark_upload_has_github]=true [benchmark_upload_gh_auth]=true [error_upload]=false
+        [custom_sets]='' [auto_overrides]='' [benchmark_upload]=false [benchmark_upload_has_github]=true [benchmark_upload_gh_auth]=true [error_upload]=false [submission_browser_action]=later [submission_failure_action]=later [submission_pending_retry]=true
     )
     DEFAULTS=(); for key in "${(@k)S[@]}"; do DEFAULTS[$key]=${S[$key]}; done
 }
@@ -1092,99 +1092,7 @@ submission_summary_json() {
     printf ']'
 }
 
-open_submission_receipt() {
-    local receipt_id=$1 receipt_token=$2
-    [[ $receipt_id =~ ^rc_[A-Za-z0-9_-]+$ && $receipt_token =~ ^[A-Za-z0-9_-]+$ ]] || return 1
-    if ! open_submission_url "$SUBMISSION_SITE_ORIGIN/community/index.html#receipt=$receipt_id&token=$receipt_token"; then
-        printf '未能打开回执页；可在网站“我的回执”导入本机私密回执文件。\nCould not open the receipt page; import the saved private receipt on the website.\n' >&2
-    fi
-}
 
-submission_proxy_url() {
-    local name value settings host port enabled
-    for name in HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy; do
-        eval "value=\${$name-}"
-        if [[ -n $value ]]; then REPLY=$value; return 0; fi
-    done
-    if command -v scutil >/dev/null 2>&1; then
-        settings=$(scutil --proxy 2>/dev/null || true)
-        enabled=$(printf '%s\n' "$settings" | awk '/HTTPSEnable : 1/{print $3; exit}')
-        if [[ $enabled == 1 ]]; then
-            host=$(printf '%s\n' "$settings" | awk -F' : ' '/HTTPSProxy :/{print $2; exit}')
-            port=$(printf '%s\n' "$settings" | awk -F' : ' '/HTTPSPort :/{print $2; exit}')
-            if [[ -n $host && $port == <-> ]]; then REPLY="http://$host:$port"; return 0; fi
-        fi
-    fi
-    REPLY=''; return 1
-}
-
-start_submission_connectivity_probe() {
-    local api_base generation proxy=''
-    if [[ -n ${SUBMISSION_CONNECTIVITY_PID-} ]] && kill -0 "$SUBMISSION_CONNECTIVITY_PID" 2>/dev/null; then return 0; fi
-    mkdir -p -- "$CONFIG_DIR/private"
-    SUBMISSION_CONNECTIVITY_FILE="$CONFIG_DIR/private/submission-connectivity.status"
-    generation="$$-$RANDOM-$(date +%s)"
-    SUBMISSION_CONNECTIVITY_GENERATION=$generation
-    rm -f -- "$SUBMISSION_CONNECTIVITY_FILE"
-    submission_proxy_url && proxy=$REPLY
-    SUBMISSION_DETECTED_PROXY=$proxy
-    api_base=${MOE4ALL_SUBMISSION_API_BASE:-https://api.moe4all.com/v1}
-    api_base=${api_base%/}
-    (
-        local temp="$CONFIG_DIR/private/.submission-connectivity.$generation" output
-        mkdir -p -- "$temp"
-        probe_one() {
-            local probe_mode=$1 probe_url=$2 probe_output=$3 probe_code=000
-            if [[ $probe_mode == direct ]]; then
-                probe_code=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --connect-timeout 2 --max-time 5 --noproxy '*' --user-agent 'MoE4All-Wizard/connectivity' "$probe_url" 2>/dev/null) || probe_code=000
-            else
-                probe_code=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --connect-timeout 2 --max-time 5 --noproxy '' --proxy "$proxy" --user-agent 'MoE4All-Wizard/connectivity' "$probe_url" 2>/dev/null) || probe_code=000
-            fi
-            case $probe_code in 407) printf false ;; [234][0-9][0-9]) printf true ;; *) printf false ;; esac > "$probe_output"
-        }
-        if command -v curl >/dev/null 2>&1; then
-            probe_one direct 'https://api.github.com/rate_limit' "$temp/github-direct" &
-            probe_one direct "$api_base/health" "$temp/cloudflare-direct" &
-            if [[ -n $proxy ]]; then
-                probe_one proxy 'https://api.github.com/rate_limit' "$temp/github-proxy" &
-                probe_one proxy "$api_base/health" "$temp/cloudflare-proxy" &
-            fi
-            wait
-        fi
-        local github=false cloudflare=false proxy_state=not-configured github_route=default cloudflare_route=default
-        [[ $(cat "$temp/github-direct" 2>/dev/null || true) == true ]] && github=true
-        [[ $(cat "$temp/cloudflare-direct" 2>/dev/null || true) == true ]] && cloudflare=true
-        if [[ -n $proxy ]]; then
-            proxy_state=unreachable
-            if [[ $(cat "$temp/github-proxy" 2>/dev/null || true) == true || $(cat "$temp/cloudflare-proxy" 2>/dev/null || true) == true ]]; then proxy_state=reachable; fi
-            [[ $(cat "$temp/github-proxy" 2>/dev/null || true) == true ]] && github=true
-            [[ $(cat "$temp/cloudflare-proxy" 2>/dev/null || true) == true ]] && cloudflare=true
-        fi
-        if [[ $(cat "$temp/github-direct" 2>/dev/null || true) == true ]]; then github_route=direct
-        elif [[ $(cat "$temp/github-proxy" 2>/dev/null || true) == true ]]; then github_route=proxy; fi
-        if [[ $(cat "$temp/cloudflare-direct" 2>/dev/null || true) == true ]]; then cloudflare_route=direct
-        elif [[ $(cat "$temp/cloudflare-proxy" 2>/dev/null || true) == true ]]; then cloudflare_route=proxy; fi
-        output="$SUBMISSION_CONNECTIVITY_FILE.new-$generation"
-        printf 'generation=%s\ngithub=%s\ncloudflare=%s\nproxy=%s\ngithub-route=%s\ncloudflare-route=%s\n' "$generation" "$github" "$cloudflare" "$proxy_state" "$github_route" "$cloudflare_route" > "$output"
-        mv -f -- "$output" "$SUBMISSION_CONNECTIVITY_FILE"
-        rm -rf -- "$temp"
-    ) >/dev/null 2>&1 &
-    SUBMISSION_CONNECTIVITY_PID=$!
-}
-
-submission_connectivity_snapshot() {
-    local key value github=pending cloudflare=pending proxy=pending generation=''
-    SUBMISSION_GITHUB_ROUTE=default; SUBMISSION_CLOUDFLARE_ROUTE=default
-    if [[ -f ${SUBMISSION_CONNECTIVITY_FILE-} ]]; then
-        while IFS='=' read -r key value; do
-            case $key in generation) generation=$value ;; github) github=$value ;; cloudflare) cloudflare=$value ;; proxy) proxy=$value ;; github-route) SUBMISSION_GITHUB_ROUTE=$value ;; cloudflare-route) SUBMISSION_CLOUDFLARE_ROUTE=$value ;; esac
-        done < "$SUBMISSION_CONNECTIVITY_FILE"
-        if [[ $generation != ${SUBMISSION_CONNECTIVITY_GENERATION-} ]]; then github=pending; cloudflare=pending; proxy=pending; SUBMISSION_GITHUB_ROUTE=default; SUBMISSION_CLOUDFLARE_ROUTE=default; fi
-    fi
-    SUBMISSION_GITHUB_CONNECTIVITY=$github
-    SUBMISSION_CLOUDFLARE_CONNECTIVITY=$cloudflare
-    SUBMISSION_PROXY_CONNECTIVITY=$proxy
-}
 
 pending_submission_dir() { REPLY="$CONFIG_DIR/private/pending-submissions"; }
 
@@ -1217,16 +1125,15 @@ queue_pending_submission() {
 
 retry_pending_submissions() {
     [[ ${PENDING_SUBMISSION_PROMPTED-false} != true ]] || return 0
-    pending_submission_dir; local -h directory=$REPLY path kind
+    pending_submission_dir; local -h directory=$REPLY path kind retry
     local -a pending=()
     [[ -d $directory ]] || { PENDING_SUBMISSION_PROMPTED=true; return 0; }
     while IFS= read -r path; do pending+=("$path"); done < <(find "$directory" -type f \( -name '*.m4b' -o -name '*.m4e' \) -print 2>/dev/null | sort)
     ((${#pending[@]})) || { PENDING_SUBMISSION_PROMPTED=true; return 0; }
-    submission_connectivity_snapshot
-    if [[ $SUBMISSION_GITHUB_CONNECTIVITY == pending && $SUBMISSION_CLOUDFLARE_CONNECTIVITY == pending ]]; then return 0; fi
     PENDING_SUBMISSION_PROMPTED=true
-    yes "发现 ${#pending[@]} 份待发报告，当前重试？/ Found ${#pending[@]} pending report(s). Retry now?" true
-    [[ $REPLY == true ]] || return 0
+    yes "发现 ${#pending[@]} 份待发报告，当前重试？/ Found ${#pending[@]} pending report(s). Retry now?" "${S[submission_pending_retry]-true}" || return 1
+    retry=$REPLY; S[submission_pending_retry]=$retry; save_state
+    [[ $retry == true ]] || return 0
     for path in "${pending[@]}"; do
         kind=benchmark; [[ $path != *.m4e ]] || kind=error
         if offer_submission_upload "$path" "$kind" true; then rm -f -- "$path"; fi
@@ -1309,19 +1216,19 @@ website_submission_upload() {
     save_submission_receipt "$receipt_id" "$receipt_token" "$kind" "$report_id" "$original_hash" "$payload_hash" "$status" "$received_at" "$public_url" "$file_hash"
     printf '已收到，状态 / Received, status: %s\n回执 ID / Receipt ID: %s\n私有回执 / Private receipt: %s\n' "$status" "$receipt_id" "$REPLY"
     [[ -z $public_url ]] || printf 'Public URL: %s\n' "$public_url"
+    [[ -n $public_url ]] || printf '需要查看进度时，在网站“我的回执”导入保存的私密回执文件。\nTo check progress, import the saved private receipt under My receipts on the website.\n'
     case $status in
         delivery_failed) printf '转发已失败，云端正文已清理；请重新导出新报告。Delivery failed; export a new report to try again.\n' >&2 ;;
         rejected) printf '该报告 PR 已退回。The report PR was closed without merging.\n' >&2 ;;
     esac
-    open_submission_receipt "$receipt_id" "$receipt_token"
     rm -f -- "$request" "$response"
 }
 
 gh_submission_upload() {
-    local -h path=$1 kind=$2 login upstream=Headmaster218/MoE4All fork month report_id branch base_sha relative request content pr_url file_hash existing
+    local -h path=$1 kind=$2 retry=${3-1} login upstream=Headmaster218/MoE4All fork month report_id branch base_sha relative request content pr_url file_hash existing
     command -v gh >/dev/null 2>&1 || return 1
     submission_gh auth status --hostname github.com >/dev/null 2>&1 || return 1
-    "$BINARY" submission verify "$path" >/dev/null || return 1
+    "$BINARY" submission verify "$path" >/dev/null || return 3
     login=$(submission_gh api user --jq .login 2>/dev/null) || return 1
     [[ $login =~ ^[A-Za-z0-9-]+$ ]] || return 1
     submission_header "$path" kind; [[ $REPLY == "$kind" ]] || return 1
@@ -1332,8 +1239,12 @@ gh_submission_upload() {
     relative=$kind-database/v1/$month/${path##*/}
     printf '\nGitHub: %s\n目标 / Target: %s/%s\n' "$login" "$upstream" "$relative"
     printf 'PR 创建后报告即公开；不创建 Issue，不自动合并。\nThe report becomes public when the PR is created; no Issue or automatic merge.\n'
-    yes '现在创建分支和报告 PR？/ Create the branch and report PR now?' true
-    [[ $REPLY == true ]] || return 2
+    file_sha256 "$path"; file_hash=$REPLY
+    if [[ $retry != 2 || ${SUBMISSION_GH_CONFIRMED-} != "$kind/$file_hash" ]]; then
+        yes '现在创建分支和报告 PR？/ Create the branch and report PR now?' true || return 2
+        [[ $REPLY == true ]] || return 2
+        SUBMISSION_GH_CONFIRMED="$kind/$file_hash"
+    fi
     if ! submission_gh api "repos/$fork" >/dev/null 2>&1; then
         submission_gh repo fork "$upstream" --clone=false --remote=false >/dev/null || return 1
         local ready=false attempt
@@ -1367,39 +1278,130 @@ gh_submission_upload() {
 
 gh_benchmark_upload() { gh_submission_upload "$1" benchmark; }
 
+submission_urlencode() {
+    local -h hex pair encoded=''
+    hex=$(printf '%s' "$1" | od -An -v -tx1 | tr -d ' \n') || return 1
+    while [[ -n $hex ]]; do pair=${hex:0:2}; encoded="$encoded%$pair"; hex=${hex:2}; done
+    REPLY=$encoded
+}
+
+copy_submission_text() {
+    if command -v pbcopy >/dev/null 2>&1 && pbcopy < "$1" 2>/dev/null; then return 0; fi
+    if command -v wl-copy >/dev/null 2>&1 && wl-copy < "$1" 2>/dev/null; then return 0; fi
+    if command -v xclip >/dev/null 2>&1 && xclip -selection clipboard < "$1" 2>/dev/null; then return 0; fi
+    if command -v xsel >/dev/null 2>&1 && xsel --clipboard --input < "$1" 2>/dev/null; then return 0; fi
+    return 1
+}
+
+open_github_submission() {
+    local -h path=$1 kind=$2 month report_id file_hash guidance copied=false filename message content url
+    "$BINARY" submission verify "$path" >/dev/null || return 1
+    submission_header "$path" kind; [[ $REPLY == "$kind" ]] || return 1
+    submission_header "$path" id; report_id=$REPLY
+    submission_header "$path" created-at; month=${REPLY:0:7}
+    [[ $month =~ ^[0-9]{4}-[0-9]{2}$ && $report_id =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$ ]] || return 1
+    file_sha256 "$path"; file_hash=$REPLY
+    copy_submission_text "$path" && copied=true
+    guidance=$(printf '%s\n' \
+        '上传步骤：' \
+        '1. 在这个编辑框内按 Ctrl+A，全选并删除本提示。' \
+        '2. 按 Ctrl+V，粘贴完整的 .m4b 或 .m4e 报告文本。' \
+        '3. 点击右上角 Commit changes...（无写权限时可能显示 Propose changes）。' \
+        '4. 选择新建分支（不要直接提交 main），确认提交，然后点击 Create pull request。' \
+        '5. 检查标题与文件后，再点击 Create pull request，完成上传。' \
+        '' 'Upload steps:' \
+        '1. Press Ctrl+A in this editor to select and remove this instruction.' \
+        '2. Press Ctrl+V to paste the complete .m4b or .m4e report text.' \
+        '3. Click Commit changes... at the upper right (or Propose changes).' \
+        '4. Choose a new branch (not a direct commit to main), confirm, then click Create pull request.' \
+        '5. Review the title and file, then click Create pull request again to finish.' \
+        '' 'macOS 请使用 Cmd+A / Cmd+V。On macOS, use Cmd+A / Cmd+V.' "建议分支名 / Suggested branch: community/$kind/$file_hash")
+    if [[ $copied != true ]]; then
+        guidance=$(printf '%s\n\n%s' '剪贴板复制未成功：先打开本地报告，全选并复制完整文本。Clipboard copy failed: open the local report and copy its complete text first.' "$guidance")
+    fi
+    submission_urlencode "${path##*/}"; filename=$REPLY
+    submission_urlencode "$kind: add $report_id"; message=$REPLY
+    submission_urlencode "$guidance"; content=$REPLY
+    url="https://github.com/Headmaster218/MoE4All/new/main/$kind-database/v1/$month?filename=$filename&message=$message&value=$content"
+    printf '本地报告 / Local report: %s\n' "$path"
+    if open_submission_url "$url"; then
+        printf '已打开 GitHub 上传页，请按编辑区内的双语提示完成。Opened GitHub; follow the bilingual instructions in the editor.\n'
+    else
+        printf '未能自动打开 GitHub，请手动打开以下地址。Could not open GitHub; open this URL manually:\n%s\n' "$url"
+        return 1
+    fi
+}
+
+submission_next_action() {
+    if [[ ${1-} == browser ]]; then
+        case ${S[submission_browser_action]-later} in sent|reopen|cloudflare|later) ;; *) S[submission_browser_action]=later ;; esac
+        choice submission_browser_action 'GitHub 网页提交 / GitHub web submission' \
+            'sent|已成功提交 / Successfully submitted' \
+            'reopen|重新打开 GitHub / Reopen GitHub' \
+            'cloudflare|改用 Cloudflare / Use Cloudflare instead' \
+            'later|下次再发 / Send later' || return 1
+        save_state
+        REPLY=${S[submission_browser_action]}
+    else
+        case ${S[submission_failure_action]-later} in retry|channel|later) ;; *) S[submission_failure_action]=later ;; esac
+        choice submission_failure_action 'Cloudflare 上传未完成 / Cloudflare upload incomplete' \
+            'retry|重试 Cloudflare / Retry Cloudflare' \
+            'channel|返回渠道选择 / Return to channel selection' \
+            'later|下次再发 / Send later' || return 1
+        save_state
+        REPLY=${S[submission_failure_action]}
+    fi
+}
+
 offer_submission_upload() {
-    local -h path=$1 kind=$2 consented=${3-false} has_github gh_authenticated=false authorize=false
+    local -h path=$1 kind=$2 consented=${3-false} has_github channel=choose attempt action consent_key=benchmark_upload consent
+    "$BINARY" submission verify "$path" >/dev/null || return 1
     if [[ $consented != true ]]; then
-        yes '愿意公开提交这份报告吗？/ Submit this report publicly?' "${S[benchmark_upload]}"
-        S[benchmark_upload]=$REPLY; save_state
-        [[ $REPLY == true ]] || return 0
+        [[ $kind != error ]] || consent_key=error_upload
+        yes '愿意公开提交这份报告吗？/ Submit this report publicly?' "${S[$consent_key]}" || return 1
+        consent=$REPLY; S[$consent_key]=$consent; save_state
+        [[ $consent == true ]] || return 1
     fi
     queue_pending_submission "$path" "$kind" true || return 1
-    local pending_path="$CONFIG_DIR/private/pending-submissions/${path##*/}" upload_status=1
-    yes '你有 GitHub 账号吗？/ Do you have a GitHub account?' "${S[benchmark_upload_has_github]}"
-    has_github=$REPLY; S[benchmark_upload_has_github]=$has_github; save_state
-    submission_connectivity_snapshot
-    printf '预检参考 / Preflight only: GitHub=%s, Cloudflare=%s, proxy=%s\n' "$SUBMISSION_GITHUB_CONNECTIVITY" "$SUBMISSION_CLOUDFLARE_CONNECTIVITY" "$SUBMISSION_PROXY_CONNECTIVITY"
-    printf '预检失败不阻止提交；以实际请求结果为准。A failed preflight does not block submission; the actual request decides.\n'
-    if [[ $has_github == true ]] && command -v gh >/dev/null 2>&1; then
-        if submission_gh auth status --hostname github.com >/dev/null 2>&1; then
-            gh_authenticated=true
-        else
-            yes 'gh 尚未登录。现在通过浏览器授权？/ gh is not signed in. Authorize in the browser now?' "${S[benchmark_upload_gh_auth]}"
-            authorize=$REPLY; S[benchmark_upload_gh_auth]=$authorize; save_state
-            if [[ $authorize == true ]] && submission_gh auth login --hostname github.com --git-protocol https --web; then gh_authenticated=true; fi
+    local -h pending_path="$CONFIG_DIR/private/pending-submissions/${path##*/}" upload_status=1
+    while true; do
+        if [[ $channel == choose ]]; then
+            yes '你有 GitHub 账号吗？/ Do you have a GitHub account?' "${S[benchmark_upload_has_github]}" || return 1
+            has_github=$REPLY; S[benchmark_upload_has_github]=$has_github; save_state
+            channel=cloudflare; [[ $has_github != true ]] || channel=github
         fi
-    fi
-    if [[ $gh_authenticated == true ]]; then
-        if gh_submission_upload "$path" "$kind"; then rm -f -- "$pending_path"; return 0; else upload_status=$?; fi
-        [[ $upload_status != 2 ]] || return 1
-        printf 'GitHub 直传失败，改用网站中转。/ Direct GitHub upload failed; using the website relay.\n' >&2
-    elif [[ $has_github == true ]]; then
-        printf '没有可用的已登录 gh；不安装额外工具，改用网站中转。\n'
-        printf 'No authenticated gh CLI is available; using the website relay without installing another tool.\n'
-    fi
-    if website_submission_upload "$path" "$kind"; then rm -f -- "$pending_path"; return 0; fi
-    queue_pending_submission "$path" "$kind" || printf '无法暂存待发报告。Could not save the pending report.\n' >&2
+        if [[ $channel == github ]]; then
+            SUBMISSION_GH_CONFIRMED=''
+            if command -v gh >/dev/null 2>&1 && submission_gh auth status --hostname github.com >/dev/null 2>&1; then
+                for attempt in 1 2; do
+                    printf 'GitHub CLI 上传 / GitHub CLI upload: %s/2\n' "$attempt"
+                    if gh_submission_upload "$path" "$kind" "$attempt"; then rm -f -- "$pending_path"; return 0; else upload_status=$?; fi
+                    [[ $upload_status != 2 && $upload_status != 3 ]] || return 1
+                done
+            fi
+            printf '没有可用的已登录 CLI 或上传未完成，改用 GitHub 网页。\nNo signed-in CLI is available or CLI upload did not complete; opening GitHub.\n'
+            channel=browser
+        fi
+        if [[ $channel == browser ]]; then
+            open_github_submission "$path" "$kind" || true
+            printf '完成网页操作后再选择；向导不会查询网页提交结果。\nChoose after completing the web steps; the wizard does not query their result.\n'
+            submission_next_action browser || return 1
+            action=$REPLY
+            case $action in
+                sent) rm -f -- "$pending_path"; return 0 ;;
+                reopen) continue ;;
+                cloudflare) channel=cloudflare ;;
+                *) break ;;
+            esac
+        fi
+        if [[ $channel == cloudflare ]]; then
+            if website_submission_upload "$path" "$kind"; then rm -f -- "$pending_path"; return 0; fi
+            submission_next_action || return 1
+            action=$REPLY
+            case $action in retry) continue ;; channel) channel=choose; continue ;; *) break ;; esac
+        fi
+    done
+    printf '提交暂存，待下次启动重试 / Submission saved for a later retry: %s\n' "$pending_path"
     return 1
 }
 
@@ -1462,7 +1464,6 @@ read_problem_description() {
 
 complete_error_report() {
     local -h source=${1-} description_file output path; local -a report_args
-    start_submission_connectivity_probe
     read_problem_description || { printf '已取消；现有诊断文件未删除。Cancelled; existing diagnostics were not deleted.\n'; return 0; }
     mkdir -p -- "$CONFIG_DIR"
     description_file=$(mktemp "$CONFIG_DIR/.error-description.XXXXXX")
@@ -1478,7 +1479,7 @@ complete_error_report() {
     [[ -n $path ]] || { fail 'The engine did not return an error-report path.'; return 1; }
     yes '愿意公开提交这份错误报告吗？/ Submit this error report publicly?' "${S[error_upload]}"; S[error_upload]=$REPLY
     save_state
-    if [[ $REPLY == true ]]; then
+    if [[ ${S[error_upload]} == true ]]; then
         offer_submission_upload "$path" error true || printf '上传未完成；本地报告仍保存在 %s。Upload did not complete; the local report remains there.\n' "$path" >&2
     fi
 }
@@ -1939,10 +1940,6 @@ main() {
     [[ -n $BINARY ]] || { fail 'infr not found beside the launcher or under target/release; build infr-cli first.'; return 1; }
     [[ ! -t 0 || $DRY_RUN == true ]] || INTERACTIVE=true
     PENDING_SUBMISSION_PROMPTED=false
-    if [[ $INTERACTIVE == true && $DRY_RUN == false && $HEADLESS == false ]]; then
-        pending_submission_dir
-        if [[ -d $REPLY ]] && [[ -n $(find "$REPLY" -type f \( -name '*.m4b' -o -name '*.m4e' \) -print -quit) ]]; then start_submission_connectivity_probe; fi
-    fi
     if [[ -n $UPDATE_MODE ]]; then check_updates "$UPDATE_MODE"; return; fi
     if [[ $INTERACTIVE == true && $SKIP_UPDATE == false && ! ${MOE4ALL_NO_UPDATE_CHECK-} =~ ^(1|true|yes|on)$ ]]; then check_updates --check-update; fi
     if [[ $INTERACTIVE == true && $HEADLESS == false ]]; then
@@ -2010,7 +2007,7 @@ main() {
         else
             if "${COMMAND[@]}"; then exit_code=0; else exit_code=$?; fi
         fi
-        if [[ -n $result_path ]]; then start_submission_connectivity_probe; offer_benchmark_upload "$result_path" || true; fi
+        if [[ -n $result_path ]]; then offer_benchmark_upload "$result_path" || true; fi
         newest_error_report; after_report=$REPLY
         if ((exit_code != 0)) && [[ -n $after_report && $after_report != "$before_report" ]]; then complete_error_report "$after_report"; save_state; fi
         return "$exit_code"
