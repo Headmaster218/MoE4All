@@ -1271,7 +1271,7 @@ gh_submission_upload() {
     fi
     rm -f -- "$request"
     pr_url=$(submission_gh pr create --repo "$upstream" --base main --head "$login:$branch" --title "$kind: add $report_id" --body 'User-consented public MoE4All report. Awaiting maintainer review; no automatic merge. Format validation is not an independent reproduction.' 2>/dev/null) ||
-        pr_url=$(submission_gh pr list --repo "$upstream" --head "$login:$branch" --state all --json url --jq '.[0].url // empty' 2>/dev/null) || return 1
+        pr_url=$(submission_gh pr list --repo "$upstream" --head "$branch" --author "$login" --base main --state all --json url --jq '.[0].url // empty' 2>/dev/null) || return 1
     [[ $pr_url =~ ^https://github.com/Headmaster218/MoE4All/pull/[0-9]+$ ]] || return 1
     printf 'PR 已创建或已存在 / PR created or already exists: %s\n' "$pr_url"
 }

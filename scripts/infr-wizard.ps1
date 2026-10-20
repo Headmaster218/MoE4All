@@ -1338,7 +1338,7 @@ function Invoke-GhSubmissionUpload {
         $prCreate = Invoke-NativeCommandResult -Executable $gh.Source -Arguments @('pr', 'create', '--repo', $upstream, '--base', 'main', '--head', "${login}:$branch", '--title', "${Kind}: add $($value.id)", '--body', 'User-consented public MoE4All report. Awaiting maintainer review; no automatic merge. Format validation is not an independent reproduction.')
         $prUrl = [string]($prCreate.Output | Where-Object { $_ } | Select-Object -Last 1)
         if ($prCreate.ExitCode -ne 0) {
-            $listed = Invoke-NativeCommandResult -Executable $gh.Source -Arguments @('pr', 'list', '--repo', $upstream, '--head', "${login}:$branch", '--state', 'all', '--json', 'url', '--jq', '.[0].url // empty')
+            $listed = Invoke-NativeCommandResult -Executable $gh.Source -Arguments @('pr', 'list', '--repo', $upstream, '--head', $branch, '--author', $login, '--base', 'main', '--state', 'all', '--json', 'url', '--jq', '.[0].url // empty')
             $prUrl = [string]($listed.Output | Where-Object { $_ } | Select-Object -First 1)
             if ($listed.ExitCode -ne 0 -or $prUrl -notmatch '^https://github\.com/Headmaster218/MoE4All/pull/[0-9]+$') { throw 'could not create or reuse pull request' }
         }

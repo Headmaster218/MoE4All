@@ -53,7 +53,9 @@ gh() {
         'api repos/fixture/MoE4All/contents/'*) base64 < "$current_file" ;;
         'api repos/fixture/MoE4All'*) printf '{}' ;;
         'pr create '*) [[ ${repeat_git-false} != true ]] || return 1; printf 'https://github.com/Headmaster218/MoE4All/pull/7' ;;
-        'pr list '*) printf 'https://github.com/Headmaster218/MoE4All/pull/7' ;;
+        'pr list '*)
+            [[ "$*" == *"--head community/$current_kind/$current_hash --author fixture --base main --state all"* ]] || return 1
+            printf 'https://github.com/Headmaster218/MoE4All/pull/7' ;;
         *) printf 'Unexpected fixture gh command\n' >&2; return 1 ;;
     esac
 }

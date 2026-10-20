@@ -39,7 +39,10 @@ function Invoke-NativeCommandResult {
         if (-not $script:LostPrResponse) { $script:LostPrResponse = $true; return [pscustomobject]@{ ExitCode = 1; Output = @('Synthetic first-attempt failure') } }
         $output = 'https://github.com/Headmaster218/MoE4All/pull/7'
     }
-    if ($line -like 'pr list*') { return [pscustomobject]@{ ExitCode = 1; Output = @() } }
+    if ($line -like 'pr list*') {
+        Assert ($line -match '--head community/(benchmark|error)/[a-f0-9]{64} --author fixture --base main --state all') 'Existing PR lookup must use a bare branch plus author and base filters'
+        return [pscustomobject]@{ ExitCode = 1; Output = @() }
+    }
     return [pscustomobject]@{ ExitCode = 0; Output = @($output) }
 }
 function Start-Process {
