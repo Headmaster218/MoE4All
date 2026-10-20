@@ -1413,6 +1413,10 @@ pack_manual_benchmark() {
     [[ $JSON_KIND == array && -v "J[$avg_path]" ]] || { fail 'Manual benchmark JSON has no avg_ts result.'; return 1; }
     avg=${J[$avg_path]}
     [[ $avg =~ ^[0-9]+([.][0-9]+)?$ ]] || { fail 'Manual benchmark avg_ts is invalid.'; return 1; }
+    printf '\n结果 / Results\n+------------------+------------+----------+\n'
+    printf '| Workload         | Repetitions| Overall  |\n+------------------+------------+----------+\n'
+    printf '| %-16s | %10s | %8.1f |\n' "${S[manual_bench_kind]}" "${S[reps]}" "$avg"
+    printf '+------------------+------------+----------+\n'
     created=$(date -u '+%Y-%m-%dT%H:%M:%S.000Z')
     id=$(date -u '+manual-%Y%m%dT%H%M%S.000Z-')$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
     engine_version=$("$BINARY" --version 2>/dev/null || true); engine_version=${engine_version##* }
@@ -1430,14 +1434,27 @@ pack_manual_benchmark() {
     cat > "$payload" <<EOF
 {"schema_version":1,"id":$q_id,"created_at_utc":$q_created,"engine_version":$q_engine,"engine_commit":null,"profile":"manual","model":{"name":$q_model,"storage_bytes":$model_size},"hardware":{"os":"macos","architecture":"$(uname -m)","cpu":{},"ram":{},"gpu":{"configured_device":$q_device}},"configuration":{"benchmark_kind":$q_kind,"prompt_tokens":${S[prompt_tokens]},"decode_tokens":${S[gen_tokens]},"depth_mode":$q_depth,"depth_tokens":${S[depth_tokens]},"repetitions":${S[reps]},"auto_profile":$q_profile},"contexts":[{"requested_context_tokens":$context_tokens,"prefill":null,"decode":[],"manual_result":{"kind":$q_kind,"average_tokens_per_second":$avg},"failures":[]}],"failures":[]}
 EOF
-    if ! output=$("$BINARY" submission pack-benchmark --input "$payload" --result-dir "$ROOT/benchmark-database" 2>&1); then rm -f -- "$payload"; fail "$output"; return 1; fi
+    if [[ ${S[manual_bench_kind]} == mixed ]]; then
+        mkdir -p -- "$CONFIG_DIR/benchmark-results"
+        local local_path="$CONFIG_DIR/benchmark-results/$id.json"
+        printf '{"result":%s,"raw":%s}\n' "$(< "$payload")" "$(< "$raw_json")" > "$local_path"
+        rm -f -- "$payload"
+        printf '混合测试结果已本地保存 / Mixed benchmark result saved locally: %s\n' "$local_path"
+        printf '当前上传协议尚不支持混合速度，本次不上传；它不会被误记为纯 Decode。Mixed-speed upload is not supported yet; this result is not submitted as Decode.\n'
+        REPLY=''; return 0
+    fi
+    if ! output=$("$BINARY" submission pack-benchmark --input "$payload" --result-dir "$ROOT/benchmark-database" 2>&1); then
+        mkdir -p -- "$CONFIG_DIR/benchmark-results"
+        local local_path="$CONFIG_DIR/benchmark-results/$id.json"
+        printf '{"result":%s,"raw":%s}\n' "$(< "$payload")" "$(< "$raw_json")" > "$local_path"
+        rm -f -- "$payload"
+        printf '原始结果已保留 / Original result retained: %s\n' "$local_path"
+        fail "$output"; return 1
+    fi
     rm -f -- "$payload"
     result_path=$(printf '%s\n' "$output" | sed -n 's/^MOE4ALL_SUBMISSION_PATH=//p' | tail -n 1)
     [[ -n $result_path ]] || { fail 'The engine did not return a benchmark submission path.'; return 1; }
-    printf '\n结果 / Results\n+------------------+------------+----------+\n'
-    printf '| Workload         | Repetitions| Overall  |\n+------------------+------------+----------+\n'
-    printf '| %-16s | %10s | %8.1f |\n' "${S[manual_bench_kind]}" "${S[reps]}" "$avg"
-    printf '+------------------+------------+----------+\nBenchmark submission: %s\n' "$result_path"
+    printf 'Benchmark submission: %s\n' "$result_path"
     REPLY=$result_path
 }
 
@@ -1542,13 +1559,15 @@ configure() {
     fi
     if [[ ${S[launch_mode]} == bench ]]; then
         S[bench_kind]=manual
-        if [[ -t 1 ]]; then printf '\033[90m自动数据库套件目前需要 Vulkan 多槽引擎；Metal 暂保留手动测试。Automatic database suites currently require the Vulkan multi-slot engine; Metal keeps the manual benchmark.\033[0m\n'
-        else printf '自动数据库套件目前需要 Vulkan 多槽引擎；Metal 暂保留手动测试。Automatic database suites currently require the Vulkan multi-slot engine; Metal keeps the manual benchmark.\n'; fi
+        if [[ -t 1 ]]; then printf '\033[90m自动套件：每个长度完整 Prefill 一次，复用 KV，Decode 每路 1024 tokens。目前需要 Vulkan 多槽引擎；Metal 暂保留手动测试。Automatic suites: one full Prefill per length, shared KV, 1024 tokens Decode. Vulkan multi-slot engine required; Metal keeps the manual benchmark.\033[0m\n'
+        else printf '自动套件：每个长度完整 Prefill 一次，复用 KV，Decode 每路 1024 tokens。目前需要 Vulkan 多槽引擎；Metal 暂保留手动测试。Automatic suites: one full Prefill per length, shared KV, 1024 tokens Decode. Vulkan multi-slot engine required; Metal keeps the manual benchmark.\n'; fi
         [[ ${S[manual_bench_kind]} =~ ^(prefill|decode|mixed)$ ]] || S[manual_bench_kind]=decode
         choice manual_bench_kind '第一步：选择要添加的工作 / Step 1: choose work' \
             $'prefill|只测 Prefill / Prefill only|处理一段提示词，不生成 token。\nProcess a prompt without generating tokens.' \
             $'decode|只测 Decode / Decode only|生成 token；下一步可添加已有上下文。\nGenerate tokens; existing context can be added next.' \
             $'mixed|Prefill + Decode|同一轮先处理提示词，再生成 token。\nProcess a prompt and then generate in the same turn.'
+        [[ ${S[prompt_tokens]} =~ ^[1-9][0-9]*$ ]] || S[prompt_tokens]=6144
+        [[ ${S[gen_tokens]} =~ ^[1-9][0-9]*$ ]] || S[gen_tokens]=512
         case ${S[manual_bench_kind]} in
             prefill) integer prompt_tokens 'Prefill token 数 / Prefill tokens' 1; S[gen_tokens]=0; S[depth_mode]=none; S[depth_tokens]=0 ;;
             decode) S[prompt_tokens]=0; integer gen_tokens 'Decode token 数 / Decode tokens' 1 ;;
@@ -1559,7 +1578,10 @@ configure() {
             choice depth_mode '添加测量前上下文 / Add context before measurement' \
                 $'none|不添加 / None|从空 KV 开始测量。\nMeasure from an empty KV cache.' \
                 $'real|真实上下文 / Real context|先真实 Prefill 指定长度，再开始计时。\nReally prefill the selected depth before timing.'
-            if [[ ${S[depth_mode]} == none ]]; then S[depth_tokens]=0; else integer depth_tokens '已有上下文 token 数 / Existing context tokens' 1; fi
+            if [[ ${S[depth_mode]} == none ]]; then S[depth_tokens]=0; else
+                [[ ${S[depth_tokens]} =~ ^[1-9][0-9]*$ ]] || S[depth_tokens]=6144
+                integer depth_tokens '已有上下文 token 数 / Existing context tokens' 1
+            fi
             printf '已添加 / Added: context=%s, depth=%s\n' "${S[depth_mode]}" "${S[depth_tokens]}"
         fi
         integer reps '重复次数 / Repetitions' 1; S[json_output]=true

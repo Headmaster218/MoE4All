@@ -1572,6 +1572,10 @@ pack_manual_benchmark() {
     [[ $JSON_KIND == array && -v 'J[$avg_path]' ]] || { fail 'Manual benchmark JSON has no avg_ts result.'; return 1; }
     avg=${J[$avg_path]}
     [[ $avg =~ ^[0-9]+([.][0-9]+)?$ ]] || { fail 'Manual benchmark avg_ts is invalid.'; return 1; }
+    printf '\n结果 / Results\n+------------------+------------+----------+\n'
+    printf '| Workload         | Repetitions| Overall  |\n+------------------+------------+----------+\n'
+    printf '| %-16s | %10s | %8.1f |\n' "${S[manual_bench_kind]}" "${S[reps]}" "$avg"
+    printf '+------------------+------------+----------+\n'
     created=$(date -u '+%Y-%m-%dT%H:%M:%S.000Z')
     id=$(date -u '+manual-%Y%m%dT%H%M%S.000Z-')$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
     engine_version=$("$BINARY" --version 2>/dev/null || true); engine_version=${engine_version##* }
@@ -1589,14 +1593,27 @@ pack_manual_benchmark() {
     cat > "$payload" <<EOF
 {"schema_version":1,"id":$q_id,"created_at_utc":$q_created,"engine_version":$q_engine,"engine_commit":null,"profile":"manual","model":{"name":$q_model,"storage_bytes":$model_size},"hardware":{"os":"linux","architecture":"$(uname -m)","cpu":{},"ram":{},"gpu":{"configured_device":$q_device}},"configuration":{"benchmark_kind":$q_kind,"prompt_tokens":${S[prompt_tokens]},"decode_tokens":${S[gen_tokens]},"depth_mode":$q_depth,"depth_tokens":${S[depth_tokens]},"repetitions":${S[reps]},"auto_profile":$q_profile},"contexts":[{"requested_context_tokens":$context_tokens,"prefill":null,"decode":[],"manual_result":{"kind":$q_kind,"average_tokens_per_second":$avg},"failures":[]}],"failures":[]}
 EOF
-    if ! output=$("$BINARY" submission pack-benchmark --input "$payload" --result-dir "$ROOT/benchmark-database" 2>&1); then rm -f -- "$payload"; fail "$output"; return 1; fi
+    if [[ ${S[manual_bench_kind]} == mixed ]]; then
+        mkdir -p -- "$CONFIG_DIR/benchmark-results"
+        local local_path="$CONFIG_DIR/benchmark-results/$id.json"
+        printf '{"result":%s,"raw":%s}\n' "$(< "$payload")" "$(< "$raw_json")" > "$local_path"
+        rm -f -- "$payload"
+        printf '混合测试结果已本地保存 / Mixed benchmark result saved locally: %s\n' "$local_path"
+        printf '当前上传协议尚不支持混合速度，本次不上传；它不会被误记为纯 Decode。Mixed-speed upload is not supported yet; this result is not submitted as Decode.\n'
+        REPLY=''; return 0
+    fi
+    if ! output=$("$BINARY" submission pack-benchmark --input "$payload" --result-dir "$ROOT/benchmark-database" 2>&1); then
+        mkdir -p -- "$CONFIG_DIR/benchmark-results"
+        local local_path="$CONFIG_DIR/benchmark-results/$id.json"
+        printf '{"result":%s,"raw":%s}\n' "$(< "$payload")" "$(< "$raw_json")" > "$local_path"
+        rm -f -- "$payload"
+        printf '原始结果已保留 / Original result retained: %s\n' "$local_path"
+        fail "$output"; return 1
+    fi
     rm -f -- "$payload"
     result_path=$(printf '%s\n' "$output" | sed -n 's/^MOE4ALL_SUBMISSION_PATH=//p' | tail -n 1)
     [[ -n $result_path ]] || { fail 'The engine did not return a benchmark submission path.'; return 1; }
-    printf '\n结果 / Results\n+------------------+------------+----------+\n'
-    printf '| Workload         | Repetitions| Overall  |\n+------------------+------------+----------+\n'
-    printf '| %-16s | %10s | %8.1f |\n' "${S[manual_bench_kind]}" "${S[reps]}" "$avg"
-    printf '+------------------+------------+----------+\nBenchmark submission: %s\n' "$result_path"
+    printf 'Benchmark submission: %s\n' "$result_path"
     REPLY=$result_path
 }
 
@@ -1724,9 +1741,9 @@ configure() {
     if [[ ${S[launch_mode]} == bench ]]; then
         if [[ ! ${S[bench_kind]} =~ ^(quick|standard|full|manual)$ ]]; then S[manual_bench_kind]=${S[bench_kind]}; S[bench_kind]=manual; fi
         choice bench_kind '测试方案 / Benchmark plan' \
-            $'quick|自动快速 / Automatic quick|6K Prefill + 1024 Decode。单发，一次。\n6K Prefill + 1024 Decode. x1, one run.' \
-            $'standard|自动标准 / Automatic standard|6K Prefill + 1024 Decode；30K Prefill + 1024 Decode；1-2 并发，各一次，共 4 次。\n6K Prefill + 1024 Decode; 30K Prefill + 1024 Decode; x1-x2, one run each, 4 runs total.' \
-            $'full|自动完整 / Automatic full|6K、30K、150K Prefill + 1024 Decode；1-4 并发，各三次，共 36 次。\n6K, 30K and 150K Prefill + 1024 Decode; x1-x4, three runs each, 36 runs total.' \
+            $'quick|自动快速 / Automatic quick|6K Prefill + 1024 Decode。单发，一次，可追加并发。\n6K Prefill + 1024 Decode. x1, one run; optional concurrency.' \
+            $'standard|自动标准 / Automatic standard|6K、30K Prefill + 1024 Decode；1-2 并发，各一次，共 4 次。\n6K, 30K Prefill + 1024 Decode; x1-x2, one run each, 4 runs. Shared KV, different questions.' \
+            $'full|自动完整 / Automatic full|6K、30K、150K Prefill + 1024 Decode；1-4 并发，各三次，共 36 次。\n6K, 30K, 150K Prefill + 1024 Decode; x1-x4, three runs each, 36 runs. Shared KV, different questions.' \
             $'manual|手动测试 / Manual benchmark|按顺序添加 Prefill、Decode 和上下文深度。\nBuild one test step by step: Prefill, Decode and context depth.'
         if [[ ${S[bench_kind]} != manual ]]; then
             case ${S[bench_kind]} in quick) S[bench_parallel]=1 ;; standard) S[bench_parallel]=2 ;; full) S[bench_parallel]=4 ;; esac
@@ -1737,6 +1754,8 @@ configure() {
                 $'prefill|只测 Prefill / Prefill only|处理一段提示词，不生成 token。\nProcess a prompt without generating tokens.' \
                 $'decode|只测 Decode / Decode only|生成 token；下一步可添加已有上下文。\nGenerate tokens; existing context can be added next.' \
                 $'mixed|Prefill + Decode|同一轮先处理提示词，再生成 token。\nProcess a prompt and then generate in the same turn.'
+            [[ ${S[prompt_tokens]} =~ ^[1-9][0-9]*$ ]] || S[prompt_tokens]=6144
+            [[ ${S[gen_tokens]} =~ ^[1-9][0-9]*$ ]] || S[gen_tokens]=512
             case ${S[manual_bench_kind]} in
                 prefill) integer prompt_tokens 'Prefill token 数 / Prefill tokens' 1; S[gen_tokens]=0; S[depth_mode]=none; S[depth_tokens]=0 ;;
                 decode) S[prompt_tokens]=0; integer gen_tokens 'Decode token 数 / Decode tokens' 1 ;;
@@ -1748,7 +1767,10 @@ configure() {
                     $'none|不添加 / None|从空 KV 开始测量。\nMeasure from an empty KV cache.' \
                     $'real|真实上下文 / Real context|先真实 Prefill 指定长度，再开始计时。\nReally prefill the selected depth before timing.' \
                     $'synthetic|Synthetic KV 深度 / Synthetic KV depth|只构造 KV 深度与注意力形状，不计作真实 Prefill。\nCreate KV depth and attention shape without a real Prefill.'
-                if [[ ${S[depth_mode]} == none ]]; then S[depth_tokens]=0; else integer depth_tokens '已有上下文 token 数 / Existing context tokens' 1; fi
+                if [[ ${S[depth_mode]} == none ]]; then S[depth_tokens]=0; else
+                    [[ ${S[depth_tokens]} =~ ^[1-9][0-9]*$ ]] || S[depth_tokens]=6144
+                    integer depth_tokens '已有上下文 token 数 / Existing context tokens' 1
+                fi
                 printf '已添加 / Added: context=%s, depth=%s\n' "${S[depth_mode]}" "${S[depth_tokens]}"
             fi
             integer reps '重复次数 / Repetitions' 1; S[json_output]=true

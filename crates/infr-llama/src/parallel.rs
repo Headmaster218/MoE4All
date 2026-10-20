@@ -1400,10 +1400,99 @@ impl ParallelSeam {
         Ok(results)
     }
 
-    /// Reset every resident benchmark slot so the next context-size case measures a full real
-    /// Prefill instead of extending or seeding from the preceding case. Keep the preallocated KV
-    /// buffers alive: the Vulkan arena is frozen after startup and cannot recreate those claims.
+    /// Prefill the common background once, copy its live state, then append each lane's question.
+    /// This is setup-only: ordinary request checkout and serving cache policy are unchanged.
+    pub fn prepare_benchmark_shared_slots(
+        &self,
+        background: &str,
+        prompts: &[String],
+        progress: Option<&[infr_core::GenerationProgressCallback]>,
+    ) -> Result<Vec<GenStats>> {
+        anyhow::ensure!(
+            !prompts.is_empty() && prompts.len() <= self.n_slots(),
+            "invalid shared benchmark slot count"
+        );
+        anyhow::ensure!(
+            progress.is_none_or(|callbacks| callbacks.len() == prompts.len()),
+            "benchmark progress callback count must match the prompt count"
+        );
+        let background_tokens = self.model.encode(background)?;
+        anyhow::ensure!(background_tokens.len() > 1, "benchmark background is empty");
+        for prompt in prompts {
+            let tokens = self.model.encode(prompt)?;
+            anyhow::ensure!(
+                tokens.starts_with(&background_tokens[..background_tokens.len() - 1]),
+                "benchmark question changed the shared token prefix"
+            );
+        }
+        let mut scored = self.prepare_benchmark_slots(
+            &[background.to_owned()],
+            progress.map(|callbacks| &callbacks[..1]),
+        )?;
+        if prompts.len() > 1 {
+            let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
+            let mut states = {
+                let mut pool = self.pool.lock().expect("pool poisoned");
+                anyhow::ensure!(
+                    pool.slots.iter().all(|slot| !slot.busy),
+                    "cannot copy benchmark state while a slot is busy"
+                );
+                anyhow::ensure!(
+                    pool.slots[..prompts.len()]
+                        .iter()
+                        .all(|slot| slot.kv.is_some()),
+                    "benchmark slot has no KV"
+                );
+                pool.slots[..prompts.len()]
+                    .iter_mut()
+                    .map(|slot| {
+                        slot.busy = true;
+                        slot.kv.take().expect("validated benchmark KV")
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let copied = (|| -> Result<()> {
+                let (source, targets) = states.split_at_mut(1);
+                for target in targets {
+                    let copied = target.seed_benchmark_from(
+                        self.vk.as_ref(),
+                        self.model.config(),
+                        self.model.engine_cfg(),
+                        &source[0],
+                    )?;
+                    anyhow::ensure!(
+                        copied == background_tokens.len() - 1,
+                        "benchmark could not copy the complete shared frontier"
+                    );
+                }
+                Ok(())
+            })();
+            // Always return all reservations, including when a device copy fails.
+            let mut pool = self.pool.lock().expect("pool poisoned");
+            for (slot, state) in pool.slots.iter_mut().zip(states) {
+                slot.kv = Some(state);
+                slot.busy = false;
+            }
+            drop(pool);
+            self.freed.notify_all();
+            copied?;
+        }
+        // Materialize the short questions before any measured Decode lane starts.
+        let questions = self.prepare_benchmark_slots(prompts, None)?;
+        for (index, stats) in questions.into_iter().enumerate() {
+            if index == 0 {
+                continue;
+            }
+            scored.push(stats);
+        }
+        Ok(scored)
+    }
+
+    /// Reset benchmark contents and return unused dynamic segments before the next context case.
+    /// Keep logical buffers/address tables and fixed recurrent/IO state alive: frozen flat
+    /// allocations cannot be recreated, while segmented physical ranges support recommit.
     pub fn clear_benchmark_slots(&self) -> Result<()> {
+        let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
         let mut pool = self.pool.lock().expect("pool poisoned");
         anyhow::ensure!(
             pool.slots.iter().all(|slot| !slot.busy),
@@ -1492,7 +1581,6 @@ impl ParallelSeam {
                         (!empty, p.slots[i].tick)
                     })
                     .expect("free is non-empty"),
-        let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
             };
             // Seed the target with the best shared prefix among the other FREE slots (a common
             // system prompt), via a device-side KV copy instead of re-prefilling it.
@@ -2341,6 +2429,7 @@ impl ParallelSeam {
         acc: &mut Vec<u32>,
         printed: &mut usize,
         on_piece: &mut F,
+        stream_text: bool,
     ) -> Result<GenStats> {
         loop {
             let event = match events.recv() {
@@ -2359,7 +2448,9 @@ impl ParallelSeam {
                     let keep_going = if crate::sampling::abort_requested(Some(req)) {
                         false
                     } else {
-                        crate::stream_token(self.model.tokenizer(), acc, printed, id, on_piece);
+                        if stream_text {
+                            crate::stream_token(self.model.tokenizer(), acc, printed, id, on_piece);
+                        }
                         !crate::sampling::abort_requested(Some(req))
                     };
                     let _ = acknowledgements.send(keep_going);
@@ -3924,7 +4015,47 @@ impl ParallelSeam {
         max_new: usize,
         constraint: Option<&mut crate::grammar::Constraint>,
         req: &RequestCtx,
+        on_piece: impl FnMut(&str),
+    ) -> Result<GenStats> {
+        self.generate_turn_inner(
+            prompt,
+            checkpoint_prefixes,
+            max_new,
+            constraint,
+            req,
+            on_piece,
+            true,
+        )
+    }
+
+    /// Benchmark token sampling skips text decoding; scheduling, KV and sampling stay identical.
+    pub fn generate_benchmark_turn(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        req: &RequestCtx,
+    ) -> Result<GenStats> {
+        self.generate_turn_inner(
+            prompt,
+            crate::seam::TurnCheckpointPrefixes::benchmark_frontier(),
+            max_new,
+            None,
+            req,
+            |_| {},
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_turn_inner(
+        &self,
+        prompt: &str,
+        checkpoint_prefixes: crate::seam::TurnCheckpointPrefixes<'_>,
+        max_new: usize,
+        constraint: Option<&mut crate::grammar::Constraint>,
+        req: &RequestCtx,
         mut on_piece: impl FnMut(&str),
+        stream_text: bool,
     ) -> Result<GenStats> {
         let mtp_eligible = self.mtp_heads.as_ref().is_none_or(|_| {
             let base = crate::sampling::Sampler::from_cfg(&self.model.engine_cfg().sampling);
@@ -3969,13 +4100,15 @@ impl ParallelSeam {
                 &prompt_tokens,
                 max_new,
                 |id| {
-                    crate::stream_token(
-                        self.model.tokenizer(),
-                        &mut acc,
-                        &mut printed,
-                        id,
-                        &mut on_piece,
-                    )
+                    if stream_text {
+                        crate::stream_token(
+                            self.model.tokenizer(),
+                            &mut acc,
+                            &mut printed,
+                            id,
+                            &mut on_piece,
+                        );
+                    }
                 },
                 &mut guard.kv,
                 self.max_ctx,
@@ -4047,6 +4180,7 @@ impl ParallelSeam {
             &mut acc,
             &mut printed,
             &mut on_piece,
+            stream_text,
         )
     }
 
@@ -4184,6 +4318,7 @@ impl ParallelSeam {
                 &mut acc,
                 &mut printed,
                 &mut on_piece,
+                true,
             );
         }
         if let Some(heads) = &self.mtp_heads {
@@ -4294,6 +4429,7 @@ impl ParallelSeam {
             &mut acc,
             &mut printed,
             &mut on_piece,
+            true,
         )
     }
 }

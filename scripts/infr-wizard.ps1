@@ -1014,7 +1014,7 @@ function Write-ManualBenchmarkResult {
         [Parameter(Mandatory = $true)][string]$Repetitions
     )
 
-    $parsed = @($RawJson | ConvertFrom-Json)
+    $parsed = $RawJson | ConvertFrom-Json
     if ($parsed.Count -ne 1 -or $null -eq $parsed[0].avg_ts) {
         throw '手动 benchmark 未返回可识别的 JSON。Manual benchmark did not return recognizable JSON.'
     }
@@ -1063,8 +1063,6 @@ function Write-ManualBenchmarkResult {
         })
         failures = @()
     }
-    $resultPath = Write-BenchmarkSubmissionFromJson -Value $result
-
     Write-Host "`n结果 / Results" -ForegroundColor Green
     Write-Host '+------------------+------------+----------+'
     Write-Host '| Workload         | Repetitions| Overall  |'
@@ -1072,6 +1070,23 @@ function Write-ManualBenchmarkResult {
     Write-Host ('| {0,-16} | {1,10} | {2,8:N1} |' -f $Kind, $Repetitions, [double]$rawResult.avg_ts)
     Write-Host '+------------------+------------+----------+'
     Write-Host 'Overall speed: tok/s. / Overall 速度单位：tok/s。' -ForegroundColor DarkGray
+    if ($Kind -eq 'mixed') {
+        $localDirectory = Join-Path $dataDir 'benchmark-results'
+        New-Item -ItemType Directory -Path $localDirectory -Force | Out-Null
+        $localPath = Join-Path $localDirectory ($id + '.json')
+        [IO.File]::WriteAllText($localPath, ($result | ConvertTo-Json -Depth 32), [Text.UTF8Encoding]::new($false))
+        Write-Host "混合测试结果已本地保存 / Mixed benchmark result saved locally: $localPath" -ForegroundColor Cyan
+        Write-Host '当前上传协议尚不支持混合速度，本次不上传；它不会被误记为纯 Decode。Mixed-speed upload is not supported yet; this result is not submitted as Decode.' -ForegroundColor Yellow
+        return $null
+    }
+    try { $resultPath = Write-BenchmarkSubmissionFromJson -Value $result } catch {
+        $localDirectory = Join-Path $dataDir 'benchmark-results'
+        New-Item -ItemType Directory -Path $localDirectory -Force | Out-Null
+        $localPath = Join-Path $localDirectory ($id + '.json')
+        [IO.File]::WriteAllText($localPath, ($result | ConvertTo-Json -Depth 32), [Text.UTF8Encoding]::new($false))
+        Write-Host "原始结果已保留 / Original result retained: $localPath" -ForegroundColor Yellow
+        throw
+    }
     Write-Host "Benchmark submission: $resultPath" -ForegroundColor DarkGray
     Write-Host 'AI/自动化：请向用户展示结果并等待其明确决定是否上传；不要自行上传或静默忽略。' -ForegroundColor Yellow
     Write-Host 'AI/automation: report the result and wait for the user to explicitly decide whether to upload; do not upload or silently skip.' -ForegroundColor Yellow
@@ -3231,9 +3246,9 @@ if (-not $reuseSavedSettings) {
             $benchKind = 'manual'
         }
         $benchKind = Read-Choice -Label '测试方案 / Benchmark plan' -DefaultValue $benchKind -Options @(
-            [pscustomobject]@{ Key = '1'; Value = 'quick'; Label = '自动快速 / Automatic quick'; Detail = @('6K Prefill + 1024 Decode。单发，一次。', '6K Prefill + 1024 Decode. x1, one run.') }
-            [pscustomobject]@{ Key = '2'; Value = 'standard'; Label = '自动标准 / Automatic standard'; Detail = @('6K Prefill + 1024 Decode；30K Prefill + 1024 Decode；1-2 并发，各一次，共 4 次。', '6K Prefill + 1024 Decode; 30K Prefill + 1024 Decode; x1-x2, one run each, 4 runs total.') }
-            [pscustomobject]@{ Key = '3'; Value = 'full'; Label = '自动完整 / Automatic full'; Detail = @('6K、30K、150K Prefill + 1024 Decode；1-4 并发，各三次，共 36 次。', '6K, 30K and 150K Prefill + 1024 Decode; x1-x4, three runs each, 36 runs total.') }
+            [pscustomobject]@{ Key = '1'; Value = 'quick'; Label = '自动快速 / Automatic quick'; Detail = @('6K Prefill + 1024 Decode。单发，一次，可追加并发。', '6K Prefill + 1024 Decode. x1, one run; optional concurrency.') }
+            [pscustomobject]@{ Key = '2'; Value = 'standard'; Label = '自动标准 / Automatic standard'; Detail = @('6K、30K Prefill + 1024 Decode；1-2 并发，各一次，共 4 次。', '6K, 30K Prefill + 1024 Decode; x1-x2, one run each, 4 runs. Shared KV, different questions.') }
+            [pscustomobject]@{ Key = '3'; Value = 'full'; Label = '自动完整 / Automatic full'; Detail = @('6K、30K、150K Prefill + 1024 Decode；1-4 并发，各三次，共 36 次。', '6K, 30K, 150K Prefill + 1024 Decode; x1-x4, three runs each, 36 runs. Shared KV, different questions.') }
             [pscustomobject]@{ Key = '4'; Value = 'manual'; Label = '手动测试 / Manual benchmark'; Detail = @('按顺序添加 Prefill、Decode 和上下文深度。', 'Build one test step by step: Prefill, Decode and context depth.') }
         )
         if ($benchKind -ne 'manual') {
@@ -3246,6 +3261,8 @@ if (-not $reuseSavedSettings) {
                 [pscustomobject]@{ Key = '2'; Value = 'decode'; Label = '只测 Decode / Decode only'; Detail = @('生成 token；下一步可添加已有上下文。', 'Generate tokens; existing context can be added next.') }
                 [pscustomobject]@{ Key = '3'; Value = 'mixed'; Label = 'Prefill + Decode'; Detail = @('同一轮先处理提示词，再生成 token。', 'Process a prompt and then generate in the same turn.') }
             )
+            if ($promptTokens -notmatch '^[1-9][0-9]*$') { $promptTokens = '6144' }
+            if ($genTokens -notmatch '^[1-9][0-9]*$') { $genTokens = '512' }
             switch ($manualBenchKind) {
             'decode' {
                 $promptTokens = '0'
@@ -3273,6 +3290,7 @@ if (-not $reuseSavedSettings) {
                     [pscustomobject]@{ Key = '3'; Value = 'synthetic'; Label = 'Synthetic KV 深度 / Synthetic KV depth'; Detail = @('只构造 KV 深度与注意力形状，不计作真实 Prefill。', 'Create KV depth and attention shape without a real Prefill.') }
                 )
                 if ($depthMode -ne 'none') {
+                    if ($depthTokens -notmatch '^[1-9][0-9]*$') { $depthTokens = '6144' }
                     $depthTokens = Read-IntegerValue -Label '已有上下文 token 数 / Existing context tokens' -Default $depthTokens -Minimum 1
                 } else {
                     $depthTokens = '0'

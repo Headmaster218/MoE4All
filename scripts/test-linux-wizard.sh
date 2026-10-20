@@ -62,6 +62,9 @@ reset; S[launch_mode]=bench; S[bench_kind]=manual; S[manual_bench_kind]=mixed; S
 build_command; has_arg --pg; has_arg --synthetic-depth; has_arg --json; ! has_arg spec.mtp=false; pass
 reset; S[launch_mode]=bench; S[bench_kind]=standard; S[bench_parallel]=3
 build_command; has_arg --suite; has_arg standard; has_arg --parallel; has_arg 3; has_arg --result-dir; ! has_arg --synthetic-depth; pass
+grep -Fq '6K Prefill + 1024 Decode. x1, one run' "$repo/Start-INFR-Wizard-Linux.sh"; pass
+grep -Fq 'Shared KV, different questions.' "$repo/Start-INFR-Wizard-Linux.sh"; pass
+! grep -Fq '90s Decode' "$repo/Start-INFR-Wizard-Linux.sh"; pass
 reset; S[launch_mode]=bench; S[setup_mode]=aggressive; S[device]=Vulkan1
 start_benchmark_estimate_probe
 benchmark_estimate_detail quick 1; [[ $REPLY == '预计约 1 分钟。Estimated about 1 min.' ]]; pass

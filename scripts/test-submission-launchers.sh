@@ -219,6 +219,15 @@ S[model]="$work/model with spaces.gguf"
 pack_manual_benchmark "$work/manual.json" > "$work/manual-output"
 check test -f "$REPLY"
 check grep -q '123.4' "$work/manual-output"
+S[manual_bench_kind]=mixed
+pack_manual_benchmark "$work/manual.json" > "$work/mixed-output"
+check test -z "$REPLY"
+local_result=$(find "$CONFIG_DIR/benchmark-results" -name '*.json' -type f | head -n 1)
+check test -f "$local_result"
+json_load "$local_result"
+json_get '["result","configuration","benchmark_kind"]'; check test "$REPLY" = mixed
+json_get '["raw",0,"avg_ts"]'; check test "$REPLY" = 123.4
+check grep -q 'not submitted as Decode' "$work/mixed-output"
 
 curl() {
     output='' headers=''

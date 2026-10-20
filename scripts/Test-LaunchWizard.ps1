@@ -232,12 +232,19 @@ try {
         Assert (-not ('--max-new' -in $nativeArgs) -and -not ('spec.mtp=false' -in $nativeArgs) -and -not ('--ctx' -in $nativeArgs)) 'Benchmark received chat or context settings'
         Assert (($script:Output -join "`n") -match 'Current plan') 'Manual benchmark did not show the incremental plan'
     }
+    Test-Flow 'manual mode changes restore positive defaults' -Saved ([pscustomobject]@{ setup_mode = 'conservative'; prompt_tokens = '0'; gen_tokens = '0'; depth_tokens = '0' }) -Inputs @('3', $model, '', '1', '', '4', '3', '', '', '2', '', '1') -Check {
+        Assert ('6144,512' -in $nativeArgs -and '-d' -in $nativeArgs -and '6144' -in $nativeArgs) 'Zero defaults survived switching manual modes'
+    }
+    Test-Flow 'manual positive defaults stay unchanged' -Saved ([pscustomobject]@{ setup_mode = 'conservative'; prompt_tokens = '1024'; gen_tokens = '64'; depth_tokens = '2048' }) -Inputs @('3', $model, '', '1', '', '4', '3', '', '', '2', '', '1') -Check {
+        Assert ('1024,64' -in $nativeArgs -and '-d' -in $nativeArgs -and '2048' -in $nativeArgs) 'Valid manual defaults were overwritten'
+    }
     Test-Flow 'automatic standard benchmark' -Inputs @('3', $model, '', '', '', '2', '3') -Check {
         $joinedOutput = $script:Output -join "`n"
         Assert ($nativeArgs[0] -eq 'bench' -and '--suite' -in $nativeArgs -and 'standard' -in $nativeArgs) 'Automatic suite flags lost'
         Assert ('--parallel' -in $nativeArgs -and '3' -in $nativeArgs -and '--result-dir' -in $nativeArgs) 'Automatic concurrency or result directory lost'
         Assert (-not ('--synthetic-depth' -in $nativeArgs) -and -not ('-p' -in $nativeArgs) -and -not ('--ctx' -in $nativeArgs)) 'Automatic suite must use its own real context plan'
-        Assert ($joinedOutput.Contains('6K Prefill + 1024 Decode. x1, one run.')) 'Concise bilingual benchmark copy is missing'
+        Assert ($joinedOutput.Contains('6K Prefill + 1024 Decode. x1, one run')) 'Fixed-token bilingual benchmark copy is missing'
+        Assert ($joinedOutput.Contains('Shared KV, different questions.')) 'Shared context benchmark copy is missing'
         Assert (-not $joinedOutput.Contains('Estimated about')) 'Benchmark menu must not display an estimate'
         Assert (-not $state.benchmark_upload -and $state.benchmark_upload_has_github -and $state.benchmark_upload_gh_auth -and $state.benchmark_upload_fallback -eq 'folder') 'Benchmark upload preference defaults changed'
     }
@@ -279,6 +286,14 @@ try {
     New-Item -ItemType Directory -Path $resultDir -Force | Out-Null
     $dataDir = Join-Path $testRoot 'gui-data'
     $infrPath = Join-Path $testRoot 'never-run.exe'
+    $localOnly = Write-ManualBenchmarkResult -RawJson '[{"avg_ts":123.4,"reps_ts":[123.4]}]' -ModelPath $model35 -Kind mixed -PromptTokens 512 -GenTokens 128 -DepthMode synthetic -DepthTokens 6144 -Repetitions 1
+    Assert ($null -eq $localOnly) 'Mixed speed must not enter standardized upload'
+    $localResult = @(Get-ChildItem -LiteralPath (Join-Path $dataDir 'benchmark-results') -Filter '*.json')
+    Assert ($localResult.Count -eq 1) 'Mixed benchmark raw result was not retained'
+    $localPayload = Get-Content -LiteralPath $localResult[0].FullName -Raw | ConvertFrom-Json
+    Assert ($localPayload.configuration.benchmark_kind -eq 'mixed' -and $localPayload.contexts[0].manual_result.raw.reps_ts[0] -eq 123.4) 'Mixed result lost its parameters or raw samples'
+    $script:Passed++
+    Microsoft.PowerShell.Utility\Write-Host 'PASS mixed benchmark stays local with its raw samples'
     $fixtureSubmissionPath = Join-Path $resultDir 'manual-fixture.m4b'
     $resultValue = [ordered]@{
         schema_version = 1; id = 'manual-fixture'; created_at_utc = '2026-10-18T00:00:00Z'; engine_version = '1.0.3'; profile = 'manual'
