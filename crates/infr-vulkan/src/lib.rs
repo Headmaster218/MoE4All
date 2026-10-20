@@ -7730,6 +7730,33 @@ impl Backend for VulkanBackend {
         Ok(())
     }
 
+    fn trim_segmented_kv(&self, buffer: &dyn Buffer, keep: usize) -> Result<()> {
+        let segmented = as_segmented_kv(buffer)
+            .ok_or_else(|| be("trim_segmented_kv received a flat or foreign buffer"))?;
+        if !Arc::ptr_eq(&segmented.shared, &self.shared) {
+            return Err(be(
+                "segmented KV trim belongs to a different backend/device",
+            ));
+        }
+        self.with_unified_exclusive(|| {
+            let mut segments = segmented.segments.lock().unwrap();
+            if keep > segments.len() {
+                return Err(be("segmented KV trim cannot grow the committed prefix"));
+            }
+            let ptr = segmented
+                .table
+                .mapped_ptr()
+                .ok_or_else(|| be("KV address table is not host-visible"))?;
+            let offset = keep * std::mem::size_of::<u64>();
+            unsafe {
+                std::ptr::write_bytes(ptr.add(offset), 0, segmented.table.size - offset);
+            }
+            // Keep the reservation: future growth must reuse the same frozen coordinates.
+            segments.truncate(keep);
+            Ok(())
+        })
+    }
+
     fn release_segmented_kv(&self, buffer: &dyn Buffer) -> Result<()> {
         let segmented = as_segmented_kv(buffer)
             .ok_or_else(|| be("release_segmented_kv received a flat or foreign buffer"))?;
@@ -10657,6 +10684,20 @@ mod tests {
         be.download_range(virtual_kv.as_ref(), offset, &mut restored)
             .expect("download across a segment boundary");
         assert_eq!(restored, payload);
+
+        let first_address = addresses[0];
+        be.trim_segmented_kv(virtual_kv.as_ref(), 1).unwrap();
+        assert_eq!(segmented.committed(), 1);
+        assert_eq!(addresses[0], first_address);
+        assert_eq!(addresses[1], 0);
+        assert!(be.trim_segmented_kv(virtual_kv.as_ref(), 2).is_err());
+        let mut prefix = vec![0; 31];
+        be.download_range(virtual_kv.as_ref(), offset, &mut prefix)
+            .unwrap();
+        assert_eq!(prefix, payload[..31]);
+        be.ensure_segmented_kv(virtual_kv.as_ref(), 2).unwrap();
+        assert_eq!(addresses[0], first_address);
+        assert_ne!(addresses[1], 0);
 
         be.release_segmented_kv(virtual_kv.as_ref())
             .expect("release committed KV segments");

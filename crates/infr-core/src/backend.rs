@@ -659,6 +659,13 @@ pub trait Backend: Send + Sync {
             "segmented KV release is not supported by this backend",
         ))
     }
+    /// Return only unused tail segments, keeping the prefix and frozen physical layout stable.
+    /// Unlike release, this is a capacity trim, not a session-spill operation.
+    fn trim_segmented_kv(&self, _buffer: &dyn Buffer, _keep: usize) -> Result<()> {
+        Err(crate::error::Error::backend(
+            "segmented KV trimming is not supported by this backend",
+        ))
+    }
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()>;
     fn download(&self, src: &dyn Buffer, dst: &mut [u8]) -> Result<()>;
     /// Emit the one-shot KV-cache placement summary for a VRAM-first spill backend (the Vulkan

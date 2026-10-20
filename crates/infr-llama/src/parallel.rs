@@ -1411,7 +1411,7 @@ impl ParallelSeam {
         );
         for slot in &mut pool.slots {
             if let Some(kv) = slot.kv.as_mut() {
-                kv.reset();
+                kv.reset_benchmark_session_state(self.vk.as_ref(), self.model.config())?;
             }
             slot.multimodal_key = None;
             slot.idle_since = None;
@@ -1492,6 +1492,7 @@ impl ParallelSeam {
                         (!empty, p.slots[i].tick)
                     })
                     .expect("free is non-empty"),
+        let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
             };
             // Seed the target with the best shared prefix among the other FREE slots (a common
             // system prompt), via a device-side KV copy instead of re-prefilling it.
