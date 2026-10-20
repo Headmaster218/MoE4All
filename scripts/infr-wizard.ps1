@@ -2947,9 +2947,9 @@ $context = [string](Get-SavedValue 'context' '')
 $ubatch = [string](Get-SavedValue 'ubatch' '')
 $threads = [string](Get-SavedValue 'threads' '')
 $configPath = [string](Get-SavedValue 'config_path' '')
-$kvPreset = [string](Get-SavedValue 'kv_preset' 'q8')
-$kvTypeK = [string](Get-SavedValue 'kv_type_k' 'q8_0')
-$kvTypeV = [string](Get-SavedValue 'kv_type_v' 'q8_0')
+$kvPreset = [string](Get-SavedValue 'kv_preset' 'auto')
+$kvTypeK = [string](Get-SavedValue 'kv_type_k' '')
+$kvTypeV = [string](Get-SavedValue 'kv_type_v' '')
 $configureMemory = [bool](Get-SavedValue 'configure_memory' $false)
 
 $vramBudget = [string](Get-SavedValue 'vram_budget' '')
@@ -3112,15 +3112,15 @@ if (-not $reuseSavedSettings) {
         Write-Host 'Hardware stays auto-detected, with tighter RAM/VRAM headroom, a larger Ubatch and a wider Submit cap search.' -ForegroundColor DarkGray
         Write-Host '适合追求吞吐且能接受更高资源压力；启动失败或系统换页时请改用保守档。' -ForegroundColor Yellow
         Write-Host 'Use conservative mode if allocation fails or Windows starts paging.' -ForegroundColor DarkGray
-        $kvPreset = 'q8'
-        $kvTypeK = 'q8_0'
-        $kvTypeV = 'q8_0'
+        $kvPreset = 'auto'
+        $kvTypeK = ''
+        $kvTypeV = ''
     } else {
         Write-Host "`n将自动预算所选设备的显存和 RAM；上下文留空时由引擎自动确定。" -ForegroundColor DarkGray
         Write-Host 'VRAM and RAM budgets use the selected device; leave context blank for engine sizing.' -ForegroundColor DarkGray
-        $kvPreset = 'q8'
-        $kvTypeK = 'q8_0'
-        $kvTypeV = 'q8_0'
+        $kvPreset = 'auto'
+        $kvTypeK = ''
+        $kvTypeV = ''
     }
     if ($setupMode -eq 'manual' -and $configureMemory) {
         Write-Host '大小可写 21GiB、512MiB、80%；留空表示自动。Sizes accept 21GiB, 512MiB or 80%; blank means auto.' -ForegroundColor DarkGray
@@ -3333,6 +3333,10 @@ if ($launchMode -ne 'benchmark' -and -not [string]::IsNullOrWhiteSpace($context)
 
 if ($setupMode -eq 'conservative' -or $setupMode -eq 'aggressive') {
     Add-SetArgument $nativeArgs 'device.auto_profile' $setupMode
+    # Also migrate direct reuse of older automatic settings; the engine owns format support.
+    $kvPreset = 'auto'
+    $kvTypeK = ''
+    $kvTypeV = ''
 }
 
 if ($kvPreset -ne 'auto') {

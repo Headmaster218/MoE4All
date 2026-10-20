@@ -554,7 +554,7 @@ defaults() {
     local key
     S=(
         [launch_mode]=run [setup_mode]=conservative [model]='' [model_history]='' [device]='' [context]=''
-        [ubatch]='' [threads]='' [config_path]='' [kv_preset]=q8 [kv_type_k]=q8_0 [kv_type_v]=q8_0
+        [ubatch]='' [threads]='' [config_path]='' [kv_preset]=auto [kv_type_k]='' [kv_type_v]=''
         [configure_memory]=false [vram_budget]='' [vram_reserve]='' [expert_cache]='' [ram_budget]=''
         [host_dma]=true [pager_ring]='' [pager_ring_slots]='' [kv_overflow]=false [kv_overflow_vram_mb]='' [kv_overflow_reserve_mb]=''
         [submit_mode]=auto [submit_cap]=64 [configure_diagnostics]=false [pager_stats]=false [pager_profile]=false [stage_profile]=false [vram_profile]=false
@@ -1524,7 +1524,7 @@ configure() {
         S[vram_budget]=''; S[vram_reserve]=''; S[expert_cache]=''; S[pager_ring]=''; S[pager_ring_slots]=''
         S[host_dma]=false; S[kv_overflow]=false; S[submit_mode]=auto; S[configure_diagnostics]=false
         ask custom_sets '额外 --set，以分号分隔 / Extra --set entries separated by semicolons'
-    else S[kv_preset]=q8; S[kv_type_k]=q8_0; S[kv_type_v]=q8_0; fi
+    else S[kv_preset]=auto; S[kv_type_k]=''; S[kv_type_v]=''; fi
     S[auto_overrides]=''
     if [[ ${S[launch_mode]} != bench ]]; then
         ask_yes configure_thinking '是否配置默认思考？API 可覆盖 / Configure default reasoning? API may override'
@@ -1612,7 +1612,17 @@ build_command() {
         if [[ ,${S[auto_overrides]}, == *,ram_budget,* && -n ${S[ram_budget]} ]]; then setting device.ram_budget "${S[ram_budget]}"; fi
     fi
     [[ ${S[launch_mode]} == bench ]] || add_arg --ctx context
-    if [[ ${S[kv_preset]} != auto ]]; then setting kv.type_k "${S[kv_type_k]}"; setting kv.type_v "${S[kv_type_v]}"; fi
+    if [[ ${S[setup_mode]} != manual ]]; then
+        # Old automatic profiles saved Q8 as if it were explicit; retain only current CLI choices.
+        S[kv_preset]=auto
+        if [[ -v 'OVERRIDES[kv_type_k]' || -v 'OVERRIDES[kv_type_v]' ]]; then S[kv_preset]=custom; fi
+        [[ -v 'OVERRIDES[kv_type_k]' ]] || S[kv_type_k]=''
+        [[ -v 'OVERRIDES[kv_type_v]' ]] || S[kv_type_v]=''
+    fi
+    if [[ ${S[kv_preset]} != auto ]]; then
+        [[ -z ${S[kv_type_k]} ]] || setting kv.type_k "${S[kv_type_k]}"
+        [[ -z ${S[kv_type_v]} ]] || setting kv.type_v "${S[kv_type_v]}"
+    fi
     if [[ ${S[setup_mode]} == manual ]]; then
         if [[ ${S[configure_memory]} == true && -n ${S[ram_budget]} ]]; then setting device.ram_budget "${S[ram_budget]}"; fi
     fi

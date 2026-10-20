@@ -166,7 +166,8 @@ try {
 
     Test-Flow 'fresh chat defaults' -Inputs @('', $model, '', '', '', '', '', '', '') -Check {
         Assert ($nativeArgs[0] -eq 'run') 'Expected chat'
-        Assert ('65536' -in $nativeArgs -and 'kv.type_k=q8_0' -in $nativeArgs) 'Fresh defaults changed'
+        Assert ('65536' -in $nativeArgs -and $state.kv_preset -eq 'auto') 'Fresh defaults changed'
+        Assert (-not (@($nativeArgs | Where-Object { $_ -match '^kv.type_[kv]=' }).Count)) 'Automatic defaults must defer KV format to the engine'
         Assert (-not ('--think' -in $nativeArgs) -and -not ('--reasoning-effort' -in $nativeArgs)) 'Default reasoning should be inherited'
         Assert (@($script:Events | Where-Object { $_ -match 'Compute device' }).Count -eq 1) 'One GPU still needs manual selection'
         Assert (($script:Output -join "`n") -notmatch 'CPU: Fixture CPU') 'CPU must not be a compute-device option'
@@ -249,6 +250,28 @@ try {
         Assert (-not $state.benchmark_upload -and $state.benchmark_upload_has_github -and $state.benchmark_upload_gh_auth -and $state.benchmark_upload_fallback -eq 'folder') 'Benchmark upload preference defaults changed'
     }
     $chatSettings = [pscustomobject]@{ launch_mode = 'chat'; setup_mode = 'quick'; model = $model; device = 'Vulkan0'; context = '150k'; max_new = '8192'; think_mode = 'think'; reasoning_effort = 'medium'; last_command = 'NEVER EXECUTE THIS' }
+    foreach ($profile in @('conservative', 'aggressive')) {
+        foreach ($mode in @('chat', 'server', 'benchmark')) {
+            $oldAutomatic = [pscustomobject]@{ launch_mode = $mode; setup_mode = $profile; model = $model; device = 'Vulkan0'; kv_preset = 'q8'; kv_type_k = 'q8_0'; kv_type_v = 'q8_0'; server_addr = '127.0.0.1:8080' }
+            Test-Flow "saved automatic $profile $mode migrates stale Q8" -Saved $oldAutomatic -Inputs @('') -Check {
+                Assert ($reuseSavedSettings) 'Saved automatic launch should still reuse settings'
+                Assert (-not (@($nativeArgs | Where-Object { $_ -match '^kv.type_[kv]=' }).Count)) 'Stale Q8 must not override engine capability selection'
+                Assert ($state.kv_preset -eq 'auto' -and -not $state.kv_type_k -and -not $state.kv_type_v) 'Migrated automatic state must stay automatic on the next launch'
+            }
+        }
+    }
+    foreach ($preset in @('q8', 'f16', 'custom', 'auto')) {
+        $k = if ($preset -eq 'custom') { 'q4_0' } elseif ($preset -eq 'f16') { 'f16' } else { 'q8_0' }
+        $v = if ($preset -eq 'custom') { 'f16' } else { $k }
+        $manualKv = [pscustomobject]@{ launch_mode = 'chat'; setup_mode = 'manual'; model = $model; device = 'Vulkan0'; kv_preset = $preset; kv_type_k = $k; kv_type_v = $v }
+        Test-Flow "manual $preset KV choice is preserved" -Saved $manualKv -Inputs @('') -Check {
+            if ($preset -eq 'auto') {
+                Assert (-not (@($nativeArgs | Where-Object { $_ -match '^kv.type_[kv]=' }).Count)) 'Manual engine-default must not pass stale values'
+            } else {
+                Assert ("kv.type_k=$k" -in $nativeArgs -and "kv.type_v=$v" -in $nativeArgs) 'Explicit manual KV choice was changed'
+            }
+        }
+    }
     Test-Flow 'saved launch uses structured settings without reconfiguration' -Saved $chatSettings -Inputs @('') -Check {
         Assert ($reuseSavedSettings -and $script:Events.Count -eq 1) 'Saved launch asked configuration questions'
         Assert ('8192' -in $nativeArgs -and '150k' -in $nativeArgs -and 'medium' -in $nativeArgs) 'Saved generation settings lost'
