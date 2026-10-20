@@ -17,9 +17,9 @@ const digest = data => createHash('sha256').update(data).digest('hex');
 
 test('publication retries execute the generator from the same trusted main tree as its inputs', async () => {
   const workflow = await fs.readFile(path.join(scripts, '../.github/workflows/benchmark-index.yml'), 'utf8');
-  assert.match(workflow, /node "\$source\/scripts\/publish-benchmark-index\.mjs" --source "\$source" --data-dir "\$tree"/);
-  assert.match(workflow, /push origin HEAD:refs\/heads\/benchmark-index/);
-  assert.doesNotMatch(workflow, /push origin HEAD:main/);
+  assert.match(workflow, /node "\$tree\/scripts\/publish-benchmark-main\.mjs" --source "\$tree"/);
+  assert.match(workflow, /pull-requests: write/);
+  assert.doesNotMatch(workflow, /push origin HEAD:main|refs\/heads\/benchmark-index/);
   assert.doesNotMatch(workflow, /--force|pull_request_target/);
 });
 const git = (root, ...args) => execFileSync('git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', ...args], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -122,28 +122,4 @@ test('concurrent main advancement rejects stale push; rebuilding current main in
   await prepareIndexCommit({ directory: other, python }); git(other, 'push', 'origin', 'HEAD:main');
   assert.equal((await published(other)).index.reports.length, 2);
   assert.equal(git(dir, '--git-dir=' + remote, 'rev-parse', 'main'), git(other, 'rev-parse', 'HEAD'));
-});
-
-test('a data-only branch publishes trusted main originals without copying source or bypassing main protection', async t => {
-  const { dir, repo } = await fixture(t), firstInput = await report(repo);
-  const data = path.join(dir, 'data'); await fs.mkdir(data);
-  git(data, 'init', '--initial-branch=benchmark-index'); git(data, 'config', 'core.autocrlf', 'true');
-  git(data, 'commit', '--allow-empty', '-m', 'initial');
-  const first = await prepareIndexCommit({ directory: data, sourceDirectory: repo, python });
-  const old = await published(data);
-  assert.equal(old.manifest.source.commit, firstInput.commit);
-  assert.equal(git(data, 'ls-files').split('\n').length, 4);
-  assert.equal(git(repo, 'rev-parse', 'HEAD'), firstInput.commit);
-  assert.equal((await prepareIndexCommit({ directory: data, sourceDirectory: repo, python })).changed, false);
-  assert.equal(git(data, 'rev-parse', 'HEAD'), first.commit);
-  const secondInput = await report(repo, 'fixture-benchmark-002');
-  await prepareIndexCommit({ directory: data, sourceDirectory: repo, python });
-  const updated = await published(data);
-  assert.equal(updated.manifest.source.commit, secondInput.commit);
-  assert.equal(updated.index.reports.length, 2);
-  assert.equal(git(data, 'ls-files').split('\n').length, 4);
-  assert.equal(digest(execFileSync('git', ['show', `${old.manifest.package_commit}:benchmark-database/index/v1/${old.manifest.packages.gzip.url}`], { cwd: data })), old.manifest.packages.gzip.sha256);
-  await fs.writeFile(path.join(data, 'unexpected.mjs'), 'throw new Error("untrusted")');
-  git(data, 'add', '.'); git(data, 'commit', '-m', 'unexpected file');
-  await assert.rejects(prepareIndexCommit({ directory: data, sourceDirectory: repo, python }), /data-only/);
 });

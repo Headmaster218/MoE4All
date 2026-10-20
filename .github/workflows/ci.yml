@@ -126,7 +126,7 @@ jobs:
         with:
           node-version: '24'
       - name: Compact benchmark index tests
-        run: node --test scripts/test-benchmark-index.mjs
+        run: node --test scripts/test-benchmark-index.mjs scripts/test-benchmark-main.mjs
       - name: Install glslc (shaderc)
         run: sudo apt-get update && sudo apt-get install -y glslc
       - uses: actions-rust-lang/setup-rust-toolchain@v1
