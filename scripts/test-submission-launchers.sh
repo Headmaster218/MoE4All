@@ -38,6 +38,7 @@ open_submission_url() { printf '%s' "$1" > "$work/opened-url"; }
 # BSD wc pads its count; protocol comparisons must not depend on that padding.
 wc() { local count; count=$(command wc "$@") || return 1; printf '        %s\n' "$count"; }
 original_request=$(typeset -f submission_api_request)
+original_snapshot=$(typeset -f submission_connectivity_snapshot)
 eval "${original_request/submission_api_request/original_submission_api_request}"
 
 gh() {
@@ -106,6 +107,17 @@ check grep -q error "$work/chosen-git-kind"
 offer_mode=cloudflare; offer_submission_upload "$current_file" error true
 check grep -q error "$work/chosen-web-kind"
 
+submission_connectivity_snapshot() { SUBMISSION_GITHUB_CONNECTIVITY=false; SUBMISSION_CLOUDFLARE_CONNECTIVITY=false; SUBMISSION_PROXY_CONNECTIVITY=false; }
+offer_mode=github; rm -f -- "$work/chosen-git-kind" "$work/chosen-web-kind"
+offer_submission_upload "$current_file" error true
+check test -f "$work/chosen-git-kind"
+check test ! -f "$work/chosen-web-kind"
+gh_submission_upload() { return 1; }
+offer_submission_upload "$current_file" error true
+check test -f "$work/chosen-web-kind"
+eval "$original_snapshot"
+gh_submission_upload() { printf '%s' "$2" > "$work/chosen-git-kind"; }
+
 website_submission_upload() { return 1; }
 yes() { REPLY=false; }
 if offer_submission_upload "$current_file" error true; then exit 1; fi
@@ -121,7 +133,7 @@ yes() {
 }
 SUBMISSION_CONNECTIVITY_FILE=$CONFIG_DIR/private/submission-connectivity.status
 SUBMISSION_CONNECTIVITY_GENERATION=fixture
-printf 'generation=fixture\ngithub=true\ncloudflare=true\nproxy=not-configured\n' > "$SUBMISSION_CONNECTIVITY_FILE"
+printf 'generation=fixture\ngithub=false\ncloudflare=false\nproxy=not-configured\n' > "$SUBMISSION_CONNECTIVITY_FILE"
 PENDING_SUBMISSION_PROMPTED=false
 retry_pending_submissions
 check test ! -f "$pending_file"
@@ -134,11 +146,12 @@ check test -f "$pending_file"
 rm -f -- "$pending_file"
 SUBMISSION_GITHUB_ROUTE=direct
 HTTPS_PROXY=http://127.0.0.1:9
-gh() { [[ -z ${HTTPS_PROXY-} && ${NO_PROXY-} == '*' ]]; }
+NO_PROXY=localhost
+gh() { [[ $HTTPS_PROXY == http://127.0.0.1:9 && $NO_PROXY == localhost ]]; }
 check submission_gh auth status
 check test "$HTTPS_PROXY" = http://127.0.0.1:9
 SUBMISSION_GITHUB_ROUTE=proxy; SUBMISSION_DETECTED_PROXY=http://127.0.0.1:12345
-gh() { [[ $HTTPS_PROXY == http://127.0.0.1:12345 && -z $NO_PROXY ]]; }
+gh() { [[ $HTTPS_PROXY == http://127.0.0.1:9 && $NO_PROXY == localhost ]]; }
 check submission_gh auth status
 check test "$HTTPS_PROXY" = http://127.0.0.1:9
 

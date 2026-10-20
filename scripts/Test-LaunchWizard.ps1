@@ -432,10 +432,18 @@ try {
     Assert (Offer-SubmissionUpload -Path $fixtureSubmissionPath -Kind benchmark -ConsentAlreadyGranted) 'Cloudflare-only route failed'
     Assert (-not $script:GitRouteUsed -and $script:CloudflareRouteUsed) 'No-account flow did not go directly to Cloudflare'
     function Get-SubmissionConnectivitySnapshot { return [pscustomobject]@{ Github = 'unreachable'; Cloudflare = 'unreachable'; ProxyConfigured = $true; Proxy = 'unreachable' } }
+    $script:Answers.Enqueue('y'); $script:GitRouteUsed = $false; $script:CloudflareRouteUsed = $false
+    Assert (Offer-SubmissionUpload -Path $fixtureSubmissionPath -Kind benchmark -ConsentAlreadyGranted) 'Failed preflight blocked a successful GitHub submission'
+    Assert ($script:GitRouteUsed -and -not $script:CloudflareRouteUsed) 'Failed preflight bypassed GitHub'
+    function Invoke-GhSubmissionUpload { $script:GitRouteUsed = $true; return $false }
+    $script:Answers.Enqueue('y'); $script:GitRouteUsed = $false; $script:CloudflareRouteUsed = $false
+    Assert (Offer-SubmissionUpload -Path $fixtureSubmissionPath -Kind benchmark -ConsentAlreadyGranted) 'Actual GitHub failure did not fall back to Cloudflare'
+    Assert ($script:GitRouteUsed -and $script:CloudflareRouteUsed) 'Fallback skipped an actual route'
+    function Invoke-WebsiteSubmissionUpload { $script:CloudflareRouteUsed = $true; return $false }
     $script:Answers.Enqueue('n'); $script:GitRouteUsed = $false; $script:CloudflareRouteUsed = $false
     Assert (-not (Offer-SubmissionUpload -Path $fixtureSubmissionPath -Kind benchmark -ConsentAlreadyGranted)) 'Offline submission should be queued rather than reported as sent'
-    Assert ((Test-Path -LiteralPath (Join-Path $pendingSubmissionDir (Split-Path -Leaf $fixtureSubmissionPath))) -and -not $script:GitRouteUsed -and -not $script:CloudflareRouteUsed) 'Offline fallback did not preserve the report without touching either route'
-    function Get-SubmissionConnectivitySnapshot { return [pscustomobject]@{ Github = 'reachable'; Cloudflare = 'reachable'; ProxyConfigured = $false; Proxy = 'not-configured' } }
+    Assert ((Test-Path -LiteralPath (Join-Path $pendingSubmissionDir (Split-Path -Leaf $fixtureSubmissionPath))) -and -not $script:GitRouteUsed -and $script:CloudflareRouteUsed) 'Offline fallback did not attempt Cloudflare and preserve the report'
+    function Invoke-WebsiteSubmissionUpload { $script:CloudflareRouteUsed = $true; return $true }
     function Invoke-GhSubmissionUpload { $script:SubmissionUploadCancelled = $true; return $false }
     $script:CloudflareRouteUsed = $false; $script:Answers.Enqueue('y')
     Assert (-not (Offer-SubmissionUpload -Path $fixtureSubmissionPath -Kind benchmark -ConsentAlreadyGranted)) 'A cancelled GitHub confirmation must keep the pending submission'
@@ -449,9 +457,18 @@ try {
     try {
         [Environment]::SetEnvironmentVariable('HTTPS_PROXY', 'http://127.0.0.1:9', 'Process')
         $script:SubmissionRouteModes = @{ github = 'direct' }
-        $sawDirect = Invoke-WithSubmissionGithubRoute -Action { return ([string]::IsNullOrEmpty($env:HTTPS_PROXY) -and $env:NO_PROXY -eq '*') }
-        Assert $sawDirect 'GitHub did not use the direct route selected by the probe'
+        $originalNoProxy = $env:NO_PROXY
+        $sawDirect = Invoke-WithSubmissionGithubRoute -Action { return ($env:HTTPS_PROXY -eq 'http://127.0.0.1:9' -and $env:NO_PROXY -eq $originalNoProxy) }
+        Assert $sawDirect 'Preflight changed the actual GitHub proxy settings'
         Assert ($env:HTTPS_PROXY -eq 'http://127.0.0.1:9') 'GitHub route selection leaked proxy changes into the parent process'
+        $savedNoProxy = $env:NO_PROXY
+        try {
+            $env:NO_PROXY = '.fixture.invalid:443,localhost'
+            Assert ((Get-SubmissionProxy -ProbeUri ([Uri]'https://api.fixture.invalid')).IsBypassed([Uri]'https://api.fixture.invalid')) 'NO_PROXY domain/port bypass was ignored'
+            Assert (-not (Get-SubmissionProxy -ProbeUri ([Uri]'https://api.fixture.invalid:444')).IsBypassed([Uri]'https://api.fixture.invalid:444')) 'NO_PROXY port bypass matched another port'
+            $env:NO_PROXY = '*'
+            Assert ((Get-SubmissionProxy -ProbeUri ([Uri]'https://api.github.com')).IsBypassed([Uri]'https://api.github.com')) 'NO_PROXY wildcard was ignored'
+        } finally { $env:NO_PROXY = $savedNoProxy }
     } finally {
         [Environment]::SetEnvironmentVariable('HTTPS_PROXY', $savedProxyValue, 'Process')
         $script:SubmissionRouteModes = @{}

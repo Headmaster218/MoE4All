@@ -1428,6 +1428,17 @@ function Get-Moe4AllSubmissionApiConfig {
 function Get-SubmissionProxy {
     param([Parameter(Mandatory = $true)][Uri]$ProbeUri)
 
+    $noProxy = [Environment]::GetEnvironmentVariable('NO_PROXY', 'Process')
+    foreach ($entry in @($noProxy -split ',')) {
+        $entry = $entry.Trim().ToLowerInvariant()
+        if (-not $entry) { continue }
+        $hostPattern = $entry; $port = 0
+        if ($entry -match '^([^:]+):(\d+)$') { $hostPattern = $Matches[1]; $port = [int]$Matches[2] }
+        $hostPattern = $hostPattern.TrimStart('.')
+        if (($port -eq 0 -or $port -eq $ProbeUri.Port) -and ($hostPattern -eq '*' -or $ProbeUri.DnsSafeHost -eq $hostPattern -or $ProbeUri.DnsSafeHost.EndsWith('.' + $hostPattern, [StringComparison]::OrdinalIgnoreCase))) {
+            return [System.Net.WebProxy]::new()
+        }
+    }
     foreach ($name in @('HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy')) {
         $raw = [Environment]::GetEnvironmentVariable($name, 'Process')
         $uri = $null
@@ -1510,13 +1521,16 @@ function Start-SubmissionConnectivityProbe {
         $api = Get-Moe4AllSubmissionApiConfig
         $cloudflareUri = [Uri]::new($api.ApiBase.AbsoluteUri.TrimEnd('/') + '/health')
         $proxy = Get-SubmissionProxy -ProbeUri $githubUri
+        $cloudflareProxy = Get-SubmissionProxy -ProbeUri $cloudflareUri
+        if ($null -ne $proxy -and $proxy.IsBypassed($githubUri)) { $proxy = $null }
+        if ($null -ne $cloudflareProxy -and $cloudflareProxy.IsBypassed($cloudflareUri)) { $cloudflareProxy = $null }
         $tasks = @()
         $tasks += New-SubmissionConnectivityTask -Target github -Uri $githubUri
         $tasks += New-SubmissionConnectivityTask -Target cloudflare -Uri $cloudflareUri
         if ($null -ne $proxy) {
             $tasks += New-SubmissionConnectivityTask -Target github -Uri $githubUri -Proxy $proxy
-            $tasks += New-SubmissionConnectivityTask -Target cloudflare -Uri $cloudflareUri -Proxy $proxy
         }
+        if ($null -ne $cloudflareProxy) { $tasks += New-SubmissionConnectivityTask -Target cloudflare -Uri $cloudflareUri -Proxy $cloudflareProxy }
         [pscustomobject]@{ Tasks = $tasks; Proxy = $proxy }
     }).AddArgument($productVersion)
     $script:SubmissionConnectivityWorker = [pscustomobject]@{ Worker = $worker; Async = $worker.BeginInvoke() }
@@ -1615,19 +1629,15 @@ function Remove-PendingSubmission {
 function Invoke-WithSubmissionGithubRoute {
     param([Parameter(Mandatory = $true)][scriptblock]$Action)
 
-    $mode = if ($null -ne $script:SubmissionRouteModes) { $script:SubmissionRouteModes['github'] } else { '' }
     $names = @('HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'NO_PROXY')
     $saved = @{}
     foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
     try {
-        if ($mode -eq 'direct') {
-            foreach ($name in @('HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY')) { [Environment]::SetEnvironmentVariable($name, $null, 'Process') }
-            [Environment]::SetEnvironmentVariable('NO_PROXY', '*', 'Process')
-        } elseif ($mode -eq 'proxy') {
-            $proxy = $script:SubmissionDetectedProxy
-            if ($null -ne $proxy) {
+        # gh honors environment proxies, but does not discover the Windows system proxy.
+        if (-not ($saved['HTTPS_PROXY'] -or $saved['HTTP_PROXY'] -or $saved['ALL_PROXY'])) {
+            $proxy = Get-SubmissionProxy -ProbeUri ([Uri]'https://api.github.com')
+            if ($null -ne $proxy -and -not $proxy.IsBypassed([Uri]'https://api.github.com')) {
                 [Environment]::SetEnvironmentVariable('HTTPS_PROXY', $proxy.GetProxy([Uri]'https://api.github.com').AbsoluteUri, 'Process')
-                [Environment]::SetEnvironmentVariable('NO_PROXY', '', 'Process')
             }
         }
         & $Action
@@ -1664,9 +1674,8 @@ function Invoke-Moe4AllSubmissionApi {
     for ($attempt = 0; $attempt -le $maximumRetries; $attempt++) {
         $handler = [System.Net.Http.HttpClientHandler]::new()
         $handler.AllowAutoRedirect = $false
-        $route = if ($null -ne $script:SubmissionRouteModes) { $script:SubmissionRouteModes['cloudflare'] } else { '' }
-        if ($route -eq 'direct') { $handler.UseProxy = $false }
-        if ($route -eq 'proxy') { $handler.Proxy = $script:SubmissionDetectedProxy }
+        $proxy = Get-SubmissionProxy -ProbeUri $Uri
+        if ($null -ne $proxy) { $handler.Proxy = $proxy }
         $client = [System.Net.Http.HttpClient]::new($handler)
         $client.Timeout = [TimeSpan]::FromSeconds(30)
         $request = $null
@@ -2047,8 +2056,9 @@ function Offer-SubmissionUpload {
     Save-BenchmarkUploadPreferences
     $connectivity = Get-SubmissionConnectivitySnapshot
     $proxyText = if ($connectivity.ProxyConfigured) { "; proxy=$($connectivity.Proxy)" } else { '' }
-    Write-Host "提交连通性 / Submission connectivity: GitHub=$($connectivity.Github), Cloudflare=$($connectivity.Cloudflare)$proxyText" -ForegroundColor DarkGray
-    if ($hasGithub -and $connectivity.Github -ne 'unreachable') {
+    Write-Host "预检参考 / Preflight only: GitHub=$($connectivity.Github), Cloudflare=$($connectivity.Cloudflare)$proxyText" -ForegroundColor DarkGray
+    Write-Host '预检失败不阻止提交；以实际请求结果为准。A failed preflight does not block submission; the actual request decides.' -ForegroundColor DarkGray
+    if ($hasGithub) {
         try {
             $gitUploaded = Invoke-WithSubmissionGithubRoute -Action {
                 $gh = Get-Command gh -ErrorAction SilentlyContinue
@@ -2075,17 +2085,11 @@ function Offer-SubmissionUpload {
         if ($gitUploaded) { Remove-PendingSubmission -Path $pendingPath; return $true }
         if ($script:SubmissionUploadCancelled) { return $false }
         Write-Host 'GitHub 直传不可用，改用浏览器确认的 Cloudflare 中转。Direct GitHub upload is unavailable; using the browser-confirmed Cloudflare relay.'
-    } elseif ($hasGithub) {
-        Write-Host 'GitHub 当前不可达，改用 Cloudflare 中转。GitHub is currently unreachable; using the Cloudflare relay.' -ForegroundColor Yellow
     }
-    if ($connectivity.Cloudflare -ne 'unreachable') {
-        try {
-            if (Invoke-WebsiteSubmissionUpload -Path $Path -Kind $Kind) { Remove-PendingSubmission -Path $pendingPath; return $true }
-        } catch {
-            Write-Warning "Cloudflare 中转失败：$($_.Exception.Message) / Cloudflare relay failed."
-        }
-    } else {
-        Write-Host 'Cloudflare 当前也不可达。Cloudflare is currently unreachable.' -ForegroundColor Yellow
+    try {
+        if (Invoke-WebsiteSubmissionUpload -Path $Path -Kind $Kind) { Remove-PendingSubmission -Path $pendingPath; return $true }
+    } catch {
+        Write-Warning "Cloudflare 中转失败：$($_.Exception.Message) / Cloudflare relay failed."
     }
     Write-Host "提交暂存，待下次启动重试 / Submission saved for a later retry: $pendingPath" -ForegroundColor Yellow
     return $false
@@ -2114,13 +2118,7 @@ function Offer-PendingSubmissions {
     $pending = @(Get-PendingSubmissions)
     if ($pending.Count -eq 0) { $script:PendingSubmissionPrompted = $true; return }
     $connectivity = Get-SubmissionConnectivitySnapshot
-    if ($connectivity.Github -eq 'unreachable' -and $connectivity.Cloudflare -eq 'unreachable') {
-        Write-Host "发现 $($pending.Count) 份待发报告；当前提交渠道均不可达，将继续保留。" -ForegroundColor DarkGray
-        Write-Host "Found $($pending.Count) pending report(s); submission routes are offline, so they remain queued." -ForegroundColor DarkGray
-        return
-    }
-    if ($connectivity.Github -ne 'reachable' -and $connectivity.Cloudflare -ne 'reachable') { return }
-    if (-not $script:BenchmarkUploadHasGithubDefault -and $connectivity.Cloudflare -ne 'reachable') { return }
+    if ($connectivity.Github -eq 'pending' -and $connectivity.Cloudflare -eq 'pending') { return }
     $script:PendingSubmissionPrompted = $true
     if (-not (Read-YesNo -Label "发现 $($pending.Count) 份待发报告，当前重试？/ Found $($pending.Count) pending report(s). Retry now?" -Default $true)) { return }
     foreach ($item in $pending) {

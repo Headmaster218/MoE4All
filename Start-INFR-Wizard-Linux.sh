@@ -1339,19 +1339,11 @@ submission_connectivity_snapshot() {
 pending_submission_dir() { REPLY="$CONFIG_DIR/private/pending-submissions"; }
 
 submission_gh() (
-    case ${SUBMISSION_GITHUB_ROUTE-default} in
-        direct) unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy; export NO_PROXY='*' no_proxy='*' ;;
-        proxy) export HTTPS_PROXY="$SUBMISSION_DETECTED_PROXY" https_proxy="$SUBMISSION_DETECTED_PROXY" NO_PROXY='' no_proxy='' ;;
-    esac
     gh "$@"
 )
 
 submission_curl() {
-    case ${SUBMISSION_CLOUDFLARE_ROUTE-default} in
-        direct) curl --noproxy '*' "$@" ;;
-        proxy) curl --noproxy '' --proxy "$SUBMISSION_DETECTED_PROXY" "$@" ;;
-        *) curl "$@" ;;
-    esac
+    curl "$@"
 }
 
 queue_pending_submission() {
@@ -1381,12 +1373,7 @@ retry_pending_submissions() {
     while IFS= read -r path; do pending+=("$path"); done < <(find "$directory" -type f \( -name '*.m4b' -o -name '*.m4e' \) -print 2>/dev/null | sort)
     ((${#pending[@]})) || { PENDING_SUBMISSION_PROMPTED=true; return 0; }
     submission_connectivity_snapshot
-    if [[ $SUBMISSION_GITHUB_CONNECTIVITY == false && $SUBMISSION_CLOUDFLARE_CONNECTIVITY == false ]]; then
-        printf '发现 %s 份待发报告；当前提交渠道均不可达，将继续保留。\nFound %s pending report(s); submission routes are offline, so they remain queued.\n' "${#pending[@]}" "${#pending[@]}"
-        return 0
-    fi
-    if [[ $SUBMISSION_GITHUB_CONNECTIVITY != true && $SUBMISSION_CLOUDFLARE_CONNECTIVITY != true ]]; then return 0; fi
-    if [[ ${S[benchmark_upload_has_github]} != true && $SUBMISSION_CLOUDFLARE_CONNECTIVITY != true ]]; then return 0; fi
+    if [[ $SUBMISSION_GITHUB_CONNECTIVITY == pending && $SUBMISSION_CLOUDFLARE_CONNECTIVITY == pending ]]; then return 0; fi
     PENDING_SUBMISSION_PROMPTED=true
     yes "发现 ${#pending[@]} 份待发报告，当前重试？/ Found ${#pending[@]} pending report(s). Retry now?" true
     [[ $REPLY == true ]] || return 0
@@ -1542,8 +1529,9 @@ offer_submission_upload() {
     yes '你有 GitHub 账号吗？/ Do you have a GitHub account?' "${S[benchmark_upload_has_github]}"
     has_github=$REPLY; S[benchmark_upload_has_github]=$has_github; save_state
     submission_connectivity_snapshot
-    printf '提交连通性 / Submission connectivity: GitHub=%s, Cloudflare=%s, proxy=%s\n' "$SUBMISSION_GITHUB_CONNECTIVITY" "$SUBMISSION_CLOUDFLARE_CONNECTIVITY" "$SUBMISSION_PROXY_CONNECTIVITY"
-    if [[ $has_github == true && $SUBMISSION_GITHUB_CONNECTIVITY != false ]] && command -v gh >/dev/null 2>&1; then
+    printf '预检参考 / Preflight only: GitHub=%s, Cloudflare=%s, proxy=%s\n' "$SUBMISSION_GITHUB_CONNECTIVITY" "$SUBMISSION_CLOUDFLARE_CONNECTIVITY" "$SUBMISSION_PROXY_CONNECTIVITY"
+    printf '预检失败不阻止提交；以实际请求结果为准。A failed preflight does not block submission; the actual request decides.\n'
+    if [[ $has_github == true ]] && command -v gh >/dev/null 2>&1; then
         if submission_gh auth status --hostname github.com >/dev/null 2>&1; then
             gh_authenticated=true
         else
@@ -1556,16 +1544,11 @@ offer_submission_upload() {
         if gh_submission_upload "$path" "$kind"; then rm -f -- "$pending_path"; return 0; else upload_status=$?; fi
         [[ $upload_status != 2 ]] || return 1
         printf 'GitHub 直传失败，改用网站中转。/ Direct GitHub upload failed; using the website relay.\n' >&2
-    elif [[ $has_github == true && $SUBMISSION_GITHUB_CONNECTIVITY == false ]]; then
-        printf 'GitHub 当前不可达，改用网站中转。GitHub is currently unreachable; using the website relay.\n' >&2
     elif [[ $has_github == true ]]; then
         printf '没有可用的已登录 gh；不安装额外工具，改用网站中转。\n'
         printf 'No authenticated gh CLI is available; using the website relay without installing another tool.\n'
     fi
-    if [[ $SUBMISSION_CLOUDFLARE_CONNECTIVITY != false ]]; then
-        if website_submission_upload "$path" "$kind"; then rm -f -- "$pending_path"; return 0; fi
-    fi
-    [[ $SUBMISSION_CLOUDFLARE_CONNECTIVITY != false ]] || printf 'Cloudflare 当前不可达。Cloudflare is currently unreachable.\n' >&2
+    if website_submission_upload "$path" "$kind"; then rm -f -- "$pending_path"; return 0; fi
     queue_pending_submission "$path" "$kind" || printf '无法暂存待发报告。Could not save the pending report.\n' >&2
     return 1
 }
