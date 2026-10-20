@@ -1,0 +1,63 @@
+name: Publish compact benchmark index
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'benchmark-database/v1/**'
+      - 'scripts/benchmark_index_sources.py'
+      - 'scripts/build-benchmark-index.mjs'
+      - 'scripts/publish-benchmark-index.mjs'
+      - 'scripts/publish-benchmark-main.mjs'
+      - 'scripts/leaderboard/**'
+      - 'scripts/moe4all_submission.py'
+      - 'scripts/submission_validation.py'
+      - '.github/workflows/benchmark-index.yml'
+      - '.gitattributes'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compact-benchmark-index
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Check generator and publication regressions
+        run: node --test scripts/test-benchmark-index.mjs scripts/test-benchmark-main.mjs
+      - name: Publish only generated index files to protected main
+        env:
+          PYTHONUTF8: '1'
+          PYTHONDONTWRITEBYTECODE: '1'
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            git fetch origin main
+            tree="$RUNNER_TEMP/benchmark-index-$attempt"
+            git worktree add --detach "$tree" origin/main
+            result=0
+            node "$tree/scripts/publish-benchmark-main.mjs" --source "$tree" --repository "$GITHUB_REPOSITORY" --python python3 || result=$?
+            git worktree remove "$tree"
+            if [[ "$result" == 0 ]]; then exit 0; fi
+            if [[ "$result" != 75 ]]; then exit "$result"; fi
+            sleep "$((attempt * 2))"
+          done
+          echo 'Index publication failed; the last published manifest remains available.' >&2
+          exit 1

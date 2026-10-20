@@ -16,3 +16,6 @@ scripts/test_linux_tools.py text eol=lf
 documentation/evidence/campaigns/qwen38/assets/expert-omission-20261011/* text eol=lf
 *.m4b text eol=lf
 *.m4e text eol=lf
+# Compressed index bytes must not be rewritten by checkout/add newline conversion.
+benchmark-database/index/v1/*.bin binary
+benchmark-database/index/v1/manifest.json text eol=lf

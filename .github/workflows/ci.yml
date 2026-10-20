@@ -122,6 +122,11 @@ jobs:
         run: python3 -m unittest discover -s scripts -p 'test_release_ci.py' -v
       - name: Submission protocol and PR classification tests
         run: python3 -m unittest discover -s scripts -p 'test_submission.py' -v
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Compact benchmark index tests
+        run: node --test scripts/test-benchmark-index.mjs scripts/test-benchmark-main.mjs
       - name: Install glslc (shaderc)
         run: sudo apt-get update && sudo apt-get install -y glslc
       - uses: actions-rust-lang/setup-rust-toolchain@v1

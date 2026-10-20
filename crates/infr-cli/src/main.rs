@@ -122,8 +122,12 @@ impl BenchSuite {
         512
     }
 
+    fn required_context_tokens(self) -> usize {
+        self.max_context_tokens() + self.decode_warmup_tokens() + self.decode_tokens() + 256
+    }
+
     fn prefill_warmup_tokens(self) -> usize {
-        self.context_tokens().first().copied().unwrap_or(0)
+        256
     }
 
     fn decode_reps(self) -> usize {
@@ -1362,9 +1366,8 @@ fn cli_flag_layer(cmd: &Cmd) -> anyhow::Result<PartialConfig> {
         }
         Cmd::Bench { device, .. } => {
             device.overrides(&mut layer)?;
-            // Benchmarks decode a FIXED, deterministic token count (llama-bench semantics): greedy
-            // sampling with a fixed seed, and never stop at EOS. The four-prompt Vulkan harness
-            // relies on every A/B process taking the same generated-token path for each prompt.
+            // Fixed-workload suites use reproducible greedy sampling and ignore EOS so a short
+            // answer cannot truncate the measurement.
             layer.sampling.ignore_eos = Some(true);
             layer.sampling.temp = Some(0.0);
             layer.sampling.seed = Some(Some(0x1_6e37));
@@ -3294,6 +3297,10 @@ struct SuiteDecodeRep {
     sections: [SuiteRate; 3],
     overall: SuiteRate,
     lane_tokens_per_second: [Vec<f64>; 3],
+    #[serde(skip)]
+    start_tokens: Vec<usize>,
+    #[serde(skip)]
+    end_tokens: Vec<usize>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -3598,15 +3605,14 @@ fn suite_estimate(
                 .map(|lanes| {
                     let aggregate = one_decode_tps * concurrency_gain(lanes, context_tokens);
                     suite.decode_reps() as f64
-                        * lanes as f64
                         * (suite.decode_warmup_tokens() + suite.decode_tokens()) as f64
+                        * lanes as f64
                         / aggregate
                 })
                 .sum::<f64>();
             (
-                // Every configured slot is populated with a real, independent context. Slot one
-                // supplies the score; it is not an extra Prefill on top of this work.
-                prefill_total + parallel as f64 * context_tokens as f64 / prefill_tps,
+                // One real background per length, then short independent lane questions.
+                prefill_total + (context_tokens + parallel * 256) as f64 / prefill_tps,
                 decode_total + context_decode,
             )
         },
@@ -3678,12 +3684,150 @@ fn make_suite_prompts(
     make_suite_prompts_from_corpus(model, target, lanes, CORPUS, "Benchmark")
 }
 
+fn make_suite_shared_prompts(
+    model: &infr_llama::SeamModel,
+    target: usize,
+    lanes: usize,
+) -> anyhow::Result<(String, Vec<String>, Vec<usize>)> {
+    const QUESTIONS: [&str; 4] = [
+        "Design a crash-safe storage engine with a write-ahead log, concurrent readers, compaction and recovery. Compare alternative designs, explain invariants, give pseudocode, and work through failure cases in detail.",
+        "Review a distributed job scheduler with retries, leases, cancellation and idempotency. Derive a state machine, identify race conditions, propose tests, and explain a robust implementation in detail.",
+        "Design an incremental parser and dependency graph for a large codebase. Discuss invalidation, parallel updates, memory ownership and cyclic dependencies, with algorithms and worked examples.",
+        "Analyze a bounded GPU memory allocator serving concurrent inference requests. Explain fragmentation, resource lifetimes, admission control, fairness and failure recovery, with detailed algorithms and tests.",
+    ];
+    anyhow::ensure!(
+        (1..=QUESTIONS.len()).contains(&lanes),
+        "invalid benchmark lane count"
+    );
+    let (mut backgrounds, _) = make_suite_prompts(model, target, 1)?;
+    let background = backgrounds.remove(0);
+    let prompts = QUESTIONS[..lanes]
+        .iter()
+        .map(|question| format!("{background}\n\nQuestion: {question}\nAnswer:"))
+        .collect::<Vec<_>>();
+    let lengths = prompts
+        .iter()
+        .map(|prompt| model.encode(prompt).map(|ids| ids.len()))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok((background, prompts, lengths))
+}
+
 fn make_suite_warmup_prompt(
     model: &infr_llama::SeamModel,
     target: usize,
 ) -> anyhow::Result<(Vec<String>, Vec<usize>)> {
     const WARMUP_CORPUS: &str = "A separate warmup workload surveys storage engines, network protocols, parser invariants, transactional recovery, and numerical algorithms. It intentionally differs from the scored benchmark while exercising the same runtime shape and memory paths. ";
     make_suite_prompts_from_corpus(model, target, 1, WARMUP_CORPUS, "Warmup")
+}
+
+/// Fixed token work, observed without stopping or restarting generation at section boundaries.
+struct TokenDecodeSampler {
+    warmup_tokens: usize,
+    section_tokens: [usize; 3],
+    last_tokens: Vec<usize>,
+    boundaries: Vec<[Option<std::time::Duration>; 4]>,
+}
+
+impl TokenDecodeSampler {
+    fn new(lanes: usize, warmup_tokens: usize, tokens: usize) -> Self {
+        let first = tokens / 3;
+        Self {
+            warmup_tokens,
+            section_tokens: [first, first, tokens - 2 * first],
+            last_tokens: vec![0; lanes],
+            boundaries: vec![[None; 4]; lanes],
+        }
+    }
+
+    fn target(&self) -> usize {
+        self.warmup_tokens + self.section_tokens.iter().sum::<usize>()
+    }
+
+    fn observe(&mut self, lane: usize, tokens: u64, elapsed: std::time::Duration) {
+        let tokens = usize::try_from(tokens).unwrap_or(usize::MAX);
+        let previous = self.last_tokens[lane];
+        if tokens <= previous {
+            return;
+        }
+        self.last_tokens[lane] = tokens;
+        let mut threshold = self.warmup_tokens;
+        for boundary in 0..4 {
+            if boundary > 0 {
+                threshold += self.section_tokens[boundary - 1];
+            }
+            if self.boundaries[lane][boundary].is_none() && tokens >= threshold {
+                self.boundaries[lane][boundary] = Some(if threshold == 0 {
+                    std::time::Duration::ZERO
+                } else {
+                    elapsed
+                });
+            }
+        }
+    }
+
+    fn lane_finished(&self, lane: usize) -> bool {
+        self.last_tokens[lane] >= self.target()
+    }
+
+    fn summarize(&self) -> anyhow::Result<SuiteDecodeRep> {
+        anyhow::ensure!(!self.boundaries.is_empty(), "Decode benchmark has no lanes");
+        let mut starts = Vec::with_capacity(self.boundaries.len());
+        let mut ends = [0.0f64; 3];
+        let mut lane_rates: [Vec<f64>; 3] = std::array::from_fn(|_| Vec::new());
+        for (lane, boundaries) in self.boundaries.iter().enumerate() {
+            anyhow::ensure!(
+                self.lane_finished(lane),
+                "Decode lane {} generated fewer than {} tokens",
+                lane + 1,
+                self.target()
+            );
+            let start = boundaries[0]
+                .context("Decode warmup boundary missing")?
+                .as_secs_f64();
+            starts.push(start);
+            let mut previous = start;
+            for section in 0..3 {
+                let end = boundaries[section + 1]
+                    .context("Decode section boundary missing")?
+                    .as_secs_f64();
+                anyhow::ensure!(
+                    end > previous,
+                    "Decode lane {} section boundaries are not strictly increasing",
+                    lane + 1
+                );
+                lane_rates[section].push(self.section_tokens[section] as f64 / (end - previous));
+                ends[section] = ends[section].max(end);
+                previous = end;
+            }
+        }
+        // Start at the EARLIEST measured lane, not the last warmup completion: otherwise
+        // tokens already generated by a faster lane are counted without their elapsed time.
+        let start = starts.into_iter().fold(f64::INFINITY, f64::min);
+        let mut previous = start;
+        let sections = std::array::from_fn(|section| {
+            let seconds = ends[section] - previous;
+            previous = ends[section];
+            let tokens = self.section_tokens[section] * self.boundaries.len();
+            SuiteRate {
+                tokens,
+                seconds,
+                tokens_per_second: tokens as f64 / seconds,
+            }
+        });
+        let overall_tokens = self.section_tokens.iter().sum::<usize>() * self.boundaries.len();
+        let overall_seconds = ends[2] - start;
+        Ok(SuiteDecodeRep {
+            sections,
+            overall: SuiteRate {
+                tokens: overall_tokens,
+                seconds: overall_seconds,
+                tokens_per_second: overall_tokens as f64 / overall_seconds,
+            },
+            lane_tokens_per_second: lane_rates,
+            start_tokens: vec![self.warmup_tokens; self.boundaries.len()],
+            end_tokens: vec![self.target(); self.boundaries.len()],
+        })
+    }
 }
 
 fn run_suite_decode_rep(
@@ -3693,76 +3837,94 @@ fn run_suite_decode_rep(
     tokens: usize,
     case_parallel: usize,
 ) -> anyhow::Result<SuiteDecodeRep> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{mpsc, Barrier, OnceLock};
+    anyhow::ensure!(
+        prompts.len() == case_parallel,
+        "Decode prompt count does not match lanes"
+    );
+    let target = warmup_tokens
+        .checked_add(tokens)
+        .context("Decode token count overflow")?;
+    for prompt in prompts {
+        let length = engine.model().encode(prompt)?.len();
+        anyhow::ensure!(
+            engine.max_ctx().saturating_sub(length) >= target,
+            "no Decode headroom after the prompt"
+        );
+    }
+    run_token_decode_rep(
+        warmup_tokens,
+        tokens,
+        case_parallel,
+        |lane, stop, callback| {
+            let req = engine
+                .request_ctx(infr_llama::sampling::RequestSampling::default())
+                .with_external_abort(stop)
+                .with_progress(Some(callback));
+            let stats = engine.generate_benchmark_turn(&prompts[lane], target, &req)?;
+            anyhow::ensure!(
+                stats.n_gen == target,
+                "Decode generated {} of {target} requested tokens",
+                stats.n_gen
+            );
+            Ok(())
+        },
+    )
+}
+
+fn run_token_decode_rep(
+    warmup_tokens: usize,
+    tokens: usize,
+    case_parallel: usize,
+    run: impl Fn(
+            usize,
+            Arc<std::sync::atomic::AtomicBool>,
+            infr_core::GenerationProgressCallback,
+        ) -> anyhow::Result<()>
+        + Sync,
+) -> anyhow::Result<SuiteDecodeRep> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Barrier, Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
-    let section_tokens = {
-        let first = tokens / 3;
-        let middle = tokens / 3;
-        [first, middle, tokens - first - middle]
-    };
-    let measured_start = warmup_tokens as u64;
-    let boundaries_at = [
-        measured_start,
-        measured_start + section_tokens[0] as u64,
-        measured_start + (section_tokens[0] + section_tokens[1]) as u64,
-        measured_start + tokens as u64,
-    ];
-    let progress = Arc::new(
-        (0..case_parallel)
-            .map(|_| AtomicU64::new(0))
-            .collect::<Vec<_>>(),
+    anyhow::ensure!(
+        case_parallel > 0 && tokens >= 3 && warmup_tokens.checked_add(tokens).is_some(),
+        "invalid fixed-token Decode shape"
     );
-    let boundaries = Arc::new(
-        (0..case_parallel)
-            .map(|_| std::array::from_fn::<_, 4, _>(|_| AtomicU64::new(0)))
-            .collect::<Vec<_>>(),
-    );
+    let sampler = Arc::new(Mutex::new(TokenDecodeSampler::new(
+        case_parallel,
+        warmup_tokens,
+        tokens,
+    )));
+    let stop = Arc::new(AtomicBool::new(false));
     let started = Arc::new(OnceLock::<Instant>::new());
     let ready = Arc::new(Barrier::new(case_parallel + 1));
     let go = Arc::new(Barrier::new(case_parallel + 1));
     let (tx, rx) = mpsc::channel();
-    let mut received = Vec::with_capacity(case_parallel);
-    let wall_start = std::thread::scope(|scope| -> anyhow::Result<Instant> {
+
+    let outcome = std::thread::scope(|scope| -> anyhow::Result<()> {
         for lane in 0..case_parallel {
             let tx = tx.clone();
             let ready = Arc::clone(&ready);
             let go = Arc::clone(&go);
-            let progress = Arc::clone(&progress);
-            let boundaries = Arc::clone(&boundaries);
+            let sampler = Arc::clone(&sampler);
             let started = Arc::clone(&started);
-            let prompt = prompts[lane].clone();
+            let stop = Arc::clone(&stop);
+            let run = &run;
             scope.spawn(move || {
                 let callback: infr_core::GenerationProgressCallback = Arc::new(move |snapshot| {
                     if snapshot.phase == infr_core::GenerationPhase::Decode {
-                        progress[lane].store(snapshot.completion_tokens, Ordering::Relaxed);
-                        if let (Some(started), Some(boundary)) = (
-                            started.get(),
-                            boundaries_at
-                                .iter()
-                                .position(|&tokens| tokens == snapshot.completion_tokens),
-                        ) {
-                            let elapsed = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-                            boundaries[lane][boundary].store(elapsed.max(1), Ordering::Relaxed);
+                        if let Some(clock) = started.get() {
+                            sampler.lock().expect("benchmark sampler poisoned").observe(
+                                lane,
+                                snapshot.completion_tokens,
+                                clock.elapsed(),
+                            );
                         }
                     }
                 });
-                let req = engine
-                    .request_ctx(infr_llama::sampling::RequestSampling::default())
-                    .with_progress(Some(callback));
                 ready.wait();
                 go.wait();
-                let result = engine
-                    .generate_turn_with_checkpoints(
-                        &prompt,
-                        infr_llama::seam::TurnCheckpointPrefixes::benchmark_frontier(),
-                        warmup_tokens + tokens,
-                        None,
-                        &req,
-                        |_| {},
-                    )
-                    .map_err(|error| error.to_string());
+                let result = run(lane, stop, callback).map_err(|error| error.to_string());
                 let _ = tx.send((lane, result));
             });
         }
@@ -3770,159 +3932,98 @@ fn run_suite_decode_rep(
         ready.wait();
         started
             .set(Instant::now())
-            .map_err(|_| anyhow::anyhow!("Decode benchmark start clock was already initialized"))?;
+            .map_err(|_| anyhow::anyhow!("Decode clock already initialized"))?;
         go.wait();
-        let start = started
-            .get()
-            .copied()
-            .context("Decode benchmark start clock was not initialized")?;
-        while received.len() < case_parallel {
-            match rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(result) => received.push(result),
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    let total_done = progress
+        let clock = *started.get().context("Decode clock not initialized")?;
+        let mut received = 0;
+        let mut failure = None;
+        let mut last_print = Instant::now();
+        while received < case_parallel {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok((lane, result)) => {
+                    received += 1;
+                    if let Err(error) = result {
+                        failure.get_or_insert(error);
+                        stop.store(true, Ordering::Relaxed);
+                    } else if !sampler
+                        .lock()
+                        .expect("benchmark sampler poisoned")
+                        .lane_finished(lane)
+                    {
+                        failure.get_or_insert_with(|| {
+                            format!(
+                                "Decode lane {} ended before the requested token count",
+                                lane + 1
+                            )
+                        });
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    failure.get_or_insert_with(|| "Decode workers disconnected".to_string());
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+            if last_print.elapsed() >= Duration::from_secs(1) {
+                let (warmup_done, measured, first_start) = {
+                    let state = sampler.lock().expect("benchmark sampler poisoned");
+                    let warmup_done = state
+                        .last_tokens
                         .iter()
-                        .map(|tokens| tokens.load(Ordering::Relaxed))
-                        .sum::<u64>();
-                    let warmup_target = warmup_tokens.saturating_mul(case_parallel) as u64;
-                    let warmup_complete = boundaries
+                        .map(|&n| n.min(warmup_tokens))
+                        .sum::<usize>();
+                    let measured = state
+                        .last_tokens
                         .iter()
-                        .all(|lane| lane[0].load(Ordering::Relaxed) > 0);
-                    if !warmup_complete {
-                        // print-ok: interactive benchmark warmup progress, throttled to once per second.
+                        .map(|&n| n.saturating_sub(warmup_tokens).min(tokens))
+                        .sum::<usize>();
+                    let first_start = state.boundaries.iter().filter_map(|row| row[0]).min();
+                    (warmup_done, measured, first_start)
+                };
+                if warmup_done < warmup_tokens * case_parallel {
+                    // print-ok: user-requested benchmark warmup progress, outside the sampler lock.
+                    eprint!(
+                        "\rDecode x{case_parallel} warmup: {warmup_done}/{} tokens",
+                        warmup_tokens * case_parallel
+                    );
+                } else {
+                    let seconds = first_start
+                        .map(|start| clock.elapsed().saturating_sub(start).as_secs_f64())
+                        .unwrap_or(0.0);
+                    if seconds < 0.5 || measured < 64 * case_parallel {
+                        // print-ok: user-requested benchmark progress before a stable speed is available.
                         eprint!(
-                            "\rDecode x{case_parallel} warmup: {}/{warmup_target} tokens",
-                            total_done.min(warmup_target)
+                            "\rDecode x{case_parallel}: {measured}/{} tokens, measuring...",
+                            tokens * case_parallel
                         );
                     } else {
-                        let done = progress
-                            .iter()
-                            .map(|counter| {
-                                counter
-                                    .load(Ordering::Relaxed)
-                                    .saturating_sub(warmup_tokens as u64)
-                                    .min(tokens as u64)
-                            })
-                            .sum::<u64>();
-                        let target = tokens.saturating_mul(case_parallel);
-                        let measured_elapsed = boundaries
-                            .iter()
-                            .map(|lane| lane[0].load(Ordering::Relaxed))
-                            .filter(|&nanos| nanos > 0)
-                            .max()
-                            .map(|nanos| {
-                                start.elapsed().as_secs_f64() - nanos as f64 / 1_000_000_000.0
-                            })
-                            .unwrap_or_default()
-                            .max(1e-9);
-                        let minimum_live_tokens = case_parallel.saturating_mul(64) as u64;
-                        if done < minimum_live_tokens || measured_elapsed < 0.5 {
-                            // print-ok: avoid a meaningless startup spike while lanes cross the
-                            // warmup boundary a few milliseconds apart.
-                            eprint!(
-                                "\rDecode x{case_parallel}: {done}/{target} measured tokens, measuring..."
-                            );
-                        } else {
-                            let live = done as f64 / measured_elapsed;
-                            // print-ok: interactive measured Decode progress, throttled to once per second.
-                            eprint!(
-                                "\rDecode x{case_parallel}: {done}/{target} measured tokens, {live:.1} tok/s"
-                            );
-                        }
+                        // print-ok: user-requested benchmark speed, outside the sampler lock, once per second.
+                        eprint!(
+                            "\rDecode x{case_parallel}: {measured}/{} tokens, {:.1} tok/s",
+                            tokens * case_parallel,
+                            measured as f64 / seconds
+                        );
                     }
-                    let _ = std::io::stderr().flush();
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                let _ = std::io::stderr().flush();
+                last_print = Instant::now();
             }
         }
-        Ok(start)
-    })?;
-    let _wall_elapsed = wall_start.elapsed().as_secs_f64();
-    // print-ok: terminate the live progress line before printing the stable result.
-    eprintln!();
-    received.sort_by_key(|(lane, _)| *lane);
-    anyhow::ensure!(
-        received.len() == case_parallel,
-        "Decode x{case_parallel} ended before every lane returned"
-    );
-    for (_, result) in received {
-        let stats = result.map_err(anyhow::Error::msg)?;
-        let expected = warmup_tokens + tokens;
-        anyhow::ensure!(
-            stats.n_gen == expected,
-            "Decode benchmark generated {} of {expected} requested warmup + measured tokens",
-            stats.n_gen
-        );
-    }
-
-    let recorded_boundaries = (0..case_parallel)
-        .map(|lane| {
-            std::array::from_fn(|section| boundaries[lane][section].load(Ordering::Relaxed))
-        })
-        .collect::<Vec<_>>();
-    summarize_suite_decode(section_tokens, &recorded_boundaries)
-}
-
-fn summarize_suite_decode(
-    section_tokens: [usize; 3],
-    boundary_nanos: &[[u64; 4]],
-) -> anyhow::Result<SuiteDecodeRep> {
-    anyhow::ensure!(!boundary_nanos.is_empty(), "Decode benchmark has no lanes");
-    let mut lane_tokens_per_second: [Vec<f64>; 3] =
-        std::array::from_fn(|_| Vec::with_capacity(boundary_nanos.len()));
-    let mut global_start = 0.0f64;
-    let mut global_ends = [0.0f64; 3];
-    for (lane, boundaries) in boundary_nanos.iter().enumerate() {
-        anyhow::ensure!(
-            boundaries[0] > 0,
-            "Decode x{} did not record the warmup boundary for lane {}",
-            boundary_nanos.len(),
-            lane + 1
-        );
-        let mut previous = boundaries[0] as f64 / 1_000_000_000.0;
-        global_start = global_start.max(previous);
-        for (section, &nanos) in boundaries[1..].iter().enumerate() {
-            anyhow::ensure!(
-                nanos > 0,
-                "Decode x{} did not record section {} for lane {}",
-                boundary_nanos.len(),
-                section + 1,
-                lane + 1
-            );
-            let end = nanos as f64 / 1_000_000_000.0;
-            anyhow::ensure!(
-                end > previous,
-                "Decode lane {} section boundaries are not strictly increasing",
-                lane + 1
-            );
-            let seconds = end - previous;
-            lane_tokens_per_second[section].push(section_tokens[section] as f64 / seconds);
-            global_ends[section] = global_ends[section].max(end);
-            previous = end;
+        if let Some(error) = failure {
+            anyhow::bail!("{error}");
         }
-    }
-    let mut previous = global_start;
-    let sections = std::array::from_fn(|section| {
-        let seconds = (global_ends[section] - previous).max(1e-9);
-        previous = global_ends[section];
-        let total_tokens = section_tokens[section] * boundary_nanos.len();
-        SuiteRate {
-            tokens: total_tokens,
-            seconds,
-            tokens_per_second: total_tokens as f64 / seconds,
-        }
+        Ok(())
     });
-    let overall_tokens = section_tokens.iter().sum::<usize>() * boundary_nanos.len();
-    let overall_seconds = (global_ends[2] - global_start).max(1e-9);
-    Ok(SuiteDecodeRep {
-        sections,
-        overall: SuiteRate {
-            tokens: overall_tokens,
-            seconds: overall_seconds,
-            tokens_per_second: overall_tokens as f64 / overall_seconds,
-        },
-        lane_tokens_per_second,
-    })
+    // print-ok: terminate the progress line before the stable result.
+    eprintln!();
+    outcome?;
+    let result = sampler
+        .lock()
+        .expect("benchmark sampler poisoned")
+        .summarize();
+    result
 }
 
 fn run_suite_context(
@@ -3949,8 +4050,8 @@ fn run_suite_context(
         });
         return result;
     }
-    let (base_prompts, prompt_lengths) =
-        match make_suite_prompts(engine.model(), context_tokens, parallel) {
+    let (background, base_prompts, prompt_lengths) =
+        match make_suite_shared_prompts(engine.model(), context_tokens, parallel) {
             Ok(prompts) => prompts,
             Err(error) => {
                 result.failures.push(SuiteFailure {
@@ -3963,24 +4064,11 @@ fn run_suite_context(
             }
         };
     result.actual_prompt_tokens = prompt_lengths.clone();
-    result.decode_measurement_start_tokens = prompt_lengths
-        .iter()
-        .map(|&tokens| tokens.saturating_add(suite.decode_warmup_tokens()))
-        .collect();
-    result.decode_measurement_end_tokens = prompt_lengths
-        .iter()
-        .map(|&tokens| {
-            tokens
-                .saturating_add(suite.decode_warmup_tokens())
-                .saturating_add(suite.decode_tokens())
-        })
-        .collect();
-
-    // Extra slots are required for real concurrent Decode but are not reported as additional
-    // Prefill benchmark samples.
+    result.decode_measurement_start_tokens = vec![0; parallel];
+    result.decode_measurement_end_tokens = vec![0; parallel];
     // print-ok: benchmark preparation progress requested by the user.
     println!(
-        "Preparing {parallel} real context slot(s) at {context_tokens} tokens; only slot 1 is the Prefill score..."
+        "Prefill {context_tokens} once, copy the shared KV to {parallel} slot(s), then prepare independent questions..."
     );
     let setup_started = std::time::Instant::now();
     let prefill_counts = Arc::new(
@@ -3989,7 +4077,11 @@ fn run_suite_context(
             .collect::<Vec<_>>(),
     );
     let prefill_last_print = Arc::new(std::sync::Mutex::new(setup_started));
-    let prefill_target = prompt_lengths.iter().sum::<usize>();
+    let prefill_target = engine
+        .model()
+        .encode(&background)
+        .map(|ids| ids.len())
+        .unwrap_or(context_tokens);
     let prefill_progress = (0..parallel)
         .map(|lane| {
             let counts = Arc::clone(&prefill_counts);
@@ -4017,8 +4109,11 @@ fn run_suite_context(
             }) as infr_core::GenerationProgressCallback
         })
         .collect::<Vec<_>>();
-    let prefill_stats = match engine.prepare_benchmark_slots(&base_prompts, Some(&prefill_progress))
-    {
+    let prefill_stats = match engine.prepare_benchmark_shared_slots(
+        &background,
+        &base_prompts,
+        Some(&prefill_progress),
+    ) {
         Ok(stats) => stats,
         Err(error) => {
             // print-ok: end the CLI progress line before reporting the case failure.
@@ -4038,7 +4133,7 @@ fn run_suite_context(
     // print-ok: terminate the CLI Prefill progress line.
     eprintln!();
     let setup_seconds = setup_started.elapsed().as_secs_f64();
-    let Some(scored) = prefill_stats.first().copied() else {
+    let Some(mut scored) = prefill_stats.first().copied() else {
         result.failures.push(SuiteFailure {
             stage: "prefill",
             parallel: None,
@@ -4047,6 +4142,8 @@ fn run_suite_context(
         });
         return result;
     };
+    // max_new=0 leaves the final prompt token unfed; don't count it as timed Prefill work.
+    scored.n_prompt = scored.n_prompt.saturating_sub(1);
     let prefill_tps = scored.n_prompt as f64 / scored.prompt_secs.max(1e-9);
     // print-ok: completed Prefill benchmark score.
     println!(
@@ -4055,7 +4152,7 @@ fn run_suite_context(
     );
     result.prefill = Some(SuitePrefill {
         requested_context_tokens: context_tokens,
-        actual_prompt_tokens: prompt_lengths[0],
+        actual_prompt_tokens: prefill_target,
         evaluated_tokens: scored.n_prompt,
         seconds: scored.prompt_secs,
         tokens_per_second: prefill_tps,
@@ -4080,6 +4177,18 @@ fn run_suite_context(
                 active,
             ) {
                 Ok(measurement) => {
+                    for (lane, &prompt_length) in prompt_lengths.iter().enumerate().take(active) {
+                        let start = prompt_length + measurement.start_tokens[lane];
+                        let end = prompt_length + measurement.end_tokens[lane];
+                        if result.decode_measurement_start_tokens[lane] == 0 {
+                            result.decode_measurement_start_tokens[lane] = start;
+                        } else {
+                            result.decode_measurement_start_tokens[lane] =
+                                result.decode_measurement_start_tokens[lane].min(start);
+                        }
+                        result.decode_measurement_end_tokens[lane] =
+                            result.decode_measurement_end_tokens[lane].max(end);
+                    }
                     // print-ok: completed Decode benchmark repetition score.
                     println!(
                         "Decode {context_tokens} x{active} rep {}/{}: first {:.1}, middle {:.1}, last {:.1}, overall {:.1} tok/s",
@@ -4243,7 +4352,7 @@ fn cmd_bench_suite(
         .join(", ");
     // print-ok: user-facing automatic benchmark plan.
     println!(
-        "Automatic {} benchmark: untimed {}-token Prefill warmup, then real Prefill + {}-token measured Decode after a {}-token Decode warmup at context [{}], {} rep(s) each, x1..x{}.",
+        "Automatic {} benchmark: untimed {}-token Prefill warmup, then one real Prefill per length and {} measured Decode tokens per lane after a {}-token Decode warmup at context [{}], {} rep(s) each, x1..x{}. Shared KV, independent questions.",
         suite.as_str(),
         suite.prefill_warmup_tokens(),
         suite.decode_tokens(),
@@ -4261,11 +4370,7 @@ fn cmd_bench_suite(
         .unwrap_or("unknown")
         .to_string();
     let footprint = infr_llama::weight_footprint(loaded.gguf());
-    let required_ctx = suite
-        .max_context_tokens()
-        .saturating_add(suite.decode_warmup_tokens())
-        .saturating_add(suite.decode_tokens())
-        .saturating_add(256);
+    let required_ctx = suite.required_context_tokens();
     let want_ctx = cfg
         .device
         .ctx
@@ -4295,10 +4400,11 @@ fn cmd_bench_suite(
             |(prompts, _)| {
                 let wall_started = std::time::Instant::now();
                 let stats = engine.prepare_benchmark_slots(&prompts, None)?;
-                let scored = stats
+                let mut scored = stats
                     .first()
                     .copied()
                     .context("Prefill warmup produced no result")?;
+                scored.n_prompt = scored.n_prompt.saturating_sub(1);
                 Ok((scored, wall_started.elapsed().as_secs_f64()))
             },
         ) {
@@ -4362,6 +4468,10 @@ fn cmd_bench_suite(
     let ram_available_after = infr_core::hostmem::available_bytes();
     // print-ok: final table remains visible after the process exits.
     println!("\n结果 / Results");
+    // print-ok: define token sections without changing the existing result table layout.
+    println!(
+        "Decode: First 341 | Middle 341 | Last 342 tokens/lane; 512 warmup tokens/lane excluded."
+    );
     // print-ok: benchmark result table border.
     println!("+----------+------------+----------+----------+----------+----------+");
     // print-ok: benchmark result table heading.
@@ -4469,14 +4579,12 @@ fn cmd_bench_suite(
             "per_slot_context_limit": engine.max_ctx(),
             "requested_context_tokens": suite.context_tokens(),
             "prefill_warmup_tokens": suite.prefill_warmup_tokens(),
+            "decode_measurement": "tokens",
             "decode_tokens_per_rep": suite.decode_tokens(),
             "decode_warmup_tokens_per_rep": suite.decode_warmup_tokens(),
             "decode_repetitions": suite.decode_reps(),
-            "decode_sections": [
-                suite.decode_tokens() / 3,
-                suite.decode_tokens() / 3,
-                suite.decode_tokens() - 2 * (suite.decode_tokens() / 3),
-            ],
+            "decode_section_tokens": [341, 341, 342],
+            "shared_prefill": true,
             "real_context": true,
             "synthetic_depth": false,
             "kv_type_k": format!("{:?}", cfg.kv.type_k),
@@ -7386,6 +7494,219 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires MOE4ALL_BENCH_TEST_MODEL and an idle default Vulkan GPU"]
+    fn benchmark_prefill_warmup_comparison_probe() {
+        use std::time::Instant;
+
+        let path = PathBuf::from(std::env::var("MOE4ALL_BENCH_TEST_MODEL").unwrap());
+        let output = PathBuf::from(std::env::var("MOE4ALL_BENCH_RESEARCH_OUTPUT").unwrap());
+        let root = PathBuf::from(std::env::var("MOE4ALL_WORK_ROOT").unwrap());
+        assert!(output.is_absolute() && output.starts_with(root.join("results")));
+        let warmup_tokens: usize = std::env::var("MOE4ALL_BENCH_PREFILL_WARMUP")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!([256, 6144].contains(&warmup_tokens));
+        let settings = [
+            "device.auto_profile=aggressive",
+            "kv.type_k=q8_0",
+            "kv.type_v=q8_0",
+            "kernels.vulkan.cpu_miss_threads=0",
+            "spec.mtp=false",
+        ];
+        let mut cfg = resolve_cfg(&[], cli_flag_layer(&bench_cmd()).unwrap(), &settings);
+        infr_core::hostmem::freeze_automatic_ram_budget(&mut cfg);
+        publish_thread_count(&cfg);
+        let resolved_ram_budget = format!("{:?}", cfg.device.ram_budget);
+        let device = selected_benchmark_device(&cfg).unwrap();
+        assert!(
+            device.name.contains("7900 XTX"),
+            "unexpected GPU: {}",
+            device.name
+        );
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("info")
+            .with_writer(std::io::stderr)
+            .try_init();
+        let load_started = Instant::now();
+        let model = infr_llama::SeamModel::load_with(&path, None, Arc::new(cfg)).unwrap();
+        let engine = infr_llama::parallel::ParallelSeam::new(
+            model,
+            1,
+            Some(infr_core::SizeSpec::Bytes(40960)),
+        )
+        .unwrap();
+        let startup_seconds = load_started.elapsed().as_secs_f64();
+        let (warmup, _) = make_suite_warmup_prompt(engine.model(), warmup_tokens).unwrap();
+        let warmup_started = Instant::now();
+        let warmup_stats = engine.prepare_benchmark_slots(&warmup, None).unwrap();
+        let warmup_wall_seconds = warmup_started.elapsed().as_secs_f64();
+        engine.clear_benchmark_slots().unwrap();
+        let (background, prompts, _) = make_suite_shared_prompts(engine.model(), 6144, 1).unwrap();
+        let prefill_started = Instant::now();
+        let measured = engine
+            .prepare_benchmark_shared_slots(&background, &prompts, None)
+            .unwrap();
+        let setup_seconds = prefill_started.elapsed().as_secs_f64();
+        let evaluated = measured[0].n_prompt.saturating_sub(1);
+        let report = serde_json::json!({
+            "research_only":true,"model":path,"gpu":device.name,"settings":settings,
+            "resolved_ram_budget":resolved_ram_budget,"resident_slots":1,"max_ctx":engine.max_ctx(),
+            "startup_seconds":startup_seconds,"warmup_requested_tokens":warmup_tokens,
+            "warmup_evaluated_tokens":warmup_stats[0].n_prompt.saturating_sub(1),
+            "warmup_seconds":warmup_stats[0].prompt_secs,"warmup_wall_seconds":warmup_wall_seconds,
+            "scored_requested_tokens":6144,"scored_evaluated_tokens":evaluated,
+            "scored_seconds":measured[0].prompt_secs,
+            "scored_tokens_per_second":evaluated as f64 / measured[0].prompt_secs.max(1e-9),
+            "scored_setup_seconds":setup_seconds,
+            "gpu_memory":format!("{:?}",engine.vram_info()),
+        });
+        std::fs::write(&output, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        eprintln!("PREFILL_WARMUP_COMPARISON={report}");
+    }
+
+    #[test]
+    #[ignore = "requires MOE4ALL_BENCH_TEST_MODEL and an idle default Vulkan GPU"]
+    fn benchmark_reset_reclaims_dynamic_kv_and_can_reprefill() {
+        use infr_vulkan::unified::UnifiedVramClass;
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("info")
+            .with_writer(std::io::stderr)
+            .try_init();
+        let path = PathBuf::from(std::env::var("MOE4ALL_BENCH_TEST_MODEL").unwrap());
+        let mut cfg = resolve_cfg(
+            &[],
+            cli_flag_layer(&bench_cmd()).unwrap(),
+            &[
+                "device.auto_profile=aggressive",
+                "kv.type_k=q8_0",
+                "kv.type_v=q8_0",
+                "kernels.vulkan.cpu_miss_threads=0",
+                "spec.mtp=false",
+            ],
+        );
+        infr_core::hostmem::freeze_automatic_ram_budget(&mut cfg);
+        publish_thread_count(&cfg);
+        assert!(selected_benchmark_device(&cfg)
+            .unwrap()
+            .name
+            .contains("7900 XTX"));
+        let model = infr_llama::SeamModel::load_with(&path, None, Arc::new(cfg)).unwrap();
+        let engine = infr_llama::parallel::ParallelSeam::new(
+            model,
+            3,
+            Some(infr_core::SizeSpec::Bytes(40960)),
+        )
+        .unwrap();
+        eprintln!("KV_RESET_STAGE=initial_base");
+        let (base, base_prompts, _) = make_suite_shared_prompts(engine.model(), 6144, 3).unwrap();
+        engine
+            .prepare_benchmark_shared_slots(&base, &base_prompts, None)
+            .unwrap();
+        engine.clear_benchmark_slots().unwrap();
+        let empty = engine.unified_vram_stats().unwrap();
+        let mut observations = Vec::new();
+        for tokens in [32769, 6144] {
+            eprintln!("KV_RESET_STAGE=prefill tokens={tokens}");
+            let (background, prompts, _) =
+                make_suite_shared_prompts(engine.model(), tokens, 3).unwrap();
+            engine
+                .prepare_benchmark_shared_slots(&background, &prompts, None)
+                .unwrap();
+            let populated = engine.unified_vram_stats().unwrap();
+            assert!(
+                populated.class_bytes(UnifiedVramClass::KvCache)
+                    >= empty.class_bytes(UnifiedVramClass::KvCache)
+            );
+            if tokens > 32768 {
+                assert!(
+                    populated.class_bytes(UnifiedVramClass::KvCache)
+                        > empty.class_bytes(UnifiedVramClass::KvCache)
+                );
+            }
+            for active in 1..=3 {
+                eprintln!("KV_RESET_STAGE=decode tokens={tokens} active={active}");
+                run_suite_decode_rep(&engine, &prompts[..active], 8, 16, active).unwrap();
+            }
+            engine.clear_benchmark_slots().unwrap();
+            eprintln!("KV_RESET_STAGE=cleared tokens={tokens}");
+            let released = engine.unified_vram_stats().unwrap();
+            assert_eq!(released.capacity_bytes, empty.capacity_bytes);
+            assert_eq!(
+                released.class_bytes(UnifiedVramClass::KvCache),
+                empty.class_bytes(UnifiedVramClass::KvCache)
+            );
+            observations.push(serde_json::json!({
+                "context_tokens":tokens,"kv_before":populated.class_bytes(UnifiedVramClass::KvCache),
+                "kv_after_reset":released.class_bytes(UnifiedVramClass::KvCache),
+            }));
+        }
+        let output = PathBuf::from(std::env::var("MOE4ALL_BENCH_RESEARCH_OUTPUT").unwrap());
+        let root = PathBuf::from(std::env::var("MOE4ALL_WORK_ROOT").unwrap());
+        assert!(output.is_absolute() && output.starts_with(root.join("results")));
+        std::fs::write(output, serde_json::to_vec_pretty(&observations).unwrap()).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires MOE4ALL_BENCH_TEST_MODEL and an idle default Vulkan GPU"]
+    fn shared_benchmark_frontier_survives_concurrency_changes() {
+        let path =
+            PathBuf::from(std::env::var("MOE4ALL_BENCH_TEST_MODEL").expect("test model path"));
+        let cfg = Arc::new(resolve_cfg(
+            &[],
+            cli_flag_layer(&bench_cmd()).unwrap(),
+            &[
+                "device.auto_profile=aggressive",
+                "kv.type_k=q8_0",
+                "kv.type_v=q8_0",
+            ],
+        ));
+        let model = infr_llama::SeamModel::load_with(&path, None, cfg).unwrap();
+        let engine = infr_llama::parallel::ParallelSeam::new(
+            model,
+            4,
+            Some(infr_core::SizeSpec::Bytes(40960)),
+        )
+        .unwrap();
+        let (background, prompts, _) = make_suite_shared_prompts(engine.model(), 6144, 4).unwrap();
+        let mut failures = Vec::new();
+        for shared in [true, false] {
+            engine.clear_benchmark_slots().unwrap();
+            if shared {
+                engine
+                    .prepare_benchmark_shared_slots(&background, &prompts, None)
+                    .unwrap();
+            } else {
+                engine.prepare_benchmark_slots(&prompts, None).unwrap();
+            }
+            for (lane, prompt) in prompts.iter().enumerate().take(4) {
+                let req = engine.request_ctx(infr_llama::sampling::RequestSampling::default());
+                let result = engine.generate_benchmark_turn(prompt, 16, &req);
+                eprintln!("frontier shared={shared} serial lane={lane}: {result:?}");
+                if let Err(error) = result {
+                    failures.push(format!("shared={shared} serial lane={lane}: {error:#}"));
+                }
+            }
+            for active in 1..=4 {
+                let result = run_token_decode_rep(8, 16, active, |lane, stop, callback| {
+                    let req = engine
+                        .request_ctx(infr_llama::sampling::RequestSampling::default())
+                        .with_external_abort(stop)
+                        .with_progress(Some(callback));
+                    engine
+                        .generate_benchmark_turn(&prompts[lane], 24, &req)
+                        .map(|_| ())
+                });
+                eprintln!("frontier shared={shared} active={active}: {result:?}");
+                if let Err(error) = result {
+                    failures.push(format!("shared={shared} active={active}: {error:#}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
     fn set_reaches_a_knob_with_no_flag_and_loses_to_the_flag_that_has_one() {
         // `--set` is the escape hatch for the knobs with no dedicated flag…
         let cfg = resolve_cfg(
@@ -7554,7 +7875,11 @@ mod tests {
             &[6 * 1024, 30 * 1024, 150 * 1024]
         );
         assert_eq!(BenchSuite::Quick.decode_tokens(), 1024);
-        assert_eq!(BenchSuite::Quick.prefill_warmup_tokens(), 6 * 1024);
+        assert_eq!(BenchSuite::Standard.decode_tokens(), 1024);
+        assert_eq!(BenchSuite::Full.decode_tokens(), 1024);
+        assert_eq!(BenchSuite::Quick.prefill_warmup_tokens(), 256);
+        assert_eq!(BenchSuite::Quick.required_context_tokens(), 7936);
+        assert_eq!(BenchSuite::Full.required_context_tokens(), 155392);
         assert_eq!(BenchSuite::Quick.decode_warmup_tokens(), 512);
         assert_eq!(BenchSuite::Quick.decode_reps(), 1);
         assert_eq!(BenchSuite::Standard.decode_reps(), 1);
@@ -7594,17 +7919,13 @@ mod tests {
             &device,
             &cfg,
         );
-        // The measured shape-warmup run was about 94 seconds including Decode warmups. Keep the
-        // formula honest without pretending one host is a universal exact-performance oracle.
-        assert!(
-            (85.0..=105.0).contains(&estimate.central_seconds),
-            "{}",
-            estimate.central_seconds
-        );
+        assert!(estimate.decode_seconds.is_finite() && estimate.decode_seconds > 0.0);
         assert!(estimate.startup_seconds > 20.0);
-        assert!(estimate.decode_seconds > estimate.prefill_seconds);
         assert_eq!(estimate.architecture_class, "full-attention");
-        assert_eq!(estimate.display_minutes, 3);
+        assert_eq!(
+            estimate.display_minutes,
+            (estimate.central_seconds * 1.30 / 60.0).ceil() as u64
+        );
 
         let standard = suite_estimate(
             BenchSuite::Standard,
@@ -7616,9 +7937,7 @@ mod tests {
             &device,
             &cfg,
         );
-        // Reconstructing the same plan from the published 6K/30K stage rates gives about 129s.
-        assert!((120.0..=145.0).contains(&standard.central_seconds));
-        assert_eq!(standard.display_minutes, 3);
+        assert!(standard.decode_seconds > estimate.decode_seconds);
 
         let full_x3 = suite_estimate(
             BenchSuite::Full,
@@ -7630,35 +7949,171 @@ mod tests {
             &device,
             &cfg,
         );
-        // The 6K/30K/150K x1-x3 release table reconstructs to about 1475s.
-        assert!((1_300.0..=1_550.0).contains(&full_x3.central_seconds));
-        assert_eq!(full_x3.display_minutes, 31);
+        assert!(full_x3.decode_seconds > standard.decode_seconds);
+        assert!(full_x3.prefill_seconds < 3.0 * 150_000.0 / 100.0);
     }
 
     #[test]
-    fn continuous_decode_boundaries_produce_three_sections_without_restarts() {
-        let result = summarize_suite_decode(
-            [341, 341, 342],
-            &[
-                [1_000_000_000, 2_000_000_000, 3_000_000_000, 4_000_000_000],
-                [1_200_000_000, 2_200_000_000, 3_200_000_000, 4_200_000_000],
-            ],
-        )
+    fn fixed_decode_uses_token_sections_and_a_common_clock() {
+        use std::time::Duration;
+        for lanes in 1..=4 {
+            let mut sampler = TokenDecodeSampler::new(lanes, 512, 1024);
+            for (boundary, tokens) in [512, 853, 1194, 1536].into_iter().enumerate() {
+                for lane in 0..lanes {
+                    sampler.observe(
+                        lane,
+                        tokens,
+                        Duration::from_millis((boundary as u64 + 1) * 1000 + lane as u64 * 100),
+                    );
+                }
+            }
+            let result = sampler.summarize().unwrap();
+            assert_eq!(result.overall.tokens, lanes * 1024);
+            assert!((result.overall.seconds - (3.0 + (lanes - 1) as f64 * 0.1)).abs() < 1e-9);
+            assert_eq!(
+                result.sections.each_ref().map(|rate| rate.tokens),
+                [341 * lanes, 341 * lanes, 342 * lanes]
+            );
+            assert_eq!(result.start_tokens, vec![512; lanes]);
+            assert_eq!(result.end_tokens, vec![1536; lanes]);
+            // Start at the earliest measured token, never inflate rates by discarding its time.
+            assert!((result.sections[0].seconds - (1.0 + (lanes - 1) as f64 * 0.1)).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn fixed_decode_ignores_duplicates_and_rejects_incomplete_boundaries() {
+        use std::time::Duration;
+        let mut sampler = TokenDecodeSampler::new(1, 512, 1024);
+        sampler.observe(0, 512, Duration::from_secs(1));
+        assert!(sampler.summarize().is_err());
+        sampler.observe(0, 853, Duration::from_secs(2));
+        sampler.observe(0, 853, Duration::from_secs(3));
+        sampler.observe(0, 500, Duration::from_secs(4));
+        sampler.observe(0, 1194, Duration::from_secs(5));
+        assert!(sampler.summarize().is_err());
+        sampler.observe(0, 1600, Duration::from_secs(6));
+        let result = sampler.summarize().unwrap();
+        assert_eq!(result.overall.tokens, 1024);
+        assert_eq!(result.sections[0].seconds, 1.0);
+        assert_eq!(result.overall.seconds, 5.0);
+        let mut jumped = TokenDecodeSampler::new(1, 512, 1024);
+        jumped.observe(0, 1536, Duration::from_secs(1));
+        assert!(jumped.summarize().is_err());
+    }
+
+    #[test]
+    fn fixed_decode_without_warmup_and_small_token_counts() {
+        use std::time::Duration;
+        let mut sampler = TokenDecodeSampler::new(1, 0, 4);
+        for token in 1..=4 {
+            sampler.observe(0, token, Duration::from_secs(token));
+        }
+        let result = sampler.summarize().unwrap();
+        assert_eq!(result.sections.each_ref().map(|r| r.tokens), [1, 1, 2]);
+        assert_eq!(result.overall.seconds, 4.0);
+    }
+
+    #[test]
+    fn fixed_decode_reports_use_the_unchanged_submission_protocol() {
+        use std::time::Duration;
+        let fixtures: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../scripts/fixtures/submission-vectors.json"
+        ))
         .unwrap();
-        assert_eq!(result.sections[0].tokens, 682);
-        assert!((result.sections[0].seconds - 1.0).abs() < 1e-9);
-        assert!((result.sections[1].seconds - 1.0).abs() < 1e-9);
-        assert!((result.sections[2].seconds - 1.0).abs() < 1e-9);
-        assert_eq!(result.overall.tokens, 2048);
-        assert!((result.overall.seconds - 3.0).abs() < 1e-9);
-        assert!((result.overall.tokens_per_second - (2048.0 / 3.0)).abs() < 1e-9);
-        assert_eq!(result.lane_tokens_per_second[0].len(), 2);
+        for lanes in 1..=4 {
+            let mut sampler = TokenDecodeSampler::new(lanes, 512, 1024);
+            for (boundary, tokens) in [512, 853, 1194, 1536].into_iter().enumerate() {
+                for lane in 0..lanes {
+                    sampler.observe(lane, tokens, Duration::from_secs(boundary as u64 + 1));
+                }
+            }
+            let rep = sampler.summarize().unwrap();
+            let mut payload = fixtures["benchmark"].clone();
+            payload["configuration"]["decode_measurement"] = serde_json::json!("tokens");
+            payload["configuration"]["decode_tokens_per_rep"] = serde_json::json!(1024);
+            let decode = &mut payload["contexts"][0]["decode"][0];
+            decode["parallel"] = serde_json::json!(lanes);
+            decode["overall_tokens_per_second"] = serde_json::json!(rep.overall.tokens_per_second);
+            decode["section_mean_tokens_per_second"] =
+                serde_json::json!(rep.sections.each_ref().map(|rate| rate.tokens_per_second));
+            decode["repetitions"] = serde_json::json!([rep]);
+            submission_validation::validate("benchmark", &payload).unwrap();
+            let armor = submission::encode(submission::Kind::Benchmark, &payload).unwrap();
+            assert_eq!(submission::decode(&armor).unwrap().payload, payload);
+        }
+    }
+
+    fn benchmark_progress(tokens: u64) -> infr_core::GenerationProgress {
+        infr_core::GenerationProgress {
+            phase: infr_core::GenerationPhase::Decode,
+            prompt_tokens: 6144,
+            cached_prompt_tokens: 6143,
+            prefill_tokens: 1,
+            completion_tokens: tokens,
+            context_tokens: 6144 + tokens,
+            context_limit: 40_000,
+        }
     }
 
     #[test]
-    fn continuous_decode_rejects_missing_or_reordered_boundaries() {
-        assert!(summarize_suite_decode([1, 1, 1], &[[1, 2, 0, 4]]).is_err());
-        assert!(summarize_suite_decode([1, 1, 1], &[[2, 1, 3, 4]]).is_err());
+    fn fixed_decode_workers_run_once_without_deadlines_or_section_restarts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        for lanes in 1..=4 {
+            let calls = AtomicUsize::new(0);
+            let exited = AtomicUsize::new(0);
+            let result = run_token_decode_rep(2, 16, lanes, |lane, stop, callback| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(lane as u64 * 2));
+                for tokens in 1..=18 {
+                    assert!(!stop.load(Ordering::Relaxed));
+                    callback(benchmark_progress(tokens));
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                exited.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(calls.load(Ordering::Relaxed), lanes);
+            assert_eq!(exited.load(Ordering::Relaxed), lanes);
+            assert_eq!(result.overall.tokens, lanes * 16);
+            assert_eq!(
+                result.sections.iter().map(|s| s.tokens).sum::<usize>(),
+                lanes * 16
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_decode_drains_every_worker_after_error_or_early_completion() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        for fail in [false, true] {
+            let exited = AtomicUsize::new(0);
+            let result = run_token_decode_rep(1, 16, 4, |lane, stop, callback| {
+                if lane == 0 {
+                    exited.fetch_add(1, Ordering::Relaxed);
+                    anyhow::ensure!(!fail, "fixture worker failure");
+                    return Ok(());
+                }
+                let mut tokens = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    tokens += 1;
+                    callback(benchmark_progress(tokens));
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                exited.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            });
+            assert_eq!(exited.load(Ordering::Relaxed), 4);
+            let error = result.unwrap_err().to_string();
+            assert!(if fail {
+                error.contains("fixture worker failure")
+            } else {
+                error.contains("ended before the requested token count")
+            });
+        }
     }
 
     #[test]

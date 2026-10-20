@@ -25,6 +25,8 @@ EOF
 /bin/zsh -n "$repo/Start-INFR-Wizard-macOS.sh"
 python3 -c 'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))' "$repo/scripts/macos_release.py"
 grep -Fq "trap 'launcher_exit \$?' EXIT" "$repo/Start-INFR-Wizard-macOS.sh"
+grep -Fq '1024 tokens Decode' "$repo/Start-INFR-Wizard-macOS.sh"
+grep -Fq 'Metal keeps the manual benchmark.' "$repo/Start-INFR-Wizard-macOS.sh"
 
 root="$work/root"
 home="$work/home"
@@ -38,6 +40,14 @@ assert_contains "$output" '--dev metal'
 assert_contains "$output" 'device.auto_profile=aggressive'
 assert_contains "$output" 'device.ram_budget=48GiB'
 assert_contains "$output" "$root/model.gguf"
+[[ $output != *kv.type_k=* && $output != *kv.type_v=* ]] || fail 'Automatic profile forced a KV format'
+for side in k v; do
+    output=$(HOME="$home" /bin/zsh "$repo/Start-INFR-Wizard-macOS.sh" \
+        --root "$root" --dry-run --mode run --model model.gguf --profile aggressive "--kv-$side" f16)
+    assert_contains "$output" "kv.type_$side=f16"
+    other=k; [[ $side != k ]] || other=v
+    [[ $output != *kv.type_$other=* ]] || fail 'An explicit KV side forced the other side'
+done
 
 output=$(HOME="$home" /bin/zsh "$repo/Start-INFR-Wizard-macOS.sh" \
     --root "$root" --dry-run --mode serve --model model.gguf --profile conservative \
@@ -86,6 +96,31 @@ python3 "$repo/scripts/macos_release.py" --root "$repo" --binary "$work/infr-new
 python3 "$repo/scripts/macos_release.py" --root "$repo" --binary "$work/infr-bad" --output "$bad_out" --version 1.0.2 >/dev/null
 
 MOE4ALL_WIZARD_LIBRARY=1 source "$repo/Start-INFR-Wizard-macOS.sh"
+BINARY="$root/infr"
+ROOT="$root"
+
+for profile in conservative aggressive; do
+    for mode in run serve bench; do
+        defaults; S[model]="$root/model.gguf"; S[device]=metal; S[setup_mode]=$profile; S[launch_mode]=$mode
+        S[kv_preset]=q8; S[kv_type_k]=q8_0; S[kv_type_v]=q8_0
+        build_command
+        [[ ${S[kv_preset]} == auto && -z ${S[kv_type_k]} && -z ${S[kv_type_v]} ]] || fail 'Saved automatic Q8 was not migrated'
+        for argument in "${COMMAND[@]}"; do
+            [[ $argument != kv.type_k=* && $argument != kv.type_v=* ]] || fail 'Saved automatic Q8 leaked into the command'
+        done
+    done
+done
+for preset in q8 f16 custom auto; do
+    defaults; S[model]="$root/model.gguf"; S[device]=metal; S[setup_mode]=manual; S[kv_preset]=$preset
+    S[kv_type_k]=q8_0; S[kv_type_v]=f16
+    build_command
+    if [[ $preset == auto ]]; then
+        [[ ${COMMAND[*]} != *kv.type_k=* && ${COMMAND[*]} != *kv.type_v=* ]] || fail 'Manual engine-default passed stale values'
+    else
+        assert_contains "${COMMAND[*]}" 'kv.type_k=q8_0'
+        assert_contains "${COMMAND[*]}" 'kv.type_v=f16'
+    fi
+done
 
 # The submission client uses only tools included with macOS. Exercise the
 # browser-confirmed relay with local fixtures and verify that the private token

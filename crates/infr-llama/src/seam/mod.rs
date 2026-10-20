@@ -5313,11 +5313,11 @@ pub(crate) fn vulkan_moe_binder<'a>(
             .map_err(|e| anyhow!("{e}"))?;
         vk.upload(buf.as_ref(), &padded)
             .map_err(|e| anyhow!("{e}"))?;
-        if vk.capabilities().unified_memory {
-            // upload has copied the CPU source into its destination or an owned staging buffer.
-            // UMA must not retain another resident file-backed copy of every GPU weight.
-            tb.release_source_pages();
-        }
+        // upload has copied the source into its destination or an owned staging buffer.
+        // Release only these clean mapped pages, not the process working set: otherwise the
+        // post-fixed RAM snapshot charges reclaimable upload sources against the Host tier.
+        // This applies to discrete GPUs too; persistent allocations remain in that snapshot.
+        tb.release_source_pages();
         Ok((buf, dt))
     });
     Ok((bind, finish_fixed_allocations))

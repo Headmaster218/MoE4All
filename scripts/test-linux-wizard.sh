@@ -38,9 +38,24 @@ done
 reject managed image-codecs/evil.so
 for mode in run serve bench; do
     output=$(bash "$ROOT/Start-INFR-Wizard-Linux.sh" --dry-run --mode "$mode" --model 'model with spaces.gguf' --profile aggressive </dev/null)
-    [[ $output == *device.auto_profile=aggressive* && $output != *STUB_LAUNCHED* ]]; pass
+    [[ $output == *device.auto_profile=aggressive* && $output != *STUB_LAUNCHED* && $output != *kv.type_k=* && $output != *kv.type_v=* ]]; pass
 done
 [[ ! -f $STATE ]]; pass
+for profile in conservative aggressive; do
+    for mode in run serve bench; do
+        reset; S[setup_mode]=$profile; S[launch_mode]=$mode
+        S[kv_preset]=q8; S[kv_type_k]=q8_0; S[kv_type_v]=q8_0
+        build_command
+        ! has_arg kv.type_k=q8_0; ! has_arg kv.type_v=q8_0
+        [[ ${S[kv_preset]} == auto && -z ${S[kv_type_k]} && -z ${S[kv_type_v]} ]]; pass
+    done
+done
+for preset in q8 f16 custom auto; do
+    reset; S[setup_mode]=manual; S[kv_preset]=$preset; S[kv_type_k]=q8_0; S[kv_type_v]=f16
+    build_command
+    if [[ $preset == auto ]]; then ! has_arg kv.type_k=q8_0; ! has_arg kv.type_v=f16
+    else has_arg kv.type_k=q8_0; has_arg kv.type_v=f16; fi; pass
+done
 reset; S[launch_mode]=serve; S[server_parallel]=2; S[mtp_enabled]=true; S[mtp_model]=head.gguf; S[mtp_verify_tokens]=2
 choice mtp_verify_tokens 'MTP width' '4|4' '3|3' '2|2' <<< '' > "$tmp/numeric-choice"
 [[ ${S[mtp_verify_tokens]} == 2 ]]; pass
@@ -62,6 +77,9 @@ reset; S[launch_mode]=bench; S[bench_kind]=manual; S[manual_bench_kind]=mixed; S
 build_command; has_arg --pg; has_arg --synthetic-depth; has_arg --json; ! has_arg spec.mtp=false; pass
 reset; S[launch_mode]=bench; S[bench_kind]=standard; S[bench_parallel]=3
 build_command; has_arg --suite; has_arg standard; has_arg --parallel; has_arg 3; has_arg --result-dir; ! has_arg --synthetic-depth; pass
+grep -Fq '6K Prefill + 1024 Decode. x1, one run' "$repo/Start-INFR-Wizard-Linux.sh"; pass
+grep -Fq 'Shared KV, different questions.' "$repo/Start-INFR-Wizard-Linux.sh"; pass
+! grep -Fq '90s Decode' "$repo/Start-INFR-Wizard-Linux.sh"; pass
 reset; S[launch_mode]=bench; S[setup_mode]=aggressive; S[device]=Vulkan1
 start_benchmark_estimate_probe
 benchmark_estimate_detail quick 1; [[ $REPLY == '预计约 1 分钟。Estimated about 1 min.' ]]; pass
@@ -250,7 +268,11 @@ reset; S[launch_mode]=serve; S[mtp_enabled]=true; S[mtp_model]=head.gguf; S[serv
 S[server_embedding]=true; S[embedding_model]=emb.gguf; S[ubatch]=2048; save_state
 before=$(sha256sum "$STATE")
 output=$(INFR_API_KEY=fixture-secret bash "$ROOT/Start-INFR-Wizard-Linux.sh" --dry-run --model relative.gguf --ubatch 3072 --kv-k q8_0 --no-mtp --no-mmproj --no-embedding --no-api-key </dev/null)
-[[ $output == *3072* && $output == *kv.type_k=q8_0* && $output != *fixture-secret* && $output != *spec.draft* && $output != *--mmproj* && $(sha256sum "$STATE") == "$before" ]]; pass
+[[ $output == *3072* && $output == *kv.type_k=q8_0* && $output != *kv.type_v=* && $output != *fixture-secret* && $output != *spec.draft* && $output != *--mmproj* && $(sha256sum "$STATE") == "$before" ]]; pass
+output=$(bash "$ROOT/Start-INFR-Wizard-Linux.sh" --dry-run --model relative.gguf --kv-v f16 --no-mtp --no-mmproj --no-embedding --no-api-key </dev/null)
+[[ $output == *kv.type_v=f16* && $output != *kv.type_k=* && $(sha256sum "$STATE") == "$before" ]]; pass
+output=$(bash "$ROOT/Start-INFR-Wizard-Linux.sh" --dry-run --model relative.gguf --kv-k q8_0 --kv-v f16 --no-mtp --no-mmproj --no-embedding --no-api-key </dev/null)
+[[ $output == *kv.type_k=q8_0* && $output == *kv.type_v=f16* && $(sha256sum "$STATE") == "$before" ]]; pass
 output=$(bash "$ROOT/Start-INFR-Wizard-Linux.sh" --dry-run --model relative.gguf --no-mmproj --no-embedding --no-api-key </dev/null)
 [[ $output == *spec.mtp=false* && $output != *spec.draft* ]]; pass
 output=$(bash "$ROOT/Start-INFR-Wizard-Linux.sh" --dry-run --model relative.gguf --mtp head.gguf --mtp-k 3 --no-mmproj --no-embedding --no-api-key </dev/null)

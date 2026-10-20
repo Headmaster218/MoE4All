@@ -1014,7 +1014,7 @@ function Write-ManualBenchmarkResult {
         [Parameter(Mandatory = $true)][string]$Repetitions
     )
 
-    $parsed = @($RawJson | ConvertFrom-Json)
+    $parsed = $RawJson | ConvertFrom-Json
     if ($parsed.Count -ne 1 -or $null -eq $parsed[0].avg_ts) {
         throw '手动 benchmark 未返回可识别的 JSON。Manual benchmark did not return recognizable JSON.'
     }
@@ -1063,8 +1063,6 @@ function Write-ManualBenchmarkResult {
         })
         failures = @()
     }
-    $resultPath = Write-BenchmarkSubmissionFromJson -Value $result
-
     Write-Host "`n结果 / Results" -ForegroundColor Green
     Write-Host '+------------------+------------+----------+'
     Write-Host '| Workload         | Repetitions| Overall  |'
@@ -1072,6 +1070,23 @@ function Write-ManualBenchmarkResult {
     Write-Host ('| {0,-16} | {1,10} | {2,8:N1} |' -f $Kind, $Repetitions, [double]$rawResult.avg_ts)
     Write-Host '+------------------+------------+----------+'
     Write-Host 'Overall speed: tok/s. / Overall 速度单位：tok/s。' -ForegroundColor DarkGray
+    if ($Kind -eq 'mixed') {
+        $localDirectory = Join-Path $dataDir 'benchmark-results'
+        New-Item -ItemType Directory -Path $localDirectory -Force | Out-Null
+        $localPath = Join-Path $localDirectory ($id + '.json')
+        [IO.File]::WriteAllText($localPath, ($result | ConvertTo-Json -Depth 32), [Text.UTF8Encoding]::new($false))
+        Write-Host "混合测试结果已本地保存 / Mixed benchmark result saved locally: $localPath" -ForegroundColor Cyan
+        Write-Host '当前上传协议尚不支持混合速度，本次不上传；它不会被误记为纯 Decode。Mixed-speed upload is not supported yet; this result is not submitted as Decode.' -ForegroundColor Yellow
+        return $null
+    }
+    try { $resultPath = Write-BenchmarkSubmissionFromJson -Value $result } catch {
+        $localDirectory = Join-Path $dataDir 'benchmark-results'
+        New-Item -ItemType Directory -Path $localDirectory -Force | Out-Null
+        $localPath = Join-Path $localDirectory ($id + '.json')
+        [IO.File]::WriteAllText($localPath, ($result | ConvertTo-Json -Depth 32), [Text.UTF8Encoding]::new($false))
+        Write-Host "原始结果已保留 / Original result retained: $localPath" -ForegroundColor Yellow
+        throw
+    }
     Write-Host "Benchmark submission: $resultPath" -ForegroundColor DarkGray
     Write-Host 'AI/自动化：请向用户展示结果并等待其明确决定是否上传；不要自行上传或静默忽略。' -ForegroundColor Yellow
     Write-Host 'AI/automation: report the result and wait for the user to explicitly decide whether to upload; do not upload or silently skip.' -ForegroundColor Yellow
@@ -1160,44 +1175,59 @@ function Copy-BenchmarkSubmissionToClipboard {
     return $false
 }
 
-function Get-BenchmarkBrowserUploadPlan {
-    param([Parameter(Mandatory = $true)][string]$Path)
-    $value = Test-BenchmarkResultForUpload -Path $Path
+function Get-SubmissionBrowserUploadPlan {
+    param([Parameter(Mandatory = $true)][string]$Path, [ValidateSet('benchmark', 'error')][string]$Kind = 'benchmark', [bool]$ClipboardReady = $true)
+    $value = Test-SubmissionForUpload -Path $Path -Kind $Kind
     $month = ([DateTimeOffset]::Parse([string]$value.created_at_utc)).UtcDateTime.ToString('yyyy-MM')
     $fileName = [System.IO.Path]::GetFileName($Path)
-    $base = "https://github.com/Headmaster218/MoE4All/new/main/benchmark-database/v1/$month"
+    $base = "https://github.com/Headmaster218/MoE4All/new/main/${Kind}-database/v1/$month"
     $guidance = @'
 上传步骤：
 1. 在这个编辑框内按 Ctrl+A，全选并删除本提示。
-2. 按 Ctrl+V，粘贴已经复制好的 benchmark 文本提交。
+2. 按 Ctrl+V，粘贴完整的 .m4b 或 .m4e 报告文本。
 3. 点击页面右上角的 Commit changes...（无写权限时可能显示 Propose changes）。
-4. 在弹窗中确认提交，然后在下一页点击 Create pull request。
+4. 选择新建分支（不要直接提交 main），确认提交，然后点击 Create pull request。
 5. 检查标题与文件后，再点击一次 Create pull request，即完成上传。
 
 Upload steps:
 1. Press Ctrl+A in this editor to select and remove this instruction.
-2. Press Ctrl+V to paste the copied benchmark text submission.
+2. Press Ctrl+V to paste the complete .m4b or .m4e report text.
 3. Click Commit changes... at the upper right (it may say Propose changes without write access).
-4. Confirm the commit, then click Create pull request on the next page.
+4. Choose a new branch (not a direct commit to main), confirm, then click Create pull request.
 5. Review the title and file, then click Create pull request again to finish.
 '@
+    if (-not $ClipboardReady) {
+        $guidance = "剪贴板复制未成功：先打开本地报告，全选并复制完整文本，再按以下步骤操作。`nClipboard copy failed: open the local report and copy its complete text first.`n`n" + $guidance
+    }
+    $branch = "community/$Kind/$((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant())"
+    $guidance += "`nmacOS 请使用 Cmd+A / Cmd+V。On macOS, use Cmd+A / Cmd+V.`n建议分支名 / Suggested branch: $branch"
     $commonQuery = @(
         'filename=' + [Uri]::EscapeDataString($fileName)
-        'message=' + [Uri]::EscapeDataString("bench: add $($value.id)")
+        'message=' + [Uri]::EscapeDataString("${Kind}: add $($value.id)")
         'value=' + [Uri]::EscapeDataString($guidance.Trim())
     ) -join '&'
     return [pscustomobject]@{ Url = "$base`?$commonQuery"; GuidancePrefilled = $true }
 }
 
-function Open-BenchmarkBrowserUpload {
+function Get-BenchmarkBrowserUploadPlan {
     param([Parameter(Mandatory = $true)][string]$Path)
+    Get-SubmissionBrowserUploadPlan -Path $Path -Kind benchmark
+}
+
+function Open-SubmissionBrowserUpload {
+    param([Parameter(Mandatory = $true)][string]$Path, [ValidateSet('benchmark', 'error')][string]$Kind = 'benchmark')
     $copied = Copy-BenchmarkSubmissionToClipboard -Path $Path
     if (-not $copied) {
-        Start-Process -FilePath 'explorer.exe' -ArgumentList ("/select,`"{0}`"" -f $Path)
+        try { Start-Process -FilePath 'explorer.exe' -ArgumentList ("/select,`"{0}`"" -f $Path) } catch { }
     }
-    $plan = Get-BenchmarkBrowserUploadPlan -Path $Path
-    Start-Process -FilePath $plan.Url
-    Write-Host '已打开 GitHub 上传页，请按编辑区内的双语提示完成。Opened GitHub; follow the bilingual instructions in the editor.' -ForegroundColor Cyan
+    $plan = Get-SubmissionBrowserUploadPlan -Path $Path -Kind $Kind -ClipboardReady $copied
+    try {
+        Start-Process -FilePath $plan.Url
+        Write-Host '已打开 GitHub 上传页，请按编辑区内的双语提示完成。Opened GitHub; follow the bilingual instructions in the editor.' -ForegroundColor Cyan
+    } catch {
+        Write-Host "未能自动打开 GitHub，请手动打开以下地址。Could not open GitHub; open this URL manually:`n$($plan.Url)" -ForegroundColor Yellow
+    }
+    Write-Host "本地报告 / Local report: $Path"
 }
 
 function Invoke-NativeCommandResult {
@@ -1229,29 +1259,13 @@ function Test-GhAuthenticated {
     return $auth.ExitCode -eq 0
 }
 
-function Invoke-GhBrowserLogin {
-    param([Parameter(Mandatory = $true)]$GhCommand)
-
-    Write-Host "`n正在打开 GitHub 设备授权页；一次性代码将由 gh 自动复制到剪贴板。" -ForegroundColor Cyan
-    Write-Host 'Opening GitHub device authorization; gh will copy the one-time code to the clipboard.' -ForegroundColor Cyan
-    try {
-        Start-Process -FilePath 'https://github.com/login/device'
-        $process = Start-Process -FilePath $GhCommand.Source -ArgumentList @(
-            'auth', 'login', '--hostname', 'github.com', '--git-protocol', 'https', '--web'
-        ) -NoNewWindow -Wait -PassThru
-        return $process.ExitCode -eq 0
-    } catch {
-        Write-Warning "GitHub 登录失败：$($_.Exception.Message) / GitHub login failed."
-        return $false
-    }
-}
 
 function Invoke-GhSubmissionUpload {
-    param([Parameter(Mandatory = $true)][string]$Path, [ValidateSet('benchmark', 'error')][string]$Kind = 'benchmark')
+    param([Parameter(Mandatory = $true)][string]$Path, [ValidateSet('benchmark', 'error')][string]$Kind = 'benchmark', [switch]$Retry)
 
     $value = Test-SubmissionForUpload -Path $Path -Kind $Kind
     $verified = Invoke-NativeCommandResult -Executable $infrPath -Arguments @('submission', 'verify', $Path)
-    if ($verified.ExitCode -ne 0) { throw '提交文件未通过本地校验，未上传。Local submission validation failed; nothing was uploaded.' }
+    if ($verified.ExitCode -ne 0) { $script:SubmissionValidationFailed = $true; throw '提交文件未通过本地校验，未上传。Local submission validation failed; nothing was uploaded.' }
     $gh = Get-Command gh -ErrorAction SilentlyContinue
     if ($null -eq $gh) { return $false }
     if (-not (Test-GhAuthenticated -GhCommand $gh)) { return $false }
@@ -1265,12 +1279,16 @@ function Invoke-GhSubmissionUpload {
     $fork = "$login/MoE4All"
     $month = ([DateTimeOffset]::Parse([string]$value.created_at_utc)).UtcDateTime.ToString('yyyy-MM')
     $relative = "${Kind}-database/v1/$month/$([System.IO.Path]::GetFileName($Path))"
+    $fileHash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
     Write-Host "`nGitHub: $login" -ForegroundColor Cyan
     Write-Host "目标 / Target: $upstream/$relative"
     Write-Host 'PR 创建后报告即公开；不创建 Issue，不自动合并。The report becomes public when the PR is created; no Issue or automatic merge.' -ForegroundColor Yellow
-    if (-not (Read-YesNo -Label '确认创建分支并提交报告 PR？/ Create the branch and report PR now?' -Default $true)) {
-        $script:SubmissionUploadCancelled = $true
-        return $false
+    if (-not ($Retry -and $script:SubmissionGhConfirmedHash -eq "$Kind/$fileHash")) {
+        if (-not (Read-YesNo -Label '确认创建分支并提交报告 PR？/ Create the branch and report PR now?' -Default $true)) {
+            $script:SubmissionUploadCancelled = $true
+            return $false
+        }
+        $script:SubmissionGhConfirmedHash = "$Kind/$fileHash"
     }
 
     try {
@@ -1290,7 +1308,6 @@ function Invoke-GhSubmissionUpload {
         $baseSha = [string]($baseResult.Output | Where-Object { $_ } | Select-Object -First 1)
         if ($baseResult.ExitCode -ne 0 -or -not $baseSha) { throw 'could not read upstream main SHA' }
         $baseSha = $baseSha.Trim()
-        $fileHash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
         $branch = "community/$Kind/$fileHash"
         $refCreate = Invoke-NativeCommandResult -Executable $gh.Source -Arguments @('api', '--method', 'POST', "repos/$fork/git/refs", '-f', "ref=refs/heads/$branch", '-f', "sha=$baseSha")
         if ($refCreate.ExitCode -ne 0) {
@@ -1321,10 +1338,11 @@ function Invoke-GhSubmissionUpload {
         $prCreate = Invoke-NativeCommandResult -Executable $gh.Source -Arguments @('pr', 'create', '--repo', $upstream, '--base', 'main', '--head', "${login}:$branch", '--title', "${Kind}: add $($value.id)", '--body', 'User-consented public MoE4All report. Awaiting maintainer review; no automatic merge. Format validation is not an independent reproduction.')
         $prUrl = [string]($prCreate.Output | Where-Object { $_ } | Select-Object -Last 1)
         if ($prCreate.ExitCode -ne 0) {
-            $listed = Invoke-NativeCommandResult -Executable $gh.Source -Arguments @('pr', 'list', '--repo', $upstream, '--head', "${login}:$branch", '--state', 'all', '--json', 'url', '--jq', '.[0].url // empty')
+            $listed = Invoke-NativeCommandResult -Executable $gh.Source -Arguments @('pr', 'list', '--repo', $upstream, '--head', $branch, '--author', $login, '--base', 'main', '--state', 'all', '--json', 'url', '--jq', '.[0].url // empty')
             $prUrl = [string]($listed.Output | Where-Object { $_ } | Select-Object -First 1)
             if ($listed.ExitCode -ne 0 -or $prUrl -notmatch '^https://github\.com/Headmaster218/MoE4All/pull/[0-9]+$') { throw 'could not create or reuse pull request' }
         }
+        if ($prUrl -notmatch '^https://github\.com/Headmaster218/MoE4All/pull/[0-9]+$') { throw 'GitHub did not return a valid report PR URL' }
         Write-Host "PR 已创建 / PR created: $prUrl" -ForegroundColor Green
         return $true
     } catch {
@@ -1353,6 +1371,9 @@ function Save-BenchmarkUploadPreferences {
         $preferences['benchmark_upload_has_github'] = $script:BenchmarkUploadHasGithubDefault
         $preferences['benchmark_upload_gh_auth'] = $script:BenchmarkUploadGhAuthDefault
         $preferences['benchmark_upload_fallback'] = $script:BenchmarkUploadFallbackDefault
+        $preferences['submission_browser_action'] = $script:SubmissionBrowserActionDefault
+        $preferences['submission_failure_action'] = $script:SubmissionFailureActionDefault
+        $preferences['submission_pending_retry'] = $script:SubmissionPendingRetryDefault
         New-Item -ItemType Directory -Path (Split-Path -Parent $statePath) -Force | Out-Null
         [System.IO.File]::WriteAllText(
             $statePath,
@@ -1428,6 +1449,17 @@ function Get-Moe4AllSubmissionApiConfig {
 function Get-SubmissionProxy {
     param([Parameter(Mandatory = $true)][Uri]$ProbeUri)
 
+    $noProxy = [Environment]::GetEnvironmentVariable('NO_PROXY', 'Process')
+    foreach ($entry in @($noProxy -split ',')) {
+        $entry = $entry.Trim().ToLowerInvariant()
+        if (-not $entry) { continue }
+        $hostPattern = $entry; $port = 0
+        if ($entry -match '^([^:]+):(\d+)$') { $hostPattern = $Matches[1]; $port = [int]$Matches[2] }
+        $hostPattern = $hostPattern.TrimStart('.')
+        if (($port -eq 0 -or $port -eq $ProbeUri.Port) -and ($hostPattern -eq '*' -or $ProbeUri.DnsSafeHost -eq $hostPattern -or $ProbeUri.DnsSafeHost.EndsWith('.' + $hostPattern, [StringComparison]::OrdinalIgnoreCase))) {
+            return [System.Net.WebProxy]::new()
+        }
+    }
     foreach ($name in @('HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy')) {
         $raw = [Environment]::GetEnvironmentVariable($name, 'Process')
         $uri = $null
@@ -1449,131 +1481,6 @@ function Get-SubmissionProxy {
     return $null
 }
 
-function New-SubmissionConnectivityTask {
-    param(
-        [Parameter(Mandatory = $true)][ValidateSet('github', 'cloudflare')][string]$Target,
-        [Parameter(Mandatory = $true)][Uri]$Uri,
-        [System.Net.IWebProxy]$Proxy = $null
-    )
-
-    Add-Type -AssemblyName System.Net.Http
-    $handler = [System.Net.Http.HttpClientHandler]::new()
-    $handler.AllowAutoRedirect = $false
-    if ($null -eq $Proxy) {
-        $handler.UseProxy = $false
-    } else {
-        $handler.UseProxy = $true
-        $handler.Proxy = $Proxy
-    }
-    $client = [System.Net.Http.HttpClient]::new($handler)
-    $client.Timeout = [TimeSpan]::FromSeconds(5)
-    $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $Uri)
-    [void]$request.Headers.UserAgent.ParseAdd("MoE4All-Wizard/$productVersion")
-    return [pscustomobject]@{
-        Target = $Target
-        ViaProxy = $null -ne $Proxy
-        Handler = $handler
-        Client = $client
-        Request = $request
-        Task = $client.SendAsync($request)
-        Finished = $false
-        Reachable = $false
-    }
-}
-
-function Start-SubmissionConnectivityProbe {
-    if ($null -ne $script:SubmissionConnectivityWorker -and -not $script:SubmissionConnectivityWorker.Async.IsCompleted) { return }
-    if ($null -ne $script:SubmissionConnectivityWorker) {
-        [void](Get-SubmissionConnectivitySnapshot)
-    }
-    foreach ($probe in @($script:SubmissionConnectivityTasks)) {
-        if ($null -eq $probe) { continue }
-        if (-not $probe.Finished) {
-            $probe.Client.CancelPendingRequests()
-            $probe.Request.Dispose()
-            $probe.Client.Dispose()
-            $probe.Handler.Dispose()
-        }
-    }
-    $script:SubmissionConnectivityTasks = @()
-    $script:SubmissionProxyConfigured = $false
-    $script:SubmissionRouteModes = @{}
-    $definitions = @('Get-Moe4AllSubmissionApiConfig', 'Get-SubmissionProxy', 'New-SubmissionConnectivityTask') | ForEach-Object {
-        "function $_ {`n$((Get-Item -LiteralPath ('Function:' + $_)).Definition)`n}"
-    }
-    $worker = [PowerShell]::Create()
-    [void]$worker.AddScript(($definitions -join "`n"))
-    [void]$worker.AddScript({
-        param($Version)
-        $productVersion = $Version
-        $githubUri = [Uri]::new('https://api.github.com/rate_limit')
-        $api = Get-Moe4AllSubmissionApiConfig
-        $cloudflareUri = [Uri]::new($api.ApiBase.AbsoluteUri.TrimEnd('/') + '/health')
-        $proxy = Get-SubmissionProxy -ProbeUri $githubUri
-        $tasks = @()
-        $tasks += New-SubmissionConnectivityTask -Target github -Uri $githubUri
-        $tasks += New-SubmissionConnectivityTask -Target cloudflare -Uri $cloudflareUri
-        if ($null -ne $proxy) {
-            $tasks += New-SubmissionConnectivityTask -Target github -Uri $githubUri -Proxy $proxy
-            $tasks += New-SubmissionConnectivityTask -Target cloudflare -Uri $cloudflareUri -Proxy $proxy
-        }
-        [pscustomobject]@{ Tasks = $tasks; Proxy = $proxy }
-    }).AddArgument($productVersion)
-    $script:SubmissionConnectivityWorker = [pscustomobject]@{ Worker = $worker; Async = $worker.BeginInvoke() }
-}
-
-function Get-SubmissionConnectivitySnapshot {
-    $background = $script:SubmissionConnectivityWorker
-    if ($null -ne $background -and $background.Async.IsCompleted) {
-        try {
-            $result = @($background.Worker.EndInvoke($background.Async))
-            if ($result.Count -gt 0) {
-                $script:SubmissionConnectivityTasks = @($result[-1].Tasks)
-                $script:SubmissionDetectedProxy = $result[-1].Proxy
-                $script:SubmissionProxyConfigured = $null -ne $script:SubmissionDetectedProxy
-            }
-        } catch { } finally {
-            $background.Worker.Dispose()
-            $script:SubmissionConnectivityWorker = $null
-        }
-    }
-    $tasks = @($script:SubmissionConnectivityTasks)
-    foreach ($probe in $tasks) {
-        if ($probe.Finished -or -not $probe.Task.IsCompleted) { continue }
-        try {
-            $response = $probe.Task.GetAwaiter().GetResult()
-            try {
-                $status = [int]$response.StatusCode
-                $probe.Reachable = $status -ge 200 -and $status -lt 500 -and $status -ne 407
-            } finally {
-                $response.Dispose()
-            }
-        } catch {
-            $probe.Reachable = $false
-        } finally {
-            $probe.Finished = $true
-            $probe.Request.Dispose()
-            $probe.Client.Dispose()
-            $probe.Handler.Dispose()
-        }
-    }
-    $github = @($tasks | Where-Object Target -eq 'github')
-    $cloudflare = @($tasks | Where-Object Target -eq 'cloudflare')
-    $proxyTasks = @($tasks | Where-Object ViaProxy)
-    $githubReachable = @($github | Where-Object Reachable).Count -gt 0
-    $cloudflareReachable = @($cloudflare | Where-Object Reachable).Count -gt 0
-    $script:SubmissionRouteModes = @{}
-    foreach ($target in @('github', 'cloudflare')) {
-        $successful = @($tasks | Where-Object { $_.Target -eq $target -and $_.Reachable } | Sort-Object ViaProxy | Select-Object -First 1)
-        if ($successful.Count) { $script:SubmissionRouteModes[$target] = if ($successful[0].ViaProxy) { 'proxy' } else { 'direct' } }
-    }
-    return [pscustomobject]@{
-        Github = if ($githubReachable) { 'reachable' } elseif ($github.Count -gt 0 -and @($github | Where-Object { -not $_.Finished }).Count -eq 0) { 'unreachable' } else { 'pending' }
-        Cloudflare = if ($cloudflareReachable) { 'reachable' } elseif ($cloudflare.Count -gt 0 -and @($cloudflare | Where-Object { -not $_.Finished }).Count -eq 0) { 'unreachable' } else { 'pending' }
-        ProxyConfigured = [bool]$script:SubmissionProxyConfigured
-        Proxy = if (-not $script:SubmissionProxyConfigured) { 'not-configured' } elseif (@($proxyTasks | Where-Object Reachable).Count -gt 0) { 'reachable' } elseif ($proxyTasks.Count -gt 0 -and @($proxyTasks | Where-Object { -not $_.Finished }).Count -eq 0) { 'unreachable' } else { 'pending' }
-    }
-}
 
 function Save-PendingSubmission {
     param([Parameter(Mandatory = $true)][string]$Path, [ValidateSet('benchmark', 'error')][string]$Kind, [switch]$Quiet)
@@ -1615,19 +1522,15 @@ function Remove-PendingSubmission {
 function Invoke-WithSubmissionGithubRoute {
     param([Parameter(Mandatory = $true)][scriptblock]$Action)
 
-    $mode = if ($null -ne $script:SubmissionRouteModes) { $script:SubmissionRouteModes['github'] } else { '' }
     $names = @('HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'NO_PROXY')
     $saved = @{}
     foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
     try {
-        if ($mode -eq 'direct') {
-            foreach ($name in @('HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY')) { [Environment]::SetEnvironmentVariable($name, $null, 'Process') }
-            [Environment]::SetEnvironmentVariable('NO_PROXY', '*', 'Process')
-        } elseif ($mode -eq 'proxy') {
-            $proxy = $script:SubmissionDetectedProxy
-            if ($null -ne $proxy) {
+        # gh honors environment proxies, but does not discover the Windows system proxy.
+        if (-not ($saved['HTTPS_PROXY'] -or $saved['HTTP_PROXY'] -or $saved['ALL_PROXY'])) {
+            $proxy = Get-SubmissionProxy -ProbeUri ([Uri]'https://api.github.com')
+            if ($null -ne $proxy -and -not $proxy.IsBypassed([Uri]'https://api.github.com')) {
                 [Environment]::SetEnvironmentVariable('HTTPS_PROXY', $proxy.GetProxy([Uri]'https://api.github.com').AbsoluteUri, 'Process')
-                [Environment]::SetEnvironmentVariable('NO_PROXY', '', 'Process')
             }
         }
         & $Action
@@ -1664,9 +1567,8 @@ function Invoke-Moe4AllSubmissionApi {
     for ($attempt = 0; $attempt -le $maximumRetries; $attempt++) {
         $handler = [System.Net.Http.HttpClientHandler]::new()
         $handler.AllowAutoRedirect = $false
-        $route = if ($null -ne $script:SubmissionRouteModes) { $script:SubmissionRouteModes['cloudflare'] } else { '' }
-        if ($route -eq 'direct') { $handler.UseProxy = $false }
-        if ($route -eq 'proxy') { $handler.Proxy = $script:SubmissionDetectedProxy }
+        $proxy = Get-SubmissionProxy -ProbeUri $Uri
+        if ($null -ne $proxy) { $handler.Proxy = $proxy }
         $client = [System.Net.Http.HttpClient]::new($handler)
         $client.Timeout = [TimeSpan]::FromSeconds(30)
         $request = $null
@@ -1888,12 +1790,11 @@ function Invoke-WebsiteSubmissionUpload {
     if (-not [string]::IsNullOrWhiteSpace([string]$receipt.public_url)) {
         Write-Host ("公开地址 / Public URL: {0}" -f [string]$receipt.public_url) -ForegroundColor Cyan
     } else {
-        Write-Host '可在浏览器回执页查看转发与审核进度。' -ForegroundColor DarkGray
-        Write-Host 'View delivery and review progress on the browser receipt page.' -ForegroundColor DarkGray
+        Write-Host '需要查看进度时，在网站“我的回执”导入下方保存的私密回执文件。' -ForegroundColor DarkGray
+        Write-Host 'To check progress, import the saved private receipt under My receipts on the website.' -ForegroundColor DarkGray
     }
     Write-Host ("Receipt ID: {0}" -f [string]$receipt.receipt_id) -ForegroundColor Cyan
     Write-Host "Private receipt: $receiptPath" -ForegroundColor DarkGray
-    Open-Moe4AllSubmissionReceipt -Receipt $receipt -SiteOrigin $config.SiteOrigin
     return $true
 }
 
@@ -1910,13 +1811,6 @@ function Get-SubmissionReadableSummary {
     }
 }
 
-function Open-Moe4AllSubmissionReceipt {
-    param([Parameter(Mandatory = $true)]$Receipt, [Parameter(Mandatory = $true)][string]$SiteOrigin)
-    $url = $SiteOrigin.TrimEnd('/') + '/community/index.html#receipt=' + [Uri]::EscapeDataString([string]$Receipt.receipt_id) + '&token=' + [Uri]::EscapeDataString([string]$Receipt.receipt_token)
-    try { Start-Process -FilePath $url } catch {
-        Write-Host '未能打开回执页；可在网站“我的回执”导入本机保存的私密回执文件。Could not open the receipt page; import the saved private receipt on the website.' -ForegroundColor Yellow
-    }
-}
 
 function Get-ErrorSubmissionSnapshot {
     $root = Join-Path (Join-Path $repoRoot 'diagnostics') 'reports'
@@ -1994,7 +1888,6 @@ function Save-ErrorUploadPreference {
 function Complete-ErrorReport {
     param([AllowEmptyString()][string]$Source = '')
 
-    Start-SubmissionConnectivityProbe
     $description = Read-ProblemDescription
     if ($null -eq $description) {
         Write-Host '已取消；已有诊断文件不会删除。Cancelled; existing diagnostics were not deleted.' -ForegroundColor Yellow
@@ -2031,6 +1924,32 @@ function Complete-ErrorReport {
     }
 }
 
+function Read-SubmissionNextAction {
+    param([switch]$Browser)
+    if ($Browser) {
+        $default = $script:SubmissionBrowserActionDefault
+        if ($default -notin @('sent', 'reopen', 'cloudflare', 'later')) { $default = 'later' }
+        $value = Read-Choice -Label 'GitHub 网页提交 / GitHub web submission' -DefaultValue $default -Options @(
+            [pscustomobject]@{ Key = '1'; Value = 'sent'; Label = '已成功提交 / Successfully submitted' }
+            [pscustomobject]@{ Key = '2'; Value = 'reopen'; Label = '重新打开 GitHub / Reopen GitHub' }
+            [pscustomobject]@{ Key = '3'; Value = 'cloudflare'; Label = '改用 Cloudflare / Use Cloudflare instead' }
+            [pscustomobject]@{ Key = '4'; Value = 'later'; Label = '下次再发 / Send later' }
+        )
+        $script:SubmissionBrowserActionDefault = $value
+    } else {
+        $default = $script:SubmissionFailureActionDefault
+        if ($default -notin @('retry', 'channel', 'later')) { $default = 'later' }
+        $value = Read-Choice -Label 'Cloudflare 上传未完成 / Cloudflare upload incomplete' -DefaultValue $default -Options @(
+            [pscustomobject]@{ Key = '1'; Value = 'retry'; Label = '重试 Cloudflare / Retry Cloudflare' }
+            [pscustomobject]@{ Key = '2'; Value = 'channel'; Label = '返回渠道选择 / Return to channel selection' }
+            [pscustomobject]@{ Key = '3'; Value = 'later'; Label = '下次再发 / Send later' }
+        )
+        $script:SubmissionFailureActionDefault = $value
+    }
+    Save-BenchmarkUploadPreferences
+    return $value
+}
+
 function Offer-SubmissionUpload {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -2039,53 +1958,66 @@ function Offer-SubmissionUpload {
     )
 
     try { [void](Test-SubmissionForUpload -Path $Path -Kind $Kind) } catch { Write-Warning $_.Exception.Message; return $false }
-    if (-not $ConsentAlreadyGranted -and -not (Read-BenchmarkUploadConsent)) { return $true }
-    try { $pendingPath = Save-PendingSubmission -Path $Path -Kind $Kind -Quiet } catch { Write-Warning $_.Exception.Message; return $false }
-    $script:SubmissionUploadCancelled = $false
-    $hasGithub = Read-YesNo -Label '你有 GitHub 账号吗？/ Do you have a GitHub account?' -Default $script:BenchmarkUploadHasGithubDefault
-    $script:BenchmarkUploadHasGithubDefault = $hasGithub
-    Save-BenchmarkUploadPreferences
-    $connectivity = Get-SubmissionConnectivitySnapshot
-    $proxyText = if ($connectivity.ProxyConfigured) { "; proxy=$($connectivity.Proxy)" } else { '' }
-    Write-Host "提交连通性 / Submission connectivity: GitHub=$($connectivity.Github), Cloudflare=$($connectivity.Cloudflare)$proxyText" -ForegroundColor DarkGray
-    if ($hasGithub -and $connectivity.Github -ne 'unreachable') {
-        try {
-            $gitUploaded = Invoke-WithSubmissionGithubRoute -Action {
-                $gh = Get-Command gh -ErrorAction SilentlyContinue
-                $ghAuthenticated = $null -ne $gh -and (Test-GhAuthenticated -GhCommand $gh)
-                if ($null -ne $gh -and -not $ghAuthenticated) {
-                    $authorizeGh = Read-YesNo -Label 'gh 尚未登录。现在通过浏览器授权，以便自动创建 PR？/ gh is not signed in. Authorize in the browser for automatic PR creation?' -Default $script:BenchmarkUploadGhAuthDefault
-                    $script:BenchmarkUploadGhAuthDefault = $authorizeGh
-                    Save-BenchmarkUploadPreferences
-                    if ($authorizeGh) {
-                        if (Invoke-GhBrowserLogin -GhCommand $gh) {
-                            $ghAuthenticated = Test-GhAuthenticated -GhCommand $gh
-                        }
-                    } else {
-                        Write-Host '不进行 gh 授权，改用浏览器确认的 Cloudflare 中转。Using the browser-confirmed Cloudflare relay without gh authorization.'
-                    }
-                }
-                if ($ghAuthenticated) { return (Invoke-GhSubmissionUpload -Path $Path -Kind $Kind) }
-                return $false
-            }
-        } catch {
-            $gitUploaded = $false
-            Write-Warning "GitHub 直传失败：$($_.Exception.Message) / Direct GitHub upload failed."
-        }
-        if ($gitUploaded) { Remove-PendingSubmission -Path $pendingPath; return $true }
-        if ($script:SubmissionUploadCancelled) { return $false }
-        Write-Host 'GitHub 直传不可用，改用浏览器确认的 Cloudflare 中转。Direct GitHub upload is unavailable; using the browser-confirmed Cloudflare relay.'
-    } elseif ($hasGithub) {
-        Write-Host 'GitHub 当前不可达，改用 Cloudflare 中转。GitHub is currently unreachable; using the Cloudflare relay.' -ForegroundColor Yellow
+    if (-not $ConsentAlreadyGranted) {
+        if ($Kind -eq 'error') {
+            $consent = Read-YesNo -Label '愿意公开提交这份错误报告吗？/ Submit this error report publicly?' -Default $script:ErrorUploadDefault
+            $script:ErrorUploadDefault = $consent
+            Save-ErrorUploadPreference
+        } else { $consent = Read-BenchmarkUploadConsent }
+        if (-not $consent) { return $false }
     }
-    if ($connectivity.Cloudflare -ne 'unreachable') {
-        try {
-            if (Invoke-WebsiteSubmissionUpload -Path $Path -Kind $Kind) { Remove-PendingSubmission -Path $pendingPath; return $true }
-        } catch {
-            Write-Warning "Cloudflare 中转失败：$($_.Exception.Message) / Cloudflare relay failed."
+    try { $pendingPath = Save-PendingSubmission -Path $Path -Kind $Kind -Quiet } catch { Write-Warning $_.Exception.Message; return $false }
+    $channel = 'choose'
+    while ($true) {
+        if ($channel -eq 'choose') {
+            $hasGithub = Read-YesNo -Label '你有 GitHub 账号吗？/ Do you have a GitHub account?' -Default $script:BenchmarkUploadHasGithubDefault
+            $script:BenchmarkUploadHasGithubDefault = $hasGithub
+            Save-BenchmarkUploadPreferences
+            $channel = if ($hasGithub) { 'github' } else { 'cloudflare' }
         }
-    } else {
-        Write-Host 'Cloudflare 当前也不可达。Cloudflare is currently unreachable.' -ForegroundColor Yellow
+        if ($channel -eq 'github') {
+            $script:SubmissionUploadCancelled = $false
+            $script:SubmissionValidationFailed = $false
+            $script:SubmissionGhConfirmedHash = ''
+            $gh = Get-Command gh -ErrorAction SilentlyContinue
+            $ghAuthenticated = $false
+            if ($null -ne $gh) {
+                try { $ghAuthenticated = Invoke-WithSubmissionGithubRoute -Action { Test-GhAuthenticated -GhCommand $gh } } catch { }
+            }
+            if ($ghAuthenticated) {
+                for ($attempt = 1; $attempt -le 2; $attempt++) {
+                    try {
+                        $gitUploaded = Invoke-WithSubmissionGithubRoute -Action {
+                            Write-Host "GitHub CLI 上传 / GitHub CLI upload: $attempt/2"
+                            return (Invoke-GhSubmissionUpload -Path $Path -Kind $Kind -Retry:($attempt -gt 1))
+                        }
+                        if ($gitUploaded) { Remove-PendingSubmission -Path $pendingPath; return $true }
+                    } catch { Write-Warning "GitHub CLI 上传失败：$($_.Exception.Message) / GitHub CLI upload failed." }
+                    if ($script:SubmissionUploadCancelled -or $script:SubmissionValidationFailed) { return $false }
+                }
+            }
+            Write-Host '没有可用的已登录 CLI 或上传未完成，改用 GitHub 网页。No signed-in CLI is available or CLI upload did not complete; opening GitHub.' -ForegroundColor Cyan
+            $channel = 'browser'
+        }
+        if ($channel -eq 'browser') {
+            try { Open-SubmissionBrowserUpload -Path $Path -Kind $Kind } catch {
+                Write-Warning "未能自动打开 GitHub，请保留本地报告。Could not open GitHub: $($_.Exception.Message)"
+            }
+            Write-Host '完成网页操作后再选择；向导不会查询网页提交结果。Choose after completing the web steps; the wizard does not query their result.'
+            $action = Read-SubmissionNextAction -Browser
+            if ($action -eq 'sent') { Remove-PendingSubmission -Path $pendingPath; return $true }
+            if ($action -eq 'reopen') { continue }
+            if ($action -eq 'cloudflare') { $channel = 'cloudflare' } else { break }
+        }
+        if ($channel -eq 'cloudflare') {
+            try {
+                if (Invoke-WebsiteSubmissionUpload -Path $Path -Kind $Kind) { Remove-PendingSubmission -Path $pendingPath; return $true }
+            } catch { Write-Warning "Cloudflare 中转失败：$($_.Exception.Message) / Cloudflare relay failed." }
+            $action = Read-SubmissionNextAction
+            if ($action -eq 'retry') { continue }
+            if ($action -eq 'channel') { $channel = 'choose'; continue }
+            break
+        }
     }
     Write-Host "提交暂存，待下次启动重试 / Submission saved for a later retry: $pendingPath" -ForegroundColor Yellow
     return $false
@@ -2113,16 +2045,12 @@ function Offer-PendingSubmissions {
     if ($script:PendingSubmissionPrompted) { return }
     $pending = @(Get-PendingSubmissions)
     if ($pending.Count -eq 0) { $script:PendingSubmissionPrompted = $true; return }
-    $connectivity = Get-SubmissionConnectivitySnapshot
-    if ($connectivity.Github -eq 'unreachable' -and $connectivity.Cloudflare -eq 'unreachable') {
-        Write-Host "发现 $($pending.Count) 份待发报告；当前提交渠道均不可达，将继续保留。" -ForegroundColor DarkGray
-        Write-Host "Found $($pending.Count) pending report(s); submission routes are offline, so they remain queued." -ForegroundColor DarkGray
-        return
-    }
-    if ($connectivity.Github -ne 'reachable' -and $connectivity.Cloudflare -ne 'reachable') { return }
-    if (-not $script:BenchmarkUploadHasGithubDefault -and $connectivity.Cloudflare -ne 'reachable') { return }
     $script:PendingSubmissionPrompted = $true
-    if (-not (Read-YesNo -Label "发现 $($pending.Count) 份待发报告，当前重试？/ Found $($pending.Count) pending report(s). Retry now?" -Default $true)) { return }
+    $default = if ($null -eq $script:SubmissionPendingRetryDefault) { $true } else { [bool]$script:SubmissionPendingRetryDefault }
+    $retry = Read-YesNo -Label "发现 $($pending.Count) 份待发报告，当前重试？/ Found $($pending.Count) pending report(s). Retry now?" -Default $default
+    $script:SubmissionPendingRetryDefault = $retry
+    Save-BenchmarkUploadPreferences
+    if (-not $retry) { return }
     foreach ($item in $pending) {
         $kind = if ($item.Extension -ieq '.m4e') { 'error' } else { 'benchmark' }
         if (Offer-SubmissionUpload -Path $item.FullName -Kind $kind -ConsentAlreadyGranted) {
@@ -2958,7 +2886,6 @@ if (-not (Test-Path -LiteralPath $infrPath -PathType Leaf)) {
 }
 
 $productVersion = Get-EngineVersion
-if (-not $DryRun -and @(Get-PendingSubmissions).Count -gt 0) { Start-SubmissionConnectivityProbe }
 if ($PostUpdateProbePath) {
     Write-PostUpdateProbe -Path $PostUpdateProbePath -Version $productVersion
     if ($ExitAfterPostUpdateProbe) { exit 43 }
@@ -3020,9 +2947,9 @@ $context = [string](Get-SavedValue 'context' '')
 $ubatch = [string](Get-SavedValue 'ubatch' '')
 $threads = [string](Get-SavedValue 'threads' '')
 $configPath = [string](Get-SavedValue 'config_path' '')
-$kvPreset = [string](Get-SavedValue 'kv_preset' 'q8')
-$kvTypeK = [string](Get-SavedValue 'kv_type_k' 'q8_0')
-$kvTypeV = [string](Get-SavedValue 'kv_type_v' 'q8_0')
+$kvPreset = [string](Get-SavedValue 'kv_preset' 'auto')
+$kvTypeK = [string](Get-SavedValue 'kv_type_k' '')
+$kvTypeV = [string](Get-SavedValue 'kv_type_v' '')
 $configureMemory = [bool](Get-SavedValue 'configure_memory' $false)
 
 $vramBudget = [string](Get-SavedValue 'vram_budget' '')
@@ -3071,6 +2998,9 @@ $script:BenchmarkUploadDefault = [bool](Get-SavedValue 'benchmark_upload' $false
 $script:BenchmarkUploadHasGithubDefault = [bool](Get-SavedValue 'benchmark_upload_has_github' $true)
 $script:BenchmarkUploadGhAuthDefault = [bool](Get-SavedValue 'benchmark_upload_gh_auth' $true)
 $script:BenchmarkUploadFallbackDefault = [string](Get-SavedValue 'benchmark_upload_fallback' 'folder')
+$script:SubmissionBrowserActionDefault = [string](Get-SavedValue 'submission_browser_action' 'later')
+$script:SubmissionFailureActionDefault = [string](Get-SavedValue 'submission_failure_action' 'later')
+$script:SubmissionPendingRetryDefault = [bool](Get-SavedValue 'submission_pending_retry' $true)
 $script:ErrorUploadDefault = [bool](Get-SavedValue 'error_upload' $false)
 if ($script:BenchmarkUploadFallbackDefault -notin @('folder', 'clipboard', 'skip')) { $script:BenchmarkUploadFallbackDefault = 'folder' }
 $script:PendingSubmissionPrompted = $false
@@ -3182,15 +3112,15 @@ if (-not $reuseSavedSettings) {
         Write-Host 'Hardware stays auto-detected, with tighter RAM/VRAM headroom, a larger Ubatch and a wider Submit cap search.' -ForegroundColor DarkGray
         Write-Host '适合追求吞吐且能接受更高资源压力；启动失败或系统换页时请改用保守档。' -ForegroundColor Yellow
         Write-Host 'Use conservative mode if allocation fails or Windows starts paging.' -ForegroundColor DarkGray
-        $kvPreset = 'q8'
-        $kvTypeK = 'q8_0'
-        $kvTypeV = 'q8_0'
+        $kvPreset = 'auto'
+        $kvTypeK = ''
+        $kvTypeV = ''
     } else {
         Write-Host "`n将自动预算所选设备的显存和 RAM；上下文留空时由引擎自动确定。" -ForegroundColor DarkGray
         Write-Host 'VRAM and RAM budgets use the selected device; leave context blank for engine sizing.' -ForegroundColor DarkGray
-        $kvPreset = 'q8'
-        $kvTypeK = 'q8_0'
-        $kvTypeV = 'q8_0'
+        $kvPreset = 'auto'
+        $kvTypeK = ''
+        $kvTypeV = ''
     }
     if ($setupMode -eq 'manual' -and $configureMemory) {
         Write-Host '大小可写 21GiB、512MiB、80%；留空表示自动。Sizes accept 21GiB, 512MiB or 80%; blank means auto.' -ForegroundColor DarkGray
@@ -3316,9 +3246,9 @@ if (-not $reuseSavedSettings) {
             $benchKind = 'manual'
         }
         $benchKind = Read-Choice -Label '测试方案 / Benchmark plan' -DefaultValue $benchKind -Options @(
-            [pscustomobject]@{ Key = '1'; Value = 'quick'; Label = '自动快速 / Automatic quick'; Detail = @('6K Prefill + 1024 Decode。单发，一次。', '6K Prefill + 1024 Decode. x1, one run.') }
-            [pscustomobject]@{ Key = '2'; Value = 'standard'; Label = '自动标准 / Automatic standard'; Detail = @('6K Prefill + 1024 Decode；30K Prefill + 1024 Decode；1-2 并发，各一次，共 4 次。', '6K Prefill + 1024 Decode; 30K Prefill + 1024 Decode; x1-x2, one run each, 4 runs total.') }
-            [pscustomobject]@{ Key = '3'; Value = 'full'; Label = '自动完整 / Automatic full'; Detail = @('6K、30K、150K Prefill + 1024 Decode；1-4 并发，各三次，共 36 次。', '6K, 30K and 150K Prefill + 1024 Decode; x1-x4, three runs each, 36 runs total.') }
+            [pscustomobject]@{ Key = '1'; Value = 'quick'; Label = '自动快速 / Automatic quick'; Detail = @('6K Prefill + 1024 Decode。单发，一次，可追加并发。', '6K Prefill + 1024 Decode. x1, one run; optional concurrency.') }
+            [pscustomobject]@{ Key = '2'; Value = 'standard'; Label = '自动标准 / Automatic standard'; Detail = @('6K、30K Prefill + 1024 Decode；1-2 并发，各一次，共 4 次。', '6K, 30K Prefill + 1024 Decode; x1-x2, one run each, 4 runs. Shared KV, different questions.') }
+            [pscustomobject]@{ Key = '3'; Value = 'full'; Label = '自动完整 / Automatic full'; Detail = @('6K、30K、150K Prefill + 1024 Decode；1-4 并发，各三次，共 36 次。', '6K, 30K, 150K Prefill + 1024 Decode; x1-x4, three runs each, 36 runs. Shared KV, different questions.') }
             [pscustomobject]@{ Key = '4'; Value = 'manual'; Label = '手动测试 / Manual benchmark'; Detail = @('按顺序添加 Prefill、Decode 和上下文深度。', 'Build one test step by step: Prefill, Decode and context depth.') }
         )
         if ($benchKind -ne 'manual') {
@@ -3331,6 +3261,8 @@ if (-not $reuseSavedSettings) {
                 [pscustomobject]@{ Key = '2'; Value = 'decode'; Label = '只测 Decode / Decode only'; Detail = @('生成 token；下一步可添加已有上下文。', 'Generate tokens; existing context can be added next.') }
                 [pscustomobject]@{ Key = '3'; Value = 'mixed'; Label = 'Prefill + Decode'; Detail = @('同一轮先处理提示词，再生成 token。', 'Process a prompt and then generate in the same turn.') }
             )
+            if ($promptTokens -notmatch '^[1-9][0-9]*$') { $promptTokens = '6144' }
+            if ($genTokens -notmatch '^[1-9][0-9]*$') { $genTokens = '512' }
             switch ($manualBenchKind) {
             'decode' {
                 $promptTokens = '0'
@@ -3358,6 +3290,7 @@ if (-not $reuseSavedSettings) {
                     [pscustomobject]@{ Key = '3'; Value = 'synthetic'; Label = 'Synthetic KV 深度 / Synthetic KV depth'; Detail = @('只构造 KV 深度与注意力形状，不计作真实 Prefill。', 'Create KV depth and attention shape without a real Prefill.') }
                 )
                 if ($depthMode -ne 'none') {
+                    if ($depthTokens -notmatch '^[1-9][0-9]*$') { $depthTokens = '6144' }
                     $depthTokens = Read-IntegerValue -Label '已有上下文 token 数 / Existing context tokens' -Default $depthTokens -Minimum 1
                 } else {
                     $depthTokens = '0'
@@ -3400,6 +3333,10 @@ if ($launchMode -ne 'benchmark' -and -not [string]::IsNullOrWhiteSpace($context)
 
 if ($setupMode -eq 'conservative' -or $setupMode -eq 'aggressive') {
     Add-SetArgument $nativeArgs 'device.auto_profile' $setupMode
+    # Also migrate direct reuse of older automatic settings; the engine owns format support.
+    $kvPreset = 'auto'
+    $kvTypeK = ''
+    $kvTypeV = ''
 }
 
 if ($kvPreset -ne 'auto') {
@@ -3547,6 +3484,9 @@ $state = [ordered]@{
     benchmark_upload_has_github = $script:BenchmarkUploadHasGithubDefault
     benchmark_upload_gh_auth = $script:BenchmarkUploadGhAuthDefault
     benchmark_upload_fallback = $script:BenchmarkUploadFallbackDefault
+    submission_browser_action = $script:SubmissionBrowserActionDefault
+    submission_failure_action = $script:SubmissionFailureActionDefault
+    submission_pending_retry = $script:SubmissionPendingRetryDefault
     error_upload = $script:ErrorUploadDefault
     think_mode = $thinkMode; configure_thinking = $configureThinking
     max_new = $maxNew; configure_sampling = $configureSampling
@@ -3660,7 +3600,6 @@ if ($launchMode -eq 'benchmark' -and $benchKind -ne 'manual') {
 }
 $benchmarkUploadRequested = $false
 if ($benchmarkResultPath) {
-    Start-SubmissionConnectivityProbe
     $benchmarkUploadRequested = Read-BenchmarkUploadConsent
 }
 if ($benchmarkResultPath) {

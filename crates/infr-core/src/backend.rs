@@ -659,6 +659,13 @@ pub trait Backend: Send + Sync {
             "segmented KV release is not supported by this backend",
         ))
     }
+    /// Return only unused tail segments, keeping the prefix and frozen physical layout stable.
+    /// Unlike release, this is a capacity trim, not a session-spill operation.
+    fn trim_segmented_kv(&self, _buffer: &dyn Buffer, _keep: usize) -> Result<()> {
+        Err(crate::error::Error::backend(
+            "segmented KV trimming is not supported by this backend",
+        ))
+    }
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()>;
     fn download(&self, src: &dyn Buffer, dst: &mut [u8]) -> Result<()>;
     /// Emit the one-shot KV-cache placement summary for a VRAM-first spill backend (the Vulkan
@@ -743,6 +750,28 @@ pub trait Backend: Send + Sync {
             self.copy_buffer(src, dst, bytes)?;
         }
         Ok(())
+    }
+
+    /// Copy materialized KV elements, including their quantization metadata. The default uses
+    /// contiguous storage; backends with planar or segmented caches own the physical layout.
+    fn copy_kv_prefixes(
+        &self,
+        copies: &[(&dyn Buffer, &dyn Buffer, crate::tensor::DType, usize)],
+    ) -> Result<()> {
+        let ranges = copies
+            .iter()
+            .map(|&(src, dst, dtype, elements)| {
+                let (block_elements, block_bytes) = crate::decode_spec::block_layout(dtype);
+                if !elements.is_multiple_of(block_elements) {
+                    return Err(Error::backend("unaligned KV prefix format"));
+                }
+                let bytes = (elements / block_elements)
+                    .checked_mul(block_bytes)
+                    .ok_or_else(|| Error::backend("KV prefix size overflow"))?;
+                Ok((src, 0, dst, 0, bytes))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.copy_buffer_ranges(&ranges)
     }
 
     /// Copy several arbitrary buffer ranges as one logical batch. The default is a bounded host
@@ -1081,6 +1110,46 @@ mod tests {
             &dst_b.0.lock().unwrap()[..10],
             &[16, 17, 18, 19, 20, 21, 22, 23, 0xBB, 0xBB]
         );
+    }
+
+    #[test]
+    fn kv_prefix_copy_default_respects_dtype_and_bounds() {
+        use crate::tensor::DType;
+        let be = MockBackend {
+            last_download_len: std::sync::Mutex::new(0),
+        };
+        let src = MockBuffer(std::sync::Mutex::new((0u8..64).collect()));
+        for (dtype, elements, bytes) in [
+            (DType::F16, 12, 24),
+            (DType::F32, 9, 36),
+            (DType::Q8_0, 32, 34),
+            (DType::Bf16, 12, 24),
+            (DType::Q4_0, 32, 18),
+            (DType::Q4_1, 32, 20),
+            (DType::Q5_0, 32, 22),
+            (DType::Q5_1, 32, 24),
+            (DType::Iq4Nl, 32, 18),
+            (DType::Turbo2, 128, 34),
+        ] {
+            let dst = MockBuffer(std::sync::Mutex::new(vec![0xaa; 64]));
+            be.copy_kv_prefixes(&[(&src, &dst, dtype, elements)])
+                .unwrap();
+            let out = dst.0.lock().unwrap();
+            assert_eq!(&out[..bytes], &src.0.lock().unwrap()[..bytes]);
+            assert!(out[bytes..].iter().all(|&value| value == 0xaa));
+        }
+        let dst = MockBuffer(std::sync::Mutex::new(vec![0xaa; 64]));
+        assert!(be
+            .copy_kv_prefixes(&[(&src, &dst, DType::Q8_0, 31)])
+            .is_err());
+        assert!(be
+            .copy_kv_prefixes(&[(&src, &dst, DType::F16, 33)])
+            .is_err());
+        assert!(be
+            .copy_kv_prefixes(&[(&src, &dst, DType::F32, usize::MAX)])
+            .is_err());
+        be.copy_kv_prefixes(&[(&src, &dst, DType::F16, 0)]).unwrap();
+        assert!(dst.0.lock().unwrap().iter().all(|&value| value == 0xaa));
     }
 
     #[test]

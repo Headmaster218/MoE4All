@@ -137,5 +137,12 @@ class ClassificationTests(unittest.TestCase):
         self.write("error-database/v1/2026-10/bad name.m4e", "bad")
         with self.assertRaises(ValueError): self.classifier.classify(code_commit, self.commit(), self.root)
 
+    def test_generated_index_cannot_be_submitted_or_bundled_with_a_report(self):
+        self.write("benchmark-database/index/v1/manifest.json", "{}")
+        generated = self.commit()
+        with self.assertRaises(ValueError): self.classifier.classify(self.base, generated, self.root)
+        self.write("benchmark-database/v1/2026-10/fixture.m4b", "fixture")
+        with self.assertRaises(ValueError): self.classifier.classify(self.base, self.commit(), self.root)
+
 
 if __name__ == "__main__": unittest.main()
