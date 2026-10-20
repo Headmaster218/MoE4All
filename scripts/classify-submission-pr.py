@@ -13,6 +13,8 @@ def classify(base: str, head: str, cwd=None) -> dict:
     if len(fields) % 2:
         raise ValueError("malformed Git diff")
     changes = list(zip(fields[::2], fields[1::2]))
+    if any(path.startswith(b"benchmark-database/index/v1/") for _, path in changes):
+        raise ValueError("compact indexes are generated only by trusted main CI, never by report PRs")
     touched = any(path.startswith((b"benchmark-database/v1/", b"error-database/v1/")) for _, path in changes)
     result = {"submission_only": "false", "submission_kind": "", "submission_path": ""}
     if len(changes) == 1 and changes[0][0] == b"A":
