@@ -49,7 +49,7 @@ jobs:
             git fetch origin main
             tree="$RUNNER_TEMP/benchmark-index-$attempt"
             git worktree add --detach "$tree" origin/main
-            node scripts/publish-benchmark-index.mjs --source "$tree" --repository "$GITHUB_REPOSITORY" --python python3
+            node "$tree/scripts/publish-benchmark-index.mjs" --source "$tree" --repository "$GITHUB_REPOSITORY" --python python3
             if git -C "$tree" push origin HEAD:main; then
               git worktree remove "$tree"
               exit 0

@@ -14,6 +14,12 @@ import { decodeIndex, indexRows, validateManifest } from './leaderboard/model.mj
 const scripts = path.dirname(fileURLToPath(import.meta.url));
 const python = process.env.MOE4ALL_PYTHON || 'python3';
 const digest = data => createHash('sha256').update(data).digest('hex');
+
+test('publication retries execute the generator from the same trusted main tree as its inputs', async () => {
+  const workflow = await fs.readFile(path.join(scripts, '../.github/workflows/benchmark-index.yml'), 'utf8');
+  assert.match(workflow, /node "\$tree\/scripts\/publish-benchmark-index\.mjs" --source "\$tree"/);
+  assert.doesNotMatch(workflow, /--force|pull_request_target/);
+});
 const git = (root, ...args) => execFileSync('git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', ...args], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 async function fixture(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'benchmark-index-'));
