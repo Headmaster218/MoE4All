@@ -106,6 +106,25 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual(historical(current, rows(current)[0], refs)[0], 1)
         self.assertEqual(historical(current, measured_row(current), refs)[0], 2)
 
+    def test_relaxed_hardware_never_combines_different_gpus(self):
+        current = fixture()
+        refs = []
+        for identity, name, vram, speed in (("a", "NVIDIA RTX 4090", 24, 20), ("b", "NVIDIA RTX 4090", 24, 40), ("c", "NVIDIA RTX 4070", 12, 1000)):
+            p = fixture(identity)
+            p['hardware']['gpu'].update(name=name, vram_total_bytes=vram * GIB)
+            p['contexts'][0]['decode'][0]['overall_tokens_per_second'] = speed
+            refs.append(entry(p))
+        result = comparison(current, measured_row(current), refs)
+        self.assertEqual(result['level'], 4)
+        self.assertEqual(result['reference'], 30)
+        self.assertEqual(len(result['matches']), 2)
+        for p in refs[:2]:
+            p['payload']['hardware']['gpu']['name'] = 'AMD Radeon RX 7900 XT'
+        refs[2]['payload']['hardware']['gpu'].update(name='AMD Radeon RX 7900 GRE', vram_total_bytes=24 * GIB)
+        result = comparison(current, measured_row(current), refs)
+        self.assertEqual(result['level'], 3)
+        self.assertEqual(result['reference'], 30)
+
     def test_wrong_context_or_parallel_is_not_a_reference(self):
         current = fixture()
         wrong_context = fixture("context")

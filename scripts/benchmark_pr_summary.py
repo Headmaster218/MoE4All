@@ -171,6 +171,25 @@ def historical(current, row, entries):
             groups[level].append({**entry, "rate": match["rate"]})
     for level, matches in groups.items():
         if matches:
+            if level >= 3:
+                # Relaxing hardware must not turn different GPUs into one average.
+                hardware_groups = {}
+                for match in matches:
+                    gpu, _ = hardware(match['payload'])
+                    key = (normal(gpu.get('name')), capacity(gpu.get('vram_total_bytes')),
+                           normal((match['payload']['hardware'].get('cpu') or {}).get('name')) if not gpu.get('name') else '')
+                    hardware_groups.setdefault(key, []).append(match)
+                gpu, ram = hardware(current)
+                target_vram, target_ram = capacity(gpu.get('vram_total_bytes')), capacity(ram.get('total_bytes'))
+
+                def closeness(item):
+                    key, candidates = item
+                    vram_gap = abs(key[1] - target_vram) if key[1] is not None and target_vram is not None else math.inf
+                    ram_sizes = [capacity(hardware(e['payload'])[1].get('total_bytes')) for e in candidates]
+                    ram_gap = min((abs(value - target_ram) for value in ram_sizes if value is not None and target_ram is not None), default=math.inf)
+                    return vram_gap, ram_gap, -len(candidates), str(key)
+
+                matches = min(hardware_groups.items(), key=closeness)[1]
             return level, sorted(matches, key=lambda e: e["payload"]["id"])
     return None, []
 
@@ -258,7 +277,7 @@ def render_summary(payload, entries, repository, baseline, head, report_path, ro
             links.append(f"[{i}](https://github.com/{repository}/blob/{baseline}/benchmark-database/v1/{month}/{name}.m4b)")
         reference = rate(result['reference'])
         match_label = f"{labels[level]}，{len(matches)}份 {' '.join(links)}" if matches else "无匹配记录"
-        if level == 4:
+        if level in (3, 4):
             names = sorted({f"{hardware(e['payload'])[0].get('name') or '未知GPU'}/{size(hardware(e['payload'])[0].get('vram_total_bytes'))}/{size(hardware(e['payload'])[1].get('total_bytes'))} RAM" for e in matches})
             match_label += "；" + cell("、".join(names), 180)
         delta = f"{result['delta']:+.1f}%" if result['delta'] is not None else "—"
