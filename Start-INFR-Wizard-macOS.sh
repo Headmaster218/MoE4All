@@ -1666,12 +1666,18 @@ build_command() {
 }
 
 version_valid() { [[ $1 =~ $RE_VERSION ]]; }
+installed_version_valid() {
+    local core=${1%%[-+]*} suffix pattern='^(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+    version_valid "$core" || return 1
+    suffix=${1#"$core"}
+    [[ $suffix =~ $pattern ]]
+}
 version_newer() {
-    version_valid "$1" && version_valid "$2" || return 1
-    local -a a b; local i
-    IFS=. read -rA a <<< "$1"; IFS=. read -rA b <<< "$2"
+    version_valid "$1" && installed_version_valid "$2" || return 1
+    local -a a b; local i core=${2%%[-+]*} without_build=${2%%+*}
+    IFS=. read -rA a <<< "$1"; IFS=. read -rA b <<< "$core"
     for i in 0 1 2; do ((a[i]>b[i])) && return 0; ((a[i]<b[i])) && return 1; done
-    return 1
+    [[ $without_build == *-* ]]
 }
 managed() {
     [[ -n $1 && $1 != /* && $1 != */ && $1 != *//* && $1 != *\\* && ! $1 =~ [[:cntrl:]] ]] || return 1
@@ -1868,7 +1874,7 @@ check_updates() (
     local mode=$1 current temp
     if ! need curl; then printf '更新检查不可用，继续离线启动。Update check unavailable; continuing offline.\n'; return; fi
     current=$("$BINARY" --version) || return 0; current=${current##* }
-    version_valid "$current" || return 0
+    installed_version_valid "$current" || return 0
     mkdir -p -- "$CONFIG_DIR"
     temp=$(mktemp -d "$CONFIG_DIR/.update-check.XXXXXX"); trap 'rm -rf -- "$temp"' EXIT
     if ! fetch_url 'https://api.github.com/repos/Headmaster218/MoE4All/releases?per_page=100' "$temp/releases.json" 8388608 10 || ! json_load "$temp/releases.json" || ! select_release; then

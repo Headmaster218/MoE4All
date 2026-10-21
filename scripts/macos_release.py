@@ -6,10 +6,11 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
-import re
 import shutil
 import tarfile
 import tempfile
+
+from release_ci import validate_version
 
 
 PLATFORM = "macOS-arm64"
@@ -27,15 +28,8 @@ ROOT_FILES = {
 DOC_SUFFIXES = {".md", ".png", ".jpg", ".svg", ".webp"}
 
 
-def version_key(version):
-    match = re.fullmatch(r"(?:v|release-)?(\d+)\.(\d+)\.(\d+)", version)
-    if not match:
-        raise ValueError("Expected a stable engine version: " + version)
-    return tuple(map(int, match.groups()))
-
-
 def package_name(version):
-    version_key(version)
+    validate_version(version)
     return f"MoE4All-{PLATFORM}-v{version}"
 
 

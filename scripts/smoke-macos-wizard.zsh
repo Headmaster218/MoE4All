@@ -96,6 +96,12 @@ python3 "$repo/scripts/macos_release.py" --root "$repo" --binary "$work/infr-new
 python3 "$repo/scripts/macos_release.py" --root "$repo" --binary "$work/infr-bad" --output "$bad_out" --version 1.0.2 >/dev/null
 
 MOE4ALL_WIZARD_LIBRARY=1 source "$repo/Start-INFR-Wizard-macOS.sh"
+for version in 1.1.0 1.1.0-beta.1 1.1.0-rc.2 1.1.0+build.7; do installed_version_valid "$version" || fail 'Invalid installed version'; done
+version_newer 1.1.0 1.1.0-beta.1 || fail 'Stable did not supersede beta'
+version_newer 1.1.1 1.1.0-beta.1 || fail 'Higher stable did not supersede beta'
+if version_valid 1.1.0-beta.1 || installed_version_valid '1.1.0-beta/1' || version_newer 1.0.3 1.1.0-beta.1 || version_newer 1.1.0 1.1.0 || version_newer 1.1.0 1.1.0+build.7 || version_newer 1.1.0 1.1.0+build-with-hyphen || version_newer 1.1.0-beta.2 1.1.0-beta.1; then
+    fail 'Prerelease support changed stable-only update selection or allowed a downgrade'
+fi
 BINARY="$root/infr"
 ROOT="$root"
 

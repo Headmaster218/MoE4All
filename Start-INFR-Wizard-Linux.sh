@@ -1878,12 +1878,18 @@ build_command() {
 }
 
 version_valid() { [[ $1 =~ ^(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})$ ]]; }
+installed_version_valid() {
+    local core=${1%%[-+]*} suffix pattern='^(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+    version_valid "$core" || return 1
+    suffix=${1#"$core"}
+    [[ $suffix =~ $pattern ]]
+}
 version_newer() {
-    version_valid "$1" && version_valid "$2" || return 1
-    local -a a b; local i
-    IFS=. read -r -a a <<< "$1"; IFS=. read -r -a b <<< "$2"
+    version_valid "$1" && installed_version_valid "$2" || return 1
+    local -a a b; local i core=${2%%[-+]*} without_build=${2%%+*}
+    IFS=. read -r -a a <<< "$1"; IFS=. read -r -a b <<< "$core"
     for i in 0 1 2; do ((a[i]>b[i])) && return 0; ((a[i]<b[i])) && return 1; done
-    return 1
+    [[ $without_build == *-* ]]
 }
 managed() {
     [[ -n $1 && $1 != /* && $1 != *\\* && ! $1 =~ (^|/)(\.|\.\.|)(/|$) && ! $1 =~ [[:cntrl:]] ]] || return 1
@@ -2070,7 +2076,7 @@ check_updates() (
     local mode=$1 current temp
     if ! need curl; then printf '更新检查不可用，继续离线启动。Update check unavailable; continuing offline.\n'; return; fi
     current=$("$BINARY" --version) || return 0; current=${current##* }
-    version_valid "$current" || return 0
+    installed_version_valid "$current" || return 0
     temp=$(mktemp -d); trap 'rm -rf -- "$temp"' EXIT
     if ! fetch_url 'https://api.github.com/repos/Headmaster218/MoE4All/releases?per_page=100' "$temp/releases.json" 8388608 10 || ! json_load "$temp/releases.json" || ! select_release; then
         printf '更新检查不可用，继续离线启动。Update check unavailable; continuing offline.\n'; return 0
