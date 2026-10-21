@@ -13,6 +13,8 @@ import tarfile
 import tempfile
 import urllib.request
 
+from release_ci import validate_version
+
 API = "https://api.github.com/repos/Headmaster218/MoE4All/releases?per_page=100"
 PLATFORM = "Linux-x86_64"
 ROOT_FILES = {
@@ -33,7 +35,7 @@ def version_key(version):
 
 
 def package_name(version):
-    version_key(version)
+    validate_version(version)
     return "MoE4All-{}-v{}".format(PLATFORM, version)
 
 
