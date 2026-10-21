@@ -32,6 +32,16 @@ reject() { if "$@" > "$tmp/reject.log" 2>&1; then printf 'Unexpected success: %s
 reset() { defaults; S[model]="$ROOT/model with spaces.gguf"; }
 
 bash -n "$repo/Start-INFR-Wizard-Linux.sh"; pass
+for version in 1.1.0 1.1.0-beta.1 1.1.0-rc.2 1.1.0+build.7; do installed_version_valid "$version"; pass; done
+version_newer 1.1.0 1.1.0-beta.1; pass
+version_newer 1.1.1 1.1.0-beta.1; pass
+reject version_valid 1.1.0-beta.1
+reject installed_version_valid '1.1.0-beta/1'
+reject version_newer 1.0.3 1.1.0-beta.1
+reject version_newer 1.1.0 1.1.0
+reject version_newer 1.1.0 1.1.0+build.7
+reject version_newer 1.1.0 1.1.0+build-with-hyphen
+reject version_newer 1.1.0-beta.2 1.1.0-beta.1
 for file in image-codecs/libheif.so.1 image-codecs/libde265.so.0 image-codecs/libdav1d.so.7 image-codecs/SOURCES.txt; do
     managed "$file"; pass
 done
