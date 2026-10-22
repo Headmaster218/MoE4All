@@ -16,6 +16,31 @@ fn main() {
     gen_grids(&out);
     // (source stem, output stem, extra glslc defines)
     let builds: &[(&str, &str, &[&str])] = &[
+        (
+            "native_gemm_mmq_iq4_nl",
+            "native_gemm_mmq_iq4_nl_pair_xp",
+            &["-DIQ4_PAIR_LUT", "-DEXPERT_GRID"],
+        ),
+        (
+            "native_gemm_mmq_iq4_nl",
+            "native_gemm_mmq_iq4_nl_pair_xp32",
+            &["-DIQ4_PAIR_LUT", "-DEXPERT_GRID", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_iq4_nl",
+            "native_gemm_mmq_iq4_nl_pair_xpg",
+            &["-DIQ4_PAIR_LUT", "-DEXPERT_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemm_mmq_iq4_nl",
+            "native_gemm_mmq_iq4_nl_pair_xpg32",
+            &[
+                "-DIQ4_PAIR_LUT",
+                "-DEXPERT_GRID",
+                "-DPAGED",
+                "-DBM_TILE=32u",
+            ],
+        ),
         ("gemm_coopmat_tiled", "gemm_coopmat_tiled", &[]),
         ("gemm_warp", "gemm_warp", &[]),
         ("quant_q8", "quant_q8", &[]),

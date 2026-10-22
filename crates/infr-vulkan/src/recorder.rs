@@ -430,6 +430,44 @@ fn splitk_reduce_extents(m: usize, n: usize) -> (usize, usize) {
 /// A batched-MoE expert-GEMM kernel variant: `(kernel name, SPIR-V)`.
 type MmqKern = (&'static str, &'static [u32]);
 
+fn iq4_pair_lut_applies(
+    enabled: bool,
+    measured_device: bool,
+    dtype: infr_core::DType,
+    k: usize,
+    n: usize,
+) -> bool {
+    enabled && measured_device && dtype == infr_core::DType::Iq4Nl && k == 640 && n == 2560
+}
+
+#[cfg(test)]
+#[test]
+fn iq4_pair_lut_keeps_unmeasured_devices_and_shapes_on_fallback() {
+    use infr_core::DType::*;
+    for dtype in [
+        Iq4Nl, Iq4Xs, Iq2S, Iq2Xs, Iq3S, Iq3Xxs, Q2K, Q3K, Q4K, Q5K, Q6K, Q8_0,
+    ] {
+        for (k, n) in [
+            (640, 2560),
+            (2560, 640),
+            (512, 2048),
+            (1024, 3072),
+            (32, 64),
+            (640, 512),
+        ] {
+            for enabled in [false, true] {
+                for measured in [false, true] {
+                    let expected = enabled && measured && dtype == Iq4Nl && (k, n) == (640, 2560);
+                    assert_eq!(
+                        iq4_pair_lut_applies(enabled, measured, dtype, k, n),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// ONE dtype-keyed source of truth for batched-MoE expert-GEMM kernel selection, driving BOTH the
 /// resident (`_xp`) dispatch in [`Recorder::matmul_mmq_experts`] and the paged (`_xpg`) one in
 /// [`Recorder::matmul_mmq_experts_paged`]. Each previously carried its own ~180-line dtype→kernel
@@ -12696,6 +12734,17 @@ impl<'a> Recorder<'a> {
             desc.xp
         };
         let nb = desc.resident_nb;
+        let (name, spv) = if iq4_pair_lut_applies(
+            self.vk().iq4_pair_lut,
+            self.be.prefers_iq4_pair_lut(),
+            dtype,
+            k,
+            n,
+        ) {
+            crate::gemm::iq4_pair_lut_kernel(small_tile, false)
+        } else {
+            (name, spv)
+        };
         let kern = self.be.kernel(name, spv, nb, 24);
         let mut push = [0u8; 24];
         let stride_bytes = expert_stride_bytes(dtype, stride);
@@ -12776,6 +12825,17 @@ impl<'a> Recorder<'a> {
             )
         });
         let (name, spv) = if small_tile { desc.xpg32 } else { desc.xpg };
+        let (name, spv) = if iq4_pair_lut_applies(
+            self.vk().iq4_pair_lut,
+            self.be.prefers_iq4_pair_lut(),
+            dtype,
+            k,
+            n,
+        ) {
+            crate::gemm::iq4_pair_lut_kernel(small_tile, true)
+        } else {
+            (name, spv)
+        };
         let nb = desc.resident_nb + 1;
         let kern = self.be.kernel(name, spv, nb, 28);
         let mut push = [0u8; 28];

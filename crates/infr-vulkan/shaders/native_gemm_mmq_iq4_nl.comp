@@ -78,6 +78,10 @@ layout(binding = 3) writeonly buffer CB { float c[]; };         // [m, n]
 shared uint As[BM * SP];
 shared uint Bs[BN * SP];
 shared float Bdl[BN];
+#ifdef IQ4_PAIR_LUT
+// Opt-in K04 prototype: 256 pairs of signed int8 bytes, stored in uints (1 KiB LDS).
+shared uint iq4_pairs[256];
+#endif
 
 #if defined(PAGED) || defined(STREAMED)
 // Arena read via 64-bit device address (see native_weight_addr.glsl): `w_addr` (set in main) is
@@ -134,6 +138,16 @@ void main() {
     uint tr = li / (BN / TN);
     uint tc = li % (BN / TN);
 
+#ifdef IQ4_PAIR_LUT
+    // After the uniform empty-expert exit, before any live-row masking. BM=32/64 uses
+    // 128/256 threads, so each invocation initializes two/one entries. No subgroup assumption.
+    for (uint pair = li; pair < 256u; pair += THREADS) {
+        iq4_pairs[pair] = (uint(kv_iq4nl(pair & 15u)) & 255u)
+                       | ((uint(kv_iq4nl(pair >> 4u)) & 255u) << 8u);
+    }
+    barrier();
+#endif
+
     float acc[TM][TN];
     [[unroll]] for (uint i = 0u; i < TM; i++)
         [[unroll]] for (uint j = 0u; j < TN; j++) acc[i][j] = 0.0;
@@ -173,12 +187,23 @@ void main() {
             uint p = idx % WPB;
             uint gelem = wbase + (wgCol + cc) * pc.k + blk * BLK;
             uint bd = (gelem / 32u) * 18u;
+#ifdef IQ4_PAIR_LUT
+            // IQ4_NL stores elements 0..15 in low nibbles, 16..31 in high nibbles.
+            // Keep rb() addressing (including 18-byte block alignment) for SSBO/BDA alike.
+            uint qb = bd + 2u + (p & 3u) * 4u;
+            uint qs = ru16(qb) | (ru16(qb + 2u) << 16u);
+            uint pairs = (qs >> ((p >> 2u) * 4u)) & 0x0F0F0F0Fu;
+            pairs |= pairs >> 4u;
+            uint packed = iq4_pairs[pairs & 255u]
+                        | (iq4_pairs[(pairs >> 16u) & 255u] << 16u);
+#else
             uint packed = 0u;
             [[unroll]] for (uint b = 0u; b < 4u; b++) {
                 uint j = p * 4u + b;
                 uint idx4 = (j < 16u) ? (rb(bd + 2u + j) & 0xFu) : (rb(bd + 2u + j - 16u) >> 4u);
                 packed |= (uint(kv_iq4nl(idx4)) & 0xFFu) << (b * 8u);
             }
+#endif
             Bs[cc * SP + p] = packed;
         }
         barrier();

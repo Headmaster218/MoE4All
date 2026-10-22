@@ -3019,6 +3019,12 @@ impl VulkanBackend {
         cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
     }
 
+    /// IQ4_NL pair-table MMQ was measured on Windows/Navi 31; other architectures keep the
+    /// scalar codebook kernel until their occupancy and initialization costs are validated.
+    pub(crate) fn prefers_iq4_pair_lut(&self) -> bool {
+        cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+    }
+
     /// The hd256/Q8/GQA4 replay layout measured on Windows/Navi 31. Its register/LDS tradeoff is
     /// device-sensitive, so unmeasured drivers and architectures
     /// retain the established per-query-head replay kernel even when the feature knobs are enabled.

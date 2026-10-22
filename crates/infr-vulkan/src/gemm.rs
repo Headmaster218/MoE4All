@@ -3078,6 +3078,28 @@ pub(crate) fn native_gemm_mmq_q4_1_xpg32_spv() -> &'static [u32] {
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn iq4_pair_lut_kernel(small: bool, paged: bool) -> (&'static str, &'static [u32]) {
+    macro_rules! variant {
+        ($name:literal) => {{
+            static SPV: OnceLock<Vec<u32>> = OnceLock::new();
+            (
+                $name,
+                SPV.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            )
+        }};
+    }
+    match (small, paged) {
+        (false, false) => variant!("native_gemm_mmq_iq4_nl_pair_xp"),
+        (true, false) => variant!("native_gemm_mmq_iq4_nl_pair_xp32"),
+        (false, true) => variant!("native_gemm_mmq_iq4_nl_pair_xpg"),
+        (true, true) => variant!("native_gemm_mmq_iq4_nl_pair_xpg32"),
+    }
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_iq4_nl_xpg_spv() -> &'static [u32] {
     const BYTES: &[u8] =
         include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq4_nl_xpg.spv"));
