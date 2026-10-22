@@ -22,41 +22,54 @@ layout(binding = 1) writeonly buffer PB { float part[]; };
 #endif
 shared float sval[256];
 shared uint sidx[256];
+shared uint sbad[256];
 void main() {
     uint t = gl_LocalInvocationID.x;
     float best = -1e30;
     uint bi = 0u;
+    uint bad = 0u;
 #ifdef PASS2
     if (t < pc.n) {
         best = part[t];
         bi = floatBitsToUint(part[pc.n + t]);
+        bad = uint(bi == 0xFFFFFFFFu);
     }
 #else
     uint chunk = (pc.n + 255u) / 256u;
     uint lo = gl_WorkGroupID.x * chunk;
     uint hi = min(lo + chunk, pc.n);
     for (uint i = lo + t; i < hi; i += 256u) {
+        float v = logits[pc.off + i];
+        if (isnan(v) || isinf(v)) {
+            bad = 1u;
+            continue;
+        }
         // ascending scan + strict > keeps the lowest index within this thread's stride
-        if (logits[pc.off + i] > best) { best = logits[pc.off + i]; bi = i; }
+        if (v > best) { best = v; bi = i; }
     }
 #endif
     sval[t] = best;
     sidx[t] = bi;
+    sbad[t] = bad;
     barrier();
     for (uint s = 128u; s > 0u; s /= 2u) {
-        if (t < s
-            && (sval[t + s] > sval[t] || (sval[t + s] == sval[t] && sidx[t + s] < sidx[t]))) {
-            sval[t] = sval[t + s];
-            sidx[t] = sidx[t + s];
+        if (t < s) {
+            sbad[t] |= sbad[t + s];
+            if (sval[t + s] > sval[t] ||
+                (sval[t + s] == sval[t] && sidx[t + s] < sidx[t])) {
+                sval[t] = sval[t + s];
+                sidx[t] = sidx[t + s];
+            }
         }
         barrier();
     }
     if (t == 0u) {
 #ifdef PASS2
-        out_id[pc.off] = sidx[0];
+        out_id[pc.off] = (sbad[0] != 0u) ? 0xFFFFFFFFu : sidx[0];
 #else
         part[gl_WorkGroupID.x] = sval[0];
-        part[256u + gl_WorkGroupID.x] = uintBitsToFloat(sidx[0]);
+        part[256u + gl_WorkGroupID.x] =
+            uintBitsToFloat((sbad[0] != 0u) ? 0xFFFFFFFFu : sidx[0]);
 #endif
     }
 }

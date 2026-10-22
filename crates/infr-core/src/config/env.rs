@@ -27,6 +27,14 @@ use crate::{DType, SizeSpec};
 /// `Some("")` — "set to the empty string" is DISTINCT from "unset" for every presence knob.
 pub type Get<'a> = &'a dyn Fn(&str) -> Option<String>;
 
+/// Resolve the diagnostic bootstrap path before runtime configuration can fail.
+/// An OS-string reader preserves non-Unicode paths without changing process state in tests.
+pub fn diagnostic_directory(get: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    get("INFR_DIAGNOSTIC_DIR")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
 // ── per-grammar readers ──────────────────────────────────────────────────────
 
 /// `presence`: set to anything (including empty) ⇒ the feature is ON.

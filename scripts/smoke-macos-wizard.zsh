@@ -25,6 +25,8 @@ EOF
 /bin/zsh -n "$repo/Start-INFR-Wizard-macOS.sh"
 python3 -c 'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))' "$repo/scripts/macos_release.py"
 grep -Fq "trap 'launcher_exit \$?' EXIT" "$repo/Start-INFR-Wizard-macOS.sh"
+grep -Fq '1024 tokens Decode' "$repo/Start-INFR-Wizard-macOS.sh"
+grep -Fq 'Metal keeps the manual benchmark.' "$repo/Start-INFR-Wizard-macOS.sh"
 
 root="$work/root"
 home="$work/home"
@@ -38,6 +40,14 @@ assert_contains "$output" '--dev metal'
 assert_contains "$output" 'device.auto_profile=aggressive'
 assert_contains "$output" 'device.ram_budget=48GiB'
 assert_contains "$output" "$root/model.gguf"
+[[ $output != *kv.type_k=* && $output != *kv.type_v=* ]] || fail 'Automatic profile forced a KV format'
+for side in k v; do
+    output=$(HOME="$home" /bin/zsh "$repo/Start-INFR-Wizard-macOS.sh" \
+        --root "$root" --dry-run --mode run --model model.gguf --profile aggressive "--kv-$side" f16)
+    assert_contains "$output" "kv.type_$side=f16"
+    other=k; [[ $side != k ]] || other=v
+    [[ $output != *kv.type_$other=* ]] || fail 'An explicit KV side forced the other side'
+done
 
 output=$(HOME="$home" /bin/zsh "$repo/Start-INFR-Wizard-macOS.sh" \
     --root "$root" --dry-run --mode serve --model model.gguf --profile conservative \
@@ -86,6 +96,135 @@ python3 "$repo/scripts/macos_release.py" --root "$repo" --binary "$work/infr-new
 python3 "$repo/scripts/macos_release.py" --root "$repo" --binary "$work/infr-bad" --output "$bad_out" --version 1.0.2 >/dev/null
 
 MOE4ALL_WIZARD_LIBRARY=1 source "$repo/Start-INFR-Wizard-macOS.sh"
+for version in 1.1.0 1.1.0-beta.1 1.1.0-rc.2 1.1.0+build.7; do installed_version_valid "$version" || fail 'Invalid installed version'; done
+version_newer 1.1.0 1.1.0-beta.1 || fail 'Stable did not supersede beta'
+version_newer 1.1.1 1.1.0-beta.1 || fail 'Higher stable did not supersede beta'
+if version_valid 1.1.0-beta.1 || installed_version_valid '1.1.0-beta/1' || version_newer 1.0.3 1.1.0-beta.1 || version_newer 1.1.0 1.1.0 || version_newer 1.1.0 1.1.0+build.7 || version_newer 1.1.0 1.1.0+build-with-hyphen || version_newer 1.1.0-beta.2 1.1.0-beta.1; then
+    fail 'Prerelease support changed stable-only update selection or allowed a downgrade'
+fi
+BINARY="$root/infr"
+ROOT="$root"
+
+for profile in conservative aggressive; do
+    for mode in run serve bench; do
+        defaults; S[model]="$root/model.gguf"; S[device]=metal; S[setup_mode]=$profile; S[launch_mode]=$mode
+        S[kv_preset]=q8; S[kv_type_k]=q8_0; S[kv_type_v]=q8_0
+        build_command
+        [[ ${S[kv_preset]} == auto && -z ${S[kv_type_k]} && -z ${S[kv_type_v]} ]] || fail 'Saved automatic Q8 was not migrated'
+        for argument in "${COMMAND[@]}"; do
+            [[ $argument != kv.type_k=* && $argument != kv.type_v=* ]] || fail 'Saved automatic Q8 leaked into the command'
+        done
+    done
+done
+for preset in q8 f16 custom auto; do
+    defaults; S[model]="$root/model.gguf"; S[device]=metal; S[setup_mode]=manual; S[kv_preset]=$preset
+    S[kv_type_k]=q8_0; S[kv_type_v]=f16
+    build_command
+    if [[ $preset == auto ]]; then
+        [[ ${COMMAND[*]} != *kv.type_k=* && ${COMMAND[*]} != *kv.type_v=* ]] || fail 'Manual engine-default passed stale values'
+    else
+        assert_contains "${COMMAND[*]}" 'kv.type_k=q8_0'
+        assert_contains "${COMMAND[*]}" 'kv.type_v=f16'
+    fi
+done
+
+# The submission client uses only tools included with macOS. Exercise the
+# browser-confirmed relay with local fixtures and verify that the private token
+# is kept outside the public report tree.
+submission_root="$work/submission-root"
+submission_home="$work/submission-home"
+submission_bin="$work/submission-bin"
+mkdir -p -- "$submission_root/diagnostics/reports/v1/2026-10" "$submission_home" "$submission_bin"
+report_id=20261019T010203.004Z-00112233445566778899aabbccddeeff
+report_path="$submission_root/diagnostics/reports/v1/2026-10/$report_id.m4e"
+printf 'MOE4ALL-SUBMISSION/1\nkind: error\nid: %s\n' "$report_id" > "$report_path"
+file_sha256 "$report_path"; fixture_hash=$REPLY
+cat > "$submission_bin/infr" <<'ENGINE'
+#!/bin/zsh
+if [[ ${1-} == submission && ${2-} == verify ]]; then
+    exit 0
+fi
+if [[ ${1-} == submission && ${2-} == pack-benchmark ]]; then
+    shift 2
+    result_dir=''
+    while (($#)); do
+        case $1 in
+            --result-dir) result_dir=$2; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    report_path="$result_dir/v1/2026-10/manual-fixture.m4b"
+    mkdir -p -- "${report_path:h}"
+    printf 'MOE4ALL-SUBMISSION/1\nkind: benchmark\nid: manual-fixture\n' > "$report_path"
+    printf 'MOE4ALL_SUBMISSION_PATH=%s\n' "$report_path"
+    exit 0
+fi
+exit 1
+ENGINE
+cat > "$submission_bin/open" <<'OPEN'
+#!/bin/zsh
+exit 0
+OPEN
+cat > "$submission_bin/curl" <<'CURL'
+#!/bin/zsh
+emulate -LR zsh
+setopt KSH_ARRAYS
+output='' url='' method=GET
+while (($#)); do
+    case $1 in
+        --output) output=$2; shift 2 ;;
+        --request) method=$2; shift 2 ;;
+        --write-out|--header|--data-binary|--connect-timeout|--max-time) shift 2 ;;
+        --silent|--show-error) shift ;;
+        *) url=$1; shift ;;
+    esac
+done
+if [[ $url == */upload-sessions && $method == POST ]]; then
+    printf '{"api_version":1,"state":"awaiting_verification","session_id":"us_fixture","session_token":"st_fixture","verification_url":"http://127.0.0.1:18765/community/upload.html#session=fixture","max_upload_bytes":131072}' > "$output"
+    printf 201
+elif [[ $url == */upload-sessions/us_fixture && $method == GET ]]; then
+    printf '{"api_version":1,"state":"ready","kind":"error","report_id":"%s","file_sha256":"%s","size_bytes":%s}' "$FIXTURE_REPORT_ID" "$FIXTURE_HASH" "$FIXTURE_SIZE" > "$output"
+    printf 200
+else
+    printf '{"api_version":1,"receipt_id":"rc_fixture","receipt_token":"rt_fixture","kind":"error","report_id":"%s","file_sha256":"%s","payload_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","status":"forwarding","duplicate":false,"received_at":"2026-10-19T01:02:03Z","public_url":null}' "$FIXTURE_REPORT_ID" "$FIXTURE_HASH" > "$output"
+    printf 202
+fi
+CURL
+chmod 755 "$submission_bin/infr" "$submission_bin/open" "$submission_bin/curl"
+ROOT=$submission_root
+CONFIG_DIR="$submission_home/Library/Application Support/MoE4All"
+STATE="$CONFIG_DIR/wizard-state.json"
+BINARY=$submission_bin/infr
+INTERACTIVE=true
+HEADLESS=false
+defaults
+unset MOE4ALL_SUBMISSION_API_BASE MOE4ALL_SUBMISSION_SITE_ORIGIN
+submission_api_config
+[[ $SUBMISSION_API_BASE == https://api.moe4all.com/v1 && $SUBMISSION_SITE_ORIGIN == https://moe4all.com ]] || fail 'Default submission origins are inconsistent'
+export FIXTURE_REPORT_ID=$report_id FIXTURE_HASH=$fixture_hash FIXTURE_SIZE=$(wc -c < "$report_path")
+export MOE4ALL_SUBMISSION_API_BASE=http://127.0.0.1:18765/v1
+old_path=$PATH
+PATH="$submission_bin:$PATH"
+website_submission_upload "$report_path" error > "$work/submission-output"
+PATH=$old_path
+unset FIXTURE_REPORT_ID FIXTURE_HASH FIXTURE_SIZE MOE4ALL_SUBMISSION_API_BASE
+[[ -f "$CONFIG_DIR/private/submission-receipts/rc_fixture.private-receipt.json" ]] || fail 'Submission receipt was not saved'
+assert_contains "$(< "$work/submission-output")" 'status: forwarding'
+printf '[{"avg_ts":42.5}]\n' > "$work/manual-benchmark.json"
+touch "$submission_root/model.gguf"
+S[model]="$submission_root/model.gguf"
+S[manual_bench_kind]=decode
+S[prompt_tokens]=0
+S[gen_tokens]=512
+S[depth_mode]=real
+S[depth_tokens]=30000
+S[reps]=1
+S[device]=metal
+S[setup_mode]=aggressive
+pack_manual_benchmark "$work/manual-benchmark.json" > "$work/manual-pack-output"
+[[ -f $REPLY ]] || fail 'Manual benchmark submission was not packed'
+assert_contains "$(< "$work/manual-pack-output")" '结果 / Results'
+
 install="$work/install"
 extract_package "$old_out/MoE4All-macOS-arm64-v1.0.1.tar.gz" "$install" 1.0.1
 stage="$work/stage"

@@ -544,6 +544,26 @@ fn sort_token_lane_indices(active: &[BatchWork], indices: &mut [usize]) {
     });
 }
 
+// Return a cohort-relative lane index and a Prefill-only step cap, not a physical KV slot id.
+fn token_lane_prefill_fallback(
+    lanes: impl IntoIterator<Item = (bool, usize)>,
+) -> Option<(usize, usize)> {
+    let mut previous = usize::MAX;
+    let mut out_of_order = false;
+    let mut text_prefill = None;
+    for (lane, (has_mrope, remaining)) in lanes.into_iter().enumerate() {
+        out_of_order |= previous < remaining;
+        previous = remaining;
+        if !has_mrope
+            && remaining > 0
+            && text_prefill.is_none_or(|(_, longest)| remaining > longest)
+        {
+            text_prefill = Some((lane, remaining));
+        }
+    }
+    out_of_order.then_some(text_prefill).flatten()
+}
+
 struct BatchChannels {
     events: SyncSender<BatchEvent>,
     acknowledgements: Receiver<bool>,
@@ -1513,6 +1533,11 @@ impl ParallelSeam {
         self.vk.capabilities().name
     }
 
+    /// Live device-memory snapshot for diagnostics and benchmark result attribution.
+    pub fn vram_info(&self) -> infr_vulkan::VramInfo {
+        self.vk.vram()
+    }
+
     pub fn model(&self) -> &SeamModel {
         &self.model
     }
@@ -1523,6 +1548,198 @@ impl ParallelSeam {
             Some(g) => RequestCtx::with_gate(sampling, g.clone()),
             None => RequestCtx::new(sampling),
         }
+    }
+
+    /// Fill one real prompt into each slot without counting setup prompts as concurrent Prefill.
+    ///
+    /// The automatic benchmark measures slot 0 as its single Prefill result, then needs equivalent
+    /// real contexts in the remaining slots before it can measure x2..xN Decode. Driving those
+    /// prompts through ordinary checkout would repeatedly select the best-prefix slot instead of
+    /// deterministically filling every slot. This setup-only entry point pins prompt `i` to slot
+    /// `i`, while using the same runner, KV layout and turn checkpoint machinery as serving.
+    pub fn prepare_benchmark_slots(
+        &self,
+        prompts: &[String],
+        progress: Option<&[infr_core::GenerationProgressCallback]>,
+    ) -> Result<Vec<GenStats>> {
+        anyhow::ensure!(
+            !prompts.is_empty() && prompts.len() <= self.n_slots(),
+            "benchmark needs 1..={} prompts, got {}",
+            self.n_slots(),
+            prompts.len(),
+        );
+        anyhow::ensure!(
+            self.mtp_heads.is_none(),
+            "automatic benchmark slot preparation does not support MTP yet"
+        );
+        anyhow::ensure!(
+            progress.is_none_or(|callbacks| callbacks.len() == prompts.len()),
+            "benchmark Prefill progress callback count must match the prompt count"
+        );
+
+        let mut results = Vec::with_capacity(prompts.len());
+        let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
+        for (index, prompt) in prompts.iter().enumerate() {
+            let prompt_tokens = self.model.encode(prompt)?;
+            let checkpoint = self.model.turn_checkpoints(
+                &prompt_tokens,
+                crate::seam::TurnCheckpointPrefixes::benchmark_frontier(),
+            )?;
+            let req = self
+                .request_ctx(crate::sampling::RequestSampling::default())
+                .with_progress(progress.and_then(|callbacks| callbacks.get(index).cloned()));
+            let mut kv = {
+                let mut pool = self.pool.lock().expect("pool poisoned");
+                let slot = &mut pool.slots[index];
+                anyhow::ensure!(!slot.busy, "benchmark slot {index} is busy");
+                slot.busy = true;
+                slot.multimodal_key = None;
+                slot.kv.take()
+            };
+            let run = crate::seam::generate_dense_vulkan_session(
+                self.vk.as_ref(),
+                self.model.gguf(),
+                self.model.config(),
+                self.model.engine_cfg(),
+                self.model.embd(),
+                self.model.per_layer_embd(),
+                &prompt_tokens,
+                0,
+                |_| {},
+                &mut kv,
+                self.max_ctx,
+                checkpoint,
+                None,
+                Some(&req),
+                None,
+            );
+            {
+                let mut pool = self.pool.lock().expect("pool poisoned");
+                pool.tick += 1;
+                let tick = pool.tick;
+                let slot = &mut pool.slots[index];
+                slot.kv = kv;
+                slot.busy = false;
+                slot.tick = tick;
+                slot.idle_since = self.session_cache.is_some().then(Instant::now);
+            }
+            self.freed.notify_all();
+            results.push((run?).1);
+        }
+        Ok(results)
+    }
+
+    /// Prefill the common background once, copy its live state, then append each lane's question.
+    /// This is setup-only: ordinary request checkout and serving cache policy are unchanged.
+    pub fn prepare_benchmark_shared_slots(
+        &self,
+        background: &str,
+        prompts: &[String],
+        progress: Option<&[infr_core::GenerationProgressCallback]>,
+    ) -> Result<Vec<GenStats>> {
+        anyhow::ensure!(
+            !prompts.is_empty() && prompts.len() <= self.n_slots(),
+            "invalid shared benchmark slot count"
+        );
+        anyhow::ensure!(
+            progress.is_none_or(|callbacks| callbacks.len() == prompts.len()),
+            "benchmark progress callback count must match the prompt count"
+        );
+        let background_tokens = self.model.encode(background)?;
+        anyhow::ensure!(background_tokens.len() > 1, "benchmark background is empty");
+        for prompt in prompts {
+            let tokens = self.model.encode(prompt)?;
+            anyhow::ensure!(
+                tokens.starts_with(&background_tokens[..background_tokens.len() - 1]),
+                "benchmark question changed the shared token prefix"
+            );
+        }
+        let mut scored = self.prepare_benchmark_slots(
+            &[background.to_owned()],
+            progress.map(|callbacks| &callbacks[..1]),
+        )?;
+        if prompts.len() > 1 {
+            let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
+            let mut states = {
+                let mut pool = self.pool.lock().expect("pool poisoned");
+                anyhow::ensure!(
+                    pool.slots.iter().all(|slot| !slot.busy),
+                    "cannot copy benchmark state while a slot is busy"
+                );
+                anyhow::ensure!(
+                    pool.slots[..prompts.len()]
+                        .iter()
+                        .all(|slot| slot.kv.is_some()),
+                    "benchmark slot has no KV"
+                );
+                pool.slots[..prompts.len()]
+                    .iter_mut()
+                    .map(|slot| {
+                        slot.busy = true;
+                        slot.kv.take().expect("validated benchmark KV")
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let copied = (|| -> Result<()> {
+                let (source, targets) = states.split_at_mut(1);
+                for target in targets {
+                    let copied = target.seed_benchmark_from(
+                        self.vk.as_ref(),
+                        self.model.config(),
+                        self.model.engine_cfg(),
+                        &source[0],
+                    )?;
+                    anyhow::ensure!(
+                        copied == background_tokens.len() - 1,
+                        "benchmark could not copy the complete shared frontier"
+                    );
+                }
+                Ok(())
+            })();
+            // Always return all reservations, including when a device copy fails.
+            let mut pool = self.pool.lock().expect("pool poisoned");
+            for (slot, state) in pool.slots.iter_mut().zip(states) {
+                slot.kv = Some(state);
+                slot.busy = false;
+            }
+            drop(pool);
+            self.freed.notify_all();
+            copied?;
+        }
+        // Materialize the short questions before any measured Decode lane starts.
+        let questions = self.prepare_benchmark_slots(prompts, None)?;
+        for (index, stats) in questions.into_iter().enumerate() {
+            if index == 0 {
+                continue;
+            }
+            scored.push(stats);
+        }
+        Ok(scored)
+    }
+
+    /// Reset benchmark contents and return unused dynamic segments before the next context case.
+    /// Keep logical buffers/address tables and fixed recurrent/IO state alive: frozen flat
+    /// allocations cannot be recreated, while segmented physical ranges support recommit.
+    pub fn clear_benchmark_slots(&self) -> Result<()> {
+        let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
+        let mut pool = self.pool.lock().expect("pool poisoned");
+        anyhow::ensure!(
+            pool.slots.iter().all(|slot| !slot.busy),
+            "cannot clear benchmark slots while a request is active"
+        );
+        for slot in &mut pool.slots {
+            if let Some(kv) = slot.kv.as_mut() {
+                kv.reset_benchmark_session_state(self.vk.as_ref(), self.model.config())?;
+            }
+            slot.multimodal_key = None;
+            slot.idle_since = None;
+        }
+        if let Some(heads) = &self.mtp_heads {
+            for head in heads.lock().expect("MTP heads poisoned").iter_mut() {
+                head.invalidate_all();
+            }
+        }
+        Ok(())
     }
 
     /// Take a slot for `prompt`, blocking until one is free.
@@ -2981,6 +3198,7 @@ impl ParallelSeam {
         acc: &mut Vec<u32>,
         printed: &mut usize,
         on_piece: &mut F,
+        stream_text: bool,
     ) -> Result<GenStats> {
         loop {
             let event = match events.recv() {
@@ -2999,7 +3217,9 @@ impl ParallelSeam {
                     let keep_going = if crate::sampling::abort_requested(Some(req)) {
                         false
                     } else {
-                        crate::stream_token(self.model.tokenizer(), acc, printed, id, on_piece);
+                        if stream_text {
+                            crate::stream_token(self.model.tokenizer(), acc, printed, id, on_piece);
+                        }
                         !crate::sampling::abort_requested(Some(req))
                     };
                     let _ = acknowledgements.send(keep_going);
@@ -3435,6 +3655,18 @@ impl ParallelSeam {
         if indices.is_empty() {
             return Ok(());
         }
+        // MRoPE needs a visual primary, but sampling needs all Prefill rows before Decode rows.
+        // If these orders conflict, drain one text suffix without sampling, then rejoin the cohort.
+        let prefill_fallback = token_lane_prefill_fallback(indices.iter().map(|&index| {
+            let work = &active[index];
+            (work.mrope_plan.is_some(), work.remaining_prefill())
+        }));
+        let prefill_index = prefill_fallback.map(|(lane, _)| indices[lane]);
+        let indices = prefill_index
+            .as_ref()
+            .map(std::slice::from_ref)
+            .unwrap_or(indices);
+        let quantum = prefill_fallback.map_or(quantum, |(_, remaining)| quantum.min(remaining));
         let max_steps = indices
             .iter()
             .map(|&index| {
@@ -3647,6 +3879,16 @@ impl ParallelSeam {
 
     fn fail_unified_scheduler(&self, active: &mut Vec<BatchWork>, error: anyhow::Error) {
         let message = error.to_string();
+        if crate::sampling::is_numerical_corruption(&error) {
+            for work in active.iter_mut() {
+                work.kv.as_mut().expect("batch work owns a KV slot").reset();
+            }
+            tracing::error!(
+                active_slots = active.len(),
+                %error,
+                "discarded KV state after non-finite model output"
+            );
+        }
         if let Some(heads) = &self.mtp_heads {
             let mut heads = heads.lock().expect("MTP heads poisoned");
             for work in active.iter() {
@@ -3849,7 +4091,7 @@ impl ParallelSeam {
             );
             work.reasoning_guard.mask_eos(cfg, &mut pending_logits);
             let blocked = pending;
-            pending = crate::mtp::argmax_row(&pending_logits);
+            pending = crate::mtp::argmax_row(&pending_logits)?;
             tracing::warn!(
                 slot = work.slot,
                 blocked_token = blocked,
@@ -4318,7 +4560,7 @@ impl ParallelSeam {
                 let row_logits = &mut logits[row * cfg.vocab..(row + 1) * cfg.vocab];
                 verify_guard.mask_eos(cfg, row_logits);
                 let blocked = ids[row];
-                ids[row] = crate::mtp::argmax_row(row_logits);
+                ids[row] = crate::mtp::argmax_row(row_logits)?;
                 tracing::warn!(
                     slot = work.slot,
                     row,
@@ -4542,7 +4784,47 @@ impl ParallelSeam {
         max_new: usize,
         constraint: Option<&mut crate::grammar::Constraint>,
         req: &RequestCtx,
+        on_piece: impl FnMut(&str),
+    ) -> Result<GenStats> {
+        self.generate_turn_inner(
+            prompt,
+            checkpoint_prefixes,
+            max_new,
+            constraint,
+            req,
+            on_piece,
+            true,
+        )
+    }
+
+    /// Benchmark token sampling skips text decoding; scheduling, KV and sampling stay identical.
+    pub fn generate_benchmark_turn(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        req: &RequestCtx,
+    ) -> Result<GenStats> {
+        self.generate_turn_inner(
+            prompt,
+            crate::seam::TurnCheckpointPrefixes::benchmark_frontier(),
+            max_new,
+            None,
+            req,
+            |_| {},
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_turn_inner(
+        &self,
+        prompt: &str,
+        checkpoint_prefixes: crate::seam::TurnCheckpointPrefixes<'_>,
+        max_new: usize,
+        constraint: Option<&mut crate::grammar::Constraint>,
+        req: &RequestCtx,
         mut on_piece: impl FnMut(&str),
+        stream_text: bool,
     ) -> Result<GenStats> {
         let mtp_eligible = self.mtp_heads.as_ref().is_none_or(|_| {
             let base = crate::sampling::Sampler::from_cfg(&self.model.engine_cfg().sampling);
@@ -4577,7 +4859,7 @@ impl ParallelSeam {
                 let mut heads = heads.lock().expect("MTP heads poisoned");
                 heads[guard.idx].invalidate_live();
             }
-            let (_, stats) = crate::seam::generate_dense_vulkan_session(
+            let result = crate::seam::generate_dense_vulkan_session(
                 self.vk.as_ref(),
                 self.model.gguf(),
                 self.model.config(),
@@ -4587,13 +4869,15 @@ impl ParallelSeam {
                 &prompt_tokens,
                 max_new,
                 |id| {
-                    crate::stream_token(
-                        self.model.tokenizer(),
-                        &mut acc,
-                        &mut printed,
-                        id,
-                        &mut on_piece,
-                    )
+                    if stream_text {
+                        crate::stream_token(
+                            self.model.tokenizer(),
+                            &mut acc,
+                            &mut printed,
+                            id,
+                            &mut on_piece,
+                        );
+                    }
                 },
                 &mut guard.kv,
                 self.max_ctx,
@@ -4601,7 +4885,17 @@ impl ParallelSeam {
                 constraint,
                 Some(req),
                 None,
-            )?;
+            );
+            if result
+                .as_ref()
+                .err()
+                .is_some_and(crate::sampling::is_numerical_corruption)
+            {
+                if let Some(kv) = guard.kv.as_mut() {
+                    kv.reset();
+                }
+            }
+            let (_, stats) = result?;
             return Ok(stats);
         }
 
@@ -4655,6 +4949,7 @@ impl ParallelSeam {
             &mut acc,
             &mut printed,
             &mut on_piece,
+            stream_text,
         )
     }
 
@@ -4792,6 +5087,7 @@ impl ParallelSeam {
                 &mut acc,
                 &mut printed,
                 &mut on_piece,
+                true,
             );
         }
         if let Some(heads) = &self.mtp_heads {
@@ -4902,6 +5198,7 @@ impl ParallelSeam {
             &mut acc,
             &mut printed,
             &mut on_piece,
+            true,
         )
     }
 }
@@ -4913,8 +5210,8 @@ mod tests {
         long_prefill_cohort_limit, long_prefill_phase_prompt_end, mtp_accepted_rows,
         mtp_context_profitable, multimodal_key, multimodal_token_position,
         phase_for_remaining_prefill, pick_continuation, scheduler_mode,
-        should_handoff_multimodal_to_scheduler, token_lane_sort_key, BatchPhase,
-        MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
+        should_handoff_multimodal_to_scheduler, token_lane_prefill_fallback, token_lane_sort_key,
+        BatchPhase, MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
     };
     use std::sync::Arc;
 
@@ -4996,6 +5293,99 @@ mod tests {
             token_lane_sort_key(has_mrope, remaining, slot)
         });
         assert_eq!(lanes.map(|lane| lane.0), [1, 0]);
+    }
+
+    #[test]
+    fn token_lanes_drain_text_prefill_before_visual_decode() {
+        for remaining in [1, 37, SHORT_PREFILL_TOKENS] {
+            let lanes = [(true, 0), (false, remaining)];
+            assert_eq!(token_lane_prefill_fallback(lanes), Some((1, remaining)));
+            // At the fallback boundary no token was sampled; both lanes can now Decode together.
+            assert_eq!(token_lane_prefill_fallback([(true, 0), (false, 0)]), None);
+        }
+    }
+
+    #[test]
+    fn token_lanes_preserve_compatible_batches() {
+        for lanes in [
+            vec![],
+            vec![(false, 37)],
+            vec![(true, 0)],
+            vec![(false, 37), (false, 0)],
+            vec![(true, 37), (false, 0)],
+            vec![(true, 37), (true, 5), (false, 0)],
+            vec![(true, 0), (false, 0), (false, 0), (false, 0)],
+        ] {
+            assert_eq!(token_lane_prefill_fallback(lanes), None);
+        }
+    }
+
+    #[test]
+    fn token_lanes_drain_conflicting_suffixes_and_rejoin() {
+        let mut lanes = [(0, true, 5), (1, true, 0), (2, false, 96), (3, false, 37)];
+        for expected_slot in [2, 3] {
+            lanes.sort_by_key(|&(slot, has_mrope, remaining)| {
+                token_lane_sort_key(has_mrope, remaining, slot)
+            });
+            let (lane, steps) = token_lane_prefill_fallback(
+                lanes
+                    .iter()
+                    .map(|&(_, has_mrope, remaining)| (has_mrope, remaining)),
+            )
+            .expect("text suffix must run before this mixed cohort");
+            assert_eq!(lanes[lane].0, expected_slot);
+            assert!(!lanes[lane].1);
+            assert_eq!(steps, lanes[lane].2);
+            lanes[lane].2 -= steps;
+        }
+        assert_eq!(
+            token_lane_prefill_fallback(
+                lanes.map(|(_, has_mrope, remaining)| (has_mrope, remaining))
+            ),
+            None
+        );
+        assert!(lanes.windows(2).all(|pair| pair[0].2 >= pair[1].2));
+    }
+
+    #[test]
+    fn token_lanes_exhaustive_mixed_cohorts_remain_executable() {
+        const REMAINING: [usize; 3] = [0, 1, SHORT_PREFILL_TOKENS];
+        for count in 1..=4u32 {
+            for mut encoded in 0..6usize.pow(count) {
+                let mut lanes = (0..count as usize)
+                    .map(|slot| {
+                        let state = encoded % 6;
+                        encoded /= 6;
+                        (slot, state >= 3, REMAINING[state % 3])
+                    })
+                    .collect::<Vec<_>>();
+                let mut fallbacks = 0;
+                loop {
+                    lanes.sort_by_key(|&(slot, has_mrope, remaining)| {
+                        token_lane_sort_key(has_mrope, remaining, slot)
+                    });
+                    let fallback = token_lane_prefill_fallback(
+                        lanes
+                            .iter()
+                            .map(|&(_, has_mrope, remaining)| (has_mrope, remaining)),
+                    );
+                    let descending = lanes.windows(2).all(|pair| pair[0].2 >= pair[1].2);
+                    if let Some((lane, steps)) = fallback {
+                        assert!(!descending);
+                        assert!(!lanes[lane].1);
+                        assert!(steps > 0);
+                        assert_eq!(steps, lanes[lane].2);
+                        lanes[lane].2 -= steps;
+                        fallbacks += 1;
+                        assert!(fallbacks < lanes.len());
+                    } else {
+                        assert!(descending);
+                        assert!(!lanes.iter().any(|lane| lane.1) || lanes[0].1);
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     #[test]

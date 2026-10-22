@@ -20,7 +20,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.3"
+version = "1.1.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/Headmaster218/MoE4All"
@@ -50,6 +50,7 @@ half = "2"
 bytemuck = "1"
 smallvec = "1"
 serde = { version = "1", features = ["derive"] }
+regex = "1"
 # preserve_order: chat templates `tojson` the request's tool definitions into the prompt — HF
 # transformers and llama.cpp-minja both keep the author's key order, so infr must too (BTreeMap
 # would alphabetize the JSON the model sees).
@@ -107,6 +108,8 @@ llguidance = "1"
 toktrie_hf_tokenizers = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff", "ico"] }
 base64 = "0.22"
+getrandom = "0.3"
+flate2 = "1"
 
 # `cargo test` builds dev (-O0); the CPU interpreter, GGUF dequant, and f16 conversions at -O0 are
 # 10-50x slower, which turns the locally-gated model tests (CI skips them — no GGUFs in its cache)

@@ -74,7 +74,8 @@ use gpu_allocator::MemoryLocation;
 
 use infr_core::{
     backend::{
-        Bindings, Buffer, BufferUsage, Capabilities, KvFrameCorridor, Plan, SegmentedKvSpec,
+        Bindings, Buffer, BufferUsage, Capabilities, IdleResourceReclaimer, KvFrameCorridor, Plan,
+        SegmentedKvSpec,
     },
     budget::{spill_report_line, SpillNouns, SpillTally},
     config::Config,
@@ -2632,6 +2633,7 @@ struct UnifiedPhaseState {
     active: Option<u64>,
     next_id: u64,
     arenas: Vec<(u64, std::sync::Weak<Mutex<adapter::RuntimePhaseArena>>)>,
+    idle_reclaimers: Vec<(u64, Weak<dyn IdleResourceReclaimer>)>,
 }
 
 struct UnifiedPhaseRegistry {
@@ -2647,6 +2649,7 @@ impl UnifiedPhaseRegistry {
                 active: None,
                 next_id: Self::PRIMARY_ID + 1,
                 arenas: vec![(Self::PRIMARY_ID, Arc::downgrade(primary))],
+                idle_reclaimers: Vec::new(),
             }),
         })
     }
@@ -2657,6 +2660,27 @@ impl UnifiedPhaseRegistry {
         state.next_id = state.next_id.wrapping_add(1).max(Self::PRIMARY_ID + 1);
         state.arenas.push((id, Arc::downgrade(arena)));
         id
+    }
+
+    fn register_idle_reclaimer(&self, owner: u64, reclaimer: Weak<dyn IdleResourceReclaimer>) {
+        let mut state = self.state.lock().unwrap();
+        state
+            .idle_reclaimers
+            .retain(|(_, entry)| entry.strong_count() != 0);
+        state.idle_reclaimers.push((owner, reclaimer));
+    }
+
+    fn idle_reclaim_candidates(&self, current: u64) -> Vec<Arc<dyn IdleResourceReclaimer>> {
+        let mut state = self.state.lock().unwrap();
+        state
+            .idle_reclaimers
+            .retain(|(_, entry)| entry.strong_count() != 0);
+        state
+            .idle_reclaimers
+            .iter()
+            .filter(|(owner, _)| *owner != current)
+            .filter_map(|(_, entry)| entry.upgrade())
+            .collect()
     }
 
     /// Track transitions without destroying another client's reusable workspace.
@@ -2702,6 +2726,16 @@ impl UnifiedPhaseRegistry {
             match claim() {
                 Ok(value) => return Ok(value),
                 Err(next) => error = next,
+            }
+        }
+        // Callbacks run without the registry lock and must never wait on a request-owned lock.
+        // Preserve the successful fast path and exhaust the existing scratch recovery first.
+        for reclaimer in self.idle_reclaim_candidates(current) {
+            if reclaimer.try_reclaim_idle() {
+                match claim() {
+                    Ok(value) => return Ok(value),
+                    Err(next) => error = next,
+                }
             }
         }
         Err(error)
@@ -4195,9 +4229,11 @@ impl VulkanBackend {
 
         // infr's Vulkan compute kernels are written for a PINNED subgroup size of 32 (RDNA3 wave32):
         // rmsnorm / softmax / quant_q8 / the coopmat GEMM / attention QK+PV / flash / DeltaNet all
-        // dispatch via `kernel_sg(..., 32)`, which sets `requiredSubgroupSize=32` and FAILS pipeline
-        // creation on any device that can't provide a size-32 subgroup (no `subgroup_size_control`,
-        // or 32 outside `[minSubgroupSize, maxSubgroupSize]`). rmsnorm/softmax run on EVERY forward
+        // run at wave32. Explicit specializations dispatch via `kernel_sg(..., 32)`; the ordinary
+        // `kernel()` builder also inspects SPIR-V and safely pins subgroup-using modules to 32. Both
+        // set `requiredSubgroupSize=32` and FAIL pipeline creation on any device that can't provide
+        // it (no `subgroup_size_control`, or 32 outside `[minSubgroupSize, maxSubgroupSize]`).
+        // rmsnorm/softmax run on EVERY forward
         // and are NOT coopmat-gated, so gating only the coopmat caps wouldn't prevent the crash —
         // the whole backend needs 32. Refuse the Vulkan backend here (a clean Err, not a mid-forward
         // panic) so `gpu_available()`/the seam falls back to CPU. Every real target — RADV (32-64),
@@ -5114,7 +5150,7 @@ impl VulkanBackend {
             0,
             // The kernel this probes is dispatched at a pinned subgroup 32, and its lane->element
             // arithmetic only holds there; pin the probe identically.
-            Some(32),
+            crate::ops::SubgroupContract::Fixed(32),
             self.shared.push_descriptor.is_some(),
             self.shared.max_push_constants,
         )?;
@@ -7740,6 +7776,33 @@ impl Backend for VulkanBackend {
         Ok(())
     }
 
+    fn trim_segmented_kv(&self, buffer: &dyn Buffer, keep: usize) -> Result<()> {
+        let segmented = as_segmented_kv(buffer)
+            .ok_or_else(|| be("trim_segmented_kv received a flat or foreign buffer"))?;
+        if !Arc::ptr_eq(&segmented.shared, &self.shared) {
+            return Err(be(
+                "segmented KV trim belongs to a different backend/device",
+            ));
+        }
+        self.with_unified_exclusive(|| {
+            let mut segments = segmented.segments.lock().unwrap();
+            if keep > segments.len() {
+                return Err(be("segmented KV trim cannot grow the committed prefix"));
+            }
+            let ptr = segmented
+                .table
+                .mapped_ptr()
+                .ok_or_else(|| be("KV address table is not host-visible"))?;
+            let offset = keep * std::mem::size_of::<u64>();
+            unsafe {
+                std::ptr::write_bytes(ptr.add(offset), 0, segmented.table.size - offset);
+            }
+            // Keep the reservation: future growth must reuse the same frozen coordinates.
+            segments.truncate(keep);
+            Ok(())
+        })
+    }
+
     fn release_segmented_kv(&self, buffer: &dyn Buffer) -> Result<()> {
         let segmented = as_segmented_kv(buffer)
             .ok_or_else(|| be("release_segmented_kv received a flat or foreign buffer"))?;
@@ -7944,6 +8007,9 @@ impl Backend for VulkanBackend {
     /// If `dst` is host-visible (`CpuToGpu`), writes directly through the
     /// Device-side prefix copy (`vkCmdCopyBuffer` region `[0, bytes)`) — no host bounce.
     fn copy_buffer(&self, src: &dyn Buffer, dst: &dyn Buffer, bytes: usize) -> Result<()> {
+        if as_segmented_kv(src).is_some() || as_segmented_kv(dst).is_some() {
+            return self.copy_buffer_ranges(&[(src, 0, dst, 0, bytes)]);
+        }
         let (s, d) = (as_vk_buf(src)?, as_vk_buf(dst)?);
         // BOTH sides, unlike `upload`/`download` which each have only one device buffer to police.
         // An oversize `bytes` here is a `vkCmdCopyBuffer` region that runs off the end of the source
@@ -7971,6 +8037,16 @@ impl Backend for VulkanBackend {
     fn copy_buffers(&self, copies: &[(&dyn Buffer, &dyn Buffer, usize)]) -> Result<()> {
         if copies.is_empty() {
             return Ok(());
+        }
+        if copies
+            .iter()
+            .any(|&(src, dst, _)| as_segmented_kv(src).is_some() || as_segmented_kv(dst).is_some())
+        {
+            let ranges: Vec<_> = copies
+                .iter()
+                .map(|&(src, dst, bytes)| (src, 0, dst, 0, bytes))
+                .collect();
+            return self.copy_buffer_ranges(&ranges);
         }
         let mut prepared = Vec::with_capacity(copies.len());
         for &(src, dst, bytes) in copies {
@@ -8001,12 +8077,223 @@ impl Backend for VulkanBackend {
         })
     }
 
+    fn copy_kv_prefixes(
+        &self,
+        copies: &[(&dyn Buffer, &dyn Buffer, infr_core::tensor::DType, usize)],
+    ) -> Result<()> {
+        use infr_core::tensor::DType;
+        if copies.is_empty() {
+            return Ok(());
+        }
+        self.with_unified_exclusive(|| {
+            let mut virtual_buffers: Vec<_> = copies
+                .iter()
+                .flat_map(|&(src, dst, _, _)| [src, dst])
+                .filter_map(as_segmented_kv)
+                .collect();
+            virtual_buffers.sort_unstable_by_key(|b| std::ptr::from_ref(*b) as usize);
+            virtual_buffers.dedup_by_key(|b| std::ptr::from_ref(*b) as usize);
+            for buffer in &virtual_buffers {
+                if !Arc::ptr_eq(&buffer.shared, &self.shared) {
+                    return Err(be("KV prefix belongs to a different Vulkan backend/device"));
+                }
+            }
+            let locked: Vec<_> = virtual_buffers
+                .iter()
+                .map(|buffer| buffer.segments.lock().unwrap())
+                .collect();
+            let storage_bytes = |dtype, elements: usize| -> Result<usize> {
+                let (block_elements, block_bytes) = infr_core::decode_spec::block_layout(dtype);
+                if !elements.is_multiple_of(block_elements) {
+                    return Err(be("unaligned KV prefix format"));
+                }
+                (elements / block_elements)
+                    .checked_mul(block_bytes)
+                    .ok_or_else(|| be("KV prefix size overflow"))
+            };
+            let endpoint = |buffer: &dyn Buffer, dtype, element: usize| -> Result<_> {
+                if let Some(segmented) = as_segmented_kv(buffer) {
+                    let index = virtual_buffers
+                        .binary_search_by_key(&(std::ptr::from_ref(segmented) as usize), |b| {
+                            std::ptr::from_ref(*b) as usize
+                        })
+                        .expect("locked KV prefix buffer");
+                    let capacity = segmented.spec.segment_elements;
+                    let segment = locked[index]
+                        .get(element / capacity)
+                        .ok_or_else(|| be("KV prefix exceeds committed segments"))?;
+                    check_extent(
+                        "KV prefix segment",
+                        "into",
+                        storage_bytes(dtype, capacity)?,
+                        segment.size,
+                    )?;
+                    Ok((
+                        segment.buffer,
+                        segment.sub_offset,
+                        element % capacity,
+                        capacity,
+                    ))
+                } else {
+                    let flat = as_vk_buf(buffer)?;
+                    let (block_elements, block_bytes) = infr_core::decode_spec::block_layout(dtype);
+                    let capacity = (flat.size / block_bytes)
+                        .checked_mul(block_elements)
+                        .ok_or_else(|| be("KV prefix capacity overflow"))?;
+                    Ok((flat.buffer, flat.sub_offset, element, capacity))
+                }
+            };
+            let mut prepared = Vec::new();
+            for &(src, dst, dtype, elements) in copies {
+                let bytes = storage_bytes(dtype, elements)?;
+                check_extent("KV prefix", "out of", bytes, src.len_bytes())?;
+                check_extent("KV prefix", "into", bytes, dst.len_bytes())?;
+                if std::ptr::eq(src, dst) {
+                    continue;
+                }
+                let mut offset = 0;
+                while offset < elements {
+                    let (sb, so, se, sc) = endpoint(src, dtype, offset)?;
+                    let (db, doff, de, dc) = endpoint(dst, dtype, offset)?;
+                    let count = (elements - offset).min(sc - se).min(dc - de);
+                    if dtype == DType::Q8_0 {
+                        // Vulkan Q8 is planar within EACH physical segment: codes, then scales.
+                        // A byte prefix would leave the scales uninitialized, including those
+                        // beyond the logical byte extent of a partially used final segment.
+                        prepared.push((sb, db, so + se, doff + de, count));
+                        let scale_bytes = count / 32 * 2;
+                        prepared.push((
+                            sb,
+                            db,
+                            so + sc + se / 32 * 2,
+                            doff + dc + de / 32 * 2,
+                            scale_bytes,
+                        ));
+                    } else {
+                        let (block_elements, block_bytes) =
+                            infr_core::decode_spec::block_layout(dtype);
+                        prepared.push((
+                            sb,
+                            db,
+                            so + se / block_elements * block_bytes,
+                            doff + de / block_elements * block_bytes,
+                            count / block_elements * block_bytes,
+                        ));
+                    }
+                    offset += count;
+                }
+            }
+            self.one_shot(move |cmd| unsafe {
+                for (src, dst, src_offset, dst_offset, size) in prepared {
+                    self.shared.device.cmd_copy_buffer(
+                        cmd,
+                        src,
+                        dst,
+                        &[vk::BufferCopy {
+                            src_offset: src_offset as u64,
+                            dst_offset: dst_offset as u64,
+                            size: size as u64,
+                        }],
+                    );
+                }
+            })
+        })
+    }
+
     fn copy_buffer_ranges(
         &self,
         copies: &[(&dyn Buffer, usize, &dyn Buffer, usize, usize)],
     ) -> Result<()> {
         if copies.is_empty() {
             return Ok(());
+        }
+        if copies.iter().any(|&(src, _, dst, _, _)| {
+            as_segmented_kv(src).is_some() || as_segmented_kv(dst).is_some()
+        }) {
+            return self.with_unified_exclusive(|| {
+                let mut virtual_buffers: Vec<_> = copies
+                    .iter()
+                    .flat_map(|&(src, _, dst, _, _)| [src, dst])
+                    .filter_map(as_segmented_kv)
+                    .collect();
+                virtual_buffers.sort_unstable_by_key(|b| std::ptr::from_ref(*b) as usize);
+                virtual_buffers.dedup_by_key(|b| std::ptr::from_ref(*b) as usize);
+                for buffer in &virtual_buffers {
+                    if !Arc::ptr_eq(&buffer.shared, &self.shared) {
+                        return Err(be(
+                            "segmented KV copy belongs to a different Vulkan backend/device",
+                        ));
+                    }
+                }
+                // Hold each buffer once, under the execution gate, through completion. This also
+                // supports copying disjoint ranges within one segmented buffer without deadlock.
+                let locked: Vec<_> = virtual_buffers
+                    .iter()
+                    .map(|buffer| buffer.segments.lock().unwrap())
+                    .collect();
+                let physical = |buffer: &dyn Buffer,
+                                offset: usize|
+                 -> Result<(vk::Buffer, u64, usize)> {
+                    if let Some(segmented) = as_segmented_kv(buffer) {
+                        let index = virtual_buffers
+                            .binary_search_by_key(&(std::ptr::from_ref(segmented) as usize), |b| {
+                                std::ptr::from_ref(*b) as usize
+                            })
+                            .expect("locked segmented copy buffer");
+                        let within = offset % segmented.spec.segment_bytes;
+                        let segment = locked[index]
+                            .get(offset / segmented.spec.segment_bytes)
+                            .ok_or_else(|| {
+                                be("copy_buffer_ranges exceeds committed segmented KV")
+                            })?;
+                        Ok((
+                            segment.buffer,
+                            (segment.sub_offset + within) as u64,
+                            segment.size - within,
+                        ))
+                    } else {
+                        let flat = as_vk_buf(buffer)?;
+                        Ok((
+                            flat.buffer,
+                            (flat.sub_offset + offset) as u64,
+                            flat.size - offset,
+                        ))
+                    }
+                };
+                let mut prepared = Vec::with_capacity(copies.len());
+                for &(src, src_offset, dst, dst_offset, bytes) in copies {
+                    let src_end = src_offset
+                        .checked_add(bytes)
+                        .ok_or_else(|| be("copy_buffer_ranges source range overflow"))?;
+                    let dst_end = dst_offset
+                        .checked_add(bytes)
+                        .ok_or_else(|| be("copy_buffer_ranges destination range overflow"))?;
+                    check_extent("copy_buffer_ranges", "out of", src_end, src.len_bytes())?;
+                    check_extent("copy_buffer_ranges", "into", dst_end, dst.len_bytes())?;
+                    let mut copied = 0;
+                    while copied < bytes {
+                        let (sb, so, sn) = physical(src, src_offset + copied)?;
+                        let (db, doff, dn) = physical(dst, dst_offset + copied)?;
+                        let count = (bytes - copied).min(sn).min(dn);
+                        prepared.push((sb, db, so, doff, count as u64));
+                        copied += count;
+                    }
+                }
+                self.one_shot(move |cmd| unsafe {
+                    for (src, dst, src_offset, dst_offset, size) in prepared {
+                        self.shared.device.cmd_copy_buffer(
+                            cmd,
+                            src,
+                            dst,
+                            &[vk::BufferCopy {
+                                src_offset,
+                                dst_offset,
+                                size,
+                            }],
+                        );
+                    }
+                })
+            });
         }
         let mut prepared = Vec::with_capacity(copies.len());
         for &(src, src_offset, dst, dst_offset, bytes) in copies {
@@ -8206,6 +8493,13 @@ impl Backend for VulkanBackend {
         self.with_unified_exclusive(|| {
             self.runtime_phase.lock().unwrap().release_phase();
         });
+    }
+
+    fn register_idle_reclaimer(&self, reclaimer: Weak<dyn IdleResourceReclaimer>) {
+        if matches!(self.unified_client, Some(UnifiedClient::Embedding)) {
+            self.unified_phases
+                .register_idle_reclaimer(self.unified_phase_id, reclaimer);
+        }
     }
 
     fn prepare_prefill(&self, candidates: &[(usize, u64)]) -> Result<Option<usize>> {
@@ -9066,6 +9360,203 @@ mod tests {
             0,
             "current workspace must never be reclaimed"
         );
+    }
+
+    struct TestIdleReclaimer<F>(F);
+
+    impl<F: Fn() -> bool + Send + Sync> IdleResourceReclaimer for TestIdleReclaimer<F> {
+        fn try_reclaim_idle(&self) -> bool {
+            (self.0)()
+        }
+    }
+
+    fn test_idle_reclaimer(
+        f: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Arc<dyn IdleResourceReclaimer> {
+        Arc::new(TestIdleReclaimer(f))
+    }
+
+    #[test]
+    fn unified_embedding_pressure_keeps_successful_claims_unchanged() {
+        let (primary, _) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let reclaimer =
+            test_idle_reclaimer(|| panic!("successful allocation must not evict weights"));
+        registry.register_idle_reclaimer(2, Arc::downgrade(&reclaimer));
+        assert_eq!(registry.claim_with_reclaim(1, || Ok(7)).unwrap(), 7);
+    }
+
+    #[test]
+    fn unified_embedding_pressure_frees_real_allocator_ranges_without_dropping_kv() {
+        use crate::unified::{UnifiedRangePool, UnifiedVramClass as Class};
+        let pool = UnifiedRangePool::new([4096]).unwrap();
+        let weights = Arc::new(Mutex::new(Some(
+            pool.allocate(3072, 256, Class::EmbeddingWeights).unwrap(),
+        )));
+        let kv = pool.allocate(512, 256, Class::KvCache).unwrap();
+        assert!(pool.allocate(1024, 256, Class::LlmRuntime).is_none());
+        let (primary, _) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let callback_weights = Arc::clone(&weights);
+        let reclaimer = test_idle_reclaimer(move || {
+            let Ok(mut weights) = callback_weights.try_lock() else {
+                return false;
+            };
+            weights.take().is_some()
+        });
+        registry.register_idle_reclaimer(2, Arc::downgrade(&reclaimer));
+        let runtime = registry
+            .claim_with_reclaim(1, || {
+                pool.allocate(1024, 256, Class::LlmRuntime)
+                    .ok_or_else(|| be("no room"))
+            })
+            .unwrap();
+        let stats = pool.stats();
+        assert_eq!(stats.class_bytes(Class::EmbeddingWeights), 0);
+        assert_eq!(stats.class_bytes(Class::KvCache), 512);
+        assert_eq!(stats.class_bytes(Class::LlmRuntime), 1024);
+        drop(runtime);
+        drop(kv);
+        assert_eq!(pool.stats().free_bytes, 4096);
+    }
+
+    #[test]
+    fn unified_embedding_pressure_runs_only_after_runtime_recovery_fails() {
+        let (primary, _) = counted_runtime();
+        let (runtime, drops) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let owner = registry.register(&runtime);
+        let released = Arc::new(AtomicBool::new(false));
+        let callback_released = Arc::clone(&released);
+        let callback_drops = Arc::clone(&drops);
+        let reclaimer = test_idle_reclaimer(move || {
+            assert_eq!(callback_drops.load(Ordering::SeqCst), 1);
+            callback_released.store(true, Ordering::SeqCst);
+            true
+        });
+        registry.register_idle_reclaimer(owner, Arc::downgrade(&reclaimer));
+        let attempts = AtomicUsize::new(0);
+        let result = registry.claim_with_reclaim(1, || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            if released.load(Ordering::SeqCst) {
+                Ok(9)
+            } else {
+                Err(be("no room"))
+            }
+        });
+        assert_eq!(result.unwrap(), 9);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn unified_embedding_pressure_keeps_weights_if_runtime_recovery_succeeds() {
+        let (primary, _) = counted_runtime();
+        let (runtime, drops) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let owner = registry.register(&runtime);
+        let reclaimer = test_idle_reclaimer(|| panic!("runtime alone satisfied the allocation"));
+        registry.register_idle_reclaimer(owner, Arc::downgrade(&reclaimer));
+        assert_eq!(
+            registry
+                .claim_with_reclaim(1, || {
+                    if drops.load(Ordering::SeqCst) == 1 {
+                        Ok(9)
+                    } else {
+                        Err(be("no room"))
+                    }
+                })
+                .unwrap(),
+            9
+        );
+    }
+
+    #[test]
+    fn unified_embedding_pressure_excludes_the_allocating_client() {
+        let (primary, _) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let reclaimer = test_idle_reclaimer(|| panic!("current client's weights must stay pinned"));
+        registry.register_idle_reclaimer(1, Arc::downgrade(&reclaimer));
+        assert!(registry
+            .claim_with_reclaim::<()>(1, || Err(be("no room")))
+            .is_err());
+    }
+
+    #[test]
+    fn unified_embedding_pressure_skips_busy_and_expired_callbacks() {
+        let (primary, _) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let reclaimer = test_idle_reclaimer(move || {
+            callback_calls.fetch_add(1, Ordering::SeqCst);
+            false
+        });
+        registry.register_idle_reclaimer(2, Arc::downgrade(&reclaimer));
+        let expired = test_idle_reclaimer(|| panic!("expired callback"));
+        registry.register_idle_reclaimer(3, Arc::downgrade(&expired));
+        drop(expired);
+        let attempts = AtomicUsize::new(0);
+        assert!(registry
+            .claim_with_reclaim::<()>(1, || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(be("no room"))
+            })
+            .is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.state.lock().unwrap().idle_reclaimers.len(), 1);
+    }
+
+    #[test]
+    fn unified_embedding_pressure_retries_once_per_release_and_stops_after_success() {
+        let (primary, _) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let released = Arc::new(AtomicUsize::new(0));
+        let callback_released = Arc::clone(&released);
+        let first = test_idle_reclaimer(move || {
+            callback_released.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+        let second = test_idle_reclaimer(|| panic!("stop after the first successful retry"));
+        registry.register_idle_reclaimer(2, Arc::downgrade(&first));
+        registry.register_idle_reclaimer(3, Arc::downgrade(&second));
+        let attempts = AtomicUsize::new(0);
+        assert_eq!(
+            registry
+                .claim_with_reclaim(1, || {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    if released.load(Ordering::SeqCst) != 0 {
+                        Ok(9)
+                    } else {
+                        Err(be("no room"))
+                    }
+                })
+                .unwrap(),
+            9
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn unified_embedding_pressure_calls_back_without_holding_the_registry_lock() {
+        let (primary, _) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let callback_registry = Arc::clone(&registry);
+        let reclaimer = test_idle_reclaimer(move || {
+            callback_registry.activate(1);
+            true
+        });
+        registry.register_idle_reclaimer(2, Arc::downgrade(&reclaimer));
+        let attempts = AtomicUsize::new(0);
+        assert!(registry
+            .claim_with_reclaim::<()>(1, || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(be("still no room"))
+            })
+            .is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        drop(reclaimer);
+        assert!(registry.idle_reclaim_candidates(1).is_empty());
     }
 
     #[test]
@@ -10162,6 +10653,186 @@ mod tests {
     /// KV-class bytes return to the arena with the virtual buffer.
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
+    fn kv_prefix_copy_preserves_planar_q8_scales_and_partial_segments() {
+        use infr_core::tensor::DType;
+        let be = VulkanBackend::new().expect("Vulkan GPU required");
+        be.init_unified_vram(8 * 1024 * 1024).unwrap();
+        let make = |segment_elements, max_segments| {
+            be.alloc_segmented_kv(SegmentedKvSpec {
+                logical_bytes: 1536 / 32 * 34,
+                segment_bytes: segment_elements / 32 * 34,
+                segment_elements,
+                max_segments,
+            })
+            .unwrap()
+            .unwrap()
+        };
+        let src = make(1024, 2);
+        let dst = make(512, 3);
+        be.ensure_segmented_kv(src.as_ref(), 2).unwrap();
+        be.ensure_segmented_kv(dst.as_ref(), 3).unwrap();
+        {
+            let segments = as_segmented_kv(src.as_ref())
+                .unwrap()
+                .segments
+                .lock()
+                .unwrap();
+            for (index, segment) in segments.iter().enumerate() {
+                let mut data = vec![0; 1088];
+                for (i, value) in data[..1024].iter_mut().enumerate() {
+                    *value = ((index * 1024 + i) % 127) as u8;
+                }
+                for scale in data[1024..].chunks_exact_mut(2) {
+                    scale.copy_from_slice(&[0, 60]);
+                }
+                be.upload(segment, &data).unwrap();
+            }
+        }
+        {
+            let segments = as_segmented_kv(dst.as_ref())
+                .unwrap()
+                .segments
+                .lock()
+                .unwrap();
+            for segment in segments.iter() {
+                be.upload(segment, &vec![0xa5; 544]).unwrap();
+            }
+        }
+        be.copy_kv_prefixes(&[(src.as_ref(), dst.as_ref(), DType::Q8_0, 1280)])
+            .unwrap();
+        {
+            let segments = as_segmented_kv(dst.as_ref())
+                .unwrap()
+                .segments
+                .lock()
+                .unwrap();
+            for (index, segment) in segments.iter().enumerate() {
+                let mut data = vec![0; 544];
+                be.download(segment, &mut data).unwrap();
+                for (i, &value) in data[..512].iter().enumerate() {
+                    let global = index * 512 + i;
+                    assert_eq!(
+                        value,
+                        if global < 1280 {
+                            (global % 127) as u8
+                        } else {
+                            0xa5
+                        }
+                    );
+                }
+                for (block, scale) in data[512..].chunks_exact(2).enumerate() {
+                    assert_eq!(
+                        scale,
+                        if index * 512 + block * 32 < 1280 {
+                            &[0, 60]
+                        } else {
+                            &[0xa5, 0xa5]
+                        }
+                    );
+                }
+            }
+        }
+        let flat = be.alloc(1632, BufferUsage::KvCache).unwrap();
+        be.copy_kv_prefixes(&[(src.as_ref(), flat.as_ref(), DType::Q8_0, 1280)])
+            .unwrap();
+        be.copy_kv_prefixes(&[(flat.as_ref(), dst.as_ref(), DType::Q8_0, 1280)])
+            .unwrap();
+        let mut scales = vec![0; 80];
+        be.download_range(flat.as_ref(), 1536, &mut scales).unwrap();
+        assert!(scales.chunks_exact(2).all(|scale| scale == [0, 60]));
+        assert!(be
+            .copy_kv_prefixes(&[(src.as_ref(), dst.as_ref(), DType::Q8_0, 1537)])
+            .is_err());
+        assert!(be
+            .copy_kv_prefixes(&[(src.as_ref(), dst.as_ref(), DType::Q8_0, 31)])
+            .is_err());
+        be.copy_kv_prefixes(&[(src.as_ref(), dst.as_ref(), DType::Q8_0, 0)])
+            .unwrap();
+        for (dtype, elements, bytes, capacity) in [
+            (DType::Q8_0, 32, 34, 36),
+            (DType::Q4_0, 32, 18, 72),
+            (DType::F16, 15, 30, 128),
+            (DType::F32, 7, 28, 128),
+        ] {
+            let source = be.alloc(capacity, BufferUsage::KvCache).unwrap();
+            let target = be.alloc(capacity, BufferUsage::KvCache).unwrap();
+            let payload: Vec<_> = (0..capacity).map(|i| i as u8).collect();
+            be.upload(source.as_ref(), &payload).unwrap();
+            be.upload(target.as_ref(), &vec![0xa5; capacity]).unwrap();
+            be.copy_kv_prefixes(&[(source.as_ref(), target.as_ref(), dtype, elements)])
+                .unwrap();
+            let mut actual = vec![0; capacity];
+            be.download(target.as_ref(), &mut actual).unwrap();
+            assert_eq!(&actual[..bytes], &payload[..bytes]);
+            assert!(actual[bytes..].iter().all(|&value| value == 0xa5));
+            be.copy_kv_prefixes(&[(target.as_ref(), target.as_ref(), dtype, elements)])
+                .unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn segmented_kv_device_copy_splits_both_endpoints() {
+        let be = VulkanBackend::new().expect("Vulkan GPU required");
+        const MIB: usize = 1024 * 1024;
+        be.init_unified_vram(8 * MIB).unwrap();
+        let make = |segment_bytes| {
+            be.alloc_segmented_kv(SegmentedKvSpec {
+                logical_bytes: 4 * segment_bytes,
+                segment_bytes,
+                segment_elements: segment_bytes / 2,
+                max_segments: 4,
+            })
+            .unwrap()
+            .unwrap()
+        };
+        let src = make(MIB);
+        let dst = make(MIB / 2);
+        be.ensure_segmented_kv_batch(&[src.as_ref(), dst.as_ref()], 2)
+            .unwrap();
+        let payload: Vec<_> = (0..100).map(|i| (i as u8).wrapping_mul(29)).collect();
+        be.upload_range(src.as_ref(), MIB - 32, &payload).unwrap();
+        be.copy_buffer_ranges(&[(src.as_ref(), MIB - 32, dst.as_ref(), MIB / 2 - 48, 100)])
+            .unwrap();
+        let mut restored = vec![0; 100];
+        be.download_range(dst.as_ref(), MIB / 2 - 48, &mut restored)
+            .unwrap();
+        assert_eq!(restored, payload);
+
+        let flat = be.alloc(100, BufferUsage::KvCache).unwrap();
+        be.copy_buffer_ranges(&[(dst.as_ref(), MIB / 2 - 48, flat.as_ref(), 0, 100)])
+            .unwrap();
+        be.copy_buffers(&[(flat.as_ref(), dst.as_ref(), 100)])
+            .unwrap();
+        be.copy_buffer(dst.as_ref(), flat.as_ref(), 100).unwrap();
+        be.download(flat.as_ref(), &mut restored).unwrap();
+        assert_eq!(restored, payload);
+        be.copy_buffer_ranges(&[(dst.as_ref(), 0, dst.as_ref(), 1024, 100)])
+            .unwrap();
+        be.download_range(dst.as_ref(), 1024, &mut restored)
+            .unwrap();
+        assert_eq!(restored, payload);
+
+        // Neither a logical tail nor an uncommitted segment may be used as backing storage.
+        assert!(be.copy_buffer(src.as_ref(), dst.as_ref(), 2 * MIB).is_err());
+        assert!(be
+            .copy_buffer_ranges(&[(src.as_ref(), usize::MAX, dst.as_ref(), 0, 4)])
+            .is_err());
+        assert!(be
+            .copy_buffer_ranges(&[(src.as_ref(), 0, dst.as_ref(), 4 * MIB, 4)])
+            .is_err());
+        be.copy_buffer_ranges(&[(dst.as_ref(), MIB, dst.as_ref(), MIB, 0)])
+            .unwrap();
+        be.download_range(dst.as_ref(), 1024, &mut restored)
+            .unwrap();
+        assert_eq!(
+            restored, payload,
+            "invalid copies must not partially execute"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
     fn segmented_kv_commits_and_releases_elastic_ranges() {
         let be = match VulkanBackend::new() {
             Ok(b) => b,
@@ -10241,6 +10912,20 @@ mod tests {
         be.download_range(virtual_kv.as_ref(), offset, &mut restored)
             .expect("download across a segment boundary");
         assert_eq!(restored, payload);
+
+        let first_address = addresses[0];
+        be.trim_segmented_kv(virtual_kv.as_ref(), 1).unwrap();
+        assert_eq!(segmented.committed(), 1);
+        assert_eq!(addresses[0], first_address);
+        assert_eq!(addresses[1], 0);
+        assert!(be.trim_segmented_kv(virtual_kv.as_ref(), 2).is_err());
+        let mut prefix = vec![0; 31];
+        be.download_range(virtual_kv.as_ref(), offset, &mut prefix)
+            .unwrap();
+        assert_eq!(prefix, payload[..31]);
+        be.ensure_segmented_kv(virtual_kv.as_ref(), 2).unwrap();
+        assert_eq!(addresses[0], first_address);
+        assert_ne!(addresses[1], 0);
 
         be.release_segmented_kv(virtual_kv.as_ref())
             .expect("release committed KV segments");

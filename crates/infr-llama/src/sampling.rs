@@ -1,6 +1,81 @@
 //! Token sampling (greedy / temperature + top-k + top-p) and incremental UTF-8-safe
 //! detokenization. Mechanically split out of `lib.rs` (no logic change).
 
+/// Device-side samplers return this out-of-vocabulary id when any input logit is non-finite.
+/// Keeping the sentinel outside every real vocabulary lets the host fail the request without
+/// downloading the full logits row on the GPU-resident fast paths.
+pub(crate) const NUMERICAL_CORRUPTION_TOKEN: u32 = u32::MAX;
+
+#[derive(Debug)]
+struct NumericalCorruption {
+    stage: String,
+    detail: String,
+}
+
+impl std::fmt::Display for NumericalCorruption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "non-finite model output at {}: {}; the request was aborted and its KV state was discarded",
+            self.stage, self.detail
+        )
+    }
+}
+
+impl std::error::Error for NumericalCorruption {}
+
+pub(crate) fn numerical_corruption(
+    stage: impl Into<String>,
+    detail: impl Into<String>,
+) -> anyhow::Error {
+    anyhow::Error::new(NumericalCorruption {
+        stage: stage.into(),
+        detail: detail.into(),
+    })
+}
+
+pub(crate) fn is_numerical_corruption(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<NumericalCorruption>().is_some()
+}
+
+/// Validate a model-produced logits row before any intentional `-inf` masking is applied.
+/// Sampling a damaged row used to collapse to token 0 (or another arbitrary candidate), allowing
+/// an HTTP 200 response and a poisoned Q8 KV prefix. Fail closed while the owning request can still
+/// invalidate that prefix.
+pub(crate) fn ensure_finite_logits(logits: &[f32], stage: &str) -> anyhow::Result<()> {
+    if let Some((index, value)) = logits
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, v)| !v.is_finite())
+    {
+        return Err(numerical_corruption(
+            stage,
+            format!("logit[{index}]={value:?} (bits=0x{:08x})", value.to_bits()),
+        ));
+    }
+    Ok(())
+}
+
+/// Check the compact id returned by the GPU argmax/sample fast paths. The shaders emit
+/// [`NUMERICAL_CORRUPTION_TOKEN`] for a non-finite row; any other out-of-range id is also a
+/// numerical/driver corruption and must never reach tokenization or the KV prefix metadata.
+pub(crate) fn ensure_sampled_token(token: u32, vocab: usize, stage: &str) -> anyhow::Result<u32> {
+    if token == NUMERICAL_CORRUPTION_TOKEN {
+        return Err(numerical_corruption(
+            stage,
+            "GPU sampler observed a NaN or infinity in the logits row",
+        ));
+    }
+    if token as usize >= vocab {
+        return Err(numerical_corruption(
+            stage,
+            format!("GPU sampler returned out-of-range token {token} for vocab {vocab}"),
+        ));
+    }
+    Ok(token)
+}
+
 /// Token sampling: greedy when `temp <= 0`, else temperature + top-k + top-p (nucleus). Qwen3
 /// recommends temp 0.6 / top_k 20 / top_p 0.95 — pure greedy makes thinking models degenerate
 /// (fail to close `</think>`, repeat, or stop without answering).
@@ -898,6 +973,22 @@ mod tests {
             qwen4_think_start: Some(10),
             qwen4_think_end: Some(11),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn numerical_guard_rejects_non_finite_logits_and_gpu_sentinels() {
+        ensure_finite_logits(&[-3.0, 0.0, 4.5], "unit logits").unwrap();
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let error = ensure_finite_logits(&[0.0, value, 1.0], "unit logits").unwrap_err();
+            assert!(is_numerical_corruption(&error));
+            assert!(error.to_string().contains("logit[1]"));
+        }
+
+        assert_eq!(ensure_sampled_token(7, 8, "unit GPU sample").unwrap(), 7);
+        for token in [NUMERICAL_CORRUPTION_TOKEN, 8, 99] {
+            let error = ensure_sampled_token(token, 8, "unit GPU sample").unwrap_err();
+            assert!(is_numerical_corruption(&error));
         }
     }
 

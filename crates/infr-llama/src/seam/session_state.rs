@@ -472,6 +472,54 @@ impl SeamKv {
         kv.session_release(&chain);
         Ok(full * page)
     }
+
+    /// Benchmark cases keep the 32K base segment and its frozen layout, but return unused tails.
+    /// This must not use the SSD spill release, which also relinquishes the slot's reservation.
+    pub(crate) fn reset_benchmark_session_state(
+        &mut self,
+        be: &dyn Backend,
+        cfg: &Config,
+    ) -> Result<()> {
+        use super::segmented_kv::KV_GROW_ROWS;
+        if self.segmented_kv.enabled && self.segmented_kv.committed_tokens > KV_GROW_ROWS {
+            be.sync()
+                .map_err(|error| anyhow!("sync before benchmark KV trim: {error}"))?;
+            let layout = SegmentedKvLayout::for_qwen(
+                cfg,
+                self.max_ctx,
+                self.k_fmt,
+                self.v_fmt,
+                self.segmented_kv.page_tokens,
+            )
+            .ok_or_else(|| anyhow!("segmented KV enabled for a non-Qwen session"))?;
+            self.segmented_kv.committed_tokens = 0;
+            self.reset();
+            for plane in layout.planes {
+                let buffer: &dyn Buffer = match plane.kind {
+                    PlaneKind::K => self.kbufs[plane.layer].as_ref(),
+                    PlaneKind::V => self.vbufs[plane.layer].as_ref(),
+                    PlaneKind::QsaRaw => self.qsa_kbufs[plane.layer]
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("missing QSA raw cache at layer {}", plane.layer))?,
+                    PlaneKind::QsaBlock => {
+                        self.qsa_cbufs[plane.layer].as_deref().ok_or_else(|| {
+                            anyhow!("missing QSA block cache at layer {}", plane.layer)
+                        })?
+                    }
+                };
+                be.trim_segmented_kv(buffer, 1).map_err(|error| {
+                    anyhow!(
+                        "trim benchmark KV {:?} layer {}: {error}",
+                        plane.kind,
+                        plane.layer
+                    )
+                })?;
+            }
+            self.segmented_kv.committed_tokens = KV_GROW_ROWS.min(self.max_ctx);
+        }
+        self.reset();
+        Ok(())
+    }
 }
 
 impl SessionStateMeta {

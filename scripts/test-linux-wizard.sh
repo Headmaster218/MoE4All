@@ -7,6 +7,8 @@ trap 'rm -rf -- "$tmp"' EXIT
 ROOT=$tmp/package
 CONFIG_DIR=$tmp/config/infr
 STATE=$CONFIG_DIR/wizard-state.json
+LEGACY_CONFIG_DIR=$tmp/legacy-config/infr
+LEGACY_STATE=$LEGACY_CONFIG_DIR/wizard-state.json
 BINARY=$ROOT/infr
 mkdir -p "$ROOT" "$CONFIG_DIR"
 cp "$repo/Start-INFR-Wizard-Linux.sh" "$ROOT/"
@@ -15,6 +17,8 @@ cat > "$BINARY" <<'ENGINE'
 case ${1-} in
     --version) printf 'infr 0.10.0\n' ;;
     devices) printf '%s\n' '  Vulkan0: Software [cpu, 0 MiB]' '  Vulkan1: Test GPU [discrete, 24 GiB] <- default' '  Vulkan2: Other GPU [integrated, 4 GiB]' ;;
+    bench) printf 'BENCH_ESTIMATE_MENU_V1|1|2|3|4|2|3|4|5|10|11|12|13\n' ;;
+    report) printf 'MOE4ALL_SUBMISSION_PATH=%s\n' "$ROOT/diagnostics/reports/fixture.m4e" ;;
     *) printf 'STUB_LAUNCHED\n'; printf '<%s>\n' "$@"; printf 'KEY=%s\n' "${INFR_API_KEY-}" ;;
 esac
 ENGINE
@@ -28,15 +32,40 @@ reject() { if "$@" > "$tmp/reject.log" 2>&1; then printf 'Unexpected success: %s
 reset() { defaults; S[model]="$ROOT/model with spaces.gguf"; }
 
 bash -n "$repo/Start-INFR-Wizard-Linux.sh"; pass
+for version in 1.1.0 1.1.0-beta.1 1.1.0-rc.2 1.1.0+build.7; do installed_version_valid "$version"; pass; done
+version_newer 1.1.0 1.1.0-beta.1; pass
+version_newer 1.1.1 1.1.0-beta.1; pass
+reject version_valid 1.1.0-beta.1
+reject installed_version_valid '1.1.0-beta/1'
+reject version_newer 1.0.3 1.1.0-beta.1
+reject version_newer 1.1.0 1.1.0
+reject version_newer 1.1.0 1.1.0+build.7
+reject version_newer 1.1.0 1.1.0+build-with-hyphen
+reject version_newer 1.1.0-beta.2 1.1.0-beta.1
 for file in image-codecs/libheif.so.1 image-codecs/libde265.so.0 image-codecs/libdav1d.so.7 image-codecs/SOURCES.txt; do
     managed "$file"; pass
 done
 reject managed image-codecs/evil.so
 for mode in run serve bench; do
     output=$(bash "$ROOT/Start-INFR-Wizard-Linux.sh" --dry-run --mode "$mode" --model 'model with spaces.gguf' --profile aggressive </dev/null)
-    [[ $output == *device.auto_profile=aggressive* && $output != *STUB_LAUNCHED* ]]; pass
+    [[ $output == *device.auto_profile=aggressive* && $output != *STUB_LAUNCHED* && $output != *kv.type_k=* && $output != *kv.type_v=* ]]; pass
 done
 [[ ! -f $STATE ]]; pass
+for profile in conservative aggressive; do
+    for mode in run serve bench; do
+        reset; S[setup_mode]=$profile; S[launch_mode]=$mode
+        S[kv_preset]=q8; S[kv_type_k]=q8_0; S[kv_type_v]=q8_0
+        build_command
+        ! has_arg kv.type_k=q8_0; ! has_arg kv.type_v=q8_0
+        [[ ${S[kv_preset]} == auto && -z ${S[kv_type_k]} && -z ${S[kv_type_v]} ]]; pass
+    done
+done
+for preset in q8 f16 custom auto; do
+    reset; S[setup_mode]=manual; S[kv_preset]=$preset; S[kv_type_k]=q8_0; S[kv_type_v]=f16
+    build_command
+    if [[ $preset == auto ]]; then ! has_arg kv.type_k=q8_0; ! has_arg kv.type_v=f16
+    else has_arg kv.type_k=q8_0; has_arg kv.type_v=f16; fi; pass
+done
 reset; S[launch_mode]=serve; S[server_parallel]=2; S[mtp_enabled]=true; S[mtp_model]=head.gguf; S[mtp_verify_tokens]=2
 choice mtp_verify_tokens 'MTP width' '4|4' '3|3' '2|2' <<< '' > "$tmp/numeric-choice"
 [[ ${S[mtp_verify_tokens]} == 2 ]]; pass
@@ -54,8 +83,66 @@ S[custom_sets]='malformed'; reject build_command
 reset; S[cpu_miss_enabled]=true; S[cpu_miss_cores]=4; S[cpu_miss_max]=3
 build_command; has_arg kernels.vulkan.cpu_miss_threads=4; has_arg kernels.vulkan.cpu_miss_max=3; pass
 S[cpu_miss_max]=4; reject build_command
-reset; S[launch_mode]=bench; S[bench_kind]=mixed; S[depth_mode]=synthetic; S[depth_tokens]=30000; S[json_output]=true
+reset; S[launch_mode]=bench; S[bench_kind]=manual; S[manual_bench_kind]=mixed; S[depth_mode]=synthetic; S[depth_tokens]=30000; S[json_output]=true
 build_command; has_arg --pg; has_arg --synthetic-depth; has_arg --json; ! has_arg spec.mtp=false; pass
+reset; S[launch_mode]=bench; S[bench_kind]=standard; S[bench_parallel]=3
+build_command; has_arg --suite; has_arg standard; has_arg --parallel; has_arg 3; has_arg --result-dir; ! has_arg --synthetic-depth; pass
+grep -Fq '6K Prefill + 1024 Decode. x1, one run' "$repo/Start-INFR-Wizard-Linux.sh"; pass
+grep -Fq 'Shared KV, different questions.' "$repo/Start-INFR-Wizard-Linux.sh"; pass
+! grep -Fq '90s Decode' "$repo/Start-INFR-Wizard-Linux.sh"; pass
+reset; S[launch_mode]=bench; S[setup_mode]=aggressive; S[device]=Vulkan1
+start_benchmark_estimate_probe
+benchmark_estimate_detail quick 1; [[ $REPLY == '预计约 1 分钟。Estimated about 1 min.' ]]; pass
+benchmark_estimate_detail standard 3; [[ $REPLY == '预计约 4 分钟。Estimated about 4 min.' ]]; pass
+reset; S[error_upload]=false
+output=$(complete_error_report <<< $'first line\nsecond line\n.\n1\nn\n')
+[[ $output == *MOE4ALL_SUBMISSION_PATH=*fixture.m4e* && ${S[error_upload]} == false ]]; pass
+
+# The submission client is dependency-light: it uses the embedded JSON parser,
+# system curl, the engine verifier and a private receipt file.
+unset MOE4ALL_SUBMISSION_API_BASE MOE4ALL_SUBMISSION_SITE_ORIGIN
+submission_api_config; [[ $SUBMISSION_API_BASE == https://api.moe4all.com/v1 && $SUBMISSION_SITE_ORIGIN == https://moe4all.com ]]; pass
+MOE4ALL_SUBMISSION_API_BASE=http://127.0.0.1:18765/v1 submission_api_config
+[[ $SUBMISSION_SITE_ORIGIN == http://127.0.0.1:18765 ]]; pass
+if MOE4ALL_SUBMISSION_API_BASE=http://example.invalid/v1 submission_api_config > "$tmp/invalid-api" 2>&1; then exit 1; fi; pass
+mkdir -p "$tmp/submission-bin" "$ROOT/diagnostics/reports/v1/2026-10"
+report_id=20261019T010203.004Z-00112233445566778899aabbccddeeff
+report_path=$ROOT/diagnostics/reports/v1/2026-10/$report_id.m4e
+printf 'MOE4ALL-SUBMISSION/1\nkind: error\nid: %s\n' "$report_id" > "$report_path"
+fixture_hash=$(sha256sum "$report_path"); fixture_hash=${fixture_hash%% *}
+cat > "$tmp/submission-bin/curl" <<'CURL'
+#!/usr/bin/env bash
+output='' url='' method=GET
+while (($#)); do
+    case $1 in
+        --output) output=$2; shift 2 ;;
+        --request) method=$2; shift 2 ;;
+        --write-out|--header|--data-binary|--connect-timeout|--max-time) shift 2 ;;
+        --silent|--show-error) shift ;;
+        *) url=$1; shift ;;
+    esac
+done
+if [[ $url == */upload-sessions && $method == POST ]]; then
+    printf '{"api_version":1,"state":"awaiting_verification","session_id":"us_fixture","session_token":"st_fixture","verification_url":"http://127.0.0.1:18765/community/upload.html#session=fixture","max_upload_bytes":131072}' > "$output"
+    printf 201
+elif [[ $url == */upload-sessions/us_fixture && $method == GET ]]; then
+    printf '{"api_version":1,"state":"ready","kind":"error","report_id":"%s","file_sha256":"%s","size_bytes":%s}' "$FIXTURE_REPORT_ID" "$FIXTURE_HASH" "$FIXTURE_SIZE" > "$output"
+    printf 200
+else
+    printf '{"api_version":1,"receipt_id":"rc_fixture","receipt_token":"rt_fixture","kind":"error","report_id":"%s","file_sha256":"%s","payload_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","status":"forwarding","duplicate":false,"received_at":"2026-10-19T01:02:03Z","public_url":null}' "$FIXTURE_REPORT_ID" "$FIXTURE_HASH" > "$output"
+    printf 202
+fi
+CURL
+cat > "$tmp/submission-bin/xdg-open" <<'OPEN'
+#!/usr/bin/env bash
+exit 0
+OPEN
+chmod +x "$tmp/submission-bin/curl" "$tmp/submission-bin/xdg-open"
+old_path=$PATH; PATH=$tmp/submission-bin:$PATH
+export FIXTURE_REPORT_ID=$report_id FIXTURE_HASH=$fixture_hash FIXTURE_SIZE=$(wc -c < "$report_path") MOE4ALL_SUBMISSION_API_BASE=http://127.0.0.1:18765/v1
+website_submission_upload "$report_path" error > "$tmp/submission-output"
+PATH=$old_path; unset FIXTURE_REPORT_ID FIXTURE_HASH FIXTURE_SIZE MOE4ALL_SUBMISSION_API_BASE
+[[ -f $CONFIG_DIR/private/submission-receipts/rc_fixture.private-receipt.json && $(< "$tmp/submission-output") == *'status: forwarding'* ]]; pass
 
 # Round-trip adversarial values as data, never as shell commands.
 reset; S[model]=$'model "quote" \\ space\nline\t.g g u f'; S[mtp_model]='$(touch SENTINEL)'; S[think_mode]=think; S[reasoning_effort]=medium
@@ -86,6 +173,17 @@ printf 'MODE=server\nMODEL=model.gguf\nPROFILE=aggressive\nUBATCH=3072\nMMPROJ=i
 defaults; load_state; [[ ${S[launch_mode]} == serve && ${S[server_vision]} == true && ${S[auto_overrides]} == *ubatch* ]]; pass
 rm "$CONFIG_DIR/wizard.conf"
 
+# Package-local state wins. Old XDG state is a read-only fallback and migrates
+# naturally when the next normal save writes the package-local state.
+mkdir -p "$LEGACY_CONFIG_DIR"
+printf '{"model":"legacy-model.gguf","setup_mode":"aggressive"}\n' > "$LEGACY_STATE"
+defaults; load_state; [[ ${S[model]} == legacy-model.gguf && ${S[setup_mode]} == aggressive ]]; pass
+printf '{"model":"package-model.gguf","setup_mode":"conservative"}\n' > "$STATE"
+defaults; load_state; [[ ${S[model]} == package-model.gguf && ${S[setup_mode]} == conservative ]]; pass
+rm "$STATE"
+defaults; load_state; save_state
+[[ -f $STATE && -f $LEGACY_STATE && ${S[model]} == legacy-model.gguf ]]; pass
+
 mkdir "$ROOT/models"
 for name in flash-00001-of-00002.gguf flash-00002-of-00002.gguf mmproj-flash.gguf mtp-flash.gguf; do touch "$ROOT/models/$name"; done
 model_candidates "$ROOT/models" llm; [[ ${#CANDIDATES[@]} == 1 && ${CANDIDATES[0]} == *-00001-of-00002.gguf ]]; pass
@@ -111,7 +209,7 @@ catalog_load qwen3-embedding-06b-q8; [[ $CATALOG_KIND == embedding && $CATALOG_P
     }
     reset; model_path llm model <<< $'D\nN\nmodels/flash-00001-of-00002.gguf'; printf '%s\n' "${S[model]}" > "$tmp/model-after-download"
 ) > "$tmp/model-download-choice"
-[[ $(grep -c '^LLM model$' "$tmp/model-download-choice") == 2 && $(< "$tmp/model-after-download") == *flash-00001-of-00002.gguf ]]; pass
+[[ $(grep -c '^LLM 模型 / model$' "$tmp/model-download-choice") == 2 && $(< "$tmp/model-after-download") == *flash-00001-of-00002.gguf ]]; pass
 
 # Exercise the real download path without network access and reject arbitrary URLs.
 mkdir "$tmp/fake-downloader"
@@ -180,7 +278,11 @@ reset; S[launch_mode]=serve; S[mtp_enabled]=true; S[mtp_model]=head.gguf; S[serv
 S[server_embedding]=true; S[embedding_model]=emb.gguf; S[ubatch]=2048; save_state
 before=$(sha256sum "$STATE")
 output=$(INFR_API_KEY=fixture-secret bash "$ROOT/Start-INFR-Wizard-Linux.sh" --dry-run --model relative.gguf --ubatch 3072 --kv-k q8_0 --no-mtp --no-mmproj --no-embedding --no-api-key </dev/null)
-[[ $output == *3072* && $output == *kv.type_k=q8_0* && $output != *fixture-secret* && $output != *spec.draft* && $output != *--mmproj* && $(sha256sum "$STATE") == "$before" ]]; pass
+[[ $output == *3072* && $output == *kv.type_k=q8_0* && $output != *kv.type_v=* && $output != *fixture-secret* && $output != *spec.draft* && $output != *--mmproj* && $(sha256sum "$STATE") == "$before" ]]; pass
+output=$(bash "$ROOT/Start-INFR-Wizard-Linux.sh" --dry-run --model relative.gguf --kv-v f16 --no-mtp --no-mmproj --no-embedding --no-api-key </dev/null)
+[[ $output == *kv.type_v=f16* && $output != *kv.type_k=* && $(sha256sum "$STATE") == "$before" ]]; pass
+output=$(bash "$ROOT/Start-INFR-Wizard-Linux.sh" --dry-run --model relative.gguf --kv-k q8_0 --kv-v f16 --no-mtp --no-mmproj --no-embedding --no-api-key </dev/null)
+[[ $output == *kv.type_k=q8_0* && $output == *kv.type_v=f16* && $(sha256sum "$STATE") == "$before" ]]; pass
 output=$(bash "$ROOT/Start-INFR-Wizard-Linux.sh" --dry-run --model relative.gguf --no-mmproj --no-embedding --no-api-key </dev/null)
 [[ $output == *spec.mtp=false* && $output != *spec.draft* ]]; pass
 output=$(bash "$ROOT/Start-INFR-Wizard-Linux.sh" --dry-run --model relative.gguf --mtp head.gguf --mtp-k 3 --no-mmproj --no-embedding --no-api-key </dev/null)
@@ -277,7 +379,12 @@ before=$(sha256sum "$tmp/mid-old/infr" "$tmp/mid-old/install-manifest.json")
 [[ $(sha256sum "$tmp/mid-old/infr" "$tmp/mid-old/install-manifest.json") == "$before" ]]; pass
 
 if [[ $(uname -s) == Linux ]]; then
-    make_package "$tmp/fifo" 1.0.0; mkfifo "$tmp/fifo/unlisted-fifo"; reject validate_package "$tmp/fifo" 1.0.0
+    make_package "$tmp/fifo" 1.0.0
+    if mkfifo "$tmp/fifo/unlisted-fifo" 2>/dev/null; then
+        reject validate_package "$tmp/fifo" 1.0.0
+    else
+        rm -rf -- "$tmp/fifo"
+    fi
     mkdir -p "$tmp/archive-bad/$prefix"
     ln -s /outside "$tmp/archive-bad/$prefix/infr"
     tar -czf "$tmp/bad-link.tar.gz" -C "$tmp/archive-bad" "$prefix"

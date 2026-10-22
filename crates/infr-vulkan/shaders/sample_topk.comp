@@ -49,6 +49,7 @@ shared uint sh_krem;
 shared uint gcnt;
 shared float gval[KMAX];
 shared uint gidx[KMAX];
+shared uint sinvalid;
 
 // Order-preserving float→uint: larger float ⇒ larger uint (ggml f2ui).
 uint f2ui(float x) {
@@ -80,6 +81,8 @@ void main() {
     // Phase A: radix N-ary select for the k-th largest key in [lo, hi) (MSB-first, 4 bits/pass).
     uint prefix = 0u;
     uint krem = k;
+    if (tid == 0u) { sinvalid = 0u; }
+    barrier();
     for (uint level = 0u; level < 8u; level++) {
         uint shift = 28u - 4u * level;
         uint himask = (shift + 4u >= 32u) ? 0u : (0xFFFFFFFFu << (shift + 4u));
@@ -88,9 +91,17 @@ void main() {
         barrier();
         for (uint i = lo + tid; i < hi; i += BLOCK) {
 #ifdef PASS2
+            uint index = idx_at(i);
+            if (level == 0u && index == 0xFFFFFFFFu) { atomicOr(sinvalid, 1u); }
             uint key = f2ui(val_at(i));
 #else
-            uint key = f2ui(logits[row * pc.n + i]);
+            float v = logits[row * pc.n + i];
+            bool finite = true;
+            if (level == 0u) {
+                finite = !(isnan(v) || isinf(v));
+                if (!finite) { atomicOr(sinvalid, 1u); }
+            }
+            uint key = f2ui(finite ? v : -1e30);
 #endif
             if ((key & himask) == pfix) {
                 atomicAdd(bucket[(key >> shift) & 0xFu], 1u);
@@ -112,27 +123,39 @@ void main() {
         barrier();
         prefix |= (sh_sel << shift);
         krem = sh_krem;
+#ifdef PASS2
+        if (level == 0u && sinvalid != 0u) {
+            if (tid == 0u) { out_id[gl_WorkGroupID.x] = 0xFFFFFFFFu; }
+            return;
+        }
+#endif
     }
     uint thresh = prefix; // key of the k-th largest value in the range
 
     // Phase B: gather values with key ≥ threshold into shared (cap k).
     if (tid == 0u) { gcnt = 0u; }
     barrier();
-    for (uint i = lo + tid; i < hi; i += BLOCK) {
 #ifdef PASS2
+    for (uint i = lo + tid; i < hi; i += BLOCK) {
         float v = val_at(i);
-#else
-        float v = logits[row * pc.n + i];
-#endif
         if (f2ui(v) >= thresh) {
             uint slot = atomicAdd(gcnt, 1u);
-#ifdef PASS2
             if (slot < k) { gval[slot] = v; gidx[slot] = idx_at(i); }
-#else
-            if (slot < k) { gval[slot] = v; gidx[slot] = i; }
-#endif
         }
     }
+#else
+    // The first radix pass already proved this slice finite. A damaged slice only needs to emit
+    // its marker below; skip the ordinary gather and avoid another isfinite scan on the hot path.
+    if (sinvalid == 0u) {
+        for (uint i = lo + tid; i < hi; i += BLOCK) {
+            float v = logits[row * pc.n + i];
+            if (f2ui(v) >= thresh) {
+                uint slot = atomicAdd(gcnt, 1u);
+                if (slot < k) { gval[slot] = v; gidx[slot] = i; }
+            }
+        }
+    }
+#endif
     barrier();
 
 #ifdef PASS2
@@ -140,6 +163,10 @@ void main() {
     // inverse-CDF sample with the buffered uniform — identical order of operations to the host
     // `sample_logits`, so the same `u` picks the same token (modulo exact-tie order).
     if (tid == 0u) {
+        if (sinvalid != 0u) {
+            out_id[gl_WorkGroupID.x] = 0xFFFFFFFFu;
+            return;
+        }
         uint m = min(gcnt, k);
         for (uint a = 1u; a < m; a++) {
             float vv = gval[a];
@@ -192,9 +219,11 @@ void main() {
         uint base = row_base + slice * k;
         uint ncand = 256u * k;
         for (uint j = 0u; j < k; j++) {
-            cand[base + j] = (j < m) ? gval[j] : -1e30;
+            bool marker = sinvalid != 0u && j == 0u;
+            cand[base + j] = marker ? uintBitsToFloat(0x7F800000u)
+                                      : ((j < m) ? gval[j] : -1e30);
             cand[row_base + ncand + slice * k + j] =
-                uintBitsToFloat((j < m) ? gidx[j] : 0u);
+                uintBitsToFloat(marker ? 0xFFFFFFFFu : ((j < m) ? gidx[j] : 0u));
         }
     }
 #endif

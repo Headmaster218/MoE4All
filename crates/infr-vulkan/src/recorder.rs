@@ -6211,6 +6211,7 @@ impl<'a> Recorder<'a> {
         nkv: usize,
         pos_offset: usize,
         prefer_deep_splits: bool,
+        register_o_tail_safe: bool,
         kv_addr: Option<(u64, u64)>,
     ) {
         const HD: u32 = 256;
@@ -6218,7 +6219,7 @@ impl<'a> Recorder<'a> {
         // Register-O is profitable at deep context but requires its 128-row padded contract. Full
         // 128-row tiles use it; arbitrary tail chunks stay on the established BM16 kernel. The
         // existing flash_warp knob is the same-binary A/B/fallback escape hatch.
-        if self.vk().flash_warp && n.is_multiple_of(128) {
+        if self.vk().flash_warp && n.is_multiple_of(128) && register_o_tail_safe {
             self.attention_prefill_flash_reg(
                 q,
                 kc,
@@ -7098,7 +7099,8 @@ impl<'a> Recorder<'a> {
         } else {
             ("store_q8", crate::gemm::store_q8_spv())
         };
-        let k = self.be.kernel(name, spv, 2, 24);
+        // One 32-lane subgroup owns one Q8_0 block; subgroupMax must cover all 32 values.
+        let k = self.be.kernel_sg(name, spv, 2, 24, 32);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
@@ -7134,7 +7136,8 @@ impl<'a> Recorder<'a> {
         } else {
             ("store_q8_seg", crate::gemm::store_q8_seg_spv())
         };
-        let k = self.be.kernel(name, spv, 2, 24);
+        // Keep the segmented store on the same one-wave-per-Q8-block contract.
+        let k = self.be.kernel_sg(name, spv, 2, 24, 32);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
@@ -7170,7 +7173,8 @@ impl<'a> Recorder<'a> {
         } else {
             ("store_q8_dyn", crate::gemm::store_q8_dyn_spv())
         };
-        let k = self.be.kernel(name, spv, 3, 24);
+        // Replay does not change the quantizer's fixed 32-lane reduction contract.
+        let k = self.be.kernel_sg(name, spv, 3, 24, 32);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         // [4..8] off: unused (from params). [12..16] src_off: always 0 here (a single decode row
@@ -12443,6 +12447,43 @@ impl<'a> Recorder<'a> {
         }
     }
 
+    /// Zero one byte range with `vkCmdFillBuffer`. This is used for small tile-padding tails after
+    /// a compute writer filled the valid prefix; unlike [`Self::zero`], it is deliberately not
+    /// available inside a conditional region because transfer commands are not conditional.
+    pub fn zero_bytes(&self, buf: &dyn Buffer, byte_offset: usize, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        assert!(
+            !self.conditional_active.get(),
+            "zero_bytes cannot be recorded inside a conditional region"
+        );
+        assert!(
+            byte_offset.is_multiple_of(4) && bytes.is_multiple_of(4),
+            "zero_bytes requires four-byte aligned offset and length"
+        );
+        let vkbuf = Self::vk_of(buf);
+        let end = byte_offset
+            .checked_add(bytes)
+            .expect("zero_bytes range overflow");
+        assert!(
+            end <= vkbuf.size,
+            "zero_bytes range {byte_offset}..{end} exceeds {}-byte buffer",
+            vkbuf.size
+        );
+        self.stamp("zero_fill_range");
+        self.sync(&[], &[vkbuf.buffer], true);
+        unsafe {
+            self.be.shared.device.cmd_fill_buffer(
+                self.cmd,
+                vkbuf.buffer,
+                (vkbuf.sub_offset + byte_offset) as u64,
+                bytes as u64,
+                0,
+            );
+        }
+    }
+
     /// MoE bucketing pass 1 (count): tally assignments per expert into `counts` (pre-zeroed).
     pub fn moe_bucket_count(&self, tok_ids: &dyn Buffer, counts: &dyn Buffer, n_pairs: usize) {
         let k = self.be.kernel(
@@ -14677,6 +14718,23 @@ mod tests {
     use infr_core::{backend::BufferUsage, Backend};
 
     #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn zero_bytes_clears_only_the_requested_tail() {
+        let backend = VulkanBackend::new().unwrap();
+        let buffer = backend.alloc(64, BufferUsage::Activations).unwrap();
+        backend.upload(buffer.as_ref(), &[0xff; 64]).unwrap();
+        let recorder = backend.recorder().unwrap();
+        recorder.zero_bytes(buffer.as_ref(), 16, 32);
+        recorder.finish().unwrap();
+
+        let mut bytes = [0u8; 64];
+        backend.download(buffer.as_ref(), &mut bytes).unwrap();
+        assert!(bytes[..16].iter().all(|&byte| byte == 0xff));
+        assert!(bytes[16..48].iter().all(|&byte| byte == 0));
+        assert!(bytes[48..].iter().all(|&byte| byte == 0xff));
+    }
+
+    #[test]
     fn q8_wave32_uses_two_rows_only_for_very_wide_outputs() {
         assert_eq!(
             native_q8_wave32_choice(infr_core::DType::Q8_0, 2560, 248_320, true),
@@ -16671,6 +16729,72 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn q8_dynamic_store_matches_static_offset_for_f32_and_f16() {
+        let Ok(be) = VulkanBackend::new() else {
+            return;
+        };
+        const ROW_ELEMS: usize = 512;
+        const ROWS: usize = 8;
+        const POS: usize = 5;
+        let cap = ROWS * ROW_ELEMS;
+        let cache_bytes = (cap / 32 * 34).next_multiple_of(4);
+        let values: Vec<f32> = (0..ROW_ELEMS)
+            .map(|i| ((i * 37 + 11) % 251) as f32 / 73.0 - 1.7)
+            .collect();
+        let params = be.alloc(8, BufferUsage::Staging).unwrap();
+        be.upload(
+            params.as_ref(),
+            bytemuck::cast_slice(&[POS as u32, (POS + 1) as u32]),
+        )
+        .unwrap();
+
+        for src_f16 in [false, true] {
+            let src = if src_f16 {
+                upf16(&be, &values)
+            } else {
+                upf32(&be, &values)
+            };
+            let static_cache = be.alloc(cache_bytes, BufferUsage::KvCache).unwrap();
+            let dynamic_cache = be.alloc(cache_bytes, BufferUsage::KvCache).unwrap();
+            let zeroes = vec![0u8; cache_bytes];
+            be.upload(static_cache.as_ref(), &zeroes).unwrap();
+            be.upload(dynamic_cache.as_ref(), &zeroes).unwrap();
+
+            let rec = be.recorder().unwrap();
+            rec.store_q8(
+                src.as_ref(),
+                static_cache.as_ref(),
+                ROW_ELEMS,
+                POS * ROW_ELEMS,
+                cap,
+                src_f16,
+                0,
+            );
+            rec.store_q8_dyn(
+                src.as_ref(),
+                params.as_ref(),
+                dynamic_cache.as_ref(),
+                ROW_ELEMS,
+                cap,
+                src_f16,
+            );
+            rec.finish().unwrap();
+
+            let mut static_bytes = vec![0u8; cache_bytes];
+            let mut dynamic_bytes = vec![0u8; cache_bytes];
+            be.download(static_cache.as_ref(), &mut static_bytes)
+                .unwrap();
+            be.download(dynamic_cache.as_ref(), &mut dynamic_bytes)
+                .unwrap();
+            assert_eq!(
+                dynamic_bytes, static_bytes,
+                "dynamic Q8 store diverged from static offset (src_f16={src_f16})"
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "requires Vulkan GPU"]
     fn qsa_scan_default_uses_the_actual_parallel_workspace() {
         let be = VulkanBackend::new().expect("QSA automatic scan probe needs Vulkan");
@@ -17451,6 +17575,7 @@ mod tests {
                 nkv,
                 pos_offset,
                 false,
+                true,
                 None,
             );
         } else {

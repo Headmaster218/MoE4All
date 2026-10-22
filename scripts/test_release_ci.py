@@ -3,8 +3,11 @@
 import json
 from pathlib import Path
 import tempfile
+import tarfile
 import unittest
 
+import linux_release
+import macos_release
 import release_ci
 
 
@@ -109,6 +112,37 @@ class ReleaseCiTests(unittest.TestCase):
         cargo = self.root / "Cargo.toml"
         cargo.write_text('[workspace.package]\nversion = "1.2.3"\n', encoding="utf-8")
         self.assertEqual("1.2.3", release_ci.workspace_version(cargo))
+
+    def test_unix_packagers_preserve_prerelease_identity_and_reject_unsafe_versions(self):
+        for module in (linux_release, macos_release):
+            source = self.workspace / module.PLATFORM
+            source.mkdir()
+            (source / "documentation").mkdir()
+            for name in module.ROOT_FILES:
+                (source / name).write_bytes(b"fixture\n")
+            output = source / "output"
+            for version in ("1.1.0", "1.1.0-beta.1", "1.1.0-rc.2", "1.1.0+build.7"):
+                with self.subTest(platform=module.PLATFORM, version=version):
+                    archive = module.package(source, source / "infr", output, version)
+                    prefix = f"MoE4All-{module.PLATFORM}-v{version}"
+                    self.assertEqual(archive.name, prefix + ".tar.gz")
+                    with tarfile.open(archive, "r:gz") as bundle:
+                        manifest = json.load(bundle.extractfile(prefix + "/install-manifest.json"))
+                    self.assertEqual(manifest["version"], version)
+                    self.assertEqual(manifest["tag"], "release-" + version)
+                    self.assertEqual(archive.with_name(archive.name + ".sha256").read_text().split()[0], release_ci.sha256(archive))
+            for invalid in ("../1.1.0", "1.1.0-beta/1", "1.1.0 beta", "release-1.1.0-beta.1"):
+                with self.assertRaises(ValueError):
+                    module.package_name(invalid)
+
+    def test_prerelease_package_support_does_not_change_stable_update_selection(self):
+        releases = [
+            {"tag_name": "release-1.0.3", "prerelease": False},
+            {"tag_name": "release-1.1.0-beta.1", "prerelease": True},
+            {"tag_name": "release-1.1.0-rc.2", "prerelease": False},
+            {"tag_name": "release-1.1.0", "draft": True},
+        ]
+        self.assertEqual(linux_release.select_release(releases)["version"], "1.0.3")
 
 
 if __name__ == "__main__":

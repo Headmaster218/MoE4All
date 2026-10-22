@@ -134,6 +134,13 @@ fn segmented_kv_view(buffer: &dyn Buffer) -> Option<(&dyn Buffer, u32)> {
     Some((segmented.table_buffer(), elements.trailing_zeros()))
 }
 
+/// Register-O FlashAttention consumes K/V in whole 64-row cooperative-matrix tiles. Transient
+/// dequant scratch must therefore include a zeroed tail through the final tile, even though only
+/// `kv_rows` carry cache data.
+fn flash_kv_storage_rows(kv_rows: usize) -> usize {
+    kv_rows.div_ceil(64) * 64
+}
+
 /// Lever 1 (kv-decode-perf-levers #1): mainline low-bit block quants the DECODE split-K kernel can
 /// dequant INLINE via a coalesced block-amortized decoder (`attn_partial`'s `dqv4`,
 /// `attn_partial_ml_kernel`) — so decode reads the compact cache directly instead of a dequant→f16
@@ -5786,7 +5793,17 @@ fn lower_op(
                 // Ring cache: only att_cap_rows rows exist — dequant the WHOLE ring (element i →
                 // element i keeps the ring layout, so the f16 scratch is read with the same
                 // row-modulo mapping as the cache itself). Identity on full-context caches.
-                let ne = kv_len.min(att_cap_rows) * nkv * hd;
+                let kv_rows = kv_len.min(att_cap_rows);
+                let ne = kv_rows * nkv * hd;
+                let register_o_candidate =
+                    be_.cfg().kernels.vulkan.flash_warp && hd == 256 && rows.is_multiple_of(128);
+                let scratch_rows = if register_o_candidate {
+                    flash_kv_storage_rows(kv_rows)
+                } else {
+                    kv_rows
+                };
+                let scratch_ne = scratch_rows * nkv * hd;
+                let scratch_tail_bytes = (scratch_ne - ne) * 2;
                 // Expand a KV side into the f16 scratch: native Q8 (planar), f32 cast (store_f16),
                 // else the shared quant/bf16 dequant (dequant_kv_f16).
                 // #74: the dequant READERS read the SOURCE cache (`r(*k_cache)?`/`r(*v_cache)?`, always
@@ -5795,7 +5812,7 @@ fn lower_op(
                 // read slot so the store→dequant-read barrier survives. The f32 cast (store_f16) writes
                 // the f16 SCRATCH `sc` (Activations, no address) → bound; turbo dequant is deferred/bound.
                 let kc_key = if deq_k {
-                    let k = pooled(pool, be_, "kvdeq_k", ne * 2)?;
+                    let k = pooled(pool, be_, "kvdeq_k", scratch_ne * 2)?;
                     let sc = pool[&k].as_ref();
                     let src = r(*k_cache)?;
                     if k_q8 {
@@ -5811,12 +5828,13 @@ fn lower_op(
                     } else {
                         rec.dequant_kv_f16(kdt, src, sc, ne);
                     }
+                    rec.zero_bytes(sc, ne * 2, scratch_tail_bytes);
                     Some(k)
                 } else {
                     None
                 };
                 let vc_key = if deq_v {
-                    let k = pooled(pool, be_, "kvdeq_v", ne * 2)?;
+                    let k = pooled(pool, be_, "kvdeq_v", scratch_ne * 2)?;
                     let sc = pool[&k].as_ref();
                     let src = r(*v_cache)?;
                     if v_q8 {
@@ -5832,6 +5850,7 @@ fn lower_op(
                     } else {
                         rec.dequant_kv_f16(vdt, src, sc, ne);
                     }
+                    rec.zero_bytes(sc, ne * 2, scratch_tail_bytes);
                     Some(k)
                 } else {
                     None
@@ -6098,6 +6117,11 @@ fn lower_op(
                         _ => None,
                     };
                     if hd == 256 {
+                        let required_kv_rows = flash_kv_storage_rows(kv_len);
+                        let k_storage_rows = if deq_k { scratch_rows } else { att_cap_rows };
+                        let v_storage_rows = if deq_v { scratch_rows } else { att_cap_rows };
+                        let register_o_tail_safe = k_storage_rows >= required_kv_rows
+                            && v_storage_rows >= required_kv_rows;
                         rec.attention_prefill_flash_hd256(
                             r(*q)?,
                             kcb,
@@ -6112,6 +6136,7 @@ fn lower_op(
                             nkv,
                             pos,
                             k_q8 && v_q8 && kv_len >= 65_536,
+                            register_o_tail_safe,
                             kv_addr,
                         );
                     } else {
@@ -14329,6 +14354,14 @@ fn execute_paged_moe<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn flash_kv_storage_rows_cover_the_final_coopmat_tile() {
+        assert_eq!(super::flash_kv_storage_rows(0), 0);
+        assert_eq!(super::flash_kv_storage_rows(64), 64);
+        assert_eq!(super::flash_kv_storage_rows(65), 128);
+        assert_eq!(super::flash_kv_storage_rows(10_723), 10_752);
+    }
+
     fn shared_scan_graph(rows: usize, routed_dtype: infr_core::DType) -> super::Graph {
         use super::*;
         use infr_core::TensorDesc;

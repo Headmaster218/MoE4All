@@ -1663,7 +1663,7 @@ impl<'a> MtpHeadSession<'a> {
     ) -> Result<(u32, f32, Vec<f32>)> {
         if !self.gpu_draft_prob_enabled() {
             let (logits, h_mtp) = self.forward(&[tok], h_row, pos, true)?;
-            let (id, p) = top1_softmax(&logits);
+            let (id, p) = top1_softmax(&logits)?;
             return Ok((id, p, h_mtp));
         }
 
@@ -1757,12 +1757,22 @@ impl<'a> MtpHeadSession<'a> {
         self.be
             .download(id_buf.as_ref(), &mut idb)
             .map_err(|e| anyhow!("{e}"))?;
-        let id = u32::from_le_bytes(idb);
+        let id = crate::sampling::ensure_sampled_token(
+            u32::from_le_bytes(idb),
+            self.cfg.vocab,
+            "MTP GPU draft argmax",
+        )?;
         let mut pb = [0u8; 4];
         self.be
             .download(prob_buf.as_ref(), &mut pb)
             .map_err(|e| anyhow!("{e}"))?;
         let prob = f32::from_le_bytes(pb);
+        if !prob.is_finite() {
+            return Err(crate::sampling::numerical_corruption(
+                "MTP GPU draft probability",
+                format!("probability={prob:?} (bits=0x{:08x})", prob.to_bits()),
+            ));
+        }
         self.exec_secs += t_exec.elapsed().as_secs_f64();
 
         Ok((id, prob, h_mtp))
@@ -1915,7 +1925,11 @@ impl<'a> MtpHeadSession<'a> {
             self.be
                 .download(buf.as_ref(), &mut idb)
                 .map_err(|e| anyhow!("{e}"))?;
-            out.push(u32::from_le_bytes(idb));
+            out.push(crate::sampling::ensure_sampled_token(
+                u32::from_le_bytes(idb),
+                self.cfg.vocab,
+                "MTP chained GPU argmax",
+            )?);
         }
         self.exec_secs += t_exec.elapsed().as_secs_f64();
 
@@ -2023,6 +2037,7 @@ fn draft_stochastic(
     let mut h = pending_h.to_vec();
     for pos in n_past..n_past + n_max {
         let (logits, h_mtp) = sess.forward(&[tok], &h, pos, true)?;
+        crate::sampling::ensure_finite_logits(&logits, "MTP stochastic draft logits")?;
         let dist = crate::sampling::truncated_dist(&logits, sampler);
         let id = crate::sampling::sample_from_dist(&dist, rng);
         result.push((id, dist));
@@ -2038,7 +2053,8 @@ fn draft_stochastic(
 /// keep), argmax + `1/Σexp(logit - max)` is exactly `softmax(logits)[argmax]` without materializing
 /// the full distribution.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-fn top1_softmax(logits: &[f32]) -> (u32, f32) {
+fn top1_softmax(logits: &[f32]) -> Result<(u32, f32)> {
+    crate::sampling::ensure_finite_logits(logits, "MTP host draft logits")?;
     let (mut amax, mut m) = (0usize, f32::NEG_INFINITY);
     for (i, &v) in logits.iter().enumerate() {
         if v > m {
@@ -2047,7 +2063,7 @@ fn top1_softmax(logits: &[f32]) -> (u32, f32) {
         }
     }
     let z: f32 = logits.iter().map(|&v| (v - m).exp()).sum();
-    (amax as u32, 1.0 / z)
+    Ok((amax as u32, 1.0 / z))
 }
 
 // ─── Phase 3: the MTP self-speculative generation loop + run/serve wiring (issue #33) ───────────
@@ -2147,7 +2163,15 @@ fn run_verify_with_finish(
         );
         ids = (0..m)
             .map(|j| argmax_row(&logits[j * cfg.vocab..(j + 1) * cfg.vocab]))
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
+    } else {
+        for (row, id) in ids.iter_mut().enumerate() {
+            *id = crate::sampling::ensure_sampled_token(
+                *id,
+                cfg.vocab,
+                &format!("MTP GPU verify row {row}"),
+            )?;
+        }
     }
     Ok((ids, logits, h))
 }
@@ -2194,7 +2218,7 @@ pub(crate) fn run_qwen4_prime_frontier_with_finish(
         cfg.vocab,
         logits.len()
     );
-    Ok((argmax_row(&logits), logits))
+    Ok((argmax_row(&logits)?, logits))
 }
 
 /// Full-distribution VERIFY forward — the temperature-aware MTP accept rule's twin of
@@ -2245,6 +2269,15 @@ fn run_verify_full(
         None,
         None,
     )?;
+    anyhow::ensure!(
+        logits.len().is_multiple_of(cfg.vocab),
+        "MTP full verify returned {} logits for vocab {}",
+        logits.len(),
+        cfg.vocab
+    );
+    for (row, logits) in logits.chunks_exact(cfg.vocab).enumerate() {
+        crate::sampling::ensure_finite_logits(logits, &format!("MTP full verify row {row}"))?;
+    }
     Ok((logits, h))
 }
 
@@ -2316,7 +2349,14 @@ fn run_prime_last(
         ids.len(),
         h.len()
     );
-    Ok((ids[0], logits, h))
+    if !logits.is_empty() {
+        crate::sampling::ensure_finite_logits(&logits, "MTP reprime logits")?;
+    }
+    Ok((
+        crate::sampling::ensure_sampled_token(ids[0], cfg.vocab, "MTP reprime sample")?,
+        logits,
+        h,
+    ))
 }
 
 /// Cumulative per-phase wall time + accept-rate counters over one [`generate_mtp_spec_vulkan_timed`]
@@ -2412,7 +2452,8 @@ enum LeadingPred {
 /// Greedy argmax over one `[vocab]` logits row (unlike [`top1_softmax`], no probability needed —
 /// `spec_accept`/the verify-round check only reads the winning id).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn argmax_row(row: &[f32]) -> u32 {
+pub(crate) fn argmax_row(row: &[f32]) -> Result<u32> {
+    crate::sampling::ensure_finite_logits(row, "MTP host argmax")?;
     let mut bi = 0usize;
     let mut bv = f32::NEG_INFINITY;
     for (i, &v) in row.iter().enumerate() {
@@ -2421,7 +2462,7 @@ pub(crate) fn argmax_row(row: &[f32]) -> u32 {
             bi = i;
         }
     }
-    bi as u32
+    Ok(bi as u32)
 }
 
 /// The backend-generic MTP draft-verify-catchup loop — the shared body of the `_vulkan`/`_metal`

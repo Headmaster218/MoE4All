@@ -1,8 +1,8 @@
 //! Per-layer weight handles + the persistent seam session state ([`SeamKv`]/[`SeamWeights`]).
 //! Pure-move split of `seam.rs` — see `super` for the module overview.
+use super::common_prefix_len;
 use super::sc::{DenoiseCache, SelfCondWeights};
 use super::segmented_kv::{PlaneKind, SegmentedKvLayout};
-use super::{common_prefix_len, kv_fmt_bytes};
 use crate::Config;
 use anyhow::{anyhow, Result as AResult};
 use infr_core::backend::{Backend, Buffer, BufferUsage};
@@ -1847,30 +1847,64 @@ impl SeamKv {
                 return Ok(0);
             }
         }
+        let mut copies = Vec::new();
         for l in 0..cfg.n_layer {
             // One prefix position is `k_row`/`v_row` elements per side — MLA's compressed row is
             // three times `n_kv * head_dim` wide and has no V side at all, so both widths come
             // from the shared `crate::seam::kv_row_elems` (docs/backlog.md B41).
             let (k_row, v_row) = crate::seam::kv_row_elems(cfg, l);
-            be.copy_buffer(
+            copies.push((
                 src.kbufs[l].as_ref(),
                 self.kbufs[l].as_ref(),
-                kv_fmt_bytes(self.k_fmt, p * k_row),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
+                self.k_fmt,
+                p * k_row,
+            ));
             // `v_row == 0`: this arch caches no V (MLA) and `vbufs[l]` is the placeholder — there
             // is nothing to seed.
             if v_row > 0 {
-                be.copy_buffer(
+                copies.push((
                     src.vbufs[l].as_ref(),
                     self.vbufs[l].as_ref(),
-                    kv_fmt_bytes(self.v_fmt, p * v_row),
-                )
-                .map_err(|e| anyhow!("{e}"))?;
+                    self.v_fmt,
+                    p * v_row,
+                ));
             }
         }
+        be.copy_kv_prefixes(&copies).map_err(|e| anyhow!("{e}"))?;
         self.cached = src.cached[..p].to_vec();
         Ok(p)
+    }
+
+    /// Benchmark setup copies a complete live hybrid frontier, never an arbitrary rewind.
+    /// Keep the normal serving policy (which rejects Qwen3.5 cross-slot seeds) unchanged.
+    pub(crate) fn seed_benchmark_from(
+        &mut self,
+        be: &dyn Backend,
+        cfg: &Config,
+        ec: &crate::EngineConfig,
+        src: &SeamKv,
+    ) -> AResult<usize> {
+        let tokens = src.cached.len();
+        if cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3 {
+            return self.seed_qwen4_from(be, cfg, ec, src, tokens);
+        }
+        // Compressed and windowed caches carry more state than a linear token prefix.
+        // Their non-segmented buffers can be copied whole at this exact live frontier.
+        if cfg.deepseek4 || src.kv_ring {
+            let copies = src
+                .kbufs
+                .iter()
+                .chain(&src.vbufs)
+                .zip(self.kbufs.iter().chain(&self.vbufs))
+                .map(|(source, target)| (source.as_ref(), target.as_ref(), source.len_bytes()))
+                .collect::<Vec<_>>();
+            be.copy_buffers(&copies)
+                .map_err(|e| anyhow!("benchmark live-state copy: {e}"))?;
+            self.cached.clone_from(&src.cached);
+            self.invalidate_turn_checkpoint();
+            return Ok(tokens);
+        }
+        self.seed_from(be, cfg, ec, src, tokens)
     }
 
     fn seed_qwen4_from(
@@ -1916,6 +1950,7 @@ impl SeamKv {
 
         self.ensure_segmented_depth(be, cfg, tokens)?;
         let mut copies: Vec<(&dyn Buffer, usize, &dyn Buffer, usize, usize)> = Vec::new();
+        let mut kv_copies = Vec::new();
         for layer in 0..cfg.n_layer {
             if cfg.is_recurrent_layer(layer) {
                 let (src_k, src_v) = if let Some(index) = recurrent_checkpoint {
@@ -1942,24 +1977,20 @@ impl SeamKv {
             }
 
             let (k_row, v_row) = crate::seam::kv_row_elems(cfg, layer);
-            let k_bytes = kv_fmt_bytes(self.k_fmt, tokens * k_row);
-            if k_bytes != 0 {
-                copies.push((
+            if k_row != 0 {
+                kv_copies.push((
                     src.kbufs[layer].as_ref(),
-                    0,
                     self.kbufs[layer].as_ref(),
-                    0,
-                    k_bytes,
+                    self.k_fmt,
+                    tokens * k_row,
                 ));
             }
-            let v_bytes = kv_fmt_bytes(self.v_fmt, tokens * v_row);
-            if v_bytes != 0 {
-                copies.push((
+            if v_row != 0 {
+                kv_copies.push((
                     src.vbufs[layer].as_ref(),
-                    0,
                     self.vbufs[layer].as_ref(),
-                    0,
-                    v_bytes,
+                    self.v_fmt,
+                    tokens * v_row,
                 ));
             }
             if let (Some(src_raw), Some(dst_raw)) = (
@@ -1995,6 +2026,8 @@ impl SeamKv {
         }
         be.copy_buffer_ranges(&copies)
             .map_err(|error| anyhow!("seed Qwen3.8 live state: {error}"))?;
+        be.copy_kv_prefixes(&kv_copies)
+            .map_err(|error| anyhow!("seed KV prefix planes: {error}"))?;
         drop(copies);
 
         for checkpoint in self.turn_recurrent_ckpts.iter_mut().flatten() {

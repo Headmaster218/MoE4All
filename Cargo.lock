@@ -1216,7 +1216,7 @@ dependencies = [
 
 [[package]]
 name = "infr-chat"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "infr-core",
@@ -1231,13 +1231,17 @@ dependencies = [
 
 [[package]]
 name = "infr-cli"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "chrono",
  "clap",
  "clap_complete",
  "clap_complete_nushell",
  "clap_mangen",
+ "flate2",
+ "getrandom 0.3.4",
  "infr-core",
  "infr-embedding",
  "infr-engine",
@@ -1248,7 +1252,10 @@ dependencies = [
  "infr-vision",
  "infr-vulkan",
  "libc",
+ "regex",
+ "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1256,7 +1263,7 @@ dependencies = [
 
 [[package]]
 name = "infr-core"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "bytemuck",
  "half",
@@ -1277,7 +1284,7 @@ dependencies = [
 
 [[package]]
 name = "infr-cpu"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -1293,7 +1300,7 @@ dependencies = [
 
 [[package]]
 name = "infr-embedding"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -1310,7 +1317,7 @@ dependencies = [
 
 [[package]]
 name = "infr-engine"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "infr-chat",
@@ -1324,7 +1331,7 @@ dependencies = [
 
 [[package]]
 name = "infr-gguf"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -1340,7 +1347,7 @@ dependencies = [
 
 [[package]]
 name = "infr-hub"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "dirs",
  "indicatif",
@@ -1357,7 +1364,7 @@ dependencies = [
 
 [[package]]
 name = "infr-llama"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -1382,7 +1389,7 @@ dependencies = [
 
 [[package]]
 name = "infr-metal"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "bytemuck",
  "half",
@@ -1398,7 +1405,7 @@ dependencies = [
 
 [[package]]
 name = "infr-prof"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1407,11 +1414,11 @@ dependencies = [
 
 [[package]]
 name = "infr-prof-rt"
-version = "1.0.3"
+version = "1.1.0"
 
 [[package]]
 name = "infr-server"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1431,7 +1438,7 @@ dependencies = [
 
 [[package]]
 name = "infr-testkit"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "bytemuck",
  "half",
@@ -1441,7 +1448,7 @@ dependencies = [
 
 [[package]]
 name = "infr-vision"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1459,7 +1466,7 @@ dependencies = [
 
 [[package]]
 name = "infr-vulkan"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "ash",
  "bytemuck",
