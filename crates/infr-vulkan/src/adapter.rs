@@ -1092,7 +1092,18 @@ fn moe_static_phase(rows: usize, n_used: usize, n_expert: usize) -> RuntimePhase
 /// Decode while selecting Prefill for the wide batches that switch residency strategy. `None`
 /// keeps graphs with no MoE work on the established local-pool path even when their backend also
 /// happens to own a pager.
+///
+/// A stamped `prefill_runtime_reserve_bytes` makes the WHOLE graph Prefill regardless of its row
+/// height: the runner only stamps a reserve on rounds where it already ran `prepare_prefill` and
+/// crushed the expert corridor to price the ring (2026-10-19 memory-bomb fix — a gray chunk that
+/// executes Decode on a paid round storm-misses hundreds of experts per layer through the emptied
+/// corridor into unbounded staging, and with no Prefill transition the corridor is never restored).
+/// The ring layout is row-count agnostic (`build_prefill_layout` sizes lanes by layer banks), so a
+/// short paid chunk rides the ring correctly, it just amortizes the lane streaming less well.
 fn paged_static_phase(graph: &Graph) -> Option<RuntimePhase> {
+    let paid_round = graph
+        .prefill_runtime_reserve_bytes
+        .is_some_and(|bytes| bytes > 0);
     let mut phase = None;
     for op in &graph.ops {
         let Op::MoeFfn {
@@ -1106,7 +1117,11 @@ fn paged_static_phase(graph: &Graph) -> Option<RuntimePhase> {
             continue;
         };
         let rows = graph.desc(*x).numel() / *ne as usize;
-        let op_phase = moe_static_phase(rows, *n_used as usize, *n_expert as usize);
+        let op_phase = if paid_round {
+            RuntimePhase::Prefill
+        } else {
+            moe_static_phase(rows, *n_used as usize, *n_expert as usize)
+        };
         phase = Some(op_phase);
         if op_phase == RuntimePhase::Prefill {
             return Some(RuntimePhase::Prefill);

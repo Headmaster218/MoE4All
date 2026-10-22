@@ -699,6 +699,22 @@ pub trait Backend: Send + Sync {
             "segmented KV frame corridors are not supported by this backend",
         ))
     }
+    /// Copy one paged-KV frame out of its device corridor into host memory (Phase C RAM-tier
+    /// demotion). `frame_addr` is the frame's first-byte corridor address
+    /// (`FramePool::frame_addr`); `dst.len()` must equal `frame_bytes`. The caller holds the GPU
+    /// baton: no dispatch may be writing the frame while it leaves VRAM. Default unsupported.
+    fn kv_frame_download(&self, _frame_addr: u64, _dst: &mut [u8]) -> Result<()> {
+        Err(crate::error::Error::backend(
+            "KV frame corridor DMA is not supported by this backend",
+        ))
+    }
+    /// Copy one paged-KV frame's bytes from host memory into its device-corridor slot (Phase C
+    /// promotion). Same baton discipline as [`Self::kv_frame_download`]. Default unsupported.
+    fn kv_frame_upload(&self, _frame_addr: u64, _src: &[u8]) -> Result<()> {
+        Err(crate::error::Error::backend(
+            "KV frame corridor DMA is not supported by this backend",
+        ))
+    }
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()>;
     fn download(&self, src: &dyn Buffer, dst: &mut [u8]) -> Result<()>;
     /// Emit the one-shot KV-cache placement summary for a VRAM-first spill backend (the Vulkan

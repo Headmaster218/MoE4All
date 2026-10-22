@@ -1167,7 +1167,12 @@ impl ParallelSeam {
                     "paged KV frame pool is smaller than the full ctx budget; cold tree entries evict earlier"
                 );
             }
-            let mut tree = PagedKv::new(frame_bytes, page_tokens, plane_offsets, vram_frames, 0);
+            // Phase C: `spec` is the RAM tier budget. Frames sunk out of the VRAM corridor live in
+            // a lazily grown host backing (high-water mark = ram_frames * frame_bytes), so a big
+            // budget costs nothing until prefixes actually demote. Zero budget keeps the tier off
+            // and the tree behaves exactly like Phase B (cold entries evict instead of sink).
+            let ram_frames = (paged_budget / frame_bytes) as usize;
+            let mut tree = PagedKv::new(frame_bytes, page_tokens, plane_offsets, vram_frames, ram_frames);
             tree.set_vram_segments(&corridors);
             tracing::info!(
                 page_tokens,
@@ -1176,8 +1181,10 @@ impl ParallelSeam {
                 corridors = corridors.len(),
                 corridor_bytes = frame_bytes * vram_frames as u64,
                 ram_budget = ?spec,
+                ram_frames,
+                ram_bytes = frame_bytes * ram_frames as u64,
                 tree = %tree.stats_line(),
-                "paged KV radix prefix cache ready (frames held by the tree, zero-copy prefix reuse, multimodal sessions never enter the tree, RAM tier pending Phase C)"
+                "paged KV radix prefix cache ready (frames held by the tree, zero-copy prefix reuse, multimodal sessions never enter the tree, cold chains sink to the RAM tier before eviction)"
             );
             let tree = Arc::new(Mutex::new(tree));
             self.paged_cache = Some(Arc::clone(&tree));
@@ -2150,8 +2157,14 @@ impl ParallelSeam {
                             }
                         }
                         if ready {
-                            let frames = tree.entry_chain(node, reusable);
-                            if let Some(kv) = target_kv.as_mut() {
+                            // Phase C: RAM frames in the matched chain DMA back into VRAM before
+                            // the attach (the page table never sees a RAM address). A chain VRAM
+                            // cannot fully host attaches at its deepest promotable prefix; the
+                            // un-promoted tail stays sunk and the rest re-prefills.
+                            let frames =
+                                tree.entry_chain_promoted(self.vk.as_ref(), node, reusable);
+                            let reusable = frames.len() * tree.page_tokens();
+                            if let Some(kv) = target_kv.as_mut().filter(|_| !frames.is_empty()) {
                                 match kv.paged_attach(
                                     self.vk.as_ref(),
                                     cfg,

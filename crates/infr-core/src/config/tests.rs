@@ -1646,6 +1646,9 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     /// they were born reading `Config` (`docs/config-plan.md` R3), so they are `migrated` from
     /// their first commit and this list exists only to keep the count honest.
     const POST_MIGRATION: &[&str] = &[
+        "INFR_MEM_GUARD_HEADROOM",
+        "INFR_MEM_GUARD_RAM_HEADROOM",
+        "INFR_MEM_GUARD_POLL_MS",
         "INFR_RAM_BUDGET",
         "INFR_DRAM_CACHE",
         "INFR_DRAM_BYPASS",

@@ -36,11 +36,43 @@
 //! under that single lock, and the scheduler's discipline is unchanged — tree mutation only happens
 //! at request boundaries (checkout/demote) while the GPU baton is held, so no dispatch can observe
 //! a half-written page table. There is deliberately no idle worker (PR #86 black-hole conviction).
+//!
+//! # Phase C: the RAM tier
+//!
+//! `kv.paged_cache_max` sizes a host-RAM frame pool behind the VRAM corridor. When the corridor
+//! runs dry, the coldest tree entry SINKS (one frame DMA down per frame, the entry's chain
+//! rewritten to RAM ids) before any entry is truly evicted; a hit on a chain with RAM frames
+//! PROMOTES them back ([`PagedKv::entry_chain_promoted`]) before the attaching session's page
+//! table is written — RAM addresses never enter a table (bandwidth-wall + BDA convictions).
+//! Promotion claims may themselves sink other cold entries; the hot chain that just hit is
+//! skipped by the sinker because its LRU stamp was refreshed by [`PagedKv::best_match`].
+//! The host backing is `Vec<u8>` indexed by RAM slot — a RAM `FrameId`'s `slot() * frame_bytes`
+//! IS its backing offset, mirroring how a VRAM slot maps into its corridor.
 
 use crate::seam::kv_frame_pool::{FrameId, FramePool, Tier};
 use anyhow::{anyhow, Result};
-use infr_core::backend::KvFrameCorridor;
+use infr_core::backend::{Backend, KvFrameCorridor};
 use std::collections::HashMap;
+
+/// Frame-granularity DMA between the VRAM corridor and host memory, factored out of [`Backend`]
+/// so the pool/tree logic tests against an in-memory stand-in. Blanket-impl'd for every backend.
+pub(crate) trait FrameDma {
+    /// Copy one frame's corridor bytes into host memory (`dst.len() == frame_bytes`).
+    fn download_frame(&self, frame_addr: u64, dst: &mut [u8]) -> Result<()>;
+    /// Copy one frame's host bytes into its corridor slot (`src.len() == frame_bytes`).
+    fn upload_frame(&self, frame_addr: u64, src: &[u8]) -> Result<()>;
+}
+
+impl<T: Backend + ?Sized> FrameDma for T {
+    fn download_frame(&self, frame_addr: u64, dst: &mut [u8]) -> Result<()> {
+        self.kv_frame_download(frame_addr, dst)
+            .map_err(|error| anyhow!("{error}"))
+    }
+    fn upload_frame(&self, frame_addr: u64, src: &[u8]) -> Result<()> {
+        self.kv_frame_upload(frame_addr, src)
+            .map_err(|error| anyhow!("{error}"))
+    }
+}
 
 /// One cached conversation: the frames covering every COMPLETE page of its token prefix
 /// (`chain.len() == tokens.len() / page_tokens`). The token spine itself lives in the node edges,
@@ -84,11 +116,17 @@ pub(crate) struct PagedKv {
     /// its plane buffers (`SegmentedKvLayout::planes`): prefix sums of `plane.segment_bytes()`.
     /// A page-table entry for plane `p` on frame `f` is `plane_addr(f, p)`.
     plane_offsets: Vec<u64>,
+    /// Host backing for the RAM tier: slot `s` owns bytes `s * frame_bytes..(s + 1) *
+    /// frame_bytes`. Grown lazily to the high-water mark of demoted slots so a server that never
+    /// fills its RAM budget never commits the full host allocation.
+    ram_backing: Vec<u8>,
     clock: u64,
     hits: u64,
     misses: u64,
     demotions: u64,
     evictions: u64,
+    tier_demotions: u64,
+    tier_promotions: u64,
 }
 
 impl PagedKv {
@@ -113,12 +151,20 @@ impl PagedKv {
             free: Vec::new(),
             page_tokens,
             plane_offsets,
+            ram_backing: Vec::new(),
             clock: 0,
             hits: 0,
             misses: 0,
             demotions: 0,
             evictions: 0,
+            tier_demotions: 0,
+            tier_promotions: 0,
         }
+    }
+
+    /// Tokens per page (callers recompute a truncated reuse length after a partial promotion).
+    pub(crate) fn page_tokens(&self) -> usize {
+        self.page_tokens
     }
 
     /// Install the VRAM corridors backing frames `0..vram_frames`. Usually one segment; the
@@ -147,7 +193,7 @@ impl PagedKv {
         let held = self.pool.held_frames(Tier::Vram);
         let total = self.pool.capacity_frames(Tier::Vram);
         format!(
-            "entries={} frames_held={}/{} free={} tokens_held={}/{} bytes={:.2}GiB/{:.2}GiB hits={} misses={} demotions={} evictions={}",
+            "entries={} frames_held={}/{} free={} tokens_held={}/{} bytes={:.2}GiB/{:.2}GiB ram={}/{} ram_bytes={:.2}GiB hits={} misses={} demotions={} evictions={} sunk={} promoted={}",
             self.nodes
                 .iter()
                 .filter(|node| node.entry.is_some())
@@ -159,29 +205,142 @@ impl PagedKv {
             total * self.page_tokens,
             gib(held),
             gib(total),
+            self.pool.held_frames(Tier::Ram),
+            self.pool.capacity_frames(Tier::Ram),
+            self.pool.held_bytes(Tier::Ram) as f64 / (1u64 << 30) as f64,
             self.hits,
             self.misses,
             self.demotions,
             self.evictions,
+            self.tier_demotions,
+            self.tier_promotions,
         )
     }
 
     // ---- session-side frame operations ----------------------------------------------------
 
-    /// Claim a fresh frame for a growing session. On an exhausted corridor, evict cold entries
-    /// until one slot frees; `None` when every frame is owned by a live session's chain that the
-    /// tree cannot drop (all entries gone or every remaining frame still ref-pinned by sessions —
-    /// the caller then recycles the slot the old way).
-    pub(crate) fn alloc_frame(&mut self) -> Option<FrameId> {
+    /// Claim a fresh frame for a growing session. The frame arrives ACTIVE: the caller's page
+    /// table points at it immediately, and only active frames are excluded from tier migration.
+    /// On an exhausted corridor, cold tree entries first SINK to RAM (Phase C) and only then are
+    /// evicted; `None` when every frame is owned by a live session's chain that the tree cannot
+    /// drop (all entries gone or every remaining frame still ref-pinned by sessions — the caller
+    /// then recycles the slot the old way).
+    pub(crate) fn alloc_frame<M: FrameDma + ?Sized>(&mut self, be: &M) -> Option<FrameId> {
+        self.claim_frame(be, true, &[])
+    }
+
+    /// Claim one VRAM frame, marking it active (a session table will point at it) or not.
+    /// `protect` names frames a caller is already carrying (e.g. a promotion in flight): the
+    /// sinker must not touch any entry whose chain holds one, because a tier migration REWRITES
+    /// that id in every chain and would strand the caller's copy against a freed slot.
+    fn claim_frame<M: FrameDma + ?Sized>(
+        &mut self,
+        be: &M,
+        active: bool,
+        protect: &[FrameId],
+    ) -> Option<FrameId> {
         if let Some(frame) = self.pool.alloc(Tier::Vram) {
+            self.pool.set_active(frame, active);
             return Some(frame);
+        }
+        // Sink the coldest tree entry to RAM before deleting anything: the prefix survives the
+        // pressure and a later hit pays one DMA instead of a full re-prefill.
+        while self.demote_coldest_entry(be, protect) {
+            if let Some(frame) = self.pool.alloc(Tier::Vram) {
+                self.pool.set_active(frame, active);
+                return Some(frame);
+            }
         }
         while self.evict_cold_one() {
             if let Some(frame) = self.pool.alloc(Tier::Vram) {
+                self.pool.set_active(frame, active);
                 return Some(frame);
             }
         }
         None
+    }
+
+    /// Rewrite every entry-chain occurrence of `source` to `fresh` after a tier migration.
+    /// Entries share positional frames: an ancestor's chain and a descendant's chain carry the
+    /// SAME id at the SAME index (attach reuses the matched chain, publish pins it), and the
+    /// frame's refcount counts exactly those occurrences. `migrate_into` moves the full refcount,
+    /// so ALL chains naming the frame must be rewritten, not just the entry being sunk/promoted —
+    /// otherwise an ancestor would keep a dangling id for a freed slot.
+    fn rewrite_frame_in_entries(&mut self, source: FrameId, fresh: FrameId) {
+        for node in &mut self.nodes {
+            if let Some(entry) = node.entry.as_mut() {
+                for f in entry.chain.iter_mut() {
+                    if *f == source {
+                        *f = fresh;
+                    }
+                }
+            }
+        }
+    }
+
+    /// DMA the coldest RAM-eligible tree entry (leaf-first, LRU — the [`Self::evict_cold_one`]
+    /// order) into the RAM tier and rewrite its chain to RAM ids. Skips entries with any ACTIVE
+    /// frame (a session table points there — migration would corrupt it) and entries already sunk
+    /// (a second sink is a no-op). Returns whether at least one frame left VRAM. A DMA failure
+    /// rolls the entry back frame by frame: whatever already sank stays sunk (its bytes are safe
+    /// in the backing), the rest stay in VRAM, and the entry keeps a consistent mixed chain.
+    fn demote_coldest_entry<M: FrameDma + ?Sized>(&mut self, be: &M, protect: &[FrameId]) -> bool {
+        if self.pool.capacity_frames(Tier::Ram) == 0 {
+            return false;
+        }
+        let mut best: Option<(usize, usize)> = None; // (node, chain length)
+        let mut best_key: Option<(bool, u64, usize)> = None;
+        for (index, node) in self.nodes.iter().enumerate() {
+            let Some(entry) = node.entry.as_ref() else {
+                continue;
+            };
+            if entry.chain.is_empty()
+                || entry.chain.iter().any(|f| !matches!(f.tier(), Tier::Vram))
+                || entry.chain.iter().any(|f| self.pool.is_active(*f))
+                || entry.chain.iter().any(|f| protect.contains(f))
+            {
+                continue;
+            }
+            if self.pool.free_frames(Tier::Ram) < entry.chain.len() {
+                continue;
+            }
+            let key = (self.has_entry_below(index), node.last_access, index);
+            if best_key.is_none_or(|current| key < current) {
+                best_key = Some(key);
+                best = Some((index, entry.chain.len()));
+            }
+        }
+        let Some((node, len)) = best else {
+            return false;
+        };
+        let frame_bytes = self.pool.frame_bytes() as usize;
+        let mut moved = 0usize;
+        for i in 0..len {
+            let source = self.nodes[node].entry.as_ref().unwrap().chain[i];
+            let Some(fresh) = self.pool.alloc(Tier::Ram) else {
+                break; // RAM filled mid-chain: the entry keeps a mixed chain, still consistent
+            };
+            let backing_off = fresh.slot() * frame_bytes;
+            if self.ram_backing.len() < backing_off + frame_bytes {
+                self.ram_backing.resize(backing_off + frame_bytes, 0);
+            }
+            if let Err(error) = be.download_frame(
+                self.pool.frame_addr(source),
+                &mut self.ram_backing[backing_off..backing_off + frame_bytes],
+            ) {
+                self.pool.unpin(fresh);
+                tracing::warn!(
+                    "paged KV could not DMA frame {} to RAM; keeping it in VRAM: {error}",
+                    source.slot()
+                );
+                break;
+            }
+            self.rewrite_frame_in_entries(source, fresh);
+            self.pool.migrate_into(source, fresh);
+            self.tier_demotions += 1;
+            moved += 1;
+        }
+        moved > 0
     }
 
     /// A restoring session takes tree-owned frames: gain one owner each and mark them active
@@ -254,14 +413,74 @@ impl PagedKv {
         Some((node, pages * self.page_tokens))
     }
 
-    /// The entry node's frames covering `reusable` tokens (a chain prefix — frames are positional
-    /// from token 0). Callers pair this with [`Self::session_attach`] under the same lock.
-    pub(crate) fn entry_chain(&self, node: usize, reusable: usize) -> Vec<FrameId> {
+    /// Read-only form of the chain accessor below: the entry node's frames covering `reusable`
+    /// tokens, tiers untouched. Only the unit tests read raw (possibly RAM-tier) chains — every
+    /// production attach path must go through [`Self::entry_chain_promoted`] so a RAM address can
+    /// never reach a page table.
+    #[cfg(test)]
+    fn entry_chain(&self, node: usize, reusable: usize) -> Vec<FrameId> {
         let entry = self.nodes[node]
             .entry
             .as_ref()
             .expect("matched node carries an entry");
         entry.chain[..reusable / self.page_tokens].to_vec()
+    }
+
+    /// The production chain accessor: every RAM frame in the matched prefix is DMA'd
+    /// back into a freshly claimed VRAM slot BEFORE returning, so the caller only ever handles
+    /// device-addressable frames (the page table never sees a RAM address). VRAM claims go
+    /// through [`Self::claim_frame`], so a full corridor sinks/evicts other cold entries first —
+    /// the just-hit chain is skipped by the sinker because [`Self::best_match`] refreshed its
+    /// LRU stamp. If VRAM cannot yield a slot for frame `k`, the chain truncates at `k` frames:
+    /// the caller recomputes the reuse length from the returned length (`len * page_tokens()`),
+    /// and the un-promoted tail stays sunk in RAM for a later hit. A mid-chain DMA failure
+    /// truncates the same way; already-promoted frames are committed to the tree chain.
+    pub(crate) fn entry_chain_promoted<M: FrameDma + ?Sized>(
+        &mut self,
+        be: &M,
+        node: usize,
+        reusable: usize,
+    ) -> Vec<FrameId> {
+        let pages = reusable / self.page_tokens;
+        let frame_bytes = self.pool.frame_bytes() as usize;
+        let mut out = Vec::with_capacity(pages);
+        for i in 0..pages {
+            let frame = self.nodes[node]
+                .entry
+                .as_ref()
+                .expect("matched node carries an entry")
+                .chain[i];
+            if matches!(frame.tier(), Tier::Vram) {
+                out.push(frame);
+                continue;
+            }
+            let backing_off = frame.slot() * frame_bytes;
+            if backing_off + frame_bytes > self.ram_backing.len() {
+                // Bookkeeping can only reach here if the backing shrank under a bug; refuse the
+                // promotion rather than DMA garbage bytes into the corridor.
+                tracing::warn!("paged KV promotion found no backing for RAM frame {}", frame.slot());
+                break;
+            }
+            let Some(fresh) = self.claim_frame(be, false, &out) else {
+                break; // corridor cannot yield: truncate the reuse here
+            };
+            if let Err(error) = be.upload_frame(
+                self.pool.frame_addr(fresh),
+                &self.ram_backing[backing_off..backing_off + frame_bytes],
+            ) {
+                self.pool.unpin(fresh);
+                tracing::warn!(
+                    "paged KV could not DMA frame {} back to VRAM; re-prefilling from here: {error}",
+                    frame.slot()
+                );
+                break;
+            }
+            self.rewrite_frame_in_entries(frame, fresh);
+            self.pool.migrate_into(frame, fresh);
+            self.tier_promotions += 1;
+            out.push(fresh);
+        }
+        out
     }
 
     /// Publish a demoted session's conversation. `chain` must cover exactly the complete pages of
@@ -521,8 +740,13 @@ mod tests {
     const FB: u64 = 1 << 20;
 
     fn cache(vram_frames: usize) -> PagedKv {
-        // Two planes so plane_addr exercises the offset prefix sums.
-        let mut kv = PagedKv::new(FB, PAGE, vec![0, FB / 2], vram_frames, 0);
+        // Two planes so plane_addr exercises the offset prefix sums. RAM tier off: the tree
+        // behaves exactly like Phase B (cold entries evict instead of sink).
+        cache_ram(vram_frames, 0)
+    }
+
+    fn cache_ram(vram_frames: usize, ram_frames: usize) -> PagedKv {
+        let mut kv = PagedKv::new(FB, PAGE, vec![0, FB / 2], vram_frames, ram_frames);
         kv.set_vram_segments(&[KvFrameCorridor {
             base: 0x1_0000_0000,
             frames: vram_frames,
@@ -530,10 +754,53 @@ mod tests {
         kv
     }
 
-    /// A session-shaped chain: `pages` freshly allocated frames (one session owner each).
+    /// Deterministic "corridor content" for one frame byte: [`MockDma`] writes it on download
+    /// and demands to see exactly it on upload, so a sunk-then-promoted frame proves the bytes
+    /// round-tripped through the host backing untouched.
+    fn pattern(addr: u64, i: usize) -> u8 {
+        let x = addr.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (i as u64).wrapping_mul(0x0100_0000_01B3);
+        (x >> 32) as u8
+    }
+
+    /// Host-side DMA stand-in: downloads stamp a frame's corridor bytes with [`pattern`],
+    /// uploads must replay the pattern of some frame this mock ever downloaded — content
+    /// that vanished from VRAM can only come back through the backing it wrote.
+    #[derive(Default)]
+    struct MockDma {
+        downloaded: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl FrameDma for MockDma {
+        fn download_frame(&self, frame_addr: u64, dst: &mut [u8]) -> Result<()> {
+            for (i, byte) in dst.iter_mut().enumerate() {
+                *byte = pattern(frame_addr, i);
+            }
+            self.downloaded.lock().unwrap().push(frame_addr);
+            Ok(())
+        }
+        fn upload_frame(&self, frame_addr: u64, src: &[u8]) -> Result<()> {
+            let replayed = self.downloaded.lock().unwrap().iter().any(|&addr| {
+                src.iter()
+                    .enumerate()
+                    .all(|(i, byte)| *byte == pattern(addr, i))
+            });
+            if replayed {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "mock DMA upload of frame slot {frame_addr} matches no downloaded frame"
+                ))
+            }
+        }
+    }
+
+    /// A session-shaped chain: `pages` freshly allocated frames (one session owner each). The
+    /// throwaway DMA is fine here — growth only claims free corridor frames (demotion needs
+    /// pressure a free corridor cannot offer), tests that verify DMA carry their own handle.
     fn grow(kv: &mut PagedKv, pages: usize) -> Vec<FrameId> {
+        let dma = MockDma::default();
         (0..pages)
-            .map(|_| kv.alloc_frame().expect("corridor has room"))
+            .map(|_| kv.alloc_frame(&dma).expect("corridor has room"))
             .collect()
     }
 
@@ -630,7 +897,7 @@ mod tests {
         kv.session_release(&a); // tree-only owners; corridor now fully held by the entry
         assert_eq!(kv.pool.free_frames(Tier::Vram), 0);
         // A new conversation needs a frame: the cold leaf entry is evicted, its frames freed.
-        let b = kv.alloc_frame().expect("eviction made room");
+        let b = kv.alloc_frame(&MockDma::default()).expect("eviction made room");
         assert_eq!(kv.evictions, 1);
         assert_eq!(
             kv.best_match(&(1..=8).collect::<Vec<_>>()),
@@ -656,11 +923,11 @@ mod tests {
         let (node, reusable) = kv.best_match(&(1..=8).collect::<Vec<_>>()).unwrap();
         assert_eq!(reusable, 8);
         assert_eq!(kv.entry_chain(node, reusable), a);
-        let (node, reusable) = kv.best_match(&vec![1, 2, 3, 4, 9, 10, 11, 12]).unwrap();
+        let (node, reusable) = kv.best_match(&[1, 2, 3, 4, 9, 10, 11, 12]).unwrap();
         assert_eq!(reusable, 8);
         assert_eq!(kv.entry_chain(node, reusable), b_frames);
         // A prompt diverging inside the split edge still shares the complete first page.
-        let (node, reusable) = kv.best_match(&vec![1, 2, 3, 4, 5, 99]).unwrap();
+        let (node, reusable) = kv.best_match(&[1, 2, 3, 4, 5, 99]).unwrap();
         assert_eq!(reusable, 4);
         assert_eq!(kv.entry_chain(node, reusable), vec![a[0]]);
     }
@@ -683,7 +950,9 @@ mod tests {
         // release alone mirror the checkout demotion: after it the tree owns the chain alone.
         let mut kv = cache(2);
         for seed in 0..20u32 {
-            let chain = kv.alloc_frame().expect("frames recycle as the LRU leaves");
+            let chain = kv
+                .alloc_frame(&MockDma::default())
+                .expect("frames recycle as the LRU leaves");
             let chain = vec![chain];
             let tokens = [seed * 10 + 1, seed * 10 + 2, seed * 10 + 3, seed * 10 + 4].to_vec();
             kv.publish(tokens, chain.clone()).unwrap();
@@ -691,7 +960,9 @@ mod tests {
         }
         let steady = kv.nodes.len();
         for seed in 20..40u32 {
-            let chain = kv.alloc_frame().expect("frames recycle as the LRU leaves");
+            let chain = kv
+                .alloc_frame(&MockDma::default())
+                .expect("frames recycle as the LRU leaves");
             let chain = vec![chain];
             let tokens = [seed * 10 + 1, seed * 10 + 2, seed * 10 + 3, seed * 10 + 4].to_vec();
             kv.publish(tokens, chain.clone()).unwrap();
@@ -712,11 +983,11 @@ mod tests {
     #[test]
     fn superseded_pass_through_spine_merges_into_the_deeper_entry() {
         let mut kv = cache(4);
-        let f1 = kv.alloc_frame().unwrap();
+        let f1 = kv.alloc_frame(&MockDma::default()).unwrap();
         kv.publish(vec![1, 2, 3, 4], vec![f1]).unwrap();
         kv.session_release(&[f1]);
-        let f2 = kv.alloc_frame().unwrap();
-        let f3 = kv.alloc_frame().unwrap();
+        let f2 = kv.alloc_frame(&MockDma::default()).unwrap();
+        let f3 = kv.alloc_frame(&MockDma::default()).unwrap();
         kv.publish(vec![1, 2, 3, 4, 5, 6, 7, 8], vec![f2, f3])
             .unwrap();
         kv.session_release(&[f2, f3]);
@@ -732,5 +1003,108 @@ mod tests {
             .best_match(&[1, 2, 3, 4, 5, 6, 7, 8])
             .expect("the full conversation matches");
         assert_eq!(reusable, 8);
+    }
+
+    #[test]
+    fn cold_chain_sinks_to_ram_and_promotes_back_on_hit() {
+        let mut kv = cache_ram(2, 4);
+        let dma = MockDma::default();
+        let a = grow(&mut kv, 2);
+        kv.publish((1..=8).collect(), a.clone()).unwrap();
+        kv.session_release(&a); // tree-only owners; corridor fully held by the entry
+        assert_eq!(kv.pool.free_frames(Tier::Vram), 0);
+        // Corridor pressure sinks the published chain instead of evicting it: the prefix
+        // survives in RAM and the fresh request gets its frame.
+        let fresh = kv.alloc_frame(&dma).expect("sinking freed a VRAM frame");
+        assert_eq!(kv.tier_demotions, 2, "both frames left the corridor");
+        assert_eq!(kv.evictions, 0, "sinking precedes eviction");
+        assert_eq!(kv.pool.held_frames(Tier::Ram), 2);
+        // A fully sunk chain still matches; the entry is not gone, only resting.
+        let (node, reusable) = kv.best_match(&(1..=8).collect::<Vec<u32>>()).unwrap();
+        assert_eq!(reusable, 8);
+        // Give the corridor its frame back so the whole chain can promote at once.
+        kv.session_release(&[fresh]);
+        // Promotion hands out device-addressable frames only (the page table never sees a RAM
+        // id) and the mock's pattern check proves the bytes came back through the backing.
+        let back = kv.entry_chain_promoted(&dma, node, reusable);
+        assert_eq!(back.len(), 2);
+        assert!(
+            back.iter().all(|f| matches!(f.tier(), Tier::Vram)),
+            "the attach path only ever sees VRAM frames"
+        );
+        assert_eq!(kv.tier_promotions, 2);
+        assert_eq!(kv.pool.held_frames(Tier::Ram), 0, "backing slots recycled");
+        assert_eq!(kv.pool.held_frames(Tier::Vram), 2);
+        // The entry chain was rewritten in place: a second pass promotes nothing.
+        let again = kv.entry_chain_promoted(&dma, node, reusable);
+        assert_eq!(again, back);
+        assert_eq!(kv.tier_promotions, 2, "VRAM frames pass straight through");
+    }
+
+    #[test]
+    fn active_chains_are_never_sunk() {
+        let mut kv = cache_ram(2, 4);
+        let dma = MockDma::default();
+        let a = grow(&mut kv, 2); // still active: a session table points here
+        kv.publish((1..=8).collect(), a.clone()).unwrap();
+        // Session AND tree own the frames and the session is live: nothing may DMA out, and
+        // eviction cannot free bytes out from under the session either.
+        assert!(
+            kv.alloc_frame(&dma).is_none(),
+            "a corridor of only-active frames yields nothing"
+        );
+        assert_eq!(kv.tier_demotions, 0, "active frames are not DMA candidates");
+        assert_eq!(kv.pool.held_frames(Tier::Ram), 0);
+        assert_eq!(
+            kv.pool.held_frames(Tier::Vram),
+            2,
+            "the session owner keeps the bytes"
+        );
+        assert!(kv.pool.is_active(a[0]));
+    }
+
+    #[test]
+    fn shared_frames_follow_their_migration_across_both_chains() {
+        // Branch A (tokens 1..=8, frames a0+a1) and branch B (1,2,3,4,9..=12, frames a0+b1)
+        // share a0. Sinking either leaf must rewrite a0 in BOTH chains (refcount travels with
+        // `migrate_into`), and a promotion must hand both chains the same fresh id again.
+        let mut kv = cache_ram(3, 4);
+        let dma = MockDma::default();
+        let a = grow(&mut kv, 2);
+        kv.publish((1..=8).collect(), a.clone()).unwrap();
+        kv.session_release(&a);
+        // Session B restores the shared first page (attach gains its owner), grows one divergence
+        // page, publishes, then demotes — the full checkout shape.
+        kv.session_attach(&[a[0]]);
+        let mut b = vec![a[0]];
+        b.push(grow(&mut kv, 1)[0]);
+        kv.publish(vec![1, 2, 3, 4, 9, 10, 11, 12], b.clone())
+            .unwrap();
+        kv.session_release(&b);
+        assert_eq!(kv.pool.refcount(a[0]), 2, "both entries own the shared frame");
+        // Pressure sinks the coldest leaf (whichever it picks); both branches must survive.
+        let c = kv
+            .alloc_frame(&dma)
+            .expect("sinking a leaf freed a VRAM frame");
+        assert!(kv.tier_demotions >= 1);
+        assert!(kv.best_match(&(1..=8).collect::<Vec<u32>>()).is_some());
+        assert!(
+            kv.best_match(&[1, 2, 3, 4, 9, 10, 11, 12]).is_some(),
+            "sinking never deletes an entry"
+        );
+        kv.session_release(&[c]);
+        // Promote branch A fully, then branch B: the shared frame must land on one id owned
+        // by exactly two chains again.
+        let (node_a, reusable_a) = kv.best_match(&(1..=8).collect::<Vec<u32>>()).unwrap();
+        let back_a = kv.entry_chain_promoted(&dma, node_a, reusable_a);
+        assert_eq!(back_a.len(), 2, "the corridor can host the whole chain");
+        let (node_b, reusable_b) = kv
+            .best_match(&[1, 2, 3, 4, 9, 10, 11, 12])
+            .unwrap();
+        let back_b = kv.entry_chain_promoted(&dma, node_b, reusable_b);
+        assert_eq!(back_b.len(), 2);
+        assert_eq!(back_a[0], back_b[0], "shared frame id agrees again");
+        assert_eq!(kv.pool.refcount(back_a[0]), 2, "shared ownership survived the trip");
+        assert_eq!(kv.pool.held_frames(Tier::Ram), 0, "the tier is empty again");
     }
 }

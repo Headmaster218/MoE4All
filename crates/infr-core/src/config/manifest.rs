@@ -128,6 +128,9 @@ knobs! {
     "INFR_AUTO_PROFILE"         => "device.auto_profile",      Literal, Error, "aggressive", migrated;
     "INFR_VRAM_BUDGET"          => "device.vram_budget",       Size, Ignored, "23GiB",   migrated;
     "INFR_RAM_BUDGET"           => "device.ram_budget",        Size, Ignored, "50GiB",   migrated;
+    "INFR_MEM_GUARD_HEADROOM"   => "device.mem_guard_headroom", Size, Ignored, "8GiB",   migrated;
+    "INFR_MEM_GUARD_RAM_HEADROOM"  => "device.mem_guard_ram_headroom", Size, Ignored, "4GiB",  migrated;
+    "INFR_MEM_GUARD_POLL_MS"    => "device.mem_guard_poll_ms", Int,  Ignored, "500",     migrated;
     "INFR_VRAM_RESERVE"         => "device.vram_reserve",      Size, Ignored, "512MiB",  migrated;
     "INFR_UBATCH"               => "device.ubatch",            Int,  Ignored, "512",     migrated;
     "INFR_UBATCH_PARALLEL"      => "device.ubatch_parallel",   Int,  Ignored, "128",     migrated;

@@ -104,6 +104,26 @@ cfg_struct! {
         /// weight cache. Unset keeps automatic sizing with system headroom; zero disables the
         /// host cache. Percentages resolve against total physical host RAM.
         ram_budget: Option<SizeSpec> = None,
+        /// `INFR_MEM_GUARD_HEADROOM`: commit-charge circuit-breaker water line. When the system's
+        /// remaining commit headroom (Windows `ullAvailPageFile`, which WDDM device memory also
+        /// charges) drops below this, the process exits with code 87 instead of sliding into a
+        /// paging storm or a driver AV — the 2026-10-19 gray-zone-prefill miss storm grew host
+        /// staging to ~145 GiB through thousands of small allocations no downstream budget caught.
+        /// The default guards hard commit exhaustion only; miss-storm TESTING wants a much taller
+        /// line (e.g. `50%` of RAM) so the trip lands before RAM itself runs out. Zero disables.
+        mem_guard_headroom: Option<SizeSpec> = Some(SizeSpec::Bytes(
+            crate::memguard::DEFAULT_HEADROOM_BYTES,
+        )),
+        /// `INFR_MEM_GUARD_RAM_HEADROOM`: the breaker's PHYSICAL-RAM water line — the sensitive
+        /// axis on big-budget boxes, where a healthy boot legitimately keeps only ~46 GiB of
+        /// commit headroom while the active working set (not commit) is what overruns RAM into a
+        /// paging storm. Trips when available physical RAM drops below this. The default guards
+        /// imminent death only; miss-storm TESTING wants a taller line (e.g. 8-16 GiB) that lands
+        /// before the storm starts. Zero disables this axis.
+        mem_guard_ram_headroom: Option<SizeSpec> = Some(SizeSpec::Bytes(4u64 << 30)),
+        /// `INFR_MEM_GUARD_POLL_MS`: breaker poll interval; inline checks at the staging floodgates
+        /// cover the ramps between polls.
+        mem_guard_poll_ms: u64 = 500,
         /// `INFR_VRAM_RESERVE`: additional device memory kept outside the backend's allocation
         /// budget, on top of the Vulkan allocator's built-in safety guard. Percentages resolve
         /// against total device-local memory.
@@ -319,11 +339,16 @@ cfg_struct! {
         sg_nr: u32 = 2,
         /// `INFR_GEMV_ID_GRID_NR`: output rows handled per 64-thread paged IQ id-GEMV workgroup.
         id_grid_nr: u32 = 8,
-        /// Output rows per immutable-codebook paged IQ2_S/IQ3_S workgroup. None selects the
+        /// Output rows per immutable-codebook paged IQ2_S/IQ3_S/IQ3_XXS workgroup. None selects the
         /// measured device policy; Some(1/2/4/8) is an explicit A/B override.
         id_grid_buffer_nr: Option<u32> = None,
-        /// Immutable IQ codebooks. None selects measured Windows/RDNA3 Decode shapes only.
+        /// Immutable IQ codebooks (IQ2_S/IQ3_S/IQ3_XXS). None selects measured Windows/RDNA3 Decode
+        /// shapes only (the Qwen3.8-Flash-Next GSQ mixed-quant banks hit 2560x640 gate/up).
         id_grid_buffer: Option<bool> = None,
+        /// A/B gate for enrolling Q5_1 expert-down banks (the UD-Q4_K_XL Qwen3.8-Flash-Next stores
+        /// 43 of 48 downs as Q5_1 at the 640x2560 SG band shape) into the subgroup id-GEMV. False
+        /// keeps the tree id kernel until the model A/B lands. `--set kernels.vulkan.gemv.id_sg_q51`.
+        id_sg_q51: bool = false,
         /// Bit-identical Wave32 large-K Q8_0 Decode GEMV. None selects measured Windows/RDNA3
         /// Decode shapes only; Some(false/true) is an explicit A/B override.
         q8_wave32: Option<bool> = None,

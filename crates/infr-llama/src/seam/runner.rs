@@ -43,18 +43,34 @@ pub(crate) trait MtpPrefillHiddenSink {
     ) -> AResult<()>;
 }
 
+/// End of one batched-prefill chunk: the earliest TURN_CHECKPOINT boundary inside the ubatch, or
+/// the natural ubatch end.
+///
+/// `min_rows` is the layer-ring threshold (see [`prefill_uses_layer_ring`]): while a round PAID the
+/// ring reserve, a boundary that would starve the chunk below the threshold is skipped (the
+/// 2026-10-19 memory-bomb fix). Skipping is functionally free — recurrent checkpoints publish only
+/// when a chunk ends exactly on the boundary (`Some(cend) == boundary` at the snapshot sites), so a
+/// starved boundary simply degrades to "no reuse checkpoint this turn" instead of misaligning.
+/// Without it, a 160-token prompt was cut into 45+115-row chunks below every ring decision, the
+/// reserve was paid without the ring ever being used, and the gray chunks storm-missed hundreds of
+/// experts per layer through the emptied corridor into unbounded staging (~23 GiB/s of commit).
 fn prefill_chunk_end(
     start: usize,
     end: usize,
     rows: usize,
     checkpoint_boundaries: &[Option<usize>; super::TURN_CHECKPOINT_COUNT],
+    min_rows: usize,
 ) -> usize {
     let natural_end = start.saturating_add(rows).min(end);
     checkpoint_boundaries
         .iter()
         .flatten()
         .copied()
-        .filter(|&boundary| start < boundary && boundary < natural_end)
+        .filter(|&boundary| {
+            start < boundary
+                && boundary < natural_end
+                && boundary.saturating_sub(start) >= min_rows
+        })
         .min()
         .unwrap_or(natural_end)
 }
@@ -87,6 +103,19 @@ fn prefill_runtime_candidates(
             (rows, reserve)
         })
         .collect()
+}
+
+/// Chunk height where one row-slot stops touching more experts than `3 * n_expert` amortizes a
+/// full-layer ring pass — the SAME threshold [`prefill_chunk_end`] must not starve below on a paid
+/// round, and the Vulkan adapter's per-graph `moe_static_phase` boundary. Kept as one expression
+/// so the gate, the chunker and the adapter can never disagree again (2026-10-19 conviction: they
+/// disagreed through the prompt LENGTH vs the actual CHUNK rows and starved the ring).
+pub(crate) fn ring_min_rows(c: &Config) -> Option<usize> {
+    c.moe.map(|moe| {
+        3usize
+            .saturating_mul(moe.n_expert)
+            .div_ceil(moe.n_used.max(1))
+    })
 }
 
 fn prefill_uses_layer_ring(c: &Config, remaining: usize, ubatch: usize) -> bool {
@@ -11170,7 +11199,17 @@ fn generate_dense_backend_inner(
         };
         let pf_end = prompt.len() - 1;
         let mut prefill_runtime_reserve = None;
-        if be.moe_paged() && prefill_uses_layer_ring(c, pf_end.saturating_sub(start), ubatch) {
+        // The round pays the ring reserve iff this gate is true; `ring_floor` then forbids any
+        // TURN_CHECKPOINT from cutting a chunk under the threshold the reserve was priced with
+        // (2026-10-19 memory-bomb fix, see `prefill_chunk_end`).
+        let ring_round =
+            be.moe_paged() && prefill_uses_layer_ring(c, pf_end.saturating_sub(start), ubatch);
+        let ring_floor = if ring_round {
+            ring_min_rows(c).unwrap_or(0)
+        } else {
+            0
+        };
+        if ring_round {
             let _gp = req.and_then(|request| request.gate_pass());
             ensure_kv_depth!(pf_end);
             let candidates = prefill_runtime_candidates(
@@ -11221,7 +11260,7 @@ fn generate_dense_backend_inner(
             let mut v = Vec::new();
             let mut cs = start;
             while cs < pf_end {
-                let ce = prefill_chunk_end(cs, pf_end, ubatch, &turn_checkpoint_boundaries);
+                let ce = prefill_chunk_end(cs, pf_end, ubatch, &turn_checkpoint_boundaries, ring_floor);
                 v.push((cs, ce));
                 cs = ce;
             }
@@ -13130,9 +13169,41 @@ mod tests {
     #[test]
     fn ordinary_prefill_chunks_stop_at_turn_checkpoints() {
         let checkpoints = [Some(789), Some(2405)];
-        assert_eq!(prefill_chunk_end(0, 4063, 2048, &checkpoints), 789);
-        assert_eq!(prefill_chunk_end(789, 4063, 2048, &checkpoints), 2405);
-        assert_eq!(prefill_chunk_end(2405, 4063, 2048, &checkpoints), 4063);
+        assert_eq!(prefill_chunk_end(0, 4063, 2048, &checkpoints, 0), 789);
+        assert_eq!(prefill_chunk_end(789, 4063, 2048, &checkpoints, 0), 2405);
+        assert_eq!(prefill_chunk_end(2405, 4063, 2048, &checkpoints, 0), 4063);
+    }
+
+    #[test]
+    fn ring_rounds_never_starve_a_chunk_below_the_ring_threshold() {
+        // The 2026-10-19 bomb shape: a 160-token prompt with a checkpoint at 45. Under min_rows=0
+        // (unpaid round) the boundary still wins; on a paid ring round (min_rows=154) it is skipped
+        // and the whole suffix rides the ring the reserve paid for.
+        let starving = [Some(45), None];
+        assert_eq!(prefill_chunk_end(0, 159, 2048, &starving, 0), 45);
+        assert_eq!(prefill_chunk_end(0, 159, 2048, &starving, 154), 159);
+        // A qualifying boundary keeps working on paid rounds (skip only starves).
+        let healthy = [Some(160), None];
+        assert_eq!(prefill_chunk_end(0, 4063, 2048, &healthy, 154), 160);
+        // `ring_min_rows` agrees with the gate exactly at 153/154 (n_used=10, n_expert=512).
+        let cfg = crate::Config {
+            moe: Some(crate::MoeConfig {
+                n_expert: 512,
+                n_used: 10,
+                n_ff_exp: 640,
+                scale: 1.0,
+                gating: infr_core::graph::MoeGating::Sigmoid,
+                norm_w: true,
+                weight_before: false,
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(super::ring_min_rows(&cfg), Some(154));
+        assert!(!super::prefill_uses_layer_ring(&cfg, 153, 4096));
+        assert!(super::prefill_uses_layer_ring(&cfg, 154, 4096));
+        assert_eq!(super::ring_min_rows(&crate::Config::default()), None);
     }
 
     #[test]

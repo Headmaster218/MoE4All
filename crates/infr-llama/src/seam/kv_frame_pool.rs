@@ -324,13 +324,34 @@ impl FramePool {
             .collect()
     }
 
-    /// Move a frame's bookkeeping to a fresh slot of `target` *after* the
-    /// caller has DMA'd the bytes there (demote/promote). Owners and the cold
-    /// LRU stamp carry over, so a demoted frame does not look brand-new to the
-    /// next trim; the source slot returns to its tier's free list. `None` when
-    /// the target tier is full — the source is left untouched, so the caller
-    /// trims the target tier first. Active frames must not migrate (the
-    /// in-VRAM pin invariant).
+    /// Finish a migration whose bytes the caller already DMA'd into the PREALLOCATED `fresh`
+    /// slot of the other tier (Phase C: the host-side bookkeeper needs the destination address —
+    /// `frame_addr(fresh)` on the RAM tier is its offset into the host backing — BEFORE the bytes
+    /// move, which `transfer`'s atomic alloc cannot offer). Owners and the cold LRU stamp carry
+    /// over exactly as in [`Self::transfer`], and the source slot returns to its tier's free list.
+    /// `fresh` must be a freshly allocated (single-owner, inactive) slot of the opposite tier.
+    pub(crate) fn migrate_into(&mut self, id: FrameId, fresh: FrameId) {
+        let source = id.tier();
+        assert_ne!(source, fresh.tier(), "migrate_into between the same tier");
+        let (owners, lru) = {
+            let s = self.slot(id);
+            debug_assert!(!s.active, "active frame {id:?} must stay pinned");
+            (s.refcount, s.lru)
+        };
+        {
+            let dest = self.slot_mut(fresh);
+            debug_assert_eq!(dest.refcount, 1, "fresh slot {fresh:?} must be a fresh alloc");
+            debug_assert!(!dest.active, "fresh slot {fresh:?} must not be active");
+            dest.refcount = owners;
+            dest.lru = lru;
+        }
+        let t = &mut self.tiers[Self::idx(source)];
+        t.slots[id.slot()].refcount = 0;
+        t.slots[id.slot()].active = false;
+        t.free.push_back(id.slot());
+        t.held -= 1;
+    }
+
     pub(crate) fn transfer(&mut self, id: FrameId, target: Tier) -> Option<FrameId> {
         let source = id.tier();
         assert_ne!(source, target, "transfer between the same tier");
@@ -505,6 +526,41 @@ mod tests {
             p.frame_addr(FrameId::new(Tier::Vram, 4)),
             0x9000_0000 + 2 * FB
         );
+    }
+
+    #[test]
+    fn migrate_into_carries_owners_lru_and_frees_the_source() {
+        let mut p = FramePool::new(FB, 2, 2);
+        p.set_segments(
+            Tier::Vram,
+            &[KvFrameCorridor {
+                base: 0x1000_0000,
+                frames: 2,
+            }],
+        );
+        let a = p.alloc(Tier::Vram).unwrap(); // clock 1: cold stamp to carry over
+        p.pin(a); // two entry chains share the frame
+        let _b = p.alloc(Tier::Vram).unwrap(); // clock 2
+        let r = p.alloc(Tier::Ram).unwrap();
+        p.migrate_into(a, r);
+        assert_eq!(p.refcount(r), 2, "owners carry over");
+        assert_eq!(p.held_frames(Tier::Vram), 1);
+        assert_eq!(p.held_frames(Tier::Ram), 1);
+        assert_eq!(p.free_frames(Tier::Vram), 1, "source slot is back on the list");
+        let a2 = p.alloc(Tier::Vram).unwrap();
+        assert_eq!(a2, a, "the freed source slot is reusable");
+        assert!(!p.is_active(r), "the migrated frame is not active");
+        // The cold stamp carried over: a frame freshly allocated into RAM after the
+        // migration sorts behind the demoted one.
+        let c = p.alloc(Tier::Ram).unwrap();
+        let cold = p.cold_candidates(Tier::Ram, 2);
+        assert_eq!(cold[0], r, "demoted frame keeps its cold LRU");
+        assert_eq!(cold[1], c);
+        // The RAM frame's "address" is its offset into the host backing (no corridor).
+        assert_eq!(p.frame_addr(r), r.slot() as u64 * FB);
+        assert!(!p.unpin(r) && p.unpin(r), "both owners survive");
+        let _ = p.unpin(c);
+        let _ = p.unpin(a2);
     }
 
     #[test]

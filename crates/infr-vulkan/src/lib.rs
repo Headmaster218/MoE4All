@@ -2585,6 +2585,11 @@ pub struct VulkanBackend {
     bda_weight_arena: Mutex<Option<BdaWeightArena>>,
     iq2s_grid: Option<Arc<dyn Buffer>>,
     iq3s_grid: Option<Arc<dyn Buffer>>,
+    /// IQ3_XXS codebook + KSIGNS staged in one L2-resident buffer (binding 0) for the paged
+    /// grid-buffer GEMV. Unlike IQ2_S/IQ3_S (single table), IQ3_XXS's dq reads TWO tables — the
+    /// 256-word `G_IQ3XXS` grid and the 128-word `KSIGNS` sign table — so this buffer carries both,
+    /// contiguous, matching the `IQ3XXS_GRID_BUFFER` SSBO block layout in native_decode.glsl.
+    iq3xxs_grid: Option<Arc<dyn Buffer>>,
     /// Service-level elastic VRAM arena. Kept on backend handles rather than `VulkanShared`
     /// because its physical shard buffers retain `Arc<VulkanShared>` and would otherwise form a
     /// device-leaking reference cycle.
@@ -4607,6 +4612,7 @@ impl VulkanBackend {
             bda_weight_arena: Mutex::new(None),
             iq2s_grid: None,
             iq3s_grid: None,
+            iq3xxs_grid: None,
             unified_pool: Arc::new(Mutex::new(None)),
             unified_exec: Arc::new(RwLock::new(())),
             unified_phases,
@@ -4703,6 +4709,17 @@ impl VulkanBackend {
                 bytemuck::cast_slice(&infr_core::iquant_grids::IQ3S_GRID),
             )?;
             backend.iq3s_grid = Some(Arc::new(grid));
+            // IQ3_XXS dq reads TWO tables (grid + sign), so the buffer carries both contiguous,
+            // matching the `IQ3XXS_GRID_BUFFER` SSBO block (G_IQ3XXS[256] then KSIGNS[128]).
+            let mut xx_words: Vec<u32> = infr_core::iquant_grids::IQ3XXS_GRID.to_vec();
+            xx_words.extend(infr_core::iquant_grids::KSIGNS_IQ2XS.iter().map(|&v| v as u32));
+            let grid = backend.make_buf(
+                xx_words.len() * 4,
+                MemoryLocation::GpuOnly,
+                "iq3xxs-grid",
+            )?;
+            backend.upload(&grid, bytemuck::cast_slice(&xx_words))?;
+            backend.iq3xxs_grid = Some(Arc::new(grid));
         }
 
         Ok(backend)
@@ -6019,6 +6036,7 @@ impl VulkanBackend {
             bda_weight_arena: Mutex::new(None),
             iq2s_grid: self.iq2s_grid.clone(),
             iq3s_grid: self.iq3s_grid.clone(),
+            iq3xxs_grid: self.iq3xxs_grid.clone(),
             unified_pool: Arc::clone(&self.unified_pool),
             unified_exec: Arc::clone(&self.unified_exec),
             unified_phases: Arc::clone(&self.unified_phases),
@@ -7887,6 +7905,38 @@ impl Backend for VulkanBackend {
             installed.remove(index);
         }
         Ok(())
+    }
+
+    fn kv_frame_download(&self, frame_addr: u64, dst: &mut [u8]) -> Result<()> {
+        // Phase C demotion: locate the installed corridor holding this frame and range-copy its
+        // bytes to host memory. The caller holds the GPU baton (no dispatch may read the corridor
+        // while a frame leaves it), so no extra device-side sync is taken here.
+        let installed = self.kv_corridors.lock().unwrap();
+        for (base, buffer) in installed.iter() {
+            let committed = self.buffer_committed_bytes(buffer)? as u64;
+            if frame_addr >= *base && frame_addr.saturating_add(dst.len() as u64) <= *base + committed {
+                let offset = (frame_addr - *base) as usize;
+                return self.download_range(buffer, offset, dst);
+            }
+        }
+        Err(be(
+            "KV frame DMA address lies outside every installed frame corridor",
+        ))
+    }
+
+    fn kv_frame_upload(&self, frame_addr: u64, src: &[u8]) -> Result<()> {
+        // Phase C promotion: the mirror direction, same baton discipline.
+        let installed = self.kv_corridors.lock().unwrap();
+        for (base, buffer) in installed.iter() {
+            let committed = self.buffer_committed_bytes(buffer)? as u64;
+            if frame_addr >= *base && frame_addr.saturating_add(src.len() as u64) <= *base + committed {
+                let offset = (frame_addr - *base) as usize;
+                return self.upload_range(buffer, offset, src);
+            }
+        }
+        Err(be(
+            "KV frame DMA address lies outside every installed frame corridor",
+        ))
     }
 
     /// Copy `src` (host slice) into `dst` (device buffer).

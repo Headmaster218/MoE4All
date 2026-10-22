@@ -142,6 +142,9 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     }
     p.device.vram_budget = opt_size(get, "INFR_VRAM_BUDGET");
     p.device.ram_budget = opt_size(get, "INFR_RAM_BUDGET");
+    p.device.mem_guard_headroom = opt_size(get, "INFR_MEM_GUARD_HEADROOM");
+    p.device.mem_guard_ram_headroom = opt_size(get, "INFR_MEM_GUARD_RAM_HEADROOM");
+    p.device.mem_guard_poll_ms = num(get, "INFR_MEM_GUARD_POLL_MS");
     p.device.vram_reserve = opt_size(get, "INFR_VRAM_RESERVE");
     // §6.12: the VALUE (`>0`, else fall through) and the PRESENCE (the placement sweeps' "the user
     // pinned a height") are recorded separately — `INFR_UBATCH=0`/`=abc` is specified-but-unusable.

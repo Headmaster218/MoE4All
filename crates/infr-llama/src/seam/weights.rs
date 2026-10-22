@@ -610,7 +610,7 @@ impl SegmentedKvState {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             while self.chain.len() < segments {
                 let page = self.chain.len();
-                let frame = kv.alloc_frame().ok_or_else(|| {
+                let frame = kv.alloc_frame(be).ok_or_else(|| {
                     anyhow!("paged KV corridor exhausted at page {page} (every frame is owned by a live session)")
                 })?;
                 for (plane, &buffer) in buffers.iter().enumerate() {

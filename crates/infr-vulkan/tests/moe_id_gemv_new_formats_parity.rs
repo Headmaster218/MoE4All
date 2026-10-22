@@ -50,6 +50,7 @@ fn block_geom(dt: DType) -> (usize, usize) {
         DType::Iq3S => (256, 110),
         DType::Q5K => (256, 176),
         DType::Q6K => (256, 210),
+        DType::Q5_1 => (32, 24),
         DType::Iq1S => (256, 50),
         DType::Iq1M => (256, 56),
         DType::Bf16 | DType::F16 => (1, 2),
@@ -88,6 +89,11 @@ fn synth_block(dt: DType, rng: &mut Rng) -> Vec<u8> {
             b[2..4].copy_from_slice(&half::f16::from_f32(0.01).to_le_bytes());
         }
         DType::Q6K => b[208..210].copy_from_slice(&d16),
+        // Q5_1: leading f16 d and f16 m; qh[4]+qs[16] payload is total bit-math (y = d*q5 + m).
+        DType::Q5_1 => {
+            b[0..2].copy_from_slice(&d16);
+            b[2..4].copy_from_slice(&half::f16::from_f32(0.01).to_le_bytes());
+        }
         // IQ1_M spreads its f16 d across the four scale-u16s' TOP NIBBLES (bytes 48..56); keep
         // the low 12 bits random (real 3-bit sub-scales) and plant d's nibbles on top.
         DType::Iq1M => {
@@ -855,4 +861,184 @@ fn id_gemv_multi_rejects_sub_block_in_f() {
             &want,
         );
     }
+}
+
+/// The immutable-codebook GRID-BUFFER paged id-GEMV (binding 0 = L2-resident codebook instead of
+/// per-workgroup LDS staging). `use_paged_grid_buffer` auto-engages on measured Windows/RDNA3
+/// devices only for the Qwen3.8-Flash-Next gate/up shape (in_f=2560, out_f=640, rows 1..=3); this
+/// test forces the route on with `id_grid_buffer=Some(true)` so the kernel path is exercised on any
+/// device. IQ3_XXS is the format this tuning added to the family (GSQ mixed-quant gate/up's largest
+/// bank, 17 of 48) and the only grid format whose dq reads TWO tables (G_IQ3XXS + KSIGNS) — its
+/// buffer carries both contiguous, so a layout/upload bug shows up here as a host-reference
+/// mismatch. Each NR (1/2/4/8) has its own SPV build; all are checked.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn paged_grid_buffer_idm_matches_host() {
+    use infr_core::config::Config;
+    use std::sync::Arc;
+    let (in_f, out_f, n_used) = (256usize, 8usize, 2usize);
+    let stride = in_f * out_f;
+    let ids: Vec<u32> = (0..n_used as u32).collect();
+    // The three formats wired to the grid-buffer path. IQ3_XXS is the new one.
+    for &dt in &[DType::Iq2S, DType::Iq3S, DType::Iq3Xxs] {
+        let (epb, bpb) = block_geom(dt);
+        let stride_bytes = stride / epb * bpb;
+        let banks: Vec<Vec<u8>> = (0..n_used)
+            .map(|e| synth_bank(dt, stride, 0x9b0f ^ dt as u64 ^ (e as u64) << 32))
+            .collect();
+        let host_w: Vec<Vec<f32>> = banks
+            .iter()
+            .map(|b| infr_gguf::dequant::dequant_block(dt, b).unwrap())
+            .collect();
+        let x: Vec<f32> = (0..in_f).map(|i| ((i % 13) as f32 - 6.0) * 0.04).collect();
+
+        // Force each NR build in turn by rebuilding the backend with the override. The grid-buffer
+        // codebook SSBO is allocated at init only when `id_grid_buffer` resolves true, so the
+        // backend must be constructed with the gate on for the route to be live.
+        for nr in [1u32, 2, 4, 8] {
+            let mut cfg = Config::default();
+            cfg.kernels.vulkan.gemv.id_grid_buffer = Some(true);
+            cfg.kernels.vulkan.gemv.id_grid_buffer_nr = Some(nr);
+            let Ok(be) = VulkanBackend::new_with(Arc::new(cfg)) else {
+                eprintln!("skip: no Vulkan device");
+                return;
+            };
+            let x_buf = be.alloc(in_f * 4, BufferUsage::Activations).unwrap();
+            be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+            let mut pager = GpuPager::new(&be, n_used, n_used, stride_bytes).unwrap();
+            let staging = be.alloc_uninit(stride_bytes, BufferUsage::Staging).unwrap();
+            for eid in 0..n_used as u32 {
+                pager
+                    .ensure_resident(&be, staging.as_ref(), eid, &banks[eid as usize])
+                    .unwrap();
+            }
+            pager.flush_lut(&be).unwrap();
+            let ids_buf = be.alloc(ids.len() * 4, BufferUsage::Activations).unwrap();
+            be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids)).unwrap();
+            let y = be
+                .alloc(n_used * out_f * 4, BufferUsage::Activations)
+                .unwrap();
+            let rec = be.recorder().unwrap();
+            rec.linear_native_id_multi_paged(
+                dt,
+                pager.arena_addr(),
+                pager.slot_bytes() as u32,
+                pager.lut_buffer(),
+                ids_buf.as_ref(),
+                n_used,
+                0,
+                x_buf.as_ref(),
+                false,
+                y.as_ref(),
+                in_f,
+                out_f,
+                1,
+                u32::MAX,
+                0,
+            );
+            rec.finish().unwrap();
+            let mut out = vec![0u8; n_used * out_f * 4];
+            be.download(y.as_ref(), &mut out).unwrap();
+            let got: &[f32] = bytemuck::cast_slice(&out);
+            for (slot, &eid) in ids.iter().enumerate() {
+                let want = host_gemv(&host_w[eid as usize], &x, in_f, out_f);
+                assert_close(
+                    dt,
+                    &format!("grid-buffer nr={nr} expert {eid}"),
+                    &got[slot * out_f..(slot + 1) * out_f],
+                    &want,
+                );
+            }
+            println!("{dt:?}: paged grid-buffer idm NR={nr} OK");
+        }
+    }
+}
+
+/// The Q5_1 expert-down SG enrollment (UD-Q4_K_XL: 43/48 downs are Q5_1 at 640x2560, the exact
+/// shape the Q5_K down band was cut for). Enrollment is gated by `id_sg_q51` (default OFF keeps
+/// the tree), so the backend must be built with the gate ON for the route to be live — same
+/// forced-config pattern as the grid-buffer test. The shape here is the PRODUCTION one, not the
+/// 2048-band stand-in `paged_sg_id_gemv_matches_host` uses; scrambled ids + a load order that
+/// differs from logical order keep the LUT-resolution path honest.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn paged_sg_q51_idm_matches_host() {
+    use infr_core::config::Config;
+    use std::sync::Arc;
+    let (in_f, out_f, n_expert) = (640usize, 2560usize, 4usize);
+    let stride = in_f * out_f;
+    let dt = DType::Q5_1;
+    let (epb, bpb) = block_geom(dt);
+    let stride_bytes = stride / epb * bpb;
+    let banks: Vec<Vec<u8>> = (0..n_expert)
+        .map(|e| synth_bank(dt, stride, 0x05a1 ^ ((e as u64) << 32)))
+        .collect();
+    let host: Vec<Vec<f32>> = banks
+        .iter()
+        .map(|b| infr_gguf::dequant::dequant_block(dt, b).unwrap())
+        .collect();
+
+    let mut cfg = Config::default();
+    cfg.kernels.vulkan.gemv.id_sg_q51 = true;
+    let Ok(be) = VulkanBackend::new_with(Arc::new(cfg)) else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let ids = [3u32, 0, 2];
+    let ids_buf = be.alloc(ids.len() * 4, BufferUsage::Activations).unwrap();
+    be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids))
+        .unwrap();
+    let x: Vec<f32> = (0..in_f).map(|i| ((i % 23) as f32 - 11.0) * 0.0125).collect();
+    let x_buf = be.alloc(in_f * 4, BufferUsage::Activations).unwrap();
+    be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+
+    let mut pager = GpuPager::new(&be, n_expert, ids.len(), stride_bytes).unwrap();
+    let staging = be.alloc_uninit(stride_bytes, BufferUsage::Staging).unwrap();
+    // Load order != logical id order: logical expert id must never alias a physical slot.
+    for &eid in &[0u32, 2, 3] {
+        pager
+            .ensure_resident(&be, staging.as_ref(), eid, &banks[eid as usize])
+            .unwrap();
+    }
+    pager.flush_lut(&be).unwrap();
+    let y = be
+        .alloc(ids.len() * out_f * 4, BufferUsage::Activations)
+        .unwrap();
+    let rec = be.recorder().unwrap();
+    rec.linear_native_id_multi_paged(
+        dt,
+        pager.arena_addr(),
+        pager.slot_bytes() as u32,
+        pager.lut_buffer(),
+        ids_buf.as_ref(),
+        ids.len(),
+        0,
+        x_buf.as_ref(),
+        false,
+        y.as_ref(),
+        in_f,
+        out_f,
+        1,
+        u32::MAX,
+        0,
+    );
+    rec.finish().unwrap();
+
+    let mut out = vec![0u8; ids.len() * out_f * 4];
+    be.download(y.as_ref(), &mut out).unwrap();
+    let got: &[f32] = bytemuck::cast_slice(&out);
+    for (slot, &eid) in ids.iter().enumerate() {
+        let want = host_gemv(&host[eid as usize], &x, in_f, out_f);
+        assert!(
+            want.iter().any(|v| v.abs() > 1e-3),
+            "reference for expert {eid} is ~zero — the fixture cannot tell a no-op apart"
+        );
+        assert_close(
+            dt,
+            &format!("paged SG Q5_1 expert {eid}"),
+            &got[slot * out_f..(slot + 1) * out_f],
+            &want,
+        );
+    }
+    println!("{dt:?}: paged SG idm at 640x2560 OK");
 }
