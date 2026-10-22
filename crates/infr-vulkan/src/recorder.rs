@@ -20,6 +20,10 @@ use infr_core::{
 use super::ops::ComputeKernel;
 use super::{as_vk_buf, be, Backing, VkBuffer, VulkanBackend};
 
+#[cfg(test)]
+#[path = "hc_inject_norm_sync_contract.rs"]
+mod hc_inject_norm_sync_contract;
+
 pub(crate) const QSA_TOPK_PARALLEL_MIN_BLOCKS: u32 = 4096;
 pub(crate) const QSA_TOPK_PARALLEL_WORK_BYTES: usize = (64 * 256 + 2) * 4;
 const QSA_TOPK_PARALLEL_MAX_GROUPS: u32 = 64;
@@ -5167,7 +5171,7 @@ impl<'a> Recorder<'a> {
                 Self::vkb(residual_dst),
                 Self::vkb(normed_dst),
             ],
-            1,
+            2,
             &push,
             rows * hc,
         );
