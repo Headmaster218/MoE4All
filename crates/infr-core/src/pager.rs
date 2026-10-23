@@ -46,6 +46,27 @@ pub enum Resolution {
     Miss { slot: u32, evicted: Option<BlockId> },
 }
 
+/// Why [`Pager::admit_at`] could not replay an admission. Every error leaves the pager unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionError {
+    /// `NOT_RESIDENT` cannot name a block in an admission replay.
+    InvalidBlockId,
+    SlotOutOfRange,
+    SlotDisabled,
+    /// The requested block already owns a different physical slot.
+    ResidentElsewhere {
+        slot: u32,
+    },
+    /// The target's current owner has an outstanding explicit pin.
+    Pinned {
+        id: BlockId,
+    },
+    /// The target's current owner was accessed in the current batch.
+    CurrentBatch {
+        id: BlockId,
+    },
+}
+
 /// Cumulative pager activity — the `INFR_PAGER_STATS` hit-rate counter the task's validation step
 /// asks for rides this.
 #[derive(Debug, Clone, Copy, Default)]
@@ -281,6 +302,25 @@ impl Pager {
         out
     }
 
+    /// Free slots followed by unpinned residents, coldest first, without allocating a full snapshot.
+    /// This is selection only: callers still own batch/read protection and physical reservations.
+    pub fn replacement_slots(&self) -> impl Iterator<Item = (Option<BlockId>, u32)> + '_ {
+        let free = self.free.iter().rev().copied().map(|slot| (None, slot));
+        let mut next = self.lru_head;
+        let resident = std::iter::from_fn(move || {
+            while let Some(slot) = next {
+                let node = self.lru[self.slot_idx(slot)];
+                next = node.next;
+                let id = node.id.expect("linked LRU node has a block id");
+                if !self.pinned.contains_key(&id) {
+                    return Some((Some(id), slot));
+                }
+            }
+            None
+        });
+        free.chain(resident)
+    }
+
     /// Number of entries in the `epoch` map — test-only, to assert eviction keeps it bounded by
     /// `n_slots` rather than growing per distinct BlockId ever touched.
     #[cfg(test)]
@@ -438,6 +478,69 @@ impl Pager {
         self.resident.insert(id, slot);
         self.push_back_lru(slot, id);
         Resolution::Miss { slot, evicted }
+    }
+
+    /// Replay a demand admission into an exact, previously selected physical `slot`.
+    ///
+    /// This is host bookkeeping for a backend reconciling a GPU-selected admission. It neither
+    /// copies bytes nor reserves the slot: the backend must protect and validate its selection
+    /// before copying, then reconcile its LUT using the returned `Resolution`. A `Miss` describes
+    /// the ownership change even when the backend has already filled the slot.
+    ///
+    /// A hit is accepted only at the block's existing slot, including when that block is pinned
+    /// or current-batch protected. A miss may replace only an unpinned owner outside the current
+    /// batch. As with normal demand access, epoch protection starts at the first `begin_batch`;
+    /// successful hits and misses mark the block MRU, join the epoch and update demand stats.
+    /// No explicit pin is acquired. Errors change no state, including counters and LRU order.
+    ///
+    /// Only the `NOT_RESIDENT` sentinel is rejected as an ID here; the pager has no model-specific
+    /// ID bound, so validating that namespace remains the backend's responsibility.
+    pub fn admit_at(&mut self, id: BlockId, slot: u32) -> Result<Resolution, AdmissionError> {
+        if id == NOT_RESIDENT {
+            return Err(AdmissionError::InvalidBlockId);
+        }
+        let idx = slot as usize;
+        if idx >= self.n_slots {
+            return Err(AdmissionError::SlotOutOfRange);
+        }
+        if self.disabled[idx] {
+            return Err(AdmissionError::SlotDisabled);
+        }
+        if let Some(actual) = self.slot_of(id) {
+            if actual != slot {
+                return Err(AdmissionError::ResidentElsewhere { slot: actual });
+            }
+            return Ok(self.touch(id));
+        }
+
+        let evicted = self.lru[idx].id;
+        if let Some(owner) = evicted {
+            if self.pinned.contains_key(&owner) {
+                return Err(AdmissionError::Pinned { id: owner });
+            }
+            if self.cur_epoch != 0 && self.epoch.get(&owner) == Some(&self.cur_epoch) {
+                return Err(AdmissionError::CurrentBatch { id: owner });
+            }
+            let removed = self.unlink_lru(slot);
+            debug_assert_eq!(removed, Some(owner));
+            let old_slot = self.resident.remove(&owner);
+            debug_assert_eq!(old_slot, Some(slot));
+            self.epoch.remove(&owner);
+            self.stats.evictions += 1;
+        } else {
+            let pos = self
+                .free
+                .iter()
+                .position(|&free| free == slot)
+                .expect("enabled empty slot is on the free list");
+            // Preserve the allocation order of every other free slot.
+            self.free.remove(pos);
+        }
+        self.resident.insert(id, slot);
+        self.epoch.insert(id, self.cur_epoch);
+        self.push_back_lru(slot, id);
+        self.stats.misses += 1;
+        Ok(Resolution::Miss { slot, evicted })
     }
 
     /// Ensure `id` is resident AND pin it, so it cannot be evicted until [`Self::unpin`].
@@ -911,6 +1014,409 @@ pub fn ring_bytes(pager_budget: u64, ring: Option<crate::SizeSpec>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacement_slots_are_bounded_read_only_and_skip_explicit_pins() {
+        let mut pager = Pager::new(6);
+        for id in 10..14 { pager.touch(id); }
+        pager.disable_slot(5);
+        pager.repin(11).unwrap();
+        let before = admission_state(&pager);
+        assert_eq!(pager.replacement_slots().take(2).collect::<Vec<_>>(), vec![(None,4),(Some(10),0)]);
+        assert_eq!(pager.replacement_slots().collect::<Vec<_>>(), vec![(None,4),(Some(10),0),(Some(12),2),(Some(13),3)]);
+        assert_eq!(admission_state(&pager), before);
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct AdmissionState {
+        n_slots: usize,
+        disabled: Vec<bool>,
+        enabled_slots: usize,
+        resident: HashMap<BlockId, u32>,
+        lru: Vec<(Option<BlockId>, Option<u32>, Option<u32>)>,
+        lru_head: Option<u32>,
+        lru_tail: Option<u32>,
+        lru_len: usize,
+        free: Vec<u32>,
+        epoch: HashMap<BlockId, u64>,
+        cur_epoch: u64,
+        cold_victim_cursor: Option<u32>,
+        pinned: HashMap<BlockId, u32>,
+        stats: (u64, u64, u64),
+        profile_work: crate::pager_profile::LruWorkStats,
+    }
+
+    fn admission_state(p: &Pager) -> AdmissionState {
+        AdmissionState {
+            n_slots: p.n_slots,
+            disabled: p.disabled.clone(),
+            enabled_slots: p.enabled_slots,
+            resident: p.resident.clone(),
+            lru: p.lru.iter().map(|n| (n.id, n.prev, n.next)).collect(),
+            lru_head: p.lru_head,
+            lru_tail: p.lru_tail,
+            lru_len: p.lru_len,
+            free: p.free.clone(),
+            epoch: p.epoch.clone(),
+            cur_epoch: p.cur_epoch,
+            cold_victim_cursor: p.cold_victim_cursor,
+            pinned: p.pinned.clone(),
+            stats: (p.stats.hits, p.stats.misses, p.stats.evictions),
+            profile_work: p.profile_work,
+        }
+    }
+
+    fn assert_admission_rejected(p: &mut Pager, id: BlockId, slot: u32, error: AdmissionError) {
+        let before = admission_state(p);
+        assert_eq!(p.admit_at(id, slot), Err(error));
+        assert_eq!(admission_state(p), before, "a refusal must change no state");
+    }
+
+    fn assert_admission_invariants(p: &Pager) {
+        assert_eq!(p.enabled_slots, p.disabled.iter().filter(|&&d| !d).count());
+        assert_eq!(p.lru_len, p.resident.len());
+        assert_eq!(p.free.len() + p.resident.len(), p.enabled_slots);
+        assert_eq!(p.epoch.len(), p.resident.len());
+        let mut seen = vec![false; p.n_slots];
+        let mut prev = None;
+        let mut slot = p.lru_head;
+        let mut linked = 0;
+        while let Some(s) = slot {
+            let idx = s as usize;
+            assert!(!seen[idx], "duplicate slot or LRU cycle");
+            seen[idx] = true;
+            let node = p.lru[idx];
+            let id = node.id.expect("linked slot must have an owner");
+            assert!(!p.disabled[idx]);
+            assert_eq!(p.slot_of(id), Some(s));
+            assert!(p.epoch.contains_key(&id));
+            assert_eq!(node.prev, prev);
+            prev = Some(s);
+            slot = node.next;
+            linked += 1;
+        }
+        assert_eq!(prev, p.lru_tail);
+        assert_eq!(linked, p.lru_len);
+        if let Some(cursor) = p.cold_victim_cursor {
+            assert!(
+                seen[cursor as usize],
+                "cold cursor must point to a linked slot"
+            );
+        }
+        for &s in &p.free {
+            let idx = s as usize;
+            assert!(!seen[idx], "free slot is duplicated or still resident");
+            seen[idx] = true;
+            assert!(!p.disabled[idx]);
+            assert!(p.lru[idx].id.is_none());
+        }
+        for (idx, &disabled) in p.disabled.iter().enumerate() {
+            assert_eq!(seen[idx], !disabled);
+            if p.lru[idx].id.is_none() {
+                assert!(p.lru[idx].prev.is_none() && p.lru[idx].next.is_none());
+            }
+        }
+        for (&id, &count) in &p.pinned {
+            assert!(count > 0 && p.resident.contains_key(&id));
+        }
+    }
+
+    #[test]
+    fn admission_rejects_invalid_ids_slots_and_resident_mismatches_without_mutation() {
+        let mut p = Pager::new(4);
+        p.touch(10);
+        p.touch(11);
+        p.begin_batch();
+        p.disable_slot(3);
+        assert_admission_rejected(&mut p, NOT_RESIDENT, 2, AdmissionError::InvalidBlockId);
+        for slot in [4, u32::MAX] {
+            assert_admission_rejected(&mut p, 12, slot, AdmissionError::SlotOutOfRange);
+        }
+        assert_admission_rejected(&mut p, 12, 3, AdmissionError::SlotDisabled);
+        // A mismatch must not evict either an occupied target or consume a free target.
+        for slot in [1, 2] {
+            assert_admission_rejected(
+                &mut p,
+                10,
+                slot,
+                AdmissionError::ResidentElsewhere { slot: 0 },
+            );
+        }
+        assert_admission_invariants(&p);
+    }
+
+    #[test]
+    fn admission_preserves_explicit_pins_and_current_batch_owners() {
+        let mut p = Pager::new(3);
+        p.resolve_and_pin(10, Insert::Mru).unwrap();
+        p.repin(10).unwrap();
+        p.touch(11);
+        p.begin_batch();
+        p.touch(11);
+        // Refuse the exact protected target even though slot 2 is free.
+        assert_admission_rejected(&mut p, 12, 0, AdmissionError::Pinned { id: 10 });
+        assert_admission_rejected(&mut p, 12, 1, AdmissionError::CurrentBatch { id: 11 });
+        assert_eq!(p.admit_at(10, 0), Ok(Resolution::Hit { slot: 0 }));
+        assert_eq!(p.pinned.get(&10), Some(&2), "a hit acquires no new pin");
+        p.unpin(10);
+        p.begin_batch();
+        assert_admission_rejected(&mut p, 12, 0, AdmissionError::Pinned { id: 10 });
+        p.unpin(10);
+        assert_eq!(
+            p.admit_at(12, 0),
+            Ok(Resolution::Miss {
+                slot: 0,
+                evicted: Some(10),
+            })
+        );
+        assert_eq!(p.pinned_blocks(), 0);
+        assert_admission_invariants(&p);
+    }
+
+    #[test]
+    fn admission_hit_marks_mru_counts_once_and_protects_the_epoch() {
+        let mut p = Pager::new(3);
+        for id in 10..13 {
+            p.touch(id);
+        }
+        p.begin_batch();
+        assert_eq!(p.admit_at(10, 0), Ok(Resolution::Hit { slot: 0 }));
+        assert_eq!(p.lru_order(), vec![11, 12, 10]);
+        assert_eq!(p.stats.hits, 1);
+        assert_eq!((p.stats.misses, p.stats.evictions), (3, 0));
+        assert_eq!(p.epoch.get(&10), Some(&p.cur_epoch));
+        assert_admission_rejected(&mut p, 20, 0, AdmissionError::CurrentBatch { id: 10 });
+        assert_eq!(p.admit_at(10, 0), Ok(Resolution::Hit { slot: 0 }));
+        assert_eq!(p.stats.hits, 2);
+        assert_eq!(p.lru_order(), vec![11, 12, 10]);
+        assert_admission_invariants(&p);
+    }
+
+    #[test]
+    fn admission_consumes_any_free_slot_without_reordering_or_duplicate_allocation() {
+        for target in 0..4u32 {
+            let mut p = Pager::new(4);
+            let remaining: Vec<_> = (0..4u32).filter(|&s| s != target).collect();
+            assert_eq!(
+                p.admit_at(10, target),
+                Ok(Resolution::Miss {
+                    slot: target,
+                    evicted: None,
+                })
+            );
+            assert_admission_invariants(&p);
+            for (id, slot) in (11..).zip(remaining) {
+                assert_eq!(
+                    p.touch(id),
+                    Resolution::Miss {
+                        slot,
+                        evicted: None
+                    }
+                );
+                assert_admission_invariants(&p);
+            }
+            assert_eq!(p.stats.evictions, 0);
+            assert_eq!(p.stats.misses, 4);
+            assert_eq!(p.slot_of(10), Some(target));
+        }
+    }
+
+    #[test]
+    fn admission_reuses_evicted_and_reenabled_slots() {
+        let mut p = Pager::new(3);
+        p.touch(10);
+        p.touch(11);
+        assert_eq!(p.disable_slot(0), Some(10));
+        assert_admission_rejected(&mut p, 12, 0, AdmissionError::SlotDisabled);
+        p.enable_slot(0);
+        assert_eq!(
+            p.admit_at(12, 0),
+            Ok(Resolution::Miss {
+                slot: 0,
+                evicted: None
+            })
+        );
+        assert_admission_invariants(&p);
+        assert_eq!(p.evict(12), Some(0));
+        assert_eq!(
+            p.admit_at(13, 0),
+            Ok(Resolution::Miss {
+                slot: 0,
+                evicted: None
+            })
+        );
+        assert_eq!(
+            p.touch(14),
+            Resolution::Miss {
+                slot: 2,
+                evicted: None
+            }
+        );
+        assert_eq!(
+            p.stats.evictions, 1,
+            "only disable_slot displaced a resident"
+        );
+        assert_admission_invariants(&p);
+    }
+
+    #[test]
+    fn admission_replaces_the_selected_head_middle_or_tail_even_with_free_slots() {
+        for target in 0..4u32 {
+            let mut p = Pager::new(5);
+            for id in 0..4 {
+                p.touch(id);
+            }
+            p.begin_batch();
+            let free = p.free.clone();
+            assert_eq!(
+                p.admit_at(10, target),
+                Ok(Resolution::Miss {
+                    slot: target,
+                    evicted: Some(target),
+                })
+            );
+            let mut order: Vec<_> = (0..4).filter(|&id| id != target).collect();
+            order.push(10);
+            assert_eq!(p.lru_order(), order);
+            assert_eq!(p.free, free);
+            assert_eq!(p.slot_of(target), None);
+            assert_eq!(p.slot_of(10), Some(target));
+            assert!(!p.epoch.contains_key(&target));
+            assert_eq!((p.stats.hits, p.stats.misses, p.stats.evictions), (0, 5, 1));
+            assert_admission_rejected(&mut p, 11, target, AdmissionError::CurrentBatch { id: 10 });
+            assert_admission_invariants(&p);
+        }
+    }
+
+    #[test]
+    fn admission_supports_legacy_epoch_zero_and_bounds_ownership_metadata() {
+        let mut p = Pager::new(1);
+        for id in 0..100 {
+            assert_eq!(
+                p.admit_at(id, 0),
+                Ok(Resolution::Miss {
+                    slot: 0,
+                    evicted: id.checked_sub(1),
+                })
+            );
+            assert_eq!(p.slot_of(id), Some(0));
+            assert_eq!(p.lru_order(), vec![id]);
+            assert_admission_invariants(&p);
+        }
+        assert_eq!(
+            (p.stats.hits, p.stats.misses, p.stats.evictions),
+            (0, 100, 99)
+        );
+    }
+
+    #[test]
+    fn admission_keeps_cold_cursor_valid_after_hits_and_selected_evictions() {
+        for hit in [false, true] {
+            for target in 0..4u32 {
+                let mut p = Pager::new(4);
+                for id in 0..4 {
+                    p.touch(id);
+                }
+                p.begin_batch();
+                let id = if hit { target } else { 10 };
+                let result = p.admit_at(id, target).unwrap();
+                assert_eq!(matches!(result, Resolution::Hit { .. }), hit);
+                assert_admission_invariants(&p);
+                for (new, victim) in (20..).zip((0..4).filter(|&old| old != target)) {
+                    assert_eq!(
+                        p.touch_cold(new),
+                        Resolution::Miss {
+                            slot: victim,
+                            evicted: Some(victim),
+                        }
+                    );
+                    assert_admission_invariants(&p);
+                }
+                assert_eq!(p.slot_of(id), Some(target));
+                assert_eq!(p.prefetch_cold(30), None);
+                p.begin_batch();
+                assert!(matches!(p.touch_cold(30), Resolution::Miss { .. }));
+                assert_admission_invariants(&p);
+            }
+        }
+    }
+
+    #[test]
+    fn admission_reconciles_a_simulated_gpu_lut_and_physical_owners() {
+        let mut p = Pager::new(4);
+        let mut lut = [NOT_RESIDENT; 8];
+        let mut physical = [None; 4];
+        let selected = [
+            (0, 2),
+            (1, 0),
+            (2, 3),
+            (0, 2),
+            (3, 1),
+            (4, 0),
+            (5, 2),
+            (2, 3),
+            (1, 1),
+            (4, 0),
+            (6, 3),
+        ];
+        for (id, slot) in selected {
+            p.begin_batch();
+            // The backend has already copied bytes and published its ownership/LUT change.
+            let old = physical[slot as usize].replace(id);
+            if let Some(old) = old {
+                if old != id {
+                    lut[old as usize] = NOT_RESIDENT;
+                }
+            }
+            lut[id as usize] = slot;
+            let expected = if old == Some(id) {
+                Resolution::Hit { slot }
+            } else {
+                Resolution::Miss { slot, evicted: old }
+            };
+            assert_eq!(p.admit_at(id, slot), Ok(expected));
+            for (id, &mapped) in lut.iter().enumerate() {
+                assert_eq!(p.slot_of(id as u32).unwrap_or(NOT_RESIDENT), mapped);
+                if mapped != NOT_RESIDENT {
+                    assert_eq!(physical[mapped as usize], Some(id as u32));
+                }
+            }
+            assert_admission_invariants(&p);
+        }
+        assert!(p.stats.hits > 0 && p.stats.evictions > 0);
+    }
+
+    #[test]
+    fn admission_matches_normal_demand_lru_epochs_and_statistics() {
+        let mut normal = Pager::new(4);
+        let mut replay = Pager::new(4);
+        for id in [0, 1, 2, 0, 1, 3, 4, 0, 1, 5, 0, 1, 6, 7, 0, 1] {
+            normal.begin_batch();
+            replay.begin_batch();
+            let expected = normal.touch(id);
+            let slot = match expected {
+                Resolution::Hit { slot } | Resolution::Miss { slot, .. } => slot,
+            };
+            assert_eq!(replay.admit_at(id, slot), Ok(expected));
+            assert_eq!(replay.resident_slots_lru(), normal.resident_slots_lru());
+            assert_eq!(replay.epoch, normal.epoch);
+            assert_eq!(replay.free, normal.free);
+            assert_eq!(replay.cold_victim_cursor, normal.cold_victim_cursor);
+            assert_eq!(
+                (
+                    replay.stats.hits,
+                    replay.stats.misses,
+                    replay.stats.evictions
+                ),
+                (
+                    normal.stats.hits,
+                    normal.stats.misses,
+                    normal.stats.evictions
+                ),
+            );
+            assert_admission_invariants(&replay);
+        }
+    }
 
     #[test]
     fn legacy_mru_then_cold_touch_preserves_remaining_victims() {
