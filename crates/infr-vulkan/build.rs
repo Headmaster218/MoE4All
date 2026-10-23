@@ -880,6 +880,7 @@ fn main() {
             &["-DQSA_SCORE_DECODE8", "-DQSA_SCORE_H4", "-DKV_SEGMENTED"],
         ),
         ("qsa_indexer_topk", "qsa_indexer_topk", &[]),
+        ("linear_native_q8_pair", "linear_native_q8_pair", &[]),
         (
             "qsa_indexer_topk",
             "qsa_indexer_topk_scan",

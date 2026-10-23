@@ -210,11 +210,16 @@ pub enum Op {
         /// its slices. Must be row-aligned (`w_off % in_f == 0`) and block-aligned for quants.
         w_off: u32,
     },
-    /// Two same-shape F32 projections over one activation: `dst_a = x * weight_a^T` and
-    /// `dst_b = x * weight_b^T`. The independent dot products keep the same reduction order as
-    /// two [`Op::Linear`] operations; a capable backend only folds their command submission and
-    /// shared activation binding into one dispatch. Used by DeltaNet's adjacent alpha/beta
-    /// projections. Backends without `Capabilities::linear_pair_f32` keep the split graph.
+    /// Two same-shape projections over one F32 activation: `dst_a = x * weight_a^T` and
+    /// `dst_b = x * weight_b^T`, with independent F32 outputs. Matching F32 and matching Q8_0
+    /// weights require the backend's separate `linear_pair_f32` / `linear_pair_q8` capabilities.
+    /// Backends without the matching capability keep two ordinary [`Op::Linear`] operations.
+    /// A fused kernel preserves the independent baseline dot products; unsupported fused row
+    /// counts/shapes retain ordinary two-Linear graph nodes and their multi-row selection.
+    /// This primitive neither updates recurrent state nor concatenates/repackages weights.
+    /// All three read operands and both outputs belong to ONE op: retain the activation until
+    /// both projections have consumed it. Outputs must not alias each other or live inputs.
+    /// Weights start at logical element zero; unlike `Linear`, this op has no `w_off` operands.
     LinearPair {
         x: TensorId,
         weight_a: TensorId,
@@ -2144,6 +2149,36 @@ impl Graph {
 mod tests {
     use super::*;
     use crate::tensor::{DType, TensorDesc};
+
+    #[test]
+    fn linear_pair_declares_both_outputs_and_keeps_activation_live() {
+        for dtype in [DType::F32, DType::Q8_0] {
+            for rows in [1, 2, 8, 128, 2048] {
+                let mut graph = Graph::new();
+                let x = graph.internal(TensorDesc::new(vec![rows, 2560], DType::F32));
+                let weight_a = graph.weight(TensorDesc::new(vec![48, 2560], dtype));
+                let weight_b = graph.weight(TensorDesc::new(vec![48, 2560], dtype));
+                let dst_a = graph.internal(TensorDesc::new(vec![rows, 48], DType::F32));
+                let dst_b = graph.internal(TensorDesc::new(vec![rows, 48], DType::F32));
+                let op = Op::LinearPair {
+                    x,
+                    weight_a,
+                    weight_b,
+                    dst_a,
+                    dst_b,
+                    m: rows as u32,
+                    in_f: 2560,
+                    out_f: 48,
+                };
+                assert_eq!(op.io(), (vec![x, weight_a, weight_b], vec![dst_a, dst_b]));
+                graph.push(op);
+                assert!(graph.in_place_inputs().is_empty());
+                assert_ne!(x, dst_a);
+                assert_ne!(x, dst_b);
+                assert_ne!(dst_a, dst_b);
+            }
+        }
+    }
 
     #[test]
     fn inline_io_keeps_maximal_stateful_and_optional_operands_on_stack() {

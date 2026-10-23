@@ -3099,6 +3099,16 @@ pub(crate) fn iq4_pair_lut_kernel(small: bool, paged: bool) -> (&'static str, &'
     }
 }
 
+pub(crate) fn linear_native_q8_pair_spv() -> &'static [u32] {
+    static SPV: OnceLock<Vec<u32>> = OnceLock::new();
+    SPV.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/linear_native_q8_pair.spv"
+        )))
+    })
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_iq4_nl_xpg_spv() -> &'static [u32] {
     const BYTES: &[u8] =

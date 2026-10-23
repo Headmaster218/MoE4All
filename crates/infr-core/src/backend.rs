@@ -201,6 +201,12 @@ pub struct Capabilities {
     /// This saves one command and the inter-op scheduling boundary; it does not concatenate or
     /// duplicate either weight and adds no persistent device allocation.
     pub linear_pair_f32: bool,
+    /// The backend accepts [`crate::Op::LinearPair`] with two same-shape Q8_0 weights and F32
+    /// activation/outputs for one row. Other row counts keep ordinary two-Linear graph nodes,
+    /// including their multi-row selection; this does not promise fusion for every shape.
+    /// Independent from `linear_pair_f32`, false by default, and advertised only when the
+    /// backend's paired-Q8 implementation and device policy are enabled.
+    pub linear_pair_q8: bool,
     /// The backend executes Qwen3.8's one-row Q8_0 HC down projection, scaled SiLU, and tiny F32
     /// inject projection in one dispatch. Multi-row Prefill/Verify and other weight types retain
     /// the split graph.
@@ -1011,6 +1017,14 @@ mod tests {
         let caps = Capabilities::default();
         assert!(!caps.integrated);
         assert_eq!(caps.compute_units, 0);
+    }
+
+    #[test]
+    fn quantized_linear_pair_is_not_implied_by_f32_support() {
+        let mut caps = Capabilities::default();
+        assert!(!caps.linear_pair_q8);
+        caps.linear_pair_f32 = true;
+        assert!(!caps.linear_pair_q8);
     }
 
     /// The `copy_buffer` bounds-check helper: an oversize prefix errors instead of panicking, and

@@ -2280,6 +2280,47 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    pub(crate) fn linear_q8_pair(
+        &self,
+        w_a: &dyn Buffer,
+        w_b: &dyn Buffer,
+        x: &dyn Buffer,
+        y_a: &dyn Buffer,
+        y_b: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        let aa = w_a.device_addr().expect("fixed paired Q8 weight address");
+        let ab = w_b.device_addr().expect("fixed paired Q8 weight address");
+        let pc = [
+            in_f as u32,
+            out_f as u32,
+            0,
+            0,
+            aa as u32,
+            (aa >> 32) as u32,
+            ab as u32,
+            (ab >> 32) as u32,
+        ];
+        self.label_gemv("linear_native_q8_pair", 1, in_f, out_f * 2);
+        let kernel = self.be.kernel_sg(
+            "linear_native_q8_pair",
+            crate::gemm::linear_native_q8_pair_spv(),
+            3,
+            32,
+            32,
+        );
+        self.dispatch3(
+            kernel,
+            &[Self::vkb(x), Self::vkb(y_a), Self::vkb(y_b)],
+            2,
+            bytemuck::cast_slice(&pc),
+            out_f as u32,
+            2,
+            1,
+        );
+    }
+
     /// Two independent F32 projections over the same activation in one dispatch. The paired
     /// shader doubles the logical output-column grid but retains the exact scalar/vec4/MROW
     /// variant selected by two standalone [`Self::linear_f32`] calls.

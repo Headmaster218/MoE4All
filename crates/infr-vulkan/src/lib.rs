@@ -4344,6 +4344,10 @@ impl VulkanBackend {
             // Two F32 DeltaNet projections share one dispatch while retaining separate weights
             // and outputs. The paired kernel mirrors every scalar/vec4/mrow shape tier.
             linear_pair_f32: true,
+            linear_pair_q8: cfg.kernels.vulkan.q8_linear_pair
+                && cfg!(target_os = "windows")
+                && !integrated
+                && device_arch == crate::caps::DeviceArch::AmdRdna3,
             // Qwen3.8 decode-only mixed Q8_0 down + scaled SiLU + F32 inject dispatch.
             qwen_hc_down_inject: true,
             // Every KV write/read kernel maps position -> row modulo the cache's row capacity

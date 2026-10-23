@@ -181,30 +181,62 @@ fn fuse_qsa_prepare_decision(
         })
 }
 
-/// DeltaNet alpha/beta projection fusion eligibility. Both projections are kept as independent
-/// weights and outputs; only a backend command is shared. The decision is session-wide so warm
-/// graph rebuilds cannot change shape, and it stays off when any layer exposes a non-F32 or
-/// incomplete pair.
-fn fuse_delta_ab_decision(backend_support: bool, g: &Gguf, c: &Config, ec: &EngineConfig) -> bool {
-    if !backend_support || !ec.kernels.delta_ab_fuse {
+/// Session-wide projection eligibility: keep the old F32 policy and independently gate Q8_0
+/// by backend support and the measured dimensions. No model-name or architecture matching.
+fn fuse_delta_ab_pairs_supported(
+    enabled: bool,
+    caps: &infr_core::backend::Capabilities,
+    in_f: usize,
+    out_f: usize,
+    pairs: impl IntoIterator<Item = (Option<DType>, Option<DType>)>,
+) -> bool {
+    if !enabled || !(caps.linear_pair_f32 || caps.linear_pair_q8) {
         return false;
     }
-    let dtype = |layer: usize, suffix: &str| {
-        let name = format!("blk.{layer}.{suffix}");
-        g.tensors().iter().find(|t| t.name == name).map(|t| t.dtype)
-    };
     let mut found = false;
-    for layer in 0..c.n_layer {
-        match (
-            dtype(layer, "ssm_alpha.weight"),
-            dtype(layer, "ssm_beta.weight"),
-        ) {
+    for pair in pairs {
+        match pair {
             (None, None) => {}
-            (Some(DType::F32), Some(DType::F32)) => found = true,
+            (Some(DType::F32), Some(DType::F32)) if caps.linear_pair_f32 => found = true,
+            (Some(DType::Q8_0), Some(DType::Q8_0))
+                if caps.linear_pair_q8 && in_f == 2560 && out_f == 48 =>
+            {
+                found = true;
+            }
             _ => return false,
         }
     }
     found
+}
+
+fn fuse_delta_ab_decision(
+    caps: &infr_core::backend::Capabilities,
+    g: &Gguf,
+    c: &Config,
+    ec: &EngineConfig,
+) -> bool {
+    let dtype = |layer: usize, suffix: &str| {
+        let name = format!("blk.{layer}.{suffix}");
+        g.tensors().iter().find(|t| t.name == name).map(|t| t.dtype)
+    };
+    fuse_delta_ab_pairs_supported(
+        ec.kernels.delta_ab_fuse,
+        caps,
+        c.n_embd,
+        c.q35_num_v_heads(),
+        (0..c.n_layer).map(|layer| {
+            (
+                dtype(layer, "ssm_alpha.weight"),
+                dtype(layer, "ssm_beta.weight"),
+            )
+        }),
+    )
+}
+
+// Session eligibility already validated capabilities, dtypes and the Q8 shape. Preserve the
+// original F32 row policy; multi-row Q8 must keep the original two Linear graph nodes.
+fn delta_ab_pair_for_batch(fuse: bool, batch: usize, weight_dtype: DType) -> bool {
+    fuse && (batch == 1 || weight_dtype == DType::F32)
 }
 
 /// Ling KDA normally uploads Q/K/V as one fused projection. The official Tiny Q4_K_M GGUF uses
@@ -1122,7 +1154,7 @@ fn session_stable(
     // form is bit-identical — same dots, same fixed-order sums).
     let fuse_qkv = fuse_qkv_decision(caps.combined_gu, g, c, ec);
     let fuse_qsa_prepare = fuse_qsa_prepare_decision(caps.qsa_prepare, g, c, ec);
-    let fuse_delta_ab = fuse_delta_ab_decision(caps.linear_pair_f32, g, c, ec);
+    let fuse_delta_ab = fuse_delta_ab_decision(&caps, g, c, ec);
     let fuse_qwen_hc_down_inject = caps.qwen_hc_down_inject && ec.kernels.qwen_hc_down_inject;
     let kda_qkv_fused = if c.bailingmoe3 {
         (0..c.n_layer)
@@ -5720,7 +5752,7 @@ fn generate_dense_backend_inner(
                         n: (q35_nv * q35_vd) as u32,
                     });
                 }
-                if fuse_delta_ab {
+                if delta_ab_pair_for_batch(fuse_delta_ab, batch, g.desc(dw.beta).dtype) {
                     g.push(Op::LinearPair {
                         x: hn,
                         weight_a: dw.beta,
@@ -12952,6 +12984,174 @@ mod tests {
         recurrent_extension_start, resident_after_gen, sampling_suffix_start, validate_token_ids,
     };
     use infr_core::DType;
+
+    #[test]
+    fn delta_ab_pair_dtype_shape_and_capability_contract() {
+        use infr_core::backend::Capabilities;
+        let types = [
+            None,
+            Some(DType::F32),
+            Some(DType::Q8_0),
+            Some(DType::F16),
+            Some(DType::Q4K),
+            Some(DType::Q6K),
+        ];
+        let mut cases = 0;
+        for f32_cap in [false, true] {
+            for q8_cap in [false, true] {
+                let caps = Capabilities {
+                    linear_pair_f32: f32_cap,
+                    linear_pair_q8: q8_cap,
+                    ..Default::default()
+                };
+                for (k, n) in [
+                    (2560, 48),
+                    (32, 48),
+                    (2560, 47),
+                    (2560, 49),
+                    (4096, 48),
+                    (0, 0),
+                ] {
+                    for a in types {
+                        for b in types {
+                            for enabled in [false, true] {
+                                let expected = enabled
+                                    && ((f32_cap
+                                        && a == Some(DType::F32)
+                                        && b == Some(DType::F32))
+                                        || (q8_cap
+                                            && k == 2560
+                                            && n == 48
+                                            && a == Some(DType::Q8_0)
+                                            && b == Some(DType::Q8_0)));
+                                assert_eq!(
+                                    super::fuse_delta_ab_pairs_supported(enabled, &caps, k, n, [(a, b)]),
+                                    expected,
+                                    "enabled={enabled} f32={f32_cap} q8={q8_cap} k={k} n={n} a={a:?} b={b:?}",
+                                );
+                                cases += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 1728);
+    }
+
+    #[test]
+    fn delta_ab_batch_selection_preserves_f32_and_original_q8_multilinear_graph() {
+        use infr_core::backend::Capabilities;
+        let caps = Capabilities {
+            linear_pair_f32: true,
+            linear_pair_q8: true,
+            ..Default::default()
+        };
+        for dtype in [DType::F32, DType::Q8_0] {
+            let pair = (Some(dtype), Some(dtype));
+            assert!(super::fuse_delta_ab_pairs_supported(
+                true,
+                &caps,
+                2560,
+                48,
+                [pair]
+            ));
+            for batch in [0, 1, 2, 3, 4, 8, 16, 128, 2048, 4096] {
+                for fuse in [false, true] {
+                    let expected = fuse && (batch == 1 || dtype == DType::F32);
+                    assert_eq!(super::delta_ab_pair_for_batch(fuse, batch, dtype), expected);
+                }
+            }
+        }
+        for enabled in [false, true] {
+            let mut q8_caps = caps.clone();
+            q8_caps.linear_pair_q8 = enabled;
+            let fuse = super::fuse_delta_ab_pairs_supported(
+                true,
+                &q8_caps,
+                2560,
+                48,
+                [(Some(DType::Q8_0), Some(DType::Q8_0))],
+            );
+            assert_eq!(
+                super::delta_ab_pair_for_batch(fuse, 1, DType::Q8_0),
+                enabled
+            );
+            assert!(!super::delta_ab_pair_for_batch(fuse, 2, DType::Q8_0));
+        }
+    }
+
+    #[test]
+    fn delta_ab_pair_session_policy_rejects_incomplete_or_unsupported_layers() {
+        use infr_core::backend::Capabilities;
+        let caps = Capabilities {
+            linear_pair_f32: true,
+            linear_pair_q8: true,
+            ..Default::default()
+        };
+        let decide = |pairs: &[(Option<DType>, Option<DType>)]| {
+            super::fuse_delta_ab_pairs_supported(true, &caps, 2560, 48, pairs.iter().copied())
+        };
+        let f32_pair = (Some(DType::F32), Some(DType::F32));
+        let q8_pair = (Some(DType::Q8_0), Some(DType::Q8_0));
+        assert!(!decide(&[]));
+        assert!(!decide(&[(None, None), (None, None)]));
+        assert!(decide(&[(None, None), f32_pair, (None, None), q8_pair]));
+        for bad in [
+            (Some(DType::Q8_0), None),
+            (None, Some(DType::F32)),
+            (Some(DType::F32), Some(DType::Q8_0)),
+            (Some(DType::Q4K), Some(DType::Q4K)),
+            (Some(DType::Q6K), Some(DType::Q6K)),
+        ] {
+            assert!(!decide(&[q8_pair, bad]));
+            assert!(!decide(&[bad, f32_pair]));
+        }
+        let q8_only = Capabilities {
+            linear_pair_q8: true,
+            ..Default::default()
+        };
+        assert!(super::fuse_delta_ab_pairs_supported(
+            true,
+            &q8_only,
+            2560,
+            48,
+            [q8_pair]
+        ));
+        assert!(!super::fuse_delta_ab_pairs_supported(
+            true,
+            &q8_only,
+            2560,
+            48,
+            [f32_pair]
+        ));
+        let old_f32 = Capabilities {
+            linear_pair_f32: true,
+            ..Default::default()
+        };
+        assert!(super::fuse_delta_ab_pairs_supported(
+            true,
+            &old_f32,
+            4096,
+            16,
+            [f32_pair]
+        ));
+        assert!(!super::fuse_delta_ab_pairs_supported(
+            true,
+            &old_f32,
+            2560,
+            48,
+            [q8_pair]
+        ));
+        // Removing Q8 advertisement for an A/B run returns the entire session to split Linears.
+        assert!(!super::fuse_delta_ab_pairs_supported(
+            true,
+            &old_f32,
+            2560,
+            48,
+            [f32_pair, q8_pair]
+        ));
+    }
 
     #[test]
     fn prefill_planning_does_not_touch_decode_sized_suffixes() {

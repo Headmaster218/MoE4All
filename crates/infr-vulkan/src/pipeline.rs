@@ -493,6 +493,7 @@ impl Backend for PipelineBackend {
         // supports (keeps `hidden` a bound Input, every step a plain `execute`). This is the sole
         // lever that keeps `generate_dense_backend` unmodified.
         let mut c = self.backends[0].capabilities();
+        c.linear_pair_q8 = false;
         c.decode_replay = false;
         c.embed_gather = false;
         c.gpu_sample = false;

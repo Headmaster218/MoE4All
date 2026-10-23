@@ -549,6 +549,8 @@ cfg_struct! {
         /// Pair-codebook decode for IQ4_NL expert MMQ on measured Windows/RDNA3 devices.
         /// Other devices and matrix shapes retain the established scalar lookup path.
         iq4_pair_lut: bool = true,
+        /// Independent native-Q8 scalar projection pair; other row counts retain split Linears.
+        q8_linear_pair: bool = true,
         /// QSA Prefill Q8 K/V reuse mode. `2` keeps two heads in registers; `12` uses the
         /// Qwen3.8-specific LDS-tiled full-GQA path. Unsupported shapes fall back safely.
         qsa_prefill_gqa: usize = 12,

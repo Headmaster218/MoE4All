@@ -2270,6 +2270,111 @@ fn q8_kv_write_replay_fusions(
     Ok(out)
 }
 
+fn disjoint_device_views(a: &dyn Buffer, a_bytes: usize, b: &dyn Buffer, b_bytes: usize) -> bool {
+    match (a.device_addr(), b.device_addr()) {
+        (Some(a), Some(b)) => {
+            match (a.checked_add(a_bytes as u64), b.checked_add(b_bytes as u64)) {
+                (Some(a_end), Some(b_end)) => a_end <= b || b_end <= a,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn q8_linear_pair_views_disjoint(
+    a: &dyn Buffer,
+    a_bytes: usize,
+    b: &dyn Buffer,
+    b_bytes: usize,
+) -> bool {
+    if a_bytes > a.len_bytes() || b_bytes > b.len_bytes() {
+        return false;
+    }
+    if a.device_addr().is_some() && b.device_addr().is_some() {
+        return disjoint_device_views(a, a_bytes, b, b_bytes);
+    }
+    // Ordinary activation/readback allocations need not request a BDA. Shared-buffer views
+    // still carry their exact byte offsets; separate backend-owned VkBuffers do not alias.
+    let (Ok(a), Ok(b)) = (crate::as_vk_buf(a), crate::as_vk_buf(b)) else {
+        return false;
+    };
+    let (Some(a_end), Some(b_end)) = (
+        a.sub_offset.checked_add(a_bytes),
+        b.sub_offset.checked_add(b_bytes),
+    ) else {
+        return false;
+    };
+    a.buffer != b.buffer || a_end <= b.sub_offset || b_end <= a.sub_offset
+}
+
+fn validate_q8_linear_pair(
+    graph: &Graph,
+    ids: [TensorId; 5],
+    buffers: [&dyn Buffer; 5],
+) -> Result<()> {
+    // This helper is called only after the measured m1/K2560/N48 route gate.
+    const K: usize = 2560;
+    const N: usize = 48;
+    let elements = [K * N, K * N, K, N, N];
+    let bytes = [K * N / 32 * 34, K * N / 32 * 34, K * 4, N * 4, N * 4];
+    let names = ["weight_a", "weight_b", "x", "dst_a", "dst_b"];
+    for i in 0..5 {
+        let desc = graph.desc(ids[i]);
+        let expected = if i < 2 {
+            infr_core::DType::Q8_0
+        } else {
+            infr_core::DType::F32
+        };
+        if desc.dtype != expected {
+            return Err(be(format!(
+                "vulkan adapter: Q8 LinearPair {} requires {expected:?}",
+                names[i]
+            )));
+        }
+        let count = desc
+            .shape
+            .iter()
+            .try_fold(1usize, |n, &dim| n.checked_mul(dim));
+        if count.is_none_or(|count| count < elements[i]) || buffers[i].len_bytes() < bytes[i] {
+            return Err(be(format!("vulkan adapter: Q8 LinearPair {} has insufficient or overflowing descriptor/buffer length", names[i])));
+        }
+    }
+    if buffers[..2]
+        .iter()
+        .any(|weight| weight.device_addr().is_none())
+    {
+        return Err(be(
+            "vulkan adapter: Q8 LinearPair weights require fixed BDA buffers",
+        ));
+    }
+    for output in 3..5 {
+        // Both outputs must be disjoint from every read operand and from each other.
+        for other in 0..output {
+            if !q8_linear_pair_views_disjoint(
+                buffers[output],
+                bytes[output],
+                buffers[other],
+                bytes[other],
+            ) {
+                return Err(be(format!(
+                    "vulkan adapter: Q8 LinearPair unsafe overlap between {} and {}",
+                    names[output], names[other]
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "q8_pair_graph_contract.rs"]
+mod q8_pair_graph_contract;
+
+#[cfg(test)]
+#[path = "q8_pair_defensive_contract.rs"]
+mod q8_pair_defensive_contract;
+
 /// Lower ONE graph op into the recorder. Shared by the static (`execute_static`) and record-once
 /// (`record_decode_replay`) paths — only the three pos-dependent ops branch on `mode`.
 #[allow(clippy::too_many_arguments)]
@@ -2415,10 +2520,31 @@ fn lower_op(
                     "vulkan adapter: streamed weight substitution is unsupported for LinearPair",
                 ));
             }
+            if graph.desc(*weight_a).dtype == infr_core::DType::Q8_0
+                && graph.desc(*weight_b).dtype == infr_core::DType::Q8_0
+                && *m == 1
+                && *in_f == 2560
+                && *out_f == 48
+                && be_.caps().linear_pair_q8
+            {
+                let ids = [*weight_a, *weight_b, *x, *dst_a, *dst_b];
+                let buffers = [r(*weight_a)?, r(*weight_b)?, r(*x)?, r(*dst_a)?, r(*dst_b)?];
+                validate_q8_linear_pair(graph, ids, buffers)?;
+                rec.linear_q8_pair(
+                    buffers[0],
+                    buffers[1],
+                    buffers[2],
+                    buffers[3],
+                    buffers[4],
+                    *in_f as usize,
+                    *out_f as usize,
+                );
+                return Ok(());
+            }
             if graph.desc(*weight_a).dtype != infr_core::DType::F32
                 || graph.desc(*weight_b).dtype != infr_core::DType::F32
             {
-                return Err(be("vulkan adapter: LinearPair requires two F32 weights"));
+                return Err(be("vulkan adapter: LinearPair requires F32 weights or an eligible one-row Q8 pair"));
             }
             rec.linear_f32_pair(
                 r(*weight_a)?,
