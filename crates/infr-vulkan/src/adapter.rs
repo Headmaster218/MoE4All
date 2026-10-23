@@ -5578,10 +5578,32 @@ fn lower_op(
                      k_dtype={kdt:?} v_dtype={vdt:?}"
                 )));
             }
-            if graph.independent_rows {
-                let spans = independent_spans.expect("independent spans were validated");
-                let k_rows = resolve_rows(bindings, *k_cache, spans.len())?;
-                let v_rows = resolve_rows(bindings, *v_cache, spans.len())?;
+            let verify_spans = qsa_verify_split::causal_row_views(
+                graph,
+                be_.cfg().kernels.vulkan.qsa_verify_split,
+                *rows,
+                *kv_len,
+                *top_blocks,
+            );
+            if graph.independent_rows || verify_spans.is_some() {
+                let spans = independent_spans
+                    .or(verify_spans.as_deref())
+                    .expect("QSA row views were validated");
+                let shared_rows = if graph.independent_rows {
+                    None
+                } else {
+                    Some((
+                        vec![r(*k_cache)?; spans.len()],
+                        vec![r(*v_cache)?; spans.len()],
+                    ))
+                };
+                let (k_rows, v_rows) = match &shared_rows {
+                    Some((k_rows, v_rows)) => (k_rows.as_slice(), v_rows.as_slice()),
+                    None => (
+                        resolve_rows(bindings, *k_cache, spans.len())?,
+                        resolve_rows(bindings, *v_cache, spans.len())?,
+                    ),
+                };
                 let q_row_bytes = *n_head as usize * *head_dim as usize * 2;
                 let idx_row_bytes = *top_blocks as usize * 4;
                 let dst_row_bytes = *n_head as usize * *head_dim as usize * 4;
@@ -5590,7 +5612,8 @@ fn lower_op(
                 // context it makes two independent decode rows slower than two scalar forwards.
                 // Preserve the scalar QSA algorithm instead: gather one lane's selected blocks,
                 // run the established split-K attention, then reuse the same scratch for the next
-                // lane. The surrounding graph (including its aggregated MoE) remains batched.
+                // lane. Small causal VERIFY rows use the same algorithm with shared K/V and
+                // row-specific visible lengths. The rest of the graph remains batched.
                 if spans.iter().all(|span| span.rows == 1) {
                     let row_elems = *n_kv as usize * *head_dim as usize;
                     let geometries = spans
@@ -23663,3 +23686,6 @@ mod tests {
         }
     }
 }
+
+#[path = "adapter_qsa_verify_split.rs"]
+mod qsa_verify_split;
