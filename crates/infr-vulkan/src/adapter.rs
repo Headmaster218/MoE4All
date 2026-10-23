@@ -236,6 +236,7 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
             // was recorded at.
             Op::Mla { .. }
             | Op::LightningIndexer { .. }
+            | Op::GlmKpoolIndexer { .. }
             | Op::Dsv4Compress { .. }
             | Op::Dsv4CacheWrite { .. }
             | Op::Dsv4Indexer { .. }
@@ -8119,6 +8120,16 @@ fn lower_op(
                 *scale,
                 *pos,
             );
+        }
+        // glm5next's k-pool indexer runs on the CPU seam for now (the graph gates on
+        // `be.name() == "cpu"`); a Vulkan graph carrying it means that gate moved without the
+        // shader. Fail loudly rather than silently attending every key.
+        Op::GlmKpoolIndexer { .. } => {
+            return Err(be(
+                "vulkan Op::GlmKpoolIndexer: the k-pool indexer shader has not landed — glm5next \
+                 attention must take the dense interim on this backend (the graph builder gates \
+                 it to the CPU seam)",
+            ));
         }
         Op::TopkMask {
             idx,

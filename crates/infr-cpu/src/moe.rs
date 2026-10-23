@@ -3,9 +3,9 @@
 //! quant-specific batch kernels.
 use crate::bytes_to_f32;
 use crate::kernels::{
-    dot, dot_bf16, dot_f16, vec_dot_q32_batch8, vec_dot_q4k_batch, vec_dot_q4k_batch8,
-    vec_dot_q5_0_32_batch, vec_dot_q5k_batch, vec_dot_q6k_batch, vec_dot_q8_0_32_batch,
-    vec_dot_q8_0_batch,
+    dot, dot_bf16, dot_f16, vec_dot_iq2s_batch, vec_dot_iq2xxs_batch, vec_dot_iq3xxs_batch,
+    vec_dot_q32_batch8, vec_dot_q4k_batch, vec_dot_q4k_batch8, vec_dot_q5_0_32_batch,
+    vec_dot_q5k_batch, vec_dot_q6k_batch, vec_dot_q8_0_32_batch, vec_dot_q8_0_batch,
 };
 use crate::quant::{Q8x32, Q8};
 #[cfg(target_arch = "x86_64")]
@@ -38,11 +38,22 @@ pub(crate) enum ActsKind {
 /// Which activation representation an expert bank of this `(dtype, in_f)` uses — the SAME
 /// dispatch order the old `expert_matvec_batch` fast paths had, so every (weights, activations)
 /// pairing lands on the identical kernel.
+///
+/// `iq_ok` (callers pass `!reference`) additionally admits the IQ-grid expert dtypes
+/// (glm5next: Iq2Xxs gate/up, Iq2S/Iq3Xxs down) to the Super path at ANY row count. Their
+/// `vec_dot_iq*_batch` kernels are the same ones `Op::Linear` already runs for these formats;
+/// the f32 Raw fallback re-expanded every codebook row per token, which dominated glm5next
+/// decode (34 MoE layers × 81 ms/token measured). Q4K/Q6K/Q8_0/Q5K keep the old `rows >= 2`
+/// gate (`int8_ok`) untouched, so pre-IQ models stay byte-for-byte on their Metal-parity path,
+/// and REFERENCE oracle runs keep Raw everywhere.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn expert_acts_kind(dt: DType, in_f: usize, int8_ok: bool) -> ActsKind {
-    if int8_ok
-        && matches!(dt, DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q5K)
-        && in_f.is_multiple_of(256)
+pub(crate) fn expert_acts_kind(dt: DType, in_f: usize, int8_ok: bool, iq_ok: bool) -> ActsKind {
+    if (iq_ok
+        && matches!(dt, DType::Iq2Xxs | DType::Iq2S | DType::Iq3Xxs)
+        && in_f.is_multiple_of(256))
+        || (int8_ok
+            && matches!(dt, DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q5K)
+            && in_f.is_multiple_of(256))
     {
         ActsKind::Super
     } else if int8_ok && matches!(dt, DType::Q8_0 | DType::Q5_0) && in_f.is_multiple_of(32) {
@@ -84,6 +95,9 @@ pub(crate) fn expert_gemm_range(
                     DType::Q6K => vec_dot_q6k_batch(row, q8s, in_f, col),
                     DType::Q8_0 => vec_dot_q8_0_batch(row, q8s, in_f, col),
                     DType::Q5K => vec_dot_q5k_batch(row, q8s, in_f, col),
+                    DType::Iq2Xxs => vec_dot_iq2xxs_batch(row, q8s, in_f, col),
+                    DType::Iq2S => vec_dot_iq2s_batch(row, q8s, in_f, col),
+                    DType::Iq3Xxs => vec_dot_iq3xxs_batch(row, q8s, in_f, col),
                     _ => unreachable!("Super acts imply a 256-super-block quant dtype"),
                 }
             };

@@ -164,11 +164,17 @@ pub(super) struct KdaW {
     pub(super) qkv: KdaQkvW,
     pub(super) conv: TensorId,
     pub(super) forget: TensorId,
+    /// glm5next's SECOND-stage forget projection `[rank, n_head * kda_head_dim]` — the forget gate
+    /// is two-stage low-rank (`ssm_f_a` then `ssm_f_b`), where Ling carries one stage. `Some`
+    /// exactly when `Config::glm5next`; pushed right after `forget` to mirror the upload order.
+    pub(super) forget_b: Option<TensorId>,
     pub(super) beta: TensorId,
     pub(super) a: TensorId,
     pub(super) dt_bias: TensorId,
     pub(super) norm: TensorId,
     pub(super) gate: TensorId,
+    /// glm5next's SECOND-stage gate projection, the `ssm_g_b` twin of [`Self::forget_b`].
+    pub(super) gate_b: Option<TensorId>,
     pub(super) out: TensorId,
 }
 
@@ -223,6 +229,13 @@ pub(super) struct IndexerW {
     /// `indexer.attn_q_b.weight` `[q_lora_rank, indexer_n_head * indexer_head_size]` — the indexer
     /// queries, read off the SAME normed low-rank `qr` that `wq_b` consumes.
     pub(super) attn_q_b: TensorId,
+    /// glm5next's key-pooling compressor APE `[kpool, key_length]` — the learned per-slot position
+    /// embedding of the kpool-4 pool (`glm5next.cpp`'s `indexer_compressor_ape`). `Some` exactly
+    /// when `Config::glm5next`; V3.2 scores every token directly and has no pool.
+    pub(super) compressor_ape: Option<TensorId>,
+    /// glm5next's key-pooling gate `[n_embd, key_length]` — projects the token input to pool the
+    /// kpool consecutive key rows with (`indexer_compressor_gate`). Same `glm5next`-only rule.
+    pub(super) compressor_gate: Option<TensorId>,
 }
 
 /// DeepSeek V4's attention-mixer weights shared by all three compression tiers.
@@ -289,7 +302,8 @@ pub(super) struct HcTriple {
 }
 
 /// The two per-layer hyper-connection triples: one wrapping the attention sublayer, one the FFN.
-/// Both are unconditional on every V4 layer (`hc_attn_*` / `hc_ffn_*`).
+/// Both are unconditional on every V4 layer (`hc_attn_*` / `hc_ffn_*`) — and on every glm5next
+/// trunk layer, which reuses the same tensor names and the (fn, base, scale) triple shape.
 pub(super) struct LayerHcW {
     pub(super) attn: HcTriple,
     pub(super) ffn: HcTriple,
@@ -388,6 +402,13 @@ pub(crate) struct SessionStable {
     pub(super) kda_qkv_fused: Vec<bool>,
     /// Whether the MoE expert banks all have a dp4a-mmq kernel (batched-prefill eligibility).
     pub(super) moe_batched_ok: bool,
+    /// Whether the MoE expert banks are IQ-grid dtypes the CPU Super batch kernels run at ANY
+    /// row count (glm5next: Iq2Xxs gate/up + Iq2S/Iq3Xxs down). The `MOE_MMQ_DTYPES` scan above
+    /// is the Vulkan dp4a-mmq story and carries no Iq2Xxs kernel, which stranded every glm5next
+    /// prefill on one token per submit; the CPU backend's `expert_acts_kind` Super path (the same
+    /// `vec_dot_iq*_batch` kernels `Op::Linear` runs for these formats) batches them instead.
+    /// CPU-only gate — see the `batched_prefill_ok` call site in `runner`.
+    pub(super) moe_super_batched_ok: bool,
 }
 
 pub(crate) struct SeamKv {
@@ -1136,7 +1157,7 @@ impl SeamKv {
     /// recurrent models can only export their live frontier or a captured turn checkpoint; an
     /// arbitrary token LCP has no matching recurrent/PLE summary.
     pub(crate) fn seedable_prefix_len(&self, cfg: &Config, prompt: &[u32]) -> usize {
-        if cfg.qwen35 || cfg.bailingmoe3 || cfg.deepseek4 {
+        if cfg.qwen35 || cfg.bailingmoe3 || cfg.glm5next || cfg.deepseek4 {
             return 0;
         }
         if !cfg.qwen4exp {
@@ -1243,7 +1264,7 @@ impl SeamKv {
             &self.qsa_kbufs,
             &self.qsa_cbufs,
         )?;
-        if cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3 {
+        if cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3 || cfg.glm5next {
             let conv_elems = (cfg.ssm_d_conv - 1) * cfg.recurrent_conv_channels();
             let s_elems = cfg.recurrent_state_elems();
             let conv_zero = vec![0f32; conv_elems];
@@ -1643,7 +1664,7 @@ impl SeamKv {
             None
         };
         let mut turn_recurrent_ckpts = std::array::from_fn(|_| None);
-        if cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3 {
+        if cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3 || cfg.glm5next {
             for checkpoint in &mut turn_recurrent_ckpts {
                 TurnRecurrentCkpt::begin(
                     checkpoint,
@@ -1767,7 +1788,7 @@ impl SeamKv {
         src: &SeamKv,
         p: usize,
     ) -> AResult<usize> {
-        if cfg.qwen35 || cfg.bailingmoe3 || cfg.deepseek4 {
+        if cfg.qwen35 || cfg.bailingmoe3 || cfg.glm5next || cfg.deepseek4 {
             return Ok(0);
         }
         if cfg.qwen4exp {

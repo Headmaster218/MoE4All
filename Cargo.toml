@@ -84,7 +84,9 @@ clap_mangen = "0.3"
 # fuel: the chat template is attacker-supplied (it ships inside the DOWNLOADED model's GGUF), so
 # `infr_chat::template` bounds every render with `Environment::set_fuel` — without this feature the
 # setter does not exist and a template with a nested loop renders forever. See CHAT_TEMPLATE_FUEL.
-minijinja = { version = "2", features = ["preserve_order", "fuel"] }
+# `loop_controls`: GLM-4.5/5 chat templates use `{% break %}` in their dedup macros; llama.cpp's
+# minja parses them, so the parser must accept them too (compile-time feature, no runtime setter).
+minijinja = { version = "2", features = ["preserve_order", "fuel", "loop_controls"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 # `strftime_now` in HF chat templates (Llama-3.x stamps "Today Date:") — llama.cpp-minja parity.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

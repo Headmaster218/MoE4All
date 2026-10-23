@@ -644,7 +644,7 @@ fn prepare_parallel_prompt_state(
     turn_checkpoint: Option<TurnCheckpoint>,
     req: Option<&crate::sampling::RequestCtx>,
 ) -> AResult<PreparedParallelPrompt> {
-    let recurrent_model = c.qwen35 || c.qwen4exp || c.bailingmoe3;
+    let recurrent_model = c.qwen35 || c.qwen4exp || c.bailingmoe3 || c.glm5next;
     let live_turn_start = recurrent_model
         .then(|| recurrent_extension_start(&kv.cached, prompt))
         .flatten();
@@ -1124,10 +1124,10 @@ fn session_stable(
     let fuse_qsa_prepare = fuse_qsa_prepare_decision(caps.qsa_prepare, g, c, ec);
     let fuse_delta_ab = fuse_delta_ab_decision(caps.linear_pair_f32, g, c, ec);
     let fuse_qwen_hc_down_inject = caps.qwen_hc_down_inject && ec.kernels.qwen_hc_down_inject;
-    let kda_qkv_fused = if c.bailingmoe3 {
+    let kda_qkv_fused = if c.bailingmoe3 || c.glm5next {
         (0..c.n_layer)
             .map(|l| {
-                if c.is_bailing_mla_layer(l) {
+                if c.is_mla_layer(l) {
                     Ok(false)
                 } else {
                     kda_qkv_is_fused(g, l)
@@ -1168,6 +1168,36 @@ fn session_stable(
                 })
             }
     };
+    // CPU-only batched-prefill eligibility for the IQ-grid expert dtypes (glm5next). The mmq scan
+    // above is the Vulkan dp4a story; Iq2Xxs has no mmq kernel, yet the CPU MoE arm runs IQ banks
+    // through the Super q8-activation batch kernels (`expert_acts_kind`'s `iq_ok` admission, the
+    // same `vec_dot_iq*_batch` kernels `Op::Linear` uses) at ANY row count — so a chunked prefill
+    // is correct AND amortizes the per-token expert-weight streaming that made glm5next prefill
+    // ~17x off gold. Mirror the arm's dtype set and its `in_f % 256 == 0` super-block condition
+    // (in_f = the expert FFN width, the GEMM's input dimension).
+    let moe_super_ok = |d: Option<DType>| {
+        d.is_some_and(|dt| {
+            matches!(dt, DType::Iq2Xxs | DType::Iq2S | DType::Iq3Xxs)
+                && c.moe.as_ref().is_some_and(|m| m.n_ff_exp % 256 == 0)
+        })
+    };
+    let moe_super_batched_ok = c.moe.is_some() && {
+        let dt = |n: String| g.tensors().iter().find(|t| t.name == n).map(|t| t.dtype);
+        let moe_layers = || (0..c.n_layer).filter(|&l| c.is_moe_layer(l));
+        moe_layers().next().is_some()
+            && if c.dual_moe() {
+                moe_layers().all(|l| {
+                    moe_super_ok(dt(format!("blk.{l}.ffn_gate_up_exps.weight")))
+                        && moe_super_ok(dt(format!("blk.{l}.ffn_down_exps.weight")))
+                })
+            } else {
+                moe_layers().all(|l| {
+                    moe_super_ok(dt(format!("blk.{l}.ffn_gate_exps.weight")))
+                        && moe_super_ok(dt(format!("blk.{l}.ffn_up_exps.weight")))
+                        && moe_super_ok(dt(format!("blk.{l}.ffn_down_exps.weight")))
+                })
+            }
+    };
     Ok(SessionStable {
         has_wv,
         out_scale,
@@ -1181,6 +1211,7 @@ fn session_stable(
         fuse_qwen_hc_down_inject,
         kda_qkv_fused,
         moe_batched_ok,
+        moe_super_batched_ok,
     })
 }
 
@@ -2162,12 +2193,12 @@ fn generate_dense_backend_inner(
     let max_qrow = nh * max_hd;
     // DeepSeek2 MLA: per-layer dims are uniform (no SWA/full variation), but the max calc is for
     // uniform models anyway.
-    let mla_key_len = if c.deepseek2 || c.bailingmoe3 {
+    let mla_key_len = if c.deepseek2 || c.bailingmoe3 || c.glm5next {
         c.kv_lora_rank + c.qk_rope_dim
     } else {
         0
     };
-    let mla_qhead = if c.deepseek2 || c.bailingmoe3 {
+    let mla_qhead = if c.deepseek2 || c.bailingmoe3 || c.glm5next {
         c.head_k_mla + c.qk_rope_dim
     } else {
         0
@@ -2207,6 +2238,7 @@ fn generate_dense_backend_inner(
     let fuse_qwen_hc_down_inject = stable.fuse_qwen_hc_down_inject;
     let kda_qkv_fused = &stable.kda_qkv_fused;
     let moe_batched_ok = stable.moe_batched_ok;
+    let moe_super_batched_ok = stable.moe_super_batched_ok;
 
     // qwen35 DeltaNet silu-gated RMSNorm fusion (decode op-fusion campaign): QkNorm's per-head
     // rmsnorm write is immediately read-after-write by the z-gate GatedAct — a real barrier on
@@ -2485,7 +2517,21 @@ fn generate_dense_backend_inner(
                     }
                     let bytes = expanded.iter().flat_map(|&x| x.to_le_bytes()).collect();
                     (WBytes::Owned(bytes), DType::F32, expanded.len())
-                } else if ((c.deepseek2 || c.bailingmoe3)
+                } else if c.glm5next && name.ends_with(".ssm_a") {
+                    // GLM stores `ssm_a` as `-exp(A_log)` and the reference scores the KDA decay
+                    // as `lower_bound * sigmoid(-gate * A)` (`glm5-next.cpp`), while the shared
+                    // Kda op computes `lower_bound * sigmoid(gate * a)` — bailing's convention,
+                    // where the GGUF stores the sign the op wants. Negating the 64 f32 at upload
+                    // makes the two conventions coincide exactly; no op or Vulkan change.
+                    let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
+                    let mut v: Vec<f32> = bytemuck::cast_slice(tb.as_ref()).to_vec();
+                    for x in v.iter_mut() {
+                        *x = -*x;
+                    }
+                    let numel = v.len();
+                    let bytes = v.iter().flat_map(|&x| x.to_le_bytes()).collect();
+                    (WBytes::Owned(bytes), DType::F32, numel)
+                } else if ((c.deepseek2 || c.bailingmoe3 || c.glm5next)
                     && (name.ends_with("attn_k_b.weight") || name.ends_with("attn_v_b.weight")))
                     || (c.deepseek4
                         && (name.contains("_compressor_ape.weight")
@@ -2559,7 +2605,7 @@ fn generate_dense_backend_inner(
             // mixer, no q/k/v/qk_norm/attn_output/bias at all. `false` for every non-qwen35 model.
             let is_delta = (c.qwen35 || c.qwen4exp) && !c.is_qwen_hybrid_attn_layer(l);
             let is_mla = c.is_mla_layer(l);
-            let is_kda = c.bailingmoe3 && !is_mla;
+            let is_kda = (c.bailingmoe3 || c.glm5next) && !is_mla;
             // DeepSeek V4: neither MLA nor plain attention — single-head MQA KV, a low-rank grouped
             // output projection, attention sinks, hyper-connections and up to two compressor blocks
             // per layer. `false` for every other arch. See docs/deepseek.md § Stage 4.
@@ -2610,6 +2656,21 @@ fn generate_dense_backend_inner(
                     wload(&[&p("indexer.proj.weight")])?;
                     wload(&[&p("indexer.attn_k.weight")])?;
                     wload(&[&p("indexer.attn_q_b.weight")])?;
+                }
+                if c.glm5next {
+                    // glm5next.cpp reads the five V3.2 lightning-indexer tensors on its MLA
+                    // blocks, PLUS a two-tensor key-pooling compressor: `indexer_compressor_ape`
+                    // `[kpool, key_length]` (the learned per-slot APE) and `indexer_compressor_gate`
+                    // `[n_embd, key_length]` — the kpool-4 pool whose semantics llama.cpp keeps
+                    // in-graph (score 4 consecutive tokens, keep incomplete tail pools). KDA blocks
+                    // carry neither.
+                    wload(&[&p("indexer.k_norm.weight")])?;
+                    wload(&[&p("indexer.k_norm.bias")])?;
+                    wload(&[&p("indexer.proj.weight")])?;
+                    wload(&[&p("indexer.attn_k.weight")])?;
+                    wload(&[&p("indexer.attn_q_b.weight")])?;
+                    wload(&[&p("indexer_compressor_ape.weight")])?;
+                    wload(&[&p("indexer_compressor_gate.weight")])?;
                 }
             } else if is_dsv4 {
                 // `deepseek4.cpp::load_arch_tensors`, in its order. The Q path is deepseek2's LoRA
@@ -2687,12 +2748,21 @@ fn generate_dense_backend_inner(
                 ])?;
                 let forget = kda_projection_name(g, l, "ssm_f.weight", "ssm_f_a.weight")?;
                 wload(&[&forget])?;
+                if c.glm5next {
+                    // GLM's forget gate is TWO-stage low-rank: `ssm_f_a` then `ssm_f_b` (Ling
+                    // carries only the single `ssm_f_a`). Loaded here; the graph consumes it in
+                    // M2 — until then placed but unread.
+                    wload(&[&p("ssm_f_b.weight")])?;
+                }
                 wload(&[&p("ssm_beta.weight")])?;
                 wload(&[&p("ssm_a")])?;
                 wload(&[&p("ssm_dt.bias")])?;
                 wload(&[&p("ssm_norm.weight")])?;
                 let gate = kda_projection_name(g, l, "ssm_g.weight", "ssm_g_a.weight")?;
                 wload(&[&gate])?;
+                if c.glm5next {
+                    wload(&[&p("ssm_g_b.weight")])?;
+                }
                 wload(&[&p("attn_output.weight")])?;
             } else if is_delta {
                 wload(&[&p("attn_qkv.weight")])?;
@@ -2732,6 +2802,22 @@ fn generate_dense_backend_inner(
             // no single `attn_output` tensor, so it is excluded here alongside MLA and DeltaNet.
             if !is_delta && !is_mla && !is_kda && !is_dsv4 {
                 wload(&[&p("attn_output.weight")])?;
+            }
+            if c.glm5next {
+                // glm5next's hyper-connections: the SAME (fn, base, scale) × (attn, ffn) triples
+                // deepseek4 uploads, on every trunk block (the NextN block carries none — the trunk
+                // loop stops before it), beside the plain `attn_norm`: no HC input norm. Uploaded
+                // after the mixer chain to mirror the `hc` `wpush` slot in `build`.
+                for name in [
+                    "hc_attn_fn.weight",
+                    "hc_attn_base.weight",
+                    "hc_attn_scale.weight",
+                    "hc_ffn_fn.weight",
+                    "hc_ffn_base.weight",
+                    "hc_ffn_scale.weight",
+                ] {
+                    wload(&[&p(name)])?;
+                }
             }
             if c.qwen4exp && c.is_qwen_hybrid_attn_layer(l) {
                 if fuse_qsa_prepare {
@@ -2818,7 +2904,7 @@ fn generate_dense_backend_inner(
                     wload(&[&p("ffn_up_exps.weight")])?;
                 }
                 wload(&[&p("ffn_down_exps.weight")])?;
-                if c.deepseek2 || c.bailingmoe3 {
+                if c.deepseek2 || c.bailingmoe3 || c.glm5next {
                     let ep_name = p("exp_probs_b.bias");
                     if g.tensors().iter().any(|t| t.name == ep_name) {
                         wload(&[&ep_name])?;
@@ -2986,7 +3072,7 @@ fn generate_dense_backend_inner(
         // `ggml_rms_norm` there). `Op::RmsNorm` requires a weight, so — exactly like the three
         // ones-vectors above — one `hc_mult*n_embd`-wide vector of 1.0 serves all of them
         // (`x * s * 1.0 == x * s` in IEEE). See the matching `hc_ones` handle in `build`.
-        if c.deepseek4 {
+        if c.deepseek4 || c.glm5next {
             let ones = vec![1.0f32; c.hc_mult * ne];
             let b = be
                 .alloc(ones.len() * 4, BufferUsage::Weights)
@@ -3447,7 +3533,7 @@ fn generate_dense_backend_inner(
     // A live append-only recurrent state wins when the new prompt extends it exactly. Otherwise
     // try the last stable conversation checkpoint before taking the unchanged zero-reset path.
     // Restoration is device-side work, so concurrent serve takes the same GPU baton as a forward.
-    let recurrent_model = c.qwen35 || c.qwen4exp || c.bailingmoe3;
+    let recurrent_model = c.qwen35 || c.qwen4exp || c.bailingmoe3 || c.glm5next;
     let cached_before_restore = state.as_ref().map_or(0, |kv| kv.cached.len());
     let common_before_restore = state_trace.then(|| {
         state
@@ -4311,7 +4397,7 @@ fn generate_dense_backend_inner(
             // the `wload` skip above). `is_delta` is `false` for every non-qwen35 model.
             let is_delta = (c.qwen35 || c.qwen4exp) && !c.is_qwen_hybrid_attn_layer(l);
             let is_mla = c.is_mla_layer(l);
-            let is_kda = c.bailingmoe3 && !is_mla;
+            let is_kda = (c.bailingmoe3 || c.glm5next) && !is_mla;
             let mixer = if c.deepseek4 {
                 // EXACT order of `wload`'s `is_dsv4` arm — `wpush` consumes `wspecs` sequentially,
                 // so one handle out of place binds every later weight in the model one buffer off,
@@ -4347,12 +4433,16 @@ fn generate_dense_backend_inner(
                 // arm above — `wpush` consumes `wspecs` SEQUENTIALLY, so a missing or reordered
                 // declaration here would bind every later weight in the layer one buffer off,
                 // silently.
-                let indexer = c.deepseek32.then(|| IndexerW {
+                let indexer = (c.deepseek32 || c.glm5next).then(|| IndexerW {
                     k_norm: wpush(&mut g, &mut weights),
                     k_norm_b: wpush(&mut g, &mut weights),
                     proj: wpush(&mut g, &mut weights),
                     attn_k: wpush(&mut g, &mut weights),
                     attn_q_b: wpush(&mut g, &mut weights),
+                    // glm5next's kpool-4 compressor pair, uploaded right after the five V3.2
+                    // tensors; V3.2 scores every token directly and has None here.
+                    compressor_ape: c.glm5next.then(|| wpush(&mut g, &mut weights)),
+                    compressor_gate: c.glm5next.then(|| wpush(&mut g, &mut weights)),
                 });
                 MixerW::Mla(MlaW {
                     wq_a,
@@ -4379,11 +4469,15 @@ fn generate_dense_backend_inner(
                     qkv,
                     conv: wpush(&mut g, &mut weights),
                     forget: wpush(&mut g, &mut weights),
+                    // glm5next's second-stage low-rank projections, uploaded right after their
+                    // first-stage twins (`ssm_f_b` after `ssm_f_a`, `ssm_g_b` after `ssm_g_a`).
+                    forget_b: c.glm5next.then(|| wpush(&mut g, &mut weights)),
                     beta: wpush(&mut g, &mut weights),
                     a: wpush(&mut g, &mut weights),
                     dt_bias: wpush(&mut g, &mut weights),
                     norm: wpush(&mut g, &mut weights),
                     gate: wpush(&mut g, &mut weights),
+                    gate_b: c.glm5next.then(|| wpush(&mut g, &mut weights)),
                     out: wpush(&mut g, &mut weights),
                 })
             } else if is_delta {
@@ -4479,9 +4573,10 @@ fn generate_dense_backend_inner(
                     qsa,
                 })
             };
-            // DeepSeek V4's two hyper-connection triples, in `wload`'s order: attn `(fn, base,
-            // scale)` then ffn `(fn, base, scale)`.
-            let hc = c.deepseek4.then(|| LayerHcW {
+            // DeepSeek V4's and glm5next's two hyper-connection triples, in `wload`'s order: attn
+            // `(fn, base, scale)` then ffn `(fn, base, scale)`. Both archs carry them on EVERY
+            // trunk layer; glm5next reuses the tensor names AND this slot verbatim.
+            let hc = (c.deepseek4 || c.glm5next).then(|| LayerHcW {
                 attn: HcTriple {
                     w_fn: wpush(&mut g, &mut weights),
                     base: wpush(&mut g, &mut weights),
@@ -4778,10 +4873,10 @@ fn generate_dense_backend_inner(
         } else {
             None
         };
-        // DeepSeek V4's `hc_mult*n_embd`-wide ones-vector for the weightless RMSNorm that feeds
-        // every hyper-connection mixing matmul — upload order matches the `if c.deepseek4` block
-        // at the end of the weight loop above.
-        let hc_ones = if c.deepseek4 {
+        // DeepSeek V4's / glm5next's `hc_mult*n_embd`-wide ones-vector for the weightless RMSNorm
+        // that feeds every hyper-connection mixing matmul — upload order matches the
+        // `if c.deepseek4 || c.glm5next` block at the end of the weight loop above.
+        let hc_ones = if c.deepseek4 || c.glm5next {
             Some(wpush(&mut g, &mut weights))
         } else {
             None
@@ -4851,12 +4946,12 @@ fn generate_dense_backend_inner(
         } else {
             None
         };
-        let mla_kv_cmpr = if c.deepseek2 || c.bailingmoe3 {
+        let mla_kv_cmpr = if c.deepseek2 || c.bailingmoe3 || c.glm5next {
             Some(g.internal(f32d(batch * c.kv_lora_rank)))
         } else {
             None
         };
-        let mla_rope = if c.deepseek2 || c.bailingmoe3 {
+        let mla_rope = if c.deepseek2 || c.bailingmoe3 || c.glm5next {
             Some(g.internal(f32d(batch * c.qk_rope_dim)))
         } else {
             None
@@ -4876,7 +4971,7 @@ fn generate_dense_backend_inner(
         //   hc_pre / hc_post   [batch, hc]      collapse weights / per-stream output gates
         //   hc_comb    [batch, hc, hc]          Sinkhorn-normalised mixing matrix
         let hcw = c.hc_mult * ne;
-        let (hcr, hc_normed) = if c.deepseek4 {
+        let (hcr, hc_normed) = if c.deepseek4 || c.glm5next {
             (
                 [
                     g.internal(f32d(batch * hcw.max(1))),
@@ -4965,17 +5060,32 @@ fn generate_dense_backend_inner(
         //   ix_mask [batch, kv_len]                              additive score mask for Op::Mla
         // `ix_topk`/`ix_mask` are sized by the SELECTION, so they scale with the context, not with
         // the model: `batch * kv_len` f32 is the mask's whole cost (see `Op::TopkMask`).
-        let ix_top_k = c.indexer_top_k.min(start_pos + batch);
-        let (ix_q, ix_k, ix_w, ix_topk, ix_mask) = if c.deepseek32 {
+        // glm5next's token budget must stay a multiple of kpool (pools emit 4 slots each); the
+        // ceiling is the causal prefix rounded UP to a whole pool so every real token fits.
+        let ix_top_k = if c.glm5next && be.name() == "cpu" {
+            let ceil =
+                ((start_pos + batch + c.indexer_kpool - 1) / c.indexer_kpool) * c.indexer_kpool;
+            c.indexer_top_k.min(ceil)
+        } else {
+            c.indexer_top_k.min(start_pos + batch)
+        };
+        // glm5next's kpool indexer runs on the CPU backend (the Vulkan shader is pending); the
+        // token budget is the GGUF's `top_k` (pools kept = top_k / kpool), and the packed
+        // `[key | gate]` scratch is one row the WriteKv lands in the V-side cache.
+        let glm_ix = c.glm5next && be.name() == "cpu";
+        let (ix_q, ix_k, ix_w, ix_topk, ix_mask, ix_gate, ix_kg) = if c.deepseek32 || glm_ix {
             (
                 Some(g.internal(f32d(batch * c.indexer_n_head * c.indexer_head_size))),
                 Some(g.internal(f32d(batch * c.indexer_head_size))),
                 Some(g.internal(f32d(batch * c.indexer_n_head))),
                 Some(g.internal(TensorDesc::new(vec![batch * ix_top_k], DType::I32))),
                 Some(g.internal(f32d(batch * (start_pos + batch)))),
+                // dsv32-only slots stay None; glm5next-only slots mirror that.
+                glm_ix.then(|| g.internal(f32d(batch * c.indexer_head_size))),
+                glm_ix.then(|| g.internal(f32d(batch * 2 * c.indexer_head_size))),
             )
         } else {
-            (None, None, None, None, None)
+            (None, None, None, None, None, None, None)
         };
         // Fused-QKV prefill staging: the wide GEMM writes [batch, qrow+2·kvrow] here, then three
         // CopyStrided ops split it into q/k/v. Decode (batch==1) skips it (offset GEMVs).
@@ -5061,8 +5171,17 @@ fn generate_dense_backend_inner(
         let dn_out = g.internal(f32d(batch * q35_vdim.max(1)));
         // Ling KDA adds a vector forget projection, while its MLA layers add one gate scalar per
         // head. Both are shared scratch across mutually-exclusive layer mixer arms.
-        let kda_forget = if c.bailingmoe3 {
+        let kda_forget = if c.bailingmoe3 || c.glm5next {
             g.internal(f32d(batch * c.ssm_d_inner.max(1)))
+        } else {
+            g.internal(f32d(1))
+        };
+        // glm5next's forget/gate are TWO-stage low-rank (`glm5-next.cpp`: `f_a` [n_embd, head_dim]
+        // then `f_b` [head_dim, d_inner], the `g` pair identical). One `head_dim`-wide row buffer
+        // carries each stage-1 output; the two chains run serially (forget before the scan, gate
+        // after), so one buffer serves both.
+        let kda_rank = if c.glm5next {
+            g.internal(f32d(batch * c.kda_head_dim.max(1)))
         } else {
             g.internal(f32d(1))
         };
@@ -5453,8 +5572,10 @@ fn generate_dense_backend_inner(
         // and neither it nor `docs/backlog.md` § B-DSV4-WIRING records how the reference seeds the
         // widened stream. Replicating the input across streams is what the hyper-connections
         // formulation calls for and what makes the head's collapse a partition of unity at depth 0;
-        // it is recorded as unverified in `docs/backlog.md` § B-DSV4-HC.
-        if c.deepseek4 {
+        // it is recorded as unverified in `docs/backlog.md` § B-DSV4-HC. glm5next VERIFIES it:
+        // `glm5-next.cpp` seeds the streams with `ggml_repeat_4d(inp, n_embd, hc, n_tokens, 1)`
+        // ("hc_init") — the same replication, from the reference itself.
+        if c.deepseek4 || c.glm5next {
             for h in 0..c.hc_mult {
                 g.push(Op::CopyStrided {
                     src: hidden,
@@ -5615,7 +5736,7 @@ fn generate_dense_backend_inner(
             // because its GGUF omits both optional keys. `infr_core::graph::swiglu_clamp` owns the
             // `limit > 1e-6` disabled gate; passing a non-clamping layer's raw 0.0 through as
             // `Some(0.0)` would clamp that whole FFN to zero. `None` for every other arch.
-            let (clamp_exp, clamp_shexp) = if c.deepseek4 || c.bailingmoe3 {
+            let (clamp_exp, clamp_shexp) = if c.deepseek4 || c.bailingmoe3 || c.glm5next {
                 (
                     infr_core::graph::swiglu_clamp(c.swiglu_clamp_exp[l]),
                     infr_core::graph::swiglu_clamp(c.swiglu_clamp_shexp[l]),
@@ -5901,15 +6022,41 @@ fn generate_dense_backend_inner(
                     channels: packed as u32,
                     kernel: c.ssm_d_conv as u32,
                 });
-                g.push(Op::Linear {
-                    x: hn,
-                    weight: kw.forget,
-                    dst: kda_forget,
-                    m: batch as u32,
-                    in_f: ne as u32,
-                    out_f: inner as u32,
-                    w_off: 0,
-                });
+                match kw.forget_b {
+                    // glm5next: `forget = f_b · f_a · x` — two Linears, the rank-128 intermediate
+                    // in `kda_rank` (`glm5-next.cpp::build_kda_layer`, the `f_a`/`g1` pair). The
+                    // `Op::Kda` op still receives the FULL `inner`-wide forget row + `dt_bias`,
+                    // exactly like Ling's single-stage form.
+                    Some(fb) => {
+                        g.push(Op::Linear {
+                            x: hn,
+                            weight: kw.forget,
+                            dst: kda_rank,
+                            m: batch as u32,
+                            in_f: ne as u32,
+                            out_f: c.kda_head_dim as u32,
+                            w_off: 0,
+                        });
+                        g.push(Op::Linear {
+                            x: kda_rank,
+                            weight: fb,
+                            dst: kda_forget,
+                            m: batch as u32,
+                            in_f: c.kda_head_dim as u32,
+                            out_f: inner as u32,
+                            w_off: 0,
+                        });
+                    }
+                    None => g.push(Op::Linear {
+                        x: hn,
+                        weight: kw.forget,
+                        dst: kda_forget,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: inner as u32,
+                        w_off: 0,
+                    }),
+                }
                 g.push(Op::Linear {
                     x: hn,
                     weight: kw.beta,
@@ -5933,15 +6080,38 @@ fn generate_dense_backend_inner(
                     eps,
                     lower_bound: c.kda_gate_lower_bound,
                 });
-                g.push(Op::Linear {
-                    x: hn,
-                    weight: kw.gate,
-                    dst: dn_zbuf,
-                    m: batch as u32,
-                    in_f: ne as u32,
-                    out_f: inner as u32,
-                    w_off: 0,
-                });
+                match kw.gate_b {
+                    // glm5next's output gate is the `g_a`/`g_b` twin of the forget pair above.
+                    Some(gb) => {
+                        g.push(Op::Linear {
+                            x: hn,
+                            weight: kw.gate,
+                            dst: kda_rank,
+                            m: batch as u32,
+                            in_f: ne as u32,
+                            out_f: c.kda_head_dim as u32,
+                            w_off: 0,
+                        });
+                        g.push(Op::Linear {
+                            x: kda_rank,
+                            weight: gb,
+                            dst: dn_zbuf,
+                            m: batch as u32,
+                            in_f: c.kda_head_dim as u32,
+                            out_f: inner as u32,
+                            w_off: 0,
+                        });
+                    }
+                    None => g.push(Op::Linear {
+                        x: hn,
+                        weight: kw.gate,
+                        dst: dn_zbuf,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: inner as u32,
+                        w_off: 0,
+                    }),
+                }
                 g.push(Op::QkNorm {
                     x: dn_out,
                     weight: Some(kw.norm),
@@ -6461,156 +6631,282 @@ fn generate_dense_backend_inner(
                 // The emit reads `mw.indexer`, NOT `c.deepseek32`: a V3.2 model whose indexer
                 // weights were not captured therefore takes the `else` below and FAILS loudly,
                 // instead of quietly running the deepseek2 graph over every key.
-                let key_mask = match &mw.indexer {
-                    None => {
-                        assert!(
-                            !c.deepseek32,
-                            "deepseek32 model reached the MLA emit with no lightning-indexer \
+                // glm5next runs its kpool-4 POOL indexer (`glm5-next.cpp`) on the CPU backend via
+                // the `glm_ix` arm below — pooled keys + per-channel APE softmax + gate, NO rope
+                // on the indexer heads. On backends whose shader has not landed (Vulkan) it keeps
+                // the dense deepseek2 mask: at ≤ top_k keys the selection IS the causal prefix, so
+                // the interim is numerically equal there and only diverges past the pool budget.
+                let key_mask = if glm_ix && mw.indexer.is_some() {
+                    let ix = mw.indexer.as_ref().expect("glm_ix implies indexer weights");
+                    let ix_q = ix_q.expect("glm5next without ix_q scratch");
+                    let ix_k = ix_k.expect("glm5next without ix_k scratch");
+                    let ix_w = ix_w.expect("glm5next without ix_w scratch");
+                    let ix_topk = ix_topk.expect("glm5next without ix_topk scratch");
+                    let ix_mask = ix_mask.expect("glm5next without ix_mask scratch");
+                    let ix_gate = ix_gate.expect("glm5next without ix_gate scratch");
+                    let ix_kg = ix_kg.expect("glm5next without ix_kg scratch");
+                    let ix_nh = c.indexer_n_head as u32;
+                    let ix_hd = c.indexer_head_size as u32;
+                    let kv_len = (start_pos + batch) as u32;
+                    // indexer_k = LayerNorm(indexer_attn_k · x) — the mean-centred norm with bias
+                    // and its own 1e-6 epsilon, like V3.2's — but NO rope: the arch is NoPE.
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: ix.attn_k,
+                        dst: ix_k,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: ix_hd,
+                        w_off: 0,
+                    });
+                    g.push(Op::LayerNorm {
+                        x: ix_k,
+                        weight: ix.k_norm,
+                        bias: ix.k_norm_b,
+                        dst: ix_k,
+                        rows: batch as u32,
+                        dim: ix_hd,
+                        eps: c.norm_eps,
+                    });
+                    // Pool gate `ig = indexer_compressor_gate · x`, then pack `[key | gate]` —
+                    // one 2·head_dim row per token for the cache.
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: ix
+                            .compressor_gate
+                            .expect("glm5next indexer without compressor_gate"),
+                        dst: ix_gate,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: ix_hd,
+                        w_off: 0,
+                    });
+                    g.push(Op::CopyStrided {
+                        src: ix_k,
+                        src_off: 0,
+                        src_stride: ix_hd,
+                        dst: ix_kg,
+                        dst_off: 0,
+                        dst_stride: 2 * ix_hd,
+                        rows: batch as u32,
+                        n: ix_hd,
+                    });
+                    g.push(Op::CopyStrided {
+                        src: ix_gate,
+                        src_off: 0,
+                        src_stride: ix_hd,
+                        dst: ix_kg,
+                        dst_off: ix_hd,
+                        dst_stride: 2 * ix_hd,
+                        rows: batch as u32,
+                        n: ix_hd,
+                    });
+                    g.push(Op::WriteKv {
+                        src: ix_kg,
+                        cache: v_cache[l],
+                        rows: batch as u32,
+                        row_stride: 2 * ix_hd,
+                        pos: start_pos as u32,
+                    });
+                    // Queries off the q_lora (`attn`), never cached, never roped.
+                    g.push(Op::Linear {
+                        x: attn,
+                        weight: ix.attn_q_b,
+                        dst: ix_q,
+                        m: batch as u32,
+                        in_f: c.q_lora_rank as u32,
+                        out_f: ix_nh * ix_hd,
+                        w_off: 0,
+                    });
+                    // Per-head weights, UNSCALED — the op folds `1/sqrt(hd·nh)` into `w`.
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: ix.proj,
+                        dst: ix_w,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: ix_nh,
+                        w_off: 0,
+                    });
+                    g.push(Op::GlmKpoolIndexer {
+                        q: ix_q,
+                        k_cache: v_cache[l],
+                        ape: ix
+                            .compressor_ape
+                            .expect("glm5next indexer without compressor_ape"),
+                        weights: ix_w,
+                        dst: ix_topk,
+                        rows: batch as u32,
+                        kv_len,
+                        n_head: ix_nh,
+                        head_dim: ix_hd,
+                        kpool: c.indexer_kpool as u32,
+                        top_k: ix_top_k as u32,
+                        scale: 1.0 / ((ix_hd * ix_nh) as f32).sqrt(),
+                        pos: start_pos as u32,
+                    });
+                    g.push(Op::TopkMask {
+                        idx: ix_topk,
+                        dst: ix_mask,
+                        rows: batch as u32,
+                        kv_len,
+                        top_k: ix_top_k as u32,
+                    });
+                    Some(ix_mask)
+                } else {
+                    match mw.indexer.as_ref().filter(|_| !c.glm5next) {
+                        None => {
+                            assert!(
+                                !c.deepseek32,
+                                "deepseek32 model reached the MLA emit with no lightning-indexer \
                              weights captured — running the deepseek2 graph here would attend \
                              every key instead of the indexer's top-k. See docs/deepseek.md § \
                              Stage 3."
-                        );
-                        None
-                    }
-                    Some(ix) => {
-                        let ix_q = ix_q.expect("deepseek32 model without ix_q scratch");
-                        let ix_k = ix_k.expect("deepseek32 model without ix_k scratch");
-                        let ix_w = ix_w.expect("deepseek32 model without ix_w scratch");
-                        let ix_topk = ix_topk.expect("deepseek32 model without ix_topk scratch");
-                        let ix_mask = ix_mask.expect("deepseek32 model without ix_mask scratch");
-                        let ix_nh = c.indexer_n_head as u32;
-                        let ix_hd = c.indexer_head_size as u32;
-                        let kv_len = (start_pos + batch) as u32;
-                        // The indexer head is `[rope | nope]` — rope FIRST, the OPPOSITE of the
-                        // MLA head's `[nope | rope]`. That is why both ropes below are a plain
-                        // `Op::Rope` over the head's leading `qk_rope` dims with no offset and no
-                        // split: the op rotates `[0, rope_dim)` of each `head_dim`-wide head and
-                        // passes the tail through. llama.cpp writes the nope view's offset as
-                        // `row_size(nope)` where the layout means `row_size(rope)`; the two
-                        // coincide only because V3.2 has nope == rope == 64. This port takes the
-                        // layout ("rope occupies the head's first `n_rot` dims") and so does not
-                        // depend on that coincidence — `synthetic_deepseek32_indexer_head_is_rope_
-                        // then_nope` runs it at nope != rope, where the two readings differ.
-                        assert!(
+                            );
+                            None
+                        }
+                        Some(ix) => {
+                            let ix_q = ix_q.expect("deepseek32 model without ix_q scratch");
+                            let ix_k = ix_k.expect("deepseek32 model without ix_k scratch");
+                            let ix_w = ix_w.expect("deepseek32 model without ix_w scratch");
+                            let ix_topk =
+                                ix_topk.expect("deepseek32 model without ix_topk scratch");
+                            let ix_mask =
+                                ix_mask.expect("deepseek32 model without ix_mask scratch");
+                            let ix_nh = c.indexer_n_head as u32;
+                            let ix_hd = c.indexer_head_size as u32;
+                            let kv_len = (start_pos + batch) as u32;
+                            // The indexer head is `[rope | nope]` — rope FIRST, the OPPOSITE of the
+                            // MLA head's `[nope | rope]`. That is why both ropes below are a plain
+                            // `Op::Rope` over the head's leading `qk_rope` dims with no offset and no
+                            // split: the op rotates `[0, rope_dim)` of each `head_dim`-wide head and
+                            // passes the tail through. llama.cpp writes the nope view's offset as
+                            // `row_size(nope)` where the layout means `row_size(rope)`; the two
+                            // coincide only because V3.2 has nope == rope == 64. This port takes the
+                            // layout ("rope occupies the head's first `n_rot` dims") and so does not
+                            // depend on that coincidence — `synthetic_deepseek32_indexer_head_is_rope_
+                            // then_nope` runs it at nope != rope, where the two readings differ.
+                            assert!(
                             c.indexer_head_size > c.qk_rope_dim,
                             "deepseek32 indexer head_size {} must exceed the rope width {} — the \
                              head is [rope | nope] and there has to be a nope part",
                             c.indexer_head_size,
                             c.qk_rope_dim
                         );
-                        // indexer_k = LayerNorm(indexer_attn_k · x), rope'd, then cached. ONE key
-                        // row per token, shared by every indexer query head (MQA).
-                        g.push(Op::Linear {
-                            x: hn,
-                            weight: ix.attn_k,
-                            dst: ix_k,
-                            m: batch as u32,
-                            in_f: ne as u32,
-                            out_f: ix_hd,
-                            w_off: 0,
-                        });
-                        // A real mean-centred LayerNorm WITH bias (`Op::LayerNorm`), on its own
-                        // hardcoded 1e-6 epsilon — not the GGUF's RMS epsilon. The only non-RMS
-                        // norm in the DeepSeek family.
-                        g.push(Op::LayerNorm {
-                            x: ix_k,
-                            weight: ix.k_norm,
-                            bias: ix.k_norm_b,
-                            dst: ix_k,
-                            rows: batch as u32,
-                            dim: ix_hd,
-                            eps: c.norm_eps,
-                        });
-                        // NEOX, hardcoded in `deepseek32.cpp` (`LLAMA_ROPE_TYPE_NEOX`), while the
-                        // MLA q_pe/k_pe rope a few lines below stays NORM. Same width, same
-                        // frequencies, same YaRN divisors — different element pairing.
-                        g.push(Op::Rope {
-                            x: ix_k,
-                            positions,
-                            dst: ix_k,
-                            rows: batch as u32,
-                            n_head: 1,
-                            head_dim: ix_hd,
-                            rope_dim: qk_rope,
-                            theta,
-                            freq_factors: yarn_ff,
-                            x_stride: 0,
-                            neox: true,
-                            backward: false,
-                        });
-                        // The indexer's own KV cache — a SECOND per-token cache alongside the
-                        // 576-wide MLA one, carried on the V side this arch leaves unused (see
-                        // `crate::seam::kv_row_elems`). Written before the scoring reads it.
-                        g.push(Op::WriteKv {
-                            src: ix_k,
-                            cache: v_cache[l],
-                            rows: batch as u32,
-                            row_stride: ix_hd,
-                            pos: start_pos as u32,
-                        });
-                        // indexer_q = indexer_attn_q_b · qr, same `[rope | nope]` head, same NEOX
-                        // rope. Not cached — queries never are.
-                        g.push(Op::Linear {
-                            x: attn,
-                            weight: ix.attn_q_b,
-                            dst: ix_q,
-                            m: batch as u32,
-                            in_f: c.q_lora_rank as u32,
-                            out_f: ix_nh * ix_hd,
-                            w_off: 0,
-                        });
-                        g.push(Op::Rope {
-                            x: ix_q,
-                            positions,
-                            dst: ix_q,
-                            rows: batch as u32,
-                            n_head: ix_nh,
-                            head_dim: ix_hd,
-                            rope_dim: qk_rope,
-                            theta,
-                            freq_factors: yarn_ff,
-                            x_stride: 0,
-                            neox: true,
-                            backward: false,
-                        });
-                        // Per-head weights `w[t, h]`, UNSCALED — `Op::LightningIndexer` applies
-                        // the `1/sqrt(head_dim * n_head)` normaliser to the WEIGHT, which is where
-                        // llama.cpp folds it too ("pre-scale weights to avoid scaling operations
-                        // on huge indexer_score tensor").
-                        g.push(Op::Linear {
-                            x: hn,
-                            weight: ix.proj,
-                            dst: ix_w,
-                            m: batch as u32,
-                            in_f: ne as u32,
-                            out_f: ix_nh,
-                            w_off: 0,
-                        });
-                        g.push(Op::LightningIndexer {
-                            q: ix_q,
-                            k_cache: v_cache[l],
-                            weights: ix_w,
-                            dst: ix_topk,
-                            rows: batch as u32,
-                            kv_len,
-                            n_head: ix_nh,
-                            head_dim: ix_hd,
-                            top_k: ix_top_k as u32,
-                            scale: 1.0 / ((ix_hd * ix_nh) as f32).sqrt(),
-                            pos: start_pos as u32,
-                        });
-                        // Expand the indices into the additive `-inf`-outside-top-k score mask the
-                        // MLA kernels add. llama.cpp materialises the same mask and runs DENSE
-                        // attention over the full n_kv — the FLOP saving is not taken, only the
-                        // numerics are faithful (docs/deepseek.md § "How top-k feeds attention").
-                        g.push(Op::TopkMask {
-                            idx: ix_topk,
-                            dst: ix_mask,
-                            rows: batch as u32,
-                            kv_len,
-                            top_k: ix_top_k as u32,
-                        });
-                        Some(ix_mask)
+                            // indexer_k = LayerNorm(indexer_attn_k · x), rope'd, then cached. ONE key
+                            // row per token, shared by every indexer query head (MQA).
+                            g.push(Op::Linear {
+                                x: hn,
+                                weight: ix.attn_k,
+                                dst: ix_k,
+                                m: batch as u32,
+                                in_f: ne as u32,
+                                out_f: ix_hd,
+                                w_off: 0,
+                            });
+                            // A real mean-centred LayerNorm WITH bias (`Op::LayerNorm`), on its own
+                            // hardcoded 1e-6 epsilon — not the GGUF's RMS epsilon. The only non-RMS
+                            // norm in the DeepSeek family.
+                            g.push(Op::LayerNorm {
+                                x: ix_k,
+                                weight: ix.k_norm,
+                                bias: ix.k_norm_b,
+                                dst: ix_k,
+                                rows: batch as u32,
+                                dim: ix_hd,
+                                eps: c.norm_eps,
+                            });
+                            // NEOX, hardcoded in `deepseek32.cpp` (`LLAMA_ROPE_TYPE_NEOX`), while the
+                            // MLA q_pe/k_pe rope a few lines below stays NORM. Same width, same
+                            // frequencies, same YaRN divisors — different element pairing.
+                            g.push(Op::Rope {
+                                x: ix_k,
+                                positions,
+                                dst: ix_k,
+                                rows: batch as u32,
+                                n_head: 1,
+                                head_dim: ix_hd,
+                                rope_dim: qk_rope,
+                                theta,
+                                freq_factors: yarn_ff,
+                                x_stride: 0,
+                                neox: true,
+                                backward: false,
+                            });
+                            // The indexer's own KV cache — a SECOND per-token cache alongside the
+                            // 576-wide MLA one, carried on the V side this arch leaves unused (see
+                            // `crate::seam::kv_row_elems`). Written before the scoring reads it.
+                            g.push(Op::WriteKv {
+                                src: ix_k,
+                                cache: v_cache[l],
+                                rows: batch as u32,
+                                row_stride: ix_hd,
+                                pos: start_pos as u32,
+                            });
+                            // indexer_q = indexer_attn_q_b · qr, same `[rope | nope]` head, same NEOX
+                            // rope. Not cached — queries never are.
+                            g.push(Op::Linear {
+                                x: attn,
+                                weight: ix.attn_q_b,
+                                dst: ix_q,
+                                m: batch as u32,
+                                in_f: c.q_lora_rank as u32,
+                                out_f: ix_nh * ix_hd,
+                                w_off: 0,
+                            });
+                            g.push(Op::Rope {
+                                x: ix_q,
+                                positions,
+                                dst: ix_q,
+                                rows: batch as u32,
+                                n_head: ix_nh,
+                                head_dim: ix_hd,
+                                rope_dim: qk_rope,
+                                theta,
+                                freq_factors: yarn_ff,
+                                x_stride: 0,
+                                neox: true,
+                                backward: false,
+                            });
+                            // Per-head weights `w[t, h]`, UNSCALED — `Op::LightningIndexer` applies
+                            // the `1/sqrt(head_dim * n_head)` normaliser to the WEIGHT, which is where
+                            // llama.cpp folds it too ("pre-scale weights to avoid scaling operations
+                            // on huge indexer_score tensor").
+                            g.push(Op::Linear {
+                                x: hn,
+                                weight: ix.proj,
+                                dst: ix_w,
+                                m: batch as u32,
+                                in_f: ne as u32,
+                                out_f: ix_nh,
+                                w_off: 0,
+                            });
+                            g.push(Op::LightningIndexer {
+                                q: ix_q,
+                                k_cache: v_cache[l],
+                                weights: ix_w,
+                                dst: ix_topk,
+                                rows: batch as u32,
+                                kv_len,
+                                n_head: ix_nh,
+                                head_dim: ix_hd,
+                                top_k: ix_top_k as u32,
+                                scale: 1.0 / ((ix_hd * ix_nh) as f32).sqrt(),
+                                pos: start_pos as u32,
+                            });
+                            // Expand the indices into the additive `-inf`-outside-top-k score mask the
+                            // MLA kernels add. llama.cpp materialises the same mask and runs DENSE
+                            // attention over the full n_kv — the FLOP saving is not taken, only the
+                            // numerics are faithful (docs/deepseek.md § "How top-k feeds attention").
+                            g.push(Op::TopkMask {
+                                idx: ix_topk,
+                                dst: ix_mask,
+                                rows: batch as u32,
+                                kv_len,
+                                top_k: ix_top_k as u32,
+                            });
+                            Some(ix_mask)
+                        }
                     }
                 };
 
@@ -7472,7 +7768,14 @@ fn generate_dense_backend_inner(
                         rows: batch as u32,
                         nff: nff_l as u32,
                         act,
-                        swiglu_clamp: None,
+                        // glm5next's `swiglu_clamp_exp` array covers the DENSE lead layers too
+                        // (llama.cpp's `build_ffn` reads it for every `il`); every other arch has
+                        // no clamp key and gets `None` exactly as before.
+                        swiglu_clamp: if c.glm5next {
+                            infr_core::graph::swiglu_clamp(c.swiglu_clamp_exp[l])
+                        } else {
+                            None
+                        },
                     });
                     // bitnet SubLN: RMSNorm the FFN intermediate (`actbuf`, width `nff_l`) BEFORE
                     // the down projection — matches llama.cpp `build_bitnet`'s `ffn_sub_norm`.
@@ -7526,7 +7829,12 @@ fn generate_dense_backend_inner(
                         up_stride: 0,
                         gate_stride: 0,
                         gate_block_width: 0,
-                        swiglu_clamp: None,
+                        // glm5next dense-lead clamp — see the `GatedActFused` arm above.
+                        swiglu_clamp: if c.glm5next {
+                            infr_core::graph::swiglu_clamp(c.swiglu_clamp_exp[l])
+                        } else {
+                            None
+                        },
                     });
                     // bitnet SubLN: RMSNorm the FFN intermediate BEFORE the down projection (see the
                     // `FfnW::DenseFused` arm above; same `ffn_sub_norm` from llama.cpp `build_bitnet`).
@@ -8048,6 +8356,48 @@ fn generate_dense_backend_inner(
                 rows: batch as u32,
                 hc: c.hc_mult as u32,
                 n_embd: ne as u32,
+            });
+        }
+        // glm5next's model head: NO learned collapse triple (the GGUF carries no `output_hc_*`) —
+        // `glm5-next.cpp::build_hc_mean` collapses the streams with a plain MEAN: sum the
+        // `hc_mult` streams, scale by 1/hc, then `output_norm`. One stream at a time through
+        // `hc_normed`'s head (wide enough, and dead after the last wrap's pre), summed into
+        // `hidden`, which the LM-head tail reads like every other arch does.
+        if c.glm5next {
+            let hc = c.hc_mult as u32;
+            g.push(Op::CopyStrided {
+                src: hcr[0],
+                src_off: 0,
+                src_stride: hcw as u32,
+                dst: hidden,
+                dst_off: 0,
+                dst_stride: ne as u32,
+                rows: batch as u32,
+                n: ne as u32,
+            });
+            for h in 1..c.hc_mult {
+                g.push(Op::CopyStrided {
+                    src: hcr[0],
+                    src_off: (h * ne) as u32,
+                    src_stride: hcw as u32,
+                    dst: hc_normed,
+                    dst_off: 0,
+                    dst_stride: ne as u32,
+                    rows: batch as u32,
+                    n: ne as u32,
+                });
+                g.push(Op::Add {
+                    a: hidden,
+                    b: hc_normed,
+                    dst: hidden,
+                    n: (batch * ne) as u32,
+                });
+            }
+            g.push(Op::Scale {
+                x: hidden,
+                dst: hidden,
+                s: 1.0 / hc as f32,
+                n: (batch * ne) as u32,
             });
         }
         if l_end == c.n_layer {
@@ -11176,7 +11526,11 @@ fn generate_dense_backend_inner(
             && matches!(v_fmt, DType::F16 | DType::Q8_0)
             && (be.moe_paged() || moe_batched_ok)
     } else {
-        (c.moe.is_none() || moe_batched_ok) && !c.deepseek4
+        // The CPU backend batches IQ-grid expert banks through its Super q8-activation kernels
+        // (see `session_stable`'s `moe_super_batched_ok`), so glm5next earns chunked prefill
+        // there even though Iq2Xxs has no dp4a-mmq kernel. Vulkan keeps the mmq-only gate.
+        (c.moe.is_none() || moe_batched_ok || (be.name() == "cpu" && moe_super_batched_ok))
+            && !c.deepseek4
     };
     let decode_start = if prompt.len() - start > 2 && batched_prefill_ok {
         // Batch-prefill the un-cached suffix, all but the last prompt token (positions
@@ -11778,6 +12132,9 @@ fn generate_dense_backend_inner(
         // cache). Keeps the "strict subset" promise the gate's doc states.
         && !c.deepseek2
         && !c.bailingmoe3
+        // glm5next: same trap — `Op::Mla` on its MLA blocks and (from M2) `Op::HyperConnectMix`
+        // on every block, none with a record-once dyn twin.
+        && !c.glm5next
         // DeepSeek V4: the same trap, from four ops at once. `Op::Attention { sinks }`,
         // `Op::HyperConnectMix`/`Pre`/`Post`, `Op::Rope { backward }` and `Op::QkNorm { weight:
         // None }` each have no record-once dyn twin, so the adapter's `decode_eligible` is false —
