@@ -1,0 +1,45 @@
+MOE4ALL-SUBMISSION/1
+kind: benchmark
+schema: benchmark/1
+id: 20261023T142603.501Z-3599cb5dc1e28b2eadd231c7d098ecc2-000
+created-at: 2026-10-23T14:26:03.500643100+00:00
+engine: 1.1.0
+encoding: gzip+base64
+decoded-bytes: 3503
+compressed-bytes: 1532
+sha256: 4ac7cca89022abbecd070fa2d37c27b509ae6926ba7850cf4efc782fcd81c50e
+summary-count: 4
+summary-001: model: Ornith-1.5-35B-A3B.APEX-I-MiniPlus-V2.1.gguf | qwen35moe | 14.18 GiB
+summary-002: device: AMD Radeon RX 9070 | 15.92 GiB
+summary-003: profile: quick
+summary-004: result 6K: prefill=2965.44 | x1=96.55 tok/s
+
+-----BEGIN MOE4ALL PAYLOAD-----
+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
+-----END MOE4ALL PAYLOAD-----
