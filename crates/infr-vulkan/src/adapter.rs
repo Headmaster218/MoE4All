@@ -35,18 +35,30 @@ pub(crate) struct VkDecodePlan {
     /// Built on the first eligible `execute` and replayed on every one after (interior mutability so
     /// `execute` can stay `&dyn Plan`). `None` until then; always `None` for an ineligible graph.
     replay: Mutex<Option<DecodeReplay>>,
-    /// Graph-only analysis, populated on the first successful static setup. No buffers or phases.
+    /// Graph-only analysis, populated by explicit preparation or the first successful static setup.
+    /// No buffers, KV state, or resource leases.
     static_scratch: OnceLock<StaticScratchMetadata>,
+    /// Snapshot of static_scratch_memo; only enables explicit CPU metadata preparation.
+    prepare_enabled: bool,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl VkDecodePlan {
     fn boxed(be_: &VulkanBackend, graph: &Graph) -> Box<dyn Plan> {
+        Self::boxed_cpu(
+            graph,
+            decode_eligible(be_, graph),
+            be_.cfg().kernels.vulkan.static_scratch_memo,
+        )
+    }
+
+    fn boxed_cpu(graph: &Graph, eligible: bool, prepare_enabled: bool) -> Box<dyn Plan> {
         Box::new(VkDecodePlan {
             graph: graph.clone(),
-            eligible: decode_eligible(be_, graph),
+            eligible,
             replay: Mutex::new(None),
             static_scratch: OnceLock::new(),
+            prepare_enabled,
         })
     }
 
@@ -54,9 +66,9 @@ impl VkDecodePlan {
         if let Some(metadata) = self.static_scratch.get() {
             return Ok(metadata);
         }
-        // Preserve execute-time validation and retry errors rather than caching a failure.
+        // Retry analysis errors rather than caching a failure, whether called by prepare or execute.
         let metadata = StaticScratchMetadata::analyze(&self.graph)?;
-        // The execution gate serializes normal callers; racing pure analyses are equivalent.
+        // Preparation may race with execute; both only analyze the immutable graph.
         let _ = self.static_scratch.set(metadata);
         Ok(self
             .static_scratch
@@ -69,6 +81,13 @@ impl VkDecodePlan {
 impl Plan for VkDecodePlan {
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn prepare(&self) -> Result<()> {
+        if self.prepare_enabled {
+            self.static_scratch_metadata()?;
+        }
+        Ok(())
     }
 }
 
@@ -15525,6 +15544,172 @@ mod scratch_metadata_contract;
 
 #[cfg(test)]
 mod tests {
+    fn prepare_metadata_graph(rows: usize, dtype: infr_core::DType) -> super::Graph {
+        use super::*;
+        use infr_core::TensorDesc;
+
+        let mut graph = Graph::new();
+        let desc = || TensorDesc::new(vec![rows, 8], dtype);
+        let src = graph.input(desc());
+        graph.weight(TensorDesc::new(vec![32], infr_core::DType::Q8_0));
+        let full = graph.internal(desc());
+        let partial = graph.internal(desc());
+        let before_write = graph.internal(desc());
+        let dst = graph.output(desc());
+        graph.push(Op::Copy {
+            src,
+            src_off: 0,
+            dst: full,
+            dst_off: 0,
+            n: (rows * 8) as u32,
+        });
+        graph.push(Op::Copy {
+            src: full,
+            src_off: 0,
+            dst: partial,
+            dst_off: 0,
+            n: 1,
+        });
+        graph.push(Op::Add {
+            a: partial,
+            b: before_write,
+            dst,
+            n: (rows * 8) as u32,
+        });
+        graph
+    }
+
+    #[test]
+    fn prepare_metadata_matches_lazy_execute_and_is_idempotent() {
+        use super::*;
+        use infr_core::DType;
+
+        for (rows, dtype, bytes) in [
+            (1, DType::F32, 2048),
+            (65, DType::F16, 2048),
+            (65, DType::Bf16, 2048),
+        ] {
+            let graph = prepare_metadata_graph(rows, dtype);
+            // This is the CPU-only construction path used by compile; no device or buffers exist.
+            let prepared = VkDecodePlan::boxed_cpu(&graph, false, true);
+            let lazy = VkDecodePlan::boxed_cpu(&graph, false, true);
+            let prepared_vk = prepared.as_any().downcast_ref::<VkDecodePlan>().unwrap();
+            let lazy_vk = lazy.as_any().downcast_ref::<VkDecodePlan>().unwrap();
+            assert!(prepared_vk.static_scratch.get().is_none());
+            assert!(lazy_vk.static_scratch.get().is_none());
+
+            prepared.prepare().unwrap();
+            let metadata = prepared_vk.static_scratch.get().unwrap();
+            let lazy_metadata = lazy_vk.static_scratch_metadata().unwrap();
+            let original = StaticScratchMetadata::analyze(&graph).unwrap();
+            assert_eq!(metadata.layout, lazy_metadata.layout);
+            assert_eq!(metadata.reset_indices, lazy_metadata.reset_indices);
+            assert_eq!(metadata.layout, original.layout);
+            assert_eq!(metadata.reset_indices, original.reset_indices);
+            assert_eq!(
+                metadata.layout,
+                vec![None, None, Some(bytes), Some(bytes), Some(bytes), None]
+            );
+            assert_eq!(metadata.reset_indices, vec![3, 4]);
+
+            for _ in 0..4 {
+                prepared.prepare().unwrap();
+                assert!(std::ptr::eq(
+                    metadata,
+                    prepared_vk.static_scratch_metadata().unwrap()
+                ));
+                lazy.prepare().unwrap();
+                assert!(std::ptr::eq(
+                    lazy_metadata,
+                    lazy_vk.static_scratch_metadata().unwrap()
+                ));
+            }
+            assert!(prepared_vk.replay.lock().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn prepare_metadata_failure_is_not_cached_and_can_retry() {
+        use super::*;
+        use infr_core::{DType, TensorDesc};
+
+        let mut graph = Graph::new();
+        let id = graph.internal(TensorDesc::new(vec![32], DType::Q8_0));
+        let mut plan = VkDecodePlan {
+            graph,
+            eligible: false,
+            replay: Mutex::new(None),
+            static_scratch: OnceLock::new(),
+            prepare_enabled: true,
+        };
+        for _ in 0..2 {
+            let error = plan.prepare().unwrap_err().to_string();
+            assert!(error.contains("internal tensor must be a dense dtype"));
+            assert_eq!(
+                error,
+                plan.static_scratch_metadata().err().unwrap().to_string()
+            );
+            assert!(plan.static_scratch.get().is_none());
+        }
+        // Correct the fixture only after the failed calls, proving the same memo is retryable.
+        plan.graph.tensors[id.0 as usize].desc.dtype = DType::F32;
+        plan.prepare().unwrap();
+        assert_eq!(plan.static_scratch.get().unwrap().layout, vec![Some(256)]);
+    }
+
+    #[test]
+    fn prepare_metadata_disabled_does_not_prewarm_or_validate() {
+        use super::*;
+        use infr_core::{DType, TensorDesc};
+
+        for dtype in [DType::F32, DType::Q8_0] {
+            let mut graph = Graph::new();
+            graph.internal(TensorDesc::new(vec![32], dtype));
+            let plan = VkDecodePlan::boxed_cpu(&graph, false, false);
+            let vk = plan.as_any().downcast_ref::<VkDecodePlan>().unwrap();
+            for _ in 0..2 {
+                plan.prepare().unwrap();
+                assert!(vk.static_scratch.get().is_none());
+                // The memo-disabled execute path retains its uncached analysis and validation.
+                assert_eq!(
+                    StaticScratchMetadata::analyze(&vk.graph).is_ok(),
+                    dtype == DType::F32
+                );
+                assert!(vk.static_scratch.get().is_none());
+                assert!(vk.replay.lock().unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn prepare_metadata_can_race_with_lazy_execute_analysis() {
+        use super::*;
+        use std::sync::Barrier;
+
+        let graph = prepare_metadata_graph(65, infr_core::DType::F32);
+        let plan = VkDecodePlan::boxed_cpu(&graph, false, true);
+        let barrier = Barrier::new(4);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|i| {
+                    let plan = &plan;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        if i % 2 == 0 {
+                            plan.prepare().unwrap();
+                        }
+                        let vk = plan.as_any().downcast_ref::<VkDecodePlan>().unwrap();
+                        vk.static_scratch_metadata().unwrap() as *const StaticScratchMetadata
+                            as usize
+                    })
+                })
+                .collect();
+            let pointers: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            assert!(pointers.iter().all(|p| *p == pointers[0]));
+        });
+    }
+
     #[test]
     fn flash_kv_storage_rows_cover_the_final_coopmat_tile() {
         assert_eq!(super::flash_kv_storage_rows(0), 0);

@@ -457,6 +457,17 @@ pub struct SegmentedKvSpec {
 pub trait Plan: Send + Sync {
     /// Downcast hook so a backend can recover its concrete plan type from a `&dyn Plan`.
     fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Optionally precompute immutable layout/metadata using CPU work only. The default is a no-op;
+    /// callers opt in explicitly, and `compile` need not call this method.
+    ///
+    /// Implementations must not allocate GPU resources, read or write bound buffers, touch KV
+    /// state, or acquire/change resource leases. Repeated calls must be idempotent; failed analysis
+    /// must remain retryable. Concurrent use with `execute` requires the backend's explicit
+    /// [`Backend::supports_async_compile`] guarantee.
+    fn prepare(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// The trivial [`Plan`] both current backends share: it just carries a clone of the [`Graph`] — the
@@ -804,6 +815,16 @@ pub trait Backend: Send + Sync {
     }
 
     // ---- execution (compile once per shape, execute per token/step) ----
+    /// Opt in only when both `compile` and the returned [`Plan::prepare`] perform CPU-only work
+    /// and may safely run concurrently with `execute` on this backend. Neither may allocate GPU
+    /// resources, access bound buffers or KV state, or acquire/change resource leases.
+    ///
+    /// The default keeps callers on the synchronous path. Wrappers must establish this guarantee
+    /// for their own compile/prepare paths before opting in; an inner backend's opt-in is not enough.
+    fn supports_async_compile(&self) -> bool {
+        false
+    }
+
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>>;
     fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()>;
     /// Chained decode: run the record-once decode plan `n` times in ONE submission, the sampled
@@ -939,6 +960,26 @@ pub fn kv_overflow_report_each<B: Backend>(backends: &[B]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_prepare_defaults_to_noop() {
+        let graph = Graph::new();
+        let plan = GraphPlan::boxed(&graph);
+        plan.prepare().unwrap();
+        plan.prepare().unwrap();
+        let graph = &plan.as_any().downcast_ref::<GraphPlan>().unwrap().graph;
+        assert!(graph.tensors.is_empty());
+        assert!(graph.ops.is_empty());
+    }
+
+    #[test]
+    fn async_compile_defaults_to_disabled() {
+        let backend = MockBackend {
+            last_download_len: std::sync::Mutex::new(0),
+        };
+        let backend: &dyn Backend = &backend;
+        assert!(!backend.supports_async_compile());
+    }
 
     /// The integrated chunk policy. The load-bearing property is the CEILING: this may only ever
     /// SHRINK the discrete default (1024), never grow it — it is a watchdog guard, not a tuning

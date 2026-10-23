@@ -8379,6 +8379,11 @@ impl Backend for VulkanBackend {
         })
     }
 
+    fn supports_async_compile(&self) -> bool {
+        // Compile only clones/inspects the graph; preparation memoizes graph-only CPU metadata.
+        true
+    }
+
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>> {
         adapter::compile(self, graph)
     }
