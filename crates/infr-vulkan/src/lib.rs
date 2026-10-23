@@ -3043,6 +3043,12 @@ impl VulkanBackend {
             && !self.shared.caps.integrated
     }
 
+    pub(crate) fn prefers_qsa_topk_ordered(&self) -> bool {
+        cfg!(target_os = "windows")
+            && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+            && !self.shared.caps.integrated
+    }
+
     /// The hd256/Q8/GQA4 replay layout measured on Windows/Navi 31. Its register/LDS tradeoff is
     /// device-sensitive, so unmeasured drivers and architectures
     /// retain the established per-query-head replay kernel even when the feature knobs are enabled.

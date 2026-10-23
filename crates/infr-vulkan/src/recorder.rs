@@ -10483,6 +10483,12 @@ impl<'a> Recorder<'a> {
         dst_byte_off: usize,
         scan: bool,
     ) {
+        let ordered = self.vk().qsa_topk_ordered
+            && self.be.prefers_qsa_topk_ordered()
+            && top_blocks == 512
+            && blocks > top_blocks
+            && blocks <= 65536;
+        let mask = blocks >= 7680 && blocks <= 65536;
         if let Some(work) = topk_work.filter(|_| rows == 1 && self.vk().qsa_topk_parallel) {
             let groups = blocks.div_ceil(1024).clamp(1, QSA_TOPK_PARALLEL_MAX_GROUPS);
             let state_base = groups * 256;
@@ -10525,7 +10531,14 @@ impl<'a> Recorder<'a> {
                 self.dispatch(select_k, &[Self::vkb(work)], 1, &radix_push, 1);
             }
 
-            let collect_k = if scan {
+            let collect_k = if ordered {
+                let (name, spv) = crate::gemm::qsa_ordered_topk_kernel(scan, true, mask);
+                if scan {
+                    self.be.kernel_sg(name, spv, 3, 12, 32)
+                } else {
+                    self.be.kernel(name, spv, 3, 12)
+                }
+            } else if scan {
                 self.be.kernel_sg(
                     "qsa_indexer_topk_collect_scan",
                     crate::gemm::qsa_indexer_topk_collect_scan_spv(),
@@ -10557,7 +10570,14 @@ impl<'a> Recorder<'a> {
                 1,
             );
         } else {
-            let topk_k = if scan {
+            let topk_k = if ordered {
+                let (name, spv) = crate::gemm::qsa_ordered_topk_kernel(scan, false, mask);
+                if scan {
+                    self.be.kernel_sg(name, spv, 2, 20, 32)
+                } else {
+                    self.be.kernel(name, spv, 2, 20)
+                }
+            } else if scan {
                 self.be.kernel_sg(
                     "qsa_indexer_topk_scan",
                     crate::gemm::qsa_indexer_topk_scan_spv(),
@@ -17185,7 +17205,12 @@ mod tests {
             assert_eq!(got, (0..512u32).collect::<Vec<_>>());
         }
         let names = be.built_kernel_names();
-        assert!(names.contains(&"qsa_indexer_topk"));
+        let single = if be.cfg().kernels.vulkan.qsa_topk_ordered && be.prefers_qsa_topk_ordered() {
+            "qsa_indexer_topk_ordered"
+        } else {
+            "qsa_indexer_topk"
+        };
+        assert!(names.contains(&single));
         let select = if be.use_qsa_topk_scan(1, 512, true) {
             "qsa_indexer_topk_select_scan"
         } else {

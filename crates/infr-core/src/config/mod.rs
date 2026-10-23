@@ -553,6 +553,8 @@ cfg_struct! {
         iq4_pair_lut: bool = true,
         /// Packed Q3_K/Q6_K byte decode for measured BM32 expert MMQ shapes only.
         kquant_packed_decode: bool = true,
+        /// Exact chronological QSA Top-K collection on measured devices.
+        qsa_topk_ordered: bool = true,
         /// Reuse probability fragments in measured hd256 Prefill register-O kernels.
         flash_pv_reuse: bool = true,
         /// Independent native-Q8 scalar projection pair; other row counts retain split Linears.

@@ -955,6 +955,26 @@ fn main() {
         ("linear_native_q8_pair", "linear_native_q8_pair", &[]),
         (
             "qsa_indexer_topk",
+            "qsa_indexer_topk_ordered",
+            &["-DORDERED_COLLECT"],
+        ),
+        (
+            "qsa_indexer_topk",
+            "qsa_indexer_topk_ordered_scan",
+            &["-DORDERED_COLLECT", "-DPARALLEL_SCAN"],
+        ),
+        (
+            "qsa_indexer_topk",
+            "qsa_indexer_topk_mask",
+            &["-DORDERED_COLLECT", "-DCOLLECT_MASK"],
+        ),
+        (
+            "qsa_indexer_topk",
+            "qsa_indexer_topk_mask_scan",
+            &["-DORDERED_COLLECT", "-DCOLLECT_MASK", "-DPARALLEL_SCAN"],
+        ),
+        (
+            "qsa_indexer_topk",
             "qsa_indexer_topk_scan",
             &["-DPARALLEL_SCAN"],
         ),
@@ -966,6 +986,26 @@ fn main() {
             &["-DPARALLEL_SCAN"],
         ),
         ("qsa_indexer_topk_collect", "qsa_indexer_topk_collect", &[]),
+        (
+            "qsa_indexer_topk_collect",
+            "qsa_indexer_topk_collect_ordered",
+            &["-DORDERED_COLLECT"],
+        ),
+        (
+            "qsa_indexer_topk_collect",
+            "qsa_indexer_topk_collect_ordered_scan",
+            &["-DORDERED_COLLECT", "-DPARALLEL_SCAN"],
+        ),
+        (
+            "qsa_indexer_topk_collect",
+            "qsa_indexer_topk_collect_mask",
+            &["-DORDERED_COLLECT", "-DCOLLECT_MASK"],
+        ),
+        (
+            "qsa_indexer_topk_collect",
+            "qsa_indexer_topk_collect_mask_scan",
+            &["-DORDERED_COLLECT", "-DCOLLECT_MASK", "-DPARALLEL_SCAN"],
+        ),
         (
             "qsa_indexer_topk_collect",
             "qsa_indexer_topk_collect_scan",

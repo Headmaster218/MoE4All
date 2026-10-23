@@ -13,9 +13,11 @@ layout(binding = 1) readonly buffer WB { uint work[]; };
 layout(binding = 2) writeonly buffer DB { uint dst[]; };
 
 #define INVALID 0xffffffffu
+#ifndef ORDERED_COLLECT
 shared uint selected_count;
 shared uint tie_prefix[256];
 shared uint chosen[512];
+#endif
 #ifdef PARALLEL_SCAN
 #include "qsa_prefix_scan.glsl"
 #endif
@@ -25,6 +27,10 @@ uint ordered_float(float x) {
     return (bits & 0x80000000u) != 0u ? ~bits : bits | 0x80000000u;
 }
 
+#ifdef ORDERED_COLLECT
+#include "qsa_topk_ordered_collect.glsl"
+#endif
+
 void main() {
     uint t = gl_LocalInvocationID.x;
 #ifdef PARALLEL_SCAN
@@ -32,6 +38,9 @@ void main() {
 #endif
     uint prefix_score = work[pc.state_base];
     uint rank = work[pc.state_base + 1u];
+#ifdef ORDERED_COLLECT
+    collect_ordered(t, pc.blocks, 0u, 0u, prefix_score, rank);
+#else
     uint begin = pc.blocks * t / 256u;
     uint end = pc.blocks * (t + 1u) / 256u;
 
@@ -95,4 +104,5 @@ void main() {
     }
     if (i0 < pc.top_k) { dst[i0] = chosen[i0]; }
     if (i1 < pc.top_k) { dst[i1] = chosen[i1]; }
+#endif
 }

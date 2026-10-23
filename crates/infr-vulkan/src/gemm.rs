@@ -3180,6 +3180,35 @@ pub(crate) fn kquant_packed_kernel(
     }
 }
 
+pub(crate) fn qsa_ordered_topk_kernel(
+    scan: bool,
+    collect: bool,
+    mask: bool,
+) -> (&'static str, &'static [u32]) {
+    macro_rules! variant {
+        ($name:literal) => {{
+            static SPV: OnceLock<Vec<u32>> = OnceLock::new();
+            (
+                $name,
+                SPV.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            )
+        }};
+    }
+    match (scan, collect, mask) {
+        (false, false, false) => variant!("qsa_indexer_topk_ordered"),
+        (true, false, false) => variant!("qsa_indexer_topk_ordered_scan"),
+        (false, false, true) => variant!("qsa_indexer_topk_mask"),
+        (true, false, true) => variant!("qsa_indexer_topk_mask_scan"),
+        (false, true, false) => variant!("qsa_indexer_topk_collect_ordered"),
+        (true, true, false) => variant!("qsa_indexer_topk_collect_ordered_scan"),
+        (false, true, true) => variant!("qsa_indexer_topk_collect_mask"),
+        (true, true, true) => variant!("qsa_indexer_topk_collect_mask_scan"),
+    }
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_iq4_nl_xpg_spv() -> &'static [u32] {
     const BYTES: &[u8] =
