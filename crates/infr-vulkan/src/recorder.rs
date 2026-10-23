@@ -25,6 +25,10 @@ use super::{as_vk_buf, be, Backing, VkBuffer, VulkanBackend};
 mod segmented_attention_contract;
 
 #[cfg(test)]
+#[path = "flash_pv_reuse_contract.rs"]
+mod flash_pv_reuse_contract;
+
+#[cfg(test)]
 #[path = "g01_cold_state_contract.rs"]
 mod g01_cold_state_contract;
 
@@ -6524,6 +6528,17 @@ impl<'a> Recorder<'a> {
                 ),
                 _ => unreachable!("register-O head dim must be 128 or 256"),
             }
+        };
+        let (rname, rspv) = if self.vk().flash_pv_reuse
+            && hd == 256
+            && !bda
+            && n >= 512
+            && !self.be.caps().integrated
+            && (cw4 || br128_f16score)
+        {
+            crate::gemm::flash_pv_reuse_kernel(br128_f16score)
+        } else {
+            (rname, rspv)
         };
         let plen: usize = if bda { 48 } else { 32 };
         let kp = self.be.kernel_sg(rname, rspv, 6, plen as u32, 32);

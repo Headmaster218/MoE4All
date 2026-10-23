@@ -252,26 +252,42 @@ void main() {
         // ---- PV: subgroup sg computes panel sg (rows [sg*16,+16)) × HD, 8 col-tiles ----
 #ifdef CW4
         uint pv_row0 = pair * 16u;
+#else
+        uint pv_row0 = sg * 16u;
+#endif
+#ifdef PV_REUSE
+        // Psh is immutable until the final workgroup barrier. Keep its four fragments across
+        // output columns without changing the per-column accumulation or shared scratch lifetime.
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> pv_p[BC / 16u];
+        [[unroll]] for (uint bc = 0u; bc < BC; bc += 16u)
+            coopMatLoad(pv_p[bc / 16u], Psh, pv_row0 * BC + bc, BC,
+                        gl_CooperativeMatrixLayoutRowMajor);
+#endif
         uint pvb = sg * 256u;
+#ifdef CW4
         [[unroll]] for (uint ctl = 0u; ctl < HD / 32u; ctl++) {
             uint ct = pair_side * (HD / 32u) + ctl;
 #else
-        uint pv_row0 = sg * 16u;
-        uint pvb = sg * 256u;
         [[unroll]] for (uint ct = 0u; ct < HD / 16u; ct++) {
 #endif
             coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> pacc =
                 coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
             [[unroll]] for (uint bc = 0u; bc < BC; bc += 16u) {
+#ifndef PV_REUSE
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> Pm;
                 coopMatLoad(Pm, Psh, pv_row0 * BC + bc, BC, gl_CooperativeMatrixLayoutRowMajor);
+#endif
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> Vm;
                 // Direct global V read: same bounded over-read as the K load above. Tail rows are
                 // guaranteed allocated and zeroed; relying only on a 0 P weight is unsafe because
                 // IEEE 0*NaN would still poison the accumulator.
                 coopMatLoad(Vm, VMAT, (kv0 + bc) * nkvhd + kvh * HD + ct * 16u, nkvhd,
                             gl_CooperativeMatrixLayoutRowMajor);
+#ifdef PV_REUSE
+                pacc = coopMatMulAdd(pv_p[bc / 16u], Vm, pacc);
+#else
                 pacc = coopMatMulAdd(Pm, Vm, pacc);
+#endif
             }
 #ifdef CW4
             coopMatStore(pacc, sfsh, pvb, 16u, gl_CooperativeMatrixLayoutRowMajor);

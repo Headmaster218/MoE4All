@@ -3133,6 +3133,26 @@ pub(crate) fn attn_decode_segmented_kernel(
     }
 }
 
+pub(crate) fn flash_pv_reuse_kernel(br128: bool) -> (&'static str, &'static [u32]) {
+    macro_rules! variant {
+        ($name:literal) => {{
+            static SPV: OnceLock<Vec<u32>> = OnceLock::new();
+            (
+                $name,
+                SPV.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            )
+        }};
+    }
+    if br128 {
+        variant!("attn_flash_reg_hd256_br128_f16score_qk4_pvreuse")
+    } else {
+        variant!("attn_flash_reg_hd256_br64_cw4_pvreuse")
+    }
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_iq4_nl_xpg_spv() -> &'static [u32] {
     const BYTES: &[u8] =

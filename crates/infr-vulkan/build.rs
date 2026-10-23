@@ -709,6 +709,22 @@ fn main() {
         ),
         (
             "attn_flash_reg",
+            "attn_flash_reg_hd256_br64_cw4_pvreuse",
+            &["-DHEAD_DIM=256", "-DBR_TILE=64", "-DCW4", "-DPV_REUSE"],
+        ),
+        (
+            "attn_flash_reg",
+            "attn_flash_reg_hd256_br128_f16score_qk4_pvreuse",
+            &[
+                "-DHEAD_DIM=256",
+                "-DBR_TILE=128",
+                "-DF16_SCORE",
+                "-DQK_ROWS4",
+                "-DPV_REUSE",
+            ],
+        ),
+        (
+            "attn_flash_reg",
             "attn_flash_reg_hd256_br128_f16score",
             &["-DHEAD_DIM=256", "-DBR_TILE=128", "-DF16_SCORE"],
         ),

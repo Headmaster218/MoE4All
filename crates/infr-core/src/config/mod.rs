@@ -551,6 +551,8 @@ cfg_struct! {
         /// Pair-codebook decode for IQ4_NL expert MMQ on measured Windows/RDNA3 devices.
         /// Other devices and matrix shapes retain the established scalar lookup path.
         iq4_pair_lut: bool = true,
+        /// Reuse probability fragments in measured hd256 Prefill register-O kernels.
+        flash_pv_reuse: bool = true,
         /// Independent native-Q8 scalar projection pair; other row counts retain split Linears.
         q8_linear_pair: bool = true,
         /// Memoize graph-only scratch analysis within one immutable compiled plan.
