@@ -19,7 +19,7 @@ use infr_core::{Backend, TensorId};
 use std::collections::{HashMap, HashSet};
 use std::ops::Index;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 
 use crate::recorder::RecordedCmd;
 
@@ -35,6 +35,8 @@ pub(crate) struct VkDecodePlan {
     /// Built on the first eligible `execute` and replayed on every one after (interior mutability so
     /// `execute` can stay `&dyn Plan`). `None` until then; always `None` for an ineligible graph.
     replay: Mutex<Option<DecodeReplay>>,
+    /// Graph-only analysis, populated on the first successful static setup. No buffers or phases.
+    static_scratch: OnceLock<StaticScratchMetadata>,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -44,7 +46,22 @@ impl VkDecodePlan {
             graph: graph.clone(),
             eligible: decode_eligible(be_, graph),
             replay: Mutex::new(None),
+            static_scratch: OnceLock::new(),
         })
+    }
+
+    fn static_scratch_metadata(&self) -> Result<&StaticScratchMetadata> {
+        if let Some(metadata) = self.static_scratch.get() {
+            return Ok(metadata);
+        }
+        // Preserve execute-time validation and retry errors rather than caching a failure.
+        let metadata = StaticScratchMetadata::analyze(&self.graph)?;
+        // The execution gate serializes normal callers; racing pure analyses are equivalent.
+        let _ = self.static_scratch.set(metadata);
+        Ok(self
+            .static_scratch
+            .get()
+            .expect("successful scratch analysis was published"))
     }
 }
 
@@ -511,6 +528,20 @@ fn qsa_indexer_score_capacity_bytes(
 /// [`alloc_scratch`]'s result: the per-tensor `Internal` scratch, indexed by `TensorId`.
 type ScratchSet = Vec<Option<Box<dyn Buffer>>>;
 type ScratchLayout = Vec<Option<usize>>;
+
+struct StaticScratchMetadata {
+    layout: ScratchLayout,
+    reset_indices: Vec<usize>,
+}
+
+impl StaticScratchMetadata {
+    fn analyze(graph: &Graph) -> Result<Self> {
+        Ok(Self {
+            layout: scratch_layout(graph)?,
+            reset_indices: scratch_reset_indices(graph),
+        })
+    }
+}
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn scratch_layout(graph: &Graph) -> Result<ScratchLayout> {
@@ -8368,7 +8399,7 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
     // frozen at record time). Auxiliary plans use the independent, expiring runtime cache rather
     // than retaining buffer references inside a replay tape beyond that cache's deadline.
     if !plan.eligible || be_.unified_client.is_some() || be_.moe_paged() || be_.dense_paged() {
-        return execute_static(be_, &plan.graph, bindings);
+        return execute_static(be_, plan, bindings);
     }
 
     // Record-once replay: build the recording on the first execute (cache miss), then only refresh
@@ -9305,10 +9336,10 @@ impl Drop for FrozenMoeLutGuard<'_> {
 /// (Static mode — pos as a push constant read from `positions[0]`), submit + wait. Paged plans
 /// retain scratch within one decode/prefill phase; auxiliary clients retain it until idle expiry.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Result<()> {
+fn execute_static(be_: &VulkanBackend, plan: &VkDecodePlan, bindings: &Bindings) -> Result<()> {
     let _timeline_execute = infr_core::timeline::span("backend_execute");
     let profile_t0 = infr_core::pager_profile::start();
-    let result = match execute_static_inner(be_, graph, bindings) {
+    let result = match execute_static_inner(be_, plan, bindings) {
         Ok(()) => Ok(()),
         Err(error) => match cancel_decode_prefetch(be_) {
             Ok(()) => Err(error),
@@ -9323,7 +9354,12 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     result
 }
 
-fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Result<()> {
+fn execute_static_inner(
+    be_: &VulkanBackend,
+    plan: &VkDecodePlan,
+    bindings: &Bindings,
+) -> Result<()> {
+    let graph = &plan.graph;
     let timeline_setup = infr_core::timeline::span("backend_setup");
     // A previous errored execute may have left protection until its recorder/segments dropped.
     // We are now inside the same unified execution gate, so no old command can still reference it.
@@ -9331,8 +9367,17 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
     let _frozen_lut_guard = FrozenMoeLutGuard(be_.moe_pager());
     let setup_t0 = infr_core::pager_profile::start();
     let setup_part_t0 = infr_core::pager_profile::start();
-    let layout = scratch_layout(graph)?;
-    let scratch_resets = scratch_reset_indices(graph);
+    let uncached_metadata = if be_.cfg().kernels.vulkan.static_scratch_memo {
+        None
+    } else {
+        Some(StaticScratchMetadata::analyze(graph)?)
+    };
+    let metadata = match uncached_metadata.as_ref() {
+        Some(metadata) => metadata,
+        None => plan.static_scratch_metadata()?,
+    };
+    let layout = &metadata.layout;
+    let scratch_resets = &metadata.reset_indices;
     if let Some(elapsed) = infr_core::pager_profile::elapsed(setup_part_t0) {
         infr_core::pager_profile::record_backend_setup_part(
             infr_core::pager_profile::BackendSetupKind::Layout,
@@ -9348,9 +9393,9 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
     let mut reset_retained_scratch = false;
     let mut phase_arena = if be_.unified_client.is_some() {
         let mut arena = be_.runtime_phase.lock().unwrap();
-        let start = arena.begin_execute(RuntimePhase::Auxiliary, &layout);
+        let start = arena.begin_execute(RuntimePhase::Auxiliary, layout);
         reset_retained_scratch = start.reset_retained_scratch;
-        arena.grow_workspace(be_, &layout, &[])?;
+        arena.grow_workspace(be_, layout, &[])?;
         Some(arena)
     } else if be_.moe_paged() {
         if let Some(phase) = paged_static_phase(graph) {
@@ -9358,7 +9403,7 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
                 cancel_decode_prefetch(be_)?;
             }
             let mut arena = be_.runtime_phase.lock().unwrap();
-            let start = arena.begin_execute(phase, &layout);
+            let start = arena.begin_execute(phase, layout);
             reset_retained_scratch = start.reset_retained_scratch;
             let pager_transition =
                 pager_static_transition(start.previous, phase, be_.cfg().paging.moe_layer_stream);
@@ -9386,7 +9431,7 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
             }
 
             let pool_requests = paged_phase_scratch_requests(be_, graph)?;
-            arena.grow_workspace(be_, &layout, &pool_requests)?;
+            arena.grow_workspace(be_, layout, &pool_requests)?;
             Some(arena)
         } else {
             None
@@ -9396,7 +9441,7 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
     };
     let mut local_scratch = None;
     if phase_arena.is_none() {
-        local_scratch = Some(alloc_scratch_layout(be_, &layout)?);
+        local_scratch = Some(alloc_scratch_layout(be_, layout)?);
     }
     let using_phase_arena = phase_arena.is_some();
     let mut local_pool = ScratchPool::default();
@@ -9573,7 +9618,7 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
         // order provides the same zero-before-read guarantee as the former synchronous one-shot,
         // without an extra submit + queue_wait_idle before every static decode execution.
         let rec0 = rec.as_ref().expect("initial recorder is present");
-        for &i in &scratch_resets {
+        for &i in scratch_resets {
             let buf = scratch[i]
                 .as_deref()
                 .expect("an Internal scratch reset must have an allocation");
@@ -14462,6 +14507,10 @@ fn execute_paged_moe<'a>(
     }
     Ok(current_layer) // recorded inline; the ambient segment stays open
 }
+
+#[cfg(test)]
+#[path = "kernel_campaign_scratch_metadata.rs"]
+mod scratch_metadata_contract;
 
 #[cfg(test)]
 mod tests {
