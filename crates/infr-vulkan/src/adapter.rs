@@ -40,26 +40,40 @@ pub(crate) struct VkDecodePlan {
     static_scratch: OnceLock<StaticScratchMetadata>,
     /// Snapshot of static_scratch_memo; only enables explicit CPU metadata preparation.
     prepare_enabled: bool,
+    /// Backend-configured, CPU-only phase sizing. No pager or allocation state is captured.
+    phase_requests: Option<Vec<(&'static str, usize)>>,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl VkDecodePlan {
-    fn boxed(be_: &VulkanBackend, graph: &Graph) -> Box<dyn Plan> {
-        Self::boxed_cpu(
+    fn boxed(be_: &VulkanBackend, graph: &Graph) -> Result<Box<dyn Plan>> {
+        let mut plan = Self::new_cpu(
             graph,
             decode_eligible(be_, graph),
             be_.cfg().kernels.vulkan.static_scratch_memo,
-        )
+        );
+        if plan.prepare_enabled && graph.ops.iter().any(|op| matches!(op, Op::MoeFfn { .. })) {
+            // A non-paged caller may never need this sizing. Preserve execute-time validation
+            // for failed estimates instead of rejecting a graph on an unused paging path.
+            plan.phase_requests = paged_phase_scratch_requests(be_, graph).ok();
+        }
+        Ok(Box::new(plan))
     }
 
+    #[cfg(test)]
     fn boxed_cpu(graph: &Graph, eligible: bool, prepare_enabled: bool) -> Box<dyn Plan> {
-        Box::new(VkDecodePlan {
+        Box::new(Self::new_cpu(graph, eligible, prepare_enabled))
+    }
+
+    fn new_cpu(graph: &Graph, eligible: bool, prepare_enabled: bool) -> Self {
+        VkDecodePlan {
             graph: graph.clone(),
             eligible,
             replay: Mutex::new(None),
             static_scratch: OnceLock::new(),
             prepare_enabled,
-        })
+            phase_requests: None,
+        }
     }
 
     fn static_scratch_metadata(&self) -> Result<&StaticScratchMetadata> {
@@ -124,7 +138,7 @@ pub(crate) fn compile(be_: &VulkanBackend, graph: &Graph) -> Result<Box<dyn Plan
     // Eligibility (record-once replay vs per-execute static recording) is a pure function of the
     // graph shape and the backend's `kernels.vulkan.no_replay`, so decide it here, once. `execute`
     // builds the replay lazily on first run.
-    Ok(VkDecodePlan::boxed(be_, graph))
+    VkDecodePlan::boxed(be_, graph)
 }
 
 /// Record-once replay applies to a single-token decode graph the `_dyn` kernels cover: every
@@ -695,6 +709,7 @@ type ScratchKey = (&'static str, usize);
 struct ScratchPool {
     buffers: HashMap<ScratchKey, Box<dyn Buffer>>,
     in_use: HashSet<ScratchKey>,
+    needs_compaction: bool,
 }
 
 struct PagedMmqScratch {
@@ -733,7 +748,7 @@ enum PagedMoeScratch {
 impl ScratchPool {
     /// Start a new recording after the previous execute has fully drained. Compact here as well as
     /// at the success tail so an execute that returned through an error path cannot leave several
-    /// capacities resident for the rest of the phase.
+    /// capacities resident for the rest of the phase. Unchanged capacities skip the scan.
     fn begin_execute(&mut self) {
         self.compact();
         self.in_use.clear();
@@ -757,6 +772,8 @@ impl ScratchPool {
             return Ok(key);
         }
 
+        // Mark before releasing old capacities or attempting an allocation so errors stay dirty.
+        self.needs_compaction = true;
         // No command in this execute references this tag yet, so capacities inherited from the
         // previous execute are safe to release before growing. Besides bounding lifetime, dropping
         // first avoids requiring the unified arena to fit old+new workspace simultaneously.
@@ -817,6 +834,7 @@ impl ScratchPool {
             let key = if let Some(key) = reusable {
                 key
             } else {
+                self.needs_compaction = true;
                 if !self.in_use.iter().any(|(candidate, _)| *candidate == tag) {
                     self.buffers.retain(|(candidate, _), _| *candidate != tag);
                 }
@@ -838,6 +856,9 @@ impl ScratchPool {
         missing: Vec<ScratchKey>,
         buffers: Vec<Box<dyn Buffer>>,
     ) -> Result<()> {
+        if !missing.is_empty() {
+            self.needs_compaction = true;
+        }
         if buffers.len() != missing.len() {
             return Err(be(
                 "scratch batch allocator returned the wrong buffer count",
@@ -859,6 +880,9 @@ impl ScratchPool {
     }
 
     fn compact(&mut self) {
+        if !self.needs_compaction {
+            return;
+        }
         let mut largest = HashMap::<&'static str, usize>::new();
         for &(tag, bytes) in self.buffers.keys() {
             largest
@@ -868,11 +892,14 @@ impl ScratchPool {
         }
         self.buffers
             .retain(|(tag, bytes), _| largest.get(tag) == Some(bytes));
+        self.needs_compaction = false;
     }
 
     fn clear(&mut self) {
+        self.needs_compaction = true;
         self.buffers.clear();
         self.in_use.clear();
+        self.needs_compaction = false;
     }
 
     fn into_values(self) -> impl Iterator<Item = Box<dyn Buffer>> {
@@ -881,6 +908,7 @@ impl ScratchPool {
 
     fn drain_values(&mut self) -> impl Iterator<Item = Box<dyn Buffer>> + '_ {
         self.in_use.clear();
+        self.needs_compaction = false;
         self.buffers.drain().map(|(_, buffer)| buffer)
     }
 }
@@ -10418,8 +10446,15 @@ fn execute_static_inner(
                 }
             }
 
-            let pool_requests = paged_phase_scratch_requests(be_, graph)?;
-            arena.grow_workspace(be_, layout, &pool_requests)?;
+            let uncached_requests;
+            let pool_requests = match plan.phase_requests.as_deref() {
+                Some(requests) => requests,
+                None => {
+                    uncached_requests = paged_phase_scratch_requests(be_, graph)?;
+                    &uncached_requests
+                }
+            };
+            arena.grow_workspace(be_, layout, pool_requests)?;
             Some(arena)
         } else {
             None
@@ -10715,9 +10750,14 @@ fn execute_static_inner(
                     || chunk.notice_resume.is_some()
                     || chunk.notice_stop)
             {
-                if let Some((op_idx, ids)) =
-                    chunk.finish(be_, &mut rec, &mut pstream, pool, &mut segments)?
-                {
+                if let Some((op_idx, ids)) = chunk.finish(
+                    be_,
+                    &mut rec,
+                    &mut pstream,
+                    pool,
+                    &mut segments,
+                    live_pos == live_ops.len(),
+                )? {
                     live_pos = live_ops
                         .iter()
                         .position(|&(idx, _)| idx == op_idx)
@@ -11011,17 +11051,40 @@ fn execute_static_inner(
     if !using_phase_arena {
         transient.extend(pool.drain_values());
     }
-    let last = rec.take().expect("segment always Some at loop end");
-    submitted_dispatches += last.dispatches();
-    if resident_chunk.is_some() && last.dispatches() == 0 {
-        last.discard()?;
-    } else {
-        last.finish_after_submit(|| pstream.start_cpu_promotion(be_))
-            .map_err(|e| be(e.to_string()))?;
+    if let Some(last) = rec.take() {
+        submitted_dispatches += last.dispatches();
+        if resident_chunk.is_some() && last.dispatches() == 0 {
+            last.discard()?;
+        } else if token_row_paged_moe
+            && !graph.mtp_verify
+            && be_.cfg().kernels.vulkan.static_decode_tail_overlap
+        {
+            // Keep this final reader alive while earlier fences, producer acknowledgments and
+            // command pools retire. This changes only host overlap, not the submitted work or
+            // the forward's completion/phase boundary.
+            let pending = last.finish_nowait()?;
+            let host_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pstream.start_cpu_promotion(be_)
+            }))
+            .unwrap_or_else(|_| Err(be("post-submit promotion panicked")));
+            let retirement_result = (|| -> Result<()> {
+                for segment in segments.drain(..) {
+                    segment.wait()?;
+                }
+                pstream.drain()
+            })();
+            // Even failed host work must join the final reader before returning an error.
+            let completion_result = pending.wait();
+            host_result?;
+            retirement_result?;
+            completion_result?;
+        } else {
+            last.finish_after_submit(|| pstream.start_cpu_promotion(be_))
+                .map_err(|e| be(e.to_string()))?;
+        }
     }
-    // The blocking finish above already waited the queue idle — draining just releases the
-    // pipelined segments' command buffers/fences (every buffer they referenced outlives this
-    // call: pooled scratch in `transient`, ring/tape/arenas on the session).
+    // The overlapping path already retired these. Blocking and empty-tail paths still own
+    // their segments; every referenced buffer remains alive until this drain completes.
     for seg in segments {
         seg.wait().map_err(|e| be(e.to_string()))?;
     }
@@ -12087,9 +12150,10 @@ impl ResidentChunk {
         ps: &mut PagedStream,
         pool: &mut ScratchPool,
         segments: &mut std::collections::VecDeque<crate::recorder::PendingSegment>,
+        graph_end: bool,
     ) -> Result<Option<(usize, Vec<u32>)>> {
         if self.notices.is_some() {
-            return self.finish_with_notice(be_, rec, ps, pool, segments);
+            return self.finish_with_notice(be_, rec, ps, pool, segments, graph_end);
         }
         rec.as_ref().unwrap().end_conditional();
         rec.as_ref().unwrap().publish_host_reads();
@@ -12322,6 +12386,7 @@ impl ResidentChunk {
         ps: &mut PagedStream,
         pool: &ScratchPool,
         segments: &mut std::collections::VecDeque<crate::recorder::PendingSegment>,
+        graph_end: bool,
     ) -> Result<Option<(usize, Vec<u32>)>> {
         ps.gpu_route = None;
         ps.finish_cpu_miss(be_, pool)?;
@@ -12338,6 +12403,16 @@ impl ResidentChunk {
             if self.early_recovery && self.notice_resume.is_some() {
                 segments.push_back(pending);
             } else {
+                if self.notice_resume.is_none()
+                    && be_.cfg().kernels.vulkan.static_decode_tail_overlap
+                {
+                    // Retire older readers while the final useful submission runs. The
+                    // pending guard still drains the final reader on errors and unwinds.
+                    for segment in segments.drain(..) {
+                        segment.wait()?;
+                    }
+                    ps.drain()?;
+                }
                 pending.wait()?;
             }
         } else {
@@ -12437,10 +12512,12 @@ impl ResidentChunk {
                 }
             }
         }
-        let fresh = be_.recorder()?;
-        fresh.seed_barrier();
-        ps.acquire_cpu_promotion(&fresh);
-        *rec = Some(fresh);
+        if !graph_end || resume.is_some() || !be_.cfg().kernels.vulkan.static_decode_tail_overlap {
+            let fresh = be_.recorder()?;
+            fresh.seed_barrier();
+            ps.acquire_cpu_promotion(&fresh);
+            *rec = Some(fresh);
+        }
         self.entries.clear();
         self.recording = false;
         self.submitted_entries = 0;
@@ -15641,6 +15718,7 @@ mod tests {
             replay: Mutex::new(None),
             static_scratch: OnceLock::new(),
             prepare_enabled: true,
+            phase_requests: None,
         };
         for _ in 0..2 {
             let error = plan.prepare().unwrap_err().to_string();
@@ -18013,6 +18091,233 @@ mod tests {
             })
             .unwrap();
         assert_eq!(reused, [("large", 64), ("small", 4)]);
+    }
+
+    #[test]
+    fn scratch_pool_lazy_compaction_compacts_multiple_capacities_after_drain() {
+        for finish in [false, true] {
+            let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut pool = ScratchPool::default();
+            pool.begin_execute();
+            for bytes in [8, 16, 32] {
+                pool.acquire("workspace", bytes, {
+                    let drops = std::sync::Arc::clone(&drops);
+                    move |bytes| Ok(Box::new(DropCountBuffer { bytes, drops }))
+                })
+                .unwrap();
+            }
+            let reused = pool
+                .acquire("workspace", 12, |_| {
+                    panic!("must reuse the smallest fitting capacity")
+                })
+                .unwrap();
+            assert_eq!(reused, ("workspace", 16));
+            assert!(pool.needs_compaction);
+            assert_eq!(pool.buffers.len(), 3);
+            assert_eq!(pool.in_use.len(), 3);
+            assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+            if finish {
+                pool.finish_execute();
+            } else {
+                // An errored execute skips finish; its drained successor must still compact.
+                pool.begin_execute();
+            }
+            assert!(!pool.needs_compaction);
+            assert!(pool.in_use.is_empty());
+            assert_eq!(pool.buffers.len(), 1);
+            assert!(pool.buffers.contains_key(&("workspace", 32)));
+            assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 2);
+        }
+    }
+
+    #[test]
+    fn scratch_pool_lazy_compaction_keeps_unchanged_pool_clean() {
+        let mut pool = ScratchPool::default();
+        let key = pool
+            .acquire("workspace", 16, |bytes| Ok(Box::new(TestBuffer(bytes))))
+            .unwrap();
+        pool.finish_execute();
+        for _ in 0..3 {
+            pool.begin_execute();
+            assert!(!pool.needs_compaction);
+            assert!(pool.in_use.is_empty());
+            assert_eq!(
+                pool.acquire("workspace", 8, |_| panic!("must reuse retained capacity"))
+                    .unwrap(),
+                key
+            );
+            assert_eq!(
+                pool.acquire_batch(&[("workspace", 12)], |_| {
+                    panic!("batch must reuse capacity")
+                })
+                .unwrap(),
+                vec![key]
+            );
+            assert!(!pool.needs_compaction);
+            assert!(pool.in_use.contains(&key));
+            pool.finish_execute();
+            assert!(!pool.needs_compaction);
+            assert!(pool.in_use.is_empty());
+            assert_eq!(pool.buffers.len(), 1);
+        }
+    }
+
+    #[test]
+    fn scratch_pool_lazy_compaction_recovers_after_allocation_failure() {
+        let mut pool = ScratchPool::default();
+        pool.acquire("workspace", 8, |bytes| Ok(Box::new(TestBuffer(bytes))))
+            .unwrap();
+        pool.finish_execute();
+        pool.begin_execute();
+        assert!(pool
+            .acquire("workspace", 16, |_| Err(be("test allocation failure")))
+            .is_err());
+        assert!(pool.needs_compaction);
+        assert!(pool.buffers.is_empty());
+        assert!(pool.in_use.is_empty());
+
+        pool.begin_execute();
+        assert!(!pool.needs_compaction);
+        pool.acquire("workspace", 16, |bytes| Ok(Box::new(TestBuffer(bytes))))
+            .unwrap();
+        pool.finish_execute();
+        assert!(!pool.needs_compaction);
+        assert!(pool.buffers.contains_key(&("workspace", 16)));
+    }
+
+    #[test]
+    fn scratch_pool_lazy_compaction_recovers_after_batch_failure_and_retry() {
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut pool = ScratchPool::default();
+        for tag in ["active", "replace"] {
+            pool.acquire(tag, 8, {
+                let drops = std::sync::Arc::clone(&drops);
+                move |bytes| Ok(Box::new(DropCountBuffer { bytes, drops }))
+            })
+            .unwrap();
+        }
+        pool.finish_execute();
+        pool.begin_execute();
+        pool.acquire("active", 8, |_| panic!("active capacity must be retained"))
+            .unwrap();
+        let requests = [("active", 16), ("replace", 16)];
+        assert!(pool
+            .acquire_batch(&requests, |capacities| {
+                assert_eq!(capacities, &[16, 16]);
+                Err(be("test batch allocation failure"))
+            })
+            .is_err());
+        assert!(pool.needs_compaction);
+        assert_eq!(pool.in_use.len(), 1);
+        assert!(pool.in_use.contains(&("active", 8)));
+        assert!(pool.buffers.contains_key(&("active", 8)));
+        assert!(!pool.buffers.contains_key(&("replace", 8)));
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        let keys = pool
+            .acquire_batch(&requests, |capacities| {
+                Ok(capacities
+                    .iter()
+                    .map(|&bytes| Box::new(TestBuffer(bytes)) as Box<dyn Buffer>)
+                    .collect())
+            })
+            .unwrap();
+        assert_eq!(keys, requests);
+        assert_eq!(pool.buffers.len(), 3);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 1);
+        pool.finish_execute();
+        assert!(!pool.needs_compaction);
+        assert!(pool.in_use.is_empty());
+        assert_eq!(pool.buffers.len(), 2);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn scratch_pool_lazy_compaction_recovers_after_invalid_batch_result() {
+        let mut pool = ScratchPool::default();
+        let keys = [("workspace", 16)];
+        assert!(pool
+            .finish_planned_batch(&keys, keys.to_vec(), Vec::new())
+            .is_err());
+        assert!(pool.needs_compaction);
+        assert!(pool.buffers.is_empty());
+        assert!(pool.in_use.is_empty());
+        pool.begin_execute();
+        assert!(!pool.needs_compaction);
+        pool.acquire_batch(&keys, |_| Ok(vec![Box::new(TestBuffer(16))]))
+            .unwrap();
+        pool.finish_execute();
+        assert!(!pool.needs_compaction);
+        assert!(pool.buffers.contains_key(&keys[0]));
+    }
+
+    #[test]
+    fn scratch_pool_lazy_compaction_resets_on_phase_clear() {
+        let mut arena = RuntimePhaseArena::default();
+        let layout = Vec::new();
+        arena.begin_execute(RuntimePhase::Decode, &layout);
+        for bytes in [8, 16] {
+            arena
+                .pool
+                .acquire("workspace", bytes, |bytes| Ok(Box::new(TestBuffer(bytes))))
+                .unwrap();
+        }
+        assert!(arena.pool.needs_compaction);
+        arena.begin_execute(RuntimePhase::Prefill, &layout);
+        assert!(arena.pool.buffers.is_empty());
+        assert!(arena.pool.in_use.is_empty());
+        assert!(!arena.pool.needs_compaction);
+        arena
+            .pool
+            .acquire("workspace", 32, |bytes| Ok(Box::new(TestBuffer(bytes))))
+            .unwrap();
+        arena.pool.finish_execute();
+        assert!(!arena.pool.needs_compaction);
+        assert!(arena.pool.buffers.contains_key(&("workspace", 32)));
+    }
+
+    #[test]
+    fn scratch_pool_lazy_compaction_resets_when_drained() {
+        let mut pool = ScratchPool::default();
+        pool.acquire("workspace", 8, |bytes| Ok(Box::new(TestBuffer(bytes))))
+            .unwrap();
+        pool.acquire("workspace", 16, |bytes| Ok(Box::new(TestBuffer(bytes))))
+            .unwrap();
+        assert!(pool.needs_compaction);
+        assert_eq!(pool.drain_values().count(), 2);
+        assert!(!pool.needs_compaction);
+        assert!(pool.buffers.is_empty());
+        assert!(pool.in_use.is_empty());
+    }
+
+    #[test]
+    #[ignore = "CPU-only timing qualification; no GPU"]
+    fn scratch_pool_lazy_compaction_cpu_timing() {
+        let mut pool = ScratchPool::default();
+        for tag in [
+            "pm", "pl", "pacc", "qa", "qda", "qsa", "ge", "ue", "ae", "ye", "counts", "offsets",
+            "fill", "brows", "bwts", "ipos", "gate", "up", "down", "argmax",
+        ] {
+            pool.acquire(tag, 64, |bytes| Ok(Box::new(TestBuffer(bytes))))
+                .unwrap();
+        }
+        pool.finish_execute();
+        for eager in [true, false, true, false] {
+            let started = std::time::Instant::now();
+            for _ in 0..20_000 {
+                pool.needs_compaction |= eager;
+                pool.begin_execute();
+                std::hint::black_box(&pool);
+                pool.needs_compaction |= eager;
+                pool.finish_execute();
+            }
+            eprintln!(
+                "scratch_compaction eager={eager} ns_per_step={:.1}",
+                started.elapsed().as_nanos() as f64 / 20_000.0
+            );
+            assert_eq!(pool.buffers.len(), 20);
+        }
     }
 
     #[test]

@@ -10298,6 +10298,7 @@ fn generate_dense_backend_inner(
                 prepare_decode_plans(step)
             },
             |pipeline| -> AResult<()> {
+                let mut next_ple_ticket = None;
                 for step in 0..max_new {
                     let step_t0 = std::time::Instant::now();
                     let profile_front_t0 = profile_cohort.then(std::time::Instant::now);
@@ -10365,17 +10366,19 @@ fn generate_dense_backend_inner(
                         .map_err(|e| anyhow!("{e}"))?;
 
                     let ple_ticket = if c.qwen4exp {
-                        Some(
-                            ple_worker
-                                .as_ref()
-                                .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?
-                                .submit_batch(
-                                    curs.iter()
-                                        .zip(&positions)
-                                        .map(|(tokens, &position)| (tokens.as_slice(), position)),
+                        let ticket = next_ple_ticket.take().unwrap_or_else(|| {
+                            ple_ticket_carry::Ticket::new(
+                                step,
+                                submit_ple_batch(
+                                    ple_worker.as_deref(),
+                                    &curs,
+                                    positions.iter().copied(),
                                     c.ple_ngram_size,
-                                )?,
-                        )
+                                ),
+                                drain_ple_ticket,
+                            )
+                        });
+                        Some(ticket.validate(step)?)
                     } else {
                         None
                     };
@@ -10451,7 +10454,7 @@ fn generate_dense_backend_inner(
                     if let Some(ticket) = ple_ticket {
                         let profile_ple_wait_t0 = profile_cohort.then(std::time::Instant::now);
                         let timeline_ple_wait = infr_core::timeline::span("PLE_wait");
-                        let ple_rows = ticket.wait()?;
+                        let ple_rows = ticket.take().wait()?;
                         if let Some(t0) = profile_ple_wait_t0 {
                             profile_ple_wait += t0.elapsed();
                         }
@@ -10742,6 +10745,19 @@ fn generate_dense_backend_inner(
                         || parallel.yield_requested.is_some_and(|requested| {
                             requested.load(std::sync::atomic::Ordering::Acquire)
                         });
+                    if c.qwen4exp && !should_stop && step + 1 < max_new {
+                        // All lane ACKs are resolved; only host gathering runs ahead of the next step.
+                        next_ple_ticket = Some(ple_ticket_carry::Ticket::new(
+                            step + 1,
+                            submit_ple_batch(
+                                ple_worker.as_deref(),
+                                &curs,
+                                positions.iter().map(|&position| position + 1),
+                                c.ple_ngram_size,
+                            ),
+                            drain_ple_ticket,
+                        ));
+                    }
                     if let Some(t0) = profile_tail_t0 {
                         profile_tail += t0.elapsed();
                     }
@@ -12052,6 +12068,7 @@ fn generate_dense_backend_inner(
             (shape, prepare_decode_plans(shape))
         },
         |pipeline| -> AResult<()> {
+            let mut next_ple_ticket = None;
             while pos < end {
                 // `max_new == 0` (prefill-only: bench pp, session cache warming) must still FEED the
                 // prompt: models without a batched-prefill path (MoE with non-Q4_K expert banks, E2B
@@ -12308,12 +12325,14 @@ fn generate_dense_backend_inner(
                 let mut ple_el = std::time::Duration::ZERO;
                 // Preserve the PLE handoff: submit before waiting for plans or executing layer 0.
                 let ple_ticket = if ro.is_none() && c.qwen4exp {
-                    Some(
-                        ple_worker
-                            .as_ref()
-                            .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?
-                            .submit(&cur, pos, c.ple_ngram_size)?,
-                    )
+                    let ticket = next_ple_ticket.take().unwrap_or_else(|| {
+                        ple_ticket_carry::Ticket::new(
+                            pos,
+                            submit_ple_token(ple_worker.as_deref(), &cur, pos, c.ple_ngram_size),
+                            drain_ple_ticket,
+                        )
+                    });
+                    Some(ticket.validate(pos)?)
                 } else {
                     None
                 };
@@ -12399,7 +12418,10 @@ fn generate_dense_backend_inner(
                     layer0_el = exec0;
 
                     let t_setup1 = std::time::Instant::now();
-                    let ple_rows = ple_ticket.expect("qwen4exp submitted PLE gather").wait()?;
+                    let ple_rows = ple_ticket
+                        .expect("qwen4exp submitted PLE gather")
+                        .take()
+                        .wait()?;
                     let ple_buf = ple_embd_buf
                         .as_ref()
                         .ok_or_else(|| anyhow!("qwen4exp session has no PLE staging buffer"))?;
@@ -12710,6 +12732,23 @@ fn generate_dense_backend_inner(
                         pos.saturating_add(1).saturating_sub(start),
                         decode_n,
                     );
+                }
+                if ro.is_none() && c.qwen4exp && !crate::sampling::abort_requested(req) {
+                    // Use the committed queue, including forced spans, rather than a predicted token.
+                    if let Some(next_pos) = ple_ticket_carry::next_serial_position(
+                        pos,
+                        end,
+                        prompt.len(),
+                        cur.len(),
+                        out.len(),
+                        max_new,
+                    ) {
+                        next_ple_ticket = Some(ple_ticket_carry::Ticket::new(
+                            next_pos,
+                            submit_ple_token(ple_worker.as_deref(), &cur, next_pos, c.ple_ngram_size),
+                            drain_ple_ticket,
+                        ));
+                    }
                 }
                 pos += 1;
             }
@@ -13685,6 +13724,167 @@ mod tests {
     #[test]
     fn validate_token_ids_rejects_far_out_of_vocab() {
         assert!(validate_token_ids(&[u32::MAX], 100).is_err());
+    }
+}
+
+fn submit_ple_token(
+    worker: Option<&super::ple::PleWorker>,
+    tokens: &[u32],
+    pos: usize,
+    ngram: usize,
+) -> AResult<super::ple::PleTicket> {
+    worker
+        .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?
+        .submit(tokens, pos, ngram)
+}
+
+fn submit_ple_batch(
+    worker: Option<&super::ple::PleWorker>,
+    tokens: &[Vec<u32>],
+    positions: impl Iterator<Item = usize>,
+    ngram: usize,
+) -> AResult<super::ple::PleTicket> {
+    worker
+        .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?
+        .submit_batch(
+            tokens
+                .iter()
+                .zip(positions)
+                .map(|(tokens, position)| (tokens.as_slice(), position)),
+            ngram,
+        )
+}
+
+fn drain_ple_ticket(ticket: super::ple::PleTicket) {
+    let _ = ticket.wait();
+}
+
+mod ple_ticket_carry {
+    use anyhow::{anyhow, Result};
+
+    pub(super) struct Ticket<T> {
+        step: usize,
+        ticket: Option<Result<T>>,
+        drain: fn(T),
+    }
+
+    impl<T> Ticket<T> {
+        pub(super) fn new(step: usize, ticket: Result<T>, drain: fn(T)) -> Self {
+            Self {
+                step,
+                ticket: Some(ticket),
+                drain,
+            }
+        }
+
+        pub(super) fn validate(mut self, step: usize) -> Result<Self> {
+            if self.step != step {
+                return Err(anyhow!(
+                    "PLE ticket position {} does not match {step}",
+                    self.step
+                ));
+            }
+            let ticket = self.ticket.take().expect("PLE ticket consumed once")?;
+            self.ticket = Some(Ok(ticket));
+            Ok(self)
+        }
+
+        pub(super) fn take(mut self) -> T {
+            self.ticket
+                .take()
+                .expect("PLE ticket consumed once")
+                .expect("PLE ticket validated before consumption")
+        }
+    }
+
+    impl<T> Drop for Ticket<T> {
+        fn drop(&mut self) {
+            // The shared worker owns its inputs; wait only for this ticket before releasing it.
+            if let Some(Ok(ticket)) = self.ticket.take() {
+                (self.drain)(ticket);
+            }
+        }
+    }
+
+    pub(super) fn next_serial_position(
+        pos: usize,
+        end: usize,
+        prompt_len: usize,
+        cur_len: usize,
+        generated: usize,
+        max_new: usize,
+    ) -> Option<usize> {
+        let next = pos.checked_add(1)?;
+        (next < end
+            && next < cur_len
+            && (generated < max_new || next < prompt_len.saturating_sub(1)))
+        .then_some(next)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{next_serial_position, Ticket};
+        use std::sync::mpsc;
+
+        #[test]
+        fn serial_carry_uses_actual_forced_queue_and_respects_budgets() {
+            assert_eq!(next_serial_position(3, 9, 4, 4, 1, 4), None);
+            assert_eq!(next_serial_position(3, 9, 4, 7, 3, 4), Some(4));
+            assert_eq!(next_serial_position(5, 9, 4, 7, 3, 4), Some(6));
+            assert_eq!(next_serial_position(6, 9, 4, 7, 3, 4), None);
+            assert_eq!(next_serial_position(3, 9, 4, 7, 4, 4), None);
+            assert_eq!(next_serial_position(7, 8, 4, 9, 1, 4), None);
+            assert_eq!(next_serial_position(0, 9, 4, 4, 0, 0), Some(1));
+            assert_eq!(next_serial_position(1, 9, 4, 4, 0, 0), Some(2));
+            assert_eq!(next_serial_position(2, 9, 4, 4, 0, 0), None);
+            assert_eq!(next_serial_position(usize::MAX, 9, 4, 7, 1, 4), None);
+        }
+
+        #[test]
+        fn unused_submission_error_is_ignored_but_consumed_error_is_returned() {
+            drop(Ticket::new(
+                4,
+                Err::<(), _>(anyhow::anyhow!("unused")),
+                drop,
+            ));
+            assert!(
+                Ticket::new(4, Err::<(), _>(anyhow::anyhow!("needed")), drop)
+                    .validate(4)
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn cancel_error_unwind_and_wrong_position_drain_owned_ticket() {
+            fn drain(ticket: mpsc::Receiver<()>) {
+                ticket.recv().unwrap();
+            }
+            for reason in ["cancel", "error", "unwind", "position"] {
+                std::thread::scope(|scope| {
+                    let (tx, rx) = mpsc::sync_channel(0);
+                    let worker = scope.spawn(move || tx.send(()).unwrap());
+                    let ticket = Ticket::new(4, Ok(rx), drain);
+                    if reason == "unwind" {
+                        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let _ticket = ticket;
+                            panic!("caller unwind");
+                        }))
+                        .is_err());
+                    } else if reason == "position" {
+                        assert!(ticket.validate(5).is_err());
+                    } else {
+                        drop(ticket);
+                    }
+                    worker.join().unwrap();
+                });
+            }
+        }
+
+        #[test]
+        fn consumed_ticket_is_not_drained_twice() {
+            let ticket = Ticket::new(4, Ok(7), |_| panic!("already consumed"));
+            assert_eq!(ticket.validate(4).unwrap().take(), 7);
+        }
     }
 }
 

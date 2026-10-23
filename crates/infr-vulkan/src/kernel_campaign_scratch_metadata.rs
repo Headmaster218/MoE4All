@@ -87,6 +87,7 @@ fn plan(graph: &Graph) -> VkDecodePlan {
         replay: Mutex::new(None),
         static_scratch: OnceLock::new(),
         prepare_enabled: true,
+        phase_requests: None,
     }
 }
 

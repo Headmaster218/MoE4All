@@ -577,6 +577,9 @@ cfg_struct! {
         silu_quant_q8: bool = true,
         /// Memoize graph-only scratch analysis within one immutable compiled plan.
         static_scratch_memo: bool = true,
+        /// Retire earlier paged Decode submissions while its final submission executes.
+        /// The forward still drains completely before results, callbacks or phase changes.
+        static_decode_tail_overlap: bool = true,
         /// QSA Prefill Q8 K/V reuse mode. `2` keeps two heads in registers; `12` uses the
         /// Qwen3.8-specific LDS-tiled full-GQA path. Unsupported shapes fall back safely.
         qsa_prefill_gqa: usize = 12,

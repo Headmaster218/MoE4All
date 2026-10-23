@@ -1166,7 +1166,7 @@ pub struct Recorder<'a> {
     owns_transient: std::cell::Cell<bool>,
     /// Descriptor pools, GROWN on exhaustion (a batched-MoE prefill chunk records ~50k dispatches
     /// — far beyond any fixed max_sets). The last entry is the active pool; `alloc_set` appends a
-    /// fresh one on ERROR_OUT_OF_POOL_MEMORY.
+    /// fresh one on ERROR_OUT_OF_POOL_MEMORY. Empty when push descriptors are available.
     pools: std::cell::RefCell<Vec<vk::DescriptorPool>>,
     /// Buffers referenced only by commands recorded in this recorder. Keeping an `Arc` here makes
     /// temporary transfer sources survive until blocking finish, or move into `PendingSegment`
@@ -1325,25 +1325,32 @@ impl<'a> Recorder<'a> {
             return Err(be(format!("begin cmd buffer: {e}")));
         }
 
-        // Big pool: one descriptor set per recorded op.
-        let pool = match backend.shared.recorder_desc_pools.lock().unwrap().pop() {
-            Some(pool) => {
-                if let Err(e) = unsafe {
-                    device.reset_descriptor_pool(pool, vk::DescriptorPoolResetFlags::empty())
-                } {
-                    unsafe { device.destroy_descriptor_pool(pool, None) };
-                    backend.shared.recorder_cmds.lock().unwrap().push(cmd);
-                    return Err(be(format!("reset recycled descriptor pool: {e}")));
-                }
-                pool
-            }
-            None => match Self::new_desc_pool(device) {
-                Ok(pool) => pool,
-                Err(e) => {
-                    backend.shared.recorder_cmds.lock().unwrap().push(cmd);
-                    return Err(e);
-                }
-            },
+        // Only the descriptor-set fallback needs a pool; push descriptors bind inline.
+        let pool = if backend.shared.push_descriptor.is_some() {
+            None
+        } else {
+            Some(
+                match backend.shared.recorder_desc_pools.lock().unwrap().pop() {
+                    Some(pool) => {
+                        if let Err(e) = unsafe {
+                            device
+                                .reset_descriptor_pool(pool, vk::DescriptorPoolResetFlags::empty())
+                        } {
+                            unsafe { device.destroy_descriptor_pool(pool, None) };
+                            backend.shared.recorder_cmds.lock().unwrap().push(cmd);
+                            return Err(be(format!("reset recycled descriptor pool: {e}")));
+                        }
+                        pool
+                    }
+                    None => match Self::new_desc_pool(device) {
+                        Ok(pool) => pool,
+                        Err(e) => {
+                            backend.shared.recorder_cmds.lock().unwrap().push(cmd);
+                            return Err(e);
+                        }
+                    },
+                },
+            )
         };
 
         // Per-DISPATCH stamps (auto-labels): a batched prefill chunk can record tens of
@@ -1372,12 +1379,14 @@ impl<'a> Recorder<'a> {
                 Ok(qp) => qp,
                 Err(e) => {
                     backend.shared.recorder_cmds.lock().unwrap().push(cmd);
-                    backend
-                        .shared
-                        .recorder_desc_pools
-                        .lock()
-                        .unwrap()
-                        .push(pool);
+                    if let Some(pool) = pool {
+                        backend
+                            .shared
+                            .recorder_desc_pools
+                            .lock()
+                            .unwrap()
+                            .push(pool);
+                    }
                     return Err(be(format!("create query pool: {e}")));
                 }
             };
@@ -1428,12 +1437,14 @@ impl<'a> Recorder<'a> {
                     }
                     backend.shared.return_submit_timing_query(submit_query_pool);
                     backend.shared.recorder_cmds.lock().unwrap().push(cmd);
-                    backend
-                        .shared
-                        .recorder_desc_pools
-                        .lock()
-                        .unwrap()
-                        .push(pool);
+                    if let Some(pool) = pool {
+                        backend
+                            .shared
+                            .recorder_desc_pools
+                            .lock()
+                            .unwrap()
+                            .push(pool);
+                    }
                     return Err(error);
                 }
             }
@@ -1442,7 +1453,7 @@ impl<'a> Recorder<'a> {
             be: backend,
             cmd,
             owns_transient: std::cell::Cell::new(true),
-            pools: std::cell::RefCell::new(vec![pool]),
+            pools: std::cell::RefCell::new(pool.into_iter().collect()),
             buffer_keepalive: std::cell::RefCell::new(Vec::new()),
             dedicated_transfer_wait: std::cell::Cell::new(0),
             dirty_writes: RefCell::new(HashSet::new()),
