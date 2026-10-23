@@ -2399,6 +2399,214 @@ fn validate_q8_linear_pair(
 }
 
 #[derive(Clone, Copy)]
+struct PleGateNormPair {
+    key: TensorId,
+    query: TensorId,
+    value: TensorId,
+    norm: TensorId,
+    gated: TensorId,
+    normed: TensorId,
+    rows: u32,
+    eps: f32,
+}
+
+fn ple_gate_norm_at(graph: &Graph, idx: usize) -> Option<PleGateNormPair> {
+    let Op::QwenPleGate {
+        key,
+        query,
+        value,
+        dst: gated,
+        rows,
+        hc: 4,
+        n_embd: 2560,
+    } = graph.ops.get(idx)?
+    else {
+        return None;
+    };
+    let Op::QwenHcNorm {
+        x,
+        norm,
+        dst: normed,
+        rows: nr,
+        hc: 4,
+        n_embd: 2560,
+        eps,
+    } = graph.ops.get(idx.checked_add(1)?)?
+    else {
+        return None;
+    };
+    if x != gated
+        || rows != nr
+        || !matches!(rows, 1 | 2 | 4 | 9 | 512 | 513)
+        || graph.independent_rows
+        || graph.mtp_verify
+        || !graph.sequence_spans.is_empty()
+        || !eps.is_finite()
+        || *eps <= 0.0
+        || graph.tensors[gated.0 as usize].kind != TensorKind::Internal
+        || graph.outputs.contains(gated)
+    {
+        return None;
+    }
+    let wide = *rows as usize * 4 * 2560;
+    for (id, len) in [
+        (*key, wide),
+        (*query, wide),
+        (*value, *rows as usize * 2560),
+        (*norm, 4 * 2560),
+        (*gated, wide),
+        (*normed, wide),
+    ] {
+        let d = graph.desc(id);
+        if d.dtype != infr_core::DType::F32 || d.numel() != len {
+            return None;
+        }
+    }
+    // Both outputs survive normal consumers. Decline explicit intermediate Copy/taps without
+    // resolving every suffix operand list or constructing a live set.
+    for op in graph.ops.iter().skip(idx + 2) {
+        match op {
+            Op::Copy { src, .. } | Op::CopyStrided { src, .. } if src == gated => {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    Some(PleGateNormPair {
+        key: *key,
+        query: *query,
+        value: *value,
+        norm: *norm,
+        gated: *gated,
+        normed: *normed,
+        rows: *rows,
+        eps: *eps,
+    })
+}
+
+fn ple_gate_norm_key_reusable(
+    graph: &Graph,
+    start: usize,
+    key: TensorId,
+    normed: TensorId,
+) -> bool {
+    if graph.tensors[key.0 as usize].kind != TensorKind::Internal {
+        return false;
+    }
+    // This very Norm defines the new version of the same tensor; subsequent reads are normed.
+    if key == normed {
+        return true;
+    }
+    if graph.outputs.contains(&key) {
+        return false;
+    }
+    for op in graph.ops.iter().skip(start) {
+        // Only the overlapping old key needs a lifetime proof. Unknown op I/O may spill once;
+        // unrelated tensors and ordinary pooled-frame reuse are not alias validation targets.
+        let (reads, writes) = op.io_inline();
+        if reads.contains(&key) {
+            return false;
+        }
+        if writes.contains(&key) {
+            let len = graph.desc(key).numel();
+            return match op {
+                Op::Copy { .. } | Op::CopyStrided { .. } => {
+                    op_fully_overwrites_internal(op, key, graph)
+                }
+                Op::Add { n, .. } => *n as usize >= len,
+                Op::Linear { m, out_f, .. } => {
+                    (*m as usize).checked_mul(*out_f as usize) == Some(len)
+                }
+                Op::QwenHcNorm {
+                    rows, hc, n_embd, ..
+                }
+                | Op::QwenPleGate {
+                    rows, hc, n_embd, ..
+                } => {
+                    (*rows as usize)
+                        .checked_mul(*hc as usize)
+                        .and_then(|n| n.checked_mul(*n_embd as usize))
+                        == Some(len)
+                }
+                _ => false,
+            };
+        }
+    }
+    true
+}
+
+fn ple_gate_norm_buffers(
+    graph: &Graph,
+    idx: usize,
+    pair: PleGateNormPair,
+    scratch: &[Option<Box<dyn Buffer>>],
+    bindings: &Bindings,
+) -> bool {
+    let wide = pair.rows as usize * 4 * 2560 * 4;
+    let ids = [
+        pair.key,
+        pair.query,
+        pair.value,
+        pair.norm,
+        pair.gated,
+        pair.normed,
+    ];
+    let lens = [wide, wide, pair.rows as usize * 2560 * 4, 40960, wide, wide];
+    let [Some(key), Some(query), Some(value), Some(norm), Some(gated), Some(normed)] =
+        ids.map(|id| resolve(scratch, bindings, id).ok())
+    else {
+        return false;
+    };
+    let buffers = [key, query, value, norm, gated, normed];
+    for (b, bytes) in buffers.into_iter().zip(lens) {
+        if b.len_bytes() < bytes || b.device_addr().is_none() {
+            return false;
+        }
+    }
+    if !disjoint_device_views(gated, wide, normed, wide) {
+        return false;
+    }
+    for i in 0..4 {
+        if !disjoint_device_views(gated, wide, buffers[i], lens[i]) {
+            return false;
+        }
+    }
+    for i in 1..4 {
+        if !disjoint_device_views(normed, wide, buffers[i], lens[i]) {
+            return false;
+        }
+    }
+    if !disjoint_device_views(normed, wide, buffers[0], wide) {
+        // Only the measured SAME-view dead-key reuse, never a shifted/partial overlap.
+        if normed.device_addr() != buffers[0].device_addr()
+            || !ple_gate_norm_key_reusable(graph, idx + 2, pair.key, pair.normed)
+        {
+            return false;
+        }
+    }
+    // Baseline-valid graph: other dead IDs may reuse these frame ranges. Only changed
+    // source/output windows above require proof; this is not a whole-graph alias validator.
+    true
+}
+
+fn ple_gate_norm_pair(
+    be_: &VulkanBackend,
+    graph: &Graph,
+    idx: usize,
+    scratch: &[Option<Box<dyn Buffer>>],
+    bindings: &Bindings,
+) -> Option<PleGateNormPair> {
+    if !be_.cfg().kernels.vulkan.ple_gate_norm_lds || be_.cfg().spec.mtp {
+        return None;
+    }
+    let pair = ple_gate_norm_at(graph, idx)?;
+    if be_.dense_paged() || !be_.prefers_ple_gate_norm_lds() {
+        return None;
+    }
+    ple_gate_norm_buffers(graph, idx, pair, scratch, bindings).then_some(pair)
+}
+
+#[derive(Clone, Copy)]
 struct HcUpMixPair {
     low: TensorId,
     weight: TensorId,
@@ -2544,6 +2752,9 @@ mod deltanet_fusion_contract;
 #[path = "hc_up_mix_graph_contract.rs"]
 mod hc_up_mix_graph_contract;
 #[cfg(test)]
+#[path = "ple_gate_norm_graph_contract.rs"]
+mod ple_gate_norm_graph_contract;
+#[cfg(test)]
 #[path = "q8_pair_graph_contract.rs"]
 mod q8_pair_graph_contract;
 
@@ -2677,6 +2888,21 @@ fn lower_op(
     let _timeline_lower = infr_core::timeline::span(op.kind());
     let memo_prev = mmv_memo.take();
     let r = |id: TensorId| resolve(scratch, bindings, id);
+    if matches!(op, Op::QwenPleGate { .. }) {
+        if let Some(pair) = ple_gate_norm_pair(be_, graph, op_idx, scratch, bindings) {
+            rec.qwen_ple_gate_norm_lds(
+                r(pair.key)?,
+                r(pair.query)?,
+                r(pair.value)?,
+                r(pair.norm)?,
+                r(pair.gated)?,
+                r(pair.normed)?,
+                pair.rows,
+                pair.eps,
+            );
+            return Ok(());
+        }
+    }
     if be_.cfg().kernels.vulkan.hc_up_mix && wsub.is_none() && matches!(op, Op::Linear { .. }) {
         if let Some(pair) = hc_up_mix_pair(be_, graph, op_idx, scratch, bindings) {
             rec.qwen_hc_up_mix(r(pair.low)?, r(pair.weight)?, r(pair.x)?, r(pair.dst)?);
@@ -8783,6 +9009,13 @@ fn record_decode_replay(
     let fused_add = plan.linear_add;
     let mut skip_op = plan.skip;
     skip_op.extend(fused_q8_kv_write.keys().map(|&i| i + 1));
+    if be_.cfg().kernels.vulkan.ple_gate_norm_lds {
+        skip_op.extend(
+            (0..graph.ops.len()).filter_map(|i| {
+                ple_gate_norm_pair(be_, graph, i, &scratch, bindings).map(|_| i + 1)
+            }),
+        );
+    }
     if be_.cfg().kernels.vulkan.hc_up_mix {
         skip_op.extend(
             (0..graph.ops.len())
@@ -9945,6 +10178,13 @@ fn execute_static_inner(
         skip_op.extend(
             (0..graph.ops.len())
                 .filter_map(|i| hc_up_mix_pair(be_, graph, i, scratch, bindings).map(|_| i + 1)),
+        );
+    }
+    if be_.cfg().kernels.vulkan.ple_gate_norm_lds {
+        skip_op.extend(
+            (0..graph.ops.len()).filter_map(|i| {
+                ple_gate_norm_pair(be_, graph, i, scratch, bindings).map(|_| i + 1)
+            }),
         );
     }
     let live_ops: Vec<_> = infr_core::exec::live_ops(&graph.ops, &skip_op).collect();

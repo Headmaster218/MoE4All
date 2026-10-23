@@ -57,6 +57,23 @@ pub const FLASH_HD256_BM16_SHARED: u32 = 30_912;
 /// Keep in sync with `attn_flash_reg.comp`.
 pub const FLASH_REG_SHARED_PER_ROW: u32 = 460;
 
+/// O07 sums[256] + part[8] + gated_local[2560], all F32.
+pub(crate) const PLE_GATE_NORM_LDS_SHARED: u32 = 11_296;
+
+fn ple_gate_norm_lds_device_ok(
+    windows: bool,
+    arch: caps::DeviceArch,
+    caps: &infr_core::backend::Capabilities,
+) -> bool {
+    windows
+        && arch == caps::DeviceArch::AmdRdna3
+        && !caps.integrated
+        && caps.subgroup_min > 0
+        && caps.subgroup_min <= 32
+        && caps.subgroup_max >= 32
+        && caps.max_shared_memory_bytes >= PLE_GATE_NORM_LDS_SHARED
+}
+
 use rayon::prelude::*;
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -3048,6 +3065,14 @@ impl VulkanBackend {
         cfg!(target_os = "windows")
             && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
             && !self.shared.caps.integrated
+    }
+
+    pub(crate) fn prefers_ple_gate_norm_lds(&self) -> bool {
+        ple_gate_norm_lds_device_ok(
+            cfg!(target_os = "windows"),
+            self.shared.device_arch,
+            &self.shared.caps,
+        )
     }
 
     pub(crate) fn prefers_silu_quant_q8(&self) -> bool {

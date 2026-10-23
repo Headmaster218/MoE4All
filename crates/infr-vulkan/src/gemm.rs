@@ -2913,6 +2913,16 @@ pub(crate) fn qwen_ple_gate_spv() -> &'static [u32] {
         )))
     })
 }
+/// Fixed-Wave32 O07 LDS2560 variant; no global-materialization fallback is registered.
+pub(crate) fn qwen_ple_gate_norm_lds2560_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/qwen_ple_gate_norm_lds2560.spv"
+        )))
+    })
+}
 /// SPIR-V for the 256-thread subgroup row-softmax (`y=softmax(x*scale)`). Used by the recorder's
 /// `softmax` (diffusion-gemma's in-graph self-conditioning).
 #[cfg_attr(infr_profile, infr_prof::instrument)]

@@ -1114,6 +1114,11 @@ fn main() {
         ),
         ("qwen_ple_gate", "qwen_ple_gate", &[]),
         (
+            "qwen_ple_gate_norm_o07",
+            "qwen_ple_gate_norm_lds2560",
+            &["-DPLE_CACHE_LDS", "-DPLE_DIM_MAX=2560"],
+        ),
+        (
             "qwen_hc_down_inject",
             "qwen_hc_down_inject_q8",
             &["-DHC_INJECT_Q8"],

@@ -5418,6 +5418,48 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn qwen_ple_gate_norm_lds(
+        &self,
+        key: &dyn Buffer,
+        query: &dyn Buffer,
+        value: &dyn Buffer,
+        norm: &dyn Buffer,
+        gated_dst: &dyn Buffer,
+        normed_dst: &dyn Buffer,
+        rows: u32,
+        eps: f32,
+    ) {
+        assert!(matches!(rows, 1 | 2 | 4 | 9 | 512 | 513));
+        assert!(self.be.prefers_ple_gate_norm_lds());
+        let kernel = self.be.kernel_sg(
+            "qwen_ple_gate_norm_lds2560",
+            crate::gemm::qwen_ple_gate_norm_lds2560_spv(),
+            6,
+            16,
+            32,
+        );
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&4u32.to_ne_bytes());
+        push[4..8].copy_from_slice(&2560u32.to_ne_bytes());
+        push[8..12].copy_from_slice(&(rows * 4).to_ne_bytes());
+        push[12..16].copy_from_slice(&eps.to_ne_bytes());
+        self.dispatch(
+            kernel,
+            &[
+                Self::vkb(key),
+                Self::vkb(query),
+                Self::vkb(value),
+                Self::vkb(norm),
+                Self::vkb(gated_dst),
+                Self::vkb(normed_dst),
+            ],
+            2,
+            &push,
+            rows * 4,
+        );
+    }
+
     /// DeepSeek V3.2 lightning indexer (`lightning_indexer.comp`, `Op::LightningIndexer`): scores
     /// every cached key against the row's indexer heads and writes the top-`top_k` key indices.
     /// One workgroup per query row — the dispatch below is `rows` groups, and each group's 256
