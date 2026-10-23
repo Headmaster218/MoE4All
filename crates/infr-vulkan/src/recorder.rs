@@ -33,6 +33,10 @@ mod flash_pv_reuse_contract;
 mod g01_cold_state_contract;
 
 #[cfg(test)]
+#[path = "kquant_decode_contract.rs"]
+mod kquant_decode_contract;
+
+#[cfg(test)]
 #[path = "hc_inject_norm_sync_contract.rs"]
 mod hc_inject_norm_sync_contract;
 
@@ -445,6 +449,81 @@ fn splitk_reduce_extents(m: usize, n: usize) -> (usize, usize) {
 
 /// A batched-MoE expert-GEMM kernel variant: `(kernel name, SPIR-V)`.
 type MmqKern = (&'static str, &'static [u32]);
+
+fn kquant_packed_applies(
+    enabled: bool,
+    measured: bool,
+    small: bool,
+    paged: bool,
+    wide_bn: bool,
+    dtype: infr_core::DType,
+    k: usize,
+    n: usize,
+) -> bool {
+    enabled
+        && measured
+        && small
+        && match (dtype, paged, wide_bn) {
+            (infr_core::DType::Q3K, _, false) => {
+                matches!((k, n), (3072, 1024) | (1024, 3072))
+            }
+            (infr_core::DType::Q6K, true, false) | (infr_core::DType::Q6K, false, true) => {
+                matches!((k, n), (2048, 512) | (512, 2048))
+            }
+            _ => false,
+        }
+}
+
+#[test]
+fn packed_mmq_preserves_wide_and_unmeasured_fallbacks() {
+    use infr_core::DType;
+    for enabled in [false, true] {
+        for measured in [false, true] {
+            for small in [false, true] {
+                for paged in [false, true] {
+                    for wide_bn in [false, true] {
+                        for dtype in [
+                            DType::Q2K,
+                            DType::Q3K,
+                            DType::Q4K,
+                            DType::Q5K,
+                            DType::Q6K,
+                            DType::Q8_0,
+                        ] {
+                            for (k, n) in [
+                                (3072, 1024),
+                                (1024, 3072),
+                                (2048, 512),
+                                (512, 2048),
+                                (2560, 640),
+                                (640, 2560),
+                                (512, 1920),
+                            ] {
+                                let geometry = match dtype {
+                                    DType::Q3K => matches!((k, n), (3072, 1024) | (1024, 3072)),
+                                    DType::Q6K => matches!((k, n), (2048, 512) | (512, 2048)),
+                                    _ => false,
+                                };
+                                let route = match dtype {
+                                    DType::Q3K => !wide_bn,
+                                    DType::Q6K => paged != wide_bn,
+                                    _ => false,
+                                };
+                                assert_eq!(
+                                    kquant_packed_applies(
+                                        enabled, measured, small, paged, wide_bn, dtype, k, n
+                                    ),
+                                    enabled && measured && small && geometry && route,
+                                    "dtype={dtype:?} paged={paged} wide={wide_bn} k={k} n={n}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 fn iq4_pair_lut_applies(
     enabled: bool,
@@ -12922,6 +13001,20 @@ impl<'a> Recorder<'a> {
             desc.xp
         };
         let nb = desc.resident_nb;
+        let (name, spv) = if kquant_packed_applies(
+            self.vk().kquant_packed_decode,
+            self.be.prefers_kquant_packed_decode(),
+            small_tile,
+            false,
+            wide_bn,
+            dtype,
+            k,
+            n,
+        ) {
+            crate::gemm::kquant_packed_kernel(dtype, false, wide_bn)
+        } else {
+            (name, spv)
+        };
         let (name, spv) = if iq4_pair_lut_applies(
             self.vk().iq4_pair_lut,
             self.be.prefers_iq4_pair_lut(),
@@ -13013,6 +13106,20 @@ impl<'a> Recorder<'a> {
             )
         });
         let (name, spv) = if small_tile { desc.xpg32 } else { desc.xpg };
+        let (name, spv) = if kquant_packed_applies(
+            self.vk().kquant_packed_decode,
+            self.be.prefers_kquant_packed_decode(),
+            small_tile,
+            true,
+            false,
+            dtype,
+            k,
+            n,
+        ) {
+            crate::gemm::kquant_packed_kernel(dtype, true, false)
+        } else {
+            (name, spv)
+        };
         let (name, spv) = if iq4_pair_lut_applies(
             self.vk().iq4_pair_lut,
             self.be.prefers_iq4_pair_lut(),

@@ -3031,6 +3031,12 @@ impl VulkanBackend {
             && !self.shared.caps.integrated
     }
 
+    pub(crate) fn prefers_kquant_packed_decode(&self) -> bool {
+        cfg!(target_os = "windows")
+            && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+            && !self.shared.caps.integrated
+    }
+
     pub(crate) fn prefers_segmented_q8_decode(&self) -> bool {
         cfg!(target_os = "windows")
             && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3

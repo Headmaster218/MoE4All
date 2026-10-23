@@ -1,4 +1,7 @@
 #version 460
+// K02 prototype: -DPACKED_DECODE changes integer weight staging only; default is baseline.
+// Keep dp4a, sub-block order, floating-point expressions, tile sizes and barriers unchanged.
+// Activation layout requires k%32 == 0; output columns require n%BN == 0.
 // Tiled dp4a (mmq) GEMM for stacked Q6_K experts (the MoE down projection): C[m,n] = A[m,k]·W[ids]ᵀ
 // via hardware int8 dot-product. Q6_K is symmetric (no min): w = d·sc·(q6 − 32). We bake the (q6 − 32)
 // centering into a signed int8 weight and fold d·sc into a per-sub-block float scale. Activations are
@@ -93,6 +96,30 @@ uint ru16(uint byte) { return rb(byte) | (rb(byte + 1u) << 8u); }
 float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
 int sgn8(uint b) { return int(b << 24u) >> 24; }
 
+
+#ifdef PACKED_DECODE
+#if defined(PAGED) && !defined(EXPERT_GRID)
+#error PACKED_DECODE PAGED requires EXPERT_GRID
+#endif
+#if defined(PAGED) && defined(STREAMED)
+#error PAGED and STREAMED are mutually exclusive
+#endif
+// Four consecutive bytes, including the +2 alignment of odd 110/210-byte blocks.
+// Aligned reads touch one word only; the covering pair stays within the GGUF block.
+uint k02_word(uint byte) {
+    uint wi = byte >> 2u;
+    uint sh = (byte & 3u) * 8u;
+#if defined(PAGED) || defined(STREAMED)
+    if (sh == 0u) { return arena_word(wi); }
+    uvec2 words = arena_word2(wi);
+#else
+    if (sh == 0u) { return nw[wi]; }
+    uvec2 words = uvec2(nw[wi], nw[wi + 1u]);
+#endif
+    return (words.x >> sh) | (words.y << (32u - sh));
+}
+#endif
+
 void main() {
 #ifdef STREAMED
     w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident tensor base byte address; NO LUT/slot multiply
@@ -123,6 +150,9 @@ void main() {
 #endif
 #else
     uint wgRow = (gl_WorkGroupID.x / tilesN) * BM;
+#ifdef PACKED_DECODE
+    uint rowEnd = pc.m;
+#endif
     uint wbase = pc.w_base;
 #endif
     uint wgCol = (gl_WorkGroupID.x % tilesN) * BN;
@@ -134,7 +164,7 @@ void main() {
     [[unroll]] for (uint i = 0u; i < TM; i++)
         [[unroll]] for (uint j = 0u; j < TN; j++) acc[i][j] = 0.0;
 
-#ifdef EXPERT_GRID
+#if defined(EXPERT_GRID) || defined(PACKED_DECODE)
     // Dead-row mask for partial expert tiles — see native_gemm_mmq_q4k.comp's `live` doc (same
     // reasoning, same wave-coherent tr stripe; staging + both barriers stay unconditional).
     bool live = (wgRow + tr * TM) < rowEnd;
@@ -148,7 +178,12 @@ void main() {
         for (uint idx = li; idx < BM * WPB; idx += THREADS) {
             uint r = idx / WPB;
             uint p = idx % WPB;
+#ifdef PACKED_DECODE
+            As[r * SP + p] = (wgRow + r < rowEnd)
+                ? qa[(wgRow + r) * kw + sub * WPB + p] : 0u;
+#else
             As[r * SP + p] = qa[(wgRow + r) * kw + sub * WPB + p];
+#endif
         }
         // per-col scale d·sc for this sub-block (constant across the 16 elements)
         for (uint cc = li; cc < BN; cc += THREADS) {
@@ -175,6 +210,15 @@ void main() {
             uint l0 = (p0 % 128u) % 32u;
             uint qlo = hf * 64u;
             uint qho = hf * 32u;
+#ifdef PACKED_DECODE
+            // og={0,2} share ql[l], og={1,3} ql[l+32]; og/2 selects the nibble.
+            uint qbytes = k02_word(bd + qlo + l0 + 4u * wd + (og & 1u) * 32u);
+            uint hbytes = k02_word(bd + 128u + qho + l0 + 4u * wd);
+            uint codes = ((qbytes >> ((og >> 1u) * 4u)) & 0x0f0f0f0fu)
+                | (((hbytes >> (2u * og)) & 0x03030303u) << 4u);
+            // Guard bits prevent cross-byte borrows: each byte is exactly int(q6)-32.
+            uint packed = ((codes | 0x80808080u) - 0x20202020u) ^ 0x80808080u;
+#else
             uint packed = 0u;
             for (uint b = 0u; b < 4u; b++) {
                 uint l = l0 + 4u * wd + b;
@@ -191,6 +235,7 @@ void main() {
                 uint q = nib | (((qh >> (2u * og)) & 3u) << 4u);
                 packed |= (uint(int(q) - 32) & 0xFFu) << (b * 8u);
             }
+#endif
             Bs[cc * SP + wd] = packed;
         }
         barrier();
@@ -211,7 +256,11 @@ void main() {
 
         float dval[TM];
         [[unroll]] for (uint i = 0u; i < TM; i++)
+#ifdef PACKED_DECODE
+            dval[i] = (wgRow + tr * TM + i < rowEnd) ? float(dact[(wgRow + tr * TM + i) * nblk32 + blk32]) : 0.0;
+#else
             dval[i] = float(dact[(wgRow + tr * TM + i) * nblk32 + blk32]);
+#endif
         [[unroll]] for (uint j = 0u; j < TN; j++) {
             float dl = Bdl[tc * TN + j];
             [[unroll]] for (uint i = 0u; i < TM; i++) {
@@ -229,7 +278,7 @@ void main() {
 
     [[unroll]] for (uint i = 0u; i < TM; i++) {
         uint rr = wgRow + tr * TM + i;
-#ifdef EXPERT_GRID
+#if defined(EXPERT_GRID) || defined(PACKED_DECODE)
         if (rr >= rowEnd) { continue; }
 #endif
         [[unroll]] for (uint j = 0u; j < TN; j++) {

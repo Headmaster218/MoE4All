@@ -3133,6 +3133,41 @@ fn main() {
         ("native_gemm_mmq_q5_1", "native_gemm_mmq_q5_1", &[]),
         ("native_gemm_mmq_q2_k", "native_gemm_mmq_q2_k", &[]),
         ("native_gemm_mmq_q3_k", "native_gemm_mmq_q3_k", &[]),
+        (
+            "native_gemm_mmq_q3_k",
+            "native_gemm_mmq_q3_k_packed_xp32",
+            &["-DEXPERT_GRID", "-DBM_TILE=32u", "-DPACKED_DECODE"],
+        ),
+        (
+            "native_gemm_mmq_q3_k",
+            "native_gemm_mmq_q3_k_packed_xpg32",
+            &[
+                "-DEXPERT_GRID",
+                "-DPAGED",
+                "-DBM_TILE=32u",
+                "-DPACKED_DECODE",
+            ],
+        ),
+        (
+            "native_gemm_mmq_q6k",
+            "native_gemm_mmq_q6k_packed_xpg32",
+            &[
+                "-DEXPERT_GRID",
+                "-DPAGED",
+                "-DBM_TILE=32u",
+                "-DPACKED_DECODE",
+            ],
+        ),
+        (
+            "native_gemm_mmq_q6k",
+            "native_gemm_mmq_q6k_packed_xp32w",
+            &[
+                "-DEXPERT_GRID",
+                "-DBM_TILE=32u",
+                "-DBN_TILE=128u",
+                "-DPACKED_DECODE",
+            ],
+        ),
         ("native_gemm_mmq_q4_0", "native_gemm_mmq_q4_0", &[]),
         ("native_gemm_mmq_q4_1", "native_gemm_mmq_q4_1", &[]),
         ("native_gemm_mmq_iq4_nl", "native_gemm_mmq_iq4_nl", &[]),

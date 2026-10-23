@@ -1,4 +1,7 @@
 #version 460
+// K02 prototype: -DPACKED_DECODE changes integer weight staging only; default is baseline.
+// Keep dp4a, sub-block order, floating-point expressions, tile sizes and barriers unchanged.
+// Activation layout requires k%32 == 0; output columns require n%BN == 0.
 // Tiled dp4a (mmq) GEMM for stacked Q3_K experts (Llama-4-Scout's shipped down-projection MoE
 // bank): C[m,n] = A[m,k]·W[ids]ᵀ via hardware int8 dot-product. Q3_K is SYMMETRIC (no min term,
 // unlike Q2_K/Q4_K/Q5_K) — y = d·(sc6−32)·(q3u−4) — so this mirrors native_gemm_mmq_q6k exactly:
@@ -122,6 +125,30 @@ int sc3(uint sr, uint si) {
     return int(val) - 32;
 }
 
+
+#ifdef PACKED_DECODE
+#if defined(PAGED) && !defined(EXPERT_GRID)
+#error PACKED_DECODE PAGED requires EXPERT_GRID
+#endif
+#if defined(PAGED) && defined(STREAMED)
+#error PAGED and STREAMED are mutually exclusive
+#endif
+// Four consecutive bytes, including the +2 alignment of odd 110/210-byte blocks.
+// Aligned reads touch one word only; the covering pair stays within the GGUF block.
+uint k02_word(uint byte) {
+    uint wi = byte >> 2u;
+    uint sh = (byte & 3u) * 8u;
+#if defined(PAGED) || defined(STREAMED)
+    if (sh == 0u) { return arena_word(wi); }
+    uvec2 words = arena_word2(wi);
+#else
+    if (sh == 0u) { return nw[wi]; }
+    uvec2 words = uvec2(nw[wi], nw[wi + 1u]);
+#endif
+    return (words.x >> sh) | (words.y << (32u - sh));
+}
+#endif
+
 void main() {
 #ifdef STREAMED
     w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident tensor base byte address; NO LUT/slot multiply
@@ -152,6 +179,9 @@ void main() {
 #endif
 #else
     uint wgRow = (gl_WorkGroupID.x / tilesN) * BM;
+#ifdef PACKED_DECODE
+    uint rowEnd = pc.m;
+#endif
     uint wbase = pc.w_base;
 #endif
     uint wgCol = (gl_WorkGroupID.x % tilesN) * BN;
@@ -169,7 +199,12 @@ void main() {
         for (uint idx = li; idx < BM * WPB; idx += THREADS) {
             uint r = idx / WPB;
             uint p = idx % WPB;
+#ifdef PACKED_DECODE
+            As[r * SP + p] = (wgRow + r < rowEnd)
+                ? qa[(wgRow + r) * kw + sub * WPB + p] : 0u;
+#else
             As[r * SP + p] = qa[(wgRow + r) * kw + sub * WPB + p];
+#endif
         }
         // per-col scale d·(sc6−32) for this sub-block (constant across the 16 elements). `si`
         // (the 16-sub-block's index within its 256-elem superblock) is derived from the COLUMN's
@@ -195,6 +230,14 @@ void main() {
             uint hm_base = bd + 16u * (si & 1u);
             uint shift = 2u * ((si & 7u) >> 1u);
             uint hbit = (si >> 3u) * 4u + ((si & 7u) >> 1u);
+#ifdef PACKED_DECODE
+            uint qbytes = k02_word(qs_base + p * 4u);
+            uint hbytes = k02_word(hm_base + p * 4u);
+            uint codes = ((qbytes >> shift) & 0x03030303u)
+                | (((hbytes >> hbit) & 0x01010101u) << 2u);
+            // Guard bits prevent cross-byte borrows: each byte is exactly int(q3u)-4.
+            uint packed = ((codes | 0x80808080u) - 0x04040404u) ^ 0x80808080u;
+#else
             uint packed = 0u;
             [[unroll]] for (uint b = 0u; b < 4u; b++) {
                 uint l = p * 4u + b;
@@ -205,6 +248,7 @@ void main() {
                 uint q3u = low2 | (high << 2u);
                 packed |= (uint(int(q3u) - 4) & 0xFFu) << (b * 8u);
             }
+#endif
             Bs[cc * SP + p] = packed;
         }
         barrier();
@@ -224,7 +268,11 @@ void main() {
 
         float dval[TM];
         [[unroll]] for (uint i = 0u; i < TM; i++)
+#ifdef PACKED_DECODE
+            dval[i] = (wgRow + tr * TM + i < rowEnd) ? float(dact[(wgRow + tr * TM + i) * nblk32 + blk32]) : 0.0;
+#else
             dval[i] = float(dact[(wgRow + tr * TM + i) * nblk32 + blk32]);
+#endif
         [[unroll]] for (uint j = 0u; j < TN; j++) {
             float dl = Bdl[tc * TN + j];
             [[unroll]] for (uint i = 0u; i < TM; i++) {
@@ -241,7 +289,7 @@ void main() {
 
     [[unroll]] for (uint i = 0u; i < TM; i++) {
         uint rr = wgRow + tr * TM + i;
-#ifdef EXPERT_GRID
+#if defined(EXPERT_GRID) || defined(PACKED_DECODE)
         if (rr >= rowEnd) { continue; }
 #endif
         [[unroll]] for (uint j = 0u; j < TN; j++) {

@@ -3153,6 +3153,33 @@ pub(crate) fn flash_pv_reuse_kernel(br128: bool) -> (&'static str, &'static [u32
     }
 }
 
+pub(crate) fn kquant_packed_kernel(
+    dtype: infr_core::DType,
+    paged: bool,
+    wide_bn: bool,
+) -> (&'static str, &'static [u32]) {
+    use infr_core::DType;
+    macro_rules! variant {
+        ($name:literal) => {{
+            static SPV: OnceLock<Vec<u32>> = OnceLock::new();
+            (
+                $name,
+                SPV.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            )
+        }};
+    }
+    match (dtype, paged, wide_bn) {
+        (DType::Q3K, false, false) => variant!("native_gemm_mmq_q3_k_packed_xp32"),
+        (DType::Q3K, true, false) => variant!("native_gemm_mmq_q3_k_packed_xpg32"),
+        (DType::Q6K, true, false) => variant!("native_gemm_mmq_q6k_packed_xpg32"),
+        (DType::Q6K, false, true) => variant!("native_gemm_mmq_q6k_packed_xp32w"),
+        _ => unreachable!("packed MMQ selected outside measured format/route gate"),
+    }
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_iq4_nl_xpg_spv() -> &'static [u32] {
     const BYTES: &[u8] =
