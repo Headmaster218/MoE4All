@@ -3023,6 +3023,7 @@ if ([string]::Equals($sessionCacheDir, $legacySessionCacheDir, [System.StringCom
 $sessionIdleSecs = [string](Get-SavedValue 'session_idle_secs' '120')
 $sessionCacheMax = [string](Get-SavedValue 'session_cache_max' '5GiB')
 $sessionCacheTtlHours = [string](Get-SavedValue 'session_cache_ttl_hours' '24')
+$kvRamCacheMax = [string](Get-SavedValue 'kv_ram_cache_max' '')
 $serverAuth = [bool](Get-SavedValue 'server_auth' $false)
 $serverApiKey = ''
 $serverVision = [bool](Get-SavedValue 'server_vision' $false)
@@ -3234,6 +3235,19 @@ if (-not $reuseSavedSettings) {
             $sessionCacheMax = Read-TextValue -Label 'SSD KV 缓存总上限（绝对大小）/ Total SSD KV cache limit (absolute size)' -Default $sessionCacheMax -Required
             $sessionCacheTtlHours = Read-IntegerValue -Label '缓存保留小时数，0 为不按时间清理 / Cache TTL hours, 0 disables age expiry' -Default $sessionCacheTtlHours -Minimum 0
         }
+        $kvRamCacheEnabled = Read-YesNo -Label '改用内存基数树前缀缓存闲置 KV（不落盘，优先于 SSD）？/ Keep idle-session KV in a RAM radix-tree prefix cache instead (no disk, takes precedence over SSD)?' -Default ([bool]$kvRamCacheMax)
+        if ($kvRamCacheEnabled) {
+            if (-not $kvRamCacheMax) { $kvRamCacheMax = '16GiB' }
+            $kvRamCacheMax = Read-TextValue -Label 'RAM KV 缓存上限（绝对大小或内存百分比，如 16GiB / 25%）/ RAM KV cache limit (absolute size or percent, e.g. 16GiB / 25%)' -Default $kvRamCacheMax -Required
+            Write-Host '试验性特性：此缓存独立分配，不并入进程总 RAM 预算，会从专家 Host Store 的可用内存中挤占；自动策略或核显设备可能触发换页或内存分配失败，建议使用物理内存充裕的设备。' -ForegroundColor Yellow
+            Write-Host 'Experimental: this cache allocates OUTSIDE the process-wide RAM budget and competes with the expert host store; the auto strategy or iGPU devices may page or fail to allocate. Recommended on RAM-rich machines only.' -ForegroundColor DarkGray
+            if ($serverSessionCache) {
+                Write-Host 'RAM 缓存开启，磁盘会话缓存已关闭。The disk session cache was turned off because the RAM cache is on.' -ForegroundColor Yellow
+                $serverSessionCache = $false
+            }
+        } else {
+            $kvRamCacheMax = ''
+        }
 
         Write-Host "`nAPI 服务器 / API server" -ForegroundColor Cyan
         $serverAddr = Read-ListenAddress -Label '监听地址（IP:端口）/ Listen address (IP:port)' -Default $serverAddr
@@ -3443,6 +3457,9 @@ if ($launchMode -eq 'server') {
     }
     [void]$nativeArgs.Add('--addr'); [void]$nativeArgs.Add($serverAddr)
     [void]$nativeArgs.Add('--parallel'); [void]$nativeArgs.Add($serverParallel)
+    if ($kvRamCacheMax) {
+        Add-SetArgument $nativeArgs 'kv.ram_cache_max' $kvRamCacheMax
+    }
     if ($serverSessionCache) {
         Add-SetArgument $nativeArgs 'kv.session_cache_dir' $sessionCacheDir
         Add-SetArgument $nativeArgs 'kv.session_idle_secs' $sessionIdleSecs
@@ -3499,7 +3516,7 @@ $state = [ordered]@{
     server_addr = $serverAddr; server_parallel = $serverParallel; server_auth = $serverAuth
     server_session_cache = $serverSessionCache; session_cache_dir = $sessionCacheDir
     session_idle_secs = $sessionIdleSecs; session_cache_max = $sessionCacheMax
-    session_cache_ttl_hours = $sessionCacheTtlHours
+    session_cache_ttl_hours = $sessionCacheTtlHours; kv_ram_cache_max = $kvRamCacheMax
     server_vision = $serverVision; vision_projector = $visionProjectorPath
     server_embedding = $serverEmbedding; embedding_model = $embeddingModelPath
     embedding_idle_timeout = $embeddingIdleTimeout

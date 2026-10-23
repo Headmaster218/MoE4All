@@ -22,6 +22,7 @@ pub mod grammar;
 /// N-slot concurrent generation (`infr serve --parallel N`) — see [`parallel::ParallelSeam`].
 pub mod parallel;
 pub mod sampling;
+mod ram_cache;
 mod session_cache;
 pub use config::Config;
 
