@@ -254,6 +254,9 @@ fn default_config_matches_documented_defaults() {
     assert_eq!(d.serve.stats_interval_secs, 5);
     // §6.8: `INFR_MTP` is the exact string "1"; unset ⇒ off, and the three MTP hatches default on.
     assert!(!d.spec.mtp);
+    assert!(!d.spec.lookup);
+    assert_eq!(d.spec.lookup_max_draft, 3);
+    assert_eq!(d.spec.lookup_min_match, 8);
     assert!(d.spec.mtp_ckpt && d.spec.mtp_reprime && d.spec.mtp_draft_chain);
     assert!(d.spec.mtp_ple_overlap);
     assert_eq!(d.spec.k, 6);
@@ -271,6 +274,77 @@ fn gpu_resident_decode_is_shipped_by_default_and_can_be_disabled_explicitly() {
     let mut cfg = defaults;
     cli_layer(&["kernels.vulkan.decode_gpu_resident=false"]).apply(&mut cfg);
     assert!(!cfg.kernels.vulkan.decode_gpu_resident);
+}
+
+#[test]
+fn speculative_paths_preserve_explicit_runtime_ab_controls() {
+    let defaults = Config::default();
+    assert_eq!(defaults.kernels.vulkan.decode_gpu_resident_copy, None);
+    assert!(!defaults.kernels.vulkan.decode_gpu_resident_copy_overlap);
+    assert_eq!(defaults.kernels.vulkan.decode_gpu_resident_copy_groups, 0);
+    assert!(defaults.kernels.vulkan.qsa_verify_split);
+    assert!(defaults.kernels.vulkan.verify_pair);
+    assert!(defaults.spec.mtp_tail_kv_only);
+    assert!(defaults.spec.mtp_vocab.is_none());
+    assert!(!defaults.spec.lookup);
+    for layer in [
+        cli_layer(&[
+            "kernels.vulkan.decode_gpu_resident_copy=true",
+            "kernels.vulkan.decode_gpu_resident_copy_overlap=true",
+            "kernels.vulkan.qsa_verify_split=false",
+            "kernels.vulkan.verify_pair=true",
+            "spec.mtp_tail_kv_only=false", "spec.mtp_vocab=draft-vocab.bin", "spec.lookup=true",
+            "spec.lookup_max_draft=2", "spec.lookup_min_match=12",
+        ]),
+        file_layer("[kernels.vulkan]\ndecode_gpu_resident_copy=true\ndecode_gpu_resident_copy_overlap=true\nqsa_verify_split=false\nverify_pair=true\n[spec]\nmtp_tail_kv_only=false\nmtp_vocab='draft-vocab.bin'\nlookup=true\nlookup_max_draft=2\nlookup_min_match=12\n"),
+    ] {
+        let cfg = Config::load_from_layers(&[layer]);
+        assert_eq!(cfg.kernels.vulkan.decode_gpu_resident_copy, Some(true));
+        assert!(cfg.kernels.vulkan.decode_gpu_resident_copy_overlap);
+        assert!(!cfg.kernels.vulkan.qsa_verify_split);
+        assert!(cfg.kernels.vulkan.verify_pair);
+        assert!(!cfg.spec.mtp_tail_kv_only);
+        assert_eq!(cfg.spec.mtp_vocab.as_deref(), Some(std::path::Path::new("draft-vocab.bin")));
+        assert!(cfg.spec.lookup);
+        assert_eq!(cfg.spec.lookup_max_draft, 2);
+        assert_eq!(cfg.spec.lookup_min_match, 12);
+    }
+}
+
+#[test]
+fn gpu_copy_auto_policy_preserves_explicit_on_off_layers() {
+    for enabled in [false, true] {
+        let setting = format!("kernels.vulkan.decode_gpu_resident_copy={enabled}");
+        let toml = format!("[kernels.vulkan]\ndecode_gpu_resident_copy={enabled}\n");
+        for layer in [cli_layer(&[setting.as_str()]), file_layer(&toml)] {
+            let cfg = Config::load_from_layers(&[layer]);
+            assert_eq!(cfg.kernels.vulkan.decode_gpu_resident_copy, Some(enabled));
+        }
+    }
+    let cfg = Config::load_from_layers(&[
+        file_layer("[kernels.vulkan]\ndecode_gpu_resident_copy=true\nverify_pair=true\n"),
+        cli_layer(&["kernels.vulkan.decode_gpu_resident_copy=false", "kernels.vulkan.verify_pair=false"]),
+    ]);
+    assert_eq!(cfg.kernels.vulkan.decode_gpu_resident_copy, Some(false));
+    assert!(!cfg.kernels.vulkan.verify_pair);
+}
+
+#[test]
+fn gpu_copy_groups_config_accepts_auto_and_explicit_ab_values() {
+    for value in [0, 1, 2, 4, 8, 9, 1024] {
+        let setting = format!("kernels.vulkan.decode_gpu_resident_copy_groups={value}");
+        let toml = format!("[kernels.vulkan]\ndecode_gpu_resident_copy_groups={value}\n");
+        for layer in [cli_layer(&[setting.as_str()]), file_layer(&toml)] {
+            let cfg = Config::load_from_layers(&[layer]);
+            assert_eq!(cfg.kernels.vulkan.decode_gpu_resident_copy_groups, value);
+            assert_eq!(cfg.kernels.vulkan.decode_gpu_resident_copy, None);
+            assert!(!cfg.kernels.vulkan.decode_gpu_resident_copy_overlap);
+        }
+    }
+    for value in ["-1", "1.5", "invalid"] {
+        assert!(PartialConfig::default()
+            .set_path("kernels.vulkan.decode_gpu_resident_copy_groups", value).is_err());
+    }
 }
 
 #[test]

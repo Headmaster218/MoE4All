@@ -438,6 +438,16 @@ cfg_struct! {
         decode_gpu_resident_fast_lut: bool = true,
         /// Continue resident hits while a miss notice starts host-side recovery.
         decode_gpu_resident_hit_first: bool = true,
+        /// GPU miss copy from imported RAM. None selects ordinary single-row Decode only;
+        /// true also permits experimental multirow/Verify, false disables it.
+        /// Unmapped sources, bounded host tiers and exhausted safe destinations retain recovery.
+        decode_gpu_resident_copy: Option<bool> = None,
+        /// GPU copy workgroups for serial and overlap paths. 0 selects 8 for both variants;
+        /// explicit values clamp to 1..=8. Performance qualified on RX 7900 XTX only.
+        decode_gpu_resident_copy_groups: usize = 0,
+        /// Experimental bounded compute copy concurrent with resident hit projections.
+        /// Requires serial-copy eligibility; false preserves its copy-then-full-FFN path.
+        decode_gpu_resident_copy_overlap: bool = false,
         /// Wait submitted resident fences on a dedicated host thread (driver scheduling A/B).
         decode_gpu_resident_waiter: bool = false,
         /// Give each checked layer immutable predicate words to avoid predicate read/write barriers.
@@ -601,6 +611,12 @@ cfg_struct! {
         /// Also use cooperative-matrix PV in that path. Kept separate so QK-only remains an
         /// exact runtime A/B fallback on drivers where F16 probability staging is not profitable.
         qsa_prefill_coopmat_pv: bool = true,
+        /// Use per-row causal split-K for small target Verify QSA cohorts. Larger Prefill
+        /// batches retain the tiled kernel, and false keeps that path for same-binary A/B.
+        qsa_verify_split: bool = true,
+        /// Reuse native expert weight decoding across adjacent causal Verify rows.
+        /// Unqualified dtypes/shapes and insufficient row reuse keep the baseline kernel.
+        verify_pair: bool = true,
         /// Block width of the Qwen3.8 Prefill indexer scorer's 8-query F32 tile. Supported values
         /// are 32 and 64; other values keep the established 2-query x 4-block path.
         qsa_score_tile: usize = 32,
@@ -770,12 +786,25 @@ cfg_struct! {
         /// `INFR_MTP`: the EXACT string `"1"`. `INFR_MTP=true` does nothing today; the `== "1"`
         /// mapping is the behaviour-preserving one.
         mtp: bool = false,
+        /// Exact prompt-lookup proposals, independent of draft-model weights. Requests outside
+        /// the target's transactional Verify capabilities retain ordinary decode.
+        lookup: bool = false,
+        /// Maximum proposed suffix, excluding the already selected pending token (1..=3).
+        lookup_max_draft: usize = 3,
+        /// Minimum exact suffix match before proposing historical continuation tokens.
+        lookup_min_match: usize = 8,
         /// `INFR_NO_MTP_CKPT` (inverted).
         mtp_ckpt: bool = true,
         /// `INFR_NO_MTP_REPRIME` (inverted). ANDed with [`SpecCfg::mtp_ckpt`] at the site (R5).
         mtp_reprime: bool = true,
         /// `INFR_NO_MTP_DRAFT_CHAIN` (inverted).
         mtp_draft_chain: bool = true,
+        /// Compute only the required K/V writes in the last draft step; false retains the
+        /// full-step reference path for same-binary performance/correctness comparison.
+        mtp_tail_kv_only: bool = true,
+        /// Optional sorted u32 token IDs for a compact draft-only output projection.
+        /// The target always validates against its full vocabulary.
+        mtp_vocab: Option<PathBuf> = None,
         /// `INFR_NO_MTP_PLE_OVERLAP` (inverted): run VERIFY layer 0 while PLE rows are gathered.
         mtp_ple_overlap: bool = true,
         /// `INFR_SPEC_DRAFT`: draft-model path.
