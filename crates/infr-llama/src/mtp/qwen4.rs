@@ -12,6 +12,19 @@ use super::{BindWeightFn, MtpTensor};
 
 pub const DRAFT_TOKENS: usize = 4;
 
+fn refill_verify_feed(
+    feed: &mut Vec<u32>,
+    committed: &[u32],
+    pending_token: u32,
+    candidates: &[u32],
+) {
+    feed.clear();
+    feed.reserve(committed.len() + 1 + candidates.len());
+    feed.extend_from_slice(committed);
+    feed.push(pending_token);
+    feed.extend_from_slice(candidates);
+}
+
 fn generation_budget(prompt_rows: usize, requested: usize, max_ctx: usize) -> Result<usize> {
     let reserved = prompt_rows
         .checked_add(DRAFT_TOKENS)
@@ -2379,6 +2392,7 @@ impl Qwen4MtpRuntime {
         // The next VERIFY consumes it as row zero, so every batch commits at least one token and
         // rejection never needs a separate correction forward or MTP-head catch-up.
         let mut pending_h = prime_capture.last_h;
+        let mut feed = Vec::new();
         let mut acc = Vec::new();
         let mut printed = 0usize;
         let mut generated = 0usize;
@@ -2417,10 +2431,12 @@ impl Qwen4MtpRuntime {
             timing.draft_secs += draft_secs;
             timing.total_drafted += verify_tokens - 1;
 
-            let mut feed = Vec::with_capacity(committed.len() + verify_tokens);
-            feed.extend_from_slice(&committed);
-            feed.push(pending_token);
-            feed.extend_from_slice(&candidates[..verify_tokens - 1]);
+            refill_verify_feed(
+                &mut feed,
+                &committed,
+                pending_token,
+                &candidates[..verify_tokens - 1],
+            );
             self.trunk
                 .as_mut()
                 .expect("target trunk remains initialized")
@@ -2501,7 +2517,7 @@ impl Qwen4MtpRuntime {
             let new_tokens = &feed[n_past..n_past + accepted];
             committed.extend_from_slice(new_tokens);
             pending_token = verify_ids[accepted - 1];
-            pending_h = verify_h[(accepted - 1) * h_width..accepted * h_width].to_vec();
+            pending_h.copy_from_slice(&verify_h[(accepted - 1) * h_width..accepted * h_width]);
             let snapshot_profile = PhaseProfile::new("snapshot");
             self.trunk
                 .as_mut()
@@ -2640,4 +2656,335 @@ mod tests {
         push_bounded(&mut cache, 5, 0);
         assert_eq!(cache, VecDeque::from([2, 3, 4]));
     }
+}
+
+#[cfg(test)]
+mod m01_local_tests {
+    use super::refill_verify_feed;
+    use std::hint::black_box;
+
+    fn hidden_rows(width: usize) -> Vec<f32> {
+        let bits = [
+            0,
+            0x8000_0000,
+            1,
+            0x8000_0001,
+            0x7f7f_ffff,
+            0xff7f_ffff,
+            0x7fc1_2345,
+            0xffc5_4321,
+        ];
+        (0..4 * width)
+            .map(|i| f32::from_bits(bits[i % bits.len()] ^ ((i / width) as u32 * 0x100)))
+            .collect()
+    }
+
+    fn update_hidden(
+        pending_h: &mut Vec<f32>,
+        verify_h: &[f32],
+        accepted: usize,
+        h_width: usize,
+        reuse: bool,
+    ) {
+        if reuse {
+            pending_h.copy_from_slice(&verify_h[(accepted - 1) * h_width..accepted * h_width]);
+        } else {
+            *pending_h = verify_h[(accepted - 1) * h_width..accepted * h_width].to_vec();
+        }
+    }
+
+    #[test]
+    fn m01_feed_matches_original_for_widths_growth_and_shrink() {
+        let tokens: Vec<u32> = (0..150_004).collect();
+        let candidates = [17, 29, 43];
+        let mut feed = Vec::new();
+        for n in [0, 1, 30_000, 150_000, 1, 0, 150_000] {
+            for verify_tokens in 2..=4 {
+                let tail = &candidates[..verify_tokens - 1];
+                let mut expected = Vec::with_capacity(n + verify_tokens);
+                expected.extend_from_slice(&tokens[..n]);
+                expected.push(11);
+                expected.extend_from_slice(tail);
+                let (ptr, cap) = (feed.as_ptr(), feed.capacity());
+                refill_verify_feed(&mut feed, &tokens[..n], 11, tail);
+                assert_eq!(feed, expected);
+                assert!(feed.capacity() >= n + verify_tokens);
+                if cap >= n + verify_tokens {
+                    assert_eq!(feed.capacity(), cap);
+                    assert_eq!(feed.as_ptr(), ptr);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn m01_hidden_copy_preserves_every_bit_and_allocation_for_accepted_rows() {
+        for width in [1, 7, 10_240] {
+            let rows = hidden_rows(width);
+            let mut pending_h = vec![0.0; width];
+            let (ptr, cap) = (pending_h.as_ptr(), pending_h.capacity());
+            for verify_tokens in 2..=4 {
+                for accepted in 1..=verify_tokens {
+                    let expected = rows[(accepted - 1) * width..accepted * width].to_vec();
+                    update_hidden(&mut pending_h, &rows, accepted, width, true);
+                    assert!(pending_h
+                        .iter()
+                        .zip(&expected)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()));
+                    assert_eq!(pending_h.as_ptr(), ptr);
+                    assert_eq!(pending_h.capacity(), cap);
+                    assert_eq!(pending_h.len(), width);
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Event {
+        Restore(usize),
+        Commit,
+        Select,
+        Snapshot,
+        Observe(u32),
+        Emit(u32),
+        Stop,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Abort {
+        Never,
+        BeforeCycle,
+        AfterFirstEmission,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Cycle {
+        committed: Vec<u32>,
+        pending: u32,
+        hidden_bits: Vec<u32>,
+        generated: usize,
+        aborted: bool,
+        events: Vec<Event>,
+    }
+
+    // A selector/order contract, not an implementation of the real EOS guard or GPU rollback.
+    fn cycle_contract(
+        reuse: bool,
+        verify_tokens: usize,
+        verify_ids: &[u32],
+        eos: Option<u32>,
+        ignore_eos: bool,
+        limit: usize,
+        abort: Abort,
+    ) -> Cycle {
+        let mut committed = vec![1, 2, 3];
+        let mut pending_token = 10;
+        let mut pending_h = vec![0.0; 7];
+        let verify_h = hidden_rows(7);
+        let h_width = 7;
+        let mut events = Vec::new();
+        let mut generated = 0;
+        let mut aborted = matches!(abort, Abort::BeforeCycle);
+        if limit > 0 && !aborted {
+            let candidates = [11, 12, 13];
+            let n_past = committed.len();
+            let mut feed = Vec::new();
+            if reuse {
+                refill_verify_feed(
+                    &mut feed,
+                    &committed,
+                    pending_token,
+                    &candidates[..verify_tokens - 1],
+                );
+            } else {
+                feed = Vec::with_capacity(committed.len() + verify_tokens);
+                feed.extend_from_slice(&committed);
+                feed.push(pending_token);
+                feed.extend_from_slice(&candidates[..verify_tokens - 1]);
+            }
+            // verify_ids is the already-repaired target selector, just like the production loop.
+            let accepted_spec = (0..verify_tokens - 1)
+                .take_while(|&i| candidates[i] == verify_ids[i])
+                .count();
+            let accepted = accepted_spec + 1;
+            if accepted < verify_tokens {
+                events.push(Event::Restore(accepted));
+            }
+            let new_tokens = &feed[n_past..n_past + accepted];
+            committed.extend_from_slice(new_tokens);
+            events.push(Event::Commit);
+            pending_token = verify_ids[accepted - 1];
+            update_hidden(&mut pending_h, &verify_h, accepted, h_width, reuse);
+            events.push(Event::Select);
+            events.push(Event::Snapshot);
+            let emitted = new_tokens.to_vec();
+            for token in emitted {
+                let stop_eos = !ignore_eos && eos == Some(token);
+                generated += 1;
+                events.push(Event::Observe(token));
+                if !stop_eos {
+                    events.push(Event::Emit(token));
+                    if matches!(abort, Abort::AfterFirstEmission) {
+                        aborted = true;
+                    }
+                }
+                // Abort is checked at the NEXT cycle, not midway through this accepted batch.
+                if stop_eos || generated >= limit {
+                    events.push(Event::Stop);
+                    break;
+                }
+            }
+        }
+        Cycle {
+            committed,
+            pending: pending_token,
+            hidden_bits: pending_h.iter().map(|v| v.to_bits()).collect(),
+            generated,
+            aborted,
+            events,
+        }
+    }
+
+    #[test]
+    fn m01_rejection_eos_abort_and_limit_keep_original_selectors_and_order() {
+        for verify_tokens in 2..=4 {
+            for accepted in 1..=verify_tokens {
+                let mut ids = [11, 12, 13, 77];
+                if accepted < verify_tokens {
+                    ids[accepted - 1] = 90 + accepted as u32;
+                }
+                for eos in [None, Some(10), Some(11), Some(12), Some(13)] {
+                    for ignore_eos in [false, true] {
+                        for limit in [0, 1, 2, 3, 4, 8] {
+                            for abort in
+                                [Abort::Never, Abort::BeforeCycle, Abort::AfterFirstEmission]
+                            {
+                                let old = cycle_contract(
+                                    false,
+                                    verify_tokens,
+                                    &ids,
+                                    eos,
+                                    ignore_eos,
+                                    limit,
+                                    abort,
+                                );
+                                let new = cycle_contract(
+                                    true,
+                                    verify_tokens,
+                                    &ids,
+                                    eos,
+                                    ignore_eos,
+                                    limit,
+                                    abort,
+                                );
+                                assert_eq!(new, old);
+                                if limit > 0 && !matches!(abort, Abort::BeforeCycle) {
+                                    assert_eq!(new.pending, ids[accepted - 1]);
+                                    assert_eq!(new.committed.len(), 3 + accepted);
+                                    let first = usize::from(accepted < verify_tokens);
+                                    assert_eq!(
+                                        new.events[first..first + 3],
+                                        [Event::Commit, Event::Select, Event::Snapshot]
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn m01_repaired_target_ids_and_deferred_pending_eos_are_selected_before_emission() {
+        let raw = cycle_contract(true, 4, &[11, 99, 13, 77], None, false, 8, Abort::Never);
+        let repaired = cycle_contract(true, 4, &[11, 12, 13, 99], Some(99), false, 8, Abort::Never);
+        assert_eq!(raw.committed.len(), 5);
+        assert_eq!(repaired.committed.len(), 7);
+        assert_eq!(repaired.pending, 99);
+        assert_eq!(repaired.generated, 4); // Pending EOS is not yet an emitted token.
+        assert!(!repaired.events.contains(&Event::Stop));
+        let aborted = cycle_contract(
+            true,
+            4,
+            &[11, 12, 13, 77],
+            None,
+            false,
+            8,
+            Abort::AfterFirstEmission,
+        );
+        assert!(aborted.aborted);
+        assert_eq!(aborted.generated, 4);
+    }
+
+    pub(super) struct AllocationCase {
+        tokens: Vec<u32>,
+        rows: Vec<f32>,
+        pending_h: Vec<f32>,
+        feed: Vec<u32>,
+        prefix: usize,
+        cycles: usize,
+    }
+
+    impl AllocationCase {
+        pub(super) fn new(prefix: usize, cycles: usize) -> Self {
+            Self {
+                tokens: (0..prefix + cycles + 4).map(|i| i as u32).collect(),
+                rows: hidden_rows(10_240),
+                pending_h: vec![0.0; 10_240],
+                feed: Vec::new(),
+                prefix,
+                cycles,
+            }
+        }
+
+        pub(super) fn run(&mut self, reuse: bool) -> usize {
+            let mut growth_calls = 0;
+            let candidates = [11, 12, 13];
+            for i in 0..self.cycles {
+                let committed = &self.tokens[..self.prefix + i];
+                let accepted = i % 4 + 1;
+                if reuse {
+                    let cap = self.feed.capacity();
+                    refill_verify_feed(&mut self.feed, committed, 10, &candidates);
+                    growth_calls += usize::from(self.feed.capacity() != cap);
+                    update_hidden(&mut self.pending_h, &self.rows, accepted, 10_240, true);
+                    black_box((&self.feed[..], &self.pending_h[..]));
+                } else {
+                    let mut feed = Vec::with_capacity(committed.len() + 4);
+                    feed.extend_from_slice(committed);
+                    feed.push(10);
+                    feed.extend_from_slice(&candidates);
+                    update_hidden(&mut self.pending_h, &self.rows, accepted, 10_240, false);
+                    growth_calls += 2; // One nonempty feed allocation and one hidden allocation.
+                    black_box((&feed[..], &self.pending_h[..]));
+                }
+            }
+            growth_calls
+        }
+    }
+
+    #[test]
+    fn m01_capacity_growth_counts_exclude_setup_and_hidden_copy_allocations() {
+        for prefix in [0, 30_000, 150_000] {
+            let cycles = 4096;
+            let mut old = AllocationCase::new(prefix, cycles);
+            let mut new = AllocationCase::new(prefix, cycles);
+            assert_eq!(old.run(false), 2 * cycles);
+            let (ptr, cap) = (new.pending_h.as_ptr(), new.pending_h.capacity());
+            let growth = new.run(true);
+            assert!(growth > 0 && growth < 32);
+            assert_eq!(new.pending_h.as_ptr(), ptr);
+            assert_eq!(new.pending_h.capacity(), cap);
+            assert!(old
+                .pending_h
+                .iter()
+                .zip(&new.pending_h)
+                .all(|(a, b)| a.to_bits() == b.to_bits()));
+            assert_eq!(new.feed.len(), prefix + cycles - 1 + 4);
+            // A second run is fully warmed and must not grow either allocation.
+            assert_eq!(new.run(true), 0);
+        }
+    }
+
 }
