@@ -22,6 +22,26 @@ fn env_layer(pairs: &[(&str, &str)]) -> PartialConfig {
 }
 
 #[test]
+fn next_step_preparation_defaults_on_and_has_explicit_sync_fallback() {
+    assert!(Config::default().device.decode_prepare_ahead);
+    let mut layer = PartialConfig::default();
+    layer
+        .set_path("device.decode_prepare_ahead", "false")
+        .unwrap();
+    let mut cfg = Config::default();
+    layer.apply(&mut cfg);
+    assert!(!cfg.device.decode_prepare_ahead);
+    let (layer, warnings) = file::parse_str(
+        "[device]\ndecode_prepare_ahead = true\n",
+        Path::new("infr.toml"),
+    )
+    .unwrap();
+    assert!(warnings.is_empty());
+    layer.apply(&mut cfg);
+    assert!(cfg.device.decode_prepare_ahead);
+}
+
+#[test]
 fn paged_iq_grid_override_preserves_auto_and_explicit_modes() {
     for (value, expected) in [("none", None), ("true", Some(true)), ("false", Some(false))] {
         let mut layer = PartialConfig::default();

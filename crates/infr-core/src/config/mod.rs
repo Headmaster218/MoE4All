@@ -134,6 +134,10 @@ cfg_struct! {
         /// Worker threads. Sourced from the CLI's `-t`; still PUBLISHED as `RAYON_NUM_THREADS`
         /// because rayon has no other input. Not an `INFR_*` knob.
         threads: Option<usize> = None,
+        /// Prepare the next token's immutable plan on a bounded CPU worker while the current
+        /// step executes and its result is processed. Backends without CPU-only concurrent
+        /// compilation retain inline preparation. Does not execute unconfirmed tokens.
+        decode_prepare_ahead: bool = true,
     }
 }
 

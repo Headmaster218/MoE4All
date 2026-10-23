@@ -10172,6 +10172,8 @@ fn generate_dense_backend_inner(
                     && (gpu_penalty_backend || lane.penalties().is_none())
             })
             .collect::<Vec<_>>();
+        let prepare_ahead =
+            ec.device.decode_prepare_ahead && be.supports_async_compile() && max_new > 1;
         let prepare_decode_plans = |plan_step: usize| -> AResult<PreparedParallelDecodePlans> {
             let plan_positions = lane_starts
                 .iter()
@@ -10234,6 +10236,9 @@ fn generate_dense_backend_inner(
                     Some(0..1),
                 );
                 let plan0 = be.compile(&g0).map_err(|e| anyhow!("{e}"))?;
+                if prepare_ahead {
+                    plan0.prepare().map_err(|e| anyhow!("{e}"))?;
+                }
                 Some((plan0, h0))
             };
             let (g1, h1) = build(
@@ -10253,6 +10258,9 @@ fn generate_dense_backend_inner(
                 Some(usize::from(!plan_full_graph)..c.n_layer),
             );
             let plan1 = be.compile(&g1).map_err(|e| anyhow!("{e}"))?;
+            if prepare_ahead {
+                plan1.prepare().map_err(|e| anyhow!("{e}"))?;
+            }
             Ok(PreparedParallelDecodePlans {
                 first,
                 main: (plan1, h1),
@@ -10263,437 +10271,492 @@ fn generate_dense_backend_inner(
             })
         };
         type RetiredDecodePlans = (Option<Box<dyn Plan>>, Box<dyn Plan>);
+        struct RetiredPlans<'a> {
+            plans: Option<RetiredDecodePlans>,
+            request: Option<&'a crate::sampling::RequestCtx>,
+        }
+        impl Drop for RetiredPlans<'_> {
+            fn drop(&mut self) {
+                if self.plans.is_some() {
+                    // Result/prepare errors and unwinds must obey the same queue ownership as
+                    // normal teardown: a previously executed plan can own recorded GPU commands.
+                    let _gate = self.request.and_then(|request| request.gate_pass());
+                    drop(self.plans.take());
+                }
+            }
+        }
         let mut prepared_decode_plans = Some(prepare_decode_plans(0)?);
-        let mut retired_decode_plans: Option<RetiredDecodePlans> = None;
-        for step in 0..max_new {
-            let step_t0 = std::time::Instant::now();
-            let profile_front_t0 = profile_cohort.then(std::time::Instant::now);
-            let _gp = req.and_then(|request| request.gate_pass());
-            let positions = lane_starts
-                .iter()
-                .map(|&lane_start| lane_start + step)
-                .collect::<Vec<_>>();
-            let sample_from = sampling_suffix_start(&positions, parallel.prompt_ends)?;
-            let _timeline_step = if sample_from == 0 {
-                infr_core::timeline::begin_step(&positions)
-            } else {
-                None
-            };
-            let timeline_front = infr_core::timeline::span("step_front");
-            let logits_rows = lanes - sample_from;
-            let batch_argmax = logits_rows > 0
-                && caps.argmax_rows
-                && ec.spec.gpu_argmax
-                && parallel.samplers[sample_from..].iter().all(|lane| {
-                    lane.can_gpu_argmax() && (gpu_penalty_backend || lane.penalties().is_none())
-                });
-            let batch_gpu_sample = logits_rows > 0
-                && (logits_rows == 1 || caps.sample_rows)
-                && caps.gpu_sample
-                && ec.spec.gpu_sample
-                && (2..=infr_vulkan::Recorder::SAMPLE_KMAX).contains(&sampler.top_k)
-                && parallel.samplers[sample_from..].iter().all(|lane| {
-                    lane.can_gpu_sample_with(sampler)
-                        && (gpu_penalty_backend || lane.penalties().is_none())
-                });
-            let mut current_plans = prepared_decode_plans
-                .take()
-                .ok_or_else(|| anyhow!("missing prepared Decode plans"))?;
-            if current_plans.logits_rows != logits_rows
-                || current_plans.batch_argmax != batch_argmax
-                || current_plans.batch_gpu_sample != batch_gpu_sample
-            {
-                return Err(anyhow!(
-                    "prepared Decode sampling shape changed unexpectedly"
-                ));
-            }
-            ensure_kv_depth!(positions[0] + 1);
-            for (peer, &position) in parallel.peers.iter_mut().zip(&positions[1..]) {
-                peer.ensure_segmented_depth(be, c, position + 1)?;
-            }
-            let ids = curs
-                .iter()
-                .zip(&positions)
-                .map(|(tokens, &position)| tokens[position] as i32)
-                .collect::<Vec<_>>();
-            let position_rows = positions
-                .iter()
-                .zip(parallel.mrope_plans)
-                .map(|(&position, plan)| mrope_token_position(*plan, position))
-                .collect::<AResult<Vec<_>>>()?;
-            be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids))
-                .map_err(|e| anyhow!("{e}"))?;
-            be.upload(pos_batch.as_ref(), bytemuck::cast_slice(&position_rows))
-                .map_err(|e| anyhow!("{e}"))?;
-
-            let ple_ticket = if c.qwen4exp {
-                Some(
-                    ple_worker
-                        .as_ref()
-                        .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?
-                        .submit_batch(
-                            curs.iter()
-                                .zip(&positions)
-                                .map(|(tokens, &position)| (tokens.as_slice(), position)),
-                            c.ple_ngram_size,
-                        )?,
-                )
-            } else {
-                None
-            };
-            let full_graph = resident_full_graph_decode(
-                c,
-                ec,
-                be.name(),
-                lanes,
-                sample_from,
-                capture_hidden,
-                has_multimodal_lane,
-                positions.iter().copied().max().unwrap_or(0) + 1,
-            );
-            if current_plans.full_graph != full_graph {
-                return Err(anyhow!("prepared Decode graph mode changed unexpectedly"));
-            }
-            let mut first_layer = if full_graph {
-                if current_plans.first.is_some() {
-                    return Err(anyhow!(
-                        "prepared split Decode L0 plan for a full-graph step"
-                    ));
-                }
-                None
-            } else {
-                let (plan0, h0) = current_plans
-                    .first
-                    .take()
-                    .ok_or_else(|| anyhow!("missing prepared Decode L0 plan"))?;
-                let mut b0 = Bindings::new();
-                b0.bind(
-                    h0.tok_ids.expect("GPU embedding needs ids"),
-                    ids_buf.as_ref(),
-                );
-                b0.bind(h0.hidden, hidden_batch.as_ref());
-                b0.bind(h0.positions, pos_batch.as_ref());
-                bind_parallel_layer_io(
-                    &mut b0,
-                    &h0,
-                    c.n_layer,
-                    rf_buf,
-                    yff_buf,
-                    &kbufs[..],
-                    &vbufs[..],
-                    &qsa_kbufs[..],
-                    &qsa_cbufs[..],
-                    &mrope_history_buf,
-                    peer_mrope_history_bufs.as_deref(),
-                    &wbufs[..],
-                    qwen_wide_buf,
-                    ple_embd_buf,
-                    ple_state_buf,
-                    wide_batch.as_deref(),
-                    None,
-                    &*parallel.peers,
-                    None,
-                    independent_rows,
-                );
-                Some((plan0, b0))
-            };
-            if let Some(t0) = profile_front_t0 {
-                profile_front += t0.elapsed();
-            }
-            drop(timeline_front);
-            let layer0_started = std::time::Instant::now();
-            if let Some((plan0, b0)) = first_layer.as_ref() {
-                be.execute(plan0.as_ref(), b0).map_err(|e| anyhow!("{e}"))?;
-            }
-            if profile_cohort {
-                profile_layer0 += layer0_started.elapsed();
-            }
-            let (plan1, h1) = current_plans.main;
-
-            if let Some(ticket) = ple_ticket {
-                let profile_ple_wait_t0 = profile_cohort.then(std::time::Instant::now);
-                let timeline_ple_wait = infr_core::timeline::span("PLE_wait");
-                let ple_rows = ticket.wait()?;
-                if let Some(t0) = profile_ple_wait_t0 {
-                    profile_ple_wait += t0.elapsed();
-                }
-                drop(timeline_ple_wait);
-                let expected_ple_values = lanes * ple_row.expect("Qwen3.8 has a PLE row");
-                if ple_rows.len() != expected_ple_values {
-                    return Err(anyhow!(
-                        "parallel PLE produced {} values, expected {expected_ple_values}",
-                        ple_rows.len()
-                    ));
-                }
-                let profile_ple_upload_t0 = profile_cohort.then(std::time::Instant::now);
-                be.upload(
-                    ple_batch
-                        .as_deref()
-                        .expect("Qwen3.8 parallel Decode has a PLE buffer"),
-                    bytemuck::cast_slice(ple_rows.as_slice()),
-                )
-                .map_err(|e| anyhow!("{e}"))?;
-                if let Some(t0) = profile_ple_upload_t0 {
-                    profile_ple_upload += t0.elapsed();
-                }
-            }
-
-            let profile_main_setup_t0 = profile_cohort.then(std::time::Instant::now);
-            let mut b1 = Bindings::new();
-            if full_graph {
-                b1.bind(
-                    h1.tok_ids.expect("full Decode graph embeds token ids"),
-                    ids_buf.as_ref(),
-                );
-            }
-            b1.bind(h1.hidden, hidden_batch.as_ref());
-            b1.bind(h1.positions, pos_batch.as_ref());
-            bind_parallel_layer_io(
-                &mut b1,
-                &h1,
-                c.n_layer,
-                rf_buf,
-                yff_buf,
-                &kbufs[..],
-                &vbufs[..],
-                &qsa_kbufs[..],
-                &qsa_cbufs[..],
-                &mrope_history_buf,
-                peer_mrope_history_bufs.as_deref(),
-                &wbufs[..],
-                qwen_wide_buf,
-                ple_embd_buf,
-                ple_state_buf,
-                wide_batch.as_deref(),
-                ple_batch.as_deref(),
-                &*parallel.peers,
-                None,
-                independent_rows,
-            );
-            if logits_rows > 0 {
-                b1.bind(
-                    h1.logits.expect("parallel token build has logits"),
-                    logits_batch.as_ref(),
-                );
-            }
-            if let Some(buffers) = gpu_penalty_buffers
-                .as_ref()
-                .filter(|_| h1.penalty_io.is_some())
-            {
-                buffers.upload(
-                    be,
-                    (sample_from..lanes).map(|lane| {
-                        GpuPenaltyBuffers::control_row(
-                            parallel.samplers[lane].penalties(),
-                            penalty_previous[lane],
-                            lane,
-                        )
-                    }),
-                )?;
-                buffers.bind(&mut b1, &h1);
-            }
-            if batch_argmax {
-                b1.bind(
-                    h1.tok_id.expect("parallel greedy token step has ids"),
-                    ids_out.as_ref(),
-                );
-            }
-            if batch_gpu_sample {
-                let uniforms = parallel.samplers[sample_from..]
-                    .iter_mut()
-                    .map(crate::sampling::ParallelSampler::next_uniform)
-                    .collect::<Vec<_>>();
-                be.upload(sample_u.as_ref(), bytemuck::cast_slice(&uniforms))
-                    .map_err(|e| anyhow!("{e}"))?;
-                b1.bind(
-                    h1.u_in
-                        .expect("parallel stochastic token step has a uniform"),
-                    sample_u.as_ref(),
-                );
-                b1.bind(
-                    h1.tok_id.expect("parallel stochastic token step has an id"),
-                    ids_out.as_ref(),
-                );
-            }
-            if let (Some(id), Some(buffer)) = (h1.h_out, hidden_out.as_deref()) {
-                b1.bind(id, buffer);
-            }
-            if let Some(t0) = profile_main_setup_t0 {
-                profile_main_setup += t0.elapsed();
-            }
-            let profile_main_execute_t0 = profile_cohort.then(std::time::Instant::now);
-            let retired_first = first_layer.take().map(|(plan, bindings)| {
-                drop(bindings);
-                plan
-            });
-            let previously_retired = retired_decode_plans.take();
-            let execute_trace_context = infr_core::timeline::context();
-            let (execute_result, next_plans_result) = rayon::join(
-                || {
-                    let _trace_context = infr_core::timeline::scoped_context(execute_trace_context);
-                    be.execute(plan1.as_ref(), &b1).map_err(|e| anyhow!("{e}"))
-                },
-                || {
-                    drop(previously_retired);
-                    if step + 1 < max_new {
-                        prepare_decode_plans(step + 1).map(Some)
+        let mut retired_decode_plans = RetiredPlans {
+            plans: None,
+            request: req,
+        };
+        infr_core::step_pipeline::with_step_preparation(
+            prepare_ahead,
+            |(step, context): (usize, Option<infr_core::timeline::Context>)| {
+                let _context = infr_core::timeline::scoped_context(context);
+                let _prepare = infr_core::timeline::span("decode_prepare_next");
+                prepare_decode_plans(step)
+            },
+            |pipeline| -> AResult<()> {
+                for step in 0..max_new {
+                    let step_t0 = std::time::Instant::now();
+                    let profile_front_t0 = profile_cohort.then(std::time::Instant::now);
+                    let _gp = req.and_then(|request| request.gate_pass());
+                    let positions = lane_starts
+                        .iter()
+                        .map(|&lane_start| lane_start + step)
+                        .collect::<Vec<_>>();
+                    let sample_from = sampling_suffix_start(&positions, parallel.prompt_ends)?;
+                    let _timeline_step = if sample_from == 0 {
+                        infr_core::timeline::begin_step(&positions)
                     } else {
-                        Ok(None)
-                    }
-                },
-            );
-            execute_result?;
-            prepared_decode_plans = next_plans_result?;
-            retired_decode_plans = Some((retired_first, plan1));
-            if let Some(t0) = profile_main_execute_t0 {
-                profile_main_execute += t0.elapsed();
-            }
-
-            let profile_tail_t0 = profile_cohort.then(std::time::Instant::now);
-            let _timeline_tail = infr_core::timeline::span("step_tail");
-            if let (Some(buffer), Some(hidden)) =
-                (hidden_out.as_deref(), parallel.hidden.as_deref_mut())
-            {
-                be.download(buffer, bytemuck::cast_slice_mut(&mut hidden_step))
-                    .map_err(|e| anyhow!("{e}"))?;
-                for (lane, rows) in hidden.iter_mut().enumerate() {
-                    let start = lane * hidden_width;
-                    rows.extend_from_slice(&hidden_step[start..start + hidden_width]);
-                }
-            }
-            let mut next = vec![0u32; logits_rows];
-            if batch_argmax || batch_gpu_sample {
-                be.download(ids_out.as_ref(), bytemuck::cast_slice_mut(&mut next))
-                    .map_err(|e| anyhow!("{e}"))?;
-                for (row, token) in next.iter_mut().enumerate() {
-                    *token = crate::sampling::ensure_sampled_token(
-                        *token,
-                        c.vocab,
-                        &format!("parallel GPU sample row {row}"),
-                    )?;
-                }
-                let needs_reasoning_repair = next.iter().enumerate().any(|(row, &token)| {
-                    parallel.reasoning_guards[sample_from + row].blocks(
-                        c,
-                        token,
-                        ec.sampling.ignore_eos,
-                    )
-                });
-                if needs_reasoning_repair {
-                    let mut logits = vec![0f32; logits_rows * c.vocab];
-                    be.download(logits_batch.as_ref(), bytemuck::cast_slice_mut(&mut logits))
-                        .map_err(|e| anyhow!("{e}"))?;
-                    for row in 0..logits_rows {
-                        let lane = sample_from + row;
-                        let row_logits = &mut logits[row * c.vocab..(row + 1) * c.vocab];
-                        crate::sampling::ensure_finite_logits(
-                            row_logits,
-                            &format!("parallel EOS repair row {row}"),
-                        )?;
-                        if !parallel.reasoning_guards[lane].blocks(
-                            c,
-                            next[row],
-                            ec.sampling.ignore_eos,
-                        ) {
-                            continue;
+                        None
+                    };
+                    let timeline_front = infr_core::timeline::span("step_front");
+                    let logits_rows = lanes - sample_from;
+                    let batch_argmax = logits_rows > 0
+                        && caps.argmax_rows
+                        && ec.spec.gpu_argmax
+                        && parallel.samplers[sample_from..].iter().all(|lane| {
+                            lane.can_gpu_argmax()
+                                && (gpu_penalty_backend || lane.penalties().is_none())
+                        });
+                    let batch_gpu_sample = logits_rows > 0
+                        && (logits_rows == 1 || caps.sample_rows)
+                        && caps.gpu_sample
+                        && ec.spec.gpu_sample
+                        && (2..=infr_vulkan::Recorder::SAMPLE_KMAX).contains(&sampler.top_k)
+                        && parallel.samplers[sample_from..].iter().all(|lane| {
+                            lane.can_gpu_sample_with(sampler)
+                                && (gpu_penalty_backend || lane.penalties().is_none())
+                        });
+                    let mut current_plans = match prepared_decode_plans.take() {
+                        Some(plans) => plans,
+                        None => {
+                            let _wait = infr_core::timeline::span("decode_prepare_wait");
+                            pipeline.take(step)??
                         }
-                        let blocked = next[row];
-                        parallel.reasoning_guards[lane].mask_eos(c, row_logits);
-                        next[row] = parallel.samplers[lane].sample_penalized(row_logits);
-                        tracing::warn!(
+                    };
+                    if current_plans.logits_rows != logits_rows
+                        || current_plans.batch_argmax != batch_argmax
+                        || current_plans.batch_gpu_sample != batch_gpu_sample
+                    {
+                        return Err(anyhow!(
+                            "prepared Decode sampling shape changed unexpectedly"
+                        ));
+                    }
+                    ensure_kv_depth!(positions[0] + 1);
+                    for (peer, &position) in parallel.peers.iter_mut().zip(&positions[1..]) {
+                        peer.ensure_segmented_depth(be, c, position + 1)?;
+                    }
+                    let ids = curs
+                        .iter()
+                        .zip(&positions)
+                        .map(|(tokens, &position)| tokens[position] as i32)
+                        .collect::<Vec<_>>();
+                    let position_rows = positions
+                        .iter()
+                        .zip(parallel.mrope_plans)
+                        .map(|(&position, plan)| mrope_token_position(*plan, position))
+                        .collect::<AResult<Vec<_>>>()?;
+                    be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids))
+                        .map_err(|e| anyhow!("{e}"))?;
+                    be.upload(pos_batch.as_ref(), bytemuck::cast_slice(&position_rows))
+                        .map_err(|e| anyhow!("{e}"))?;
+
+                    let ple_ticket = if c.qwen4exp {
+                        Some(
+                            ple_worker
+                                .as_ref()
+                                .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?
+                                .submit_batch(
+                                    curs.iter()
+                                        .zip(&positions)
+                                        .map(|(tokens, &position)| (tokens.as_slice(), position)),
+                                    c.ple_ngram_size,
+                                )?,
+                        )
+                    } else {
+                        None
+                    };
+                    let full_graph = resident_full_graph_decode(
+                        c,
+                        ec,
+                        be.name(),
+                        lanes,
+                        sample_from,
+                        capture_hidden,
+                        has_multimodal_lane,
+                        positions.iter().copied().max().unwrap_or(0) + 1,
+                    );
+                    if current_plans.full_graph != full_graph {
+                        return Err(anyhow!("prepared Decode graph mode changed unexpectedly"));
+                    }
+                    let mut first_layer = if full_graph {
+                        if current_plans.first.is_some() {
+                            return Err(anyhow!(
+                                "prepared split Decode L0 plan for a full-graph step"
+                            ));
+                        }
+                        None
+                    } else {
+                        let (plan0, h0) = current_plans
+                            .first
+                            .take()
+                            .ok_or_else(|| anyhow!("missing prepared Decode L0 plan"))?;
+                        let mut b0 = Bindings::new();
+                        b0.bind(
+                            h0.tok_ids.expect("GPU embedding needs ids"),
+                            ids_buf.as_ref(),
+                        );
+                        b0.bind(h0.hidden, hidden_batch.as_ref());
+                        b0.bind(h0.positions, pos_batch.as_ref());
+                        bind_parallel_layer_io(
+                            &mut b0,
+                            &h0,
+                            c.n_layer,
+                            rf_buf,
+                            yff_buf,
+                            &kbufs[..],
+                            &vbufs[..],
+                            &qsa_kbufs[..],
+                            &qsa_cbufs[..],
+                            &mrope_history_buf,
+                            peer_mrope_history_bufs.as_deref(),
+                            &wbufs[..],
+                            qwen_wide_buf,
+                            ple_embd_buf,
+                            ple_state_buf,
+                            wide_batch.as_deref(),
+                            None,
+                            &*parallel.peers,
+                            None,
+                            independent_rows,
+                        );
+                        Some((plan0, b0))
+                    };
+                    if let Some(t0) = profile_front_t0 {
+                        profile_front += t0.elapsed();
+                    }
+                    drop(timeline_front);
+                    let layer0_started = std::time::Instant::now();
+                    if let Some((plan0, b0)) = first_layer.as_ref() {
+                        be.execute(plan0.as_ref(), b0).map_err(|e| anyhow!("{e}"))?;
+                    }
+                    if profile_cohort {
+                        profile_layer0 += layer0_started.elapsed();
+                    }
+                    let (plan1, h1) = current_plans.main;
+
+                    if let Some(ticket) = ple_ticket {
+                        let profile_ple_wait_t0 = profile_cohort.then(std::time::Instant::now);
+                        let timeline_ple_wait = infr_core::timeline::span("PLE_wait");
+                        let ple_rows = ticket.wait()?;
+                        if let Some(t0) = profile_ple_wait_t0 {
+                            profile_ple_wait += t0.elapsed();
+                        }
+                        drop(timeline_ple_wait);
+                        let expected_ple_values = lanes * ple_row.expect("Qwen3.8 has a PLE row");
+                        if ple_rows.len() != expected_ple_values {
+                            return Err(anyhow!(
+                                "parallel PLE produced {} values, expected {expected_ple_values}",
+                                ple_rows.len()
+                            ));
+                        }
+                        let profile_ple_upload_t0 = profile_cohort.then(std::time::Instant::now);
+                        be.upload(
+                            ple_batch
+                                .as_deref()
+                                .expect("Qwen3.8 parallel Decode has a PLE buffer"),
+                            bytemuck::cast_slice(ple_rows.as_slice()),
+                        )
+                        .map_err(|e| anyhow!("{e}"))?;
+                        if let Some(t0) = profile_ple_upload_t0 {
+                            profile_ple_upload += t0.elapsed();
+                        }
+                    }
+
+                    let profile_main_setup_t0 = profile_cohort.then(std::time::Instant::now);
+                    let mut b1 = Bindings::new();
+                    if full_graph {
+                        b1.bind(
+                            h1.tok_ids.expect("full Decode graph embeds token ids"),
+                            ids_buf.as_ref(),
+                        );
+                    }
+                    b1.bind(h1.hidden, hidden_batch.as_ref());
+                    b1.bind(h1.positions, pos_batch.as_ref());
+                    bind_parallel_layer_io(
+                        &mut b1,
+                        &h1,
+                        c.n_layer,
+                        rf_buf,
+                        yff_buf,
+                        &kbufs[..],
+                        &vbufs[..],
+                        &qsa_kbufs[..],
+                        &qsa_cbufs[..],
+                        &mrope_history_buf,
+                        peer_mrope_history_bufs.as_deref(),
+                        &wbufs[..],
+                        qwen_wide_buf,
+                        ple_embd_buf,
+                        ple_state_buf,
+                        wide_batch.as_deref(),
+                        ple_batch.as_deref(),
+                        &*parallel.peers,
+                        None,
+                        independent_rows,
+                    );
+                    if logits_rows > 0 {
+                        b1.bind(
+                            h1.logits.expect("parallel token build has logits"),
+                            logits_batch.as_ref(),
+                        );
+                    }
+                    if let Some(buffers) = gpu_penalty_buffers
+                        .as_ref()
+                        .filter(|_| h1.penalty_io.is_some())
+                    {
+                        buffers.upload(
+                            be,
+                            (sample_from..lanes).map(|lane| {
+                                GpuPenaltyBuffers::control_row(
+                                    parallel.samplers[lane].penalties(),
+                                    penalty_previous[lane],
+                                    lane,
+                                )
+                            }),
+                        )?;
+                        buffers.bind(&mut b1, &h1);
+                    }
+                    if batch_argmax {
+                        b1.bind(
+                            h1.tok_id.expect("parallel greedy token step has ids"),
+                            ids_out.as_ref(),
+                        );
+                    }
+                    if batch_gpu_sample {
+                        let uniforms = parallel.samplers[sample_from..]
+                            .iter_mut()
+                            .map(crate::sampling::ParallelSampler::next_uniform)
+                            .collect::<Vec<_>>();
+                        be.upload(sample_u.as_ref(), bytemuck::cast_slice(&uniforms))
+                            .map_err(|e| anyhow!("{e}"))?;
+                        b1.bind(
+                            h1.u_in
+                                .expect("parallel stochastic token step has a uniform"),
+                            sample_u.as_ref(),
+                        );
+                        b1.bind(
+                            h1.tok_id.expect("parallel stochastic token step has an id"),
+                            ids_out.as_ref(),
+                        );
+                    }
+                    if let (Some(id), Some(buffer)) = (h1.h_out, hidden_out.as_deref()) {
+                        b1.bind(id, buffer);
+                    }
+                    if let Some(t0) = profile_main_setup_t0 {
+                        profile_main_setup += t0.elapsed();
+                    }
+                    let profile_main_execute_t0 = profile_cohort.then(std::time::Instant::now);
+                    let retired_first = first_layer.take().map(|(plan, bindings)| {
+                        drop(bindings);
+                        plan
+                    });
+                    let previously_retired = retired_decode_plans.plans.take();
+                    let execute_trace_context = infr_core::timeline::context();
+                    if pipeline.is_async() {
+                        if step + 1 < max_new {
+                            pipeline.schedule(step + 1, (step + 1, execute_trace_context))?;
+                        }
+                        be.execute(plan1.as_ref(), &b1)
+                            .map_err(|e| anyhow!("{e}"))?;
+                        // Executed plans may own replay commands: retire them under the execution gate,
+                        // never on the CPU-only preparation worker while another execute uses the queue.
+                        drop(previously_retired);
+                    } else {
+                        let (execute_result, next_plans_result) = rayon::join(
+                            || {
+                                let _trace_context =
+                                    infr_core::timeline::scoped_context(execute_trace_context);
+                                be.execute(plan1.as_ref(), &b1).map_err(|e| anyhow!("{e}"))
+                            },
+                            || {
+                                if step + 1 < max_new {
+                                    prepare_decode_plans(step + 1).map(Some)
+                                } else {
+                                    Ok(None)
+                                }
+                            },
+                        );
+                        execute_result?;
+                        drop(previously_retired);
+                        prepared_decode_plans = next_plans_result?;
+                    }
+                    retired_decode_plans.plans = Some((retired_first, plan1));
+                    if let Some(t0) = profile_main_execute_t0 {
+                        profile_main_execute += t0.elapsed();
+                    }
+
+                    let profile_tail_t0 = profile_cohort.then(std::time::Instant::now);
+                    let _timeline_tail = infr_core::timeline::span("step_tail");
+                    if let (Some(buffer), Some(hidden)) =
+                        (hidden_out.as_deref(), parallel.hidden.as_deref_mut())
+                    {
+                        be.download(buffer, bytemuck::cast_slice_mut(&mut hidden_step))
+                            .map_err(|e| anyhow!("{e}"))?;
+                        for (lane, rows) in hidden.iter_mut().enumerate() {
+                            let start = lane * hidden_width;
+                            rows.extend_from_slice(&hidden_step[start..start + hidden_width]);
+                        }
+                    }
+                    let mut next = vec![0u32; logits_rows];
+                    if batch_argmax || batch_gpu_sample {
+                        be.download(ids_out.as_ref(), bytemuck::cast_slice_mut(&mut next))
+                            .map_err(|e| anyhow!("{e}"))?;
+                        for (row, token) in next.iter_mut().enumerate() {
+                            *token = crate::sampling::ensure_sampled_token(
+                                *token,
+                                c.vocab,
+                                &format!("parallel GPU sample row {row}"),
+                            )?;
+                        }
+                        let needs_reasoning_repair =
+                            next.iter().enumerate().any(|(row, &token)| {
+                                parallel.reasoning_guards[sample_from + row].blocks(
+                                    c,
+                                    token,
+                                    ec.sampling.ignore_eos,
+                                )
+                            });
+                        if needs_reasoning_repair {
+                            let mut logits = vec![0f32; logits_rows * c.vocab];
+                            be.download(
+                                logits_batch.as_ref(),
+                                bytemuck::cast_slice_mut(&mut logits),
+                            )
+                            .map_err(|e| anyhow!("{e}"))?;
+                            for row in 0..logits_rows {
+                                let lane = sample_from + row;
+                                let row_logits = &mut logits[row * c.vocab..(row + 1) * c.vocab];
+                                crate::sampling::ensure_finite_logits(
+                                    row_logits,
+                                    &format!("parallel EOS repair row {row}"),
+                                )?;
+                                if !parallel.reasoning_guards[lane].blocks(
+                                    c,
+                                    next[row],
+                                    ec.sampling.ignore_eos,
+                                ) {
+                                    continue;
+                                }
+                                let blocked = next[row];
+                                parallel.reasoning_guards[lane].mask_eos(c, row_logits);
+                                next[row] = parallel.samplers[lane].sample_penalized(row_logits);
+                                tracing::warn!(
                             lane,
                             blocked_token = blocked,
                             replacement_token = next[row],
                             "Qwen3.8 suppressed premature EOS inside an open reasoning block"
                         );
-                    }
-                }
-                for (row, &token) in next.iter().enumerate() {
-                    let lane = sample_from + row;
-                    parallel.samplers[lane].observe(token);
-                    penalty_previous[lane] = Some(token);
-                }
-            } else if logits_rows > 0 {
-                let mut logits = vec![0f32; logits_rows * c.vocab];
-                be.download(logits_batch.as_ref(), bytemuck::cast_slice_mut(&mut logits))
-                    .map_err(|e| anyhow!("{e}"))?;
-                for row in 0..logits_rows {
-                    let lane = sample_from + row;
-                    let logits = &mut logits[row * c.vocab..(row + 1) * c.vocab];
-                    crate::sampling::ensure_finite_logits(
-                        logits,
-                        &format!("parallel host sample row {row}"),
-                    )?;
-                    if !ec.sampling.ignore_eos {
-                        parallel.reasoning_guards[lane].mask_eos(c, logits);
-                    }
-                    next[row] = parallel.samplers[lane].sample(logits);
-                }
-            }
-            for (written, &position) in last_written.iter_mut().zip(&positions) {
-                *written = Some(position);
-            }
-            for lane in 0..lanes {
-                for (index, boundary) in parallel.checkpoint_boundaries[lane].iter().enumerate() {
-                    if Some(positions[lane] + 1) == *boundary {
-                        if lane == 0 {
-                            if let Some(checkpoint) = turn_recurrent_ckpts[index].as_mut() {
-                                checkpoint.snapshot_all(
-                                    be,
-                                    &kbufs[..],
-                                    &vbufs[..],
-                                    ple_state_buf.as_deref(),
-                                )?;
                             }
-                        } else {
-                            let slot = &mut parallel.peers[lane - 1];
-                            if let Some(checkpoint) = slot.turn_recurrent_ckpts[index].as_mut() {
-                                checkpoint.snapshot_all(
-                                    be,
-                                    &slot.kbufs,
-                                    &slot.vbufs,
-                                    slot.ple_state_buf.as_deref(),
-                                )?;
+                        }
+                        for (row, &token) in next.iter().enumerate() {
+                            let lane = sample_from + row;
+                            parallel.samplers[lane].observe(token);
+                            penalty_previous[lane] = Some(token);
+                        }
+                    } else if logits_rows > 0 {
+                        let mut logits = vec![0f32; logits_rows * c.vocab];
+                        be.download(logits_batch.as_ref(), bytemuck::cast_slice_mut(&mut logits))
+                            .map_err(|e| anyhow!("{e}"))?;
+                        for row in 0..logits_rows {
+                            let lane = sample_from + row;
+                            let logits = &mut logits[row * c.vocab..(row + 1) * c.vocab];
+                            crate::sampling::ensure_finite_logits(
+                                logits,
+                                &format!("parallel host sample row {row}"),
+                            )?;
+                            if !ec.sampling.ignore_eos {
+                                parallel.reasoning_guards[lane].mask_eos(c, logits);
+                            }
+                            next[row] = parallel.samplers[lane].sample(logits);
+                        }
+                    }
+                    for (written, &position) in last_written.iter_mut().zip(&positions) {
+                        *written = Some(position);
+                    }
+                    for lane in 0..lanes {
+                        for (index, boundary) in
+                            parallel.checkpoint_boundaries[lane].iter().enumerate()
+                        {
+                            if Some(positions[lane] + 1) == *boundary {
+                                if lane == 0 {
+                                    if let Some(checkpoint) = turn_recurrent_ckpts[index].as_mut() {
+                                        checkpoint.snapshot_all(
+                                            be,
+                                            &kbufs[..],
+                                            &vbufs[..],
+                                            ple_state_buf.as_deref(),
+                                        )?;
+                                    }
+                                } else {
+                                    let slot = &mut parallel.peers[lane - 1];
+                                    if let Some(checkpoint) =
+                                        slot.turn_recurrent_ckpts[index].as_mut()
+                                    {
+                                        checkpoint.snapshot_all(
+                                            be,
+                                            &slot.kbufs,
+                                            &slot.vbufs,
+                                            slot.ple_state_buf.as_deref(),
+                                        )?;
+                                    }
+                                }
                             }
                         }
                     }
+                    let step_secs = step_t0.elapsed().as_secs_f64();
+                    for lane in 0..sample_from {
+                        prompt_secs[lane] += step_secs;
+                    }
+                    for lane in sample_from..lanes {
+                        decode_secs[lane] += step_secs;
+                    }
+                    let mut stop_batch = false;
+                    for (row, &token) in next.iter().enumerate() {
+                        let lane = sample_from + row;
+                        generated[lane].push(token);
+                        parallel.reasoning_guards[lane].observe(c, token);
+                        let is_eos = !ec.sampling.ignore_eos
+                            && (c.eos_ids.contains(&token) || token == c.eos);
+                        let keep_going = !is_eos && (parallel.on_token)(lane, token);
+                        if keep_going {
+                            curs[lane].push(token);
+                        } else {
+                            stop_batch = true;
+                        }
+                    }
+                    let should_stop = stop_batch
+                        || parallel.yield_requested.is_some_and(|requested| {
+                            requested.load(std::sync::atomic::Ordering::Acquire)
+                        });
+                    if let Some(t0) = profile_tail_t0 {
+                        profile_tail += t0.elapsed();
+                    }
+                    profile_steps += 1;
+                    profile_decode_rows += logits_rows;
+                    profile_prefill_rows += sample_from;
+                    if should_stop {
+                        break;
+                    }
                 }
-            }
-            let step_secs = step_t0.elapsed().as_secs_f64();
-            for lane in 0..sample_from {
-                prompt_secs[lane] += step_secs;
-            }
-            for lane in sample_from..lanes {
-                decode_secs[lane] += step_secs;
-            }
-            let mut stop_batch = false;
-            for (row, &token) in next.iter().enumerate() {
-                let lane = sample_from + row;
-                generated[lane].push(token);
-                parallel.reasoning_guards[lane].observe(c, token);
-                let is_eos =
-                    !ec.sampling.ignore_eos && (c.eos_ids.contains(&token) || token == c.eos);
-                let keep_going = !is_eos && (parallel.on_token)(lane, token);
-                if keep_going {
-                    curs[lane].push(token);
-                } else {
-                    stop_batch = true;
-                }
-            }
-            let should_stop = stop_batch
-                || parallel
-                    .yield_requested
-                    .is_some_and(|requested| requested.load(std::sync::atomic::Ordering::Acquire));
-            if let Some(t0) = profile_tail_t0 {
-                profile_tail += t0.elapsed();
-            }
-            profile_steps += 1;
-            profile_decode_rows += logits_rows;
-            profile_prefill_rows += sample_from;
-            if should_stop {
-                break;
-            }
-        }
+                let _gate = req.and_then(|request| request.gate_pass());
+                drop(retired_decode_plans.plans.take());
+                Ok(())
+            },
+        )?;
 
         let profile_teardown_t0 = profile_cohort.then(std::time::Instant::now);
         *cached = resident_after_gen(&curs[0], last_written[0]);
@@ -11934,638 +11997,725 @@ fn generate_dense_backend_inner(
     // (`start`) plus the batched prefill (which fills through `plen-2`), so the highest is
     // `decode_start - 1` (`None` when nothing is resident yet). Bumped after every executed step.
     let mut last_written: Option<usize> = decode_start.checked_sub(1);
-    while pos < end {
-        // `max_new == 0` (prefill-only: bench pp, session cache warming) must still FEED the
-        // prompt: models without a batched-prefill path (MoE with non-Q4_K expert banks, E2B
-        // short suffixes) do their entire prefill in this loop — breaking before the prompt is
-        // consumed skips their KV fill and reports a zero prompt time (bench pp printed 512e9
-        // t/s for qwen35moe UD quants). Only break once every prompt position but the frontier
-        // has been processed (the frontier token stays un-fed at max_new == 0, matching the
-        // batched-prefill path's plen-1 contract).
-        if out.len() >= max_new && pos + 1 >= prompt.len() {
-            break;
-        }
-        // Shutdown (SIGINT/SIGTERM), polled at the TOP of the loop as well as at the existing
-        // bottom-of-loop stop checks. The bottom checks only run on a step that SAMPLED, so the
-        // per-token PROMPT-feed steps this loop also does (MoE / gemma-E2B / short suffixes, which
-        // have no batched-prefill path) had no stop check at all — a Ctrl-C during one of those
-        // prefills would have fed the whole prompt, one submit at a time, before anything noticed.
-        // Whatever partial output was already streamed stands; the caller reports it.
-        if crate::sampling::abort_requested(req) {
-            break;
-        }
-        // ONE turn on the GPU per loop iteration — a single decode step, or one chained chunk of
-        // `chain_n` steps (the `can_chain` branch below submits them as one recording). Dropped at
-        // the end of the iteration (including on `continue`, `break`, and `?`), handing the baton
-        // to the longest-waiting sequence. THIS is the token-granularity round-robin: no request
-        // can be head-of-line blocked behind another's whole generation, only behind one step of it.
-        // `req` None (run/bench/tests) constructs nothing.
-        let _gp = req.and_then(|r| r.gate_pass());
-        ensure_kv_depth!(pos + 1);
-        if can_chain && pos + 1 >= prompt.len() && pos + 1 == cur.len() && logits_out.is_none() {
-            // Clamped by the backend's watchdog budget too: a chain is one submit of `n` decode
-            // steps, and on a slow device that submit has to stay short (see
-            // `Backend::max_decode_chain`). Clamped HERE, before the per-step sampling uniforms
-            // below are drawn, so the RNG stream advances by exactly the steps we run.
-            let n = chain_n
-                .min(max_new - out.len())
-                .min(64)
-                .min(be.max_decode_chain());
-            if n >= 2 {
-                let step_t0 = std::time::Instant::now();
-                // Seed the shared id slot with the token to feed (the previous chunk's last
-                // sampled id is already there device-side, but forced/first tokens aren't) and
-                // the position (read ONCE, at replay-record time — the chain may be the very
-                // first decode step, before the per-token path ever wrote pos_buf).
-                be.upload(
-                    dec_ids_buf.as_ref(),
-                    bytemuck::cast_slice(&[cur[pos] as i32]),
-                )
-                .map_err(|e| anyhow!("{e}"))?;
-                be.upload(pos_buf.as_ref(), bytemuck::cast_slice(&[pos as i32]))
-                    .map_err(|e| anyhow!("{e}"))?;
-                // GPU stochastic sampling: draw this chunk's `n` uniforms from the SAME xorshift
-                // stream the per-token path consumes (one per frontier token, in order) and seed
-                // the ring slots the chained replay will read. Replay `j` (1-indexed within this
-                // chunk) feeds the token at sequence position `pos+j-1` (replay 1 feeds THIS
-                // iteration's frontier token, `cur[pos]`, just uploaded above) and its
-                // `params_advance` lands on the adapter's `p0+j` where `p0 = pos-1` (the runner's
-                // `pos` tracks one AHEAD of the device's pre-call `params[0]`, matching
-                // `execute_chain`'s own `p0+1..=p0+n` accounting) — so replay `j`'s ring slot is
-                // `(p0+j)&63 = (pos+j-1)&63`, i.e. slots `pos .. pos+n-1` for `i in 0..n`.
-                if gpu_sample {
-                    for i in 0..n {
-                        u_ring_host[(pos + i) & 63] = crate::sampling::next_uniform(&mut rng);
+    use self::serial_decode_preparation::Shape;
+    struct PreparedSerialDecodePlans {
+        first: Option<(Box<dyn Plan>, DecodeHandles)>,
+        main: (Box<dyn Plan>, DecodeHandles),
+    }
+    let prepare_ahead = ro.is_none()
+        && ec.device.decode_prepare_ahead
+        && be.supports_async_compile()
+        && max_new > 1;
+    // Only immutable graph metadata reaches this closure: no bindings, buffers or token history.
+    let prepare_decode_plan =
+        |shape: Shape, first: bool| -> AResult<(Box<dyn Plan>, DecodeHandles)> {
+            let span = c.qwen4exp.then(|| if first { 0..1 } else { 1..c.n_layer });
+            let (g, h) = build(
+                1,
+                shape.pos,
+                usize::from(!first),
+                false,
+                None,
+                false,
+                !first && shape.want_h,
+                !first && gpu_argmax,
+                !first && gpu_sample,
+                (!c.qwen4exp || first) && shape.gpu_embed_tok,
+                false, // mtp_verify: ordinary per-token decode
+                false, // independent_rows: ordinary single-session decode
+                None,
+                span,
+            );
+            let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
+            if prepare_ahead {
+                plan.prepare().map_err(|e| anyhow!("{e}"))?;
+            }
+            Ok((plan, h))
+        };
+    let prepare_decode_plans = |shape: Shape| -> AResult<PreparedSerialDecodePlans> {
+        let first = if c.qwen4exp {
+            Some(prepare_decode_plan(shape, true)?)
+        } else {
+            None
+        };
+        Ok(PreparedSerialDecodePlans {
+            first,
+            main: prepare_decode_plan(shape, false)?,
+        })
+    };
+    infr_core::step_pipeline::with_step_preparation(
+        prepare_ahead,
+        |(shape, context): (Shape, Option<infr_core::timeline::Context>)| {
+            let _context = infr_core::timeline::scoped_context(context);
+            let _prepare = infr_core::timeline::span("decode_prepare_next");
+            // Keep errors inside the candidate until the main thread validates its shape.
+            (shape, prepare_decode_plans(shape))
+        },
+        |pipeline| -> AResult<()> {
+            while pos < end {
+                // `max_new == 0` (prefill-only: bench pp, session cache warming) must still FEED the
+                // prompt: models without a batched-prefill path (MoE with non-Q4_K expert banks, E2B
+                // short suffixes) do their entire prefill in this loop — breaking before the prompt is
+                // consumed skips their KV fill and reports a zero prompt time (bench pp printed 512e9
+                // t/s for qwen35moe UD quants). Only break once every prompt position but the frontier
+                // has been processed (the frontier token stays un-fed at max_new == 0, matching the
+                // batched-prefill path's plen-1 contract).
+                if out.len() >= max_new && pos + 1 >= prompt.len() {
+                    break;
+                }
+                // Shutdown (SIGINT/SIGTERM), polled at the TOP of the loop as well as at the existing
+                // bottom-of-loop stop checks. The bottom checks only run on a step that SAMPLED, so the
+                // per-token PROMPT-feed steps this loop also does (MoE / gemma-E2B / short suffixes, which
+                // have no batched-prefill path) had no stop check at all — a Ctrl-C during one of those
+                // prefills would have fed the whole prompt, one submit at a time, before anything noticed.
+                // Whatever partial output was already streamed stands; the caller reports it.
+                if crate::sampling::abort_requested(req) {
+                    break;
+                }
+                // ONE turn on the GPU per loop iteration — a single decode step, or one chained chunk of
+                // `chain_n` steps (the `can_chain` branch below submits them as one recording). Dropped at
+                // the end of the iteration (including on `continue`, `break`, and `?`), handing the baton
+                // to the longest-waiting sequence. THIS is the token-granularity round-robin: no request
+                // can be head-of-line blocked behind another's whole generation, only behind one step of it.
+                // `req` None (run/bench/tests) constructs nothing.
+                let _gp = req.and_then(|r| r.gate_pass());
+                ensure_kv_depth!(pos + 1);
+                if can_chain
+                    && pos + 1 >= prompt.len()
+                    && pos + 1 == cur.len()
+                    && logits_out.is_none()
+                {
+                    // Clamped by the backend's watchdog budget too: a chain is one submit of `n` decode
+                    // steps, and on a slow device that submit has to stay short (see
+                    // `Backend::max_decode_chain`). Clamped HERE, before the per-step sampling uniforms
+                    // below are drawn, so the RNG stream advances by exactly the steps we run.
+                    let n = chain_n
+                        .min(max_new - out.len())
+                        .min(64)
+                        .min(be.max_decode_chain());
+                    if n >= 2 {
+                        let step_t0 = std::time::Instant::now();
+                        // Seed the shared id slot with the token to feed (the previous chunk's last
+                        // sampled id is already there device-side, but forced/first tokens aren't) and
+                        // the position (read ONCE, at replay-record time — the chain may be the very
+                        // first decode step, before the per-token path ever wrote pos_buf).
+                        be.upload(
+                            dec_ids_buf.as_ref(),
+                            bytemuck::cast_slice(&[cur[pos] as i32]),
+                        )
+                        .map_err(|e| anyhow!("{e}"))?;
+                        be.upload(pos_buf.as_ref(), bytemuck::cast_slice(&[pos as i32]))
+                            .map_err(|e| anyhow!("{e}"))?;
+                        // GPU stochastic sampling: draw this chunk's `n` uniforms from the SAME xorshift
+                        // stream the per-token path consumes (one per frontier token, in order) and seed
+                        // the ring slots the chained replay will read. Replay `j` (1-indexed within this
+                        // chunk) feeds the token at sequence position `pos+j-1` (replay 1 feeds THIS
+                        // iteration's frontier token, `cur[pos]`, just uploaded above) and its
+                        // `params_advance` lands on the adapter's `p0+j` where `p0 = pos-1` (the runner's
+                        // `pos` tracks one AHEAD of the device's pre-call `params[0]`, matching
+                        // `execute_chain`'s own `p0+1..=p0+n` accounting) — so replay `j`'s ring slot is
+                        // `(p0+j)&63 = (pos+j-1)&63`, i.e. slots `pos .. pos+n-1` for `i in 0..n`.
+                        if gpu_sample {
+                            for i in 0..n {
+                                u_ring_host[(pos + i) & 63] =
+                                    crate::sampling::next_uniform(&mut rng);
+                            }
+                            be.upload(u_buf.as_ref(), bytemuck::cast_slice(&u_ring_host))
+                                .map_err(|e| anyhow!("{e}"))?;
+                        }
+                        let (plan, b) = ro.as_ref().expect("can_chain implies record-once");
+                        if let Some(ids) = be
+                            .execute_chain(plan.as_ref(), b, n)
+                            .map_err(|e| anyhow!("{e}"))?
+                        {
+                            let mut stop = false;
+                            let mut fed = 0usize;
+                            for &id in &ids {
+                                out.push(id);
+                                decode_n += 1;
+                                fed += 1;
+                                let is_eos =
+                                    !ignore_eos && (c.eos_ids.contains(&id) || id == c.eos);
+                                if is_eos {
+                                    stop = true;
+                                    break;
+                                }
+                                on_token(id);
+                                cur.push(id);
+                                // `abort_requested` was NOT polled here before (pre-existing bug, reported):
+                                // the chained path is the DEFAULT decode fast path (greedy + gpu_embed), so
+                                // an `infr serve` request with a `stop` sequence kept generating all the way
+                                // to `max_tokens` after its stop had already fired. The client's TEXT was
+                                // right (StopMatcher suppresses emission after a hit) but the server burned
+                                // the whole budget on tokens nobody would ever see — and, now, held a slot
+                                // other requests were queued behind. Same shape as the EOS/max_new checks.
+                                if out.len() >= max_new || crate::sampling::abort_requested(req) {
+                                    stop = true;
+                                    break;
+                                }
+                            }
+                            decode_t += step_t0.elapsed();
+                            // The chain fed positions `pos..pos+fed-1` with kept tokens (`cur[pos]` then
+                            // each accepted sampled id); the final sampled id was pushed but never fed, so
+                            // its row isn't written — `pos + fed - 1` is the last materialized position.
+                            // Matches the old `prompt ++ out[..out.len()-1]` teardown on every chain case.
+                            if fed > 0 {
+                                last_written = Some(pos + fed - 1);
+                            }
+                            report_progress(
+                                infr_core::GenerationPhase::Decode,
+                                prompt_work,
+                                decode_n,
+                            );
+                            if stop {
+                                break;
+                            }
+                            pos += fed;
+                            continue;
+                        }
+                        // Backend declined (e.g. adapter fell back to static) — per-token path below.
                     }
+                }
+                // Sample only after prefill, at a drained single-sequence decode boundary.
+                if profile_single && pos + 1 >= prompt.len() && decode_profile_before.is_none() {
+                    decode_profile_before = Some((
+                        infr_core::pager_profile::snapshot(),
+                        infr_core::pager_profile::device_timeline_snapshot(),
+                        infr_core::pager_profile::paged_moe_layer_snapshot(),
+                    ));
+                    tracing::info!("[single-decode-begin] pos={pos} max_new={max_new}");
+                }
+                let step_t0 = std::time::Instant::now();
+                let _timeline_step = if pos + 1 >= prompt.len() {
+                    infr_core::timeline::begin_step(&[pos])
+                } else {
+                    None
+                };
+                let tok = cur[pos] as usize;
+                let image_row = mm.and_then(|plan| {
+                    plan.spans.iter().find_map(|span| {
+                        (pos >= span.start && pos < span.start + span.n_tokens)
+                            .then_some((&span.embeds, (pos - span.start) * ne))
+                    })
+                });
+                let gpu_embed_tok = gpu_embed && image_row.is_none();
+                // The 4-byte token id, uploaded whenever the graph declared the ids Input: for the embed
+                // gather (`gpu_embed`), and for a deepseek4 hash-routed layer's `ffn_gate_tid2eid`
+                // selection gather (`hash_ids`), which needs it independently of how the embedding was
+                // produced. Not a round trip — this is the id the host already fed this step.
+                if gpu_embed_tok || hash_ids {
+                    be.upload(dec_ids_buf.as_ref(), bytemuck::cast_slice(&[tok as i32]))
+                        .map_err(|e| anyhow!("{e}"))?;
+                }
+                if !gpu_embed_tok {
+                    // Host embed (gemma scales by √n_embd; qwen3/llama identity). At the identity scale the
+                    // table slice is already the row to upload — hand it straight to the backend rather
+                    // than allocating a throwaway `Vec<f32>` per token to copy it.
+                    let table = token_embd.get()?;
+                    let row = match image_row {
+                        Some((embeds, offset)) => &embeds[offset..offset + ne],
+                        None => &table[tok * ne..tok * ne + ne],
+                    };
+                    if embed_scale == 1.0 {
+                        be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(row))
+                            .map_err(|e| anyhow!("{e}"))?;
+                    } else {
+                        let emb: Vec<f32> = row.iter().map(|&x| x * embed_scale).collect();
+                        be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(&emb))
+                            .map_err(|e| anyhow!("{e}"))?;
+                    }
+                }
+                let rope_pos = mrope_positions
+                    .as_deref()
+                    .map_or(pos as i32, |table| table[pos * 4]);
+                be.upload(pos_buf.as_ref(), bytemuck::cast_slice(&[rope_pos]))
+                    .map_err(|e| anyhow!("{e}"))?;
+                if let (Some(plan), Some(buffer)) = (mm, &pos4_buf) {
+                    let row: [i32; 4] = if pos < prompt.len() {
+                        plan.prompt_pos4[pos * 4..pos * 4 + 4]
+                            .try_into()
+                            .expect("validated multimodal prompt position row")
+                    } else {
+                        let delta = i32::try_from(pos - prompt.len())
+                            .map_err(|_| anyhow!("multimodal decode position exceeds i32"))?;
+                        let value = plan
+                            .decode_base
+                            .checked_add(delta)
+                            .ok_or_else(|| anyhow!("multimodal decode position overflow"))?;
+                        [value, value, value, 0]
+                    };
+                    be.upload(buffer.as_ref(), bytemuck::cast_slice(&row))
+                        .map_err(|e| anyhow!("{e}"))?;
+                }
+
+                // gemma4 E2B host ipl path: this token's per-layer TOKEN embedding row (gather+dequant
+                // only). `ipl_buf` is None under `gpu_ple` — the graph gathers on-device.
+                if let (Some(ple), Some(ipl_buf)) = (ple, &ipl_buf) {
+                    let ipl = e2b_ipl_rows(g, ple, &[tok as u32])?;
+                    be.upload(ipl_buf.as_ref(), bytemuck::cast_slice(&ipl))
+                        .map_err(|e| anyhow!("{e}"))?;
+                }
+
+                // Only sample once we're past the prompt (decode position = last prompt token onward).
+                let is_decode = pos + 1 >= prompt.len();
+                // GPU stochastic sampling: draw this step's uniform from the SAME xorshift stream the
+                // host sampler would consume. Record-once (`ro.is_some()`, `RopeMode::Dynamic`) seeds the
+                // ring slot `pos & 63` — the in-graph `Op::Sample` reads `u_buf[params[0] & 63]`, matching
+                // the chained fast-path's geometry above, since this iteration's dispatch advances
+                // `params[0]` to `pos` whether it's replayed singly here or folded into an
+                // `execute_chain` chunk (see `Recorder::sample_topk_chain`). The classic per-execute
+                // rebuild (`ro` is `None`, `RopeMode::Static`) has no ring — its kernel always reads
+                // `u_buf[0]`, so pin the write there. Only frontier rows sample, matching the host path's
+                // rng consumption exactly.
+                if gpu_sample && is_decode && pos + 1 == cur.len() {
+                    let slot = if ro.is_some() { pos & 63 } else { 0 };
+                    u_ring_host[slot] = crate::sampling::next_uniform(&mut rng);
                     be.upload(u_buf.as_ref(), bytemuck::cast_slice(&u_ring_host))
                         .map_err(|e| anyhow!("{e}"))?;
                 }
-                let (plan, b) = ro.as_ref().expect("can_chain implies record-once");
-                if let Some(ids) = be
-                    .execute_chain(plan.as_ref(), b, n)
-                    .map_err(|e| anyhow!("{e}"))?
-                {
-                    let mut stop = false;
-                    let mut fed = 0usize;
-                    for &id in &ids {
-                        out.push(id);
-                        decode_n += 1;
-                        fed += 1;
-                        let is_eos = !ignore_eos && (c.eos_ids.contains(&id) || id == c.eos);
-                        if is_eos {
-                            stop = true;
-                            break;
-                        }
-                        on_token(id);
-                        cur.push(id);
-                        // `abort_requested` was NOT polled here before (pre-existing bug, reported):
-                        // the chained path is the DEFAULT decode fast path (greedy + gpu_embed), so
-                        // an `infr serve` request with a `stop` sequence kept generating all the way
-                        // to `max_tokens` after its stop had already fired. The client's TEXT was
-                        // right (StopMatcher suppresses emission after a hit) but the server burned
-                        // the whole budget on tokens nobody would ever see — and, now, held a slot
-                        // other requests were queued behind. Same shape as the EOS/max_new checks.
-                        if out.len() >= max_new || crate::sampling::abort_requested(req) {
-                            stop = true;
-                            break;
-                        }
+                // Sample only at the FRONTIER (this position's token is the newest one fed). A constrained
+                // step can emit several deterministically-forced tokens at once — they're queued onto
+                // `cur` and the following iterations just feed them (no sampling) until the frontier.
+                let at_frontier = pos + 1 == cur.len();
+                if is_decode && at_frontier {
+                    if let Some(buffers) = gpu_penalty_buffers.as_ref() {
+                        buffers.upload(
+                            be,
+                            std::iter::once(GpuPenaltyBuffers::control_row(
+                                penalties.as_ref(),
+                                penalty_previous,
+                                0,
+                            )),
+                        )?;
                     }
-                    decode_t += step_t0.elapsed();
-                    // The chain fed positions `pos..pos+fed-1` with kept tokens (`cur[pos]` then
-                    // each accepted sampled id); the final sampled id was pushed but never fed, so
-                    // its row isn't written — `pos + fed - 1` is the last materialized position.
-                    // Matches the old `prompt ++ out[..out.len()-1]` teardown on every chain case.
-                    if fed > 0 {
-                        last_written = Some(pos + fed - 1);
-                    }
-                    report_progress(infr_core::GenerationPhase::Decode, prompt_work, decode_n);
-                    if stop {
-                        break;
-                    }
-                    pos += fed;
-                    continue;
                 }
-                // Backend declined (e.g. adapter fell back to static) — per-token path below.
-            }
-        }
-        // Sample only after prefill, at a drained single-sequence decode boundary.
-        if profile_single && pos + 1 >= prompt.len() && decode_profile_before.is_none() {
-            decode_profile_before = Some((
-                infr_core::pager_profile::snapshot(),
-                infr_core::pager_profile::device_timeline_snapshot(),
-                infr_core::pager_profile::paged_moe_layer_snapshot(),
-            ));
-            tracing::info!("[single-decode-begin] pos={pos} max_new={max_new}");
-        }
-        let step_t0 = std::time::Instant::now();
-        let _timeline_step = if pos + 1 >= prompt.len() {
-            infr_core::timeline::begin_step(&[pos])
-        } else {
-            None
-        };
-        let tok = cur[pos] as usize;
-        let image_row = mm.and_then(|plan| {
-            plan.spans.iter().find_map(|span| {
-                (pos >= span.start && pos < span.start + span.n_tokens)
-                    .then_some((&span.embeds, (pos - span.start) * ne))
-            })
-        });
-        let gpu_embed_tok = gpu_embed && image_row.is_none();
-        // The 4-byte token id, uploaded whenever the graph declared the ids Input: for the embed
-        // gather (`gpu_embed`), and for a deepseek4 hash-routed layer's `ffn_gate_tid2eid`
-        // selection gather (`hash_ids`), which needs it independently of how the embedding was
-        // produced. Not a round trip — this is the id the host already fed this step.
-        if gpu_embed_tok || hash_ids {
-            be.upload(dec_ids_buf.as_ref(), bytemuck::cast_slice(&[tok as i32]))
-                .map_err(|e| anyhow!("{e}"))?;
-        }
-        if !gpu_embed_tok {
-            // Host embed (gemma scales by √n_embd; qwen3/llama identity). At the identity scale the
-            // table slice is already the row to upload — hand it straight to the backend rather
-            // than allocating a throwaway `Vec<f32>` per token to copy it.
-            let table = token_embd.get()?;
-            let row = match image_row {
-                Some((embeds, offset)) => &embeds[offset..offset + ne],
-                None => &table[tok * ne..tok * ne + ne],
-            };
-            if embed_scale == 1.0 {
-                be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(row))
-                    .map_err(|e| anyhow!("{e}"))?;
-            } else {
-                let emb: Vec<f32> = row.iter().map(|&x| x * embed_scale).collect();
-                be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(&emb))
-                    .map_err(|e| anyhow!("{e}"))?;
-            }
-        }
-        let rope_pos = mrope_positions
-            .as_deref()
-            .map_or(pos as i32, |table| table[pos * 4]);
-        be.upload(pos_buf.as_ref(), bytemuck::cast_slice(&[rope_pos]))
-            .map_err(|e| anyhow!("{e}"))?;
-        if let (Some(plan), Some(buffer)) = (mm, &pos4_buf) {
-            let row: [i32; 4] = if pos < prompt.len() {
-                plan.prompt_pos4[pos * 4..pos * 4 + 4]
-                    .try_into()
-                    .expect("validated multimodal prompt position row")
-            } else {
-                let delta = i32::try_from(pos - prompt.len())
-                    .map_err(|_| anyhow!("multimodal decode position exceeds i32"))?;
-                let value = plan
-                    .decode_base
-                    .checked_add(delta)
-                    .ok_or_else(|| anyhow!("multimodal decode position overflow"))?;
-                [value, value, value, 0]
-            };
-            be.upload(buffer.as_ref(), bytemuck::cast_slice(&row))
-                .map_err(|e| anyhow!("{e}"))?;
-        }
-
-        // gemma4 E2B host ipl path: this token's per-layer TOKEN embedding row (gather+dequant
-        // only). `ipl_buf` is None under `gpu_ple` — the graph gathers on-device.
-        if let (Some(ple), Some(ipl_buf)) = (ple, &ipl_buf) {
-            let ipl = e2b_ipl_rows(g, ple, &[tok as u32])?;
-            be.upload(ipl_buf.as_ref(), bytemuck::cast_slice(&ipl))
-                .map_err(|e| anyhow!("{e}"))?;
-        }
-
-        // Only sample once we're past the prompt (decode position = last prompt token onward).
-        let is_decode = pos + 1 >= prompt.len();
-        // GPU stochastic sampling: draw this step's uniform from the SAME xorshift stream the
-        // host sampler would consume. Record-once (`ro.is_some()`, `RopeMode::Dynamic`) seeds the
-        // ring slot `pos & 63` — the in-graph `Op::Sample` reads `u_buf[params[0] & 63]`, matching
-        // the chained fast-path's geometry above, since this iteration's dispatch advances
-        // `params[0]` to `pos` whether it's replayed singly here or folded into an
-        // `execute_chain` chunk (see `Recorder::sample_topk_chain`). The classic per-execute
-        // rebuild (`ro` is `None`, `RopeMode::Static`) has no ring — its kernel always reads
-        // `u_buf[0]`, so pin the write there. Only frontier rows sample, matching the host path's
-        // rng consumption exactly.
-        if gpu_sample && is_decode && pos + 1 == cur.len() {
-            let slot = if ro.is_some() { pos & 63 } else { 0 };
-            u_ring_host[slot] = crate::sampling::next_uniform(&mut rng);
-            be.upload(u_buf.as_ref(), bytemuck::cast_slice(&u_ring_host))
-                .map_err(|e| anyhow!("{e}"))?;
-        }
-        // Sample only at the FRONTIER (this position's token is the newest one fed). A constrained
-        // step can emit several deterministically-forced tokens at once — they're queued onto
-        // `cur` and the following iterations just feed them (no sampling) until the frontier.
-        let at_frontier = pos + 1 == cur.len();
-        if is_decode && at_frontier {
-            if let Some(buffers) = gpu_penalty_buffers.as_ref() {
-                buffers.upload(
-                    be,
-                    std::iter::once(GpuPenaltyBuffers::control_row(
-                        penalties.as_ref(),
-                        penalty_previous,
-                        0,
-                    )),
-                )?;
-            }
-        }
-        // MTP Phase 1 h-tap (issue #33): only the frontier row is ever sampled/downloaded as
-        // logits — same row `h_out` (when requested) captures. `dyn_replay` already excludes
-        // `h_out.is_some()` (see its doc), so this is always the rebuild (`else`) branch below.
-        let want_h = h_out.is_some() && is_decode && at_frontier;
-        let h_width = ne * if c.qwen4exp { c.hc_mult } else { 1 };
-        let h_tap_buf = if want_h {
-            Some(
-                be.alloc(h_width * 4, BufferUsage::Staging)
-                    .map_err(|e| anyhow!("{e}"))?,
-            )
-        } else {
-            None
-        };
-        let t_setup = std::time::Instant::now();
-        let (setup_el, exec_el);
-        let mut layer0_el = std::time::Duration::ZERO;
-        let mut ple_el = std::time::Duration::ZERO;
-        if let Some((plan, b)) = &ro {
-            // Record-once path: reuse the single compiled plan + bindings (no per-token rebuild).
-            setup_el = t_setup.elapsed();
-            let t_exec = std::time::Instant::now();
-            be.execute(plan.as_ref(), b).map_err(|e| anyhow!("{e}"))?;
-            exec_el = t_exec.elapsed();
-        } else if c.qwen4exp {
-            // Start the mmap/SSD PLE gather before layer 0. The first GPU plan initializes the
-            // four-stream residual and executes layer 0 while this CPU worker hashes/dequants the
-            // 16 selected rows; the second plan starts at the PLE-bearing layer 1.
-            let ticket = ple_worker
-                .as_ref()
-                .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?
-                .submit(&cur, pos, c.ple_ngram_size)?;
-
-            let (g0, h0) = build(
-                1,
-                pos,
-                0,
-                false,
-                None,
-                false,
-                false,
-                false,
-                false,
-                gpu_embed_tok,
-                false,
-                false,
-                None,
-                Some(0..1),
-            );
-            let plan0 = be.compile(&g0).map_err(|e| anyhow!("{e}"))?;
-            let mut b0 = Bindings::new();
-            if let Some(ids) = h0.tok_ids {
-                b0.bind(ids, dec_ids_buf.as_ref());
-            }
-            // A partial span exposes hidden as an Input even when EmbedGather writes it.
-            b0.bind(h0.hidden, hidden_buf.as_ref());
-            b0.bind(h0.positions, pos_buf.as_ref());
-            if let (Some(id), Some(buf)) = (h0.positions4, &pos4_buf) {
-                b0.bind(id, buf.as_ref());
-            }
-            bind_layer_io(
-                &mut b0,
-                &h0,
-                c.n_layer,
-                rf_buf,
-                yff_buf,
-                &kbufs[..],
-                &vbufs[..],
-                &qsa_kbufs[..],
-                &qsa_cbufs[..],
-                &mrope_history_buf,
-                &wbufs[..],
-                qwen_wide_buf,
-                ple_embd_buf,
-                ple_state_buf,
-            );
-            let mut setup_total = t_setup.elapsed();
-            let t_exec0 = std::time::Instant::now();
-            be.execute(plan0.as_ref(), &b0)
-                .map_err(|e| anyhow!("{e}"))?;
-            let exec0 = t_exec0.elapsed();
-            layer0_el = exec0;
-
-            let t_setup1 = std::time::Instant::now();
-            let ple_rows = ticket.wait()?;
-            let ple_buf = ple_embd_buf
-                .as_ref()
-                .ok_or_else(|| anyhow!("qwen4exp session has no PLE staging buffer"))?;
-            if ple_rows.len() * 4 != ple_buf.len_bytes() {
-                return Err(anyhow!(
-                    "qwen4exp PLE worker produced {} bytes, staging buffer has {}",
-                    ple_rows.len() * 4,
-                    ple_buf.len_bytes()
-                ));
-            }
-            let upload_t0 = infr_core::pager_profile::start();
-            be.upload(ple_buf.as_ref(), bytemuck::cast_slice(ple_rows.as_slice()))
-                .map_err(|e| anyhow!("{e}"))?;
-            if let Some(elapsed) = infr_core::pager_profile::elapsed(upload_t0) {
-                infr_core::pager_profile::record_ple_upload(ple_rows.len() * 4, elapsed);
-            }
-            if profile_single {
-                ple_el = t_setup1.elapsed();
-            }
-
-            let (g1, h1) = build(
-                1,
-                pos,
-                1,
-                false,
-                None,
-                false,
-                want_h,
-                gpu_argmax,
-                gpu_sample,
-                false,
-                false,
-                false,
-                None,
-                Some(1..c.n_layer),
-            );
-            let plan1 = be.compile(&g1).map_err(|e| anyhow!("{e}"))?;
-            let mut b1 = Bindings::new();
-            b1.bind(h1.hidden, hidden_buf.as_ref());
-            b1.bind(h1.positions, pos_buf.as_ref());
-            if let (Some(id), Some(buf)) = (h1.positions4, &pos4_buf) {
-                b1.bind(id, buf.as_ref());
-            }
-            bind_layer_io(
-                &mut b1,
-                &h1,
-                c.n_layer,
-                rf_buf,
-                yff_buf,
-                &kbufs[..],
-                &vbufs[..],
-                &qsa_kbufs[..],
-                &qsa_cbufs[..],
-                &mrope_history_buf,
-                &wbufs[..],
-                qwen_wide_buf,
-                ple_embd_buf,
-                ple_state_buf,
-            );
-            b1.bind(
-                h1.logits.expect("qwen4exp tail build has logits"),
-                logits_buf.as_ref(),
-            );
-            if let Some(tid) = h1.tok_id {
-                b1.bind(tid, id_out);
-            }
-            if let Some(uin) = h1.u_in {
-                b1.bind(uin, u_buf.as_ref());
-            }
-            if let Some(buffers) = gpu_penalty_buffers.as_ref() {
-                buffers.bind(&mut b1, &h1);
-            }
-            if let (Some(ho), Some(hb)) = (h1.h_out, &h_tap_buf) {
-                b1.bind(ho, hb.as_ref());
-            }
-            setup_total += t_setup1.elapsed();
-            let t_exec1 = std::time::Instant::now();
-            be.execute(plan1.as_ref(), &b1)
-                .map_err(|e| anyhow!("{e}"))?;
-            setup_el = setup_total;
-            exec_el = exec0 + t_exec1.elapsed();
-        } else {
-            let (g, h) = build(
-                1, pos, 1, false, None, false, want_h, gpu_argmax, gpu_sample, gpu_embed,
-                false, // mtp_verify: ordinary per-token decode, not MTP verify
-                false, // independent_rows: ordinary single-session decode
-                None,  // independent spans
-                None,  // span: the whole model in one graph
-            );
-            let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
-            let mut b = Bindings::new();
-            bind_step_input(
-                &mut b,
-                &h,
-                gpu_embed,
-                dec_ids_buf.as_ref(),
-                hidden_buf.as_ref(),
-            );
-            b.bind(h.positions, pos_buf.as_ref());
-            if let (Some(pid), Some(ib)) = (h.pl_tok_in, &ipl_buf) {
-                b.bind(pid, ib.as_ref());
-            }
-            bind_layer_io(
-                &mut b,
-                &h,
-                c.n_layer,
-                rf_buf,
-                yff_buf,
-                &kbufs[..],
-                &vbufs[..],
-                &qsa_kbufs[..],
-                &qsa_cbufs[..],
-                &mrope_history_buf,
-                &wbufs[..],
-                qwen_wide_buf,
-                ple_embd_buf,
-                ple_state_buf,
-            );
-            b.bind(
-                h.logits.expect("decode build has logits"),
-                logits_buf.as_ref(),
-            );
-            if let Some(tid) = h.tok_id {
-                b.bind(tid, id_out);
-            }
-            if let Some(uin) = h.u_in {
-                b.bind(uin, u_buf.as_ref());
-            }
-            if let Some(buffers) = gpu_penalty_buffers.as_ref() {
-                buffers.bind(&mut b, &h);
-            }
-            if let (Some(ho), Some(hb)) = (h.h_out, &h_tap_buf) {
-                b.bind(ho, hb.as_ref());
-            }
-            setup_el = t_setup.elapsed();
-            let t_exec = std::time::Instant::now();
-            be.execute(plan.as_ref(), &b).map_err(|e| anyhow!("{e}"))?;
-            exec_el = t_exec.elapsed();
-        }
-        if pos < prompt.len() {
-            if let Some(sink) = mtp_prefill_sink.as_deref_mut() {
-                let target_hidden = qwen_wide_buf
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("MTP Prefill tap requires Qwen3.8 wide residual"))?;
-                sink.consume(
-                    be,
-                    &cur[pos..pos + 1],
-                    target_hidden,
+                // MTP Phase 1 h-tap (issue #33): only the frontier row is ever sampled/downloaded as
+                // logits — same row `h_out` (when requested) captures. `dyn_replay` already excludes
+                // `h_out.is_some()` (see its doc), so this is always the rebuild (`else`) branch below.
+                let want_h = h_out.is_some() && is_decode && at_frontier;
+                let h_width = ne * if c.qwen4exp { c.hc_mult } else { 1 };
+                let h_tap_buf = if want_h {
+                    Some(
+                        be.alloc(h_width * 4, BufferUsage::Staging)
+                            .map_err(|e| anyhow!("{e}"))?,
+                    )
+                } else {
+                    None
+                };
+                let t_setup = std::time::Instant::now();
+                let (setup_el, exec_el);
+                let mut layer0_el = std::time::Duration::ZERO;
+                let mut ple_el = std::time::Duration::ZERO;
+                // Preserve the PLE handoff: submit before waiting for plans or executing layer 0.
+                let ple_ticket = if ro.is_none() && c.qwen4exp {
+                    Some(
+                        ple_worker
+                            .as_ref()
+                            .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?
+                            .submit(&cur, pos, c.ple_ngram_size)?,
+                    )
+                } else {
+                    None
+                };
+                let shape = Shape {
                     pos,
-                    mm,
-                    (
-                        (
-                            wbufs[mtp_token_embd_index].as_ref(),
-                            wspecs[mtp_token_embd_index].0,
-                            wspecs[mtp_token_embd_index].1,
-                        ),
-                        (
-                            wbufs[mtp_lm_head_index].as_ref(),
-                            wspecs[mtp_lm_head_index].0,
-                            wspecs[mtp_lm_head_index].1,
-                        ),
-                    ),
-                )?;
-            }
-        }
-        // This step wrote `cur[pos]`'s KV row (a prompt token, a fed generated token, or a fed
-        // grammar-forced token — all kept). The final sampled token and any forced tokens queued
-        // past the frontier are pushed AFTER this and never re-enter the loop, so they stay
-        // excluded from `last_written` — the fix for the `max_new==0` frontier and the
-        // constrained-break unfed-forced-token cache-corruption cases.
-        last_written = Some(pos);
-        for (index, boundary) in turn_checkpoint_boundaries.iter().enumerate() {
-            if Some(pos + 1) == *boundary {
-                if let Some(ck) = turn_recurrent_ckpts[index].as_mut() {
-                    ck.snapshot_all(be, &kbufs[..], &vbufs[..], ple_state_buf.as_deref())?;
+                    gpu_embed_tok,
+                    want_h,
+                };
+                let mut prepared = if let Some(step) = pipeline.pending_step() {
+                    let _wait = infr_core::timeline::span("decode_prepare_wait");
+                    // A forced span can change the frontier/head-tap shape. Discard even an error for
+                    // that unused shape; only a matching candidate's error belongs to this step.
+                    shape.select(pipeline.take(step)?).transpose()?
+                } else {
+                    None
+                };
+                let next_shape = if pipeline.is_async() && ro.is_none() && is_decode {
+                    let next_is_image = mm.is_some_and(|plan| {
+                        plan.spans.iter().any(|span| {
+                            pos + 1 >= span.start && pos + 1 < span.start + span.n_tokens
+                        })
+                    });
+                    Shape::next(
+                        pos,
+                        prompt.len(),
+                        end,
+                        max_new.saturating_sub(out.len()),
+                        cur.len(),
+                        gpu_embed && !next_is_image,
+                        h_out.is_some() && !want_h,
+                    )
+                } else {
+                    None
+                };
+                if let Some((plan, b)) = &ro {
+                    // Record-once path: reuse the single compiled plan + bindings (no per-token rebuild).
+                    setup_el = t_setup.elapsed();
+                    let t_exec = std::time::Instant::now();
+                    be.execute(plan.as_ref(), b).map_err(|e| anyhow!("{e}"))?;
+                    exec_el = t_exec.elapsed();
+                } else if c.qwen4exp {
+                    // Start the mmap/SSD PLE gather before layer 0. The first GPU plan initializes the
+                    // four-stream residual and executes layer 0 while this CPU worker hashes/dequants the
+                    // 16 selected rows; the second plan starts at the PLE-bearing layer 1.
+                    let (plan0, h0) = match prepared.as_mut().and_then(|plans| plans.first.take()) {
+                        Some(first) => first,
+                        None => prepare_decode_plan(shape, true)?,
+                    };
+                    let mut b0 = Bindings::new();
+                    if let Some(ids) = h0.tok_ids {
+                        b0.bind(ids, dec_ids_buf.as_ref());
+                    }
+                    // A partial span exposes hidden as an Input even when EmbedGather writes it.
+                    b0.bind(h0.hidden, hidden_buf.as_ref());
+                    b0.bind(h0.positions, pos_buf.as_ref());
+                    if let (Some(id), Some(buf)) = (h0.positions4, &pos4_buf) {
+                        b0.bind(id, buf.as_ref());
+                    }
+                    bind_layer_io(
+                        &mut b0,
+                        &h0,
+                        c.n_layer,
+                        rf_buf,
+                        yff_buf,
+                        &kbufs[..],
+                        &vbufs[..],
+                        &qsa_kbufs[..],
+                        &qsa_cbufs[..],
+                        &mrope_history_buf,
+                        &wbufs[..],
+                        qwen_wide_buf,
+                        ple_embd_buf,
+                        ple_state_buf,
+                    );
+                    let mut setup_total = t_setup.elapsed();
+                    if let Some(next) = next_shape {
+                        pipeline.schedule(next.pos, (next, infr_core::timeline::context()))?;
+                    }
+                    let t_exec0 = std::time::Instant::now();
+                    be.execute(plan0.as_ref(), &b0)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    let exec0 = t_exec0.elapsed();
+                    layer0_el = exec0;
+
+                    let t_setup1 = std::time::Instant::now();
+                    let ple_rows = ple_ticket.expect("qwen4exp submitted PLE gather").wait()?;
+                    let ple_buf = ple_embd_buf
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("qwen4exp session has no PLE staging buffer"))?;
+                    if ple_rows.len() * 4 != ple_buf.len_bytes() {
+                        return Err(anyhow!(
+                            "qwen4exp PLE worker produced {} bytes, staging buffer has {}",
+                            ple_rows.len() * 4,
+                            ple_buf.len_bytes()
+                        ));
+                    }
+                    let upload_t0 = infr_core::pager_profile::start();
+                    be.upload(ple_buf.as_ref(), bytemuck::cast_slice(ple_rows.as_slice()))
+                        .map_err(|e| anyhow!("{e}"))?;
+                    if let Some(elapsed) = infr_core::pager_profile::elapsed(upload_t0) {
+                        infr_core::pager_profile::record_ple_upload(ple_rows.len() * 4, elapsed);
+                    }
+                    if profile_single {
+                        ple_el = t_setup1.elapsed();
+                    }
+
+                    let (plan1, h1) = match prepared.take() {
+                        Some(plans) => plans.main,
+                        None => prepare_decode_plan(shape, false)?,
+                    };
+                    let mut b1 = Bindings::new();
+                    b1.bind(h1.hidden, hidden_buf.as_ref());
+                    b1.bind(h1.positions, pos_buf.as_ref());
+                    if let (Some(id), Some(buf)) = (h1.positions4, &pos4_buf) {
+                        b1.bind(id, buf.as_ref());
+                    }
+                    bind_layer_io(
+                        &mut b1,
+                        &h1,
+                        c.n_layer,
+                        rf_buf,
+                        yff_buf,
+                        &kbufs[..],
+                        &vbufs[..],
+                        &qsa_kbufs[..],
+                        &qsa_cbufs[..],
+                        &mrope_history_buf,
+                        &wbufs[..],
+                        qwen_wide_buf,
+                        ple_embd_buf,
+                        ple_state_buf,
+                    );
+                    b1.bind(
+                        h1.logits.expect("qwen4exp tail build has logits"),
+                        logits_buf.as_ref(),
+                    );
+                    if let Some(tid) = h1.tok_id {
+                        b1.bind(tid, id_out);
+                    }
+                    if let Some(uin) = h1.u_in {
+                        b1.bind(uin, u_buf.as_ref());
+                    }
+                    if let Some(buffers) = gpu_penalty_buffers.as_ref() {
+                        buffers.bind(&mut b1, &h1);
+                    }
+                    if let (Some(ho), Some(hb)) = (h1.h_out, &h_tap_buf) {
+                        b1.bind(ho, hb.as_ref());
+                    }
+                    setup_total += t_setup1.elapsed();
+                    let t_exec1 = std::time::Instant::now();
+                    be.execute(plan1.as_ref(), &b1)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    setup_el = setup_total;
+                    exec_el = exec0 + t_exec1.elapsed();
+                } else {
+                    let (plan, h) = match prepared.take() {
+                        Some(plans) => plans.main,
+                        None => prepare_decode_plan(shape, false)?,
+                    };
+                    let mut b = Bindings::new();
+                    bind_step_input(
+                        &mut b,
+                        &h,
+                        gpu_embed_tok,
+                        dec_ids_buf.as_ref(),
+                        hidden_buf.as_ref(),
+                    );
+                    b.bind(h.positions, pos_buf.as_ref());
+                    if let (Some(pid), Some(ib)) = (h.pl_tok_in, &ipl_buf) {
+                        b.bind(pid, ib.as_ref());
+                    }
+                    bind_layer_io(
+                        &mut b,
+                        &h,
+                        c.n_layer,
+                        rf_buf,
+                        yff_buf,
+                        &kbufs[..],
+                        &vbufs[..],
+                        &qsa_kbufs[..],
+                        &qsa_cbufs[..],
+                        &mrope_history_buf,
+                        &wbufs[..],
+                        qwen_wide_buf,
+                        ple_embd_buf,
+                        ple_state_buf,
+                    );
+                    b.bind(
+                        h.logits.expect("decode build has logits"),
+                        logits_buf.as_ref(),
+                    );
+                    if let Some(tid) = h.tok_id {
+                        b.bind(tid, id_out);
+                    }
+                    if let Some(uin) = h.u_in {
+                        b.bind(uin, u_buf.as_ref());
+                    }
+                    if let Some(buffers) = gpu_penalty_buffers.as_ref() {
+                        buffers.bind(&mut b, &h);
+                    }
+                    if let (Some(ho), Some(hb)) = (h.h_out, &h_tap_buf) {
+                        b.bind(ho, hb.as_ref());
+                    }
+                    setup_el = t_setup.elapsed();
+                    if let Some(next) = next_shape {
+                        pipeline.schedule(next.pos, (next, infr_core::timeline::context()))?;
+                    }
+                    let t_exec = std::time::Instant::now();
+                    be.execute(plan.as_ref(), &b).map_err(|e| anyhow!("{e}"))?;
+                    exec_el = t_exec.elapsed();
                 }
-            }
-        }
-        if prof_dec && pos + 1 >= prompt.len() {
-            dec_setup += setup_el;
-            dec_exec += exec_el;
-            dec_layer0 += layer0_el;
-            dec_ple += ple_el;
-            if profile_single {
-                tracing::info!(
+                if pos < prompt.len() {
+                    if let Some(sink) = mtp_prefill_sink.as_deref_mut() {
+                        let target_hidden = qwen_wide_buf.as_deref().ok_or_else(|| {
+                            anyhow!("MTP Prefill tap requires Qwen3.8 wide residual")
+                        })?;
+                        sink.consume(
+                            be,
+                            &cur[pos..pos + 1],
+                            target_hidden,
+                            pos,
+                            mm,
+                            (
+                                (
+                                    wbufs[mtp_token_embd_index].as_ref(),
+                                    wspecs[mtp_token_embd_index].0,
+                                    wspecs[mtp_token_embd_index].1,
+                                ),
+                                (
+                                    wbufs[mtp_lm_head_index].as_ref(),
+                                    wspecs[mtp_lm_head_index].0,
+                                    wspecs[mtp_lm_head_index].1,
+                                ),
+                            ),
+                        )?;
+                    }
+                }
+                // This step wrote `cur[pos]`'s KV row (a prompt token, a fed generated token, or a fed
+                // grammar-forced token — all kept). The final sampled token and any forced tokens queued
+                // past the frontier are pushed AFTER this and never re-enter the loop, so they stay
+                // excluded from `last_written` — the fix for the `max_new==0` frontier and the
+                // constrained-break unfed-forced-token cache-corruption cases.
+                last_written = Some(pos);
+                for (index, boundary) in turn_checkpoint_boundaries.iter().enumerate() {
+                    if Some(pos + 1) == *boundary {
+                        if let Some(ck) = turn_recurrent_ckpts[index].as_mut() {
+                            ck.snapshot_all(be, &kbufs[..], &vbufs[..], ple_state_buf.as_deref())?;
+                        }
+                    }
+                }
+                if prof_dec && pos + 1 >= prompt.len() {
+                    dec_setup += setup_el;
+                    dec_exec += exec_el;
+                    dec_layer0 += layer0_el;
+                    dec_ple += ple_el;
+                    if profile_single {
+                        tracing::info!(
                     "[single-decode-forward] pos={pos} setup={:.3}ms exec={:.3}ms layer0={:.3}ms ple={:.3}ms",
                     setup_el.as_secs_f64() * 1e3,
                     exec_el.as_secs_f64() * 1e3,
                     layer0_el.as_secs_f64() * 1e3,
                     ple_el.as_secs_f64() * 1e3,
                 );
-            }
-        }
+                    }
+                }
 
-        if is_decode && at_frontier {
-            // GPU-sampled paths (argmax or stochastic): skip the [vocab] logits download
-            // entirely — the sampled id is read below (4 bytes). The one-time `logits_out` hook
-            // still wants the full row.
-            let mut have_frontier_logits = false;
-            if !(gpu_argmax || gpu_sample) || logits_out.is_some() {
-                be.download(logits_buf.as_ref(), bytemuck::cast_slice_mut(&mut logits))
-                    .map_err(|e| anyhow!("{e}"))?;
-                have_frontier_logits = true;
-                crate::sampling::ensure_finite_logits(&logits, "single-stream logits")?;
-            }
-            // Phase-1 DiffusionGemma validation hook (see the param doc): this is the FIRST
-            // is_decode row — the causal prefill's last-token logits — captured before sampling
-            // touches `logits` (grammar-constrained steps overwrite it in place below).
-            if let Some(out) = logits_out.take() {
-                *out = logits.clone();
-            }
-            // MTP Phase 1 h-tap (see `want_h` above): same row, one op earlier than `logits`.
-            if let (Some(out), Some(hb)) = (h_out.take(), &h_tap_buf) {
-                let mut hrow = vec![0f32; h_width];
-                be.download(hb.as_ref(), bytemuck::cast_slice_mut(&mut hrow))
-                    .map_err(|e| anyhow!("{e}"))?;
-                *out = hrow;
-            }
-            if let Some(cst) = constraint.as_deref_mut() {
-                if !ignore_eos {
-                    reasoning_eos_guard.mask_eos(c, &mut logits);
-                }
-                // Grammar-forced span (serve's tool_choice "required"/named): the shared
-                // llguidance step. Empty step ⇒ the constrained span ended.
-                let (step, done) = crate::grammar::constrained_step(
-                    cst,
-                    &mut logits,
-                    &c.eos_ids,
-                    sampler,
-                    &mut rng,
-                )
-                .map_err(|e| anyhow!("{e}"))?;
-                decode_t += step_t0.elapsed();
-                if step.is_empty() {
-                    break;
-                }
-                for &t in &step {
-                    out.push(t);
-                    on_token(t);
-                    cur.push(t);
-                    reasoning_eos_guard.observe(c, t);
-                    decode_n += 1;
-                }
-                report_progress(infr_core::GenerationPhase::Decode, prompt_work, decode_n);
-                if done || out.len() >= max_new || crate::sampling::abort_requested(req) {
-                    break;
-                }
-            } else {
-                let mut next = if gpu_argmax || gpu_sample {
-                    // Device-side sampling (Op::Argmax / Op::Sample): read back the 4-byte id.
-                    let mut idb = [0u8; 4];
-                    let readback_t0 = profile_single.then(std::time::Instant::now);
-                    be.download(id_out, &mut idb).map_err(|e| anyhow!("{e}"))?;
-                    if let Some(t0) = readback_t0 {
-                        dec_id_readback += t0.elapsed();
-                    }
-                    crate::sampling::ensure_sampled_token(
-                        u32::from_le_bytes(idb),
-                        c.vocab,
-                        "single-stream GPU sample",
-                    )?
-                } else {
-                    // Serve-only: repetition penalties patch the row in place (no-op allocation-wise
-                    // — `penalties` is `None` on every other path, so this is one branch per token).
-                    if let Some(p) = penalties.as_ref() {
-                        p.apply(&mut logits);
-                    }
-                    if !ignore_eos {
-                        reasoning_eos_guard.mask_eos(c, &mut logits);
-                    }
-                    crate::sampling::sample_logits(&logits, sampler, &mut rng)
-                };
-                if reasoning_eos_guard.blocks(c, next, ignore_eos) {
-                    if !have_frontier_logits {
+                if is_decode && at_frontier {
+                    // GPU-sampled paths (argmax or stochastic): skip the [vocab] logits download
+                    // entirely — the sampled id is read below (4 bytes). The one-time `logits_out` hook
+                    // still wants the full row.
+                    let mut have_frontier_logits = false;
+                    if !(gpu_argmax || gpu_sample) || logits_out.is_some() {
                         be.download(logits_buf.as_ref(), bytemuck::cast_slice_mut(&mut logits))
                             .map_err(|e| anyhow!("{e}"))?;
-                        crate::sampling::ensure_finite_logits(&logits, "single-stream EOS repair")?;
+                        have_frontier_logits = true;
+                        crate::sampling::ensure_finite_logits(&logits, "single-stream logits")?;
                     }
-                    reasoning_eos_guard.mask_eos(c, &mut logits);
-                    let blocked = next;
-                    next = crate::sampling::sample_logits(&logits, sampler, &mut rng);
-                    tracing::warn!(
-                        blocked_token = blocked,
-                        replacement_token = next,
-                        "Qwen3.8 suppressed premature EOS inside an open reasoning block"
+                    // Phase-1 DiffusionGemma validation hook (see the param doc): this is the FIRST
+                    // is_decode row — the causal prefill's last-token logits — captured before sampling
+                    // touches `logits` (grammar-constrained steps overwrite it in place below).
+                    if let Some(out) = logits_out.take() {
+                        *out = logits.clone();
+                    }
+                    // MTP Phase 1 h-tap (see `want_h` above): same row, one op earlier than `logits`.
+                    if let (Some(out), Some(hb)) = (h_out.take(), &h_tap_buf) {
+                        let mut hrow = vec![0f32; h_width];
+                        be.download(hb.as_ref(), bytemuck::cast_slice_mut(&mut hrow))
+                            .map_err(|e| anyhow!("{e}"))?;
+                        *out = hrow;
+                    }
+                    if let Some(cst) = constraint.as_deref_mut() {
+                        if !ignore_eos {
+                            reasoning_eos_guard.mask_eos(c, &mut logits);
+                        }
+                        // Grammar-forced span (serve's tool_choice "required"/named): the shared
+                        // llguidance step. Empty step ⇒ the constrained span ended.
+                        let (step, done) = crate::grammar::constrained_step(
+                            cst,
+                            &mut logits,
+                            &c.eos_ids,
+                            sampler,
+                            &mut rng,
+                        )
+                        .map_err(|e| anyhow!("{e}"))?;
+                        decode_t += step_t0.elapsed();
+                        if step.is_empty() {
+                            break;
+                        }
+                        for &t in &step {
+                            out.push(t);
+                            on_token(t);
+                            cur.push(t);
+                            reasoning_eos_guard.observe(c, t);
+                            decode_n += 1;
+                        }
+                        report_progress(infr_core::GenerationPhase::Decode, prompt_work, decode_n);
+                        if done || out.len() >= max_new || crate::sampling::abort_requested(req) {
+                            break;
+                        }
+                    } else {
+                        let mut next = if gpu_argmax || gpu_sample {
+                            // Device-side sampling (Op::Argmax / Op::Sample): read back the 4-byte id.
+                            let mut idb = [0u8; 4];
+                            let readback_t0 = profile_single.then(std::time::Instant::now);
+                            be.download(id_out, &mut idb).map_err(|e| anyhow!("{e}"))?;
+                            if let Some(t0) = readback_t0 {
+                                dec_id_readback += t0.elapsed();
+                            }
+                            crate::sampling::ensure_sampled_token(
+                                u32::from_le_bytes(idb),
+                                c.vocab,
+                                "single-stream GPU sample",
+                            )?
+                        } else {
+                            // Serve-only: repetition penalties patch the row in place (no-op allocation-wise
+                            // — `penalties` is `None` on every other path, so this is one branch per token).
+                            if let Some(p) = penalties.as_ref() {
+                                p.apply(&mut logits);
+                            }
+                            if !ignore_eos {
+                                reasoning_eos_guard.mask_eos(c, &mut logits);
+                            }
+                            crate::sampling::sample_logits(&logits, sampler, &mut rng)
+                        };
+                        if reasoning_eos_guard.blocks(c, next, ignore_eos) {
+                            if !have_frontier_logits {
+                                be.download(
+                                    logits_buf.as_ref(),
+                                    bytemuck::cast_slice_mut(&mut logits),
+                                )
+                                .map_err(|e| anyhow!("{e}"))?;
+                                crate::sampling::ensure_finite_logits(
+                                    &logits,
+                                    "single-stream EOS repair",
+                                )?;
+                            }
+                            reasoning_eos_guard.mask_eos(c, &mut logits);
+                            let blocked = next;
+                            next = crate::sampling::sample_logits(&logits, sampler, &mut rng);
+                            tracing::warn!(
+                                blocked_token = blocked,
+                                replacement_token = next,
+                                "Qwen3.8 suppressed premature EOS inside an open reasoning block"
+                            );
+                        }
+                        if let Some(p) = penalties.as_mut() {
+                            p.observe(next);
+                        }
+                        penalty_previous = Some(next);
+                        reasoning_eos_guard.observe(c, next);
+                        let is_eos = !ignore_eos && (c.eos_ids.contains(&next) || next == c.eos);
+                        out.push(next);
+                        decode_t += step_t0.elapsed();
+                        decode_n += 1;
+                        report_progress(infr_core::GenerationPhase::Decode, prompt_work, decode_n);
+                        if !is_eos {
+                            on_token(next); // stream the token (EOS is not emitted)
+                        }
+                        // `on_token` -> the server's stop-sequence matcher may have latched an abort (a stop
+                        // string completed inside this token's text). One relaxed atomic load per token,
+                        // and not even that when `req` is None.
+                        if is_eos || out.len() >= max_new || crate::sampling::abort_requested(req) {
+                            break;
+                        }
+                        cur.push(next);
+                    }
+                } else if is_decode {
+                    // feeding a queued forced token — its KV write is the whole point of this step
+                    decode_t += step_t0.elapsed();
+                } else {
+                    prompt_t += step_t0.elapsed();
+                    report_progress(
+                        infr_core::GenerationPhase::Prefill,
+                        pos.saturating_add(1).saturating_sub(start),
+                        decode_n,
                     );
                 }
-                if let Some(p) = penalties.as_mut() {
-                    p.observe(next);
-                }
-                penalty_previous = Some(next);
-                reasoning_eos_guard.observe(c, next);
-                let is_eos = !ignore_eos && (c.eos_ids.contains(&next) || next == c.eos);
-                out.push(next);
-                decode_t += step_t0.elapsed();
-                decode_n += 1;
-                report_progress(infr_core::GenerationPhase::Decode, prompt_work, decode_n);
-                if !is_eos {
-                    on_token(next); // stream the token (EOS is not emitted)
-                }
-                // `on_token` -> the server's stop-sequence matcher may have latched an abort (a stop
-                // string completed inside this token's text). One relaxed atomic load per token,
-                // and not even that when `req` is None.
-                if is_eos || out.len() >= max_new || crate::sampling::abort_requested(req) {
-                    break;
-                }
-                cur.push(next);
+                pos += 1;
             }
-        } else if is_decode {
-            // feeding a queued forced token — its KV write is the whole point of this step
-            decode_t += step_t0.elapsed();
-        } else {
-            prompt_t += step_t0.elapsed();
-            report_progress(
-                infr_core::GenerationPhase::Prefill,
-                pos.saturating_add(1).saturating_sub(start),
-                decode_n,
-            );
-        }
-        pos += 1;
-    }
+            Ok(())
+        },
+    )?;
     // TEARDOWN IS GPU WORK TOO. The record-once replay plan owns a Vulkan command buffer, and
     // dropping it runs `RecordedCmd::drop` -> `vkQueueWaitIdle` + `vkFreeCommandBuffers`. Left to
     // fall out of scope at the end of this function it would do that OUTSIDE the baton — and N
@@ -13535,5 +13685,159 @@ mod tests {
     #[test]
     fn validate_token_ids_rejects_far_out_of_vocab() {
         assert!(validate_token_ids(&[u32::MAX], 100).is_err());
+    }
+}
+
+// Pure decisions shared by the ordinary serial loop and its model-free tests.
+mod serial_decode_preparation {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) struct Shape {
+        pub pos: usize,
+        pub gpu_embed_tok: bool,
+        pub want_h: bool,
+    }
+
+    impl Shape {
+        pub(super) fn next(
+            pos: usize,
+            prompt_len: usize,
+            end: usize,
+            remaining: usize,
+            cur_len: usize,
+            gpu_embed_tok: bool,
+            pending_h: bool,
+        ) -> Option<Self> {
+            let next = pos.checked_add(1)?;
+            let at_frontier = next == cur_len;
+            if next < prompt_len || next >= end || remaining <= usize::from(at_frontier) {
+                return None;
+            }
+            // Predict one new output at the frontier; queued forced tokens keep cur_len fixed.
+            // The main thread checks the real shape after sampling/ACK before using this plan.
+            let predicted_len = cur_len.checked_add(usize::from(at_frontier))?;
+            Some(Self {
+                pos: next,
+                gpu_embed_tok,
+                want_h: pending_h && next.checked_add(1)? == predicted_len,
+            })
+        }
+
+        pub(super) fn select<T>(self, (shape, candidate): (Self, T)) -> Option<T> {
+            (self == shape).then_some(candidate)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::Shape;
+
+        #[test]
+        fn next_shape_stays_in_decode_and_within_output_and_context_limits() {
+            assert_eq!(Shape::next(2, 4, 8, 4, 4, true, false), None);
+            assert_eq!(Shape::next(3, 4, 8, 0, 4, true, false), None);
+            assert_eq!(Shape::next(3, 4, 8, 1, 4, true, false), None);
+            assert_eq!(Shape::next(7, 4, 8, 4, 8, true, false), None);
+            assert_eq!(
+                Shape::next(usize::MAX, 4, usize::MAX, 4, 4, true, false),
+                None
+            );
+            assert_eq!(
+                Shape::next(3, 4, 8, 2, 4, true, false),
+                Some(Shape {
+                    pos: 4,
+                    gpu_embed_tok: true,
+                    want_h: false,
+                })
+            );
+        }
+
+        #[test]
+        fn forced_tokens_predict_frontier_without_consuming_another_output() {
+            assert_eq!(
+                Shape::next(3, 4, 9, 1, 6, false, true),
+                Some(Shape {
+                    pos: 4,
+                    gpu_embed_tok: false,
+                    want_h: false,
+                })
+            );
+            let frontier = Shape::next(4, 4, 9, 1, 6, false, true).unwrap();
+            assert_eq!(
+                frontier,
+                Shape {
+                    pos: 5,
+                    gpu_embed_tok: false,
+                    want_h: true
+                }
+            );
+            // A frontier tap is consumed by the current tail, before the next shape is used.
+            assert!(!Shape::next(5, 4, 9, 2, 6, false, false).unwrap().want_h);
+        }
+
+        #[test]
+        fn image_to_text_and_forced_shape_changes_reject_even_candidate_errors() {
+            let predicted = Shape::next(3, 4, 9, 3, 4, true, true).unwrap();
+            let actual = Shape {
+                want_h: false,
+                ..predicted
+            };
+            assert_eq!(
+                actual.select((predicted, Err::<(), _>("unused head tap"))),
+                None
+            );
+            let image = Shape {
+                gpu_embed_tok: false,
+                ..actual
+            };
+            assert_eq!(
+                actual.select((image, Err::<(), _>("unused image shape"))),
+                None
+            );
+            let wrong_pos = Shape {
+                pos: actual.pos + 1,
+                ..actual
+            };
+            assert_eq!(actual.select((wrong_pos, Ok::<_, &str>(()))), None);
+            assert_eq!(
+                actual.select((actual, Err::<(), _>("current shape"))),
+                Some(Err("current shape"))
+            );
+            assert_eq!(actual.select((actual, Ok::<_, &str>(7))), Some(Ok(7)));
+        }
+
+        #[test]
+        fn stop_eos_cancel_and_error_drain_unused_candidates_before_cache_teardown() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            // The stop reason is decided by the current tail, after scheduling. No next input
+            // is fed, and an unused preparation error must not change output or cached KV rows.
+            for reason in ["stop", "eos", "cancel", "error"] {
+                let drained = AtomicBool::new(false);
+                let mut last_written = Some(2);
+                let shape = Shape::next(3, 4, 8, 3, 4, true, false).unwrap();
+                let result = infr_core::step_pipeline::with_step_preparation(
+                    true,
+                    |next| {
+                        drained.store(true, Ordering::SeqCst);
+                        (next, Err::<(), _>("unused candidate"))
+                    },
+                    |pipeline| {
+                        pipeline.schedule(shape.pos, shape).unwrap();
+                        last_written = Some(3);
+                        if reason == "error" {
+                            Err(reason)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                );
+                assert_eq!(result.is_err(), reason == "error");
+                assert!(drained.load(Ordering::SeqCst));
+                assert_eq!(
+                    super::super::resident_after_gen(&[10, 11, 12, 13, 14], last_written),
+                    vec![10, 11, 12, 13]
+                );
+            }
+        }
     }
 }

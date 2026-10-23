@@ -32,6 +32,7 @@ pub mod prof;
 pub mod progress;
 pub mod resource;
 pub mod shutdown;
+pub mod step_pipeline;
 pub mod tensor;
 pub mod test_resource;
 pub mod tier;
