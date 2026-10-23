@@ -539,6 +539,8 @@ cfg_struct! {
         /// row directly from QkNormRope's LDS into the planar Q8 cache. Disabling it restores the
         /// f16 scratch write followed by the standalone Q8 quantization dispatch.
         q8_kv_write_fusion: bool = false,
+        /// Bounded static segmented Q8 K norm/RoPE+write. Flat replay remains independently off.
+        q8_kv_write_segmented: bool = true,
         /// `INFR_NO_Q8_PV_F16` (inverted) — use packed fp16 only for Q8 V dequantization before
         /// converting back to fp32; softmax weighting and P.V accumulation remain fp32.
         q8_pv_f16: bool = true,

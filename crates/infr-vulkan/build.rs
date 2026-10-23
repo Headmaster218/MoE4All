@@ -1445,6 +1445,16 @@ fn main() {
         ),
         ("qk_norm_rope", "qk_norm_rope_bda", &["-DKV_BDA"]),
         (
+            "qk_norm_rope_q8_segmented",
+            "qk_norm_rope_q8_segmented_q8",
+            &["-DDIRECT_Q8"],
+        ),
+        (
+            "qk_norm_rope_q8_segmented",
+            "qk_norm_rope_q8_segmented_mrope_q8",
+            &["-DMROPE", "-DDIRECT_Q8"],
+        ),
+        (
             "qk_norm_rope",
             "qk_norm_rope_seg",
             &["-DKV_BDA", "-DKV_SEGMENTED"],

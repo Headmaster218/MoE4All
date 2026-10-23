@@ -2399,6 +2399,20 @@ fn validate_q8_linear_pair(
 }
 
 #[derive(Clone, Copy)]
+struct Q8SegmentedWrite {
+    x: TensorId,
+    weight: TensorId,
+    positions: TensorId,
+    cache: TensorId,
+    rows: u32,
+    rope_dim: u32,
+    theta: f32,
+    eps: f32,
+    pos: u32,
+    sections: Option<[u32; 4]>,
+}
+
+#[derive(Clone, Copy)]
 struct PleGateNormPair {
     key: TensorId,
     query: TensorId,
@@ -2606,6 +2620,420 @@ fn ple_gate_norm_pair(
     ple_gate_norm_buffers(graph, idx, pair, scratch, bindings).then_some(pair)
 }
 
+fn q8_segmented_required_segments(rows: u32, pos: u32, cap: usize) -> Option<usize> {
+    let end = pos.checked_add(rows)?;
+    if !(1..=129).contains(&rows)
+        || cap % 512 != 0
+        || end as usize > cap / 512
+        || u64::from(end) * 512 > u64::from(u32::MAX)
+    {
+        return None;
+    }
+    Some((end as usize).div_ceil(32768))
+}
+
+/// Classify one precomputed first observer, without rescanning/allocating operand Vecs per pair.
+fn q8_segmented_value_peer(graph: &Graph, observer: usize, cache: TensorId) -> Option<TensorId> {
+    match &graph.ops[observer] {
+        Op::Attention {
+            k_cache,
+            v_cache,
+            n_kv: 2,
+            head_dim: 256,
+            ..
+        }
+        | Op::QsaBatchAttention {
+            k_cache,
+            v_cache,
+            n_kv: 2,
+            head_dim: 256,
+            ..
+        }
+        | Op::QsaGather {
+            k_cache,
+            v_cache,
+            row_elems: 512,
+            ..
+        } if *k_cache == cache
+            && *v_cache != cache
+            && graph.desc(*v_cache).dtype == infr_core::DType::Q8_0 =>
+        {
+            Some(*v_cache)
+        }
+        _ => None,
+    }
+}
+
+// O04 removes the F16 producer, so only a proved whole-tensor write kills its old value.
+// Keep this proof local: other fusion and scratch-reset policies have different contracts.
+fn q8_segmented_full_scratch_write(graph: &Graph, op: &Op, id: TensorId) -> bool {
+    let Some(elements) = graph
+        .desc(id)
+        .shape
+        .iter()
+        .try_fold(1usize, |n, &dim| n.checked_mul(dim))
+    else {
+        return false;
+    };
+    match op {
+        Op::Copy {
+            dst, dst_off, n, ..
+        } => *dst == id && *dst_off == 0 && *n as usize == elements,
+        Op::CopyStrided {
+            dst,
+            dst_off,
+            dst_stride,
+            rows,
+            n,
+            ..
+        } => {
+            *dst == id
+                && *dst_off == 0
+                && *rows > 0
+                && *n > 0
+                && *dst_stride == *n
+                && (*rows as usize).checked_mul(*n as usize) == Some(elements)
+        }
+        Op::QkNormRope {
+            dst,
+            rows,
+            n_head,
+            head_dim,
+            x_stride: 0,
+            ..
+        }
+        | Op::QkNormMrope {
+            dst,
+            rows,
+            n_head,
+            head_dim,
+            x_stride: 0,
+            ..
+        } => {
+            *dst == id
+                && (*rows as usize)
+                    .checked_mul(*n_head as usize)
+                    .and_then(|n| n.checked_mul(*head_dim as usize))
+                    == Some(elements)
+        }
+        _ => false,
+    }
+}
+
+struct Q8SegmentedGraphFacts {
+    written: Vec<bool>,
+    peers: HashMap<usize, TensorId>,
+    dead_scratch: HashSet<usize>,
+}
+
+impl Q8SegmentedGraphFacts {
+    fn analyze(graph: &Graph) -> Self {
+        let n = graph.tensors.len();
+        let mut facts = Self {
+            written: vec![false; n],
+            peers: HashMap::new(),
+            dead_scratch: HashSet::new(),
+        };
+        let mut read = vec![usize::MAX; n];
+        let mut full_write = vec![usize::MAX; n];
+        let mut touch = vec![usize::MAX; n];
+        // One reverse pass per map build; fixed-inline operand storage, not O(pairs*ops) scans.
+        for (i, op) in graph.ops.iter().enumerate().rev() {
+            if let Op::WriteKv { src, cache, .. } = op {
+                let s = src.0 as usize;
+                if read[s] == usize::MAX || full_write[s] < read[s] {
+                    facts.dead_scratch.insert(i);
+                }
+                let observer = touch[cache.0 as usize];
+                if observer != usize::MAX {
+                    if let Some(peer) = q8_segmented_value_peer(graph, observer, *cache) {
+                        facts.peers.insert(i, peer);
+                    }
+                }
+            }
+            let (inputs, outputs) = op.io_inline();
+            for id in inputs {
+                read[id.0 as usize] = i;
+                touch[id.0 as usize] = i;
+            }
+            for id in outputs {
+                if q8_segmented_full_scratch_write(graph, op, id) {
+                    full_write[id.0 as usize] = i;
+                }
+                touch[id.0 as usize] = i;
+                facts.written[id.0 as usize] = true;
+            }
+        }
+        facts
+    }
+}
+
+/// Static-only O04 extension. Unlike flat replay, this uses the already committed segmented LUT
+/// and the real per-row position input. Never allocates/commits a cache or changes its lifetime.
+fn q8_kv_write_segmented_fusions(
+    be_: &VulkanBackend,
+    graph: &Graph,
+    scratch: &[Option<Box<dyn Buffer>>],
+    bindings: &Bindings,
+    mode: &RopeMode<'_>,
+    already_skip: &HashSet<usize>,
+) -> Result<HashMap<usize, Q8SegmentedWrite>> {
+    let mut out = HashMap::new();
+    let RopeMode::Static(rope_pos) = mode else {
+        return Ok(out);
+    };
+    if !be_.cfg().kernels.vulkan.q8_kv_write_segmented
+        || !be_.prefers_segmented_q8_decode()
+        || graph.independent_rows
+        || graph.mtp_verify
+        || !graph.sequence_spans.is_empty()
+    {
+        return Ok(out);
+    }
+    let facts = Q8SegmentedGraphFacts::analyze(graph);
+    for (i, op) in graph.ops.iter().enumerate() {
+        if already_skip.contains(&i) || already_skip.contains(&(i + 1)) {
+            continue;
+        }
+        let (x, weight, positions, dst, rows, rope_dim, theta, eps, sections) = match op {
+            Op::QkNormRope {
+                x,
+                weight,
+                positions,
+                dst,
+                rows,
+                n_head: 2,
+                head_dim: 256,
+                rope_dim,
+                theta,
+                eps,
+                freq_factors: None,
+                x_stride: 0,
+            } => (
+                *x, *weight, *positions, *dst, *rows, *rope_dim, *theta, *eps, None,
+            ),
+            Op::QkNormMrope {
+                x,
+                weight,
+                positions4,
+                dst,
+                rows,
+                n_head: 2,
+                head_dim: 256,
+                rope_dim,
+                theta,
+                eps,
+                sections,
+                x_stride: 0,
+            } if *sections == [16; 4] => (
+                *x,
+                *weight,
+                *positions4,
+                *dst,
+                *rows,
+                *rope_dim,
+                *theta,
+                *eps,
+                Some(*sections),
+            ),
+            _ => continue,
+        };
+        let Some(Op::WriteKv {
+            src,
+            cache,
+            rows: write_rows,
+            row_stride: 512,
+            pos,
+        }) = graph.ops.get(i + 1)
+        else {
+            continue;
+        };
+        if *src != dst
+            || *write_rows != rows
+            || !(1..=129).contains(&rows)
+            || !matches!(rope_dim, 64 | 256)
+            || !theta.is_finite()
+            || theta <= 0.0
+            || !eps.is_finite()
+            || eps < 0.0
+            || graph.desc(x).dtype != infr_core::DType::F32
+            || graph.desc(weight).dtype != infr_core::DType::F32
+            || graph.desc(dst).dtype != infr_core::DType::F16
+            || graph.desc(positions).dtype != infr_core::DType::I32
+            || graph.desc(*cache).dtype != infr_core::DType::Q8_0
+            || graph.tensors[dst.0 as usize].kind != TensorKind::Internal
+            || graph.tensors[cache.0 as usize].kind != TensorKind::Input
+            || graph.outputs.contains(&dst)
+            || !facts.dead_scratch.contains(&(i + 1))
+            || graph.desc(dst).numel() != rows as usize * 512
+            || graph.desc(x).numel() < rows as usize * 512
+            || graph.desc(weight).numel() < 256
+            || !matches!(
+                graph.tensors[positions.0 as usize].kind,
+                TensorKind::Input | TensorKind::Weight
+            )
+            || facts.written[positions.0 as usize]
+        {
+            continue;
+        }
+        let position_count = if sections.is_some() {
+            rows as usize * 4
+        } else {
+            1
+        };
+        let position_buffer = resolve(scratch, bindings, positions)?;
+        if graph.desc(positions).numel() < position_count
+            || position_buffer.len_bytes() < position_count * 4
+            || resolve(scratch, bindings, x)?.len_bytes() < rows as usize * 512 * 4
+            || resolve(scratch, bindings, weight)?.len_bytes() < 256 * 4
+        {
+            continue;
+        }
+        let cap = graph.desc(*cache).numel();
+        let Some(required_segments) = q8_segmented_required_segments(rows, *pos, cap) else {
+            continue;
+        };
+        let cache_buffer = resolve(scratch, bindings, *cache)?;
+        let Some(segmented) = crate::as_segmented_kv(cache_buffer) else {
+            continue;
+        };
+        let spec = segmented.spec();
+        // Exactly the measured 32K-row planar Q8 geometry; reject flat, wrap and partial commits.
+        if spec.segment_elements != 32768 * 512
+            || spec.segment_bytes != (32768 * 512 / 32 * 34)
+            || spec.logical_bytes != cache_buffer.len_bytes()
+            || cap / 32 * 34 > spec.logical_bytes
+            || required_segments > segmented.committed()
+            || required_segments > spec.max_segments
+        {
+            continue;
+        }
+        let Some(&peer) = facts.peers.get(&(i + 1)) else {
+            continue;
+        };
+        let peer_buffer = resolve(scratch, bindings, peer)?;
+        let Some(peer_segments) = crate::as_segmented_kv(peer_buffer) else {
+            continue;
+        };
+        let peer_spec = peer_segments.spec();
+        if graph.desc(peer).numel() != cap
+            || peer_spec.segment_elements != spec.segment_elements
+            || peer_spec.segment_bytes != spec.segment_bytes
+            || peer_spec.logical_bytes != spec.logical_bytes
+            || required_segments > peer_segments.committed()
+        {
+            continue;
+        }
+        if sections.is_none() {
+            if rope_pos.get(&positions.0).copied() != Some(*pos as usize) {
+                continue;
+            }
+        }
+        out.insert(
+            i,
+            Q8SegmentedWrite {
+                x,
+                weight,
+                positions,
+                cache: *cache,
+                rows,
+                rope_dim,
+                theta,
+                eps,
+                pos: *pos,
+                sections,
+            },
+        );
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod q8_segmented_fusion_contract {
+    use super::*;
+
+    #[test]
+    fn bounded_spans_never_wrap_or_overflow() {
+        assert_eq!(
+            q8_segmented_required_segments(33, 32765, 65536 * 512),
+            Some(2)
+        );
+        assert_eq!(
+            q8_segmented_required_segments(129, 150003, 163840 * 512),
+            Some(5)
+        );
+        assert_eq!(
+            q8_segmented_required_segments(1, 32767, 32768 * 512),
+            Some(1)
+        );
+        for rows in [0, 130, 512, 2048, 4096] {
+            assert_eq!(q8_segmented_required_segments(rows, 0, 32768 * 512), None);
+        }
+        assert_eq!(q8_segmented_required_segments(33, 32765, 32768 * 512), None);
+        assert_eq!(q8_segmented_required_segments(1, 32768, 32768 * 512), None);
+        assert_eq!(
+            q8_segmented_required_segments(1, u32::MAX, usize::MAX),
+            None
+        );
+        assert_eq!(q8_segmented_required_segments(1, 0, 513), None);
+        assert_eq!(q8_segmented_required_segments(1, 0, 0), None);
+    }
+
+    #[test]
+    fn coupled_peer_rejects_extra_observers_or_intervening_write() {
+        use infr_core::{tensor::TensorDesc, DType};
+        let mut g = Graph::new();
+        let k = g.input(TensorDesc::new([32768, 512], DType::Q8_0));
+        let v = g.input(TensorDesc::new([32768, 512], DType::Q8_0));
+        let indices = g.input(TensorDesc::new([1], DType::I32));
+        let kd = g.internal(TensorDesc::new([1, 512], DType::F16));
+        let vd = g.internal(TensorDesc::new([1, 512], DType::F16));
+        let gather = Op::QsaGather {
+            k_cache: k,
+            v_cache: v,
+            indices,
+            k_dst: kd,
+            v_dst: vd,
+            selected_blocks: 1,
+            complete_blocks: 1,
+            tail: 0,
+            ratio: 1,
+            row_elems: 512,
+        };
+        g.push(gather.clone());
+        assert_eq!(q8_segmented_value_peer(&g, 0, k), Some(v));
+        g.tensors[v.0 as usize].desc.dtype = DType::F16;
+        assert_eq!(q8_segmented_value_peer(&g, 0, k), None);
+        g.tensors[v.0 as usize].desc.dtype = DType::Q8_0;
+        g.ops.insert(
+            0,
+            Op::WriteKv {
+                src: kd,
+                cache: k,
+                rows: 1,
+                row_stride: 512,
+                pos: 0,
+            },
+        );
+        assert_eq!(Q8SegmentedGraphFacts::analyze(&g).peers.get(&0), Some(&v));
+        assert_eq!(q8_segmented_value_peer(&g, 0, k), None);
+        assert_eq!(q8_segmented_value_peer(&g, 1, k), Some(v));
+        g.ops.insert(
+            1,
+            Op::WriteKv {
+                src: kd,
+                cache: k,
+                rows: 1,
+                row_stride: 512,
+                pos: 1,
+            },
+        );
+        assert!(!Q8SegmentedGraphFacts::analyze(&g).peers.contains_key(&0));
+        g.ops.clear();
+        assert!(Q8SegmentedGraphFacts::analyze(&g).peers.is_empty());
+    }
+}
+
 #[derive(Clone, Copy)]
 struct HcUpMixPair {
     low: TensorId,
@@ -2759,6 +3187,10 @@ mod ple_gate_norm_graph_contract;
 mod q8_pair_graph_contract;
 
 #[cfg(test)]
+#[path = "q8_segmented_write_graph_contract.rs"]
+mod q8_segmented_write_graph_contract;
+
+#[cfg(test)]
 #[path = "q8_pair_defensive_contract.rs"]
 mod q8_pair_defensive_contract;
 
@@ -2847,6 +3279,7 @@ fn lower_op(
     bindings: &Bindings,
     fused_kv_write: &HashMap<usize, (TensorId, usize)>,
     fused_q8_kv_write: &HashMap<usize, TensorId>,
+    fused_q8_segmented_write: &HashMap<usize, Q8SegmentedWrite>,
     fused_add: &HashMap<usize, (TensorId, TensorId)>,
     mode: &RopeMode,
     transient: &mut Vec<Box<dyn Buffer>>,
@@ -2902,6 +3335,29 @@ fn lower_op(
             );
             return Ok(());
         }
+    }
+    if let Some(pair) = fused_q8_segmented_write.get(&op_idx) {
+        if !matches!(mode, RopeMode::Static(_)) {
+            return Err(be("segmented Q8 K-write fusion requires static recording"));
+        }
+        let (table, shift) = segmented_kv_view(r(pair.cache)?)
+            .ok_or_else(|| be("segmented Q8 K-write fusion lost its committed LUT"))?;
+        rec.qk_norm_rope_q8_segmented(
+            r(pair.x)?,
+            r(pair.weight)?,
+            r(pair.positions)?,
+            table,
+            pair.rows as usize,
+            2,
+            256,
+            pair.rope_dim as usize,
+            pair.theta,
+            pair.eps,
+            pair.pos as usize,
+            shift,
+            pair.sections,
+        );
+        return Ok(());
     }
     if be_.cfg().kernels.vulkan.hc_up_mix && wsub.is_none() && matches!(op, Op::Linear { .. }) {
         if let Some(pair) = hc_up_mix_pair(be_, graph, op_idx, scratch, bindings) {
@@ -9005,6 +9461,7 @@ fn record_decode_replay(
     } else {
         HashMap::new()
     };
+    let fused_q8_segmented_write = HashMap::new(); // Static-only, never changes flat replay.
     let fused_kv_write = plan.kv_write;
     let fused_add = plan.linear_add;
     let mut skip_op = plan.skip;
@@ -9141,6 +9598,7 @@ fn record_decode_replay(
             bindings,
             &fused_kv_write,
             &fused_q8_kv_write,
+            &fused_q8_segmented_write,
             &fused_add,
             &mode,
             &mut transient,
@@ -10039,8 +10497,17 @@ fn execute_static_inner(
     }
     let fused_kv_write = plan.kv_write;
     let fused_q8_kv_write = HashMap::new();
+    let fused_q8_segmented_write = q8_kv_write_segmented_fusions(
+        be_,
+        graph,
+        scratch,
+        bindings,
+        &RopeMode::Static(&rope_pos),
+        &plan.skip,
+    )?;
     let fused_add = plan.linear_add;
     let mut skip_op = plan.skip;
+    skip_op.extend(fused_q8_segmented_write.keys().map(|&i| i + 1));
     // Strict decode-only Qwen peephole. Only suppress the six dense shared-expert ops when the
     // routed bank is actually backed by the Vulkan pager; resident/CPU/other-model graphs keep the
     // original op stream. `PagedMoeShared` is Copy and contains only graph handles.
@@ -10462,6 +10929,7 @@ fn execute_static_inner(
                         bindings,
                         &fused_kv_write,
                         &fused_q8_kv_write,
+                        &fused_q8_segmented_write,
                         &fused_add,
                         &mode,
                         &mut transient,
@@ -10492,6 +10960,7 @@ fn execute_static_inner(
             bindings,
             &fused_kv_write,
             &fused_q8_kv_write,
+            &fused_q8_segmented_write,
             &fused_add,
             &mode,
             &mut transient,

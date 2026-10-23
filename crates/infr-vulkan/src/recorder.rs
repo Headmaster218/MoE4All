@@ -7116,6 +7116,66 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Static packed F32 QK norm/RoPE -> typed F16 boundary -> committed segmented planar Q8.
+    /// The LUT remains output-last for the same BDA hazard tracking as store_q8_segmented.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qk_norm_rope_q8_segmented(
+        &self,
+        x: &dyn Buffer,
+        norm: &dyn Buffer,
+        positions: &dyn Buffer,
+        table: &dyn Buffer,
+        rows: usize,
+        nheads: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+        eps: f32,
+        pos: usize,
+        segment_shift: u32,
+        sections: Option<[u32; 4]>,
+    ) {
+        let (name, spv) = if sections.is_some() {
+            (
+                "qk_norm_rope_q8_segmented_mrope_q8",
+                crate::gemm::qk_norm_rope_q8_segmented_mrope_spv(),
+            )
+        } else {
+            (
+                "qk_norm_rope_q8_segmented_q8",
+                crate::gemm::qk_norm_rope_q8_segmented_spv(),
+            )
+        };
+        let kernel = self.be.kernel_sg(name, spv, 4, 48, 32);
+        let sections = sections.unwrap_or([16; 4]);
+        let push: [u32; 12] = [
+            rows as u32,
+            nheads as u32,
+            hd as u32,
+            rope_dim as u32,
+            theta.to_bits(),
+            eps.to_bits(),
+            pos as u32,
+            segment_shift,
+            sections[0],
+            sections[1],
+            sections[2],
+            sections[3],
+        ];
+        self.dispatch_wide(
+            kernel,
+            &[
+                Self::vkb(x),
+                Self::vkb(norm),
+                Self::vkb(positions),
+                Self::vkb(table),
+            ],
+            1,
+            bytemuck::cast_slice(&push),
+            (rows * nheads) as u32,
+        );
+    }
+
     /// `-DKV_BDA` twin of [`Self::qk_norm_rope_interleaved`]: writes the fused K cache at `y_addr`.
     /// `y` stays bound at slot 2 (inert) for the store→read barrier.
     #[allow(clippy::too_many_arguments)]

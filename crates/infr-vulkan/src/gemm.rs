@@ -4188,6 +4188,14 @@ dyn_spv!(qk_norm_rope_dyn_spv, "qk_norm_rope_dyn");
 dyn_spv!(qk_norm_rope_dyn_ff_spv, "qk_norm_rope_dyn_ff");
 dyn_spv!(qk_norm_rope_seg_spv, "qk_norm_rope_seg");
 dyn_spv!(
+    qk_norm_rope_q8_segmented_spv,
+    "qk_norm_rope_q8_segmented_q8"
+);
+dyn_spv!(
+    qk_norm_rope_q8_segmented_mrope_spv,
+    "qk_norm_rope_q8_segmented_mrope_q8"
+);
+dyn_spv!(
     qk_norm_rope_interleaved_seg_spv,
     "qk_norm_rope_interleaved_seg"
 );
