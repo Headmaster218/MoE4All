@@ -3040,7 +3040,9 @@ impl VulkanBackend {
     /// IQ4_NL pair-table MMQ was measured on Windows/Navi 31; other architectures keep the
     /// scalar codebook kernel until their occupancy and initialization costs are validated.
     pub(crate) fn prefers_iq4_pair_lut(&self) -> bool {
-        cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+        cfg!(target_os = "windows")
+            && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+            && !self.shared.caps.integrated
     }
 
     pub(crate) fn prefers_deltanet_fused_norm(&self) -> bool {
