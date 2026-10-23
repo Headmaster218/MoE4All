@@ -454,6 +454,29 @@ fn splitk_reduce_extents(m: usize, n: usize) -> (usize, usize) {
 /// A batched-MoE expert-GEMM kernel variant: `(kernel name, SPIR-V)`.
 type MmqKern = (&'static str, &'static [u32]);
 
+pub(crate) fn q8_prefill_bm128_applies(
+    enabled: bool,
+    measured: bool,
+    default_ag: bool,
+    dtype: infr_core::DType,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
+    enabled
+        && measured
+        && default_ag
+        && dtype == infr_core::DType::Q8_0
+        && matches!(
+            (k, n, m),
+            (3072, 8192, 512)
+                | (8192, 3072, 1024)
+                | (3072, 12288, 512 | 1024)
+                | (2560, 10240, 1024)
+                | (2560, 12288, 1024)
+        )
+}
+
 fn kquant_packed_applies(
     enabled: bool,
     measured: bool,
@@ -2931,6 +2954,20 @@ impl<'a> Recorder<'a> {
                 128,
                 64,
             )
+        };
+        // All six tuples have M%128==0 and production splits==1. No padding or split policy change.
+        let (name, bn, bm) = if q8_prefill_bm128_applies(
+            self.vk().q8_prefill_bm128,
+            self.be.prefers_q8_prefill_bm128(),
+            self.vk().gemm_warp && !self.vk().gemm_direct_a && !self.vk().gemm_wide_tile,
+            dtype,
+            m,
+            k,
+            n,
+        ) {
+            ("native_gemm_warp_q8_0_n128_ag_bm128", 128, 128)
+        } else {
+            (name, bn, bm)
         };
         self.label_gemm(name, m, k, n);
         // Weight read by its 64-bit address (`w_addr`): the picked A_GLOBAL tile, arena base

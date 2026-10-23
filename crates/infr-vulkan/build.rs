@@ -3914,6 +3914,11 @@ fn main() {
             &["-DFMT_Q8_0", "-DNARROW_N", "-DA_GLOBAL"],
         ),
         (
+            "native_gemm_warp",
+            "native_gemm_warp_q8_0_n128_ag_bm128",
+            &["-DFMT_Q8_0", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
             // Qwen3.8 recurrent projection: N=320 is divisible by 64 but not 128, so it used to
             // miss every warptile and fall back to the legacy BN=64/BK=32 kernel. Keep BN=64,
             // but use the A_GLOBAL path, BK=64, and four wave32s per workgroup.

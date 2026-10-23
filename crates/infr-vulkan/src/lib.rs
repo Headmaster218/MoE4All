@@ -3055,6 +3055,13 @@ impl VulkanBackend {
             && !self.shared.caps.integrated
     }
 
+    pub(crate) fn prefers_q8_prefill_bm128(&self) -> bool {
+        cfg!(target_os = "windows")
+            && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+            && !self.shared.caps.integrated
+            && self.shared.caps.name.contains("Radeon RX 7900 XTX")
+    }
+
     pub(crate) fn prefers_segmented_q8_decode(&self) -> bool {
         cfg!(target_os = "windows")
             && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3

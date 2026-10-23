@@ -3187,6 +3187,10 @@ mod ple_gate_norm_graph_contract;
 mod q8_pair_graph_contract;
 
 #[cfg(test)]
+#[path = "q8_prefill_bm128_graph_contract.rs"]
+mod q8_prefill_bm128_graph_contract;
+
+#[cfg(test)]
 #[path = "q8_segmented_write_graph_contract.rs"]
 mod q8_segmented_write_graph_contract;
 
