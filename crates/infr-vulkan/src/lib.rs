@@ -745,10 +745,13 @@ struct VulkanShared {
     /// residency is resolved before its copies are submitted, so allowing a later request after an
     /// ultimately failed submit could turn those unexecuted copies into false cache hits.
     queue_submit_failure: AtomicI32,
+    /// Global buffer-lifetime generation for revalidating unsubmitted raw references.
+    resource_epoch: AtomicU64,
     /// Serialises all one-shot command-buffer submissions.
     cmd_pool: Mutex<vk::CommandPool>,
     /// Completed transient recorder command buffers. Acquisition resets one before recording.
     recorder_cmds: Mutex<Vec<vk::CommandBuffer>>,
+    recorder_prepared_pools: recorder::PreparedPoolCache,
     /// Completed transient recorder descriptor-pool tranches. They are reset on acquisition.
     recorder_desc_pools: Mutex<Vec<vk::DescriptorPool>>,
     /// Completed fences from non-blocking recorder submissions. They are reset on acquisition.
@@ -1085,6 +1088,9 @@ impl VulkanShared {
         queue: vk::Queue,
         submit: &vk::SubmitInfo<'_>,
     ) -> Result<()> {
+        if adapter::preparing_commands() {
+            return Err(be("next-token preparation cannot submit GPU transfers"));
+        }
         if let Some(error) = self.queue_submit_failure() {
             return Err(be(format!(
                 "dedicated transfer queue is unavailable after an earlier submit failure: {error}"
@@ -1327,6 +1333,9 @@ impl VulkanShared {
         profile_dispatches: Option<usize>,
         context: &str,
     ) -> std::result::Result<(), vk::Result> {
+        if adapter::preparing_commands() {
+            return Err(vk::Result::ERROR_VALIDATION_FAILED_EXT);
+        }
         let _queue = self.queue_access.lock().unwrap();
         if let Some(error) = self.queue_submit_failure() {
             return Err(error);
@@ -1687,6 +1696,7 @@ impl Drop for VulkanShared {
                 self.device.device_wait_idle(),
                 Err(vk::Result::ERROR_DEVICE_LOST)
             );
+            self.recorder_prepared_pools.destroy(&self.device);
             if let Ok(map) = self.kernels.lock() {
                 for k in map.values() {
                     crate::ops::destroy_compute_kernel(&self.device, k);
@@ -1716,6 +1726,7 @@ impl Drop for VulkanShared {
                 self.device.destroy_query_pool(pool, None);
             }
             // Destroy command pool.
+            self.recorder_prepared_pools.destroy(&self.device);
             let pool = self.cmd_pool.lock().unwrap();
             self.device.destroy_command_pool(*pool, None);
             // Drop the allocator *before* destroying the device.
@@ -1730,6 +1741,12 @@ impl Drop for VulkanShared {
 
 /// How a `VkBuffer`'s device memory is owned.
 enum Backing {
+    /// Non-owning snapshot used only by a scoped recording worker. The caller pins the owner.
+    RecordingAlias {
+        mapped: Option<*mut u8>,
+        /// Original arena/shard extent for descriptor range clamping; `None` for whole buffers.
+        backing_len: Option<usize>,
+    },
     /// A gpu-allocator sub-allocation — freed back to the allocator on drop (transient buffers,
     /// host-visible staging/readback).
     Pooled(ManuallyDrop<Allocation>),
@@ -1756,7 +1773,7 @@ enum Backing {
     /// mapped device-local heap is absent or too small (notably RDNA2 on the Windows AMD driver).
     Device { memory: vk::DeviceMemory },
     /// A logical BYTE RANGE of a [`BdaWeightArena`] block's single big `vk::Buffer` (resident weight
-    /// sub-tensors — see [`VulkanBackend::bda_weight_alloc`]). Unlike every other
+    /// sub-tensors — see [`VulkanBackend::bda_weight_alloc`]). Unlike an owning
     /// variant, `VkBuffer::buffer` here is NOT this handle's own object: it is the block's buffer,
     /// shared byte-for-byte with every other sub-tensor carved from the same block, and with the
     /// block's own keepalive copy. The `Arc` is what keeps the block (and therefore its memory and
@@ -1832,12 +1849,45 @@ struct VkBuffer {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl VkBuffer {
+    /// Snapshot buffer identity without owning or allocating GPU storage.
+    ///
+    /// # Safety
+    /// The caller must keep the original allocation, buffer identity, and mapping alive and
+    /// unchanged until the scoped recording worker joins and drops all aliases. Pin original
+    /// scratch-pool entries against growth/free. Use the alias only to record descriptors; it
+    /// must never escape the worker or be used for host reads/writes or resource management.
+    /// Recorded commands retain no allocation ownership and require the parent's lifetime and
+    /// resource-epoch validation before submission.
+    pub(crate) unsafe fn recording_alias(&self) -> VkBuffer {
+        let backing_len = match &self.backing {
+            Backing::BdaSub(block) => Some(block.buf.size),
+            Backing::UnifiedSub(handle) => Some(handle.shard_bytes()),
+            Backing::RecordingAlias { backing_len, .. } => *backing_len,
+            _ => None,
+        };
+        VkBuffer {
+            shared: Arc::clone(&self.shared),
+            buffer: self.buffer,
+            backing: Backing::RecordingAlias {
+                mapped: self.mapped_ptr(),
+                backing_len,
+            },
+            size: self.size,
+            mem_size: 0,
+            location: self.location,
+            sub_offset: self.sub_offset,
+            own_addr: self.device_addr(),
+            act_bytes: 0,
+        }
+    }
+
     /// Persistently-mapped host pointer for host-visible buffers — pooled host-visible allocations
     /// AND [`Backing::Vram`] weights (device-local VRAM the host can write through, via ReBAR).
     /// `None` for plain device-local or arena buffers, which are filled via a staging copy.
     /// Every "can I just memcpy into this?" decision (`upload`, `fill_buf`) keys off this.
     fn mapped_ptr(&self) -> Option<*mut u8> {
         match &self.backing {
+            Backing::RecordingAlias { mapped, .. } => *mapped,
             Backing::Pooled(a) => a.mapped_ptr().map(|p| p.as_ptr() as *mut u8),
             Backing::Vram { ptr, .. } => Some(*ptr),
             Backing::Device { .. } => None,
@@ -1863,6 +1913,11 @@ impl VkBuffer {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Drop for VkBuffer {
     fn drop(&mut self) {
+        if matches!(&self.backing, Backing::RecordingAlias { .. }) {
+            return;
+        }
+        // Invalidate prepared commands before backing storage or buffer handles can be reused.
+        self.shared.resource_epoch.fetch_add(1, Ordering::AcqRel);
         // Release this buffer's share of the live-activation tally (see `VulkanShared::act_live`).
         // `act_peak` is a high-water mark and deliberately never comes back down.
         if self.act_bytes > 0 {
@@ -1872,6 +1927,7 @@ impl Drop for VkBuffer {
         }
         unsafe {
             match &mut self.backing {
+                Backing::RecordingAlias { .. } => return,
                 Backing::Pooled(alloc) => {
                     let alloc = ManuallyDrop::take(alloc);
                     self.shared.release_owned_ram(alloc.size());
@@ -4743,8 +4799,10 @@ impl VulkanBackend {
                 queue_access,
                 vram_keepalive,
                 queue_submit_failure: AtomicI32::new(vk::Result::SUCCESS.as_raw()),
+                resource_epoch: AtomicU64::new(1),
                 cmd_pool: Mutex::new(cmd_pool),
                 recorder_cmds: Mutex::new(Vec::new()),
+                recorder_prepared_pools: recorder::PreparedPoolCache::default(),
                 recorder_desc_pools: Mutex::new(Vec::new()),
                 recorder_fences: Mutex::new(Vec::new()),
                 recorder_submit_query_pools: Mutex::new(Vec::new()),
@@ -7017,6 +7075,9 @@ impl VulkanBackend {
         sizes: &[usize],
         usage: BufferUsage,
     ) -> Result<Vec<VkBuffer>> {
+        if adapter::preparing_commands() && !sizes.is_empty() {
+            return Err(be("command preparation requires retained batch workspace"));
+        }
         let buffers = if sizes.is_empty() {
             Vec::new()
         } else if let (Some(class), Some(pool)) =
@@ -7163,6 +7224,9 @@ impl VulkanBackend {
     }
 
     fn make_alloc(&self, bytes: usize, usage: BufferUsage) -> Result<VkBuffer> {
+        if adapter::preparing_commands() {
+            return Err(be("command preparation requires retained workspace"));
+        }
         let unified_class = self.unified_class_for_usage(usage);
         if let Some(class) = unified_class {
             let mut buf = self.alloc_unified_buffer(bytes, class)?;
@@ -8384,6 +8448,10 @@ impl Backend for VulkanBackend {
         true
     }
 
+    fn supports_execution_lookahead(&self) -> bool {
+        adapter::command_recording_supported(self)
+    }
+
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>> {
         adapter::compile(self, graph)
     }
@@ -8391,6 +8459,24 @@ impl Backend for VulkanBackend {
     fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
         self.with_unified_exclusive(|| {
             let result = adapter::execute(self, plan, bindings);
+            if let Some(reaper) = &self.auxiliary_runtime_reaper {
+                if result.is_err() {
+                    self.runtime_phase.lock().unwrap().release_phase();
+                }
+                reaper.arm();
+            }
+            result
+        })
+    }
+
+    fn execute_with_lookahead(
+        &self,
+        plan: &dyn Plan,
+        bindings: &Bindings,
+        next: Option<(&dyn Plan, &Bindings, &[usize])>,
+    ) -> Result<()> {
+        self.with_unified_exclusive(|| {
+            let result = adapter::execute_with_lookahead(self, plan, bindings, next);
             if let Some(reaper) = &self.auxiliary_runtime_reaper {
                 if result.is_err() {
                     self.runtime_phase.lock().unwrap().release_phase();

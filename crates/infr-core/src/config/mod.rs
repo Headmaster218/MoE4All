@@ -138,6 +138,12 @@ cfg_struct! {
         /// step executes and its result is processed. Backends without CPU-only concurrent
         /// compilation retain inline preparation. Does not execute unconfirmed tokens.
         decode_prepare_ahead: bool = true,
+        /// Prepare one unsubmitted Decode command prefix during the current forward.
+        /// Unsupported backends and phase/resource changes retain ordinary execution.
+        decode_command_ahead: bool = false,
+        /// Submit an acknowledged prepared prefix before suffix setup to overlap CPU work.
+        /// Experimental alternative to combining the prefix with the ordinary first submit.
+        decode_command_early_submit: bool = false,
     }
 }
 

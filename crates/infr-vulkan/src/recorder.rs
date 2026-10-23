@@ -1158,12 +1158,132 @@ fn bda_out_f_chunks(
     Ok(chunks)
 }
 
+struct PreparedPool {
+    pool: vk::CommandPool,
+    cmd: vk::CommandBuffer,
+}
+
+/// Idle pools only: every recording or pending prefix exclusively owns its pool.
+#[derive(Default)]
+pub(crate) struct PreparedPoolCache {
+    pools: std::sync::Mutex<Vec<PreparedPool>>,
+}
+
+impl PreparedPoolCache {
+    const RETAIN: usize = 4;
+
+    /// Called by VulkanShared teardown before destroying the device.
+    pub(crate) fn destroy(&self, device: &ash::Device) {
+        for entry in self.pools.lock().unwrap().drain(..) {
+            unsafe { device.destroy_command_pool(entry.pool, None) };
+        }
+    }
+}
+
+struct PreparedPoolLease {
+    shared: std::sync::Arc<crate::VulkanShared>,
+    entry: Option<PreparedPool>,
+}
+
+impl PreparedPoolLease {
+    fn new(backend: &VulkanBackend) -> Result<Self> {
+        let shared = &backend.shared;
+        let cached = shared.recorder_prepared_pools.pools.lock().unwrap().pop();
+        let entry = match cached {
+            Some(entry) => entry,
+            None => {
+                let pool = unsafe {
+                    shared.device.create_command_pool(
+                        &vk::CommandPoolCreateInfo::default()
+                            .queue_family_index(shared.queue_family_index)
+                            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                        None,
+                    )
+                }
+                .map_err(|e| be(format!("create prepared command pool: {e}")))?;
+                let cmd = match unsafe {
+                    shared.device.allocate_command_buffers(
+                        &vk::CommandBufferAllocateInfo::default()
+                            .command_pool(pool)
+                            .level(vk::CommandBufferLevel::PRIMARY)
+                            .command_buffer_count(1),
+                    )
+                } {
+                    Ok(cmds) => cmds[0],
+                    Err(e) => {
+                        unsafe { shared.device.destroy_command_pool(pool, None) };
+                        return Err(be(format!("allocate prepared command buffer: {e}")));
+                    }
+                };
+                PreparedPool { pool, cmd }
+            }
+        };
+        Ok(Self {
+            shared: std::sync::Arc::clone(shared),
+            entry: Some(entry),
+        })
+    }
+}
+
+impl Drop for PreparedPoolLease {
+    fn drop(&mut self) {
+        let Some(entry) = self.entry.take() else {
+            return;
+        };
+        let device = &self.shared.device;
+        // The owner drops only before submission or after completion; neither needs an idle wait.
+        let reset =
+            unsafe { device.reset_command_pool(entry.pool, vk::CommandPoolResetFlags::empty()) };
+        if reset.is_ok() {
+            let mut cache = self.shared.recorder_prepared_pools.pools.lock().unwrap();
+            if cache.len() < PreparedPoolCache::RETAIN {
+                cache.push(entry);
+                return;
+            }
+        }
+        unsafe { device.destroy_command_pool(entry.pool, None) };
+    }
+}
+
+/// An unsubmitted, single-use primary prefix. Bound buffers remain caller-owned unless retained
+/// explicitly; the decode plan must validate their epoch and bindings before attaching this packet.
+pub struct PreparedCommand {
+    shared: std::sync::Arc<crate::VulkanShared>,
+    cmd: vk::CommandBuffer,
+    dispatches: usize,
+    private_pool: Option<PreparedPoolLease>,
+    pools: Vec<vk::DescriptorPool>,
+    buffer_keepalive: Vec<std::sync::Arc<dyn Buffer>>,
+    dedicated_transfer_wait: u64,
+}
+
+impl PreparedCommand {
+    pub fn dispatches(&self) -> usize {
+        self.dispatches
+    }
+}
+
+impl Drop for PreparedCommand {
+    fn drop(&mut self) {
+        // Invalidate command-buffer references before returning descriptor pools and buffers.
+        self.private_pool.take();
+        self.shared
+            .recorder_desc_pools
+            .lock()
+            .unwrap()
+            .extend(self.pools.drain(..));
+    }
+}
+
 pub struct Recorder<'a> {
     be: &'a VulkanBackend,
     cmd: vk::CommandBuffer,
     /// Owns `cmd`, `pools` and `query_pool` until a submitted or persistent command takes them.
     /// The drop guard closes every recording-time `?`/unwind path without burdening each caller.
     owns_transient: std::cell::Cell<bool>,
+    prepared_pool: RefCell<Option<PreparedPoolLease>>,
+    prepared_prefix: RefCell<Option<PreparedCommand>>,
+    first_submit: RefCell<Option<std::sync::mpsc::SyncSender<()>>>,
     /// Descriptor pools, GROWN on exhaustion (a batched-MoE prefill chunk records ~50k dispatches
     /// — far beyond any fixed max_sets). The last entry is the active pool; `alloc_set` appends a
     /// fresh one on ERROR_OUT_OF_POOL_MEMORY. Empty when push descriptors are available.
@@ -1275,38 +1395,59 @@ fn intern_label(s: String) -> &'static str {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl<'a> Recorder<'a> {
     pub(crate) fn new(backend: &'a VulkanBackend) -> Result<Self> {
-        Self::new_inner(backend, false)
+        Self::new_inner(backend, false, false)
     }
 
     /// A recorder whose command buffer is resubmittable (no ONE_TIME_SUBMIT). `finish_record` returns
     /// a [`RecordedCmd`] the caller can replay instead of re-recording. Profiling is disabled on this
     /// path (the recorder is gone after recording, so per-replay timestamps can't be reported).
     pub(crate) fn new_persistent(backend: &'a VulkanBackend) -> Result<Self> {
-        Self::new_inner(backend, true)
+        Self::new_inner(backend, true, false)
     }
 
-    fn new_inner(backend: &'a VulkanBackend, persistent: bool) -> Result<Self> {
+    /// Record a one-use prefix on a private pool without submitting any GPU work.
+    /// The caller disables preparation when profiling or timeline capture is enabled.
+    pub(crate) fn new_prepared(backend: &'a VulkanBackend) -> Result<Self> {
+        Self::new_inner(backend, false, true)
+    }
+
+    fn new_inner(backend: &'a VulkanBackend, persistent: bool, prepared: bool) -> Result<Self> {
         let _timeline_acquire = infr_core::timeline::span("recorder_acquire");
         let profile_acquire_t0 = pager_profile::start();
         let device = &backend.shared.device;
-        let cmd_pool = backend.shared.cmd_pool.lock().unwrap();
-        let cmd = match backend.shared.recorder_cmds.lock().unwrap().pop() {
-            Some(cmd) => {
-                unsafe { device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()) }
-                    .map_err(|e| be(format!("reset recycled cmd buffer: {e}")))?;
-                cmd
-            }
-            None => unsafe {
-                device.allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(*cmd_pool)
-                        .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(1),
-                )
-            }
-            .map_err(|e| be(format!("alloc cmd buffer: {e}")))?[0],
+        let prepared_pool = if prepared {
+            Some(PreparedPoolLease::new(backend)?)
+        } else {
+            None
         };
-        drop(cmd_pool);
+        let recycle_cmd = |cmd| {
+            if !prepared {
+                backend.shared.recorder_cmds.lock().unwrap().push(cmd);
+            }
+        };
+        let cmd = if let Some(lease) = &prepared_pool {
+            lease.entry.as_ref().unwrap().cmd
+        } else {
+            let cmd_pool = backend.shared.cmd_pool.lock().unwrap();
+            match backend.shared.recorder_cmds.lock().unwrap().pop() {
+                Some(cmd) => {
+                    unsafe {
+                        device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+                    }
+                    .map_err(|e| be(format!("reset recycled cmd buffer: {e}")))?;
+                    cmd
+                }
+                None => unsafe {
+                    device.allocate_command_buffers(
+                        &vk::CommandBufferAllocateInfo::default()
+                            .command_pool(*cmd_pool)
+                            .level(vk::CommandBufferLevel::PRIMARY)
+                            .command_buffer_count(1),
+                    )
+                }
+                .map_err(|e| be(format!("alloc cmd buffer: {e}")))?[0],
+            }
+        };
         let begin_flags = if persistent {
             // SIMULTANEOUS_USE: the chained decode submits the SAME recorded command buffer n
             // times in one vkQueueSubmit (see RecordedCmd::replay_n) — the buffer must be legal
@@ -1321,7 +1462,7 @@ impl<'a> Recorder<'a> {
                 &vk::CommandBufferBeginInfo::default().flags(begin_flags),
             )
         } {
-            backend.shared.recorder_cmds.lock().unwrap().push(cmd);
+            recycle_cmd(cmd);
             return Err(be(format!("begin cmd buffer: {e}")));
         }
 
@@ -1337,7 +1478,7 @@ impl<'a> Recorder<'a> {
                                 .reset_descriptor_pool(pool, vk::DescriptorPoolResetFlags::empty())
                         } {
                             unsafe { device.destroy_descriptor_pool(pool, None) };
-                            backend.shared.recorder_cmds.lock().unwrap().push(cmd);
+                            recycle_cmd(cmd);
                             return Err(be(format!("reset recycled descriptor pool: {e}")));
                         }
                         pool
@@ -1345,7 +1486,7 @@ impl<'a> Recorder<'a> {
                     None => match Self::new_desc_pool(device) {
                         Ok(pool) => pool,
                         Err(e) => {
-                            backend.shared.recorder_cmds.lock().unwrap().push(cmd);
+                            recycle_cmd(cmd);
                             return Err(e);
                         }
                     },
@@ -1365,7 +1506,7 @@ impl<'a> Recorder<'a> {
         let dbgcfg = &backend.cfg().debug;
         let (bda_chunk_elem_cap, bda_chunk_byte_cap) =
             bda_chunk_caps(&backend.cfg().kernels.vulkan);
-        let prof_ops = infr_core::prof::enabled(profcfg) && !persistent;
+        let prof_ops = infr_core::prof::enabled(profcfg) && !persistent && !prepared;
         let op_shapes = prof_ops && profcfg.op_shapes;
         let query_pool = if prof_ops {
             let qp = match unsafe {
@@ -1378,7 +1519,7 @@ impl<'a> Recorder<'a> {
             } {
                 Ok(qp) => qp,
                 Err(e) => {
-                    backend.shared.recorder_cmds.lock().unwrap().push(cmd);
+                    recycle_cmd(cmd);
                     if let Some(pool) = pool {
                         backend
                             .shared
@@ -1396,30 +1537,31 @@ impl<'a> Recorder<'a> {
             vk::QueryPool::null()
         };
 
-        let (submit_query_pool, submit_timing_token, submit_pager_profile) = if !persistent {
-            backend.shared.take_submit_timing_query().map_or(
-                (vk::QueryPool::null(), None, false),
-                |(pool, token, pager_profile)| {
-                    unsafe {
-                        device.cmd_reset_query_pool(cmd, pool, 0, 2);
-                        device.cmd_write_timestamp(
-                            cmd,
-                            vk::PipelineStageFlags::TOP_OF_PIPE,
-                            pool,
-                            0,
-                        );
-                    }
-                    (pool, token, pager_profile)
-                },
-            )
-        } else {
-            (vk::QueryPool::null(), None, false)
-        };
+        let (submit_query_pool, submit_timing_token, submit_pager_profile) =
+            if !persistent && !prepared {
+                backend.shared.take_submit_timing_query().map_or(
+                    (vk::QueryPool::null(), None, false),
+                    |(pool, token, pager_profile)| {
+                        unsafe {
+                            device.cmd_reset_query_pool(cmd, pool, 0, 2);
+                            device.cmd_write_timestamp(
+                                cmd,
+                                vk::PipelineStageFlags::TOP_OF_PIPE,
+                                pool,
+                                0,
+                            );
+                        }
+                        (pool, token, pager_profile)
+                    },
+                )
+            } else {
+                (vk::QueryPool::null(), None, false)
+            };
 
         if let Some(elapsed) = pager_profile::elapsed(profile_acquire_t0) {
             pager_profile::record_command_recorder_acquire(elapsed);
         }
-        let timeline_query = if persistent {
+        let timeline_query = if persistent || prepared {
             None
         } else {
             match crate::timeline::Query::new(
@@ -1436,7 +1578,7 @@ impl<'a> Recorder<'a> {
                         }
                     }
                     backend.shared.return_submit_timing_query(submit_query_pool);
-                    backend.shared.recorder_cmds.lock().unwrap().push(cmd);
+                    recycle_cmd(cmd);
                     if let Some(pool) = pool {
                         backend
                             .shared
@@ -1453,6 +1595,9 @@ impl<'a> Recorder<'a> {
             be: backend,
             cmd,
             owns_transient: std::cell::Cell::new(true),
+            prepared_pool: RefCell::new(prepared_pool),
+            prepared_prefix: RefCell::new(None),
+            first_submit: RefCell::new(None),
             pools: std::cell::RefCell::new(pool.into_iter().collect()),
             buffer_keepalive: std::cell::RefCell::new(Vec::new()),
             dedicated_transfer_wait: std::cell::Cell::new(0),
@@ -1467,7 +1612,7 @@ impl<'a> Recorder<'a> {
             indirect_region: std::cell::Cell::new(None),
             no_barrier: dbgcfg.no_barrier,
             full_barrier: dbgcfg.full_barrier,
-            stages: profcfg.stages,
+            stages: profcfg.stages && !prepared,
             prof_ops,
             op_shapes,
             query_pool,
@@ -1475,7 +1620,11 @@ impl<'a> Recorder<'a> {
             submit_timing_token: std::cell::Cell::new(submit_timing_token),
             submit_pager_profile: std::cell::Cell::new(submit_pager_profile),
             timeline_query: RefCell::new(timeline_query),
-            timeline_lifetime: RefCell::new(infr_core::timeline::span("recorder_lifetime")),
+            timeline_lifetime: RefCell::new(if prepared {
+                None
+            } else {
+                infr_core::timeline::span("recorder_lifetime")
+            }),
             ts_labels: RefCell::new(Vec::new()),
             ts_dropped: std::cell::Cell::new(0),
             next_label: std::cell::Cell::new(None),
@@ -1514,9 +1663,99 @@ impl<'a> Recorder<'a> {
         (self.bda_chunk_elem_cap, self.bda_chunk_byte_cap)
     }
 
-    /// Dispatches recorded into this command buffer so far — the submit splitter's trigger.
+    /// Dispatches in this submit, including any prepared prefix; the submit splitter's trigger.
     pub fn dispatches(&self) -> usize {
         self.dispatches.get()
+            + self
+                .prepared_prefix
+                .borrow()
+                .as_ref()
+                .map_or(0, |cmd| cmd.dispatches)
+    }
+
+    /// Finish a private-pool recorder without submission or a GPU wait.
+    pub(crate) fn finish_prepared(self) -> Result<PreparedCommand> {
+        if self.prepared_pool.borrow().is_none() {
+            return Err(be("finish_prepared requires a prepared recorder"));
+        }
+        self.end_conditional();
+        unsafe { self.be.shared.device.end_command_buffer(self.cmd) }
+            .map_err(|e| be(format!("end prepared cmd: {e}")))?;
+        self.owns_transient.set(false);
+        Ok(PreparedCommand {
+            shared: std::sync::Arc::clone(&self.be.shared),
+            cmd: self.cmd,
+            dispatches: self.dispatches.get(),
+            private_pool: self.prepared_pool.borrow_mut().take(),
+            pools: std::mem::take(&mut *self.pools.borrow_mut()),
+            buffer_keepalive: std::mem::take(&mut *self.buffer_keepalive.borrow_mut()),
+            dedicated_transfer_wait: self.dedicated_transfer_wait.get(),
+        })
+    }
+
+    /// Attach a validated prefix before recording main work. The seed barrier in the main
+    /// command buffer makes prefix writes visible across the two primary command buffers.
+    pub(crate) fn prepend_prepared(&self, cmd: PreparedCommand) -> Result<()> {
+        if self.persistent
+            || self.prepared_pool.borrow().is_some()
+            || self.prepared_prefix.borrow().is_some()
+            || self.dispatches.get() != 0
+            || self.conditional_active.get()
+        {
+            return Err(be(
+                "prepared prefix requires an empty transient main recorder",
+            ));
+        }
+        if !std::sync::Arc::ptr_eq(&self.be.shared, &cmd.shared) {
+            return Err(be("prepared prefix belongs to another Vulkan device"));
+        }
+        self.dedicated_transfer_wait.set(
+            self.dedicated_transfer_wait
+                .get()
+                .max(cmd.dedicated_transfer_wait),
+        );
+        *self.prepared_prefix.borrow_mut() = Some(cmd);
+        self.seed_barrier();
+        Ok(())
+    }
+
+    /// Wake bounded host preparation only after this recorder's first successful submission.
+    pub(crate) fn on_first_submit(&self, sender: std::sync::mpsc::SyncSender<()>) {
+        // A speculative resident tail may be discarded and re-armed after miss recovery.
+        // Repeated arming of the same live recorder must still notify only once.
+        self.first_submit.borrow_mut().get_or_insert(sender);
+    }
+
+    fn notify_first_submit(&self) {
+        if let Some(sender) = self.first_submit.borrow_mut().take() {
+            let _ = sender.try_send(());
+        }
+    }
+
+    fn submit_commands(
+        &self,
+        fence: vk::Fence,
+        context: &str,
+    ) -> std::result::Result<(), vk::Result> {
+        let prefix = self.prepared_prefix.borrow();
+        let commands = [
+            prefix
+                .as_ref()
+                .map_or(vk::CommandBuffer::null(), |cmd| cmd.cmd),
+            self.cmd,
+        ];
+        let batch = if prefix.is_some() {
+            &commands[..]
+        } else {
+            &commands[1..]
+        };
+        self.be.shared.queue_submit_commands_recovering(
+            batch,
+            fence,
+            Some(self.dispatches()),
+            context,
+            self.dedicated_transfer_wait.get(),
+        )
     }
 
     /// Disjoint-batch barrier suppression: while ON, recorded dispatches accumulate hazard state
@@ -2004,6 +2243,10 @@ impl<'a> Recorder<'a> {
         let backing_len = match &vb.backing {
             Backing::BdaSub(block) => block.buf.size,
             Backing::UnifiedSub(handle) => handle.shard_bytes(),
+            Backing::RecordingAlias {
+                backing_len: Some(len),
+                ..
+            } => *len,
             _ => {
                 return vk::DescriptorBufferInfo {
                     buffer: vb.buffer,
@@ -14446,13 +14689,18 @@ impl<'a> Recorder<'a> {
         self.submit_timing_token.set(None);
         self.submit_pager_profile.set(false);
         self.be.shared.return_submit_timing_query(submit_pool);
-        self.be.shared.recorder_cmds.lock().unwrap().push(self.cmd);
+        if let Some(private_pool) = self.prepared_pool.borrow_mut().take() {
+            drop(private_pool);
+        } else {
+            self.be.shared.recorder_cmds.lock().unwrap().push(self.cmd);
+        }
         self.be
             .shared
             .recorder_desc_pools
             .lock()
             .unwrap()
             .extend(self.pools.borrow_mut().drain(..));
+        self.prepared_prefix.borrow_mut().take();
     }
 
     /// End recording, submit once, wait, and release transient objects.
@@ -14465,9 +14713,12 @@ impl<'a> Recorder<'a> {
         self,
         after_submit: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
+        if self.prepared_pool.borrow().is_some() {
+            return Err(be("prepared recorder must finish_prepared or discard"));
+        }
         self.end_conditional();
         let device = &self.be.shared.device;
-        let dispatches = self.dispatches.get();
+        let dispatches = self.dispatches();
         let t_record = self.t0.elapsed();
         let prof = pager_profile::active();
         if prof {
@@ -14498,18 +14749,13 @@ impl<'a> Recorder<'a> {
         if let Some(query) = self.timeline_query.borrow_mut().as_mut() {
             query.submitted();
         }
-        let submit = self.be.shared.queue_submit_commands_recovering(
-            std::slice::from_ref(&self.cmd),
-            vk::Fence::null(),
-            Some(dispatches),
-            "forward queue_submit",
-            self.dedicated_transfer_wait.get(),
-        );
+        let submit = self.submit_commands(vk::Fence::null(), "forward queue_submit");
         drop(submit_span);
         if let Err(e) = submit {
             self.free_transient();
             return Err(be(format!("queue_submit: {e}")));
         }
+        self.notify_first_submit();
         let host_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(after_submit))
             .unwrap_or_else(|_| Err(be("post-submit host work panicked")));
         let wait_t0 = prof.then(std::time::Instant::now);
@@ -14576,8 +14822,11 @@ impl<'a> Recorder<'a> {
     /// per-recorder, so cross-submission RAW/WAR ordering (scratch reuse, arena-slot rewrites vs
     /// a prior segment's reads) is otherwise invisible to it.
     pub fn finish_nowait(self) -> Result<PendingSegment> {
+        if self.prepared_pool.borrow().is_some() {
+            return Err(be("prepared recorder must finish_prepared or discard"));
+        }
         self.end_conditional();
-        let dispatches = self.dispatches.get();
+        let dispatches = self.dispatches();
         if self.stages || self.prof_ops {
             let shared = std::sync::Arc::clone(&self.be.shared);
             self.finish()?;
@@ -14587,6 +14836,7 @@ impl<'a> Recorder<'a> {
                 cmd: vk::CommandBuffer::null(),
                 pools: Vec::new(),
                 buffer_keepalive: Vec::new(),
+                prepared_prefix: None,
                 submit_query_pool: vk::QueryPool::null(),
                 submit_timing_token: None,
                 submit_pager_profile: false,
@@ -14629,19 +14879,14 @@ impl<'a> Recorder<'a> {
         if let Some(query) = self.timeline_query.borrow_mut().as_mut() {
             query.submitted();
         }
-        let submit = self.be.shared.queue_submit_commands_recovering(
-            std::slice::from_ref(&self.cmd),
-            fence,
-            Some(dispatches),
-            "pipelined queue_submit",
-            self.dedicated_transfer_wait.get(),
-        );
+        let submit = self.submit_commands(fence, "pipelined queue_submit");
         drop(submit_span);
         if let Err(e) = submit {
             self.be.shared.recorder_fences.lock().unwrap().push(fence);
             self.free_transient();
             return Err(be(format!("queue_submit: {e}")));
         }
+        self.notify_first_submit();
         let shared = std::sync::Arc::clone(&self.be.shared);
         let pools = self.pools.borrow().clone();
         let buffer_keepalive = std::mem::take(&mut *self.buffer_keepalive.borrow_mut());
@@ -14655,6 +14900,7 @@ impl<'a> Recorder<'a> {
             cmd: self.cmd,
             pools,
             buffer_keepalive,
+            prepared_prefix: self.prepared_prefix.borrow_mut().take(),
             submit_query_pool,
             submit_timing_token,
             submit_pager_profile,
@@ -14710,6 +14956,9 @@ impl<'a> Recorder<'a> {
     /// and its own segment is a SEPARATE submit at replay time, so no single submit can trip the
     /// per-submit GPU hang watchdog. A discrete GPU records the whole decode into one segment.
     pub(crate) fn end_segment(self) -> Result<RecordedSegment> {
+        if self.prepared_pool.borrow().is_some() || self.prepared_prefix.borrow().is_some() {
+            return Err(be("prepared prefix cannot become a replayable segment"));
+        }
         self.end_conditional();
         if self.stages {
             eprintln!("[prof] barriers emitted = {}", self.barriers.borrow());
@@ -15023,6 +15272,7 @@ pub struct PendingSegment {
     pools: Vec<vk::DescriptorPool>,
     /// Temporary transfer buffers referenced by `cmd`; released only after `fence` signals.
     buffer_keepalive: Vec<std::sync::Arc<dyn Buffer>>,
+    prepared_prefix: Option<PreparedCommand>,
     /// Automatic submit calibration query state. Both are empty after calibration, on explicit
     /// caps, and on the already-drained profiling compatibility path.
     submit_query_pool: vk::QueryPool,
@@ -15140,6 +15390,7 @@ impl PendingSegment {
             .unwrap()
             .extend(self.pools.drain(..));
         self.buffer_keepalive.clear();
+        self.prepared_prefix.take();
         waited.map_err(|e| be(format!("wait segment fence: {e}")))
     }
 }
@@ -15147,6 +15398,201 @@ impl PendingSegment {
 impl Drop for PendingSegment {
     fn drop(&mut self) {
         let _ = self.drain();
+    }
+}
+
+#[cfg(test)]
+mod prepared_command_tests {
+    use super::*;
+    use infr_core::backend::BufferUsage;
+    use std::sync::{mpsc, Arc};
+
+    fn backend(push_desc: bool) -> VulkanBackend {
+        let mut cfg = infr_core::config::Config::default();
+        cfg.kernels.vulkan.push_desc = push_desc;
+        VulkanBackend::new_with(Arc::new(cfg)).unwrap()
+    }
+
+    fn value(backend: &VulkanBackend, buf: &dyn Buffer) -> f32 {
+        let mut out = [0.0f32];
+        backend
+            .download(buf, bytemuck::cast_slice_mut(&mut out))
+            .unwrap();
+        out[0]
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU; parent serializes GPU tests"]
+    fn prepare_does_not_execute_and_discard_recycles_private_pools() {
+        fn assert_send<T: Send>() {}
+        assert_send::<PreparedCommand>();
+        let backend = backend(true);
+        let src = backend.alloc(4, BufferUsage::Staging).unwrap();
+        let dst = backend.alloc(4, BufferUsage::Readback).unwrap();
+        backend
+            .upload(src.as_ref(), bytemuck::bytes_of(&17.0f32))
+            .unwrap();
+        backend
+            .upload(dst.as_ref(), bytemuck::bytes_of(&3.0f32))
+            .unwrap();
+        let rec = Recorder::new_prepared(&backend).unwrap();
+        rec.copy(src.as_ref(), 0, dst.as_ref(), 0, 4);
+        let pool = rec
+            .prepared_pool
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .entry
+            .as_ref()
+            .unwrap()
+            .pool;
+        assert_ne!(pool, *backend.shared.cmd_pool.lock().unwrap());
+        assert_eq!(value(&backend, dst.as_ref()), 3.0);
+        let cmd = rec.finish_prepared().unwrap();
+        assert_eq!(cmd.dispatches(), 1);
+        assert_eq!(value(&backend, dst.as_ref()), 3.0);
+        drop(cmd);
+        let rec = Recorder::new_prepared(&backend).unwrap();
+        assert_eq!(
+            rec.prepared_pool
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .entry
+                .as_ref()
+                .unwrap()
+                .pool,
+            pool
+        );
+        // Unfinished-recording Drop must be just as safe as dropping a finished packet.
+        rec.copy(src.as_ref(), 0, dst.as_ref(), 0, 4);
+        drop(rec);
+        assert_eq!(value(&backend, dst.as_ref()), 3.0);
+
+        let recorders: Vec<_> = (0..PreparedPoolCache::RETAIN + 2)
+            .map(|_| Recorder::new_prepared(&backend).unwrap())
+            .collect();
+        let pools: HashSet<_> = recorders
+            .iter()
+            .map(|rec| {
+                rec.prepared_pool
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .entry
+                    .as_ref()
+                    .unwrap()
+                    .pool
+            })
+            .collect();
+        assert_eq!(pools.len(), recorders.len());
+        drop(recorders);
+        assert_eq!(
+            backend
+                .shared
+                .recorder_prepared_pools
+                .pools
+                .lock()
+                .unwrap()
+                .len(),
+            PreparedPoolCache::RETAIN
+        );
+    }
+
+    fn prepend_visibility(push_desc: bool) {
+        let backend = backend(push_desc);
+        if !push_desc {
+            assert!(backend.shared.push_descriptor.is_none());
+        }
+        let src = backend.alloc(4, BufferUsage::Staging).unwrap();
+        let scratch = backend.alloc(512, BufferUsage::Activations).unwrap();
+        let out = backend.alloc(4, BufferUsage::Readback).unwrap();
+        // A worker's subrange alias must preserve the original SSBO offset and extent.
+        // The owning allocation stays pinned for this entire recording/submission test.
+        let mut alias = unsafe { Recorder::vk_of(scratch.as_ref()).recording_alias() };
+        alias.backing = Backing::RecordingAlias {
+            mapped: None,
+            backing_len: Some(512),
+        };
+        alias.sub_offset = 256;
+        alias.size = 4;
+        alias.own_addr = alias.own_addr.map(|addr| addr + 256);
+        let info = Recorder::vkb(&alias);
+        assert_eq!(info.offset, 256);
+        assert_eq!(info.range, 256);
+        backend
+            .upload(src.as_ref(), bytemuck::bytes_of(&7.0f32))
+            .unwrap();
+        for nowait in [false, true] {
+            let rec = Recorder::new_prepared(&backend).unwrap();
+            rec.copy(src.as_ref(), 0, &alias, 0, 4);
+            rec.scale(&alias, 2.0, 1);
+            let cmd = rec.finish_prepared().unwrap();
+            if !push_desc {
+                assert!(!cmd.pools.is_empty());
+            }
+            let rec = backend.recorder().unwrap();
+            rec.prepend_prepared(cmd).unwrap();
+            assert_eq!(*rec.barriers.borrow(), 1);
+            rec.copy(scratch.as_ref(), 256, out.as_ref(), 0, 4);
+            assert_eq!(rec.dispatches(), 3);
+            let (sender, receiver) = mpsc::sync_channel(1);
+            rec.on_first_submit(sender.clone());
+            rec.on_first_submit(sender);
+            assert_eq!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty));
+            if nowait {
+                let pending = rec.finish_nowait().unwrap();
+                assert_eq!(receiver.try_recv(), Ok(()));
+                assert!(pending.prepared_prefix.is_some());
+                // Pending ownership excludes its pool from the cache, even if already signaled.
+                assert!(backend
+                    .shared
+                    .recorder_prepared_pools
+                    .pools
+                    .lock()
+                    .unwrap()
+                    .is_empty());
+                pending.wait().unwrap();
+            } else {
+                rec.finish().unwrap();
+                assert_eq!(receiver.try_recv(), Ok(()));
+            }
+            assert_eq!(receiver.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+            assert_eq!(value(&backend, out.as_ref()), 14.0);
+            assert_eq!(
+                backend
+                    .shared
+                    .recorder_prepared_pools
+                    .pools
+                    .lock()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        // A dropped main recorder must drop both unsubmitted commands without notification.
+        let prefix = Recorder::new_prepared(&backend)
+            .unwrap()
+            .finish_prepared()
+            .unwrap();
+        let rec = backend.recorder().unwrap();
+        rec.prepend_prepared(prefix).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        rec.on_first_submit(sender);
+        drop(rec);
+        assert_eq!(receiver.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU; parent serializes GPU tests"]
+    fn prepend_copy_visibility_and_first_submit_notification() {
+        prepend_visibility(true);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU; parent serializes GPU tests"]
+    fn prepend_copy_visibility_with_classic_descriptor_fallback() {
+        prepend_visibility(false);
     }
 }
 

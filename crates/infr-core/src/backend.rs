@@ -502,12 +502,13 @@ impl Plan for GraphPlan {
 /// not a `HashMap` — `bind`/`get` are then hash-free O(1), which matters because decode rebinds
 /// every step. `bind`/`get` semantics are identical to the old map: `get` on an unbound (or
 /// never-grown-to) id returns `None`, and re-binding an id overwrites.
+#[derive(Clone)]
 enum BoundBuffer<'a> {
     Single(&'a dyn Buffer),
     Rows(Vec<&'a dyn Buffer>),
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Bindings<'a> {
     /// `slots[id.0] = Some(buf)` for a bound handle, `None` for unbound. Grows on demand to the
     /// highest id bound (bounded by the graph's tensor count).
@@ -825,8 +826,25 @@ pub trait Backend: Send + Sync {
         false
     }
 
+    /// Can record a bounded next-step command prefix while the current forward executes.
+    /// This is distinct from CPU-only compile/prepare: no future GPU work may be submitted.
+    fn supports_execution_lookahead(&self) -> bool {
+        false
+    }
+
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>>;
     fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()>;
+    /// Synchronous forward plus optional recording of the next forward. All preparation workers
+    /// must join before returning; binding buffers may be rebound/dropped immediately afterwards.
+    /// The next plan is only submitted by its later, explicitly authorized execute call.
+    fn execute_with_lookahead(
+        &self,
+        plan: &dyn Plan,
+        bindings: &Bindings,
+        _next: Option<(&dyn Plan, &Bindings, &[usize])>,
+    ) -> Result<()> {
+        self.execute(plan, bindings)
+    }
     /// Chained decode: run the record-once decode plan `n` times in ONE submission, the sampled
     /// token id flowing device-side from each iteration's `Op::Argmax`/`Op::Sample` into the next
     /// iteration's `Op::EmbedGather` — the caller MUST have bound the sampler output and the

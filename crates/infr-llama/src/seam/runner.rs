@@ -1217,6 +1217,7 @@ fn session_stable(
 }
 
 /// Handles into one freshly-built decode graph that the driver re-binds each step.
+#[derive(PartialEq, Eq)]
 pub(super) struct DecodeHandles {
     hidden: TensorId,
     positions: TensorId,
@@ -1276,6 +1277,22 @@ pub(super) struct DecodeHandles {
     qsa_k_cache: Vec<Option<TensorId>>,
     qsa_block_cache: Vec<Option<TensorId>>,
     weights: Vec<TensorId>, // flat, in declaration == upload order
+}
+
+// A ready candidate may own commands recorded by execute_with_lookahead, even if EOS/ACK
+// prevents its execution. Release it on the caller under the same gate as executed plans.
+struct GatedDecodeCandidate<'a, T> {
+    candidate: Option<T>,
+    request: Option<&'a crate::sampling::RequestCtx>,
+}
+
+impl<T> Drop for GatedDecodeCandidate<'_, T> {
+    fn drop(&mut self) {
+        if self.candidate.is_some() {
+            let _gate = self.request.and_then(|request| request.gate_pass());
+            drop(self.candidate.take());
+        }
+    }
 }
 
 /// Counts are initialized from request-local CPU mirrors once per cohort. Thereafter only the
@@ -10174,6 +10191,10 @@ fn generate_dense_backend_inner(
             .collect::<Vec<_>>();
         let prepare_ahead =
             ec.device.decode_prepare_ahead && be.supports_async_compile() && max_new > 1;
+        let command_ahead = prepare_ahead
+            && lanes == 1
+            && ec.device.decode_command_ahead
+            && be.supports_execution_lookahead();
         let prepare_decode_plans = |plan_step: usize| -> AResult<PreparedParallelDecodePlans> {
             let plan_positions = lane_starts
                 .iter()
@@ -10299,6 +10320,11 @@ fn generate_dense_backend_inner(
             },
             |pipeline| -> AResult<()> {
                 let mut next_ple_ticket = None;
+                let command_ahead = command_ahead && pipeline.is_async();
+                let mut ready = GatedDecodeCandidate {
+                    candidate: command_ahead.then(|| prepare_decode_plans(1)),
+                    request: req,
+                };
                 for step in 0..max_new {
                     let step_t0 = std::time::Instant::now();
                     let profile_front_t0 = profile_cohort.then(std::time::Instant::now);
@@ -10333,11 +10359,34 @@ fn generate_dense_backend_inner(
                         });
                     let mut current_plans = match prepared_decode_plans.take() {
                         Some(plans) => plans,
+                        None if command_ahead => ready
+                            .candidate
+                            .take()
+                            .expect("command lookahead has the current candidate")?,
                         None => {
                             let _wait = infr_core::timeline::span("decode_prepare_wait");
                             pipeline.take(step)??
                         }
                     };
+                    if command_ahead && step + 1 < max_new {
+                        if ready.candidate.is_none() {
+                            let _wait = infr_core::timeline::span("decode_prepare_wait");
+                            ready.candidate = Some(match pipeline.pending_step() {
+                                Some(pending) => pipeline
+                                    .take(pending)
+                                    .map_err(anyhow::Error::from)
+                                    .and_then(|candidate| candidate),
+                                None => prepare_decode_plans(step + 1),
+                            });
+                        }
+                        if step + 2 < max_new && ready.candidate.as_ref().is_some_and(Result::is_ok)
+                        {
+                            // Only CPU plans run two steps ahead. A failed submission is retried
+                            // synchronously if that future step is actually needed.
+                            let _ = pipeline
+                                .schedule(step + 2, (step + 2, infr_core::timeline::context()));
+                        }
+                    }
                     if current_plans.logits_rows != logits_rows
                         || current_plans.batch_argmax != batch_argmax
                         || current_plans.batch_gpu_sample != batch_gpu_sample
@@ -10569,7 +10618,91 @@ fn generate_dense_backend_inner(
                     });
                     let previously_retired = retired_decode_plans.plans.take();
                     let execute_trace_context = infr_core::timeline::context();
-                    if pipeline.is_async() {
+                    if command_ahead {
+                        let next = ready.candidate.as_ref().and_then(|candidate| {
+                            let candidate = candidate.as_ref().ok()?;
+                            let (plan, handles) = if candidate.full_graph {
+                                &candidate.main
+                            } else {
+                                candidate.first.as_ref()?
+                            };
+                            let bindings = if full_graph
+                                && candidate.full_graph
+                                && candidate.logits_rows == logits_rows
+                                && candidate.batch_argmax == batch_argmax
+                                && candidate.batch_gpu_sample == batch_gpu_sample
+                                && handles == &h1
+                            {
+                                b1.clone()
+                            } else {
+                                let mut bindings = Bindings::new();
+                                if let Some(id) = handles.tok_ids {
+                                    bindings.bind(id, ids_buf.as_ref());
+                                }
+                                bindings.bind(handles.hidden, hidden_batch.as_ref());
+                                bindings.bind(handles.positions, pos_batch.as_ref());
+                                bind_parallel_layer_io(
+                                    &mut bindings,
+                                    handles,
+                                    c.n_layer,
+                                    rf_buf,
+                                    yff_buf,
+                                    &kbufs[..],
+                                    &vbufs[..],
+                                    &qsa_kbufs[..],
+                                    &qsa_cbufs[..],
+                                    &mrope_history_buf,
+                                    peer_mrope_history_bufs.as_deref(),
+                                    &wbufs[..],
+                                    qwen_wide_buf,
+                                    ple_embd_buf,
+                                    ple_state_buf,
+                                    wide_batch.as_deref(),
+                                    if candidate.full_graph {
+                                        ple_batch.as_deref()
+                                    } else {
+                                        None
+                                    },
+                                    &*parallel.peers,
+                                    None,
+                                    independent_rows,
+                                );
+                                if candidate.full_graph {
+                                    if let Some(id) = handles.logits {
+                                        bindings.bind(id, logits_batch.as_ref());
+                                    }
+                                    if let Some(id) = handles.tok_id {
+                                        bindings.bind(id, ids_out.as_ref());
+                                    }
+                                    if let Some(id) = handles.u_in {
+                                        bindings.bind(id, sample_u.as_ref());
+                                    }
+                                    if let Some(buffers) = gpu_penalty_buffers.as_ref() {
+                                        buffers.bind(&mut bindings, handles);
+                                    }
+                                    if let (Some(id), Some(buffer)) =
+                                        (handles.h_out, hidden_out.as_deref())
+                                    {
+                                        bindings.bind(id, buffer);
+                                    }
+                                }
+                                bindings
+                            };
+                            let positions =
+                                positions.iter().map(|&pos| pos + 1).collect::<Vec<_>>();
+                            Some((plan.as_ref(), bindings, positions))
+                        });
+                        be.execute_with_lookahead(
+                            plan1.as_ref(),
+                            &b1,
+                            next.as_ref().map(|(plan, bindings, positions)| {
+                                (*plan, bindings, positions.as_slice())
+                            }),
+                        )
+                        .map_err(|e| anyhow!("{e}"))?;
+                        drop(next);
+                        drop(previously_retired);
+                    } else if pipeline.is_async() {
                         if step + 1 < max_new {
                             pipeline.schedule(step + 1, (step + 1, execute_trace_context))?;
                         }
@@ -12022,6 +12155,8 @@ fn generate_dense_backend_inner(
         && ec.device.decode_prepare_ahead
         && be.supports_async_compile()
         && max_new > 1;
+    let command_ahead =
+        prepare_ahead && ec.device.decode_command_ahead && be.supports_execution_lookahead();
     // Only immutable graph metadata reaches this closure: no bindings, buffers or token history.
     let prepare_decode_plan =
         |shape: Shape, first: bool| -> AResult<(Box<dyn Plan>, DecodeHandles)> {
@@ -12069,6 +12204,13 @@ fn generate_dense_backend_inner(
         },
         |pipeline| -> AResult<()> {
             let mut next_ple_ticket = None;
+            let command_ahead = command_ahead && pipeline.is_async();
+            let mut ready: GatedDecodeCandidate<'_, (Shape, AResult<PreparedSerialDecodePlans>)> =
+                GatedDecodeCandidate {
+                    candidate: None,
+                    request: req,
+                };
+            let mut command_pending_shape: Option<Shape> = None;
             while pos < end {
                 // `max_new == 0` (prefill-only: bench pp, session cache warming) must still FEED the
                 // prompt: models without a batched-prefill path (MoE with non-Q4_K expert banks, E2B
@@ -12341,7 +12483,13 @@ fn generate_dense_backend_inner(
                     gpu_embed_tok,
                     want_h,
                 };
-                let mut prepared = if let Some(step) = pipeline.pending_step() {
+                let mut prepared = if command_ahead {
+                    ready
+                        .candidate
+                        .take()
+                        .and_then(|candidate| shape.select(candidate))
+                        .transpose()?
+                } else if let Some(step) = pipeline.pending_step() {
                     let _wait = infr_core::timeline::span("decode_prepare_wait");
                     // A forced span can change the frontier/head-tap shape. Discard even an error for
                     // that unused shape; only a matching candidate's error belongs to this step.
@@ -12366,6 +12514,127 @@ fn generate_dense_backend_inner(
                     )
                 } else {
                     None
+                };
+                if command_ahead && is_decode {
+                    if prepared.is_none() {
+                        prepared = Some(prepare_decode_plans(shape)?);
+                    }
+                    if let Some(next) = next_shape {
+                        let candidate = if let Some(pending) = pipeline.pending_step() {
+                            let _wait = infr_core::timeline::span("decode_prepare_wait");
+                            let predicted = command_pending_shape
+                                .take()
+                                .expect("command lookahead tracks its pending shape");
+                            let candidate = pipeline
+                                .take(pending)
+                                .unwrap_or_else(|error| (predicted, Err(anyhow!("{error}"))));
+                            // Forced spans can invalidate this second prediction too, including errors.
+                            next.select(candidate)
+                        } else {
+                            None
+                        };
+                        ready.candidate = Some((
+                            next,
+                            candidate.unwrap_or_else(|| prepare_decode_plans(next)),
+                        ));
+                        if ready
+                            .candidate
+                            .as_ref()
+                            .is_some_and(|(_, candidate)| candidate.is_ok())
+                        {
+                            let next_is_image = mm.is_some_and(|plan| {
+                                plan.spans.iter().any(|span| {
+                                    next.pos + 1 >= span.start
+                                        && next.pos + 1 < span.start + span.n_tokens
+                                })
+                            });
+                            if let Some(future) = Shape::next(
+                                next.pos,
+                                prompt.len(),
+                                end,
+                                max_new.saturating_sub(out.len() + usize::from(at_frontier)),
+                                cur.len() + usize::from(at_frontier),
+                                gpu_embed && !next_is_image,
+                                h_out.is_some() && !want_h && !next.want_h,
+                            ) {
+                                if pipeline
+                                    .schedule(future.pos, (future, infr_core::timeline::context()))
+                                    .is_ok()
+                                {
+                                    command_pending_shape = Some(future);
+                                }
+                            }
+                        }
+                    }
+                }
+                let execute_decode = |plan: &dyn Plan, bindings: &Bindings| -> AResult<()> {
+                    if !command_ahead || !is_decode {
+                        return be.execute(plan, bindings).map_err(|e| anyhow!("{e}"));
+                    }
+                    let next = ready.candidate.as_ref().and_then(|(shape, candidate)| {
+                        let candidate = candidate.as_ref().ok()?;
+                        let first = candidate.first.as_ref();
+                        // The main plan's hidden tap is allocated by its actual step, not speculatively.
+                        if first.is_none() && shape.want_h {
+                            return None;
+                        }
+                        let (plan, handles) = first.unwrap_or(&candidate.main);
+                        let mut bindings = Bindings::new();
+                        bind_step_input(
+                            &mut bindings,
+                            handles,
+                            shape.gpu_embed_tok && (!c.qwen4exp || first.is_some()),
+                            dec_ids_buf.as_ref(),
+                            hidden_buf.as_ref(),
+                        );
+                        if first.is_some() {
+                            bindings.bind(handles.hidden, hidden_buf.as_ref());
+                        }
+                        bindings.bind(handles.positions, pos_buf.as_ref());
+                        if let (Some(id), Some(buf)) = (handles.positions4, &pos4_buf) {
+                            bindings.bind(id, buf.as_ref());
+                        }
+                        if let (Some(id), Some(buf)) = (handles.pl_tok_in, &ipl_buf) {
+                            bindings.bind(id, buf.as_ref());
+                        }
+                        bind_layer_io(
+                            &mut bindings,
+                            handles,
+                            c.n_layer,
+                            rf_buf,
+                            yff_buf,
+                            &kbufs[..],
+                            &vbufs[..],
+                            &qsa_kbufs[..],
+                            &qsa_cbufs[..],
+                            &mrope_history_buf,
+                            &wbufs[..],
+                            qwen_wide_buf,
+                            ple_embd_buf,
+                            ple_state_buf,
+                        );
+                        if let Some(id) = handles.logits {
+                            bindings.bind(id, logits_buf.as_ref());
+                        }
+                        if let Some(id) = handles.tok_id {
+                            bindings.bind(id, id_out);
+                        }
+                        if let Some(id) = handles.u_in {
+                            bindings.bind(id, u_buf.as_ref());
+                        }
+                        if let Some(buffers) = gpu_penalty_buffers.as_ref() {
+                            buffers.bind(&mut bindings, handles);
+                        }
+                        Some((plan.as_ref(), bindings, [shape.pos]))
+                    });
+                    be.execute_with_lookahead(
+                        plan,
+                        bindings,
+                        next.as_ref().map(|(plan, bindings, positions)| {
+                            (*plan, bindings, positions.as_slice())
+                        }),
+                    )
+                    .map_err(|e| anyhow!("{e}"))
                 };
                 if let Some((plan, b)) = &ro {
                     // Record-once path: reuse the single compiled plan + bindings (no per-token rebuild).
@@ -12408,7 +12677,7 @@ fn generate_dense_backend_inner(
                         ple_state_buf,
                     );
                     let mut setup_total = t_setup.elapsed();
-                    if let Some(next) = next_shape {
+                    if let Some(next) = next_shape.filter(|_| !command_ahead) {
                         pipeline.schedule(next.pos, (next, infr_core::timeline::context()))?;
                     }
                     let t_exec0 = std::time::Instant::now();
@@ -12486,8 +12755,7 @@ fn generate_dense_backend_inner(
                     }
                     setup_total += t_setup1.elapsed();
                     let t_exec1 = std::time::Instant::now();
-                    be.execute(plan1.as_ref(), &b1)
-                        .map_err(|e| anyhow!("{e}"))?;
+                    execute_decode(plan1.as_ref(), &b1)?;
                     setup_el = setup_total;
                     exec_el = exec0 + t_exec1.elapsed();
                 } else {
@@ -12540,11 +12808,11 @@ fn generate_dense_backend_inner(
                         b.bind(ho, hb.as_ref());
                     }
                     setup_el = t_setup.elapsed();
-                    if let Some(next) = next_shape {
+                    if let Some(next) = next_shape.filter(|_| !command_ahead) {
                         pipeline.schedule(next.pos, (next, infr_core::timeline::context()))?;
                     }
                     let t_exec = std::time::Instant::now();
-                    be.execute(plan.as_ref(), &b).map_err(|e| anyhow!("{e}"))?;
+                    execute_decode(plan.as_ref(), &b)?;
                     exec_el = t_exec.elapsed();
                 }
                 if pos < prompt.len() {
@@ -12745,7 +13013,12 @@ fn generate_dense_backend_inner(
                     ) {
                         next_ple_ticket = Some(ple_ticket_carry::Ticket::new(
                             next_pos,
-                            submit_ple_token(ple_worker.as_deref(), &cur, next_pos, c.ple_ngram_size),
+                            submit_ple_token(
+                                ple_worker.as_deref(),
+                                &cur,
+                                next_pos,
+                                c.ple_ngram_size,
+                            ),
                             drain_ple_ticket,
                         ));
                     }

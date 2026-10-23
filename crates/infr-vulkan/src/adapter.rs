@@ -23,6 +23,12 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 
 use crate::recorder::RecordedCmd;
 
+#[path = "adapter_prefix.rs"]
+mod command_prefix;
+pub(crate) use command_prefix::preparing_commands;
+pub(crate) use command_prefix::supported as command_recording_supported;
+use command_prefix::PreparedPrefix;
+
 /// Vulkan-specific compiled plan. Carries the cloned graph (like the old `GraphPlan`) plus, for an
 /// eligible single-token decode graph, a lazily-built record-once replay (see [`DecodeReplay`]). An
 /// ineligible graph (prefill batch, gemma/E2B/MoE/qwen35 decode, …) re-records every `execute` — the
@@ -42,6 +48,7 @@ pub(crate) struct VkDecodePlan {
     prepare_enabled: bool,
     /// Backend-configured, CPU-only phase sizing. No pager or allocation state is captured.
     phase_requests: Option<Vec<(&'static str, usize)>>,
+    prepared_prefix: Mutex<Option<PreparedPrefix>>,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -73,6 +80,7 @@ impl VkDecodePlan {
             static_scratch: OnceLock::new(),
             prepare_enabled,
             phase_requests: None,
+            prepared_prefix: Mutex::new(None),
         }
     }
 
@@ -9419,6 +9427,27 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
     Ok(())
 }
 
+pub(crate) fn execute_with_lookahead(
+    be_: &VulkanBackend,
+    plan: &dyn Plan,
+    bindings: &Bindings,
+    next: Option<(&dyn Plan, &Bindings, &[usize])>,
+) -> Result<()> {
+    let current = plan
+        .as_any()
+        .downcast_ref::<VkDecodePlan>()
+        .ok_or_else(|| be("vulkan adapter: plan is not a VkDecodePlan"))?;
+    let next = next.and_then(|(plan, bindings, positions)| {
+        plan.as_any()
+            .downcast_ref::<VkDecodePlan>()
+            .map(|plan| (plan, bindings, positions))
+    });
+    if !be_.moe_paged() || !be_.cfg().device.decode_command_ahead {
+        return execute(be_, plan, bindings);
+    }
+    execute_static_next(be_, current, bindings, next)
+}
+
 /// Chained decode (`Backend::execute_chain`): replay the record-once recording `n` times in ONE
 /// submission — the sampled id flows device-side (the runner bound the sampler output and the
 /// embed-gather ids input to one buffer), params self-advance, and the trailing `id_log` writes
@@ -10353,9 +10382,18 @@ impl Drop for FrozenMoeLutGuard<'_> {
 /// retain scratch within one decode/prefill phase; auxiliary clients retain it until idle expiry.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn execute_static(be_: &VulkanBackend, plan: &VkDecodePlan, bindings: &Bindings) -> Result<()> {
+    execute_static_next(be_, plan, bindings, None)
+}
+
+fn execute_static_next(
+    be_: &VulkanBackend,
+    plan: &VkDecodePlan,
+    bindings: &Bindings,
+    next: Option<(&VkDecodePlan, &Bindings, &[usize])>,
+) -> Result<()> {
     let _timeline_execute = infr_core::timeline::span("backend_execute");
     let profile_t0 = infr_core::pager_profile::start();
-    let result = match execute_static_inner(be_, plan, bindings) {
+    let result = match execute_static_inner(be_, plan, bindings, next) {
         Ok(()) => Ok(()),
         Err(error) => match cancel_decode_prefetch(be_) {
             Ok(()) => Err(error),
@@ -10374,7 +10412,10 @@ fn execute_static_inner(
     be_: &VulkanBackend,
     plan: &VkDecodePlan,
     bindings: &Bindings,
+    next: Option<(&VkDecodePlan, &Bindings, &[usize])>,
 ) -> Result<()> {
+    let execute_started = std::time::Instant::now();
+    let compiled = plan;
     let graph = &plan.graph;
     let timeline_setup = infr_core::timeline::span("backend_setup");
     // A previous errored execute may have left protection until its recorder/segments dropped.
@@ -10487,6 +10528,27 @@ fn execute_static_inner(
             infr_core::pager_profile::BackendSetupKind::PhaseScratch,
             elapsed,
         );
+    }
+
+    let prepared = compiled
+        .prepared_prefix
+        .lock()
+        .unwrap()
+        .take()
+        .and_then(|prefix| prefix.take_if_valid(be_, scratch, pool, bindings));
+    let prepared_end = prepared.as_ref().map_or(0, |(_, end)| *end);
+    let mut prepared_command = prepared.map(|(command, _)| command);
+    let mut early_prefix = None;
+    let mut early_prefix_dispatches = 0;
+    let mut early_submit_us = None;
+    if be_.cfg().device.decode_command_early_submit {
+        if let Some(prefix) = prepared_command.take() {
+            let rec = be_.recorder()?;
+            rec.prepend_prepared(prefix)?;
+            early_prefix_dispatches = rec.dispatches();
+            early_prefix = Some(rec.finish_nowait()?);
+            early_submit_us = Some(execute_started.elapsed().as_micros());
+        }
     }
 
     // RoPE position: the static `qk_norm_rope`/`rope` kernels take a scalar `rope_pos`, but the IR
@@ -10645,7 +10707,22 @@ fn execute_static_inner(
     }
     drop(timeline_setup);
     let mut rec = Some(be_.recorder()?);
-    if reset_retained_scratch {
+    if prepared_end != 0 {
+        static PREFIX_USED: AtomicBool = AtomicBool::new(false);
+        if !PREFIX_USED.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                prefix_ops = prepared_end,
+                early_submit = early_prefix.is_some(),
+                "Decode command prefix consumed"
+            );
+        }
+    }
+    if let Some(prefix) = prepared_command {
+        rec.as_mut().unwrap().prepend_prepared(prefix)?;
+    } else if early_prefix.is_some() {
+        rec.as_ref().unwrap().seed_barrier();
+    }
+    if reset_retained_scratch && prepared_end == 0 {
         // Restore only true read-before-write scratch in the first useful command stream. Queue
         // order provides the same zero-before-read guarantee as the former synchronous one-shot,
         // without an extra submit + queue_wait_idle before every static decode execution.
@@ -10673,7 +10750,7 @@ fn execute_static_inner(
     // only the watchdog's view changes, from one long job to several short ones.
     let pager_prof = infr_core::pager_profile::active();
     let submit_before = pager_prof.then(infr_core::pager_profile::queue_submit_count);
-    let mut submitted_dispatches = 0usize;
+    let mut submitted_dispatches = early_prefix_dispatches;
     let mut splitter_splits = 0usize;
     /// In-flight segments allowed at once. Each one pins a command buffer plus its descriptor
     /// pools until the GPU is done reading them, and the devices that split are exactly the
@@ -10688,6 +10765,9 @@ fn execute_static_inner(
     // happens before any of them drop.
     let mut segments: std::collections::VecDeque<crate::recorder::PendingSegment> =
         std::collections::VecDeque::new();
+    if let Some(prefix) = early_prefix.take() {
+        segments.push_back(prefix);
+    }
     // Graph order with the fused-away indices elided — the shared walk definition
     // (`infr_core::exec::live_ops`). Only the WALK is shared: everything between ops below (the
     // submit splitter, the shutdown poll, the paged-MoE hand-off, the dense-streaming stage) is
@@ -10713,422 +10793,517 @@ fn execute_static_inner(
         );
     }
     let live_ops: Vec<_> = infr_core::exec::live_ops(&graph.ops, &skip_op).collect();
-    let mut live_pos: usize = 0;
-    loop {
-        if let Some(chunk) = resident_chunk.as_mut() {
-            if let Some(recovery) = chunk.recovery_op {
-                if resident_recovery_submit_due(
-                    pstream.resume_ids.is_some(),
-                    live_ops.get(live_pos).map(|(_, op)| *op),
-                    cap > 0 && rec.as_ref().is_some_and(|r| r.dispatches() >= cap),
-                ) {
-                    submitted_dispatches += chunk.submit_early_recovery(
-                        be_,
-                        recovery.op_idx,
-                        &mut rec,
-                        &mut pstream,
-                        &mut segments,
-                    )?;
-                }
-            }
-        }
-        if let Some(chunk) = resident_chunk
-            .as_mut()
-            .filter(|chunk| chunk.recovery_op.is_none())
-        {
-            if (chunk.producer.is_some() || live_pos.is_multiple_of(8)) && chunk.notices.is_some() {
-                chunk.poll_notices(be_, &mut pstream, None)?;
-            }
-            if chunk.notice_resume.is_some() || chunk.notice_stop {
-                // All commands currently being recorded follow a notified miss and would be
-                // predicated off. Do not submit or keep encoding them; retain submitted hits.
-                rec.take().unwrap().discard()?;
-            }
-            if !chunk.entries.is_empty()
-                && (chunk.entries.len() == chunk.limit
-                    || live_pos == live_ops.len()
-                    || chunk.notice_resume.is_some()
-                    || chunk.notice_stop)
-            {
-                if let Some((op_idx, ids)) = chunk.finish(
-                    be_,
-                    &mut rec,
-                    &mut pstream,
-                    pool,
-                    &mut segments,
-                    live_pos == live_ops.len(),
-                )? {
-                    live_pos = live_ops
-                        .iter()
-                        .position(|&(idx, _)| idx == op_idx)
-                        .expect("journal op belongs to this walk");
-                    pstream.resume_ids = Some(ids);
-                    mmv_memo = None;
-                }
-                if chunk.recovery_op.is_none() {
-                    while let Some(segment) = segments.pop_front() {
-                        segment.wait()?;
+    let mut live_pos = live_ops.partition_point(|(index, _)| *index < prepared_end);
+    let next = next
+        .filter(|(_, _, positions)| positions.len() == 1)
+        .filter(|(plan, _, _)| {
+            command_prefix::enabled(be_)
+                && token_row_paged_moe
+                && command_prefix::compatible(graph, &plan.graph, scratch)
+        });
+    let snapshot = next.and_then(|_| command_prefix::snapshot_pool(pool).ok());
+    let preparation_cancelled = AtomicBool::new(false);
+    let result = rayon::in_place_scope(|scope| {
+        let (wake, ready) = std::sync::mpsc::sync_channel(1);
+        let preparing = match (next, snapshot) {
+            (Some((next, next_bindings, positions)), Some(snapshot)) => {
+                let cancelled = &preparation_cancelled;
+                scope.spawn(move |_| {
+                    let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        if ready.recv().is_ok() && !cancelled.load(Ordering::Acquire) {
+                            let preparation_start_us = execute_started.elapsed().as_micros();
+                            let recording_started = std::time::Instant::now();
+                            match command_prefix::record(
+                                be_,
+                                next,
+                                scratch,
+                                next_bindings,
+                                positions,
+                                snapshot,
+                            ) {
+                                Ok(prefix) => {
+                                    *next.prepared_prefix.lock().unwrap() = Some(prefix);
+                                    static SAMPLES: AtomicU64 = AtomicU64::new(0);
+                                    let sample = SAMPLES.fetch_add(1, Ordering::Relaxed) + 1;
+                                    if sample.is_multiple_of(128) {
+                                        tracing::info!(sample, ?early_submit_us, preparation_start_us,
+                                            recording_us=recording_started.elapsed().as_micros(),
+                                            "Decode command preparation host sample");
+                                    }
+                                }
+                                Err(error) => {
+                                    static REPORTED: std::sync::Once = std::sync::Once::new();
+                                    REPORTED.call_once(|| tracing::info!(%error, "Decode prefix preparation fell back; subsequent tokens retry after warmup"));
+                                }
+                            }
+                        }
+                    }));
+                    if prepared.is_err() {
+                        tracing::warn!(
+                            "Decode prefix preparation panicked; retaining ordinary recording"
+                        );
                     }
-                }
-            } else if chunk.submit_due()
-                || (chunk.recording
-                    && cap > 0
-                    && rec.as_ref().is_some_and(|r| r.dispatches() >= cap))
-            {
-                if !chunk.submit_due() {
-                    splitter_splits += 1;
-                }
-                let _span = infr_core::timeline::span("gpu_resident_rolling_submit");
-                let mut segment = rec
-                    .take()
-                    .expect("resident recorder exists")
-                    .finish_nowait()?;
-                if let Some(waiter) = &chunk.waiter {
-                    segment.start_waiter(waiter)?;
-                }
-                chunk.send_producer_jobs(&mut segment, chunk.entries.len())?;
-                submitted_dispatches += segment.dispatches();
-                segments.push_back(segment);
-                while segments.len()
-                    > be_
-                        .cfg()
-                        .kernels
-                        .vulkan
-                        .decode_gpu_resident_inflight
-                        .clamp(1, 2)
-                {
-                    segments
-                        .pop_front()
-                        .expect("in-flight resident segment")
-                        .wait()?;
-                }
-                let fresh = be_.recorder()?;
-                fresh.seed_barrier();
-                fresh.arena_stream_barrier();
-                chunk.begin_conditional(&fresh);
-                rec = Some(fresh);
-                chunk.submitted_entries = chunk.entries.len();
+                });
+                true
             }
-            if live_pos < live_ops.len() && !chunk.recording && pstream.resume_ids.is_none() {
-                if let Some(notices) = &chunk.notices {
-                    notices.reset()?;
-                }
-                // Initialization is a GPU command after the resumed FFN, never a host write
-                // into an in-flight predicate. Fresh tape ranges remain pinned until the drain.
-                let rc = rec.as_ref().unwrap();
-                // All fresh host LUT windows are published before this recorder is submitted.
-                rc.arena_stream_barrier();
-                rc.gpu_resident_check(
-                    chunk.control.as_ref(),
-                    chunk.control.as_ref(),
-                    chunk.control.as_ref(),
-                    chunk.journal.as_ref(),
-                    [0; 6],
-                );
-                chunk.begin_conditional(rc);
-                chunk.recording = true;
-            }
+            _ => false,
+        };
+        let mut prepare_wake = preparing.then_some(wake);
+        if let (Some(chunk), Some(wake)) = (resident_chunk.as_mut(), prepare_wake.as_ref()) {
+            chunk.command_tail_ready = Some(wake.clone());
         }
-        if live_pos == live_ops.len() {
-            break;
-        }
-        let (op_idx, op) = live_ops[live_pos];
-        live_pos += 1;
-        // ── shutdown (SIGINT/SIGTERM) ─────────────────────────────────────────────────────────
-        // Polled HERE — at the op/submit boundary INSIDE the forward — and not merely between
-        // tokens, because on the devices that split (§ the splitter above) a single forward is
-        // tens of seconds of GPU: a token-boundary-only check would make Ctrl-C during an iGPU
-        // prefill sit for a whole forward before it took effect, which is exactly the window in
-        // which a impatient second signal (or a `timeout` SIGKILL) kills the process mid-submit
-        // and wedges the device. Stopping at an op boundary bounds the wait by ONE segment.
-        //
-        // A submitted command buffer CANNOT be cancelled, so this is a "stop recording", never a
-        // "stop waiting". Two halves:
-        //   * the segment being RECORDED right now is not submitted at all — `discard` frees it
-        //     (its dispatches are waste: this forward is being abandoned, and handing the driver
-        //     more work is the last thing we want while trying to stop);
-        //   * everything ALREADY submitted is drained to its fence, exactly as the success path
-        //     does. That is the irreducible part of the wait, and it is why the in-flight window
-        //     (`MAX_INFLIGHT`) is the real latency bound.
-        if shutdown_requested() {
-            let partial = rec.take().expect("segment always Some between ops");
-            partial.discard().map_err(|e| be(e.to_string()))?;
-            for seg in segments {
-                seg.wait().map_err(|e| be(e.to_string()))?;
-            }
-            pstream.drain()?;
-            pstream.finish_prefill_uploads(be_)?;
-            // `transient`, `pool`, `dyn_args` and the scratch arena drop AFTER these waits (they
-            // are locals of this fn), so nothing the GPU was reading is freed under it.
-            return Err(Error::Aborted);
-        }
-        // Split BETWEEN ops, never inside one: a single op can lower to several dispatches that
-        // share transient scratch, and the hazard tracking that orders them is per-recorder.
-        // Crossing the cap therefore closes the segment at the next op boundary.
-        if resident_chunk.is_none()
-            && cap > 0
-            && rec.as_ref().is_some_and(|r| r.dispatches() >= cap)
-        {
-            splitter_splits += 1;
-            pstream.finish_cpu_miss(be_, pool)?;
-            let seg = rec
-                .take()
-                .expect("segment always Some between ops")
-                .finish_nowait()
-                .map_err(|e| be(e.to_string()))?;
-            pstream.start_cpu_promotion(be_)?;
-            submitted_dispatches += seg.dispatches();
-            segments.push_back(seg);
-            // Retire the oldest in-flight segment once the window is full. Queue execution is
-            // FIFO, so by the time we are recording segment N+2 the GPU has almost always already
-            // finished N — in steady state this fence is already signaled and the wait is free.
-            while segments.len() > MAX_INFLIGHT {
-                let old = segments.pop_front().expect("len > MAX_INFLIGHT >= 0");
-                old.wait().map_err(|e| be(e.to_string()))?;
-            }
-            let fresh = be_.recorder()?;
-            // Hazard tracking is per-recorder and starts empty, so cross-segment RAW/WAR ordering
-            // (every layer reads the residual stream the previous segment wrote) is invisible to
-            // it and MUST be seeded explicitly. `vkCmdPipelineBarrier`'s scope spans submission
-            // order on the queue, so this one barrier orders the whole segment after everything
-            // already submitted.
-            fresh.seed_barrier();
-            rec = Some(fresh);
-        }
-        if let Op::MoeFfn { gate_exps, .. } = op {
-            let gbuf = resolve(scratch, bindings, *gate_exps)?;
-            let paged = be_.moe_pager().lock().unwrap().as_ref().is_some_and(|s| {
-                s.is_paged(
-                    crate::pager::Role::Gate,
-                    crate::pager::buffer_identity(gbuf),
-                )
-            });
-            if paged {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+            loop {
                 if let Some(chunk) = resident_chunk.as_mut() {
-                    if pstream.resume_ids.is_none() {
-                        let Op::MoeFfn {
-                            up_exps, down_exps, ..
-                        } = op
-                        else {
-                            unreachable!()
-                        };
-                        let layout = ResidentMoeLayout::from_op(graph, op)
-                            .expect("resident graph contains only supported MoeFfn layouts");
-                        chunk.entries.push(ResidentJournalEntry {
-                            op_idx,
-                            layout,
-                            roles: [
-                                crate::pager::buffer_identity(gbuf),
-                                crate::pager::buffer_identity(resolve(
-                                    scratch, bindings, *up_exps,
-                                )?),
-                                crate::pager::buffer_identity(resolve(
-                                    scratch, bindings, *down_exps,
-                                )?),
-                            ],
-                        });
-                        pstream.gpu_route = Some(GpuRoute {
-                            control: std::sync::Arc::clone(&chunk.control),
-                            journal: std::sync::Arc::clone(&chunk.journal),
-                            ordinal: (chunk.entries.len() - 1) as u32,
-                            notice: chunk
-                                .notices
-                                .as_ref()
-                                .map(|notices| notices.events[chunk.entries.len() - 1]),
-                        });
+                    if let Some(recovery) = chunk.recovery_op {
+                        if resident_recovery_submit_due(
+                            pstream.resume_ids.is_some(),
+                            live_ops.get(live_pos).map(|(_, op)| *op),
+                            cap > 0 && rec.as_ref().is_some_and(|r| r.dispatches() >= cap),
+                        ) {
+                            submitted_dispatches += chunk.submit_early_recovery(
+                                be_,
+                                recovery.op_idx,
+                                &mut rec,
+                                &mut pstream,
+                                &mut segments,
+                                live_pos == live_ops.len(),
+                            )?;
+                        }
                     }
                 }
-                let layer_profile_t0 = infr_core::pager_profile::start();
-                let layer_profile_before =
-                    layer_profile_t0.map(|_| infr_core::pager_profile::paged_moe_hot_snapshot());
-                let layer = execute_paged_moe(
+                if let Some(chunk) = resident_chunk
+                    .as_mut()
+                    .filter(|chunk| chunk.recovery_op.is_none())
+                {
+                    if (chunk.producer.is_some() || live_pos.is_multiple_of(8))
+                        && chunk.notices.is_some()
+                    {
+                        chunk.poll_notices(be_, &mut pstream, None)?;
+                    }
+                    if chunk.notice_resume.is_some() || chunk.notice_stop {
+                        // All commands currently being recorded follow a notified miss and would be
+                        // predicated off. Do not submit or keep encoding them; retain submitted hits.
+                        rec.take().unwrap().discard()?;
+                    }
+                    if !chunk.entries.is_empty()
+                        && (chunk.entries.len() == chunk.limit
+                            || live_pos == live_ops.len()
+                            || chunk.notice_resume.is_some()
+                            || chunk.notice_stop)
+                    {
+                        if let Some((op_idx, ids)) = chunk.finish(
+                            be_,
+                            &mut rec,
+                            &mut pstream,
+                            pool,
+                            &mut segments,
+                            live_pos == live_ops.len(),
+                        )? {
+                            live_pos = live_ops
+                                .iter()
+                                .position(|&(idx, _)| idx == op_idx)
+                                .expect("journal op belongs to this walk");
+                            pstream.resume_ids = Some(ids);
+                            mmv_memo = None;
+                        }
+                        if chunk.recovery_op.is_none() {
+                            while let Some(segment) = segments.pop_front() {
+                                segment.wait()?;
+                            }
+                        }
+                    } else if chunk.submit_due()
+                        || (chunk.recording
+                            && cap > 0
+                            && rec.as_ref().is_some_and(|r| r.dispatches() >= cap))
+                    {
+                        if !chunk.submit_due() {
+                            splitter_splits += 1;
+                        }
+                        let _span = infr_core::timeline::span("gpu_resident_rolling_submit");
+                        let mut segment = rec
+                            .take()
+                            .expect("resident recorder exists")
+                            .finish_nowait()?;
+                        if let Some(waiter) = &chunk.waiter {
+                            segment.start_waiter(waiter)?;
+                        }
+                        chunk.send_producer_jobs(&mut segment, chunk.entries.len())?;
+                        submitted_dispatches += segment.dispatches();
+                        segments.push_back(segment);
+                        while segments.len()
+                            > be_
+                                .cfg()
+                                .kernels
+                                .vulkan
+                                .decode_gpu_resident_inflight
+                                .clamp(1, 2)
+                        {
+                            segments
+                                .pop_front()
+                                .expect("in-flight resident segment")
+                                .wait()?;
+                        }
+                        let fresh = be_.recorder()?;
+                        fresh.seed_barrier();
+                        fresh.arena_stream_barrier();
+                        chunk.begin_conditional(&fresh);
+                        rec = Some(fresh);
+                        chunk.submitted_entries = chunk.entries.len();
+                    }
+                    if live_pos < live_ops.len() && !chunk.recording && pstream.resume_ids.is_none()
+                    {
+                        if let Some(notices) = &chunk.notices {
+                            notices.reset()?;
+                        }
+                        // Initialization is a GPU command after the resumed FFN, never a host write
+                        // into an in-flight predicate. Fresh tape ranges remain pinned until the drain.
+                        let rc = rec.as_ref().unwrap();
+                        // All fresh host LUT windows are published before this recorder is submitted.
+                        rc.arena_stream_barrier();
+                        rc.gpu_resident_check(
+                            chunk.control.as_ref(),
+                            chunk.control.as_ref(),
+                            chunk.control.as_ref(),
+                            chunk.journal.as_ref(),
+                            [0; 6],
+                        );
+                        chunk.begin_conditional(rc);
+                        chunk.recording = true;
+                    }
+                }
+                if live_pos == live_ops.len() {
+                    break;
+                }
+                let (op_idx, op) = live_ops[live_pos];
+                live_pos += 1;
+                // ── shutdown (SIGINT/SIGTERM) ─────────────────────────────────────────────────────────
+                // Polled HERE — at the op/submit boundary INSIDE the forward — and not merely between
+                // tokens, because on the devices that split (§ the splitter above) a single forward is
+                // tens of seconds of GPU: a token-boundary-only check would make Ctrl-C during an iGPU
+                // prefill sit for a whole forward before it took effect, which is exactly the window in
+                // which a impatient second signal (or a `timeout` SIGKILL) kills the process mid-submit
+                // and wedges the device. Stopping at an op boundary bounds the wait by ONE segment.
+                //
+                // A submitted command buffer CANNOT be cancelled, so this is a "stop recording", never a
+                // "stop waiting". Two halves:
+                //   * the segment being RECORDED right now is not submitted at all — `discard` frees it
+                //     (its dispatches are waste: this forward is being abandoned, and handing the driver
+                //     more work is the last thing we want while trying to stop);
+                //   * everything ALREADY submitted is drained to its fence, exactly as the success path
+                //     does. That is the irreducible part of the wait, and it is why the in-flight window
+                //     (`MAX_INFLIGHT`) is the real latency bound.
+                if shutdown_requested() {
+                    let partial = rec.take().expect("segment always Some between ops");
+                    partial.discard().map_err(|e| be(e.to_string()))?;
+                    for seg in segments {
+                        seg.wait().map_err(|e| be(e.to_string()))?;
+                    }
+                    pstream.drain()?;
+                    pstream.finish_prefill_uploads(be_)?;
+                    // `transient`, `pool`, `dyn_args` and the scratch arena drop AFTER these waits (they
+                    // are locals of this fn), so nothing the GPU was reading is freed under it.
+                    return Err(Error::Aborted);
+                }
+                // Split BETWEEN ops, never inside one: a single op can lower to several dispatches that
+                // share transient scratch, and the hazard tracking that orders them is per-recorder.
+                // Crossing the cap therefore closes the segment at the next op boundary.
+                if resident_chunk.is_none()
+                    && cap > 0
+                    && rec.as_ref().is_some_and(|r| r.dispatches() >= cap)
+                {
+                    splitter_splits += 1;
+                    pstream.finish_cpu_miss(be_, pool)?;
+                    let seg = rec
+                        .take()
+                        .expect("segment always Some between ops")
+                        .finish_nowait()
+                        .map_err(|e| be(e.to_string()))?;
+                    pstream.start_cpu_promotion(be_)?;
+                    submitted_dispatches += seg.dispatches();
+                    segments.push_back(seg);
+                    // Retire the oldest in-flight segment once the window is full. Queue execution is
+                    // FIFO, so by the time we are recording segment N+2 the GPU has almost always already
+                    // finished N — in steady state this fence is already signaled and the wait is free.
+                    while segments.len() > MAX_INFLIGHT {
+                        let old = segments.pop_front().expect("len > MAX_INFLIGHT >= 0");
+                        old.wait().map_err(|e| be(e.to_string()))?;
+                    }
+                    let fresh = be_.recorder()?;
+                    // Hazard tracking is per-recorder and starts empty, so cross-segment RAW/WAR ordering
+                    // (every layer reads the residual stream the previous segment wrote) is invisible to
+                    // it and MUST be seeded explicitly. `vkCmdPipelineBarrier`'s scope spans submission
+                    // order on the queue, so this one barrier orders the whole segment after everything
+                    // already submitted.
+                    fresh.seed_barrier();
+                    rec = Some(fresh);
+                }
+                if let Op::MoeFfn { gate_exps, .. } = op {
+                    let gbuf = resolve(scratch, bindings, *gate_exps)?;
+                    let paged = be_.moe_pager().lock().unwrap().as_ref().is_some_and(|s| {
+                        s.is_paged(
+                            crate::pager::Role::Gate,
+                            crate::pager::buffer_identity(gbuf),
+                        )
+                    });
+                    if paged {
+                        if let Some(chunk) = resident_chunk.as_mut() {
+                            if pstream.resume_ids.is_none() {
+                                let Op::MoeFfn {
+                                    up_exps, down_exps, ..
+                                } = op
+                                else {
+                                    unreachable!()
+                                };
+                                let layout = ResidentMoeLayout::from_op(graph, op).expect(
+                                    "resident graph contains only supported MoeFfn layouts",
+                                );
+                                chunk.entries.push(ResidentJournalEntry {
+                                    op_idx,
+                                    layout,
+                                    roles: [
+                                        crate::pager::buffer_identity(gbuf),
+                                        crate::pager::buffer_identity(resolve(
+                                            scratch, bindings, *up_exps,
+                                        )?),
+                                        crate::pager::buffer_identity(resolve(
+                                            scratch, bindings, *down_exps,
+                                        )?),
+                                    ],
+                                });
+                                pstream.gpu_route = Some(GpuRoute {
+                                    control: std::sync::Arc::clone(&chunk.control),
+                                    journal: std::sync::Arc::clone(&chunk.journal),
+                                    ordinal: (chunk.entries.len() - 1) as u32,
+                                    notice: chunk
+                                        .notices
+                                        .as_ref()
+                                        .map(|notices| notices.events[chunk.entries.len() - 1]),
+                                });
+                            }
+                        }
+                        let layer_profile_t0 = infr_core::pager_profile::start();
+                        let layer_profile_before = layer_profile_t0
+                            .map(|_| infr_core::pager_profile::paged_moe_hot_snapshot());
+                        let layer = execute_paged_moe(
+                            be_,
+                            graph,
+                            op_idx,
+                            op,
+                            scratch,
+                            bindings,
+                            pool,
+                            &mut rec,
+                            &mut pstream,
+                            paged_moe_shared.get(&op_idx).copied(),
+                        )?;
+                        if let (Some(t0), Some(before)) = (layer_profile_t0, layer_profile_before) {
+                            infr_core::pager_profile::record_paged_moe_layer(
+                                layer,
+                                t0.elapsed(),
+                                before,
+                                infr_core::pager_profile::paged_moe_hot_snapshot(),
+                            );
+                        }
+                        continue;
+                    }
+                }
+                // Dense layer streaming: a `Op::Linear` whose weight buffer is a registered streamed
+                // block stages its residency (recorded ring→arena copy, pipelined via the same
+                // `PagedStream` rotation the MoE path uses — the CPU's memcpys for later layers overlap
+                // the GPU's execution of already-submitted segments), then lowers through the ORDINARY
+                // Linear arm with the pool arena + slot element base substituted for the placeholder
+                // (see `lower_op`'s `wsub` param). No readbacks anywhere: layer order is deterministic,
+                // so every miss is known the moment the op is reached.
+                if be_.dense_paged() {
+                    if let Op::Linear { weight, .. } = op {
+                        let wid =
+                            crate::pager::buffer_identity(resolve(scratch, bindings, *weight)?);
+                        let streamed = be_
+                            .dense_pager()
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .is_some_and(|s| s.is_streamed(wid));
+                        if streamed {
+                            let arena_addr =
+                                stage_dense_linear(be_, &mut rec, &mut pstream, pool, wid)?;
+                            if let Err(e) = lower_op(
+                                be_,
+                                graph,
+                                op_idx,
+                                op,
+                                rec.as_ref().expect("segment always Some between ops"),
+                                scratch,
+                                bindings,
+                                &fused_kv_write,
+                                &fused_q8_kv_write,
+                                &fused_q8_segmented_write,
+                                &fused_add,
+                                &mode,
+                                &mut transient,
+                                &mut dyn_args,
+                                pool,
+                                &mut mmv_memo,
+                                Some(arena_addr),
+                            ) {
+                                return Err(abort_segment(
+                                    rec.take(),
+                                    be(format!(
+                                        "vulkan adapter: op {op_idx} {} failed: {e}",
+                                        op.kind()
+                                    )),
+                                ));
+                            }
+                            continue;
+                        }
+                    }
+                }
+                if let Err(e) = lower_op(
                     be_,
                     graph,
                     op_idx,
                     op,
+                    rec.as_ref().expect("segment always Some between ops"),
                     scratch,
                     bindings,
+                    &fused_kv_write,
+                    &fused_q8_kv_write,
+                    &fused_q8_segmented_write,
+                    &fused_add,
+                    &mode,
+                    &mut transient,
+                    &mut dyn_args,
                     pool,
-                    &mut rec,
-                    &mut pstream,
-                    paged_moe_shared.get(&op_idx).copied(),
-                )?;
-                if let (Some(t0), Some(before)) = (layer_profile_t0, layer_profile_before) {
-                    infr_core::pager_profile::record_paged_moe_layer(
-                        layer,
-                        t0.elapsed(),
-                        before,
-                        infr_core::pager_profile::paged_moe_hot_snapshot(),
-                    );
+                    &mut mmv_memo,
+                    None,
+                ) {
+                    return Err(abort_segment(
+                        rec.take(),
+                        be(format!(
+                            "vulkan adapter: op {op_idx} {} failed: {e}",
+                            op.kind()
+                        )),
+                    ));
                 }
-                continue;
             }
-        }
-        // Dense layer streaming: a `Op::Linear` whose weight buffer is a registered streamed
-        // block stages its residency (recorded ring→arena copy, pipelined via the same
-        // `PagedStream` rotation the MoE path uses — the CPU's memcpys for later layers overlap
-        // the GPU's execution of already-submitted segments), then lowers through the ORDINARY
-        // Linear arm with the pool arena + slot element base substituted for the placeholder
-        // (see `lower_op`'s `wsub` param). No readbacks anywhere: layer order is deterministic,
-        // so every miss is known the moment the op is reached.
-        if be_.dense_paged() {
-            if let Op::Linear { weight, .. } = op {
-                let wid = crate::pager::buffer_identity(resolve(scratch, bindings, *weight)?);
-                let streamed = be_
-                    .dense_pager()
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .is_some_and(|s| s.is_streamed(wid));
-                if streamed {
-                    let arena_addr = stage_dense_linear(be_, &mut rec, &mut pstream, pool, wid)?;
-                    if let Err(e) = lower_op(
-                        be_,
-                        graph,
-                        op_idx,
-                        op,
-                        rec.as_ref().expect("segment always Some between ops"),
-                        scratch,
-                        bindings,
-                        &fused_kv_write,
-                        &fused_q8_kv_write,
-                        &fused_q8_segmented_write,
-                        &fused_add,
-                        &mode,
-                        &mut transient,
-                        &mut dyn_args,
-                        pool,
-                        &mut mmv_memo,
-                        Some(arena_addr),
-                    ) {
-                        return Err(abort_segment(
-                            rec.take(),
-                            be(format!(
-                                "vulkan adapter: op {op_idx} {} failed: {e}",
-                                op.kind()
-                            )),
-                        ));
+            for c in dyn_args.drain(..) {
+                transient.extend([c.args, c.pm, c.pl, c.pacc]);
+            }
+            // Non-paged static execution keeps the established per-call lifetime: move its buffers beside
+            // the other transient allocations until the final submit drains. Paged buffers remain in the
+            // backend cache and are dropped only on a decode/prefill transition or model teardown.
+            pstream.finish_cpu_miss(be_, pool)?;
+            if !using_phase_arena {
+                transient.extend(pool.drain_values());
+            }
+            if let Some(last) = rec.take() {
+                submitted_dispatches += last.dispatches();
+                if last.dispatches() != 0 {
+                    if let Some(wake) = prepare_wake.take() {
+                        last.on_first_submit(wake);
                     }
-                    continue;
+                }
+                if resident_chunk.is_some() && last.dispatches() == 0 {
+                    last.discard()?;
+                } else if token_row_paged_moe
+                    && !graph.mtp_verify
+                    && be_.cfg().kernels.vulkan.static_decode_tail_overlap
+                {
+                    // Keep this final reader alive while earlier fences, producer acknowledgments and
+                    // command pools retire. This changes only host overlap, not the submitted work or
+                    // the forward's completion/phase boundary.
+                    let pending = last.finish_nowait()?;
+                    let host_result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            pstream.start_cpu_promotion(be_)
+                        }))
+                        .unwrap_or_else(|_| Err(be("post-submit promotion panicked")));
+                    let retirement_result = (|| -> Result<()> {
+                        for segment in segments.drain(..) {
+                            segment.wait()?;
+                        }
+                        pstream.drain()
+                    })();
+                    // Even failed host work must join the final reader before returning an error.
+                    let completion_result = pending.wait();
+                    host_result?;
+                    retirement_result?;
+                    completion_result?;
+                } else {
+                    last.finish_after_submit(|| pstream.start_cpu_promotion(be_))
+                        .map_err(|e| be(e.to_string()))?;
                 }
             }
-        }
-        if let Err(e) = lower_op(
-            be_,
-            graph,
-            op_idx,
-            op,
-            rec.as_ref().expect("segment always Some between ops"),
-            scratch,
-            bindings,
-            &fused_kv_write,
-            &fused_q8_kv_write,
-            &fused_q8_segmented_write,
-            &fused_add,
-            &mode,
-            &mut transient,
-            &mut dyn_args,
-            pool,
-            &mut mmv_memo,
-            None,
-        ) {
-            return Err(abort_segment(
-                rec.take(),
-                be(format!(
-                    "vulkan adapter: op {op_idx} {} failed: {e}",
-                    op.kind()
-                )),
-            ));
-        }
-    }
-    for c in dyn_args.drain(..) {
-        transient.extend([c.args, c.pm, c.pl, c.pacc]);
-    }
-    // Non-paged static execution keeps the established per-call lifetime: move its buffers beside
-    // the other transient allocations until the final submit drains. Paged buffers remain in the
-    // backend cache and are dropped only on a decode/prefill transition or model teardown.
-    pstream.finish_cpu_miss(be_, pool)?;
-    if !using_phase_arena {
-        transient.extend(pool.drain_values());
-    }
-    if let Some(last) = rec.take() {
-        submitted_dispatches += last.dispatches();
-        if resident_chunk.is_some() && last.dispatches() == 0 {
-            last.discard()?;
-        } else if token_row_paged_moe
-            && !graph.mtp_verify
-            && be_.cfg().kernels.vulkan.static_decode_tail_overlap
-        {
-            // Keep this final reader alive while earlier fences, producer acknowledgments and
-            // command pools retire. This changes only host overlap, not the submitted work or
-            // the forward's completion/phase boundary.
-            let pending = last.finish_nowait()?;
-            let host_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                pstream.start_cpu_promotion(be_)
-            }))
-            .unwrap_or_else(|_| Err(be("post-submit promotion panicked")));
-            let retirement_result = (|| -> Result<()> {
-                for segment in segments.drain(..) {
-                    segment.wait()?;
+            if let Some(wake) = prepare_wake.take() {
+                let _ = wake.try_send(());
+            }
+            // The overlapping path already retired these. Blocking and empty-tail paths still own
+            // their segments; every referenced buffer remains alive until this drain completes.
+            for seg in segments {
+                seg.wait().map_err(|e| be(e.to_string()))?;
+            }
+            pstream.drain()?;
+            pstream.wait_cpu_promotion(be_)?;
+            if pstream.cpu_transfer_wait != 0 {
+                let acquire = be_.recorder()?;
+                pstream.acquire_cpu_promotion(&acquire);
+                acquire.finish()?;
+            }
+            pstream.finish_prefill_uploads(be_)?;
+            if let Some(abort) = pstream.cpu_promotion_abort.as_mut() {
+                abort.complete = true;
+            }
+            // Every recorder and pager-owned pending segment has now resolved its two GPU timestamps.
+            // Fold this complete sample into the finite auto-tuner; dropping the guard on an earlier error
+            // cancels the partial round instead.
+            submit_tune_round.finish(splitter_splits);
+            if let Some(before) = submit_before {
+                let submits = infr_core::pager_profile::queue_submit_count().saturating_sub(before);
+                infr_core::pager_profile::record_splitter_forward(
+                    cap,
+                    be_.submit_dispatch_cap(),
+                    submitted_dispatches,
+                    submits,
+                );
+            }
+            complete_decode_prefetch_handoffs(be_);
+            if be_.cfg().kernels.vulkan.cpu_miss_token_park && pstream.cpu_miss_controller.is_some()
+            {
+                // All result readers and cache promotions drained; avoid private spin crossing into
+                // the next forward's PLE work while preserving warm phase/layer handoffs within this one.
+                if let Some(worker) = be_.cpu_miss_worker() {
+                    worker.finish_burst()?;
                 }
-                pstream.drain()
-            })();
-            // Even failed host work must join the final reader before returning an error.
-            let completion_result = pending.wait();
-            host_result?;
-            retirement_result?;
-            completion_result?;
-        } else {
-            last.finish_after_submit(|| pstream.start_cpu_promotion(be_))
-                .map_err(|e| be(e.to_string()))?;
+            }
+            Ok(())
+        }));
+        // Unsubmitted recorders drop their wake sender on errors. Always join before a pool
+        // can compact, and never turn an unused preparation failure into a current-step error.
+        if !matches!(&result, Ok(Ok(()))) {
+            preparation_cancelled.store(true, Ordering::Release);
         }
-    }
-    // The overlapping path already retired these. Blocking and empty-tail paths still own
-    // their segments; every referenced buffer remains alive until this drain completes.
-    for seg in segments {
-        seg.wait().map_err(|e| be(e.to_string()))?;
-    }
-    pstream.drain()?;
-    pstream.wait_cpu_promotion(be_)?;
-    if pstream.cpu_transfer_wait != 0 {
-        let acquire = be_.recorder()?;
-        pstream.acquire_cpu_promotion(&acquire);
-        acquire.finish()?;
-    }
-    pstream.finish_prefill_uploads(be_)?;
-    if using_phase_arena {
-        // All queue work and asynchronous Prefill uploads that can reference pooled buffers have
-        // drained. It is now safe to release superseded capacities from this execute.
+        drop(
+            resident_chunk
+                .as_mut()
+                .and_then(|chunk| chunk.command_tail_ready.take()),
+        );
+        if let Some(wake) = prepare_wake.take() {
+            let _ = wake.try_send(());
+        }
+        drop(rec.take());
+        match result {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    });
+    if result.is_ok() && using_phase_arena {
         phase_arena
             .as_mut()
-            .expect("phase arena exists when cached runtime is active")
+            .expect("cached phase exists")
             .finish_execute();
     }
-    if let Some(abort) = pstream.cpu_promotion_abort.as_mut() {
-        abort.complete = true;
-    }
-    // Every recorder and pager-owned pending segment has now resolved its two GPU timestamps.
-    // Fold this complete sample into the finite auto-tuner; dropping the guard on an earlier error
-    // cancels the partial round instead.
-    submit_tune_round.finish(splitter_splits);
-    if let Some(before) = submit_before {
-        let submits = infr_core::pager_profile::queue_submit_count().saturating_sub(before);
-        infr_core::pager_profile::record_splitter_forward(
-            cap,
-            be_.submit_dispatch_cap(),
-            submitted_dispatches,
-            submits,
-        );
-    }
-    complete_decode_prefetch_handoffs(be_);
-    if be_.cfg().kernels.vulkan.cpu_miss_token_park && pstream.cpu_miss_controller.is_some() {
-        // All result readers and cache promotions drained; avoid private spin crossing into
-        // the next forward's PLE work while preserving warm phase/layer handoffs within this one.
-        if let Some(worker) = be_.cpu_miss_worker() {
-            worker.finish_burst()?;
-        }
-    }
-    Ok(())
+    result
 }
 
 /// Get-or-alloc a pooled buffer with an explicit `usage` (unlike [`pooled`], which is always
@@ -11410,6 +11585,7 @@ struct ResidentChunk {
     notice_cursor: usize,
     notice_resume: Option<(usize, Vec<u32>)>,
     notice_stop: bool,
+    command_tail_ready: Option<std::sync::mpsc::SyncSender<()>>,
     producer: Option<Arc<ResidentNoticeProducer>>,
     notices_sent: usize,
     mapped_serial_max_bytes: usize,
@@ -11911,6 +12087,12 @@ fn resident_notice_slots(
 }
 
 impl ResidentChunk {
+    fn notify_command_tail_ready(&mut self) {
+        if let Some(sender) = self.command_tail_ready.take() {
+            let _ = sender.try_send(());
+        }
+    }
+
     fn send_producer_jobs(
         &mut self,
         segment: &mut crate::recorder::PendingSegment,
@@ -12122,6 +12304,7 @@ impl ResidentChunk {
             notice_cursor: 0,
             notice_resume: None,
             notice_stop: false,
+            command_tail_ready: None,
             producer: buffers.producer.clone(),
             notices_sent: 0,
             mapped_serial_max_bytes: resident_mapped_serial_max_bytes(
@@ -12399,6 +12582,9 @@ impl ResidentChunk {
             }
             self.send_producer_jobs(&mut pending, self.entries.len())?;
             self.poll_notices(be_, ps, Some(&pending))?;
+            if graph_end && self.notice_resume.is_none() && !self.notice_stop {
+                self.notify_command_tail_ready();
+            }
             // Error paths drain through PendingSegment::drop before phase storage disappears.
             if self.early_recovery && self.notice_resume.is_some() {
                 segments.push_back(pending);
@@ -12540,6 +12726,7 @@ impl ResidentChunk {
         rec: &mut Option<Recorder<'a>>,
         ps: &mut PagedStream,
         segments: &mut std::collections::VecDeque<crate::recorder::PendingSegment>,
+        graph_end: bool,
     ) -> Result<usize> {
         let recovery = self.recovery_op.take().expect("pending recovery");
         if op_idx != recovery.op_idx
@@ -12555,6 +12742,10 @@ impl ResidentChunk {
             .finish_nowait()?;
         let dispatches = pending.dispatches();
         segments.push_back(pending);
+        // The full live-op walk includes the head; capped or pre-router recovery is not final.
+        if graph_end {
+            self.notify_command_tail_ready();
+        }
         // Queue the next frontend before CPU retirement. Decode early-submit may already have
         // queued the miss FFN separately; this larger useful interval still covers cleanup.
         // Queue order and the transfer semaphore protect both the residual and missing weights.
@@ -15719,6 +15910,7 @@ mod tests {
             static_scratch: OnceLock::new(),
             prepare_enabled: true,
             phase_requests: None,
+            prepared_prefix: Mutex::new(None),
         };
         for _ in 0..2 {
             let error = plan.prepare().unwrap_err().to_string();
