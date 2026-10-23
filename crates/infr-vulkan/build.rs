@@ -953,6 +953,8 @@ fn main() {
         ),
         ("qsa_indexer_topk", "qsa_indexer_topk", &[]),
         ("linear_native_q8_pair", "linear_native_q8_pair", &[]),
+        ("silu_mul_quant_q8", "silu_mul_quant_q8", &[]),
+        ("silu_mul_quant_q8", "silu_mul_quant_q8_gu", &["-DFUSED_GU"]),
         (
             "qsa_indexer_topk",
             "qsa_indexer_topk_ordered",

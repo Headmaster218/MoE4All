@@ -7846,6 +7846,8 @@ fn lower_op(
                     n_expert_local,
                     n_used,
                 );
+                let fused_silu_quant =
+                    *act == Activation::Silu && rec.can_silu_quant_q8(n_pairs, nff);
                 if let Some(ue) = ue {
                     // Split (qwen3moe, llama4): the up GEMM reads the same quantized activations
                     // and writes its own buffer — disjoint from the gate GEMM, no barrier needed.
@@ -7879,13 +7881,15 @@ fn lower_op(
                         rec.moe_weight_scale(pool[&ge].as_ref(), bucket_wts.as_ref(), n_pairs, nff);
                         rec.moe_weight_scale(pool[&ue].as_ref(), bucket_wts.as_ref(), n_pairs, nff);
                     }
-                    rec.silu_mul(
-                        pool[&ge].as_ref(),
-                        pool[&ue].as_ref(),
-                        pool[&ae].as_ref(),
-                        n_pairs * nff,
-                        *swiglu_clamp,
-                    );
+                    if !fused_silu_quant {
+                        rec.silu_mul(
+                            pool[&ge].as_ref(),
+                            pool[&ue].as_ref(),
+                            pool[&ae].as_ref(),
+                            n_pairs * nff,
+                            *swiglu_clamp,
+                        );
+                    }
                 } else {
                     // Fused: `ge` already holds [n_pairs, 2*nff] (gate half first, up half second
                     // per row) from the single wide GEMM above.
@@ -7897,36 +7901,51 @@ fn lower_op(
                             gu_width,
                         );
                     }
-                    match act {
-                        Activation::Silu => rec.silu_mul_fused(
-                            pool[&ge].as_ref(),
-                            pool[&ae].as_ref(),
-                            n_pairs,
-                            nff,
-                            *swiglu_clamp,
-                        ),
-                        Activation::Gelu => rec.gelu_mul_fused(
-                            pool[&ge].as_ref(),
-                            pool[&ae].as_ref(),
-                            n_pairs,
-                            nff,
-                            *swiglu_clamp,
-                        ),
-                        Activation::Sigmoid => {
-                            return Err(be(
+                    if !fused_silu_quant {
+                        match act {
+                            Activation::Silu => rec.silu_mul_fused(
+                                pool[&ge].as_ref(),
+                                pool[&ae].as_ref(),
+                                n_pairs,
+                                nff,
+                                *swiglu_clamp,
+                            ),
+                            Activation::Gelu => rec.gelu_mul_fused(
+                                pool[&ge].as_ref(),
+                                pool[&ae].as_ref(),
+                                n_pairs,
+                                nff,
+                                *swiglu_clamp,
+                            ),
+                            Activation::Sigmoid => {
+                                return Err(be(
                                 "vulkan adapter: fused_gate_up batched MoeFfn Sigmoid unsupported",
                             ));
+                            }
                         }
                     }
                 }
-                rec.quant_q8(
-                    pool[&ae].as_ref(),
-                    pool[&dqa].as_ref(),
-                    pool[&dda].as_ref(),
-                    pool[&dsa].as_ref(),
-                    n_pairs,
-                    nff,
-                );
+                if fused_silu_quant {
+                    rec.silu_mul_quant_q8(
+                        pool[&ge].as_ref(),
+                        ue.as_ref().map(|id| pool[id].as_ref()),
+                        pool[&dqa].as_ref(),
+                        pool[&dda].as_ref(),
+                        pool[&dsa].as_ref(),
+                        n_pairs,
+                        nff,
+                        *swiglu_clamp,
+                    );
+                } else {
+                    rec.quant_q8(
+                        pool[&ae].as_ref(),
+                        pool[&dqa].as_ref(),
+                        pool[&dda].as_ref(),
+                        pool[&dsa].as_ref(),
+                        n_pairs,
+                        nff,
+                    );
+                }
                 // The min-carrying down formats (Q4_K/Q5_K's K-quant min, Q5_1/Q4_1's legacy min)
                 // bind `sact` — the rest of `MOE_MMQ_DTYPES` are symmetric (no min), and Q2_K
                 // self-computes its own min term in-shader (see the gate/up `_needs_sact` comment
@@ -14219,43 +14238,56 @@ fn execute_paged_moe<'a>(
                 rec2.moe_weight_scale(pool[ue].as_ref(), pool[&bucket_wts].as_ref(), n_pairs, nff);
             }
         }
-        match &ue {
-            // Split: gate and up are separate [n_pairs, nff] buffers.
-            Some(ue) => rec2.silu_mul(
+        if *act == Activation::Silu && rec2.can_silu_quant_q8(n_pairs, nff) {
+            rec2.silu_mul_quant_q8(
                 pool[&ge].as_ref(),
-                pool[ue].as_ref(),
-                pool[&ae].as_ref(),
-                n_pairs * nff,
+                ue.as_ref().map(|id| pool[id].as_ref()),
+                pool[&dqa].as_ref(),
+                pool[&dda].as_ref(),
+                pool[&dsa].as_ref(),
+                n_pairs,
+                nff,
                 *swiglu_clamp,
-            ),
-            // Fused: `ge` already holds [n_pairs, 2*nff] (gate half first, up half second per
-            // row) from the single wide GEMM above — the resident batched fused arm's shape.
-            None => match act {
-                Activation::Silu => rec2.silu_mul_fused(
+            );
+        } else {
+            match &ue {
+                // Split: gate and up are separate [n_pairs, nff] buffers.
+                Some(ue) => rec2.silu_mul(
                     pool[&ge].as_ref(),
+                    pool[ue].as_ref(),
                     pool[&ae].as_ref(),
-                    n_pairs,
-                    nff,
+                    n_pairs * nff,
                     *swiglu_clamp,
                 ),
-                Activation::Gelu => rec2.gelu_mul_fused(
-                    pool[&ge].as_ref(),
-                    pool[&ae].as_ref(),
-                    n_pairs,
-                    nff,
-                    *swiglu_clamp,
-                ),
-                Activation::Sigmoid => unreachable!("act_ok gate above excludes Sigmoid"),
-            },
+                // Fused: `ge` already holds [n_pairs, 2*nff] (gate half first, up half second per
+                // row) from the single wide GEMM above — the resident batched fused arm's shape.
+                None => match act {
+                    Activation::Silu => rec2.silu_mul_fused(
+                        pool[&ge].as_ref(),
+                        pool[&ae].as_ref(),
+                        n_pairs,
+                        nff,
+                        *swiglu_clamp,
+                    ),
+                    Activation::Gelu => rec2.gelu_mul_fused(
+                        pool[&ge].as_ref(),
+                        pool[&ae].as_ref(),
+                        n_pairs,
+                        nff,
+                        *swiglu_clamp,
+                    ),
+                    Activation::Sigmoid => unreachable!("act_ok gate above excludes Sigmoid"),
+                },
+            }
+            rec2.quant_q8(
+                pool[&ae].as_ref(),
+                pool[&dqa].as_ref(),
+                pool[&dda].as_ref(),
+                pool[&dsa].as_ref(),
+                n_pairs,
+                nff,
+            );
         }
-        rec2.quant_q8(
-            pool[&ae].as_ref(),
-            pool[&dqa].as_ref(),
-            pool[&dda].as_ref(),
-            pool[&dsa].as_ref(),
-            n_pairs,
-            nff,
-        );
         {
             let guard = be_.moe_pager().lock().unwrap();
             let sess = guard.as_ref().expect("checked above");

@@ -709,6 +709,7 @@ struct VulkanShared {
     _entry: ash::Entry,
     instance: ash::Instance,
     physical_device: vk::PhysicalDevice,
+    exact_silu_quant_order: bool,
     device: ash::Device,
     queue: vk::Queue,
     queue_family_index: u32,
@@ -3043,6 +3044,13 @@ impl VulkanBackend {
             && !self.shared.caps.integrated
     }
 
+    pub(crate) fn prefers_silu_quant_q8(&self) -> bool {
+        cfg!(target_os = "windows")
+            && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+            && !self.shared.caps.integrated
+            && self.shared.exact_silu_quant_order
+    }
+
     pub(crate) fn prefers_qsa_topk_ordered(&self) -> bool {
         cfg!(target_os = "windows")
             && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
@@ -4683,6 +4691,11 @@ impl VulkanBackend {
                 _entry: entry,
                 instance,
                 physical_device,
+                // This fusion preserves the split shader's measured driver arithmetic order.
+                // Unknown compilers retain the original pair until exactness is qualified.
+                exact_silu_quant_order: device_probe.driver_id_reported
+                    && device_probe.driver_id == vk::DriverId::AMD_PROPRIETARY
+                    && props.driver_version == 8_389_003,
                 device,
                 queue,
                 queue_family_index,

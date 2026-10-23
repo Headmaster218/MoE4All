@@ -3099,6 +3099,26 @@ pub(crate) fn iq4_pair_lut_kernel(small: bool, paged: bool) -> (&'static str, &'
     }
 }
 
+pub(crate) fn silu_quant_q8_kernel(fused_gu: bool) -> (&'static str, &'static [u32]) {
+    macro_rules! variant {
+        ($name:literal) => {{
+            static SPV: OnceLock<Vec<u32>> = OnceLock::new();
+            (
+                $name,
+                SPV.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            )
+        }};
+    }
+    if fused_gu {
+        variant!("silu_mul_quant_q8_gu")
+    } else {
+        variant!("silu_mul_quant_q8")
+    }
+}
+
 pub(crate) fn linear_native_q8_pair_spv() -> &'static [u32] {
     static SPV: OnceLock<Vec<u32>> = OnceLock::new();
     SPV.get_or_init(|| {

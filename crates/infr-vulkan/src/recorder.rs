@@ -33,6 +33,10 @@ mod flash_pv_reuse_contract;
 mod g01_cold_state_contract;
 
 #[cfg(test)]
+#[path = "swiglu_quant_contract.rs"]
+mod swiglu_quant_contract;
+
+#[cfg(test)]
 #[path = "kquant_decode_contract.rs"]
 mod kquant_decode_contract;
 
@@ -2369,6 +2373,53 @@ impl<'a> Recorder<'a> {
             &push,
             groups,
         );
+    }
+
+    pub(crate) fn can_silu_quant_q8(&self, rows: usize, k: usize) -> bool {
+        self.vk().silu_quant_q8
+            && self.be.prefers_silu_quant_q8()
+            && rows > 0
+            && rows <= 40960
+            && matches!(k, 512 | 640 | 1024)
+    }
+
+    pub(crate) fn silu_mul_quant_q8(
+        &self,
+        gate: &dyn Buffer,
+        up: Option<&dyn Buffer>,
+        qa: &dyn Buffer,
+        da: &dyn Buffer,
+        sa: &dyn Buffer,
+        rows: usize,
+        k: usize,
+        clamp: Option<f32>,
+    ) {
+        let (name, spv) = crate::gemm::silu_quant_q8_kernel(up.is_none());
+        let kernel = self
+            .be
+            .kernel_sg(name, spv, if up.is_some() { 5 } else { 4 }, 16, 32);
+        let pc = [
+            rows as u32,
+            k as u32,
+            u32::from(clamp.is_some()),
+            clamp.unwrap_or(0.0).to_bits(),
+        ];
+        let groups = (rows * (k / 32)) as u32;
+        let gy = groups.div_ceil(Self::MAX_GROUP_COUNT_X).max(1);
+        let gx = groups.div_ceil(gy);
+        let record = |buffers: &[vk::DescriptorBufferInfo]| {
+            self.dispatch3(kernel, buffers, 3, bytemuck::cast_slice(&pc), gx, gy, 1);
+        };
+        match up {
+            Some(up) => record(&[
+                Self::vkb(gate),
+                Self::vkb(up),
+                Self::vkb(qa),
+                Self::vkb(da),
+                Self::vkb(sa),
+            ]),
+            None => record(&[Self::vkb(gate), Self::vkb(qa), Self::vkb(da), Self::vkb(sa)]),
+        }
     }
 
     pub(crate) fn linear_q8_pair(
