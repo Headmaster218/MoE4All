@@ -21,6 +21,7 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 layout(push_constant) uniform PC {
     uint rows;
     uint ne;
+    uint table_rows;
 } pc;
 layout(binding = 0) readonly buffer TB { int table[]; };
 layout(binding = 1) readonly buffer IB { int ids[]; };
@@ -32,8 +33,12 @@ void main() {
     if (i >= total) { return; }
     uint r = i / pc.ne;
     uint j = i - r * pc.ne;
-    // In-range by the same contract embed_gather's `ids` carries: these are the model's own token
-    // ids, and the host refuses a `ffn_gate_tid2eid` whose row count is not the vocabulary
-    // (see the deepseek4 checks in `generate_dense_backend`).
-    dst[i] = table[uint(ids[r]) * pc.ne + j];
+    // Logical tensor rows, not descriptor length: pooled descriptors may include padding.
+    // Argmax's non-finite sentinel must not index the table or reach a chained embedding.
+    uint row = uint(ids[r]);
+    if (row >= pc.table_rows) {
+        dst[i] = 0;
+        return;
+    }
+    dst[i] = table[row * pc.ne + j];
 }

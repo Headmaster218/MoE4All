@@ -5033,13 +5033,15 @@ impl<'a> Recorder<'a> {
         dst: &dyn Buffer,
         rows: usize,
         ne: usize,
+        table_rows: u32,
     ) {
         let k = self
             .be
-            .kernel("gather_i32", crate::gemm::gather_i32_spv(), 3, 8);
-        let mut push = [0u8; 8];
+            .kernel("gather_i32", crate::gemm::gather_i32_spv(), 3, 12);
+        let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&table_rows.to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(table), Self::vkb(ids), Self::vkb(dst)],

@@ -8294,7 +8294,20 @@ fn lower_op(
                      I32, got {dt:?}"
                 )));
             }
-            rec.gather_i32(r(*table)?, r(*ids)?, r(*dst)?, *rows as usize, *ne as usize);
+            let elements = graph.desc(*table).numel();
+            if *ne == 0 || !elements.is_multiple_of(*ne as usize) {
+                return Err(be("vulkan GatherI32: invalid logical table row width"));
+            }
+            let table_rows = u32::try_from(elements / *ne as usize)
+                .map_err(|_| be("vulkan GatherI32: logical table row count exceeds u32"))?;
+            rec.gather_i32(
+                r(*table)?,
+                r(*ids)?,
+                r(*dst)?,
+                *rows as usize,
+                *ne as usize,
+                table_rows,
+            );
         }
         Op::SamplingPenalty {
             x,
