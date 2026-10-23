@@ -14,6 +14,7 @@ verified_commit: ed62393068679573afe94a1472454efe7eae0f15
 ## 性能
 
 - [Benchmarking 与 profiling](performance/benchmarking.md)
+- [量化 MoE 专家的异构执行成本模型与收益边界](performance/expert-execution-cost-model.md)：从解码、计算、传输和重叠推导路径选择；硬件算例与历史证据分层引用。
 - [优化方法和已知误区](performance/optimization-playbook.md)
 
 ## 验证与发布
