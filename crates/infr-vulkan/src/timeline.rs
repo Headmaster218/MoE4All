@@ -88,6 +88,7 @@ pub(crate) struct Query {
     signal: u64,
     bytes: u64,
     dispatches: usize,
+    emit: bool,
 }
 
 impl Query {
@@ -147,7 +148,20 @@ impl Query {
             signal: 0,
             bytes: 0,
             dispatches: 0,
+            emit: true,
         }))
+    }
+
+    /// Commands were recorded under an older step, but execute only in this acknowledged one.
+    pub(crate) fn activate_prepared(&mut self, context: Option<Context>) {
+        self.emit = context.is_some();
+        if let Some(context) = context {
+            self.ctx = context;
+            for (_, label) in &mut self.labels {
+                label.step = context.step;
+                label.lanes = context.lanes;
+            }
+        }
     }
 
     pub(crate) fn mark(&mut self, name: &'static str) {
@@ -195,6 +209,9 @@ impl Query {
     }
 
     pub(crate) fn resolve(mut self) {
+        if !self.emit {
+            return;
+        }
         let _span = timeline::span("trace_query_readback");
         let mut ticks = vec![0u64; self.labels.len() + 2];
         match unsafe {

@@ -11,6 +11,24 @@ pub(crate) fn preparing_commands() -> bool {
 }
 
 struct RecordingGuard;
+
+/// Keep unready work out of Rayon: nested parallel expert copies may steal queued tasks.
+pub(super) struct DeferredPreparation<F>(Option<F>);
+
+impl<F> DeferredPreparation<F> {
+    pub(super) fn new(job: Option<F>) -> Self {
+        Self(job)
+    }
+
+    pub(super) fn start<'scope>(&mut self, scope: &rayon::Scope<'scope>)
+    where
+        F: FnOnce() + Send + 'scope,
+    {
+        if let Some(job) = self.0.take() {
+            scope.spawn(move |_| job());
+        }
+    }
+}
 impl RecordingGuard {
     fn enter() -> Self {
         assert!(!RECORDING.with(|value| value.replace(true)));
@@ -44,6 +62,38 @@ pub(super) struct PreparedPrefix {
     pool: Vec<(ScratchKey, u64, usize, usize)>,
     positions: Vec<(TensorId, usize)>,
     pub(super) end: usize,
+    resident: Option<PreparedResident>,
+}
+
+struct PreparedResident {
+    chunk: ResidentChunk,
+    tape: Arc<dyn Buffer>,
+    banks: Vec<(usize, u64, usize)>,
+    tape_words: usize,
+}
+
+pub(super) struct ActivatedPrefix {
+    pub(super) command: crate::recorder::PreparedCommand,
+    pub(super) end: usize,
+    pub(super) resident: Option<ResidentChunk>,
+    pub(super) tape_words: usize,
+}
+
+fn resident_end(graph: &Graph, layers: usize) -> Option<usize> {
+    prefix_end(graph)?;
+    let mut count = 0;
+    for (index, op) in graph.ops.iter().enumerate() {
+        if matches!(op, Op::MoeFfn { .. }) {
+            ResidentMoeLayout::from_op(graph, op)?;
+            count += 1;
+            if count == layers {
+                return Some(index + 1);
+            }
+        } else if !supported_op(op) {
+            return None;
+        }
+    }
+    None
 }
 
 fn positions_match(
@@ -76,7 +126,6 @@ fn keys(scratch: &ScratchSet, bindings: &Bindings, id: TensorId) -> Result<Vec<B
 pub(crate) fn supported(be_: &VulkanBackend) -> bool {
     be_.cfg().device.decode_command_ahead
         && be_.moe_paged()
-        && !infr_core::timeline::enabled()
         && !infr_core::pager_profile::active()
         && !be_.cfg().prof.ops
         && !be_.cfg().prof.stages
@@ -104,44 +153,45 @@ pub(super) fn prefix_end(graph: &Graph) -> Option<usize> {
     }) {
         return None;
     }
-    (end > 0
-        && graph.ops[..end].iter().all(|op| {
-            matches!(
-                op,
-                Op::EmbedGather { .. }
-                    | Op::Copy { .. }
-                    | Op::CopyStrided { .. }
-                    | Op::Linear { m: 1, .. }
-                    | Op::LinearPair { m: 1, .. }
-                    | Op::RmsNorm { .. }
-                    | Op::RmsNormAdd { .. }
-                    | Op::LayerNorm { .. }
-                    | Op::QwenHcNorm { .. }
-                    | Op::QwenHcMix { .. }
-                    | Op::QwenHcDownInject { .. }
-                    | Op::QwenHcInject { .. }
-                    | Op::QwenHcInjectNorm { .. }
-                    | Op::QwenPleGate { .. }
-                    | Op::QkNorm { .. }
-                    | Op::GatedRmsNorm { .. }
-                    | Op::QkNormRope { .. }
-                    | Op::Rope { .. }
-                    | Op::WriteKv { .. }
-                    | Op::Attention { rows: 1, .. }
-                    | Op::Conv1dSilu { rows: 1, .. }
-                    | Op::DeltaNet { rows: 1, .. }
-                    | Op::GatedAct { .. }
-                    | Op::GatedActFused { .. }
-                    | Op::Silu { .. }
-                    | Op::Gelu { .. }
-                    | Op::Add { .. }
-                    | Op::AddBias { .. }
-                    | Op::MulVec { .. }
-                    | Op::Scale { .. }
-                    | Op::HeadwiseSigmoidMul { .. }
-            )
-        }))
-    .then_some(end)
+    (end > 0 && graph.ops[..end].iter().all(supported_op)).then_some(end)
+}
+
+fn supported_op(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::EmbedGather { .. }
+            | Op::Copy { .. }
+            | Op::CopyStrided { .. }
+            | Op::Linear { m: 1, .. }
+            | Op::LinearPair { m: 1, .. }
+            | Op::RmsNorm { .. }
+            | Op::RmsNormAdd { .. }
+            | Op::LayerNorm { .. }
+            | Op::QwenHcNorm { .. }
+            | Op::QwenHcMix { .. }
+            | Op::QwenHcDownInject { .. }
+            | Op::QwenHcInject { .. }
+            | Op::QwenHcInjectNorm { .. }
+            | Op::QwenPleGate { .. }
+            | Op::QkNorm { .. }
+            | Op::GatedRmsNorm { .. }
+            | Op::QkNormRope { .. }
+            | Op::Rope { .. }
+            | Op::WriteKv { .. }
+            | Op::Attention { rows: 1, .. }
+            | Op::Conv1dSilu { rows: 1, .. }
+            | Op::DeltaNet { rows: 1, .. }
+            | Op::GatedAct { .. }
+            | Op::GatedActFused { .. }
+            | Op::Silu { .. }
+            | Op::Gelu { .. }
+            | Op::Add { .. }
+            | Op::AddBias { .. }
+            | Op::MulVec { .. }
+            | Op::Scale { .. }
+            | Op::HeadwiseSigmoidMul { .. }
+            | Op::MoeSharedExpertAdd { rows: 1, .. }
+    )
 }
 
 /// Alias allocation objects only for the scoped recorder. Pin every source capacity against
@@ -181,14 +231,20 @@ pub(super) fn compatible(current: &Graph, next: &Graph, scratch: &ScratchSet) ->
 }
 
 impl PreparedPrefix {
+    pub(super) fn resident_layers(&self) -> usize {
+        self.resident
+            .as_ref()
+            .map_or(0, |resident| resident.chunk.entries.len())
+    }
     pub(super) fn take_if_valid(
         self,
         be_: &VulkanBackend,
         scratch: &ScratchSet,
         pool: &mut ScratchPool,
         bindings: &Bindings,
-    ) -> Option<(crate::recorder::PreparedCommand, usize)> {
-        if !enabled(be_) {
+        retained: Option<&ResidentBuffers>,
+    ) -> Option<ActivatedPrefix> {
+        if !enabled(be_) || !self.command.trace_compatible() {
             return None;
         }
         let epoch = be_.shared.resource_epoch.load(Ordering::Acquire);
@@ -227,7 +283,58 @@ impl PreparedPrefix {
         // begin_execute cleared the previous step's pins. Keep referenced capacities alive
         // through this submission even when no further command is being prepared.
         pool.in_use.extend(self.pool.iter().map(|(key, ..)| *key));
-        Some((self.command, self.end))
+        let mut tape_words = 0;
+        let resident = if let Some(mut prepared) = self.resident {
+            let buffers = retained?;
+            if !Arc::ptr_eq(&buffers.control, &prepared.chunk.control)
+                || !Arc::ptr_eq(&buffers.journal, &prepared.chunk.journal)
+                || !match (&buffers.notices, &prepared.chunk.notices) {
+                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                    (None, None) => true,
+                    _ => false,
+                }
+            {
+                return None;
+            }
+            let mut guard = be_.moe_pager().lock().ok()?;
+            let session = guard.as_mut()?;
+            if !Arc::ptr_eq(&session.retained_tape(), &prepared.tape)
+                || prepared.banks.iter().any(|&(role, address, bytes)| {
+                    session.arena_addr(role).ok() != Some(address)
+                        || session.slot_bytes(role).ok() != Some(bytes)
+                })
+            {
+                return None;
+            }
+            // No submitted command references these new tape ranges yet. Only now publish
+            // fresh addresses; recording on the previous token never froze or wrote them.
+            for entry in &prepared.chunk.entries {
+                for &role in &entry.roles {
+                    session
+                        .resident_lut_window(&mut tape_words, role, entry.layout.n_expert)
+                        .ok()?;
+                }
+            }
+            if tape_words != prepared.tape_words {
+                return None;
+            }
+            if let Some(notices) = &prepared.chunk.notices {
+                notices.reset().ok()?;
+            }
+            // Speculative packets must not own the live producer: ResidentChunk::drop drains
+            // and resets it. Attach those runtime owners only after successful activation.
+            prepared.chunk.producer = buffers.producer.clone();
+            prepared.chunk.waiter = buffers.waiter.clone();
+            Some(prepared.chunk)
+        } else {
+            None
+        };
+        Some(ActivatedPrefix {
+            command: self.command,
+            end: self.end,
+            resident,
+            tape_words,
+        })
     }
 }
 
@@ -238,11 +345,34 @@ pub(super) fn record(
     bindings: &Bindings,
     positions: &[usize],
     mut pool: ScratchPool,
+    mut resident: Option<ResidentChunk>,
 ) -> Result<PreparedPrefix> {
     use ash::vk::Handle;
     let _guard = RecordingGuard::enter();
     let graph = &plan.graph;
-    let end = prefix_end(graph).ok_or_else(|| be("unsupported prepared prefix"))?;
+    if let Some(chunk) = resident.as_mut() {
+        let cfg = &be_.cfg().kernels.vulkan;
+        let submit_layers = match cfg.decode_gpu_resident_submit_layers {
+            0 => graph.resident_submit_layers.unwrap_or(1),
+            explicit => explicit,
+        };
+        chunk.submit_layers = submit_layers;
+        chunk.mapped_serial_max_bytes =
+            resident_mapped_serial_max_bytes(cfg.decode_gpu_resident_mapped_serial_max_kib, graph);
+        if !(1..chunk.limit).contains(&submit_layers) {
+            resident = None;
+        }
+    }
+    let end = match resident
+        .as_ref()
+        .and_then(|chunk| resident_end(graph, chunk.submit_layers))
+    {
+        Some(end) => end,
+        None => {
+            resident = None;
+            prefix_end(graph).ok_or_else(|| be("unsupported prepared prefix"))?
+        }
+    };
     if positions.len() != 1 {
         return Err(be("prepared prefix requires one row"));
     }
@@ -254,6 +384,16 @@ pub(super) fn record(
     }
     let metadata = plan.static_scratch_metadata()?;
     ids.extend(metadata.reset_indices.iter().map(|&i| TensorId(i as u32)));
+    // Fused shared-expert weights/outputs can belong to ops just past the submission boundary.
+    // Validate those bindings too, even though their standalone commands are suppressed.
+    for (index, _) in paged_moe_shared_candidates(graph, false) {
+        if index < end {
+            for op in graph.ops.iter().skip(index + 1).take(6) {
+                let (reads, writes) = op.io_inline();
+                ids.extend(reads.into_iter().chain(writes));
+            }
+        }
+    }
     let tensors = ids
         .into_iter()
         .map(|id| Ok((id, keys(scratch, bindings, id)?)))
@@ -282,6 +422,31 @@ pub(super) fn record(
     }
     let fusions = infr_core::fusion::plan_fusions(graph, &fusion_cfg(be_));
     let mut skip = fusions.skip;
+    let mut shared_ops = HashMap::new();
+    if resident.is_some() {
+        let disabled = std::env::var_os("INFR_NO_MOE_SHARED_SLOT").is_some();
+        for (index, shared) in paged_moe_shared_candidates(graph, disabled) {
+            let Op::MoeFfn { gate_exps, .. } = &graph.ops[index] else {
+                unreachable!()
+            };
+            let gate = resolve(scratch, bindings, *gate_exps)?;
+            if be_
+                .moe_pager()
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|session| {
+                    session.is_paged(
+                        crate::pager::Role::Gate,
+                        crate::pager::buffer_identity(gate),
+                    )
+                })
+            {
+                shared_ops.insert(index, shared);
+                skip.extend(index + 1..index + 7);
+            }
+        }
+    }
     if be_.cfg().kernels.vulkan.hc_up_mix {
         skip.extend(
             (0..end)
@@ -305,13 +470,81 @@ pub(super) fn record(
     let mut transient = Vec::new();
     let mut dynamic = Vec::new();
     let mut memo = None;
+    let mut stream = PagedStream::default();
+    if let Some(chunk) = resident.as_mut() {
+        rec.arena_stream_barrier();
+        rec.gpu_resident_check(
+            chunk.control.as_ref(),
+            chunk.control.as_ref(),
+            chunk.control.as_ref(),
+            chunk.journal.as_ref(),
+            [0; 6],
+        );
+        chunk.begin_conditional(&rec);
+        chunk.recording = true;
+    }
+    let mut recorder = Some(rec);
+    let (cap, _) = crate::static_submit_mode(
+        be_.shared.submit_dispatch_cap_explicit,
+        be_.caps().integrated,
+        true,
+        be_.submit_dispatch_cap(),
+    );
     for (index, op) in infr_core::exec::live_ops(&graph.ops[..end], &skip) {
+        if resident.is_some() && cap != 0 && recorder.as_ref().unwrap().dispatches() >= cap {
+            return Err(be("prepared resident segment reaches a splitter boundary"));
+        }
+        if let (
+            Some(chunk),
+            Op::MoeFfn {
+                gate_exps,
+                up_exps,
+                down_exps,
+                ..
+            },
+        ) = (resident.as_mut(), op)
+        {
+            let roles = [*gate_exps, *up_exps, *down_exps]
+                .map(|id| resolve(scratch, bindings, id).map(crate::pager::buffer_identity));
+            let [gate, up, down] = roles;
+            let roles = [gate?, up?, down?];
+            let layout = ResidentMoeLayout::from_op(graph, op)
+                .ok_or_else(|| be("unsupported prepared resident layout"))?;
+            chunk.entries.push(ResidentJournalEntry {
+                op_idx: index,
+                layout,
+                roles,
+            });
+            let ordinal = chunk.entries.len() - 1;
+            stream.gpu_route = Some(GpuRoute {
+                control: Arc::clone(&chunk.control),
+                journal: Arc::clone(&chunk.journal),
+                ordinal: ordinal as u32,
+                notice: chunk
+                    .notices
+                    .as_ref()
+                    .map(|notices| notices.events[ordinal]),
+            });
+            execute_paged_moe(
+                be_,
+                graph,
+                index,
+                op,
+                scratch,
+                bindings,
+                &mut pool,
+                &mut recorder,
+                &mut stream,
+                shared_ops.get(&index).copied(),
+            )?;
+            continue;
+        }
         lower_op(
             be_,
             graph,
             index,
             op,
-            &rec,
+            recorder.as_ref().unwrap(),
             scratch,
             bindings,
             &fusions.kv_write,
@@ -329,7 +562,25 @@ pub(super) fn record(
     if !transient.is_empty() || !dynamic.is_empty() {
         return Err(be("prepared prefix produced transient GPU resources"));
     }
-    let command = rec.finish_prepared()?;
+    let resident = resident
+        .map(|chunk| -> Result<_> {
+            let guard = be_.moe_pager().lock().unwrap();
+            let session = guard.as_ref().ok_or_else(|| be("missing prepared pager"))?;
+            let mut banks = Vec::new();
+            for entry in &chunk.entries {
+                for &role in &entry.roles {
+                    banks.push((role, session.arena_addr(role)?, session.slot_bytes(role)?));
+                }
+            }
+            Ok(PreparedResident {
+                chunk,
+                tape: session.retained_tape(),
+                banks,
+                tape_words: stream.tape_cursor,
+            })
+        })
+        .transpose()?;
+    let command = recorder.take().unwrap().finish_prepared()?;
     let positions = rope_positions
         .into_iter()
         .map(|(id, position)| (TensorId(id), position))
@@ -341,6 +592,7 @@ pub(super) fn record(
         pool: pool_keys,
         positions,
         end,
+        resident,
     })
 }
 
@@ -349,6 +601,37 @@ mod tests {
     use super::*;
     use infr_core::{DType, TensorDesc};
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn deferred_recording_does_not_block_nested_parallel_uploads() {
+        use rayon::prelude::*;
+        for threads in [1, 2] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let recorded = AtomicUsize::new(0);
+            let copied = AtomicUsize::new(0);
+            pool.install(|| {
+                rayon::in_place_scope(|scope| {
+                    let mut preparation = DeferredPreparation::new(Some(|| {
+                        assert_eq!(copied.load(Ordering::Acquire), 128);
+                        recorded.fetch_add(1, Ordering::Release);
+                    }));
+                    let upload = || {
+                        (0..64).into_par_iter().for_each(|_| {
+                            copied.fetch_add(1, Ordering::AcqRel);
+                        })
+                    };
+                    rayon::join(upload, upload);
+                    assert_eq!(recorded.load(Ordering::Acquire), 0);
+                    preparation.start(scope);
+                    preparation.start(scope);
+                })
+            });
+            assert_eq!(recorded.load(Ordering::Acquire), 1);
+        }
+    }
 
     #[test]
     fn position_value_change_invalidates_without_a_buffer_replacement() {
@@ -525,6 +808,62 @@ mod tests {
         let second_moe = graph.ops[2].clone();
         graph.push(second_moe);
         assert_eq!(prefix_end(&graph), Some(2));
+    }
+
+    #[test]
+    fn resident_prefix_stops_at_the_existing_layer_submit_boundary() {
+        let mut graph = decode_graph();
+        assert_eq!(resident_end(&graph, 1), Some(3));
+        assert_eq!(resident_end(&graph, 0), None);
+        assert_eq!(resident_end(&graph, 2), None);
+        graph.ops.extend(graph.ops.clone());
+        assert_eq!(resident_end(&graph, 2), Some(6));
+        assert_eq!(resident_end(&graph, 1), Some(3));
+        let x = graph.inputs[0];
+        graph.ops.insert(
+            3,
+            Op::Argmax {
+                x,
+                dst: x,
+                n: 8,
+                rows: 1,
+            },
+        );
+        assert_eq!(resident_end(&graph, 1), Some(3));
+        assert_eq!(resident_end(&graph, 2), None);
+    }
+
+    #[test]
+    fn resident_prefix_keeps_unsupported_moe_layouts_on_the_old_path() {
+        let mut graph = decode_graph();
+        if let Op::MoeFfn { fused_gate_up, .. } = &mut graph.ops[2] {
+            *fused_gate_up = true;
+        }
+        assert_eq!(prefix_end(&graph), Some(2));
+        assert_eq!(resident_end(&graph, 1), None);
+    }
+
+    #[test]
+    fn resident_prefix_accepts_the_single_row_shared_expert_tail() {
+        let mut graph = decode_graph();
+        graph.ops.extend(graph.ops.clone());
+        let x = graph.inputs[0];
+        graph.ops.insert(
+            3,
+            Op::MoeSharedExpertAdd {
+                moe: x,
+                shexp: x,
+                gate: x,
+                dst: x,
+                rows: 1,
+                n: 8,
+            },
+        );
+        assert_eq!(resident_end(&graph, 2), Some(7));
+        if let Op::MoeSharedExpertAdd { rows, .. } = &mut graph.ops[3] {
+            *rows = 2;
+        }
+        assert_eq!(resident_end(&graph, 2), None);
     }
 
     #[test]

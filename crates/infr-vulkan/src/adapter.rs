@@ -25,6 +25,12 @@ use crate::recorder::RecordedCmd;
 
 #[path = "adapter_prefix.rs"]
 mod command_prefix;
+#[cfg(test)]
+#[path = "adapter_deferred_prepare_tests.rs"]
+mod deferred_prepare_tests;
+#[cfg(test)]
+#[path = "adapter_resident_ahead_tests.rs"]
+mod resident_ahead_tests;
 pub(crate) use command_prefix::preparing_commands;
 pub(crate) use command_prefix::supported as command_recording_supported;
 use command_prefix::PreparedPrefix;
@@ -10535,18 +10541,42 @@ fn execute_static_inner(
         .lock()
         .unwrap()
         .take()
-        .and_then(|prefix| prefix.take_if_valid(be_, scratch, pool, bindings));
-    let prepared_end = prepared.as_ref().map_or(0, |(_, end)| *end);
-    let mut prepared_command = prepared.map(|(command, _)| command);
+        .and_then(|prefix| {
+            prefix.take_if_valid(be_, scratch, pool, bindings, resident_buffers.as_ref())
+        });
+    let prepared_end = prepared.as_ref().map_or(0, |prefix| prefix.end);
+    let prepared_tape_words = prepared.as_ref().map_or(0, |prefix| prefix.tape_words);
+    let prepared_layers = prepared
+        .as_ref()
+        .and_then(|prefix| prefix.resident.as_ref())
+        .map_or(0, |chunk| chunk.entries.len());
+    let (mut prepared_command, mut prepared_resident) = prepared.map_or((None, None), |prefix| {
+        (Some(prefix.command), prefix.resident)
+    });
     let mut early_prefix = None;
     let mut early_prefix_dispatches = 0;
     let mut early_submit_us = None;
     if be_.cfg().device.decode_command_early_submit {
         if let Some(prefix) = prepared_command.take() {
-            let rec = be_.recorder()?;
-            rec.prepend_prepared(prefix)?;
-            early_prefix_dispatches = rec.dispatches();
-            early_prefix = Some(rec.finish_nowait()?);
+            if shutdown_requested() {
+                return Err(Error::Aborted);
+            }
+            early_prefix_dispatches = prefix.dispatches();
+            let mut pending = if prepared_layers != 0 {
+                prefix.submit(be_)?
+            } else {
+                let rec = be_.recorder()?;
+                rec.prepend_prepared(prefix)?;
+                rec.finish_nowait()?
+            };
+            if let Some(chunk) = prepared_resident.as_mut() {
+                if let Some(waiter) = &chunk.waiter {
+                    pending.start_waiter(waiter)?;
+                }
+                chunk.send_producer_jobs(&mut pending, chunk.entries.len())?;
+                chunk.submitted_entries = chunk.entries.len();
+            }
+            early_prefix = Some(pending);
             early_submit_us = Some(execute_started.elapsed().as_micros());
         }
     }
@@ -10712,10 +10742,21 @@ fn execute_static_inner(
         if !PREFIX_USED.swap(true, Ordering::Relaxed) {
             tracing::info!(
                 prefix_ops = prepared_end,
+                resident_layers = prepared_layers,
                 early_submit = early_prefix.is_some(),
                 "Decode command prefix consumed"
             );
         }
+    }
+    if prepared_layers != 0 {
+        static RESIDENT_PREFIX_USED: std::sync::Once = std::sync::Once::new();
+        RESIDENT_PREFIX_USED.call_once(|| {
+            tracing::info!(
+                prefix_ops = prepared_end,
+                resident_layers = prepared_layers,
+                "Decode prepared resident segment consumed"
+            )
+        });
     }
     if let Some(prefix) = prepared_command {
         rec.as_mut().unwrap().prepend_prepared(prefix)?;
@@ -10738,7 +10779,17 @@ fn execute_static_inner(
     let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
     let mut mmv_memo: Option<(TensorId, usize, usize)> = None;
     let mut pstream = PagedStream::default();
-    let mut resident_chunk = ResidentChunk::new(be_, graph, token_row_paged_moe, resident_buffers)?;
+    pstream.tape_cursor = prepared_tape_words;
+    let mut resident_chunk = match prepared_resident {
+        Some(chunk) => Some(chunk),
+        None => ResidentChunk::new(be_, graph, token_row_paged_moe, resident_buffers)?,
+    };
+    if prepared_tape_words != 0 {
+        if let Some(chunk) = &resident_chunk {
+            rec.as_ref().unwrap().arena_stream_barrier();
+            chunk.begin_conditional(rec.as_ref().unwrap());
+        }
+    }
 
     // ── submit splitter ───────────────────────────────────────────────────────────────────────
     // The GPU hang watchdog is armed per SUBMIT, so recording the whole forward into ONE command
@@ -10802,15 +10853,24 @@ fn execute_static_inner(
                 && command_prefix::compatible(graph, &plan.graph, scratch)
         });
     let snapshot = next.and_then(|_| command_prefix::snapshot_pool(pool).ok());
+    let resident_snapshot = (be_.cfg().device.decode_command_early_submit
+        && be_.cfg().device.decode_command_resident)
+        .then(|| {
+            resident_chunk
+                .as_ref()
+                .and_then(ResidentChunk::preparation_snapshot)
+        })
+        .flatten();
     let preparation_cancelled = AtomicBool::new(false);
     let result = rayon::in_place_scope(|scope| {
-        let (wake, ready) = std::sync::mpsc::sync_channel(1);
-        let preparing = match (next, snapshot) {
+        let preparation = match (next, snapshot) {
             (Some((next, next_bindings, positions)), Some(snapshot)) => {
                 let cancelled = &preparation_cancelled;
-                scope.spawn(move |_| {
+                let preparation_context = infr_core::timeline::context();
+                Some(move || {
+                    let _context = infr_core::timeline::scoped_context(preparation_context);
                     let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        if ready.recv().is_ok() && !cancelled.load(Ordering::Acquire) {
+                        if !cancelled.load(Ordering::Acquire) {
                             let preparation_start_us = execute_started.elapsed().as_micros();
                             let recording_started = std::time::Instant::now();
                             match command_prefix::record(
@@ -10820,15 +10880,25 @@ fn execute_static_inner(
                                 next_bindings,
                                 positions,
                                 snapshot,
+                                resident_snapshot,
                             ) {
                                 Ok(prefix) => {
+                                    if cancelled.load(Ordering::Acquire) {
+                                        return;
+                                    }
+                                    let prepared_resident_layers = prefix.resident_layers();
                                     *next.prepared_prefix.lock().unwrap() = Some(prefix);
                                     static SAMPLES: AtomicU64 = AtomicU64::new(0);
                                     let sample = SAMPLES.fetch_add(1, Ordering::Relaxed) + 1;
                                     if sample.is_multiple_of(128) {
-                                        tracing::info!(sample, ?early_submit_us, preparation_start_us,
-                                            recording_us=recording_started.elapsed().as_micros(),
-                                            "Decode command preparation host sample");
+                                        tracing::info!(
+                                            sample,
+                                            ?early_submit_us,
+                                            preparation_start_us,
+                                            prepared_resident_layers,
+                                            recording_us = recording_started.elapsed().as_micros(),
+                                            "Decode command preparation host sample"
+                                        );
                                     }
                                 }
                                 Err(error) => {
@@ -10843,15 +10913,14 @@ fn execute_static_inner(
                             "Decode prefix preparation panicked; retaining ordinary recording"
                         );
                     }
-                });
-                true
+                })
             }
-            _ => false,
+            _ => None,
         };
-        let mut prepare_wake = preparing.then_some(wake);
-        if let (Some(chunk), Some(wake)) = (resident_chunk.as_mut(), prepare_wake.as_ref()) {
-            chunk.command_tail_ready = Some(wake.clone());
-        }
+        // Do not enqueue a worker that blocks waiting for the tail. A mapped-upload Rayon join
+        // can steal that job and wait on itself. Publish only ready, nonblocking work.
+        let mut preparation = command_prefix::DeferredPreparation::new(preparation);
+        let mut prepare_tail = || preparation.start(scope);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
             loop {
                 if let Some(chunk) = resident_chunk.as_mut() {
@@ -10868,6 +10937,7 @@ fn execute_static_inner(
                                 &mut pstream,
                                 &mut segments,
                                 live_pos == live_ops.len(),
+                                &mut prepare_tail,
                             )?;
                         }
                     }
@@ -10899,6 +10969,7 @@ fn execute_static_inner(
                             pool,
                             &mut segments,
                             live_pos == live_ops.len(),
+                            &mut prepare_tail,
                         )? {
                             live_pos = live_ops
                                 .iter()
@@ -11199,11 +11270,6 @@ fn execute_static_inner(
             }
             if let Some(last) = rec.take() {
                 submitted_dispatches += last.dispatches();
-                if last.dispatches() != 0 {
-                    if let Some(wake) = prepare_wake.take() {
-                        last.on_first_submit(wake);
-                    }
-                }
                 if resident_chunk.is_some() && last.dispatches() == 0 {
                     last.discard()?;
                 } else if token_row_paged_moe
@@ -11214,6 +11280,7 @@ fn execute_static_inner(
                     // command pools retire. This changes only host overlap, not the submitted work or
                     // the forward's completion/phase boundary.
                     let pending = last.finish_nowait()?;
+                    prepare_tail();
                     let host_result =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             pstream.start_cpu_promotion(be_)
@@ -11231,13 +11298,14 @@ fn execute_static_inner(
                     retirement_result?;
                     completion_result?;
                 } else {
-                    last.finish_after_submit(|| pstream.start_cpu_promotion(be_))
-                        .map_err(|e| be(e.to_string()))?;
+                    last.finish_after_submit(|| {
+                        prepare_tail();
+                        pstream.start_cpu_promotion(be_)
+                    })
+                    .map_err(|e| be(e.to_string()))?;
                 }
             }
-            if let Some(wake) = prepare_wake.take() {
-                let _ = wake.try_send(());
-            }
+            prepare_tail();
             // The overlapping path already retired these. Blocking and empty-tail paths still own
             // their segments; every referenced buffer remains alive until this drain completes.
             for seg in segments {
@@ -11278,18 +11346,9 @@ fn execute_static_inner(
             }
             Ok(())
         }));
-        // Unsubmitted recorders drop their wake sender on errors. Always join before a pool
-        // can compact, and never turn an unused preparation failure into a current-step error.
+        // Started recorders join before compaction; unstarted preparation simply drops on errors.
         if !matches!(&result, Ok(Ok(()))) {
             preparation_cancelled.store(true, Ordering::Release);
-        }
-        drop(
-            resident_chunk
-                .as_mut()
-                .and_then(|chunk| chunk.command_tail_ready.take()),
-        );
-        if let Some(wake) = prepare_wake.take() {
-            let _ = wake.try_send(());
         }
         drop(rec.take());
         match result {
@@ -11297,6 +11356,13 @@ fn execute_static_inner(
             Err(panic) => std::panic::resume_unwind(panic),
         }
     });
+    if result.is_err() {
+        // A recorder can finish just as cancellation is published. The scope has joined,
+        // so no late worker can republish this unused packet after an errored forward.
+        if let Some((next, _, _)) = next {
+            next.prepared_prefix.lock().unwrap().take();
+        }
+    }
     if result.is_ok() && using_phase_arena {
         phase_arena
             .as_mut()
@@ -11585,7 +11651,6 @@ struct ResidentChunk {
     notice_cursor: usize,
     notice_resume: Option<(usize, Vec<u32>)>,
     notice_stop: bool,
-    command_tail_ready: Option<std::sync::mpsc::SyncSender<()>>,
     producer: Option<Arc<ResidentNoticeProducer>>,
     notices_sent: usize,
     mapped_serial_max_bytes: usize,
@@ -12087,10 +12152,31 @@ fn resident_notice_slots(
 }
 
 impl ResidentChunk {
-    fn notify_command_tail_ready(&mut self) {
-        if let Some(sender) = self.command_tail_ready.take() {
-            let _ = sender.try_send(());
+    /// Clone only retained handles and policy. Never reset the active token's events or journal.
+    fn preparation_snapshot(&self) -> Option<Self> {
+        if self.indirect.is_some() || !(1..self.limit).contains(&self.submit_layers) {
+            return None;
         }
+        Some(Self {
+            control: Arc::clone(&self.control),
+            journal: Arc::clone(&self.journal),
+            entries: Vec::with_capacity(self.limit),
+            early_recovery: self.early_recovery,
+            recovery_op: None,
+            limit: self.limit,
+            recording: false,
+            submit_layers: self.submit_layers,
+            submitted_entries: 0,
+            notices: self.notices.clone(),
+            notice_cursor: 0,
+            notice_resume: None,
+            notice_stop: false,
+            producer: None,
+            notices_sent: 0,
+            mapped_serial_max_bytes: self.mapped_serial_max_bytes,
+            waiter: None,
+            indirect: None,
+        })
     }
 
     fn send_producer_jobs(
@@ -12304,7 +12390,6 @@ impl ResidentChunk {
             notice_cursor: 0,
             notice_resume: None,
             notice_stop: false,
-            command_tail_ready: None,
             producer: buffers.producer.clone(),
             notices_sent: 0,
             mapped_serial_max_bytes: resident_mapped_serial_max_bytes(
@@ -12334,9 +12419,10 @@ impl ResidentChunk {
         pool: &mut ScratchPool,
         segments: &mut std::collections::VecDeque<crate::recorder::PendingSegment>,
         graph_end: bool,
+        prepare_tail: &mut dyn FnMut(),
     ) -> Result<Option<(usize, Vec<u32>)>> {
         if self.notices.is_some() {
-            return self.finish_with_notice(be_, rec, ps, pool, segments, graph_end);
+            return self.finish_with_notice(be_, rec, ps, pool, segments, graph_end, prepare_tail);
         }
         rec.as_ref().unwrap().end_conditional();
         rec.as_ref().unwrap().publish_host_reads();
@@ -12570,6 +12656,7 @@ impl ResidentChunk {
         pool: &ScratchPool,
         segments: &mut std::collections::VecDeque<crate::recorder::PendingSegment>,
         graph_end: bool,
+        prepare_tail: &mut dyn FnMut(),
     ) -> Result<Option<(usize, Vec<u32>)>> {
         ps.gpu_route = None;
         ps.finish_cpu_miss(be_, pool)?;
@@ -12583,7 +12670,7 @@ impl ResidentChunk {
             self.send_producer_jobs(&mut pending, self.entries.len())?;
             self.poll_notices(be_, ps, Some(&pending))?;
             if graph_end && self.notice_resume.is_none() && !self.notice_stop {
-                self.notify_command_tail_ready();
+                prepare_tail();
             }
             // Error paths drain through PendingSegment::drop before phase storage disappears.
             if self.early_recovery && self.notice_resume.is_some() {
@@ -12727,6 +12814,7 @@ impl ResidentChunk {
         ps: &mut PagedStream,
         segments: &mut std::collections::VecDeque<crate::recorder::PendingSegment>,
         graph_end: bool,
+        prepare_tail: &mut dyn FnMut(),
     ) -> Result<usize> {
         let recovery = self.recovery_op.take().expect("pending recovery");
         if op_idx != recovery.op_idx
@@ -12744,7 +12832,7 @@ impl ResidentChunk {
         segments.push_back(pending);
         // The full live-op walk includes the head; capped or pre-router recovery is not final.
         if graph_end {
-            self.notify_command_tail_ready();
+            prepare_tail();
         }
         // Queue the next frontend before CPU retirement. Decode early-submit may already have
         // queued the miss FFN separately; this larger useful interval still covers cleanup.
@@ -14214,12 +14302,16 @@ fn execute_paged_moe<'a>(
     let mut cpu_miss_result = None;
     // A submitted promotion can still own mapped slots; drain before any residency changes.
     // Unsubmitted result copies retain their sources until sync_stream submits them.
-    ps.finish_cpu_miss(be_, pool)?;
-    if precomputed_hit_masks.is_none() {
-        ps.wait_cpu_promotion(be_)?;
+    if !preparing_commands() {
+        ps.finish_cpu_miss(be_, pool)?;
+        if precomputed_hit_masks.is_none() {
+            ps.wait_cpu_promotion(be_)?;
+        }
+        ps.acquire_cpu_promotion(rec.as_ref().expect("ambient segment exists"));
+    } else if ps.gpu_route.is_none() {
+        return Err(be("command preparation requires a resident route"));
     }
-    ps.acquire_cpu_promotion(rec.as_ref().expect("ambient segment exists"));
-    if !layer_stream && !touch_all {
+    if !preparing_commands() && !layer_stream && !touch_all {
         let changed = be_
             .moe_pager()
             .lock()
@@ -14261,11 +14353,16 @@ fn execute_paged_moe<'a>(
             let sess = guard
                 .as_mut()
                 .expect("GPU resident Decode requires a pager");
-            let windows = [
-                sess.resident_lut_window(&mut ps.tape_cursor, gate_id, n_expert)?,
-                sess.resident_lut_window(&mut ps.tape_cursor, up_id, n_expert)?,
-                sess.resident_lut_window(&mut ps.tape_cursor, down_id, n_expert)?,
-            ];
+            // Recording captures coordinates only. The acknowledged consumer publishes the
+            // current addresses and protects slots immediately before the first submission.
+            let mut window = |role| {
+                if preparing_commands() {
+                    sess.resident_lut_coordinates(&mut ps.tape_cursor, role, n_expert)
+                } else {
+                    sess.resident_lut_window(&mut ps.tape_cursor, role, n_expert)
+                }
+            };
+            let windows = [window(gate_id)?, window(up_id)?, window(down_id)?];
             let bank = |role| -> Result<(u64, u32)> {
                 Ok((sess.arena_addr(role)?, sess.slot_bytes(role)? as u32))
             };

@@ -1255,11 +1255,75 @@ pub struct PreparedCommand {
     pools: Vec<vk::DescriptorPool>,
     buffer_keepalive: Vec<std::sync::Arc<dyn Buffer>>,
     dedicated_transfer_wait: u64,
+    timeline_query: Option<crate::timeline::Query>,
 }
 
 impl PreparedCommand {
     pub fn dispatches(&self) -> usize {
         self.dispatches
+    }
+
+    pub(crate) fn trace_compatible(&self) -> bool {
+        // A packet recorded outside a sampled window has no timestamps. Re-record the first
+        // sampled consumer rather than silently reporting only its suffix as the whole step.
+        !infr_core::timeline::device_enabled()
+            || infr_core::timeline::context().is_none()
+            || self.timeline_query.is_some()
+    }
+
+    /// Submit the acknowledged primary directly; its private pool travels to the fence.
+    pub(crate) fn submit(mut self, backend: &VulkanBackend) -> Result<PendingSegment> {
+        if crate::adapter::preparing_commands()
+            || !std::sync::Arc::ptr_eq(&self.shared, &backend.shared)
+        {
+            return Err(be(
+                "prepared submission requires the owning execution device",
+            ));
+        }
+        let device = &self.shared.device;
+        let fence = match self.shared.recorder_fences.lock().unwrap().pop() {
+            Some(fence) => {
+                if let Err(error) = unsafe { device.reset_fences(&[fence]) } {
+                    unsafe { device.destroy_fence(fence, None) };
+                    return Err(be(format!("reset prepared fence: {error}")));
+                }
+                fence
+            }
+            None => unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
+                .map_err(|error| be(format!("create prepared fence: {error}")))?,
+        };
+        let submit_span = infr_core::timeline::span("queue_submit");
+        if let Some(query) = self.timeline_query.as_mut() {
+            query.activate_prepared(infr_core::timeline::context());
+            query.submitted();
+        }
+        let result = self.shared.queue_submit_commands_recovering(
+            &[self.cmd],
+            fence,
+            Some(self.dispatches),
+            "prepared queue_submit",
+            self.dedicated_transfer_wait,
+        );
+        drop(submit_span);
+        if let Err(error) = result {
+            self.shared.recorder_fences.lock().unwrap().push(fence);
+            return Err(be(format!("prepared queue_submit: {error}")));
+        }
+        Ok(PendingSegment {
+            shared: std::sync::Arc::clone(&self.shared),
+            fence: Some(fence),
+            cmd: vk::CommandBuffer::null(),
+            pools: Vec::new(),
+            buffer_keepalive: Vec::new(),
+            dispatches: self.dispatches,
+            prepared_prefix: Some(self),
+            submit_query_pool: vk::QueryPool::null(),
+            submit_timing_token: None,
+            submit_pager_profile: false,
+            timeline_query: None,
+            waiter: None,
+            notice_producer: None,
+        })
     }
 }
 
@@ -1406,7 +1470,7 @@ impl<'a> Recorder<'a> {
     }
 
     /// Record a one-use prefix on a private pool without submitting any GPU work.
-    /// The caller disables preparation when profiling or timeline capture is enabled.
+    /// Per-op profiling stays disabled; optional timeline queries travel with the command.
     pub(crate) fn new_prepared(backend: &'a VulkanBackend) -> Result<Self> {
         Self::new_inner(backend, false, true)
     }
@@ -1561,7 +1625,7 @@ impl<'a> Recorder<'a> {
         if let Some(elapsed) = pager_profile::elapsed(profile_acquire_t0) {
             pager_profile::record_command_recorder_acquire(elapsed);
         }
-        let timeline_query = if persistent || prepared {
+        let timeline_query = if persistent {
             None
         } else {
             match crate::timeline::Query::new(
@@ -1679,6 +1743,14 @@ impl<'a> Recorder<'a> {
             return Err(be("finish_prepared requires a prepared recorder"));
         }
         self.end_conditional();
+        if let Some(query) = self.timeline_query.borrow_mut().as_mut() {
+            query.close(
+                self.dispatches.get(),
+                self.dedicated_transfer_wait.get(),
+                0,
+                0,
+            );
+        }
         unsafe { self.be.shared.device.end_command_buffer(self.cmd) }
             .map_err(|e| be(format!("end prepared cmd: {e}")))?;
         self.owns_transient.set(false);
@@ -1690,12 +1762,13 @@ impl<'a> Recorder<'a> {
             pools: std::mem::take(&mut *self.pools.borrow_mut()),
             buffer_keepalive: std::mem::take(&mut *self.buffer_keepalive.borrow_mut()),
             dedicated_transfer_wait: self.dedicated_transfer_wait.get(),
+            timeline_query: self.timeline_query.borrow_mut().take(),
         })
     }
 
     /// Attach a validated prefix before recording main work. The seed barrier in the main
     /// command buffer makes prefix writes visible across the two primary command buffers.
-    pub(crate) fn prepend_prepared(&self, cmd: PreparedCommand) -> Result<()> {
+    pub(crate) fn prepend_prepared(&self, mut cmd: PreparedCommand) -> Result<()> {
         if self.persistent
             || self.prepared_pool.borrow().is_some()
             || self.prepared_prefix.borrow().is_some()
@@ -1708,6 +1781,9 @@ impl<'a> Recorder<'a> {
         }
         if !std::sync::Arc::ptr_eq(&self.be.shared, &cmd.shared) {
             return Err(be("prepared prefix belongs to another Vulkan device"));
+        }
+        if let Some(query) = cmd.timeline_query.as_mut() {
+            query.activate_prepared(infr_core::timeline::context());
         }
         self.dedicated_transfer_wait.set(
             self.dedicated_transfer_wait
@@ -1737,7 +1813,14 @@ impl<'a> Recorder<'a> {
         fence: vk::Fence,
         context: &str,
     ) -> std::result::Result<(), vk::Result> {
-        let prefix = self.prepared_prefix.borrow();
+        let dispatches = self.dispatches();
+        let mut prefix = self.prepared_prefix.borrow_mut();
+        if let Some(query) = prefix
+            .as_mut()
+            .and_then(|prefix| prefix.timeline_query.as_mut())
+        {
+            query.submitted();
+        }
         let commands = [
             prefix
                 .as_ref()
@@ -1752,7 +1835,7 @@ impl<'a> Recorder<'a> {
         self.be.shared.queue_submit_commands_recovering(
             batch,
             fence,
-            Some(self.dispatches()),
+            Some(dispatches),
             context,
             self.dedicated_transfer_wait.get(),
         )
@@ -14785,6 +14868,14 @@ impl<'a> Recorder<'a> {
         if let Some(query) = self.timeline_query.borrow_mut().take() {
             query.resolve();
         }
+        if let Some(query) = self
+            .prepared_prefix
+            .borrow_mut()
+            .as_mut()
+            .and_then(|prefix| prefix.timeline_query.take())
+        {
+            query.resolve();
+        }
         self.free_transient();
         host_result
     }
@@ -15362,6 +15453,13 @@ impl PendingSegment {
             if let Some(query) = self.timeline_query.take() {
                 query.resolve();
             }
+            if let Some(query) = self
+                .prepared_prefix
+                .as_mut()
+                .and_then(|prefix| prefix.timeline_query.take())
+            {
+                query.resolve();
+            }
         }
         if let Some(elapsed) = pager_profile::elapsed(wait_t0) {
             pager_profile::record_sync_wait(pager_profile::SyncKind::Fence, elapsed);
@@ -15383,7 +15481,9 @@ impl PendingSegment {
         }
         let _recycle = infr_core::timeline::span("resident_segment_recycle");
         self.shared.recorder_fences.lock().unwrap().push(fence);
-        self.shared.recorder_cmds.lock().unwrap().push(self.cmd);
+        if self.cmd != vk::CommandBuffer::null() {
+            self.shared.recorder_cmds.lock().unwrap().push(self.cmd);
+        }
         self.shared
             .recorder_desc_pools
             .lock()
@@ -15419,6 +15519,97 @@ mod prepared_command_tests {
             .download(buf, bytemuck::cast_slice_mut(&mut out))
             .unwrap();
         out[0]
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU; parent serializes GPU tests"]
+    fn direct_prepared_submission_retains_private_pool_until_fence_and_orders_suffix() {
+        for push_desc in [true, false] {
+            let backend = backend(push_desc);
+            let src = backend.alloc(4, BufferUsage::Staging).unwrap();
+            let dst = backend.alloc(4, BufferUsage::Readback).unwrap();
+            let out = backend.alloc(4, BufferUsage::Readback).unwrap();
+            backend
+                .upload(src.as_ref(), bytemuck::bytes_of(&19.0f32))
+                .unwrap();
+            for explicit_wait in [true, false, true, false] {
+                let rec = Recorder::new_prepared(&backend).unwrap();
+                rec.seed_barrier();
+                rec.copy(src.as_ref(), 0, dst.as_ref(), 0, 4);
+                rec.scale(dst.as_ref(), 2.0, 1);
+                let pending = rec.finish_prepared().unwrap().submit(&backend).unwrap();
+                assert_eq!(
+                    backend
+                        .shared
+                        .recorder_prepared_pools
+                        .pools
+                        .lock()
+                        .unwrap()
+                        .len(),
+                    0
+                );
+                let suffix = backend.recorder().unwrap();
+                suffix.seed_barrier();
+                suffix.copy(dst.as_ref(), 0, out.as_ref(), 0, 4);
+                suffix.finish().unwrap();
+                if explicit_wait {
+                    pending.wait().unwrap();
+                } else {
+                    drop(pending);
+                }
+                assert_eq!(value(&backend, out.as_ref()), 38.0);
+                assert_eq!(
+                    backend
+                        .shared
+                        .recorder_prepared_pools
+                        .pools
+                        .lock()
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert!(backend
+                    .shared
+                    .recorder_cmds
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|&cmd| cmd != vk::CommandBuffer::null()));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an idle Vulkan GPU; standalone submit microbenchmark"]
+    fn direct_prepared_submission_microbenchmark() {
+        let backend = backend(true);
+        let src = backend.alloc(4, BufferUsage::Staging).unwrap();
+        let dst = backend.alloc(4, BufferUsage::Readback).unwrap();
+        backend.upload(src.as_ref(), bytemuck::bytes_of(&23.0f32)).unwrap();
+        let mut samples = [Vec::new(), Vec::new()];
+        for round in 0..288 {
+            for mode in [round % 2, 1 - round % 2] {
+                let rec = Recorder::new_prepared(&backend).unwrap();
+                rec.copy(src.as_ref(), 0, dst.as_ref(), 0, 4);
+                let command = rec.finish_prepared().unwrap();
+                let start = std::time::Instant::now();
+                let pending = if mode == 0 {
+                    let wrapper = backend.recorder().unwrap();
+                    wrapper.prepend_prepared(command).unwrap();
+                    wrapper.finish_nowait().unwrap()
+                } else {
+                    command.submit(&backend).unwrap()
+                };
+                pending.wait().unwrap();
+                if round >= 32 { samples[mode].push(start.elapsed().as_secs_f64() * 1e6); }
+            }
+        }
+        for (mode, values) in samples.iter_mut().enumerate() {
+            values.sort_by(f64::total_cmp);
+            eprintln!("prepared-submit mode={mode} mean_us={:.3} p50_us={:.3}",
+                values.iter().sum::<f64>() / values.len() as f64, values[values.len() / 2]);
+        }
+        assert_eq!(value(&backend, dst.as_ref()), 23.0);
     }
 
     #[test]

@@ -4117,6 +4117,36 @@ impl MoePagerSession {
         Ok(w)
     }
 
+    /// Plan a resident LUT offset for recording without publishing addresses or protecting slots.
+    /// After ACK, publish the same window with `resident_lut_window` before submitting its reader.
+    pub(crate) fn resident_lut_coordinates(
+        &self,
+        tape_cursor: &mut usize,
+        buf_id: usize,
+        n_expert: usize,
+    ) -> Result<u32> {
+        let (_, _, source) = self
+            .sources
+            .get(&buf_id)
+            .ok_or_else(|| be("resident LUT on an unregistered bank"))?;
+        if n_expert == 0
+            || source.stride_bytes == 0
+            || source.stride_bytes.checked_mul(n_expert) != Some(source.bank_bytes)
+        {
+            return Err(be(
+                "resident LUT expert count does not match registered bank",
+            ));
+        }
+        let end = tape_cursor
+            .checked_add(n_expert)
+            .filter(|&end| end <= self.tape_words)
+            .ok_or_else(|| be("resident LUT tape overflow"))?;
+        let window =
+            u32::try_from(*tape_cursor).map_err(|_| be("resident LUT tape offset exceeds u32"))?;
+        *tape_cursor = end;
+        Ok(window)
+    }
+
     /// GPU routing is not host-known yet. Freeze every present address until the chunk drains.
     pub(crate) fn resident_lut_window(
         &mut self,

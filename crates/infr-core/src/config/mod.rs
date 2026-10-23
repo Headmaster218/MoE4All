@@ -144,6 +144,9 @@ cfg_struct! {
         /// Submit an acknowledged prepared prefix before suffix setup to overlap CPU work.
         /// Experimental alternative to combining the prefix with the ordinary first submit.
         decode_command_early_submit: bool = false,
+        /// Extend acknowledged command lookahead through the first resident expert submission.
+        /// Requires command-ahead and early-submit; unsupported shapes keep the shorter prefix.
+        decode_command_resident: bool = false,
     }
 }
 
