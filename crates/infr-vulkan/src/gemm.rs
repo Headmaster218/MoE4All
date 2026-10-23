@@ -3730,6 +3730,27 @@ pub(crate) fn kda_spv() -> &'static [u32] {
 }
 /// SPIR-V for DeltaNet reading q/k/v from a single strided source buffer (env-gated).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn deltanet_fused_norm_kernel(sigmoid: bool) -> (&'static str, &'static [u32]) {
+    macro_rules! variant {
+        ($name:literal) => {{
+            static SPV: OnceLock<Vec<u32>> = OnceLock::new();
+            (
+                $name,
+                SPV.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            )
+        }};
+    }
+    if sigmoid {
+        variant!("deltanet_fused_norm_sigmoid")
+    } else {
+        variant!("deltanet_fused_norm")
+    }
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn deltanet_strided_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| {

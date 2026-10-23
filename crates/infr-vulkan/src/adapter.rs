@@ -2398,6 +2398,17 @@ fn validate_q8_linear_pair(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct DeltaNormPair {
+    weight: TensorId,
+    gate: TensorId,
+    eps: f32,
+    sigmoid: bool,
+}
+
+#[cfg(test)]
+#[path = "deltanet_fusion_contract.rs"]
+mod deltanet_fusion_contract;
 #[cfg(test)]
 #[path = "q8_pair_graph_contract.rs"]
 mod q8_pair_graph_contract;
@@ -2405,6 +2416,77 @@ mod q8_pair_graph_contract;
 #[cfg(test)]
 #[path = "q8_pair_defensive_contract.rs"]
 mod q8_pair_defensive_contract;
+
+fn deltanet_norm_pair(graph: &Graph, idx: usize) -> Option<DeltaNormPair> {
+    if graph.independent_rows || graph.mtp_verify {
+        return None;
+    }
+    let Op::DeltaNet {
+        q,
+        k,
+        v,
+        b,
+        a,
+        a_coef,
+        dt_bias,
+        state,
+        dst,
+        state_trace: None,
+        rows: 1,
+        n_khead: 16,
+        n_vhead,
+        head_k: 128,
+        head_v: 128,
+        ..
+    } = graph.ops.get(idx)?
+    else {
+        return None;
+    };
+    if q != k || k != v || ![32, 48, 64].contains(n_vhead) {
+        return None;
+    }
+    let Op::GatedRmsNorm {
+        x,
+        weight,
+        gate,
+        dst: norm_dst,
+        rows: 1,
+        n_head,
+        head_dim: 128,
+        eps,
+        act,
+    } = graph.ops.get(idx + 1)?
+    else {
+        return None;
+    };
+    // In-place only: a new output's scratch could alias a source that expires at DeltaNet.
+    if x != dst
+        || norm_dst != dst
+        || n_head != n_vhead
+        || gate == dst
+        || graph.tensors[weight.0 as usize].kind != TensorKind::Weight
+        || graph.tensors[dst.0 as usize].kind != TensorKind::Internal
+        || !matches!(act, Activation::Silu | Activation::Sigmoid)
+        || [q, k, v, b, a, a_coef, dt_bias, state, dst, weight, gate]
+            .iter()
+            .any(|id| graph.desc(**id).dtype != infr_core::DType::F32)
+    {
+        return None;
+    }
+    Some(DeltaNormPair {
+        weight: *weight,
+        gate: *gate,
+        eps: *eps,
+        sigmoid: *act == Activation::Sigmoid,
+    })
+}
+
+fn deltanet_norm_enabled(be_: &VulkanBackend) -> bool {
+    be_.cfg().kernels.vulkan.delta_fused_norm
+        && be_.cfg().kernels.vulkan.delta_strided
+        && !be_.cfg().spec.mtp
+        && be_.prefers_deltanet_fused_norm()
+}
 
 /// Lower ONE graph op into the recorder. Shared by the static (`execute_static`) and record-once
 /// (`record_decode_replay`) paths — only the three pos-dependent ops branch on `mode`.
@@ -6766,6 +6848,27 @@ fn lower_op(
                 *head_k as usize,
                 *head_v as usize,
             );
+            if deltanet_norm_enabled(be_) {
+                if let Some(norm) = deltanet_norm_pair(graph, op_idx) {
+                    rec.deltanet_gated_norm(
+                        r(*q)?,
+                        r(*b)?,
+                        r(*a)?,
+                        r(*a_coef)?,
+                        r(*dt_bias)?,
+                        r(norm.weight)?,
+                        r(norm.gate)?,
+                        r(*state)?,
+                        r(*dst)?,
+                        nv_,
+                        nk_,
+                        *eps,
+                        norm.eps,
+                        norm.sigmoid,
+                    );
+                    return Ok(());
+                }
+            }
             if let Some(trace) = state_trace {
                 if rows_ < 2
                     || !be_.cfg().kernels.vulkan.dn_chunk
@@ -8520,6 +8623,11 @@ fn record_decode_replay(
     let fused_add = plan.linear_add;
     let mut skip_op = plan.skip;
     skip_op.extend(fused_q8_kv_write.keys().map(|&i| i + 1));
+    if deltanet_norm_enabled(be_) {
+        skip_op.extend(
+            (0..graph.ops.len()).filter_map(|i| deltanet_norm_pair(graph, i).map(|_| i + 1)),
+        );
+    }
 
     let mut transient: Vec<Box<dyn Buffer>> = Vec::new();
     let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
@@ -9662,6 +9770,11 @@ fn execute_static_inner(
     // device-specific and stays here, so this path keeps its own loop body rather than an
     // `OpDispatch`. `record_decode_replay` can't even use this much — its skip set is MUTATED
     // mid-walk by the E2B `Linear`+`GatedAct` peephole.
+    if deltanet_norm_enabled(be_) {
+        skip_op.extend(
+            (0..graph.ops.len()).filter_map(|i| deltanet_norm_pair(graph, i).map(|_| i + 1)),
+        );
+    }
     let live_ops: Vec<_> = infr_core::exec::live_ops(&graph.ops, &skip_op).collect();
     let mut live_pos: usize = 0;
     loop {

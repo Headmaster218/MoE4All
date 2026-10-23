@@ -21,6 +21,10 @@ use super::ops::ComputeKernel;
 use super::{as_vk_buf, be, Backing, VkBuffer, VulkanBackend};
 
 #[cfg(test)]
+#[path = "g01_cold_state_contract.rs"]
+mod g01_cold_state_contract;
+
+#[cfg(test)]
 #[path = "hc_inject_norm_sync_contract.rs"]
 mod hc_inject_norm_sync_contract;
 
@@ -10695,6 +10699,42 @@ impl<'a> Recorder<'a> {
             &push[..push_bytes as usize],
             total_pairs.div_ceil(256),
         );
+    }
+
+    /// One-token recurrence and output gated norm. The graph matcher guarantees an in-place,
+    /// trace-free consumer; state ownership and the interleaved source layout stay unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn deltanet_gated_norm(
+        &self,
+        qkv: &dyn Buffer,
+        beta: &dyn Buffer,
+        alpha: &dyn Buffer,
+        acoef: &dyn Buffer,
+        dtbias: &dyn Buffer,
+        norm: &dyn Buffer,
+        gate: &dyn Buffer,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        nv: usize,
+        nk: usize,
+        delta_eps: f32,
+        norm_eps: f32,
+        sigmoid: bool,
+    ) {
+        let (name, spv) = crate::gemm::deltanet_fused_norm_kernel(sigmoid);
+        let kernel = self.be.kernel_sg(name, spv, 9, 20, 32);
+        // The first word was unused nv. A runtime dim mirrors rmsnorm_gate's FP32 arithmetic.
+        // The existing matcher fixes head_v/head_dim=128; nv still determines the grid below.
+        let kd = 128usize;
+        let push = [
+            128u32,
+            nk as u32,
+            delta_eps.to_bits(),
+            norm_eps.to_bits(),
+            (1.0f32 / (kd as f32).sqrt()).to_bits(),
+        ];
+        let buffers = [qkv, beta, alpha, acoef, dtbias, norm, gate, state, out].map(Self::vkb);
+        self.dispatch(kernel, &buffers, 2, bytemuck::cast_slice(&push), nv as u32);
     }
 
     /// Strided DeltaNet: q/k/v read from same source buffer at offsets 0, nk*kd, 2*nk*kd.

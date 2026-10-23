@@ -1007,6 +1007,12 @@ fn main() {
         ("kda", "kda", &[]),
         // Strided variant: q/k/v read from single convout buffer with offsets (env-gated).
         ("deltanet_strided", "deltanet_strided", &[]),
+        ("deltanet_fused_chain", "deltanet_fused_norm", &[]),
+        (
+            "deltanet_fused_chain",
+            "deltanet_fused_norm_sigmoid",
+            &["-DGATE_SIGMOID"],
+        ),
         ("deltanet_chunked", "deltanet_chunked", &[]),
         ("deltanet_prep", "deltanet_prep", &[]),
         ("deltanet_gates", "deltanet_gates", &[]),

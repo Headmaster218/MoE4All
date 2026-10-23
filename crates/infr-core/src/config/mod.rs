@@ -592,6 +592,9 @@ cfg_struct! {
         /// default after dense-vs-strided output/state parity; `INFR_NO_DELTA_STRIDED` disables it
         /// and the historical `INFR_DELTA_STRIDED` opt-in remains accepted.
         delta_strided: bool = true,
+        /// Fuse single-token interleaved DeltaNet with its in-place gated norm on measured
+        /// devices. Multi-token, independent-state rows and checkpoint traces keep split ops.
+        delta_fused_norm: bool = true,
         /// `INFR_NO_PUSH_DESC` (inverted).
         push_desc: bool = true,
         /// `INFR_NO_PIPELINE_CACHE` (inverted).
