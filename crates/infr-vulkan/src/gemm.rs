@@ -3119,6 +3119,16 @@ pub(crate) fn silu_quant_q8_kernel(fused_gu: bool) -> (&'static str, &'static [u
     }
 }
 
+pub(crate) fn qwen_hc_up_mix_wave32_spv() -> &'static [u32] {
+    static SPV: OnceLock<Vec<u32>> = OnceLock::new();
+    SPV.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/qwen_hc_up_mix_e14_wave32.spv"
+        )))
+    })
+}
+
 pub(crate) fn linear_native_q8_pair_spv() -> &'static [u32] {
     static SPV: OnceLock<Vec<u32>> = OnceLock::new();
     SPV.get_or_init(|| {

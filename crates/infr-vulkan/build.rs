@@ -956,6 +956,11 @@ fn main() {
         ("silu_mul_quant_q8", "silu_mul_quant_q8", &[]),
         ("silu_mul_quant_q8", "silu_mul_quant_q8_gu", &["-DFUSED_GU"]),
         (
+            "qwen_hc_up_mix_e14_wave32",
+            "qwen_hc_up_mix_e14_wave32",
+            &[],
+        ),
+        (
             "qsa_indexer_topk",
             "qsa_indexer_topk_ordered",
             &["-DORDERED_COLLECT"],

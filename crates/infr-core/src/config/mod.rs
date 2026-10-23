@@ -559,6 +559,8 @@ cfg_struct! {
         flash_pv_reuse: bool = true,
         /// Independent native-Q8 scalar projection pair; other row counts retain split Linears.
         q8_linear_pair: bool = true,
+        /// Exact one-row Q8 HC up projection and ordered mix, when scratch views are disjoint.
+        hc_up_mix: bool = true,
         /// Preserve the exact F32 SwiGLU -> planar-Q8 boundary in one measured dispatch.
         silu_quant_q8: bool = true,
         /// Memoize graph-only scratch analysis within one immutable compiled plan.

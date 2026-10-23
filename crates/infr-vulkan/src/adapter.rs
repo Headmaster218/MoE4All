@@ -2399,6 +2399,137 @@ fn validate_q8_linear_pair(
 }
 
 #[derive(Clone, Copy)]
+struct HcUpMixPair {
+    low: TensorId,
+    weight: TensorId,
+    x: TensorId,
+    dst: TensorId,
+}
+
+fn hc_up_mix_gate_unobserved(graph: &Graph, start: usize, gate: TensorId) -> bool {
+    if graph.outputs.contains(&gate) {
+        return false;
+    }
+    let Some(elements) = graph
+        .desc(gate)
+        .shape
+        .iter()
+        .try_fold(1usize, |n, &dim| n.checked_mul(dim))
+    else {
+        return false;
+    };
+    for op in graph.ops.iter().skip(start) {
+        let (reads, writes) = op.io_inline();
+        if reads.contains(&gate) {
+            return false;
+        }
+        if !writes.contains(&gate) {
+            continue;
+        }
+        // O06 omits the gate store: a partial write cannot kill its remaining old elements.
+        let full_write = match op {
+            Op::Copy { dst_off, n, .. } => *dst_off == 0 && *n as usize == elements,
+            Op::CopyStrided {
+                dst_off,
+                dst_stride,
+                rows,
+                n,
+                ..
+            } => {
+                *dst_off == 0
+                    && *rows > 0
+                    && *n > 0
+                    && *dst_stride == *n
+                    && (*rows as usize).checked_mul(*n as usize) == Some(elements)
+            }
+            Op::Linear { m, out_f, .. } => {
+                (*m as usize).checked_mul(*out_f as usize) == Some(elements)
+            }
+            _ => false,
+        };
+        if full_write {
+            return true;
+        }
+    }
+    true
+}
+
+fn hc_up_mix_pair(
+    be_: &VulkanBackend,
+    graph: &Graph,
+    idx: usize,
+    scratch: &[Option<Box<dyn Buffer>>],
+    bindings: &Bindings,
+) -> Option<HcUpMixPair> {
+    let Op::Linear {
+        x: low,
+        weight,
+        dst: gate,
+        m: 1,
+        in_f: 320,
+        out_f: 10240,
+        w_off: 0,
+    } = graph.ops.get(idx)?
+    else {
+        return None;
+    };
+    let Op::QwenHcMix {
+        x,
+        gate: mix_gate,
+        dst,
+        rows: 1,
+        hc: 4,
+        n_embd: 2560,
+    } = graph.ops.get(idx + 1)?
+    else {
+        return None;
+    };
+    if !be_.cfg().kernels.vulkan.hc_up_mix
+        || !be_.prefers_hc_up_mix()
+        || !be_.use_q8_wave32()
+        || be_.dense_paged()
+        || graph.independent_rows
+        || graph.mtp_verify
+    {
+        return None;
+    }
+    if gate != mix_gate
+        || graph.desc(*weight).dtype != infr_core::DType::Q8_0
+        || graph.tensors[weight.0 as usize].kind != TensorKind::Weight
+        || graph.tensors[gate.0 as usize].kind != TensorKind::Internal
+        || !hc_up_mix_gate_unobserved(graph, idx + 2, *gate)
+        || [low, gate, x, dst]
+            .iter()
+            .any(|id| graph.desc(**id).dtype != infr_core::DType::F32)
+    {
+        return None;
+    }
+    let output = resolve(scratch, bindings, *dst).ok()?;
+    let start = output.device_addr()?;
+    let end = start.checked_add(2560 * 4)?;
+    // The unfused scratch plan may recycle the final-read low row for Mix's output.
+    // A fused dispatch extends that read: only disjoint physical views are eligible.
+    for (id, bytes) in [
+        (*low, 320 * 4),
+        (*x, 10240 * 4),
+        (*weight, 10240 * 320 / 32 * 34),
+    ] {
+        let buffer = resolve(scratch, bindings, id).ok()?;
+        let a = buffer.device_addr()?;
+        let b = a.checked_add(bytes)?;
+        if start < b && a < end {
+            return None;
+        }
+    }
+    Some(HcUpMixPair {
+        low: *low,
+        weight: *weight,
+        x: *x,
+        dst: *dst,
+    })
+}
+
+#[derive(Clone, Copy)]
 struct DeltaNormPair {
     weight: TensorId,
     gate: TensorId,
@@ -2409,6 +2540,9 @@ struct DeltaNormPair {
 #[cfg(test)]
 #[path = "deltanet_fusion_contract.rs"]
 mod deltanet_fusion_contract;
+#[cfg(test)]
+#[path = "hc_up_mix_graph_contract.rs"]
+mod hc_up_mix_graph_contract;
 #[cfg(test)]
 #[path = "q8_pair_graph_contract.rs"]
 mod q8_pair_graph_contract;
@@ -2543,6 +2677,12 @@ fn lower_op(
     let _timeline_lower = infr_core::timeline::span(op.kind());
     let memo_prev = mmv_memo.take();
     let r = |id: TensorId| resolve(scratch, bindings, id);
+    if be_.cfg().kernels.vulkan.hc_up_mix && wsub.is_none() && matches!(op, Op::Linear { .. }) {
+        if let Some(pair) = hc_up_mix_pair(be_, graph, op_idx, scratch, bindings) {
+            rec.qwen_hc_up_mix(r(pair.low)?, r(pair.weight)?, r(pair.x)?, r(pair.dst)?);
+            return Ok(());
+        }
+    }
     match op {
         Op::RmsNorm {
             x,
@@ -8643,6 +8783,12 @@ fn record_decode_replay(
     let fused_add = plan.linear_add;
     let mut skip_op = plan.skip;
     skip_op.extend(fused_q8_kv_write.keys().map(|&i| i + 1));
+    if be_.cfg().kernels.vulkan.hc_up_mix {
+        skip_op.extend(
+            (0..graph.ops.len())
+                .filter_map(|i| hc_up_mix_pair(be_, graph, i, &scratch, bindings).map(|_| i + 1)),
+        );
+    }
     if deltanet_norm_enabled(be_) {
         skip_op.extend(
             (0..graph.ops.len()).filter_map(|i| deltanet_norm_pair(graph, i).map(|_| i + 1)),
@@ -9793,6 +9939,12 @@ fn execute_static_inner(
     if deltanet_norm_enabled(be_) {
         skip_op.extend(
             (0..graph.ops.len()).filter_map(|i| deltanet_norm_pair(graph, i).map(|_| i + 1)),
+        );
+    }
+    if be_.cfg().kernels.vulkan.hc_up_mix {
+        skip_op.extend(
+            (0..graph.ops.len())
+                .filter_map(|i| hc_up_mix_pair(be_, graph, i, scratch, bindings).map(|_| i + 1)),
         );
     }
     let live_ops: Vec<_> = infr_core::exec::live_ops(&graph.ops, &skip_op).collect();

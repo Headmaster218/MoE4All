@@ -5084,6 +5084,31 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    pub(crate) fn qwen_hc_up_mix(
+        &self,
+        low: &dyn Buffer,
+        weight: &dyn Buffer,
+        x: &dyn Buffer,
+        dst: &dyn Buffer,
+    ) {
+        let addr = weight.device_addr().expect("fixed HC up weight address");
+        let pc = [320, 2560, addr as u32, (addr >> 32) as u32];
+        let kernel = self.be.kernel_sg(
+            "qwen_hc_up_mix_e14_wave32",
+            crate::gemm::qwen_hc_up_mix_wave32_spv(),
+            3,
+            16,
+            32,
+        );
+        self.dispatch(
+            kernel,
+            &[Self::vkb(low), Self::vkb(x), Self::vkb(dst)],
+            1,
+            bytemuck::cast_slice(&pc),
+            640,
+        );
+    }
+
     pub fn qwen_hc_mix(
         &self,
         x: &dyn Buffer,
