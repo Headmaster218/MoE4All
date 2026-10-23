@@ -21,6 +21,10 @@ use super::ops::ComputeKernel;
 use super::{as_vk_buf, be, Backing, VkBuffer, VulkanBackend};
 
 #[cfg(test)]
+#[path = "segmented_attention_contract.rs"]
+mod segmented_attention_contract;
+
+#[cfg(test)]
 #[path = "g01_cold_state_contract.rs"]
 mod g01_cold_state_contract;
 
@@ -7921,7 +7925,7 @@ impl<'a> Recorder<'a> {
         v_q8: bool,
         segment_shift: u32,
     ) {
-        self.attention_kv_split_impl(
+        self.attention_kv_split_segmented_canvas(
             q,
             kc,
             vc,
@@ -7940,6 +7944,59 @@ impl<'a> Recorder<'a> {
             scale,
             window,
             None,
+            k_q8,
+            v_q8,
+            segment_shift,
+        );
+    }
+
+    /// Segmented split-K with the same optional Canvas mask as the flat entry.
+    /// Ordinary callers retain the wrapper above; Canvas disables decode-only
+    /// specializations and uses attn_partial's existing lo+1 push-field encoding.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_kv_split_segmented_canvas(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        o: &dyn Buffer,
+        pm: &dyn Buffer,
+        pl: &dyn Buffer,
+        pacc: &dyn Buffer,
+        rows: usize,
+        pos: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        chunk: usize,
+        n_chunks: usize,
+        scale: f32,
+        window: usize,
+        canvas_lo: Option<usize>,
+        k_q8: bool,
+        v_q8: bool,
+        segment_shift: u32,
+    ) {
+        self.attention_kv_split_impl(
+            q,
+            kc,
+            vc,
+            o,
+            pm,
+            pl,
+            pacc,
+            rows,
+            pos,
+            kv_len,
+            nh,
+            nkv,
+            hd,
+            chunk,
+            n_chunks,
+            scale,
+            window,
+            canvas_lo,
             k_q8,
             v_q8,
             segment_shift as usize,
@@ -8234,7 +8291,33 @@ impl<'a> Recorder<'a> {
         // garbage rather than a crash. `window > 0` needs no such check: those builds carry the
         // modulo, which is the identity when the cache happens to be full-context.
         let ring_safe = segmented || window > 0 || cap == 0 || pos < cap / (nkv * hd);
-        let fast = if !batched
+        let segmented_fast = segmented
+            && !batched
+            && rows == 1
+            && canvas_lo.is_none()
+            && k_q8
+            && v_q8
+            && hd == 256
+            && nkv == 2
+            && matches!(nh, 16 | 32)
+            && window == 0
+            && chunk <= 1024
+            && (chunk <= 512 || self.vk().q8_decode_chunk1024)
+            && self.vk().q8_decode_segmented
+            && self.be.prefers_segmented_q8_decode()
+            && self.be.max_shared_memory_bytes() >= 32768
+            && self.vk().q8_decode_d8
+            && self.vk().q8_decode_ls256
+            && self.vk().q8_qk_f16
+            && self.vk().q8_pv_f16
+            && !crate::gemm::attn_decode_disabled(self.vk())
+            && !crate::gemm::attn_hd_spec_disabled(self.vk());
+        let fast = if segmented_fast {
+            Some(crate::gemm::attn_decode_segmented_kernel(
+                self.vk().q8_decode_gqa4 && (nh / nkv).is_multiple_of(4),
+                chunk > 512,
+            ))
+        } else if !batched
             && !segmented
             && !crate::gemm::attn_decode_disabled(self.vk())
             && bda
@@ -8290,7 +8373,12 @@ impl<'a> Recorder<'a> {
         };
         let (p1name, p1spv) = fast.unwrap_or((p1name, p1spv));
         let fused_gqa2 = p1name == "attn_decode_hd256_q8_gqa2";
-        let fused_gqa4 = p1name == "attn_decode_hd256_q8_gqa4";
+        let fused_gqa4 = matches!(
+            p1name,
+            "attn_decode_hd256_q8_gqa4"
+                | "attn_decode_hd256_q8_seg_gqa4"
+                | "attn_decode_hd256_q8_seg_gqa4_c1024"
+        );
         // The -DKV_BDA push grows by k_lo/k_hi/v_lo/v_hi (uvec2 splits) → 60 bytes; the bound push is
         // the base 44. n_buf stays 6 (q, kc, vc, pm, pl, pacc): kc/vc are inert-but-bound under BDA.
         let plen: usize = if bda { 60 } else { 44 };

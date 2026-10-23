@@ -546,6 +546,8 @@ cfg_struct! {
         q8_decode_gqa2: bool = true,
         /// Reuse each Q8 K/V read across four adjacent GQA query heads when occupancy permits.
         q8_decode_gqa4: bool = true,
+        /// Reuse the measured hd256 Q8 decode kernels for segmented KV address tables.
+        q8_decode_segmented: bool = true,
         /// Pair-codebook decode for IQ4_NL expert MMQ on measured Windows/RDNA3 devices.
         /// Other devices and matrix shapes retain the established scalar lookup path.
         iq4_pair_lut: bool = true,

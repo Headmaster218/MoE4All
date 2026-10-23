@@ -3109,6 +3109,30 @@ pub(crate) fn linear_native_q8_pair_spv() -> &'static [u32] {
     })
 }
 
+pub(crate) fn attn_decode_segmented_kernel(
+    gqa4: bool,
+    chunk1024: bool,
+) -> (&'static str, &'static [u32]) {
+    macro_rules! variant {
+        ($name:literal) => {{
+            static SPV: OnceLock<Vec<u32>> = OnceLock::new();
+            (
+                $name,
+                SPV.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            )
+        }};
+    }
+    match (gqa4, chunk1024) {
+        (false, false) => variant!("attn_decode_hd256_q8_seg_d8"),
+        (false, true) => variant!("attn_decode_hd256_q8_seg_d8_c1024"),
+        (true, false) => variant!("attn_decode_hd256_q8_seg_gqa4"),
+        (true, true) => variant!("attn_decode_hd256_q8_seg_gqa4_c1024"),
+    }
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_iq4_nl_xpg_spv() -> &'static [u32] {
     const BYTES: &[u8] =

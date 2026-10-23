@@ -6484,7 +6484,7 @@ fn lower_op(
                     let kv_ml = if decode_inline { Some(kdt) } else { None };
                     match (segmented_kv_view(kcb), segmented_kv_view(vcb)) {
                         (Some((kt, ks)), Some((vt, vs))) if ks == vs => {
-                            rec.attention_kv_split_segmented(
+                            rec.attention_kv_split_segmented_canvas(
                                 r(*q)?,
                                 kt,
                                 vt,
@@ -6502,6 +6502,7 @@ fn lower_op(
                                 n_chunks,
                                 *scale,
                                 window,
+                                canvas_lo,
                                 k_q8_eff,
                                 v_q8_eff,
                                 ks | if ring_past { SEGMENTED_KV_RING_FLAG } else { 0 },
