@@ -632,7 +632,11 @@ impl LookupBatchState {
         if tokens > 0 && seconds.is_finite() && seconds > 0.0 {
             let measured = seconds / tokens as f64;
             if let Some(previous) = self.ordinary_token_secs {
-                self.ordinary_token_secs = Some(0.75 * previous + 0.25 * measured);
+                // Proposal-triggered re-entry setup is not continuous Decode cost.
+                // Only amortized ordinary chunks may refresh the reference rate.
+                if tokens >= LOOKUP_CALIBRATION_TOKENS {
+                    self.ordinary_token_secs = Some(0.75 * previous + 0.25 * measured);
+                }
             } else {
                 self.calibration_tokens += tokens;
                 self.calibration_secs += seconds;
@@ -5885,6 +5889,21 @@ mod tests {
         assert_eq!(state.slow_cycles, 1);
         state.record_ordinary(0.0, 0);
         assert_eq!(state.ordinary_token_secs, Some(0.01));
+    }
+
+    #[test]
+    fn lookup_short_reentry_cannot_inflate_continuous_decode_reference() {
+        let mut state = LookupBatchState::new(Default::default(), &[]).unwrap();
+        state.record_ordinary(0.16, 16);
+        for tokens in 1..super::LOOKUP_CALIBRATION_TOKENS {
+            state.record_ordinary(tokens as f64, tokens);
+            assert_eq!(state.ordinary_token_secs, Some(0.01));
+        }
+        state.record_cycle(3, 3, 4, 0.06);
+        state.record_cycle(3, 3, 4, 0.06);
+        assert_eq!(state.cost_cooldown, super::LOOKUP_COST_COOLDOWN_TOKENS);
+        state.record_ordinary(0.32, 16);
+        assert!((state.ordinary_token_secs.unwrap() - 0.0125).abs() < 1e-12);
     }
 
     #[test]
