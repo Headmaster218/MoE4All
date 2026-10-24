@@ -38,6 +38,87 @@ pub use sc::{DenoiseOutcome, EbReduced};
 pub(crate) use session_state::{SessionBuffer, SessionBufferKey, SessionStateMeta};
 pub(crate) use weights::SeamKv;
 
+/// Persistent-state coverage for target Verify, independent of the proposer.
+/// Ordinary full Attention needs only an append-only KV frontier. GDN conv/S and
+/// Qwen PLE additionally use row traces; QSA's append-only planes share the KV frontier.
+/// MLA/indexers, KDA, diffusion, shared-layer KV and wrapping KV remain unsupported.
+/// Non-hybrid Attention currently uses one lane; parallel lanes have a separate runtime gate.
+pub(crate) fn target_verify_supported(cfg: &Config) -> bool {
+    if cfg.bailingmoe3
+        || cfg.deepseek4
+        || cfg.deepseek32
+        || cfg.diffusion_gemma
+        || cfg.n_layer == 0
+        || cfg.n_embd == 0
+        || !cfg.n_embd.is_multiple_of(32)
+        || cfg.n_embd_per_layer != 0
+        || (0..cfg.n_layer)
+            .any(|l| !cfg.has_own_kv(l) || cfg.is_swa_layer(l) || cfg.is_mla_layer(l))
+    {
+        return false;
+    }
+    if cfg.qwen4exp
+        && (!(1..=infr_core::graph::HYPER_CONNECT_MAX_MULT as usize).contains(&cfg.hc_mult)
+            || ((0..cfg.n_layer).any(|l| cfg.is_ple_layer(l))
+                && (cfg.is_ple_layer(0)
+                    || cfg.ple_ngram_size <= 1
+                    || cfg.ple_conv_kernel <= 1
+                    || cfg.ple_heads_per_ngram == 0
+                    || cfg.ple_head_dim == 0)))
+    {
+        return false;
+    }
+    // The builder selects DeltaNet from is_qwen_hybrid_attn_layer, while state allocation
+    // selects is_recurrent_layer. Reject inconsistent metadata before either can mutate state.
+    if (cfg.qwen35 || cfg.qwen4exp)
+        && (0..cfg.n_layer).any(|l| !cfg.is_qwen_hybrid_attn_layer(l) != cfg.is_recurrent_layer(l))
+    {
+        return false;
+    }
+    if !(0..cfg.n_layer).any(|l| cfg.is_recurrent_layer(l)) {
+        return true;
+    }
+    // GDN is the only recurrent participant with matching conv/S traces in this builder.
+    (cfg.qwen35 || cfg.qwen4exp)
+        && cfg.ssm_d_conv > 1 && cfg.ssm_n_group > 0 && cfg.ssm_dt_rank > 0
+        && cfg.ssm_d_inner.is_multiple_of(cfg.ssm_dt_rank)
+        && cfg.q35_head_k_dim() == 128 && cfg.q35_head_v_dim() > 0
+        // Mirrors the sequential trace kernel's two-column blocking (DN_SEQ_NCOL).
+        && cfg.q35_head_v_dim().is_multiple_of(2)
+}
+
+/// Detached proposer eligibility, shared with head construction. The loader still validates
+/// its sidecar; legacy embedded-head MTP uses a separate driver and lazy checkpoints.
+pub(crate) fn detached_mtp_enabled(cfg: &Config, ec: &EngineConfig) -> bool {
+    ec.spec.mtp && cfg.qwen4exp
+}
+
+pub(super) fn target_verify_enabled(cfg: &Config, ec: &EngineConfig) -> bool {
+    target_verify_supported(cfg)
+        && (ec.spec.lookup || detached_mtp_enabled(cfg, ec))
+        && ec.spec.gpu_embed
+        && (!(0..cfg.n_layer).any(|l| cfg.is_recurrent_layer(l))
+            || (ec.kernels.vulkan.dn_chunk
+                && ec.kernels.vulkan.dn_chunk_scan
+                && ec.kernels.vulkan.dn_split))
+}
+
+pub(super) fn target_verify_hidden_width(cfg: &Config) -> usize {
+    if cfg.qwen4exp {
+        cfg.hc_mult * cfg.n_embd
+    } else {
+        cfg.n_embd
+    }
+}
+
+pub(super) fn target_verify_ple_row(cfg: &Config) -> usize {
+    if (0..cfg.n_layer).any(|l| cfg.is_ple_layer(l)) {
+        cfg.ple_ngram_size.saturating_sub(1) * cfg.ple_heads_per_ngram * cfg.ple_head_dim
+    } else {
+        0
+    }
+}
+
 pub(crate) struct ParallelSampledOutput {
     pub(crate) tokens: Vec<Vec<u32>>,
     pub(crate) prompt_secs: Vec<f64>,
@@ -1008,6 +1089,43 @@ pub(crate) fn generate_dense_vulkan_parallel_mtp_verify_session(
     peers: &mut [SeamKv],
     want_ctx: usize,
 ) -> AResult<(Vec<Vec<u32>>, Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+    generate_dense_vulkan_parallel_verify_session(
+        vk,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        feeds,
+        mrope_plans,
+        primary,
+        peers,
+        want_ctx,
+        true,
+    )
+}
+
+/// Verify uniform 2..=4-row suffixes of warm targets without a draft head.
+/// Callers snapshot and arm each target's recurrent trace for the actual suffix width.
+/// Attention-only targets use the same metadata owner with no state buffers. Their current
+/// support is one lane and text positions; other lanes/multimodal require validated bindings.
+/// Returns lane-major ids/logits/hidden; hidden lanes are empty when not requested.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn generate_dense_vulkan_parallel_verify_session(
+    vk: &infr_vulkan::VulkanBackend,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    feeds: &[Vec<u32>],
+    mrope_plans: &[Option<&MropePlan>],
+    primary: &mut Option<SeamKv>,
+    peers: &mut [SeamKv],
+    want_ctx: usize,
+    want_hidden: bool,
+) -> AResult<(Vec<Vec<u32>>, Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+    // Reject unsupported/invalid requests before the failure cleanup can reset warm targets.
+    runner::validate_parallel_target_verify(vk, g, cfg, ec, feeds, mrope_plans, primary, peers)?;
     let bind: Box<BindWeight<'_>> = Box::new(|name: &str, _tb, _dt, _n| {
         Err(anyhow!("warm parallel MTP session must not re-bind {name}"))
     });
@@ -1029,6 +1147,7 @@ pub(crate) fn generate_dense_vulkan_parallel_mtp_verify_session(
         &mut ids,
         &mut logits,
         &mut hidden,
+        want_hidden,
     );
     if result.is_err() {
         if let Some(slot) = primary.as_mut() {
@@ -7420,6 +7539,86 @@ mod seam_helper_tests {
         assert_eq!(super::kv_side_elems(k), k);
     }
 
+    #[test]
+    #[ignore = "requires MOE4ALL_SPEC_TEST_MODEL pointing to a supported target GGUF"]
+    fn real_model_target_verify_capability() {
+        use infr_core::WeightSource;
+        let path = std::path::PathBuf::from(
+            std::env::var_os("MOE4ALL_SPEC_TEST_MODEL")
+                .expect("set MOE4ALL_SPEC_TEST_MODEL to the Flash or Qwen3.5 target GGUF"),
+        );
+        // Gguf::open maps the file; parsing below reads metadata and tensor shapes only.
+        // No tensor payload access, backend creation, weight upload or inference is needed.
+        let gguf = infr_gguf::Gguf::open(&path)
+            .unwrap_or_else(|err| panic!("open {}: {err}", path.display()));
+        let cfg = Config::from_gguf(&gguf)
+            .unwrap_or_else(|err| panic!("parse config {}: {err}", path.display()));
+        let supported = super::target_verify_supported(&cfg);
+        eprintln!(
+            "target_verify_supported={supported} model={} arch={} qwen35={} qwen4exp={} \
+             bailingmoe3={} deepseek4={} deepseek32={} diffusion_gemma={}",
+            path.display(),
+            gguf.metadata().str("general.architecture").unwrap_or(""),
+            cfg.qwen35,
+            cfg.qwen4exp,
+            cfg.bailingmoe3,
+            cfg.deepseek4,
+            cfg.deepseek32,
+            cfg.diffusion_gemma,
+        );
+        eprintln!(
+            "layers={} n_embd={} n_embd_per_layer={} n_head={} n_kv={} head_dim={} \
+             full_attn_interval={} hc_mult={} ssm(conv,state,inner,group,rank)={:?} \
+             gdn_head_k={} gdn_head_v={} ple(ngram,conv,heads,dim)={:?}",
+            cfg.n_layer,
+            cfg.n_embd,
+            cfg.n_embd_per_layer,
+            cfg.n_head,
+            cfg.n_kv,
+            cfg.head_dim,
+            cfg.full_attn_interval,
+            cfg.hc_mult,
+            (
+                cfg.ssm_d_conv,
+                cfg.ssm_d_state,
+                cfg.ssm_d_inner,
+                cfg.ssm_n_group,
+                cfg.ssm_dt_rank,
+            ),
+            cfg.q35_head_k_dim(),
+            cfg.q35_head_v_dim(),
+            (
+                cfg.ple_ngram_size,
+                cfg.ple_conv_kernel,
+                cfg.ple_heads_per_ngram,
+                cfg.ple_head_dim,
+            ),
+        );
+        let layers: Vec<_> = (0..cfg.n_layer)
+            .map(|layer| {
+                (
+                    layer,
+                    cfg.has_own_kv(layer),
+                    cfg.is_swa_layer(layer),
+                    cfg.is_mla_layer(layer),
+                    cfg.is_recurrent_layer(layer),
+                    cfg.is_qwen_hybrid_attn_layer(layer),
+                    cfg.is_ple_layer(layer),
+                )
+            })
+            .collect();
+        eprintln!(
+            "layers(index,own_kv,swa,mla,recurrent,qwen_full_attention,ple)={layers:?} \
+             recurrent_flags={:?} ple_flags={:?}",
+            cfg.recurrent_layers, cfg.ple_layers,
+        );
+        assert!(
+            supported,
+            "expected target Verify capability for {}; inspect parsed dimensions above",
+            path.display(),
+        );
+    }
+
     fn qwen35_hybrid_state() -> Config {
         Config {
             qwen35: true,
@@ -7434,6 +7633,196 @@ mod seam_helper_tests {
             ssm_dt_rank: 16,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn target_verify_capability_covers_qwen35_and_qwen4_exact_traces() {
+        let mut cfg = qwen35_hybrid_state();
+        cfg.n_embd = 2560;
+        cfg.n_layer_kv_from_start = cfg.n_layer;
+        assert!(super::target_verify_supported(&cfg));
+        assert_eq!(super::target_verify_hidden_width(&cfg), 2560);
+        assert_eq!(super::target_verify_ple_row(&cfg), 0);
+
+        cfg.qwen35 = false;
+        cfg.qwen4exp = true;
+        cfg.hc_mult = 4;
+        cfg.recurrent_layers = (0..cfg.n_layer).map(|layer| layer % 4 != 3).collect();
+        assert!(super::target_verify_supported(&cfg));
+        assert_eq!(super::target_verify_hidden_width(&cfg), 4 * 2560);
+        assert_eq!(super::target_verify_ple_row(&cfg), 0);
+        cfg.ple_layers = vec![true];
+        cfg.ple_ngram_size = 3;
+        cfg.ple_heads_per_ngram = 4;
+        cfg.ple_head_dim = 8;
+        assert_eq!(super::target_verify_ple_row(&cfg), 64);
+    }
+
+    #[test]
+    fn target_verify_eager_allocation_requires_matching_proposer() {
+        let mut qwen35 = qwen35_hybrid_state();
+        qwen35.n_embd = 2048;
+        qwen35.n_layer_kv_from_start = qwen35.n_layer;
+        let mut qwen4 = qwen35.clone();
+        qwen4.qwen35 = false;
+        qwen4.qwen4exp = true;
+        qwen4.hc_mult = 4;
+        qwen4.recurrent_layers = (0..qwen4.n_layer).map(|layer| layer % 4 != 3).collect();
+        let attention = Config {
+            n_layer: 4,
+            n_layer_kv_from_start: 4,
+            n_embd: 256,
+            n_head: 4,
+            n_kv: 2,
+            head_dim: 64,
+            ..Default::default()
+        };
+        let mut ec = EngineConfig::default();
+        ec.spec.gpu_embed = true;
+        ec.kernels.vulkan.dn_chunk = true;
+        ec.kernels.vulkan.dn_chunk_scan = true;
+        ec.kernels.vulkan.dn_split = true;
+        for (name, cfg, detached) in [
+            ("qwen35", qwen35, false),
+            ("qwen4", qwen4, true),
+            ("attention", attention, false),
+        ] {
+            assert!(super::target_verify_supported(&cfg), "{name}");
+            for mtp in [false, true] {
+                for lookup in [false, true] {
+                    ec.spec.mtp = mtp;
+                    ec.spec.lookup = lookup;
+                    assert_eq!(super::detached_mtp_enabled(&cfg, &ec), mtp && detached, "{name}");
+                    assert_eq!(
+                        super::target_verify_enabled(&cfg, &ec),
+                        lookup || (mtp && detached),
+                        "{name}: mtp={mtp} lookup={lookup}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn detached_mtp_eligibility_keeps_legacy_embedded_heads_separate() {
+        let mut cfg = qwen35_hybrid_state();
+        cfg.n_embd = 2048;
+        cfg.n_layer_kv_from_start = cfg.n_layer;
+        cfg.n_layer_nextn = 1;
+        let mut ec = EngineConfig::default();
+        ec.spec.mtp = true;
+        ec.spec.lookup = false;
+        ec.spec.gpu_embed = true;
+        ec.kernels.vulkan.dn_chunk = true;
+        ec.kernels.vulkan.dn_chunk_scan = true;
+        ec.kernels.vulkan.dn_split = true;
+        assert!(super::target_verify_supported(&cfg));
+        assert!(!super::detached_mtp_enabled(&cfg, &ec));
+        assert!(!super::target_verify_enabled(&cfg, &ec));
+        ec.spec.lookup = true;
+        assert!(super::target_verify_enabled(&cfg, &ec));
+
+        cfg.qwen35 = false;
+        cfg.qwen4exp = true;
+        cfg.hc_mult = 4;
+        cfg.n_layer_nextn = 0;
+        cfg.recurrent_layers = (0..cfg.n_layer).map(|layer| layer % 4 != 3).collect();
+        ec.spec.lookup = false;
+        ec.spec.draft = None; // Sidecar validation stays with the loader, not this capability gate.
+        assert!(super::detached_mtp_enabled(&cfg, &ec));
+        assert!(super::target_verify_enabled(&cfg, &ec));
+    }
+
+    #[test]
+    fn target_verify_rejects_unsupported_mixer_shapes_and_disabled_scan() {
+        let mut cfg = qwen35_hybrid_state();
+        cfg.n_embd = 2560;
+        cfg.n_layer_kv_from_start = cfg.n_layer;
+        let mut ec = EngineConfig::default();
+        ec.spec.mtp = false;
+        ec.spec.lookup = true;
+        ec.spec.gpu_embed = true;
+        ec.kernels.vulkan.dn_chunk = true;
+        ec.kernels.vulkan.dn_chunk_scan = true;
+        ec.kernels.vulkan.dn_split = true;
+        assert!(super::target_verify_enabled(&cfg, &ec));
+        ec.spec.lookup = false;
+        assert!(!super::target_verify_enabled(&cfg, &ec));
+        ec.spec.lookup = true;
+        ec.kernels.vulkan.dn_chunk_scan = false;
+        assert!(!super::target_verify_enabled(&cfg, &ec));
+
+        cfg.ssm_d_state = 64;
+        assert!(!super::target_verify_supported(&cfg));
+        cfg.ssm_d_state = 128;
+        cfg.ssm_d_inner = cfg.ssm_dt_rank * 65;
+        assert!(!super::target_verify_supported(&cfg));
+        cfg.ssm_dt_rank = 0;
+        assert!(!super::target_verify_supported(&cfg));
+        assert!(!super::target_verify_supported(&Config::default()));
+    }
+
+    #[test]
+    fn target_verify_rejects_target_rings_and_cross_layer_kv() {
+        let mut cfg = qwen35_hybrid_state();
+        cfg.n_embd = 2560;
+        cfg.n_layer_kv_from_start = cfg.n_layer;
+        assert!(super::target_verify_supported(&cfg));
+        cfg.n_layer_kv_from_start -= 1;
+        assert!(!super::target_verify_supported(&cfg));
+        cfg.n_layer_kv_from_start = cfg.n_layer;
+        cfg.swa_window = 256;
+        cfg.swa_pattern = 4;
+        assert!(!super::target_verify_supported(&cfg));
+    }
+
+    #[test]
+    fn target_verify_accepts_plain_append_only_attention_without_gdn_hc_or_ple() {
+        let mut cfg = Config {
+            n_layer: 4,
+            n_layer_kv_from_start: 4,
+            n_embd: 256,
+            n_head: 4,
+            n_kv: 2,
+            head_dim: 64,
+            ..Default::default()
+        };
+        assert!(super::target_verify_supported(&cfg));
+        assert_eq!(super::target_verify_hidden_width(&cfg), 256);
+        assert_eq!(super::target_verify_ple_row(&cfg), 0);
+        let mut ec = EngineConfig::default();
+        ec.spec.mtp = false;
+        ec.spec.lookup = true;
+        ec.spec.gpu_embed = true;
+        ec.kernels.vulkan.dn_chunk = false;
+        ec.kernels.vulkan.dn_chunk_scan = false;
+        ec.kernels.vulkan.dn_split = false;
+        assert!(super::target_verify_enabled(&cfg, &ec));
+
+        cfg.deepseek2 = true;
+        assert!(!super::target_verify_supported(&cfg));
+        cfg.deepseek2 = false;
+        cfg.bailingmoe3 = true;
+        assert!(!super::target_verify_supported(&cfg));
+        cfg.bailingmoe3 = false;
+        cfg.diffusion_gemma = true;
+        assert!(!super::target_verify_supported(&cfg));
+    }
+
+    #[test]
+    fn target_verify_rejects_untracked_qwen_recurrent_fallback_metadata() {
+        let cfg = Config {
+            qwen4exp: true,
+            hc_mult: 4,
+            n_layer: 4,
+            n_layer_kv_from_start: 4,
+            n_embd: 256,
+            full_attn_interval: 4,
+            // The builder's interval fallback selects GDN but allocation sees no recurrent flags.
+            recurrent_layers: Vec::new(),
+            ..Default::default()
+        };
+        assert!(!super::target_verify_supported(&cfg));
     }
 
     #[test]

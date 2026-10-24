@@ -10,6 +10,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::{BindWeightFn, MtpTensor};
 
+#[path = "qwen4_draft_vocab.rs"]
+mod draft_vocab;
+
 pub const DRAFT_TOKENS: usize = 4;
 
 fn refill_verify_feed(
@@ -35,6 +38,18 @@ fn generation_budget(prompt_rows: usize, requested: usize, max_ctx: usize) -> Re
         );
     }
     Ok(requested.min(max_ctx - reserved))
+}
+
+fn retained_draft_rows(
+    accepted_tokens: &[u32],
+    remaining: usize,
+    mut is_eos: impl FnMut(u32) -> bool,
+) -> usize {
+    let limit = accepted_tokens.len().min(remaining);
+    accepted_tokens[..limit]
+        .iter()
+        .position(|&token| is_eos(token))
+        .map_or(limit, |row| row + 1)
 }
 
 pub(crate) type SharedWeight<'a> = (&'a dyn Buffer, DType, usize);
@@ -89,6 +104,8 @@ impl Drop for PhaseProfile {
 }
 
 struct Qwen4MtpWeights {
+    // Shipped sidecars also contain the four QSA indexer tensors. Head QSA is deferred,
+    // not weight-blocked: it needs bounded-ring index state, journaling and frozen selection.
     hc_attn_norm: MtpTensor,
     hc_attn_down: MtpTensor,
     hc_attn_up: MtpTensor,
@@ -1158,9 +1175,13 @@ struct DraftHandles {
     weights: Vec<TensorId>,
     embd: TensorId,
     lm_head: TensorId,
+    vocab_map: Option<TensorId>,
+    raw_ids: Vec<TensorId>,
+    #[cfg(test)]
     ids: Vec<TensorId>,
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn build_draft_graph(
     cfg: &crate::Config,
@@ -1172,7 +1193,59 @@ fn build_draft_graph(
     steps: usize,
     fuse_down_inject: bool,
 ) -> (Graph, DraftHandles) {
+    build_draft_graph_impl::<true>(
+        cfg,
+        specs,
+        shared,
+        kv_capacity,
+        attention_window,
+        start_pos,
+        steps,
+        fuse_down_inject,
+    )
+}
+
+// The production full-vocabulary path also uses the bounded identity-map gather.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn build_draft_graph_impl<const LAST_STEP_KV_ONLY: bool>(
+    cfg: &crate::Config,
+    specs: &[(DType, usize)],
+    shared: [(DType, usize); 2],
+    kv_capacity: usize,
+    attention_window: usize,
+    start_pos: usize,
+    steps: usize,
+    fuse_down_inject: bool,
+) -> (Graph, DraftHandles) {
+    build_draft_graph_vocab_impl::<LAST_STEP_KV_ONLY>(
+        cfg,
+        specs,
+        shared,
+        kv_capacity,
+        attention_window,
+        start_pos,
+        steps,
+        fuse_down_inject,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_draft_graph_vocab_impl<const LAST_STEP_KV_ONLY: bool>(
+    cfg: &crate::Config,
+    specs: &[(DType, usize)],
+    shared: [(DType, usize); 2],
+    kv_capacity: usize,
+    attention_window: usize,
+    start_pos: usize,
+    steps: usize,
+    fuse_down_inject: bool,
+    vocab_rows: Option<usize>,
+) -> (Graph, DraftHandles) {
     let mut g = Graph::new();
+    // Unrolled steps have distinct KV/RoPE positions, even with only one Attention at width two.
+    g.no_decode_replay = true;
     let f32d = |n| TensorDesc::new(vec![n], DType::F32);
     let hcw = cfg.hc_mult * cfg.n_embd;
     let kvrow = cfg.n_kv * cfg.head_dim;
@@ -1184,12 +1257,35 @@ fn build_draft_graph(
     let k_cache = g.input(TensorDesc::new(vec![kv_capacity * kvrow], DType::F16));
     let v_cache = g.input(TensorDesc::new(vec![kv_capacity * kvrow], DType::F16));
     let (weights, handles) = declare_weights(&mut g, specs, shared[0], shared[1]);
+    let vocab_map = vocab_rows.map(|rows| g.weight(TensorDesc::new(vec![rows], DType::I32)));
+    let output_rows = vocab_rows.unwrap_or(cfg.vocab);
     let scratch = step_scratch(&mut g, cfg, 1);
     let mut prev_id = id;
     let mut prev_h = h;
+    #[cfg(test)]
     let mut out_ids = Vec::with_capacity(steps.saturating_sub(1));
+    let mut raw_ids = Vec::with_capacity(steps.saturating_sub(1));
     for (step, &position) in positions.iter().enumerate() {
         emit_bridge(&mut g, cfg, 1, prev_id, prev_h, &weights, &scratch, None);
+        if LAST_STEP_KV_ONLY && step + 1 == steps {
+            // The last row has no hidden/prediction consumer. Its only persistent writes are
+            // K/V; the remaining Q, Attention and FFN work would only update internal scratch.
+            emit_attention_kv(
+                &mut g,
+                cfg,
+                1,
+                start_pos + step,
+                position,
+                None,
+                k_cache,
+                v_cache,
+                &weights,
+                &scratch,
+                fuse_down_inject,
+                false,
+            );
+            break;
+        }
         let h_next = g.internal(f32d(hcw));
         emit_full_step(
             &mut g,
@@ -1204,9 +1300,7 @@ fn build_draft_graph(
             h_next,
             fuse_down_inject,
         );
-        // The last step is needed to commit the final verified token to the MTP KV cache, but its
-        // prediction is not part of this target batch. Avoid an unused HC mix, vocab projection,
-        // argmax and readback.
+        // The baseline also omits the last prediction, which is outside this target batch.
         if step + 1 == steps {
             break;
         }
@@ -1227,23 +1321,41 @@ fn build_draft_graph(
             fuse_down_inject,
             None,
         );
-        let logits = g.internal(f32d(cfg.vocab));
+        let logits = g.internal(f32d(output_rows));
         g.push(Op::Linear {
             x: head_hidden,
             weight: weights.lm_head,
             dst: logits,
             m: 1,
             in_f: cfg.n_embd as u32,
-            out_f: cfg.vocab as u32,
+            out_f: output_rows as u32,
             w_off: 0,
         });
-        let next_id = g.output(f32d(1));
+        let argmax_id = g.output(f32d(1));
+        let next_id = if vocab_map.is_some() {
+            g.internal(f32d(1))
+        } else {
+            argmax_id
+        };
         g.push(Op::Argmax {
             x: logits,
-            dst: next_id,
-            n: cfg.vocab as u32,
+            dst: argmax_id,
+            n: output_rows as u32,
             rows: 1,
         });
+        if let Some(table) = vocab_map {
+            // Vulkan Argmax/GatherI32 carry raw integer words, including in the F32 id outputs.
+            // Remap before the next bridge; a host-only readback remap would chain the wrong token.
+            g.push(Op::GatherI32 {
+                ids: argmax_id,
+                table,
+                dst: next_id,
+                rows: 1,
+                ne: 1,
+            });
+        }
+        raw_ids.push(argmax_id);
+        #[cfg(test)]
         out_ids.push(next_id);
         prev_id = next_id;
         prev_h = h_next;
@@ -1259,6 +1371,9 @@ fn build_draft_graph(
             weights: handles,
             embd: weights.embd,
             lm_head: weights.lm_head,
+            vocab_map,
+            raw_ids,
+            #[cfg(test)]
             ids: out_ids,
         },
     )
@@ -1269,6 +1384,8 @@ pub(crate) struct Qwen4MtpFixed {
     weights: Vec<Box<dyn Buffer>>,
     specs: Vec<(DType, usize)>,
     fuse_down_inject: bool,
+    draft_vocab: Option<draft_vocab::DraftVocab>,
+    draft_identity_map: Option<Box<dyn Buffer>>,
     device_catch_plans: Mutex<VecDeque<Arc<DeviceCatchPlan>>>,
 }
 
@@ -1292,6 +1409,142 @@ struct Qwen4MtpKvCache {
     v: Box<dyn Buffer>,
     segmented: bool,
     committed_tokens: usize,
+    draft_journal: DraftKvJournal,
+}
+
+#[derive(Clone, Copy)]
+struct DraftKvOverwrite {
+    start_pos: usize,
+    rows: usize,
+    first_saved: usize,
+    retained_limit: usize,
+}
+
+struct DraftKvJournal {
+    k: Box<dyn Buffer>,
+    v: Box<dyn Buffer>,
+    capacity: usize,
+    row_bytes: usize,
+    pending: Option<DraftKvOverwrite>,
+}
+
+impl DraftKvJournal {
+    fn new(be: &dyn Backend, capacity: usize, row_bytes: usize) -> Result<Self> {
+        anyhow::ensure!(
+            capacity > 0 && row_bytes > 0,
+            "invalid MTP draft journal geometry"
+        );
+        capacity
+            .checked_mul(row_bytes)
+            .ok_or_else(|| anyhow!("MTP draft ring byte count overflow"))?;
+        let bytes = capacity.min(DRAFT_TOKENS) * row_bytes;
+        Ok(Self {
+            k: be
+                .alloc(bytes, BufferUsage::Activations)
+                .map_err(|e| anyhow!("{e}"))?,
+            v: be
+                .alloc(bytes, BufferUsage::Activations)
+                .map_err(|e| anyhow!("{e}"))?,
+            capacity,
+            row_bytes,
+            pending: None,
+        })
+    }
+
+    fn offsets(&self, start_pos: usize, rows: usize, first: usize) -> Result<Vec<(usize, usize)>> {
+        anyhow::ensure!(
+            rows > 0 && rows <= DRAFT_TOKENS && rows <= self.capacity && first <= rows,
+            "MTP draft journal needs distinct ring rows and a valid retained prefix"
+        );
+        start_pos
+            .checked_add(rows)
+            .ok_or_else(|| anyhow!("MTP draft position overflow"))?;
+        Ok((first..rows)
+            .map(|step| {
+                (
+                    ((start_pos + step) % self.capacity) * self.row_bytes,
+                    step * self.row_bytes,
+                )
+            })
+            .collect())
+    }
+
+    fn begin(
+        &mut self,
+        be: &dyn Backend,
+        k_cache: &dyn Buffer,
+        v_cache: &dyn Buffer,
+        start_pos: usize,
+        rows: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.pending.is_none(),
+            "MTP head draft must be settled before another draft"
+        );
+        // Before the first wrap, the leading slots have no historical rows to preserve.
+        let first_saved = rows.min(self.capacity.saturating_sub(start_pos));
+        let offsets = self.offsets(start_pos, rows, first_saved)?;
+        let copies = offsets
+            .iter()
+            .flat_map(|&(cache, saved)| {
+                [
+                    (k_cache, cache, self.k.as_ref(), saved, self.row_bytes),
+                    (v_cache, cache, self.v.as_ref(), saved, self.row_bytes),
+                ]
+            })
+            .collect::<Vec<_>>();
+        if !copies.is_empty() {
+            be.copy_buffer_ranges(&copies)
+                .map_err(|e| anyhow!("save MTP draft overwritten KV rows: {e}"))?;
+        }
+        self.pending = Some(DraftKvOverwrite {
+            start_pos,
+            rows,
+            first_saved,
+            retained_limit: rows,
+        });
+        Ok(())
+    }
+
+    fn settle(
+        &mut self,
+        be: &dyn Backend,
+        k_cache: &dyn Buffer,
+        v_cache: &dyn Buffer,
+        retained_rows: usize,
+    ) -> Result<()> {
+        let Some(pending) = self.pending else {
+            anyhow::ensure!(retained_rows == 0, "MTP head has no draft to retain");
+            return Ok(());
+        };
+        anyhow::ensure!(
+            retained_rows <= pending.retained_limit,
+            "MTP draft retained prefix exceeds saved rows or a previous restore attempt"
+        );
+        let offsets = self.offsets(
+            pending.start_pos,
+            pending.rows,
+            retained_rows.max(pending.first_saved),
+        )?;
+        // A backend may fail after copying part of the batch. Keep all original bytes for retry
+        // or full abort, and forbid increasing the retained prefix after restoration has begun.
+        self.pending.as_mut().unwrap().retained_limit = retained_rows;
+        let copies = offsets
+            .iter()
+            .flat_map(|&(cache, saved)| {
+                [
+                    (self.k.as_ref(), saved, k_cache, cache, self.row_bytes),
+                    (self.v.as_ref(), saved, v_cache, cache, self.row_bytes),
+                ]
+            })
+            .collect::<Vec<_>>();
+        if !copies.is_empty() {
+            be.copy_buffer_ranges(&copies)
+                .map_err(|e| anyhow!("restore MTP draft overwritten KV rows: {e}"))?;
+        }
+        self.pending = None;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1488,12 +1741,35 @@ impl Qwen4MtpSession {
                 .map_err(|e| anyhow!("{e}"))?;
             Ok((buffer, dtype))
         };
-        Self::load_fixed(
+        let mut fixed = Self::load_fixed(
             bind,
             sidecar_path,
             cfg,
             vk.capabilities().qwen_hc_down_inject && vk.cfg().kernels.qwen_hc_down_inject,
-        )
+        )?;
+        Arc::get_mut(&mut fixed)
+            .ok_or_else(|| anyhow!("MTP fixed head was shared before ID-map initialization"))?
+            .draft_identity_map = Some(draft_vocab::load_identity_map(vk, cfg.vocab)?);
+        Ok(fixed)
+    }
+
+    pub(crate) fn load_fixed_vulkan_with_vocab(
+        vk: &infr_vulkan::VulkanBackend,
+        sidecar_path: &Path,
+        cfg: &crate::Config,
+        target: &Gguf,
+        vocab_ids: Option<&Path>,
+    ) -> Result<Arc<Qwen4MtpFixed>> {
+        // Vulkan loaders bind raw-integer safety maps. Generic loading remains available for
+        // CPU structural tests; CPU Argmax and GatherI32 use different id representations.
+        let vocab = vocab_ids
+            .map(|path| draft_vocab::DraftVocab::load_vulkan(vk, target, cfg, path))
+            .transpose()?;
+        let mut fixed = Self::load_fixed_vulkan(vk, sidecar_path, cfg)?;
+        Arc::get_mut(&mut fixed)
+            .ok_or_else(|| anyhow!("MTP fixed head was shared before vocabulary initialization"))?
+            .draft_vocab = vocab;
+        Ok(fixed)
     }
 
     pub(crate) fn load_fixed(
@@ -1526,6 +1802,8 @@ impl Qwen4MtpSession {
             weights,
             specs,
             fuse_down_inject,
+            draft_vocab: None,
+            draft_identity_map: None,
             device_catch_plans: Mutex::new(VecDeque::new()),
         }))
     }
@@ -1650,6 +1928,11 @@ impl Qwen4MtpSession {
                 v: v_cache,
                 segmented: segmented_kv,
                 committed_tokens: 0,
+                draft_journal: DraftKvJournal::new(
+                    be,
+                    kv_capacity,
+                    kv_spec.logical_bytes / kv_capacity,
+                )?,
             }),
             catch,
             prime_last_h,
@@ -1674,6 +1957,10 @@ impl Qwen4MtpSession {
             .kv
             .lock()
             .map_err(|_| anyhow!("Qwen3.8 MTP KV state poisoned"))?;
+        anyhow::ensure!(
+            kv.draft_journal.pending.is_none(),
+            "settle the MTP head draft before accessing its KV state"
+        );
         if kv.segmented && !be.segmented_kv_available() {
             let alloc = || {
                 be.alloc(self.kv_spec.logical_bytes, BufferUsage::KvCache)
@@ -1765,6 +2052,7 @@ impl Qwen4MtpSession {
     }
 
     pub(crate) fn release_kv(&self, be: &dyn Backend) -> Result<()> {
+        self.settle_draft(be, 0)?;
         be.sync()
             .map_err(|error| anyhow!("sync before Qwen3.8 MTP KV release: {error}"))?;
         let mut kv = self
@@ -2185,6 +2473,26 @@ impl Qwen4MtpSession {
             .map_err(|e| anyhow!("{e}"))
     }
 
+    /// Finish one head draft after target verification and delivery. `retained_rows` counts the
+    /// actual committed target rows, INCLUDING the pending row (not just accepted candidates).
+    /// Use zero on abort/error. Previously-live rows overwritten by the rejected suffix regain
+    /// their original K/V bytes even at ring/segment boundaries; unused slots need no restore.
+    /// Settle before another draft, catch-up, cache export or release, even with no saved rows.
+    pub(crate) fn settle_draft(&self, be: &dyn Backend, retained_rows: usize) -> Result<()> {
+        let mut kv = self
+            .kv
+            .lock()
+            .map_err(|_| anyhow!("Qwen3.8 MTP KV state poisoned"))?;
+        let Qwen4MtpKvCache {
+            k,
+            v,
+            draft_journal,
+            ..
+        } = &mut *kv;
+        draft_journal.settle(be, k.as_ref(), v.as_ref(), retained_rows)
+    }
+
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn draft(
         &self,
@@ -2195,6 +2503,57 @@ impl Qwen4MtpSession {
         rope_start_pos: i32,
         verify_tokens: usize,
         shared: SharedWeights<'_>,
+    ) -> Result<Vec<u32>> {
+        self.draft_with_tail_mode(
+            be,
+            token,
+            h,
+            start_pos,
+            rope_start_pos,
+            verify_tokens,
+            shared,
+            true,
+        )
+    }
+
+    /// Same execution/transaction path for runtime A/B; only the final graph step differs.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn draft_with_tail_mode(
+        &self,
+        be: &dyn Backend,
+        token: u32,
+        h: &[f32],
+        start_pos: usize,
+        rope_start_pos: i32,
+        verify_tokens: usize,
+        shared: SharedWeights<'_>,
+        tail_kv_only: bool,
+    ) -> Result<Vec<u32>> {
+        self.draft_with_projection(
+            be,
+            token,
+            h,
+            start_pos,
+            rope_start_pos,
+            verify_tokens,
+            shared,
+            tail_kv_only,
+            self.fixed.draft_vocab.as_ref(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draft_with_projection(
+        &self,
+        be: &dyn Backend,
+        token: u32,
+        h: &[f32],
+        start_pos: usize,
+        rope_start_pos: i32,
+        verify_tokens: usize,
+        shared: SharedWeights<'_>,
+        tail_kv_only: bool,
+        draft_vocab: Option<&draft_vocab::DraftVocab>,
     ) -> Result<Vec<u32>> {
         anyhow::ensure!(
             (2..=DRAFT_TOKENS).contains(&verify_tokens),
@@ -2207,10 +2566,13 @@ impl Qwen4MtpSession {
                 h.len()
             );
         }
-        if start_pos + verify_tokens > self.max_ctx {
+        let draft_end = start_pos
+            .checked_add(verify_tokens)
+            .ok_or_else(|| anyhow!("Qwen3.8 MTP draft position overflow"))?;
+        if draft_end > self.max_ctx {
             bail!("Qwen3.8 MTP draft exceeds {} token cache", self.max_ctx);
         }
-        let kv = self.kv_for_depth(be, start_pos + verify_tokens)?;
+        let mut kv = self.kv_for_depth(be, draft_end)?;
         be.upload(self.draft_id.as_ref(), bytemuck::bytes_of(&(token as i32)))
             .map_err(|e| anyhow!("{e}"))?;
         be.upload(self.draft_h.as_ref(), bytemuck::cast_slice(h))
@@ -2224,8 +2586,27 @@ impl Qwen4MtpSession {
             be.upload(buffer.as_ref(), bytemuck::bytes_of(&position))
                 .map_err(|e| anyhow!("{e}"))?;
         }
-        let specs = [(shared.0 .1, shared.0 .2), (shared.1 .1, shared.1 .2)];
-        let (graph, handles) = build_draft_graph(
+        let output_rows = draft_vocab.map_or(self.cfg.vocab, draft_vocab::DraftVocab::rows);
+        let id_map = if let Some(vocab) = draft_vocab {
+            vocab.id_map.as_ref()
+        } else {
+            self.fixed
+                .draft_identity_map
+                .as_deref()
+                .ok_or_else(|| anyhow!("MTP draft requires a Vulkan safety identity map"))?
+        };
+        let specs = [
+            (shared.0 .1, shared.0 .2),
+            draft_vocab.map_or((shared.1 .1, shared.1 .2), |vocab| {
+                (vocab.dtype, vocab.numel)
+            }),
+        ];
+        let build_graph = if tail_kv_only {
+            build_draft_graph_vocab_impl::<true>
+        } else {
+            build_draft_graph_vocab_impl::<false>
+        };
+        let (graph, handles) = build_graph(
             &self.cfg,
             &self.fixed.specs,
             specs,
@@ -2234,8 +2615,18 @@ impl Qwen4MtpSession {
             start_pos,
             verify_tokens,
             self.fixed.fuse_down_inject,
+            Some(output_rows),
         );
         let plan = be.compile(&graph).map_err(|e| anyhow!("{e}"))?;
+        {
+            let Qwen4MtpKvCache {
+                k,
+                v,
+                draft_journal,
+                ..
+            } = &mut *kv;
+            draft_journal.begin(be, k.as_ref(), v.as_ref(), start_pos, verify_tokens)?;
+        }
         let mut bindings = Bindings::new();
         bindings.bind(handles.id, self.draft_id.as_ref());
         bindings.bind(handles.h, self.draft_h.as_ref());
@@ -2244,7 +2635,7 @@ impl Qwen4MtpSession {
         for (id, buffer) in handles.positions.into_iter().zip(&self.draft_positions) {
             bindings.bind(id, buffer.as_ref());
         }
-        for (id, buffer) in handles.ids.into_iter().zip(&self.draft_ids) {
+        for (id, buffer) in handles.raw_ids.into_iter().zip(&self.draft_ids) {
             bindings.bind(id, buffer.as_ref());
         }
         self.bind_common(
@@ -2253,16 +2644,43 @@ impl Qwen4MtpSession {
             handles.embd,
             handles.lm_head,
             shared.0 .0,
-            shared.1 .0,
+            draft_vocab.map_or(shared.1 .0, |vocab| vocab.weights.as_ref()),
         );
-        be.execute(plan.as_ref(), &bindings)
-            .map_err(|e| anyhow!("{e}"))?;
-        let mut result = vec![0u32; verify_tokens - 1];
-        for (dst, buffer) in result.iter_mut().zip(&self.draft_ids) {
-            be.download(buffer.as_ref(), bytemuck::bytes_of_mut(dst))
-                .map_err(|e| anyhow!("{e}"))?;
+        if let Some(id) = handles.vocab_map {
+            bindings.bind(id, id_map);
         }
-        Ok(result)
+        let result = (|| -> Result<Vec<u32>> {
+            be.execute(plan.as_ref(), &bindings)
+                .map_err(|e| anyhow!("{e}"))?;
+            let mut result = vec![0u32; verify_tokens - 1];
+            for (dst, buffer) in result.iter_mut().zip(&self.draft_ids) {
+                be.download(buffer.as_ref(), bytemuck::bytes_of_mut(dst))
+                    .map_err(|e| anyhow!("{e}"))?;
+            }
+            draft_vocab::validate_raw_ids(&result, output_rows)?;
+            if let Some(vocab) = draft_vocab {
+                for id in &mut result {
+                    *id = vocab.original_id(*id);
+                }
+            }
+            Ok(result)
+        })();
+        drop(bindings);
+        if let Err(error) = result {
+            let Qwen4MtpKvCache {
+                k,
+                v,
+                draft_journal,
+                ..
+            } = &mut *kv;
+            return match draft_journal.settle(be, k.as_ref(), v.as_ref(), 0) {
+                Ok(()) => Err(error),
+                Err(restore) => {
+                    Err(error.context(format!("MTP draft abort also failed: {restore:#}")))
+                }
+            };
+        }
+        result
     }
 }
 
@@ -2284,7 +2702,13 @@ impl Qwen4MtpRuntime {
         max_ctx: usize,
     ) -> Result<Self> {
         let catch_batch = crate::seam::ubatch_rows(model.engine_cfg());
-        let fixed = Qwen4MtpSession::load_fixed_vulkan(vk, sidecar_path, model.config())?;
+        let fixed = Qwen4MtpSession::load_fixed_vulkan_with_vocab(
+            vk,
+            sidecar_path,
+            model.config(),
+            model.gguf(),
+            model.engine_cfg().spec.mtp_vocab.as_deref(),
+        )?;
         let head = Qwen4MtpSession::with_fixed(
             vk,
             fixed,
@@ -2307,6 +2731,28 @@ impl Qwen4MtpRuntime {
 
     #[cfg_attr(infr_profile, infr_prof::instrument)]
     pub(crate) fn generate_vulkan(
+        &mut self,
+        vk: &infr_vulkan::VulkanBackend,
+        model: &crate::SeamModel,
+        prompt: &str,
+        max_new: usize,
+        req: Option<&crate::sampling::RequestCtx>,
+        on_piece: impl FnMut(&str),
+    ) -> Result<(crate::GenStats, super::MtpTiming)> {
+        self.head.settle_draft(vk, 0)?;
+        let result = self.generate_vulkan_inner(vk, model, prompt, max_new, req, on_piece);
+        if let Err(error) = result {
+            return match self.head.settle_draft(vk, 0) {
+                Ok(()) => Err(error),
+                Err(restore) => {
+                    Err(error.context(format!("MTP generation abort also failed: {restore:#}")))
+                }
+            };
+        }
+        result
+    }
+
+    fn generate_vulkan_inner(
         &mut self,
         vk: &infr_vulkan::VulkanBackend,
         model: &crate::SeamModel,
@@ -2416,7 +2862,7 @@ impl Qwen4MtpRuntime {
                     .as_ref()
                     .expect("target trunk remains initialized")
                     .mtp_shared_weights();
-                self.head.draft(
+                self.head.draft_with_tail_mode(
                     vk,
                     pending_token,
                     &pending_h,
@@ -2425,6 +2871,7 @@ impl Qwen4MtpRuntime {
                         .map_err(|_| anyhow!("Qwen3.8 MTP position exceeds i32"))?,
                     verify_tokens,
                     shared,
+                    ec.spec.mtp_tail_kv_only,
                 )?
             };
             let draft_secs = t_draft.elapsed().as_secs_f64();
@@ -2503,21 +2950,28 @@ impl Qwen4MtpRuntime {
                 .count();
             let accepted = accepted_spec + 1;
             timing.total_accepted += accepted_spec;
+            // Retain only the deliverable prefix; EOS itself occupies one committed row.
+            let retained = retained_draft_rows(
+                &feed[n_past..n_past + accepted],
+                max_new - generated,
+                &hit_eos,
+            );
 
             let t_catchup = std::time::Instant::now();
-            if accepted < verify_tokens {
+            if retained < verify_tokens {
                 let trunk = self
                     .trunk
                     .as_mut()
                     .expect("target trunk remains initialized");
                 let restore_profile = PhaseProfile::new("restore");
-                trunk.mtp_restore_delta_row(vk, accepted)?;
+                trunk.mtp_restore_delta_row(vk, retained)?;
                 drop(restore_profile);
             }
-            let new_tokens = &feed[n_past..n_past + accepted];
+            let new_tokens = &feed[n_past..n_past + retained];
+            self.head.settle_draft(vk, retained)?;
             committed.extend_from_slice(new_tokens);
-            pending_token = verify_ids[accepted - 1];
-            pending_h.copy_from_slice(&verify_h[(accepted - 1) * h_width..accepted * h_width]);
+            pending_token = verify_ids[retained - 1];
+            pending_h.copy_from_slice(&verify_h[(retained - 1) * h_width..retained * h_width]);
             let snapshot_profile = PhaseProfile::new("snapshot");
             self.trunk
                 .as_mut()
@@ -2530,7 +2984,7 @@ impl Qwen4MtpRuntime {
 
             if ec.prof.stages || infr_core::pager_profile::active() {
                 tracing::info!(
-                    "[qwen4 mtp cycle {cycle}] drafted={} accepted={accepted_spec} committed={accepted} draft={:.1}ms verify={:.1}ms catchup={:.1}ms",
+                    "[qwen4 mtp cycle {cycle}] drafted={} accepted={accepted_spec} committed={retained} draft={:.1}ms verify={:.1}ms catchup={:.1}ms",
                     verify_tokens - 1,
                     draft_secs * 1e3,
                     verify_secs * 1e3,
@@ -2581,6 +3035,14 @@ impl Qwen4MtpRuntime {
         ))
     }
 }
+
+#[cfg(test)]
+#[path = "qwen4_draft_kv_tests.rs"]
+mod draft_kv_tests;
+
+#[cfg(test)]
+#[path = "qwen4_draft_gpu_tests.rs"]
+mod draft_gpu_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2986,5 +3448,4 @@ mod m01_local_tests {
             assert_eq!(new.run(true), 0);
         }
     }
-
 }

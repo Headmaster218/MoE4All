@@ -1457,7 +1457,7 @@ fn allocate_pending_seam_slot(
         });
     }
 
-    let ple_state_buf = if cfg.qwen4exp {
+    let ple_state_buf = if (0..cfg.n_layer).any(|l| cfg.is_ple_layer(l)) {
         let hist = (cfg.ple_conv_kernel - 1) * cfg.ple_ngram_size;
         Some(
             be.alloc(hist * cfg.hc_mult * cfg.n_embd * 4, BufferUsage::KvCache)
@@ -1480,7 +1480,7 @@ fn allocate_pending_seam_slot(
             )?;
         }
     }
-    let mtp_delta_ckpt = if ec.spec.mtp && cfg.qwen4exp {
+    let mtp_delta_ckpt = if super::target_verify_enabled(cfg, ec) {
         MtpDeltaCkpt::allocate_before_dynamic_kv(
             be,
             cfg,
@@ -1488,11 +1488,12 @@ fn allocate_pending_seam_slot(
             &vbufs,
             ple_state_buf.as_deref(),
             crate::mtp::DRAFT_TOKENS.saturating_sub(1),
+            ec.spec.mtp,
         )?
     } else {
         None
     };
-    let mtp_verify_bufs = (ec.spec.mtp && cfg.qwen4exp)
+    let mtp_verify_bufs = super::target_verify_enabled(cfg, ec)
         .then(|| QwenMtpVerifyBuffers::allocate(be, cfg))
         .transpose()?;
 
@@ -1514,7 +1515,7 @@ fn allocate_pending_seam_slot(
     let logits_buf = be
         .alloc(cfg.vocab * 4, BufferUsage::Readback)
         .map_err(|e| anyhow!("{e}"))?;
-    let ple_embd_buf = if cfg.qwen4exp {
+    let ple_embd_buf = if (0..cfg.n_layer).any(|l| cfg.is_ple_layer(l)) {
         let heads = (cfg.ple_ngram_size - 1) * cfg.ple_heads_per_ngram;
         Some(
             be.alloc(heads * cfg.ple_head_dim * 4, BufferUsage::Staging)
@@ -1728,6 +1729,8 @@ struct ParallelMtpVerifyRequest<'a> {
     ids: &'a mut Vec<Vec<u32>>,
     logits: &'a mut Vec<Vec<f32>>,
     hidden: &'a mut Vec<Vec<f32>>,
+    rows_per_lane: usize,
+    want_hidden: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2057,6 +2060,117 @@ pub(crate) fn generate_dense_backend_parallel_prefill(
     Ok(stats)
 }
 
+fn take_verify_hidden_rows(hidden: &mut Vec<f32>, rows: std::ops::Range<usize>) -> Vec<f32> {
+    if rows.start == 0 && rows.end == hidden.len() {
+        std::mem::take(hidden)
+    } else {
+        hidden[rows].to_vec()
+    }
+}
+
+fn parallel_verify_rows(lengths: impl IntoIterator<Item = usize>) -> AResult<usize> {
+    let mut lengths = lengths.into_iter();
+    let rows = lengths
+        .next()
+        .ok_or_else(|| anyhow!("target Verify needs at least one lane"))?;
+    anyhow::ensure!(
+        (2..=crate::mtp::DRAFT_TOKENS).contains(&rows),
+        "target Verify suffix width {rows} must be 2..=4"
+    );
+    anyhow::ensure!(
+        lengths.all(|length| length == rows),
+        "target Verify needs uniform suffix widths across lanes"
+    );
+    Ok(rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn validate_parallel_target_verify(
+    be: &dyn Backend,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    feeds: &[Vec<u32>],
+    mrope_plans: &[Option<&crate::seam::MropePlan>],
+    primary: &Option<SeamKv>,
+    peers: &[SeamKv],
+) -> AResult<usize> {
+    anyhow::ensure!(
+        super::target_verify_enabled(cfg, ec),
+        "target Verify is unsupported or its exact recurrent trace settings are disabled"
+    );
+    anyhow::ensure!(
+        be.name() == "vulkan"
+            && be.capabilities().embed_gather
+            && g.tensors()
+                .iter()
+                .find(|t| t.name == "token_embd.weight")
+                .is_some_and(|t| infr_vulkan::linear::embed_gather_supported(t.dtype)),
+        "target Verify requires supported GPU token embeddings"
+    );
+    anyhow::ensure!(
+        !feeds.is_empty()
+            && feeds.len() == mrope_plans.len()
+            && feeds.len() == peers.len() + 1
+            && primary.is_some(),
+        "target Verify needs one initialized target per feed"
+    );
+    anyhow::ensure!(
+        feeds.len() == 1 || cfg.supports_parallel_token_rows(),
+        "parallel target Verify lanes need validated independent-row bindings"
+    );
+    anyhow::ensure!(
+        !mrope_plans.iter().any(Option::is_some) || cfg.qwen35 || cfg.qwen4exp,
+        "multimodal target Verify needs the Qwen position participant"
+    );
+    anyhow::ensure!(
+        !mrope_plans.iter().any(Option::is_some) || mrope_plans[0].is_some(),
+        "multimodal target Verify must place a multimodal lane first"
+    );
+    let primary = primary.as_ref().expect("checked warm primary");
+    let mut lengths = Vec::with_capacity(feeds.len());
+    for (lane, (feed, slot)) in feeds
+        .iter()
+        .zip(std::iter::once(primary).chain(peers))
+        .enumerate()
+    {
+        let start = slot.cached_len();
+        let rows = feed
+            .len()
+            .checked_sub(start)
+            .ok_or_else(|| anyhow!("target Verify lane {lane} does not extend its target"))?;
+        anyhow::ensure!(
+            feed.len() <= slot.max_ctx()
+                && feed.len() <= u32::MAX as usize
+                && feed[..start] == slot.cached[..],
+            "target Verify lane {lane} must extend its exact committed prefix within capacity"
+        );
+        validate_token_ids(feed, cfg.vocab)?;
+        lengths.push(rows);
+    }
+    let rows = parallel_verify_rows(lengths)?;
+    for slot in std::iter::once(primary).chain(peers) {
+        slot.mtp_validate_delta_trace(rows)?;
+    }
+    let batch = rows
+        .checked_mul(feeds.len())
+        .filter(|&batch| batch <= u32::MAX as usize)
+        .ok_or_else(|| anyhow!("target Verify batch size overflows"))?;
+    let fixed = primary
+        .mtp_verify_bufs
+        .as_ref()
+        .ok_or_else(|| anyhow!("target Verify has no preallocated fixed buffers"))?;
+    anyhow::ensure!(
+        fixed.ids.len_bytes() / 4 >= batch
+            && fixed.positions.len_bytes() / 4 >= batch
+            && fixed.positions4.len_bytes() / 16 >= batch
+            && fixed.logits.len_bytes() / 4 / cfg.vocab.max(1) >= batch
+            && fixed.h_out.len_bytes() / 4 / super::target_verify_hidden_width(cfg).max(1) >= batch,
+        "target Verify fixed buffers cannot hold {batch} rows"
+    );
+    Ok(rows)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_dense_backend_parallel_mtp_verify(
     be: &dyn Backend,
@@ -2073,14 +2187,10 @@ pub(crate) fn generate_dense_backend_parallel_mtp_verify(
     ids: &mut Vec<Vec<u32>>,
     logits: &mut Vec<Vec<f32>>,
     hidden: &mut Vec<Vec<f32>>,
+    want_hidden: bool,
 ) -> AResult<()> {
-    anyhow::ensure!(
-        !feeds.is_empty()
-            && feeds.len() == mrope_plans.len()
-            && feeds.len() == peers.len() + 1
-            && primary.is_some(),
-        "parallel MTP VERIFY needs one initialized target per feed"
-    );
+    let rows_per_lane =
+        validate_parallel_target_verify(be, g, cfg, ec, feeds, mrope_plans, primary, peers)?;
     let prepared = std::iter::once(primary.as_ref().unwrap().cached_len())
         .chain(peers.iter().map(SeamKv::cached_len))
         .map(|start| PreparedParallelPrompt {
@@ -2096,6 +2206,8 @@ pub(crate) fn generate_dense_backend_parallel_mtp_verify(
         ids,
         logits,
         hidden,
+        rows_per_lane,
+        want_hidden,
     };
     generate_dense_backend_inner(
         be,
@@ -3181,7 +3293,7 @@ fn generate_dense_backend_inner(
 
         // Fixed recurrent state is a real owner, unlike the Expert filler. Place Qwen3.8's PLE
         // history and both conversation checkpoints before the deferred Vulkan arena too.
-        let ple_state_buf = if c.qwen4exp {
+        let ple_state_buf = if (0..c.n_layer).any(|l| c.is_ple_layer(l)) {
             let hist = (c.ple_conv_kernel - 1) * c.ple_ngram_size;
             let b = be
                 .alloc(hist * c.hc_mult * ne * 4, BufferUsage::KvCache)
@@ -3206,7 +3318,7 @@ fn generate_dense_backend_inner(
                 )?;
             }
         }
-        let mtp_delta_ckpt = if ec.spec.mtp && c.qwen4exp {
+        let mtp_delta_ckpt = if super::target_verify_enabled(c, ec) {
             MtpDeltaCkpt::allocate_before_dynamic_kv(
                 be,
                 c,
@@ -3214,6 +3326,7 @@ fn generate_dense_backend_inner(
                 &vbufs,
                 ple_state_buf.as_deref(),
                 crate::mtp::DRAFT_TOKENS.saturating_sub(1),
+                ec.spec.mtp,
             )?
         } else {
             None
@@ -3285,7 +3398,7 @@ fn generate_dense_backend_inner(
         let logits_buf = be
             .alloc(c.vocab * 4, BufferUsage::Readback)
             .map_err(|e| anyhow!("{e}"))?;
-        let ple_embd_buf = if c.qwen4exp {
+        let ple_embd_buf = if (0..c.n_layer).any(|l| c.is_ple_layer(l)) {
             let heads = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram;
             Some(
                 be.alloc(heads * c.ple_head_dim * 4, BufferUsage::Staging)
@@ -3294,7 +3407,7 @@ fn generate_dense_backend_inner(
         } else {
             None
         };
-        let mtp_verify_bufs = (ec.spec.mtp && c.qwen4exp)
+        let mtp_verify_bufs = super::target_verify_enabled(c, ec)
             .then(|| {
                 QwenMtpVerifyBuffers::allocate_rows(
                     be,
@@ -3467,11 +3580,11 @@ fn generate_dense_backend_inner(
         Some(parallel.prepared.to_vec())
     } else if let Some(parallel) = parallel_mtp_verify.as_deref() {
         anyhow::ensure!(
-            c.qwen4exp
+            super::target_verify_supported(c)
                 && parallel.feeds.len() == parallel.peers.len() + 1
                 && parallel.mrope_plans.len() == parallel.feeds.len()
                 && parallel.feeds.first().map(Vec::as_slice) == Some(prompt),
-            "invalid parallel Qwen3.8 MTP VERIFY layout"
+            "invalid parallel target Verify layout"
         );
         for (lane, (feed, slot)) in parallel
             .feeds
@@ -3482,10 +3595,10 @@ fn generate_dense_backend_inner(
             let start = parallel.prepared[lane].start;
             anyhow::ensure!(
                 start == slot.cached_len()
-                    && feed.len() == start + crate::mtp::DRAFT_TOKENS
+                    && feed.len() == start + parallel.rows_per_lane
                     && feed[..start] == slot.cached[..]
                     && feed.len() <= slot.max_ctx(),
-                "parallel MTP lane {lane} does not extend its committed target state by four rows"
+                "parallel Verify lane {lane} does not extend its committed target state"
             );
             validate_token_ids(feed, c.vocab)?;
         }
@@ -4018,7 +4131,9 @@ fn generate_dense_backend_inner(
             ));
         }
     }
-    let parallel_mtp_trace = parallel_mtp_verify.is_some();
+    let parallel_mtp_rows = parallel_mtp_verify
+        .as_ref()
+        .map(|request| request.rows_per_lane);
     let build = |batch: usize,
                  start_pos: usize,
                  logits_rows: usize,
@@ -4214,9 +4329,7 @@ fn generate_dense_backend_inner(
             g.input(f32d(hist * c.hc_mult * ne))
         });
         let trace_recurrent = mtp_verify
-            && mtp_trace.is_some_and(|(rows, _)| {
-                rows == batch || (parallel_mtp_trace && rows == crate::mtp::DRAFT_TOKENS)
-            });
+            && mtp_trace.is_some_and(|(rows, _)| rows == batch || parallel_mtp_rows == Some(rows));
         let mtp_trace_rows = mtp_trace.map_or(0, |(_, trace_rows)| trace_rows);
         let mtp_ple_trace = (trace_recurrent && span_has_ple).then(|| {
             let hist = (c.ple_conv_kernel - 1) * c.ple_ngram_size;
@@ -9138,11 +9251,11 @@ fn generate_dense_backend_inner(
             has_multimodal_lane == mm.is_some(),
             "a multimodal parallel MTP cohort must place a multimodal lane first"
         );
-        let rows_per_lane = crate::mtp::DRAFT_TOKENS;
+        let rows_per_lane = parallel.rows_per_lane;
         let batch = lanes * rows_per_lane;
         anyhow::ensure!(
             mtp_trace == Some((rows_per_lane, rows_per_lane - 1)),
-            "primary MTP recurrent trace was not armed for four rows"
+            "primary target Verify recurrent trace was not armed for {rows_per_lane} rows"
         );
         for (lane, peer) in parallel.peers.iter_mut().enumerate() {
             anyhow::ensure!(
@@ -9157,11 +9270,12 @@ fn generate_dense_backend_inner(
         anyhow::ensure!(
             fixed.ids.len_bytes() >= batch * 4
                 && fixed.positions4.len_bytes() >= batch * 4 * 4
-                && fixed.h_out.len_bytes() >= batch * c.hc_mult * ne * 4,
+                && fixed.h_out.len_bytes() >= batch * super::target_verify_hidden_width(c) * 4,
             "parallel MTP VERIFY primary slot lacks {batch}-row fixed buffers"
         );
-        let h_width = c.hc_mult * ne;
-        let ple_row = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram * c.ple_head_dim;
+        let h_width = super::target_verify_hidden_width(c);
+        let ple_row = super::target_verify_ple_row(c);
+        let has_ple = ple_row > 0;
         let mut ids = Vec::with_capacity(batch);
         let mut positions = Vec::with_capacity(batch);
         let mut positions4 = Vec::with_capacity(batch * 4);
@@ -9182,9 +9296,15 @@ fn generate_dense_backend_inner(
         } else {
             None
         };
-        let worker = ple_worker
-            .as_ref()
-            .ok_or_else(|| anyhow!("parallel MTP VERIFY has no PLE worker"))?;
+        let worker = if has_ple {
+            Some(
+                ple_worker
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("parallel target Verify has no PLE worker"))?,
+            )
+        } else {
+            None
+        };
         for lane in 0..lanes {
             let start_pos = parallel.prepared[lane].start;
             let end = start_pos + rows_per_lane;
@@ -9208,12 +9328,14 @@ fn generate_dense_backend_inner(
                 rows: rows_per_lane as u32,
                 start_pos: start_pos as u32,
             });
-            tickets.push(worker.submit_range(
-                &parallel.feeds[lane],
-                start_pos,
-                rows_per_lane,
-                c.ple_ngram_size,
-            )?);
+            if let Some(worker) = worker {
+                tickets.push(worker.submit_range(
+                    &parallel.feeds[lane],
+                    start_pos,
+                    rows_per_lane,
+                    c.ple_ngram_size,
+                )?);
+            }
         }
         be.upload(fixed.ids.as_ref(), bytemuck::cast_slice(&ids))
             .map_err(|e| anyhow!("{e}"))?;
@@ -9225,68 +9347,70 @@ fn generate_dense_backend_inner(
         }
         let independent = lanes > 1;
         let spans = independent.then_some(spans.as_slice());
-        let (g0, h0) = build(
-            batch,
-            parallel.prepared[0].start,
-            0,
-            false,
-            None,
-            false,
-            false,
-            false,
-            false,
-            true,
-            true,
-            independent,
-            spans,
-            Some(0..1),
-        );
-        let plan0 = be.compile(&g0).map_err(|e| anyhow!("{e}"))?;
-        let mut bindings0 = Bindings::new();
-        bindings0.bind(h0.tok_ids.expect("MTP GPU embedding"), fixed.ids.as_ref());
-        bindings0.bind(h0.hidden, fixed.hidden.as_ref());
-        bindings0.bind(h0.positions, fixed.positions.as_ref());
-        if let Some(id) = h0.positions4 {
-            bindings0.bind(id, fixed.positions4.as_ref());
-        }
-        bind_parallel_layer_io(
-            &mut bindings0,
-            &h0,
-            c.n_layer,
-            rf_buf,
-            yff_buf,
-            &kbufs[..],
-            &vbufs[..],
-            &qsa_kbufs[..],
-            &qsa_cbufs[..],
-            &mrope_history_buf,
-            peer_mrope_history_bufs.as_deref(),
-            &wbufs[..],
-            qwen_wide_buf,
-            ple_embd_buf,
-            ple_state_buf,
-            Some(fixed.wide.as_ref()),
-            None,
-            &*parallel.peers,
-            None,
-            independent,
-        );
-        bind_parallel_mtp_traces(&mut bindings0, &h0, mtp_delta_ckpt, parallel.peers);
-        be.execute(plan0.as_ref(), &bindings0)
-            .map_err(|e| anyhow!("{e}"))?;
+        if has_ple {
+            let (g0, h0) = build(
+                batch,
+                parallel.prepared[0].start,
+                0,
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+                true,
+                true,
+                independent,
+                spans,
+                Some(0..1),
+            );
+            let plan0 = be.compile(&g0).map_err(|e| anyhow!("{e}"))?;
+            let mut bindings0 = Bindings::new();
+            bindings0.bind(h0.tok_ids.expect("MTP GPU embedding"), fixed.ids.as_ref());
+            bindings0.bind(h0.hidden, fixed.hidden.as_ref());
+            bindings0.bind(h0.positions, fixed.positions.as_ref());
+            if let Some(id) = h0.positions4 {
+                bindings0.bind(id, fixed.positions4.as_ref());
+            }
+            bind_parallel_layer_io(
+                &mut bindings0,
+                &h0,
+                c.n_layer,
+                rf_buf,
+                yff_buf,
+                &kbufs[..],
+                &vbufs[..],
+                &qsa_kbufs[..],
+                &qsa_cbufs[..],
+                &mrope_history_buf,
+                peer_mrope_history_bufs.as_deref(),
+                &wbufs[..],
+                qwen_wide_buf,
+                ple_embd_buf,
+                ple_state_buf,
+                Some(fixed.wide.as_ref()),
+                None,
+                &*parallel.peers,
+                None,
+                independent,
+            );
+            bind_parallel_mtp_traces(&mut bindings0, &h0, mtp_delta_ckpt, parallel.peers);
+            be.execute(plan0.as_ref(), &bindings0)
+                .map_err(|e| anyhow!("{e}"))?;
 
-        let mut ple_rows = Vec::with_capacity(batch * ple_row);
-        for ticket in tickets {
-            let rows = ticket.wait()?;
-            ple_rows.extend_from_slice(rows.as_slice());
+            let mut ple_rows = Vec::with_capacity(batch * ple_row);
+            for ticket in tickets {
+                let rows = ticket.wait()?;
+                ple_rows.extend_from_slice(rows.as_slice());
+            }
+            anyhow::ensure!(
+                ple_rows.len() == batch * ple_row,
+                "parallel MTP PLE produced {} rows, expected {batch}",
+                ple_rows.len() / ple_row
+            );
+            be.upload(fixed.ple.as_ref(), bytemuck::cast_slice(&ple_rows))
+                .map_err(|e| anyhow!("{e}"))?;
         }
-        anyhow::ensure!(
-            ple_rows.len() == batch * ple_row,
-            "parallel MTP PLE produced {} rows, expected {batch}",
-            ple_rows.len() / ple_row
-        );
-        be.upload(fixed.ple.as_ref(), bytemuck::cast_slice(&ple_rows))
-            .map_err(|e| anyhow!("{e}"))?;
         let gpu_ids = caps.argmax_rows && ec.spec.gpu_argmax && ec.spec.gpu_mtp_accept;
         let (g1, h1) = build(
             batch,
@@ -9295,17 +9419,20 @@ fn generate_dense_backend_inner(
             false,
             None,
             false,
-            true,
+            parallel.want_hidden,
             gpu_ids,
             false,
-            false,
+            !has_ple,
             true,
             independent,
             spans,
-            Some(1..c.n_layer),
+            if has_ple { Some(1..c.n_layer) } else { None },
         );
         let plan1 = be.compile(&g1).map_err(|e| anyhow!("{e}"))?;
         let mut bindings1 = Bindings::new();
+        if let Some(id) = h1.tok_ids {
+            bindings1.bind(id, fixed.ids.as_ref());
+        }
         bindings1.bind(h1.hidden, fixed.hidden.as_ref());
         bindings1.bind(h1.positions, fixed.positions.as_ref());
         if let Some(id) = h1.positions4 {
@@ -9328,14 +9455,16 @@ fn generate_dense_backend_inner(
             ple_embd_buf,
             ple_state_buf,
             Some(fixed.wide.as_ref()),
-            Some(fixed.ple.as_ref()),
+            has_ple.then_some(fixed.ple.as_ref()),
             &*parallel.peers,
             None,
             independent,
         );
         bind_parallel_mtp_traces(&mut bindings1, &h1, mtp_delta_ckpt, parallel.peers);
         bindings1.bind(h1.logits.expect("MTP VERIFY logits"), fixed.logits.as_ref());
-        bindings1.bind(h1.h_out.expect("MTP VERIFY hidden"), fixed.h_out.as_ref());
+        if let Some(id) = h1.h_out {
+            bindings1.bind(id, fixed.h_out.as_ref());
+        }
         if let Some(id) = h1.tok_id {
             bindings1.bind(id, fixed.out_ids.as_ref());
         }
@@ -9385,12 +9514,15 @@ fn generate_dense_backend_inner(
                 &format!("parallel MTP verify logits row {row}"),
             )?;
         }
-        let mut all_hidden = vec![0.0f32; batch * h_width];
-        be.download(
-            fixed.h_out.as_ref(),
-            bytemuck::cast_slice_mut(&mut all_hidden),
-        )
-        .map_err(|e| anyhow!("{e}"))?;
+        let mut all_hidden = Vec::new();
+        if parallel.want_hidden {
+            all_hidden.resize(batch * h_width, 0.0f32);
+            be.download(
+                fixed.h_out.as_ref(),
+                bytemuck::cast_slice_mut(&mut all_hidden),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+        }
         parallel.ids.clear();
         parallel.logits.clear();
         parallel.hidden.clear();
@@ -9404,9 +9536,14 @@ fn generate_dense_backend_inner(
             } else {
                 all_logits[row * c.vocab..(row + rows_per_lane) * c.vocab].to_vec()
             });
-            parallel
-                .hidden
-                .push(all_hidden[row * h_width..(row + rows_per_lane) * h_width].to_vec());
+            parallel.hidden.push(if parallel.want_hidden {
+                take_verify_hidden_rows(
+                    &mut all_hidden,
+                    row * h_width..(row + rows_per_lane) * h_width,
+                )
+            } else {
+                Vec::new()
+            });
         }
         cached.extend_from_slice(&parallel.feeds[0][parallel.prepared[0].start..]);
         for (lane, peer) in parallel.peers.iter_mut().enumerate() {
@@ -9669,19 +9806,6 @@ fn generate_dense_backend_inner(
             }
 
             let vf_t0 = std::time::Instant::now();
-            let ple_rows = ticket.wait()?;
-            if ple_rows.len() != m * ple_row {
-                return Err(anyhow!(
-                    "qwen4exp verify PLE produced {} values, expected {}",
-                    ple_rows.len(),
-                    m * ple_row
-                ));
-            }
-            be.upload(ple_buf, bytemuck::cast_slice(ple_rows.as_slice()))
-                .map_err(|e| anyhow!("{e}"))?;
-
-            let vf_ple = vf_t0.elapsed();
-            let vf_t0 = std::time::Instant::now();
             // With overlap enabled, layer 0 has already initialized hidden/wide state while the
             // PLE worker gathered these rows. The tail starts at the first PLE-bearing layer.
             let (vg, vh) = build(
@@ -9744,6 +9868,22 @@ fn generate_dense_backend_inner(
                 vb.bind(id, buf);
             }
             vf_build += vf_t0.elapsed();
+            // Graph preparation and binding do not read PLE contents. Let the worker finish
+            // during that CPU work, then validate and upload before the first tail execution.
+            let vf_t0 = std::time::Instant::now();
+            let ple_rows = ticket.wait()?;
+            if ple_rows.len() != m * ple_row {
+                return Err(anyhow!(
+                    "qwen4exp verify PLE produced {} values, expected {}",
+                    ple_rows.len(),
+                    m * ple_row
+                ));
+            }
+            be.upload(ple_buf, bytemuck::cast_slice(ple_rows.as_slice()))
+                .map_err(|e| anyhow!("{e}"))?;
+
+            let vf_ple = vf_t0.elapsed();
+
             let vf_t0 = std::time::Instant::now();
             be.execute(vplan.as_ref(), &vb)
                 .map_err(|e| anyhow!("{e}"))?;
@@ -13201,6 +13341,82 @@ fn generate_dense_backend_inner(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn single_verify_hidden_rows_move_readback_without_changing_shape_or_bits() {
+        let bits = [0, 0x8000_0000, 0x3f80_0000, 0xbf80_0000, 1, 0x7fc0_1234];
+        for rows in 2..=4 {
+            for width in [7, 10_240] {
+                let len = rows * width;
+                let mut hidden = Vec::with_capacity(len + 7);
+                hidden.extend((0..len).map(|i| f32::from_bits(bits[i % bits.len()])));
+                let address = hidden.as_ptr();
+                let capacity = hidden.capacity();
+                let result = super::take_verify_hidden_rows(&mut hidden, 0..len);
+                assert_eq!(result.len(), len);
+                assert_eq!(result.as_ptr(), address);
+                assert_eq!(result.capacity(), capacity);
+                assert!(hidden.is_empty());
+                assert_eq!(hidden.capacity(), 0);
+                for (i, value) in result.iter().enumerate() {
+                    assert_eq!(value.to_bits(), bits[i % bits.len()]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multiple_verify_hidden_lanes_keep_original_readback_and_row_order() {
+        for lanes in 2..=4 {
+            for rows in 2..=4 {
+                for width in [7, 10_240] {
+                    let lane_len = rows * width;
+                    let len = lanes * lane_len;
+                    let mut hidden = (0..len).map(|i| i as f32 - 0.5).collect::<Vec<_>>();
+                    let address = hidden.as_ptr();
+                    let capacity = hidden.capacity();
+                    for lane in 0..lanes {
+                        let start = lane * lane_len;
+                        let result = super::take_verify_hidden_rows(
+                            &mut hidden,
+                            start..start + lane_len,
+                        );
+                        assert_eq!(result.len(), lane_len);
+                        assert_eq!(hidden.len(), len);
+                        assert_eq!(hidden.as_ptr(), address);
+                        assert_eq!(hidden.capacity(), capacity);
+                        assert_eq!(result, hidden[start..start + lane_len]);
+                        for (row, value) in result.iter().enumerate() {
+                            assert_eq!(value.to_bits(), ((start + row) as f32 - 0.5).to_bits());
+                        }
+                    }
+                }
+            }
+        }
+        assert!(super::take_verify_hidden_rows(&mut Vec::new(), 0..0).is_empty());
+    }
+
+    #[test]
+    fn target_verify_suffix_width_is_uniform_and_bounded() {
+        assert!(super::parallel_verify_rows([]).is_err());
+        for width in 0..=6 {
+            for lanes in 1..=4 {
+                let result = super::parallel_verify_rows(vec![width; lanes]);
+                assert_eq!(result.is_ok(), (2..=4).contains(&width));
+                if let Ok(actual) = result {
+                    assert_eq!(actual, width);
+                }
+            }
+        }
+        for first in 2..=4 {
+            for second in 0..=6 {
+                assert_eq!(
+                    super::parallel_verify_rows([first, second]).is_ok(),
+                    first == second
+                );
+            }
+        }
+    }
+
     #[test]
     fn resident_full_graph_follows_host_interlocks_and_journal_capacity() {
         let flashnext = crate::Config {

@@ -683,6 +683,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn abandoned_ple_ticket_recycles_queued_and_late_rows() {
+        for queued in [false, true] {
+            let pool = Arc::new(PleOutputPool::new());
+            let rows = PleRows::new(Arc::clone(&pool), 16);
+            assert_eq!(pool.buffers.lock().unwrap().len(), OUTPUT_POOL_DEPTH - 1);
+            let (tx, rx) = mpsc::sync_channel::<Result<PleRows>>(1);
+            if queued {
+                assert!(tx.send(Ok(rows)).is_ok());
+                drop(PleTicket(rx));
+            } else {
+                drop(PleTicket(rx));
+                assert!(tx.send(Ok(rows)).is_err());
+            }
+            assert_eq!(pool.buffers.lock().unwrap().len(), OUTPUT_POOL_DEPTH);
+        }
+    }
+
+    #[test]
     fn hash_is_wrapping_u64_and_head_partitioned() {
         let ctx = [u32::MAX as u64, 7, 3];
         let mul = [u64::MAX - 2, 11, 13];
