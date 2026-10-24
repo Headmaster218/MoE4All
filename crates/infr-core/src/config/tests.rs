@@ -283,6 +283,7 @@ fn speculative_paths_preserve_explicit_runtime_ab_controls() {
     assert!(!defaults.kernels.vulkan.decode_gpu_resident_copy_overlap);
     assert_eq!(defaults.kernels.vulkan.decode_gpu_resident_copy_groups, 0);
     assert!(defaults.kernels.vulkan.qsa_verify_split);
+    assert!(!defaults.kernels.vulkan.verify_shared_iq2_nr8);
     assert!(defaults.kernels.vulkan.verify_pair);
     assert!(defaults.spec.mtp_tail_kv_only);
     assert!(defaults.spec.mtp_vocab.is_none());
@@ -308,6 +309,32 @@ fn speculative_paths_preserve_explicit_runtime_ab_controls() {
         assert!(cfg.spec.lookup);
         assert_eq!(cfg.spec.lookup_max_draft, 2);
         assert_eq!(cfg.spec.lookup_min_match, 12);
+    }
+}
+
+#[test]
+fn shared_iq2_verify_nr8_preserves_explicit_reference_path() {
+    for enabled in [false, true] {
+        let setting = format!("kernels.vulkan.verify_shared_iq2_nr8={enabled}");
+        let toml = format!("[kernels.vulkan]\nverify_shared_iq2_nr8={enabled}\n");
+        for layer in [cli_layer(&[setting.as_str()]), file_layer(&toml)] {
+            let cfg = Config::load_from_layers(&[layer]);
+            assert_eq!(cfg.kernels.vulkan.verify_shared_iq2_nr8, enabled);
+        }
+    }
+}
+
+#[test]
+fn lookup_width_policy_can_be_compared_without_changing_target_verification() {
+    assert!(Config::default().spec.lookup_adaptive_width);
+    for enabled in [false, true] {
+        let setting = format!("spec.lookup_adaptive_width={enabled}");
+        let toml = format!("[spec]\nlookup_adaptive_width={enabled}\n");
+        for layer in [cli_layer(&[setting.as_str()]), file_layer(&toml)] {
+            let cfg = Config::load_from_layers(&[layer]);
+            assert_eq!(cfg.spec.lookup_adaptive_width, enabled);
+            assert!(!cfg.spec.lookup);
+        }
     }
 }
 

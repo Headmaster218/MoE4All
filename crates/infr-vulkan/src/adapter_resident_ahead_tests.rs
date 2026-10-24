@@ -1,4 +1,7 @@
 //! Small model-free resident command-ahead regressions; declared as a child of `adapter`.
+#[path = "adapter_single_verify_tests.rs"]
+mod single_verify_tests;
+
 use super::*;
 use crate::pager::{ExpertSource, MoeHostChunkSpec, MoePagerLayout, MoePoolSpec, Role};
 use infr_core::blockio::{BlockDesc, BlockExtent, BlockIo};
@@ -37,6 +40,7 @@ fn resident_ahead_snapshot_drop_preserves_live_miss_announcement() {
         results: Mutex::new(results),
         thread: None,
         announced_miss: Arc::clone(&announced),
+        pager: Arc::new(Mutex::new(None)),
     });
     let chunk = ResidentChunk {
         control: Arc::new(CpuBuffer(crate::recorder::RESIDENT_CONTROL_BYTES)),
@@ -57,6 +61,7 @@ fn resident_ahead_snapshot_drop_preserves_live_miss_announcement() {
         mapped_serial_max_bytes: 0,
         waiter: None,
         indirect: None,
+        gpu_copy: None,
     };
 
     for miss in [0, 1, usize::MAX] {
@@ -105,6 +110,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(submit_layers: usize, producer: bool) -> Self {
+        Self::new_with_copy_policy(submit_layers, producer, Some(false))
+    }
+
+    fn new_with_copy_policy(submit_layers: usize, producer: bool, copy: Option<bool>) -> Self {
         let mut cfg = infr_core::config::Config::default();
         cfg.device.submit_dispatches = Some(0);
         cfg.device.decode_command_ahead = true;
@@ -116,6 +125,7 @@ impl Fixture {
         cfg.kernels.vulkan.cpu_miss_threads = 0;
         cfg.kernels.vulkan.static_scratch_memo = true;
         cfg.kernels.vulkan.decode_gpu_resident = true;
+        cfg.kernels.vulkan.decode_gpu_resident_copy = copy;
         cfg.kernels.vulkan.decode_gpu_resident_layers = 3;
         cfg.kernels.vulkan.decode_gpu_resident_submit_layers = submit_layers;
         cfg.kernels.vulkan.decode_gpu_resident_inflight = 1;
@@ -544,5 +554,50 @@ fn gpu_resident_ahead_prepares_and_recovers_without_repeating_frontends() {
         }
         fixture.binding_invalidation(submit_layers, producer);
         fixture.unsupported_next();
+    }
+}
+
+#[test]
+#[ignore = "requires an idle Vulkan GPU; model-free auto-copy/prepared transition"]
+fn gpu_resident_copy_auto_lazy_init_after_multirow_and_verify() {
+    for verify in [false, true] {
+        let fixture = Fixture::new_with_copy_policy(1, true, None);
+        let mut losing = fixture.graph.clone();
+        losing.mtp_verify = verify;
+        losing.independent_rows = !verify;
+        if !verify {
+            losing.sequence_spans = (0..2).map(|row_start| SequenceSpan {
+                row_start, rows: 1, start_pos: row_start * 100,
+            }).collect();
+        }
+        let inputs: Vec<_> = losing.ops.iter().filter_map(|op| match op {
+            Op::MoeFfn { x, .. } => Some(*x),
+            _ => None,
+        }).collect();
+        for id in inputs {
+            losing.tensors[id.0 as usize].desc = TensorDesc::new(vec![2, NE], DType::F32);
+        }
+        // Constructor-only probe: no mismatched fixture tensors are dispatched.
+        let mut retained = None;
+        let chunk = ResidentChunk::new(&fixture.backend, &losing, true, &mut retained)
+            .unwrap().expect("multirow graph retains ordinary recovery");
+        assert!(chunk.gpu_copy.is_none());
+        drop(chunk);
+        assert!(!retained.as_ref().unwrap().gpu_copy_init_attempted);
+        fixture.backend.runtime_phase.lock().unwrap().resident_buffers = retained;
+
+        // The winning ordinary graph reuses common buffers, initializes copy, then prepares
+        // and consumes a real resident packet with a forced miss and numerical comparison.
+        fixture.run_case(1, true, Some(0));
+        let mut phase = fixture.backend.runtime_phase.lock().unwrap();
+        let copy = phase.resident_buffers.as_ref().unwrap().gpu_copy.clone()
+            .expect("ordinary graph must lazily allocate copy metadata");
+        let chunk = ResidentChunk::new(&fixture.backend, &losing, true, &mut phase.resident_buffers)
+            .unwrap().unwrap();
+        assert!(chunk.gpu_copy.is_none(), "warm copy cannot escape the graph policy");
+        drop(chunk);
+        assert!(Arc::ptr_eq(phase.resident_buffers.as_ref().unwrap().gpu_copy.as_ref().unwrap(), &copy));
+        drop(phase);
+        fixture.run_case(1, true, Some(1));
     }
 }

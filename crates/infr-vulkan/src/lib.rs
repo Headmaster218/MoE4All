@@ -5101,14 +5101,35 @@ impl VulkanBackend {
         offset: usize,
         len: usize,
     ) -> Result<ImportedHostShard> {
+        if self.cfg.kernels.vulkan.decode_gpu_resident_copy != Some(false) && self.shared.caps.buffer_device_address {
+            match self.try_import_host_shard_with_address(ext, Arc::clone(&owner), offset, len, true) {
+                Ok(shard) => return Ok(shard),
+                Err(error) => tracing::debug!(%error, "GPU-copy host alias unavailable; retaining ordinary DMA import"),
+            }
+        }
+        self.try_import_host_shard_with_address(ext, owner, offset, len, false)
+    }
+
+    fn try_import_host_shard_with_address(
+        &self,
+        ext: &ash::ext::external_memory_host::Device,
+        owner: Arc<AlignedHostBuffer>,
+        offset: usize,
+        len: usize,
+        device_address: bool,
+    ) -> Result<ImportedHostShard> {
         let device = &self.shared.device;
         let handle_type = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
         let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle_type);
         let queue_families = self.shared.dedicated_transfer_families();
+        let mut usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+        if device_address {
+            usage |= vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
+        }
         let mut info = vk::BufferCreateInfo::default()
             .push_next(&mut external)
             .size(len as u64)
-            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST);
+            .usage(usage);
         if let Some(families) = queue_families.as_ref() {
             info = info
                 .sharing_mode(vk::SharingMode::CONCURRENT)
@@ -5167,10 +5188,15 @@ impl VulkanBackend {
         let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
             .handle_type(handle_type)
             .host_pointer(host_ptr.cast());
-        let allocation = vk::MemoryAllocateInfo::default()
+        let mut address_flags = vk::MemoryAllocateFlagsInfo::default()
+            .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let mut allocation = vk::MemoryAllocateInfo::default()
             .push_next(&mut import)
             .allocation_size(requirements.size)
             .memory_type_index(memory_type_index);
+        if device_address {
+            allocation = allocation.push_next(&mut address_flags);
+        }
         let memory = unsafe { device.allocate_memory(&allocation, None) }.map_err(|e| {
             unsafe { device.destroy_buffer(buffer, None) };
             be(format!("import host shard {offset}..{}: {e}", offset + len,))
@@ -5182,6 +5208,9 @@ impl VulkanBackend {
             }
             return Err(be(format!("bind imported-host shard at {offset}: {e}")));
         }
+        let own_addr = device_address.then(|| unsafe {
+            device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
+        });
         let imported: Arc<dyn Buffer> = Arc::new(VkBuffer {
             shared: Arc::clone(&self.shared),
             buffer,
@@ -5194,7 +5223,7 @@ impl VulkanBackend {
             mem_size: requirements.size,
             location: MemoryLocation::CpuToGpu,
             sub_offset: 0,
-            own_addr: None,
+            own_addr,
             act_bytes: 0,
         });
         Ok(ImportedHostShard {

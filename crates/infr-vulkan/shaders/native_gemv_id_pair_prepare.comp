@@ -1,0 +1,80 @@
+#version 460
+
+// Experimental VERIFY-4 classifier, one workgroup per cohort (not per output tile).
+// Metadata: mates[64], active pair counts[3], valid, then 3 * {baseline, pair}
+// VkDispatchIndirectCommand triples. Bank 0 is full, 1 hits, 2 misses.
+layout(local_size_x = 32) in;
+layout(binding = 0, std430) readonly buffer IDB { uint ids[]; };
+layout(binding = 1, std430) writeonly buffer MB { uint meta[]; };
+layout(push_constant) uniform PC {
+    uint rows; uint used; uint experts; uint groups_x; uint groups_y; uint active_mask;
+} pc;
+
+const uint NONE = 0xffffffffu;
+const uint CAPACITY = 64u;
+const uint COUNTS = 64u;
+const uint VALID = 67u;
+const uint COMMANDS = 68u;
+const uint WORDS = 86u;
+shared uint mates[64];
+shared uint pairs[3];
+shared uint bad;
+
+uint mask_for(uint bank, uint row) {
+    return bank == 0u ? pc.active_mask : ids[pc.rows * pc.used + (bank - 1u) * pc.rows + row];
+}
+
+void main() {
+    if (any(notEqual(gl_WorkGroupID, uvec3(0))) || uint(meta.length()) < WORDS) { return; }
+    uint t = gl_LocalInvocationID.x;
+    for (uint a = t; a < CAPACITY; a += 32u) { mates[a] = NONE; }
+    if (t < 3u) { pairs[t] = 0u; }
+    if (t == 0u) { bad = 0u; }
+    barrier();
+    bool valid = pc.rows == 4u && pc.used > 0u && pc.used <= 16u
+        && pc.experts >= pc.used && pc.groups_x > 0u && pc.groups_x <= 65535u
+        && pc.groups_y > 0u && pc.groups_y <= 65535u;
+    valid = valid && uint(ids.length()) >= 4u * pc.used + 8u;
+    if (valid) {
+        for (uint a = t; a < pc.rows * pc.used; a += 32u) {
+            uint id = ids[a];
+            if (id >= pc.experts) { atomicOr(bad, 1u); continue; }
+            uint row = a / pc.used;
+            uint own_count = 0u, other_count = 0u, mate = NONE;
+            for (uint s = 0u; s < pc.used; s++) {
+                own_count += uint(ids[row * pc.used + s] == id);
+                uint b = (row ^ 1u) * pc.used + s;
+                if (ids[b] == id) { other_count++; mate = b; }
+            }
+            // Ambiguous duplicate routes stay singletons; never double-write an output.
+            if (own_count == 1u && other_count == 1u) { mates[a] = mate; }
+        }
+    }
+    barrier();
+    valid = valid && bad == 0u;
+    if (valid) {
+        for (uint a = t; a < pc.rows * pc.used; a += 32u) {
+            uint b = mates[a];
+            if (b == NONE || b <= a || mates[b] != a) { continue; }
+            for (uint bank = 0u; bank < 3u; bank++) {
+                bool first = (mask_for(bank, a / pc.used) & (1u << (a % pc.used))) != 0u;
+                bool second = (mask_for(bank, b / pc.used) & (1u << (b % pc.used))) != 0u;
+                if (first && second) { atomicAdd(pairs[bank], 1u); }
+            }
+        }
+    }
+    barrier();
+    for (uint a = t; a < CAPACITY; a += 32u) { meta[a] = valid ? mates[a] : NONE; }
+    if (t < 3u) {
+        meta[COUNTS + t] = valid ? pairs[t] : 0u;
+        uint base = COMMANDS + t * 6u;
+        bool paired = valid && pairs[t] != 0u;
+        meta[base] = valid && !paired ? pc.groups_x : 0u;
+        meta[base + 1u] = pc.groups_y;
+        meta[base + 2u] = 1u;
+        meta[base + 3u] = paired ? pc.groups_x : 0u;
+        meta[base + 4u] = pc.groups_y;
+        meta[base + 5u] = 1u;
+    }
+    if (t == 0u) { meta[VALID] = uint(valid); }
+}

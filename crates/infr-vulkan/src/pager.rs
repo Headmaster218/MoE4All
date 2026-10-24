@@ -1962,6 +1962,12 @@ pub struct MoePagerSession {
     prefill_allocations: Vec<Arc<UnifiedAllocationHandle>>,
 }
 
+#[path = "pager_gpu_copy.rs"]
+mod gpu_copy;
+pub(crate) use gpu_copy::GpuCopyBuffers;
+#[cfg(test)]
+pub(crate) use gpu_copy::completed_copies;
+
 struct ResidentLutCache {
     addresses: Vec<Vec<u64>>,
     frozen: Vec<Vec<u8>>,

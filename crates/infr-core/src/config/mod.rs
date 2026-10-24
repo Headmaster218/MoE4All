@@ -614,6 +614,10 @@ cfg_struct! {
         /// Use per-row causal split-K for small target Verify QSA cohorts. Larger Prefill
         /// batches retain the tiled kernel, and false keeps that path for same-binary A/B.
         qsa_verify_split: bool = true,
+        /// Opt into exact-shape causal Verify IQ2_S shared-slot fusion and staged NR8.
+        /// Default off pending real-engine E2E qualification against the nonfused graph.
+        /// Other shapes, independent rows, SG and buffer-grid paths remain unchanged.
+        verify_shared_iq2_nr8: bool = false,
         /// Reuse native expert weight decoding across adjacent causal Verify rows.
         /// Unqualified dtypes/shapes and insufficient row reuse keep the baseline kernel.
         verify_pair: bool = true,
@@ -793,6 +797,9 @@ cfg_struct! {
         lookup_max_draft: usize = 3,
         /// Minimum exact suffix match before proposing historical continuation tokens.
         lookup_min_match: usize = 8,
+        /// Narrow Lookup drafts using recent acceptance; false keeps the configured maximum.
+        /// Rejection cooldown and caller/context/output budgets apply to both policies.
+        lookup_adaptive_width: bool = true,
         /// `INFR_NO_MTP_CKPT` (inverted).
         mtp_ckpt: bool = true,
         /// `INFR_NO_MTP_REPRIME` (inverted). ANDed with [`SpecCfg::mtp_ckpt`] at the site (R5).

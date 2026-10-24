@@ -70,6 +70,7 @@ struct PreparedResident {
     tape: Arc<dyn Buffer>,
     banks: Vec<(usize, u64, usize)>,
     tape_words: usize,
+    copy_params: Vec<([usize; 3], [u32; 9])>,
 }
 
 pub(super) struct ActivatedPrefix {
@@ -230,6 +231,17 @@ pub(super) fn compatible(current: &Graph, next: &Graph, scratch: &ScratchSet) ->
     prefix_end(next).is_some()
 }
 
+pub(super) fn copy_binding_matches(
+    selected: Option<&Arc<crate::pager::GpuCopyBuffers>>,
+    recorded: Option<&Arc<crate::pager::GpuCopyBuffers>>,
+) -> bool {
+    match (selected, recorded) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 impl PreparedPrefix {
     pub(super) fn resident_layers(&self) -> usize {
         self.resident
@@ -243,6 +255,7 @@ impl PreparedPrefix {
         pool: &mut ScratchPool,
         bindings: &Bindings,
         retained: Option<&ResidentBuffers>,
+        copy_enabled: bool,
     ) -> Option<ActivatedPrefix> {
         if !enabled(be_) || !self.command.trace_compatible() {
             return None;
@@ -293,6 +306,8 @@ impl PreparedPrefix {
                     (None, None) => true,
                     _ => false,
                 }
+                || !copy_binding_matches(buffers.selected_gpu_copy(copy_enabled), prepared.chunk.gpu_copy.as_ref())
+                || (prepared.chunk.gpu_copy.is_some() && buffers.producer.is_none())
             {
                 return None;
             }
@@ -303,23 +318,37 @@ impl PreparedPrefix {
                     session.arena_addr(role).ok() != Some(address)
                         || session.slot_bytes(role).ok() != Some(bytes)
                 })
+                || prepared.copy_params.iter().any(|(roles, expected)| {
+                    prepared.chunk.gpu_copy.as_ref()
+                        .and_then(|copy| copy.role_params(session, roles).ok())
+                        .as_ref() != Some(expected)
+                })
             {
                 return None;
             }
-            // No submitted command references these new tape ranges yet. Only now publish
-            // fresh addresses; recording on the previous token never froze or wrote them.
-            for entry in &prepared.chunk.entries {
-                for &role in &entry.roles {
-                    session
-                        .resident_lut_window(&mut tape_words, role, entry.layout.n_expert)
-                        .ok()?;
+            let mut publish = |session: &mut crate::pager::MoePagerSession| -> Result<()> {
+                // Victims must be selected before these windows freeze the live LUT slots.
+                for entry in &prepared.chunk.entries {
+                    for &role in &entry.roles {
+                        session.resident_lut_window(
+                            &mut tape_words,
+                            role,
+                            entry.layout.n_expert,
+                        )?;
+                    }
                 }
-            }
-            if tape_words != prepared.tape_words {
-                return None;
-            }
-            if let Some(notices) = &prepared.chunk.notices {
-                notices.reset().ok()?;
+                if tape_words != prepared.tape_words {
+                    return Err(be("prepared resident tape layout changed"));
+                }
+                if let Some(notices) = &prepared.chunk.notices {
+                    notices.reset()?;
+                }
+                Ok(())
+            };
+            if let Some(copy) = &prepared.chunk.gpu_copy {
+                copy.activate_prepared(session, publish).ok()?;
+            } else {
+                publish(session).ok()?;
             }
             // Speculative packets must not own the live producer: ResidentChunk::drop drains
             // and resets it. Attach those runtime owners only after successful activation.
@@ -352,6 +381,11 @@ pub(super) fn record(
     let graph = &plan.graph;
     if let Some(chunk) = resident.as_mut() {
         let cfg = &be_.cfg().kernels.vulkan;
+        let copy_requested = resident_graph_layouts(be_, graph, be_.moe_paged())
+            .is_some_and(|layouts| resident_copy_requested(cfg.decode_gpu_resident_copy, graph, &layouts));
+        if !copy_requested {
+            chunk.gpu_copy = None;
+        }
         let submit_layers = match cfg.decode_gpu_resident_submit_layers {
             0 => graph.resident_submit_layers.unwrap_or(1),
             explicit => explicit,
@@ -472,6 +506,9 @@ pub(super) fn record(
     let mut memo = None;
     let mut stream = PagedStream::default();
     if let Some(chunk) = resident.as_mut() {
+        if let Some(copy) = &chunk.gpu_copy {
+            rec.zero(copy.overlay.as_ref(), copy.overlay.len_bytes() / 4);
+        }
         rec.arena_stream_barrier();
         rec.gpu_resident_check(
             chunk.control.as_ref(),
@@ -520,6 +557,7 @@ pub(super) fn record(
                 control: Arc::clone(&chunk.control),
                 journal: Arc::clone(&chunk.journal),
                 ordinal: ordinal as u32,
+                copy: chunk.gpu_copy.clone(),
                 notice: chunk
                     .notices
                     .as_ref()
@@ -567,9 +605,13 @@ pub(super) fn record(
             let guard = be_.moe_pager().lock().unwrap();
             let session = guard.as_ref().ok_or_else(|| be("missing prepared pager"))?;
             let mut banks = Vec::new();
+            let mut copy_params = Vec::new();
             for entry in &chunk.entries {
                 for &role in &entry.roles {
                     banks.push((role, session.arena_addr(role)?, session.slot_bytes(role)?));
+                }
+                if let Some(copy) = &chunk.gpu_copy {
+                    copy_params.push((entry.roles, copy.role_params(session, &entry.roles)?));
                 }
             }
             Ok(PreparedResident {
@@ -577,6 +619,7 @@ pub(super) fn record(
                 tape: session.retained_tape(),
                 banks,
                 tape_words: stream.tape_cursor,
+                copy_params,
             })
         })
         .transpose()?;

@@ -25,6 +25,23 @@ pub(crate) fn spv_words(bytes: &[u8]) -> Vec<u32> {
 // remap). Uses `spv_words`/`OnceLock` from this module scope.
 include!(concat!(env!("OUT_DIR"), "/native_gemm_map.rs"));
 
+pub(crate) fn verify_pair_spv(name: &str) -> &'static [u32] {
+    macro_rules! shader {
+        ($name:literal) => {{
+            static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+            WORDS.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))).as_slice()
+        }};
+    }
+    match name {
+        "gpu_resident_hit_check_pair" => shader!("gpu_resident_hit_check_pair"),
+        "gpu_resident_copy_prepare_pair" => shader!("gpu_resident_copy_prepare_pair"),
+        "verify_pair_iq2s_nr8" => shader!("verify_pair_iq2s_nr8"),
+        "verify_pair_iq3s_nr1" => shader!("verify_pair_iq3s_nr1"),
+        "verify_pair_iq3s_nr1_shared" => shader!("verify_pair_iq3s_nr1_shared"),
+        _ => panic!("unknown VERIFY pair shader: {name}"),
+    }
+}
+
 /// Kernel-cache NAME of the multi-row native GEMV (m = 2..8 — the spec-decode verify /
 /// short-suffix-prefill shape) for `dtype`, or `None` for formats without an mrow build (they keep
 /// the tiled GEMM route). Availability + name oracle; the SPIR-V (the sole, arena-addressed weight
@@ -506,6 +523,25 @@ pub(crate) fn native_idm_paged_shared_build_spv(
         Iq4Xs => v!("native_idm_iq4xs_paged_shexp"),
         _ => None,
     }
+}
+
+/// Staged-grid shared IQ2_S NR8; admission remains an explicit causal-Verify policy.
+pub(crate) fn native_idm_grid_nr_paged_shared_build_spv(
+    dtype: infr_core::DType,
+    nr: u32,
+) -> Option<(&'static str, &'static [u32])> {
+    if dtype != infr_core::DType::Iq2S || nr != 8 {
+        return None;
+    }
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    Some((
+        "native_idm_iq2s_nr8_paged_shexp",
+        S.get_or_init(|| {
+            spv_words(include_bytes!(concat!(
+                env!("OUT_DIR"), "/native_idm_iq2s_nr8_paged_shexp.spv"
+            )))
+        }).as_slice(),
+    ))
 }
 
 pub(crate) fn native_idm_grid_buffer_shared_spv(
@@ -4013,6 +4049,33 @@ pub(crate) fn gpu_resident_silu_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_resident_silu.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
+}
+
+pub(crate) fn gpu_resident_copy_prepare_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_resident_copy_prepare.spv"));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+pub(crate) fn gpu_resident_copy_prepare_overlap_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_resident_copy_prepare_overlap.spv"));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+pub(crate) fn gpu_resident_silu_misses_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_resident_silu_misses.spv"));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+pub(crate) fn gpu_resident_copy_payload_spv(wide: bool) -> &'static [u32] {
+    const SMALL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_resident_copy_payload.spv"));
+    const WIDE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_resident_copy_payload1024.spv"));
+    static SMALL_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    static WIDE_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    if wide { WIDE_WORDS.get_or_init(|| spv_words(WIDE)) }
+    else { SMALL_WORDS.get_or_init(|| spv_words(SMALL)) }
 }
 /// SPIR-V for the elementwise sigmoid gate `y = a * sigmoid(b)`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]

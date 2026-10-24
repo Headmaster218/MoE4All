@@ -1,0 +1,391 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) buffer Ids { uint ids[]; };
+layout(std430, binding = 1) buffer Tape { uvec2 addresses[]; };
+layout(std430, binding = 2) buffer Control {
+    uint run; uint stopped; uint reached; uint invalid; uint hit_run; uint predicates[];
+};
+layout(std430, binding = 3) buffer Journal { uint journal[]; };
+layout(std430, binding = 4) readonly buffer Sources { uvec4 sources[]; };
+layout(std430, binding = 5) buffer Candidates { uvec4 candidates[]; };
+layout(std430, binding = 6) buffer Overlay { uvec4 overlay[]; };
+layout(std430, binding = 7) buffer Jobs { uvec4 jobs[]; };
+#ifdef COPY_OVERLAP
+layout(std430, binding = 8) buffer MissPredicates { uint miss_jobs[]; };
+#endif
+layout(push_constant) uniform Params {
+    uint count; uint experts; uint gate_base; uint up_base; uint down_base;
+    uint ordinal; uint used; uint shared_mask; uint immutable_predicates;
+    uint role_block_base0; uint role_block_base1; uint role_block_base2;
+    uint pool_start0; uint pool_start1; uint pool_start2;
+    uint pool_count0; uint pool_count1; uint pool_count2;
+    uint copy_groups;
+} p;
+
+#ifdef VERIFY_PAIR
+#define VERIFY_PAIR_BINDING 8
+#include "verify_pair.glsl"
+#endif
+
+const uint NONE = 0xffffffffu;
+const uint MAX_ROUTED = INFR_MAX_DECODE_ROWS * 16u;
+const uint JOB_CAPACITY = MAX_ROUTED * 3u;
+const uint JOURNAL_MASK_WORD = MAX_ROUTED;
+const uint JOURNAL_JOB_COUNT_WORD = JOURNAL_MASK_WORD + INFR_MAX_DECODE_ROWS;
+const uint JOURNAL_STATUS_WORD = JOURNAL_MASK_WORD + INFR_MAX_DECODE_ROWS + 3u;
+const uint JOURNAL_WORDS = JOURNAL_STATUS_WORD + 1u;
+
+shared uvec2 resolved_roles[JOB_CAPACITY];
+shared uint resolved_tape_words[JOB_CAPACITY];
+shared uint update_tape[JOB_CAPACITY];
+shared uint prepare_ready;
+shared uint prepare_journal_base;
+shared uint prepare_rows;
+shared uint prepare_invalid;
+shared uint prepare_missing;
+
+uint tape_base(uint role) {
+    return role == 0u ? p.gate_base : (role == 1u ? p.up_base : p.down_base);
+}
+
+uint block_base(uint role) {
+    return role == 0u ? p.role_block_base0
+                    : (role == 1u ? p.role_block_base1 : p.role_block_base2);
+}
+
+uint pool_start(uint role) {
+    return role == 0u ? p.pool_start0 : (role == 1u ? p.pool_start1 : p.pool_start2);
+}
+
+uint pool_count(uint role) {
+    return role == 0u ? p.pool_count0 : (role == 1u ? p.pool_count1 : p.pool_count2);
+}
+
+bool present(uvec2 address) {
+    return any(notEqual(address, uvec2(0u)));
+}
+
+uvec2 resolve_address(uint tape_word, uint block) {
+    uvec2 override_address = overlay[block].xy;
+    if (all(equal(override_address, uvec2(NONE)))) return uvec2(0u);
+    return present(override_address) ? override_address : addresses[tape_word];
+}
+
+bool valid_span(uvec2 address, uint bytes) {
+    if (!present(address) || all(equal(address, uvec2(NONE)))) return false;
+    if ((address.x & 15u) != 0u || bytes == 0u || (bytes & 15u) != 0u) return false;
+    // Adding a u32 byte count can carry at most once into the high address word.
+    return address.y != NONE || address.x <= NONE - (bytes - 1u);
+}
+
+void finish(uint journal_base, uint status, bool stop) {
+    reached = p.ordinal + 1u;
+    hit_run = invalid == 0u ? 1u : 0u;
+    journal[journal_base + JOURNAL_STATUS_WORD] = status;
+    if (stop) {
+        run = 0u;
+        stopped = p.ordinal;
+    }
+    if (p.immutable_predicates != 0u) {
+        predicates[p.ordinal * 2u] = run;
+        predicates[p.ordinal * 2u + 1u] = hit_run;
+    }
+}
+
+bool plan_jobs(uint job_base, out uint job_count) {
+    job_count = 0u;
+    uint cursor_count = 0u;
+    uint cursor_start[3];
+    uint cursor_end[3];
+    uint cursor_next[3];
+    for (uint i = 0u; i < p.count; ++i) {
+        uint id = ids[i];
+        for (uint role = 0u; role < 3u; ++role) {
+            uint tape_word = tape_base(role) + id;
+            if (present(addresses[tape_word])) continue;
+            uint block = block_base(role) + id;
+            bool duplicate = false;
+            for (uint j = 0u; j < job_count; ++j) {
+                if (jobs[job_base + j * 2u + 1u].y == block) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+            if (job_count >= JOB_CAPACITY || block >= uint(sources.length())) return false;
+            uvec4 source = sources[block];
+            if (!valid_span(source.xy, source.z)) return false;
+
+            uint start = pool_start(role);
+            uint count = pool_count(role);
+            uint available = uint(candidates.length());
+            if (start > available || count > available - start) return false;
+            uint end = start + count;
+            uint cursor = NONE;
+            for (uint r = 0u; r < cursor_count; ++r) {
+                if (cursor_start[r] == start && cursor_end[r] == end) {
+                    cursor = r;
+                    break;
+                }
+                // Real pools are disjoint or exact aliases. A malformed partial overlap
+                // cannot use independent cursors without risking a duplicate placement.
+                if (start < cursor_end[r] && cursor_start[r] < end) return false;
+            }
+            if (cursor == NONE) {
+                if (cursor_count >= 3u) return false;
+                cursor = cursor_count++;
+                cursor_start[cursor] = start;
+                cursor_end[cursor] = end;
+                cursor_next[cursor] = start;
+            }
+            uint selected = NONE;
+            // Gate/Up aliases share this local cursor. Selected and rejected slots are
+            // never rescanned, and tentative ownership needs no writes to GPU metadata.
+            while (cursor_next[cursor] < cursor_end[cursor]) {
+                uint c = cursor_next[cursor]++;
+                uvec4 candidate = candidates[c];
+                if (candidate.w != 0u || !valid_span(candidate.xy, source.z)) continue;
+                if (candidate.z != NONE) {
+                    if (candidate.z >= uint(overlay.length())) continue;
+                    if (overlay[candidate.z].z != 0u) continue;
+                }
+                selected = c;
+                break;
+            }
+            if (selected == NONE) return false;
+            // Tentative jobs are scratch until the entire dispatch's missing set fits.
+            jobs[job_base + job_count * 2u] = uvec4(source.xy, candidates[selected].xy);
+            jobs[job_base + job_count * 2u + 1u] =
+                uvec4(source.z, block, selected, tape_word);
+            ++job_count;
+        }
+    }
+    return true;
+}
+
+bool begin_prepare(out uint journal_base, out uint rows) {
+    journal_base = 0u;
+    rows = 0u;
+    hit_run = 0u;
+    bool journal_valid = p.ordinal < uint(journal.length()) / JOURNAL_WORDS;
+    bool predicates_valid = p.immutable_predicates == 0u
+                         || p.ordinal < uint(predicates.length()) / 2u;
+#ifdef COPY_OVERLAP
+    bool miss_valid = p.ordinal < uint(miss_jobs.length()) / 4u;
+    if (miss_valid) {
+        miss_jobs[p.ordinal * 4u] = 0u;
+        miss_jobs[p.ordinal * 4u + 1u] = 0u;
+        miss_jobs[p.ordinal * 4u + 2u] = 1u;
+        miss_jobs[p.ordinal * 4u + 3u] = 1u;
+    }
+    predicates_valid = predicates_valid && miss_valid;
+#endif
+    if (journal_valid) {
+        journal_base = p.ordinal * JOURNAL_WORDS;
+        journal[journal_base + JOURNAL_STATUS_WORD] = 0u;
+        journal[journal_base + JOURNAL_JOB_COUNT_WORD] = 0u;
+    }
+    if (p.immutable_predicates != 0u && predicates_valid) {
+        predicates[p.ordinal * 2u] = 0u;
+        predicates[p.ordinal * 2u + 1u] = 0u;
+    }
+    if (run == 0u) return false;
+    if (!journal_valid || !predicates_valid) {
+        invalid = 1u;
+        run = 0u;
+        stopped = p.ordinal;
+        reached = p.ordinal == NONE ? NONE : p.ordinal + 1u;
+        if (journal_valid) journal[journal_base + JOURNAL_STATUS_WORD] = 3u;
+        return false;
+    }
+
+    // Validate dimensions before divisions, shifts, or row-mask writes.
+    bool dimensions_valid = p.used > 0u && p.used <= 16u && p.count <= MAX_ROUTED;
+    if (dimensions_valid) {
+        rows = p.count / p.used;
+        dimensions_valid = p.count % p.used == 0u && rows <= INFR_MAX_DECODE_ROWS
+                        && p.count + rows * 2u <= uint(ids.length());
+    }
+    if (!dimensions_valid) {
+        invalid = 1u;
+        finish(journal_base, 3u, true);
+        return false;
+    }
+    return true;
+}
+
+#ifdef VERIFY_PAIR
+// begin_prepare can reject before classifier shared memory has been initialized.
+void finish_paired(uint journal_base, uint status, bool stop) {
+    finish(journal_base, status, stop);
+    vp_publish(status);
+}
+#define finish finish_paired
+#endif
+
+void main() {
+    if (any(notEqual(gl_WorkGroupID, uvec3(0u)))) return;
+    uint lane = gl_LocalInvocationID.x;
+    if (lane == 0u) {
+        uint journal_base;
+        uint rows;
+        prepare_ready = begin_prepare(journal_base, rows) ? 1u : 0u;
+        prepare_journal_base = journal_base;
+        prepare_rows = rows;
+        prepare_invalid = invalid;
+        prepare_missing = 0u;
+    }
+    barrier();
+#ifdef VERIFY_PAIR
+    vp_begin(p.count, p.experts, p.used, p.shared_mask, prepare_ready != 0u);
+#endif
+    if (prepare_ready == 0u) {
+#ifdef VERIFY_PAIR
+        if (lane == 0u) {
+            uint status = p.ordinal < uint(journal.length()) / JOURNAL_WORDS
+                ? journal[prepare_journal_base + JOURNAL_STATUS_WORD] : 3u;
+            vp_publish(status);
+        }
+#endif
+        return;
+    }
+    uint journal_base = prepare_journal_base;
+    uint rows = prepare_rows;
+    uint role_count = p.count * 3u;
+
+    // Finish every overlay/tape load before any lane writes seen: an xy load may fetch
+    // the full overlay vector, including z, even though only the address is used.
+    for (uint task = lane; task < role_count; task += 32u) {
+        uint i = task / 3u;
+        uint role = task % 3u;
+        uint id = ids[i];
+        if (role == 0u) journal[journal_base + i] = id;
+        uvec2 address = uvec2(0u);
+        uint tape_word = NONE;
+        uint changed = 0u;
+        if (id >= p.experts) atomicOr(prepare_invalid, 1u);
+        else {
+            uint tb = tape_base(role);
+            uint gb = block_base(role);
+            uint tape_length = uint(addresses.length());
+            uint overlay_length = uint(overlay.length());
+            if (tb > tape_length || id >= tape_length - tb
+                || gb > overlay_length || id >= overlay_length - gb) {
+                atomicOr(prepare_invalid, 1u);
+            } else {
+                tape_word = tb + id;
+                uvec2 original = addresses[tape_word];
+                uint block = gb + id;
+                address = resolve_address(tape_word, block);
+                changed = any(notEqual(original, address)) ? 1u : 0u;
+            }
+        }
+        resolved_roles[task] = address;
+        resolved_tape_words[task] = tape_word;
+        update_tape[task] = changed;
+    }
+    memoryBarrierBuffer();
+    barrier();
+
+    // Unchanged all-hit tape entries need no stores or alias scans. For overrides, only the
+    // lowest task writes each tape word; contradictory aliases invalidate the dispatch.
+    for (uint task = lane; task < role_count; task += 32u) {
+        if (resolved_tape_words[task] != NONE && present(resolved_roles[task])) {
+            uint block = block_base(task % 3u) + ids[task / 3u];
+            atomicOr(overlay[block].z, 1u);
+        }
+        if (update_tape[task] == 0u) continue;
+        uint tape_word = resolved_tape_words[task];
+        bool leader = true;
+        for (uint other = 0u; other < role_count; ++other) {
+            if (resolved_tape_words[other] != tape_word) continue;
+            if (other < task) leader = false;
+            if (any(notEqual(resolved_roles[other], resolved_roles[task]))) {
+                atomicOr(prepare_invalid, 1u);
+            }
+        }
+        if (leader) addresses[tape_word] = resolved_roles[task];
+    }
+    for (uint row = lane; row < rows; row += 32u) {
+        uint hit = 0u;
+        uint miss = 0u;
+        for (uint slot = 0u; slot < p.used; ++slot) {
+            uint task = (row * p.used + slot) * 3u;
+            bool resident = present(resolved_roles[task])
+                         && present(resolved_roles[task + 1u])
+                         && present(resolved_roles[task + 2u]);
+            if (resident) hit |= 1u << slot;
+            else miss |= 1u << slot;
+        }
+        ids[p.count + row] = hit | p.shared_mask;
+        ids[p.count + rows + row] = miss;
+        journal[journal_base + JOURNAL_MASK_WORD + row] = hit;
+        if (miss != 0u) atomicOr(prepare_missing, 1u);
+    }
+    memoryBarrierBuffer();
+    barrier();
+    if (lane != 0u) return;
+
+    invalid = prepare_invalid;
+#ifdef VERIFY_PAIR
+    invalid |= vp_bad | uint(vp_valid == 0u);
+#endif
+    if (invalid != 0u) {
+        finish(journal_base, 3u, true);
+        return;
+    }
+    if (prepare_missing == 0u) {
+        finish(journal_base, 1u, false);
+        return;
+    }
+
+    uint job_count = 0u;
+    if (p.ordinal >= uint(jobs.length()) / (JOB_CAPACITY * 2u)) {
+        finish(journal_base, 2u, true);
+        return;
+    }
+    uint job_base = p.ordinal * JOB_CAPACITY * 2u;
+    if (!plan_jobs(job_base, job_count)) {
+        // Retain the original hit/miss masks and zero published jobs on every fallback.
+        finish(journal_base, 2u, true);
+        return;
+    }
+
+    // Invalidate all old owners first, so a later invalidation cannot erase a newly installed ID.
+    for (uint j = 0u; j < job_count; ++j) {
+        uint candidate = jobs[job_base + j * 2u + 1u].z;
+        uint old = candidates[candidate].z;
+        candidates[candidate].w = 1u;
+        if (old != NONE) overlay[old].xy = uvec2(NONE);
+    }
+    for (uint j = 0u; j < job_count; ++j) {
+        uvec4 a = jobs[job_base + j * 2u];
+        uvec4 b = jobs[job_base + j * 2u + 1u];
+        overlay[b.y].xy = a.zw;
+        overlay[b.y].z = 1u;
+        addresses[b.w] = a.zw;
+    }
+    // Refresh all aliases too: repeated global IDs share a job even across tape role ranges.
+    for (uint i = 0u; i < p.count; ++i) {
+        uint id = ids[i];
+        for (uint role = 0u; role < 3u; ++role) {
+            uint tape_word = tape_base(role) + id;
+            addresses[tape_word] = resolve_address(tape_word, block_base(role) + id);
+        }
+    }
+#ifdef COPY_OVERLAP
+    // Keep H/M immutable for the independent hit projections and later miss-only FFN.
+    miss_jobs[p.ordinal * 4u] = job_count;
+    miss_jobs[p.ordinal * 4u + 1u] = clamp(p.copy_groups, 1u, 8u);
+#else
+    uint all_topk = (1u << p.used) - 1u;
+    for (uint row = 0u; row < rows; ++row) {
+        ids[p.count + row] = all_topk | p.shared_mask;
+        ids[p.count + rows + row] = 0u;
+    }
+#endif
+    journal[journal_base + JOURNAL_JOB_COUNT_WORD] = job_count;
+    finish(journal_base, 4u, false);
+}

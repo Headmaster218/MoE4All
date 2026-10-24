@@ -1,0 +1,107 @@
+#version 460
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Local experiment only: PAGED IQ2S/IQ3S Gate/Up, fixed VERIFY row pairs 0/1, 2/3.
+// No-pair phases dispatch the original kernel, avoiding MR2 register pressure there.
+#if !defined(PAGED) || !defined(USE_GRID) || defined(SHARED_Q8) || (!defined(FMT_IQ2S) && !defined(FMT_IQ3S))
+#error Pair experiment requires PAGED USE_GRID IQ2S or IQ3S without a shared expert
+#endif
+#if defined(IQ2_GRID_BUFFER) || defined(IQ3_GRID_BUFFER)
+#error Pair experiment uses the production staged codebook variants
+#endif
+#ifndef NR
+#define NR 1
+#endif
+#if NR < 1 || NR > 8
+#error Pair experiment supports NR from 1 through 8
+#endif
+layout(local_size_x = 64) in;
+layout(push_constant) uniform PC {
+    uint in_f; uint out_f; uint n_used; uint stride; uint x_per_slot; uint rows;
+    uint arena_lo; uint arena_hi; uint slot_bytes; uint active_mask; uint row_mask_bank;
+} pc;
+layout(binding = 1) readonly buffer XB { float x_buf[]; };
+layout(binding = 2) readonly buffer IDB { uint ids[]; };
+layout(binding = 3) readonly buffer LUTB { uvec2 lut[]; };
+layout(binding = 4, std430) readonly buffer MB { uint meta[]; };
+layout(binding = 5) buffer YB { float y_buf[]; };
+
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+#include "native_decode.glsl"
+
+shared float part[2][NR][8];
+
+uint mask_for(uint row) {
+    if (pc.row_mask_bank == 0u) { return pc.active_mask; }
+    return ids[pc.rows * pc.n_used + (pc.row_mask_bank - 1u) * pc.rows + row];
+}
+
+void main() {
+    if (pc.rows != 4u || pc.n_used == 0u || pc.n_used > 16u || pc.row_mask_bank > 2u
+        || pc.in_f == 0u || pc.in_f % 256u != 0u || pc.out_f == 0u) { return; }
+    uint og = (pc.out_f + uint(NR) - 1u) / uint(NR);
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (unit >= pc.rows * pc.n_used * og) { return; }
+    uint a = unit / og;
+    uint o0 = (unit - a * og) * uint(NR);
+    uint row = a / pc.n_used;
+    if ((mask_for(row) & (1u << (a % pc.n_used))) == 0u) { return; }
+    if (uint(meta.length()) < 86u || meta[67] != 1u) { return; }
+    uint b = meta[a];
+    bool paired = b < pc.rows * pc.n_used;
+    if (paired) {
+        paired = meta[b] == a && b / pc.n_used == (row ^ 1u) && ids[b] == ids[a];
+        paired = paired && (mask_for(b / pc.n_used) & (1u << (b % pc.n_used))) != 0u;
+    }
+    // The higher member remains a singleton when its lower partner is masked out.
+    if (paired && b < a) { return; }
+    GRID_INIT;
+    w_addr = arena_base(lut[pc.stride + ids[a]].x, lut[pc.stride + ids[a]].y);
+    uint x0 = (pc.x_per_slot != 0u ? a : row) * pc.in_f;
+    uint x1 = paired ? (pc.x_per_slot != 0u ? b : b / pc.n_used) * pc.in_f : x0;
+    uint t = gl_LocalInvocationID.x;
+    float acc0[NR], acc1[NR];
+    for (uint rr = 0u; rr < uint(NR); rr++) { acc0[rr] = 0.0; acc1[rr] = 0.0; }
+    for (uint s = t; s < pc.in_f / 32u; s += 64u) {
+        for (uint rr = 0u; rr < uint(NR); rr++) {
+            uint o = o0 + rr;
+            if (o >= pc.out_f) { continue; }
+            float v[32];
+            dqblk(o * pc.in_f + s * 32u, v);
+            // Preserve dqsub's 32-term order, then its outer sub-block accumulation.
+            float dot0 = 0.0;
+            for (uint w = 0u; w < 32u; w++) { dot0 += v[w] * x_buf[x0 + s * 32u + w]; }
+            acc0[rr] += dot0;
+            if (paired) {
+                float dot1 = 0.0;
+                for (uint w = 0u; w < 32u; w++) { dot1 += v[w] * x_buf[x1 + s * 32u + w]; }
+                acc1[rr] += dot1;
+            }
+        }
+    }
+    for (uint rr = 0u; rr < uint(NR); rr++) {
+        float sg0 = subgroupAdd(acc0[rr]);
+        if (subgroupElect()) { part[0][rr][gl_SubgroupID] = sg0; }
+        if (paired) {
+            float sg1 = subgroupAdd(acc1[rr]);
+            if (subgroupElect()) { part[1][rr][gl_SubgroupID] = sg1; }
+        }
+    }
+    barrier();
+    if (t == 0u) {
+        for (uint rr = 0u; rr < uint(NR); rr++) {
+            uint o = o0 + rr;
+            if (o >= pc.out_f) { continue; }
+            float tot0 = 0.0;
+            for (uint s = 0u; s < gl_NumSubgroups; s++) { tot0 += part[0][rr][s]; }
+            y_buf[a * pc.out_f + o] = tot0;
+            if (paired) {
+                float tot1 = 0.0;
+                for (uint s = 0u; s < gl_NumSubgroups; s++) { tot1 += part[1][rr][s]; }
+                y_buf[b * pc.out_f + o] = tot1;
+            }
+        }
+    }
+}
