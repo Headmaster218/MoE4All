@@ -98,8 +98,7 @@ fn gpu_copy_overlap_verify_is_single_lane_bounded_and_pair_exclusive() {
                         for immutable in [false, true] {
                             for predicate in [false, true] {
                                 for indirect in [false, true] {
-                                    let shape =
-                                        !verify || (!independent && matches!(rows, 2 | 3 | 4));
+                                    let shape = !verify || (!independent && matches!(rows, 2..=4));
                                     assert_eq!(
                                         gpu_copy_overlap_eligible(
                                             requested, verify, rows, independent, pair,

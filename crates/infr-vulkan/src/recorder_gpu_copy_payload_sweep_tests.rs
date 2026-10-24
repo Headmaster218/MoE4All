@@ -80,9 +80,9 @@ mod fixtures {
                 assert_eq!(ranges.iter().map(|range| range.len()).sum::<usize>(), bytes);
                 assert_eq!(ranges[0].start, GUARD);
                 assert_eq!(span - ranges.last().unwrap().end, GUARD);
-                assert!(ranges.iter().all(|range| range.len() > 0
-                    && range.start % 16 == 0
-                    && range.len() % 16 == 0));
+                assert!(ranges.iter().all(|range| !range.is_empty()
+                    && range.start.is_multiple_of(16)
+                    && range.len().is_multiple_of(16)));
                 assert!(ranges
                     .windows(2)
                     .all(|pair| pair[1].start - pair[0].end == GUARD));
@@ -102,7 +102,7 @@ mod fixtures {
         let mut cfg = infr_core::config::Config::default();
         cfg.device.dev =
             Some(std::env::var("MOE4ALL_TEST_DEVICE").expect("select the idle GPU explicitly"));
-            cfg.kernels.vulkan.decode_gpu_resident_copy = Some(true);
+        cfg.kernels.vulkan.decode_gpu_resident_copy = Some(true);
         let backend = VulkanBackend::new_with(Arc::new(cfg)).unwrap();
         let device = &backend.shared.device;
         let properties = unsafe {
@@ -218,8 +218,8 @@ mod fixtures {
                             bank
                         });
                         assert_ne!(banks[0], banks[1]);
-                        for ordinal in 0..2 {
-                            let source_base = banks[ordinal] * span;
+                        for (ordinal, &bank) in banks.iter().enumerate() {
+                            let source_base = bank * span;
                             let destination_base = ordinal * span;
                             for (job, range) in ranges.iter().enumerate() {
                                 let src = source_address + (source_base + range.start) as u64;
@@ -377,7 +377,6 @@ mod fixtures {
                     println!("PAYLOAD_SWEEP {{\"bytes\":{bytes},\"experts\":{experts},\"jobs\":{},\"baseline_local\":1024,\"baseline_groups\":2,\"candidate_local\":{},\"candidate_groups\":{},\"pairs\":{PAIRS},\"order\":\"AB_BA\",\"baseline_us\":{base_us:?},\"candidate_us\":{candidate_us:?},\"source_banks_execution_order\":{source_banks:?},\"baseline_median_us\":{base_median},\"candidate_median_us\":{candidate_median},\"baseline_GBps\":{},\"candidate_GBps\":{},\"median_paired_speedup\":{},\"guards\":\"all_bytes_every_pair\"}}",
                     ranges.len(), candidate.0, candidate.1, bytes as f64 / (base_median * 1000.0), bytes as f64 / (candidate_median * 1000.0), median(&ratios));
                 }
-                drop(measure_pair);
                 let visited_bytes = visited.len() * bytes;
                 assert!(
                     visited_bytes > 128 * MIB,

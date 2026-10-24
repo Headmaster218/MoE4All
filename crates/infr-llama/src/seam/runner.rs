@@ -13376,10 +13376,8 @@ mod tests {
                     let capacity = hidden.capacity();
                     for lane in 0..lanes {
                         let start = lane * lane_len;
-                        let result = super::take_verify_hidden_rows(
-                            &mut hidden,
-                            start..start + lane_len,
-                        );
+                        let result =
+                            super::take_verify_hidden_rows(&mut hidden, start..start + lane_len);
                         assert_eq!(result.len(), lane_len);
                         assert_eq!(hidden.len(), len);
                         assert_eq!(hidden.as_ptr(), address);

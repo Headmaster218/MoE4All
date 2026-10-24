@@ -392,7 +392,11 @@ mod fixtures {
         fn timing_pair(&self, trial: usize, warmup: bool) -> [Timing; 2] {
             const START: usize = 30_000;
             self.reset_history(START, 4);
-            let order = if trial % 2 == 0 { [0, 1] } else { [1, 0] };
+            let order = if trial.is_multiple_of(2) {
+                [0, 1]
+            } else {
+                [1, 0]
+            };
             let mut ids = [Vec::new(), Vec::new()];
             let mut samples = [Timing::default(); 2];
             for slot in order {
@@ -412,7 +416,7 @@ mod fixtures {
     fn median(mut samples: Vec<f64>) -> f64 {
         samples.sort_by(f64::total_cmp);
         let middle = samples.len() / 2;
-        if samples.len() % 2 == 0 {
+        if samples.len().is_multiple_of(2) {
             (samples[middle - 1] + samples[middle]) / 2.0
         } else {
             samples[middle]

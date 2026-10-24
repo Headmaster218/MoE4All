@@ -1964,9 +1964,9 @@ pub struct MoePagerSession {
 
 #[path = "pager_gpu_copy.rs"]
 mod gpu_copy;
-pub(crate) use gpu_copy::GpuCopyBuffers;
 #[cfg(test)]
 pub(crate) use gpu_copy::completed_copies;
+pub(crate) use gpu_copy::GpuCopyBuffers;
 
 struct ResidentLutCache {
     addresses: Vec<Vec<u64>>,

@@ -1456,7 +1456,10 @@ impl ParallelSeam {
                     model.config(),
                     model.engine_cfg(),
                     vk.capabilities().embed_gather,
-                    model.gguf().tensors().iter()
+                    model
+                        .gguf()
+                        .tensors()
+                        .iter()
                         .find(|tensor| tensor.name == "token_embd.weight")
                         .map(|tensor| tensor.dtype),
                 )
@@ -2965,21 +2968,19 @@ impl ParallelSeam {
     fn scheduler_admission_eligible(&self) -> bool {
         self.gate.is_some()
             && (!self.model.engine_cfg().spec.lookup
-                || scheduler_requested(
-                    self.n_slots(),
-                    self.mtp_heads.is_some(),
-                    true,
-                    || {
-                        lookup_scheduler_supported(
-                            self.model.config(),
-                            self.model.engine_cfg(),
-                            self.vk.capabilities().embed_gather,
-                            self.model.gguf().tensors().iter()
-                                .find(|tensor| tensor.name == "token_embd.weight")
-                                .map(|tensor| tensor.dtype),
-                        )
-                    },
-                ))
+                || scheduler_requested(self.n_slots(), self.mtp_heads.is_some(), true, || {
+                    lookup_scheduler_supported(
+                        self.model.config(),
+                        self.model.engine_cfg(),
+                        self.vk.capabilities().embed_gather,
+                        self.model
+                            .gguf()
+                            .tensors()
+                            .iter()
+                            .find(|tensor| tensor.name == "token_embd.weight")
+                            .map(|tensor| tensor.dtype),
+                    )
+                }))
     }
 
     fn new_lookup_work(
@@ -3015,7 +3016,7 @@ impl ParallelSeam {
         let config = crate::speculative_lookup::LookupConfig {
             min_match: ec.spec.lookup_min_match,
             adaptive_width: ec.spec.lookup_adaptive_width,
-            history_capacity: self.max_ctx.min(262_144).max(65_536),
+            history_capacity: self.max_ctx.clamp(65_536, 262_144),
             max_drafts: ec
                 .spec
                 .lookup_max_draft
@@ -3645,8 +3646,6 @@ impl ParallelSeam {
             Some(&group_req),
             sync_mtp,
         );
-        drop(stream);
-
         active[indices[0]].kv = primary;
         for (&index, kv) in indices[1..].iter().zip(peers) {
             active[index].kv = Some(kv);
@@ -4207,10 +4206,7 @@ impl ParallelSeam {
                     active[index].mtp_ready
                         && !mtp_context_profitable(
                             self.model.engine_cfg().spec.mtp_max_context,
-                            active[index]
-                                .kv()
-                                .cached_len()
-                                .saturating_add(verify_rows),
+                            active[index].kv().cached_len().saturating_add(verify_rows),
                         )
                 })
                 .collect::<Vec<_>>();
@@ -4233,9 +4229,7 @@ impl ParallelSeam {
                 continue;
             }
             let fallback = (0..active.len())
-                .filter(|&index| {
-                    active[index].kv().cached_len() + verify_rows > self.max_ctx
-                })
+                .filter(|&index| active[index].kv().cached_len() + verify_rows > self.max_ctx)
                 .collect::<Vec<_>>();
             if !fallback.is_empty() {
                 if let Err(error) = self.materialize_mtp_frontiers(&mut active, &fallback) {
@@ -4560,17 +4554,26 @@ impl ParallelSeam {
             work.finished = stopped || work.generated >= work.max_new;
             if first_cycle {
                 tracing::info!(
-                    slot = work.slot, context = old_len, rows,
-                    accepted = accepted - 1, published = emitted,
+                    slot = work.slot,
+                    context = old_len,
+                    rows,
+                    accepted = accepted - 1,
+                    published = emitted,
                     tail_kv_only = ec.spec.mtp_tail_kv_only,
                     "Qwen3.8 MTP first Verify cycle"
                 );
             }
             tracing::debug!(
-                slot = work.slot, lanes = indices.len(), context = old_len, rows,
-                drafted = predictions[lane_index].len(), accepted = accepted - 1,
-                committed, published = emitted,
-                snapshot_ms = snapshot_secs * 1000.0, draft_ms = draft_secs * 1000.0,
+                slot = work.slot,
+                lanes = indices.len(),
+                context = old_len,
+                rows,
+                drafted = predictions[lane_index].len(),
+                accepted = accepted - 1,
+                committed,
+                published = emitted,
+                snapshot_ms = snapshot_secs * 1000.0,
+                draft_ms = draft_secs * 1000.0,
                 verify_ms = (compute_secs - draft_secs).max(0.0) * 1000.0,
                 restore_ms = restore_secs * 1000.0,
                 "Qwen3.8 MTP verified cycle"
@@ -5450,12 +5453,11 @@ mod tests {
         concurrent_mtp_profitable, concurrent_mtp_ready, deliver_lookup_prefix,
         expand_multimodal_prompt, long_prefill_cohort_limit, long_prefill_phase_prompt_end,
         lookup_fallback_reason, lookup_greedy_eligible, lookup_scheduler_supported,
-        mtp_accepted_rows, mtp_context_profitable,
-        multimodal_key, multimodal_token_position, phase_for_remaining_prefill, pick_continuation,
-        repair_lookup_predictions, scheduler_mode, scheduler_requested,
-        should_handoff_multimodal_to_scheduler,
-        token_lane_prefill_fallback, token_lane_sort_key, BatchPhase, LookupBatchState,
-        LookupTokenDelivery, MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
+        mtp_accepted_rows, mtp_context_profitable, multimodal_key, multimodal_token_position,
+        phase_for_remaining_prefill, pick_continuation, repair_lookup_predictions, scheduler_mode,
+        scheduler_requested, should_handoff_multimodal_to_scheduler, token_lane_prefill_fallback,
+        token_lane_sort_key, BatchPhase, LookupBatchState, LookupTokenDelivery,
+        MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
     };
     use std::sync::Arc;
 
@@ -5641,12 +5643,20 @@ mod tests {
         }
         ec.spec.gpu_embed = true;
         ec.spec.lookup = false;
-        assert!(!lookup_scheduler_supported(&cfg, &ec, true, Some(infr_core::DType::F16)));
+        assert!(!lookup_scheduler_supported(
+            &cfg,
+            &ec,
+            true,
+            Some(infr_core::DType::F16)
+        ));
         ec.spec.lookup = true;
         let mut unsupported = cfg;
         unsupported.n_layer = 0;
         assert!(!lookup_scheduler_supported(
-            &unsupported, &ec, true, Some(infr_core::DType::F16),
+            &unsupported,
+            &ec,
+            true,
+            Some(infr_core::DType::F16),
         ));
     }
 
@@ -5909,8 +5919,16 @@ mod tests {
     #[test]
     fn lookup_cost_baseline_excludes_prefill_handoffs_and_concurrent_groups() {
         use super::{lookup_ordinary_sample_eligible, BatchPhase};
-        assert!(!lookup_ordinary_sample_eligible(BatchPhase::ShortPrefill, 0, 1));
-        assert!(!lookup_ordinary_sample_eligible(BatchPhase::LongPrefill, 0, 1));
+        assert!(!lookup_ordinary_sample_eligible(
+            BatchPhase::ShortPrefill,
+            0,
+            1
+        ));
+        assert!(!lookup_ordinary_sample_eligible(
+            BatchPhase::LongPrefill,
+            0,
+            1
+        ));
         assert!(!lookup_ordinary_sample_eligible(BatchPhase::Decode, 0, 1));
         assert!(!lookup_ordinary_sample_eligible(BatchPhase::Decode, 16, 2));
         assert!(lookup_ordinary_sample_eligible(BatchPhase::Decode, 16, 1));
@@ -5952,7 +5970,9 @@ mod tests {
         }
         assert_eq!(state.stats.searches, outputs.len());
         assert_eq!(state.indexed_len, history.len() + outputs.len());
-        state.finish_ordinary_outputs(history.len(), &outputs).unwrap();
+        state
+            .finish_ordinary_outputs(history.len(), &outputs)
+            .unwrap();
         assert_eq!(state.indexed_len, history.len() + outputs.len());
         assert!(state.proposer.propose(None, 3).is_none());
     }
@@ -6008,7 +6028,11 @@ mod tests {
     fn lookup_callback_cancel_cohort_and_admission_do_not_request_proposal_yields() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let history = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 4, 5, 6, 7];
-        for (ack, single, admission) in [(false, true, false), (true, false, false), (true, true, true)] {
+        for (ack, single, admission) in [
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
             let mut state = LookupBatchState::new(Default::default(), &history).unwrap();
             state.record_ordinary(0.16, 16);
             let interrupt = AtomicBool::new(admission);
@@ -6027,7 +6051,9 @@ mod tests {
         // A new cohort can advance ordinary decode before Lookup gets another single-lane turn.
         state.observe_ordinary_token(9, true, false, 0, &interrupt);
         assert!(state.take_pending_proposal(3).is_none());
-        state.finish_ordinary_outputs(history.len(), &[8, 9, 2]).unwrap(); // EOS bypassed callback
+        state
+            .finish_ordinary_outputs(history.len(), &[8, 9, 2])
+            .unwrap(); // EOS bypassed callback
         assert_eq!(state.indexed_len, history.len() + 3);
         state.sync_history(&history); // rewind invalidates even a same-frontier cached proposal
         assert!(state.take_pending_proposal(3).is_none());

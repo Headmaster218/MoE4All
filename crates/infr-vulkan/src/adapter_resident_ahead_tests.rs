@@ -566,37 +566,70 @@ fn gpu_resident_copy_auto_lazy_init_after_multirow_and_verify() {
         losing.mtp_verify = verify;
         losing.independent_rows = !verify;
         if !verify {
-            losing.sequence_spans = (0..2).map(|row_start| SequenceSpan {
-                row_start, rows: 1, start_pos: row_start * 100,
-            }).collect();
+            losing.sequence_spans = (0..2)
+                .map(|row_start| SequenceSpan {
+                    row_start,
+                    rows: 1,
+                    start_pos: row_start * 100,
+                })
+                .collect();
         }
-        let inputs: Vec<_> = losing.ops.iter().filter_map(|op| match op {
-            Op::MoeFfn { x, .. } => Some(*x),
-            _ => None,
-        }).collect();
+        let inputs: Vec<_> = losing
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::MoeFfn { x, .. } => Some(*x),
+                _ => None,
+            })
+            .collect();
         for id in inputs {
             losing.tensors[id.0 as usize].desc = TensorDesc::new(vec![2, NE], DType::F32);
         }
         // Constructor-only probe: no mismatched fixture tensors are dispatched.
         let mut retained = None;
         let chunk = ResidentChunk::new(&fixture.backend, &losing, true, &mut retained)
-            .unwrap().expect("multirow graph retains ordinary recovery");
+            .unwrap()
+            .expect("multirow graph retains ordinary recovery");
         assert!(chunk.gpu_copy.is_none());
         drop(chunk);
         assert!(!retained.as_ref().unwrap().gpu_copy_init_attempted);
-        fixture.backend.runtime_phase.lock().unwrap().resident_buffers = retained;
+        fixture
+            .backend
+            .runtime_phase
+            .lock()
+            .unwrap()
+            .resident_buffers = retained;
 
         // The winning ordinary graph reuses common buffers, initializes copy, then prepares
         // and consumes a real resident packet with a forced miss and numerical comparison.
         fixture.run_case(1, true, Some(0));
         let mut phase = fixture.backend.runtime_phase.lock().unwrap();
-        let copy = phase.resident_buffers.as_ref().unwrap().gpu_copy.clone()
+        let copy = phase
+            .resident_buffers
+            .as_ref()
+            .unwrap()
+            .gpu_copy
+            .clone()
             .expect("ordinary graph must lazily allocate copy metadata");
-        let chunk = ResidentChunk::new(&fixture.backend, &losing, true, &mut phase.resident_buffers)
-            .unwrap().unwrap();
-        assert!(chunk.gpu_copy.is_none(), "warm copy cannot escape the graph policy");
+        let chunk =
+            ResidentChunk::new(&fixture.backend, &losing, true, &mut phase.resident_buffers)
+                .unwrap()
+                .unwrap();
+        assert!(
+            chunk.gpu_copy.is_none(),
+            "warm copy cannot escape the graph policy"
+        );
         drop(chunk);
-        assert!(Arc::ptr_eq(phase.resident_buffers.as_ref().unwrap().gpu_copy.as_ref().unwrap(), &copy));
+        assert!(Arc::ptr_eq(
+            phase
+                .resident_buffers
+                .as_ref()
+                .unwrap()
+                .gpu_copy
+                .as_ref()
+                .unwrap(),
+            &copy
+        ));
         drop(phase);
         fixture.run_case(1, true, Some(1));
     }

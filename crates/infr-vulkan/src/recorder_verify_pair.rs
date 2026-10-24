@@ -10,7 +10,8 @@ pub(crate) fn shared_iq2_verify_fusion_allowed(backend: &VulkanBackend) -> bool 
         return false;
     }
     if !verify_pair::shared_iq2_fusion_staged_policy(
-        true, cfg.gemv.id_grid_nr,
+        true,
+        cfg.gemv.id_grid_nr,
         native_id_sg_choice(infr_core::DType::Iq2S, 2560, 640, &cfg.gemv).is_some(),
         backend.use_paged_grid_buffer(2560, 640, 4),
     ) {
@@ -58,8 +59,13 @@ pub(crate) fn baseline_policy(
     let name = if cohort.shared_q8 {
         let name = crate::gemm::native_idm_paged_shared_build_spv(dtype)?.0;
         if verify_pair::shared_iq2_nr8_eligible(
-            cfg.verify_shared_iq2_nr8, cohort.verify && !cohort.independent_rows,
-            dtype, [rows, k, n], cohort.used, false, name,
+            cfg.verify_shared_iq2_nr8,
+            cohort.verify && !cohort.independent_rows,
+            dtype,
+            [rows, k, n],
+            cohort.used,
+            false,
+            name,
         ) {
             crate::gemm::native_idm_grid_nr_paged_shared_build_spv(dtype, 8)?.0
         } else {

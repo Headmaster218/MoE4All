@@ -310,7 +310,7 @@ mod fixtures {
         cfg.kernels.vulkan.gemv.id_grid_buffer = Some(false);
         cfg.kernels.vulkan.gemv.id_grid_nr = 8;
         // No copy buffer participates: the legacy CPU-promotion Verify path is independent.
-            cfg.kernels.vulkan.decode_gpu_resident_copy = Some(false);
+        cfg.kernels.vulkan.decode_gpu_resident_copy = Some(false);
         let backend = VulkanBackend::new_with(Arc::new(cfg)).unwrap();
         let event = Event(&backend, unsafe {
             backend
@@ -341,11 +341,8 @@ mod fixtures {
         }
         full_tape[EXPERTS * 2..EXPERTS * 2 + 40].fill(1);
         let tape = upload(&backend, bytemuck::cast_slice(&full_tape));
-        let ids_buffer = upload(&backend, &vec![0; 48]);
-        let control = upload(
-            &backend,
-            &vec![0; crate::recorder::RESIDENT_CONTROL_BYTES / 4],
-        );
+        let ids_buffer = upload(&backend, &[0; 48]);
+        let control = upload(&backend, &[0; crate::recorder::RESIDENT_CONTROL_BYTES / 4]);
         let journal = upload(&backend, &vec![0; crate::recorder::RESIDENT_JOURNAL_WORDS]);
         for shared in [false, true] {
             let cohort = cohort(shared);

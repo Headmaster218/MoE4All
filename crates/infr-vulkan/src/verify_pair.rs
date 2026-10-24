@@ -312,8 +312,10 @@ mod tests {
             for enabled in [false, true] {
                 for sg in [false, true] {
                     for buffer in [false, true] {
-                        assert_eq!(shared_iq2_fusion_staged_policy(enabled, nr, sg, buffer),
-                            enabled && nr == 8 && !sg && !buffer);
+                        assert_eq!(
+                            shared_iq2_fusion_staged_policy(enabled, nr, sg, buffer),
+                            enabled && nr == 8 && !sg && !buffer
+                        );
                     }
                 }
             }
@@ -326,30 +328,111 @@ mod tests {
         let eligible = |enabled, verify, dtype, shape, used, per_slot, name| {
             shared_iq2_nr8_eligible(enabled, verify, dtype, shape, used, per_slot, name)
         };
-        assert!(eligible(true, true, DType::Iq2S, [4, 2560, 640], 10, false, baseline));
-        assert!(!eligible(false, true, DType::Iq2S, [4, 2560, 640], 10, false, baseline));
+        assert!(eligible(
+            true,
+            true,
+            DType::Iq2S,
+            [4, 2560, 640],
+            10,
+            false,
+            baseline
+        ));
+        assert!(!eligible(
+            false,
+            true,
+            DType::Iq2S,
+            [4, 2560, 640],
+            10,
+            false,
+            baseline
+        ));
         // Ordinary and independent rows pass false, even when their dimensions match.
-        assert!(!eligible(true, false, DType::Iq2S, [4, 2560, 640], 10, false, baseline));
-        assert!(!eligible(true, true, DType::Iq3S, [4, 2560, 640], 10, false, baseline));
-        assert!(!eligible(true, true, DType::Iq2S, [4, 2560, 640], 8, false, baseline));
-        assert!(!eligible(true, true, DType::Iq2S, [4, 2560, 640], 10, true, baseline));
-        for shape in [[1, 2560, 640], [2, 2560, 640], [3, 2560, 640], [8, 2560, 640],
-            [4, 2048, 640], [4, 2560, 512], [4, 640, 2560]] {
-            assert!(!eligible(true, true, DType::Iq2S, shape, 10, false, baseline));
+        assert!(!eligible(
+            true,
+            false,
+            DType::Iq2S,
+            [4, 2560, 640],
+            10,
+            false,
+            baseline
+        ));
+        assert!(!eligible(
+            true,
+            true,
+            DType::Iq3S,
+            [4, 2560, 640],
+            10,
+            false,
+            baseline
+        ));
+        assert!(!eligible(
+            true,
+            true,
+            DType::Iq2S,
+            [4, 2560, 640],
+            8,
+            false,
+            baseline
+        ));
+        assert!(!eligible(
+            true,
+            true,
+            DType::Iq2S,
+            [4, 2560, 640],
+            10,
+            true,
+            baseline
+        ));
+        for shape in [
+            [1, 2560, 640],
+            [2, 2560, 640],
+            [3, 2560, 640],
+            [8, 2560, 640],
+            [4, 2048, 640],
+            [4, 2560, 512],
+            [4, 640, 2560],
+        ] {
+            assert!(!eligible(
+                true,
+                true,
+                DType::Iq2S,
+                shape,
+                10,
+                false,
+                baseline
+            ));
         }
-        for name in ["native_idm_iq2s_buffer_paged_shexp",
-            "native_idm_iq2s_buffer_nr8_paged_shexp", "native_idm_iq2s_sg8_paged_shexp",
-            "native_idm_iq2s_nr8_paged_shexp", "native_idm_iq2s_paged"] {
-            assert!(!eligible(true, true, DType::Iq2S, [4, 2560, 640], 10, false, name));
+        for name in [
+            "native_idm_iq2s_buffer_paged_shexp",
+            "native_idm_iq2s_buffer_nr8_paged_shexp",
+            "native_idm_iq2s_sg8_paged_shexp",
+            "native_idm_iq2s_nr8_paged_shexp",
+            "native_idm_iq2s_paged",
+        ] {
+            assert!(!eligible(
+                true,
+                true,
+                DType::Iq2S,
+                [4, 2560, 640],
+                10,
+                false,
+                name
+            ));
         }
     }
 
     #[test]
     fn shared_iq2_nr8_spv_getter_does_not_expand_other_variants() {
-        for (dtype, nr) in [(DType::Iq2S, 1), (DType::Iq2S, 4), (DType::Iq3S, 8), (DType::Iq4Nl, 8)] {
+        for (dtype, nr) in [
+            (DType::Iq2S, 1),
+            (DType::Iq2S, 4),
+            (DType::Iq3S, 8),
+            (DType::Iq4Nl, 8),
+        ] {
             assert!(crate::gemm::native_idm_grid_nr_paged_shared_build_spv(dtype, nr).is_none());
         }
-        let (name, words) = crate::gemm::native_idm_grid_nr_paged_shared_build_spv(DType::Iq2S, 8).unwrap();
+        let (name, words) =
+            crate::gemm::native_idm_grid_nr_paged_shared_build_spv(DType::Iq2S, 8).unwrap();
         assert_eq!(name, "native_idm_iq2s_nr8_paged_shexp");
         assert_eq!(words.first().copied(), Some(0x0723_0203));
     }

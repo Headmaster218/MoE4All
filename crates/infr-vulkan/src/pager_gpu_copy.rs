@@ -16,11 +16,11 @@ pub(crate) fn completed_copies() -> (u64, u64) {
 }
 
 #[cfg(test)]
-#[path = "pager_gpu_copy_tests.rs"]
-mod tests;
-#[cfg(test)]
 #[path = "pager_gpu_copy_overlap_tests.rs"]
 mod overlap_tests;
+#[cfg(test)]
+#[path = "pager_gpu_copy_tests.rs"]
+mod tests;
 const JOB_COUNT_WORD: usize = crate::recorder::RESIDENT_JOURNAL_JOB_COUNT_WORD;
 
 pub(crate) struct GpuCopySources {
@@ -234,7 +234,8 @@ impl GpuCopyBuffers {
         let overlay = alloc(inputs.words.len() * 4)?;
         let jobs = alloc(layers * JOBS_PER_LAYER * JOB_WORDS * 4)?;
         let miss_predicates = if be_.cfg().kernels.vulkan.decode_gpu_resident_copy_overlap {
-            match be_.alloc_mapped_predicate(layers * crate::recorder::GPU_COPY_PREDICATE_WORDS * 4) {
+            match be_.alloc_mapped_predicate(layers * crate::recorder::GPU_COPY_PREDICATE_WORDS * 4)
+            {
                 Ok(buffer) => Some(Arc::from(buffer)),
                 Err(error) => {
                     tracing::warn!(%error, "GPU copy overlap predicates unavailable; retaining serial copy");
@@ -253,7 +254,8 @@ impl GpuCopyBuffers {
         let wide_copy = properties.limits.max_compute_work_group_invocations >= 1024
             && properties.limits.max_compute_work_group_size[0] >= 1024;
         let copy_groups = effective_copy_groups(
-            be_.cfg().kernels.vulkan.decode_gpu_resident_copy_groups, wide_copy,
+            be_.cfg().kernels.vulkan.decode_gpu_resident_copy_groups,
+            wide_copy,
         );
         Ok(Some(Arc::new(Self {
             sources,
@@ -285,7 +287,11 @@ impl GpuCopyBuffers {
         for (pool_index, pool) in session.pools.iter().enumerate() {
             let start = pool_index * CANDIDATES_PER_POOL;
             let mut count = 0;
-            let budget = CANDIDATES_PER_POOL.min(pool.pager.enabled_slots().saturating_sub(pool.min_enabled_slots));
+            let budget = CANDIDATES_PER_POOL.min(
+                pool.pager
+                    .enabled_slots()
+                    .saturating_sub(pool.min_enabled_slots),
+            );
             for (owner, slot) in pool.pager.pager.replacement_slots() {
                 if count >= budget {
                     break;
@@ -333,11 +339,14 @@ impl GpuCopyBuffers {
         publish: impl FnOnce(&mut MoePagerSession) -> Result<T>,
     ) -> Result<T> {
         if !session.frozen_lut_slots.is_empty()
-            || session.resident_lut_cache.as_ref().is_some_and(|cache| {
-                cache.frozen.iter().flatten().any(|&frozen| frozen != 0)
-            })
+            || session
+                .resident_lut_cache
+                .as_ref()
+                .is_some_and(|cache| cache.frozen.iter().flatten().any(|&frozen| frozen != 0))
         {
-            return Err(be("prepared GPU copy activation requires drained LUT windows"));
+            return Err(be(
+                "prepared GPU copy activation requires drained LUT windows",
+            ));
         }
         let token = self.begin_epoch(session)?;
         let mut activation = PreparedCopyActivation {
@@ -512,7 +521,15 @@ mod prepared_tests {
         assert_eq!(effective_copy_groups(0, true), 8);
         assert_eq!(effective_copy_groups(0, false), 8);
         for wide in [false, true] {
-            for (requested, expected) in [(1, 1), (2, 2), (3, 3), (4, 4), (8, 8), (9, 8), (usize::MAX, 8)] {
+            for (requested, expected) in [
+                (1, 1),
+                (2, 2),
+                (3, 3),
+                (4, 4),
+                (8, 8),
+                (9, 8),
+                (usize::MAX, 8),
+            ] {
                 assert_eq!(effective_copy_groups(requested, wide), expected);
             }
         }
@@ -650,39 +667,50 @@ mod prepared_tests {
     #[ignore = "requires an explicitly selected idle Vulkan GPU; activation metadata only"]
     fn prepared_copy_activation_success_discard_and_failure() {
         let mut cfg = infr_core::config::Config::default();
-        cfg.device.dev = Some(std::env::var("MOE4ALL_TEST_DEVICE").expect("select the test GPU explicitly"));
+        cfg.device.dev =
+            Some(std::env::var("MOE4ALL_TEST_DEVICE").expect("select the test GPU explicitly"));
         cfg.kernels.vulkan.decode_gpu_resident_fast_lut = true;
         let be_ = VulkanBackend::new_with(Arc::new(cfg)).unwrap();
         const POOL_SLOTS: usize = 64; // 4 MiB physical arena, including the runtime reserve.
-        let session = MoePagerSession::new(&be_, MoePagerLayout {
-            load_reserve_bytes: 0,
-            n_blocks: 4,
-            pools: vec![MoePoolSpec {
-                slot_bytes: 64 * 1024,
-                n_slots: POOL_SLOTS,
-                min_enabled_slots: 1,
-            }],
-            host_tier: None,
-            host_store_io: None,
-            dynamic_state_reserve_bytes: 0,
-            dynamic_state_max_allocation_bytes: 0,
-            prefill_min_lane_bytes: 0,
-            runtime_reserve_bytes: 1024 * 1024,
-            host_chunks: vec![MoeHostChunkSpec {
-                base_offset: 0,
-                bytes: 64 * 1024,
-            }],
-            prefill_target_lanes: 1,
-            prefill_cache_bytes: 2 * 1024 * 1024,
-        }).unwrap();
+        let session = MoePagerSession::new(
+            &be_,
+            MoePagerLayout {
+                load_reserve_bytes: 0,
+                n_blocks: 4,
+                pools: vec![MoePoolSpec {
+                    slot_bytes: 64 * 1024,
+                    n_slots: POOL_SLOTS,
+                    min_enabled_slots: 1,
+                }],
+                host_tier: None,
+                host_store_io: None,
+                dynamic_state_reserve_bytes: 0,
+                dynamic_state_max_allocation_bytes: 0,
+                prefill_min_lane_bytes: 0,
+                runtime_reserve_bytes: 1024 * 1024,
+                host_chunks: vec![MoeHostChunkSpec {
+                    base_offset: 0,
+                    bytes: 64 * 1024,
+                }],
+                prefill_target_lanes: 1,
+                prefill_cache_bytes: 2 * 1024 * 1024,
+            },
+        )
+        .unwrap();
         assert!(session.resident_lut_cache.is_some());
         // Metadata claims retire Expert filler through the backend's installed pager.
         *be_.moe_pager().lock().unwrap() = Some(session);
-        let copy = GpuCopyBuffers::new(&be_, GpuCopySources {
-            words: vec![0; 4 * 3 * 4],
-            keepalive: Vec::new(),
-            pools: 1,
-        }, 2).unwrap().unwrap();
+        let copy = GpuCopyBuffers::new(
+            &be_,
+            GpuCopySources {
+                words: vec![0; 4 * 3 * 4],
+                keepalive: Vec::new(),
+                pools: 1,
+            },
+            2,
+        )
+        .unwrap()
+        .unwrap();
         let mut session = be_.moe_pager().lock().unwrap().take().unwrap();
 
         drop(Arc::clone(&copy));
@@ -695,8 +723,13 @@ mod prepared_tests {
         assert!(failed.is_err());
         assert!(!copy.epoch.lock().unwrap().armed);
         assert!(session.frozen_lut_slots.is_empty());
-        assert!(session.resident_lut_cache.as_ref().unwrap().frozen[0].iter().all(|&v| v == 0));
-        assert_eq!(session.pools[0].pager.lut_host, owners, "unsubmitted rollback must not evict");
+        assert!(session.resident_lut_cache.as_ref().unwrap().frozen[0]
+            .iter()
+            .all(|&v| v == 0));
+        assert_eq!(
+            session.pools[0].pager.lut_host, owners,
+            "unsubmitted rollback must not evict"
+        );
 
         copy.activate_prepared(&mut session, |_| Ok(())).unwrap();
         {
@@ -712,7 +745,8 @@ mod prepared_tests {
                 assert_ne!(candidate.address, 0);
             }
             let words = candidate_words(&epoch.candidates);
-            assert!(words[valid * 4..].chunks_exact(4)
+            assert!(words[valid * 4..]
+                .chunks_exact(4)
                 .all(|word| word == [0, 0, NOT_RESIDENT, 1]));
             assert_eq!(session.frozen_lut_slots.len(), valid);
         }
@@ -729,9 +763,8 @@ mod prepared_tests {
         session.clear_frozen_lut_slots();
 
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _: Result<()> = copy.activate_prepared(&mut session, |_| {
-                panic!("injected activation unwind")
-            });
+            let _: Result<()> =
+                copy.activate_prepared(&mut session, |_| panic!("injected activation unwind"));
         }));
         assert!(panicked.is_err());
         assert!(!copy.epoch.lock().unwrap().armed);

@@ -609,8 +609,13 @@ impl SessionTransferPlan {
 
     pub(crate) fn imported_device_source(&self, src: &[u8]) -> Option<(Arc<dyn Buffer>, u64)> {
         let ranges = self.imported_ranges(src)?;
-        let [range] = ranges.as_slice() else { return None };
-        let address = range.buffer.device_addr()?.checked_add(range.offset as u64)?;
+        let [range] = ranges.as_slice() else {
+            return None;
+        };
+        let address = range
+            .buffer
+            .device_addr()?
+            .checked_add(range.offset as u64)?;
         (address.is_multiple_of(16) && src.len().is_multiple_of(16))
             .then(|| (Arc::clone(&range.buffer), address))
     }

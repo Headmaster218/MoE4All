@@ -1018,12 +1018,20 @@ mod tests {
     #[test]
     fn replacement_slots_are_bounded_read_only_and_skip_explicit_pins() {
         let mut pager = Pager::new(6);
-        for id in 10..14 { pager.touch(id); }
+        for id in 10..14 {
+            pager.touch(id);
+        }
         pager.disable_slot(5);
         pager.repin(11).unwrap();
         let before = admission_state(&pager);
-        assert_eq!(pager.replacement_slots().take(2).collect::<Vec<_>>(), vec![(None,4),(Some(10),0)]);
-        assert_eq!(pager.replacement_slots().collect::<Vec<_>>(), vec![(None,4),(Some(10),0),(Some(12),2),(Some(13),3)]);
+        assert_eq!(
+            pager.replacement_slots().take(2).collect::<Vec<_>>(),
+            vec![(None, 4), (Some(10), 0)]
+        );
+        assert_eq!(
+            pager.replacement_slots().collect::<Vec<_>>(),
+            vec![(None, 4), (Some(10), 0), (Some(12), 2), (Some(13), 3)]
+        );
         assert_eq!(admission_state(&pager), before);
     }
 

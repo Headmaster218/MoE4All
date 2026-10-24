@@ -32,7 +32,7 @@ fn overlap_copy_contract_with_groups(groups: usize) {
     let mut cfg = infr_core::config::Config::default();
     cfg.device.dev =
         Some(std::env::var("MOE4ALL_TEST_DEVICE").expect("select the test GPU explicitly"));
-        cfg.kernels.vulkan.decode_gpu_resident_copy = Some(true);
+    cfg.kernels.vulkan.decode_gpu_resident_copy = Some(true);
     cfg.kernels.vulkan.decode_gpu_resident_copy_groups = groups;
     cfg.kernels.vulkan.decode_gpu_resident_copy_overlap = true;
     let be = VulkanBackend::new_with(Arc::new(cfg)).unwrap();

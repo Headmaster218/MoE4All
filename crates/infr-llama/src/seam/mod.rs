@@ -7692,7 +7692,11 @@ mod seam_helper_tests {
                 for lookup in [false, true] {
                     ec.spec.mtp = mtp;
                     ec.spec.lookup = lookup;
-                    assert_eq!(super::detached_mtp_enabled(&cfg, &ec), mtp && detached, "{name}");
+                    assert_eq!(
+                        super::detached_mtp_enabled(&cfg, &ec),
+                        mtp && detached,
+                        "{name}"
+                    );
                     assert_eq!(
                         super::target_verify_enabled(&cfg, &ec),
                         lookup || (mtp && detached),

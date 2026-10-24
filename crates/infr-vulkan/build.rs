@@ -1155,17 +1155,63 @@ fn main() {
         ("gpu_resident_check", "gpu_resident_check", &[]),
         ("gpu_resident_dispatch", "gpu_resident_dispatch", &[]),
         ("gpu_resident_hit_check", "gpu_resident_hit_check", &[]),
-        ("gpu_resident_hit_check_pair", "gpu_resident_hit_check_pair", &[]),
-        ("gpu_resident_copy_prepare", "gpu_resident_copy_prepare", &[]),
-        ("gpu_resident_copy_prepare", "gpu_resident_copy_prepare_pair", &["-DVERIFY_PAIR"]),
-        ("native_gemv_id_verify_pair", "verify_pair_iq2s_nr8", &["-DPAGED", "-DUSE_GRID", "-DFMT_IQ2S", "-DNR=8"]),
-        ("native_gemv_id_verify_pair", "verify_pair_iq3s_nr1", &["-DPAGED", "-DUSE_GRID", "-DFMT_IQ3S", "-DNR=1"]),
-        ("native_gemv_id_verify_pair", "verify_pair_iq3s_nr1_shared", &["-DPAGED", "-DUSE_GRID", "-DFMT_IQ3S", "-DNR=1", "-DSHARED_Q8"]),
-        ("gpu_resident_copy_prepare", "gpu_resident_copy_prepare_overlap", &["-DCOPY_OVERLAP"]),
-        ("gpu_resident_copy_payload", "gpu_resident_copy_payload", &[]),
-        ("gpu_resident_copy_payload", "gpu_resident_copy_payload1024", &["-DCOPY_LOCAL=1024"]),
+        (
+            "gpu_resident_hit_check_pair",
+            "gpu_resident_hit_check_pair",
+            &[],
+        ),
+        (
+            "gpu_resident_copy_prepare",
+            "gpu_resident_copy_prepare",
+            &[],
+        ),
+        (
+            "gpu_resident_copy_prepare",
+            "gpu_resident_copy_prepare_pair",
+            &["-DVERIFY_PAIR"],
+        ),
+        (
+            "native_gemv_id_verify_pair",
+            "verify_pair_iq2s_nr8",
+            &["-DPAGED", "-DUSE_GRID", "-DFMT_IQ2S", "-DNR=8"],
+        ),
+        (
+            "native_gemv_id_verify_pair",
+            "verify_pair_iq3s_nr1",
+            &["-DPAGED", "-DUSE_GRID", "-DFMT_IQ3S", "-DNR=1"],
+        ),
+        (
+            "native_gemv_id_verify_pair",
+            "verify_pair_iq3s_nr1_shared",
+            &[
+                "-DPAGED",
+                "-DUSE_GRID",
+                "-DFMT_IQ3S",
+                "-DNR=1",
+                "-DSHARED_Q8",
+            ],
+        ),
+        (
+            "gpu_resident_copy_prepare",
+            "gpu_resident_copy_prepare_overlap",
+            &["-DCOPY_OVERLAP"],
+        ),
+        (
+            "gpu_resident_copy_payload",
+            "gpu_resident_copy_payload",
+            &[],
+        ),
+        (
+            "gpu_resident_copy_payload",
+            "gpu_resident_copy_payload1024",
+            &["-DCOPY_LOCAL=1024"],
+        ),
         ("gpu_resident_silu", "gpu_resident_silu", &[]),
-        ("gpu_resident_silu", "gpu_resident_silu_misses", &["-DMOE_MASK_MISSES"]),
+        (
+            "gpu_resident_silu",
+            "gpu_resident_silu_misses",
+            &["-DMOE_MASK_MISSES"],
+        ),
         ("zero_words", "zero_words", &[]),
         ("mul_sigmoid", "mul_sigmoid", &[]),
         ("add", "add", &[]),
@@ -2279,7 +2325,13 @@ fn main() {
         (
             "native_gemv_id_multi",
             "native_idm_iq2s_nr8_paged_shexp",
-            &["-DFMT_IQ2S", "-DUSE_GRID", "-DPAGED", "-DSHARED_Q8", "-DNR=8"],
+            &[
+                "-DFMT_IQ2S",
+                "-DUSE_GRID",
+                "-DPAGED",
+                "-DSHARED_Q8",
+                "-DNR=8",
+            ],
         ),
         (
             "native_gemv_id_multi",
@@ -4614,9 +4666,12 @@ fn main() {
         for d in defines {
             args.push(d.clone());
         }
-        if src_stem == "gpu_resident_check" || src_stem == "gpu_resident_hit_check"
+        if src_stem == "gpu_resident_check"
+            || src_stem == "gpu_resident_hit_check"
             || src_stem == "gpu_resident_hit_check_pair"
-            || src_stem == "gpu_resident_copy_prepare" || src_stem == "gpu_resident_copy_payload" {
+            || src_stem == "gpu_resident_copy_prepare"
+            || src_stem == "gpu_resident_copy_payload"
+        {
             args.push(format!(
                 "-DINFR_MAX_DECODE_ROWS={}",
                 infr_core::backend::MAX_DECODE_ROWS

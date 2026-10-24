@@ -350,7 +350,10 @@ fn gpu_copy_auto_policy_preserves_explicit_on_off_layers() {
     }
     let cfg = Config::load_from_layers(&[
         file_layer("[kernels.vulkan]\ndecode_gpu_resident_copy=true\nverify_pair=true\n"),
-        cli_layer(&["kernels.vulkan.decode_gpu_resident_copy=false", "kernels.vulkan.verify_pair=false"]),
+        cli_layer(&[
+            "kernels.vulkan.decode_gpu_resident_copy=false",
+            "kernels.vulkan.verify_pair=false",
+        ]),
     ]);
     assert_eq!(cfg.kernels.vulkan.decode_gpu_resident_copy, Some(false));
     assert!(!cfg.kernels.vulkan.verify_pair);
@@ -370,7 +373,8 @@ fn gpu_copy_groups_config_accepts_auto_and_explicit_ab_values() {
     }
     for value in ["-1", "1.5", "invalid"] {
         assert!(PartialConfig::default()
-            .set_path("kernels.vulkan.decode_gpu_resident_copy_groups", value).is_err());
+            .set_path("kernels.vulkan.decode_gpu_resident_copy_groups", value)
+            .is_err());
     }
 }
 

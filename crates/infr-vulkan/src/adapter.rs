@@ -25,22 +25,22 @@ use crate::recorder::RecordedCmd;
 
 #[path = "adapter_prefix.rs"]
 mod command_prefix;
-#[path = "verify_pair.rs"]
-pub(crate) mod verify_pair;
-#[path = "adapter_verify_pair.rs"]
-mod pair_admission;
+#[cfg(test)]
+#[path = "adapter_copy_policy_tests.rs"]
+mod copy_policy_tests;
 #[cfg(test)]
 #[path = "adapter_deferred_prepare_tests.rs"]
 mod deferred_prepare_tests;
+#[path = "adapter_verify_pair.rs"]
+mod pair_admission;
 #[cfg(test)]
 #[path = "adapter_resident_ahead_tests.rs"]
 mod resident_ahead_tests;
 #[cfg(test)]
 #[path = "adapter_serial_copy_recovery_tests.rs"]
 mod serial_copy_recovery_tests;
-#[cfg(test)]
-#[path = "adapter_copy_policy_tests.rs"]
-mod copy_policy_tests;
+#[path = "verify_pair.rs"]
+pub(crate) mod verify_pair;
 pub(crate) use command_prefix::preparing_commands;
 pub(crate) use command_prefix::supported as command_recording_supported;
 use command_prefix::PreparedPrefix;
@@ -515,7 +515,8 @@ fn resident_mtp_bindings_supported(
             up_exps,
             down_exps,
             ..
-        } = op else {
+        } = op
+        else {
             return true;
         };
         saw_moe = true;
@@ -526,9 +527,9 @@ fn resident_mtp_bindings_supported(
         ]
         .into_iter()
         .all(|(role, id)| {
-            resolve(scratch, bindings, id).ok().is_some_and(|buffer| {
-                is_paged(role, crate::pager::buffer_identity(buffer))
-            })
+            resolve(scratch, bindings, id)
+                .ok()
+                .is_some_and(|buffer| is_paged(role, crate::pager::buffer_identity(buffer)))
         })
     }) && saw_moe
 }
@@ -544,7 +545,9 @@ fn resident_mtp_graph_supported(
     }
     let pager = be_.moe_pager().lock().unwrap();
     resident_mtp_bindings_supported(true, graph, scratch, bindings, |role, id| {
-        pager.as_ref().is_some_and(|session| session.is_paged(role, id))
+        pager
+            .as_ref()
+            .is_some_and(|session| session.is_paged(role, id))
     })
 }
 
@@ -1689,12 +1692,7 @@ fn paged_qsa_scratch_requests(graph: &Graph) -> Result<Vec<(&'static str, usize)
     Ok(requests)
 }
 
-fn paged_mmq_selected(
-    graph: &Graph,
-    op: &Op,
-    small_m_threshold: usize,
-    i8_dot: bool,
-) -> bool {
+fn paged_mmq_selected(graph: &Graph, op: &Op, small_m_threshold: usize, i8_dot: bool) -> bool {
     let Op::MoeFfn {
         x,
         gate_exps,
@@ -1760,7 +1758,8 @@ fn paged_mmq_scratch_requests(
         n_used,
         n_ff_exp,
         ..
-    } = op else {
+    } = op
+    else {
         return None;
     };
     let (ne, n_expert, n_used, nff) = (
@@ -10647,7 +10646,12 @@ fn execute_static_inner(
     let (scratch, pool, resident_buffers, pair_windows) = match phase_arena.as_mut() {
         Some(arena) => {
             let arena = &mut **arena;
-            (&arena.scratch, &mut arena.pool, &mut arena.resident_buffers, &mut arena.verify_pairs)
+            (
+                &arena.scratch,
+                &mut arena.pool,
+                &mut arena.resident_buffers,
+                &mut arena.verify_pairs,
+            )
         }
         None => (
             local_scratch
@@ -10673,15 +10677,27 @@ fn execute_static_inner(
         .take()
         .filter(|_| resident_banks_supported);
     let prepared_copy_requested = pending_prefix.as_ref().is_some_and(|_| {
-        resident_graph_layouts(be_, graph, be_.moe_paged() && resident_banks_supported)
-            .is_some_and(|layouts| resident_copy_requested(
-                be_.cfg().kernels.vulkan.decode_gpu_resident_copy, graph, &layouts))
+        resident_graph_layouts(be_, graph, be_.moe_paged() && resident_banks_supported).is_some_and(
+            |layouts| {
+                resident_copy_requested(
+                    be_.cfg().kernels.vulkan.decode_gpu_resident_copy,
+                    graph,
+                    &layouts,
+                )
+            },
+        )
     });
-    let limit = be_.cfg().kernels.vulkan.decode_gpu_resident_layers
+    let limit = be_
+        .cfg()
+        .kernels
+        .vulkan
+        .decode_gpu_resident_layers
         .clamp(1, crate::recorder::RESIDENT_MAX_LAYERS);
     // A newly eligible graph must initialize before ACK can publish/freeze a prepared LUT.
     let prefix_copy_ready = !prepared_copy_requested
-        || resident_buffers.as_ref().is_some_and(|buffers| buffers.capacity >= limit);
+        || resident_buffers
+            .as_ref()
+            .is_some_and(|buffers| buffers.capacity >= limit);
     if pending_prefix.is_some() && prefix_copy_ready {
         if let Some(buffers) = resident_buffers.as_mut() {
             buffers.ensure_gpu_copy(be_, prepared_copy_requested)?;
@@ -10690,7 +10706,14 @@ fn execute_static_inner(
     let prepared = pending_prefix
         .filter(|_| prefix_copy_ready)
         .and_then(|prefix| {
-            prefix.take_if_valid(be_, scratch, pool, bindings, resident_buffers.as_ref(), prepared_copy_requested)
+            prefix.take_if_valid(
+                be_,
+                scratch,
+                pool,
+                bindings,
+                resident_buffers.as_ref(),
+                prepared_copy_requested,
+            )
         });
     let prepared_end = prepared.as_ref().map_or(0, |prefix| prefix.end);
     let prepared_tape_words = prepared.as_ref().map_or(0, |prefix| prefix.tape_words);
@@ -10814,12 +10837,16 @@ fn execute_static_inner(
     // This escape hatch is execute-scoped, not per-op. Most ops cannot be a shared-expert tail;
     // checking the process environment for each of them dominated the scan on Windows.
     let shared_slot_disabled = std::env::var_os("INFR_NO_MOE_SHARED_SLOT").is_some();
-    let allow_verify_iq2_nr8 = graph.mtp_verify && !graph.independent_rows
+    let allow_verify_iq2_nr8 = graph.mtp_verify
+        && !graph.independent_rows
         && crate::recorder::shared_iq2_verify_fusion_allowed(be_);
-    for (op_idx, shared) in paged_moe_shared_candidates_with_policy(
-        graph, shared_slot_disabled, allow_verify_iq2_nr8,
-    ) {
-        let Op::MoeFfn { x, ne, gate_exps, .. } = &graph.ops[op_idx] else {
+    for (op_idx, shared) in
+        paged_moe_shared_candidates_with_policy(graph, shared_slot_disabled, allow_verify_iq2_nr8)
+    {
+        let Op::MoeFfn {
+            x, ne, gate_exps, ..
+        } = &graph.ops[op_idx]
+        else {
             unreachable!();
         };
         let gbuf = resolve(scratch, bindings, *gate_exps)?;
@@ -10841,7 +10868,8 @@ fn execute_static_inner(
                     );
                 }
                 #[cfg(test)]
-                shared_verify_contract::ADMISSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                shared_verify_contract::ADMISSIONS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             paged_moe_shared.insert(op_idx, shared);
             skip_op.extend(op_idx + 1..op_idx + 7);
@@ -10954,9 +10982,17 @@ fn execute_static_inner(
             ResidentChunk::new(be_, graph, resident_paged_moe, resident_buffers)?
         }
     };
-    if resident_chunk.as_ref().is_some_and(|chunk| chunk.notices.is_some()) {
+    if resident_chunk
+        .as_ref()
+        .is_some_and(|chunk| chunk.notices.is_some())
+    {
         // Lease warm sidecars unchanged; only cold keys allocate before candidate freeze.
-        pstream.verify_pairs = match pair_admission::allocate(be_, graph, &paged_moe_shared, pair_windows) {
+        pstream.verify_pairs = match pair_admission::allocate(
+            be_,
+            graph,
+            &paged_moe_shared,
+            pair_windows,
+        ) {
             Ok(pairs) => pairs,
             Err(error) => {
                 tracing::warn!(%error, "VERIFY pair metadata unavailable; retaining baseline kernels");
@@ -11043,12 +11079,17 @@ fn execute_static_inner(
             }
             let layouts = resident_graph_layouts(be_, &next_plan.graph, be_.moe_paged())?;
             let copy_requested = resident_copy_requested(
-                be_.cfg().kernels.vulkan.decode_gpu_resident_copy, &next_plan.graph, &layouts);
+                be_.cfg().kernels.vulkan.decode_gpu_resident_copy,
+                &next_plan.graph,
+                &layouts,
+            );
             let mut snapshot = resident_chunk
                 .as_ref()
                 .and_then(ResidentChunk::preparation_snapshot)?;
-            snapshot.gpu_copy = resident_buffers.as_ref()?
-                .selected_gpu_copy(copy_requested).cloned();
+            snapshot.gpu_copy = resident_buffers
+                .as_ref()?
+                .selected_gpu_copy(copy_requested)
+                .cloned();
             Some(snapshot)
         })
         .flatten();
@@ -11549,7 +11590,9 @@ fn execute_static_inner(
         drop(rec.take());
         match result {
             Ok(result) => {
-                if result.is_err() { pair_windows.clear(); }
+                if result.is_err() {
+                    pair_windows.clear();
+                }
                 result
             }
             Err(panic) => {
@@ -11893,10 +11936,16 @@ fn resident_copy_requested(
         return false;
     }
     match policy {
-        None => !graph.mtp_verify && !graph.independent_rows
-            && layouts.iter().all(|layout| layout.rows == 1),
-        Some(true) => !graph.mtp_verify || (!graph.independent_rows
-            && layouts.iter().all(|layout| (2..=4).contains(&layout.rows))),
+        None => {
+            !graph.mtp_verify
+                && !graph.independent_rows
+                && layouts.iter().all(|layout| layout.rows == 1)
+        }
+        Some(true) => {
+            !graph.mtp_verify
+                || (!graph.independent_rows
+                    && layouts.iter().all(|layout| (2..=4).contains(&layout.rows)))
+        }
         Some(false) => false,
     }
 }
@@ -11907,13 +11956,19 @@ fn resident_graph_layouts(
     resident_paged_moe: bool,
 ) -> Option<Vec<ResidentMoeLayout>> {
     let cfg = &be_.cfg().kernels.vulkan;
-    let layouts = graph.ops.iter()
+    let layouts = graph
+        .ops
+        .iter()
         .filter(|op| matches!(op, Op::MoeFfn { .. }))
         .map(|op| ResidentMoeLayout::from_op(graph, op))
         .collect::<Option<Vec<_>>>()?;
     let rows_supported = if graph.mtp_verify {
         !graph.independent_rows
-            && resident_verify_scratch_supported(graph, moe_small_m_threshold(be_), be_.caps().i8_dot)
+            && resident_verify_scratch_supported(
+                graph,
+                moe_small_m_threshold(be_),
+                be_.caps().i8_dot,
+            )
     } else {
         decode_token_rows(graph).is_some_and(|rows| {
             (1..=crate::GPU_RESIDENT_MAX_ROWS).contains(&rows)
@@ -11929,7 +11984,8 @@ fn resident_graph_layouts(
         && !be_.cfg().paging.expert_prefetch
         && cfg.cpu_miss_threads == 0
         && rows_supported
-        && (layouts.len() > 1 || (graph.mtp_verify && layouts.len() == 1))).then_some(layouts)
+        && (layouts.len() > 1 || (graph.mtp_verify && layouts.len() == 1)))
+        .then_some(layouts)
 }
 
 impl ResidentBuffers {
@@ -11951,11 +12007,15 @@ impl ResidentBuffers {
 
     fn ensure_gpu_copy(&mut self, be_: &VulkanBackend, requested: bool) -> Result<()> {
         let cfg = &be_.cfg().kernels.vulkan;
-        let enabled = requested && cfg.decode_gpu_resident_hit_first
-            && cfg.decode_gpu_resident_notice_thread && !preparing_commands()
-            && self.notices.is_some() && self.producer.is_some()
+        let enabled = requested
+            && cfg.decode_gpu_resident_hit_first
+            && cfg.decode_gpu_resident_notice_thread
+            && !preparing_commands()
+            && self.notices.is_some()
+            && self.producer.is_some()
             && be_.background_expert_transfer_executor().is_some()
-            && be_.shared.caps.buffer_device_address && self.indirect.is_none();
+            && be_.shared.caps.buffer_device_address
+            && self.indirect.is_none();
         self.ensure_gpu_copy_with(enabled, |capacity| {
             let inputs = {
                 let pager = be_.moe_pager().lock().unwrap();
@@ -12213,9 +12273,15 @@ impl ResidentNoticeProducer {
                 let copy = gpu_copy.ok_or_else(|| be("GPU copy notice has no epoch owner"))?;
                 let mut guard = pager.lock().map_err(|_| be("GPU copy pager poisoned"))?;
                 let session = guard.as_mut().ok_or_else(|| be("GPU copy pager missing"))?;
-                copy.replay(session, ordinal, &entry.roles, &words[..entry.layout.count()],
+                copy.replay(
+                    session,
+                    ordinal,
+                    &entry.roles,
+                    &words[..entry.layout.count()],
                     &words[crate::recorder::RESIDENT_JOURNAL_MASK_WORD..][..entry.layout.rows],
-                    entry.layout.n_used, &words)?;
+                    entry.layout.n_used,
+                    &words,
+                )?;
             }
             1 => {
                 let _lru = ResidentProducerTrace::begin("resident_producer_lru", trace_context);
@@ -12354,7 +12420,9 @@ impl Drop for ResidentChunk {
         if let Some(copy) = &self.gpu_copy {
             if let Some(producer) = &self.producer {
                 if let Ok(mut pager) = producer.pager.lock() {
-                    if let Some(session) = pager.as_mut() { copy.abort(session); }
+                    if let Some(session) = pager.as_mut() {
+                        copy.abort(session);
+                    }
                 }
             }
         }
@@ -12576,7 +12644,8 @@ impl ResidentChunk {
         let Some(resident_layouts) = resident_graph_layouts(be_, graph, resident_paged_moe) else {
             return Ok(None);
         };
-        let copy_requested = resident_copy_requested(cfg.decode_gpu_resident_copy, graph, &resident_layouts);
+        let copy_requested =
+            resident_copy_requested(cfg.decode_gpu_resident_copy, graph, &resident_layouts);
         let submit_layers = match cfg.decode_gpu_resident_submit_layers {
             0 => graph.resident_submit_layers.unwrap_or(1),
             explicit => explicit,
@@ -13102,7 +13171,9 @@ impl ResidentChunk {
         self.notice_cursor = 0;
         self.notices_sent = 0;
         self.notice_stop = false;
-        if let Some(copy) = &self.gpu_copy { copy.complete(); }
+        if let Some(copy) = &self.gpu_copy {
+            copy.complete();
+        }
         if let Some(producer) = &self.producer {
             producer.reset_after_drain();
         }
@@ -13187,7 +13258,9 @@ impl ResidentChunk {
         self.notice_cursor = 0;
         self.notices_sent = 0;
         self.notice_stop = false;
-        if let Some(copy) = &self.gpu_copy { copy.complete(); }
+        if let Some(copy) = &self.gpu_copy {
+            copy.complete();
+        }
         if let Some(producer) = &self.producer {
             producer.reset_after_drain();
         }
@@ -14029,7 +14102,8 @@ fn paged_moe_shared_candidates_with_policy(
         if disabled || !matches!(op, Op::MoeFfn { .. }) {
             return None;
         }
-        paged_moe_shared_at_with_policy(graph, idx, allow_verify_iq2_nr8).map(|shared| (idx, shared))
+        paged_moe_shared_at_with_policy(graph, idx, allow_verify_iq2_nr8)
+            .map(|shared| (idx, shared))
     })
 }
 
@@ -14098,14 +14172,20 @@ fn paged_moe_shared_at_with_policy(
         )
     };
     let verify_iq2_nr8 = allow_verify_iq2_nr8
-        && graph.mtp_verify && !graph.independent_rows
-        && rows == 4 && *ne == 2560 && *n_ff_exp == 640
-        && *n_expert == 512 && *n_used == 10
+        && graph.mtp_verify
+        && !graph.independent_rows
+        && rows == 4
+        && *ne == 2560
+        && *n_ff_exp == 640
+        && *n_expert == 512
+        && *n_used == 10
         && graph.desc(*gate_exps).dtype == infr_core::DType::Iq2S
         && graph.desc(*up_exps).dtype == infr_core::DType::Iq2S
         && graph.desc(*down_exps).dtype == infr_core::DType::Iq4Nl;
-    if rows > 1 && !verify_iq2_nr8
-        && (is_new_iq(*gate_exps) || is_new_iq(*up_exps) || is_new_iq(*down_exps)) {
+    if rows > 1
+        && !verify_iq2_nr8
+        && (is_new_iq(*gate_exps) || is_new_iq(*up_exps) || is_new_iq(*down_exps))
+    {
         return None;
     }
     let [gate_op, g_op, u_op, act_op, d_op, add_op] = graph.ops.get(op_idx + 1..op_idx + 7)? else {
@@ -14552,9 +14632,14 @@ fn execute_paged_moe<'a>(
     }
     let resume_ids = ps.resume_ids.take();
     let precomputed_hit_masks = ps.resume_hit_masks.take();
-    let pair = ps.verify_pairs.as_ref().and_then(|pairs| pairs.layer(op_idx));
-    let resume_pair = precomputed_hit_masks.as_ref()
-        .filter(|_| ps.pair_classified.contains(&op_idx)).and_then(|_| pair.clone());
+    let pair = ps
+        .verify_pairs
+        .as_ref()
+        .and_then(|pairs| pairs.layer(op_idx));
+    let resume_pair = precomputed_hit_masks
+        .as_ref()
+        .filter(|_| ps.pair_classified.contains(&op_idx))
+        .and_then(|_| pair.clone());
     if resume_ids.is_none() {
         let rc = rec.as_ref().expect("segment always Some between ops");
         let rxb = r(*router_x)?;
@@ -14712,7 +14797,11 @@ fn execute_paged_moe<'a>(
                 Ok((sess.arena_addr(role)?, sess.slot_bytes(role)? as u32))
             };
             let banks = [bank(gate_id)?, bank(up_id)?, bank(down_id)?];
-            let copy_params = route.copy.as_ref().map(|copy| copy.role_params(sess, &[gate_id, up_id, down_id])).transpose()?;
+            let copy_params = route
+                .copy
+                .as_ref()
+                .map(|copy| copy.role_params(sess, &[gate_id, up_id, down_id]))
+                .transpose()?;
             (windows, sess.retained_tape(), banks, copy_params)
         };
         // Frozen addresses remain protected until the chunk drains. Encoding does not
@@ -14720,16 +14809,23 @@ fn execute_paged_moe<'a>(
         let rc = rec.as_ref().unwrap();
         rc.end_conditional();
         // Select bounded overlap before pair classification; the two schedules never mix.
-        let overlap = route.notice.is_some() && route.copy.as_ref().is_some_and(|copy| {
-            rc.gpu_copy_overlap_supported(
-                graph.mtp_verify, rows, graph.independent_rows, false,
-                route.control.as_ref(), copy,
-            )
-        });
+        let overlap = route.notice.is_some()
+            && route.copy.as_ref().is_some_and(|copy| {
+                rc.gpu_copy_overlap_supported(
+                    graph.mtp_verify,
+                    rows,
+                    graph.independent_rows,
+                    false,
+                    route.control.as_ref(),
+                    copy,
+                )
+            });
         // Actual overlap wins deterministically. Its CPU fallback must not consume unclassified
         // sidecar commands; pair-only Verify remains available when GPU copying is disabled.
         let pair = pair.filter(|_| !overlap);
-        if pair.is_some() { ps.pair_classified.insert(op_idx); }
+        if pair.is_some() {
+            ps.pair_classified.insert(op_idx);
+        }
         {
             let _notice_phase = infr_core::timeline::device_enabled()
                 .then(|| infr_core::timeline::device_phase_scope("resident_router_notice"));
@@ -14743,40 +14839,70 @@ fn execute_paged_moe<'a>(
             ];
             if let Some(notice) = route.notice {
                 let check_params = [
-                    params[0], params[1], params[2], params[3], params[4], params[5],
-                    n_used as u32, shared_mask,
+                    params[0],
+                    params[1],
+                    params[2],
+                    params[3],
+                    params[4],
+                    params[5],
+                    n_used as u32,
+                    shared_mask,
                 ];
                 if let (Some(copy), Some(copy_params)) = (&route.copy, copy_params) {
                     if overlap {
                         rc.gpu_resident_copy_prepare_overlap(
-                            pool[&ids_key].as_ref(), tape.as_ref(), route.control.as_ref(),
-                            route.journal.as_ref(), copy, check_params, copy_params, notice,
+                            pool[&ids_key].as_ref(),
+                            tape.as_ref(),
+                            route.control.as_ref(),
+                            route.journal.as_ref(),
+                            copy,
+                            check_params,
+                            copy_params,
+                            notice,
                         );
                     } else if let Some(pair) = pair.as_ref() {
                         rc.gpu_resident_copy_check_pair(
-                            pool[&ids_key].as_ref(), tape.as_ref(), route.control.as_ref(),
-                            route.journal.as_ref(), copy, check_params, copy_params, notice, pair,
+                            pool[&ids_key].as_ref(),
+                            tape.as_ref(),
+                            route.control.as_ref(),
+                            route.journal.as_ref(),
+                            copy,
+                            check_params,
+                            copy_params,
+                            notice,
+                            pair,
                         );
                     } else {
-                    rc.gpu_resident_copy_check(
-                        pool[&ids_key].as_ref(), tape.as_ref(), route.control.as_ref(),
-                        route.journal.as_ref(), copy, check_params, copy_params, notice,
-                    );
+                        rc.gpu_resident_copy_check(
+                            pool[&ids_key].as_ref(),
+                            tape.as_ref(),
+                            route.control.as_ref(),
+                            route.journal.as_ref(),
+                            copy,
+                            check_params,
+                            copy_params,
+                            notice,
+                        );
                     }
                 } else if let Some(pair) = pair.as_ref() {
                     rc.gpu_resident_hit_check_pair(
-                        pool[&ids_key].as_ref(), tape.as_ref(), route.control.as_ref(),
-                        route.journal.as_ref(), check_params, notice, pair,
+                        pool[&ids_key].as_ref(),
+                        tape.as_ref(),
+                        route.control.as_ref(),
+                        route.journal.as_ref(),
+                        check_params,
+                        notice,
+                        pair,
                     );
                 } else {
-                rc.gpu_resident_hit_check(
-                    pool[&ids_key].as_ref(),
-                    tape.as_ref(),
-                    route.control.as_ref(),
-                    route.journal.as_ref(),
-                    check_params,
-                    notice,
-                );
+                    rc.gpu_resident_hit_check(
+                        pool[&ids_key].as_ref(),
+                        tape.as_ref(),
+                        route.control.as_ref(),
+                        route.journal.as_ref(),
+                        check_params,
+                        notice,
+                    );
                 }
             } else {
                 rc.gpu_resident_check(
@@ -14819,7 +14945,14 @@ fn execute_paged_moe<'a>(
         });
         let independent = overlap.then(|| rc.independent_dispatch_scope());
         for (role, dtype, bank, window, shared_weight, output) in [
-            (verify_pair::Role::Gate, gdt, banks[0], windows[0], shared_wgate, workspace.gbuf),
+            (
+                verify_pair::Role::Gate,
+                gdt,
+                banks[0],
+                windows[0],
+                shared_wgate,
+                workspace.gbuf,
+            ),
             (
                 verify_pair::Role::Up,
                 udt,
@@ -14854,7 +14987,9 @@ fn execute_paged_moe<'a>(
         }
         if overlap {
             rc.gpu_resident_copy_payload_overlap(
-                route.copy.as_ref().unwrap(), route.journal.as_ref(), route.ordinal,
+                route.copy.as_ref().unwrap(),
+                route.journal.as_ref(),
+                route.ordinal,
             );
         }
         // The scope joins BDA payload writes and hit Gate/Up before dependent FFN work.
@@ -14909,27 +15044,64 @@ fn execute_paged_moe<'a>(
                 .then(|| infr_core::timeline::device_phase_scope("resident_gpu_copy_miss_FFN"));
             for (dtype, bank, window, shared_weight, output) in [
                 (gdt, banks[0], windows[0], shared_wgate, workspace.gbuf),
-                (udt, banks[1], windows[1], shared_wup, workspace.ubuf.unwrap()),
+                (
+                    udt,
+                    banks[1],
+                    windows[1],
+                    shared_wup,
+                    workspace.ubuf.unwrap(),
+                ),
             ] {
                 // Keep the shared weight binding: it selects the physical (top-k + 1) stride.
                 // Only H contains its mask bit; M never evaluates the shared expert twice.
                 linear_paged_maybe_shared(
                     graph.mtp_verify && !graph.independent_rows,
-                    rc, dtype, bank.0, bank.1, tape.as_ref(), pool[&ids_key].as_ref(),
-                    n_used, window as usize, shared_weight, xb, false, pool[&output].as_ref(),
-                    ne, nff, rows, 0, MOE_ROW_MASK_MISSES,
+                    rc,
+                    dtype,
+                    bank.0,
+                    bank.1,
+                    tape.as_ref(),
+                    pool[&ids_key].as_ref(),
+                    n_used,
+                    window as usize,
+                    shared_weight,
+                    xb,
+                    false,
+                    pool[&output].as_ref(),
+                    ne,
+                    nff,
+                    rows,
+                    0,
+                    MOE_ROW_MASK_MISSES,
                 );
             }
             rc.gpu_resident_silu_bank(
-                pool[&workspace.gbuf].as_ref(), pool[&workspace.ubuf.unwrap()].as_ref(),
-                pool[&ids_key].as_ref(), pool[&workspace.abuf].as_ref(),
-                [rows as u32, n_used as u32, physical_used as u32, nff as u32], true,
+                pool[&workspace.gbuf].as_ref(),
+                pool[&workspace.ubuf.unwrap()].as_ref(),
+                pool[&ids_key].as_ref(),
+                pool[&workspace.abuf].as_ref(),
+                [rows as u32, n_used as u32, physical_used as u32, nff as u32],
+                true,
             );
             linear_paged_maybe_shared(
                 graph.mtp_verify && !graph.independent_rows,
-                rc, ddt, banks[2].0, banks[2].1, tape.as_ref(), pool[&ids_key].as_ref(),
-                n_used, windows[2] as usize, shared_wdown, pool[&workspace.abuf].as_ref(),
-                true, pool[&workspace.ybuf].as_ref(), nff, ne, rows, 0, MOE_ROW_MASK_MISSES,
+                rc,
+                ddt,
+                banks[2].0,
+                banks[2].1,
+                tape.as_ref(),
+                pool[&ids_key].as_ref(),
+                n_used,
+                windows[2] as usize,
+                shared_wdown,
+                pool[&workspace.abuf].as_ref(),
+                true,
+                pool[&workspace.ybuf].as_ref(),
+                nff,
+                ne,
+                rows,
+                0,
+                MOE_ROW_MASK_MISSES,
             );
         }
         if route.notice.is_some() {
@@ -16934,13 +17106,19 @@ mod tests {
         for (requested, verify) in [(false, false), (false, true), (true, true)] {
             graph.mtp_verify = verify;
             assert!(resident_mtp_bindings_supported(
-                requested, &graph, &[], &Bindings::new(), |_, _| {
-                    panic!("unchanged paths must not inspect bound roles")
-                },
+                requested,
+                &graph,
+                &[],
+                &Bindings::new(),
+                |_, _| { panic!("unchanged paths must not inspect bound roles") },
             ));
         }
         assert!(!resident_mtp_bindings_supported(
-            true, &Graph::new(), &[], &Bindings::new(), |_, _| true,
+            true,
+            &Graph::new(),
+            &[],
+            &Bindings::new(),
+            |_, _| true,
         ));
     }
 
@@ -16949,7 +17127,13 @@ mod tests {
         use super::*;
         use crate::pager::{buffer_identity, Role};
         let graph = resident_layout_graph(1, 256, 256, 4, 2, DType::Q4K, false, false);
-        let Op::MoeFfn { gate_exps, up_exps, down_exps, .. } = &graph.ops[0] else {
+        let Op::MoeFfn {
+            gate_exps,
+            up_exps,
+            down_exps,
+            ..
+        } = &graph.ops[0]
+        else {
             unreachable!();
         };
         let ids = [*gate_exps, *up_exps, *down_exps];
@@ -16957,15 +17141,22 @@ mod tests {
         let main = [TestBuffer(4), TestBuffer(4), TestBuffer(4)];
         let head = [TestBuffer(4), TestBuffer(4), TestBuffer(4)];
         let scratch: ScratchSet = (0..graph.tensors.len()).map(|_| None).collect();
-        let registered = |role, id| (0..3).any(|i| {
-            role == roles[i] && id == buffer_identity(&main[i])
-        });
+        let registered =
+            |role, id| (0..3).any(|i| role == roles[i] && id == buffer_identity(&main[i]));
         let mut bindings = Bindings::new();
         for i in 0..3 {
             bindings.bind(ids[i], &main[i]);
         }
-        assert!(resident_mtp_bindings_supported(true, &graph, &scratch, &bindings, registered));
-        assert!(!resident_mtp_bindings_supported(true, &graph, &scratch, &bindings, |_, _| false));
+        assert!(resident_mtp_bindings_supported(
+            true, &graph, &scratch, &bindings, registered
+        ));
+        assert!(!resident_mtp_bindings_supported(
+            true,
+            &graph,
+            &scratch,
+            &bindings,
+            |_, _| false
+        ));
         for missing in 0..3 {
             let mut incomplete = Bindings::new();
             for i in 0..3 {
@@ -16973,22 +17164,38 @@ mod tests {
                     incomplete.bind(ids[i], &main[i]);
                 }
             }
-            assert!(!resident_mtp_bindings_supported(true, &graph, &scratch, &incomplete, registered));
+            assert!(!resident_mtp_bindings_supported(
+                true,
+                &graph,
+                &scratch,
+                &incomplete,
+                registered
+            ));
             bindings.bind(ids[missing], &head[missing]);
-            assert!(!resident_mtp_bindings_supported(true, &graph, &scratch, &bindings, registered));
+            assert!(!resident_mtp_bindings_supported(
+                true, &graph, &scratch, &bindings, registered
+            ));
             bindings.bind(ids[missing], &main[missing]);
-            assert!(!resident_mtp_bindings_supported(true, &graph, &scratch, &bindings, |role, id| {
-                if id == buffer_identity(&main[missing]) {
-                    role == roles[(missing + 1) % 3]
-                } else {
-                    registered(role, id)
+            assert!(!resident_mtp_bindings_supported(
+                true,
+                &graph,
+                &scratch,
+                &bindings,
+                |role, id| {
+                    if id == buffer_identity(&main[missing]) {
+                        role == roles[(missing + 1) % 3]
+                    } else {
+                        registered(role, id)
+                    }
                 }
-            }));
+            ));
         }
         for i in 0..3 {
             bindings.bind(ids[i], &head[i]);
         }
-        assert!(!resident_mtp_bindings_supported(true, &graph, &scratch, &bindings, registered));
+        assert!(!resident_mtp_bindings_supported(
+            true, &graph, &scratch, &bindings, registered
+        ));
     }
 
     #[test]
@@ -17000,7 +17207,13 @@ mod tests {
         let main_op = graph.ops[0].clone();
         graph.push(main_op.clone());
         graph.push(main_op);
-        let Op::MoeFfn { gate_exps, up_exps, down_exps, .. } = &graph.ops[0] else {
+        let Op::MoeFfn {
+            gate_exps,
+            up_exps,
+            down_exps,
+            ..
+        } = &graph.ops[0]
+        else {
             unreachable!();
         };
         let ids = [*gate_exps, *up_exps, *down_exps];
@@ -17012,20 +17225,27 @@ mod tests {
             bindings.bind(ids[i], &main[i]);
         }
         let scratch: ScratchSet = (0..graph.tensors.len()).map(|_| None).collect();
-        let registered = |role, id| (0..3).any(|i| {
-            role == roles[i] && id == buffer_identity(&main[i])
-        });
-        assert!(resident_mtp_bindings_supported(true, &graph, &scratch, &bindings, registered));
+        let registered =
+            |role, id| (0..3).any(|i| role == roles[i] && id == buffer_identity(&main[i]));
+        assert!(resident_mtp_bindings_supported(
+            true, &graph, &scratch, &bindings, registered
+        ));
         let private = graph.weight(TensorDesc::new(vec![4, 256, 256], DType::Q4K));
-        let Op::MoeFfn { down_exps, .. } = &mut graph.ops[2] else { unreachable!() };
+        let Op::MoeFfn { down_exps, .. } = &mut graph.ops[2] else {
+            unreachable!()
+        };
         *down_exps = private;
         bindings.bind(private, &head);
         let scratch: ScratchSet = (0..graph.tensors.len()).map(|_| None).collect();
-        assert!(!resident_mtp_bindings_supported(true, &graph, &scratch, &bindings, registered));
-        for i in 0..3 {
-            bindings.bind(ids[i], &head);
+        assert!(!resident_mtp_bindings_supported(
+            true, &graph, &scratch, &bindings, registered
+        ));
+        for &id in &ids[..3] {
+            bindings.bind(id, &head);
         }
-        assert!(!resident_mtp_bindings_supported(true, &graph, &scratch, &bindings, registered));
+        assert!(!resident_mtp_bindings_supported(
+            true, &graph, &scratch, &bindings, registered
+        ));
     }
 
     #[test]
@@ -17057,7 +17277,8 @@ mod tests {
                 up_exps,
                 down_exps,
                 ..
-            } = &graph.ops[0] else {
+            } = &graph.ops[0]
+            else {
                 unreachable!();
             };
             let weight = [*gate_exps, *up_exps, *down_exps][role];
@@ -17094,7 +17315,8 @@ mod tests {
             up_exps,
             down_exps,
             ..
-        } = &mut mmq_op else {
+        } = &mut mmq_op
+        else {
             unreachable!();
         };
         for weight in [gate_exps, up_exps, down_exps] {
@@ -17204,7 +17426,10 @@ mod tests {
         verify_copy_only: bool,
     ) {
         gpu_resident_recovery_fixture_with_overlap(
-            recovery_only, serial_copy_only, verify_copy_only, false,
+            recovery_only,
+            serial_copy_only,
+            verify_copy_only,
+            false,
         );
     }
 
@@ -17314,8 +17539,12 @@ mod tests {
                     &[(1, false), (2, false)]
                 } else {
                     &[
-                        (1, false), (2, false), (3, false),
-                        (4, false), (8, false), (4, true),
+                        (1, false),
+                        (2, false),
+                        (3, false),
+                        (4, false),
+                        (8, false),
+                        (4, true),
                     ]
                 };
                 for &(rows, mtp_verify) in shapes {
@@ -17339,7 +17568,8 @@ mod tests {
                     cfg.kernels.vulkan.decode_gpu_resident_fast_lut = true;
                     cfg.kernels.vulkan.decode_gpu_resident_hit_first = hit_first;
                     cfg.kernels.vulkan.decode_gpu_resident_waiter = hit_first;
-                    cfg.kernels.vulkan.decode_gpu_resident_immutable_predicates = immutable || verify_overlap;
+                    cfg.kernels.vulkan.decode_gpu_resident_immutable_predicates =
+                        immutable || verify_overlap;
                     cfg.kernels.vulkan.decode_gpu_resident_notice_thread = producer;
                     cfg.kernels.vulkan.decode_gpu_resident_early_recovery =
                         producer && (!serial_copy_only || verify_overlap);
@@ -17585,29 +17815,49 @@ mod tests {
                         }
                         if verify_overlap {
                             let recorder = backend.recorder().unwrap();
-                            assert!(recorder.gpu_copy_overlap_supported(
-                                graph.mtp_verify, rows, graph.independent_rows, false,
-                                resident.control.as_ref(), resident.gpu_copy.as_ref().unwrap(),
-                            ), "Verify overlap fixture must exercise the bounded overlap path");
+                            assert!(
+                                recorder.gpu_copy_overlap_supported(
+                                    graph.mtp_verify,
+                                    rows,
+                                    graph.independent_rows,
+                                    false,
+                                    resident.control.as_ref(),
+                                    resident.gpu_copy.as_ref().unwrap(),
+                                ),
+                                "Verify overlap fixture must exercise the bounded overlap path"
+                            );
                         }
                         drop(resident);
                         if verify_copy_only {
-                            let copy = retained.as_ref().unwrap()
-                                .gpu_copy.as_ref().unwrap().clone();
+                            let copy = retained
+                                .as_ref()
+                                .unwrap()
+                                .gpu_copy
+                                .as_ref()
+                                .unwrap()
+                                .clone();
                             for rejected_rows in [1, crate::recorder::RESIDENT_JOURNAL_MASK_WORDS] {
                                 let mut rejected = graph.clone();
                                 rejected.tensors[state.0 as usize].desc =
                                     TensorDesc::new(vec![rejected_rows, NE], DType::F32);
                                 let cold = ResidentChunk::new(&backend, &rejected, true, &mut None)
                                     .unwrap()
-                                    .expect("unsupported copy width retains ordinary resident recovery");
-                                assert!(cold.gpu_copy.is_none(),
-                                    "ineligible Verify copy allocation");
+                                    .expect(
+                                        "unsupported copy width retains ordinary resident recovery",
+                                    );
+                                assert!(
+                                    cold.gpu_copy.is_none(),
+                                    "ineligible Verify copy allocation"
+                                );
                                 drop(cold);
-                                let warm = ResidentChunk::new(&backend, &rejected, true, &mut retained)
-                                    .unwrap().unwrap();
-                                assert!(warm.gpu_copy.is_none(),
-                                    "retained copy bypassed Verify width filter");
+                                let warm =
+                                    ResidentChunk::new(&backend, &rejected, true, &mut retained)
+                                        .unwrap()
+                                        .unwrap();
+                                assert!(
+                                    warm.gpu_copy.is_none(),
+                                    "retained copy bypassed Verify width filter"
+                                );
                                 drop(warm);
                             }
                             let mut ordinary = graph.clone();
@@ -17622,31 +17872,61 @@ mod tests {
                                 &backend, &ordinary, &scratch, &bindings,
                             );
                             assert!(target_banks, "ordinary MTP target banks are registered");
-                            let target = ResidentChunk::new(&backend, &ordinary, target_banks, &mut retained)
-                                .unwrap().expect("registered ordinary target must retain resident admission");
+                            let target = ResidentChunk::new(
+                                &backend,
+                                &ordinary,
+                                target_banks,
+                                &mut retained,
+                            )
+                            .unwrap()
+                            .expect("registered ordinary target must retain resident admission");
                             drop(target);
 
-                            let private_banks: Vec<_> = (0..role_handles.len())
-                                .map(|_| TestBuffer(4)).collect();
+                            let private_banks: Vec<_> =
+                                (0..role_handles.len()).map(|_| TestBuffer(4)).collect();
                             let mut private_bindings = Bindings::new();
                             for (handle, buffer) in role_handles.iter().zip(&private_banks) {
                                 private_bindings.bind(*handle, buffer);
                             }
                             let private_banks_supported = resident_mtp_graph_supported(
-                                &backend, &ordinary, &scratch, &private_bindings,
+                                &backend,
+                                &ordinary,
+                                &scratch,
+                                &private_bindings,
                             );
-                            assert!(!private_banks_supported, "private head banks are not registered");
-                            assert!(ResidentChunk::new(
-                                &backend, &ordinary, private_banks_supported, &mut retained,
-                            ).unwrap().is_none(), "private draft must stay excluded");
+                            assert!(
+                                !private_banks_supported,
+                                "private head banks are not registered"
+                            );
+                            assert!(
+                                ResidentChunk::new(
+                                    &backend,
+                                    &ordinary,
+                                    private_banks_supported,
+                                    &mut retained,
+                                )
+                                .unwrap()
+                                .is_none(),
+                                "private draft must stay excluded"
+                            );
 
                             let mut independent_verify = graph.clone();
                             independent_verify.independent_rows = true;
-                            assert!(ResidentChunk::new(
-                                &backend, &independent_verify, true, &mut retained,
-                            ).unwrap().is_none(), "independent Verify must stay excluded");
-                            let supported = ResidentChunk::new(&backend, &graph, true, &mut retained)
-                                .unwrap().unwrap();
+                            assert!(
+                                ResidentChunk::new(
+                                    &backend,
+                                    &independent_verify,
+                                    true,
+                                    &mut retained,
+                                )
+                                .unwrap()
+                                .is_none(),
+                                "independent Verify must stay excluded"
+                            );
+                            let supported =
+                                ResidentChunk::new(&backend, &graph, true, &mut retained)
+                                    .unwrap()
+                                    .unwrap();
                             assert!(
                                 Arc::ptr_eq(supported.gpu_copy.as_ref().unwrap(), &copy),
                                 "eligible Verify must reuse its drained copy metadata"
@@ -17665,10 +17945,17 @@ mod tests {
                     let plan = backend.compile(&graph).unwrap();
                     let scenarios: &[(Option<usize>, bool)] = if verify_overlap {
                         &[
-                            (None, false), (Some(0), false), (Some(1), false),
-                            (None, false), (Some(0), true), (Some(1), true),
-                            (None, false), (Some(0), false), (Some(0), false),
-                            (Some(1), false), (None, false),
+                            (None, false),
+                            (Some(0), false),
+                            (Some(1), false),
+                            (None, false),
+                            (Some(0), true),
+                            (Some(1), true),
+                            (None, false),
+                            (Some(0), false),
+                            (Some(0), false),
+                            (Some(1), false),
+                            (None, false),
                         ]
                     } else if serial_copy_only {
                         &[
@@ -17681,7 +17968,12 @@ mod tests {
                             (None, false),
                         ]
                     } else {
-                        &[(None, false), (Some(0), false), (Some(1), false), (None, false)]
+                        &[
+                            (None, false),
+                            (Some(0), false),
+                            (Some(1), false),
+                            (None, false),
+                        ]
                     };
                     for (case, &(missing, unmapped)) in scenarios.iter().enumerate() {
                         // The alternating router uses only two banks, even at Verify width four.
@@ -17722,10 +18014,7 @@ mod tests {
                             } else {
                                 roles[layer * 3..layer * 3 + 3].try_into().unwrap()
                             };
-                            session.discard_cpu_miss(
-                                missing_roles,
-                                &[0],
-                            );
+                            session.discard_cpu_miss(missing_roles, &[0]);
                         }
                         drop(guard);
                         backend
@@ -17739,13 +18028,20 @@ mod tests {
                             // the CPU store and its import owners stay alive for normal recovery.
                             let directory = {
                                 let arena = backend.runtime_phase.lock().unwrap();
-                                let copy = arena.resident_buffers.as_ref().unwrap()
-                                    .gpu_copy.as_ref().unwrap();
+                                let copy = arena
+                                    .resident_buffers
+                                    .as_ref()
+                                    .unwrap()
+                                    .gpu_copy
+                                    .as_ref()
+                                    .unwrap();
                                 Arc::clone(&copy.sources)
                             };
                             assert_eq!(directory.len_bytes() % 16, 0);
                             let ptr = crate::as_vk_buf(directory.as_ref())
-                                .unwrap().mapped_ptr().unwrap();
+                                .unwrap()
+                                .mapped_ptr()
+                                .unwrap();
                             let mut original = vec![0u32; directory.len_bytes() / 4];
                             unsafe {
                                 std::ptr::copy_nonoverlapping(
@@ -17754,7 +18050,8 @@ mod tests {
                                     directory.len_bytes(),
                                 );
                             }
-                            assert!(original.chunks_exact(4)
+                            assert!(original
+                                .chunks_exact(4)
                                 .any(|word| word[0] != 0 || word[1] != 0));
                             let mut hidden = original.clone();
                             for word in hidden.chunks_exact_mut(4) {
@@ -17786,7 +18083,9 @@ mod tests {
                             .unwrap();
                         if let Some((directory, original)) = unmapped_sources {
                             let ptr = crate::as_vk_buf(directory.as_ref())
-                                .unwrap().mapped_ptr().unwrap();
+                                .unwrap()
+                                .mapped_ptr()
+                                .unwrap();
                             unsafe {
                                 std::ptr::copy_nonoverlapping(
                                     original.as_ptr().cast(),
@@ -17802,8 +18101,10 @@ mod tests {
                                 .checked_sub(copies_before)
                                 .expect("completed GPU copy replay count must be monotonic");
                             if missing.is_none() && case == 0 {
-                                assert_eq!(copies, 0,
-                                    "preloaded all-hit fixture must not copy experts");
+                                assert_eq!(
+                                    copies, 0,
+                                    "preloaded all-hit fixture must not copy experts"
+                                );
                             } else if unmapped {
                                 assert_eq!(
                                     copies, 0,

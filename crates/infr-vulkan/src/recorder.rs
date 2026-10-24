@@ -7,8 +7,8 @@
 //! binds them. Reuses the cached kernels in `VulkanShared.kernels`.
 
 use std::cell::RefCell;
-use std::sync::Arc;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use ash::vk;
 
@@ -1404,9 +1404,11 @@ impl IndependentDispatchBatch {
                 end: end.unwrap(),
                 write: index >= split,
             };
-            if self.accesses.iter().any(|&old| {
-                (old.write || access.write) && access.overlaps(old)
-            }) {
+            if self
+                .accesses
+                .iter()
+                .any(|&old| (old.write || access.write) && access.overlaps(old))
+            {
                 // An internal helper dependency ends the optimization, not its barrier.
                 self.closed = true;
                 return false;
@@ -2004,16 +2006,31 @@ impl<'a> Recorder<'a> {
         assert!(self.resident_indirect.borrow().is_none());
         assert!(!self.conditional_active.get() || !self.conditional_mutable.get());
         let barrier = vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::HOST_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE
-                | vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE
-                | vk::AccessFlags::INDIRECT_COMMAND_READ);
+            .src_access_mask(
+                vk::AccessFlags::SHADER_WRITE
+                    | vk::AccessFlags::TRANSFER_WRITE
+                    | vk::AccessFlags::HOST_WRITE,
+            )
+            .dst_access_mask(
+                vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::SHADER_WRITE
+                    | vk::AccessFlags::TRANSFER_READ
+                    | vk::AccessFlags::TRANSFER_WRITE
+                    | vk::AccessFlags::INDIRECT_COMMAND_READ,
+            );
         unsafe {
             self.be.shared.device.cmd_pipeline_barrier(
                 self.cmd,
-                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::HOST,
-                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::DRAW_INDIRECT,
-                vk::DependencyFlags::empty(), &[barrier], &[], &[],
+                vk::PipelineStageFlags::COMPUTE_SHADER
+                    | vk::PipelineStageFlags::TRANSFER
+                    | vk::PipelineStageFlags::HOST,
+                vk::PipelineStageFlags::COMPUTE_SHADER
+                    | vk::PipelineStageFlags::TRANSFER
+                    | vk::PipelineStageFlags::DRAW_INDIRECT,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
             );
         }
         *self.barriers.borrow_mut() += 1;
@@ -2385,20 +2402,32 @@ impl<'a> Recorder<'a> {
             write_bufs[i] = b.buffer;
         }
         self.indirect_pending.set(true);
-        let independent = self.independent_dispatch.borrow_mut().as_mut().is_some_and(|batch| {
-            if self.full_barrier || self.no_barrier || self.suppress.get() {
-                batch.closed = true;
-                return false;
-            }
-            let mut ranges = Vec::with_capacity(n + 1);
-            ranges.extend_from_slice(&buffers[..split]);
-            ranges.push(vk::DescriptorBufferInfo { buffer: args, offset: args_off, range: 12 });
-            ranges.extend_from_slice(&buffers[split..]);
-            batch.accept(&ranges, n_out)
-        });
+        let independent = self
+            .independent_dispatch
+            .borrow_mut()
+            .as_mut()
+            .is_some_and(|batch| {
+                if self.full_barrier || self.no_barrier || self.suppress.get() {
+                    batch.closed = true;
+                    return false;
+                }
+                let mut ranges = Vec::with_capacity(n + 1);
+                ranges.extend_from_slice(&buffers[..split]);
+                ranges.push(vk::DescriptorBufferInfo {
+                    buffer: args,
+                    offset: args_off,
+                    range: 12,
+                });
+                ranges.extend_from_slice(&buffers[split..]);
+                batch.accept(&ranges, n_out)
+            });
         if independent {
-            self.dirty_reads.borrow_mut().extend(all_reads[..split + 1].iter().copied());
-            self.dirty_writes.borrow_mut().extend(write_bufs[..n_out].iter().copied());
+            self.dirty_reads
+                .borrow_mut()
+                .extend(all_reads[..split + 1].iter().copied());
+            self.dirty_writes
+                .borrow_mut()
+                .extend(write_bufs[..n_out].iter().copied());
         } else {
             self.sync(&all_reads[..split + 1], &write_bufs[..n_out], false);
         }
@@ -2444,17 +2473,25 @@ impl<'a> Recorder<'a> {
         for (i, b) in buffers.iter().enumerate() {
             handles[i] = b.buffer;
         }
-        let independent = self.independent_dispatch.borrow_mut().as_mut().is_some_and(|batch| {
-            if self.full_barrier || self.no_barrier || self.suppress.get() {
-                batch.closed = true;
-                false
-            } else {
-                batch.accept(buffers, n_out)
-            }
-        });
+        let independent = self
+            .independent_dispatch
+            .borrow_mut()
+            .as_mut()
+            .is_some_and(|batch| {
+                if self.full_barrier || self.no_barrier || self.suppress.get() {
+                    batch.closed = true;
+                    false
+                } else {
+                    batch.accept(buffers, n_out)
+                }
+            });
         if independent {
-            self.dirty_reads.borrow_mut().extend(handles[..split].iter().copied());
-            self.dirty_writes.borrow_mut().extend(handles[split..n].iter().copied());
+            self.dirty_reads
+                .borrow_mut()
+                .extend(handles[..split].iter().copied());
+            self.dirty_writes
+                .borrow_mut()
+                .extend(handles[split..n].iter().copied());
         } else {
             self.sync_inner(&handles[..split], &handles[split..n], false);
         }
@@ -13397,30 +13434,43 @@ impl<'a> Recorder<'a> {
     }
 
     pub(crate) fn gpu_resident_hit_check_pair(
-        &self, ids: &dyn Buffer, tape: &dyn Buffer, control: &dyn Buffer,
-        journal: &dyn Buffer, params: [u32; 8], notice: vk::Event,
+        &self,
+        ids: &dyn Buffer,
+        tape: &dyn Buffer,
+        control: &dyn Buffer,
+        journal: &dyn Buffer,
+        params: [u32; 8],
+        notice: vk::Event,
         pair: &crate::adapter::verify_pair::Layer,
     ) {
         self.gpu_resident_hit_check_impl(ids, tape, control, journal, params, notice, Some(pair));
     }
 
     fn gpu_resident_hit_check_impl(
-        &self, ids: &dyn Buffer, tape: &dyn Buffer, control: &dyn Buffer,
-        journal: &dyn Buffer, params: [u32; 8], notice: vk::Event,
+        &self,
+        ids: &dyn Buffer,
+        tape: &dyn Buffer,
+        control: &dyn Buffer,
+        journal: &dyn Buffer,
+        params: [u32; 8],
+        notice: vk::Event,
         pair: Option<&crate::adapter::verify_pair::Layer>,
     ) {
         assert!(!self.conditional_active.get());
         let (name, spv, bindings) = if pair.is_some() {
-            ("gpu_resident_hit_check_pair", crate::gemm::verify_pair_spv("gpu_resident_hit_check_pair"), 5)
+            (
+                "gpu_resident_hit_check_pair",
+                crate::gemm::verify_pair_spv("gpu_resident_hit_check_pair"),
+                5,
+            )
         } else {
-            ("gpu_resident_hit_check", crate::gemm::gpu_resident_hit_check_spv(), 4)
+            (
+                "gpu_resident_hit_check",
+                crate::gemm::gpu_resident_hit_check_spv(),
+                4,
+            )
         };
-        let kernel = self.be.kernel(
-            name,
-            spv,
-            bindings,
-            36,
-        );
+        let kernel = self.be.kernel(name, spv, bindings, 36);
         let params = [
             params[0],
             params[1],
@@ -13432,9 +13482,16 @@ impl<'a> Recorder<'a> {
             params[7],
             u32::from(control.len_bytes() == RESIDENT_CONTROL_BYTES),
         ];
-        if let Some(pair) = pair { self.retain_buffer(Arc::clone(&pair.buffer)); }
-        let buffers = [Self::vkb(ids), Self::vkb(tape), Self::vkb(control), Self::vkb(journal),
-            Self::vkb(pair.map_or(journal, |pair| pair.buffer.as_ref()))];
+        if let Some(pair) = pair {
+            self.retain_buffer(Arc::clone(&pair.buffer));
+        }
+        let buffers = [
+            Self::vkb(ids),
+            Self::vkb(tape),
+            Self::vkb(control),
+            Self::vkb(journal),
+            Self::vkb(pair.map_or(journal, |pair| pair.buffer.as_ref())),
+        ];
         self.dispatch(
             kernel,
             &buffers[..bindings],
@@ -13487,62 +13544,145 @@ impl<'a> Recorder<'a> {
     }
 
     pub(crate) fn gpu_resident_copy_check(
-        &self, ids: &dyn Buffer, tape: &dyn Buffer, control: &dyn Buffer, journal: &dyn Buffer,
-        copy: &crate::pager::GpuCopyBuffers, params: [u32; 8], extra: [u32; 9], notice: vk::Event,
+        &self,
+        ids: &dyn Buffer,
+        tape: &dyn Buffer,
+        control: &dyn Buffer,
+        journal: &dyn Buffer,
+        copy: &crate::pager::GpuCopyBuffers,
+        params: [u32; 8],
+        extra: [u32; 9],
+        notice: vk::Event,
     ) {
-        self.gpu_resident_copy_check_impl(ids, tape, control, journal, copy, params, extra, notice, None);
+        self.gpu_resident_copy_check_impl(
+            ids, tape, control, journal, copy, params, extra, notice, None,
+        );
     }
 
     pub(crate) fn gpu_resident_copy_check_pair(
-        &self, ids: &dyn Buffer, tape: &dyn Buffer, control: &dyn Buffer, journal: &dyn Buffer,
-        copy: &crate::pager::GpuCopyBuffers, params: [u32; 8], extra: [u32; 9], notice: vk::Event,
+        &self,
+        ids: &dyn Buffer,
+        tape: &dyn Buffer,
+        control: &dyn Buffer,
+        journal: &dyn Buffer,
+        copy: &crate::pager::GpuCopyBuffers,
+        params: [u32; 8],
+        extra: [u32; 9],
+        notice: vk::Event,
         pair: &crate::adapter::verify_pair::Layer,
     ) {
-        self.gpu_resident_copy_check_impl(ids, tape, control, journal, copy, params, extra, notice, Some(pair));
+        self.gpu_resident_copy_check_impl(
+            ids,
+            tape,
+            control,
+            journal,
+            copy,
+            params,
+            extra,
+            notice,
+            Some(pair),
+        );
     }
 
     fn gpu_resident_copy_check_impl(
-        &self, ids: &dyn Buffer, tape: &dyn Buffer, control: &dyn Buffer, journal: &dyn Buffer,
-        copy: &crate::pager::GpuCopyBuffers, params: [u32; 8], extra: [u32; 9], notice: vk::Event,
+        &self,
+        ids: &dyn Buffer,
+        tape: &dyn Buffer,
+        control: &dyn Buffer,
+        journal: &dyn Buffer,
+        copy: &crate::pager::GpuCopyBuffers,
+        params: [u32; 8],
+        extra: [u32; 9],
+        notice: vk::Event,
         pair: Option<&crate::adapter::verify_pair::Layer>,
     ) {
         assert!(!self.conditional_active.get());
         let prepare_phase = infr_core::timeline::device_enabled()
             .then(|| infr_core::timeline::device_phase_scope("resident_gpu_copy_prepare"));
         let (name, spv, bindings) = if pair.is_some() {
-            ("gpu_resident_copy_prepare_pair", crate::gemm::verify_pair_spv("gpu_resident_copy_prepare_pair"), 9)
+            (
+                "gpu_resident_copy_prepare_pair",
+                crate::gemm::verify_pair_spv("gpu_resident_copy_prepare_pair"),
+                9,
+            )
         } else {
-            ("gpu_resident_copy_prepare", crate::gemm::gpu_resident_copy_prepare_spv(), 8)
+            (
+                "gpu_resident_copy_prepare",
+                crate::gemm::gpu_resident_copy_prepare_spv(),
+                8,
+            )
         };
-        let kernel = self.be.kernel(name, spv, bindings, GPU_COPY_PREPARE_PUSH_BYTES);
-        let all = gpu_copy_prepare_push(params,
-            control.len_bytes() == RESIDENT_CONTROL_BYTES, extra, copy.copy_groups);
-        if let Some(pair) = pair { self.retain_buffer(Arc::clone(&pair.buffer)); }
+        let kernel = self
+            .be
+            .kernel(name, spv, bindings, GPU_COPY_PREPARE_PUSH_BYTES);
+        let all = gpu_copy_prepare_push(
+            params,
+            control.len_bytes() == RESIDENT_CONTROL_BYTES,
+            extra,
+            copy.copy_groups,
+        );
+        if let Some(pair) = pair {
+            self.retain_buffer(Arc::clone(&pair.buffer));
+        }
         let buffers = [
-            Self::vkb(ids), Self::vkb(tape), Self::vkb(control), Self::vkb(journal),
-            Self::vkb(copy.sources.as_ref()), Self::vkb(copy.candidates.as_ref()),
-            Self::vkb(copy.overlay.as_ref()), Self::vkb(copy.jobs.as_ref()),
+            Self::vkb(ids),
+            Self::vkb(tape),
+            Self::vkb(control),
+            Self::vkb(journal),
+            Self::vkb(copy.sources.as_ref()),
+            Self::vkb(copy.candidates.as_ref()),
+            Self::vkb(copy.overlay.as_ref()),
+            Self::vkb(copy.jobs.as_ref()),
             Self::vkb(pair.map_or(journal, |pair| pair.buffer.as_ref())),
         ];
-        self.dispatch(kernel, &buffers[..bindings], bindings, bytemuck::cast_slice(&all), 1);
+        self.dispatch(
+            kernel,
+            &buffers[..bindings],
+            bindings,
+            bytemuck::cast_slice(&all),
+            1,
+        );
         drop(prepare_phase);
         let payload_phase = infr_core::timeline::device_enabled()
             .then(|| infr_core::timeline::device_phase_scope("resident_gpu_copy_payload"));
-        let kernel = self.be.kernel(if copy.wide_copy { "gpu_resident_copy_payload1024" } else { "gpu_resident_copy_payload" },
-            crate::gemm::gpu_resident_copy_payload_spv(copy.wide_copy), 2, 4);
-        self.dispatch(kernel, &[Self::vkb(journal), Self::vkb(copy.jobs.as_ref())], 2,
-            bytemuck::bytes_of(&params[5]), copy.copy_groups);
+        let kernel = self.be.kernel(
+            if copy.wide_copy {
+                "gpu_resident_copy_payload1024"
+            } else {
+                "gpu_resident_copy_payload"
+            },
+            crate::gemm::gpu_resident_copy_payload_spv(copy.wide_copy),
+            2,
+            4,
+        );
+        self.dispatch(
+            kernel,
+            &[Self::vkb(journal), Self::vkb(copy.jobs.as_ref())],
+            2,
+            bytemuck::bytes_of(&params[5]),
+            copy.copy_groups,
+        );
         drop(payload_phase);
         // BDA payload writes are not descriptor writes. Publish them explicitly to all FFN readers
         // and to the host notification, before the CPU may replay the cache placement.
-        let barrier = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE)
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
             .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::HOST_READ);
         unsafe {
-            self.be.shared.device.cmd_pipeline_barrier(self.cmd,
+            self.be.shared.device.cmd_pipeline_barrier(
+                self.cmd,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::HOST,
-                vk::DependencyFlags::empty(), &[barrier], &[], &[]);
-            self.be.shared.device.cmd_set_event(self.cmd, notice, vk::PipelineStageFlags::ALL_COMMANDS);
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+            self.be.shared.device.cmd_set_event(
+                self.cmd,
+                notice,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+            );
         }
     }
 
@@ -13556,7 +13696,11 @@ impl<'a> Recorder<'a> {
         copy: &crate::pager::GpuCopyBuffers,
     ) -> bool {
         gpu_copy_overlap_eligible(
-            self.be.cfg().kernels.vulkan.decode_gpu_resident_copy_overlap,
+            self.be
+                .cfg()
+                .kernels
+                .vulkan
+                .decode_gpu_resident_copy_overlap,
             verify,
             rows,
             independent_rows,
@@ -13564,7 +13708,9 @@ impl<'a> Recorder<'a> {
             control.len_bytes() == RESIDENT_CONTROL_BYTES,
             copy.miss_predicates.is_some(),
             self.resident_indirect.borrow().is_some(),
-        ) && !self.no_barrier && !self.full_barrier && !self.stages
+        ) && !self.no_barrier
+            && !self.full_barrier
+            && !self.stages
     }
 
     /// Publish an ordered admission, not payload completion. The host only reads these immutable
@@ -13582,7 +13728,10 @@ impl<'a> Recorder<'a> {
     ) {
         assert!(!self.conditional_active.get());
         assert_eq!(control.len_bytes(), RESIDENT_CONTROL_BYTES);
-        let miss_predicates = copy.miss_predicates.as_ref().expect("overlap predicate allocation");
+        let miss_predicates = copy
+            .miss_predicates
+            .as_ref()
+            .expect("overlap predicate allocation");
         let ordinal = params[5] as usize;
         assert!((ordinal + 1) * GPU_COPY_PREDICATE_WORDS * 4 <= miss_predicates.len_bytes());
         let _phase = infr_core::timeline::device_enabled()
@@ -13594,43 +13743,75 @@ impl<'a> Recorder<'a> {
             GPU_COPY_PREPARE_PUSH_BYTES,
         );
         let all = gpu_copy_prepare_push(params, true, extra, copy.copy_groups);
-        self.dispatch(kernel, &[
-            Self::vkb(ids), Self::vkb(tape), Self::vkb(control), Self::vkb(journal),
-            Self::vkb(copy.sources.as_ref()), Self::vkb(copy.candidates.as_ref()),
-            Self::vkb(copy.overlay.as_ref()), Self::vkb(copy.jobs.as_ref()),
-            Self::vkb(miss_predicates.as_ref()),
-        ], 9, bytemuck::cast_slice(&all), 1);
+        self.dispatch(
+            kernel,
+            &[
+                Self::vkb(ids),
+                Self::vkb(tape),
+                Self::vkb(control),
+                Self::vkb(journal),
+                Self::vkb(copy.sources.as_ref()),
+                Self::vkb(copy.candidates.as_ref()),
+                Self::vkb(copy.overlay.as_ref()),
+                Self::vkb(copy.jobs.as_ref()),
+                Self::vkb(miss_predicates.as_ref()),
+            ],
+            9,
+            bytemuck::cast_slice(&all),
+            1,
+        );
         let job_bytes = RESIDENT_JOURNAL_ID_WORDS * 3 * 32;
         let metadata = [
-            (journal, ordinal * RESIDENT_JOURNAL_BYTES, RESIDENT_JOURNAL_BYTES),
+            (
+                journal,
+                ordinal * RESIDENT_JOURNAL_BYTES,
+                RESIDENT_JOURNAL_BYTES,
+            ),
             (copy.jobs.as_ref(), ordinal * job_bytes, job_bytes),
             (control, 0, 16),
         ];
-        let barriers: Vec<_> = metadata.iter().map(|&(buffer, offset, bytes)| {
-            assert!(offset + bytes <= buffer.len_bytes());
-            let buffer = Self::vk_of(buffer);
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(buffer.buffer)
-                .offset((buffer.sub_offset + offset) as u64)
-                .size(bytes as u64)
-        }).collect();
+        let barriers: Vec<_> = metadata
+            .iter()
+            .map(|&(buffer, offset, bytes)| {
+                assert!(offset + bytes <= buffer.len_bytes());
+                let buffer = Self::vk_of(buffer);
+                vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(buffer.buffer)
+                    .offset((buffer.sub_offset + offset) as u64)
+                    .size(bytes as u64)
+            })
+            .collect();
         let args = Self::vk_of(miss_predicates.as_ref());
         let args_barrier = gpu_copy_payload_args_barrier(args.buffer, args.sub_offset, ordinal);
         unsafe {
             self.be.shared.device.cmd_pipeline_barrier(
-                self.cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::HOST,
-                vk::DependencyFlags::empty(), &[], &barriers, &[],
+                self.cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[],
+                &barriers,
+                &[],
             );
             // Publish the GPU-written dispatch triple even when independent dispatch skips sync.
             self.be.shared.device.cmd_pipeline_barrier(
-                self.cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::DRAW_INDIRECT,
-                vk::DependencyFlags::empty(), &[], &[args_barrier], &[],
+                self.cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::DRAW_INDIRECT,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[args_barrier],
+                &[],
             );
-            self.be.shared.device.cmd_set_event(self.cmd, notice, vk::PipelineStageFlags::ALL_COMMANDS);
+            self.be.shared.device.cmd_set_event(
+                self.cmd,
+                notice,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+            );
         }
     }
 
@@ -13646,13 +13827,22 @@ impl<'a> Recorder<'a> {
         let _phase = infr_core::timeline::device_enabled()
             .then(|| infr_core::timeline::device_phase_scope("resident_gpu_copy_payload_overlap"));
         let kernel = self.be.kernel(
-            if copy.wide_copy { "gpu_resident_copy_payload1024" } else { "gpu_resident_copy_payload" },
-            crate::gemm::gpu_resident_copy_payload_spv(copy.wide_copy), 2, 4,
+            if copy.wide_copy {
+                "gpu_resident_copy_payload1024"
+            } else {
+                "gpu_resident_copy_payload"
+            },
+            crate::gemm::gpu_resident_copy_payload_spv(copy.wide_copy),
+            2,
+            4,
         );
         let args = Self::vk_of(copy.miss_predicates.as_ref().unwrap().as_ref());
         self.dispatch_indirect(
-            kernel, &[Self::vkb(journal), Self::vkb(copy.jobs.as_ref())], 0,
-            bytemuck::bytes_of(&ordinal), args.buffer,
+            kernel,
+            &[Self::vkb(journal), Self::vkb(copy.jobs.as_ref())],
+            0,
+            bytemuck::bytes_of(&ordinal),
+            args.buffer,
             (args.sub_offset + (ordinal as usize * GPU_COPY_PREDICATE_WORDS + 1) * 4) as u64,
         );
     }
@@ -13678,9 +13868,16 @@ impl<'a> Recorder<'a> {
         misses: bool,
     ) {
         let kernel = self.be.kernel(
-            if misses { "gpu_resident_silu_misses" } else { "gpu_resident_silu" },
-            if misses { crate::gemm::gpu_resident_silu_misses_spv() }
-                else { crate::gemm::gpu_resident_silu_spv() },
+            if misses {
+                "gpu_resident_silu_misses"
+            } else {
+                "gpu_resident_silu"
+            },
+            if misses {
+                crate::gemm::gpu_resident_silu_misses_spv()
+            } else {
+                crate::gemm::gpu_resident_silu_spv()
+            },
             4,
             16,
         );
@@ -14548,8 +14745,23 @@ impl<'a> Recorder<'a> {
         row_mask_bank: u32,
     ) {
         self.linear_native_id_multi_paged_shared_for_verify(
-            dtype, arena_addr, slot_bytes, lut, ids, routed_used, lut_base, shared,
-            x, x_per_slot, y, in_f, out_f, rows, active_mask, row_mask_bank, false,
+            dtype,
+            arena_addr,
+            slot_bytes,
+            lut,
+            ids,
+            routed_used,
+            lut_base,
+            shared,
+            x,
+            x_per_slot,
+            y,
+            in_f,
+            out_f,
+            rows,
+            active_mask,
+            row_mask_bank,
+            false,
         );
     }
 
@@ -14643,15 +14855,26 @@ impl<'a> Recorder<'a> {
         let mut nr = 1;
         // SG and buffer-grid selection above retain priority over this measured specialization.
         if crate::adapter::verify_pair::shared_iq2_nr8_eligible(
-            self.be.cfg().kernels.vulkan.verify_shared_iq2_nr8, causal_verify,
-            dtype, [rows, in_f, out_f], routed_used, x_per_slot, name,
+            self.be.cfg().kernels.vulkan.verify_shared_iq2_nr8,
+            causal_verify,
+            dtype,
+            [rows, in_f, out_f],
+            routed_used,
+            x_per_slot,
+            name,
         ) {
             (name, spv) = crate::gemm::native_idm_grid_nr_paged_shared_build_spv(dtype, 8)
                 .expect("qualified staged shared IQ2S NR8 build");
             nr = 8;
         }
         let k = self.be.kernel(name, spv, 5, 56);
-        self.dispatch_wide(k, &bufs, 1, &push, (rows * n_used * out_f.div_ceil(nr)) as u32);
+        self.dispatch_wide(
+            k,
+            &bufs,
+            1,
+            &push,
+            (rows * n_used * out_f.div_ceil(nr)) as u32,
+        );
     }
 
     /// Fused paged IQ2_XS gate+up GEMV and SwiGLU for Qwen3.8 decode.
@@ -16037,7 +16260,9 @@ mod prepared_command_tests {
         let backend = backend(true);
         let src = backend.alloc(4, BufferUsage::Staging).unwrap();
         let dst = backend.alloc(4, BufferUsage::Readback).unwrap();
-        backend.upload(src.as_ref(), bytemuck::bytes_of(&23.0f32)).unwrap();
+        backend
+            .upload(src.as_ref(), bytemuck::bytes_of(&23.0f32))
+            .unwrap();
         let mut samples = [Vec::new(), Vec::new()];
         for round in 0..288 {
             for mode in [round % 2, 1 - round % 2] {
@@ -16053,13 +16278,18 @@ mod prepared_command_tests {
                     command.submit(&backend).unwrap()
                 };
                 pending.wait().unwrap();
-                if round >= 32 { samples[mode].push(start.elapsed().as_secs_f64() * 1e6); }
+                if round >= 32 {
+                    samples[mode].push(start.elapsed().as_secs_f64() * 1e6);
+                }
             }
         }
         for (mode, values) in samples.iter_mut().enumerate() {
             values.sort_by(f64::total_cmp);
-            eprintln!("prepared-submit mode={mode} mean_us={:.3} p50_us={:.3}",
-                values.iter().sum::<f64>() / values.len() as f64, values[values.len() / 2]);
+            eprintln!(
+                "prepared-submit mode={mode} mean_us={:.3} p50_us={:.3}",
+                values.iter().sum::<f64>() / values.len() as f64,
+                values[values.len() / 2]
+            );
         }
         assert_eq!(value(&backend, dst.as_ref()), 23.0);
     }

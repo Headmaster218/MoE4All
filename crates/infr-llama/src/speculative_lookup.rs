@@ -693,7 +693,10 @@ mod tests {
             assert_eq!(lookup.propose(None, 100).unwrap().tokens.len(), width);
             // Edits reset feedback; the configured maximum remains unchanged for either policy.
             lookup.sync(&[1, 2, 3, 20, 21, 22, 23, 24, 0, 1, 2, 3]);
-            assert_eq!(lookup.propose(None, 100).unwrap().tokens, [20, 21, 22, 23, 24]);
+            assert_eq!(
+                lookup.propose(None, 100).unwrap().tokens,
+                [20, 21, 22, 23, 24]
+            );
         }
     }
 

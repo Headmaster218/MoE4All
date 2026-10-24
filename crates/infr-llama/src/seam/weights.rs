@@ -2307,7 +2307,9 @@ mod tests {
         fn alloc(&self, bytes: usize, usage: BufferUsage) -> BackendResult<Box<dyn Buffer>> {
             let allocation = self.allocations.fetch_add(1, Ordering::Relaxed) + 1;
             if self.fail_allocation_at.load(Ordering::Relaxed) == allocation {
-                return Err(BackendError::backend("injected checkpoint allocation failure"));
+                return Err(BackendError::backend(
+                    "injected checkpoint allocation failure",
+                ));
             }
             let buffer = self.inner.alloc(bytes, usage)?;
             self.allocated_bytes.fetch_add(bytes, Ordering::Relaxed);
@@ -2343,7 +2345,9 @@ mod tests {
             self.row_copies.fetch_add(1, Ordering::Relaxed);
             if self.fail_restore.swap(false, Ordering::Relaxed) {
                 self.inner.copy_buffer_ranges(&copies[..1])?;
-                return Err(BackendError::backend("injected partial row restore failure"));
+                return Err(BackendError::backend(
+                    "injected partial row restore failure",
+                ));
             }
             self.inner.copy_buffer_ranges(copies)
         }
@@ -2760,7 +2764,11 @@ mod tests {
                     + checkpoint.ple_state.as_deref().map_or(0, Buffer::len_bytes);
                 assert_eq!(
                     base_bytes,
-                    if eager_base { rollback_base_bytes(&cfg, &sibling) } else { 0 }
+                    if eager_base {
+                        rollback_base_bytes(&cfg, &sibling)
+                    } else {
+                        0
+                    }
                 );
                 assert!(sibling.cached.is_empty());
             }
@@ -2784,7 +2792,10 @@ mod tests {
             ple_ngram_size: 3,
             ..Default::default()
         };
-        assert_eq!(crate::seam::recurrent_checkpoint_bytes(&cfg) * 2, 236_077_056);
+        assert_eq!(
+            crate::seam::recurrent_checkpoint_bytes(&cfg) * 2,
+            236_077_056
+        );
     }
 
     #[test]

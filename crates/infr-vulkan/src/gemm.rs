@@ -29,7 +29,11 @@ pub(crate) fn verify_pair_spv(name: &str) -> &'static [u32] {
     macro_rules! shader {
         ($name:literal) => {{
             static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
-            WORDS.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))).as_slice()
+            WORDS
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice()
         }};
     }
     match name {
@@ -538,9 +542,11 @@ pub(crate) fn native_idm_grid_nr_paged_shared_build_spv(
         "native_idm_iq2s_nr8_paged_shexp",
         S.get_or_init(|| {
             spv_words(include_bytes!(concat!(
-                env!("OUT_DIR"), "/native_idm_iq2s_nr8_paged_shexp.spv"
+                env!("OUT_DIR"),
+                "/native_idm_iq2s_nr8_paged_shexp.spv"
             )))
-        }).as_slice(),
+        })
+        .as_slice(),
     ))
 }
 
@@ -4058,7 +4064,10 @@ pub(crate) fn gpu_resident_copy_prepare_spv() -> &'static [u32] {
 }
 
 pub(crate) fn gpu_resident_copy_prepare_overlap_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_resident_copy_prepare_overlap.spv"));
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_resident_copy_prepare_overlap.spv"
+    ));
     static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
     WORDS.get_or_init(|| spv_words(BYTES))
 }
@@ -4071,11 +4080,17 @@ pub(crate) fn gpu_resident_silu_misses_spv() -> &'static [u32] {
 
 pub(crate) fn gpu_resident_copy_payload_spv(wide: bool) -> &'static [u32] {
     const SMALL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_resident_copy_payload.spv"));
-    const WIDE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_resident_copy_payload1024.spv"));
+    const WIDE: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_resident_copy_payload1024.spv"
+    ));
     static SMALL_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
     static WIDE_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
-    if wide { WIDE_WORDS.get_or_init(|| spv_words(WIDE)) }
-    else { SMALL_WORDS.get_or_init(|| spv_words(SMALL)) }
+    if wide {
+        WIDE_WORDS.get_or_init(|| spv_words(WIDE))
+    } else {
+        SMALL_WORDS.get_or_init(|| spv_words(SMALL))
+    }
 }
 /// SPIR-V for the elementwise sigmoid gate `y = a * sigmoid(b)`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]

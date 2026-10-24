@@ -5101,10 +5101,20 @@ impl VulkanBackend {
         offset: usize,
         len: usize,
     ) -> Result<ImportedHostShard> {
-        if self.cfg.kernels.vulkan.decode_gpu_resident_copy != Some(false) && self.shared.caps.buffer_device_address {
-            match self.try_import_host_shard_with_address(ext, Arc::clone(&owner), offset, len, true) {
+        if self.cfg.kernels.vulkan.decode_gpu_resident_copy != Some(false)
+            && self.shared.caps.buffer_device_address
+        {
+            match self.try_import_host_shard_with_address(
+                ext,
+                Arc::clone(&owner),
+                offset,
+                len,
+                true,
+            ) {
                 Ok(shard) => return Ok(shard),
-                Err(error) => tracing::debug!(%error, "GPU-copy host alias unavailable; retaining ordinary DMA import"),
+                Err(error) => {
+                    tracing::debug!(%error, "GPU-copy host alias unavailable; retaining ordinary DMA import")
+                }
             }
         }
         self.try_import_host_shard_with_address(ext, owner, offset, len, false)
@@ -5124,7 +5134,8 @@ impl VulkanBackend {
         let queue_families = self.shared.dedicated_transfer_families();
         let mut usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
         if device_address {
-            usage |= vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
+            usage |=
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
         }
         let mut info = vk::BufferCreateInfo::default()
             .push_next(&mut external)
@@ -5188,8 +5199,8 @@ impl VulkanBackend {
         let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
             .handle_type(handle_type)
             .host_pointer(host_ptr.cast());
-        let mut address_flags = vk::MemoryAllocateFlagsInfo::default()
-            .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let mut address_flags =
+            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
         let mut allocation = vk::MemoryAllocateInfo::default()
             .push_next(&mut import)
             .allocation_size(requirements.size)

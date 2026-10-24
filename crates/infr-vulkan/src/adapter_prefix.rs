@@ -306,7 +306,10 @@ impl PreparedPrefix {
                     (None, None) => true,
                     _ => false,
                 }
-                || !copy_binding_matches(buffers.selected_gpu_copy(copy_enabled), prepared.chunk.gpu_copy.as_ref())
+                || !copy_binding_matches(
+                    buffers.selected_gpu_copy(copy_enabled),
+                    prepared.chunk.gpu_copy.as_ref(),
+                )
                 || (prepared.chunk.gpu_copy.is_some() && buffers.producer.is_none())
             {
                 return None;
@@ -319,9 +322,13 @@ impl PreparedPrefix {
                         || session.slot_bytes(role).ok() != Some(bytes)
                 })
                 || prepared.copy_params.iter().any(|(roles, expected)| {
-                    prepared.chunk.gpu_copy.as_ref()
+                    prepared
+                        .chunk
+                        .gpu_copy
+                        .as_ref()
                         .and_then(|copy| copy.role_params(session, roles).ok())
-                        .as_ref() != Some(expected)
+                        .as_ref()
+                        != Some(expected)
                 })
             {
                 return None;
@@ -381,8 +388,10 @@ pub(super) fn record(
     let graph = &plan.graph;
     if let Some(chunk) = resident.as_mut() {
         let cfg = &be_.cfg().kernels.vulkan;
-        let copy_requested = resident_graph_layouts(be_, graph, be_.moe_paged())
-            .is_some_and(|layouts| resident_copy_requested(cfg.decode_gpu_resident_copy, graph, &layouts));
+        let copy_requested =
+            resident_graph_layouts(be_, graph, be_.moe_paged()).is_some_and(|layouts| {
+                resident_copy_requested(cfg.decode_gpu_resident_copy, graph, &layouts)
+            });
         if !copy_requested {
             chunk.gpu_copy = None;
         }
