@@ -117,7 +117,8 @@ function Test-UpdateAction {
 }
 
 $workRoot = if ($env:MOE4ALL_WORK_ROOT) { $env:MOE4ALL_WORK_ROOT } else { throw 'MOE4ALL_WORK_ROOT is required for wizard tests' }
-$testRoot = Join-Path (Join-Path (Join-Path $workRoot 'tmp') 'moe4all') ('wizard-test-' + [guid]::NewGuid().ToString('N'))
+$testParent = if ($env:MOE4ALL_WIZARD_TEST_TMP) { $env:MOE4ALL_WIZARD_TEST_TMP } else { Join-Path (Join-Path $workRoot 'tmp') 'moe4all' }
+$testRoot = Join-Path $testParent ('wizard-test-' + [guid]::NewGuid().ToString('N'))
 $script:Passed = 0
 try {
     New-Item -ItemType Directory -Path $testRoot | Out-Null
@@ -799,10 +800,10 @@ try {
     }
     Microsoft.PowerShell.Utility\Write-Host "Launch wizard tests passed: $script:Passed; no engine, GPU, update or user state was touched."
 } finally {
-    if ($ChildFixture -eq 'decline') {
-        Assert (-not (Test-Path -LiteralPath $statePath)) 'Declining launch must not save settings'
+    if ($ChildFixture -in @('decline', 'dry')) {
+        Assert (-not (Test-Path -LiteralPath $statePath)) 'Declining launch or DryRun must not save settings'
     } elseif ($ChildFixture) {
-        Assert (Test-Path -LiteralPath $statePath -PathType Leaf) 'Accepted launch or DryRun must save settings'
+        Assert (Test-Path -LiteralPath $statePath -PathType Leaf) 'Accepted launch must save settings'
     }
     $resolvedRoot = [System.IO.Path]::GetFullPath($testRoot)
     $tempPrefix = [System.IO.Path]::GetFullPath((Join-Path (Join-Path $workRoot 'tmp') 'moe4all')).TrimEnd('\') + '\'

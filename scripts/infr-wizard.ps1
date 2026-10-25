@@ -61,6 +61,96 @@ function Get-SavedValue {
     return $Default
 }
 
+function Get-BenchmarkGuideNow {
+    return [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+}
+
+function Test-BenchmarkGuideInteractive {
+    if ($DryRun -or [Console]::IsInputRedirected -or [Console]::IsOutputRedirected -or $env:CI) { return $false }
+    if ([Environment]::GetCommandLineArgs() -match '^-NonI(nteractive)?$') { return $false }
+    return [Environment]::UserInteractive
+}
+
+function Get-BenchmarkGuideState {
+    $result = [pscustomobject]@{ submitted = $false; next_remind_at = [long]0 }
+    $path = Join-Path $dataDir 'private\benchmark-first-submission.json'
+    try {
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            $value = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($value.submitted -is [bool] -and $value.submitted) { $result.submitted = $true }
+            $next = [long]0
+            if ([long]::TryParse([string]$value.next_remind_at, [ref]$next) -and $next -ge 0) { $result.next_remind_at = $next }
+        }
+    } catch { } # A damaged reminder must not stop normal startup.
+    return $result
+}
+
+function Save-BenchmarkGuideState {
+    param([bool]$Submitted = $false, [long]$NextRemindAt = 0)
+    if ($DryRun) { return }
+    $temporary = $null
+    try {
+        $previous = Get-BenchmarkGuideState
+        $value = [ordered]@{
+            schema_version = 1
+            submitted = ($Submitted -or $previous.submitted)
+            next_remind_at = [Math]::Max($NextRemindAt, $previous.next_remind_at)
+        }
+        $directory = Join-Path $dataDir 'private'
+        [void][IO.Directory]::CreateDirectory($directory)
+        $path = Join-Path $directory 'benchmark-first-submission.json'
+        $temporary = Join-Path $directory ('.benchmark-guide-' + [guid]::NewGuid().ToString('N'))
+        [IO.File]::WriteAllText($temporary, (($value | ConvertTo-Json) + "`n"), [Text.UTF8Encoding]::new($false))
+        if ([IO.File]::Exists($path)) { [IO.File]::Replace($temporary, $path, [System.Management.Automation.Language.NullString]::Value) }
+        else { [IO.File]::Move($temporary, $path) }
+    } catch { Write-Warning 'Could not save the benchmark reminder; normal startup will continue.' }
+    finally { if ($temporary -and [IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } }
+}
+
+function Set-BenchmarkSubmissionSucceeded {
+    param([string]$Kind)
+    if ($Kind -eq 'benchmark' -and -not $DryRun) { Save-BenchmarkGuideState -Submitted $true }
+}
+
+function Test-BenchmarkBodyReceipt {
+    param($Receipt)
+    $received = [DateTimeOffset]::MinValue
+    return ($Receipt.api_version -eq 1 -and [string]$Receipt.kind -eq 'benchmark' -and
+        [string]$Receipt.receipt_id -cmatch '^[A-Za-z0-9_-]+$' -and
+        -not [string]::IsNullOrWhiteSpace([string]$Receipt.report_id) -and
+        [string]$Receipt.file_sha256 -cmatch '^[0-9a-f]{64}$' -and
+        [string]$Receipt.payload_sha256 -cmatch '^[0-9a-f]{64}$' -and
+        [string]$Receipt.status -in @('forwarding', 'pending_review', 'published', 'rejected', 'delivery_failed') -and
+        [DateTimeOffset]::TryParse([string]$Receipt.received_at, [ref]$received))
+}
+
+function Invoke-BenchmarkStartupGuide {
+    param([bool]$Interactive = $false, [bool]$JsonAutomation = $false)
+    if (-not $Interactive -or $DryRun -or $JsonAutomation) { return $false }
+    $guide = Get-BenchmarkGuideState
+    if ($guide.submitted) { return $false }
+    # Only stored body-received metadata is historical proof; a saved browser choice is not.
+    $receipts = Join-Path $dataDir 'private\submission-receipts'
+    foreach ($file in @(Get-ChildItem -LiteralPath $receipts -Filter '*.private-receipt.json' -File -ErrorAction SilentlyContinue)) {
+        try {
+            $receipt = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+            if (Test-BenchmarkBodyReceipt $receipt) { Set-BenchmarkSubmissionSucceeded benchmark; return $false }
+        } catch { } # Never print private receipt contents or parser errors.
+    }
+    $now = Get-BenchmarkGuideNow
+    if ($now -lt $guide.next_remind_at) { return $false }
+    # Persist before asking so EOF, cancellation and failed benchmarks also get a cooldown.
+    Save-BenchmarkGuideState -NextRemindAt ($now + 172800)
+    Write-Host "`n邀请你跑一次快速 Benchmark，分享成绩到 MoE4All.com 排行榜！" -ForegroundColor Cyan
+    Write-Host 'Run a quick benchmark and share your result on the MoE4All.com leaderboard!'
+    Write-Host '上传前仍会征求同意。You will be asked before uploading.'
+    $answer = Read-Choice -Label '来试试吗？/ Give it a try?' -DefaultValue 'later' -Options @(
+        [pscustomobject]@{ Key = '1'; Value = 'try'; Label = '试试！ / Try it!' }
+        [pscustomobject]@{ Key = '2'; Value = 'later'; Label = '后面再说~ / Maybe later~' }
+    )
+    return ($answer -eq 'try')
+}
+
 function Read-TextValue {
     param(
         [Parameter(Mandatory = $true)][string]$Label,
@@ -1343,6 +1433,7 @@ function Invoke-GhSubmissionUpload {
             if ($listed.ExitCode -ne 0 -or $prUrl -notmatch '^https://github\.com/Headmaster218/MoE4All/pull/[0-9]+$') { throw 'could not create or reuse pull request' }
         }
         if ($prUrl -notmatch '^https://github\.com/Headmaster218/MoE4All/pull/[0-9]+$') { throw 'GitHub did not return a valid report PR URL' }
+        Set-BenchmarkSubmissionSucceeded -Kind $Kind
         Write-Host "PR 已创建 / PR created: $prUrl" -ForegroundColor Green
         return $true
     } catch {
@@ -1357,9 +1448,11 @@ function Invoke-GhBenchmarkUpload {
 }
 
 function Save-BenchmarkUploadPreferences {
+    if ($DryRun) { return }
     if ([string]::IsNullOrWhiteSpace($statePath)) { return }
     try {
         $preferences = $script:state
+        if ($script:BenchmarkGuideActive) { $preferences = $null }
         if ($null -eq $preferences) {
             $preferences = [ordered]@{}
             if (Test-Path -LiteralPath $statePath -PathType Leaf) {
@@ -1782,6 +1875,7 @@ function Invoke-WebsiteSubmissionUpload {
         throw '提交回执与本地文件不匹配。Submission receipt does not match the local file.'
     }
     $receiptPath = Save-Moe4AllSubmissionReceipt -Receipt $receipt -ApiBase $config.ApiBase
+    if (Test-BenchmarkBodyReceipt $receipt) { Set-BenchmarkSubmissionSucceeded -Kind $Kind }
     if ([string]$receipt.status -eq 'delivery_failed') {
         Write-Warning '该报告此前转发失败，正文已清理；请重新导出新报告。This report previously failed delivery; export a new report to try again.'
     } elseif ([string]$receipt.status -eq 'rejected') {
@@ -1871,6 +1965,7 @@ function Read-ProblemDescription {
 }
 
 function Save-ErrorUploadPreference {
+    if ($DryRun) { return }
     New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
     $value = if (Test-Path -LiteralPath $statePath -PathType Leaf) {
         try { [System.IO.File]::ReadAllText($statePath) | ConvertFrom-Json } catch { [pscustomobject]@{} }
@@ -1927,8 +2022,9 @@ function Complete-ErrorReport {
 function Read-SubmissionNextAction {
     param([switch]$Browser)
     if ($Browser) {
+        # A remembered "sent" must never confirm a different report by pressing Enter.
         $default = $script:SubmissionBrowserActionDefault
-        if ($default -notin @('sent', 'reopen', 'cloudflare', 'later')) { $default = 'later' }
+        if ($default -notin @('reopen', 'cloudflare', 'later')) { $default = 'later' }
         $value = Read-Choice -Label 'GitHub 网页提交 / GitHub web submission' -DefaultValue $default -Options @(
             [pscustomobject]@{ Key = '1'; Value = 'sent'; Label = '已成功提交 / Successfully submitted' }
             [pscustomobject]@{ Key = '2'; Value = 'reopen'; Label = '重新打开 GitHub / Reopen GitHub' }
@@ -2005,7 +2101,7 @@ function Offer-SubmissionUpload {
             }
             Write-Host '完成网页操作后再选择；向导不会查询网页提交结果。Choose after completing the web steps; the wizard does not query their result.'
             $action = Read-SubmissionNextAction -Browser
-            if ($action -eq 'sent') { Remove-PendingSubmission -Path $pendingPath; return $true }
+            if ($action -eq 'sent') { Set-BenchmarkSubmissionSucceeded -Kind $Kind; Remove-PendingSubmission -Path $pendingPath; return $true }
             if ($action -eq 'reopen') { continue }
             if ($action -eq 'cloudflare') { $channel = 'cloudflare' } else { break }
         }
@@ -2914,8 +3010,9 @@ Show-PendingUpdateResult
 Show-UpdateStatus -CurrentVersion $productVersion
 
 $reuseSavedSettings = $false
+$script:BenchmarkGuideActive = Invoke-BenchmarkStartupGuide -Interactive (Test-BenchmarkGuideInteractive) -JsonAutomation ([bool](Get-SavedValue 'json_output' $false))
 $savedModel = [string](Get-SavedValue 'model' '')
-if ($null -ne $script:Saved -and -not $InitialModelPath -and $savedModel) {
+if (-not $script:BenchmarkGuideActive -and $null -ne $script:Saved -and -not $InitialModelPath -and $savedModel) {
     if (Test-Path -LiteralPath $savedModel -PathType Leaf) {
         $reuseSavedSettings = Read-YesNo -Label '是否按上次设置直接启动？/ Start with the previous settings?' -Default $true
     } else {
@@ -3039,12 +3136,16 @@ $cpuMissCores = [string](Get-SavedValue 'cpu_miss_cores' '')
 $customSets = [string](Get-SavedValue 'custom_sets' '')
 
 if (-not $reuseSavedSettings) {
+    if ($script:BenchmarkGuideActive) {
+        $launchMode = 'benchmark'; $benchKind = 'quick'; $benchParallel = '1'; $jsonOutput = $false
+    } else {
     $launchMode = Read-Choice -Label '你想做什么？/ What would you like to do?' -DefaultValue ([string](Get-SavedValue 'launch_mode' 'chat')) -Options @(
         [pscustomobject]@{ Key = '1'; Value = 'chat'; Label = '实时终端对话（推荐）/ Interactive terminal chat (recommended)' }
         [pscustomobject]@{ Key = '2'; Value = 'server'; Label = '启动 OpenAI 兼容 API / Start OpenAI-compatible API server' }
         [pscustomobject]@{ Key = '3'; Value = 'benchmark'; Label = '性能测试 / Benchmark' }
         [pscustomobject]@{ Key = '4'; Value = 'report'; Label = '报告当前运行问题 / Report a current runtime problem' }
     )
+    }
     if ($launchMode -eq 'report') {
         try { [void](Complete-ErrorReport) } catch { Write-Warning "错误报告生成失败：$($_.Exception.Message) / Could not create the error report." }
         exit 0
@@ -3246,15 +3347,17 @@ if (-not $reuseSavedSettings) {
             $manualBenchKind = $benchKind
             $benchKind = 'manual'
         }
+        if (-not $script:BenchmarkGuideActive) {
         $benchKind = Read-Choice -Label '测试方案 / Benchmark plan' -DefaultValue $benchKind -Options @(
             [pscustomobject]@{ Key = '1'; Value = 'quick'; Label = '自动快速 / Automatic quick'; Detail = @('6K Prefill + 1024 Decode。单发，一次，可追加并发。', '6K Prefill + 1024 Decode. x1, one run; optional concurrency.') }
             [pscustomobject]@{ Key = '2'; Value = 'standard'; Label = '自动标准 / Automatic standard'; Detail = @('6K、30K Prefill + 1024 Decode；1-2 并发，各一次，共 4 次。', '6K, 30K Prefill + 1024 Decode; x1-x2, one run each, 4 runs. Shared KV, different questions.') }
             [pscustomobject]@{ Key = '3'; Value = 'full'; Label = '自动完整 / Automatic full'; Detail = @('6K、30K、150K Prefill + 1024 Decode；1-4 并发，各三次，共 36 次。', '6K, 30K, 150K Prefill + 1024 Decode; x1-x4, three runs each, 36 runs. Shared KV, different questions.') }
             [pscustomobject]@{ Key = '4'; Value = 'manual'; Label = '手动测试 / Manual benchmark'; Detail = @('按顺序添加 Prefill、Decode 和上下文深度。', 'Build one test step by step: Prefill, Decode and context depth.') }
         )
+        }
         if ($benchKind -ne 'manual') {
             $profileParallel = switch ($benchKind) { 'quick' { '1' } 'standard' { '2' } default { '4' } }
-            $benchParallel = Read-IntegerValue -Label '最大并发路数（会依次测试 x1 到 xN）/ Maximum concurrency (tests x1 through xN)' -Default $profileParallel -Minimum 1 -Maximum 4
+            if (-not $script:BenchmarkGuideActive) { $benchParallel = Read-IntegerValue -Label '最大并发路数（会依次测试 x1 到 xN）/ Maximum concurrency (tests x1 through xN)' -Default $profileParallel -Minimum 1 -Maximum 4 }
         } else {
             if ($manualBenchKind -notin @('decode', 'prefill', 'mixed')) { $manualBenchKind = 'decode' }
             $manualBenchKind = Read-Choice -Label '第一步：选择要添加的工作 / Step 1: choose work' -DefaultValue $manualBenchKind -Options @(
@@ -3518,9 +3621,11 @@ $startLabel = if ($launchMode -eq 'server') { '现在启动服务器？/ Start t
 if (-not $DryRun -and -not $reuseSavedSettings -and -not (Read-YesNo -Label $startLabel -Default $true)) {
     exit 0
 }
-New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
-$state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statePath -Encoding UTF8
-Write-Host "`n设置已保存 / Settings saved: $statePath" -ForegroundColor DarkGray
+if (-not $DryRun -and -not $script:BenchmarkGuideActive) {
+    New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
+    $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statePath -Encoding UTF8
+    Write-Host "`n设置已保存 / Settings saved: $statePath" -ForegroundColor DarkGray
+}
 if ($DryRun) {
     Write-Host 'DryRun：未启动。DryRun: command was not started.' -ForegroundColor Yellow
     exit 0
