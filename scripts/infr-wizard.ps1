@@ -2897,11 +2897,12 @@ $banner = @'
 |  \/  | ___ | ____| || |   / \ | | |
 | |\/| |/ _ \|  _| | || |_ / _ \| | |
 | |  | | (_) | |___|__   _/ ___ \ | |___
-|_|  |_|\___/|_____|  |_|/_/   \_\_|_____|
+|_|  |_|\___/|_____|  |_|/_/   \_\_|_____|.com
 '@
 
 Write-Host $banner -ForegroundColor Green
 Write-Host "  MoE4All v$productVersion" -ForegroundColor Green
+Write-Host '  https://moe4all.com' -ForegroundColor Cyan
 Write-Host '  Run models far larger than VRAM on gaming GPUs.'
 Write-Host '  让游戏显卡跑起远超显存容量的大模型。'
 Write-Host '  John / Headmaster218  https://github.com/Headmaster218/MoE4All' -ForegroundColor DarkGray

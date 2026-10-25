@@ -541,6 +541,23 @@ json_quote() {
     done
     REPLY="$out\""
 }
+show_brand() {
+    local version=$1 green='' cyan='' reset=''
+    if [[ -t 1 && ${TERM-} != dumb && -z ${NO_COLOR+x} ]]; then
+        green=$'\033[32m'; cyan=$'\033[96m'; reset=$'\033[0m'
+    fi
+    printf '%s' "$green"
+    cat <<'BANNER'
+ __  __       _____ _  _     _   _ _
+|  \/  | ___ | ____| || |   / \ | | |
+| |\/| |/ _ \|  _| | || |_ / _ \| | |
+| |  | | (_) | |___|__   _/ ___ \ | |___
+|_|  |_|\___/|_____|  |_|/_/   \_\_|_____|.com
+BANNER
+    printf '  MoE4All v%s%s\n%s  https://moe4all.com%s\n' "$version" "$reset" "$cyan" "$reset"
+    printf '  Run models far larger than VRAM on gaming GPUs.\n  让游戏显卡跑起远超显存容量的大模型。\n'
+}
+
 defaults() {
     local key
     S=(
@@ -2171,7 +2188,8 @@ main() {
     if [[ $INTERACTIVE == true && $HEADLESS == false ]]; then
         retry_pending_submissions
         value=$("$BINARY" --version 2>/dev/null || true); value=${value##* }
-        printf 'MoE4All v%s Linux 启动向导 / Launch Wizard\n上次设置会作为默认值；直接回车即可复用，输入 - 可清空。\nPress Enter to reuse the previous/default value; enter - to clear it.\n' "$value"
+        show_brand "$value"
+        printf 'Linux 启动向导 / Launch Wizard\n上次设置会作为默认值；直接回车即可复用，输入 - 可清空。\nPress Enter to reuse the previous/default value; enter - to clear it.\n'
         if [[ -n ${S[model]} && ${#OVERRIDES[@]} == 0 && ${#disables[@]} == 0 ]]; then
             absolute "${S[model]}"; if [[ -f $REPLY ]]; then yes '是否按上次设置直接启动？/ Start with the previous settings?' true; reused=$REPLY; fi
         fi
