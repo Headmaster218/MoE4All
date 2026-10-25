@@ -1570,7 +1570,7 @@ EOF
         printf '当前上传协议尚不支持混合速度，本次不上传；它不会被误记为纯 Decode。Mixed-speed upload is not supported yet; this result is not submitted as Decode.\n'
         REPLY=''; return 0
     fi
-    if ! output=$("$BINARY" submission pack-benchmark --input "$payload" --result-dir "$ROOT/benchmark-database" 2>&1); then
+    if ! output=$("$BINARY" submission pack-benchmark --input "$payload" --raw-benchmark "$raw_json" --result-dir "$ROOT/benchmark-database" 2>&1); then
         mkdir -p -- "$CONFIG_DIR/benchmark-results"
         local local_path="$CONFIG_DIR/benchmark-results/$id.json"
         printf '{"result":%s,"raw":%s}\n' "$(< "$payload")" "$(< "$raw_json")" > "$local_path"
@@ -1820,6 +1820,7 @@ managed() {
     case "/$1/" in */./*|*/../*) return 1 ;; esac
     case $1 in
         infr|Start-INFR-Wizard-macOS.sh|README.md|README_EN.md|CHANGELOG.md|infr.example.toml|LICENSE|LICENSE-MIT|NOTICE|install-manifest.json) return 0 ;;
+        scripts/benchmark-hardware.sh) return 0 ;;
         documentation/*) case ${1:l} in *.md|*.png|*.jpg|*.svg|*.webp) return 0 ;; *) return 1 ;; esac ;;
         *) return 1 ;;
     esac

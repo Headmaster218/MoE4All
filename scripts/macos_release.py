@@ -26,6 +26,7 @@ ROOT_FILES = {
     "NOTICE",
 }
 DOC_SUFFIXES = {".md", ".png", ".jpg", ".svg", ".webp"}
+SCRIPT_FILES = {"scripts/benchmark-hardware.sh"}
 
 
 def package_name(version):
@@ -47,7 +48,7 @@ def managed(name):
         part in ("", ".", "..") for part in name.split("/")
     ):
         return False
-    return name in ROOT_FILES | {"install-manifest.json"} or (
+    return name in ROOT_FILES | SCRIPT_FILES | {"install-manifest.json"} or (
         name.startswith("documentation/") and path.suffix.lower() in DOC_SUFFIXES
     )
 
@@ -97,11 +98,13 @@ def package(root, binary, output, version):
     with tempfile.TemporaryDirectory(prefix=".macos-package-", dir=output) as temporary:
         stage = Path(temporary) / name
         stage.mkdir()
-        for relative in sorted(ROOT_FILES - {"infr"}):
+        for relative in sorted((ROOT_FILES - {"infr"}) | SCRIPT_FILES):
             source = root / relative
             if not source.is_file() or source.is_symlink():
                 raise ValueError("Missing package source: " + relative)
-            shutil.copyfile(source, stage / relative)
+            target = stage / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
         shutil.copyfile(binary, stage / "infr")
         for source in sorted((root / "documentation").rglob("*")):
             relative = source.relative_to(root).as_posix()

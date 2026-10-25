@@ -1729,7 +1729,7 @@ EOF
         printf '当前上传协议尚不支持混合速度，本次不上传；它不会被误记为纯 Decode。Mixed-speed upload is not supported yet; this result is not submitted as Decode.\n'
         REPLY=''; return 0
     fi
-    if ! output=$("$BINARY" submission pack-benchmark --input "$payload" --result-dir "$ROOT/benchmark-database" 2>&1); then
+    if ! output=$("$BINARY" submission pack-benchmark --input "$payload" --raw-benchmark "$raw_json" --result-dir "$ROOT/benchmark-database" 2>&1); then
         mkdir -p -- "$CONFIG_DIR/benchmark-results"
         local local_path="$CONFIG_DIR/benchmark-results/$id.json"
         printf '{"result":%s,"raw":%s}\n' "$(< "$payload")" "$(< "$raw_json")" > "$local_path"
@@ -2025,6 +2025,7 @@ managed() {
     [[ -n $1 && $1 != /* && $1 != *\\* && ! $1 =~ (^|/)(\.|\.\.|)(/|$) && ! $1 =~ [[:cntrl:]] ]] || return 1
     case $1 in
         infr|Start-INFR-Wizard-Linux.sh|README.md|README_EN.md|CHANGELOG.md|infr.example.toml|LICENSE|LICENSE-MIT|NOTICE|install-manifest.json) return 0 ;;
+        scripts/benchmark-hardware.sh) return 0 ;;
         image-codecs/libheif.so.1|image-codecs/libde265.so.0|image-codecs/libdav1d.so.7|image-codecs/libheif-LICENSE.txt|image-codecs/libde265-LICENSE.txt|image-codecs/dav1d-LICENSE.txt|image-codecs/SOURCES.txt) return 0 ;;
         documentation/*) [[ ${1,,} =~ \.(md|png|jpg|svg|webp)$ ]] ;;
         *) return 1 ;;

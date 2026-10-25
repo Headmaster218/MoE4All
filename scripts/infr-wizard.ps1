@@ -1114,8 +1114,10 @@ function Write-ManualBenchmarkResult {
     $modelFile = Get-Item -LiteralPath $ModelPath -ErrorAction Stop
     $cpuName = $null
     $ramBytes = $null
-    try { $cpuName = [string](Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name) } catch { }
-    try { $ramBytes = [uint64](Get-CimInstance Win32_ComputerSystem | Select-Object -ExpandProperty TotalPhysicalMemory) } catch { }
+    if ($null -eq $rawResult.benchmark_metadata) {
+        try { $cpuName = [string](Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name) } catch { }
+        try { $ramBytes = [uint64](Get-CimInstance Win32_ComputerSystem | Select-Object -ExpandProperty TotalPhysicalMemory) } catch { }
+    }
     $contextTokens = if ($DepthMode -eq 'none') { 0 } else { [int64]$DepthTokens }
     if ($Kind -eq 'prefill') { $contextTokens = [int64]$PromptTokens }
     $result = [ordered]@{
@@ -1152,6 +1154,18 @@ function Write-ManualBenchmarkResult {
             failures = @()
         })
         failures = @()
+    }
+    if ($null -ne $rawResult.benchmark_metadata) {
+        $metadata = $rawResult.benchmark_metadata
+        foreach ($key in @('engine_version', 'engine_commit', 'hardware', 'model')) {
+            if ($null -ne $metadata.$key) { $result[$key] = $metadata.$key }
+        }
+        if ($null -ne $metadata.configuration) {
+            foreach ($property in $metadata.configuration.PSObject.Properties) {
+                if ($property.Name -eq 'auto_profile') { continue }
+                $result.configuration[$property.Name] = $property.Value
+            }
+        }
     }
     Write-Host "`n结果 / Results" -ForegroundColor Green
     Write-Host '+------------------+------------+----------+'
@@ -2155,319 +2169,6 @@ function Offer-PendingSubmissions {
     }
 }
 
-function ConvertFrom-SmbiosMemoryType {
-    param([int]$Type)
-    switch ($Type) {
-        20 { 'DDR' }
-        21 { 'DDR2' }
-        22 { 'DDR2 FB-DIMM' }
-        24 { 'DDR3' }
-        26 { 'DDR4' }
-        27 { 'LPDDR' }
-        28 { 'LPDDR2' }
-        29 { 'LPDDR3' }
-        30 { 'LPDDR4' }
-        34 { 'DDR5' }
-        35 { 'LPDDR5' }
-        default { $null }
-    }
-}
-
-function Get-PcieTheoreticalBandwidthGbps {
-    param([int]$Generation, [int]$Width)
-    if ($Width -le 0) { return $null }
-    $perLane = switch ($Generation) {
-        1 { 0.250 }
-        2 { 0.500 }
-        3 { 0.985 }
-        4 { 1.969 }
-        5 { 3.938 }
-        6 { 7.563 }
-        default { return $null }
-    }
-    return [Math]::Round($perLane * $Width, 3)
-}
-
-function ConvertFrom-StorageBusType {
-    param([int]$Type)
-    switch ($Type) {
-        3 { 'ATA' }
-        7 { 'USB' }
-        8 { 'RAID' }
-        10 { 'SAS' }
-        11 { 'SATA' }
-        12 { 'SD' }
-        13 { 'MMC' }
-        17 { 'NVMe' }
-        18 { 'SCM' }
-        19 { 'UFS' }
-        default { $null }
-    }
-}
-
-function ConvertFrom-StorageMediaType {
-    param([int]$Type)
-    switch ($Type) {
-        3 { 'HDD' }
-        4 { 'SSD' }
-        5 { 'SCM' }
-        default { $null }
-    }
-}
-
-function Get-PhysicalDiskReadCounter {
-    param([Parameter(Mandatory = $true)][int]$DiskIndex)
-    try {
-        $prefix = "^$([regex]::Escape([string]$DiskIndex))(?:\s|$)"
-        return Get-CimInstance Win32_PerfRawData_PerfDisk_PhysicalDisk -ErrorAction Stop |
-            Where-Object { [string]$_.Name -match $prefix } |
-            Select-Object -First 1
-    } catch {
-        return $null
-    }
-}
-
-function New-PhysicalDiskReadPerformanceCounter {
-    param([Parameter(Mandatory = $true)][int]$DiskIndex)
-    try {
-        $prefix = "^$([regex]::Escape([string]$DiskIndex))(?:\s|$)"
-        $category = [System.Diagnostics.PerformanceCounterCategory]::new('PhysicalDisk')
-        $instance = @($category.GetInstanceNames() | Where-Object { $_ -match $prefix } | Select-Object -First 1)
-        if ($instance.Count -ne 1) { return $null }
-        return [System.Diagnostics.PerformanceCounter]::new('PhysicalDisk', 'Disk Read Bytes/sec', [string]$instance[0], $true)
-    } catch {
-        return $null
-    }
-}
-
-function Measure-ModelStorageRead {
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][int]$DiskIndex
-    )
-
-    $file = Get-Item -LiteralPath $Path -ErrorAction Stop
-    if ($file.Length -lt 65536) { return $null }
-    $performanceCounter = New-PhysicalDiskReadPerformanceCounter -DiskIndex $DiskIndex
-    $before = $null
-    $beforeBytes = $null
-    if ($null -ne $performanceCounter) {
-        try { $beforeBytes = [uint64]$performanceCounter.RawValue } catch { }
-    }
-    if ($null -eq $beforeBytes) { $before = Get-PhysicalDiskReadCounter -DiskIndex $DiskIndex }
-    $seqBuffer = New-Object byte[] (4MB)
-    $seqStream = [System.IO.FileStream]::new($file.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite, $seqBuffer.Length, [System.IO.FileOptions]::SequentialScan)
-    try {
-        $seqClock = [System.Diagnostics.Stopwatch]::StartNew()
-        [int64]$seqBytes = 0
-        while ($seqClock.Elapsed.TotalSeconds -lt 0.5) {
-            $read = $seqStream.Read($seqBuffer, 0, $seqBuffer.Length)
-            if ($read -le 0) { $seqStream.Position = 0; continue }
-            $seqBytes += $read
-        }
-        $seqSeconds = $seqClock.Elapsed.TotalSeconds
-    } finally {
-        $seqStream.Dispose()
-    }
-
-    $randomBlockBytes = 64KB
-    $randomBuffer = New-Object byte[] $randomBlockBytes
-    $randomStream = [System.IO.FileStream]::new($file.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite, $randomBlockBytes, [System.IO.FileOptions]::RandomAccess)
-    try {
-        $random = [System.Random]::new(218)
-        $blockCount = [Math]::Floor($file.Length / $randomBlockBytes)
-        $randomClock = [System.Diagnostics.Stopwatch]::StartNew()
-        [int64]$randomBytes = 0
-        [int64]$randomOps = 0
-        while ($randomClock.Elapsed.TotalSeconds -lt 0.5) {
-            $block = [int64]($random.NextDouble() * $blockCount)
-            $randomStream.Position = $block * $randomBlockBytes
-            $read = $randomStream.Read($randomBuffer, 0, $randomBuffer.Length)
-            if ($read -gt 0) { $randomBytes += $read; $randomOps++ }
-        }
-        $randomSeconds = $randomClock.Elapsed.TotalSeconds
-    } finally {
-        $randomStream.Dispose()
-    }
-    $after = $null
-    $afterBytes = $null
-    if ($null -ne $performanceCounter) {
-        try { $afterBytes = [uint64]$performanceCounter.RawValue } catch { }
-        $performanceCounter.Dispose()
-    }
-    if ($null -eq $afterBytes) { $after = Get-PhysicalDiskReadCounter -DiskIndex $DiskIndex }
-
-    $applicationBytes = $seqBytes + $randomBytes
-    $physicalBytes = $null
-    if ($null -eq $beforeBytes -and $null -ne $before) { $beforeBytes = [uint64]$before.DiskReadBytesPersec }
-    if ($null -eq $afterBytes -and $null -ne $after) { $afterBytes = [uint64]$after.DiskReadBytesPersec }
-    if ($null -ne $beforeBytes -and $null -ne $afterBytes -and $afterBytes -ge $beforeBytes) {
-        $physicalBytes = [uint64]($afterBytes - $beforeBytes)
-    }
-    $cacheDisposition = $null
-    $physicalFraction = $null
-    if ($null -ne $physicalBytes -and $applicationBytes -gt 0) {
-        $physicalFraction = [Math]::Round([Math]::Min(1.0, $physicalBytes / [double]$applicationBytes), 4)
-        $cacheDisposition = if ($physicalFraction -ge 0.75) { 'mostly_physical' } elseif ($physicalFraction -le 0.10) { 'mostly_cached' } else { 'mixed' }
-    }
-    return [pscustomobject][ordered]@{
-        mode = 'buffered_read_only_before_benchmark'
-        sampled_file_bytes = [uint64]$file.Length
-        sequential = [pscustomobject][ordered]@{
-            seconds = [Math]::Round($seqSeconds, 6)
-            bytes = [uint64]$seqBytes
-            mib_per_second = [Math]::Round($seqBytes / 1MB / $seqSeconds, 3)
-        }
-        random_64k = [pscustomobject][ordered]@{
-            seconds = [Math]::Round($randomSeconds, 6)
-            operations = [uint64]$randomOps
-            bytes = [uint64]$randomBytes
-            mib_per_second = [Math]::Round($randomBytes / 1MB / $randomSeconds, 3)
-            iops = [Math]::Round($randomOps / $randomSeconds, 3)
-        }
-        physical_disk_read_bytes = $physicalBytes
-        physical_read_fraction = $physicalFraction
-        cache_disposition = $cacheDisposition
-    }
-}
-
-function Get-WindowsBenchmarkModelStorageDetails {
-    param([Parameter(Mandatory = $true)][string]$ModelPath)
-
-    try {
-        $root = [System.IO.Path]::GetPathRoot($ModelPath)
-        if ($root -notmatch '^([A-Za-z]):\\$') { return $null }
-        $logical = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}:'" -f $Matches[1]) -ErrorAction Stop
-        $partition = @(Get-CimAssociatedInstance -InputObject $logical -Association Win32_LogicalDiskToPartition -ErrorAction Stop | Select-Object -First 1)
-        $drive = @($partition | ForEach-Object { Get-CimAssociatedInstance -InputObject $_ -Association Win32_DiskDriveToDiskPartition -ErrorAction Stop } | Select-Object -First 1)
-        if ($drive.Count -eq 0) { return $null }
-
-        $diskIndex = [int]$drive[0].Index
-        $physical = $null
-        try {
-            $physical = Get-CimInstance -Namespace 'root/Microsoft/Windows/Storage' -ClassName MSFT_PhysicalDisk -Filter ("DeviceId='{0}'" -f $diskIndex) -ErrorAction Stop | Select-Object -First 1
-        } catch { }
-        $busType = if ($null -ne $physical) { ConvertFrom-StorageBusType -Type ([int]$physical.BusType) } elseif ([string]$drive[0].PNPDeviceID -match 'NVME') { 'NVMe' } else { [string]$drive[0].InterfaceType }
-        $mediaType = if ($null -ne $physical) { ConvertFrom-StorageMediaType -Type ([int]$physical.MediaType) } else { [string]$drive[0].MediaType }
-        return [pscustomobject][ordered]@{
-            model = [string]$drive[0].Model
-            media_type = $mediaType
-            bus_type = $busType
-            size_bytes = [uint64]$drive[0].Size
-            filesystem = [string]$logical.FileSystem
-            read_probe = Measure-ModelStorageRead -Path $ModelPath -DiskIndex $diskIndex
-        }
-    } catch {
-        return $null
-    }
-}
-
-function Get-WindowsBenchmarkHardwareDetails {
-    param(
-        [Parameter(Mandatory = $true)][string]$ModelPath,
-        [AllowEmptyString()][string]$SelectedGpuName = '',
-        $ModelStorage = $null
-    )
-
-    $modules = @()
-    try {
-        $modules = @(Get-CimInstance Win32_PhysicalMemory -ErrorAction Stop | ForEach-Object {
-            $generation = ConvertFrom-SmbiosMemoryType -Type ([int]$_.SMBIOSMemoryType)
-            [pscustomobject][ordered]@{
-                capacity_bytes = [uint64]$_.Capacity
-                generation = $generation
-                speed_mt_s = if ($_.Speed) { [uint64]$_.Speed } else { $null }
-                configured_speed_mt_s = if ($_.ConfiguredClockSpeed) { [uint64]$_.ConfiguredClockSpeed } else { $null }
-                manufacturer = if ($_.Manufacturer) { ([string]$_.Manufacturer).Trim() } else { $null }
-                part_number = if ($_.PartNumber) { ([string]$_.PartNumber).Trim() } else { $null }
-            }
-        })
-    } catch { }
-    $generations = @($modules | ForEach-Object { $_.generation } | Where-Object { $_ } | Sort-Object -Unique)
-    $memoryGeneration = if ($generations.Count -eq 1) { $generations[0] } elseif ($generations.Count -gt 1) { 'Mixed: ' + ($generations -join ', ') } else { $null }
-
-    $gpuLinks = @()
-    if (-not [string]::IsNullOrWhiteSpace($SelectedGpuName)) {
-        try {
-            $linkKeys = @(
-                'DEVPKEY_PciDevice_CurrentLinkSpeed', 'DEVPKEY_PciDevice_CurrentLinkWidth',
-                'DEVPKEY_PciDevice_MaxLinkSpeed', 'DEVPKEY_PciDevice_MaxLinkWidth'
-            )
-            $gpuLinks = @(Get-CimInstance Win32_VideoController -ErrorAction Stop | Where-Object {
-                [string]$_.PNPDeviceID -like 'PCI\*' -and [string]$_.Name -eq $SelectedGpuName
-            } | Select-Object -First 1 | ForEach-Object {
-                $properties = @(Get-PnpDeviceProperty -InstanceId $_.PNPDeviceID -KeyName $linkKeys -ErrorAction SilentlyContinue)
-                $get = { param($key) $entry = $properties | Where-Object KeyName -eq $key | Select-Object -First 1; if ($null -ne $entry -and $null -ne $entry.Data -and [int]$entry.Data -gt 0) { [int]$entry.Data } else { $null } }
-                $currentGeneration = & $get 'DEVPKEY_PciDevice_CurrentLinkSpeed'
-                $currentWidth = & $get 'DEVPKEY_PciDevice_CurrentLinkWidth'
-                $maxGeneration = & $get 'DEVPKEY_PciDevice_MaxLinkSpeed'
-                $maxWidth = & $get 'DEVPKEY_PciDevice_MaxLinkWidth'
-                [pscustomobject][ordered]@{
-                    name = [string]$_.Name
-                    current_generation = $currentGeneration
-                    current_width = $currentWidth
-                    max_generation = $maxGeneration
-                    max_width = $maxWidth
-                    current_theoretical_one_way_gb_per_second = Get-PcieTheoreticalBandwidthGbps -Generation $currentGeneration -Width $currentWidth
-                    max_theoretical_one_way_gb_per_second = Get-PcieTheoreticalBandwidthGbps -Generation $maxGeneration -Width $maxWidth
-                    source = 'windows_pnp'
-                }
-            })
-        } catch { }
-    }
-
-    if ($null -eq $ModelStorage) { $ModelStorage = Get-WindowsBenchmarkModelStorageDetails -ModelPath $ModelPath }
-    return [pscustomobject]@{
-        MemoryGeneration = $memoryGeneration
-        MemoryModules = $modules
-        GpuLinks = $gpuLinks
-        ModelStorage = $ModelStorage
-    }
-}
-
-function Set-JsonProperty {
-    param([Parameter(Mandatory = $true)]$Object, [Parameter(Mandatory = $true)][string]$Name, $Value)
-    if ($Object.PSObject.Properties.Name -contains $Name) { $Object.$Name = $Value } else { $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value }
-}
-
-function Add-BenchmarkHardwareDetails {
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)]$Details
-    )
-    $value = Read-MoE4AllSubmissionPayload -Path $Path
-    if ($null -eq $value.hardware) { return }
-    if ($null -ne $value.hardware.ram) {
-        Set-JsonProperty -Object $value.hardware.ram -Name 'memory_generation' -Value $Details.MemoryGeneration
-        Set-JsonProperty -Object $value.hardware.ram -Name 'module_count' -Value @($Details.MemoryModules).Count
-        Set-JsonProperty -Object $value.hardware.ram -Name 'modules' -Value @($Details.MemoryModules)
-    }
-    if ($null -ne $value.hardware.gpu -and $value.hardware.gpu.name) {
-        $matches = @($Details.GpuLinks | Where-Object { [string]$_.name -eq [string]$value.hardware.gpu.name })
-        if ($matches.Count -eq 1) {
-            $link = $matches[0]
-            Set-JsonProperty -Object $value.hardware.gpu -Name 'pcie_generation' -Value $link.current_generation
-            Set-JsonProperty -Object $value.hardware.gpu -Name 'pcie_width' -Value $link.current_width
-            Set-JsonProperty -Object $value.hardware.gpu -Name 'pcie_max_generation' -Value $link.max_generation
-            Set-JsonProperty -Object $value.hardware.gpu -Name 'pcie_max_width' -Value $link.max_width
-            Set-JsonProperty -Object $value.hardware.gpu -Name 'pcie_theoretical_one_way_gb_per_second' -Value $link.current_theoretical_one_way_gb_per_second
-            Set-JsonProperty -Object $value.hardware.gpu -Name 'pcie_max_theoretical_one_way_gb_per_second' -Value $link.max_theoretical_one_way_gb_per_second
-            Set-JsonProperty -Object $value.hardware.gpu -Name 'pcie_source' -Value $link.source
-        }
-    }
-    Set-JsonProperty -Object $value.hardware -Name 'model_storage' -Value $Details.ModelStorage
-    New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
-    $temporary = Join-Path $dataDir ("benchmark-enrichment-{0}.json" -f [Guid]::NewGuid().ToString('N'))
-    try {
-        [System.IO.File]::WriteAllText($temporary, (($value | ConvertTo-Json -Depth 20 -Compress) + "`n"), [System.Text.UTF8Encoding]::new($false))
-        $repacked = Invoke-NativeCommandResult -Executable $infrPath -Arguments @('submission', 'repack-benchmark', '--source', $Path, '--input', $temporary)
-        if ($repacked.ExitCode -ne 0) {
-            throw "submission repack failed: $($repacked.Output -join ' ')"
-        }
-    } finally {
-        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
-    }
-}
 
 function Select-EmbeddingModelPath {
     param([AllowEmptyString()][string]$Default = '')
@@ -3654,15 +3355,6 @@ $benchmarkFilesBefore = @()
 if ($launchMode -eq 'benchmark') { $benchmarkFilesBefore = @(Get-BenchmarkSubmissionSnapshot) }
 $errorReportsBefore = @(Get-ErrorSubmissionSnapshot)
 $benchmarkResultPath = $null
-$benchmarkModelStorage = $null
-if ($launchMode -eq 'benchmark') {
-    Write-Host '正在进行模型盘短读测（只读，约 2 秒）... / Running a short read-only model-storage probe (about 2 seconds)...' -ForegroundColor DarkGray
-    try {
-        $benchmarkModelStorage = Get-WindowsBenchmarkModelStorageDetails -ModelPath $modelPath
-    } catch {
-        Write-Warning "模型盘信息采集失败，将继续 benchmark：$($_.Exception.Message) / Model-storage collection failed; benchmark will continue."
-    }
-}
 $previousApiKey = [Environment]::GetEnvironmentVariable('INFR_API_KEY', 'Process')
 $hadApiKey = $null -ne $previousApiKey
 $previousDiagnosticDir = [Environment]::GetEnvironmentVariable('INFR_DIAGNOSTIC_DIR', 'Process')
@@ -3707,27 +3399,6 @@ if ($launchMode -eq 'benchmark' -and $benchKind -ne 'manual') {
 $benchmarkUploadRequested = $false
 if ($benchmarkResultPath) {
     $benchmarkUploadRequested = Read-BenchmarkUploadConsent
-}
-if ($benchmarkResultPath) {
-    try {
-        $resultGpuName = ''
-        try {
-            $resultValue = Read-MoE4AllSubmissionPayload -Path $benchmarkResultPath
-            $resultGpuName = [string]$resultValue.hardware.gpu.name
-        } catch { }
-        if ([string]::IsNullOrWhiteSpace($resultGpuName)) {
-            $deviceProbe = Invoke-NativeCommandResult -Executable $infrPath -Arguments @('devices')
-            if ($deviceProbe.ExitCode -eq 0) {
-                $devicePattern = '^\s*' + [regex]::Escape($device) + ':\s+(.+?)\s+\[[^\]]+\]'
-                $deviceLine = @($deviceProbe.Output | Where-Object { [string]$_ -match $devicePattern } | Select-Object -First 1)
-                if ($deviceLine.Count -eq 1 -and [string]$deviceLine[0] -match $devicePattern) { $resultGpuName = $Matches[1] }
-            }
-        }
-        $benchmarkHardwareDetails = Get-WindowsBenchmarkHardwareDetails -ModelPath $modelPath -SelectedGpuName $resultGpuName -ModelStorage $benchmarkModelStorage
-        Add-BenchmarkHardwareDetails -Path $benchmarkResultPath -Details $benchmarkHardwareDetails
-    } catch {
-        Write-Warning "Benchmark 提交的硬件信息补全失败：$($_.Exception.Message) / Could not enrich benchmark submission hardware details."
-    }
 }
 if ($benchmarkResultPath -and $benchmarkUploadRequested) {
     Invoke-BenchmarkUploadSafely -Path $benchmarkResultPath -ConsentAlreadyGranted

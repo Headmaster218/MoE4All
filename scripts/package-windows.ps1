@@ -76,6 +76,7 @@ foreach ($file in $rootFiles) {
     Copy-Item -LiteralPath $sourcePath -Destination (Join-Path $stagingPath $file)
 }
 $packagedScripts = @(
+    'benchmark-hardware.ps1'
     'infr-wizard.ps1'
     'moe4all-update-common.ps1'
     'apply-engine-update.ps1'

@@ -200,6 +200,24 @@ impl<B, X> DenseSession<B, X> {
     pub fn cfg(&self) -> &std::sync::Arc<crate::EngineConfig> {
         &self.cfg
     }
+
+    /// Read-only benchmark attribution for the backend actually bound by this session.
+    pub fn benchmark_capabilities(&self) -> infr_core::backend::Capabilities
+    where
+        B: Backend,
+    {
+        self.be.capabilities()
+    }
+
+    /// Report only uniform allocated formats; uninitialized or mixed pools remain unknown.
+    pub fn benchmark_kv_formats(&self) -> Option<(DType, DType)> {
+        if self.pool.slots.iter().any(Option::is_none) {
+            return None;
+        }
+        let mut formats = self.pool.slots.iter().flatten().map(|kv| kv.kv_formats());
+        let first = formats.next()?;
+        formats.all(|format| format == first).then_some(first)
+    }
 }
 
 /// The Vulkan session's [`DenseSession::ext`] state: that session's OWN placement pins (see

@@ -32,6 +32,9 @@
 //! that state into any free resident slot. This extends the number of retained conversations; it
 //! does not alter the scheduler policy described above.
 
+#[path = "parallel_report.rs"]
+mod parallel_report;
+
 use crate::sampling::{ParallelSampler, RequestCtx, RequestSampling, StepGate};
 use crate::seam::SeamKv;
 use crate::session_cache::{MtpCacheSource, SessionCache};

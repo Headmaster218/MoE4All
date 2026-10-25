@@ -1190,6 +1190,11 @@ impl SeamKv {
         self.k_fmt == DType::Q8_0 && self.v_fmt == DType::Q8_0
     }
 
+    /// Allocated cache formats, without cloning token history or accessing device buffers.
+    pub(crate) fn kv_formats(&self) -> (DType, DType) {
+        (self.k_fmt, self.v_fmt)
+    }
+
     /// Longest common prefix of this slot's materialized tokens and `prompt` — the slot-selection
     /// score for multi-conversation serve.
     pub(crate) fn prefix_score(&self, prompt: &[u32]) -> usize {

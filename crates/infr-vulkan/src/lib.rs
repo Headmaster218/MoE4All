@@ -11,6 +11,7 @@
 
 mod adapter;
 mod arena;
+pub mod benchmark_report;
 mod caps;
 mod cpu_miss;
 pub mod ep;
