@@ -369,6 +369,9 @@ knobs! {
     "INFR_SERVE_STATS_SECS" => "serve.stats_interval_secs", Int, Ignored, "10", migrated;
     "INFR_SHUTDOWN_FILE" => "serve.shutdown_file", Path, Ignored, "worker.stop", migrated;
     "INFR_EMBEDDING_RUNNER" => "serve.embedding_runner", Path, Ignored, "llama-server", migrated;
+    // `0` = response state OFF (the stateless 400 path), a VALUE like the two knobs above —
+    // the env layer must not filter non-positive values. See `ServeCfg::response_store_entries`.
+    "INFR_RESPONSE_STORE_ENTRIES" => "serve.response_store_entries", Int, Ignored, "64", migrated;
 
     // ── hub (§6.9) ───────────────────────────────────────────────────────────
     "INFR_HF_ENDPOINT" => "hub.endpoint", Text, Ignored, "https://hf-mirror.com", migrated;

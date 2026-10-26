@@ -13243,8 +13243,8 @@ mod tests {
     #[test]
     fn frontier_checkpoint_does_not_create_a_tiny_prefill_tail() {
         let checkpoints = [None, Some(4063)];
-        assert_eq!(prefill_chunk_end(0, 4063, 2048, &checkpoints), 2048);
-        assert_eq!(prefill_chunk_end(2048, 4063, 2048, &checkpoints), 4063);
+        assert_eq!(prefill_chunk_end(0, 4063, 2048, &checkpoints, 0), 2048);
+        assert_eq!(prefill_chunk_end(2048, 4063, 2048, &checkpoints, 0), 4063);
     }
 
     #[test]

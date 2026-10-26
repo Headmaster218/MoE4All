@@ -97,6 +97,9 @@ fn trip(axis: &str, avail: u64, water_line: u64) -> ! {
         water_line_bytes = water_line,
         "[mem-guard] TRIP: {axis} headroom below the water line - exiting to protect the box"
     );
+    // print-ok: last-words-on-hard-exit — `process::exit` skips Drop/flush, so the tracing
+    // error above may never reach a sink; this stderr line is the only guaranteed witness of
+    // WHY exit 87 fired.
     eprintln!(
         "[mem-guard] {axis} headroom {} MiB < {} MiB water line; aborting (exit {EXIT_CODE})",
         avail >> 20,

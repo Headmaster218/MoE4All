@@ -1689,6 +1689,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_KV_RAM_CACHE_MAX",
         "INFR_KV_PAGED_PAGE_TOKENS",
         "INFR_KV_PAGED_CACHE_MAX",
+        "INFR_RESPONSE_STORE_ENTRIES",
     ];
 
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();

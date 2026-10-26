@@ -38,6 +38,10 @@ const REPORT_FILES: &[&str] = &[
     "infr-metal/src/shaders.rs",
     // The shared TEST harness: every caller of `SweepReport::assert_ok` is a `#[test]`.
     "infr-testkit/src/lib.rs",
+    // `mem_guard::trip`'s last-words line: `process::exit` skips Drop/flush, so the tracing
+    // error above it may never reach a sink — this stderr line is the only guaranteed witness
+    // of WHY exit 87 fired (the gray-zone probes grep for exactly that).
+    "infr-core/src/memguard.rs",
 ];
 
 /// The four macros. `write!`/`writeln!` to an explicit stream are fine — they name their sink.

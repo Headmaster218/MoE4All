@@ -458,6 +458,9 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.serve.stats_interval_secs = num::<u64>(get, "INFR_SERVE_STATS_SECS");
     p.serve.shutdown_file = opt_path(get, "INFR_SHUTDOWN_FILE");
     p.serve.embedding_runner = opt_path(get, "INFR_EMBEDDING_RUNNER");
+    // Same "`0` is a VALUE" grammar as the deadline above: `0` means "response state OFF" (the
+    // stateless rejection path), so it must survive this layer to turn a config-file setting off.
+    p.serve.response_store_entries = num::<u32>(get, "INFR_RESPONSE_STORE_ENTRIES");
 
     // ── hub ──────────────────────────────────────────────────────────────────
     if let Some(endpoint) = get("INFR_HF_ENDPOINT") {

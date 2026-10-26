@@ -660,7 +660,7 @@ fn validate_tool_choice(
 }
 
 /// A single chat message.  `content` may be a JSON string or a content-part array.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatMessageDto {
     pub role: String,
     #[serde(default)]
@@ -2090,6 +2090,11 @@ pub struct AppState {
     /// Presentation-only slot registry. It mirrors admission permits but never participates in
     /// scheduling; request progress is read from each request's existing local state.
     dashboard: Arc<ActivityDashboard>,
+    /// Server-side `/v1/responses` state (`previous_response_id` chains, `conversation` cursors),
+    /// LRU-bounded by `serve.response_store_entries` (0 = feature OFF, chains rejected as before).
+    /// Holds message DTOs only — chained requests rebuild the same token prefix and the paged KV
+    /// radix tree hits it on its own; no KV is pinned here.
+    response_store: Arc<Mutex<responses::ResponseStore>>,
 }
 
 impl AppState {
@@ -2112,6 +2117,10 @@ impl AppState {
             dashboard: Arc::new(ActivityDashboard::new(&models, &embeddings)),
             models,
             embeddings,
+            // Bound read off `cfg` BEFORE it moves into the struct field below.
+            response_store: Arc::new(Mutex::new(responses::ResponseStore::new(
+                cfg.serve.response_store_entries,
+            ))),
             cfg,
             stats: Arc::default(),
         }
@@ -2140,6 +2149,10 @@ impl AppState {
             dashboard: Arc::new(ActivityDashboard::new(&models, &embeddings)),
             models,
             embeddings,
+            // Bound read off `cfg` BEFORE it moves into the struct field below.
+            response_store: Arc::new(Mutex::new(responses::ResponseStore::new(
+                cfg.serve.response_store_entries,
+            ))),
             cfg,
             stats: Arc::default(),
         }
@@ -2155,6 +2168,10 @@ impl AppState {
             dashboard: Arc::new(ActivityDashboard::new(&models, &embeddings)),
             models,
             embeddings,
+            // Bound read off `cfg` BEFORE it moves into the struct field below.
+            response_store: Arc::new(Mutex::new(responses::ResponseStore::new(
+                cfg.serve.response_store_entries,
+            ))),
             cfg,
             stats: Arc::default(),
         }
@@ -2215,6 +2232,10 @@ impl AppState {
             dashboard: Arc::new(ActivityDashboard::new(&models, &embeddings)),
             models,
             embeddings,
+            // Bound read off `cfg` BEFORE it moves into the struct field below.
+            response_store: Arc::new(Mutex::new(responses::ResponseStore::new(
+                cfg.serve.response_store_entries,
+            ))),
             cfg,
             stats: Arc::default(),
         }

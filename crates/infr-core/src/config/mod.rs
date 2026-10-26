@@ -1057,6 +1057,15 @@ cfg_struct! {
         /// `INFR_EMBEDDING_RUNNER`: optional llama-server executable used by the managed embedding
         /// worker. Unset lets the embedding adapter discover a compatible runner.
         embedding_runner: Option<PathBuf> = None,
+        /// `INFR_RESPONSE_STORE_ENTRIES`: LRU bound on server-side `/v1/responses` state
+        /// (`previous_response_id` chains and `conversation` cursors). `0` (the default) keeps
+        /// the stateless contract — those fields are rejected with a 400 exactly as before.
+        ///
+        /// When ON, a chained request replays the stored message history and appends the new
+        /// turn, so the rebuilt prompt shares the previous turn's exact token prefix; the paged
+        /// KV radix tree (`best_match`) then hits that prefix on its own. The store holds DTOs
+        /// only — no KV is pinned here, eviction of cached KV pages is unaffected.
+        response_store_entries: u32 = 0,
     }
 }
 
