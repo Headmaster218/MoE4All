@@ -881,9 +881,7 @@ impl super::gpu_copy::GpuCopyBuffers {
                     .zip(disabled.iter())
                     .all(|(pool, mask)| {
                         pool.pager.n_slots() == mask.len()
-                            && mask.iter().enumerate().all(|(slot, &off)| {
-                                pool.pager.pager.slot_enabled(slot as u32) != off
-                            })
+                            && pool.pager.pager.disabled() == mask.as_slice()
                     });
             if !unchanged {
                 return Err(be("GPU-owned expert layout changed without a handoff"));

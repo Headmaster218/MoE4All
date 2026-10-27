@@ -360,6 +360,12 @@ impl Pager {
         !self.disabled[self.slot_idx(slot)]
     }
 
+    /// Borrowed physical-slot mask; true means disabled. Both free and resident enabled slots
+    /// are false, with the same indexing and meaning as [`PagerSnapshot::disabled`].
+    pub fn disabled(&self) -> &[bool] {
+        &self.disabled
+    }
+
     pub fn stats(&self) -> PagerStats {
         self.stats
     }
@@ -1216,6 +1222,156 @@ pub fn ring_bytes(pager_budget: u64, ring: Option<crate::SizeSpec>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scalar_disabled_mask_matches(pager: &Pager, mask: &[bool]) -> bool {
+        pager.n_slots() == mask.len()
+            && mask
+                .iter()
+                .enumerate()
+                .all(|(slot, &off)| pager.slot_enabled(slot as u32) != off)
+    }
+
+    fn assert_disabled_mask_matches(pager: &Pager, mask: &[bool], expected: bool) {
+        let before = admission_state(pager);
+        assert_eq!(scalar_disabled_mask_matches(pager, mask), expected);
+        assert_eq!(
+            pager.n_slots() == mask.len() && pager.disabled() == mask,
+            expected
+        );
+        assert_eq!(
+            pager.disabled(),
+            pager.snapshot_for_handoff().unwrap().disabled()
+        );
+        assert_eq!(admission_state(pager), before);
+    }
+
+    #[test]
+    fn disabled_mask_view_tracks_free_resident_disabled_and_enabled_slots() {
+        let mut pager = Pager::new(6);
+        let enabled = [false; 6];
+        assert_disabled_mask_matches(&pager, &enabled, true);
+        assert!(matches!(pager.touch(10), Resolution::Miss { slot: 0, .. }));
+        assert_disabled_mask_matches(&pager, &enabled, true);
+
+        assert_eq!(pager.disable_slot(0), Some(10));
+        assert_eq!(pager.disable_slot(5), None);
+        let disabled = [true, false, false, false, false, true];
+        assert_disabled_mask_matches(&pager, &disabled, true);
+        assert_disabled_mask_matches(&pager, &enabled, false);
+
+        pager.enable_slot(0);
+        assert_disabled_mask_matches(&pager, &disabled, false);
+        assert_disabled_mask_matches(
+            &pager,
+            &[false, false, false, false, false, true],
+            true,
+        );
+        pager.enable_slot(5);
+        assert_disabled_mask_matches(&pager, &enabled, true);
+        assert_disabled_mask_matches(&pager, &disabled, false);
+    }
+
+    #[test]
+    fn disabled_mask_slice_equality_matches_scalar_for_every_small_mask() {
+        for slots in 1..=7 {
+            for actual in 0..(1usize << slots) {
+                let mut pager = Pager::new(slots);
+                for slot in 0..slots {
+                    if actual & (1 << slot) != 0 {
+                        pager.disable_slot(slot as u32);
+                    }
+                }
+                let before = admission_state(&pager);
+                for expected in 0..(1usize << slots) {
+                    let mask = (0..slots)
+                        .map(|slot| expected & (1 << slot) != 0)
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        scalar_disabled_mask_matches(&pager, &mask),
+                        actual == expected
+                    );
+                    assert_eq!(pager.disabled() == mask.as_slice(), actual == expected);
+                }
+                assert_eq!(admission_state(&pager), before);
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_mask_equality_rejects_empty_short_and_long_masks() {
+        // Pager::new(0) is invalid; an empty expected mask must reject a valid pager.
+        for slots in [1, 8] {
+            let pager = Pager::new(slots);
+            for length in [0, slots - 1, slots + 1] {
+                assert_disabled_mask_matches(&pager, &vec![false; length], false);
+            }
+            assert_disabled_mask_matches(&pager, &vec![false; slots], true);
+        }
+    }
+
+    #[test]
+    fn disabled_mask_large_comparison_detects_first_middle_and_last_changes() {
+        let mut pager = Pager::new(16_384);
+        for slot in (0..pager.n_slots()).step_by(257) {
+            pager.disable_slot(slot as u32);
+        }
+        let mask = pager.disabled().to_vec();
+        assert_disabled_mask_matches(&pager, &mask, true);
+        for slot in [0, mask.len() / 2, mask.len() - 1] {
+            let mut changed = mask.clone();
+            changed[slot] = !changed[slot];
+            assert_disabled_mask_matches(&pager, &changed, false);
+        }
+    }
+
+    #[test]
+    #[ignore = "manual CPU microbenchmark; compare scalar and slice masks in an optimized build"]
+    fn disabled_mask_scalar_vs_slice_microbenchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const ITERATIONS: usize = 10_000;
+        for slots in [64, 1_024, 16_384] {
+            let pager = Pager::new(slots);
+            for (label, difference) in [
+                ("equal", None),
+                ("early", Some(0)),
+                ("late", Some(slots - 1)),
+            ] {
+                let mut mask = pager.disabled().to_vec();
+                if let Some(slot) = difference {
+                    mask[slot] = !mask[slot];
+                }
+                let started = Instant::now();
+                let mut scalar_matches = 0;
+                for _ in 0..ITERATIONS {
+                    scalar_matches += usize::from(black_box(scalar_disabled_mask_matches(
+                        black_box(&pager),
+                        black_box(mask.as_slice()),
+                    )));
+                }
+                let scalar_ns = started.elapsed().as_nanos();
+                let started = Instant::now();
+                let mut slice_matches = 0;
+                for _ in 0..ITERATIONS {
+                    let pager = black_box(&pager);
+                    let mask = black_box(mask.as_slice());
+                    slice_matches += usize::from(black_box(
+                        pager.n_slots() == mask.len() && pager.disabled() == mask,
+                    ));
+                }
+                let slice_ns = started.elapsed().as_nanos();
+                assert_eq!(scalar_matches, slice_matches);
+                assert_eq!(
+                    scalar_matches,
+                    if difference.is_none() { ITERATIONS } else { 0 }
+                );
+                eprintln!(
+                    "disabled mask slots={slots} case={label} iterations={ITERATIONS} scalar_ns={scalar_ns} slice_ns={slice_ns}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn replacement_slots_are_bounded_read_only_and_skip_explicit_pins() {
