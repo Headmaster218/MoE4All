@@ -36,6 +36,7 @@
 mod parallel_report;
 
 use crate::sampling::{ParallelSampler, RequestCtx, RequestSampling, StepGate};
+use crate::seam::token_delivery::{self, ParallelTokenCallback, TokenDelivery};
 use crate::seam::SeamKv;
 use crate::session_cache::{MtpCacheSource, SessionCache};
 use crate::{Config, GenStats, SeamModel};
@@ -1004,6 +1005,41 @@ fn token_lane_prefill_fallback(
 struct BatchChannels {
     events: SyncSender<BatchEvent>,
     acknowledgements: Receiver<bool>,
+}
+
+struct BatchTokenDelivery<'a> {
+    engine: &'a ParallelSeam,
+    channels: &'a [Option<BatchChannels>],
+    progress_bases: &'a [(usize, usize, usize)],
+    streamed: &'a mut [usize],
+}
+
+impl TokenDelivery for BatchTokenDelivery<'_> {
+    fn send_token(&mut self, lane: usize, id: u32) -> bool {
+        self.streamed[lane] += 1;
+        let (prompt_tokens, cached_prompt_tokens, generated) = self.progress_bases[lane];
+        let progress = self.engine.batch_decode_progress(
+            prompt_tokens,
+            cached_prompt_tokens,
+            generated.saturating_add(self.streamed[lane]),
+        );
+        self.channels
+            .get(lane)
+            .and_then(Option::as_ref)
+            .is_some_and(|channels| {
+                channels
+                    .events
+                    .send(BatchEvent::Token { id, progress })
+                    .is_ok()
+            })
+    }
+
+    fn receive_ack(&mut self, lane: usize) -> bool {
+        self.channels
+            .get(lane)
+            .and_then(Option::as_ref)
+            .is_some_and(|channels| channels.acknowledgements.recv().unwrap_or(false))
+    }
 }
 
 #[derive(Default)]
@@ -3575,52 +3611,6 @@ impl ParallelSeam {
         };
         let mut lookup_search_secs = vec![0.0; lookups.len()];
         let mut lookup_delivery_secs = 0.0;
-        let mut stream = |lane: usize, id: u32| {
-            let delivery_t0 = lookup_t0.map(|_| Instant::now());
-            streamed[lane] += 1;
-            let (prompt_tokens, cached_prompt_tokens, generated) = progress_bases[lane];
-            let progress = self.batch_decode_progress(
-                prompt_tokens,
-                cached_prompt_tokens,
-                generated.saturating_add(streamed[lane]),
-            );
-            let keep_going =
-                channels
-                    .get_mut(lane)
-                    .and_then(Option::as_mut)
-                    .is_some_and(|channels| {
-                        channels
-                            .events
-                            .send(BatchEvent::Token { id, progress })
-                            .is_ok()
-                            && channels.acknowledgements.recv().unwrap_or(false)
-                    });
-            accepted[lane] = keep_going;
-            if let Some(lookup) = lookups.get_mut(lane).and_then(Option::as_mut) {
-                let budget = if lookup_single_decode {
-                    lookup_draft_budget(
-                        lookup_max_draft,
-                        lookup_output_limit.saturating_sub(generated + streamed[lane]),
-                        lookup.indexed_len + 1,
-                        self.max_ctx,
-                        lookup_qsa_threshold,
-                    )
-                } else {
-                    0
-                };
-                lookup_search_secs[lane] += lookup.observe_ordinary_token(
-                    id,
-                    keep_going,
-                    lookup_single_decode,
-                    budget,
-                    self.batch_interrupt.as_ref(),
-                );
-            }
-            if let Some(t0) = delivery_t0 {
-                lookup_delivery_secs += t0.elapsed().as_secs_f64();
-            }
-            keep_going
-        };
         let group_req = match &self.gate {
             Some(gate) => {
                 RequestCtx::with_gate(active[indices[0]].sampling.clone(), Arc::clone(gate))
@@ -3629,28 +3619,102 @@ impl ParallelSeam {
         };
         // This shared service path reaches execute_parallel_token_forward in the runner:
         // split PLE Decode admits L0 and tail together before either plan submits work.
-        let result = crate::seam::generate_dense_vulkan_parallel_sampled_session(
-            self.vk.as_ref(),
-            self.model.gguf(),
-            self.model.config(),
-            self.model.engine_cfg(),
-            self.model.embd(),
-            self.model.per_layer_embd(),
-            &prompts,
-            &prompt_ends,
-            &checkpoints,
-            &mrope_plans,
-            max_steps,
-            &mut primary,
-            &mut peers,
-            self.max_ctx,
-            &mut samplers,
-            &mut reasoning_guards,
-            &mut stream,
-            Some(&self.batch_interrupt),
-            Some(&group_req),
-            sync_mtp,
-        );
+        let mut run = |on_token: ParallelTokenCallback<'_>| {
+            crate::seam::generate_dense_vulkan_parallel_sampled_session(
+                self.vk.as_ref(),
+                self.model.gguf(),
+                self.model.config(),
+                self.model.engine_cfg(),
+                self.model.embd(),
+                self.model.per_layer_embd(),
+                &prompts,
+                &prompt_ends,
+                &checkpoints,
+                &mrope_plans,
+                max_steps,
+                &mut primary,
+                &mut peers,
+                self.max_ctx,
+                &mut samplers,
+                &mut reasoning_guards,
+                on_token,
+                Some(&self.batch_interrupt),
+                Some(&group_req),
+                sync_mtp,
+            )
+        };
+        let batch_delivery = !sync_mtp
+            && !self.model.engine_cfg().spec.mtp
+            && lookups.is_empty()
+            && indices
+                .iter()
+                .all(|&index| active[index].phase == BatchPhase::Decode);
+        let result = if batch_delivery {
+            let mut delivery = BatchTokenDelivery {
+                engine: self,
+                channels: &channels,
+                progress_bases: &progress_bases,
+                streamed: &mut streamed,
+            };
+            let mut stream = |tokens: &[(usize, u32)]| {
+                let batch_accepted =
+                    token_delivery::deliver_token_batch::<MAX_DECODE_BATCH>(tokens, &mut delivery);
+                for &(lane, _) in tokens {
+                    accepted[lane] = batch_accepted[lane];
+                }
+                batch_accepted
+            };
+            run(ParallelTokenCallback::Batch(&mut stream))
+        } else {
+            // Keep Lookup's post-ACK indexing/yield and the MTP/Prefill callback order intact.
+            let mut stream = |lane: usize, id: u32| {
+                let delivery_t0 = lookup_t0.map(|_| Instant::now());
+                streamed[lane] += 1;
+                let (prompt_tokens, cached_prompt_tokens, generated) = progress_bases[lane];
+                let progress = self.batch_decode_progress(
+                    prompt_tokens,
+                    cached_prompt_tokens,
+                    generated.saturating_add(streamed[lane]),
+                );
+                let keep_going =
+                    channels
+                        .get_mut(lane)
+                        .and_then(Option::as_mut)
+                        .is_some_and(|channels| {
+                            channels
+                                .events
+                                .send(BatchEvent::Token { id, progress })
+                                .is_ok()
+                                && channels.acknowledgements.recv().unwrap_or(false)
+                        });
+                accepted[lane] = keep_going;
+                if let Some(lookup) = lookups.get_mut(lane).and_then(Option::as_mut) {
+                    let budget = if lookup_single_decode {
+                        lookup_draft_budget(
+                            lookup_max_draft,
+                            lookup_output_limit.saturating_sub(generated + streamed[lane]),
+                            lookup.indexed_len + 1,
+                            self.max_ctx,
+                            lookup_qsa_threshold,
+                        )
+                    } else {
+                        0
+                    };
+                    lookup_search_secs[lane] += lookup.observe_ordinary_token(
+                        id,
+                        keep_going,
+                        lookup_single_decode,
+                        budget,
+                        self.batch_interrupt.as_ref(),
+                    );
+                }
+                if let Some(t0) = delivery_t0 {
+                    lookup_delivery_secs += t0.elapsed().as_secs_f64();
+                }
+                keep_going
+            };
+            run(ParallelTokenCallback::Legacy(&mut stream))
+        };
         active[indices[0]].kv = primary;
         for (&index, kv) in indices[1..].iter().zip(peers) {
             active[index].kv = Some(kv);

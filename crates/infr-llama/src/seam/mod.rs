@@ -25,6 +25,8 @@ mod ple;
 mod runner;
 mod sc;
 mod segmented_kv;
+#[path = "../parallel_token_delivery.rs"]
+pub(crate) mod token_delivery;
 pub(crate) use segmented_kv::KV_GROW_ROWS;
 mod session_state;
 mod weights;
@@ -979,7 +981,7 @@ pub(crate) fn generate_dense_vulkan_parallel_sampled_session(
     want_ctx: usize,
     samplers: &mut [crate::sampling::ParallelSampler],
     reasoning_guards: &mut [crate::sampling::Qwen4ReasoningEosGuard],
-    on_token: &mut dyn FnMut(usize, u32) -> bool,
+    on_token: token_delivery::ParallelTokenCallback<'_>,
     yield_requested: Option<&std::sync::atomic::AtomicBool>,
     req: Option<&crate::sampling::RequestCtx>,
     capture_hidden: bool,

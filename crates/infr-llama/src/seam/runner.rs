@@ -6,6 +6,7 @@ use super::sc::{
     build_sc_embt, diffusion_self_cond, DenoiseCache, DenoiseReq, EbReduced, SelfCondWeights,
 };
 use super::segmented_kv::{PlaneKind, SegmentedKvLayout};
+use super::token_delivery::ParallelTokenCallback;
 use super::weights::{
     alloc_segmented_plane, AttnW, DeltaW, Dsv4CompressedW, Dsv4CompressorW, Dsv4IndexerW, Dsv4W,
     FfnW, HcTriple, IndexerW, KdaQkvW, KdaW, LayerHcW, LayerW, MixerW, MlaW, MoeSharedW,
@@ -531,6 +532,67 @@ fn parallel_decode_should_stop(
         || yield_requested
             .is_some_and(|requested| requested.load(std::sync::atomic::Ordering::Acquire))
 }
+
+/// Account for sampled ids once, emit no EOS, and resolve all ACKs before another forward.
+/// Legacy callbacks keep their per-lane observation/delivery order for MTP and Lookup.
+#[allow(clippy::too_many_arguments)]
+fn deliver_parallel_token_step(
+    cfg: &Config,
+    ignore_eos: bool,
+    sample_from: usize,
+    next: &[u32],
+    generated: &mut [Vec<u32>],
+    curs: &mut [Vec<u32>],
+    reasoning_guards: &mut [crate::sampling::Qwen4ReasoningEosGuard],
+    on_token: &mut ParallelTokenCallback<'_>,
+    req: Option<&crate::sampling::RequestCtx>,
+    yield_requested: Option<&std::sync::atomic::AtomicBool>,
+) -> bool {
+    let mut visible = [(0usize, 0u32); infr_core::backend::MAX_DECODE_ROWS];
+    let mut visible_len = 0;
+    let mut stop_batch = false;
+    for (row, &token) in next.iter().enumerate() {
+        let lane = sample_from + row;
+        generated[lane].push(token);
+        reasoning_guards[lane].observe(cfg, token);
+        let is_eos = !ignore_eos && (cfg.eos_ids.contains(&token) || token == cfg.eos);
+        if is_eos {
+            stop_batch = true;
+            continue;
+        }
+        match &mut *on_token {
+            ParallelTokenCallback::Legacy(deliver) => {
+                if deliver(lane, token) {
+                    curs[lane].push(token);
+                } else {
+                    stop_batch = true;
+                }
+            }
+            ParallelTokenCallback::Batch(_) => {
+                visible[visible_len] = (lane, token);
+                visible_len += 1;
+            }
+        }
+    }
+    if let ParallelTokenCallback::Batch(deliver) = on_token {
+        if visible_len > 0 {
+            let visible = &visible[..visible_len];
+            let accepted = deliver(visible);
+            for &(lane, token) in visible {
+                if accepted[lane] {
+                    curs[lane].push(token);
+                } else {
+                    stop_batch = true;
+                }
+            }
+        }
+    }
+    parallel_decode_should_stop(req, stop_batch, yield_requested)
+}
+
+#[cfg(test)]
+#[path = "runner_token_delivery_tests.rs"]
+mod token_delivery_tests;
 
 /// Whether a contiguous slice of Qwen IMROPE rows is exactly representable by ordinary 1D RoPE.
 /// The Vulkan 1D kernel receives the first position and advances it once per row, so both the
@@ -1720,7 +1782,7 @@ fn finish_pending_seam_slot(
     })
 }
 
-struct ParallelDecodeRequest<'a> {
+struct ParallelDecodeRequest<'a, 'callback> {
     prompts: &'a [Vec<u32>],
     prompt_ends: &'a [usize],
     checkpoint_boundaries: &'a [[Option<usize>; super::TURN_CHECKPOINT_COUNT]],
@@ -1731,7 +1793,8 @@ struct ParallelDecodeRequest<'a> {
     decode_secs: &'a mut Vec<f64>,
     samplers: &'a mut [crate::sampling::ParallelSampler],
     reasoning_guards: &'a mut [crate::sampling::Qwen4ReasoningEosGuard],
-    on_token: &'a mut dyn FnMut(usize, u32) -> bool,
+    // The callback can borrow caller state longer than this request's local output buffers.
+    on_token: ParallelTokenCallback<'callback>,
     yield_requested: Option<&'a std::sync::atomic::AtomicBool>,
     hidden: Option<&'a mut [Vec<f32>]>,
 }
@@ -1985,7 +2048,7 @@ pub(crate) fn generate_dense_backend_parallel_sampled(
     want_ctx: usize,
     samplers: &mut [crate::sampling::ParallelSampler],
     reasoning_guards: &mut [crate::sampling::Qwen4ReasoningEosGuard],
-    on_token: &mut dyn FnMut(usize, u32) -> bool,
+    on_token: ParallelTokenCallback<'_>,
     yield_requested: Option<&std::sync::atomic::AtomicBool>,
     req: Option<&crate::sampling::RequestCtx>,
     capture_hidden: bool,
@@ -2379,7 +2442,7 @@ fn generate_dense_backend_inner(
     finish_fixed_allocations: Option<&dyn Fn() -> AResult<()>>,
     // Vision request plan. `None` keeps every existing text-only graph and upload unchanged.
     mm: Option<&crate::seam::MropePlan>,
-    parallel_decode: Option<&mut ParallelDecodeRequest<'_>>,
+    parallel_decode: Option<&mut ParallelDecodeRequest<'_, '_>>,
     mut parallel_prefill: Option<&mut ParallelPrefillRequest<'_>>,
     parallel_mtp_verify: Option<&mut ParallelMtpVerifyRequest<'_>>,
     prepared_single: Option<PreparedParallelPrompt>,
@@ -11156,22 +11219,18 @@ fn generate_dense_backend_inner(
                     for lane in sample_from..lanes {
                         decode_secs[lane] += step_secs;
                     }
-                    let mut stop_batch = false;
-                    for (row, &token) in next.iter().enumerate() {
-                        let lane = sample_from + row;
-                        generated[lane].push(token);
-                        parallel.reasoning_guards[lane].observe(c, token);
-                        let is_eos = !ec.sampling.ignore_eos
-                            && (c.eos_ids.contains(&token) || token == c.eos);
-                        let keep_going = !is_eos && (parallel.on_token)(lane, token);
-                        if keep_going {
-                            curs[lane].push(token);
-                        } else {
-                            stop_batch = true;
-                        }
-                    }
-                    let should_stop =
-                        parallel_decode_should_stop(req, stop_batch, parallel.yield_requested);
+                    let should_stop = deliver_parallel_token_step(
+                        c,
+                        ec.sampling.ignore_eos,
+                        sample_from,
+                        &next,
+                        &mut generated,
+                        &mut curs,
+                        parallel.reasoning_guards,
+                        &mut parallel.on_token,
+                        req,
+                        parallel.yield_requested,
+                    );
                     if c.qwen4exp && !should_stop && step + 1 < max_new {
                         // All lane ACKs are resolved; only host gathering runs ahead of the next step.
                         next_ple_ticket = Some(ple_ticket_carry::Ticket::new(
