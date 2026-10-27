@@ -104,6 +104,15 @@ fn candidate_words(candidates: &[Option<Candidate>]) -> Vec<u32> {
         .collect()
 }
 
+fn gpu_copy_workgroup_supported(max_invocations: u32, max_size_x: u32) -> bool {
+    // The small payload kernel is WG256; wide-copy selection is not a smaller-device fallback.
+    max_invocations >= 256 && max_size_x >= 256
+}
+
+fn copy_overlap_predicates_requested(requested: bool, mtp_enabled: bool) -> bool {
+    requested && !mtp_enabled
+}
+
 fn effective_copy_groups(requested: usize, _wide_copy: bool) -> u32 {
     if requested == 0 {
         8
@@ -496,6 +505,18 @@ impl GpuCopyBuffers {
         layers: usize,
         seed: Option<super::gpu_owner::OwnedSeed>,
     ) -> Result<Option<Arc<Self>>> {
+        let properties = unsafe {
+            be_.shared
+                .instance
+                .get_physical_device_properties(be_.shared.physical_device)
+        };
+        if !gpu_copy_workgroup_supported(
+            properties.limits.max_compute_work_group_invocations,
+            properties.limits.max_compute_work_group_size[0],
+        ) {
+            // Decline both host-managed and owned copying before metadata allocation/upload.
+            return Ok(None);
+        }
         if let Some(seed) = &seed {
             seed.state.validate_source_words(&inputs.words)?;
         }
@@ -525,7 +546,10 @@ impl GpuCopyBuffers {
         )?;
         let overlay = alloc(inputs.words.len() * 4, seed.is_none())?;
         let jobs = alloc(layers * JOBS_PER_LAYER * JOB_WORDS * 4, true)?;
-        let miss_predicates = if be_.cfg().kernels.vulkan.decode_gpu_resident_copy_overlap {
+        let miss_predicates = if copy_overlap_predicates_requested(
+            be_.cfg().kernels.vulkan.decode_gpu_resident_copy_overlap,
+            be_.cfg().spec.mtp,
+        ) {
             match be_.alloc_mapped_predicate(layers * crate::recorder::GPU_COPY_PREDICATE_WORDS * 4)
             {
                 Ok(buffer) => Some(Arc::from(buffer)),
@@ -547,11 +571,6 @@ impl GpuCopyBuffers {
             uploads.push((overlay.as_ref(), bytemuck::cast_slice(&seed.blocks)));
         }
         upload_metadata_batch(be_, metadata_staging.as_ref(), &uploads)?;
-        let properties = unsafe {
-            be_.shared
-                .instance
-                .get_physical_device_properties(be_.shared.physical_device)
-        };
         let wide_copy = properties.limits.max_compute_work_group_invocations >= 1024
             && properties.limits.max_compute_work_group_size[0] >= 1024;
         let copy_groups = effective_copy_groups(
@@ -1105,6 +1124,40 @@ mod prepared_tests {
             activation.committed = true;
         }
         assert!(in_forward.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn gpu_copy_workgroup_floor_rejects_either_sub256_limit() {
+        for (invocations, size_x) in [
+            (0, 0),
+            (128, 128),
+            (255, 256),
+            (256, 255),
+            (128, 1024),
+            (1024, 128),
+            (255, u32::MAX),
+            (u32::MAX, 255),
+        ] {
+            assert!(
+                !gpu_copy_workgroup_supported(invocations, size_x),
+                "must decline before allocation: invocations={invocations} size_x={size_x}"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_copy_workgroup_floor_accepts_small_and_wide_devices() {
+        for (invocations, size_x) in [
+            (256, 256),
+            (256, 1024),
+            (1024, 256),
+            (1023, 1024),
+            (1024, 1023),
+            (1024, 1024),
+            (u32::MAX, u32::MAX),
+        ] {
+            assert!(gpu_copy_workgroup_supported(invocations, size_x));
+        }
     }
 
     #[test]

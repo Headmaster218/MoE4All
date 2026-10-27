@@ -102,7 +102,7 @@ fn gpu_copy_overlap_verify_is_single_lane_bounded_and_pair_exclusive() {
                                     assert_eq!(
                                         gpu_copy_overlap_eligible(
                                             requested, verify, rows, independent, pair,
-                                            immutable, predicate, indirect,
+                                            immutable, predicate, indirect, false,
                                         ),
                                         requested && shape && !pair && immutable && predicate && !indirect,
                                         "verify={verify} rows={rows} independent={independent} pair={pair}",
@@ -112,6 +112,27 @@ fn gpu_copy_overlap_verify_is_single_lane_bounded_and_pair_exclusive() {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+#[test]
+fn decode_mtp_isolation_overlap_eligibility_cpu() {
+    for verify in [false, true] {
+        for rows in 1..=infr_core::backend::MAX_DECODE_ROWS {
+            for independent in [false, true] {
+                let ordinary_shape = !verify || (!independent && matches!(rows, 2..=4));
+                assert_eq!(
+                    gpu_copy_overlap_eligible(
+                        true, verify, rows, independent, false, true, true, false, false,
+                    ),
+                    ordinary_shape,
+                );
+                // Includes ordinary-looking target graphs, not just Verify graphs.
+                assert!(!gpu_copy_overlap_eligible(
+                    true, verify, rows, independent, false, true, true, false, true,
+                ));
             }
         }
     }

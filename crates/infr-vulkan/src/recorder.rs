@@ -1506,8 +1506,10 @@ fn gpu_copy_overlap_eligible(
     immutable: bool,
     miss_predicate: bool,
     indirect: bool,
+    mtp_enabled: bool,
 ) -> bool {
     requested
+        && !mtp_enabled
         && (!verify || (!independent_rows && (2..=4).contains(&rows)))
         && !pair_enabled
         && immutable
@@ -14512,6 +14514,7 @@ impl<'a> Recorder<'a> {
             control.len_bytes() == RESIDENT_CONTROL_BYTES,
             copy.miss_predicates.is_some(),
             self.resident_indirect.borrow().is_some(),
+            self.be.cfg().spec.mtp,
         ) && (!copy.is_owned() || !verify)
             && !self.no_barrier
             && !self.full_barrier

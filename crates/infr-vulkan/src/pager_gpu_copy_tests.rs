@@ -1,3 +1,15 @@
+#[test]
+fn decode_mtp_isolation_copy_predicate_allocation_cpu() {
+    for requested in [false, true] {
+        for mtp_enabled in [false, true] {
+            assert_eq!(
+                super::copy_overlap_predicates_requested(requested, mtp_enabled),
+                requested && !mtp_enabled,
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod fixtures {
     use super::super::*;
