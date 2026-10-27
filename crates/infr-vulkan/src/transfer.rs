@@ -421,6 +421,17 @@ fn timestamp_delta_ns(start: u64, end: u64, valid_bits: u32, period_ns: f32) -> 
 /// types or queue choices; a different executor can satisfy the same requests without changing
 /// pager policy.
 pub(crate) trait TransferExecutor: Sync {
+    fn handoff_gpu_decode(&self, session: &mut crate::pager::MoePagerSession) -> Result<()> {
+        if session
+            .gpu_decode_owner
+            .as_ref()
+            .is_some_and(|owner| owner.owned_active())
+        {
+            return Err(be("GPU owner handoff requires the owning Vulkan backend"));
+        }
+        Ok(())
+    }
+
     fn mapped_serial_max_bytes(&self) -> usize {
         0
     }
@@ -460,6 +471,14 @@ pub(crate) struct SessionTransferPlan {
 }
 
 impl SessionTransferPlan {
+    pub(crate) fn contains_imported_upload(&self, src: &[u8]) -> bool {
+        self.imports
+            .read()
+            .unwrap()
+            .iter()
+            .any(|import| import.contains(src.as_ptr(), src.len()))
+    }
+
     pub(crate) fn new(imports: Vec<ImportedHostAllocation>) -> Self {
         Self {
             imports: RwLock::new(imports),
@@ -1005,6 +1024,38 @@ fn mapped_batch_is_serial(copies: &[MappedHostCopy], max_bytes: usize) -> bool {
                 .is_some_and(|bytes| bytes <= max_bytes))
 }
 
+pub(crate) fn copy_owned_mapped_batch<'a>(
+    uploads: impl IntoIterator<Item = (&'a [u8], &'a DeviceTransferTarget)>,
+    serial_max_bytes: usize,
+) -> Result<()> {
+    // Validate the entire batch before its first write. This route never imports, stages,
+    // submits, or waits on a GPU queue, including on its error path.
+    let copies = uploads
+        .into_iter()
+        .map(|(src, target)| {
+            if src.len() != target.len() {
+                return Err(be("owned CPU upload source and target sizes differ"));
+            }
+            let dst = target
+                .mapped_ptr()
+                .ok_or_else(|| be("owned CPU upload target lost its mapping"))?;
+            Ok(MappedHostCopy {
+                src: src.as_ptr() as usize,
+                dst: dst as usize,
+                len: src.len(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let _span = infr_core::timeline::background_span("resident_producer_mapped_copy");
+    let started = pager_profile::active().then(std::time::Instant::now);
+    copy_to_mapped_batch(&copies, serial_max_bytes);
+    if let Some(started) = started {
+        let bytes = copies.iter().map(|copy| copy.len).sum();
+        pager_profile::record_memcpy_batch(copies.len(), bytes, started.elapsed());
+    }
+    Ok(())
+}
+
 fn copy_to_mapped_batch(copies: &[MappedHostCopy], serial_max_bytes: usize) {
     use rayon::prelude::*;
 
@@ -1436,6 +1487,10 @@ impl VulkanBackend {
 }
 
 impl TransferExecutor for VulkanBackend {
+    fn handoff_gpu_decode(&self, session: &mut crate::pager::MoePagerSession) -> Result<()> {
+        session.handoff_gpu_decode(self)
+    }
+
     fn materialize_staging(&self, src: &[u8]) -> Result<(Arc<dyn Buffer>, usize, bool)> {
         VulkanBackend::stage_host_bytes(self, src)
     }

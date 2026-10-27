@@ -1937,6 +1937,9 @@ pub struct MoePagerSession {
     /// leave the immutable tape address pointing at its former contents.
     frozen_lut_slots: HashSet<ExpertSlotId>,
     resident_lut_cache: Option<ResidentLutCache>,
+    /// Authoritative Decode metadata survives command chunks and token boundaries. CPU cache
+    /// mutation requires an explicit drained handoff from this owner.
+    pub(crate) gpu_decode_owner: Option<Arc<GpuCopyBuffers>>,
     print_stats: bool,
     trace: Option<PagerTrace>,
     /// Physical interpretation of every pool arena. Prefill owns slot 0..n_expert as one
@@ -1964,9 +1967,13 @@ pub struct MoePagerSession {
 
 #[path = "pager_gpu_copy.rs"]
 mod gpu_copy;
+#[path = "pager_gpu_owner.rs"]
+mod gpu_owner;
 #[cfg(test)]
 pub(crate) use gpu_copy::completed_copies;
 pub(crate) use gpu_copy::GpuCopyBuffers;
+pub(crate) use gpu_owner::seed as owned_seed;
+pub(crate) use gpu_owner::OwnedHostLease;
 
 struct ResidentLutCache {
     addresses: Vec<Vec<u64>>,
@@ -2098,6 +2105,30 @@ fn select_prefill_candidate(candidates: &[(usize, usize, u64)]) -> Option<(usize
 }
 
 impl MoePagerSession {
+    #[cfg(test)]
+    pub(crate) fn test_resident_lru_snapshot(&self) -> Result<Vec<(Vec<u32>, usize)>> {
+        self.pools
+            .iter()
+            .map(|pool| {
+                let snapshot = pool
+                    .pager
+                    .pager
+                    .snapshot_for_handoff()
+                    .map_err(|error| be(format!("test LRU snapshot: {error:?}")))?;
+                Ok((
+                    snapshot.resident_lru().iter().map(|&(block, _)| block).collect(),
+                    snapshot.free().len(),
+                ))
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_unimport_host_uploads(&mut self) {
+        assert!(self.gpu_decode_owner.is_none());
+        self.transfer_plan = Arc::new(SessionTransferPlan::default());
+    }
+
     pub fn new(vk: &VulkanBackend, layout: MoePagerLayout) -> Result<Self> {
         let load_reservation = vk.alloc_load_vram_reservation(layout.load_reserve_bytes)?;
         if layout.load_reserve_bytes > 0 {
@@ -2287,6 +2318,7 @@ impl MoePagerSession {
             tape_words,
             frozen_lut_slots: HashSet::new(),
             resident_lut_cache,
+            gpu_decode_owner: None,
             print_stats: vk.cfg().paging.stats,
             trace: vk.cfg().paging.trace.clone().map(PagerTrace::new),
             mode: MoeArenaMode::DecodeLru,
@@ -2608,6 +2640,7 @@ impl MoePagerSession {
         executor: &E,
         plan: UnifiedClaimPlan,
     ) -> Result<Vec<Arc<UnifiedAllocationHandle>>> {
+        executor.handoff_gpu_decode(self)?;
         let floor_suspended =
             plan.class() == UnifiedVramClass::Prefill || self.mode == MoeArenaMode::PrefillLayer;
         let floor_slots: Vec<Vec<usize>> = (0..self.pools.len())
@@ -2726,6 +2759,15 @@ impl MoePagerSession {
     }
 
     fn restore_unified_slots_if_changed(&mut self) -> usize {
+        // Decode owns a stable enabled-slot set. Freeing unrelated scratch must not silently
+        // restore a slot into the stale CPU pager while the GPU is its residency authority.
+        if self
+            .gpu_decode_owner
+            .as_ref()
+            .is_some_and(|owner| owner.owned_active())
+        {
+            return 0;
+        }
         if self.unified_pool.generation() == self.unified_generation {
             return 0;
         }
@@ -3109,6 +3151,7 @@ impl MoePagerSession {
     /// Select whole-layer interpretation for Prefill. The ring claims its frozen middle corridor;
     /// every Expert cell outside those exact physical ranges retains both residency and heat.
     pub(crate) fn enter_prefill_layer<E: TransferExecutor>(&mut self, executor: &E) -> Result<()> {
+        executor.handoff_gpu_decode(self)?;
         if self.mode != MoeArenaMode::PrefillLayer {
             // Decode/runtime allocations may have released ranges since the previous phase.
             self.restore_unified_slots_if_changed();
@@ -4352,6 +4395,28 @@ impl MoePagerSession {
     /// after generation finishes (see the CLI's bench/run/serve exit paths) — cheap enough to
     /// always compute, only printed when asked.
     pub fn print_stats_if_enabled(&self) {
+        self.print_stats_with_snapshot(None);
+    }
+
+    pub(crate) fn print_stats_with_owner(&self, backend: &VulkanBackend) {
+        let snapshot = if self.print_stats {
+            self.gpu_decode_owner
+                .as_ref()
+                .map(|owner| owner.owned_statistics(backend, self))
+                .transpose()
+        } else {
+            Ok(None)
+        };
+        match snapshot {
+            Ok(stats) => self.print_stats_with_snapshot(stats.flatten().as_deref()),
+            Err(error) => {
+                tracing::warn!(%error, "GPU-owned pager statistics unavailable; preserving residency authority");
+                self.print_stats_with_snapshot(None);
+            }
+        }
+    }
+
+    fn print_stats_with_snapshot(&self, gpu_stats: Option<&[PagerStats]>) {
         if let Some(trace) = &self.trace {
             match trace.flush() {
                 Ok(()) => tracing::info!(
@@ -4369,14 +4434,25 @@ impl MoePagerSession {
         if !self.print_stats {
             return;
         }
-        for p in &self.pools {
-            let s = p.pager.stats();
+        let gpu_owned = self
+            .gpu_decode_owner
+            .as_ref()
+            .is_some_and(|owner| owner.owned_active());
+        if gpu_owned && gpu_stats.is_none() {
             tracing::info!(
-                "[moe pager] shared/{:.1} MiB: {} slots={}",
-                p.slot_bytes as f64 / MIB_F64,
-                stats_suffix(&s),
-                p.pager.enabled_slots(),
+                "[moe pager] residency counters are GPU-owned; host LRU counters deferred until a layout handoff"
             );
+        }
+        for (index, p) in self.pools.iter().enumerate() {
+            if !gpu_owned || gpu_stats.is_some() {
+                let s = gpu_stats.map_or_else(|| p.pager.stats(), |stats| stats[index]);
+                tracing::info!(
+                    "[moe pager] shared/{:.1} MiB: {} slots={}",
+                    p.slot_bytes as f64 / MIB_F64,
+                    stats_suffix(&s),
+                    p.pager.enabled_slots(),
+                );
+            }
             if let Some(host) = &p.host {
                 let hs = host.stats();
                 tracing::info!(

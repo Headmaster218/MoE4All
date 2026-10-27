@@ -213,6 +213,7 @@ fn assert_drained(fixture: &Fixture, producer_enabled: bool) -> (Arc<dyn Buffer>
             .as_ref()
             .unwrap()
             .send(ResidentNoticeJob {
+                _fence_lease: None,
                 journal: Arc::clone(&journal),
                 notices: notices.unwrap(),
                 fence: None,

@@ -1,6 +1,22 @@
 //! Small model-free resident command-ahead regressions; declared as a child of `adapter`.
+#[path = "adapter_pure_mapped_coalesce_tests.rs"]
+mod pure_mapped_coalesce_tests;
+#[path = "adapter_owned_stage_tail_tests.rs"]
+mod owned_stage_tail_tests;
+#[path = "adapter_owned_topk_tests.rs"]
+mod owned_topk_tests;
+#[path = "adapter_owned_upload_tests.rs"]
+mod owned_upload_tests;
+#[path = "adapter_prepared_empty_stage_tests.rs"]
+mod prepared_empty_stage_tests;
+#[path = "adapter_prepared_mapped_run_tests.rs"]
+mod prepared_mapped_run_tests;
+#[path = "adapter_rolling_mapped_run_tests.rs"]
+mod rolling_mapped_run_tests;
 #[path = "adapter_single_verify_tests.rs"]
 mod single_verify_tests;
+#[path = "adapter_staged_next_tests.rs"]
+mod staged_next_tests;
 
 use super::*;
 use crate::pager::{ExpertSource, MoeHostChunkSpec, MoePagerLayout, MoePoolSpec, Role};
@@ -31,11 +47,469 @@ impl Buffer for CpuBuffer {
     }
 }
 
+fn notice_entries(required: &[bool]) -> Vec<ResidentJournalEntry> {
+    required
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(ordinal, host_notice)| ResidentJournalEntry {
+            op_idx: ordinal * 2,
+            roles: [ordinal * 3, ordinal * 3 + 1, ordinal * 3 + 2],
+            layout: ResidentMoeLayout {
+                rows: 1,
+                n_expert: EXP,
+                n_used: TOP,
+            },
+            host_notice,
+        })
+        .collect()
+}
+
+fn setup_cache_graph() -> (Graph, HcUpMixPair) {
+    let mut g = Graph::new();
+    let low = g.input(TensorDesc::new([320], DType::F32));
+    let x = g.input(TensorDesc::new([10240], DType::F32));
+    let weight = g.weight(TensorDesc::new([10240, 320], DType::Q8_0));
+    let gate = g.internal(TensorDesc::new([10240], DType::F32));
+    let dst = g.output(TensorDesc::new([2560], DType::F32));
+    g.push(Op::Linear {
+        x: low,
+        weight,
+        dst: gate,
+        m: 1,
+        in_f: 320,
+        out_f: 10240,
+        w_off: 0,
+    });
+    g.push(Op::QwenHcMix {
+        x,
+        gate,
+        dst,
+        rows: 1,
+        hc: 4,
+        n_embd: 2560,
+    });
+    let value = g.input(TensorDesc::new([2560], DType::F32));
+    let norm = g.weight(TensorDesc::new([10240], DType::F32));
+    let gated = g.internal(TensorDesc::new([10240], DType::F32));
+    let normed = g.output(TensorDesc::new([10240], DType::F32));
+    g.push(Op::QwenPleGate {
+        key: x,
+        query: x,
+        value,
+        dst: gated,
+        rows: 1,
+        hc: 4,
+        n_embd: 2560,
+    });
+    g.push(Op::QwenHcNorm {
+        x: gated,
+        norm,
+        dst: normed,
+        rows: 1,
+        hc: 4,
+        n_embd: 2560,
+        eps: 1e-6,
+    });
+    let positions = g.input(TensorDesc::new([1], DType::I32));
+    let q = g.input(TensorDesc::new([512], DType::F32));
+    let gamma = g.weight(TensorDesc::new([256], DType::F32));
+    let k = g.internal(TensorDesc::new([512], DType::F16));
+    let cache = g.input(TensorDesc::new([32768, 512], DType::Q8_0));
+    g.push(Op::QkNormRope {
+        x: q,
+        weight: gamma,
+        positions,
+        dst: k,
+        rows: 1,
+        n_head: 2,
+        head_dim: 256,
+        rope_dim: 64,
+        theta: 10000.0,
+        eps: 1e-6,
+        freq_factors: None,
+        x_stride: 0,
+    });
+    g.push(Op::WriteKv {
+        src: k,
+        cache,
+        rows: 1,
+        row_stride: 512,
+        pos: 0,
+    });
+    (
+        g,
+        HcUpMixPair {
+            low,
+            weight,
+            x,
+            dst,
+        },
+    )
+}
+
+#[test]
+fn graph_setup_cached_candidates_match_original_scans_and_config() {
+    for mode in 0..4 {
+        let (mut graph, _) = setup_cache_graph();
+        graph.independent_rows = mode == 1;
+        graph.mtp_verify = mode == 2;
+        if mode == 3 {
+            graph.prefill_target_tokens = Some(512);
+        }
+        let compiled = VkDecodePlan::new_cpu(&graph, false, true);
+        let cached = &compiled.setup_analysis;
+        assert_eq!(
+            cached.hc.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            (0..graph.ops.len())
+                .filter(|&i| hc_up_mix_at(&graph, i).is_some())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            cached.ple.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            (0..graph.ops.len())
+                .filter(|&i| ple_gate_norm_at(&graph, i).is_some())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            cached.delta,
+            (0..graph.ops.len())
+                .filter(|&i| deltanet_norm_pair(&graph, i).is_some())
+                .collect::<Vec<_>>()
+        );
+        let facts = Q8SegmentedGraphFacts::analyze(&graph);
+        assert_eq!(cached.q8_facts.written, facts.written);
+        assert_eq!(cached.q8_facts.peers, facts.peers);
+        assert_eq!(cached.q8_facts.dead_scratch, facts.dead_scratch);
+        assert_eq!(cached.rope_ids.len(), 1);
+        assert_eq!(cached.write_kv, [5]);
+        for disabled in [false, true] {
+            for verify in [false, true] {
+                assert_eq!(
+                    cached
+                        .shared_candidates(disabled, verify)
+                        .collect::<Vec<_>>(),
+                    paged_moe_shared_candidates_with_policy(&graph, disabled, verify)
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        for enabled in [false, true] {
+            let mut cached_plan = cached.fusions(enabled);
+            let original = infr_core::fusion::plan_fusions(&graph, &graph_fusion_cfg(enabled));
+            assert_eq!(cached_plan.kv_write, original.kv_write);
+            assert_eq!(cached_plan.linear_add, original.linear_add);
+            assert_eq!(cached_plan.skip, original.skip);
+            cached_plan.skip.clear();
+            assert_eq!(
+                cached.fusions(enabled).skip,
+                original.skip,
+                "execute must own its mutable skip set"
+            );
+        }
+    }
+}
+
+#[test]
+fn graph_setup_hc_candidate_rechecks_changed_binding_aliases_and_addresses() {
+    struct AddressBuffer(Option<u64>);
+    impl Buffer for AddressBuffer {
+        fn len_bytes(&self) -> usize {
+            4 * 10240 * 320
+        }
+        fn device_addr(&self) -> Option<u64> {
+            self.0
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+    let (graph, pair) = setup_cache_graph();
+    let compiled = VkDecodePlan::new_cpu(&graph, false, true);
+    let cached = compiled.setup_analysis.hc[0].1;
+    let scratch: ScratchSet = (0..graph.tensors.len()).map(|_| None).collect();
+    let low = AddressBuffer(Some(0x100000));
+    let x = AddressBuffer(Some(0x200000));
+    let weight = AddressBuffer(Some(0x300000));
+    for address in [Some(0x1000000), low.0, x.0, weight.0, None] {
+        let output = AddressBuffer(address);
+        let mut bindings = Bindings::new();
+        bindings
+            .bind(pair.low, &low)
+            .bind(pair.x, &x)
+            .bind(pair.weight, &weight)
+            .bind(pair.dst, &output);
+        let original = hc_up_mix_at(&graph, 0).unwrap();
+        assert_eq!(
+            hc_up_mix_buffers(cached, &scratch, &bindings).is_some(),
+            hc_up_mix_buffers(original, &scratch, &bindings).is_some()
+        );
+        assert_eq!(
+            hc_up_mix_buffers(cached, &scratch, &bindings).is_some(),
+            address == Some(0x1000000)
+        );
+    }
+}
+
+#[test]
+fn per_layer_host_notices_preserve_sparse_ordinals_and_submitted_bounds() {
+    // Exhaust all short masks, including CPU-service at the first/middle/last layer.
+    for mask in 0u32..128 {
+        let required = (0..7).map(|i| mask & (1 << i) != 0).collect::<Vec<_>>();
+        let entries = notice_entries(&required);
+        let expected = required
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &yes)| yes.then_some(i))
+            .collect::<Vec<_>>();
+        let jobs = resident_host_notice_entries(&entries, 0, entries.len()).unwrap();
+        assert_eq!(jobs.iter().map(|(i, _)| *i).collect::<Vec<_>>(), expected);
+        let mut cursor = 0;
+        let mut seen = Vec::new();
+        for end in 0..=entries.len() {
+            while let Some(ordinal) = next_resident_host_notice(&entries, &mut cursor, end).unwrap()
+            {
+                seen.push(ordinal);
+                accept_resident_host_notice(&mut cursor, ordinal, ordinal).unwrap();
+            }
+        }
+        assert_eq!(seen, expected);
+        assert_eq!(cursor, entries.len());
+        for split in 0..=entries.len() {
+            let a = resident_host_notice_entries(&entries, 0, split).unwrap();
+            let b = resident_host_notice_entries(&entries, split, entries.len()).unwrap();
+            assert_eq!(
+                a.iter().chain(&b).map(|(i, _)| *i).collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+    let entries = notice_entries(&[false; 128]);
+    let mut cursor = 0;
+    assert_eq!(
+        next_resident_host_notice(&entries, &mut cursor, 128).unwrap(),
+        None
+    );
+    assert_eq!(cursor, 128);
+    assert!(next_resident_host_notice(&entries, &mut cursor, 127).is_err());
+    assert!(resident_host_notice_entries(&entries, 2, 1).is_err());
+    assert!(resident_host_notice_entries(&entries, 0, 129).is_err());
+    assert!(accept_resident_host_notice(&mut cursor, 17, 16).is_err());
+    assert_eq!(
+        cursor, 18,
+        "an invalid result was consumed and must not be awaited twice"
+    );
+}
+
+#[test]
+fn sparse_notice_drop_drains_errors_and_acks_without_waiting_for_gpu_only_layers() {
+    for cpu_layer in 0..3 {
+        for failed in [false, true] {
+            let (output, results) = mpsc::channel();
+            let announced = Arc::new(AtomicUsize::new(cpu_layer));
+            let producer = Arc::new(ResidentNoticeProducer {
+                host_ready: None,
+                sender: None,
+                results: Mutex::new(results),
+                thread: None,
+                announced_miss: Arc::clone(&announced),
+                pager: Arc::new(Mutex::new(None)),
+            });
+            let mut required = [false; 3];
+            required[cpu_layer] = true;
+            let (done, ack) = mpsc::channel();
+            let chunk = ResidentChunk {
+                control: Arc::new(CpuBuffer(crate::recorder::RESIDENT_CONTROL_BYTES)),
+                journal: Arc::new(CpuBuffer(3 * crate::recorder::RESIDENT_JOURNAL_BYTES)),
+                entries: notice_entries(&required),
+                early_recovery: false,
+                recovery_op: None,
+                limit: 3,
+                recording: false,
+                self_service: false,
+                submit_layers: 1,
+                submitted_entries: 3,
+                pure_mapped_schedule: None,
+                notices: None,
+                notice_cursor: 0,
+                notice_resume: None,
+                notice_stop: false,
+                producer: Some(Arc::clone(&producer)),
+                notices_sent: 3,
+                owned_notice_acks: vec![ack],
+                mapped_serial_max_bytes: 0,
+                waiter: None,
+                indirect: None,
+                gpu_copy: None,
+            };
+            let result = if failed {
+                Err(be("synthetic service failure"))
+            } else {
+                Ok(ProducedNotice {
+                    words: [0; crate::recorder::RESIDENT_JOURNAL_WORDS],
+                    promotion: None,
+                    owned_cpu: false,
+                })
+            };
+            assert!(output.send((cpu_layer, result)).is_ok());
+            done.send(()).unwrap();
+            // Keep output connected: a mistaken receive for a GPU-only hole would block.
+            drop(chunk);
+            assert!(matches!(
+                producer.results.lock().unwrap().try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            assert_eq!(announced.load(Ordering::Acquire), usize::MAX);
+            drop(output);
+        }
+    }
+}
+
+#[test]
+fn sparse_notice_dirty_reset_preserves_failed_and_future_events() {
+    let dirty = ResidentNoticeDirty::default();
+    for ordinal in [0, 2, 64, 127] {
+        dirty.mark(ordinal);
+    }
+    let mut reset = Vec::new();
+    dirty
+        .reset_with(128, |ordinal| {
+            reset.push(ordinal);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(reset, [0, 2, 64, 127]);
+    dirty
+        .reset_with(128, |_| panic!("clean events must not be reset again"))
+        .unwrap();
+    for ordinal in [1, 3, 65] {
+        dirty.mark(ordinal);
+    }
+    let mut reset = Vec::new();
+    assert!(dirty
+        .reset_with(128, |ordinal| {
+            if ordinal == 3 {
+                return Err(be("synthetic reset failure"));
+            }
+            reset.push(ordinal);
+            Ok(())
+        })
+        .is_err());
+    assert_eq!(reset, [1]);
+    reset.clear();
+    dirty
+        .reset_with(128, |ordinal| {
+            reset.push(ordinal);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(reset, [3, 65]);
+    dirty.mark(127);
+    assert!(dirty.reset_with(127, |_| Ok(())).is_err());
+    reset.clear();
+    dirty
+        .reset_with(128, |ordinal| {
+            reset.push(ordinal);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(reset, [127]);
+}
+
+#[test]
+fn owned_execution_window_and_preparation_budget_are_independent() {
+    for layers in [1, 16, 17, 48, 128] {
+        assert_eq!(
+            resident_execution_limit(true, layers, 16, 128).unwrap(),
+            layers
+        );
+        assert_eq!(
+            resident_execution_limit(false, layers, 16, 128).unwrap(),
+            16
+        );
+        assert!(resident_execution_limit(true, layers, 16, layers - 1).is_err());
+        let budget = command_prefix::partial_preparation_limit(16, layers);
+        assert_eq!(budget, layers.min(16));
+        assert_eq!(command_prefix::partial_preparation_limit(1, layers), 1);
+        assert_eq!(
+            command_prefix::partial_preparation_limit(48, layers),
+            layers.min(48)
+        );
+        for cadence in [1, 2] {
+            for recorded in 1..=layers {
+                assert_eq!(
+                    resident_submit_due(recorded, 0, cadence, layers),
+                    recorded < layers && recorded >= cadence.min(layers),
+                );
+            }
+        }
+    }
+    assert!(resident_execution_limit(true, 0, 16, 128).is_err());
+    assert!(resident_execution_limit(false, 48, 16, 15).is_err());
+    assert_eq!(resident_execution_limit(true, 129, 16, 128).unwrap(), 128);
+    assert_eq!(command_prefix::partial_preparation_limit(0, 48), 1);
+    assert_eq!(
+        command_prefix::partial_preparation_limit(usize::MAX, 128),
+        128
+    );
+}
+
+#[test]
+fn owned_execution_window_checks_actual_protocol_buffer_capacities() {
+    let job_layer_bytes =
+        crate::recorder::RESIDENT_JOURNAL_ID_WORDS * 3 * std::mem::size_of::<[u32; 8]>();
+    let predicate_layer_bytes = crate::recorder::GPU_COPY_PREDICATE_WORDS * 4;
+    for layers in [1, 16, 17, 48, 128] {
+        let control = (6 + layers * 2) * 4;
+        let journal = layers * crate::recorder::RESIDENT_JOURNAL_BYTES;
+        let jobs = layers * job_layer_bytes;
+        let predicates = layers * predicate_layer_bytes;
+        let capacity = resident_owned_protocol_capacity(
+            control,
+            true,
+            journal,
+            layers,
+            jobs,
+            Some(predicates),
+        );
+        assert_eq!(capacity, layers);
+        assert_eq!(
+            resident_owned_protocol_capacity(control, true, journal, layers, jobs, None),
+            layers,
+        );
+        for reduced in 0..5 {
+            let actual = resident_owned_protocol_capacity(
+                if reduced == 0 { control - 1 } else { control },
+                true,
+                if reduced == 1 { journal - 1 } else { journal },
+                if reduced == 2 { layers - 1 } else { layers },
+                if reduced == 3 { jobs - 1 } else { jobs },
+                Some(if reduced == 4 {
+                    predicates - 1
+                } else {
+                    predicates
+                }),
+            );
+            assert_eq!(actual, layers - 1, "truncated protocol component {reduced}");
+            assert!(resident_execution_limit(true, layers, 16, actual).is_err());
+        }
+        assert_eq!(
+            resident_owned_protocol_capacity(20, false, journal, layers, jobs, None),
+            layers,
+        );
+        assert_eq!(
+            resident_owned_protocol_capacity(19, false, journal, layers, jobs, None),
+            0,
+        );
+    }
+}
+
 #[test]
 fn resident_ahead_snapshot_drop_preserves_live_miss_announcement() {
     let (_output, results) = mpsc::channel();
     let announced = Arc::new(AtomicUsize::new(1));
     let producer = Arc::new(ResidentNoticeProducer {
+        host_ready: None,
         sender: None,
         results: Mutex::new(results),
         thread: None,
@@ -50,14 +524,17 @@ fn resident_ahead_snapshot_drop_preserves_live_miss_announcement() {
         recovery_op: None,
         limit: 3,
         recording: true,
+        self_service: false,
         submit_layers: 1,
         submitted_entries: 0,
+        pure_mapped_schedule: None,
         notices: None,
         notice_cursor: 0,
         notice_resume: None,
         notice_stop: false,
         producer: Some(Arc::clone(&producer)),
         notices_sent: 0,
+        owned_notice_acks: Vec::new(),
         mapped_serial_max_bytes: 0,
         waiter: None,
         indirect: None,
@@ -108,12 +585,64 @@ struct Fixture {
     backend: VulkanBackend,
 }
 
+fn drained_owner_epoch(fixture: &Fixture) -> (Arc<crate::pager::GpuCopyBuffers>, u64) {
+    let copy = fixture
+        .backend
+        .moe_pager()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .gpu_decode_owner
+        .clone()
+        .expect("active GPU owner");
+    assert!(!copy.owned_in_forward());
+    let mut header = [0u32; 8];
+    fixture
+        .backend
+        .download(
+            copy.candidates.as_ref(),
+            bytemuck::cast_slice_mut(&mut header),
+        )
+        .unwrap();
+    assert_eq!(header[0], 4);
+    (copy, u64::from(header[3]) | (u64::from(header[4]) << 32))
+}
+
 impl Fixture {
     fn new(submit_layers: usize, producer: bool) -> Self {
         Self::new_with_copy_policy(submit_layers, producer, Some(false))
     }
 
     fn new_with_copy_policy(submit_layers: usize, producer: bool, copy: Option<bool>) -> Self {
+        Self::new_with_copy_policy_and_kv(submit_layers, producer, copy, 0, 0)
+    }
+
+    fn new_with_copy_policy_and_kv(
+        submit_layers: usize,
+        producer: bool,
+        copy: Option<bool>,
+        kv_reserve_bytes: usize,
+        kv_segment_bytes: usize,
+    ) -> Self {
+        Self::new_with_copy_policy_and_kv_ready(
+            submit_layers,
+            producer,
+            copy,
+            kv_reserve_bytes,
+            kv_segment_bytes,
+            false,
+        )
+    }
+
+    fn new_with_copy_policy_and_kv_ready(
+        submit_layers: usize,
+        producer: bool,
+        copy: Option<bool>,
+        kv_reserve_bytes: usize,
+        kv_segment_bytes: usize,
+        host_ready: bool,
+    ) -> Self {
         let mut cfg = infr_core::config::Config::default();
         cfg.device.submit_dispatches = Some(0);
         cfg.device.decode_command_ahead = true;
@@ -121,6 +650,7 @@ impl Fixture {
         cfg.device.decode_command_resident = true;
         cfg.paging.expert_prefetch = false;
         cfg.paging.host_dma = true;
+        cfg.kernels.vulkan.decode_gpu_resident_host_ready = host_ready;
         cfg.paging.ring = Some(SizeSpec::Bytes((4 * SLOT_BYTES) as u64));
         cfg.kernels.vulkan.cpu_miss_threads = 0;
         cfg.kernels.vulkan.static_scratch_memo = true;
@@ -170,8 +700,8 @@ impl Fixture {
                 }],
                 host_tier: None,
                 host_store_io: Some(Arc::new(DiagonalExpertIo)),
-                dynamic_state_reserve_bytes: 0,
-                dynamic_state_max_allocation_bytes: 0,
+                dynamic_state_reserve_bytes: kv_reserve_bytes as u64,
+                dynamic_state_max_allocation_bytes: kv_segment_bytes as u64,
                 prefill_min_lane_bytes: 0,
                 runtime_reserve_bytes: 1024 * 1024,
                 host_chunks: vec![MoeHostChunkSpec {
@@ -371,6 +901,7 @@ impl Fixture {
     fn preload(&self) {
         let mut guard = self.backend.moe_pager().lock().unwrap();
         let session = guard.as_mut().unwrap();
+        session.handoff_gpu_decode(&self.backend).unwrap();
         for roles in &self.roles {
             session.begin_role_batches(roles).unwrap();
             session
@@ -387,7 +918,16 @@ impl Fixture {
 
     fn prepare(&self, submit_layers: usize, producer: bool) -> (VkDecodePlan, Vec<Vec<f32>>) {
         let current = VkDecodePlan::new_cpu(&self.graph, false, true);
-        let next = VkDecodePlan::new_cpu(&self.graph, false, true);
+        let mut next_graph = self.graph.clone();
+        let next_position = if next_graph.independent_rows {
+            assert_eq!(next_graph.sequence_spans.len(), 1);
+            let span = &mut next_graph.sequence_spans[0];
+            span.start_pos = span.start_pos.checked_add(1).unwrap();
+            span.start_pos as usize
+        } else {
+            1
+        };
+        let next = VkDecodePlan::new_cpu(&next_graph, false, true);
         let bindings = self.bindings();
         self.preload();
         self.reset_frontend();
@@ -410,6 +950,21 @@ impl Fixture {
                 producer,
                 "requested producer must be active"
             );
+            if resident
+                .gpu_copy
+                .as_ref()
+                .is_none_or(|copy| !copy.is_owned())
+            {
+                let notices = resident.notices.as_ref().expect("fixture event notices");
+                for ordinal in 0..LAYERS {
+                    assert_ne!(
+                        notices.dirty.words[ordinal / 64].load(Ordering::Acquire)
+                            & (1u64 << (ordinal % 64)),
+                        0,
+                        "live legacy notice {ordinal} must be dirty before prepared reuse"
+                    );
+                }
+            }
         }
         self.reset_frontend();
         let epoch = self.backend.shared.resource_epoch.load(Ordering::Acquire);
@@ -417,7 +972,7 @@ impl Fixture {
             &self.backend,
             &current,
             &bindings,
-            Some((&next, &bindings, &[1])),
+            Some((&next, &bindings, &[next_position])),
         )
         .unwrap();
         {
@@ -425,8 +980,42 @@ impl Fixture {
             let packet = packet
                 .as_ref()
                 .expect("actual command preparation, not calibration fallback");
-            // The short prefix ends at 1; an end after MoeFfn proves resident content was recorded.
-            assert_eq!(packet.end, submit_layers * 2);
+            let (head_end, head_layers, last_end, layers, self_service, owned) =
+                packet.recorded_shape();
+            // Preparation spans the graph, but CPU-service submissions keep their old cadence.
+            assert_eq!(
+                packet.end,
+                if owned {
+                    self.graph.ops.len()
+                } else {
+                    submit_layers * 2
+                }
+            );
+            assert_eq!(
+                head_end,
+                if self_service {
+                    packet.end
+                } else {
+                    submit_layers * 2
+                }
+            );
+            assert_eq!(
+                head_layers,
+                if self_service {
+                    self.roles.len()
+                } else {
+                    submit_layers
+                }
+            );
+            assert_eq!(last_end, packet.end);
+            assert_eq!(
+                layers,
+                if owned {
+                    self.roles.len()
+                } else {
+                    submit_layers
+                }
+            );
             assert!(packet.end > command_prefix::prefix_end(&self.graph).unwrap());
         }
         self.assert_frontend(self.buffer(self.frontend), 2.0);
@@ -451,6 +1040,7 @@ impl Fixture {
         {
             let mut guard = self.backend.moe_pager().lock().unwrap();
             let session = guard.as_mut().unwrap();
+            session.handoff_gpu_decode(&self.backend).unwrap();
             for roles in &self.roles {
                 assert_eq!(
                     session.routed_roles_resident_mask(roles, &ROUTED).unwrap(),
@@ -479,14 +1069,14 @@ impl Fixture {
         );
         self.assert_frontend(self.buffer(self.frontend), 2.0);
         assert_close(&self.outputs(), &expected);
-        if let Some(layer) = missing {
-            let guard = self.backend.moe_pager().lock().unwrap();
+        // Validate ownership even for all-hit reuse: correct numeric output alone can hide
+        // duplicate LRU owners created by a prepared packet clearing the seeded directory.
+        let mut guard = self.backend.moe_pager().lock().unwrap();
+        let session = guard.as_mut().unwrap();
+        session.handoff_gpu_decode(&self.backend).unwrap();
+        for roles in &self.roles {
             assert_eq!(
-                guard
-                    .as_ref()
-                    .unwrap()
-                    .routed_roles_resident_mask(&self.roles[layer], &ROUTED)
-                    .unwrap(),
+                session.routed_roles_resident_mask(roles, &ROUTED).unwrap(),
                 HIT_MASK
             );
         }
@@ -559,7 +1149,602 @@ fn gpu_resident_ahead_prepares_and_recovers_without_repeating_frontends() {
 
 #[test]
 #[ignore = "requires an idle Vulkan GPU; model-free auto-copy/prepared transition"]
-fn gpu_resident_copy_auto_lazy_init_after_multirow_and_verify() {
+fn gpu_resident_copy_prepared_prefix_preserves_owned_directory() {
+    let fixture = Fixture::new_with_copy_policy(1, true, Some(true));
+    for missing in [None, Some(0), Some(1), None] {
+        fixture.run_case(1, true, missing);
+        let guard = fixture.backend.moe_pager().lock().unwrap();
+        assert!(guard
+            .as_ref()
+            .unwrap()
+            .gpu_decode_owner
+            .as_ref()
+            .is_some_and(|copy| copy.is_owned()));
+    }
+}
+
+#[test]
+#[ignore = "central GPU runner only; sparse notices with CPU service first/middle/last"]
+fn gpu_owned_sparse_notice_cpu_service_at_first_middle_last() {
+    for cpu_layer in 0..3 {
+        let mut fixture = Fixture::new_with_copy_policy(1, true, Some(true));
+        let frontend = fixture.graph.ops[0].clone();
+        let mapped_moe = fixture.graph.ops[1].clone();
+        let cpu_moe = fixture.graph.ops[3].clone();
+        let Op::MoeFfn { x: mut input, .. } = mapped_moe.clone() else {
+            unreachable!()
+        };
+        let extra = fixture.graph.output(TensorDesc::new([1, NE], DType::F32));
+        fixture.buffers.push((
+            extra,
+            fixture
+                .backend
+                .alloc(NE * 4, BufferUsage::Readback)
+                .unwrap(),
+        ));
+        let outputs = [fixture.outputs[0], fixture.outputs[1], extra];
+        fixture.graph.ops.clear();
+        for (layer, &output) in outputs.iter().enumerate() {
+            fixture.graph.push(frontend.clone());
+            let mut moe = if layer == cpu_layer {
+                cpu_moe.clone()
+            } else {
+                mapped_moe.clone()
+            };
+            if let Op::MoeFfn { x, dst, .. } = &mut moe {
+                *x = input;
+                *dst = output;
+            }
+            fixture.graph.push(moe);
+            input = output;
+        }
+        let plan = fixture.backend.compile(&fixture.graph).unwrap();
+        fixture.preload();
+        fixture
+            .backend
+            .execute(plan.as_ref(), &fixture.bindings())
+            .unwrap();
+        let expected = outputs
+            .iter()
+            .map(|&id| fixture.read(fixture.buffer(id)))
+            .collect::<Vec<_>>();
+        let (mut sources, seed, cpu_bases, mapped_bases) = {
+            let mut guard = fixture.backend.moe_pager().lock().unwrap();
+            let session = guard.as_mut().unwrap();
+            let previous = session.gpu_decode_owner.clone().unwrap();
+            session.handoff_gpu_decode(&fixture.backend).unwrap();
+            let cpu = previous.role_params(session, &fixture.roles[1]).unwrap();
+            let mapped = previous.role_params(session, &fixture.roles[0]).unwrap();
+            session.discard_cpu_miss(fixture.roles[1], &[ROUTED[1]]);
+            session.gpu_decode_owner = None;
+            (
+                session.gpu_copy_sources().unwrap().unwrap(),
+                crate::pager::owned_seed(session, 0).unwrap(),
+                [cpu[0], cpu[1], cpu[2]],
+                [mapped[0], mapped[1], mapped[2]],
+            )
+        };
+        for base in cpu_bases {
+            sources.test_cpu_only_source(base as usize + ROUTED[1] as usize);
+        }
+        let owner = crate::pager::GpuCopyBuffers::new_owned(&fixture.backend, sources, 3, seed)
+            .unwrap()
+            .unwrap();
+        assert!(!owner.owned_self_service());
+        assert!(owner.owned_roles_self_service(mapped_bases, EXP as u32));
+        assert!(!owner.owned_roles_self_service(cpu_bases, EXP as u32));
+        fixture
+            .backend
+            .moe_pager()
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .gpu_decode_owner = Some(owner.clone());
+        fixture
+            .backend
+            .runtime_phase
+            .lock()
+            .unwrap()
+            .resident_buffers
+            .as_mut()
+            .unwrap()
+            .gpu_copy = Some(owner.clone());
+        for _ in 0..2 {
+            fixture.reset_frontend();
+            fixture
+                .backend
+                .execute(plan.as_ref(), &fixture.bindings())
+                .unwrap();
+            fixture.assert_frontend(fixture.buffer(fixture.frontend), 3.0);
+            let actual = outputs
+                .iter()
+                .map(|&id| fixture.read(fixture.buffer(id)))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual, expected,
+                "sparse recovery must accumulate hit/miss output once"
+            );
+        }
+        fixture.backend.with_unified_exclusive(|| {
+            let mut guard = fixture.backend.moe_pager().lock().unwrap();
+            let session = guard.as_mut().unwrap();
+            assert!(Arc::ptr_eq(
+                session.gpu_decode_owner.as_ref().unwrap(),
+                &owner
+            ));
+            session.handoff_gpu_decode(&fixture.backend).unwrap();
+            assert_eq!(
+                session
+                    .routed_roles_resident_mask(&fixture.roles[1], &ROUTED)
+                    .unwrap(),
+                HIT_MASK
+            );
+        });
+    }
+}
+
+#[test]
+#[ignore = "central GPU runner only; staged owned workspace and failed callback lifetime"]
+fn gpu_staged_callback_failure_drains_without_replaying_prefix() {
+    use infr_core::backend::ExecutionStage;
+
+    let fixture = Fixture::new_with_copy_policy(1, true, Some(true));
+    let bindings = fixture.bindings();
+    let full = VkDecodePlan::new_cpu(&fixture.graph, false, true);
+    fixture.preload();
+    execute_static(&fixture.backend, &full, &bindings).unwrap();
+    let expected = fixture.outputs();
+
+    let mut head_graph = fixture.graph.clone();
+    head_graph.ops.truncate(2);
+    let mut tail_graph = fixture.graph.clone();
+    tail_graph.ops.drain(..2);
+    let head = VkDecodePlan::new_cpu(&head_graph, false, true);
+    let tail = VkDecodePlan::new_cpu(&tail_graph, false, true);
+    let stages = [
+        ExecutionStage::new(&head, &bindings),
+        ExecutionStage::new(&tail, &bindings),
+    ];
+    let sentinel = vec![-17.0f32; NE];
+    fixture
+        .backend
+        .upload(
+            fixture.buffer(fixture.outputs[1]),
+            bytemuck::cast_slice(&sentinel),
+        )
+        .unwrap();
+    fixture.reset_frontend();
+    let caller = std::thread::current().id();
+    let mut callbacks = Vec::new();
+    let error = fixture
+        .backend
+        .execute_staged(
+            &stages,
+            &mut |index| {
+                assert_eq!(std::thread::current().id(), caller);
+                assert!(fixture.backend.runtime_phase.try_lock().is_ok());
+                assert!(fixture.backend.moe_pager().try_lock().is_ok());
+                assert!(staged_continuity_supported(
+                    &fixture.backend,
+                    &[&head, &tail]
+                ));
+                callbacks.push(index);
+                if index == 1 {
+                    return Err(be("synthetic tail input failure"));
+                }
+                Ok(())
+            },
+            None,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("synthetic tail input failure"));
+    assert_eq!(callbacks, [0, 1]);
+    // All submitted readers must have drained before inspecting or reusing these allocations.
+    fixture.assert_frontend(fixture.buffer(fixture.frontend), 1.0);
+    assert_close(
+        &[fixture.read(fixture.buffer(fixture.outputs[0]))],
+        &expected[..1],
+    );
+    assert_eq!(fixture.read(fixture.buffer(fixture.outputs[1])), sentinel);
+    fixture.backend.with_unified_exclusive(|| {
+        fixture
+            .backend
+            .moe_pager()
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .handoff_gpu_decode(&fixture.backend)
+            .unwrap();
+    });
+
+    // Re-enter using the same plans/buffers after dropping the unsubmitted tail packet.
+    fixture.reset_frontend();
+    callbacks.clear();
+    fixture
+        .backend
+        .execute_staged(
+            &stages,
+            &mut |index| {
+                callbacks.push(index);
+                Ok(())
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(callbacks, [0, 1]);
+    fixture.assert_frontend(fixture.buffer(fixture.frontend), 2.0);
+    assert_close(&fixture.outputs(), &expected);
+}
+
+#[test]
+#[ignore = "central GPU runner only; single independent-lane prepared prefix and recovery"]
+fn gpu_resident_ahead_single_independent_lane_prepares_and_recovers() {
+    for copy in [Some(false), Some(true)] {
+        let mut fixture = Fixture::new_with_copy_policy(1, true, copy);
+        fixture.graph.independent_rows = true;
+        fixture.graph.sequence_spans = vec![SequenceSpan {
+            row_start: 0,
+            rows: 1,
+            start_pos: 37,
+        }];
+        for missing in [None, Some(0), Some(1), None] {
+            fixture.run_case(1, true, missing);
+        }
+        fixture.binding_invalidation(1, true);
+    }
+}
+
+#[test]
+fn resident_notice_trace_preserves_shape_and_marks_compact_payload_absent() {
+    for rows in [1, 2, 4, 8] {
+        for used in [1, 10, 16] {
+            let layout = ResidentMoeLayout {
+                rows,
+                n_expert: 128,
+                n_used: used,
+            };
+            let mut words = std::array::from_fn(|i| i as u32 + 17);
+            for status in [0, 1, 2, 3, 4, 5, u32::MAX] {
+                words[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] = status;
+                for compact in [false, true] {
+                    let trace = resident_notice_trace(
+                        infr_core::timeline::Context {
+                            step: 7,
+                            lanes: rows,
+                            layer: 9,
+                        },
+                        13,
+                        &words,
+                        layout,
+                        compact,
+                    );
+                    assert_eq!(trace.status, status);
+                    assert_eq!(trace.ordinal, 13);
+                    assert_eq!(trace.count, rows * used);
+                    assert_eq!(trace.context.lanes, rows);
+                    let payload = !compact || !matches!(status, 0 | 1 | 4);
+                    assert_eq!(trace.route_payload_present, payload);
+                    if payload {
+                        assert_eq!(trace.routed_ids, words[..rows * used]);
+                        assert_eq!(
+                            trace.hit_masks,
+                            std::array::from_fn(|i| {
+                                words[crate::recorder::RESIDENT_JOURNAL_MASK_WORD + i]
+                            })
+                        );
+                    } else {
+                        assert!(trace.routed_ids.is_empty());
+                        assert_eq!(trace.hit_masks, [0; 4]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "central GPU runner only; mapped journal completion and CPU-service boundary"]
+fn gpu_resident_owned_notice_compacts_completions_but_preserves_cpu_service_payload() {
+    let mut cfg = infr_core::config::Config::default();
+    cfg.device.dev = Some(std::env::var("MOE4ALL_TEST_DEVICE").expect("select test GPU"));
+    let backend = VulkanBackend::new_with(Arc::new(cfg)).unwrap();
+    let (journal, _) = backend
+        .alloc_mapped_arena_bda(crate::recorder::RESIDENT_JOURNAL_BYTES)
+        .unwrap();
+    let mut expected: Vec<_> = (0..crate::recorder::RESIDENT_JOURNAL_WORDS as u32).collect();
+    for status in [0, 1, 4, 2, 3, 5] {
+        expected[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] = status;
+        backend
+            .upload(journal.as_ref(), bytemuck::cast_slice(&expected))
+            .unwrap();
+        assert_eq!(
+            resident_notice_words(journal.as_ref(), 0)
+                .unwrap()
+                .as_slice(),
+            expected
+        );
+        let compact = resident_notice_words_impl(journal.as_ref(), 0, true).unwrap();
+        if matches!(status, 0 | 1 | 4) {
+            let mut summary = [0; crate::recorder::RESIDENT_JOURNAL_WORDS];
+            summary[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] = status;
+            assert_eq!(compact, summary);
+        } else {
+            assert_eq!(compact.as_slice(), expected);
+        }
+    }
+    expected[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] = 1;
+    backend
+        .upload(journal.as_ref(), bytemuck::cast_slice(&expected))
+        .unwrap();
+    for compact in [false, true] {
+        let started = std::time::Instant::now();
+        for _ in 0..256 {
+            std::hint::black_box(resident_notice_words_impl(journal.as_ref(), 0, compact).unwrap());
+        }
+        eprintln!(
+            "OWNED_NOTICE_READ compact={compact} mean_us={:.3}",
+            started.elapsed().as_secs_f64() * 1e6 / 256.0
+        );
+    }
+}
+
+#[test]
+fn sparse_cpu_notice_prototype_rejects_invalid_shapes_and_ranges() {
+    let valid = ResidentMoeLayout {
+        rows: 1,
+        n_expert: 64,
+        n_used: 10,
+    };
+    let stride = crate::recorder::RESIDENT_JOURNAL_BYTES;
+    for rows in [1, 2, 4, 8] {
+        for used in [8, 10, 16] {
+            let layout = ResidentMoeLayout {
+                rows,
+                n_used: used,
+                ..valid
+            };
+            assert_eq!(
+                sparse_cpu_notice_range(3 * stride, 2, layout).unwrap(),
+                (2 * stride, rows * used)
+            );
+        }
+    }
+    for layout in [
+        ResidentMoeLayout { rows: 0, ..valid },
+        ResidentMoeLayout {
+            rows: crate::recorder::RESIDENT_JOURNAL_MASK_WORDS + 1,
+            ..valid
+        },
+        ResidentMoeLayout { n_used: 0, ..valid },
+        ResidentMoeLayout {
+            n_used: 17,
+            ..valid
+        },
+        ResidentMoeLayout {
+            n_expert: 9,
+            ..valid
+        },
+        ResidentMoeLayout {
+            rows: usize::MAX,
+            n_used: 16,
+            ..valid
+        },
+    ] {
+        assert!(sparse_cpu_notice_range(usize::MAX, 0, layout).is_err());
+    }
+    for (bytes, ordinal) in [
+        (0, 0),
+        (stride - 1, 0),
+        (3 * stride, 3),
+        (3 * stride - 1, 2),
+        (usize::MAX, usize::MAX),
+    ] {
+        assert!(sparse_cpu_notice_range(bytes, ordinal, valid).is_err());
+    }
+}
+
+#[test]
+#[ignore = "parent serial GPU only; production sparse CPU miss read correctness and bounded timing"]
+fn gpu_resident_cpu_miss_sparse_read_prototype_exact_fields_and_timing() {
+    let mut cfg = infr_core::config::Config::default();
+    cfg.device.dev = Some(std::env::var("MOE4ALL_TEST_DEVICE").expect("select test GPU"));
+    let backend = VulkanBackend::new_with(Arc::new(cfg)).unwrap();
+    let stride = crate::recorder::RESIDENT_JOURNAL_WORDS;
+    let (journal, _) = backend.alloc_mapped_arena_bda(3 * stride * 4).unwrap();
+    for rows in [1, 2, 4, 8] {
+        for used in [8, 10, 16] {
+            let layout = ResidentMoeLayout {
+                rows,
+                n_expert: 64,
+                n_used: used,
+            };
+            for status in [2, 5] {
+                let mut fixture = (0..3 * stride)
+                    .map(|i| 0xa5000000 | i as u32)
+                    .collect::<Vec<_>>();
+                for ordinal in 0..3 {
+                    let words = &mut fixture[ordinal * stride..(ordinal + 1) * stride];
+                    for (i, id) in words[..rows * used].iter_mut().enumerate() {
+                        *id = (i % used) as u32;
+                    }
+                    for row in 0..rows {
+                        words[crate::recorder::RESIDENT_JOURNAL_MASK_WORD + row] =
+                            ((1u32 << used) - 1) ^ (1u32 << (row % used));
+                    }
+                    words[crate::recorder::RESIDENT_JOURNAL_JOB_COUNT_WORD] = 3;
+                    words[crate::recorder::RESIDENT_JOURNAL_JOB_COUNT_WORD + 1] = 0x12345678;
+                    words[crate::recorder::RESIDENT_JOURNAL_JOB_COUNT_WORD + 2] = 0x9abcdef0;
+                    words[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] = status;
+                }
+                backend
+                    .upload(journal.as_ref(), bytemuck::cast_slice(&fixture))
+                    .unwrap();
+                for ordinal in 0..3 {
+                    let full = resident_notice_words_impl(journal.as_ref(), ordinal, true).unwrap();
+                    assert_eq!(
+                        full.as_slice(),
+                        &fixture[ordinal * stride..(ordinal + 1) * stride]
+                    );
+                    assert_eq!(
+                        resident_notice_words(journal.as_ref(), ordinal).unwrap(),
+                        full,
+                        "legacy must retain the full journal including padding"
+                    );
+                    let sparse =
+                        resident_owned_notice_words(journal.as_ref(), ordinal, layout).unwrap();
+                    let tail = crate::recorder::RESIDENT_JOURNAL_MASK_WORD;
+                    assert_eq!(&sparse[..rows * used], &full[..rows * used]);
+                    assert_eq!(&sparse[tail..], &full[tail..]);
+                    assert!(sparse[rows * used..tail].iter().all(|&word| word == 0));
+                    let mut full_recovery = full;
+                    let mut sparse_recovery = sparse;
+                    full_recovery[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] = 2;
+                    sparse_recovery[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] = 2;
+                    assert_eq!(
+                        resident_notice_slots(&sparse_recovery, layout).unwrap(),
+                        resident_notice_slots(&full_recovery, layout).unwrap()
+                    );
+                    let context = infr_core::timeline::Context {
+                        step: 1,
+                        lanes: rows,
+                        layer: 0,
+                    };
+                    let a = resident_notice_trace(context, ordinal, &full, layout, true);
+                    let b = resident_notice_trace(context, ordinal, &sparse, layout, true);
+                    assert!(a.route_payload_present && b.route_payload_present);
+                    assert_eq!(a.routed_ids, b.routed_ids);
+                    assert_eq!(a.hit_masks, b.hit_masks);
+                }
+                let mut samples = [Vec::with_capacity(256), Vec::with_capacity(256)];
+                for iteration in 0..256 {
+                    for variant in [iteration % 2, 1 - iteration % 2] {
+                        let start = std::time::Instant::now();
+                        let words = if variant == 0 {
+                            resident_notice_words_impl(journal.as_ref(), 1, true).unwrap()
+                        } else {
+                            resident_owned_notice_words(journal.as_ref(), 1, layout).unwrap()
+                        };
+                        std::hint::black_box(words);
+                        samples[variant].push(start.elapsed().as_secs_f64() * 1e6);
+                    }
+                }
+                for (variant, times) in samples.iter_mut().enumerate() {
+                    let mean = times.iter().sum::<f64>() / times.len() as f64;
+                    times.sort_by(f64::total_cmp);
+                    eprintln!("CPU_NOTICE_SPARSE rows={rows} top={used} status={status} sparse={} bytes={} n={} mean_us={mean:.3} p50_us={:.3} p95_us={:.3}",
+                        variant == 1, if variant == 0 { stride * 4 + 4 } else {
+                            rows * used * 4 + (stride - crate::recorder::RESIDENT_JOURNAL_MASK_WORD) * 4 + 4
+                        }, times.len(), times[times.len() / 2], times[(times.len() * 95).div_ceil(100) - 1]);
+                }
+            }
+        }
+    }
+    for status in [0, 1, 3, 4, u32::MAX] {
+        let mut words = (0..3 * stride)
+            .map(|i| 0xb6000000 | i as u32)
+            .collect::<Vec<_>>();
+        words[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] = status;
+        backend
+            .upload(journal.as_ref(), bytemuck::cast_slice(&words))
+            .unwrap();
+        let layout = ResidentMoeLayout {
+            rows: 1,
+            n_expert: 64,
+            n_used: 10,
+        };
+        let got = resident_owned_notice_words(journal.as_ref(), 0, layout).unwrap();
+        if matches!(status, 0 | 1 | 4) {
+            let mut expected = [0; crate::recorder::RESIDENT_JOURNAL_WORDS];
+            expected[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] = status;
+            assert_eq!(got, expected);
+        } else {
+            assert_eq!(got.as_slice(), &words[..stride]);
+        }
+    }
+    let mut words = vec![0u32; 3 * stride];
+    words[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] = 5;
+    backend
+        .upload(journal.as_ref(), bytemuck::cast_slice(&words))
+        .unwrap();
+    for layout in [
+        ResidentMoeLayout {
+            rows: 0,
+            n_expert: 64,
+            n_used: 10,
+        },
+        ResidentMoeLayout {
+            rows: 8,
+            n_expert: 64,
+            n_used: 17,
+        },
+        ResidentMoeLayout {
+            rows: usize::MAX,
+            n_expert: 64,
+            n_used: 16,
+        },
+    ] {
+        assert!(resident_owned_notice_words(journal.as_ref(), 0, layout).is_err());
+    }
+}
+
+#[test]
+#[ignore = "requires an idle Vulkan GPU; model-free auto-copy/prepared transition"]
+fn resident_copy_switches_owned_legacy_and_reuses_session_owner() {
+    let fixture = Fixture::new_with_copy_policy(1, false, Some(true));
+    fixture.preload();
+    fixture.backend.with_unified_exclusive(|| {
+        let mut retained = None;
+        let chunk = ResidentChunk::new(&fixture.backend, &fixture.graph, true, &mut retained)
+            .unwrap()
+            .unwrap();
+        let owner = chunk.gpu_copy.clone().unwrap();
+        assert!(owner.is_owned());
+        drop(chunk);
+        {
+            let mut pager = fixture.backend.moe_pager().lock().unwrap();
+            let session = pager.as_mut().unwrap();
+            owner.begin(&fixture.backend, session).unwrap();
+            session.finish_gpu_decode_forward();
+            session.handoff_gpu_decode(&fixture.backend).unwrap();
+        }
+        let buffers = retained.as_mut().unwrap();
+        buffers
+            .ensure_gpu_copy(&fixture.backend, true, false)
+            .unwrap();
+        let legacy = buffers.gpu_copy.clone().unwrap();
+        assert!(!legacy.is_owned());
+        assert!(!Arc::ptr_eq(&legacy, &owner));
+        assert!(!owner.owned_active());
+        assert!(Arc::ptr_eq(
+            fixture
+                .backend
+                .moe_pager()
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .gpu_decode_owner
+                .as_ref()
+                .unwrap(),
+            &owner
+        ));
+        buffers
+            .ensure_gpu_copy(&fixture.backend, true, true)
+            .unwrap();
+        assert!(Arc::ptr_eq(buffers.gpu_copy.as_ref().unwrap(), &owner));
+        assert!(buffers.gpu_copy_init_attempted);
+        buffers
+            .ensure_gpu_copy(&fixture.backend, true, true)
+            .unwrap();
+        assert!(Arc::ptr_eq(buffers.gpu_copy.as_ref().unwrap(), &owner));
+    });
+}
+
+#[test]
+#[ignore = "requires an idle Vulkan GPU; model-free auto-copy/prepared transition"]
+fn gpu_resident_copy_auto_includes_token_rows_but_excludes_verify() {
     for verify in [false, true] {
         let fixture = Fixture::new_with_copy_policy(1, true, None);
         let mut losing = fixture.graph.clone();
@@ -590,9 +1775,9 @@ fn gpu_resident_copy_auto_lazy_init_after_multirow_and_verify() {
         let chunk = ResidentChunk::new(&fixture.backend, &losing, true, &mut retained)
             .unwrap()
             .expect("multirow graph retains ordinary recovery");
-        assert!(chunk.gpu_copy.is_none());
+        assert_eq!(chunk.gpu_copy.is_some(), !verify);
         drop(chunk);
-        assert!(!retained.as_ref().unwrap().gpu_copy_init_attempted);
+        assert_eq!(retained.as_ref().unwrap().gpu_copy_init_attempted, !verify);
         fixture
             .backend
             .runtime_phase
@@ -600,7 +1785,7 @@ fn gpu_resident_copy_auto_lazy_init_after_multirow_and_verify() {
             .unwrap()
             .resident_buffers = retained;
 
-        // The winning ordinary graph reuses common buffers, initializes copy, then prepares
+        // The ordinary graph reuses common buffers, initializes copy if needed, then prepares
         // and consumes a real resident packet with a forced miss and numerical comparison.
         fixture.run_case(1, true, Some(0));
         let mut phase = fixture.backend.runtime_phase.lock().unwrap();
@@ -615,9 +1800,10 @@ fn gpu_resident_copy_auto_lazy_init_after_multirow_and_verify() {
             ResidentChunk::new(&fixture.backend, &losing, true, &mut phase.resident_buffers)
                 .unwrap()
                 .unwrap();
-        assert!(
-            chunk.gpu_copy.is_none(),
-            "warm copy cannot escape the graph policy"
+        assert_eq!(
+            chunk.gpu_copy.is_some(),
+            !verify,
+            "warm copy follows token-row policy"
         );
         drop(chunk);
         assert!(Arc::ptr_eq(

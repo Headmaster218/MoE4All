@@ -1,0 +1,149 @@
+#version 450
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+#ifndef COPY_LOCAL
+#define COPY_LOCAL 256
+#endif
+layout(local_size_x = COPY_LOCAL) in;
+
+layout(std430, binding = 0) readonly buffer Journal { uint journal[]; };
+layout(std430, binding = 1) readonly buffer Jobs { uvec4 jobs[]; };
+layout(std430, binding = 2) buffer Candidates { uvec4 nodes[]; };
+layout(std430, binding = 3) buffer Overlay { uvec4 overlay[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Source {
+    uvec4 chunks[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 16) writeonly buffer Destination {
+    uvec4 chunks[];
+};
+layout(push_constant) uniform Params { uint ordinal; } p;
+
+const uint NONE = 0xffffffffu;
+const uint JOB_CAPACITY = INFR_MAX_DECODE_ROWS * 16u * 3u;
+const uint COUNT_WORD = INFR_MAX_DECODE_ROWS * 17u;
+const uint STATUS_WORD = COUNT_WORD + 3u;
+const uint JOURNAL_WORDS = STATUS_WORD + 1u;
+shared uint valid, count, job_base, slot_count, pool_count, slot_base, address_base;
+
+bool fits(uint base, uint n, uint length) {
+    return base <= length && n <= length - base;
+}
+bool valid_span(uvec2 a, uint bytes) {
+    return any(notEqual(a, uvec2(0u))) && !all(equal(a, uvec2(NONE)))
+        && bytes != 0u && ((a.x | bytes) & 15u) == 0u
+        && (a.y != NONE || a.x <= NONE - (bytes - 1u));
+}
+
+// Same rejection rules as gpu_owned_publish(mode=0), independently of payload checks.
+bool initialize_publish() {
+    if (p.ordinal >= uint(journal.length()) / JOURNAL_WORDS
+        || p.ordinal >= uint(jobs.length()) / (JOB_CAPACITY * 2u)
+        || uint(nodes.length()) < 3u || (nodes[0].x != 4u && nodes[0].x != 2u)) return false;
+    uint base = p.ordinal * JOURNAL_WORDS;
+    uint status = journal[base + STATUS_WORD];
+    if (status != 4u && status != 5u) return false;
+    count = journal[base + COUNT_WORD];
+    if (count == 0u || count > JOB_CAPACITY) return false;
+    slot_count = nodes[0].z;
+    pool_count = nodes[0].y;
+    uint pool_base = nodes[1].y;
+    slot_base = nodes[1].z;
+    address_base = nodes[1].w;
+    uint length = uint(nodes.length());
+    if (pool_base < 3u || pool_count == 0u || pool_count > (length - 3u) / 2u
+        || !fits(pool_base, pool_count * 2u, length)
+        || slot_base != pool_base + pool_count * 2u
+        || !fits(slot_base, slot_count, length) || address_base < slot_base + slot_count
+        || !fits(address_base, slot_count, length)) return false;
+    job_base = p.ordinal * JOB_CAPACITY * 2u;
+    return true;
+}
+
+bool valid_job(uint j) {
+    uvec4 a = jobs[job_base + j * 2u], b = jobs[job_base + j * 2u + 1u];
+    if (b.y >= uint(overlay.length()) || b.z >= slot_count
+        || !valid_span(a.zw, b.x)
+        || (any(notEqual(a.xy, uvec2(0u))) && !valid_span(a.xy, b.x))) return false;
+    uvec4 slot = nodes[slot_base + b.z], address = nodes[address_base + b.z];
+    uvec4 entry = overlay[b.y];
+    if (address.z >= pool_count || address.w >= slot_count
+        || slot.z != b.y || (slot.w != 1u && slot.w != 2u)
+        || entry.z != slot.w || entry.w != b.z
+        || any(notEqual(entry.xy, a.zw)) || any(notEqual(address.xy, a.zw))) return false;
+    for (uint k = 0u; k < j; ++k) {
+        uvec4 other = jobs[job_base + k * 2u + 1u];
+        if (other.y == b.y || other.z == b.z) return false;
+    }
+    return true;
+}
+
+void publish_mapped() {
+    // No other workgroup may read mutable owner metadata while WG0 publishes it.
+    if (any(notEqual(gl_WorkGroupID, uvec3(0u)))) return;
+    uint lane = gl_LocalInvocationIndex;
+    if (lane == 0u) valid = uint(initialize_publish());
+    barrier();
+    if (valid == 0u) return;
+    barrier();
+    for (uint j = lane; j < count; j += gl_WorkGroupSize.x)
+        if (!valid_job(j)) atomicAnd(valid, 0u);
+    barrier();
+    if (valid == 0u) return;
+    for (uint j = lane; j < count; j += gl_WorkGroupSize.x) {
+        uvec4 a = jobs[job_base + j * 2u], b = jobs[job_base + j * 2u + 1u];
+        if (all(equal(a.xy, uvec2(0u)))) continue;
+        nodes[slot_base + b.z].w = 1u;
+        overlay[b.y].z = 1u;
+    }
+}
+
+uint64_t address64(uvec2 address) {
+    return uint64_t(address.x) | (uint64_t(address.y) << 32u);
+}
+
+void copy_payload() {
+    if (gl_GlobalInvocationID.y != 0u || gl_GlobalInvocationID.z != 0u) return;
+    if (p.ordinal >= uint(journal.length()) / JOURNAL_WORDS) return;
+    uint journal_base = p.ordinal * JOURNAL_WORDS;
+    uint status = journal[journal_base + STATUS_WORD];
+    if (status != 4u && status != 5u) return;
+    uint job_count = journal[journal_base + COUNT_WORD];
+    if (job_count == 0u || job_count > JOB_CAPACITY) return;
+    if (p.ordinal >= uint(jobs.length()) / (JOB_CAPACITY * 2u)) return;
+    uint base = p.ordinal * JOB_CAPACITY * 2u;
+    uint64_t lane = uint64_t(gl_WorkGroupID.x) * uint64_t(gl_WorkGroupSize.x)
+                  + uint64_t(gl_LocalInvocationID.x);
+    uint64_t stride = uint64_t(gl_NumWorkGroups.x) * uint64_t(gl_WorkGroupSize.x);
+    if (stride == uint64_t(0)) return;
+
+    // Keep the old payload's whole-batch BDA checks separate from publication.
+    for (uint j = 0u; j < job_count; ++j) {
+        uvec4 a = jobs[base + j * 2u];
+        uint bytes = jobs[base + j * 2u + 1u].x;
+        uint64_t src = address64(a.xy);
+        uint64_t dst = address64(a.zw);
+        if ((src == uint64_t(0) && status != 5u) || dst == uint64_t(0) || bytes == 0u) return;
+        if (((a.x | a.z | bytes) & 15u) != 0u) return;
+        uint64_t last = uint64_t(bytes - 1u);
+        if (src + last < src || dst + last < dst) return;
+    }
+    for (uint j = 0u; j < job_count; ++j) {
+        uvec4 a = jobs[base + j * 2u];
+        if (all(equal(a.xy, uvec2(0u)))) continue;
+        uint bytes = jobs[base + j * 2u + 1u].x;
+        Source src = Source(address64(a.xy));
+        Destination dst = Destination(address64(a.zw));
+        uint64_t chunks = uint64_t(bytes / 16u);
+        for (uint64_t chunk = lane; chunk < chunks; chunk += stride)
+            dst.chunks[uint(chunk)] = src.chunks[uint(chunk)];
+    }
+}
+
+void main() {
+    // Serial-only contract: no owner/payload consumer until the caller's post-dispatch
+    // global COMPUTE_WRITE -> COMPUTE_READ dependency has completed ALL workgroups.
+    // CPU observes only the previously published immutable request, never this owner state.
+    publish_mapped();
+    copy_payload();
+}

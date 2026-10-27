@@ -1,0 +1,1355 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#ifdef OWNER_TOPK_FUSED
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_GOOGLE_include_directive : require
+#endif
+// Certified single-row WG64/Fixed32 path: split hot preflight plus complete cold admission.
+// Full cold revalidation/reset on uniform fast fallback; no status6 mailbox dependency.
+#ifdef OWNER_TOPK_TWO_ROW
+layout(local_size_x = 128) in;
+#else
+layout(local_size_x = 64) in;
+#endif
+
+layout(std430, binding = 0) buffer Ids { uint ids[]; };
+layout(std430, binding = 1) buffer Tape { uvec2 addresses[]; };
+layout(std430, binding = 2) buffer Control {
+    uint run; uint stopped; uint reached; uint invalid; uint hit_run; uint predicates[];
+};
+layout(std430, binding = 3) buffer Journal { uint journal[]; };
+layout(std430, binding = 4) readonly buffer Sources { uvec4 sources[]; };
+layout(std430, binding = 5) buffer Candidates { uvec4 nodes[]; };
+layout(std430, binding = 6) buffer Overlay { uvec4 overlay[]; };
+layout(std430, binding = 7) buffer Jobs { uvec4 jobs[]; };
+#ifdef COPY_OVERLAP
+layout(std430, binding = 8) buffer MissPredicates { uint miss_jobs[]; };
+#endif
+layout(push_constant, std430) uniform Params {
+    uint count; uint experts; uint gate_base; uint up_base; uint down_base;
+    uint ordinal; uint used; uint shared_mask; uint immutable_predicates;
+    uint role_block_base0; uint role_block_base1; uint role_block_base2;
+    uint pool_start0; uint pool_start1; uint pool_start2; // owned: 1 = recovery refresh
+    uint pool_count0; uint pool_count1; uint pool_count2;
+    uint copy_groups;
+    // CPU-certified per registered bank: {pool, bytes, first physical slot, physical capacity}.
+    // Scalar array stride is 4 bytes: the original 76-byte prefix plus 48 = 124 bytes.
+    layout(offset = 76) uint role_geometry[12];
+} p;
+
+const uint NONE = 0xffffffffu;
+const uint FREE = 0u, READY = 1u, COPYING = 2u;
+const uint MAX_ROUTED = INFR_MAX_DECODE_ROWS * 16u;
+const uint JOB_CAPACITY = MAX_ROUTED * 3u;
+const uint MASK_WORD = MAX_ROUTED;
+const uint COUNT_WORD = MASK_WORD + INFR_MAX_DECODE_ROWS;
+const uint STATUS_WORD = COUNT_WORD + 3u;
+const uint JOURNAL_WORDS = STATUS_WORD + 1u;
+const uint NEEDS_SLOW = 6u;
+const uint FIRST_MASK = 0x1ffu;
+const uint TAPE_WRITER = 0x80000000u;
+const uint WAS_MISSING = 0x40000000u;
+const uint LOG_VICTIM = 0x20000000u;
+#ifdef OWNER_TOPK_FUSED
+// Single-row TopK can retain a checked hot prefix for ordinary FREE misses. All other
+// failures still rerun the complete cold validator before any ownership mutation.
+const uint HOT_MISS = 1u, HOT_DECLINE = 2u, PARTIAL_READY = 3u;
+#else
+// Preserve the original non-TopK hot/cold rejection value and compiled instruction path.
+#define HOT_DECLINE 1u
+#endif
+
+shared uint pool_count, slot_count, pool_base, slot_base, address_base, heap_base;
+shared uint request_count, work_valid, work_invalid, work_missing, miss_count;
+shared uvec2 old_clock, new_clock;
+shared uint blocks[JOB_CAPACITY];
+shared uint tapes[JOB_CAPACITY];
+shared uint placements[JOB_CAPACITY];
+shared uint firsts[JOB_CAPACITY];
+shared uint lasts[JOB_CAPACITY];
+shared uvec4 source_values[JOB_CAPACITY];
+shared uint plan_count;
+shared uvec4 pool_info[3]; // pool, bytes, first global slot, physical capacity
+shared uvec4 pool_lists[3]; // queue-header index, resident count, free head, enabled
+shared uvec4 pool_counts[3]; // touches, unique misses, unique requests, free pops
+shared uint free_after[3];
+#ifdef OWNER_TOPK_TWO_ROW
+shared uvec4 scan_min[128]; // FIFO {slot,eligible,malformed,0}; compaction borrows w as keep flag
+#else
+shared uvec4 scan_min[64]; // FIFO {slot,eligible,malformed,0}; compaction borrows w as keep flag
+#endif
+shared uvec4 queue_state[3]; // head, tail, log capacity, unique touches to append
+shared uint selected_index, need_scan, job_count, cpu_jobs;
+#ifdef OWNER_TOPK_FUSED
+// Published with the wrapper's routed IDs and exact first/last indices.
+shared uint route_unique_ids;
+#endif
+
+uint pool_node(uint pool) { return pool_base + pool * 2u; }
+uint tape_base(uint role) {
+    return role == 0u ? p.gate_base : (role == 1u ? p.up_base : p.down_base);
+}
+uint block_base(uint role) {
+    return role == 0u ? p.role_block_base0
+                    : (role == 1u ? p.role_block_base1 : p.role_block_base2);
+}
+bool present(uvec2 a) { return any(notEqual(a, uvec2(0u))); }
+bool span_fits(uint base, uint count, uint length) {
+    return base <= length && count <= length - base;
+}
+bool valid_span(uvec2 a, uint bytes) {
+    return present(a) && !all(equal(a, uvec2(NONE)))
+        && ((a.x | bytes) & 15u) == 0u && bytes != 0u
+        && (a.y != NONE || a.x <= NONE - (bytes - 1u));
+}
+bool stamp_less(uvec2 a, uvec2 b) {
+    return a.y < b.y || (a.y == b.y && a.x < b.x);
+}
+bool key_less(uvec4 a, uvec4 b) {
+    return stamp_less(a.xy, b.xy) || (all(equal(a.xy, b.xy)) && a.z < b.z);
+}
+uvec2 stamp_add(uvec2 a, uint n) {
+    uint lo = a.x + n;
+    return uvec2(lo, a.y + uint(lo < a.x));
+}
+bool protected_block(uint block) {
+    // collect_request proved all three banks and every routed ID before selection.
+    uint id0 = block - p.role_block_base0;
+    uint id1 = block - p.role_block_base1;
+    uint id2 = block - p.role_block_base2;
+    bool in0 = block >= p.role_block_base0 && id0 < p.experts;
+    bool in1 = block >= p.role_block_base1 && id1 < p.experts;
+    bool in2 = block >= p.role_block_base2 && id2 < p.experts;
+    if (!in0 && !in1 && !in2) return false;
+    // All roles use the same routed IDs. Scan the role0 slice once, testing every
+    // containing bank: equal and partially overlapping banks remain exact.
+    for (uint i = 0u; i < p.count; ++i) {
+        uint routed = blocks[i] - p.role_block_base0;
+        if ((in0 && routed == id0) || (in1 && routed == id1)
+            || (in2 && routed == id2)) return true;
+    }
+    return false;
+}
+uint plan_index(uint pool) {
+    for (uint i = 0u; i < plan_count; ++i)
+        if (pool_info[i].x == pool) return i;
+    return NONE;
+}
+bool first_request(uint q) { return (firsts[q] & FIRST_MASK) == q; }
+bool was_missing(uint q) { return (firsts[q] & WAS_MISSING) != 0u; }
+
+void finish(uint base, uint status) {
+    reached = p.ordinal + 1u;
+    hit_run = uint(status == 1u || status == 4u || status == 5u);
+#ifdef COPY_OVERLAP
+    // A CPU-serviced miss may evaluate hits, but run stays zero until recovery.
+    hit_run |= uint(status == 5u);
+    if (status == 4u || status == 5u) {
+        miss_jobs[p.ordinal * 4u] = status == 4u ? job_count : 0u;
+        miss_jobs[p.ordinal * 4u + 1u] = job_count != cpu_jobs ? p.copy_groups : 0u;
+    }
+#endif
+    if (status == 3u || status == 5u) {
+        run = 0u;
+        stopped = p.ordinal;
+    }
+    if (status == 3u) invalid = 1u;
+    // Only these statuses follow a validated ownership header; invalid headers may be short.
+    if (status == 1u || status == 4u || status == 5u) {
+        journal[base + COUNT_WORD + 1u] = nodes[0].w;
+        journal[base + COUNT_WORD + 2u] = nodes[1].x;
+    }
+    journal[base + STATUS_WORD] = status;
+    if (p.immutable_predicates != 0u) {
+        predicates[p.ordinal * 2u] = run;
+        predicates[p.ordinal * 2u + 1u] = hit_run;
+    }
+}
+
+bool valid_header() {
+    uint length = uint(nodes.length());
+    if (length < 3u || nodes[0].x != 4u) return false;
+    pool_count = nodes[0].y;
+    slot_count = nodes[0].z;
+    pool_base = nodes[1].y;
+    slot_base = nodes[1].z;
+    address_base = nodes[1].w;
+    if (pool_count == 0u || pool_base < 3u || pool_count > (length - 3u) / 2u
+        || !span_fits(pool_base, pool_count * 2u, length)
+        || slot_base != pool_base + pool_count * 2u
+        || !span_fits(slot_base, slot_count, length)
+        || address_base < slot_base + slot_count
+        || !span_fits(address_base, slot_count, length)) return false;
+    heap_base = address_base + slot_count;
+    // Queue region contains one header per pool and two log records per physical slot.
+    if (!span_fits(heap_base, pool_count, length)
+        || slot_count > (length - heap_base - pool_count) / 2u
+        || length - heap_base - pool_count != slot_count * 2u) return false;
+    old_clock = nodes[2].zw;
+    new_clock = stamp_add(old_clock, request_count);
+    return p.pool_start0 == 1u || !stamp_less(new_clock, old_clock);
+}
+
+bool pool_geometry(uint pool, out uint first, out uint capacity) {
+    uint base = nodes[pool_node(pool)].x;
+    uint end = pool + 1u == pool_count ? uint(nodes.length())
+                                     : nodes[pool_node(pool + 1u)].x;
+    if (base < heap_base + pool || base >= uint(nodes.length())
+        || end <= base || end > uint(nodes.length())
+        || ((base - heap_base - pool) & 1u) != 0u || ((end - base - 1u) & 1u) != 0u)
+        return false;
+    first = (base - heap_base - pool) / 2u;
+    capacity = (end - base - 1u) / 2u;
+    return capacity != 0u && span_fits(first, capacity, slot_count)
+        && (pool != 0u || first == 0u)
+        && (pool + 1u != pool_count || first + capacity == slot_count);
+}
+
+bool valid_address(uint s, uint pool, uint bytes) {
+    if (s >= slot_count) return false;
+    uint first, capacity;
+    if (!pool_geometry(pool, first, capacity) || s < first || s - first >= capacity)
+        return false;
+    uvec4 a = nodes[address_base + s];
+    return a.z == pool && a.w == s - first && valid_span(a.xy, bytes);
+}
+
+bool valid_resident(uint s, uint pool, uint bytes) {
+    if (!valid_address(s, pool, bytes)) return false;
+    uvec4 slot = nodes[slot_base + s];
+    if ((slot.w != READY && slot.w != COPYING) || !present(slot.xy)
+        || stamp_less(old_clock, slot.xy) || slot.z >= uint(sources.length())
+        || slot.z >= uint(overlay.length())) return false;
+    uvec4 source = sources[slot.z], entry = overlay[slot.z];
+    return source.w == pool && source.z == bytes && entry.z == slot.w && entry.w == s
+        && all(equal(entry.xy, nodes[address_base + s].xy));
+}
+
+bool collect_request(uint q) {
+    uint role = q / p.count, i = q % p.count;
+    uint tb = tape_base(role), bb = block_base(role), id = ids[i];
+    if (id >= p.experts || !span_fits(tb, p.experts, uint(addresses.length()))
+        || !span_fits(bb, p.experts, uint(sources.length()))
+        || !span_fits(bb, p.experts, uint(overlay.length()))) return false;
+    uint block = bb + id;
+    blocks[q] = block;
+    tapes[q] = tb + id;
+    placements[q] = NONE;
+    uvec4 source = sources[block];
+    source_values[q] = source;
+    if (source.w >= pool_count || source.z == 0u || (source.z & 15u) != 0u
+        || (present(source.xy) && !valid_span(source.xy, source.z))) return false;
+    uvec4 entry = overlay[block];
+    if (entry.z > READY || (p.pool_start0 == 1u && entry.z != READY)) return false;
+    if (entry.z == READY) {
+        if (!valid_address(entry.w, source.w, source.z)) return false;
+        uvec4 slot = nodes[slot_base + entry.w];
+        if (slot.z != block || slot.w != READY || !present(slot.xy)
+            || stamp_less(old_clock, slot.xy)
+            || any(notEqual(entry.xy, nodes[address_base + entry.w].xy))) return false;
+        placements[q] = entry.w;
+    } else atomicOr(work_missing, 1u);
+    return true;
+}
+
+void classify_request(uint q) {
+    uint first = q, last = q;
+    bool writer = true;
+    for (uint j = 0u; j < request_count; ++j) {
+        if (blocks[j] == blocks[q]) { first = min(first, j); last = max(last, j); }
+        if (tapes[j] == tapes[q]) {
+            if (blocks[j] != blocks[q]) atomicOr(work_invalid, 1u);
+            if (j < q) writer = false;
+        }
+    }
+    bool missing = placements[q] == NONE;
+    firsts[q] = first | (writer ? TAPE_WRITER : 0u) | (missing ? WAS_MISSING : 0u);
+    lasts[q] = last;
+    if (first == q && missing) atomicAdd(miss_count, 1u);
+    uint bank = q / p.count * p.count;
+    if (source_values[q].w != source_values[bank].w
+        || source_values[q].z != source_values[bank].z) atomicOr(work_invalid, 1u);
+}
+
+void make_plans() {
+    plan_count = 0u;
+    for (uint role = 0u; role < 3u; ++role) {
+        uvec4 source = source_values[role * p.count];
+        if (plan_index(source.w) != NONE) continue;
+        uint i = plan_count++;
+        pool_info[i] = uvec4(source.w, source.z, 0u, 0u);
+        pool_lists[i] = nodes[pool_node(source.w)];
+    }
+}
+
+bool unique_pool(uint i) {
+    if (i >= plan_count) return false;
+    for (uint j = 0u; j < i; ++j)
+        if (pool_info[j].x == pool_info[i].x) return false;
+    return true;
+}
+
+bool valid_queue_header(uint pool, uint capacity) {
+    uvec4 list = nodes[pool_node(pool)];
+    uvec4 queue = nodes[list.x];
+    return list.y <= list.w && list.w <= capacity
+        && (list.w != list.y || list.z == NONE)
+        && queue.z == capacity * 2u && queue.w == 0u
+        && queue.x <= queue.y && queue.y <= queue.z && list.y <= queue.y - queue.x;
+}
+
+bool valid_log_record(uvec4 entry, uint first, uint capacity) {
+    return entry.w == 0u && present(entry.xy) && !stamp_less(old_clock, entry.xy)
+        && entry.z >= first && entry.z < slot_count && entry.z - first < capacity;
+}
+
+bool matching_log(uvec4 entry) {
+    if (entry.z >= slot_count) return false;
+    uvec4 slot = nodes[slot_base + entry.z];
+    return (slot.w == READY || slot.w == COPYING) && all(equal(slot.xy, entry.xy));
+}
+
+// The seed guarantees one matching log per resident and actual-stamp FIFO order.
+// Pool leaders validate counts, geometry, free prefix, and statistics only.
+// The whole workgroup selects and validates FIFO victims afterward, before any mutation.
+bool preflight_pool(uint i) {
+    uint pool = pool_info[i].x, bytes = pool_info[i].y, first, capacity;
+    if (!pool_geometry(pool, first, capacity)) return false;
+    pool_info[i].zw = uvec2(first, capacity);
+    uvec4 list = pool_lists[i];
+    if (!valid_queue_header(pool, capacity)) return false;
+    uvec4 counts = uvec4(0u);
+    for (uint q = 0u; q < request_count; ++q) {
+        if (source_values[q].w != pool) continue;
+        if (source_values[q].z != bytes) return false;
+        ++counts.x;
+        if (first_request(q)) {
+            ++counts.z;
+            if (was_missing(q)) ++counts.y;
+        }
+    }
+    if (counts.z > list.w) return false;
+    uint cursor = list.z;
+    for (uint q = 0u; q < request_count && counts.w < counts.y && cursor != NONE; ++q) {
+        if (source_values[q].w != pool || !first_request(q) || !was_missing(q)) continue;
+        if (cursor == NONE) break;
+        if (counts.w >= list.w - list.y || !valid_address(cursor, pool, bytes)) return false;
+        uvec4 slot = nodes[slot_base + cursor];
+        if (slot.w != FREE || slot.z != NONE) return false;
+        for (uint j = 0u; j < q; ++j)
+            if (source_values[j].w == pool && first_request(j) && was_missing(j)
+                && placements[j] == cursor) return false;
+        placements[q] = cursor;
+        ++counts.w;
+        uint next = slot.y;
+        if (next != NONE) {
+            if (!valid_address(next, pool, bytes) || nodes[slot_base + next].w != FREE)
+                return false;
+            for (uint j = 0u; j <= q; ++j)
+                if (source_values[j].w == pool && first_request(j) && was_missing(j)
+                    && placements[j] == next) return false;
+        }
+        cursor = next;
+    }
+    free_after[i] = cursor;
+    uint needed = counts.y - counts.w;
+    if (p.pool_start0 == 0u) {
+        uvec4 stats = nodes[pool_node(pool) + 1u];
+        if (counts.x - counts.y > NONE - stats.x || counts.y > NONE - stats.y
+            || needed > NONE - stats.z) return false;
+    }
+    pool_counts[i] = counts;
+    return true;
+}
+
+#ifdef OWNER_TOPK_TWO_ROW
+void select_fifo_victims_workgroup() {
+#else
+void select_fifo_victims() {
+#endif
+    uint lane = gl_LocalInvocationIndex;
+    // Subgroup lane order need not match LocalInvocationIndex, and a native subgroup
+    // may have inactive invocation holes. Build a dense logical FIFO lane once.
+    uint active_subgroup_size = subgroupAdd(1u);
+    uint fifo_lane = subgroupExclusiveAdd(1u);
+    if (subgroupElect()) scan_min[gl_SubgroupID].w = active_subgroup_size;
+    barrier();
+    for (uint subgroup = 0u; subgroup < gl_SubgroupID; ++subgroup)
+        fifo_lane += scan_min[subgroup].w;
+    // Every size reader completes before the first chunk reuses .w for eligible totals.
+    barrier();
+    for (uint i = 0u; i < plan_count; ++i) {
+        uint pool = pool_info[i].x, bytes = pool_info[i].y;
+        uint needed = pool_counts[i].y - pool_counts[i].w;
+        if (needed == 0u) continue;
+        uvec4 queue = nodes[pool_lists[i].x];
+        uint found = 0u;
+        for (uint start = queue.x; start < queue.y && found < needed;
+             start += gl_WorkGroupSize.x) {
+            uint active_count = min(gl_WorkGroupSize.x, queue.y - start);
+            uvec4 entry = uvec4(0u);
+            bool malformed = false, eligible = false;
+            if (fifo_lane < active_count) {
+                entry = nodes[pool_lists[i].x + 1u + start + fifo_lane];
+                malformed = !valid_log_record(entry, pool_info[i].z, pool_info[i].w);
+                // Never dereference a malformed slot index. COPYING is neither selected
+                // nor removed; selection never changes the queue or its head.
+                if (!malformed) {
+                    uvec4 slot = nodes[slot_base + entry.z];
+                    eligible = slot.w == READY && all(equal(slot.xy, entry.xy))
+                        && !protected_block(slot.z);
+                }
+            }
+            uint subgroup_prefix = subgroupExclusiveAdd(uint(eligible));
+            uint subgroup_total = subgroupAdd(uint(eligible));
+            // Only the elected invocation writes this component. Do not also write
+            // scan_min[lane]: that may overwrite another subgroup's published count.
+            if (subgroupElect()) scan_min[gl_SubgroupID].w = subgroup_total;
+            barrier();
+
+            uint remaining = needed - found, prefix = subgroup_prefix, total = 0u;
+            for (uint subgroup = 0u; subgroup < gl_NumSubgroups; ++subgroup) {
+                uint flags = scan_min[subgroup].w;
+                if (subgroup < gl_SubgroupID) prefix += flags;
+                total += flags;
+            }
+            // Malformed records are never eligible: prefix < remaining is exactly
+            // the original serial cutoff, including a chunk with too few eligible entries.
+            if (malformed && prefix < remaining) atomicOr(work_invalid, 1u);
+
+            uint target = NONE;
+            if (eligible && prefix < remaining) {
+                uint rank = pool_counts[i].w + found + prefix, ordinal = 0u;
+                // Use immutable first-miss order, NOT placements==NONE, which this
+                // batch will change. Include the leading free-pop destinations in rank.
+                for (uint q = 0u; q < request_count; ++q) {
+                    if (source_values[q].w != pool || !first_request(q) || !was_missing(q))
+                        continue;
+                    if (ordinal == rank) { target = q; break; }
+                    ++ordinal;
+                }
+                if (target == NONE || !valid_resident(entry.z, pool, bytes))
+                    atomicOr(work_invalid, 1u);
+            }
+            // All firsts[] readers and strong resident validators finish before flag writes.
+            barrier();
+            if (work_invalid != 0u) return;
+            if (target != NONE) {
+                placements[target] = entry.z;
+                firsts[target] |= LOG_VICTIM;
+            }
+            barrier();
+            found += min(total, remaining);
+        }
+        if (lane == 0u && found != needed) atomicOr(work_invalid, 1u);
+        barrier();
+        if (work_invalid != 0u) return;
+    }
+    // Finish every lane's preceding pool-decision read before duplicate checks can set
+    // work_invalid again; otherwise a late reader could leave while peers enter a barrier.
+    barrier();
+    // Selected records can be malformed duplicates even when each owner is individually
+    // canonical. Preserve the old duplicate rejection before any SSBO commit.
+    for (uint q = lane; q < request_count; q += gl_WorkGroupSize.x) {
+        if ((firsts[q] & LOG_VICTIM) == 0u) continue;
+        for (uint j = 0u; j < q; ++j)
+            if (source_values[j].w == source_values[q].w
+                && (firsts[j] & LOG_VICTIM) != 0u && placements[j] == placements[q])
+                atomicOr(work_invalid, 1u);
+    }
+    barrier();
+}
+
+#ifdef OWNER_TOPK_TWO_ROW
+void select_fifo_victims() {
+    if (plan_count > min(2u, gl_NumSubgroups) || request_count > gl_WorkGroupSize.x) {
+        select_fifo_victims_workgroup();
+        return;
+    }
+    uint lane = gl_LocalInvocationIndex;
+    uint fifo_lane = subgroupExclusiveAdd(1u);
+    uint fifo_width = subgroupAdd(1u);
+    // Keep firsts[] immutable until independent pools finish ranking their misses.
+    // Temporary victim markers borrow the existing compaction scratch only.
+    scan_min[lane].x = 0u;
+    barrier();
+    if (gl_SubgroupID < plan_count) {
+        uint i = gl_SubgroupID;
+        uint pool = pool_info[i].x, bytes = pool_info[i].y;
+        uint needed = pool_counts[i].y - pool_counts[i].w;
+        uvec4 queue = nodes[pool_lists[i].x];
+        uint found = 0u;
+        for (uint start = queue.x; start < queue.y && found < needed;
+             start += fifo_width) {
+            uint active_count = min(fifo_width, queue.y - start);
+            uvec4 entry = uvec4(0u);
+            bool malformed = false, eligible = false;
+            if (fifo_lane < active_count) {
+                entry = nodes[pool_lists[i].x + 1u + start + fifo_lane];
+                malformed = !valid_log_record(entry, pool_info[i].z, pool_info[i].w);
+                if (!malformed) {
+                    uvec4 slot = nodes[slot_base + entry.z];
+                    eligible = slot.w == READY && all(equal(slot.xy, entry.xy))
+                        && !protected_block(slot.z);
+                }
+            }
+            uint prefix = subgroupExclusiveAdd(uint(eligible));
+            uint total = subgroupAdd(uint(eligible));
+            uint remaining = needed - found;
+            if (malformed && prefix < remaining) atomicOr(work_invalid, 1u);
+            if (eligible && prefix < remaining) {
+                uint rank = pool_counts[i].w + found + prefix, ordinal = 0u;
+                uint target = NONE;
+                for (uint q = 0u; q < request_count; ++q) {
+                    if (source_values[q].w != pool || !first_request(q) || !was_missing(q))
+                        continue;
+                    if (ordinal == rank) { target = q; break; }
+                    ++ordinal;
+                }
+                if (target == NONE || !valid_resident(entry.z, pool, bytes))
+                    atomicOr(work_invalid, 1u);
+                if (target != NONE) {
+                    placements[target] = entry.z;
+                    scan_min[target].x = 1u;
+                }
+            }
+            found += min(total, remaining);
+        }
+        if (subgroupElect() && found != needed) atomicOr(work_invalid, 1u);
+    }
+    barrier();
+    if (work_invalid != 0u) return;
+    if (lane < request_count && scan_min[lane].x != 0u) firsts[lane] |= LOG_VICTIM;
+    barrier();
+    for (uint q = lane; q < request_count; q += gl_WorkGroupSize.x) {
+        if ((firsts[q] & LOG_VICTIM) == 0u) continue;
+        for (uint j = 0u; j < q; ++j)
+            if (source_values[j].w == source_values[q].w
+                && (firsts[j] & LOG_VICTIM) != 0u && placements[j] == placements[q])
+                atomicOr(work_invalid, 1u);
+    }
+    barrier();
+}
+#endif
+
+// Preflight every prospective compaction before any queue, placement, or Tape write.
+// Hot scratch has already changed source_values.z from entry state to pool ID.
+void prepare_queues(bool hot) {
+    uint lane = gl_LocalInvocationIndex;
+    if (unique_pool(lane)) {
+        uint pool = pool_info[lane].x;
+        uvec4 list = nodes[pool_node(pool)];
+        uvec4 queue = nodes[list.x];
+        uint touches = 0u;
+        if (hot) {
+            for (uint q = 0u; q < request_count; ++q)
+                if (lasts[q] == q && source_values[q].z == pool) ++touches;
+        } else touches = pool_counts[lane].z;
+        if (touches > list.w) atomicOr(work_invalid, 1u);
+        // Only an initial stale prefix is discarded. A live COPYING head is retained.
+        uint head = queue.x;
+        // Hot appends do not need to inspect old entries unless a parallel compaction
+        // is required. In particular, repeated all-pool hits never serially trim N entries.
+        while (!hot && head < queue.y) {
+            uvec4 entry = nodes[list.x + 1u + head];
+            if (!valid_log_record(entry, pool_info[lane].z, pool_info[lane].w)) {
+                atomicOr(work_invalid, 1u);
+                break;
+            }
+            if (matching_log(entry)) break;
+            ++head;
+        }
+        queue_state[lane] = uvec4(head, queue.y, queue.z, touches);
+    }
+    barrier();
+    for (uint i = 0u; i < plan_count; ++i) {
+        if (!unique_pool(i)) continue;
+        uvec4 queue = queue_state[i];
+        if (queue.w <= queue.z - queue.y) continue;
+        if (lane == 0u) selected_index = 0u;
+        barrier();
+        uint base = nodes[pool_node(pool_info[i].x)].x + 1u;
+        for (uint j = queue.x + lane; j < queue.y; j += gl_WorkGroupSize.x) {
+            uvec4 entry = nodes[base + j];
+            if (!valid_log_record(entry, pool_info[i].z, pool_info[i].w))
+                atomicOr(work_invalid, 1u);
+            else if (matching_log(entry)) atomicAdd(selected_index, 1u);
+        }
+        barrier();
+        if (lane == 0u) {
+            uint residents = nodes[pool_node(pool_info[i].x)].y;
+            if (selected_index != residents || queue.w > queue.z - selected_index)
+                atomicOr(work_invalid, 1u);
+        }
+        barrier();
+    }
+}
+
+void compact_queues() {
+    uint lane = gl_LocalInvocationIndex;
+    for (uint i = 0u; i < plan_count; ++i) {
+        if (!unique_pool(i)) continue;
+        uvec4 queue = queue_state[i];
+        if (queue.w <= queue.z - queue.y) continue;
+        uint base = nodes[pool_node(pool_info[i].x)].x;
+        if (lane == 0u) selected_index = 0u;
+        barrier();
+        for (uint start = queue.x; start < queue.y; start += gl_WorkGroupSize.x) {
+            uvec4 entry = uvec4(0u);
+            if (lane < queue.y - start) {
+                entry = nodes[base + 1u + start + lane];
+                entry.w = uint(matching_log(entry));
+            }
+            scan_min[lane] = entry;
+            barrier();
+            uint rank = 0u, kept = 0u, write_base = selected_index;
+            for (uint j = 0u; j < gl_WorkGroupSize.x; ++j) {
+                uint flag = scan_min[j].w;
+                kept += flag;
+                if (j < lane) rank += flag;
+            }
+            // All lanes capture this block and write cursor before left-compacting.
+            // Destinations never extend past loaded source positions into the next block.
+            barrier();
+            if (entry.w != 0u)
+                nodes[base + 1u + write_base + rank] = uvec4(entry.xyz, 0u);
+            if (lane == 0u) selected_index = write_base + kept;
+            memoryBarrierBuffer();
+            barrier();
+        }
+        if (lane == 0u) {
+            queue_state[i].xy = uvec2(0u, selected_index);
+            nodes[base] = uvec4(0u, selected_index, queue.z, 0u);
+        }
+        memoryBarrierBuffer();
+        barrier();
+    }
+}
+
+bool legacy_joint_hit_flags(uint i) {
+    return !was_missing(i) && !was_missing(p.count + i)
+        && !was_missing(p.count * 2u + i);
+}
+
+bool legacy_regular_banks() {
+    for (uint r = 0u; r < 3u; ++r)
+        for (uint s = 0u; s < r; ++s) {
+            uint a = block_base(r), b = block_base(s);
+            if (a != b && a < b + p.experts && b < a + p.experts) return false;
+        }
+    return true;
+}
+
+bool legacy_writer_role(uint r) {
+    for (uint s = r + 1u; s < 3u; ++s)
+        if (block_base(s) == block_base(r)) return false;
+    return true;
+}
+
+// Tape/job readers have finished; reuse their scratch, without extra LDS.
+void prepare_legacy_touch_order() {
+    bool regular = legacy_regular_banks();
+    // No later cold consumer needs this selection scratch. Publish with the rank barrier.
+    if (gl_LocalInvocationIndex == 0u) need_scan = regular ? 0u : 1u;
+    for (uint i = gl_LocalInvocationIndex; i < p.count; i += gl_WorkGroupSize.x) {
+        uint hits = 0u, hits_before = 0u;
+        uint hit_unique = 0u, miss_unique = 0u, hit_before = 0u, miss_before = 0u;
+        for (uint j = 0u; j < p.count; ++j) {
+            uint h = uint(legacy_joint_hit_flags(j));
+            hits += h;
+            if (j < i) hits_before += h;
+            if (regular && lasts[j] % p.count == j) {
+                hit_unique += h;
+                miss_unique += 1u - h;
+                if (j < i) {
+                    hit_before += h;
+                    miss_before += 1u - h;
+                }
+            }
+        }
+        bool hit = legacy_joint_hit_flags(i);
+        uint base = hit ? 0u : hits * 3u;
+        uint count = hit ? hits : p.count - hits;
+        uint within = hit ? hits_before : i - hits_before;
+        for (uint role = 0u; role < 3u; ++role) {
+            uint q = role * p.count + i;
+            uint ordinal = base + role * count + within;
+            uint queue_rank = 0u;
+            if (regular && lasts[q] == q) {
+                uint writers = 0u, prior = 0u, pool = source_values[q].w;
+                for (uint r = 0u; r < 3u; ++r) {
+                    if (source_values[r * p.count].w != pool || !legacy_writer_role(r)) continue;
+                    ++writers;
+                    prior += uint(r < role);
+                }
+                queue_rank = (hit ? 0u : hit_unique * writers)
+                    + prior * (hit ? hit_unique : miss_unique)
+                    + (hit ? hit_before : miss_before);
+            }
+            // MAX_ROUTED*3=384: both exact ordinals fit the existing scratch word.
+            tapes[q] = ordinal | (queue_rank << 16u);
+        }
+    }
+    barrier();
+}
+
+// Final touches match the existing hit-first/miss-last policy. Physical admissions
+// remain role-major; aliases append once at their final touch in the new ordering.
+// source_values.z is the pool here; no source class consumers remain after report_requests.
+void append_union() {
+    uint lane = gl_LocalInvocationIndex;
+    for (uint q = lane; q < request_count; q += gl_WorkGroupSize.x) {
+        if (lasts[q] != q) continue;
+        uint pool = source_values[q].z, i = plan_index(pool), rank = 0u;
+        if (need_scan == 0u) rank = tapes[q] >> 16u;
+        else for (uint j = 0u; j < request_count; ++j)
+            if (lasts[j] == j && source_values[j].z == pool && tapes[j] < tapes[q]) ++rank;
+        uvec2 stamp = stamp_add(old_clock, (tapes[q] & 0xffffu) + 1u);
+        uint s = placements[q];
+        // Component stores leave an admitted COPYING state and original owner intact.
+        nodes[slot_base + s].xy = stamp;
+        // Preflight proved this address; accounting may rewrite the mutable pool header.
+        uint base = heap_base + pool + pool_info[i].z * 2u;
+        nodes[base + 1u + queue_state[i].y + rank] = uvec4(stamp, s, 0u);
+    }
+    memoryBarrierBuffer();
+    barrier();
+    if (unique_pool(lane)) {
+        uvec4 queue = queue_state[lane];
+        uint base = heap_base + pool_info[lane].x + pool_info[lane].z * 2u;
+        nodes[base] = uvec4(queue.x, queue.y + queue.w, queue.z, 0u);
+    }
+}
+
+void install_miss(uint q, uint job_rank) {
+    uint s = placements[q];
+    uvec2 stamp = stamp_add(old_clock, lasts[q] + 1u);
+    if ((firsts[q] & LOG_VICTIM) != 0u) {
+        uvec4 old_slot = nodes[slot_base + s];
+        overlay[old_slot.z] = uvec4(0u, 0u, 0u, NONE);
+    }
+    uint block = blocks[q];
+    uvec4 source = source_values[q];
+    uvec2 destination = nodes[address_base + s].xy;
+    nodes[slot_base + s] = uvec4(stamp, block, COPYING);
+    overlay[block] = uvec4(destination, COPYING, s);
+    uint jb = (p.ordinal * JOB_CAPACITY + job_rank) * 2u;
+    jobs[jb] = uvec4(source.xy, destination);
+    jobs[jb + 1u] = uvec4(source.z, block, s, tapes[q]);
+    if (!present(source.xy)) atomicAdd(cpu_jobs, 1u);
+}
+
+void report_requests(uint base) {
+    for (uint i = gl_LocalInvocationIndex; i < p.count; i += gl_WorkGroupSize.x)
+        journal[base + i] = ids[i];
+    uint rows = p.count / p.used, mask = (1u << p.used) - 1u;
+    for (uint row = gl_LocalInvocationIndex; row < rows; row += gl_WorkGroupSize.x) {
+        uint hits = 0u;
+        for (uint lane = 0u; lane < p.used; ++lane) {
+            uint i = row * p.used + lane;
+            if (!was_missing(i) && !was_missing(p.count + i)
+                && !was_missing(p.count * 2u + i)) hits |= 1u << lane;
+        }
+        journal[base + MASK_WORD + row] = hits;
+#ifdef COPY_OVERLAP
+        ids[p.count + row] = hits | p.shared_mask;
+        ids[p.count + rows + row] = mask ^ hits;
+#else
+        ids[p.count + row] = (cpu_jobs != 0u ? hits : mask) | p.shared_mask;
+        ids[p.count + rows + row] = 0u;
+#endif
+    }
+    for (uint q = gl_LocalInvocationIndex; q < request_count; q += gl_WorkGroupSize.x)
+        if ((firsts[q] & TAPE_WRITER) != 0u) addresses[tapes[q]] = overlay[blocks[q]].xy;
+}
+
+void account_request() {
+    for (uint i = 0u; i < plan_count; ++i) {
+        uvec4 counts = pool_counts[i];
+        uint pn = pool_node(pool_info[i].x);
+        uvec4 stats = nodes[pn + 1u];
+        stats.xyz += uvec3(counts.x - counts.y, counts.y, counts.y - counts.w);
+        nodes[pn + 1u] = stats;
+        if (counts.y != 0u) {
+            pool_lists[i].z = free_after[i];
+            nodes[pn] = pool_lists[i];
+        }
+    }
+    uvec4 stats = nodes[2];
+    stats.xy += uvec2(request_count - miss_count, miss_count);
+    stats.zw = new_clock;
+    nodes[2] = stats;
+}
+
+void initialize() {
+    work_valid = 0u;
+    work_invalid = 0u;
+    work_missing = 0u;
+    miss_count = 0u;
+    job_count = 0u;
+    cpu_jobs = 0u;
+    hit_run = 0u;
+    bool journal_valid = p.ordinal < uint(journal.length()) / JOURNAL_WORDS;
+    bool predicates_valid = p.immutable_predicates == 0u
+        || p.ordinal < uint(predicates.length()) / 2u;
+#ifdef COPY_OVERLAP
+    bool miss_valid = p.ordinal < uint(miss_jobs.length()) / 4u;
+    if (miss_valid) {
+        miss_jobs[p.ordinal * 4u] = 0u;
+        miss_jobs[p.ordinal * 4u + 1u] = 0u;
+        miss_jobs[p.ordinal * 4u + 2u] = 1u;
+        miss_jobs[p.ordinal * 4u + 3u] = 1u;
+    }
+    predicates_valid = predicates_valid && miss_valid;
+#endif
+    uint base = journal_valid ? p.ordinal * JOURNAL_WORDS : 0u;
+    if (journal_valid) {
+        journal[base + STATUS_WORD] = 0u;
+        journal[base + COUNT_WORD] = 0u;
+        journal[base + COUNT_WORD + 1u] = 0u;
+        journal[base + COUNT_WORD + 2u] = 0u;
+    }
+    if (p.immutable_predicates != 0u && predicates_valid) {
+        predicates[p.ordinal * 2u] = 0u;
+        predicates[p.ordinal * 2u + 1u] = 0u;
+    }
+    if (run == 0u) return;
+    if (!journal_valid || !predicates_valid) {
+        invalid = 1u;
+        run = 0u;
+        stopped = p.ordinal;
+        reached = p.ordinal == NONE ? NONE : p.ordinal + 1u;
+        if (journal_valid) journal[base + STATUS_WORD] = 3u;
+        return;
+    }
+    bool dimensions_valid = p.used > 0u && p.used <= 16u && p.count > 0u
+        && p.count <= MAX_ROUTED && p.experts > 0u && p.copy_groups >= 1u
+        && p.copy_groups <= 8u && p.pool_start0 <= 1u;
+    uint rows = 0u;
+    if (dimensions_valid) {
+        rows = p.count / p.used;
+        dimensions_valid = p.count % p.used == 0u && rows <= INFR_MAX_DECODE_ROWS
+            && p.count + rows * 2u <= uint(ids.length());
+    }
+    request_count = p.count * 3u;
+    if (!dimensions_valid || invalid != 0u || !valid_header()) {
+        finish(base, 3u);
+        return;
+    }
+    work_valid = 1u;
+}
+
+void append_union_hot() {
+    uint lane = gl_LocalInvocationIndex;
+    for (uint q = lane; q < request_count; q += gl_WorkGroupSize.x) {
+        if (lasts[q] != q) continue;
+        uint pool = source_values[q].z, i = plan_index(pool), rank = 0u;
+        for (uint j = 0u; j < q; ++j)
+            if (lasts[j] == j && source_values[j].z == pool) ++rank;
+        uvec2 stamp = stamp_add(old_clock, q + 1u);
+        uint s = placements[q];
+        // Component stores leave an admitted COPYING state and original owner intact.
+        nodes[slot_base + s].xy = stamp;
+        uint base = nodes[pool_node(pool)].x;
+        nodes[base + 1u + queue_state[i].y + rank] = uvec4(stamp, s, 0u);
+    }
+    memoryBarrierBuffer();
+    barrier();
+    if (unique_pool(lane)) {
+        uvec4 queue = queue_state[lane];
+        uint base = nodes[pool_node(pool_info[lane].x)].x;
+        nodes[base] = uvec4(queue.x, queue.y + queue.w, queue.z, 0u);
+    }
+}
+
+bool prepare_hit_prefix() {
+    plan_count = 3u;
+    for (uint r = 0u; r < 3u; ++r) {
+        if (!span_fits(tape_base(r), p.experts, uint(addresses.length()))
+            || !span_fits(block_base(r), p.experts, uint(sources.length()))
+            || !span_fits(block_base(r), p.experts, uint(overlay.length()))) return false;
+    }
+    // Whole equal-length banks are disjoint or identical. The full validator handles
+    // partial overlaps, and identical Tape banks backed by different block banks.
+    for (uint r = 0u; r < 3u; ++r) {
+        for (uint s = 0u; s < r; ++s) {
+            uint br = block_base(r), bs = block_base(s);
+            uint tr = tape_base(r), ts = tape_base(s);
+            if ((br != bs && br < bs + p.experts && bs < br + p.experts)
+                || (tr < ts + p.experts && ts < tr + p.experts
+                    && (tr != ts || br != bs))) return false;
+        }
+    }
+    selected_index = 7u;
+    need_scan = 7u;
+    for (uint r = 0u; r < 3u; ++r) {
+        // The CPU getter must certify this exact (block_base, experts) bank for the
+        // active owned generation. Uncertified banks use the checked monolithic path.
+        uint g = r * 4u;
+        uvec4 geometry = uvec4(p.role_geometry[g], p.role_geometry[g + 1u],
+                               p.role_geometry[g + 2u], p.role_geometry[g + 3u]);
+        if (geometry.x >= pool_count || geometry.y == 0u || (geometry.y & 15u) != 0u
+            || geometry.w == 0u || !span_fits(geometry.z, geometry.w, slot_count)
+            || (geometry.x == 0u && geometry.z != 0u)
+            || (geometry.x + 1u == pool_count && geometry.z + geometry.w != slot_count))
+            return false;
+        pool_info[r] = geometry;
+        pool_counts[r] = uvec4(p.count, 0u, 0u, 0u);
+        for (uint s = 0u; s < r; ++s) {
+            if (block_base(r) == block_base(s)
+                && any(notEqual(pool_info[s], geometry))) return false;
+            if (pool_info[s].x == geometry.x) {
+                if (any(notEqual(pool_info[s].yzw, geometry.yzw))) return false;
+                pool_counts[r].x = 0u;
+            }
+            if (tape_base(r) == tape_base(s)) need_scan &= ~(1u << r);
+        }
+        for (uint s = r + 1u; s < 3u; ++s)
+            if (block_base(r) == block_base(s)) selected_index &= ~(1u << r);
+    }
+    for (uint r = 0u; r < 3u; ++r) {
+        if (pool_counts[r].x == 0u) continue;
+        for (uint s = r + 1u; s < 3u; ++s)
+            if (pool_info[s].x == pool_info[r].x) pool_counts[r].x += p.count;
+    }
+    pool_counts[0].yz = nodes[2].xy;
+    return p.pool_start0 == 1u || request_count <= NONE - pool_counts[0].y;
+}
+
+void gather_hit_prefix(uint q) {
+    uint r = q / p.count, i = q % p.count;
+    uint id = blocks[i];
+    if (id >= p.experts) {
+        atomicOr(work_invalid, HOT_DECLINE);
+        return;
+    }
+#ifndef OWNER_TOPK_FUSED
+    if (r == 0u) {
+        bool first = true, last = true;
+        for (uint j = 0u; j < p.count; ++j) {
+            if (blocks[j] != id) continue;
+            if (j < i) first = false;
+            if (j > i) last = false;
+        }
+        tapes[i] = uint(first) | (uint(last) << 1u);
+    }
+#endif
+    uint block = block_base(r) + id;
+    uvec4 entry = overlay[block];
+    source_values[q] = entry;
+#ifdef OWNER_TOPK_FUSED
+    if (entry.z == FREE && p.pool_start0 == 0u) {
+        atomicOr(work_invalid, HOT_MISS);
+        return;
+    }
+#endif
+    uint first_slot = pool_info[r].z, capacity = pool_info[r].w;
+    if (entry.z != READY || entry.w >= slot_count || entry.w < first_slot
+        || entry.w - first_slot >= capacity) {
+        atomicOr(work_invalid, HOT_DECLINE);
+        return;
+    }
+    uvec4 address = nodes[address_base + entry.w];
+    if (address.z != pool_info[r].x || address.w != entry.w - first_slot
+        || !valid_span(address.xy, pool_info[r].y)
+        || any(notEqual(entry.xy, address.xy))) {
+        atomicOr(work_invalid, HOT_DECLINE);
+        return;
+    }
+    uvec2 owner_state = nodes[slot_base + entry.w].zw;
+    if (owner_state.x != block || owner_state.y != READY) atomicOr(work_invalid, HOT_DECLINE);
+}
+
+uint hit_unique_ids() {
+#ifdef OWNER_TOPK_FUSED
+    return route_unique_ids;
+#else
+    uvec4 seen = uvec4(0u);
+    bool small_ids = true;
+    for (uint i = 0u; i < p.count; ++i) {
+        uint id = blocks[i];
+        if (id < 128u) seen[id >> 5u] |= 1u << (id & 31u);
+        else small_ids = false;
+    }
+    if (small_ids)
+        return uint(bitCount(seen.x) + bitCount(seen.y) + bitCount(seen.z) + bitCount(seen.w));
+    uint unique_ids = 0u;
+    for (uint i = 0u; i < p.count; ++i) {
+        bool last = true;
+        for (uint j = i + 1u; j < p.count; ++j)
+            if (blocks[j] == blocks[i]) { last = false; break; }
+        unique_ids += uint(last);
+    }
+    return unique_ids;
+#endif
+}
+
+void prepare_hit_queue_role(uint role) {
+    uint pool = pool_info[role].x, capacity = pool_info[role].w;
+    uint pn = pool_node(pool);
+    uvec4 list = nodes[pn];
+    // valid_header and the certified slot span bound this arithmetic by nodes.length().
+    // Check the mutable queue pointer BEFORE dereferencing it; no next-pool pointer chase.
+    uint base = heap_base + pool + pool_info[role].z * 2u;
+    if (list.x != base || !span_fits(base, 1u + capacity * 2u, uint(nodes.length()))) {
+        atomicOr(work_invalid, HOT_DECLINE);
+        return;
+    }
+    uvec4 queue = nodes[base];
+    // These are exactly valid_queue_header's checks, on the already loaded values.
+    if (!(list.y <= list.w && list.w <= capacity
+        && (list.w != list.y || list.z == NONE)
+        && queue.z == capacity * 2u && queue.w == 0u
+        && queue.x <= queue.y && queue.y <= queue.z && list.y <= queue.y - queue.x))
+        atomicOr(work_invalid, HOT_DECLINE);
+    if (pool_counts[role].x != 0u) {
+        uvec4 stats = nodes[pn + 1u];
+        pool_lists[role] = stats;
+        if (p.pool_start0 == 0u && pool_counts[role].x > NONE - stats.x)
+            atomicOr(work_invalid, HOT_DECLINE);
+    }
+    if (p.pool_start0 == 1u) return;
+    uint unique_ids = hit_unique_ids(), writer_roles = 0u, prior_roles = 0u;
+    for (uint r = 0u; r < 3u; ++r) {
+        if (pool_info[r].x != pool || (selected_index & (1u << r)) == 0u) continue;
+        ++writer_roles;
+        if (r < role) ++prior_roles;
+    }
+    uint touches = unique_ids * writer_roles;
+    if (touches > list.w) atomicOr(work_invalid, HOT_DECLINE);
+    if (touches > queue.z - queue.y) atomicOr(work_missing, 1u);
+    queue_state[role] = uvec4(queue.xyz, touches);
+    free_after[role] = list.x + 1u + queue.y + prior_roles * unique_ids;
+    pool_counts[role].w = list.x;
+}
+
+void initialize_hit_prefix() {
+    initialize();
+    if (work_valid != 0u && !prepare_hit_prefix()) work_valid = 2u;
+}
+
+#ifdef OWNER_TOPK_FUSED
+// Enter only after every hot gather/queue lane joined, with valid disjoint/equal banks,
+// no hot rejection except ordinary FREE misses, and at most one request per WG lane.
+// No directory, Overlay, Tape, IDs, jobs, or statistics are written by this conversion.
+bool prepare_partial_from_hits() {
+    // Every caller must consume the shared eligibility decision before any validator
+    // changes work_invalid; otherwise another subgroup could skip our later barriers.
+    barrier();
+    uint q = gl_LocalInvocationIndex;
+    // The wrapper classified actual IDs (including duplicates and false-predicate
+    // inputs) before hot validation. Keep the existing capture/overwrite barriers.
+    barrier();
+    bool live_request = q < request_count;
+    uint role = 0u, i = 0u, id = 0u, first_id = 0u, last_id = 0u;
+    uvec4 entry = uvec4(0u), source = uvec4(0u);
+    if (live_request) {
+        role = q / p.count;
+        i = q % p.count;
+        id = blocks[i];
+        first_id = firsts[i];
+        last_id = lasts[i];
+        entry = source_values[q];
+        uint block = block_base(role) + id;
+        source = sources[block];
+        // A certified bank is not a substitute for cold's actual source/BDA checks.
+        // A class mismatch declines to the original validator; never redefine rejection.
+        if (source.w >= pool_count || source.z == 0u || (source.z & 15u) != 0u
+            || (present(source.xy) && !valid_span(source.xy, source.z))
+            || source.w != pool_info[role].x || source.z != pool_info[role].y)
+            atomicOr(work_invalid, HOT_DECLINE);
+        if (entry.z == READY) {
+            // Hot already checked the range, canonical address, reverse owner and READY.
+            // Cold additionally requires a nonzero stamp no newer than the captured clock.
+            uvec2 stamp = nodes[slot_base + entry.w].xy;
+            if (!present(stamp) || stamp_less(old_clock, stamp))
+                atomicOr(work_invalid, HOT_DECLINE);
+        } else if (entry.z != FREE) atomicOr(work_invalid, HOT_DECLINE);
+    }
+    if (q < 3u) {
+        uint first, capacity;
+        // Preserve cold's actual adjacent-pool geometry checks, not just cert bounds.
+        if (!pool_geometry(pool_info[q].x, first, capacity)
+            || first != pool_info[q].z || capacity != pool_info[q].w)
+            atomicOr(work_invalid, HOT_DECLINE);
+    }
+    // Every role must capture indices and overlay into registers before any lane reuses
+    // firsts/lasts/blocks/tapes/source_values. Role0 owns the prefix every role reads.
+    barrier();
+    if (work_invalid != HOT_MISS) return false;
+    if (live_request) {
+        uint first_role = role, last_role = role, first_tape_role = role;
+        for (uint r = 0u; r < 3u; ++r) {
+            if (block_base(r) == block_base(role)) {
+                first_role = min(first_role, r);
+                last_role = max(last_role, r);
+            }
+            if (tape_base(r) == tape_base(role)) first_tape_role = min(first_tape_role, r);
+        }
+        uint first = first_role * p.count + first_id;
+        uint last = last_role * p.count + last_id;
+        bool writer = role == first_tape_role && i == first_id;
+        bool missing = entry.z == FREE;
+        blocks[q] = block_base(role) + id;
+        tapes[q] = tape_base(role) + id;
+        placements[q] = missing ? NONE : entry.w;
+        source_values[q] = source;
+        firsts[q] = first | (writer ? TAPE_WRITER : 0u) | (missing ? WAS_MISSING : 0u);
+        lasts[q] = last;
+        if (first == q && missing) atomicAdd(miss_count, 1u);
+    }
+    barrier();
+    if (q == 0u) {
+        work_invalid = 0u;
+        work_missing = 1u;
+        work_valid = PARTIAL_READY;
+    }
+    barrier();
+    return true;
+}
+#endif
+
+bool try_all_hits(bool prefix_ready) {
+    uint lane = gl_LocalInvocationIndex;
+    if (!prefix_ready) {
+        // Safe independently of lane zero's full dimension validation; no IDs change here.
+        if (p.count <= MAX_ROUTED && p.count <= uint(ids.length()))
+            for (uint i = lane; i < p.count; i += gl_WorkGroupSize.x) blocks[i] = ids[i];
+        if (lane == 0u) initialize_hit_prefix();
+        barrier();
+    }
+    if (work_valid == 0u) return true;
+    if (work_valid == 2u) return false;
+
+    // The first wave handles queues; other available waves gather routed entries.
+    // Use subgroup identities, never assume LocalInvocationIndex / 32 identifies a wave.
+    if (gl_SubgroupID == 0u) {
+        if (gl_SubgroupInvocationID < 3u)
+            prepare_hit_queue_role(gl_SubgroupInvocationID);
+#ifdef OWNER_TOPK_TWO_ROW
+    } else {
+        uint start = (gl_SubgroupID - 1u) * gl_SubgroupSize + gl_SubgroupInvocationID;
+        uint stride = (gl_NumSubgroups - 1u) * gl_SubgroupSize;
+        for (uint q = start; q < request_count; q += stride)
+            gather_hit_prefix(q);
+#else
+    } else if (gl_SubgroupID == 1u) {
+        for (uint q = gl_SubgroupInvocationID; q < request_count; q += gl_SubgroupSize)
+            gather_hit_prefix(q);
+#endif
+    }
+    barrier();
+    if (work_invalid != 0u) {
+#ifdef OWNER_TOPK_FUSED
+        // Keep the live checked prefix for qualified ordinary TopK shapes. Partial aliases,
+        // malformed metadata, recovery and unsupported shapes retain the full fallback.
+        bool partial_shape = p.count == p.used && p.count <= 16u;
+#ifdef OWNER_TOPK_TWO_ROW
+        // The wrapper classified the complete union. WG128 captures every role
+        // occurrence before the checked prefix scratch is repurposed.
+        partial_shape = p.count == 2u * p.used && (p.used == 8u || p.used == 10u);
+#endif
+        if (work_invalid == HOT_MISS && p.pool_start0 == 0u && partial_shape
+            && request_count <= gl_WorkGroupSize.x) {
+            if (prepare_partial_from_hits()) return false;
+        }
+#endif
+        // All lanes must finish reading the decision and scratch before the heavy path
+        // resets its accumulator or overwrites the borrowed ID/overlay storage.
+        barrier();
+        if (lane == 0u) { work_invalid = 0u; work_missing = 0u; }
+        barrier();
+        return false;
+    }
+
+    bool recovery = p.pool_start0 == 1u;
+    bool compact_hot = !recovery && work_missing != 0u;
+    if (compact_hot) {
+        // Preserve role masks before queue preflight borrows selected_index as a counter.
+        if (lane == 0u) free_after[0] = selected_index;
+        barrier();
+        for (uint q = lane; q < request_count; q += gl_WorkGroupSize.x) {
+            uint r = q / p.count, i = q % p.count;
+            uvec4 entry = source_values[q];
+            // blocks[] is being repurposed in parallel: read routed IDs from ids[], not blocks[].
+            blocks[q] = block_base(r) + ids[i];
+            placements[q] = entry.w;
+            lasts[q] = ((tapes[i] & 2u) != 0u && (free_after[0] & (1u << r)) != 0u)
+                ? q : NONE;
+            source_values[q].z = pool_info[r].x;
+        }
+        barrier();
+        prepare_queues(true);
+        if (work_invalid != 0u) {
+            if (lane == 0u) finish(p.ordinal * JOURNAL_WORDS, 3u);
+            return true;
+        }
+        compact_queues();
+    }
+
+    for (uint i = lane; i < p.count; i += gl_WorkGroupSize.x) {
+        uint id = ids[i], flags = tapes[i], prior_last_ids = 0u;
+        if (!recovery && !compact_hot && (flags & 2u) != 0u)
+            for (uint j = 0u; j < i; ++j)
+                prior_last_ids += uint((tapes[j] & 2u) != 0u);
+        for (uint r = 0u; r < 3u; ++r) {
+            uvec4 entry = source_values[r * p.count + i];
+            if (!recovery && !compact_hot && (flags & 2u) != 0u
+                && (selected_index & (1u << r)) != 0u) {
+                uvec2 stamp = stamp_add(old_clock, r * p.count + i + 1u);
+                nodes[slot_base + entry.w] = uvec4(stamp, block_base(r) + id, READY);
+                nodes[free_after[r] + prior_last_ids] = uvec4(stamp, entry.w, 0u);
+            }
+            if ((flags & 1u) != 0u && (need_scan & (1u << r)) != 0u)
+                addresses[tape_base(r) + id] = entry.xy;
+        }
+        journal[p.ordinal * JOURNAL_WORDS + i] = id;
+    }
+    uint rows = p.count / p.used, mask = (1u << p.used) - 1u;
+    for (uint row = lane; row < rows; row += gl_WorkGroupSize.x) {
+        journal[p.ordinal * JOURNAL_WORDS + MASK_WORD + row] = mask;
+        ids[p.count + row] = mask | p.shared_mask;
+        ids[p.count + rows + row] = 0u;
+    }
+    if (!recovery) {
+        if (compact_hot) append_union_hot();
+        else if (unique_pool(lane)) {
+            uvec4 queue = queue_state[lane];
+            // Header, records, stamps, and stats have disjoint final writers. The
+            // dispatch-completion barrier publishes them together to the next consumer.
+            nodes[pool_counts[lane].w] = uvec4(queue.x, queue.y + queue.w, queue.z, 0u);
+        }
+        if (lane < 3u && pool_counts[lane].x != 0u) {
+            uvec4 stats = pool_lists[lane];
+            stats.x += pool_counts[lane].x;
+            nodes[pool_node(pool_info[lane].x) + 1u] = stats;
+        }
+        if (lane == 0u)
+            nodes[2] = uvec4(pool_counts[0].y + request_count, pool_counts[0].z, new_clock);
+    }
+    // Dispatch completion and the recorder's buffer barrier publish disjoint final writes.
+    if (lane == 0u) finish(p.ordinal * JOURNAL_WORDS, 1u);
+    return true;
+}
+
+void execute_owner(bool prefix_ready) {
+    if (any(notEqual(gl_WorkGroupID, uvec3(0u)))) return;
+    if (try_all_hits(prefix_ready)) return;
+    // Complete every hot decision/scratch read before initialize resets shared state.
+    // Uniform false has not committed directory, overlays, Tape, IDs, or jobs.
+    barrier();
+#ifdef OWNER_TOPK_FUSED
+    uint base = p.ordinal * JOURNAL_WORDS;
+    bool partial_ready = work_valid == PARTIAL_READY;
+    if (!partial_ready) {
+#endif
+    if (gl_LocalInvocationIndex == 0u) initialize();
+    barrier();
+    if (work_valid == 0u) return;
+#ifndef OWNER_TOPK_FUSED
+    uint base = p.ordinal * JOURNAL_WORDS;
+#endif
+    for (uint q = gl_LocalInvocationIndex; q < request_count; q += gl_WorkGroupSize.x)
+        if (!collect_request(q)) atomicOr(work_invalid, 1u);
+    barrier();
+    if (work_invalid != 0u) {
+        if (gl_LocalInvocationIndex == 0u) finish(base, 3u);
+        return;
+    }
+    // All subgroups consume the collect decision before classify can set the same flag.
+    barrier();
+    for (uint q = gl_LocalInvocationIndex; q < request_count; q += gl_WorkGroupSize.x)
+        classify_request(q);
+#ifdef OWNER_TOPK_FUSED
+    }
+#endif
+    if (gl_LocalInvocationIndex == 0u) make_plans();
+    barrier();
+    if (gl_LocalInvocationIndex < plan_count)
+        if (!preflight_pool(gl_LocalInvocationIndex)) atomicOr(work_invalid, 1u);
+    if (gl_LocalInvocationIndex == 0u && p.pool_start0 == 0u) {
+        uvec4 stats = nodes[2];
+        if (request_count - miss_count > NONE - stats.x || miss_count > NONE - stats.y
+            || (work_missing != 0u
+                && p.ordinal >= uint(jobs.length()) / (JOB_CAPACITY * 2u)))
+            atomicOr(work_invalid, 1u);
+    }
+    barrier();
+    if (work_invalid != 0u) {
+        if (gl_LocalInvocationIndex == 0u) finish(base, 3u);
+        return;
+    }
+
+    bool recovery = p.pool_start0 == 1u;
+    if (!recovery) {
+        if (work_missing != 0u) select_fifo_victims();
+        if (work_invalid != 0u) {
+            if (gl_LocalInvocationIndex == 0u) finish(base, 3u);
+            return;
+        }
+        // All lanes consume the selection decision before prepare_queues can report
+        // a new validation error in the same shared accumulator.
+        barrier();
+        prepare_queues(false);
+        if (work_invalid != 0u) {
+            if (gl_LocalInvocationIndex == 0u) finish(base, 3u);
+            return;
+        }
+        compact_queues();
+        // Destinations are distinct, old owners are outside the protected union, and
+        // first missing blocks are unique. Each job owns its slot and both overlay writes.
+        // Prefix ranks preserve first-role-major job order independent of execution order.
+        if (gl_LocalInvocationIndex == 0u) job_count = miss_count;
+        if (gl_LocalInvocationIndex < plan_count)
+            pool_lists[gl_LocalInvocationIndex].y += pool_counts[gl_LocalInvocationIndex].w;
+        for (uint q = gl_LocalInvocationIndex; q < request_count; q += gl_WorkGroupSize.x) {
+            if (!first_request(q) || !was_missing(q)) continue;
+            uint job_rank = 0u;
+            for (uint j = 0u; j < q; ++j)
+                if (first_request(j) && was_missing(j)) ++job_rank;
+            install_miss(q, job_rank);
+        }
+        memoryBarrierBuffer();
+        barrier();
+    }
+    report_requests(base);
+    memoryBarrierBuffer();
+    barrier();
+    if (!recovery) {
+        // report_requests and install_miss are the final source-class/Tape consumers.
+        // Reuse scratch only after every lane has finished reporting.
+        prepare_legacy_touch_order();
+        for (uint q = gl_LocalInvocationIndex; q < request_count; q += gl_WorkGroupSize.x) {
+            if (need_scan != 0u) {
+                uint last = q;
+                for (uint j = 0u; j < request_count; ++j)
+                    if (blocks[j] == blocks[q] && tapes[j] > tapes[last]) last = j;
+                lasts[q] = last;
+            }
+            placements[q] = overlay[blocks[q]].w;
+            source_values[q].z = source_values[q].w;
+        }
+        barrier();
+        append_union();
+    }
+    if (gl_LocalInvocationIndex == 0u) {
+        if (!recovery) account_request();
+        journal[base + COUNT_WORD] = job_count;
+        finish(base, work_missing == 0u ? 1u : (cpu_jobs != 0u ? 5u : 4u));
+    }
+}
+#ifdef OWNER_TOPK_FUSED
+#define main owner_main
+#endif
+void main() {
+    execute_owner(false);
+}
+#ifdef OWNER_TOPK_FUSED
+#undef main
+#ifdef OWNER_TOPK_TWO_ROW
+#include "gpu_owned_topk_two_row_route.glsl"
+#else
+#include "gpu_owned_topk_route.glsl"
+#endif
+#endif

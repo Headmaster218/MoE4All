@@ -209,6 +209,7 @@ fn default_config_matches_documented_defaults() {
     assert!(d.kernels.vulkan.decode_gpu_resident);
     assert_eq!(d.kernels.vulkan.decode_gpu_resident_layers, 16);
     assert_eq!(d.kernels.vulkan.decode_gpu_resident_submit_layers, 0);
+    assert_eq!(d.kernels.vulkan.decode_gpu_resident_pure_mapped_layers, 0);
     assert_eq!(d.kernels.vulkan.decode_gpu_resident_inflight, 1);
     assert!(d.kernels.vulkan.decode_gpu_resident_mapped_metadata);
     assert!(d.kernels.vulkan.decode_gpu_resident_mapped_journal);
@@ -990,6 +991,22 @@ fn timeline_raw_label_controls_use_config_and_preserve_presence_env() {
     let cfg = Config::load_from_layers(&[env_layer(&[("INFR_TIMELINE_RAW_KERNELS", "1")]), layer]);
     assert!(!cfg.prof.timeline_raw_kernels);
     assert!(!cfg.prof.timeline_raw_unknown);
+}
+
+#[test]
+fn timeline_selective_sampling_is_opt_in_and_cli_configured() {
+    let default = Config::default();
+    assert!(default.prof.timeline_device_select.is_none());
+    assert!(default.prof.timeline_device_layer.is_none());
+    assert!(default.prof.timeline_host_select.is_none());
+    let cfg = Config::load_from_layers(&[cli_layer(&[
+        "prof.timeline_device_select=resident_,argmax",
+        "prof.timeline_device_layer=3",
+        "prof.timeline_host_select=queue_submit,PLE_",
+    ])]);
+    assert_eq!(cfg.prof.timeline_device_select.as_deref(), Some("resident_,argmax"));
+    assert_eq!(cfg.prof.timeline_device_layer, Some(3));
+    assert_eq!(cfg.prof.timeline_host_select.as_deref(), Some("queue_submit,PLE_"));
 }
 
 // ── §8.8 — every key is read ─────────────────────────────────────────────────

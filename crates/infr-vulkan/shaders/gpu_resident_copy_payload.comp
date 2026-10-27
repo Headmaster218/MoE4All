@@ -31,7 +31,8 @@ void main() {
     if (gl_GlobalInvocationID.y != 0u || gl_GlobalInvocationID.z != 0u) return;
     if (p.ordinal >= uint(journal.length()) / JOURNAL_WORDS) return;
     uint journal_base = p.ordinal * JOURNAL_WORDS;
-    if (journal[journal_base + JOURNAL_STATUS_WORD] != 4u) return;
+    uint status = journal[journal_base + JOURNAL_STATUS_WORD];
+    if (status != 4u && status != 5u) return;
     uint job_count = journal[journal_base + JOURNAL_JOB_COUNT_WORD];
     if (job_count == 0u || job_count > JOB_CAPACITY) return;
     if (p.ordinal >= uint(jobs.length()) / (JOB_CAPACITY * 2u)) return;
@@ -47,7 +48,8 @@ void main() {
         uint bytes = jobs[job_base + j * 2u + 1u].x;
         uint64_t src = address64(a.xy);
         uint64_t dst = address64(a.zw);
-        if (src == uint64_t(0) || dst == uint64_t(0) || bytes == 0u) return;
+        // Status 5 belongs to GPU-owned admission: zero-BDA jobs are serviced by CPU.
+        if ((src == uint64_t(0) && status != 5u) || dst == uint64_t(0) || bytes == 0u) return;
         if (((a.x | a.z | bytes) & 15u) != 0u) return;
         uint64_t last = uint64_t(bytes - 1u);
         if (src + last < src || dst + last < dst) return;
@@ -55,6 +57,7 @@ void main() {
     // The caller orders prepare -> payload -> full FFN with device memory barriers.
     for (uint j = 0u; j < job_count; ++j) {
         uvec4 a = jobs[job_base + j * 2u];
+        if (all(equal(a.xy, uvec2(0u)))) continue;
         uint bytes = jobs[job_base + j * 2u + 1u].x;
         Source src = Source(address64(a.xy));
         Destination dst = Destination(address64(a.zw));

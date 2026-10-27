@@ -66,7 +66,11 @@ fn real(layer: usize) -> [Vec<u8>; 2] {
         .filter(|path| !path.is_empty())
         .expect("D01_Q8PAIR_MODEL must name actual AD GGUF; no synthetic real-test fallback");
     let path = std::path::PathBuf::from(path);
-    assert!(path.is_file(), "D01_Q8PAIR_MODEL must name an existing GGUF file: {}", path.display());
+    assert!(
+        path.is_file(),
+        "D01_Q8PAIR_MODEL must name an existing GGUF file: {}",
+        path.display()
+    );
     let gguf = infr_gguf::Gguf::open(&path).unwrap();
     ["ssm_beta.weight", "ssm_alpha.weight"].map(|suffix| {
         let name = format!("blk.{layer}.{suffix}");

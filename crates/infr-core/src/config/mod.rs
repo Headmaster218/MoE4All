@@ -426,7 +426,11 @@ cfg_struct! {
         decode_gpu_resident_layers: usize = 16,
         /// Resident rolling-submit depth. 0 selects the graph's model-tuned value.
         decode_gpu_resident_submit_layers: usize = 0,
-        /// Keep one submitted resident segment in flight so miss recovery has a single owner.
+        /// Experiment: coalesce only certified GPU-owned mapped runs; 0 disables, 4 enables.
+        /// Host-required entries retain their original submit cadence. No preparation horizon grows.
+        decode_gpu_resident_pure_mapped_layers: usize = 0,
+        /// Rolling retirement depth (clamped to 1..2). GPU-owned HOST-sensitive runs allow
+        /// one extra speculative segment; certified mapped-only spans may continue freely.
         decode_gpu_resident_inflight: usize = 1,
         /// Keep resident predicates and LUT tape in coherent mapped VRAM when the device supports it.
         decode_gpu_resident_mapped_metadata: bool = true,
@@ -448,6 +452,9 @@ cfg_struct! {
         /// Experimental bounded compute copy concurrent with resident hit projections.
         /// Requires serial-copy eligibility; false preserves its copy-then-full-FFN path.
         decode_gpu_resident_copy_overlap: bool = false,
+        /// Submit guarded ordinary-Decode recovery while a certified CPU-only upload completes.
+        /// Experimental: the independent host timeline also retires the old notice epoch.
+        decode_gpu_resident_host_ready: bool = false,
         /// Wait submitted resident fences on a dedicated host thread (driver scheduling A/B).
         decode_gpu_resident_waiter: bool = false,
         /// Give each checked layer immutable predicate words to avoid predicate read/write barriers.
@@ -958,6 +965,12 @@ cfg_struct! {
         timeline_raw_kernels: bool = false,
         /// `INFR_TIMELINE_RAW_UNKNOWN`: retain names for kernels outside known categories.
         timeline_raw_unknown: bool = false,
+        /// Diagnostic-only comma-separated device label substrings; unset captures all.
+        timeline_device_select: Option<String> = None,
+        /// Diagnostic-only GPU layer restriction. Unlabelled frontend work is excluded.
+        timeline_device_layer: Option<usize> = None,
+        /// Diagnostic-only comma-separated host span substrings; unset captures all.
+        timeline_host_select: Option<String> = None,
         /// Optional one-shot CPU-miss weight/input fixture for local kernel diagnostics.
         cpu_miss_fixture_dir: Option<PathBuf> = None,
         timeline_skip_steps: usize = 64,

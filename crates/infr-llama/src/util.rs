@@ -1,10 +1,10 @@
 //! Crate-level glue: GGUF metadata helpers, chat-eos detection, streaming detok, the GPU probe,
 //! per-layer-embedding loader, and test helpers. Split out of `lib.rs` (no logic change).
 use crate::*;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use infr_core::WeightSource;
 use infr_gguf::Gguf;
-use tokenizers::Tokenizer;
+use tokenizers::{DecoderWrapper, Tokenizer};
 
 /// Qwen2/Qwen3 pre-tokenizer regex (same string the HF `tokenizer.json` uses) — applied via a
 /// Split before ByteLevel. Differs from the default GPT-2 ByteLevel regex (punctuation/number runs),
@@ -90,9 +90,9 @@ pub(crate) fn build_per_layer_embd(g: &Gguf, cfg: &Config) -> Result<Option<PerL
     }))
 }
 
-/// UTF-8-safe incremental detokenizer for streaming: appends `id` to `acc`, decodes the whole
-/// sequence so far, and emits the newly-completed suffix past `printed` — holding back a trailing
-/// `�` (a multi-byte char split across tokens) until it completes. Mirrors the GPU path's streamer.
+/// UTF-8-safe streaming detokenizer: appends `id` to `acc` and emits the newly-completed suffix
+/// past `printed`, holding back a trailing replacement character until it completes. Pure
+/// ByteLevel decoders discard fully emitted history; contextual decoders retain it.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn stream_token(
     tokenizer: &Tokenizer,
@@ -127,23 +127,39 @@ pub(crate) fn stream_tokens(
     emit_decoded_suffix(tokenizer, acc, printed, on_piece);
 }
 
-/// Shared tail of [`stream_token`]/[`stream_tokens`]: decode the whole accumulator, emit the
-/// newly-completed suffix past `printed`, and hold back a trailing `�` (a multi-byte char split
-/// across the token boundary) until it completes.
+/// Decode the pending accumulator and emit the suffix past `printed`, holding back a trailing
+/// replacement character. Only a pure ByteLevel decoder can discard fully emitted history.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn emit_decoded_suffix(
     tokenizer: &Tokenizer,
-    acc: &[u32],
+    acc: &mut Vec<u32>,
     printed: &mut usize,
     on_piece: &mut impl FnMut(&str),
 ) {
-    if let Ok(full) = tokenizer.decode(acc, true) {
+    let decode_span = infr_core::timeline::span("token_detokenize");
+    let decoded = tokenizer.decode(acc, true);
+    drop(decode_span);
+    if let Ok(full) = decoded {
         if !full.ends_with('\u{FFFD}') && full.len() > *printed && full.is_char_boundary(*printed) {
+            let _callback = infr_core::timeline::span("token_output_callback");
             on_piece(&full[*printed..]);
             *printed = full.len();
         }
+        // ByteLevel concatenates raw bytes; without a trailing replacement character,
+        // later bytes cannot repair this fully emitted suffix. Keep contextual history.
+        if !full.ends_with('\u{FFFD}')
+            && *printed == full.len()
+            && matches!(tokenizer.get_decoder(), Some(DecoderWrapper::ByteLevel(_)))
+        {
+            acc.clear();
+            *printed = 0;
+        }
     }
 }
+
+#[cfg(test)]
+#[path = "util_streaming_tests.rs"]
+mod util_streaming_tests;
 
 /// Run `f` with per-op GPU profiling suppressed for its duration, restoring the prior state
 /// afterward. Every backend's `warmup()` / startup path (`chat::vulkan`, `chat::diffusion`,

@@ -419,18 +419,55 @@ fn o07_read_only_aliases_and_dead_frame_reuse() {
 #[test]
 fn o07_production_wiring_and_signed_zero_identity() {
     let compact = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
-    let adapter = compact(include_str!("adapter.rs"));
-    assert_eq!(
-        adapter.matches("ple_gate_norm_pair(be_,graph,").count(),
-        3,
-        "lowering and BOTH static/replay skip sets must use the same physical matcher"
-    );
-    let predicate = adapter.split("fnple_gate_norm_pair(").nth(1).unwrap();
-    assert!(predicate
-        .split("fn")
-        .next()
+    let source = include_str!("adapter.rs");
+    let adapter = compact(source);
+    let body = |name: &str| {
+        let marker = name.replacen("fn", "fn ", 1);
+        compact(
+            source
+                .split(marker.as_str())
+                .nth(1)
+                .unwrap()
+                .split("\nfn ")
+                .next()
+                .unwrap(),
+        )
+    };
+    assert!(body("fnlower_op(").contains("ple_gate_norm_pair(be_,graph,op_idx,scratch,bindings)"));
+    assert!(body("fnrecord_decode_replay(")
+        .contains("ple_gate_norm_pair(be_,graph,i,&scratch,bindings)"));
+    let pair = body("fnple_gate_norm_pair(");
+    assert!(pair.contains("ple_gate_norm_at(graph,idx)?"));
+    assert!(pair.contains("ple_gate_norm_candidate(be_,graph,idx,pair,scratch,bindings)"));
+    let candidate = body("fnple_gate_norm_candidate(");
+    for gate in [
+        "be_.cfg().kernels.vulkan.ple_gate_norm_lds",
+        "be_.cfg().spec.mtp",
+        "be_.dense_paged()",
+        "be_.prefers_ple_gate_norm_lds()",
+        "ple_gate_norm_buffers(graph,idx,pair,scratch,bindings).then_some(pair)",
+    ] {
+        assert!(candidate.contains(gate), "shared bound matcher lost {gate}");
+    }
+    let setup = adapter
+        .split("implStageSetup{")
+        .nth(1)
         .unwrap()
-        .contains("be_.cfg().spec.mtp"));
+        .split("fnrefresh_inputs(")
+        .next()
+        .unwrap();
+    assert!(setup.contains("analysis.ple.iter()"));
+    assert!(setup.contains("ple_gate_norm_candidate(be_,graph,i,pair,scratch,bindings)"));
+    let prefix = compact(include_str!("adapter_prefix.rs"));
+    assert!(prefix.contains("ple_gate_norm_candidate(be_,graph,i,pair,scratch,bindings)"));
+    let analysis = adapter
+        .split("implGraphSetupAnalysis{")
+        .nth(1)
+        .unwrap()
+        .split("fnfusions(")
+        .next()
+        .unwrap();
+    assert!(analysis.contains("ple_gate_norm_at(graph,i)"));
     let recorder = compact(include_str!("recorder.rs"));
     let method = recorder
         .split("fnqwen_ple_gate_norm_lds(")

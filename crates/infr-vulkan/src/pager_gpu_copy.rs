@@ -1,5 +1,13 @@
-//! Bounded GPU-selected placements; the ordinary Pager remains the host replacement owner.
+//! GPU copy metadata for host-managed windows and persistent GPU-owned Decode.
 use super::*;
+
+#[cfg(test)]
+impl GpuCopySources {
+    pub(crate) fn test_cpu_only_source(&mut self, block: usize) {
+        assert!(self.words[block * 4 + 2] != 0);
+        self.words[block * 4..block * 4 + 2].fill(0);
+    }
+}
 
 const CANDIDATES_PER_POOL: usize = 128;
 pub(crate) const JOBS_PER_LAYER: usize = infr_core::backend::MAX_DECODE_ROWS * 16 * 3;
@@ -104,7 +112,52 @@ fn effective_copy_groups(requested: usize, _wide_copy: bool) -> u32 {
     }
 }
 
+fn all_registered_sources_mapped(words: &[u32]) -> bool {
+    if words.len() % 4 != 0 {
+        return false;
+    }
+    let mut registered = false;
+    for source in words.chunks_exact(4).filter(|source| source[2] != 0) {
+        registered = true;
+        if source[0] == 0 && source[1] == 0 {
+            return false;
+        }
+    }
+    registered
+}
+
+fn source_unmapped_prefix(words: &[u32], pools: usize) -> Vec<usize> {
+    if !words.len().is_multiple_of(4) {
+        return Vec::new();
+    }
+    let mut prefix = Vec::with_capacity(words.len() / 4 + 1);
+    prefix.push(0);
+    for entry in words.chunks_exact(4) {
+        let address = u64::from(entry[0]) | (u64::from(entry[1]) << 32);
+        let mapped = address != 0
+            && address & 15 == 0
+            && entry[2] != 0
+            && entry[2].is_multiple_of(16)
+            && (entry[3] as usize) < pools
+            && address.checked_add(u64::from(entry[2]) - 1).is_some();
+        prefix.push(prefix.last().copied().unwrap() + usize::from(!mapped));
+    }
+    prefix
+}
+
+fn source_banks_mapped(prefix: &[usize], bases: [u32; 3], experts: u32) -> bool {
+    experts != 0
+        && bases.into_iter().all(|base| {
+            let start = base as usize;
+            start
+                .checked_add(experts as usize)
+                .and_then(|end| Some((prefix.get(start)?, prefix.get(end)?)))
+                .is_some_and(|(start, end)| start == end)
+        })
+}
+
 pub(crate) struct GpuCopyBuffers {
+    pub(super) owned: Option<super::gpu_owner::OwnedState>,
     pub(crate) sources: Arc<dyn Buffer>,
     pub(crate) candidates: Arc<dyn Buffer>,
     pub(crate) overlay: Arc<dyn Buffer>,
@@ -112,8 +165,14 @@ pub(crate) struct GpuCopyBuffers {
     pub(crate) miss_predicates: Option<Arc<dyn Buffer>>,
     pub(crate) wide_copy: bool,
     pub(crate) copy_groups: u32,
+    all_sources_mapped: bool,
+    // Immutable owner/source-directory certificate: prefix count of blocks without GPU sources.
+    unmapped_source_prefix: Vec<usize>,
+    // Allocated before ownership starts; seed refresh never allocates GPU storage or reenters
+    // unified admission while the caller holds the pager/execution lease.
+    metadata_staging: Option<std::sync::Mutex<crate::VkBuffer>>,
     _sources: Vec<Arc<dyn Buffer>>,
-    source_words: Vec<u32>,
+    pub(super) source_words: Vec<u32>,
     pools: usize,
     epoch: std::sync::Mutex<Epoch>,
 }
@@ -127,6 +186,33 @@ struct PreparedCopyActivation<'a> {
     committed: bool,
 }
 
+struct PreparedOwnedActivation<'a> {
+    in_forward: &'a std::sync::atomic::AtomicBool,
+    previous: bool,
+    committed: bool,
+}
+
+impl<'a> PreparedOwnedActivation<'a> {
+    fn new(in_forward: &'a std::sync::atomic::AtomicBool) -> Self {
+        Self {
+            in_forward,
+            previous: in_forward.load(std::sync::atomic::Ordering::Acquire),
+            committed: false,
+        }
+    }
+}
+
+impl Drop for PreparedOwnedActivation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            // Publication cannot submit work. Keep the valid active owner, but roll back this
+            // attempted forward on both Result errors and unwinding; an outer forward may exist.
+            self.in_forward
+                .store(self.previous, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
 impl Drop for PreparedCopyActivation<'_> {
     fn drop(&mut self) {
         if !self.committed && self.copy.epoch.lock().unwrap().retire(self.token) {
@@ -135,9 +221,50 @@ impl Drop for PreparedCopyActivation<'_> {
     }
 }
 
-fn mapped_write(buffer: &dyn Buffer, bytes: &[u8]) -> Result<()> {
+fn direct_metadata_mapping(mapped: bool, properties: vk::MemoryPropertyFlags) -> bool {
+    mapped
+        && properties.contains(
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+}
+
+fn coherent_metadata_mapping(buffer: &dyn Buffer) -> Result<bool> {
+    let buffer = as_vk_buf(buffer)?;
+    let properties = match &buffer.backing {
+        crate::Backing::Pooled(allocation) => allocation.memory_properties(),
+        // A suballocation inherits physical memory properties, not merely its parent's pointer.
+        crate::Backing::UnifiedSub(handle) => {
+            return Ok(buffer.mapped_ptr().is_some() && coherent_metadata_mapping(handle.buffer())?);
+        }
+        crate::Backing::BdaSub(block) => {
+            return Ok(buffer.mapped_ptr().is_some() && coherent_metadata_mapping(&block.buf)?);
+        }
+        // Dedicated mapped allocations retain no property flags. All current constructors
+        // explicitly select HOST_VISIBLE|HOST_COHERENT: ReBAR, UMA/KV spill and host import.
+        crate::Backing::Vram { .. } | crate::Backing::ImportedHost { .. } => {
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
+        }
+        crate::Backing::Device { .. } | crate::Backing::External { .. } => {
+            vk::MemoryPropertyFlags::empty()
+        }
+        crate::Backing::RecordingAlias { .. } => {
+            return Err(be("recording-only buffer cannot publish GPU copy metadata"));
+        }
+    };
+    Ok(direct_metadata_mapping(
+        buffer.mapped_ptr().is_some(),
+        properties,
+    ))
+}
+
+pub(super) fn mapped_write(buffer: &dyn Buffer, bytes: &[u8]) -> Result<()> {
     if bytes.len() > buffer.len_bytes() {
         return Err(be("GPU copy metadata overflow"));
+    }
+    if !coherent_metadata_mapping(buffer)? {
+        return Err(be(
+            "GPU copy metadata direct write requires a coherent host mapping",
+        ));
     }
     let ptr = as_vk_buf(buffer)?
         .mapped_ptr()
@@ -146,18 +273,118 @@ fn mapped_write(buffer: &dyn Buffer, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn metadata_upload_layout(entries: &[(usize, bool)]) -> Result<(usize, Vec<Option<usize>>)> {
+    let mut bytes = 0usize;
+    let mut offsets = Vec::with_capacity(entries.len());
+    for &(size, mapped) in entries {
+        if size == 0 || size > isize::MAX as usize || !size.is_multiple_of(4) {
+            return Err(be(
+                "GPU owner metadata has invalid upload alignment or size",
+            ));
+        }
+        offsets.push(if mapped {
+            None
+        } else {
+            let offset = bytes;
+            bytes = bytes
+                .checked_add(size)
+                .filter(|&n| n <= isize::MAX as usize)
+                .ok_or_else(|| be("GPU owner metadata staging size overflow"))?;
+            Some(offset)
+        });
+    }
+    Ok((bytes, offsets))
+}
+
+fn new_metadata_staging(
+    backend: &VulkanBackend,
+    buffers: &[&dyn Buffer],
+) -> Result<Option<std::sync::Mutex<crate::VkBuffer>>> {
+    let entries = buffers
+        .iter()
+        .map(|buffer| Ok((buffer.len_bytes(), coherent_metadata_mapping(*buffer)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let (bytes, _) = metadata_upload_layout(&entries)?;
+    if bytes == 0 {
+        return Ok(None);
+    }
+    let staging = backend.make_buf(
+        bytes,
+        gpu_allocator::MemoryLocation::CpuToGpu,
+        "gpu-owner-seed-upload",
+    )?;
+    let crate::Backing::Pooled(allocation) = &staging.backing else {
+        return Err(be("GPU owner upload requires pooled host staging memory"));
+    };
+    if staging.mapped_ptr().is_none()
+        || !allocation.memory_properties().contains(
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+    {
+        return Err(be("GPU owner upload requires coherent host staging memory"));
+    }
+    Ok(Some(std::sync::Mutex::new(staging)))
+}
+
+fn upload_metadata_batch(
+    backend: &VulkanBackend,
+    retained: Option<&std::sync::Mutex<crate::VkBuffer>>,
+    uploads: &[(&dyn Buffer, &[u8])],
+) -> Result<()> {
+    // Validate the whole batch before changing any mapped bytes or queuing a partial seed.
+    let mut entries = Vec::with_capacity(uploads.len());
+    for &(buffer, data) in uploads {
+        let vk_buffer = as_vk_buf(buffer)?;
+        if !Arc::ptr_eq(&vk_buffer.shared, &backend.shared) || data.len() > buffer.len_bytes() {
+            return Err(be("GPU owner upload device or destination size mismatch"));
+        }
+        entries.push((data.len(), coherent_metadata_mapping(buffer)?));
+    }
+    let (bytes, offsets) = metadata_upload_layout(&entries)?;
+    if bytes == 0 {
+        for &(buffer, data) in uploads {
+            mapped_write(buffer, data)?;
+        }
+        return Ok(());
+    }
+    let staging = retained
+        .ok_or_else(|| be("GPU owner upload has no retained staging allocation"))?
+        .lock()
+        .unwrap();
+    if bytes > staging.size || !Arc::ptr_eq(&staging.shared, &backend.shared) {
+        return Err(be("GPU owner upload exceeds retained staging geometry"));
+    }
+    let ptr = staging
+        .mapped_ptr()
+        .ok_or_else(|| be("GPU owner retained staging is not mapped"))?;
+    for (&(buffer, data), &offset) in uploads.iter().zip(&offsets) {
+        if let Some(offset) = offset {
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), data.len()) };
+        } else {
+            mapped_write(buffer, data)?;
+        }
+    }
+    // Caller owns the forward/admission lease and has drained old directory users. Do not use
+    // Backend::upload/one_shot: their phase/admission hooks may reenter the locked pager.
+    let recorder = backend.recorder()?;
+    recorder.seed_barrier();
+    recorder.host_transfer_barrier();
+    for (&(buffer, data), offset) in uploads.iter().zip(offsets) {
+        if let Some(offset) = offset {
+            recorder.copy(&*staging, offset, buffer, 0, data.len());
+        }
+    }
+    recorder.arena_stream_barrier();
+    // Retain staging and destination borrows through submission and draining on every path.
+    recorder.finish_nowait()?.wait()
+}
+
 impl MoePagerSession {
     pub(crate) fn gpu_copy_sources(&self) -> Result<Option<GpuCopySources>> {
-        if self._host_tier.is_some() {
-            return Ok(None);
-        }
         let mut words = vec![0u32; self.role_stride * 3 * 4];
         let mut owners = HashMap::new();
         let mut mapped = 0;
         for (_, pool, source) in self.sources.values() {
-            let Some(chunk) = source.host_chunk else {
-                return Ok(None);
-            };
             if source.stride_bytes == 0
                 || !source.stride_bytes.is_multiple_of(16)
                 || source.stride_bytes > u32::MAX as usize
@@ -167,12 +394,14 @@ impl MoePagerSession {
             for expert in 0..source.bank_bytes / source.stride_bytes {
                 let id = source.block_base as usize + expert;
                 let offset = source.host_offset + expert * source.stride_bytes;
-                let bytes = self.host_store[chunk]
-                    .range(offset, source.stride_bytes)
-                    .ok_or_else(|| be("GPU copy source exceeds host store"))?;
                 words[id * 4 + 2] = source.stride_bytes as u32;
                 words[id * 4 + 3] = *pool as u32;
-                if let Some((owner, address)) = self.transfer_plan.imported_device_source(bytes) {
+                let imported = source.host_chunk.and_then(|chunk| {
+                    self.host_store[chunk]
+                        .range(offset, source.stride_bytes)
+                        .and_then(|bytes| self.transfer_plan.imported_device_source(bytes))
+                });
+                if let Some((owner, address)) = imported {
                     words[id * 4] = address as u32;
                     words[id * 4 + 1] = (address >> 32) as u32;
                     owners
@@ -181,9 +410,6 @@ impl MoePagerSession {
                     mapped += 1;
                 }
             }
-        }
-        if mapped == 0 {
-            return Ok(None);
         }
         tracing::info!(
             mapped_role_blocks = mapped,
@@ -198,9 +424,38 @@ impl MoePagerSession {
 }
 
 impl GpuCopyBuffers {
+    pub(super) fn upload_owned_seed(
+        &self,
+        backend: &VulkanBackend,
+        nodes: &[u32],
+        blocks: &[u32],
+    ) -> Result<()> {
+        upload_metadata_batch(
+            backend,
+            self.metadata_staging.as_ref(),
+            &[
+                (self.candidates.as_ref(), bytemuck::cast_slice(nodes)),
+                (self.overlay.as_ref(), bytemuck::cast_slice(blocks)),
+            ],
+        )
+    }
+
+    pub(crate) fn owned_self_service(&self) -> bool {
+        self.is_owned() && self.all_sources_mapped
+    }
+
+    pub(crate) fn owned_roles_self_service(&self, bases: [u32; 3], experts: u32) -> bool {
+        // The registered-bank geometry prevents certifying an arbitrary subrange or padding.
+        // This certificate lives with this exact owner Arc and its retained imported sources;
+        // mutable residency/generation validation remains in begin/activate_prepared and shaders.
+        self.owned_role_geometry(bases, experts).is_some()
+            && source_banks_mapped(&self.unmapped_source_prefix, bases, experts)
+    }
+
     #[cfg(test)]
     pub(crate) fn test_stub(buffer: Arc<dyn Buffer>) -> Arc<Self> {
         Arc::new(Self {
+            owned: None,
             sources: buffer.clone(),
             candidates: buffer.clone(),
             overlay: buffer.clone(),
@@ -208,6 +463,9 @@ impl GpuCopyBuffers {
             miss_predicates: None,
             wide_copy: false,
             copy_groups: effective_copy_groups(0, false),
+            all_sources_mapped: false,
+            unmapped_source_prefix: Vec::new(),
+            metadata_staging: None,
             _sources: Vec::new(),
             source_words: Vec::new(),
             pools: 0,
@@ -220,19 +478,53 @@ impl GpuCopyBuffers {
         inputs: GpuCopySources,
         layers: usize,
     ) -> Result<Option<Arc<Self>>> {
-        let alloc = |bytes| -> Result<Arc<dyn Buffer>> {
-            let buffer: Arc<dyn Buffer> =
-                Arc::from(be_.alloc_unified(bytes, UnifiedVramClass::LlmRuntime)?);
-            if as_vk_buf(buffer.as_ref())?.mapped_ptr().is_none() {
-                return Err(be("GPU serial-copy metadata has no coherent host mapping"));
+        Self::new_inner(be_, inputs, layers, None)
+    }
+
+    pub(crate) fn new_owned(
+        be_: &VulkanBackend,
+        inputs: GpuCopySources,
+        layers: usize,
+        seed: super::gpu_owner::OwnedSeed,
+    ) -> Result<Option<Arc<Self>>> {
+        Self::new_inner(be_, inputs, layers, Some(seed))
+    }
+
+    fn new_inner(
+        be_: &VulkanBackend,
+        inputs: GpuCopySources,
+        layers: usize,
+        seed: Option<super::gpu_owner::OwnedSeed>,
+    ) -> Result<Option<Arc<Self>>> {
+        if let Some(seed) = &seed {
+            seed.state.validate_source_words(&inputs.words)?;
+        }
+        let alloc = |bytes: usize, host_access_required: bool| -> Result<Arc<dyn Buffer>> {
+            let buffer = be_.alloc_unified(bytes, UnifiedVramClass::LlmRuntime)?;
+            if !host_access_required || coherent_metadata_mapping(buffer.as_ref())? {
+                return Ok(Arc::from(buffer));
             }
-            Ok(buffer)
+            // A GPU-visible host allocation keeps the protocol usable without mapped VRAM.
+            drop(buffer);
+            let host = be_.alloc_uninit(bytes, BufferUsage::Staging)?;
+            if !coherent_metadata_mapping(host.as_ref())? {
+                return Err(be("GPU cache metadata has no coherent host mapping"));
+            }
+            Ok(Arc::from(host))
         };
-        let sources = alloc(inputs.words.len() * 4)?;
+        let all_sources_mapped = all_registered_sources_mapped(&inputs.words);
+        let unmapped_source_prefix = source_unmapped_prefix(&inputs.words, inputs.pools);
+        let sources = alloc(inputs.words.len() * 4, false)?;
         let (last_start, count) = candidate_range(inputs.pools.saturating_sub(1), inputs.pools)?;
-        let candidates = alloc((last_start as usize + count as usize) * 16)?;
-        let overlay = alloc(inputs.words.len() * 4)?;
-        let jobs = alloc(layers * JOBS_PER_LAYER * JOB_WORDS * 4)?;
+        let candidates = alloc(
+            seed.as_ref()
+                .map_or((last_start as usize + count as usize) * 16, |s| {
+                    s.nodes.len() * 4
+                }),
+            seed.is_none(),
+        )?;
+        let overlay = alloc(inputs.words.len() * 4, seed.is_none())?;
+        let jobs = alloc(layers * JOBS_PER_LAYER * JOB_WORDS * 4, true)?;
         let miss_predicates = if be_.cfg().kernels.vulkan.decode_gpu_resident_copy_overlap {
             match be_.alloc_mapped_predicate(layers * crate::recorder::GPU_COPY_PREDICATE_WORDS * 4)
             {
@@ -245,7 +537,16 @@ impl GpuCopyBuffers {
         } else {
             None
         };
-        mapped_write(sources.as_ref(), bytemuck::cast_slice(&inputs.words))?;
+        let metadata_staging = new_metadata_staging(
+            be_,
+            &[sources.as_ref(), candidates.as_ref(), overlay.as_ref()],
+        )?;
+        let mut uploads = vec![(sources.as_ref(), bytemuck::cast_slice(&inputs.words))];
+        if let Some(seed) = &seed {
+            uploads.push((candidates.as_ref(), bytemuck::cast_slice(&seed.nodes)));
+            uploads.push((overlay.as_ref(), bytemuck::cast_slice(&seed.blocks)));
+        }
+        upload_metadata_batch(be_, metadata_staging.as_ref(), &uploads)?;
         let properties = unsafe {
             be_.shared
                 .instance
@@ -265,15 +566,26 @@ impl GpuCopyBuffers {
             miss_predicates,
             wide_copy,
             copy_groups,
+            all_sources_mapped,
+            unmapped_source_prefix,
+            metadata_staging,
             _sources: inputs.keepalive,
             source_words: inputs.words,
             pools: inputs.pools,
             epoch: std::sync::Mutex::new(Epoch::default()),
+            owned: seed.map(|s| s.state),
         })))
     }
 
     /// Called only after the preceding resident window's commands and notices have drained.
-    pub(crate) fn begin(&self, session: &mut MoePagerSession) -> Result<()> {
+    pub(crate) fn begin(
+        &self,
+        backend: &VulkanBackend,
+        session: &mut MoePagerSession,
+    ) -> Result<()> {
+        if self.is_owned() {
+            return self.begin_owned(backend, session);
+        }
         self.begin_epoch(session).map(|_| ())
     }
 
@@ -335,9 +647,17 @@ impl GpuCopyBuffers {
     /// `publish` may update LUT windows/events, but must not submit any command.
     pub(crate) fn activate_prepared<T>(
         &self,
+        backend: &VulkanBackend,
         session: &mut MoePagerSession,
         publish: impl FnOnce(&mut MoePagerSession) -> Result<T>,
     ) -> Result<T> {
+        if let Some(state) = &self.owned {
+            let mut activation = PreparedOwnedActivation::new(&state.in_forward);
+            self.begin_owned(backend, session)?;
+            let result = publish(session)?;
+            activation.committed = true;
+            return Ok(result);
+        }
         if !session.frozen_lut_slots.is_empty()
             || session
                 .resident_lut_cache
@@ -375,7 +695,9 @@ impl GpuCopyBuffers {
                 .get(role)
                 .ok_or_else(|| be("GPU copy role missing"))?;
             params[index] = source.block_base;
-            (params[index + 3], params[index + 6]) = candidate_range(*pool, self.pools)?;
+            if !self.is_owned() {
+                (params[index + 3], params[index + 6]) = candidate_range(*pool, self.pools)?;
+            }
         }
         Ok(params)
     }
@@ -486,12 +808,20 @@ impl GpuCopyBuffers {
     }
 
     pub(crate) fn complete(&self) {
+        if self.is_owned() {
+            return;
+        }
         self.epoch.lock().unwrap().armed = false;
     }
 
     /// An errored GPU window may have overwritten a victim without publishing its final notice.
     /// Invalidate host ownership only; never write into still-running GPU metadata here.
     pub(crate) fn abort(&self, session: &mut MoePagerSession) {
+        // GPU ownership is session-wide; a chunk drop must never replay or resurrect the stale
+        // CPU snapshot. Pending placements are discarded at a drained ownership handoff.
+        if self.is_owned() {
+            return;
+        }
         let mut epoch = self.epoch.lock().unwrap();
         if !epoch.armed {
             return;
@@ -515,6 +845,267 @@ impl GpuCopyBuffers {
 #[cfg(test)]
 mod prepared_tests {
     use super::*;
+
+    #[test]
+    fn per_bank_mapping_certificate_covers_aliases_holes_and_invalid_ranges() {
+        let mut words = Vec::new();
+        // Three registered banks: the middle bank has one CPU-only expert.
+        for block in 0..12 {
+            let address = if block == 5 { 0 } else { 0x1000 + block * 16 };
+            words.extend([address, 0, 16, 0]);
+        }
+        let prefix = source_unmapped_prefix(&words, 1);
+        assert!(source_banks_mapped(&prefix, [0, 8, 0], 4));
+        for bases in [[4, 0, 8], [0, 4, 8], [0, 8, 4], [3, 8, 0]] {
+            assert!(!source_banks_mapped(&prefix, bases, 4));
+        }
+        assert!(!source_banks_mapped(&prefix, [0, 0, 0], 0));
+        assert!(!source_banks_mapped(&prefix, [0, 8, 9], 4));
+        assert!(!source_banks_mapped(&prefix, [u32::MAX; 3], 4));
+        assert!(!source_banks_mapped(
+            &source_unmapped_prefix(&words[..47], 1),
+            [0; 3],
+            4
+        ));
+        // Host source mutation changes a NEW owner's certificate, never the old retained one.
+        words[5 * 4] = 0x2000;
+        assert!(!source_banks_mapped(&prefix, [4; 3], 4));
+        let replacement = source_unmapped_prefix(&words, 1);
+        assert!(source_banks_mapped(&replacement, [0, 4, 8], 4));
+        for bad in [
+            [0, 0, 0, 0],
+            [1, 0, 16, 0],
+            [16, 0, 17, 0],
+            [16, 0, 16, 1],
+            [0xfffffff0, u32::MAX, 32, 0],
+        ] {
+            assert!(!source_banks_mapped(
+                &source_unmapped_prefix(&bad, 1),
+                [0; 3],
+                1
+            ));
+        }
+    }
+
+    #[test]
+    fn self_service_requires_a_nonempty_fully_mapped_registered_directory() {
+        for words in [
+            vec![],
+            vec![0; 4],
+            vec![1, 0, 0, 0],
+            vec![0, 0, 16, 0],
+            vec![1, 0, 16],
+        ] {
+            assert!(!all_registered_sources_mapped(&words));
+        }
+        assert!(all_registered_sources_mapped(&[0, 0, 0, 0, 1, 0, 16, 0]));
+        assert!(all_registered_sources_mapped(&[0, 1, 16, 0, 2, 0, 32, 1]));
+        assert!(!all_registered_sources_mapped(&[1, 0, 16, 0, 0, 0, 32, 1]));
+    }
+
+    #[test]
+    fn metadata_upload_layout_preserves_mapped_and_disjoint_unmapped_ranges() {
+        assert_eq!(metadata_upload_layout(&[]).unwrap(), (0, vec![]));
+        assert_eq!(
+            metadata_upload_layout(&[(16, true), (160, false), (64, false), (32, true)]).unwrap(),
+            (224, vec![None, Some(0), Some(160), None])
+        );
+        // Constructor reserves all three directories; reseed uploads only nodes + overlay.
+        let (capacity, _) =
+            metadata_upload_layout(&[(64, false), (160, false), (64, false)]).unwrap();
+        let (reseed, offsets) = metadata_upload_layout(&[(160, false), (64, false)]).unwrap();
+        assert!(reseed <= capacity);
+        assert_eq!(offsets, [Some(0), Some(160)]);
+        for mask in 0..8 {
+            let entries = [16, 160, 64]
+                .into_iter()
+                .enumerate()
+                .map(|(i, size)| (size, mask & (1 << i) != 0))
+                .collect::<Vec<_>>();
+            let (size, offsets) = metadata_upload_layout(&entries).unwrap();
+            let mut cursor = 0;
+            for ((length, mapped), offset) in entries.into_iter().zip(offsets) {
+                if mapped {
+                    assert_eq!(offset, None);
+                } else {
+                    assert_eq!(offset, Some(cursor));
+                    cursor += length;
+                }
+            }
+            assert_eq!(cursor, size);
+        }
+    }
+
+    #[test]
+    fn metadata_direct_mapping_requires_both_pointer_and_actual_coherent_visible_flags() {
+        use vk::MemoryPropertyFlags as F;
+        for mapped in [false, true] {
+            for bits in 0..32 {
+                let properties = F::from_raw(bits);
+                let expected = mapped
+                    && bits & F::HOST_VISIBLE.as_raw() != 0
+                    && bits & F::HOST_COHERENT.as_raw() != 0;
+                assert_eq!(direct_metadata_mapping(mapped, properties), expected);
+            }
+        }
+        assert!(!direct_metadata_mapping(
+            true,
+            F::DEVICE_LOCAL | F::HOST_VISIBLE
+        ));
+        assert!(!direct_metadata_mapping(
+            true,
+            F::HOST_VISIBLE | F::HOST_CACHED
+        ));
+        assert!(direct_metadata_mapping(
+            true,
+            F::HOST_VISIBLE | F::HOST_COHERENT
+        ));
+        assert!(!direct_metadata_mapping(
+            false,
+            F::HOST_VISIBLE | F::HOST_COHERENT
+        ));
+        // Noncoherent mapped directories remain in device memory and reserve staging, whereas
+        // coherent mapped directories use no staging bytes. Host accessibility alone is not proof.
+        assert_eq!(
+            metadata_upload_layout(&[
+                (64, direct_metadata_mapping(true, F::HOST_VISIBLE)),
+                (
+                    160,
+                    direct_metadata_mapping(true, F::HOST_VISIBLE | F::HOST_COHERENT)
+                ),
+            ])
+            .unwrap(),
+            (64, vec![Some(0), None])
+        );
+    }
+
+    #[test]
+    fn metadata_upload_layout_rejects_partial_words_and_overflow() {
+        for mapped in [false, true] {
+            for size in [0, 1, 2, 3, 5, usize::MAX] {
+                assert!(metadata_upload_layout(&[(size, mapped)]).is_err());
+            }
+        }
+        let largest = (isize::MAX as usize) & !3;
+        assert!(metadata_upload_layout(&[(largest, false), (4, false)]).is_err());
+        assert_eq!(
+            metadata_upload_layout(&[(largest, true), (4, false)]).unwrap(),
+            (4, vec![None, Some(0)])
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly selected idle Vulkan GPU; unmapped metadata upload only"]
+    fn gpu_owned_unmapped_metadata_reuses_staging_without_pager_reentry() {
+        let mut cfg = infr_core::config::Config::default();
+        cfg.device.dev =
+            Some(std::env::var("MOE4ALL_TEST_DEVICE").expect("select the test GPU explicitly"));
+        let backend = VulkanBackend::new_with(Arc::new(cfg)).unwrap();
+        // Force real private DEVICE_LOCAL buffers even on ReBAR hardware. UMA may have no private
+        // memory type, in which case only the mapped path is available and this probe skips.
+        let buffers = [64, 160, 64]
+            .into_iter()
+            .map(|bytes| backend.alloc_device_local_arena_bda(bytes).unwrap().0)
+            .collect::<Vec<_>>();
+        if buffers
+            .iter()
+            .any(|buffer| as_vk_buf(buffer.as_ref()).unwrap().mapped_ptr().is_some())
+        {
+            eprintln!("unmapped metadata probe unavailable: this device has no private VRAM type");
+            return;
+        }
+        let mapped = backend.alloc_uninit(16, BufferUsage::Staging).unwrap();
+        assert!(coherent_metadata_mapping(mapped.as_ref()).unwrap());
+        assert!(buffers
+            .iter()
+            .all(|buffer| !coherent_metadata_mapping(buffer.as_ref()).unwrap()));
+        let retained = new_metadata_staging(
+            &backend,
+            &buffers.iter().map(|b| b.as_ref()).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let identity = retained.as_ref().unwrap().lock().unwrap().buffer;
+        for generation in [1u32, 2, 17] {
+            let words = [16, 40, 16]
+                .into_iter()
+                .enumerate()
+                .map(|(index, count)| {
+                    (0..count)
+                        .map(|word| generation * 1000 + index as u32 * 100 + word)
+                        .collect::<Vec<u32>>()
+                })
+                .collect::<Vec<_>>();
+            let mapped_words = [generation; 4];
+            let mut uploads = buffers
+                .iter()
+                .zip(&words)
+                .map(|(buffer, words)| (buffer.as_ref(), bytemuck::cast_slice(words)))
+                .collect::<Vec<_>>();
+            uploads.push((mapped.as_ref(), bytemuck::cast_slice(&mapped_words)));
+            // The real caller holds the pager during ownership activation. Any admission hook,
+            // phase activation or generic upload would deadlock against this mutex.
+            {
+                let _pager = backend.moe_pager().lock().unwrap();
+                upload_metadata_batch(&backend, retained.as_ref(), &uploads).unwrap();
+            }
+            assert_eq!(identity, retained.as_ref().unwrap().lock().unwrap().buffer);
+            for (buffer, expected) in buffers.iter().zip(&words) {
+                let mut actual = vec![0u32; expected.len()];
+                backend
+                    .download(buffer.as_ref(), bytemuck::cast_slice_mut(&mut actual))
+                    .unwrap();
+                assert_eq!(&actual, expected);
+            }
+            let mut actual_mapped = [0u32; 4];
+            backend
+                .download(
+                    mapped.as_ref(),
+                    bytemuck::cast_slice_mut(&mut actual_mapped),
+                )
+                .unwrap();
+            assert_eq!(actual_mapped, mapped_words);
+            assert!(upload_metadata_batch(&backend, None, &uploads).is_err());
+            let bad = [0u8; 3];
+            assert!(
+                upload_metadata_batch(&backend, retained.as_ref(), &[(mapped.as_ref(), &bad)],)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn owned_activation_failure_restores_the_prior_forward_flag() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for previous in [false, true] {
+            let in_forward = AtomicBool::new(previous);
+            let failed = || -> Result<()> {
+                let _activation = PreparedOwnedActivation::new(&in_forward);
+                in_forward.store(true, Ordering::Release);
+                Err(be("injected owned publication failure"))
+            };
+            assert!(failed().is_err());
+            assert_eq!(in_forward.load(Ordering::Acquire), previous);
+            let panicked = std::panic::catch_unwind(|| {
+                let _activation = PreparedOwnedActivation::new(&in_forward);
+                in_forward.store(true, Ordering::Release);
+                panic!("injected owned publication unwind");
+            });
+            assert!(panicked.is_err());
+            assert_eq!(in_forward.load(Ordering::Acquire), previous);
+        }
+    }
+
+    #[test]
+    fn owned_activation_success_keeps_the_forward_active() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let in_forward = AtomicBool::new(false);
+        {
+            let mut activation = PreparedOwnedActivation::new(&in_forward);
+            in_forward.store(true, Ordering::Release);
+            activation.committed = true;
+        }
+        assert!(in_forward.load(Ordering::Acquire));
+    }
 
     #[test]
     fn gpu_copy_groups_auto_and_clamp_preserve_both_payload_variants() {
@@ -638,6 +1229,7 @@ mod prepared_tests {
     fn discarding_retained_copy_handles_does_not_retire_live_epoch() {
         let source: Arc<dyn Buffer> = Arc::new(CpuBuffer);
         let copy = Arc::new(GpuCopyBuffers {
+            owned: None,
             sources: Arc::new(CpuBuffer),
             candidates: Arc::new(CpuBuffer),
             overlay: Arc::new(CpuBuffer),
@@ -645,6 +1237,9 @@ mod prepared_tests {
             miss_predicates: None,
             wide_copy: false,
             copy_groups: 8,
+            all_sources_mapped: false,
+            unmapped_source_prefix: Vec::new(),
+            metadata_staging: None,
             _sources: vec![Arc::clone(&source)],
             source_words: Vec::new(),
             pools: 1,
@@ -716,7 +1311,7 @@ mod prepared_tests {
         drop(Arc::clone(&copy));
         assert!(!copy.epoch.lock().unwrap().armed);
         let owners = session.pools[0].pager.lut_host.clone();
-        let failed: Result<()> = copy.activate_prepared(&mut session, |session| {
+        let failed: Result<()> = copy.activate_prepared(&be_, &mut session, |session| {
             session.resident_lut_cache.as_mut().unwrap().frozen[0][0] = 1;
             Err(be("injected publication failure"))
         });
@@ -731,7 +1326,8 @@ mod prepared_tests {
             "unsubmitted rollback must not evict"
         );
 
-        copy.activate_prepared(&mut session, |_| Ok(())).unwrap();
+        copy.activate_prepared(&be_, &mut session, |_| Ok(()))
+            .unwrap();
         {
             let epoch = copy.epoch.lock().unwrap();
             let valid = epoch.candidates.iter().flatten().count();
@@ -753,7 +1349,7 @@ mod prepared_tests {
         let token = CopyEpochToken(copy.epoch.lock().unwrap().generation);
         assert!(copy.epoch.lock().unwrap().armed);
         let frozen = session.frozen_lut_slots.clone();
-        let blocked: Result<()> = copy.activate_prepared(&mut session, |_| {
+        let blocked: Result<()> = copy.activate_prepared(&be_, &mut session, |_| {
             panic!("a second activation must not publish")
         });
         assert!(blocked.is_err());
@@ -763,13 +1359,14 @@ mod prepared_tests {
         session.clear_frozen_lut_slots();
 
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _: Result<()> =
-                copy.activate_prepared(&mut session, |_| panic!("injected activation unwind"));
+            let _: Result<()> = copy
+                .activate_prepared(&be_, &mut session, |_| panic!("injected activation unwind"));
         }));
         assert!(panicked.is_err());
         assert!(!copy.epoch.lock().unwrap().armed);
         assert!(session.frozen_lut_slots.is_empty());
-        copy.activate_prepared(&mut session, |_| Ok(())).unwrap();
+        copy.activate_prepared(&be_, &mut session, |_| Ok(()))
+            .unwrap();
         copy.complete();
         session.clear_frozen_lut_slots();
     }

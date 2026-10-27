@@ -20,8 +20,23 @@ void main() {
         stopped = 0xffffffffu;
         reached = 0;
         invalid = 0;
-        // Word 37 is the initial predicate; words 5..36 belong to 16 checked layers.
-        if (p.immutable_predicates != 0) extra[33] = 1;
+        // The final word is the seed; preceding pairs belong to checked layers.
+        if (p.immutable_predicates != 0) {
+            uint length = uint(extra.length());
+            if (length < 4u || (length & 1u) != 0u) {
+                run = 0;
+                invalid = 1;
+                return;
+            }
+            extra[length - 1u] = 1;
+        }
+        return;
+    }
+    if (p.immutable_predicates != 0
+        && (uint(extra.length()) < 4u || p.ordinal >= (uint(extra.length()) - 2u) / 2u)) {
+        run = 0;
+        invalid = 1;
+        stopped = p.ordinal;
         return;
     }
     if (p.immutable_predicates != 0) extra[1 + p.ordinal * 2] = 0;

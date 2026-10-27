@@ -1153,6 +1153,7 @@ fn main() {
         ("conv1d_shift", "conv1d_shift", &[]),
         ("copy_strided", "copy_strided", &[]),
         ("gpu_resident_check", "gpu_resident_check", &[]),
+        ("gpu_owned_recovery_seed", "gpu_owned_recovery_seed", &[]),
         ("gpu_resident_dispatch", "gpu_resident_dispatch", &[]),
         ("gpu_resident_hit_check", "gpu_resident_hit_check", &[]),
         (
@@ -1164,6 +1165,87 @@ fn main() {
             "gpu_resident_copy_prepare",
             "gpu_resident_copy_prepare",
             &[],
+        ),
+        ("gpu_owned_prepare", "gpu_owned_prepare", &[]),
+        ("gpu_owned_prepare_fused", "gpu_owned_prepare_fused", &[]),
+        (
+            "gpu_owned_prepare_fused",
+            "gpu_owned_prepare_topk_fused_two_row",
+            &["-DOWNER_TOPK_FUSED", "-DOWNER_TOPK_TWO_ROW"],
+        ),
+        (
+            "gpu_owned_prepare_fused",
+            "gpu_owned_prepare_topk_fused_two_row_overlap",
+            &["-DOWNER_TOPK_FUSED", "-DOWNER_TOPK_TWO_ROW", "-DCOPY_OVERLAP"],
+        ),
+        (
+            "gpu_owned_prepare_fused",
+            "gpu_owned_prepare_topk_fused",
+            &["-DOWNER_TOPK_FUSED"],
+        ),
+        (
+            "gpu_owned_prepare_fused",
+            "gpu_owned_prepare_topk_fused_overlap",
+            &["-DOWNER_TOPK_FUSED", "-DCOPY_OVERLAP"],
+        ),
+        (
+            "gpu_owned_prepare_fused",
+            "gpu_owned_prepare_fused_overlap",
+            &["-DCOPY_OVERLAP"],
+        ),
+        ("gpu_owned_prepare_fast", "gpu_owned_prepare_fast", &[]),
+        (
+            "gpu_owned_prepare_fast",
+            "gpu_owned_prepare_fast_split",
+            &["-DOWNER_SPLIT_PREFLIGHT"],
+        ),
+        (
+            "gpu_owned_prepare_fast",
+            "gpu_owned_prepare_fast_split_overlap",
+            &["-DOWNER_SPLIT_PREFLIGHT", "-DCOPY_OVERLAP"],
+        ),
+        ("gpu_owned_prepare_slow", "gpu_owned_prepare_slow", &[]),
+        (
+            "gpu_owned_prepare_slow",
+            "gpu_owned_prepare_slow_subgroup",
+            &["-DOWNER_SUBGROUP_SCAN"],
+        ),
+        (
+            "gpu_owned_prepare_slow",
+            "gpu_owned_prepare_slow_subgroup_overlap",
+            &["-DOWNER_SUBGROUP_SCAN", "-DCOPY_OVERLAP"],
+        ),
+        (
+            "gpu_owned_prepare_fast",
+            "gpu_owned_prepare_fast_overlap",
+            &["-DCOPY_OVERLAP"],
+        ),
+        (
+            "gpu_owned_prepare_slow",
+            "gpu_owned_prepare_slow_overlap",
+            &["-DCOPY_OVERLAP"],
+        ),
+        (
+            "gpu_owned_prepare_reference",
+            "gpu_owned_prepare_reference",
+            &[],
+        ),
+        (
+            "gpu_owned_prepare_reference",
+            "gpu_owned_prepare_reference_overlap",
+            &["-DCOPY_OVERLAP"],
+        ),
+        (
+            "gpu_owned_prepare",
+            "gpu_owned_prepare_overlap",
+            &["-DCOPY_OVERLAP"],
+        ),
+        ("gpu_owned_publish", "gpu_owned_publish", &[]),
+        ("gpu_owned_copy_publish", "gpu_owned_copy_publish", &[]),
+        (
+            "gpu_owned_copy_publish",
+            "gpu_owned_copy_publish1024",
+            &["-DCOPY_LOCAL=1024"],
         ),
         (
             "gpu_resident_copy_prepare",
@@ -4657,6 +4739,10 @@ fn main() {
         let src = format!("shaders/{src_stem}.comp");
         let dst = format!("{out}/{dst_stem}.spv");
         println!("cargo:rerun-if-changed={src}");
+        if src_stem == "gpu_owned_prepare_fused" {
+            println!("cargo:rerun-if-changed=shaders/gpu_owned_topk_route.glsl");
+            println!("cargo:rerun-if-changed=shaders/gpu_owned_topk_two_row_route.glsl");
+        }
         let mut args: Vec<String> = vec![
             "-fshader-stage=comp".into(),
             "--target-env=vulkan1.3".into(),
@@ -4667,10 +4753,18 @@ fn main() {
             args.push(d.clone());
         }
         if src_stem == "gpu_resident_check"
+            || src_stem == "gpu_owned_recovery_seed"
             || src_stem == "gpu_resident_hit_check"
             || src_stem == "gpu_resident_hit_check_pair"
             || src_stem == "gpu_resident_copy_prepare"
             || src_stem == "gpu_resident_copy_payload"
+            || src_stem == "gpu_owned_prepare"
+            || src_stem == "gpu_owned_prepare_fused"
+            || src_stem == "gpu_owned_prepare_fast"
+            || src_stem == "gpu_owned_prepare_slow"
+            || src_stem == "gpu_owned_prepare_reference"
+            || src_stem == "gpu_owned_publish"
+            || src_stem == "gpu_owned_copy_publish"
         {
             args.push(format!(
                 "-DINFR_MAX_DECODE_ROWS={}",

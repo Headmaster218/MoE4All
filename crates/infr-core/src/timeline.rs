@@ -12,7 +12,48 @@ static HOST_SPANS: AtomicBool = AtomicBool::new(false);
 static NEXT_STEP: AtomicU64 = AtomicU64::new(0);
 static NEXT_SUBMIT: AtomicU64 = AtomicU64::new(1);
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+static CAPTURE: OnceLock<CaptureFilter> = OnceLock::new();
 const MAX_EVENTS: usize = 2_000_000;
+
+#[derive(Default, Serialize)]
+struct CaptureFilter {
+    device: Option<Vec<String>>,
+    layer: Option<usize>,
+    host: Option<Vec<String>>,
+}
+
+fn label_patterns(value: Option<&str>) -> Result<Option<Vec<String>>, String> {
+    value.map(|value| {
+        let patterns: Vec<_> = value.split(',').map(str::trim).map(str::to_owned).collect();
+        if patterns.iter().any(String::is_empty) {
+            return Err("timeline label filters require non-empty comma-separated substrings".into());
+        }
+        Ok(patterns)
+    }).transpose()
+}
+
+fn matches_label(patterns: Option<&[String]>, name: &str) -> bool {
+    patterns.is_none_or(|patterns| patterns.iter().any(|pattern| name.contains(pattern)))
+}
+
+impl CaptureFilter {
+    fn device_matches(&self, name: &str, layer: i32) -> bool {
+        self.layer.is_none_or(|wanted| layer >= 0 && wanted == layer as usize)
+            && matches_label(self.device.as_deref(), name)
+    }
+}
+
+pub fn device_label_selected(name: &str, layer: i32) -> bool {
+    CAPTURE.get().is_none_or(|filter| filter.device_matches(name, layer))
+}
+
+pub fn device_labels_selective() -> bool {
+    CAPTURE.get().is_some_and(|filter| filter.device.is_some() || filter.layer.is_some())
+}
+
+pub fn host_label_selected(name: &str) -> bool {
+    CAPTURE.get().is_none_or(|filter| matches_label(filter.host.as_deref(), name))
+}
 
 thread_local! {
     static CONTEXT: Cell<Option<Context>> = const { Cell::new(None) };
@@ -79,6 +120,8 @@ pub struct ResidentNotice {
     pub hit_masks: [u32; 4],
     pub count: usize,
     pub routed_ids: Vec<u32>,
+    /// GPU-only retirement samples carry status, not a reconstructed route or hit mask.
+    pub route_payload_present: bool,
 }
 
 struct State {
@@ -148,6 +191,18 @@ pub fn configure(cfg: &crate::config::ProfCfg) -> Result<(), String> {
     {
         return Err("timeline requires positive steps/windows and stride >= steps".into());
     }
+    let capture = CaptureFilter {
+        device: label_patterns(cfg.timeline_device_select.as_deref())?,
+        layer: cfg.timeline_device_layer,
+        host: label_patterns(cfg.timeline_host_select.as_deref())?,
+    };
+    if capture.layer.is_some_and(|layer| layer > i32::MAX as usize) {
+        return Err("timeline device layer exceeds the trace context range".into());
+    }
+    if STATE.get().is_some() {
+        return Err("timeline already configured".into());
+    }
+    CAPTURE.set(capture).map_err(|_| "timeline filters already configured".to_string())?;
     STATE
         .set(Mutex::new(State {
             path: path.clone(),
@@ -316,7 +371,7 @@ pub fn span(name: &'static str) -> Option<Span> {
 }
 
 pub fn span_with_submit(name: &'static str, submit: u64) -> Option<Span> {
-    if !host_enabled() || !LOCAL_HOST_SPANS.with(Cell::get) {
+    if !host_enabled() || !LOCAL_HOST_SPANS.with(Cell::get) || !host_label_selected(name) {
         return None;
     }
     context().map(|ctx| Span {
@@ -343,7 +398,7 @@ pub struct BackgroundSpan {
 }
 
 pub fn background_span(name: &'static str) -> Option<BackgroundSpan> {
-    if !host_enabled() {
+    if !host_enabled() || !host_label_selected(name) {
         return None;
     }
     background_context().map(|context| BackgroundSpan {
@@ -403,7 +458,7 @@ pub fn record_device(event: DeviceEvent) {
 /// A background CPU producer retains the submitting decode step's context rather than using its
 /// own (empty) thread-local graph context. The interval is wall time, including worker handoffs.
 pub fn record_cpu_miss(name: &'static str, context: Context, start_ns: u64, end_ns: u64) {
-    if !host_enabled() {
+    if !host_enabled() || !host_label_selected(name) {
         return;
     }
     if let Some(state) = STATE.get() {
@@ -488,6 +543,7 @@ pub fn flush() -> std::io::Result<()> {
         "clock_samples":state.clocks,"dropped_events":state.dropped,
         "device_timestamps":DEVICE_TIMESTAMPS.load(Ordering::Relaxed),
         "host_spans":HOST_SPANS.load(Ordering::Relaxed),
+        "capture_filters":CAPTURE.get(),
         "resident_notices":state.resident_notices,
         "gpu_interval_semantics":"TOP/BOTTOM queue envelope; includes dependencies and stalls, not ALU busy time"});
     if let Some(parent) = state.path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -524,6 +580,26 @@ fn map_tick(tick: u64, bits: u32, sample: ClockSample) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selective_capture_filters_are_explicit_and_do_not_accept_empty_terms() {
+        assert!(label_patterns(None).unwrap().is_none());
+        for input in ["", " ", ",owner", "owner,", "owner,,hit"] {
+            assert!(label_patterns(Some(input)).is_err(), "{input}");
+        }
+        let filter = CaptureFilter {
+            device: label_patterns(Some(" topk , FFN ")).unwrap(),
+            layer: Some(3),
+            host: label_patterns(Some("queue_submit,PLE_")).unwrap(),
+        };
+        assert!(filter.device_matches("resident_owned_topk_prepare", 3));
+        assert!(filter.device_matches("resident_hit_FFN", 3));
+        assert!(!filter.device_matches("resident_hit_FFN", -1));
+        assert!(!filter.device_matches("resident_hit_FFN", 2));
+        assert!(!filter.device_matches("native_q8", 3));
+        assert!(matches_label(filter.host.as_deref(), "PLE_wait"));
+        assert!(!matches_label(filter.host.as_deref(), "command_encode"));
+        assert!(CaptureFilter::default().device_matches("any_kernel", -1));
+    }
     #[test]
     fn background_context_restores_tls_without_cpu_spans() {
         assert!(LOCAL_HOST_SPANS.with(Cell::get));

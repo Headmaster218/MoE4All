@@ -88,6 +88,7 @@ fn plan(graph: &Graph) -> VkDecodePlan {
         static_scratch: OnceLock::new(),
         prepare_enabled: true,
         phase_requests: None,
+        setup_analysis: GraphSetupAnalysis::analyze(graph),
         prepared_prefix: Mutex::new(None),
     }
 }

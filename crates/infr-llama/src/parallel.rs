@@ -3627,6 +3627,8 @@ impl ParallelSeam {
             }
             None => RequestCtx::new(active[indices[0]].sampling.clone()),
         };
+        // This shared service path reaches execute_parallel_token_forward in the runner:
+        // split PLE Decode admits L0 and tail together before either plan submits work.
         let result = crate::seam::generate_dense_vulkan_parallel_sampled_session(
             self.vk.as_ref(),
             self.model.gguf(),
@@ -3673,6 +3675,8 @@ impl ParallelSeam {
 
         let lookup_wall_secs =
             lookup_t0.map(|t0| (t0.elapsed().as_secs_f64() - lookup_delivery_secs).max(0.0));
+        // L0 may already have changed recurrent/KV state when a staged PLE handoff fails.
+        // All slot ownership is restored above; propagate the error without replaying the group.
         let result = result?;
         let outputs = result.tokens;
         let prompt_secs = result.prompt_secs;

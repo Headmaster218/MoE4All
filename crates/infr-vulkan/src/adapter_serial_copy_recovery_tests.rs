@@ -93,6 +93,36 @@ struct Fixture {
 }
 
 impl Fixture {
+    fn legacy(resident: bool, early: bool, overlap: bool) -> Self {
+        let fixture = Self::new(resident, early, overlap);
+        if resident {
+            let inputs = fixture
+                .backend
+                .moe_pager()
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .gpu_copy_sources()
+                .unwrap()
+                .unwrap();
+            let copy = crate::pager::GpuCopyBuffers::new(&fixture.backend, inputs, 3)
+                .unwrap()
+                .unwrap();
+            assert!(!copy.is_owned());
+            // These tests specifically exercise compatibility epoch replay and overlap.
+            fixture
+                .backend
+                .moe_pager()
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .gpu_decode_owner = Some(copy);
+        }
+        fixture
+    }
+
     fn new(resident: bool, early: bool, overlap: bool) -> Self {
         let mut cfg = infr_core::config::Config::default();
         cfg.device.dev =
@@ -269,6 +299,129 @@ fn gpu_overlap_copy_cpu_fallback_redemands_evicted_victim() {
     redemand_fixture(true);
 }
 
+#[test]
+#[ignore = "central GPU runner only; owned cold graph, CPU source and exact re-demand"]
+fn gpu_owned_cold_graph_admits_all_layers_before_ownership_and_redemands_after_cpu_copy() {
+    owned_redemand_fixture(false);
+}
+
+#[test]
+#[ignore = "central GPU runner only; preserve hit output while CPU fills the missing expert"]
+fn gpu_owned_partial_cpu_recovery_preserves_hit_output_and_accumulates_once() {
+    owned_redemand_fixture(true);
+}
+
+fn owned_redemand_fixture(partial: bool) {
+    let reference = {
+        let fixture = Fixture::new(false, false, false);
+        let plan = fixture.backend.compile(&fixture.graph).unwrap();
+        fixture
+            .backend
+            .execute(plan.as_ref(), &fixture.bindings())
+            .unwrap();
+        fixture.outputs()
+    };
+    let fixture = Fixture::new(true, false, false);
+    let plan = fixture.backend.compile(&fixture.graph).unwrap();
+    let mut warm_graph = fixture.graph.clone();
+    if partial {
+        let mut layer = 0;
+        for op in &mut warm_graph.ops {
+            if let Op::MoeFfn { n_used, .. } = op {
+                if layer == 1 {
+                    *n_used = 1;
+                }
+                layer += 1;
+            }
+        }
+    }
+    let warm_plan = fixture.backend.compile(&warm_graph).unwrap();
+    // Top-1, top-2, top-1 need different pooled capacities in the same cold forward.
+    fixture
+        .backend
+        .execute(warm_plan.as_ref(), &fixture.bindings())
+        .unwrap();
+    if !partial {
+        assert_eq!(fixture.outputs(), reference);
+    }
+    let (mut inputs, seed) = {
+        let mut pager = fixture.backend.moe_pager().lock().unwrap();
+        let session = pager.as_mut().unwrap();
+        let copy = session.gpu_decode_owner.clone().unwrap();
+        assert!(copy.is_owned());
+        session.handoff_gpu_decode(&fixture.backend).unwrap();
+        if partial {
+            assert_eq!(
+                session
+                    .routed_roles_resident_mask(&fixture.roles[1], &[0, 1])
+                    .unwrap(),
+                1
+            );
+        } else {
+            for roles in fixture.roles {
+                session.discard_cpu_miss(roles, &[0, 1, 2, 3]);
+            }
+        }
+        session.gpu_decode_owner = None;
+        (
+            session.gpu_copy_sources().unwrap().unwrap(),
+            crate::pager::owned_seed(session, 0).unwrap(),
+        )
+    };
+    // Start a fresh immutable source generation whose B bank has no GPU alias.
+    for role in 0..3 {
+        for expert in 0..EXP {
+            let block = role * (2 * EXP) + EXP + expert;
+            if !partial || expert == 1 {
+                inputs.test_cpu_only_source(block);
+            }
+        }
+    }
+    let copy = crate::pager::GpuCopyBuffers::new_owned(&fixture.backend, inputs, 3, seed)
+        .unwrap()
+        .unwrap();
+    fixture
+        .backend
+        .moe_pager()
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .gpu_decode_owner = Some(copy.clone());
+    fixture
+        .backend
+        .runtime_phase
+        .lock()
+        .unwrap()
+        .resident_buffers
+        .as_mut()
+        .unwrap()
+        .gpu_copy = Some(copy);
+    fixture
+        .backend
+        .execute(plan.as_ref(), &fixture.bindings())
+        .unwrap();
+    assert_eq!(fixture.outputs(), reference);
+    let mut pager = fixture.backend.moe_pager().lock().unwrap();
+    let session = pager.as_mut().unwrap();
+    if !partial {
+        assert_eq!(
+            session
+                .routed_roles_resident_mask(&fixture.roles[0], &[0])
+                .unwrap(),
+            0,
+            "CPU mirror must not be updated by access replay during GPU ownership"
+        );
+    }
+    session.handoff_gpu_decode(&fixture.backend).unwrap();
+    assert_eq!(
+        session
+            .routed_roles_resident_mask(&fixture.roles[0], &[0])
+            .unwrap(),
+        1
+    );
+}
+
 fn redemand_fixture(overlap: bool) {
     let reference = {
         let fixture = Fixture::new(false, false, false);
@@ -283,7 +436,7 @@ fn redemand_fixture(overlap: bool) {
     assert!((reference[0][0] - reference[1][0]).abs() > 0.01);
 
     for early in [false, true] {
-        let fixture = Fixture::new(true, early, overlap);
+        let fixture = Fixture::legacy(true, early, overlap);
         let plan = fixture.backend.compile(&fixture.graph).unwrap();
         // Warm fixed metadata/workspace before making the measured epoch completely cold.
         fixture

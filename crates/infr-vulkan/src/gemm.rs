@@ -4036,6 +4036,11 @@ pub(crate) fn gpu_resident_check_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+pub(crate) fn gpu_owned_recovery_seed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_recovery_seed.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 pub(crate) fn gpu_resident_dispatch_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_resident_dispatch.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
@@ -4063,6 +4068,120 @@ pub(crate) fn gpu_resident_copy_prepare_spv() -> &'static [u32] {
     WORDS.get_or_init(|| spv_words(BYTES))
 }
 
+pub(crate) fn gpu_owned_prepare_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_prepare.spv"));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+pub(crate) fn gpu_owned_prepare_fast_spv(overlap: bool) -> &'static [u32] {
+    const SERIAL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_prepare_fast.spv"));
+    const OVERLAP: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_fast_overlap.spv"
+    ));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    static OVERLAP_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    if overlap {
+        OVERLAP_WORDS.get_or_init(|| spv_words(OVERLAP))
+    } else {
+        WORDS.get_or_init(|| spv_words(SERIAL))
+    }
+}
+
+pub(crate) fn gpu_owned_prepare_slow_spv(overlap: bool) -> &'static [u32] {
+    const SERIAL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_prepare_slow.spv"));
+    const OVERLAP: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_slow_overlap.spv"
+    ));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    static OVERLAP_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    if overlap {
+        OVERLAP_WORDS.get_or_init(|| spv_words(OVERLAP))
+    } else {
+        WORDS.get_or_init(|| spv_words(SERIAL))
+    }
+}
+
+pub(crate) fn gpu_owned_prepare_fast_split_spv(overlap: bool) -> &'static [u32] {
+    const SERIAL: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_fast_split.spv"
+    ));
+    const OVERLAP: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_fast_split_overlap.spv"
+    ));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    static OVERLAP_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    if overlap {
+        OVERLAP_WORDS.get_or_init(|| spv_words(OVERLAP))
+    } else {
+        WORDS.get_or_init(|| spv_words(SERIAL))
+    }
+}
+
+pub(crate) fn gpu_owned_prepare_slow_subgroup_spv(overlap: bool) -> &'static [u32] {
+    const SERIAL: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_slow_subgroup.spv"
+    ));
+    const OVERLAP: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_slow_subgroup_overlap.spv"
+    ));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    static OVERLAP_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    if overlap {
+        OVERLAP_WORDS.get_or_init(|| spv_words(OVERLAP))
+    } else {
+        WORDS.get_or_init(|| spv_words(SERIAL))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn gpu_owned_prepare_reference_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_prepare_reference.spv"));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+#[cfg(test)]
+pub(crate) fn gpu_owned_prepare_reference_overlap_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_reference_overlap.spv"
+    ));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+pub(crate) fn gpu_owned_publish_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_publish.spv"));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+pub(crate) fn gpu_owned_copy_publish_spv(wide: bool) -> &'static [u32] {
+    const SMALL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_copy_publish.spv"));
+    const WIDE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_copy_publish1024.spv"));
+    static SMALL_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    static WIDE_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    if wide {
+        WIDE_WORDS.get_or_init(|| spv_words(WIDE))
+    } else {
+        SMALL_WORDS.get_or_init(|| spv_words(SMALL))
+    }
+}
+
+pub(crate) fn gpu_owned_prepare_overlap_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_prepare_overlap.spv"));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
 pub(crate) fn gpu_resident_copy_prepare_overlap_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(
         env!("OUT_DIR"),
@@ -4076,6 +4195,57 @@ pub(crate) fn gpu_resident_silu_misses_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_resident_silu_misses.spv"));
     static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
     WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+pub(crate) fn gpu_owned_prepare_topk_fused_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_topk_fused.spv"
+    ));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+pub(crate) fn gpu_owned_prepare_topk_fused_overlap_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_topk_fused_overlap.spv"
+    ));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+pub(crate) fn gpu_owned_prepare_topk_fused_two_row_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_topk_fused_two_row.spv"
+    ));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+pub(crate) fn gpu_owned_prepare_topk_fused_two_row_overlap_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_topk_fused_two_row_overlap.spv"
+    ));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+pub(crate) fn gpu_owned_prepare_fused_spv(overlap: bool) -> &'static [u32] {
+    const SERIAL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_prepare_fused.spv"));
+    const OVERLAP: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_fused_overlap.spv"
+    ));
+    static SERIAL_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    static OVERLAP_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    if overlap {
+        OVERLAP_WORDS.get_or_init(|| spv_words(OVERLAP))
+    } else {
+        SERIAL_WORDS.get_or_init(|| spv_words(SERIAL))
+    }
 }
 
 pub(crate) fn gpu_resident_copy_payload_spv(wide: bool) -> &'static [u32] {

@@ -10,11 +10,8 @@ const QUALIFIED: [(usize, usize, usize); 6] = [
     (2560, 10240, 1024),
     (2560, 12288, 1024),
 ];
-const EXCLUDED_FLASH_M512: [(usize, usize, usize); 3] = [
-    (2560, 6144, 512),
-    (6144, 2560, 512),
-    (2560, 12288, 512),
-];
+const EXCLUDED_FLASH_M512: [(usize, usize, usize); 3] =
+    [(2560, 6144, 512), (6144, 2560, 512), (2560, 12288, 512)];
 const GUARD: usize = 64;
 const POISON: f32 = -7777.25;
 const BM128: &str = "native_gemm_warp_q8_0_n128_ag_bm128";
@@ -525,7 +522,13 @@ fn q8_prefill_bm128_graph_excluded_flash_m512_fallback() {
     assert_eq!(EXCLUDED_FLASH_M512.len(), 3);
     for (k, n, m) in EXCLUDED_FLASH_M512 {
         assert!(!crate::recorder::q8_prefill_bm128_applies(
-            true, true, true, DType::Q8_0, m, k, n
+            true,
+            true,
+            true,
+            DType::Q8_0,
+            m,
+            k,
+            n
         ));
         actual(k, n, m, false);
     }
