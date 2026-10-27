@@ -28,6 +28,8 @@ pub(crate) struct TransferCopyBatch {
 
 const DEDICATED_TRANSFER_COMMAND_SLOTS: usize = 3;
 
+pub(crate) type RetiredTransferKeepalive = [Vec<Arc<dyn Buffer>>; DEDICATED_TRANSFER_COMMAND_SLOTS];
+
 struct DedicatedTransferCommandSlot {
     cmd: vk::CommandBuffer,
     pending_value: u64,
@@ -208,10 +210,28 @@ impl DedicatedTransferQueue {
         self.timeline
     }
 
+    pub(crate) fn has_pending_keepalive(&self) -> bool {
+        self.slots.iter().any(|slot| !slot.keepalive.is_empty())
+    }
+
+    /// `completed` must come from a successful wait or counter read of this queue's timeline.
+    /// The caller drops the returned owners only AFTER releasing the queue mutex. Leave command
+    /// and timestamp metadata intact: ordinary slot reuse/destroy still resolves those queries.
+    pub(crate) fn take_completed_keepalive(&mut self, completed: u64) -> RetiredTransferKeepalive {
+        let mut retired = std::array::from_fn(|_| Vec::new());
+        for (slot, owners) in self.slots.iter_mut().zip(&mut retired) {
+            if slot.pending_value != 0 && slot.pending_value <= completed {
+                *owners = std::mem::take(&mut slot.keepalive);
+            }
+        }
+        retired
+    }
+
     pub(crate) fn submit(
         &mut self,
         shared: &crate::VulkanShared,
         batches: &[TransferCopyBatch],
+        retired: &mut RetiredTransferKeepalive,
     ) -> Result<u64> {
         let _timeline_transfer = infr_core::timeline::span("dma_prepare_submit");
         let _worker_prepare = infr_core::timeline::background_span("resident_producer_dma_prepare");
@@ -244,7 +264,8 @@ impl DedicatedTransferQueue {
                 slot_index,
                 slot,
             );
-            slot.keepalive.clear();
+            // `retired` belongs to the wrapper outside the queue guard, including error/unwind.
+            retired[slot_index] = std::mem::take(&mut slot.keepalive);
         }
         unsafe {
             shared
@@ -1517,6 +1538,10 @@ impl TransferExecutor for VulkanBackend {
         VulkanBackend::write_device_target(self, target, fill)
     }
 }
+
+#[cfg(test)]
+#[path = "transfer_retirement_tests.rs"]
+mod retirement_tests;
 
 #[cfg(test)]
 mod tests {

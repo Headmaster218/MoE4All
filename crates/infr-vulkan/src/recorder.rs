@@ -1403,6 +1403,7 @@ impl PreparedCommand {
             self.shared.recorder_fences.lock().unwrap().push(fence);
             return Err(be(format!("prepared queue_submit: {error}")));
         }
+        let dedicated_transfer_wait = self.dedicated_transfer_wait;
         Ok(PendingSegment {
             shared: std::sync::Arc::clone(&self.shared),
             fence: Some(fence),
@@ -1410,6 +1411,7 @@ impl PreparedCommand {
             pools: Vec::new(),
             buffer_keepalive: Vec::new(),
             dispatches: self.dispatches,
+            dedicated_transfer_wait,
             prepared_prefix: Some(self),
             submit_query_pool: vk::QueryPool::null(),
             submit_timing_token: None,
@@ -16538,6 +16540,7 @@ impl<'a> Recorder<'a> {
                 submit_timing_token: None,
                 submit_pager_profile: false,
                 dispatches,
+                dedicated_transfer_wait: 0,
                 timeline_query: None,
                 waiter: None,
                 notice_producer: None,
@@ -16604,6 +16607,7 @@ impl<'a> Recorder<'a> {
             submit_timing_token,
             submit_pager_profile,
             dispatches,
+            dedicated_transfer_wait: self.dedicated_transfer_wait.get(),
             timeline_query: self.timeline_query.borrow_mut().take(),
             waiter: None,
             notice_producer: None,
@@ -17017,6 +17021,8 @@ pub struct PendingSegment {
     submit_pager_profile: bool,
     /// Dispatches this segment carried; consumed by the submit profiler and finite GPU tuner.
     dispatches: usize,
+    /// A successful compute fence proves this submission's transfer timeline dependency.
+    dedicated_transfer_wait: u64,
     timeline_query: Option<crate::timeline::Query>,
     /// The fence is never reset/recycled until this worker's wait has returned.
     waiter: Option<std::sync::mpsc::Receiver<std::result::Result<(), vk::Result>>>,
@@ -17109,6 +17115,10 @@ impl PendingSegment {
         };
         drop(wait_span);
         if waited.is_ok() {
+            if self.dedicated_transfer_wait != 0 {
+                self.shared
+                    .retire_dedicated_transfer_through(self.dedicated_transfer_wait);
+            }
             if let Some(query) = self.timeline_query.take() {
                 query.resolve();
             }

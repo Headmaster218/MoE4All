@@ -738,6 +738,9 @@ struct VulkanShared {
     /// preserves the established main-queue path on devices without the required family or
     /// timeline support.
     dedicated_transfer: Option<Mutex<crate::transfer::DedicatedTransferQueue>>,
+    /// Conservative lock-free gate for completed-owner retirement. Publish true BEFORE submit;
+    /// recompute under the same dedicated queue mutex after every submit/retirement mutation.
+    dedicated_transfer_keepalive_pending: AtomicBool,
     /// Vulkan requires host access to one queue to be externally synchronized. It also turns the
     /// rare submit-OOM recovery into one atomic drain/retry boundary across the graph and Prefill
     /// upload threads without changing GPU submission order.
@@ -1156,10 +1159,26 @@ impl VulkanShared {
         &self,
         batches: &[crate::transfer::TransferCopyBatch],
     ) -> Result<Option<u64>> {
+        if batches.is_empty() {
+            return Ok(None);
+        }
         let Some(queue) = self.dedicated_transfer.as_ref() else {
             return Ok(None);
         };
-        queue.lock().unwrap().submit(self, batches).map(Some)
+        let mut retired = std::array::from_fn(|_| Vec::new());
+        let result = {
+            let mut queue = queue.lock().unwrap();
+            // A probe that sees true serializes with this submit. Unwind leaves true (safe),
+            // rather than losing the only retirement notification for accepted GPU work.
+            self.dedicated_transfer_keepalive_pending
+                .store(true, Ordering::Release);
+            let result = queue.submit(self, batches, &mut retired).map(Some);
+            self.dedicated_transfer_keepalive_pending
+                .store(queue.has_pending_keepalive(), Ordering::Release);
+            result
+        };
+        drop(retired);
+        result
     }
 
     fn wait_dedicated_transfer(&self, value: u64) -> Result<()> {
@@ -1188,7 +1207,95 @@ impl VulkanShared {
         if let Some(elapsed) = infr_core::pager_profile::elapsed(wait_t0) {
             infr_core::pager_profile::record_dedicated_transfer_timeline_wait(elapsed);
         }
-        wait.map_err(|error| be(format!("wait dedicated transfer timeline {value}: {error}")))
+        wait.map_err(|error| be(format!("wait dedicated transfer timeline {value}: {error}")))?;
+        self.retire_waited_dedicated_transfer_through(value);
+        Ok(())
+    }
+
+    /// A successful CPU wait proves this prefix without another Vulkan query or queue-idle.
+    fn retire_waited_dedicated_transfer_through(&self, completed: u64) {
+        if completed == 0
+            || !self
+                .dedicated_transfer_keepalive_pending
+                .load(Ordering::Acquire)
+        {
+            return;
+        }
+        let Some(queue) = self.dedicated_transfer.as_ref() else {
+            return;
+        };
+        let retired = {
+            let Ok(mut queue) = queue.lock() else {
+                return; // No new poisoned-lock/error retirement policy.
+            };
+            let retired = queue.take_completed_keepalive(completed);
+            self.dedicated_transfer_keepalive_pending
+                .store(queue.has_pending_keepalive(), Ordering::Release);
+            retired
+        };
+        // The caller still owns Shared while VkBuffer::drop may use its allocator/device.
+        drop(retired);
+    }
+
+    /// A successfully drained compute fence proves ONLY its submitted timeline-wait prefix.
+    /// Pass that submission's captured transfer value, never a current/newest queue value.
+    /// Cleanup is opportunistic: contention leaves owners for a later proof or CPU wait, without
+    /// blocking the foreground on another transfer slot's wait/recording. No Vulkan query needed.
+    pub(crate) fn retire_dedicated_transfer_through(&self, completed: u64) {
+        if completed == 0
+            || !self
+                .dedicated_transfer_keepalive_pending
+                .load(Ordering::Acquire)
+        {
+            return;
+        }
+        let Some(queue) = self.dedicated_transfer.as_ref() else {
+            return;
+        };
+        let retired = {
+            let Ok(mut queue) = queue.try_lock() else {
+                return;
+            };
+            let retired = queue.take_completed_keepalive(completed);
+            self.dedicated_transfer_keepalive_pending
+                .store(queue.has_pending_keepalive(), Ordering::Release);
+            retired
+        };
+        drop(retired);
+    }
+
+    /// Best-effort fallback after an existing queue/device-idle boundary, not per-fence cleanup.
+    /// Main-queue idle alone does not prove all transfer work complete: read the actual timeline.
+    pub(crate) fn retire_completed_dedicated_transfers(&self) {
+        if !self
+            .dedicated_transfer_keepalive_pending
+            .load(Ordering::Acquire)
+        {
+            return;
+        }
+        let Some(queue) = self.dedicated_transfer.as_ref() else {
+            return;
+        };
+        let retired = {
+            let Ok(mut queue) = queue.try_lock() else {
+                return;
+            };
+            // Another retirement may have won between the atomic load and try_lock.
+            if !queue.has_pending_keepalive() {
+                self.dedicated_transfer_keepalive_pending
+                    .store(false, Ordering::Release);
+                return;
+            }
+            let completed = match unsafe { self.device.get_semaphore_counter_value(queue.timeline()) } {
+                Ok(value) => value,
+                Err(_) => return, // Unproven owners stay pinned; D3 error policy is unchanged.
+            };
+            let retired = queue.take_completed_keepalive(completed);
+            self.dedicated_transfer_keepalive_pending
+                .store(queue.has_pending_keepalive(), Ordering::Release);
+            retired
+        };
+        drop(retired);
     }
 
     fn queue_submit_commands_recovering(
@@ -1500,13 +1607,25 @@ impl VulkanShared {
     }
 
     pub(crate) fn queue_wait_idle_serialized(&self) -> std::result::Result<(), vk::Result> {
-        let _queue = self.queue_access.lock().unwrap();
-        unsafe { self.device.queue_wait_idle(self.queue) }
+        let result = {
+            let _queue = self.queue_access.lock().unwrap();
+            unsafe { self.device.queue_wait_idle(self.queue) }
+        };
+        if result.is_ok() {
+            self.retire_completed_dedicated_transfers();
+        }
+        result
     }
 
     fn device_wait_idle_serialized(&self) -> std::result::Result<(), vk::Result> {
-        let _queue = self.queue_access.lock().unwrap();
-        unsafe { self.device.device_wait_idle() }
+        let result = {
+            let _queue = self.queue_access.lock().unwrap();
+            unsafe { self.device.device_wait_idle() }
+        };
+        if result.is_ok() {
+            self.retire_completed_dedicated_transfers();
+        }
+        result
     }
 }
 
@@ -4872,6 +4991,7 @@ impl VulkanBackend {
                 queue,
                 queue_family_index,
                 dedicated_transfer,
+                dedicated_transfer_keepalive_pending: AtomicBool::new(false),
                 queue_access,
                 vram_keepalive,
                 queue_submit_failure: AtomicI32::new(vk::Result::SUCCESS.as_raw()),
