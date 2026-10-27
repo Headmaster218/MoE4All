@@ -48,11 +48,27 @@
 //! skipped by the sinker because its LRU stamp was refreshed by [`PagedKv::best_match`].
 //! The host backing is `Vec<u8>` indexed by RAM slot — a RAM `FrameId`'s `slot() * frame_bytes`
 //! IS its backing offset, mirroring how a VRAM slot maps into its corridor.
+//!
+//! # Phase D: the disk tier
+//!
+//! `kv.disk_cache_max` sizes a third pool behind the RAM tier, backed by ONE sparse file (disk
+//! slot `s` owns bytes `s * frame_bytes..`, grown lazily to the high-water mark). Only whole
+//! RAM-resident chains sink: when the RAM pool runs dry, the coldest all-RAM entry's frames are
+//! written to the file and its chain rewritten to Disk ids, freeing RAM slots for the VRAM sink
+//! that triggered the cascade. A hit on a Disk frame reads it back into a fresh RAM slot (making
+//! room by sinking another cold RAM entry if needed) before the normal RAM→VRAM promotion uploads
+//! it. Synchronous `std::fs` I/O runs inside the GPU baton like every other tree mutation — an
+//! NVMe frame read is ~ms, and the alternative (an idle worker) is the PR #86 black hole. The
+//! backing is process-scoped: slots recycle without wiping, and a restart starts with an empty
+//! disk tier (content-addressed cross-process reuse stays out of scope).
 
 use crate::seam::kv_frame_pool::{FrameId, FramePool, Tier};
 use anyhow::{anyhow, Result};
 use infr_core::backend::{Backend, KvFrameCorridor};
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 
 /// Frame-granularity DMA between the VRAM corridor and host memory, factored out of [`Backend`]
 /// so the pool/tree logic tests against an in-memory stand-in. Blanket-impl'd for every backend.
@@ -72,6 +88,14 @@ impl<T: Backend + ?Sized> FrameDma for T {
         self.kv_frame_upload(frame_addr, src)
             .map_err(|error| anyhow!("{error}"))
     }
+}
+
+/// The disk tier's backing store: one open sparse file, `slot * frame_bytes` per frame.
+/// `high_water` tracks the logical file length so growth is one `set_len` per new max slot,
+/// never a metadata round-trip per frame.
+struct DiskBacking {
+    file: File,
+    high_water: u64,
 }
 
 /// One cached conversation: the frames covering every COMPLETE page of its token prefix
@@ -120,6 +144,9 @@ pub(crate) struct PagedKv {
     /// frame_bytes`. Grown lazily to the high-water mark of demoted slots so a server that never
     /// fills its RAM budget never commits the full host allocation.
     ram_backing: Vec<u8>,
+    /// Phase D: the disk tier's sparse backing file, `None` when the tier is closed (budget 0 or
+    /// the file could not be opened — a cache layer must never fail engine init).
+    disk: Option<DiskBacking>,
     clock: u64,
     hits: u64,
     misses: u64,
@@ -127,6 +154,8 @@ pub(crate) struct PagedKv {
     evictions: u64,
     tier_demotions: u64,
     tier_promotions: u64,
+    disk_demotions: u64,
+    disk_promotions: u64,
 }
 
 impl PagedKv {
@@ -136,6 +165,8 @@ impl PagedKv {
         plane_offsets: Vec<u64>,
         vram_frames: usize,
         ram_frames: usize,
+        disk_frames: usize,
+        disk_path: Option<PathBuf>,
     ) -> Self {
         assert!(
             page_tokens.is_power_of_two(),
@@ -145,13 +176,50 @@ impl PagedKv {
             !plane_offsets.is_empty(),
             "a paged KV cache needs at least one plane"
         );
+        // Open (lazily-sparse) the disk backing up front so a misconfigured path surfaces once at
+        // init instead of silently disabling every later sink. A failure is a WARN + closed tier:
+        // the VRAM+RAM behavior of Phase C must survive its own cache layer being unavailable.
+        let disk = match (disk_frames > 0, disk_path) {
+            (true, Some(path)) => match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                // The backing is process-scoped bookkeeping, never restored across restarts
+                // (content-addressed cross-process reuse is out of scope). `truncate` makes an
+                // explicit shared `kv.disk_cache_path` start empty and reclaims the prior run's
+                // disk space; the default per-pid temp path never collides anyway.
+                .truncate(true)
+                .open(&path)
+            {
+                Ok(file) => {
+                    tracing::info!(
+                        path = %path.display(),
+                        disk_frames,
+                        "paged KV disk tier backing opened"
+                    );
+                    Some(DiskBacking {
+                        file,
+                        high_water: 0,
+                    })
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "paged KV disk tier disabled: could not open the backing file: {error}"
+                    );
+                    None
+                }
+            },
+            _ => None,
+        };
         Self {
-            pool: FramePool::new(frame_bytes, vram_frames, ram_frames),
+            pool: FramePool::new(frame_bytes, vram_frames, ram_frames, disk_frames),
             nodes: vec![Node::new(None, Vec::new(), 0)],
             free: Vec::new(),
             page_tokens,
             plane_offsets,
             ram_backing: Vec::new(),
+            disk,
             clock: 0,
             hits: 0,
             misses: 0,
@@ -159,6 +227,8 @@ impl PagedKv {
             evictions: 0,
             tier_demotions: 0,
             tier_promotions: 0,
+            disk_demotions: 0,
+            disk_promotions: 0,
         }
     }
 
@@ -193,7 +263,7 @@ impl PagedKv {
         let held = self.pool.held_frames(Tier::Vram);
         let total = self.pool.capacity_frames(Tier::Vram);
         format!(
-            "entries={} frames_held={}/{} free={} tokens_held={}/{} bytes={:.2}GiB/{:.2}GiB ram={}/{} ram_bytes={:.2}GiB hits={} misses={} demotions={} evictions={} sunk={} promoted={}",
+            "entries={} frames_held={}/{} free={} tokens_held={}/{} bytes={:.2}GiB/{:.2}GiB ram={}/{} ram_bytes={:.2}GiB disk={}/{} disk_bytes={:.2}GiB hits={} misses={} demotions={} evictions={} sunk={} promoted={} disk_sunk={} disk_promoted={}",
             self.nodes
                 .iter()
                 .filter(|node| node.entry.is_some())
@@ -208,12 +278,17 @@ impl PagedKv {
             self.pool.held_frames(Tier::Ram),
             self.pool.capacity_frames(Tier::Ram),
             self.pool.held_bytes(Tier::Ram) as f64 / (1u64 << 30) as f64,
+            self.pool.held_frames(Tier::Disk),
+            self.pool.capacity_frames(Tier::Disk),
+            self.pool.held_bytes(Tier::Disk) as f64 / (1u64 << 30) as f64,
             self.hits,
             self.misses,
             self.demotions,
             self.evictions,
             self.tier_demotions,
             self.tier_promotions,
+            self.disk_demotions,
+            self.disk_promotions,
         )
     }
 
@@ -244,20 +319,26 @@ impl PagedKv {
             return Some(frame);
         }
         // Sink the coldest tree entry to RAM before deleting anything: the prefix survives the
-        // pressure and a later hit pays one DMA instead of a full re-prefill.
-        while self.demote_coldest_entry(be, protect) {
+        // pressure and a later hit pays one DMA instead of a full re-prefill. Phase D adds the
+        // cascade: when RAM is full, sinking the coldest all-RAM entry to disk frees RAM slots
+        // for the VRAM sink that needs them. The loop interleaves sinks and eviction so an
+        // evicted entry's freed host slot immediately re-enables a sink (evict one, then try
+        // sinking again before evicting the next) — bytes always move down a tier before an
+        // entry is dropped. Every successful step moves bytes strictly DOWN or deletes an
+        // entry, so the loop cannot spin.
+        loop {
             if let Some(frame) = self.pool.alloc(Tier::Vram) {
                 self.pool.set_active(frame, active);
                 return Some(frame);
             }
-        }
-        while self.evict_cold_one() {
-            if let Some(frame) = self.pool.alloc(Tier::Vram) {
-                self.pool.set_active(frame, active);
-                return Some(frame);
+            if self.demote_coldest_entry(be, protect) || self.demote_ram_coldest_entry(protect) {
+                continue;
             }
+            if self.evict_cold_one() {
+                continue;
+            }
+            return None;
         }
-        None
     }
 
     /// Rewrite every entry-chain occurrence of `source` to `fresh` after a tier migration.
@@ -338,6 +419,129 @@ impl PagedKv {
             self.rewrite_frame_in_entries(source, fresh);
             self.pool.migrate_into(source, fresh);
             self.tier_demotions += 1;
+            moved += 1;
+        }
+        moved > 0
+    }
+
+    /// Phase D: write one frame's bytes to its disk slot, growing the sparse file to cover it.
+    /// Field-disjoint borrows (`disk` vs `ram_backing`) let the caller keep the backing slice
+    /// alive while the file handle is mutated — no copy through a temp buffer.
+    fn disk_write(
+        disk: &mut DiskBacking,
+        frame_bytes: usize,
+        slot: usize,
+        src: &[u8],
+    ) -> Result<()> {
+        let off = slot as u64 * frame_bytes as u64;
+        let need = off + frame_bytes as u64;
+        if disk.high_water < need {
+            disk.file
+                .set_len(need)
+                .map_err(|error| anyhow!("disk backing set_len {need}: {error}"))?;
+            disk.high_water = need;
+        }
+        disk.file
+            .seek(SeekFrom::Start(off))
+            .map_err(|error| anyhow!("disk backing seek {off}: {error}"))?;
+        disk.file
+            .write_all(src)
+            .map_err(|error| anyhow!("disk backing write slot {slot}: {error}"))
+    }
+
+    /// Phase D: read one frame's bytes from its disk slot. A short read (file truncated under an
+    /// external tool) is an error: the caller keeps the frame where it is rather than DMA holes.
+    fn disk_read(
+        disk: &mut DiskBacking,
+        frame_bytes: usize,
+        slot: usize,
+        dst: &mut [u8],
+    ) -> Result<()> {
+        let off = slot as u64 * frame_bytes as u64;
+        if disk.high_water < off + frame_bytes as u64 {
+            return Err(anyhow!(
+                "disk backing has no bytes for slot {slot} (high_water {})",
+                disk.high_water
+            ));
+        }
+        disk.file
+            .seek(SeekFrom::Start(off))
+            .map_err(|error| anyhow!("disk backing seek {off}: {error}"))?;
+        disk.file
+            .read_exact(dst)
+            .map_err(|error| anyhow!("disk backing read slot {slot}: {error}"))
+    }
+
+    /// Sink the coldest ALL-RAM tree entry to the disk tier (the same leaf-first LRU order as
+    /// [`Self::demote_coldest_entry`], one tier down). Mixed chains (some frames still VRAM) are
+    /// skipped exactly like the VRAM sinker skips chains with host frames: a chain crosses tiers
+    /// only in the direction the cascade needs, never partially back. A write failure keeps the
+    /// entry's mixed RAM/disk chain consistent — whatever already sank stays sunk.
+    fn demote_ram_coldest_entry(&mut self, protect: &[FrameId]) -> bool {
+        if self.disk.is_none() || self.pool.capacity_frames(Tier::Disk) == 0 {
+            return false;
+        }
+        let mut best: Option<(usize, usize)> = None; // (node, chain length)
+        let mut best_key: Option<(bool, u64, usize)> = None;
+        for (index, node) in self.nodes.iter().enumerate() {
+            let Some(entry) = node.entry.as_ref() else {
+                continue;
+            };
+            if entry.chain.is_empty()
+                || entry.chain.iter().any(|f| !matches!(f.tier(), Tier::Ram))
+                || entry.chain.iter().any(|f| protect.contains(f))
+            {
+                continue;
+            }
+            if self.pool.free_frames(Tier::Disk) < entry.chain.len() {
+                continue;
+            }
+            let key = (self.has_entry_below(index), node.last_access, index);
+            if best_key.is_none_or(|current| key < current) {
+                best_key = Some(key);
+                best = Some((index, entry.chain.len()));
+            }
+        }
+        let Some((node, len)) = best else {
+            return false;
+        };
+        let frame_bytes = self.pool.frame_bytes() as usize;
+        let mut moved = 0usize;
+        for i in 0..len {
+            let source = self.nodes[node].entry.as_ref().unwrap().chain[i];
+            let Some(fresh) = self.pool.alloc(Tier::Disk) else {
+                break; // disk filled mid-chain: mixed chain, still consistent
+            };
+            let backing_off = source.slot() * frame_bytes;
+            if backing_off + frame_bytes > self.ram_backing.len() {
+                // Bookkeeping can only reach here if the backing shrank under a bug.
+                self.pool.unpin(fresh);
+                tracing::warn!(
+                    "paged KV found no RAM backing for sunk frame {}; leaving the entry in RAM",
+                    source.slot()
+                );
+                break;
+            }
+            let write_result = match self.disk.as_mut() {
+                Some(disk) => Self::disk_write(
+                    disk,
+                    frame_bytes,
+                    fresh.slot(),
+                    &self.ram_backing[backing_off..backing_off + frame_bytes],
+                ),
+                None => Err(anyhow!("disk tier closed")),
+            };
+            if let Err(error) = write_result {
+                self.pool.unpin(fresh);
+                tracing::warn!(
+                    "paged KV could not write frame {} to disk; keeping it in RAM: {error}",
+                    source.slot()
+                );
+                break;
+            }
+            self.rewrite_frame_in_entries(source, fresh);
+            self.pool.migrate_into(source, fresh);
+            self.disk_demotions += 1;
             moved += 1;
         }
         moved > 0
@@ -454,14 +658,35 @@ impl PagedKv {
                 out.push(frame);
                 continue;
             }
-            let backing_off = frame.slot() * frame_bytes;
+            // Phase D: a disk frame must first land in a RAM slot — the upload below reads from
+            // the host backing, and the disk->RAM read may itself cascade (RAM full: sink other
+            // cold RAM entries to disk).
+            let ram = match frame.tier() {
+                Tier::Ram => frame,
+                Tier::Disk => {
+                    let Some(ram) = self.disk_to_ram(frame, &out) else {
+                        break; // no RAM room / read failure: truncate, the tail stays on disk
+                    };
+                    ram
+                }
+                Tier::Vram => unreachable!("handled above"),
+            };
+            let backing_off = ram.slot() * frame_bytes;
             if backing_off + frame_bytes > self.ram_backing.len() {
                 // Bookkeeping can only reach here if the backing shrank under a bug; refuse the
                 // promotion rather than DMA garbage bytes into the corridor.
-                tracing::warn!("paged KV promotion found no backing for RAM frame {}", frame.slot());
+                tracing::warn!(
+                    "paged KV promotion found no backing for RAM frame {}",
+                    ram.slot()
+                );
                 break;
             }
-            let Some(fresh) = self.claim_frame(be, false, &out) else {
+            // The in-flight RAM frame is protected alongside the already-promoted VRAM ids: the
+            // VRAM claim below can cascade a RAM->disk sink, and if that sink moved an entry
+            // sharing THIS frame, `rewrite_frame_in_entries` would strand `backing_off`'s owner.
+            let mut protect = out.clone();
+            protect.push(ram);
+            let Some(fresh) = self.claim_frame(be, false, &protect) else {
                 break; // corridor cannot yield: truncate the reuse here
             };
             if let Err(error) = be.upload_frame(
@@ -471,16 +696,60 @@ impl PagedKv {
                 self.pool.unpin(fresh);
                 tracing::warn!(
                     "paged KV could not DMA frame {} back to VRAM; re-prefilling from here: {error}",
-                    frame.slot()
+                    ram.slot()
                 );
                 break;
             }
-            self.rewrite_frame_in_entries(frame, fresh);
-            self.pool.migrate_into(frame, fresh);
+            self.rewrite_frame_in_entries(ram, fresh);
+            self.pool.migrate_into(ram, fresh);
             self.tier_promotions += 1;
             out.push(fresh);
         }
         out
+    }
+
+    /// Phase D: bring one disk frame up into a fresh RAM slot (bytes read from the sparse
+    /// backing). RAM pressure is relieved by the same cascade the VRAM claim uses — sink the
+    /// coldest all-RAM entry to disk — and the just-converted frame is NOT yet in any chain the
+    /// sinker can see as a victim candidate problem: `rewrite_frame_in_entries` keeps every
+    /// chain naming the disk id consistent across the conversion. `None` = no RAM slot even
+    /// after cascading, or a read failure; the caller truncates the promotion there.
+    fn disk_to_ram(&mut self, disk_id: FrameId, protect: &[FrameId]) -> Option<FrameId> {
+        let frame_bytes = self.pool.frame_bytes() as usize;
+        loop {
+            let Some(ram) = self.pool.alloc(Tier::Ram) else {
+                // RAM full: make room the cheap way first (sink a cold all-RAM entry to disk).
+                if !self.demote_ram_coldest_entry(protect) {
+                    return None;
+                }
+                continue;
+            };
+            let backing_off = ram.slot() * frame_bytes;
+            if self.ram_backing.len() < backing_off + frame_bytes {
+                self.ram_backing.resize(backing_off + frame_bytes, 0);
+            }
+            let read_result = match self.disk.as_mut() {
+                Some(disk) => Self::disk_read(
+                    disk,
+                    frame_bytes,
+                    disk_id.slot(),
+                    &mut self.ram_backing[backing_off..backing_off + frame_bytes],
+                ),
+                None => Err(anyhow!("disk tier closed")),
+            };
+            if let Err(error) = read_result {
+                self.pool.unpin(ram);
+                tracing::warn!(
+                    "paged KV could not read disk frame {} back into RAM: {error}",
+                    disk_id.slot()
+                );
+                return None;
+            }
+            self.rewrite_frame_in_entries(disk_id, ram);
+            self.pool.migrate_into(disk_id, ram);
+            self.disk_promotions += 1;
+            return Some(ram);
+        }
     }
 
     /// Publish a demoted session's conversation. `chain` must cover exactly the complete pages of
@@ -746,7 +1015,7 @@ mod tests {
     }
 
     fn cache_ram(vram_frames: usize, ram_frames: usize) -> PagedKv {
-        let mut kv = PagedKv::new(FB, PAGE, vec![0, FB / 2], vram_frames, ram_frames);
+        let mut kv = PagedKv::new(FB, PAGE, vec![0, FB / 2], vram_frames, ram_frames, 0, None);
         kv.set_vram_segments(&[KvFrameCorridor {
             base: 0x1_0000_0000,
             frames: vram_frames,
@@ -754,11 +1023,38 @@ mod tests {
         kv
     }
 
+    /// Phase D: a disk-backed tree on a real temp file (the backing is plain `std::fs`, so the
+    /// tests exercise the actual sparse-file path — no mock needed below the RAM tier).
+    fn cache_disk(vram_frames: usize, ram_frames: usize, disk_frames: usize) -> (PagedKv, PathBuf) {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "infr-paged-kv-disk-test-{}-{}.bin",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut kv = PagedKv::new(
+            FB,
+            PAGE,
+            vec![0, FB / 2],
+            vram_frames,
+            ram_frames,
+            disk_frames,
+            Some(path.clone()),
+        );
+        kv.set_vram_segments(&[KvFrameCorridor {
+            base: 0x1_0000_0000,
+            frames: vram_frames,
+        }]);
+        (kv, path)
+    }
+
     /// Deterministic "corridor content" for one frame byte: [`MockDma`] writes it on download
     /// and demands to see exactly it on upload, so a sunk-then-promoted frame proves the bytes
     /// round-tripped through the host backing untouched.
     fn pattern(addr: u64, i: usize) -> u8 {
-        let x = addr.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (i as u64).wrapping_mul(0x0100_0000_01B3);
+        let x =
+            addr.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (i as u64).wrapping_mul(0x0100_0000_01B3);
         (x >> 32) as u8
     }
 
@@ -897,7 +1193,9 @@ mod tests {
         kv.session_release(&a); // tree-only owners; corridor now fully held by the entry
         assert_eq!(kv.pool.free_frames(Tier::Vram), 0);
         // A new conversation needs a frame: the cold leaf entry is evicted, its frames freed.
-        let b = kv.alloc_frame(&MockDma::default()).expect("eviction made room");
+        let b = kv
+            .alloc_frame(&MockDma::default())
+            .expect("eviction made room");
         assert_eq!(kv.evictions, 1);
         assert_eq!(
             kv.best_match(&(1..=8).collect::<Vec<_>>()),
@@ -1081,7 +1379,11 @@ mod tests {
         kv.publish(vec![1, 2, 3, 4, 9, 10, 11, 12], b.clone())
             .unwrap();
         kv.session_release(&b);
-        assert_eq!(kv.pool.refcount(a[0]), 2, "both entries own the shared frame");
+        assert_eq!(
+            kv.pool.refcount(a[0]),
+            2,
+            "both entries own the shared frame"
+        );
         // Pressure sinks the coldest leaf (whichever it picks); both branches must survive.
         let c = kv
             .alloc_frame(&dma)
@@ -1098,13 +1400,110 @@ mod tests {
         let (node_a, reusable_a) = kv.best_match(&(1..=8).collect::<Vec<u32>>()).unwrap();
         let back_a = kv.entry_chain_promoted(&dma, node_a, reusable_a);
         assert_eq!(back_a.len(), 2, "the corridor can host the whole chain");
-        let (node_b, reusable_b) = kv
-            .best_match(&[1, 2, 3, 4, 9, 10, 11, 12])
-            .unwrap();
+        let (node_b, reusable_b) = kv.best_match(&[1, 2, 3, 4, 9, 10, 11, 12]).unwrap();
         let back_b = kv.entry_chain_promoted(&dma, node_b, reusable_b);
         assert_eq!(back_b.len(), 2);
         assert_eq!(back_a[0], back_b[0], "shared frame id agrees again");
-        assert_eq!(kv.pool.refcount(back_a[0]), 2, "shared ownership survived the trip");
+        assert_eq!(
+            kv.pool.refcount(back_a[0]),
+            2,
+            "shared ownership survived the trip"
+        );
         assert_eq!(kv.pool.held_frames(Tier::Ram), 0, "the tier is empty again");
+    }
+
+    #[test]
+    fn ram_pressure_cascades_to_disk_and_a_hit_walks_back_up() {
+        // VRAM 2 / RAM 2 / disk 4: the cascade must move A all the way down (VRAM->RAM->disk)
+        // and back up (disk->RAM->VRAM) with the MockDma pattern proving byte integrity across
+        // the real temp-file round-trip.
+        let (mut kv, path) = cache_disk(2, 2, 4);
+        let dma = MockDma::default();
+        let a = grow(&mut kv, 2);
+        kv.publish((1..=8).collect(), a.clone()).unwrap();
+        kv.session_release(&a); // tree-only; VRAM fully held by A
+        let b = grow(&mut kv, 2); // claim sinks A to RAM, then claims both frames
+        kv.publish((21..=28).collect(), b.clone()).unwrap();
+        kv.session_release(&b); // VRAM now fully held by B, RAM fully held by A
+        assert_eq!(kv.tier_demotions, 2, "A sank VRAM->RAM");
+        assert_eq!(kv.pool.held_frames(Tier::Disk), 0);
+        let c = kv
+            .alloc_frame(&dma)
+            .expect("cascade freed a VRAM frame via RAM->disk");
+        assert_eq!(
+            kv.disk_demotions, 2,
+            "A sank RAM->disk, freeing its RAM slots"
+        );
+        assert_eq!(kv.tier_demotions, 4, "then B sank VRAM->RAM");
+        assert_eq!(kv.evictions, 0, "the cascade precedes eviction");
+        assert_eq!(kv.pool.held_frames(Tier::Disk), 2);
+        assert_eq!(kv.pool.held_frames(Tier::Ram), 2);
+        kv.session_release(&[c]); // give the corridor one frame back for the promotion
+                                  // A is a Disk chain now: still matchable, still resting.
+        let (node, reusable) = kv.best_match(&(1..=8).collect::<Vec<u32>>()).unwrap();
+        assert_eq!(reusable, 8);
+        // Promotion walks A back up: disk->RAM (cascading B to disk for the RAM slot) then
+        // RAM->VRAM. The mock's pattern check can only pass if the file round-trip was exact.
+        let back = kv.entry_chain_promoted(&dma, node, reusable);
+        assert_eq!(back.len(), 2, "the whole chain came back");
+        assert!(
+            back.iter().all(|f| matches!(f.tier(), Tier::Vram)),
+            "the attach path only ever sees VRAM frames"
+        );
+        assert_eq!(kv.disk_promotions, 2);
+        assert_eq!(kv.tier_promotions, 2, "RAM->VRAM counted separately");
+        assert_eq!(kv.pool.held_frames(Tier::Disk), 2, "B took A's disk slots");
+        assert_eq!(kv.pool.held_frames(Tier::Ram), 0);
+        drop(kv);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn disk_too_small_to_host_a_chain_falls_back_to_eviction() {
+        // One disk slot cannot hold a two-frame chain: the RAM sinker skips the entry (capacity
+        // check), the cascade yields nothing, and eviction reclaims the tier exactly like the
+        // disk-closed Phase C path.
+        let (mut kv, path) = cache_disk(2, 2, 1);
+        let dma = MockDma::default();
+        let a = grow(&mut kv, 2);
+        kv.publish((1..=8).collect(), a.clone()).unwrap();
+        kv.session_release(&a);
+        let b = grow(&mut kv, 2);
+        kv.publish((21..=28).collect(), b.clone()).unwrap();
+        kv.session_release(&b);
+        assert_eq!(kv.tier_demotions, 2, "A sank to RAM");
+        let c = kv
+            .alloc_frame(&dma)
+            .expect("eviction freed the corridor when disk could not help");
+        assert_eq!(
+            kv.disk_demotions, 0,
+            "the chain never half-sinks to an undersized disk"
+        );
+        // Interleaving sinks with eviction: evicting A frees the RAM slots that let B SINK, so
+        // only the truly unpromotable cold entry (A) is lost.
+        assert_eq!(
+            kv.evictions, 1,
+            "only the undersized-disk entry was dropped"
+        );
+        assert_eq!(kv.tier_demotions, 4, "B sank once A's RAM slots came back");
+        assert_eq!(kv.pool.held_frames(Tier::Disk), 0);
+        assert_eq!(kv.pool.held_frames(Tier::Ram), 2, "B rests in RAM");
+        kv.session_release(&[c]);
+        drop(kv);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn disk_closed_behaves_exactly_like_phase_c() {
+        // The regression guard for the default-off path: with disk_frames=0 the cascade helper
+        // short-circuits and every Phase C assertion (sink, promote, evict) still holds.
+        let mut kv = cache_ram(2, 4);
+        let dma = MockDma::default();
+        let a = grow(&mut kv, 2);
+        kv.publish((1..=8).collect(), a.clone()).unwrap();
+        kv.session_release(&a);
+        let _b = kv.alloc_frame(&dma).expect("sinking freed a frame");
+        assert_eq!(kv.disk_demotions, 0);
+        assert_eq!(kv.pool.capacity_frames(Tier::Disk), 0);
     }
 }

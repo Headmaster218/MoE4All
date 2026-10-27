@@ -41,7 +41,7 @@ use crate::{Config, GenStats, SeamModel};
 use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -54,6 +54,10 @@ const SHORT_PREFILL_TOKENS: usize = 96;
 const MTP_PLAIN_SYNC_QUANTUM: usize = 1024;
 const MTP_CONCURRENT_PROBE_CYCLES: usize = 8;
 const MTP_CONCURRENT_MIN_ACCEPT_PERCENT: usize = 80;
+
+/// Disambiguates default disk-backing filenames when one process builds several paged trees
+/// (the temp path is per-process + per-seq; an explicit `kv.disk_cache_path` bypasses this).
+static DISK_BACKING_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 /// One projector result handed to the text model. Kept backend-neutral so `infr-llama` does not
 /// depend on the optional vision crate.
@@ -1052,6 +1056,14 @@ impl ParallelSeam {
 
     fn init_session_cache(&mut self) -> Result<()> {
         let ec = self.model.engine_cfg();
+        if ec.kv.disk_cache_max.is_some() && ec.kv.paged_cache_max.is_none() {
+            // The disk tier only exists behind the paged tree's RAM pool; on the blob/RAM-blob
+            // paths it would silently do nothing, so make the half-config loud.
+            tracing::warn!(
+                "kv.disk_cache_max is set without kv.paged_cache_max: the disk frame tier only \
+                 backs the paged KV tree and stays closed (enable kv.paged_cache_max)"
+            );
+        }
         if ec.kv.paged_cache_max.is_none() && ec.kv.paged_page_tokens != crate::seam::KV_GROW_ROWS {
             // Shrink-wrapped pages only pay off inside the paged tree; on the plain blob path every
             // page is another grow step with nothing shared. Usually a forgotten `paged_cache_max`
@@ -1192,7 +1204,46 @@ impl ParallelSeam {
             // budget costs nothing until prefixes actually demote. Zero budget keeps the tier off
             // and the tree behaves exactly like Phase B (cold entries evict instead of sink).
             let ram_frames = (paged_budget / frame_bytes) as usize;
-            let mut tree = PagedKv::new(frame_bytes, page_tokens, plane_offsets, vram_frames, ram_frames);
+            // Phase D: `kv.disk_cache_max` sizes the sparse-file tier behind RAM. Resolution
+            // mirrors the RAM budget's grammar (percent = of physical RAM, an odd denominator
+            // for disk but consistent); zero/unset keeps the two-tier cascade byte-for-byte off.
+            let disk_budget = match ec.kv.disk_cache_max {
+                None => 0,
+                Some(spec) => match spec {
+                    infr_core::SizeSpec::Bytes(bytes)
+                    | infr_core::SizeSpec::FrozenAutomaticBytes(bytes) => bytes,
+                    infr_core::SizeSpec::Percent(fraction) => {
+                        match infr_core::hostmem::total_bytes() {
+                            Some(total) => (total as f64 * fraction) as u64,
+                            None => return Err(anyhow!(
+                                "kv.disk_cache_max percentages need a known physical RAM total; \
+                                     use an absolute GiB/MiB size"
+                            )),
+                        }
+                    }
+                },
+            };
+            let disk_frames = (disk_budget / frame_bytes) as usize;
+            let disk_path = (disk_frames > 0).then(|| {
+                ec.kv.disk_cache_path.clone().unwrap_or_else(|| {
+                    // Per-process (and per-engine within a process) default under the temp dir:
+                    // the backing is process-scoped bookkeeping, never restored across restarts.
+                    let seq = DISK_BACKING_SEQ.fetch_add(1, Ordering::Relaxed);
+                    std::env::temp_dir().join(format!(
+                        "infr-paged-kv-disk-{}-{seq}.bin",
+                        std::process::id()
+                    ))
+                })
+            });
+            let mut tree = PagedKv::new(
+                frame_bytes,
+                page_tokens,
+                plane_offsets,
+                vram_frames,
+                ram_frames,
+                disk_frames,
+                disk_path,
+            );
             tree.set_vram_segments(&corridors);
             tracing::info!(
                 page_tokens,
@@ -1203,8 +1254,11 @@ impl ParallelSeam {
                 ram_budget = ?spec,
                 ram_frames,
                 ram_bytes = frame_bytes * ram_frames as u64,
+                disk_budget = ?ec.kv.disk_cache_max,
+                disk_frames,
+                disk_bytes = frame_bytes * disk_frames as u64,
                 tree = %tree.stats_line(),
-                "paged KV radix prefix cache ready (frames held by the tree, zero-copy prefix reuse, multimodal sessions never enter the tree, cold chains sink to the RAM tier before eviction)"
+                "paged KV radix prefix cache ready (frames held by the tree, zero-copy prefix reuse, multimodal sessions never enter the tree, cold chains sink to the RAM tier and cascade to the disk tier before eviction)"
             );
             let tree = Arc::new(Mutex::new(tree));
             self.paged_cache = Some(Arc::clone(&tree));

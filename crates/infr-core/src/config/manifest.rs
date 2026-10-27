@@ -160,6 +160,8 @@ knobs! {
     "INFR_NO_DYNAMIC_KV"        => "kv.dynamic",             PresenceInv, Ignored, "1",    migrated;
     "INFR_KV_PAGED_PAGE_TOKENS" => "kv.paged_page_tokens",    Int,         Ignored, "64",   migrated;
     "INFR_KV_PAGED_CACHE_MAX"   => "kv.paged_cache_max",      Size,        Ignored, "16GiB", migrated;
+    "INFR_KV_DISK_CACHE_MAX"    => "kv.disk_cache_max",       Size,        Ignored, "64GiB", migrated;
+    "INFR_KV_DISK_CACHE_PATH"   => "kv.disk_cache_path",      Path,        Ignored, "D:\\infr-kv-disk.bin", migrated;
     "INFR_KV_INLINE"            => "kv.inline_decode",       Presence,    Ignored, "1",    migrated;
     "INFR_KV_COOPMAT_BDA"       => "kv.coopmat_bda",         Presence,    Ignored, "1",    migrated;
     "INFR_KV_OVERFLOW"          => "kv.overflow",            Flag,        Ignored, "1",    migrated;

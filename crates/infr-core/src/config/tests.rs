@@ -1689,6 +1689,8 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_KV_RAM_CACHE_MAX",
         "INFR_KV_PAGED_PAGE_TOKENS",
         "INFR_KV_PAGED_CACHE_MAX",
+        "INFR_KV_DISK_CACHE_MAX",
+        "INFR_KV_DISK_CACHE_PATH",
         "INFR_RESPONSE_STORE_ENTRIES",
     ];
 

@@ -238,6 +238,17 @@ cfg_struct! {
         /// physical RAM, like `device.ram_budget`. `None`/zero disables the RAM tier; only
         /// meaningful together with small [`KvCfg::paged_page_tokens`].
         paged_cache_max: Option<SizeSpec> = None,
+        /// `INFR_KV_DISK_CACHE_MAX`: byte ceiling of the disk frame tier behind the paged KV
+        /// cache's RAM tier (Phase D). When the RAM pool runs dry, the coldest all-RAM chains
+        /// sink to one sparse backing file (`slot * frame_bytes` addressing, grown lazily to the
+        /// high-water mark) instead of being evicted; a hit reads them back through RAM.
+        /// Percentages resolve against total physical RAM like the other budgets. `None`/zero
+        /// keeps the two-tier (VRAM+RAM) behavior. Only meaningful with [`KvCfg::paged_cache_max`].
+        disk_cache_max: Option<SizeSpec> = None,
+        /// `INFR_KV_DISK_CACHE_PATH`: backing file for the paged KV disk tier. `None` = a
+        /// per-process file under the system temp dir. The file is process-scoped bookkeeping:
+        /// it is NOT restored across restarts (content-addressed reuse stays out of scope).
+        disk_cache_path: Option<PathBuf> = None,
         /// `INFR_KV_INLINE`.
         inline_decode: bool = false,
         /// `INFR_KV_COOPMAT_BDA`.

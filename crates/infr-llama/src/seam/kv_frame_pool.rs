@@ -9,8 +9,9 @@
 //! attention layer x every K/V/QSA plane, laid out contiguously so a migration
 //! is a single `vkCmdCopyBuffer` region per page. Every frame is the same fixed
 //! byte size, which is the whole point: a fixed-size allocator never hunts for
-//! a hole, so VRAM external fragmentation cannot form. Frames live in two tiers
-//! behind one handle type — `FrameId` bit 63 selects VRAM vs imported host RAM.
+//! a hole, so VRAM external fragmentation cannot form. Frames live in three tiers
+//! behind one handle type — `FrameId` bit 63 selects imported host RAM, bit 62 the
+//! sparse disk backing file (Phase D); neither bit set = VRAM.
 //! Migration is a *new id*, never an in-place tier flip: the caller DMAs the
 //! bytes into a slot of the target tier, then rewrites its page->frame mapping
 //! (the radix-tree chain, Phase B) and releases the source slot. The caller
@@ -28,11 +29,19 @@ use std::collections::VecDeque;
 /// only names where the bytes physically sit for the host-side bookkeeper.
 pub(crate) const RAM_TIER_BIT: u64 = 1 << 63;
 
+/// Bit 62 of a packed [`FrameId`]: set = disk-tier frame (bytes live in the
+/// sparse paged-KV backing file at `slot * frame_bytes`). Like the RAM tier, a
+/// disk frame never enters a device page table; the bit only names the backing
+/// store for the bookkeeper. Clear together with [`RAM_TIER_BIT`] = VRAM, so
+/// Phase B/C encodings stay byte-identical and old telemetry parses unchanged.
+pub(crate) const DISK_TIER_BIT: u64 = 1 << 62;
+
 /// Physical tier a frame's bytes live in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Tier {
     Vram,
     Ram,
+    Disk,
 }
 
 /// Handle to one frame slot inside its tier's pool.
@@ -41,10 +50,10 @@ pub(crate) struct FrameId(u64);
 
 impl FrameId {
     pub(crate) fn new(tier: Tier, slot: usize) -> Self {
-        let bit = if matches!(tier, Tier::Ram) {
-            RAM_TIER_BIT
-        } else {
-            0
+        let bit = match tier {
+            Tier::Vram => 0,
+            Tier::Ram => RAM_TIER_BIT,
+            Tier::Disk => DISK_TIER_BIT,
         };
         Self(bit | slot as u64)
     }
@@ -52,13 +61,15 @@ impl FrameId {
     pub(crate) fn tier(self) -> Tier {
         if self.0 & RAM_TIER_BIT != 0 {
             Tier::Ram
+        } else if self.0 & DISK_TIER_BIT != 0 {
+            Tier::Disk
         } else {
             Tier::Vram
         }
     }
 
     pub(crate) fn slot(self) -> usize {
-        (self.0 & !RAM_TIER_BIT) as usize
+        (self.0 & !(RAM_TIER_BIT | DISK_TIER_BIT)) as usize
     }
 
     /// Wire form for later serialization (page chains in telemetry dumps).
@@ -121,12 +132,12 @@ pub(crate) struct FrameSegment {
     frames: usize,
 }
 
-/// The two-tier fixed-frame allocator shared by the paged KV cache.
+/// The three-tier fixed-frame allocator shared by the paged KV cache.
 #[derive(Clone, Debug)]
 pub(crate) struct FramePool {
     frame_bytes: u64,
     clock: u64,
-    tiers: [TierState; 2],
+    tiers: [TierState; 3],
     /// Device corridors of each tier in ascending slot order (VRAM: the unified-arena
     /// `alloc_kv_frames` corridors; RAM: empty until Phase C imports a host arena — RAM frames
     /// are never device-addressable anyway). A tier may hold several segments: the unified arena
@@ -135,17 +146,26 @@ pub(crate) struct FramePool {
     /// segments are pure addressing detail, so the radix tree, the LRU and the eviction logic
     /// never see them. A page-table entry is then `base + slot * frame_bytes + plane_offset`
     /// without the pool ever owning a buffer.
-    segments: [Vec<FrameSegment>; 2],
+    segments: [Vec<FrameSegment>; 3],
 }
 
 impl FramePool {
-    pub(crate) fn new(frame_bytes: u64, vram_frames: usize, ram_frames: usize) -> Self {
+    pub(crate) fn new(
+        frame_bytes: u64,
+        vram_frames: usize,
+        ram_frames: usize,
+        disk_frames: usize,
+    ) -> Self {
         assert!(frame_bytes > 0, "frame_bytes must be positive");
         Self {
             frame_bytes,
             clock: 0,
-            tiers: [TierState::new(vram_frames), TierState::new(ram_frames)],
-            segments: [Vec::new(), Vec::new()],
+            tiers: [
+                TierState::new(vram_frames),
+                TierState::new(ram_frames),
+                TierState::new(disk_frames),
+            ],
+            segments: [Vec::new(), Vec::new(), Vec::new()],
         }
     }
 
@@ -180,9 +200,11 @@ impl FramePool {
         let slot = id.slot();
         if segments.is_empty() {
             debug_assert!(
-                matches!(tier, Tier::Ram),
+                !matches!(tier, Tier::Vram),
                 "frame {id:?} used before its corridor was installed"
             );
+            // Host-side tiers address their own backing stores: RAM slot = offset into
+            // `ram_backing`, disk slot = offset into the sparse backing file.
             return slot as u64 * self.frame_bytes;
         }
         // Segments are sorted by `first_frame`, so the owning segment is the last one whose first
@@ -201,7 +223,11 @@ impl FramePool {
     }
 
     fn idx(tier: Tier) -> usize {
-        matches!(tier, Tier::Ram) as usize
+        match tier {
+            Tier::Vram => 0,
+            Tier::Ram => 1,
+            Tier::Disk => 2,
+        }
     }
 
     pub(crate) fn frame_bytes(&self) -> u64 {
@@ -340,7 +366,10 @@ impl FramePool {
         };
         {
             let dest = self.slot_mut(fresh);
-            debug_assert_eq!(dest.refcount, 1, "fresh slot {fresh:?} must be a fresh alloc");
+            debug_assert_eq!(
+                dest.refcount, 1,
+                "fresh slot {fresh:?} must be a fresh alloc"
+            );
             debug_assert!(!dest.active, "fresh slot {fresh:?} must not be active");
             dest.refcount = owners;
             dest.lru = lru;
@@ -398,7 +427,7 @@ mod tests {
 
     #[test]
     fn alloc_release_round_trip_reuses_free_slots() {
-        let mut p = FramePool::new(FB, 2, 1);
+        let mut p = FramePool::new(FB, 2, 1, 0);
         assert_eq!(p.free_frames(Tier::Vram), 2);
         let a = p.alloc(Tier::Vram).unwrap();
         let b = p.alloc(Tier::Vram).unwrap();
@@ -415,7 +444,7 @@ mod tests {
 
     #[test]
     fn shared_frame_frees_only_after_last_owner() {
-        let mut p = FramePool::new(FB, 4, 0);
+        let mut p = FramePool::new(FB, 4, 0, 0);
         let a = p.alloc(Tier::Vram).unwrap();
         p.pin(a);
         assert_eq!(p.refcount(a), 2);
@@ -427,7 +456,7 @@ mod tests {
 
     #[test]
     fn cold_candidates_order_lru_and_skip_active_and_freed() {
-        let mut p = FramePool::new(FB, 4, 0);
+        let mut p = FramePool::new(FB, 4, 0, 0);
         let a = p.alloc(Tier::Vram).unwrap();
         let b = p.alloc(Tier::Vram).unwrap();
         let c = p.alloc(Tier::Vram).unwrap();
@@ -450,7 +479,7 @@ mod tests {
 
     #[test]
     fn transfer_moves_owners_and_recency_to_target_tier() {
-        let mut p = FramePool::new(FB, 2, 2);
+        let mut p = FramePool::new(FB, 2, 2, 0);
         let a = p.alloc(Tier::Vram).unwrap();
         p.pin(a); // two chains share the page
         let _b = p.alloc(Tier::Vram).unwrap(); // clock 2
@@ -469,7 +498,7 @@ mod tests {
 
     #[test]
     fn transfer_without_target_capacity_leaves_source_intact() {
-        let mut p = FramePool::new(FB, 1, 0);
+        let mut p = FramePool::new(FB, 1, 0, 0);
         let a = p.alloc(Tier::Vram).unwrap();
         assert!(p.transfer(a, Tier::Ram).is_none());
         assert_eq!(p.refcount(a), 1);
@@ -479,7 +508,7 @@ mod tests {
 
     #[test]
     fn frame_addr_is_slot_arithmetic_on_the_corridor_base() {
-        let mut p = FramePool::new(FB, 4, 1);
+        let mut p = FramePool::new(FB, 4, 1, 0);
         p.set_segments(
             Tier::Vram,
             &[KvFrameCorridor {
@@ -501,7 +530,7 @@ mod tests {
     fn frame_addr_walks_several_corridors_by_global_slot() {
         // The unified arena is sharded, so a 5-frame tier arrives as 2 + 3 frames in two
         // corridors; global slot indices cross the segment boundary untouched.
-        let mut p = FramePool::new(FB, 5, 0);
+        let mut p = FramePool::new(FB, 5, 0, 0);
         p.set_segments(
             Tier::Vram,
             &[
@@ -530,7 +559,7 @@ mod tests {
 
     #[test]
     fn migrate_into_carries_owners_lru_and_frees_the_source() {
-        let mut p = FramePool::new(FB, 2, 2);
+        let mut p = FramePool::new(FB, 2, 2, 0);
         p.set_segments(
             Tier::Vram,
             &[KvFrameCorridor {
@@ -546,7 +575,11 @@ mod tests {
         assert_eq!(p.refcount(r), 2, "owners carry over");
         assert_eq!(p.held_frames(Tier::Vram), 1);
         assert_eq!(p.held_frames(Tier::Ram), 1);
-        assert_eq!(p.free_frames(Tier::Vram), 1, "source slot is back on the list");
+        assert_eq!(
+            p.free_frames(Tier::Vram),
+            1,
+            "source slot is back on the list"
+        );
         let a2 = p.alloc(Tier::Vram).unwrap();
         assert_eq!(a2, a, "the freed source slot is reusable");
         assert!(!p.is_active(r), "the migrated frame is not active");
@@ -565,7 +598,7 @@ mod tests {
 
     #[test]
     fn transfer_frees_source_slot_for_reuse() {
-        let mut p = FramePool::new(FB, 1, 1);
+        let mut p = FramePool::new(FB, 1, 1, 0);
         let a = p.alloc(Tier::Vram).unwrap();
         let r = p.transfer(a, Tier::Ram).unwrap();
         assert_eq!(p.free_frames(Tier::Vram), 1);
@@ -573,5 +606,48 @@ mod tests {
         assert_eq!(a2, a, "source slot returns to the free list");
         assert_eq!(p.held_frames(Tier::Ram), 1);
         assert!(p.unpin(r));
+    }
+
+    #[test]
+    fn disk_tier_packs_bit_62_and_keeps_vram_ram_encodings() {
+        let v = FrameId::new(Tier::Vram, 7);
+        let r = FrameId::new(Tier::Ram, 7);
+        let d = FrameId::new(Tier::Disk, 7);
+        assert_eq!(d.tier(), Tier::Disk);
+        assert_eq!(d.slot(), 7);
+        // Phase B/C wire forms untouched: VRAM has neither bit, RAM only bit 63.
+        assert_eq!(v.raw(), 7);
+        assert_eq!(r.raw(), RAM_TIER_BIT | 7);
+        assert_eq!(d.raw(), DISK_TIER_BIT | 7);
+        assert_eq!(FrameId::from_raw(d.raw()), d);
+    }
+
+    #[test]
+    fn migrate_ram_to_disk_and_back_carries_owners() {
+        // Phase D round-trip through the pool ledger alone (bytes are the tree's job):
+        // RAM -> Disk frees the RAM slot, Disk -> RAM frees the disk slot.
+        let mut p = FramePool::new(FB, 0, 1, 1);
+        let r = p.alloc(Tier::Ram).unwrap(); // clock 1: cold stamp to carry over
+        p.pin(r); // two chains share the frame
+        let d = p.alloc(Tier::Disk).unwrap();
+        p.migrate_into(r, d);
+        assert_eq!(p.refcount(d), 2);
+        assert_eq!(p.held_frames(Tier::Ram), 0);
+        assert_eq!(
+            p.free_frames(Tier::Ram),
+            1,
+            "the RAM slot is claimable again"
+        );
+        assert_eq!(
+            p.frame_addr(d),
+            d.slot() as u64 * FB,
+            "disk addr = file offset"
+        );
+        let r2 = p.alloc(Tier::Ram).unwrap();
+        p.migrate_into(d, r2);
+        assert_eq!(p.refcount(r2), 2);
+        assert_eq!(p.held_frames(Tier::Disk), 0);
+        assert_eq!(p.free_frames(Tier::Disk), 1);
+        assert!(!p.unpin(r2) && p.unpin(r2), "both owners survived");
     }
 }
