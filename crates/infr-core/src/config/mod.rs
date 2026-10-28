@@ -140,13 +140,13 @@ cfg_struct! {
         decode_prepare_ahead: bool = true,
         /// Prepare one unsubmitted Decode command prefix during the current forward.
         /// Unsupported backends and phase/resource changes retain ordinary execution.
-        decode_command_ahead: bool = false,
+        decode_command_ahead: bool = true,
         /// Submit an acknowledged prepared prefix before suffix setup to overlap CPU work.
-        /// Experimental alternative to combining the prefix with the ordinary first submit.
-        decode_command_early_submit: bool = false,
+        /// Unsupported execution retains the ordinary first submit.
+        decode_command_early_submit: bool = true,
         /// Extend acknowledged command lookahead through the first resident expert submission.
         /// Requires command-ahead and early-submit; unsupported shapes keep the shorter prefix.
-        decode_command_resident: bool = false,
+        decode_command_resident: bool = true,
     }
 }
 
@@ -452,15 +452,15 @@ cfg_struct! {
         /// GPU copy workgroups for serial and overlap paths. 0 selects 8 for both variants;
         /// explicit values clamp to 1..=8. Performance qualified on RX 7900 XTX only.
         decode_gpu_resident_copy_groups: usize = 0,
-        /// Experimental bounded compute copy concurrent with resident hit projections.
+        /// Bounded compute copy concurrent with resident hit projections.
         /// Requires serial-copy eligibility; false preserves its copy-then-full-FFN path.
-        decode_gpu_resident_copy_overlap: bool = false,
+        decode_gpu_resident_copy_overlap: bool = true,
         /// Split owned GPU role copies around miss GU only for qualified single-row
         /// Q5K Gate/Up geometry (NE2048, NFF512, top-k 8). False retains the old schedule.
         decode_gpu_resident_role_pipeline: bool = true,
         /// Submit guarded ordinary-Decode recovery while a certified CPU-only upload completes.
-        /// Experimental: the independent host timeline also retires the old notice epoch.
-        decode_gpu_resident_host_ready: bool = false,
+        /// The independent host timeline also retires the old notice epoch.
+        decode_gpu_resident_host_ready: bool = true,
         /// Reuse a bounded CPU upload helper so old SKIP/ACK observations can overlap uploads.
         /// False retains inline upload on the notice producer; ownership/protocol are unchanged.
         decode_gpu_resident_upload_worker: bool = true,

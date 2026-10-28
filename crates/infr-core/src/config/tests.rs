@@ -42,6 +42,37 @@ fn next_step_preparation_defaults_on_and_has_explicit_sync_fallback() {
 }
 
 #[test]
+fn ordinary_decode_pipeline_defaults_preserve_explicit_fallbacks() {
+    let flags: [(&str, fn(&Config) -> bool); 5] = [
+        ("device.decode_command_ahead", |cfg| {
+            cfg.device.decode_command_ahead
+        }),
+        ("device.decode_command_early_submit", |cfg| {
+            cfg.device.decode_command_early_submit
+        }),
+        ("device.decode_command_resident", |cfg| {
+            cfg.device.decode_command_resident
+        }),
+        ("kernels.vulkan.decode_gpu_resident_copy_overlap", |cfg| {
+            cfg.kernels.vulkan.decode_gpu_resident_copy_overlap
+        }),
+        ("kernels.vulkan.decode_gpu_resident_host_ready", |cfg| {
+            cfg.kernels.vulkan.decode_gpu_resident_host_ready
+        }),
+    ];
+    for (path, enabled) in flags {
+        assert!(enabled(&Config::default()), "default {path}");
+        let setting = format!("{path}=false");
+        let (section, key) = path.rsplit_once('.').unwrap();
+        let toml = format!("[{section}]\n{key}=false\n");
+        for layer in [cli_layer(&[setting.as_str()]), file_layer(&toml)] {
+            let cfg = Config::load_from_layers(&[layer]);
+            assert!(!enabled(&cfg), "explicit fallback {path}");
+        }
+    }
+}
+
+#[test]
 fn owned_role_pipeline_defaults_on_with_explicit_fallback() {
     assert!(Config::default().kernels.vulkan.decode_gpu_resident_role_pipeline);
     let path = "kernels.vulkan.decode_gpu_resident_role_pipeline";
@@ -295,7 +326,7 @@ fn gpu_resident_decode_is_shipped_by_default_and_can_be_disabled_explicitly() {
 fn speculative_paths_preserve_explicit_runtime_ab_controls() {
     let defaults = Config::default();
     assert_eq!(defaults.kernels.vulkan.decode_gpu_resident_copy, None);
-    assert!(!defaults.kernels.vulkan.decode_gpu_resident_copy_overlap);
+    assert!(defaults.kernels.vulkan.decode_gpu_resident_copy_overlap);
     assert_eq!(defaults.kernels.vulkan.decode_gpu_resident_copy_groups, 0);
     assert!(defaults.kernels.vulkan.qsa_verify_split);
     assert!(!defaults.kernels.vulkan.verify_shared_iq2_nr8);
@@ -383,7 +414,7 @@ fn gpu_copy_groups_config_accepts_auto_and_explicit_ab_values() {
             let cfg = Config::load_from_layers(&[layer]);
             assert_eq!(cfg.kernels.vulkan.decode_gpu_resident_copy_groups, value);
             assert_eq!(cfg.kernels.vulkan.decode_gpu_resident_copy, None);
-            assert!(!cfg.kernels.vulkan.decode_gpu_resident_copy_overlap);
+            assert!(cfg.kernels.vulkan.decode_gpu_resident_copy_overlap);
         }
     }
     for value in ["-1", "1.5", "invalid"] {
