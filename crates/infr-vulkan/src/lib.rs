@@ -8405,7 +8405,7 @@ impl Backend for VulkanBackend {
             ));
         }
         let frame_bytes = frame_bytes as usize;
-        let corridors = self.with_unified_exclusive(|| -> Result<Vec<KvFrameCorridor>> {
+        let corridors = self.with_unified_exclusive_result(|| -> Result<Vec<KvFrameCorridor>> {
             let pool = self
                 .unified_vram()
                 .ok_or_else(|| be("KV frame corridor lost its unified VRAM arena"))?;
