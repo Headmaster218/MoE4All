@@ -441,8 +441,8 @@ mod tokenizer_tests {
     // Optional real-vocab fixture: a metadata-only GGUF is sufficient; weights are never read.
     #[test]
     fn gemma4_real_vocab_token_ids() {
-        let Ok(path) = std::env::var("INFR_TEST_GEMMA4_GGUF") else {
-            eprintln!("skip: set INFR_TEST_GEMMA4_GGUF to the issue #126 Q6 metadata fixture");
+        let Ok(path) = std::env::var("MOE4ALL_TEST_GEMMA4_GGUF") else {
+            eprintln!("skip: set MOE4ALL_TEST_GEMMA4_GGUF to the issue #126 Q6 metadata fixture");
             return;
         };
         let g = Gguf::open(std::path::Path::new(&path)).unwrap();
