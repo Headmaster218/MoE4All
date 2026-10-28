@@ -1208,6 +1208,9 @@ fn make_dedicated_host_transfer_buffer(
     shared: &Arc<VulkanShared>,
     size: usize,
 ) -> Result<VkBuffer> {
+    // Floodgate inline check (2026-10-19 miss-storm conviction): host-visible staging is where
+    // the ramp reached GiB/s. Stop at the water line instead of queueing another allocation.
+    infr_core::memguard::check();
     let memory_type = shared
         .host_overflow_type
         .ok_or_else(|| be("background transfer has no host-visible system-memory type"))?;
@@ -1292,6 +1295,8 @@ impl VulkanBackend {
     /// exposes one. This prevents a small RDNA2 ReBAR heap from being consumed by the fallback
     /// that exists precisely because the expert arena did not fit that heap.
     fn make_host_transfer_buffer(&self, size: usize) -> Result<(VkBuffer, bool)> {
+        // Floodgate inline check — see `make_dedicated_host_transfer_buffer`.
+        infr_core::memguard::check();
         let Some(memory_type) = self.shared.host_overflow_type else {
             return self
                 .make_buf(size, MemoryLocation::CpuToGpu, "host-transfer-staging")

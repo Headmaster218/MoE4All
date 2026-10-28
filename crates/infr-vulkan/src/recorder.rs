@@ -466,7 +466,13 @@ fn native_id_sg_choice(
     if dtype == Iq2Xs {
         return (in_f == 2560 && out_f == 640).then_some(8);
     }
-    if !matches!(dtype, Q6K | Q5K | Iq3S) {
+    // Q5_1 (UD-Q4_K_XL's 43/48 expert downs, 640x2560) fits this band and the same heavy-unpack
+    // rationale, but enrollment is A/B-gated: until the model-level decode A/B lands, the default
+    // keeps every Q5_1 bank on the tree id kernel.
+    if dtype == Q5_1 && !k.id_sg_q51 {
+        return None;
+    }
+    if !matches!(dtype, Q6K | Q5K | Iq3S | Q5_1) {
         return None;
     }
     // wave32 lanes stride 32-elem sub-blocks; in_f must be a multiple of 32 (all projections are).
@@ -15626,14 +15632,16 @@ impl<'a> Recorder<'a> {
             Self::vkb(lut),
             Self::vkb(y),
         ];
-        if matches!(dtype, infr_core::DType::Iq2S | infr_core::DType::Iq3S)
-            && self.be.use_paged_grid_buffer(in_f, out_f, rows)
+        if matches!(
+            dtype,
+            infr_core::DType::Iq2S | infr_core::DType::Iq3S | infr_core::DType::Iq3Xxs
+        ) && self.be.use_paged_grid_buffer(in_f, out_f, rows)
         {
             let nr = self.be.paged_grid_buffer_nr();
-            let grid = if dtype == infr_core::DType::Iq2S {
-                &self.be.iq2s_grid
-            } else {
-                &self.be.iq3s_grid
+            let grid = match dtype {
+                infr_core::DType::Iq2S => &self.be.iq2s_grid,
+                infr_core::DType::Iq3Xxs => &self.be.iq3xxs_grid,
+                _ => &self.be.iq3s_grid,
             };
             if let Some(grid) = grid.as_ref() {
                 let build = crate::gemm::native_idm_grid_buffer_paged_spv(dtype, nr);
@@ -19993,6 +20001,13 @@ mod tests {
         }
         assert_eq!(native_id_sg_choice(D::Q6K, 512, 1024, k), None);
         assert_eq!(native_id_sg_choice(D::Q6K, 512, 8193, k), None);
+        // Q5_1 rides the same band but stays gated OFF by default (A/B switch `id_sg_q51`).
+        assert_eq!(native_id_sg_choice(D::Q5_1, 640, 2560, k), None);
+        let mut cfg_on = infr_core::config::Config::default();
+        cfg_on.kernels.vulkan.gemv.id_sg_q51 = true;
+        let kon = &cfg_on.kernels.vulkan.gemv;
+        assert_eq!(native_id_sg_choice(D::Q5_1, 640, 2560, kon), Some(2));
+        assert_eq!(native_id_sg_choice(D::Q5_1, 640, 1024, kon), None);
     }
 
     /// #4 drift guard: the ONE unified [`moe_mmq_desc`] table must produce, for every dtype in

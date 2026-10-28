@@ -2406,6 +2406,41 @@ fn main() {
                 "-DNR=8",
             ],
         ),
+        // Qwen3.8-Flash-Next GSQ mixed-quant banks: IQ3_XXS is the largest gate/up family (17 of
+        // 48) after IQ2_S. Same codebook-in-buffer treatment as the IQ2_S/IQ3_S twins above; the
+        // buffer carries G_IQ3XXS + KSIGNS (see native_decode.glsl's IQ3XXS_GRID_BUFFER block).
+        // No -DSHARED_Q8 arm: the shared-expert peephole needs a Q8_0 shared gate/up, which the
+        // GSQ mixed K-quant shared banks never are.
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3xxs_buffer_paged",
+            &["-DFMT_IQ3XXS", "-DIQ3XXS_GRID_BUFFER", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3xxs_buffer_nr2_paged",
+            &["-DFMT_IQ3XXS", "-DIQ3XXS_GRID_BUFFER", "-DPAGED", "-DNR=2"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3xxs_buffer_nr4_paged",
+            &[
+                "-DFMT_IQ3XXS",
+                "-DIQ3XXS_GRID_BUFFER",
+                "-DPAGED",
+                "-DNR=4",
+            ],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3xxs_buffer_nr8_paged",
+            &[
+                "-DFMT_IQ3XXS",
+                "-DIQ3XXS_GRID_BUFFER",
+                "-DPAGED",
+                "-DNR=8",
+            ],
+        ),
         // Qwen shared-expert decode: routed slots keep their native quant while the final slot
         // reads one fixed Q8_0 shared-expert matrix by BDA. Keep the format set aligned with
         // `paged_moe_shared_at`; Qwen3.8 uses IQ2_S/IQ4_NL/IQ3_S across its mixed-quant banks.
@@ -2726,6 +2761,56 @@ fn main() {
                 "-DPAGED",
                 "-DSHARED_Q8",
             ],
+        ),
+        // Q5_1 SG id variant (2026-10-19): the UD-Q4_K_XL Qwen3.8-Flash-Next stores 43 of 48
+        // expert DOWN projections as Q5_1 at the 640x2560 shape the Q5_K down band was cut for
+        // (24B/32-elem blocks, y = d*q5 + m). Same wave32 + subgroupAdd tier; enrollment is
+        // A/B-gated by `kernels.vulkan.gemv.id_sg_q51` (default OFF keeps the tree) until the
+        // UD-Q4_K_XL decode A/B lands. NR ∈ {2,4,8}.
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q51_sg2",
+            &["-DFMT_Q5_1", "-DNR=2"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q51_sg4",
+            &["-DFMT_Q5_1", "-DNR=4"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q51_sg8",
+            &["-DFMT_Q5_1", "-DNR=8"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q51_sg2_paged",
+            &["-DFMT_Q5_1", "-DNR=2", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q51_sg4_paged",
+            &["-DFMT_Q5_1", "-DNR=4", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q51_sg8_paged",
+            &["-DFMT_Q5_1", "-DNR=8", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q51_sg2_paged_shexp",
+            &["-DFMT_Q5_1", "-DNR=2", "-DPAGED", "-DSHARED_Q8"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q51_sg4_paged_shexp",
+            &["-DFMT_Q5_1", "-DNR=4", "-DPAGED", "-DSHARED_Q8"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q51_sg8_paged_shexp",
+            &["-DFMT_Q5_1", "-DNR=8", "-DPAGED", "-DSHARED_Q8"],
         ),
         (
             "native_gemv_id_swiglu_sg",

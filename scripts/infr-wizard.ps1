@@ -2822,6 +2822,9 @@ if ([string]::Equals($sessionCacheDir, $legacySessionCacheDir, [System.StringCom
 $sessionIdleSecs = [string](Get-SavedValue 'session_idle_secs' '120')
 $sessionCacheMax = [string](Get-SavedValue 'session_cache_max' '5GiB')
 $sessionCacheTtlHours = [string](Get-SavedValue 'session_cache_ttl_hours' '24')
+$kvRamCacheMax = [string](Get-SavedValue 'kv_ram_cache_max' '')
+$kvPagedCacheMax = [string](Get-SavedValue 'kv_paged_cache_max' '')
+$kvPagedPageTokens = [string](Get-SavedValue 'kv_paged_page_tokens' '')
 $serverAuth = [bool](Get-SavedValue 'server_auth' $false)
 $serverApiKey = ''
 $serverVision = [bool](Get-SavedValue 'server_vision' $false)
@@ -3037,6 +3040,44 @@ if (-not $reuseSavedSettings) {
             $sessionCacheMax = Read-TextValue -Label 'SSD KV 缓存总上限（绝对大小）/ Total SSD KV cache limit (absolute size)' -Default $sessionCacheMax -Required
             $sessionCacheTtlHours = Read-IntegerValue -Label '缓存保留小时数，0 为不按时间清理 / Cache TTL hours, 0 disables age expiry' -Default $sessionCacheTtlHours -Minimum 0
         }
+        $kvPagedCacheEnabled = Read-YesNo -Label '改用地基树分页 KV 前缀缓存（试验性，零拷贝帧共享，冷前缀下沉 RAM）？/ Use the paged radix-frame KV prefix cache instead (experimental, zero-copy frame sharing, cold prefixes sink to RAM)?' -Default ([bool]$kvPagedCacheMax)
+        if ($kvPagedCacheEnabled) {
+            if (-not $kvPagedCacheMax) { $kvPagedCacheMax = '16GiB' }
+            $kvPagedCacheMax = Read-TextValue -Label '分页 KV 的 RAM 帧池上限（显存走廊放不下的冷前缀整链 DMA 下沉到此，命中再换回；host 内存按实际下沉量惰性增长，不预占）/ Paged KV RAM frame-pool cap (cold chains evicted from the VRAM corridor DMA down here and promote back on a hit; the host backing grows lazily with actual demotions, no up-front reservation)' -Default $kvPagedCacheMax -Required
+            if (-not $kvPagedPageTokens) { $kvPagedPageTokens = '64' }
+            $kvPagedPageTokens = Read-TextValue -Label '每帧 token 数（2 的幂，如 64；越小共享越细、重算尾巴越短）/ Tokens per frame (power of two, e.g. 64; smaller shares finer with shorter recompute tails)' -Default $kvPagedPageTokens -Required
+            Write-Host '试验性特性：分页走廊占用全部 KV 显存（会话与缓存树共用，不再为每个会话单独保留 KV）。' -ForegroundColor Yellow
+            Write-Host 'Experimental: the frame corridor claims the FULL KV VRAM space (resident sessions and the cache tree share it; no per-slot KV reserve).' -ForegroundColor DarkGray
+            Write-Host '命中只到帧边界，尾帧重算；多模态会话不入树；与 MTP 联用未验收（draft 状态在树恢复时丢弃，且 draft KV 在走廊之外另占显存），建议关闭 MTP。' -ForegroundColor Yellow
+            Write-Host 'Hits are frame-aligned (tail frame recomputed); multimodal sessions never enter the tree; the MTP combination is unvalidated (draft state is dropped on tree restore and the draft KV costs VRAM outside the corridor) - keep MTP off.' -ForegroundColor DarkGray
+            if ($kvRamCacheMax) {
+                Write-Host '分页缓存开启，RAM 基数树缓存已关闭（两者互斥）。The RAM blob cache was turned off: it is mutually exclusive with the paged cache.' -ForegroundColor Yellow
+                $kvRamCacheMax = ''
+            }
+            if ($serverSessionCache) {
+                Write-Host '分页缓存开启，磁盘会话缓存已关闭。The disk session cache was turned off because the paged cache is on.' -ForegroundColor Yellow
+                $serverSessionCache = $false
+            }
+        } else {
+            $kvPagedCacheMax = ''
+            $kvPagedPageTokens = ''
+        }
+        $kvRamCacheEnabled = $false
+        if (-not $kvPagedCacheEnabled) {
+            $kvRamCacheEnabled = Read-YesNo -Label '改用内存基数树前缀缓存闲置 KV（不落盘，优先于 SSD）？/ Keep idle-session KV in a RAM radix-tree prefix cache instead (no disk, takes precedence over SSD)?' -Default ([bool]$kvRamCacheMax)
+        }
+        if ($kvRamCacheEnabled) {
+            if (-not $kvRamCacheMax) { $kvRamCacheMax = '16GiB' }
+            $kvRamCacheMax = Read-TextValue -Label 'RAM KV 缓存上限（绝对大小或内存百分比，如 16GiB / 25%）/ RAM KV cache limit (absolute size or percent, e.g. 16GiB / 25%)' -Default $kvRamCacheMax -Required
+            Write-Host '试验性特性：此缓存独立分配，不并入进程总 RAM 预算，会从专家 Host Store 的可用内存中挤占；自动策略或核显设备可能触发换页或内存分配失败，建议使用物理内存充裕的设备。' -ForegroundColor Yellow
+            Write-Host 'Experimental: this cache allocates OUTSIDE the process-wide RAM budget and competes with the expert host store; the auto strategy or iGPU devices may page or fail to allocate. Recommended on RAM-rich machines only.' -ForegroundColor DarkGray
+            if ($serverSessionCache) {
+                Write-Host 'RAM 缓存开启，磁盘会话缓存已关闭。The disk session cache was turned off because the RAM cache is on.' -ForegroundColor Yellow
+                $serverSessionCache = $false
+            }
+        } else {
+            $kvRamCacheMax = ''
+        }
 
         Write-Host "`nAPI 服务器 / API server" -ForegroundColor Cyan
         $serverAddr = Read-ListenAddress -Label '监听地址（IP:端口）/ Listen address (IP:port)' -Default $serverAddr
@@ -3248,6 +3289,13 @@ if ($launchMode -eq 'server') {
     }
     [void]$nativeArgs.Add('--addr'); [void]$nativeArgs.Add($serverAddr)
     [void]$nativeArgs.Add('--parallel'); [void]$nativeArgs.Add($serverParallel)
+    if ($kvPagedCacheMax) {
+        Add-SetArgument $nativeArgs 'kv.paged_cache_max' $kvPagedCacheMax
+        Add-SetArgument $nativeArgs 'kv.paged_page_tokens' $kvPagedPageTokens
+    }
+    if ($kvRamCacheMax) {
+        Add-SetArgument $nativeArgs 'kv.ram_cache_max' $kvRamCacheMax
+    }
     if ($serverSessionCache) {
         Add-SetArgument $nativeArgs 'kv.session_cache_dir' $sessionCacheDir
         Add-SetArgument $nativeArgs 'kv.session_idle_secs' $sessionIdleSecs
@@ -3304,7 +3352,8 @@ $state = [ordered]@{
     server_addr = $serverAddr; server_parallel = $serverParallel; server_auth = $serverAuth
     server_session_cache = $serverSessionCache; session_cache_dir = $sessionCacheDir
     session_idle_secs = $sessionIdleSecs; session_cache_max = $sessionCacheMax
-    session_cache_ttl_hours = $sessionCacheTtlHours
+    session_cache_ttl_hours = $sessionCacheTtlHours; kv_ram_cache_max = $kvRamCacheMax
+    kv_paged_cache_max = $kvPagedCacheMax; kv_paged_page_tokens = $kvPagedPageTokens
     server_vision = $serverVision; vision_projector = $visionProjectorPath
     server_embedding = $serverEmbedding; embedding_model = $embeddingModelPath
     embedding_idle_timeout = $embeddingIdleTimeout

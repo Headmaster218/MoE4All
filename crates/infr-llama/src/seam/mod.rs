@@ -21,12 +21,17 @@ const MIB_F64: f64 = (1u64 << 20) as f64;
 const GIB_F64: f64 = (1u64 << 30) as f64;
 
 pub mod model;
+// Pure two-tier frame bookkeeping for the paged KV cache; the Vulkan wiring
+// lands in Phase B/C, so nothing consumes it yet.
+#[allow(dead_code)]
+pub(crate) mod kv_frame_pool;
 mod ple;
 mod runner;
 mod sc;
 mod segmented_kv;
 #[path = "../parallel_token_delivery.rs"]
 pub(crate) mod token_delivery;
+pub(crate) use segmented_kv::SegmentedKvLayout;
 pub(crate) use segmented_kv::KV_GROW_ROWS;
 mod session_state;
 mod weights;
@@ -2508,8 +2513,14 @@ fn kv_state_reserve_bytes(
     if !segmented_kv_wanted(cfg, ec, ring, k_fmt, v_fmt) {
         return logical;
     }
-    let layout = segmented_kv::SegmentedKvLayout::for_qwen(cfg, want_ctx.max(1), k_fmt, v_fmt)
-        .expect("segmented Qwen state has a layout");
+    let layout = segmented_kv::SegmentedKvLayout::for_qwen(
+        cfg,
+        want_ctx.max(1),
+        k_fmt,
+        v_fmt,
+        ec.kv.paged_page_tokens,
+    )
+    .expect("segmented Qwen state has a layout");
     logical
         .saturating_sub(layout.logical_bytes())
         .saturating_add(layout.committed_bytes(want_ctx))
@@ -3893,8 +3904,14 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let k_fmt = vulkan_kv_fmt_for_budget(cfg, ec, ec.kv.type_k);
         let v_fmt = vulkan_kv_fmt_for_budget(cfg, ec, ec.kv.type_v);
         let dynamic_layout = segmented_kv_wanted(cfg, ec, ring, k_fmt, v_fmt).then(|| {
-            segmented_kv::SegmentedKvLayout::for_qwen(cfg, want_ctx, k_fmt, v_fmt)
-                .expect("Qwen hybrid models have segmented KV geometry")
+            segmented_kv::SegmentedKvLayout::for_qwen(
+                cfg,
+                want_ctx,
+                k_fmt,
+                v_fmt,
+                ec.kv.paged_page_tokens,
+            )
+            .expect("Qwen hybrid models have segmented KV geometry")
         });
         let dynamic_kv_reserve_per_slot = dynamic_layout
             .as_ref()

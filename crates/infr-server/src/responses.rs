@@ -1,12 +1,16 @@
-//! Stateless OpenAI Responses compatibility on top of the server's chat generation path.
+//! OpenAI Responses compatibility on top of the server's chat generation path.
 //! Keep wire conversion here so slot admission, cancellation, progress and usage have one owner.
+//! The request is stateless by default; `serve.response_store_entries` additionally enables an
+//! LRU of response histories so `previous_response_id`/`conversation` chains replay server-side.
+//! A chained request rebuilds the previous turn's exact token prefix, which the paged KV radix
+//! tree hits via `best_match` — the integration point is the rebuilt history, not any KV handle.
 
 use super::*;
 use axum::body::{to_bytes, Body, Bytes};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use futures_util::{stream, Stream, StreamExt};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 #[derive(Debug, Deserialize)]
 pub(super) struct ResponsesRequest {
@@ -68,6 +72,136 @@ struct Meta {
     text: Value,
     parallel_tool_calls: bool,
     user: Option<String>,
+    previous_response_id: Option<String>,
+    store: bool,
+}
+
+/// A converted request: the chat payload to dispatch, the wire metadata for the response
+/// envelope, and what the handler needs to persist after a successful generation.
+struct Prepared {
+    chat: ChatRequest,
+    meta: Meta,
+    /// Input-side message history (this turn's assistant output is appended only on save).
+    history: Arc<Vec<ChatMessageDto>>,
+    conversation: Option<String>,
+    store: bool,
+}
+
+/// Server-side `/v1/responses` state: response id -> replayable message history, plus
+/// `conversation` name -> latest response id cursors. Message DTOs only — KV reuse is
+/// implicit (chained requests rebuild the same token prefix and the paged radix tree's
+/// `best_match` hits it), so this store never pins or references KV pages.
+pub(super) struct ResponseStore {
+    capacity: usize,
+    entries: HashMap<String, StoredResponse>,
+    conversations: HashMap<String, String>,
+    /// Monotonic tick for LRU recency; no wall clock needed.
+    clock: u64,
+}
+
+struct StoredResponse {
+    /// Full history INCLUDING this turn's assistant output — exactly what a stateless client
+    /// would have sent back on the next request.
+    history: Arc<Vec<ChatMessageDto>>,
+    last_used: u64,
+}
+
+impl ResponseStore {
+    pub(super) fn new(capacity: u32) -> Self {
+        Self {
+            capacity: capacity as usize,
+            entries: HashMap::new(),
+            conversations: HashMap::new(),
+            clock: 0,
+        }
+    }
+
+    /// Resolve the replay base for a chained request. `previous_response_id` wins over the
+    /// `conversation` cursor. An unknown id is a hard 400 — NEVER a silent fresh context:
+    /// a client that believes it is continuing a conversation must learn that it is not.
+    fn chain(
+        &mut self,
+        previous: Option<&str>,
+        conversation: Option<&str>,
+    ) -> Result<Option<Arc<Vec<ChatMessageDto>>>, ParamError> {
+        self.clock += 1;
+        if let Some(id) = previous {
+            let entry = self.entries.get_mut(id).ok_or_else(|| {
+                invalid(
+                    "previous_response_id",
+                    format!("no stored response {id:?} (state is LRU-bounded and lost on restart)"),
+                )
+            })?;
+            entry.last_used = self.clock;
+            return Ok(Some(entry.history.clone()));
+        }
+        if let Some(name) = conversation {
+            if let Some(id) = self.conversations.get(name) {
+                // The cursor may point at an evicted entry: fail loudly (see `put`'s note on
+                // why cursors survive eviction) instead of restarting the conversation blank.
+                let entry = self.entries.get_mut(id).ok_or_else(|| {
+                    invalid(
+                        "conversation",
+                        format!("conversation {name:?} points at evicted response {id:?}"),
+                    )
+                })?;
+                entry.last_used = self.clock;
+                return Ok(Some(entry.history.clone()));
+            }
+            return Ok(None); // unknown name = start a new conversation, per OpenAI semantics
+        }
+        Ok(None)
+    }
+
+    fn put(&mut self, id: &str, history: Arc<Vec<ChatMessageDto>>, conversation: Option<&str>) {
+        self.clock += 1;
+        self.entries.insert(
+            id.to_owned(),
+            StoredResponse {
+                history,
+                last_used: self.clock,
+            },
+        );
+        if let Some(name) = conversation {
+            self.conversations.insert(name.to_owned(), id.to_owned());
+        }
+        // Evict least-recently-used entries, but NEVER rewrite or drop conversation cursors:
+        // a cursor left pointing at an evicted id makes the next chained request fail
+        // explicitly (see `chain`) rather than silently lose the conversation's history.
+        while self.entries.len() > self.capacity {
+            let Some(victim) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&victim);
+        }
+    }
+}
+
+/// Extract an optional non-empty string from a `previous_response_id` / `conversation` field.
+/// `conversation` also accepts OpenAI's `{"id": ...}` object form.
+fn chain_string(
+    value: &Option<Value>,
+    param: &'static str,
+) -> Result<Option<String>, ParamError> {
+    match value.as_ref() {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) if !text.is_empty() => Ok(Some(text.clone())),
+        Some(Value::Object(object)) if param == "conversation" => {
+            match object.get("id").and_then(Value::as_str) {
+                Some(id) if !id.is_empty() => Ok(Some(id.to_owned())),
+                _ => Err(invalid(
+                    "conversation",
+                    "conversation object requires a non-empty id string",
+                )),
+            }
+        }
+        _ => Err(invalid(param, format!("{param} must be a non-empty string"))),
+    }
 }
 
 fn invalid(param: &'static str, message: impl Into<String>) -> ParamError {
@@ -351,28 +485,18 @@ fn convert_tool_choice(value: Option<&Value>) -> Result<Option<Value>, ParamErro
 }
 
 impl ResponsesRequest {
-    fn into_chat(self) -> Result<(ChatRequest, Meta), ParamError> {
+    /// Convert to the chat path. `base` is the stored history of a chained request (already
+    /// resolved by [`ResponseStore::chain`]); `previous`/`conversation`/`store` are the
+    /// feature-gated wire fields the handler validated, kept for the response envelope.
+    fn into_chat(
+        self,
+        base: Option<Arc<Vec<ChatMessageDto>>>,
+        previous: Option<String>,
+        conversation: Option<String>,
+        store: bool,
+    ) -> Result<Prepared, ParamError> {
         if self.model.is_empty() {
             return Err(invalid("model", "model must not be empty"));
-        }
-        if self
-            .previous_response_id
-            .as_ref()
-            .is_some_and(|v| !v.is_null())
-        {
-            return Err(invalid(
-                "previous_response_id",
-                "server-side response state is not supported",
-            ));
-        }
-        if self.conversation.as_ref().is_some_and(|v| !v.is_null()) {
-            return Err(invalid(
-                "conversation",
-                "server-side conversations are not supported",
-            ));
-        }
-        if self.store == Some(true) {
-            return Err(invalid("store", "store=true is not supported"));
         }
         if self.truncation.as_deref().is_some_and(|s| s != "disabled") {
             return Err(invalid(
@@ -493,33 +617,65 @@ impl ResponsesRequest {
         if messages.is_empty() {
             return Err(invalid("input", "input must contain at least one item"));
         }
-        // Many GGUF templates accept only one initial system message. Preserve the
-        // instruction prefix order, but do not silently move later instructions
-        // across conversation turns.
-        let mut system_parts = Vec::new();
-        if let Some(instructions) = self.instructions.as_ref().filter(|s| !s.is_empty()) {
-            system_parts.push(instructions.clone());
-        }
-        let prefix_len = messages
-            .iter()
-            .take_while(|m| matches!(m.role.as_str(), "system" | "developer"))
-            .count();
-        for m in &messages[..prefix_len] {
-            system_parts.push(instruction_text(&m.content)?);
-        }
-        if messages[prefix_len..]
-            .iter()
-            .any(|m| matches!(m.role.as_str(), "system" | "developer"))
-        {
-            return Err(invalid(
-                "input",
-                "system and developer messages must precede conversation turns",
-            ));
-        }
-        messages.drain(..prefix_len);
-        if !system_parts.is_empty() {
-            messages.insert(0, message("system", Some(json!(system_parts.join("\n\n")))));
-        }
+        let messages = match base {
+            Some(base) => {
+                // Chained replay: the stored history already carries the system prefix and
+                // the prior turns. Re-sending instructions or a system/developer message
+                // would change the tokenized prompt prefix and defeat the paged-KV radix
+                // hit the chain exists to get — reject instead of silently diverging.
+                if self.instructions.as_ref().is_some_and(|s| !s.is_empty()) {
+                    return Err(invalid(
+                        "instructions",
+                        "instructions cannot be re-sent on a chained request; keep them on the first turn",
+                    ));
+                }
+                if messages
+                    .iter()
+                    .any(|m| matches!(m.role.as_str(), "system" | "developer"))
+                {
+                    return Err(invalid(
+                        "input",
+                        "system and developer messages cannot be re-sent on a chained request",
+                    ));
+                }
+                let mut chained = (*base).clone();
+                chained.extend(messages);
+                chained
+            }
+            None => {
+                // Many GGUF templates accept only one initial system message. Preserve the
+                // instruction prefix order, but do not silently move later instructions
+                // across conversation turns.
+                let mut system_parts = Vec::new();
+                if let Some(instructions) = self.instructions.as_ref().filter(|s| !s.is_empty()) {
+                    system_parts.push(instructions.clone());
+                }
+                let prefix_len = messages
+                    .iter()
+                    .take_while(|m| matches!(m.role.as_str(), "system" | "developer"))
+                    .count();
+                for m in &messages[..prefix_len] {
+                    system_parts.push(instruction_text(&m.content)?);
+                }
+                if messages[prefix_len..]
+                    .iter()
+                    .any(|m| matches!(m.role.as_str(), "system" | "developer"))
+                {
+                    return Err(invalid(
+                        "input",
+                        "system and developer messages must precede conversation turns",
+                    ));
+                }
+                messages.drain(..prefix_len);
+                if !system_parts.is_empty() {
+                    messages.insert(0, message("system", Some(json!(system_parts.join("\n\n")))));
+                }
+                messages
+            }
+        };
+        // The store replays this exact vector; the chat path owns a clone. One Vec-of-DTO
+        // clone per request is nothing next to a generation.
+        let history = Arc::new(messages.clone());
         let chat = ChatRequest {
             model: self.model,
             messages,
@@ -553,8 +709,16 @@ impl ResponsesRequest {
             text,
             parallel_tool_calls: self.parallel_tool_calls.unwrap_or(true),
             user: self.user,
+            previous_response_id: previous,
+            store,
         };
-        Ok((chat, meta))
+        Ok(Prepared {
+            chat,
+            meta,
+            history,
+            conversation,
+            store,
+        })
     }
 }
 
@@ -570,20 +734,100 @@ pub(super) async fn handler(
         Ok(value) => value,
         Err(e) => return json_body_error(e),
     };
-    let (chat, meta) = match request.into_chat() {
+    let enabled = state.cfg.serve.response_store_entries > 0;
+    let previous = match chain_string(&request.previous_response_id, "previous_response_id") {
         Ok(value) => value,
         Err(e) => return param_error(Some(e.param), e.message),
     };
+    let conversation = match chain_string(&request.conversation, "conversation") {
+        Ok(value) => value,
+        Err(e) => return param_error(Some(e.param), e.message),
+    };
+    // OpenAI defaults `store` to true; a stateless server cannot honour replay, so the default
+    // follows the feature: ON when the store is enabled, OFF (the old wire shape) when not.
+    let store = request.store.unwrap_or(enabled);
+    if !enabled && (previous.is_some() || conversation.is_some() || request.store == Some(true)) {
+        return param_error(
+            Some("previous_response_id"),
+            "server-side response state is not supported; enable serve.response_store_entries"
+                .to_string(),
+        );
+    }
+    let base = if enabled {
+        match state
+            .response_store
+            .lock()
+            .unwrap()
+            .chain(previous.as_deref(), conversation.as_deref())
+        {
+            Ok(value) => value,
+            Err(e) => return param_error(Some(e.param), e.message),
+        }
+    } else {
+        None
+    };
+    let prepared = match request.into_chat(base, previous, conversation, store) {
+        Ok(value) => value,
+        Err(e) => return param_error(Some(e.param), e.message),
+    };
+    let Prepared {
+        chat,
+        meta,
+        history,
+        conversation,
+        store,
+    } = prepared;
     let streaming = chat.stream;
+    let save = (enabled && store).then(|| SaveCtx {
+        store: state.response_store.clone(),
+        history,
+        conversation,
+    });
     let response = dispatch_chat(state, chat, "/v1/responses").await;
     if response.status() != StatusCode::OK {
         return response;
     }
     if streaming {
-        stream_response(response, meta)
+        stream_response(response, meta, save)
     } else {
-        non_stream_response(response, meta).await
+        non_stream_response(response, meta, save).await
     }
+}
+
+/// What a successful generation must persist: the shared store, the input-side history, and
+/// the conversation cursor to advance.
+struct SaveCtx {
+    store: Arc<Mutex<ResponseStore>>,
+    history: Arc<Vec<ChatMessageDto>>,
+    conversation: Option<String>,
+}
+
+/// Append this turn's assistant output to the replay history. The DTO mirrors what a
+/// stateless client would send back next turn: content string (omitted when the turn is
+/// tool-calls only), reasoning summary, and the tool_calls array.
+fn output_history(
+    history: &Arc<Vec<ChatMessageDto>>,
+    reasoning: &str,
+    content: &str,
+    calls: &[Value],
+) -> Arc<Vec<ChatMessageDto>> {
+    let mut out = (**history).clone();
+    let mut assistant = message(
+        "assistant",
+        if content.is_empty() && !calls.is_empty() {
+            None
+        } else {
+            Some(Value::String(content.to_owned()))
+        },
+    );
+    if !reasoning.is_empty() {
+        assistant.reasoning_content = Some(reasoning.to_owned());
+    }
+    if !calls.is_empty() {
+        assistant.tool_calls = Some(Value::Array(calls.to_vec()));
+    }
+    out.push(assistant);
+    Arc::new(out)
 }
 
 fn response_id(chat_id: &str) -> String {
@@ -599,9 +843,10 @@ fn response_base(id: &str, created: i64, model: &str, meta: &Meta) -> Value {
         "status":"in_progress","background":false,
         "error":null,"incomplete_details":null,"instructions":meta.instructions,
         "max_output_tokens":meta.max_output_tokens,"model":model,"output":[],
-        "parallel_tool_calls":meta.parallel_tool_calls,"previous_response_id":null,
+        "parallel_tool_calls":meta.parallel_tool_calls,
+        "previous_response_id":meta.previous_response_id,
         "prompt_cache_key":meta.prompt_cache_key,"prompt_cache_retention":null,
-        "reasoning":meta.reasoning,"service_tier":"default","store":false,
+        "reasoning":meta.reasoning,"service_tier":"default","store":meta.store,
         "temperature":meta.temperature,
         "text":meta.text,"tool_choice":meta.tool_choice,"tools":meta.tools,
         "top_p":meta.top_p,"truncation":"disabled","usage":null,"user":meta.user,
@@ -682,7 +927,7 @@ fn completed_response(chat: &Value, meta: &Meta) -> Value {
     response
 }
 
-async fn non_stream_response(response: Response, meta: Meta) -> Response {
+async fn non_stream_response(response: Response, meta: Meta, save: Option<SaveCtx>) -> Response {
     let bytes = match to_bytes(response.into_body(), 16 * 1024 * 1024).await {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -696,6 +941,26 @@ async fn non_stream_response(response: Response, meta: Meta) -> Response {
         Ok(chat) => chat,
         Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
+    if let Some(save) = &save {
+        let choice = &chat["choices"][0];
+        // Persist completed AND incomplete (length-truncated) turns — an incomplete response is
+        // still replayable history; a missing terminal frame is not.
+        if !choice["finish_reason"].is_null() {
+            let message = &choice["message"];
+            let calls = message["tool_calls"].as_array().cloned().unwrap_or_default();
+            let history = output_history(
+                &save.history,
+                message["reasoning_content"].as_str().unwrap_or(""),
+                message["content"].as_str().unwrap_or(""),
+                &calls,
+            );
+            let id = response_id(chat["id"].as_str().unwrap_or("unknown"));
+            save.store
+                .lock()
+                .unwrap()
+                .put(&id, history, save.conversation.as_deref());
+        }
+    }
     Json(completed_response(&chat, &meta)).into_response()
 }
 
@@ -715,6 +980,7 @@ struct StreamState {
     content_index: Option<usize>,
     next_index: usize,
     terminal: bool,
+    save: Option<SaveCtx>,
 }
 
 impl StreamState {
@@ -909,6 +1175,16 @@ impl StreamState {
                 },
                 json!({"response":response}),
             );
+            // Same save rule as the non-streaming path: completed AND incomplete persist;
+            // `fail()` (below the terminal boundary) never does.
+            if let Some(save) = &self.save {
+                let history =
+                    output_history(&save.history, &self.reasoning, &self.content, &self.calls);
+                save.store
+                    .lock()
+                    .unwrap()
+                    .put(&id, history, save.conversation.as_deref());
+            }
             self.terminal = true;
         }
     }
@@ -933,7 +1209,7 @@ impl StreamState {
     }
 }
 
-fn stream_response(response: Response, meta: Meta) -> Response {
+fn stream_response(response: Response, meta: Meta, save: Option<SaveCtx>) -> Response {
     let source = Box::pin(response.into_body().into_data_stream());
     let state = StreamState {
         source,
@@ -951,6 +1227,7 @@ fn stream_response(response: Response, meta: Meta) -> Response {
         content_index: None,
         next_index: 0,
         terminal: false,
+        save,
     };
     let translated = stream::unfold(state, |mut state| async move {
         loop {
@@ -1110,7 +1387,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let (chat, _) = request.into_chat().unwrap();
+        let chat = request.into_chat(None, None, None, false).unwrap().chat;
         assert_eq!(chat.messages.len(), 2);
         assert_eq!(chat.messages[0].role, "system");
         assert_eq!(
@@ -1143,7 +1420,10 @@ mod tests {
             ]
         }))
         .unwrap();
-        assert_eq!(request.into_chat().err().unwrap().param, "input");
+        assert_eq!(
+            request.into_chat(None, None, None, false).err().unwrap().param,
+            "input"
+        );
     }
 
     #[test]
@@ -1153,7 +1433,7 @@ mod tests {
             "max_output_tokens":100
         }))
         .unwrap();
-        let (chat, meta) = request.into_chat().unwrap();
+        let Prepared { chat, meta, .. } = request.into_chat(None, None, None, false).unwrap();
         assert_eq!(
             chat.reasoning_effort,
             Some(infr_core::config::ReasoningEffort::Low)
@@ -1168,12 +1448,15 @@ mod tests {
             "model":"fixture","input":"hi","user":"本地用户"
         }))
         .unwrap();
-        assert!(request.into_chat().is_ok());
+        assert!(request.into_chat(None, None, None, false).is_ok());
         let request: ResponsesRequest = serde_json::from_value(json!({
             "model":"fixture","input":"hi","user":"x".repeat(65)
         }))
         .unwrap();
-        assert_eq!(request.into_chat().err().unwrap().param, "user");
+        assert_eq!(
+            request.into_chat(None, None, None, false).err().unwrap().param,
+            "user"
+        );
     }
 
     #[tokio::test]
@@ -1233,7 +1516,7 @@ mod tests {
             ],
             "tools":[{"type":"function","name":"shell","parameters":{"type":"object"}}]
         })).unwrap();
-        let (chat, meta) = request.into_chat().unwrap();
+        let Prepared { chat, meta, .. } = request.into_chat(None, None, None, false).unwrap();
         assert_eq!(
             chat.reasoning_effort,
             Some(infr_core::config::ReasoningEffort::High)
@@ -1339,12 +1622,12 @@ mod tests {
     async fn stream_failure_uses_typed_terminal_event_and_uncached_headers() {
         let request: ResponsesRequest =
             serde_json::from_value(json!({"model":"fixture","input":"hi"})).unwrap();
-        let (_, meta) = request.into_chat().unwrap();
+        let meta = request.into_chat(None, None, None, false).unwrap().meta;
         let upstream = Response::new(Body::from(concat!(
             "data: {\"id\":\"chatcmpl-test\",\"created\":1,\"model\":\"fixture\",\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\",\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
             "data: {\"error\":{\"code\":\"server_error\",\"message\":\"boom\"}}\n\n"
         )));
-        let response = stream_response(upstream, meta);
+        let response = stream_response(upstream, meta, None);
         assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
         assert_eq!(response.headers()["x-accel-buffering"], "no");
         let wire = String::from_utf8(
@@ -1388,11 +1671,11 @@ mod tests {
     async fn stream_error_before_creation_has_flat_error_shape() {
         let request: ResponsesRequest =
             serde_json::from_value(json!({"model":"fixture","input":"hi"})).unwrap();
-        let (_, meta) = request.into_chat().unwrap();
+        let meta = request.into_chat(None, None, None, false).unwrap().meta;
         let upstream = Response::new(Body::from(
             "data: {\"error\":{\"code\":\"server_error\",\"message\":\"boom\"}}\n\n",
         ));
-        let response = stream_response(upstream, meta);
+        let response = stream_response(upstream, meta, None);
         let wire = String::from_utf8(
             response
                 .into_body()
@@ -1418,14 +1701,259 @@ mod tests {
     async fn oversized_non_streaming_translation_is_a_clear_gateway_error() {
         let request: ResponsesRequest =
             serde_json::from_value(json!({"model":"fixture","input":"hi"})).unwrap();
-        let (_, meta) = request.into_chat().unwrap();
+        let meta = request.into_chat(None, None, None, false).unwrap().meta;
         let upstream = Response::new(Body::from(vec![b' '; 16 * 1024 * 1024 + 1]));
-        let response = non_stream_response(upstream, meta).await;
+        let response = non_stream_response(upstream, meta, None).await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let body = json_body(response).await;
         assert!(body["error"]["message"]
             .as_str()
             .unwrap()
             .contains("16 MiB"));
+    }
+
+    // -- response store: chained replay ----------------------------------------------------
+
+    /// Records the message count each generation actually receives — the replay proof.
+    struct Recorder {
+        lengths: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl ChatGenerator for Recorder {
+        fn chat(
+            &self,
+            messages: &[ChatMessage],
+            _tools: Option<&Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            _cancel: &Arc<AtomicBool>,
+            _progress: Option<infr_core::GenerationProgressCallback>,
+            on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            self.lengths.lock().unwrap().push(messages.len());
+            on_delta(Delta::Content("ok".into()));
+            Ok(ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: 10,
+                cached_prompt_tokens: 0,
+                completion_tokens: 1,
+            })
+        }
+    }
+
+    fn recorder() -> (Arc<Recorder>, Arc<Mutex<Vec<usize>>>) {
+        let lengths = Arc::new(Mutex::new(Vec::new()));
+        (
+            Arc::new(Recorder {
+                lengths: lengths.clone(),
+            }),
+            lengths,
+        )
+    }
+
+    fn router_entries(generator: Arc<dyn ChatGenerator>, entries: u32) -> Router {
+        let mut cfg = Config::default();
+        cfg.serve.response_store_entries = entries;
+        build_router(AppState::new(generator, "fixture", 1, Arc::new(cfg)))
+    }
+
+    async fn post_to(router: &Router, input: Value) -> Response {
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(input.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn first_id(body: &Value) -> String {
+        body["id"].as_str().unwrap().to_owned()
+    }
+
+    #[tokio::test]
+    async fn chained_response_replays_history_and_grows_the_prefix() {
+        let (rec, lengths) = recorder();
+        let router = router_entries(rec, 8);
+        let first = json_body(post_to(&router, json!({"model":"fixture","input":"first"})).await).await;
+        assert_eq!(first["status"], "completed");
+        assert_eq!(first["store"], true);
+        let second = json_body(
+            post_to(
+                &router,
+                json!({"model":"fixture","input":"second","previous_response_id":first_id(&first)}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(second["previous_response_id"], first["id"]);
+        // R1 sent [user]; R2 replays [user, assistant] and appends [user] — the rebuilt prompt
+        // carries R1's exact token prefix, which is what the paged radix tree hits.
+        assert_eq!(*lengths.lock().unwrap(), vec![1, 3]);
+    }
+
+    #[tokio::test]
+    async fn unknown_previous_response_id_is_a_loud_400() {
+        let (rec, _) = recorder();
+        let router = router_entries(rec, 8);
+        let response = post_to(
+            &router,
+            json!({"model":"fixture","input":"hi","previous_response_id":"resp_missing"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["param"], "previous_response_id");
+    }
+
+    #[tokio::test]
+    async fn conversation_cursor_chains_without_an_explicit_id() {
+        let (rec, lengths) = recorder();
+        let router = router_entries(rec, 8);
+        post_to(
+            &router,
+            json!({"model":"fixture","input":"first","conversation":"chat-1"}),
+        )
+        .await;
+        let body = json_body(
+            post_to(
+                &router,
+                json!({"model":"fixture","input":"second","conversation":"chat-1"}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(body["status"], "completed");
+        assert_eq!(*lengths.lock().unwrap(), vec![1, 3]);
+        // The `{"id": ...}` object form resolves the same cursor.
+        json_body(
+            post_to(
+                &router,
+                json!({"model":"fixture","input":"third","conversation":{"id":"chat-1"}}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(*lengths.lock().unwrap(), vec![1, 3, 5]);
+    }
+
+    #[tokio::test]
+    async fn store_false_response_cannot_be_replayed() {
+        let (rec, _) = recorder();
+        let router = router_entries(rec, 8);
+        let first = json_body(
+            post_to(
+                &router,
+                json!({"model":"fixture","input":"hi","store":false}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(first["store"], false);
+        let response = post_to(
+            &router,
+            json!({"model":"fixture","input":"again","previous_response_id":first_id(&first)}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn lru_eviction_breaks_old_chains_explicitly() {
+        let (rec, _) = recorder();
+        let router = router_entries(rec, 1);
+        let first = json_body(
+            post_to(
+                &router,
+                json!({"model":"fixture","input":"one","conversation":"c"}),
+            )
+            .await,
+        )
+        .await;
+        let first_id = first_id(&first);
+        let second = json_body(
+            post_to(
+                &router,
+                json!({"model":"fixture","input":"two","previous_response_id":first_id.clone()}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(second["status"], "completed");
+        // capacity 1: storing the second response evicted the first.
+        let response = post_to(
+            &router,
+            json!({"model":"fixture","input":"three","previous_response_id":first_id}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // The cursor still points at the evicted id — fail, do not silently restart.
+        let response = post_to(
+            &router,
+            json!({"model":"fixture","input":"three","conversation":"c"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["param"], "conversation");
+    }
+
+    #[tokio::test]
+    async fn streaming_chain_stores_history() {
+        let (rec, lengths) = recorder();
+        let router = router_entries(rec, 8);
+        let response = post_to(
+            &router,
+            json!({"model":"fixture","input":"first","stream":true}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let wire =
+            String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec())
+                .unwrap();
+        let id = wire
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .and_then(|data| serde_json::from_str::<Value>(data).ok())
+            .and_then(|event| event["response"]["id"].as_str().map(str::to_owned))
+            .unwrap();
+        let body = json_body(
+            post_to(
+                &router,
+                json!({"model":"fixture","input":"second","previous_response_id":id}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(body["status"], "completed");
+        assert_eq!(*lengths.lock().unwrap(), vec![1, 3]);
+    }
+
+    #[tokio::test]
+    async fn instructions_cannot_be_resent_on_a_chain() {
+        let (rec, _) = recorder();
+        let router = router_entries(rec, 8);
+        let first = json_body(
+            post_to(
+                &router,
+                json!({"model":"fixture","input":"one","instructions":"be brief"}),
+            )
+            .await,
+        )
+        .await;
+        let response = post_to(
+            &router,
+            json!({"model":"fixture","input":"two","previous_response_id":first_id(&first),
+                   "instructions":"be brief"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["param"], "instructions");
     }
 }
