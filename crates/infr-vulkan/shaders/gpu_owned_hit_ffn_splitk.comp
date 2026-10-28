@@ -1,0 +1,261 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+// Experimental split-NFF H FFN. Runtime callers qualify shape/resources; no owner mutation.
+// Compute: one WG per (row, physical slot, NFF chunk); each UG output is computed
+// ONCE, not once per Down tile. Down uses clustered adjacent K-block loads.
+// SPLITK_REDUCE: one invocation/output sums chunks in increasing order, no atomics.
+// Host pins Fixed32/full subgroups. Bindings are X/Ids/Tape/Partial for compute,
+// and Partial/Ids/Tape(unused)/Y for reduce. Partial=[assignment][parts][ne].
+// Push: ten uints/40B; SHARED_Q8 appends Gate/Up/Down uvec2 BDAs, total64B.
+// IDs use routed used stride; outputs/partials use physical_used. Only H is read.
+// Split reduction changes Down summation order; qualification keeps old tolerance.
+#ifndef LOCAL_SIZE
+#define LOCAL_SIZE 128
+#endif
+#ifndef SPLIT_K
+#define SPLIT_K 64
+#endif
+#if LOCAL_SIZE != 128
+#error Initial_splitk_probe_requires_LOCAL_SIZE_128
+#endif
+#if SPLIT_K != 32 && SPLIT_K != 64 && SPLIT_K != 128
+#error SPLIT_K_must_be_32_64_or_128
+#endif
+
+layout(local_size_x = LOCAL_SIZE) in;
+layout(std430, binding = 0) readonly buffer Input { float input_values[]; };
+layout(std430, binding = 1) readonly buffer Ids { uint ids[]; };
+layout(std430, binding = 2) readonly buffer Tape { uvec2 tape[]; };
+layout(std430, binding = 3) buffer Output { float output_values[]; };
+layout(push_constant) uniform Params {
+    uint ne;
+    uint nff;
+    uint rows;
+    uint used;
+    uint experts;
+    uint physical_used;
+    uint gate_base;
+    uint up_base;
+    uint down_base;
+    uint parts;
+#ifdef SHARED_Q8
+    layout(offset = 40) uvec2 shared_gate;
+    layout(offset = 48) uvec2 shared_up;
+    layout(offset = 56) uvec2 shared_down;
+#endif
+} p;
+
+bool fits(uint base, uint count, uint length) {
+    return base <= length && count <= length - base;
+}
+bool valid_address(uvec2 address) {
+    return any(notEqual(address, uvec2(0u)))
+        && !all(equal(address, uvec2(0xffffffffu))) && (address.x & 3u) == 0u;
+}
+bool valid_shape() {
+    return p.rows > 0u && p.rows <= 8u && p.used > 0u && p.used <= 16u
+        && p.experts > 0u && p.ne > 0u && p.ne <= 8192u && (p.ne & 255u) == 0u
+        && p.nff > 0u && p.nff <= 2048u && (p.nff & 31u) == 0u
+#ifdef SPLITK_REDUCE
+        && p.parts > 0u && p.parts <= 64u
+#else
+        && p.parts == (p.nff + uint(SPLIT_K) - 1u) / uint(SPLIT_K)
+#endif
+        && uint(ids.length()) >= p.rows * p.used + p.rows
+#ifdef SHARED_Q8
+        && p.physical_used == p.used + 1u
+        && valid_address(p.shared_gate) && valid_address(p.shared_up)
+        && valid_address(p.shared_down)
+#else
+        && p.physical_used == p.used
+#endif
+        ;
+}
+bool active_assignment(uint row, uint slot) {
+#ifdef SHARED_Q8
+    if (slot == p.used) return true;
+#endif
+    return (ids[p.rows * p.used + row] & (1u << slot)) != 0u;
+}
+
+#ifdef SPLITK_REDUCE
+#ifdef TREE32_REDUCE
+// Coalesced global loads, then a padded LDS transpose into native's SG32 tree.
+shared float reduce_tile[32][129];
+#endif
+void main() {
+    if (!valid_shape() || gl_WorkGroupID.y != 0u || gl_WorkGroupID.z != 0u) return;
+    uint count = p.rows * p.physical_used * p.ne;
+    if (uint(input_values.length()) < count * p.parts
+        || uint(output_values.length()) < count) return;
+#ifdef TREE32_REDUCE
+    if (gl_SubgroupSize != 32u || gl_NumSubgroups != 4u || p.parts > 32u) return;
+    uint base = gl_WorkGroupID.x * uint(LOCAL_SIZE);
+    if (base >= count) return;
+    uint assignment = base / p.ne, first_o = base % p.ne;
+    uint row = assignment / p.physical_used, slot = assignment % p.physical_used;
+    // ne is a multiple of256, so the entire128-output tile shares one mask bit.
+    if (!active_assignment(row, slot)) return;
+    for (uint part = 0u; part < p.parts; ++part)
+        reduce_tile[part][gl_LocalInvocationIndex] =
+            input_values[(assignment * p.parts + part) * p.ne + first_o + gl_LocalInvocationIndex];
+    barrier();
+    for (uint tile = 0u; tile < 32u; ++tile) {
+        uint local_o = tile * 4u + gl_SubgroupID;
+        uint lane = gl_SubgroupInvocationID;
+        float value = lane < p.parts ? reduce_tile[lane][local_o] : 0.0;
+        float sum = subgroupAdd(value);
+        if (subgroupElect()) {
+            float total = 0.0;
+            total += sum;
+            total += 0.0; // Native LOCAL64's second32-lane half has no K block for nff640.
+            output_values[base + local_o] = total;
+        }
+    }
+#else
+    uint at = gl_GlobalInvocationID.x;
+    if (at >= count) return;
+    uint assignment = at / p.ne, o = at % p.ne;
+    uint row = assignment / p.physical_used, slot = assignment % p.physical_used;
+    // Never read poisoned M partials or overwrite their eventual ordinary output.
+    if (!active_assignment(row, slot)) return;
+    float sum = 0.0;
+    for (uint part = 0u; part < p.parts; ++part)
+        sum += input_values[(assignment * p.parts + part) * p.ne + o];
+    output_values[at] = sum;
+#endif
+}
+#else
+#if (defined(FMT_Q5K) + defined(FMT_IQ2S)) != 1
+#error Initial_splitk_probe_supports_Q5K_or_IQ2S_Gate_Up_only
+#endif
+#if defined(FMT_IQ2S) && (!defined(DOWN_IQ4NL) || !defined(USE_GRID))
+#error IQ2S_requires_DOWN_IQ4NL_and_USE_GRID
+#endif
+#if defined(IQ2_GRID_BUFFER) || defined(IQ3_GRID_BUFFER)
+#error Initial_splitk_probe_uses_existing_generated_LDS_grid
+#endif
+#include "native_weight_addr.glsl"
+#define NW(index) arena_word(index)
+#define STREAMED
+#include "native_decode.glsl"
+#ifdef DOWN_IQ4NL
+#include "gpu_owned_hit_ffn_down_iq4nl.glsl"
+#else
+void owned_down_dqblk32(uint start, out float values[32]) { dqblk(start, values); }
+#endif
+#ifdef SHARED_Q8
+#include "gpu_owned_hit_ffn_shared_q8.glsl"
+#endif
+
+shared float gate_half[SPLIT_K][2];
+shared float up_half[SPLIT_K][2];
+shared float activation[SPLIT_K];
+
+// Same fresh per-block dot and 64-thread K distribution as owned_gu_tree64.comp
+// and native_gemv_id_multi.comp. Do not accumulate all 32 elements into K's acc.
+float input_block(uint start, uint xoff, bool shared_slot) {
+    float values[32];
+#ifdef SHARED_Q8
+    if (shared_slot) owned_shared_q8_dqblk32(start, values);
+    else
+#endif
+        dqblk(start, values);
+    float sum = 0.0;
+    for (uint w = 0u; w < 32u; ++w) sum += values[w] * input_values[xoff + w];
+    return sum;
+}
+
+void main() {
+    // All returns before GRID_INIT are WG-uniform, including masked assignments.
+    if (!valid_shape() || gl_SubgroupSize != 32u || gl_NumSubgroups != 4u
+        || gl_WorkGroupID.y != 0u || gl_WorkGroupID.z != 0u) return;
+#ifndef DOWN_IQ4NL
+    if ((p.nff & 255u) != 0u) return;
+#endif
+    uint assignments = p.rows * p.physical_used;
+    if (uint(input_values.length()) < p.rows * p.ne
+        || uint(output_values.length()) < assignments * p.parts * p.ne
+        || !fits(p.gate_base, p.experts, uint(tape.length()))
+        || !fits(p.up_base, p.experts, uint(tape.length()))
+        || !fits(p.down_base, p.experts, uint(tape.length()))) return;
+    uint unit = gl_WorkGroupID.x;
+    if (unit >= assignments * p.parts) return;
+    uint assignment = unit / p.parts, part = unit % p.parts;
+    uint row = assignment / p.physical_used, slot = assignment % p.physical_used;
+    if (!active_assignment(row, slot)) return;
+    bool shared_slot = false;
+    uvec2 gate, up, down;
+#ifdef SHARED_Q8
+    shared_slot = slot == p.used;
+    if (shared_slot) {
+        gate = p.shared_gate; up = p.shared_up; down = p.shared_down;
+    } else
+#endif
+    {
+        uint expert = ids[row * p.used + slot];
+        if (expert >= p.experts) return;
+        gate = tape[p.gate_base + expert];
+        up = tape[p.up_base + expert];
+        down = tape[p.down_base + expert];
+    }
+    if (!valid_address(gate) || !valid_address(up) || !valid_address(down)) return;
+    GRID_INIT;
+    uint wave = gl_SubgroupID, half_wave = wave & 1u, group = wave / 2u;
+    uint t = half_wave * 32u + gl_SubgroupInvocationID;
+    uint first = part * uint(SPLIT_K), width = min(uint(SPLIT_K), p.nff - first);
+    uint xbase = row * p.ne;
+    uint64_t ga = arena_base(gate.x, gate.y), ua = arena_base(up.x, up.y);
+    // Each logical output is owned by one 64-thread group. Only this chunk is
+    // computed; no WG repeats another chunk's Gate/Up/SiLU.
+    for (uint f = group; f < width; f += 2u) {
+        float g = 0.0, u = 0.0;
+        for (uint s = t; s < p.ne / 32u; s += 64u) {
+            uint at = (first + f) * p.ne + s * 32u;
+            w_addr = ga;
+            g += input_block(at, xbase + s * 32u, shared_slot);
+            w_addr = ua;
+            u += input_block(at, xbase + s * 32u, shared_slot);
+        }
+        g = subgroupAdd(g); u = subgroupAdd(u);
+        if (subgroupElect()) { gate_half[f][half_wave] = g; up_half[f][half_wave] = u; }
+    }
+    barrier();
+    uint local = gl_LocalInvocationIndex;
+    if (local < width) {
+        // Preserve native's +0, SG0, SG1 order, not a reassociated half sum.
+        float g = 0.0, u = 0.0;
+        for (uint h = 0u; h < 2u; ++h) { g += gate_half[local][h]; u += up_half[local][h]; }
+        activation[local] = (g / (1.0 + exp(-g))) * u;
+    }
+    barrier();
+    w_addr = arena_base(down.x, down.y);
+    // Adjacent lanes fetch adjacent K blocks; a tail lane contributes exact zero.
+    const uint cluster = uint(SPLIT_K) / 32u;
+    uint member = gl_SubgroupInvocationID & (cluster - 1u);
+    uint cluster_base = gl_SubgroupInvocationID - member;
+    const uint outputs_per_wg = uint(LOCAL_SIZE) / cluster;
+    for (uint tile = 0u; tile < p.ne; tile += outputs_per_wg) {
+        uint o = tile + local / cluster;
+        uint f = member * 32u;
+        float block_sum = 0.0;
+        if (f < width) {
+            float values[32];
+#ifdef SHARED_Q8
+            if (shared_slot) owned_shared_q8_dqblk32(o * p.nff + first + f, values);
+            else
+#endif
+                owned_down_dqblk32(o * p.nff + first + f, values);
+            for (uint w = 0u; w < 32u; ++w) block_sum += values[w] * activation[f + w];
+        }
+        float sum = 0.0;
+        for (uint c = 0u; c < cluster; ++c)
+            sum += subgroupShuffle(block_sum, cluster_base + c);
+        if (member == 0u) output_values[(assignment * p.parts + part) * p.ne + o] = sum;
+    }
+}
+#endif

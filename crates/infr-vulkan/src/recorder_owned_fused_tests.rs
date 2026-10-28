@@ -7,6 +7,8 @@ mod sparse_pipeline;
 mod tree64_local64;
 #[path = "recorder_owned_tree64_wide_nr_tests.rs"]
 mod tree64_wide_nr;
+#[path = "recorder_owned_splitk_hit_tests.rs"]
+mod splitk_hit_v2;
 use crate::ops::ComputeKernel;
 use std::path::PathBuf;
 
