@@ -3,7 +3,7 @@ kind: roadmap
 status: partially-validated
 scope: ordinary-decode-gpu-ownership-and-overlap
 last_verified: 2026-10-28
-verified_commit: 040aae67f
+verified_commit: 434037b39
 ---
 # 普通 Decode：GPU 所有权与重叠优化
 
@@ -30,7 +30,7 @@ CPU 优先解除 GPU 阻塞，其余工作与 GPU 计算重叠。
 | 顺序 | 工作 | 验收条件 | 结果 |
 | --- | --- | --- | --- |
 | A | 贯穿 1～8 路：批量发布／ACK、3～8 路 router／owner、recovery | 数值、FIFO、取消及 fallback 正确；多路不退 | 已保留；原生有收益，但 Flash 四路仅在原版波动内 |
-| B | 完整 hit FFN 与 GPU 自主搬运重叠 | 包含最终归约的模块更快；必要原生无回退 | 新 split-NFF 四路 IQ2S 路径有收益，实验开关默认关；最终归约仍在 join 后 |
+| B | 完整 hit FFN 与 GPU 自主搬运重叠 | 包含最终归约的模块更快；必要原生无回退 | 多方案及参数复测完成；event 相对既有 split 回退，删除其运行时；保留默认关闭的 IQ3 四路计算拓展 |
 | C | GU 先搬、Down 后搬，保留完整 hit；CPU 上传不拆两次 | 相同搬运参数下模块获益，必要原生无回退 | 严格 Q5 单路原方案保留；新 mixed dispatch／预分类无额外收益 |
 | D | CPU miss 首尾：尽早上传、旧 SKIP／准备与上传重叠 | 目标、源租约、ACK／event 代次正确 | 成功路径保留并通过组合测试；真实 DMA wait-error 仍未闭合 |
 | E | 首尾 gap：前移准备、延后非关键工作、批量交付 | 不越过采样、EOS、取消、工况切换边界 | 已保留并默认开启；非所有工况达到预期 |
@@ -101,7 +101,87 @@ chunk32／local128／Fixed32，需要 BASIC／ARITHMETIC／SHUFFLE 和完整 sub
 CPU 上传、LRU 所有权、miss recovery 与合并规则不改。准备包失效仍走现有回退。
 
 该窄路径已有一次无 trace 30K×4 配对收益，见下表；150K、其他设备尚未原生确认，
-不据此默认开启或宣称所有路数受益。完整最终 H 与 copy 完全独立仍需更大执行模型工作。
+不据此默认开启或宣称所有路数受益。完整最终 H 与 copy 独立的后续试验见下节，
+不能将相对原生 FFN 的收益重复计为相对 split 路径的额外收益。
+
+### 完整 H 再试（v118～v128）
+
+本轮只搬完整专家，**不拆 GU／Down 传输**。模块覆盖 Q5K 与 Flash IQ2S／IQ3S，
+1／2／4 路、全命中和一个整专家 miss；放大输入、原误差门限、毒值与 guard 均保留。
+Q5 合成 shared 模块还补测了真实引擎的独立 shared-tail 口径，不能互相代替。
+原生测试只对模块通过的候选做必要对照，不扩展完整上下文矩阵。
+
+| 方案 | 迭代与结果 | 决定 |
+| --- | --- | --- |
+| 完整 FFN 单 WG／输出分块 | WG128／256、tile1～32，再试显式展开和 WG512／1024；重复 GU 与并行度损失仍大，部分大 WG Q5 强数值检查失败 | 不进入运行时 |
+| 紧凑 GU＋SiLU、原生 Down、精确 event | NR2／4／8，LDS／buffer 码表，再合并 event 重置；Q5 真实非 shared 单／双路全 hit 仍约多0.4／0.8us，不能只拿合成 shared 的小收益宣称通过 | 不进入运行时 |
+| 同 family 辅助计算队列 | 保留原生 H；再将16阶段压入两次 submit、减少自等待／信号、先提交辅助队列；组合成本仍高约130～220us／阶段 | 仅留显式 cfg(test) 实验，不改生产队列 |
+| split partial／reduce＋event | 可以令完整 H 归约不再等待整专家 copy；数值与真实 adapter 正确，但相对既有 split 没有增量收益 | 撤掉实验运行时，只留测试与原始证据 |
+
+辅助计算队列仍用 CU 做复制，**不是硬件 DMA 队列**。queue count 不等于硬件并发能力；
+模块时间包含提交范围内的信号、等待和最终 M，不能只报 H kernel 的时间。
+
+关键的同条件增量对照（v127，四路、batch event reset，单位 us）：
+
+| 量化 | 全 hit：既有 split → event | 一个整专家 miss：既有 split → event |
+| --- | ---: | ---: |
+| IQ2S／IQ4NL | 242.81 → 244.15 | 327.98 → 336.38 |
+| IQ3S／IQ4NL | 246.13 → 248.23 | 294.80 → 336.07 |
+
+此前相对原生 FFN 的约70us收益，主要是 split 计算本身，不是 event 的额外收益。
+既有 copy-first 调度已经能用 partial 计算覆盖不少搬运；提前末尾归约的收益有限，
+producer-first 排序又不利于尽早发起复制。这里不将模块数据冒充精确硬件 overlap 时间线。
+event 的执行范围依据 [Vulkan 同步规范](https://docs.vulkan.org/spec/latest/chapters/synchronization.html#synchronization-events)，
+合法缩小依赖范围也不保证端到端更快。
+
+v126 曾接入真实运行时，覆盖 IQ2／IQ3、三种跨路路由、prepared replay、
+CPU／GPU 混合来源、下一 token 与所有权交接，weighted max_abs=0；但无 trace 的
+30K×4 同 EXE A/B/A 为47.4672／48.3654／46.9082ms，event 比两次旧路径均值慢1.1777ms。
+因此最终不保留它的 event 资源、重置跟踪和新执行控制；`pager_gpu_copy.rs` 与
+`recorder.rs` 恢复原样。源码快照、失败及数值正确的版本都保留为证据。
+
+### IQ3 计算路径拓展（v128）
+
+只扩展已有 chunk32 partial→整专家 copy join→原生树 reduce，不改变同步策略。
+新增 `kernels.vulkan.decode_gpu_resident_splitk_iq3_hit`，默认 false，仍需
+`decode_gpu_resident_splitk_hit=true`；仅 IQ3S／IQ3S／IQ4NL、普通独立四路、
+NE2560／NFF640／top10 及原能力／语义证明均成立时可用。
+图级预检传递实际 dtype，不再硬编码 IQ2；所有层复用已有7.8125MiB scratch，
+不在冻结后扩池。35B、单／双路及其他不合格形状保留旧路径。
+
+同条件模块对照（原生 FFN → classic split；包含整专家搬运、H／M 计算及最终归约，单位 us）：
+
+| IQ3 路数 | 全 hit | 一个整专家 miss | 决定 |
+| --- | ---: | ---: | --- |
+| 1 | 108.22 → 106.62 | 152.35 → 188.75 | miss 回退，不入选 |
+| 2 | 174.13 → 148.71 | 203.88 → 239.56 | miss 回退，不入选 |
+| 4 | 320.10 → 246.95 | 391.81 → 299.58 | 两种模式六组配对均更快，保留窄路径 |
+
+v128 的552项 Vulkan、303项 Core、17项交付 CPU 测试及相关控制测试通过。
+真实 IQ2／IQ3 跨路／prepared／混合 CPU＋GPU recovery／下一 token／handoff 验证通过，
+weighted max_abs=0，H partial 新写、M partial 保留毒值、guard／资源代次正确。
+
+无 trace 原生只做必要的 FlashNext 4.27bpw、30K×4 同 EXE 对照，
+固定 VRAM23g／RAM48g／ubatch3072／Q8，不开 MTP，256 token 预热＋每路128 token 测量。
+原 IQ2 split 始终开启，单独切换 IQ3 拓展；role transfer split 两侧均关闭。
+
+| 顺序 | IQ3 拓展 | 每批前向 ms | 聚合 tok/s |
+| --- | --- | ---: | ---: |
+| 1 | 关闭 | 46.886 | 85.31 |
+| 2 | 开启 | 46.420 | 86.17 |
+| 3 | 关闭 | 48.260 | 82.88 |
+| 4 | 开启 | 46.892 | 85.30 |
+
+均值47.573 → 46.656ms，约省0.917ms（1.93%时间）；各次输入与四路输出 hash 均相同。
+两侧均为24,787个 arena 专家块、15.86GiB arena、31.02／47.17GiB导入覆盖。
+关闭状态本身波动约1.37ms，不能把均值当作稳定的普遍增益；150K和其他设备未重新做原生确认。
+因此只保留显式、默认关闭的四路试验，不放宽路数、设备能力或默认策略。
+最终没有新增运行时 event、队列、所有权状态或 CPU 同步。
+
+原始证据和汇总均在 `local-work/{evidence,results}/infr/20261025-130100-gpu-owned-decode-c741/`：
+`hitfirst-v3-final.md`、`hitfirst-v3-joint-analysis.json`、`splitk-iq3-native-v128-30000.json`，
+源码／成品对应关系见 `hitfirst-v128-final-equivalence.json`。失败原型和反例不删除。
+本轮本地提交：`25a30a35f` 保留多方案对照测试；`434037b39` 仅保留上述 IQ3 窄路径。
 
 ## C：GPU role 流水
 
