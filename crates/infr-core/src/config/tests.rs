@@ -162,6 +162,99 @@ fn cli_layer(sets: &[&str]) -> PartialConfig {
 }
 
 #[test]
+fn attention_splits_preserve_automatic_and_supported_overrides() {
+    let defaults = Config::default();
+    assert_eq!(defaults.kernels.vulkan.flash_splits, None);
+    assert_eq!(defaults.kernels.vulkan.pv_splits, None);
+    defaults.kernels.vulkan.validate_attention_splits().unwrap();
+
+    for (key, env_key) in [
+        ("flash_splits", "INFR_FLASH_SPLITS"),
+        ("pv_splits", "INFR_PV_SPLITS"),
+    ] {
+        for splits in 1..=super::VulkanCfg::MAX_ATTENTION_SPLITS {
+            let value = splits.to_string();
+            let setting = format!("kernels.vulkan.{key}={value}");
+            let toml = format!("[kernels.vulkan]\n{key}={value}\n");
+            for layer in [
+                env_layer(&[(env_key, &value)]),
+                file_layer(&toml),
+                cli_layer(&[&setting]),
+            ] {
+                let cfg = Config::load_from_layers(&[layer]);
+                let vk = &cfg.kernels.vulkan;
+                vk.validate_attention_splits().unwrap();
+                let (actual, other) = if key == "flash_splits" {
+                    (vk.flash_splits, vk.pv_splits)
+                } else {
+                    (vk.pv_splits, vk.flash_splits)
+                };
+                assert_eq!(actual, Some(splits));
+                assert_eq!(other, None);
+            }
+        }
+    }
+}
+
+#[test]
+fn attention_splits_reject_zero_overflow_and_out_of_capacity_values() {
+    for (key, env_key) in [
+        ("flash_splits", "INFR_FLASH_SPLITS"),
+        ("pv_splits", "INFR_PV_SPLITS"),
+    ] {
+        for splits in [
+            0,
+            super::VulkanCfg::MAX_ATTENTION_SPLITS + 1,
+            u32::MAX as usize,
+            usize::MAX,
+        ] {
+            let value = splits.to_string();
+            let path = format!("kernels.vulkan.{key}");
+            let setting = format!("{path}={value}");
+            let mut layers = vec![env_layer(&[(env_key, &value)]), cli_layer(&[&setting])];
+            if splits as u128 <= i64::MAX as u128 {
+                layers.push(file_layer(&format!("[kernels.vulkan]\n{key}={value}\n")));
+            }
+            for layer in layers {
+                let cfg = Config::load_from_layers(&[layer]);
+                let err = cfg.kernels.vulkan.validate_attention_splits().unwrap_err();
+                match err {
+                    ConfigError::Value {
+                        path: actual,
+                        message,
+                    } => {
+                        assert_eq!(actual, path);
+                        assert!(message.contains("1..=8"), "{message}");
+                        assert!(message.contains(&format!("received {splits}")), "{message}");
+                    }
+                    other => panic!("unexpected error: {other}"),
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn attention_splits_validate_final_values_without_changing_layer_precedence() {
+    for (key, env_key) in [
+        ("flash_splits", "INFR_FLASH_SPLITS"),
+        ("pv_splits", "INFR_PV_SPLITS"),
+    ] {
+        let cfg = Config::load_from_layers(&[
+            file_layer(&format!("[kernels.vulkan]\n{key}=9\n")),
+            env_layer(&[(env_key, "0")]),
+            cli_layer(&[&format!("kernels.vulkan.{key}=4")]),
+        ]);
+        cfg.kernels.vulkan.validate_attention_splits().unwrap();
+        let cfg = Config::load_from_layers(&[
+            env_layer(&[(env_key, "4")]),
+            cli_layer(&[&format!("kernels.vulkan.{key}=9")]),
+        ]);
+        assert!(cfg.kernels.vulkan.validate_attention_splits().is_err());
+    }
+}
+
+#[test]
 fn thinking_config_file_and_set_have_the_same_typed_values() {
     let from_file =
         file_layer("[sampling]\nreasoning_effort = 'medium'\npreserve_thinking = false\n");

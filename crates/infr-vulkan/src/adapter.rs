@@ -9,6 +9,7 @@ use crate::linear::{
 use crate::recorder::{QSA_TOPK_PARALLEL_MIN_BLOCKS, QSA_TOPK_PARALLEL_WORK_BYTES, Recorder};
 use crate::{VulkanBackend, be};
 use infr_core::backend::{Bindings, Buffer, BufferUsage, Plan};
+use infr_core::config::VulkanCfg;
 use infr_core::error::{Error, Result};
 use infr_core::graph::{
     Activation, AttnMask, Dsv4CacheFormat, Graph, MoePrefetchHint, Op, QSA_MAX_TOP_BLOCKS,
@@ -2202,9 +2203,21 @@ fn paged_tail_scratch_requests(
                     && matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
                 if flash_possible {
                     let mpad = rows.div_ceil(64) * 64;
-                    record_scratch_max(&mut maxima, "flash_po", 8 * mpad * nh * hd * 4);
-                    record_scratch_max(&mut maxima, "flash_pm", 8 * mpad * nh * 4);
-                    record_scratch_max(&mut maxima, "flash_pl", 8 * mpad * nh * 4);
+                    record_scratch_max(
+                        &mut maxima,
+                        "flash_po",
+                        VulkanCfg::MAX_ATTENTION_SPLITS * mpad * nh * hd * 4,
+                    );
+                    record_scratch_max(
+                        &mut maxima,
+                        "flash_pm",
+                        VulkanCfg::MAX_ATTENTION_SPLITS * mpad * nh * 4,
+                    );
+                    record_scratch_max(
+                        &mut maxima,
+                        "flash_pl",
+                        VulkanCfg::MAX_ATTENTION_SPLITS * mpad * nh * 4,
+                    );
                 }
 
                 if rows == 0 || rows > MAX_SMALL_STATIC_ROWS || hd % 4 != 0 || hd > 512 {
@@ -7556,9 +7569,24 @@ fn lower_op(
                     let mpad = rows.div_ceil(64) * 64;
                     // Pooled split partials (fully written before the combine reads them) — one
                     // set serves every layer instead of n_layer live copies (~1 GiB each at 8B p8k).
-                    let po = pooled(pool, be_, "flash_po", 8 * mpad * nh * hd * 4)?;
-                    let pm = pooled(pool, be_, "flash_pm", 8 * mpad * nh * 4)?;
-                    let pl = pooled(pool, be_, "flash_pl", 8 * mpad * nh * 4)?;
+                    let po = pooled(
+                        pool,
+                        be_,
+                        "flash_po",
+                        VulkanCfg::MAX_ATTENTION_SPLITS * mpad * nh * hd * 4,
+                    )?;
+                    let pm = pooled(
+                        pool,
+                        be_,
+                        "flash_pm",
+                        VulkanCfg::MAX_ATTENTION_SPLITS * mpad * nh * 4,
+                    )?;
+                    let pl = pooled(
+                        pool,
+                        be_,
+                        "flash_pl",
+                        VulkanCfg::MAX_ATTENTION_SPLITS * mpad * nh * 4,
+                    )?;
                     let kcb = match &kc_key {
                         Some(k) => pool[k].as_ref(),
                         None => r(*k_cache)?,
@@ -7629,7 +7657,12 @@ fn lower_op(
                     // fills every [mpad, kv_pad] row; PV partials are written per split before
                     // the reduce), and one set serves every same-shape layer.
                     let s = pooled(pool, be_, "nonfa_s", nh * mpad * kv_pad * 2)?;
-                    let pv = pooled(pool, be_, "nonfa_pv", 8 * mpad * nh * hd * 4)?;
+                    let pv = pooled(
+                        pool,
+                        be_,
+                        "nonfa_pv",
+                        VulkanCfg::MAX_ATTENTION_SPLITS * mpad * nh * hd * 4,
+                    )?;
                     let kcb = match &kc_key {
                         Some(k) => pool[k].as_ref(),
                         None => r(*k_cache)?,

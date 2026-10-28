@@ -14,6 +14,7 @@ use ash::vk;
 
 use infr_core::{
     backend::{Backend, Buffer},
+    config::VulkanCfg,
     error::Result,
     pager_profile,
 };
@@ -245,13 +246,13 @@ fn flash_split_count(
 ) -> u32 {
     match configured.and_then(|v| u32::try_from(v).ok()) {
         Some(v) => v,
-        None if prefer_deep_splits && kv_len >= 65_536 => 8,
+        None if prefer_deep_splits && kv_len >= 65_536 => VulkanCfg::MAX_ATTENTION_SPLITS as u32,
         None => {
             if base_wg >= 1024 || kv_len < 4096 {
                 1
             } else {
                 (2048 / base_wg.max(1))
-                    .clamp(2, 8)
+                    .clamp(2, VulkanCfg::MAX_ATTENTION_SPLITS as u32)
                     .min((kv_len / 2048).max(1) as u32)
             }
         }
@@ -6985,9 +6986,8 @@ impl<'a> Recorder<'a> {
         // capacity while each grinds a huge kv reduction → split the kv dim across gl_WorkGroupID.y
         // into partials, then sum them.
         let pv_base_wg = (mpad / 64) * (hdu / 64) * nh as u32;
-        // `pv_splits` is `Option<usize>` in the config; the dispatch count is a u32, so an
-        // out-of-range override falls back to the adaptive policy exactly as `.parse::<u32>().ok()`
-        // did at the old env read.
+        // Explicit splits are validated before device creation; automatic splits share the
+        // partial-buffer capacity used by the adapter.
         let n_splits = match self.vk().pv_splits.and_then(|v| u32::try_from(v).ok()) {
             Some(v) => v,
             None => {
@@ -6995,7 +6995,7 @@ impl<'a> Recorder<'a> {
                     1u32
                 } else {
                     (2048 / pv_base_wg.max(1))
-                        .clamp(2, 8)
+                        .clamp(2, VulkanCfg::MAX_ATTENTION_SPLITS as u32)
                         .min(kv_pad / 2048)
                         .max(1)
                 }
@@ -7097,18 +7097,7 @@ impl<'a> Recorder<'a> {
     ) {
         let mpad = (n.div_ceil(64) * 64) as u32;
         let base_wg = (mpad / 64) * nh as u32;
-        let n_splits = match self.vk().flash_splits.and_then(|v| u32::try_from(v).ok()) {
-            Some(v) => v,
-            None => {
-                if base_wg >= 1024 || kv_len < 4096 {
-                    1u32
-                } else {
-                    (2048 / base_wg.max(1))
-                        .clamp(2, 8)
-                        .min((kv_len / 2048).max(1) as u32)
-                }
-            }
-        };
+        let n_splits = flash_split_count(self.vk().flash_splits, base_wg, kv_len, false);
         // hd=128 → register-blocked partial (always via partial+combine). Other hd → the
         // 4-subgroup path: single fused kernel for n_splits==1, else the scalar partial.
         //
@@ -18904,6 +18893,43 @@ mod gpu_owned_tests {
 mod tests {
     use super::*;
     use infr_core::{backend::BufferUsage, Backend};
+
+    #[test]
+    fn attention_splits_keep_flash_automatic_policy() {
+        for base_wg in [0, 1, 16, 1023, 1024, 4096] {
+            for kv_len in [0, 1, 2047, 4095, 4096, 65_535, 65_536, 150_000] {
+                for prefer_deep_splits in [false, true] {
+                    let expected = if prefer_deep_splits && kv_len >= 65_536 {
+                        8
+                    } else if base_wg >= 1024 || kv_len < 4096 {
+                        1
+                    } else {
+                        (2048 / base_wg.max(1))
+                            .clamp(2, 8)
+                            .min((kv_len / 2048).max(1) as u32)
+                    };
+                    assert_eq!(
+                        flash_split_count(None, base_wg, kv_len, prefer_deep_splits),
+                        expected,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn attention_splits_keep_every_legal_flash_override() {
+        for splits in 1..=VulkanCfg::MAX_ATTENTION_SPLITS {
+            for (base_wg, kv_len) in [(0, 0), (16, 4096), (1024, 150_000)] {
+                for prefer_deep_splits in [false, true] {
+                    assert_eq!(
+                        flash_split_count(Some(splits), base_wg, kv_len, prefer_deep_splits),
+                        splits as u32,
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     #[ignore = "requires a Vulkan GPU"]

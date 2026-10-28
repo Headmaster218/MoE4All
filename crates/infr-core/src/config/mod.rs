@@ -527,7 +527,7 @@ cfg_struct! {
         /// `INFR_CANVAS_CHUNK_N` (`tier::EnvRows`, floored at 1).
         canvas_chunk_n: usize = 3,
 
-        /// `INFR_FLASH_SPLITS`.
+        /// `INFR_FLASH_SPLITS`: 1..=8, or `None` for automatic selection.
         flash_splits: Option<usize> = None,
         /// `INFR_FLASH_BM`: compared to the LITERAL `"32"`, not parsed as an int.
         flash_bm32: bool = false,
@@ -545,7 +545,7 @@ cfg_struct! {
         qk_warp: bool = true,
         /// `INFR_NO_PV_WARP` (inverted).
         pv_warp: bool = true,
-        /// `INFR_PV_SPLITS`.
+        /// `INFR_PV_SPLITS`: 1..=8, or `None` for automatic selection.
         pv_splits: Option<usize> = None,
         /// `INFR_NO_ATTN_HD`: a `presence` knob despite the `NO_` spelling — sanctioned negative
         /// field (§4).
@@ -696,6 +696,32 @@ cfg_struct! {
         /// `INFR_BDA_CHUNK_BYTES`: byte cap per BDA addressing unit.
         bda_chunk_bytes: Option<u64> = None,
         }
+    }
+}
+
+impl VulkanCfg {
+    /// Capacity of the FlashAttention and non-flash PV partial-result buffers.
+    pub const MAX_ATTENTION_SPLITS: usize = 8;
+
+    /// Reject unsafe overrides after layer resolution, before creating a Vulkan device.
+    pub fn validate_attention_splits(&self) -> Result<(), ConfigError> {
+        for (path, configured) in [
+            ("kernels.vulkan.flash_splits", self.flash_splits),
+            ("kernels.vulkan.pv_splits", self.pv_splits),
+        ] {
+            if let Some(splits) = configured {
+                if !(1..=Self::MAX_ATTENTION_SPLITS).contains(&splits) {
+                    return Err(ConfigError::Value {
+                        path: path.to_owned(),
+                        message: format!(
+                            "must be in 1..={} (received {splits}); omit the override for automatic selection",
+                            Self::MAX_ATTENTION_SPLITS,
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 }
 

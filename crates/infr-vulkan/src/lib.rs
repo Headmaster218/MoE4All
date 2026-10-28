@@ -3682,6 +3682,11 @@ impl VulkanBackend {
     }
 
     fn new_selected(explicit_index: Option<usize>, cfg: Arc<Config>) -> Result<Self> {
+        cfg.kernels
+            .vulkan
+            .validate_attention_splits()
+            .map_err(|e| be(e.to_string()))?;
+
         // Apple: the Vulkan backend is DELIBERATELY unsupported (the only Vulkan on Apple is
         // MoltenVK, which lacks features this backend depends on — e.g. `bufferDeviceAddress` for
         // the paged MoE arena — and is slower than talking to Metal directly). infr ships a NATIVE
@@ -9405,6 +9410,29 @@ fn shader_clock_test_opt_in(value: Option<&std::ffi::OsStr>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attention_splits_reject_invalid_configs_before_vulkan_initialization() {
+        for key in ["flash_splits", "pv_splits"] {
+            for splits in [0, 9, usize::MAX] {
+                let mut cfg = Config::default();
+                if key == "flash_splits" {
+                    cfg.kernels.vulkan.flash_splits = Some(splits);
+                } else {
+                    cfg.kernels.vulkan.pv_splits = Some(splits);
+                }
+                for device in [None, Some(usize::MAX)] {
+                    let result = VulkanBackend::new_selected(device, Arc::new(cfg.clone()));
+                    let err = match result {
+                        Ok(_) => panic!("invalid {key}={splits} was accepted"),
+                        Err(err) => err.to_string(),
+                    };
+                    assert!(err.contains(&format!("kernels.vulkan.{key}")), "{err}");
+                    assert!(err.contains("1..=8"), "{err}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn owner_subgroup_operations_require_reported_compute_support() {
         let basic = vk::SubgroupFeatureFlags::BASIC;
