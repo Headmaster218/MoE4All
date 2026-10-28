@@ -74,6 +74,14 @@ fn backend() -> VulkanBackend {
 
 impl Kernels {
     fn new(be: &VulkanBackend) -> Self {
+        let embedded = Self::embedded(be);
+        match std::env::var_os("MOE4ALL_MANY_ROW_CANDIDATE_SPV_DIR") {
+            Some(dir) => external_many_kernels(be, embedded, std::path::Path::new(&dir)),
+            None => embedded,
+        }
+    }
+
+    fn embedded(be: &VulkanBackend) -> Self {
         let properties = unsafe {
             be.shared
                 .instance
@@ -131,6 +139,75 @@ impl Kernels {
     }
 }
 
+// Test-only explicit external selection; production factories/capability gates are unchanged.
+fn external_many_kernels(be: &VulkanBackend, embedded: Kernels, dir: &std::path::Path) -> Kernels {
+    let words = external_many_words(dir);
+    let same: [bool; 2] = std::array::from_fn(|i| {
+        words[i].as_slice() == crate::gemm::gpu_owned_prepare_topk_fused_many_row_spv(i != 0)
+    });
+    eprintln!(
+        "MANY_ROW_EXTERNAL active=explicit_external reference=embedded_current dir={} serial_identical_to_embedded={} overlap_identical_to_embedded={}",
+        dir.display(), same[0], same[1],
+    );
+    Kernels {
+        router: embedded.router,
+        owner: embedded.owner,
+        many: [0, 1].map(|i| {
+            be.kernel_sg(
+                [
+                    "many_row_external_candidate",
+                    "many_row_external_candidate_overlap",
+                ][i],
+                &words[i],
+                10 + i,
+                GPU_OWNED_FAST_PUSH_BYTES,
+                32,
+            )
+        }),
+    }
+}
+
+fn current_external_kernels(be: &VulkanBackend) -> (Kernels, Kernels) {
+    let dir = std::env::var_os("MOE4ALL_MANY_ROW_CANDIDATE_SPV_DIR")
+        .expect("explicit candidate directory required; no frozen-v94 fallback");
+    let reference = Kernels::embedded(be);
+    let candidate = external_many_kernels(
+        be,
+        Kernels {
+            router: reference.router,
+            owner: reference.owner,
+            many: reference.many,
+        },
+        std::path::Path::new(&dir),
+    );
+    eprintln!(
+        "MANY_ROW_COMPARISON reference=embedded_current candidate=explicit_external subgroup=32"
+    );
+    (reference, candidate)
+}
+
+fn qualification_kernels(be: &VulkanBackend) -> (Kernels, Kernels) {
+    if std::env::var_os("MOE4ALL_MANY_ROW_CANDIDATE_SPV_DIR").is_some() {
+        current_external_kernels(be)
+    } else {
+        comparison_kernels(be)
+    }
+}
+
+fn external_many_word_file(path: &std::path::Path) -> Vec<u32> {
+    let bytes = std::fs::read(path)
+        .unwrap_or_else(|e| panic!("explicit ManyRow SPV {}: {e}", path.display()));
+    let fingerprint = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3)
+    });
+    eprintln!(
+        "MANY_ROW_SPV path={} bytes={} fnv1a64={fingerprint:016x}",
+        path.display(),
+        bytes.len()
+    );
+    ash::util::read_spv(&mut std::io::Cursor::new(bytes)).unwrap()
+}
+
 const V94_MANY_ROW_DIR: &str = r"D:\AIinfr\infr\local-work\bin\infr\20261025-130100-gpu-owned-decode-c741\many-row-v94-reference";
 
 fn external_many_words(dir: &std::path::Path) -> [Vec<u32>; 2] {
@@ -140,19 +217,7 @@ fn external_many_words(dir: &std::path::Path) -> [Vec<u32>; 2] {
         } else {
             "gpu_owned_prepare_topk_fused_many_row.spv"
         };
-        let path = dir.join(file);
-        let bytes = std::fs::read(&path)
-            .unwrap_or_else(|e| panic!("explicit ManyRow SPV {}: {e}", path.display()));
-        // Diagnostic identity only; the frozen directory also retains its SHA256 manifest.
-        let fingerprint = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
-            (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3)
-        });
-        eprintln!(
-            "MANY_ROW_SPV path={} bytes={} fnv1a64={fingerprint:016x}",
-            path.display(),
-            bytes.len()
-        );
-        ash::util::read_spv(&mut std::io::Cursor::new(bytes)).unwrap()
+        external_many_word_file(&dir.join(file))
     })
 }
 
@@ -621,12 +686,12 @@ fn compare_probe(
     let (new, _) = probe.run(be, candidate, true, None);
     assert_eq!(
         old, oracle,
-        "frozen v94 vs independent oracle: {:?}",
+        "reference vs independent oracle: {:?}",
         probe.shape
     );
     assert_eq!(
         new, old,
-        "candidate vs frozen v94, every raw word: {:?}",
+        "candidate vs reference, every raw word: {:?}",
         probe.shape
     );
     new
@@ -636,7 +701,7 @@ fn compare_probe(
 #[ignore = "central serial GPU only; bounded partial/two-pool candidate vs frozen v94 and independent oracle"]
 fn gpu_owned_topk_many_row_partial_fifo_exact_3_to_8() {
     let be = backend();
-    let (reference, candidate) = comparison_kernels(&be);
+    let (reference, candidate) = qualification_kernels(&be);
     for rows in 3..=8 {
         for used in [8, 10] {
             for overlap in [false, true] {
@@ -696,7 +761,7 @@ fn gpu_owned_topk_many_row_partial_fifo_exact_3_to_8() {
 #[ignore = "central serial GPU only; bounded partial rejection, CPU-only jobs, duplicate/stale FIFO and free pops"]
 fn gpu_owned_topk_many_row_partial_rejection_fifo_3_to_8() {
     let be = backend();
-    let (reference, candidate) = comparison_kernels(&be);
+    let (reference, candidate) = qualification_kernels(&be);
     for rows in 3..=8 {
         for fault in 0..6 {
             let mut p = Probe::new(
@@ -995,9 +1060,19 @@ fn gpu_owned_topk_many_row_rejection_and_fifo() {
 fn gpu_owned_topk_many_row_prefix_1_to_128() {
     let be = backend();
     let _capabilities = Kernels::new(&be);
+    // This filter has a distinct classifier-only ABI. Never silently use embedded
+    // code when external qualification was requested; compile the existing probe macro.
+    let external = std::env::var_os("MOE4ALL_MANY_ROW_CANDIDATE_SPV_DIR").map(|dir| {
+        external_many_word_file(
+            &std::path::Path::new(&dir).join("gpu_owned_topk_many_row_classify_probe.spv"),
+        )
+    });
+    let words = external
+        .as_deref()
+        .unwrap_or_else(|| crate::gemm::gpu_owned_topk_many_row_classify_probe_spv());
     let kernel = be.kernel_sg(
         "many_row_prefix_probe",
-        crate::gemm::gpu_owned_topk_many_row_classify_probe_spv(),
+        words,
         10,
         GPU_OWNED_FAST_PUSH_BYTES,
         32,
@@ -1185,7 +1260,7 @@ fn gpu_owned_topk_many_row_v94_paired_latency_probe() {
 #[ignore = "central serial GPU only; same-kernel 4x10 true-route vs preserved-ID hot-owner attribution"]
 fn gpu_owned_topk_many_row_hot_route_attribution_4x10() {
     let be = backend();
-    let kernels = Kernels::new(&be);
+    let kernels = Kernels::embedded(&be);
     assert!(be.shared.submit_timestamp_valid_bits > 0);
     let shape = Shape {
         overlap: true,
@@ -1295,4 +1370,65 @@ fn gpu_owned_topk_many_row_hot_route_attribution_4x10() {
         "MANY_ROW_HOT_ROUTE_ATTRIBUTION rows=4 used=10 experts=512 gating=1 mixed=false overlap=true slots_per_pool=4096 kernel=embedded_many_row_wg256 subgroup=32 dispatches_per_sample=1 warmups_per_arm=2 pairs=8 timed_samples=16 true_route_mean_us={:.6} owner_only_mean_us={:.6} owner_minus_route_mean_us={:.6} paired_min_us={min:.6} paired_max_us={max:.6} outer_only=true reset_readback_outside_timestamps=true fixed_overhead_subtracted=false empty_bracket_measured=false immutable_input_unchanged=true exact_raw_fp_fifo_guards=pass module_only=true",
         mean(&samples[0]), mean(&samples[1]), mean(&paired),
     );
+}
+
+#[test]
+#[ignore = "central serial GPU only; embedded-current vs explicit external ManyRow, eight outer timestamp pairs"]
+fn gpu_owned_topk_many_row_current_external_paired_latency_probe() {
+    let be = backend();
+    let (reference, candidate) = current_external_kernels(&be);
+    assert!(be.shared.submit_timestamp_valid_bits > 0);
+    let queries = Queries {
+        be: &be,
+        pool: unsafe {
+            be.shared.device.create_query_pool(
+                &vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(2),
+                None,
+            )
+        }
+        .unwrap(),
+    };
+    for rows in [3, 4] {
+        for used in [8, 10] {
+            for mixed in [false, true] {
+                let probe = Probe::new(
+                    &be,
+                    Shape {
+                        mixed,
+                        overlap: true,
+                        ..Shape::new(rows, used)
+                    },
+                    4096,
+                );
+                let expected = compare_probe(&be, &reference, &candidate, &probe);
+                probe.check_guards_and_valid(&expected);
+                let mut samples: [Vec<f64>; 2] = std::array::from_fn(|_| Vec::new());
+                for round in 0..8 {
+                    for variant in [round % 2, 1 - round % 2] {
+                        let kernels = if variant == 0 { &reference } else { &candidate };
+                        let (raw, us) = probe.run(&be, kernels, true, Some(&queries));
+                        assert_eq!(
+                            raw, expected,
+                            "every fresh timed replay: rows={rows} used={used} mixed={mixed} variant={variant}"
+                        );
+                        samples[variant].push(us.unwrap());
+                    }
+                }
+                let mean = |a: &[f64]| a.iter().sum::<f64>() / a.len() as f64;
+                let paired: Vec<_> = samples[0]
+                    .iter()
+                    .zip(&samples[1])
+                    .map(|(old, new)| new - old)
+                    .collect();
+                eprintln!(
+                    "MANY_ROW_CURRENT_EXTERNAL_PAIRED rows={rows} used={used} experts=512 mixed={mixed} overlap=true slots_per_pool=4096 pairs=8 reference=embedded_current candidate=explicit_external baseline_us={:.6} candidate_us={:.6} paired_delta_us={:.6} outer_only=true reset_readback_outside_timestamps=true fixed_overhead_subtracted=false exact_raw_fp_fifo=pass module_only=true",
+                    mean(&samples[0]),
+                    mean(&samples[1]),
+                    mean(&paired)
+                );
+            }
+        }
+    }
 }
