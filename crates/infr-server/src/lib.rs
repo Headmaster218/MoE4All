@@ -55,6 +55,9 @@ const SSE_KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(25);
 
 mod responses;
 
+#[cfg(test)]
+mod image_input_tests;
+
 const REQUEST_BODY_LIMIT: usize = 64 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -2760,7 +2763,7 @@ async fn non_streaming(
         Err(e) => {
             stats.fold_failure();
             tracing::warn!(req = req_id, error = %e, "request failed");
-            if invalid_template_input(&e) {
+            if invalid_request_input(&e) {
                 param_error(None, e.to_string())
             } else {
                 json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
@@ -3052,7 +3055,7 @@ async fn streaming(
                     // A mid-stream failure is NOT a clean `stop` — the error frame lets the client tell
                     // this apart from success (matching the non-streaming 500). `[DONE]` still follows,
                     // via `DoneGuard` (audit finding 1).
-                    if invalid_template_input(&e) {
+                    if invalid_request_input(&e) {
                         done.fail_with_type(&e.to_string(), "invalid_request_error");
                     } else {
                         done.fail(&e.to_string());
@@ -3207,10 +3210,13 @@ fn error_body(msg: &str, ty: &str) -> serde_json::Value {
     serde_json::json!({"error": {"message": msg, "type": ty}})
 }
 
-fn invalid_template_input(error: &anyhow::Error) -> bool {
+fn invalid_request_input(error: &anyhow::Error) -> bool {
     error
-        .downcast_ref::<infr_engine::TemplateError>()
-        .is_some_and(infr_engine::TemplateError::is_invalid_input)
+        .downcast_ref::<infr_core::error::InvalidInput>()
+        .is_some()
+        || error
+            .downcast_ref::<infr_engine::TemplateError>()
+            .is_some_and(infr_engine::TemplateError::is_invalid_input)
 }
 
 /// A terminal SSE error frame: `data: {"error":{...}}`. Distinguishable from a normal

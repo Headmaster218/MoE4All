@@ -46,6 +46,15 @@ impl PreparedImage {
 /// - a bare base64 string — decoded.
 /// - `http(s)://…` — **not supported in this stage** (V5 wires fetching); bails with a clear error.
 pub fn decode_image_input(url_or_data: &str) -> Result<Vec<u8>> {
+    decode_image_input_inner(url_or_data).map_err(invalid_image_input)
+}
+
+pub(crate) fn invalid_image_input(error: anyhow::Error) -> anyhow::Error {
+    let marker = infr_core::error::InvalidInput(error.to_string());
+    error.context(marker)
+}
+
+fn decode_image_input_inner(url_or_data: &str) -> Result<Vec<u8>> {
     if url_or_data.starts_with("http://") || url_or_data.starts_with("https://") {
         bail!(
             "infr-vision V1 does not fetch http(s) image URLs; pass a data: URI or base64 \
@@ -198,6 +207,25 @@ fn describe_undecodable(bytes: &[u8], guessed: Option<image::ImageFormat>) -> St
     )
 }
 
+fn image_decode_error(error: image::ImageError, description: String) -> anyhow::Error {
+    use image::{error::LimitErrorKind, ImageError};
+    let invalid = match &error {
+        ImageError::Decoding(_) | ImageError::Unsupported(_) => true,
+        ImageError::IoError(e) => matches!(
+            e.kind(),
+            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::InvalidData
+        ),
+        ImageError::Limits(e) => matches!(e.kind(), LimitErrorKind::DimensionError),
+        _ => false,
+    };
+    let error = anyhow::Error::new(error).context(description);
+    if invalid {
+        invalid_image_input(error)
+    } else {
+        error
+    }
+}
+
 /// Decode, resize, normalize, patchify, and reorder one image into ViT input.
 ///
 /// `pos_table_f32` is the dequantized `v.position_embd.weight`, `[embd, base²]` ne0-fastest.
@@ -215,7 +243,7 @@ pub fn prepare_image_bytes(
         let guessed = reader.format();
         reader
             .decode()
-            .with_context(|| describe_undecodable(bytes, guessed))?
+            .map_err(|e| image_decode_error(e, describe_undecodable(bytes, guessed)))?
     };
     let (w, h) = img.dimensions();
     let (rw, rh) = smart_resize(w, h, cfg.merge_factor() as u32, cfg.patch_size);
@@ -373,9 +401,65 @@ mod tests {
 
     #[test]
     fn decode_rejects_http_and_non_base64_data_uri() {
-        assert!(decode_image_input("https://example.com/x.png").is_err());
-        assert!(decode_image_input("data:image/png,raw").is_err());
-        assert!(decode_image_input("not base64 !!!").is_err());
+        for input in [
+            "https://example.com/x.png",
+            "http://example.com/x.png",
+            "data:image/png,raw",
+            "data:image/png;base64",
+            "not base64 !!!",
+        ] {
+            let error = decode_image_input(input).unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<infr_core::error::InvalidInput>()
+                    .is_some(),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_image_bytes_are_invalid_input() {
+        for bytes in [
+            b"".as_slice(),
+            b"not-an-image",
+            b"GIF89a\x01\x00\x01\x00",
+            b"\x89PNG\r\n\x1a\n",
+        ] {
+            let error = prepare_image_bytes(bytes, &test_cfg(), &[0.0; 32])
+                .err()
+                .expect("invalid image");
+            assert!(
+                error
+                    .downcast_ref::<infr_core::error::InvalidInput>()
+                    .is_some(),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_resource_failures_remain_server_errors() {
+        use image::error::{LimitError, LimitErrorKind, ParameterError, ParameterErrorKind};
+        for error in [
+            image::ImageError::Limits(LimitError::from_kind(LimitErrorKind::InsufficientMemory)),
+            image::ImageError::Parameter(ParameterError::from_kind(
+                ParameterErrorKind::DimensionMismatch,
+            )),
+            image::ImageError::IoError(std::io::Error::from(std::io::ErrorKind::OutOfMemory)),
+        ] {
+            let error = image_decode_error(error, "decoding image".into());
+            assert!(error
+                .downcast_ref::<infr_core::error::InvalidInput>()
+                .is_none());
+        }
+        let error = image_decode_error(
+            image::ImageError::Limits(LimitError::from_kind(LimitErrorKind::DimensionError)),
+            "decoding image".into(),
+        );
+        assert!(error
+            .downcast_ref::<infr_core::error::InvalidInput>()
+            .is_some());
     }
 
     /// Every format a client may realistically upload must survive the FULL prepare path.
@@ -577,6 +661,9 @@ mod tests {
         let cfg = test_cfg();
         let img = RgbImage::from_pixel(32, 32, Rgb([0, 0, 0]));
         let err = prepare_image_bytes(&png_of(&img), &cfg, &[0.0f32; 7]).map(|_| ());
-        assert!(err.is_err());
+        assert!(err
+            .unwrap_err()
+            .downcast_ref::<infr_core::error::InvalidInput>()
+            .is_none());
     }
 }
