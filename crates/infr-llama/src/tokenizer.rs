@@ -235,14 +235,14 @@ fn build_multi_split_seq(patterns: &[&str]) -> Result<PreSequence> {
     Ok(PreSequence::new(parts))
 }
 
-/// Build a SentencePiece (Unigram) tokenizer from a GGUF's embedded vocab (`tokenizer.ggml.model
-/// == "llama"`, used by llama/gemma). The token strings + `scores` become the Unigram lattice;
-/// `<0xXX>` byte tokens (token_type 6) are handled by Unigram byte-fallback; CONTROL tokens
-/// (type 3, e.g. `<bos>`/`<start_of_turn>`) register as special so they encode atomically. The
-/// Metaspace replacement (▁) maps spaces; `add_space_prefix` controls the leading dummy space.
+/// Build a byte-fallback BPE from an SPM-family GGUF. Gemma4 supplies merges and splits only
+/// newline runs; legacy llama/gemma tokenizers reconstruct merges and retain word splitting.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn build_spm_tokenizer(g: &Gguf) -> Result<Tokenizer> {
-    let md = g.metadata();
+    build_spm_tokenizer_from_metadata(g.metadata())
+}
+
+fn build_spm_tokenizer_from_metadata(md: &Metadata) -> Result<Tokenizer> {
     let toks = md
         .get("tokenizer.ggml.tokens")
         .and_then(MetaValue::as_arr)
@@ -302,8 +302,7 @@ pub(crate) fn build_spm_tokenizer(g: &Gguf) -> Result<Tokenizer> {
         .build()
         .map_err(|e| anyhow!("build spm bpe: {e}"))?;
     let mut tok = Tokenizer::new(bpe);
-    // SPM: spaces → ▁. add_space_prefix=true prepends a dummy ▁ (PrependScheme::First); gemma3
-    // sets it false. `split` keeps Metaspace's word splitting on the replacement char.
+    // SPM: spaces -> U+2581; Gemma4 BPE must still see consecutive spaces and whole lines.
     let add_prefix = matches!(
         md.get("tokenizer.ggml.add_space_prefix"),
         Some(MetaValue::Bool(true))
@@ -313,7 +312,20 @@ pub(crate) fn build_spm_tokenizer(g: &Gguf) -> Result<Tokenizer> {
     } else {
         PrependScheme::Never
     };
-    tok.with_pre_tokenizer(Some(Metaspace::new('▁', scheme, true)));
+    if md.str("tokenizer.ggml.model") == Some("gemma4") {
+        let newlines = Split::new(
+            SplitPattern::Regex(r"[^\n]+|[\n]+".into()),
+            SplitDelimiterBehavior::Isolated,
+            false,
+        )
+        .map_err(|e| anyhow!("gemma4 newline pretokenizer: {e}"))?;
+        tok.with_pre_tokenizer(Some(PreSequence::new(vec![
+            PreTokenizerWrapper::Metaspace(Metaspace::new('▁', scheme, false)),
+            PreTokenizerWrapper::Split(newlines),
+        ])));
+    } else {
+        tok.with_pre_tokenizer(Some(Metaspace::new('▁', scheme, true)));
+    }
     // Decode: reassemble byte-fallback bytes, fuse, then map ▁→space (Metaspace decoder).
     let dec = DecoderSequence::new(vec![
         DecoderWrapper::ByteFallback(ByteFallback::default()),
@@ -331,6 +343,134 @@ pub(crate) fn build_spm_tokenizer(g: &Gguf) -> Result<Tokenizer> {
 mod tokenizer_tests {
     use super::*;
     use crate::sampling::{sample_logits, Sampler};
+
+    fn spm_metadata(model: &str) -> Metadata {
+        let mut md = Metadata::default();
+        md.kv
+            .insert("tokenizer.ggml.model".into(), MetaValue::Str(model.into()));
+        md.kv.insert(
+            "tokenizer.ggml.add_space_prefix".into(),
+            MetaValue::Bool(false),
+        );
+        let tokens = [
+            "<unk>",
+            "\u{2581}",
+            "\u{2581}\u{2581}",
+            "\u{2581}\u{2581}\u{2581}\u{2581}",
+            "a",
+            "b",
+            "\n",
+            "\n\n",
+            "a\n",
+            "\u{2581}a",
+            "\t",
+            "\r",
+            "\u{4e2d}",
+        ];
+        md.kv.insert(
+            "tokenizer.ggml.tokens".into(),
+            MetaValue::Arr(
+                tokens
+                    .iter()
+                    .map(|s| MetaValue::Str(s.to_string()))
+                    .collect(),
+            ),
+        );
+        md.kv.insert(
+            "tokenizer.ggml.merges".into(),
+            MetaValue::Arr(
+                [
+                    "\u{2581} \u{2581}",
+                    "\u{2581}\u{2581} \u{2581}\u{2581}",
+                    "\n \n",
+                    "a \n",
+                    "\u{2581} a",
+                ]
+                .iter()
+                .map(|s| MetaValue::Str(s.to_string()))
+                .collect(),
+            ),
+        );
+        md
+    }
+
+    #[test]
+    fn gemma4_preserves_space_merges_but_isolates_newline_runs() {
+        let tok = build_spm_tokenizer_from_metadata(&spm_metadata("gemma4")).unwrap();
+        for (text, ids) in [
+            ("", vec![]),
+            ("    ", vec![3]),
+            ("a  b", vec![4, 2, 5]),
+            ("    a\n", vec![3, 4, 6]),
+            ("a\n\nb", vec![4, 7, 5]),
+            ("\t\u{4e2d}\r\n", vec![10, 12, 11, 6]),
+        ] {
+            let encoded = tok.encode(text, false).unwrap();
+            assert_eq!(encoded.get_ids(), ids, "{text:?}");
+            assert_eq!(tok.decode(encoded.get_ids(), false).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn legacy_spm_keeps_word_splitting() {
+        let tok = build_spm_tokenizer_from_metadata(&spm_metadata("llama")).unwrap();
+        assert_eq!(tok.encode("    ", false).unwrap().get_ids(), [1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn gemma4_preserves_registered_protocol_tokens() {
+        let mut md = spm_metadata("gemma4");
+        let Some(MetaValue::Arr(tokens)) = md.kv.get_mut("tokenizer.ggml.tokens") else {
+            unreachable!()
+        };
+        tokens.extend([
+            MetaValue::Str("<turn|>".into()),
+            MetaValue::Str("<|channel>".into()),
+        ]);
+        let mut types = vec![MetaValue::U64(1); tokens.len()];
+        types[13] = MetaValue::U64(3);
+        types[14] = MetaValue::U64(4);
+        md.kv
+            .insert("tokenizer.ggml.token_type".into(), MetaValue::Arr(types));
+        let tok = build_spm_tokenizer_from_metadata(&md).unwrap();
+        let ids = tok.encode("<|channel>a<turn|>", false).unwrap();
+        assert_eq!(ids.get_ids(), [14, 4, 13]);
+        assert_eq!(tok.decode(ids.get_ids(), true).unwrap(), "<|channel>a");
+    }
+
+    // Optional real-vocab fixture: a metadata-only GGUF is sufficient; weights are never read.
+    #[test]
+    fn gemma4_real_vocab_token_ids() {
+        let Ok(path) = std::env::var("INFR_TEST_GEMMA4_GGUF") else {
+            eprintln!("skip: set INFR_TEST_GEMMA4_GGUF to the issue #126 Q6 metadata fixture");
+            return;
+        };
+        let g = Gguf::open(std::path::Path::new(&path)).unwrap();
+        let tok = build_tokenizer(&g).unwrap();
+        assert_eq!(crate::resolve_chat_eos(g.metadata(), &tok, 1), [1, 106, 50]);
+        for (text, ids) in [
+            ("Hello", vec![9259]),
+            (" of the", vec![529, 506]),
+            (
+                "    return 1;\n",
+                vec![140, 2060, 236743, 236770, 236793, 107],
+            ),
+            ("\n\n", vec![108]),
+            ("a  b", vec![236746, 138, 236763]),
+            ("a\n\nb", vec![236746, 108, 236763]),
+            ("    ", vec![140]),
+            (
+                "{\n    \"action\": \"chat\"\n}",
+                vec![
+                    236782, 107, 140, 236775, 2064, 1083, 623, 12952, 236775, 107, 236783,
+                ],
+            ),
+        ] {
+            let encoded = tok.encode(text, false).unwrap();
+            assert_eq!(encoded.get_ids(), ids, "{text:?}");
+            assert_eq!(tok.decode(encoded.get_ids(), false).unwrap(), text);
+        }
+    }
 
     /// The chunk boundaries a DeepSeek pre-tokenizer sequence yields, as slices of the ORIGINAL
     /// text. [`build_multi_split_seq`] ends the sequence with `ByteLevel`, which rewrites each
