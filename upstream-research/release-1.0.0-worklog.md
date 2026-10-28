@@ -19,7 +19,7 @@ concurrency, device, and measurement interval.
 | 5 | Decode front/back bubble overlap | Done | No production change. Runner-side setup is already overlapped/small; splitting the first frontend into an earlier submit regressed matched 30K and 150K throughput and was removed. Further gains require reusable command buffers/GPU-driven replay, which is architecture work. |
 | 6 | Expert-miss critical path | Done | No production change. Pool-streaming and mapped-copy worker variants were neutral/slower; the aggressive copy/encode overlap also produced nondeterministic output despite a host join before submit, so it was rejected. |
 | 7 | Version 1.0.0 and release benchmark | Done | Native benchmark binary and portable static-CRT package built. Both models completed the full matrix; FlashNext 150K x3 exposed one output-stability warning, while all other rows were stable. |
-| 8 | Recover MTP experiment and automatic splitter | Done | The WIP startup-reference splitter is not portable and was not copied. The current global tuner also mixes unrelated graph shapes; an implementation-ready class-isolated replacement and validation matrix are recorded below. |
+| 8 | Recover MTP experiment and automatic splitter | Plan recorded; implementation pending | The WIP startup-reference splitter is not portable and was not copied. The current global tuner also mixes unrelated graph shapes; an implementation-ready class-isolated replacement and validation matrix are recorded below. |
 
 ## Accepted baseline
 
@@ -238,8 +238,68 @@ are rejected.
 
 ## Measurement rules
 
-- Explicitly use `Vulkan1` (RX 7900 XTX); never rely on automatic selection while the 2 GiB adapters are present.
-- Put new Cargo build output under `B:\` and keep source, records, and release artifacts under `D:\AIinfr\infr`.
+- Enumerate devices and verify RX 7900 XTX by identity before testing; Vulkan indices can change between starts while the 2 GiB adapters are present.
+- Follow `D:\AIinfr\disk_usage_rule.md`. Generated data belongs under the documented categories of `D:\AIinfr\infr\local-work`; the old B-drive build rule is retired. Do not move source, Git data, models, user state or evidence as part of cache management.
 - Separate isolated-kernel timing from complete-cycle throughput.
 - For Decode, discard warm-up, report three warmed runs, and define front/middle/back windows before collection.
 - Preserve unrelated `harness/plugins/dsh-llm-moe4all` and `test-kv-cache` state.
+
+## Maintenance follow-up, 2026-10-23
+
+- This remains the historical 1.0.0 measurement log. The source snapshot for this entry was
+  `release/1.0.0-maintenance` at `0bbc19b79`; official `release-1.1.0` resolves to
+  `0ee28889ad0f4d1e2ff19704284a93c0932f7a52`. No build or GPU run was performed for this documentation update.
+- `689c9cd22` enables resident paging by default; `4d224762c` generalizes full-graph eligibility
+  while retaining host-interlock and mode gates; `091278d97` unifies the eight-row ABI and reserves
+  LM-head scratch before expert mappings freeze. CPU still owned cache allocation/LRU in that
+  maintenance snapshot; this does not describe the later GPU-owned Decode branch.
+- MTP resident VERIFY (`2180c9a77`), four-row Q8 fixed projections (`6477de582`), very-wide
+  projections (`f006c165b`) and Q8 long-context attention (`8d5a4875b`) are in both maintenance
+  HEAD and the release tag. Device/shape gates remain; INT8 query is not a bit-exact rewrite.
+- `bc427a7f5` rejects non-finite output; `c08f5bd1d/ccfaea3d8` fix Q8 tail/store contracts;
+  `c7eedfba8` preserves quantized KV planes during shared-prefix copies. These do not independently
+  prove that every historical FlashNext 150K x3 divergence has been eliminated.
+- Workload-isolated automatic splitter tuning is still a proposal: the current backend retains
+  a global `SubmitAutoTuner`. Do not label the repair plan above as completed implementation.
+- Recent official-1.1.0 fixed-token smoke results and raw evidence are under
+  `local-work/results/infr/20261022-164526-standard-benchmark-1-1-0-b71d/README.md`.
+  FlashNext partly overlapped a model download, and 35B aggressive failed before the separately
+  labelled conservative run. Do not use these results as a matched replacement for the old matrix.
+- Ornith 122B Q2_K versus Q3_K_S is under
+  `local-work/results/infr/20261022-192955-ornith-q2-compare-8a31/README.md`:
+  6K Prefill 1269.9 versus 1176.8 tok/s; Decode 33.3 versus 26.3 tok/s. Both use explicit
+  extra 768 MiB VRAM reserve, Q8 KV and no MTP. One run per quant; not an engine-kernel A/B.
+- Current upstream cache and overview remain in `D:\AIinfr\infr\upstream-research`, with
+  `status-20261023.md` and per-source notes. This maintenance checkout tracks this worklog only;
+  no research source cache or generated benchmark evidence is added to release Git history.
+- Same-day discovery adds `projects-20261023.md`: 32 repository endpoints checked, 31 accessible,
+  26 newly tracked sources and 1,464 observed branch entries (some lists are capped). Selected
+  Colibri branches are already ancestors of dev; other fork lineages are not counted as independent
+  speedups. Nathanw's Vulkan IQ views, SelfRef, FreeToken, ik_llama and mixed-backend/MTP sources
+  are research inputs, not new local performance claims. No runtime code, build or GPU work.
+
+## Five-model upstream coverage, 2026-10-23
+
+- This documentation-only follow-up was recorded on `release/1.0.0-maintenance@0bbc19b79`.
+  Existing worklog edits are preserved. No build, service change or GPU execution.
+- Read GGUF metadata and tensor descriptors across the actual 35B APEX, Ornith
+  Q2_K/Q3_K_S and FlashNext AD-4.27/UD-Q2 inputs, without reading weight payloads.
+  Trunk experts and embedded NextN tensors are accounted separately across shards.
+- APEX experts are mixed Q5_K/Q6_K; FlashNext AD is IQ2_S/IQ3_S/IQ4_NL,
+  UD is IQ2_XS/IQ3_XXS/IQ4_NL. Ornith uses mixed k-quants, not IQ formats.
+- Broadened official/research/community/edge engine and kernel-library coverage,
+  including DeepInfer, DeepGEMM, DeepSelect, TileKernels, FlashMLA, DeepEP, FLA,
+  Q36, reinstinct and the separate vLLM GGUF plugin. Fixed source snapshots,
+  README-only observations and selected implementation reads remain distinct.
+- The user-approved retention rule is now correctness plus reproducible unit/
+  module benefit and no matched end-to-end regression. A universal 1% end-to-end
+  uplift is not required. Masked positive modules, actual regressions and numerical
+  failures are kept as separate records; existing negative measurements are not erased.
+- Local entry points under `D:\AIinfr\infr\upstream-research` are
+  `engines-catalog-20261023.md`, `model-coverage-20261023.md`,
+  `model-quantization-details-20261023.md`, `optimization-atlas-20261023.md`
+  and `optimization-acceptance.md`. Raw research evidence is under
+  `local-work/evidence/infr/20261023-030346-engine-model-coverage-b8c4`.
+- No research clones, model inputs, generated tables or raw snapshots are added
+  to release Git history by this entry; no implementation is marked validated
+  merely because an upstream kernel exists.
