@@ -27,6 +27,9 @@ pub(crate) mod owned_topk;
 #[path = "recorder_owned_role_pipeline.rs"]
 pub(crate) mod owned_role_pipeline;
 
+#[path = "recorder_owned_splitk_runtime.rs"]
+pub(crate) mod owned_splitk_hit;
+
 #[cfg(test)]
 #[path = "recorder_owned_indirect.rs"]
 mod owned_indirect;

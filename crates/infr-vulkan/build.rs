@@ -4594,6 +4594,21 @@ fn main() {
             }
         })
         .collect();
+    for (name, defines) in [
+        (
+            "gpu_owned_hit_splitk_iq2s_32",
+            vec!["-DFMT_IQ2S", "-DDOWN_IQ4NL", "-DUSE_GRID"],
+        ),
+        ("gpu_owned_hit_splitk_reduce_32", vec!["-DSPLITK_REDUCE", "-DTREE32_REDUCE"]),
+    ] {
+        let mut defines: Vec<String> = defines.into_iter().map(str::to_owned).collect();
+        defines.extend(["-DLOCAL_SIZE=128".to_owned(), "-DSPLIT_K=32".to_owned()]);
+        builds.push((
+            "gpu_owned_hit_ffn_splitk".to_owned(),
+            name.to_owned(),
+            defines,
+        ));
+    }
     for format in ["q4k", "q5k", "q6k", "iq2s", "iq3s"] {
         for local in [64, 128, 256] {
             for nr in [1, 2, 4, 8] {

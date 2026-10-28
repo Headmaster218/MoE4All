@@ -827,6 +827,7 @@ struct PagedSmallScratch {
     ubuf: Option<ScratchKey>,
     abuf: ScratchKey,
     ybuf: ScratchKey,
+    splitk_partial: Option<ScratchKey>,
 }
 
 // Kept inline: this is built on the MoE recording path, where boxing adds allocator traffic.
@@ -1854,6 +1855,97 @@ fn paged_moe_scratch_requests(be_: &VulkanBackend, graph: &Graph) -> Vec<(&'stat
     requests
 }
 
+fn owned_splitk_graph_shape(graph: &Graph, op: &Op) -> Option<[usize; 4]> {
+    let Op::MoeFfn {
+        x,
+        dst,
+        gate_exps,
+        up_exps,
+        down_exps,
+        ne,
+        n_expert,
+        n_used,
+        n_ff_exp,
+        act,
+        fused_gate_up,
+        swiglu_clamp,
+        weight_before,
+        down_scale,
+        ep_band,
+        expert_ids,
+        ..
+    } = op
+    else {
+        return None;
+    };
+    if graph.mtp_verify
+        || graph.prefill_target_tokens.is_some()
+        || graph.prefill_next_chunk
+        || !graph.independent_rows
+        || graph.sequence_spans.len() != 4
+        || !graph.sequence_spans.iter().enumerate().all(|(row, span)| span.rows == 1 && span.row_start as usize == row)
+        || *fused_gate_up
+        || *weight_before
+        || *act != Activation::Silu
+        || swiglu_clamp.is_some()
+        || down_scale.is_some()
+        || ep_band.is_some()
+        || expert_ids.is_some()
+        || *ne != 2560
+        || *n_ff_exp != 640
+        || *n_used != 10
+        || !(10..=512).contains(n_expert)
+        || graph.desc(*x).dtype != infr_core::DType::F32
+        || graph.desc(*dst).dtype != infr_core::DType::F32
+        || graph.desc(*x).numel() != 4 * *ne as usize
+        || graph.desc(*gate_exps).dtype != infr_core::DType::Iq2S
+        || graph.desc(*up_exps).dtype != infr_core::DType::Iq2S
+        || graph.desc(*down_exps).dtype != infr_core::DType::Iq4Nl
+    {
+        return None;
+    }
+    Some([*ne as usize, *n_ff_exp as usize, 4, *n_used as usize])
+}
+
+fn owned_splitk_request(be_: &VulkanBackend, graph: &Graph, op: &Op) -> Option<usize> {
+    if !be_.cfg().kernels.vulkan.decode_gpu_resident_splitk_hit
+        || !be_.cfg().kernels.vulkan.decode_gpu_resident
+        || !be_.cfg().kernels.vulkan.decode_gpu_resident_copy_overlap
+        || be_.cfg().kernels.vulkan.decode_gpu_resident_copy == Some(false)
+        || !be_.cfg().device.decode_command_resident
+        || be_.cfg().spec.mtp {
+        return None;
+    }
+    let [ne, nff, rows, used] = owned_splitk_graph_shape(graph, op)?;
+    crate::recorder::owned_splitk_hit::enabled_for_shape(
+        be_,
+        [
+            infr_core::DType::Iq2S,
+            infr_core::DType::Iq2S,
+            infr_core::DType::Iq4Nl,
+        ],
+        ne,
+        nff,
+        rows,
+        used,
+    )
+    .then(|| crate::recorder::owned_splitk_hit::partial_bytes(ne, nff, rows, used))
+    .flatten()
+}
+
+fn owned_splitk_scratch_requests(be_: &VulkanBackend, graph: &Graph) -> Vec<(&'static str, usize)> {
+    if !be_.cfg().kernels.vulkan.decode_gpu_resident_splitk_hit {
+        return Vec::new();
+    }
+    graph
+        .ops
+        .iter()
+        .filter_map(|op| owned_splitk_request(be_, graph, op))
+        .max()
+        .map(|bytes| vec![(crate::recorder::owned_splitk_hit::PARTIAL_TAG, bytes)])
+        .unwrap_or_default()
+}
+
 /// Reserve every DeltaNet prefill workspace before a paged graph freezes its first expert LUT.
 /// These buffers are reused across serialized layers; allocating them lazily inside `lower_op`
 /// would let unified VRAM retire an expert slot that an earlier recorded layer still addresses.
@@ -2173,8 +2265,12 @@ fn paged_phase_scratch_requests(
     let mut maxima = HashMap::<&'static str, usize>::new();
     for (tag, bytes) in paged_qsa_scratch_requests(graph)?
         .into_iter()
-        .chain(qsa_workspace::requests(graph, be_.cfg().kernels.vulkan.qsa_verify_split)?)
+        .chain(qsa_workspace::requests(
+            graph,
+            be_.cfg().kernels.vulkan.qsa_verify_split,
+        )?)
         .chain(paged_moe_scratch_requests(be_, graph))
+        .chain(owned_splitk_scratch_requests(be_, graph))
         .chain(paged_deltanet_scratch_requests(be_, graph))
         .chain(paged_tail_scratch_requests(be_, graph)?)
     {
@@ -18616,6 +18712,16 @@ fn execute_paged_moe<'a>(
             },
             abuf: pooled(pool, be_, "moe_paged_a", physical_slots * nff * 4)?,
             ybuf: pooled(pool, be_, "moe_paged_y", physical_slots * ne * 4)?,
+            // Never grow scratch after any owner/LUT capture; preflight reserved it.
+            splitk_partial: owned_splitk_request(be_, graph, op).and_then(|bytes| {
+                pool.buffers
+                    .keys()
+                    .filter(|&&(tag, capacity)| {
+                        tag == crate::recorder::owned_splitk_hit::PARTIAL_TAG && capacity >= bytes
+                    })
+                    .min_by_key(|&&(_, capacity)| capacity)
+                    .copied()
+            }),
         })
     } else {
         None
@@ -18677,46 +18783,79 @@ fn execute_paged_moe<'a>(
                     copy,
                 )
             });
-        let role_pipeline = if overlap
-            && crate::recorder::owned_role_pipeline::enabled_for_shape(
-                be_, [gdt, udt], ne, nff, rows, n_used,
-            )
+        let splitk_plan = if overlap
+            && shared.is_none()
+            && resume_ids.is_none()
+            && precomputed_hit_masks.is_none()
+            && route.copy.as_ref().is_some_and(|copy| copy.is_owned())
         {
-            route.copy.as_ref().zip(copy_params).and_then(|(copy, params)| {
-                rc.try_owned_role_pipeline(crate::recorder::owned_role_pipeline::Request {
-                    copy,
-                    journal: &route.journal,
-                    control: route.control.as_ref(),
-                    ids: pool[&ids_key].as_ref(),
-                    tape: tape.as_ref(),
-                    input: r(*x).ok()?,
-                    activation: pool[&workspace.abuf].as_ref(),
-                    hit_scratch: [pool[&workspace.gbuf].as_ref(),
-                        pool[&workspace.ubuf.unwrap()].as_ref(), pool[&workspace.ybuf].as_ref()],
-                    geometry: crate::recorder::owned_role_pipeline::Geometry {
-                        ne,
-                        nff,
-                        rows,
-                        used: n_used,
-                        experts: n_expert,
-                        physical_used,
-                        tape_bases: windows,
-                        block_bases: [params[0], params[1], params[2]],
-                    },
-                    dtypes: [gdt, udt],
-                    ordinal: route.ordinal,
-                    ordinary: !be_.cfg().spec.mtp
-                        && !graph.mtp_verify
-                        && !*fused_gate_up
-                        && resume_ids.is_none()
-                        && precomputed_hit_masks.is_none()
-                        && *act == Activation::Silu
-                        && swiglu_clamp.is_none()
-                        && !*weight_before
-                        && (rows == 1 || graph.independent_rows),
-                    preparing: preparing_commands(),
-                })
+            workspace.splitk_partial.and_then(|key| {
+                crate::recorder::owned_splitk_hit::try_plan(
+                    rc,
+                    r(*x).ok()?,
+                    pool[&ids_key].as_ref(),
+                    tape.as_ref(),
+                    pool[&key].as_ref(),
+                    pool[&workspace.ybuf].as_ref(),
+                    [ne, nff, rows, n_used, n_expert],
+                    windows,
+                )
             })
+        } else {
+            None
+        };
+        let role_pipeline = if splitk_plan.is_none()
+            && overlap
+            && crate::recorder::owned_role_pipeline::enabled_for_shape(
+                be_,
+                [gdt, udt],
+                ne,
+                nff,
+                rows,
+                n_used,
+            ) {
+            route
+                .copy
+                .as_ref()
+                .zip(copy_params)
+                .and_then(|(copy, params)| {
+                    rc.try_owned_role_pipeline(crate::recorder::owned_role_pipeline::Request {
+                        copy,
+                        journal: &route.journal,
+                        control: route.control.as_ref(),
+                        ids: pool[&ids_key].as_ref(),
+                        tape: tape.as_ref(),
+                        input: r(*x).ok()?,
+                        activation: pool[&workspace.abuf].as_ref(),
+                        hit_scratch: [
+                            pool[&workspace.gbuf].as_ref(),
+                            pool[&workspace.ubuf.unwrap()].as_ref(),
+                            pool[&workspace.ybuf].as_ref(),
+                        ],
+                        geometry: crate::recorder::owned_role_pipeline::Geometry {
+                            ne,
+                            nff,
+                            rows,
+                            used: n_used,
+                            experts: n_expert,
+                            physical_used,
+                            tape_bases: windows,
+                            block_bases: [params[0], params[1], params[2]],
+                        },
+                        dtypes: [gdt, udt],
+                        ordinal: route.ordinal,
+                        ordinary: !be_.cfg().spec.mtp
+                            && !graph.mtp_verify
+                            && !*fused_gate_up
+                            && resume_ids.is_none()
+                            && precomputed_hit_masks.is_none()
+                            && *act == Activation::Silu
+                            && swiglu_clamp.is_none()
+                            && !*weight_before
+                            && (rows == 1 || graph.independent_rows),
+                        preparing: preparing_commands(),
+                    })
+                })
         } else {
             None
         };
@@ -18893,46 +19032,50 @@ fn execute_paged_moe<'a>(
                 );
             }
         }
-        for (role, dtype, bank, window, shared_weight, output) in [
-            (
-                verify_pair::Role::Gate,
-                gdt,
-                banks[0],
-                windows[0],
-                shared_wgate,
-                workspace.gbuf,
-            ),
-            (
-                verify_pair::Role::Up,
-                udt,
-                banks[1],
-                windows[1],
-                shared_wup,
-                workspace.ubuf.unwrap(),
-            ),
-        ] {
-            pair_admission::linear(
-                graph.mtp_verify && !graph.independent_rows,
-                pair.as_ref(),
-                role,
-                rc,
-                dtype,
-                bank.0,
-                bank.1,
-                tape.as_ref(),
-                pool[&ids_key].as_ref(),
-                n_used,
-                window as usize,
-                shared_weight,
-                xb,
-                false,
-                pool[&output].as_ref(),
-                ne,
-                nff,
-                rows,
-                route_mask,
-                route_bank,
-            );
+        if let Some(plan) = &splitk_plan {
+            plan.partial(rc);
+        } else {
+            for (role, dtype, bank, window, shared_weight, output) in [
+                (
+                    verify_pair::Role::Gate,
+                    gdt,
+                    banks[0],
+                    windows[0],
+                    shared_wgate,
+                    workspace.gbuf,
+                ),
+                (
+                    verify_pair::Role::Up,
+                    udt,
+                    banks[1],
+                    windows[1],
+                    shared_wup,
+                    workspace.ubuf.unwrap(),
+                ),
+            ] {
+                pair_admission::linear(
+                    graph.mtp_verify && !graph.independent_rows,
+                    pair.as_ref(),
+                    role,
+                    rc,
+                    dtype,
+                    bank.0,
+                    bank.1,
+                    tape.as_ref(),
+                    pool[&ids_key].as_ref(),
+                    n_used,
+                    window as usize,
+                    shared_weight,
+                    xb,
+                    false,
+                    pool[&output].as_ref(),
+                    ne,
+                    nff,
+                    rows,
+                    route_mask,
+                    route_bank,
+                );
+            }
         }
         if overlap && !payload_first {
             // Legacy/Verify copying retains its separately qualified ordering.
@@ -18944,43 +19087,47 @@ fn execute_paged_moe<'a>(
         }
         // The scope joins BDA payload writes and hit Gate/Up before dependent FFN work.
         drop(independent);
-        if route.notice.is_some() {
-            rc.gpu_resident_silu(
-                pool[&workspace.gbuf].as_ref(),
-                pool[&workspace.ubuf.unwrap()].as_ref(),
-                pool[&ids_key].as_ref(),
-                pool[&workspace.abuf].as_ref(),
-                [rows as u32, n_used as u32, physical_used as u32, nff as u32],
-            );
+        if let Some(plan) = &splitk_plan {
+            plan.reduce(rc);
         } else {
-            rc.silu_mul(
-                pool[&workspace.gbuf].as_ref(),
-                pool[&workspace.ubuf.unwrap()].as_ref(),
+            if route.notice.is_some() {
+                rc.gpu_resident_silu(
+                    pool[&workspace.gbuf].as_ref(),
+                    pool[&workspace.ubuf.unwrap()].as_ref(),
+                    pool[&ids_key].as_ref(),
+                    pool[&workspace.abuf].as_ref(),
+                    [rows as u32, n_used as u32, physical_used as u32, nff as u32],
+                );
+            } else {
+                rc.silu_mul(
+                    pool[&workspace.gbuf].as_ref(),
+                    pool[&workspace.ubuf.unwrap()].as_ref(),
+                    pool[&workspace.abuf].as_ref(),
+                    physical_slots * nff,
+                    None,
+                );
+            }
+            linear_paged_maybe_shared(
+                graph.mtp_verify && !graph.independent_rows,
+                rc,
+                ddt,
+                banks[2].0,
+                banks[2].1,
+                tape.as_ref(),
+                pool[&ids_key].as_ref(),
+                n_used,
+                windows[2] as usize,
+                shared_wdown,
                 pool[&workspace.abuf].as_ref(),
-                physical_slots * nff,
-                None,
+                true,
+                pool[&workspace.ybuf].as_ref(),
+                nff,
+                ne,
+                rows,
+                route_mask,
+                route_bank,
             );
         }
-        linear_paged_maybe_shared(
-            graph.mtp_verify && !graph.independent_rows,
-            rc,
-            ddt,
-            banks[2].0,
-            banks[2].1,
-            tape.as_ref(),
-            pool[&ids_key].as_ref(),
-            n_used,
-            windows[2] as usize,
-            shared_wdown,
-            pool[&workspace.abuf].as_ref(),
-            true,
-            pool[&workspace.ybuf].as_ref(),
-            nff,
-            ne,
-            rows,
-            route_mask,
-            route_bank,
-        );
         drop(hit_phase);
         if overlap {
             rc.end_conditional();
@@ -21219,6 +21366,57 @@ mod tests {
         assert!(!resident_mtp_bindings_supported(
             true, &graph, &scratch, &bindings, registered
         ));
+    }
+
+    #[test]
+    fn splitk_hit_graph_admission_keeps_unsupported_semantics_out() {
+        use super::*;
+        use infr_core::DType;
+        let mut graph = resident_layout_graph(4, 2560, 640, 40, 10, DType::Iq2S, false, false);
+        graph.independent_rows = true;
+        graph.sequence_spans = (0..4).map(|row| infr_core::graph::SequenceSpan {
+            row_start: row, rows: 1, start_pos: 0,
+        }).collect();
+        let Op::MoeFfn { down_exps, .. } = graph.ops[0] else {
+            unreachable!()
+        };
+        graph.tensors[down_exps.0 as usize].desc.dtype = DType::Iq4Nl;
+        assert_eq!(
+            owned_splitk_graph_shape(&graph, &graph.ops[0]),
+            Some([2560, 640, 4, 10])
+        );
+        for reason in 0..7 {
+            let mut g = graph.clone();
+            let Op::MoeFfn {
+                act,
+                fused_gate_up,
+                weight_before,
+                swiglu_clamp,
+                down_scale,
+                ep_band,
+                router,
+                ..
+            } = &mut g.ops[0]
+            else {
+                unreachable!()
+            };
+            match reason {
+                0 => *act = Activation::Gelu,
+                1 => *fused_gate_up = true,
+                2 => *weight_before = true,
+                3 => *swiglu_clamp = Some(1.0),
+                4 => *down_scale = Some(*router),
+                5 => *ep_band = Some((0, 20)),
+                _ => g.mtp_verify = true,
+            }
+            assert_eq!(
+                owned_splitk_graph_shape(&g, &g.ops[0]),
+                None,
+                "reason={reason}"
+            );
+        }
+        graph.independent_rows = false;
+        assert_eq!(owned_splitk_graph_shape(&graph, &graph.ops[0]), None);
     }
 
     #[test]

@@ -4280,6 +4280,24 @@ pub(crate) fn gpu_owned_indirect_jobs_spv() -> &'static [u32] {
     WORDS.get_or_init(|| spv_words(BYTES))
 }
 
+pub(crate) fn gpu_owned_hit_splitk_spv(reduce: bool) -> &'static [u32] {
+    const PARTIAL: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_hit_splitk_iq2s_32.spv"
+    ));
+    const REDUCE: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_hit_splitk_reduce_32.spv"
+    ));
+    static PARTIAL_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    static REDUCE_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    if reduce {
+        REDUCE_WORDS.get_or_init(|| spv_words(REDUCE))
+    } else {
+        PARTIAL_WORDS.get_or_init(|| spv_words(PARTIAL))
+    }
+}
+
 pub(crate) fn gpu_owned_role_copy_spv(wide: bool) -> &'static [u32] {
     const SMALL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_role_copy.spv"));
     const WIDE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_role_copy1024.spv"));

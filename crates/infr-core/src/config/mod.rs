@@ -458,6 +458,8 @@ cfg_struct! {
         /// Split owned GPU role copies around miss GU only for qualified single-row
         /// Q5K Gate/Up geometry (NE2048, NFF512, top-k 8). False retains the old schedule.
         decode_gpu_resident_role_pipeline: bool = true,
+        /// Trial H-only chunk32 FFN for independent rows4 IQ2S/IQ4NL, NE2560/NFF640/top-k10.
+        decode_gpu_resident_splitk_hit: bool = false,
         /// Submit guarded ordinary-Decode recovery while a certified CPU-only upload completes.
         /// The independent host timeline also retires the old notice epoch.
         decode_gpu_resident_host_ready: bool = true,

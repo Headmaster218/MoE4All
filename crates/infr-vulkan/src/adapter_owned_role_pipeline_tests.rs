@@ -7,6 +7,8 @@ use infr_core::{DType, SizeSpec, TensorDesc};
 
 #[path = "adapter_owned_role_pipeline_mixed_tests.rs"]
 mod mixed_tests;
+#[path = "adapter_owned_splitk_tests.rs"]
+mod splitk_tests;
 
 const NE: usize = 256;
 const FF: usize = 256;
@@ -70,7 +72,25 @@ impl Fixture {
         enabled: bool,
         host_ready: bool,
     ) -> Self {
-        let experts = EXP.max(used);
+        Self::with_profile_modes(
+            ne, nff, used, rows, dtypes, enabled, host_ready, false, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_profile_modes(
+        ne: usize,
+        nff: usize,
+        used: usize,
+        rows: usize,
+        dtypes: [DType; 3],
+        enabled: bool,
+        host_ready: bool,
+        splitk: bool,
+        expert_count: Option<usize>,
+    ) -> Self {
+        let experts = expert_count.unwrap_or(EXP.max(used));
+        let slots = 64.max(experts * 3 + 4 + usize::from(splitk) * 32);
         let max_weight = dtypes
             .into_iter()
             .map(|dtype| infr_testkit::synth_weight(dtype, ne * nff, 0).len())
@@ -97,6 +117,7 @@ impl Fixture {
         vk.decode_gpu_resident_copy = Some(true);
         vk.decode_gpu_resident_copy_overlap = true;
         vk.decode_gpu_resident_role_pipeline = enabled;
+        vk.decode_gpu_resident_splitk_hit = splitk;
         vk.decode_gpu_resident_layers = 1;
         vk.decode_gpu_resident_submit_layers = 1;
         vk.decode_gpu_resident_inflight = 1;
@@ -137,7 +158,7 @@ impl Fixture {
                 n_blocks: experts,
                 pools: vec![MoePoolSpec {
                     slot_bytes,
-                    n_slots: 64,
+                    n_slots: slots,
                     min_enabled_slots: experts * 3,
                 }],
                 host_tier: None,
@@ -145,13 +166,17 @@ impl Fixture {
                 dynamic_state_reserve_bytes: 0,
                 dynamic_state_max_allocation_bytes: 0,
                 prefill_min_lane_bytes: 0,
-                runtime_reserve_bytes: 1024 * 1024,
+                runtime_reserve_bytes: if splitk {
+                    16 * 1024 * 1024
+                } else {
+                    1024 * 1024
+                },
                 host_chunks: vec![MoeHostChunkSpec {
                     base_offset: 0,
                     bytes: 3 * bank_bytes,
                 }],
                 prefill_target_lanes: 1,
-                prefill_cache_bytes: (64 * slot_bytes) as u64,
+                prefill_cache_bytes: (slots * slot_bytes) as u64,
             })
             .unwrap();
         assert!(
