@@ -366,6 +366,7 @@ pub struct OaiRenderer {
     gguf: infr_gguf::Gguf,
     tokenizer: tokenizers::Tokenizer,
     eos: u32,
+    eos_ids: Vec<u32>,
     /// The engine configuration this renderer was opened with — `infr-chat`'s renderer reads
     /// `sampling.no_think` / `debug.chat` off it (S7). Held as the `Arc` the caller resolved in
     /// `main()`, borrowed at the render site (R6).
@@ -410,10 +411,12 @@ impl OaiRenderer {
             .metadata()
             .u64("tokenizer.ggml.eos_token_id")
             .unwrap_or(2) as u32;
+        let eos_ids = crate::resolve_chat_eos(gguf.metadata(), &tokenizer, eos);
         Ok(Self {
             gguf,
             tokenizer,
             eos,
+            eos_ids,
             ecfg,
         })
     }
@@ -573,7 +576,13 @@ impl OaiRenderer {
         tool_choice: Option<&str>,
     ) -> Result<Option<crate::grammar::Constraint>> {
         let vocab = self.tokenizer.get_vocab_size(true);
-        crate::grammar::tool_constraint_for(&self.tokenizer, vocab, &[self.eos], tools, tool_choice)
+        crate::grammar::tool_constraint_for(
+            &self.tokenizer,
+            vocab,
+            &self.eos_ids,
+            tools,
+            tool_choice,
+        )
     }
 
     /// Detokenize ids (markers preserved) — the serve-side parse of a constrained tool-call body.

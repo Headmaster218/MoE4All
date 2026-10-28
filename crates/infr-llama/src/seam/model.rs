@@ -4,7 +4,7 @@ use crate::*;
 use anyhow::{anyhow, Result};
 use infr_chat::{render_chat_jinja, render_chat_user};
 use infr_core::backend::Backend;
-use infr_core::DType;
+use infr_core::{DType, WeightSource};
 use infr_cpu::CpuBackend;
 use infr_gguf::Gguf;
 use std::path::Path;
@@ -436,7 +436,7 @@ impl SeamModel {
             Some(p) => Tokenizer::from_file(p).map_err(|e| anyhow!("load tokenizer: {e}"))?,
             None => build_tokenizer(&g)?,
         };
-        add_chat_eos(&mut cfg, &tokenizer);
+        cfg.eos_ids = resolve_chat_eos(g.metadata(), &tokenizer, cfg.eos);
         if cfg.qwen4exp {
             cfg.qwen4_think_start = tokenizer.token_to_id("<think>");
             cfg.qwen4_think_end = tokenizer.token_to_id("</think>");

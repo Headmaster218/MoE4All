@@ -623,7 +623,7 @@ impl Config {
     /// Parse the model config purely from GGUF metadata + tensor shapes — no GPU/Vulkan, no weight
     /// upload. The single source of truth for both the GPU loader ([`Llama::load_opt`]) and the
     /// CPU-only loader ([`SeamModel::load`]). `eos_ids` holds only the GGUF `eos` here; chat-end
-    /// markers (`<|im_end|>` …) are appended once a tokenizer exists (see [`add_chat_eos`]).
+    /// markers are resolved once a tokenizer exists (see [`resolve_chat_eos`]).
     pub fn from_gguf(g: &Gguf) -> Result<Config> {
         let arch = g
             .metadata()
