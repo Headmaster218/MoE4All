@@ -24,7 +24,6 @@ use super::{as_vk_buf, be, Backing, VkBuffer, VulkanBackend};
 #[path = "recorder_owned_topk.rs"]
 pub(crate) mod owned_topk;
 
-#[cfg(test)]
 #[path = "recorder_owned_role_pipeline.rs"]
 pub(crate) mod owned_role_pipeline;
 

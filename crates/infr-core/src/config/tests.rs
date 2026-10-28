@@ -42,6 +42,20 @@ fn next_step_preparation_defaults_on_and_has_explicit_sync_fallback() {
 }
 
 #[test]
+fn owned_role_pipeline_defaults_on_with_explicit_fallback() {
+    assert!(Config::default().kernels.vulkan.decode_gpu_resident_role_pipeline);
+    let path = "kernels.vulkan.decode_gpu_resident_role_pipeline";
+    for enabled in [false, true] {
+        let setting = format!("{path}={enabled}");
+        let toml = format!("[kernels.vulkan]\ndecode_gpu_resident_role_pipeline={enabled}\n");
+        for layer in [cli_layer(&[setting.as_str()]), file_layer(&toml)] {
+            let cfg = Config::load_from_layers(&[layer]);
+            assert_eq!(cfg.kernels.vulkan.decode_gpu_resident_role_pipeline, enabled);
+        }
+    }
+}
+
+#[test]
 fn paged_iq_grid_override_preserves_auto_and_explicit_modes() {
     for (value, expected) in [("none", None), ("true", Some(true)), ("false", Some(false))] {
         let mut layer = PartialConfig::default();

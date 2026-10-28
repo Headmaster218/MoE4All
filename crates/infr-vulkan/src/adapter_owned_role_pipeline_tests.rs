@@ -5,13 +5,13 @@ use crate::recorder::owned_role_pipeline as pipeline;
 use infr_core::blockio::{BlockDesc, BlockExtent, BlockIo};
 use infr_core::{DType, SizeSpec, TensorDesc};
 
+#[path = "adapter_owned_role_pipeline_mixed_tests.rs"]
+mod mixed_tests;
+
 const NE: usize = 256;
 const FF: usize = 256;
 const EXP: usize = 4;
 const TOP: usize = 2;
-const ROUTED: [u32; TOP] = [0, 1];
-const SLOT_BYTES: usize = 64 * 1024;
-const BANK_BYTES: usize = EXP * SLOT_BYTES;
 const GUARD_WORDS: usize = 64;
 const GUARD: f32 = -1234.5;
 
@@ -23,10 +23,10 @@ impl BlockIo for ExpertIo {
             .0
             .get(desc.id as usize)
             .ok_or_else(|| be("role-pipeline fixture bank"))?;
-        if desc.nbytes() != BANK_BYTES || dst.len() < BANK_BYTES {
+        if desc.nbytes() != bank.len() || dst.len() < bank.len() {
             return Err(be("role-pipeline fixture bank extent"));
         }
-        dst[..BANK_BYTES].copy_from_slice(bank.as_slice());
+        dst[..bank.len()].copy_from_slice(bank.as_slice());
         Ok(())
     }
 }
@@ -38,10 +38,47 @@ struct Fixture {
     output: TensorId,
     roles: [usize; 3],
     buffers: Vec<(TensorId, Box<dyn Buffer>)>,
+    ne: usize,
+    nff: usize,
+    rows: usize,
+    used: usize,
+    routed: Vec<u32>,
 }
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_profile(NE, FF, TOP, 1, [DType::Q5K; 3], true)
+    }
+
+    fn with_profile(
+        ne: usize,
+        nff: usize,
+        used: usize,
+        rows: usize,
+        dtypes: [DType; 3],
+        enabled: bool,
+    ) -> Self {
+        Self::with_profile_and_host_ready(ne, nff, used, rows, dtypes, enabled, false)
+    }
+
+    fn with_profile_and_host_ready(
+        ne: usize,
+        nff: usize,
+        used: usize,
+        rows: usize,
+        dtypes: [DType; 3],
+        enabled: bool,
+        host_ready: bool,
+    ) -> Self {
+        let experts = EXP.max(used);
+        let max_weight = dtypes
+            .into_iter()
+            .map(|dtype| infr_testkit::synth_weight(dtype, ne * nff, 0).len())
+            .max()
+            .unwrap();
+        let slot_bytes = ((max_weight + GUARD_WORDS * 4).div_ceil(4096) * 4096).max(64 * 1024);
+        let bank_bytes = experts * slot_bytes;
+        let value_count = rows * ne;
         let mut cfg = infr_core::config::Config::default();
         cfg.device.dev =
             Some(std::env::var("MOE4ALL_TEST_DEVICE").expect("parent selects the idle test GPU"));
@@ -52,13 +89,14 @@ impl Fixture {
         cfg.spec.mtp = false;
         cfg.paging.expert_prefetch = false;
         cfg.paging.host_dma = true;
-        cfg.paging.ring = Some(SizeSpec::Bytes((4 * SLOT_BYTES) as u64));
+        cfg.paging.ring = Some(SizeSpec::Bytes((4 * slot_bytes) as u64));
         let vk = &mut cfg.kernels.vulkan;
         vk.cpu_miss_threads = 0;
         vk.static_scratch_memo = true;
         vk.decode_gpu_resident = true;
         vk.decode_gpu_resident_copy = Some(true);
         vk.decode_gpu_resident_copy_overlap = true;
+        vk.decode_gpu_resident_role_pipeline = enabled;
         vk.decode_gpu_resident_layers = 1;
         vk.decode_gpu_resident_submit_layers = 1;
         vk.decode_gpu_resident_inflight = 1;
@@ -71,7 +109,7 @@ impl Fixture {
         vk.decode_gpu_resident_notice_thread = true;
         vk.decode_gpu_resident_early_recovery = true;
         vk.decode_gpu_resident_waiter = false;
-        vk.decode_gpu_resident_host_ready = false;
+        vk.decode_gpu_resident_host_ready = host_ready;
         vk.decode_gpu_resident_pure_mapped_layers = 0;
         cfg.prof.ops = false;
         cfg.prof.stages = false;
@@ -80,15 +118,15 @@ impl Fixture {
         assert!(backend.shared.conditional_rendering.is_some());
 
         let banks: [Arc<Vec<u8>>; 3] = std::array::from_fn(|role| {
-            let mut bank = vec![0xa5; BANK_BYTES];
-            for expert in 0..EXP {
+            let mut bank = vec![0xa5; bank_bytes];
+            for expert in 0..experts {
                 let weight = infr_testkit::synth_weight(
-                    DType::Q5K,
-                    NE * FF,
-                    101 + (role * EXP + expert) as u32,
+                    dtypes[role],
+                    ne * nff,
+                    101 + (role * experts + expert) as u32,
                 );
-                assert!(weight.len() + GUARD_WORDS * 4 <= SLOT_BYTES);
-                bank[expert * SLOT_BYTES..expert * SLOT_BYTES + weight.len()]
+                assert!(weight.len() + GUARD_WORDS * 4 <= slot_bytes);
+                bank[expert * slot_bytes..expert * slot_bytes + weight.len()]
                     .copy_from_slice(&weight);
             }
             Arc::new(bank)
@@ -96,11 +134,11 @@ impl Fixture {
         backend
             .init_moe_pager(MoePagerLayout {
                 load_reserve_bytes: 0,
-                n_blocks: EXP,
+                n_blocks: experts,
                 pools: vec![MoePoolSpec {
-                    slot_bytes: SLOT_BYTES,
+                    slot_bytes,
                     n_slots: 64,
-                    min_enabled_slots: EXP * 3,
+                    min_enabled_slots: experts * 3,
                 }],
                 host_tier: None,
                 host_store_io: Some(Arc::new(ExpertIo(banks.clone()))),
@@ -110,10 +148,10 @@ impl Fixture {
                 runtime_reserve_bytes: 1024 * 1024,
                 host_chunks: vec![MoeHostChunkSpec {
                     base_offset: 0,
-                    bytes: 3 * BANK_BYTES,
+                    bytes: 3 * bank_bytes,
                 }],
                 prefill_target_lanes: 1,
-                prefill_cache_bytes: (64 * SLOT_BYTES) as u64,
+                prefill_cache_bytes: (64 * slot_bytes) as u64,
             })
             .unwrap();
         assert!(
@@ -122,20 +160,35 @@ impl Fixture {
         );
 
         let mut graph = Graph::new();
-        let frontend = graph.input(TensorDesc::new([1, NE], DType::F32));
-        let one = graph.input(TensorDesc::new([1, NE], DType::F32));
-        let input = graph.input(TensorDesc::new([1, NE], DType::F32));
-        let routing = graph.input(TensorDesc::new([1, NE], DType::F32));
-        let router = graph.weight(TensorDesc::new([EXP, NE], DType::F32));
-        let weights = std::array::from_fn::<_, 3, _>(|_| {
-            graph.weight(TensorDesc::new([EXP, FF, NE], DType::Q5K))
+        graph.independent_rows = rows > 1;
+        if graph.independent_rows {
+            graph.sequence_spans = (0..rows)
+                .map(|row| infr_core::graph::SequenceSpan {
+                    row_start: row as u32,
+                    rows: 1,
+                    start_pos: 0,
+                })
+                .collect();
+        }
+        let frontend = graph.input(TensorDesc::new([rows, ne], DType::F32));
+        let one = graph.input(TensorDesc::new([rows, ne], DType::F32));
+        let input = graph.input(TensorDesc::new([rows, ne], DType::F32));
+        let routing = graph.input(TensorDesc::new([rows, ne], DType::F32));
+        let router = graph.weight(TensorDesc::new([experts, ne], DType::F32));
+        let weights = std::array::from_fn::<_, 3, _>(|role| {
+            let dims = if role == 2 {
+                [experts, ne, nff]
+            } else {
+                [experts, nff, ne]
+            };
+            graph.weight(TensorDesc::new(dims, dtypes[role]))
         });
-        let output = graph.output(TensorDesc::new([1, NE], DType::F32));
+        let output = graph.output(TensorDesc::new([rows, ne], DType::F32));
         graph.push(Op::Add {
             a: frontend,
             b: one,
             dst: frontend,
-            n: NE as u32,
+            n: value_count as u32,
         });
         graph.push(Op::MoeFfn {
             x: input,
@@ -147,10 +200,10 @@ impl Fixture {
             down_scale: None,
             fused_gate_up: false,
             dst: output,
-            ne: NE as u32,
-            n_expert: EXP as u32,
-            n_used: TOP as u32,
-            n_ff_exp: FF as u32,
+            ne: ne as u32,
+            n_expert: experts as u32,
+            n_used: used as u32,
+            n_ff_exp: nff as u32,
             scale: 1.0,
             act: Activation::Silu,
             gating: infr_core::graph::MoeGating::Softmax,
@@ -163,39 +216,43 @@ impl Fixture {
             swiglu_clamp: None,
             expert_ids: None,
         });
-        let mut route = vec![0.0; NE];
-        route[0] = 1.0;
+        let mut route = vec![0.0; value_count];
+        for row in 0..rows {
+            route[row * ne] = 1.0;
+        }
         let mut buffers = Vec::new();
         for (id, values) in [
-            (frontend, vec![0.0; NE]),
-            (one, vec![1.0; NE]),
+            (frontend, vec![0.0; value_count]),
+            (one, vec![1.0; value_count]),
             (
                 input,
-                (0..NE).map(|i| ((i % 17) as f32 - 8.0) / 128.0).collect(),
+                (0..value_count)
+                    .map(|i| ((i % 17) as f32 - 8.0) / 128.0)
+                    .collect(),
             ),
             (routing, route),
-            (output, vec![GUARD; NE]),
+            (output, vec![GUARD; value_count]),
         ] {
             let buffer = backend
-                .alloc((NE + GUARD_WORDS) * 4, BufferUsage::Readback)
+                .alloc((value_count + GUARD_WORDS) * 4, BufferUsage::Readback)
                 .unwrap();
             let mut guarded = values;
-            guarded.resize(NE + GUARD_WORDS, GUARD);
+            guarded.resize(value_count + GUARD_WORDS, GUARD);
             backend
                 .upload(buffer.as_ref(), bytemuck::cast_slice(&guarded))
                 .unwrap();
             buffers.push((id, buffer));
         }
         let (router_buffer, router_address) = backend
-            .alloc_mapped_arena_bda((EXP * NE + GUARD_WORDS) * 4)
+            .alloc_mapped_arena_bda((experts * ne + GUARD_WORDS) * 4)
             .unwrap();
         assert_ne!(router_address, 0);
         assert_eq!(router_buffer.device_addr(), Some(router_address));
-        let mut router_values = vec![0.0; EXP * NE];
-        for expert in 0..EXP {
-            router_values[expert * NE] = (EXP - expert) as f32;
+        let mut router_values = vec![0.0; experts * ne];
+        for expert in 0..experts {
+            router_values[expert * ne] = (experts - expert) as f32;
         }
-        router_values.resize(EXP * NE + GUARD_WORDS, GUARD);
+        router_values.resize(experts * ne + GUARD_WORDS, GUARD);
         backend
             .upload(router_buffer.as_ref(), bytemuck::cast_slice(&router_values))
             .unwrap();
@@ -210,18 +267,18 @@ impl Fixture {
                     identity,
                     ExpertSource {
                         bank: banks[role].clone(),
-                        stride_bytes: SLOT_BYTES,
+                        stride_bytes: slot_bytes,
                         layer_base: 0,
-                        host_offset: role * BANK_BYTES,
+                        host_offset: role * bank_bytes,
                         file: Some(BlockDesc {
                             id: role as u32,
                             extents: vec![BlockExtent {
                                 offset: 0,
-                                len: BANK_BYTES,
+                                len: bank_bytes,
                             }],
                         }),
                     },
-                    EXP,
+                    experts,
                 )
                 .unwrap();
             buffers.push((id, placeholder));
@@ -235,6 +292,11 @@ impl Fixture {
             output,
             roles: roles.try_into().unwrap(),
             buffers,
+            ne,
+            nff,
+            rows,
+            used,
+            routed: (0..used as u32).collect(),
         }
     }
 
@@ -267,7 +329,7 @@ impl Fixture {
         self.backend
             .upload(
                 self.buffer(self.frontend),
-                bytemuck::cast_slice(&[0.0f32; NE]),
+                bytemuck::cast_slice(&vec![0.0f32; self.rows * self.ne]),
             )
             .unwrap();
     }
@@ -280,7 +342,7 @@ impl Fixture {
         session
             .push_roles_cpu(
                 &self.backend,
-                &self.roles.map(|role| (role, ROUTED.as_slice())),
+                &self.roles.map(|role| (role, self.routed.as_slice())),
                 false,
             )
             .unwrap()
@@ -294,16 +356,16 @@ impl Fixture {
         session.handoff_gpu_decode(&self.backend).unwrap();
         assert_eq!(
             session
-                .routed_roles_resident_mask(&self.roles, &ROUTED)
+                .routed_roles_resident_mask(&self.roles, &self.routed)
                 .unwrap(),
-            3
+            (1 << self.used) - 1
         );
-        session.discard_cpu_miss(self.roles, &[ROUTED[0]]);
+        session.discard_cpu_miss(self.roles, &[self.routed[0]]);
         assert_eq!(
             session
-                .routed_roles_resident_mask(&self.roles, &ROUTED)
+                .routed_roles_resident_mask(&self.roles, &self.routed)
                 .unwrap(),
-            2
+            (1 << self.used) - 2
         );
     }
 
@@ -316,7 +378,7 @@ impl Fixture {
             .filter(|((tag, _), _)| *tag == "moe_paged_a")
             .collect();
         assert_eq!(buffers.len(), 1, "one retained ACT capacity");
-        self.read(buffers[0].1.as_ref(), TOP * FF)
+        self.read(buffers[0].1.as_ref(), self.rows * self.used * self.nff)
     }
 
     fn poison_activation(&self) {
@@ -331,7 +393,11 @@ impl Fixture {
                 .filter(|((tag, _), _)| *tag == "moe_paged_a")
                 .collect();
             assert_eq!(buffers.len(), 1);
-            rec.scale(buffers[0].1.as_ref(), f32::NAN, TOP * FF);
+            rec.scale(
+                buffers[0].1.as_ref(),
+                f32::NAN,
+                self.rows * self.used * self.nff,
+            );
         }
         rec.resident_stage_handoff_barrier();
         rec.publish_host_reads();
@@ -342,11 +408,52 @@ impl Fixture {
         );
     }
 
+    fn poison_role_scratch(&self) {
+        let rec = self.backend.recorder().unwrap();
+        rec.seed_barrier();
+        {
+            let phase = self.backend.runtime_phase.lock().unwrap();
+            for tag in ["moe_paged_g", "moe_paged_u", "moe_paged_a", "moe_paged_y"] {
+                let buffers: Vec<_> = phase
+                    .pool
+                    .buffers
+                    .iter()
+                    .filter(|((name, _), _)| *name == tag)
+                    .collect();
+                assert_eq!(buffers.len(), 1, "one retained {tag} capacity");
+                let width = if tag == "moe_paged_y" {
+                    self.ne
+                } else {
+                    self.nff
+                };
+                rec.scale(
+                    buffers[0].1.as_ref(),
+                    f32::NAN,
+                    self.rows * self.used * width,
+                );
+            }
+        }
+        rec.resident_stage_handoff_barrier();
+        rec.publish_host_reads();
+        rec.finish().unwrap();
+        assert!(self.activation().iter().all(|x| x.is_nan()));
+        self.backend
+            .upload(
+                self.buffer(self.output),
+                bytemuck::cast_slice(&vec![f32::NAN; self.rows * self.ne]),
+            )
+            .unwrap();
+    }
+
     fn epoch(&self) -> u64 {
         self.backend.shared.resource_epoch.load(Ordering::Acquire)
     }
 
     fn assert_mapped_completion(&self) {
+        self.assert_completion(true);
+    }
+
+    fn assert_completion(&self, selected: bool) {
         let (journal, copy) = {
             let phase = self.backend.runtime_phase.lock().unwrap();
             let resident = phase.resident_buffers.as_ref().unwrap();
@@ -357,12 +464,14 @@ impl Fixture {
         self.backend
             .download(journal.as_ref(), bytemuck::cast_slice_mut(&mut words))
             .unwrap();
-        assert_eq!(&words[..TOP], &ROUTED);
-        assert_eq!(
-            words[crate::recorder::RESIDENT_JOURNAL_MASK_WORD],
-            2,
-            "one real H and one M"
-        );
+        for row in 0..self.rows {
+            assert_eq!(&words[row * self.used..(row + 1) * self.used], &self.routed);
+            assert_eq!(
+                words[crate::recorder::RESIDENT_JOURNAL_MASK_WORD + row],
+                (1 << self.used) - 2,
+                "one real M per row"
+            );
+        }
         assert_eq!(words[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD], 4);
         assert_eq!(
             words[crate::recorder::RESIDENT_JOURNAL_JOB_COUNT_WORD],
@@ -378,28 +487,32 @@ impl Fixture {
             .unwrap();
         assert_eq!(predicate, [3, copy.copy_groups, 1, 1]);
         let names = self.backend.built_kernel_names();
-        assert!(names.contains(&"owned_role_gu_tree64_q5k_256_nr2"));
-        assert!(names.contains(&if copy.wide_copy {
-            "owned_role_copy1024"
+        if selected {
+            assert!(names.contains(&"owned_role_gu_tree64_q5k_256_nr2"));
+            assert!(names.contains(&if copy.wide_copy {
+                "owned_role_copy1024"
+            } else {
+                "owned_role_copy256"
+            }));
         } else {
-            "owned_role_copy256"
-        }));
+            assert!(!names.iter().any(|name| name.starts_with("owned_role_")));
+        }
         let mut guard = self.backend.moe_pager().lock().unwrap();
         let session = guard.as_mut().unwrap();
         session.handoff_gpu_decode(&self.backend).unwrap();
         assert_eq!(
             session
-                .routed_roles_resident_mask(&self.roles, &ROUTED)
+                .routed_roles_resident_mask(&self.roles, &self.routed)
                 .unwrap(),
-            3
+            (1 << self.used) - 1
         );
         assert!(!session.gpu_decode_in_forward());
     }
 
     fn assert_result(&self, expected: &[f32], activation: &[f32]) -> (f32, f32) {
         assert_eq!(
-            self.read(self.buffer(self.frontend), NE),
-            vec![1.0; NE],
+            self.read(self.buffer(self.frontend), self.rows * self.ne),
+            vec![1.0; self.rows * self.ne],
             "frontend runs exactly once"
         );
         for (_, buffer) in self
@@ -416,7 +529,10 @@ impl Fixture {
             );
         }
         (
-            compare(&self.read(self.buffer(self.output), NE), expected),
+            compare(
+                &self.read(self.buffer(self.output), self.rows * self.ne),
+                expected,
+            ),
             compare(&self.activation(), activation),
         )
     }
@@ -593,4 +709,188 @@ fn gpu_owned_role_pipeline_adapter_prepared_mapped_miss() {
     let prepared_errors = fixture.assert_result(&expected, &expected_activation);
     println!("OWNED_ROLE_ADAPTER_PREPARED ne={NE} nff={FF} rows=1 q5k=true selections={before_replay:?} prepared_submits=1 real_mapped_jobs=3 poisoned_act_restored=true ordinary_maxerr={} ordinary_act_maxerr={} prepared_maxerr={} prepared_act_maxerr={} frontend_once=true guards_exact=true owner_drained=true",
         ordinary_errors.0, ordinary_errors.1, prepared_errors.0, prepared_errors.1);
+}
+
+#[test]
+fn owned_role_pipeline_auto_gate_qualified_geometry_only() {
+    for enabled in [false, true] {
+        for gate in [DType::Q4K, DType::Q5K, DType::Q6K, DType::Iq2S, DType::Iq3S] {
+            for up in [DType::Q4K, DType::Q5K, DType::Q6K, DType::Iq2S, DType::Iq3S] {
+                for ne in [1792, 2048, 2304] {
+                    for nff in [480, 512, 544] {
+                        for used in [7, 8, 9] {
+                            for rows in [1, 2, 4, 8] {
+                                let expected = enabled
+                                    && gate == DType::Q5K
+                                    && up == DType::Q5K
+                                    && ne == 2048
+                                    && nff == 512
+                                    && used == 8
+                                    && rows == 1;
+                                assert_eq!(
+                                    pipeline::production_eligible(enabled, [gate, up], ne, nff, rows, used),
+                                    expected,
+                                    "enabled={enabled} G={gate:?} U={up:?} ne={ne} nff={nff} used={used} rows={rows}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for rows in [1, 2, 4, 8] {
+        assert!(!pipeline::production_eligible(
+            true,
+            [DType::Iq2S; 2],
+            2560,
+            640,
+            rows,
+            10
+        ));
+    }
+}
+
+fn assert_exact(actual: &[f32], expected: &[f32]) {
+    assert_eq!(actual.len(), expected.len());
+    for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+        assert!(
+            actual.is_finite() && expected.is_finite(),
+            "nonfinite at {index}"
+        );
+        assert_eq!(
+            actual.to_bits(),
+            expected.to_bits(),
+            "exact element {index}"
+        );
+    }
+}
+
+fn exercise_auto(fixture: Fixture, selected: bool, prepared: bool) -> (Vec<f32>, Vec<f32>) {
+    let counts = pipeline::test_selection_scope(&fixture.backend);
+    let current = VkDecodePlan::new_cpu(&fixture.graph, false, true);
+    let next = VkDecodePlan::new_cpu(&fixture.graph, false, true);
+    fixture.preload();
+    let (expected, expected_act) = {
+        let _old = pipeline::test_scope(&fixture.backend, false);
+        execute_static(&fixture.backend, &current, &fixture.bindings()).unwrap();
+        assert_eq!(counts.counts(), [0, 0]);
+        assert!(!fixture
+            .backend
+            .built_kernel_names()
+            .iter()
+            .any(|name| name.starts_with("owned_role_")));
+        (
+            fixture.read(fixture.buffer(fixture.output), fixture.rows * fixture.ne),
+            fixture.activation(),
+        )
+    };
+    // No experimental override here or during preparation/replay: exercise config + shape auto.
+    fixture.force_mapped_miss();
+    fixture.reset_frontend();
+    fixture.poison_role_scratch();
+    execute_static(&fixture.backend, &current, &fixture.bindings()).unwrap();
+    assert_eq!(counts.counts(), [usize::from(selected), 0]);
+    assert_eq!(
+        counts.phase2_counts(),
+        [0, usize::from(selected)],
+        "qualified H suffix preserves the no-entry proof"
+    );
+    fixture.assert_completion(selected);
+    fixture.assert_result(&expected, &expected_act);
+    assert_exact(
+        &fixture.read(fixture.buffer(fixture.output), fixture.rows * fixture.ne),
+        &expected,
+    );
+    assert_exact(&fixture.activation(), &expected_act);
+
+    if prepared {
+        fixture.reset_frontend();
+        let epoch = fixture.epoch();
+        execute_static_next(
+            &fixture.backend,
+            &current,
+            &fixture.bindings(),
+            Some((&next, &fixture.bindings(), &[1])),
+        )
+        .unwrap();
+        assert_eq!(
+            counts.counts(),
+            [2 * usize::from(selected), usize::from(selected)]
+        );
+        assert_eq!(counts.phase2_counts(), [0, 3 * usize::from(selected)]);
+        assert!(
+            next.prepared_prefix.lock().unwrap().is_some(),
+            "real captured packet required"
+        );
+        fixture.force_mapped_miss();
+        fixture.reset_frontend();
+        fixture.poison_role_scratch();
+        assert_eq!(
+            fixture.epoch(),
+            epoch,
+            "fresh scratch must preserve the captured leases"
+        );
+        let before = counts.counts();
+        let phase2_before = counts.phase2_counts();
+        let trace = ActivationTrace::begin();
+        execute_static(&fixture.backend, &next, &fixture.bindings()).unwrap();
+        trace.assert_submitted(1);
+        assert!(next.prepared_prefix.lock().unwrap().is_none());
+        assert_eq!(
+            counts.counts(),
+            before,
+            "replay must not fall back to ordinary recording"
+        );
+        assert_eq!(counts.phase2_counts(), phase2_before);
+        fixture.assert_completion(selected);
+        fixture.assert_result(&expected, &expected_act);
+        assert_exact(
+            &fixture.read(fixture.buffer(fixture.output), fixture.rows * fixture.ne),
+            &expected,
+        );
+        assert_exact(&fixture.activation(), &expected_act);
+    }
+    (expected, expected_act)
+}
+
+#[test]
+#[ignore = "explicit MOE4ALL_TEST_DEVICE; serialized adapter auto on/off, real miss and prepared replay"]
+fn gpu_owned_role_pipeline_adapter_auto_on_off() {
+    let off = exercise_auto(
+        Fixture::with_profile(2048, 512, 8, 1, [DType::Q5K; 3], false),
+        false,
+        true,
+    );
+    let on = exercise_auto(
+        Fixture::with_profile(2048, 512, 8, 1, [DType::Q5K; 3], true),
+        true,
+        true,
+    );
+    assert_exact(&on.0, &off.0);
+    assert_exact(&on.1, &off.1);
+}
+
+#[test]
+#[ignore = "explicit MOE4ALL_TEST_DEVICE; serialized real adapter default fallback, Q5K rows 2/4/8 and Flash geometry"]
+fn gpu_owned_role_pipeline_adapter_auto_multirow_and_flash_fallback() {
+    for rows in [2, 4, 8] {
+        exercise_auto(
+            Fixture::with_profile(2048, 512, 8, rows, [DType::Q5K; 3], true),
+            false,
+            false,
+        );
+    }
+    exercise_auto(
+        Fixture::with_profile(
+            2560,
+            640,
+            10,
+            1,
+            [DType::Iq2S, DType::Iq2S, DType::Iq4Nl],
+            true,
+        ),
+        false,
+        false,
+    );
 }

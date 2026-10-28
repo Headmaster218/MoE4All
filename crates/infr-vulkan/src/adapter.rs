@@ -18677,8 +18677,11 @@ fn execute_paged_moe<'a>(
                     copy,
                 )
             });
-        #[cfg(test)]
-        let role_pipeline = if overlap {
+        let role_pipeline = if overlap
+            && crate::recorder::owned_role_pipeline::enabled_for_shape(
+                be_, [gdt, udt], ne, nff, rows, n_used,
+            )
+        {
             route.copy.as_ref().zip(copy_params).and_then(|(copy, params)| {
                 rc.try_owned_role_pipeline(crate::recorder::owned_role_pipeline::Request {
                     copy,
@@ -18880,7 +18883,6 @@ fn execute_paged_moe<'a>(
         if payload_first {
             // Start the bounded copy before hit projections; the scope still joins both
             // before any consumer of copied weights. Workgroup count is not a CU reservation.
-            #[cfg(test)]
             if let Some(pipeline) = &role_pipeline {
                 pipeline.phase1(rc);
             } else {
@@ -18890,12 +18892,6 @@ fn execute_paged_moe<'a>(
                     route.ordinal,
                 );
             }
-            #[cfg(not(test))]
-            rc.gpu_resident_copy_payload_overlap(
-                route.copy.as_ref().unwrap(),
-                route.journal.as_ref(),
-                route.ordinal,
-            );
         }
         for (role, dtype, bank, window, shared_weight, output) in [
             (
@@ -18989,9 +18985,7 @@ fn execute_paged_moe<'a>(
         if overlap {
             rc.end_conditional();
             let copy = route.copy.as_ref().unwrap();
-            #[cfg(test)]
             let role_pipeline_used = role_pipeline.is_some();
-            #[cfg(test)]
             if let Some(pipeline) = role_pipeline {
                 pipeline.phase2_finish_and_begin_miss(rc);
             } else {
@@ -19002,17 +18996,8 @@ fn execute_paged_moe<'a>(
                     route.ordinal as usize * crate::recorder::GPU_COPY_PREDICATE_WORDS,
                 );
             }
-            #[cfg(not(test))]
-            {
-                rc.gpu_resident_copy_finish_overlap(copy, route.journal.as_ref(), route.ordinal);
-                rc.begin_immutable_conditional_at(
-                    copy.miss_predicates.as_ref().unwrap().as_ref(),
-                    route.ordinal as usize * crate::recorder::GPU_COPY_PREDICATE_WORDS,
-                );
-            }
             let _miss_phase = infr_core::timeline::device_enabled()
                 .then(|| infr_core::timeline::device_phase_scope("resident_gpu_copy_miss_FFN"));
-            #[cfg(test)]
             if !role_pipeline_used {
                 for (dtype, bank, window, shared_weight, output) in [
                     (gdt, banks[0], windows[0], shared_wgate, workspace.gbuf),
@@ -19026,49 +19011,6 @@ fn execute_paged_moe<'a>(
                 ] {
                     // Keep the shared weight binding: it selects the physical (top-k + 1) stride.
                     // Only H contains its mask bit; M never evaluates the shared expert twice.
-                    linear_paged_maybe_shared(
-                        graph.mtp_verify && !graph.independent_rows,
-                        rc,
-                        dtype,
-                        bank.0,
-                        bank.1,
-                        tape.as_ref(),
-                        pool[&ids_key].as_ref(),
-                        n_used,
-                        window as usize,
-                        shared_weight,
-                        xb,
-                        false,
-                        pool[&output].as_ref(),
-                        ne,
-                        nff,
-                        rows,
-                        0,
-                        MOE_ROW_MASK_MISSES,
-                    );
-                }
-                rc.gpu_resident_silu_bank(
-                    pool[&workspace.gbuf].as_ref(),
-                    pool[&workspace.ubuf.unwrap()].as_ref(),
-                    pool[&ids_key].as_ref(),
-                    pool[&workspace.abuf].as_ref(),
-                    [rows as u32, n_used as u32, physical_used as u32, nff as u32],
-                    true,
-                );
-            }
-            #[cfg(not(test))]
-            {
-                for (dtype, bank, window, shared_weight, output) in [
-                    (gdt, banks[0], windows[0], shared_wgate, workspace.gbuf),
-                    (
-                        udt,
-                        banks[1],
-                        windows[1],
-                        shared_wup,
-                        workspace.ubuf.unwrap(),
-                    ),
-                ] {
-                    // Preserve the shared binding's physical stride; M excludes its mask bit.
                     linear_paged_maybe_shared(
                         graph.mtp_verify && !graph.independent_rows,
                         rc,

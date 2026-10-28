@@ -455,6 +455,9 @@ cfg_struct! {
         /// Experimental bounded compute copy concurrent with resident hit projections.
         /// Requires serial-copy eligibility; false preserves its copy-then-full-FFN path.
         decode_gpu_resident_copy_overlap: bool = false,
+        /// Split owned GPU role copies around miss GU only for qualified single-row
+        /// Q5K Gate/Up geometry (NE2048, NFF512, top-k 8). False retains the old schedule.
+        decode_gpu_resident_role_pipeline: bool = true,
         /// Submit guarded ordinary-Decode recovery while a certified CPU-only upload completes.
         /// Experimental: the independent host timeline also retires the old notice epoch.
         decode_gpu_resident_host_ready: bool = false,

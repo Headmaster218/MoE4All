@@ -4280,7 +4280,6 @@ pub(crate) fn gpu_owned_indirect_jobs_spv() -> &'static [u32] {
     WORDS.get_or_init(|| spv_words(BYTES))
 }
 
-#[cfg(test)]
 pub(crate) fn gpu_owned_role_copy_spv(wide: bool) -> &'static [u32] {
     const SMALL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_role_copy.spv"));
     const WIDE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_role_copy1024.spv"));
@@ -4293,7 +4292,6 @@ pub(crate) fn gpu_owned_role_copy_spv(wide: bool) -> &'static [u32] {
     }
 }
 
-#[cfg(test)]
 pub(crate) fn gpu_owned_miss_gu_tree64_spv(
     dtype: infr_core::DType,
     local: u32,
@@ -4308,6 +4306,12 @@ pub(crate) fn gpu_owned_miss_gu_tree64_spv(
             )))).as_slice())
         }};
     }
+    #[cfg(not(test))]
+    return match (dtype, local, nr) {
+        (Q5K, 256, 2) => variant!("q5k_256_nr2"),
+        _ => None,
+    };
+    #[cfg(test)]
     match (dtype, local, nr) {
         (Q4K, 64, 1) => variant!("q4k_64_nr1"),
         (Q4K, 64, 2) => variant!("q4k_64_nr2"),

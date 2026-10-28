@@ -1,4 +1,4 @@
-//! Test-only owned role-copy/GU candidate. No production owner or host-upload policy.
+//! Geometry-qualified owned role-copy/GU schedule; owner and host-upload policy are unchanged.
 use super::*;
 use infr_core::DType;
 
@@ -164,16 +164,75 @@ pub(super) struct Dispatch<'a> {
     gu_buffers: [vk::DescriptorBufferInfo; 4],
 }
 
-fn settings(be: &VulkanBackend) -> Option<Settings> {
-    scoped_settings(
-        test_states()
-            .lock()
-            .unwrap()
-            .get(&(Arc::as_ptr(&be.shared) as usize))
-            .copied(),
+fn settings(be: &VulkanBackend, geometry: Geometry, dtypes: [DType; 2]) -> Option<Settings> {
+    #[cfg(test)]
+    if let Some(override_settings) = test_states()
+        .lock()
+        .unwrap()
+        .get(&(Arc::as_ptr(&be.shared) as usize))
+        .copied()
+    {
+        return scoped_settings(Some(override_settings));
+    }
+    production_eligible(
+        be.cfg().kernels.vulkan.decode_gpu_resident_role_pipeline,
+        dtypes,
+        geometry.ne,
+        geometry.nff,
+        geometry.rows,
+        geometry.used,
+    )
+    .then_some(DEFAULT_SETTINGS)
+}
+
+// Policy admission only. The existing route, geometry, device and alias proofs still apply.
+#[inline]
+pub(crate) fn production_eligible(
+    enabled: bool,
+    dtypes: [DType; 2],
+    ne: usize,
+    nff: usize,
+    rows: usize,
+    used: usize,
+) -> bool {
+    enabled
+        && dtypes == [DType::Q5K; 2]
+        && rows == 1
+        && ne == 2048
+        && nff == 512
+        && used == 8
+}
+
+/// Cheap admission before the adapter resolves candidate scratch or constructs a Request.
+#[inline]
+pub(crate) fn enabled_for_shape(
+    be: &VulkanBackend,
+    dtypes: [DType; 2],
+    ne: usize,
+    nff: usize,
+    rows: usize,
+    used: usize,
+) -> bool {
+    #[cfg(test)]
+    if let Some(override_settings) = test_states()
+        .lock()
+        .unwrap()
+        .get(&(Arc::as_ptr(&be.shared) as usize))
+        .copied()
+    {
+        return override_settings.is_some();
+    }
+    production_eligible(
+        be.cfg().kernels.vulkan.decode_gpu_resident_role_pipeline,
+        dtypes,
+        ne,
+        nff,
+        rows,
+        used,
     )
 }
 
+#[cfg(test)]
 fn scoped_settings(override_settings: Option<Option<Settings>>) -> Option<Settings> {
     override_settings.flatten()
 }
@@ -404,7 +463,7 @@ impl Recorder<'_> {
     /// encoding this schedule neither reads owner state nor starts a new epoch.
     pub(crate) fn try_owned_role_pipeline<'b>(&self, request: Request<'b>) -> Option<Plan<'b>> {
         let r = request;
-        let settings = settings(self.be)?;
+        let settings = settings(self.be, r.geometry, r.dtypes)?;
         if !route_eligible(
             r.ordinary,
             r.preparing,
