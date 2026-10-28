@@ -3,7 +3,7 @@ kind: roadmap
 status: partially-validated
 scope: ordinary-decode-gpu-ownership-and-overlap
 last_verified: 2026-10-28
-verified_commit: 5f4d21dc0
+verified_commit: 040aae67f
 ---
 # 普通 Decode：GPU 所有权与重叠优化
 
@@ -30,8 +30,8 @@ CPU 优先解除 GPU 阻塞，其余工作与 GPU 计算重叠。
 | 顺序 | 工作 | 验收条件 | 结果 |
 | --- | --- | --- | --- |
 | A | 贯穿 1～8 路：批量发布／ACK、3～8 路 router／owner、recovery | 数值、FIFO、取消及 fallback 正确；多路不退 | 已保留；原生有收益，但 Flash 四路仅在原版波动内 |
-| B | 完整 hit FFN 与 GPU 自主搬运重叠 | 全程重叠而非内部 barrier 提前 join；模块更快 | 两种局部方案回退，拒绝；跨队列／持久 FFN pending |
-| C | GU 先搬、Down 后搬，保留完整 hit；CPU 上传不拆两次 | 相同搬运参数下模块获益，必要原生无回退 | 仅严格 Q5 单路形状保留；其他形状／路数回退原调度 |
+| B | 完整 hit FFN 与 GPU 自主搬运重叠 | 包含最终归约的模块更快；必要原生无回退 | 新 split-NFF 四路 IQ2S 路径有收益，实验开关默认关；最终归约仍在 join 后 |
+| C | GU 先搬、Down 后搬，保留完整 hit；CPU 上传不拆两次 | 相同搬运参数下模块获益，必要原生无回退 | 严格 Q5 单路原方案保留；新 mixed dispatch／预分类无额外收益 |
 | D | CPU miss 首尾：尽早上传、旧 SKIP／准备与上传重叠 | 目标、源租约、ACK／event 代次正确 | 成功路径保留并通过组合测试；真实 DMA wait-error 仍未闭合 |
 | E | 首尾 gap：前移准备、延后非关键工作、批量交付 | 不越过采样、EOS、取消、工况切换边界 | 已保留并默认开启；非所有工况达到预期 |
 
@@ -70,8 +70,38 @@ CPU 优先解除 GPU 阻塞，其余工作与 GPU 计算重叠。
 - KHR indirect copy：真实量化 1～8 路、合法 dummy 记录、地址提示均正确；
   连续 frame 仍比现有 partial overlap 慢约 5%～10%，不进入生产扩展初始化。
 
-进一步完整重叠需要独立 compute queue 或持久／协作 FFN，涉及执行模型与同步保证。
-本轮不删除关键 barrier 强行“完成”；该项架构性 pending，测试与失败证据保留。
+上述否决只针对旧实现，不等于局部融合无法获益。新一轮按 NFF 分块，每块只计算一次
+Gate／Up→SiLU，再生成 Down 部分和，避免每个 Down 输出 tile 重算 GU。
+该部分可与原整专家 CU copy 并行；join 后单独归约。主要 Down 运算已前移，
+但最终 H 输出仍依赖 join，不能称为完全无同步，也没有取消必要 barrier。
+
+### 新 split-NFF 试验（v117）
+
+- 先覆盖 1／2／4／8 路模块、shared／无 shared、all-hit／mapped miss、非法几何、
+  stale W0、别名及 prepared replay，再选实际 engine 形状。
+- 早期串行归约在小幅输入下通过，但 512 倍输入放大后超出原定误差门限；
+  v115 的 6K 原生结果也有 3 路文本不同，因此其速度不作为最终合格证据。
+- 修正为原生 Down 的 SG32 归约树；128 输出合并读取、带 padding 的 LDS 转置，
+  不用 atomic 求和、不放宽门限。最终模块和实际 adapter 强数值测试 max_abs=0，
+  包括三种重合／不重合路由、ID>9、真实 mapped miss、accepted prepared replay、
+  新 H partial 写入、M partial 保持毒值、guard 与资源代次不变。
+- Q5 shared 四路最终模块仍回退（约91.33→108.37us／154.86→176.50us），
+  不加入 Q5 新运行路径。旧串行版 Q5 单路 miss 模块的小收益不能冒充最终合格结果。
+
+保留 `kernels.vulkan.decode_gpu_resident_splitk_hit`，**默认 false**，仅普通独立四路、
+G/U=IQ2S、Down=IQ4NL、NE2560／NFF640／top10、F32／SiLU，且全部能力与语义证明通过时可用。
+不是模型名特判；Flash 当前权重的36个 IQ2 层可入选，12个 IQ3 层保持原路径。
+1／2／3／5～8 路、其他量化／形状、MTP／Verify／Prefill 以及设备不支持均回退。
+shared expert 保持 engine 原有 standalone dense tail，不把合成 shared 模块当真实基线。
+
+chunk32／local128／Fixed32，需要 BASIC／ARITHMETIC／SHUFFLE 和完整 subgroup；
+归约使用16,512字节 LDS。新增8,192,000字节（7.8125MiB）统一 phase scratch，
+所有层复用，在 owner／LUT capture **之前**预留，录制中只查已存在 pool key，不再扩池。
+同设备、范围、对齐、LUT window、非别名、命令及 epoch 校验继续有效；
+CPU 上传、LRU 所有权、miss recovery 与合并规则不改。准备包失效仍走现有回退。
+
+该窄路径已有一次无 trace 30K×4 配对收益，见下表；150K、其他设备尚未原生确认，
+不据此默认开启或宣称所有路数受益。完整最终 H 与 copy 完全独立仍需更大执行模型工作。
 
 ## C：GPU role 流水
 
@@ -104,6 +134,12 @@ v102 同 EXE 开／关：30K 7.362125／7.385410ms（约省23us）；
 实际 adapter／prepared、2／4／8 路与 Flash fallback、mixed status5 的 GPU-readable 和
 CPU-only miss、延迟 host-ready 上传、ACT／输出及同实例下一请求／交接均通过。
 v103 混合测试仅补测试代码，生产字节与冻结 v102 CLI 相同。
+
+本轮再测 mixed dispatch：独立 workgroup 搬 Down 与算 miss GU，另测 GPU 提前／延后
+job 分类，计入分类 launch 和 barrier。比较同宽256×8／256×32及原1024×8控制，
+通过1／2／4／8路数值、status5／零 mask、别名及 stale W0 拒绝测试。
+同宽 Q5 mixed 略慢（约106.1→107.3us），Flash 相比原调度回退；
+分类再增加开销，未超过已保留流水。只提交测试与 shader 证据，不注册新运行路径。
 
 ## D：CPU miss 关键路径与生命周期
 
@@ -146,7 +182,7 @@ v103 混合测试仅补测试代码，生产字节与冻结 v102 CLI 相同。
   copy_overlap、host_ready；能力和工况回退继续有效。
 - MTP 保持旧路；Lookup 不提前录制；Verify 保留串行复制，本轮不扩大 speculative 支持。
 
-547 项 Vulkan CPU、302 项 Core、17 项交付通过；
+551 项 Vulkan CPU、302 项 Core、17 项交付通过；
 短预录包接管、early-submit、未 signal host-wait 的错误／取消、同实例重试、
 KV／辅助资源交接与非普通图隔离 GPU 回归通过。
 这些不是全部设备／工况的穷举证明。
@@ -174,6 +210,21 @@ KV／辅助资源交接与非普通图隔离 GPU 回归通过。
 当前目标**未全部达到**。Flash 四路曾从 v85 52.20ms、v94 50.26ms 改到 v102 48.56ms，
 已消除先前明显回退，但不能把相对旧候选的改善全当相对原版的收益。
 
+### v117 split-K 独立配对
+
+以下为同一冻结 v117 EXE 开关比较，不是对旧原版重测；参数同上，
+每路 warmup256 tokens、正式128 tokens，四路不同普通思考问题。计时无 trace，
+表内整批时长取各路 API engine token duration 的均值，不是单路延迟或纯 GPU 时间。
+
+| 工况 | 关闭 ms/轮 | 开启 ms/轮 | 净省 | 聚合 tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| FlashNext 4.27bpw，30K×4 | 48.465510 | 46.627893 | 1.837617ms／3.79% | 82.53→85.79 |
+
+四路各128 tokens完整结束，4／4最终文本一致，输入与成品身份相同。
+只有一次成对原生测试，不作为统计稳定性结论；不与旧256-token测量的收益直接相加。
+源文件 hash 逐项匹配冻结成品；SHA256：
+`13BFCEAC60DF4DD91661710B0555DAD4DD69B8E0F61C821CCB2DA7FABA3632E8`。
+
 ## 本地提交与证据
 
 | 提交 | 内容 |
@@ -192,12 +243,17 @@ KV／辅助资源交接与非普通图隔离 GPU 回归通过。
 | `39b118ece` | 已验普通调度默认开启 |
 | `cb60c3d69` | 路由／hot-owner 归因测试 |
 | `5f4d21dc0` | current／external 候选精确与配对测试，评分 hoist 被否决 |
+| `498739daa` | split-NFF hit FFN、原生归约树及模块对照 |
+| `85e506a27` | mixed Down-copy／miss-GU 与预分类对照，未进入运行路径 |
+| `040aae67f` | 默认关闭的四路 IQ2S split-K 接入、池预留和实际 adapter 强数值回归 |
 
 任务 ID：`20261025-130100-gpu-owned-decode-c741`。
 生成物统一在 `D:\AIinfr\infr\local-work`：
 `evidence/infr/<task-id>` 保存 manifest、输入／exe身份、原始 log 和失败方案；
 `results/infr/<task-id>` 保存 `roadmap-native-summary.json/md`、
-`v103-v104-qualification.md`、`v105-score-hoist.md` 与 D3 审计。
+`v103-v104-qualification.md`、`v105-score-hoist.md`、D3 审计、
+`fusion-v2-checkpoint.md`、`fusion-v2-results.json/md`、`fusion-v2-final.md` 和
+`splitk-native-v117-30000.json`；`fusion-runtime-v117-equivalence.json` 保存最终源码与成品核对。
 详细本机实验账本：`upstream-research/decode-overlap-roadmap.md`。
 
 共用通用 x86-64／static-CRT 构建缓存，冻结 exe 再测；原生最多四路，模块保留八路。
