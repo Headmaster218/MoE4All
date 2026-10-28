@@ -1,0 +1,98 @@
+#version 460
+// E01 opt-in SwiGLU -> quant_q8 fusion. No intermediate buffer, shared scratch,
+// FP8, weight epilogue or production selector change. Requires subgroup size 32.
+//
+// PC: { uint rows, k, do_clamp; float limit; }, offsets 0/4/8/12, 16 bytes.
+// Separate F32 inputs: binding 0=Gate[rows,k], 1=Up[rows,k],
+//                     2=QA int8[rows,k], 3=DA f16[rows,k/32], 4=SA f16[rows,k/32].
+// -DFUSED_GU: binding 0=GU[rows,2*k] with Gate then Up in each row;
+//            binding 1=QA, 2=DA, 3=SA. This is silu_mul_fused.comp's exact layout.
+// No general interleaved-head or independent-input stride ABI is introduced.
+//
+// One workgroup/32-element activation block. Dispatch x*y=rows*(k/32), or
+// overdispatch with the uniform bound check below; flat index = x+y*numGroups.x.
+// k>0, k%32==0; rows*k and (FUSED_GU) rows*2*k must fit u32.
+// Local size and requiredSubgroupSize are BOTH 32, with full compute subgroups.
+// Needs storageBuffer8BitAccess, storageBuffer16BitAccess and subgroup
+// BASIC/ARITHMETIC in compute, as already required by quant_q8. The offline
+// compiler emits no Int8/Float16 arithmetic capability, only storage conversions.
+//
+// Match silu_mul.comp/silu_mul_fused.comp's observed driver arithmetic and the
+// unchanged quant_q8.comp sequence. This is an opt-in, exactness-gated prototype.
+// Clamp is ONE-SIDED on pre-SiLU Gate, symmetric on Up. SA uses the original
+// float d, NOT float(DA): rounding d to f16 before q/SA would change the contract.
+// On the campaign driver, the split baseline evaluates (g*u)*rcp(1+exp(-g)),
+// not round(g/(1+exp(-g)))*u. Preserve that order, then materialize precise F32 v
+// before quantization. Keep the reciprocal helper non-precise, like the baseline;
+// precise applies only to the two product boundaries, not its exp/add/reciprocal.
+// No F16 intermediate. Both the ordinary and near-round fixtures must pass.
+// Compiler/driver exp/division differences must still pass the parent's exact
+// QA/DA/SA test. A one-bit discrepancy rejects the variant; it is not waived.
+// As in quant_q8, NaN/Inf SwiGLU values make float-to-int quantization undefined;
+// no new finite sanitization or semantic exception is added here.
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC {
+    uint rows; uint k; uint do_clamp; float limit;
+} pc;
+
+#ifdef FUSED_GU
+layout(binding = 0) readonly buffer GUB { float gu[]; };
+#define QB 1
+#define DB 2
+#define SB 3
+#else
+layout(binding = 0) readonly buffer GB { float gate[]; };
+layout(binding = 1) readonly buffer UB { float up[]; };
+#define QB 2
+#define DB 3
+#define SB 4
+#endif
+layout(binding = QB) writeonly buffer QA { int8_t qa[]; };
+layout(binding = DB) writeonly buffer DA { float16_t dact[]; };
+layout(binding = SB) writeonly buffer SA { float16_t sact[]; };
+
+float silu_reciprocal(float g) {
+    return 1.0 / (1.0 + exp(-g));
+}
+
+void main() {
+    if (gl_SubgroupSize != 32u || pc.k == 0u || pc.k % 32u != 0u) { return; }
+    uint nblk = pc.k / 32u;
+    uint gid = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (gid >= pc.rows * nblk) { return; }
+    uint row = gid / nblk;
+    uint blk = gid % nblk;
+    uint t = gl_LocalInvocationID.x;
+    uint col = blk * 32u + t;
+    uint idx = row * pc.k + col;
+#ifdef FUSED_GU
+    uint base = row * 2u * pc.k;
+    float g = gu[base + col];
+    float u = gu[base + pc.k + col];
+#else
+    float g = gate[idx];
+    float u = up[idx];
+#endif
+    if (pc.do_clamp != 0u) { g = min(g, pc.limit); }
+    if (pc.do_clamp != 0u) { u = clamp(u, -pc.limit, pc.limit); }
+    precise float v = (g * u) * silu_reciprocal(g);
+
+    float amax = subgroupMax(abs(v));
+    float d = amax / 127.0;
+    float inv = (amax > 0.0) ? 1.0 / d : 0.0;
+    int q = int(round(v * inv));
+    q = clamp(q, -127, 127);
+    qa[idx] = int8_t(q);
+    float s = subgroupAdd(d * float(q));
+    if (t == 0u) {
+        dact[row * nblk + blk] = float16_t(d);
+        sact[row * nblk + blk] = float16_t(s);
+    }
+}

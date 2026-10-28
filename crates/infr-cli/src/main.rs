@@ -3,10 +3,10 @@
 
 use clap::{Parser, Subcommand};
 use infr_core::config::{Config, ConfigOverrides, PartialConfig};
-use infr_core::WeightSource;
 use std::io::Write as _;
 use std::sync::Arc;
 
+mod benchmark_hardware;
 mod diagnostics;
 mod submission;
 mod submission_validation;
@@ -72,6 +72,9 @@ enum SubmissionCommand {
     PackBenchmark {
         #[arg(long, value_name = "PATH")]
         input: PathBuf,
+        /// Native manual bench JSON whose engine metadata is retained in the report.
+        #[arg(long, value_name = "PATH")]
+        raw_benchmark: Option<PathBuf>,
         #[arg(long, value_name = "DIR", default_value = "benchmark-database")]
         result_dir: PathBuf,
     },
@@ -1224,11 +1227,21 @@ fn print_submission_summary(decoded: &submission::Decoded) {
 
 fn cmd_submission(action: SubmissionCommand) -> anyhow::Result<()> {
     match action {
-        SubmissionCommand::PackBenchmark { input, result_dir } => {
+        SubmissionCommand::PackBenchmark {
+            input,
+            raw_benchmark,
+            result_dir,
+        } => {
             let bytes = std::fs::read(&input)
                 .with_context(|| format!("read benchmark JSON {}", input.display()))?;
-            let value =
+            let mut value =
                 submission_validation::parse_json(&bytes).context("parse benchmark JSON")?;
+            if let Some(raw_path) = raw_benchmark {
+                let raw = submission_validation::parse_json(&std::fs::read(raw_path)?)?;
+                if let Some(metadata) = raw.get(0).and_then(|row| row.get("benchmark_metadata")) {
+                    benchmark_hardware::enrich_manual(&mut value, metadata);
+                }
+            }
             validate_benchmark_payload(&value)?;
             let created = value
                 .get("created_at_utc")
@@ -4363,12 +4376,6 @@ fn cmd_bench_suite(
     );
 
     let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
-    let architecture = loaded
-        .gguf()
-        .metadata()
-        .str("general.architecture")
-        .unwrap_or("unknown")
-        .to_string();
     let footprint = infr_llama::weight_footprint(loaded.gguf());
     let required_ctx = suite.required_context_tokens();
     let want_ctx = cfg
@@ -4388,6 +4395,13 @@ fn cmd_bench_suite(
     let load_started = std::time::Instant::now();
     let engine = infr_llama::parallel::ParallelSeam::new(loaded, parallel, want_ctx)?;
     let startup_seconds = load_started.elapsed().as_secs_f64();
+    // The initialized device supplies the PCI identity; probing finishes before suite warmup.
+    let initialized = engine.benchmark_configuration();
+    let collected_hardware = benchmark_hardware::collect(
+        &gguf,
+        &engine.device_name(),
+        initialized["driver"]["pci_bdf"].as_str(),
+    );
     anyhow::ensure!(
         engine.max_ctx() >= required_ctx,
         "automatic benchmark needs {required_ctx} tokens per slot, but placement provided {}",
@@ -4530,6 +4544,17 @@ fn cmd_bench_suite(
         // print-ok: final benchmark-wide failure summary.
         println!("失败 / FAILED {}: {}", failure.stage, failure.error);
     }
+    let mut model_report = benchmark_hardware::model(
+        engine.model().gguf(),
+        gguf.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("model"),
+        model_bytes,
+    );
+    model_report["resident_weight_bytes"] = footprint.total().into();
+    model_report["dense_weight_bytes"] = footprint.dense.into();
+    model_report["expert_weight_bytes"] = footprint.expert.into();
+    let actual_configuration = engine.benchmark_configuration();
     let result = SuiteResult {
         schema_version: 1,
         id: String::new(),
@@ -4537,15 +4562,9 @@ fn cmd_bench_suite(
         engine_version: env!("CARGO_PKG_VERSION"),
         engine_commit: option_env!("INFR_GIT_COMMIT"),
         profile: suite.as_str(),
-        model: serde_json::json!({
-            "name": gguf.file_name().and_then(|name| name.to_str()).unwrap_or("model"),
-            "architecture": architecture,
-            "storage_bytes": model_bytes,
-            "resident_weight_bytes": footprint.total(),
-            "dense_weight_bytes": footprint.dense,
-            "expert_weight_bytes": footprint.expert,
-        }),
-        hardware: serde_json::json!({
+        model: model_report,
+        hardware: {
+            let mut hardware = serde_json::json!({
             "os": std::env::consts::OS,
             "architecture": std::env::consts::ARCH,
             "cpu": {
@@ -4573,8 +4592,13 @@ fn cmd_bench_suite(
                 "pcie_generation": serde_json::Value::Null,
                 "pcie_width": serde_json::Value::Null,
             },
-        }),
-        configuration: serde_json::json!({
+            });
+            benchmark_hardware::merge(&mut hardware, &collected_hardware);
+            hardware["collection"] = collected_hardware["collection"].clone();
+            hardware
+        },
+        configuration: {
+            let mut configuration = serde_json::json!({
             "max_parallel": parallel,
             "per_slot_context_limit": engine.max_ctx(),
             "requested_context_tokens": suite.context_tokens(),
@@ -4587,15 +4611,10 @@ fn cmd_bench_suite(
             "shared_prefill": true,
             "real_context": true,
             "synthetic_depth": false,
-            "kv_type_k": format!("{:?}", cfg.kv.type_k),
-            "kv_type_v": format!("{:?}", cfg.kv.type_v),
             "auto_profile": format!("{:?}", cfg.device.auto_profile),
             "configured_device": cfg.device.dev.as_deref(),
             "configured_ubatch": cfg.device.ubatch,
             "configured_threads": cfg.device.threads,
-            "configured_vram_budget": format!("{:?}", cfg.device.vram_budget),
-            "configured_vram_reserve": format!("{:?}", cfg.device.vram_reserve),
-            "configured_ram_budget": format!("{:?}", cfg.device.ram_budget),
             "host_dma": cfg.paging.host_dma,
             "submit_dispatches": cfg.device.submit_dispatches,
             "sampling": {
@@ -4606,7 +4625,21 @@ fn cmd_bench_suite(
                 "ignore_eos": cfg.sampling.ignore_eos,
             },
             "mtp": false,
-        }),
+            });
+            for (key, value) in benchmark_hardware::configured(&cfg, "Vulkan")
+                .as_object()
+                .expect("configuration object")
+            {
+                configuration[key] = value.clone();
+            }
+            for (key, value) in actual_configuration
+                .as_object()
+                .expect("actual configuration object")
+            {
+                configuration[key] = value.clone();
+            }
+            configuration
+        },
         estimate,
         startup: serde_json::json!({
             "seconds": startup_seconds,
@@ -4721,6 +4754,25 @@ fn cmd_bench(
     if synthetic_depth.is_some() && !matches!(backend, Backend::Vulkan(_)) {
         anyhow::bail!("--synthetic-depth currently supports the Vulkan benchmark path only");
     }
+    let gpu_name = if matches!(backend, Backend::Vulkan(_)) {
+        selected_benchmark_device(cfg)?.name
+    } else {
+        String::new()
+    };
+    let collected = benchmark_hardware::collect(&gguf, &gpu_name, None);
+    let mut hardware = serde_json::json!({
+        "os": std::env::consts::OS, "architecture": std::env::consts::ARCH,
+        "cpu": {"name": benchmark_cpu_name(), "logical_threads": std::thread::available_parallelism().ok().map(|n| n.get())},
+        "ram": {"total_bytes": infr_core::hostmem::total_bytes()},
+        "gpu": {"name": (!gpu_name.is_empty()).then_some(&gpu_name)},
+    });
+    benchmark_hardware::merge(&mut hardware, &collected);
+    hardware["collection"] = collected["collection"].clone();
+    let mut metadata = serde_json::json!({
+        "engine_version": env!("CARGO_PKG_VERSION"), "engine_commit": option_env!("INFR_GIT_COMMIT"),
+        "hardware": hardware,
+        "configuration": benchmark_hardware::configured(cfg, match backend { Backend::Cpu => "CPU", Backend::Metal => "Metal", _ => "Vulkan" }),
+    });
     // diffusion-gemma (Phase 4/D, docs/diffusion-gemma.md): llama-bench has no diffusion mode, so
     // `infr bench` measures infr's OWN decode shape (block prefill + canvas denoise, see
     // `cmd_bench_diffusion_gemma`'s doc) instead of routing through the AR pp/tg arms below.
@@ -4739,6 +4791,7 @@ fn cmd_bench(
             metal,
             json,
             cfg,
+            &mut metadata,
         );
     }
     // qwen35 (Qwen3.5) benches through the STANDARD arms below (`cmd_bench_cpu` / the seam's
@@ -4759,6 +4812,7 @@ fn cmd_bench(
             reps,
             json,
             cfg,
+            &mut metadata,
         );
     }
     // Metal (set by `--dev metal` or `INFR_DEV=metal`): bench the dense forward on the Metal backend
@@ -4775,12 +4829,18 @@ fn cmd_bench(
             reps,
             json,
             cfg,
+            &mut metadata,
         );
     }
     // `--dev VulkanN` is `device.dev` on this `cfg`, which the seam hands to
     // `VulkanBackend::new_with` when it picks the physical device; the prefill chunk
     // (`-u`/`device.ubatch`) rides the same config. Nothing to set here — straight to the seam.
     let model = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
+    metadata["model"] = benchmark_hardware::model(
+        model.gguf(),
+        gguf.file_name().and_then(|n| n.to_str()).unwrap_or("model"),
+        model_storage_bytes(&gguf),
+    );
     let (samples, placement) =
         model.bench_vulkan(n_prompt, n_gen, depth, synthetic_depth, pg, reps)?;
     let reported_depth = synthetic_depth.unwrap_or(depth);
@@ -4820,6 +4880,7 @@ fn cmd_bench(
         json,
         mtp.as_ref(),
         Some(&placement),
+        Some(&metadata),
     );
     Ok(())
 }
@@ -4916,16 +4977,22 @@ fn print_bench_avg_mtp(
     json: bool,
     mtp: Option<&MtpBenchStats>,
     placement: Option<&infr_llama::BenchPlacement>,
+    metadata: Option<&serde_json::Value>,
 ) {
     let Some(m) = mtp else {
-        print_bench_avg(samples, label, depth, suffix, reps, json, placement);
+        print_bench_avg(
+            samples, label, depth, suffix, reps, json, placement, metadata,
+        );
         return;
     };
     let avg = samples.iter().sum::<f64>() / samples.len().max(1) as f64;
     let ratio = m.ts / avg.max(1e-9);
     if json {
         // print-ok: program OUTPUT — an `infr bench` result line (`--json` shape included).
-        println!("{}", bench_json_line(samples, Some(m), placement));
+        println!(
+            "{}",
+            bench_json_with_metadata(samples, Some(m), placement, metadata)
+        );
         return;
     }
     let d = if depth > 0 {
@@ -4980,6 +5047,32 @@ fn bench_json_line(
     format!(
         "[{{\"avg_ts\": {avg:.2}{mtp_fields}, \"reps_ts\": [{}]{place}}}]",
         reps_ts.join(", ")
+    )
+}
+
+fn bench_json_with_metadata(
+    samples: &[f64],
+    mtp: Option<&MtpBenchStats>,
+    placement: Option<&infr_llama::BenchPlacement>,
+    metadata: Option<&serde_json::Value>,
+) -> String {
+    let line = bench_json_line(samples, mtp, placement);
+    let Some(metadata) = metadata else {
+        return line;
+    };
+    let mut metadata = metadata.clone();
+    if let Some(p) = placement {
+        metadata["configuration"]["actual_ubatch"] = p.ubatch.into();
+        metadata["configuration"]["kv_layout"] = p.kv_layout.into();
+        metadata["configuration"]["submit_dispatches"] = p.submit_cap.into();
+        if matches!(p.kv_layout, "f16" | "q8_0") {
+            metadata["configuration"]["kv_type_k"] = p.kv_layout.into();
+            metadata["configuration"]["kv_type_v"] = p.kv_layout.into();
+        }
+    }
+    format!(
+        "{}, \"benchmark_metadata\": {metadata}}}]",
+        line.strip_suffix("}]").expect("bench array")
     )
 }
 
@@ -5038,11 +5131,15 @@ fn print_bench_avg(
     reps: usize,
     json: bool,
     placement: Option<&infr_llama::BenchPlacement>,
+    metadata: Option<&serde_json::Value>,
 ) {
     let avg = samples.iter().sum::<f64>() / samples.len().max(1) as f64;
     if json {
         // print-ok: program OUTPUT — an `infr bench` result line (`--json` shape included).
-        println!("{}", bench_json_line(samples, None, placement));
+        println!(
+            "{}",
+            bench_json_with_metadata(samples, None, placement, metadata)
+        );
     } else {
         let d = if depth > 0 {
             format!(" @ d{depth}")
@@ -5119,22 +5216,33 @@ fn cmd_bench_metal(
     reps: usize,
     json: bool,
     cfg: &Arc<Config>,
+    metadata: &mut serde_json::Value,
 ) -> anyhow::Result<()> {
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (gguf, tok, n_prompt, n_gen, depth, pg, reps, json, cfg);
+        let _ = (
+            gguf, tok, n_prompt, n_gen, depth, pg, reps, json, cfg, metadata,
+        );
         anyhow::bail!("metal bench requires macOS");
     }
     #[cfg(target_os = "macos")]
     {
         let watch = infr_llama::WeightWatch::open(gguf)?;
         let model = infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?;
+        metadata["model"] = benchmark_hardware::model(
+            model.gguf(),
+            gguf.file_name().and_then(|n| n.to_str()).unwrap_or("model"),
+            model_storage_bytes(gguf),
+        );
         let shape = metal_bench_shape(n_prompt, n_gen, depth, pg);
         // ONE session for warmup + every rep: backend, uploaded weights, compiled pipelines and
         // the dequant/repack weight caches persist (each rep still measures a full prefill —
         // the depth warm resets the materialized tokens). A fresh backend per rep re-paid those
         // one-time costs inside the measurement.
         let mut sess = model.metal_session(shape.max_ctx)?;
+        let caps = sess.benchmark_capabilities();
+        metadata["hardware"]["gpu"]["name"] = caps.name.into();
+        metadata["hardware"]["gpu"]["unified_memory"] = caps.unified_memory.into();
         // One untimed warmup: build the weight caches and compile pipelines.
         let _ = model.bench_metal(&mut sess, 8, 2, true, false);
         let mut samples = Vec::with_capacity(reps);
@@ -5183,6 +5291,10 @@ fn cmd_bench_metal(
         // Numbers measured against a mapping whose file moved under it are not numbers. Checked
         // before REPORTING rather than before running, so the whole timed window is covered.
         watch.check()?;
+        if let Some((k, v)) = sess.benchmark_kv_formats() {
+            metadata["configuration"]["kv_type_k"] = format!("{k:?}").to_ascii_lowercase().into();
+            metadata["configuration"]["kv_type_v"] = format!("{v:?}").to_ascii_lowercase().into();
+        }
         print_bench_avg_mtp(
             &samples,
             &label,
@@ -5192,6 +5304,7 @@ fn cmd_bench_metal(
             json,
             mtp.as_ref(),
             None, // Metal has no Vulkan placement ladder / submit splitter to report.
+            Some(metadata),
         );
         Ok(())
     }
@@ -5210,6 +5323,7 @@ fn cmd_bench_cpu(
     reps: usize,
     json: bool,
     cfg: &Arc<Config>,
+    metadata: &mut serde_json::Value,
 ) -> anyhow::Result<()> {
     let watch = infr_llama::WeightWatch::open(gguf)?;
     let model = infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?;
@@ -5240,7 +5354,21 @@ fn cmd_bench_cpu(
     // Numbers measured against a mapping whose file moved under it are not numbers. Checked
     // before REPORTING rather than before running, so the whole timed window is covered.
     watch.check()?;
-    print_bench_avg(&samples, &label, depth, " [cpu]", reps, json, None);
+    metadata["model"] = benchmark_hardware::model(
+        model.gguf(),
+        gguf.file_name().and_then(|n| n.to_str()).unwrap_or("model"),
+        model_storage_bytes(gguf),
+    );
+    print_bench_avg(
+        &samples,
+        &label,
+        depth,
+        " [cpu]",
+        reps,
+        json,
+        None,
+        Some(metadata),
+    );
     Ok(())
 }
 
@@ -5491,6 +5619,7 @@ fn cmd_bench_diffusion_gemma(
     metal: bool,
     json: bool,
     cfg: &Arc<Config>,
+    metadata: &mut serde_json::Value,
 ) -> anyhow::Result<()> {
     if pg.is_some() {
         anyhow::bail!(
@@ -5515,7 +5644,10 @@ fn cmd_bench_diffusion_gemma(
     if json {
         let a = if n_gen > 0 { r.gen_ts } else { r.pp_ts };
         // print-ok: program OUTPUT — an `infr bench` result line (`--json` shape included).
-        println!("[{{\"avg_ts\": {a:.2}}}]");
+        println!(
+            "{}",
+            bench_json_with_metadata(&[a], None, None, Some(metadata))
+        );
     } else if n_gen > 0 {
         // print-ok: program OUTPUT — an `infr bench` result line (`--json` shape included).
         println!(
@@ -8324,6 +8456,58 @@ mod tests {
     /// any diagnostic printed beside it — takes down every cell of a sweep at once, silently, as
     /// a measurement failure rather than a crash. The stdout-purity half is enforced in `main`
     /// (the subscriber is pinned to stderr); this is the shape half.
+    #[test]
+    fn bench_json_metadata_keeps_avg_contract_and_actual_placement() {
+        let metadata = serde_json::json!({"hardware":{"cpu":{"name":"fixture"}},"configuration":{"configured_ubatch":4096}});
+        let place = infr_llama::BenchPlacement {
+            ubatch: 512,
+            ubatch_pinned: false,
+            kv_q8: true,
+            kv_layout: "q8_0",
+            submit_cap: 0,
+        };
+        let line = bench_json_with_metadata(&[100.0, 120.0], None, Some(&place), Some(&metadata));
+        assert!(line.starts_with("[{\"avg_ts\": "));
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value[0]["avg_ts"], 110.0);
+        assert_eq!(
+            value[0]["benchmark_metadata"]["configuration"]["configured_ubatch"],
+            4096
+        );
+        assert_eq!(
+            value[0]["benchmark_metadata"]["configuration"]["actual_ubatch"],
+            512
+        );
+        assert_eq!(
+            value[0]["benchmark_metadata"]["configuration"]["kv_type_k"],
+            "q8_0"
+        );
+        assert!(metadata["configuration"].get("actual_ubatch").is_none());
+    }
+
+    #[test]
+    fn benchmark_metadata_survives_compression_and_existing_validation() {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../scripts/fixtures/submission-vectors.json"
+        ))
+        .unwrap();
+        let mut payload = vectors["benchmark"].clone();
+        payload["model"]["quantization"] = "IQ3_S + Q4_K".into();
+        payload["hardware"]["collection"] =
+            serde_json::json!({"probes":{"ram":{"status":"permission_denied"}}});
+        payload["configuration"]["actual_ubatch"] = 512.into();
+        payload["configuration"]["kv_type_k"] = "q8_0".into();
+        payload["configuration"]["kv_type_v"] = "q8_0".into();
+        payload["configuration"]["backend"] = "vulkan".into();
+        payload["engine_commit"] = option_env!("INFR_GIT_COMMIT").into();
+        validate_benchmark_payload(&payload).unwrap();
+        let encoded = submission::encode(submission::Kind::Benchmark, &payload).unwrap();
+        assert!(encoded.len() < 128 * 1024);
+        let decoded = submission::decode(&encoded).unwrap();
+        assert_eq!(decoded.payload, payload);
+        validate_benchmark_payload(&decoded.payload).unwrap();
+    }
+
     #[test]
     fn bench_json_line_parses_and_leads_with_avg_ts() {
         let samples = [100.0_f64, 110.0, 120.0];

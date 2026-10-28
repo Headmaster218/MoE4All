@@ -392,6 +392,7 @@ impl Backend for ExpertParallelBackend {
         // attention qkv/dense fuses are LEFT ON — attention is replicated (not sharded) under EP, so
         // fused projections run identically on every rank.
         let mut c = self.ranks[0].capabilities();
+        c.linear_pair_q8 = false;
         c.decode_replay = false;
         c.embed_gather = false;
         c.gpu_sample = false;

@@ -10,6 +10,7 @@ verified_commit: ed62393068679573afe94a1472454efe7eae0f15
 
 ## Qwen3.8
 
+- [CPU 专家计算：静态模型、历史实测与实验边界](qwen38/2026-10-23-cpu-expert-offload.md)：配套异构执行方法论，保留基线、单位、IQ 行 tile、旧实测和未验证硬件算例的区别；本轮无新性能运行。
 - [低权重专家跳过与局部误差](qwen38/2026-10-11-low-weight-expert-omission.md)：真实专家输出记录、108 组离线策略、重归一化对照与交互曲面；未启用实际跳过。
 - [MTP 调研](qwen38/2026-09-22-mtp-investigation.md)
 - [MTP 瓶颈](qwen38/2026-09-23-mtp-bottlenecks.md)

@@ -2,6 +2,12 @@
 
 use thiserror::Error;
 
+/// A client-supplied value failed validation, not a backend or deployment failure.
+/// Keep this marker in the error chain so API adapters need not match error text.
+#[derive(Debug, Error)]
+#[error("{0}")]
+pub struct InvalidInput(pub String);
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("backend: {0}")]

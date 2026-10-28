@@ -4,7 +4,7 @@ use crate::*;
 use anyhow::{anyhow, Result};
 use infr_core::WeightSource;
 use infr_gguf::Gguf;
-use tokenizers::Tokenizer;
+use tokenizers::{DecoderWrapper, Tokenizer};
 
 /// Qwen2/Qwen3 pre-tokenizer regex (same string the HF `tokenizer.json` uses) — applied via a
 /// Split before ByteLevel. Differs from the default GPT-2 ByteLevel regex (punctuation/number runs),
@@ -90,9 +90,9 @@ pub(crate) fn build_per_layer_embd(g: &Gguf, cfg: &Config) -> Result<Option<PerL
     }))
 }
 
-/// UTF-8-safe incremental detokenizer for streaming: appends `id` to `acc`, decodes the whole
-/// sequence so far, and emits the newly-completed suffix past `printed` — holding back a trailing
-/// `�` (a multi-byte char split across tokens) until it completes. Mirrors the GPU path's streamer.
+/// UTF-8-safe streaming detokenizer: appends `id` to `acc` and emits the newly-completed suffix
+/// past `printed`, holding back a trailing replacement character until it completes. Pure
+/// ByteLevel decoders discard fully emitted history; contextual decoders retain it.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn stream_token(
     tokenizer: &Tokenizer,
@@ -127,23 +127,39 @@ pub(crate) fn stream_tokens(
     emit_decoded_suffix(tokenizer, acc, printed, on_piece);
 }
 
-/// Shared tail of [`stream_token`]/[`stream_tokens`]: decode the whole accumulator, emit the
-/// newly-completed suffix past `printed`, and hold back a trailing `�` (a multi-byte char split
-/// across the token boundary) until it completes.
+/// Decode the pending accumulator and emit the suffix past `printed`, holding back a trailing
+/// replacement character. Only a pure ByteLevel decoder can discard fully emitted history.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn emit_decoded_suffix(
     tokenizer: &Tokenizer,
-    acc: &[u32],
+    acc: &mut Vec<u32>,
     printed: &mut usize,
     on_piece: &mut impl FnMut(&str),
 ) {
-    if let Ok(full) = tokenizer.decode(acc, true) {
+    let decode_span = infr_core::timeline::span("token_detokenize");
+    let decoded = tokenizer.decode(acc, true);
+    drop(decode_span);
+    if let Ok(full) = decoded {
         if !full.ends_with('\u{FFFD}') && full.len() > *printed && full.is_char_boundary(*printed) {
+            let _callback = infr_core::timeline::span("token_output_callback");
             on_piece(&full[*printed..]);
             *printed = full.len();
         }
+        // ByteLevel concatenates raw bytes; without a trailing replacement character,
+        // later bytes cannot repair this fully emitted suffix. Keep contextual history.
+        if !full.ends_with('\u{FFFD}')
+            && *printed == full.len()
+            && matches!(tokenizer.get_decoder(), Some(DecoderWrapper::ByteLevel(_)))
+        {
+            acc.clear();
+            *printed = 0;
+        }
     }
 }
+
+#[cfg(test)]
+#[path = "util_streaming_tests.rs"]
+mod util_streaming_tests;
 
 /// Run `f` with per-op GPU profiling suppressed for its duration, restoring the prior state
 /// afterward. Every backend's `warmup()` / startup path (`chat::vulkan`, `chat::diffusion`,
@@ -196,16 +212,132 @@ pub(crate) fn test_qwen3_06b() -> Option<std::path::PathBuf> {
     })
 }
 
-/// Append chat-end markers in the vocab (`<|im_end|>` / `<|endoftext|>` / `<|eot_id|>`) to
-/// `cfg.eos_ids` so generation stops on any of them, not just the GGUF `eos`.
+/// Resolve generation ends once for both sampling and forced-tool constraints. Metadata ends
+/// apply to every family; additional protocol spellings must stay scoped to their model family.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn add_chat_eos(cfg: &mut Config, tokenizer: &Tokenizer) {
-    for name in ["<|im_end|>", "<|endoftext|>", "<|eot_id|>"] {
-        if let Some(id) = tokenizer.token_to_id(name) {
-            if !cfg.eos_ids.contains(&id) {
-                cfg.eos_ids.push(id);
+pub(crate) fn resolve_chat_eos(
+    md: &infr_core::loader::Metadata,
+    tokenizer: &Tokenizer,
+    eos: u32,
+) -> Vec<u32> {
+    let mut ids = vec![eos];
+    for key in ["tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id"] {
+        if let Some(id) = md.u64(key).and_then(|id| u32::try_from(id).ok()) {
+            if tokenizer.id_to_token(id).is_some() && !ids.contains(&id) {
+                ids.push(id);
             }
         }
+    }
+    // Preserve the existing ChatML/Llama stop policy.
+    for name in ["<|im_end|>", "<|endoftext|>", "<|eot_id|>"] {
+        if let Some(id) = tokenizer.token_to_id(name) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    let gemma4 = md.str("tokenizer.ggml.model") == Some("gemma4")
+        || matches!(
+            md.str("general.architecture"),
+            Some(crate::arch::GEMMA4 | crate::arch::DIFFUSION_GEMMA)
+        );
+    if gemma4 {
+        // A turn end and a tool handoff both end generation. <channel|> only closes reasoning.
+        for name in ["<turn|>", "<|tool_response>"] {
+            if let Some(id) = tokenizer.token_to_id(name) {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+    ids
+}
+
+#[cfg(test)]
+mod chat_eos_tests {
+    use super::*;
+    use infr_core::loader::{MetaValue, Metadata};
+    use tokenizers::models::bpe::BPE;
+
+    fn tokenizer() -> Tokenizer {
+        let vocab: std::collections::HashMap<String, u32> = [
+            "<unk>",
+            "<eos>",
+            "<turn|>",
+            "<|tool_response>",
+            "<channel|>",
+            "ordinary",
+            "<|im_end|>",
+            "<|endoftext|>",
+            "<|eot_id|>",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(id, name)| (name.to_string(), id as u32))
+        .collect();
+        Tokenizer::new(
+            BPE::builder()
+                .vocab_and_merges(vocab, vec![])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn gemma4_ends_turns_and_yields_tools_but_not_reasoning() {
+        let tok = tokenizer();
+        for (key, value) in [
+            ("general.architecture", crate::arch::GEMMA4),
+            ("general.architecture", crate::arch::DIFFUSION_GEMMA),
+            ("tokenizer.ggml.model", "gemma4"),
+        ] {
+            let mut md = Metadata::default();
+            md.kv.insert(key.into(), MetaValue::Str(value.into()));
+            let ids = resolve_chat_eos(&md, &tok, 1);
+            assert_eq!(ids, [1, 6, 7, 8, 2, 3]);
+            assert!(!ids.contains(&4));
+            assert!(!ids.contains(&5));
+        }
+    }
+
+    #[test]
+    fn other_families_keep_the_existing_marker_policy() {
+        assert_eq!(
+            resolve_chat_eos(&Metadata::default(), &tokenizer(), 1),
+            [1, 6, 7, 8]
+        );
+    }
+
+    #[test]
+    fn explicit_metadata_ends_are_deduplicated_and_checked() {
+        let mut md = Metadata::default();
+        md.kv
+            .insert("tokenizer.ggml.eot_token_id".into(), MetaValue::U64(5));
+        md.kv
+            .insert("tokenizer.ggml.eom_token_id".into(), MetaValue::U64(1));
+        assert_eq!(resolve_chat_eos(&md, &tokenizer(), 1), [1, 5, 6, 7, 8]);
+        for invalid in [
+            MetaValue::I64(-1),
+            MetaValue::U64(u64::MAX),
+            MetaValue::U64(1000),
+        ] {
+            md.kv.insert("tokenizer.ggml.eot_token_id".into(), invalid);
+            assert_eq!(resolve_chat_eos(&md, &tokenizer(), 1), [1, 6, 7, 8]);
+        }
+    }
+
+    #[test]
+    fn missing_optional_markers_do_not_invent_token_ids() {
+        let mut md = Metadata::default();
+        md.kv.insert(
+            "tokenizer.ggml.model".into(),
+            MetaValue::Str("gemma4".into()),
+        );
+        assert_eq!(
+            resolve_chat_eos(&md, &Tokenizer::new(BPE::default()), 1),
+            [1]
+        );
     }
 }
 

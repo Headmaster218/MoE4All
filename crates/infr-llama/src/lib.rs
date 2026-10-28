@@ -23,6 +23,8 @@ pub mod grammar;
 pub mod parallel;
 pub mod sampling;
 mod session_cache;
+mod speculative_lookup;
+mod speculative_verify;
 pub use config::Config;
 
 /// The ENGINE configuration ([`infr_core::config::Config`]), re-exported under a name that cannot

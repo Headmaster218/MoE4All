@@ -387,7 +387,7 @@ fn plan_kv_write(graph: &Graph, plan: &mut FusionPlan) {
 /// function keeps that check the same one every other pattern uses.
 pub fn dst_only_read_by_next(graph: &Graph, start: usize, dst: TensorId) -> bool {
     for j in start..graph.ops.len() {
-        let (ins, outs) = graph.ops[j].io();
+        let (ins, outs) = graph.ops[j].io_inline();
         if ins.contains(&dst) {
             return false;
         }
@@ -404,6 +404,255 @@ mod tests {
     use crate::config::Config;
     use crate::graph::Op;
     use crate::tensor::TensorDesc;
+
+    fn dst_only_read_by_next_vec_reference(graph: &Graph, start: usize, dst: TensorId) -> bool {
+        for j in start..graph.ops.len() {
+            let (ins, outs) = graph.ops[j].io();
+            if ins.contains(&dst) {
+                return false;
+            }
+            if outs.contains(&dst) {
+                break;
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn dst_only_read_by_next_inline_matches_vec_reference() {
+        let mut g = Graph::new();
+        let x = g.input(TensorDesc::new(vec![1, 4], DType::F32));
+        let dst = g.internal(TensorDesc::new(vec![1, 4], DType::F32));
+        let other = g.internal(TensorDesc::new(vec![1, 4], DType::F32));
+        let wa = g.weight(TensorDesc::new(vec![4, 4], DType::F32));
+        let wb = g.weight(TensorDesc::new(vec![4, 4], DType::F32));
+        let unrelated = || Op::Scale {
+            x,
+            dst: other,
+            s: 1.0,
+            n: 4,
+        };
+        let read = || Op::Scale {
+            x: dst,
+            dst: other,
+            s: 1.0,
+            n: 4,
+        };
+        let rewrite = || Op::Scale {
+            x,
+            dst,
+            s: 1.0,
+            n: 4,
+        };
+        let read_write = || Op::Scale {
+            x: dst,
+            dst,
+            s: 1.0,
+            n: 4,
+        };
+        let multi_output = |first: bool| Op::LinearPair {
+            x,
+            weight_a: wa,
+            weight_b: wb,
+            dst_a: if first { dst } else { other },
+            dst_b: if first { other } else { dst },
+            m: 1,
+            in_f: 4,
+            out_f: 4,
+        };
+        let cases: [(&str, Vec<Op>, &[bool]); 8] = [
+            ("empty", vec![], &[true]),
+            ("untouched", vec![unrelated()], &[true, true]),
+            (
+                "read_without_rewrite",
+                vec![unrelated(), read()],
+                &[false, false, true],
+            ),
+            (
+                "rewrite_before_future_read",
+                vec![rewrite(), read()],
+                &[true, false, true],
+            ),
+            (
+                "read_before_same_op_write",
+                vec![read_write()],
+                &[false, true],
+            ),
+            (
+                "first_output_rewrite",
+                vec![multi_output(true), read()],
+                &[true, false, true],
+            ),
+            (
+                "second_output_rewrite",
+                vec![multi_output(false), read()],
+                &[true, false, true],
+            ),
+            (
+                "reused_tensor_versions",
+                vec![rewrite(), read_write(), rewrite(), read()],
+                &[true, false, true, false, true],
+            ),
+        ];
+        for (name, ops, expected) in cases {
+            g.ops = ops;
+            assert_eq!(expected.len(), g.ops.len() + 1, "{name}");
+            for (start, &want) in expected.iter().enumerate() {
+                assert_eq!(
+                    dst_only_read_by_next(&g, start, dst),
+                    want,
+                    "{name} {start}"
+                );
+            }
+            for start in (0..=g.ops.len() + 2).chain(std::iter::once(usize::MAX)) {
+                for id in [x, dst, other, wa, wb] {
+                    assert_eq!(
+                        dst_only_read_by_next(&g, start, id),
+                        dst_only_read_by_next_vec_reference(&g, start, id),
+                        "{name} start={start} tensor={id:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "CPU-only paired timing on a generated graph; parent runs after the GPU queue"]
+    fn dst_only_read_by_next_paired_microbench() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        let mut g = Graph::new();
+        let x = g.input(TensorDesc::new(vec![1, 4], DType::F32));
+        let untouched = g.input(TensorDesc::new(vec![1, 4], DType::F32));
+        let tail_read = g.input(TensorDesc::new(vec![1, 4], DType::F32));
+        let gate = g.internal(TensorDesc::new(vec![1, 4], DType::F32));
+        let tmp = g.internal(TensorDesc::new(vec![1, 4], DType::F32));
+        let other = g.internal(TensorDesc::new(vec![1, 4], DType::F32));
+        let wa = g.weight(TensorDesc::new(vec![4, 4], DType::F32));
+        let wb = g.weight(TensorDesc::new(vec![4, 4], DType::F32));
+        let mut next_writes = Vec::new();
+        for layer in 0..48 {
+            g.push(Op::Scale {
+                x,
+                dst: gate,
+                s: 1.0,
+                n: 4,
+            });
+            if layer < 47 {
+                next_writes.push((g.ops.len(), gate));
+            }
+            for step in 0..[8, 16, 32][layer % 3] {
+                g.push(match step % 3 {
+                    0 => Op::LinearPair {
+                        x,
+                        weight_a: wa,
+                        weight_b: wb,
+                        dst_a: tmp,
+                        dst_b: other,
+                        m: 1,
+                        in_f: 4,
+                        out_f: 4,
+                    },
+                    1 => Op::Scale {
+                        x: tmp,
+                        dst: other,
+                        s: 1.0,
+                        n: 4,
+                    },
+                    _ => Op::Add {
+                        a: x,
+                        b: tmp,
+                        dst: other,
+                        n: 4,
+                    },
+                });
+            }
+        }
+        g.push(Op::Scale {
+            x: tail_read,
+            dst: other,
+            s: 1.0,
+            n: 4,
+        });
+        let no_write = [(0, untouched), (g.ops.len() / 2, untouched)];
+        let read_at_end = [(0, tail_read), (g.ops.len() / 2, tail_read)];
+        let cases: [(&str, &[(usize, TensorId)], bool); 3] = [
+            ("next_write_intervals", &next_writes, true),
+            ("end_no_write", &no_write, true),
+            ("end_read_no_write", &read_at_end, false),
+        ];
+        let sample = |old: bool, queries: &[(usize, TensorId)], repeats: usize| {
+            let scan: fn(&Graph, usize, TensorId) -> bool = if old {
+                dst_only_read_by_next_vec_reference
+            } else {
+                dst_only_read_by_next
+            };
+            let scan = black_box(scan);
+            let mut checksum = 0usize;
+            let begin = Instant::now();
+            for _ in 0..repeats {
+                for &(start, id) in queries {
+                    checksum += usize::from(black_box(scan(
+                        black_box(&g),
+                        black_box(start),
+                        black_box(id),
+                    )));
+                }
+            }
+            let elapsed = begin.elapsed();
+            (elapsed, black_box(checksum))
+        };
+        const REPEATS: usize = 32;
+        const ROUNDS: usize = 6;
+        eprintln!(
+            "generated-graph CPU-only: layers=48 ops={} intervals=8/16/32; A=old-io B=inline; not native lowering or allocation counts; debug_assertions={}",
+            g.ops.len(),
+            cfg!(debug_assertions)
+        );
+        for (name, queries, expected) in cases {
+            for &(start, id) in queries {
+                assert_eq!(dst_only_read_by_next_vec_reference(&g, start, id), expected);
+                assert_eq!(dst_only_read_by_next(&g, start, id), expected);
+            }
+            let expected_sum = usize::from(expected) * queries.len() * REPEATS;
+            for old in [true, false] {
+                assert_eq!(sample(old, queries, REPEATS).1, expected_sum);
+            }
+            let mut totals = [Duration::ZERO; 2];
+            for round in 0..ROUNDS {
+                let order = if round % 2 == 0 {
+                    [true, false, false, true]
+                } else {
+                    [false, true, true, false]
+                };
+                let mut paired = [Duration::ZERO; 2];
+                for old in order {
+                    let (elapsed, checksum) = sample(old, queries, REPEATS);
+                    assert_eq!(checksum, expected_sum);
+                    paired[usize::from(!old)] += elapsed;
+                }
+                let calls = (2 * REPEATS * queries.len()) as f64;
+                let a = paired[0].as_secs_f64() * 1e9 / calls;
+                let b = paired[1].as_secs_f64() * 1e9 / calls;
+                eprintln!(
+                    "{name} round={round} order={} calls_per_side={} A_ns_per_call={a:.2} B_ns_per_call={b:.2} B_over_A={:.4}",
+                    if round % 2 == 0 { "ABBA" } else { "BAAB" },
+                    2 * REPEATS * queries.len(),
+                    b / a
+                );
+                for side in 0..2 {
+                    totals[side] += paired[side];
+                }
+            }
+            eprintln!(
+                "{name} aggregate A_ms={:.3} B_ms={:.3} B_over_A={:.4}; no winner assertion",
+                totals[0].as_secs_f64() * 1e3,
+                totals[1].as_secs_f64() * 1e3,
+                totals[1].as_secs_f64() / totals[0].as_secs_f64()
+            );
+        }
+    }
 
     /// A minimal decode `Linear(m==1) -> Add(residual)` pair, the shape both `linear_add` backends
     /// fuse.

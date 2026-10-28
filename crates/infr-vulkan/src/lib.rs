@@ -11,10 +11,13 @@
 
 mod adapter;
 mod arena;
+pub mod benchmark_report;
 mod caps;
 mod cpu_miss;
 pub mod ep;
 mod gemm;
+#[cfg(test)]
+pub(crate) mod indirect_copy;
 pub mod linear;
 mod matmul;
 mod ops;
@@ -28,6 +31,8 @@ pub mod tp;
 pub mod tp_allreduce;
 pub mod tp_sem;
 mod transfer;
+#[cfg(test)]
+mod host_ready_combined_test_support;
 pub mod unified;
 mod vkext;
 
@@ -57,6 +62,23 @@ pub const FLASH_HD256_BM16_SHARED: u32 = 30_912;
 /// Keep in sync with `attn_flash_reg.comp`.
 pub const FLASH_REG_SHARED_PER_ROW: u32 = 460;
 
+/// O07 sums[256] + part[8] + gated_local[2560], all F32.
+pub(crate) const PLE_GATE_NORM_LDS_SHARED: u32 = 11_296;
+
+fn ple_gate_norm_lds_device_ok(
+    windows: bool,
+    arch: caps::DeviceArch,
+    caps: &infr_core::backend::Capabilities,
+) -> bool {
+    windows
+        && arch == caps::DeviceArch::AmdRdna3
+        && !caps.integrated
+        && caps.subgroup_min > 0
+        && caps.subgroup_min <= 32
+        && caps.subgroup_max >= 32
+        && caps.max_shared_memory_bytes >= PLE_GATE_NORM_LDS_SHARED
+}
+
 use rayon::prelude::*;
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -64,6 +86,8 @@ use std::ffi::CStr;
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
+
+mod host_ready;
 use std::time::{Duration, Instant};
 
 use ash::vk;
@@ -74,7 +98,8 @@ use gpu_allocator::MemoryLocation;
 
 use infr_core::{
     backend::{
-        Bindings, Buffer, BufferUsage, Capabilities, IdleResourceReclaimer, Plan, SegmentedKvSpec,
+        Bindings, Buffer, BufferUsage, Capabilities, ExecutionStage, IdleResourceReclaimer, Plan,
+        SegmentedKvSpec,
     },
     budget::{spill_report_line, SpillNouns, SpillTally},
     config::Config,
@@ -709,13 +734,20 @@ struct VulkanShared {
     _entry: ash::Entry,
     instance: ash::Instance,
     physical_device: vk::PhysicalDevice,
+    exact_silu_quant_order: bool,
     device: ash::Device,
     queue: vk::Queue,
     queue_family_index: u32,
+    /// Optional KHR indirect-copy ABI; availability alone never selects a recorder policy.
+    #[cfg(test)]
+    indirect_copy: Option<crate::indirect_copy::Device>,
     /// Optional transfer-only queue for imported host-RAM to unified-arena copies. Its absence
     /// preserves the established main-queue path on devices without the required family or
     /// timeline support.
     dedicated_transfer: Option<Mutex<crate::transfer::DedicatedTransferQueue>>,
+    /// Conservative lock-free gate for completed-owner retirement. Publish true BEFORE submit;
+    /// recompute under the same dedicated queue mutex after every submit/retirement mutation.
+    dedicated_transfer_keepalive_pending: AtomicBool,
     /// Vulkan requires host access to one queue to be externally synchronized. It also turns the
     /// rare submit-OOM recovery into one atomic drain/retry boundary across the graph and Prefill
     /// upload threads without changing GPU submission order.
@@ -727,10 +759,13 @@ struct VulkanShared {
     /// residency is resolved before its copies are submitted, so allowing a later request after an
     /// ultimately failed submit could turn those unexecuted copies into false cache hits.
     queue_submit_failure: AtomicI32,
+    /// Global buffer-lifetime generation for revalidating unsubmitted raw references.
+    resource_epoch: AtomicU64,
     /// Serialises all one-shot command-buffer submissions.
     cmd_pool: Mutex<vk::CommandPool>,
     /// Completed transient recorder command buffers. Acquisition resets one before recording.
     recorder_cmds: Mutex<Vec<vk::CommandBuffer>>,
+    recorder_prepared_pools: recorder::PreparedPoolCache,
     /// Completed transient recorder descriptor-pool tranches. They are reset on acquisition.
     recorder_desc_pools: Mutex<Vec<vk::DescriptorPool>>,
     /// Completed fences from non-blocking recorder submissions. They are reset on acquisition.
@@ -741,6 +776,8 @@ struct VulkanShared {
     /// Must be dropped before the device is destroyed.
     allocator: ManuallyDrop<Mutex<Allocator>>,
     caps: Capabilities,
+    /// Subgroup operations actually available to compute shaders; empty means scalar fallback.
+    compute_subgroup_operations: vk::SubgroupFeatureFlags,
     /// Architecture bucket retained for narrow Vulkan kernel-policy decisions that must not leak
     /// vendor-specific flags into infr-core's backend-neutral `Capabilities`.
     device_arch: crate::caps::DeviceArch,
@@ -1067,6 +1104,9 @@ impl VulkanShared {
         queue: vk::Queue,
         submit: &vk::SubmitInfo<'_>,
     ) -> Result<()> {
+        if adapter::preparing_commands() {
+            return Err(be("next-token preparation cannot submit GPU transfers"));
+        }
         if let Some(error) = self.queue_submit_failure() {
             return Err(be(format!(
                 "dedicated transfer queue is unavailable after an earlier submit failure: {error}"
@@ -1126,10 +1166,26 @@ impl VulkanShared {
         &self,
         batches: &[crate::transfer::TransferCopyBatch],
     ) -> Result<Option<u64>> {
+        if batches.is_empty() {
+            return Ok(None);
+        }
         let Some(queue) = self.dedicated_transfer.as_ref() else {
             return Ok(None);
         };
-        queue.lock().unwrap().submit(self, batches).map(Some)
+        let mut retired = std::array::from_fn(|_| Vec::new());
+        let result = {
+            let mut queue = queue.lock().unwrap();
+            // A probe that sees true serializes with this submit. Unwind leaves true (safe),
+            // rather than losing the only retirement notification for accepted GPU work.
+            self.dedicated_transfer_keepalive_pending
+                .store(true, Ordering::Release);
+            let result = queue.submit(self, batches, &mut retired).map(Some);
+            self.dedicated_transfer_keepalive_pending
+                .store(queue.has_pending_keepalive(), Ordering::Release);
+            result
+        };
+        drop(retired);
+        result
     }
 
     fn wait_dedicated_transfer(&self, value: u64) -> Result<()> {
@@ -1158,7 +1214,95 @@ impl VulkanShared {
         if let Some(elapsed) = infr_core::pager_profile::elapsed(wait_t0) {
             infr_core::pager_profile::record_dedicated_transfer_timeline_wait(elapsed);
         }
-        wait.map_err(|error| be(format!("wait dedicated transfer timeline {value}: {error}")))
+        wait.map_err(|error| be(format!("wait dedicated transfer timeline {value}: {error}")))?;
+        self.retire_waited_dedicated_transfer_through(value);
+        Ok(())
+    }
+
+    /// A successful CPU wait proves this prefix without another Vulkan query or queue-idle.
+    fn retire_waited_dedicated_transfer_through(&self, completed: u64) {
+        if completed == 0
+            || !self
+                .dedicated_transfer_keepalive_pending
+                .load(Ordering::Acquire)
+        {
+            return;
+        }
+        let Some(queue) = self.dedicated_transfer.as_ref() else {
+            return;
+        };
+        let retired = {
+            let Ok(mut queue) = queue.lock() else {
+                return; // No new poisoned-lock/error retirement policy.
+            };
+            let retired = queue.take_completed_keepalive(completed);
+            self.dedicated_transfer_keepalive_pending
+                .store(queue.has_pending_keepalive(), Ordering::Release);
+            retired
+        };
+        // The caller still owns Shared while VkBuffer::drop may use its allocator/device.
+        drop(retired);
+    }
+
+    /// A successfully drained compute fence proves ONLY its submitted timeline-wait prefix.
+    /// Pass that submission's captured transfer value, never a current/newest queue value.
+    /// Cleanup is opportunistic: contention leaves owners for a later proof or CPU wait, without
+    /// blocking the foreground on another transfer slot's wait/recording. No Vulkan query needed.
+    pub(crate) fn retire_dedicated_transfer_through(&self, completed: u64) {
+        if completed == 0
+            || !self
+                .dedicated_transfer_keepalive_pending
+                .load(Ordering::Acquire)
+        {
+            return;
+        }
+        let Some(queue) = self.dedicated_transfer.as_ref() else {
+            return;
+        };
+        let retired = {
+            let Ok(mut queue) = queue.try_lock() else {
+                return;
+            };
+            let retired = queue.take_completed_keepalive(completed);
+            self.dedicated_transfer_keepalive_pending
+                .store(queue.has_pending_keepalive(), Ordering::Release);
+            retired
+        };
+        drop(retired);
+    }
+
+    /// Best-effort fallback after an existing queue/device-idle boundary, not per-fence cleanup.
+    /// Main-queue idle alone does not prove all transfer work complete: read the actual timeline.
+    pub(crate) fn retire_completed_dedicated_transfers(&self) {
+        if !self
+            .dedicated_transfer_keepalive_pending
+            .load(Ordering::Acquire)
+        {
+            return;
+        }
+        let Some(queue) = self.dedicated_transfer.as_ref() else {
+            return;
+        };
+        let retired = {
+            let Ok(mut queue) = queue.try_lock() else {
+                return;
+            };
+            // Another retirement may have won between the atomic load and try_lock.
+            if !queue.has_pending_keepalive() {
+                self.dedicated_transfer_keepalive_pending
+                    .store(false, Ordering::Release);
+                return;
+            }
+            let completed = match unsafe { self.device.get_semaphore_counter_value(queue.timeline()) } {
+                Ok(value) => value,
+                Err(_) => return, // Unproven owners stay pinned; D3 error policy is unchanged.
+            };
+            let retired = queue.take_completed_keepalive(completed);
+            self.dedicated_transfer_keepalive_pending
+                .store(queue.has_pending_keepalive(), Ordering::Release);
+            retired
+        };
+        drop(retired);
     }
 
     fn queue_submit_commands_recovering(
@@ -1169,26 +1313,57 @@ impl VulkanShared {
         context: &str,
         transfer_wait: u64,
     ) -> std::result::Result<(), vk::Result> {
-        if transfer_wait == 0 {
+        self.queue_submit_commands_host_ready_recovering(
+            commands,
+            fence,
+            profile_dispatches,
+            context,
+            transfer_wait,
+            None,
+        )
+    }
+
+    fn queue_submit_commands_host_ready_recovering(
+        &self,
+        commands: &[vk::CommandBuffer],
+        fence: vk::Fence,
+        profile_dispatches: Option<usize>,
+        context: &str,
+        transfer_wait: u64,
+        host_ready: Option<(vk::Semaphore, u64)>,
+    ) -> std::result::Result<(), vk::Result> {
+        if transfer_wait == 0 && host_ready.is_none() {
             let submits = [vk::SubmitInfo::default().command_buffers(commands)];
             return self.queue_submit_recovering(&submits, fence, profile_dispatches, context);
         }
-        let timeline = self
-            .dedicated_transfer
-            .as_ref()
-            .expect("a transfer timeline wait requires the dedicated queue")
-            .lock()
-            .unwrap()
-            .timeline();
-        let waits = [timeline];
-        let values = [transfer_wait];
-        let stages = [vk::PipelineStageFlags::ALL_COMMANDS];
+        let mut waits = [vk::Semaphore::null(); 2];
+        let mut values = [0u64; 2];
+        let mut count = 0;
+        if transfer_wait != 0 {
+            let transfer_queue = self
+                .dedicated_transfer
+                .as_ref()
+                .expect("a transfer timeline wait requires the dedicated queue");
+            let transfer_lock_span = infr_core::timeline::span("mainqueue_transfer_lock_wait");
+            let transfer = transfer_queue.lock().unwrap();
+            drop(transfer_lock_span);
+            waits[count] = transfer.timeline();
+            drop(transfer);
+            values[count] = transfer_wait;
+            count += 1;
+        }
+        if let Some((semaphore, value)) = host_ready {
+            waits[count] = semaphore;
+            values[count] = value;
+            count += 1;
+        }
+        let stages = [vk::PipelineStageFlags::ALL_COMMANDS; 2];
         let mut timeline_info =
-            vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&values);
+            vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&values[..count]);
         let submits = [vk::SubmitInfo::default()
             .command_buffers(commands)
-            .wait_semaphores(&waits)
-            .wait_dst_stage_mask(&stages)
+            .wait_semaphores(&waits[..count])
+            .wait_dst_stage_mask(&stages[..count])
             .push_next(&mut timeline_info)];
         self.queue_submit_recovering(&submits, fence, profile_dispatches, context)
     }
@@ -1269,7 +1444,9 @@ impl VulkanShared {
         let started = profile_dispatches
             .filter(|_| infr_core::pager_profile::active())
             .map(|_| std::time::Instant::now());
+        let submit_span = infr_core::timeline::span("mainqueue_vk_submit");
         let result = unsafe { self.device.queue_submit(self.queue, submits, fence) };
+        drop(submit_span);
         if let (Some(dispatches), Some(t0)) = (profile_dispatches, started) {
             infr_core::pager_profile::record_queue_submit(dispatches, t0.elapsed());
         }
@@ -1309,7 +1486,12 @@ impl VulkanShared {
         profile_dispatches: Option<usize>,
         context: &str,
     ) -> std::result::Result<(), vk::Result> {
+        if adapter::preparing_commands() {
+            return Err(vk::Result::ERROR_VALIDATION_FAILED_EXT);
+        }
+        let queue_lock_span = infr_core::timeline::span("mainqueue_host_lock_wait");
         let _queue = self.queue_access.lock().unwrap();
+        drop(queue_lock_span);
         if let Some(error) = self.queue_submit_failure() {
             return Err(error);
         }
@@ -1438,13 +1620,25 @@ impl VulkanShared {
     }
 
     pub(crate) fn queue_wait_idle_serialized(&self) -> std::result::Result<(), vk::Result> {
-        let _queue = self.queue_access.lock().unwrap();
-        unsafe { self.device.queue_wait_idle(self.queue) }
+        let result = {
+            let _queue = self.queue_access.lock().unwrap();
+            unsafe { self.device.queue_wait_idle(self.queue) }
+        };
+        if result.is_ok() {
+            self.retire_completed_dedicated_transfers();
+        }
+        result
     }
 
     fn device_wait_idle_serialized(&self) -> std::result::Result<(), vk::Result> {
-        let _queue = self.queue_access.lock().unwrap();
-        unsafe { self.device.device_wait_idle() }
+        let result = {
+            let _queue = self.queue_access.lock().unwrap();
+            unsafe { self.device.device_wait_idle() }
+        };
+        if result.is_ok() {
+            self.retire_completed_dedicated_transfers();
+        }
+        result
     }
 }
 
@@ -1669,6 +1863,7 @@ impl Drop for VulkanShared {
                 self.device.device_wait_idle(),
                 Err(vk::Result::ERROR_DEVICE_LOST)
             );
+            self.recorder_prepared_pools.destroy(&self.device);
             if let Ok(map) = self.kernels.lock() {
                 for k in map.values() {
                     crate::ops::destroy_compute_kernel(&self.device, k);
@@ -1698,6 +1893,7 @@ impl Drop for VulkanShared {
                 self.device.destroy_query_pool(pool, None);
             }
             // Destroy command pool.
+            self.recorder_prepared_pools.destroy(&self.device);
             let pool = self.cmd_pool.lock().unwrap();
             self.device.destroy_command_pool(*pool, None);
             // Drop the allocator *before* destroying the device.
@@ -1712,6 +1908,12 @@ impl Drop for VulkanShared {
 
 /// How a `VkBuffer`'s device memory is owned.
 enum Backing {
+    /// Non-owning snapshot used only by a scoped recording worker. The caller pins the owner.
+    RecordingAlias {
+        mapped: Option<*mut u8>,
+        /// Original arena/shard extent for descriptor range clamping; `None` for whole buffers.
+        backing_len: Option<usize>,
+    },
     /// A gpu-allocator sub-allocation — freed back to the allocator on drop (transient buffers,
     /// host-visible staging/readback).
     Pooled(ManuallyDrop<Allocation>),
@@ -1738,7 +1940,7 @@ enum Backing {
     /// mapped device-local heap is absent or too small (notably RDNA2 on the Windows AMD driver).
     Device { memory: vk::DeviceMemory },
     /// A logical BYTE RANGE of a [`BdaWeightArena`] block's single big `vk::Buffer` (resident weight
-    /// sub-tensors — see [`VulkanBackend::bda_weight_alloc`]). Unlike every other
+    /// sub-tensors — see [`VulkanBackend::bda_weight_alloc`]). Unlike an owning
     /// variant, `VkBuffer::buffer` here is NOT this handle's own object: it is the block's buffer,
     /// shared byte-for-byte with every other sub-tensor carved from the same block, and with the
     /// block's own keepalive copy. The `Arc` is what keeps the block (and therefore its memory and
@@ -1814,12 +2016,45 @@ struct VkBuffer {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl VkBuffer {
+    /// Snapshot buffer identity without owning or allocating GPU storage.
+    ///
+    /// # Safety
+    /// The caller must keep the original allocation, buffer identity, and mapping alive and
+    /// unchanged until the scoped recording worker joins and drops all aliases. Pin original
+    /// scratch-pool entries against growth/free. Use the alias only to record descriptors; it
+    /// must never escape the worker or be used for host reads/writes or resource management.
+    /// Recorded commands retain no allocation ownership and require the parent's lifetime and
+    /// resource-epoch validation before submission.
+    pub(crate) unsafe fn recording_alias(&self) -> VkBuffer {
+        let backing_len = match &self.backing {
+            Backing::BdaSub(block) => Some(block.buf.size),
+            Backing::UnifiedSub(handle) => Some(handle.shard_bytes()),
+            Backing::RecordingAlias { backing_len, .. } => *backing_len,
+            _ => None,
+        };
+        VkBuffer {
+            shared: Arc::clone(&self.shared),
+            buffer: self.buffer,
+            backing: Backing::RecordingAlias {
+                mapped: self.mapped_ptr(),
+                backing_len,
+            },
+            size: self.size,
+            mem_size: 0,
+            location: self.location,
+            sub_offset: self.sub_offset,
+            own_addr: self.device_addr(),
+            act_bytes: 0,
+        }
+    }
+
     /// Persistently-mapped host pointer for host-visible buffers — pooled host-visible allocations
     /// AND [`Backing::Vram`] weights (device-local VRAM the host can write through, via ReBAR).
     /// `None` for plain device-local or arena buffers, which are filled via a staging copy.
     /// Every "can I just memcpy into this?" decision (`upload`, `fill_buf`) keys off this.
     fn mapped_ptr(&self) -> Option<*mut u8> {
         match &self.backing {
+            Backing::RecordingAlias { mapped, .. } => *mapped,
             Backing::Pooled(a) => a.mapped_ptr().map(|p| p.as_ptr() as *mut u8),
             Backing::Vram { ptr, .. } => Some(*ptr),
             Backing::Device { .. } => None,
@@ -1845,6 +2080,11 @@ impl VkBuffer {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Drop for VkBuffer {
     fn drop(&mut self) {
+        if matches!(&self.backing, Backing::RecordingAlias { .. }) {
+            return;
+        }
+        // Invalidate prepared commands before backing storage or buffer handles can be reused.
+        self.shared.resource_epoch.fetch_add(1, Ordering::AcqRel);
         // Release this buffer's share of the live-activation tally (see `VulkanShared::act_live`).
         // `act_peak` is a high-water mark and deliberately never comes back down.
         if self.act_bytes > 0 {
@@ -1854,6 +2094,7 @@ impl Drop for VkBuffer {
         }
         unsafe {
             match &mut self.backing {
+                Backing::RecordingAlias { .. } => return,
                 Backing::Pooled(alloc) => {
                     let alloc = ManuallyDrop::take(alloc);
                     self.shared.release_owned_ram(alloc.size());
@@ -3019,6 +3260,66 @@ impl VulkanBackend {
         cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
     }
 
+    /// IQ4_NL pair-table MMQ was measured on Windows/Navi 31; other architectures keep the
+    /// scalar codebook kernel until their occupancy and initialization costs are validated.
+    pub(crate) fn prefers_iq4_pair_lut(&self) -> bool {
+        cfg!(target_os = "windows")
+            && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+            && !self.shared.caps.integrated
+    }
+
+    pub(crate) fn prefers_deltanet_fused_norm(&self) -> bool {
+        cfg!(target_os = "windows")
+            && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+            && !self.shared.caps.integrated
+    }
+
+    pub(crate) fn prefers_kquant_packed_decode(&self) -> bool {
+        cfg!(target_os = "windows")
+            && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+            && !self.shared.caps.integrated
+    }
+
+    pub(crate) fn prefers_q8_prefill_bm128(&self) -> bool {
+        cfg!(target_os = "windows")
+            && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+            && !self.shared.caps.integrated
+            && self.shared.caps.name.contains("Radeon RX 7900 XTX")
+    }
+
+    pub(crate) fn prefers_segmented_q8_decode(&self) -> bool {
+        cfg!(target_os = "windows")
+            && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+            && !self.shared.caps.integrated
+    }
+
+    pub(crate) fn prefers_hc_up_mix(&self) -> bool {
+        cfg!(target_os = "windows")
+            && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+            && !self.shared.caps.integrated
+    }
+
+    pub(crate) fn prefers_ple_gate_norm_lds(&self) -> bool {
+        ple_gate_norm_lds_device_ok(
+            cfg!(target_os = "windows"),
+            self.shared.device_arch,
+            &self.shared.caps,
+        )
+    }
+
+    pub(crate) fn prefers_silu_quant_q8(&self) -> bool {
+        cfg!(target_os = "windows")
+            && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+            && !self.shared.caps.integrated
+            && self.shared.exact_silu_quant_order
+    }
+
+    pub(crate) fn prefers_qsa_topk_ordered(&self) -> bool {
+        cfg!(target_os = "windows")
+            && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+            && !self.shared.caps.integrated
+    }
+
     /// The hd256/Q8/GQA4 replay layout measured on Windows/Navi 31. Its register/LDS tradeoff is
     /// device-sensitive, so unmeasured drivers and architectures
     /// retain the established per-query-head replay kernel even when the feature knobs are enabled.
@@ -3387,6 +3688,11 @@ impl VulkanBackend {
     }
 
     fn new_selected(explicit_index: Option<usize>, cfg: Arc<Config>) -> Result<Self> {
+        cfg.kernels
+            .vulkan
+            .validate_attention_splits()
+            .map_err(|e| be(e.to_string()))?;
+
         // Apple: the Vulkan backend is DELIBERATELY unsupported (the only Vulkan on Apple is
         // MoltenVK, which lacks features this backend depends on — e.g. `bufferDeviceAddress` for
         // the paged MoE arena — and is slower than talking to Metal directly). infr ships a NATIVE
@@ -3530,6 +3836,13 @@ impl VulkanBackend {
             .position(|p| p.queue_flags.contains(vk::QueueFlags::COMPUTE))
             .map(|i| i as u32)
             .ok_or_else(|| be("no compute queue family found"))?;
+        #[cfg(test)]
+        let test_aux_compute =
+            std::env::var("MOE4ALL_TEST_AUX_COMPUTE_QUEUE").ok().as_deref() == Some("1");
+        #[cfg(test)]
+        if test_aux_compute && qf_props[queue_family_index as usize].queue_count < 2 {
+            return Err(be("test auxiliary compute queue requires main-family queue_count >= 2"));
+        }
         let dedicated_transfer_family_index = qf_props
             .iter()
             .position(|p| {
@@ -3552,6 +3865,46 @@ impl VulkanBackend {
                 .iter()
                 .any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) == name })
         };
+
+        #[cfg(test)]
+        let indirect_copy_support = unsafe {
+            crate::indirect_copy::query(
+                &instance,
+                physical_device,
+                has_ext(crate::indirect_copy::EXTENSION_NAME),
+            )
+        };
+        #[cfg(test)]
+        let enable_indirect_copy = indirect_copy_support
+            .supports_queue(qf_props[queue_family_index as usize].queue_flags);
+
+        #[cfg(test)]
+        let test_shader_clock =
+            shader_clock_test_opt_in(std::env::var_os("MOE4ALL_TEST_SHADER_CLOCK").as_deref());
+        #[cfg(not(test))]
+        let test_shader_clock = false;
+        #[cfg(test)]
+        let mut shader_clock_ci = vk::PhysicalDeviceShaderClockFeaturesKHR::default();
+        #[cfg(test)]
+        if test_shader_clock {
+            if !has_ext(c"VK_KHR_shader_clock") {
+                return Err(be(
+                    "MOE4ALL_TEST_SHADER_CLOCK=1 requires VK_KHR_shader_clock",
+                ));
+            }
+            let mut clock_features =
+                vk::PhysicalDeviceFeatures2::default().push_next(&mut shader_clock_ci);
+            unsafe { instance.get_physical_device_features2(physical_device, &mut clock_features) };
+            if shader_clock_ci.shader_subgroup_clock == vk::FALSE {
+                return Err(be(
+                    "MOE4ALL_TEST_SHADER_CLOCK=1 requires shaderSubgroupClock",
+                ));
+            }
+            // Enable only reported bits; device-clock timestamps remain optional.
+            shader_clock_ci.shader_subgroup_clock = vk::TRUE;
+            shader_clock_ci.shader_device_clock =
+                u32::from(shader_clock_ci.shader_device_clock != vk::FALSE);
+        }
 
         let has_coop_matrix = has_ext(c"VK_KHR_cooperative_matrix");
         let has_16bit_storage = has_ext(c"VK_KHR_16bit_storage");
@@ -3690,11 +4043,17 @@ impl VulkanBackend {
         // The same transfer-only queue consumes either imported host RAM or a temporary
         // host-visible staging buffer. It therefore remains useful on devices that cannot expose
         // their expert arena through ReBAR or VK_EXT_external_memory_host (notably RDNA2).
-        let dedicated_transfer_family_index = (cfg.paging.host_dma
+        let dedicated_transfer_family_index = (cfg.paging.dedicated_transfer
             && timeline_feat.timeline_semaphore != 0)
             .then_some(dedicated_transfer_family_index)
             .flatten();
         let timeline_enabled = has_ext_sem || dedicated_transfer_family_index.is_some();
+        #[cfg(test)]
+        if test_aux_compute && timeline_feat.timeline_semaphore == 0 {
+            return Err(be("test auxiliary compute queue requires timeline semaphores"));
+        }
+        #[cfg(test)]
+        let timeline_enabled = timeline_enabled || test_aux_compute;
         // Hard requirement, not a fallback: the paged-MoE arena is addressed by a 64-bit device
         // pointer, so a device that cannot hand out one has no 64-bit address space for infr to
         // use. bufferDeviceAddress is core in Vulkan 1.2 and this backend targets 1.3, so on any
@@ -3998,6 +4357,10 @@ impl VulkanBackend {
 
         // ── build extension name list (only available ones) ────────────────────
         let mut ext_ptrs: Vec<*const i8> = Vec::new();
+        #[cfg(test)]
+        if enable_indirect_copy {
+            ext_ptrs.push(crate::indirect_copy::EXTENSION_NAME.as_ptr());
+        }
         if has_coop_matrix {
             ext_ptrs.push(c"VK_KHR_cooperative_matrix".as_ptr());
         }
@@ -4018,6 +4381,9 @@ impl VulkanBackend {
         }
         if has_conditional {
             ext_ptrs.push(c"VK_EXT_conditional_rendering".as_ptr());
+        }
+        if test_shader_clock {
+            ext_ptrs.push(c"VK_KHR_shader_clock".as_ptr());
         }
         let has_timeline_clock =
             infr_core::timeline::device_enabled() && has_ext(c"VK_EXT_calibrated_timestamps");
@@ -4075,6 +4441,14 @@ impl VulkanBackend {
         let queue_ci = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family_index)
             .queue_priorities(&priorities);
+        #[cfg(test)]
+        let test_main_priorities = [1.0f32, 1.0f32];
+        #[cfg(test)]
+        let queue_ci = if test_aux_compute {
+            queue_ci.queue_priorities(&test_main_priorities)
+        } else {
+            queue_ci
+        };
         let mut queue_cis = vec![queue_ci];
         if let Some(family) = dedicated_transfer_family_index {
             queue_cis.push(
@@ -4118,6 +4492,11 @@ impl VulkanBackend {
             vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
         let mut conditional_ci = vk::PhysicalDeviceConditionalRenderingFeaturesEXT::default()
             .conditional_rendering(true);
+        #[cfg(test)]
+        let mut indirect_copy_ci = indirect_copy_support.enable_features();
+        #[cfg(test)]
+        let mut indirect_copy_sync2_ci = vk::PhysicalDeviceSynchronization2Features::default()
+            .synchronization2(indirect_copy_support.synchronization2);
 
         // Core 1.0 features (shaderInt16 — see the probe comment above): passed via
         // `enabled_features`, NOT a pNext-chained `PhysicalDeviceFeatures2` (the two are mutually
@@ -4149,6 +4528,14 @@ impl VulkanBackend {
         if has_conditional {
             device_ci = device_ci.push_next(&mut conditional_ci);
         }
+        #[cfg(test)]
+        if enable_indirect_copy && indirect_copy_support.synchronization2 {
+            device_ci = device_ci.push_next(&mut indirect_copy_sync2_ci);
+        }
+        #[cfg(test)]
+        if test_shader_clock {
+            device_ci = device_ci.push_next(&mut shader_clock_ci);
+        }
         // The two post-ash feature structs (see `vkext`): chained by hand, asking for exactly the
         // bits the device reported, and only when their tier is live. Both must outlive
         // `create_device`, which the block below guarantees.
@@ -4160,12 +4547,29 @@ impl VulkanBackend {
         if coopmat_f8.is_some() {
             unsafe { crate::vkext::chain_into_device_ci(&mut device_ci, &mut f8_ci) };
         }
+        #[cfg(test)]
+        if enable_indirect_copy {
+            unsafe { crate::vkext::chain_into_device_ci(&mut device_ci, &mut indirect_copy_ci) };
+        }
 
         let device = unsafe { instance.create_device(physical_device, &device_ci, None) }
             .map_err(|e| be(format!("create_device: {e}")))?;
         // Register the device so any Err below (subgroup-32/env guards, allocator build) destroys
         // it instead of leaking it — see `InstanceCleanup` above.
         cleanup.device = Some(device.clone());
+        #[cfg(test)]
+        let indirect_copy = if enable_indirect_copy {
+            unsafe {
+                crate::indirect_copy::Device::load(
+                    &instance,
+                    &device,
+                    indirect_copy_support,
+                    qf_props[queue_family_index as usize].queue_flags,
+                )
+            }
+        } else {
+            None
+        };
         let timeline_clock = has_timeline_clock
             .then(|| crate::timeline::Clock::new(&entry, &instance, &device, physical_device))
             .flatten();
@@ -4192,11 +4596,17 @@ impl VulkanBackend {
         // Maintenance3 (core in Vulkan 1.1) carries `maxMemoryAllocationSize` — the weight arena
         // splits its up-front reservation into blocks no larger than this.
         let mut maint3_props = vk::PhysicalDeviceMaintenance3Properties::default();
+        let mut subgroup_props = vk::PhysicalDeviceSubgroupProperties::default();
         let mut props2 = vk::PhysicalDeviceProperties2::default()
             .push_next(&mut sgsize_props)
-            .push_next(&mut maint3_props);
+            .push_next(&mut maint3_props)
+            .push_next(&mut subgroup_props);
         unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
         let props = props2.properties;
+        let compute_subgroup_operations = compute_subgroup_operations(
+            subgroup_props.supported_stages,
+            subgroup_props.supported_operations,
+        );
         // 0 = not reported → fall back to the Vulkan-guaranteed floor (2^30 = 1 GiB).
         let max_mem_alloc_size = if maint3_props.max_memory_allocation_size == 0 {
             1 << 30
@@ -4338,6 +4748,10 @@ impl VulkanBackend {
             // Two F32 DeltaNet projections share one dispatch while retaining separate weights
             // and outputs. The paired kernel mirrors every scalar/vec4/mrow shape tier.
             linear_pair_f32: true,
+            linear_pair_q8: cfg.kernels.vulkan.q8_linear_pair
+                && cfg!(target_os = "windows")
+                && !integrated
+                && device_arch == crate::caps::DeviceArch::AmdRdna3,
             // Qwen3.8 decode-only mixed Q8_0 down + scaled SiLU + F32 inject dispatch.
             qwen_hc_down_inject: true,
             // Every KV write/read kernel maps position -> row modulo the cache's row capacity
@@ -4569,19 +4983,23 @@ impl VulkanBackend {
                 submit_timestamp_period_ns,
             ) {
                 Ok(queue) => {
-                    tracing::info!(
-                        "[infr] host DMA: dedicated transfer queue family {family} enabled"
-                    );
+                    tracing::info!("[infr] pager: dedicated transfer queue family {family} enabled");
                     Some(Mutex::new(queue))
                 }
                 Err(error) => {
                     tracing::warn!(
-                        "[infr] host DMA: dedicated transfer queue unavailable ({error}); using the main queue"
+                        "[infr] pager: dedicated transfer queue unavailable ({error}); using the main queue"
                     );
                     None
                 }
             }
         });
+        tracing::info!(
+            host_import_requested = cfg.paging.host_dma,
+            dedicated_transfer_requested = cfg.paging.dedicated_transfer,
+            dedicated_transfer_active = dedicated_transfer.is_some(),
+            "[infr] pager transfer policy"
+        );
         let queue_access = Arc::new(Mutex::new(()));
         let vram_keepalive = if needs_amd_windows_vram_keepalive(
             &device_probe,
@@ -4649,20 +5067,31 @@ impl VulkanBackend {
                 _entry: entry,
                 instance,
                 physical_device,
+                // This fusion preserves the split shader's measured driver arithmetic order.
+                // Unknown compilers retain the original pair until exactness is qualified.
+                exact_silu_quant_order: device_probe.driver_id_reported
+                    && device_probe.driver_id == vk::DriverId::AMD_PROPRIETARY
+                    && props.driver_version == 8_389_003,
                 device,
                 queue,
                 queue_family_index,
                 dedicated_transfer,
+                dedicated_transfer_keepalive_pending: AtomicBool::new(false),
+                #[cfg(test)]
+                indirect_copy,
                 queue_access,
                 vram_keepalive,
                 queue_submit_failure: AtomicI32::new(vk::Result::SUCCESS.as_raw()),
+                resource_epoch: AtomicU64::new(1),
                 cmd_pool: Mutex::new(cmd_pool),
                 recorder_cmds: Mutex::new(Vec::new()),
+                recorder_prepared_pools: recorder::PreparedPoolCache::default(),
                 recorder_desc_pools: Mutex::new(Vec::new()),
                 recorder_fences: Mutex::new(Vec::new()),
                 recorder_submit_query_pools: Mutex::new(Vec::new()),
                 allocator: ManuallyDrop::new(Mutex::new(allocator)),
                 caps,
+                compute_subgroup_operations,
                 device_arch,
                 largest_device_local_heap_only: uses_largest_device_local_heap_only(
                     device_probe.vendor_id,
@@ -4956,14 +5385,46 @@ impl VulkanBackend {
         offset: usize,
         len: usize,
     ) -> Result<ImportedHostShard> {
+        if self.cfg.kernels.vulkan.decode_gpu_resident_copy != Some(false)
+            && self.shared.caps.buffer_device_address
+        {
+            match self.try_import_host_shard_with_address(
+                ext,
+                Arc::clone(&owner),
+                offset,
+                len,
+                true,
+            ) {
+                Ok(shard) => return Ok(shard),
+                Err(error) => {
+                    tracing::debug!(%error, "GPU-copy host alias unavailable; retaining ordinary DMA import")
+                }
+            }
+        }
+        self.try_import_host_shard_with_address(ext, owner, offset, len, false)
+    }
+
+    fn try_import_host_shard_with_address(
+        &self,
+        ext: &ash::ext::external_memory_host::Device,
+        owner: Arc<AlignedHostBuffer>,
+        offset: usize,
+        len: usize,
+        device_address: bool,
+    ) -> Result<ImportedHostShard> {
         let device = &self.shared.device;
         let handle_type = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
         let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle_type);
         let queue_families = self.shared.dedicated_transfer_families();
+        let mut usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+        if device_address {
+            usage |=
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
+        }
         let mut info = vk::BufferCreateInfo::default()
             .push_next(&mut external)
             .size(len as u64)
-            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST);
+            .usage(usage);
         if let Some(families) = queue_families.as_ref() {
             info = info
                 .sharing_mode(vk::SharingMode::CONCURRENT)
@@ -5022,10 +5483,15 @@ impl VulkanBackend {
         let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
             .handle_type(handle_type)
             .host_pointer(host_ptr.cast());
-        let allocation = vk::MemoryAllocateInfo::default()
+        let mut address_flags =
+            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let mut allocation = vk::MemoryAllocateInfo::default()
             .push_next(&mut import)
             .allocation_size(requirements.size)
             .memory_type_index(memory_type_index);
+        if device_address {
+            allocation = allocation.push_next(&mut address_flags);
+        }
         let memory = unsafe { device.allocate_memory(&allocation, None) }.map_err(|e| {
             unsafe { device.destroy_buffer(buffer, None) };
             be(format!("import host shard {offset}..{}: {e}", offset + len,))
@@ -5037,6 +5503,9 @@ impl VulkanBackend {
             }
             return Err(be(format!("bind imported-host shard at {offset}: {e}")));
         }
+        let own_addr = device_address.then(|| unsafe {
+            device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
+        });
         let imported: Arc<dyn Buffer> = Arc::new(VkBuffer {
             shared: Arc::clone(&self.shared),
             buffer,
@@ -5049,7 +5518,7 @@ impl VulkanBackend {
             mem_size: requirements.size,
             location: MemoryLocation::CpuToGpu,
             sub_offset: 0,
-            own_addr: None,
+            own_addr,
             act_bytes: 0,
         });
         Ok(ImportedHostShard {
@@ -5306,6 +5775,14 @@ impl VulkanBackend {
 
     /// `INFR_PAGER_STATS=1` reporting hook — a no-op when no paged model is loaded.
     pub fn print_moe_pager_stats(&self) {
+        if self.cfg().paging.stats {
+            self.with_unified_gate(|| {
+                if let Some(session) = self.moe_pager.lock().unwrap().as_ref() {
+                    session.print_stats_with_owner(self);
+                }
+            });
+            return;
+        }
         if let Some(s) = self.moe_pager.lock().unwrap().as_ref() {
             s.print_stats_if_enabled();
         }
@@ -6067,10 +6544,11 @@ impl VulkanBackend {
         if self.unified_client.is_none() {
             return Err(be("the primary LLM backend is not an auxiliary client"));
         }
-        self.with_unified_exclusive(|| {
+        self.with_unified_exclusive_result(|| {
+            self.handoff_gpu_decode()?;
             self.runtime_phase.lock().unwrap().release_phase();
-        });
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Drop the primary LLM's retained Decode high-water workspace after an active batch cohort
@@ -6082,12 +6560,17 @@ impl VulkanBackend {
             self.unified_client.is_none(),
             "only the primary LLM owns the decode cohort"
         );
-        self.with_unified_exclusive(|| {
+        let result = self.with_unified_exclusive_result(|| {
+            self.handoff_gpu_decode()?;
             self.runtime_phase.lock().unwrap().release_phase();
             if let Some(session) = self.moe_pager.lock().unwrap().as_mut() {
                 session.restore_released_unified_slots();
             }
+            Ok(())
         });
+        if let Err(error) = result {
+            tracing::warn!(%error, "could not release primary runtime after cohort shrink");
+        }
     }
 
     /// Hold optional Host DMA imports until a caller has materialized a batch of persistent KV
@@ -6131,7 +6614,7 @@ impl VulkanBackend {
         size: usize,
         class: crate::unified::UnifiedVramClass,
     ) -> Result<VkBuffer> {
-        self.with_unified_exclusive(|| self.alloc_unified_buffer_locked(size, class))
+        self.with_unified_exclusive_result(|| self.alloc_unified_buffer_locked(size, class))
     }
 
     fn alloc_unified_buffer_locked(
@@ -6139,6 +6622,7 @@ impl VulkanBackend {
         size: usize,
         class: crate::unified::UnifiedVramClass,
     ) -> Result<VkBuffer> {
+        self.handoff_gpu_decode()?;
         let pool = self
             .unified_vram()
             .ok_or_else(|| be("unified VRAM arena has not been initialized"))?;
@@ -6216,7 +6700,7 @@ impl VulkanBackend {
     /// nested from graph lowering reuse the outer lease; calls made by model loading or another
     /// request acquire it normally. This is deliberately exclusive rather than an upgradable read
     /// lock: scratch allocation may have to evict cold expert slots before recording can proceed.
-    fn with_unified_exclusive<T>(&self, f: impl FnOnce() -> T) -> T {
+    fn with_unified_gate<T>(&self, f: impl FnOnce() -> T) -> T {
         if self.unified_vram().is_none() {
             return f();
         }
@@ -6231,13 +6715,67 @@ impl VulkanBackend {
         );
         let _exclusive = self.unified_exec.write().unwrap();
         let _scope = UnifiedExecScope::enter(owner);
+        f()
+    }
+
+    fn handoff_gpu_decode(&self) -> Result<()> {
+        if let Some(session) = self.moe_pager.lock().unwrap().as_mut() {
+            session.handoff_gpu_decode(self)?;
+        }
+        Ok(())
+    }
+
+    // Execute-local recorders and pending transfers have drained before this boundary.
+    // Export only completed payloads; abandoned COPYING slots must not survive a retry.
+    fn recover_decode_execution(&self, result: Result<()>) -> Result<()> {
+        let Err(error) = result else { return Ok(()) };
+        let cleanup = adapter::cancel_decode_prefetch(self).and_then(|()| {
+            if let Some(session) = self.moe_pager.lock().unwrap().as_mut() {
+                session.finish_gpu_decode_forward();
+                session.handoff_gpu_decode(self)?;
+            }
+            Ok(())
+        });
+        match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(be(format!(
+                "{error} (GPU Decode recovery also failed: {cleanup})"
+            ))),
+        }
+    }
+
+    fn activate_unified_phase(&self) -> Result<()> {
+        if self.unified_vram().is_none() {
+            return Ok(());
+        }
+        let changed =
+            self.unified_phases.state.lock().unwrap().active != Some(self.unified_phase_id);
+        if changed && self.unified_client.is_some() {
+            self.handoff_gpu_decode()?;
+        }
         let client_changed = self.unified_phases.activate(self.unified_phase_id);
         if client_changed && self.unified_client.is_none() {
             if let Some(session) = self.moe_pager.lock().unwrap().as_mut() {
                 session.restore_released_unified_slots();
             }
         }
-        f()
+        Ok(())
+    }
+
+    fn with_unified_exclusive_result<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.with_unified_gate(|| {
+            self.activate_unified_phase()?;
+            f()
+        })
+    }
+
+    // Non-fallible scope entry is retained for existing internal queue-ownership tests.
+    #[cfg(test)]
+    fn with_unified_exclusive<T>(&self, f: impl FnOnce() -> T) -> T {
+        self.with_unified_gate(|| {
+            self.activate_unified_phase().unwrap();
+            f()
+        })
     }
 
     pub(crate) fn alloc_unified(
@@ -6304,7 +6842,7 @@ impl VulkanBackend {
             identities.push(identity);
         }
 
-        self.with_unified_exclusive(|| {
+        self.with_unified_exclusive_result(|| {
             let mut locked = Vec::with_capacity(buffers.len());
             for buffer in buffers {
                 locked.push(buffer.segments.lock().unwrap());
@@ -6318,6 +6856,8 @@ impl VulkanBackend {
             if requests.is_empty() {
                 return Ok(());
             }
+
+            self.handoff_gpu_decode()?;
 
             let pool = self
                 .unified_vram()
@@ -6930,13 +7470,17 @@ impl VulkanBackend {
         sizes: &[usize],
         usage: BufferUsage,
     ) -> Result<Vec<VkBuffer>> {
+        if adapter::preparing_commands() && !sizes.is_empty() {
+            return Err(be("command preparation requires retained batch workspace"));
+        }
         let buffers = if sizes.is_empty() {
             Vec::new()
         } else if let (Some(class), Some(pool)) =
             (self.unified_class_for_usage(usage), self.unified_vram())
         {
             if pool.expert_layout().is_some() {
-                self.with_unified_exclusive(|| {
+                self.with_unified_exclusive_result(|| {
+                    self.handoff_gpu_decode()?;
                     let protected = self.protected_unified_experts();
                     let mut plan = self
                         .unified_phases
@@ -7076,6 +7620,9 @@ impl VulkanBackend {
     }
 
     fn make_alloc(&self, bytes: usize, usage: BufferUsage) -> Result<VkBuffer> {
+        if adapter::preparing_commands() {
+            return Err(be("command preparation requires retained workspace"));
+        }
         let unified_class = self.unified_class_for_usage(usage);
         if let Some(class) = unified_class {
             let mut buf = self.alloc_unified_buffer(bytes, class)?;
@@ -7198,7 +7745,9 @@ impl VulkanBackend {
     /// tensors (see [`Backing::BdaSub`]) — without it every such tensor would land at the block's
     /// byte 0 and overwrite whatever the previous tensor wrote there.
     fn upload_staged_ring(&self, dst_buf: vk::Buffer, dst_base: u64, src: &[u8]) -> Result<()> {
-        self.with_unified_exclusive(|| self.upload_staged_ring_locked(dst_buf, dst_base, src))
+        self.with_unified_exclusive_result(|| {
+            self.upload_staged_ring_locked(dst_buf, dst_base, src)
+        })
     }
 
     fn upload_staged_ring_locked(
@@ -7426,7 +7975,7 @@ impl VulkanBackend {
     /// The execution gate also excludes graph recording on this pool. The pool mutex alone
     /// cannot protect against a Recorder that released it after allocating its command buffer.
     fn one_shot(&self, f: impl FnOnce(vk::CommandBuffer)) -> Result<()> {
-        self.with_unified_exclusive(|| self.one_shot_locked(f))
+        self.with_unified_exclusive_result(|| self.one_shot_locked(f))
     }
 
     fn one_shot_locked(&self, f: impl FnOnce(vk::CommandBuffer)) -> Result<()> {
@@ -7738,7 +8287,8 @@ impl Backend for VulkanBackend {
                 "segmented KV trim belongs to a different backend/device",
             ));
         }
-        self.with_unified_exclusive(|| {
+        self.with_unified_exclusive_result(|| {
+            self.handoff_gpu_decode()?;
             let mut segments = segmented.segments.lock().unwrap();
             if keep > segments.len() {
                 return Err(be("segmented KV trim cannot grow the committed prefix"));
@@ -7760,7 +8310,8 @@ impl Backend for VulkanBackend {
     fn release_segmented_kv(&self, buffer: &dyn Buffer) -> Result<()> {
         let segmented = as_segmented_kv(buffer)
             .ok_or_else(|| be("release_segmented_kv received a flat or foreign buffer"))?;
-        self.with_unified_exclusive(|| {
+        self.with_unified_exclusive_result(|| {
+            self.handoff_gpu_decode()?;
             let table_ptr = segmented
                 .table
                 .mapped_ptr()
@@ -7857,7 +8408,7 @@ impl Backend for VulkanBackend {
         if copies.is_empty() {
             return Ok(());
         }
-        self.with_unified_exclusive(|| {
+        self.with_unified_exclusive_result(|| {
             let mut virtual_buffers: Vec<_> = copies
                 .iter()
                 .flat_map(|&(src, dst, _, _)| [src, dst])
@@ -7982,7 +8533,7 @@ impl Backend for VulkanBackend {
         if copies.iter().any(|&(src, _, dst, _, _)| {
             as_segmented_kv(src).is_some() || as_segmented_kv(dst).is_some()
         }) {
-            return self.with_unified_exclusive(|| {
+            return self.with_unified_exclusive_result(|| {
                 let mut virtual_buffers: Vec<_> = copies
                     .iter()
                     .flat_map(|&(src, _, dst, _, _)| [src, dst])
@@ -8262,9 +8813,14 @@ impl Backend for VulkanBackend {
     }
 
     fn release_transient_runtime(&self) {
-        self.with_unified_exclusive(|| {
+        let result = self.with_unified_exclusive_result(|| {
+            self.handoff_gpu_decode()?;
             self.runtime_phase.lock().unwrap().release_phase();
+            Ok(())
         });
+        if let Err(error) = result {
+            tracing::warn!(%error, "could not release transient runtime");
+        }
     }
 
     fn register_idle_reclaimer(&self, reclaimer: Weak<dyn IdleResourceReclaimer>) {
@@ -8278,7 +8834,8 @@ impl Backend for VulkanBackend {
         if !self.cfg().paging.moe_layer_stream {
             return Ok(None);
         }
-        self.with_unified_exclusive(|| {
+        self.with_unified_exclusive_result(|| {
+            self.handoff_gpu_decode()?;
             adapter::cancel_decode_prefetch(self)?;
             self.runtime_phase.lock().unwrap().release_phase();
             self.unified_phases
@@ -8292,13 +8849,23 @@ impl Backend for VulkanBackend {
         })
     }
 
+    fn supports_async_compile(&self) -> bool {
+        // Compile only clones/inspects the graph; preparation memoizes graph-only CPU metadata.
+        true
+    }
+
+    fn supports_execution_lookahead(&self) -> bool {
+        adapter::command_recording_supported(self)
+    }
+
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>> {
         adapter::compile(self, graph)
     }
 
     fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
-        self.with_unified_exclusive(|| {
+        self.with_unified_exclusive_result(|| {
             let result = adapter::execute(self, plan, bindings);
+            let result = self.recover_decode_execution(result);
             if let Some(reaper) = &self.auxiliary_runtime_reaper {
                 if result.is_err() {
                     self.runtime_phase.lock().unwrap().release_phase();
@@ -8307,6 +8874,81 @@ impl Backend for VulkanBackend {
             }
             result
         })
+    }
+
+    fn execute_with_lookahead(
+        &self,
+        plan: &dyn Plan,
+        bindings: &Bindings,
+        next: Option<(&dyn Plan, &Bindings, &[usize])>,
+    ) -> Result<()> {
+        self.with_unified_exclusive_result(|| {
+            let result = adapter::execute_with_lookahead(self, plan, bindings, next);
+            let result = self.recover_decode_execution(result);
+            if let Some(reaper) = &self.auxiliary_runtime_reaper {
+                if result.is_err() {
+                    self.runtime_phase.lock().unwrap().release_phase();
+                }
+                reaper.arm();
+            }
+            result
+        })
+    }
+
+    fn execute_staged(
+        &self,
+        stages: &[ExecutionStage<'_>],
+        input_ready: &mut dyn FnMut(usize) -> Result<()>,
+        next: Option<(&dyn Plan, &Bindings, &[usize])>,
+    ) -> Result<()> {
+        // Share the same drained panic boundary even when there is no future token.
+        let future = next.map(|(plan, bindings, _)| [ExecutionStage::new(plan, bindings)]);
+        let lookahead = future
+            .as_ref()
+            .zip(next)
+            .map(|(stages, (_, _, positions))| {
+                infr_core::backend::ExecutionLookahead::new(stages, positions)
+            });
+        self.execute_staged_lookahead(stages, input_ready, lookahead)
+    }
+
+    fn execute_staged_lookahead(
+        &self,
+        stages: &[ExecutionStage<'_>],
+        input_ready: &mut dyn FnMut(usize) -> Result<()>,
+        next: Option<infr_core::backend::ExecutionLookahead<'_>>,
+    ) -> Result<()> {
+        if stages.is_empty() {
+            return Ok(());
+        }
+        let outcome = self.with_unified_exclusive_result(|| {
+            // Drain stage-owned work during unwind, but release the outer lease before the
+            // panic crosses it. A caller callback must not poison unrelated later requests.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let result = adapter::stages::execute_lookahead(self, stages, input_ready, next);
+                let result = self.recover_decode_execution(result);
+                if let Some(reaper) = &self.auxiliary_runtime_reaper {
+                    if result.is_err() {
+                        self.runtime_phase.lock().unwrap().release_phase();
+                    }
+                    reaper.arm();
+                }
+                result
+            }));
+            if outcome.is_err() {
+                let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.recover_decode_execution(Err(be("staged forward panicked")))
+                }));
+                if cleanup.is_err() {
+                    tracing::error!("staged Decode panic recovery also panicked");
+                }
+            }
+            Ok(outcome)
+        })?;
+        match outcome {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     /// See `Backend::max_decode_chain`. Persistent decode keeps the established platform cap
@@ -8326,7 +8968,7 @@ impl Backend for VulkanBackend {
         bindings: &Bindings,
         n: usize,
     ) -> Result<Option<Vec<u32>>> {
-        self.with_unified_exclusive(|| adapter::execute_chain(self, plan, bindings, n))
+        self.with_unified_exclusive_result(|| adapter::execute_chain(self, plan, bindings, n))
     }
 
     fn sync(&self) -> Result<()> {
@@ -8375,6 +9017,16 @@ impl Backend for VulkanBackend {
             .map(crate::pager::MoePagerSession::take_transfer_sources)
             .unwrap_or_default();
         if !sources.is_empty() {
+            // Warmup can execute before host aliases are finalized. A session-wide GPU owner
+            // must not retain that provisional, all-CPU source directory or its workspace.
+            self.with_unified_exclusive_result(|| {
+                self.handoff_gpu_decode()?;
+                if let Some(session) = self.moe_pager.lock().unwrap().as_mut() {
+                    session.gpu_decode_owner = None;
+                }
+                self.runtime_phase.lock().unwrap().release_phase();
+                Ok(())
+            })?;
             let plan = Arc::new(self.build_session_transfer_plan(sources));
             self.moe_pager
                 .lock()
@@ -8750,8 +9402,78 @@ fn probe_flash_attention_hd256(
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 
+fn compute_subgroup_operations(
+    stages: vk::ShaderStageFlags,
+    operations: vk::SubgroupFeatureFlags,
+) -> vk::SubgroupFeatureFlags {
+    if stages.contains(vk::ShaderStageFlags::COMPUTE) {
+        operations
+    } else {
+        vk::SubgroupFeatureFlags::empty()
+    }
+}
+
+#[cfg(test)]
+fn shader_clock_test_opt_in(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attention_splits_reject_invalid_configs_before_vulkan_initialization() {
+        for key in ["flash_splits", "pv_splits"] {
+            for splits in [0, 9, usize::MAX] {
+                let mut cfg = Config::default();
+                if key == "flash_splits" {
+                    cfg.kernels.vulkan.flash_splits = Some(splits);
+                } else {
+                    cfg.kernels.vulkan.pv_splits = Some(splits);
+                }
+                for device in [None, Some(usize::MAX)] {
+                    let result = VulkanBackend::new_selected(device, Arc::new(cfg.clone()));
+                    let err = match result {
+                        Ok(_) => panic!("invalid {key}={splits} was accepted"),
+                        Err(err) => err.to_string(),
+                    };
+                    assert!(err.contains(&format!("kernels.vulkan.{key}")), "{err}");
+                    assert!(err.contains("1..=8"), "{err}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn owner_subgroup_operations_require_reported_compute_support() {
+        let basic = vk::SubgroupFeatureFlags::BASIC;
+        let scan = basic | vk::SubgroupFeatureFlags::ARITHMETIC;
+        for stages in [
+            vk::ShaderStageFlags::empty(),
+            vk::ShaderStageFlags::FRAGMENT,
+        ] {
+            assert!(super::compute_subgroup_operations(stages, scan).is_empty());
+        }
+        assert_eq!(
+            super::compute_subgroup_operations(vk::ShaderStageFlags::COMPUTE, basic),
+            basic
+        );
+        assert_eq!(
+            super::compute_subgroup_operations(vk::ShaderStageFlags::COMPUTE, scan),
+            scan
+        );
+    }
+
+    #[test]
+    fn shader_clock_test_opt_in_requires_exact_one() {
+        use std::ffi::OsStr;
+
+        assert!(super::shader_clock_test_opt_in(Some(OsStr::new("1"))));
+        assert!(!super::shader_clock_test_opt_in(None));
+        for value in ["", "0", "true", "yes", "01", " 1", "1 "] {
+            assert!(!super::shader_clock_test_opt_in(Some(OsStr::new(value))));
+        }
+    }
+
     use super::*;
     use infr_core::Backend;
 

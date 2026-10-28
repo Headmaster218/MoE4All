@@ -28,6 +28,8 @@ pub(crate) struct TransferCopyBatch {
 
 const DEDICATED_TRANSFER_COMMAND_SLOTS: usize = 3;
 
+pub(crate) type RetiredTransferKeepalive = [Vec<Arc<dyn Buffer>>; DEDICATED_TRANSFER_COMMAND_SLOTS];
+
 struct DedicatedTransferCommandSlot {
     cmd: vk::CommandBuffer,
     pending_value: u64,
@@ -208,10 +210,28 @@ impl DedicatedTransferQueue {
         self.timeline
     }
 
+    pub(crate) fn has_pending_keepalive(&self) -> bool {
+        self.slots.iter().any(|slot| !slot.keepalive.is_empty())
+    }
+
+    /// `completed` must come from a successful wait or counter read of this queue's timeline.
+    /// The caller drops the returned owners only AFTER releasing the queue mutex. Leave command
+    /// and timestamp metadata intact: ordinary slot reuse/destroy still resolves those queries.
+    pub(crate) fn take_completed_keepalive(&mut self, completed: u64) -> RetiredTransferKeepalive {
+        let mut retired = std::array::from_fn(|_| Vec::new());
+        for (slot, owners) in self.slots.iter_mut().zip(&mut retired) {
+            if slot.pending_value != 0 && slot.pending_value <= completed {
+                *owners = std::mem::take(&mut slot.keepalive);
+            }
+        }
+        retired
+    }
+
     pub(crate) fn submit(
         &mut self,
         shared: &crate::VulkanShared,
         batches: &[TransferCopyBatch],
+        retired: &mut RetiredTransferKeepalive,
     ) -> Result<u64> {
         let _timeline_transfer = infr_core::timeline::span("dma_prepare_submit");
         let _worker_prepare = infr_core::timeline::background_span("resident_producer_dma_prepare");
@@ -244,7 +264,8 @@ impl DedicatedTransferQueue {
                 slot_index,
                 slot,
             );
-            slot.keepalive.clear();
+            // `retired` belongs to the wrapper outside the queue guard, including error/unwind.
+            retired[slot_index] = std::mem::take(&mut slot.keepalive);
         }
         unsafe {
             shared
@@ -421,6 +442,17 @@ fn timestamp_delta_ns(start: u64, end: u64, valid_bits: u32, period_ns: f32) -> 
 /// types or queue choices; a different executor can satisfy the same requests without changing
 /// pager policy.
 pub(crate) trait TransferExecutor: Sync {
+    fn handoff_gpu_decode(&self, session: &mut crate::pager::MoePagerSession) -> Result<()> {
+        if session
+            .gpu_decode_owner
+            .as_ref()
+            .is_some_and(|owner| owner.owned_active())
+        {
+            return Err(be("GPU owner handoff requires the owning Vulkan backend"));
+        }
+        Ok(())
+    }
+
     fn mapped_serial_max_bytes(&self) -> usize {
         0
     }
@@ -460,6 +492,14 @@ pub(crate) struct SessionTransferPlan {
 }
 
 impl SessionTransferPlan {
+    pub(crate) fn contains_imported_upload(&self, src: &[u8]) -> bool {
+        self.imports
+            .read()
+            .unwrap()
+            .iter()
+            .any(|import| import.contains(src.as_ptr(), src.len()))
+    }
+
     pub(crate) fn new(imports: Vec<ImportedHostAllocation>) -> Self {
         Self {
             imports: RwLock::new(imports),
@@ -605,6 +645,19 @@ impl SessionTransferPlan {
             .iter()
             .find(|import| import.contains(src.as_ptr(), src.len()))
             .and_then(|import| import.ranges(src.as_ptr(), src.len()))
+    }
+
+    pub(crate) fn imported_device_source(&self, src: &[u8]) -> Option<(Arc<dyn Buffer>, u64)> {
+        let ranges = self.imported_ranges(src)?;
+        let [range] = ranges.as_slice() else {
+            return None;
+        };
+        let address = range
+            .buffer
+            .device_addr()?
+            .checked_add(range.offset as u64)?;
+        (address.is_multiple_of(16) && src.len().is_multiple_of(16))
+            .then(|| (Arc::clone(&range.buffer), address))
     }
 
     /// Release up to `target_bytes` of imported-host aliases without touching any source buffer
@@ -990,6 +1043,56 @@ fn mapped_batch_is_serial(copies: &[MappedHostCopy], max_bytes: usize) -> bool {
                 .iter()
                 .try_fold(0usize, |sum, copy| sum.checked_add(copy.len))
                 .is_some_and(|bytes| bytes <= max_bytes))
+}
+
+pub(crate) fn copy_owned_mapped_batch<'a>(
+    uploads: impl IntoIterator<Item = (&'a [u8], &'a DeviceTransferTarget)>,
+    serial_max_bytes: usize,
+) -> Result<()> {
+    // Validate the entire batch before its first write. This route never imports, stages,
+    // submits, or waits on a GPU queue, including on its error path.
+    #[cfg(test)]
+    let mut combined_probe = None;
+    let copies = uploads
+        .into_iter()
+        .map(|(src, target)| {
+            if src.len() != target.len() {
+                return Err(be("owned CPU upload source and target sizes differ"));
+            }
+            let dst = target
+                .mapped_ptr()
+                .ok_or_else(|| be("owned CPU upload target lost its mapping"))?;
+            #[cfg(test)]
+            if combined_probe.is_none() {
+                combined_probe = crate::host_ready_combined_test_support::claim_copy(
+                    &as_vk_buf(target.buffer.as_ref())?.shared,
+                );
+            }
+            Ok(MappedHostCopy {
+                src: src.as_ptr() as usize,
+                dst: dst as usize,
+                len: src.len(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let _span = infr_core::timeline::background_span("resident_producer_mapped_copy");
+    let started = pager_profile::active().then(std::time::Instant::now);
+    #[cfg(test)]
+    if let Some(probe) = combined_probe {
+        probe.before_copy(copies.len())?;
+        for (index, copy) in copies.iter().enumerate() {
+            // Exercise the same actual memcpy, with a deterministic partial-job fault edge.
+            copy_to_mapped_batch(std::slice::from_ref(copy), serial_max_bytes);
+            probe.after_copy(index + 1)?;
+        }
+        return Ok(());
+    }
+    copy_to_mapped_batch(&copies, serial_max_bytes);
+    if let Some(started) = started {
+        let bytes = copies.iter().map(|copy| copy.len).sum();
+        pager_profile::record_memcpy_batch(copies.len(), bytes, started.elapsed());
+    }
+    Ok(())
 }
 
 fn copy_to_mapped_batch(copies: &[MappedHostCopy], serial_max_bytes: usize) {
@@ -1423,6 +1526,10 @@ impl VulkanBackend {
 }
 
 impl TransferExecutor for VulkanBackend {
+    fn handoff_gpu_decode(&self, session: &mut crate::pager::MoePagerSession) -> Result<()> {
+        session.handoff_gpu_decode(self)
+    }
+
     fn materialize_staging(&self, src: &[u8]) -> Result<(Arc<dyn Buffer>, usize, bool)> {
         VulkanBackend::stage_host_bytes(self, src)
     }
@@ -1449,6 +1556,10 @@ impl TransferExecutor for VulkanBackend {
         VulkanBackend::write_device_target(self, target, fill)
     }
 }
+
+#[cfg(test)]
+#[path = "transfer_retirement_tests.rs"]
+mod retirement_tests;
 
 #[cfg(test)]
 mod tests {

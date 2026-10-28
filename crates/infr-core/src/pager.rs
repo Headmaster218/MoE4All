@@ -46,9 +46,30 @@ pub enum Resolution {
     Miss { slot: u32, evicted: Option<BlockId> },
 }
 
+/// Why [`Pager::admit_at`] could not replay an admission. Every error leaves the pager unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionError {
+    /// `NOT_RESIDENT` cannot name a block in an admission replay.
+    InvalidBlockId,
+    SlotOutOfRange,
+    SlotDisabled,
+    /// The requested block already owns a different physical slot.
+    ResidentElsewhere {
+        slot: u32,
+    },
+    /// The target's current owner has an outstanding explicit pin.
+    Pinned {
+        id: BlockId,
+    },
+    /// The target's current owner was accessed in the current batch.
+    CurrentBatch {
+        id: BlockId,
+    },
+}
+
 /// Cumulative pager activity — the `INFR_PAGER_STATS` hit-rate counter the task's validation step
 /// asks for rides this.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PagerStats {
     pub hits: u64,
     pub misses: u64,
@@ -65,6 +86,90 @@ impl PagerStats {
             self.hits as f64 / total as f64
         }
     }
+}
+
+/// Immutable cache ownership at a completed-dispatch handoff boundary.
+///
+/// This describes bookkeeping only: the backend must synchronize outstanding readers and keep
+/// slot bytes and its device LUT consistent with these mappings. Batch epochs and explicit pins
+/// are not transferable. Restoring starts with no batch protection; begin a new batch before
+/// resolving the next dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PagerSnapshot {
+    disabled: Vec<bool>,
+    free: Vec<u32>,
+    resident_lru: Vec<(BlockId, u32)>,
+    stats: PagerStats,
+}
+
+impl PagerSnapshot {
+    /// Assemble a snapshot, for example from GPU-authoritative cache state.
+    ///
+    /// `disabled` is indexed by physical slot (true means disabled) and its length is the total
+    /// slot capacity. `free` is a stack of enabled empty slots: `pop()` allocates the LAST element
+    /// next, exactly as in the pager. `resident_lru` lists `(block, slot)` pairs exactly once,
+    /// oldest to newest. Every
+    /// enabled slot must occur in exactly one of those lists. IDs are opaque, possibly sparse;
+    /// only `NOT_RESIDENT` is reserved. `stats` contains cumulative totals, including any activity
+    /// while the GPU owned the cache. Construction does not validate: [`Pager::restore_handoff`]
+    /// checks the entire snapshot before changing the destination.
+    pub fn from_parts(
+        disabled: Vec<bool>,
+        free: Vec<u32>,
+        resident_lru: Vec<(BlockId, u32)>,
+        stats: PagerStats,
+    ) -> Self {
+        Self {
+            disabled,
+            free,
+            resident_lru,
+            stats,
+        }
+    }
+
+    pub fn n_slots(&self) -> usize {
+        self.disabled.len()
+    }
+
+    /// Physical-slot mask; true means disabled, false means enabled.
+    pub fn disabled(&self) -> &[bool] {
+        &self.disabled
+    }
+
+    /// Enabled empty-slot stack in the pager's internal order; the LAST element allocates next.
+    pub fn free(&self) -> &[u32] {
+        &self.free
+    }
+
+    /// Exact resident `(block, slot)` mapping and eviction order, oldest to newest.
+    pub fn resident_lru(&self) -> &[(BlockId, u32)] {
+        &self.resident_lru
+    }
+
+    pub fn stats(&self) -> PagerStats {
+        self.stats
+    }
+}
+
+/// A rejected handoff changes no pager state, including batch protection and counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum HandoffError {
+    #[error("pager handoff: {blocks} blocks have active pins")]
+    ActivePins { blocks: usize },
+    #[error("pager handoff: expected {expected} slots, snapshot has {actual}")]
+    CapacityMismatch { expected: usize, actual: usize },
+    #[error("pager handoff: NOT_RESIDENT is not a valid block ID")]
+    InvalidBlockId,
+    #[error("pager handoff: slot {slot} is out of range")]
+    SlotOutOfRange { slot: u32 },
+    #[error("pager handoff: slot {slot} is disabled")]
+    SlotDisabled { slot: u32 },
+    #[error("pager handoff: block {id} appears more than once")]
+    DuplicateBlockId { id: BlockId },
+    #[error("pager handoff: slot {slot} appears more than once")]
+    SlotConflict { slot: u32 },
+    #[error("pager handoff: enabled slot {slot} is neither free nor resident")]
+    MissingSlot { slot: u32 },
 }
 
 #[derive(Clone, Copy, Default)]
@@ -255,8 +360,132 @@ impl Pager {
         !self.disabled[self.slot_idx(slot)]
     }
 
+    /// Borrowed physical-slot mask; true means disabled. Both free and resident enabled slots
+    /// are false, with the same indexing and meaning as [`PagerSnapshot::disabled`].
+    pub fn disabled(&self) -> &[bool] {
+        &self.disabled
+    }
+
     pub fn stats(&self) -> PagerStats {
         self.stats
+    }
+
+    /// Capture exact slot ownership, allocation/eviction order and cumulative demand stats.
+    ///
+    /// Requires no explicit pins. The caller must also have completed outstanding dispatches;
+    /// epoch protection is deliberately omitted from the snapshot (see [`PagerSnapshot`]).
+    pub fn snapshot_for_handoff(&self) -> Result<PagerSnapshot, HandoffError> {
+        if !self.pinned.is_empty() {
+            return Err(HandoffError::ActivePins {
+                blocks: self.pinned.len(),
+            });
+        }
+        if self.resident.contains_key(&NOT_RESIDENT) {
+            return Err(HandoffError::InvalidBlockId);
+        }
+        Ok(PagerSnapshot::from_parts(
+            self.disabled.clone(),
+            self.free.clone(),
+            self.resident_slots_lru(),
+            self.stats,
+        ))
+    }
+
+    /// Check whether this pager can accept a handoff without changing any state.
+    ///
+    /// Uses the same checks as [`Self::restore_handoff`], including destination pins and total
+    /// physical capacity. Callers can validate every pool before restoring any pool, keeping all
+    /// pool states unchanged between validation and restore. This does not reserve slots or
+    /// synchronize device readers; restore revalidates against the destination's current state.
+    pub fn validate_handoff(&self, snapshot: &PagerSnapshot) -> Result<(), HandoffError> {
+        if !self.pinned.is_empty() {
+            return Err(HandoffError::ActivePins {
+                blocks: self.pinned.len(),
+            });
+        }
+        if snapshot.n_slots() != self.n_slots {
+            return Err(HandoffError::CapacityMismatch {
+                expected: self.n_slots,
+                actual: snapshot.n_slots(),
+            });
+        }
+
+        let mut seen = vec![false; self.n_slots];
+        let mut resident = HashMap::with_capacity(snapshot.resident_lru.len().min(self.n_slots));
+        let mut claim_slot = |slot: u32| -> Result<(), HandoffError> {
+            let idx = slot as usize;
+            if idx >= self.n_slots {
+                return Err(HandoffError::SlotOutOfRange { slot });
+            }
+            if snapshot.disabled[idx] {
+                return Err(HandoffError::SlotDisabled { slot });
+            }
+            if seen[idx] {
+                return Err(HandoffError::SlotConflict { slot });
+            }
+            seen[idx] = true;
+            Ok(())
+        };
+        for &slot in &snapshot.free {
+            claim_slot(slot)?;
+        }
+        for &(id, slot) in &snapshot.resident_lru {
+            if id == NOT_RESIDENT {
+                return Err(HandoffError::InvalidBlockId);
+            }
+            if resident.insert(id, slot).is_some() {
+                return Err(HandoffError::DuplicateBlockId { id });
+            }
+            claim_slot(slot)?;
+        }
+        for (idx, &claimed) in seen.iter().enumerate() {
+            if !snapshot.disabled[idx] && !claimed {
+                return Err(HandoffError::MissingSlot { slot: idx as u32 });
+            }
+        }
+        Ok(())
+    }
+
+    /// Replace ownership from a completed-dispatch handoff without replaying any accesses.
+    ///
+    /// The snapshot must have the same total physical capacity; its enabled/disabled mask
+    /// replaces this pager's mask. All mappings, free slots and IDs are validated before any
+    /// mutation. A rejection leaves EVERY field unchanged, including pins, epochs and profiling.
+    /// Success preserves the supplied cumulative demand stats without counting admissions or
+    /// evictions. CPU profiling stays local to this pager. Old batch guards are cleared, so the
+    /// caller must synchronize readers before restore and begin a new batch for the next dispatch.
+    pub fn restore_handoff(&mut self, snapshot: &PagerSnapshot) -> Result<(), HandoffError> {
+        self.validate_handoff(snapshot)?;
+
+        // Build the intrusive list directly, in slot space, after validation. No touch/admit
+        // replay: those would reorder the cache, recreate batch guards and count false traffic.
+        let mut lru = vec![LruNode::default(); self.n_slots];
+        let entries = &snapshot.resident_lru;
+        let resident = entries.iter().copied().collect();
+        for (pos, &(id, slot)) in entries.iter().enumerate() {
+            lru[slot as usize] = LruNode {
+                id: Some(id),
+                prev: pos.checked_sub(1).map(|prev| entries[prev].1),
+                next: entries.get(pos + 1).map(|entry| entry.1),
+            };
+        }
+        let disabled = snapshot.disabled.clone();
+        let enabled_slots = disabled.iter().filter(|&&disabled| !disabled).count();
+        let free = snapshot.free.clone();
+
+        self.disabled = disabled;
+        self.enabled_slots = enabled_slots;
+        self.resident = resident;
+        self.lru = lru;
+        self.lru_head = entries.first().map(|entry| entry.1);
+        self.lru_tail = entries.last().map(|entry| entry.1);
+        self.lru_len = entries.len();
+        self.free = free;
+        self.epoch.clear();
+        self.cur_epoch = 0;
+        self.cold_victim_cursor = self.lru_head;
+        self.stats = snapshot.stats;
+        Ok(())
     }
 
     /// Number of currently-resident blocks (== `n_slots` once the cache is full).
@@ -279,6 +508,25 @@ impl Pager {
             slot = node.next;
         }
         out
+    }
+
+    /// Free slots followed by unpinned residents, coldest first, without allocating a full snapshot.
+    /// This is selection only: callers still own batch/read protection and physical reservations.
+    pub fn replacement_slots(&self) -> impl Iterator<Item = (Option<BlockId>, u32)> + '_ {
+        let free = self.free.iter().rev().copied().map(|slot| (None, slot));
+        let mut next = self.lru_head;
+        let resident = std::iter::from_fn(move || {
+            while let Some(slot) = next {
+                let node = self.lru[self.slot_idx(slot)];
+                next = node.next;
+                let id = node.id.expect("linked LRU node has a block id");
+                if !self.pinned.contains_key(&id) {
+                    return Some((Some(id), slot));
+                }
+            }
+            None
+        });
+        free.chain(resident)
     }
 
     /// Number of entries in the `epoch` map — test-only, to assert eviction keeps it bounded by
@@ -438,6 +686,69 @@ impl Pager {
         self.resident.insert(id, slot);
         self.push_back_lru(slot, id);
         Resolution::Miss { slot, evicted }
+    }
+
+    /// Replay a demand admission into an exact, previously selected physical `slot`.
+    ///
+    /// This is host bookkeeping for a backend reconciling a GPU-selected admission. It neither
+    /// copies bytes nor reserves the slot: the backend must protect and validate its selection
+    /// before copying, then reconcile its LUT using the returned `Resolution`. A `Miss` describes
+    /// the ownership change even when the backend has already filled the slot.
+    ///
+    /// A hit is accepted only at the block's existing slot, including when that block is pinned
+    /// or current-batch protected. A miss may replace only an unpinned owner outside the current
+    /// batch. As with normal demand access, epoch protection starts at the first `begin_batch`;
+    /// successful hits and misses mark the block MRU, join the epoch and update demand stats.
+    /// No explicit pin is acquired. Errors change no state, including counters and LRU order.
+    ///
+    /// Only the `NOT_RESIDENT` sentinel is rejected as an ID here; the pager has no model-specific
+    /// ID bound, so validating that namespace remains the backend's responsibility.
+    pub fn admit_at(&mut self, id: BlockId, slot: u32) -> Result<Resolution, AdmissionError> {
+        if id == NOT_RESIDENT {
+            return Err(AdmissionError::InvalidBlockId);
+        }
+        let idx = slot as usize;
+        if idx >= self.n_slots {
+            return Err(AdmissionError::SlotOutOfRange);
+        }
+        if self.disabled[idx] {
+            return Err(AdmissionError::SlotDisabled);
+        }
+        if let Some(actual) = self.slot_of(id) {
+            if actual != slot {
+                return Err(AdmissionError::ResidentElsewhere { slot: actual });
+            }
+            return Ok(self.touch(id));
+        }
+
+        let evicted = self.lru[idx].id;
+        if let Some(owner) = evicted {
+            if self.pinned.contains_key(&owner) {
+                return Err(AdmissionError::Pinned { id: owner });
+            }
+            if self.cur_epoch != 0 && self.epoch.get(&owner) == Some(&self.cur_epoch) {
+                return Err(AdmissionError::CurrentBatch { id: owner });
+            }
+            let removed = self.unlink_lru(slot);
+            debug_assert_eq!(removed, Some(owner));
+            let old_slot = self.resident.remove(&owner);
+            debug_assert_eq!(old_slot, Some(slot));
+            self.epoch.remove(&owner);
+            self.stats.evictions += 1;
+        } else {
+            let pos = self
+                .free
+                .iter()
+                .position(|&free| free == slot)
+                .expect("enabled empty slot is on the free list");
+            // Preserve the allocation order of every other free slot.
+            self.free.remove(pos);
+        }
+        self.resident.insert(id, slot);
+        self.epoch.insert(id, self.cur_epoch);
+        self.push_back_lru(slot, id);
+        self.stats.misses += 1;
+        Ok(Resolution::Miss { slot, evicted })
     }
 
     /// Ensure `id` is resident AND pin it, so it cannot be evicted until [`Self::unpin`].
@@ -911,6 +1222,853 @@ pub fn ring_bytes(pager_budget: u64, ring: Option<crate::SizeSpec>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scalar_disabled_mask_matches(pager: &Pager, mask: &[bool]) -> bool {
+        pager.n_slots() == mask.len()
+            && mask
+                .iter()
+                .enumerate()
+                .all(|(slot, &off)| pager.slot_enabled(slot as u32) != off)
+    }
+
+    fn assert_disabled_mask_matches(pager: &Pager, mask: &[bool], expected: bool) {
+        let before = admission_state(pager);
+        assert_eq!(scalar_disabled_mask_matches(pager, mask), expected);
+        assert_eq!(
+            pager.n_slots() == mask.len() && pager.disabled() == mask,
+            expected
+        );
+        assert_eq!(
+            pager.disabled(),
+            pager.snapshot_for_handoff().unwrap().disabled()
+        );
+        assert_eq!(admission_state(pager), before);
+    }
+
+    #[test]
+    fn disabled_mask_view_tracks_free_resident_disabled_and_enabled_slots() {
+        let mut pager = Pager::new(6);
+        let enabled = [false; 6];
+        assert_disabled_mask_matches(&pager, &enabled, true);
+        assert!(matches!(pager.touch(10), Resolution::Miss { slot: 0, .. }));
+        assert_disabled_mask_matches(&pager, &enabled, true);
+
+        assert_eq!(pager.disable_slot(0), Some(10));
+        assert_eq!(pager.disable_slot(5), None);
+        let disabled = [true, false, false, false, false, true];
+        assert_disabled_mask_matches(&pager, &disabled, true);
+        assert_disabled_mask_matches(&pager, &enabled, false);
+
+        pager.enable_slot(0);
+        assert_disabled_mask_matches(&pager, &disabled, false);
+        assert_disabled_mask_matches(
+            &pager,
+            &[false, false, false, false, false, true],
+            true,
+        );
+        pager.enable_slot(5);
+        assert_disabled_mask_matches(&pager, &enabled, true);
+        assert_disabled_mask_matches(&pager, &disabled, false);
+    }
+
+    #[test]
+    fn disabled_mask_slice_equality_matches_scalar_for_every_small_mask() {
+        for slots in 1..=7 {
+            for actual in 0..(1usize << slots) {
+                let mut pager = Pager::new(slots);
+                for slot in 0..slots {
+                    if actual & (1 << slot) != 0 {
+                        pager.disable_slot(slot as u32);
+                    }
+                }
+                let before = admission_state(&pager);
+                for expected in 0..(1usize << slots) {
+                    let mask = (0..slots)
+                        .map(|slot| expected & (1 << slot) != 0)
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        scalar_disabled_mask_matches(&pager, &mask),
+                        actual == expected
+                    );
+                    assert_eq!(pager.disabled() == mask.as_slice(), actual == expected);
+                }
+                assert_eq!(admission_state(&pager), before);
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_mask_equality_rejects_empty_short_and_long_masks() {
+        // Pager::new(0) is invalid; an empty expected mask must reject a valid pager.
+        for slots in [1, 8] {
+            let pager = Pager::new(slots);
+            for length in [0, slots - 1, slots + 1] {
+                assert_disabled_mask_matches(&pager, &vec![false; length], false);
+            }
+            assert_disabled_mask_matches(&pager, &vec![false; slots], true);
+        }
+    }
+
+    #[test]
+    fn disabled_mask_large_comparison_detects_first_middle_and_last_changes() {
+        let mut pager = Pager::new(16_384);
+        for slot in (0..pager.n_slots()).step_by(257) {
+            pager.disable_slot(slot as u32);
+        }
+        let mask = pager.disabled().to_vec();
+        assert_disabled_mask_matches(&pager, &mask, true);
+        for slot in [0, mask.len() / 2, mask.len() - 1] {
+            let mut changed = mask.clone();
+            changed[slot] = !changed[slot];
+            assert_disabled_mask_matches(&pager, &changed, false);
+        }
+    }
+
+    #[test]
+    #[ignore = "manual CPU microbenchmark; compare scalar and slice masks in an optimized build"]
+    fn disabled_mask_scalar_vs_slice_microbenchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const ITERATIONS: usize = 10_000;
+        for slots in [64, 1_024, 16_384] {
+            let pager = Pager::new(slots);
+            for (label, difference) in [
+                ("equal", None),
+                ("early", Some(0)),
+                ("late", Some(slots - 1)),
+            ] {
+                let mut mask = pager.disabled().to_vec();
+                if let Some(slot) = difference {
+                    mask[slot] = !mask[slot];
+                }
+                let started = Instant::now();
+                let mut scalar_matches = 0;
+                for _ in 0..ITERATIONS {
+                    scalar_matches += usize::from(black_box(scalar_disabled_mask_matches(
+                        black_box(&pager),
+                        black_box(mask.as_slice()),
+                    )));
+                }
+                let scalar_ns = started.elapsed().as_nanos();
+                let started = Instant::now();
+                let mut slice_matches = 0;
+                for _ in 0..ITERATIONS {
+                    let pager = black_box(&pager);
+                    let mask = black_box(mask.as_slice());
+                    slice_matches += usize::from(black_box(
+                        pager.n_slots() == mask.len() && pager.disabled() == mask,
+                    ));
+                }
+                let slice_ns = started.elapsed().as_nanos();
+                assert_eq!(scalar_matches, slice_matches);
+                assert_eq!(
+                    scalar_matches,
+                    if difference.is_none() { ITERATIONS } else { 0 }
+                );
+                eprintln!(
+                    "disabled mask slots={slots} case={label} iterations={ITERATIONS} scalar_ns={scalar_ns} slice_ns={slice_ns}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replacement_slots_are_bounded_read_only_and_skip_explicit_pins() {
+        let mut pager = Pager::new(6);
+        for id in 10..14 {
+            pager.touch(id);
+        }
+        pager.disable_slot(5);
+        pager.repin(11).unwrap();
+        let before = admission_state(&pager);
+        assert_eq!(
+            pager.replacement_slots().take(2).collect::<Vec<_>>(),
+            vec![(None, 4), (Some(10), 0)]
+        );
+        assert_eq!(
+            pager.replacement_slots().collect::<Vec<_>>(),
+            vec![(None, 4), (Some(10), 0), (Some(12), 2), (Some(13), 3)]
+        );
+        assert_eq!(admission_state(&pager), before);
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct AdmissionState {
+        n_slots: usize,
+        disabled: Vec<bool>,
+        enabled_slots: usize,
+        resident: HashMap<BlockId, u32>,
+        lru: Vec<(Option<BlockId>, Option<u32>, Option<u32>)>,
+        lru_head: Option<u32>,
+        lru_tail: Option<u32>,
+        lru_len: usize,
+        free: Vec<u32>,
+        epoch: HashMap<BlockId, u64>,
+        cur_epoch: u64,
+        cold_victim_cursor: Option<u32>,
+        pinned: HashMap<BlockId, u32>,
+        stats: (u64, u64, u64),
+        profile_work: crate::pager_profile::LruWorkStats,
+    }
+
+    fn admission_state(p: &Pager) -> AdmissionState {
+        AdmissionState {
+            n_slots: p.n_slots,
+            disabled: p.disabled.clone(),
+            enabled_slots: p.enabled_slots,
+            resident: p.resident.clone(),
+            lru: p.lru.iter().map(|n| (n.id, n.prev, n.next)).collect(),
+            lru_head: p.lru_head,
+            lru_tail: p.lru_tail,
+            lru_len: p.lru_len,
+            free: p.free.clone(),
+            epoch: p.epoch.clone(),
+            cur_epoch: p.cur_epoch,
+            cold_victim_cursor: p.cold_victim_cursor,
+            pinned: p.pinned.clone(),
+            stats: (p.stats.hits, p.stats.misses, p.stats.evictions),
+            profile_work: p.profile_work,
+        }
+    }
+
+    fn mixed_handoff_pager() -> Pager {
+        let mut pager = Pager::new(8);
+        pager.begin_batch();
+        for id in [7, 4_000, u32::MAX - 1, 99] {
+            pager.touch(id);
+        }
+        pager.touch(7);
+        pager.evict(4_000);
+        pager.disable_slot(3);
+        pager.disable_slot(6);
+        pager.enable_slot(6);
+        pager.disable_slot(5);
+        pager
+    }
+
+    #[test]
+    fn handoff_roundtrip_preserves_mixed_slots_orders_sparse_ids_and_stats() {
+        let mut source = mixed_handoff_pager();
+        let before = admission_state(&source);
+        let snapshot = source.snapshot_for_handoff().unwrap();
+        assert_eq!(admission_state(&source), before, "snapshot is read-only");
+        assert_eq!(snapshot.n_slots(), 8);
+        assert_eq!(
+            snapshot.disabled(),
+            &[false, false, false, true, false, true, false, false]
+        );
+        assert_eq!(snapshot.free(), &[7, 1, 6, 4]);
+        assert_eq!(snapshot.resident_lru(), &[(u32::MAX - 1, 2), (7, 0)]);
+        assert_eq!(
+            snapshot.stats(),
+            PagerStats {
+                hits: 1,
+                misses: 4,
+                evictions: 1
+            }
+        );
+
+        let mut restored = Pager::new(8);
+        restored.touch(123);
+        restored.disable_slot(0);
+        restored.profile_work.mark_calls = 17;
+        let profile_before = restored.profile_work;
+        restored.restore_handoff(&snapshot).unwrap();
+        assert_eq!(restored.snapshot_for_handoff().unwrap(), snapshot);
+        assert_eq!(restored.profile_work, profile_before);
+        assert_eq!(restored.enabled_slots(), 6);
+        assert!(restored.epoch.is_empty());
+        assert_eq!(restored.cur_epoch, 0);
+        assert_eq!(restored.cold_victim_cursor, restored.lru_head);
+        for &(id, slot) in snapshot.resident_lru() {
+            assert_eq!(restored.slot_of(id), Some(slot));
+        }
+
+        // Verify behavior, not just serialization: pop every free slot in its original order,
+        // then evict in the supplied oldest-to-newest order, using both insertion policies.
+        for (id, slot, evicted) in [
+            (100, 4, None),
+            (101, 6, None),
+            (102, 1, None),
+            (103, 7, None),
+            (104, 2, Some(u32::MAX - 1)),
+            (105, 0, Some(7)),
+        ] {
+            source.begin_batch();
+            restored.begin_batch();
+            let expected = Resolution::Miss { slot, evicted };
+            assert_eq!(source.touch(id), expected);
+            assert_eq!(restored.touch(id), expected);
+            assert_eq!(
+                restored.snapshot_for_handoff(),
+                source.snapshot_for_handoff()
+            );
+        }
+        source.begin_batch();
+        restored.begin_batch();
+        assert_eq!(restored.touch_cold(106), source.touch_cold(106));
+        assert_eq!(
+            restored.snapshot_for_handoff(),
+            source.snapshot_for_handoff()
+        );
+        assert_admission_invariants(&restored);
+    }
+
+    #[test]
+    fn malformed_handoff_is_transactional_for_every_validation_failure() {
+        let good = mixed_handoff_pager().snapshot_for_handoff().unwrap();
+        let mut cases = Vec::new();
+
+        let mut bad = good.clone();
+        bad.disabled.pop();
+        cases.push((
+            bad,
+            HandoffError::CapacityMismatch {
+                expected: 8,
+                actual: 7,
+            },
+        ));
+        let mut bad = good.clone();
+        bad.resident_lru[0].0 = NOT_RESIDENT;
+        cases.push((bad, HandoffError::InvalidBlockId));
+        let mut bad = good.clone();
+        bad.resident_lru[1].0 = bad.resident_lru[0].0;
+        cases.push((bad, HandoffError::DuplicateBlockId { id: u32::MAX - 1 }));
+        let mut bad = good.clone();
+        bad.resident_lru[1].1 = bad.resident_lru[0].1;
+        cases.push((bad, HandoffError::SlotConflict { slot: 2 }));
+        let mut bad = good.clone();
+        bad.resident_lru[1].1 = good.free[0];
+        cases.push((bad, HandoffError::SlotConflict { slot: 7 }));
+        let mut bad = good.clone();
+        bad.free.push(good.free[0]);
+        cases.push((bad, HandoffError::SlotConflict { slot: 7 }));
+        let mut bad = good.clone();
+        bad.free.pop();
+        cases.push((bad, HandoffError::MissingSlot { slot: 4 }));
+        let mut bad = good.clone();
+        bad.resident_lru.pop();
+        cases.push((bad, HandoffError::MissingSlot { slot: 0 }));
+        for resident in [false, true] {
+            for (slot, error) in [
+                (8, HandoffError::SlotOutOfRange { slot: 8 }),
+                (u32::MAX, HandoffError::SlotOutOfRange { slot: u32::MAX }),
+                (3, HandoffError::SlotDisabled { slot: 3 }),
+            ] {
+                let mut bad = good.clone();
+                if resident {
+                    bad.resident_lru[0].1 = slot;
+                } else {
+                    bad.free[0] = slot;
+                }
+                cases.push((bad, error));
+            }
+        }
+
+        let mut destination = mixed_handoff_pager();
+        destination.begin_batch();
+        destination.touch_cold(7);
+        destination.profile_work.victim_calls = 11;
+        let before = admission_state(&destination);
+        for (snapshot, error) in cases {
+            assert_eq!(destination.validate_handoff(&snapshot), Err(error));
+            assert_eq!(admission_state(&destination), before);
+            assert_eq!(destination.restore_handoff(&snapshot), Err(error));
+            assert_eq!(admission_state(&destination), before);
+        }
+    }
+
+    #[test]
+    fn handoff_rejects_nested_active_pins_without_changing_any_state() {
+        let mut pager = mixed_handoff_pager();
+        let snapshot = pager.snapshot_for_handoff().unwrap();
+        pager.repin(7).unwrap();
+        pager.repin(7).unwrap();
+        for _ in 0..2 {
+            let before = admission_state(&pager);
+            let error = HandoffError::ActivePins { blocks: 1 };
+            assert_eq!(pager.snapshot_for_handoff(), Err(error));
+            assert_eq!(pager.validate_handoff(&snapshot), Err(error));
+            assert_eq!(admission_state(&pager), before);
+            assert_eq!(pager.restore_handoff(&snapshot), Err(error));
+            assert_eq!(admission_state(&pager), before);
+            pager.unpin(7);
+        }
+        assert_eq!(pager.snapshot_for_handoff().unwrap(), snapshot);
+        pager.restore_handoff(&snapshot).unwrap();
+    }
+
+    #[test]
+    fn handoff_validation_accepts_new_ownership_without_changing_destination() {
+        let mut pager = mixed_handoff_pager();
+        pager.begin_batch();
+        pager.touch_cold(7);
+        pager.profile_work.victim_calls = 11;
+        let mut snapshot = pager.snapshot_for_handoff().unwrap();
+        snapshot.free.reverse();
+        snapshot.resident_lru.reverse();
+        snapshot.stats.hits += 5;
+        let before = admission_state(&pager);
+        let snapshot_before = snapshot.clone();
+        let shared: &Pager = &pager;
+        assert_eq!(shared.validate_handoff(&snapshot), Ok(()));
+        assert_eq!(shared.validate_handoff(&snapshot), Ok(()));
+        assert_eq!(admission_state(&pager), before);
+        assert_eq!(snapshot, snapshot_before);
+
+        pager.restore_handoff(&snapshot).unwrap();
+        assert_eq!(pager.snapshot_for_handoff().unwrap(), snapshot);
+    }
+
+    #[test]
+    fn handoff_validation_can_reject_a_later_pool_before_restoring_any_pool() {
+        let mut first = mixed_handoff_pager();
+        let mut second = mixed_handoff_pager();
+        let first_snapshot = first.snapshot_for_handoff().unwrap();
+        let second_snapshot = second.snapshot_for_handoff().unwrap();
+        let mut invalid_second = second_snapshot.clone();
+        invalid_second.resident_lru[0].1 = 3;
+        let first_before = admission_state(&first);
+        let second_before = admission_state(&second);
+
+        let validation = first
+            .validate_handoff(&first_snapshot)
+            .and_then(|()| second.validate_handoff(&invalid_second));
+        assert_eq!(validation, Err(HandoffError::SlotDisabled { slot: 3 }));
+        assert_eq!(admission_state(&first), first_before);
+        assert_eq!(admission_state(&second), second_before);
+
+        first.validate_handoff(&first_snapshot).unwrap();
+        second.validate_handoff(&second_snapshot).unwrap();
+        first.restore_handoff(&first_snapshot).unwrap();
+        second.restore_handoff(&second_snapshot).unwrap();
+        assert_eq!(first.snapshot_for_handoff().unwrap(), first_snapshot);
+        assert_eq!(second.snapshot_for_handoff().unwrap(), second_snapshot);
+    }
+
+    #[test]
+    fn handoff_imports_gpu_order_and_cumulative_stats_without_access_replay() {
+        let stats = PagerStats {
+            hits: 900,
+            misses: 70,
+            evictions: 40,
+        };
+        let snapshot = PagerSnapshot::from_parts(
+            vec![false, true, false, false],
+            vec![3],
+            vec![(u32::MAX - 1, 2), (0, 0)],
+            stats,
+        );
+        let mut pager = Pager::new(4);
+        pager.begin_batch();
+        pager.touch(100);
+        pager.restore_handoff(&snapshot).unwrap();
+        assert_eq!(pager.stats(), stats);
+        assert_eq!(pager.snapshot_for_handoff().unwrap(), snapshot);
+        assert_eq!(
+            pager.touch(1),
+            Resolution::Miss {
+                slot: 3,
+                evicted: None
+            }
+        );
+        // No old/current-batch guard may prevent the GPU's oldest resident being evicted.
+        assert_eq!(
+            pager.touch_cold(2),
+            Resolution::Miss {
+                slot: 2,
+                evicted: Some(u32::MAX - 1)
+            }
+        );
+        assert_eq!(
+            pager.stats(),
+            PagerStats {
+                hits: 900,
+                misses: 72,
+                evictions: 41
+            }
+        );
+        assert_eq!(pager.slot_of(0), Some(0));
+    }
+
+    #[test]
+    fn handoff_handles_empty_full_and_all_disabled_caches() {
+        for (disabled, free, residents) in [
+            (vec![false; 2], vec![1, 0], vec![]),
+            (vec![false; 2], vec![], vec![(0, 1), (u32::MAX - 1, 0)]),
+            (vec![true; 2], vec![], vec![]),
+        ] {
+            let snapshot =
+                PagerSnapshot::from_parts(disabled, free, residents, PagerStats::default());
+            let mut pager = Pager::new(2);
+            pager.restore_handoff(&snapshot).unwrap();
+            assert_eq!(pager.snapshot_for_handoff().unwrap(), snapshot);
+            // Enabling a spare after restore must retain every other slot's ownership/order.
+            if pager.enabled_slots() == 0 {
+                pager.enable_slot(1);
+                assert_eq!(
+                    pager.touch(8),
+                    Resolution::Miss {
+                        slot: 1,
+                        evicted: None
+                    }
+                );
+            }
+        }
+    }
+
+    fn assert_admission_rejected(p: &mut Pager, id: BlockId, slot: u32, error: AdmissionError) {
+        let before = admission_state(p);
+        assert_eq!(p.admit_at(id, slot), Err(error));
+        assert_eq!(admission_state(p), before, "a refusal must change no state");
+    }
+
+    fn assert_admission_invariants(p: &Pager) {
+        assert_eq!(p.enabled_slots, p.disabled.iter().filter(|&&d| !d).count());
+        assert_eq!(p.lru_len, p.resident.len());
+        assert_eq!(p.free.len() + p.resident.len(), p.enabled_slots);
+        assert_eq!(p.epoch.len(), p.resident.len());
+        let mut seen = vec![false; p.n_slots];
+        let mut prev = None;
+        let mut slot = p.lru_head;
+        let mut linked = 0;
+        while let Some(s) = slot {
+            let idx = s as usize;
+            assert!(!seen[idx], "duplicate slot or LRU cycle");
+            seen[idx] = true;
+            let node = p.lru[idx];
+            let id = node.id.expect("linked slot must have an owner");
+            assert!(!p.disabled[idx]);
+            assert_eq!(p.slot_of(id), Some(s));
+            assert!(p.epoch.contains_key(&id));
+            assert_eq!(node.prev, prev);
+            prev = Some(s);
+            slot = node.next;
+            linked += 1;
+        }
+        assert_eq!(prev, p.lru_tail);
+        assert_eq!(linked, p.lru_len);
+        if let Some(cursor) = p.cold_victim_cursor {
+            assert!(
+                seen[cursor as usize],
+                "cold cursor must point to a linked slot"
+            );
+        }
+        for &s in &p.free {
+            let idx = s as usize;
+            assert!(!seen[idx], "free slot is duplicated or still resident");
+            seen[idx] = true;
+            assert!(!p.disabled[idx]);
+            assert!(p.lru[idx].id.is_none());
+        }
+        for (idx, &disabled) in p.disabled.iter().enumerate() {
+            assert_eq!(seen[idx], !disabled);
+            if p.lru[idx].id.is_none() {
+                assert!(p.lru[idx].prev.is_none() && p.lru[idx].next.is_none());
+            }
+        }
+        for (&id, &count) in &p.pinned {
+            assert!(count > 0 && p.resident.contains_key(&id));
+        }
+    }
+
+    #[test]
+    fn admission_rejects_invalid_ids_slots_and_resident_mismatches_without_mutation() {
+        let mut p = Pager::new(4);
+        p.touch(10);
+        p.touch(11);
+        p.begin_batch();
+        p.disable_slot(3);
+        assert_admission_rejected(&mut p, NOT_RESIDENT, 2, AdmissionError::InvalidBlockId);
+        for slot in [4, u32::MAX] {
+            assert_admission_rejected(&mut p, 12, slot, AdmissionError::SlotOutOfRange);
+        }
+        assert_admission_rejected(&mut p, 12, 3, AdmissionError::SlotDisabled);
+        // A mismatch must not evict either an occupied target or consume a free target.
+        for slot in [1, 2] {
+            assert_admission_rejected(
+                &mut p,
+                10,
+                slot,
+                AdmissionError::ResidentElsewhere { slot: 0 },
+            );
+        }
+        assert_admission_invariants(&p);
+    }
+
+    #[test]
+    fn admission_preserves_explicit_pins_and_current_batch_owners() {
+        let mut p = Pager::new(3);
+        p.resolve_and_pin(10, Insert::Mru).unwrap();
+        p.repin(10).unwrap();
+        p.touch(11);
+        p.begin_batch();
+        p.touch(11);
+        // Refuse the exact protected target even though slot 2 is free.
+        assert_admission_rejected(&mut p, 12, 0, AdmissionError::Pinned { id: 10 });
+        assert_admission_rejected(&mut p, 12, 1, AdmissionError::CurrentBatch { id: 11 });
+        assert_eq!(p.admit_at(10, 0), Ok(Resolution::Hit { slot: 0 }));
+        assert_eq!(p.pinned.get(&10), Some(&2), "a hit acquires no new pin");
+        p.unpin(10);
+        p.begin_batch();
+        assert_admission_rejected(&mut p, 12, 0, AdmissionError::Pinned { id: 10 });
+        p.unpin(10);
+        assert_eq!(
+            p.admit_at(12, 0),
+            Ok(Resolution::Miss {
+                slot: 0,
+                evicted: Some(10),
+            })
+        );
+        assert_eq!(p.pinned_blocks(), 0);
+        assert_admission_invariants(&p);
+    }
+
+    #[test]
+    fn admission_hit_marks_mru_counts_once_and_protects_the_epoch() {
+        let mut p = Pager::new(3);
+        for id in 10..13 {
+            p.touch(id);
+        }
+        p.begin_batch();
+        assert_eq!(p.admit_at(10, 0), Ok(Resolution::Hit { slot: 0 }));
+        assert_eq!(p.lru_order(), vec![11, 12, 10]);
+        assert_eq!(p.stats.hits, 1);
+        assert_eq!((p.stats.misses, p.stats.evictions), (3, 0));
+        assert_eq!(p.epoch.get(&10), Some(&p.cur_epoch));
+        assert_admission_rejected(&mut p, 20, 0, AdmissionError::CurrentBatch { id: 10 });
+        assert_eq!(p.admit_at(10, 0), Ok(Resolution::Hit { slot: 0 }));
+        assert_eq!(p.stats.hits, 2);
+        assert_eq!(p.lru_order(), vec![11, 12, 10]);
+        assert_admission_invariants(&p);
+    }
+
+    #[test]
+    fn admission_consumes_any_free_slot_without_reordering_or_duplicate_allocation() {
+        for target in 0..4u32 {
+            let mut p = Pager::new(4);
+            let remaining: Vec<_> = (0..4u32).filter(|&s| s != target).collect();
+            assert_eq!(
+                p.admit_at(10, target),
+                Ok(Resolution::Miss {
+                    slot: target,
+                    evicted: None,
+                })
+            );
+            assert_admission_invariants(&p);
+            for (id, slot) in (11..).zip(remaining) {
+                assert_eq!(
+                    p.touch(id),
+                    Resolution::Miss {
+                        slot,
+                        evicted: None
+                    }
+                );
+                assert_admission_invariants(&p);
+            }
+            assert_eq!(p.stats.evictions, 0);
+            assert_eq!(p.stats.misses, 4);
+            assert_eq!(p.slot_of(10), Some(target));
+        }
+    }
+
+    #[test]
+    fn admission_reuses_evicted_and_reenabled_slots() {
+        let mut p = Pager::new(3);
+        p.touch(10);
+        p.touch(11);
+        assert_eq!(p.disable_slot(0), Some(10));
+        assert_admission_rejected(&mut p, 12, 0, AdmissionError::SlotDisabled);
+        p.enable_slot(0);
+        assert_eq!(
+            p.admit_at(12, 0),
+            Ok(Resolution::Miss {
+                slot: 0,
+                evicted: None
+            })
+        );
+        assert_admission_invariants(&p);
+        assert_eq!(p.evict(12), Some(0));
+        assert_eq!(
+            p.admit_at(13, 0),
+            Ok(Resolution::Miss {
+                slot: 0,
+                evicted: None
+            })
+        );
+        assert_eq!(
+            p.touch(14),
+            Resolution::Miss {
+                slot: 2,
+                evicted: None
+            }
+        );
+        assert_eq!(
+            p.stats.evictions, 1,
+            "only disable_slot displaced a resident"
+        );
+        assert_admission_invariants(&p);
+    }
+
+    #[test]
+    fn admission_replaces_the_selected_head_middle_or_tail_even_with_free_slots() {
+        for target in 0..4u32 {
+            let mut p = Pager::new(5);
+            for id in 0..4 {
+                p.touch(id);
+            }
+            p.begin_batch();
+            let free = p.free.clone();
+            assert_eq!(
+                p.admit_at(10, target),
+                Ok(Resolution::Miss {
+                    slot: target,
+                    evicted: Some(target),
+                })
+            );
+            let mut order: Vec<_> = (0..4).filter(|&id| id != target).collect();
+            order.push(10);
+            assert_eq!(p.lru_order(), order);
+            assert_eq!(p.free, free);
+            assert_eq!(p.slot_of(target), None);
+            assert_eq!(p.slot_of(10), Some(target));
+            assert!(!p.epoch.contains_key(&target));
+            assert_eq!((p.stats.hits, p.stats.misses, p.stats.evictions), (0, 5, 1));
+            assert_admission_rejected(&mut p, 11, target, AdmissionError::CurrentBatch { id: 10 });
+            assert_admission_invariants(&p);
+        }
+    }
+
+    #[test]
+    fn admission_supports_legacy_epoch_zero_and_bounds_ownership_metadata() {
+        let mut p = Pager::new(1);
+        for id in 0..100 {
+            assert_eq!(
+                p.admit_at(id, 0),
+                Ok(Resolution::Miss {
+                    slot: 0,
+                    evicted: id.checked_sub(1),
+                })
+            );
+            assert_eq!(p.slot_of(id), Some(0));
+            assert_eq!(p.lru_order(), vec![id]);
+            assert_admission_invariants(&p);
+        }
+        assert_eq!(
+            (p.stats.hits, p.stats.misses, p.stats.evictions),
+            (0, 100, 99)
+        );
+    }
+
+    #[test]
+    fn admission_keeps_cold_cursor_valid_after_hits_and_selected_evictions() {
+        for hit in [false, true] {
+            for target in 0..4u32 {
+                let mut p = Pager::new(4);
+                for id in 0..4 {
+                    p.touch(id);
+                }
+                p.begin_batch();
+                let id = if hit { target } else { 10 };
+                let result = p.admit_at(id, target).unwrap();
+                assert_eq!(matches!(result, Resolution::Hit { .. }), hit);
+                assert_admission_invariants(&p);
+                for (new, victim) in (20..).zip((0..4).filter(|&old| old != target)) {
+                    assert_eq!(
+                        p.touch_cold(new),
+                        Resolution::Miss {
+                            slot: victim,
+                            evicted: Some(victim),
+                        }
+                    );
+                    assert_admission_invariants(&p);
+                }
+                assert_eq!(p.slot_of(id), Some(target));
+                assert_eq!(p.prefetch_cold(30), None);
+                p.begin_batch();
+                assert!(matches!(p.touch_cold(30), Resolution::Miss { .. }));
+                assert_admission_invariants(&p);
+            }
+        }
+    }
+
+    #[test]
+    fn admission_reconciles_a_simulated_gpu_lut_and_physical_owners() {
+        let mut p = Pager::new(4);
+        let mut lut = [NOT_RESIDENT; 8];
+        let mut physical = [None; 4];
+        let selected = [
+            (0, 2),
+            (1, 0),
+            (2, 3),
+            (0, 2),
+            (3, 1),
+            (4, 0),
+            (5, 2),
+            (2, 3),
+            (1, 1),
+            (4, 0),
+            (6, 3),
+        ];
+        for (id, slot) in selected {
+            p.begin_batch();
+            // The backend has already copied bytes and published its ownership/LUT change.
+            let old = physical[slot as usize].replace(id);
+            if let Some(old) = old {
+                if old != id {
+                    lut[old as usize] = NOT_RESIDENT;
+                }
+            }
+            lut[id as usize] = slot;
+            let expected = if old == Some(id) {
+                Resolution::Hit { slot }
+            } else {
+                Resolution::Miss { slot, evicted: old }
+            };
+            assert_eq!(p.admit_at(id, slot), Ok(expected));
+            for (id, &mapped) in lut.iter().enumerate() {
+                assert_eq!(p.slot_of(id as u32).unwrap_or(NOT_RESIDENT), mapped);
+                if mapped != NOT_RESIDENT {
+                    assert_eq!(physical[mapped as usize], Some(id as u32));
+                }
+            }
+            assert_admission_invariants(&p);
+        }
+        assert!(p.stats.hits > 0 && p.stats.evictions > 0);
+    }
+
+    #[test]
+    fn admission_matches_normal_demand_lru_epochs_and_statistics() {
+        let mut normal = Pager::new(4);
+        let mut replay = Pager::new(4);
+        for id in [0, 1, 2, 0, 1, 3, 4, 0, 1, 5, 0, 1, 6, 7, 0, 1] {
+            normal.begin_batch();
+            replay.begin_batch();
+            let expected = normal.touch(id);
+            let slot = match expected {
+                Resolution::Hit { slot } | Resolution::Miss { slot, .. } => slot,
+            };
+            assert_eq!(replay.admit_at(id, slot), Ok(expected));
+            assert_eq!(replay.resident_slots_lru(), normal.resident_slots_lru());
+            assert_eq!(replay.epoch, normal.epoch);
+            assert_eq!(replay.free, normal.free);
+            assert_eq!(replay.cold_victim_cursor, normal.cold_victim_cursor);
+            assert_eq!(
+                (
+                    replay.stats.hits,
+                    replay.stats.misses,
+                    replay.stats.evictions
+                ),
+                (
+                    normal.stats.hits,
+                    normal.stats.misses,
+                    normal.stats.evictions
+                ),
+            );
+            assert_admission_invariants(&replay);
+        }
+    }
 
     #[test]
     fn legacy_mru_then_cold_touch_preserves_remaining_victims() {

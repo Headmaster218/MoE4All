@@ -13,6 +13,15 @@ use serde_json::Value;
 /// The marker that begins the final-answer channel.
 const FINAL_MARK: &str = "<channel|>";
 
+pub(crate) const CHANNEL_THOUGHT_MARKERS: [&str; 2] = ["<|channel|>thought", "<|channel>thought"];
+
+/// Only a leading protocol header selects channel parsing; quoted markers in prose do not.
+pub(crate) fn channel_thought_start(text: &str) -> Option<usize> {
+    CHANNEL_THOUGHT_MARKERS
+        .iter()
+        .find_map(|marker| text.starts_with(marker).then_some(marker.len()))
+}
+
 /// All marker substrings that should be stripped when cleaning channel text.
 const MARKERS: &[&str] = &[
     "<|channel>thought",
@@ -620,11 +629,17 @@ const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
 
 /// Format-aware reasoning split: channel-marker output (E2B/gpt-oss `<|channel>thought…<channel|>`)
-/// goes through [`split_channels`], everything else through [`split_think`]. THE one entry point
+/// uses the same leading header as the stream, everything else uses [`split_think`]. THE entry point
 /// for "what part of this reply was reasoning" — history stripping and batch consumers use this.
 pub fn split_reasoning(text: &str) -> (String, String) {
-    if MARKERS.iter().any(|m| text.contains(m)) {
-        split_channels(text)
+    if let Some(start) = channel_thought_start(text) {
+        match text[start..].find(FINAL_MARK) {
+            Some(end) => (
+                text[start..start + end].trim().to_owned(),
+                text[start + end + FINAL_MARK.len()..].trim().to_owned(),
+            ),
+            None => (text[start..].trim().to_owned(), String::new()),
+        }
     } else {
         split_think(text)
     }
@@ -681,6 +696,33 @@ pub fn split_think(text: &str) -> (String, String) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn reasoning_split_requires_a_leading_channel_header() {
+        let text = "Example: `<|channel>thought ... <channel|>` is a protocol.";
+        assert_eq!(split_reasoning(text), (String::new(), text.into()));
+        assert_eq!(
+            split_reasoning("<think>quoted <channel|></think>answer"),
+            ("quoted <channel|>".into(), "answer".into())
+        );
+    }
+
+    #[test]
+    fn reasoning_split_preserves_channel_literals_in_final_content() {
+        let text =
+            "<|channel>thought\nplan<channel|>Use `<channel|>` or `<|channel>thought` literally.";
+        assert_eq!(
+            split_reasoning(text),
+            (
+                "plan".into(),
+                "Use `<channel|>` or `<|channel>thought` literally.".into()
+            )
+        );
+        assert_eq!(
+            split_reasoning("<|channel|>thought\nunfinished"),
+            ("unfinished".into(), String::new())
+        );
+    }
 
     // --- split_channels --------------------------------------------------
 

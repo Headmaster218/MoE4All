@@ -61,6 +61,96 @@ function Get-SavedValue {
     return $Default
 }
 
+function Get-BenchmarkGuideNow {
+    return [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+}
+
+function Test-BenchmarkGuideInteractive {
+    if ($DryRun -or [Console]::IsInputRedirected -or [Console]::IsOutputRedirected -or $env:CI) { return $false }
+    if ([Environment]::GetCommandLineArgs() -match '^-NonI(nteractive)?$') { return $false }
+    return [Environment]::UserInteractive
+}
+
+function Get-BenchmarkGuideState {
+    $result = [pscustomobject]@{ submitted = $false; next_remind_at = [long]0 }
+    $path = Join-Path $dataDir 'private\benchmark-first-submission.json'
+    try {
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            $value = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($value.submitted -is [bool] -and $value.submitted) { $result.submitted = $true }
+            $next = [long]0
+            if ([long]::TryParse([string]$value.next_remind_at, [ref]$next) -and $next -ge 0) { $result.next_remind_at = $next }
+        }
+    } catch { } # A damaged reminder must not stop normal startup.
+    return $result
+}
+
+function Save-BenchmarkGuideState {
+    param([bool]$Submitted = $false, [long]$NextRemindAt = 0)
+    if ($DryRun) { return }
+    $temporary = $null
+    try {
+        $previous = Get-BenchmarkGuideState
+        $value = [ordered]@{
+            schema_version = 1
+            submitted = ($Submitted -or $previous.submitted)
+            next_remind_at = [Math]::Max($NextRemindAt, $previous.next_remind_at)
+        }
+        $directory = Join-Path $dataDir 'private'
+        [void][IO.Directory]::CreateDirectory($directory)
+        $path = Join-Path $directory 'benchmark-first-submission.json'
+        $temporary = Join-Path $directory ('.benchmark-guide-' + [guid]::NewGuid().ToString('N'))
+        [IO.File]::WriteAllText($temporary, (($value | ConvertTo-Json) + "`n"), [Text.UTF8Encoding]::new($false))
+        if ([IO.File]::Exists($path)) { [IO.File]::Replace($temporary, $path, [System.Management.Automation.Language.NullString]::Value) }
+        else { [IO.File]::Move($temporary, $path) }
+    } catch { Write-Warning 'Could not save the benchmark reminder; normal startup will continue.' }
+    finally { if ($temporary -and [IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } }
+}
+
+function Set-BenchmarkSubmissionSucceeded {
+    param([string]$Kind)
+    if ($Kind -eq 'benchmark' -and -not $DryRun) { Save-BenchmarkGuideState -Submitted $true }
+}
+
+function Test-BenchmarkBodyReceipt {
+    param($Receipt)
+    $received = [DateTimeOffset]::MinValue
+    return ($Receipt.api_version -eq 1 -and [string]$Receipt.kind -eq 'benchmark' -and
+        [string]$Receipt.receipt_id -cmatch '^[A-Za-z0-9_-]+$' -and
+        -not [string]::IsNullOrWhiteSpace([string]$Receipt.report_id) -and
+        [string]$Receipt.file_sha256 -cmatch '^[0-9a-f]{64}$' -and
+        [string]$Receipt.payload_sha256 -cmatch '^[0-9a-f]{64}$' -and
+        [string]$Receipt.status -in @('forwarding', 'pending_review', 'published', 'rejected', 'delivery_failed') -and
+        [DateTimeOffset]::TryParse([string]$Receipt.received_at, [ref]$received))
+}
+
+function Invoke-BenchmarkStartupGuide {
+    param([bool]$Interactive = $false, [bool]$JsonAutomation = $false)
+    if (-not $Interactive -or $DryRun -or $JsonAutomation) { return $false }
+    $guide = Get-BenchmarkGuideState
+    if ($guide.submitted) { return $false }
+    # Only stored body-received metadata is historical proof; a saved browser choice is not.
+    $receipts = Join-Path $dataDir 'private\submission-receipts'
+    foreach ($file in @(Get-ChildItem -LiteralPath $receipts -Filter '*.private-receipt.json' -File -ErrorAction SilentlyContinue)) {
+        try {
+            $receipt = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+            if (Test-BenchmarkBodyReceipt $receipt) { Set-BenchmarkSubmissionSucceeded benchmark; return $false }
+        } catch { } # Never print private receipt contents or parser errors.
+    }
+    $now = Get-BenchmarkGuideNow
+    if ($now -lt $guide.next_remind_at) { return $false }
+    # Persist before asking so EOF, cancellation and failed benchmarks also get a cooldown.
+    Save-BenchmarkGuideState -NextRemindAt ($now + 172800)
+    Write-Host "`n邀请你跑一次快速 Benchmark，分享成绩到 MoE4All.com 排行榜！" -ForegroundColor Cyan
+    Write-Host 'Run a quick benchmark and share your result on the MoE4All.com leaderboard!'
+    Write-Host '上传前仍会征求同意。You will be asked before uploading.'
+    $answer = Read-Choice -Label '来试试吗？/ Give it a try?' -DefaultValue 'later' -Options @(
+        [pscustomobject]@{ Key = '1'; Value = 'try'; Label = '试试！ / Try it!' }
+        [pscustomobject]@{ Key = '2'; Value = 'later'; Label = '后面再说~ / Maybe later~' }
+    )
+    return ($answer -eq 'try')
+}
+
 function Read-TextValue {
     param(
         [Parameter(Mandatory = $true)][string]$Label,
@@ -1024,8 +1114,10 @@ function Write-ManualBenchmarkResult {
     $modelFile = Get-Item -LiteralPath $ModelPath -ErrorAction Stop
     $cpuName = $null
     $ramBytes = $null
-    try { $cpuName = [string](Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name) } catch { }
-    try { $ramBytes = [uint64](Get-CimInstance Win32_ComputerSystem | Select-Object -ExpandProperty TotalPhysicalMemory) } catch { }
+    if ($null -eq $rawResult.benchmark_metadata) {
+        try { $cpuName = [string](Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name) } catch { }
+        try { $ramBytes = [uint64](Get-CimInstance Win32_ComputerSystem | Select-Object -ExpandProperty TotalPhysicalMemory) } catch { }
+    }
     $contextTokens = if ($DepthMode -eq 'none') { 0 } else { [int64]$DepthTokens }
     if ($Kind -eq 'prefill') { $contextTokens = [int64]$PromptTokens }
     $result = [ordered]@{
@@ -1062,6 +1154,18 @@ function Write-ManualBenchmarkResult {
             failures = @()
         })
         failures = @()
+    }
+    if ($null -ne $rawResult.benchmark_metadata) {
+        $metadata = $rawResult.benchmark_metadata
+        foreach ($key in @('engine_version', 'engine_commit', 'hardware', 'model')) {
+            if ($null -ne $metadata.$key) { $result[$key] = $metadata.$key }
+        }
+        if ($null -ne $metadata.configuration) {
+            foreach ($property in $metadata.configuration.PSObject.Properties) {
+                if ($property.Name -eq 'auto_profile') { continue }
+                $result.configuration[$property.Name] = $property.Value
+            }
+        }
     }
     Write-Host "`n结果 / Results" -ForegroundColor Green
     Write-Host '+------------------+------------+----------+'
@@ -1343,6 +1447,7 @@ function Invoke-GhSubmissionUpload {
             if ($listed.ExitCode -ne 0 -or $prUrl -notmatch '^https://github\.com/Headmaster218/MoE4All/pull/[0-9]+$') { throw 'could not create or reuse pull request' }
         }
         if ($prUrl -notmatch '^https://github\.com/Headmaster218/MoE4All/pull/[0-9]+$') { throw 'GitHub did not return a valid report PR URL' }
+        Set-BenchmarkSubmissionSucceeded -Kind $Kind
         Write-Host "PR 已创建 / PR created: $prUrl" -ForegroundColor Green
         return $true
     } catch {
@@ -1357,9 +1462,11 @@ function Invoke-GhBenchmarkUpload {
 }
 
 function Save-BenchmarkUploadPreferences {
+    if ($DryRun) { return }
     if ([string]::IsNullOrWhiteSpace($statePath)) { return }
     try {
         $preferences = $script:state
+        if ($script:BenchmarkGuideActive) { $preferences = $null }
         if ($null -eq $preferences) {
             $preferences = [ordered]@{}
             if (Test-Path -LiteralPath $statePath -PathType Leaf) {
@@ -1782,6 +1889,7 @@ function Invoke-WebsiteSubmissionUpload {
         throw '提交回执与本地文件不匹配。Submission receipt does not match the local file.'
     }
     $receiptPath = Save-Moe4AllSubmissionReceipt -Receipt $receipt -ApiBase $config.ApiBase
+    if (Test-BenchmarkBodyReceipt $receipt) { Set-BenchmarkSubmissionSucceeded -Kind $Kind }
     if ([string]$receipt.status -eq 'delivery_failed') {
         Write-Warning '该报告此前转发失败，正文已清理；请重新导出新报告。This report previously failed delivery; export a new report to try again.'
     } elseif ([string]$receipt.status -eq 'rejected') {
@@ -1871,6 +1979,7 @@ function Read-ProblemDescription {
 }
 
 function Save-ErrorUploadPreference {
+    if ($DryRun) { return }
     New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
     $value = if (Test-Path -LiteralPath $statePath -PathType Leaf) {
         try { [System.IO.File]::ReadAllText($statePath) | ConvertFrom-Json } catch { [pscustomobject]@{} }
@@ -1927,8 +2036,9 @@ function Complete-ErrorReport {
 function Read-SubmissionNextAction {
     param([switch]$Browser)
     if ($Browser) {
+        # A remembered "sent" must never confirm a different report by pressing Enter.
         $default = $script:SubmissionBrowserActionDefault
-        if ($default -notin @('sent', 'reopen', 'cloudflare', 'later')) { $default = 'later' }
+        if ($default -notin @('reopen', 'cloudflare', 'later')) { $default = 'later' }
         $value = Read-Choice -Label 'GitHub 网页提交 / GitHub web submission' -DefaultValue $default -Options @(
             [pscustomobject]@{ Key = '1'; Value = 'sent'; Label = '已成功提交 / Successfully submitted' }
             [pscustomobject]@{ Key = '2'; Value = 'reopen'; Label = '重新打开 GitHub / Reopen GitHub' }
@@ -2005,7 +2115,7 @@ function Offer-SubmissionUpload {
             }
             Write-Host '完成网页操作后再选择；向导不会查询网页提交结果。Choose after completing the web steps; the wizard does not query their result.'
             $action = Read-SubmissionNextAction -Browser
-            if ($action -eq 'sent') { Remove-PendingSubmission -Path $pendingPath; return $true }
+            if ($action -eq 'sent') { Set-BenchmarkSubmissionSucceeded -Kind $Kind; Remove-PendingSubmission -Path $pendingPath; return $true }
             if ($action -eq 'reopen') { continue }
             if ($action -eq 'cloudflare') { $channel = 'cloudflare' } else { break }
         }
@@ -2059,319 +2169,6 @@ function Offer-PendingSubmissions {
     }
 }
 
-function ConvertFrom-SmbiosMemoryType {
-    param([int]$Type)
-    switch ($Type) {
-        20 { 'DDR' }
-        21 { 'DDR2' }
-        22 { 'DDR2 FB-DIMM' }
-        24 { 'DDR3' }
-        26 { 'DDR4' }
-        27 { 'LPDDR' }
-        28 { 'LPDDR2' }
-        29 { 'LPDDR3' }
-        30 { 'LPDDR4' }
-        34 { 'DDR5' }
-        35 { 'LPDDR5' }
-        default { $null }
-    }
-}
-
-function Get-PcieTheoreticalBandwidthGbps {
-    param([int]$Generation, [int]$Width)
-    if ($Width -le 0) { return $null }
-    $perLane = switch ($Generation) {
-        1 { 0.250 }
-        2 { 0.500 }
-        3 { 0.985 }
-        4 { 1.969 }
-        5 { 3.938 }
-        6 { 7.563 }
-        default { return $null }
-    }
-    return [Math]::Round($perLane * $Width, 3)
-}
-
-function ConvertFrom-StorageBusType {
-    param([int]$Type)
-    switch ($Type) {
-        3 { 'ATA' }
-        7 { 'USB' }
-        8 { 'RAID' }
-        10 { 'SAS' }
-        11 { 'SATA' }
-        12 { 'SD' }
-        13 { 'MMC' }
-        17 { 'NVMe' }
-        18 { 'SCM' }
-        19 { 'UFS' }
-        default { $null }
-    }
-}
-
-function ConvertFrom-StorageMediaType {
-    param([int]$Type)
-    switch ($Type) {
-        3 { 'HDD' }
-        4 { 'SSD' }
-        5 { 'SCM' }
-        default { $null }
-    }
-}
-
-function Get-PhysicalDiskReadCounter {
-    param([Parameter(Mandatory = $true)][int]$DiskIndex)
-    try {
-        $prefix = "^$([regex]::Escape([string]$DiskIndex))(?:\s|$)"
-        return Get-CimInstance Win32_PerfRawData_PerfDisk_PhysicalDisk -ErrorAction Stop |
-            Where-Object { [string]$_.Name -match $prefix } |
-            Select-Object -First 1
-    } catch {
-        return $null
-    }
-}
-
-function New-PhysicalDiskReadPerformanceCounter {
-    param([Parameter(Mandatory = $true)][int]$DiskIndex)
-    try {
-        $prefix = "^$([regex]::Escape([string]$DiskIndex))(?:\s|$)"
-        $category = [System.Diagnostics.PerformanceCounterCategory]::new('PhysicalDisk')
-        $instance = @($category.GetInstanceNames() | Where-Object { $_ -match $prefix } | Select-Object -First 1)
-        if ($instance.Count -ne 1) { return $null }
-        return [System.Diagnostics.PerformanceCounter]::new('PhysicalDisk', 'Disk Read Bytes/sec', [string]$instance[0], $true)
-    } catch {
-        return $null
-    }
-}
-
-function Measure-ModelStorageRead {
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][int]$DiskIndex
-    )
-
-    $file = Get-Item -LiteralPath $Path -ErrorAction Stop
-    if ($file.Length -lt 65536) { return $null }
-    $performanceCounter = New-PhysicalDiskReadPerformanceCounter -DiskIndex $DiskIndex
-    $before = $null
-    $beforeBytes = $null
-    if ($null -ne $performanceCounter) {
-        try { $beforeBytes = [uint64]$performanceCounter.RawValue } catch { }
-    }
-    if ($null -eq $beforeBytes) { $before = Get-PhysicalDiskReadCounter -DiskIndex $DiskIndex }
-    $seqBuffer = New-Object byte[] (4MB)
-    $seqStream = [System.IO.FileStream]::new($file.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite, $seqBuffer.Length, [System.IO.FileOptions]::SequentialScan)
-    try {
-        $seqClock = [System.Diagnostics.Stopwatch]::StartNew()
-        [int64]$seqBytes = 0
-        while ($seqClock.Elapsed.TotalSeconds -lt 0.5) {
-            $read = $seqStream.Read($seqBuffer, 0, $seqBuffer.Length)
-            if ($read -le 0) { $seqStream.Position = 0; continue }
-            $seqBytes += $read
-        }
-        $seqSeconds = $seqClock.Elapsed.TotalSeconds
-    } finally {
-        $seqStream.Dispose()
-    }
-
-    $randomBlockBytes = 64KB
-    $randomBuffer = New-Object byte[] $randomBlockBytes
-    $randomStream = [System.IO.FileStream]::new($file.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite, $randomBlockBytes, [System.IO.FileOptions]::RandomAccess)
-    try {
-        $random = [System.Random]::new(218)
-        $blockCount = [Math]::Floor($file.Length / $randomBlockBytes)
-        $randomClock = [System.Diagnostics.Stopwatch]::StartNew()
-        [int64]$randomBytes = 0
-        [int64]$randomOps = 0
-        while ($randomClock.Elapsed.TotalSeconds -lt 0.5) {
-            $block = [int64]($random.NextDouble() * $blockCount)
-            $randomStream.Position = $block * $randomBlockBytes
-            $read = $randomStream.Read($randomBuffer, 0, $randomBuffer.Length)
-            if ($read -gt 0) { $randomBytes += $read; $randomOps++ }
-        }
-        $randomSeconds = $randomClock.Elapsed.TotalSeconds
-    } finally {
-        $randomStream.Dispose()
-    }
-    $after = $null
-    $afterBytes = $null
-    if ($null -ne $performanceCounter) {
-        try { $afterBytes = [uint64]$performanceCounter.RawValue } catch { }
-        $performanceCounter.Dispose()
-    }
-    if ($null -eq $afterBytes) { $after = Get-PhysicalDiskReadCounter -DiskIndex $DiskIndex }
-
-    $applicationBytes = $seqBytes + $randomBytes
-    $physicalBytes = $null
-    if ($null -eq $beforeBytes -and $null -ne $before) { $beforeBytes = [uint64]$before.DiskReadBytesPersec }
-    if ($null -eq $afterBytes -and $null -ne $after) { $afterBytes = [uint64]$after.DiskReadBytesPersec }
-    if ($null -ne $beforeBytes -and $null -ne $afterBytes -and $afterBytes -ge $beforeBytes) {
-        $physicalBytes = [uint64]($afterBytes - $beforeBytes)
-    }
-    $cacheDisposition = $null
-    $physicalFraction = $null
-    if ($null -ne $physicalBytes -and $applicationBytes -gt 0) {
-        $physicalFraction = [Math]::Round([Math]::Min(1.0, $physicalBytes / [double]$applicationBytes), 4)
-        $cacheDisposition = if ($physicalFraction -ge 0.75) { 'mostly_physical' } elseif ($physicalFraction -le 0.10) { 'mostly_cached' } else { 'mixed' }
-    }
-    return [pscustomobject][ordered]@{
-        mode = 'buffered_read_only_before_benchmark'
-        sampled_file_bytes = [uint64]$file.Length
-        sequential = [pscustomobject][ordered]@{
-            seconds = [Math]::Round($seqSeconds, 6)
-            bytes = [uint64]$seqBytes
-            mib_per_second = [Math]::Round($seqBytes / 1MB / $seqSeconds, 3)
-        }
-        random_64k = [pscustomobject][ordered]@{
-            seconds = [Math]::Round($randomSeconds, 6)
-            operations = [uint64]$randomOps
-            bytes = [uint64]$randomBytes
-            mib_per_second = [Math]::Round($randomBytes / 1MB / $randomSeconds, 3)
-            iops = [Math]::Round($randomOps / $randomSeconds, 3)
-        }
-        physical_disk_read_bytes = $physicalBytes
-        physical_read_fraction = $physicalFraction
-        cache_disposition = $cacheDisposition
-    }
-}
-
-function Get-WindowsBenchmarkModelStorageDetails {
-    param([Parameter(Mandatory = $true)][string]$ModelPath)
-
-    try {
-        $root = [System.IO.Path]::GetPathRoot($ModelPath)
-        if ($root -notmatch '^([A-Za-z]):\\$') { return $null }
-        $logical = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}:'" -f $Matches[1]) -ErrorAction Stop
-        $partition = @(Get-CimAssociatedInstance -InputObject $logical -Association Win32_LogicalDiskToPartition -ErrorAction Stop | Select-Object -First 1)
-        $drive = @($partition | ForEach-Object { Get-CimAssociatedInstance -InputObject $_ -Association Win32_DiskDriveToDiskPartition -ErrorAction Stop } | Select-Object -First 1)
-        if ($drive.Count -eq 0) { return $null }
-
-        $diskIndex = [int]$drive[0].Index
-        $physical = $null
-        try {
-            $physical = Get-CimInstance -Namespace 'root/Microsoft/Windows/Storage' -ClassName MSFT_PhysicalDisk -Filter ("DeviceId='{0}'" -f $diskIndex) -ErrorAction Stop | Select-Object -First 1
-        } catch { }
-        $busType = if ($null -ne $physical) { ConvertFrom-StorageBusType -Type ([int]$physical.BusType) } elseif ([string]$drive[0].PNPDeviceID -match 'NVME') { 'NVMe' } else { [string]$drive[0].InterfaceType }
-        $mediaType = if ($null -ne $physical) { ConvertFrom-StorageMediaType -Type ([int]$physical.MediaType) } else { [string]$drive[0].MediaType }
-        return [pscustomobject][ordered]@{
-            model = [string]$drive[0].Model
-            media_type = $mediaType
-            bus_type = $busType
-            size_bytes = [uint64]$drive[0].Size
-            filesystem = [string]$logical.FileSystem
-            read_probe = Measure-ModelStorageRead -Path $ModelPath -DiskIndex $diskIndex
-        }
-    } catch {
-        return $null
-    }
-}
-
-function Get-WindowsBenchmarkHardwareDetails {
-    param(
-        [Parameter(Mandatory = $true)][string]$ModelPath,
-        [AllowEmptyString()][string]$SelectedGpuName = '',
-        $ModelStorage = $null
-    )
-
-    $modules = @()
-    try {
-        $modules = @(Get-CimInstance Win32_PhysicalMemory -ErrorAction Stop | ForEach-Object {
-            $generation = ConvertFrom-SmbiosMemoryType -Type ([int]$_.SMBIOSMemoryType)
-            [pscustomobject][ordered]@{
-                capacity_bytes = [uint64]$_.Capacity
-                generation = $generation
-                speed_mt_s = if ($_.Speed) { [uint64]$_.Speed } else { $null }
-                configured_speed_mt_s = if ($_.ConfiguredClockSpeed) { [uint64]$_.ConfiguredClockSpeed } else { $null }
-                manufacturer = if ($_.Manufacturer) { ([string]$_.Manufacturer).Trim() } else { $null }
-                part_number = if ($_.PartNumber) { ([string]$_.PartNumber).Trim() } else { $null }
-            }
-        })
-    } catch { }
-    $generations = @($modules | ForEach-Object { $_.generation } | Where-Object { $_ } | Sort-Object -Unique)
-    $memoryGeneration = if ($generations.Count -eq 1) { $generations[0] } elseif ($generations.Count -gt 1) { 'Mixed: ' + ($generations -join ', ') } else { $null }
-
-    $gpuLinks = @()
-    if (-not [string]::IsNullOrWhiteSpace($SelectedGpuName)) {
-        try {
-            $linkKeys = @(
-                'DEVPKEY_PciDevice_CurrentLinkSpeed', 'DEVPKEY_PciDevice_CurrentLinkWidth',
-                'DEVPKEY_PciDevice_MaxLinkSpeed', 'DEVPKEY_PciDevice_MaxLinkWidth'
-            )
-            $gpuLinks = @(Get-CimInstance Win32_VideoController -ErrorAction Stop | Where-Object {
-                [string]$_.PNPDeviceID -like 'PCI\*' -and [string]$_.Name -eq $SelectedGpuName
-            } | Select-Object -First 1 | ForEach-Object {
-                $properties = @(Get-PnpDeviceProperty -InstanceId $_.PNPDeviceID -KeyName $linkKeys -ErrorAction SilentlyContinue)
-                $get = { param($key) $entry = $properties | Where-Object KeyName -eq $key | Select-Object -First 1; if ($null -ne $entry -and $null -ne $entry.Data -and [int]$entry.Data -gt 0) { [int]$entry.Data } else { $null } }
-                $currentGeneration = & $get 'DEVPKEY_PciDevice_CurrentLinkSpeed'
-                $currentWidth = & $get 'DEVPKEY_PciDevice_CurrentLinkWidth'
-                $maxGeneration = & $get 'DEVPKEY_PciDevice_MaxLinkSpeed'
-                $maxWidth = & $get 'DEVPKEY_PciDevice_MaxLinkWidth'
-                [pscustomobject][ordered]@{
-                    name = [string]$_.Name
-                    current_generation = $currentGeneration
-                    current_width = $currentWidth
-                    max_generation = $maxGeneration
-                    max_width = $maxWidth
-                    current_theoretical_one_way_gb_per_second = Get-PcieTheoreticalBandwidthGbps -Generation $currentGeneration -Width $currentWidth
-                    max_theoretical_one_way_gb_per_second = Get-PcieTheoreticalBandwidthGbps -Generation $maxGeneration -Width $maxWidth
-                    source = 'windows_pnp'
-                }
-            })
-        } catch { }
-    }
-
-    if ($null -eq $ModelStorage) { $ModelStorage = Get-WindowsBenchmarkModelStorageDetails -ModelPath $ModelPath }
-    return [pscustomobject]@{
-        MemoryGeneration = $memoryGeneration
-        MemoryModules = $modules
-        GpuLinks = $gpuLinks
-        ModelStorage = $ModelStorage
-    }
-}
-
-function Set-JsonProperty {
-    param([Parameter(Mandatory = $true)]$Object, [Parameter(Mandatory = $true)][string]$Name, $Value)
-    if ($Object.PSObject.Properties.Name -contains $Name) { $Object.$Name = $Value } else { $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value }
-}
-
-function Add-BenchmarkHardwareDetails {
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)]$Details
-    )
-    $value = Read-MoE4AllSubmissionPayload -Path $Path
-    if ($null -eq $value.hardware) { return }
-    if ($null -ne $value.hardware.ram) {
-        Set-JsonProperty -Object $value.hardware.ram -Name 'memory_generation' -Value $Details.MemoryGeneration
-        Set-JsonProperty -Object $value.hardware.ram -Name 'module_count' -Value @($Details.MemoryModules).Count
-        Set-JsonProperty -Object $value.hardware.ram -Name 'modules' -Value @($Details.MemoryModules)
-    }
-    if ($null -ne $value.hardware.gpu -and $value.hardware.gpu.name) {
-        $matches = @($Details.GpuLinks | Where-Object { [string]$_.name -eq [string]$value.hardware.gpu.name })
-        if ($matches.Count -eq 1) {
-            $link = $matches[0]
-            Set-JsonProperty -Object $value.hardware.gpu -Name 'pcie_generation' -Value $link.current_generation
-            Set-JsonProperty -Object $value.hardware.gpu -Name 'pcie_width' -Value $link.current_width
-            Set-JsonProperty -Object $value.hardware.gpu -Name 'pcie_max_generation' -Value $link.max_generation
-            Set-JsonProperty -Object $value.hardware.gpu -Name 'pcie_max_width' -Value $link.max_width
-            Set-JsonProperty -Object $value.hardware.gpu -Name 'pcie_theoretical_one_way_gb_per_second' -Value $link.current_theoretical_one_way_gb_per_second
-            Set-JsonProperty -Object $value.hardware.gpu -Name 'pcie_max_theoretical_one_way_gb_per_second' -Value $link.max_theoretical_one_way_gb_per_second
-            Set-JsonProperty -Object $value.hardware.gpu -Name 'pcie_source' -Value $link.source
-        }
-    }
-    Set-JsonProperty -Object $value.hardware -Name 'model_storage' -Value $Details.ModelStorage
-    New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
-    $temporary = Join-Path $dataDir ("benchmark-enrichment-{0}.json" -f [Guid]::NewGuid().ToString('N'))
-    try {
-        [System.IO.File]::WriteAllText($temporary, (($value | ConvertTo-Json -Depth 20 -Compress) + "`n"), [System.Text.UTF8Encoding]::new($false))
-        $repacked = Invoke-NativeCommandResult -Executable $infrPath -Arguments @('submission', 'repack-benchmark', '--source', $Path, '--input', $temporary)
-        if ($repacked.ExitCode -ne 0) {
-            throw "submission repack failed: $($repacked.Output -join ' ')"
-        }
-    } finally {
-        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
-    }
-}
 
 function Select-EmbeddingModelPath {
     param([AllowEmptyString()][string]$Default = '')
@@ -2897,11 +2694,12 @@ $banner = @'
 |  \/  | ___ | ____| || |   / \ | | |
 | |\/| |/ _ \|  _| | || |_ / _ \| | |
 | |  | | (_) | |___|__   _/ ___ \ | |___
-|_|  |_|\___/|_____|  |_|/_/   \_\_|_____|
+|_|  |_|\___/|_____|  |_|/_/   \_\_|_____|.com
 '@
 
 Write-Host $banner -ForegroundColor Green
 Write-Host "  MoE4All v$productVersion" -ForegroundColor Green
+Write-Host '  https://moe4all.com' -ForegroundColor Cyan
 Write-Host '  Run models far larger than VRAM on gaming GPUs.'
 Write-Host '  让游戏显卡跑起远超显存容量的大模型。'
 Write-Host '  John / Headmaster218  https://github.com/Headmaster218/MoE4All' -ForegroundColor DarkGray
@@ -2913,8 +2711,9 @@ Show-PendingUpdateResult
 Show-UpdateStatus -CurrentVersion $productVersion
 
 $reuseSavedSettings = $false
+$script:BenchmarkGuideActive = Invoke-BenchmarkStartupGuide -Interactive (Test-BenchmarkGuideInteractive) -JsonAutomation ([bool](Get-SavedValue 'json_output' $false))
 $savedModel = [string](Get-SavedValue 'model' '')
-if ($null -ne $script:Saved -and -not $InitialModelPath -and $savedModel) {
+if (-not $script:BenchmarkGuideActive -and $null -ne $script:Saved -and -not $InitialModelPath -and $savedModel) {
     if (Test-Path -LiteralPath $savedModel -PathType Leaf) {
         $reuseSavedSettings = Read-YesNo -Label '是否按上次设置直接启动？/ Start with the previous settings?' -Default $true
     } else {
@@ -3038,12 +2837,16 @@ $cpuMissCores = [string](Get-SavedValue 'cpu_miss_cores' '')
 $customSets = [string](Get-SavedValue 'custom_sets' '')
 
 if (-not $reuseSavedSettings) {
+    if ($script:BenchmarkGuideActive) {
+        $launchMode = 'benchmark'; $benchKind = 'quick'; $benchParallel = '1'; $jsonOutput = $false
+    } else {
     $launchMode = Read-Choice -Label '你想做什么？/ What would you like to do?' -DefaultValue ([string](Get-SavedValue 'launch_mode' 'chat')) -Options @(
         [pscustomobject]@{ Key = '1'; Value = 'chat'; Label = '实时终端对话（推荐）/ Interactive terminal chat (recommended)' }
         [pscustomobject]@{ Key = '2'; Value = 'server'; Label = '启动 OpenAI 兼容 API / Start OpenAI-compatible API server' }
         [pscustomobject]@{ Key = '3'; Value = 'benchmark'; Label = '性能测试 / Benchmark' }
         [pscustomobject]@{ Key = '4'; Value = 'report'; Label = '报告当前运行问题 / Report a current runtime problem' }
     )
+    }
     if ($launchMode -eq 'report') {
         try { [void](Complete-ErrorReport) } catch { Write-Warning "错误报告生成失败：$($_.Exception.Message) / Could not create the error report." }
         exit 0
@@ -3245,15 +3048,17 @@ if (-not $reuseSavedSettings) {
             $manualBenchKind = $benchKind
             $benchKind = 'manual'
         }
+        if (-not $script:BenchmarkGuideActive) {
         $benchKind = Read-Choice -Label '测试方案 / Benchmark plan' -DefaultValue $benchKind -Options @(
             [pscustomobject]@{ Key = '1'; Value = 'quick'; Label = '自动快速 / Automatic quick'; Detail = @('6K Prefill + 1024 Decode。单发，一次，可追加并发。', '6K Prefill + 1024 Decode. x1, one run; optional concurrency.') }
             [pscustomobject]@{ Key = '2'; Value = 'standard'; Label = '自动标准 / Automatic standard'; Detail = @('6K、30K Prefill + 1024 Decode；1-2 并发，各一次，共 4 次。', '6K, 30K Prefill + 1024 Decode; x1-x2, one run each, 4 runs. Shared KV, different questions.') }
             [pscustomobject]@{ Key = '3'; Value = 'full'; Label = '自动完整 / Automatic full'; Detail = @('6K、30K、150K Prefill + 1024 Decode；1-4 并发，各三次，共 36 次。', '6K, 30K, 150K Prefill + 1024 Decode; x1-x4, three runs each, 36 runs. Shared KV, different questions.') }
             [pscustomobject]@{ Key = '4'; Value = 'manual'; Label = '手动测试 / Manual benchmark'; Detail = @('按顺序添加 Prefill、Decode 和上下文深度。', 'Build one test step by step: Prefill, Decode and context depth.') }
         )
+        }
         if ($benchKind -ne 'manual') {
             $profileParallel = switch ($benchKind) { 'quick' { '1' } 'standard' { '2' } default { '4' } }
-            $benchParallel = Read-IntegerValue -Label '最大并发路数（会依次测试 x1 到 xN）/ Maximum concurrency (tests x1 through xN)' -Default $profileParallel -Minimum 1 -Maximum 4
+            if (-not $script:BenchmarkGuideActive) { $benchParallel = Read-IntegerValue -Label '最大并发路数（会依次测试 x1 到 xN）/ Maximum concurrency (tests x1 through xN)' -Default $profileParallel -Minimum 1 -Maximum 4 }
         } else {
             if ($manualBenchKind -notin @('decode', 'prefill', 'mixed')) { $manualBenchKind = 'decode' }
             $manualBenchKind = Read-Choice -Label '第一步：选择要添加的工作 / Step 1: choose work' -DefaultValue $manualBenchKind -Options @(
@@ -3517,9 +3322,11 @@ $startLabel = if ($launchMode -eq 'server') { '现在启动服务器？/ Start t
 if (-not $DryRun -and -not $reuseSavedSettings -and -not (Read-YesNo -Label $startLabel -Default $true)) {
     exit 0
 }
-New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
-$state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statePath -Encoding UTF8
-Write-Host "`n设置已保存 / Settings saved: $statePath" -ForegroundColor DarkGray
+if (-not $DryRun -and -not $script:BenchmarkGuideActive) {
+    New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
+    $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statePath -Encoding UTF8
+    Write-Host "`n设置已保存 / Settings saved: $statePath" -ForegroundColor DarkGray
+}
 if ($DryRun) {
     Write-Host 'DryRun：未启动。DryRun: command was not started.' -ForegroundColor Yellow
     exit 0
@@ -3548,15 +3355,6 @@ $benchmarkFilesBefore = @()
 if ($launchMode -eq 'benchmark') { $benchmarkFilesBefore = @(Get-BenchmarkSubmissionSnapshot) }
 $errorReportsBefore = @(Get-ErrorSubmissionSnapshot)
 $benchmarkResultPath = $null
-$benchmarkModelStorage = $null
-if ($launchMode -eq 'benchmark') {
-    Write-Host '正在进行模型盘短读测（只读，约 2 秒）... / Running a short read-only model-storage probe (about 2 seconds)...' -ForegroundColor DarkGray
-    try {
-        $benchmarkModelStorage = Get-WindowsBenchmarkModelStorageDetails -ModelPath $modelPath
-    } catch {
-        Write-Warning "模型盘信息采集失败，将继续 benchmark：$($_.Exception.Message) / Model-storage collection failed; benchmark will continue."
-    }
-}
 $previousApiKey = [Environment]::GetEnvironmentVariable('INFR_API_KEY', 'Process')
 $hadApiKey = $null -ne $previousApiKey
 $previousDiagnosticDir = [Environment]::GetEnvironmentVariable('INFR_DIAGNOSTIC_DIR', 'Process')
@@ -3601,27 +3399,6 @@ if ($launchMode -eq 'benchmark' -and $benchKind -ne 'manual') {
 $benchmarkUploadRequested = $false
 if ($benchmarkResultPath) {
     $benchmarkUploadRequested = Read-BenchmarkUploadConsent
-}
-if ($benchmarkResultPath) {
-    try {
-        $resultGpuName = ''
-        try {
-            $resultValue = Read-MoE4AllSubmissionPayload -Path $benchmarkResultPath
-            $resultGpuName = [string]$resultValue.hardware.gpu.name
-        } catch { }
-        if ([string]::IsNullOrWhiteSpace($resultGpuName)) {
-            $deviceProbe = Invoke-NativeCommandResult -Executable $infrPath -Arguments @('devices')
-            if ($deviceProbe.ExitCode -eq 0) {
-                $devicePattern = '^\s*' + [regex]::Escape($device) + ':\s+(.+?)\s+\[[^\]]+\]'
-                $deviceLine = @($deviceProbe.Output | Where-Object { [string]$_ -match $devicePattern } | Select-Object -First 1)
-                if ($deviceLine.Count -eq 1 -and [string]$deviceLine[0] -match $devicePattern) { $resultGpuName = $Matches[1] }
-            }
-        }
-        $benchmarkHardwareDetails = Get-WindowsBenchmarkHardwareDetails -ModelPath $modelPath -SelectedGpuName $resultGpuName -ModelStorage $benchmarkModelStorage
-        Add-BenchmarkHardwareDetails -Path $benchmarkResultPath -Details $benchmarkHardwareDetails
-    } catch {
-        Write-Warning "Benchmark 提交的硬件信息补全失败：$($_.Exception.Message) / Could not enrich benchmark submission hardware details."
-    }
 }
 if ($benchmarkResultPath -and $benchmarkUploadRequested) {
     Invoke-BenchmarkUploadSafely -Path $benchmarkResultPath -ConsentAlreadyGranted

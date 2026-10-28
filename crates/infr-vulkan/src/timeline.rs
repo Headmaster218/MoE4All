@@ -5,7 +5,25 @@ use infr_core::timeline::{self, Context, DeviceEvent};
 
 use crate::{be, VulkanShared};
 
-const QUERY_COUNT: u32 = 128;
+// A whole-forward owner can retain up to128 layers in one recording. Keep its grouped
+// timestamps intact; the old128 entries silently truncated the latter half of35B traces.
+const QUERY_COUNT: u32 = 2048;
+const UNSAMPLED: &str = "timeline_unsampled";
+
+fn sampling_label(
+    selected: bool,
+    previous: Option<&'static str>,
+    name: &'static str,
+) -> Option<&'static str> {
+    if selected {
+        Some(name)
+    } else if previous.is_some_and(|previous| previous != UNSAMPLED) {
+        // Close the last measured interval before crossing unmeasured work.
+        Some(UNSAMPLED)
+    } else {
+        None
+    }
+}
 
 pub(crate) struct Clock {
     loader: ash::ext::calibrated_timestamps::Device,
@@ -88,6 +106,7 @@ pub(crate) struct Query {
     signal: u64,
     bytes: u64,
     dispatches: usize,
+    emit: bool,
 }
 
 impl Query {
@@ -147,12 +166,33 @@ impl Query {
             signal: 0,
             bytes: 0,
             dispatches: 0,
+            emit: true,
         }))
+    }
+
+    /// Commands were recorded under an older step, but execute only in this acknowledged one.
+    pub(crate) fn activate_prepared(&mut self, context: Option<Context>) {
+        self.emit = context.is_some();
+        if let Some(context) = context {
+            self.ctx = context;
+            for (_, label) in &mut self.labels {
+                label.step = context.step;
+                label.lanes = context.lanes;
+            }
+        }
     }
 
     pub(crate) fn mark(&mut self, name: &'static str) {
         let name = timeline::device_phase().unwrap_or(name);
         let ctx = timeline::context().unwrap_or(self.ctx);
+        let Some(name) = sampling_label(
+            timeline::device_label_selected(name, ctx.layer),
+            self.labels.last().map(|label| label.0),
+            name,
+        ) else {
+            return;
+        };
+        let ctx = if name == UNSAMPLED { self.ctx } else { ctx };
         if self.queue != "main"
             || self.labels.last().is_some_and(|&(label, previous)| {
                 label == name && previous.layer == ctx.layer && previous.step == ctx.step
@@ -195,6 +235,21 @@ impl Query {
     }
 
     pub(crate) fn resolve(mut self) {
+        if !self.emit {
+            return;
+        }
+        let has_selected = if self.queue == "main" {
+            self.labels.iter().any(|(name, _)| *name != UNSAMPLED)
+        } else {
+            timeline::device_label_selected("DMA_copy", self.ctx.layer)
+        };
+        if timeline::device_labels_selective() && !has_selected
+        {
+            // The normal fence already completed. Recycle without a driver readback.
+            self.pools.lock().unwrap().push(self.pool);
+            self.pool = vk::QueryPool::null();
+            return;
+        }
         let _span = timeline::span("trace_query_readback");
         let mut ticks = vec![0u64; self.labels.len() + 2];
         match unsafe {
@@ -217,7 +272,9 @@ impl Query {
                     self.ctx,
                 );
                 for (index, &(label, ctx)) in self.labels.iter().enumerate() {
-                    self.event(label, ticks[index + 1], ticks[index + 2], ctx);
+                    if label != UNSAMPLED {
+                        self.event(label, ticks[index + 1], ticks[index + 2], ctx);
+                    }
                 }
                 self.pools.lock().unwrap().push(self.pool);
                 self.pool = vk::QueryPool::null();
@@ -305,6 +362,30 @@ pub(crate) fn group(kernel: &'static str, config: &infr_core::config::ProfCfg) -
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sparse_markers_close_selected_work_without_absorbing_unsampled_work() {
+        use super::{sampling_label, UNSAMPLED};
+        let input = [
+            (false, "outside", 0),
+            (true, "owner", 10),
+            (false, "outside", 20),
+            (false, "outside", 40),
+            (true, "ffn", 80),
+            (false, "outside", 90),
+        ];
+        let mut marks = Vec::new();
+        for (selected, name, tick) in input {
+            if let Some(label) = sampling_label(selected, marks.last().map(|m: &(&str, i32)| m.0), name) {
+                marks.push((label, tick));
+            }
+        }
+        assert_eq!(marks, [("owner", 10), (UNSAMPLED, 20), ("ffn", 80), (UNSAMPLED, 90)]);
+        let measured: Vec<_> = marks.windows(2).filter(|pair| pair[0].0 != UNSAMPLED)
+            .map(|pair| (pair[0].0, pair[1].1-pair[0].1)).collect();
+        assert_eq!(measured, [("owner", 10), ("ffn", 10)]);
+        assert_eq!(sampling_label(false, None, "outside"), None);
+        assert_eq!(sampling_label(true, None, "owner"), Some("owner"));
+    }
     fn group(kernel: &'static str) -> &'static str {
         super::group(kernel, &Default::default())
     }

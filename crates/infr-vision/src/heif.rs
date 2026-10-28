@@ -37,6 +37,19 @@ struct Error {
     message: *const c_char,
 }
 impl Error {
+    fn check_input(self, stage: &str) -> Result<()> {
+        // Pinned libheif: Invalid_input=2, Unsupported_filetype=3;
+        // Memory_allocation_error=6 with Security_limit_exceeded=1000.
+        // Missing plugins and actual allocation failures remain server errors.
+        let invalid = matches!(self.code, 2 | 3) || (self.code == 6 && self.subcode == 1000);
+        let result = self.check(stage);
+        if invalid {
+            result.map_err(crate::preprocess::invalid_image_input)
+        } else {
+            result
+        }
+    }
+
     fn check(self, stage: &str) -> Result<()> {
         if self.code == 0 {
             return Ok(());
@@ -153,7 +166,10 @@ impl Decoder {
 
     fn decode(&self, bytes: &[u8]) -> Result<DynamicImage> {
         if bytes.len() > 256 * 1024 * 1024 {
-            bail!("HEIC/AVIF compressed image exceeds 256 MiB");
+            return Err(infr_core::error::InvalidInput(
+                "HEIC/AVIF compressed image exceeds 256 MiB".into(),
+            )
+            .into());
         }
         // Each request owns its context; the borrowed input lives until all handles are released.
         unsafe {
@@ -176,12 +192,12 @@ impl Decoder {
                 bytes.len(),
                 ptr::null(),
             )
-            .check("read")?;
+            .check_input("read")?;
             let mut handle = Owned {
                 pointer: ptr::null_mut(),
                 free: self.handle_free,
             };
-            (self.primary)(context.pointer, &mut handle.pointer).check("primary image")?;
+            (self.primary)(context.pointer, &mut handle.pointer).check_input("primary image")?;
             if handle.pointer.is_null() {
                 bail!("HEIC/AVIF missing primary image");
             }
@@ -195,7 +211,7 @@ impl Decoder {
             };
             // RGB/interleaved RGB8. Default options apply rotation, mirroring and crop.
             (self.decode)(handle.pointer, &mut image.pointer, 1, 10, ptr::null())
-                .check("decode")?;
+                .check_input("decode")?;
             if image.pointer.is_null() {
                 bail!("HEIC/AVIF decoder returned no image");
             }
@@ -225,7 +241,10 @@ impl Decoder {
 
 fn dimensions(w: c_int, h: c_int) -> Result<(u32, u32)> {
     if w <= 0 || h <= 0 || w > MAX_SIDE || h > MAX_SIDE || w as u64 * h as u64 > MAX_PIXELS {
-        bail!("HEIC/AVIF image dimensions {w}x{h} exceed the 8192-side / 64-Mpixel limit");
+        return Err(infr_core::error::InvalidInput(format!(
+            "HEIC/AVIF image dimensions {w}x{h} exceed the 8192-side / 64-Mpixel limit"
+        ))
+        .into());
     }
     Ok((w as u32, h as u32))
 }
@@ -248,6 +267,44 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<DynamicImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn input_errors_do_not_hide_codec_or_resource_failures() {
+        for (code, subcode, invalid) in [
+            (2, 100, true),
+            (3, 0, true),
+            (6, 1000, true),
+            (6, 0, false),
+            (7, 0, false),
+            (11, 6003, false),
+            (5, 0, false),
+        ] {
+            let error = Error {
+                code,
+                subcode,
+                message: ptr::null(),
+            }
+            .check_input("read")
+            .unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<infr_core::error::InvalidInput>()
+                    .is_some(),
+                invalid,
+                "code={code}, subcode={subcode}"
+            );
+        }
+        let initialization = Error {
+            code: 2,
+            subcode: 0,
+            message: ptr::null(),
+        }
+        .check("initialization")
+        .unwrap_err();
+        assert!(initialization
+            .downcast_ref::<infr_core::error::InvalidInput>()
+            .is_none());
+    }
+
     #[test]
     fn brands_and_limits() {
         assert!(recognizes(b"\0\0\0\x18ftypheic\0\0\0\0mif1heic"));

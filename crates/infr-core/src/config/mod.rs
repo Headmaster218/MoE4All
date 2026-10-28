@@ -134,6 +134,19 @@ cfg_struct! {
         /// Worker threads. Sourced from the CLI's `-t`; still PUBLISHED as `RAYON_NUM_THREADS`
         /// because rayon has no other input. Not an `INFR_*` knob.
         threads: Option<usize> = None,
+        /// Prepare the next token's immutable plan on a bounded CPU worker while the current
+        /// step executes and its result is processed. Backends without CPU-only concurrent
+        /// compilation retain inline preparation. Does not execute unconfirmed tokens.
+        decode_prepare_ahead: bool = true,
+        /// Prepare one unsubmitted Decode command prefix during the current forward.
+        /// Unsupported backends and phase/resource changes retain ordinary execution.
+        decode_command_ahead: bool = true,
+        /// Submit an acknowledged prepared prefix before suffix setup to overlap CPU work.
+        /// Unsupported execution retains the ordinary first submit.
+        decode_command_early_submit: bool = true,
+        /// Extend acknowledged command lookahead through the first resident expert submission.
+        /// Requires command-ahead and early-submit; unsupported shapes keep the shorter prefix.
+        decode_command_resident: bool = true,
     }
 }
 
@@ -264,8 +277,12 @@ cfg_struct! {
         /// machine whose RAM is better spent elsewhere.
         dram_bypass: bool = false,
         /// Alias eligible DRAM pager arenas through `VK_EXT_external_memory_host` so Vulkan can
-        /// DMA promotions into VRAM. Unsupported devices transparently keep CPU ReBAR copies.
+        /// read them from shaders or copy them into VRAM. Does not control the transfer queue.
+        /// Unsupported devices transparently keep direct or staged uploads.
         host_dma: bool = true,
+        /// Use a transfer-only Vulkan queue for pager uploads when supported. Independent from
+        /// `host_dma`: staging can use this queue without importing the RAM expert cache.
+        dedicated_transfer: bool = true,
         /// `INFR_LAYER_MAJOR`, TRI-state syntax: `None` and `Some(false)` use the chunk-major
         /// default; `Some(true)` forces layer-major where the backend and architecture support it.
         ///
@@ -413,7 +430,11 @@ cfg_struct! {
         decode_gpu_resident_layers: usize = 16,
         /// Resident rolling-submit depth. 0 selects the graph's model-tuned value.
         decode_gpu_resident_submit_layers: usize = 0,
-        /// Keep one submitted resident segment in flight so miss recovery has a single owner.
+        /// Experiment: coalesce only certified GPU-owned mapped runs; 0 disables, 4 enables.
+        /// Host-required entries retain their original submit cadence. No preparation horizon grows.
+        decode_gpu_resident_pure_mapped_layers: usize = 0,
+        /// Rolling retirement depth (clamped to 1..2). GPU-owned HOST-sensitive runs allow
+        /// one extra speculative segment; certified mapped-only spans may continue freely.
         decode_gpu_resident_inflight: usize = 1,
         /// Keep resident predicates and LUT tape in coherent mapped VRAM when the device supports it.
         decode_gpu_resident_mapped_metadata: bool = true,
@@ -423,8 +444,35 @@ cfg_struct! {
         decode_gpu_resident_fence_wait: bool = false,
         /// Cache immutable physical addresses and use dense slot protection for resident LUTs.
         decode_gpu_resident_fast_lut: bool = true,
+        /// Fuse ordinary 3..=8-row router selection with GPU-owned admission when supported.
+        /// False retains the established separate router/owner recording for diagnosis.
+        decode_gpu_resident_many_row: bool = true,
         /// Continue resident hits while a miss notice starts host-side recovery.
         decode_gpu_resident_hit_first: bool = true,
+        /// GPU miss copy from imported RAM. None selects ordinary 1..=8-row Decode;
+        /// true also permits experimental multirow/Verify, false disables it.
+        /// Unmapped sources, bounded host tiers and exhausted safe destinations retain recovery.
+        decode_gpu_resident_copy: Option<bool> = None,
+        /// GPU copy workgroups for serial and overlap paths. 0 selects 8 for both variants;
+        /// explicit values clamp to 1..=8. Performance qualified on RX 7900 XTX only.
+        decode_gpu_resident_copy_groups: usize = 0,
+        /// Bounded compute copy concurrent with resident hit projections.
+        /// Requires serial-copy eligibility; false preserves its copy-then-full-FFN path.
+        decode_gpu_resident_copy_overlap: bool = true,
+        /// Split owned GPU role copies around miss GU only for qualified single-row
+        /// Q5K Gate/Up geometry (NE2048, NFF512, top-k 8). False retains the old schedule.
+        decode_gpu_resident_role_pipeline: bool = true,
+        /// Trial H-only chunk32 FFN for independent rows4 IQ2S/IQ4NL, NE2560/NFF640/top-k10.
+        decode_gpu_resident_splitk_hit: bool = false,
+        /// Extend the splitk-hit trial to qualified rows4 IQ3S/IQ4NL geometry.
+        /// Requires decode_gpu_resident_splitk_hit; false preserves IQ2S-only admission.
+        decode_gpu_resident_splitk_iq3_hit: bool = false,
+        /// Submit guarded ordinary-Decode recovery while a certified CPU-only upload completes.
+        /// The independent host timeline also retires the old notice epoch.
+        decode_gpu_resident_host_ready: bool = true,
+        /// Reuse a bounded CPU upload helper so old SKIP/ACK observations can overlap uploads.
+        /// False retains inline upload on the notice producer; ownership/protocol are unchanged.
+        decode_gpu_resident_upload_worker: bool = true,
         /// Wait submitted resident fences on a dedicated host thread (driver scheduling A/B).
         decode_gpu_resident_waiter: bool = false,
         /// Give each checked layer immutable predicate words to avoid predicate read/write barriers.
@@ -483,7 +531,7 @@ cfg_struct! {
         /// `INFR_CANVAS_CHUNK_N` (`tier::EnvRows`, floored at 1).
         canvas_chunk_n: usize = 3,
 
-        /// `INFR_FLASH_SPLITS`.
+        /// `INFR_FLASH_SPLITS`: 1..=8, or `None` for automatic selection.
         flash_splits: Option<usize> = None,
         /// `INFR_FLASH_BM`: compared to the LITERAL `"32"`, not parsed as an int.
         flash_bm32: bool = false,
@@ -501,7 +549,7 @@ cfg_struct! {
         qk_warp: bool = true,
         /// `INFR_NO_PV_WARP` (inverted).
         pv_warp: bool = true,
-        /// `INFR_PV_SPLITS`.
+        /// `INFR_PV_SPLITS`: 1..=8, or `None` for automatic selection.
         pv_splits: Option<usize> = None,
         /// `INFR_NO_ATTN_HD`: a `presence` knob despite the `NO_` spelling — sanctioned negative
         /// field (§4).
@@ -539,6 +587,8 @@ cfg_struct! {
         /// row directly from QkNormRope's LDS into the planar Q8 cache. Disabling it restores the
         /// f16 scratch write followed by the standalone Q8 quantization dispatch.
         q8_kv_write_fusion: bool = false,
+        /// Bounded static segmented Q8 K norm/RoPE+write. Flat replay remains independently off.
+        q8_kv_write_segmented: bool = true,
         /// `INFR_NO_Q8_PV_F16` (inverted) — use packed fp16 only for Q8 V dequantization before
         /// converting back to fp32; softmax weighting and P.V accumulation remain fp32.
         q8_pv_f16: bool = true,
@@ -546,6 +596,34 @@ cfg_struct! {
         q8_decode_gqa2: bool = true,
         /// Reuse each Q8 K/V read across four adjacent GQA query heads when occupancy permits.
         q8_decode_gqa4: bool = true,
+        /// Reuse the measured hd256 Q8 decode kernels for segmented KV address tables.
+        q8_decode_segmented: bool = true,
+        /// Pair-codebook decode for IQ4_NL expert MMQ on measured Windows/RDNA3 devices.
+        /// Other devices and matrix shapes retain the established scalar lookup path.
+        iq4_pair_lut: bool = true,
+        /// Packed Q3_K/Q6_K byte decode for measured BM32 expert MMQ shapes only.
+        kquant_packed_decode: bool = true,
+        /// Six qualified Q8 BN128 Prefill tuples on measured Windows RX 7900 XTX.
+        /// The original BM64 path remains the per-feature fallback.
+        q8_prefill_bm128: bool = true,
+        /// Exact chronological QSA Top-K collection on measured devices.
+        qsa_topk_ordered: bool = true,
+        /// Reuse probability fragments in measured hd256 Prefill register-O kernels.
+        flash_pv_reuse: bool = true,
+        /// Independent native-Q8 scalar projection pair; other row counts retain split Linears.
+        q8_linear_pair: bool = true,
+        /// Exact one-row Q8 HC up projection and ordered mix, when scratch views are disjoint.
+        hc_up_mix: bool = true,
+        /// Measured HC4/2560 PLE gate+norm LDS pair on qualified Windows/RDNA3 shapes.
+        /// Unsupported rows, devices, aliases and MTP keep the original two operations.
+        ple_gate_norm_lds: bool = true,
+        /// Preserve the exact F32 SwiGLU -> planar-Q8 boundary in one measured dispatch.
+        silu_quant_q8: bool = true,
+        /// Memoize graph-only scratch analysis within one immutable compiled plan.
+        static_scratch_memo: bool = true,
+        /// Retire earlier paged Decode submissions while its final submission executes.
+        /// The forward still drains completely before results, callbacks or phase changes.
+        static_decode_tail_overlap: bool = true,
         /// QSA Prefill Q8 K/V reuse mode. `2` keeps two heads in registers; `12` uses the
         /// Qwen3.8-specific LDS-tiled full-GQA path. Unsupported shapes fall back safely.
         qsa_prefill_gqa: usize = 12,
@@ -558,6 +636,16 @@ cfg_struct! {
         /// Also use cooperative-matrix PV in that path. Kept separate so QK-only remains an
         /// exact runtime A/B fallback on drivers where F16 probability staging is not profitable.
         qsa_prefill_coopmat_pv: bool = true,
+        /// Use per-row causal split-K for small target Verify QSA cohorts. Larger Prefill
+        /// batches retain the tiled kernel, and false keeps that path for same-binary A/B.
+        qsa_verify_split: bool = true,
+        /// Opt into exact-shape causal Verify IQ2_S shared-slot fusion and staged NR8.
+        /// Default off pending real-engine E2E qualification against the nonfused graph.
+        /// Other shapes, independent rows, SG and buffer-grid paths remain unchanged.
+        verify_shared_iq2_nr8: bool = false,
+        /// Reuse native expert weight decoding across adjacent causal Verify rows.
+        /// Unqualified dtypes/shapes and insufficient row reuse keep the baseline kernel.
+        verify_pair: bool = true,
         /// Block width of the Qwen3.8 Prefill indexer scorer's 8-query F32 tile. Supported values
         /// are 32 and 64; other values keep the established 2-query x 4-block path.
         qsa_score_tile: usize = 32,
@@ -585,6 +673,9 @@ cfg_struct! {
         /// default after dense-vs-strided output/state parity; `INFR_NO_DELTA_STRIDED` disables it
         /// and the historical `INFR_DELTA_STRIDED` opt-in remains accepted.
         delta_strided: bool = true,
+        /// Fuse single-token interleaved DeltaNet with its in-place gated norm on measured
+        /// devices. Multi-token, independent-state rows and checkpoint traces keep split ops.
+        delta_fused_norm: bool = true,
         /// `INFR_NO_PUSH_DESC` (inverted).
         push_desc: bool = true,
         /// `INFR_NO_PIPELINE_CACHE` (inverted).
@@ -609,6 +700,32 @@ cfg_struct! {
         /// `INFR_BDA_CHUNK_BYTES`: byte cap per BDA addressing unit.
         bda_chunk_bytes: Option<u64> = None,
         }
+    }
+}
+
+impl VulkanCfg {
+    /// Capacity of the FlashAttention and non-flash PV partial-result buffers.
+    pub const MAX_ATTENTION_SPLITS: usize = 8;
+
+    /// Reject unsafe overrides after layer resolution, before creating a Vulkan device.
+    pub fn validate_attention_splits(&self) -> Result<(), ConfigError> {
+        for (path, configured) in [
+            ("kernels.vulkan.flash_splits", self.flash_splits),
+            ("kernels.vulkan.pv_splits", self.pv_splits),
+        ] {
+            if let Some(splits) = configured {
+                if !(1..=Self::MAX_ATTENTION_SPLITS).contains(&splits) {
+                    return Err(ConfigError::Value {
+                        path: path.to_owned(),
+                        message: format!(
+                            "must be in 1..={} (received {splits}); omit the override for automatic selection",
+                            Self::MAX_ATTENTION_SPLITS,
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -724,12 +841,28 @@ cfg_struct! {
         /// `INFR_MTP`: the EXACT string `"1"`. `INFR_MTP=true` does nothing today; the `== "1"`
         /// mapping is the behaviour-preserving one.
         mtp: bool = false,
+        /// Exact prompt-lookup proposals, independent of draft-model weights. Requests outside
+        /// the target's transactional Verify capabilities retain ordinary decode.
+        lookup: bool = false,
+        /// Maximum proposed suffix, excluding the already selected pending token (1..=3).
+        lookup_max_draft: usize = 3,
+        /// Minimum exact suffix match before proposing historical continuation tokens.
+        lookup_min_match: usize = 8,
+        /// Narrow Lookup drafts using recent acceptance; false keeps the configured maximum.
+        /// Rejection cooldown and caller/context/output budgets apply to both policies.
+        lookup_adaptive_width: bool = true,
         /// `INFR_NO_MTP_CKPT` (inverted).
         mtp_ckpt: bool = true,
         /// `INFR_NO_MTP_REPRIME` (inverted). ANDed with [`SpecCfg::mtp_ckpt`] at the site (R5).
         mtp_reprime: bool = true,
         /// `INFR_NO_MTP_DRAFT_CHAIN` (inverted).
         mtp_draft_chain: bool = true,
+        /// Compute only the required K/V writes in the last draft step; false retains the
+        /// full-step reference path for same-binary performance/correctness comparison.
+        mtp_tail_kv_only: bool = true,
+        /// Optional sorted u32 token IDs for a compact draft-only output projection.
+        /// The target always validates against its full vocabulary.
+        mtp_vocab: Option<PathBuf> = None,
         /// `INFR_NO_MTP_PLE_OVERLAP` (inverted): run VERIFY layer 0 while PLE rows are gathered.
         mtp_ple_overlap: bool = true,
         /// `INFR_SPEC_DRAFT`: draft-model path.
@@ -876,6 +1009,12 @@ cfg_struct! {
         timeline_raw_kernels: bool = false,
         /// `INFR_TIMELINE_RAW_UNKNOWN`: retain names for kernels outside known categories.
         timeline_raw_unknown: bool = false,
+        /// Diagnostic-only comma-separated device label substrings; unset captures all.
+        timeline_device_select: Option<String> = None,
+        /// Diagnostic-only GPU layer restriction. Unlabelled frontend work is excluded.
+        timeline_device_layer: Option<usize> = None,
+        /// Diagnostic-only comma-separated host span substrings; unset captures all.
+        timeline_host_select: Option<String> = None,
         /// Optional one-shot CPU-miss weight/input fixture for local kernel diagnostics.
         cpu_miss_fixture_dir: Option<PathBuf> = None,
         timeline_skip_steps: usize = 64,
@@ -1299,4 +1438,37 @@ fn edit_distance(a: &str, b: &str) -> usize {
         std::mem::swap(&mut prev, &mut cur);
     }
     prev[b.len()]
+}
+
+#[cfg(test)]
+#[test]
+fn resident_iq3_splitk_default_off_and_explicitly_independent_of_splitk_hit() {
+    let defaults = Config::default();
+    assert!(!defaults.kernels.vulkan.decode_gpu_resident_splitk_iq3_hit);
+    assert!(!defaults.kernels.vulkan.decode_gpu_resident_splitk_hit);
+    for splitk in [false, true] {
+        for iq3 in [false, true] {
+            let cli = ConfigLayer::cli(&ConfigOverrides {
+                sets: vec![
+                    format!("kernels.vulkan.decode_gpu_resident_splitk_hit={splitk}"),
+                    format!("kernels.vulkan.decode_gpu_resident_splitk_iq3_hit={iq3}"),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+            let (file, warnings) = file::parse_str(
+                &format!(
+                    "[kernels.vulkan]\ndecode_gpu_resident_splitk_hit={splitk}\ndecode_gpu_resident_splitk_iq3_hit={iq3}\n"
+                ),
+                Path::new("infr.toml"),
+            )
+            .unwrap();
+            assert!(warnings.is_empty());
+            for layer in [cli, file] {
+                let cfg = Config::load_from_layers(&[layer]);
+                assert_eq!(cfg.kernels.vulkan.decode_gpu_resident_splitk_iq3_hit, iq3);
+                assert_eq!(cfg.kernels.vulkan.decode_gpu_resident_splitk_hit, splitk);
+            }
+        }
+    }
 }

@@ -32,11 +32,16 @@
 //! that state into any free resident slot. This extends the number of retained conversations; it
 //! does not alter the scheduler policy described above.
 
+#[path = "parallel_report.rs"]
+mod parallel_report;
+
 use crate::sampling::{ParallelSampler, RequestCtx, RequestSampling, StepGate};
+use crate::seam::token_delivery::{self, ParallelTokenCallback, TokenDelivery};
 use crate::seam::SeamKv;
 use crate::session_cache::{MtpCacheSource, SessionCache};
 use crate::{Config, GenStats, SeamModel};
 use anyhow::{anyhow, Context, Result};
+use infr_core::{backend::Backend, WeightSource};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,6 +57,8 @@ const SHORT_PREFILL_TOKENS: usize = 96;
 const MTP_PLAIN_SYNC_QUANTUM: usize = 1024;
 const MTP_CONCURRENT_PROBE_CYCLES: usize = 8;
 const MTP_CONCURRENT_MIN_ACCEPT_PERCENT: usize = 80;
+const LOOKUP_CALIBRATION_TOKENS: usize = 16;
+const LOOKUP_COST_COOLDOWN_TOKENS: usize = 128;
 
 /// One projector result handed to the text model. Kept backend-neutral so `infr-llama` does not
 /// depend on the optional vision crate.
@@ -336,12 +343,444 @@ fn long_prefill_cohort_limit(config: &Config) -> usize {
 }
 
 fn mtp_accepted_rows(candidates: &[u32], verified: &[u32]) -> usize {
-    debug_assert_eq!(verified.len(), candidates.len() + 1);
-    1 + candidates
-        .iter()
-        .zip(verified)
-        .take_while(|(candidate, target)| candidate == target)
-        .count()
+    crate::speculative_verify::accepted_rows(candidates, verified)
+        .expect("MTP Verify returned validated 2..=4-row results")
+}
+
+fn mtp_verify_rows(k: usize) -> usize {
+    k.clamp(2, crate::mtp::DRAFT_TOKENS)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LookupTokenDelivery {
+    Disconnected,
+    Continue,
+    Stop,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LookupDelivery {
+    accepted_drafts: usize,
+    keep_inputs: usize,
+    new_tokens: usize,
+    stopped: bool,
+}
+
+/// Pending was emitted before Verify. Publish the matching candidates and then the target
+/// prediction after the last accepted input. That bonus is emitted but never a retained row.
+fn deliver_lookup_prefix(
+    candidates: &[u32],
+    verified: &[u32],
+    remaining: usize,
+    mut publish: impl FnMut(u32) -> LookupTokenDelivery,
+) -> Result<LookupDelivery> {
+    let accepted = crate::speculative_verify::accepted_rows(candidates, verified)?;
+    let mut delivery = LookupDelivery {
+        accepted_drafts: accepted - 1,
+        keep_inputs: 1,
+        new_tokens: 0,
+        stopped: remaining == 0,
+    };
+    for row in 0..accepted.min(remaining) {
+        let token = if row < accepted - 1 {
+            candidates[row]
+        } else {
+            verified[accepted - 1]
+        };
+        let result = publish(token);
+        if result == LookupTokenDelivery::Disconnected {
+            delivery.stopped = true;
+            break;
+        }
+        delivery.new_tokens += 1;
+        if row < accepted - 1 {
+            delivery.keep_inputs += 1;
+        }
+        if result == LookupTokenDelivery::Stop {
+            delivery.stopped = true;
+            break;
+        }
+    }
+    delivery.stopped |= delivery.new_tokens == remaining;
+    Ok(delivery)
+}
+
+fn lookup_greedy_eligible(req: &RequestCtx, cfg: &infr_core::config::SamplingCfg) -> bool {
+    let effective = crate::sampling::Sampler::resolve(Some(req), cfg);
+    (effective.temp <= 0.0 || effective.top_k == 1) && !req.sampling().penalties_active()
+}
+
+fn lookup_ordinary_sample_eligible(phase: BatchPhase, generated: usize, lanes: usize) -> bool {
+    phase == BatchPhase::Decode && generated > 0 && lanes == 1
+}
+
+fn lookup_draft_budget(
+    configured: usize,
+    remaining_output: usize,
+    history_len: usize,
+    max_ctx: usize,
+    qsa_threshold: usize,
+) -> usize {
+    let before_boundary = if history_len <= qsa_threshold {
+        qsa_threshold - history_len
+    } else {
+        usize::MAX
+    };
+    configured
+        .min(crate::speculative_verify::MAX_VERIFY_ROWS - 1)
+        .min(remaining_output.saturating_sub(1))
+        .min(max_ctx.saturating_sub(history_len))
+        .min(before_boundary)
+}
+
+fn lookup_scheduler_supported(
+    cfg: &Config,
+    ec: &crate::EngineConfig,
+    embed_gather: bool,
+    embedding_dtype: Option<infr_core::DType>,
+) -> bool {
+    ec.spec.lookup
+        && crate::seam::target_verify_supported(cfg)
+        && ec.spec.gpu_embed
+        && embed_gather
+        && embedding_dtype.is_some_and(infr_vulkan::linear::embed_gather_supported)
+}
+
+fn scheduler_requested(
+    n_slots: usize,
+    heads_loaded: bool,
+    lookup_enabled: bool,
+    lookup_supported: impl FnOnce() -> bool,
+) -> bool {
+    n_slots > 1 || heads_loaded || (lookup_enabled && lookup_supported())
+}
+
+fn lookup_fallback_reason(
+    cfg: &Config,
+    ec: &crate::EngineConfig,
+    req: &RequestCtx,
+    heads_loaded: bool,
+    embed_gather: bool,
+    embedding_dtype: Option<infr_core::DType>,
+) -> Option<&'static str> {
+    if !ec.spec.lookup {
+        return Some("lookup_disabled");
+    }
+    if heads_loaded {
+        return Some("mtp_head_loaded");
+    }
+    if !crate::seam::target_verify_supported(cfg) {
+        return Some("unsupported_target_state");
+    }
+    if !ec.spec.gpu_embed {
+        return Some("gpu_embedding_disabled");
+    }
+    if (0..cfg.n_layer).any(|layer| cfg.is_recurrent_layer(layer)) {
+        if !ec.kernels.vulkan.dn_chunk {
+            return Some("gdn_chunk_disabled");
+        }
+        if !ec.kernels.vulkan.dn_chunk_scan {
+            return Some("gdn_chunk_scan_disabled");
+        }
+        if !ec.kernels.vulkan.dn_split {
+            return Some("gdn_split_disabled");
+        }
+    }
+    if !crate::seam::target_verify_enabled(cfg, ec) {
+        return Some("target_verify_disabled");
+    }
+    if !embed_gather {
+        return Some("backend_embed_gather_unsupported");
+    }
+    if ec.spec.lookup_max_draft == 0 {
+        return Some("zero_draft_budget");
+    }
+    if req.sampling().penalties_active() {
+        return Some("request_penalties_active");
+    }
+    if !lookup_greedy_eligible(req, &ec.sampling) {
+        return Some("request_sampling_not_greedy");
+    }
+    match embedding_dtype {
+        None => Some("token_embedding_missing"),
+        Some(dtype) if !infr_vulkan::linear::embed_gather_supported(dtype) => {
+            Some("token_embedding_dtype_unsupported")
+        }
+        Some(_) => None,
+    }
+}
+
+fn repair_lookup_predictions(
+    cfg: &Config,
+    mut guard: crate::sampling::Qwen4ReasoningEosGuard,
+    candidates: &[u32],
+    ids: &mut [u32],
+    logits: &mut [f32],
+    ignore_eos: bool,
+) -> Result<()> {
+    crate::speculative_verify::accepted_rows(candidates, ids)?;
+    let rows = ids.len();
+    for row in 0..rows {
+        // The persistent guard already observed pending during ordinary delivery.
+        if row > 0 {
+            guard.observe(cfg, candidates[row - 1]);
+        }
+        crate::sampling::ensure_sampled_token(ids[row], cfg.vocab, "Lookup Verify")?;
+        if !guard.blocks(cfg, ids[row], ignore_eos) {
+            continue;
+        }
+        let expected = rows
+            .checked_mul(cfg.vocab)
+            .context("Lookup logits size overflow")?;
+        anyhow::ensure!(
+            logits.len() == expected,
+            "Lookup EOS repair requires full target logits"
+        );
+        let row_logits = &mut logits[row * cfg.vocab..(row + 1) * cfg.vocab];
+        // Validate before the guard intentionally masks EOS to negative infinity.
+        crate::sampling::ensure_finite_logits(row_logits, "Lookup EOS repair")?;
+        guard.mask_eos(cfg, row_logits);
+        anyhow::ensure!(
+            row_logits.iter().any(|value| value.is_finite()),
+            "Lookup EOS repair masked every target token"
+        );
+        ids[row] = crate::sampling::argmax(row_logits) as u32;
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct LookupBatchStats {
+    searches: usize,
+    cycles: usize,
+    drafted: usize,
+    accepted: usize,
+    delivered: usize,
+    ordinary_fallbacks: usize,
+    cost_backoffs: usize,
+    search_secs: f64,
+    snapshot_secs: f64,
+    verify_secs: f64,
+    restore_secs: f64,
+    cycle_secs: f64,
+}
+
+struct LookupBatchState {
+    proposer: crate::speculative_lookup::LookupProposer,
+    indexed_len: usize,
+    ordinary_token_secs: Option<f64>,
+    calibration_tokens: usize,
+    calibration_secs: f64,
+    pending_proposal: Option<(usize, crate::speculative_lookup::Candidates, f64)>,
+    slow_cycles: usize,
+    cost_cooldown: usize,
+    missed_search_secs: f64,
+    stats: LookupBatchStats,
+}
+
+impl LookupBatchState {
+    fn new(config: crate::speculative_lookup::LookupConfig, prompt: &[u32]) -> Result<Self> {
+        let mut proposer = crate::speculative_lookup::LookupProposer::new(config)
+            .map_err(|error| anyhow!(error))?;
+        proposer.sync(prompt);
+        Ok(Self {
+            proposer,
+            indexed_len: prompt.len(),
+            ordinary_token_secs: None,
+            calibration_tokens: 0,
+            calibration_secs: 0.0,
+            pending_proposal: None,
+            slow_cycles: 0,
+            cost_cooldown: 0,
+            missed_search_secs: 0.0,
+            stats: LookupBatchStats::default(),
+        })
+    }
+
+    fn append_confirmed(&mut self, tokens: &[u32]) {
+        if !tokens.is_empty() {
+            if let Some((_, _, seconds)) = self.pending_proposal.take() {
+                self.missed_search_secs += seconds;
+            }
+        }
+        self.proposer.append_confirmed(tokens);
+        self.indexed_len += tokens.len();
+    }
+
+    fn sync_history(&mut self, history: &[u32]) {
+        if let Some((_, _, seconds)) = self.pending_proposal.take() {
+            self.missed_search_secs += seconds;
+        }
+        self.proposer.sync(history);
+        self.indexed_len = history.len();
+    }
+
+    fn finish_ordinary_outputs(&mut self, prompt_len: usize, outputs: &[u32]) -> Result<()> {
+        let indexed = self
+            .indexed_len
+            .checked_sub(prompt_len)
+            .ok_or_else(|| anyhow!("Lookup ordinary callback lost its history frontier"))?;
+        anyhow::ensure!(
+            indexed <= outputs.len(),
+            "Lookup indexed extra ordinary outputs"
+        );
+        // EOS bypasses on_token. Other outputs were already indexed after their ACK.
+        let tail = &outputs[indexed..];
+        self.append_confirmed(tail);
+        self.cost_cooldown = self.cost_cooldown.saturating_sub(tail.len());
+        Ok(())
+    }
+
+    fn record_ordinary(&mut self, seconds: f64, tokens: usize) {
+        self.stats.ordinary_fallbacks += 1;
+        if tokens > 0 && seconds.is_finite() && seconds > 0.0 {
+            let measured = seconds / tokens as f64;
+            if let Some(previous) = self.ordinary_token_secs {
+                // Proposal-triggered re-entry setup is not continuous Decode cost.
+                // Only amortized ordinary chunks may refresh the reference rate.
+                if tokens >= LOOKUP_CALIBRATION_TOKENS {
+                    self.ordinary_token_secs = Some(0.75 * previous + 0.25 * measured);
+                }
+            } else {
+                self.calibration_tokens += tokens;
+                self.calibration_secs += seconds;
+                if self.calibration_tokens >= LOOKUP_CALIBRATION_TOKENS {
+                    self.ordinary_token_secs =
+                        Some(self.calibration_secs / self.calibration_tokens as f64);
+                }
+            }
+        }
+    }
+
+    fn search(&mut self, budget: usize) -> (Option<crate::speculative_lookup::Candidates>, f64) {
+        if budget == 0 || self.cost_cooldown > 0 {
+            return (None, 0.0);
+        }
+        let t0 = Instant::now();
+        let timeline = infr_core::timeline::span("lookup_search");
+        let candidates = self.proposer.propose(None, budget);
+        drop(timeline);
+        let seconds = t0.elapsed().as_secs_f64();
+        self.stats.searches += 1;
+        self.stats.search_secs += seconds;
+        if candidates.is_none() {
+            self.missed_search_secs += seconds;
+        }
+        (candidates, seconds)
+    }
+
+    /// Index once after delivery/ACK. A proposal requests a scheduler yield, not request completion.
+    fn observe_ordinary_token(
+        &mut self,
+        token: u32,
+        acknowledged: bool,
+        single_decode: bool,
+        budget: usize,
+        interrupt: &AtomicBool,
+    ) -> f64 {
+        self.append_confirmed(&[token]);
+        if self.cost_cooldown > 0 {
+            self.cost_cooldown -= 1;
+            return 0.0;
+        }
+        if !acknowledged
+            || !single_decode
+            || self.ordinary_token_secs.is_none()
+            || interrupt.load(Ordering::Acquire)
+        {
+            return 0.0;
+        }
+        let (candidates, seconds) = self.search(budget);
+        if let Some(candidates) = candidates {
+            self.pending_proposal = Some((self.indexed_len, candidates, seconds));
+            interrupt.store(true, Ordering::Release);
+        }
+        seconds
+    }
+
+    fn take_pending_proposal(
+        &mut self,
+        budget: usize,
+    ) -> Option<(crate::speculative_lookup::Candidates, f64)> {
+        let (frontier, mut candidates, seconds) = self.pending_proposal.take()?;
+        if frontier != self.indexed_len || budget == 0 || self.cost_cooldown > 0 {
+            self.missed_search_secs += seconds;
+            return None;
+        }
+        candidates.tokens.truncate(budget);
+        Some((candidates, seconds))
+    }
+
+    /// Compare measured complete CPU/GPU cycle time per newly delivered token with ordinary
+    /// decode, excluding channel/ACK delivery from both. Full acceptance can still lose on cost.
+    fn record_cycle(&mut self, accepted: usize, produced: usize, advanced: usize, seconds: f64) {
+        self.proposer.record_result(accepted, produced);
+        self.stats.cycles += 1;
+        self.stats.drafted += produced;
+        self.stats.accepted += accepted;
+        self.stats.delivered += advanced;
+        let seconds = seconds + std::mem::take(&mut self.missed_search_secs);
+        self.stats.cycle_secs += seconds;
+        if advanced == 0 {
+            return;
+        }
+        if let Some(ordinary) = self.ordinary_token_secs {
+            if seconds / advanced as f64 >= ordinary * 1.05 {
+                self.slow_cycles += 1;
+                if self.slow_cycles >= 2 {
+                    self.cost_cooldown = LOOKUP_COST_COOLDOWN_TOKENS;
+                    self.stats.cost_backoffs += 1;
+                    self.slow_cycles = 0;
+                }
+            } else {
+                self.slow_cycles = 0;
+            }
+        }
+    }
+
+    fn report(&self, slot: usize) {
+        let stats = &self.stats;
+        let outcome = if stats.cycles > 0 {
+            "verified"
+        } else if stats.searches > 0 {
+            "ordinary_only_no_candidates"
+        } else {
+            "ordinary_only_no_eligible_verify_window"
+        };
+        tracing::info!(
+            slot, searches = stats.searches, cycles = stats.cycles,
+            outcome,
+            drafted = stats.drafted, accepted = stats.accepted, delivered = stats.delivered,
+            ordinary_fallbacks = stats.ordinary_fallbacks, cost_backoffs = stats.cost_backoffs,
+            search_ms = stats.search_secs * 1000.0,
+            snapshot_ms = stats.snapshot_secs * 1000.0,
+            verify_ms = stats.verify_secs * 1000.0,
+            restore_ms = stats.restore_secs * 1000.0,
+            cycle_ms = stats.cycle_secs * 1000.0,
+            ordinary_token_ms = ?self.ordinary_token_secs.map(|seconds| seconds * 1000.0),
+            "independent Lookup request summary"
+        );
+    }
+}
+
+fn lookup_plain_quantum(
+    lanes: usize,
+    generated: usize,
+    remaining_prefill: usize,
+    lookup: Option<&LookupBatchState>,
+) -> usize {
+    let Some(lookup) = lookup.filter(|_| lanes == 1) else {
+        return usize::MAX;
+    };
+    if generated == 0 {
+        remaining_prefill.saturating_add(1)
+    } else if lookup.ordinary_token_secs.is_none() {
+        LOOKUP_CALIBRATION_TOKENS
+            .saturating_sub(lookup.calibration_tokens)
+            .max(1)
+    } else {
+        usize::MAX
+    }
 }
 
 fn concurrent_mtp_profitable(accepted: usize, drafted: usize) -> bool {
@@ -382,6 +821,7 @@ struct BatchWork {
     sampler: Option<ParallelSampler>,
     reasoning_guard: crate::sampling::Qwen4ReasoningEosGuard,
     mtp_ready: bool,
+    lookup: Option<LookupBatchState>,
     channels: Option<BatchChannels>,
 }
 
@@ -565,6 +1005,45 @@ fn token_lane_prefill_fallback(
 struct BatchChannels {
     events: SyncSender<BatchEvent>,
     acknowledgements: Receiver<bool>,
+}
+
+struct BatchTokenDelivery<'a> {
+    engine: &'a ParallelSeam,
+    channels: &'a [Option<BatchChannels>],
+    progress_bases: &'a [(usize, usize, usize)],
+    streamed: &'a mut [usize],
+}
+
+impl TokenDelivery for BatchTokenDelivery<'_> {
+    fn send_token(&mut self, lane: usize, id: u32) -> bool {
+        let timeline_output = infr_core::timeline::span("decode_output_progress");
+        self.streamed[lane] += 1;
+        let (prompt_tokens, cached_prompt_tokens, generated) = self.progress_bases[lane];
+        let progress = self.engine.batch_decode_progress(
+            prompt_tokens,
+            cached_prompt_tokens,
+            generated.saturating_add(self.streamed[lane]),
+        );
+        drop(timeline_output);
+        let _timeline_send = infr_core::timeline::span("decode_output_send");
+        self.channels
+            .get(lane)
+            .and_then(Option::as_ref)
+            .is_some_and(|channels| {
+                channels
+                    .events
+                    .send(BatchEvent::Token { id, progress })
+                    .is_ok()
+            })
+    }
+
+    fn receive_ack(&mut self, lane: usize) -> bool {
+        let _timeline_ack = infr_core::timeline::span("decode_output_ack_wait");
+        self.channels
+            .get(lane)
+            .and_then(Option::as_ref)
+            .is_some_and(|channels| channels.acknowledgements.recv().unwrap_or(false))
+    }
 }
 
 #[derive(Default)]
@@ -951,7 +1430,8 @@ impl ParallelSeam {
         vk: infr_vulkan::VulkanBackend,
     ) -> Result<Self> {
         let n_slots = n_slots.max(1);
-        if model.engine_cfg().spec.mtp && model.config().qwen4exp && n_slots > 2 {
+        let detached_mtp = crate::seam::detached_mtp_enabled(model.config(), model.engine_cfg());
+        if detached_mtp && n_slots > 2 {
             return Err(anyhow!("Qwen3.8 concurrent MTP supports at most two slots"));
         }
         // This engine's own placement pins, entered as the current scope for the whole
@@ -960,7 +1440,7 @@ impl ParallelSeam {
         let pins = Arc::new(crate::seam::PlacementPins::for_slots(n_slots));
         let scope = crate::seam::PlacementScope::enter(pins.clone());
         let max_ctx = model.vulkan_slot_ctx(&vk, n_slots, want_ctx)?;
-        let mtp_heads = if model.engine_cfg().spec.mtp && model.config().qwen4exp {
+        let mtp_heads = if detached_mtp {
             let sampler = crate::sampling::Sampler::from_cfg(&model.engine_cfg().sampling);
             if sampler.temp > 0.0 && sampler.top_k != 1 {
                 tracing::warn!(
@@ -973,8 +1453,13 @@ impl ParallelSeam {
                 .draft
                 .as_deref()
                 .ok_or_else(|| anyhow!("Qwen3.8 MTP needs a draft sidecar"))?;
-            let fixed =
-                crate::mtp::Qwen4MtpSession::load_fixed_vulkan(&vk, sidecar, model.config())?;
+            let fixed = crate::mtp::Qwen4MtpSession::load_fixed_vulkan_with_vocab(
+                &vk,
+                sidecar,
+                model.config(),
+                model.gguf(),
+                model.engine_cfg().spec.mtp_vocab.as_deref(),
+            )?;
             let catch = crate::mtp::Qwen4MtpSession::shared_catch_workspace(
                 &vk,
                 &fixed,
@@ -1005,7 +1490,24 @@ impl ParallelSeam {
         } else {
             None
         };
-        let scheduler_enabled = n_slots > 1 || mtp_heads.is_some();
+        let scheduler_enabled = scheduler_requested(
+            n_slots,
+            mtp_heads.is_some(),
+            model.engine_cfg().spec.lookup,
+            || {
+                lookup_scheduler_supported(
+                    model.config(),
+                    model.engine_cfg(),
+                    vk.capabilities().embed_gather,
+                    model
+                        .gguf()
+                        .tensors()
+                        .iter()
+                        .find(|tensor| tensor.name == "token_embd.weight")
+                        .map(|tensor| tensor.dtype),
+                )
+            },
+        );
         let session_idle = Duration::from_secs(model.engine_cfg().kv.session_idle_secs);
         let mut engine = Self {
             scheduler_worker: None,
@@ -1020,8 +1522,7 @@ impl ParallelSeam {
             decode_batch: Arc::new(Mutex::new(DecodeBatchQueue::default())),
             decode_ready: Arc::new(Condvar::new()),
             batch_interrupt: Arc::new(AtomicBool::new(false)),
-            // Ordinary one-slot serving has no scheduler. MTP needs the gate even with one slot
-            // because the request thread hands ownership to the persistent speculative worker.
+            // Speculative one-slot requests also hand ownership to the persistent worker.
             gate: scheduler_enabled.then(|| Arc::new(StepGate::new())),
             session_cache: None,
             session_idle,
@@ -2209,6 +2710,9 @@ impl ParallelSeam {
     }
 
     fn fail_batch_work(&self, mut work: BatchWork, error: &str) {
+        if let Some(lookup) = &work.lookup {
+            lookup.report(work.slot);
+        }
         let kv = work.kv.take().expect("active decode work owns a KV slot");
         let Some(channels) = work.channels.take() else {
             self.return_detached_slot(work.slot, kv);
@@ -2225,6 +2729,9 @@ impl ParallelSeam {
     }
 
     fn complete_batch_work(&self, mut work: BatchWork) {
+        if let Some(lookup) = &work.lookup {
+            lookup.report(work.slot);
+        }
         let kv = work
             .kv
             .take()
@@ -2467,9 +2974,117 @@ impl ParallelSeam {
         }
     }
 
+    fn report_lookup_policy(
+        &self,
+        req: &RequestCtx,
+        slot: usize,
+        path: &'static str,
+        reason: Option<&str>,
+    ) {
+        let cfg = self.model.config();
+        let ec = self.model.engine_cfg();
+        if !ec.spec.lookup {
+            return;
+        }
+        let effective = crate::sampling::Sampler::resolve(Some(req), &ec.sampling);
+        let dtype = self
+            .model
+            .gguf()
+            .tensors()
+            .iter()
+            .find(|tensor| tensor.name == "token_embd.weight")
+            .map(|tensor| tensor.dtype);
+        tracing::info!(slot, path, eligible = reason.is_none(), reason = reason.unwrap_or("ready"),
+            effective_temp = effective.temp, effective_top_k = effective.top_k,
+            penalties = req.sampling().penalties_active(), heads_loaded = self.mtp_heads.is_some(),
+            scheduler_available = self.gate.is_some(), parallel_rows = cfg.supports_parallel_token_rows(),
+            target_supported = crate::seam::target_verify_supported(cfg),
+            target_enabled = crate::seam::target_verify_enabled(cfg, ec),
+            gpu_embed = ec.spec.gpu_embed, backend_embed_gather = self.vk.capabilities().embed_gather,
+            embedding_dtype = ?dtype, dn_chunk = ec.kernels.vulkan.dn_chunk,
+            dn_chunk_scan = ec.kernels.vulkan.dn_chunk_scan, dn_split = ec.kernels.vulkan.dn_split,
+            layers = cfg.n_layer, width = cfg.n_embd, hc_mult = cfg.hc_mult,
+            ssm_state = cfg.ssm_d_state, ssm_inner = cfg.ssm_d_inner, ssm_rank = cfg.ssm_dt_rank,
+            "independent Lookup request policy");
+    }
+
+    fn scheduler_admission_eligible(&self) -> bool {
+        self.gate.is_some()
+            && (!self.model.engine_cfg().spec.lookup
+                || scheduler_requested(self.n_slots(), self.mtp_heads.is_some(), true, || {
+                    lookup_scheduler_supported(
+                        self.model.config(),
+                        self.model.engine_cfg(),
+                        self.vk.capabilities().embed_gather,
+                        self.model
+                            .gguf()
+                            .tensors()
+                            .iter()
+                            .find(|tensor| tensor.name == "token_embd.weight")
+                            .map(|tensor| tensor.dtype),
+                    )
+                }))
+    }
+
+    fn new_lookup_work(
+        &self,
+        req: &RequestCtx,
+        prompt: &[u32],
+        slot: usize,
+        path: &'static str,
+    ) -> Option<LookupBatchState> {
+        let ec = self.model.engine_cfg();
+        if !ec.spec.lookup {
+            return None;
+        }
+        let dtype = self
+            .model
+            .gguf()
+            .tensors()
+            .iter()
+            .find(|tensor| tensor.name == "token_embd.weight")
+            .map(|tensor| tensor.dtype);
+        // A loaded head owns the target frontier until explicitly synchronized.
+        if let Some(reason) = lookup_fallback_reason(
+            self.model.config(),
+            ec,
+            req,
+            self.mtp_heads.is_some(),
+            self.vk.capabilities().embed_gather,
+            dtype,
+        ) {
+            self.report_lookup_policy(req, slot, path, Some(reason));
+            return None;
+        }
+        let config = crate::speculative_lookup::LookupConfig {
+            min_match: ec.spec.lookup_min_match,
+            adaptive_width: ec.spec.lookup_adaptive_width,
+            history_capacity: self.max_ctx.clamp(65_536, 262_144),
+            max_drafts: ec
+                .spec
+                .lookup_max_draft
+                .min(crate::speculative_verify::MAX_VERIFY_ROWS - 1),
+            ..Default::default()
+        };
+        match LookupBatchState::new(config, prompt) {
+            Ok(lookup) => {
+                self.report_lookup_policy(req, slot, path, None);
+                Some(lookup)
+            }
+            Err(error) => {
+                self.report_lookup_policy(req, slot, path, Some("invalid_lookup_policy"));
+                tracing::warn!(%error, "invalid Lookup policy; using ordinary decode");
+                None
+            }
+        }
+    }
+
     fn prepare_unified_work(&self, work: &mut BatchWork, req: &RequestCtx) -> Result<()> {
         if work.phase != BatchPhase::Unprepared {
             return Ok(());
+        }
+        if let Some(lookup) = &mut work.lookup {
+            lookup.sync_history(&work.prompt);
         }
         let checkpoint = work.turn_checkpoint.take();
         let prepared = {
@@ -2518,7 +3133,6 @@ impl ParallelSeam {
         if long.is_empty() {
             return Ok(());
         }
-
         let phase_prompt_ends = long
             .iter()
             .map(|work| {
@@ -2897,6 +3511,10 @@ impl ParallelSeam {
             .as_ref()
             .map(std::slice::from_ref)
             .unwrap_or(indices);
+        let lookup_t0 = (indices.len() == 1
+            && active[indices[0]].lookup.is_some()
+            && active[indices[0]].phase == BatchPhase::Decode)
+            .then(Instant::now);
         let quantum = prefill_fallback.map_or(quantum, |(_, remaining)| quantum.min(remaining));
         let max_steps = indices
             .iter()
@@ -2912,7 +3530,6 @@ impl ParallelSeam {
         if max_steps == 0 {
             return Err(anyhow!("parallel token group contains exhausted work"));
         }
-
         let prompts = indices
             .iter()
             .map(|&index| active[index].prompt.clone())
@@ -2969,57 +3586,144 @@ impl ParallelSeam {
             .collect::<Vec<_>>();
         let mut streamed = vec![0usize; indices.len()];
         let mut accepted = vec![true; indices.len()];
-        let mut stream = |lane: usize, id: u32| {
-            streamed[lane] += 1;
-            let (prompt_tokens, cached_prompt_tokens, generated) = progress_bases[lane];
-            let progress = self.batch_decode_progress(
-                prompt_tokens,
-                cached_prompt_tokens,
-                generated.saturating_add(streamed[lane]),
+        let lookup_single_decode = active.len() == 1
+            && !sync_mtp
+            && lookup_ordinary_sample_eligible(
+                active[indices[0]].phase,
+                active[indices[0]].generated,
+                indices.len(),
             );
-            let keep_going =
-                channels
-                    .get_mut(lane)
-                    .and_then(Option::as_mut)
-                    .is_some_and(|channels| {
-                        channels
-                            .events
-                            .send(BatchEvent::Token { id, progress })
-                            .is_ok()
-                            && channels.acknowledgements.recv().unwrap_or(false)
-                    });
-            accepted[lane] = keep_going;
-            keep_going
+        let lookup_output_limit = active[indices[0]].max_new;
+        let lookup_max_draft = self.model.engine_cfg().spec.lookup_max_draft;
+        let lookup_qsa_threshold = self.qsa_threshold();
+        let mut lookups = if indices.iter().any(|&index| active[index].lookup.is_some()) {
+            indices
+                .iter()
+                .map(|&index| {
+                    let work = &mut active[index];
+                    let mut lookup = work.lookup.take();
+                    if let Some(lookup) = &mut lookup {
+                        if lookup.indexed_len != work.prompt.len() {
+                            lookup.sync_history(&work.prompt);
+                        }
+                    }
+                    lookup
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
         };
+        let mut lookup_search_secs = vec![0.0; lookups.len()];
+        let mut lookup_delivery_secs = 0.0;
         let group_req = match &self.gate {
             Some(gate) => {
                 RequestCtx::with_gate(active[indices[0]].sampling.clone(), Arc::clone(gate))
             }
             None => RequestCtx::new(active[indices[0]].sampling.clone()),
         };
-        let result = crate::seam::generate_dense_vulkan_parallel_sampled_session(
-            self.vk.as_ref(),
-            self.model.gguf(),
-            self.model.config(),
-            self.model.engine_cfg(),
-            self.model.embd(),
-            self.model.per_layer_embd(),
-            &prompts,
-            &prompt_ends,
-            &checkpoints,
-            &mrope_plans,
-            max_steps,
-            &mut primary,
-            &mut peers,
-            self.max_ctx,
-            &mut samplers,
-            &mut reasoning_guards,
-            &mut stream,
-            Some(&self.batch_interrupt),
-            Some(&group_req),
-            sync_mtp,
-        );
-
+        // This shared service path reaches execute_parallel_token_forward in the runner:
+        // split PLE Decode admits L0 and tail together before either plan submits work.
+        let mut run = |on_token: ParallelTokenCallback<'_>| {
+            crate::seam::generate_dense_vulkan_parallel_sampled_session(
+                self.vk.as_ref(),
+                self.model.gguf(),
+                self.model.config(),
+                self.model.engine_cfg(),
+                self.model.embd(),
+                self.model.per_layer_embd(),
+                &prompts,
+                &prompt_ends,
+                &checkpoints,
+                &mrope_plans,
+                max_steps,
+                &mut primary,
+                &mut peers,
+                self.max_ctx,
+                &mut samplers,
+                &mut reasoning_guards,
+                on_token,
+                Some(&self.batch_interrupt),
+                Some(&group_req),
+                sync_mtp,
+            )
+        };
+        let batch_delivery = !sync_mtp
+            && !self.model.engine_cfg().spec.mtp
+            && lookups.is_empty()
+            && indices
+                .iter()
+                .all(|&index| active[index].phase == BatchPhase::Decode);
+        let result = if batch_delivery {
+            let mut delivery = BatchTokenDelivery {
+                engine: self,
+                channels: &channels,
+                progress_bases: &progress_bases,
+                streamed: &mut streamed,
+            };
+            let mut stream = |tokens: &[(usize, u32)]| {
+                let batch_accepted =
+                    token_delivery::deliver_token_batch::<MAX_DECODE_BATCH>(tokens, &mut delivery);
+                for &(lane, _) in tokens {
+                    accepted[lane] = batch_accepted[lane];
+                }
+                batch_accepted
+            };
+            run(ParallelTokenCallback::Batch(&mut stream))
+        } else {
+            // Keep Lookup's post-ACK indexing/yield and the MTP/Prefill callback order intact.
+            let mut stream = |lane: usize, id: u32| {
+                let delivery_t0 = lookup_t0.map(|_| Instant::now());
+                let timeline_output = infr_core::timeline::span("decode_output_progress");
+                streamed[lane] += 1;
+                let (prompt_tokens, cached_prompt_tokens, generated) = progress_bases[lane];
+                let progress = self.batch_decode_progress(
+                    prompt_tokens,
+                    cached_prompt_tokens,
+                    generated.saturating_add(streamed[lane]),
+                );
+                drop(timeline_output);
+                let keep_going =
+                    channels
+                        .get_mut(lane)
+                        .and_then(Option::as_mut)
+                        .is_some_and(|channels| {
+                            let timeline_send = infr_core::timeline::span("decode_output_send");
+                            let sent = channels
+                                .events
+                                .send(BatchEvent::Token { id, progress })
+                                .is_ok();
+                            drop(timeline_send);
+                            let _timeline_ack = infr_core::timeline::span("decode_output_ack_wait");
+                            sent && channels.acknowledgements.recv().unwrap_or(false)
+                        });
+                accepted[lane] = keep_going;
+                if let Some(lookup) = lookups.get_mut(lane).and_then(Option::as_mut) {
+                    let budget = if lookup_single_decode {
+                        lookup_draft_budget(
+                            lookup_max_draft,
+                            lookup_output_limit.saturating_sub(generated + streamed[lane]),
+                            lookup.indexed_len + 1,
+                            self.max_ctx,
+                            lookup_qsa_threshold,
+                        )
+                    } else {
+                        0
+                    };
+                    lookup_search_secs[lane] += lookup.observe_ordinary_token(
+                        id,
+                        keep_going,
+                        lookup_single_decode,
+                        budget,
+                        self.batch_interrupt.as_ref(),
+                    );
+                }
+                if let Some(t0) = delivery_t0 {
+                    lookup_delivery_secs += t0.elapsed().as_secs_f64();
+                }
+                keep_going
+            };
+            run(ParallelTokenCallback::Legacy(&mut stream))
+        };
         active[indices[0]].kv = primary;
         for (&index, kv) in indices[1..].iter().zip(peers) {
             active[index].kv = Some(kv);
@@ -3033,11 +3737,19 @@ impl ParallelSeam {
         for (&index, channel) in indices.iter().zip(channels) {
             active[index].channels = channel;
         }
+        // Restore ownership before inspecting result: error cleanup must still see Lookup slots.
+        for (&index, lookup) in indices.iter().zip(lookups) {
+            active[index].lookup = lookup;
+        }
         drop(mrope_plans);
         for (&index, plan) in indices.iter().zip(owned_mrope_plans.drain(..)) {
             active[index].mrope_plan = plan;
         }
 
+        let lookup_wall_secs =
+            lookup_t0.map(|t0| (t0.elapsed().as_secs_f64() - lookup_delivery_secs).max(0.0));
+        // L0 may already have changed recurrent/KV state when a staged PLE handoff fails.
+        // All slot ownership is restored above; propagate the error without replaying the group.
         let result = result?;
         let outputs = result.tokens;
         let prompt_secs = result.prompt_secs;
@@ -3056,11 +3768,25 @@ impl ParallelSeam {
         let cfg = self.model.config();
         for (lane, &index) in indices.iter().enumerate() {
             let work = &mut active[index];
+            let lookup_sample =
+                lookup_ordinary_sample_eligible(work.phase, work.generated, indices.len());
             work.stats.prompt_secs += prompt_secs[lane];
             work.stats.decode_secs += decode_secs[lane];
             work.generated += outputs[lane].len();
             work.stats.n_gen += outputs[lane].len();
             work.prompt.extend_from_slice(&outputs[lane]);
+            if let Some(lookup) = &mut work.lookup {
+                lookup.finish_ordinary_outputs(prompts[lane].len(), &outputs[lane])?;
+                work.stats.decode_secs += lookup_search_secs[lane];
+                lookup.record_ordinary(
+                    if lookup_sample {
+                        lookup_wall_secs.unwrap_or(decode_secs[lane])
+                    } else {
+                        0.0
+                    },
+                    outputs[lane].len(),
+                );
+            }
             let cached_len = work.kv().cached_len();
             for boundary in &mut work.checkpoint_boundaries {
                 if boundary.is_some_and(|boundary| cached_len >= boundary) {
@@ -3108,12 +3834,14 @@ impl ParallelSeam {
         }
     }
 
-    fn fail_unified_scheduler(&self, active: &mut Vec<BatchWork>, error: anyhow::Error) {
-        let message = error.to_string();
-        if crate::sampling::is_numerical_corruption(&error) {
-            for work in active.iter_mut() {
+    fn fail_unified_scheduler(&self, active: &mut Vec<BatchWork>, mut error: anyhow::Error) {
+        let numerical = crate::sampling::is_numerical_corruption(&error);
+        for work in active.iter_mut() {
+            if numerical || self.mtp_heads.is_some() || work.lookup.is_some() {
                 work.kv.as_mut().expect("batch work owns a KV slot").reset();
             }
+        }
+        if numerical {
             tracing::error!(
                 active_slots = active.len(),
                 %error,
@@ -3121,11 +3849,22 @@ impl ParallelSeam {
             );
         }
         if let Some(heads) = &self.mtp_heads {
+            let _gate = self.gate.as_ref().map(|gate| gate.enter());
             let mut heads = heads.lock().expect("MTP heads poisoned");
             for work in active.iter() {
-                heads[work.slot].invalidate_live();
+                let lane = &mut heads[work.slot];
+                if let Err(restore) = lane.head.settle_draft(self.vk.as_ref(), 0) {
+                    tracing::error!(slot = work.slot, %restore,
+                        "MTP head rollback failed; discarded the affected target/head prefix");
+                    error = error.context(format!(
+                        "MTP head slot {} rollback also failed: {restore:#}",
+                        work.slot
+                    ));
+                }
+                lane.invalidate_all();
             }
         }
+        let message = format!("{error:#}");
         for work in active.drain(..) {
             self.fail_batch_work(work, &message);
         }
@@ -3373,6 +4112,7 @@ impl ParallelSeam {
 
     fn run_mtp_batch(&self, work: Vec<BatchWork>, req: &RequestCtx) {
         let mut active = work;
+        let verify_rows = mtp_verify_rows(self.model.engine_cfg().spec.k);
         let mut concurrent_plain = false;
         let mut concurrent_probe_cycles = 0usize;
         let mut concurrent_accepted = 0usize;
@@ -3546,10 +4286,7 @@ impl ParallelSeam {
                     active[index].mtp_ready
                         && !mtp_context_profitable(
                             self.model.engine_cfg().spec.mtp_max_context,
-                            active[index]
-                                .kv()
-                                .cached_len()
-                                .saturating_add(crate::mtp::DRAFT_TOKENS),
+                            active[index].kv().cached_len().saturating_add(verify_rows),
                         )
                 })
                 .collect::<Vec<_>>();
@@ -3572,9 +4309,7 @@ impl ParallelSeam {
                 continue;
             }
             let fallback = (0..active.len())
-                .filter(|&index| {
-                    active[index].kv().cached_len() + crate::mtp::DRAFT_TOKENS > self.max_ctx
-                })
+                .filter(|&index| active[index].kv().cached_len() + verify_rows > self.max_ctx)
                 .collect::<Vec<_>>();
             if !fallback.is_empty() {
                 if let Err(error) = self.materialize_mtp_frontiers(&mut active, &fallback) {
@@ -3653,15 +4388,17 @@ impl ParallelSeam {
         let cfg = self.model.config();
         let ec = self.model.engine_cfg();
         let h_width = cfg.hc_mult * cfg.n_embd;
-        let rows = crate::mtp::DRAFT_TOKENS;
+        let rows = mtp_verify_rows(ec.spec.k);
         let timeline_positions = indices
             .iter()
             .map(|&index| active[index].kv().cached_len())
             .collect::<Vec<_>>();
         let _timeline_cycle = infr_core::timeline::begin_step(&timeline_positions);
+        let snapshot_t0 = Instant::now();
         let timeline_snapshot = infr_core::timeline::span("mtp_snapshot_refresh");
         self.refresh_mtp_snapshots(active, indices)?;
         drop(timeline_snapshot);
+        let snapshot_secs = snapshot_t0.elapsed().as_secs_f64();
         let t0 = Instant::now();
         let timeline_draft = infr_core::timeline::span("mtp_draft");
         let (feeds, predictions) = {
@@ -3685,7 +4422,7 @@ impl ParallelSeam {
                 let physical_position = work.kv().cached_len();
                 let rope_position =
                     multimodal_token_position(work.mrope_plan.as_ref(), physical_position)?;
-                let candidates = lane.head.draft(
+                let candidates = lane.head.draft_with_tail_mode(
                     self.vk.as_ref(),
                     pending,
                     &lane.last_h,
@@ -3693,6 +4430,7 @@ impl ParallelSeam {
                     rope_position,
                     rows,
                     work.kv().mtp_shared_weights(),
+                    ec.spec.mtp_tail_kv_only,
                 )?;
                 let mut feed = work.kv().cached_tokens().to_vec();
                 feed.push(pending);
@@ -3707,6 +4445,7 @@ impl ParallelSeam {
             (feeds, predictions)
         };
         drop(timeline_draft);
+        let draft_secs = t0.elapsed().as_secs_f64();
 
         let timeline_verify = infr_core::timeline::span("mtp_verify");
         let (mut verify_ids, mut verify_logits, verify_hidden) = {
@@ -3761,6 +4500,7 @@ impl ParallelSeam {
         for (lane_index, &index) in indices.iter().enumerate() {
             let timeline_accept = infr_core::timeline::span("mtp_accept_emit");
             let work = &mut active[index];
+            let first_cycle = work.generated == 0;
             let pending_emitted = self
                 .mtp_heads
                 .as_ref()
@@ -3868,6 +4608,7 @@ impl ParallelSeam {
                     .lock()
                     .expect("MTP heads poisoned");
                 let lane = &mut heads[work.slot];
+                lane.head.settle_draft(self.vk.as_ref(), committed)?;
                 lane.cached = kv.cached_tokens().to_vec();
                 lane.live_valid = true;
                 if committed > 0 {
@@ -3888,10 +4629,290 @@ impl ParallelSeam {
             let emitted = committed - already_emitted;
             work.generated += emitted;
             work.stats.n_gen += emitted;
-            work.stats.decode_secs += compute_secs + restore_t0.elapsed().as_secs_f64();
+            let restore_secs = restore_t0.elapsed().as_secs_f64();
+            work.stats.decode_secs += compute_secs + restore_secs;
             work.finished = stopped || work.generated >= work.max_new;
+            if first_cycle {
+                tracing::info!(
+                    slot = work.slot,
+                    context = old_len,
+                    rows,
+                    accepted = accepted - 1,
+                    published = emitted,
+                    tail_kv_only = ec.spec.mtp_tail_kv_only,
+                    "Qwen3.8 MTP first Verify cycle"
+                );
+            }
+            tracing::debug!(
+                slot = work.slot,
+                lanes = indices.len(),
+                context = old_len,
+                rows,
+                drafted = predictions[lane_index].len(),
+                accepted = accepted - 1,
+                committed,
+                published = emitted,
+                snapshot_ms = snapshot_secs * 1000.0,
+                draft_ms = draft_secs * 1000.0,
+                verify_ms = (compute_secs - draft_secs).max(0.0) * 1000.0,
+                restore_ms = restore_secs * 1000.0,
+                "Qwen3.8 MTP verified cycle"
+            );
         }
         Ok(cycle)
+    }
+
+    fn publish_lookup_token(&self, work: &mut BatchWork, token: u32) -> LookupTokenDelivery {
+        let cfg = self.model.config();
+        let eos = !self.model.engine_cfg().sampling.ignore_eos
+            && (token == cfg.eos || cfg.eos_ids.contains(&token));
+        let mut keep_going = !eos;
+        if !eos {
+            let timeline_output = infr_core::timeline::span("decode_output_progress");
+            let progress =
+                self.batch_decode_progress(work.prompt_end, work.prefill_start, work.generated + 1);
+            drop(timeline_output);
+            let Some(channels) = work.channels.as_ref() else {
+                work.finished = true;
+                return LookupTokenDelivery::Disconnected;
+            };
+            let timeline_send = infr_core::timeline::span("decode_output_send");
+            let sent = channels
+                .events
+                .send(BatchEvent::Token {
+                    id: token,
+                    progress,
+                })
+                .is_ok();
+            drop(timeline_send);
+            if !sent {
+                work.finished = true;
+                return LookupTokenDelivery::Disconnected;
+            }
+            let _timeline_ack = infr_core::timeline::span("decode_output_ack_wait");
+            keep_going = channels.acknowledgements.recv().unwrap_or(false);
+        }
+        // A successful send is delivered even when its ACK requests cancellation. EOS is
+        // counted once without a text event, exactly as in the ordinary token runner.
+        work.prompt.push(token);
+        work.reasoning_guard.observe(cfg, token);
+        work.sampler
+            .as_mut()
+            .expect("Lookup work owns a sampler")
+            .observe(token);
+        work.generated += 1;
+        work.stats.n_gen += 1;
+        work.lookup
+            .as_mut()
+            .expect("Lookup work owns an index")
+            .append_confirmed(&[token]);
+        work.finished = !keep_going || work.generated >= work.max_new;
+        if work.finished {
+            LookupTokenDelivery::Stop
+        } else {
+            LookupTokenDelivery::Continue
+        }
+    }
+
+    fn try_lookup_cycle(&self, work: &mut BatchWork, req: &RequestCtx) -> Result<bool> {
+        if work
+            .lookup
+            .as_ref()
+            .is_none_or(|lookup| lookup.ordinary_token_secs.is_none())
+            || self.mtp_heads.is_some()
+            || work.finished
+            || work.phase != BatchPhase::Decode
+            || work.generated == 0
+            || work.max_new.saturating_sub(work.generated) < 2
+        {
+            return Ok(false);
+        }
+        let result = self.run_lookup_cycle(work, req);
+        if result.is_err() {
+            // Any error after arming/Verify/restore may leave recurrent state ahead of
+            // published tokens. Never return that slot as a reusable apparent prefix.
+            if let Some(kv) = work.kv.as_mut() {
+                kv.reset();
+            }
+            if let Some(lookup) = work.lookup.as_mut() {
+                lookup.pending_proposal = None;
+                lookup.proposer.clear();
+                lookup.indexed_len = 0;
+            }
+        }
+        result
+    }
+
+    fn run_lookup_cycle(&self, work: &mut BatchWork, req: &RequestCtx) -> Result<bool> {
+        let cfg = self.model.config();
+        let ec = self.model.engine_cfg();
+        let base = work.kv().cached_len();
+        anyhow::ensure!(
+            work.prompt.len() == base + 1,
+            "Lookup requires exactly one previously emitted pending token"
+        );
+        let budget = lookup_draft_budget(
+            ec.spec.lookup_max_draft,
+            work.max_new.saturating_sub(work.generated),
+            work.prompt.len(),
+            self.max_ctx,
+            self.qsa_threshold(),
+        );
+        if budget == 0 {
+            return Ok(false);
+        }
+        let cycle_t0 = Instant::now();
+        let lookup = work.lookup.as_mut().expect("Lookup work owns an index");
+        if lookup.cost_cooldown > 0 {
+            return Ok(false);
+        }
+        if lookup.indexed_len != work.prompt.len() {
+            // Known ordinary/speculative appends normally maintain this exactly. A caller
+            // changing the frontier must synchronize the bounded retained window instead.
+            lookup.sync_history(&work.prompt);
+        }
+        // The emitted pending is already in this confirmed logical history. Passing None
+        // includes it exactly once; it has not yet been materialized in the target KV.
+        let (candidates, cached_search_secs, search_secs) =
+            if let Some((candidates, seconds)) = lookup.take_pending_proposal(budget) {
+                (Some(candidates), seconds, 0.0)
+            } else {
+                let (candidates, seconds) = lookup.search(budget);
+                (candidates, 0.0, seconds)
+            };
+        let Some(candidates) = candidates else {
+            work.stats.decode_secs += search_secs;
+            return Ok(false);
+        };
+        let rows = 1 + candidates.tokens.len();
+        anyhow::ensure!(
+            (2..=crate::speculative_verify::MAX_VERIFY_ROWS).contains(&rows),
+            "Lookup proposer returned invalid Verify width"
+        );
+        let _timeline_cycle = infr_core::timeline::begin_step(&[base]);
+        let mut feed = work.kv().cached_tokens().to_vec();
+        feed.push(work.prompt[base]);
+        feed.extend_from_slice(&candidates.tokens);
+        let snapshot_t0 = Instant::now();
+        {
+            // Keep the existing timing series; Lookup now arms traces without a base copy.
+            let _timeline_snapshot = infr_core::timeline::span("lookup_snapshot");
+            let _gate = req.gate_pass();
+            let kv = work.kv.as_mut().expect("Lookup owns target KV");
+            kv.lookup_arm_delta_trace(base, rows)?;
+        }
+        let snapshot_secs = snapshot_t0.elapsed().as_secs_f64();
+        let verify_t0 = Instant::now();
+        let (mut ids, mut logits, _hidden) = {
+            let _timeline_verify = infr_core::timeline::span("lookup_verify");
+            let _gate = req.gate_pass();
+            crate::seam::generate_dense_vulkan_parallel_verify_session(
+                self.vk.as_ref(),
+                self.model.gguf(),
+                cfg,
+                ec,
+                self.model.embd(),
+                std::slice::from_ref(&feed),
+                &[work.mrope_plan.as_ref()],
+                &mut work.kv,
+                &mut [],
+                self.max_ctx,
+                false,
+            )?
+        };
+        let verify_secs = verify_t0.elapsed().as_secs_f64();
+        anyhow::ensure!(
+            ids.len() == 1 && logits.len() == 1 && ids[0].len() == rows,
+            "Lookup Verify returned inconsistent rows"
+        );
+        let ids = &mut ids[0];
+        let logits = &mut logits[0];
+        repair_lookup_predictions(
+            cfg,
+            work.reasoning_guard,
+            &candidates.tokens,
+            ids,
+            logits,
+            ec.sampling.ignore_eos,
+        )?;
+        anyhow::ensure!(
+            work.kv().cached_len() == base + rows,
+            "Lookup Verify did not materialize its input rows"
+        );
+        let delivery_t0 = Instant::now();
+        let delivery = deliver_lookup_prefix(
+            &candidates.tokens,
+            ids,
+            work.max_new.saturating_sub(work.generated),
+            |token| {
+                if crate::sampling::abort_requested(Some(req)) {
+                    work.finished = true;
+                    LookupTokenDelivery::Disconnected
+                } else {
+                    self.publish_lookup_token(work, token)
+                }
+            },
+        )?;
+        let delivery_secs = delivery_t0.elapsed().as_secs_f64();
+        let restore_t0 = Instant::now();
+        {
+            let _timeline_restore = infr_core::timeline::span("lookup_restore");
+            let _gate = req.gate_pass();
+            let kv = work.kv.as_mut().expect("Lookup owns target KV");
+            kv.lookup_settle_delta_trace(self.vk.as_ref(), delivery.keep_inputs)?;
+            anyhow::ensure!(
+                kv.cached_len() == base + delivery.keep_inputs,
+                "Lookup row restore lost the retained input prefix"
+            );
+        }
+        let restore_secs = restore_t0.elapsed().as_secs_f64();
+        let cycle_secs = (cycle_t0.elapsed().as_secs_f64() - delivery_secs).max(0.0);
+        work.stats.decode_secs += cycle_secs;
+        work.finished |= delivery.stopped;
+        anyhow::ensure!(
+            work.finished || work.prompt.len() == work.kv().cached_len() + 1,
+            "Lookup must leave its bonus as the next unmaterialized pending token"
+        );
+        let lookup = work.lookup.as_mut().expect("Lookup work owns an index");
+        lookup.stats.snapshot_secs += snapshot_secs;
+        lookup.stats.verify_secs += verify_secs;
+        lookup.stats.restore_secs += restore_secs;
+        lookup.record_cycle(
+            delivery.accepted_drafts,
+            candidates.tokens.len(),
+            delivery.new_tokens,
+            cycle_secs + cached_search_secs,
+        );
+        if lookup.stats.cycles == 1 {
+            tracing::info!(
+                slot = work.slot,
+                rows,
+                matched = candidates.matched_tokens,
+                accepted = delivery.accepted_drafts,
+                kept_inputs = delivery.keep_inputs,
+                delivered = delivery.new_tokens,
+                verify_ms = verify_secs * 1000.0,
+                restore_ms = restore_secs * 1000.0,
+                cycle_ms = cycle_secs * 1000.0,
+                trace_only = true,
+                "independent Lookup first Verify cycle"
+            );
+        }
+        tracing::debug!(
+            slot = work.slot,
+            rows,
+            matched = candidates.matched_tokens,
+            accepted = delivery.accepted_drafts,
+            kept_inputs = delivery.keep_inputs,
+            delivered = delivery.new_tokens,
+            search_ms = search_secs * 1000.0,
+            verify_ms = verify_secs * 1000.0,
+            restore_ms = restore_secs * 1000.0,
+            cycle_ms = cycle_secs * 1000.0,
+            trace_only = true,
+            "independent Lookup Verify cycle"
+        );
+        Ok(true)
     }
 
     fn run_unified_batch(&self, work: Vec<BatchWork>, req: &RequestCtx) {
@@ -3946,6 +4967,23 @@ impl ParallelSeam {
             }
             long_prefill_coalesced = false;
 
+            if active.len() == 1 && active[0].lookup.is_some() {
+                match self.try_lookup_cycle(&mut active[0], req) {
+                    Ok(true) => {
+                        self.retire_finished_work(&mut active);
+                        if active.is_empty() {
+                            self.vk.release_primary_runtime_after_cohort_shrink();
+                        }
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        self.fail_unified_scheduler(&mut active, error);
+                        return;
+                    }
+                }
+            }
+
             // QSA attention remains lane-specific, but the surrounding projections and MoE are
             // shared across dense- and sparse-QSA rows. Keep the whole token cohort together;
             // `run_token_group` still stops exactly at the next dense-to-sparse boundary so the
@@ -3953,7 +4991,14 @@ impl ParallelSeam {
             let mut indices = (0..active.len()).collect::<Vec<_>>();
             // The primary lane decides whether the shared graph carries MRoPE history.
             sort_token_lane_indices(&active, &mut indices);
-            if let Err(error) = self.run_token_group(&mut active, &indices, usize::MAX, false) {
+            // After calibration, only proposals/admission/QSA boundaries end ordinary work.
+            let quantum = lookup_plain_quantum(
+                active.len(),
+                active[0].generated,
+                active[0].remaining_prefill(),
+                active[0].lookup.as_ref(),
+            );
+            if let Err(error) = self.run_token_group(&mut active, &indices, quantum, false) {
                 self.fail_unified_scheduler(&mut active, error);
                 return;
             }
@@ -4067,7 +5112,7 @@ impl ParallelSeam {
         });
         let initially_eligible = self.model.config().supports_parallel_token_rows()
             && constraint.is_none()
-            && self.gate.is_some()
+            && self.scheduler_admission_eligible()
             && mtp_eligible
             && max_new > 0;
         let mut registration = initially_eligible.then(|| BatchRegistration::new(self));
@@ -4086,6 +5131,18 @@ impl ParallelSeam {
         let mut printed = 0usize;
         let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
         if !batch_candidate {
+            let reason = if constraint.is_some() {
+                "grammar_constraint"
+            } else if !self.model.config().supports_parallel_token_rows() {
+                "scheduler_architecture_unsupported"
+            } else if self.gate.is_none() {
+                "scheduler_unavailable"
+            } else if !mtp_eligible {
+                "mtp_request_ineligible"
+            } else {
+                "output_budget_zero"
+            };
+            self.report_lookup_policy(req, guard.idx, "legacy_text", Some(reason));
             if let Some(heads) = &self.mtp_heads {
                 let mut heads = heads.lock().expect("MTP heads poisoned");
                 heads[guard.idx].invalidate_live();
@@ -4150,6 +5207,7 @@ impl ParallelSeam {
                 &prompt_tokens,
             ),
             prompt_end: prompt_tokens.len(),
+            lookup: self.new_lookup_work(req, &prompt_tokens, guard.idx, "scheduled_text"),
             prompt: prompt_tokens,
             max_new,
             generated: 0,
@@ -4287,6 +5345,12 @@ impl ParallelSeam {
                     self.model.config(),
                     &prompt_tokens,
                 ),
+                lookup: self.new_lookup_work(
+                    req,
+                    &prompt_tokens,
+                    guard.idx,
+                    "scheduled_mtp_multimodal",
+                ),
                 prompt: prompt_tokens,
                 prompt_end: plan.prompt_pos4.len() / 4,
                 max_new,
@@ -4332,12 +5396,24 @@ impl ParallelSeam {
         // A one-slot non-MTP engine has no scheduler worker, so its visual turn must stay on the
         // legacy runner. Multi-slot serving retains the handoff that batches visual and text decode.
         let handoff = should_handoff_multimodal_to_scheduler(
-            self.gate.is_some(),
+            self.scheduler_admission_eligible(),
             self.mtp_heads.is_some(),
             frontier_is_image,
             max_new,
         );
         let legacy_max_new = if handoff { 0 } else { max_new };
+        if !handoff {
+            let reason = if self.mtp_heads.is_some() {
+                "mtp_request_ineligible"
+            } else if frontier_is_image {
+                "image_frontier_requires_legacy_decode"
+            } else if max_new == 0 {
+                "output_budget_zero"
+            } else {
+                "scheduler_unavailable"
+            };
+            self.report_lookup_policy(req, guard.idx, "legacy_multimodal", Some(reason));
+        }
         let result = crate::seam::generate_dense_vulkan_session(
             &self.vk,
             self.model.gguf(),
@@ -4364,12 +5440,28 @@ impl ParallelSeam {
             Some(&plan),
         );
         if result.is_err() {
+            if handoff {
+                self.report_lookup_policy(
+                    req,
+                    guard.idx,
+                    "legacy_multimodal",
+                    Some("prefill_failed_before_handoff"),
+                );
+            }
             if let Some(kv) = guard.kv.as_mut() {
                 kv.reset();
             }
         }
         let (legacy_ids, stats) = result?;
         if !handoff || crate::sampling::abort_requested(Some(req)) {
+            if handoff {
+                self.report_lookup_policy(
+                    req,
+                    guard.idx,
+                    "legacy_multimodal",
+                    Some("cancelled_before_handoff"),
+                );
+            }
             return Ok(stats);
         }
         debug_assert!(legacy_ids.is_empty());
@@ -4398,6 +5490,7 @@ impl ParallelSeam {
                 self.model.config(),
                 &prompt_tokens,
             ),
+            lookup: self.new_lookup_work(req, &prompt_tokens, guard.idx, "scheduled_multimodal"),
             prompt: prompt_tokens,
             prompt_end,
             max_new,
@@ -4437,14 +5530,714 @@ impl ParallelSeam {
 #[cfg(test)]
 mod tests {
     use super::{
-        concurrent_mtp_profitable, concurrent_mtp_ready, expand_multimodal_prompt,
-        long_prefill_cohort_limit, long_prefill_phase_prompt_end, mtp_accepted_rows,
-        mtp_context_profitable, multimodal_key, multimodal_token_position,
-        phase_for_remaining_prefill, pick_continuation, scheduler_mode,
-        should_handoff_multimodal_to_scheduler, token_lane_prefill_fallback, token_lane_sort_key,
-        BatchPhase, MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
+        concurrent_mtp_profitable, concurrent_mtp_ready, deliver_lookup_prefix,
+        expand_multimodal_prompt, long_prefill_cohort_limit, long_prefill_phase_prompt_end,
+        lookup_fallback_reason, lookup_greedy_eligible, lookup_scheduler_supported,
+        mtp_accepted_rows, mtp_context_profitable, multimodal_key, multimodal_token_position,
+        phase_for_remaining_prefill, pick_continuation, repair_lookup_predictions, scheduler_mode,
+        scheduler_requested, should_handoff_multimodal_to_scheduler, token_lane_prefill_fallback,
+        token_lane_sort_key, BatchPhase, LookupBatchState, LookupTokenDelivery,
+        MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn lookup_delivery_exhausts_widths_caps_and_disconnect_prefixes() {
+        for width in 2..=4 {
+            let candidates = &([11, 12, 13])[..width - 1];
+            for accepted_drafts in 0..width {
+                let mut ids = vec![99; width];
+                ids[..accepted_drafts].copy_from_slice(&candidates[..accepted_drafts]);
+                let mut expected = candidates[..accepted_drafts].to_vec();
+                expected.push(ids[accepted_drafts]);
+                for remaining in 0..=width + 1 {
+                    for disconnect_after in 0..=expected.len() {
+                        let mut sent = Vec::new();
+                        let delivery =
+                            deliver_lookup_prefix(candidates, &ids, remaining, |token| {
+                                if sent.len() == disconnect_after {
+                                    LookupTokenDelivery::Disconnected
+                                } else {
+                                    sent.push(token);
+                                    LookupTokenDelivery::Continue
+                                }
+                            })
+                            .unwrap();
+                        let delivered = remaining.min(disconnect_after).min(expected.len());
+                        assert_eq!(sent, expected[..delivered]);
+                        assert_eq!(delivery.accepted_drafts, accepted_drafts);
+                        assert_eq!(delivery.new_tokens, delivered);
+                        assert_eq!(delivery.keep_inputs, 1 + delivered.min(accepted_drafts));
+                        assert_eq!(
+                            delivery.stopped,
+                            delivered == remaining
+                                || (disconnect_after < expected.len()
+                                    && disconnect_after < remaining)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lookup_ack_cancel_retains_the_sent_candidate_but_never_a_bonus_row() {
+        for stop_after in 1..=4 {
+            let mut sent = Vec::new();
+            let delivery = deliver_lookup_prefix(&[11, 12, 13], &[11, 12, 13, 99], 10, |token| {
+                sent.push(token);
+                if sent.len() == stop_after {
+                    LookupTokenDelivery::Stop
+                } else {
+                    LookupTokenDelivery::Continue
+                }
+            })
+            .unwrap();
+            assert!(delivery.stopped);
+            assert_eq!(delivery.new_tokens, stop_after);
+            assert_eq!(delivery.keep_inputs, 1 + stop_after.min(3));
+            assert_eq!(sent, [11, 12, 13, 99][..stop_after]);
+        }
+        let delivery = deliver_lookup_prefix(&[11], &[11, 99], 0, |_| {
+            panic!("pending is already emitted")
+        })
+        .unwrap();
+        assert_eq!((delivery.keep_inputs, delivery.new_tokens), (1, 0));
+    }
+
+    #[test]
+    fn lookup_eos_stops_candidate_or_bonus_delivery_without_extra_rows() {
+        const EOS: u32 = 2;
+        for (candidates, ids, expected_rows) in [
+            (vec![11, EOS, 13], vec![11, EOS, 13, 99], 3),
+            (vec![11], vec![11, EOS], 2),
+        ] {
+            let mut sent = Vec::new();
+            let delivery = deliver_lookup_prefix(&candidates, &ids, 10, |token| {
+                sent.push(token);
+                if token == EOS {
+                    LookupTokenDelivery::Stop
+                } else {
+                    LookupTokenDelivery::Continue
+                }
+            })
+            .unwrap();
+            assert_eq!(sent, [11, EOS]);
+            assert_eq!(delivery.keep_inputs, expected_rows);
+            assert_eq!(delivery.new_tokens, 2);
+            assert!(delivery.stopped);
+        }
+    }
+
+    #[test]
+    fn lookup_delivery_rejects_invalid_results_before_publishing() {
+        for ids in [
+            &[][..],
+            &[99][..],
+            &[11, 12, 13][..],
+            &[11, 12, 13, 14, 99][..],
+        ] {
+            assert!(
+                deliver_lookup_prefix(&[11], ids, 5, |_| panic!("invalid Verify delivery"))
+                    .is_err()
+            );
+        }
+        let mut sent = Vec::new();
+        let delivery = deliver_lookup_prefix(&[11, 12, 13], &[11, 99, 13, 77], 10, |token| {
+            sent.push(token);
+            LookupTokenDelivery::Continue
+        })
+        .unwrap();
+        assert_eq!(sent, [11, 99]); // a later matching row cannot extend the rejected prefix
+        assert_eq!(delivery.keep_inputs, 2);
+    }
+
+    #[test]
+    fn lookup_eligibility_is_greedy_and_penalty_free() {
+        let cfg = infr_core::config::SamplingCfg::default();
+        for (temp, top_k, presence_penalty, expected) in [
+            (0.0, 20, 0.0, true),
+            (0.8, 1, 0.0, true),
+            (0.8, 20, 0.0, false),
+            (0.0, 1, 1.0, false),
+            (f32::NAN, 20, 0.0, false),
+        ] {
+            let req = crate::sampling::RequestCtx::new(crate::sampling::RequestSampling {
+                temp: Some(temp),
+                top_k: Some(top_k),
+                presence_penalty,
+                ..Default::default()
+            });
+            assert_eq!(lookup_greedy_eligible(&req, &cfg), expected);
+        }
+    }
+
+    #[test]
+    fn lookup_only_scheduler_requires_device_embedding_for_admission() {
+        let cfg = crate::Config {
+            qwen35: true,
+            n_layer: 4,
+            n_layer_kv_from_start: 4,
+            n_embd: 256,
+            full_attn_interval: 4,
+            n_kv: 4,
+            head_dim: 128,
+            ssm_d_conv: 4,
+            ssm_d_state: 128,
+            ssm_d_inner: 1024,
+            ssm_n_group: 8,
+            ssm_dt_rank: 16,
+            ..Default::default()
+        };
+        assert!(cfg.supports_parallel_token_rows());
+        assert!(crate::seam::target_verify_supported(&cfg));
+        let mut ec = crate::EngineConfig::default();
+        assert!(!ec.spec.lookup);
+        ec.spec.lookup = true;
+        ec.spec.mtp = false;
+        for gpu_embed in [false, true] {
+            ec.spec.gpu_embed = gpu_embed;
+            for embed_gather in [false, true] {
+                for dtype in [
+                    None,
+                    Some(infr_core::DType::F32),
+                    Some(infr_core::DType::F16),
+                    Some(infr_core::DType::Q8_0),
+                ] {
+                    let supported = lookup_scheduler_supported(&cfg, &ec, embed_gather, dtype);
+                    let expected = gpu_embed
+                        && embed_gather
+                        && matches!(dtype, Some(infr_core::DType::F16 | infr_core::DType::Q8_0));
+                    let admitted = scheduler_requested(1, false, ec.spec.lookup, || supported);
+                    assert_eq!(supported, expected);
+                    assert_eq!(admitted, expected);
+                    assert_eq!(
+                        should_handoff_multimodal_to_scheduler(admitted, false, false, 16),
+                        expected,
+                    );
+                    // These pre-existing scheduler routes are not narrowed by Lookup policy.
+                    assert!(scheduler_requested(2, false, ec.spec.lookup, || supported));
+                    assert!(scheduler_requested(1, true, ec.spec.lookup, || supported));
+                }
+            }
+        }
+        ec.spec.gpu_embed = true;
+        ec.spec.lookup = false;
+        assert!(!lookup_scheduler_supported(
+            &cfg,
+            &ec,
+            true,
+            Some(infr_core::DType::F16)
+        ));
+        ec.spec.lookup = true;
+        let mut unsupported = cfg;
+        unsupported.n_layer = 0;
+        assert!(!lookup_scheduler_supported(
+            &unsupported,
+            &ec,
+            true,
+            Some(infr_core::DType::F16),
+        ));
+    }
+
+    #[test]
+    fn scheduler_preserves_legacy_decisions_without_probing_lookup() {
+        for slots in [1, 2] {
+            for heads in [false, true] {
+                assert_eq!(
+                    scheduler_requested(slots, heads, false, || {
+                        panic!("disabled Lookup must not inspect embedding metadata")
+                    }),
+                    slots > 1 || heads,
+                );
+                if slots > 1 || heads {
+                    assert!(scheduler_requested(slots, heads, true, || {
+                        panic!("legacy multi-slot/MTP scheduling must not depend on Lookup")
+                    }));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lookup_flash_metadata_shape_is_eligible_and_reports_each_fallback() {
+        // CPU-only fixture from the actual Flash GGUF header; no tensor payload is loaded.
+        let mut cfg = crate::Config {
+            qwen4exp: true,
+            n_layer: 48,
+            n_layer_kv_from_start: 48,
+            n_embd: 2560,
+            n_head: 24,
+            n_kv: 2,
+            hc_mult: 4,
+            full_attn_interval: 4,
+            recurrent_layers: (0..48).map(|layer| (layer + 1) % 4 != 0).collect(),
+            ssm_d_conv: 4,
+            ssm_d_state: 128,
+            ssm_d_inner: 6144,
+            ssm_n_group: 16,
+            ssm_dt_rank: 48,
+            ple_layers: vec![false; 48],
+            ple_ngram_size: 3,
+            ple_heads_per_ngram: 8,
+            ple_head_dim: 160,
+            ple_conv_kernel: 4,
+            ..Default::default()
+        };
+        cfg.ple_layers[1] = true;
+        let mut ec = crate::EngineConfig::default();
+        ec.spec.lookup = true;
+        ec.spec.mtp = false;
+        ec.spec.gpu_embed = true;
+        ec.sampling.temp = 1.0;
+        let req = crate::sampling::RequestCtx::new(crate::sampling::RequestSampling {
+            temp: Some(0.0),
+            ..Default::default()
+        });
+        let dtype = Some(infr_core::DType::Q8_0);
+        assert_eq!(
+            lookup_fallback_reason(&cfg, &ec, &req, false, true, dtype),
+            None
+        );
+        assert_eq!(
+            lookup_fallback_reason(&cfg, &ec, &req, true, true, dtype),
+            Some("mtp_head_loaded")
+        );
+        assert_eq!(
+            lookup_fallback_reason(&cfg, &ec, &req, false, false, dtype),
+            Some("backend_embed_gather_unsupported")
+        );
+        assert_eq!(
+            lookup_fallback_reason(&cfg, &ec, &req, false, true, None),
+            Some("token_embedding_missing")
+        );
+        assert_eq!(
+            lookup_fallback_reason(&cfg, &ec, &req, false, true, Some(infr_core::DType::F32)),
+            Some("token_embedding_dtype_unsupported")
+        );
+        ec.spec.lookup = false;
+        assert_eq!(
+            lookup_fallback_reason(&cfg, &ec, &req, false, true, dtype),
+            Some("lookup_disabled")
+        );
+        ec.spec.lookup = true;
+        ec.spec.gpu_embed = false;
+        assert_eq!(
+            lookup_fallback_reason(&cfg, &ec, &req, false, true, dtype),
+            Some("gpu_embedding_disabled")
+        );
+        ec.spec.gpu_embed = true;
+        ec.kernels.vulkan.dn_chunk = false;
+        assert_eq!(
+            lookup_fallback_reason(&cfg, &ec, &req, false, true, dtype),
+            Some("gdn_chunk_disabled")
+        );
+        ec.kernels.vulkan.dn_chunk = true;
+        ec.kernels.vulkan.dn_chunk_scan = false;
+        assert_eq!(
+            lookup_fallback_reason(&cfg, &ec, &req, false, true, dtype),
+            Some("gdn_chunk_scan_disabled")
+        );
+        ec.kernels.vulkan.dn_chunk_scan = true;
+        ec.kernels.vulkan.dn_split = false;
+        assert_eq!(
+            lookup_fallback_reason(&cfg, &ec, &req, false, true, dtype),
+            Some("gdn_split_disabled")
+        );
+        ec.kernels.vulkan.dn_split = true;
+        ec.spec.lookup_max_draft = 0;
+        assert_eq!(
+            lookup_fallback_reason(&cfg, &ec, &req, false, true, dtype),
+            Some("zero_draft_budget")
+        );
+        ec.spec.lookup_max_draft = 3;
+        let inherited = crate::sampling::RequestCtx::new(Default::default());
+        assert_eq!(
+            lookup_fallback_reason(&cfg, &ec, &inherited, false, true, dtype),
+            Some("request_sampling_not_greedy")
+        );
+        let penalized = crate::sampling::RequestCtx::new(crate::sampling::RequestSampling {
+            temp: Some(0.0),
+            presence_penalty: 1.0,
+            ..Default::default()
+        });
+        assert_eq!(
+            lookup_fallback_reason(&cfg, &ec, &penalized, false, true, dtype),
+            Some("request_penalties_active")
+        );
+        cfg.ple_layers[0] = true;
+        assert_eq!(
+            lookup_fallback_reason(&cfg, &ec, &req, false, true, dtype),
+            Some("unsupported_target_state")
+        );
+    }
+
+    #[test]
+    fn lookup_request_greedy_override_works_with_nongreedy_model_defaults() {
+        let cfg = infr_core::config::SamplingCfg {
+            temp: 1.0,
+            top_k: 20,
+            ..Default::default()
+        };
+        let inherited = crate::sampling::RequestCtx::new(Default::default());
+        assert!(!lookup_greedy_eligible(&inherited, &cfg));
+        for sampling in [
+            crate::sampling::RequestSampling {
+                temp: Some(0.0),
+                ..Default::default()
+            },
+            crate::sampling::RequestSampling {
+                top_k: Some(1),
+                ..Default::default()
+            },
+        ] {
+            let req = crate::sampling::RequestCtx::new(sampling);
+            assert!(lookup_greedy_eligible(&req, &cfg));
+            // Ordinary token rows use this same request-local resolution.
+            let sampler = crate::sampling::ParallelSampler::new(&req, &cfg);
+            assert!(sampler.can_gpu_argmax());
+        }
+    }
+
+    #[test]
+    fn lookup_shared_target_gate_requires_gdn_flags_only_with_recurrent_layers() {
+        let attention = crate::Config {
+            n_layer: 4,
+            n_layer_kv_from_start: 4,
+            n_embd: 256,
+            n_head: 4,
+            n_kv: 2,
+            head_dim: 64,
+            ..Default::default()
+        };
+        let hybrid = crate::Config {
+            qwen35: true,
+            n_layer: 4,
+            n_layer_kv_from_start: 4,
+            n_embd: 256,
+            full_attn_interval: 4,
+            n_kv: 4,
+            head_dim: 128,
+            ssm_d_conv: 4,
+            ssm_d_state: 128,
+            ssm_d_inner: 1024,
+            ssm_n_group: 8,
+            ssm_dt_rank: 16,
+            ..Default::default()
+        };
+        let mut ec = crate::EngineConfig::default();
+        ec.spec.lookup = true;
+        ec.spec.mtp = false;
+        ec.spec.gpu_embed = true;
+        for mask in 0..8 {
+            ec.kernels.vulkan.dn_chunk = mask & 1 != 0;
+            ec.kernels.vulkan.dn_chunk_scan = mask & 2 != 0;
+            ec.kernels.vulkan.dn_split = mask & 4 != 0;
+            assert!(crate::seam::target_verify_enabled(&attention, &ec));
+            assert_eq!(crate::seam::target_verify_enabled(&hybrid, &ec), mask == 7);
+        }
+    }
+
+    #[test]
+    fn lookup_history_sync_handles_same_length_edits_rewind_and_ordinary_handoff() {
+        let mut state = LookupBatchState::new(Default::default(), &[1; 8]).unwrap();
+        state.sync_history(&[2; 8]);
+        assert_eq!(state.indexed_len, 8);
+        assert!(state.proposer.propose(None, 3).is_none());
+        state.sync_history(&[2; 4]);
+        assert_eq!(state.indexed_len, 4);
+        state.append_confirmed(&[99]); // pending is indexed exactly once, not materialized here
+        assert_eq!(state.indexed_len, 5);
+        state.record_ordinary(0.16, 16);
+        state.append_confirmed(&[100, 101]);
+        assert_eq!(state.indexed_len, 7);
+        assert_eq!(state.ordinary_token_secs, Some(0.01));
+        state.sync_history(&[3; 8]);
+        assert_eq!(state.indexed_len, 8);
+        assert!(state.proposer.propose(None, 3).is_none());
+    }
+
+    #[test]
+    fn lookup_cost_backoff_applies_even_at_full_acceptance_and_recovers() {
+        let mut state = LookupBatchState::new(Default::default(), &[]).unwrap();
+        state.record_ordinary(0.16, 16); // ordinary wall time = 10 ms/token
+        state.record_cycle(3, 3, 4, 0.06); // full acceptance, but 15 ms/token
+        assert_eq!(state.cost_cooldown, 0);
+        state.record_cycle(3, 3, 4, 0.06);
+        let interrupt = std::sync::atomic::AtomicBool::new(false);
+        for remaining in (0..super::LOOKUP_COST_COOLDOWN_TOKENS).rev() {
+            state.observe_ordinary_token(42, true, true, 3, &interrupt);
+            assert_eq!(state.cost_cooldown, remaining);
+            assert!(!interrupt.load(std::sync::atomic::Ordering::Acquire));
+        }
+        assert_eq!(state.cost_cooldown, 0);
+        state.record_cycle(3, 3, 4, 0.02);
+        assert_eq!(state.slow_cycles, 0);
+        assert_eq!(state.stats.cost_backoffs, 1);
+        state.missed_search_secs = 0.05; // unsuccessful searches also cost wall time
+        state.record_cycle(3, 3, 4, 0.02);
+        assert_eq!(state.slow_cycles, 1);
+        state.record_ordinary(0.0, 0);
+        assert_eq!(state.ordinary_token_secs, Some(0.01));
+    }
+
+    #[test]
+    fn lookup_short_reentry_cannot_inflate_continuous_decode_reference() {
+        let mut state = LookupBatchState::new(Default::default(), &[]).unwrap();
+        state.record_ordinary(0.16, 16);
+        for tokens in 1..super::LOOKUP_CALIBRATION_TOKENS {
+            state.record_ordinary(tokens as f64, tokens);
+            assert_eq!(state.ordinary_token_secs, Some(0.01));
+        }
+        state.record_cycle(3, 3, 4, 0.06);
+        state.record_cycle(3, 3, 4, 0.06);
+        assert_eq!(state.cost_cooldown, super::LOOKUP_COST_COOLDOWN_TOKENS);
+        state.record_ordinary(0.32, 16);
+        assert!((state.ordinary_token_secs.unwrap() - 0.0125).abs() < 1e-12);
+    }
+
+    #[test]
+    fn lookup_cost_baseline_excludes_prefill_handoffs_and_concurrent_groups() {
+        use super::{lookup_ordinary_sample_eligible, BatchPhase};
+        assert!(!lookup_ordinary_sample_eligible(
+            BatchPhase::ShortPrefill,
+            0,
+            1
+        ));
+        assert!(!lookup_ordinary_sample_eligible(
+            BatchPhase::LongPrefill,
+            0,
+            1
+        ));
+        assert!(!lookup_ordinary_sample_eligible(BatchPhase::Decode, 0, 1));
+        assert!(!lookup_ordinary_sample_eligible(BatchPhase::Decode, 16, 2));
+        assert!(lookup_ordinary_sample_eligible(BatchPhase::Decode, 16, 1));
+    }
+
+    #[test]
+    fn lookup_quantum_only_bounds_initial_single_lane_calibration() {
+        use super::lookup_plain_quantum;
+        let mut state = LookupBatchState::new(Default::default(), &[]).unwrap();
+        assert_eq!(lookup_plain_quantum(1, 0, 7, Some(&state)), 8);
+        assert_eq!(lookup_plain_quantum(1, 1, 0, Some(&state)), 16);
+        assert_eq!(lookup_plain_quantum(2, 0, 7, Some(&state)), usize::MAX);
+        assert_eq!(lookup_plain_quantum(2, 1, 0, Some(&state)), usize::MAX);
+        assert_eq!(lookup_plain_quantum(1, 1, 0, None), usize::MAX);
+        state.record_ordinary(0.0, 1); // short-prefill handoff does not warm the baseline
+        assert_eq!(state.calibration_tokens, 0);
+        state.record_ordinary(0.04, 4); // admission can interrupt calibration
+        assert_eq!(state.ordinary_token_secs, None);
+        assert_eq!(lookup_plain_quantum(1, 5, 0, Some(&state)), 12);
+        state.record_ordinary(0.12, 12);
+        assert_eq!(state.ordinary_token_secs, Some(0.01));
+        assert_eq!(lookup_plain_quantum(1, 17, 0, Some(&state)), usize::MAX);
+        state.cost_cooldown = super::LOOKUP_COST_COOLDOWN_TOKENS;
+        assert_eq!(lookup_plain_quantum(1, 17, 0, Some(&state)), usize::MAX);
+    }
+
+    #[test]
+    fn lookup_callback_no_match_keeps_contiguous_ordinary_and_indexes_once() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let history = (0..64).collect::<Vec<_>>();
+        let mut state = LookupBatchState::new(Default::default(), &history).unwrap();
+        state.record_ordinary(0.16, 16);
+        let interrupt = AtomicBool::new(false);
+        let outputs = (64..320).collect::<Vec<_>>();
+        for &token in &outputs {
+            state.observe_ordinary_token(token, true, true, 3, &interrupt);
+            assert!(!interrupt.load(Ordering::Acquire));
+            assert!(state.pending_proposal.is_none());
+        }
+        assert_eq!(state.stats.searches, outputs.len());
+        assert_eq!(state.indexed_len, history.len() + outputs.len());
+        state
+            .finish_ordinary_outputs(history.len(), &outputs)
+            .unwrap();
+        assert_eq!(state.indexed_len, history.len() + outputs.len());
+        assert!(state.proposer.propose(None, 3).is_none());
+    }
+
+    #[test]
+    fn lookup_callback_ack_proposal_yields_and_is_consumed_without_research() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let history = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 4, 5, 6, 7];
+        let mut state = LookupBatchState::new(Default::default(), &history).unwrap();
+        state.record_ordinary(0.16, 16);
+        let interrupt = AtomicBool::new(false);
+        state.observe_ordinary_token(8, true, true, 3, &interrupt);
+        assert!(interrupt.load(Ordering::Acquire));
+        assert_eq!(state.indexed_len, history.len() + 1);
+        state.finish_ordinary_outputs(history.len(), &[8]).unwrap();
+        let searches = state.stats.searches;
+        let (proposal, _) = state.take_pending_proposal(2).unwrap();
+        assert_eq!(proposal.tokens, [9, 10]);
+        assert_eq!(state.stats.searches, searches);
+        assert!(state.take_pending_proposal(2).is_none());
+        // The proposal consumed no candidate tokens: only the emitted pending was appended.
+        assert_eq!(state.indexed_len, history.len() + 1);
+        state.append_confirmed(&[9, 99]); // Verify publishes one match plus its target correction
+        assert_eq!(state.indexed_len, history.len() + 3);
+    }
+
+    #[test]
+    fn lookup_callback_preserves_the_selected_width_feedback_policy() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let history = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 4, 5, 6, 7];
+        for adaptive_width in [false, true] {
+            let mut state = LookupBatchState::new(
+                crate::speculative_lookup::LookupConfig {
+                    adaptive_width,
+                    ..Default::default()
+                },
+                &history,
+            )
+            .unwrap();
+            state.record_ordinary(0.16, 16);
+            state.proposer.record_result(1, 3);
+            let interrupt = AtomicBool::new(false);
+            state.observe_ordinary_token(8, true, true, 3, &interrupt);
+            assert!(interrupt.load(Ordering::Acquire));
+            let (proposal, _) = state.take_pending_proposal(3).unwrap();
+            let width = if adaptive_width { 1 } else { 3 };
+            assert_eq!(proposal.tokens, [9, 10, 11][..width]);
+            assert_eq!(state.indexed_len, history.len() + 1);
+        }
+    }
+
+    #[test]
+    fn lookup_callback_cancel_cohort_and_admission_do_not_request_proposal_yields() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let history = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 4, 5, 6, 7];
+        for (ack, single, admission) in [
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            let mut state = LookupBatchState::new(Default::default(), &history).unwrap();
+            state.record_ordinary(0.16, 16);
+            let interrupt = AtomicBool::new(admission);
+            state.observe_ordinary_token(8, ack, single, 3, &interrupt);
+            assert_eq!(interrupt.load(Ordering::Acquire), admission);
+            assert!(state.pending_proposal.is_none());
+            assert_eq!(state.stats.searches, 0);
+            state.finish_ordinary_outputs(history.len(), &[8]).unwrap();
+            assert_eq!(state.indexed_len, history.len() + 1);
+        }
+        let mut state = LookupBatchState::new(Default::default(), &history).unwrap();
+        state.record_ordinary(0.16, 16);
+        let interrupt = AtomicBool::new(false);
+        state.observe_ordinary_token(8, true, true, 3, &interrupt);
+        assert!(state.pending_proposal.is_some());
+        // A new cohort can advance ordinary decode before Lookup gets another single-lane turn.
+        state.observe_ordinary_token(9, true, false, 0, &interrupt);
+        assert!(state.take_pending_proposal(3).is_none());
+        state
+            .finish_ordinary_outputs(history.len(), &[8, 9, 2])
+            .unwrap(); // EOS bypassed callback
+        assert_eq!(state.indexed_len, history.len() + 3);
+        state.sync_history(&history); // rewind invalidates even a same-frontier cached proposal
+        assert!(state.take_pending_proposal(3).is_none());
+        assert_eq!(state.indexed_len, history.len());
+        interrupt.store(false, Ordering::Release);
+        state.observe_ordinary_token(8, true, true, 3, &interrupt);
+        assert!(state.pending_proposal.is_some());
+        let mut edited = history.to_vec();
+        edited.push(8);
+        edited[0] = 99;
+        state.sync_history(&edited); // equal length is not proof of the same proposal frontier
+        assert!(state.take_pending_proposal(3).is_none());
+        assert_eq!(state.indexed_len, edited.len());
+    }
+
+    #[test]
+    fn lookup_cost_cooldown_is_128_ordinary_tokens_without_intermediate_yields() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut state = LookupBatchState::new(Default::default(), &[1; 32]).unwrap();
+        state.record_ordinary(0.16, 16);
+        state.record_cycle(3, 3, 4, 0.06);
+        state.record_cycle(3, 3, 4, 0.06);
+        let interrupt = AtomicBool::new(false);
+        for _ in 0..128 {
+            state.observe_ordinary_token(1, true, true, 3, &interrupt);
+            assert!(!interrupt.load(Ordering::Acquire));
+        }
+        assert_eq!(state.stats.searches, 0);
+        assert_eq!(state.cost_cooldown, 0);
+        state.observe_ordinary_token(1, true, true, 3, &interrupt);
+        assert!(interrupt.load(Ordering::Acquire));
+        assert!(state.take_pending_proposal(3).is_some());
+    }
+
+    #[test]
+    fn lookup_callback_and_verify_share_output_context_and_qsa_budget() {
+        use super::lookup_draft_budget;
+        assert_eq!(lookup_draft_budget(3, 1, 20, 128, 64), 0);
+        assert_eq!(lookup_draft_budget(3, 2, 20, 128, 64), 1);
+        assert_eq!(lookup_draft_budget(9, 10, 20, 128, 64), 3);
+        assert_eq!(lookup_draft_budget(3, 10, 128, 128, 64), 0);
+        assert_eq!(lookup_draft_budget(3, 10, 127, 128, 64), 1);
+        assert_eq!(lookup_draft_budget(3, 10, 63, 128, 64), 1);
+        assert_eq!(lookup_draft_budget(3, 10, 64, 128, 64), 0);
+        assert_eq!(lookup_draft_budget(3, 10, 65, 128, 64), 3);
+        assert_eq!(lookup_draft_budget(0, 10, 65, 128, 64), 0);
+    }
+
+    #[test]
+    fn mtp_verify_width_matches_standalone_limits() {
+        for (configured, rows) in [(0, 2), (1, 2), (2, 2), (3, 3), (4, 4), (6, 4)] {
+            assert_eq!(super::mtp_verify_rows(configured), rows);
+        }
+    }
+
+    #[test]
+    fn lookup_indexes_each_known_append_including_pending_exactly_once() {
+        let mut state = LookupBatchState::new(
+            Default::default(),
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 4, 5, 6, 7],
+        )
+        .unwrap();
+        assert!(state.proposer.propose(None, 3).is_none());
+        state.append_confirmed(&[8]); // ordinary decode's already-emitted pending
+        assert_eq!(state.indexed_len, 20);
+        let found = state.proposer.propose(None, 3).unwrap();
+        assert_eq!(found.tokens, [9, 10, 11]);
+        assert_eq!(found.matched_tokens, 8);
+        state.proposer.record_result(1, 3);
+        state.append_confirmed(&[9, 99]); // accepted candidate plus target correction
+        assert_eq!(state.indexed_len, 22);
+        assert!(state.proposer.propose(None, 3).is_none());
+    }
+
+    #[test]
+    fn lookup_eos_repair_uses_full_logits_and_only_the_candidate_guard_branch() {
+        let cfg = crate::Config {
+            qwen4exp: true,
+            vocab: 16,
+            eos: 2,
+            eos_ids: vec![2, 3],
+            qwen4_think_start: Some(10),
+            qwen4_think_end: Some(11),
+            ..Default::default()
+        };
+        let guard = crate::sampling::Qwen4ReasoningEosGuard::from_prompt(&cfg, &[10, 7]);
+        let mut logits = vec![0.0; 2 * cfg.vocab];
+        logits[2] = 100.0;
+        logits[3] = 90.0;
+        logits[7] = 10.0;
+        let mut ids = vec![2, 2];
+        repair_lookup_predictions(&cfg, guard, &[11], &mut ids, &mut logits, false).unwrap();
+        assert_eq!(ids, [7, 2]); // candidate closes reasoning only for its following row
+        assert!(guard.blocks(&cfg, 2, false)); // persistent guard remains unchanged
+        assert!(repair_lookup_predictions(&cfg, guard, &[7], &mut [2, 2], &mut [], false).is_err());
+        let mut ids = [2, 2];
+        repair_lookup_predictions(&cfg, guard, &[7], &mut ids, &mut [], true).unwrap();
+        assert_eq!(ids, [2, 2]);
+        let mut corrupt = vec![0.0; 2 * cfg.vocab];
+        corrupt[7] = f32::NAN;
+        let error = repair_lookup_predictions(&cfg, guard, &[7], &mut [2, 2], &mut corrupt, false)
+            .unwrap_err();
+        assert!(crate::sampling::is_numerical_corruption(&error));
+    }
 
     #[test]
     fn short_prefill_boundary_is_inclusive_at_96_tokens() {

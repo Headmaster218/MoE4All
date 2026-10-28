@@ -117,7 +117,8 @@ function Test-UpdateAction {
 }
 
 $workRoot = if ($env:MOE4ALL_WORK_ROOT) { $env:MOE4ALL_WORK_ROOT } else { throw 'MOE4ALL_WORK_ROOT is required for wizard tests' }
-$testRoot = Join-Path (Join-Path (Join-Path $workRoot 'tmp') 'moe4all') ('wizard-test-' + [guid]::NewGuid().ToString('N'))
+$testParent = if ($env:MOE4ALL_WIZARD_TEST_TMP) { $env:MOE4ALL_WIZARD_TEST_TMP } else { Join-Path (Join-Path $workRoot 'tmp') 'moe4all' }
+$testRoot = Join-Path $testParent ('wizard-test-' + [guid]::NewGuid().ToString('N'))
 $script:Passed = 0
 try {
     New-Item -ItemType Directory -Path $testRoot | Out-Null
@@ -309,12 +310,13 @@ try {
     New-Item -ItemType Directory -Path $resultDir -Force | Out-Null
     $dataDir = Join-Path $testRoot 'gui-data'
     $infrPath = Join-Path $testRoot 'never-run.exe'
-    $localOnly = Write-ManualBenchmarkResult -RawJson '[{"avg_ts":123.4,"reps_ts":[123.4]}]' -ModelPath $model35 -Kind mixed -PromptTokens 512 -GenTokens 128 -DepthMode synthetic -DepthTokens 6144 -Repetitions 1
+    $localOnly = Write-ManualBenchmarkResult -RawJson '[{"avg_ts":123.4,"reps_ts":[123.4],"benchmark_metadata":{"engine_commit":"abcdef1234","hardware":{"cpu":{"name":"Native CPU"}},"model":{"name":"Native.gguf","quantization":"Q4_K"},"configuration":{"actual_ubatch":512,"kv_type_k":"q8_0","backend":"vulkan"}}}]' -ModelPath $model35 -Kind mixed -PromptTokens 512 -GenTokens 128 -DepthMode synthetic -DepthTokens 6144 -Repetitions 1
     Assert ($null -eq $localOnly) 'Mixed speed must not enter standardized upload'
     $localResult = @(Get-ChildItem -LiteralPath (Join-Path $dataDir 'benchmark-results') -Filter '*.json')
     Assert ($localResult.Count -eq 1) 'Mixed benchmark raw result was not retained'
     $localPayload = Get-Content -LiteralPath $localResult[0].FullName -Raw | ConvertFrom-Json
     Assert ($localPayload.configuration.benchmark_kind -eq 'mixed' -and $localPayload.contexts[0].manual_result.raw.reps_ts[0] -eq 123.4) 'Mixed result lost its parameters or raw samples'
+    Assert ($localPayload.hardware.cpu.name -eq 'Native CPU' -and $localPayload.model.quantization -eq 'Q4_K' -and $localPayload.configuration.actual_ubatch -eq 512 -and $localPayload.engine_commit -eq 'abcdef1234') 'Manual export discarded native engine metadata'
     $script:Passed++
     Microsoft.PowerShell.Utility\Write-Host 'PASS mixed benchmark stays local with its raw samples'
     $fixtureSubmissionPath = Join-Path $resultDir 'manual-fixture.m4b'
@@ -345,13 +347,10 @@ try {
     Assert ($largeBrowserPlan.GuidancePrefilled -and $largeBrowserPlan.Url.Length -lt 6000 -and $largeBrowserPlan.Url -match '&value=') 'Large browser upload must keep the short guidance URL'
     $resultValue.Remove('padding')
     [System.IO.File]::WriteAllText($fixtureSubmissionPath, ($resultValue | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
-    Assert ((ConvertFrom-SmbiosMemoryType -Type 26) -eq 'DDR4' -and (ConvertFrom-SmbiosMemoryType -Type 34) -eq 'DDR5') 'SMBIOS memory generation mapping changed'
-    Assert ((ConvertFrom-StorageBusType -Type 17) -eq 'NVMe' -and (ConvertFrom-StorageMediaType -Type 4) -eq 'SSD') 'Storage enum mapping changed'
-    Assert ((Get-PcieTheoreticalBandwidthGbps -Generation 4 -Width 16) -eq 31.504) 'PCIe 4.0 x16 bandwidth calculation changed'
     Assert ($source -notmatch 'gh auth login|Invoke-GhBrowserLogin') 'Upload must not require CLI authorization before using the GitHub browser form'
     Assert ($source.Contains('$branch = "community/$Kind/$fileHash"')) 'Report branches must be deterministic and separated by kind'
     Assert ($source.Contains("Create the branch and report PR now?' -Default `$true")) 'Final automated PR confirmation should accept Enter'
-    Assert ($source.IndexOf('$benchmarkUploadRequested = Read-BenchmarkUploadConsent') -lt $source.IndexOf('$benchmarkHardwareDetails = Get-WindowsBenchmarkHardwareDetails')) 'Upload consent must be requested before post-benchmark hardware enrichment'
+    Assert ($source -notmatch 'Get-WindowsBenchmarkHardwareDetails|Add-BenchmarkHardwareDetails') 'Hardware collection must be owned by infr, not repeated by the wizard'
     $savedApiBase = [Environment]::GetEnvironmentVariable('MOE4ALL_SUBMISSION_API_BASE', 'Process')
     $savedSiteOrigin = [Environment]::GetEnvironmentVariable('MOE4ALL_SUBMISSION_SITE_ORIGIN', 'Process')
     try {
@@ -432,30 +431,8 @@ try {
         $script:SubmissionFailureActionDefault = $savedFailureAction
         $script:SubmissionPendingRetryDefault = $savedPendingRetry
     }
-    $details = [pscustomobject]@{
-        MemoryGeneration = 'DDR5'
-        MemoryModules = @([pscustomobject]@{ capacity_bytes = [uint64]1024; generation = 'DDR5'; configured_speed_mt_s = [uint64]6000 })
-        GpuLinks = @([pscustomobject]@{ name = 'Fixture GPU'; current_generation = 4; current_width = 8; max_generation = 5; max_width = 16; current_theoretical_one_way_gb_per_second = 15.752; max_theoretical_one_way_gb_per_second = 63.008; source = 'windows_pnp' })
-        ModelStorage = [pscustomobject]@{ model = 'Fixture SSD'; media_type = 'SSD'; bus_type = 'NVMe'; size_bytes = [uint64]2048 }
-    }
-    function Invoke-NativeCommandResult {
-        param([string]$Executable, [string[]]$Arguments)
-        if ($Arguments[0] -eq 'submission' -and $Arguments[1] -eq 'repack-benchmark') {
-            $sourceIndex = [Array]::IndexOf($Arguments, '--source')
-            $inputIndex = [Array]::IndexOf($Arguments, '--input')
-            [System.IO.File]::Copy($Arguments[$inputIndex + 1], $Arguments[$sourceIndex + 1], $true)
-            return [pscustomobject]@{ ExitCode = 0; Output = @("MOE4ALL_SUBMISSION_PATH=$($Arguments[$sourceIndex + 1])") }
-        }
-        throw 'unexpected native command in benchmark enrichment fixture'
-    }
-    Add-BenchmarkHardwareDetails -Path $fixtureSubmissionPath -Details $details
-    Set-Item -Path Function:Invoke-NativeCommandResult -Value $realInvokeNativeCommandResult
-    $enriched = Get-Content -LiteralPath $fixtureSubmissionPath -Raw | ConvertFrom-Json
-    Assert ($enriched.hardware.ram.memory_generation -eq 'DDR5' -and $enriched.hardware.ram.module_count -eq 1) 'Memory details were not added to benchmark submission'
-    Assert ($enriched.hardware.gpu.pcie_generation -eq 4 -and $enriched.hardware.gpu.pcie_width -eq 8) 'PCIe details were not added to benchmark submission'
-    Assert ($enriched.hardware.model_storage.bus_type -eq 'NVMe') 'Model storage details were not added to benchmark submission'
     $script:Passed++
-    Microsoft.PowerShell.Utility\Write-Host 'PASS benchmark browser prefill and hardware enrichment'
+    Microsoft.PowerShell.Utility\Write-Host 'PASS benchmark browser prefill and engine-owned hardware collection'
     $resultValue.model.local_path = 'C:\private\model.gguf'
     [System.IO.File]::WriteAllText($fixtureSubmissionPath, ($resultValue | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
     $privacyRejected = $false
@@ -799,10 +776,10 @@ try {
     }
     Microsoft.PowerShell.Utility\Write-Host "Launch wizard tests passed: $script:Passed; no engine, GPU, update or user state was touched."
 } finally {
-    if ($ChildFixture -eq 'decline') {
-        Assert (-not (Test-Path -LiteralPath $statePath)) 'Declining launch must not save settings'
+    if ($ChildFixture -in @('decline', 'dry')) {
+        Assert (-not (Test-Path -LiteralPath $statePath)) 'Declining launch or DryRun must not save settings'
     } elseif ($ChildFixture) {
-        Assert (Test-Path -LiteralPath $statePath -PathType Leaf) 'Accepted launch or DryRun must save settings'
+        Assert (Test-Path -LiteralPath $statePath -PathType Leaf) 'Accepted launch must save settings'
     }
     $resolvedRoot = [System.IO.Path]::GetFullPath($testRoot)
     $tempPrefix = [System.IO.Path]::GetFullPath((Join-Path (Join-Path $workRoot 'tmp') 'moe4all')).TrimEnd('\') + '\'

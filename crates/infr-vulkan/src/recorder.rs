@@ -8,11 +8,13 @@
 
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use ash::vk;
 
 use infr_core::{
     backend::{Backend, Buffer},
+    config::VulkanCfg,
     error::Result,
     pager_profile,
 };
@@ -20,11 +22,80 @@ use infr_core::{
 use super::ops::ComputeKernel;
 use super::{as_vk_buf, be, Backing, VkBuffer, VulkanBackend};
 
+#[path = "recorder_owned_topk.rs"]
+pub(crate) mod owned_topk;
+
+#[path = "recorder_owned_role_pipeline.rs"]
+pub(crate) mod owned_role_pipeline;
+
+#[path = "recorder_owned_splitk_runtime.rs"]
+pub(crate) mod owned_splitk_hit;
+
+#[cfg(test)]
+#[path = "recorder_owned_indirect.rs"]
+mod owned_indirect;
+
+#[cfg(test)]
+#[path = "recorder_owned_indirect_tests.rs"]
+mod owned_indirect_tests;
+
+#[cfg(test)]
+#[path = "segmented_attention_contract.rs"]
+mod segmented_attention_contract;
+
+#[cfg(test)]
+#[path = "flash_pv_reuse_contract.rs"]
+mod flash_pv_reuse_contract;
+
+#[cfg(test)]
+#[path = "g01_cold_state_contract.rs"]
+mod g01_cold_state_contract;
+
+#[cfg(test)]
+#[path = "swiglu_quant_contract.rs"]
+mod swiglu_quant_contract;
+
+#[cfg(test)]
+#[path = "kquant_decode_contract.rs"]
+mod kquant_decode_contract;
+
+#[cfg(test)]
+#[path = "pair_verify_contract.rs"]
+mod pair_verify_contract;
+#[path = "recorder_verify_pair.rs"]
+mod verify_pairs;
+pub(crate) use verify_pairs::baseline_policy as verify_pair_baseline_policy;
+pub(crate) use verify_pairs::shared_iq2_verify_fusion_allowed;
+
+#[cfg(test)]
+#[path = "recorder_gpu_copy_overlap_tests.rs"]
+mod gpu_copy_overlap_tests;
+
+#[cfg(test)]
+#[path = "recorder_owned_payload_sync_tests.rs"]
+mod owned_payload_sync_tests;
+
+#[cfg(test)]
+#[path = "recorder_host_ready_probe_tests.rs"]
+mod host_ready_probe_tests;
+
+#[cfg(test)]
+#[path = "recorder_fence_handoff_probe_tests.rs"]
+mod fence_handoff_probe_tests;
+
+#[cfg(test)]
+#[path = "recorder_gpu_copy_payload_sweep_tests.rs"]
+mod gpu_copy_payload_sweep_tests;
+
+#[cfg(test)]
+#[path = "hc_inject_norm_sync_contract.rs"]
+mod hc_inject_norm_sync_contract;
+
 pub(crate) const QSA_TOPK_PARALLEL_MIN_BLOCKS: u32 = 4096;
 pub(crate) const QSA_TOPK_PARALLEL_WORK_BYTES: usize = (64 * 256 + 2) * 4;
 const QSA_TOPK_PARALLEL_MAX_GROUPS: u32 = 64;
 // Shader ABI: five status words, two predicates per checked layer, one immutable seed.
-pub(crate) const RESIDENT_MAX_LAYERS: usize = 16;
+pub(crate) const RESIDENT_MAX_LAYERS: usize = 128;
 pub(crate) const RESIDENT_SEED_WORD: usize = 5 + 2 * RESIDENT_MAX_LAYERS;
 pub(crate) const RESIDENT_CONTROL_BYTES: usize = (RESIDENT_SEED_WORD + 1) * 4;
 // Resident journal ABI shared with gpu_resident_{check,hit_check}.comp. Keep routed ids and
@@ -32,10 +103,72 @@ pub(crate) const RESIDENT_CONTROL_BYTES: usize = (RESIDENT_SEED_WORD + 1) * 4;
 pub(crate) const RESIDENT_JOURNAL_ID_WORDS: usize = infr_core::backend::MAX_DECODE_ROWS * 16;
 pub(crate) const RESIDENT_JOURNAL_MASK_WORD: usize = RESIDENT_JOURNAL_ID_WORDS;
 pub(crate) const RESIDENT_JOURNAL_MASK_WORDS: usize = infr_core::backend::MAX_DECODE_ROWS;
+pub(crate) const RESIDENT_JOURNAL_JOB_COUNT_WORD: usize =
+    RESIDENT_JOURNAL_MASK_WORD + RESIDENT_JOURNAL_MASK_WORDS;
+pub(crate) const GPU_COPY_PREDICATE_WORDS: usize = 4;
+const GPU_COPY_PREPARE_PUSH_BYTES: u32 = 19 * 4;
+const GPU_OWNED_FAST_PUSH_BYTES: u32 = 31 * 4;
 pub(crate) const RESIDENT_JOURNAL_STATUS_WORD: usize =
     RESIDENT_JOURNAL_MASK_WORD + RESIDENT_JOURNAL_MASK_WORDS + 3;
 pub(crate) const RESIDENT_JOURNAL_WORDS: usize = RESIDENT_JOURNAL_STATUS_WORD + 1;
 pub(crate) const RESIDENT_JOURNAL_BYTES: usize = RESIDENT_JOURNAL_WORDS * 4;
+
+fn owned_recovery_seed_shape_valid(
+    control_bytes: usize,
+    journal_bytes: usize,
+    candidate_bytes: usize,
+    params: [u32; 4],
+) -> bool {
+    control_bytes == RESIDENT_CONTROL_BYTES
+        && candidate_bytes >= 48
+        && candidate_bytes % 16 == 0
+        && journal_bytes % RESIDENT_JOURNAL_BYTES == 0
+        && params[0] < params[1]
+        && params[1] as usize <= RESIDENT_MAX_LAYERS
+        && (params[0] as usize) < journal_bytes / RESIDENT_JOURNAL_BYTES
+}
+
+fn owned_notice_ranges(ordinal: usize, lengths: [usize; 3]) -> [(usize, usize); 3] {
+    assert!(ordinal < RESIDENT_MAX_LAYERS);
+    let job_bytes = RESIDENT_JOURNAL_ID_WORDS * 3 * 32;
+    let ranges = [
+        (0, 16),
+        (ordinal * RESIDENT_JOURNAL_BYTES, RESIDENT_JOURNAL_BYTES),
+        (ordinal * job_bytes, job_bytes),
+    ];
+    for ((offset, bytes), length) in ranges.into_iter().zip(lengths) {
+        assert!(offset <= length && bytes <= length - offset);
+    }
+    ranges
+}
+
+#[cfg(test)]
+#[test]
+fn gpu_owned_notice_ranges_cover_only_current_ordinal() {
+    let job_bytes = RESIDENT_JOURNAL_ID_WORDS * 3 * 32;
+    let lengths = [
+        RESIDENT_CONTROL_BYTES,
+        RESIDENT_MAX_LAYERS * RESIDENT_JOURNAL_BYTES,
+        RESIDENT_MAX_LAYERS * job_bytes,
+    ];
+    for ordinal in [0, 1, 16, 47, RESIDENT_MAX_LAYERS - 1] {
+        let ranges = owned_notice_ranges(ordinal, lengths);
+        assert_eq!(ranges[0], (0, 16));
+        assert_eq!(
+            ranges[1],
+            (ordinal * RESIDENT_JOURNAL_BYTES, RESIDENT_JOURNAL_BYTES)
+        );
+        assert_eq!(ranges[2], (ordinal * job_bytes, job_bytes));
+        for component in 0..3 {
+            let mut truncated = lengths;
+            truncated[component] = ranges[component].0 + ranges[component].1 - 1;
+            assert!(std::panic::catch_unwind(|| owned_notice_ranges(ordinal, truncated)).is_err());
+        }
+    }
+    assert!(
+        std::panic::catch_unwind(|| owned_notice_ranges(RESIDENT_MAX_LAYERS, lengths)).is_err()
+    );
+}
 
 const RESIDENT_DISPATCH_CAPACITY: usize = 8192;
 const RESIDENT_REGION_CAPACITY: usize = 4096;
@@ -113,13 +246,13 @@ fn flash_split_count(
 ) -> u32 {
     match configured.and_then(|v| u32::try_from(v).ok()) {
         Some(v) => v,
-        None if prefer_deep_splits && kv_len >= 65_536 => 8,
+        None if prefer_deep_splits && kv_len >= 65_536 => VulkanCfg::MAX_ATTENTION_SPLITS as u32,
         None => {
             if base_wg >= 1024 || kv_len < 4096 {
                 1
             } else {
                 (2048 / base_wg.max(1))
-                    .clamp(2, 8)
+                    .clamp(2, VulkanCfg::MAX_ATTENTION_SPLITS as u32)
                     .min((kv_len / 2048).max(1) as u32)
             }
         }
@@ -429,6 +562,142 @@ fn splitk_reduce_extents(m: usize, n: usize) -> (usize, usize) {
 
 /// A batched-MoE expert-GEMM kernel variant: `(kernel name, SPIR-V)`.
 type MmqKern = (&'static str, &'static [u32]);
+
+pub(crate) fn q8_prefill_bm128_applies(
+    enabled: bool,
+    measured: bool,
+    default_ag: bool,
+    dtype: infr_core::DType,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
+    enabled
+        && measured
+        && default_ag
+        && dtype == infr_core::DType::Q8_0
+        && matches!(
+            (k, n, m),
+            (3072, 8192, 512)
+                | (8192, 3072, 1024)
+                | (3072, 12288, 512 | 1024)
+                | (2560, 10240, 1024)
+                | (2560, 12288, 1024)
+        )
+}
+
+fn kquant_packed_applies(
+    enabled: bool,
+    measured: bool,
+    small: bool,
+    paged: bool,
+    wide_bn: bool,
+    dtype: infr_core::DType,
+    k: usize,
+    n: usize,
+) -> bool {
+    enabled
+        && measured
+        && small
+        && match (dtype, paged, wide_bn) {
+            (infr_core::DType::Q3K, _, false) => {
+                matches!((k, n), (3072, 1024) | (1024, 3072))
+            }
+            (infr_core::DType::Q6K, true, false) | (infr_core::DType::Q6K, false, true) => {
+                matches!((k, n), (2048, 512) | (512, 2048))
+            }
+            _ => false,
+        }
+}
+
+#[test]
+fn packed_mmq_preserves_wide_and_unmeasured_fallbacks() {
+    use infr_core::DType;
+    for enabled in [false, true] {
+        for measured in [false, true] {
+            for small in [false, true] {
+                for paged in [false, true] {
+                    for wide_bn in [false, true] {
+                        for dtype in [
+                            DType::Q2K,
+                            DType::Q3K,
+                            DType::Q4K,
+                            DType::Q5K,
+                            DType::Q6K,
+                            DType::Q8_0,
+                        ] {
+                            for (k, n) in [
+                                (3072, 1024),
+                                (1024, 3072),
+                                (2048, 512),
+                                (512, 2048),
+                                (2560, 640),
+                                (640, 2560),
+                                (512, 1920),
+                            ] {
+                                let geometry = match dtype {
+                                    DType::Q3K => matches!((k, n), (3072, 1024) | (1024, 3072)),
+                                    DType::Q6K => matches!((k, n), (2048, 512) | (512, 2048)),
+                                    _ => false,
+                                };
+                                let route = match dtype {
+                                    DType::Q3K => !wide_bn,
+                                    DType::Q6K => paged != wide_bn,
+                                    _ => false,
+                                };
+                                assert_eq!(
+                                    kquant_packed_applies(
+                                        enabled, measured, small, paged, wide_bn, dtype, k, n
+                                    ),
+                                    enabled && measured && small && geometry && route,
+                                    "dtype={dtype:?} paged={paged} wide={wide_bn} k={k} n={n}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn iq4_pair_lut_applies(
+    enabled: bool,
+    measured_device: bool,
+    dtype: infr_core::DType,
+    k: usize,
+    n: usize,
+) -> bool {
+    enabled && measured_device && dtype == infr_core::DType::Iq4Nl && k == 640 && n == 2560
+}
+
+#[cfg(test)]
+#[test]
+fn iq4_pair_lut_keeps_unmeasured_devices_and_shapes_on_fallback() {
+    use infr_core::DType::*;
+    for dtype in [
+        Iq4Nl, Iq4Xs, Iq2S, Iq2Xs, Iq3S, Iq3Xxs, Q2K, Q3K, Q4K, Q5K, Q6K, Q8_0,
+    ] {
+        for (k, n) in [
+            (640, 2560),
+            (2560, 640),
+            (512, 2048),
+            (1024, 3072),
+            (32, 64),
+            (640, 512),
+        ] {
+            for enabled in [false, true] {
+                for measured in [false, true] {
+                    let expected = enabled && measured && dtype == Iq4Nl && (k, n) == (640, 2560);
+                    assert_eq!(
+                        iq4_pair_lut_applies(enabled, measured, dtype, k, n),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+}
 
 /// ONE dtype-keyed source of truth for batched-MoE expert-GEMM kernel selection, driving BOTH the
 /// resident (`_xp`) dispatch in [`Recorder::matmul_mmq_experts`] and the paged (`_xpg`) one in
@@ -998,15 +1267,358 @@ fn bda_out_f_chunks(
     Ok(chunks)
 }
 
+struct PreparedPool {
+    pool: vk::CommandPool,
+    cmd: vk::CommandBuffer,
+}
+
+/// Idle pools only: every recording or pending prefix exclusively owns its pool.
+#[derive(Default)]
+pub(crate) struct PreparedPoolCache {
+    pools: std::sync::Mutex<Vec<PreparedPool>>,
+}
+
+impl PreparedPoolCache {
+    const RETAIN: usize = 4;
+
+    /// Called by VulkanShared teardown before destroying the device.
+    pub(crate) fn destroy(&self, device: &ash::Device) {
+        for entry in self.pools.lock().unwrap().drain(..) {
+            unsafe { device.destroy_command_pool(entry.pool, None) };
+        }
+    }
+}
+
+struct PreparedPoolLease {
+    shared: std::sync::Arc<crate::VulkanShared>,
+    entry: Option<PreparedPool>,
+}
+
+impl PreparedPoolLease {
+    fn new(backend: &VulkanBackend) -> Result<Self> {
+        let shared = &backend.shared;
+        let cached = shared.recorder_prepared_pools.pools.lock().unwrap().pop();
+        let entry = match cached {
+            Some(entry) => entry,
+            None => {
+                let pool = unsafe {
+                    shared.device.create_command_pool(
+                        &vk::CommandPoolCreateInfo::default()
+                            .queue_family_index(shared.queue_family_index)
+                            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                        None,
+                    )
+                }
+                .map_err(|e| be(format!("create prepared command pool: {e}")))?;
+                let cmd = match unsafe {
+                    shared.device.allocate_command_buffers(
+                        &vk::CommandBufferAllocateInfo::default()
+                            .command_pool(pool)
+                            .level(vk::CommandBufferLevel::PRIMARY)
+                            .command_buffer_count(1),
+                    )
+                } {
+                    Ok(cmds) => cmds[0],
+                    Err(e) => {
+                        unsafe { shared.device.destroy_command_pool(pool, None) };
+                        return Err(be(format!("allocate prepared command buffer: {e}")));
+                    }
+                };
+                PreparedPool { pool, cmd }
+            }
+        };
+        Ok(Self {
+            shared: std::sync::Arc::clone(shared),
+            entry: Some(entry),
+        })
+    }
+}
+
+impl Drop for PreparedPoolLease {
+    fn drop(&mut self) {
+        let Some(entry) = self.entry.take() else {
+            return;
+        };
+        let device = &self.shared.device;
+        // The owner drops only before submission or after completion; neither needs an idle wait.
+        let reset =
+            unsafe { device.reset_command_pool(entry.pool, vk::CommandPoolResetFlags::empty()) };
+        if reset.is_ok() {
+            let mut cache = self.shared.recorder_prepared_pools.pools.lock().unwrap();
+            if cache.len() < PreparedPoolCache::RETAIN {
+                cache.push(entry);
+                return;
+            }
+        }
+        unsafe { device.destroy_command_pool(entry.pool, None) };
+    }
+}
+
+/// An unsubmitted, single-use primary prefix. Bound buffers remain caller-owned unless retained
+/// explicitly; the decode plan must validate their epoch and bindings before attaching this packet.
+pub struct PreparedCommand {
+    shared: std::sync::Arc<crate::VulkanShared>,
+    cmd: vk::CommandBuffer,
+    dispatches: usize,
+    private_pool: Option<PreparedPoolLease>,
+    pools: Vec<vk::DescriptorPool>,
+    buffer_keepalive: Vec<std::sync::Arc<dyn Buffer>>,
+    dedicated_transfer_wait: u64,
+    timeline_query: Option<crate::timeline::Query>,
+}
+
+impl PreparedCommand {
+    pub fn dispatches(&self) -> usize {
+        self.dispatches
+    }
+
+    pub(crate) fn trace_compatible(&self) -> bool {
+        // A packet recorded outside a sampled window has no timestamps. Re-record the first
+        // sampled consumer rather than silently reporting only its suffix as the whole step.
+        !infr_core::timeline::device_enabled()
+            || infr_core::timeline::context().is_none()
+            || self.timeline_query.is_some()
+    }
+
+    /// Submit the acknowledged primary directly; its private pool travels to the fence.
+    pub(crate) fn submit(mut self, backend: &VulkanBackend) -> Result<PendingSegment> {
+        if crate::adapter::preparing_commands()
+            || !std::sync::Arc::ptr_eq(&self.shared, &backend.shared)
+        {
+            return Err(be(
+                "prepared submission requires the owning execution device",
+            ));
+        }
+        let device = &self.shared.device;
+        let fence = match self.shared.recorder_fences.lock().unwrap().pop() {
+            Some(fence) => {
+                if let Err(error) = unsafe { device.reset_fences(&[fence]) } {
+                    unsafe { device.destroy_fence(fence, None) };
+                    return Err(be(format!("reset prepared fence: {error}")));
+                }
+                fence
+            }
+            None => unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
+                .map_err(|error| be(format!("create prepared fence: {error}")))?,
+        };
+        let submit_span = infr_core::timeline::span("queue_submit");
+        if let Some(query) = self.timeline_query.as_mut() {
+            query.activate_prepared(infr_core::timeline::context());
+            query.submitted();
+        }
+        let result = self.shared.queue_submit_commands_recovering(
+            &[self.cmd],
+            fence,
+            Some(self.dispatches),
+            "prepared queue_submit",
+            self.dedicated_transfer_wait,
+        );
+        drop(submit_span);
+        if let Err(error) = result {
+            self.shared.recorder_fences.lock().unwrap().push(fence);
+            return Err(be(format!("prepared queue_submit: {error}")));
+        }
+        let dedicated_transfer_wait = self.dedicated_transfer_wait;
+        Ok(PendingSegment {
+            shared: std::sync::Arc::clone(&self.shared),
+            fence: Some(fence),
+            cmd: vk::CommandBuffer::null(),
+            pools: Vec::new(),
+            buffer_keepalive: Vec::new(),
+            dispatches: self.dispatches,
+            dedicated_transfer_wait,
+            prepared_prefix: Some(self),
+            submit_query_pool: vk::QueryPool::null(),
+            submit_timing_token: None,
+            submit_pager_profile: false,
+            timeline_query: None,
+            waiter: None,
+            notice_producer: None,
+            notice_fence_lease: None,
+            host_ready_wait: None,
+        })
+    }
+}
+
+impl Drop for PreparedCommand {
+    fn drop(&mut self) {
+        // Invalidate command-buffer references before returning descriptor pools and buffers.
+        self.private_pool.take();
+        self.shared
+            .recorder_desc_pools
+            .lock()
+            .unwrap()
+            .extend(self.pools.drain(..));
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DescriptorAccess {
+    buffer: vk::Buffer,
+    start: u64,
+    end: u64,
+    write: bool,
+}
+
+impl DescriptorAccess {
+    fn overlaps(self, other: Self) -> bool {
+        self.buffer == other.buffer && self.start < other.end && other.start < self.end
+    }
+}
+
+#[derive(Default)]
+struct IndependentDispatchBatch {
+    accesses: Vec<DescriptorAccess>,
+    closed: bool,
+}
+
+impl IndependentDispatchBatch {
+    fn accept(&mut self, buffers: &[vk::DescriptorBufferInfo], outputs: usize) -> bool {
+        if self.closed || outputs > buffers.len() || self.accesses.len() + buffers.len() > 64 {
+            self.closed = true;
+            return false;
+        }
+        let split = buffers.len() - outputs;
+        let mut current = Vec::with_capacity(buffers.len());
+        for (index, buffer) in buffers.iter().enumerate() {
+            let end = if buffer.range == vk::WHOLE_SIZE {
+                Some(u64::MAX)
+            } else {
+                buffer.offset.checked_add(buffer.range)
+            };
+            if buffer.range == 0 || end.is_none_or(|end| end <= buffer.offset) {
+                self.closed = true;
+                return false;
+            }
+            let access = DescriptorAccess {
+                buffer: buffer.buffer,
+                start: buffer.offset,
+                end: end.unwrap(),
+                write: index >= split,
+            };
+            if self
+                .accesses
+                .iter()
+                .any(|&old| (old.write || access.write) && access.overlaps(old))
+            {
+                // An internal helper dependency ends the optimization, not its barrier.
+                self.closed = true;
+                return false;
+            }
+            current.push(access);
+        }
+        self.accesses.extend(current);
+        true
+    }
+}
+
+fn gpu_copy_overlap_eligible(
+    requested: bool,
+    verify: bool,
+    _rows: usize,
+    _independent_rows: bool,
+    pair_enabled: bool,
+    immutable: bool,
+    miss_predicate: bool,
+    indirect: bool,
+    mtp_enabled: bool,
+) -> bool {
+    requested
+        && !mtp_enabled
+        // Lookup and MTP Verify keep the existing serial-copy schedule.
+        && !verify
+        && !pair_enabled
+        && immutable
+        && miss_predicate
+        && !indirect
+}
+
+fn gpu_copy_prepare_push(
+    params: [u32; 8],
+    immutable: bool,
+    extra: [u32; 9],
+    groups: u32,
+) -> [u32; 19] {
+    assert!((1..=8).contains(&groups));
+    let mut push = [0u32; 19];
+    push[..8].copy_from_slice(&params);
+    push[8] = u32::from(immutable);
+    push[9..18].copy_from_slice(&extra);
+    push[18] = groups;
+    push
+}
+
+fn gpu_owned_fast_push(base: &[u32; 19], geometry: &[u32; 12]) -> [u32; 31] {
+    let mut push = [0; 31];
+    push[..19].copy_from_slice(base);
+    push[19..].copy_from_slice(geometry);
+    push
+}
+
+fn owned_prepare_fused_eligible(subgroup_scan: bool, base: &[u32; 19], wider_trial: bool) -> bool {
+    let used = base[6];
+    subgroup_scan
+        && (base[0] == base[6]
+            || (wider_trial && matches!(used, 8 | 10) && base[0] == used * 2)
+            // extra[3] is pool_start0 at base[12]. Only READY recovery was qualified
+            // beyond two rows; ordinary non-TopK admission keeps split preparation.
+            || (wider_trial
+                && base[12] == 1
+                && ((matches!(used, 8 | 10)
+                    && base[0].is_multiple_of(used)
+                    && (3..=8).contains(&(base[0] / used)))
+                    || (used == 16 && base[0] == 8 * 16))))
+}
+
+fn gpu_copy_payload_args_barrier(
+    buffer: vk::Buffer,
+    sub_offset: usize,
+    ordinal: usize,
+) -> vk::BufferMemoryBarrier<'static> {
+    vk::BufferMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+        .dst_access_mask(vk::AccessFlags::INDIRECT_COMMAND_READ)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .buffer(buffer)
+        .offset((sub_offset + (ordinal * GPU_COPY_PREDICATE_WORDS + 1) * 4) as u64)
+        .size(12)
+}
+
+fn serial_owned_payload_read_retirement_eligible(
+    payload_reset: bool,
+    normal_tracking: bool,
+    writes_empty: bool,
+    dirty_transfer: bool,
+) -> bool {
+    payload_reset && normal_tracking && writes_empty && !dirty_transfer
+}
+
+pub(crate) struct IndependentDispatchScope<'r, 'a> {
+    recorder: &'r Recorder<'a>,
+}
+
+impl Drop for IndependentDispatchScope<'_, '_> {
+    fn drop(&mut self) {
+        self.recorder.independent_dispatch.borrow_mut().take();
+        // Payload writes use BDA, outside descriptor tracking. Always join even if a
+        // helper forced an earlier conservative barrier or recording unwinds.
+        self.recorder.global_barrier();
+    }
+}
+
 pub struct Recorder<'a> {
     be: &'a VulkanBackend,
     cmd: vk::CommandBuffer,
     /// Owns `cmd`, `pools` and `query_pool` until a submitted or persistent command takes them.
     /// The drop guard closes every recording-time `?`/unwind path without burdening each caller.
     owns_transient: std::cell::Cell<bool>,
+    prepared_pool: RefCell<Option<PreparedPoolLease>>,
+    prepared_prefix: RefCell<Option<PreparedCommand>>,
+    first_submit: RefCell<Option<std::sync::mpsc::SyncSender<()>>>,
     /// Descriptor pools, GROWN on exhaustion (a batched-MoE prefill chunk records ~50k dispatches
     /// — far beyond any fixed max_sets). The last entry is the active pool; `alloc_set` appends a
-    /// fresh one on ERROR_OUT_OF_POOL_MEMORY.
+    /// fresh one on ERROR_OUT_OF_POOL_MEMORY. Empty when push descriptors are available.
     pools: std::cell::RefCell<Vec<vk::DescriptorPool>>,
     /// Buffers referenced only by commands recorded in this recorder. Keeping an `Arc` here makes
     /// temporary transfer sources survive until blocking finish, or move into `PendingSegment`
@@ -1015,6 +1627,8 @@ pub struct Recorder<'a> {
     /// Highest dedicated-transfer timeline value whose writes this command buffer consumes.
     /// Zero preserves the ordinary main-queue submit byte-for-byte.
     dedicated_transfer_wait: std::cell::Cell<u64>,
+    /// Independent host release owns its semaphore until this recording's fence retires.
+    host_ready_wait: RefCell<Option<crate::host_ready::HostReadyWait>>,
     /// Buffers written since the last barrier (for read-after-write / write-after-write detection).
     dirty_writes: RefCell<HashSet<vk::Buffer>>,
     /// Buffers read since the last barrier (for write-after-read detection).
@@ -1027,6 +1641,7 @@ pub struct Recorder<'a> {
     indirect_pending: std::cell::Cell<bool>,
     conditional_active: std::cell::Cell<bool>,
     conditional_mutable: std::cell::Cell<bool>,
+    immutable_condition: std::cell::Cell<Option<(vk::Buffer, usize, usize)>>,
     resident_indirect: RefCell<Option<std::sync::Arc<ResidentIndirect>>>,
     indirect_region: std::cell::Cell<Option<(usize, usize)>>,
     /// Debug knobs, resolved ONCE at construction from the backend's `Config` — `debug.no_barrier`,
@@ -1068,6 +1683,7 @@ pub struct Recorder<'a> {
     t0: std::time::Instant,
     /// See [`Self::suppress_sync`]: while set, `sync` accumulates hazards without emitting.
     suppress: std::cell::Cell<bool>,
+    independent_dispatch: RefCell<Option<IndependentDispatchBatch>>,
     /// Dispatches recorded into THIS command buffer so far (counted at the `stamp` chokepoint).
     /// The submit splitter reads it to decide when the segment has grown to the device's cap —
     /// see `VulkanShared::submit_dispatch_cap` and `adapter::execute_static`.
@@ -1115,38 +1731,59 @@ fn intern_label(s: String) -> &'static str {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl<'a> Recorder<'a> {
     pub(crate) fn new(backend: &'a VulkanBackend) -> Result<Self> {
-        Self::new_inner(backend, false)
+        Self::new_inner(backend, false, false)
     }
 
     /// A recorder whose command buffer is resubmittable (no ONE_TIME_SUBMIT). `finish_record` returns
     /// a [`RecordedCmd`] the caller can replay instead of re-recording. Profiling is disabled on this
     /// path (the recorder is gone after recording, so per-replay timestamps can't be reported).
     pub(crate) fn new_persistent(backend: &'a VulkanBackend) -> Result<Self> {
-        Self::new_inner(backend, true)
+        Self::new_inner(backend, true, false)
     }
 
-    fn new_inner(backend: &'a VulkanBackend, persistent: bool) -> Result<Self> {
+    /// Record a one-use prefix on a private pool without submitting any GPU work.
+    /// Per-op profiling stays disabled; optional timeline queries travel with the command.
+    pub(crate) fn new_prepared(backend: &'a VulkanBackend) -> Result<Self> {
+        Self::new_inner(backend, false, true)
+    }
+
+    fn new_inner(backend: &'a VulkanBackend, persistent: bool, prepared: bool) -> Result<Self> {
         let _timeline_acquire = infr_core::timeline::span("recorder_acquire");
         let profile_acquire_t0 = pager_profile::start();
         let device = &backend.shared.device;
-        let cmd_pool = backend.shared.cmd_pool.lock().unwrap();
-        let cmd = match backend.shared.recorder_cmds.lock().unwrap().pop() {
-            Some(cmd) => {
-                unsafe { device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()) }
-                    .map_err(|e| be(format!("reset recycled cmd buffer: {e}")))?;
-                cmd
-            }
-            None => unsafe {
-                device.allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(*cmd_pool)
-                        .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(1),
-                )
-            }
-            .map_err(|e| be(format!("alloc cmd buffer: {e}")))?[0],
+        let prepared_pool = if prepared {
+            Some(PreparedPoolLease::new(backend)?)
+        } else {
+            None
         };
-        drop(cmd_pool);
+        let recycle_cmd = |cmd| {
+            if !prepared {
+                backend.shared.recorder_cmds.lock().unwrap().push(cmd);
+            }
+        };
+        let cmd = if let Some(lease) = &prepared_pool {
+            lease.entry.as_ref().unwrap().cmd
+        } else {
+            let cmd_pool = backend.shared.cmd_pool.lock().unwrap();
+            match backend.shared.recorder_cmds.lock().unwrap().pop() {
+                Some(cmd) => {
+                    unsafe {
+                        device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+                    }
+                    .map_err(|e| be(format!("reset recycled cmd buffer: {e}")))?;
+                    cmd
+                }
+                None => unsafe {
+                    device.allocate_command_buffers(
+                        &vk::CommandBufferAllocateInfo::default()
+                            .command_pool(*cmd_pool)
+                            .level(vk::CommandBufferLevel::PRIMARY)
+                            .command_buffer_count(1),
+                    )
+                }
+                .map_err(|e| be(format!("alloc cmd buffer: {e}")))?[0],
+            }
+        };
         let begin_flags = if persistent {
             // SIMULTANEOUS_USE: the chained decode submits the SAME recorded command buffer n
             // times in one vkQueueSubmit (see RecordedCmd::replay_n) — the buffer must be legal
@@ -1161,29 +1798,36 @@ impl<'a> Recorder<'a> {
                 &vk::CommandBufferBeginInfo::default().flags(begin_flags),
             )
         } {
-            backend.shared.recorder_cmds.lock().unwrap().push(cmd);
+            recycle_cmd(cmd);
             return Err(be(format!("begin cmd buffer: {e}")));
         }
 
-        // Big pool: one descriptor set per recorded op.
-        let pool = match backend.shared.recorder_desc_pools.lock().unwrap().pop() {
-            Some(pool) => {
-                if let Err(e) = unsafe {
-                    device.reset_descriptor_pool(pool, vk::DescriptorPoolResetFlags::empty())
-                } {
-                    unsafe { device.destroy_descriptor_pool(pool, None) };
-                    backend.shared.recorder_cmds.lock().unwrap().push(cmd);
-                    return Err(be(format!("reset recycled descriptor pool: {e}")));
-                }
-                pool
-            }
-            None => match Self::new_desc_pool(device) {
-                Ok(pool) => pool,
-                Err(e) => {
-                    backend.shared.recorder_cmds.lock().unwrap().push(cmd);
-                    return Err(e);
-                }
-            },
+        // Only the descriptor-set fallback needs a pool; push descriptors bind inline.
+        let pool = if backend.shared.push_descriptor.is_some() {
+            None
+        } else {
+            Some(
+                match backend.shared.recorder_desc_pools.lock().unwrap().pop() {
+                    Some(pool) => {
+                        if let Err(e) = unsafe {
+                            device
+                                .reset_descriptor_pool(pool, vk::DescriptorPoolResetFlags::empty())
+                        } {
+                            unsafe { device.destroy_descriptor_pool(pool, None) };
+                            recycle_cmd(cmd);
+                            return Err(be(format!("reset recycled descriptor pool: {e}")));
+                        }
+                        pool
+                    }
+                    None => match Self::new_desc_pool(device) {
+                        Ok(pool) => pool,
+                        Err(e) => {
+                            recycle_cmd(cmd);
+                            return Err(e);
+                        }
+                    },
+                },
+            )
         };
 
         // Per-DISPATCH stamps (auto-labels): a batched prefill chunk can record tens of
@@ -1198,7 +1842,7 @@ impl<'a> Recorder<'a> {
         let dbgcfg = &backend.cfg().debug;
         let (bda_chunk_elem_cap, bda_chunk_byte_cap) =
             bda_chunk_caps(&backend.cfg().kernels.vulkan);
-        let prof_ops = infr_core::prof::enabled(profcfg) && !persistent;
+        let prof_ops = infr_core::prof::enabled(profcfg) && !persistent && !prepared;
         let op_shapes = prof_ops && profcfg.op_shapes;
         let query_pool = if prof_ops {
             let qp = match unsafe {
@@ -1211,13 +1855,15 @@ impl<'a> Recorder<'a> {
             } {
                 Ok(qp) => qp,
                 Err(e) => {
-                    backend.shared.recorder_cmds.lock().unwrap().push(cmd);
-                    backend
-                        .shared
-                        .recorder_desc_pools
-                        .lock()
-                        .unwrap()
-                        .push(pool);
+                    recycle_cmd(cmd);
+                    if let Some(pool) = pool {
+                        backend
+                            .shared
+                            .recorder_desc_pools
+                            .lock()
+                            .unwrap()
+                            .push(pool);
+                    }
                     return Err(be(format!("create query pool: {e}")));
                 }
             };
@@ -1227,25 +1873,26 @@ impl<'a> Recorder<'a> {
             vk::QueryPool::null()
         };
 
-        let (submit_query_pool, submit_timing_token, submit_pager_profile) = if !persistent {
-            backend.shared.take_submit_timing_query().map_or(
-                (vk::QueryPool::null(), None, false),
-                |(pool, token, pager_profile)| {
-                    unsafe {
-                        device.cmd_reset_query_pool(cmd, pool, 0, 2);
-                        device.cmd_write_timestamp(
-                            cmd,
-                            vk::PipelineStageFlags::TOP_OF_PIPE,
-                            pool,
-                            0,
-                        );
-                    }
-                    (pool, token, pager_profile)
-                },
-            )
-        } else {
-            (vk::QueryPool::null(), None, false)
-        };
+        let (submit_query_pool, submit_timing_token, submit_pager_profile) =
+            if !persistent && !prepared {
+                backend.shared.take_submit_timing_query().map_or(
+                    (vk::QueryPool::null(), None, false),
+                    |(pool, token, pager_profile)| {
+                        unsafe {
+                            device.cmd_reset_query_pool(cmd, pool, 0, 2);
+                            device.cmd_write_timestamp(
+                                cmd,
+                                vk::PipelineStageFlags::TOP_OF_PIPE,
+                                pool,
+                                0,
+                            );
+                        }
+                        (pool, token, pager_profile)
+                    },
+                )
+            } else {
+                (vk::QueryPool::null(), None, false)
+            };
 
         if let Some(elapsed) = pager_profile::elapsed(profile_acquire_t0) {
             pager_profile::record_command_recorder_acquire(elapsed);
@@ -1267,13 +1914,15 @@ impl<'a> Recorder<'a> {
                         }
                     }
                     backend.shared.return_submit_timing_query(submit_query_pool);
-                    backend.shared.recorder_cmds.lock().unwrap().push(cmd);
-                    backend
-                        .shared
-                        .recorder_desc_pools
-                        .lock()
-                        .unwrap()
-                        .push(pool);
+                    recycle_cmd(cmd);
+                    if let Some(pool) = pool {
+                        backend
+                            .shared
+                            .recorder_desc_pools
+                            .lock()
+                            .unwrap()
+                            .push(pool);
+                    }
                     return Err(error);
                 }
             }
@@ -1282,9 +1931,13 @@ impl<'a> Recorder<'a> {
             be: backend,
             cmd,
             owns_transient: std::cell::Cell::new(true),
-            pools: std::cell::RefCell::new(vec![pool]),
+            prepared_pool: RefCell::new(prepared_pool),
+            prepared_prefix: RefCell::new(None),
+            first_submit: RefCell::new(None),
+            pools: std::cell::RefCell::new(pool.into_iter().collect()),
             buffer_keepalive: std::cell::RefCell::new(Vec::new()),
             dedicated_transfer_wait: std::cell::Cell::new(0),
+            host_ready_wait: RefCell::new(None),
             dirty_writes: RefCell::new(HashSet::new()),
             dirty_reads: RefCell::new(HashSet::new()),
             dirty_transfer: std::cell::Cell::new(false),
@@ -1292,11 +1945,12 @@ impl<'a> Recorder<'a> {
             indirect_pending: std::cell::Cell::new(false),
             conditional_active: std::cell::Cell::new(false),
             conditional_mutable: std::cell::Cell::new(true),
+            immutable_condition: std::cell::Cell::new(None),
             resident_indirect: RefCell::new(None),
             indirect_region: std::cell::Cell::new(None),
             no_barrier: dbgcfg.no_barrier,
             full_barrier: dbgcfg.full_barrier,
-            stages: profcfg.stages,
+            stages: profcfg.stages && !prepared,
             prof_ops,
             op_shapes,
             query_pool,
@@ -1304,13 +1958,18 @@ impl<'a> Recorder<'a> {
             submit_timing_token: std::cell::Cell::new(submit_timing_token),
             submit_pager_profile: std::cell::Cell::new(submit_pager_profile),
             timeline_query: RefCell::new(timeline_query),
-            timeline_lifetime: RefCell::new(infr_core::timeline::span("recorder_lifetime")),
+            timeline_lifetime: RefCell::new(if prepared {
+                None
+            } else {
+                infr_core::timeline::span("recorder_lifetime")
+            }),
             ts_labels: RefCell::new(Vec::new()),
             ts_dropped: std::cell::Cell::new(0),
             next_label: std::cell::Cell::new(None),
             persistent,
             t0: std::time::Instant::now(),
             suppress: std::cell::Cell::new(false),
+            independent_dispatch: RefCell::new(None),
             dispatches: std::cell::Cell::new(0),
             bda_chunk_elem_cap,
             bda_chunk_byte_cap,
@@ -1343,9 +2002,147 @@ impl<'a> Recorder<'a> {
         (self.bda_chunk_elem_cap, self.bda_chunk_byte_cap)
     }
 
-    /// Dispatches recorded into this command buffer so far — the submit splitter's trigger.
+    /// Dispatches in this submit, including any prepared prefix; the submit splitter's trigger.
     pub fn dispatches(&self) -> usize {
         self.dispatches.get()
+            + self
+                .prepared_prefix
+                .borrow()
+                .as_ref()
+                .map_or(0, |cmd| cmd.dispatches)
+    }
+
+    /// Finish a private-pool recorder without submission or a GPU wait.
+    pub(crate) fn finish_prepared(self) -> Result<PreparedCommand> {
+        if self.host_ready_wait.borrow().is_some() {
+            return Err(be(
+                "host-gated recovery cannot become a reusable preparation",
+            ));
+        }
+        if self.prepared_pool.borrow().is_none() {
+            return Err(be("finish_prepared requires a prepared recorder"));
+        }
+        self.end_conditional();
+        if let Some(query) = self.timeline_query.borrow_mut().as_mut() {
+            query.close(
+                self.dispatches.get(),
+                self.dedicated_transfer_wait.get(),
+                0,
+                0,
+            );
+        }
+        unsafe { self.be.shared.device.end_command_buffer(self.cmd) }
+            .map_err(|e| be(format!("end prepared cmd: {e}")))?;
+        self.owns_transient.set(false);
+        Ok(PreparedCommand {
+            shared: std::sync::Arc::clone(&self.be.shared),
+            cmd: self.cmd,
+            dispatches: self.dispatches.get(),
+            private_pool: self.prepared_pool.borrow_mut().take(),
+            pools: std::mem::take(&mut *self.pools.borrow_mut()),
+            buffer_keepalive: std::mem::take(&mut *self.buffer_keepalive.borrow_mut()),
+            dedicated_transfer_wait: self.dedicated_transfer_wait.get(),
+            timeline_query: self.timeline_query.borrow_mut().take(),
+        })
+    }
+
+    /// Attach a validated prefix before recording main work. The seed barrier in the main
+    /// command buffer makes prefix writes visible across the two primary command buffers.
+    pub(crate) fn prepend_prepared(&self, mut cmd: PreparedCommand) -> Result<()> {
+        if self.persistent
+            || self.prepared_pool.borrow().is_some()
+            || self.prepared_prefix.borrow().is_some()
+            || self.dispatches.get() != 0
+            || self.conditional_active.get()
+        {
+            return Err(be(
+                "prepared prefix requires an empty transient main recorder",
+            ));
+        }
+        if !std::sync::Arc::ptr_eq(&self.be.shared, &cmd.shared) {
+            return Err(be("prepared prefix belongs to another Vulkan device"));
+        }
+        if let Some(query) = cmd.timeline_query.as_mut() {
+            query.activate_prepared(infr_core::timeline::context());
+        }
+        self.dedicated_transfer_wait.set(
+            self.dedicated_transfer_wait
+                .get()
+                .max(cmd.dedicated_transfer_wait),
+        );
+        *self.prepared_prefix.borrow_mut() = Some(cmd);
+        self.seed_barrier();
+        Ok(())
+    }
+
+    /// Wake bounded host preparation only after this recorder's first successful submission.
+    pub(crate) fn on_first_submit(&self, sender: std::sync::mpsc::SyncSender<()>) {
+        // A speculative resident tail may be discarded and re-armed after miss recovery.
+        // Repeated arming of the same live recorder must still notify only once.
+        self.first_submit.borrow_mut().get_or_insert(sender);
+    }
+
+    fn notify_first_submit(&self) {
+        if let Some(sender) = self.first_submit.borrow_mut().take() {
+            let _ = sender.try_send(());
+        }
+    }
+
+    fn submit_commands(
+        &self,
+        fence: vk::Fence,
+        context: &str,
+    ) -> std::result::Result<(), vk::Result> {
+        let dispatches = self.dispatches();
+        let mut prefix = self.prepared_prefix.borrow_mut();
+        if let Some(query) = prefix
+            .as_mut()
+            .and_then(|prefix| prefix.timeline_query.as_mut())
+        {
+            query.submitted();
+        }
+        let commands = [
+            prefix
+                .as_ref()
+                .map_or(vk::CommandBuffer::null(), |cmd| cmd.cmd),
+            self.cmd,
+        ];
+        let batch = if prefix.is_some() {
+            &commands[..]
+        } else {
+            &commands[1..]
+        };
+        let host_ready = self.host_ready_wait.borrow();
+        let result = self.be.shared.queue_submit_commands_host_ready_recovering(
+            batch,
+            fence,
+            Some(dispatches),
+            context,
+            self.dedicated_transfer_wait.get(),
+            host_ready
+                .as_ref()
+                .map(|wait| (wait.timeline.semaphore, wait.value)),
+        );
+        #[cfg(test)]
+        if result.is_ok() {
+            crate::host_ready_combined_test_support::submitted(
+                &self.be.shared, host_ready.as_ref(), fence,
+            );
+        }
+        result
+    }
+
+    pub(crate) fn wait_for_host_ready(&self, wait: crate::host_ready::HostReadyWait) -> Result<()> {
+        if self.prepared_pool.borrow().is_some()
+            || self.host_ready_wait.borrow().is_some()
+            || !Arc::ptr_eq(&wait.timeline.shared, &self.be.shared)
+        {
+            return Err(be(
+                "host readiness requires a fresh owning-device recovery recorder",
+            ));
+        }
+        *self.host_ready_wait.borrow_mut() = Some(wait);
+        Ok(())
     }
 
     /// Disjoint-batch barrier suppression: while ON, recorded dispatches accumulate hazard state
@@ -1355,7 +2152,53 @@ impl<'a> Recorder<'a> {
     /// so the stage orders after its producers, and turn suppression OFF after the batch (the
     /// next normal dispatch then fences the whole batch with ONE barrier).
     pub fn suppress_sync(&self, on: bool) {
+        if let Some(batch) = self.independent_dispatch.borrow_mut().as_mut() {
+            batch.closed = true;
+        }
         self.suppress.set(on);
+    }
+
+    /// Caller proves BDA payload destinations do not alias hit weights. Descriptor hazards
+    /// are checked independently for every dispatch; any dependency restores normal sync.
+    pub(crate) fn independent_dispatch_scope(&self) -> IndependentDispatchScope<'_, 'a> {
+        assert!(self.independent_dispatch.borrow().is_none());
+        assert!(!self.suppress.get() && !self.indirect_pending.get());
+        assert!(self.resident_indirect.borrow().is_none());
+        assert!(!self.conditional_active.get() || !self.conditional_mutable.get());
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(
+                vk::AccessFlags::SHADER_WRITE
+                    | vk::AccessFlags::TRANSFER_WRITE
+                    | vk::AccessFlags::HOST_WRITE,
+            )
+            .dst_access_mask(
+                vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::SHADER_WRITE
+                    | vk::AccessFlags::TRANSFER_READ
+                    | vk::AccessFlags::TRANSFER_WRITE
+                    | vk::AccessFlags::INDIRECT_COMMAND_READ,
+            );
+        unsafe {
+            self.be.shared.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER
+                    | vk::PipelineStageFlags::TRANSFER
+                    | vk::PipelineStageFlags::HOST,
+                vk::PipelineStageFlags::COMPUTE_SHADER
+                    | vk::PipelineStageFlags::TRANSFER
+                    | vk::PipelineStageFlags::DRAW_INDIRECT,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+        }
+        *self.barriers.borrow_mut() += 1;
+        self.dirty_reads.borrow_mut().clear();
+        self.dirty_writes.borrow_mut().clear();
+        self.dirty_transfer.set(false);
+        *self.independent_dispatch.borrow_mut() = Some(IndependentDispatchBatch::default());
+        IndependentDispatchScope { recorder: self }
     }
 
     /// Override the label of the NEXT dispatch's timestamp. Consumed once — a pre-set override
@@ -1484,6 +2327,13 @@ impl<'a> Recorder<'a> {
     /// `dst_transfer` = this op consumes via a transfer (copy) rather than a compute shader.
     /// Returns once any required barrier is recorded; updates the hazard-tracking sets.
     fn sync(&self, reads: &[vk::Buffer], writes: &[vk::Buffer], dst_transfer: bool) {
+        if let Some(batch) = self.independent_dispatch.borrow_mut().as_mut() {
+            batch.closed = true;
+        }
+        self.sync_inner(reads, writes, dst_transfer);
+    }
+
+    fn sync_inner(&self, reads: &[vk::Buffer], writes: &[vk::Buffer], dst_transfer: bool) {
         if self.no_barrier {
             return;
         }
@@ -1712,7 +2562,35 @@ impl<'a> Recorder<'a> {
             write_bufs[i] = b.buffer;
         }
         self.indirect_pending.set(true);
-        self.sync(&all_reads[..split + 1], &write_bufs[..n_out], false);
+        let independent = self
+            .independent_dispatch
+            .borrow_mut()
+            .as_mut()
+            .is_some_and(|batch| {
+                if self.full_barrier || self.no_barrier || self.suppress.get() {
+                    batch.closed = true;
+                    return false;
+                }
+                let mut ranges = Vec::with_capacity(n + 1);
+                ranges.extend_from_slice(&buffers[..split]);
+                ranges.push(vk::DescriptorBufferInfo {
+                    buffer: args,
+                    offset: args_off,
+                    range: 12,
+                });
+                ranges.extend_from_slice(&buffers[split..]);
+                batch.accept(&ranges, n_out)
+            });
+        if independent {
+            self.dirty_reads
+                .borrow_mut()
+                .extend(all_reads[..split + 1].iter().copied());
+            self.dirty_writes
+                .borrow_mut()
+                .extend(write_bufs[..n_out].iter().copied());
+        } else {
+            self.sync(&all_reads[..split + 1], &write_bufs[..n_out], false);
+        }
         self.indirect_pending.set(false);
         self.bind_descriptors(k, buffers);
         let device = &self.be.shared.device;
@@ -1755,7 +2633,28 @@ impl<'a> Recorder<'a> {
         for (i, b) in buffers.iter().enumerate() {
             handles[i] = b.buffer;
         }
-        self.sync(&handles[..split], &handles[split..n], false);
+        let independent = self
+            .independent_dispatch
+            .borrow_mut()
+            .as_mut()
+            .is_some_and(|batch| {
+                if self.full_barrier || self.no_barrier || self.suppress.get() {
+                    batch.closed = true;
+                    false
+                } else {
+                    batch.accept(buffers, n_out)
+                }
+            });
+        if independent {
+            self.dirty_reads
+                .borrow_mut()
+                .extend(handles[..split].iter().copied());
+            self.dirty_writes
+                .borrow_mut()
+                .extend(handles[split..n].iter().copied());
+        } else {
+            self.sync_inner(&handles[..split], &handles[split..n], false);
+        }
         self.bind_descriptors(k, buffers);
         let device = &self.be.shared.device;
 
@@ -1833,6 +2732,10 @@ impl<'a> Recorder<'a> {
         let backing_len = match &vb.backing {
             Backing::BdaSub(block) => block.buf.size,
             Backing::UnifiedSub(handle) => handle.shard_bytes(),
+            Backing::RecordingAlias {
+                backing_len: Some(len),
+                ..
+            } => *len,
             _ => {
                 return vk::DescriptorBufferInfo {
                     buffer: vb.buffer,
@@ -1862,6 +2765,16 @@ impl<'a> Recorder<'a> {
             offset: vb.sub_offset as u64,
             range,
         }
+    }
+
+    /// Protocol arrays use runtime `.length()` as their logical directory boundary, not padding.
+    fn vkb_exact(b: &dyn Buffer) -> vk::DescriptorBufferInfo {
+        let mut view = Self::vkb(b);
+        assert!(b.len_bytes() != 0, "empty protocol buffer");
+        assert!(b.len_bytes() as u64 <= u64::from(crate::max_storage_buffer_range()));
+        assert!(view.range == vk::WHOLE_SIZE || b.len_bytes() as u64 <= view.range);
+        view.range = b.len_bytes() as u64;
+        view
     }
 
     /// [`Self::vkb`] with a leading f32-element offset, for binding one OUTPUT-row sub-range of an
@@ -2235,6 +3148,94 @@ impl<'a> Recorder<'a> {
             1,
             &push,
             groups,
+        );
+    }
+
+    pub(crate) fn can_silu_quant_q8(&self, rows: usize, k: usize) -> bool {
+        self.vk().silu_quant_q8
+            && self.be.prefers_silu_quant_q8()
+            && rows > 0
+            && rows <= 40960
+            && matches!(k, 512 | 640 | 1024)
+    }
+
+    pub(crate) fn silu_mul_quant_q8(
+        &self,
+        gate: &dyn Buffer,
+        up: Option<&dyn Buffer>,
+        qa: &dyn Buffer,
+        da: &dyn Buffer,
+        sa: &dyn Buffer,
+        rows: usize,
+        k: usize,
+        clamp: Option<f32>,
+    ) {
+        let (name, spv) = crate::gemm::silu_quant_q8_kernel(up.is_none());
+        let kernel = self
+            .be
+            .kernel_sg(name, spv, if up.is_some() { 5 } else { 4 }, 16, 32);
+        let pc = [
+            rows as u32,
+            k as u32,
+            u32::from(clamp.is_some()),
+            clamp.unwrap_or(0.0).to_bits(),
+        ];
+        let groups = (rows * (k / 32)) as u32;
+        let gy = groups.div_ceil(Self::MAX_GROUP_COUNT_X).max(1);
+        let gx = groups.div_ceil(gy);
+        let record = |buffers: &[vk::DescriptorBufferInfo]| {
+            self.dispatch3(kernel, buffers, 3, bytemuck::cast_slice(&pc), gx, gy, 1);
+        };
+        match up {
+            Some(up) => record(&[
+                Self::vkb(gate),
+                Self::vkb(up),
+                Self::vkb(qa),
+                Self::vkb(da),
+                Self::vkb(sa),
+            ]),
+            None => record(&[Self::vkb(gate), Self::vkb(qa), Self::vkb(da), Self::vkb(sa)]),
+        }
+    }
+
+    pub(crate) fn linear_q8_pair(
+        &self,
+        w_a: &dyn Buffer,
+        w_b: &dyn Buffer,
+        x: &dyn Buffer,
+        y_a: &dyn Buffer,
+        y_b: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        let aa = w_a.device_addr().expect("fixed paired Q8 weight address");
+        let ab = w_b.device_addr().expect("fixed paired Q8 weight address");
+        let pc = [
+            in_f as u32,
+            out_f as u32,
+            0,
+            0,
+            aa as u32,
+            (aa >> 32) as u32,
+            ab as u32,
+            (ab >> 32) as u32,
+        ];
+        self.label_gemv("linear_native_q8_pair", 1, in_f, out_f * 2);
+        let kernel = self.be.kernel_sg(
+            "linear_native_q8_pair",
+            crate::gemm::linear_native_q8_pair_spv(),
+            3,
+            32,
+            32,
+        );
+        self.dispatch3(
+            kernel,
+            &[Self::vkb(x), Self::vkb(y_a), Self::vkb(y_b)],
+            2,
+            bytemuck::cast_slice(&pc),
+            out_f as u32,
+            2,
+            1,
         );
     }
 
@@ -2706,6 +3707,20 @@ impl<'a> Recorder<'a> {
                 128,
                 64,
             )
+        };
+        // All six tuples have M%128==0 and production splits==1. No padding or split policy change.
+        let (name, bn, bm) = if q8_prefill_bm128_applies(
+            self.vk().q8_prefill_bm128,
+            self.be.prefers_q8_prefill_bm128(),
+            self.vk().gemm_warp && !self.vk().gemm_direct_a && !self.vk().gemm_wide_tile,
+            dtype,
+            m,
+            k,
+            n,
+        ) {
+            ("native_gemm_warp_q8_0_n128_ag_bm128", 128, 128)
+        } else {
+            (name, bn, bm)
         };
         self.label_gemm(name, m, k, n);
         // Weight read by its 64-bit address (`w_addr`): the picked A_GLOBAL tile, arena base
@@ -4434,13 +5449,15 @@ impl<'a> Recorder<'a> {
         dst: &dyn Buffer,
         rows: usize,
         ne: usize,
+        table_rows: u32,
     ) {
         let k = self
             .be
-            .kernel("gather_i32", crate::gemm::gather_i32_spv(), 3, 8);
-        let mut push = [0u8; 8];
+            .kernel("gather_i32", crate::gemm::gather_i32_spv(), 3, 12);
+        let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&table_rows.to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(table), Self::vkb(ids), Self::vkb(dst)],
@@ -4859,6 +5876,31 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    pub(crate) fn qwen_hc_up_mix(
+        &self,
+        low: &dyn Buffer,
+        weight: &dyn Buffer,
+        x: &dyn Buffer,
+        dst: &dyn Buffer,
+    ) {
+        let addr = weight.device_addr().expect("fixed HC up weight address");
+        let pc = [320, 2560, addr as u32, (addr >> 32) as u32];
+        let kernel = self.be.kernel_sg(
+            "qwen_hc_up_mix_e14_wave32",
+            crate::gemm::qwen_hc_up_mix_wave32_spv(),
+            3,
+            16,
+            32,
+        );
+        self.dispatch(
+            kernel,
+            &[Self::vkb(low), Self::vkb(x), Self::vkb(dst)],
+            1,
+            bytemuck::cast_slice(&pc),
+            640,
+        );
+    }
+
     pub fn qwen_hc_mix(
         &self,
         x: &dyn Buffer,
@@ -5129,7 +6171,7 @@ impl<'a> Recorder<'a> {
                 Self::vkb(residual_dst),
                 Self::vkb(normed_dst),
             ],
-            1,
+            2,
             &push,
             rows * hc,
         );
@@ -5165,6 +6207,48 @@ impl<'a> Recorder<'a> {
             1,
             &push,
             groups,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn qwen_ple_gate_norm_lds(
+        &self,
+        key: &dyn Buffer,
+        query: &dyn Buffer,
+        value: &dyn Buffer,
+        norm: &dyn Buffer,
+        gated_dst: &dyn Buffer,
+        normed_dst: &dyn Buffer,
+        rows: u32,
+        eps: f32,
+    ) {
+        assert!(matches!(rows, 1 | 2 | 4 | 9 | 512 | 513));
+        assert!(self.be.prefers_ple_gate_norm_lds());
+        let kernel = self.be.kernel_sg(
+            "qwen_ple_gate_norm_lds2560",
+            crate::gemm::qwen_ple_gate_norm_lds2560_spv(),
+            6,
+            16,
+            32,
+        );
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&4u32.to_ne_bytes());
+        push[4..8].copy_from_slice(&2560u32.to_ne_bytes());
+        push[8..12].copy_from_slice(&(rows * 4).to_ne_bytes());
+        push[12..16].copy_from_slice(&eps.to_ne_bytes());
+        self.dispatch(
+            kernel,
+            &[
+                Self::vkb(key),
+                Self::vkb(query),
+                Self::vkb(value),
+                Self::vkb(norm),
+                Self::vkb(gated_dst),
+                Self::vkb(normed_dst),
+            ],
+            2,
+            &push,
+            rows * 4,
         );
     }
 
@@ -5902,9 +6986,8 @@ impl<'a> Recorder<'a> {
         // capacity while each grinds a huge kv reduction → split the kv dim across gl_WorkGroupID.y
         // into partials, then sum them.
         let pv_base_wg = (mpad / 64) * (hdu / 64) * nh as u32;
-        // `pv_splits` is `Option<usize>` in the config; the dispatch count is a u32, so an
-        // out-of-range override falls back to the adaptive policy exactly as `.parse::<u32>().ok()`
-        // did at the old env read.
+        // Explicit splits are validated before device creation; automatic splits share the
+        // partial-buffer capacity used by the adapter.
         let n_splits = match self.vk().pv_splits.and_then(|v| u32::try_from(v).ok()) {
             Some(v) => v,
             None => {
@@ -5912,7 +6995,7 @@ impl<'a> Recorder<'a> {
                     1u32
                 } else {
                     (2048 / pv_base_wg.max(1))
-                        .clamp(2, 8)
+                        .clamp(2, VulkanCfg::MAX_ATTENTION_SPLITS as u32)
                         .min(kv_pad / 2048)
                         .max(1)
                 }
@@ -6014,18 +7097,7 @@ impl<'a> Recorder<'a> {
     ) {
         let mpad = (n.div_ceil(64) * 64) as u32;
         let base_wg = (mpad / 64) * nh as u32;
-        let n_splits = match self.vk().flash_splits.and_then(|v| u32::try_from(v).ok()) {
-            Some(v) => v,
-            None => {
-                if base_wg >= 1024 || kv_len < 4096 {
-                    1u32
-                } else {
-                    (2048 / base_wg.max(1))
-                        .clamp(2, 8)
-                        .min((kv_len / 2048).max(1) as u32)
-                }
-            }
-        };
+        let n_splits = flash_split_count(self.vk().flash_splits, base_wg, kv_len, false);
         // hd=128 → register-blocked partial (always via partial+combine). Other hd → the
         // 4-subgroup path: single fused kernel for n_splits==1, else the scalar partial.
         //
@@ -6434,6 +7506,17 @@ impl<'a> Recorder<'a> {
                 _ => unreachable!("register-O head dim must be 128 or 256"),
             }
         };
+        let (rname, rspv) = if self.vk().flash_pv_reuse
+            && hd == 256
+            && !bda
+            && n >= 512
+            && !self.be.caps().integrated
+            && (cw4 || br128_f16score)
+        {
+            crate::gemm::flash_pv_reuse_kernel(br128_f16score)
+        } else {
+            (rname, rspv)
+        };
         let plen: usize = if bda { 48 } else { 32 };
         let kp = self.be.kernel_sg(rname, rspv, 6, plen as u32, 32);
         let mut pp = [0u8; 48];
@@ -6809,6 +7892,66 @@ impl<'a> Recorder<'a> {
             &[Self::vkb(x), Self::vkb(nw), Self::vkb(y)],
             1,
             &push,
+            (rows * nheads) as u32,
+        );
+    }
+
+    /// Static packed F32 QK norm/RoPE -> typed F16 boundary -> committed segmented planar Q8.
+    /// The LUT remains output-last for the same BDA hazard tracking as store_q8_segmented.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qk_norm_rope_q8_segmented(
+        &self,
+        x: &dyn Buffer,
+        norm: &dyn Buffer,
+        positions: &dyn Buffer,
+        table: &dyn Buffer,
+        rows: usize,
+        nheads: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+        eps: f32,
+        pos: usize,
+        segment_shift: u32,
+        sections: Option<[u32; 4]>,
+    ) {
+        let (name, spv) = if sections.is_some() {
+            (
+                "qk_norm_rope_q8_segmented_mrope_q8",
+                crate::gemm::qk_norm_rope_q8_segmented_mrope_spv(),
+            )
+        } else {
+            (
+                "qk_norm_rope_q8_segmented_q8",
+                crate::gemm::qk_norm_rope_q8_segmented_spv(),
+            )
+        };
+        let kernel = self.be.kernel_sg(name, spv, 4, 48, 32);
+        let sections = sections.unwrap_or([16; 4]);
+        let push: [u32; 12] = [
+            rows as u32,
+            nheads as u32,
+            hd as u32,
+            rope_dim as u32,
+            theta.to_bits(),
+            eps.to_bits(),
+            pos as u32,
+            segment_shift,
+            sections[0],
+            sections[1],
+            sections[2],
+            sections[3],
+        ];
+        self.dispatch_wide(
+            kernel,
+            &[
+                Self::vkb(x),
+                Self::vkb(norm),
+                Self::vkb(positions),
+                Self::vkb(table),
+            ],
+            1,
+            bytemuck::cast_slice(&push),
             (rows * nheads) as u32,
         );
     }
@@ -7834,7 +8977,7 @@ impl<'a> Recorder<'a> {
         v_q8: bool,
         segment_shift: u32,
     ) {
-        self.attention_kv_split_impl(
+        self.attention_kv_split_segmented_canvas(
             q,
             kc,
             vc,
@@ -7853,6 +8996,59 @@ impl<'a> Recorder<'a> {
             scale,
             window,
             None,
+            k_q8,
+            v_q8,
+            segment_shift,
+        );
+    }
+
+    /// Segmented split-K with the same optional Canvas mask as the flat entry.
+    /// Ordinary callers retain the wrapper above; Canvas disables decode-only
+    /// specializations and uses attn_partial's existing lo+1 push-field encoding.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_kv_split_segmented_canvas(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        o: &dyn Buffer,
+        pm: &dyn Buffer,
+        pl: &dyn Buffer,
+        pacc: &dyn Buffer,
+        rows: usize,
+        pos: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        chunk: usize,
+        n_chunks: usize,
+        scale: f32,
+        window: usize,
+        canvas_lo: Option<usize>,
+        k_q8: bool,
+        v_q8: bool,
+        segment_shift: u32,
+    ) {
+        self.attention_kv_split_impl(
+            q,
+            kc,
+            vc,
+            o,
+            pm,
+            pl,
+            pacc,
+            rows,
+            pos,
+            kv_len,
+            nh,
+            nkv,
+            hd,
+            chunk,
+            n_chunks,
+            scale,
+            window,
+            canvas_lo,
             k_q8,
             v_q8,
             segment_shift as usize,
@@ -8147,7 +9343,33 @@ impl<'a> Recorder<'a> {
         // garbage rather than a crash. `window > 0` needs no such check: those builds carry the
         // modulo, which is the identity when the cache happens to be full-context.
         let ring_safe = segmented || window > 0 || cap == 0 || pos < cap / (nkv * hd);
-        let fast = if !batched
+        let segmented_fast = segmented
+            && !batched
+            && rows == 1
+            && canvas_lo.is_none()
+            && k_q8
+            && v_q8
+            && hd == 256
+            && nkv == 2
+            && matches!(nh, 16 | 32)
+            && window == 0
+            && chunk <= 1024
+            && (chunk <= 512 || self.vk().q8_decode_chunk1024)
+            && self.vk().q8_decode_segmented
+            && self.be.prefers_segmented_q8_decode()
+            && self.be.max_shared_memory_bytes() >= 32768
+            && self.vk().q8_decode_d8
+            && self.vk().q8_decode_ls256
+            && self.vk().q8_qk_f16
+            && self.vk().q8_pv_f16
+            && !crate::gemm::attn_decode_disabled(self.vk())
+            && !crate::gemm::attn_hd_spec_disabled(self.vk());
+        let fast = if segmented_fast {
+            Some(crate::gemm::attn_decode_segmented_kernel(
+                self.vk().q8_decode_gqa4 && (nh / nkv).is_multiple_of(4),
+                chunk > 512,
+            ))
+        } else if !batched
             && !segmented
             && !crate::gemm::attn_decode_disabled(self.vk())
             && bda
@@ -8203,7 +9425,12 @@ impl<'a> Recorder<'a> {
         };
         let (p1name, p1spv) = fast.unwrap_or((p1name, p1spv));
         let fused_gqa2 = p1name == "attn_decode_hd256_q8_gqa2";
-        let fused_gqa4 = p1name == "attn_decode_hd256_q8_gqa4";
+        let fused_gqa4 = matches!(
+            p1name,
+            "attn_decode_hd256_q8_gqa4"
+                | "attn_decode_hd256_q8_seg_gqa4"
+                | "attn_decode_hd256_q8_seg_gqa4_c1024"
+        );
         // The -DKV_BDA push grows by k_lo/k_hi/v_lo/v_hi (uvec2 splits) → 60 bytes; the bound push is
         // the base 44. n_buf stays 6 (q, kc, vc, pm, pl, pacc): kc/vc are inert-but-bound under BDA.
         let plen: usize = if bda { 60 } else { 44 };
@@ -10214,6 +11441,12 @@ impl<'a> Recorder<'a> {
         dst_byte_off: usize,
         scan: bool,
     ) {
+        let ordered = self.vk().qsa_topk_ordered
+            && self.be.prefers_qsa_topk_ordered()
+            && top_blocks == 512
+            && blocks > top_blocks
+            && blocks <= 65536;
+        let mask = blocks >= 7680 && blocks <= 65536;
         if let Some(work) = topk_work.filter(|_| rows == 1 && self.vk().qsa_topk_parallel) {
             let groups = blocks.div_ceil(1024).clamp(1, QSA_TOPK_PARALLEL_MAX_GROUPS);
             let state_base = groups * 256;
@@ -10256,7 +11489,14 @@ impl<'a> Recorder<'a> {
                 self.dispatch(select_k, &[Self::vkb(work)], 1, &radix_push, 1);
             }
 
-            let collect_k = if scan {
+            let collect_k = if ordered {
+                let (name, spv) = crate::gemm::qsa_ordered_topk_kernel(scan, true, mask);
+                if scan {
+                    self.be.kernel_sg(name, spv, 3, 12, 32)
+                } else {
+                    self.be.kernel(name, spv, 3, 12)
+                }
+            } else if scan {
                 self.be.kernel_sg(
                     "qsa_indexer_topk_collect_scan",
                     crate::gemm::qsa_indexer_topk_collect_scan_spv(),
@@ -10288,7 +11528,14 @@ impl<'a> Recorder<'a> {
                 1,
             );
         } else {
-            let topk_k = if scan {
+            let topk_k = if ordered {
+                let (name, spv) = crate::gemm::qsa_ordered_topk_kernel(scan, false, mask);
+                if scan {
+                    self.be.kernel_sg(name, spv, 2, 20, 32)
+                } else {
+                    self.be.kernel(name, spv, 2, 20)
+                }
+            } else if scan {
                 self.be.kernel_sg(
                     "qsa_indexer_topk_scan",
                     crate::gemm::qsa_indexer_topk_scan_spv(),
@@ -10612,6 +11859,42 @@ impl<'a> Recorder<'a> {
             &push[..push_bytes as usize],
             total_pairs.div_ceil(256),
         );
+    }
+
+    /// One-token recurrence and output gated norm. The graph matcher guarantees an in-place,
+    /// trace-free consumer; state ownership and the interleaved source layout stay unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn deltanet_gated_norm(
+        &self,
+        qkv: &dyn Buffer,
+        beta: &dyn Buffer,
+        alpha: &dyn Buffer,
+        acoef: &dyn Buffer,
+        dtbias: &dyn Buffer,
+        norm: &dyn Buffer,
+        gate: &dyn Buffer,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        nv: usize,
+        nk: usize,
+        delta_eps: f32,
+        norm_eps: f32,
+        sigmoid: bool,
+    ) {
+        let (name, spv) = crate::gemm::deltanet_fused_norm_kernel(sigmoid);
+        let kernel = self.be.kernel_sg(name, spv, 9, 20, 32);
+        // The first word was unused nv. A runtime dim mirrors rmsnorm_gate's FP32 arithmetic.
+        // The existing matcher fixes head_v/head_dim=128; nv still determines the grid below.
+        let kd = 128usize;
+        let push = [
+            128u32,
+            nk as u32,
+            delta_eps.to_bits(),
+            norm_eps.to_bits(),
+            (1.0f32 / (kd as f32).sqrt()).to_bits(),
+        ];
+        let buffers = [qkv, beta, alpha, acoef, dtbias, norm, gate, state, out].map(Self::vkb);
+        self.dispatch(kernel, &buffers, 2, bytemuck::cast_slice(&push), nv as u32);
     }
 
     /// Strided DeltaNet: q/k/v read from same source buffer at offsets 0, nk*kd, 2*nk*kd.
@@ -11565,17 +12848,21 @@ impl<'a> Recorder<'a> {
             assert!(n_tokens == 1 && !has_bias && !hash);
             assert!(input.len_bytes() >= 2560 * 4 && output.len_bytes() >= 2560 * 4);
         }
-        let fast_selected_norm_wave32 = self.vk().moe_topk_sg
-            && n_tokens == 1
-            && gating <= 1
-            && norm_w
-            && !has_bias
-            && (n_expert_groups <= 1 || n_expert_groups_used == 0)
-            && !hash
-            && n_expert > 0
-            && n_expert <= 512
-            && n_used > 0
-            && n_used <= 32;
+        let fast_selected_norm_wave32 = owned_topk::TopkParams {
+            rows: n_tokens,
+            experts: n_expert,
+            used: n_used,
+            scale,
+            gating,
+            norm_w,
+            has_bias,
+            groups: n_expert_groups,
+            groups_used: n_expert_groups_used,
+            hash,
+        }
+        .wave32(self.vk().moe_topk_sg);
+        #[cfg(test)]
+        owned_topk::test_note(self.be, |counts| counts.routers += 1);
         let k = if fast_selected_norm_wave32 {
             let (name, spv) = if input_tap.is_some() {
                 (
@@ -11818,6 +13105,43 @@ impl<'a> Recorder<'a> {
                 vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[mb],
+                &[],
+                &[],
+            );
+        }
+        *self.barriers.borrow_mut() += 1;
+    }
+
+    /// A following stage can reuse protocol storage before this submission's host fence
+    /// retires. Include immutable conditional readers: queue order alone is not a WAR edge.
+    pub(crate) fn resident_stage_handoff_barrier(&self) {
+        assert!(!self.conditional_active.get());
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(
+                vk::AccessFlags::CONDITIONAL_RENDERING_READ_EXT
+                    | vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::SHADER_WRITE
+                    | vk::AccessFlags::TRANSFER_READ
+                    | vk::AccessFlags::TRANSFER_WRITE,
+            )
+            .dst_access_mask(
+                vk::AccessFlags::CONDITIONAL_RENDERING_READ_EXT
+                    | vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::SHADER_WRITE
+                    | vk::AccessFlags::TRANSFER_READ
+                    | vk::AccessFlags::TRANSFER_WRITE,
+            );
+        unsafe {
+            self.be.shared.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::CONDITIONAL_RENDERING_EXT
+                    | vk::PipelineStageFlags::COMPUTE_SHADER
+                    | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::CONDITIONAL_RENDERING_EXT
+                    | vk::PipelineStageFlags::COMPUTE_SHADER
+                    | vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[barrier],
                 &[],
                 &[],
             );
@@ -12100,6 +13424,12 @@ impl<'a> Recorder<'a> {
     fn begin_conditional_inner(&self, control: &dyn Buffer, word: usize, mutable: bool) {
         assert!((word + 1) * 4 <= control.len_bytes());
         assert!(!self.conditional_active.get());
+        let buffer = Self::vk_of(control);
+        self.immutable_condition.set((!mutable).then_some((
+            buffer.buffer,
+            buffer.sub_offset,
+            word,
+        )));
         if let Some(state) = self.resident_indirect.borrow().as_ref() {
             let region = state
                 .region_cursor
@@ -12202,6 +13532,7 @@ impl<'a> Recorder<'a> {
     }
 
     pub(crate) fn end_conditional(&self) {
+        self.immutable_condition.set(None);
         if !self.conditional_active.replace(false) {
             return;
         }
@@ -12279,6 +13610,70 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// GPU queue-order continuation: validate the stopped epoch before reusing its seed.
+    pub(crate) fn gpu_owned_recovery_seed(
+        &self,
+        control: &dyn Buffer,
+        journal: &dyn Buffer,
+        candidates: &dyn Buffer,
+        params: [u32; 4],
+    ) {
+        assert!(!self.conditional_active.get());
+        assert!(
+            owned_recovery_seed_shape_valid(
+                control.len_bytes(),
+                journal.len_bytes(),
+                candidates.len_bytes(),
+                params
+            ),
+            "guarded recovery requires canonical control and bounded protocol directories"
+        );
+        // Immutable predicate readers deliberately omitted their usual WAR barrier. They
+        // may still be in flight in an older submission; FIFO alone is not that dependency.
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(
+                vk::AccessFlags::CONDITIONAL_RENDERING_READ_EXT | vk::AccessFlags::SHADER_WRITE,
+            )
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+        unsafe {
+            self.be.shared.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::CONDITIONAL_RENDERING_EXT
+                    | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+        }
+        *self.barriers.borrow_mut() += 1;
+        let _phase = infr_core::timeline::device_enabled().then(|| {
+            // Old GPU-only journal entries are intentionally not sampled after this seed:
+            // the recovery will reuse them. Raw timestamps and host miss notices remain exact.
+            infr_core::timeline::device_phase_scope(
+                "resident_owned_guarded_seed_old_journal_not_sampled",
+            )
+        });
+        let kernel = self.be.kernel(
+            "gpu_owned_recovery_seed",
+            crate::gemm::gpu_owned_recovery_seed_spv(),
+            3,
+            16,
+        );
+        self.dispatch(
+            kernel,
+            &[
+                Self::vkb_exact(journal),
+                Self::vkb_exact(candidates),
+                Self::vkb_exact(control),
+            ],
+            1,
+            bytemuck::cast_slice(&params),
+            1,
+        );
+    }
+
     pub(crate) fn publish_host_reads(&self) {
         let barrier = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
@@ -12305,13 +13700,47 @@ impl<'a> Recorder<'a> {
         params: [u32; 8],
         notice: vk::Event,
     ) {
+        self.gpu_resident_hit_check_impl(ids, tape, control, journal, params, notice, None);
+    }
+
+    pub(crate) fn gpu_resident_hit_check_pair(
+        &self,
+        ids: &dyn Buffer,
+        tape: &dyn Buffer,
+        control: &dyn Buffer,
+        journal: &dyn Buffer,
+        params: [u32; 8],
+        notice: vk::Event,
+        pair: &crate::adapter::verify_pair::Layer,
+    ) {
+        self.gpu_resident_hit_check_impl(ids, tape, control, journal, params, notice, Some(pair));
+    }
+
+    fn gpu_resident_hit_check_impl(
+        &self,
+        ids: &dyn Buffer,
+        tape: &dyn Buffer,
+        control: &dyn Buffer,
+        journal: &dyn Buffer,
+        params: [u32; 8],
+        notice: vk::Event,
+        pair: Option<&crate::adapter::verify_pair::Layer>,
+    ) {
         assert!(!self.conditional_active.get());
-        let kernel = self.be.kernel(
-            "gpu_resident_hit_check",
-            crate::gemm::gpu_resident_hit_check_spv(),
-            4,
-            36,
-        );
+        let (name, spv, bindings) = if pair.is_some() {
+            (
+                "gpu_resident_hit_check_pair",
+                crate::gemm::verify_pair_spv("gpu_resident_hit_check_pair"),
+                5,
+            )
+        } else {
+            (
+                "gpu_resident_hit_check",
+                crate::gemm::gpu_resident_hit_check_spv(),
+                4,
+            )
+        };
+        let kernel = self.be.kernel(name, spv, bindings, 36);
         let params = [
             params[0],
             params[1],
@@ -12323,17 +13752,22 @@ impl<'a> Recorder<'a> {
             params[7],
             u32::from(control.len_bytes() == RESIDENT_CONTROL_BYTES),
         ];
+        if let Some(pair) = pair {
+            self.retain_buffer(Arc::clone(&pair.buffer));
+        }
+        let buffers = [
+            Self::vkb(ids),
+            Self::vkb(tape),
+            Self::vkb(control),
+            Self::vkb(journal),
+            Self::vkb(pair.map_or(journal, |pair| pair.buffer.as_ref())),
+        ];
         self.dispatch(
             kernel,
-            &[
-                Self::vkb(ids),
-                Self::vkb(tape),
-                Self::vkb(control),
-                Self::vkb(journal),
-            ],
+            &buffers[..bindings],
             // Ids is read/write and not trailing. Conservatively mark all bindings as writes
             // so the following masked GEMVs observe its freshly written row masks.
-            4,
+            bindings,
             bytemuck::cast_slice(&params),
             1,
         );
@@ -12379,6 +13813,1000 @@ impl<'a> Recorder<'a> {
         }
     }
 
+    pub(crate) fn gpu_resident_copy_check(
+        &self,
+        ids: &dyn Buffer,
+        tape: &dyn Buffer,
+        control: &dyn Buffer,
+        journal: &dyn Buffer,
+        copy: &crate::pager::GpuCopyBuffers,
+        params: [u32; 8],
+        extra: [u32; 9],
+        notice: vk::Event,
+    ) {
+        self.gpu_resident_copy_check_impl(
+            ids, tape, control, journal, copy, params, extra, notice, None, None,
+        );
+    }
+
+    pub(crate) fn gpu_resident_copy_check_topk(
+        &self,
+        ids: &dyn Buffer,
+        tape: &dyn Buffer,
+        control: &dyn Buffer,
+        journal: &dyn Buffer,
+        copy: &crate::pager::GpuCopyBuffers,
+        params: [u32; 8],
+        extra: [u32; 9],
+        notice: vk::Event,
+        topk: owned_topk::OwnedTopkRoute,
+    ) {
+        self.gpu_resident_copy_check_impl(
+            ids,
+            tape,
+            control,
+            journal,
+            copy,
+            params,
+            extra,
+            notice,
+            None,
+            Some(topk),
+        );
+    }
+
+    pub(crate) fn gpu_resident_copy_check_pair(
+        &self,
+        ids: &dyn Buffer,
+        tape: &dyn Buffer,
+        control: &dyn Buffer,
+        journal: &dyn Buffer,
+        copy: &crate::pager::GpuCopyBuffers,
+        params: [u32; 8],
+        extra: [u32; 9],
+        notice: vk::Event,
+        pair: &crate::adapter::verify_pair::Layer,
+    ) {
+        self.gpu_resident_copy_check_impl(
+            ids,
+            tape,
+            control,
+            journal,
+            copy,
+            params,
+            extra,
+            notice,
+            Some(pair),
+            None,
+        );
+    }
+
+    fn gpu_resident_copy_check_impl(
+        &self,
+        ids: &dyn Buffer,
+        tape: &dyn Buffer,
+        control: &dyn Buffer,
+        journal: &dyn Buffer,
+        copy: &crate::pager::GpuCopyBuffers,
+        params: [u32; 8],
+        extra: [u32; 9],
+        notice: vk::Event,
+        pair: Option<&crate::adapter::verify_pair::Layer>,
+        topk: Option<owned_topk::OwnedTopkRoute>,
+    ) {
+        #[cfg(test)]
+        crate::adapter::promotion_isolation_note(self.be, "serial");
+        assert!(!self.conditional_active.get());
+        let owned = copy.is_owned();
+        #[cfg(test)]
+        if owned {
+            owned_topk::test_note(self.be, |counts| {
+                counts.admissions += 1;
+                counts.recovery += usize::from(extra[3] != 0);
+            });
+        }
+        assert!(owned || notice != vk::Event::null());
+        assert!(
+            !owned || pair.is_none(),
+            "GPU-owned cache does not use Verify-pair classifiers"
+        );
+        let prepare_phase = infr_core::timeline::device_enabled()
+            .then(|| infr_core::timeline::device_phase_scope("resident_gpu_copy_prepare"));
+        let (name, spv, bindings) = if owned {
+            ("gpu_owned_prepare", crate::gemm::gpu_owned_prepare_spv(), 8)
+        } else if pair.is_some() {
+            (
+                "gpu_resident_copy_prepare_pair",
+                crate::gemm::verify_pair_spv("gpu_resident_copy_prepare_pair"),
+                9,
+            )
+        } else {
+            (
+                "gpu_resident_copy_prepare",
+                crate::gemm::gpu_resident_copy_prepare_spv(),
+                8,
+            )
+        };
+        let all = gpu_copy_prepare_push(
+            params,
+            control.len_bytes() == RESIDENT_CONTROL_BYTES,
+            extra,
+            copy.copy_groups,
+        );
+        // The ordinary router leaves IDs dirty, so dispatch's tracked WAW dependency already
+        // orders all earlier compute (including BDA expert readers). First use/recovery also
+        // imports HOST/TRANSFER writes; debug or disjoint-batch modes need the explicit fence.
+        let tracked_compute = !self.no_barrier
+            && !self.suppress.get()
+            && self.independent_dispatch.borrow().is_none();
+        let tracked_ids = tracked_compute
+            && self
+                .dirty_writes
+                .borrow()
+                .contains(&Self::vk_of(ids).buffer);
+        let tracked_router = tracked_compute
+            && topk.is_some_and(|route| self.dirty_writes.borrow().contains(&route.logits.buffer));
+        if owned && ((!tracked_ids && !tracked_router) || params[5] == 0 || extra[3] != 0) {
+            // A hash router need not depend on the previous layer's BDA expert readers.
+            // Host writes enter only at a window boundary or CPU-service recovery, not on
+            // every ordinary GPU-owned layer.
+            let mut source_stage = vk::PipelineStageFlags::COMPUTE_SHADER;
+            let mut source_access = vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE;
+            if params[5] == 0 || extra[3] != 0 {
+                source_stage |= vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::HOST;
+                source_access |= vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::HOST_WRITE;
+            }
+            let war = vk::MemoryBarrier::default()
+                .src_access_mask(source_access)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+            unsafe {
+                self.be.shared.device.cmd_pipeline_barrier(
+                    self.cmd,
+                    source_stage,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[war],
+                    &[],
+                    &[],
+                );
+            }
+        }
+        if let Some(pair) = pair {
+            self.retain_buffer(Arc::clone(&pair.buffer));
+        }
+        let buffers = [
+            Self::vkb(ids),
+            Self::vkb(tape),
+            Self::vkb(control),
+            Self::vkb(journal),
+            Self::vkb(copy.sources.as_ref()),
+            Self::vkb_exact(copy.candidates.as_ref()),
+            Self::vkb(copy.overlay.as_ref()),
+            Self::vkb(copy.jobs.as_ref()),
+            Self::vkb(pair.map_or(journal, |pair| pair.buffer.as_ref())),
+        ];
+        let fused_topk = topk.is_some_and(|route| {
+            self.try_dispatch_owned_topk(copy, &buffers[..bindings], &all, route, false)
+        });
+        if !fused_topk {
+            if let Some(route) = topk {
+                self.dispatch_deferred_topk(ids, control, route);
+            }
+        }
+        if !fused_topk
+            && (!owned || !self.try_dispatch_owned_prepare(copy, &buffers[..bindings], &all, false))
+        {
+            let kernel = self
+                .be
+                .kernel(name, spv, bindings, GPU_COPY_PREPARE_PUSH_BYTES);
+            self.dispatch(
+                kernel,
+                &buffers[..bindings],
+                bindings,
+                bytemuck::cast_slice(&all),
+                1,
+            );
+        }
+        drop(prepare_phase);
+        if owned && notice != vk::Event::null() {
+            // The immutable request is complete before any payload work. CPU-only jobs
+            // can upload while this recorder copies mapped siblings and evaluates hits.
+            let buffers = [control, journal, copy.jobs.as_ref()];
+            let ranges = owned_notice_ranges(params[5] as usize, buffers.map(Buffer::len_bytes));
+            let mailboxes = std::array::from_fn::<_, 3, _>(|index| {
+                let (offset, bytes) = ranges[index];
+                let buffer = buffers[index];
+                let buffer = Self::vk_of(buffer);
+                vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(buffer.buffer)
+                    .offset((buffer.sub_offset + offset) as u64)
+                    .size(bytes as u64)
+            });
+            unsafe {
+                self.be.shared.device.cmd_pipeline_barrier(
+                    self.cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &mailboxes,
+                    &[],
+                );
+                self.be.shared.device.cmd_set_event(
+                    self.cmd,
+                    notice,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                );
+            }
+        }
+        if owned && !tracked_compute {
+            // Keep this dependency GPU-local. A HOST_READ publication here would flush every
+            // layer's metadata even on hits, before the payload and final publication below.
+            // With tracking, the payload's journal/jobs reads emit this same dependency.
+            self.owned_copy_barrier(false, false);
+        }
+        let payload_resets_reads = owned
+            && tracked_compute
+            && self.serial_owned_payload_reads_will_reset(journal, copy.jobs.as_ref());
+        let payload_phase = infr_core::timeline::device_enabled()
+            .then(|| infr_core::timeline::device_phase_scope("resident_gpu_copy_payload"));
+        if owned {
+            // Serial path only: no owner consumer runs before the global barrier below
+            // retires every payload workgroup, including early READY stores from WG0.
+            let kernel = self.be.kernel(
+                if copy.wide_copy {
+                    "gpu_owned_copy_publish1024"
+                } else {
+                    "gpu_owned_copy_publish"
+                },
+                crate::gemm::gpu_owned_copy_publish_spv(copy.wide_copy),
+                4,
+                4,
+            );
+            self.dispatch(
+                kernel,
+                &[
+                    Self::vkb(journal),
+                    Self::vkb(copy.jobs.as_ref()),
+                    Self::vkb_exact(copy.candidates.as_ref()),
+                    Self::vkb(copy.overlay.as_ref()),
+                ],
+                0,
+                bytemuck::bytes_of(&params[5]),
+                copy.copy_groups,
+            );
+        } else {
+            let kernel = self.be.kernel(
+                if copy.wide_copy {
+                    "gpu_resident_copy_payload1024"
+                } else {
+                    "gpu_resident_copy_payload"
+                },
+                crate::gemm::gpu_resident_copy_payload_spv(copy.wide_copy),
+                2,
+                4,
+            );
+            self.dispatch(
+                kernel,
+                &[Self::vkb(journal), Self::vkb(copy.jobs.as_ref())],
+                0,
+                bytemuck::bytes_of(&params[5]),
+                copy.copy_groups,
+            );
+        }
+        drop(payload_phase);
+        if owned {
+            self.owned_timeline_boundary("resident_owned_publish_ffn_dependency_interval");
+        }
+        // GPU-owned metadata stays device-owned. Only its leased request mailbox is read by
+        // the CPU; a real ownership handoff explicitly snapshots the full directory later.
+        // Keep BDA payload visibility global, independently of descriptor hazard tracking.
+        let notify_host = !owned && notice != vk::Event::null();
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(if owned {
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE
+            } else {
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::HOST_READ
+            });
+        unsafe {
+            self.be.shared.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER
+                    | if notify_host {
+                        vk::PipelineStageFlags::HOST
+                    } else {
+                        vk::PipelineStageFlags::empty()
+                    },
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+            if notify_host {
+                self.be.shared.device.cmd_set_event(
+                    self.cmd,
+                    notice,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                );
+            }
+        }
+        if owned {
+            self.retire_serial_owned_payload_reads(payload_resets_reads);
+        }
+    }
+
+    fn serial_owned_payload_tracking(&self) -> bool {
+        !self.no_barrier
+            && !self.full_barrier
+            && !self.suppress.get()
+            && self.independent_dispatch.borrow().is_none()
+            && !self.indirect_pending.get()
+            && self.resident_indirect.borrow().is_none()
+    }
+
+    fn serial_owned_payload_reads_will_reset(
+        &self,
+        journal: &dyn Buffer,
+        jobs: &dyn Buffer,
+    ) -> bool {
+        self.serial_owned_payload_tracking() && {
+            let writes = self.dirty_writes.borrow();
+            writes.contains(&Self::vk_of(journal).buffer)
+                && writes.contains(&Self::vk_of(jobs).buffer)
+        }
+    }
+
+    // Only called after the serial owner's global COMPUTE write -> read/write barrier.
+    // A proven RAW reset plus this direct all-read payload excludes older transfer or
+    // indirect readers. Never retire writes or infer this from an arbitrary global barrier.
+    fn retire_serial_owned_payload_reads(&self, payload_reset: bool) -> bool {
+        if !serial_owned_payload_read_retirement_eligible(
+            payload_reset,
+            self.serial_owned_payload_tracking(),
+            self.dirty_writes.borrow().is_empty(),
+            self.dirty_transfer.get(),
+        ) {
+            return false;
+        }
+        self.dirty_reads.borrow_mut().clear();
+        true
+    }
+
+    // Explicitly cover BDA accesses even when normal descriptor hazard barriers are disabled.
+    fn owned_copy_barrier(&self, cpu_completion: bool, to_host: bool) {
+        let mut source_stage = vk::PipelineStageFlags::COMPUTE_SHADER;
+        let mut source_access = vk::AccessFlags::SHADER_WRITE;
+        if cpu_completion {
+            source_stage |= vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::HOST;
+            source_access |= vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::HOST_WRITE;
+        }
+        let mut destination_stage = vk::PipelineStageFlags::COMPUTE_SHADER;
+        let mut destination_access = vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE;
+        if to_host {
+            destination_stage |= vk::PipelineStageFlags::HOST;
+            destination_access |= vk::AccessFlags::HOST_READ;
+        }
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(source_access)
+            .dst_access_mask(destination_access);
+        unsafe {
+            self.be.shared.device.cmd_pipeline_barrier(
+                self.cmd,
+                source_stage,
+                destination_stage,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+        }
+    }
+
+    fn owned_timeline_boundary(&self, name: &'static str) {
+        if !infr_core::timeline::device_enabled() || !self.be.cfg().prof.timeline_raw_kernels {
+            return;
+        }
+        if let Some(query) = self.timeline_query.borrow_mut().as_mut() {
+            // A diagnostic boundary is not a dispatch and must not change splitter cadence.
+            let _phase = infr_core::timeline::device_phase_scope(name);
+            query.mark(name);
+        }
+    }
+
+    fn try_dispatch_owned_prepare(
+        &self,
+        copy: &crate::pager::GpuCopyBuffers,
+        buffers: &[vk::DescriptorBufferInfo],
+        base: &[u32; 19],
+        overlap: bool,
+    ) -> bool {
+        let Some(geometry) = copy.owned_role_geometry([base[9], base[10], base[11]], base[1])
+        else {
+            return false;
+        };
+        // Two ordinary rows of used8/10, plus recovery-only rows3..8 used8/10
+        // and the exact 8x16 corner are qualified. Other shapes retain split preparation.
+        self.dispatch_owned_prepare_geometry(buffers, base, overlap, &geometry, true)
+    }
+
+    fn dispatch_owned_prepare_geometry(
+        &self,
+        buffers: &[vk::DescriptorBufferInfo],
+        base: &[u32; 19],
+        overlap: bool,
+        geometry: &[u32; 12],
+        wider_trial: bool,
+    ) -> bool {
+        let subgroup_scan = self
+            .be
+            .shared
+            .compute_subgroup_operations
+            .contains(vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::ARITHMETIC);
+        if owned_prepare_fused_eligible(subgroup_scan, base, wider_trial) {
+            let kernel = self.be.kernel(
+                if overlap {
+                    "gpu_owned_prepare_fused_overlap"
+                } else {
+                    "gpu_owned_prepare_fused"
+                },
+                crate::gemm::gpu_owned_prepare_fused_spv(overlap),
+                buffers.len(),
+                GPU_OWNED_FAST_PUSH_BYTES,
+            );
+            let phase = (infr_core::timeline::device_enabled()
+                && self.be.cfg().prof.timeline_raw_kernels)
+                .then(|| infr_core::timeline::device_phase_scope("resident_owned_fused_prepare"));
+            self.dispatch(
+                kernel,
+                buffers,
+                buffers.len(),
+                bytemuck::cast_slice(&gpu_owned_fast_push(base, geometry)),
+                1,
+            );
+            drop(phase);
+            self.owned_timeline_boundary("resident_owned_mailbox_completion_interval");
+            return true;
+        }
+        let split_preflight = self
+            .be
+            .shared
+            .compute_subgroup_operations
+            .contains(vk::SubgroupFeatureFlags::BASIC);
+        let fast_name = if split_preflight {
+            if overlap {
+                "gpu_owned_prepare_fast_split_overlap"
+            } else {
+                "gpu_owned_prepare_fast_split"
+            }
+        } else if overlap {
+            "gpu_owned_prepare_fast_overlap"
+        } else {
+            "gpu_owned_prepare_fast"
+        };
+        let fast = self.be.kernel(
+            fast_name,
+            if split_preflight {
+                crate::gemm::gpu_owned_prepare_fast_split_spv(overlap)
+            } else {
+                crate::gemm::gpu_owned_prepare_fast_spv(overlap)
+            },
+            buffers.len(),
+            GPU_OWNED_FAST_PUSH_BYTES,
+        );
+        let fast_phase = (infr_core::timeline::device_enabled()
+            && self.be.cfg().prof.timeline_raw_kernels)
+            .then(|| infr_core::timeline::device_phase_scope("resident_owned_fast_prepare"));
+        self.dispatch(
+            fast,
+            buffers,
+            buffers.len(),
+            bytemuck::cast_slice(&gpu_owned_fast_push(base, geometry)),
+            1,
+        );
+        drop(fast_phase);
+        // Both dispatches declare the mailbox/directory as outputs, so ordinary hazard
+        // tracking emits their full WAW dependency, including the internal status-6 marker.
+        // Untracked modes still need the explicit dependency before the cold validator.
+        if self.no_barrier || self.suppress.get() || self.independent_dispatch.borrow().is_some() {
+            self.owned_copy_barrier(false, false);
+        }
+        let slow_name = if subgroup_scan {
+            if overlap {
+                "gpu_owned_prepare_slow_subgroup_overlap"
+            } else {
+                "gpu_owned_prepare_slow_subgroup"
+            }
+        } else if overlap {
+            "gpu_owned_prepare_slow_overlap"
+        } else {
+            "gpu_owned_prepare_slow"
+        };
+        let make_kernel = if subgroup_scan {
+            VulkanBackend::kernel_native
+        } else {
+            VulkanBackend::kernel
+        };
+        let slow_spv = if subgroup_scan {
+            crate::gemm::gpu_owned_prepare_slow_subgroup_spv(overlap)
+        } else {
+            crate::gemm::gpu_owned_prepare_slow_spv(overlap)
+        };
+        let slow = make_kernel(
+            self.be,
+            slow_name,
+            slow_spv,
+            buffers.len(),
+            GPU_COPY_PREPARE_PUSH_BYTES,
+        );
+        let _slow_phase = (infr_core::timeline::device_enabled()
+            && self.be.cfg().prof.timeline_raw_kernels)
+            .then(|| infr_core::timeline::device_phase_scope("resident_owned_cold_prepare"));
+        self.dispatch(slow, buffers, buffers.len(), bytemuck::cast_slice(base), 1);
+        self.owned_timeline_boundary("resident_owned_mailbox_completion_interval");
+        true
+    }
+
+    fn dispatch_owned_publish(
+        &self,
+        copy: &crate::pager::GpuCopyBuffers,
+        journal: &dyn Buffer,
+        ordinal: u32,
+        mode: u32,
+    ) {
+        let _phase = (infr_core::timeline::device_enabled()
+            && self.be.cfg().prof.timeline_raw_kernels)
+            .then(|| {
+                infr_core::timeline::device_phase_scope(if mode == 1 {
+                    "resident_owned_cpu_publish"
+                } else {
+                    "resident_owned_gpu_publish"
+                })
+            });
+        let kernel = self.be.kernel(
+            "gpu_owned_publish",
+            crate::gemm::gpu_owned_publish_spv(),
+            4,
+            8,
+        );
+        self.dispatch(
+            kernel,
+            &[
+                Self::vkb(journal),
+                Self::vkb(copy.jobs.as_ref()),
+                Self::vkb_exact(copy.candidates.as_ref()),
+                Self::vkb(copy.overlay.as_ref()),
+            ],
+            2,
+            bytemuck::cast_slice(&[ordinal, mode]),
+            1,
+        );
+    }
+
+    /// Call after the CPU-only jobs' transfers have completed (including any cross-queue wait).
+    /// This publishes readiness only; recovery owns control predicates and the stopped FFN.
+    pub(crate) fn publish_owned_cpu(
+        &self,
+        copy: &crate::pager::GpuCopyBuffers,
+        journal: &dyn Buffer,
+        ordinal: u32,
+    ) {
+        assert!(!self.conditional_active.get());
+        assert!(copy.is_owned());
+        assert!((ordinal as usize) < journal.len_bytes() / RESIDENT_JOURNAL_BYTES);
+        self.owned_copy_barrier(true, false);
+        self.dispatch_owned_publish(copy, journal, ordinal, 1);
+        self.owned_copy_barrier(false, false);
+    }
+
+    pub(crate) fn publish_owned_cpu_guarded(
+        &self,
+        copy: &crate::pager::GpuCopyBuffers,
+        control: &dyn Buffer,
+        journal: &dyn Buffer,
+        ordinal: u32,
+    ) {
+        assert!(!self.conditional_active.get() && copy.is_owned());
+        assert_eq!(control.len_bytes(), RESIDENT_CONTROL_BYTES);
+        assert!((ordinal as usize) < journal.len_bytes() / RESIDENT_JOURNAL_BYTES);
+        self.begin_immutable_conditional_at(control, RESIDENT_SEED_WORD);
+        self.owned_copy_barrier(true, false);
+        self.dispatch_owned_publish(copy, journal, ordinal, 1);
+        self.owned_copy_barrier(false, false);
+        self.end_conditional();
+    }
+
+    /// Replace recovery's full-hit masks after prepare has refreshed authoritative addresses.
+    /// The first FFN retained hit/shared outputs; recovery writes only the complementary routed
+    /// slots, leaving the shared bit clear. Its normal accumulation then consumes both halves once.
+    pub(crate) fn gpu_owned_recovery_miss_masks(
+        &self,
+        ids: &dyn Buffer,
+        count: usize,
+        used: usize,
+        masks: &[u32],
+    ) {
+        assert!(!self.conditional_active.get());
+        assert!(self.independent_dispatch.borrow().is_none() && !self.suppress.get());
+        assert!((1..=16).contains(&used));
+        assert!(count > 0 && count <= RESIDENT_JOURNAL_ID_WORDS && count % used == 0);
+        let rows = count / used;
+        assert!(rows <= infr_core::backend::MAX_DECODE_ROWS && masks.len() == rows);
+        let routed_mask = (1u32 << used) - 1;
+        assert!(masks.iter().all(|mask| mask & !routed_mask == 0));
+        let offset = count * 4;
+        let bytes = rows * 2 * 4;
+        assert!(offset + bytes <= ids.len_bytes() && bytes <= 65536);
+        let buffer = Self::vk_of(ids);
+        let absolute_offset = buffer
+            .sub_offset
+            .checked_add(offset)
+            .expect("recovery mask offset overflow");
+        assert!(absolute_offset % 4 == 0);
+        let mut words = vec![0u32; rows * 2];
+        for (row, hits) in masks.iter().enumerate() {
+            words[row] = routed_mask ^ hits;
+        }
+        // Follow copy's transfer bookkeeping. Keep these mandatory mask dependencies even
+        // for a diagnostic recorder that otherwise disables the ordinary hazard tracker.
+        let untracked_dependency = |before: bool| {
+            let barrier = vk::BufferMemoryBarrier::default()
+                .src_access_mask(if before {
+                    vk::AccessFlags::SHADER_READ
+                        | vk::AccessFlags::SHADER_WRITE
+                        | vk::AccessFlags::TRANSFER_READ
+                        | vk::AccessFlags::TRANSFER_WRITE
+                } else {
+                    vk::AccessFlags::TRANSFER_WRITE
+                })
+                .dst_access_mask(if before {
+                    vk::AccessFlags::TRANSFER_WRITE
+                } else {
+                    vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE
+                })
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(buffer.buffer)
+                .offset(absolute_offset as u64)
+                .size(bytes as u64);
+            unsafe {
+                self.be.shared.device.cmd_pipeline_barrier(
+                    self.cmd,
+                    if before {
+                        vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER
+                    } else {
+                        vk::PipelineStageFlags::TRANSFER
+                    },
+                    if before {
+                        vk::PipelineStageFlags::TRANSFER
+                    } else {
+                        vk::PipelineStageFlags::COMPUTE_SHADER
+                    },
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[barrier],
+                    &[],
+                );
+            }
+        };
+        self.stamp("gpu_owned_recovery_miss_masks");
+        self.sync(&[], &[buffer.buffer], true);
+        if self.no_barrier {
+            untracked_dependency(true);
+        }
+        unsafe {
+            self.be.shared.device.cmd_update_buffer(
+                self.cmd,
+                buffer.buffer,
+                absolute_offset as u64,
+                bytemuck::cast_slice(&words),
+            );
+        }
+        self.dirty_transfer.set(true);
+        self.sync(&[buffer.buffer], &[], false);
+        if self.no_barrier {
+            untracked_dependency(false);
+        }
+    }
+
+    pub(crate) fn gpu_copy_overlap_supported(
+        &self,
+        verify: bool,
+        rows: usize,
+        independent_rows: bool,
+        pair_enabled: bool,
+        control: &dyn Buffer,
+        copy: &crate::pager::GpuCopyBuffers,
+    ) -> bool {
+        gpu_copy_overlap_eligible(
+            self.be
+                .cfg()
+                .kernels
+                .vulkan
+                .decode_gpu_resident_copy_overlap,
+            verify,
+            rows,
+            independent_rows,
+            pair_enabled,
+            control.len_bytes() == RESIDENT_CONTROL_BYTES,
+            copy.miss_predicates.is_some(),
+            self.resident_indirect.borrow().is_some(),
+            self.be.cfg().spec.mtp,
+        ) && (!copy.is_owned() || !verify)
+            && !self.no_barrier
+            && !self.full_barrier
+            && !self.stages
+    }
+
+    /// Publish an ordered admission, not payload completion. The host only reads these immutable
+    /// job/journal slices; candidate protection and the later BDA join still own readiness.
+    pub(crate) fn gpu_resident_copy_prepare_overlap(
+        &self,
+        ids: &dyn Buffer,
+        tape: &dyn Buffer,
+        control: &dyn Buffer,
+        journal: &dyn Buffer,
+        copy: &crate::pager::GpuCopyBuffers,
+        params: [u32; 8],
+        extra: [u32; 9],
+        notice: vk::Event,
+    ) {
+        self.gpu_resident_copy_prepare_overlap_impl(
+            ids, tape, control, journal, copy, params, extra, notice, None,
+        );
+    }
+
+    pub(crate) fn gpu_resident_copy_prepare_overlap_topk(
+        &self,
+        ids: &dyn Buffer,
+        tape: &dyn Buffer,
+        control: &dyn Buffer,
+        journal: &dyn Buffer,
+        copy: &crate::pager::GpuCopyBuffers,
+        params: [u32; 8],
+        extra: [u32; 9],
+        notice: vk::Event,
+        topk: owned_topk::OwnedTopkRoute,
+    ) {
+        self.gpu_resident_copy_prepare_overlap_impl(
+            ids,
+            tape,
+            control,
+            journal,
+            copy,
+            params,
+            extra,
+            notice,
+            Some(topk),
+        );
+    }
+
+    fn gpu_resident_copy_prepare_overlap_impl(
+        &self,
+        ids: &dyn Buffer,
+        tape: &dyn Buffer,
+        control: &dyn Buffer,
+        journal: &dyn Buffer,
+        copy: &crate::pager::GpuCopyBuffers,
+        params: [u32; 8],
+        extra: [u32; 9],
+        notice: vk::Event,
+        topk: Option<owned_topk::OwnedTopkRoute>,
+    ) {
+        #[cfg(test)]
+        crate::adapter::promotion_isolation_note(self.be, "overlap");
+        assert!(!self.conditional_active.get());
+        let owned = copy.is_owned();
+        assert!(owned || topk.is_none());
+        // A recovery refreshes frozen addresses/IDs; it must never route again, even if
+        // a caller retained a deferred route across the CPU-service boundary.
+        let topk = topk.filter(|_| extra[3] == 0);
+        #[cfg(test)]
+        if owned {
+            owned_topk::test_note(self.be, |counts| {
+                counts.admissions += 1;
+                counts.recovery += usize::from(extra[3] != 0);
+            });
+        }
+        assert!(owned || notice != vk::Event::null());
+        assert_eq!(control.len_bytes(), RESIDENT_CONTROL_BYTES);
+        let miss_predicates = copy
+            .miss_predicates
+            .as_ref()
+            .expect("overlap predicate allocation");
+        let ordinal = params[5] as usize;
+        assert!((ordinal + 1) * GPU_COPY_PREDICATE_WORDS * 4 <= miss_predicates.len_bytes());
+        let _phase = infr_core::timeline::device_enabled()
+            .then(|| infr_core::timeline::device_phase_scope("resident_gpu_copy_prepare_overlap"));
+        let tracked_compute = !self.no_barrier
+            && !self.suppress.get()
+            && self.independent_dispatch.borrow().is_none();
+        let tracked_ids = tracked_compute
+            && self
+                .dirty_writes
+                .borrow()
+                .contains(&Self::vk_of(ids).buffer);
+        let tracked_router = tracked_compute
+            && topk.is_some_and(|route| self.dirty_writes.borrow().contains(&route.logits.buffer));
+        if owned && ((!tracked_ids && !tracked_router) || params[5] == 0 || extra[3] != 0) {
+            // Admission may overwrite an old BDA weight slot. Cover prior readers as well as
+            // writes; the first layer/recovery additionally consumes host/transfer updates.
+            let source_stage = vk::PipelineStageFlags::COMPUTE_SHADER
+                | if params[5] == 0 || extra[3] != 0 {
+                    vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::TRANSFER
+                } else {
+                    vk::PipelineStageFlags::empty()
+                };
+            let source_access = vk::AccessFlags::SHADER_READ
+                | vk::AccessFlags::SHADER_WRITE
+                | if params[5] == 0 || extra[3] != 0 {
+                    vk::AccessFlags::HOST_WRITE | vk::AccessFlags::TRANSFER_WRITE
+                } else {
+                    vk::AccessFlags::empty()
+                };
+            let barrier = vk::MemoryBarrier::default()
+                .src_access_mask(source_access)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+            unsafe {
+                self.be.shared.device.cmd_pipeline_barrier(
+                    self.cmd,
+                    source_stage,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[barrier],
+                    &[],
+                    &[],
+                );
+            }
+        }
+        let all = gpu_copy_prepare_push(params, true, extra, copy.copy_groups);
+        let buffers = [
+            Self::vkb(ids),
+            Self::vkb(tape),
+            Self::vkb(control),
+            Self::vkb(journal),
+            Self::vkb(copy.sources.as_ref()),
+            Self::vkb_exact(copy.candidates.as_ref()),
+            Self::vkb(copy.overlay.as_ref()),
+            Self::vkb(copy.jobs.as_ref()),
+            Self::vkb(miss_predicates.as_ref()),
+        ];
+        let fused_topk = topk
+            .is_some_and(|route| self.try_dispatch_owned_topk(copy, &buffers, &all, route, true));
+        if !fused_topk {
+            if let Some(route) = topk {
+                self.dispatch_deferred_topk(ids, control, route);
+            }
+        }
+        if !fused_topk && (!owned || !self.try_dispatch_owned_prepare(copy, &buffers, &all, true)) {
+            let kernel = self.be.kernel(
+                if owned {
+                    "gpu_owned_prepare_overlap"
+                } else {
+                    "gpu_resident_copy_prepare_overlap"
+                },
+                if owned {
+                    crate::gemm::gpu_owned_prepare_overlap_spv()
+                } else {
+                    crate::gemm::gpu_resident_copy_prepare_overlap_spv()
+                },
+                9,
+                GPU_COPY_PREPARE_PUSH_BYTES,
+            );
+            self.dispatch(kernel, &buffers, 9, bytemuck::cast_slice(&all), 1);
+        }
+        let job_bytes = RESIDENT_JOURNAL_ID_WORDS * 3 * 32;
+        let metadata = [
+            (
+                journal,
+                ordinal * RESIDENT_JOURNAL_BYTES,
+                RESIDENT_JOURNAL_BYTES,
+            ),
+            (copy.jobs.as_ref(), ordinal * job_bytes, job_bytes),
+            (control, 0, 16),
+        ];
+        let barriers: Vec<_> = metadata
+            .iter()
+            .map(|&(buffer, offset, bytes)| {
+                assert!(offset + bytes <= buffer.len_bytes());
+                let buffer = Self::vk_of(buffer);
+                vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(buffer.buffer)
+                    .offset((buffer.sub_offset + offset) as u64)
+                    .size(bytes as u64)
+            })
+            .collect();
+        let args = Self::vk_of(miss_predicates.as_ref());
+        let args_barrier = gpu_copy_payload_args_barrier(args.buffer, args.sub_offset, ordinal);
+        unsafe {
+            if notice != vk::Event::null() {
+                self.be.shared.device.cmd_pipeline_barrier(
+                    self.cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &barriers,
+                    &[],
+                );
+            }
+            // Publish the GPU-written dispatch triple even when independent dispatch skips sync.
+            self.be.shared.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::DRAW_INDIRECT,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[args_barrier],
+                &[],
+            );
+            if notice != vk::Event::null() {
+                self.be.shared.device.cmd_set_event(
+                    self.cmd,
+                    notice,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                );
+            }
+        }
+    }
+
+    /// Call unconditionally after the independent payload/hit-projection scope has joined,
+    /// before recording any miss-only FFN. CPU-only jobs retain COPYING until CPU recovery.
+    pub(crate) fn gpu_resident_copy_finish_overlap(
+        &self,
+        copy: &crate::pager::GpuCopyBuffers,
+        journal: &dyn Buffer,
+        ordinal: u32,
+    ) {
+        assert!(!self.conditional_active.get());
+        assert!(self.independent_dispatch.borrow().is_none());
+        if copy.is_owned() {
+            self.dispatch_owned_publish(copy, journal, ordinal, 0);
+            self.owned_copy_barrier(false, false);
+        }
+    }
+
+    /// The configured workgroup count bounds occupancy, not a hardware CU reservation. Payload BDA writes
+    /// require the independent scope's unconditional join before any miss-weight consumer.
+    pub(crate) fn gpu_resident_copy_payload_overlap(
+        &self,
+        copy: &crate::pager::GpuCopyBuffers,
+        journal: &dyn Buffer,
+        ordinal: u32,
+    ) {
+        assert!(self.independent_dispatch.borrow().is_some());
+        let _phase = infr_core::timeline::device_enabled()
+            .then(|| infr_core::timeline::device_phase_scope("resident_gpu_copy_payload_overlap"));
+        let kernel = self.be.kernel(
+            if copy.wide_copy {
+                "gpu_resident_copy_payload1024"
+            } else {
+                "gpu_resident_copy_payload"
+            },
+            crate::gemm::gpu_resident_copy_payload_spv(copy.wide_copy),
+            2,
+            4,
+        );
+        let args = Self::vk_of(copy.miss_predicates.as_ref().unwrap().as_ref());
+        self.dispatch_indirect(
+            kernel,
+            &[Self::vkb(journal), Self::vkb(copy.jobs.as_ref())],
+            0,
+            bytemuck::bytes_of(&ordinal),
+            args.buffer,
+            (args.sub_offset + (ordinal as usize * GPU_COPY_PREDICATE_WORDS + 1) * 4) as u64,
+        );
+    }
+
     pub(crate) fn gpu_resident_silu(
         &self,
         gate: &dyn Buffer,
@@ -12387,9 +14815,29 @@ impl<'a> Recorder<'a> {
         out: &dyn Buffer,
         params: [u32; 4],
     ) {
+        self.gpu_resident_silu_bank(gate, up, ids, out, params, false);
+    }
+
+    pub(crate) fn gpu_resident_silu_bank(
+        &self,
+        gate: &dyn Buffer,
+        up: &dyn Buffer,
+        ids: &dyn Buffer,
+        out: &dyn Buffer,
+        params: [u32; 4],
+        misses: bool,
+    ) {
         let kernel = self.be.kernel(
-            "gpu_resident_silu",
-            crate::gemm::gpu_resident_silu_spv(),
+            if misses {
+                "gpu_resident_silu_misses"
+            } else {
+                "gpu_resident_silu"
+            },
+            if misses {
+                crate::gemm::gpu_resident_silu_misses_spv()
+            } else {
+                crate::gemm::gpu_resident_silu_spv()
+            },
             4,
             16,
         );
@@ -12696,6 +15144,31 @@ impl<'a> Recorder<'a> {
             desc.xp
         };
         let nb = desc.resident_nb;
+        let (name, spv) = if kquant_packed_applies(
+            self.vk().kquant_packed_decode,
+            self.be.prefers_kquant_packed_decode(),
+            small_tile,
+            false,
+            wide_bn,
+            dtype,
+            k,
+            n,
+        ) {
+            crate::gemm::kquant_packed_kernel(dtype, false, wide_bn)
+        } else {
+            (name, spv)
+        };
+        let (name, spv) = if iq4_pair_lut_applies(
+            self.vk().iq4_pair_lut,
+            self.be.prefers_iq4_pair_lut(),
+            dtype,
+            k,
+            n,
+        ) {
+            crate::gemm::iq4_pair_lut_kernel(small_tile, false)
+        } else {
+            (name, spv)
+        };
         let kern = self.be.kernel(name, spv, nb, 24);
         let mut push = [0u8; 24];
         let stride_bytes = expert_stride_bytes(dtype, stride);
@@ -12776,6 +15249,31 @@ impl<'a> Recorder<'a> {
             )
         });
         let (name, spv) = if small_tile { desc.xpg32 } else { desc.xpg };
+        let (name, spv) = if kquant_packed_applies(
+            self.vk().kquant_packed_decode,
+            self.be.prefers_kquant_packed_decode(),
+            small_tile,
+            true,
+            false,
+            dtype,
+            k,
+            n,
+        ) {
+            crate::gemm::kquant_packed_kernel(dtype, true, false)
+        } else {
+            (name, spv)
+        };
+        let (name, spv) = if iq4_pair_lut_applies(
+            self.vk().iq4_pair_lut,
+            self.be.prefers_iq4_pair_lut(),
+            dtype,
+            k,
+            n,
+        ) {
+            crate::gemm::iq4_pair_lut_kernel(small_tile, true)
+        } else {
+            (name, spv)
+        };
         let nb = desc.resident_nb + 1;
         let kern = self.be.kernel(name, spv, nb, 28);
         let mut push = [0u8; 28];
@@ -13206,6 +15704,49 @@ impl<'a> Recorder<'a> {
         active_mask: u32,
         row_mask_bank: u32,
     ) {
+        self.linear_native_id_multi_paged_shared_for_verify(
+            dtype,
+            arena_addr,
+            slot_bytes,
+            lut,
+            ids,
+            routed_used,
+            lut_base,
+            shared,
+            x,
+            x_per_slot,
+            y,
+            in_f,
+            out_f,
+            rows,
+            active_mask,
+            row_mask_bank,
+            false,
+        );
+    }
+
+    /// Explicit graph context: dimensions alone must not enroll independent four-row decode.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn linear_native_id_multi_paged_shared_for_verify(
+        &self,
+        dtype: infr_core::DType,
+        arena_addr: u64,
+        slot_bytes: u32,
+        lut: &dyn Buffer,
+        ids: &dyn Buffer,
+        routed_used: usize,
+        lut_base: usize,
+        shared: &dyn Buffer,
+        x: &dyn Buffer,
+        x_per_slot: bool,
+        y: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+        rows: usize,
+        active_mask: u32,
+        row_mask_bank: u32,
+        causal_verify: bool,
+    ) {
         assert_native_k("linear_native_id_multi_paged_shared", in_f);
         let shared_addr = shared
             .device_addr()
@@ -13269,10 +15810,31 @@ impl<'a> Recorder<'a> {
                 }
             }
         }
-        let (name, spv) = crate::gemm::native_idm_paged_shared_build_spv(dtype)
+        let (mut name, mut spv) = crate::gemm::native_idm_paged_shared_build_spv(dtype)
             .expect("native idm paged shared kernel");
+        let mut nr = 1;
+        // SG and buffer-grid selection above retain priority over this measured specialization.
+        if crate::adapter::verify_pair::shared_iq2_nr8_eligible(
+            self.be.cfg().kernels.vulkan.verify_shared_iq2_nr8,
+            causal_verify,
+            dtype,
+            [rows, in_f, out_f],
+            routed_used,
+            x_per_slot,
+            name,
+        ) {
+            (name, spv) = crate::gemm::native_idm_grid_nr_paged_shared_build_spv(dtype, 8)
+                .expect("qualified staged shared IQ2S NR8 build");
+            nr = 8;
+        }
         let k = self.be.kernel(name, spv, 5, 56);
-        self.dispatch_wide(k, &bufs, 1, &push, (rows * n_used * out_f) as u32);
+        self.dispatch_wide(
+            k,
+            &bufs,
+            1,
+            &push,
+            (rows * n_used * out_f.div_ceil(nr)) as u32,
+        );
     }
 
     /// Fused paged IQ2_XS gate+up GEMV and SwiGLU for Qwen3.8 decode.
@@ -13845,13 +16407,18 @@ impl<'a> Recorder<'a> {
         self.submit_timing_token.set(None);
         self.submit_pager_profile.set(false);
         self.be.shared.return_submit_timing_query(submit_pool);
-        self.be.shared.recorder_cmds.lock().unwrap().push(self.cmd);
+        if let Some(private_pool) = self.prepared_pool.borrow_mut().take() {
+            drop(private_pool);
+        } else {
+            self.be.shared.recorder_cmds.lock().unwrap().push(self.cmd);
+        }
         self.be
             .shared
             .recorder_desc_pools
             .lock()
             .unwrap()
             .extend(self.pools.borrow_mut().drain(..));
+        self.prepared_prefix.borrow_mut().take();
     }
 
     /// End recording, submit once, wait, and release transient objects.
@@ -13864,9 +16431,12 @@ impl<'a> Recorder<'a> {
         self,
         after_submit: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
+        if self.prepared_pool.borrow().is_some() {
+            return Err(be("prepared recorder must finish_prepared or discard"));
+        }
         self.end_conditional();
         let device = &self.be.shared.device;
-        let dispatches = self.dispatches.get();
+        let dispatches = self.dispatches();
         let t_record = self.t0.elapsed();
         let prof = pager_profile::active();
         if prof {
@@ -13897,18 +16467,13 @@ impl<'a> Recorder<'a> {
         if let Some(query) = self.timeline_query.borrow_mut().as_mut() {
             query.submitted();
         }
-        let submit = self.be.shared.queue_submit_commands_recovering(
-            std::slice::from_ref(&self.cmd),
-            vk::Fence::null(),
-            Some(dispatches),
-            "forward queue_submit",
-            self.dedicated_transfer_wait.get(),
-        );
+        let submit = self.submit_commands(vk::Fence::null(), "forward queue_submit");
         drop(submit_span);
         if let Err(e) = submit {
             self.free_transient();
             return Err(be(format!("queue_submit: {e}")));
         }
+        self.notify_first_submit();
         let host_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(after_submit))
             .unwrap_or_else(|_| Err(be("post-submit host work panicked")));
         let wait_t0 = prof.then(std::time::Instant::now);
@@ -13936,6 +16501,14 @@ impl<'a> Recorder<'a> {
         }
         self.resolve_submit_timing(dispatches);
         if let Some(query) = self.timeline_query.borrow_mut().take() {
+            query.resolve();
+        }
+        if let Some(query) = self
+            .prepared_prefix
+            .borrow_mut()
+            .as_mut()
+            .and_then(|prefix| prefix.timeline_query.take())
+        {
             query.resolve();
         }
         self.free_transient();
@@ -13975,8 +16548,11 @@ impl<'a> Recorder<'a> {
     /// per-recorder, so cross-submission RAW/WAR ordering (scratch reuse, arena-slot rewrites vs
     /// a prior segment's reads) is otherwise invisible to it.
     pub fn finish_nowait(self) -> Result<PendingSegment> {
+        if self.prepared_pool.borrow().is_some() {
+            return Err(be("prepared recorder must finish_prepared or discard"));
+        }
         self.end_conditional();
-        let dispatches = self.dispatches.get();
+        let dispatches = self.dispatches();
         if self.stages || self.prof_ops {
             let shared = std::sync::Arc::clone(&self.be.shared);
             self.finish()?;
@@ -13986,13 +16562,17 @@ impl<'a> Recorder<'a> {
                 cmd: vk::CommandBuffer::null(),
                 pools: Vec::new(),
                 buffer_keepalive: Vec::new(),
+                prepared_prefix: None,
                 submit_query_pool: vk::QueryPool::null(),
                 submit_timing_token: None,
                 submit_pager_profile: false,
                 dispatches,
+                dedicated_transfer_wait: 0,
                 timeline_query: None,
                 waiter: None,
                 notice_producer: None,
+                notice_fence_lease: None,
+                host_ready_wait: None,
             });
         }
         if pager_profile::active() {
@@ -14028,19 +16608,14 @@ impl<'a> Recorder<'a> {
         if let Some(query) = self.timeline_query.borrow_mut().as_mut() {
             query.submitted();
         }
-        let submit = self.be.shared.queue_submit_commands_recovering(
-            std::slice::from_ref(&self.cmd),
-            fence,
-            Some(dispatches),
-            "pipelined queue_submit",
-            self.dedicated_transfer_wait.get(),
-        );
+        let submit = self.submit_commands(fence, "pipelined queue_submit");
         drop(submit_span);
         if let Err(e) = submit {
             self.be.shared.recorder_fences.lock().unwrap().push(fence);
             self.free_transient();
             return Err(be(format!("queue_submit: {e}")));
         }
+        self.notify_first_submit();
         let shared = std::sync::Arc::clone(&self.be.shared);
         let pools = self.pools.borrow().clone();
         let buffer_keepalive = std::mem::take(&mut *self.buffer_keepalive.borrow_mut());
@@ -14054,13 +16629,17 @@ impl<'a> Recorder<'a> {
             cmd: self.cmd,
             pools,
             buffer_keepalive,
+            prepared_prefix: self.prepared_prefix.borrow_mut().take(),
             submit_query_pool,
             submit_timing_token,
             submit_pager_profile,
             dispatches,
+            dedicated_transfer_wait: self.dedicated_transfer_wait.get(),
             timeline_query: self.timeline_query.borrow_mut().take(),
             waiter: None,
             notice_producer: None,
+            notice_fence_lease: None,
+            host_ready_wait: self.host_ready_wait.borrow_mut().take(),
         })
     }
 
@@ -14109,6 +16688,12 @@ impl<'a> Recorder<'a> {
     /// and its own segment is a SEPARATE submit at replay time, so no single submit can trip the
     /// per-submit GPU hang watchdog. A discrete GPU records the whole decode into one segment.
     pub(crate) fn end_segment(self) -> Result<RecordedSegment> {
+        if self.host_ready_wait.borrow().is_some() {
+            return Err(be("host-gated recovery cannot export an unleased segment"));
+        }
+        if self.prepared_pool.borrow().is_some() || self.prepared_prefix.borrow().is_some() {
+            return Err(be("prepared prefix cannot become a replayable segment"));
+        }
         self.end_conditional();
         if self.stages {
             eprintln!("[prof] barriers emitted = {}", self.barriers.borrow());
@@ -14133,6 +16718,11 @@ impl<'a> Recorder<'a> {
     /// fast path taken by every discrete GPU; a device that watchdog-splits its decode builds a
     /// multi-segment [`RecordedCmd`] from [`Self::end_segment`] instead.
     pub fn finish_record(self) -> Result<RecordedCmd> {
+        if self.host_ready_wait.borrow().is_some() {
+            return Err(be(
+                "host-gated recovery cannot become a persistent recording",
+            ));
+        }
         self.end_conditional();
         let shared = std::sync::Arc::clone(&self.be.shared);
         let seg = self.end_segment()?;
@@ -14412,8 +17002,36 @@ impl Drop for FenceWaiter {
     }
 }
 
-/// A submitted segment owns its fence and transient objects until GPU completion. Both explicit
-/// waits and Drop drain the optional worker before recycling objects that the GPU can still read.
+/// Keeps a notice fence out of the pool until both GPU completion and the last worker query.
+/// The segment retains a share until its GPU wait has returned.
+pub(crate) struct NoticeFenceLease {
+    shared: Arc<crate::VulkanShared>,
+    fence: vk::Fence,
+}
+
+impl NoticeFenceLease {
+    pub(crate) fn wait(&self) -> Result<()> {
+        unsafe {
+            self.shared
+                .device
+                .wait_for_fences(&[self.fence], true, u64::MAX)
+        }
+        .map_err(|error| {
+            be(format!(
+                "wait old recovery fence before invalidation: {error}"
+            ))
+        })
+    }
+}
+
+impl Drop for NoticeFenceLease {
+    fn drop(&mut self) {
+        self.shared.recorder_fences.lock().unwrap().push(self.fence);
+    }
+}
+
+/// A submitted segment owns its fence and transient objects until GPU completion. Legacy notice
+/// producers are drained before recycling; leased notice fences may outlive the segment.
 pub struct PendingSegment {
     shared: std::sync::Arc<crate::VulkanShared>,
     /// `None` = already drained (the profiling degrade path in `finish_nowait`, or after `wait`).
@@ -14422,6 +17040,7 @@ pub struct PendingSegment {
     pools: Vec<vk::DescriptorPool>,
     /// Temporary transfer buffers referenced by `cmd`; released only after `fence` signals.
     buffer_keepalive: Vec<std::sync::Arc<dyn Buffer>>,
+    prepared_prefix: Option<PreparedCommand>,
     /// Automatic submit calibration query state. Both are empty after calibration, on explicit
     /// caps, and on the already-drained profiling compatibility path.
     submit_query_pool: vk::QueryPool,
@@ -14429,15 +17048,30 @@ pub struct PendingSegment {
     submit_pager_profile: bool,
     /// Dispatches this segment carried; consumed by the submit profiler and finite GPU tuner.
     dispatches: usize,
+    /// A successful compute fence proves this submission's transfer timeline dependency.
+    dedicated_transfer_wait: u64,
     timeline_query: Option<crate::timeline::Query>,
     /// The fence is never reset/recycled until this worker's wait has returned.
     waiter: Option<std::sync::mpsc::Receiver<std::result::Result<(), vk::Result>>>,
     notice_producer: Option<std::sync::mpsc::Receiver<()>>,
+    notice_fence_lease: Option<Arc<NoticeFenceLease>>,
+    host_ready_wait: Option<crate::host_ready::HostReadyWait>,
 }
 
 impl PendingSegment {
     pub(crate) fn notice_fence(&self) -> Option<vk::Fence> {
         self.fence
+    }
+
+    pub(crate) fn lease_notice_fence(&mut self) -> Option<Arc<NoticeFenceLease>> {
+        let fence = self.fence?;
+        let lease = self.notice_fence_lease.get_or_insert_with(|| {
+            Arc::new(NoticeFenceLease {
+                shared: Arc::clone(&self.shared),
+                fence,
+            })
+        });
+        Some(Arc::clone(lease))
     }
 
     pub(crate) fn retain_notice_producer(&mut self, done: std::sync::mpsc::Receiver<()>) {
@@ -14508,7 +17142,18 @@ impl PendingSegment {
         };
         drop(wait_span);
         if waited.is_ok() {
+            if self.dedicated_transfer_wait != 0 {
+                self.shared
+                    .retire_dedicated_transfer_through(self.dedicated_transfer_wait);
+            }
             if let Some(query) = self.timeline_query.take() {
+                query.resolve();
+            }
+            if let Some(query) = self
+                .prepared_prefix
+                .as_mut()
+                .and_then(|prefix| prefix.timeline_query.take())
+            {
                 query.resolve();
             }
         }
@@ -14531,14 +17176,21 @@ impl PendingSegment {
             }
         }
         let _recycle = infr_core::timeline::span("resident_segment_recycle");
-        self.shared.recorder_fences.lock().unwrap().push(fence);
-        self.shared.recorder_cmds.lock().unwrap().push(self.cmd);
+        if self.notice_fence_lease.is_none() {
+            self.shared.recorder_fences.lock().unwrap().push(fence);
+        }
+        if self.cmd != vk::CommandBuffer::null() {
+            self.shared.recorder_cmds.lock().unwrap().push(self.cmd);
+        }
         self.shared
             .recorder_desc_pools
             .lock()
             .unwrap()
             .extend(self.pools.drain(..));
         self.buffer_keepalive.clear();
+        self.host_ready_wait.take();
+        self.prepared_prefix.take();
+        self.notice_fence_lease.take();
         waited.map_err(|e| be(format!("wait segment fence: {e}")))
     }
 }
@@ -14546,6 +17198,299 @@ impl PendingSegment {
 impl Drop for PendingSegment {
     fn drop(&mut self) {
         let _ = self.drain();
+    }
+}
+
+#[cfg(test)]
+mod prepared_command_tests {
+    use super::*;
+    use infr_core::backend::BufferUsage;
+    use std::sync::{mpsc, Arc};
+
+    fn backend(push_desc: bool) -> VulkanBackend {
+        let mut cfg = infr_core::config::Config::default();
+        cfg.kernels.vulkan.push_desc = push_desc;
+        VulkanBackend::new_with(Arc::new(cfg)).unwrap()
+    }
+
+    fn value(backend: &VulkanBackend, buf: &dyn Buffer) -> f32 {
+        let mut out = [0.0f32];
+        backend
+            .download(buf, bytemuck::cast_slice_mut(&mut out))
+            .unwrap();
+        out[0]
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU; parent serializes GPU tests"]
+    fn direct_prepared_submission_retains_private_pool_until_fence_and_orders_suffix() {
+        for push_desc in [true, false] {
+            let backend = backend(push_desc);
+            let src = backend.alloc(4, BufferUsage::Staging).unwrap();
+            let dst = backend.alloc(4, BufferUsage::Readback).unwrap();
+            let out = backend.alloc(4, BufferUsage::Readback).unwrap();
+            backend
+                .upload(src.as_ref(), bytemuck::bytes_of(&19.0f32))
+                .unwrap();
+            for explicit_wait in [true, false, true, false] {
+                let rec = Recorder::new_prepared(&backend).unwrap();
+                rec.seed_barrier();
+                rec.copy(src.as_ref(), 0, dst.as_ref(), 0, 4);
+                rec.scale(dst.as_ref(), 2.0, 1);
+                let pending = rec.finish_prepared().unwrap().submit(&backend).unwrap();
+                assert_eq!(
+                    backend
+                        .shared
+                        .recorder_prepared_pools
+                        .pools
+                        .lock()
+                        .unwrap()
+                        .len(),
+                    0
+                );
+                let suffix = backend.recorder().unwrap();
+                suffix.seed_barrier();
+                suffix.copy(dst.as_ref(), 0, out.as_ref(), 0, 4);
+                suffix.finish().unwrap();
+                if explicit_wait {
+                    pending.wait().unwrap();
+                } else {
+                    drop(pending);
+                }
+                assert_eq!(value(&backend, out.as_ref()), 38.0);
+                assert_eq!(
+                    backend
+                        .shared
+                        .recorder_prepared_pools
+                        .pools
+                        .lock()
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert!(backend
+                    .shared
+                    .recorder_cmds
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|&cmd| cmd != vk::CommandBuffer::null()));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an idle Vulkan GPU; standalone submit microbenchmark"]
+    fn direct_prepared_submission_microbenchmark() {
+        let backend = backend(true);
+        let src = backend.alloc(4, BufferUsage::Staging).unwrap();
+        let dst = backend.alloc(4, BufferUsage::Readback).unwrap();
+        backend
+            .upload(src.as_ref(), bytemuck::bytes_of(&23.0f32))
+            .unwrap();
+        let mut samples = [Vec::new(), Vec::new()];
+        for round in 0..288 {
+            for mode in [round % 2, 1 - round % 2] {
+                let rec = Recorder::new_prepared(&backend).unwrap();
+                rec.copy(src.as_ref(), 0, dst.as_ref(), 0, 4);
+                let command = rec.finish_prepared().unwrap();
+                let start = std::time::Instant::now();
+                let pending = if mode == 0 {
+                    let wrapper = backend.recorder().unwrap();
+                    wrapper.prepend_prepared(command).unwrap();
+                    wrapper.finish_nowait().unwrap()
+                } else {
+                    command.submit(&backend).unwrap()
+                };
+                pending.wait().unwrap();
+                if round >= 32 {
+                    samples[mode].push(start.elapsed().as_secs_f64() * 1e6);
+                }
+            }
+        }
+        for (mode, values) in samples.iter_mut().enumerate() {
+            values.sort_by(f64::total_cmp);
+            eprintln!(
+                "prepared-submit mode={mode} mean_us={:.3} p50_us={:.3}",
+                values.iter().sum::<f64>() / values.len() as f64,
+                values[values.len() / 2]
+            );
+        }
+        assert_eq!(value(&backend, dst.as_ref()), 23.0);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU; parent serializes GPU tests"]
+    fn prepare_does_not_execute_and_discard_recycles_private_pools() {
+        fn assert_send<T: Send>() {}
+        assert_send::<PreparedCommand>();
+        let backend = backend(true);
+        let src = backend.alloc(4, BufferUsage::Staging).unwrap();
+        let dst = backend.alloc(4, BufferUsage::Readback).unwrap();
+        backend
+            .upload(src.as_ref(), bytemuck::bytes_of(&17.0f32))
+            .unwrap();
+        backend
+            .upload(dst.as_ref(), bytemuck::bytes_of(&3.0f32))
+            .unwrap();
+        let rec = Recorder::new_prepared(&backend).unwrap();
+        rec.copy(src.as_ref(), 0, dst.as_ref(), 0, 4);
+        let pool = rec
+            .prepared_pool
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .entry
+            .as_ref()
+            .unwrap()
+            .pool;
+        assert_ne!(pool, *backend.shared.cmd_pool.lock().unwrap());
+        assert_eq!(value(&backend, dst.as_ref()), 3.0);
+        let cmd = rec.finish_prepared().unwrap();
+        assert_eq!(cmd.dispatches(), 1);
+        assert_eq!(value(&backend, dst.as_ref()), 3.0);
+        drop(cmd);
+        let rec = Recorder::new_prepared(&backend).unwrap();
+        assert_eq!(
+            rec.prepared_pool
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .entry
+                .as_ref()
+                .unwrap()
+                .pool,
+            pool
+        );
+        // Unfinished-recording Drop must be just as safe as dropping a finished packet.
+        rec.copy(src.as_ref(), 0, dst.as_ref(), 0, 4);
+        drop(rec);
+        assert_eq!(value(&backend, dst.as_ref()), 3.0);
+
+        let recorders: Vec<_> = (0..PreparedPoolCache::RETAIN + 2)
+            .map(|_| Recorder::new_prepared(&backend).unwrap())
+            .collect();
+        let pools: HashSet<_> = recorders
+            .iter()
+            .map(|rec| {
+                rec.prepared_pool
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .entry
+                    .as_ref()
+                    .unwrap()
+                    .pool
+            })
+            .collect();
+        assert_eq!(pools.len(), recorders.len());
+        drop(recorders);
+        assert_eq!(
+            backend
+                .shared
+                .recorder_prepared_pools
+                .pools
+                .lock()
+                .unwrap()
+                .len(),
+            PreparedPoolCache::RETAIN
+        );
+    }
+
+    fn prepend_visibility(push_desc: bool) {
+        let backend = backend(push_desc);
+        if !push_desc {
+            assert!(backend.shared.push_descriptor.is_none());
+        }
+        let src = backend.alloc(4, BufferUsage::Staging).unwrap();
+        let scratch = backend.alloc(512, BufferUsage::Activations).unwrap();
+        let out = backend.alloc(4, BufferUsage::Readback).unwrap();
+        // A worker's subrange alias must preserve the original SSBO offset and extent.
+        // The owning allocation stays pinned for this entire recording/submission test.
+        let mut alias = unsafe { Recorder::vk_of(scratch.as_ref()).recording_alias() };
+        alias.backing = Backing::RecordingAlias {
+            mapped: None,
+            backing_len: Some(512),
+        };
+        alias.sub_offset = 256;
+        alias.size = 4;
+        alias.own_addr = alias.own_addr.map(|addr| addr + 256);
+        let info = Recorder::vkb(&alias);
+        assert_eq!(info.offset, 256);
+        assert_eq!(info.range, 256);
+        backend
+            .upload(src.as_ref(), bytemuck::bytes_of(&7.0f32))
+            .unwrap();
+        for nowait in [false, true] {
+            let rec = Recorder::new_prepared(&backend).unwrap();
+            rec.copy(src.as_ref(), 0, &alias, 0, 4);
+            rec.scale(&alias, 2.0, 1);
+            let cmd = rec.finish_prepared().unwrap();
+            if !push_desc {
+                assert!(!cmd.pools.is_empty());
+            }
+            let rec = backend.recorder().unwrap();
+            rec.prepend_prepared(cmd).unwrap();
+            assert_eq!(*rec.barriers.borrow(), 1);
+            rec.copy(scratch.as_ref(), 256, out.as_ref(), 0, 4);
+            assert_eq!(rec.dispatches(), 3);
+            let (sender, receiver) = mpsc::sync_channel(1);
+            rec.on_first_submit(sender.clone());
+            rec.on_first_submit(sender);
+            assert_eq!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty));
+            if nowait {
+                let pending = rec.finish_nowait().unwrap();
+                assert_eq!(receiver.try_recv(), Ok(()));
+                assert!(pending.prepared_prefix.is_some());
+                // Pending ownership excludes its pool from the cache, even if already signaled.
+                assert!(backend
+                    .shared
+                    .recorder_prepared_pools
+                    .pools
+                    .lock()
+                    .unwrap()
+                    .is_empty());
+                pending.wait().unwrap();
+            } else {
+                rec.finish().unwrap();
+                assert_eq!(receiver.try_recv(), Ok(()));
+            }
+            assert_eq!(receiver.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+            assert_eq!(value(&backend, out.as_ref()), 14.0);
+            assert_eq!(
+                backend
+                    .shared
+                    .recorder_prepared_pools
+                    .pools
+                    .lock()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        // A dropped main recorder must drop both unsubmitted commands without notification.
+        let prefix = Recorder::new_prepared(&backend)
+            .unwrap()
+            .finish_prepared()
+            .unwrap();
+        let rec = backend.recorder().unwrap();
+        rec.prepend_prepared(prefix).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        rec.on_first_submit(sender);
+        drop(rec);
+        assert_eq!(receiver.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU; parent serializes GPU tests"]
+    fn prepend_copy_visibility_and_first_submit_notification() {
+        prepend_visibility(true);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU; parent serializes GPU tests"]
+    fn prepend_copy_visibility_with_classic_descriptor_fallback() {
+        prepend_visibility(false);
     }
 }
 
@@ -14705,9 +17650,1286 @@ mod chunk_math_tests {
 }
 
 #[cfg(test)]
+#[path = "recorder_gpu_owner_performance.rs"]
+mod gpu_owner_performance;
+
+#[cfg(test)]
+mod gpu_owned_tests {
+    use super::*;
+
+    include!("recorder_gpu_owned_overlap_tests.rs");
+    include!("recorder_gpu_owned_fifo_tests.rs");
+    include!("recorder_gpu_owned_copy_publish_tests.rs");
+    include!("recorder_gpu_owned_copy_count_tests.rs");
+    include!("recorder_gpu_owned_recovery_seed_tests.rs");
+    include!("recorder_owned_role_pipeline_tests.rs");
+
+    const NONE: u32 = u32::MAX;
+    const POOL_BASE: usize = 3;
+    const SLOT_BASE: usize = 7;
+    const ADDRESS_BASE: usize = 13;
+    const HEAP_BASE: usize = ADDRESS_BASE + 6;
+
+    fn stamp(words: &[u32]) -> u64 {
+        u64::from(words[0]) | (u64::from(words[1]) << 32)
+    }
+
+    fn heap_key(words: &[u32]) -> (u64, u32) {
+        (stamp(words), words[2])
+    }
+
+    fn lru_slots(nodes: &[u32], pool: usize) -> Vec<usize> {
+        let mut slots: Vec<_> = (pool * 3..pool * 3 + 3)
+            .filter(|&slot| matches!(nodes[(SLOT_BASE + slot) * 4 + 3], 1 | 2))
+            .collect();
+        slots.sort_unstable_by_key(|&slot| (stamp(&nodes[(SLOT_BASE + slot) * 4..]), slot));
+        slots
+    }
+
+    fn assert_heaps(nodes: &[u32]) {
+        assert_eq!(nodes.len(), (HEAP_BASE + 6) * 4);
+        assert_eq!(&nodes[..3], &[2, 2, 6]);
+        assert_eq!(
+            &nodes[5..8],
+            &[POOL_BASE as u32, SLOT_BASE as u32, ADDRESS_BASE as u32]
+        );
+        let clock = stamp(&nodes[10..12]);
+        for pool in 0..2 {
+            let header = &nodes[(POOL_BASE + pool * 2) * 4..];
+            let base = header[0] as usize;
+            let count = header[1] as usize;
+            assert_eq!(base, HEAP_BASE + pool * 3);
+            assert_eq!(header[3], 3);
+            let residents = lru_slots(nodes, pool);
+            assert_eq!(count, residents.len());
+            let mut seen = std::collections::HashSet::new();
+            let mut timestamps = std::collections::HashSet::new();
+            for index in 0..count {
+                let entry = &nodes[(base + index) * 4..];
+                let slot = entry[2] as usize;
+                assert!(
+                    residents.contains(&slot),
+                    "heap entry outside resident pool"
+                );
+                assert!(seen.insert(slot), "duplicate heap slot");
+                let actual = stamp(&nodes[(SLOT_BASE + slot) * 4..]);
+                assert!(
+                    stamp(entry) <= actual,
+                    "cached heap timestamp exceeds live slot"
+                );
+                assert!(actual > 0 && actual <= clock);
+                assert!(
+                    timestamps.insert(actual),
+                    "duplicate live timestamp in pool"
+                );
+                assert_eq!(entry[3], 0);
+                if index != 0 {
+                    let parent = &nodes[(base + (index - 1) / 2) * 4..];
+                    assert!(
+                        heap_key(parent) <= heap_key(entry),
+                        "cached timestamps are not a min-heap"
+                    );
+                }
+            }
+        }
+    }
+
+    struct Fixture {
+        buffers: Vec<Box<dyn Buffer>>,
+        source: Box<dyn Buffer>,
+        destination: Box<dyn Buffer>,
+        nodes: Vec<[u32; 4]>,
+        source_words: Vec<u32>,
+    }
+
+    fn backend() -> VulkanBackend {
+        let mut cfg = infr_core::config::Config::default();
+        cfg.device.dev = Some(
+            std::env::var("MOE4ALL_TEST_DEVICE")
+                .expect("central GPU runner must explicitly select an idle device"),
+        );
+        VulkanBackend::new_with(Arc::new(cfg)).unwrap()
+    }
+
+    fn upload_words(be: &VulkanBackend, buffer: &dyn Buffer, words: &[u32]) {
+        be.upload(buffer, bytemuck::cast_slice(words)).unwrap();
+    }
+
+    fn read_words(be: &VulkanBackend, buffer: &dyn Buffer) -> Vec<u32> {
+        let mut words = vec![0; buffer.len_bytes() / 4];
+        be.download(buffer, bytemuck::cast_slice_mut(&mut words))
+            .unwrap();
+        words
+    }
+
+    #[test]
+    #[ignore = "central GPU runner only; notice fence lease recycling lifetime"]
+    fn notice_fence_lease_waits_for_segment_and_last_worker_share() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<NoticeFenceLease>();
+        let be = backend();
+        for gpu_finishes_first in [true, false] {
+            let mut segment = be.recorder().unwrap().finish_nowait().unwrap();
+            let fence = segment
+                .notice_fence()
+                .expect("nonprofiling pending segment");
+            let lease = segment.lease_notice_fence().unwrap();
+            let cached = segment.lease_notice_fence().unwrap();
+            assert!(Arc::ptr_eq(&lease, &cached));
+            assert_eq!(Arc::strong_count(&lease), 3);
+            drop(cached);
+            let weak = Arc::downgrade(&lease);
+            if gpu_finishes_first {
+                segment.drain().unwrap();
+                assert_eq!(Arc::strong_count(&lease), 1);
+                assert!(!be.shared.recorder_fences.lock().unwrap().contains(&fence));
+                let next = be.recorder().unwrap().finish_nowait().unwrap();
+                assert_ne!(next.notice_fence(), Some(fence));
+                next.wait().unwrap();
+                drop(lease);
+            } else {
+                drop(lease);
+                assert_eq!(weak.strong_count(), 1);
+                assert!(!be.shared.recorder_fences.lock().unwrap().contains(&fence));
+                // Exercise the Drop/error-unwind backstop as well as explicit drain.
+                drop(segment);
+                assert!(weak.upgrade().is_none());
+                assert_eq!(
+                    be.shared
+                        .recorder_fences
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|&&f| f == fence)
+                        .count(),
+                    1
+                );
+                continue;
+            }
+            assert!(weak.upgrade().is_none());
+            assert!(segment.lease_notice_fence().is_none());
+            drop(segment);
+            assert_eq!(
+                be.shared
+                    .recorder_fences
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|&&f| f == fence)
+                    .count(),
+                1
+            );
+        }
+    }
+
+    impl Fixture {
+        fn new(be: &VulkanBackend, count: usize, cpu_job: bool) -> Self {
+            let (source, source_address) = be.alloc_mapped_arena_bda(8 * 16).unwrap();
+            let (destination, destination_address) = be.alloc_mapped_arena_bda(6 * 16).unwrap();
+            let source_words: Vec<u32> = (0..32).map(|i| 0x1234_0000 + i).collect();
+            upload_words(be, source.as_ref(), &source_words);
+            upload_words(be, destination.as_ref(), &[0xa5a5_a5a5; 24]);
+            let mut nodes = vec![[0; 4]; HEAP_BASE + 6];
+            nodes[0] = [2, 2, 6, 41];
+            nodes[1] = [7, POOL_BASE as u32, SLOT_BASE as u32, ADDRESS_BASE as u32];
+            nodes[2] = [0, 0, 2, 0];
+            let mut overlay = vec![[0, 0, 0, NONE]; 8];
+            for pool in 0..2 {
+                let s = (pool * 3) as u32;
+                let heap = HEAP_BASE + pool * 3;
+                nodes[POOL_BASE + 2 * pool] = [heap as u32, 2, s + 2, 3];
+                nodes[SLOT_BASE + s as usize] = [1, 0, (pool * 4 + 3) as u32, 1];
+                nodes[SLOT_BASE + s as usize + 1] = [2, 0, (pool * 4 + 1) as u32, 1];
+                nodes[SLOT_BASE + s as usize + 2] = [0, NONE, NONE, 0];
+                nodes[heap] = [1, 0, s, 0];
+                nodes[heap + 1] = [2, 0, s + 1, 0];
+                for local in 0..3 {
+                    let slot = pool * 3 + local;
+                    let address = destination_address + (slot * 16) as u64;
+                    nodes[ADDRESS_BASE + slot] = [
+                        address as u32,
+                        (address >> 32) as u32,
+                        pool as u32,
+                        local as u32,
+                    ];
+                    if local < 2 {
+                        let block = pool * 4 + if local == 0 { 3 } else { 1 };
+                        overlay[block] = [address as u32, (address >> 32) as u32, 1, slot as u32];
+                    }
+                }
+            }
+            let mut sources = vec![[0; 4]; 8];
+            for (block, entry) in sources.iter_mut().enumerate() {
+                let address = if cpu_job && block == 6 {
+                    0
+                } else {
+                    source_address + (block * 16) as u64
+                };
+                *entry = [
+                    address as u32,
+                    (address >> 32) as u32,
+                    16,
+                    (block / 4) as u32,
+                ];
+            }
+            let sizes = [
+                (count + 2) * 4,
+                12 * 8,
+                RESIDENT_CONTROL_BYTES,
+                RESIDENT_JOURNAL_BYTES,
+                sources.len() * 16,
+                nodes.len() * 16,
+                overlay.len() * 16,
+                RESIDENT_JOURNAL_ID_WORDS * 3 * 32,
+            ];
+            let buffers: Vec<_> = sizes
+                .into_iter()
+                .map(|bytes| {
+                    let buffer = be.alloc_mapped_arena_bda(bytes).unwrap().0;
+                    upload_words(be, buffer.as_ref(), &vec![0; bytes / 4]);
+                    buffer
+                })
+                .collect();
+            let mut ids = vec![0; count + 2];
+            for (i, id) in ids[..count].iter_mut().enumerate() {
+                *id = i as u32;
+            }
+            upload_words(be, buffers[0].as_ref(), &ids);
+            upload_words(be, buffers[1].as_ref(), &[0xdead_beef; 24]);
+            let mut control = vec![0; RESIDENT_CONTROL_BYTES / 4];
+            control[0] = 1;
+            control[1] = NONE;
+            upload_words(be, buffers[2].as_ref(), &control);
+            be.upload(buffers[4].as_ref(), bytemuck::cast_slice(&sources))
+                .unwrap();
+            be.upload(buffers[5].as_ref(), bytemuck::cast_slice(&nodes))
+                .unwrap();
+            be.upload(buffers[6].as_ref(), bytemuck::cast_slice(&overlay))
+                .unwrap();
+            Self {
+                buffers,
+                source,
+                destination,
+                nodes,
+                source_words,
+            }
+        }
+
+        fn publish(&self, rec: &Recorder<'_>, mode: u32) {
+            let kernel = rec.be.kernel(
+                "gpu_owned_publish",
+                crate::gemm::gpu_owned_publish_spv(),
+                4,
+                8,
+            );
+            let bindings = [3, 7, 5, 6].map(|i| Recorder::vkb(self.buffers[i].as_ref()));
+            rec.dispatch(kernel, &bindings, 4, bytemuck::cast_slice(&[0u32, mode]), 1);
+        }
+
+        fn run(&self, be: &VulkanBackend, count: u32) {
+            self.run_with_roles(be, count, [0, 0, 4]);
+        }
+
+        fn reset_inputs(&self, be: &VulkanBackend, ids: &[u32]) {
+            let mut words = vec![0; self.buffers[0].len_bytes() / 4];
+            words[..ids.len()].copy_from_slice(ids);
+            upload_words(be, self.buffers[0].as_ref(), &words);
+            let mut control = vec![0; RESIDENT_CONTROL_BYTES / 4];
+            control[0] = 1;
+            control[1] = NONE;
+            upload_words(be, self.buffers[2].as_ref(), &control);
+        }
+
+        fn run_with_roles(&self, be: &VulkanBackend, count: u32, roles: [u32; 3]) {
+            let rec = be.recorder().unwrap();
+            let push = gpu_copy_prepare_push(
+                [count, 4, 0, 4, 8, 0, count, 0],
+                true,
+                [roles[0], roles[1], roles[2], 0, 0, 0, 0, 0, 0],
+                2,
+            );
+            let bindings: Vec<_> = self
+                .buffers
+                .iter()
+                .map(|buffer| Recorder::vkb(buffer.as_ref()))
+                .collect();
+            rec.owned_copy_barrier(true, false);
+            if self.nodes[0][0] == 4 && roles.iter().all(|&base| matches!(base, 0 | 4)) {
+                let mut geometry = [0; 12];
+                for (role, base) in roles.into_iter().enumerate() {
+                    let pool = base / 4;
+                    geometry[role * 4..role * 4 + 4].copy_from_slice(&[pool, 16, pool * 3, 3]);
+                }
+                let fused = be.kernel(
+                    "gpu_owned_prepare_fused",
+                    crate::gemm::gpu_owned_prepare_fused_spv(false),
+                    8,
+                    GPU_OWNED_FAST_PUSH_BYTES,
+                );
+                rec.dispatch(
+                    fused,
+                    &bindings,
+                    8,
+                    bytemuck::cast_slice(&gpu_owned_fast_push(&push, &geometry)),
+                    1,
+                );
+            } else {
+                let kernel = be.kernel(
+                    if self.nodes[0][0] == 4 {
+                        "gpu_owned_prepare"
+                    } else {
+                        "gpu_owned_prepare_reference"
+                    },
+                    if self.nodes[0][0] == 4 {
+                        crate::gemm::gpu_owned_prepare_spv()
+                    } else {
+                        crate::gemm::gpu_owned_prepare_reference_spv()
+                    },
+                    8,
+                    GPU_COPY_PREPARE_PUSH_BYTES,
+                );
+                rec.dispatch(kernel, &bindings, 8, bytemuck::cast_slice(&push), 1);
+            }
+            rec.owned_copy_barrier(false, false);
+            let kernel = be.kernel(
+                "gpu_owned_payload",
+                crate::gemm::gpu_resident_copy_payload_spv(false),
+                2,
+                4,
+            );
+            rec.dispatch(
+                kernel,
+                &[bindings[3], bindings[7]],
+                2,
+                bytemuck::bytes_of(&0u32),
+                2,
+            );
+            rec.owned_copy_barrier(false, false);
+            self.publish(&rec, 0);
+            rec.owned_copy_barrier(false, true);
+            rec.finish().unwrap();
+        }
+    }
+
+    struct CpuReference {
+        blocks: [Option<usize>; 6],
+        stamps: [u64; 6],
+        clock: u64,
+        stats: [[u32; 4]; 2],
+    }
+
+    impl CpuReference {
+        fn new() -> Self {
+            Self {
+                blocks: [Some(3), Some(1), None, Some(7), Some(5), None],
+                stamps: [1, 2, 0, 1, 2, 0],
+                clock: 2,
+                stats: [[0; 4]; 2],
+            }
+        }
+
+        fn request(&mut self, ids: &[u32], roles: [u32; 3]) -> usize {
+            let requests: Vec<_> = roles
+                .into_iter()
+                .flat_map(|base| ids.iter().map(move |&id| (base + id) as usize))
+                .collect();
+            let protected: std::collections::HashSet<_> = requests.iter().copied().collect();
+            for pool in 0..2 {
+                assert!(protected.iter().filter(|&&block| block / 4 == pool).count() <= 3);
+            }
+            let clock = self.clock;
+            let timestamp = |block| {
+                clock + requests.iter().rposition(|&value| value == block).unwrap() as u64 + 1
+            };
+            let stamps: Vec<_> = requests.iter().map(|&block| timestamp(block)).collect();
+            // Publish every requested resident's final alias timestamp before selecting victims.
+            for slot in 0..6 {
+                if let Some(block) = self.blocks[slot].filter(|block| protected.contains(block)) {
+                    self.stamps[slot] = timestamp(block);
+                }
+            }
+            let mut misses = 0;
+            for (q, &block) in requests.iter().enumerate() {
+                let pool = block / 4;
+                if self.blocks.contains(&Some(block)) {
+                    self.stats[pool][0] += 1;
+                    continue;
+                }
+                self.stats[pool][1] += 1;
+                misses += 1;
+                let range = pool * 3..pool * 3 + 3;
+                let slot = range
+                    .clone()
+                    .find(|&slot| self.blocks[slot].is_none())
+                    .unwrap_or_else(|| {
+                        let slot = range
+                            .filter(|&slot| !protected.contains(&self.blocks[slot].unwrap()))
+                            .min_by_key(|&slot| (self.stamps[slot], slot))
+                            .unwrap();
+                        self.stats[pool][2] += 1;
+                        slot
+                    });
+                self.blocks[slot] = Some(block);
+                self.stamps[slot] = stamps[q];
+            }
+            self.clock += requests.len() as u64;
+            misses
+        }
+
+        fn assert_fixture(&self, be: &VulkanBackend, fixture: &Fixture) {
+            let nodes = read_words(be, fixture.buffers[5].as_ref());
+            if nodes[0] == 4 {
+                assert_fifo(&nodes);
+            } else {
+                assert_heaps(&nodes);
+            }
+            assert_eq!(stamp(&nodes[10..12]), self.clock);
+            assert_eq!(
+                nodes[8],
+                self.stats.iter().map(|stats| stats[0]).sum::<u32>()
+            );
+            assert_eq!(
+                nodes[9],
+                self.stats.iter().map(|stats| stats[1]).sum::<u32>()
+            );
+            let overlay = read_words(be, fixture.buffers[6].as_ref());
+            let data = read_words(be, fixture.destination.as_ref());
+            for pool in 0..2 {
+                let mut expected: Vec<_> = (pool * 3..pool * 3 + 3)
+                    .filter(|&slot| self.blocks[slot].is_some())
+                    .collect();
+                expected.sort_unstable_by_key(|&slot| (self.stamps[slot], slot));
+                assert_eq!(lru_slots(&nodes, pool), expected);
+                let stats = (POOL_BASE + pool * 2 + 1) * 4;
+                assert_eq!(&nodes[stats..stats + 4], &self.stats[pool]);
+            }
+            for slot in 0..6 {
+                let actual = &nodes[(SLOT_BASE + slot) * 4..];
+                if let Some(block) = self.blocks[slot] {
+                    assert_eq!(&actual[2..4], &[block as u32, 1]);
+                    assert_eq!(stamp(actual), self.stamps[slot]);
+                    let entry = &overlay[block * 4..block * 4 + 4];
+                    assert_eq!(&entry[2..4], &[1, slot as u32]);
+                    assert_eq!(
+                        &entry[..2],
+                        &nodes[(ADDRESS_BASE + slot) * 4..(ADDRESS_BASE + slot) * 4 + 2]
+                    );
+                    assert_eq!(
+                        &data[slot * 4..slot * 4 + 4],
+                        &fixture.source_words[block * 4..block * 4 + 4]
+                    );
+                } else {
+                    assert_eq!(actual[3], 0);
+                }
+            }
+            for block in 0..8 {
+                if !self.blocks.contains(&Some(block)) {
+                    assert_eq!(&overlay[block * 4..block * 4 + 4], &[0, 0, 0, NONE]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "central GPU runner only; 64-slot exact parallel scan after stale-root repairs"]
+    fn gpu_owned_v2_parallel_scan_after_repair_budget() {
+        const SLOTS: usize = 64;
+        const BLOCKS: usize = SLOTS + 1;
+        const POOLS: usize = 3;
+        const SLOTS_BASE: usize = POOLS + 2;
+        const ADDRESSES: usize = SLOTS_BASE + SLOTS;
+        const HEAP: usize = ADDRESSES + SLOTS;
+        let be = backend();
+        let (source, source_address) = be.alloc_mapped_arena_bda(BLOCKS * 16).unwrap();
+        let (destination, destination_address) = be.alloc_mapped_arena_bda(SLOTS * 16).unwrap();
+        let source_words: Vec<u32> = (0..BLOCKS * 4).map(|i| 0x7642_0000 + i as u32).collect();
+        upload_words(&be, source.as_ref(), &source_words);
+        upload_words(&be, destination.as_ref(), &source_words[..SLOTS * 4]);
+        let mut nodes = vec![[0u32; 4]; HEAP + SLOTS];
+        nodes[0] = [2, 1, SLOTS as u32, 41];
+        nodes[1] = [7, POOLS as u32, SLOTS_BASE as u32, ADDRESSES as u32];
+        nodes[2] = [0, 0, 200, 0];
+        nodes[POOLS] = [HEAP as u32, SLOTS as u32, NONE, SLOTS as u32];
+        let mut sources = vec![[0u32; 4]; BLOCKS];
+        let mut overlay = vec![[0, 0, 0, NONE]; BLOCKS];
+        for block in 0..BLOCKS {
+            let address = source_address + (block * 16) as u64;
+            sources[block] = [address as u32, (address >> 32) as u32, 16, 0];
+            if block < SLOTS {
+                let address = destination_address + (block * 16) as u64;
+                nodes[SLOTS_BASE + block] = [100 + block as u32, 0, block as u32, 1];
+                nodes[ADDRESSES + block] =
+                    [address as u32, (address >> 32) as u32, 0, block as u32];
+                nodes[HEAP + block] = [1 + block as u32, 0, block as u32, 0];
+                overlay[block] = [address as u32, (address >> 32) as u32, 1, block as u32];
+            }
+        }
+        // Every cached key precedes every live key. All 16 root repairs are exhausted
+        // before finding a fresh minimum, forcing exact parallel scan fallback.
+        let sizes = [
+            4 * 4,
+            3 * BLOCKS * 8,
+            RESIDENT_CONTROL_BYTES,
+            RESIDENT_JOURNAL_BYTES,
+            sources.len() * 16,
+            nodes.len() * 16,
+            overlay.len() * 16,
+            RESIDENT_JOURNAL_ID_WORDS * 3 * 32,
+        ];
+        let buffers: Vec<_> = sizes
+            .into_iter()
+            .map(|bytes| {
+                let buffer = be.alloc_mapped_arena_bda(bytes).unwrap().0;
+                upload_words(&be, buffer.as_ref(), &vec![0; bytes / 4]);
+                buffer
+            })
+            .collect();
+        upload_words(&be, buffers[0].as_ref(), &[64, 1, 0, 0]);
+        upload_words(&be, buffers[1].as_ref(), &vec![0xdead_beef; 3 * BLOCKS * 2]);
+        let mut control = vec![0; RESIDENT_CONTROL_BYTES / 4];
+        control[0] = 1;
+        control[1] = NONE;
+        upload_words(&be, buffers[2].as_ref(), &control);
+        be.upload(buffers[4].as_ref(), bytemuck::cast_slice(&sources))
+            .unwrap();
+        be.upload(buffers[5].as_ref(), bytemuck::cast_slice(&nodes))
+            .unwrap();
+        be.upload(buffers[6].as_ref(), bytemuck::cast_slice(&overlay))
+            .unwrap();
+        let bindings: Vec<_> = buffers
+            .iter()
+            .map(|buffer| Recorder::vkb(buffer.as_ref()))
+            .collect();
+        let push = gpu_copy_prepare_push(
+            [
+                2,
+                BLOCKS as u32,
+                0,
+                BLOCKS as u32,
+                (2 * BLOCKS) as u32,
+                0,
+                2,
+                0,
+            ],
+            true,
+            [0; 9],
+            2,
+        );
+        let rec = be.recorder().unwrap();
+        let prepare = be.kernel(
+            "gpu_owned_prepare_reference",
+            crate::gemm::gpu_owned_prepare_reference_spv(),
+            8,
+            GPU_COPY_PREPARE_PUSH_BYTES,
+        );
+        rec.owned_copy_barrier(true, false);
+        rec.dispatch(prepare, &bindings, 8, bytemuck::cast_slice(&push), 1);
+        rec.owned_copy_barrier(false, false);
+        let payload = be.kernel(
+            "gpu_owned_payload",
+            crate::gemm::gpu_resident_copy_payload_spv(false),
+            2,
+            4,
+        );
+        rec.dispatch(
+            payload,
+            &[bindings[3], bindings[7]],
+            2,
+            bytemuck::bytes_of(&0u32),
+            2,
+        );
+        rec.owned_copy_barrier(false, false);
+        let publish = be.kernel(
+            "gpu_owned_publish",
+            crate::gemm::gpu_owned_publish_spv(),
+            4,
+            8,
+        );
+        rec.dispatch(
+            publish,
+            &[bindings[3], bindings[7], bindings[5], bindings[6]],
+            4,
+            bytemuck::cast_slice(&[0u32, 0]),
+            1,
+        );
+        rec.owned_copy_barrier(false, true);
+        rec.finish().unwrap();
+
+        let journal = read_words(&be, buffers[3].as_ref());
+        assert_eq!(journal[RESIDENT_JOURNAL_STATUS_WORD], 4);
+        assert_eq!(journal[RESIDENT_JOURNAL_JOB_COUNT_WORD], 1);
+        let jobs = read_words(&be, buffers[7].as_ref());
+        assert_eq!(&jobs[..2], &sources[64][..2]);
+        assert_eq!(&jobs[2..4], &nodes[ADDRESSES][..2]);
+        assert_eq!(&jobs[4..7], &[16, 64, 0]);
+        let actual = read_words(&be, buffers[5].as_ref());
+        assert_eq!(
+            &actual[..8],
+            bytemuck::cast_slice::<[u32; 4], u32>(&nodes[..2])
+        );
+        assert_eq!(&actual[8..12], &[5, 1, 206, 0]);
+        assert_eq!(&actual[POOLS * 4..POOLS * 4 + 4], &nodes[POOLS]);
+        assert_eq!(&actual[(POOLS + 1) * 4..(POOLS + 2) * 4], &[5, 1, 1, 0]);
+        let mut seen = std::collections::HashSet::new();
+        for index in 0..SLOTS {
+            let entry = &actual[(HEAP + index) * 4..(HEAP + index + 1) * 4];
+            let slot = entry[2] as usize;
+            assert!(
+                slot < SLOTS && seen.insert(slot),
+                "invalid or duplicate heap slot after parallel scan"
+            );
+            let live = &actual[(SLOTS_BASE + slot) * 4..(SLOTS_BASE + slot + 1) * 4];
+            assert!(
+                stamp(entry) <= stamp(live),
+                "cached heap timestamp exceeds live slot after parallel scan"
+            );
+            assert_eq!(entry[3], 0);
+            if index != 0 {
+                let parent = &actual[(HEAP + (index - 1) / 2) * 4..];
+                assert!(
+                    heap_key(parent) <= heap_key(entry),
+                    "heap violates handoff key ordering after parallel scan"
+                );
+            }
+        }
+        let mut order: Vec<_> = (0..SLOTS).collect();
+        order.sort_unstable_by_key(|&slot| (stamp(&actual[(SLOTS_BASE + slot) * 4..]), slot));
+        assert_eq!(order, (2..SLOTS).chain([0, 1]).collect::<Vec<_>>());
+        let published = read_words(&be, buffers[6].as_ref());
+        assert_eq!(&published[..4], &[0, 0, 0, NONE]);
+        let data = read_words(&be, destination.as_ref());
+        for slot in 0..SLOTS {
+            let block = if slot == 0 { 64 } else { slot };
+            let timestamp = match slot {
+                0 => 205,
+                1 => 206,
+                _ => 100 + slot as u32,
+            };
+            assert_eq!(
+                &actual[(SLOTS_BASE + slot) * 4..(SLOTS_BASE + slot + 1) * 4],
+                &[timestamp, 0, block as u32, 1]
+            );
+            let address = &nodes[ADDRESSES + slot];
+            assert_eq!(
+                &actual[(ADDRESSES + slot) * 4..(ADDRESSES + slot + 1) * 4],
+                address
+            );
+            assert_eq!(
+                &published[block * 4..block * 4 + 4],
+                &[address[0], address[1], 1, slot as u32]
+            );
+            assert_eq!(
+                &data[slot * 4..slot * 4 + 4],
+                &source_words[block * 4..block * 4 + 4]
+            );
+        }
+        let tape = read_words(&be, buffers[1].as_ref());
+        for role in 0..3 {
+            for (id, slot) in [(64, 0), (1, 1)] {
+                let word = (role * BLOCKS + id) * 2;
+                assert_eq!(&tape[word..word + 2], &nodes[ADDRESSES + slot][..2]);
+            }
+        }
+        let control = read_words(&be, buffers[2].as_ref());
+        assert_eq!(control[0], 1);
+        assert_eq!(control[3], 0);
+        assert_eq!(source.len_bytes(), BLOCKS * 16);
+    }
+
+    #[test]
+    #[ignore = "central GPU runner only; bounded v2 stale-heap and exact-LRU regression"]
+    fn gpu_owned_v2_lazy_heap_matches_cpu_lru_for_mixed_requests() {
+        let be = backend();
+        let fixture = Fixture::new(&be, 2, false);
+        let mut reference = CpuReference::new();
+        let mut data = vec![0xa5a5_a5a5; 24];
+        for (slot, block) in reference.blocks.iter().enumerate() {
+            if let Some(block) = *block {
+                data[slot * 4..slot * 4 + 4]
+                    .copy_from_slice(&fixture.source_words[block * 4..block * 4 + 4]);
+            }
+        }
+        upload_words(&be, fixture.destination.as_ref(), &data);
+        // Exercise timestamp carry without adding another device/test matrix.
+        reference.clock = u64::from(u32::MAX) - 2;
+        let mut seed = fixture.nodes.clone();
+        seed[2] = [0, 0, reference.clock as u32, (reference.clock >> 32) as u32];
+        be.upload(fixture.buffers[5].as_ref(), bytemuck::cast_slice(&seed))
+            .unwrap();
+        let mut check = |ids: &[u32], roles: [u32; 3]| {
+            fixture.reset_inputs(&be, ids);
+            let misses = reference.request(ids, roles);
+            fixture.run_with_roles(&be, ids.len() as u32, roles);
+            let journal = read_words(&be, fixture.buffers[3].as_ref());
+            assert_eq!(
+                journal[RESIDENT_JOURNAL_STATUS_WORD],
+                if misses == 0 { 1 } else { 4 }
+            );
+            assert_eq!(journal[RESIDENT_JOURNAL_JOB_COUNT_WORD], misses as u32);
+            reference.assert_fixture(&be, &fixture);
+        };
+        // Hit both cached roots without eagerly fixing them, fill free slots, then force
+        // eviction. Exact LRU must repair the stale roots and evict block 1/5, not 3/7.
+        check(&[3], [0, 0, 4]);
+        let stale = read_words(&be, fixture.buffers[5].as_ref());
+        for pool in 0..2 {
+            let root = &stale[(HEAP_BASE + pool * 3) * 4..];
+            assert!(stamp(root) < stamp(&stale[(SLOT_BASE + root[2] as usize) * 4..]));
+        }
+        check(&[0], [0, 0, 4]);
+        check(&[2], [0, 0, 4]);
+        // Real role banks are complete size-class-aligned ranges, not ranges straddling pools.
+        let patterns = [[0, 0, 4], [4, 0, 4], [0, 4, 0], [4, 4, 0]];
+        let mut rng = 0x61c8_8647u32;
+        let mut completed = 0;
+        let mut attempts = 0;
+        while completed < 64 {
+            attempts += 1;
+            assert!(
+                attempts <= 256,
+                "bounded request generator did not fill its sample"
+            );
+            rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let count = 1 + (rng as usize & 1);
+            let ids = [(rng >> 8) & 3, (rng >> 16) & 3];
+            let roles = patterns[(rng >> 24) as usize & 3];
+            let requested: std::collections::HashSet<_> = roles
+                .into_iter()
+                .flat_map(|base| ids[..count].iter().map(move |&id| base + id))
+                .collect();
+            if requested.iter().any(|&block| block >= 8)
+                || (0..2)
+                    .any(|pool| requested.iter().filter(|&&block| block / 4 == pool).count() > 3)
+            {
+                continue;
+            }
+            check(&ids[..count], roles);
+            completed += 1;
+        }
+    }
+
+    #[test]
+    #[ignore = "central GPU runner only; requires MOE4ALL_TEST_DEVICE and Vulkan BDA"]
+    fn gpu_owned_cache_aliases_pool_stats_payload_and_cpu_publish() {
+        let be = backend();
+        for cpu_job in [false, true] {
+            let fixture = Fixture::new(&be, 3, cpu_job);
+            fixture.run(&be, 3);
+            let journal = read_words(&be, fixture.buffers[3].as_ref());
+            assert_eq!(
+                journal[RESIDENT_JOURNAL_STATUS_WORD],
+                if cpu_job { 5 } else { 4 }
+            );
+            assert_eq!(journal[RESIDENT_JOURNAL_JOB_COUNT_WORD], 4);
+            assert_eq!(journal[RESIDENT_JOURNAL_MASK_WORD], 2);
+            let masks = read_words(&be, fixture.buffers[0].as_ref());
+            assert_eq!(&masks[3..5], &[if cpu_job { 2 } else { 7 }, 0]);
+            let control = read_words(&be, fixture.buffers[2].as_ref());
+            assert_eq!(control[0], u32::from(!cpu_job));
+            assert_eq!(control[3], 0);
+            assert_eq!(control[4], 1);
+            assert_eq!(&control[5..7], &[u32::from(!cpu_job), 1]);
+            if cpu_job {
+                assert_eq!(control[1], 0);
+            }
+            let nodes = read_words(&be, fixture.buffers[5].as_ref());
+            assert_eq!(&nodes[8..12], &[5, 4, 11, 0]);
+            assert_heaps(&nodes);
+            assert_eq!(
+                &nodes[(POOL_BASE + 1) * 4..(POOL_BASE + 2) * 4],
+                &[4, 2, 1, 0]
+            );
+            assert_eq!(
+                &nodes[(POOL_BASE + 3) * 4..(POOL_BASE + 4) * 4],
+                &[1, 2, 1, 0]
+            );
+            assert_eq!(
+                &nodes[POOL_BASE * 4..POOL_BASE * 4 + 4],
+                &[HEAP_BASE as u32, 3, NONE, 3]
+            );
+            assert_eq!(
+                &nodes[(POOL_BASE + 2) * 4..(POOL_BASE + 2) * 4 + 4],
+                &[(HEAP_BASE + 3) as u32, 3, NONE, 3]
+            );
+            assert_eq!(lru_slots(&nodes, 0), [2, 1, 0]);
+            assert_eq!(lru_slots(&nodes, 1), [5, 4, 3]);
+            for (slot, timestamp) in [(2, 6), (1, 7), (0, 8), (5, 9), (4, 10), (3, 11)] {
+                assert_eq!(stamp(&nodes[(SLOT_BASE + slot) * 4..]), timestamp);
+            }
+            let mut data = read_words(&be, fixture.destination.as_ref());
+            for (block, slot) in [(0, 2), (2, 0), (4, 5), (6, 3)] {
+                let state = nodes[(SLOT_BASE + slot) * 4 + 3];
+                if cpu_job && block == 6 {
+                    assert_eq!(state, 2);
+                    assert_eq!(&data[slot * 4..slot * 4 + 4], &[0xa5a5_a5a5; 4]);
+                } else {
+                    assert_eq!(state, 1);
+                    assert_eq!(
+                        &data[slot * 4..slot * 4 + 4],
+                        &fixture.source_words[block * 4..block * 4 + 4]
+                    );
+                }
+            }
+            if cpu_job {
+                // Simulate precisely the unmapped job's completed host transfer.
+                let pointer = as_vk_buf(fixture.destination.as_ref())
+                    .unwrap()
+                    .mapped_ptr()
+                    .unwrap();
+                crate::copy_to_mapped(
+                    bytemuck::cast_slice(&fixture.source_words[24..28]),
+                    unsafe { pointer.add(3 * 16) },
+                );
+                let rec = be.recorder().unwrap();
+                rec.owned_copy_barrier(true, false);
+                fixture.publish(&rec, 1);
+                rec.owned_copy_barrier(false, true);
+                rec.finish().unwrap();
+                data = read_words(&be, fixture.destination.as_ref());
+                assert_eq!(&data[12..16], &fixture.source_words[24..28]);
+                let overlay = read_words(&be, fixture.buffers[6].as_ref());
+                assert_eq!(overlay[6 * 4 + 2], 1);
+                assert_eq!(
+                    read_words(&be, fixture.buffers[3].as_ref())[RESIDENT_JOURNAL_STATUS_WORD],
+                    5
+                );
+            }
+            // A stale frozen host Tape must never resurrect an evicted address on replay.
+            upload_words(&be, fixture.buffers[1].as_ref(), &[0xdead_beef; 24]);
+            let mut reset = vec![0; RESIDENT_CONTROL_BYTES / 4];
+            reset[0] = 1;
+            reset[1] = NONE;
+            upload_words(&be, fixture.buffers[2].as_ref(), &reset);
+            fixture.run(&be, 3);
+            let journal = read_words(&be, fixture.buffers[3].as_ref());
+            assert_eq!(journal[RESIDENT_JOURNAL_STATUS_WORD], 1);
+            assert_eq!(journal[RESIDENT_JOURNAL_JOB_COUNT_WORD], 0);
+            let tape = read_words(&be, fixture.buffers[1].as_ref());
+            let overlay = read_words(&be, fixture.buffers[6].as_ref());
+            for role in 0..3 {
+                for id in 0..3 {
+                    let block = if role == 2 { 4 + id } else { id };
+                    let word = (role * 4 + id) * 2;
+                    assert_eq!(&tape[word..word + 2], &overlay[block * 4..block * 4 + 2]);
+                }
+            }
+            let nodes = read_words(&be, fixture.buffers[5].as_ref());
+            assert_heaps(&nodes);
+            assert_eq!(&nodes[8..12], &[14, 4, 20, 0]);
+            assert_eq!(lru_slots(&nodes, 0), [2, 1, 0]);
+            assert_eq!(lru_slots(&nodes, 1), [5, 4, 3]);
+            assert_eq!(
+                &nodes[(POOL_BASE + 1) * 4..(POOL_BASE + 2) * 4],
+                &[10, 2, 1, 0]
+            );
+            assert_eq!(
+                &nodes[(POOL_BASE + 3) * 4..(POOL_BASE + 4) * 4],
+                &[4, 2, 1, 0]
+            );
+            // Keep the mapped source allocation alive through every payload submission.
+            assert_eq!(fixture.source.len_bytes(), 8 * 16);
+        }
+    }
+
+    #[test]
+    #[ignore = "central GPU runner only; isolated all-hit metadata latency, not model throughput"]
+    fn gpu_owned_prepare_latency_probe() {
+        let be = backend();
+        let fixture = Fixture::new(&be, 10, false);
+        let mut ids = vec![0u32; 12];
+        for (index, id) in ids[..10].iter_mut().enumerate() {
+            *id = if index % 2 == 0 { 1 } else { 3 };
+        }
+        upload_words(&be, fixture.buffers[0].as_ref(), &ids);
+        let push = gpu_copy_prepare_push(
+            [10, 4, 0, 4, 8, 0, 10, 0],
+            true,
+            [0, 0, 4, 0, 0, 0, 0, 0, 0],
+            2,
+        );
+        let bindings = fixture
+            .buffers
+            .iter()
+            .map(|b| Recorder::vkb(b.as_ref()))
+            .collect::<Vec<_>>();
+        // The old linked-list v1 baseline cannot consume this metadata. Optional comparisons
+        // must explicitly supply a v2 shader; this probe compares timings, not byte layouts.
+        let baseline = std::env::var_os("MOE4ALL_OWNER_PREPARE_V2_SPV").map(|path| {
+            ash::util::read_spv(&mut std::io::Cursor::new(std::fs::read(path).unwrap())).unwrap()
+        });
+        let mut shaders = vec![("current", crate::gemm::gpu_owned_prepare_reference_spv())];
+        if let Some(bytes) = baseline.as_ref() {
+            shaders.push(("optional_v2", bytes.as_slice()));
+        }
+        if std::env::var("MOE4ALL_OWNER_PREPARE_REVERSE").as_deref() == Ok("1") {
+            shaders.reverse();
+        }
+        let device = &be.shared.device;
+        let query = unsafe {
+            device.create_query_pool(
+                &vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(2),
+                None,
+            )
+        }
+        .unwrap();
+        let period = unsafe {
+            be.shared
+                .instance
+                .get_physical_device_properties(be.shared.physical_device)
+        }
+        .limits
+        .timestamp_period;
+        for (name, spv) in shaders {
+            be.upload(
+                fixture.buffers[5].as_ref(),
+                bytemuck::cast_slice(&fixture.nodes),
+            )
+            .unwrap();
+            let kernel_name = if name == "current" {
+                "gpu_owned_prepare"
+            } else {
+                "gpu_owned_prepare_probe_v2"
+            };
+            let kernel = if name != "current"
+                && std::env::var("MOE4ALL_OWNER_PREPARE_FORCE_SG32").as_deref() == Ok("1")
+            {
+                be.kernel_sg(kernel_name, spv, 8, GPU_COPY_PREPARE_PUSH_BYTES, 32)
+            } else {
+                be.kernel(kernel_name, spv, 8, GPU_COPY_PREPARE_PUSH_BYTES)
+            };
+            let mut samples = Vec::new();
+            for round in 0..8 {
+                let rec = be.recorder().unwrap();
+                unsafe {
+                    device.cmd_reset_query_pool(rec.cmd, query, 0, 2);
+                    device.cmd_write_timestamp(
+                        rec.cmd,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        query,
+                        0,
+                    );
+                }
+                for _ in 0..64 {
+                    rec.dispatch(kernel, &bindings, 8, bytemuck::cast_slice(&push), 1);
+                    rec.owned_copy_barrier(false, false);
+                }
+                unsafe {
+                    device.cmd_write_timestamp(
+                        rec.cmd,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        query,
+                        1,
+                    );
+                }
+                rec.finish().unwrap();
+                let mut ticks = [0u64; 2];
+                unsafe {
+                    device.get_query_pool_results(
+                        query,
+                        0,
+                        &mut ticks,
+                        vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                    )
+                }
+                .unwrap();
+                let status = read_words(&be, fixture.buffers[3].as_ref());
+                assert_eq!(status[RESIDENT_JOURNAL_STATUS_WORD], 1);
+                if round > 1 {
+                    samples.push((ticks[1] - ticks[0]) as f64 * period as f64 / 64.0 / 1000.0);
+                }
+            }
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "GPU_OWNER_PREPARE variant={name} routed=10 roles=3 mean_us={:.3} p50_us={:.3}",
+                samples.iter().sum::<f64>() / samples.len() as f64,
+                samples[samples.len() / 2]
+            );
+            let nodes = read_words(&be, fixture.buffers[5].as_ref());
+            assert_heaps(&nodes);
+            assert_eq!(&nodes[8..12], &[15_360, 0, 15_362, 0]);
+            assert_eq!(
+                &nodes[(POOL_BASE + 1) * 4..(POOL_BASE + 2) * 4],
+                &[10_240, 0, 0, 0]
+            );
+            assert_eq!(
+                &nodes[(POOL_BASE + 3) * 4..(POOL_BASE + 4) * 4],
+                &[5_120, 0, 0, 0]
+            );
+        }
+        unsafe {
+            device.destroy_query_pool(query, None);
+        }
+    }
+
+    #[test]
+    #[ignore = "central GPU runner only; requires MOE4ALL_TEST_DEVICE and Vulkan BDA"]
+    fn gpu_owned_cache_protects_owners_requested_by_later_roles() {
+        let be = backend();
+        let mut fixture = Fixture::new(&be, 2, false);
+        // Pool 0 is full. Its oldest owner (2) is requested only by Up; owner 3 is eligible.
+        fixture.nodes[2] = [0, 0, 3, 0];
+        fixture.nodes[POOL_BASE] = [HEAP_BASE as u32, 3, NONE, 3];
+        fixture.nodes[SLOT_BASE] = [1, 0, 2, 1];
+        fixture.nodes[SLOT_BASE + 1] = [2, 0, 1, 1];
+        fixture.nodes[SLOT_BASE + 2] = [3, 0, 3, 1];
+        for slot in 0..3 {
+            fixture.nodes[HEAP_BASE + slot] = [slot as u32 + 1, 0, slot as u32, 0];
+        }
+        be.upload(
+            fixture.buffers[5].as_ref(),
+            bytemuck::cast_slice(&fixture.nodes),
+        )
+        .unwrap();
+        let mut overlay = read_words(&be, fixture.buffers[6].as_ref());
+        for (block, slot) in [(2, 0), (3, 2)] {
+            let address = fixture.nodes[ADDRESS_BASE + slot];
+            overlay[block * 4..block * 4 + 4].copy_from_slice(&[
+                address[0],
+                address[1],
+                1,
+                slot as u32,
+            ]);
+        }
+        upload_words(&be, fixture.buffers[6].as_ref(), &overlay);
+        fixture.run_with_roles(&be, 2, [0, 1, 4]);
+        let journal = read_words(&be, fixture.buffers[3].as_ref());
+        assert_eq!(journal[RESIDENT_JOURNAL_STATUS_WORD], 4);
+        assert_eq!(journal[RESIDENT_JOURNAL_JOB_COUNT_WORD], 2);
+        let jobs = read_words(&be, fixture.buffers[7].as_ref());
+        assert_eq!(&jobs[5..7], &[0, 2]);
+        let overlay = read_words(&be, fixture.buffers[6].as_ref());
+        assert_eq!(&overlay[2 * 4 + 2..2 * 4 + 4], &[1, 0]);
+        assert_eq!(&overlay[3 * 4..4 * 4], &[0, 0, 0, NONE]);
+        let nodes = read_words(&be, fixture.buffers[5].as_ref());
+        assert_heaps(&nodes);
+        assert_eq!(&nodes[8..12], &[4, 2, 9, 0]);
+        assert_eq!(
+            &nodes[POOL_BASE * 4..POOL_BASE * 4 + 4],
+            &[HEAP_BASE as u32, 3, NONE, 3]
+        );
+        assert_eq!(lru_slots(&nodes, 0), [2, 1, 0]);
+        assert_eq!(lru_slots(&nodes, 1), [3, 5, 4]);
+        assert_eq!(
+            &nodes[(POOL_BASE + 1) * 4..(POOL_BASE + 2) * 4],
+            &[3, 1, 1, 0]
+        );
+        assert_eq!(
+            &nodes[(POOL_BASE + 3) * 4..(POOL_BASE + 4) * 4],
+            &[1, 1, 0, 0]
+        );
+    }
+
+    #[test]
+    #[ignore = "central GPU runner only; requires MOE4ALL_TEST_DEVICE and Vulkan BDA"]
+    fn gpu_owned_all_hit_bad_requested_mapping_is_atomic() {
+        fn prepare(be: &VulkanBackend, fixture: &Fixture, count: usize, used: usize) {
+            let rec = be.recorder().unwrap();
+            let push = gpu_copy_prepare_push(
+                [count as u32, 4, 0, 4, 8, 0, used as u32, 0],
+                true,
+                [0, 0, 4, 0, 0, 0, 0, 0, 0],
+                2,
+            );
+            let bindings: Vec<_> = fixture
+                .buffers
+                .iter()
+                .map(|buffer| Recorder::vkb(buffer.as_ref()))
+                .collect();
+            let kernel = be.kernel(
+                "gpu_owned_prepare_reference",
+                crate::gemm::gpu_owned_prepare_reference_spv(),
+                8,
+                GPU_COPY_PREPARE_PUSH_BYTES,
+            );
+            rec.owned_copy_barrier(true, false);
+            rec.dispatch(kernel, &bindings, 8, bytemuck::cast_slice(&push), 1);
+            rec.owned_copy_barrier(false, true);
+            rec.finish().unwrap();
+        }
+
+        let be = backend();
+        for (count, used) in [(2usize, 2usize), (128, 16)] {
+            for corruption in [
+                "invalid_id",
+                "slot_out_of_range",
+                "slot_wrong_pool",
+                "owner_mismatch",
+                "state_mismatch",
+                "overlay_copying",
+                "canonical_pool",
+                "canonical_local",
+                "canonical_zero",
+                "canonical_unaligned",
+                "canonical_address_mismatch",
+                "overlay_address_mismatch",
+            ] {
+                let mut fixture = Fixture::new(&be, 2, false);
+                let rows = count / used;
+                fixture.buffers[0] = be.alloc_mapped_arena_bda((count + rows * 2) * 4).unwrap().0;
+                let mut routed: Vec<u32> =
+                    (0..count).map(|i| if i % 2 == 0 { 1 } else { 3 }).collect();
+                fixture.reset_inputs(&be, &routed);
+                prepare(&be, &fixture, count, used);
+                let warm_journal = read_words(&be, fixture.buffers[3].as_ref());
+                assert_eq!(warm_journal[RESIDENT_JOURNAL_STATUS_WORD], 1);
+                assert_eq!(warm_journal[RESIDENT_JOURNAL_JOB_COUNT_WORD], 0);
+                assert_eq!(
+                    &warm_journal
+                        [RESIDENT_JOURNAL_JOB_COUNT_WORD + 1..RESIDENT_JOURNAL_JOB_COUNT_WORD + 3],
+                    &[41, 7]
+                );
+
+                let mut nodes = read_words(&be, fixture.buffers[5].as_ref());
+                let mut overlay = read_words(&be, fixture.buffers[6].as_ref());
+                // Block 7 is requested by the last role and the final ID, including i=127.
+                let entry = 7 * 4;
+                let slot = (SLOT_BASE + 3) * 4;
+                let address = (ADDRESS_BASE + 3) * 4;
+                assert_eq!(&overlay[entry + 2..entry + 4], &[1, 3]);
+                assert_eq!(&nodes[slot + 2..slot + 4], &[7, 1]);
+                match corruption {
+                    "invalid_id" => routed[count - 1] = 4,
+                    "slot_out_of_range" => overlay[entry + 3] = NONE,
+                    "slot_wrong_pool" => overlay[entry + 3] = 1,
+                    "owner_mismatch" => nodes[slot + 2] = 6,
+                    "state_mismatch" => nodes[slot + 3] = 2,
+                    "overlay_copying" => overlay[entry + 2] = 2,
+                    "canonical_pool" => nodes[address + 2] = 0,
+                    "canonical_local" => nodes[address + 3] = 2,
+                    "canonical_zero" => {
+                        nodes[address..address + 2].fill(0);
+                        overlay[entry..entry + 2].fill(0);
+                    }
+                    "canonical_unaligned" => {
+                        nodes[address] |= 1;
+                        overlay[entry] = nodes[address];
+                    }
+                    "canonical_address_mismatch" => nodes[address] ^= 16,
+                    "overlay_address_mismatch" => overlay[entry] ^= 16,
+                    _ => unreachable!(),
+                }
+                fixture.reset_inputs(&be, &routed);
+                upload_words(&be, fixture.buffers[5].as_ref(), &nodes);
+                upload_words(&be, fixture.buffers[6].as_ref(), &overlay);
+                let tracked = [0usize, 1, 4, 5, 6, 7];
+                let before: Vec<_> = tracked
+                    .iter()
+                    .map(|&i| read_words(&be, fixture.buffers[i].as_ref()))
+                    .collect();
+                let source = read_words(&be, fixture.source.as_ref());
+                let destination = read_words(&be, fixture.destination.as_ref());
+                prepare(&be, &fixture, count, used);
+                let journal = read_words(&be, fixture.buffers[3].as_ref());
+                assert_eq!(
+                    journal[RESIDENT_JOURNAL_STATUS_WORD], 3,
+                    "{count} IDs/{corruption}"
+                );
+                assert_eq!(journal[RESIDENT_JOURNAL_JOB_COUNT_WORD], 0);
+                assert_eq!(
+                    &journal
+                        [RESIDENT_JOURNAL_JOB_COUNT_WORD + 1..RESIDENT_JOURNAL_JOB_COUNT_WORD + 3],
+                    &[0, 0]
+                );
+                for (&i, words) in tracked.iter().zip(before) {
+                    assert_eq!(
+                        read_words(&be, fixture.buffers[i].as_ref()),
+                        words,
+                        "{count} IDs/{corruption}: buffer {i} changed"
+                    );
+                }
+                assert_eq!(read_words(&be, fixture.source.as_ref()), source);
+                assert_eq!(read_words(&be, fixture.destination.as_ref()), destination);
+                let control = read_words(&be, fixture.buffers[2].as_ref());
+                assert_eq!(&control[..5], &[0, 0, 1, 1, 0]);
+                assert_eq!(&control[5..7], &[0, 0]);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "central GPU runner only; requires MOE4ALL_TEST_DEVICE and Vulkan BDA"]
+    fn gpu_owned_cache_invalid_preflight_is_atomic() {
+        let be = backend();
+        for corruption in ["capacity", "free_cycle", "source_pool"] {
+            let count = if corruption == "capacity" { 4 } else { 3 };
+            let mut fixture = Fixture::new(&be, count, false);
+            if corruption == "free_cycle" {
+                fixture.nodes[SLOT_BASE + 2][1] = 2;
+                be.upload(
+                    fixture.buffers[5].as_ref(),
+                    bytemuck::cast_slice(&fixture.nodes),
+                )
+                .unwrap();
+            }
+            if corruption == "source_pool" {
+                let mut sources = read_words(&be, fixture.buffers[4].as_ref());
+                sources[3] = 2;
+                upload_words(&be, fixture.buffers[4].as_ref(), &sources);
+            }
+            let before: Vec<_> = [0, 1, 4, 5, 6, 7]
+                .map(|i| read_words(&be, fixture.buffers[i].as_ref()))
+                .into_iter()
+                .collect();
+            fixture.run(&be, count as u32);
+            let journal = read_words(&be, fixture.buffers[3].as_ref());
+            assert_eq!(journal[RESIDENT_JOURNAL_STATUS_WORD], 3);
+            assert_eq!(journal[RESIDENT_JOURNAL_JOB_COUNT_WORD], 0);
+            for (i, words) in [0, 1, 4, 5, 6, 7].into_iter().zip(before) {
+                assert_eq!(read_words(&be, fixture.buffers[i].as_ref()), words);
+            }
+            let control = read_words(&be, fixture.buffers[2].as_ref());
+            assert_eq!(&control[..5], &[0, 0, 1, 1, 0]);
+            assert_eq!(
+                read_words(&be, fixture.destination.as_ref()),
+                vec![0xa5a5_a5a5; 24]
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use infr_core::{backend::BufferUsage, Backend};
+
+    #[test]
+    fn attention_splits_keep_flash_automatic_policy() {
+        for base_wg in [0, 1, 16, 1023, 1024, 4096] {
+            for kv_len in [0, 1, 2047, 4095, 4096, 65_535, 65_536, 150_000] {
+                for prefer_deep_splits in [false, true] {
+                    let expected = if prefer_deep_splits && kv_len >= 65_536 {
+                        8
+                    } else if base_wg >= 1024 || kv_len < 4096 {
+                        1
+                    } else {
+                        (2048 / base_wg.max(1))
+                            .clamp(2, 8)
+                            .min((kv_len / 2048).max(1) as u32)
+                    };
+                    assert_eq!(
+                        flash_split_count(None, base_wg, kv_len, prefer_deep_splits),
+                        expected,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn attention_splits_keep_every_legal_flash_override() {
+        for splits in 1..=VulkanCfg::MAX_ATTENTION_SPLITS {
+            for (base_wg, kv_len) in [(0, 0), (16, 4096), (1024, 150_000)] {
+                for prefer_deep_splits in [false, true] {
+                    assert_eq!(
+                        flash_split_count(Some(splits), base_wg, kv_len, prefer_deep_splits),
+                        splits as u32,
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     #[ignore = "requires a Vulkan GPU"]
@@ -16830,7 +21052,12 @@ mod tests {
             assert_eq!(got, (0..512u32).collect::<Vec<_>>());
         }
         let names = be.built_kernel_names();
-        assert!(names.contains(&"qsa_indexer_topk"));
+        let single = if be.cfg().kernels.vulkan.qsa_topk_ordered && be.prefers_qsa_topk_ordered() {
+            "qsa_indexer_topk_ordered"
+        } else {
+            "qsa_indexer_topk"
+        };
+        assert!(names.contains(&single));
         let select = if be.use_qsa_topk_scan(1, 512, true) {
             "qsa_indexer_topk_select_scan"
         } else {

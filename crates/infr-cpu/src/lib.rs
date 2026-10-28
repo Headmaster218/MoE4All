@@ -849,6 +849,8 @@ impl Backend for CpuBackend {
             // The interpreter implements the op as a parity oracle below, but has no command
             // submission boundary to save, so production graphs retain two ordinary Linears.
             linear_pair_f32: false,
+            // Q8 pairs retain two ordinary Linear operations in the reference graph.
+            linear_pair_q8: false,
             // Vulkan-only mixed Q8_0/F32 launch fusion; the CPU keeps the split oracle graph.
             qwen_hc_down_inject: false,
             // The interpreter's WriteKv/Attention honor ring KV caches (row = pos % cap_rows), so

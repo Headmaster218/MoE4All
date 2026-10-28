@@ -25,6 +25,27 @@ pub(crate) fn spv_words(bytes: &[u8]) -> Vec<u32> {
 // remap). Uses `spv_words`/`OnceLock` from this module scope.
 include!(concat!(env!("OUT_DIR"), "/native_gemm_map.rs"));
 
+pub(crate) fn verify_pair_spv(name: &str) -> &'static [u32] {
+    macro_rules! shader {
+        ($name:literal) => {{
+            static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+            WORDS
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice()
+        }};
+    }
+    match name {
+        "gpu_resident_hit_check_pair" => shader!("gpu_resident_hit_check_pair"),
+        "gpu_resident_copy_prepare_pair" => shader!("gpu_resident_copy_prepare_pair"),
+        "verify_pair_iq2s_nr8" => shader!("verify_pair_iq2s_nr8"),
+        "verify_pair_iq3s_nr1" => shader!("verify_pair_iq3s_nr1"),
+        "verify_pair_iq3s_nr1_shared" => shader!("verify_pair_iq3s_nr1_shared"),
+        _ => panic!("unknown VERIFY pair shader: {name}"),
+    }
+}
+
 /// Kernel-cache NAME of the multi-row native GEMV (m = 2..8 — the spec-decode verify /
 /// short-suffix-prefill shape) for `dtype`, or `None` for formats without an mrow build (they keep
 /// the tiled GEMM route). Availability + name oracle; the SPIR-V (the sole, arena-addressed weight
@@ -506,6 +527,27 @@ pub(crate) fn native_idm_paged_shared_build_spv(
         Iq4Xs => v!("native_idm_iq4xs_paged_shexp"),
         _ => None,
     }
+}
+
+/// Staged-grid shared IQ2_S NR8; admission remains an explicit causal-Verify policy.
+pub(crate) fn native_idm_grid_nr_paged_shared_build_spv(
+    dtype: infr_core::DType,
+    nr: u32,
+) -> Option<(&'static str, &'static [u32])> {
+    if dtype != infr_core::DType::Iq2S || nr != 8 {
+        return None;
+    }
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    Some((
+        "native_idm_iq2s_nr8_paged_shexp",
+        S.get_or_init(|| {
+            spv_words(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/native_idm_iq2s_nr8_paged_shexp.spv"
+            )))
+        })
+        .as_slice(),
+    ))
 }
 
 pub(crate) fn native_idm_grid_buffer_shared_spv(
@@ -2913,6 +2955,16 @@ pub(crate) fn qwen_ple_gate_spv() -> &'static [u32] {
         )))
     })
 }
+/// Fixed-Wave32 O07 LDS2560 variant; no global-materialization fallback is registered.
+pub(crate) fn qwen_ple_gate_norm_lds2560_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/qwen_ple_gate_norm_lds2560.spv"
+        )))
+    })
+}
 /// SPIR-V for the 256-thread subgroup row-softmax (`y=softmax(x*scale)`). Used by the recorder's
 /// `softmax` (diffusion-gemma's in-graph self-conditioning).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -3075,6 +3127,168 @@ pub(crate) fn native_gemm_mmq_q4_1_xpg32_spv() -> &'static [u32] {
         include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4_1_xpg32.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn iq4_pair_lut_kernel(small: bool, paged: bool) -> (&'static str, &'static [u32]) {
+    macro_rules! variant {
+        ($name:literal) => {{
+            static SPV: OnceLock<Vec<u32>> = OnceLock::new();
+            (
+                $name,
+                SPV.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            )
+        }};
+    }
+    match (small, paged) {
+        (false, false) => variant!("native_gemm_mmq_iq4_nl_pair_xp"),
+        (true, false) => variant!("native_gemm_mmq_iq4_nl_pair_xp32"),
+        (false, true) => variant!("native_gemm_mmq_iq4_nl_pair_xpg"),
+        (true, true) => variant!("native_gemm_mmq_iq4_nl_pair_xpg32"),
+    }
+}
+
+pub(crate) fn silu_quant_q8_kernel(fused_gu: bool) -> (&'static str, &'static [u32]) {
+    macro_rules! variant {
+        ($name:literal) => {{
+            static SPV: OnceLock<Vec<u32>> = OnceLock::new();
+            (
+                $name,
+                SPV.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            )
+        }};
+    }
+    if fused_gu {
+        variant!("silu_mul_quant_q8_gu")
+    } else {
+        variant!("silu_mul_quant_q8")
+    }
+}
+
+pub(crate) fn qwen_hc_up_mix_wave32_spv() -> &'static [u32] {
+    static SPV: OnceLock<Vec<u32>> = OnceLock::new();
+    SPV.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/qwen_hc_up_mix_e14_wave32.spv"
+        )))
+    })
+}
+
+pub(crate) fn linear_native_q8_pair_spv() -> &'static [u32] {
+    static SPV: OnceLock<Vec<u32>> = OnceLock::new();
+    SPV.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/linear_native_q8_pair.spv"
+        )))
+    })
+}
+
+pub(crate) fn attn_decode_segmented_kernel(
+    gqa4: bool,
+    chunk1024: bool,
+) -> (&'static str, &'static [u32]) {
+    macro_rules! variant {
+        ($name:literal) => {{
+            static SPV: OnceLock<Vec<u32>> = OnceLock::new();
+            (
+                $name,
+                SPV.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            )
+        }};
+    }
+    match (gqa4, chunk1024) {
+        (false, false) => variant!("attn_decode_hd256_q8_seg_d8"),
+        (false, true) => variant!("attn_decode_hd256_q8_seg_d8_c1024"),
+        (true, false) => variant!("attn_decode_hd256_q8_seg_gqa4"),
+        (true, true) => variant!("attn_decode_hd256_q8_seg_gqa4_c1024"),
+    }
+}
+
+pub(crate) fn flash_pv_reuse_kernel(br128: bool) -> (&'static str, &'static [u32]) {
+    macro_rules! variant {
+        ($name:literal) => {{
+            static SPV: OnceLock<Vec<u32>> = OnceLock::new();
+            (
+                $name,
+                SPV.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            )
+        }};
+    }
+    if br128 {
+        variant!("attn_flash_reg_hd256_br128_f16score_qk4_pvreuse")
+    } else {
+        variant!("attn_flash_reg_hd256_br64_cw4_pvreuse")
+    }
+}
+
+pub(crate) fn kquant_packed_kernel(
+    dtype: infr_core::DType,
+    paged: bool,
+    wide_bn: bool,
+) -> (&'static str, &'static [u32]) {
+    use infr_core::DType;
+    macro_rules! variant {
+        ($name:literal) => {{
+            static SPV: OnceLock<Vec<u32>> = OnceLock::new();
+            (
+                $name,
+                SPV.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            )
+        }};
+    }
+    match (dtype, paged, wide_bn) {
+        (DType::Q3K, false, false) => variant!("native_gemm_mmq_q3_k_packed_xp32"),
+        (DType::Q3K, true, false) => variant!("native_gemm_mmq_q3_k_packed_xpg32"),
+        (DType::Q6K, true, false) => variant!("native_gemm_mmq_q6k_packed_xpg32"),
+        (DType::Q6K, false, true) => variant!("native_gemm_mmq_q6k_packed_xp32w"),
+        _ => unreachable!("packed MMQ selected outside measured format/route gate"),
+    }
+}
+
+pub(crate) fn qsa_ordered_topk_kernel(
+    scan: bool,
+    collect: bool,
+    mask: bool,
+) -> (&'static str, &'static [u32]) {
+    macro_rules! variant {
+        ($name:literal) => {{
+            static SPV: OnceLock<Vec<u32>> = OnceLock::new();
+            (
+                $name,
+                SPV.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            )
+        }};
+    }
+    match (scan, collect, mask) {
+        (false, false, false) => variant!("qsa_indexer_topk_ordered"),
+        (true, false, false) => variant!("qsa_indexer_topk_ordered_scan"),
+        (false, false, true) => variant!("qsa_indexer_topk_mask"),
+        (true, false, true) => variant!("qsa_indexer_topk_mask_scan"),
+        (false, true, false) => variant!("qsa_indexer_topk_collect_ordered"),
+        (true, true, false) => variant!("qsa_indexer_topk_collect_ordered_scan"),
+        (false, true, true) => variant!("qsa_indexer_topk_collect_mask"),
+        (true, true, true) => variant!("qsa_indexer_topk_collect_mask_scan"),
+    }
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -3698,6 +3912,27 @@ pub(crate) fn kda_spv() -> &'static [u32] {
 }
 /// SPIR-V for DeltaNet reading q/k/v from a single strided source buffer (env-gated).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn deltanet_fused_norm_kernel(sigmoid: bool) -> (&'static str, &'static [u32]) {
+    macro_rules! variant {
+        ($name:literal) => {{
+            static SPV: OnceLock<Vec<u32>> = OnceLock::new();
+            (
+                $name,
+                SPV.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            )
+        }};
+    }
+    if sigmoid {
+        variant!("deltanet_fused_norm_sigmoid")
+    } else {
+        variant!("deltanet_fused_norm")
+    }
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn deltanet_strided_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| {
@@ -3801,6 +4036,11 @@ pub(crate) fn gpu_resident_check_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+pub(crate) fn gpu_owned_recovery_seed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_recovery_seed.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 pub(crate) fn gpu_resident_dispatch_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_resident_dispatch.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
@@ -3820,6 +4060,378 @@ pub(crate) fn gpu_resident_silu_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_resident_silu.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
+}
+
+pub(crate) fn gpu_resident_copy_prepare_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_resident_copy_prepare.spv"));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+pub(crate) fn gpu_owned_prepare_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_prepare.spv"));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+pub(crate) fn gpu_owned_prepare_fast_spv(overlap: bool) -> &'static [u32] {
+    const SERIAL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_prepare_fast.spv"));
+    const OVERLAP: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_fast_overlap.spv"
+    ));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    static OVERLAP_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    if overlap {
+        OVERLAP_WORDS.get_or_init(|| spv_words(OVERLAP))
+    } else {
+        WORDS.get_or_init(|| spv_words(SERIAL))
+    }
+}
+
+pub(crate) fn gpu_owned_prepare_slow_spv(overlap: bool) -> &'static [u32] {
+    const SERIAL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_prepare_slow.spv"));
+    const OVERLAP: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_slow_overlap.spv"
+    ));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    static OVERLAP_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    if overlap {
+        OVERLAP_WORDS.get_or_init(|| spv_words(OVERLAP))
+    } else {
+        WORDS.get_or_init(|| spv_words(SERIAL))
+    }
+}
+
+pub(crate) fn gpu_owned_prepare_fast_split_spv(overlap: bool) -> &'static [u32] {
+    const SERIAL: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_fast_split.spv"
+    ));
+    const OVERLAP: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_fast_split_overlap.spv"
+    ));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    static OVERLAP_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    if overlap {
+        OVERLAP_WORDS.get_or_init(|| spv_words(OVERLAP))
+    } else {
+        WORDS.get_or_init(|| spv_words(SERIAL))
+    }
+}
+
+pub(crate) fn gpu_owned_prepare_slow_subgroup_spv(overlap: bool) -> &'static [u32] {
+    const SERIAL: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_slow_subgroup.spv"
+    ));
+    const OVERLAP: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_slow_subgroup_overlap.spv"
+    ));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    static OVERLAP_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    if overlap {
+        OVERLAP_WORDS.get_or_init(|| spv_words(OVERLAP))
+    } else {
+        WORDS.get_or_init(|| spv_words(SERIAL))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn gpu_owned_prepare_reference_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_prepare_reference.spv"));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+#[cfg(test)]
+pub(crate) fn gpu_owned_prepare_reference_overlap_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_reference_overlap.spv"
+    ));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+pub(crate) fn gpu_owned_publish_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_publish.spv"));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+pub(crate) fn gpu_owned_copy_publish_spv(wide: bool) -> &'static [u32] {
+    const SMALL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_copy_publish.spv"));
+    const WIDE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_copy_publish1024.spv"));
+    static SMALL_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    static WIDE_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    if wide {
+        WIDE_WORDS.get_or_init(|| spv_words(WIDE))
+    } else {
+        SMALL_WORDS.get_or_init(|| spv_words(SMALL))
+    }
+}
+
+pub(crate) fn gpu_owned_prepare_overlap_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_prepare_overlap.spv"));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+pub(crate) fn gpu_resident_copy_prepare_overlap_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_resident_copy_prepare_overlap.spv"
+    ));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+pub(crate) fn gpu_resident_silu_misses_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_resident_silu_misses.spv"));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+pub(crate) fn gpu_owned_prepare_topk_fused_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_topk_fused.spv"
+    ));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+pub(crate) fn gpu_owned_prepare_topk_fused_overlap_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_topk_fused_overlap.spv"
+    ));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+pub(crate) fn gpu_owned_prepare_topk_fused_two_row_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_topk_fused_two_row.spv"
+    ));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+pub(crate) fn gpu_owned_prepare_topk_fused_two_row_overlap_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_topk_fused_two_row_overlap.spv"
+    ));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+pub(crate) fn gpu_owned_prepare_topk_fused_many_row_spv(overlap: bool) -> &'static [u32] {
+    const SERIAL: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"), "/gpu_owned_prepare_topk_fused_many_row.spv"
+    ));
+    const OVERLAP: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"), "/gpu_owned_prepare_topk_fused_many_row_overlap.spv"
+    ));
+    static SERIAL_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    static OVERLAP_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    if overlap {
+        OVERLAP_WORDS.get_or_init(|| spv_words(OVERLAP))
+    } else {
+        SERIAL_WORDS.get_or_init(|| spv_words(SERIAL))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn gpu_owned_topk_many_row_classify_probe_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"), "/gpu_owned_topk_many_row_classify_probe.spv"
+    ));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+pub(crate) fn gpu_owned_prepare_fused_spv(overlap: bool) -> &'static [u32] {
+    const SERIAL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_prepare_fused.spv"));
+    const OVERLAP: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_fused_overlap.spv"
+    ));
+    static SERIAL_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    static OVERLAP_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    if overlap {
+        OVERLAP_WORDS.get_or_init(|| spv_words(OVERLAP))
+    } else {
+        SERIAL_WORDS.get_or_init(|| spv_words(SERIAL))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn gpu_owned_indirect_jobs_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_indirect_jobs.spv"));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+pub(crate) fn gpu_owned_hit_splitk_spv(dtype: infr_core::DType, reduce: bool) -> &'static [u32] {
+    const IQ2_PARTIAL: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_hit_splitk_iq2s_32.spv"
+    ));
+    const IQ3_PARTIAL: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_hit_splitk_iq3s_32.spv"
+    ));
+    const REDUCE: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_hit_splitk_reduce_32.spv"
+    ));
+    static IQ2_PARTIAL_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    static IQ3_PARTIAL_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    static REDUCE_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    if reduce {
+        REDUCE_WORDS.get_or_init(|| spv_words(REDUCE))
+    } else {
+        match dtype {
+            infr_core::DType::Iq2S => IQ2_PARTIAL_WORDS.get_or_init(|| spv_words(IQ2_PARTIAL)),
+            infr_core::DType::Iq3S => IQ3_PARTIAL_WORDS.get_or_init(|| spv_words(IQ3_PARTIAL)),
+            _ => panic!("splitk-hit partial requires IQ2S or IQ3S Gate/Up"),
+        }
+    }
+}
+
+pub(crate) fn gpu_owned_role_copy_spv(wide: bool) -> &'static [u32] {
+    const SMALL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_role_copy.spv"));
+    const WIDE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_role_copy1024.spv"));
+    static SMALL_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    static WIDE_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    if wide {
+        WIDE_WORDS.get_or_init(|| spv_words(WIDE))
+    } else {
+        SMALL_WORDS.get_or_init(|| spv_words(SMALL))
+    }
+}
+
+pub(crate) fn gpu_owned_miss_gu_tree64_spv(
+    dtype: infr_core::DType,
+    local: u32,
+    nr: u32,
+) -> Option<&'static [u32]> {
+    use infr_core::DType::*;
+    macro_rules! variant {
+        ($file:literal) => {{
+            static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+            Some(WORDS.get_or_init(|| spv_words(include_bytes!(concat!(
+                env!("OUT_DIR"), "/gpu_owned_miss_gu_tree64_", $file, ".spv"
+            )))).as_slice())
+        }};
+    }
+    #[cfg(not(test))]
+    return match (dtype, local, nr) {
+        (Q5K, 256, 2) => variant!("q5k_256_nr2"),
+        _ => None,
+    };
+    #[cfg(test)]
+    match (dtype, local, nr) {
+        (Q4K, 64, 1) => variant!("q4k_64_nr1"),
+        (Q4K, 64, 2) => variant!("q4k_64_nr2"),
+        (Q4K, 128, 1) => variant!("q4k_128_nr1"),
+        (Q4K, 128, 2) => variant!("q4k_128_nr2"),
+        (Q4K, 128, 4) => variant!("q4k_128_nr4"),
+        (Q4K, 128, 8) => variant!("q4k_128_nr8"),
+        (Q4K, 256, 1) => variant!("q4k_256_nr1"),
+        (Q4K, 256, 2) => variant!("q4k_256_nr2"),
+        (Q4K, 256, 4) => variant!("q4k_256_nr4"),
+        (Q4K, 256, 8) => variant!("q4k_256_nr8"),
+        (Q5K, 64, 1) => variant!("q5k_64_nr1"),
+        (Q5K, 64, 2) => variant!("q5k_64_nr2"),
+        (Q5K, 128, 1) => variant!("q5k_128_nr1"),
+        (Q5K, 128, 2) => variant!("q5k_128_nr2"),
+        (Q5K, 128, 4) => variant!("q5k_128_nr4"),
+        (Q5K, 128, 8) => variant!("q5k_128_nr8"),
+        (Q5K, 256, 1) => variant!("q5k_256_nr1"),
+        (Q5K, 256, 2) => variant!("q5k_256_nr2"),
+        (Q5K, 256, 4) => variant!("q5k_256_nr4"),
+        (Q5K, 256, 8) => variant!("q5k_256_nr8"),
+        (Q6K, 64, 1) => variant!("q6k_64_nr1"),
+        (Q6K, 64, 2) => variant!("q6k_64_nr2"),
+        (Q6K, 128, 1) => variant!("q6k_128_nr1"),
+        (Q6K, 128, 2) => variant!("q6k_128_nr2"),
+        (Q6K, 128, 4) => variant!("q6k_128_nr4"),
+        (Q6K, 128, 8) => variant!("q6k_128_nr8"),
+        (Q6K, 256, 1) => variant!("q6k_256_nr1"),
+        (Q6K, 256, 2) => variant!("q6k_256_nr2"),
+        (Q6K, 256, 4) => variant!("q6k_256_nr4"),
+        (Q6K, 256, 8) => variant!("q6k_256_nr8"),
+        (Iq2S, 64, 1) => variant!("iq2s_64_nr1"),
+        (Iq2S, 64, 2) => variant!("iq2s_64_nr2"),
+        (Iq2S, 128, 1) => variant!("iq2s_128_nr1"),
+        (Iq2S, 128, 2) => variant!("iq2s_128_nr2"),
+        (Iq2S, 128, 4) => variant!("iq2s_128_nr4"),
+        (Iq2S, 128, 8) => variant!("iq2s_128_nr8"),
+        (Iq2S, 256, 1) => variant!("iq2s_256_nr1"),
+        (Iq2S, 256, 2) => variant!("iq2s_256_nr2"),
+        (Iq2S, 256, 4) => variant!("iq2s_256_nr4"),
+        (Iq2S, 256, 8) => variant!("iq2s_256_nr8"),
+        (Iq3S, 64, 1) => variant!("iq3s_64_nr1"),
+        (Iq3S, 64, 2) => variant!("iq3s_64_nr2"),
+        (Iq3S, 128, 1) => variant!("iq3s_128_nr1"),
+        (Iq3S, 128, 2) => variant!("iq3s_128_nr2"),
+        (Iq3S, 128, 4) => variant!("iq3s_128_nr4"),
+        (Iq3S, 128, 8) => variant!("iq3s_128_nr8"),
+        (Iq3S, 256, 1) => variant!("iq3s_256_nr1"),
+        (Iq3S, 256, 2) => variant!("iq3s_256_nr2"),
+        (Iq3S, 256, 4) => variant!("iq3s_256_nr4"),
+        (Iq3S, 256, 8) => variant!("iq3s_256_nr8"),
+        _ => None,
+    }
+}
+
+/// IQ buffer codebook at binding 0; Input/Ids/Tape/ACT at 1/2/3/4, push 40 bytes.
+#[cfg(test)]
+pub(crate) fn gpu_owned_miss_gu_tree64_grid_buffer_spv(
+    dtype: infr_core::DType,
+    local: u32,
+    nr: u32,
+) -> Option<&'static [u32]> {
+    use infr_core::DType::*;
+    macro_rules! variant {
+        ($file:literal) => {{
+            static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+            Some(WORDS.get_or_init(|| spv_words(include_bytes!(concat!(
+                env!("OUT_DIR"), "/gpu_owned_miss_gu_tree64_grid_buffer_", $file, ".spv"
+            )))).as_slice())
+        }};
+    }
+    match (dtype, local, nr) {
+        (Iq2S, 64, 1) => variant!("iq2s_64_nr1"),
+        (Iq2S, 64, 2) => variant!("iq2s_64_nr2"),
+        (Iq3S, 64, 1) => variant!("iq3s_64_nr1"),
+        (Iq3S, 64, 2) => variant!("iq3s_64_nr2"),
+        _ => None,
+    }
+}
+
+pub(crate) fn gpu_resident_copy_payload_spv(wide: bool) -> &'static [u32] {
+    const SMALL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_resident_copy_payload.spv"));
+    const WIDE: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_resident_copy_payload1024.spv"
+    ));
+    static SMALL_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    static WIDE_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    if wide {
+        WIDE_WORDS.get_or_init(|| spv_words(WIDE))
+    } else {
+        SMALL_WORDS.get_or_init(|| spv_words(SMALL))
+    }
 }
 /// SPIR-V for the elementwise sigmoid gate `y = a * sigmoid(b)`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -3994,6 +4606,14 @@ macro_rules! dyn_spv {
 dyn_spv!(qk_norm_rope_dyn_spv, "qk_norm_rope_dyn");
 dyn_spv!(qk_norm_rope_dyn_ff_spv, "qk_norm_rope_dyn_ff");
 dyn_spv!(qk_norm_rope_seg_spv, "qk_norm_rope_seg");
+dyn_spv!(
+    qk_norm_rope_q8_segmented_spv,
+    "qk_norm_rope_q8_segmented_q8"
+);
+dyn_spv!(
+    qk_norm_rope_q8_segmented_mrope_spv,
+    "qk_norm_rope_q8_segmented_mrope_q8"
+);
 dyn_spv!(
     qk_norm_rope_interleaved_seg_spv,
     "qk_norm_rope_interleaved_seg"

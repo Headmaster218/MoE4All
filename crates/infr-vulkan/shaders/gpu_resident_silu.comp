@@ -11,7 +11,11 @@ void main() {
     uint slot = i / p.width;
     uint row = slot / p.physical_used;
     uint expert = slot % p.physical_used;
+#ifdef MOE_MASK_MISSES
+    uint mask = ids[p.rows * p.used + p.rows + row];
+#else
     uint mask = ids[p.rows * p.used + row];
+#endif
     if ((mask & (1u << expert)) == 0) return;
     float v = g[i];
     a[i] = (v / (1.0 + exp(-v))) * u[i];

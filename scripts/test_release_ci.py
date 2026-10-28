@@ -118,7 +118,8 @@ class ReleaseCiTests(unittest.TestCase):
             source = self.workspace / module.PLATFORM
             source.mkdir()
             (source / "documentation").mkdir()
-            for name in module.ROOT_FILES:
+            for name in module.ROOT_FILES | module.SCRIPT_FILES:
+                (source / name).parent.mkdir(parents=True, exist_ok=True)
                 (source / name).write_bytes(b"fixture\n")
             output = source / "output"
             for version in ("1.1.0", "1.1.0-beta.1", "1.1.0-rc.2", "1.1.0+build.7"):

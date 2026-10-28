@@ -1,0 +1,119 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#ifdef DIRECT_Q8
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#define KV_STORE_BYTE
+#endif
+
+// O04 isolated candidate. DIRECT_Q8 changes only the destination encoding; the default writes
+// segmented F16 for comparison against the existing norm/RoPE. The parent owns committed segments.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC {
+    uint rows; uint nheads; uint hd; uint rope_dim;
+    float theta; float eps;
+    uint pos; uint segment_shift;
+    uint s0; uint s1; uint s2; uint s3;
+} pc;
+layout(binding = 0) readonly buffer XB { float x[]; };
+layout(binding = 1) readonly buffer NB { float nw[]; };
+layout(binding = 2) readonly buffer PB { int positions[]; };
+layout(binding = 3) readonly buffer YB { uvec2 segments[]; };
+#define KV_SEGMENTED
+#include "kv_addr.glsl"
+
+shared float xs[512];
+shared float red[64];
+shared float16_t rounded16[512];
+
+uint rope_plane(uint pair) {
+    uint sector = pair % (pc.s0 + pc.s1 + pc.s2 + pc.s3);
+    if (sector % 3u == 1u && sector < 3u * pc.s1) { return 1u; }
+    if (sector % 3u == 2u && sector < 3u * pc.s2) { return 2u; }
+    if (sector % 3u == 0u && sector < 3u * pc.s0) { return 0u; }
+    return 3u;
+}
+
+void main() {
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (unit >= pc.rows * pc.nheads) { return; }
+    uint t = gl_LocalInvocationID.x;
+    uint h = unit % pc.nheads;
+    uint r = unit / pc.nheads;
+    uint in_base = (r * pc.nheads + h) * pc.hd;
+    float pss = 0.0;
+    for (uint i = t; i < pc.hd; i += 64u) {
+        float value = x[in_base + i];
+        xs[i] = value;
+        pss += value * value;
+    }
+    red[t] = pss;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) { red[t] += red[t + stride]; }
+        barrier();
+    }
+    float scale = inversesqrt(red[0] / float(pc.hd) + pc.eps);
+    uint half_rope = pc.rope_dim / 2u;
+    for (uint pair = t; pair < half_rope; pair += 64u) {
+        uint i0 = pair;
+        uint i1 = pair + half_rope;
+        float a = xs[i0] * scale * nw[i0];
+        float b = xs[i1] * scale * nw[i1];
+#ifdef MROPE
+        float position = float(positions[r * 4u + rope_plane(pair)]);
+#else
+        float position = float(pc.pos + r);
+#endif
+        float freq = pow(pc.theta, -2.0 * float(pair) / float(pc.rope_dim));
+        float angle = position * freq;
+        float s = sin(angle);
+        float c = cos(angle);
+        // Preserve the unfused qk_norm_rope -> F16 scratch -> store_q8_f16 boundary.
+        rounded16[i0] = float16_t(a * c - b * s);
+        rounded16[i1] = float16_t(a * s + b * c);
+    }
+    for (uint i = pc.rope_dim + t; i < pc.hd; i += 64u) {
+        rounded16[i] = float16_t(xs[i] * scale * nw[i]);
+    }
+    barrier();
+
+    uint out_base = ((pc.pos + r) * pc.nheads + h) * pc.hd;
+    uint segment_elems = 1u << pc.segment_shift;
+#ifdef DIRECT_Q8
+    // Exactly store_q8_f16_seg's subgroup reduction, division, rounding and byte encoding.
+    // Each 32-element block is wholly inside one committed physical segment.
+    uint lane = gl_SubgroupInvocationID;
+    for (uint block = gl_SubgroupID; block < pc.hd / 32u; block += 2u) {
+        uint i = block * 32u + lane;
+        float value = float(rounded16[i]);
+        float amax = subgroupMax(abs(value));
+        float d = amax / 127.0;
+        float inv = amax > 0.0 ? 1.0 / d : 0.0;
+        int code = clamp(int(round(value * inv)), -127, 127);
+        uint element = out_base + i;
+        uint local = kv_segment_local(element, pc.segment_shift);
+        uint64_t address = kv_segment_base(segments[kv_segment(element, pc.segment_shift)]);
+        kv_store_byte(address, local, uint(code) & 0xffu);
+        if (lane == 0u) {
+            uint scale_byte = segment_elems + (local / 32u) * 2u;
+            uint16_t bits = float16BitsToUint16(float16_t(d));
+            kv_store_byte(address, scale_byte, uint(bits & uint16_t(0xffu)));
+            kv_store_byte(address, scale_byte + 1u, uint(bits >> 8));
+        }
+    }
+#else
+    for (uint i = t; i < pc.hd; i += 64u) {
+        uint element = out_base + i;
+        uint local = kv_segment_local(element, pc.segment_shift);
+        uint64_t address = kv_segment_base(segments[kv_segment(element, pc.segment_shift)]);
+        kv_store_half(address, local, float(rounded16[i]));
+    }
+#endif
+}

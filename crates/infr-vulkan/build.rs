@@ -16,6 +16,31 @@ fn main() {
     gen_grids(&out);
     // (source stem, output stem, extra glslc defines)
     let builds: &[(&str, &str, &[&str])] = &[
+        (
+            "native_gemm_mmq_iq4_nl",
+            "native_gemm_mmq_iq4_nl_pair_xp",
+            &["-DIQ4_PAIR_LUT", "-DEXPERT_GRID"],
+        ),
+        (
+            "native_gemm_mmq_iq4_nl",
+            "native_gemm_mmq_iq4_nl_pair_xp32",
+            &["-DIQ4_PAIR_LUT", "-DEXPERT_GRID", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_iq4_nl",
+            "native_gemm_mmq_iq4_nl_pair_xpg",
+            &["-DIQ4_PAIR_LUT", "-DEXPERT_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemm_mmq_iq4_nl",
+            "native_gemm_mmq_iq4_nl_pair_xpg32",
+            &[
+                "-DIQ4_PAIR_LUT",
+                "-DEXPERT_GRID",
+                "-DPAGED",
+                "-DBM_TILE=32u",
+            ],
+        ),
         ("gemm_coopmat_tiled", "gemm_coopmat_tiled", &[]),
         ("gemm_warp", "gemm_warp", &[]),
         ("quant_q8", "quant_q8", &[]),
@@ -684,6 +709,22 @@ fn main() {
         ),
         (
             "attn_flash_reg",
+            "attn_flash_reg_hd256_br64_cw4_pvreuse",
+            &["-DHEAD_DIM=256", "-DBR_TILE=64", "-DCW4", "-DPV_REUSE"],
+        ),
+        (
+            "attn_flash_reg",
+            "attn_flash_reg_hd256_br128_f16score_qk4_pvreuse",
+            &[
+                "-DHEAD_DIM=256",
+                "-DBR_TILE=128",
+                "-DF16_SCORE",
+                "-DQK_ROWS4",
+                "-DPV_REUSE",
+            ],
+        ),
+        (
+            "attn_flash_reg",
             "attn_flash_reg_hd256_br128_f16score",
             &["-DHEAD_DIM=256", "-DBR_TILE=128", "-DF16_SCORE"],
         ),
@@ -718,6 +759,62 @@ fn main() {
             ],
         ),
         ("attn_flash_combine", "attn_flash_combine", &[]),
+        (
+            "attn_decode",
+            "attn_decode_hd256_q8_seg_d8",
+            &[
+                "-DDHD4=64",
+                "-DKVQ8",
+                "-DKVQ8_D8",
+                "-DLS256",
+                "-DQK_F16",
+                "-DPV_F16",
+                "-DKV_SEGMENTED",
+            ],
+        ),
+        (
+            "attn_decode",
+            "attn_decode_hd256_q8_seg_d8_c1024",
+            &[
+                "-DDHD4=64",
+                "-DKVQ8",
+                "-DKVQ8_D8",
+                "-DLS256",
+                "-DQK_F16",
+                "-DPV_F16",
+                "-DKV_SEGMENTED",
+                "-DQ8_CHUNK1024",
+            ],
+        ),
+        (
+            "attn_decode",
+            "attn_decode_hd256_q8_seg_gqa4",
+            &[
+                "-DDHD4=64",
+                "-DKVQ8",
+                "-DKVQ8_D8",
+                "-DLS256",
+                "-DQK_F16",
+                "-DPV_F16",
+                "-DKV_SEGMENTED",
+                "-DGQA4",
+            ],
+        ),
+        (
+            "attn_decode",
+            "attn_decode_hd256_q8_seg_gqa4_c1024",
+            &[
+                "-DDHD4=64",
+                "-DKVQ8",
+                "-DKVQ8_D8",
+                "-DLS256",
+                "-DQK_F16",
+                "-DPV_F16",
+                "-DKV_SEGMENTED",
+                "-DGQA4",
+                "-DQ8_CHUNK1024",
+            ],
+        ),
         ("attn_flash_combine_hd256", "attn_flash_combine_hd256", &[]),
         ("attn_softmax", "attn_softmax", &[]),
         ("attn_pv", "attn_pv", &[]),
@@ -855,6 +952,34 @@ fn main() {
             &["-DQSA_SCORE_DECODE8", "-DQSA_SCORE_H4", "-DKV_SEGMENTED"],
         ),
         ("qsa_indexer_topk", "qsa_indexer_topk", &[]),
+        ("linear_native_q8_pair", "linear_native_q8_pair", &[]),
+        ("silu_mul_quant_q8", "silu_mul_quant_q8", &[]),
+        ("silu_mul_quant_q8", "silu_mul_quant_q8_gu", &["-DFUSED_GU"]),
+        (
+            "qwen_hc_up_mix_e14_wave32",
+            "qwen_hc_up_mix_e14_wave32",
+            &[],
+        ),
+        (
+            "qsa_indexer_topk",
+            "qsa_indexer_topk_ordered",
+            &["-DORDERED_COLLECT"],
+        ),
+        (
+            "qsa_indexer_topk",
+            "qsa_indexer_topk_ordered_scan",
+            &["-DORDERED_COLLECT", "-DPARALLEL_SCAN"],
+        ),
+        (
+            "qsa_indexer_topk",
+            "qsa_indexer_topk_mask",
+            &["-DORDERED_COLLECT", "-DCOLLECT_MASK"],
+        ),
+        (
+            "qsa_indexer_topk",
+            "qsa_indexer_topk_mask_scan",
+            &["-DORDERED_COLLECT", "-DCOLLECT_MASK", "-DPARALLEL_SCAN"],
+        ),
         (
             "qsa_indexer_topk",
             "qsa_indexer_topk_scan",
@@ -868,6 +993,26 @@ fn main() {
             &["-DPARALLEL_SCAN"],
         ),
         ("qsa_indexer_topk_collect", "qsa_indexer_topk_collect", &[]),
+        (
+            "qsa_indexer_topk_collect",
+            "qsa_indexer_topk_collect_ordered",
+            &["-DORDERED_COLLECT"],
+        ),
+        (
+            "qsa_indexer_topk_collect",
+            "qsa_indexer_topk_collect_ordered_scan",
+            &["-DORDERED_COLLECT", "-DPARALLEL_SCAN"],
+        ),
+        (
+            "qsa_indexer_topk_collect",
+            "qsa_indexer_topk_collect_mask",
+            &["-DORDERED_COLLECT", "-DCOLLECT_MASK"],
+        ),
+        (
+            "qsa_indexer_topk_collect",
+            "qsa_indexer_topk_collect_mask_scan",
+            &["-DORDERED_COLLECT", "-DCOLLECT_MASK", "-DPARALLEL_SCAN"],
+        ),
         (
             "qsa_indexer_topk_collect",
             "qsa_indexer_topk_collect_scan",
@@ -969,6 +1114,11 @@ fn main() {
         ),
         ("qwen_ple_gate", "qwen_ple_gate", &[]),
         (
+            "qwen_ple_gate_norm_o07",
+            "qwen_ple_gate_norm_lds2560",
+            &["-DPLE_CACHE_LDS", "-DPLE_DIM_MAX=2560"],
+        ),
+        (
             "qwen_hc_down_inject",
             "qwen_hc_down_inject_q8",
             &["-DHC_INJECT_Q8"],
@@ -981,6 +1131,12 @@ fn main() {
         ("kda", "kda", &[]),
         // Strided variant: q/k/v read from single convout buffer with offsets (env-gated).
         ("deltanet_strided", "deltanet_strided", &[]),
+        ("deltanet_fused_chain", "deltanet_fused_norm", &[]),
+        (
+            "deltanet_fused_chain",
+            "deltanet_fused_norm_sigmoid",
+            &["-DGATE_SIGMOID"],
+        ),
         ("deltanet_chunked", "deltanet_chunked", &[]),
         ("deltanet_prep", "deltanet_prep", &[]),
         ("deltanet_gates", "deltanet_gates", &[]),
@@ -997,9 +1153,177 @@ fn main() {
         ("conv1d_shift", "conv1d_shift", &[]),
         ("copy_strided", "copy_strided", &[]),
         ("gpu_resident_check", "gpu_resident_check", &[]),
+        ("gpu_owned_recovery_seed", "gpu_owned_recovery_seed", &[]),
         ("gpu_resident_dispatch", "gpu_resident_dispatch", &[]),
         ("gpu_resident_hit_check", "gpu_resident_hit_check", &[]),
+        (
+            "gpu_resident_hit_check_pair",
+            "gpu_resident_hit_check_pair",
+            &[],
+        ),
+        (
+            "gpu_resident_copy_prepare",
+            "gpu_resident_copy_prepare",
+            &[],
+        ),
+        ("gpu_owned_prepare", "gpu_owned_prepare", &[]),
+        ("gpu_owned_prepare_fused", "gpu_owned_prepare_fused", &[]),
+        (
+            "gpu_owned_prepare_fused",
+            "gpu_owned_prepare_topk_fused_many_row",
+            &["-DOWNER_TOPK_FUSED", "-DOWNER_TOPK_MANY_ROW"],
+        ),
+        (
+            "gpu_owned_prepare_fused",
+            "gpu_owned_prepare_topk_fused_many_row_overlap",
+            &["-DOWNER_TOPK_FUSED", "-DOWNER_TOPK_MANY_ROW", "-DCOPY_OVERLAP"],
+        ),
+        (
+            "gpu_owned_prepare_fused",
+            "gpu_owned_topk_many_row_classify_probe",
+            &[
+                "-DOWNER_TOPK_FUSED",
+                "-DOWNER_TOPK_MANY_ROW",
+                "-DOWNER_TOPK_MANY_ROW_CLASSIFY_PROBE",
+            ],
+        ),
+        (
+            "gpu_owned_prepare_fused",
+            "gpu_owned_prepare_topk_fused_two_row",
+            &["-DOWNER_TOPK_FUSED", "-DOWNER_TOPK_TWO_ROW"],
+        ),
+        (
+            "gpu_owned_prepare_fused",
+            "gpu_owned_prepare_topk_fused_two_row_overlap",
+            &["-DOWNER_TOPK_FUSED", "-DOWNER_TOPK_TWO_ROW", "-DCOPY_OVERLAP"],
+        ),
+        (
+            "gpu_owned_prepare_fused",
+            "gpu_owned_prepare_topk_fused",
+            &["-DOWNER_TOPK_FUSED"],
+        ),
+        (
+            "gpu_owned_prepare_fused",
+            "gpu_owned_prepare_topk_fused_overlap",
+            &["-DOWNER_TOPK_FUSED", "-DCOPY_OVERLAP"],
+        ),
+        (
+            "gpu_owned_prepare_fused",
+            "gpu_owned_prepare_fused_overlap",
+            &["-DCOPY_OVERLAP"],
+        ),
+        ("gpu_owned_prepare_fast", "gpu_owned_prepare_fast", &[]),
+        (
+            "gpu_owned_prepare_fast",
+            "gpu_owned_prepare_fast_split",
+            &["-DOWNER_SPLIT_PREFLIGHT"],
+        ),
+        (
+            "gpu_owned_prepare_fast",
+            "gpu_owned_prepare_fast_split_overlap",
+            &["-DOWNER_SPLIT_PREFLIGHT", "-DCOPY_OVERLAP"],
+        ),
+        ("gpu_owned_prepare_slow", "gpu_owned_prepare_slow", &[]),
+        (
+            "gpu_owned_prepare_slow",
+            "gpu_owned_prepare_slow_subgroup",
+            &["-DOWNER_SUBGROUP_SCAN"],
+        ),
+        (
+            "gpu_owned_prepare_slow",
+            "gpu_owned_prepare_slow_subgroup_overlap",
+            &["-DOWNER_SUBGROUP_SCAN", "-DCOPY_OVERLAP"],
+        ),
+        (
+            "gpu_owned_prepare_fast",
+            "gpu_owned_prepare_fast_overlap",
+            &["-DCOPY_OVERLAP"],
+        ),
+        (
+            "gpu_owned_prepare_slow",
+            "gpu_owned_prepare_slow_overlap",
+            &["-DCOPY_OVERLAP"],
+        ),
+        (
+            "gpu_owned_prepare_reference",
+            "gpu_owned_prepare_reference",
+            &[],
+        ),
+        (
+            "gpu_owned_prepare_reference",
+            "gpu_owned_prepare_reference_overlap",
+            &["-DCOPY_OVERLAP"],
+        ),
+        (
+            "gpu_owned_prepare",
+            "gpu_owned_prepare_overlap",
+            &["-DCOPY_OVERLAP"],
+        ),
+        ("gpu_owned_publish", "gpu_owned_publish", &[]),
+        ("gpu_owned_copy_publish", "gpu_owned_copy_publish", &[]),
+        ("gpu_owned_indirect_jobs", "gpu_owned_indirect_jobs", &[]),
+        (
+            "gpu_owned_copy_publish",
+            "gpu_owned_copy_publish1024",
+            &["-DCOPY_LOCAL=1024"],
+        ),
+        (
+            "gpu_resident_copy_prepare",
+            "gpu_resident_copy_prepare_pair",
+            &["-DVERIFY_PAIR"],
+        ),
+        (
+            "native_gemv_id_verify_pair",
+            "verify_pair_iq2s_nr8",
+            &["-DPAGED", "-DUSE_GRID", "-DFMT_IQ2S", "-DNR=8"],
+        ),
+        (
+            "native_gemv_id_verify_pair",
+            "verify_pair_iq3s_nr1",
+            &["-DPAGED", "-DUSE_GRID", "-DFMT_IQ3S", "-DNR=1"],
+        ),
+        (
+            "native_gemv_id_verify_pair",
+            "verify_pair_iq3s_nr1_shared",
+            &[
+                "-DPAGED",
+                "-DUSE_GRID",
+                "-DFMT_IQ3S",
+                "-DNR=1",
+                "-DSHARED_Q8",
+            ],
+        ),
+        (
+            "gpu_resident_copy_prepare",
+            "gpu_resident_copy_prepare_overlap",
+            &["-DCOPY_OVERLAP"],
+        ),
+        (
+            "gpu_resident_copy_payload",
+            "gpu_resident_copy_payload",
+            &[],
+        ),
+        (
+            "gpu_resident_copy_payload",
+            "gpu_resident_copy_payload1024",
+            &["-DCOPY_LOCAL=1024"],
+        ),
+        (
+            "gpu_resident_copy_payload",
+            "gpu_owned_role_copy",
+            &["-DCOPY_ROLE_FILTER"],
+        ),
+        (
+            "gpu_resident_copy_payload",
+            "gpu_owned_role_copy1024",
+            &["-DCOPY_ROLE_FILTER", "-DCOPY_LOCAL=1024"],
+        ),
         ("gpu_resident_silu", "gpu_resident_silu", &[]),
+        (
+            "gpu_resident_silu",
+            "gpu_resident_silu_misses",
+            &["-DMOE_MASK_MISSES"],
+        ),
         ("zero_words", "zero_words", &[]),
         ("mul_sigmoid", "mul_sigmoid", &[]),
         ("add", "add", &[]),
@@ -1288,6 +1612,16 @@ fn main() {
             &["-DOUT_F16", "-DUSE_PARAMS", "-DKV_BDA"],
         ),
         ("qk_norm_rope", "qk_norm_rope_bda", &["-DKV_BDA"]),
+        (
+            "qk_norm_rope_q8_segmented",
+            "qk_norm_rope_q8_segmented_q8",
+            &["-DDIRECT_Q8"],
+        ),
+        (
+            "qk_norm_rope_q8_segmented",
+            "qk_norm_rope_q8_segmented_mrope_q8",
+            &["-DMROPE", "-DDIRECT_Q8"],
+        ),
         (
             "qk_norm_rope",
             "qk_norm_rope_seg",
@@ -2099,6 +2433,17 @@ fn main() {
             "native_gemv_id_multi",
             "native_idm_iq2s_paged_shexp",
             &["-DFMT_IQ2S", "-DUSE_GRID", "-DPAGED", "-DSHARED_Q8"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_nr8_paged_shexp",
+            &[
+                "-DFMT_IQ2S",
+                "-DUSE_GRID",
+                "-DPAGED",
+                "-DSHARED_Q8",
+                "-DNR=8",
+            ],
         ),
         (
             "native_gemv_id_multi",
@@ -3029,6 +3374,41 @@ fn main() {
         ("native_gemm_mmq_q5_1", "native_gemm_mmq_q5_1", &[]),
         ("native_gemm_mmq_q2_k", "native_gemm_mmq_q2_k", &[]),
         ("native_gemm_mmq_q3_k", "native_gemm_mmq_q3_k", &[]),
+        (
+            "native_gemm_mmq_q3_k",
+            "native_gemm_mmq_q3_k_packed_xp32",
+            &["-DEXPERT_GRID", "-DBM_TILE=32u", "-DPACKED_DECODE"],
+        ),
+        (
+            "native_gemm_mmq_q3_k",
+            "native_gemm_mmq_q3_k_packed_xpg32",
+            &[
+                "-DEXPERT_GRID",
+                "-DPAGED",
+                "-DBM_TILE=32u",
+                "-DPACKED_DECODE",
+            ],
+        ),
+        (
+            "native_gemm_mmq_q6k",
+            "native_gemm_mmq_q6k_packed_xpg32",
+            &[
+                "-DEXPERT_GRID",
+                "-DPAGED",
+                "-DBM_TILE=32u",
+                "-DPACKED_DECODE",
+            ],
+        ),
+        (
+            "native_gemm_mmq_q6k",
+            "native_gemm_mmq_q6k_packed_xp32w",
+            &[
+                "-DEXPERT_GRID",
+                "-DBM_TILE=32u",
+                "-DBN_TILE=128u",
+                "-DPACKED_DECODE",
+            ],
+        ),
         ("native_gemm_mmq_q4_0", "native_gemm_mmq_q4_0", &[]),
         ("native_gemm_mmq_q4_1", "native_gemm_mmq_q4_1", &[]),
         ("native_gemm_mmq_iq4_nl", "native_gemm_mmq_iq4_nl", &[]),
@@ -3713,6 +4093,11 @@ fn main() {
             &["-DFMT_Q8_0", "-DNARROW_N", "-DA_GLOBAL"],
         ),
         (
+            "native_gemm_warp",
+            "native_gemm_warp_q8_0_n128_ag_bm128",
+            &["-DFMT_Q8_0", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
             // Qwen3.8 recurrent projection: N=320 is divisible by 64 but not 128, so it used to
             // miss every warptile and fall back to the legacy BN=64/BK=32 kernel. Keep BN=64,
             // but use the A_GLOBAL path, BK=64, and four wave32s per workgroup.
@@ -4189,7 +4574,7 @@ fn main() {
         "native_mmv_mw",
         "quant_q8_row",
     ];
-    let builds: Vec<(String, String, Vec<String>)> = builds
+    let mut builds: Vec<(String, String, Vec<String>)> = builds
         .iter()
         .flat_map(|(src_stem, dst_stem, defines)| {
             let base = (
@@ -4209,6 +4594,61 @@ fn main() {
             }
         })
         .collect();
+    for (name, defines) in [
+        (
+            "gpu_owned_hit_splitk_iq2s_32",
+            vec!["-DFMT_IQ2S", "-DDOWN_IQ4NL", "-DUSE_GRID"],
+        ),
+        (
+            "gpu_owned_hit_splitk_iq3s_32",
+            vec!["-DFMT_IQ3S", "-DDOWN_IQ4NL", "-DUSE_GRID"],
+        ),
+        ("gpu_owned_hit_splitk_reduce_32", vec!["-DSPLITK_REDUCE", "-DTREE32_REDUCE"]),
+    ] {
+        let mut defines: Vec<String> = defines.into_iter().map(str::to_owned).collect();
+        defines.extend(["-DLOCAL_SIZE=128".to_owned(), "-DSPLIT_K=32".to_owned()]);
+        builds.push((
+            "gpu_owned_hit_ffn_splitk".to_owned(),
+            name.to_owned(),
+            defines,
+        ));
+    }
+    for format in ["q4k", "q5k", "q6k", "iq2s", "iq3s"] {
+        for local in [64, 128, 256] {
+            for nr in [1, 2, 4, 8] {
+                if local == 64 && nr > 2 {
+                    continue;
+                }
+                let mut defines = vec![
+                    format!("-DFMT_{}", format.to_ascii_uppercase()),
+                    format!("-DLOCAL={local}"),
+                    format!("-DNR={nr}"),
+                ];
+                if matches!(format, "iq2s" | "iq3s") {
+                    defines.push("-DUSE_GRID".to_owned());
+                }
+                builds.push((
+                    "owned_gu_tree64".to_owned(),
+                    format!("gpu_owned_miss_gu_tree64_{format}_{local}_nr{nr}"),
+                    defines,
+                ));
+            }
+        }
+    }
+    for (format, grid) in [("iq2s", "IQ2_GRID_BUFFER"), ("iq3s", "IQ3_GRID_BUFFER")] {
+        for nr in [1, 2] {
+            builds.push((
+                "owned_gu_tree64".to_owned(),
+                format!("gpu_owned_miss_gu_tree64_grid_buffer_{format}_64_nr{nr}"),
+                vec![
+                    format!("-DFMT_{}", format.to_ascii_uppercase()),
+                    format!("-D{grid}"),
+                    "-DLOCAL=64".to_owned(),
+                    format!("-DNR={nr}"),
+                ],
+            ));
+        }
+    }
     // STREAMED weight builds (resident-BDA): the `-DSTREAMED` build reads the weight from a
     // `bufferDeviceAddress` arena pool (native_weight_addr.glsl) instead of a bound SSBO, lifting the
     // ~4 GiB `maxStorageBufferRange` cap one SSBO binding imposes. `wants_streamed_twin` marks the
@@ -4384,6 +4824,11 @@ fn main() {
         let src = format!("shaders/{src_stem}.comp");
         let dst = format!("{out}/{dst_stem}.spv");
         println!("cargo:rerun-if-changed={src}");
+        if src_stem == "gpu_owned_prepare_fused" {
+            println!("cargo:rerun-if-changed=shaders/gpu_owned_topk_route.glsl");
+            println!("cargo:rerun-if-changed=shaders/gpu_owned_topk_two_row_route.glsl");
+            println!("cargo:rerun-if-changed=shaders/gpu_owned_topk_many_row_route.glsl");
+        }
         let mut args: Vec<String> = vec![
             "-fshader-stage=comp".into(),
             "--target-env=vulkan1.3".into(),
@@ -4393,7 +4838,21 @@ fn main() {
         for d in defines {
             args.push(d.clone());
         }
-        if src_stem == "gpu_resident_check" || src_stem == "gpu_resident_hit_check" {
+        if src_stem == "gpu_resident_check"
+            || src_stem == "gpu_owned_recovery_seed"
+            || src_stem == "gpu_resident_hit_check"
+            || src_stem == "gpu_resident_hit_check_pair"
+            || src_stem == "gpu_resident_copy_prepare"
+            || src_stem == "gpu_resident_copy_payload"
+            || src_stem == "gpu_owned_prepare"
+            || src_stem == "gpu_owned_prepare_fused"
+            || src_stem == "gpu_owned_prepare_fast"
+            || src_stem == "gpu_owned_prepare_slow"
+            || src_stem == "gpu_owned_prepare_reference"
+            || src_stem == "gpu_owned_publish"
+            || src_stem == "gpu_owned_copy_publish"
+            || src_stem == "gpu_owned_indirect_jobs"
+        {
             args.push(format!(
                 "-DINFR_MAX_DECODE_ROWS={}",
                 infr_core::backend::MAX_DECODE_ROWS

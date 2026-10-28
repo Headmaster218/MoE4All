@@ -21,7 +21,7 @@ ROOT_FILES = {
     "infr", "Start-INFR-Wizard-Linux.sh", "README.md", "README_EN.md", "CHANGELOG.md",
     "infr.example.toml", "LICENSE", "LICENSE-MIT", "NOTICE",
 }
-SCRIPT_FILES = set()
+SCRIPT_FILES = {"scripts/benchmark-hardware.sh"}
 CODEC_FILES = {"libheif.so.1", "libde265.so.0", "libdav1d.so.7", "libheif-LICENSE.txt",
                "libde265-LICENSE.txt", "dav1d-LICENSE.txt", "SOURCES.txt"}
 MAX_BYTES = 1024 * 1024 * 1024
@@ -104,7 +104,7 @@ def validate_package(root, version):
         path = safe_target(root, name)
         if not path.is_file() or path.stat().st_size != entry["size"] or sha256(path) != entry["sha256"]:
             raise ValueError("Package integrity check failed: " + name)
-    if not ({"infr", "Start-INFR-Wizard-Linux.sh"} | SCRIPT_FILES).issubset(names):
+    if not {"infr", "Start-INFR-Wizard-Linux.sh"}.issubset(names):
         raise ValueError("Package is missing runtime files")
     actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()}
     if actual != names | {"install-manifest.json"}:

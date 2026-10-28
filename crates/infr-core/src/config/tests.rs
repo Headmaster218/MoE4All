@@ -22,6 +22,71 @@ fn env_layer(pairs: &[(&str, &str)]) -> PartialConfig {
 }
 
 #[test]
+fn next_step_preparation_defaults_on_and_has_explicit_sync_fallback() {
+    assert!(Config::default().device.decode_prepare_ahead);
+    let mut layer = PartialConfig::default();
+    layer
+        .set_path("device.decode_prepare_ahead", "false")
+        .unwrap();
+    let mut cfg = Config::default();
+    layer.apply(&mut cfg);
+    assert!(!cfg.device.decode_prepare_ahead);
+    let (layer, warnings) = file::parse_str(
+        "[device]\ndecode_prepare_ahead = true\n",
+        Path::new("infr.toml"),
+    )
+    .unwrap();
+    assert!(warnings.is_empty());
+    layer.apply(&mut cfg);
+    assert!(cfg.device.decode_prepare_ahead);
+}
+
+#[test]
+fn ordinary_decode_pipeline_defaults_preserve_explicit_fallbacks() {
+    let flags: [(&str, fn(&Config) -> bool); 5] = [
+        ("device.decode_command_ahead", |cfg| {
+            cfg.device.decode_command_ahead
+        }),
+        ("device.decode_command_early_submit", |cfg| {
+            cfg.device.decode_command_early_submit
+        }),
+        ("device.decode_command_resident", |cfg| {
+            cfg.device.decode_command_resident
+        }),
+        ("kernels.vulkan.decode_gpu_resident_copy_overlap", |cfg| {
+            cfg.kernels.vulkan.decode_gpu_resident_copy_overlap
+        }),
+        ("kernels.vulkan.decode_gpu_resident_host_ready", |cfg| {
+            cfg.kernels.vulkan.decode_gpu_resident_host_ready
+        }),
+    ];
+    for (path, enabled) in flags {
+        assert!(enabled(&Config::default()), "default {path}");
+        let setting = format!("{path}=false");
+        let (section, key) = path.rsplit_once('.').unwrap();
+        let toml = format!("[{section}]\n{key}=false\n");
+        for layer in [cli_layer(&[setting.as_str()]), file_layer(&toml)] {
+            let cfg = Config::load_from_layers(&[layer]);
+            assert!(!enabled(&cfg), "explicit fallback {path}");
+        }
+    }
+}
+
+#[test]
+fn owned_role_pipeline_defaults_on_with_explicit_fallback() {
+    assert!(Config::default().kernels.vulkan.decode_gpu_resident_role_pipeline);
+    let path = "kernels.vulkan.decode_gpu_resident_role_pipeline";
+    for enabled in [false, true] {
+        let setting = format!("{path}={enabled}");
+        let toml = format!("[kernels.vulkan]\ndecode_gpu_resident_role_pipeline={enabled}\n");
+        for layer in [cli_layer(&[setting.as_str()]), file_layer(&toml)] {
+            let cfg = Config::load_from_layers(&[layer]);
+            assert_eq!(cfg.kernels.vulkan.decode_gpu_resident_role_pipeline, enabled);
+        }
+    }
+}
+
+#[test]
 fn paged_iq_grid_override_preserves_auto_and_explicit_modes() {
     for (value, expected) in [("none", None), ("true", Some(true)), ("false", Some(false))] {
         let mut layer = PartialConfig::default();
@@ -94,6 +159,158 @@ fn cli_layer(sets: &[&str]) -> PartialConfig {
     })
     .expect("cli layer rejected a valid --set")
     .0
+}
+
+#[test]
+fn host_dma_and_dedicated_transfer_are_independent() {
+    let defaults = Config::default();
+    assert!(defaults.paging.host_dma);
+    assert!(defaults.paging.dedicated_transfer);
+
+    for host_dma in [false, true] {
+        for dedicated in [false, true] {
+            let import_setting = format!("paging.host_dma={host_dma}");
+            let queue_setting = format!("paging.dedicated_transfer={dedicated}");
+            let toml = format!("[paging]\nhost_dma={host_dma}\ndedicated_transfer={dedicated}\n");
+            let mut vars = Vec::new();
+            if !host_dma {
+                vars.push(("INFR_NO_HOST_DMA", "1"));
+            }
+            if !dedicated {
+                vars.push(("INFR_NO_DEDICATED_TRANSFER", "1"));
+            }
+            for layer in [
+                env_layer(&vars),
+                file_layer(&toml),
+                cli_layer(&[&import_setting, &queue_setting]),
+            ] {
+                let cfg = Config::load_from_layers(&[layer]);
+                assert_eq!(cfg.paging.host_dma, host_dma);
+                assert_eq!(cfg.paging.dedicated_transfer, dedicated);
+            }
+        }
+    }
+}
+
+#[test]
+fn transfer_switch_overrides_preserve_other_settings() {
+    let cfg = Config::load_from_layers(&[
+        file_layer("[paging]\nhost_dma=false\ndedicated_transfer=false\n"),
+        env_layer(&[("INFR_NO_HOST_DMA", "1")]),
+        cli_layer(&["paging.dedicated_transfer=true"]),
+    ]);
+    assert!(!cfg.paging.host_dma);
+    assert!(cfg.paging.dedicated_transfer);
+
+    let cfg = Config::load_from_layers(&[
+        env_layer(&[("INFR_NO_DEDICATED_TRANSFER", "1")]),
+        cli_layer(&["paging.host_dma=true"]),
+    ]);
+    assert!(cfg.paging.host_dma);
+    assert!(!cfg.paging.dedicated_transfer);
+
+    let cfg = Config::load_from_layers(&[
+        env_layer(&[
+            ("INFR_NO_HOST_DMA", "1"),
+            ("INFR_NO_DEDICATED_TRANSFER", "1"),
+        ]),
+        cli_layer(&["paging.host_dma=true", "paging.dedicated_transfer=true"]),
+    ]);
+    assert!(cfg.paging.host_dma);
+    assert!(cfg.paging.dedicated_transfer);
+}
+
+#[test]
+fn attention_splits_preserve_automatic_and_supported_overrides() {
+    let defaults = Config::default();
+    assert_eq!(defaults.kernels.vulkan.flash_splits, None);
+    assert_eq!(defaults.kernels.vulkan.pv_splits, None);
+    defaults.kernels.vulkan.validate_attention_splits().unwrap();
+
+    for (key, env_key) in [
+        ("flash_splits", "INFR_FLASH_SPLITS"),
+        ("pv_splits", "INFR_PV_SPLITS"),
+    ] {
+        for splits in 1..=super::VulkanCfg::MAX_ATTENTION_SPLITS {
+            let value = splits.to_string();
+            let setting = format!("kernels.vulkan.{key}={value}");
+            let toml = format!("[kernels.vulkan]\n{key}={value}\n");
+            for layer in [
+                env_layer(&[(env_key, &value)]),
+                file_layer(&toml),
+                cli_layer(&[&setting]),
+            ] {
+                let cfg = Config::load_from_layers(&[layer]);
+                let vk = &cfg.kernels.vulkan;
+                vk.validate_attention_splits().unwrap();
+                let (actual, other) = if key == "flash_splits" {
+                    (vk.flash_splits, vk.pv_splits)
+                } else {
+                    (vk.pv_splits, vk.flash_splits)
+                };
+                assert_eq!(actual, Some(splits));
+                assert_eq!(other, None);
+            }
+        }
+    }
+}
+
+#[test]
+fn attention_splits_reject_zero_overflow_and_out_of_capacity_values() {
+    for (key, env_key) in [
+        ("flash_splits", "INFR_FLASH_SPLITS"),
+        ("pv_splits", "INFR_PV_SPLITS"),
+    ] {
+        for splits in [
+            0,
+            super::VulkanCfg::MAX_ATTENTION_SPLITS + 1,
+            u32::MAX as usize,
+            usize::MAX,
+        ] {
+            let value = splits.to_string();
+            let path = format!("kernels.vulkan.{key}");
+            let setting = format!("{path}={value}");
+            let mut layers = vec![env_layer(&[(env_key, &value)]), cli_layer(&[&setting])];
+            if splits as u128 <= i64::MAX as u128 {
+                layers.push(file_layer(&format!("[kernels.vulkan]\n{key}={value}\n")));
+            }
+            for layer in layers {
+                let cfg = Config::load_from_layers(&[layer]);
+                let err = cfg.kernels.vulkan.validate_attention_splits().unwrap_err();
+                match err {
+                    ConfigError::Value {
+                        path: actual,
+                        message,
+                    } => {
+                        assert_eq!(actual, path);
+                        assert!(message.contains("1..=8"), "{message}");
+                        assert!(message.contains(&format!("received {splits}")), "{message}");
+                    }
+                    other => panic!("unexpected error: {other}"),
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn attention_splits_validate_final_values_without_changing_layer_precedence() {
+    for (key, env_key) in [
+        ("flash_splits", "INFR_FLASH_SPLITS"),
+        ("pv_splits", "INFR_PV_SPLITS"),
+    ] {
+        let cfg = Config::load_from_layers(&[
+            file_layer(&format!("[kernels.vulkan]\n{key}=9\n")),
+            env_layer(&[(env_key, "0")]),
+            cli_layer(&[&format!("kernels.vulkan.{key}=4")]),
+        ]);
+        cfg.kernels.vulkan.validate_attention_splits().unwrap();
+        let cfg = Config::load_from_layers(&[
+            env_layer(&[(env_key, "4")]),
+            cli_layer(&[&format!("kernels.vulkan.{key}=9")]),
+        ]);
+        assert!(cfg.kernels.vulkan.validate_attention_splits().is_err());
+    }
 }
 
 #[test]
@@ -189,6 +406,7 @@ fn default_config_matches_documented_defaults() {
     assert!(d.kernels.vulkan.decode_gpu_resident);
     assert_eq!(d.kernels.vulkan.decode_gpu_resident_layers, 16);
     assert_eq!(d.kernels.vulkan.decode_gpu_resident_submit_layers, 0);
+    assert_eq!(d.kernels.vulkan.decode_gpu_resident_pure_mapped_layers, 0);
     assert_eq!(d.kernels.vulkan.decode_gpu_resident_inflight, 1);
     assert!(d.kernels.vulkan.decode_gpu_resident_mapped_metadata);
     assert!(d.kernels.vulkan.decode_gpu_resident_mapped_journal);
@@ -234,6 +452,9 @@ fn default_config_matches_documented_defaults() {
     assert_eq!(d.serve.stats_interval_secs, 5);
     // §6.8: `INFR_MTP` is the exact string "1"; unset ⇒ off, and the three MTP hatches default on.
     assert!(!d.spec.mtp);
+    assert!(!d.spec.lookup);
+    assert_eq!(d.spec.lookup_max_draft, 3);
+    assert_eq!(d.spec.lookup_min_match, 8);
     assert!(d.spec.mtp_ckpt && d.spec.mtp_reprime && d.spec.mtp_draft_chain);
     assert!(d.spec.mtp_ple_overlap);
     assert_eq!(d.spec.k, 6);
@@ -251,6 +472,108 @@ fn gpu_resident_decode_is_shipped_by_default_and_can_be_disabled_explicitly() {
     let mut cfg = defaults;
     cli_layer(&["kernels.vulkan.decode_gpu_resident=false"]).apply(&mut cfg);
     assert!(!cfg.kernels.vulkan.decode_gpu_resident);
+}
+
+#[test]
+fn speculative_paths_preserve_explicit_runtime_ab_controls() {
+    let defaults = Config::default();
+    assert_eq!(defaults.kernels.vulkan.decode_gpu_resident_copy, None);
+    assert!(defaults.kernels.vulkan.decode_gpu_resident_copy_overlap);
+    assert_eq!(defaults.kernels.vulkan.decode_gpu_resident_copy_groups, 0);
+    assert!(defaults.kernels.vulkan.qsa_verify_split);
+    assert!(!defaults.kernels.vulkan.verify_shared_iq2_nr8);
+    assert!(defaults.kernels.vulkan.verify_pair);
+    assert!(defaults.spec.mtp_tail_kv_only);
+    assert!(defaults.spec.mtp_vocab.is_none());
+    assert!(!defaults.spec.lookup);
+    for layer in [
+        cli_layer(&[
+            "kernels.vulkan.decode_gpu_resident_copy=true",
+            "kernels.vulkan.decode_gpu_resident_copy_overlap=true",
+            "kernels.vulkan.qsa_verify_split=false",
+            "kernels.vulkan.verify_pair=true",
+            "spec.mtp_tail_kv_only=false", "spec.mtp_vocab=draft-vocab.bin", "spec.lookup=true",
+            "spec.lookup_max_draft=2", "spec.lookup_min_match=12",
+        ]),
+        file_layer("[kernels.vulkan]\ndecode_gpu_resident_copy=true\ndecode_gpu_resident_copy_overlap=true\nqsa_verify_split=false\nverify_pair=true\n[spec]\nmtp_tail_kv_only=false\nmtp_vocab='draft-vocab.bin'\nlookup=true\nlookup_max_draft=2\nlookup_min_match=12\n"),
+    ] {
+        let cfg = Config::load_from_layers(&[layer]);
+        assert_eq!(cfg.kernels.vulkan.decode_gpu_resident_copy, Some(true));
+        assert!(cfg.kernels.vulkan.decode_gpu_resident_copy_overlap);
+        assert!(!cfg.kernels.vulkan.qsa_verify_split);
+        assert!(cfg.kernels.vulkan.verify_pair);
+        assert!(!cfg.spec.mtp_tail_kv_only);
+        assert_eq!(cfg.spec.mtp_vocab.as_deref(), Some(std::path::Path::new("draft-vocab.bin")));
+        assert!(cfg.spec.lookup);
+        assert_eq!(cfg.spec.lookup_max_draft, 2);
+        assert_eq!(cfg.spec.lookup_min_match, 12);
+    }
+}
+
+#[test]
+fn shared_iq2_verify_nr8_preserves_explicit_reference_path() {
+    for enabled in [false, true] {
+        let setting = format!("kernels.vulkan.verify_shared_iq2_nr8={enabled}");
+        let toml = format!("[kernels.vulkan]\nverify_shared_iq2_nr8={enabled}\n");
+        for layer in [cli_layer(&[setting.as_str()]), file_layer(&toml)] {
+            let cfg = Config::load_from_layers(&[layer]);
+            assert_eq!(cfg.kernels.vulkan.verify_shared_iq2_nr8, enabled);
+        }
+    }
+}
+
+#[test]
+fn lookup_width_policy_can_be_compared_without_changing_target_verification() {
+    assert!(Config::default().spec.lookup_adaptive_width);
+    for enabled in [false, true] {
+        let setting = format!("spec.lookup_adaptive_width={enabled}");
+        let toml = format!("[spec]\nlookup_adaptive_width={enabled}\n");
+        for layer in [cli_layer(&[setting.as_str()]), file_layer(&toml)] {
+            let cfg = Config::load_from_layers(&[layer]);
+            assert_eq!(cfg.spec.lookup_adaptive_width, enabled);
+            assert!(!cfg.spec.lookup);
+        }
+    }
+}
+
+#[test]
+fn gpu_copy_auto_policy_preserves_explicit_on_off_layers() {
+    for enabled in [false, true] {
+        let setting = format!("kernels.vulkan.decode_gpu_resident_copy={enabled}");
+        let toml = format!("[kernels.vulkan]\ndecode_gpu_resident_copy={enabled}\n");
+        for layer in [cli_layer(&[setting.as_str()]), file_layer(&toml)] {
+            let cfg = Config::load_from_layers(&[layer]);
+            assert_eq!(cfg.kernels.vulkan.decode_gpu_resident_copy, Some(enabled));
+        }
+    }
+    let cfg = Config::load_from_layers(&[
+        file_layer("[kernels.vulkan]\ndecode_gpu_resident_copy=true\nverify_pair=true\n"),
+        cli_layer(&[
+            "kernels.vulkan.decode_gpu_resident_copy=false",
+            "kernels.vulkan.verify_pair=false",
+        ]),
+    ]);
+    assert_eq!(cfg.kernels.vulkan.decode_gpu_resident_copy, Some(false));
+    assert!(!cfg.kernels.vulkan.verify_pair);
+}
+
+#[test]
+fn gpu_copy_groups_config_accepts_auto_and_explicit_ab_values() {
+    for value in [0, 1, 2, 4, 8, 9, 1024] {
+        let setting = format!("kernels.vulkan.decode_gpu_resident_copy_groups={value}");
+        let toml = format!("[kernels.vulkan]\ndecode_gpu_resident_copy_groups={value}\n");
+        for layer in [cli_layer(&[setting.as_str()]), file_layer(&toml)] {
+            let cfg = Config::load_from_layers(&[layer]);
+            assert_eq!(cfg.kernels.vulkan.decode_gpu_resident_copy_groups, value);
+            assert_eq!(cfg.kernels.vulkan.decode_gpu_resident_copy, None);
+            assert!(cfg.kernels.vulkan.decode_gpu_resident_copy_overlap);
+        }
+    }
+    for value in ["-1", "1.5", "invalid"] {
+        assert!(PartialConfig::default()
+            .set_path("kernels.vulkan.decode_gpu_resident_copy_groups", value)
+            .is_err());
+    }
 }
 
 #[test]
@@ -867,6 +1190,22 @@ fn timeline_raw_label_controls_use_config_and_preserve_presence_env() {
     assert!(!cfg.prof.timeline_raw_unknown);
 }
 
+#[test]
+fn timeline_selective_sampling_is_opt_in_and_cli_configured() {
+    let default = Config::default();
+    assert!(default.prof.timeline_device_select.is_none());
+    assert!(default.prof.timeline_device_layer.is_none());
+    assert!(default.prof.timeline_host_select.is_none());
+    let cfg = Config::load_from_layers(&[cli_layer(&[
+        "prof.timeline_device_select=resident_,argmax",
+        "prof.timeline_device_layer=3",
+        "prof.timeline_host_select=queue_submit,PLE_",
+    ])]);
+    assert_eq!(cfg.prof.timeline_device_select.as_deref(), Some("resident_,argmax"));
+    assert_eq!(cfg.prof.timeline_device_layer, Some(3));
+    assert_eq!(cfg.prof.timeline_host_select.as_deref(), Some("queue_submit,PLE_"));
+}
+
 // ── §8.8 — every key is read ─────────────────────────────────────────────────
 
 /// Setting ANY manifest key through the injected reader must change what the layer specifies.
@@ -1037,7 +1376,7 @@ fn scan_file_for_keys(path: &Path, out: &mut Vec<String>) {
 /// This is the shell grep `env::var(_os)?("INFR_` over `crates/*/src` + `crates/*/build.rs`, in
 /// Rust, minus comments. The allowed hits are exactly §6.10's permanent exclusions:
 ///
-/// * `INFR_PROFILE` in the five `build.rs` — a BUILD-time input; a runtime `Config` cannot exist
+/// * `INFR_PROFILE` and `INFR_GIT_COMMIT` in `build.rs` — BUILD-time inputs; a runtime `Config` cannot exist
 ///   when it is read (§5.3).
 /// * `INFR_TEST_GGUF` / `INFR_TEST_MODEL` / `INFR_EMBEDDING_TEST_*` /
 ///   `INFR_LLAMA_DIFFUSION_CLI` — test/dev fixtures that point at files on disk, deliberately left
@@ -1079,8 +1418,7 @@ fn no_infr_env_reads_outside_the_config_layer() {
         if DIRECT_ENV_KEYS.contains(&key) {
             return false;
         }
-        // `INFR_PROFILE` is the build scripts' alone.
-        !(key == "INFR_PROFILE" && path.ends_with("build.rs"))
+        !build_only_metadata_env_read(Path::new(path), key)
     });
     assert!(
         offenders.is_empty(),
@@ -1088,6 +1426,33 @@ fn no_infr_env_reads_outside_the_config_layer() {
          `config/env.rs` and take the value off the `Config` the caller already owns (R3): \
          {offenders:#?}"
     );
+}
+
+fn build_only_metadata_env_read(path: &Path, key: &str) -> bool {
+    path.file_name().is_some_and(|name| name == "build.rs")
+        && matches!(key, "INFR_PROFILE" | "INFR_GIT_COMMIT")
+}
+
+#[test]
+fn build_metadata_env_exception_cannot_hide_runtime_knobs() {
+    for key in ["INFR_PROFILE", "INFR_GIT_COMMIT"] {
+        assert!(build_only_metadata_env_read(
+            Path::new("crates/infr-cli/build.rs"),
+            key
+        ));
+        assert!(!build_only_metadata_env_read(
+            Path::new("crates/infr-cli/src/main.rs"),
+            key
+        ));
+        assert!(!build_only_metadata_env_read(
+            Path::new("crates/infr-core/src/build.rs.bak"),
+            key
+        ));
+    }
+    assert!(!build_only_metadata_env_read(
+        Path::new("build.rs"),
+        "INFR_KV_TYPE_K"
+    ));
 }
 
 #[test]
@@ -1675,6 +2040,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_SHUTDOWN_FILE",
         "INFR_EMBEDDING_RUNNER",
         "INFR_NO_HOST_DMA",
+        "INFR_NO_DEDICATED_TRANSFER",
         "INFR_KV_SESSION_CACHE_DIR",
         "INFR_KV_SESSION_IDLE_SECS",
         "INFR_KV_SESSION_CACHE_MAX",

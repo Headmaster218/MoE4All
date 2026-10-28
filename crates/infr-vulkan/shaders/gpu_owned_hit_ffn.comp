@@ -1,0 +1,291 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+// Experimental complete hit FFN, or GU_ONLY fused miss Gate/Up+SiLU.
+// Build exactly one FMT_Q4K/Q5K/Q6K/IQ2S/IQ3S. Optional DOWN_IQ4NL selects mixed Down;
+// otherwise full FFN Down uses the Gate/Up format. Mixed Q5K->Q6K still uses fallback.
+// IQ2S/IQ3S require USE_GRID and the existing generated native_grids.glsl.
+// LOCAL_SIZE=128|256, MAX_NFF=1024|2048. Host MUST pin subgroup size 32 with full subgroups.
+// Bindings: 0=X[f32, rows*ne], 1=IDs[u32, rows*used + rows H + rows M masks],
+// 2=Tape[uvec2 full BDA], 3=output[f32, rows*physical_used*(GU_ONLY ? nff : ne)].
+// Push ABI: ten consecutive uints, 40 bytes; SHARED_Q8 appends three uvec2 BDAs, 64 bytes.
+// Full FFN: dispatch rows*(SHARED_Q8 ? physical_used : used)*down_tiles WGs, tiles=1/2/4.
+// Each tile repeats Gate/Up+SiLU, then writes a disjoint Down slice, using H mask bank 1.
+// Without SHARED_Q8, the shared expert must run separately even when physical_used=used+1.
+// SHARED_Q8 requires physical_used=used+1 and three valid, nonzero Q8_0 BDAs. Its shared
+// slot is always H, independent of the routed mask, and is evaluated exactly once per slice.
+// Shared matrices must have the same ne/nff geometry as the routed FFN; shared gating,
+// router weighting and accumulation stay with the caller after the output dependency.
+// GU_ONLY: dispatch rows*used*ceil(nff/(LOCAL_SIZE/32)) WGs. Each subgroup computes one
+// activation output and writes ACT directly using M mask bank 2. No Down address/read,
+// activation LDS, shared expert, or Down-tiling requirement exists in this build.
+// IDs/masks always use routed stride used; output alone uses physical_used.
+// Full FFN does not populate global Gate/Up/ACT scratch; GU_ONLY produces ACT only.
+// No model-name gates or numerical qualification claims: reductions need oracle tolerances.
+
+#ifndef LOCAL_SIZE
+#define LOCAL_SIZE 128
+#endif
+#ifndef MAX_NFF
+#define MAX_NFF 1024
+#endif
+#if LOCAL_SIZE != 128 && LOCAL_SIZE != 256
+#error LOCAL_SIZE_must_be_128_or_256
+#endif
+#if MAX_NFF != 1024 && MAX_NFF != 2048
+#error MAX_NFF_must_be_1024_or_2048
+#endif
+#if (defined(FMT_Q4K) + defined(FMT_Q5K) + defined(FMT_Q6K) + defined(FMT_IQ2S) + defined(FMT_IQ3S)) != 1
+#error Select_exactly_one_supported_Gate_Up_format
+#endif
+#if defined(DOWN_Q6K)
+#error Mixed_Down_Q6K_is_not_implemented_use_the_unfused_fallback
+#endif
+#if defined(FMT_IQ4NL)
+#error Use_DOWN_IQ4NL_for_the_mixed_Down_format
+#endif
+#if (defined(FMT_IQ2S) || defined(FMT_IQ3S)) && !defined(USE_GRID)
+#error Grid_quant_formats_require_USE_GRID
+#endif
+#if defined(IQ2_GRID_BUFFER) || defined(IQ3_GRID_BUFFER)
+#error This_experiment_uses_workgroup_local_generated_grids
+#endif
+#if defined(GU_ONLY) && defined(SHARED_Q8)
+#error GU_ONLY_is_routed_misses_only_the_shared_expert_belongs_to_full_hit_FFN
+#endif
+
+layout(local_size_x = LOCAL_SIZE, local_size_y = 1, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer Input { float x[]; };
+layout(std430, binding = 1) readonly buffer Ids { uint ids[]; };
+layout(std430, binding = 2) readonly buffer Tape { uvec2 tape[]; };
+layout(std430, binding = 3) buffer Output { float output_values[]; };
+layout(push_constant) uniform Params {
+    uint ne;
+    uint nff;
+    uint rows;
+    uint used;
+    uint experts;
+    uint physical_used;
+    uint gate_base;
+    uint up_base;
+    uint down_base;
+    uint down_tiles;
+#ifdef SHARED_Q8
+    layout(offset = 40) uvec2 shared_gate;
+    layout(offset = 48) uvec2 shared_up;
+    layout(offset = 56) uvec2 shared_down;
+#endif
+} p;
+
+#include "native_weight_addr.glsl"
+#define NW(index) arena_word(index)
+// Keep the native BDA wide-fetch helpers for every selected quant format.
+#ifndef STREAMED
+#define STREAMED
+#endif
+#include "native_decode.glsl"
+
+#ifndef GU_ONLY
+#ifdef DOWN_IQ4NL
+#include "gpu_owned_hit_ffn_down_iq4nl.glsl"
+#else
+void owned_down_dqblk32(uint gstart, out float values[32]) {
+    dqblk(gstart, values);
+}
+#endif
+shared float activation[MAX_NFF];
+#endif
+
+#ifdef SHARED_Q8
+#include "gpu_owned_hit_ffn_shared_q8.glsl"
+#endif
+
+bool fits(uint base, uint count, uint length) {
+    return base <= length && count <= length - base;
+}
+
+bool valid_address(uvec2 address) {
+    return any(notEqual(address, uvec2(0u)))
+        && !all(equal(address, uvec2(0xffffffffu))) && (address.x & 3u) == 0u;
+}
+
+float owned_input_dot(uint64_t address, uint output_row, uint input_base, bool shared_slot) {
+    w_addr = address;
+    float sum = 0.0;
+    float values[32];
+    // Each lane owns whole native 32-element blocks; no scalar dq() calls.
+    for (uint block = gl_SubgroupInvocationID; block < p.ne / 32u; block += 32u) {
+        uint element = block * 32u;
+#ifdef SHARED_Q8
+        if (shared_slot) {
+            owned_shared_q8_dqblk32(output_row * p.ne + element, values);
+        } else
+#endif
+        {
+            dqblk(output_row * p.ne + element, values);
+        }
+        [[unroll]] for (uint i = 0u; i < 32u; ++i) {
+            sum += values[i] * x[input_base + element + i];
+        }
+    }
+    return subgroupAdd(sum);
+}
+
+#ifndef GU_ONLY
+float owned_activation_dot(uint output_row, bool shared_slot) {
+    float sum = 0.0;
+    float values[32];
+    for (uint block = gl_SubgroupInvocationID; block < p.nff / 32u; block += 32u) {
+        uint element = block * 32u;
+#ifdef SHARED_Q8
+        if (shared_slot) {
+            owned_shared_q8_dqblk32(output_row * p.nff + element, values);
+        } else
+#endif
+        {
+            owned_down_dqblk32(output_row * p.nff + element, values);
+        }
+        [[unroll]] for (uint i = 0u; i < 32u; ++i) {
+            sum += values[i] * activation[element + i];
+        }
+    }
+    return subgroupAdd(sum);
+}
+#endif
+
+void main() {
+    // Compile-time GRID_INIT is empty or stages the selected IQ grid with a WG barrier.
+    // Execute it uniformly before EVERY early return, including masked/padded workgroups.
+    GRID_INIT;
+    // All remaining rejection decisions are workgroup-uniform before the activation barrier.
+    // Gate/Up K rows require 256 elements; IQ4NL Down K rows require only 32.
+    if (p.rows == 0u || p.rows > 8u || p.used == 0u || p.used > 16u
+        || p.experts == 0u || p.ne == 0u || p.ne > 65536u
+        || p.nff == 0u || p.nff > uint(MAX_NFF)
+        || (p.ne & 255u) != 0u || (p.nff & 31u) != 0u
+        || p.physical_used < p.used || p.physical_used > p.used + 1u) return;
+#ifndef GU_ONLY
+    if (p.down_tiles != 1u && p.down_tiles != 2u && p.down_tiles != 4u) return;
+#ifndef DOWN_IQ4NL
+    // Same-format Down requires complete 256-element K rows for the native quant decoder.
+    if ((p.nff & 255u) != 0u) return;
+#endif
+#endif
+#ifdef SHARED_Q8
+    // Unlike the routed-only ABI, enabled shared BDAs may never be zero placeholders.
+    if (p.physical_used != p.used + 1u
+        || !valid_address(p.shared_gate) || !valid_address(p.shared_up)
+        || !valid_address(p.shared_down)) return;
+#endif
+    uint routed_assignments = p.rows * p.used;
+#ifdef GU_ONLY
+    uint mask_words = p.rows * 2u;
+    uint output_width = p.nff;
+#else
+    uint mask_words = p.rows;
+    uint output_width = p.ne;
+#endif
+    if (uint(ids.length()) < routed_assignments + mask_words
+        || uint(x.length()) < p.rows * p.ne
+        || uint(output_values.length()) < p.rows * p.physical_used * output_width
+        || !fits(p.gate_base, p.experts, uint(tape.length()))
+        || !fits(p.up_base, p.experts, uint(tape.length()))) return;
+#ifndef GU_ONLY
+    if (!fits(p.down_base, p.experts, uint(tape.length()))) return;
+#endif
+    if (gl_WorkGroupID.z != 0u) return;
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    // Required subgroup size 32 + full subgroups guarantees exactly LOCAL_SIZE/32 waves.
+    const uint waves = uint(LOCAL_SIZE) / 32u;
+#ifdef GU_ONLY
+    uint slots_per_row = p.used;
+    uint tiles = (p.nff + waves - 1u) / waves;
+#else
+#ifdef SHARED_Q8
+    uint slots_per_row = p.physical_used;
+#else
+    uint slots_per_row = p.used;
+#endif
+    uint tiles = p.down_tiles;
+#endif
+    if (unit >= p.rows * slots_per_row * tiles) return;
+    uint assignment = unit / tiles;
+    uint tile = unit % tiles;
+    uint row = assignment / slots_per_row;
+    uint slot = assignment % slots_per_row;
+    bool shared_slot = false;
+#ifdef SHARED_Q8
+    shared_slot = slot == p.used;
+#endif
+#ifdef GU_ONLY
+    uint mask = ids[routed_assignments + p.rows + row];
+#else
+    uint mask = ids[routed_assignments + row];
+#endif
+    if (!shared_slot && (mask & (1u << slot)) == 0u) return;
+
+    uvec2 gate;
+    uvec2 up;
+#ifndef GU_ONLY
+    uvec2 down;
+#endif
+#ifdef SHARED_Q8
+    if (shared_slot) {
+        gate = p.shared_gate;
+        up = p.shared_up;
+        down = p.shared_down;
+    } else
+#endif
+    {
+        // Shared output stride never changes the tightly packed routed-ID addressing.
+        uint expert = ids[row * p.used + slot];
+        if (expert >= p.experts) return;
+        gate = tape[p.gate_base + expert];
+        up = tape[p.up_base + expert];
+#ifndef GU_ONLY
+        down = tape[p.down_base + expert];
+#endif
+    }
+    if (!valid_address(gate) || !valid_address(up)) return;
+#ifndef GU_ONLY
+    if (!valid_address(down)) return;
+#endif
+    uint lane = gl_SubgroupInvocationID;
+    uint wave = gl_SubgroupID;
+    uint input_base = row * p.ne;
+    uint64_t gate_address = arena_base(gate.x, gate.y);
+    uint64_t up_address = arena_base(up.x, up.y);
+#ifdef GU_ONLY
+    // No WG barrier follows: the final output-row rejection is subgroup-uniform.
+    uint f = tile * waves + wave;
+    if (f < p.nff) {
+        float g = owned_input_dot(gate_address, f, input_base, false);
+        float u = owned_input_dot(up_address, f, input_base, false);
+        if (lane == 0u) {
+            uint output_base = (row * p.physical_used + slot) * p.nff;
+            output_values[output_base + f] = (g / (1.0 + exp(-g))) * u;
+        }
+    }
+#else
+    for (uint f = wave; f < p.nff; f += waves) {
+        float g = owned_input_dot(gate_address, f, input_base, shared_slot);
+        float u = owned_input_dot(up_address, f, input_base, shared_slot);
+        if (lane == 0u) activation[f] = (g / (1.0 + exp(-g))) * u;
+    }
+    // Every subgroup finishes its activation rows before any subgroup consumes them.
+    memoryBarrierShared();
+    barrier();
+
+    w_addr = arena_base(down.x, down.y);
+    uint first = p.ne * tile / p.down_tiles;
+    uint end = p.ne * (tile + 1u) / p.down_tiles;
+    uint output_base = (row * p.physical_used + slot) * p.ne;
+    for (uint o = first + wave; o < end; o += waves) {
+        float value = owned_activation_dot(o, shared_slot);
+        if (lane == 0u) output_values[output_base + o] = value;
+    }
+#endif
+}

@@ -201,6 +201,12 @@ pub struct Capabilities {
     /// This saves one command and the inter-op scheduling boundary; it does not concatenate or
     /// duplicate either weight and adds no persistent device allocation.
     pub linear_pair_f32: bool,
+    /// The backend accepts [`crate::Op::LinearPair`] with two same-shape Q8_0 weights and F32
+    /// activation/outputs for one row. Other row counts keep ordinary two-Linear graph nodes,
+    /// including their multi-row selection; this does not promise fusion for every shape.
+    /// Independent from `linear_pair_f32`, false by default, and advertised only when the
+    /// backend's paired-Q8 implementation and device policy are enabled.
+    pub linear_pair_q8: bool,
     /// The backend executes Qwen3.8's one-row Q8_0 HC down projection, scaled SiLU, and tiny F32
     /// inject projection in one dispatch. Multi-row Prefill/Verify and other weight types retain
     /// the split graph.
@@ -451,6 +457,17 @@ pub struct SegmentedKvSpec {
 pub trait Plan: Send + Sync {
     /// Downcast hook so a backend can recover its concrete plan type from a `&dyn Plan`.
     fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Optionally precompute immutable layout/metadata using CPU work only. The default is a no-op;
+    /// callers opt in explicitly, and `compile` need not call this method.
+    ///
+    /// Implementations must not allocate GPU resources, read or write bound buffers, touch KV
+    /// state, or acquire/change resource leases. Repeated calls must be idempotent; failed analysis
+    /// must remain retryable. Concurrent use with `execute` requires the backend's explicit
+    /// [`Backend::supports_async_compile`] guarantee.
+    fn prepare(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// The trivial [`Plan`] both current backends share: it just carries a clone of the [`Graph`] — the
@@ -485,16 +502,66 @@ impl Plan for GraphPlan {
 /// not a `HashMap` — `bind`/`get` are then hash-free O(1), which matters because decode rebinds
 /// every step. `bind`/`get` semantics are identical to the old map: `get` on an unbound (or
 /// never-grown-to) id returns `None`, and re-binding an id overwrites.
+#[derive(Clone)]
 enum BoundBuffer<'a> {
     Single(&'a dyn Buffer),
     Rows(Vec<&'a dyn Buffer>),
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Bindings<'a> {
     /// `slots[id.0] = Some(buf)` for a bound handle, `None` for unbound. Grows on demand to the
     /// highest id bound (bounded by the graph's tensor count).
     slots: Vec<Option<BoundBuffer<'a>>>,
+}
+
+/// One consecutive part of a forward. Bindings and their buffers stay alive until the entire
+/// staged call returns; a later stage may consume an earlier stage's outputs.
+#[derive(Clone, Copy)]
+pub struct ExecutionStage<'a> {
+    pub plan: &'a dyn Plan,
+    pub bindings: &'a Bindings<'a>,
+    /// Optional declaration for this stage's input-ready callback. See
+    /// [`Self::with_independent_host_inputs`]; tensor IDs alone do not prove physical isolation.
+    pub independent_host_inputs: Option<&'a [TensorId]>,
+}
+
+impl<'a> ExecutionStage<'a> {
+    pub fn new(plan: &'a dyn Plan, bindings: &'a Bindings<'a>) -> Self {
+        Self {
+            plan,
+            bindings,
+            independent_host_inputs: None,
+        }
+    }
+
+    /// Declare that this stage's input-ready callback is independent of prior GPU results.
+    /// The callback must not read those results, and its backend-buffer writes must be
+    /// limited to the declared external `Input` buffers. It must not submit GPU work or
+    /// mutate bindings, allocations, or buffer layouts.
+    ///
+    /// This declares CPU input readiness only, not stage execution independence. Before
+    /// overlapping the callback with prior GPU work, a backend must validate the declared
+    /// inputs and prove their physical storage does not alias any storage still in use by
+    /// that work. Backends may ignore this declaration and keep their ordinary ordering.
+    pub fn with_independent_host_inputs(mut self, inputs: &'a [TensorId]) -> Self {
+        self.independent_host_inputs = Some(inputs);
+        self
+    }
+}
+
+/// Unsubmitted stages of the next forward. Inputs may receive new values only after the
+/// current forward drains; recording never authorizes execution or consumes those values.
+#[derive(Clone, Copy)]
+pub struct ExecutionLookahead<'a> {
+    pub stages: &'a [ExecutionStage<'a>],
+    pub positions: &'a [usize],
+}
+
+impl<'a> ExecutionLookahead<'a> {
+    pub fn new(stages: &'a [ExecutionStage<'a>], positions: &'a [usize]) -> Self {
+        Self { stages, positions }
+    }
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -798,8 +865,88 @@ pub trait Backend: Send + Sync {
     }
 
     // ---- execution (compile once per shape, execute per token/step) ----
+    /// Opt in only when both `compile` and the returned [`Plan::prepare`] perform CPU-only work
+    /// and may safely run concurrently with `execute` on this backend. Neither may allocate GPU
+    /// resources, access bound buffers or KV state, or acquire/change resource leases.
+    ///
+    /// The default keeps callers on the synchronous path. Wrappers must establish this guarantee
+    /// for their own compile/prepare paths before opting in; an inner backend's opt-in is not enough.
+    fn supports_async_compile(&self) -> bool {
+        false
+    }
+
+    /// Can record a bounded next-step command prefix while the current forward executes.
+    /// This is distinct from CPU-only compile/prepare: no future GPU work may be submitted.
+    fn supports_execution_lookahead(&self) -> bool {
+        false
+    }
+
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>>;
     fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()>;
+    /// Synchronous forward plus optional recording of the next forward. All preparation workers
+    /// must join before returning; binding buffers may be rebound/dropped immediately afterwards.
+    /// The next plan is only submitted by its later, explicitly authorized execute call.
+    fn execute_with_lookahead(
+        &self,
+        plan: &dyn Plan,
+        bindings: &Bindings,
+        _next: Option<(&dyn Plan, &Bindings, &[usize])>,
+    ) -> Result<()> {
+        self.execute(plan, bindings)
+    }
+
+    /// Execute consecutive plans with a caller-thread input handoff before each stage. The
+    /// callback receives the zero-based stage index, including zero, exactly once in order. It
+    /// may wait for CPU-produced inputs and upload into already allocated buffers using this
+    /// backend. It must not execute another graph, allocate device resources, or wait for a
+    /// worker that needs this backend's execution/resource gate. Backends must not call it from
+    /// a preparation worker or while holding pager/workspace locks.
+    /// Uploads may change only caller-owned stage inputs after their preceding readers drained;
+    /// the callback must not mutate active GPU residency tables, copy journals or pager state.
+    ///
+    /// Backends may reserve combined resources before stage zero and prepare immutable CPU-only
+    /// metadata for later stages concurrently with execution. They must keep the overall resource
+    /// lease until all stages, callbacks, submitted work and preparation workers have drained.
+    /// Each stage completes before the next callback; `next` is lookahead for the last stage only.
+    ///
+    /// The default preserves sequential execute behavior. Any error stops immediately and may
+    /// follow partial execution, including a partially submitted failing stage. NEVER retry the
+    /// entire forward or fall back to ordinary execute after an error: earlier stages may already
+    /// have modified KV/recurrent state. An empty list does no work and invokes no callbacks.
+    fn execute_staged(
+        &self,
+        stages: &[ExecutionStage<'_>],
+        input_ready: &mut dyn FnMut(usize) -> Result<()>,
+        next: Option<(&dyn Plan, &Bindings, &[usize])>,
+    ) -> Result<()> {
+        for (index, stage) in stages.iter().enumerate() {
+            input_ready(index)?;
+            if index + 1 == stages.len() {
+                self.execute_with_lookahead(stage.plan, stage.bindings, next)?;
+            } else {
+                self.execute(stage.plan, stage.bindings)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Record compatible future stages while this staged forward executes. Every worker must
+    /// join before returning. Each future stage remains gated by its later authorized call and
+    /// input callback; EOS, cancellation or a failed forward must discard all unused packets.
+    /// Backends without multi-stage recording keep their existing first-prefix lookahead.
+    fn execute_staged_lookahead(
+        &self,
+        stages: &[ExecutionStage<'_>],
+        input_ready: &mut dyn FnMut(usize) -> Result<()>,
+        next: Option<ExecutionLookahead<'_>>,
+    ) -> Result<()> {
+        let first = next.and_then(|next| {
+            next.stages
+                .first()
+                .map(|stage| (stage.plan, stage.bindings, next.positions))
+        });
+        self.execute_staged(stages, input_ready, first)
+    }
     /// Chained decode: run the record-once decode plan `n` times in ONE submission, the sampled
     /// token id flowing device-side from each iteration's `Op::Argmax`/`Op::Sample` into the next
     /// iteration's `Op::EmbedGather` — the caller MUST have bound the sampler output and the
@@ -934,6 +1081,26 @@ pub fn kv_overflow_report_each<B: Backend>(backends: &[B]) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn plan_prepare_defaults_to_noop() {
+        let graph = Graph::new();
+        let plan = GraphPlan::boxed(&graph);
+        plan.prepare().unwrap();
+        plan.prepare().unwrap();
+        let graph = &plan.as_any().downcast_ref::<GraphPlan>().unwrap().graph;
+        assert!(graph.tensors.is_empty());
+        assert!(graph.ops.is_empty());
+    }
+
+    #[test]
+    fn async_compile_defaults_to_disabled() {
+        let backend = MockBackend {
+            last_download_len: std::sync::Mutex::new(0),
+        };
+        let backend: &dyn Backend = &backend;
+        assert!(!backend.supports_async_compile());
+    }
+
     /// The integrated chunk policy. The load-bearing property is the CEILING: this may only ever
     /// SHRINK the discrete default (1024), never grow it — it is a watchdog guard, not a tuning
     /// knob — and it must never return 0 (a zero-row prefill chunk would not terminate).
@@ -1013,6 +1180,14 @@ mod tests {
         assert_eq!(caps.compute_units, 0);
     }
 
+    #[test]
+    fn quantized_linear_pair_is_not_implied_by_f32_support() {
+        let mut caps = Capabilities::default();
+        assert!(!caps.linear_pair_q8);
+        caps.linear_pair_f32 = true;
+        assert!(!caps.linear_pair_q8);
+    }
+
     /// The `copy_buffer` bounds-check helper: an oversize prefix errors instead of panicking, and
     /// any prefix up to the source length is accepted.
     #[test]
@@ -1069,12 +1244,160 @@ mod tests {
         fn compile(&self, _graph: &Graph) -> Result<Box<dyn Plan>> {
             unimplemented!()
         }
-        fn execute(&self, _plan: &dyn Plan, _bindings: &Bindings) -> Result<()> {
-            unimplemented!()
+        fn execute(&self, plan: &dyn Plan, _bindings: &Bindings) -> Result<()> {
+            let plan = plan.as_any().downcast_ref::<StageTestPlan>().unwrap();
+            plan.events.lock().unwrap().push(("execute", plan.index));
+            if plan.fail {
+                return Err(crate::error::backend("stage partially submitted"));
+            }
+            Ok(())
         }
         fn sync(&self) -> Result<()> {
             Ok(())
         }
+    }
+
+    struct StageTestPlan {
+        index: usize,
+        fail: bool,
+        events: std::sync::Arc<std::sync::Mutex<Vec<(&'static str, usize)>>>,
+    }
+
+    impl Plan for StageTestPlan {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn staged_host_input_declaration_is_opt_in_and_preserves_default_callback_order() {
+        let backend = MockBackend {
+            last_download_len: std::sync::Mutex::new(0),
+        };
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let plans = [0, 1].map(|index| StageTestPlan {
+            index,
+            fail: false,
+            events: std::sync::Arc::clone(&events),
+        });
+        let bindings = Bindings::new();
+        let inputs = [TensorId(3), TensorId(7)];
+        let first = ExecutionStage::new(&plans[0], &bindings);
+        let main = ExecutionStage::new(&plans[1], &bindings);
+        assert!(first.independent_host_inputs.is_none());
+        assert!(main.independent_host_inputs.is_none());
+        let main = main.with_independent_host_inputs(&inputs);
+        assert_eq!(main.independent_host_inputs, Some(inputs.as_slice()));
+        assert!(std::ptr::eq(
+            main.plan.as_any().downcast_ref::<StageTestPlan>().unwrap(),
+            &plans[1]
+        ));
+        assert!(std::ptr::eq(main.bindings, &bindings));
+        let copied = main;
+        assert_eq!(copied.independent_host_inputs, main.independent_host_inputs);
+
+        backend
+            .execute_staged(
+                &[first, main],
+                &mut |index| {
+                    events.lock().unwrap().push(("ready", index));
+                    Ok(())
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            [("ready", 0), ("execute", 0), ("ready", 1), ("execute", 1)]
+        );
+    }
+
+    #[test]
+    fn staged_default_orders_ready_and_execute_and_stops_after_errors() {
+        // Exercise through a trait object, including failure in a later callback and partial
+        // execution of either stage. No earlier execute may be repeated on any error path.
+        for (callback_failure, execution_failure, expected) in [
+            (
+                None,
+                None,
+                vec![("ready", 0), ("execute", 0), ("ready", 1), ("execute", 1)],
+            ),
+            (Some(0), None, vec![("ready", 0)]),
+            (
+                Some(1),
+                None,
+                vec![("ready", 0), ("execute", 0), ("ready", 1)],
+            ),
+            (None, Some(0), vec![("ready", 0), ("execute", 0)]),
+            (
+                None,
+                Some(1),
+                vec![("ready", 0), ("execute", 0), ("ready", 1), ("execute", 1)],
+            ),
+        ] {
+            let backend = MockBackend {
+                last_download_len: std::sync::Mutex::new(0),
+            };
+            let backend: &dyn Backend = &backend;
+            let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let plans = [0, 1].map(|index| StageTestPlan {
+                index,
+                fail: execution_failure == Some(index),
+                events: std::sync::Arc::clone(&events),
+            });
+            let bindings = Bindings::new();
+            let stages = plans
+                .each_ref()
+                .map(|plan| ExecutionStage::new(plan, &bindings));
+            let caller = std::thread::current().id();
+            let result = backend.execute_staged(
+                &stages,
+                &mut |index| {
+                    assert_eq!(std::thread::current().id(), caller);
+                    events.lock().unwrap().push(("ready", index));
+                    if callback_failure == Some(index) {
+                        Err(crate::error::backend("input not ready"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                None,
+            );
+            assert_eq!(
+                result.is_err(),
+                callback_failure.is_some() || execution_failure.is_some()
+            );
+            assert_eq!(*events.lock().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn staged_default_empty_and_single_stage_are_compatible() {
+        let backend = MockBackend {
+            last_download_len: std::sync::Mutex::new(0),
+        };
+        let backend: &dyn Backend = &backend;
+        backend
+            .execute_staged(&[], &mut |_| panic!("empty forward"), None)
+            .unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let plan = StageTestPlan {
+            index: 0,
+            fail: false,
+            events: std::sync::Arc::clone(&events),
+        };
+        let bindings = Bindings::new();
+        backend
+            .execute_staged(
+                &[ExecutionStage::new(&plan, &bindings)],
+                &mut |index| {
+                    events.lock().unwrap().push(("ready", index));
+                    Ok(())
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(*events.lock().unwrap(), vec![("ready", 0), ("execute", 0)]);
     }
 
     #[test]

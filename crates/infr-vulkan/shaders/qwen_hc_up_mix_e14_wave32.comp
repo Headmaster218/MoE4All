@@ -1,0 +1,78 @@
+#version 460
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#extension GL_EXT_control_flow_attributes : require
+// O06 candidate only: Q8_0 HC up + ordered four-stream mix. Pin subgroup size 32.
+// Four subgroups own four HC streams, each retaining the current Wave32 NR4
+// per-output dot/reduction tree. Share only the 16 completed F32 gate values.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC {
+    uint in_f; uint n_embd; uint weight_lo; uint weight_hi;
+} pc;
+layout(binding = 0) readonly buffer LB { float low[]; };
+layout(binding = 1) readonly buffer XB { float x[]; };
+layout(binding = 2) writeonly buffer DB { float dst[]; };
+shared float gate_part[16];
+
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+#define FMT_Q8_0
+#include "native_decode.glsl"
+
+float dqsub(uint gstart, float xv[32]) {
+    float v[32];
+    dqblk(gstart, v);
+    float a = 0.0;
+    for (uint w = 0u; w < 32u; w++) { a += v[w] * xv[w]; }
+    return a;
+}
+
+void main() {
+    uint o0 = gl_WorkGroupID.x * 4u;
+    if (o0 >= pc.n_embd) { return; }
+    uint stream = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint nsub = pc.in_f / 32u;
+    w_addr = arena_base(pc.weight_lo, pc.weight_hi);
+    float lo[4];
+    float hi[4];
+    [[unroll]] for (uint p = 0u; p < 4u; ++p) { lo[p] = 0.0; hi[p] = 0.0; }
+    for (uint s = lane; s < nsub; s += 64u) {
+        float xv[32];
+        for (uint w = 0u; w < 32u; ++w) { xv[w] = low[s * 32u + w]; }
+        [[unroll]] for (uint p = 0u; p < 4u; ++p) {
+            uint d = o0 + p;
+            if (d < pc.n_embd) {
+                lo[p] += dqsub((stream * pc.n_embd + d) * pc.in_f + s * 32u, xv);
+            }
+        }
+    }
+    for (uint s = lane + 32u; s < nsub; s += 64u) {
+        float xv[32];
+        for (uint w = 0u; w < 32u; ++w) { xv[w] = low[s * 32u + w]; }
+        [[unroll]] for (uint p = 0u; p < 4u; ++p) {
+            uint d = o0 + p;
+            if (d < pc.n_embd) {
+                hi[p] += dqsub((stream * pc.n_embd + d) * pc.in_f + s * 32u, xv);
+            }
+        }
+    }
+    [[unroll]] for (uint p = 0u; p < 4u; ++p) {
+        float acc = lo[p] + hi[p];
+        for (uint stride = 16u; stride > 0u; stride /= 2u) {
+            float rhs = subgroupShuffleDown(acc, stride);
+            if (lane < stride) { acc += rhs; }
+        }
+        if (lane == 0u) { gate_part[stream * 4u + p] = acc; }
+    }
+    barrier();
+    if (stream == 0u && lane < 4u && o0 + lane < pc.n_embd) {
+        uint d = o0 + lane;
+        float acc = 0.0;
+        for (uint h = 0u; h < 4u; ++h) {
+            float s = 1.0 / (1.0 + exp(-gate_part[h * 4u + lane]));
+            acc += x[h * pc.n_embd + d] * s;
+        }
+        dst[d] = acc / 4.0;
+    }
+}

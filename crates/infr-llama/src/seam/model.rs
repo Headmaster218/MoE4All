@@ -4,11 +4,15 @@ use crate::*;
 use anyhow::{anyhow, Result};
 use infr_chat::{render_chat_jinja, render_chat_user};
 use infr_core::backend::Backend;
-use infr_core::DType;
+use infr_core::{DType, WeightSource};
 use infr_cpu::CpuBackend;
 use infr_gguf::Gguf;
 use std::path::Path;
 use tokenizers::Tokenizer;
+
+#[cfg(test)]
+#[path = "prefix_reuse_tests.rs"]
+mod prefix_reuse_tests;
 
 /// The placement/dispatch choices a Vulkan bench run actually settled on — reported next to the
 /// throughput figure by [`SeamModel::bench_vulkan`]'s caller.
@@ -199,6 +203,24 @@ impl<B, X> DenseSession<B, X> {
     /// and every session-driven path read their knobs from instead of the process environment.
     pub fn cfg(&self) -> &std::sync::Arc<crate::EngineConfig> {
         &self.cfg
+    }
+
+    /// Read-only benchmark attribution for the backend actually bound by this session.
+    pub fn benchmark_capabilities(&self) -> infr_core::backend::Capabilities
+    where
+        B: Backend,
+    {
+        self.be.capabilities()
+    }
+
+    /// Report only uniform allocated formats; uninitialized or mixed pools remain unknown.
+    pub fn benchmark_kv_formats(&self) -> Option<(DType, DType)> {
+        if self.pool.slots.iter().any(Option::is_none) {
+            return None;
+        }
+        let mut formats = self.pool.slots.iter().flatten().map(|kv| kv.kv_formats());
+        let first = formats.next()?;
+        formats.all(|format| format == first).then_some(first)
     }
 }
 
@@ -418,7 +440,7 @@ impl SeamModel {
             Some(p) => Tokenizer::from_file(p).map_err(|e| anyhow!("load tokenizer: {e}"))?,
             None => build_tokenizer(&g)?,
         };
-        add_chat_eos(&mut cfg, &tokenizer);
+        cfg.eos_ids = resolve_chat_eos(g.metadata(), &tokenizer, cfg.eos);
         if cfg.qwen4exp {
             cfg.qwen4_think_start = tokenizer.token_to_id("<think>");
             cfg.qwen4_think_end = tokenizer.token_to_id("</think>");

@@ -541,6 +541,23 @@ json_quote() {
     done
     REPLY="$out\""
 }
+show_brand() {
+    local version=$1 green='' cyan='' reset=''
+    if [[ -t 1 && ${TERM-} != dumb && -z ${NO_COLOR+x} ]]; then
+        green=$'\033[32m'; cyan=$'\033[96m'; reset=$'\033[0m'
+    fi
+    printf '%s' "$green"
+    cat <<'BANNER'
+ __  __       _____ _  _     _   _ _
+|  \/  | ___ | ____| || |   / \ | | |
+| |\/| |/ _ \|  _| | || |_ / _ \| | |
+| |  | | (_) | |___|__   _/ ___ \ | |___
+|_|  |_|\___/|_____|  |_|/_/   \_\_|_____|.com
+BANNER
+    printf '  MoE4All v%s%s\n%s  https://moe4all.com%s\n' "$version" "$reset" "$cyan" "$reset"
+    printf '  Run models far larger than VRAM on gaming GPUs.\n  让游戏显卡跑起远超显存容量的大模型。\n'
+}
+
 defaults() {
     local key
     S=(
@@ -601,7 +618,112 @@ load_state() {
     fi
     case ${S[launch_mode]} in chat) S[launch_mode]=run ;; server) S[launch_mode]=serve ;; benchmark) S[launch_mode]=bench ;; esac
 }
+benchmark_guide_now() { date +%s; }
+benchmark_guide_read() {
+    GUIDE_SUBMITTED=false; GUIDE_NEXT_REMIND_AT=0
+    local path=$CONFIG_DIR/private/benchmark-first-submission.json raw
+    [[ -f $path ]] || return 0
+    json_load "$path" 2>/dev/null || return 0
+    json_get '["submitted"]' || return 0
+    [[ $REPLY != true ]] || GUIDE_SUBMITTED=true
+    json_get '["next_remind_at"]' || return 0
+    raw=$REPLY
+    [[ $raw =~ ^(0|[1-9][0-9]{0,11})$ ]] || return 0
+    GUIDE_NEXT_REMIND_AT=$raw
+}
+benchmark_guide_write() {
+    local submitted=$1 next=$2 directory=$CONFIG_DIR/private temporary
+    [[ ${DRY_RUN-false} == false && ${HEADLESS-false} == false && ${INTERACTIVE-false} == true ]] || return 0
+    benchmark_guide_read
+    [[ $GUIDE_SUBMITTED != true ]] || submitted=true
+    ((next >= GUIDE_NEXT_REMIND_AT)) || next=$GUIDE_NEXT_REMIND_AT
+    mkdir -p -- "$directory" || return 1
+    chmod 700 "$directory" 2>/dev/null || true
+    temporary=$(umask 077; mktemp "$directory/.benchmark-guide.XXXXXX") || return 1
+    if ! printf '{"schema_version":1,"submitted":%s,"next_remind_at":%s}\n' "$submitted" "$next" > "$temporary" ||
+        ! mv -f -- "$temporary" "$directory/benchmark-first-submission.json"; then
+        rm -f -- "$temporary"; return 1
+    fi
+}
+benchmark_submission_succeeded() {
+    [[ $1 == benchmark ]] || return 0
+    benchmark_guide_write true 0 || printf 'Could not save the benchmark reminder.\n' >&2
+}
+benchmark_body_receipt_valid() {
+    local receipt=$1 field
+    json_load "$receipt" 2>/dev/null || return 1
+    json_get '["api_version"]' || return 1; [[ $REPLY == 1 ]] || return 1
+    json_get '["kind"]' || return 1; [[ $REPLY == benchmark ]] || return 1
+    json_get '["receipt_id"]' || return 1; [[ $REPLY =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    json_get '["report_id"]' || return 1; [[ -n $REPLY && $REPLY != null ]] || return 1
+    for field in file_sha256 payload_sha256; do
+        json_get "[\"$field\"]" || return 1; [[ $REPLY =~ ^[0-9a-f]{64}$ ]] || return 1
+    done
+    json_get '["status"]' || return 1
+    case $REPLY in forwarding|pending_review|published|rejected|delivery_failed) ;; *) return 1 ;; esac
+    json_get '["received_at"]' || return 1
+    [[ $REPLY =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$ ]]
+}
+benchmark_startup_guide() {
+    BENCHMARK_GUIDE_ACTIVE=false
+    [[ ${INTERACTIVE-false} == true && ${DRY_RUN-false} == false && ${HEADLESS-false} == false &&
+        ${S[json_output]-false} != true && -z ${CI-} ]] || return 0
+    local receipt now answer
+    benchmark_guide_read
+    [[ $GUIDE_SUBMITTED == false ]] || return 0
+    # Globbing through find also works in zsh when there are no receipts.
+    if [[ -d $CONFIG_DIR/private/submission-receipts ]]; then
+        while IFS= read -r receipt; do
+            if benchmark_body_receipt_valid "$receipt"; then benchmark_submission_succeeded benchmark; return 0; fi
+        done < <(find "$CONFIG_DIR/private/submission-receipts/." ! -name . -prune -type f -name '*.private-receipt.json' -print 2>/dev/null)
+    fi
+    now=$(benchmark_guide_now)
+    ((now >= GUIDE_NEXT_REMIND_AT)) || return 0
+    # Save before input so cancellation, EOF and benchmark failure also get 48 hours.
+    benchmark_guide_write false "$((now + 172800))" || printf 'Could not save the benchmark reminder.\n' >&2
+    printf '\n邀请你跑一次快速 Benchmark，分享成绩到 MoE4All.com 排行榜！\nRun a quick benchmark and share your result on the MoE4All.com leaderboard!\n'
+    printf '上传前仍会征求同意。You will be asked before uploading.\n  [1] 试试！ / Try it!\n* [2] 后面再说~ / Maybe later~\n'
+    while true; do
+        prompt '选择 / Select' 2 || return 1
+        answer=$REPLY
+        case $answer in
+            1|try) BENCHMARK_GUIDE_ACTIVE=true; S[launch_mode]=bench; S[bench_kind]=quick; S[bench_parallel]=1; return 0 ;;
+            2|later) return 0 ;;
+        esac
+        printf '选择无效。Invalid selection.\n'
+    done
+}
+save_benchmark_upload_preferences() {
+    local source_state=$STATE flat path raw key temporary sep=''
+    local -A preferences=()
+    [[ ${DRY_RUN-false} == false ]] || return 0
+    if [[ ! -f $source_state && -n ${LEGACY_STATE-} && -f $LEGACY_STATE ]]; then source_state=$LEGACY_STATE; fi
+    if [[ -f $source_state ]]; then
+        # BRIEF=0 retains complete JSON values, including unknown nested settings.
+        flat=$(LC_ALL=C awk -v BRIEF=0 "$JSON_PARSER" "$source_state" 2>/dev/null) || {
+            printf 'Could not merge upload preferences; saved settings were preserved.\n' >&2; return 0;
+        }
+        local top_level='^\["[^"]+"\]$'
+        while IFS=$'\t' read -r path raw; do
+            if [[ $path =~ $top_level ]]; then
+                key=${path:1:${#path}-2}; preferences[$key]=$raw
+            fi
+        done <<< "$flat"
+    fi
+    for key in benchmark_upload benchmark_upload_has_github benchmark_upload_gh_auth error_upload submission_browser_action submission_failure_action submission_pending_retry; do
+        case ${DEFAULTS[$key]} in true|false) raw=${S[$key]} ;; *) json_quote "${S[$key]}"; raw=$REPLY ;; esac
+        json_quote "$key"; preferences[$REPLY]=$raw
+    done
+    mkdir -p -- "$CONFIG_DIR"; temporary=$(mktemp "$CONFIG_DIR/.wizard-upload-prefs.XXXXXX")
+    {
+        printf '{\n'
+        for key in "${!preferences[@]}"; do printf '%s  %s: %s' "$sep" "$key" "${preferences[$key]}"; sep=$',\n'; done
+        printf '\n}\n'
+    } > "$temporary"
+    chmod 600 "$temporary"; mv -f -- "$temporary" "$STATE"
+}
 save_state() {
+    if [[ ${BENCHMARK_GUIDE_ACTIVE-false} == true ]]; then save_benchmark_upload_preferences; return; fi
     local temporary key sep=''
     mkdir -p -- "$CONFIG_DIR"; temporary=$(mktemp "$CONFIG_DIR/.wizard-state.XXXXXX")
     {
@@ -1357,6 +1479,7 @@ website_submission_upload() {
     if [[ $state != ready && $state != uploaded ]]; then rm -f -- "$request" "$response"; fail 'Upload confirmation timed out; the local report was preserved.'; return 1; fi
     if ! submission_api_request POST "$SUBMISSION_API_BASE/upload-sessions/$session_id/report" "$response" "$session_token" "$path" 'text/plain; charset=utf-8'; then rm -f -- "$request" "$response"; return 1; fi
     json_load "$response" || { rm -f -- "$request" "$response"; return 1; }
+    json_get '["api_version"]'; [[ $REPLY == 1 ]] || { rm -f -- "$request" "$response"; return 1; }
     json_get '["receipt_id"]'; receipt_id=$REPLY; [[ $receipt_id =~ ^[A-Za-z0-9_-]+$ ]] || { rm -f -- "$request" "$response"; return 1; }
     json_get '["receipt_token"]'; receipt_token=$REPLY; [[ -n $receipt_token ]] || { rm -f -- "$request" "$response"; return 1; }
     json_get '["kind"]'; [[ $REPLY == "$kind" ]] || { rm -f -- "$request" "$response"; return 1; }
@@ -1373,6 +1496,9 @@ website_submission_upload() {
     local public_path='["public_url"]'
     if [[ -v 'J[$public_path]' && ${J[$public_path]} == \"*\" ]]; then json_get "$public_path"; public_url=$REPLY; fi
     save_submission_receipt "$receipt_id" "$receipt_token" "$kind" "$report_id" "$original_hash" "$payload_hash" "$status" "$received_at" "$public_url" "$file_hash"
+    local receipt_path=$REPLY
+    if benchmark_body_receipt_valid "$receipt_path"; then benchmark_submission_succeeded "$kind"; fi
+    REPLY=$receipt_path
     printf '已收到，状态 / Received, status: %s\n回执 ID / Receipt ID: %s\n私有回执 / Private receipt: %s\n' "$status" "$receipt_id" "$REPLY"
     [[ -z $public_url ]] || printf 'Public URL: %s\n' "$public_url"
     [[ -n $public_url ]] || printf '需要查看进度时，在网站“我的回执”导入保存的私密回执文件。\nTo check progress, import the saved private receipt under My receipts on the website.\n'
@@ -1432,6 +1558,7 @@ gh_submission_upload() {
     pr_url=$(submission_gh pr create --repo "$upstream" --base main --head "$login:$branch" --title "$kind: add $report_id" --body 'User-consented public MoE4All report. Awaiting maintainer review; no automatic merge. Format validation is not an independent reproduction.' 2>/dev/null) ||
         pr_url=$(submission_gh pr list --repo "$upstream" --head "$branch" --author "$login" --base main --state all --json url --jq '.[0].url // empty' 2>/dev/null) || return 1
     [[ $pr_url =~ ^https://github.com/Headmaster218/MoE4All/pull/[0-9]+$ ]] || return 1
+    benchmark_submission_succeeded "$kind"
     printf 'PR 已创建或已存在 / PR created or already exists: %s\n' "$pr_url"
 }
 
@@ -1493,7 +1620,7 @@ open_github_submission() {
 
 submission_next_action() {
     if [[ ${1-} == browser ]]; then
-        case ${S[submission_browser_action]-later} in sent|reopen|cloudflare|later) ;; *) S[submission_browser_action]=later ;; esac
+        case ${S[submission_browser_action]-later} in reopen|cloudflare|later) ;; *) S[submission_browser_action]=later ;; esac
         choice submission_browser_action 'GitHub 网页提交 / GitHub web submission' \
             'sent|已成功提交 / Successfully submitted' \
             'reopen|重新打开 GitHub / Reopen GitHub' \
@@ -1547,7 +1674,7 @@ offer_submission_upload() {
             submission_next_action browser || return 1
             action=$REPLY
             case $action in
-                sent) rm -f -- "$pending_path"; return 0 ;;
+                sent) benchmark_submission_succeeded "$kind"; rm -f -- "$pending_path"; return 0 ;;
                 reopen) continue ;;
                 cloudflare) channel=cloudflare ;;
                 *) break ;;
@@ -1602,7 +1729,7 @@ EOF
         printf '当前上传协议尚不支持混合速度，本次不上传；它不会被误记为纯 Decode。Mixed-speed upload is not supported yet; this result is not submitted as Decode.\n'
         REPLY=''; return 0
     fi
-    if ! output=$("$BINARY" submission pack-benchmark --input "$payload" --result-dir "$ROOT/benchmark-database" 2>&1); then
+    if ! output=$("$BINARY" submission pack-benchmark --input "$payload" --raw-benchmark "$raw_json" --result-dir "$ROOT/benchmark-database" 2>&1); then
         mkdir -p -- "$CONFIG_DIR/benchmark-results"
         local local_path="$CONFIG_DIR/benchmark-results/$id.json"
         printf '{"result":%s,"raw":%s}\n' "$(< "$payload")" "$(< "$raw_json")" > "$local_path"
@@ -1663,7 +1790,9 @@ complete_error_report() {
 configure() {
     local key value effort count previous
     REPORT_RETURN_MODE=${S[launch_mode]}
-    choice launch_mode '你想做什么？/ What would you like to do?' 'run|实时终端对话（推荐）/ Terminal chat (recommended)' 'serve|启动 OpenAI 兼容 API / Start OpenAI-compatible API server' 'bench|性能测试 / Benchmark' 'report|报告当前运行问题 / Report a current runtime problem'
+    if [[ ${BENCHMARK_GUIDE_ACTIVE-false} != true ]]; then
+        choice launch_mode '你想做什么？/ What would you like to do?' 'run|实时终端对话（推荐）/ Terminal chat (recommended)' 'serve|启动 OpenAI 兼容 API / Start OpenAI-compatible API server' 'bench|性能测试 / Benchmark' 'report|报告当前运行问题 / Report a current runtime problem'
+    fi
     [[ ${S[launch_mode]} != report ]] || return 0
     model_path llm model
     if [[ ${S[launch_mode]} == serve ]]; then
@@ -1739,6 +1868,7 @@ configure() {
         ask_yes server_auth '启用 Bearer API key 鉴权？/ Enable Bearer API-key authentication?'
     fi
     if [[ ${S[launch_mode]} == bench ]]; then
+        if [[ ${BENCHMARK_GUIDE_ACTIVE-false} == true ]]; then S[bench_kind]=quick; S[bench_parallel]=1; return 0; fi
         if [[ ! ${S[bench_kind]} =~ ^(quick|standard|full|manual)$ ]]; then S[manual_bench_kind]=${S[bench_kind]}; S[bench_kind]=manual; fi
         choice bench_kind '测试方案 / Benchmark plan' \
             $'quick|自动快速 / Automatic quick|6K Prefill + 1024 Decode。单发，一次，可追加并发。\n6K Prefill + 1024 Decode. x1, one run; optional concurrency.' \
@@ -1895,6 +2025,7 @@ managed() {
     [[ -n $1 && $1 != /* && $1 != *\\* && ! $1 =~ (^|/)(\.|\.\.|)(/|$) && ! $1 =~ [[:cntrl:]] ]] || return 1
     case $1 in
         infr|Start-INFR-Wizard-Linux.sh|README.md|README_EN.md|CHANGELOG.md|infr.example.toml|LICENSE|LICENSE-MIT|NOTICE|install-manifest.json) return 0 ;;
+        scripts/benchmark-hardware.sh) return 0 ;;
         image-codecs/libheif.so.1|image-codecs/libde265.so.0|image-codecs/libdav1d.so.7|image-codecs/libheif-LICENSE.txt|image-codecs/libde265-LICENSE.txt|image-codecs/dav1d-LICENSE.txt|image-codecs/SOURCES.txt) return 0 ;;
         documentation/*) [[ ${1,,} =~ \.(md|png|jpg|svg|webp)$ ]] ;;
         *) return 1 ;;
@@ -2112,7 +2243,7 @@ main() {
     local key flag value inherited=${INFR_API_KEY-} api_key='' reused=false before_benchmark='' result_path='' raw_benchmark=''
     local -a argv=("$@")
     ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-    DRY_RUN=false; HEADLESS=false; SKIP_UPDATE=false; UPDATE_MODE=''; INTERACTIVE=false; NO_API_KEY=false
+    DRY_RUN=false; HEADLESS=false; SKIP_UPDATE=false; UPDATE_MODE=''; INTERACTIVE=false; NO_API_KEY=false; BENCHMARK_GUIDE_ACTIVE=false
     declare -A disables=()
     for ((key=0;key<${#argv[@]};key++)); do
         case ${argv[key]} in --help|-h) usage; return ;; esac
@@ -2171,8 +2302,10 @@ main() {
     if [[ $INTERACTIVE == true && $HEADLESS == false ]]; then
         retry_pending_submissions
         value=$("$BINARY" --version 2>/dev/null || true); value=${value##* }
-        printf 'MoE4All v%s Linux 启动向导 / Launch Wizard\n上次设置会作为默认值；直接回车即可复用，输入 - 可清空。\nPress Enter to reuse the previous/default value; enter - to clear it.\n' "$value"
-        if [[ -n ${S[model]} && ${#OVERRIDES[@]} == 0 && ${#disables[@]} == 0 ]]; then
+        show_brand "$value"
+        printf 'Linux 启动向导 / Launch Wizard\n上次设置会作为默认值；直接回车即可复用，输入 - 可清空。\nPress Enter to reuse the previous/default value; enter - to clear it.\n'
+        if [[ -t 1 && ${#OVERRIDES[@]} == 0 && ${#disables[@]} == 0 ]]; then benchmark_startup_guide; fi
+        if [[ $BENCHMARK_GUIDE_ACTIVE == false && -n ${S[model]} && ${#OVERRIDES[@]} == 0 && ${#disables[@]} == 0 ]]; then
             absolute "${S[model]}"; if [[ -f $REPLY ]]; then yes '是否按上次设置直接启动？/ Start with the previous settings?' true; reused=$REPLY; fi
         fi
         [[ $reused == true ]] || configure

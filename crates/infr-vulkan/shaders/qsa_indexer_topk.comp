@@ -22,9 +22,11 @@ layout(binding = 1) writeonly buffer DB { uint dst[]; };
 shared uint bucket[256];
 shared uint selected_digit;
 shared uint remaining_rank;
+#ifndef ORDERED_COLLECT
 shared uint selected_count;
 shared uint tie_prefix[256];
 shared uint chosen[512];
+#endif
 #ifdef PARALLEL_SCAN
 #include "qsa_prefix_scan.glsl"
 #endif
@@ -33,6 +35,10 @@ uint ordered_float(float x) {
     uint bits = floatBitsToUint(x);
     return (bits & 0x80000000u) != 0u ? ~bits : bits | 0x80000000u;
 }
+
+#ifdef ORDERED_COLLECT
+#include "qsa_topk_ordered_collect.glsl"
+#endif
 
 void main() {
     uint t = gl_LocalInvocationID.x;
@@ -104,6 +110,9 @@ void main() {
         barrier();
     }
 
+#ifdef ORDERED_COLLECT
+    collect_ordered(t, blocks, score_base, dst_base, prefix_score, rank);
+#else
     // `rank` is now the number of entries equal to the threshold score that must be retained.
     // Give each lane a contiguous index range, count its ties, and have lane 0 prefix those 256
     // tiny counts. A later lane can then decide locally whether each equal-score index is among
@@ -171,4 +180,5 @@ void main() {
     }
     if (i0 < pc.top_k) { dst[dst_base + i0] = chosen[i0]; }
     if (i1 < pc.top_k) { dst[dst_base + i1] = chosen[i1]; }
+#endif
 }
