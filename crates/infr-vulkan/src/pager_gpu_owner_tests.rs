@@ -502,9 +502,11 @@ fn owned_session_cpu_upload_publish_and_handoff_match_payload_and_lru() {
     let be = backend();
     be.with_unified_exclusive(|| {
         let mut fixture = Fixture::new(&be);
-        let protected_down = (2 * EXPERTS + 1) as u32;
+        let routes = [[2u32, 1, 1], [0, 1, 1]];
+        let expected = lru_parity_tests::legacy_alias_snapshot(&fixture.initial, &routes);
         let mut generation = None;
-        for expert in [2u32, 0] {
+        for routed in routes {
+            let expert = routed[0];
             fixture.copy.begin(&be, &mut fixture.session).unwrap();
             let current = fixture
                 .copy
@@ -518,7 +520,6 @@ fn owned_session_cpu_upload_publish_and_handoff_match_payload_and_lru() {
                 current,
                 "no reseed between forwards"
             );
-            let routed = [expert, 1, 1];
             let words = fixture.prepare(&be, routed);
             let jobs = fixture.cpu_jobs(&words, expert);
             assert_eq!(jobs[0].slot, fixture.initial_slot(0));
@@ -592,18 +593,6 @@ fn owned_session_cpu_upload_publish_and_handoff_match_payload_and_lru() {
             fixture.copy.finish_owned_forward();
         }
         fixture.session.handoff_gpu_decode(&be).unwrap();
-        let mut stats = fixture.initial.stats();
-        stats.hits += 14;
-        stats.misses += 4;
-        stats.evictions += 4;
-        let expected = PagerSnapshot::from_parts(
-            fixture.initial.disabled().to_vec(),
-            vec![],
-            [0, 1, (2 * EXPERTS) as u32, protected_down]
-                .map(|block| (block, fixture.initial_slot(block)))
-                .to_vec(),
-            stats,
-        );
         assert_eq!(fixture.snapshot(), expected);
         for &(block, slot) in expected.resident_lru() {
             assert_eq!(

@@ -68,6 +68,34 @@ fn legacy_pager_calls(
     result
 }
 
+pub(super) fn legacy_alias_snapshot(initial: &PagerSnapshot, routes: &[[u32; 3]]) -> PagerSnapshot {
+    let mut pagers = [restored(initial)];
+    for ids in routes {
+        legacy_pager_calls(&mut pagers, [0, 0, 0], [0, 0, 2 * EXPERTS as u32], ids);
+    }
+    pagers[0].snapshot_for_handoff().unwrap()
+}
+
+#[test]
+fn legacy_alias_snapshot_uses_hits_first_and_keeps_duplicate_touches() {
+    let mut pager = Pager::new(4);
+    for block in [9, 1, 0, 8] {
+        pager.touch(block);
+    }
+    let initial = pager.snapshot_for_handoff().unwrap();
+    let result = legacy_alias_snapshot(&initial, &[[2, 1, 1], [0, 1, 1]]);
+    assert_eq!(order(&result), [1, 9, 0, 8]);
+    assert_eq!(result.stats().hits - initial.stats().hits, 14);
+    assert_eq!(result.stats().misses - initial.stats().misses, 4);
+    assert_eq!(result.stats().evictions - initial.stats().evictions, 4);
+    assert_eq!(pager.snapshot_for_handoff().unwrap(), initial);
+    let mut canonical = [restored(&initial)];
+    for ids in [[2, 1, 1], [0, 1, 1]] {
+        request_order_pager_calls(&mut canonical, [0, 0, 0], [0, 0, 8], &ids);
+    }
+    assert_ne!(canonical[0].snapshot_for_handoff().unwrap(), result);
+}
+
 // A real-Pager request-order counterpart, NOT a GPU execution or a manual LRU implementation.
 // The fixture starts with enough older, unrequested victims for this admission.
 fn request_order_pager_calls(
@@ -757,17 +785,23 @@ fn gpu_acceptance_cohort(
 }
 
 #[test]
-#[ignore = "parent serial GPU only; actual legacy/builtin/external ordered LRU and payload parity"]
+#[ignore = "parent serial GPU only; actual CPU/builtin LRU and payload parity; external SPV optional"]
 fn owned_session_external_legacy_touch_order_acceptance() {
-    let path = std::env::var_os("MOE4ALL_OWNER_LEGACY_TOUCH_ORDER_SPV")
-        .expect("set to TMP legacy-touch-order-v73/legacy-touch-order-serial.spv");
-    let external =
-        ash::util::read_spv(&mut std::io::Cursor::new(std::fs::read(&path).unwrap())).unwrap();
-    assert_eq!(external.first(), Some(&0x0723_0203));
+    let path = std::env::var_os("MOE4ALL_OWNER_LEGACY_TOUCH_ORDER_SPV");
+    let external = path.as_ref().map(|path| {
+        let bytes = std::fs::read(path).expect("read the explicitly requested external owner SPV");
+        let words = ash::util::read_spv(&mut std::io::Cursor::new(bytes))
+            .expect("parse the explicitly requested external owner SPV");
+        assert_eq!(words.first(), Some(&0x0723_0203));
+        words
+    });
     let be = backend();
     be.with_unified_exclusive(|| {
         let builtin = be.kernel_sg("owner_lru_acceptance_builtin", crate::gemm::gpu_owned_prepare_fused_spv(false), 8, 124, 32);
-        let candidate = be.kernel_sg("owner_lru_acceptance_external_v73", &external, 8, 124, 32);
+        let mut kernels = vec![("builtin", builtin)];
+        if let Some(external) = external.as_deref() {
+            kernels.push(("external", be.kernel_sg("owner_lru_acceptance_external", external, 8, 124, 32)));
+        }
         // All cases share one physical pool and Gate/Up aliases. Partial cases leave
         // enough colder NONROUTED victims: this is not a universal protection-parity claim.
         for (case, partial, routes) in [
@@ -781,36 +815,27 @@ fn owned_session_external_legacy_touch_order_acceptance() {
                 let results: Vec<_> = routes.iter().map(|ids| legacy_acceptance_cohort(&mut f, &be, ids)).collect();
                 (initial, results)
             };
-            let mut results = Vec::new();
-            for kernel in [builtin, candidate] {
+            for &(name, kernel) in &kernels {
                 let mut f = acceptance_fixture(&be, partial);
                 assert_eq!(f.snapshot().resident_lru(), initial.as_slice(), "{case}: same initial physical placement");
                 let ids = be.alloc_mapped_arena_bda(10 * 4).unwrap().0;
-                results.push(routes.iter().map(|routed| gpu_acceptance_cohort(&mut f, &be, ids.as_ref(), routed, kernel)).collect::<Vec<_>>());
+                let results = routes.iter().map(|routed| gpu_acceptance_cohort(&mut f, &be, ids.as_ref(), routed, kernel)).collect::<Vec<_>>();
+                assert_eq!(results.len(), legacy.len());
+                for (index, (cpu, gpu)) in legacy.iter().zip(&results).enumerate() {
+                    // Global GPU stamps advance by 3*count; legacy clocks are per pool.
+                    // Compare the actual logical order AND physical slots, never raw stamps.
+                    assert_eq!(gpu.resident, cpu.resident, "{case} {name} cohort {index}: ordered (block,slot)");
+                    assert_eq!(gpu.jobs, cpu.jobs, "{case} {name} cohort {index}: actual ordered copy/victim decisions");
+                    assert_eq!(gpu.bytes, cpu.bytes, "{case} {name} cohort {index}: actual upload bytes");
+                    assert_eq!(gpu.status, Some(if cpu.bytes == 0 { 1 } else { 5 }));
+                }
+                if case == "historical_pressure" {
+                    assert_eq!(results[0].resident.iter().map(|&(id, _)| id).collect::<Vec<_>>(), [1, 9, 2, 10]);
+                    assert_eq!(results[2].bytes, 0);
+                    assert_eq!(results[2].status, Some(1));
+                }
+                eprintln!("LRU_ACCEPTANCE case={case} kernel={name} external={path:?} cpu={legacy:?} gpu={results:?} actual_payload=true sorted=false drained_handoff_each_cohort=true");
             }
-            let old = &results[0];
-            let new = &results[1];
-            for (index, (cpu, gpu)) in legacy.iter().zip(new).enumerate() {
-                // Global GPU stamps advance by 3*count; legacy clocks are per pool.
-                // Compare the actual logical order AND physical slots, never raw stamps.
-                assert_eq!(gpu.resident, cpu.resident, "{case} cohort {index}: ordered (block,slot)");
-                assert_eq!(gpu.jobs, cpu.jobs, "{case} cohort {index}: actual ordered copy/victim decisions");
-                assert_eq!(gpu.bytes, cpu.bytes, "{case} cohort {index}: actual upload bytes");
-                assert_eq!(gpu.status, Some(if cpu.bytes == 0 { 1 } else { 5 }));
-            }
-            for (index, (cpu, gpu)) in legacy.iter().zip(old).enumerate() {
-                assert_eq!(gpu.resident, cpu.resident, "{case} builtin cohort {index}: ordered (block,slot)");
-                assert_eq!(gpu.jobs, cpu.jobs, "{case} builtin cohort {index}: ordered copy/victim decisions");
-                assert_eq!(gpu.bytes, cpu.bytes, "{case} builtin cohort {index}: upload bytes");
-                assert_eq!(gpu.status, Some(if cpu.bytes == 0 { 1 } else { 5 }));
-            }
-            if case == "historical_pressure" {
-                assert_eq!(old[0].jobs, new[0].jobs, "touch-only change must retain first placement");
-                assert_eq!(old[0].resident.iter().map(|&(id, _)| id).collect::<Vec<_>>(), [1, 9, 2, 10]);
-                assert_eq!((old[2].bytes, new[2].bytes), (0, 0));
-                assert_eq!((old[2].status, new[2].status), (Some(1), Some(1)));
-            }
-            eprintln!("LRU_EXTERNAL_ACCEPTANCE case={case} external={path:?} cpu={legacy:?} builtin={old:?} candidate={new:?} actual_payload=true sorted=false drained_handoff_each_cohort=true touch_order_only=true");
         }
     });
 }
