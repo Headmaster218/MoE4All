@@ -11096,6 +11096,7 @@ fn generate_dense_backend_inner(
 
                     let profile_tail_t0 = profile_cohort.then(std::time::Instant::now);
                     let _timeline_tail = infr_core::timeline::span("step_tail");
+                    let timeline_readback = infr_core::timeline::span("decode_result_readback");
                     if let (Some(buffer), Some(hidden)) =
                         (hidden_out.as_deref(), parallel.hidden.as_deref_mut())
                     {
@@ -11179,6 +11180,8 @@ fn generate_dense_backend_inner(
                             next[row] = parallel.samplers[lane].sample(logits);
                         }
                     }
+                    drop(timeline_readback);
+                    let timeline_state = infr_core::timeline::span("decode_result_state_update");
                     for (written, &position) in last_written.iter_mut().zip(&positions) {
                         *written = Some(position);
                     }
@@ -11219,6 +11222,8 @@ fn generate_dense_backend_inner(
                     for lane in sample_from..lanes {
                         decode_secs[lane] += step_secs;
                     }
+                    drop(timeline_state);
+                    let timeline_output = infr_core::timeline::span("decode_output_ack");
                     let should_stop = deliver_parallel_token_step(
                         c,
                         ec.sampling.ignore_eos,
@@ -11231,7 +11236,9 @@ fn generate_dense_backend_inner(
                         req,
                         parallel.yield_requested,
                     );
+                    drop(timeline_output);
                     if c.qwen4exp && !should_stop && step + 1 < max_new {
+                        let _timeline_ple_submit = infr_core::timeline::span("decode_next_ple_submit");
                         // All lane ACKs are resolved; only host gathering runs ahead of the next step.
                         next_ple_ticket = Some(ple_ticket_carry::Ticket::new(
                             step + 1,
@@ -13440,6 +13447,7 @@ fn generate_dense_backend_inner(
                         out.len(),
                         max_new,
                     ) {
+                        let _timeline_ple_submit = infr_core::timeline::span("decode_next_ple_submit");
                         next_ple_ticket = Some(ple_ticket_carry::Ticket::new(
                             next_pos,
                             submit_ple_token(

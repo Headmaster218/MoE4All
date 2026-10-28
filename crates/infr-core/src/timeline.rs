@@ -338,7 +338,9 @@ impl Drop for StepGuard {
     fn drop(&mut self) {
         self.step.end_ns = clock_ns();
         CONTEXT.with(|current| current.set(self.previous));
+        let flush_start = host_enabled().then(clock_ns);
         let mut state = STATE.get().unwrap().lock().unwrap();
+        let flush_locked = flush_start.map(|_| clock_ns());
         EVENTS.with(|events| {
             let mut events = events.borrow_mut();
             let room = MAX_EVENTS.saturating_sub(state.events.len());
@@ -355,6 +357,35 @@ impl Drop for StepGuard {
             start_ns: self.step.start_ns,
             end_ns: self.step.end_ns,
         });
+        if let (Some(start), Some(locked)) = (flush_start, flush_locked) {
+            // Flushing happens outside the recorded step. Account for the profiler itself
+            // before interpreting the interval between steps as inference overhead.
+            let end = clock_ns();
+            let context = Context {
+                step: self.step.id,
+                lanes: self.step.lanes,
+                layer: -1,
+            };
+            for (name, start_ns, end_ns) in [
+                ("trace_step_flush_lock", start, locked),
+                ("trace_step_flush_copy", locked, end),
+            ] {
+                if !host_label_selected(name) {
+                    continue;
+                }
+                if state.events.len() < MAX_EVENTS {
+                    state.events.push(HostEvent {
+                        name,
+                        context,
+                        start_ns,
+                        end_ns,
+                        submit: 0,
+                    });
+                } else {
+                    state.dropped += 1;
+                }
+            }
+        }
     }
 }
 
@@ -580,6 +611,59 @@ fn map_tick(tick: u64, bits: u32, sample: ClockSample) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn step_flush_events_are_outside_inference_and_respect_capture_mode() {
+        const CHILD: &str = "MOE4ALL_TIMELINE_FLUSH_TEST_CHILD";
+        let Ok(mode) = std::env::var(CHILD) else {
+            // Each capture owns process-global OnceLocks. Keep this test isolated from
+            // other profiler tests without resetting production globals or writing files.
+            for mode in ["host", "gpu_only", "filtered"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "timeline::tests::step_flush_events_are_outside_inference_and_respect_capture_mode",
+                        "--test-threads=1",
+                    ])
+                    .env(CHILD, mode)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{mode}: {} {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr));
+            }
+            return;
+        };
+        let cfg = crate::config::ProfCfg {
+            timeline_path: Some("unused-no-flush.json".into()),
+            timeline_steps: 1,
+            timeline_skip_steps: 0,
+            timeline_stride: 1,
+            timeline_windows: 1,
+            timeline_lanes: 2,
+            timeline_gpu_only: mode == "gpu_only",
+            timeline_host_select: (mode == "filtered").then(|| "no_matching_event".into()),
+            ..Default::default()
+        };
+        configure(&cfg).unwrap();
+        drop(begin_step(&[32, 64]).expect("selected step"));
+        assert!(CONTEXT.with(Cell::get).is_none());
+        let state = STATE.get().unwrap().lock().unwrap();
+        assert_eq!(state.steps.len(), 1);
+        if mode != "host" {
+            assert!(state.events.is_empty());
+            return;
+        }
+        assert_eq!(state.events.len(), 2);
+        assert_eq!(state.events[0].name, "trace_step_flush_lock");
+        assert_eq!(state.events[1].name, "trace_step_flush_copy");
+        for event in &state.events {
+            assert_eq!(event.context.step, state.steps[0].id);
+            assert_eq!(event.context.lanes, 2);
+            assert_eq!(event.context.layer, -1);
+            assert!(event.start_ns >= state.steps[0].end_ns);
+            assert!(event.end_ns >= event.start_ns);
+        }
+    }
     #[test]
     fn selective_capture_filters_are_explicit_and_do_not_accept_empty_terms() {
         assert!(label_patterns(None).unwrap().is_none());

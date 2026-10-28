@@ -1016,6 +1016,7 @@ struct BatchTokenDelivery<'a> {
 
 impl TokenDelivery for BatchTokenDelivery<'_> {
     fn send_token(&mut self, lane: usize, id: u32) -> bool {
+        let timeline_output = infr_core::timeline::span("decode_output_progress");
         self.streamed[lane] += 1;
         let (prompt_tokens, cached_prompt_tokens, generated) = self.progress_bases[lane];
         let progress = self.engine.batch_decode_progress(
@@ -1023,6 +1024,8 @@ impl TokenDelivery for BatchTokenDelivery<'_> {
             cached_prompt_tokens,
             generated.saturating_add(self.streamed[lane]),
         );
+        drop(timeline_output);
+        let _timeline_send = infr_core::timeline::span("decode_output_send");
         self.channels
             .get(lane)
             .and_then(Option::as_ref)
@@ -1035,6 +1038,7 @@ impl TokenDelivery for BatchTokenDelivery<'_> {
     }
 
     fn receive_ack(&mut self, lane: usize) -> bool {
+        let _timeline_ack = infr_core::timeline::span("decode_output_ack_wait");
         self.channels
             .get(lane)
             .and_then(Option::as_ref)
@@ -3669,6 +3673,7 @@ impl ParallelSeam {
             // Keep Lookup's post-ACK indexing/yield and the MTP/Prefill callback order intact.
             let mut stream = |lane: usize, id: u32| {
                 let delivery_t0 = lookup_t0.map(|_| Instant::now());
+                let timeline_output = infr_core::timeline::span("decode_output_progress");
                 streamed[lane] += 1;
                 let (prompt_tokens, cached_prompt_tokens, generated) = progress_bases[lane];
                 let progress = self.batch_decode_progress(
@@ -3676,16 +3681,20 @@ impl ParallelSeam {
                     cached_prompt_tokens,
                     generated.saturating_add(streamed[lane]),
                 );
+                drop(timeline_output);
                 let keep_going =
                     channels
                         .get_mut(lane)
                         .and_then(Option::as_mut)
                         .is_some_and(|channels| {
-                            channels
+                            let timeline_send = infr_core::timeline::span("decode_output_send");
+                            let sent = channels
                                 .events
                                 .send(BatchEvent::Token { id, progress })
-                                .is_ok()
-                                && channels.acknowledgements.recv().unwrap_or(false)
+                                .is_ok();
+                            drop(timeline_send);
+                            let _timeline_ack = infr_core::timeline::span("decode_output_ack_wait");
+                            sent && channels.acknowledgements.recv().unwrap_or(false)
                         });
                 accepted[lane] = keep_going;
                 if let Some(lookup) = lookups.get_mut(lane).and_then(Option::as_mut) {

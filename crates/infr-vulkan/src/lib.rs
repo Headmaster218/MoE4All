@@ -1340,13 +1340,15 @@ impl VulkanShared {
         let mut values = [0u64; 2];
         let mut count = 0;
         if transfer_wait != 0 {
-            waits[count] = self
+            let transfer_queue = self
                 .dedicated_transfer
                 .as_ref()
-                .expect("a transfer timeline wait requires the dedicated queue")
-                .lock()
-                .unwrap()
-                .timeline();
+                .expect("a transfer timeline wait requires the dedicated queue");
+            let transfer_lock_span = infr_core::timeline::span("mainqueue_transfer_lock_wait");
+            let transfer = transfer_queue.lock().unwrap();
+            drop(transfer_lock_span);
+            waits[count] = transfer.timeline();
+            drop(transfer);
             values[count] = transfer_wait;
             count += 1;
         }
@@ -1442,7 +1444,9 @@ impl VulkanShared {
         let started = profile_dispatches
             .filter(|_| infr_core::pager_profile::active())
             .map(|_| std::time::Instant::now());
+        let submit_span = infr_core::timeline::span("mainqueue_vk_submit");
         let result = unsafe { self.device.queue_submit(self.queue, submits, fence) };
+        drop(submit_span);
         if let (Some(dispatches), Some(t0)) = (profile_dispatches, started) {
             infr_core::pager_profile::record_queue_submit(dispatches, t0.elapsed());
         }
@@ -1485,7 +1489,9 @@ impl VulkanShared {
         if adapter::preparing_commands() {
             return Err(vk::Result::ERROR_VALIDATION_FAILED_EXT);
         }
+        let queue_lock_span = infr_core::timeline::span("mainqueue_host_lock_wait");
         let _queue = self.queue_access.lock().unwrap();
+        drop(queue_lock_span);
         if let Some(error) = self.queue_submit_failure() {
             return Err(error);
         }
