@@ -20,11 +20,13 @@ struct JobSpan {
     tokens: Vec<u32>,
     start: usize,
     rows: usize,
+    absolute_start: usize,
 }
 
 struct Job {
     spans: Vec<JobSpan>,
     reply: SyncSender<Result<PleRows>>,
+    queued_ns: Option<u64>,
 }
 
 /// One persistent model-level worker. The bounded channel prevents an unbounded random-I/O queue;
@@ -243,7 +245,9 @@ impl PleWorker {
             .spawn(move || {
                 let mut state = state;
                 while let Ok(job) = rx.recv() {
-                    let _ = job.reply.send(state.gather_spans(&job.spans));
+                    let _ = job
+                        .reply
+                        .send(state.gather_spans(&job.spans, job.queued_ns));
                 }
             })
             .context("spawn qwen4exp PLE worker")?;
@@ -288,19 +292,27 @@ impl PleWorker {
 
     fn submit_spans(&self, spans: Vec<JobSpan>) -> Result<PleTicket> {
         let (reply, rx) = mpsc::sync_channel(1);
+        let queued_ns = tracing::enabled!(target: "infr_ple_probe", tracing::Level::DEBUG)
+            .then(infr_core::timeline::clock_ns);
         self.tx
-            .send(Job { spans, reply })
+            .send(Job {
+                spans,
+                reply,
+                queued_ns,
+            })
             .map_err(|_| anyhow!("qwen4exp PLE worker is not running"))?;
         Ok(PleTicket(rx))
     }
 }
 
 fn ple_job_span(tokens: &[u32], start: usize, rows: usize, ngram: usize) -> Result<JobSpan> {
+    let absolute_start = start;
     let (tokens, start) = ple_job_tokens(tokens, start, rows, ngram)?;
     Ok(JobSpan {
         tokens,
         start,
         rows,
+        absolute_start,
     })
 }
 
@@ -327,9 +339,10 @@ fn ple_job_tokens(
 }
 
 impl WorkerState {
-    fn gather_spans(&mut self, spans: &[JobSpan]) -> Result<PleRows> {
+    fn gather_spans(&mut self, spans: &[JobSpan], queued_ns: Option<u64>) -> Result<PleRows> {
+        let probe_start_ns = queued_ns.map(|_| infr_core::timeline::clock_ns());
         let profile = pager_profile::active();
-        let plan_t0 = profile.then(std::time::Instant::now);
+        let plan_t0 = (profile || queued_ns.is_some()).then(std::time::Instant::now);
         let heads = (self.ngram - 1) * self.heads_per_ngram;
         let rows = spans.iter().try_fold(0usize, |total, span| {
             total
@@ -416,7 +429,11 @@ impl WorkerState {
                     && !independent_batch
                     && !multirow_span
                     && self.groups.len() >= self.gather_threads * 2));
-        let work_t0 = profile.then(std::time::Instant::now);
+        let residency = (queued_ns.is_some() && rows <= infr_core::backend::MAX_DECODE_ROWS)
+            .then(|| probe_source_residency(&self.table, self.row_bytes, &self.groups))
+            .flatten();
+        let probe_work_ns = queued_ns.map(|_| infr_core::timeline::clock_ns());
+        let work_t0 = (profile || queued_ns.is_some()).then(std::time::Instant::now);
         let table: &[u8] = &self.table;
         let requests = &self.requests;
         let groups = &self.groups;
@@ -450,6 +467,31 @@ impl WorkerState {
             }
         }
         let work_elapsed = pager_profile::elapsed(work_t0).unwrap_or_default();
+        if let (Some(queued_ns), Some(start_ns), Some(work_ns)) =
+            (queued_ns, probe_start_ns, probe_work_ns)
+        {
+            let end_ns = infr_core::timeline::clock_ns();
+            tracing::debug!(
+                target: "infr_ple_probe",
+                queued_ns,
+                start_ns,
+                work_ns,
+                end_ns,
+                positions = ?spans.iter().map(|span| span.absolute_start).collect::<Vec<_>>(),
+                rows,
+                unique_rows = groups.len(),
+                logical_pages,
+                source_bytes = groups.len() * row_bytes,
+                table_bytes = table.len(),
+                source_base = table.as_ptr() as usize,
+                source_pages = residency.map(|value| value.0),
+                resident_pages = residency.map(|value| value.1),
+                plan_ns = plan_elapsed.as_nanos() as u64,
+                mmap_dequant_ns = work_elapsed.as_nanos() as u64,
+                parallel,
+                "PLE gather probe"
+            );
+        }
         if profile {
             pager_profile::record_ple_gather(
                 rows,
@@ -464,6 +506,61 @@ impl WorkerState {
         }
         Ok(out)
     }
+}
+
+#[cfg(windows)]
+fn probe_source_residency(
+    table: &[u8],
+    row_bytes: usize,
+    groups: &[RowGroup],
+) -> Option<(usize, usize)> {
+    #[repr(C)]
+    struct PageInfo {
+        address: usize,
+        attributes: usize,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn K32QueryWorkingSetEx(
+            process: *mut std::ffi::c_void,
+            buffer: *mut std::ffi::c_void,
+            bytes: u32,
+        ) -> i32;
+    }
+    let mut pages = Vec::<PageInfo>::new();
+    for group in groups {
+        let first = (table.as_ptr() as usize + group.src_offset) / SOURCE_PAGE_BYTES;
+        let last = (table.as_ptr() as usize + group.src_offset + row_bytes - 1) / SOURCE_PAGE_BYTES;
+        for page in first..=last {
+            let address = page * SOURCE_PAGE_BYTES;
+            if pages
+                .last()
+                .is_none_or(|previous| previous.address != address)
+            {
+                pages.push(PageInfo {
+                    address,
+                    attributes: 0,
+                });
+            }
+        }
+    }
+    let bytes = u32::try_from(std::mem::size_of_val(pages.as_slice())).ok()?;
+    // Valid=0 may be a soft fault from the standby cache, not necessarily an SSD read.
+    let ok = unsafe { K32QueryWorkingSetEx(GetCurrentProcess(), pages.as_mut_ptr().cast(), bytes) };
+    (ok != 0).then(|| {
+        let resident = pages.iter().filter(|page| page.attributes & 1 != 0).count();
+        (pages.len(), resident)
+    })
+}
+
+#[cfg(not(windows))]
+fn probe_source_residency(
+    _table: &[u8],
+    _row_bytes: usize,
+    _groups: &[RowGroup],
+) -> Option<(usize, usize)> {
+    None
 }
 
 fn process_row_group(
@@ -681,6 +778,49 @@ fn ple_row_indices(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_positions_preserve_absolute_offset_after_ngram_trimming() {
+        let tokens = (0..32).collect::<Vec<u32>>();
+        let span = ple_job_span(&tokens, 20, 2, 4).unwrap();
+        assert_eq!(span.absolute_start, 20);
+        assert_eq!(span.start, 3);
+        assert_eq!(span.rows, 2);
+        assert_eq!(span.tokens, vec![17, 18, 19, 20, 21]);
+    }
+
+    #[test]
+    fn probe_positions_preserve_each_decode_lane_context() {
+        for lanes in 1..=infr_core::backend::MAX_DECODE_ROWS {
+            for lane in 0..lanes {
+                let tokens: Vec<u32> = (0..40).map(|i| (lane * 100 + i) as u32).collect();
+                let position = 20 + lane;
+                let span = ple_job_span(&tokens, position, 1, 4).unwrap();
+                assert_eq!(span.absolute_start, position);
+                assert_eq!(span.rows, 1);
+                assert_eq!(
+                    ple_context(&span.tokens[..=span.start], 4, 2).unwrap(),
+                    ple_context(&tokens[..=position], 4, 2).unwrap(),
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn residency_probe_queries_only_planned_source_pages() {
+        let table = vec![1u8; 8192];
+        let groups = vec![RowGroup {
+            request_start: 0,
+            request_end: 1,
+            row: 0,
+            src_offset: 0,
+        }];
+        let (pages, resident) = probe_source_residency(&table, 32, &groups).unwrap();
+        assert!((1..=2).contains(&pages));
+        assert!(resident <= pages);
+        assert_eq!(table[0], 1);
+    }
 
     #[test]
     fn abandoned_ple_ticket_recycles_queued_and_late_rows() {
