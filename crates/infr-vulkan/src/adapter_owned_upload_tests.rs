@@ -546,7 +546,7 @@ fn run_owned_upload_two_cpu_misses_outcome(
         session.gpu_decode_owner = None;
         if host_ready {
             // Keep the real dedicated queue/executor, but model the unimported RAM tail.
-            // Disabling host_dma would remove that executor and never exercise Started.
+            // Keep the imported fixture buffers too: only these expert sources become CPU-only.
             session.test_unimport_host_uploads();
         }
         let mut sources = session.gpu_copy_sources().unwrap().unwrap();

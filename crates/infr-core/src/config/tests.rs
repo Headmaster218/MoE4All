@@ -162,6 +162,65 @@ fn cli_layer(sets: &[&str]) -> PartialConfig {
 }
 
 #[test]
+fn host_dma_and_dedicated_transfer_are_independent() {
+    let defaults = Config::default();
+    assert!(defaults.paging.host_dma);
+    assert!(defaults.paging.dedicated_transfer);
+
+    for host_dma in [false, true] {
+        for dedicated in [false, true] {
+            let import_setting = format!("paging.host_dma={host_dma}");
+            let queue_setting = format!("paging.dedicated_transfer={dedicated}");
+            let toml = format!("[paging]\nhost_dma={host_dma}\ndedicated_transfer={dedicated}\n");
+            let mut vars = Vec::new();
+            if !host_dma {
+                vars.push(("INFR_NO_HOST_DMA", "1"));
+            }
+            if !dedicated {
+                vars.push(("INFR_NO_DEDICATED_TRANSFER", "1"));
+            }
+            for layer in [
+                env_layer(&vars),
+                file_layer(&toml),
+                cli_layer(&[&import_setting, &queue_setting]),
+            ] {
+                let cfg = Config::load_from_layers(&[layer]);
+                assert_eq!(cfg.paging.host_dma, host_dma);
+                assert_eq!(cfg.paging.dedicated_transfer, dedicated);
+            }
+        }
+    }
+}
+
+#[test]
+fn transfer_switch_overrides_preserve_other_settings() {
+    let cfg = Config::load_from_layers(&[
+        file_layer("[paging]\nhost_dma=false\ndedicated_transfer=false\n"),
+        env_layer(&[("INFR_NO_HOST_DMA", "1")]),
+        cli_layer(&["paging.dedicated_transfer=true"]),
+    ]);
+    assert!(!cfg.paging.host_dma);
+    assert!(cfg.paging.dedicated_transfer);
+
+    let cfg = Config::load_from_layers(&[
+        env_layer(&[("INFR_NO_DEDICATED_TRANSFER", "1")]),
+        cli_layer(&["paging.host_dma=true"]),
+    ]);
+    assert!(cfg.paging.host_dma);
+    assert!(!cfg.paging.dedicated_transfer);
+
+    let cfg = Config::load_from_layers(&[
+        env_layer(&[
+            ("INFR_NO_HOST_DMA", "1"),
+            ("INFR_NO_DEDICATED_TRANSFER", "1"),
+        ]),
+        cli_layer(&["paging.host_dma=true", "paging.dedicated_transfer=true"]),
+    ]);
+    assert!(cfg.paging.host_dma);
+    assert!(cfg.paging.dedicated_transfer);
+}
+
+#[test]
 fn attention_splits_preserve_automatic_and_supported_overrides() {
     let defaults = Config::default();
     assert_eq!(defaults.kernels.vulkan.flash_splits, None);
@@ -1981,6 +2040,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_SHUTDOWN_FILE",
         "INFR_EMBEDDING_RUNNER",
         "INFR_NO_HOST_DMA",
+        "INFR_NO_DEDICATED_TRANSFER",
         "INFR_KV_SESSION_CACHE_DIR",
         "INFR_KV_SESSION_IDLE_SECS",
         "INFR_KV_SESSION_CACHE_MAX",

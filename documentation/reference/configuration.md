@@ -103,6 +103,33 @@ Error: config `device.ctx`: expected a size/count like 8192, 256k or 50% (got "b
 
 ## `--set`
 
+### Pager 传输诊断 / Pager Transfer Diagnostics
+
+两个开关默认均为 `true`，相互独立，不改变 RAM 专家缓存预算或 GPU 的 LRU 所有权。
+Both switches default to `true` and are independent; neither changes the RAM cache budget or GPU LRU ownership.
+
+| 配置 / Setting | 控制内容 / Controls |
+| --- | --- |
+| `paging.host_dma` | 导入 RAM 专家缓存供 Vulkan 访问；关闭后无法通过该导入路径由 GPU 自取专家，改走 CPU 协助的直接或 staging 上传。Import RAM expert-cache buffers for Vulkan access; disabling it removes this GPU self-copy source and retains CPU-assisted direct/staged uploads. |
+| `paging.dedicated_transfer` | 可用时使用独立传输队列；关闭后，需提交的复制走主队列或既有直接上传路径，不关闭 GPU 的 CU 自复制。Use a dedicated transfer queue when available; disabling it retains main-queue/direct fallbacks and does not disable shader-based GPU self-copy. |
+
+保持其他参数、模型和输入相同，分别追加以下配置进行对比：
+Keep the model, input and other parameters identical and compare these configurations:
+
+```text
+--set paging.host_dma=true  --set paging.dedicated_transfer=true
+--set paging.host_dma=true  --set paging.dedicated_transfer=false
+--set paging.host_dma=false --set paging.dedicated_transfer=true
+--set paging.host_dma=false --set paging.dedicated_transfer=false
+```
+
+环境变量 `INFR_NO_HOST_DMA=1` 和 `INFR_NO_DEDICATED_TRANSFER=1` 分别关闭对应功能；CLI `--set` 优先。
+Environment variables `INFR_NO_HOST_DMA=1` and `INFR_NO_DEDICATED_TRANSFER=1` disable the respective features; CLI `--set` takes precedence.
+启动日志 `pager transfer policy` 显示请求值和实际是否创建独立队列；请求开启不代表设备一定支持。RAM 导入实际覆盖量仍查看 `host DMA import total` 日志。
+The startup `pager transfer policy` log reports requested settings and whether a dedicated queue was created; requested does not mean supported. Check `host DMA import total` for actual imported RAM coverage.
+
+### 通用用法 / General Usage
+
 大多数配置调节项没有专用标志。`--set <config.path>=<value>` 可访问全部调节项，并使用与 TOML 文件相同的路径语法：
 
 ```bash

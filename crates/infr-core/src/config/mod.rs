@@ -277,8 +277,12 @@ cfg_struct! {
         /// machine whose RAM is better spent elsewhere.
         dram_bypass: bool = false,
         /// Alias eligible DRAM pager arenas through `VK_EXT_external_memory_host` so Vulkan can
-        /// DMA promotions into VRAM. Unsupported devices transparently keep CPU ReBAR copies.
+        /// read them from shaders or copy them into VRAM. Does not control the transfer queue.
+        /// Unsupported devices transparently keep direct or staged uploads.
         host_dma: bool = true,
+        /// Use a transfer-only Vulkan queue for pager uploads when supported. Independent from
+        /// `host_dma`: staging can use this queue without importing the RAM expert cache.
+        dedicated_transfer: bool = true,
         /// `INFR_LAYER_MAJOR`, TRI-state syntax: `None` and `Some(false)` use the chunk-major
         /// default; `Some(true)` forces layer-major where the backend and architecture support it.
         ///
