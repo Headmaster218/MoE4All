@@ -1051,6 +1051,8 @@ pub(crate) fn copy_owned_mapped_batch<'a>(
 ) -> Result<()> {
     // Validate the entire batch before its first write. This route never imports, stages,
     // submits, or waits on a GPU queue, including on its error path.
+    #[cfg(test)]
+    let mut combined_probe = None;
     let copies = uploads
         .into_iter()
         .map(|(src, target)| {
@@ -1060,6 +1062,12 @@ pub(crate) fn copy_owned_mapped_batch<'a>(
             let dst = target
                 .mapped_ptr()
                 .ok_or_else(|| be("owned CPU upload target lost its mapping"))?;
+            #[cfg(test)]
+            if combined_probe.is_none() {
+                combined_probe = crate::host_ready_combined_test_support::claim_copy(
+                    &as_vk_buf(target.buffer.as_ref())?.shared,
+                );
+            }
             Ok(MappedHostCopy {
                 src: src.as_ptr() as usize,
                 dst: dst as usize,
@@ -1069,6 +1077,16 @@ pub(crate) fn copy_owned_mapped_batch<'a>(
         .collect::<Result<Vec<_>>>()?;
     let _span = infr_core::timeline::background_span("resident_producer_mapped_copy");
     let started = pager_profile::active().then(std::time::Instant::now);
+    #[cfg(test)]
+    if let Some(probe) = combined_probe {
+        probe.before_copy(copies.len())?;
+        for (index, copy) in copies.iter().enumerate() {
+            // Exercise the same actual memcpy, with a deterministic partial-job fault edge.
+            copy_to_mapped_batch(std::slice::from_ref(copy), serial_max_bytes);
+            probe.after_copy(index + 1)?;
+        }
+        return Ok(());
+    }
     copy_to_mapped_batch(&copies, serial_max_bytes);
     if let Some(started) = started {
         let bytes = copies.iter().map(|copy| copy.len).sum();

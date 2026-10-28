@@ -67,6 +67,127 @@ impl Drop for RecordingGuard {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RecordingCheckpoint {
+    Setup,
+    Op(usize),
+    Finalize,
+}
+
+fn recording_checkpoint(cancelled: Option<&AtomicBool>, _point: RecordingCheckpoint) -> Result<()> {
+    #[cfg(test)]
+    if let Some(cancelled) = cancelled {
+        if TEST_CANCEL_AT.with(|point| point.get() == Some(_point)) {
+            cancelled.store(true, Ordering::Release);
+        }
+    }
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Err(Error::Aborted);
+    }
+    Ok(())
+}
+
+fn cancellable_recording<T>(
+    cancelled: &AtomicBool,
+    record: impl FnOnce() -> Result<T>,
+) -> Result<Option<T>> {
+    if cancelled.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    match record() {
+        Ok(packet) => Ok((!cancelled.load(Ordering::Acquire)).then_some(packet)),
+        Err(Error::Aborted) if cancelled.load(Ordering::Acquire) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Successful NEXT and following-stage work remains useful; errors cancel before joining.
+pub(super) fn finish_preparation_scope(
+    next_cancelled: &AtomicBool,
+    continuation_cancelled: &AtomicBool,
+    failed: bool,
+) {
+    if failed {
+        next_cancelled.store(true, Ordering::Release);
+        continuation_cancelled.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn test_finish_preparation_scope(
+    next_cancelled: &AtomicBool,
+    continuation_cancelled: &AtomicBool,
+    failed: bool,
+    experimental_end_cancel: bool,
+) {
+    finish_preparation_scope(next_cancelled, continuation_cancelled, failed || experimental_end_cancel);
+}
+
+#[cfg(test)]
+fn source_horizon_overrides() -> &'static Mutex<HashMap<usize, bool>> {
+    static STATES: OnceLock<Mutex<HashMap<usize, bool>>> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(super) struct SourceHorizonScope {
+    shared: Arc<crate::VulkanShared>,
+    previous: Option<bool>,
+}
+
+#[cfg(test)]
+impl Drop for SourceHorizonScope {
+    fn drop(&mut self) {
+        let key = Arc::as_ptr(&self.shared) as usize;
+        let mut states = source_horizon_overrides().lock().unwrap();
+        states.remove(&key);
+        if let Some(previous) = self.previous {
+            states.insert(key, previous);
+        }
+    }
+}
+
+/// Device-scoped so the isolated recording worker observes the same A/B choice.
+#[cfg(test)]
+pub(super) fn source_horizon_scope(be_: &VulkanBackend, enabled: bool) -> SourceHorizonScope {
+    let previous = source_horizon_overrides()
+        .lock()
+        .unwrap()
+        .insert(Arc::as_ptr(&be_.shared) as usize, enabled);
+    SourceHorizonScope {
+        shared: Arc::clone(&be_.shared),
+        previous,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CANCEL_AT: Cell<Option<RecordingCheckpoint>> = const { Cell::new(None) };
+    static TEST_ACCEPTED_PREFIXES: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn test_accepted_prefixes() -> usize {
+    TEST_ACCEPTED_PREFIXES.with(Cell::get)
+}
+
+#[cfg(test)]
+pub(super) struct TestCancelAt(Option<RecordingCheckpoint>);
+
+#[cfg(test)]
+impl TestCancelAt {
+    pub(super) fn enter(point: RecordingCheckpoint) -> Self {
+        Self(TEST_CANCEL_AT.with(|current| current.replace(Some(point))))
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestCancelAt {
+    fn drop(&mut self) {
+        TEST_CANCEL_AT.with(|current| current.set(self.0));
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BufferKey {
     pointer: usize,
@@ -481,8 +602,8 @@ impl<'a> StageRecording<'a> {
         }
         // Bound continuation work independently of next-token activation and position guards.
         // Standalone/first-stage next packets retain the existing wide recording policy.
-        let mut prefix = if self.horizon == RecordingHorizon::Wide {
-            record(
+        let prefix = if self.horizon == RecordingHorizon::Wide {
+            record_cancellable(
                 be_,
                 self.plan,
                 &self.scratch,
@@ -490,22 +611,32 @@ impl<'a> StageRecording<'a> {
                 &self.positions,
                 self.pool,
                 self.resident,
+                cancelled,
             )?
         } else {
-            record_with_horizon(
-                be_,
-                self.plan,
-                &self.scratch,
-                self.bindings,
-                &self.positions,
-                self.pool,
-                self.resident,
-                false,
-            )?
+            cancellable_recording(cancelled, || {
+                record_with_horizon(
+                    be_,
+                    self.plan,
+                    &self.scratch,
+                    self.bindings,
+                    &self.positions,
+                    self.pool,
+                    self.resident,
+                    false,
+                    Some(cancelled),
+                )
+            })?
+        };
+        let Some(mut prefix) = prefix else {
+            return Ok(());
         };
         // Recording aliases have different Rust object identities. Activation must validate
         // against the real retained graph scratch, not against those temporary wrappers.
         for (id, expected) in &mut prefix.tensors {
+            if cancelled.load(Ordering::Acquire) {
+                return Ok(());
+            }
             if self.bindings.get_rows(*id).is_none() {
                 if let Some(Some(canonical)) = self.canonical.get(id.0 as usize) {
                     *expected = vec![canonical.clone()];
@@ -654,6 +785,7 @@ pub(crate) fn supported(be_: &VulkanBackend) -> bool {
         && be_.unified_client.is_none()
         && !be_.dense_paged()
         && !be_.cfg().spec.mtp
+        && !be_.cfg().spec.lookup
         && !be_.cfg().paging.expert_prefetch
 }
 
@@ -1263,6 +1395,8 @@ impl PreparedPrefix {
             None
         };
         let _accepted = infr_core::timeline::span("decode_packet_accepted");
+        #[cfg(test)]
+        TEST_ACCEPTED_PREFIXES.with(|count| count.set(count.get() + 1));
         Some(ActivatedPrefix {
             command: self.command,
             parts: self.parts,
@@ -1281,10 +1415,45 @@ pub(super) fn record(
     scratch: &ScratchSet,
     bindings: &Bindings,
     positions: &[usize],
-    mut pool: ScratchPool,
+    pool: ScratchPool,
     resident: Option<ResidentChunk>,
 ) -> Result<PreparedPrefix> {
+    record_inner(be_, plan, scratch, bindings, positions, pool, resident, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn record_cancellable(
+    be_: &VulkanBackend,
+    plan: &VkDecodePlan,
+    scratch: &ScratchSet,
+    bindings: &Bindings,
+    positions: &[usize],
+    pool: ScratchPool,
+    resident: Option<ResidentChunk>,
+    cancelled: &AtomicBool,
+) -> Result<Option<PreparedPrefix>> {
+    cancellable_recording(cancelled, || {
+        record_inner(
+            be_, plan, scratch, bindings, positions, pool, resident, Some(cancelled),
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_inner(
+    be_: &VulkanBackend,
+    plan: &VkDecodePlan,
+    scratch: &ScratchSet,
+    bindings: &Bindings,
+    positions: &[usize],
+    mut pool: ScratchPool,
+    resident: Option<ResidentChunk>,
+    cancelled: Option<&AtomicBool>,
+) -> Result<PreparedPrefix> {
+    #[cfg(test)]
+    super::promotion_isolation_note(be_, "record");
     let _span = infr_core::timeline::background_span("decode_packet_record");
+    recording_checkpoint(cancelled, RecordingCheckpoint::Setup)?;
     let owned = resident
         .as_ref()
         .is_some_and(|chunk| chunk.gpu_copy.as_ref().is_some_and(|copy| copy.is_owned()));
@@ -1298,19 +1467,24 @@ pub(super) fn record(
     } else {
         None
     };
+    recording_checkpoint(cancelled, RecordingCheckpoint::Setup)?;
     match record_with_horizon(
-        be_, plan, scratch, bindings, positions, pool, resident, true,
+        be_, plan, scratch, bindings, positions, pool, resident, true, cancelled,
     ) {
         Ok(packet) => Ok(packet),
-        Err(error) => match fallback {
-            Some((pool, resident)) => {
-                tracing::debug!(%error, "long owned preparation declined; retrying bounded prefix");
-                record_with_horizon(
-                    be_, plan, scratch, bindings, positions, pool, resident, false,
-                )
+        Err(error) => {
+            // Cancellation must not restart the entire preparation with a bounded horizon.
+            recording_checkpoint(cancelled, RecordingCheckpoint::Setup)?;
+            match fallback {
+                Some((pool, resident)) => {
+                    tracing::debug!(%error, "long owned preparation declined; retrying bounded prefix");
+                    record_with_horizon(
+                        be_, plan, scratch, bindings, positions, pool, resident, false, cancelled,
+                    )
+                }
+                None => Err(error),
             }
-            None => Err(error),
-        },
+        }
     }
 }
 
@@ -1324,8 +1498,10 @@ fn record_with_horizon(
     mut pool: ScratchPool,
     mut resident: Option<ResidentChunk>,
     wide: bool,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<PreparedPrefix> {
     use ash::vk::Handle;
+    recording_checkpoint(cancelled, RecordingCheckpoint::Setup)?;
     let setup_span = infr_core::timeline::background_span("decode_packet_setup");
     let _span = infr_core::timeline::background_span(if wide {
         "decode_packet_wide_record"
@@ -1392,6 +1568,7 @@ fn record_with_horizon(
     if let Some(chunk) = resident.as_mut() {
         chunk.install_pure_mapped_schedule(be_, plan, scratch, bindings, &pool, true, cap, false);
     }
+    recording_checkpoint(cancelled, RecordingCheckpoint::Setup)?;
     let end = if full_forward {
         graph.ops.len()
     } else if owned_batch {
@@ -1400,8 +1577,10 @@ fn record_with_horizon(
             be_.cfg().kernels.vulkan.decode_gpu_resident_layers,
             chunk.limit,
         );
-        owned_prefix_end(graph, preparation_limit)
-            .ok_or_else(|| be("unsupported owned packet window"))?
+        let old_end = owned_prefix_end(graph, preparation_limit)
+            .ok_or_else(|| be("unsupported owned packet window"))?;
+        source_certificate_prefix_end(be_, graph, scratch, bindings, chunk, old_end)
+            .unwrap_or(old_end)
     } else {
         match resident
             .as_ref()
@@ -1424,6 +1603,7 @@ fn record_with_horizon(
     let epoch = be_.shared.resource_epoch.load(Ordering::Acquire);
     let mut ids = HashSet::new();
     for op in &graph.ops[..end] {
+        recording_checkpoint(cancelled, RecordingCheckpoint::Setup)?;
         let (reads, writes) = op.io_inline();
         ids.extend(reads.into_iter().chain(writes));
     }
@@ -1437,6 +1617,7 @@ fn record_with_horizon(
     // Fused shared-expert weights/outputs can belong to ops just past the submission boundary.
     // Validate those bindings too, even though their standalone commands are suppressed.
     for (index, _) in plan.setup_analysis.shared_candidates(false, false) {
+        recording_checkpoint(cancelled, RecordingCheckpoint::Setup)?;
         if index < end {
             for op in graph.ops.iter().skip(index + 1).take(6) {
                 let (reads, writes) = op.io_inline();
@@ -1446,19 +1627,25 @@ fn record_with_horizon(
     }
     let tensors = ids
         .into_iter()
-        .map(|id| Ok((id, keys(scratch, bindings, id)?)))
+        .map(|id| {
+            recording_checkpoint(cancelled, RecordingCheckpoint::Setup)?;
+            Ok((id, keys(scratch, bindings, id)?))
+        })
         .collect::<Result<Vec<_>>>()?;
     let pool_keys = pool
         .buffers
         .iter()
         .map(|(&key, buffer)| {
+            recording_checkpoint(cancelled, RecordingCheckpoint::Setup)?;
             let buffer = crate::as_vk_buf(buffer.as_ref())?;
             Ok((key, buffer.buffer.as_raw(), buffer.sub_offset, buffer.size))
         })
         .collect::<Result<Vec<_>>>()?;
+    recording_checkpoint(cancelled, RecordingCheckpoint::Setup)?;
     let rec = Recorder::new_prepared(be_)?;
     rec.seed_barrier();
     for &index in &metadata.reset_indices {
+        recording_checkpoint(cancelled, RecordingCheckpoint::Setup)?;
         let buffer = scratch[index]
             .as_deref()
             .ok_or_else(|| be("missing prepared scratch reset"))?;
@@ -1466,6 +1653,7 @@ fn record_with_horizon(
     }
     let mut rope_positions = HashMap::new();
     for &(index, id) in &plan.setup_analysis.rope_ops {
+        recording_checkpoint(cancelled, RecordingCheckpoint::Setup)?;
         if index < end {
             rope_positions.insert(id.0, positions[0]);
         }
@@ -1480,6 +1668,7 @@ fn record_with_horizon(
     if resident.is_some() {
         let disabled = std::env::var_os("INFR_NO_MOE_SHARED_SLOT").is_some();
         for (index, shared) in analysis.shared_candidates(disabled, false) {
+            recording_checkpoint(cancelled, RecordingCheckpoint::Setup)?;
             let Op::MoeFfn { gate_exps, .. } = &graph.ops[index] else {
                 unreachable!()
             };
@@ -1502,6 +1691,7 @@ fn record_with_horizon(
         }
     }
     if be_.cfg().kernels.vulkan.hc_up_mix {
+        recording_checkpoint(cancelled, RecordingCheckpoint::Setup)?;
         skip.extend(
             analysis
                 .hc
@@ -1513,6 +1703,7 @@ fn record_with_horizon(
         );
     }
     if be_.cfg().kernels.vulkan.ple_gate_norm_lds {
+        recording_checkpoint(cancelled, RecordingCheckpoint::Setup)?;
         skip.extend(
             analysis
                 .ple
@@ -1526,8 +1717,10 @@ fn record_with_horizon(
     if deltanet_norm_enabled(be_) {
         skip.extend(analysis.delta.iter().filter(|&&i| i < end).map(|&i| i + 1));
     }
+    recording_checkpoint(cancelled, RecordingCheckpoint::Setup)?;
     let mode = RopeMode::Static(&rope_positions);
     let segmented = analysis.segmented_fusions(be_, graph, scratch, bindings, &mode, &skip)?;
+    recording_checkpoint(cancelled, RecordingCheckpoint::Setup)?;
     skip.extend(segmented.keys().map(|&i| i + 1));
     let empty = HashMap::new();
     let mut transient = Vec::new();
@@ -1557,6 +1750,7 @@ fn record_with_horizon(
     let mut parts = Vec::new();
     drop(setup_span);
     for (index, op) in infr_core::exec::live_ops(&graph.ops[..end], &skip) {
+        recording_checkpoint(cancelled, RecordingCheckpoint::Op(index))?;
         let _op_span = infr_core::timeline::background_span(op.kind());
         if resident.is_some() && cap != 0 && recorder.as_ref().unwrap().dispatches() >= cap {
             return Err(be("prepared resident segment reaches a splitter boundary"));
@@ -1606,6 +1800,7 @@ fn record_with_horizon(
                 &mut stream,
                 shared_ops.get(&index).copied(),
             )?;
+            recording_checkpoint(cancelled, RecordingCheckpoint::Setup)?;
             let chunk = resident.as_ref().unwrap();
             let submitted = parts.last().map_or(0, |part: &PreparedPart| part.layers);
             if owned_batch {
@@ -1647,16 +1842,19 @@ fn record_with_horizon(
             None,
         )?;
     }
+    recording_checkpoint(cancelled, RecordingCheckpoint::Finalize)?;
     if !transient.is_empty() || !dynamic.is_empty() {
         return Err(be("prepared prefix produced transient GPU resources"));
     }
     let resident = resident
         .map(|chunk| -> Result<_> {
+            recording_checkpoint(cancelled, RecordingCheckpoint::Finalize)?;
             let guard = be_.moe_pager().lock().unwrap();
             let session = guard.as_ref().ok_or_else(|| be("missing prepared pager"))?;
             let mut banks = Vec::new();
             let mut copy_params = Vec::new();
             for entry in &chunk.entries {
+                recording_checkpoint(cancelled, RecordingCheckpoint::Finalize)?;
                 for &role in &entry.roles {
                     banks.push((role, session.arena_addr(role)?, session.slot_bytes(role)?));
                 }
@@ -1673,6 +1871,7 @@ fn record_with_horizon(
             })
         })
         .transpose()?;
+    recording_checkpoint(cancelled, RecordingCheckpoint::Finalize)?;
     if full_forward {
         let last = recorder.as_ref().unwrap();
         last.end_conditional();
@@ -1685,6 +1884,7 @@ fn record_with_horizon(
             .as_ref()
             .map_or(0, |resident| resident.chunk.entries.len()),
     });
+    recording_checkpoint(cancelled, RecordingCheckpoint::Finalize)?;
     let head = parts.remove(0);
     let positions = rope_positions
         .into_iter()
@@ -1725,6 +1925,95 @@ fn prepare_full_forward(
 
 pub(super) fn partial_preparation_limit(configured_layers: usize, execution_limit: usize) -> usize {
     execution_limit.min(configured_layers.clamp(1, crate::recorder::RESIDENT_MAX_LAYERS))
+}
+
+fn source_certificate_group_limit(certificates: &[Option<bool>], cadence: usize) -> Option<usize> {
+    if certificates.is_empty() || cadence == 0 {
+        return None;
+    }
+    // Validate the whole captured range: unknown geometry/source proof keeps the old horizon.
+    let mut first_host = None;
+    for (index, certificate) in certificates.iter().enumerate() {
+        if !(*certificate)? && first_host.is_none() {
+            first_host = Some(index + 1);
+        }
+    }
+    let Some(first_host) = first_host else {
+        return Some(certificates.len());
+    };
+    // Pure groups stop BEFORE a host-sensitive entry. A group containing that entry uses
+    // the original cadence grid, even when the preceding pure group ended off-grid.
+    Some(
+        first_host
+            .div_ceil(cadence)
+            .checked_mul(cadence)?
+            .min(certificates.len()),
+    )
+}
+
+fn source_certificate_prefix_end(
+    be_: &VulkanBackend,
+    graph: &Graph,
+    scratch: &ScratchSet,
+    bindings: &Bindings,
+    chunk: &ResidentChunk,
+    old_end: usize,
+) -> Option<usize> {
+    #[cfg(test)]
+    if source_horizon_overrides()
+        .lock()
+        .unwrap()
+        .get(&(Arc::as_ptr(&be_.shared) as usize))
+        .copied()
+        == Some(false)
+    {
+        return None;
+    }
+    let owner = chunk.gpu_copy.as_ref().filter(|copy| copy.is_owned())?;
+    let pager = be_.moe_pager().lock().ok()?;
+    let session = pager.as_ref()?;
+    if !session
+        .gpu_decode_owner
+        .as_ref()
+        .is_some_and(|live| Arc::ptr_eq(live, owner))
+    {
+        return None;
+    }
+    let mut banks = HashMap::new();
+    let mut certificates = Vec::new();
+    for op in &graph.ops[..old_end] {
+        let Op::MoeFfn {
+            gate_exps,
+            up_exps,
+            down_exps,
+            ..
+        } = op
+        else {
+            continue;
+        };
+        let layout = ResidentMoeLayout::from_op(graph, op)?;
+        let roles = [*gate_exps, *up_exps, *down_exps].map(|id| {
+            resolve(scratch, bindings, id)
+                .ok()
+                .map(crate::pager::buffer_identity)
+        });
+        let roles = [roles[0]?, roles[1]?, roles[2]?];
+        let key = (roles, layout.n_expert);
+        let mapped = if let Some(&mapped) = banks.get(&key) {
+            mapped
+        } else {
+            let params = owner.role_params(session, &roles).ok()?;
+            let bases = [params[0], params[1], params[2]];
+            owner.owned_role_geometry(bases, layout.n_expert as u32)?;
+            let mapped = owner.owned_roles_self_service(bases, layout.n_expert as u32);
+            banks.insert(key, mapped);
+            mapped
+        };
+        certificates.push(Some(mapped));
+    }
+    let layers =
+        source_certificate_group_limit(&certificates, chunk.submit_layers.min(chunk.limit))?;
+    owned_prefix_end(graph, layers)
 }
 
 pub(super) fn resident_cadence_supported(
@@ -1777,6 +2066,135 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     #[test]
+    fn cooperative_preparation_scope_end_is_test_only_and_preserves_ready_packets() {
+        for failed in [false, true] {
+            for experiment in [false, true] {
+                let next = AtomicBool::new(false);
+                let continuation = AtomicBool::new(false);
+                let lease = Arc::new(());
+                let ready = Mutex::new(Some(Arc::clone(&lease)));
+                test_finish_preparation_scope(&next, &continuation, failed, experiment);
+                assert_eq!(next.load(Ordering::Acquire), failed || experiment);
+                assert_eq!(continuation.load(Ordering::Acquire), failed || experiment);
+                assert!(Arc::ptr_eq(ready.lock().unwrap().as_ref().unwrap(), &lease));
+                assert_eq!(Arc::strong_count(&lease), 2, "ready packet lease survives");
+            }
+        }
+        let next = AtomicBool::new(false);
+        let continuation = AtomicBool::new(true);
+        finish_preparation_scope(&next, &continuation, false);
+        assert_eq!(
+            cancellable_recording(&next, || Ok(37usize)).unwrap(),
+            Some(37)
+        );
+        assert!(cancellable_recording(&continuation, || -> Result<usize> {
+            panic!("an obsolete continuation must not begin recording")
+        })
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn cooperative_preparation_checkpoints_decline_without_hiding_other_errors() {
+        for point in [
+            RecordingCheckpoint::Setup,
+            RecordingCheckpoint::Op(1),
+            RecordingCheckpoint::Finalize,
+        ] {
+            let cancelled = AtomicBool::new(false);
+            let _at = TestCancelAt::enter(point);
+            let ops = AtomicUsize::new(0);
+            let result = cancellable_recording(&cancelled, || {
+                recording_checkpoint(Some(&cancelled), RecordingCheckpoint::Setup)?;
+                for op in 0..4 {
+                    recording_checkpoint(Some(&cancelled), RecordingCheckpoint::Op(op))?;
+                    ops.fetch_add(1, Ordering::Relaxed);
+                }
+                recording_checkpoint(Some(&cancelled), RecordingCheckpoint::Finalize)?;
+                Ok(17usize)
+            })
+            .unwrap();
+            assert!(result.is_none());
+            assert!(cancelled.load(Ordering::Acquire));
+            let expected = match point {
+                RecordingCheckpoint::Setup => 0,
+                RecordingCheckpoint::Op(_) => 1,
+                RecordingCheckpoint::Finalize => 4,
+            };
+            assert_eq!(ops.load(Ordering::Relaxed), expected);
+            // The noncancellable/direct-record path never observes this scoped hook.
+            recording_checkpoint(None, point).unwrap();
+        }
+        let cancelled = AtomicBool::new(false);
+        assert!(matches!(
+            cancellable_recording(&cancelled, || -> Result<()> { Err(Error::Aborted) }),
+            Err(Error::Aborted)
+        ));
+        assert!(cancellable_recording(&cancelled, || -> Result<()> {
+            Err(be("ordinary unsupported preparation"))
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("ordinary unsupported preparation"));
+    }
+
+    #[test]
+    fn cooperative_preparation_scope_joins_cancelled_private_work_and_leases() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        const WATCHDOG: Duration = Duration::from_secs(10);
+        let next = AtomicBool::new(false);
+        let continuation = AtomicBool::new(false);
+        let ops = AtomicUsize::new(0);
+        let dropped = Arc::new(AtomicBool::new(false));
+        struct Lease(Arc<AtomicBool>);
+        impl Drop for Lease {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let lease = Lease(Arc::clone(&dropped));
+        let outcome = Mutex::new(None);
+        let (entered, started) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let entered_ok = recording_scope(true, |scope| {
+            let cancelled = &next;
+            let ops = &ops;
+            let outcome = &outcome;
+            scope.spawn(move |_| {
+                let _lease = lease;
+                let result = cancellable_recording(cancelled, || {
+                    recording_checkpoint(Some(cancelled), RecordingCheckpoint::Setup)?;
+                    ops.fetch_add(1, Ordering::Relaxed);
+                    let _ = entered.send(());
+                    gate.recv_timeout(WATCHDOG)
+                        .map_err(|_| be("checkpoint test release timed out"))?;
+                    recording_checkpoint(Some(cancelled), RecordingCheckpoint::Op(1))?;
+                    ops.fetch_add(1, Ordering::Relaxed);
+                    Ok(41usize)
+                });
+                *outcome.lock().unwrap() = Some(result);
+            });
+            let entered_ok = started.recv_timeout(WATCHDOG).is_ok();
+            test_finish_preparation_scope(&next, &continuation, false, true);
+            let still_leased = !dropped.load(Ordering::Acquire);
+            let _ = release.send(());
+            entered_ok && still_leased
+        })
+        .unwrap();
+        assert!(
+            entered_ok,
+            "worker must enter before the simulated body completion"
+        );
+        assert_eq!(ops.load(Ordering::Relaxed), 1);
+        assert!(outcome.lock().unwrap().take().unwrap().unwrap().is_none());
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "private work retires before scope return"
+        );
+    }
+
+    #[test]
     fn next_stage_recording_horizon_bounds_only_continuations() {
         assert_eq!(RecordingHorizon::for_next_stage(0), RecordingHorizon::Wide);
         for stage in [1, 2, 7, usize::MAX] {
@@ -1785,6 +2203,50 @@ mod tests {
                 RecordingHorizon::Bounded
             );
         }
+    }
+
+    #[test]
+    fn source_certificate_horizon_stops_at_existing_host_group() {
+        for cadence in [1, 2, 4, 16] {
+            assert_eq!(
+                source_certificate_group_limit(&[Some(true); 16], cadence),
+                Some(16)
+            );
+            for host in 0..16 {
+                let mut certificates = [Some(true); 16];
+                certificates[host] = Some(false);
+                let layers = source_certificate_group_limit(&certificates, cadence).unwrap();
+                assert_eq!(layers, (host + 1).div_ceil(cadence) * cadence);
+                assert!(layers >= host + 1);
+                assert!(layers == 16 || resident_submit_due(layers, 0, cadence, 128));
+                // The execution window is NOT the speculative preparation limit.
+                assert_eq!(resident_execution_limit(true, 48, 16, 128).unwrap(), 48);
+            }
+        }
+        assert_eq!(
+            source_certificate_group_limit(&[Some(false); 16], 1),
+            Some(1)
+        );
+        assert_eq!(
+            source_certificate_group_limit(&[Some(false); 16], 16),
+            Some(16)
+        );
+        assert_eq!(
+            source_certificate_group_limit(&[Some(true), Some(false), Some(true)], 2),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn source_certificate_horizon_unknown_proof_keeps_old_range() {
+        for unknown in 0..16 {
+            let mut certificates = [Some(true); 16];
+            certificates[0] = Some(false);
+            certificates[unknown] = None;
+            assert_eq!(source_certificate_group_limit(&certificates, 1), None);
+        }
+        assert_eq!(source_certificate_group_limit(&[], 1), None);
+        assert_eq!(source_certificate_group_limit(&[Some(false)], 0), None);
     }
 
     #[test]

@@ -1,4 +1,6 @@
 //! Small model-free resident command-ahead regressions; declared as a child of `adapter`.
+#[path = "adapter_promotion_isolation_tests.rs"]
+pub(crate) mod promotion_isolation_tests;
 #[path = "adapter_pure_mapped_coalesce_tests.rs"]
 mod pure_mapped_coalesce_tests;
 #[path = "adapter_owned_stage_tail_tests.rs"]
@@ -643,6 +645,36 @@ impl Fixture {
         kv_segment_bytes: usize,
         host_ready: bool,
     ) -> Self {
+        Self::new_with_preparation_budget(
+            submit_layers, producer, copy, kv_reserve_bytes, kv_segment_bytes, host_ready, 3,
+        )
+    }
+
+    fn new_with_preparation_budget(
+        submit_layers: usize,
+        producer: bool,
+        copy: Option<bool>,
+        kv_reserve_bytes: usize,
+        kv_segment_bytes: usize,
+        host_ready: bool,
+        preparation_layers: usize,
+    ) -> Self {
+        Self::new_with_combined_policy(
+            submit_layers, producer, copy, kv_reserve_bytes, kv_segment_bytes,
+            host_ready, preparation_layers, false,
+        )
+    }
+
+    fn new_with_combined_policy(
+        submit_layers: usize,
+        producer: bool,
+        copy: Option<bool>,
+        kv_reserve_bytes: usize,
+        kv_segment_bytes: usize,
+        host_ready: bool,
+        preparation_layers: usize,
+        copy_overlap: bool,
+    ) -> Self {
         let mut cfg = infr_core::config::Config::default();
         cfg.device.submit_dispatches = Some(0);
         cfg.device.decode_command_ahead = true;
@@ -651,12 +683,14 @@ impl Fixture {
         cfg.paging.expert_prefetch = false;
         cfg.paging.host_dma = true;
         cfg.kernels.vulkan.decode_gpu_resident_host_ready = host_ready;
+        cfg.kernels.vulkan.decode_gpu_resident_copy_overlap = copy_overlap;
+        cfg.kernels.vulkan.decode_gpu_resident_upload_worker = true;
         cfg.paging.ring = Some(SizeSpec::Bytes((4 * SLOT_BYTES) as u64));
         cfg.kernels.vulkan.cpu_miss_threads = 0;
         cfg.kernels.vulkan.static_scratch_memo = true;
         cfg.kernels.vulkan.decode_gpu_resident = true;
         cfg.kernels.vulkan.decode_gpu_resident_copy = copy;
-        cfg.kernels.vulkan.decode_gpu_resident_layers = 3;
+        cfg.kernels.vulkan.decode_gpu_resident_layers = preparation_layers;
         cfg.kernels.vulkan.decode_gpu_resident_submit_layers = submit_layers;
         cfg.kernels.vulkan.decode_gpu_resident_inflight = 1;
         cfg.kernels.vulkan.decode_gpu_resident_hit_first = true;
@@ -917,6 +951,9 @@ impl Fixture {
     }
 
     fn prepare(&self, submit_layers: usize, producer: bool) -> (VkDecodePlan, Vec<Vec<f32>>) {
+        // Keep the legacy whole-batch discard/recovery coverage; the source-horizon test
+        // below compares both policies using the same real preparation worker.
+        let _legacy = command_prefix::source_horizon_scope(&self.backend, false);
         let current = VkDecodePlan::new_cpu(&self.graph, false, true);
         let mut next_graph = self.graph.clone();
         let next_position = if next_graph.independent_rows {
@@ -1135,6 +1172,88 @@ fn assert_close(actual: &[Vec<f32>], expected: &[Vec<f32>]) {
 }
 
 #[test]
+#[ignore = "parent serial GPU; private prepared setup/op/finalize cancellation and ready-prefix retention"]
+fn gpu_resident_prepared_cooperative_cancellation_preserves_forward_and_fallback() {
+    use command_prefix::{RecordingCheckpoint, StageRecording, TestCancelAt};
+    let mut fixture = Fixture::new_with_copy_policy(1, true, Some(true));
+    let extra_frontend = fixture.graph.ops[0].clone();
+    fixture.graph.ops.insert(1, extra_frontend);
+    let current = VkDecodePlan::new_cpu(&fixture.graph, false, true);
+    let bindings = fixture.bindings();
+    fixture.preload();
+    execute_static(&fixture.backend, &current, &bindings).unwrap();
+    fixture.assert_frontend(fixture.buffer(fixture.frontend), 3.0);
+    let expected = fixture.outputs();
+    let tape = fixture.tape();
+    let epoch = fixture.backend.shared.resource_epoch.load(Ordering::Acquire);
+
+    for (next_token, point) in [false, true].into_iter().flat_map(|next_token| {
+        [
+            RecordingCheckpoint::Setup,
+            RecordingCheckpoint::Op(1),
+            RecordingCheckpoint::Finalize,
+        ].map(|point| (next_token, point))
+    }) {
+        let next = VkDecodePlan::new_cpu(&fixture.graph, false, true);
+        let cancelled = AtomicBool::new(false);
+        {
+            let mut arena = fixture.backend.runtime_phase.lock().unwrap();
+            let RuntimePhaseArena { scratch, pool, .. } = &mut *arena;
+            let job = if next_token {
+                StageRecording::snapshot_next_token(
+                    &fixture.backend, &next, &bindings, scratch, pool, &[1],
+                )
+            } else {
+                StageRecording::snapshot(
+                    &fixture.backend, &next, &bindings, scratch, pool, None,
+                    &HashMap::new(), &next.prepared_prefix,
+                )
+            }
+            .unwrap()
+            .expect("real optional command preparation");
+            let _cancel = TestCancelAt::enter(point);
+            job.record(&fixture.backend, &cancelled).unwrap();
+        }
+        assert!(
+            cancelled.load(Ordering::Acquire),
+            "must reach {point:?}, next_token={next_token}"
+        );
+        assert!(next.prepared_prefix.lock().unwrap().is_none());
+        fixture.assert_frontend(fixture.buffer(fixture.frontend), 3.0);
+        assert_eq!(fixture.outputs(), expected, "unsubmitted work must not execute");
+        assert_eq!(fixture.tape(), tape);
+        assert_eq!(fixture.backend.shared.resource_epoch.load(Ordering::Acquire), epoch);
+        fixture.reset_frontend();
+        execute_static(&fixture.backend, &next, &bindings).unwrap();
+        fixture.assert_frontend(fixture.buffer(fixture.frontend), 3.0);
+        assert_close(&fixture.outputs(), &expected);
+    }
+
+    // Complete a real prefix before the stop signal; successful scope completion keeps it.
+    let next = VkDecodePlan::new_cpu(&fixture.graph, false, true);
+    let next_cancelled = AtomicBool::new(false);
+    let continuation_cancelled = AtomicBool::new(false);
+    {
+        let mut arena = fixture.backend.runtime_phase.lock().unwrap();
+        let RuntimePhaseArena { scratch, pool, .. } = &mut *arena;
+        let job = StageRecording::snapshot_next_token(
+            &fixture.backend, &next, &bindings, scratch, pool, &[1],
+        ).unwrap().expect("real completed prefix");
+        job.record(&fixture.backend, &next_cancelled).unwrap();
+    }
+    assert!(next.prepared_prefix.lock().unwrap().is_some());
+    command_prefix::test_finish_preparation_scope(
+        &next_cancelled, &continuation_cancelled, false, true,
+    );
+    assert!(next.prepared_prefix.lock().unwrap().is_some(), "ready packet survives stop");
+    fixture.reset_frontend();
+    execute_static(&fixture.backend, &next, &bindings).unwrap();
+    assert!(next.prepared_prefix.lock().unwrap().is_none(), "ready packet is consumed");
+    fixture.assert_frontend(fixture.buffer(fixture.frontend), 3.0);
+    assert_close(&fixture.outputs(), &expected);
+}
+
+#[test]
 #[ignore = "requires an idle Vulkan GPU; model-free 4 MiB expert pool"]
 fn gpu_resident_ahead_prepares_and_recovers_without_repeating_frontends() {
     for (submit_layers, producer) in [(1, false), (1, true), (2, false), (2, true)] {
@@ -1285,6 +1404,243 @@ fn gpu_owned_sparse_notice_cpu_service_at_first_middle_last() {
 }
 
 #[test]
+#[ignore = "parent serial GPU; source-certified pre-lowering horizon versus legacy 16-layer packet"]
+fn gpu_prepared_source_certificate_horizon_preserves_execution_and_recovery() {
+    const WINDOW: usize = 16;
+    for cadence in [1, 2] {
+        // WINDOW means an unmapped bank exists outside the recorded graph: this owner
+        // is mixed, but its wholly mapped 16-layer prefix must NOT be shortened.
+        for cpu_layer in [None, Some(0), Some(7), Some(15), Some(WINDOW)] {
+            let mut fixture = Fixture::new_with_preparation_budget(
+                cadence,
+                true,
+                Some(true),
+                0,
+                0,
+                false,
+                WINDOW,
+            );
+            // Exercise the same host-grid cutoff both with and without pure-run grouping.
+            Arc::make_mut(&mut fixture.backend.cfg)
+                .kernels
+                .vulkan
+                .decode_gpu_resident_pure_mapped_layers = if cadence == 2 { 4 } else { 0 };
+            let frontend = fixture.graph.ops[0].clone();
+            let mapped_moe = fixture.graph.ops[1].clone();
+            let cpu_moe = fixture.graph.ops[3].clone();
+            let Op::MoeFfn { x: input, .. } = mapped_moe.clone() else {
+                unreachable!()
+            };
+            let mut outputs = Vec::new();
+            fixture.graph.ops.clear();
+            for layer in 0..WINDOW {
+                let output = fixture.graph.output(TensorDesc::new([1, NE], DType::F32));
+                fixture.buffers.push((
+                    output,
+                    fixture
+                        .backend
+                        .alloc(NE * 4, BufferUsage::Readback)
+                        .unwrap(),
+                ));
+                let mut moe = if cpu_layer == Some(layer) {
+                    cpu_moe.clone()
+                } else {
+                    mapped_moe.clone()
+                };
+                if let Op::MoeFfn { x, dst, .. } = &mut moe {
+                    *x = input;
+                    *dst = output;
+                }
+                fixture.graph.push(frontend.clone());
+                fixture.graph.push(moe);
+                outputs.push(output);
+            }
+            let make_plan = || {
+                let mut plan = VkDecodePlan::new_cpu(&fixture.graph, false, true);
+                plan.phase_requests = Some(
+                    stages::compiled_workspace_requests(&fixture.backend, &fixture.graph).unwrap(),
+                );
+                plan
+            };
+            let current = make_plan();
+            fixture.preload();
+            fixture.reset_frontend();
+            execute_static(&fixture.backend, &current, &fixture.bindings()).unwrap();
+            let read_outputs = || {
+                outputs
+                    .iter()
+                    .map(|&id| fixture.read(fixture.buffer(id)))
+                    .collect::<Vec<_>>()
+            };
+            let expected = read_outputs();
+            assert!(expected
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite() && *value > 0.0));
+
+            // Keep the exact imported-source leases, changing only one bank's GPU-readable
+            // certificate. Residency initially remains all-hit; a later trial forces status 5.
+            let (sources, seed) = {
+                let mut guard = fixture.backend.moe_pager().lock().unwrap();
+                let session = guard.as_mut().unwrap();
+                let previous = session.gpu_decode_owner.clone().unwrap();
+                session.handoff_gpu_decode(&fixture.backend).unwrap();
+                let params = previous.role_params(session, &fixture.roles[1]).unwrap();
+                let mut sources = session.gpu_copy_sources().unwrap().unwrap();
+                if cpu_layer.is_some() {
+                    for base in &params[..3] {
+                        sources.test_cpu_only_source(*base as usize + ROUTED[1] as usize);
+                    }
+                }
+                session.gpu_decode_owner = None;
+                (sources, crate::pager::owned_seed(session, 0).unwrap())
+            };
+            let owner = crate::pager::GpuCopyBuffers::new_owned(
+                &fixture.backend, sources, WINDOW, seed,
+            ).unwrap().unwrap();
+            assert_eq!(owner.owned_self_service(), cpu_layer.is_none());
+            fixture.backend.moe_pager().lock().unwrap().as_mut().unwrap().gpu_decode_owner = Some(owner.clone());
+            fixture
+                .backend
+                .runtime_phase
+                .lock()
+                .unwrap()
+                .resident_buffers
+                .as_mut()
+                .unwrap()
+                .gpu_copy = Some(owner.clone());
+            let mut legacy_parts = Vec::new();
+            for enabled in [false, true] {
+                let _horizon = command_prefix::source_horizon_scope(&fixture.backend, enabled);
+                for miss in [false, true] {
+                    if miss && cpu_layer.is_none_or(|layer| layer >= WINDOW) {
+                        continue;
+                    }
+                    fixture.preload();
+                    fixture.reset_frontend();
+                    let next = make_plan();
+                    execute_static_next(
+                        &fixture.backend,
+                        &current,
+                        &fixture.bindings(),
+                        Some((&next, &fixture.bindings(), &[1])),
+                    )
+                    .unwrap();
+                    let layers = if enabled {
+                        cpu_layer.map_or(WINDOW, |layer| {
+                            ((layer + 1).div_ceil(cadence) * cadence).min(WINDOW)
+                        })
+                    } else {
+                        WINDOW
+                    };
+                    {
+                        let packet = next.prepared_prefix.lock().unwrap();
+                        let packet = packet.as_ref().expect("actual isolated-worker preparation");
+                        assert_eq!(
+                            packet.resident_layers(),
+                            layers,
+                            "must shorten RECORDING, not submission only"
+                        );
+                        assert_eq!(packet.end, layers * 2);
+                        let parts = packet.coalesced_test_parts();
+                        if !enabled {
+                            legacy_parts = parts;
+                        } else {
+                            assert_eq!(
+                                parts,
+                                legacy_parts
+                                    .iter()
+                                    .copied()
+                                    .take_while(|&end| end <= layers)
+                                    .collect::<Vec<_>>(),
+                                "retained groups keep their original boundaries"
+                            );
+                        }
+                    }
+                    let epoch = fixture
+                        .backend
+                        .shared
+                        .resource_epoch
+                        .load(Ordering::Acquire);
+                    let tape = fixture.tape();
+                    {
+                        let arena = fixture.backend.runtime_phase.lock().unwrap();
+                        assert_eq!(arena.resident_buffers.as_ref().unwrap().capacity, WINDOW);
+                    }
+                    assert_eq!(
+                        fixture
+                            .backend
+                            .cfg()
+                            .kernels
+                            .vulkan
+                            .decode_gpu_resident_submit_layers,
+                        cadence
+                    );
+                    assert_eq!(
+                        fixture
+                            .backend
+                            .cfg()
+                            .kernels
+                            .vulkan
+                            .decode_gpu_resident_inflight,
+                        1
+                    );
+                    if miss {
+                        let mut guard = fixture.backend.moe_pager().lock().unwrap();
+                        let session = guard.as_mut().unwrap();
+                        session.handoff_gpu_decode(&fixture.backend).unwrap();
+                        session.discard_cpu_miss(fixture.roles[1], &[ROUTED[1]]);
+                        assert_ne!(
+                            session
+                                .routed_roles_resident_mask(&fixture.roles[1], &ROUTED)
+                                .unwrap(),
+                            HIT_MASK
+                        );
+                    }
+                    fixture.reset_frontend();
+                    let accepted = command_prefix::test_accepted_prefixes();
+                    execute_static(&fixture.backend, &next, &fixture.bindings()).unwrap();
+                    assert_eq!(
+                        command_prefix::test_accepted_prefixes(),
+                        accepted + 1,
+                        "must execute the prepared path, not silently fall back"
+                    );
+                    assert!(next.prepared_prefix.lock().unwrap().is_none());
+                    fixture.assert_frontend(fixture.buffer(fixture.frontend), WINDOW as f32);
+                    assert_eq!(read_outputs(), expected);
+                    assert_eq!(
+                        fixture
+                            .backend
+                            .shared
+                            .resource_epoch
+                            .load(Ordering::Acquire),
+                        epoch
+                    );
+                    // All-hit replay preserves the same initialized LUT windows. Recovery may
+                    // legally reuse coordinates, but must retire every owner/notice lease.
+                    if !miss {
+                        assert_eq!(fixture.tape(), tape);
+                    }
+                    let mut guard = fixture.backend.moe_pager().lock().unwrap();
+                    let session = guard.as_mut().unwrap();
+                    assert!(Arc::ptr_eq(
+                        session.gpu_decode_owner.as_ref().unwrap(),
+                        &owner
+                    ));
+                    session.handoff_gpu_decode(&fixture.backend).unwrap();
+                    for roles in &fixture.roles {
+                        assert_eq!(
+                            session.routed_roles_resident_mask(roles, &ROUTED).unwrap(),
+                            HIT_MASK
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 #[ignore = "central GPU runner only; staged owned workspace and failed callback lifetime"]
 fn gpu_staged_callback_failure_drains_without_replaying_prefix() {
     use infr_core::backend::ExecutionStage;
@@ -1424,6 +1780,7 @@ fn resident_notice_trace_preserves_shape_and_marks_compact_payload_absent() {
                     assert_eq!(trace.ordinal, 13);
                     assert_eq!(trace.count, rows * used);
                     assert_eq!(trace.context.lanes, rows);
+                    assert_eq!(trace.hit_masks.len(), infr_core::backend::MAX_DECODE_ROWS);
                     let payload = !compact || !matches!(status, 0 | 1 | 4);
                     assert_eq!(trace.route_payload_present, payload);
                     if payload {
@@ -1431,12 +1788,16 @@ fn resident_notice_trace_preserves_shape_and_marks_compact_payload_absent() {
                         assert_eq!(
                             trace.hit_masks,
                             std::array::from_fn(|i| {
-                                words[crate::recorder::RESIDENT_JOURNAL_MASK_WORD + i]
+                                if i < rows {
+                                    words[crate::recorder::RESIDENT_JOURNAL_MASK_WORD + i]
+                                } else {
+                                    0
+                                }
                             })
                         );
                     } else {
                         assert!(trace.routed_ids.is_empty());
-                        assert_eq!(trace.hit_masks, [0; 4]);
+                        assert_eq!(trace.hit_masks, [0; infr_core::backend::MAX_DECODE_ROWS]);
                     }
                 }
             }

@@ -708,3 +708,6 @@ fn gpu_owned_upload_empty_tail_fix_preserves_normal_transfer() {
     drop(chunk);
     be.runtime_phase.lock().unwrap().resident_buffers = retained;
 }
+
+#[path = "adapter_host_ready_combined_tests.rs"]
+mod host_ready_combined_tests;

@@ -89,7 +89,7 @@ fn gpu_copy_overlap_publishes_only_current_indirect_args_range() {
 }
 
 #[test]
-fn gpu_copy_overlap_verify_is_single_lane_bounded_and_pair_exclusive() {
+fn gpu_copy_overlap_excludes_verify_and_keeps_pair_exclusive() {
     for requested in [false, true] {
         for verify in [false, true] {
             for rows in 0..=infr_core::backend::MAX_DECODE_ROWS + 1 {
@@ -98,7 +98,7 @@ fn gpu_copy_overlap_verify_is_single_lane_bounded_and_pair_exclusive() {
                         for immutable in [false, true] {
                             for predicate in [false, true] {
                                 for indirect in [false, true] {
-                                    let shape = !verify || (!independent && matches!(rows, 2..=4));
+                                    let shape = !verify;
                                     assert_eq!(
                                         gpu_copy_overlap_eligible(
                                             requested, verify, rows, independent, pair,
@@ -122,7 +122,7 @@ fn decode_mtp_isolation_overlap_eligibility_cpu() {
     for verify in [false, true] {
         for rows in 1..=infr_core::backend::MAX_DECODE_ROWS {
             for independent in [false, true] {
-                let ordinary_shape = !verify || (!independent && matches!(rows, 2..=4));
+                let ordinary_shape = !verify;
                 assert_eq!(
                     gpu_copy_overlap_eligible(
                         true, verify, rows, independent, false, true, true, false, false,

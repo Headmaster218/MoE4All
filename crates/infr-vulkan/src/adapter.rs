@@ -41,6 +41,8 @@ mod pair_admission;
 #[path = "adapter_resident_ahead_tests.rs"]
 mod resident_ahead_tests;
 #[cfg(test)]
+pub(crate) use resident_ahead_tests::promotion_isolation_tests::note as promotion_isolation_note;
+#[cfg(test)]
 #[path = "adapter_serial_copy_recovery_tests.rs"]
 mod serial_copy_recovery_tests;
 #[cfg(test)]
@@ -12062,6 +12064,8 @@ fn activate_decode_prefix(
                 chunk.submitted_entries = prepared_layers;
             }
             early_prefix = Some(pending);
+            #[cfg(test)]
+            promotion_isolation_note(be_, "early_submit");
             early_submit_us = Some(execute_started.elapsed().as_micros());
         }
     }
@@ -12425,6 +12429,7 @@ fn execute_static_walk(
         })
         .flatten();
     let preparation_cancelled = AtomicBool::new(false);
+    let continuation_cancelled = AtomicBool::new(false);
     // Starts only after the caller has finished its scope body. The interval ends when
     // Rayon has joined all spawned preparations, including their resource destructors.
     let mut preparation_join = None;
@@ -12443,7 +12448,7 @@ fn execute_static_walk(
                                     let preparation_start_us =
                                         execute_started.elapsed().as_micros();
                                     let recording_started = std::time::Instant::now();
-                                    match command_prefix::record(
+                                    match command_prefix::record_cancellable(
                                         be_,
                                         next,
                                         scratch,
@@ -12451,8 +12456,9 @@ fn execute_static_walk(
                                         positions,
                                         snapshot,
                                         resident_snapshot,
+                                        cancelled,
                                     ) {
-                                        Ok(prefix) => {
+                                        Ok(Some(prefix)) => {
                                             if cancelled.load(Ordering::Acquire) {
                                                 return;
                                             }
@@ -12473,6 +12479,7 @@ fn execute_static_walk(
                                                 );
                                             }
                                         }
+                                        Ok(None) => (),
                                         Err(error) => {
                                             static REPORTED: std::sync::Once =
                                                 std::sync::Once::new();
@@ -12496,11 +12503,17 @@ fn execute_static_walk(
             let mut preparation = command_prefix::DeferredPreparation::new(preparation);
             let mut continuation =
                 command_prefix::DeferredPreparation::new((!continuations.is_empty()).then(|| {
-                    let cancelled = &preparation_cancelled;
+                    let next_cancelled = &preparation_cancelled;
+                    let current_cancelled = &continuation_cancelled;
                     let context = infr_core::timeline::context();
                     move || {
                         let _context = infr_core::timeline::scoped_context(context);
                         for job in continuations {
+                            let cancelled = if job.is_next_token() {
+                                next_cancelled
+                            } else {
+                                current_cancelled
+                            };
                             let _span =
                                 infr_core::timeline::background_span(if job.is_next_token() {
                                     "staged_next_command_prepare"
@@ -13151,6 +13164,10 @@ fn execute_static_walk(
                                     submitted_dispatches += pending.dispatches();
                                     // Keep submitted GPU work leased even if later host bookkeeping fails.
                                     segments.push_back(pending);
+                                    #[cfg(test)]
+                                    if crate::host_ready_combined_test_support::after_queued(&be_.shared) {
+                                        return Err(Error::Aborted);
+                                    }
                                     // Before any new notice reader or mutable epoch bookkeeping:
                                     // the old producer, copy and event reset must be fully retired.
                                     pstream.finish_host_ready()?;
@@ -13425,10 +13442,12 @@ fn execute_static_walk(
                     }
                     Ok(())
                 }));
-            // Started recorders join before compaction; unstarted preparation simply drops on errors.
-            if !matches!(&result, Ok(Ok(()))) {
-                preparation_cancelled.store(true, Ordering::Release);
-            }
+            // Successful NEXT/following-stage packets remain useful. Cancel only failed work.
+            command_prefix::finish_preparation_scope(
+                &preparation_cancelled,
+                &continuation_cancelled,
+                !matches!(&result, Ok(Ok(()))),
+            );
             {
                 let _span = infr_core::timeline::span("decode_scope_recorder_drop");
                 drop(rec.take());
@@ -13602,6 +13621,7 @@ struct OwnedUploadCompletion<E: OwnedUploadWait = crate::transfer::BackgroundTra
     completed: Option<std::sync::mpsc::Receiver<Result<Option<u64>>>>,
     pending_dma: Option<u64>,
     host_ready_eligible: bool,
+    producer_drained: bool,
 }
 
 impl<E: OwnedUploadWait> OwnedUploadCompletion<E> {
@@ -13611,7 +13631,19 @@ impl<E: OwnedUploadWait> OwnedUploadCompletion<E> {
             completed: Some(completed),
             pending_dma: None,
             host_ready_eligible: false,
+            producer_drained: false,
         }
+    }
+
+    /// Only for a producer which waits its DMA and retires its leases before sending success.
+    /// The returned value still supplies the GPU semaphore memory dependency.
+    fn new_producer_drained(
+        executor: E,
+        completed: std::sync::mpsc::Receiver<Result<Option<u64>>>,
+    ) -> Self {
+        let mut completion = Self::new(executor, completed);
+        completion.producer_drained = true;
+        completion
     }
 
     fn with_host_ready(mut self, eligible: bool) -> Self {
@@ -13621,9 +13653,13 @@ impl<E: OwnedUploadWait> OwnedUploadCompletion<E> {
 
     fn wait(&mut self) -> Result<Option<u64>> {
         if let Some(completed) = self.completed.take() {
-            self.pending_dma = completed
+            let value = completed
                 .recv()
                 .map_err(|_| be("owned upload producer disconnected before completion"))??;
+            if self.producer_drained {
+                return Ok(value);
+            }
+            self.pending_dma = value;
         }
         let value = self.pending_dma;
         if let Some(value) = value {
@@ -13634,6 +13670,25 @@ impl<E: OwnedUploadWait> OwnedUploadCompletion<E> {
         Ok(value)
     }
 }
+
+fn drain_owned_upload<E: OwnedUploadWait, L>(
+    executor: &E,
+    value: Option<u64>,
+    leases: L,
+) -> Result<Option<u64>> {
+    if let Some(value) = value {
+        executor.wait_upload(value)?;
+    }
+    drop(leases);
+    Ok(value)
+}
+
+#[path = "adapter_owned_upload_worker.rs"]
+mod owned_upload_worker;
+
+#[cfg(test)]
+#[path = "adapter_owned_upload_cpu_tests.rs"]
+mod owned_upload_cpu_tests;
 
 impl<E: OwnedUploadWait> Drop for OwnedUploadCompletion<E> {
     fn drop(&mut self) {
@@ -14446,8 +14501,26 @@ struct ResidentNoticeProducer {
     pager: Arc<crate::pager::MoePagerCell>,
 }
 
+fn resident_host_ready_worker<T>(
+    requested: bool,
+    mtp_enabled: bool,
+    owned_copy_requested: bool,
+    create: impl FnOnce() -> Result<T>,
+) -> Option<T> {
+    if !requested || mtp_enabled || !owned_copy_requested {
+        return None;
+    }
+    match create() {
+        Ok(worker) => Some(worker),
+        Err(error) => {
+            tracing::warn!(%error, "host-ready worker unavailable; retaining ordinary completion gate");
+            None
+        }
+    }
+}
+
 impl ResidentNoticeProducer {
-    fn new(be_: &VulkanBackend) -> Result<Option<Self>> {
+    fn new(be_: &VulkanBackend, owned_copy_requested: bool) -> Result<Option<Self>> {
         let Some(executor) = be_.background_expert_transfer_executor() else {
             return Ok(None);
         };
@@ -14457,15 +14530,40 @@ impl ResidentNoticeProducer {
         let (output, results) = std::sync::mpsc::channel();
         let announced_miss = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
         let worker_miss = Arc::clone(&announced_miss);
-        let host_ready_enabled = be_.cfg().kernels.vulkan.decode_gpu_resident_host_ready;
-        let host_ready = host_ready_enabled
-            .then(|| crate::host_ready::HostReadyWorker::new(be_))
-            .transpose()?;
+        let host_ready = resident_host_ready_worker(
+            be_.cfg().kernels.vulkan.decode_gpu_resident_host_ready,
+            be_.cfg().spec.mtp,
+            owned_copy_requested,
+            || {
+                #[cfg(test)]
+                promotion_isolation_note(be_, "host_ready_create");
+                let worker = crate::host_ready::HostReadyWorker::new(be_);
+                #[cfg(test)]
+                if worker.is_ok() {
+                    promotion_isolation_note(be_, "host_ready_created");
+                }
+                worker
+            },
+        );
+        let host_ready_enabled = host_ready.is_some();
+        // This producer is retained by ResidentBuffers, not recreated per token.
+        // MTP/legacy paths keep their existing thread and ACK resource behavior.
+        let mut upload_worker = owned_upload_worker::OwnedUploadWorker::optional(
+            owned_copy_requested
+                && !be_.cfg().spec.mtp
+                && be_.cfg().kernels.vulkan.decode_gpu_resident_upload_worker,
+            || owned_upload_worker::OwnedUploadWorker::new(executor.clone()),
+        );
         let thread = std::thread::Builder::new()
             .name("resident-notice-producer".into())
             .spawn(move || {
                 while let Ok(job) = jobs.recv() {
-                    let _ack = NoticeProducerAck(job.done);
+                    let (inline_ack, shared_ack) = if upload_worker.is_some() {
+                        (None, Some(Arc::new(NoticeProducerAck(job.done))))
+                    } else {
+                        (Some(NoticeProducerAck(job.done)), None)
+                    };
+                    let _ack = inline_ack;
                     let job_executor = executor
                         .clone()
                         .with_mapped_serial_max_bytes(job.mapped_serial_max_bytes);
@@ -14483,6 +14581,8 @@ impl ResidentNoticeProducer {
                             job.gpu_copy.as_ref(),
                             &output,
                             host_ready_enabled,
+                            upload_worker.as_mut(),
+                            shared_ack.as_ref(),
                         );
                         match notice {
                             Ok(None) => (), // Started already delivered this ordinal; completion has its own gate.
@@ -14525,6 +14625,10 @@ impl ResidentNoticeProducer {
         gpu_copy: Option<&Arc<crate::pager::GpuCopyBuffers>>,
         started_output: &std::sync::mpsc::Sender<(usize, Result<ProducedNotice>)>,
         host_ready_enabled: bool,
+        mut upload_worker: Option<
+            &mut owned_upload_worker::OwnedUploadWorker<crate::transfer::BackgroundTransferExecutor>,
+        >,
+        acknowledgement: Option<&Arc<NoticeProducerAck>>,
     ) -> Result<Option<ProducedNotice>> {
         let _produce = ResidentProducerTrace::begin("resident_producer_total", trace_context);
         #[cfg(test)]
@@ -14565,6 +14669,11 @@ impl ResidentNoticeProducer {
             resident_notice_words(journal, ordinal)?
         };
         drop(journal_read);
+        if let Some(worker) = upload_worker.as_mut() {
+            // Only old SKIP observations overlap upload. Restore the original
+            // serial pager/admission order before any following non-SKIP notice.
+            worker.before_notice(words[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD])?;
+        }
         let trace_context = if let Some(mut context) = trace_context {
             if infr_core::timeline::device_enabled() {
                 context.layer = pager
@@ -14642,7 +14751,7 @@ impl ResidentNoticeProducer {
                 drop(guard);
                 notice.words[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD] = 2;
                 notice.owned_cpu = true;
-                let (_, _, misses) = resident_notice_slots(&notice.words, entry.layout)?;
+                let misses = resident_notice_misses(&notice.words, entry.layout)?;
                 if plan.record_while_uploading() {
                     let pure_cpu = host_ready_enabled && plan.host_ready_eligible();
                     let (completed, completion) = std::sync::mpsc::channel();
@@ -14655,8 +14764,11 @@ impl ResidentNoticeProducer {
                             sources: Vec::new(),
                             started: true,
                             pending: Some(CpuPromotionPending::OwnedUpload(
-                                OwnedUploadCompletion::new(executor.clone(), completion)
-                                    .with_host_ready(pure_cpu),
+                                OwnedUploadCompletion::new_producer_drained(
+                                    executor.clone(),
+                                    completion,
+                                )
+                                .with_host_ready(pure_cpu),
                             )),
                         }),
                         abort: None,
@@ -14675,6 +14787,29 @@ impl ResidentNoticeProducer {
                     }
                     // The plan owns every source/target. No pager/runtime lock spans copying,
                     // so the main thread can retire hits and encode the existing recovery walk.
+                    if let Some(worker) = upload_worker {
+                        let serial_max_bytes =
+                            crate::transfer::TransferExecutor::mapped_serial_max_bytes(executor);
+                        worker.schedule(
+                            executor,
+                            move |executor| {
+                                let executor = executor
+                                    .clone()
+                                    .with_mapped_serial_max_bytes(serial_max_bytes);
+                                if pure_cpu {
+                                    plan.execute_mapped_cpu(serial_max_bytes)?;
+                                    return Ok(None);
+                                }
+                                let (push, leases) = plan.execute(&executor)?;
+                                let transfer_value = push.submit_background(&executor)?;
+                                drain_owned_upload(&executor, transfer_value, leases)
+                            },
+                            completed,
+                            Arc::clone(acknowledgement.expect("upload worker has a shared job ACK")),
+                            trace_context,
+                        );
+                        return Ok(None); // Started owns the sole result for this ordinal.
+                    }
                     let result = (|| {
                         if pure_cpu {
                             plan.execute_mapped_cpu(
@@ -14686,11 +14821,7 @@ impl ResidentNoticeProducer {
                         }
                         let (push, leases) = plan.execute(executor)?;
                         let transfer_value = push.submit_background(executor)?;
-                        if let Some(value) = transfer_value {
-                            executor.wait(value)?;
-                        }
-                        drop(leases);
-                        Ok(transfer_value)
+                        drain_owned_upload(executor, transfer_value, leases)
                     })();
                     let _complete =
                         infr_core::timeline::background_span("resident_owned_upload_completed");
@@ -15362,6 +15493,37 @@ fn resident_notice_slots(
     words: &[u32; crate::recorder::RESIDENT_JOURNAL_WORDS],
     layout: ResidentMoeLayout,
 ) -> Result<(Vec<u32>, Vec<u32>, Vec<u32>)> {
+    let (ids, masks) = validated_resident_notice_routes(words, layout)?;
+    let mut hits = Vec::new();
+    let mut misses = Vec::new();
+    for (slot, &id) in ids.iter().enumerate() {
+        if masks[slot / layout.n_used] & (1 << (slot % layout.n_used)) != 0 {
+            hits.push(id);
+        } else {
+            misses.push(id);
+        }
+    }
+    Ok((masks.to_vec(), hits, misses))
+}
+
+fn resident_notice_misses(
+    words: &[u32; crate::recorder::RESIDENT_JOURNAL_WORDS],
+    layout: ResidentMoeLayout,
+) -> Result<Vec<u32>> {
+    let (ids, masks) = validated_resident_notice_routes(words, layout)?;
+    let mut misses = Vec::with_capacity(ids.len());
+    for (slot, &id) in ids.iter().enumerate() {
+        if masks[slot / layout.n_used] & (1 << (slot % layout.n_used)) == 0 {
+            misses.push(id);
+        }
+    }
+    Ok(misses)
+}
+
+fn validated_resident_notice_routes(
+    words: &[u32; crate::recorder::RESIDENT_JOURNAL_WORDS],
+    layout: ResidentMoeLayout,
+) -> Result<(&[u32], &[u32])> {
     let count = layout.count();
     if layout.rows == 0
         || layout.rows > crate::recorder::RESIDENT_JOURNAL_MASK_WORDS
@@ -15372,9 +15534,8 @@ fn resident_notice_slots(
     {
         return Err(be("invalid resident miss notice shape/status"));
     }
-    let masks = words[crate::recorder::RESIDENT_JOURNAL_MASK_WORD
-        ..crate::recorder::RESIDENT_JOURNAL_MASK_WORD + layout.rows]
-        .to_vec();
+    let masks = &words[crate::recorder::RESIDENT_JOURNAL_MASK_WORD
+        ..crate::recorder::RESIDENT_JOURNAL_MASK_WORD + layout.rows];
     let valid_mask = (1u32 << layout.n_used) - 1;
     if masks.iter().any(|&mask| mask & !valid_mask != 0)
         || words[..count]
@@ -15383,19 +15544,10 @@ fn resident_notice_slots(
     {
         return Err(be("invalid resident miss notice mask/id"));
     }
-    let mut hits = Vec::new();
-    let mut misses = Vec::new();
-    for (slot, &id) in words[..count].iter().enumerate() {
-        if masks[slot / layout.n_used] & (1 << (slot % layout.n_used)) != 0 {
-            hits.push(id);
-        } else {
-            misses.push(id);
-        }
-    }
-    if misses.is_empty() {
+    if masks.iter().all(|&mask| mask == valid_mask) {
         return Err(be("resident miss notice contains only hits"));
     }
-    Ok((masks, hits, misses))
+    Ok((&words[..count], masks))
 }
 
 fn owned_recovery_scratch_ready(
@@ -15806,7 +15958,7 @@ impl ResidentChunk {
                 producer: if cfg.decode_gpu_resident_notice_thread
                     && cfg.decode_gpu_resident_hit_first
                 {
-                    ResidentNoticeProducer::new(be_)?.map(Arc::new)
+                    ResidentNoticeProducer::new(be_, ordinary_owner && copy_requested)?.map(Arc::new)
                 } else {
                     None
                 },

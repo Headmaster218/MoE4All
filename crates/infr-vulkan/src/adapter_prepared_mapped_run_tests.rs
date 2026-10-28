@@ -141,6 +141,8 @@ fn prepared_case(host_boundary: bool) -> (Fixture, VkDecodePlan, Vec<(TensorId, 
         })
         .collect();
     install_mixed_owner(&fixture);
+    // This regression deliberately needs the full queued suffix, not a shorter candidate.
+    let _legacy_horizon = command_prefix::source_horizon_scope(&fixture.backend, false);
     let next = VkDecodePlan::new_cpu(&fixture.graph, false, true);
     fixture.reset_frontend();
     {

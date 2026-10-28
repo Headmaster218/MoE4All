@@ -222,16 +222,41 @@ pub(crate) struct OwnedUploadPlan {
     )>,
     requested: usize,
     bytes: usize,
+    class: OwnedUploadClass,
+}
+
+struct OwnedUploadClass {
+    mapped: bool,
+    no_imported_sources: std::sync::OnceLock<bool>,
+}
+
+impl OwnedUploadClass {
+    fn from_targets(has_bounded_sources: bool, targets: impl Iterator<Item = bool>) -> Self {
+        let mut targets = targets.peekable();
+        Self {
+            mapped: !has_bounded_sources && targets.peek().is_some() && targets.all(|mapped| mapped),
+            no_imported_sources: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn host_ready_eligible(&self, no_imported_sources: impl FnOnce() -> bool) -> bool {
+        self.mapped && *self.no_imported_sources.get_or_init(no_imported_sources)
+    }
 }
 
 impl OwnedUploadPlan {
     pub(crate) fn host_ready_eligible(&self) -> bool {
-        self.record_while_uploading()
-            && self.uploads.iter().all(|(source, offset, target)| {
+        // This cache belongs only to this plan's retained source/target ranges. Target mappings
+        // never change; SessionTransferPlan can only shed imports, never add them. Therefore a
+        // cached non-imported batch stays non-imported, while false remains conservative.
+        // Classification is lazy so no import lock is acquired under plan_owned_upload's pager lock.
+        self.class.host_ready_eligible(|| {
+            self.uploads.iter().all(|(source, offset, target)| {
                 !self
                     .transfer_plan
                     .contains_imported_upload(unsafe { source.slice(*offset, target.len()) })
             })
+        })
     }
 
     pub(crate) fn execute_mapped_cpu(self, serial_max_bytes: usize) -> Result<()> {
@@ -247,12 +272,7 @@ impl OwnedUploadPlan {
     }
 
     pub(crate) fn record_while_uploading(&self) -> bool {
-        self.bounded.is_empty()
-            && !self.uploads.is_empty()
-            && self
-                .uploads
-                .iter()
-                .all(|(_, _, target)| target.mapped_ptr().is_some())
+        self.class.mapped
     }
 
     pub(crate) fn execute<E: TransferExecutor>(
@@ -1138,12 +1158,12 @@ impl super::gpu_copy::GpuCopyBuffers {
             .zip(state.slot_counts.last())
             .and_then(|(&start, &count)| start.checked_add(count))
             .ok_or_else(|| be("invalid GPU owner upload pool geometry"))?;
-        let mut uploads = Vec::new();
+        let mut uploads = Vec::with_capacity(count);
         let mut bounded = BTreeMap::<usize, Vec<(BlockId, DeviceTransferTarget)>>::new();
         let mut bytes = 0usize;
         let mut requested = 0;
-        let mut seen = HashSet::new();
-        let mut destinations = HashSet::new();
+        let mut seen = HashSet::with_capacity(count);
+        let mut destinations = HashSet::with_capacity(count);
         for job in jobs.chunks_exact(8) {
             let block = job[5];
             let g = job[6] as usize;
@@ -1230,6 +1250,12 @@ impl super::gpu_copy::GpuCopyBuffers {
         if requested == 0 {
             return Err(be("GPU requested CPU service without an unmapped expert"));
         }
+        let class = OwnedUploadClass::from_targets(
+            !bounded.is_empty(),
+            uploads
+                .iter()
+                .map(|(_, _, target)| target.mapped_ptr().is_some()),
+        );
         let bounded = bounded
             .into_iter()
             .map(|(pool, jobs)| (Arc::clone(session.pools[pool].host.as_ref().unwrap()), jobs))
@@ -1240,9 +1266,14 @@ impl super::gpu_copy::GpuCopyBuffers {
             bounded,
             requested,
             bytes,
+            class,
         })
     }
 }
+
+#[cfg(test)]
+#[path = "pager_owned_upload_cpu_tests.rs"]
+mod owned_upload_cpu_tests;
 
 #[cfg(test)]
 mod geometry_tests {

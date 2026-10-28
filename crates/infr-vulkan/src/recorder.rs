@@ -1512,8 +1512,8 @@ impl IndependentDispatchBatch {
 fn gpu_copy_overlap_eligible(
     requested: bool,
     verify: bool,
-    rows: usize,
-    independent_rows: bool,
+    _rows: usize,
+    _independent_rows: bool,
     pair_enabled: bool,
     immutable: bool,
     miss_predicate: bool,
@@ -1522,7 +1522,8 @@ fn gpu_copy_overlap_eligible(
 ) -> bool {
     requested
         && !mtp_enabled
-        && (!verify || (!independent_rows && (2..=4).contains(&rows)))
+        // Lookup and MTP Verify keep the existing serial-copy schedule.
+        && !verify
         && !pair_enabled
         && immutable
         && miss_predicate
@@ -2109,7 +2110,7 @@ impl<'a> Recorder<'a> {
             &commands[1..]
         };
         let host_ready = self.host_ready_wait.borrow();
-        self.be.shared.queue_submit_commands_host_ready_recovering(
+        let result = self.be.shared.queue_submit_commands_host_ready_recovering(
             batch,
             fence,
             Some(dispatches),
@@ -2118,7 +2119,14 @@ impl<'a> Recorder<'a> {
             host_ready
                 .as_ref()
                 .map(|wait| (wait.timeline.semaphore, wait.value)),
-        )
+        );
+        #[cfg(test)]
+        if result.is_ok() {
+            crate::host_ready_combined_test_support::submitted(
+                &self.be.shared, host_ready.as_ref(), fence,
+            );
+        }
+        result
     }
 
     pub(crate) fn wait_for_host_ready(&self, wait: crate::host_ready::HostReadyWait) -> Result<()> {
@@ -13895,6 +13903,8 @@ impl<'a> Recorder<'a> {
         pair: Option<&crate::adapter::verify_pair::Layer>,
         topk: Option<owned_topk::OwnedTopkRoute>,
     ) {
+        #[cfg(test)]
+        crate::adapter::promotion_isolation_note(self.be, "serial");
         assert!(!self.conditional_active.get());
         let owned = copy.is_owned();
         #[cfg(test)]
@@ -14597,6 +14607,8 @@ impl<'a> Recorder<'a> {
         notice: vk::Event,
         topk: Option<owned_topk::OwnedTopkRoute>,
     ) {
+        #[cfg(test)]
+        crate::adapter::promotion_isolation_note(self.be, "overlap");
         assert!(!self.conditional_active.get());
         let owned = copy.is_owned();
         assert!(owned || topk.is_none());

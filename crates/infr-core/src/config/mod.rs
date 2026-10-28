@@ -458,6 +458,9 @@ cfg_struct! {
         /// Submit guarded ordinary-Decode recovery while a certified CPU-only upload completes.
         /// Experimental: the independent host timeline also retires the old notice epoch.
         decode_gpu_resident_host_ready: bool = false,
+        /// Reuse a bounded CPU upload helper so old SKIP/ACK observations can overlap uploads.
+        /// False retains inline upload on the notice producer; ownership/protocol are unchanged.
+        decode_gpu_resident_upload_worker: bool = true,
         /// Wait submitted resident fences on a dedicated host thread (driver scheduling A/B).
         decode_gpu_resident_waiter: bool = false,
         /// Give each checked layer immutable predicate words to avoid predicate read/write barriers.

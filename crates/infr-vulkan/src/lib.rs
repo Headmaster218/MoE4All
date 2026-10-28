@@ -31,6 +31,8 @@ pub mod tp;
 pub mod tp_allreduce;
 pub mod tp_sem;
 mod transfer;
+#[cfg(test)]
+mod host_ready_combined_test_support;
 pub mod unified;
 mod vkext;
 

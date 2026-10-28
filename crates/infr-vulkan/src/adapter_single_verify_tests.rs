@@ -1,16 +1,16 @@
 //! One-layer Verify admission, recovery and retained-controller reuse.
 use super::*;
 
-struct VerifyGraph {
-    graph: Graph,
+pub(super) struct VerifyGraph {
+    pub(super) graph: Graph,
     frontend: TensorId,
     trailing: TensorId,
-    buffers: Vec<(TensorId, Box<dyn Buffer>)>,
+    pub(super) buffers: Vec<(TensorId, Box<dyn Buffer>)>,
     expected: Vec<(TensorId, Vec<f32>)>,
 }
 
 impl VerifyGraph {
-    fn new(fixture: &Fixture, rows: usize, layers: usize) -> Self {
+    pub(super) fn new(fixture: &Fixture, rows: usize, layers: usize) -> Self {
         assert!((2..=4).contains(&rows));
         assert!((1..=LAYERS).contains(&layers));
         let mut graph = fixture.graph.clone();
@@ -94,7 +94,7 @@ impl VerifyGraph {
             .as_ref()
     }
 
-    fn run(&self, fixture: &Fixture, missing: bool) {
+    pub(super) fn run(&self, fixture: &Fixture, missing: bool) {
         let rows = self.graph.desc(self.frontend).numel() / NE;
         let layouts = resident_graph_layouts(&fixture.backend, &self.graph, true)
             .expect("Verify must admit the resident controller, including one MoE");

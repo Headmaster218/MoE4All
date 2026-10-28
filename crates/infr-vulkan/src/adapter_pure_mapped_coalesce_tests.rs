@@ -122,6 +122,8 @@ fn gpu_pure_mapped_coalesce_host_boundaries_and_prepared_recovery() {
         let mut pattern = [0; 9];
         pattern[host] = 1;
         let mut fixture = fixture(&pattern, true, false);
+        // Retain full prepared-suffix coverage even when the first host entry is L0.
+        let _legacy_horizon = command_prefix::source_horizon_scope(&fixture.backend, false);
         let current = plan(&fixture);
         install(&fixture, &current);
         prepare_case(&fixture, true);
@@ -129,7 +131,7 @@ fn gpu_pure_mapped_coalesce_host_boundaries_and_prepared_recovery() {
         let expected = fixture.outputs();
         let expected_lru = lru(&fixture);
         policy(&mut fixture, true);
-        // Produce a real next packet. Its horizon still comes only from the existing config.
+        // Produce a real legacy-horizon packet for the coalesced enqueue/recovery assertions.
         let next = plan(&fixture);
         prepare_case(&fixture, false);
         execute_static_next(
