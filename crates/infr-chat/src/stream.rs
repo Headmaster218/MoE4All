@@ -54,11 +54,22 @@ struct Cursor {
 
 impl Cursor {
     fn find(&mut self, raw: &str, needle: &str) -> Option<usize> {
-        if self.off.is_some() {
-            return self.off;
+        self.find_from(raw, needle, 0)
+    }
+
+    fn find_from(&mut self, raw: &str, needle: &str, region_start: usize) -> Option<usize> {
+        if let Some(off) = self.off {
+            if off >= region_start {
+                return Some(off);
+            }
+            self.scanned = region_start;
         }
-        let mut start = self.scanned.saturating_sub(needle.len().saturating_sub(1));
-        while start > 0 && !raw.is_char_boundary(start) {
+        self.off = None;
+        let mut start = self
+            .scanned
+            .saturating_sub(needle.len().saturating_sub(1))
+            .max(region_start);
+        while start > region_start && !raw.is_char_boundary(start) {
             start -= 1;
         }
         if let Some(p) = raw[start..].find(needle) {
@@ -92,7 +103,7 @@ impl ChatStream {
     pub fn finish(&mut self, on_delta: &mut dyn FnMut(Delta)) {
         self.emit(true, on_delta); // flush the held-back tails (no marker can still be forming)
         if self.allow_tools {
-            let (_r, body) = crate::split_think(&self.raw);
+            let (_r, body) = crate::split_reasoning(&self.raw);
             // Dialect-aware: hermes JSON + qwen3.5/3.6 XML + gemma pipe-marker + llama3 bare JSON
             // (hermes-only here silently dropped every non-qwen3 model's calls over serve).
             let (_content, calls) = crate::parse_any_tool_calls(&body);
@@ -117,8 +128,8 @@ impl ChatStream {
         }
         const TL: &str = "<tool_call>";
         const PIPE: &str = "<|tool_call>";
-        let hermes = self.cur_tool.find(&self.raw, TL).filter(|&p| p >= cs);
-        let pipe = self.cur_pipe.find(&self.raw, PIPE).filter(|&p| p >= cs);
+        let hermes = self.cur_tool.find_from(&self.raw, TL, cs);
+        let pipe = self.cur_pipe.find_from(&self.raw, PIPE, cs);
         let bare = self.bare_json_open(cs, final_flush);
         [hermes, pipe, bare].into_iter().flatten().min()
     }
@@ -150,12 +161,9 @@ impl ChatStream {
         // Channel-format head (E2B/gpt-oss: `<|channel>thought…<channel|>answer`): reasoning runs
         // from after the thought marker to the final-answer marker, content after it. While the
         // head could still be a forming marker, hold everything back.
-        const CT: [&str; 2] = ["<|channel|>thought", "<|channel>thought"];
+        use crate::tools::{channel_thought_start, CHANNEL_THOUGHT_MARKERS};
         const FINAL: &str = "<channel|>";
-        if let Some(hm) = CT
-            .iter()
-            .find_map(|m| self.raw.starts_with(m).then_some(m.len()))
-        {
+        if let Some(hm) = channel_thought_start(&self.raw) {
             let (r_end, hold, c_start) = match self.cur_final.find(&self.raw, FINAL) {
                 Some(f) => (f, false, Some(f + FINAL.len())),
                 None => (self.raw.len(), !final_flush, None),
@@ -180,11 +188,11 @@ impl ChatStream {
             return;
         }
         if !final_flush
-            && CT.iter().any(|m| {
+            && CHANNEL_THOUGHT_MARKERS.iter().any(|m| {
                 m.as_bytes()
                     .starts_with(&self.raw.as_bytes()[..self.raw.len().min(m.len())])
             })
-            && self.raw.len() < CT[0].len()
+            && self.raw.len() < CHANNEL_THOUGHT_MARKERS[0].len()
         {
             return; // head could still become a channel marker — hold
         }
@@ -289,6 +297,123 @@ mod chat_stream_tests {
             }
         }
         (r, c, t)
+    }
+
+    fn check_fragmentation(
+        text: &str,
+        allow_tools: bool,
+    ) -> (String, String, Vec<(String, String)>) {
+        let expected = run(&[text], allow_tools);
+        for split in text
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(text.len()))
+        {
+            assert_eq!(
+                run(&[&text[..split], &text[split..]], allow_tools),
+                expected,
+                "split at {split}"
+            );
+        }
+        let chars: Vec<&str> = text
+            .char_indices()
+            .map(|(i, c)| &text[i..i + c.len_utf8()])
+            .collect();
+        assert_eq!(run(&chars, allow_tools), expected, "character fragments");
+        expected
+    }
+
+    #[test]
+    fn channel_tool_examples_are_reasoning_not_calls() {
+        for head in crate::tools::CHANNEL_THOUGHT_MARKERS {
+            let text = format!("{head}\nExample <|tool_call>call:example{{}}<tool_call|><channel|>No call is needed.\u{4e2d}");
+            let (r, c, calls) = check_fragmentation(&text, true);
+            assert!(r.contains("call:example"));
+            assert_eq!(c.trim(), "No call is needed.\u{4e2d}");
+            assert!(calls.is_empty());
+            assert_eq!(
+                crate::split_reasoning(&text),
+                (r.trim().into(), c.trim().into())
+            );
+        }
+    }
+
+    #[test]
+    fn unfinished_channel_reasoning_cannot_dispatch_tools() {
+        let (r, c, calls) = check_fragmentation(
+            "<|channel>thought\n<tool_call>{\"name\":\"example\",\"arguments\":{}}</tool_call>",
+            true,
+        );
+        assert!(r.contains("example"));
+        assert!(c.is_empty());
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn tools_after_reasoning_examples_are_buffered_and_dispatched_once() {
+        for (head, close) in [("<|channel>thought", "<channel|>"), ("<think>", "</think>")] {
+            for call in [
+                "<|tool_call>call:real{}<tool_call|>",
+                "<tool_call>{\"name\":\"real\",\"arguments\":{}}</tool_call>",
+                "{\"name\":\"real\",\"parameters\":{}}",
+            ] {
+                let text = format!("{head}<|tool_call>call:example{{}}<tool_call|><tool_call>{{\"name\":\"example\",\"arguments\":{{}}}}</tool_call>{close}{call}");
+                let (r, c, calls) = check_fragmentation(&text, true);
+                assert!(r.contains("example"));
+                assert!(c.trim().is_empty(), "call leaked as content: {c}");
+                assert_eq!(calls, [("real".into(), "{}".into())]);
+                let (_, body) = crate::split_reasoning(&text);
+                let (_, batch_calls) = crate::parse_any_tool_calls(&body);
+                assert_eq!(batch_calls.len(), 1);
+                assert_eq!(batch_calls[0].name, "real");
+            }
+        }
+    }
+
+    #[test]
+    fn channel_markers_in_content_remain_literal() {
+        for text in [
+            "Example: `<|channel>thought ... <channel|>` is literal text.",
+            "<|channel>thought\nplan<channel|>Use `<channel|>` and `<|channel>thought` literally.",
+        ] {
+            let (r, c, calls) = check_fragmentation(text, true);
+            assert!(calls.is_empty());
+            assert_eq!(
+                crate::split_reasoning(text),
+                (r.trim().into(), c.trim().into())
+            );
+        }
+    }
+
+    #[test]
+    fn channel_markers_in_tool_arguments_are_preserved() {
+        let text = "<|channel>thought\nplan<channel|><tool_call>{\"name\":\"real\",\"arguments\":{\"text\":\"<|channel>thought <channel|>\"}}</tool_call>";
+        let (_, c, calls) = check_fragmentation(text, true);
+        assert!(c.trim().is_empty());
+        assert_eq!(calls.len(), 1);
+        let args: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+        assert_eq!(args["text"], "<|channel>thought <channel|>");
+    }
+
+    #[test]
+    fn channel_tools_disabled_remain_final_content() {
+        let text = "<|channel>thought\nplan<channel|><|tool_call>call:real{}<tool_call|>";
+        let (r, c, calls) = check_fragmentation(text, false);
+        assert_eq!(r.trim(), "plan");
+        assert_eq!(c, "<|tool_call>call:real{}<tool_call|>");
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn cursor_skips_cached_matches_before_the_content_region() {
+        let mut cursor = Cursor::default();
+        let raw = "<tool_call>reasoning<tool_call>answer";
+        assert_eq!(cursor.find(raw, "<tool_call>"), Some(0));
+        let content_start = "<tool_call>reasoning".len();
+        assert_eq!(
+            cursor.find_from(raw, "<tool_call>", content_start),
+            Some(content_start)
+        );
     }
 
     #[test]
