@@ -460,6 +460,9 @@ cfg_struct! {
         decode_gpu_resident_role_pipeline: bool = true,
         /// Trial H-only chunk32 FFN for independent rows4 IQ2S/IQ4NL, NE2560/NFF640/top-k10.
         decode_gpu_resident_splitk_hit: bool = false,
+        /// Extend the splitk-hit trial to qualified rows4 IQ3S/IQ4NL geometry.
+        /// Requires decode_gpu_resident_splitk_hit; false preserves IQ2S-only admission.
+        decode_gpu_resident_splitk_iq3_hit: bool = false,
         /// Submit guarded ordinary-Decode recovery while a certified CPU-only upload completes.
         /// The independent host timeline also retires the old notice epoch.
         decode_gpu_resident_host_ready: bool = true,
@@ -1405,4 +1408,37 @@ fn edit_distance(a: &str, b: &str) -> usize {
         std::mem::swap(&mut prev, &mut cur);
     }
     prev[b.len()]
+}
+
+#[cfg(test)]
+#[test]
+fn resident_iq3_splitk_default_off_and_explicitly_independent_of_splitk_hit() {
+    let defaults = Config::default();
+    assert!(!defaults.kernels.vulkan.decode_gpu_resident_splitk_iq3_hit);
+    assert!(!defaults.kernels.vulkan.decode_gpu_resident_splitk_hit);
+    for splitk in [false, true] {
+        for iq3 in [false, true] {
+            let cli = ConfigLayer::cli(&ConfigOverrides {
+                sets: vec![
+                    format!("kernels.vulkan.decode_gpu_resident_splitk_hit={splitk}"),
+                    format!("kernels.vulkan.decode_gpu_resident_splitk_iq3_hit={iq3}"),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+            let (file, warnings) = file::parse_str(
+                &format!(
+                    "[kernels.vulkan]\ndecode_gpu_resident_splitk_hit={splitk}\ndecode_gpu_resident_splitk_iq3_hit={iq3}\n"
+                ),
+                Path::new("infr.toml"),
+            )
+            .unwrap();
+            assert!(warnings.is_empty());
+            for layer in [cli, file] {
+                let cfg = Config::load_from_layers(&[layer]);
+                assert_eq!(cfg.kernels.vulkan.decode_gpu_resident_splitk_iq3_hit, iq3);
+                assert_eq!(cfg.kernels.vulkan.decode_gpu_resident_splitk_hit, splitk);
+            }
+        }
+    }
 }

@@ -1855,7 +1855,7 @@ fn paged_moe_scratch_requests(be_: &VulkanBackend, graph: &Graph) -> Vec<(&'stat
     requests
 }
 
-fn owned_splitk_graph_shape(graph: &Graph, op: &Op) -> Option<[usize; 4]> {
+fn owned_splitk_graph_shape(graph: &Graph, op: &Op) -> Option<([usize; 4], [infr_core::DType; 3])> {
     let Op::MoeFfn {
         x,
         dst,
@@ -1898,13 +1898,14 @@ fn owned_splitk_graph_shape(graph: &Graph, op: &Op) -> Option<[usize; 4]> {
         || graph.desc(*x).dtype != infr_core::DType::F32
         || graph.desc(*dst).dtype != infr_core::DType::F32
         || graph.desc(*x).numel() != 4 * *ne as usize
-        || graph.desc(*gate_exps).dtype != infr_core::DType::Iq2S
-        || graph.desc(*up_exps).dtype != infr_core::DType::Iq2S
+        || !matches!(graph.desc(*gate_exps).dtype, infr_core::DType::Iq2S | infr_core::DType::Iq3S)
+        || graph.desc(*up_exps).dtype != graph.desc(*gate_exps).dtype
         || graph.desc(*down_exps).dtype != infr_core::DType::Iq4Nl
     {
         return None;
     }
-    Some([*ne as usize, *n_ff_exp as usize, 4, *n_used as usize])
+    Some(([*ne as usize, *n_ff_exp as usize, 4, *n_used as usize],
+        [graph.desc(*gate_exps).dtype, graph.desc(*up_exps).dtype, graph.desc(*down_exps).dtype]))
 }
 
 fn owned_splitk_request(be_: &VulkanBackend, graph: &Graph, op: &Op) -> Option<usize> {
@@ -1916,14 +1917,10 @@ fn owned_splitk_request(be_: &VulkanBackend, graph: &Graph, op: &Op) -> Option<u
         || be_.cfg().spec.mtp {
         return None;
     }
-    let [ne, nff, rows, used] = owned_splitk_graph_shape(graph, op)?;
+    let ([ne, nff, rows, used], dtypes) = owned_splitk_graph_shape(graph, op)?;
     crate::recorder::owned_splitk_hit::enabled_for_shape(
         be_,
-        [
-            infr_core::DType::Iq2S,
-            infr_core::DType::Iq2S,
-            infr_core::DType::Iq4Nl,
-        ],
+        dtypes,
         ne,
         nff,
         rows,
@@ -18797,6 +18794,7 @@ fn execute_paged_moe<'a>(
                     tape.as_ref(),
                     pool[&key].as_ref(),
                     pool[&workspace.ybuf].as_ref(),
+                    [gdt, udt, ddt],
                     [ne, nff, rows, n_used, n_expert],
                     windows,
                 )
@@ -21383,8 +21381,17 @@ mod tests {
         graph.tensors[down_exps.0 as usize].desc.dtype = DType::Iq4Nl;
         assert_eq!(
             owned_splitk_graph_shape(&graph, &graph.ops[0]),
-            Some([2560, 640, 4, 10])
+            Some(([2560, 640, 4, 10], [DType::Iq2S, DType::Iq2S, DType::Iq4Nl]))
         );
+        let mut iq3 = graph.clone();
+        let Op::MoeFfn { gate_exps, up_exps, .. } = iq3.ops[0] else { unreachable!() };
+        for id in [gate_exps, up_exps] {
+            iq3.tensors[id.0 as usize].desc.dtype = DType::Iq3S;
+        }
+        assert_eq!(owned_splitk_graph_shape(&iq3, &iq3.ops[0]),
+            Some(([2560, 640, 4, 10], [DType::Iq3S, DType::Iq3S, DType::Iq4Nl])));
+        iq3.tensors[up_exps.0 as usize].desc.dtype = DType::Iq2S;
+        assert!(owned_splitk_graph_shape(&iq3, &iq3.ops[0]).is_none());
         for reason in 0..7 {
             let mut g = graph.clone();
             let Op::MoeFfn {

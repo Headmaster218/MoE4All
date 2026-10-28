@@ -89,6 +89,33 @@ impl Fixture {
         splitk: bool,
         expert_count: Option<usize>,
     ) -> Self {
+        Self::with_profile_iq3_modes(
+            ne,
+            nff,
+            used,
+            rows,
+            dtypes,
+            enabled,
+            host_ready,
+            splitk,
+            expert_count,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_profile_iq3_modes(
+        ne: usize,
+        nff: usize,
+        used: usize,
+        rows: usize,
+        dtypes: [DType; 3],
+        enabled: bool,
+        host_ready: bool,
+        splitk: bool,
+        expert_count: Option<usize>,
+        iq3_trial: bool,
+    ) -> Self {
         let experts = expert_count.unwrap_or(EXP.max(used));
         let slots = 64.max(experts * 3 + 4 + usize::from(splitk) * 32);
         let max_weight = dtypes
@@ -118,6 +145,7 @@ impl Fixture {
         vk.decode_gpu_resident_copy_overlap = true;
         vk.decode_gpu_resident_role_pipeline = enabled;
         vk.decode_gpu_resident_splitk_hit = splitk;
+        vk.decode_gpu_resident_splitk_iq3_hit = iq3_trial;
         vk.decode_gpu_resident_layers = 1;
         vk.decode_gpu_resident_submit_layers = 1;
         vk.decode_gpu_resident_inflight = 1;
@@ -581,13 +609,15 @@ struct ActivationTrace;
 impl ActivationTrace {
     fn begin() -> Self {
         STAGED_ACTIVATION_TEST_STATE.with(|state| {
-            assert!(state
-                .replace(Some(StagedActivationTestState {
-                    events: Vec::new(),
-                    setup_failure: None,
-                    retirement_failure: None,
-                }))
-                .is_none());
+            assert!(
+                state
+                    .replace(Some(StagedActivationTestState {
+                        events: Vec::new(),
+                        setup_failure: None,
+                        retirement_failure: None,
+                    }))
+                    .is_none()
+            );
         });
         OWNED_RECOVERY_TEST_COUNTS.with(|state| assert!(state.replace(Some([0; 3])).is_none()));
         Self
@@ -634,11 +664,13 @@ fn gpu_owned_role_pipeline_adapter_prepared_mapped_miss() {
         let _off = pipeline::test_scope(&fixture.backend, false);
         execute_static(&fixture.backend, &current, &fixture.bindings()).unwrap();
         assert_eq!(counts.counts(), [0, 0]);
-        assert!(!fixture
-            .backend
-            .built_kernel_names()
-            .iter()
-            .any(|name| name.starts_with("owned_role_")));
+        assert!(
+            !fixture
+                .backend
+                .built_kernel_names()
+                .iter()
+                .any(|name| name.starts_with("owned_role_"))
+        );
         let output = fixture.read(fixture.buffer(fixture.output), NE);
         let activation = fixture.activation();
         assert!(output.iter().all(|x| x.is_finite()) && output.iter().any(|x| x.abs() > 1e-7));
@@ -732,8 +764,10 @@ fn gpu_owned_role_pipeline_adapter_prepared_mapped_miss() {
     assert_eq!(counts.phase2_counts(), phase2_before_replay);
     fixture.assert_mapped_completion();
     let prepared_errors = fixture.assert_result(&expected, &expected_activation);
-    println!("OWNED_ROLE_ADAPTER_PREPARED ne={NE} nff={FF} rows=1 q5k=true selections={before_replay:?} prepared_submits=1 real_mapped_jobs=3 poisoned_act_restored=true ordinary_maxerr={} ordinary_act_maxerr={} prepared_maxerr={} prepared_act_maxerr={} frontend_once=true guards_exact=true owner_drained=true",
-        ordinary_errors.0, ordinary_errors.1, prepared_errors.0, prepared_errors.1);
+    println!(
+        "OWNED_ROLE_ADAPTER_PREPARED ne={NE} nff={FF} rows=1 q5k=true selections={before_replay:?} prepared_submits=1 real_mapped_jobs=3 poisoned_act_restored=true ordinary_maxerr={} ordinary_act_maxerr={} prepared_maxerr={} prepared_act_maxerr={} frontend_once=true guards_exact=true owner_drained=true",
+        ordinary_errors.0, ordinary_errors.1, prepared_errors.0, prepared_errors.1
+    );
 }
 
 #[test]
@@ -753,7 +787,14 @@ fn owned_role_pipeline_auto_gate_qualified_geometry_only() {
                                     && used == 8
                                     && rows == 1;
                                 assert_eq!(
-                                    pipeline::production_eligible(enabled, [gate, up], ne, nff, rows, used),
+                                    pipeline::production_eligible(
+                                        enabled,
+                                        [gate, up],
+                                        ne,
+                                        nff,
+                                        rows,
+                                        used
+                                    ),
                                     expected,
                                     "enabled={enabled} G={gate:?} U={up:?} ne={ne} nff={nff} used={used} rows={rows}"
                                 );
@@ -800,11 +841,13 @@ fn exercise_auto(fixture: Fixture, selected: bool, prepared: bool) -> (Vec<f32>,
         let _old = pipeline::test_scope(&fixture.backend, false);
         execute_static(&fixture.backend, &current, &fixture.bindings()).unwrap();
         assert_eq!(counts.counts(), [0, 0]);
-        assert!(!fixture
-            .backend
-            .built_kernel_names()
-            .iter()
-            .any(|name| name.starts_with("owned_role_")));
+        assert!(
+            !fixture
+                .backend
+                .built_kernel_names()
+                .iter()
+                .any(|name| name.starts_with("owned_role_"))
+        );
         (
             fixture.read(fixture.buffer(fixture.output), fixture.rows * fixture.ne),
             fixture.activation(),

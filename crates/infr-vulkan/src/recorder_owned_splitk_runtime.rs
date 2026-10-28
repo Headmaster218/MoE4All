@@ -11,6 +11,11 @@ fn shape_matches(dtypes: [DType; 3], ne: usize, nff: usize, rows: usize, used: u
         && [ne, nff, rows, used] == [2560, 640, 4, 10]
 }
 
+fn iq3_shape_matches(dtypes: [DType; 3], ne: usize, nff: usize, rows: usize, used: usize) -> bool {
+    dtypes == [DType::Iq3S, DType::Iq3S, DType::Iq4Nl]
+        && [ne, nff, rows, used] == [2560, 640, 4, 10]
+}
+
 /// Shader bounds, independent of policy. No shared slot is included in the capacity.
 pub(crate) fn partial_bytes(ne: usize, nff: usize, rows: usize, used: usize) -> Option<usize> {
     if !(1..=8192).contains(&ne)
@@ -97,7 +102,9 @@ pub(crate) fn enabled_for_shape(
     used: usize,
 ) -> bool {
     be.cfg().kernels.vulkan.decode_gpu_resident_splitk_hit
-        && shape_matches(dtypes, ne, nff, rows, used)
+        && (shape_matches(dtypes, ne, nff, rows, used)
+            || (be.cfg().kernels.vulkan.decode_gpu_resident_splitk_iq3_hit
+                && iq3_shape_matches(dtypes, ne, nff, rows, used)))
         && device_limits(be).is_some()
 }
 
@@ -174,18 +181,13 @@ pub(crate) fn try_plan<'a>(
     tape: &'a dyn Buffer,
     partial: &'a dyn Buffer,
     output: &'a dyn Buffer,
+    dtypes: [DType; 3],
     dimensions: [usize; 5],
     windows: [u32; 3],
 ) -> Option<Plan<'a>> {
     let [ne, nff, rows, used, experts] = dimensions;
-    if !enabled_for_shape(
-        rec.be,
-        [DType::Iq2S, DType::Iq2S, DType::Iq4Nl],
-        ne,
-        nff,
-        rows,
-        used,
-    ) || !(used..=512).contains(&experts)
+    if !enabled_for_shape(rec.be, dtypes, ne, nff, rows, used)
+        || !(used..=512).contains(&experts)
         || rec.conditional_active.get()
         || rec.resident_indirect.borrow().is_some()
         || rec.indirect_region.get().is_some()
@@ -238,15 +240,19 @@ pub(crate) fn try_plan<'a>(
         parts as u32,
     ];
     let partial_kernel = rec.be.kernel_sg(
-        "gpu_owned_hit_splitk_iq2s_32",
-        crate::gemm::gpu_owned_hit_splitk_spv(false),
+        if dtypes[0] == DType::Iq3S {
+            "gpu_owned_hit_splitk_iq3s_32"
+        } else {
+            "gpu_owned_hit_splitk_iq2s_32"
+        },
+        crate::gemm::gpu_owned_hit_splitk_spv(dtypes[0], false),
         4,
         40,
         32,
     );
     let reduce_kernel = rec.be.kernel_sg(
         "gpu_owned_hit_splitk_reduce_32",
-        crate::gemm::gpu_owned_hit_splitk_spv(true),
+        crate::gemm::gpu_owned_hit_splitk_spv(dtypes[0], true),
         4,
         40,
         32,
@@ -338,6 +344,23 @@ mod tests {
             assert!(!shape_matches(formats, 2560, 640, rows, 10));
         }
         assert!(!shape_matches([DType::Q5K; 3], 2048, 512, 4, 8));
+    }
+
+    #[test]
+    fn iq3_policy_is_bounded_to_qualified_four_row_format() {
+        let formats = [DType::Iq3S, DType::Iq3S, DType::Iq4Nl];
+        assert!(iq3_shape_matches(formats, 2560, 640, 4, 10));
+        for rows in [0, 1, 2, 3, 5, 8, 9] {
+            assert!(!iq3_shape_matches(formats, 2560, 640, rows, 10));
+        }
+        assert!(!iq3_shape_matches(
+            [DType::Iq2S, DType::Iq3S, DType::Iq4Nl],
+            2560,
+            640,
+            4,
+            10
+        ));
+        assert!(!iq3_shape_matches([DType::Q5K; 3], 2560, 640, 4, 10));
     }
 
     #[test]

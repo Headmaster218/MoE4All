@@ -11,7 +11,9 @@ fn read_words(backend: &VulkanBackend, buffer: &dyn Buffer, words: usize) -> Vec
     values
 }
 
-fn install_mixed_owner(fixture: &Fixture) -> (Arc<crate::pager::GpuCopyBuffers>, [u32; 3]) {
+pub(super) fn install_mixed_owner(
+    fixture: &Fixture,
+) -> (Arc<crate::pager::GpuCopyBuffers>, [u32; 3]) {
     let (sources, seed, bases) = {
         let mut guard = fixture.backend.moe_pager().lock().unwrap();
         let session = guard.as_mut().unwrap();
@@ -30,7 +32,12 @@ fn install_mixed_owner(fixture: &Fixture) -> (Arc<crate::pager::GpuCopyBuffers>,
             session
                 .routed_roles_resident_mask(&fixture.roles, &fixture.routed)
                 .unwrap(),
-            0xff ^ (1 << 1) ^ (1 << 2),
+            (if fixture.routed.len() == 32 {
+                u32::MAX
+            } else {
+                (1u32 << fixture.routed.len()) - 1
+            }) ^ (1 << 1)
+                ^ (1 << 2),
         );
         session.gpu_decode_owner = None;
         session.test_unimport_host_uploads();
@@ -133,9 +140,11 @@ fn gpu_owned_role_pipeline_adapter_auto_mixed_status5_host_ready_success() {
     assert!(expected.iter().all(|x| x.is_finite()));
     assert!(expected.iter().any(|x| x.abs() > 1e-7));
     assert!(expected_act.iter().all(|x| x.is_finite()));
-    assert!(expected_act[fixture.nff..3 * fixture.nff]
-        .iter()
-        .any(|x| x.abs() > 1e-7));
+    assert!(
+        expected_act[fixture.nff..3 * fixture.nff]
+            .iter()
+            .any(|x| x.abs() > 1e-7)
+    );
 
     // Keep this Arc through completion/next request/handoff: it owns the retained
     // imported source leases even though CPU uploads now use an unimported plan.
@@ -192,13 +201,15 @@ fn gpu_owned_role_pipeline_adapter_auto_mixed_status5_host_ready_success() {
         &expected,
     );
     assert_exact(&fixture.activation(), &expected_act);
-    assert!(!backend
-        .moe_pager()
-        .lock()
-        .unwrap()
-        .as_ref()
-        .unwrap()
-        .gpu_decode_in_forward());
+    assert!(
+        !backend
+            .moe_pager()
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .gpu_decode_in_forward()
+    );
 
     // Execute has drained GPU and CPU work. Recovery resets JobCount but does not
     // rewrite the job array. Inspect only now, never while a host wait is in flight.
@@ -287,5 +298,9 @@ fn gpu_owned_role_pipeline_adapter_auto_mixed_status5_host_ready_success() {
             0xff
         );
     });
-    eprintln!("AUTO_C_MIXED_STATUS5 gpu_jobs={gpu_jobs} cpu_jobs={cpu_jobs} host_ready={proof:?} selections={:?} phase2={:?} output_act_exact=true next_handoff_exact=true pre_ready=existing_raw_protocol_and_source_proof", selection.counts(), selection.phase2_counts());
+    eprintln!(
+        "AUTO_C_MIXED_STATUS5 gpu_jobs={gpu_jobs} cpu_jobs={cpu_jobs} host_ready={proof:?} selections={:?} phase2={:?} output_act_exact=true next_handoff_exact=true pre_ready=existing_raw_protocol_and_source_proof",
+        selection.counts(),
+        selection.phase2_counts()
+    );
 }

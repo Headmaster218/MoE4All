@@ -4599,6 +4599,10 @@ fn main() {
             "gpu_owned_hit_splitk_iq2s_32",
             vec!["-DFMT_IQ2S", "-DDOWN_IQ4NL", "-DUSE_GRID"],
         ),
+        (
+            "gpu_owned_hit_splitk_iq3s_32",
+            vec!["-DFMT_IQ3S", "-DDOWN_IQ4NL", "-DUSE_GRID"],
+        ),
         ("gpu_owned_hit_splitk_reduce_32", vec!["-DSPLITK_REDUCE", "-DTREE32_REDUCE"]),
     ] {
         let mut defines: Vec<String> = defines.into_iter().map(str::to_owned).collect();

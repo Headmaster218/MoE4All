@@ -4280,21 +4280,30 @@ pub(crate) fn gpu_owned_indirect_jobs_spv() -> &'static [u32] {
     WORDS.get_or_init(|| spv_words(BYTES))
 }
 
-pub(crate) fn gpu_owned_hit_splitk_spv(reduce: bool) -> &'static [u32] {
-    const PARTIAL: &[u8] = include_bytes!(concat!(
+pub(crate) fn gpu_owned_hit_splitk_spv(dtype: infr_core::DType, reduce: bool) -> &'static [u32] {
+    const IQ2_PARTIAL: &[u8] = include_bytes!(concat!(
         env!("OUT_DIR"),
         "/gpu_owned_hit_splitk_iq2s_32.spv"
+    ));
+    const IQ3_PARTIAL: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/gpu_owned_hit_splitk_iq3s_32.spv"
     ));
     const REDUCE: &[u8] = include_bytes!(concat!(
         env!("OUT_DIR"),
         "/gpu_owned_hit_splitk_reduce_32.spv"
     ));
-    static PARTIAL_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    static IQ2_PARTIAL_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    static IQ3_PARTIAL_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
     static REDUCE_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
     if reduce {
         REDUCE_WORDS.get_or_init(|| spv_words(REDUCE))
     } else {
-        PARTIAL_WORDS.get_or_init(|| spv_words(PARTIAL))
+        match dtype {
+            infr_core::DType::Iq2S => IQ2_PARTIAL_WORDS.get_or_init(|| spv_words(IQ2_PARTIAL)),
+            infr_core::DType::Iq3S => IQ3_PARTIAL_WORDS.get_or_init(|| spv_words(IQ3_PARTIAL)),
+            _ => panic!("splitk-hit partial requires IQ2S or IQ3S Gate/Up"),
+        }
     }
 }
 
