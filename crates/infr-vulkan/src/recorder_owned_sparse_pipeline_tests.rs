@@ -3,6 +3,9 @@
 //! This isolates small-miss overlap, not a cold whole-model weight/cache workload.
 use super::*;
 
+#[path = "recorder_owned_copy_gu_fused_tests.rs"]
+mod copy_gu_v2;
+
 const COPIED_WORKING_SET: usize = 128 * 1024 * 1024;
 const MAX_STAGES: usize = 512;
 const MISS_EXPERT: usize = 0;
