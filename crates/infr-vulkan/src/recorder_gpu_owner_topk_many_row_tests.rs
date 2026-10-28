@@ -1180,3 +1180,119 @@ fn gpu_owned_topk_many_row_v94_paired_latency_probe() {
         }
     }
 }
+
+#[test]
+#[ignore = "central serial GPU only; same-kernel 4x10 true-route vs preserved-ID hot-owner attribution"]
+fn gpu_owned_topk_many_row_hot_route_attribution_4x10() {
+    let be = backend();
+    let kernels = Kernels::new(&be);
+    assert!(be.shared.submit_timestamp_valid_bits > 0);
+    let shape = Shape {
+        overlap: true,
+        ..Shape::new(4, 10)
+    };
+    let mut probes = [
+        Probe::new(&be, shape, 4096),
+        Probe::new(
+            &be,
+            Shape {
+                predicate: false,
+                ..shape
+            },
+            4096,
+        ),
+    ];
+    let count = shape.count();
+    let input_word = shape.predicate_word();
+    assert_eq!(count, 40);
+    assert_eq!(input_word, RESIDENT_SEED_WORD);
+    let (oracle, _) = probes[0].run(&be, &kernels, false, None);
+    probes[0].check_guards_and_valid(&oracle);
+
+    // Only routing differs. Both arms start with identical oracle IDs/weight bits;
+    // every other input (including initial owner/log state) remains identical.
+    for probe in &mut probes {
+        probe.seed[0][..count].copy_from_slice(&oracle[0][..count]);
+        probe.seed[10].clone_from(&oracle[10]);
+    }
+    let mut owner_seed = probes[1].seed.clone();
+    assert_eq!(owner_seed[2][input_word], 0);
+    assert_eq!(probes[0].seed[2][input_word], 1);
+    owner_seed[2][input_word] = 1;
+    assert_eq!(probes[0].seed, owner_seed);
+    let mut expected = [oracle.clone(), oracle];
+    assert_eq!(expected[0][2][input_word], 1);
+    expected[1][2][input_word] = 0;
+    // Seed has room for all touches: this probe cannot silently time compaction.
+    for pool in 0..2 {
+        let queue = probes[0].seed[5][(POOL_BASE + 2 * pool) * 4] as usize;
+        assert_eq!(
+            &probes[0].seed[5][queue * 4..queue * 4 + 4],
+            &[0, 4096, 8192, 0]
+        );
+        assert_eq!(
+            &expected[0][5][queue * 4..queue * 4 + 4],
+            &[0, 4096 + [80u32, 40][pool], 8192, 0]
+        );
+    }
+    let check = |variant: usize, raw: &Raw| {
+        let probe = &probes[variant];
+        assert_eq!(
+            raw[2][input_word], probe.seed[2][input_word],
+            "immutable input routing predicate must remain unchanged"
+        );
+        // Exact full raw comparison: the expected owner-only snapshot differs
+        // solely in that one input bit. No output, weight or guard is masked.
+        assert_eq!(
+            raw, &expected[variant],
+            "variant={variant}: exact raw/FP/FIFO/guards"
+        );
+        probe.check_guards_and_valid(raw);
+    };
+    // Warm BOTH paths; run() restores every seed outside the timestamp bracket.
+    for _ in 0..2 {
+        for variant in 0..2 {
+            let (raw, _) = probes[variant].run(&be, &kernels, true, None);
+            check(variant, &raw);
+        }
+    }
+    let queries = Queries {
+        be: &be,
+        pool: unsafe {
+            be.shared.device.create_query_pool(
+                &vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(2),
+                None,
+            )
+        }
+        .unwrap(),
+    };
+    let mut samples: [Vec<f64>; 2] = std::array::from_fn(|_| Vec::new());
+    let mut paired = Vec::new();
+    for round in 0..8 {
+        let mut us = [0.0; 2];
+        for variant in [round % 2, 1 - round % 2] {
+            let (raw, time) = probes[variant].run(&be, &kernels, true, Some(&queries));
+            check(variant, &raw);
+            us[variant] = time.unwrap();
+            assert!(us[variant].is_finite() && us[variant] >= 0.0);
+            samples[variant].push(us[variant]);
+        }
+        let delta = us[1] - us[0];
+        paired.push(delta);
+        eprintln!(
+            "MANY_ROW_HOT_ROUTE_PAIR pair={round} order={} true_route_us={:.6} owner_only_us={:.6} owner_minus_route_us={delta:.6} exact_raw_fp_fifo_guards=pass",
+            if round % 2 == 0 { "AB" } else { "BA" }, us[0], us[1],
+        );
+    }
+    let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
+    let min = paired.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = paired.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    assert_eq!(samples[0].len(), 8);
+    assert_eq!(samples[1].len(), 8);
+    eprintln!(
+        "MANY_ROW_HOT_ROUTE_ATTRIBUTION rows=4 used=10 experts=512 gating=1 mixed=false overlap=true slots_per_pool=4096 kernel=embedded_many_row_wg256 subgroup=32 dispatches_per_sample=1 warmups_per_arm=2 pairs=8 timed_samples=16 true_route_mean_us={:.6} owner_only_mean_us={:.6} owner_minus_route_mean_us={:.6} paired_min_us={min:.6} paired_max_us={max:.6} outer_only=true reset_readback_outside_timestamps=true fixed_overhead_subtracted=false empty_bracket_measured=false immutable_input_unchanged=true exact_raw_fp_fifo_guards=pass module_only=true",
+        mean(&samples[0]), mean(&samples[1]), mean(&paired),
+    );
+}
