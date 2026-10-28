@@ -17,8 +17,19 @@
 //! new chain, so the frames survive via the new entry's owners. Matching is *positional*: a chain
 //! covers tokens from 0, so whatever prefix the prompt walk consumes is reusable at page
 //! granularity — `floor(consumed / page_tokens) * page_tokens` — including divergence inside an
-//! entry's edge, which the blob tier's whole-snapshot rule could not share. Turn-recurrent
-//! checkpoints are not paged (Phase D attaches them as node aux).
+//! entry's edge, which the blob tier's whole-snapshot rule could not share.
+//!
+//! # Hybrid recurrent aux
+//!
+//! DeltaNet/linear-attention models keep conv/S state and PLE history OUTSIDE the page table, so
+//! frames alone cannot resume their prefill: re-prefilling a shared prefix would overwrite state
+//! the resumed positions depend on. A published entry may therefore carry host-resident
+//! [`PagedCkpt`] snapshots keyed to a page-aligned token boundary; a recurrent session attaches
+//! ONLY at exactly such a boundary, uploads the snapshot into its live buffers, and resumes from
+//! there ([`PagedKv::entry_ckpt`]). Aux bytes live under their own budget — an eighth of the RAM
+//! tier — and snapshots NEVER evict frames: when the budget is exhausted the coldest entry's
+//! snapshot is dropped (its chain still serves as an attention prefix), because a snapshot is an
+//! accelerator and a frame is the cache itself.
 //!
 //! # Ownership and eviction
 //!
@@ -69,6 +80,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Frame-granularity DMA between the VRAM corridor and host memory, factored out of [`Backend`]
 /// so the pool/tree logic tests against an in-memory stand-in. Blanket-impl'd for every backend.
@@ -103,6 +115,43 @@ struct DiskBacking {
 /// so the entry needs no copy of them. The sub-page tail is recomputed on reuse.
 struct ChainEntry {
     chain: Vec<FrameId>,
+    /// Host snapshots of the recurrent/PLE state at page-aligned boundaries of this conversation,
+    /// sorted by `boundary_tokens`. A session that resumes on a hybrid recurrent model (DeltaNet,
+    /// KDA, PLE) must attach at exactly one of these lengths; a pure attention model ignores them.
+    ckpts: Vec<Arc<PagedCkpt>>,
+}
+
+/// Host-resident recurrent state at one stable conversation boundary of a published chain. The
+/// bytes mirror [`crate::seam::weights::TurnRecurrentCkpt`]'s device buffers (one conv/`S` pair per
+/// recurrent layer plus the model-level PLE history) for a model whose per-token KV lives in the
+/// frames: the page table resumes attention, this snapshot resumes everything the page table does
+/// not cover. Snapshots are captured at publish time and restored into the live buffers BEFORE the
+/// attaching session's page table is written, so a tree hit never replays the prefill.
+pub(crate) struct PagedCkpt {
+    /// Token boundary (a multiple of `page_tokens`) this snapshot describes: a session attaching
+    /// it may reuse exactly this many tokens, never more (the state stops here).
+    pub(crate) boundary_tokens: usize,
+    /// Recurrent layer indices; `layers[i]` owns `kbufs[i]`/`vbufs[i]`.
+    pub(crate) layers: Vec<usize>,
+    pub(crate) kbufs: Vec<Vec<u8>>,
+    pub(crate) vbufs: Vec<Vec<u8>>,
+    /// Qwen3.8's model-level PLE convolution history, when the model has one.
+    pub(crate) ple: Option<Vec<u8>>,
+}
+
+impl PagedCkpt {
+    pub(crate) fn bytes(&self) -> usize {
+        self.kbufs
+            .iter()
+            .chain(self.vbufs.iter())
+            .map(Vec::len)
+            .sum::<usize>()
+            + self.ple.as_ref().map_or(0, Vec::len)
+    }
+}
+
+fn ckpts_bytes(ckpts: &[Arc<PagedCkpt>]) -> usize {
+    ckpts.iter().map(|ckpt| ckpt.bytes()).sum()
 }
 
 struct Node {
@@ -147,6 +196,11 @@ pub(crate) struct PagedKv {
     /// Phase D: the disk tier's sparse backing file, `None` when the tier is closed (budget 0 or
     /// the file could not be opened — a cache layer must never fail engine init).
     disk: Option<DiskBacking>,
+    /// Host bytes currently held by every entry's `ckpts` (see [`PagedCkpt`]).
+    aux_bytes: usize,
+    /// Cap on `aux_bytes`: an eighth of the RAM-tier frame backing, 0 when that tier is off. Aux
+    /// is a restore accelerator, not a second KV copy — it never evicts frames, only itself.
+    aux_budget: usize,
     clock: u64,
     hits: u64,
     misses: u64,
@@ -220,6 +274,12 @@ impl PagedKv {
             plane_offsets,
             ram_backing: Vec::new(),
             disk,
+            aux_bytes: 0,
+            // Derived from the RAM tier so the aux cap needs no new config surface: snapshots are
+            // an eighth-scale appendix to the prefix bytes they accelerate, never a peer tier. A
+            // corridor-only tree (`kv.paged` with no pool) has nothing to divide, so its caller
+            // overrides this — see [`Self::set_aux_budget`].
+            aux_budget: (ram_frames * frame_bytes as usize) / 8,
             clock: 0,
             hits: 0,
             misses: 0,
@@ -243,6 +303,15 @@ impl PagedKv {
         self.pool.set_segments(Tier::Vram, corridors);
     }
 
+    /// Replace the aux (recurrent/PLE snapshot) budget implied by the RAM frame pool. Only the
+    /// corridor-only tree needs it: `aux_budget` derives from a pool that is not there, and a zero
+    /// budget does not merely shrink reuse — [`Self::hit_prefix`] admits no recurrent resume point at
+    /// all, so every hybrid-recurrent hit silently re-prefills. Call once at init, before anything
+    /// publishes. Host bytes are still claimed per captured snapshot, never reserved here.
+    pub(crate) fn set_aux_budget(&mut self, bytes: usize) {
+        self.aux_budget = bytes;
+    }
+
     /// Device address to write into plane `plane`'s table for one VRAM frame. RAM-tier frames must
     /// never reach a table (bandwidth-wall + BDA stale convictions) — Phase C writes 0 instead.
     pub(crate) fn plane_addr(&self, frame: FrameId, plane: usize) -> u64 {
@@ -263,7 +332,7 @@ impl PagedKv {
         let held = self.pool.held_frames(Tier::Vram);
         let total = self.pool.capacity_frames(Tier::Vram);
         format!(
-            "entries={} frames_held={}/{} free={} tokens_held={}/{} bytes={:.2}GiB/{:.2}GiB ram={}/{} ram_bytes={:.2}GiB disk={}/{} disk_bytes={:.2}GiB hits={} misses={} demotions={} evictions={} sunk={} promoted={} disk_sunk={} disk_promoted={}",
+            "entries={} frames_held={}/{} free={} tokens_held={}/{} bytes={:.2}GiB/{:.2}GiB ram={}/{} ram_bytes={:.2}GiB disk={}/{} disk_bytes={:.2}GiB aux_bytes={:.2}MiB/{:.2}MiB hits={} misses={} demotions={} evictions={} sunk={} promoted={} disk_sunk={} disk_promoted={}",
             self.nodes
                 .iter()
                 .filter(|node| node.entry.is_some())
@@ -281,6 +350,8 @@ impl PagedKv {
             self.pool.held_frames(Tier::Disk),
             self.pool.capacity_frames(Tier::Disk),
             self.pool.held_bytes(Tier::Disk) as f64 / (1u64 << 30) as f64,
+            self.aux_bytes as f64 / (1u64 << 20) as f64,
+            self.aux_budget as f64 / (1u64 << 20) as f64,
             self.hits,
             self.misses,
             self.demotions,
@@ -752,10 +823,25 @@ impl PagedKv {
         }
     }
 
-    /// Publish a demoted session's conversation. `chain` must cover exactly the complete pages of
-    /// `tokens`. Pins every frame for the tree BEFORE the caller drops the session's owners, so
-    /// shared prefix frames never hit refcount zero mid-swap (the black-hole-window lesson).
+    /// Publish a demoted session's conversation with no recurrent snapshots. Gated with its only
+    /// callers (the tree's own tests): every production publish goes through
+    /// [`Self::publish_with_ckpts`], because a hybrid recurrent entry without a snapshot is a
+    /// conversation the next request has to replay.
+    #[cfg(test)]
     pub(crate) fn publish(&mut self, tokens: Vec<u32>, chain: Vec<FrameId>) -> Result<()> {
+        self.publish_with_ckpts(tokens, chain, Vec::new())
+    }
+
+    /// [`Self::publish`] plus host snapshots of the conversation's recurrent state at
+    /// page-aligned boundaries (hybrid recurrent models — see [`PagedCkpt`]). Every snapshot must
+    /// describe a page-aligned prefix of the published tokens; anything else is a capture bug and
+    /// is refused BEFORE any frame is pinned, so a rejected publish never leaks ownership.
+    pub(crate) fn publish_with_ckpts(
+        &mut self,
+        tokens: Vec<u32>,
+        chain: Vec<FrameId>,
+        ckpts: Vec<Arc<PagedCkpt>>,
+    ) -> Result<()> {
         let pages = tokens.len() / self.page_tokens;
         if chain.len() != pages {
             return Err(anyhow!(
@@ -764,23 +850,129 @@ impl PagedKv {
                 chain.len()
             ));
         }
+        for ckpt in &ckpts {
+            anyhow::ensure!(
+                ckpt.boundary_tokens > 0
+                    && ckpt.boundary_tokens % self.page_tokens == 0
+                    && ckpt.boundary_tokens <= tokens.len(),
+                "paged publish: checkpoint boundary {} is not a positive page-aligned prefix of {} tokens",
+                ckpt.boundary_tokens,
+                tokens.len()
+            );
+        }
         for &frame in &chain {
             self.pool.pin(frame);
         }
         let node = self.descend_to(&tokens);
         self.drop_superseded_ancestors(node);
         self.clock += 1;
-        let target = &mut self.nodes[node];
+        let ckpts = self.admit_ckpts(ckpts);
         // A newer entry at the same node replaces the old chain; the old frames' tree owners
         // leave now (session owners keep any still in use alive).
-        if let Some(old) = target.entry.replace(ChainEntry { chain }) {
-            for frame in old.chain {
-                self.pool.unpin(frame);
-            }
+        let old = self.nodes[node].entry.replace(ChainEntry { chain, ckpts });
+        if let Some(old) = old {
+            self.unpin_entry(old);
         }
         self.nodes[node].last_access = self.clock;
         self.demotions += 1;
         Ok(())
+    }
+
+    /// Drop one entry's tree ownership: frames unpinned, aux bytes subtracted. Callers bump their
+    /// own counters (evictions vs supersessions) around it.
+    fn unpin_entry(&mut self, entry: ChainEntry) {
+        for frame in entry.chain {
+            self.pool.unpin(frame);
+        }
+        self.aux_bytes = self.aux_bytes.saturating_sub(ckpts_bytes(&entry.ckpts));
+    }
+
+    /// Fit `ckpts` (sorted ascending by boundary) under the aux budget by dropping snapshots from
+    /// the coldest OTHER entries first, then the incoming ones shallowest-first. Returns the
+    /// snapshots that fit and adds their bytes to `aux_bytes`; entries keep their frames either
+    /// way — only an accelerator is ever trimmed here.
+    fn admit_ckpts(&mut self, mut ckpts: Vec<Arc<PagedCkpt>>) -> Vec<Arc<PagedCkpt>> {
+        ckpts.sort_by_key(|ckpt| ckpt.boundary_tokens);
+        while !ckpts.is_empty() && self.aux_bytes + ckpts_bytes(&ckpts) > self.aux_budget {
+            let Some(node) = self.coldest_ckpt_entry() else {
+                break;
+            };
+            let dropped = std::mem::take(
+                &mut self.nodes[node]
+                    .entry
+                    .as_mut()
+                    .expect("victim carries an entry")
+                    .ckpts,
+            );
+            self.aux_bytes = self.aux_bytes.saturating_sub(ckpts_bytes(&dropped));
+        }
+        while self.aux_bytes + ckpts_bytes(&ckpts) > self.aux_budget && !ckpts.is_empty() {
+            // Still over after every other entry yielded: the shallowest incoming snapshot goes.
+            // The deepest one is the one a same-conversation resume actually needs.
+            ckpts.remove(0);
+        }
+        self.aux_bytes += ckpts_bytes(&ckpts);
+        ckpts
+    }
+
+    /// The coldest entry that still carries snapshots, in [`Self::evict_cold_one`]'s order.
+    fn coldest_ckpt_entry(&self) -> Option<usize> {
+        let mut best: Option<(bool, u64, usize)> = None;
+        for (index, node) in self.nodes.iter().enumerate() {
+            if node
+                .entry
+                .as_ref()
+                .is_none_or(|entry| entry.ckpts.is_empty())
+            {
+                continue;
+            }
+            let key = (self.has_entry_below(index), node.last_access, index);
+            if best.is_none_or(|current| key < current) {
+                best = Some(key);
+            }
+        }
+        best.map(|(_, _, index)| index)
+    }
+
+    /// Deepest host snapshot at or below `reusable` tokens. A hybrid recurrent session must attach
+    /// at EXACTLY `boundary_tokens`: the snapshot describes the recurrent/PLE state there, so
+    /// reusing fewer frames wastes a resumable prefix and reusing more would resume on state that
+    /// does not exist. `None` = the entry's chain is a pure attention prefix for this prompt.
+    pub(crate) fn entry_ckpt(&self, node: usize, reusable: usize) -> Option<Arc<PagedCkpt>> {
+        self.nodes[node]
+            .entry
+            .as_ref()?
+            .ckpts
+            .iter()
+            .filter(|ckpt| ckpt.boundary_tokens <= reusable)
+            .max_by_key(|ckpt| ckpt.boundary_tokens)
+            .cloned()
+    }
+
+    /// The deepest prefix of `node`'s chain a request may actually resume, plus the snapshot to
+    /// restore there.
+    ///
+    /// A dense-attention entry resumes at whatever depth it matched: its pages hold every K/V row
+    /// the continuation reads. A hybrid recurrent entry is pinned to its snapshot boundaries,
+    /// because the conv window, the recurrent matrix and the PLE history summarize the whole prefix
+    /// into buffers no page table addresses. `depth` is in tokens, and callers evaluate this twice —
+    /// once for the match, once for the chain that survived promotion to VRAM — so a short promotion
+    /// re-picks a shallower snapshot instead of resuming ahead of the KV.
+    ///
+    /// `0` from a recurrent entry says the chain cannot be resumed at all: the caller's strict
+    /// comparison against the resident continuation then fails and the prompt is re-prefilled.
+    pub(crate) fn hit_prefix(
+        &self,
+        node: usize,
+        recurrent: bool,
+        depth: usize,
+    ) -> (usize, Option<Arc<PagedCkpt>>) {
+        if recurrent {
+            let ckpt = self.entry_ckpt(node, depth);
+            (ckpt.as_ref().map_or(0, |ckpt| ckpt.boundary_tokens), ckpt)
+        } else {
+            (depth, None)
+        }
     }
 
     /// Drop the coldest unpublishable... evict one entry leaf-first (see module doc). Returns
@@ -802,9 +994,7 @@ impl PagedKv {
             return false;
         };
         if let Some(entry) = self.nodes[node].entry.take() {
-            for frame in entry.chain {
-                self.pool.unpin(frame);
-            }
+            self.unpin_entry(entry);
             self.evictions += 1;
         }
         self.prune_upward(node);
@@ -942,9 +1132,7 @@ impl PagedKv {
         }
         for index in cleared {
             if let Some(entry) = self.nodes[index].entry.take() {
-                for frame in entry.chain {
-                    self.pool.unpin(frame);
-                }
+                self.unpin_entry(entry);
             }
             self.prune_upward(index);
         }
@@ -1505,5 +1693,186 @@ mod tests {
         let _b = kv.alloc_frame(&dma).expect("sinking freed a frame");
         assert_eq!(kv.disk_demotions, 0);
         assert_eq!(kv.pool.capacity_frames(Tier::Disk), 0);
+    }
+
+    /// A snapshot-shaped aux whose byte size is deterministic (the tree never inspects content).
+    fn ckpt(boundary: usize, bytes: usize) -> Arc<PagedCkpt> {
+        Arc::new(PagedCkpt {
+            boundary_tokens: boundary,
+            layers: vec![0],
+            kbufs: vec![vec![7; bytes]],
+            vbufs: Vec::new(),
+            ple: None,
+        })
+    }
+
+    /// The node whose entry chain owns `frame` (tests only — never stamps the LRU clock).
+    fn node_of(kv: &PagedKv, frame: FrameId) -> usize {
+        kv.nodes
+            .iter()
+            .position(|node| {
+                node.entry
+                    .as_ref()
+                    .is_some_and(|entry| entry.chain.contains(&frame))
+            })
+            .expect("some entry owns the frame")
+    }
+
+    #[test]
+    fn entry_ckpt_returns_the_deepest_boundary_at_or_below_reuse() {
+        let mut kv = cache_ram(16, 8);
+        let a = grow(&mut kv, 4); // 16 tokens
+        kv.publish_with_ckpts(
+            (1..=16).collect(),
+            a.clone(),
+            vec![ckpt(12, 64), ckpt(4, 64)], // insertion order must not matter
+        )
+        .unwrap();
+        let node = node_of(&kv, a[0]);
+        assert_eq!(kv.entry_ckpt(node, 16).unwrap().boundary_tokens, 12);
+        assert_eq!(kv.entry_ckpt(node, 13).unwrap().boundary_tokens, 12);
+        assert_eq!(kv.entry_ckpt(node, 11).unwrap().boundary_tokens, 4);
+        assert_eq!(kv.entry_ckpt(node, 4).unwrap().boundary_tokens, 4);
+        assert!(
+            kv.entry_ckpt(node, 3).is_none(),
+            "no snapshot covers 3 tokens"
+        );
+        assert_eq!(kv.aux_bytes, 128);
+        assert_eq!(kv.aux_budget, FB as usize, "an eighth of the RAM tier");
+    }
+
+    #[test]
+    fn a_corridor_only_tree_resumes_from_the_aux_cap_its_caller_sets() {
+        // The shape of `kv.paged` without `kv.paged_cache_max`: zero host RAM frames, so the /8
+        // derivation is zero and the init caller installs a standing cap. Without it a hybrid
+        // recurrent model would silently reuse nothing.
+        let mut kv = cache_ram(16, 0);
+        assert_eq!(kv.aux_budget, 0, "no RAM pool means no implied aux budget");
+        kv.set_aux_budget(128);
+        let a = grow(&mut kv, 4); // 16 tokens
+        kv.publish_with_ckpts((1..=16).collect(), a.clone(), vec![ckpt(12, 64)])
+            .unwrap();
+        let node = node_of(&kv, a[0]);
+        let (reusable, ckpt) = kv.hit_prefix(node, true, 16);
+        assert_eq!((reusable, ckpt.unwrap().boundary_tokens), (12, 12));
+        assert_eq!(
+            kv.pool.capacity_frames(Tier::Ram),
+            0,
+            "a corridor-only tree never claims a host frame"
+        );
+        assert_eq!(kv.aux_bytes, 64, "the snapshot fit under the standing cap");
+    }
+
+    #[test]
+    fn a_recurrent_hit_resumes_only_at_its_snapshot_boundary() {
+        let mut kv = cache_ram(16, 8);
+        let a = grow(&mut kv, 4); // 16 tokens, 4 pages
+        kv.publish_with_ckpts(
+            (1..=16).collect(),
+            a.clone(),
+            vec![ckpt(12, 64), ckpt(4, 64)],
+        )
+        .unwrap();
+        let node = node_of(&kv, a[0]);
+        // Dense attention reuses the whole matched depth and carries no aux with it.
+        let (reusable, ckpt) = kv.hit_prefix(node, false, 16);
+        assert_eq!((reusable, ckpt.is_none()), (16, true));
+        // Recurrent state is summarized, so the resume point is the DEEPEST snapshot, not the chain.
+        let (reusable, ckpt) = kv.hit_prefix(node, true, 16);
+        assert_eq!((reusable, ckpt.unwrap().boundary_tokens), (12, 12));
+        // A promotion that fell short of the snapshot re-picks a shallower boundary rather than
+        // resume ahead of the KV it actually has.
+        let (reusable, ckpt) = kv.hit_prefix(node, true, 8);
+        assert_eq!((reusable, ckpt.unwrap().boundary_tokens), (4, 4));
+        // Nothing resumable is nothing reused: the caller re-prefills instead of attaching.
+        let (reusable, ckpt) = kv.hit_prefix(node, true, 3);
+        assert_eq!((reusable, ckpt.is_none()), (0, true));
+    }
+
+    #[test]
+    fn aux_budget_trims_the_coldest_snapshots_before_any_frame() {
+        let mut kv = cache_ram(8, 8); // aux budget = 8 MiB RAM backing / 8 = 1 MiB
+        let a = grow(&mut kv, 2);
+        kv.publish_with_ckpts((1..=8).collect(), a.clone(), vec![ckpt(4, 400_000)])
+            .unwrap();
+        let b = grow(&mut kv, 2);
+        kv.publish_with_ckpts((21..=28).collect(), b.clone(), vec![ckpt(8, 400_000)])
+            .unwrap();
+        assert_eq!(kv.aux_bytes, 800_000, "both snapshots fit");
+        // A third snapshot exceeds the budget: the COLDEST entry's aux leaves first...
+        let c = grow(&mut kv, 2);
+        kv.publish_with_ckpts((41..=48).collect(), c.clone(), vec![ckpt(8, 400_000)])
+            .unwrap();
+        assert_eq!(kv.aux_bytes, 800_000);
+        assert!(
+            kv.entry_ckpt(node_of(&kv, a[0]), 8).is_none(),
+            "the coldest snapshot was trimmed"
+        );
+        // ...while its FRAMES and its match stay intact: aux never evicts cache content.
+        assert!(kv.best_match(&(1..=8).collect::<Vec<_>>()).is_some());
+        assert_eq!(kv.evictions, 0);
+        // A single conversation may not monopolize the budget either.
+        let d = grow(&mut kv, 2);
+        kv.publish_with_ckpts(
+            (61..=68).collect(),
+            d.clone(),
+            vec![ckpt(8, 3 * FB as usize)],
+        )
+        .unwrap();
+        assert_eq!(
+            kv.aux_bytes, 0,
+            "every other snapshot was trimmed and the oversized incoming one dropped"
+        );
+        assert!(kv.entry_ckpt(node_of(&kv, d[0]), 8).is_none());
+    }
+
+    #[test]
+    fn eviction_and_supersession_release_aux_bytes() {
+        let mut kv = cache_ram(8, 8);
+        let short = grow(&mut kv, 2);
+        kv.publish_with_ckpts((1..=8).collect(), short.clone(), vec![ckpt(4, 300_000)])
+            .unwrap();
+        kv.session_release(&short);
+        assert_eq!(kv.aux_bytes, 300_000);
+        // Publishing a longer conversation supersedes the shared ancestor entry: its snapshot
+        // bytes must leave the budget together with its chain owners.
+        let mut long = kv.entry_chain(node_of(&kv, short[0]), 8);
+        kv.session_attach(&long);
+        long.push(grow(&mut kv, 1)[0]);
+        kv.publish_with_ckpts((1..=12).collect(), long.clone(), vec![ckpt(12, 500_000)])
+            .unwrap();
+        assert_eq!(kv.aux_bytes, 500_000, "the superseded snapshot left");
+        kv.session_release(&long);
+        assert!(kv.evict_cold_one());
+        assert_eq!(kv.aux_bytes, 0, "eviction released the last snapshot");
+        assert!(kv.nodes.iter().all(|node| node
+            .entry
+            .as_ref()
+            .is_none_or(|entry| entry.ckpts.is_empty())));
+    }
+
+    #[test]
+    fn publish_rejects_a_snapshot_that_is_not_a_page_aligned_prefix() {
+        let mut kv = cache_ram(16, 8);
+        let a = grow(&mut kv, 2);
+        let tokens = (1..=8).collect::<Vec<u32>>();
+        assert!(
+            kv.publish_with_ckpts(tokens.clone(), a.clone(), vec![ckpt(6, 64)])
+                .is_err(),
+            "boundary is not page aligned"
+        );
+        assert!(
+            kv.publish_with_ckpts(tokens.clone(), a.clone(), vec![ckpt(0, 64)])
+                .is_err(),
+            "empty boundary"
+        );
+        assert!(
+            kv.publish_with_ckpts(tokens.clone(), a.clone(), vec![ckpt(16, 64)])
+                .is_err(),
+            "boundary lies beyond the chain"
+        );
+        // The rejected publishes pinned nothing: the tree is still empty.
+        assert_eq!(kv.pool.refcount(a[0]), 1);
+        assert!(kv.nodes.iter().all(|node| node.entry.is_none()));
     }
 }

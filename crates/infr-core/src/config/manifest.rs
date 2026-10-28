@@ -158,6 +158,7 @@ knobs! {
     "INFR_KV_RAM_CACHE_MAX"      => "kv.ram_cache_max",        Size,        Ignored, "16GiB",  migrated;
     "INFR_NO_KV_RING"           => "kv.ring",                PresenceInv, Ignored, "1",    migrated;
     "INFR_NO_DYNAMIC_KV"        => "kv.dynamic",             PresenceInv, Ignored, "1",    migrated;
+    "INFR_KV_PAGED"             => "kv.paged",               Flag,        Ignored, "1",    migrated;
     "INFR_KV_PAGED_PAGE_TOKENS" => "kv.paged_page_tokens",    Int,         Ignored, "64",   migrated;
     "INFR_KV_PAGED_CACHE_MAX"   => "kv.paged_cache_max",      Size,        Ignored, "16GiB", migrated;
     "INFR_KV_DISK_CACHE_MAX"    => "kv.disk_cache_max",       Size,        Ignored, "64GiB", migrated;
@@ -225,6 +226,7 @@ knobs! {
     "INFR_FLASH_STAGE"    => "kernels.vulkan.flash_stage",      Presence,         Ignored, "1",  migrated;
     "INFR_FLASH_DEQUANT"  => "kernels.vulkan.flash_dequant",    Presence,         Ignored, "1",  migrated;
     "INFR_NO_FLASH_WARP"  => "kernels.vulkan.flash_warp",       PresenceInv,      Ignored, "1",  migrated;
+    "INFR_AMDVLK_HD256_FLASH" => "kernels.vulkan.amdvlk_hd256_flash", Presence,  Ignored, "1",  migrated;
     "INFR_NO_NC_FA"       => "kernels.vulkan.nc_fa",            PresenceInv,      Ignored, "1",  migrated;
     "INFR_NO_QK_WARP"     => "kernels.vulkan.qk_warp",          PresenceInv,      Ignored, "1",  migrated;
     "INFR_NO_PV_WARP"     => "kernels.vulkan.pv_warp",          PresenceInv,      Ignored, "1",  migrated;

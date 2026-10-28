@@ -66,6 +66,12 @@ const LOOKUP_COST_COOLDOWN_TOKENS: usize = 128;
 /// (the temp path is per-process + per-seq; an explicit `kv.disk_cache_path` bypasses this).
 static DISK_BACKING_SEQ: AtomicUsize = AtomicUsize::new(0);
 
+/// Aux (recurrent/PLE) snapshot cap for the corridor-only tree (`kv.paged` with no
+/// `kv.paged_cache_max`), where the RAM tier has no size to take an eighth of. One Qwen3.8 boundary
+/// snapshot measures ~113 MiB, so this holds a handful of resumable frontiers without pretending to
+/// be a prefix cache. A `kv.paged_cache_max` pool still derives its own (larger) budget as before.
+const PAGED_AUX_CORRIDOR_BUDGET: usize = 512 << 20;
+
 /// One projector result handed to the text model. Kept backend-neutral so `infr-llama` does not
 /// depend on the optional vision crate.
 #[derive(Clone)]
@@ -819,6 +825,12 @@ struct BatchWork {
     phase: BatchPhase,
     prefill_start: usize,
     checkpoint_boundaries: [Option<usize>; crate::seam::TURN_CHECKPOINT_COUNT],
+    /// Paged tier: the page-aligned prefill position at which this work's slot captures the
+    /// recurrent/PLE snapshot its radix entry publishes (see
+    /// [`crate::seam::PreparedParallelPrompt::paged_frontier`]). Cleared once crossed, like a
+    /// turn checkpoint — a later phase stopping at the same position would otherwise capture the
+    /// state AFTER the boundary and publish it under the boundary's label.
+    paged_frontier: Option<usize>,
     turn_checkpoint: Option<crate::seam::TurnCheckpoint>,
     mrope_plan: Option<crate::seam::MropePlan>,
     multimodal_key: Option<MultimodalKey>,
@@ -1555,17 +1567,57 @@ impl ParallelSeam {
         Ok(engine)
     }
 
+    /// Refusal used by every persistent session-state tier: the tree, the RAM pool and the disk
+    /// cache all release a conversation's rows and re-attach them elsewhere, which IS the segmented
+    /// KV layout. Each used to fail with the same sentence naming `kv.paged_cache_max` even when the
+    /// operator had asked for `kv.paged`, and none of them said WHICH gate of the AND the session
+    /// missed — on a device with more VRAM the answer is usually "the experts never got paged, so
+    /// there is no arena", which no config spelling of `kv.*` can fix.
+    fn segmented_kv_refusal(&self, requested: &str) -> anyhow::Error {
+        use infr_core::backend::Backend;
+        let ec = self.model.engine_cfg();
+        let cfg = self.model.config().clone();
+        let arena = Backend::segmented_kv_available(self.vk.as_ref());
+        let blockers = {
+            let pool = self.pool.lock().expect("fresh pool");
+            match pool.slots.first().and_then(|slot| slot.kv.as_ref()) {
+                Some(kv) => {
+                    let meta = kv.session_state_meta();
+                    crate::seam::segmented_kv_blockers(
+                        &cfg,
+                        ec,
+                        kv.kv_ring(),
+                        meta.k_fmt,
+                        meta.v_fmt,
+                        arena,
+                    )
+                }
+                None => vec!["no KV slot exists yet".to_string()],
+            }
+        };
+        anyhow!(
+            "{requested} needs dynamic segmented KV, and this session does not have it. Unmet \
+             condition(s):\n  - {}",
+            blockers.join("\n  - ")
+        )
+    }
+
     fn init_session_cache(&mut self) -> Result<()> {
         let ec = self.model.engine_cfg();
-        if ec.kv.disk_cache_max.is_some() && ec.kv.paged_cache_max.is_none() {
+        // Two switches used to be one: `kv.paged_cache_max` both opened the tree and sized its
+        // host-RAM frame pool. `kv.paged` splits them so the tree can run entirely inside the VRAM
+        // frame corridor. A pool still implies the tree, so every pre-existing config resolves the
+        // same way it did before this field existed.
+        let paged_tree = ec.kv.paged || ec.kv.paged_cache_max.is_some();
+        if ec.kv.disk_cache_max.is_some() && !paged_tree {
             // The disk tier only exists behind the paged tree's RAM pool; on the blob/RAM-blob
             // paths it would silently do nothing, so make the half-config loud.
             tracing::warn!(
-                "kv.disk_cache_max is set without kv.paged_cache_max: the disk frame tier only \
-                 backs the paged KV tree and stays closed (enable kv.paged_cache_max)"
+                "kv.disk_cache_max is set without a paged KV tree: the disk frame tier only \
+                 backs the paged KV tree and stays closed (enable kv.paged or kv.paged_cache_max)"
             );
         }
-        if ec.kv.paged_cache_max.is_none() && ec.kv.paged_page_tokens != crate::seam::KV_GROW_ROWS {
+        if !paged_tree && ec.kv.paged_page_tokens != crate::seam::KV_GROW_ROWS {
             // Shrink-wrapped pages only pay off inside the paged tree; on the plain blob path every
             // page is another grow step with nothing shared. Usually a forgotten `paged_cache_max`
             // rather than an intentional geometry experiment, so make the half-config loud.
@@ -1574,30 +1626,37 @@ impl ParallelSeam {
             "kv.paged_page_tokens is set without kv.paged_cache_max: the blob KV grows in small segments and shares nothing (geometry-experiment mode; enable kv.paged_cache_max for real prefix reuse)"
         );
         }
-        if let Some(spec) = ec.kv.paged_cache_max {
+        if paged_tree {
             use infr_core::backend::Backend;
             if ec.kv.ram_cache_max.is_some() {
                 return Err(anyhow!(
                 "kv.paged_cache_max and kv.ram_cache_max are mutually exclusive; enable one KV prefix tier"
             ));
             }
-            // Zero disables the paged tier exactly like the RAM blob tier's zero (see the symmetric
-            // branch below): the switch stays "set" yet nothing is claimed, and the disk session
-            // cache, when configured, keeps working (PR #86 review point 3 semantics).
-            let paged_budget = match spec {
-                infr_core::SizeSpec::Bytes(bytes)
-                | infr_core::SizeSpec::FrozenAutomaticBytes(bytes) => bytes,
-                infr_core::SizeSpec::Percent(fraction) => match infr_core::hostmem::total_bytes() {
-                    Some(total) => (total as f64 * fraction) as u64,
-                    None => {
-                        return Err(anyhow!(
-                            "kv.paged_cache_max percentages need a known physical RAM total; \
+            // A zero pool disables the RAM TIER exactly like the RAM blob tier's zero (see the
+            // symmetric branch below): the switch stays "set" yet nothing is claimed, and the disk
+            // session cache, when configured, keeps working (PR #86 review point 3 semantics). With
+            // `kv.paged` the tree itself is separately requested, so a zero pool means "corridor
+            // only", not "off".
+            let paged_budget = match ec.kv.paged_cache_max {
+                None => 0,
+                Some(spec) => match spec {
+                    infr_core::SizeSpec::Bytes(bytes)
+                    | infr_core::SizeSpec::FrozenAutomaticBytes(bytes) => bytes,
+                    infr_core::SizeSpec::Percent(fraction) => {
+                        match infr_core::hostmem::total_bytes() {
+                            Some(total) => (total as f64 * fraction) as u64,
+                            None => {
+                                return Err(anyhow!(
+                                "kv.paged_cache_max percentages need a known physical RAM total; \
                          use an absolute GiB/MiB size"
-                        ))
+                            ))
+                            }
+                        }
                     }
                 },
             };
-            if paged_budget == 0 {
+            if paged_budget == 0 && !ec.kv.paged {
                 tracing::info!("paged KV prefix cache disabled by a zero size limit");
                 return Ok(());
             }
@@ -1626,9 +1685,12 @@ impl ParallelSeam {
                 )
             };
             if !supports_release {
-                return Err(anyhow!(
-                "kv.paged_cache_max requires dynamic segmented KV; use Qwen3.5/3.6/3.8 with Q8 KV and leave kv.dynamic enabled"
-            ));
+                let requested = match (ec.kv.paged, ec.kv.paged_cache_max.is_some()) {
+                    (true, true) => "kv.paged + kv.paged_cache_max",
+                    (true, false) => "kv.paged (the corridor-only paged KV tree)",
+                    _ => "kv.paged_cache_max",
+                };
+                return Err(self.segmented_kv_refusal(requested));
             }
             if ec.kv.session_cache_dir.is_some() {
                 tracing::warn!(
@@ -1679,9 +1741,9 @@ impl ParallelSeam {
             }
             // Phase B sizes the frame space to the FULL VRAM KV space (every slot x every page),
             // per the plan: sessions and the tree share one frame pool, the tree is what's left
-            // after the resident chains. `spec` (the RAM tier budget) lands with Phase C's DMA
-            // pool. The arena is sharded (~2 GiB ReBAR pieces), so this request arrives as one
-            // corridor at small ctx and as several when it exceeds a shard's largest free gap.
+            // after the resident chains. The RAM tier budget (`kv.paged_cache_max`) lands with
+            // Phase C's DMA pool. The arena is sharded (~2 GiB ReBAR pieces), so this request arrives
+            // as one corridor at small ctx and as several when it exceeds a shard's largest free gap.
             let budget_frames = n_slots * meta.max_ctx.div_ceil(page_tokens);
             let corridors = Backend::alloc_kv_frames(self.vk.as_ref(), frame_bytes, budget_frames)?
                 .ok_or_else(|| {
@@ -1700,10 +1762,11 @@ impl ParallelSeam {
                     "paged KV frame pool is smaller than the full ctx budget; cold tree entries evict earlier"
                 );
             }
-            // Phase C: `spec` is the RAM tier budget. Frames sunk out of the VRAM corridor live in
-            // a lazily grown host backing (high-water mark = ram_frames * frame_bytes), so a big
-            // budget costs nothing until prefixes actually demote. Zero budget keeps the tier off
-            // and the tree behaves exactly like Phase B (cold entries evict instead of sink).
+            // Phase C: `paged_budget` is the RAM tier budget. Frames sunk out of the VRAM corridor
+            // live in a lazily grown host backing (high-water mark = ram_frames * frame_bytes), so a
+            // big budget costs nothing until prefixes actually demote. Zero budget keeps the tier off
+            // and the tree behaves exactly like Phase B (cold entries evict instead of sink) — which
+            // is the whole point of `kv.paged`, the switch that asks for a tree without a pool.
             let ram_frames = (paged_budget / frame_bytes) as usize;
             // Phase D: `kv.disk_cache_max` sizes the sparse-file tier behind RAM. Resolution
             // mirrors the RAM budget's grammar (percent = of physical RAM, an odd denominator
@@ -1716,15 +1779,30 @@ impl ParallelSeam {
                     infr_core::SizeSpec::Percent(fraction) => {
                         match infr_core::hostmem::total_bytes() {
                             Some(total) => (total as f64 * fraction) as u64,
-                            None => return Err(anyhow!(
+                            None => {
+                                return Err(anyhow!(
                                 "kv.disk_cache_max percentages need a known physical RAM total; \
                                      use an absolute GiB/MiB size"
-                            )),
+                            ))
+                            }
                         }
                     }
                 },
             };
-            let disk_frames = (disk_budget / frame_bytes) as usize;
+            // Frames only ever reach disk through a RAM frame: demotion writes VRAM->RAM and the
+            // cascade moves RAM->disk, and a hit reads back the same way. With no RAM tier there is
+            // no route, so the disk budget stays closed rather than half-wired.
+            let disk_frames = if disk_budget == 0 || ram_frames == 0 {
+                if disk_budget > 0 {
+                    tracing::warn!(
+                        "kv.disk_cache_max needs the RAM frame tier that sinks through it: enable \
+                         kv.paged_cache_max (the corridor-only tree has no route to the disk tier)"
+                    );
+                }
+                0
+            } else {
+                (disk_budget / frame_bytes) as usize
+            };
             let disk_path = (disk_frames > 0).then(|| {
                 ec.kv.disk_cache_path.clone().unwrap_or_else(|| {
                     // Per-process (and per-engine within a process) default under the temp dir:
@@ -1746,20 +1824,30 @@ impl ParallelSeam {
                 disk_path,
             );
             tree.set_vram_segments(&corridors);
+            if ram_frames == 0 {
+                // The `RAM tier / 8` derivation has no tier to divide. A zero aux cap is not a
+                // smaller cache here, it is NO cache: `PagedKv::hit_prefix` admits a recurrent
+                // resume point only at a snapshot boundary, so a hybrid model (DeltaNet/KDA/PLE)
+                // would silently re-prefill every tree hit. Snapshots still cost host RAM one
+                // buffer at a time — a Qwen3.8 boundary snapshot is ~113 MiB — never reserved up
+                // front, which is what makes a pool-less tree cheap without making it inert.
+                tree.set_aux_budget(PAGED_AUX_CORRIDOR_BUDGET);
+            }
             tracing::info!(
                 page_tokens,
                 vram_frames,
                 frame_bytes,
                 corridors = corridors.len(),
                 corridor_bytes = frame_bytes * vram_frames as u64,
-                ram_budget = ?spec,
+                ram_budget = ?ec.kv.paged_cache_max,
                 ram_frames,
                 ram_bytes = frame_bytes * ram_frames as u64,
+                pool_less = ram_frames == 0,
                 disk_budget = ?ec.kv.disk_cache_max,
                 disk_frames,
                 disk_bytes = frame_bytes * disk_frames as u64,
                 tree = %tree.stats_line(),
-                "paged KV radix prefix cache ready (frames held by the tree, zero-copy prefix reuse, multimodal sessions never enter the tree, cold chains sink to the RAM tier and cascade to the disk tier before eviction)"
+                "paged KV radix prefix cache ready (frames held by the tree, zero-copy prefix reuse, multimodal sessions never enter the tree; cold chains sink to the RAM tier and cascade to the disk tier before eviction when a RAM tier is configured, and evict outright when there is none)"
             );
             let tree = Arc::new(Mutex::new(tree));
             self.paged_cache = Some(Arc::clone(&tree));
@@ -1797,9 +1885,7 @@ impl ParallelSeam {
                 (kv.can_release_session_state(), kv.session_state_meta())
             };
             if !supports_release {
-                return Err(anyhow!(
-                "kv.ram_cache_max requires dynamic segmented KV; use Qwen3.5/3.6/3.8 with Q8 KV and leave kv.dynamic enabled"
-            ));
+                return Err(self.segmented_kv_refusal("kv.ram_cache_max"));
             }
             if ec.kv.session_cache_dir.is_some() {
                 tracing::warn!(
@@ -1827,9 +1913,7 @@ impl ParallelSeam {
             (kv.can_release_session_state(), kv.session_state_meta())
         };
         if !supports_release {
-            return Err(anyhow!(
-                "kv.session_cache_dir requires dynamic segmented KV; use Qwen3.5/3.6/3.8 with Q8 KV and leave kv.dynamic enabled"
-            ));
+            return Err(self.segmented_kv_refusal("kv.session_cache_dir"));
         }
         self.session_cache = SessionCache::open(self.model.engine_cfg(), self.model.gguf(), &meta)?
             .map(|cache| Arc::new(Mutex::new(cache)));
@@ -2782,6 +2866,8 @@ impl ParallelSeam {
             .as_ref()
             .expect("paged checkout requires a paged cache");
         let cfg: &Config = self.model.config();
+        // Hybrid recurrent models pin reuse to snapshot boundaries; a dense model resumes anywhere.
+        let recurrent = cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3;
         let mut pool = self.pool.lock().expect("pool poisoned");
         loop {
             let free = (0..pool.slots.len())
@@ -2830,6 +2916,18 @@ impl ParallelSeam {
             let mut target_kv = pool.slots[target].kv.take();
             drop(pool);
 
+            // A hybrid recurrent slot resumes only INSIDE its own conversation: the runner needs a
+            // strict extension of `cached`, since the DeltaNet/PLE summary cannot rewind to a
+            // shorter history. Replaying the same prompt therefore keeps nothing resident — and
+            // publishing it is what turns the replay into an attach: the entry's frontier snapshot
+            // resumes the request at the last page boundary, so a 30K repeat costs the sub-page
+            // tail instead of a second 30K prefill.
+            let continuation_prefix = if recurrent && continuation_prefix >= prompt.len() {
+                0
+            } else {
+                continuation_prefix
+            };
+
             let mut tree_attached = 0usize;
             {
                 // One pass owns both the inference baton and the tree: no dispatch can observe a
@@ -2860,8 +2958,9 @@ impl ParallelSeam {
                 }
 
                 // 1. The old conversation leaves FIRST (different-prefix swap), so the tree sees
-                //    it before the new prompt matches, and the frames are never in limbo.
-                if continuation.is_none() {
+                //    it before the new prompt matches, and the frames are never in limbo. A
+                //    continuation that survived the replay rule above keeps its slot warm instead.
+                if continuation_prefix == 0 {
                     if let Some(kv) = target_kv.as_mut() {
                         if kv.cached_len() != 0 || kv.paged_holds_frames() {
                             match kv.paged_publish_detach(self.vk.as_ref(), cfg, &mut tree) {
@@ -2901,7 +3000,11 @@ impl ParallelSeam {
 
                 // 2. Deepest page-aligned chain the tree can serve (counts a hit/miss itself).
                 //    A resident continuation only loses to a STRICTLY deeper tree chain.
-                if let Some((node, reusable)) = tree.best_match(prompt) {
+                if let Some((node, matched)) = tree.best_match(prompt) {
+                    // A dense model resumes wherever it matched; a hybrid recurrent model only at a
+                    // boundary its entry carries a snapshot for (see `PagedKv::hit_prefix`).
+                    let pages = tree.page_tokens();
+                    let (mut reusable, mut ckpt) = tree.hit_prefix(node, recurrent, matched);
                     if reusable > continuation_prefix {
                         // A continuation slot that skipped step 1 may still hold its conversation
                         // (and the failed-publish path leaves the chain warm). Attach needs an
@@ -2930,25 +3033,36 @@ impl ParallelSeam {
                         }
                         if ready {
                             // Phase C: RAM frames in the matched chain DMA back into VRAM before
-                            // the attach (the page table never sees a RAM address). A chain VRAM
-                            // cannot fully host attaches at its deepest promotable prefix; the
-                            // un-promoted tail stays sunk and the rest re-prefills.
-                            let frames =
+                            // the attach (the page table never sees a RAM address). VRAM that
+                            // cannot host the whole chain attaches at its deepest promotable
+                            // prefix; the un-promoted tail stays sunk and the rest re-prefills.
+                            let mut chain =
                                 tree.entry_chain_promoted(self.vk.as_ref(), node, reusable);
-                            let reusable = frames.len() * tree.page_tokens();
-                            if let Some(kv) = target_kv.as_mut().filter(|_| !frames.is_empty()) {
+                            // Promotion may fall short of the request. Re-pick against what
+                            // actually arrived, then cut the chain back to the reuse point: a
+                            // snapshot must never describe MORE tokens than the attached chain
+                            // covers, and frames the slot never points at stay tree-owned.
+                            let promoted = chain.len() * pages;
+                            if promoted < reusable {
+                                (reusable, ckpt) = tree.hit_prefix(node, recurrent, promoted);
+                                chain.truncate(reusable / pages);
+                            }
+                            if let Some(kv) = target_kv.as_mut().filter(|_| !chain.is_empty()) {
+                                let aux = ckpt.is_some();
                                 match kv.paged_attach(
                                     self.vk.as_ref(),
                                     cfg,
                                     &mut tree,
-                                    &frames,
+                                    &chain,
                                     &prompt[..reusable],
+                                    ckpt,
                                 ) {
                                     Ok(()) => {
                                         tree_attached = reusable;
                                         tracing::info!(
                                             slot = target,
                                             cached_prefix_tokens = reusable,
+                                            aux,
                                             tree = %tree.stats_line(),
                                             "paged KV prefix hit (zero-copy frame attach)"
                                         );
@@ -3923,6 +4037,7 @@ impl ParallelSeam {
         };
         work.prefill_start = prepared.start;
         work.checkpoint_boundaries = prepared.checkpoint_boundaries;
+        work.paged_frontier = prepared.paged_frontier;
         work.stats.n_prompt = work
             .stats
             .n_prompt
@@ -3976,6 +4091,7 @@ impl ParallelSeam {
             .map(|work| crate::seam::PreparedParallelPrompt {
                 start: work.prefill_start,
                 checkpoint_boundaries: work.checkpoint_boundaries,
+                paged_frontier: work.paged_frontier,
             })
             .collect::<Vec<_>>();
         let progress_senders = long
@@ -4073,6 +4189,12 @@ impl ParallelSeam {
                 if boundary.is_some_and(|boundary| cached_len >= boundary) {
                     *boundary = None;
                 }
+            }
+            if work
+                .paged_frontier
+                .is_some_and(|frontier| cached_len >= frontier)
+            {
+                work.paged_frontier = None;
             }
             work.phase = phase_for_remaining_prefill(work.remaining_prefill());
             let progress = infr_core::GenerationProgress {
@@ -4616,6 +4738,12 @@ impl ParallelSeam {
                     *boundary = None;
                 }
             }
+            if work
+                .paged_frontier
+                .is_some_and(|frontier| cached_len >= frontier)
+            {
+                work.paged_frontier = None;
+            }
             work.phase = phase_for_remaining_prefill(work.remaining_prefill());
             let eos = outputs[lane].last().is_some_and(|token| {
                 !self.model.engine_cfg().sampling.ignore_eos
@@ -4785,6 +4913,7 @@ impl ParallelSeam {
                 .n_prompt
                 .saturating_add(prompt.len().saturating_sub(start));
             work.checkpoint_boundaries = prepared.checkpoint_boundaries;
+            work.paged_frontier = prepared.paged_frontier;
             work.phase = phase_for_remaining_prefill(work.remaining_prefill());
             work.turn_checkpoint = None;
             work.mtp_ready = false;
@@ -6038,6 +6167,7 @@ impl ParallelSeam {
             phase: BatchPhase::Unprepared,
             prefill_start: 0,
             checkpoint_boundaries: [None; crate::seam::TURN_CHECKPOINT_COUNT],
+            paged_frontier: None,
             turn_checkpoint,
             mrope_plan: None,
             multimodal_key: None,
@@ -6182,6 +6312,7 @@ impl ParallelSeam {
                 phase: BatchPhase::Unprepared,
                 prefill_start: 0,
                 checkpoint_boundaries: [None; crate::seam::TURN_CHECKPOINT_COUNT],
+                paged_frontier: None,
                 turn_checkpoint,
                 mrope_plan: Some(plan),
                 multimodal_key: Some(key),
@@ -6322,6 +6453,7 @@ impl ParallelSeam {
             phase: phase_for_remaining_prefill(remaining_prefill),
             prefill_start,
             checkpoint_boundaries: [None; crate::seam::TURN_CHECKPOINT_COUNT],
+            paged_frontier: None,
             turn_checkpoint: None,
             mrope_plan: Some(plan),
             multimodal_key: Some(key),

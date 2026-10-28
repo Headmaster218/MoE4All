@@ -212,6 +212,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.kv.ram_cache_max = opt_size(get, "INFR_KV_RAM_CACHE_MAX");
     p.kv.ring = presence_inv(get, "INFR_NO_KV_RING");
     p.kv.dynamic = presence_inv(get, "INFR_NO_DYNAMIC_KV");
+    p.kv.paged = flag(get, "INFR_KV_PAGED");
     p.kv.paged_page_tokens = num_pos(get, "INFR_KV_PAGED_PAGE_TOKENS");
     p.kv.paged_cache_max = opt_size(get, "INFR_KV_PAGED_CACHE_MAX");
     p.kv.disk_cache_max = opt_size(get, "INFR_KV_DISK_CACHE_MAX");
@@ -284,6 +285,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     v.flash_stage = presence(get, "INFR_FLASH_STAGE");
     v.flash_dequant = presence(get, "INFR_FLASH_DEQUANT");
     v.flash_warp = presence_inv(get, "INFR_NO_FLASH_WARP");
+    v.amdvlk_hd256_flash = presence(get, "INFR_AMDVLK_HD256_FLASH");
     v.nc_fa = presence_inv(get, "INFR_NO_NC_FA");
     v.qk_warp = presence_inv(get, "INFR_NO_QK_WARP");
     v.pv_warp = presence_inv(get, "INFR_NO_PV_WARP");

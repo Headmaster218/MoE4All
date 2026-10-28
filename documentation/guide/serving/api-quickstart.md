@@ -12,7 +12,7 @@ verified_commit: ed62393068679573afe94a1472454efe7eae0f15
 
 ## 查找模型与鉴权
 
-`GET /health` 无需鉴权。设置了非空 `serve.api_key` 时，`/v1/models` 和生成、嵌入接口都要求 `Authorization: Bearer <key>`；空字符串等于未启用鉴权。
+`GET /health` 无需鉴权。设置了非空 `serve.api_key` 时，`/v1/models`、生成、嵌入接口和 Responses 的状态端点（`GET`/`DELETE`/`POST .../cancel`）都要求 `Authorization: Bearer <key>`；空字符串等于未启用鉴权。
 
 **本机使用 `127.0.0.1`；局域网访问可用 `0.0.0.0`，但应启用 API key。** 不带鉴权地把服务绑定到非回环地址（例如 `--addr 0.0.0.0:8080`），等于把本机的模型能力开放给同网段的所有人。
 
@@ -44,14 +44,26 @@ Invoke-RestMethod -Method Post -Uri "$base/v1/chat/completions" -Headers $header
 
 ## Responses API
 
-0.9.0 提供无状态 `POST /v1/responses`，接受字符串或消息数组形式的 `input`，支持 JSON 响应和 typed SSE：
+`POST /v1/responses` 接受字符串或消息数组形式的 `input`，支持 JSON 响应和 typed SSE：
 
 ```powershell
 $request = @{ model = $chatModel; input = '用一句话解释 Prefill。'; max_output_tokens = 128; stream = $false } | ConvertTo-Json
 Invoke-RestMethod -Method Post -Uri "$base/v1/responses" -Headers $headers -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($request))
 ```
 
-本接口不保存服务端对话：`previous_response_id`、`conversation` 和 `store=true` 会被拒绝。需要连续对话时，由客户端传入完整的相关历史。当前也不支持远程图片 URL、`file_id`、`input_file`、自动截断和 hosted tools；不要把它当作完整的云端 Responses API。
+默认配置下这个接口不保存服务端对话：`previous_response_id`、`conversation` 和 `store=true` 会被拒绝，并指名你实际发送的那个字段。需要连续对话时，由客户端传入完整的相关历史。
+
+启动时加上 `--set serve.response_store_entries=16`（或设 `INFR_RESPONSE_STORE_ENTRIES=16`）即开启服务端状态：`store` 的默认值随之变为 `true`，`previous_response_id` 与 `conversation` 可重放上一轮，`input` 里可以用 `{"type":"item_reference","id":"..."}` 引用此前输出的条目，并多出 `GET /v1/responses`、`GET|DELETE /v1/responses/{id}`、`GET /v1/responses/{id}/input_items` 与 `POST /v1/responses/{id}/cancel` 几个端点。历史链的用法是：
+
+```powershell
+$first = Invoke-RestMethod -Method Post -Uri "$base/v1/responses" -Headers $headers -ContentType 'application/json; charset=utf-8' `
+  -Body ([Text.Encoding]::UTF8.GetBytes((@{ model = $chatModel; input = '用一句话解释 Prefill。' } | ConvertTo-Json)))
+Invoke-RestMethod -Method Post -Uri "$base/v1/responses" -Headers $headers -ContentType 'application/json; charset=utf-8' `
+  -Body ([Text.Encoding]::UTF8.GetBytes((@{ model = $chatModel; previous_response_id = $first.id; input = '那 Decode 呢？' } | ConvertTo-Json)))
+Invoke-RestMethod -Uri "$base/v1/responses/$($first.id)/input_items" -Headers $headers
+```
+
+这份状态是进程内、LRU 有界、重启即失的：被淘汰或随重启消失的 id，之后引用它会得到明确的 400，而不是悄悄从空上下文继续。`conversation` 配 `store=false` 同样被拒绝，因为未存储的轮次无法推进游标。`.../cancel` 总是返回 400——本服务器同步生成，响应在被赋予 id 时已经完成，要停止就断开这条流。当前仍不支持远程图片 URL、`file_id`、`input_file`、自动截断和 hosted tools；不要把它当作完整的云端 Responses API。
 
 ## 图片与嵌入
 

@@ -2424,22 +2424,12 @@ fn main() {
         (
             "native_gemv_id_multi",
             "native_idm_iq3xxs_buffer_nr4_paged",
-            &[
-                "-DFMT_IQ3XXS",
-                "-DIQ3XXS_GRID_BUFFER",
-                "-DPAGED",
-                "-DNR=4",
-            ],
+            &["-DFMT_IQ3XXS", "-DIQ3XXS_GRID_BUFFER", "-DPAGED", "-DNR=4"],
         ),
         (
             "native_gemv_id_multi",
             "native_idm_iq3xxs_buffer_nr8_paged",
-            &[
-                "-DFMT_IQ3XXS",
-                "-DIQ3XXS_GRID_BUFFER",
-                "-DPAGED",
-                "-DNR=8",
-            ],
+            &["-DFMT_IQ3XXS", "-DIQ3XXS_GRID_BUFFER", "-DPAGED", "-DNR=8"],
         ),
         // Qwen shared-expert decode: routed slots keep their native quant while the final slot
         // reads one fixed Q8_0 shared-expert matrix by BDA. Keep the format set aligned with

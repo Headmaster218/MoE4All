@@ -781,6 +781,11 @@ struct VulkanShared {
     /// Architecture bucket retained for narrow Vulkan kernel-policy decisions that must not leak
     /// vendor-specific flags into infr-core's backend-neutral `Capabilities`.
     device_arch: crate::caps::DeviceArch,
+    /// `VkPhysicalDeviceDriverProperties::driverID` and whether it was actually reported (ash's
+    /// default is `AMD_PROPRIETARY`, so an unreported id must never be read as one). Read only by
+    /// the amdvlk hd256 FlashAttention workaround in `adapter.rs` — never through `Capabilities`.
+    driver_id: vk::DriverId,
+    driver_id_reported: bool,
     /// Windows NVIDIA drivers can expose the BAR/ReBAR aperture as a second DEVICE_LOCAL heap
     /// backed by the same framebuffer. Count only the largest local heap for physical VRAM.
     largest_device_local_heap_only: bool,
@@ -3238,6 +3243,12 @@ impl VulkanBackend {
         self.shared.caps.max_shared_memory_bytes
     }
 
+    /// Whether the device positively reported `VK_DRIVER_ID_AMD_PROPRIETARY`. A device that never
+    /// reported a driverID reads `false` (ash's default would otherwise be misread as amdvlk).
+    pub(crate) fn is_amd_proprietary_driver(&self) -> bool {
+        self.shared.driver_id_reported && self.shared.driver_id == vk::DriverId::AMD_PROPRIETARY
+    }
+
     /// Borrowed capabilities — the kernel-tier fallback ladder's gate (`caps.f16_coopmat`,
     /// `caps.f16`, `caps.i8_dot`). Cheap: a reference, not the [`Backend::capabilities`] clone (which
     /// copies the `name: String`) — safe to call per-op inside the adapter's hot lowering loop.
@@ -5104,6 +5115,8 @@ impl VulkanBackend {
                 caps,
                 compute_subgroup_operations,
                 device_arch,
+                driver_id: device_probe.driver_id,
+                driver_id_reported: device_probe.driver_id_reported,
                 largest_device_local_heap_only: uses_largest_device_local_heap_only(
                     device_probe.vendor_id,
                     props.device_type,
@@ -5176,12 +5189,13 @@ impl VulkanBackend {
             // IQ3_XXS dq reads TWO tables (grid + sign), so the buffer carries both contiguous,
             // matching the `IQ3XXS_GRID_BUFFER` SSBO block (G_IQ3XXS[256] then KSIGNS[128]).
             let mut xx_words: Vec<u32> = infr_core::iquant_grids::IQ3XXS_GRID.to_vec();
-            xx_words.extend(infr_core::iquant_grids::KSIGNS_IQ2XS.iter().map(|&v| v as u32));
-            let grid = backend.make_buf(
-                xx_words.len() * 4,
-                MemoryLocation::GpuOnly,
-                "iq3xxs-grid",
-            )?;
+            xx_words.extend(
+                infr_core::iquant_grids::KSIGNS_IQ2XS
+                    .iter()
+                    .map(|&v| v as u32),
+            );
+            let grid =
+                backend.make_buf(xx_words.len() * 4, MemoryLocation::GpuOnly, "iq3xxs-grid")?;
             backend.upload(&grid, bytemuck::cast_slice(&xx_words))?;
             backend.iq3xxs_grid = Some(Arc::new(grid));
         }
@@ -8527,7 +8541,9 @@ impl Backend for VulkanBackend {
         let installed = self.kv_corridors.lock().unwrap();
         for (base, buffer) in installed.iter() {
             let committed = self.buffer_committed_bytes(buffer)? as u64;
-            if frame_addr >= *base && frame_addr.saturating_add(dst.len() as u64) <= *base + committed {
+            if frame_addr >= *base
+                && frame_addr.saturating_add(dst.len() as u64) <= *base + committed
+            {
                 let offset = (frame_addr - *base) as usize;
                 return self.download_range(buffer, offset, dst);
             }
@@ -8542,7 +8558,9 @@ impl Backend for VulkanBackend {
         let installed = self.kv_corridors.lock().unwrap();
         for (base, buffer) in installed.iter() {
             let committed = self.buffer_committed_bytes(buffer)? as u64;
-            if frame_addr >= *base && frame_addr.saturating_add(src.len() as u64) <= *base + committed {
+            if frame_addr >= *base
+                && frame_addr.saturating_add(src.len() as u64) <= *base + committed
+            {
                 let offset = (frame_addr - *base) as usize;
                 return self.upload_range(buffer, offset, src);
             }

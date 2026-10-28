@@ -7,7 +7,13 @@
 //!   GET  /health                -> 200 OK                                              (open)
 //!   GET  /v1/models             -> { object: "list", data: [{ id, object, owned_by }] } (auth)
 //!   POST /v1/chat/completions   -> chat.completion | SSE chat.completion.chunk stream   (auth)
-//!   POST /v1/responses          -> stateless Responses JSON | typed SSE stream         (auth)
+//!   POST /v1/responses          -> Responses JSON | typed SSE stream; stateless unless the
+//!                                   response store is enabled                     (auth)
+//!   GET  /v1/responses          -> stored-response page      | 400 with the store off   (auth)
+//!   GET  /v1/responses/{id}     -> stored response           | 404 unknown              (auth)
+//!   DELETE /v1/responses/{id}   -> {"deleted":true}                                    (auth)
+//!   GET  /v1/responses/{id}/input_items -> the items that turn was given               (auth)
+//!   POST /v1/responses/{id}/cancel      -> 400: nothing is queued to cancel            (auth)
 //!   POST /v1/embeddings         -> OpenAI-compatible normalized float embeddings         (auth)
 //!
 //! Two process-level limits bound one request's hold on a `--parallel` slot: `serve.max_tokens_cap`
@@ -2093,10 +2099,11 @@ pub struct AppState {
     /// Presentation-only slot registry. It mirrors admission permits but never participates in
     /// scheduling; request progress is read from each request's existing local state.
     dashboard: Arc<ActivityDashboard>,
-    /// Server-side `/v1/responses` state (`previous_response_id` chains, `conversation` cursors),
-    /// LRU-bounded by `serve.response_store_entries` (0 = feature OFF, chains rejected as before).
-    /// Holds message DTOs only — chained requests rebuild the same token prefix and the paged KV
-    /// radix tree hits it on its own; no KV is pinned here.
+    /// Server-side `/v1/responses` state (`previous_response_id` chains, `conversation` cursors,
+    /// stored envelopes for `retrieve`/`list`/`input_items`), LRU-bounded by
+    /// `serve.response_store_entries` (0 = feature OFF, state is rejected with a 400 as before).
+    /// Holds message DTOs and JSON only — chained requests rebuild the same token prefix and the
+    /// paged KV radix tree hits it on its own; no KV is pinned here.
     response_store: Arc<Mutex<responses::ResponseStore>>,
 }
 
@@ -2266,7 +2273,19 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health_handler))
         .route("/v1/models", get(models_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))
-        .route("/v1/responses", post(responses::handler))
+        .route(
+            "/v1/responses",
+            post(responses::handler).get(responses::list),
+        )
+        .route(
+            "/v1/responses/:response_id",
+            get(responses::retrieve).delete(responses::remove),
+        )
+        .route(
+            "/v1/responses/:response_id/input_items",
+            get(responses::input_items),
+        )
+        .route("/v1/responses/:response_id/cancel", post(responses::cancel))
         .route("/v1/embeddings", post(embeddings_handler))
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT))
         .with_state(state)

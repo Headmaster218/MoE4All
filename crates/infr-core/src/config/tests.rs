@@ -391,6 +391,10 @@ fn default_config_matches_documented_defaults() {
     assert_eq!(d.kv.session_cache_ttl_hours, 24);
     assert!(d.kv.ring);
     assert!(d.kv.dynamic);
+    // §6.3: the paged tree is opt-in and its RAM tier is a SEPARATE opt-in on top of it.
+    assert!(!d.kv.paged);
+    assert_eq!(d.kv.paged_cache_max, None);
+    assert_eq!(d.kv.paged_page_tokens, 32 * 1024);
     assert!(!d.kv.force_q8);
     assert_eq!(d.paging.trace, None);
     assert!(!d.paging.expert_prefetch);
@@ -2037,6 +2041,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_LAYER_MAJOR",
         "INFR_PULL_JOBS",
         "INFR_NO_MLA_SG",
+        "INFR_AMDVLK_HD256_FLASH",
         "INFR_NO_Q8_DECODE_CHUNK1024",
         "INFR_Q8_DECODE_REPLAY_CHUNK1024",
         "INFR_NO_Q8_QK_I8",
@@ -2053,6 +2058,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_KV_SESSION_CACHE_MAX",
         "INFR_KV_SESSION_CACHE_TTL_HOURS",
         "INFR_KV_RAM_CACHE_MAX",
+        "INFR_KV_PAGED",
         "INFR_KV_PAGED_PAGE_TOKENS",
         "INFR_KV_PAGED_CACHE_MAX",
         "INFR_KV_DISK_CACHE_MAX",

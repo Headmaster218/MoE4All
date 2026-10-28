@@ -2494,6 +2494,57 @@ pub(crate) fn segmented_kv_wanted(
         && v_fmt == DType::Q8_0
 }
 
+/// Every condition a persistent session-state tier still needs, as one readable list. The tree, the
+/// RAM pool and the disk cache all release a conversation's rows and re-attach them elsewhere, which
+/// IS [`segmented_kv_wanted`] — plus one runtime fact that no `kv.*` key controls: the segments are
+/// claimed from the unified VRAM arena, which only exists once the MoE experts are paged. Invariant
+/// (guarded by `segmented_kv_requires_q8_on_both_sides`): the list is empty exactly when the layout
+/// is available, so a refusal can always name the gate the session missed.
+pub(crate) fn segmented_kv_blockers(
+    cfg: &Config,
+    ec: &EngineConfig,
+    ring: bool,
+    k_fmt: DType,
+    v_fmt: DType,
+    arena_available: bool,
+) -> Vec<String> {
+    let mut blockers = Vec::new();
+    if !(cfg.qwen35 || cfg.qwen4exp) {
+        blockers
+            .push("this architecture has no segmented KV layout (only Qwen3.5/3.6/3.8 do)".into());
+    }
+    if !ec.kv.dynamic {
+        blockers.push("kv.dynamic is off (INFR_NO_DYNAMIC_KV, or --set kv.dynamic=false)".into());
+    }
+    if ec.kv.overflow {
+        blockers.push(
+            "kv.overflow is on: the overflow layout owns the KV rows, so none can be released"
+                .into(),
+        );
+    }
+    if ring {
+        blockers.push(
+            "the sliding-window layers were allocated as window-sized rings (kv.ring), which drop \
+             the early prefix rows a restore needs"
+                .into(),
+        );
+    }
+    if k_fmt != DType::Q8_0 || v_fmt != DType::Q8_0 {
+        blockers.push(format!(
+            "KV is {k_fmt:?}/{v_fmt:?}; the layout commits Q8_0/Q8_0 segments only"
+        ));
+    }
+    if !arena_available {
+        blockers.push(
+            "there is no unified VRAM arena: every MoE expert loaded resident, so no elastic device \
+             pool exists to back or re-attach segments (an arena appears only when experts are \
+             paged - reserve one with paging.cache / INFR_CACHE, or lower the device budget)"
+                .into(),
+        );
+    }
+    blockers
+}
+
 /// Per-slot persistent state as the allocator must reserve it. Dynamic Qwen caches occupy whole
 /// 32K physical segments, while recurrent/checkpoint state keeps its exact byte size.
 fn kv_state_reserve_bytes(
@@ -7454,6 +7505,38 @@ mod seam_helper_tests {
             DType::Q8_0,
             DType::Q8_0
         ));
+
+        // A refused session-state tier prints `segmented_kv_blockers` as the reason, so the list has
+        // to be empty exactly when the layout is available — including `arena_available`, the runner's
+        // one extra term that no `kv.*` key controls (a device with room for every expert resident
+        // never builds the arena and used to fail with a message about Qwen models and Q8 KV).
+        for (ring, k, v, arena) in [
+            (false, DType::Q8_0, DType::Q8_0, true),
+            (true, DType::Q8_0, DType::Q8_0, true),
+            (false, DType::F16, DType::Q8_0, true),
+            (false, DType::Q8_0, DType::Q8_0, false),
+        ] {
+            let blockers = super::segmented_kv_blockers(&cfg, &ec, ring, k, v, arena);
+            assert_eq!(
+                blockers.is_empty(),
+                super::segmented_kv_wanted(&cfg, &ec, ring, k, v) && arena,
+                "blockers {blockers:?} disagree at ring={ring} k={k:?} v={v:?} arena={arena}"
+            );
+        }
+        let no_arena =
+            super::segmented_kv_blockers(&cfg, &ec, false, DType::Q8_0, DType::Q8_0, false);
+        assert!(no_arena
+            .iter()
+            .any(|b| b.contains("unified VRAM arena") && b.contains("paging.cache")));
+        let plain = Config {
+            qwen35: false,
+            ..cfg.clone()
+        };
+        assert!(
+            super::segmented_kv_blockers(&plain, &ec, false, DType::Q8_0, DType::Q8_0, true)
+                .iter()
+                .any(|b| b.contains("Qwen3.5/3.6/3.8"))
+        );
     }
 
     #[test]

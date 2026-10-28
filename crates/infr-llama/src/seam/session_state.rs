@@ -62,6 +62,14 @@ impl SeamKv {
         self.segmented_kv.enabled
     }
 
+    /// Whether this session's sliding-window layers are window-sized rings. A refusal explanation
+    /// needs it (`crate::seam::segmented_kv_blockers` takes the same `ring` the runner used), and it
+    /// is per-session state: the backend capability only feeds the runner's local decision, so a
+    /// caller cannot re-derive it from the config alone.
+    pub(crate) fn kv_ring(&self) -> bool {
+        self.kv_ring
+    }
+
     pub(crate) fn session_state_buffers<'a>(
         &'a self,
         be: &dyn Backend,
@@ -378,6 +386,12 @@ impl SeamKv {
     /// `tokens` as the materialized conversation. ZERO-COPY: no bytes move — the frames already
     /// hold the KV; reuse is `frames.len() * planes` table writes plus one refcount owner each.
     /// The slot must be logically empty (the caller detaches first) and the GPU baton held.
+    ///
+    /// `ckpt` is the host snapshot of the recurrent/PLE state at `tokens.len()`, required by a
+    /// hybrid recurrent model: its frames resume attention, and nothing else can tell the model what
+    /// its conv window, recurrent matrix or PLE history were at that prefix. It is uploaded BEFORE
+    /// the page table is written so a table failure that rolls the slot back never leaves a half
+    /// attached state that a later request could read as its own history.
     pub(crate) fn paged_attach(
         &mut self,
         be: &dyn Backend,
@@ -385,6 +399,7 @@ impl SeamKv {
         kv: &mut PagedKv,
         frames: &[FrameId],
         tokens: &[u32],
+        ckpt: Option<std::sync::Arc<crate::paged_cache::PagedCkpt>>,
     ) -> Result<()> {
         if !self.segmented_kv.enabled || self.segmented_kv.paged.is_none() {
             return Err(anyhow!("paged attach requires a paged segmented KV slot"));
@@ -394,6 +409,22 @@ impl SeamKv {
                 "paged attach into a slot that still holds {} frames",
                 self.segmented_kv.chain.len()
             ));
+        }
+        if let Some(ckpt) = ckpt.as_deref() {
+            if ckpt.boundary_tokens != tokens.len() {
+                return Err(anyhow!(
+                    "paged attach was given a snapshot of {} tokens for {} tokens",
+                    ckpt.boundary_tokens,
+                    tokens.len()
+                ));
+            }
+            super::weights::restore_paged_ckpt(
+                be,
+                &self.kbufs,
+                &self.vbufs,
+                self.ple_state_buf.as_deref(),
+                ckpt,
+            )?;
         }
         let buffers = self.plane_buffers(cfg)?;
         kv.session_attach(frames);
@@ -428,6 +459,10 @@ impl SeamKv {
         for checkpoint in self.turn_recurrent_ckpts.iter_mut().flatten() {
             checkpoint.invalidate();
         }
+        // Inherit the snapshot rather than drop it: this conversation now BEGINS at that boundary,
+        // so the next publish has to carry it or the entry degenerates into a chain nobody can
+        // resume. The slot's own device checkpoints describe the previous conversation and are gone.
+        self.paged_frontier = ckpt;
         Ok(())
     }
 
@@ -451,15 +486,18 @@ impl SeamKv {
             // Publish FIRST: until `publish` returns the frames are only session-owned, so a
             // failed publish leaves a consistent resident slot. After it, the tree holds its own
             // owners and the detach below can never strand the conversation.
-            kv.publish(
+            let ckpts = self.take_paged_ckpts(be, full * page, page);
+            kv.publish_with_ckpts(
                 self.cached[..full * page].to_vec(),
                 self.segmented_kv.chain[..full].to_vec(),
+                ckpts,
             )?;
         }
         be.sync()
             .map_err(|error| anyhow!("sync before paged KV detach: {error}"))?;
         self.segmented_kv.committed_tokens = 0;
         self.cached.clear();
+        self.paged_frontier = None;
         for checkpoint in self.turn_recurrent_ckpts.iter_mut().flatten() {
             checkpoint.invalidate();
         }
@@ -471,6 +509,48 @@ impl SeamKv {
         let chain = std::mem::take(&mut self.segmented_kv.chain);
         kv.session_release(&chain);
         Ok(full * page)
+    }
+
+    /// The recurrent snapshots this slot can hand the tree for a `published_tokens`-long chain:
+    /// every still-valid device turn checkpoint plus the frontier captured during this request's
+    /// prefill. Only page-aligned boundaries at or below the chain's reach qualify — a snapshot of
+    /// a position the frame chain cannot address could never be attached. Two sources naming the
+    /// same boundary describe the same state, so the second copy is dropped rather than counted
+    /// twice against the tree's aux budget.
+    fn take_paged_ckpts(
+        &mut self,
+        be: &dyn Backend,
+        published_tokens: usize,
+        page: usize,
+    ) -> Vec<std::sync::Arc<crate::paged_cache::PagedCkpt>> {
+        let mut out: Vec<std::sync::Arc<crate::paged_cache::PagedCkpt>> = Vec::new();
+        let usable = |boundary: usize| {
+            boundary > 0 && boundary.is_multiple_of(page) && boundary <= published_tokens
+        };
+        for checkpoint in self.turn_recurrent_ckpts.iter().flatten() {
+            if !checkpoint.valid || !usable(checkpoint.tokens.len()) {
+                continue;
+            }
+            match super::weights::paged_ckpt_from_device(be, checkpoint) {
+                Ok(ckpt) => out.push(ckpt),
+                // A snapshot that will not download costs this entry its resumability, not the
+                // conversation: the frames still publish and a later request replays them.
+                Err(error) => tracing::warn!(
+                    "could not snapshot recurrent state at {} tokens for the paged KV tree: {error}",
+                    checkpoint.tokens.len()
+                ),
+            }
+        }
+        if let Some(frontier) = self.paged_frontier.take() {
+            if usable(frontier.boundary_tokens)
+                && !out
+                    .iter()
+                    .any(|ckpt| ckpt.boundary_tokens == frontier.boundary_tokens)
+            {
+                out.push(frontier);
+            }
+        }
+        out
     }
 
     /// Benchmark cases keep the 32K base segment and its frozen layout, but return unused tails.

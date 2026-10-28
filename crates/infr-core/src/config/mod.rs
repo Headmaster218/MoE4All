@@ -238,6 +238,12 @@ cfg_struct! {
         /// Lazily commit supported Qwen KV caches in 32K-token increments. Backends/models without
         /// segmented addressing retain their existing flat allocation.
         dynamic: bool = true,
+        /// `INFR_KV_PAGED`: run the paged radix prefix tree on the VRAM frame corridor ALONE. The
+        /// tree has always implied a host-RAM frame pool because `kv.paged_cache_max` was both
+        /// switches at once; this splits them, so a corridor-only tree keeps zero host RAM frames
+        /// and cold chains evict instead of sinking. `kv.paged_cache_max` stays the pool budget and
+        /// still turns the tree on by itself, so every existing configuration resolves unchanged.
+        paged: bool = false,
         /// `INFR_KV_PAGED_PAGE_TOKENS`: tokens per physical KV segment (page). The segmented
         /// machinery addresses planes through a runtime device table, so the page size is pure
         /// geometry — 32768 (default) reproduces the legacy 32K growth step byte-for-byte, while
@@ -598,6 +604,14 @@ cfg_struct! {
         flash_dequant: bool = false,
         /// `INFR_NO_FLASH_WARP` (inverted).
         flash_warp: bool = true,
+        /// `INFR_AMDVLK_HD256_FLASH` — feature switch, default OFF: on AMD's proprietary driver
+        /// (amdvlk/LLPC), hd256 prefill takes the coopmat `nonfa` tier (`attn_qk`/`softmax`/
+        /// `attn_pv`) for every geometry that is not a 128-row-aligned, tail-safe register-O
+        /// chunk. Turning it ON forces the fused `attn_flash_warp_hd256_bm16` build back on —
+        /// for older driver versions, or for re-verification once AMD fixes LLPC. Known: on
+        /// 26.9.2/26.10.1, enabling it crashes inside `vkCreateComputePipelines` at
+        /// `amdvlk64.dll+0x2b65705`.
+        amdvlk_hd256_flash: bool = false,
         /// `INFR_NO_NC_FA` (inverted).
         nc_fa: bool = true,
         /// `INFR_NO_QK_WARP` (inverted).

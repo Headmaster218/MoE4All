@@ -914,7 +914,8 @@ fn paged_grid_buffer_idm_matches_host() {
             }
             pager.flush_lut(&be).unwrap();
             let ids_buf = be.alloc(ids.len() * 4, BufferUsage::Activations).unwrap();
-            be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids)).unwrap();
+            be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids))
+                .unwrap();
             let y = be
                 .alloc(n_used * out_f * 4, BufferUsage::Activations)
                 .unwrap();
@@ -988,7 +989,9 @@ fn paged_sg_q51_idm_matches_host() {
     let ids_buf = be.alloc(ids.len() * 4, BufferUsage::Activations).unwrap();
     be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids))
         .unwrap();
-    let x: Vec<f32> = (0..in_f).map(|i| ((i % 23) as f32 - 11.0) * 0.0125).collect();
+    let x: Vec<f32> = (0..in_f)
+        .map(|i| ((i % 23) as f32 - 11.0) * 0.0125)
+        .collect();
     let x_buf = be.alloc(in_f * 4, BufferUsage::Activations).unwrap();
     be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
 

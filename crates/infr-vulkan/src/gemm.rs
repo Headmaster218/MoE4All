@@ -1467,6 +1467,23 @@ pub(crate) fn attn_nc_fa_spv(hd: usize) -> Option<(&'static str, &'static [u32],
         return None;
     })
 }
+/// Workgroup shared memory (bytes) declared by the [`attn_nc_fa_spv`] build selected for `hd`:
+/// `attn_nc_fa.comp`'s Qs + KVs + Ss + Os + per-row scalars, mirroring the shader's BM/HD_MAX
+/// selection (37632 / 54016 / 47616 B). `None` for hd > 512. `adapter.rs` keeps `nc_fa_ok`
+/// inside the device's `maxComputeSharedMemorySize` with it (VUID-RuntimeSpirv-Workgroup-06530).
+pub(crate) fn attn_nc_fa_shared_bytes(hd: usize) -> Option<u32> {
+    let (bm, hd_max) = if hd <= 128 {
+        (32usize, 128usize)
+    } else if hd <= 256 {
+        (32, 256)
+    } else if hd <= 512 {
+        (16, 512)
+    } else {
+        return None;
+    };
+    let floats = bm * 33 + 64 * 33 + bm * 64 + bm * hd_max + 3 * bm;
+    u32::try_from(floats * 4).ok()
+}
 /// SPIR-V for the int8 cooperative-matrix (WMMA) prefill GEMM, Q8_0 only — measurement kernel
 /// gated behind `INFR_I8_COOPMAT=1` (see `native_gemm_i8cm_q8_0.comp` for the design doc).
 #[cfg_attr(infr_profile, infr_prof::instrument)]

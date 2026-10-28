@@ -151,6 +151,28 @@ function Invoke-BenchmarkStartupGuide {
     return ($answer -eq 'try')
 }
 
+function Test-PagedKvEligible {
+    param(
+        [Parameter(Mandatory = $true)][string]$Preset,
+        [AllowEmptyString()][string]$TypeK = '',
+        [AllowEmptyString()][string]$TypeV = '',
+        [bool]$Overflow = $false
+    )
+    # The wizard's mirror of the engine's `segmented_kv_wanted`: every paged-KV tier IS the dynamic
+    # segmented layout, and that layout only exists over a Q8_0/Q8_0 cache with no RAM overflow.
+    # `auto` counts as eligible because the Vulkan runner resolves it to Q8 for these models.
+    if ($Overflow) {
+        return $false
+    }
+    if ($Preset -in @('auto', 'q8')) {
+        return $true
+    }
+    if ($Preset -eq 'custom') {
+        return ($TypeK -eq 'q8_0' -and $TypeV -eq 'q8_0')
+    }
+    return $false
+}
+
 function Read-TextValue {
     param(
         [Parameter(Mandatory = $true)][string]$Label,
@@ -2824,6 +2846,9 @@ $sessionCacheMax = [string](Get-SavedValue 'session_cache_max' '5GiB')
 $sessionCacheTtlHours = [string](Get-SavedValue 'session_cache_ttl_hours' '24')
 $kvRamCacheMax = [string](Get-SavedValue 'kv_ram_cache_max' '')
 $kvPagedCacheMax = [string](Get-SavedValue 'kv_paged_cache_max' '')
+# The tree and its RAM frame pool are two choices now. A state file from before `kv_paged_tree`
+# asked for a pool whenever it named one, so a saved size still implies the tree.
+$kvPagedTree = [bool](Get-SavedValue 'kv_paged_tree' ([bool]$kvPagedCacheMax))
 $kvPagedPageTokens = [string](Get-SavedValue 'kv_paged_page_tokens' '')
 $serverAuth = [bool](Get-SavedValue 'server_auth' $false)
 $serverApiKey = ''
@@ -2837,6 +2862,9 @@ $configureThinking = [bool](Get-SavedValue 'configure_thinking' ($thinkMode -ne 
 $cpuMissEnabled = [bool](Get-SavedValue 'cpu_miss_enabled' $false)
 $cpuMissMax = [string](Get-SavedValue 'cpu_miss_max' '1')
 $cpuMissCores = [string](Get-SavedValue 'cpu_miss_cores' '')
+# The engine routes hd256 prefill away from the fused flash pipeline on amdvlk because that build
+# crashes the driver; this saved opt-in is the only way to force the kernel back on.
+$amdvlkHd256Flash = [bool](Get-SavedValue 'amdvlk_hd256_flash' $false)
 $customSets = [string](Get-SavedValue 'custom_sets' '')
 
 if (-not $reuseSavedSettings) {
@@ -3024,6 +3052,12 @@ if (-not $reuseSavedSettings) {
         Write-Host 'Requires AVX2 + FMA3, supported quantization and full-RAM experts; unsupported cases or larger miss sets use GPU.' -ForegroundColor DarkGray
         Write-Host '性能收益尚未保证；2/3 miss 未做整机性能验收。Performance gains are not guaranteed; 2/3-miss model throughput is unvalidated.' -ForegroundColor Yellow
     }
+    $amdvlkHd256Flash = Read-YesNo -Label '在 AMD 专有驱动（amdvlk）上强制启用 hd256 融合 flash 注意力内核？/ Force the fused hd256 flash attention kernel on AMD proprietary driver (amdvlk)?' -Default $amdvlkHd256Flash
+    if ($amdvlkHd256Flash) {
+        Write-Host '仅为规避驱动缺陷而设的开关：默认关闭时 hd256 prefill 走 coopmat nonfa 层级。已知 26.9.2 / 26.10.1 打开后会在 vkCreateComputePipelines 内于 amdvlk64.dll+0x2b65705 崩溃（驱动 LLPC 缺陷），启动即失败。' -ForegroundColor Yellow
+        Write-Host 'Off keeps hd256 prefill on the coopmat nonfa tier. On forces the fused attn_flash_warp_hd256_bm16 build back: known to crash inside vkCreateComputePipelines at amdvlk64.dll+0x2b65705 on 26.9.2/26.10.1 (an LLPC driver defect), so use it only on older driver builds or to re-verify the AMD fix.' -ForegroundColor DarkGray
+        Write-Host '此开关只在 AMD 专有驱动上生效；RADV 与其他厂商驱动忽略它。This switch only matters on the AMD proprietary driver; RADV and other vendors ignore it.' -ForegroundColor DarkGray
+    }
     if ($launchMode -eq 'server') {
         $serverParallel = Read-IntegerValue -Label '并发会话数（每个会话有独立 KV）/ Concurrent slots (one KV cache each)' -Default $serverParallel -Minimum 1
     }
@@ -3040,10 +3074,37 @@ if (-not $reuseSavedSettings) {
             $sessionCacheMax = Read-TextValue -Label 'SSD KV 缓存总上限（绝对大小）/ Total SSD KV cache limit (absolute size)' -Default $sessionCacheMax -Required
             $sessionCacheTtlHours = Read-IntegerValue -Label '缓存保留小时数，0 为不按时间清理 / Cache TTL hours, 0 disables age expiry' -Default $sessionCacheTtlHours -Minimum 0
         }
-        $kvPagedCacheEnabled = Read-YesNo -Label '改用地基树分页 KV 前缀缓存（试验性，零拷贝帧共享，冷前缀下沉 RAM）？/ Use the paged radix-frame KV prefix cache instead (experimental, zero-copy frame sharing, cold prefixes sink to RAM)?' -Default ([bool]$kvPagedCacheMax)
-        if ($kvPagedCacheEnabled) {
-            if (-not $kvPagedCacheMax) { $kvPagedCacheMax = '16GiB' }
-            $kvPagedCacheMax = Read-TextValue -Label '分页 KV 的 RAM 帧池上限（显存走廊放不下的冷前缀整链 DMA 下沉到此，命中再换回；host 内存按实际下沉量惰性增长，不预占）/ Paged KV RAM frame-pool cap (cold chains evicted from the VRAM corridor DMA down here and promote back on a hit; the host backing grows lazily with actual demotions, no up-front reservation)' -Default $kvPagedCacheMax -Required
+        $kvPagedTree = Read-YesNo -Label '改用地基树分页 KV 前缀缓存（试验性，零拷贝帧共享，命中只改写页表）？/ Use the paged radix-frame KV prefix cache instead (experimental, zero-copy frame sharing; a hit rewrites page tables)?' -Default $kvPagedTree
+        # The tree IS the segmented KV layout, and that layout only exists on a Q8_0/Q8_0 cache with
+        # the RAM overflow off. A manual KV choice outside that pair therefore meant a command line
+        # the engine refused to boot, so resolve the conflict here the same way the mutually
+        # exclusive RAM/SSD tiers below already do.
+        if ($kvPagedTree -and -not (Test-PagedKvEligible -Preset $kvPreset -TypeK $kvTypeK -TypeV $kvTypeV -Overflow $kvOverflow)) {
+            $treeBlocker = if ($kvOverflow) { 'KV overflow is on' } else { "KV is $kvTypeK/$kvTypeV" }
+            Write-Host "分页树只建立在 Q8_0/Q8_0 动态分段 KV 上：$treeBlocker，已关闭分页树而不是让启动失败。" -ForegroundColor Yellow
+            Write-Host "The paged tree only exists on the dynamic segmented Q8_0/Q8_0 layout; $treeBlocker, so it was turned off instead of refusing at startup. Pick KV auto/Q8 and keep overflow off to use it." -ForegroundColor DarkGray
+            $kvPagedTree = $false
+            $kvPagedCacheMax = ''
+            $kvPagedPageTokens = ''
+        }
+        if ($kvPagedTree) {
+            # One prerequisite the wizard cannot test: the corridor is claimed from the unified VRAM
+            # arena, and a session whose experts all loaded resident never builds one. Say so before
+            # the operator commits, since the startup refusal now names the same condition.
+            Write-Host '前置条件：Qwen3.5/3.6/3.8 架构、Q8_0/Q8_0 KV、kv.dynamic 开启、且存在统一显存 arena（专家被分页才会建立；整机全部常驻的显存充裕设备没有 arena）。不满足时启动会拒绝并逐条列出未满足的条件。' -ForegroundColor Yellow
+            Write-Host 'Prerequisites: a Qwen3.5/3.6/3.8 model, Q8_0/Q8_0 KV, kv.dynamic on, and a unified VRAM arena (it is only built when MoE experts are paged - a fully resident model on a roomy device has none). A startup that misses a prerequisite now lists exactly which.' -ForegroundColor DarkGray
+            # The tree and its host-RAM frame pool are separate choices: with no pool every frame
+            # stays inside the VRAM corridor and a cold prefix evicts instead of sinking.
+            $kvPagedRamPool = Read-YesNo -Label '为分页树分配 RAM 帧池（显存走廊放不下的冷前缀整链 DMA 下沉到内存、命中再换回；上限只是预算，按实际下沉量惰性增长，不预占）？/ Give the paged tree a host-RAM frame pool (cold chains the VRAM corridor cannot hold DMA down and promote back on a hit; the cap is a budget, the backing grows lazily, nothing is reserved up front)?' -Default ([bool]$kvPagedCacheMax)
+            if ($kvPagedRamPool) {
+                if (-not $kvPagedCacheMax) { $kvPagedCacheMax = '16GiB' }
+                $kvPagedCacheMax = Read-TextValue -Label '分页 KV 的 RAM 帧池上限（显存走廊放不下的冷前缀整链 DMA 下沉到此，命中再换回；host 内存按实际下沉量惰性增长，不预占）/ Paged KV RAM frame-pool cap (cold chains evicted from the VRAM corridor DMA down here and promote back on a hit; the host backing grows lazily with actual demotions, no up-front reservation)' -Default $kvPagedCacheMax -Required
+            } else {
+                $kvPagedCacheMax = ''
+                Write-Host '不分配 RAM 帧池：树只使用显存帧走廊，冷前缀直接逐出、不再下沉。混合递归模型续接所需的状态快照仍保留 512 MiB 主机内存上限，按快照逐个分配、不预占。' -ForegroundColor Yellow
+                Write-Host 'No RAM frame pool: every frame stays in the VRAM corridor and cold prefixes evict instead of sinking. Recurrent/PLE state snapshots keep a 512 MiB host cap, claimed one snapshot at a time.' -ForegroundColor DarkGray
+                Write-Host '没有 RAM 帧池时磁盘帧层不生效：冷链不经过内存就无法落到磁盘。No disk frame tier without a pool: a cold chain cannot reach the file without a host frame to sink through.' -ForegroundColor DarkGray
+            }
             if (-not $kvPagedPageTokens) { $kvPagedPageTokens = '64' }
             $kvPagedPageTokens = Read-TextValue -Label '每帧 token 数（2 的幂，如 64；越小共享越细、重算尾巴越短）/ Tokens per frame (power of two, e.g. 64; smaller shares finer with shorter recompute tails)' -Default $kvPagedPageTokens -Required
             Write-Host '试验性特性：分页走廊占用全部 KV 显存（会话与缓存树共用，不再为每个会话单独保留 KV）。' -ForegroundColor Yellow
@@ -3063,7 +3124,7 @@ if (-not $reuseSavedSettings) {
             $kvPagedPageTokens = ''
         }
         $kvRamCacheEnabled = $false
-        if (-not $kvPagedCacheEnabled) {
+        if (-not $kvPagedTree) {
             $kvRamCacheEnabled = Read-YesNo -Label '改用内存基数树前缀缓存闲置 KV（不落盘，优先于 SSD）？/ Keep idle-session KV in a RAM radix-tree prefix cache instead (no disk, takes precedence over SSD)?' -Default ([bool]$kvRamCacheMax)
         }
         if ($kvRamCacheEnabled) {
@@ -3221,6 +3282,11 @@ if ($cpuMissEnabled) {
     Add-SetArgument $nativeArgs 'kernels.vulkan.cpu_miss_token_park' 'true'
     Add-SetArgument $nativeArgs 'kernels.vulkan.cpu_miss_spin' '262144'
 }
+# Emitted only when ON: the config default is already OFF, and an explicit `=false` would override
+# an INFR_AMDVLK_HD256_FLASH the operator set in the environment for a one-off driver test.
+if ($amdvlkHd256Flash) {
+    Add-SetArgument $nativeArgs 'kernels.vulkan.amdvlk_hd256_flash' 'true'
+}
 if ($setupMode -eq 'manual' -and -not [string]::IsNullOrWhiteSpace($customSets)) {
     foreach ($entry in $customSets.Split(';')) {
         $entry = $entry.Trim()
@@ -3289,9 +3355,25 @@ if ($launchMode -eq 'server') {
     }
     [void]$nativeArgs.Add('--addr'); [void]$nativeArgs.Add($serverAddr)
     [void]$nativeArgs.Add('--parallel'); [void]$nativeArgs.Add($serverParallel)
-    if ($kvPagedCacheMax) {
-        Add-SetArgument $nativeArgs 'kv.paged_cache_max' $kvPagedCacheMax
+    # Reuse mode never re-runs the question campaign, so the eligibility the fresh path enforced
+    # while asking has to be enforced here too: a state file saved with F16 KV (or overflow) plus a
+    # tree would otherwise emit a command line the engine refuses to boot. Correcting $kvPagedTree
+    # before the state write also heals the saved profile.
+    if ($kvPagedTree -and -not (Test-PagedKvEligible -Preset $kvPreset -TypeK $kvTypeK -TypeV $kvTypeV -Overflow $kvOverflow)) {
+        $treeBlocker = if ($kvOverflow) { 'KV overflow is on' } else { "KV is $kvTypeK/$kvTypeV" }
+        Write-Host "分页树只建立在 Q8_0/Q8_0 动态分段 KV 上：$treeBlocker，已关闭分页树而不是让启动失败。" -ForegroundColor Yellow
+        Write-Host "The paged tree only exists on the dynamic segmented Q8_0/Q8_0 layout; $treeBlocker, so it was turned off instead of refusing at startup. Pick KV auto/Q8 and keep overflow off to use it." -ForegroundColor DarkGray
+        $kvPagedTree = $false
+        $kvPagedCacheMax = ''
+    }
+    if ($kvPagedTree) {
+        # `kv.paged` opens the tree; the host-RAM frame pool is a separate budget that only exists
+        # when the wizard named one. Pages must be smaller than the legacy 32K segment or the engine
+        # rejects the config, so a state file that predates the split still gets a usable geometry.
+        Add-SetArgument $nativeArgs 'kv.paged' 'true'
+        if (-not $kvPagedPageTokens) { $kvPagedPageTokens = '64' }
         Add-SetArgument $nativeArgs 'kv.paged_page_tokens' $kvPagedPageTokens
+        if ($kvPagedCacheMax) { Add-SetArgument $nativeArgs 'kv.paged_cache_max' $kvPagedCacheMax }
     }
     if ($kvRamCacheMax) {
         Add-SetArgument $nativeArgs 'kv.ram_cache_max' $kvRamCacheMax
@@ -3354,10 +3436,12 @@ $state = [ordered]@{
     session_idle_secs = $sessionIdleSecs; session_cache_max = $sessionCacheMax
     session_cache_ttl_hours = $sessionCacheTtlHours; kv_ram_cache_max = $kvRamCacheMax
     kv_paged_cache_max = $kvPagedCacheMax; kv_paged_page_tokens = $kvPagedPageTokens
+    kv_paged_tree = $kvPagedTree
     server_vision = $serverVision; vision_projector = $visionProjectorPath
     server_embedding = $serverEmbedding; embedding_model = $embeddingModelPath
     embedding_idle_timeout = $embeddingIdleTimeout
     cpu_miss_enabled = $cpuMissEnabled; cpu_miss_max = $cpuMissMax; cpu_miss_cores = $cpuMissCores
+    amdvlk_hd256_flash = $amdvlkHd256Flash
     custom_sets = $customSets; last_command = $commandText
 }
 if (-not $DryRun -and -not $script:PendingSubmissionPrompted) { Offer-PendingSubmissions }

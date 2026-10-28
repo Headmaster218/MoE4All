@@ -7290,6 +7290,27 @@ fn lower_op(
                 };
                 let scratch_ne = scratch_rows * nkv * hd;
                 let scratch_tail_bytes = (scratch_ne - ne) * 2;
+                // amdvlk (VK_DRIVER_ID_AMD_PROPRIETARY, LLPC) faults with 0xc0000005 INSIDE
+                // vkCreateComputePipelines for `attn_flash_warp_hd256_bm16` (first full-attention
+                // layer of a 4K prefill, 4001 query rows). The crash is a driver pipeline-compile
+                // defect, so by default (feature switch OFF) that build is not selected on this
+                // driver. The register-O build is a different pipeline and stays available for
+                // its exact 128-row contract; every other hd256 geometry takes the coopmat
+                // `attn_qk`/`softmax`/`attn_pv` tier (`nonfa_ok`), whose small tiles compile
+                // cleanly there and stay inside the driver's reported shared-memory budget
+                // (nc_fa's hd256 build does not: 54016 B vs 32768 B). INFR_AMDVLK_HD256_FLASH=1
+                // opts in and forces the bm16 build back — for older drivers, or to re-verify
+                // once AMD fixes LLPC; known to crash on 26.9.2/26.10.1 at
+                // amdvlk64.dll+0x2b65705.
+                let required_kv_rows = flash_kv_storage_rows(kv_len);
+                let k_storage_rows = if deq_k { scratch_rows } else { att_cap_rows };
+                let v_storage_rows = if deq_v { scratch_rows } else { att_cap_rows };
+                let register_o_tail_safe =
+                    k_storage_rows >= required_kv_rows && v_storage_rows >= required_kv_rows;
+                let amdvlk_hd256_flash_avoided = hd == 256
+                    && be_.is_amd_proprietary_driver()
+                    && !be_.cfg().kernels.vulkan.amdvlk_hd256_flash
+                    && !(register_o_candidate && register_o_tail_safe);
                 // Expand a KV side into the f16 scratch: native Q8 (planar), f32 cast (store_f16),
                 // else the shared quant/bf16 dequant (dequant_kv_f16).
                 // #74: the dequant READERS read the SOURCE cache (`r(*k_cache)?`/`r(*v_cache)?`, always
@@ -7368,7 +7389,10 @@ fn lower_op(
                 // through to `split_ok`/the final `else` — `attention_kv_split`/`attention_kv`,
                 // already the scalar decode/short-prefill path, dispatch with no coopmat and no
                 // row-count ceiling, so they're a correct (if slower) fallback for ANY `rows`.
-                let flash_ok = flash_geom && !segmented_read && !(k_q8_eff || v_q8_eff);
+                let flash_ok = flash_geom
+                    && !segmented_read
+                    && !(k_q8_eff || v_q8_eff)
+                    && !amdvlk_hd256_flash_avoided;
                 // Coopmat prefill shmem-staging mode (Levers 2 & 5). Dequant wins over the pure-f16
                 // stage; both need the flash geometry. INFR_FLASH_STAGE stages the f16 KV (cache, or
                 // the prepass f16 scratch on a quant model) into shmem — the reuse experiment.
@@ -7430,7 +7454,13 @@ fn lower_op(
                 // requirement: the kernel guards pad-row reads/writes itself. Exercisable on
                 // coopmat hardware via INFR_NO_COOPMAT=1; INFR_NO_NC_FA=1 disables the arm (A/B
                 // against the scalar/split floor).
-                let nc_fa_ok = !flash_ok
+                //
+                // NOT used as the amdvlk hd256 workaround: the hd256 build declares 54016 B of
+                // workgroup storage against the 32768 B this driver reports (`VUID-RuntimeSpirv-
+                // Workgroup-06530`). The workaround routes to `nonfa_ok` instead, whose qk/pv
+                // tiles stay around 10 KiB; the budget gate below keeps this arm off any device
+                // that reports less than the selected build declares.
+                let nc_fa_armed = !flash_ok
                     && !nonfa_ok
                     && !segmented_read
                     && !be_.caps().f16_coopmat()
@@ -7440,6 +7470,23 @@ fn lower_op(
                     && hd <= 512
                     && !(k_q8_eff || v_q8_eff)
                     && be_.cfg().kernels.vulkan.nc_fa;
+                // The selected build declares 37632 B (hd128) / 54016 B (hd256) / 47616 B
+                // (hd512) of workgroup storage; a device that reports less must not get it
+                // (VUID-RuntimeSpirv-Workgroup-06530). Keep the arm inside the budget and say
+                // why when the budget alone is what skips it.
+                let nc_fa_shared = crate::gemm::attn_nc_fa_shared_bytes(hd);
+                let nc_fa_shared_ok =
+                    nc_fa_shared.is_some_and(|bytes| be_.max_shared_memory_bytes() >= bytes);
+                if nc_fa_armed && !nc_fa_shared_ok {
+                    if let Some(requested) = nc_fa_shared {
+                        tracing::warn!(
+                            "nc_fa skipped: requested shared memory {requested} B exceeds \
+                             device limit {} B (VUID-RuntimeSpirv-Workgroup-06530)",
+                            be_.max_shared_memory_bytes()
+                        );
+                    }
+                }
+                let nc_fa_ok = nc_fa_armed && nc_fa_shared_ok;
                 // Decode (rows==1) AND small-m suffix prefill (rows 2..63, below the flash/nonfa
                 // floor): flash-decoding split-K — each (row, head)'s KV range splits across ~32
                 // chunks of workgroups instead of the scalar attention_kv's rows*nh (= nh at
@@ -7618,11 +7665,6 @@ fn lower_op(
                         _ => None,
                     };
                     if hd == 256 {
-                        let required_kv_rows = flash_kv_storage_rows(kv_len);
-                        let k_storage_rows = if deq_k { scratch_rows } else { att_cap_rows };
-                        let v_storage_rows = if deq_v { scratch_rows } else { att_cap_rows };
-                        let register_o_tail_safe = k_storage_rows >= required_kv_rows
-                            && v_storage_rows >= required_kv_rows;
                         rec.attention_prefill_flash_hd256(
                             r(*q)?,
                             kcb,
