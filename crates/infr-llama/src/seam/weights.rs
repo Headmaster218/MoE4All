@@ -2867,6 +2867,7 @@ mod tests {
             sc_temp_inv_buf: None,
             mtp_delta_ckpt: checkpoint,
             turn_recurrent_ckpts: std::array::from_fn(|_| None),
+            paged_frontier: None,
             preallocated_siblings: Vec::new(),
         };
         (cfg, slot)
