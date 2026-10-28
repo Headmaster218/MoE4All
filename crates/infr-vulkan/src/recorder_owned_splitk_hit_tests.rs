@@ -2,6 +2,11 @@
 //! Test-only NFF-chunk UG+SiLU+Down partial, INCLUDING the final reduction cost.
 use super::*;
 
+#[path = "recorder_owned_hitfirst_matrix_tests.rs"]
+mod hitfirst_v3;
+#[path = "recorder_owned_same_family_dualqueue_tests.rs"]
+mod same_family_dualqueue;
+
 const CHUNKS: [usize; 3] = [32, 64, 128];
 const LOCAL: usize = 128;
 const FRAME_REPEATS: usize = 16;
@@ -72,7 +77,9 @@ impl SplitKernels {
         assert!(CHUNKS.contains(&chunk));
         assert!(matches!(
             (p.gate_up, p.down),
-            (DType::Q5K, DType::Q5K) | (DType::Iq2S, DType::Iq4Nl)
+            (DType::Q5K, DType::Q5K)
+                | (DType::Iq2S, DType::Iq4Nl)
+                | (DType::Iq3S, DType::Iq4Nl)
         ));
         let suffix = if shared { "-shared" } else { "" };
         Self {

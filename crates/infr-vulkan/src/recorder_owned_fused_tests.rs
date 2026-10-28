@@ -9,6 +9,8 @@ mod tree64_local64;
 mod tree64_wide_nr;
 #[path = "recorder_owned_splitk_hit_tests.rs"]
 mod splitk_hit_v2;
+#[path = "recorder_owned_hit_event_tests.rs"]
+pub(super) mod hit_event;
 use crate::ops::ComputeKernel;
 use std::path::PathBuf;
 

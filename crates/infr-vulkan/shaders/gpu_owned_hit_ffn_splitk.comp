@@ -130,11 +130,11 @@ void main() {
 #endif
 }
 #else
-#if (defined(FMT_Q5K) + defined(FMT_IQ2S)) != 1
-#error Initial_splitk_probe_supports_Q5K_or_IQ2S_Gate_Up_only
+#if (defined(FMT_Q5K) + defined(FMT_IQ2S) + defined(FMT_IQ3S)) != 1
+#error Splitk_probe_supports_Q5K_IQ2S_or_IQ3S_Gate_Up
 #endif
-#if defined(FMT_IQ2S) && (!defined(DOWN_IQ4NL) || !defined(USE_GRID))
-#error IQ2S_requires_DOWN_IQ4NL_and_USE_GRID
+#if (defined(FMT_IQ2S) || defined(FMT_IQ3S)) && (!defined(DOWN_IQ4NL) || !defined(USE_GRID))
+#error IQ_requires_DOWN_IQ4NL_and_USE_GRID
 #endif
 #if defined(IQ2_GRID_BUFFER) || defined(IQ3_GRID_BUFFER)
 #error Initial_splitk_probe_uses_existing_generated_LDS_grid

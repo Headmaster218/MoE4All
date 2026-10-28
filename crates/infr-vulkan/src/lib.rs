@@ -3825,6 +3825,13 @@ impl VulkanBackend {
             .position(|p| p.queue_flags.contains(vk::QueueFlags::COMPUTE))
             .map(|i| i as u32)
             .ok_or_else(|| be("no compute queue family found"))?;
+        #[cfg(test)]
+        let test_aux_compute =
+            std::env::var("MOE4ALL_TEST_AUX_COMPUTE_QUEUE").ok().as_deref() == Some("1");
+        #[cfg(test)]
+        if test_aux_compute && qf_props[queue_family_index as usize].queue_count < 2 {
+            return Err(be("test auxiliary compute queue requires main-family queue_count >= 2"));
+        }
         let dedicated_transfer_family_index = qf_props
             .iter()
             .position(|p| {
@@ -4030,6 +4037,12 @@ impl VulkanBackend {
             .then_some(dedicated_transfer_family_index)
             .flatten();
         let timeline_enabled = has_ext_sem || dedicated_transfer_family_index.is_some();
+        #[cfg(test)]
+        if test_aux_compute && timeline_feat.timeline_semaphore == 0 {
+            return Err(be("test auxiliary compute queue requires timeline semaphores"));
+        }
+        #[cfg(test)]
+        let timeline_enabled = timeline_enabled || test_aux_compute;
         // Hard requirement, not a fallback: the paged-MoE arena is addressed by a 64-bit device
         // pointer, so a device that cannot hand out one has no 64-bit address space for infr to
         // use. bufferDeviceAddress is core in Vulkan 1.2 and this backend targets 1.3, so on any
@@ -4417,6 +4430,14 @@ impl VulkanBackend {
         let queue_ci = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family_index)
             .queue_priorities(&priorities);
+        #[cfg(test)]
+        let test_main_priorities = [1.0f32, 1.0f32];
+        #[cfg(test)]
+        let queue_ci = if test_aux_compute {
+            queue_ci.queue_priorities(&test_main_priorities)
+        } else {
+            queue_ci
+        };
         let mut queue_cis = vec![queue_ci];
         if let Some(family) = dedicated_transfer_family_index {
             queue_cis.push(
