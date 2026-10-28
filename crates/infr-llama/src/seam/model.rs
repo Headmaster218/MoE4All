@@ -10,6 +10,10 @@ use infr_gguf::Gguf;
 use std::path::Path;
 use tokenizers::Tokenizer;
 
+#[cfg(test)]
+#[path = "prefix_reuse_tests.rs"]
+mod prefix_reuse_tests;
+
 /// The placement/dispatch choices a Vulkan bench run actually settled on — reported next to the
 /// throughput figure by [`SeamModel::bench_vulkan`]'s caller.
 ///
