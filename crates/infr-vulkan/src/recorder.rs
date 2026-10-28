@@ -25,6 +25,18 @@ use super::{as_vk_buf, be, Backing, VkBuffer, VulkanBackend};
 pub(crate) mod owned_topk;
 
 #[cfg(test)]
+#[path = "recorder_owned_role_pipeline.rs"]
+pub(crate) mod owned_role_pipeline;
+
+#[cfg(test)]
+#[path = "recorder_owned_indirect.rs"]
+mod owned_indirect;
+
+#[cfg(test)]
+#[path = "recorder_owned_indirect_tests.rs"]
+mod owned_indirect_tests;
+
+#[cfg(test)]
 #[path = "segmented_attention_contract.rs"]
 mod segmented_attention_contract;
 
@@ -17647,6 +17659,7 @@ mod gpu_owned_tests {
     include!("recorder_gpu_owned_copy_publish_tests.rs");
     include!("recorder_gpu_owned_copy_count_tests.rs");
     include!("recorder_gpu_owned_recovery_seed_tests.rs");
+    include!("recorder_owned_role_pipeline_tests.rs");
 
     const NONE: u32 = u32::MAX;
     const POOL_BASE: usize = 3;

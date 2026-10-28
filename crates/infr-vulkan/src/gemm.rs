@@ -4273,6 +4273,121 @@ pub(crate) fn gpu_owned_prepare_fused_spv(overlap: bool) -> &'static [u32] {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn gpu_owned_indirect_jobs_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_indirect_jobs.spv"));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
+#[cfg(test)]
+pub(crate) fn gpu_owned_role_copy_spv(wide: bool) -> &'static [u32] {
+    const SMALL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_role_copy.spv"));
+    const WIDE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_role_copy1024.spv"));
+    static SMALL_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    static WIDE_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    if wide {
+        WIDE_WORDS.get_or_init(|| spv_words(WIDE))
+    } else {
+        SMALL_WORDS.get_or_init(|| spv_words(SMALL))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn gpu_owned_miss_gu_tree64_spv(
+    dtype: infr_core::DType,
+    local: u32,
+    nr: u32,
+) -> Option<&'static [u32]> {
+    use infr_core::DType::*;
+    macro_rules! variant {
+        ($file:literal) => {{
+            static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+            Some(WORDS.get_or_init(|| spv_words(include_bytes!(concat!(
+                env!("OUT_DIR"), "/gpu_owned_miss_gu_tree64_", $file, ".spv"
+            )))).as_slice())
+        }};
+    }
+    match (dtype, local, nr) {
+        (Q4K, 64, 1) => variant!("q4k_64_nr1"),
+        (Q4K, 64, 2) => variant!("q4k_64_nr2"),
+        (Q4K, 128, 1) => variant!("q4k_128_nr1"),
+        (Q4K, 128, 2) => variant!("q4k_128_nr2"),
+        (Q4K, 128, 4) => variant!("q4k_128_nr4"),
+        (Q4K, 128, 8) => variant!("q4k_128_nr8"),
+        (Q4K, 256, 1) => variant!("q4k_256_nr1"),
+        (Q4K, 256, 2) => variant!("q4k_256_nr2"),
+        (Q4K, 256, 4) => variant!("q4k_256_nr4"),
+        (Q4K, 256, 8) => variant!("q4k_256_nr8"),
+        (Q5K, 64, 1) => variant!("q5k_64_nr1"),
+        (Q5K, 64, 2) => variant!("q5k_64_nr2"),
+        (Q5K, 128, 1) => variant!("q5k_128_nr1"),
+        (Q5K, 128, 2) => variant!("q5k_128_nr2"),
+        (Q5K, 128, 4) => variant!("q5k_128_nr4"),
+        (Q5K, 128, 8) => variant!("q5k_128_nr8"),
+        (Q5K, 256, 1) => variant!("q5k_256_nr1"),
+        (Q5K, 256, 2) => variant!("q5k_256_nr2"),
+        (Q5K, 256, 4) => variant!("q5k_256_nr4"),
+        (Q5K, 256, 8) => variant!("q5k_256_nr8"),
+        (Q6K, 64, 1) => variant!("q6k_64_nr1"),
+        (Q6K, 64, 2) => variant!("q6k_64_nr2"),
+        (Q6K, 128, 1) => variant!("q6k_128_nr1"),
+        (Q6K, 128, 2) => variant!("q6k_128_nr2"),
+        (Q6K, 128, 4) => variant!("q6k_128_nr4"),
+        (Q6K, 128, 8) => variant!("q6k_128_nr8"),
+        (Q6K, 256, 1) => variant!("q6k_256_nr1"),
+        (Q6K, 256, 2) => variant!("q6k_256_nr2"),
+        (Q6K, 256, 4) => variant!("q6k_256_nr4"),
+        (Q6K, 256, 8) => variant!("q6k_256_nr8"),
+        (Iq2S, 64, 1) => variant!("iq2s_64_nr1"),
+        (Iq2S, 64, 2) => variant!("iq2s_64_nr2"),
+        (Iq2S, 128, 1) => variant!("iq2s_128_nr1"),
+        (Iq2S, 128, 2) => variant!("iq2s_128_nr2"),
+        (Iq2S, 128, 4) => variant!("iq2s_128_nr4"),
+        (Iq2S, 128, 8) => variant!("iq2s_128_nr8"),
+        (Iq2S, 256, 1) => variant!("iq2s_256_nr1"),
+        (Iq2S, 256, 2) => variant!("iq2s_256_nr2"),
+        (Iq2S, 256, 4) => variant!("iq2s_256_nr4"),
+        (Iq2S, 256, 8) => variant!("iq2s_256_nr8"),
+        (Iq3S, 64, 1) => variant!("iq3s_64_nr1"),
+        (Iq3S, 64, 2) => variant!("iq3s_64_nr2"),
+        (Iq3S, 128, 1) => variant!("iq3s_128_nr1"),
+        (Iq3S, 128, 2) => variant!("iq3s_128_nr2"),
+        (Iq3S, 128, 4) => variant!("iq3s_128_nr4"),
+        (Iq3S, 128, 8) => variant!("iq3s_128_nr8"),
+        (Iq3S, 256, 1) => variant!("iq3s_256_nr1"),
+        (Iq3S, 256, 2) => variant!("iq3s_256_nr2"),
+        (Iq3S, 256, 4) => variant!("iq3s_256_nr4"),
+        (Iq3S, 256, 8) => variant!("iq3s_256_nr8"),
+        _ => None,
+    }
+}
+
+/// IQ buffer codebook at binding 0; Input/Ids/Tape/ACT at 1/2/3/4, push 40 bytes.
+#[cfg(test)]
+pub(crate) fn gpu_owned_miss_gu_tree64_grid_buffer_spv(
+    dtype: infr_core::DType,
+    local: u32,
+    nr: u32,
+) -> Option<&'static [u32]> {
+    use infr_core::DType::*;
+    macro_rules! variant {
+        ($file:literal) => {{
+            static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+            Some(WORDS.get_or_init(|| spv_words(include_bytes!(concat!(
+                env!("OUT_DIR"), "/gpu_owned_miss_gu_tree64_grid_buffer_", $file, ".spv"
+            )))).as_slice())
+        }};
+    }
+    match (dtype, local, nr) {
+        (Iq2S, 64, 1) => variant!("iq2s_64_nr1"),
+        (Iq2S, 64, 2) => variant!("iq2s_64_nr2"),
+        (Iq3S, 64, 1) => variant!("iq3s_64_nr1"),
+        (Iq3S, 64, 2) => variant!("iq3s_64_nr2"),
+        _ => None,
+    }
+}
+
 pub(crate) fn gpu_resident_copy_payload_spv(wide: bool) -> &'static [u32] {
     const SMALL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_resident_copy_payload.spv"));
     const WIDE: &[u8] = include_bytes!(concat!(

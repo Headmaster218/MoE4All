@@ -1261,6 +1261,7 @@ fn main() {
         ),
         ("gpu_owned_publish", "gpu_owned_publish", &[]),
         ("gpu_owned_copy_publish", "gpu_owned_copy_publish", &[]),
+        ("gpu_owned_indirect_jobs", "gpu_owned_indirect_jobs", &[]),
         (
             "gpu_owned_copy_publish",
             "gpu_owned_copy_publish1024",
@@ -1306,6 +1307,16 @@ fn main() {
             "gpu_resident_copy_payload",
             "gpu_resident_copy_payload1024",
             &["-DCOPY_LOCAL=1024"],
+        ),
+        (
+            "gpu_resident_copy_payload",
+            "gpu_owned_role_copy",
+            &["-DCOPY_ROLE_FILTER"],
+        ),
+        (
+            "gpu_resident_copy_payload",
+            "gpu_owned_role_copy1024",
+            &["-DCOPY_ROLE_FILTER", "-DCOPY_LOCAL=1024"],
         ),
         ("gpu_resident_silu", "gpu_resident_silu", &[]),
         (
@@ -4563,7 +4574,7 @@ fn main() {
         "native_mmv_mw",
         "quant_q8_row",
     ];
-    let builds: Vec<(String, String, Vec<String>)> = builds
+    let mut builds: Vec<(String, String, Vec<String>)> = builds
         .iter()
         .flat_map(|(src_stem, dst_stem, defines)| {
             let base = (
@@ -4583,6 +4594,42 @@ fn main() {
             }
         })
         .collect();
+    for format in ["q4k", "q5k", "q6k", "iq2s", "iq3s"] {
+        for local in [64, 128, 256] {
+            for nr in [1, 2, 4, 8] {
+                if local == 64 && nr > 2 {
+                    continue;
+                }
+                let mut defines = vec![
+                    format!("-DFMT_{}", format.to_ascii_uppercase()),
+                    format!("-DLOCAL={local}"),
+                    format!("-DNR={nr}"),
+                ];
+                if matches!(format, "iq2s" | "iq3s") {
+                    defines.push("-DUSE_GRID".to_owned());
+                }
+                builds.push((
+                    "owned_gu_tree64".to_owned(),
+                    format!("gpu_owned_miss_gu_tree64_{format}_{local}_nr{nr}"),
+                    defines,
+                ));
+            }
+        }
+    }
+    for (format, grid) in [("iq2s", "IQ2_GRID_BUFFER"), ("iq3s", "IQ3_GRID_BUFFER")] {
+        for nr in [1, 2] {
+            builds.push((
+                "owned_gu_tree64".to_owned(),
+                format!("gpu_owned_miss_gu_tree64_grid_buffer_{format}_64_nr{nr}"),
+                vec![
+                    format!("-DFMT_{}", format.to_ascii_uppercase()),
+                    format!("-D{grid}"),
+                    "-DLOCAL=64".to_owned(),
+                    format!("-DNR={nr}"),
+                ],
+            ));
+        }
+    }
     // STREAMED weight builds (resident-BDA): the `-DSTREAMED` build reads the weight from a
     // `bufferDeviceAddress` arena pool (native_weight_addr.glsl) instead of a bound SSBO, lifting the
     // ~4 GiB `maxStorageBufferRange` cap one SSBO binding imposes. `wants_streamed_twin` marks the
@@ -4785,6 +4832,7 @@ fn main() {
             || src_stem == "gpu_owned_prepare_reference"
             || src_stem == "gpu_owned_publish"
             || src_stem == "gpu_owned_copy_publish"
+            || src_stem == "gpu_owned_indirect_jobs"
         {
             args.push(format!(
                 "-DINFR_MAX_DECODE_ROWS={}",

@@ -16,6 +16,8 @@ mod caps;
 mod cpu_miss;
 pub mod ep;
 mod gemm;
+#[cfg(test)]
+pub(crate) mod indirect_copy;
 pub mod linear;
 mod matmul;
 mod ops;
@@ -734,6 +736,9 @@ struct VulkanShared {
     device: ash::Device,
     queue: vk::Queue,
     queue_family_index: u32,
+    /// Optional KHR indirect-copy ABI; availability alone never selects a recorder policy.
+    #[cfg(test)]
+    indirect_copy: Option<crate::indirect_copy::Device>,
     /// Optional transfer-only queue for imported host-RAM to unified-arena copies. Its absence
     /// preserves the established main-queue path on devices without the required family or
     /// timeline support.
@@ -3842,6 +3847,18 @@ impl VulkanBackend {
         };
 
         #[cfg(test)]
+        let indirect_copy_support = unsafe {
+            crate::indirect_copy::query(
+                &instance,
+                physical_device,
+                has_ext(crate::indirect_copy::EXTENSION_NAME),
+            )
+        };
+        #[cfg(test)]
+        let enable_indirect_copy = indirect_copy_support
+            .supports_queue(qf_props[queue_family_index as usize].queue_flags);
+
+        #[cfg(test)]
         let test_shader_clock =
             shader_clock_test_opt_in(std::env::var_os("MOE4ALL_TEST_SHADER_CLOCK").as_deref());
         #[cfg(not(test))]
@@ -4314,6 +4331,10 @@ impl VulkanBackend {
 
         // ── build extension name list (only available ones) ────────────────────
         let mut ext_ptrs: Vec<*const i8> = Vec::new();
+        #[cfg(test)]
+        if enable_indirect_copy {
+            ext_ptrs.push(crate::indirect_copy::EXTENSION_NAME.as_ptr());
+        }
         if has_coop_matrix {
             ext_ptrs.push(c"VK_KHR_cooperative_matrix".as_ptr());
         }
@@ -4437,6 +4458,11 @@ impl VulkanBackend {
             vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
         let mut conditional_ci = vk::PhysicalDeviceConditionalRenderingFeaturesEXT::default()
             .conditional_rendering(true);
+        #[cfg(test)]
+        let mut indirect_copy_ci = indirect_copy_support.enable_features();
+        #[cfg(test)]
+        let mut indirect_copy_sync2_ci = vk::PhysicalDeviceSynchronization2Features::default()
+            .synchronization2(indirect_copy_support.synchronization2);
 
         // Core 1.0 features (shaderInt16 — see the probe comment above): passed via
         // `enabled_features`, NOT a pNext-chained `PhysicalDeviceFeatures2` (the two are mutually
@@ -4469,6 +4495,10 @@ impl VulkanBackend {
             device_ci = device_ci.push_next(&mut conditional_ci);
         }
         #[cfg(test)]
+        if enable_indirect_copy && indirect_copy_support.synchronization2 {
+            device_ci = device_ci.push_next(&mut indirect_copy_sync2_ci);
+        }
+        #[cfg(test)]
         if test_shader_clock {
             device_ci = device_ci.push_next(&mut shader_clock_ci);
         }
@@ -4483,12 +4513,29 @@ impl VulkanBackend {
         if coopmat_f8.is_some() {
             unsafe { crate::vkext::chain_into_device_ci(&mut device_ci, &mut f8_ci) };
         }
+        #[cfg(test)]
+        if enable_indirect_copy {
+            unsafe { crate::vkext::chain_into_device_ci(&mut device_ci, &mut indirect_copy_ci) };
+        }
 
         let device = unsafe { instance.create_device(physical_device, &device_ci, None) }
             .map_err(|e| be(format!("create_device: {e}")))?;
         // Register the device so any Err below (subgroup-32/env guards, allocator build) destroys
         // it instead of leaking it — see `InstanceCleanup` above.
         cleanup.device = Some(device.clone());
+        #[cfg(test)]
+        let indirect_copy = if enable_indirect_copy {
+            unsafe {
+                crate::indirect_copy::Device::load(
+                    &instance,
+                    &device,
+                    indirect_copy_support,
+                    qf_props[queue_family_index as usize].queue_flags,
+                )
+            }
+        } else {
+            None
+        };
         let timeline_clock = has_timeline_clock
             .then(|| crate::timeline::Clock::new(&entry, &instance, &device, physical_device))
             .flatten();
@@ -4992,6 +5039,8 @@ impl VulkanBackend {
                 queue_family_index,
                 dedicated_transfer,
                 dedicated_transfer_keepalive_pending: AtomicBool::new(false),
+                #[cfg(test)]
+                indirect_copy,
                 queue_access,
                 vram_keepalive,
                 queue_submit_failure: AtomicI32::new(vk::Result::SUCCESS.as_raw()),

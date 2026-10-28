@@ -15,7 +15,15 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer So
 layout(buffer_reference, std430, buffer_reference_align = 16) writeonly buffer Destination {
     uvec4 chunks[];
 };
-layout(push_constant) uniform Params { uint ordinal; } p;
+layout(push_constant) uniform Params {
+    uint ordinal;
+#ifdef COPY_ROLE_FILTER
+    uint phase;
+    uint gate_base;
+    uint up_base;
+    uint experts;
+#endif
+} p;
 
 const uint JOB_CAPACITY = INFR_MAX_DECODE_ROWS * 16u * 3u;
 const uint JOURNAL_MASK_WORD = INFR_MAX_DECODE_ROWS * 16u;
@@ -30,6 +38,11 @@ uint64_t address64(uvec2 address) {
 void main() {
     if (gl_GlobalInvocationID.y != 0u || gl_GlobalInvocationID.z != 0u) return;
     if (p.ordinal >= uint(journal.length()) / JOURNAL_WORDS) return;
+#ifdef COPY_ROLE_FILTER
+    if (p.phase < 1u || p.phase > 2u || p.experts == 0u
+        || p.gate_base + p.experts < p.gate_base
+        || p.up_base + p.experts < p.up_base) return;
+#endif
     uint journal_base = p.ordinal * JOURNAL_WORDS;
     uint status = journal[journal_base + JOURNAL_STATUS_WORD];
     if (status != 4u && status != 5u) return;
@@ -43,6 +56,9 @@ void main() {
     if (stride == uint64_t(0)) return;
 
     // Prepare has validated these jobs. Check again before dereferencing imported BDAs.
+#ifdef COPY_ROLE_FILTER
+    bool mapped_gate_up = false;
+#endif
     for (uint j = 0u; j < job_count; ++j) {
         uvec4 a = jobs[job_base + j * 2u];
         uint bytes = jobs[job_base + j * 2u + 1u].x;
@@ -53,11 +69,27 @@ void main() {
         if (((a.x | a.z | bytes) & 15u) != 0u) return;
         uint64_t last = uint64_t(bytes - 1u);
         if (src + last < src || dst + last < dst) return;
+#ifdef COPY_ROLE_FILTER
+        uint block = jobs[job_base + j * 2u + 1u].y;
+        mapped_gate_up = mapped_gate_up || (src != uint64_t(0)
+            && ((block >= p.gate_base && block - p.gate_base < p.experts)
+                || (block >= p.up_base && block - p.up_base < p.experts)));
+#endif
     }
     // The caller orders prepare -> payload -> full FFN with device memory barriers.
     for (uint j = 0u; j < job_count; ++j) {
         uvec4 a = jobs[job_base + j * 2u];
         if (all(equal(a.xy, uvec2(0u)))) continue;
+#ifdef COPY_ROLE_FILTER
+        uint block = jobs[job_base + j * 2u + 1u].y;
+        // With no mapped GU job, delaying the sole Down transfer until H has
+        // finished only creates a bubble. Both phases derive the same decision
+        // from immutable jobs; every mapped payload still copies exactly once.
+        bool early = !mapped_gate_up
+            || (block >= p.gate_base && block - p.gate_base < p.experts)
+            || (block >= p.up_base && block - p.up_base < p.experts);
+        if ((p.phase == 1u) != early) continue;
+#endif
         uint bytes = jobs[job_base + j * 2u + 1u].x;
         Source src = Source(address64(a.xy));
         Destination dst = Destination(address64(a.zw));

@@ -1,0 +1,79 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) readonly buffer Journal { uint journal[]; };
+layout(std430, binding = 1) readonly buffer Jobs { uvec4 jobs[]; };
+layout(std430, binding = 2) writeonly buffer Commands { uvec4 commands[]; };
+layout(push_constant) uniform Params {
+    uint ordinal;
+    uint count;
+    uvec2 dummy;
+    uint phase;
+    uint gate_base;
+    uint up_base;
+    uint experts;
+} p;
+
+const uint CAPACITY = INFR_MAX_DECODE_ROWS * 16u * 3u;
+const uint COUNT_WORD = INFR_MAX_DECODE_ROWS * 16u + INFR_MAX_DECODE_ROWS;
+const uint STATUS_WORD = COUNT_WORD + 3u;
+const uint JOURNAL_WORDS = STATUS_WORD + 1u;
+shared uint bad;
+
+uint64_t address64(uvec2 a) {
+    return uint64_t(a.x) | (uint64_t(a.y) << 32u);
+}
+
+void main() {
+    uint lane = gl_LocalInvocationIndex;
+    uint base = p.ordinal * JOURNAL_WORDS;
+    uint job_base = p.ordinal * CAPACITY * 2u;
+    bool bounds = p.count > 0u && p.count <= CAPACITY
+        && p.ordinal < uint(journal.length()) / JOURNAL_WORDS
+        && p.ordinal < uint(jobs.length()) / (CAPACITY * 2u)
+        && p.ordinal < uint(commands.length()) / (CAPACITY * 2u);
+    if (lane == 0u) bad = 0u;
+    barrier();
+    uint count = bounds ? journal[base + COUNT_WORD] : 0u;
+    uint status = bounds ? journal[base + STATUS_WORD] : 0u;
+    bool roles = p.phase <= 2u && (p.phase == 0u || (p.experts > 0u
+        && p.gate_base + p.experts >= p.gate_base && p.up_base + p.experts >= p.up_base));
+    bool admitted = bounds && roles && (status == 4u || status == 5u) && count <= p.count;
+    if (admitted) {
+        for (uint j = lane; j < count; j += gl_WorkGroupSize.x) {
+            uvec4 a = jobs[job_base + j * 2u];
+            uint bytes = jobs[job_base + j * 2u + 1u].x;
+            uint64_t src = address64(a.xy), dst = address64(a.zw);
+            if ((src == 0ul && status != 5u) || dst == 0ul || bytes == 0u
+                || ((a.x | a.z | bytes) & 15u) != 0u
+                || (src != 0ul && src + uint64_t(bytes - 1u) < src)
+                || dst + uint64_t(bytes - 1u) < dst) atomicOr(bad, 1u);
+        }
+    }
+    barrier();
+    // Indirect copy ignores conditional rendering. Every invocation, including SKIP and
+    // CPU-only fallback, therefore overwrites all recorded command slots with valid jobs.
+    // Unique four-byte dummy destinations avoid overlapping writes or zero-address records.
+    if (!bounds) return;
+    uint64_t dummy = address64(p.dummy);
+    for (uint j = lane; j < p.count; j += gl_WorkGroupSize.x) {
+        uint64_t dst = dummy + 16ul + uint64_t(p.ordinal * CAPACITY + j) * 16ul;
+        uvec4 a = uvec4(p.dummy, uint(dst), uint(dst >> 32u));
+        uint bytes = 4u;
+        if (admitted && bad == 0u && j < count) {
+            uvec4 actual = jobs[job_base + j * 2u];
+            uint block = jobs[job_base + j * 2u + 1u].y;
+            bool early = (block >= p.gate_base && block - p.gate_base < p.experts)
+                || (block >= p.up_base && block - p.up_base < p.experts);
+            bool selected = p.phase == 0u || (p.phase == 1u && early)
+                || (p.phase == 2u && !early);
+            if (selected && any(notEqual(actual.xy, uvec2(0u)))) {
+                a = actual;
+                bytes = jobs[job_base + j * 2u + 1u].x;
+            }
+        }
+        commands[job_base + j * 2u] = a;
+        commands[job_base + j * 2u + 1u] = uvec4(bytes, 0u, 0u, 0u);
+    }
+}

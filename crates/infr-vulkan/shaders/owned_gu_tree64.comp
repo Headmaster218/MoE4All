@@ -1,0 +1,218 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Owned miss GU+SiLU candidate; eligibility and default policy belong to the recorder.
+// Includes use the shader directory and generated native_grids.glsl directory.
+// Select one FMT_Q4K/Q5K/Q6K/IQ2S/IQ3S, LOCAL=64|128|256, NR=1|2|4|8.
+// LOCAL64 is restricted to NR1/2. IQ2_GRID_BUFFER/IQ3_GRID_BUFFER select
+// native_decode's existing buffer codebook instead of the generated LDS grid.
+// LOCAL_SIZE is accepted as the old GU caller's spelling when LOCAL is absent.
+// IQ2S/IQ3S require USE_GRID or their matching buffer grid macro.
+// Host MUST pin Fixed32 with full subgroups.
+// Each logical pair of SGs restores native_gemv_id_multi's 64-lane K tree;
+// exact native parity still requires module qualification on the target driver.
+// Bindings and 40-byte push match gpu_owned_hit_ffn.comp's routed GU_ONLY ABI.
+// Buffer-grid builds prepend Grid at binding 0, shifting Input/Ids/Tape/Output
+// to 1/2/3/4. Output is always last; push constants are unchanged.
+// Dispatch rows*used*ceil(nff/((LOCAL/64)*NR)) WGs (2-D padded grids allowed).
+// IDs are packed rows*used; bank 2 is M. Only output uses physical_used.
+// The optional physical slot used is NOT evaluated or written. No Down reads.
+
+#ifndef LOCAL
+#ifdef LOCAL_SIZE
+#define LOCAL LOCAL_SIZE
+#else
+#define LOCAL 128
+#endif
+#endif
+#if defined(LOCAL_SIZE) && LOCAL_SIZE != LOCAL
+#error LOCAL_and_LOCAL_SIZE_must_match
+#endif
+#ifndef NR
+#define NR 1
+#endif
+#ifndef MAX_NFF
+#define MAX_NFF 1024
+#endif
+#if LOCAL != 64 && LOCAL != 128 && LOCAL != 256
+#error LOCAL_must_be_64_128_or_256
+#endif
+#if NR != 1 && NR != 2 && NR != 4 && NR != 8
+#error NR_must_be_1_or_2_or_4_or_8
+#endif
+#if LOCAL == 64 && NR != 1 && NR != 2
+#error LOCAL64_requires_NR1_or_NR2
+#endif
+#if MAX_NFF != 1024 && MAX_NFF != 2048
+#error MAX_NFF_must_be_1024_or_2048
+#endif
+#if (defined(FMT_Q4K) + defined(FMT_Q5K) + defined(FMT_Q6K) + defined(FMT_IQ2S) + defined(FMT_IQ3S)) != 1
+#error Select_exactly_one_supported_Gate_Up_format
+#endif
+#if (defined(FMT_IQ2S) || defined(FMT_IQ3S)) && !defined(USE_GRID) && !defined(IQ2_GRID_BUFFER) && !defined(IQ3_GRID_BUFFER)
+#error Grid_quant_formats_require_a_codebook
+#endif
+#if defined(IQ2_GRID_BUFFER) || defined(IQ3_GRID_BUFFER)
+#if LOCAL != 64 || (NR != 1 && NR != 2)
+#error Buffer_grid_requires_LOCAL64_NR1_or_NR2
+#endif
+#if (defined(IQ2_GRID_BUFFER) && !defined(FMT_IQ2S)) || (defined(IQ3_GRID_BUFFER) && !defined(FMT_IQ3S))
+#error Buffer_grid_must_match_format
+#endif
+#if defined(USE_GRID)
+#error Select_either_buffer_or_LDS_grid
+#endif
+#define GU_BINDING_OFFSET 1
+#else
+#define GU_BINDING_OFFSET 0
+#endif
+#ifdef SHARED_Q8
+#error Routed_misses_only_no_shared_expert_in_this_fixture
+#endif
+
+layout(local_size_x = LOCAL, local_size_y = 1, local_size_z = 1) in;
+layout(std430, binding = 0 + GU_BINDING_OFFSET) readonly buffer Input { float x[]; };
+layout(std430, binding = 1 + GU_BINDING_OFFSET) readonly buffer Ids { uint ids[]; };
+layout(std430, binding = 2 + GU_BINDING_OFFSET) readonly buffer Tape { uvec2 tape[]; };
+layout(std430, binding = 3 + GU_BINDING_OFFSET) buffer Output { float output_values[]; };
+layout(push_constant) uniform Params {
+    uint ne;
+    uint nff;
+    uint rows;
+    uint used;
+    uint experts;
+    uint physical_used;
+    uint gate_base;
+    uint up_base;
+    uint down_base;  // ABI compatibility only, never dereferenced.
+    uint down_tiles; // ABI compatibility only, never used for GU dispatch.
+} p;
+
+#include "native_weight_addr.glsl"
+#define NW(index) arena_word(index)
+#ifndef STREAMED
+#define STREAMED
+#endif
+#include "native_decode.glsl"
+
+shared float gate_part[NR][LOCAL / 32];
+shared float up_part[NR][LOCAL / 32];
+
+bool fits(uint base, uint count, uint length) {
+    return base <= length && count <= length - base;
+}
+
+bool valid_address(uvec2 address) {
+    return any(notEqual(address, uvec2(0u)))
+        && !all(equal(address, uvec2(0xffffffffu))) && (address.x & 3u) == 0u;
+}
+
+// Keep this arithmetic identical to native_gemv_id_multi.comp::dqsub:
+// a fresh partial per decoded block, NOT a running acc across its 32 elements.
+float dqsub(uint gstart, uint xoff) {
+    float v[32];
+    dqblk(gstart, v);
+    float a = 0.0;
+    for (uint w = 0u; w < 32u; w++) { a += v[w] * x[xoff + w]; }
+    return a;
+}
+
+void main() {
+    // One WG owns one assignment and output tile. Under the Fixed32 contract
+    // and immutable IDs/tape, every rejection before GRID_INIT is WG-uniform.
+    if (p.rows == 0u || p.rows > 8u || p.used == 0u || p.used > 16u
+        || p.experts == 0u || p.ne == 0u || p.ne > 65536u
+        || p.nff == 0u || p.nff > uint(MAX_NFF)
+        || (p.ne & 255u) != 0u || (p.nff & 31u) != 0u
+        || p.physical_used < p.used || p.physical_used > p.used + 1u) return;
+    // Required Fixed32/full subgroups is a host pipeline contract, not an
+    // inference from LocalInvocationIndex / 32 on an arbitrary device.
+    if (gl_SubgroupSize != 32u || gl_NumSubgroups != uint(LOCAL) / 32u) return;
+#if defined(IQ2_GRID_BUFFER)
+    if (uint(G_IQ2S.length()) < 2048u) return;
+#elif defined(IQ3_GRID_BUFFER)
+    if (uint(G_IQ3S.length()) < 512u) return;
+#endif
+    uint assignments = p.rows * p.used;
+    if (uint(ids.length()) < assignments + 2u * p.rows
+        || uint(x.length()) < p.rows * p.ne
+        || uint(output_values.length()) < p.rows * p.physical_used * p.nff
+        || !fits(p.gate_base, p.experts, uint(tape.length()))
+        || !fits(p.up_base, p.experts, uint(tape.length()))) return;
+    if (gl_WorkGroupID.z != 0u) return;
+    const uint groups = uint(LOCAL) / 64u;
+    const uint outputs_per_wg = groups * uint(NR);
+    uint tiles = (p.nff + outputs_per_wg - 1u) / outputs_per_wg;
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (unit >= assignments * tiles) return;
+    uint assignment = unit / tiles;
+    uint tile = unit % tiles;
+    uint row = assignment / p.used;
+    uint slot = assignment % p.used;
+    uint mask = ids[assignments + p.rows + row];
+    if ((mask & (1u << slot)) == 0u) return;
+    uint expert = ids[row * p.used + slot];
+    if (expert >= p.experts) return;
+    uvec2 gate = tape[p.gate_base + expert];
+    uvec2 up = tape[p.up_base + expert];
+    if (!valid_address(gate) || !valid_address(up)) return;
+
+    // Only live M WGs stage the grid; every surviving invocation joins its
+    // barrier. Per-output tails below contribute zero rather than returning.
+    GRID_INIT;
+
+    uint wave = gl_SubgroupID;
+    uint wave_half = wave & 1u;
+    uint group = wave / 2u;
+    uint t = wave_half * 32u + gl_SubgroupInvocationID;
+    uint o0 = tile * outputs_per_wg + group * uint(NR);
+    uint xbase = row * p.ne;
+    uint nsub = p.ne / 32u;
+    uint64_t gate_address = arena_base(gate.x, gate.y);
+    uint64_t up_address = arena_base(up.x, up.y);
+    float gate_acc[NR], up_acc[NR];
+    for (uint rr = 0u; rr < uint(NR); rr++) {
+        gate_acc[rr] = 0.0;
+        up_acc[rr] = 0.0;
+    }
+    // Exactly the native 64-thread output group's block/rr loop nesting.
+    for (uint s = t; s < nsub; s += 64u) {
+        for (uint rr = 0u; rr < uint(NR); rr++) {
+            uint o = o0 + rr;
+            if (o >= p.nff) { continue; }
+            uint wbase = o * p.ne;
+            w_addr = gate_address;
+            gate_acc[rr] += dqsub(wbase + s * 32u, xbase + s * 32u);
+            w_addr = up_address;
+            up_acc[rr] += dqsub(wbase + s * 32u, xbase + s * 32u);
+        }
+    }
+    // Tail outputs contribute zero and still join every reduction/barrier.
+    // Each SG has its own cell; no half-WG early return is permitted here.
+    for (uint rr = 0u; rr < uint(NR); rr++) {
+        float g = subgroupAdd(gate_acc[rr]);
+        float u = subgroupAdd(up_acc[rr]);
+        if (subgroupElect()) {
+            gate_part[rr][wave] = g;
+            up_part[rr][wave] = u;
+        }
+    }
+    barrier();
+    if (t == 0u) {
+        for (uint rr = 0u; rr < uint(NR); rr++) {
+            uint o = o0 + rr;
+            if (o >= p.nff) { continue; }
+            // Native starts at +0 and adds SG0 then SG1, not a reassociated tree.
+            float g = 0.0, u = 0.0;
+            for (uint s = 0u; s < 2u; s++) {
+                g += gate_part[rr][group * 2u + s];
+                u += up_part[rr][group * 2u + s];
+            }
+            uint at = (row * p.physical_used + slot) * p.nff + o;
+            // Identical expression to gpu_resident_silu.comp; no fast sigmoid.
+            output_values[at] = (g / (1.0 + exp(-g))) * u;
+        }
+    }
+}

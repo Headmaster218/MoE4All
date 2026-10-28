@@ -43,6 +43,9 @@ mod resident_ahead_tests;
 #[cfg(test)]
 #[path = "adapter_serial_copy_recovery_tests.rs"]
 mod serial_copy_recovery_tests;
+#[cfg(test)]
+#[path = "adapter_owned_role_pipeline_tests.rs"]
+mod owned_role_pipeline_tests;
 #[path = "adapter_stages.rs"]
 pub(crate) mod stages;
 #[path = "verify_pair.rs"]
@@ -18522,6 +18525,46 @@ fn execute_paged_moe<'a>(
                     copy,
                 )
             });
+        #[cfg(test)]
+        let role_pipeline = if overlap {
+            route.copy.as_ref().zip(copy_params).and_then(|(copy, params)| {
+                rc.try_owned_role_pipeline(crate::recorder::owned_role_pipeline::Request {
+                    copy,
+                    journal: &route.journal,
+                    control: route.control.as_ref(),
+                    ids: pool[&ids_key].as_ref(),
+                    tape: tape.as_ref(),
+                    input: r(*x).ok()?,
+                    activation: pool[&workspace.abuf].as_ref(),
+                    hit_scratch: [pool[&workspace.gbuf].as_ref(),
+                        pool[&workspace.ubuf.unwrap()].as_ref(), pool[&workspace.ybuf].as_ref()],
+                    geometry: crate::recorder::owned_role_pipeline::Geometry {
+                        ne,
+                        nff,
+                        rows,
+                        used: n_used,
+                        experts: n_expert,
+                        physical_used,
+                        tape_bases: windows,
+                        block_bases: [params[0], params[1], params[2]],
+                    },
+                    dtypes: [gdt, udt],
+                    ordinal: route.ordinal,
+                    ordinary: !be_.cfg().spec.mtp
+                        && !graph.mtp_verify
+                        && !*fused_gate_up
+                        && resume_ids.is_none()
+                        && precomputed_hit_masks.is_none()
+                        && *act == Activation::Silu
+                        && swiglu_clamp.is_none()
+                        && !*weight_before
+                        && (rows == 1 || graph.independent_rows),
+                    preparing: preparing_commands(),
+                })
+            })
+        } else {
+            None
+        };
         // Actual overlap wins deterministically. Its CPU fallback must not consume unclassified
         // sidecar commands; pair-only Verify remains available when GPU copying is disabled.
         let pair = pair.filter(|_| !overlap);
@@ -18685,6 +18728,17 @@ fn execute_paged_moe<'a>(
         if payload_first {
             // Start the bounded copy before hit projections; the scope still joins both
             // before any consumer of copied weights. Workgroup count is not a CU reservation.
+            #[cfg(test)]
+            if let Some(pipeline) = &role_pipeline {
+                pipeline.phase1(rc);
+            } else {
+                rc.gpu_resident_copy_payload_overlap(
+                    route.copy.as_ref().unwrap(),
+                    route.journal.as_ref(),
+                    route.ordinal,
+                );
+            }
+            #[cfg(not(test))]
             rc.gpu_resident_copy_payload_overlap(
                 route.copy.as_ref().unwrap(),
                 route.journal.as_ref(),
@@ -18783,55 +18837,116 @@ fn execute_paged_moe<'a>(
         if overlap {
             rc.end_conditional();
             let copy = route.copy.as_ref().unwrap();
-            rc.gpu_resident_copy_finish_overlap(copy, route.journal.as_ref(), route.ordinal);
-            // This legal predicate buffer mirrors journal.JobCount, zero for hits/fallback/SKIP.
-            rc.begin_immutable_conditional_at(
-                copy.miss_predicates.as_ref().unwrap().as_ref(),
-                route.ordinal as usize * crate::recorder::GPU_COPY_PREDICATE_WORDS,
-            );
-            let _miss_phase = infr_core::timeline::device_enabled()
-                .then(|| infr_core::timeline::device_phase_scope("resident_gpu_copy_miss_FFN"));
-            for (dtype, bank, window, shared_weight, output) in [
-                (gdt, banks[0], windows[0], shared_wgate, workspace.gbuf),
-                (
-                    udt,
-                    banks[1],
-                    windows[1],
-                    shared_wup,
-                    workspace.ubuf.unwrap(),
-                ),
-            ] {
-                // Keep the shared weight binding: it selects the physical (top-k + 1) stride.
-                // Only H contains its mask bit; M never evaluates the shared expert twice.
-                linear_paged_maybe_shared(
-                    graph.mtp_verify && !graph.independent_rows,
-                    rc,
-                    dtype,
-                    bank.0,
-                    bank.1,
-                    tape.as_ref(),
-                    pool[&ids_key].as_ref(),
-                    n_used,
-                    window as usize,
-                    shared_weight,
-                    xb,
-                    false,
-                    pool[&output].as_ref(),
-                    ne,
-                    nff,
-                    rows,
-                    0,
-                    MOE_ROW_MASK_MISSES,
+            #[cfg(test)]
+            let role_pipeline_used = role_pipeline.is_some();
+            #[cfg(test)]
+            if let Some(pipeline) = role_pipeline {
+                pipeline.phase2_finish_and_begin_miss(rc);
+            } else {
+                rc.gpu_resident_copy_finish_overlap(copy, route.journal.as_ref(), route.ordinal);
+                // This legal predicate buffer mirrors journal.JobCount, zero for hits/fallback/SKIP.
+                rc.begin_immutable_conditional_at(
+                    copy.miss_predicates.as_ref().unwrap().as_ref(),
+                    route.ordinal as usize * crate::recorder::GPU_COPY_PREDICATE_WORDS,
                 );
             }
-            rc.gpu_resident_silu_bank(
-                pool[&workspace.gbuf].as_ref(),
-                pool[&workspace.ubuf.unwrap()].as_ref(),
-                pool[&ids_key].as_ref(),
-                pool[&workspace.abuf].as_ref(),
-                [rows as u32, n_used as u32, physical_used as u32, nff as u32],
-                true,
-            );
+            #[cfg(not(test))]
+            {
+                rc.gpu_resident_copy_finish_overlap(copy, route.journal.as_ref(), route.ordinal);
+                rc.begin_immutable_conditional_at(
+                    copy.miss_predicates.as_ref().unwrap().as_ref(),
+                    route.ordinal as usize * crate::recorder::GPU_COPY_PREDICATE_WORDS,
+                );
+            }
+            let _miss_phase = infr_core::timeline::device_enabled()
+                .then(|| infr_core::timeline::device_phase_scope("resident_gpu_copy_miss_FFN"));
+            #[cfg(test)]
+            if !role_pipeline_used {
+                for (dtype, bank, window, shared_weight, output) in [
+                    (gdt, banks[0], windows[0], shared_wgate, workspace.gbuf),
+                    (
+                        udt,
+                        banks[1],
+                        windows[1],
+                        shared_wup,
+                        workspace.ubuf.unwrap(),
+                    ),
+                ] {
+                    // Keep the shared weight binding: it selects the physical (top-k + 1) stride.
+                    // Only H contains its mask bit; M never evaluates the shared expert twice.
+                    linear_paged_maybe_shared(
+                        graph.mtp_verify && !graph.independent_rows,
+                        rc,
+                        dtype,
+                        bank.0,
+                        bank.1,
+                        tape.as_ref(),
+                        pool[&ids_key].as_ref(),
+                        n_used,
+                        window as usize,
+                        shared_weight,
+                        xb,
+                        false,
+                        pool[&output].as_ref(),
+                        ne,
+                        nff,
+                        rows,
+                        0,
+                        MOE_ROW_MASK_MISSES,
+                    );
+                }
+                rc.gpu_resident_silu_bank(
+                    pool[&workspace.gbuf].as_ref(),
+                    pool[&workspace.ubuf.unwrap()].as_ref(),
+                    pool[&ids_key].as_ref(),
+                    pool[&workspace.abuf].as_ref(),
+                    [rows as u32, n_used as u32, physical_used as u32, nff as u32],
+                    true,
+                );
+            }
+            #[cfg(not(test))]
+            {
+                for (dtype, bank, window, shared_weight, output) in [
+                    (gdt, banks[0], windows[0], shared_wgate, workspace.gbuf),
+                    (
+                        udt,
+                        banks[1],
+                        windows[1],
+                        shared_wup,
+                        workspace.ubuf.unwrap(),
+                    ),
+                ] {
+                    // Preserve the shared binding's physical stride; M excludes its mask bit.
+                    linear_paged_maybe_shared(
+                        graph.mtp_verify && !graph.independent_rows,
+                        rc,
+                        dtype,
+                        bank.0,
+                        bank.1,
+                        tape.as_ref(),
+                        pool[&ids_key].as_ref(),
+                        n_used,
+                        window as usize,
+                        shared_weight,
+                        xb,
+                        false,
+                        pool[&output].as_ref(),
+                        ne,
+                        nff,
+                        rows,
+                        0,
+                        MOE_ROW_MASK_MISSES,
+                    );
+                }
+                rc.gpu_resident_silu_bank(
+                    pool[&workspace.gbuf].as_ref(),
+                    pool[&workspace.ubuf.unwrap()].as_ref(),
+                    pool[&ids_key].as_ref(),
+                    pool[&workspace.abuf].as_ref(),
+                    [rows as u32, n_used as u32, physical_used as u32, nff as u32],
+                    true,
+                );
+            }
             linear_paged_maybe_shared(
                 graph.mtp_verify && !graph.independent_rows,
                 rc,
