@@ -1179,7 +1179,7 @@ fn scan_file_for_keys(path: &Path, out: &mut Vec<String>) {
 /// This is the shell grep `env::var(_os)?("INFR_` over `crates/*/src` + `crates/*/build.rs`, in
 /// Rust, minus comments. The allowed hits are exactly §6.10's permanent exclusions:
 ///
-/// * `INFR_PROFILE` in the five `build.rs` — a BUILD-time input; a runtime `Config` cannot exist
+/// * `INFR_PROFILE` and `INFR_GIT_COMMIT` in `build.rs` — BUILD-time inputs; a runtime `Config` cannot exist
 ///   when it is read (§5.3).
 /// * `INFR_TEST_GGUF` / `INFR_TEST_MODEL` / `INFR_EMBEDDING_TEST_*` /
 ///   `INFR_LLAMA_DIFFUSION_CLI` — test/dev fixtures that point at files on disk, deliberately left
@@ -1221,8 +1221,7 @@ fn no_infr_env_reads_outside_the_config_layer() {
         if DIRECT_ENV_KEYS.contains(&key) {
             return false;
         }
-        // `INFR_PROFILE` is the build scripts' alone.
-        !(key == "INFR_PROFILE" && path.ends_with("build.rs"))
+        !build_only_metadata_env_read(Path::new(path), key)
     });
     assert!(
         offenders.is_empty(),
@@ -1230,6 +1229,33 @@ fn no_infr_env_reads_outside_the_config_layer() {
          `config/env.rs` and take the value off the `Config` the caller already owns (R3): \
          {offenders:#?}"
     );
+}
+
+fn build_only_metadata_env_read(path: &Path, key: &str) -> bool {
+    path.file_name().is_some_and(|name| name == "build.rs")
+        && matches!(key, "INFR_PROFILE" | "INFR_GIT_COMMIT")
+}
+
+#[test]
+fn build_metadata_env_exception_cannot_hide_runtime_knobs() {
+    for key in ["INFR_PROFILE", "INFR_GIT_COMMIT"] {
+        assert!(build_only_metadata_env_read(
+            Path::new("crates/infr-cli/build.rs"),
+            key
+        ));
+        assert!(!build_only_metadata_env_read(
+            Path::new("crates/infr-cli/src/main.rs"),
+            key
+        ));
+        assert!(!build_only_metadata_env_read(
+            Path::new("crates/infr-core/src/build.rs.bak"),
+            key
+        ));
+    }
+    assert!(!build_only_metadata_env_read(
+        Path::new("build.rs"),
+        "INFR_KV_TYPE_K"
+    ));
 }
 
 #[test]
