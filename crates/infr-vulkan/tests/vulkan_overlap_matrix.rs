@@ -23,6 +23,9 @@ use std::process::Command;
 use std::sync::Barrier;
 use std::time::{Duration, Instant};
 
+#[path = "probes/cu_import_copy.rs"]
+mod cu_import_copy;
+
 const MIB: usize = 1024 * 1024;
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 const MATRIX_BYTES: usize = 3_072 * 1_024 / 256 * 144;
@@ -1520,6 +1523,56 @@ fn windows_vulkan_overlap_matrix() {
             d2h_src.buffer,
             d2h_src.bytes,
         );
+
+        if std::env::var_os("INFR_CU_IMPORT_COPY_PROBE").is_some() {
+            if extensions.iter().any(|extension| {
+                CStr::from_ptr(extension.extension_name.as_ptr()).to_bytes()
+                    == b"VK_KHR_copy_memory_indirect"
+            }) {
+                cu_import_copy::print_indirect_support(&instance, physical);
+            }
+            for name in ["VK_KHR_copy_memory_indirect", "VK_NV_copy_memory_indirect"] {
+                let supported = extensions.iter().any(|extension| {
+                    CStr::from_ptr(extension.extension_name.as_ptr()).to_bytes() == name.as_bytes()
+                });
+                println!("COPY_EXTENSION {name} advertised={supported}");
+            }
+            cu_import_copy::run(
+                &device,
+                &pools,
+                main,
+                transfer_only,
+                &h2d_import,
+                h2d_host.ptr,
+                &cu_copy_dst,
+                &d2h_import,
+                d2h_host.ptr,
+                &compute_src,
+                &compute_out,
+                props.limits.timestamp_period as f64,
+            );
+            device.device_wait_idle().expect("final copy probe idle");
+            for buffer in [
+                compute_out,
+                compute_src,
+                cu_copy_dst,
+                vram_copy_dst,
+                d2h_src,
+                h2d_dst,
+                rebar,
+                staging,
+                d2h_import,
+                h2d_import,
+            ] {
+                buffer.destroy(&device);
+            }
+            for (_, pool) in pools {
+                device.destroy_command_pool(pool, None);
+            }
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+            return;
+        }
 
         println!(
             "\nCPU COPY / PUSH (payload {:.2} MiB)",
