@@ -117,7 +117,7 @@ pub struct ResidentNotice {
     pub context: Context,
     pub ordinal: usize,
     pub status: u32,
-    pub hit_masks: [u32; 4],
+    pub hit_masks: [u32; crate::backend::MAX_DECODE_ROWS],
     pub count: usize,
     pub routed_ids: Vec<u32>,
     /// GPU-only retirement samples carry status, not a reconstructed route or hit mask.

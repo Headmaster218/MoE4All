@@ -57,6 +57,40 @@ impl TopkParams {
         }
     }
 
+    fn many_row_general(self, enabled: bool) -> bool {
+        enabled
+            && (3..=8).contains(&self.rows)
+            && (1..=16).contains(&self.used)
+            && (1..=512).contains(&self.experts)
+            && self.gating <= 1
+            && self.norm_w
+            && !self.has_bias
+            && (self.groups <= 1 || self.groups_used == 0)
+            && !self.hash
+    }
+
+    fn candidate_mode(self, enabled: bool, many_row: bool) -> Option<OwnedTopkMode> {
+        self.owned_mode(enabled).or_else(|| {
+            self.many_row_general(enabled && many_row)
+                .then_some(OwnedTopkMode::ManyRowGeneral)
+        })
+    }
+
+    fn capture_mode(
+        self,
+        enabled: bool,
+        many_row: bool,
+        ordinary: bool,
+        input_tap: bool,
+    ) -> Option<OwnedTopkMode> {
+        // adapter::ordinary is false for graph.mtp_verify, spec.mtp, prefill
+        // targets, recovery, prepared uploads and paired/guarded retirement.
+        if !ordinary || input_tap {
+            return None;
+        }
+        self.candidate_mode(enabled, many_row)
+    }
+
     fn push(self) -> [u32; 9] {
         [
             self.experts as u32,
@@ -76,6 +110,7 @@ impl TopkParams {
 enum OwnedTopkMode {
     Wave32,
     TwoRowGeneral,
+    ManyRowGeneral,
 }
 
 #[derive(Clone, Copy)]
@@ -118,41 +153,78 @@ fn device_descriptors(be: &VulkanBackend, overlap: bool) -> bool {
 }
 
 fn device_descriptor_modes(be: &VulkanBackend) -> [bool; 2] {
-    type Cached = (std::sync::Weak<crate::VulkanShared>, [bool; 2]);
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<Vec<Cached>>> = std::sync::OnceLock::new();
-    let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
+    device_capabilities(be).descriptor_modes
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DeviceCapabilities {
+    descriptor_modes: [bool; 2],
+    many_row: bool,
+}
+
+impl DeviceCapabilities {
+    fn from_limits(limits: &vk::PhysicalDeviceLimits, push: Option<u32>) -> Self {
+        Self {
+            descriptor_modes: [false, true].map(|overlap| {
+                descriptor_limits(
+                    limits.max_per_stage_descriptor_storage_buffers,
+                    limits.max_descriptor_set_storage_buffers,
+                    limits.max_per_stage_resources,
+                    push,
+                    overlap,
+                )
+            }),
+            many_row: many_row_device_limits(
+                limits.max_compute_work_group_invocations,
+                limits.max_compute_work_group_size[0],
+                limits.max_compute_shared_memory_size,
+            ),
+        }
+    }
+}
+
+fn cached_device_capabilities<T>(
+    cache: &mut Vec<(std::sync::Weak<T>, DeviceCapabilities)>,
+    owner: &Arc<T>,
+    query: impl FnOnce() -> DeviceCapabilities,
+) -> DeviceCapabilities {
     cache.retain(|(owner, _)| owner.strong_count() != 0);
+    let owner = Arc::downgrade(owner);
     if let Some((_, supported)) = cache
         .iter()
-        .find(|(owner, _)| std::sync::Weak::ptr_eq(owner, &Arc::downgrade(&be.shared)))
+        .find(|(cached, _)| std::sync::Weak::ptr_eq(cached, &owner))
     {
         return *supported;
     }
-    let mut push_properties = vk::PhysicalDevicePushDescriptorPropertiesKHR::default();
-    let mut properties = vk::PhysicalDeviceProperties2::default();
-    if be.shared.push_descriptor.is_some() {
-        properties = properties.push_next(&mut push_properties);
-    }
-    unsafe {
-        be.shared
-            .instance
-            .get_physical_device_properties2(be.shared.physical_device, &mut properties)
-    };
-    let limits = properties.properties.limits;
-    let supported = [false, true].map(|overlap| {
-        descriptor_limits(
-            limits.max_per_stage_descriptor_storage_buffers,
-            limits.max_descriptor_set_storage_buffers,
-            limits.max_per_stage_resources,
+    let supported = query();
+    cache.push((owner, supported));
+    supported
+}
+
+fn device_capabilities(be: &VulkanBackend) -> DeviceCapabilities {
+    // Cache immutable limits only; runtime policy and scoped test overrides stay separate.
+    type Cached = (std::sync::Weak<crate::VulkanShared>, DeviceCapabilities);
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Vec<Cached>>> = std::sync::OnceLock::new();
+    let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
+    cached_device_capabilities(&mut cache, &be.shared, || {
+        let mut push_properties = vk::PhysicalDevicePushDescriptorPropertiesKHR::default();
+        let mut properties = vk::PhysicalDeviceProperties2::default();
+        if be.shared.push_descriptor.is_some() {
+            properties = properties.push_next(&mut push_properties);
+        }
+        unsafe {
+            be.shared
+                .instance
+                .get_physical_device_properties2(be.shared.physical_device, &mut properties)
+        };
+        DeviceCapabilities::from_limits(
+            &properties.properties.limits,
             be.shared
                 .push_descriptor
                 .as_ref()
                 .map(|_| push_properties.max_push_descriptors),
-            overlap,
         )
-    });
-    cache.push((Arc::downgrade(&be.shared), supported));
-    supported
+    })
 }
 
 fn predicate_word(ordinal: u32) -> Option<usize> {
@@ -161,6 +233,36 @@ fn predicate_word(ordinal: u32) -> Option<usize> {
             .checked_sub(1)
             .map_or(RESIDENT_SEED_WORD, |n| 5 + n as usize * 2)
     })
+}
+
+fn many_row_device_limits(invocations: u32, size_x: u32, shared_bytes: u32) -> bool {
+    // Shared arrays currently occupy less than 20 KiB; leave alignment headroom.
+    invocations >= 256 && size_x >= 256 && shared_bytes >= 20 * 1024
+}
+
+fn device_many_row(be: &VulkanBackend) -> bool {
+    device_capabilities(be).many_row
+}
+
+fn many_row_enabled(be: &VulkanBackend) -> bool {
+    // Module-qualified default; shape/device/ordinary-route gates remain independent.
+    let configured = be.cfg().kernels.vulkan.decode_gpu_resident_many_row;
+    #[cfg(test)]
+    return many_row_test_default(
+        configured,
+        test_states()
+            .lock()
+            .unwrap()
+            .get(&(Arc::as_ptr(&be.shared) as usize))
+            .map(|state| state.enabled && state.many_row),
+    );
+    #[cfg(not(test))]
+    configured
+}
+
+#[cfg(test)]
+fn many_row_test_default(configured: bool, override_enabled: Option<bool>) -> bool {
+    override_enabled.unwrap_or(configured)
 }
 
 impl Recorder<'_> {
@@ -177,10 +279,16 @@ impl Recorder<'_> {
         ordinary: bool,
         input_tap: bool,
     ) -> Option<OwnedTopkRoute> {
-        let mode = params.owned_mode(self.vk().moe_topk_sg)?;
-        if !ordinary
-            || input_tap
-            || !copy.is_owned()
+        let mode = params.capture_mode(
+            self.vk().moe_topk_sg,
+            many_row_enabled(self.be),
+            ordinary,
+            input_tap,
+        )?;
+        if mode == OwnedTopkMode::ManyRowGeneral && !device_many_row(self.be) {
+            return None;
+        }
+        if !copy.is_owned()
             || self.no_barrier
             || self.full_barrier
             || self.suppress.get()
@@ -239,7 +347,9 @@ impl Recorder<'_> {
                 "moe_topk_sigmoid_wave32",
                 crate::gemm::moe_topk_sigmoid_wave32_spv(),
             ),
-            OwnedTopkMode::TwoRowGeneral => ("moe_topk_sg", crate::gemm::moe_topk_sg_spv()),
+            OwnedTopkMode::TwoRowGeneral | OwnedTopkMode::ManyRowGeneral => {
+                ("moe_topk_sg", crate::gemm::moe_topk_sg_spv())
+            }
         };
         let kernel = self.be.kernel_sg(name, spv, 5, 36, 32);
         self.dispatch(
@@ -269,6 +379,15 @@ impl Recorder<'_> {
         overlap: bool,
     ) -> bool {
         let geometry = copy.owned_role_geometry([base[9], base[10], base[11]], base[1]);
+        // This route is tried before owned_prepare_fused_eligible in BOTH owner
+        // entrypoints. Its independent shape/capability gate must remain explicit.
+        if topk.mode == OwnedTopkMode::ManyRowGeneral
+            && (!topk.params.many_row_general(self.vk().moe_topk_sg)
+                || !many_row_enabled(self.be)
+                || !device_many_row(self.be))
+        {
+            return false;
+        }
         if base[12] != 0
             || base[5] != topk.ordinal
             || base[0] != (topk.params.rows * topk.params.used) as u32
@@ -302,6 +421,14 @@ impl Recorder<'_> {
             (OwnedTopkMode::TwoRowGeneral, true) => (
                 "gpu_owned_prepare_topk_fused_two_row_overlap",
                 crate::gemm::gpu_owned_prepare_topk_fused_two_row_overlap_spv(),
+            ),
+            (OwnedTopkMode::ManyRowGeneral, false) => (
+                "gpu_owned_prepare_topk_fused_many_row",
+                crate::gemm::gpu_owned_prepare_topk_fused_many_row_spv(false),
+            ),
+            (OwnedTopkMode::ManyRowGeneral, true) => (
+                "gpu_owned_prepare_topk_fused_many_row_overlap",
+                crate::gemm::gpu_owned_prepare_topk_fused_many_row_spv(true),
             ),
         };
         let kernel = self
@@ -338,6 +465,7 @@ pub(crate) struct Counts {
 #[derive(Clone, Copy)]
 struct TestState {
     enabled: bool,
+    many_row: bool,
     counts: Counts,
 }
 
@@ -393,10 +521,23 @@ pub(crate) fn test_scope(be: &VulkanBackend, enabled: bool) -> TestGuard {
         key,
         TestState {
             enabled,
+            many_row: enabled,
             counts: Counts::default(),
         },
     );
     TestGuard { key, previous }
+}
+
+#[cfg(test)]
+pub(crate) fn test_many_row_scope(be: &VulkanBackend) -> TestGuard {
+    let guard = test_scope(be, true);
+    test_states()
+        .lock()
+        .unwrap()
+        .get_mut(&guard.key)
+        .unwrap()
+        .many_row = true;
+    guard
 }
 
 #[cfg(test)]
@@ -424,6 +565,310 @@ pub(crate) fn test_supported_mode(be: &VulkanBackend, overlap: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_topk_device_capabilities_cache_queries_once_and_expires() {
+        let mut cache = Vec::new();
+        let calls = std::cell::Cell::new(0);
+        let first = Arc::new(());
+        let alias = Arc::clone(&first);
+        let caps = DeviceCapabilities {
+            descriptor_modes: [true, false],
+            many_row: true,
+        };
+        assert_eq!(
+            cached_device_capabilities(&mut cache, &first, || {
+                calls.set(calls.get() + 1);
+                caps
+            }),
+            caps
+        );
+        for owner in [&first, &alias, &first, &alias] {
+            let cached = cached_device_capabilities(&mut cache, owner, || {
+                panic!("capture/revalidation must reuse the same immutable query")
+            });
+            assert_eq!(cached.descriptor_modes, caps.descriptor_modes);
+            assert_eq!(cached.many_row, caps.many_row);
+        }
+        assert_eq!(calls.get(), 1);
+        let second = Arc::new(());
+        let other_caps = DeviceCapabilities {
+            descriptor_modes: [false, false],
+            many_row: false,
+        };
+        assert_eq!(
+            cached_device_capabilities(&mut cache, &second, || {
+                calls.set(calls.get() + 1);
+                other_caps
+            }),
+            other_caps,
+            "distinct backends must not share cached results"
+        );
+        assert_eq!(cache.len(), 2);
+        let expired = Arc::downgrade(&first);
+        drop(alias);
+        drop(first);
+        assert!(
+            expired.upgrade().is_none(),
+            "cache must not keep a backend alive"
+        );
+        assert_eq!(
+            cached_device_capabilities(&mut cache, &second, || panic!("live entry queried twice")),
+            other_caps
+        );
+        assert_eq!(calls.get(), 2);
+        assert_eq!(cache.len(), 1, "expired Weak entries are pruned on lookup");
+        assert!(std::sync::Weak::ptr_eq(
+            &cache[0].0,
+            &Arc::downgrade(&second)
+        ));
+    }
+
+    #[test]
+    fn owned_topk_device_capabilities_boundaries_stay_independent() {
+        let limits = vk::PhysicalDeviceLimits {
+            max_per_stage_descriptor_storage_buffers: 11,
+            max_descriptor_set_storage_buffers: 11,
+            max_per_stage_resources: 11,
+            max_compute_work_group_invocations: 256,
+            max_compute_work_group_size: [256, 1, 1],
+            max_compute_shared_memory_size: 20 * 1024,
+            ..Default::default()
+        };
+        let qualified = DeviceCapabilities {
+            descriptor_modes: [true, true],
+            many_row: true,
+        };
+        assert_eq!(
+            DeviceCapabilities::from_limits(&limits, Some(11)),
+            qualified
+        );
+        assert_eq!(DeviceCapabilities::from_limits(&limits, None), qualified);
+        for gate in 0..3 {
+            let mut lowered = limits;
+            match gate {
+                0 => lowered.max_compute_work_group_invocations = 255,
+                1 => lowered.max_compute_work_group_size[0] = 255,
+                _ => lowered.max_compute_shared_memory_size = 20 * 1024 - 1,
+            }
+            let caps = DeviceCapabilities::from_limits(&lowered, Some(11));
+            assert!(!caps.many_row);
+            assert_eq!(caps.descriptor_modes, [true, true]);
+        }
+        for (push, modes) in [(Some(10), [true, false]), (Some(9), [false, false])] {
+            let caps = DeviceCapabilities::from_limits(&limits, push);
+            assert!(caps.many_row);
+            assert_eq!(caps.descriptor_modes, modes);
+        }
+        for gate in 0..3 {
+            let mut lowered = limits;
+            match gate {
+                0 => lowered.max_per_stage_descriptor_storage_buffers = 10,
+                1 => lowered.max_descriptor_set_storage_buffers = 10,
+                _ => lowered.max_per_stage_resources = 10,
+            }
+            let caps = DeviceCapabilities::from_limits(&lowered, None);
+            assert!(caps.many_row);
+            assert_eq!(caps.descriptor_modes, [true, false]);
+        }
+    }
+
+    #[test]
+    fn owned_topk_many_row_qualified_default_preserves_explicit_false_control() {
+        let configured = infr_core::config::Config::default()
+            .kernels
+            .vulkan
+            .decode_gpu_resident_many_row;
+        assert!(configured, "qualified production default remains enabled");
+        assert!(
+            many_row_test_default(configured, None),
+            "unscoped tests match production"
+        );
+        assert!(many_row_test_default(configured, Some(true)));
+        assert!(
+            !many_row_test_default(configured, Some(false)),
+            "explicit TestGuard control"
+        );
+        assert!(!many_row_test_default(false, None), "runtime opt-out");
+        assert!(!many_row_test_default(false, Some(false)));
+        assert!(
+            many_row_test_default(false, Some(true)),
+            "explicit test opt-in"
+        );
+        for rows in 3..=8 {
+            let p = TopkParams {
+                rows,
+                experts: 512,
+                used: 10,
+                scale: 1.375,
+                gating: 1,
+                norm_w: true,
+                has_bias: false,
+                groups: 0,
+                groups_used: 0,
+                hash: false,
+            };
+            assert_eq!(
+                p.capture_mode(true, many_row_test_default(configured, None), true, false),
+                Some(OwnedTopkMode::ManyRowGeneral)
+            );
+            assert_eq!(
+                p.capture_mode(
+                    true,
+                    many_row_test_default(configured, Some(false)),
+                    true,
+                    false
+                ),
+                None
+            );
+            assert_eq!(
+                p.capture_mode(true, many_row_test_default(false, None), true, false),
+                None,
+                "runtime opt-out preserves separate router/owner fallback"
+            );
+            assert_eq!(
+                p.capture_mode(true, many_row_test_default(configured, None), false, false),
+                None
+            );
+            assert_eq!(
+                p.capture_mode(true, many_row_test_default(configured, None), true, true),
+                None
+            );
+            let mut base = [0; 19];
+            base[0] = (rows * p.used) as u32;
+            base[6] = p.used as u32;
+            assert!(!owned_prepare_fused_eligible(true, &base, true));
+        }
+    }
+
+    #[test]
+    fn owned_topk_many_row_runtime_optout_preserves_single_two_row() {
+        let many_row = many_row_test_default(false, None);
+        for (rows, expected) in [
+            (1, OwnedTopkMode::Wave32),
+            (2, OwnedTopkMode::TwoRowGeneral),
+        ] {
+            let p = TopkParams {
+                rows,
+                experts: 512,
+                used: 10,
+                scale: 1.0,
+                gating: 0,
+                norm_w: true,
+                has_bias: false,
+                groups: 0,
+                groups_used: 0,
+                hash: false,
+            };
+            assert_eq!(p.capture_mode(true, many_row, true, false), Some(expected));
+        }
+    }
+
+    #[test]
+    fn owned_topk_many_row_candidate_gate_preserves_owner_and_verified_routes() {
+        let good = TopkParams {
+            rows: 3,
+            experts: 512,
+            used: 10,
+            scale: 1.375,
+            gating: 1,
+            norm_w: true,
+            has_bias: false,
+            groups: 0,
+            groups_used: 0,
+            hash: false,
+        };
+        for rows in 3..=8 {
+            for used in 1..=16 {
+                for gating in 0..=1 {
+                    let p = TopkParams {
+                        rows,
+                        used,
+                        gating,
+                        ..good
+                    };
+                    assert_eq!(p.owned_mode(true), None);
+                    assert_eq!(p.candidate_mode(true, false), None);
+                    assert_eq!(p.candidate_mode(false, true), None);
+                    assert_eq!(
+                        p.candidate_mode(true, true),
+                        Some(OwnedTopkMode::ManyRowGeneral)
+                    );
+                    assert_eq!(
+                        p.capture_mode(true, true, false, false),
+                        None,
+                        "MTP/nonordinary route"
+                    );
+                    assert_eq!(
+                        p.capture_mode(true, true, true, true),
+                        None,
+                        "CPU input tap"
+                    );
+                    let mut base = [0; 19];
+                    base[0] = (rows * used) as u32;
+                    base[6] = used as u32;
+                    for wider in [false, true] {
+                        assert!(!owned_prepare_fused_eligible(true, &base, wider));
+                    }
+                }
+            }
+        }
+        for rows in [1, 2] {
+            for used in 1..=32 {
+                let p = TopkParams { rows, used, ..good };
+                assert_eq!(p.candidate_mode(true, true), p.owned_mode(true));
+            }
+        }
+        for p in [
+            TopkParams { rows: 0, ..good },
+            TopkParams { rows: 9, ..good },
+            TopkParams { used: 0, ..good },
+            TopkParams { used: 17, ..good },
+            TopkParams { experts: 0, ..good },
+            TopkParams {
+                experts: 513,
+                ..good
+            },
+            TopkParams { gating: 2, ..good },
+            TopkParams {
+                norm_w: false,
+                ..good
+            },
+            TopkParams {
+                has_bias: true,
+                ..good
+            },
+            TopkParams { hash: true, ..good },
+            TopkParams {
+                groups: 2,
+                groups_used: 1,
+                ..good
+            },
+        ] {
+            assert!(!p.many_row_general(true));
+            assert_eq!(p.candidate_mode(true, true), None);
+        }
+        assert!(
+            TopkParams {
+                experts: 1,
+                used: 16,
+                ..good
+            }
+            .many_row_general(true)
+        );
+        assert!(
+            TopkParams {
+                groups: 2,
+                groups_used: 0,
+                ..good
+            }
+            .many_row_general(true)
+        );
+        assert!(many_row_device_limits(256, 256, 20 * 1024));
+        assert!(!many_row_device_limits(255, 256, 20 * 1024));
+        assert!(!many_row_device_limits(256, 255, 20 * 1024));
+        assert!(!many_row_device_limits(256, 256, 20 * 1024 - 1));
+    }
 
     #[test]
     fn owned_topk_descriptor_limits_and_original_wave32_rules() {

@@ -440,9 +440,12 @@ cfg_struct! {
         decode_gpu_resident_fence_wait: bool = false,
         /// Cache immutable physical addresses and use dense slot protection for resident LUTs.
         decode_gpu_resident_fast_lut: bool = true,
+        /// Fuse ordinary 3..=8-row router selection with GPU-owned admission when supported.
+        /// False retains the established separate router/owner recording for diagnosis.
+        decode_gpu_resident_many_row: bool = true,
         /// Continue resident hits while a miss notice starts host-side recovery.
         decode_gpu_resident_hit_first: bool = true,
-        /// GPU miss copy from imported RAM. None selects ordinary single-row Decode only;
+        /// GPU miss copy from imported RAM. None selects ordinary 1..=8-row Decode;
         /// true also permits experimental multirow/Verify, false disables it.
         /// Unmapped sources, bounded host tiers and exhausted safe destinations retain recovery.
         decode_gpu_resident_copy: Option<bool> = None,

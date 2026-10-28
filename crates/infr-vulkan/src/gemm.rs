@@ -4233,6 +4233,31 @@ pub(crate) fn gpu_owned_prepare_topk_fused_two_row_overlap_spv() -> &'static [u3
     WORDS.get_or_init(|| spv_words(BYTES))
 }
 
+pub(crate) fn gpu_owned_prepare_topk_fused_many_row_spv(overlap: bool) -> &'static [u32] {
+    const SERIAL: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"), "/gpu_owned_prepare_topk_fused_many_row.spv"
+    ));
+    const OVERLAP: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"), "/gpu_owned_prepare_topk_fused_many_row_overlap.spv"
+    ));
+    static SERIAL_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    static OVERLAP_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    if overlap {
+        OVERLAP_WORDS.get_or_init(|| spv_words(OVERLAP))
+    } else {
+        SERIAL_WORDS.get_or_init(|| spv_words(SERIAL))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn gpu_owned_topk_many_row_classify_probe_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"), "/gpu_owned_topk_many_row_classify_probe.spv"
+    ));
+    static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
+    WORDS.get_or_init(|| spv_words(BYTES))
+}
+
 pub(crate) fn gpu_owned_prepare_fused_spv(overlap: bool) -> &'static [u32] {
     const SERIAL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_owned_prepare_fused.spv"));
     const OVERLAP: &[u8] = include_bytes!(concat!(

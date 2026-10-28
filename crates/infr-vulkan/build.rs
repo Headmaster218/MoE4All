@@ -1170,6 +1170,25 @@ fn main() {
         ("gpu_owned_prepare_fused", "gpu_owned_prepare_fused", &[]),
         (
             "gpu_owned_prepare_fused",
+            "gpu_owned_prepare_topk_fused_many_row",
+            &["-DOWNER_TOPK_FUSED", "-DOWNER_TOPK_MANY_ROW"],
+        ),
+        (
+            "gpu_owned_prepare_fused",
+            "gpu_owned_prepare_topk_fused_many_row_overlap",
+            &["-DOWNER_TOPK_FUSED", "-DOWNER_TOPK_MANY_ROW", "-DCOPY_OVERLAP"],
+        ),
+        (
+            "gpu_owned_prepare_fused",
+            "gpu_owned_topk_many_row_classify_probe",
+            &[
+                "-DOWNER_TOPK_FUSED",
+                "-DOWNER_TOPK_MANY_ROW",
+                "-DOWNER_TOPK_MANY_ROW_CLASSIFY_PROBE",
+            ],
+        ),
+        (
+            "gpu_owned_prepare_fused",
             "gpu_owned_prepare_topk_fused_two_row",
             &["-DOWNER_TOPK_FUSED", "-DOWNER_TOPK_TWO_ROW"],
         ),
@@ -4742,6 +4761,7 @@ fn main() {
         if src_stem == "gpu_owned_prepare_fused" {
             println!("cargo:rerun-if-changed=shaders/gpu_owned_topk_route.glsl");
             println!("cargo:rerun-if-changed=shaders/gpu_owned_topk_two_row_route.glsl");
+            println!("cargo:rerun-if-changed=shaders/gpu_owned_topk_many_row_route.glsl");
         }
         let mut args: Vec<String> = vec![
             "-fshader-stage=comp".into(),

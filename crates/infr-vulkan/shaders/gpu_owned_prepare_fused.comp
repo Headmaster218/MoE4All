@@ -7,7 +7,9 @@
 #endif
 // Certified single-row WG64/Fixed32 path: split hot preflight plus complete cold admission.
 // Full cold revalidation/reset on uniform fast fallback; no status6 mailbox dependency.
-#ifdef OWNER_TOPK_TWO_ROW
+#ifdef OWNER_TOPK_MANY_ROW
+layout(local_size_x = 256) in;
+#elif defined(OWNER_TOPK_TWO_ROW)
 layout(local_size_x = 128) in;
 #else
 layout(local_size_x = 64) in;
@@ -74,7 +76,9 @@ shared uvec4 pool_info[3]; // pool, bytes, first global slot, physical capacity
 shared uvec4 pool_lists[3]; // queue-header index, resident count, free head, enabled
 shared uvec4 pool_counts[3]; // touches, unique misses, unique requests, free pops
 shared uint free_after[3];
-#ifdef OWNER_TOPK_TWO_ROW
+#ifdef OWNER_TOPK_MANY_ROW
+shared uvec4 scan_min[256];
+#elif defined(OWNER_TOPK_TWO_ROW)
 shared uvec4 scan_min[128]; // FIFO {slot,eligible,malformed,0}; compaction borrows w as keep flag
 #else
 shared uvec4 scan_min[64]; // FIFO {slot,eligible,malformed,0}; compaction borrows w as keep flag
@@ -363,7 +367,7 @@ bool preflight_pool(uint i) {
     return true;
 }
 
-#ifdef OWNER_TOPK_TWO_ROW
+#if defined(OWNER_TOPK_TWO_ROW) || (defined(OWNER_TOPK_MANY_ROW) && !defined(OWNER_MANY_ROW_DISABLE_POOL_SG))
 void select_fifo_victims_workgroup() {
 #else
 void select_fifo_victims() {
@@ -461,7 +465,7 @@ void select_fifo_victims() {
     barrier();
 }
 
-#ifdef OWNER_TOPK_TWO_ROW
+#if defined(OWNER_TOPK_TWO_ROW) || (defined(OWNER_TOPK_MANY_ROW) && !defined(OWNER_MANY_ROW_DISABLE_POOL_SG))
 void select_fifo_victims() {
     if (plan_count > min(2u, gl_NumSubgroups) || request_count > gl_WorkGroupSize.x) {
         select_fifo_victims_workgroup();
@@ -1127,7 +1131,7 @@ bool try_all_hits(bool prefix_ready) {
     if (gl_SubgroupID == 0u) {
         if (gl_SubgroupInvocationID < 3u)
             prepare_hit_queue_role(gl_SubgroupInvocationID);
-#ifdef OWNER_TOPK_TWO_ROW
+#if defined(OWNER_TOPK_TWO_ROW) || defined(OWNER_TOPK_MANY_ROW)
     } else {
         uint start = (gl_SubgroupID - 1u) * gl_SubgroupSize + gl_SubgroupInvocationID;
         uint stride = (gl_NumSubgroups - 1u) * gl_SubgroupSize;
@@ -1145,6 +1149,16 @@ bool try_all_hits(bool prefix_ready) {
         // Keep the live checked prefix for qualified ordinary TopK shapes. Partial aliases,
         // malformed metadata, recovery and unsupported shapes retain the full fallback.
         bool partial_shape = p.count == p.used && p.count <= 16u;
+#ifdef OWNER_TOPK_MANY_ROW
+#ifdef OWNER_MANY_ROW_DISABLE_PARTIAL
+        partial_shape = false;
+#else
+        // The wrapper classified the complete routed union. Capture one role
+        // occurrence per WG lane; larger unions retain full cold revalidation.
+        partial_shape = p.used > 0u && p.used <= 16u && p.count % p.used == 0u
+            && p.count / p.used >= 3u && p.count / p.used <= 8u;
+#endif
+#endif
 #ifdef OWNER_TOPK_TWO_ROW
         // The wrapper classified the complete union. WG128 captures every role
         // occurrence before the checked prefix scratch is repurposed.
@@ -1347,7 +1361,9 @@ void main() {
 }
 #ifdef OWNER_TOPK_FUSED
 #undef main
-#ifdef OWNER_TOPK_TWO_ROW
+#ifdef OWNER_TOPK_MANY_ROW
+#include "gpu_owned_topk_many_row_route.glsl"
+#elif defined(OWNER_TOPK_TWO_ROW)
 #include "gpu_owned_topk_two_row_route.glsl"
 #else
 #include "gpu_owned_topk_route.glsl"

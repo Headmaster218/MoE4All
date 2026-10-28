@@ -235,7 +235,11 @@ fn run_route(
         copy.begin(&be, session).unwrap();
         session.gpu_decode_owner = Some(Arc::clone(&copy));
     }
-    let _counting = test_scope(&be, true);
+    let _counting = if rows >= 3 {
+        test_many_row_scope(&be)
+    } else {
+        test_scope(&be, true)
+    };
     let event = if with_event {
         unsafe {
             be.shared
@@ -286,7 +290,13 @@ fn run_route(
             [extra[0], extra[1], extra[2]],
             0,
             TopkParams {
-                rows: if rows == 1 { 2 } else { 4 },
+                rows: if rows == 1 {
+                    2
+                } else if rows == 2 {
+                    4
+                } else {
+                    9
+                },
                 ..route_params
             },
             true,
@@ -310,8 +320,10 @@ fn run_route(
         route.mode,
         if rows == 1 {
             OwnedTopkMode::Wave32
-        } else {
+        } else if rows == 2 {
             OwnedTopkMode::TwoRowGeneral
+        } else {
+            OwnedTopkMode::ManyRowGeneral
         }
     );
     rec.end_conditional();
@@ -518,4 +530,12 @@ fn gpu_owned_topk_two_row_recording_entrypoint_and_recovery() {
 fn gpu_owned_topk_two_row_recording_fallback_general_router() {
     run_route(8, false, true, true, 2, 1, false);
     run_route(10, false, true, false, 2, 0, true);
+}
+
+#[test]
+#[ignore = "central serial GPU runner; explicit ManyRow opt-in, real entrypoint and general-router fallback"]
+fn gpu_owned_topk_many_row_recording_entrypoint_and_fallback() {
+    run_route(8, false, false, false, 3, 0, false);
+    run_route(10, true, false, true, 4, 1, false);
+    run_route(8, false, true, false, 3, 1, false);
 }

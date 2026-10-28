@@ -15241,9 +15241,15 @@ fn resident_notice_trace(
         status,
         count: layout.count(),
         hit_masks: if route_payload_present {
-            std::array::from_fn(|row| words[crate::recorder::RESIDENT_JOURNAL_MASK_WORD + row])
+            std::array::from_fn(|row| {
+                if row < layout.rows {
+                    words[crate::recorder::RESIDENT_JOURNAL_MASK_WORD + row]
+                } else {
+                    0
+                }
+            })
         } else {
-            [0; 4]
+            [0; infr_core::backend::MAX_DECODE_ROWS]
         },
         routed_ids: if route_payload_present {
             words[..layout.count()].to_vec()
@@ -15528,7 +15534,7 @@ impl ResidentChunk {
                 context,
                 ordinal,
                 status: words[crate::recorder::RESIDENT_JOURNAL_STATUS_WORD],
-                hit_masks: [0; 4],
+                hit_masks: [0; infr_core::backend::MAX_DECODE_ROWS],
                 count: entry.layout.count(),
                 routed_ids: Vec::new(),
                 route_payload_present: false,

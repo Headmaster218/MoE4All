@@ -12,6 +12,9 @@ mod wider_tests;
 #[path = "recorder_gpu_owner_topk_two_row_tests.rs"]
 mod topk_two_row_tests;
 
+#[path = "recorder_gpu_owner_topk_many_row_tests.rs"]
+mod topk_many_row_tests;
+
 #[path = "recorder_gpu_owner_legacy_touch_tests.rs"]
 mod legacy_touch_tests;
 
