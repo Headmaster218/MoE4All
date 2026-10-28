@@ -23,6 +23,60 @@ fn gpu_owned_wider_prepare_admission_covers_qualified_shapes() {
     }
 }
 
+#[test]
+fn gpu_owned_recovery_prepare_push_uses_pool_start0_word12() {
+    for recovery in [0, 1, 2] {
+        let base = gpu_copy_prepare_push(
+            [40, 512, 0, 512, 1024, 0, 10, 1 << 10],
+            true,
+            [100, 612, 1124, recovery, 0, 0, 0, 0, 0],
+            8,
+        );
+        assert_eq!(base[12], recovery, "extra[3] is pool_start0, not base[3]");
+        assert_eq!(base[3], 512, "Up Tape base remains independent");
+        assert_eq!(gpu_owned_fast_push(&base, &[0; 12])[12], recovery);
+        assert_eq!(
+            owned_prepare_fused_eligible(true, &base, true),
+            recovery == 1
+        );
+    }
+}
+
+#[test]
+fn gpu_owned_recovery_fused_prepare_gate_only_qualified_shapes() {
+    let mut base = [0u32; 19];
+    for used in 1..=16 {
+        base[6] = used;
+        for rows in 1..=9 {
+            base[0] = rows * used;
+            for recovery in [0, 1, 2, u32::MAX] {
+                base[12] = recovery;
+                for wider in [false, true] {
+                    let existing = rows == 1 || (wider && rows == 2 && matches!(used, 8 | 10));
+                    let added = wider
+                        && recovery == 1
+                        && (((3..=8).contains(&rows) && matches!(used, 8 | 10))
+                            || (rows == 8 && used == 16));
+                    assert_eq!(
+                        owned_prepare_fused_eligible(true, &base, wider),
+                        existing || added,
+                        "rows={rows} used={used} recovery={recovery} wider={wider}"
+                    );
+                    assert!(!owned_prepare_fused_eligible(false, &base, wider));
+                }
+            }
+        }
+    }
+    base[12] = 1;
+    for used in [0, 8, 10, 16] {
+        base[6] = used;
+        for count in [17, 19, 21, 129, u32::MAX] {
+            base[0] = count;
+            assert!(!owned_prepare_fused_eligible(true, &base, true));
+        }
+    }
+}
+
 struct WiderProbe {
     pool: PoolProbe,
     overlap: bool,
@@ -163,10 +217,11 @@ fn backend() -> VulkanBackend {
     let mut cfg = infr_core::config::Config::default();
     cfg.device.dev = Some(std::env::var("MOE4ALL_TEST_DEVICE").expect("explicit idle device"));
     let be = VulkanBackend::new_with(Arc::new(cfg)).unwrap();
-    assert!(be
-        .shared
-        .compute_subgroup_operations
-        .contains(vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::ARITHMETIC));
+    assert!(
+        be.shared
+            .compute_subgroup_operations
+            .contains(vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::ARITHMETIC)
+    );
     be
 }
 

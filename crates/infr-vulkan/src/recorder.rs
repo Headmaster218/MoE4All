@@ -1540,9 +1540,18 @@ fn gpu_owned_fast_push(base: &[u32; 19], geometry: &[u32; 12]) -> [u32; 31] {
 }
 
 fn owned_prepare_fused_eligible(subgroup_scan: bool, base: &[u32; 19], wider_trial: bool) -> bool {
+    let used = base[6];
     subgroup_scan
         && (base[0] == base[6]
-            || (wider_trial && matches!(base[6], 8 | 10) && base[0] == base[6] * 2))
+            || (wider_trial && matches!(used, 8 | 10) && base[0] == used * 2)
+            // extra[3] is pool_start0 at base[12]. Only READY recovery was qualified
+            // beyond two rows; ordinary non-TopK admission keeps split preparation.
+            || (wider_trial
+                && base[12] == 1
+                && ((matches!(used, 8 | 10)
+                    && base[0].is_multiple_of(used)
+                    && (3..=8).contains(&(base[0] / used)))
+                    || (used == 16 && base[0] == 8 * 16))))
 }
 
 fn gpu_copy_payload_args_barrier(
@@ -14208,8 +14217,8 @@ impl<'a> Recorder<'a> {
         else {
             return false;
         };
-        // Exact/recovery and paired probes qualify two ordinary rows of 8/10 routed
-        // experts. Other cohort shapes retain split preparation; no model-name gate.
+        // Two ordinary rows of used8/10, plus recovery-only rows3..8 used8/10
+        // and the exact 8x16 corner are qualified. Other shapes retain split preparation.
         self.dispatch_owned_prepare_geometry(buffers, base, overlap, &geometry, true)
     }
 

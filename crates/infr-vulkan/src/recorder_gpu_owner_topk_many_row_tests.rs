@@ -2,6 +2,9 @@
 //! Oracle: actual moe_topk_sg (one WG/row), then the unchanged general WG64 owner.
 use super::*;
 
+#[path = "recorder_gpu_owner_recovery_candidate_tests.rs"]
+mod recovery_candidate_tests;
+
 type Raw = Vec<Vec<u32>>;
 const GUARD: u32 = 0xa53c_91e7;
 const SCALE: f32 = 1.375;

@@ -281,8 +281,8 @@ fn run_route(
         groups_used: 0,
         hash: false,
     };
-    assert!(rec
-        .defer_owned_topk(
+    assert!(
+        rec.defer_owned_topk(
             &copy,
             control.as_ref(),
             logits.as_ref(),
@@ -302,7 +302,8 @@ fn run_route(
             true,
             false
         )
-        .is_none());
+        .is_none()
+    );
     let mut route = rec
         .defer_owned_topk(
             &copy,
@@ -333,6 +334,7 @@ fn run_route(
         // about bank geometry or adding a global production debug switch.
         route.overlap_descriptors = false;
     }
+    let prepare_before = rec.dispatches();
     rec.gpu_resident_copy_prepare_overlap_topk(
         ids.as_ref(),
         tape.as_ref(),
@@ -344,6 +346,20 @@ fn run_route(
         event,
         route,
     );
+    if rows >= 3 && fallback {
+        assert_eq!(
+            rec.dispatches() - prepare_before,
+            3,
+            "ordinary router plus split owner"
+        );
+        let names = be.built_kernel_names();
+        assert!(names.contains(&"gpu_owned_prepare_fast_split_overlap"));
+        assert!(names.contains(&"gpu_owned_prepare_slow_subgroup_overlap"));
+        assert!(
+            !names.contains(&"gpu_owned_prepare_fused_overlap"),
+            "ordinary many-row non-TopK admission must stay split"
+        );
+    }
     rec.begin_immutable_conditional_at(control.as_ref(), 6);
     let scope = rec.independent_dispatch_scope();
     rec.gpu_resident_silu_bank(
@@ -406,9 +422,11 @@ fn run_route(
                 be.download_range(arena, offset, bytemuck::cast_slice_mut(&mut payload))
                     .unwrap();
             }
-            assert!(payload
-                .iter()
-                .all(|&v| v == pattern(job[5] as usize / EXPERTS, 0)));
+            assert!(
+                payload
+                    .iter()
+                    .all(|&v| v == pattern(job[5] as usize / EXPERTS, 0))
+            );
         }
     }
     let old_hits = words[RESIDENT_JOURNAL_MASK_WORD..RESIDENT_JOURNAL_MASK_WORD + rows].to_vec();
@@ -459,6 +477,18 @@ fn run_route(
         );
         let mut recovery = extra;
         recovery[3] = 1;
+        assert_eq!(
+            gpu_copy_prepare_push(params, true, recovery, copy.copy_groups)[12],
+            1
+        );
+        let recovery_before = rec.dispatches();
+        if rows >= 3 {
+            assert!(
+                !be.built_kernel_names()
+                    .contains(&"gpu_owned_prepare_fused_overlap"),
+                "recovery selection must not be inferred from an already-built kernel"
+            );
+        }
         // Even a retained route must not run again after the first admission.
         rec.gpu_resident_copy_prepare_overlap_topk(
             ids.as_ref(),
@@ -471,6 +501,24 @@ fn run_route(
             vk::Event::null(),
             captured,
         );
+        let fused_recovery = rows == 1
+            || (rows == 2 && matches!(used, 8 | 10))
+            || ((3..=8).contains(&rows) && matches!(used, 8 | 10))
+            || (rows == 8 && used == 16);
+        assert_eq!(
+            rec.dispatches() - recovery_before,
+            if fused_recovery { 1 } else { 2 },
+            "real recovery must select fused or split without rerouting"
+        );
+        let names = be.built_kernel_names();
+        assert_eq!(
+            names.contains(&"gpu_owned_prepare_fused_overlap"),
+            fused_recovery
+        );
+        if !fused_recovery {
+            assert!(names.contains(&"gpu_owned_prepare_fast_split_overlap"));
+            assert!(names.contains(&"gpu_owned_prepare_slow_subgroup_overlap"));
+        }
         rec.gpu_owned_recovery_miss_masks(ids.as_ref(), count, used, &old_hits);
         rec.begin_immutable_conditional_at(control.as_ref(), 6);
         rec.gpu_resident_silu_bank(
@@ -538,4 +586,16 @@ fn gpu_owned_topk_many_row_recording_entrypoint_and_fallback() {
     run_route(8, false, false, false, 3, 0, false);
     run_route(10, true, false, true, 4, 1, false);
     run_route(8, false, true, false, 3, 1, false);
+}
+
+#[test]
+#[ignore = "central serial GPU runner; real status5 CPU upload/publication, recovery-only fused selection and ordinary split control"]
+fn gpu_owned_recovery_fused_recording_entrypoint_qualified_shapes() {
+    for (rows, used) in [(3, 8), (4, 10), (8, 16)] {
+        run_route(used, true, false, true, rows, 0, false);
+    }
+    // The same real session must keep ordinary non-TopK admission split, while
+    // its following status5 recovery selects the new one-dispatch owner path.
+    run_route(10, true, true, true, 4, 0, false);
+    run_route(16, true, false, true, 4, 0, false); // Unqualified used16 shape stays split.
 }
