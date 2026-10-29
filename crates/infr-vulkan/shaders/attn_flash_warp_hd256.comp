@@ -74,7 +74,7 @@ void main() {
         coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> sacc =
             coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
         if (tail) {
-            [[unroll]] for (uint kf = 0u; kf < HD; kf += 16u) {
+            for (uint kf = 0u; kf < HD; kf += 16u) {
                 for (uint i = li; i < BN * 16u; i += gl_WorkGroupSize.x) {
                     uint kr = i / 16u;
                     uint d = i % 16u;
@@ -94,7 +94,7 @@ void main() {
                 barrier();
             }
         } else {
-            [[unroll]] for (uint kf = 0u; kf < HD; kf += 16u) {
+            for (uint kf = 0u; kf < HD; kf += 16u) {
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
                 coopMatLoad(A, q, qr0 * nhhd + h * HD + kf, nhhd,
                             gl_CooperativeMatrixLayoutRowMajor);
@@ -119,7 +119,7 @@ void main() {
             float oldm = mrow[r];
             float oldl = lrow[r];
             float lmax = -1e30;
-            [[unroll]] for (uint jj = 0u; jj < 16u; jj++) {
+            for (uint jj = 0u; jj < 16u; jj++) {
                 uint j = cg * 16u + jj;
                 uint kpos = kv0 + j;
                 float s = (kpos > qpos || kpos >= pc.kv_len) ? -1e30 : Ss[r * BN + j] * scale;
@@ -129,7 +129,7 @@ void main() {
             float rmax = max(oldm, subgroupClusteredMax(lmax, 4u));
             float cf = exp(oldm - rmax);
             float lsum = 0.0;
-            [[unroll]] for (uint jj = 0u; jj < 16u; jj++) {
+            for (uint jj = 0u; jj < 16u; jj++) {
                 uint j = cg * 16u + jj;
                 float p = exp(Ss[r * BN + j] - rmax);
                 Ps[r * BN + j] = float16_t(p);
@@ -150,7 +150,7 @@ void main() {
         // PV: each subgroup owns all 16 rows and one 64-dimension output band. The tail arm stages
         // one 16-dimension fragment per subgroup (64 dimensions total) before each fragment GEMM.
         if (tail) {
-            [[unroll]] for (uint j = 0u; j < PV_CMS_N; j++) {
+            for (uint j = 0u; j < PV_CMS_N; j++) {
                 uint col = warp_c * (HD / WARPS_N) + j * 16u;
                 for (uint i = li; i < BN * 64u; i += gl_WorkGroupSize.x) {
                     uint vr = i / 64u;
@@ -165,7 +165,7 @@ void main() {
                 barrier();
                 coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc;
                 coopMatLoad(acc, Os, col, HD, gl_CooperativeMatrixLayoutRowMajor);
-                [[unroll]] for (uint kf = 0u; kf < BN; kf += 16u) {
+                for (uint kf = 0u; kf < BN; kf += 16u) {
                     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
                     coopMatLoad(A, Ps, kf, BN, gl_CooperativeMatrixLayoutRowMajor);
                     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
@@ -178,14 +178,14 @@ void main() {
             }
         } else {
             coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> oacc[PV_CMS_N];
-            [[unroll]] for (uint j = 0u; j < PV_CMS_N; j++) {
+            for (uint j = 0u; j < PV_CMS_N; j++) {
                 uint col = warp_c * (HD / WARPS_N) + j * 16u;
                 coopMatLoad(oacc[j], Os, col, HD, gl_CooperativeMatrixLayoutRowMajor);
             }
-            [[unroll]] for (uint kf = 0u; kf < BN; kf += 16u) {
+            for (uint kf = 0u; kf < BN; kf += 16u) {
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
                 coopMatLoad(A, Ps, kf, BN, gl_CooperativeMatrixLayoutRowMajor);
-                [[unroll]] for (uint j = 0u; j < PV_CMS_N; j++) {
+                for (uint j = 0u; j < PV_CMS_N; j++) {
                     uint col = warp_c * (HD / WARPS_N) + j * 16u;
                     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
                     coopMatLoad(B, v, (kv0 + kf) * nkvhd + kvh * HD + col, nkvhd,
@@ -193,7 +193,7 @@ void main() {
                     oacc[j] = coopMatMulAdd(A, B, oacc[j]);
                 }
             }
-            [[unroll]] for (uint j = 0u; j < PV_CMS_N; j++) {
+            for (uint j = 0u; j < PV_CMS_N; j++) {
                 uint col = warp_c * (HD / WARPS_N) + j * 16u;
                 coopMatStore(oacc[j], Os, col, HD, gl_CooperativeMatrixLayoutRowMajor);
             }
