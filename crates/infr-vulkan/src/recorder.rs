@@ -7421,13 +7421,20 @@ impl<'a> Recorder<'a> {
         let n_splits =
             flash_split_count(self.vk().flash_splits, base_wg, kv_len, prefer_deep_splits);
         let ksplit = (kv_len as u32).div_ceil(n_splits).div_ceil(64) * 64;
-        let kp = self.be.kernel_sg(
-            "attn_flash_warp_hd256_bm16",
-            crate::gemm::attn_flash_warp_hd256_bm16_spv(),
-            6,
-            32,
-            32,
-        );
+        // LLPC (amdvlk) faults on this kernel's FULLY-UNROLLED IR; the `-DNO_UNROLL` twin compiles
+        // and runs there, while conforming drivers keep the unrolled build. Same math either way.
+        let (hd256_name, hd256_spv) = if self.be.is_amd_proprietary_driver() {
+            (
+                "attn_flash_warp_hd256_bm16_nounroll",
+                crate::gemm::attn_flash_warp_hd256_bm16_nounroll_spv(),
+            )
+        } else {
+            (
+                "attn_flash_warp_hd256_bm16",
+                crate::gemm::attn_flash_warp_hd256_bm16_spv(),
+            )
+        };
+        let kp = self.be.kernel_sg(hd256_name, hd256_spv, 6, 32, 32);
         let mut pp = [0u8; 32];
         pp[0..4].copy_from_slice(&mpad.to_ne_bytes());
         pp[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());

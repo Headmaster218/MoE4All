@@ -7337,18 +7337,16 @@ fn lower_op(
                 };
                 let scratch_ne = scratch_rows * nkv * hd;
                 let scratch_tail_bytes = (scratch_ne - ne) * 2;
-                // amdvlk (VK_DRIVER_ID_AMD_PROPRIETARY, LLPC) faults with 0xc0000005 INSIDE
-                // vkCreateComputePipelines for `attn_flash_warp_hd256_bm16` (first full-attention
-                // layer of a 4K prefill, 4001 query rows). The crash is a driver pipeline-compile
-                // defect, so by default (feature switch OFF) that build is not selected on this
-                // driver. The register-O build is a different pipeline and stays available for
-                // its exact 128-row contract; every other hd256 geometry takes the coopmat
-                // `attn_qk`/`softmax`/`attn_pv` tier (`nonfa_ok`), whose small tiles compile
-                // cleanly there and stay inside the driver's reported shared-memory budget
-                // (nc_fa's hd256 build does not: 54016 B vs 32768 B). INFR_AMDVLK_HD256_FLASH=1
-                // opts in and forces the bm16 build back — for older drivers, or to re-verify
-                // once AMD fixes LLPC; known to crash on 26.9.2/26.10.1 at
-                // amdvlk64.dll+0x2b65705.
+                // amdvlk (VK_DRIVER_ID_AMD_PROPRIETARY, LLPC) USED to fault with 0xc0000005 INSIDE
+                // vkCreateComputePipelines for `attn_flash_warp_hd256_bm16` (first FUSED flash use
+                // of a ragged 4K prefill, e.g. 4001 query rows, at amdvlk64.dll+0x2b65705). The
+                // trigger was the fully-unrolled IR: `attn_flash_warp_hd256.comp` no longer forces
+                // `[[unroll]]`, the SAME kernel compiles, and it measured +21% / +24% / +10% pp
+                // over the coopmat non-FA tier (Qwen3.6-35B, 4001 / 8000 / 12001 rows, 26.10.1).
+                // So the fused build is ENABLED by default now; `INFR_AMDVLK_HD256_FLASH=0`
+                // (`--set kernels.vulkan.amdvlk_hd256_flash=false`) restores the coopmat
+                // `attn_qk`/`softmax`/`attn_pv` tier for a driver that still faults. The register-O
+                // build is a different pipeline and stays available for its 128-row contract.
                 let required_kv_rows = flash_kv_storage_rows(kv_len);
                 let k_storage_rows = if deq_k { scratch_rows } else { att_cap_rows };
                 let v_storage_rows = if deq_v { scratch_rows } else { att_cap_rows };

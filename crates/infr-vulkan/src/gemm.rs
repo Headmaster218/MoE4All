@@ -2256,6 +2256,8 @@ const ATTN_FLASH_WARP_BM32_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_warp_bm32.spv"));
 const ATTN_FLASH_WARP_HD256_BM16_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_warp_hd256_bm16.spv"));
+const ATTN_FLASH_WARP_HD256_BM16_NOUNROLL_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_warp_hd256_bm16_nounroll.spv"));
 // Lever 2 on the warp kernel: dequant-in-flash builds that keep the register-tiled warp path.
 const ATTN_FLASH_WARP_DEQ_Q4_0_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_warp_deq_q4_0.spv"));
@@ -2398,6 +2400,7 @@ static ATTN_FLASH_PARTIAL_DEQ_Q5_1_BM32_SPV: OnceLock<Vec<u32>> = OnceLock::new(
 static ATTN_FLASH_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_WARP_BM32_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_WARP_HD256_BM16_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_WARP_HD256_BM16_NOUNROLL_SPV_BYTES_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_WARP_DEQ_Q4_0_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_WARP_DEQ_Q4_0_BM32_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_WARP_DEQ_Q4_1_SPV: OnceLock<Vec<u32>> = OnceLock::new();
@@ -2724,6 +2727,13 @@ pub(crate) fn attn_flash_reg_hd256_br64_cw4_bda_spv() -> &'static [u32] {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_flash_warp_hd256_bm16_spv() -> &'static [u32] {
     ATTN_FLASH_WARP_HD256_BM16_SPV.get_or_init(|| spv_words(ATTN_FLASH_WARP_HD256_BM16_SPV_BYTES))
+}
+/// Same kernel built with `-DNO_UNROLL` — the build amdvlk's LLPC can compile (see the shader's
+/// `UNROLL` macro doc). Selected per driver by [`crate::recorder::Recorder`].
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn attn_flash_warp_hd256_bm16_nounroll_spv() -> &'static [u32] {
+    ATTN_FLASH_WARP_HD256_BM16_NOUNROLL_SPV_BYTES_WORDS
+        .get_or_init(|| spv_words(ATTN_FLASH_WARP_HD256_BM16_NOUNROLL_SPV_BYTES))
 }
 /// hd=256 split-K combine: 128 invocations write two output dimensions each.
 #[cfg_attr(infr_profile, infr_prof::instrument)]

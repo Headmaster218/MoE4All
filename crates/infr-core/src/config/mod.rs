@@ -607,11 +607,13 @@ cfg_struct! {
         /// `INFR_AMDVLK_HD256_FLASH` — feature switch, default OFF: on AMD's proprietary driver
         /// (amdvlk/LLPC), hd256 prefill takes the coopmat `nonfa` tier (`attn_qk`/`softmax`/
         /// `attn_pv`) for every geometry that is not a 128-row-aligned, tail-safe register-O
-        /// chunk. Turning it ON forces the fused `attn_flash_warp_hd256_bm16` build back on —
-        /// for older driver versions, or for re-verification once AMD fixes LLPC. Known: on
-        /// 26.9.2/26.10.1, enabling it crashes inside `vkCreateComputePipelines` at
-        /// `amdvlk64.dll+0x2b65705`.
-        amdvlk_hd256_flash: bool = false,
+        /// chunk. The fused `attn_flash_warp_hd256_bm16` build used to crash LLPC inside
+        /// `vkCreateComputePipelines` (`amdvlk64.dll+0x2b65705`) whenever its fully-unrolled IR was
+        /// compiled; `attn_flash_warp_hd256.comp` no longer forces `[[unroll]]`, so the same kernel
+        /// compiles and runs (verified on 26.10.1, +10-24% pp on Qwen3.6-35B). ON by default now;
+        /// `INFR_AMDVLK_HD256_FLASH=0` (or `--set …=false`) restores the old coopmat non-FA tier for
+        /// a driver that still faults.
+        amdvlk_hd256_flash: bool = true,
         /// `INFR_NO_NC_FA` (inverted).
         nc_fa: bool = true,
         /// `INFR_NO_QK_WARP` (inverted).
