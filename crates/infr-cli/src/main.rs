@@ -78,6 +78,15 @@ enum SubmissionCommand {
         #[arg(long, value_name = "DIR", default_value = "benchmark-database")]
         result_dir: PathBuf,
     },
+    /// Merge engine metadata and raw samples into a local manual benchmark JSON.
+    PrepareManualBenchmark {
+        #[arg(long, value_name = "PATH")]
+        input: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        raw_benchmark: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        output: PathBuf,
+    },
     /// Replace a benchmark submission with an updated JSON payload while preserving its identity.
     RepackBenchmark {
         #[arg(long, value_name = "PATH")]
@@ -1208,6 +1217,34 @@ fn validate_error_payload(value: &serde_json::Value) -> anyhow::Result<()> {
     submission_validation::validate("error", value)
 }
 
+fn enrich_manual_from_raw(
+    report: &mut serde_json::Value,
+    raw: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let rows = raw
+        .as_array()
+        .context("manual benchmark output is not an array")?;
+    anyhow::ensure!(rows.len() == 1, "manual benchmark output must contain one row");
+    let row = &rows[0];
+    if let Some(metadata) = row.get("benchmark_metadata") {
+        benchmark_hardware::enrich_manual(report, metadata);
+    }
+    let manual = report
+        .pointer_mut("/contexts/0/manual_result")
+        .context("manual benchmark result is missing")?;
+    manual["raw"] = row.clone();
+    Ok(())
+}
+
+fn read_prepared_manual_benchmark(input: &Path, raw_benchmark: &Path) -> anyhow::Result<serde_json::Value> {
+    let bytes = std::fs::read(input)
+        .with_context(|| format!("read benchmark JSON {}", input.display()))?;
+    let mut value = submission_validation::parse_json(&bytes).context("parse benchmark JSON")?;
+    let raw = submission_validation::parse_json(&std::fs::read(raw_benchmark)?)?;
+    enrich_manual_from_raw(&mut value, &raw)?;
+    Ok(value)
+}
+
 fn print_submission_summary(decoded: &submission::Decoded) {
     // print-ok: submission verification output consumed by users and launchers.
     println!("{}", submission::ARMOR_VERSION);
@@ -1232,16 +1269,13 @@ fn cmd_submission(action: SubmissionCommand) -> anyhow::Result<()> {
             raw_benchmark,
             result_dir,
         } => {
-            let bytes = std::fs::read(&input)
-                .with_context(|| format!("read benchmark JSON {}", input.display()))?;
-            let mut value =
-                submission_validation::parse_json(&bytes).context("parse benchmark JSON")?;
-            if let Some(raw_path) = raw_benchmark {
-                let raw = submission_validation::parse_json(&std::fs::read(raw_path)?)?;
-                if let Some(metadata) = raw.get(0).and_then(|row| row.get("benchmark_metadata")) {
-                    benchmark_hardware::enrich_manual(&mut value, metadata);
-                }
-            }
+            let value = if let Some(raw_path) = raw_benchmark {
+                read_prepared_manual_benchmark(&input, &raw_path)?
+            } else {
+                let bytes = std::fs::read(&input)
+                    .with_context(|| format!("read benchmark JSON {}", input.display()))?;
+                submission_validation::parse_json(&bytes).context("parse benchmark JSON")?
+            };
             validate_benchmark_payload(&value)?;
             let created = value
                 .get("created_at_utc")
@@ -1257,6 +1291,19 @@ fn cmd_submission(action: SubmissionCommand) -> anyhow::Result<()> {
             println!("Benchmark submission: {}", path.display());
             // print-ok: machine-readable export path for launchers.
             println!("MOE4ALL_SUBMISSION_PATH={}", path.display());
+            Ok(())
+        }
+        SubmissionCommand::PrepareManualBenchmark {
+            input,
+            raw_benchmark,
+            output,
+        } => {
+            let value = read_prepared_manual_benchmark(&input, &raw_benchmark)?;
+            let json = serde_json::to_string_pretty(&value)? + "\n";
+            std::fs::write(&output, json)
+                .with_context(|| format!("write manual benchmark JSON {}", output.display()))?;
+            // print-ok: requested local manual benchmark export location.
+            println!("Manual benchmark JSON: {}", output.display());
             Ok(())
         }
         SubmissionCommand::RepackBenchmark { source, input } => {
@@ -8506,6 +8553,36 @@ mod tests {
         let decoded = submission::decode(&encoded).unwrap();
         assert_eq!(decoded.payload, payload);
         validate_benchmark_payload(&decoded.payload).unwrap();
+    }
+
+    #[test]
+    fn manual_benchmark_preparation_keeps_metadata_profile_and_raw_samples() {
+        let mut report = serde_json::json!({
+            "engine_version": "fixture",
+            "engine_commit": null,
+            "hardware": {"os": "linux"},
+            "model": {"name": "fixture.gguf"},
+            "configuration": {"auto_profile": "aggressive"},
+            "contexts": [{"manual_result": {"kind": "mixed"}}]
+        });
+        let raw = serde_json::json!([{
+            "avg_ts": 123.4,
+            "reps_ts": [120.0, 126.8],
+            "benchmark_metadata": {
+                "engine_version": "infr 1.2.0",
+                "engine_commit": "abcdef1234",
+                "hardware": {"cpu": {"name": "Fixture CPU"}},
+                "model": {"name": "native.gguf", "quantization": "Q4_K"},
+                "configuration": {"auto_profile": "engine", "actual_ubatch": 512}
+            }
+        }]);
+        enrich_manual_from_raw(&mut report, &raw).unwrap();
+        assert_eq!(report["engine_commit"], "abcdef1234");
+        assert_eq!(report["hardware"]["cpu"]["name"], "Fixture CPU");
+        assert_eq!(report["model"]["quantization"], "Q4_K");
+        assert_eq!(report["configuration"]["actual_ubatch"], 512);
+        assert_eq!(report["configuration"]["auto_profile"], "aggressive");
+        assert_eq!(report["contexts"][0]["manual_result"]["raw"], raw[0]);
     }
 
     #[test]

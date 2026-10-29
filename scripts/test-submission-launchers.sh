@@ -26,6 +26,19 @@ if [ "$1" = submission ] && [ "$2" = pack-benchmark ]; then
     printf fixture > "$result_dir/v1/2026-10/manual-fixture.m4b"
     printf 'MOE4ALL_SUBMISSION_PATH=%s/v1/2026-10/manual-fixture.m4b\n' "$result_dir"
 fi
+if [ "$1" = submission ] && [ "$2" = prepare-manual-benchmark ]; then
+    shift 2
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --input) input=$2; shift 2 ;;
+            --raw-benchmark) raw_benchmark=$2; shift 2 ;;
+            --output) output=$2; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    [ -f "$input" ] && [ -f "$raw_benchmark" ] || exit 2
+    printf '%s\n' '{"engine_commit":"abcdef1234","hardware":{"cpu":{"name":"Fixture CPU"}},"configuration":{"benchmark_kind":"mixed","actual_ubatch":512},"contexts":[{"manual_result":{"raw":{"avg_ts":123.4}}}]}' > "$output"
+fi
 exit 0
 ENGINE
 chmod +x "$BINARY"
@@ -227,8 +240,10 @@ check test -z "$REPLY"
 local_result=$(find "$CONFIG_DIR/benchmark-results" -name '*.json' -type f | head -n 1)
 check test -f "$local_result"
 json_load "$local_result"
-json_get '["result","configuration","benchmark_kind"]'; check test "$REPLY" = mixed
-json_get '["raw",0,"avg_ts"]'; check test "$REPLY" = 123.4
+json_get '["configuration","benchmark_kind"]'; check test "$REPLY" = mixed
+json_get '["configuration","actual_ubatch"]'; check test "$REPLY" = 512
+json_get '["hardware","cpu","name"]'; check test "$REPLY" = 'Fixture CPU'
+json_get '["contexts",0,"manual_result","raw","avg_ts"]'; check test "$REPLY" = 123.4
 check grep -q 'not submitted as Decode' "$work/mixed-output"
 
 curl() {

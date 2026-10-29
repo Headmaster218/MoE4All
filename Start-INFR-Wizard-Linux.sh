@@ -1723,7 +1723,10 @@ EOF
     if [[ ${S[manual_bench_kind]} == mixed ]]; then
         mkdir -p -- "$CONFIG_DIR/benchmark-results"
         local local_path="$CONFIG_DIR/benchmark-results/$id.json"
-        printf '{"result":%s,"raw":%s}\n' "$(< "$payload")" "$(< "$raw_json")" > "$local_path"
+        if ! output=$("$BINARY" submission prepare-manual-benchmark --input "$payload" --raw-benchmark "$raw_json" --output "$local_path" 2>&1); then
+            printf '{"result":%s,"raw":%s}\n' "$(< "$payload")" "$(< "$raw_json")" > "$local_path"
+            printf '元数据合并失败，已保留原始结果 / Metadata merge failed; original result retained: %s\n' "$output" >&2
+        fi
         rm -f -- "$payload"
         printf '混合测试结果已本地保存 / Mixed benchmark result saved locally: %s\n' "$local_path"
         printf '当前上传协议尚不支持混合速度，本次不上传；它不会被误记为纯 Decode。Mixed-speed upload is not supported yet; this result is not submitted as Decode.\n'
