@@ -16491,10 +16491,15 @@ impl ResidentChunk {
                         Some((entry.op_idx, words[..entry.layout.count()].to_vec()));
                     break;
                 }
-                _ => {
-                    return Err(be(
-                        "invalid or skipped resident notice before the first miss",
-                    ));
+                status => {
+                    return Err(be(format!(
+                        "invalid or skipped resident notice before the first miss: status={status} reason={} ordinal={ordinal} submitted_entries={} notices_sent={} host_notice={} owned={}",
+                        words[crate::recorder::RESIDENT_JOURNAL_JOB_COUNT_WORD],
+                        self.submitted_entries,
+                        self.notices_sent,
+                        entry.host_notice,
+                        self.gpu_copy.as_ref().is_some_and(|copy| copy.is_owned()),
+                    )));
                 }
             }
         }
@@ -16568,10 +16573,14 @@ impl ResidentChunk {
                         Some((entry.op_idx, notice.words[..entry.layout.count()].to_vec()));
                     break;
                 }
-                _ => {
-                    return Err(be(
-                        "invalid or skipped producer notice before the first miss",
-                    ));
+                status => {
+                    return Err(be(format!(
+                        "invalid or skipped producer notice before the first miss: status={status} reason={} ordinal={ordinal} notices_sent={} host_notice={} owned={}",
+                        notice.words[crate::recorder::RESIDENT_JOURNAL_JOB_COUNT_WORD],
+                        self.notices_sent,
+                        entry.host_notice,
+                        self.gpu_copy.as_ref().is_some_and(|copy| copy.is_owned()),
+                    )));
                 }
             }
         }

@@ -171,6 +171,14 @@ void finish(uint base, uint status) {
     }
 }
 
+// Status 3 previously collapsed every validation failure into one host error. The request is
+// rejected before CPU/GPU payload service begins, so COUNT_WORD is otherwise unused and can
+// retain a stable diagnostic reason without changing the journal ABI or success paths.
+void reject(uint base, uint reason) {
+    journal[base + COUNT_WORD] = reason;
+    finish(base, 3u);
+}
+
 bool valid_header() {
     uint length = uint(nodes.length());
     if (length < 3u || nodes[0].x != 4u) return false;
@@ -824,7 +832,7 @@ void initialize() {
         run = 0u;
         stopped = p.ordinal;
         reached = p.ordinal == NONE ? NONE : p.ordinal + 1u;
-        if (journal_valid) journal[base + STATUS_WORD] = 3u;
+        if (journal_valid) reject(base, 1u);
         return;
     }
     bool dimensions_valid = p.used > 0u && p.used <= 16u && p.count > 0u
@@ -838,7 +846,7 @@ void initialize() {
     }
     request_count = p.count * 3u;
     if (!dimensions_valid || invalid != 0u || !valid_header()) {
-        finish(base, 3u);
+        reject(base, 2u);
         return;
     }
     work_valid = 1u;
@@ -1196,7 +1204,7 @@ bool try_all_hits(bool prefix_ready) {
         barrier();
         prepare_queues(true);
         if (work_invalid != 0u) {
-            if (lane == 0u) finish(p.ordinal * JOURNAL_WORDS, 3u);
+            if (lane == 0u) reject(p.ordinal * JOURNAL_WORDS, 3u);
             return true;
         }
         compact_queues();
@@ -1268,7 +1276,7 @@ void execute_owner(bool prefix_ready) {
         if (!collect_request(q)) atomicOr(work_invalid, 1u);
     barrier();
     if (work_invalid != 0u) {
-        if (gl_LocalInvocationIndex == 0u) finish(base, 3u);
+        if (gl_LocalInvocationIndex == 0u) reject(base, 4u);
         return;
     }
     // All subgroups consume the collect decision before classify can set the same flag.
@@ -1291,7 +1299,7 @@ void execute_owner(bool prefix_ready) {
     }
     barrier();
     if (work_invalid != 0u) {
-        if (gl_LocalInvocationIndex == 0u) finish(base, 3u);
+        if (gl_LocalInvocationIndex == 0u) reject(base, 5u);
         return;
     }
 
@@ -1299,7 +1307,7 @@ void execute_owner(bool prefix_ready) {
     if (!recovery) {
         if (work_missing != 0u) select_fifo_victims();
         if (work_invalid != 0u) {
-            if (gl_LocalInvocationIndex == 0u) finish(base, 3u);
+            if (gl_LocalInvocationIndex == 0u) reject(base, 6u);
             return;
         }
         // All lanes consume the selection decision before prepare_queues can report
@@ -1307,7 +1315,7 @@ void execute_owner(bool prefix_ready) {
         barrier();
         prepare_queues(false);
         if (work_invalid != 0u) {
-            if (gl_LocalInvocationIndex == 0u) finish(base, 3u);
+            if (gl_LocalInvocationIndex == 0u) reject(base, 7u);
             return;
         }
         compact_queues();
