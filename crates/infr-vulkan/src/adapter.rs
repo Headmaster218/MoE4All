@@ -18893,14 +18893,8 @@ fn execute_paged_moe<'a>(
         };
         let role_pipeline = if splitk_plan.is_none()
             && overlap
-            && crate::recorder::owned_role_pipeline::enabled_for_shape(
-                be_,
-                [gdt, udt],
-                ne,
-                nff,
-                rows,
-                n_used,
-            ) {
+            && crate::recorder::owned_role_pipeline::enabled(be_)
+        {
             route
                 .copy
                 .as_ref()

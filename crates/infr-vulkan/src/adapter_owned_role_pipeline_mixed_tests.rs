@@ -110,8 +110,8 @@ impl Drop for RecoveryCountScope {
 }
 
 #[test]
-#[ignore = "explicit MOE4ALL_TEST_DEVICE; one serialized auto Q5K mixed-source status5 host-ready success"]
-fn gpu_owned_role_pipeline_adapter_auto_mixed_status5_host_ready_success() {
+#[ignore = "explicit MOE4ALL_TEST_DEVICE; one serialized explicit Q5K mixed-source status5 host-ready success"]
+fn gpu_owned_role_pipeline_adapter_explicit_mixed_status5_host_ready_success() {
     let fixture =
         Fixture::with_profile_and_host_ready(2048, 512, 8, 1, [DType::Q5K; 3], true, true);
     let backend = &fixture.backend;
@@ -131,7 +131,7 @@ fn gpu_owned_role_pipeline_adapter_auto_mixed_status5_host_ready_success() {
             .decode_gpu_resident_upload_worker
     );
     assert!(!backend.cfg().spec.mtp);
-    // Real backend Plan and the default auto gate, with no pipeline::test_scope override.
+    // Real backend Plan and the explicit config toggle, with no pipeline::test_scope override.
     let plan = backend.compile(&fixture.graph).unwrap();
     fixture.preload();
     backend.execute(plan.as_ref(), &fixture.bindings()).unwrap();

@@ -74,9 +74,9 @@ fn ordinary_decode_pipeline_defaults_preserve_explicit_fallbacks() {
 }
 
 #[test]
-fn owned_role_pipeline_defaults_on_with_explicit_fallback() {
+fn owned_role_pipeline_defaults_off_with_explicit_opt_in() {
     assert!(
-        Config::default()
+        !Config::default()
             .kernels
             .vulkan
             .decode_gpu_resident_role_pipeline
