@@ -6,6 +6,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Streamed tool-call arguments instead of one final blob: `/v1/chat/completions` now emits `delta.tool_calls[].function.arguments` fragments as the model writes them and sends only the remainder in the finished call, and `/v1/responses` forwards the same fragments as `response.function_call_arguments.delta` events.
+- Made `include:["reasoning.encrypted_content"]` return a store-backed `encrypted_content` handle that a later request's `reasoning` input item resolves back into the prompt; the request is rejected with a named `include` parameter when `store=true` is not in force.
+- Added `serve.response_store_path` (`INFR_RESPONSE_STORE_PATH`) to mirror the `/v1/responses` store to a JSON file, so `previous_response_id` and `conversation` chains survive a restart. Unset stays memory-only and nothing a client said touches a disk; a configured file is loaded at startup and rewritten atomically after every change, and a file that cannot be parsed refuses to start instead of silently presenting an empty store.
+
+### Changed
+
+- Routed narrow-output (n not a multiple of 64, so no tiled GEMM tile exists) Prefill Linears through a one-shot f32 expansion plus the batched f32r GEMV instead of the native per-row GEMV, which re-read the weight once per row. Qwen3.8-Flash-Next base at m=4096: `2560x48` 1.5 ms → 195 µs and `10240x4` 969 µs → 275 µs per dispatch, i.e. 202 ms → 42 ms of the pp4096 device time including the 11 µs casts; the Q8_0/BF16 expansion is exact (fits f32), and only weights up to 128 Ki elements are covered.
+- Extended the BM128 (128x128 single-buffer) Prefill warptile from five hard-coded Q8_0 shapes to every native-dense format, still only on measured Windows RX 7900 XTX devices. The gate is now `m >= 1024` with whole 128-row tiles and wide k/n (`dense_bm128_applies`); short-K / narrow-N shapes and the m=512 Flash tuples that lost in isolated BAAB keep the BM64 tile. Qwen3.8-Flash-Next base pp30000 1720.3 → 1740.5 t/s and pp4096 +2.0% on/off with the same binary; m=1 decode cannot reach the tile.
+- Raised the automatic prefill chunk (`ubatch`) on discrete GPUs from 4096 to 5120 rows. Ubatch is the FIRST call on the unified VRAM arena — its runtime reserve comes off the top and the expert cache is the remainder — so the default now follows the measured knee: `kernel-bench --sweep-m` puts the per-shape TF knee at m≈4096, and Qwen3.8-Flash-Next pp30000 with the paged KV tree measured 1110.9 / 1591.3 / 1712.2 / 1728.4 t/s at ub 2048 / 4096 / 5120 / 6144. 5120 is the tallest rung that still holds all four prefill lanes; a GPU too small for its reserve walks the existing fallback ladder down instead of failing.
+- Accepted `instructions` or a system/developer message on a chained Responses request when it is byte-identical to the system prefix already stored for that chain, instead of rejecting every resend.
+- Honoured `parallel_tool_calls=false` on `/v1/responses` by returning at most one call per turn and naming the withheld calls in `warnings`.
+- Raised the non-streaming `/v1/responses` translation ceiling from 16 MiB to 64 MiB and made an oversized upstream reply a named 502 instead of a bare failure.
+
+### Fixed
+
+- Accepted OpenAI's `reasoning.effort: "none"` on `/v1/responses` and `reasoning_effort: "none"` on `/v1/chat/completions`: it now turns thinking off for that request instead of failing with a 400 `unsupported reasoning effort` (DeepSeek Harness sends exactly this as soon as its thinking toggle is off). For Qwen3.8 models — whose template validates the level itself and accepts only low/medium/xhigh — `high` and `max` now snap to `xhigh` instead of failing the render with "Unexpected reasoning effort high", `minimal` keeps mapping to `low`, and a truly unknown level still 400s, now listing the accepted values.
+- Sent the bf16 MoE router (`ffn_gate_inp`) and bf16 hyper-connection projections at prefill rows through the tiled cooperative-matrix GEMM instead of the per-row streamed GEMV / the 64x64 fallback: Bf16 was missing from the A_GLOBAL warptile tables, so 10240x320 projections ran at 2.6 ms per dispatch where the narrow-n tile takes 0.85 ms, and a 2560x512 router took 15.5 ms per layer. Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S pp30000 1215.2 → 1663.0 t/s (+36.8%); models whose router ships as F32 and whose HC tensors are not bf16 take the unchanged path.
+- Made a FORCED `tool_choice` (`"required"` or a named function) stream its call progressively like an automatic one: the grammar-constrained body now goes through the same splitter, so the function name and each completed argument member arrive while the call is still generating instead of as one frame at the end. A constrained call that cannot be completed after its name has already been streamed (for example `max_tokens` was reached) now fails loudly instead of silently retrying unconstrained and appending a second call's arguments to the first.
+
 ## [1.0.2] - 2026-10-15
 
 ### Added

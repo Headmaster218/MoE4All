@@ -98,11 +98,9 @@ fn verify(f: &Fixture, expected: &[f32], selected: &[Vec<u32>], mapped_miss: boo
         .filter(|(_, b)| b.len_bytes() > GUARD_WORDS * 4)
     {
         let values = f.read(buffer.as_ref(), buffer.len_bytes() / 4);
-        assert!(
-            values[values.len() - GUARD_WORDS..]
-                .iter()
-                .all(|&v| v == GUARD)
-        );
+        assert!(values[values.len() - GUARD_WORDS..]
+            .iter()
+            .all(|&v| v == GUARD));
     }
     if mapped_miss {
         let (journal, copy) = {

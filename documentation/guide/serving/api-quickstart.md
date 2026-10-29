@@ -63,7 +63,7 @@ Invoke-RestMethod -Method Post -Uri "$base/v1/responses" -Headers $headers -Cont
 Invoke-RestMethod -Uri "$base/v1/responses/$($first.id)/input_items" -Headers $headers
 ```
 
-这份状态是进程内、LRU 有界、重启即失的：被淘汰或随重启消失的 id，之后引用它会得到明确的 400，而不是悄悄从空上下文继续。`conversation` 配 `store=false` 同样被拒绝，因为未存储的轮次无法推进游标。`.../cancel` 总是返回 400——本服务器同步生成，响应在被赋予 id 时已经完成，要停止就断开这条流。当前仍不支持远程图片 URL、`file_id`、`input_file`、自动截断和 hosted tools；不要把它当作完整的云端 Responses API。
+这份状态默认只活在进程内、LRU 有界、重启即失：被淘汰或随重启消失的 id，之后引用它会得到明确的 400，而不是悄悄从空上下文继续。要让链跨重启，再加 `--set serve.response_store_path=…`（或 `INFR_RESPONSE_STORE_PATH`）：它把同一份状态镜像成一个**明文** JSON 文件，每次改动后原子重写，启动时加载；文件无法解析会拒绝启动，而不会空库启动。`conversation` 配 `store=false` 同样被拒绝，因为未存储的轮次无法推进游标。`.../cancel` 总是返回 400——本服务器同步生成，响应在被赋予 id 时已经完成，要停止就断开这条流。请求里带 `include:["reasoning.encrypted_content"]` 时，reasoning 条目会多出一个 `encrypted_content` 句柄（`rehs_…`）：它是服务端存储的引用而不是密文，同样随 LRU、以及未配置路径时的重启而失效，把该句柄放进下一轮 `input` 的 `{"type":"reasoning","encrypted_content":"…"}` 即可重放这段推理内容；句柄无法解析时是明确的 400。这条路径要求 `store=true`（默认值随 `serve.response_store_entries` 开关而定）。当前仍不支持远程图片 URL、`file_id`、`input_file`、自动截断和 hosted tools；不要把它当作完整的云端 Responses API。
 
 ## 图片与嵌入
 

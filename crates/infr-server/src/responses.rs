@@ -4,14 +4,18 @@
 //! LRU of response histories so `previous_response_id`/`conversation` chains replay server-side.
 //! A chained request rebuilds the previous turn's exact token prefix, which the paged KV radix
 //! tree hits via `best_match` — the integration point is the rebuilt history, not any KV handle.
+//! `include:["reasoning.encrypted_content"]` rides the same store: the handle a reasoning item
+//! carries is a reference into it (see [`reasoning_handle`]), never a copy of the text.
 
 use super::*;
 use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::{Path, Query};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use futures_util::{stream, Stream, StreamExt};
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct ResponsesRequest {
@@ -75,6 +79,12 @@ struct Meta {
     user: Option<String>,
     previous_response_id: Option<String>,
     store: bool,
+    /// `include:["reasoning.encrypted_content"]` asked for a replayable reasoning handle, and this
+    /// turn is stored so the handle resolves. See [`ResponseStore::resolve_item`].
+    encrypted_reasoning: bool,
+    /// The same include was requested on a STATELESS turn: no handle is issued (the item carries
+    /// its summary only) and the response says so in `warnings`.
+    handle_withheld: bool,
 }
 
 /// A converted request: the chat payload to dispatch, the wire metadata for the response
@@ -95,6 +105,9 @@ struct Prepared {
 /// envelope the client received, plus `conversation` name -> latest response id cursors.
 /// KV reuse is implicit (chained requests rebuild the same token prefix and the paged radix
 /// tree's `best_match` hits it), so this store never pins or references KV pages.
+///
+/// `serve.response_store_path` mirrors the whole store to one JSON file, loaded by [`open`] and
+/// rewritten after every mutation; without it the store lives and dies with the process.
 pub(super) struct ResponseStore {
     capacity: usize,
     entries: HashMap<String, StoredResponse>,
@@ -105,6 +118,9 @@ pub(super) struct ResponseStore {
     items: HashMap<String, String>,
     /// Monotonic tick for LRU recency; no wall clock needed.
     clock: u64,
+    /// Mirror of the store on disk (`serve.response_store_path`), rewritten after every mutation.
+    /// `None` — the default — keeps everything in memory, so nothing a client said touches a disk.
+    path: Option<PathBuf>,
 }
 
 struct StoredResponse {
@@ -119,15 +135,161 @@ struct StoredResponse {
     last_used: u64,
 }
 
+/// The on-disk shape of the store. `version` is checked on load so a future format change is a
+/// named startup error instead of a silent mis-parse of history nobody can reconstruct.
+#[derive(Deserialize)]
+struct StoreFile {
+    version: u32,
+    clock: u64,
+    conversations: HashMap<String, String>,
+    entries: Vec<StoreFileEntry>,
+}
+
+const STORE_FILE_VERSION: u32 = 1;
+
+#[derive(Deserialize)]
+struct StoreFileEntry {
+    id: String,
+    last_used: u64,
+    history: Vec<ChatMessageDto>,
+    response: Value,
+    input_items: Vec<Value>,
+}
+
+/// The write side borrows straight out of the live store — persisting must not clone every stored
+/// history just to hand it to the serializer.
+#[derive(Serialize)]
+struct StoreFileRef<'a> {
+    version: u32,
+    clock: u64,
+    conversations: &'a HashMap<String, String>,
+    entries: Vec<StoreFileEntryRef<'a>>,
+}
+
+#[derive(Serialize)]
+struct StoreFileEntryRef<'a> {
+    id: &'a str,
+    last_used: u64,
+    history: &'a [ChatMessageDto],
+    response: &'a Value,
+    input_items: &'a [Value],
+}
+
 impl ResponseStore {
-    pub(super) fn new(capacity: u32) -> Self {
-        Self {
+    /// Open the store, loading `path` when the operator asked for restart survival. A missing file
+    /// is a fresh start; an unreadable or unparsable one is an ERROR — starting empty would turn
+    /// every stored id into a "lost on restart" 400 while the data still sits on disk.
+    pub(super) fn open(capacity: u32, path: Option<&std::path::Path>) -> Result<Self, String> {
+        let mut store = Self {
             capacity: capacity as usize,
             entries: HashMap::new(),
             conversations: HashMap::new(),
             items: HashMap::new(),
             clock: 0,
+            // `response_store_entries = 0` IS the stateless contract, so a path alongside it would
+            // have nothing to mirror; see `ServeCfg::response_store_path`.
+            path: path
+                .filter(|_| capacity > 0)
+                .map(std::path::Path::to_path_buf),
+        };
+        let Some(path) = store.path.clone() else {
+            return Ok(store);
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(store),
+            Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+        };
+        let file: StoreFile = serde_json::from_slice(&bytes).map_err(|error| {
+            format!(
+                "{} is not a response store ({error}); move it aside to start empty",
+                path.display()
+            )
+        })?;
+        if file.version != STORE_FILE_VERSION {
+            return Err(format!(
+                "{} holds store version {}, this build reads {STORE_FILE_VERSION}",
+                path.display(),
+                file.version
+            ));
         }
+        store.clock = file.clock;
+        store.conversations = file.conversations;
+        let mut entries = file.entries;
+        // Oldest first, so the capacity trim below keeps exactly the turns a running store would have.
+        entries.sort_by_key(|entry| entry.last_used);
+        for entry in entries {
+            for item in item_ids(&entry.response["output"]) {
+                store.items.insert(item, entry.id.clone());
+            }
+            store.entries.insert(
+                entry.id,
+                StoredResponse {
+                    history: Arc::new(entry.history),
+                    response: entry.response,
+                    input_items: entry.input_items,
+                    last_used: entry.last_used,
+                },
+            );
+        }
+        while store.entries.len() > store.capacity {
+            let Some(victim) = store.oldest() else {
+                break;
+            };
+            store.forget(&victim);
+        }
+        Ok(store)
+    }
+
+    /// Mirror the store to disk after a mutation. A failed write is logged, never propagated: the
+    /// generation already succeeded, and turning a full disk into a failed request would lose the
+    /// answer as well as the mirror.
+    fn save(&self) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        if let Err(error) = self.write(path) {
+            tracing::warn!(path = %path.display(), %error, "could not persist the response store");
+        }
+    }
+
+    fn write(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let mut entries: Vec<StoreFileEntryRef<'_>> = self
+            .entries
+            .iter()
+            .map(|(id, entry)| StoreFileEntryRef {
+                id,
+                last_used: entry.last_used,
+                history: &entry.history,
+                response: &entry.response,
+                input_items: &entry.input_items,
+            })
+            .collect();
+        entries.sort_by_key(|entry| entry.last_used);
+        let file = StoreFileRef {
+            version: STORE_FILE_VERSION,
+            clock: self.clock,
+            conversations: &self.conversations,
+            entries,
+        };
+        let bytes = serde_json::to_vec(&file).map_err(std::io::Error::other)?;
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Write-then-rename: a crash mid-write leaves the previous store intact, never half of one.
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, path)
+    }
+
+    /// The least-recently-used entry id, or `None` when the store is empty.
+    fn oldest(&self) -> Option<String> {
+        self.entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(id, _)| id.clone())
     }
 
     /// Resolve the replay base for a chained request. `previous_response_id` wins over the
@@ -143,7 +305,10 @@ impl ResponseStore {
             let entry = self.entries.get_mut(id).ok_or_else(|| {
                 invalid(
                     "previous_response_id",
-                    format!("no stored response {id:?} (state is LRU-bounded and lost on restart)"),
+                    format!(
+                        "no stored response {id:?} (state is LRU-bounded; without \
+                         serve.response_store_path a restart loses it)"
+                    ),
                 )
             })?;
             entry.last_used = self.clock;
@@ -195,16 +360,12 @@ impl ResponseStore {
         // a cursor left pointing at an evicted id makes the next chained request fail
         // explicitly (see `chain`) rather than silently lose the conversation's history.
         while self.entries.len() > self.capacity {
-            let Some(victim) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(id, _)| id.clone())
-            else {
+            let Some(victim) = self.oldest() else {
                 break;
             };
             self.forget(&victim);
         }
+        self.save();
     }
 
     /// Drop one response and everything only it could resolve: item references and, transitively,
@@ -224,7 +385,9 @@ impl ResponseStore {
     }
 
     fn remove(&mut self, id: &str) -> Option<Value> {
-        self.forget(id).map(|entry| entry.response)
+        let entry = self.forget(id)?;
+        self.save();
+        Some(entry.response)
     }
 
     /// Stored responses newest-first (`desc`) or oldest-first (`asc`), as OpenAI's list does.
@@ -580,6 +743,73 @@ fn instruction_text(content: &Option<Value>) -> Result<String, ParamError> {
     }
 }
 
+/// Fold the instruction surface — `instructions` plus any leading `system`/`developer` messages —
+/// into the single system text a GGUF template accepts, draining those messages from `messages`
+/// because they are not conversation turns. Returns `None` when the request carries no instruction
+/// at all.
+///
+/// A `system`/`developer` item that arrives AFTER a conversation turn is rejected rather than moved
+/// into the prefix: the templates cannot express an instruction that starts mid-conversation, and
+/// relocating it silently rewrites the prompt the client wrote.
+///
+/// Both the fresh and the chained path call this, so a re-sent instruction is compared against the
+/// stored prefix in exactly the shape the first turn put it there.
+fn fold_instructions(
+    instructions: Option<&str>,
+    messages: &mut Vec<ChatMessageDto>,
+) -> Result<Option<String>, ParamError> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(text) = instructions.filter(|text| !text.is_empty()) {
+        parts.push(text.to_owned());
+    }
+    let prefix_len = messages
+        .iter()
+        .take_while(|m| matches!(m.role.as_str(), "system" | "developer"))
+        .count();
+    for m in &messages[..prefix_len] {
+        parts.push(instruction_text(&m.content)?);
+    }
+    if messages[prefix_len..]
+        .iter()
+        .any(|m| matches!(m.role.as_str(), "system" | "developer"))
+    {
+        return Err(invalid(
+            "input",
+            "system and developer messages must precede conversation turns",
+        ));
+    }
+    messages.drain(..prefix_len);
+    Ok(if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    })
+}
+
+/// The system text a stored chain already replays — the prefix the first turn of the chain folded
+/// into a single `system` DTO — or `None` when the chain has no system turn.
+fn stored_system_prefix(base: &[ChatMessageDto]) -> Option<String> {
+    let content = base
+        .first()
+        .filter(|message| message.role == "system")?
+        .content
+        .clone()?;
+    instruction_text(&Some(content))
+        .ok()
+        .filter(|text| !text.is_empty())
+}
+
+/// Is `resent` covered by what the chain already replays? Many SDKs re-send the same `instructions`
+/// (or the same system message) on every turn, so an exact duplicate — or a leading part of the
+/// stored prefix, the shape a client takes when the first turn also carried a system *input* message
+/// it now keeps to itself — means the tokenized prompt is unchanged. Anything else would edit the
+/// prefix mid-conversation, which is what the chain exists to avoid.
+fn prefix_already_stored(stored: &str, resent: &str) -> bool {
+    stored
+        .strip_prefix(resent)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with("\n\n"))
+}
+
 fn convert_tools(value: Option<&Value>) -> Result<Option<Value>, ParamError> {
     let Some(value) = value else { return Ok(None) };
     let tools = value
@@ -667,12 +897,6 @@ impl ResponsesRequest {
                 "only truncation=disabled is supported",
             ));
         }
-        if self.parallel_tool_calls == Some(false) {
-            return Err(invalid(
-                "parallel_tool_calls",
-                "parallel_tool_calls=false is not supported",
-            ));
-        }
         if self
             .user
             .as_ref()
@@ -680,16 +904,32 @@ impl ResponsesRequest {
         {
             return Err(invalid("user", "user must be at most 64 characters"));
         }
-        if self.include.as_ref().is_some_and(|include| {
+        let wants_handle = self.include.as_ref().is_some_and(|include| {
             include
                 .iter()
-                .any(|item| item != "reasoning.encrypted_content")
+                .any(|item| item == "reasoning.encrypted_content")
+        });
+        if let Some(other) = self.include.as_ref().and_then(|include| {
+            include
+                .iter()
+                .find(|item| item.as_str() != "reasoning.encrypted_content")
         }) {
             return Err(invalid(
                 "include",
-                "only reasoning.encrypted_content is accepted as a compatibility hint; this server cannot supply hosted-tool data, logprobs, or encrypted reasoning",
+                format!(
+                    "{other:?} cannot be served: this server has no hosted-tool data, no logprobs \
+                     and no hosted reasoning to encrypt — reasoning.encrypted_content is the only \
+                     accepted entry"
+                ),
             ));
         }
+        // A STATELESS turn cannot issue a store-backed handle. That is not a client error: OpenAI's
+        // own servers omit `encrypted_content` when there is nothing to encrypt (Azure does), replay
+        // only needs the reasoning item's readable `summary`, and pi-ai's Responses adapter asks for
+        // the include on EVERY reasoning request — so 400ing here locks that client out of every
+        // thinking level. Degrade to summary-only items and say so in `warnings`.
+        let encrypted_reasoning = wants_handle && store;
+        let handle_withheld = wants_handle && !store;
         if self
             .service_tier
             .as_deref()
@@ -711,29 +951,51 @@ impl ResponsesRequest {
             Some(v @ Value::Object(_)) => v,
             _ => return Err(invalid("metadata", "metadata must be an object")),
         };
-        let text = match self.text {
-            None | Some(Value::Null) => json!({"format":{"type":"text"},"verbosity":"medium"}),
-            Some(v @ Value::Object(_))
-                if v.get("format")
-                    .is_none_or(|f| f.is_null() || f["type"] == "text")
-                    && v.get("verbosity")
-                        .is_none_or(|x| x.is_null() || x == "medium")
-                    && v.as_object()
-                        .is_some_and(|o| o.keys().all(|k| k == "format" || k == "verbosity"))
-                    && v.get("format").is_none_or(|f| {
-                        f.is_null() || f.as_object().is_some_and(|o| o.keys().all(|k| k == "type"))
-                    }) =>
-            {
-                json!({"format":{"type":"text"},"verbosity":v.get("verbosity").and_then(Value::as_str).unwrap_or("medium")})
+        // `text.format` mirrors OpenAI's Responses shape: the json_schema fields sit at the TOP
+        // level here (chat nests them under `json_schema`). Both API surfaces normalise into the
+        // SAME `ResponseFormat` — see `response_format.rs` for the JSON Schema subset gate.
+        let (text, response_format) = match self.text {
+            None | Some(Value::Null) => (
+                json!({"format":{"type":"text"},"verbosity":"medium"}),
+                None,
+            ),
+            Some(Value::Object(object)) => {
+                if let Some(key) = object
+                    .keys()
+                    .find(|key| key.as_str() != "format" && key.as_str() != "verbosity")
+                {
+                    return Err(invalid(
+                        "text",
+                        format!("text.{key} is not supported (allowed: format, verbosity)"),
+                    ));
+                }
+                if object
+                    .get("verbosity")
+                    .is_some_and(|verbosity| !verbosity.is_null() && *verbosity != "medium")
+                {
+                    return Err(invalid(
+                        "text.verbosity",
+                        "only verbosity=medium is supported",
+                    ));
+                }
+                let format = object
+                    .get("format")
+                    .filter(|format| !format.is_null())
+                    .cloned()
+                    .unwrap_or_else(|| json!({"type":"text"}));
+                let parsed = super::response_format::parse_text_format(Some(&format), "text.format")?;
+                let text = json!({"format":format,"verbosity":"medium"});
+                (text, chat_wire_format(&parsed))
             }
             _ => {
                 return Err(invalid(
                     "text",
-                    "only plain text with default verbosity is supported",
+                    "text must be an object with format/verbosity",
                 ))
             }
         };
         let mut reasoning_effort = None;
+        let mut reasoning_off = false;
         let reasoning = match self.reasoning {
             None | Some(Value::Null) => json!({"effort":null,"summary":null}),
             Some(v @ Value::Object(_)) => {
@@ -746,11 +1008,13 @@ impl ResponsesRequest {
                         effort.clone()
                     }
                 });
-                if let Some(effort) = effective_effort.as_ref().filter(|x| !x.is_null()) {
-                    reasoning_effort =
-                        Some(serde_json::from_value(effort.clone()).map_err(|_| {
-                            invalid("reasoning.effort", "unsupported reasoning effort")
-                        })?);
+                if let Some(effort) = v.get("effort").filter(|x| !x.is_null()) {
+                    // `none` = no reasoning: the templates have levels only, so it lands on the
+                    // thinking switch (`chat_template_kwargs.enable_thinking`) below.
+                    let (level, off) =
+                        crate::parse_reasoning_effort(effort, "reasoning.effort")?;
+                    reasoning_effort = level;
+                    reasoning_off = off;
                 }
                 if v.get("summary")
                     .is_some_and(|s| !s.is_null() && s != "auto")
@@ -780,26 +1044,39 @@ impl ResponsesRequest {
         if messages.is_empty() {
             return Err(invalid("input", "input must contain at least one item"));
         }
+        let resent = fold_instructions(self.instructions.as_deref(), &mut messages)?;
         let messages = match base {
             Some(base) => {
-                // Chained replay: the stored history already carries the system prefix and
-                // the prior turns. Re-sending instructions or a system/developer message
-                // would change the tokenized prompt prefix and defeat the paged-KV radix
-                // hit the chain exists to get — reject instead of silently diverging.
-                if self.instructions.as_ref().is_some_and(|s| !s.is_empty()) {
-                    return Err(invalid(
-                        "instructions",
-                        "instructions cannot be re-sent on a chained request; keep them on the first turn",
-                    ));
-                }
-                if messages
-                    .iter()
-                    .any(|m| matches!(m.role.as_str(), "system" | "developer"))
-                {
-                    return Err(invalid(
-                        "input",
-                        "system and developer messages cannot be re-sent on a chained request",
-                    ));
+                // Chained replay: the stored history already carries the system prefix and the
+                // prior turns. Re-sending instructions or a system/developer message would change
+                // the tokenized prompt prefix and defeat the paged-KV radix hit the chain exists to
+                // get — so accept it only when the stored prefix already says exactly that, and
+                // reject a real edit instead of silently diverging from either turn.
+                if let Some(resent) = resent.as_deref() {
+                    let stored = stored_system_prefix(&base);
+                    let duplicate = stored
+                        .as_deref()
+                        .is_some_and(|stored| prefix_already_stored(stored, resent));
+                    if !duplicate {
+                        let param = if self.instructions.is_some() {
+                            "instructions"
+                        } else {
+                            "input"
+                        };
+                        return Err(invalid(
+                            param,
+                            if stored.is_none() {
+                                "this chain has no system prefix: send instructions on the first \
+                                 turn of the chain, not on a chained request"
+                                    .to_string()
+                            } else {
+                                "instructions do not match the system prefix already stored for \
+                                 this chain; keep them byte-identical to the first turn or start a \
+                                 new chain"
+                                    .to_string()
+                            },
+                        ));
+                    }
                 }
                 let mut chained = (*base).clone();
                 chained.extend(messages);
@@ -809,29 +1086,8 @@ impl ResponsesRequest {
                 // Many GGUF templates accept only one initial system message. Preserve the
                 // instruction prefix order, but do not silently move later instructions
                 // across conversation turns.
-                let mut system_parts = Vec::new();
-                if let Some(instructions) = self.instructions.as_ref().filter(|s| !s.is_empty()) {
-                    system_parts.push(instructions.clone());
-                }
-                let prefix_len = messages
-                    .iter()
-                    .take_while(|m| matches!(m.role.as_str(), "system" | "developer"))
-                    .count();
-                for m in &messages[..prefix_len] {
-                    system_parts.push(instruction_text(&m.content)?);
-                }
-                if messages[prefix_len..]
-                    .iter()
-                    .any(|m| matches!(m.role.as_str(), "system" | "developer"))
-                {
-                    return Err(invalid(
-                        "input",
-                        "system and developer messages must precede conversation turns",
-                    ));
-                }
-                messages.drain(..prefix_len);
-                if !system_parts.is_empty() {
-                    messages.insert(0, message("system", Some(json!(system_parts.join("\n\n")))));
+                if let Some(text) = resent {
+                    messages.insert(0, message("system", Some(json!(text))));
                 }
                 messages
             }
@@ -851,8 +1107,14 @@ impl ResponsesRequest {
             model: self.model,
             messages,
             stream: self.stream,
-            reasoning_effort,
-            chat_template_kwargs: None,
+            // The chat DTO keeps the wire value verbatim; `parse_reasoning_effort` reads it back.
+            reasoning_effort: reasoning_effort.map(|level| json!(level)),
+            // `reasoning.effort == "none"`: no reasoning — carry it as the thinking switch, which is
+            // the engine's equivalent of OpenAI's `none` level.
+            chat_template_kwargs: reasoning_off.then(|| ChatTemplateOptions {
+                enable_thinking: Some(false),
+                ..Default::default()
+            }),
             tools: convert_tools(Some(&Value::Array(tools.clone())))?,
             tool_choice: convert_tool_choice(Some(&tool_choice))?,
             max_tokens: None,
@@ -865,6 +1127,7 @@ impl ResponsesRequest {
             presence_penalty: None,
             frequency_penalty: None,
             repeat_penalty: None,
+            response_format,
         };
         let meta = Meta {
             instructions: self.instructions,
@@ -882,6 +1145,8 @@ impl ResponsesRequest {
             user: self.user,
             previous_response_id: previous,
             store,
+            encrypted_reasoning,
+            handle_withheld,
         };
         Ok(Prepared {
             chat,
@@ -894,9 +1159,32 @@ impl ResponsesRequest {
     }
 }
 
-/// Replace `{"type":"item_reference","id":...}` input items with the stored items they name, so
-/// `input_messages` converts the real item. Resolution happens before conversion because a
-/// reference carries no content of its own: the client is pointing at history, not sending it.
+/// Re-encode the normalised Responses format in the CHAT wire shape. The dispatch path
+/// (`GenParams::from_request`) runs exactly one parser — `response_format` — so the flat Responses
+/// `text.format` object must not reach it as-is.
+fn chat_wire_format(format: &ResponseFormat) -> Option<Value> {
+    match format {
+        ResponseFormat::Text => None,
+        ResponseFormat::JsonObject => Some(json!({"type":"json_object"})),
+        ResponseFormat::JsonSchema {
+            name,
+            schema,
+            strict,
+        } => Some(json!({
+            "type":"json_schema",
+            "json_schema":{
+                "name":name.clone().unwrap_or_else(|| "response".to_string()),
+                "schema":schema,
+                "strict":strict
+            }
+        })),
+    }
+}
+
+/// Replace input items that carry no content of their own — `{"type":"item_reference","id":...}`
+/// and a `reasoning` item sent back with only its `encrypted_content` handle — with the stored items
+/// they name, so `input_messages` converts the real item. A reasoning item that already has a
+/// readable `summary` is left alone: it replays without the store, as it always has.
 fn resolve_references(
     store: &Arc<Mutex<ResponseStore>>,
     enabled: bool,
@@ -906,29 +1194,64 @@ fn resolve_references(
         return Ok(());
     };
     for item in items.iter_mut() {
-        if item["type"] != "item_reference" {
-            continue;
-        }
-        if !enabled {
-            return Err(invalid(
-                "input",
-                "item_reference needs server-side response state; enable serve.response_store_entries",
-            ));
-        }
-        let id = item
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid("input", "item_reference requires a string id"))?;
+        let lookup = match item["type"].as_str() {
+            Some("item_reference") => {
+                if !enabled {
+                    return Err(invalid(
+                        "input",
+                        "item_reference needs server-side response state; enable serve.response_store_entries",
+                    ));
+                }
+                item.get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid("input", "item_reference requires a string id"))?
+                    .to_owned()
+            }
+            Some("reasoning") if has_readable_summary(item) => continue,
+            Some("reasoning") => {
+                let handle = item
+                    .get("encrypted_content")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid("input", "reasoning item requires readable summary"))?;
+                if !enabled {
+                    return Err(invalid(
+                        "input",
+                        "a reasoning handle needs server-side response state; enable serve.response_store_entries",
+                    ));
+                }
+                reasoning_item_id(handle).ok_or_else(|| {
+                    invalid(
+                        "input",
+                        format!("{handle:?} is not a reasoning handle this server issued"),
+                    )
+                })?
+            }
+            _ => continue,
+        };
         let mut guard = store.lock().unwrap();
-        let resolved = guard.resolve_item(id).ok_or_else(|| {
+        let resolved = guard.resolve_item(&lookup).ok_or_else(|| {
             invalid(
                 "input",
-                format!("no stored item {id:?} (state is LRU-bounded and lost on restart)"),
+                format!(
+                    "no stored item {lookup:?} (state is LRU-bounded; without \
+                     serve.response_store_path a restart loses it)"
+                ),
             )
         })?;
         *item = resolved;
     }
     Ok(())
+}
+
+/// A reasoning item that can be replayed from its `summary` alone — the pre-handle wire shape.
+fn has_readable_summary(item: &Value) -> bool {
+    item.get("summary")
+        .and_then(Value::as_array)
+        .is_some_and(|summaries| {
+            summaries
+                .iter()
+                .any(|summary| summary["type"] == "summary_text")
+        })
 }
 
 pub(super) async fn handler(
@@ -958,7 +1281,8 @@ pub(super) async fn handler(
     if !enabled {
         // Name the field the client actually sent: an SDK shows `error.param`, and blaming
         // `previous_response_id` for a `conversation` or `store` request sends the reader to the
-        // wrong line of their own code.
+        // wrong line of their own code. `include:["reasoning.encrypted_content"]` is NOT such a
+        // request — it degrades to summary-only reasoning items (`handle_withheld`) instead.
         let (param, asked) = (
             if previous.is_some() {
                 "previous_response_id"
@@ -1095,13 +1419,21 @@ fn response_base(id: &str, created: i64, model: &str, meta: &Meta) -> Value {
     })
 }
 
-fn output_items(id: &str, reasoning: &str, content: &str, calls: &[Value]) -> Vec<Value> {
+fn output_items(
+    id: &str,
+    reasoning: &str,
+    content: &str,
+    calls: &[Value],
+    encrypted: bool,
+) -> Vec<Value> {
     let mut items = Vec::new();
     if !reasoning.is_empty() {
-        items.push(
-            json!({"id":format!("rs_{id}"),"type":"reasoning","status":"completed",
-            "summary":[{"type":"summary_text","text":reasoning}]}),
-        );
+        let mut item = json!({"id":format!("rs_{id}"),"type":"reasoning","status":"completed",
+            "summary":[{"type":"summary_text","text":reasoning}]});
+        if encrypted {
+            item["encrypted_content"] = json!(reasoning_handle(id));
+        }
+        items.push(item);
     }
     if !content.is_empty() || calls.is_empty() {
         items.push(
@@ -1114,6 +1446,81 @@ fn output_items(id: &str, reasoning: &str, content: &str, calls: &[Value]) -> Ve
             "call_id":call["id"],"name":call["function"]["name"],"arguments":call["function"]["arguments"]}));
     }
     items
+}
+
+/// The `encrypted_content` value handed to a client that asked for a replayable reasoning handle:
+/// a pointer into the response store, NOT a secret. There is no crypto layer here and no hosted
+/// reasoning to seal, so what this server can honestly offer is the reference a chained request
+/// already resolves — the same text the client saw in `summary`, reachable by id while the LRU holds
+/// the turn. Its own prefix keeps handles and `item_reference` ids in separate namespaces, so a
+/// client that sends the wrong kind gets a precise error instead of a resolution that happens to work.
+fn reasoning_handle(id: &str) -> String {
+    format!("rehs_{id}")
+}
+
+/// The reasoning item id a handle points at, or `None` for anything that is not one of ours.
+fn reasoning_item_id(handle: &str) -> Option<String> {
+    handle
+        .strip_prefix("rehs_")
+        .filter(|id| !id.is_empty())
+        .map(|id| format!("rs_{id}"))
+}
+
+/// The calls a chat completion's assistant message carries, in OpenAI chat shape. Read through one
+/// helper because the envelope and the replayed history must apply the same `parallel_tool_calls`
+/// shaping — a chain that replays calls the client never saw would have the model wait on results
+/// nobody asked for.
+fn chat_calls(chat: &Value) -> Vec<Value> {
+    chat["choices"][0]["message"]["tool_calls"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// `parallel_tool_calls=false` promises the client at most one call per turn. The local decoder
+/// has no such switch — the model decides how many calls to emit — so the promise is kept by
+/// shaping the output instead. What was withheld is then named in the response: a client that sees
+/// one call and no trace of the others cannot tell a short model answer from a server-side edit,
+/// and an agent loop that quietly lost two of its tool calls is worse than one that got an error.
+fn deliverable_calls(calls: &[Value], parallel: bool) -> (&[Value], usize) {
+    if parallel || calls.len() < 2 {
+        (calls, 0)
+    } else {
+        (&calls[..1], calls.len() - 1)
+    }
+}
+
+fn note_suppressed(response: &mut Value, suppressed: usize) {
+    if suppressed > 0 {
+        push_warning(
+            response,
+            &format!(
+                "{suppressed} additional tool call(s) were not returned because \
+                 parallel_tool_calls=false"
+            ),
+        );
+    }
+}
+
+/// Append one entry to the response's `warnings` array (created on first use).
+fn push_warning(response: &mut Value, text: &str) {
+    match response.get_mut("warnings").and_then(Value::as_array_mut) {
+        Some(list) => list.push(json!(text)),
+        None => response["warnings"] = json!([text]),
+    }
+}
+
+/// Say that a requested `reasoning.encrypted_content` handle was not issued: the turn is stateless,
+/// so reasoning items carry their readable summary only (OpenAI's own servers omit the field when a
+/// model has nothing to encrypt, and replay only needs the summary).
+fn note_handle_withheld(response: &mut Value, withheld: bool) {
+    if withheld {
+        push_warning(
+            response,
+            "reasoning.encrypted_content was requested but this server keeps no response state \
+             (serve.response_store_entries); reasoning items carry their summary only",
+        );
+    }
 }
 
 fn responses_usage(chat_usage: &Value) -> Value {
@@ -1138,10 +1545,8 @@ fn completed_response(chat: &Value, meta: &Meta) -> Value {
     );
     let choice = &chat["choices"][0];
     let message = &choice["message"];
-    let calls = message["tool_calls"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let all_calls = chat_calls(chat);
+    let (calls, suppressed) = deliverable_calls(&all_calls, meta.parallel_tool_calls);
     let incomplete = choice["finish_reason"] == "length";
     response["status"] = json!(if incomplete {
         "incomplete"
@@ -1162,19 +1567,33 @@ fn completed_response(chat: &Value, meta: &Meta) -> Value {
         &id,
         message["reasoning_content"].as_str().unwrap_or(""),
         message["content"].as_str().unwrap_or(""),
-        &calls
+        calls,
+        meta.encrypted_reasoning
     ));
+    note_suppressed(&mut response, suppressed);
+    note_handle_withheld(&mut response, meta.handle_withheld);
     response["usage"] = responses_usage(&chat["usage"]);
     response
 }
 
+/// Ceiling on the chat completion this layer will buffer to translate a NON-streaming
+/// `/v1/responses` reply. The largest completion the server can produce is one context window of
+/// text: 150 K tokens at the worst realistic JSON-escape ratio (~6 bytes per token for `\u00XX`
+/// escapes) is under 1 MiB, so 64 MiB sits ~60x above anything a real request can reach while still
+/// bounding what one in-flight request can hold in memory.
+const MAX_NON_STREAM_TRANSLATION_BYTES: usize = 64 * 1024 * 1024;
+
 async fn non_stream_response(response: Response, meta: Meta, save: Option<SaveCtx>) -> Response {
-    let bytes = match to_bytes(response.into_body(), 16 * 1024 * 1024).await {
+    let bytes = match to_bytes(response.into_body(), MAX_NON_STREAM_TRANSLATION_BYTES).await {
         Ok(bytes) => bytes,
         Err(e) => {
             return json_error(
                 StatusCode::BAD_GATEWAY,
-                format!("unable to translate chat response (16 MiB limit): {e}"),
+                format!(
+                    "chat response exceeded the {} MiB non-streaming translation limit; \
+                     send stream=true instead of buffering the completion: {e}",
+                    MAX_NON_STREAM_TRANSLATION_BYTES / (1024 * 1024)
+                ),
             )
         }
     };
@@ -1189,15 +1608,14 @@ async fn non_stream_response(response: Response, meta: Meta, save: Option<SaveCt
         // still replayable history; a missing terminal frame is not.
         if !choice["finish_reason"].is_null() {
             let message = &choice["message"];
-            let calls = message["tool_calls"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
+            // Same shaping as the envelope above, so the chain replays exactly what was served.
+            let all_calls = chat_calls(&chat);
+            let (calls, _) = deliverable_calls(&all_calls, meta.parallel_tool_calls);
             let history = output_history(
                 &save.history,
                 message["reasoning_content"].as_str().unwrap_or(""),
                 message["content"].as_str().unwrap_or(""),
-                &calls,
+                calls,
             );
             let id = response_id(chat["id"].as_str().unwrap_or("unknown"));
             save.store.lock().unwrap().put(
@@ -1224,11 +1642,27 @@ struct StreamState {
     reasoning: String,
     content: String,
     calls: Vec<Value>,
+    /// The tool calls the upstream stream has opened, index-aligned with `calls`.
+    open_calls: Vec<OpenCall>,
+    /// Upstream indexes dropped by `parallel_tool_calls=false`, so their later fragments stay out.
+    dropped: Vec<u64>,
+    suppressed: usize,
     reasoning_index: Option<usize>,
     content_index: Option<usize>,
     next_index: usize,
     terminal: bool,
     save: Option<SaveCtx>,
+}
+
+/// One tool call the upstream stream opened, in the shape the Responses events address it by.
+struct OpenCall {
+    /// The `delta.tool_calls[].index` this slot answers; `None` for an upstream that sends no index.
+    upstream_index: Option<u64>,
+    /// Position in `response.output` — allocated when the item opens, after the prose items.
+    output_index: usize,
+    /// Whether `response.output_item.added` has been emitted for this slot: the first fragment
+    /// announces it (and closes the prose items ahead of it), later fragments only add arguments.
+    added: bool,
 }
 
 impl StreamState {
@@ -1250,7 +1684,8 @@ impl StreamState {
             let mut response = response_base(&id, self.created, &self.model, &self.meta);
             response["status"] = json!("failed");
             response["error"] = json!({"code":code,"message":message});
-            let mut items = output_items(&id, &self.reasoning, &self.content, &self.calls);
+            // No handle on a failed turn: it is never stored, so nothing could resolve one.
+            let mut items = output_items(&id, &self.reasoning, &self.content, &self.calls, false);
             // A failed stream has no item-completion boundary. Keep only items
             // that were actually started, and leave unfinished items in progress.
             if self.content_index.is_none() && self.content.is_empty() {
@@ -1296,7 +1731,14 @@ impl StreamState {
             let index = self.next_index;
             self.next_index += 1;
             self.reasoning_index = Some(index);
-            self.emit("response.output_item.added", json!({"output_index":index,"item":{"id":format!("rs_{id}"),"type":"reasoning","status":"in_progress","summary":[]}}));
+            let mut item = json!({"id":format!("rs_{id}"),"type":"reasoning","status":"in_progress","summary":[]});
+            if self.meta.encrypted_reasoning {
+                item["encrypted_content"] = json!(reasoning_handle(&id));
+            }
+            self.emit(
+                "response.output_item.added",
+                json!({"output_index":index,"item":item}),
+            );
             self.emit("response.reasoning_summary_part.added", json!({"item_id":format!("rs_{id}"),"output_index":index,"summary_index":0,"part":{"type":"summary_text","text":""}}));
             index
         };
@@ -1326,7 +1768,14 @@ impl StreamState {
             let text = self.reasoning.clone();
             self.emit("response.reasoning_summary_text.done", json!({"item_id":format!("rs_{id}"),"output_index":index,"summary_index":0,"text":text}));
             self.emit("response.reasoning_summary_part.done", json!({"item_id":format!("rs_{id}"),"output_index":index,"summary_index":0,"part":{"type":"summary_text","text":text}}));
-            self.emit("response.output_item.done", json!({"output_index":index,"item":{"id":format!("rs_{id}"),"type":"reasoning","status":"completed","summary":[{"type":"summary_text","text":text}]}}));
+            let mut item = json!({"id":format!("rs_{id}"),"type":"reasoning","status":"completed","summary":[{"type":"summary_text","text":text}]});
+            if self.meta.encrypted_reasoning {
+                item["encrypted_content"] = json!(reasoning_handle(&id));
+            }
+            self.emit(
+                "response.output_item.done",
+                json!({"output_index":index,"item":item}),
+            );
         }
         if self.content_index.is_none() && include_empty_message && self.calls.is_empty() {
             self.content_delta("");
@@ -1340,28 +1789,121 @@ impl StreamState {
     }
 
     fn tool_call(&mut self, call: Value) {
-        if self.calls.is_empty() {
-            self.finish_items(false);
+        // OpenAI chat-completions shape: fragments of one call share its `index`, and only the
+        // first carries `id`/`name`. Keying on the index is what turns a call that arrives in
+        // pieces into ONE item with several argument deltas; treating every fragment as a whole
+        // call would hand the client a row of half-argument calls to dispatch.
+        let Some(slot) = self.open_slot(&call) else {
+            return; // suppressed by `parallel_tool_calls=false`, counted in `open_slot`
+        };
+        if let Some(name) = call["function"]["name"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+        {
+            if self.calls[slot]["function"]["name"].is_null() {
+                self.calls[slot]["function"]["name"] = json!(name);
+            }
+        }
+        if call["id"].is_string() && self.calls[slot]["id"].is_null() {
+            self.calls[slot]["id"] = call["id"].clone();
         }
         let id = self.id.clone().unwrap();
-        let index = self.next_index;
+        let item_id = format!("fc_{id}_{slot}");
+        let output_index = self.open_calls[slot].output_index;
+        if !self.open_calls[slot].added {
+            // The prose items this call follows close first, so the events arrive in `output_index`
+            // order — the ordering guarantee a client uses to interleave thinking and calls.
+            self.finish_items(false);
+            self.open_calls[slot].added = true;
+            self.emit("response.output_item.added", json!({"output_index":output_index,"item":{"id":item_id,"type":"function_call","status":"in_progress","call_id":self.calls[slot]["id"].clone(),"name":self.calls[slot]["function"]["name"].clone(),"arguments":""}}));
+        }
+        if let Some(fragment) = call["function"]["arguments"]
+            .as_str()
+            .filter(|text| !text.is_empty())
+        {
+            let mut accumulated = self.calls[slot]["function"]["arguments"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            accumulated.push_str(fragment);
+            self.calls[slot]["function"]["arguments"] = json!(accumulated);
+            self.emit(
+                "response.function_call_arguments.delta",
+                json!({"item_id":item_id,"output_index":output_index,"delta":fragment}),
+            );
+        }
+    }
+
+    /// The slot a `delta.tool_calls[]` fragment belongs to, opening a new one when it does not.
+    /// `None` = drop: `parallel_tool_calls=false` already delivered this turn's single call. A drop
+    /// is remembered by upstream index so the later fragments of a suppressed call cannot leak into
+    /// the arguments of the call the client did receive.
+    fn open_slot(&mut self, call: &Value) -> Option<usize> {
+        let upstream = call["index"].as_u64();
+        if let Some(key) = upstream {
+            if let Some(slot) = self
+                .open_calls
+                .iter()
+                .position(|open| open.upstream_index == Some(key))
+            {
+                return Some(slot);
+            }
+            if self.dropped.contains(&key) {
+                return None;
+            }
+        } else if let Some(last) = self.open_calls.len().checked_sub(1) {
+            // An index-less, name-less fragment continues the call already open. Once anything has
+            // been suppressed there is no safe target, so it is dropped instead of appended.
+            return if self.dropped.is_empty() {
+                Some(last)
+            } else {
+                None
+            };
+        }
+        if !self.meta.parallel_tool_calls && !self.calls.is_empty() {
+            if let Some(key) = upstream {
+                self.dropped.push(key);
+            }
+            self.suppressed += 1;
+            return None;
+        }
+        let mut opened = call.clone();
+        // The stored object is the accumulation target, so the arguments start empty and every
+        // fragment — this one included — is added by the caller.
+        opened["function"]["arguments"] = json!("");
+        self.open_calls.push(OpenCall {
+            upstream_index: upstream,
+            output_index: self.next_index,
+            added: false,
+        });
         self.next_index += 1;
-        let call_index = self.calls.len();
-        let item_id = format!("fc_{id}_{call_index}");
-        let call_id = call["id"].clone();
-        let name = call["function"]["name"].clone();
-        let arguments = call["function"]["arguments"].clone();
-        self.emit("response.output_item.added", json!({"output_index":index,"item":{"id":item_id,"type":"function_call","status":"in_progress","call_id":call_id,"name":name,"arguments":""}}));
-        self.emit(
-            "response.function_call_arguments.delta",
-            json!({"item_id":item_id,"output_index":index,"delta":arguments}),
-        );
-        self.emit(
-            "response.function_call_arguments.done",
-            json!({"item_id":item_id,"output_index":index,"arguments":arguments}),
-        );
-        self.emit("response.output_item.done", json!({"output_index":index,"item":{"id":item_id,"type":"function_call","status":"completed","call_id":call_id,"name":name,"arguments":arguments}}));
-        self.calls.push(call);
+        self.calls.push(opened);
+        Some(self.calls.len() - 1)
+    }
+
+    /// Close every tool call that was opened: the terminal events that move an item from "in
+    /// progress" to something the client can dispatch.
+    fn finish_calls(&mut self) {
+        let id = match self.id.clone() {
+            Some(id) => id,
+            None => return,
+        };
+        for slot in 0..self.calls.len() {
+            if !self.open_calls[slot].added {
+                continue; // never surfaced, so there is nothing to close
+            }
+            let output_index = self.open_calls[slot].output_index;
+            let item_id = format!("fc_{id}_{slot}");
+            let arguments = self.calls[slot]["function"]["arguments"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            self.emit(
+                "response.function_call_arguments.done",
+                json!({"item_id":item_id,"output_index":output_index,"arguments":arguments}),
+            );
+            self.emit("response.output_item.done", json!({"output_index":output_index,"item":{"id":item_id,"type":"function_call","status":"completed","call_id":self.calls[slot]["id"].clone(),"name":self.calls[slot]["function"]["name"].clone(),"arguments":arguments}}));
+        }
     }
 
     fn consume(&mut self, data: &[u8]) {
@@ -1390,6 +1932,7 @@ impl StreamState {
         }
         if !choice["finish_reason"].is_null() {
             self.finish_items(true);
+            self.finish_calls();
             let id = self.id.clone().unwrap();
             let mut response = response_base(&id, self.created, &self.model, &self.meta);
             let incomplete = choice["finish_reason"] == "length";
@@ -1412,9 +1955,12 @@ impl StreamState {
                 &id,
                 &self.reasoning,
                 &self.content,
-                &self.calls
+                &self.calls,
+                self.meta.encrypted_reasoning
             ));
             response["usage"] = responses_usage(&chunk["usage"]);
+            note_suppressed(&mut response, self.suppressed);
+            note_handle_withheld(&mut response, self.meta.handle_withheld);
             // Same save rule as the non-streaming path: completed AND incomplete persist;
             // `fail()` (below the terminal boundary) never does. The stored envelope is the exact
             // object this event hands the client, so `retrieve` cannot drift from what was served.
@@ -1475,6 +2021,9 @@ fn stream_response(response: Response, meta: Meta, save: Option<SaveCtx>) -> Res
         reasoning: String::new(),
         content: String::new(),
         calls: Vec::new(),
+        open_calls: Vec::new(),
+        dropped: Vec::new(),
+        suppressed: 0,
         reasoning_index: None,
         content_index: None,
         next_index: 0,
@@ -1787,7 +2336,7 @@ mod tests {
             messages: &[ChatMessage],
             tools: Option<&Value>,
             _tool_choice: Option<&str>,
-            _params: &GenParams,
+            params: &GenParams,
             _cancel: &Arc<AtomicBool>,
             _progress: Option<infr_core::GenerationProgressCallback>,
             on_delta: &mut dyn FnMut(Delta),
@@ -1797,6 +2346,8 @@ mod tests {
                     "image:{}",
                     messages.last().unwrap().images[0]
                 )));
+            } else if params.response_format.is_structured() {
+                on_delta(Delta::Content(r#"{"answer":"hello"}"#.into()));
             } else if tools.is_some_and(|v| v.as_array().is_some_and(|a| !a.is_empty())) {
                 on_delta(Delta::ToolCall {
                     name: "shell".into(),
@@ -1846,7 +2397,7 @@ mod tests {
             json!({"model":"fixture","input":"hi","instructions":"brief",
             "temperature":0.25,"metadata":{"trace":"local"},"max_output_tokens":32,
             "prompt_cache_key":"harness-test","user":"local-user",
-            "include":["reasoning.encrypted_content"],"service_tier":"auto"}),
+            "service_tier":"auto"}),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1919,6 +2470,136 @@ mod tests {
         );
     }
 
+    /// Turn one of a chain, as the store would have kept it: the folded history the next request
+    /// replays as its base.
+    fn chained_base(request: &Value) -> Arc<Vec<ChatMessageDto>> {
+        let prepared: ResponsesRequest = serde_json::from_value(request.clone()).unwrap();
+        Arc::new(
+            prepared
+                .into_chat(None, None, None, false)
+                .unwrap()
+                .chat
+                .messages,
+        )
+    }
+
+    #[test]
+    fn identical_instructions_replay_the_chain_without_a_second_system_turn() {
+        // The shape an SDK sends every turn: the same `instructions` on a chained request. The
+        // stored prefix already says it, so the duplicate is dropped and the tokenized prompt
+        // keeps the one system turn the chain was built on.
+        let first = json!({"model":"fixture","instructions":"answer briefly","input":"hi"});
+        let base = chained_base(&first);
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"fixture","instructions":"answer briefly","input":"again",
+            "previous_response_id":"resp_1"
+        }))
+        .unwrap();
+        let chat = request
+            .into_chat(Some(base), None, None, false)
+            .unwrap()
+            .chat;
+        assert_eq!(chat.messages.len(), 3);
+        assert_eq!(
+            chat.messages.iter().filter(|m| m.role == "system").count(),
+            1
+        );
+        assert_eq!(chat.messages[0].content.as_ref().unwrap(), "answer briefly");
+        assert_eq!(chat.messages[1].content.as_ref().unwrap(), "hi");
+        assert_eq!(chat.messages[2].content.as_ref().unwrap(), "again");
+    }
+
+    #[test]
+    fn instructions_matching_a_leading_part_of_the_stored_prefix_are_accepted() {
+        // Turn one folded `instructions` AND a developer message into one system turn; a client
+        // that re-sends only its instructions still matches the prefix it stored.
+        let first = json!({
+            "model":"fixture","instructions":"primary",
+            "input":[
+                {"role":"developer","content":"tool rules"},
+                {"role":"user","content":"hi"}
+            ]
+        });
+        let base = chained_base(&first);
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"fixture","instructions":"primary","input":"again"
+        }))
+        .unwrap();
+        let chat = request
+            .into_chat(Some(base), None, None, false)
+            .unwrap()
+            .chat;
+        assert_eq!(
+            chat.messages[0].content.as_ref().unwrap(),
+            "primary\n\ntool rules"
+        );
+        assert_eq!(chat.messages.len(), 3);
+    }
+
+    #[test]
+    fn edited_instructions_on_a_chain_are_rejected_with_the_field_that_changed() {
+        let base =
+            chained_base(&json!({"model":"fixture","instructions":"answer briefly","input":"hi"}));
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"fixture","instructions":"answer at length","input":"again"
+        }))
+        .unwrap();
+        let error = request
+            .into_chat(Some(base), None, None, false)
+            .err()
+            .unwrap();
+        assert_eq!(error.param, "instructions");
+        assert!(error.message.contains("do not match the system prefix"));
+
+        // A chain with no system turn at all: the instruction would be new context inserted after
+        // the replayed turns, which no template can express.
+        let base = chained_base(&json!({"model":"fixture","input":"hi"}));
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"fixture","instructions":"answer briefly","input":"again"
+        }))
+        .unwrap();
+        let error = request
+            .into_chat(Some(base), None, None, false)
+            .err()
+            .unwrap();
+        assert_eq!(error.param, "instructions");
+        assert!(error.message.contains("no system prefix"));
+    }
+
+    #[test]
+    fn repeated_system_input_message_is_dropped_but_a_new_one_is_not() {
+        let first = json!({
+            "model":"fixture",
+            "input":[{"role":"system","content":"answer briefly"},{"role":"user","content":"hi"}]
+        });
+        let base = chained_base(&first);
+        let same: ResponsesRequest = serde_json::from_value(json!({
+            "model":"fixture",
+            "input":[{"role":"system","content":"answer briefly"},{"role":"user","content":"again"}]
+        }))
+        .unwrap();
+        let chat = same
+            .into_chat(Some(base.clone()), None, None, false)
+            .unwrap()
+            .chat;
+        assert_eq!(
+            chat.messages.iter().filter(|m| m.role == "system").count(),
+            1
+        );
+        assert_eq!(chat.messages.len(), 3);
+
+        let edited: ResponsesRequest = serde_json::from_value(json!({
+            "model":"fixture",
+            "input":[{"role":"system","content":"answer at length"},{"role":"user","content":"again"}]
+        }))
+        .unwrap();
+        let error = edited
+            .into_chat(Some(base), None, None, false)
+            .err()
+            .unwrap();
+        assert_eq!(error.param, "input");
+    }
+
     #[test]
     fn minimal_effort_and_requested_token_limit_are_reported_honestly() {
         let request: ResponsesRequest = serde_json::from_value(json!({
@@ -1927,12 +2608,46 @@ mod tests {
         }))
         .unwrap();
         let Prepared { chat, meta, .. } = request.into_chat(None, None, None, false).unwrap();
-        assert_eq!(
-            chat.reasoning_effort,
-            Some(infr_core::config::ReasoningEffort::Low)
-        );
+        assert_eq!(chat.reasoning_effort, Some(json!("low")));
         assert_eq!(meta.reasoning["effort"], "low");
         assert_eq!(meta.max_output_tokens, Some(100));
+    }
+
+    /// `reasoning.effort: "none"` is OpenAI's "no reasoning" level. The local templates only have
+    /// levels, so it must land on the thinking switch instead of a 400 (a real client — DeepSeek
+    /// Harness — sent exactly this and could not talk to the server at all).
+    #[test]
+    fn effort_none_turns_thinking_off_instead_of_failing() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"fixture","input":"hello","reasoning":{"effort":"none"}
+        }))
+        .unwrap();
+        let Prepared { chat, meta, .. } = request.into_chat(None, None, None, false).unwrap();
+        assert_eq!(chat.reasoning_effort, None, "no template level is requested");
+        assert_eq!(
+            chat.chat_template_kwargs
+                .as_ref()
+                .and_then(|kwargs| kwargs.enable_thinking),
+            Some(false),
+            "`none` must reach the template as enable_thinking=false"
+        );
+        assert_eq!(meta.reasoning["effort"], "none", "echo what was asked");
+
+        // Anything else still names the parameter rather than being silently clamped.
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"fixture","input":"hello","reasoning":{"effort":"turbo"}
+        }))
+        .unwrap();
+        let error = request
+            .into_chat(None, None, None, false)
+            .err()
+            .unwrap();
+        assert_eq!(error.param, "reasoning.effort");
+        assert!(
+            error.message.contains("none, minimal, low, medium, high, xhigh or max"),
+            "the error must list the accepted values, got {:?}",
+            error.message
+        );
     }
 
     #[test]
@@ -1978,7 +2693,6 @@ mod tests {
             ("conversation", json!("conv_old")),
             ("store", json!(true)),
             ("truncation", json!("auto")),
-            ("parallel_tool_calls", json!(false)),
             ("background", json!(true)),
             ("include", json!(["message.output_text.logprobs"])),
             ("service_tier", json!("priority")),
@@ -2000,6 +2714,86 @@ mod tests {
         }
     }
 
+    /// Responses `text.format` used to be a 400 for every non-text value. It now reaches the SAME
+    /// parser/grammar as chat's `response_format`; the flat request shape is echoed back verbatim.
+    #[tokio::test]
+    async fn text_format_json_schema_and_json_object_take_effect() {
+        let format = json!({"type":"json_schema","name":"answer","strict":true,
+            "schema":{"type":"object","properties":{"answer":{"type":"string"}},
+                      "required":["answer"],"additionalProperties":false}});
+        let response = post(json!({"model":"fixture","input":"hi","text":{"format":format}})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(
+            body["output"][0]["content"][0]["text"],
+            r#"{"answer":"hello"}"#
+        );
+        assert_eq!(body["text"]["format"], format);
+
+        let response = post(
+            json!({"model":"fixture","input":"hi","text":{"format":{"type":"json_object"}}}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let text = body["output"][0]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            serde_json::from_str::<Value>(text).unwrap().is_object(),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_text_format_is_rejected_with_text_format_param() {
+        for format in [
+            json!({"type":"json_schema","name":"x","schema":{"$ref":"#/$defs/x"}}),
+            json!({"type":"json_schema","name":"x"}),
+            json!({"type":"json_schema","schema":{"type":"object"}}),
+            json!({"type":"json_schema","name":"x","schema":{"type":"object"},"extra":1}),
+            json!({"type":"nope"}),
+        ] {
+            let response =
+                post(json!({"model":"fixture","input":"hi","text":{"format":format}})).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{format}");
+            let body = json_body(response).await;
+            assert_eq!(body["error"]["param"], "text.format", "{format}");
+        }
+        let response = post(json!({"model":"fixture","input":"hi","text":{"format":
+            {"type":"json_schema","name":"x","schema":{"$ref":"#/$defs/x"}}}}))
+        .await;
+        let body = json_body(response).await;
+        assert!(
+            body["error"]["message"].as_str().unwrap().contains("$ref"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_text_format_with_tools_is_a_400_naming_text_format() {
+        let response = post(json!({"model":"fixture","input":"hi",
+            "text":{"format":{"type":"json_object"}},
+            "tools":[{"type":"function","name":"shell","parameters":{"type":"object"}}]}))
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["param"], "text.format");
+    }
+
+    #[tokio::test]
+    async fn structured_stream_completes_with_the_json_text() {
+        let format = json!({"type":"json_schema","name":"answer",
+            "schema":{"type":"object","properties":{"answer":{"type":"string"}},
+                      "required":["answer"]}});
+        let response =
+            post(json!({"model":"fixture","input":"hi","stream":true,"text":{"format":format}}))
+                .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let wire = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(wire.contains(r#""type":"response.completed""#), "{wire}");
+        assert!(wire.contains(r#"{\"answer\":\"hello\"}"#), "{wire}");
+    }
+
     #[test]
     fn stateless_replay_and_reasoning_effort_reach_chat_path() {
         let request: ResponsesRequest = serde_json::from_value(json!({
@@ -2014,10 +2808,7 @@ mod tests {
             "tools":[{"type":"function","name":"shell","parameters":{"type":"object"}}]
         })).unwrap();
         let Prepared { chat, meta, .. } = request.into_chat(None, None, None, false).unwrap();
-        assert_eq!(
-            chat.reasoning_effort,
-            Some(infr_core::config::ReasoningEffort::High)
-        );
+        assert_eq!(chat.reasoning_effort, Some(json!("high")));
         assert_eq!(chat.messages[1].reasoning_content.as_deref(), Some("plan"));
         assert_eq!(
             chat.messages[2].tool_calls.as_ref().unwrap()[0]["id"],
@@ -2199,14 +2990,157 @@ mod tests {
         let request: ResponsesRequest =
             serde_json::from_value(json!({"model":"fixture","input":"hi"})).unwrap();
         let meta = request.into_chat(None, None, None, false).unwrap().meta;
-        let upstream = Response::new(Body::from(vec![b' '; 16 * 1024 * 1024 + 1]));
+        let upstream = Response::new(Body::from(vec![b' '; MAX_NON_STREAM_TRANSLATION_BYTES + 1]));
         let response = non_stream_response(upstream, meta, None).await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let body = json_body(response).await;
-        assert!(body["error"]["message"]
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("64 MiB"), "{message}");
+        // The way out has to be in the message: this is a buffering limit, not a generation one.
+        assert!(message.contains("stream=true"), "{message}");
+    }
+
+    /// The `data:` payloads of a translated stream, in order.
+    async fn sse_events(response: Response) -> Vec<Value> {
+        let wire = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        wire.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect()
+    }
+
+    fn upstream_stream(frames: &[&str]) -> Response {
+        Response::new(Body::from(
+            frames
+                .iter()
+                .map(|frame| format!("data: {frame}\n\n"))
+                .collect::<String>(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn fragmented_tool_call_stream_becomes_one_item_with_argument_deltas() {
+        // The OpenAI chat-completions shape: fragments sharing an `index`, only the first carrying
+        // `id`/`name`. One call, three argument fragments, one completed item.
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"fixture","input":"hi",
+            "tools":[{"type":"function","name":"shell","parameters":{"type":"object"}}]
+        }))
+        .unwrap();
+        let meta = request.into_chat(None, None, None, false).unwrap().meta;
+        let response = stream_response(
+            upstream_stream(&[
+                r#"{"id":"chatcmpl-1","created":1,"model":"fixture","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":""}}]}}]}"#,
+                r#"{"id":"chatcmpl-1","created":1,"model":"fixture","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\":\""}}]}}]}"#,
+                r#"{"id":"chatcmpl-1","created":1,"model":"fixture","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"dir\"}"}}]}}]}"#,
+                r#"{"id":"chatcmpl-1","created":1,"model":"fixture","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":4,"completion_tokens":6,"total_tokens":10}}"#,
+            ]),
+            meta,
+            None,
+        );
+        let events = sse_events(response).await;
+        let added: Vec<&Value> = events
+            .iter()
+            .filter(|event| event["type"] == "response.output_item.added")
+            .collect();
+        assert_eq!(added.len(), 1, "one call, one item announcement");
+        assert_eq!(added[0]["item"]["type"], "function_call");
+        assert_eq!(added[0]["item"]["name"], "shell");
+        assert_eq!(added[0]["item"]["call_id"], "call_1");
+        let deltas: Vec<&Value> = events
+            .iter()
+            .filter(|event| event["type"] == "response.function_call_arguments.delta")
+            .collect();
+        assert_eq!(deltas.len(), 2, "empty first fragment emits nothing");
+        assert_eq!(
+            deltas
+                .iter()
+                .map(|event| event["delta"].as_str().unwrap())
+                .collect::<String>(),
+            r#"{"cmd":"dir"}"#
+        );
+        let done = events
+            .iter()
+            .find(|event| event["type"] == "response.output_item.done")
+            .unwrap();
+        assert_eq!(done["item"]["arguments"], r#"{"cmd":"dir"}"#);
+        let completed = events.last().unwrap();
+        assert_eq!(completed["type"], "response.completed");
+        let output = completed["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["arguments"], r#"{"cmd":"dir"}"#);
+        assert_eq!(output[0]["id"], added[0]["item"]["id"]);
+    }
+
+    #[tokio::test]
+    async fn parallel_tool_calls_false_returns_one_call_and_says_what_was_dropped() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"fixture","input":"hi","parallel_tool_calls":false,
+            "tools":[{"type":"function","name":"shell","parameters":{"type":"object"}}]
+        }))
+        .unwrap();
+        let meta = request.into_chat(None, None, None, false).unwrap().meta;
+        assert!(!meta.parallel_tool_calls);
+        let response = stream_response(
+            upstream_stream(&[
+                r#"{"id":"chatcmpl-1","created":1,"model":"fixture","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":"{}"}}]}}]}"#,
+                r#"{"id":"chatcmpl-1","created":1,"model":"fixture","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_2","type":"function","function":{"name":"shell","arguments":"{}"}}]}}]}"#,
+                r#"{"id":"chatcmpl-1","created":1,"model":"fixture","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"cmd\":\"late\"}"}}]}}]}"#,
+                r#"{"id":"chatcmpl-1","created":1,"model":"fixture","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":4,"completion_tokens":6,"total_tokens":10}}"#,
+            ]),
+            meta,
+            None,
+        );
+        let events = sse_events(response).await;
+        let items: Vec<&Value> = events
+            .iter()
+            .filter(|event| event["type"] == "response.output_item.done")
+            .collect();
+        assert_eq!(items.len(), 1, "the second call never opens an item");
+        assert_eq!(items[0]["item"]["call_id"], "call_1");
+        assert!(!events.iter().any(|event| {
+            event["type"] == "response.function_call_arguments.delta"
+                && event["delta"] == r#"{"cmd":"late"#
+        }));
+        let completed = events.last().unwrap();
+        assert_eq!(completed["response"]["parallel_tool_calls"], false);
+        assert!(completed["response"]["warnings"][0]
             .as_str()
             .unwrap()
-            .contains("16 MiB"));
+            .contains("parallel_tool_calls=false"));
+
+        // Non-streaming applies the same shaping, so the two paths cannot disagree.
+        let chat = json!({"id":"chatcmpl-2","created":2,"model":"fixture","choices":[{"index":0,
+            "message":{"role":"assistant","tool_calls":[
+                {"index":0,"id":"call_a","type":"function","function":{"name":"shell","arguments":"{}"}},
+                {"index":1,"id":"call_b","type":"function","function":{"name":"shell","arguments":"{}"}}
+            ]},"finish_reason":"tool_calls"}],
+            "usage":{"prompt_tokens":4,"completion_tokens":6,"total_tokens":10}});
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"fixture","input":"hi","parallel_tool_calls":false
+        }))
+        .unwrap();
+        let meta = request.into_chat(None, None, None, false).unwrap().meta;
+        let body = json_body(
+            non_stream_response(Response::new(Body::from(chat.to_string())), meta, None).await,
+        )
+        .await;
+        let output = body["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["call_id"], "call_a");
+        assert!(body["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("parallel_tool_calls=false"));
     }
 
     // -- response store: chained replay ----------------------------------------------------
@@ -2293,6 +3227,287 @@ mod tests {
         // R1 sent [user]; R2 replays [user, assistant] and appends [user] — the rebuilt prompt
         // carries R1's exact token prefix, which is what the paged radix tree hits.
         assert_eq!(*lengths.lock().unwrap(), vec![1, 3]);
+    }
+
+    /// Answers with the reasoning every prompt message carries, so a test can prove what the model
+    /// saw instead of inferring it from message counts.
+    struct ReasoningEcho;
+
+    impl ChatGenerator for ReasoningEcho {
+        fn chat(
+            &self,
+            messages: &[ChatMessage],
+            _tools: Option<&Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            _cancel: &Arc<AtomicBool>,
+            _progress: Option<infr_core::GenerationProgressCallback>,
+            on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            let seen: Vec<&str> = messages
+                .iter()
+                .filter_map(|m| m.reasoning_content.as_deref())
+                .collect();
+            on_delta(Delta::Reasoning("think".into()));
+            on_delta(Delta::Content(seen.join("|")));
+            Ok(ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: 1,
+                cached_prompt_tokens: 0,
+                completion_tokens: 1,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn encrypted_reasoning_handle_round_trips_into_the_next_prompt() {
+        let router = router_entries(Arc::new(ReasoningEcho), 8);
+        let first = json_body(
+            post_to(
+                &router,
+                json!({"model":"fixture","input":"first","include":["reasoning.encrypted_content"]}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(first["output"][0]["type"], "reasoning");
+        let handle = first["output"][0]["encrypted_content"]
+            .as_str()
+            .expect("include asked for a handle")
+            .to_owned();
+        assert!(!handle.is_empty());
+
+        // The handle replays the reasoning even though the client no longer sends its text.
+        let second = json_body(
+            post_to(
+                &router,
+                json!({"model":"fixture","input":[
+                    {"type":"reasoning","encrypted_content":handle},
+                    {"role":"user","content":"second"}
+                ]}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(second["status"], "completed");
+        let replayed = second["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "message")
+            .expect("the answer item")
+            .clone();
+        assert_eq!(replayed["content"][0]["text"], "think");
+
+        // Without the include, the same turn carries no handle at all.
+        let plain =
+            json_body(post_to(&router, json!({"model":"fixture","input":"third"})).await).await;
+        assert!(plain["output"][0].get("encrypted_content").is_none());
+    }
+
+    #[tokio::test]
+    async fn streaming_reasoning_item_carries_the_handle_when_asked() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"fixture","input":"hi","include":["reasoning.encrypted_content"],"store":true
+        }))
+        .unwrap();
+        let meta = request.into_chat(None, None, None, true).unwrap().meta;
+        let response = stream_response(
+            upstream_stream(&[
+                r#"{"id":"chatcmpl-9","created":1,"model":"fixture","choices":[{"index":0,"delta":{"reasoning_content":"plan"},"finish_reason":null}]}"#,
+                r#"{"id":"chatcmpl-9","created":1,"model":"fixture","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#,
+            ]),
+            meta,
+            None,
+        );
+        let events = sse_events(response).await;
+        let handles: Vec<&str> = events
+            .iter()
+            .filter(|event| event["item"]["type"] == "reasoning")
+            .filter(|event| {
+                matches!(
+                    event["type"].as_str(),
+                    Some("response.output_item.added" | "response.output_item.done")
+                )
+            })
+            .map(|event| event["item"]["encrypted_content"].as_str().unwrap())
+            .collect();
+        assert_eq!(handles, vec!["rehs_resp_9", "rehs_resp_9"]);
+        let completed = events.last().unwrap();
+        assert_eq!(
+            completed["response"]["output"][0]["encrypted_content"],
+            "rehs_resp_9"
+        );
+    }
+
+    /// `include:["reasoning.encrypted_content"]` on a turn the server cannot store is a CAPABILITY
+    /// request, not a contradiction: OpenAI's own servers omit the field when there is nothing to
+    /// encrypt, replay only needs the reasoning item's readable summary, and pi-ai's Responses
+    /// adapter asks for the include on every reasoning request (so 400ing here locks a client out
+    /// of every thinking level — measured with DeepSeek Harness).
+    #[tokio::test]
+    async fn include_without_response_state_degrades_with_a_warning() {
+        // Store feature off entirely: the request succeeds and says why no handle came back.
+        let response = post(json!({
+            "model":"fixture","input":"hi","include":["reasoning.encrypted_content"]
+        }))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert!(
+            body["warnings"][0]
+                .as_str()
+                .unwrap()
+                .contains("response_store_entries"),
+            "the warning names the switch that would issue a handle: {body}"
+        );
+        assert!(
+            body["output"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["type"] != "reasoning" || item["encrypted_content"].is_null()),
+            "a stateless turn must not mint a handle it cannot resolve"
+        );
+
+        // Store available but this turn declines it (`store:false`): same degradation, not a 400.
+        let (rec, _) = recorder();
+        let router = router_entries(rec, 8);
+        let response = post_to(
+            &router,
+            json!({"model":"fixture","input":"hi","store":false,
+                   "include":["reasoning.encrypted_content"]}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert!(body["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("response_store_entries"));
+
+        // An include this server genuinely cannot honour still names `include`.
+        let response = post(json!({
+            "model":"fixture","input":"hi","include":["message.output_text.logprobs"]
+        }))
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(response).await["error"]["param"], "include");
+    }
+
+    #[tokio::test]
+    async fn an_unresolvable_reasoning_handle_is_a_loud_400() {
+        let (rec, _) = recorder();
+        let router = router_entries(rec, 8);
+        for handle in ["rehs_resp_missing", "not-a-handle"] {
+            let response = post_to(
+                &router,
+                json!({"model":"fixture","input":[
+                    {"type":"reasoning","encrypted_content":handle},
+                    {"role":"user","content":"next"}
+                ]}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{handle}");
+            assert_eq!(json_body(response).await["error"]["param"], "input");
+        }
+    }
+
+    fn temp_store_path(name: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("infr-responses-{name}-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    #[test]
+    fn store_path_round_trips_history_items_and_cursors() {
+        let path = temp_store_path("roundtrip");
+        {
+            let mut store = ResponseStore::open(4, Some(&path)).unwrap();
+            let history = Arc::new(vec![message("user", Some(json!("hello")))]);
+            store.put(
+                "resp_1",
+                json!({"id":"resp_1","output":[{"id":"msg_1","type":"message","status":"completed"}]}),
+                history,
+                vec![json!({"role":"user","content":"hello"})],
+                Some("conv"),
+            );
+            assert!(path.exists(), "a mutation is mirrored immediately");
+        }
+        // A fresh store over the same file stands in for a restarted process.
+        let mut reopened = ResponseStore::open(4, Some(&path)).unwrap();
+        let chained = reopened.chain(Some("resp_1"), None).unwrap().unwrap();
+        assert_eq!(chained.len(), 1);
+        assert_eq!(chained[0].content, Some(json!("hello")));
+        let via_cursor = reopened.chain(None, Some("conv")).unwrap().unwrap();
+        assert_eq!(via_cursor.len(), 1);
+        assert_eq!(reopened.get("resp_1").unwrap()["id"], "resp_1");
+        let item = reopened.resolve_item("msg_1").expect("item index rebuilt");
+        assert_eq!(item["id"], "msg_1");
+        assert_eq!(reopened.prompt_items("resp_1").unwrap().len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn store_path_keeps_the_lru_window_and_drops_evicted_turns() {
+        let path = temp_store_path("lru");
+        {
+            let mut store = ResponseStore::open(2, Some(&path)).unwrap();
+            for id in ["resp_a", "resp_b", "resp_c"] {
+                store.put(
+                    id,
+                    json!({"id":id,"output":[]}),
+                    Arc::new(vec![message("user", Some(json!(id)))]),
+                    Vec::new(),
+                    None,
+                );
+            }
+        }
+        let mut reopened = ResponseStore::open(2, Some(&path)).unwrap();
+        assert!(reopened.get("resp_a").is_none(), "oldest turn was evicted");
+        assert!(reopened.get("resp_c").is_some());
+        assert_eq!(reopened.len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_corrupt_store_file_refuses_to_open() {
+        let path = temp_store_path("corrupt");
+        std::fs::write(&path, b"{not a store").unwrap();
+        let error = ResponseStore::open(4, Some(&path))
+            .err()
+            .expect("a corrupt store must not open");
+        assert!(error.contains("move it aside"), "{error}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn responses_chain_survives_a_restart_when_a_path_is_configured() {
+        let path = temp_store_path("restart");
+        let cfg = || {
+            let mut cfg = Config::default();
+            cfg.serve.response_store_entries = 8;
+            cfg.serve.response_store_path = Some(path.clone());
+            Arc::new(cfg)
+        };
+        let first = {
+            let router = build_router(AppState::new(Arc::new(ReasoningEcho), "fixture", 1, cfg()));
+            json_body(post_to(&router, json!({"model":"fixture","input":"first"})).await).await
+        };
+        // A second router over the same file: nothing but the mirror is shared with the first.
+        let router = build_router(AppState::new(Arc::new(ReasoningEcho), "fixture", 1, cfg()));
+        let second = json_body(
+            post_to(
+                &router,
+                json!({"model":"fixture","input":"second","previous_response_id":first_id(&first)}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(second["previous_response_id"], first["id"]);
+        assert_eq!(second["status"], "completed");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
@@ -2440,8 +3655,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn instructions_cannot_be_resent_on_a_chain() {
-        let (rec, _) = recorder();
+    async fn identical_instructions_replay_a_chain_and_edited_ones_do_not() {
+        let (rec, lengths) = recorder();
         let router = router_entries(rec, 8);
         let first = json_body(
             post_to(
@@ -2451,15 +3666,31 @@ mod tests {
             .await,
         )
         .await;
+        // The SDK shape: the same instructions on every turn. Accepted, and the prompt the engine
+        // sees still carries ONE system turn — the prefix hit the chain exists to get survives.
         let response = post_to(
             &router,
             json!({"model":"fixture","input":"two","previous_response_id":first_id(&first),
                    "instructions":"be brief"}),
         )
         .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["status"], "completed");
+        assert_eq!(*lengths.lock().unwrap(), vec![2, 4]);
+
+        let response = post_to(
+            &router,
+            json!({"model":"fixture","input":"three","previous_response_id":first_id(&first),
+                   "instructions":"be verbose"}),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = json_body(response).await;
         assert_eq!(body["error"]["param"], "instructions");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("do not match the system prefix"));
     }
 
     // -- stored-response REST surface -------------------------------------------------------

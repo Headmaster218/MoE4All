@@ -1261,11 +1261,7 @@ mod tests {
 
         pager.enable_slot(0);
         assert_disabled_mask_matches(&pager, &disabled, false);
-        assert_disabled_mask_matches(
-            &pager,
-            &[false, false, false, false, false, true],
-            true,
-        );
+        assert_disabled_mask_matches(&pager, &[false, false, false, false, false, true], true);
         pager.enable_slot(5);
         assert_disabled_mask_matches(&pager, &enabled, true);
         assert_disabled_mask_matches(&pager, &disabled, false);

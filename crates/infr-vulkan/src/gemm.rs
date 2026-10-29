@@ -81,6 +81,32 @@ pub(crate) fn native_mrow_kernel_name(dtype: infr_core::DType) -> Option<&'stati
 /// `res`: production dispatches fused-residual GEMVs too (the decode Linear+Add fusion,
 /// [`crate::recorder::Recorder::linear_add_native`]), so both arms are load-bearing. `None` for a
 /// dtype without a native GEMV build.
+/// Expand a NARROW-output native weight into f32 scratch (`weight_f32.comp`) so the f32r
+/// mrow8/vec4 GEMV can contract it — the formats Qwen3.8-Flash-Next's narrow inject / ssm_alpha /
+/// ssm_beta tensors ship in. See the shader's doc for why this is exact.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn weight_f32_build_spv(
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
+        }};
+    }
+    match dtype {
+        Q8_0 => v!("weight_f32_q8_0"),
+        Bf16 => v!("weight_f32_bf16"),
+        _ => None,
+    }
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_streamed_build_spv(
     dtype: infr_core::DType,
@@ -1967,6 +1993,7 @@ pub(crate) fn native_gemm_warp_cm8_build_spv(
 pub(crate) fn native_gemm_warp_ag_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
     Some(match dtype {
+        Bf16 => "native_gemm_warp_bf16_ag",
         Iq4Nl => "native_gemm_warp_iq4nl_ag",
         Iq4Xs => "native_gemm_warp_iq4xs_ag",
         Q2K => "native_gemm_warp_q2k_ag",
@@ -1987,6 +2014,7 @@ pub(crate) fn native_gemm_warp_n128_ag_kernel_name(
 ) -> Option<&'static str> {
     use infr_core::DType::*;
     Some(match dtype {
+        Bf16 => "native_gemm_warp_bf16_n128_ag",
         Iq4Nl => "native_gemm_warp_iq4nl_n128_ag",
         Iq4Xs => "native_gemm_warp_iq4xs_n128_ag",
         Q2K => "native_gemm_warp_q2k_n128_ag",
@@ -2000,12 +2028,14 @@ pub(crate) fn native_gemm_warp_n128_ag_kernel_name(
     })
 }
 
-/// BN=64/BK=64 A_GLOBAL warptile for Q8_0 output widths divisible by 64 but not 128.
+/// BN=64/BK=64 A_GLOBAL warptile for output widths divisible by 64 but not 128.
 /// This keeps the logical output width while avoiding the legacy BN=64/BK=32 fallback.
+/// Bf16 is Qwen3.8-Flash-Next's HC-projection width (320x10240 / 10240x320 at prefill m).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_warp_n64_ag_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
     match dtype {
         infr_core::DType::Q8_0 => Some("native_gemm_warp_q8_0_n64_ag"),
+        infr_core::DType::Bf16 => Some("native_gemm_warp_bf16_n64_ag"),
         _ => None,
     }
 }
@@ -2043,6 +2073,31 @@ pub(crate) fn native_gemm_warp_n128_ag_bm32_kernel_name(
         Q5K => "native_gemm_warp_q5k_n128_ag_bm32",
         Q6K => "native_gemm_warp_q6k_n128_ag_bm32",
         Q8_0 => "native_gemm_warp_q8_0_n128_ag_bm32",
+        _ => return None,
+    })
+}
+
+/// BM=128 row-tile variant of [`native_gemm_warp_n128_ag_kernel_name`]: NARROW_N + A_GLOBAL with
+/// the row tile doubled (WM 32→64, 4×4 accumulator frags per warp — more B-frag reuse per LDS
+/// load). `kernel-bench`'s `t128sb` sweep measured 52.9 → 72.3 TF on 2048x4096x14336 and 53.4 →
+/// 63.0 on 2048x4096x4096, but a LOSS at m=128 (4.9 vs 3.8 TF), so the recorder only takes this
+/// tile at measured-large m with wide k/n — see `dense_bm128_applies`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_warp_n128_ag_bm128_kernel_name(
+    dtype: infr_core::DType,
+) -> Option<&'static str> {
+    use infr_core::DType::*;
+    Some(match dtype {
+        Bf16 => "native_gemm_warp_bf16_n128_ag_bm128",
+        Iq4Nl => "native_gemm_warp_iq4nl_n128_ag_bm128",
+        Iq4Xs => "native_gemm_warp_iq4xs_n128_ag_bm128",
+        Q2K => "native_gemm_warp_q2k_n128_ag_bm128",
+        Q3K => "native_gemm_warp_q3k_n128_ag_bm128",
+        Q4_0 => "native_gemm_warp_q4_0_n128_ag_bm128",
+        Q4K => "native_gemm_warp_q4k_n128_ag_bm128",
+        Q5K => "native_gemm_warp_q5k_n128_ag_bm128",
+        Q6K => "native_gemm_warp_q6k_n128_ag_bm128",
+        Q8_0 => "native_gemm_warp_q8_0_n128_ag_bm128",
         _ => return None,
     })
 }
@@ -4274,10 +4329,12 @@ pub(crate) fn gpu_owned_prepare_topk_fused_two_row_overlap_spv() -> &'static [u3
 
 pub(crate) fn gpu_owned_prepare_topk_fused_many_row_spv(overlap: bool) -> &'static [u32] {
     const SERIAL: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"), "/gpu_owned_prepare_topk_fused_many_row.spv"
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_topk_fused_many_row.spv"
     ));
     const OVERLAP: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"), "/gpu_owned_prepare_topk_fused_many_row_overlap.spv"
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_topk_fused_many_row_overlap.spv"
     ));
     static SERIAL_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
     static OVERLAP_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
@@ -4291,7 +4348,8 @@ pub(crate) fn gpu_owned_prepare_topk_fused_many_row_spv(overlap: bool) -> &'stat
 #[cfg(test)]
 pub(crate) fn gpu_owned_topk_many_row_classify_probe_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"), "/gpu_owned_topk_many_row_classify_probe.spv"
+        env!("OUT_DIR"),
+        "/gpu_owned_topk_many_row_classify_probe.spv"
     ));
     static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
     WORDS.get_or_init(|| spv_words(BYTES))
@@ -4367,9 +4425,18 @@ pub(crate) fn gpu_owned_miss_gu_tree64_spv(
     macro_rules! variant {
         ($file:literal) => {{
             static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
-            Some(WORDS.get_or_init(|| spv_words(include_bytes!(concat!(
-                env!("OUT_DIR"), "/gpu_owned_miss_gu_tree64_", $file, ".spv"
-            )))).as_slice())
+            Some(
+                WORDS
+                    .get_or_init(|| {
+                        spv_words(include_bytes!(concat!(
+                            env!("OUT_DIR"),
+                            "/gpu_owned_miss_gu_tree64_",
+                            $file,
+                            ".spv"
+                        )))
+                    })
+                    .as_slice(),
+            )
         }};
     }
     #[cfg(not(test))]
@@ -4444,9 +4511,18 @@ pub(crate) fn gpu_owned_miss_gu_tree64_grid_buffer_spv(
     macro_rules! variant {
         ($file:literal) => {{
             static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
-            Some(WORDS.get_or_init(|| spv_words(include_bytes!(concat!(
-                env!("OUT_DIR"), "/gpu_owned_miss_gu_tree64_grid_buffer_", $file, ".spv"
-            )))).as_slice())
+            Some(
+                WORDS
+                    .get_or_init(|| {
+                        spv_words(include_bytes!(concat!(
+                            env!("OUT_DIR"),
+                            "/gpu_owned_miss_gu_tree64_grid_buffer_",
+                            $file,
+                            ".spv"
+                        )))
+                    })
+                    .as_slice(),
+            )
         }};
     }
     match (dtype, local, nr) {
@@ -5385,6 +5461,55 @@ mod tests {
             native_mrow_spv(infr_core::DType::Q8_0, 3).unwrap().0,
             "native_mrow_q8_0"
         );
+    }
+
+    /// Qwen3.8-Flash-Next ships its hyper-connected projections (bf16 `10240x320` / `320x10240`)
+    /// and its MoE router (`ffn_gate_inp`, bf16 `2560x512`) as Bf16. Those are the prefill shapes,
+    /// and the `lin_a16` scratch gate in `adapter_stages::linear_scratch_requests` asks the WIDE
+    /// table even when `n%128!=0` and dispatch later uses the `_n128_ag` / `_n64_ag` twin. So the
+    /// three must stay in lockstep: with Bf16 absent from the wide table, `use_ag` is false, no
+    /// `lin_a16` is allocated, and every bf16 prefill GEMM silently drops to the 64x64
+    /// `native_gemm_bf16` fallback — measured at 2.6 ms per `10240x320` dispatch vs 0.85 ms tiled.
+    #[test]
+    fn bf16_owns_the_whole_ag_family() {
+        use infr_core::DType::Bf16;
+        assert_eq!(
+            native_gemm_warp_ag_kernel_name(Bf16),
+            Some("native_gemm_warp_bf16_ag")
+        );
+        assert_eq!(
+            native_gemm_warp_n128_ag_kernel_name(Bf16),
+            Some("native_gemm_warp_bf16_n128_ag")
+        );
+        assert_eq!(
+            native_gemm_warp_n64_ag_kernel_name(Bf16),
+            Some("native_gemm_warp_bf16_n64_ag")
+        );
+        // The `n%128!=0` dispatch path must find a tile for every dtype the wide table claims:
+        // a wide-only dtype would allocate `lin_a16` and then have no kernel to run with it.
+        for dt in [
+            infr_core::DType::Iq4Nl,
+            infr_core::DType::Iq4Xs,
+            infr_core::DType::Q2K,
+            infr_core::DType::Q3K,
+            infr_core::DType::Q4_0,
+            infr_core::DType::Q4K,
+            infr_core::DType::Q5K,
+            infr_core::DType::Q6K,
+            infr_core::DType::Q8_0,
+            Bf16,
+        ] {
+            if native_gemm_warp_ag_kernel_name(dt).is_some() {
+                assert!(
+                    native_gemm_warp_n128_ag_kernel_name(dt).is_some(),
+                    "{dt:?} has a wide A_GLOBAL tile but no NARROW_N twin"
+                );
+            }
+        }
+        // Split-K and the small-M row tiles are deliberately NOT extended to Bf16 — see the
+        // `dense_small_m_row_tile_bench` note on `native_gemm_warp_sk_ag_kernel_name`.
+        assert_eq!(native_gemm_warp_sk_ag_kernel_name(Bf16), None);
+        assert_eq!(native_gemm_warp_n128_ag_bm32_kernel_name(Bf16), None);
     }
 
     /// B7 slice 3a — the decode specialization's reduction must be a PLAIN subgroup reduce, never

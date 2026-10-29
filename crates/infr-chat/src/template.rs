@@ -394,6 +394,24 @@ fn prepend_system_instruction(messages: &mut Vec<Value>, instruction: &str) {
     );
 }
 
+/// Qwen3.8's shipped template validates `reasoning_effort` ITSELF and accepts only
+/// `low | medium | xhigh` ("Unexpected reasoning effort … Supported types are xhigh (default),
+/// medium, and low"). OpenAI's `high` — the level most clients send by default — and `max` have no
+/// local rung, so they snap to the nearest supported one (xhigh) instead of failing every render.
+fn adapt_qwen4_reasoning_effort(
+    architecture: Option<&str>,
+    template_supports_effort: bool,
+    options: &mut ChatTemplateOptions,
+) {
+    if !template_supports_effort || architecture != Some("qwen4exp") {
+        return;
+    }
+    options.reasoning_effort = match options.reasoning_effort {
+        Some(ReasoningEffort::High | ReasoningEffort::Max) => Some(ReasoningEffort::Xhigh),
+        other => other,
+    };
+}
+
 fn adapt_qwen35_reasoning_effort(
     architecture: Option<&str>,
     template_supports_effort: bool,
@@ -455,6 +473,11 @@ fn render_core(
         gguf.metadata().str("general.architecture"),
         template_env.supports_effort,
         &mut msgs,
+        &mut options,
+    );
+    adapt_qwen4_reasoning_effort(
+        gguf.metadata().str("general.architecture"),
+        template_env.supports_effort,
         &mut options,
     );
     match render_template_with_options(
@@ -571,6 +594,37 @@ pub fn render_chat_user(
 #[cfg(test)]
 mod template_tests {
     use super::*;
+
+    /// The Qwen3.8 template accepts only low/medium/xhigh; OpenAI's `high` and `max` must reach it
+    /// as xhigh or every such request fails to render (measured: `reasoning.effort: "high"` on
+    /// Qwen3.8-Flash-Next returned 400 "Unexpected reasoning effort high").
+    #[test]
+    fn qwen4_effort_snaps_openai_levels_onto_the_template_set() {
+        for (requested, expected) in [
+            (ReasoningEffort::High, Some(ReasoningEffort::Xhigh)),
+            (ReasoningEffort::Max, Some(ReasoningEffort::Xhigh)),
+            (ReasoningEffort::Medium, Some(ReasoningEffort::Medium)),
+            (ReasoningEffort::Low, Some(ReasoningEffort::Low)),
+            (ReasoningEffort::Xhigh, Some(ReasoningEffort::Xhigh)),
+        ] {
+            let mut options = ChatTemplateOptions {
+                reasoning_effort: Some(requested),
+                ..Default::default()
+            };
+            adapt_qwen4_reasoning_effort(Some("qwen4exp"), true, &mut options);
+            assert_eq!(options.reasoning_effort, expected, "{requested:?}");
+        }
+        // A template without the variable keeps the request for the qwen35/other adapters to see.
+        let mut options = ChatTemplateOptions {
+            reasoning_effort: Some(ReasoningEffort::High),
+            ..Default::default()
+        };
+        adapt_qwen4_reasoning_effort(Some("qwen4exp"), false, &mut options);
+        assert_eq!(options.reasoning_effort, Some(ReasoningEffort::High));
+        // Another architecture is not touched.
+        adapt_qwen4_reasoning_effort(Some("llama"), true, &mut options);
+        assert_eq!(options.reasoning_effort, Some(ReasoningEffort::High));
+    }
 
     #[test]
     fn qwen35_prompt_effort_is_model_scoped_and_preserves_defaults() {

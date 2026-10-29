@@ -20,16 +20,12 @@ fn staged_binding_setup_reads_retained_scratch_without_switching_or_growing() {
         arena.retained_setup_scratch(&vec![None, Some(24)]).unwrap(),
         &arena.parked_scratch[0].scratch
     ));
-    assert!(
-        arena
-            .retained_setup_scratch(&vec![None, Some(33)])
-            .is_none()
-    );
-    assert!(
-        arena
-            .retained_setup_scratch(&vec![Some(16), Some(16)])
-            .is_none()
-    );
+    assert!(arena
+        .retained_setup_scratch(&vec![None, Some(33)])
+        .is_none());
+    assert!(arena
+        .retained_setup_scratch(&vec![Some(16), Some(16)])
+        .is_none());
     assert_eq!(arena.scratch_topology, [true]);
     assert_eq!(arena.parked_scratch.len(), 1);
     assert_eq!(arena.parked_scratch[0].topology, [false, true]);
@@ -68,15 +64,13 @@ struct TraceGuard;
 impl TraceGuard {
     fn begin(setup_failure: Option<(usize, bool)>) -> Self {
         STAGED_ACTIVATION_TEST_STATE.with(|state| {
-            assert!(
-                state
-                    .replace(Some(StagedActivationTestState {
-                        events: Vec::new(),
-                        setup_failure,
-                        retirement_failure: None,
-                    }))
-                    .is_none()
-            );
+            assert!(state
+                .replace(Some(StagedActivationTestState {
+                    events: Vec::new(),
+                    setup_failure,
+                    retirement_failure: None,
+                }))
+                .is_none());
         });
         Self
     }
@@ -320,14 +314,12 @@ fn gpu_staged_following_prefix_precedes_next_snapshots_and_errors_drain_before_u
             ExecutionStage::new(&next_tail, &bindings),
         ];
         STAGED_FOLLOW_TEST_STATE.with(|state| {
-            assert!(
-                state
-                    .replace(Some(StagedFollowTestState {
-                        events: Vec::new(),
-                        failure,
-                    }))
-                    .is_none()
-            )
+            assert!(state
+                .replace(Some(StagedFollowTestState {
+                    events: Vec::new(),
+                    failure,
+                }))
+                .is_none())
         });
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             fixture.backend.execute_staged_lookahead(
@@ -345,13 +337,11 @@ fn gpu_staged_following_prefix_precedes_next_snapshots_and_errors_drain_before_u
             None => {
                 result.unwrap().unwrap();
             }
-            Some(false) => assert!(
-                result
-                    .unwrap()
-                    .unwrap_err()
-                    .to_string()
-                    .contains("post-activation snapshot error")
-            ),
+            Some(false) => assert!(result
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("post-activation snapshot error")),
             Some(true) => assert!(result.is_err()),
         }
         assert!(!fixture.backend.runtime_phase.is_poisoned());
@@ -431,17 +421,15 @@ fn gpu_staged_early_prefix_errors_cancel_and_unwind_drain_without_replay() {
         } else if mode == 4 {
             assert!(matches!(result.unwrap(), Err(Error::Aborted)));
         } else {
-            assert!(
-                result
-                    .unwrap()
-                    .unwrap_err()
-                    .to_string()
-                    .contains(if mode == 0 {
-                        "injected staged binding setup error"
-                    } else {
-                        "injected staged input-ready error"
-                    })
-            );
+            assert!(result
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains(if mode == 0 {
+                    "injected staged binding setup error"
+                } else {
+                    "injected staged input-ready error"
+                }));
         }
         let events = trace.events();
         assert_eq!(

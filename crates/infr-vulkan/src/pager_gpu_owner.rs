@@ -234,7 +234,9 @@ impl OwnedUploadClass {
     fn from_targets(has_bounded_sources: bool, targets: impl Iterator<Item = bool>) -> Self {
         let mut targets = targets.peekable();
         Self {
-            mapped: !has_bounded_sources && targets.peek().is_some() && targets.all(|mapped| mapped),
+            mapped: !has_bounded_sources
+                && targets.peek().is_some()
+                && targets.all(|mapped| mapped),
             no_imported_sources: std::sync::OnceLock::new(),
         }
     }

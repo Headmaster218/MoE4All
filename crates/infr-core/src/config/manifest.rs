@@ -377,6 +377,8 @@ knobs! {
     // `0` = response state OFF (the stateless 400 path), a VALUE like the two knobs above —
     // the env layer must not filter non-positive values. See `ServeCfg::response_store_entries`.
     "INFR_RESPONSE_STORE_ENTRIES" => "serve.response_store_entries", Int, Ignored, "64", migrated;
+    // Unset = memory-only store; the file is written only when the operator names one.
+    "INFR_RESPONSE_STORE_PATH" => "serve.response_store_path", Path, Ignored, "responses.json", migrated;
 
     // ── hub (§6.9) ───────────────────────────────────────────────────────────
     "INFR_HF_ENDPOINT" => "hub.endpoint", Text, Ignored, "https://hf-mirror.com", migrated;

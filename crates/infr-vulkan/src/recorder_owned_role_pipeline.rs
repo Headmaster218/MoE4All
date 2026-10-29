@@ -195,12 +195,7 @@ pub(crate) fn production_eligible(
     rows: usize,
     used: usize,
 ) -> bool {
-    enabled
-        && dtypes == [DType::Q5K; 2]
-        && rows == 1
-        && ne == 2048
-        && nff == 512
-        && used == 8
+    enabled && dtypes == [DType::Q5K; 2] && rows == 1 && ne == 2048 && nff == 512 && used == 8
 }
 
 /// Cheap admission before the adapter resolves candidate scratch or constructs a Request.
@@ -867,10 +862,8 @@ pub(super) mod contract {
     }
 
     pub(in crate::recorder) fn policy_enabled(value: Option<bool>) -> bool {
-        super::scoped_settings(
-            value.map(|enabled| enabled.then_some(super::DEFAULT_SETTINGS)),
-        )
-        .is_some()
+        super::scoped_settings(value.map(|enabled| enabled.then_some(super::DEFAULT_SETTINGS)))
+            .is_some()
     }
 
     pub(in crate::recorder) fn resolved_settings(

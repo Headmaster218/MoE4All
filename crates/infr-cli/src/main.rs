@@ -2079,7 +2079,11 @@ impl ThinkRender {
                 // lock (see `on_signal`'s doc); `tracing` allocates and locks.
                 print!("{t}");
             }
-            infr_engine::Delta::ToolCall { .. } => {}
+            // `infr run` shows the call it dispatches, not the JSON as it is written: the read-ahead
+            // deltas would only print the same arguments before the finished call.
+            infr_engine::Delta::ToolCall { .. }
+            | infr_engine::Delta::ToolCallBegin { .. }
+            | infr_engine::Delta::ToolCallArgs { .. } => {}
         }
     }
 }
@@ -2761,7 +2765,8 @@ fn metal_chat_model(
 /// primitive `infr run`/`bench` drive (persistent session ⇒ per-request suffix-only prefill), and
 /// streams through the same [`ChatStream`] splitter (reasoning/content/auto-parsed tool calls).
 /// Grammar-FORCED tool_choice builds an llguidance constraint and generates through
-/// `generate_constrained` (llama.cpp-parity reliability); auto/none stream through the parser.
+/// `generate_constrained` (llama.cpp-parity reliability), but its JSON body still goes through the
+/// same splitter, so the call's name and argument members stream progressively on both paths.
 /// SERIALISED: the backend is a `&mut`-only `ChatModel` with a single KV session, so concurrent
 /// requests take turns behind a `Mutex`. Used for CPU / Metal / diffusion-gemma, which have no
 /// multi-slot engine — `cmd_serve` pins those to `--parallel 1` so the queueing is explicit rather
@@ -3175,10 +3180,66 @@ fn run_chat(
             .request_ctx(request_sampling(params, be.default_presence_penalty()))
             .with_external_abort(cancel.clone())
             .with_progress(progress);
+        // Structured output: ONE JSON-schema constraint over the WHOLE reply, applied from the
+        // first token. The server refuses `tools` + structured output, so this never competes
+        // with the forced-tool path below, and there is NO unconstrained fallback: a constraint
+        // that cannot be built or completed is reported to the client, never downgraded to free
+        // text (the server re-validates the finished text as a second line of defence).
+        if let Some(schema) = params.response_format.schema() {
+            if !images.is_empty() {
+                anyhow::bail!("structured output is not supported together with image inputs yet");
+            }
+            if infr_engine::prompt_prefills_think(&prompt) {
+                return Err(anyhow::Error::new(infr_core::error::InvalidInput(
+                    "structured output is enforced from the first token, but this model's \
+                     template prefills a thinking block; disable thinking \
+                     (chat_template_kwargs.enable_thinking=false / INFR_NO_THINK=1) or use \
+                     plain text"
+                        .to_string(),
+                )));
+            }
+            let mut constraint = be.renderer().output_constraint(&schema).map_err(|error| {
+                anyhow::Error::new(infr_core::error::InvalidInput(format!(
+                    "response_format json_schema cannot be compiled: {error}"
+                )))
+            })?;
+            let mut stream = infr_engine::ChatStream::new(false);
+            let mut od = |delta: infr_engine::Delta| on_delta(delta);
+            let stats = be.generate(
+                &prompt,
+                checkpoint_prefixes,
+                max_new,
+                Some(&mut constraint),
+                &req,
+                &mut |piece: &str| {
+                    stream.push(piece, &mut od);
+                    // Client disconnected (server latched `cancel`): stop this decode promptly.
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        req.abort();
+                    }
+                },
+            )?;
+            stream.finish(&mut od);
+            return Ok(infr_server::ChatOutcome {
+                // Truncation is the one case the grammar cannot rescue: the server turns an
+                // unparsable body into an explicit error rather than a half-JSON "success".
+                finish: if stats.n_gen >= max_new {
+                    infr_server::Finish::Length
+                } else {
+                    infr_server::Finish::Stop
+                },
+                prompt_tokens: stats.n_prompt.saturating_add(stats.n_cached) as u32,
+                cached_prompt_tokens: stats.n_cached as u32,
+                completion_tokens: stats.n_gen as u32,
+            });
+        }
         // Forced tool_choice ("required"/named): grammar-constrain the call body (the same
         // llguidance machinery as the bespoke path — grammar::constrained_step runs inside the
-        // seam decode). Prime the assistant turn with the <tool_call> opener and parse the
-        // constrained JSON; on any failure fall back to unconstrained (mirrors LlamaGenerator).
+        // seam decode). Prime the assistant turn with the <tool_call> opener and read the
+        // constrained JSON through the SAME splitter the unconstrained path uses: the primed
+        // opener makes it a bare-JSON call, so the name and every completed argument member
+        // stream out while the call is still generating instead of arriving as one frame at the
+        // end. On any failure fall back to unconstrained (mirrors LlamaGenerator).
         let forced_constraint = be.renderer().tool_constraint(tools, tool_choice)?;
         if !images.is_empty() && forced_constraint.is_some() {
             anyhow::bail!("forced tool calls are not supported together with image inputs yet");
@@ -3186,63 +3247,97 @@ fn run_chat(
         if let Some(mut constraint) = forced_constraint {
             let primed = format!("{prompt}<tool_call>\n");
             let mut body = String::new();
-            let mut tokens = (0u32, 0u32);
-            let mut cached_tokens = 0u32;
-            let emitted = match be.generate(
-                &primed,
-                checkpoint_prefixes,
-                max_new,
-                Some(&mut constraint),
-                &req,
-                &mut |p: &str| {
-                    body.push_str(p);
-                    // Client disconnected (server latched `cancel`): stop this constrained decode.
-                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                        req.abort();
+            let mut stream = infr_engine::ChatStream::new(true);
+            // What the client already holds. Once a call's name has gone out the unconstrained
+            // retry below would open a SECOND call on top of it, so the fallback is only allowed
+            // while nothing has been announced.
+            let mut began = false;
+            let mut calls = 0usize;
+            let (gen_res, is_call) = {
+                let mut od = |d: infr_engine::Delta| {
+                    match &d {
+                        infr_engine::Delta::ToolCallBegin { .. } => began = true,
+                        infr_engine::Delta::ToolCall { .. } => calls += 1,
+                        _ => {}
                     }
-                },
-            ) {
+                    on_delta(d);
+                };
+                let res = be.generate(
+                    &primed,
+                    checkpoint_prefixes,
+                    max_new,
+                    Some(&mut constraint),
+                    &req,
+                    &mut |p: &str| {
+                        body.push_str(p);
+                        stream.push(p, &mut od);
+                        // Client disconnected (server latched `cancel`): stop this constrained decode.
+                        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            req.abort();
+                        }
+                    },
+                );
+                // Only finish the splitter when the constrained body really is a call: a truncated
+                // body would otherwise be re-emitted as content on top of the fragments already out.
+                let complete = body.trim().trim_end_matches("</tool_call>").trim();
+                let is_call = res.is_ok()
+                    && serde_json::from_str::<serde_json::Value>(complete)
+                        .ok()
+                        .is_some_and(|v| v.get("name").and_then(|n| n.as_str()).is_some());
+                if is_call {
+                    // Flush held-back tails and dispatch the authoritative finished call, whose
+                    // arguments the streamed fragments are a prefix of.
+                    stream.finish(&mut od);
+                }
+                (res, is_call)
+            };
+            match gen_res {
                 Ok(gstats) => {
-                    tokens = (
-                        gstats.n_prompt.saturating_add(gstats.n_cached) as u32,
-                        gstats.n_gen as u32,
-                    );
-                    cached_tokens = gstats.n_cached as u32;
-                    let body = body.trim().trim_end_matches("</tool_call>").trim();
-                    match serde_json::from_str::<serde_json::Value>(body) {
-                        Ok(val) => val.get("name").and_then(|v| v.as_str()).map(|name| {
-                            let arguments = val
-                                .get("arguments")
-                                .cloned()
-                                .unwrap_or(serde_json::json!({}));
-                            on_delta(infr_engine::Delta::ToolCall {
-                                name: name.to_string(),
-                                arguments: serde_json::to_string(&arguments)
-                                    .unwrap_or_else(|_| "{}".to_string()),
-                            });
-                        }),
-                        Err(_) => None,
+                    if is_call && calls > 0 {
+                        return Ok(infr_server::ChatOutcome {
+                            finish: infr_server::Finish::ToolCalls,
+                            prompt_tokens: gstats.n_prompt.saturating_add(gstats.n_cached) as u32,
+                            cached_prompt_tokens: gstats.n_cached as u32,
+                            completion_tokens: gstats.n_gen as u32,
+                        });
                     }
-                    .is_some()
+                    if began && cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        // The decode was stopped from outside (client gone or deadline): nobody is
+                        // waiting for a retry, and the server already decides how to report an
+                        // aborted request, so hand back what ran instead of inventing an error.
+                        return Ok(infr_server::ChatOutcome {
+                            finish: if gstats.n_gen >= max_new {
+                                infr_server::Finish::Length
+                            } else {
+                                infr_server::Finish::Stop
+                            },
+                            prompt_tokens: gstats.n_prompt.saturating_add(gstats.n_cached) as u32,
+                            cached_prompt_tokens: gstats.n_cached as u32,
+                            completion_tokens: gstats.n_gen as u32,
+                        });
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("[tools] seam grammar-constrained generation failed ({e})");
-                    false
+                    if began {
+                        return Err(e);
+                    }
                 }
-            };
-            if emitted {
-                return Ok(infr_server::ChatOutcome {
-                    finish: infr_server::Finish::ToolCalls,
-                    prompt_tokens: tokens.0,
-                    cached_prompt_tokens: cached_tokens,
-                    completion_tokens: tokens.1,
-                });
             }
-            // The constrained attempt advanced the serialised session past the primed `<tool_call>`
-            // opener + the (unparseable) body. Reset it so the unconstrained retry below re-prefills
-            // the clean `prompt` from scratch, instead of inheriting that divergent KV state and
-            // relying on the seam's common-prefix rewind to unwind it. No-op on the multi-slot
-            // engine (each request already gets a fresh best-prefix slot).
+            if began {
+                // The client already holds this call's name (and whatever arguments streamed). A
+                // retry cannot start it over — it would append a second call's arguments to the
+                // first one — so stop and say why instead of emitting a duplicate.
+                anyhow::bail!(
+                    "forced tool call ended before its arguments were complete (max_tokens \
+                     reached?); refusing to retry unconstrained after streaming began"
+                );
+            }
+            // Nothing was announced, so the constrained attempt can be discarded. Reset the
+            // serialised session so the unconstrained retry below re-prefills the clean `prompt`
+            // from scratch, instead of inheriting that divergent KV state and relying on the seam's
+            // common-prefix rewind to unwind it. No-op on the multi-slot engine (each request
+            // already gets a fresh best-prefix slot).
             be.reset();
             tracing::warn!(
                 "[tools] forced tool call produced no parseable call; falling back to unconstrained"

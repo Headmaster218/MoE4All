@@ -178,7 +178,7 @@ infr run "$M" "hi" --set kv.type_k=q8_0 --set kv.type_v=q8_0
 
 **`[device]`** — 使用哪块 GPU（`dev`）、上下文大小（`ctx`）、预填充微批（`ubatch`、`ubatch_parallel`）、CPU `threads`，以及两个低层设备调节项（用于 iGPU 提交拆分器的 `submit_dispatches`，以及强制子组为 16 或 32 的 `subgroup_pref`）。
 
-`device.auto_profile` 可设为 `conservative`（默认）或 `aggressive`。未显式指定 RAM 预算或旧分页覆盖时，启动阶段将保守档的“当前可用 RAM - 3 GiB”、激进档的“总物理 RAM - 14 GiB”写入 `device.ram_budget`，之后按显式总进程预算路径处理。离散 GPU 两档的 Prefill ubatch 都从 4096 行开始，并可因显存放置不足而下调；并发 ubatch 未单独指定时继承最终值，iGPU 使用独立的小批默认值。
+`device.auto_profile` 可设为 `conservative`（默认）或 `aggressive`。未显式指定 RAM 预算或旧分页覆盖时，启动阶段将保守档的“当前可用 RAM - 3 GiB”、激进档的“总物理 RAM - 14 GiB”写入 `device.ram_budget`，之后按显式总进程预算路径处理。离散 GPU 两档的 Prefill ubatch 都从 5120 行开始（由 m 扫描的算力拐点与 Flash-Next pp30k 实测确定：5120 是仍能保住全部 4 条 prefill lane 的最高档），并可因显存放置不足自动下调；并发 ubatch 未单独指定时继承最终值，iGPU 使用独立的小批默认值。
 
 `device.vram_budget` / `INFR_VRAM_BUDGET` 限制后端的总设备内存占用：常驻权重、KV、运行时分配以及专家/稠密分页器都计入其中。`device.vram_reserve` / `INFR_VRAM_RESERVE` 还会在 Vulkan 内置的 256 MiB 安全保护之上额外保留相应的物理 VRAM。例如，`INFR_VRAM_BUDGET=23g` 和 `INFR_VRAM_RESERVE=512m` 表示严格的 23 GiB 进程上限加 512 MiB 额外物理余量。两者都未显式指定时，保守自动档在分配器 guard 外再留 768 MiB（合计约 1 GiB），激进档直接使用扣除 guard 后的设备当前可用量。任一显式值出现时走显式约束路径；统一 arena 仍以固定资源落地后的真实余量定容，物理分配失败时会缩小 arena 或下调 Ubatch 后重新探测。
 
@@ -219,17 +219,23 @@ infr run "$M" "hi" --set kv.type_k=q8_0 --set kv.type_v=q8_0
 
 如果你有旧脚本，有两项整合值得了解。逐算子性能剖析过去在各后端使用不同调节项（vulkan 使用 `INFR_PROF2`、cpu 使用 `INFR_PROF_OPS`、metal 使用 `INFR_METAL_PROFILE`），现在统一为 `ops`。主机端阶段计时过去也有五个调节项，每条管线一个（`INFR_PROF`、`INFR_PROF_DEC`、`INFR_PROF_PF`、`INFR_MTP_TIME`、`INFR_DIFFUSION_TIME`），现在统一为 `stages`。旧拼写已被彻底移除，不再读取。
 
-**`[serve]`** — `api_key`（Bearer 令牌；**空**值表示不鉴权，它限制 `/v1/chat/completions`、`/v1/responses`、`/v1/embeddings` 和 `/v1/models`，但从不限制 `/health`）、`max_tokens_cap`、`request_timeout_secs`（单个请求以秒计的实际时钟期限；默认值 `0` 表示无期限。期限会截断本来合法但较慢的回复，因此为选择启用）以及 `stats_interval_secs`（`INFR_SERVE_STATS_SECS`，控制服务器记录汇总吞吐量和每请求进度的频率；默认 `5`，`0` 关闭周期性行）。`shutdown_file`（`INFR_SHUTDOWN_FILE`）是可选的监督器 IPC 路径：创建该文件会请求与 SIGTERM 相同的优雅排空，包括模型加载期间。`embedding_runner`（`INFR_EMBEDDING_RUNNER`）可选择受管理的 llama-server 可执行文件；否则 INFR 会从自身目录、`PATH` 或 LM Studio 中发现兼容运行器。`response_store_entries`（`INFR_RESPONSE_STORE_ENTRIES`）是 `/v1/responses` 服务端状态的 LRU 上限；默认 `0` 表示完全关闭，见下。每请求采样不在此处，仍保留在请求中。
+**`[serve]`** — `api_key`（Bearer 令牌；**空**值表示不鉴权，它限制 `/v1/chat/completions`、`/v1/responses`、`/v1/embeddings` 和 `/v1/models`，但从不限制 `/health`）、`max_tokens_cap`、`request_timeout_secs`（单个请求以秒计的实际时钟期限；默认值 `0` 表示无期限。期限会截断本来合法但较慢的回复，因此为选择启用）以及 `stats_interval_secs`（`INFR_SERVE_STATS_SECS`，控制服务器记录汇总吞吐量和每请求进度的频率；默认 `5`，`0` 关闭周期性行）。`shutdown_file`（`INFR_SHUTDOWN_FILE`）是可选的监督器 IPC 路径：创建该文件会请求与 SIGTERM 相同的优雅排空，包括模型加载期间。`embedding_runner`（`INFR_EMBEDDING_RUNNER`）可选择受管理的 llama-server 可执行文件；否则 INFR 会从自身目录、`PATH` 或 LM Studio 中发现兼容运行器。`response_store_entries`（`INFR_RESPONSE_STORE_ENTRIES`）是 `/v1/responses` 服务端状态的 LRU 上限；默认 `0` 表示完全关闭。`response_store_path`（`INFR_RESPONSE_STORE_PATH`）把这份状态镜像成一个 JSON 文件，使 `previous_response_id` 链在重启后仍然有效；不设（默认）则只留在进程内存里，见下。每请求采样不在此处，仍保留在请求中。
 
 汇总 `serve stats` 行仅在**有活动时**输出：无事件的区间不输出任何内容，因此空闲服务器会留下干净日志，且不会出现可能被误认为负载的心跳。它的 `prefill_tps`/`decode_tps` 是整个服务器的模型 token 数除以该区间的实际时钟时间，而非累计值。每个活跃请求还会在完成预填充块时及解码期间输出受限频率的 `request progress` 行。它报告精确的模型 token `context_tokens/context_limit`、未缓存预填充进度、缓存前缀、已生成 token（包含推理）和请求本地速率。即使禁用周期性行，阶段变化和 `request done` 仍会记录。请求日志**仅包含计数，绝不包含提示词文本**。
 
 成功的非流式响应和流式响应的终止完成帧，均包含权威的 `usage` 及 llama.cpp 兼容的 `timings` 对象。`timings.context_n` 是完整提示词加补全深度，`context_limit` 是 KV 槽位容量，`cached_n` 将复用的提示词 token 与实际评估的 `prompt_n` token 区分开来。流式指标无条件输出，因此未发送 `stream_options.include_usage` 的客户端不会静默记录零 token。
 
-`POST /v1/responses` 复用相同的模型调度与请求上限；支持文本消息、重放的 function call/output、自定义 function tools，以及 `stream=true` 的 typed SSE。启用视觉模型及 projector 时，`input_image` 用 base64 `data:` URI。与存储无关、始终返回 400 的语义有：文件输入（`input_file`）、`file_id` 与远程图片 URL、hosted tools、结构化输出模式、`truncation="auto"`、`background`、`parallel_tool_calls=false`、除 `reasoning.encrypted_content` 之外的 `include`，以及任何未被识别的请求字段。错误体的 `error.param` 指向客户端实际发送的那个字段；无法归到单一字段时记为 `request`（未识别字段），`GET`/`DELETE /v1/responses/{id}` 这类路径参数则记为 `response_id`。
+`POST /v1/responses` 复用相同的模型调度与请求上限；支持文本消息、重放的 function call/output、自定义 function tools，以及 `stream=true` 的 typed SSE。启用视觉模型及 projector 时，`input_image` 用 base64 `data:` URI。与存储无关、始终返回 400 的语义有：文件输入（`input_file`）、`file_id` 与远程图片 URL、hosted tools、结构化输出模式、`truncation="auto"`、`background`、除 `reasoning.encrypted_content` 之外的 `include`，以及任何未被识别的请求字段。`parallel_tool_calls=false` 已被接受：解码器没有并行开关，模型仍可能给出多个调用，因此多余的调用会被丢掉，并在响应的 `warnings` 里说明丢掉了几个——静默少给调用会让 agent 循环永远等一个没人问过的结果。错误体的 `error.param` 指向客户端实际发送的那个字段；无法归到单一字段时记为 `request`（未识别字段），`GET`/`DELETE /v1/responses/{id}` 这类路径参数则记为 `response_id`。
+
+链式请求上重发 `instructions` 是允许的，只要它与链上已经存储的系统前缀逐字相同（SDK 每轮都重发同一份提示词的形状）；改动过的、或者链上根本没有系统前缀却带来了新 `instructions` 的请求，会以 `param="instructions"` 报 400，而不是悄悄多插一个 system 轮次、把 KV 前缀打断。
 
 `serve.response_store_entries`（默认 `0`）决定服务端是否保存对话状态。为 `0` 时契约是无状态的：多轮请求由客户端在 `input` 中重放此前项目，而 `previous_response_id`、`conversation`、`store=true` 和 `item_reference` 输入条目一律返回 400 并提示开启该配置。设为正数后，`store=true`（此时 `store` 的默认值也变为 `true`，与 OpenAI 一致）的完成与截断响应会连同其原始信封与本次提示条目一起进入 LRU，于是 `previous_response_id` 链、`conversation` 游标、`{"type":"item_reference","id":...}` 输入条目，以及 `GET /v1/responses`（列表）、`GET|DELETE /v1/responses/{response_id}`、`GET /v1/responses/{response_id}/input_items`、`POST /v1/responses/{response_id}/cancel` 都可用；列表与 `input_items` 接受 `limit`（默认 20，上限 100）和 `order`（`asc`/`desc`）。
 
-链式重放之所以便宜，是因为它把存储的历史原样拼回提示词，重建出与上一轮完全相同的 token 前缀，分页 KV 的 radix tree 自己就会命中它；这个存储只保存 DTO 与 JSON，从不固定或引用 KV 页。状态是进程内且有界的：被淘汰或随重启消失的 id，之后再被引用会得到明确的 400（`no stored response ...`），绝不静默降级成空上下文；`conversation` 配 `store=false` 同样直接 400，因为未存储的轮次无法推进下一轮要读的游标。`POST .../cancel` 对本服务器永远是 400（`param="background"`）：生成是同步的，一个响应在被赋予 id 时已经到达终态，要停止生成就断开这条流。
+链式重放之所以便宜，是因为它把存储的历史原样拼回提示词，重建出与上一轮完全相同的 token 前缀，分页 KV 的 radix tree 自己就会命中它；这个存储只保存 DTO 与 JSON，从不固定或引用 KV 页。状态是有界的：被淘汰的 id 之后再被引用会得到明确的 400（`no stored response ...`），绝不静默降级成空上下文；`conversation` 配 `store=false` 同样直接 400，因为未存储的轮次无法推进下一轮要读的游标。`POST .../cancel` 对本服务器永远是 400（`param="background"`）：生成是同步的，一个响应在被赋予 id 时已经到达终态，要停止生成就断开这条流。
+
+默认状态下这份状态随进程消失，重启后旧 id 一样是明确的 400。需要跨重启的链就设 `serve.response_store_path`：启动时加载，此后每次改动 LRU 都整体重写（先写 `<path>.tmp` 再 rename，读者看不到半个文件），加载时按 `last_used` 顺序套用上限、丢掉超出窗口的旧轮次。文件是**明文**的——每个保存的提示词和回复都在里面——所以默认不写盘；路径为空串等于不设。文件缺失视为空库开始，版本号不是本构建读取的 `1`、或内容无法解析，则**拒绝启动**而不是空库启动：后者会让所有已存 id 看起来像丢了，而数据其实还在盘上。`response_store_entries=0` 时该路径被忽略。
+
+`include:["reasoning.encrypted_content"]` 也已兑现，但它不是加密：推理条目上的 `encrypted_content` 是一个指向本存储的不透明句柄（`rehs_<response_id>`），客户端把它原样带回 `input` 时，服务端据此重放那一轮的推理文本。因此它要求 `store=true`（否则 400，提示先开启服务端状态），句柄的生命周期就是那一轮在 LRU 里的生命周期；本服务器从未签发过的句柄，或指向已被淘汰/重启前那一轮的句柄，都会以明确的 400 拒绝。仍带可读 `summary` 的推理条目照旧可以无状态重放。
 
 Responses API 只接受 plain text 与默认 `text.verbosity="medium"`；`low`/`high` 不支持。`reasoning.effort="minimal"` 在模板支持时近似映射为本地 `low`。本地 backend 没有独立的 hidden reasoning token 计量，因此 `reasoning_tokens` 为 0，外显思考内容计入 `output_tokens`。流式响应使用 `Cache-Control: no-store` 和 `X-Accel-Buffering: no`；生成在响应创建后失败时发出 typed `response.failed`。这些 HTTP 缓存头不会关闭模型 KV prefix cache。
 

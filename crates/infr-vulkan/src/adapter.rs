@@ -6,30 +6,26 @@
 use crate::linear::{
     native_dense_supported, native_id_paged_kernel_name, native_idm_paged_kernel_name,
 };
-use crate::recorder::{QSA_TOPK_PARALLEL_MIN_BLOCKS, QSA_TOPK_PARALLEL_WORK_BYTES, Recorder};
-use crate::{VulkanBackend, be};
+use crate::recorder::{Recorder, QSA_TOPK_PARALLEL_MIN_BLOCKS, QSA_TOPK_PARALLEL_WORK_BYTES};
+use crate::{be, VulkanBackend};
 use infr_core::backend::{Bindings, Buffer, BufferUsage, Plan};
 use infr_core::config::VulkanCfg;
 use infr_core::error::{Error, Result};
 use infr_core::graph::{
-    Activation, AttnMask, Dsv4CacheFormat, Graph, MoePrefetchHint, Op, QSA_MAX_TOP_BLOCKS,
-    SequenceSpan, TensorKind,
+    Activation, AttnMask, Dsv4CacheFormat, Graph, MoePrefetchHint, Op, SequenceSpan, TensorKind,
+    QSA_MAX_TOP_BLOCKS,
 };
 use infr_core::shutdown::shutdown_requested;
 use infr_core::{Backend, TensorId};
 use std::collections::{HashMap, HashSet};
 use std::ops::Index;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 
 use crate::recorder::RecordedCmd;
 
 #[path = "adapter_prefix.rs"]
 mod command_prefix;
-#[path = "adapter_pure_mapped_coalesce.rs"]
-mod pure_mapped_coalesce;
-#[path = "adapter_qsa_workspace.rs"]
-mod qsa_workspace;
 #[cfg(test)]
 #[path = "adapter_copy_policy_tests.rs"]
 mod copy_policy_tests;
@@ -38,24 +34,28 @@ mod copy_policy_tests;
 mod deferred_prepare_tests;
 #[path = "adapter_verify_pair.rs"]
 mod pair_admission;
+#[path = "adapter_pure_mapped_coalesce.rs"]
+mod pure_mapped_coalesce;
+#[path = "adapter_qsa_workspace.rs"]
+mod qsa_workspace;
 #[cfg(test)]
 #[path = "adapter_resident_ahead_tests.rs"]
 mod resident_ahead_tests;
 #[cfg(test)]
 pub(crate) use resident_ahead_tests::promotion_isolation_tests::note as promotion_isolation_note;
 #[cfg(test)]
-#[path = "adapter_serial_copy_recovery_tests.rs"]
-mod serial_copy_recovery_tests;
-#[cfg(test)]
 #[path = "adapter_owned_role_pipeline_tests.rs"]
 mod owned_role_pipeline_tests;
+#[cfg(test)]
+#[path = "adapter_serial_copy_recovery_tests.rs"]
+mod serial_copy_recovery_tests;
 #[path = "adapter_stages.rs"]
 pub(crate) mod stages;
 #[path = "verify_pair.rs"]
 pub(crate) mod verify_pair;
-use command_prefix::PreparedPrefix;
 pub(crate) use command_prefix::preparing_commands;
 pub(crate) use command_prefix::supported as command_recording_supported;
+use command_prefix::PreparedPrefix;
 
 /// Vulkan-specific compiled plan. Carries the cloned graph (like the old `GraphPlan`) plus, for an
 /// eligible single-token decode graph, a lazily-built record-once replay (see [`DecodeReplay`]). An
@@ -1501,7 +1501,7 @@ fn mmv_int8_decode_dtypes(
     _caps: &infr_core::backend::Capabilities,
     vk: &infr_core::config::VulkanCfg,
 ) -> &'static [infr_core::DType] {
-    use infr_core::DType::{Iq4Nl, Q2K, Q3K, Q4_0, Q4_1, Q4K, Q5_0, Q5_1, Q5K, Q6K, Q8_0};
+    use infr_core::DType::{Iq4Nl, Q2K, Q3K, Q4K, Q4_0, Q4_1, Q5K, Q5_0, Q5_1, Q6K, Q8_0};
     // §10.3: `INFR_MMV_MW` is TRI-state — `mmv_mw: Option<bool>`, where `Some(false)` is the exact
     // string `"0"`, `Some(true)` any other value, and `None` (unset) the unified default below.
     match vk.mmv_mw {
@@ -1566,7 +1566,7 @@ fn mmv_int8_decode_dtypes(
 /// therefore safe to ship unconditionally; Q3_K's DECODE default stays off (its own accuracy
 /// question is still open — this only clears prefill).
 fn mrow_int8_prefill_dtypes(dt: infr_core::DType) -> bool {
-    use infr_core::DType::{Iq4Nl, Iq4Xs, Q2K, Q3K, Q4_0, Q4_1, Q4K, Q5_0, Q5_1, Q5K, Q6K, Q8_0};
+    use infr_core::DType::{Iq4Nl, Iq4Xs, Q2K, Q3K, Q4K, Q4_0, Q4_1, Q5K, Q5_0, Q5_1, Q6K, Q8_0};
     matches!(
         dt,
         Q2K | Q3K | Q4K | Q5K | Q6K | Iq4Xs | Q8_0 | Q4_0 | Q5_0 | Q4_1 | Q5_1 | Iq4Nl
@@ -1899,7 +1899,11 @@ fn owned_splitk_graph_shape(graph: &Graph, op: &Op) -> Option<([usize; 4], [infr
         || graph.prefill_next_chunk
         || !graph.independent_rows
         || graph.sequence_spans.len() != 4
-        || !graph.sequence_spans.iter().enumerate().all(|(row, span)| span.rows == 1 && span.row_start as usize == row)
+        || !graph
+            .sequence_spans
+            .iter()
+            .enumerate()
+            .all(|(row, span)| span.rows == 1 && span.row_start as usize == row)
         || *fused_gate_up
         || *weight_before
         || *act != Activation::Silu
@@ -1914,14 +1918,23 @@ fn owned_splitk_graph_shape(graph: &Graph, op: &Op) -> Option<([usize; 4], [infr
         || graph.desc(*x).dtype != infr_core::DType::F32
         || graph.desc(*dst).dtype != infr_core::DType::F32
         || graph.desc(*x).numel() != 4 * *ne as usize
-        || !matches!(graph.desc(*gate_exps).dtype, infr_core::DType::Iq2S | infr_core::DType::Iq3S)
+        || !matches!(
+            graph.desc(*gate_exps).dtype,
+            infr_core::DType::Iq2S | infr_core::DType::Iq3S
+        )
         || graph.desc(*up_exps).dtype != graph.desc(*gate_exps).dtype
         || graph.desc(*down_exps).dtype != infr_core::DType::Iq4Nl
     {
         return None;
     }
-    Some(([*ne as usize, *n_ff_exp as usize, 4, *n_used as usize],
-        [graph.desc(*gate_exps).dtype, graph.desc(*up_exps).dtype, graph.desc(*down_exps).dtype]))
+    Some((
+        [*ne as usize, *n_ff_exp as usize, 4, *n_used as usize],
+        [
+            graph.desc(*gate_exps).dtype,
+            graph.desc(*up_exps).dtype,
+            graph.desc(*down_exps).dtype,
+        ],
+    ))
 }
 
 fn owned_splitk_request(be_: &VulkanBackend, graph: &Graph, op: &Op) -> Option<usize> {
@@ -1930,20 +1943,14 @@ fn owned_splitk_request(be_: &VulkanBackend, graph: &Graph, op: &Op) -> Option<u
         || !be_.cfg().kernels.vulkan.decode_gpu_resident_copy_overlap
         || be_.cfg().kernels.vulkan.decode_gpu_resident_copy == Some(false)
         || !be_.cfg().device.decode_command_resident
-        || be_.cfg().spec.mtp {
+        || be_.cfg().spec.mtp
+    {
         return None;
     }
     let ([ne, nff, rows, used], dtypes) = owned_splitk_graph_shape(graph, op)?;
-    crate::recorder::owned_splitk_hit::enabled_for_shape(
-        be_,
-        dtypes,
-        ne,
-        nff,
-        rows,
-        used,
-    )
-    .then(|| crate::recorder::owned_splitk_hit::partial_bytes(ne, nff, rows, used))
-    .flatten()
+    crate::recorder::owned_splitk_hit::enabled_for_shape(be_, dtypes, ne, nff, rows, used)
+        .then(|| crate::recorder::owned_splitk_hit::partial_bytes(ne, nff, rows, used))
+        .flatten()
 }
 
 fn owned_splitk_scratch_requests(be_: &VulkanBackend, graph: &Graph) -> Vec<(&'static str, usize)> {
@@ -2945,14 +2952,8 @@ fn ple_gate_norm_buffers(
         pair.normed,
     ];
     let lens = [wide, wide, pair.rows as usize * 2560 * 4, 40960, wide, wide];
-    let [
-        Some(key),
-        Some(query),
-        Some(value),
-        Some(norm),
-        Some(gated),
-        Some(normed),
-    ] = ids.map(|id| resolve(scratch, bindings, id).ok())
+    let [Some(key), Some(query), Some(value), Some(norm), Some(gated), Some(normed)] =
+        ids.map(|id| resolve(scratch, bindings, id).ok())
     else {
         return false;
     };
@@ -3415,7 +3416,7 @@ mod q8_segmented_fusion_contract {
 
     #[test]
     fn coupled_peer_rejects_extra_observers_or_intervening_write() {
-        use infr_core::{DType, tensor::TensorDesc};
+        use infr_core::{tensor::TensorDesc, DType};
         let mut g = Graph::new();
         let k = g.input(TensorDesc::new([32768, 512], DType::Q8_0));
         let v = g.input(TensorDesc::new([32768, 512], DType::Q8_0));
@@ -4064,6 +4065,25 @@ fn lower_op(
                         be_, graph, dt, arena_addr, w_off, xb, y, dst, m, in_f, out_f, rec, pool,
                         transient,
                     )?;
+                } else if narrow_f32_gemv_applies(be_, dt, m, in_f, out_f) {
+                    // Narrow output: no tile exists, and the native per-row GEMV re-reads the whole
+                    // weight once per row. Expand it to f32 into pooled scratch and let the batched
+                    // f32r GEMV contract it — a few microseconds of cast per chunk.
+                    let elems = in_f * out_f;
+                    let w32 = pooled(pool, be_, "lin_w32", elems * 4)?;
+                    rec.dequant_weight_f32(dt, arena_addr, w_off, xb, pool[&w32].as_ref(), elems);
+                    let w32_addr = pool[&w32]
+                        .device_addr()
+                        .expect("lin_w32 scratch needs a BDA device address");
+                    rec.linear_f32_tracked(
+                        w32_addr,
+                        pool[&w32].as_ref(),
+                        xb,
+                        y,
+                        m,
+                        in_f,
+                        out_f,
+                    );
                 } else {
                     // GEMV path — chunk-covered inside `linear_native_at` for a breaching weight.
                     rec.linear_native_at(dt, arena_addr, w_off, xb, y, m, in_f, out_f);
@@ -4816,6 +4836,21 @@ fn lower_op(
                         in_f,
                         out_f,
                     );
+                } else if narrow_f32_gemv_applies(be_, dt, m, in_f, out_f) {
+                    // Resident twin of the streamed narrow-f32 route (adapter.rs's arena branch):
+                    // expand the narrow native weight to f32 once per chunk and contract it with
+                    // the batched f32r GEMV instead of the per-row native GEMV. `w_off` rides as
+                    // an ELEMENT offset into `dq()` exactly as `linear_native` uses it.
+                    let w_addr = w.device_addr().ok_or_else(|| {
+                        be("vulkan adapter: narrow-f32 Linear needs a BDA weight address")
+                    })?;
+                    let elems = in_f * out_f;
+                    let w32 = pooled(pool, be_, "lin_w32", elems * 4)?;
+                    rec.dequant_weight_f32(dt, w_addr, w_off, xb, pool[&w32].as_ref(), elems);
+                    let w32_addr = pool[&w32]
+                        .device_addr()
+                        .expect("lin_w32 scratch needs a BDA device address");
+                    rec.linear_f32_tracked(w32_addr, pool[&w32].as_ref(), xb, y, m, in_f, out_f);
                 } else {
                     rec.linear_native(dt, w, w_off, xb, y, m, in_f, out_f);
                 }
@@ -6015,14 +6050,26 @@ fn lower_op(
                 if spans.iter().all(|span| span.rows == 1) {
                     let row_elems = *n_kv as usize * *head_dim as usize;
                     let workspace = qsa_workspace::geometry(
-                        spans, ratio_safe, *top_blocks, *n_head, *n_kv, *head_dim,
+                        spans,
+                        ratio_safe,
+                        *top_blocks,
+                        *n_head,
+                        *n_kv,
+                        *head_dim,
                     )?;
                     let scratch = pooled_batch(pool, be_, &workspace.requests)?;
                     let (gather_k, gather_v, pm, pl, pacc) =
                         (scratch[0], scratch[1], scratch[2], scratch[3], scratch[4]);
 
                     for (lane, (span, geometry)) in spans.iter().zip(&workspace.rows).enumerate() {
-                        let qsa_workspace::Row { complete, tail, selected, keys, chunk, chunks: n_chunks } = *geometry;
+                        let qsa_workspace::Row {
+                            complete,
+                            tail,
+                            selected,
+                            keys,
+                            chunk,
+                            chunks: n_chunks,
+                        } = *geometry;
                         let (k_binding, v_binding, segment_shift) = match (
                             segmented_kv_view(k_rows[lane]),
                             segmented_kv_view(v_rows[lane]),
@@ -6727,7 +6774,7 @@ fn lower_op(
             let k_q8 = matches!(graph.desc(*k_cache).dtype, infr_core::DType::Q8_0);
             let v_q8 = matches!(graph.desc(*v_cache).dtype, infr_core::DType::Q8_0);
             let kv_q8 = k_q8 && v_q8; // coupled (the Dynamic-branch kernels' q8 variant)
-            // Planar Q8 scales region base = total cache elements (K and V caches share numel).
+                                      // Planar Q8 scales region base = total cache elements (K and V caches share numel).
             let cap = graph.desc(*k_cache).numel();
             // A QsaGather in an independent-row graph produces one compact, graph-internal K/V
             // prefix. That prefix is already contiguous and no longer has per-session bindings;
@@ -9042,7 +9089,15 @@ fn lower_op(
                 // discarded) — pad the packed row dimension so the LAST expert's overread stays
                 // in-bounds.
                 let npad = n_pairs.div_ceil(64) * 64 + 64;
-                let logits = alu(rows * n_expert * 4)?;
+                // Router logits may take the 64-row tiled GEMM at prefill rows (see
+                // `moe_router_gemm_applies`): its C store covers whole row tiles.
+                let logits = alu(
+                    moe_router_logits_rows(
+                        rows,
+                        moe_router_gemm_applies(be_, graph.desc(*router).dtype, rows, ne, n_expert),
+                    ) * n_expert
+                        * 4,
+                )?;
                 let ids = alu(n_pairs * 4)?;
                 let wts = alu(n_pairs * 4)?;
                 // Bucket arrays index the LOCAL expert shard under EP (ids are remapped to
@@ -9079,13 +9134,17 @@ fn lower_op(
                 // Router logits for all rows (on `router_x`, NOT `x`), then GPU routing.
                 let rdt = graph.desc(*router).dtype;
                 let rw = r(*router)?;
-                if native_dense_supported(rdt) {
-                    rec.linear_native(rdt, rw, 0, rxb, logits.as_ref(), rows, ne, n_expert);
-                } else if matches!(rdt, infr_core::DType::F32) {
-                    rec.linear_f32(rw, rxb, logits.as_ref(), rows, ne, n_expert);
-                } else {
-                    rec.linear(rw, rxb, logits.as_ref(), rows, ne, n_expert);
-                }
+                record_moe_router_logits(
+                    be_,
+                    rdt,
+                    rw,
+                    rxb,
+                    logits.as_ref(),
+                    rows,
+                    ne,
+                    n_expert,
+                    rec,
+                );
                 let bias_buf: &dyn Buffer = match exp_probs_b {
                     Some(epb) => r(*epb)?,
                     None => pool[dummy_key.as_ref().expect("absent bias allocated dummy")].as_ref(),
@@ -9370,7 +9429,18 @@ fn lower_op(
             // `INFR_NO_MOE_SM_POOL=1` restores the per-layer zeroed allocs (A/B correctness oracle).
             let no_pool = be_.cfg().kernels.vulkan.no_moe_sm_pool;
             let n_slots = rows * n_used;
-            let logits = sm_buf(pool, be_, no_pool, "moe_sm_logits", rows * n_expert)?;
+            // Router logits may take the 64-row tiled GEMM at prefill rows (see
+            // `moe_router_gemm_applies`): its C store covers whole row tiles.
+            let logits = sm_buf(
+                pool,
+                be_,
+                no_pool,
+                "moe_sm_logits",
+                moe_router_logits_rows(
+                    rows,
+                    moe_router_gemm_applies(be_, graph.desc(*router).dtype, rows, ne, n_expert),
+                ) * n_expert,
+            )?;
             let ids = sm_buf(pool, be_, no_pool, "moe_sm_ids", n_slots)?;
             let wts = sm_buf(pool, be_, no_pool, "moe_sm_wts", n_slots)?;
             // Fused: one [n_slots, 2*nff] gate|up buffer (gate half first, up half second per row —
@@ -9403,15 +9473,17 @@ fn lower_op(
             // Router logits over all experts, all `rows` tokens in one dispatch.
             let rdt = graph.desc(*router).dtype;
             let rw = r(*router)?;
-            if native_dense_supported(rdt) {
-                rec.linear_native(rdt, rw, 0, rxb, logits.get(pool), rows, ne, n_expert);
-            } else if matches!(rdt, infr_core::DType::F32) {
-                // qwen3moe ships the router (ffn_gate_inp) as F32 — the f16 GEMV would read its
-                // bytes as f16 garbage and route to arbitrary experts.
-                rec.linear_f32(rw, rxb, logits.get(pool), rows, ne, n_expert);
-            } else {
-                rec.linear(rw, rxb, logits.get(pool), rows, ne, n_expert);
-            }
+            record_moe_router_logits(
+                be_,
+                rdt,
+                rw,
+                rxb,
+                logits.get(pool),
+                rows,
+                ne,
+                n_expert,
+                rec,
+            );
             let bias_buf: &dyn Buffer = match exp_probs_b {
                 Some(epb) => r(*epb)?,
                 None => pool[dummy_key.as_ref().expect("absent bias allocated dummy")].as_ref(),
@@ -12441,7 +12513,13 @@ fn execute_static_walk(
     }
     if let Some(chunk) = resident_chunk.as_mut() {
         chunk.install_pure_mapped_schedule(
-            be_, compiled, scratch, bindings, pool, using_phase_arena, cap,
+            be_,
+            compiled,
+            scratch,
+            bindings,
+            pool,
+            using_phase_arena,
+            cap,
             prepared_layers != 0,
         );
     }
@@ -12734,7 +12812,10 @@ fn execute_static_walk(
                         if prepared_parts.is_empty() {
                             if let Some(chunk) = resident_chunk.as_mut() {
                                 chunk.confirm_before_pure_group(
-                                    be_, pstream, segments.back(), None,
+                                    be_,
+                                    pstream,
+                                    segments.back(),
+                                    None,
                                 )?;
                             }
                         }
@@ -12756,7 +12837,9 @@ fn execute_static_walk(
                                 .expect("resident prepared packet batch");
                             chunk.poll_notices(be_, &mut pstream, None)?;
                             chunk.confirm_before_pure_group(
-                                be_, pstream, segments.back(),
+                                be_,
+                                pstream,
+                                segments.back(),
                                 prepared_parts.front().map(|part| part.layers),
                             )?;
                             if chunk.notice_resume.is_some() || chunk.notice_stop {
@@ -12963,9 +13046,16 @@ fn execute_static_walk(
                                 let guarded_safe_run = !mapped_safe_run
                                     && segments.len() + 1 > inflight
                                     && guarded_owner_admission.check(
-                                        be_, compiled, pool, pstream, chunk,
-                                        rolling_same_window, using_phase_arena,
-                                        resident_banks_supported, cap, segments.len() + 1,
+                                        be_,
+                                        compiled,
+                                        pool,
+                                        pstream,
+                                        chunk,
+                                        rolling_same_window,
+                                        using_phase_arena,
+                                        resident_banks_supported,
+                                        cap,
+                                        segments.len() + 1,
                                     );
                                 let mut segment = rec
                                     .take()
@@ -12993,7 +13083,10 @@ fn execute_static_walk(
                                 })?;
                                 #[cfg(test)]
                                 guarded_owner_run::tests::checkpoint(
-                                    be_, chunk, segments.len(), guarded_safe_run,
+                                    be_,
+                                    chunk,
+                                    segments.len(),
+                                    guarded_safe_run,
                                 )?;
                                 if guarded_safe_run {
                                     let _bypass = infr_core::timeline::span(
@@ -13242,13 +13335,15 @@ fn execute_static_walk(
                                     paged_moe_shared.get(&op_idx).copied(),
                                 )?;
                                 if pstream.guarded_retire_after_submit.is_none() {
-                                    if let Some(chunk) = resident_chunk.as_ref()
+                                    if let Some(chunk) = resident_chunk
+                                        .as_ref()
                                         .filter(|chunk| chunk.pure_mapped_schedule.is_some())
                                     {
                                         chunk.preserve_coalesced_boundary(
                                             rec.as_ref().expect("ambient resident recorder"),
                                             chunk.submitted_entries,
-                                            chunk.coalescing_allowed(be_, pool, pstream), false,
+                                            chunk.coalescing_allowed(be_, pool, pstream),
+                                            false,
                                         );
                                     }
                                 }
@@ -13348,7 +13443,9 @@ fn execute_static_walk(
                                     // Keep submitted GPU work leased even if later host bookkeeping fails.
                                     segments.push_back(pending);
                                     #[cfg(test)]
-                                    if crate::host_ready_combined_test_support::after_queued(&be_.shared) {
+                                    if crate::host_ready_combined_test_support::after_queued(
+                                        &be_.shared,
+                                    ) {
                                         return Err(Error::Aborted);
                                     }
                                     // Before any new notice reader or mutable epoch bookkeeping:
@@ -14598,7 +14695,8 @@ impl DeferredOwnedNotices {
                 }
                 #[cfg(test)]
                 guarded_owner_run::tests::retired_skip(
-                    Arc::as_ptr(&self.notices.shared) as usize, ordinal,
+                    Arc::as_ptr(&self.notices.shared) as usize,
+                    ordinal,
                 );
             }
             Ok(())
@@ -14809,7 +14907,9 @@ impl ResidentNoticeProducer {
         started_output: &std::sync::mpsc::Sender<(usize, Result<ProducedNotice>)>,
         host_ready_enabled: bool,
         mut upload_worker: Option<
-            &mut owned_upload_worker::OwnedUploadWorker<crate::transfer::BackgroundTransferExecutor>,
+            &mut owned_upload_worker::OwnedUploadWorker<
+                crate::transfer::BackgroundTransferExecutor,
+            >,
         >,
         acknowledgement: Option<&Arc<NoticeProducerAck>>,
     ) -> Result<Option<ProducedNotice>> {
@@ -14988,7 +15088,9 @@ impl ResidentNoticeProducer {
                                 drain_owned_upload(&executor, transfer_value, leases)
                             },
                             completed,
-                            Arc::clone(acknowledgement.expect("upload worker has a shared job ACK")),
+                            Arc::clone(
+                                acknowledgement.expect("upload worker has a shared job ACK"),
+                            ),
                             trace_context,
                         );
                         return Ok(None); // Started owns the sole result for this ordinal.
@@ -15895,7 +15997,9 @@ impl ResidentChunk {
     }
 
     fn push_entry(&mut self, be_: &VulkanBackend, mut entry: ResidentJournalEntry) -> Result<()> {
-        if let Some(notice) = self.pure_mapped_schedule.as_ref()
+        if let Some(notice) = self
+            .pure_mapped_schedule
+            .as_ref()
             .and_then(|schedule| schedule.notice(be_, self.gpu_copy.as_ref(), &entry))
         {
             entry.host_notice = notice;
@@ -16141,7 +16245,8 @@ impl ResidentChunk {
                 producer: if cfg.decode_gpu_resident_notice_thread
                     && cfg.decode_gpu_resident_hit_first
                 {
-                    ResidentNoticeProducer::new(be_, ordinary_owner && copy_requested)?.map(Arc::new)
+                    ResidentNoticeProducer::new(be_, ordinary_owner && copy_requested)?
+                        .map(Arc::new)
                 } else {
                     None
                 },
@@ -16616,11 +16721,10 @@ impl ResidentChunk {
         graph_end: bool,
         prepare_tail: &mut dyn FnMut(),
     ) -> Result<Option<(usize, Vec<u32>)>> {
-        assert!(
-            self.gpu_copy
-                .as_ref()
-                .is_some_and(|copy| copy.owned_self_service())
-        );
+        assert!(self
+            .gpu_copy
+            .as_ref()
+            .is_some_and(|copy| copy.owned_self_service()));
         assert!(self.producer.is_none() && self.notices_sent == 0);
         ps.gpu_route = None;
         let recorder = rec
@@ -17747,6 +17851,25 @@ fn sync_stream_inner<'a>(
 /// the streamed route must fall back to the GEMV too — otherwise a Q4_K out_f%128==0 shape would
 /// diverge (resident: mmq: streamed: still the coopmat GEMM twin), which can panic the twin-SPV
 /// lookup under that debug knob.
+/// Narrow-output streamed Linears at prefill rows: expand the (tiny) native weight to f32 and take
+/// the batched f32r GEMV instead of the native per-row GEMV. Shape/dtype half lives in
+/// [`crate::recorder::narrow_f32_gemm_eligible`] so the scratch reservation tracks it exactly.
+///
+/// Measured on Qwen3.8-Flash-Next base (pp4096, the two families sum to 168 dispatches): the
+/// native GEMV spent 1.5 ms per `2560x48` and 0.96 ms per `10240x4`; the same contraction on the
+/// f32 path (as the UD variant runs it natively) takes ~0.25 ms — 202 ms of a 2.15 s chunk. The
+/// Q8_0/BF16 decode is exact in f32, so this changes speed only.
+fn narrow_f32_gemv_applies(
+    be_: &VulkanBackend,
+    dt: infr_core::DType,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+) -> bool {
+    be_.cfg().kernels.vulkan.narrow_f32_gemv
+        && crate::recorder::narrow_f32_gemm_eligible(dt, m, in_f, out_f)
+}
+
 fn streamed_gemm_applies(
     be_: &VulkanBackend,
     dt: infr_core::DType,
@@ -17764,6 +17887,76 @@ fn streamed_gemm_applies(
             && !out_f.is_multiple_of(128)
             && be_.caps().i8_dot
             && be_.cfg().kernels.vulkan.mmq)
+}
+
+/// Router logits tier for prefill rows. The MoE router is a plain dense [n_expert, in_f] matrix,
+/// and every router site used to record it through the scalar GEMV family — which, past
+/// `rows == 1`, re-reads the whole router weight once per row. Measured on Qwen3.8-Flash-Next
+/// IQ3_S (`ffn_gate_inp`, bf16 2560x512 at m=4096): the streamed GEMV took 15.5 ms/layer, 48
+/// layers = 746 ms, 24.4% of the whole pp30k device time; the tiled GEMM a dense `Op::Linear` of
+/// the same shape takes runs it in ~1.4 ms (the base model's F32 router already takes its own
+/// `linear_f32` mrow tile at 1.9 ms for the same reason).
+///
+/// Gate mirrors `streamed_gemm_applies` (m > 16, n%64, k%32, coopmat f16 tiles, native dense
+/// dtype, `INFR_NO_GEMM_WARP` honored) with one deliberate difference: Q4_K is NOT excluded. That
+/// exclusion exists on the Linear path because a resident dense Q4_K GEMM would diverge from the
+/// dp4a `mmq` tier the dense arm prefers; the router has no mmq arm — its only alternative is the
+/// per-row GEMV, which even the 64x64 native-GEMM floor beats ~64x on weight traffic.
+fn moe_router_gemm_applies(
+    be_: &VulkanBackend,
+    dt: infr_core::DType,
+    rows: usize,
+    in_f: usize,
+    n_expert: usize,
+) -> bool {
+    rows > 16
+        && n_expert.is_multiple_of(64)
+        && in_f.is_multiple_of(32)
+        && be_.caps().f16_coopmat()
+        && native_dense_supported(dt)
+        && be_.cfg().kernels.vulkan.gemm_warp
+}
+
+/// Router logits buffer rows: the tiled GEMM stores whole 64-row C tiles (the padded-dst
+/// convention every prefill GEMM follows), so the buffer must cover `ceil(rows/64)*64` rows;
+/// `moe_topk` still reads only the `rows` real ones.
+fn moe_router_logits_rows(rows: usize, gemm: bool) -> usize {
+    if gemm {
+        rows.div_ceil(64) * 64
+    } else {
+        rows
+    }
+}
+
+/// Record a MoE layer's router logits (all `rows` tokens at once) into `logits` — the prefill
+/// tiled-GEMM tier or the scalar GEMV family, see `moe_router_gemm_applies`. Shared by the
+/// batched, small-m and paged MoE arms so all three pick the same tier for the same shape.
+#[allow(clippy::too_many_arguments)]
+fn record_moe_router_logits(
+    be_: &VulkanBackend,
+    dt: infr_core::DType,
+    w: &dyn Buffer,
+    x: &dyn Buffer,
+    logits: &dyn Buffer,
+    rows: usize,
+    in_f: usize,
+    n_expert: usize,
+    rec: &Recorder<'_>,
+) {
+    if moe_router_gemm_applies(be_, dt, rows, in_f, n_expert) {
+        let w_addr = w
+            .device_addr()
+            .expect("resident-BDA router weight: the prefill GEMM reads it by u64 address");
+        rec.matmul_native_off(dt, x, w_addr, 0, logits, rows, in_f, n_expert);
+    } else if native_dense_supported(dt) {
+        rec.linear_native(dt, w, 0, x, logits, rows, in_f, n_expert);
+    } else if matches!(dt, infr_core::DType::F32) {
+        // qwen3moe ships the router (ffn_gate_inp) as F32 — the f16 GEMV would read its bytes as
+        // f16 garbage and route to arbitrary experts.
+        rec.linear_f32(w, x, logits, rows, in_f, n_expert);
+    } else {
+        rec.linear(w, x, logits, rows, in_f, n_expert);
+    }
 }
 
 /// Arena-addressed twin of the resident `Op::Linear` `is_gemm && native_dense_supported` coopmat-
@@ -18466,7 +18659,18 @@ fn execute_paged_moe<'a>(
     // `Staging` (ReBAR device-local host-visible): the ONE remaining readback — the small-m
     // split path below — is then a mapped memcpy after `sync_stream`, no one-shot copy submit
     // and no fresh readback allocation per layer.
-    let logits = pooled(pool, be_, "moe_paged_logits", rows * n_expert * 4)?;
+    // Router logits may take the 64-row tiled GEMM at prefill rows (see
+    // `moe_router_gemm_applies`): its C store covers whole row tiles.
+    let logits = pooled(
+        pool,
+        be_,
+        "moe_paged_logits",
+        moe_router_logits_rows(
+            rows,
+            moe_router_gemm_applies(be_, graph.desc(*router).dtype, rows, ne, n_expert),
+        ) * n_expert
+            * 4,
+    )?;
     let ids_key = pooled_usage(
         pool,
         be_,
@@ -18628,13 +18832,17 @@ fn execute_paged_moe<'a>(
         let rxb = r(*router_x)?;
         let rw = r(*router)?;
         let rdt = graph.desc(*router).dtype;
-        if native_dense_supported(rdt) {
-            rc.linear_native(rdt, rw, 0, rxb, pool[&logits].as_ref(), rows, ne, n_expert);
-        } else if matches!(rdt, infr_core::DType::F32) {
-            rc.linear_f32(rw, rxb, pool[&logits].as_ref(), rows, ne, n_expert);
-        } else {
-            rc.linear(rw, rxb, pool[&logits].as_ref(), rows, ne, n_expert);
-        }
+        record_moe_router_logits(
+            be_,
+            rdt,
+            rw,
+            rxb,
+            pool[&logits].as_ref(),
+            rows,
+            ne,
+            n_expert,
+            rc,
+        );
         let bias_buf: &dyn Buffer = match exp_probs_b {
             Some(epb) => r(*epb)?,
             None => pool[dummy_key.as_ref().expect("absent bias allocated dummy")].as_ref(),
@@ -21049,6 +21257,93 @@ mod tests {
         assert_eq!(paged_moe_shared_candidates(&Graph::new(), false).count(), 0);
     }
 
+    /// The prefill router tier stores whole 64-row C tiles, so the logits buffer every one of the
+    /// three MoE arms allocates must round UP to the tile; `moe_topk` still reads only `rows` real
+    /// ones. Under-padding is an out-of-bounds write into the next pool slot, so the three
+    /// invariants (covers `rows`, 64-aligned, at most one tile of waste) are pinned here, along
+    /// with the small-rows half where the GEMV tier writes exactly `rows` and padding would only
+    /// cost buffer bytes.
+    ///
+    /// Qwen3.8-Flash-Next's numbers: 4096-row prefill chunks (its `ubatch` is 64-aligned, so the
+    /// GEMM tier wastes nothing) and `n_expert == 512`, which is why the gate's `n%64` holds.
+    /// The narrow-output f32 route is the only tier the Qwen3.8-Flash-Next `2560x48` /
+    /// `10240x4` tensors can take (no 64-multiple in n), and it is exact, so the gate must not
+    /// drift into shapes that either HAVE a tile, are decode-sized, or would expand a big weight.
+    #[test]
+    fn narrow_f32_gate_is_bounded_to_the_measured_shapes() {
+        use infr_core::DType;
+        for (dt, k, n) in [
+            (DType::Q8_0, 2560usize, 48usize),
+            (DType::Q8_0, 10240, 4),
+            (DType::Bf16, 2560, 48),
+            (DType::Bf16, 10240, 4),
+        ] {
+            assert!(
+                crate::recorder::narrow_f32_gemm_eligible(dt, 4096, k, n),
+                "{dt:?} {k}x{n} at prefill rows must take the f32 route"
+            );
+        }
+        // Decode keeps the native GEMV: one row is exactly what it is good at.
+        for m in [1usize, 2, 16] {
+            assert!(!crate::recorder::narrow_f32_gemm_eligible(
+                DType::Q8_0,
+                m,
+                2560,
+                48
+            ));
+        }
+        // 64-multiple widths have a tiled GEMM tile; they must never come here.
+        for n in [64usize, 128, 2560] {
+            assert!(!crate::recorder::narrow_f32_gemm_eligible(
+                DType::Q8_0,
+                4096,
+                2560,
+                n
+            ));
+        }
+        // No expansion build for these dtypes.
+        for dt in [DType::Q4K, DType::Q6K, DType::F32, DType::F16] {
+            assert!(!crate::recorder::narrow_f32_gemm_eligible(dt, 4096, 2560, 48));
+        }
+        // K must stay on the native block grid.
+        assert!(!crate::recorder::narrow_f32_gemm_eligible(
+            DType::Q8_0,
+            4096,
+            2560 + 1,
+            48
+        ));
+        // Expansion ceiling: 128 Ki elements of f32 scratch.
+        assert!(crate::recorder::narrow_f32_gemm_eligible(
+            DType::Q8_0,
+            4096,
+            2560,
+            48
+        ));
+        assert!(!crate::recorder::narrow_f32_gemm_eligible(
+            DType::Q8_0,
+            4096,
+            4096,
+            33
+        ));
+    }
+
+    #[test]
+    fn moe_router_logits_rows_pads_only_for_the_gemm_tier() {
+        use super::*;
+        for rows in [1usize, 2, 8, 16, 17, 63, 64, 65, 128, 129, 4096, 30_000] {
+            assert_eq!(moe_router_logits_rows(rows, false), rows);
+            let padded = moe_router_logits_rows(rows, true);
+            assert!(padded >= rows, "{rows} -> {padded} short of the C store");
+            assert!(padded.is_multiple_of(64), "{rows} -> {padded} not tile-aligned");
+            assert!(padded < rows + 64, "{rows} -> {padded} wastes a whole extra tile");
+            assert_eq!(padded, rows.div_ceil(64) * 64);
+        }
+        // The tile store is what forces padding: an exact-multiple chunk (the engine's 64-aligned
+        // prefill ubatch) must stay unpadded, or the padded/dst row counts would disagree.
+        assert_eq!(moe_router_logits_rows(4096, true), 4096);
+        assert_eq!(moe_router_logits_rows(17, true), 64);
+    }
+
     #[test]
     #[ignore = "CPU-only timing comparison; run explicitly with --nocapture"]
     fn shared_scan_cpu_benchmark() {
@@ -21248,10 +21543,11 @@ mod tests {
                 n_used: 17,
             },
         ] {
-            assert!(
-                super::resident_notice_slots(&[0; crate::recorder::RESIDENT_JOURNAL_WORDS], layout)
-                    .is_err()
-            );
+            assert!(super::resident_notice_slots(
+                &[0; crate::recorder::RESIDENT_JOURNAL_WORDS],
+                layout
+            )
+            .is_err());
         }
     }
 
@@ -21333,7 +21629,7 @@ mod tests {
     #[test]
     fn resident_mtp_binding_check_uses_actual_buffers_and_exact_roles() {
         use super::*;
-        use crate::pager::{Role, buffer_identity};
+        use crate::pager::{buffer_identity, Role};
         let graph = resident_layout_graph(1, 256, 256, 4, 2, DType::Q4K, false, false);
         let Op::MoeFfn {
             gate_exps,
@@ -21409,7 +21705,7 @@ mod tests {
     #[test]
     fn resident_mtp_binding_check_rejects_mixed_and_unrolled_private_banks() {
         use super::*;
-        use crate::pager::{Role, buffer_identity};
+        use crate::pager::{buffer_identity, Role};
         use infr_core::TensorDesc;
         let mut graph = resident_layout_graph(1, 256, 256, 4, 2, DType::Q4K, false, false);
         let main_op = graph.ops[0].clone();
@@ -21462,9 +21758,13 @@ mod tests {
         use infr_core::DType;
         let mut graph = resident_layout_graph(4, 2560, 640, 40, 10, DType::Iq2S, false, false);
         graph.independent_rows = true;
-        graph.sequence_spans = (0..4).map(|row| infr_core::graph::SequenceSpan {
-            row_start: row, rows: 1, start_pos: 0,
-        }).collect();
+        graph.sequence_spans = (0..4)
+            .map(|row| infr_core::graph::SequenceSpan {
+                row_start: row,
+                rows: 1,
+                start_pos: 0,
+            })
+            .collect();
         let Op::MoeFfn { down_exps, .. } = graph.ops[0] else {
             unreachable!()
         };
@@ -21474,12 +21774,19 @@ mod tests {
             Some(([2560, 640, 4, 10], [DType::Iq2S, DType::Iq2S, DType::Iq4Nl]))
         );
         let mut iq3 = graph.clone();
-        let Op::MoeFfn { gate_exps, up_exps, .. } = iq3.ops[0] else { unreachable!() };
+        let Op::MoeFfn {
+            gate_exps, up_exps, ..
+        } = iq3.ops[0]
+        else {
+            unreachable!()
+        };
         for id in [gate_exps, up_exps] {
             iq3.tensors[id.0 as usize].desc.dtype = DType::Iq3S;
         }
-        assert_eq!(owned_splitk_graph_shape(&iq3, &iq3.ops[0]),
-            Some(([2560, 640, 4, 10], [DType::Iq3S, DType::Iq3S, DType::Iq4Nl])));
+        assert_eq!(
+            owned_splitk_graph_shape(&iq3, &iq3.ops[0]),
+            Some(([2560, 640, 4, 10], [DType::Iq3S, DType::Iq3S, DType::Iq4Nl]))
+        );
         iq3.tensors[up_exps.0 as usize].desc.dtype = DType::Iq2S;
         assert!(owned_splitk_graph_shape(&iq3, &iq3.ops[0]).is_none());
         for reason in 0..7 {
@@ -22205,11 +22512,9 @@ mod tests {
                             let mut prefill = graph.clone();
                             prefill.prefill_next_chunk = next_chunk;
                             prefill.prefill_target_tokens = target_tokens;
-                            assert!(
-                                ResidentChunk::new(&backend, &prefill, true, &mut None)
-                                    .unwrap()
-                                    .is_none()
-                            );
+                            assert!(ResidentChunk::new(&backend, &prefill, true, &mut None)
+                                .unwrap()
+                                .is_none());
                         }
                     }
                     let plan = backend.compile(&graph).unwrap();
@@ -22320,11 +22625,9 @@ mod tests {
                                     directory.len_bytes(),
                                 );
                             }
-                            assert!(
-                                original
-                                    .chunks_exact(4)
-                                    .any(|word| word[0] != 0 || word[1] != 0)
-                            );
+                            assert!(original
+                                .chunks_exact(4)
+                                .any(|word| word[0] != 0 || word[1] != 0));
                             let mut hidden = original.clone();
                             for word in hidden.chunks_exact_mut(4) {
                                 word[..2].fill(0);
@@ -22624,16 +22927,12 @@ mod tests {
                     );
                 }
                 let previous = cursor;
-                assert!(
-                    session
-                        .routed_lut_window(&mut cursor, role, 2, &[0])
-                        .is_err()
-                );
-                assert!(
-                    session
-                        .routed_lut_window(&mut cursor, role, 2, &[2])
-                        .is_err()
-                );
+                assert!(session
+                    .routed_lut_window(&mut cursor, role, 2, &[0])
+                    .is_err());
+                assert!(session
+                    .routed_lut_window(&mut cursor, role, 2, &[2])
+                    .is_err());
                 assert_eq!(cursor, previous);
                 session
                     .routed_lut_window(&mut cursor, role, 2, &[])
@@ -22748,16 +23047,12 @@ mod tests {
                     );
                 }
                 let previous = cursor;
-                assert!(
-                    session
-                        .routed_lut_window(&mut cursor, role, 2, &[0])
-                        .is_err()
-                );
-                assert!(
-                    session
-                        .routed_lut_window(&mut cursor, role, 2, &[2])
-                        .is_err()
-                );
+                assert!(session
+                    .routed_lut_window(&mut cursor, role, 2, &[0])
+                    .is_err());
+                assert!(session
+                    .routed_lut_window(&mut cursor, role, 2, &[2])
+                    .is_err());
                 assert_eq!(cursor, previous);
                 session
                     .routed_lut_window(&mut cursor, role, 2, &[])
@@ -22932,9 +23227,9 @@ mod tests {
         }
     }
     use super::*;
-    use infr_core::DType;
     use infr_core::graph::Graph;
     use infr_core::tensor::TensorDesc;
+    use infr_core::DType;
 
     #[test]
     fn independent_one_row_sequences_are_decode_token_rows() {
@@ -23426,11 +23721,9 @@ mod tests {
         for (lane, blocks) in selected.chunks_exact(top_blocks).enumerate() {
             let complete_blocks = (spans[lane].start_pos + 1) as usize / ratio;
             let selected_blocks = top_blocks.min(complete_blocks);
-            assert!(
-                blocks[..selected_blocks]
-                    .iter()
-                    .all(|&block| block < complete_blocks as u32)
-            );
+            assert!(blocks[..selected_blocks]
+                .iter()
+                .all(|&block| block < complete_blocks as u32));
             if complete_blocks <= top_blocks {
                 assert_eq!(
                     &blocks[..selected_blocks],
@@ -24048,10 +24341,9 @@ mod tests {
             .unwrap();
         pool.finish_execute();
         pool.begin_execute();
-        assert!(
-            pool.acquire("workspace", 16, |_| Err(be("test allocation failure")))
-                .is_err()
-        );
+        assert!(pool
+            .acquire("workspace", 16, |_| Err(be("test allocation failure")))
+            .is_err());
         assert!(pool.needs_compaction);
         assert!(pool.buffers.is_empty());
         assert!(pool.in_use.is_empty());
@@ -24081,13 +24373,12 @@ mod tests {
         pool.acquire("active", 8, |_| panic!("active capacity must be retained"))
             .unwrap();
         let requests = [("active", 16), ("replace", 16)];
-        assert!(
-            pool.acquire_batch(&requests, |capacities| {
+        assert!(pool
+            .acquire_batch(&requests, |capacities| {
                 assert_eq!(capacities, &[16, 16]);
                 Err(be("test batch allocation failure"))
             })
-            .is_err()
-        );
+            .is_err());
         assert!(pool.needs_compaction);
         assert_eq!(pool.in_use.len(), 1);
         assert!(pool.in_use.contains(&("active", 8)));
@@ -24117,10 +24408,9 @@ mod tests {
     fn scratch_pool_lazy_compaction_recovers_after_invalid_batch_result() {
         let mut pool = ScratchPool::default();
         let keys = [("workspace", 16)];
-        assert!(
-            pool.finish_planned_batch(&keys, keys.to_vec(), Vec::new())
-                .is_err()
-        );
+        assert!(pool
+            .finish_planned_batch(&keys, keys.to_vec(), Vec::new())
+            .is_err());
         assert!(pool.needs_compaction);
         assert!(pool.buffers.is_empty());
         assert!(pool.in_use.is_empty());
@@ -24560,7 +24850,7 @@ mod tests {
     /// (m, out_f) either could see. A band edit that changes a routing decision fails here.
     #[test]
     fn mrow_bands_match_inline_formula() {
-        use infr_core::tier::{LinearTier, linear_tier};
+        use infr_core::tier::{linear_tier, LinearTier};
         // The pre-extraction expressions, verbatim.
         let old_mrow = |m: usize, out_f: usize| {
             (2..=4).contains(&m) || ((5..=8).contains(&m) && out_f <= 8192)
@@ -25733,7 +26023,7 @@ mod tests {
         let w: Vec<f32> = (0..hd).map(|i| 1.0 + i as f32 * 0.05).collect(); // NOT ones — general
         let xb16 = to_f16(&x_f32);
         let x = deq(&xb16); // the f16-rounded input the GPU shader actually reads
-        // host reference: per-head rmsnorm(x) * w, on the SAME f16-rounded input.
+                            // host reference: per-head rmsnorm(x) * w, on the SAME f16-rounded input.
         let mut want = vec![0f32; nh * hd];
         for h in 0..nh {
             let b = h * hd;
@@ -25859,7 +26149,7 @@ mod tests {
             .collect();
         let (qf, kf, vf) = (to_f16(&q), to_f16(&k), to_f16(&v));
         let (qd, kd, vd) = (deq(&qf), deq(&kf), deq(&vf)); // host uses the same f16-rounded values
-        // host GQA softmax attention
+                                                           // host GQA softmax attention
         let mut want = vec![0f32; nh * hd];
         for h in 0..nh {
             let kvh = h / group;
@@ -27056,7 +27346,7 @@ mod tests {
         let (ne, n_expert, n_used, nff) = (32usize, 4usize, 2usize, 32usize);
         let scale = 1.3f32;
         let f = |i: usize, s: f32| (i as f32 * s).sin() * 0.5; // deterministic weight/act filler
-        // Distinct per-expert router rows so top-k selection is unambiguous.
+                                                               // Distinct per-expert router rows so top-k selection is unambiguous.
         let router: Vec<f32> = (0..n_expert * ne)
             .map(|i| f(i, 0.037) + (i / ne) as f32 * 0.15)
             .collect();
@@ -27345,12 +27635,12 @@ mod tests {
 
             let got1 = run_ep(&[d0], &x, rows); // world=1: single-device (identity band, no reduce)
             let got2 = run_ep(&[d0, d1], &x, rows); // world=2: real 2-device expert split
-            // THE EP correctness bar: the 2-device expert split reproduces the single-device MoE
-            // (same runner path; world=1 is the identity lowering). Holds for BOTH the small-m
-            // id-GEMV path (rows=1/4) and the batched dp4a path (rows=16), so it validates the
-            // per-band compute + `moe_ep_band_remap` local-id rewrite + the P2P/all-reduce combine
-            // on both. Reduction-order tolerance (the cross-rank sum reassociates the weighted
-            // accumulate).
+                                                    // THE EP correctness bar: the 2-device expert split reproduces the single-device MoE
+                                                    // (same runner path; world=1 is the identity lowering). Holds for BOTH the small-m
+                                                    // id-GEMV path (rows=1/4) and the batched dp4a path (rows=16), so it validates the
+                                                    // per-band compute + `moe_ep_band_remap` local-id rewrite + the P2P/all-reduce combine
+                                                    // on both. Reduction-order tolerance (the cross-rank sum reassociates the weighted
+                                                    // accumulate).
             for i in 0..rows * ne {
                 assert!(
                     (got2[i] - got1[i]).abs() < 3e-3,

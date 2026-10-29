@@ -1,4 +1,4 @@
-use super::super::{OwnedUploadCompletion, drain_owned_upload};
+use super::super::{drain_owned_upload, OwnedUploadCompletion};
 use super::*;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -195,12 +195,10 @@ fn completion_failure_and_panic_release_captures_and_worker_is_reused() {
         thread_ids.push(observed.recv_timeout(TIMEOUT).unwrap());
         let result = completion.recv_timeout(TIMEOUT).unwrap();
         match mode {
-            0 => assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("synthetic upload completion failure")
-            ),
+            0 => assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("synthetic upload completion failure")),
             1 => assert!(result.unwrap_err().to_string().contains("panicked")),
             _ => assert_eq!(result.unwrap(), Some(53)),
         }
@@ -384,19 +382,17 @@ fn full_or_disconnected_queue_falls_back_inline_exactly_once() {
             let (completed, completion) = mpsc::channel();
             filler_completion = Some(completion);
             let (ack, _) = job_ack();
-            assert!(
-                sender
-                    .try_send(UploadJob {
-                        work: Some(Box::new(|_: &usize| -> Outcome {
-                            panic!("queued filler must not execute")
-                        })),
-                        completed: Some(completed),
-                        acknowledgement: Some(ack),
-                        retired: None,
-                        context: None,
-                    })
-                    .is_ok()
-            );
+            assert!(sender
+                .try_send(UploadJob {
+                    work: Some(Box::new(|_: &usize| -> Outcome {
+                        panic!("queued filler must not execute")
+                    })),
+                    completed: Some(completed),
+                    acknowledgement: Some(ack),
+                    retired: None,
+                    context: None,
+                })
+                .is_ok());
         } else {
             drop(receiver.take());
         }
@@ -453,14 +449,12 @@ fn unexecuted_job_drop_publishes_error_after_releasing_captures() {
     };
     drop(job);
     assert!(weak.upgrade().is_none());
-    assert!(
-        completion
-            .recv_timeout(TIMEOUT)
-            .unwrap()
-            .unwrap_err()
-            .to_string()
-            .contains("cancelled")
-    );
+    assert!(completion
+        .recv_timeout(TIMEOUT)
+        .unwrap()
+        .unwrap_err()
+        .to_string()
+        .contains("cancelled"));
     acknowledged.recv_timeout(TIMEOUT).unwrap();
     retirement.recv_timeout(TIMEOUT).unwrap();
 }
@@ -476,11 +470,9 @@ fn started_send_failure_releases_blocking_completion_before_unsent_notice_drop()
         Ok(()) => panic!("Started unexpectedly delivered"),
     };
     // This is the existing producer send-failure ordering, before worker.schedule.
-    assert!(
-        completed
-            .send(Err(be("owned upload cancelled before Started delivery")))
-            .is_ok()
-    );
+    assert!(completed
+        .send(Err(be("owned upload cancelled before Started delivery")))
+        .is_ok());
     drop(unsent);
 }
 

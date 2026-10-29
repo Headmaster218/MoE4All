@@ -33,7 +33,10 @@ fn decode_mtp_isolation_host_ready_create_failure_falls_back_cpu() {
         attempts.fetch_add(1, Ordering::Relaxed);
         Err(be("injected host-ready creation failure"))
     });
-    assert!(worker.is_none(), "failure must retain the old completion gate");
+    assert!(
+        worker.is_none(),
+        "failure must retain the old completion gate"
+    );
     assert_eq!(attempts.load(Ordering::Relaxed), 1);
     // Creation is optional, not sticky: a later producer may enable it successfully.
     assert_eq!(

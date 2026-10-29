@@ -243,8 +243,7 @@ impl Query {
         } else {
             timeline::device_label_selected("DMA_copy", self.ctx.layer)
         };
-        if timeline::device_labels_selective() && !has_selected
-        {
+        if timeline::device_labels_selective() && !has_selected {
             // The normal fence already completed. Recycle without a driver readback.
             self.pools.lock().unwrap().push(self.pool);
             self.pool = vk::QueryPool::null();
@@ -375,13 +374,21 @@ mod tests {
         ];
         let mut marks = Vec::new();
         for (selected, name, tick) in input {
-            if let Some(label) = sampling_label(selected, marks.last().map(|m: &(&str, i32)| m.0), name) {
+            if let Some(label) =
+                sampling_label(selected, marks.last().map(|m: &(&str, i32)| m.0), name)
+            {
                 marks.push((label, tick));
             }
         }
-        assert_eq!(marks, [("owner", 10), (UNSAMPLED, 20), ("ffn", 80), (UNSAMPLED, 90)]);
-        let measured: Vec<_> = marks.windows(2).filter(|pair| pair[0].0 != UNSAMPLED)
-            .map(|pair| (pair[0].0, pair[1].1-pair[0].1)).collect();
+        assert_eq!(
+            marks,
+            [("owner", 10), (UNSAMPLED, 20), ("ffn", 80), (UNSAMPLED, 90)]
+        );
+        let measured: Vec<_> = marks
+            .windows(2)
+            .filter(|pair| pair[0].0 != UNSAMPLED)
+            .map(|pair| (pair[0].0, pair[1].1 - pair[0].1))
+            .collect();
         assert_eq!(measured, [("owner", 10), ("ffn", 10)]);
         assert_eq!(sampling_label(false, None, "outside"), None);
         assert_eq!(sampling_label(true, None, "owner"), Some("owner"));

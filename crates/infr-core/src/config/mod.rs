@@ -672,9 +672,16 @@ cfg_struct! {
         iq4_pair_lut: bool = true,
         /// Packed Q3_K/Q6_K byte decode for measured BM32 expert MMQ shapes only.
         kquant_packed_decode: bool = true,
-        /// Six qualified Q8 BN128 Prefill tuples on measured Windows RX 7900 XTX.
-        /// The original BM64 path remains the per-feature fallback.
+        /// BM128 (128x128 single-buffer) Prefill warptile on measured Windows RX 7900 XTX.
+        /// Every native-dense format with a `_n128_ag_bm128` build takes it at m>=1024 with
+        /// whole 128-row tiles and wide k/n; short-k/narrow-n shapes and the m=512 Flash tuples
+        /// that regressed keep the BM64 tile. See `dense_bm128_applies`.
         q8_prefill_bm128: bool = true,
+        /// Expand a narrow-output (n not a multiple of 64, so no tiled GEMM tile exists) native
+        /// Prefill weight to f32 and contract it with the batched f32r GEMV instead of the native
+        /// per-row GEMV. The expansion is exact (Q8_0/BF16 decode fits f32); the weights it covers
+        /// are <= 512 KiB. See `narrow_f32_gemv_applies`.
+        narrow_f32_gemv: bool = true,
         /// Exact chronological QSA Top-K collection on measured devices.
         qsa_topk_ordered: bool = true,
         /// Reuse probability fragments in measured hd256 Prefill register-O kernels.
@@ -1230,6 +1237,17 @@ cfg_struct! {
         /// KV radix tree (`best_match`) then hits that prefix on its own. The store holds DTOs
         /// only — no KV is pinned here, eviction of cached KV pages is unaffected.
         response_store_entries: u32 = 0,
+        /// `INFR_RESPONSE_STORE_PATH`: file that mirrors the `/v1/responses` store, so
+        /// `previous_response_id`/`conversation` chains survive a restart. Unset (the default)
+        /// keeps the store in memory only — the privacy-preserving default, since the file holds
+        /// every stored prompt and response in the clear.
+        ///
+        /// Ignored when `response_store_entries` is 0 (the stateless contract has nothing to
+        /// mirror). Loaded once at startup — a missing file starts fresh, an unreadable or
+        /// unparsable one refuses to start rather than silently dropping the history — and
+        /// rewritten (write-to-temp, then rename) after every turn that changes the store, so the
+        /// I/O cost follows the total size of the retained turns.
+        response_store_path: Option<PathBuf> = None,
     }
 }
 
